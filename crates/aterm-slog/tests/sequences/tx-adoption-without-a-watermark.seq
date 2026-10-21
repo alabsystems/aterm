@@ -13,7 +13,7 @@ expect tx through=none
 tx prompt v2
 bind 600
 expect mark r1 source field=transcript state=on skipped=0
-expect mark r1 source field=transcript state=on skipped=600 at=1100
+expect mark r1 source field=transcript state=on skipped=600 @1100
 tx result c1 dated=1099
 tx result c1
-expect close p1 tool out=ok by=vendor at=1100
+expect close p1 tool out=ok by=vendor @1100

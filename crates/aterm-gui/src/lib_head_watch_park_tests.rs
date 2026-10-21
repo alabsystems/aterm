@@ -19,8 +19,8 @@ fn modeled_park_choice(end: &ParkEnd) -> i64 {
         ParkEnd::IndexPublished(_) => 3,
         ParkEnd::VendorMoved(_) => 4,
         ParkEnd::SwitchedOff => 0,
-        // A held toolchain flip that is due is a LOCAL wish read off the store, like a
-        // bump, and outranks every network hint as a bump does: the model's choice 1.
+        // A due held toolchain flip is a local wish, like a bump, and outranks every
+        // network hint: the model's choice 1.
         ParkEnd::FlipDue => 1,
     }
 }
@@ -62,9 +62,8 @@ fn vendor(
     }
 }
 
-/// A targeted pass is `update <program> --head-watch` on the same lane flags as every
-/// pass; the loop's whole pass alone carries `--defer-busy-flip` — never the argv a
-/// person's Settings Check spawns ([`pass_args`]).
+/// A targeted pass is `update <program> --head-watch` on the lane's flags; only the loop's
+/// whole pass carries `--defer-busy-flip`, and never the argv of a person's pass ([`pass_args`]).
 #[test]
 fn a_targeted_pass_names_its_program_on_the_lanes_own_argv() {
     let layout = atpkg::store::Layout {
@@ -220,9 +219,8 @@ fn a_window_park_holds_the_watch_with_no_vendor_program_to_watch() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A session can hold the exclusive rendezvous for its quiet look just as
-/// the window's park wakes. The window does not read the flip or advance
-/// its one-minute recheck until its next slice wins the shared claim.
+/// While a session holds the exclusive rendezvous for its quiet look, the window neither reads
+/// the flip nor advances its one-minute recheck; its next slice that wins the claim does.
 #[test]
 fn a_refused_window_claim_defers_its_held_flip_look() {
     use atpkg::quiet::{Due, DueFlip, RECHECK};
@@ -257,9 +255,9 @@ fn a_refused_window_claim_defers_its_held_flip_look() {
         due,
     ));
     assert_eq!(looks.get(), 0, "the session still owns the store look");
-    // Released by LOCK_UN (the guard's drop), not by the close alone: a child
-    // another test is forking holds this descriptor until it execs, and the
-    // very next slice makes ONE shared try (the fd-copy sweep of 2026-09-27).
+    // Released by LOCK_UN (the guard's drop), not by the close alone: a child another
+    // test is forking holds this descriptor until it execs, and the next slice makes one
+    // shared try.
     drop(held);
     assert!(!deferred_flip_due_if_watching(
         window.sit(&layout),
@@ -279,10 +277,8 @@ fn a_refused_window_claim_defers_its_held_flip_look() {
     assert_eq!(looks.get(), 2, "the second quiet look wakes the pass");
 }
 
-/// The window can take the shared watch after a session launched a whole pass,
-/// then park behind that pass at the store lock. The session may finish the
-/// held move during that park: the exact GUI pass gate must retire its old
-/// `FlipDue` reason, while an unchanged record still permits its pass.
+/// A session may finish the held move while the window parks behind its whole pass: the GUI
+/// pass gate retires the old `FlipDue`, while an unchanged record still permits its pass.
 #[test]
 fn a_window_does_not_repeat_a_sessions_completed_held_move() {
     use atpkg::quiet::{Deferral, Due, DueFlip, Recheck};
@@ -390,11 +386,8 @@ fn a_window_does_not_repeat_a_sessions_completed_held_move() {
     assert_eq!(why, PassWhy::Walk);
 }
 
-/// A vendor watcher may be admitted even if the configured store could
-/// not be resolved. Its fresh heads are due, but no store means there is
-/// no round to launch; the park must sleep instead of spinning until its
-/// deadline. Thread CPU time distinguishes the two without relying on
-/// machine load or wall-clock scheduling precision.
+/// A vendor watcher with no resolvable store has due heads but no round to launch: the park
+/// sleeps, not spins (thread CPU time tells them apart under any load).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_due_vendor_without_a_store_does_not_spin_the_package_lane() {
@@ -435,9 +428,8 @@ fn a_due_vendor_without_a_store_does_not_spin_the_package_lane() {
     );
 }
 
-/// A completed vendor hint can leave the package park while the independent
-/// index probe is still waiting on its host. A completed index answer, and a
-/// local bump, retain priority when both answers are already available.
+/// A completed vendor hint leaves the park while the index probe still waits on its host; a
+/// completed index answer, and a local bump, keep priority when both answers are in.
 #[test]
 fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     let model = aterm_models_atpkg::atpkg_index_pending_park_model();
@@ -451,10 +443,8 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
         last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
         ..BumpWatch::default()
     };
-    // The index probe stays blocked until the test releases it, after the
-    // park. Its own ten minutes must outlast the park below: a probe that
-    // answered on its own inside the park would let a lane that holds the
-    // vendor behind it return `VendorMoved` anyway.
+    // The index probe blocks until released after the park. Its ten-minute wait outlasts
+    // the park, or a lane holding the vendor behind it could still return `VendorMoved`.
     start_index_probe(&layout, &mut watch, true, Instant::now(), move |_| {
         release_rx.recv_timeout(Duration::from_secs(600)).unwrap();
         atpkg::index_probe::Probe::Published(77)
@@ -463,10 +453,9 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     assert!(watch.pending_index_probe.is_some());
     assert_eq!(state["phase"], 1);
     assert_eq!(modeled_index_owner(&watch), 1);
-    // The park is one slice of a minute: the vendor worker's completion must unpark
-    // the lane (`HeadWatch::park_for_hint`), or it wakes at the slice's timeout and
-    // answers `Elapsed`, as would a lane holding the vendor hint behind the blocked
-    // index probe.
+    // One minute-long slice of park: the vendor worker's completion must unpark the lane
+    // (`HeadWatch::park_for_hint`); a lane holding the hint behind the blocked index
+    // probe wakes at the slice's timeout and answers `Elapsed`.
     let park = aterm_spec::wait::MUST_HAPPEN;
     set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
@@ -487,8 +476,7 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
         watch.pending_index_probe.is_some(),
         "one owned probe remains"
     );
-    // Even if another minute elapses while that request is blocked, the
-    // package lane cannot start a second index worker.
+    // Even a minute later, the lane cannot start a second index worker.
     start_index_probe(
         &layout,
         &mut watch,
@@ -519,9 +507,8 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// Tier-1 of `AtpkgIndexSharedHandoff`: a window arriving near a sibling's
-/// shared-stamp expiry keeps the remaining wait. The next ordinary park
-/// may probe at that expiry, with no early request or added local interval.
+/// `AtpkgIndexSharedHandoff`: a window arriving near a sibling's shared-stamp expiry keeps the
+/// remaining wait, then probes at that expiry, with no early request or added local interval.
 #[test]
 fn a_suppressed_window_index_probe_uses_the_shared_expiry() {
     use aterm_models_atpkg::atpkg_index_shared_handoff_model;
@@ -574,10 +561,9 @@ fn a_suppressed_window_index_probe_uses_the_shared_expiry() {
     assert_eq!(requests.load(Ordering::SeqCst), state["requests"] as u64);
 }
 
-/// Tier-1 of `AtpkgIndexProbeCompletionCadence`: a worker's HEADs finish
-/// after its start, just as the shared file's mtime is stamped after them.
-/// The old start-based local clock would spend its next 30-second turn on
-/// that still-fresh stamp, pushing the next real HEAD to 60 seconds.
+/// `AtpkgIndexProbeCompletionCadence`: the shared file's mtime is stamped after the worker's
+/// HEADs, so the next probe is paced from completion; paced from the start, it would hit the
+/// still-fresh stamp and push the next real HEAD to twice the interval.
 #[test]
 fn next_index_probe_is_paced_from_worker_completion() {
     let model = aterm_models_atpkg::atpkg_index_probe_completion_cadence_model();
@@ -585,8 +571,8 @@ fn next_index_probe_is_paced_from_worker_completion() {
     let layout = atpkg::store::Layout {
         prefix: std::env::temp_dir().join("aterm-index-completion-cadence-absent"),
     };
-    // Inject five seconds of elapsed network time without sleeping. The
-    // worker's real completion stamp is still observed through its handle.
+    // Five seconds of elapsed network time, without sleeping; the worker's real completion
+    // stamp is still read through its handle.
     let launched_at = Instant::now() - Duration::from_secs(5);
     let mut watch = BumpWatch {
         last_index_probe: Some(launched_at - atpkg::index_probe::INTERVAL),
@@ -648,9 +634,8 @@ fn next_index_probe_is_paced_from_worker_completion() {
         .unwrap();
 }
 
-/// A positive near HEAD wakes the signed pass without waiting for the
-/// probe worker's far HEAD or listing. The worker remains owned through
-/// the pass and its later final answer is invalidated by that pass.
+/// A positive near HEAD wakes the signed pass without waiting for the worker's far HEAD or
+/// listing; the worker stays owned through the pass, which invalidates its later answer.
 #[test]
 fn near_index_wakes_while_unrelated_probe_helpers_are_still_running() {
     let model = aterm_models_atpkg::atpkg_index_pending_park_model();
@@ -663,18 +648,11 @@ fn near_index_wakes_while_unrelated_probe_helpers_are_still_running() {
         last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
         ..BumpWatch::default()
     };
-    start_index_probe_with_near_hint(
-        &layout,
-        &mut watch,
-        true,
-        Instant::now(),
-        // The release must come: the test's own wait names it (FAKE_OUTWAITS_THE_TEST).
-        move |_, near| {
-            near(44);
-            release_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
-            atpkg::index_probe::Probe::Published(49)
-        },
-    );
+    start_index_probe_with_near_hint(&layout, &mut watch, true, Instant::now(), move |_, near| {
+        near(44);
+        release_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
+        atpkg::index_probe::Probe::Published(49)
+    });
     assert!(model.fire("Start", &mut state));
     wait_for_what_must_happen("the near hint arrived", || index_probe_answer_ready(&watch));
     assert!(
@@ -730,9 +708,8 @@ fn near_index_wakes_while_unrelated_probe_helpers_are_still_running() {
     assert!(model.check_invariant("NoStaleAnswerApplied", &state));
 }
 
-/// A new index should start its signed pass as soon as its near HEAD lands,
-/// even when the package lane is parked inside the vendor-head watcher.
-/// Keep the final probe blocked to prove this wake comes from the near hint.
+/// A new index starts its signed pass as soon as its near HEAD lands, even with the lane
+/// parked inside the vendor-head watcher; the final probe stays blocked to prove it.
 #[test]
 fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
     let layout = atpkg::store::Layout {
@@ -768,8 +745,8 @@ fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
         std::thread::sleep(Duration::from_millis(100));
         near_tx.send(()).unwrap();
     });
-    // The near hint must beat the slice's own timeout: one slice of a minute, or a
-    // missed unpark answers `Elapsed`.
+    // The near hint must beat the slice's one-minute timeout; a missed unpark answers
+    // `Elapsed`.
     let park = aterm_spec::wait::MUST_HAPPEN;
     set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
@@ -799,9 +776,9 @@ fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
     );
 }
 
-/// A final answer must also interrupt the ordinary slice when no vendor
-/// watch is admitted. The `done` publication closes the race
-/// between unpark delivery and `JoinHandle::is_finished` becoming true.
+/// A final answer interrupts the ordinary slice with no vendor watch admitted. The `done`
+/// publication closes the race between unpark delivery and `JoinHandle::is_finished`
+/// turning true.
 #[test]
 fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
     let layout = atpkg::store::Layout {
@@ -822,7 +799,7 @@ fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
         std::thread::sleep(Duration::from_millis(100));
         finish_tx.send(()).unwrap();
     });
-    // One slice of a minute, so a missed unpark answers `Elapsed`.
+    // A one-minute slice, so a missed unpark answers `Elapsed`.
     let park = aterm_spec::wait::MUST_HAPPEN;
     set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
@@ -839,9 +816,9 @@ fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
     release.join().unwrap();
 }
 
-/// A second near HEAD can publish while the signed pass for the first is
-/// reading an older listing. The still-owned worker must offer that higher
-/// build immediately; its older far/listing answer remains invalidated.
+/// A second near HEAD can publish while the signed pass for the first reads an older
+/// listing: the still-owned worker offers the higher build at once, and its older
+/// far/listing answer stays invalidated.
 #[test]
 fn higher_near_index_after_pass_start_wakes_before_unrelated_helpers_finish() {
     let model = aterm_models_atpkg::atpkg_index_pending_park_model();
@@ -861,20 +838,13 @@ fn higher_near_index_after_pass_start_wakes_before_unrelated_helpers_finish() {
         last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
         ..BumpWatch::default()
     };
-    start_index_probe_with_near_hint(
-        &layout,
-        &mut watch,
-        true,
-        Instant::now(),
-        // The releases must come: the test's own waits name them (FAKE_OUTWAITS_THE_TEST).
-        move |_, near| {
-            near(44);
-            advance_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
-            near(45);
-            finish_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
-            atpkg::index_probe::Probe::Published(49)
-        },
-    );
+    start_index_probe_with_near_hint(&layout, &mut watch, true, Instant::now(), move |_, near| {
+        near(44);
+        advance_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
+        near(45);
+        finish_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
+        atpkg::index_probe::Probe::Published(49)
+    });
     assert!(model.fire("Start", &mut state));
     wait_for_what_must_happen("the near hint 44 arrived", || {
         index_probe_answer_ready(&watch)
@@ -950,7 +920,6 @@ fn finished_stale_probe_keeps_newer_near_hint_unless_the_floor_landed_it() {
             &mut watch,
             true,
             Instant::now(),
-            // The release must come: the test's own wait names it (FAKE_OUTWAITS_THE_TEST).
             move |_, near| {
                 near(44);
                 finish_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
@@ -1000,20 +969,13 @@ fn a_suppressed_near_build_does_not_hide_a_higher_near_build() {
         unlanded: Some(44),
         ..BumpWatch::default()
     };
-    start_index_probe_with_near_hint(
-        &layout,
-        &mut watch,
-        true,
-        Instant::now(),
-        // The releases must come: the test's own waits name them (FAKE_OUTWAITS_THE_TEST).
-        move |_, near| {
-            near(44);
-            advance_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
-            near(45);
-            release_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
-            atpkg::index_probe::Probe::Published(45)
-        },
-    );
+    start_index_probe_with_near_hint(&layout, &mut watch, true, Instant::now(), move |_, near| {
+        near(44);
+        advance_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
+        near(45);
+        release_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
+        atpkg::index_probe::Probe::Published(45)
+    });
     wait_for_what_must_happen("the near hint 44 arrived", || {
         index_probe_answer_ready(&watch)
     });
@@ -1062,7 +1024,6 @@ fn stale_missing_index_answer_keeps_the_new_full_pass_mark() {
         last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
         ..BumpWatch::default()
     };
-    // The release must come: the test's own wait names it (FAKE_OUTWAITS_THE_TEST).
     start_index_probe(&layout, &mut watch, true, Instant::now(), move |_| {
         release_rx.recv_timeout(FAKE_OUTWAITS_THE_TEST).unwrap();
         atpkg::index_probe::Probe::Missing
@@ -1365,9 +1326,7 @@ fn an_exclusion_edited_in_a_running_window_reaches_the_head_watch() {
     wait_for_what_must_happen("the slice that read the edit asked claude", || {
         !asked.lock().unwrap().is_empty()
     });
-    // Later slices harvest the worker's answer (the park that read the edit may
-    // already have, had the worker woken it in time). The minute is a hang
-    // detector; any end but `Elapsed` stops the walk for the assertion below.
+    // Later slices harvest the worker's answer; any end but `Elapsed` stops the walk.
     let harvested = Instant::now() + MUST_HAPPEN;
     while matches!(end, ParkEnd::Elapsed) {
         assert!(
@@ -1429,10 +1388,8 @@ fn the_park_ends_at_a_wall_clock_deadline_and_never_strands_on_a_clock_set_back(
 /// vendor is asked.
 #[test]
 fn a_moved_head_ends_the_park_with_its_programs() {
-    // The due head now runs on its own worker. A 20 ms park can end before
-    // that worker is scheduled under a busy test host; the next park must
-    // still harvest its completion and leave promptly. The minute is a hang
-    // detector: a completion never harvested parks `Elapsed` to its end.
+    // The due head runs on its own worker, which a busy host may not schedule within a
+    // 20 ms park; a later park harvests it.
     fn park_until_moved(layout: &atpkg::store::Layout, heads: &mut VendorHeads) -> ParkEnd {
         let deadline = Instant::now() + MUST_HAPPEN;
         loop {
@@ -1480,9 +1437,8 @@ fn a_moved_head_ends_the_park_with_its_programs() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A ready Codex hint starts its targeted pass while the independent Claude
-/// request is still stalled. This binds the pending watch to the GUI package
-/// lane, rather than only checking that two GETs overlap.
+/// A ready Codex hint starts its targeted pass while the independent Claude request is
+/// still stalled, through the GUI package lane itself, not only two overlapping GETs.
 #[cfg(unix)]
 #[test]
 fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
@@ -1519,10 +1475,9 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     let claude_finished = Arc::new(AtomicBool::new(false));
     let gate = Arc::clone(&release);
     let finished = Arc::clone(&claude_finished);
-    // Claude's stall is released by the test and must outlast every wait before
-    // that release, the Codex minute below among them: a lane that held Codex
-    // behind Claude then fails at that minute with Claude still stalled, never
-    // passes on a GET that gave up on its own. Ten minutes.
+    // Claude's ten-minute stall outlasts every wait before the test releases it, the Codex
+    // minute among them: a lane that held Codex behind Claude fails at that minute, never
+    // passes on a GET that gave up on its own.
     let get: Arc<ConcurrentVendorGetFn<'static>> = Arc::new(move |program, url, _, _| {
         let bytes = if program == "claude" {
             let (lock, ready) = &*gate;
@@ -1606,10 +1561,8 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     let (lock, ready) = &*release;
     *lock.lock().unwrap() = true;
     ready.notify_all();
-    // A thread park can return on a stale token or spuriously. The lane
-    // always rechecks the watch and parks again; exercise that same loop
-    // while waiting for Claude's independently completed GET. The minute is a
-    // hang detector.
+    // A thread park can return spuriously or on a stale token: wait for Claude's GET
+    // through the lane's own recheck-and-park loop. The minute is a hang detector.
     let deadline = Instant::now() + MUST_HAPPEN;
     let moved = loop {
         head_watch.park_for_hint(deadline.saturating_duration_since(Instant::now()));
@@ -1631,10 +1584,9 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The passes one trigger runs: every program while they run, and the contention
-/// tally starts over; the first that stands aside at the lock counts on the tally
-/// and ends the trigger — the next program is not queued behind the same holder —
-/// and none runs while the holder looks wedged.
+/// A trigger runs every program while its passes run, and a pass that ran starts the contention
+/// tally over; the first to stand aside at the lock counts on the tally and ends the trigger (the
+/// next program does not queue behind the same holder); none runs while the holder looks wedged.
 #[cfg(unix)]
 #[test]
 fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
@@ -1698,9 +1650,9 @@ fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A private window's passes lead with [`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`] (seed,
-/// whole and targeted updates); the owner's lane carries nothing new. Driven through
-/// the lane's real spawn over a fake `atpkg` that logs its argv.
+/// A private window's passes (seed, whole and targeted updates) lead with
+/// [`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`]; the owner's carry nothing new. Driven through the
+/// lane's real spawn over a fake `atpkg` that logs its argv.
 #[cfg(unix)]
 #[test]
 fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
@@ -1867,9 +1819,8 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
         None,
     );
     assert_eq!(rows(&posted), ["open", "ended", "withdraw"]);
-    // An update that stood aside at the lock, or found no network before it announced
-    // anything, wrote no outcome: its exit is carried, the lane still holds the row,
-    // and the park that follows withdraws it.
+    // An update that stood aside at the lock, or found no network before announcing, wrote
+    // no outcome: the lane still holds the row, and the next park withdraws it.
     for exit in [
         atpkg::lock::CONTENDED_EXIT,
         aterm_update_core::pkg_check::PASS_OFFLINE_EXIT,
@@ -1891,17 +1842,16 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
         );
         assert_eq!(rows(&posted), ["withdraw"], "exit {exit}");
     }
-    // A failed update is the Fault it was: it takes the row over and its exit folds it.
+    // A failed update takes the row over, and its exit folds it.
     lane.ahead = true;
     std::fs::write(&code, "1\n").unwrap();
     lane.run(PassVerb::Update, None);
     assert_eq!(rows(&posted), ["ended"]);
     assert!(!lane.ahead);
-    // An update whose only answer is a fact about this machine — the empty-store arm's
-    // informational `seed-unusable:` line, exit 2 — announced no install: its exit is
-    // carried and the park withdraws the row, never a Fault for an architecture no build
-    // serves. An exclusion that leaves nothing is a failure a person can act on, and
-    // folds the row as before.
+    // An update whose only answer is a fact about this machine (the empty-store arm's
+    // informational `seed-unusable:` line, exit 2) carries the row for the park to withdraw,
+    // never a Fault for an architecture no build serves. An exclusion that leaves nothing is
+    // a failure a person can act on, and takes the row over.
     let unusable = |body: &str| format!("atpkg: {}{body}\n", atpkg::cli::SEED_UNUSABLE_MARKER);
     let unserved = unusable(&format!(
         "ALab publishes no build {} (x86_64-apple-darwin) \u{2014} it builds for \
@@ -2205,11 +2155,10 @@ fn the_first_run_row_opens_ahead_only_where_the_seed_will_adopt() {
     assert!(!first_run_ahead(Some(&stocked), &consenting));
 }
 
-/// The first run is defined by the store at the pass's start: over a store with no
-/// program the announcement is tagged first run, over one with a program routine, and
-/// the child's own landing cannot flip it. Every exit posts `PkgPassEnded`, clean only
-/// for a whole pass that exited 0 with no failure marker. A refused vendor head-watch
-/// pass raises no row (its `error:` row is what the badge reads).
+/// The store at the pass's start decides the first run (no program: first run; a program:
+/// routine), which the child's own landing cannot flip. Every exit posts `PkgPassEnded`, clean
+/// only for a whole pass that exited 0 with no failure marker. A refused vendor head-watch pass
+/// raises no row (its `error:` row is what the badge reads).
 #[cfg(unix)]
 #[test]
 fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {

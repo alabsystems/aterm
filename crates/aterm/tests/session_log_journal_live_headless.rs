@@ -82,7 +82,7 @@ fn scratch_world(tag: &str, extra: &str) -> World {
     let world = launch_isolation::scratch_root(&format!("atsj-{tag}"));
     let root = world.path();
     assert!(
-        root.join("run/aterm/a.sock.token").as_os_str().len() < headless_boot::MAX_SOCK_PATH,
+        launch_isolation::sock_fits(&root.join("run/aterm/a.sock.token")),
         "the private root's socket fits sun_path"
     );
     let config = root.join("cfg/aterm/aterm.toml");

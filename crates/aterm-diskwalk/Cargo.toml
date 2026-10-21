@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-diskwalk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm's subtree walker: per-folder allocated size (hard-link fair share), entry counts and the huge-directory warnings, walked fd-relative in ~4 ms slices with a resumable cursor, never following a symlink and never touching a path whose stat could raise a macOS privacy prompt."
+# Integration tests are listed below: the BudgetedWalk conformance and the
+# measurement, which walks a 200k-entry scratch tree only when asked.
+autotests = false
+
+[dependencies]
+# The one list of paths whose `stat` can prompt (`consent::tcc_prompting_roots`).
+aterm-containment = { workspace = true }
+# The mount table and the pure path-to-mount lookup (`volumes::table`, `mount_of`).
+aterm-sysprobe = { workspace = true }
+# The anchor attributes' registry (std-only): the walker's entry points refine
+# the BudgetedWalk model in test and debug builds; release strips them.
+aterm-spec-anchor = { workspace = true }
+
+# fd-relative opens and the portable lister's `readdir` (Unix only: the crate is
+# empty on Windows), and the platform calls the lister arms declare beside them.
+[target.'cfg(unix)'.dependencies]
+aterm-dirfd = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# Scratch trees, removed on drop: tests walk only trees they create.
+aterm-tempfile = { workspace = true }
+aterm-spec = { workspace = true }
+aterm-models-misc = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "conformance_budgeted_walk"
+path = "tests/conformance_budgeted_walk.rs"
+
+[[test]]
+name = "measure"
+path = "tests/measure.rs"

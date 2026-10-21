@@ -58,8 +58,8 @@ struct World {
     /// A peer's release claims past the reservation as the cut starts — after the
     /// release's last look, before the cut's own claim.
     overtaken_at_cut: bool,
-    /// The cut's claim LANDS (main takes the release commit, the ledger its line) and
-    /// the cut then fails before it journals anything.
+    /// The cut's claim lands (main takes the release commit, the ledger its line) and the
+    /// cut then fails before it journals anything.
     claim_lands_unjournaled: bool,
     // behaviours
     machine_refusals: Vec<Refusal>,
@@ -909,10 +909,9 @@ fn a_second_run_finds_everything_done_and_only_checks() {
 
 // (a') the release's own handoff fixtures ---------------------------------------------
 
-/// A generator that refuses refuses the release at the build step, beside which it runs:
-/// before the publish and the cut's claim, so nothing is public and no number burned —
-/// and the bundle built beside it is kept, so the run after the fix stages the fixtures
-/// alone, building nothing again.
+/// A refusing generator refuses the release at the build step it runs beside, before the
+/// publish and the claim: nothing public, no number burned, and the bundle is kept, so the run
+/// after the fix stages the fixtures alone.
 #[test]
 fn a_generator_that_refuses_refuses_the_release_before_its_claim() {
     let mut w = World::new();
@@ -1041,8 +1040,8 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
             |w| w.latest_lags = false,
         ),
     ];
-    // resumed bare, and by the very command that stopped (docs/RELEASING.md: "the same
-    // command resumes at that step") — a `--bump` past the cut included
+    // resumed bare, and by the very command that stopped (docs/RELEASING.md: "it resumes
+    // where it stopped"), a `--bump` past the cut included
     for ((step, broken, mend), again) in cases
         .into_iter()
         .flat_map(|case| [(case, mac()), (case, bump())])
@@ -1487,11 +1486,9 @@ fn a_publish_that_recorded_source_but_failed_signing_cannot_be_skipped_into_a_cu
     assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
 }
 
-/// AUDIT 2 BEFORE EVERY FRESH CUT. A run that published and then stopped short of the
-/// claim leaves a re-run whose publish is skipped, and whose cut claims straight after:
-/// the waiting audit, and what the cut would refuse, are asked at the publish step all
-/// the same — an owner gap opened since (Apple's agreement lapsed) is waited on before
-/// the claim, never met after it with a build spent.
+/// A run that published and stopped short of the claim leaves a re-run whose publish is
+/// skipped; the waiting audit and the cut's gates are still asked at the publish step, so an
+/// owner gap opened since is waited on before the claim, never met after it with a build spent.
 #[test]
 fn a_fresh_cut_whose_publish_is_skipped_is_audited_and_waits_before_its_claim() {
     let mut w = World::new();
@@ -1840,11 +1837,10 @@ fn an_ask_no_journal_took_is_withdrawn_when_the_run_stops_before_step_3() {
 
 // (k) a claim forgotten, the site, the successor, the re-exec, --forget ---------------
 
-/// NO CLAIM IS HELD TO A PROVER, because no resume compiles. The cut claims bytes the
-/// release already built and verified, and its journal (`dist/cut-state.toml`) names
-/// them, so a resume signs those bytes whatever prover it runs under. `--forget` around
-/// a claimed, unfinished cut therefore drops nothing its resume needs: the run after it
-/// resumes the claim with `--resume`, and never reserves, builds or verifies again.
+/// No claim is held to a prover, because no resume compiles: the cut claims bytes the release
+/// already built and verified, and its journal (`dist/cut-state.toml`) names them. So
+/// `--forget` around a claimed, unfinished cut drops nothing its resume needs: the next run
+/// resumes with `--resume` and never reserves, builds or verifies again.
 #[test]
 fn a_claim_forgotten_and_resumed_is_never_built_again() {
     let mut w = World::new();
@@ -2119,13 +2115,11 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
     assert!(at("stage") < at("publish"), "{:?}", w.calls);
 }
 
-/// ONLY A CLAIMED CUT IS PAST ITS PREPARE. A visible half that published and then
-/// stopped short of the claim — a peer's release claimed past the reservation as the cut
-/// started — leaves the source public, nothing claimed, and its PREPARED record stale: the
-/// next bare run refuses before anything heavy (the ledger reached the prepared build),
-/// keeping the record; `--prepare` reserves anew, builds and verifies, and records
-/// PREPARED again over the published source; and the bare run after it releases that
-/// build, nothing heavy run again.
+/// Only a claimed cut is past its prepare. A visible half that published and then stopped
+/// short of the claim (a peer claimed past the reservation) leaves the source public and its
+/// PREPARED record stale: the next bare run refuses before anything heavy, keeping the record;
+/// `--prepare` reserves anew, builds, verifies and records PREPARED again over the published
+/// source; and the bare run after it releases that build.
 #[test]
 fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
     let mut w = World::new();
@@ -2291,7 +2285,7 @@ fn a_public_version_is_major_minor_zero() {
     }
 }
 
-// (i) build once ---------------------------------------------------------------------
+// (l) build once ---------------------------------------------------------------------
 
 /// `verify release` decides step 6 by its exit alone: a FAIL (1) refuses naming the
 /// command that reruns it; any other exit (3: a check could not run or was skipped; 2: a

@@ -335,8 +335,6 @@ pub(crate) struct BedScratch {
     pub(crate) rails: Vec<u32>,
     verts: Vec<RibbonVertex>,
     tube: Vec<BeamVertex>,
-    /// A leap tube's per-vertex opacity, for its nested soft passes.
-    tube_cov: Vec<u8>,
     /// Each sample's taper (the wedge's and the tail's), in run order.
     taper: Vec<f32>,
 }
@@ -377,7 +375,6 @@ pub(crate) fn lay_dark_bed(
         rails,
         verts,
         tube,
-        tube_cov,
         taper,
     } = scratch;
     let cell_of = |x: f32, y: f32| {
@@ -495,17 +492,19 @@ pub(crate) fn lay_dark_bed(
             {
                 let bottom = oyf + (row + 1) as f32 * chf;
                 let reach = shape.rail * chf;
+                let rail_up = reach * shape.rail_rise;
+                let rail_core_dn = reach * DARK_RAIL_CORE * (1.0 - shape.rail_rise);
                 // Only where the row below shows no letter: a line of text
                 // there (a selection, earlier output) would have its
                 // letters' tops in the rail, so the rail goes out over it.
-                let leading = |x: f32| !text.over_text(row + 1, cell_of(x, first.y).1);
+                let leading = |x: f32| !text.over_text(row + 1, ((x - oxf) / cwf).floor() as i32);
                 let rail_vertex = |x: f32, s: &CometSample, rgb: u32, k: f32| RibbonVertex {
                     x,
                     spine: bottom,
-                    up: reach * shape.rail_rise,
+                    up: rail_up,
                     dn: reach,
                     core_up: 0.0,
-                    core_dn: reach * DARK_RAIL_CORE * (1.0 - shape.rail_rise),
+                    core_dn: rail_core_dn,
                     color: rgb,
                     cov: if leading(x) {
                         shape.at(s.cov, chf, k).0
@@ -618,18 +617,16 @@ pub(crate) fn lay_dark_bed(
                         color: if k < 0.5 { a.color } else { b.color },
                         cov,
                     };
-                    let (ca, cb) = (a.cov, b.cov);
+                    let layer_cov = |a: u8| {
+                        let a = f32::from(a) / 255.0;
+                        let layer = 1.0 - (1.0 - a).powf(1.0 / LEAP_LAYERS as f32);
+                        (layer * 255.0).round().clamp(0.0, 255.0) as u8
+                    };
+                    let (ca, cb) = (layer_cov(a.cov), layer_cov(b.cov));
                     tube.clear();
                     tube.extend([at(0.0, 0), at(f, ca), at(1.0 - f, cb), at(1.0, 0)]);
-                    tube_cov.clear();
-                    tube_cov.extend(tube.iter().map(|v| v.cov));
                     for k in 0..LEAP_LAYERS {
                         let shrink = 1.0 - k as f32 / LEAP_LAYERS as f32;
-                        for (v, &a) in tube.iter_mut().zip(tube_cov.iter()) {
-                            let a = f32::from(a) / 255.0;
-                            let layer = 1.0 - (1.0 - a).powf(1.0 / LEAP_LAYERS as f32);
-                            v.cov = (layer * 255.0).round().clamp(0.0, 255.0) as u8;
-                        }
                         comet_beam_over(
                             under,
                             clip,
@@ -715,25 +712,25 @@ pub(crate) fn clip_quads_to(
         if cx0 >= cx1 || cy0 >= cy1 {
             continue;
         }
-        let w = f32::from(q.w.max(1));
-        let lerp = |a: u32, b: u32, x: i32| {
-            let t = (x - qx0) as f32 / w;
-            let ch = |sh: u32| {
-                let (u, v) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
-                ((u + (v - u) * t).round() as u32).min(255)
-            };
-            (ch(16) << 16) | (ch(8) << 8) | ch(0)
-        };
-        let lerp_a = |a: u8, b: u8, x: i32| {
-            let t = (x - qx0) as f32 / w;
-            (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
-        };
         let mut c = q;
         c.x = cx0 as u16;
         c.y = cy0 as u16;
         c.w = (cx1 - cx0) as u16;
         c.h = (cy1 - cy0) as u16;
         if cx0 != qx0 || cx1 != qx1 {
+            let w = f32::from(q.w.max(1));
+            let lerp = |a: u32, b: u32, x: i32| {
+                let t = (x - qx0) as f32 / w;
+                let ch = |sh: u32| {
+                    let (u, v) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
+                    ((u + (v - u) * t).round() as u32).min(255)
+                };
+                (ch(16) << 16) | (ch(8) << 8) | ch(0)
+            };
+            let lerp_a = |a: u8, b: u8, x: i32| {
+                let t = (x - qx0) as f32 / w;
+                (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
+            };
             c.color = lerp(q.color, q.color2, cx0);
             c.color2 = lerp(q.color, q.color2, cx1);
             if q.alpha != 0 {
@@ -851,20 +848,30 @@ impl CursorGlow {
         } else {
             &self.comet_runs[..runs_len]
         };
+        let mut last: Option<(u32, u32, u32)> = None;
         for run in runs {
             for s in run {
                 let raw = color(self, s.pos);
-                let hue = match shape.hue {
-                    BedHue::Night => night_rgb(raw),
-                    BedHue::True => raw,
+                let (bed_c, rail_c) = match last {
+                    Some((prev, b, r)) if prev == raw => (b, r),
+                    _ => {
+                        let hue = match shape.hue {
+                            BedHue::Night => night_rgb(raw),
+                            BedHue::True => raw,
+                        };
+                        let b = self.bed_ink(hue, page, budget, shape.sat);
+                        let r = if shape.rail > 0.0 {
+                            crate::rainbow_kitty::ribbon::rail_ink(raw & 0x00FF_FFFF)
+                        } else {
+                            0
+                        };
+                        last = Some((raw, b, r));
+                        (b, r)
+                    }
                 };
-                scratch
-                    .inks
-                    .push(self.bed_ink(hue, page, budget, shape.sat));
+                scratch.inks.push(bed_c);
                 if shape.rail > 0.0 {
-                    scratch
-                        .rails
-                        .push(crate::rainbow_kitty::ribbon::rail_ink(raw & 0x00FF_FFFF));
+                    scratch.rails.push(rail_c);
                 }
             }
         }

@@ -50,9 +50,13 @@ contract_fn! {
 
 pub use frontier_includes_raw as frontier_includes;
 
-/// 4-parameter Chandy-Lamport causal effect transition kernel (`causal_step_frontier_isl`),
-/// composed directly from the 4-parameter Clean-Origin (`I5`) [`causal_gate_frontier`]
-/// and [`heal_frontier_monotone`] functions.
+/// 4-parameter Chandy-Lamport causal effect transition kernel: advances `eff_cur` to
+/// `max(eff_cur, eff_cand)` once `cause_req <= cause_cut`, and keeps it otherwise.
+///
+/// Hand-written plain Rust, not compiled from Clean: it restates `causal_step_frontier_isl`,
+/// the island's composition of the Clean-Origin (`I5`) [`causal_gate_frontier`] and
+/// [`heal_frontier_monotone`] functions, and astream-broker's `clean_tla_protocol_surface`
+/// suite holds it to that composition over a grid of boundary operands.
 #[must_use]
 pub const fn causal_step_frontier(
     cause_cut: u64,
@@ -290,11 +294,13 @@ impl<K: Ord + Clone> CausalCut<K> {
         Self { frontiers }
     }
 
-    /// Directly execute `Astream.Wire.TlaCausalCut.AdvanceEffectConsistent`:
-    /// advance `effect_stream` to `effect_upto` via the 4-parameter Clean-origin
-    /// [`causal_step_frontier`] / [`heal_frontier_monotone`] transition iff the causal
-    /// parent `cause` (if any) is already admitted by this cut (`self.includes(cause_stream, cause_offset)`).
-    /// Returns `true` iff the causal guard passed and the cut was updated/satisfied.
+    /// Directly execute `Astream.Wire.TlaCausalCut.AdvanceEffectConsistent`: iff the
+    /// causal parent `cause` (if any) is already admitted by this cut
+    /// (`self.includes(cause_stream, cause_offset)`), advance `effect_stream`'s frontier to
+    /// `max(frontier, effect_upto)`. With a cause the step is [`causal_step_frontier`], the
+    /// hand-written kernel its own doc describes; without one it is [`Self::advance`],
+    /// which takes the Clean-Origin (`I5`) [`heal_frontier_monotone`].
+    /// Returns `true` iff the causal guard passed, whether or not the frontier moved.
     pub fn advance_effect_if_causal(
         &mut self,
         effect_stream: K,
@@ -452,5 +458,28 @@ mod tests {
         // Subsequent causal advance succeeds without healing because src@10 is already admitted.
         assert!(cut.advance_effect_if_causal("dst", Offset(4), Some((&"src", Offset(10)))));
         assert_eq!(cut.offset_of(&"dst"), Some(Offset(4)));
+    }
+
+    #[test]
+    fn advance_effect_if_causal_takes_the_max_and_answers_the_guard_not_the_move() {
+        let mut cut = CausalCut::new();
+        cut.set("src", Offset(10));
+        cut.set("dst", Offset(6));
+        // An admitted cause with a lower target: the guard passes, the frontier stays.
+        assert!(cut.advance_effect_if_causal("dst", Offset(2), Some((&"src", Offset(10)))));
+        assert_eq!(cut.offset_of(&"dst"), Some(Offset(6)));
+        // An admitted cause on an absent effect stream: it is created at the target.
+        assert!(cut.advance_effect_if_causal("new", Offset(5), Some((&"src", Offset(3)))));
+        assert_eq!(cut.offset_of(&"new"), Some(Offset(5)));
+        // A cause on a stream the cut does not hold is not admitted.
+        assert!(!cut.advance_effect_if_causal("dst", Offset(9), Some((&"gone", Offset(0)))));
+        assert_eq!(cut.offset_of(&"dst"), Some(Offset(6)));
+        // No cause: `advance`'s max, and `true` whether or not the frontier moved.
+        assert!(cut.advance_effect_if_causal("dst", Offset(4), None));
+        assert_eq!(cut.offset_of(&"dst"), Some(Offset(6)));
+        assert!(cut.advance_effect_if_causal("dst", Offset(8), None));
+        assert_eq!(cut.offset_of(&"dst"), Some(Offset(8)));
+        assert!(cut.advance_effect_if_causal("solo", Offset(1), None));
+        assert_eq!(cut.offset_of(&"solo"), Some(Offset(1)));
     }
 }

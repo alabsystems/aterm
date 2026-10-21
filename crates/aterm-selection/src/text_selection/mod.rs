@@ -190,33 +190,21 @@ impl TextSelection {
         self.end
     }
 
-    /// Has an endpoint been clamped to the history floor because its content was
-    /// evicted?
-    ///
-    /// `true` means the selection still resolves to real text but the oldest part
-    /// of the span is gone. Callers that report to a client (the control socket's
-    /// `selection`/`copy` verbs) surface it as ` incomplete`; nothing PAINTS from
-    /// it — `SelectionFingerprint::of` reads state/kind/start/end only, which is
-    /// sound exactly because a truncation always moves an anchor row too.
+    /// Whether an endpoint was clamped to the history floor after scrollback
+    /// eviction. Surfaced as ` incomplete` by control-socket `selection`/`copy`
+    /// replies; `SelectionFingerprint::of` ignores it because truncation always
+    /// moves an anchor row.
     #[must_use]
     #[inline]
     pub const fn truncated(&self) -> bool {
         self.truncated
     }
 
-    /// SELECTION CUSTODY Phase 4: does this selection overlap the ABSOLUTE row band
-    /// `lo_abs..=hi_abs`?
+    /// Whether this selection overlaps the absolute row band `lo_abs..=hi_abs`.
     ///
-    /// Anchors are in live-screen-relative space (0 = top visible row at the LIVE
-    /// bottom, negative = scrollback), so `live_top_abs + row` lifts them into the
-    /// absolute space the grid records damage in. `live_top_abs` is the caller's
-    /// `absolute_row_counter - visible_rows` — the same quantity
-    /// `Grid::visible_to_absolute` builds on, and likewise independent of
-    /// `display_offset`.
-    ///
-    /// This is the ONE place the two coordinate systems meet. Deliberately not a
-    /// representation change: the anchors stay relative, and the conversion happens
-    /// at the damage boundary only.
+    /// Converts live-screen-relative anchor rows (`0` = top visible row at live
+    /// bottom, negative = scrollback) into absolute rows via `live_top_abs + row`
+    /// (`live_top_abs = absolute_row_counter - visible_rows`).
     #[must_use]
     pub fn intersects_absolute_band(&self, live_top_abs: u64, lo_abs: u64, hi_abs: u64) -> bool {
         if self.state == SelectionState::None {
@@ -231,19 +219,12 @@ impl TextSelection {
         sel_lo <= hi && lo <= sel_hi
     }
 
-    /// SELECTION CUSTODY Phase 4: re-floor the selection after history was EVICTED
-    /// with no accompanying scroll.
+    /// Re-floor the selection after scrollback eviction without a scroll delta
+    /// (e.g. a retention-limit shrink or memory-budget trim).
     ///
-    /// `oldest_abs` is `Grid::oldest_absolute_row()` and `live_top_abs` is
-    /// `absolute_row_counter - visible_rows` — the same base
-    /// [`Self::intersects_absolute_band`] converts through, and likewise independent
-    /// of `display_offset`. Their difference is the deepest still-addressable anchor
-    /// row in the selection's own relative space.
-    ///
-    /// This is the eviction-with-no-DELTA entry point: a retention-limit shrink or a
-    /// memory-budget trim drops the oldest lines without moving anything, so
-    /// [`Self::adjust_for_scroll`] — which only ever runs on a real content scroll —
-    /// never sees it. Returns `false` (and clears) only when BOTH endpoints are gone.
+    /// `oldest_abs - live_top_abs` gives the deepest addressable relative row.
+    /// Clamps a single evicted endpoint and returns `false` (clearing the
+    /// selection) only when both endpoints were evicted.
     pub fn truncate_to_floor(&mut self, oldest_abs: u64, live_top_abs: u64) -> bool {
         // Saturate rather than `as`-wrap a huge absolute row into a negative one.
         let oldest = i64::try_from(oldest_abs).unwrap_or(i64::MAX);
@@ -262,16 +243,9 @@ impl TextSelection {
         self.clamp_head_to_min_row(min_row.min(0))
     }
 
-    /// Clamp an endpoint evicted below `min_row` onto the oldest retained row.
-    ///
-    /// Returns `false` (and clears) only when BOTH endpoints are gone. The copy walk
-    /// clamps the same way (`aterm-core`'s `selection_to_string_capped`), so the
-    /// highlight agrees with the text a copy returns.
-    ///
-    /// The floor is the deepest RETAINED row, not the deepest ring-resident one:
-    /// `Terminal::history_line_rev` resolves tiered and lazily-restored lines just as
-    /// well as ring lines, so narrowing this to ring residency would reinstate
-    /// whole-selection clearing under the tiered store for no correctness gain.
+    /// Clamp an endpoint evicted below `min_row` (the deepest retained row,
+    /// including tiered history) onto `min_row`, or clear and return `false`
+    /// when both endpoints are below `min_row`.
     fn clamp_head_to_min_row(&mut self, min_row: i32) -> bool {
         if self.state == SelectionState::None {
             return true;
@@ -283,12 +257,8 @@ impl TextSelection {
         if lo >= min_row {
             return true;
         }
-        // `min_row >= 0` means no retained history (the alt screen, or a primary
-        // grid with zero scrollback): clamping would pin the highlight to row 0,
-        // content the user never selected, so clear instead. Tested on `min_row`, not
-        // the alt-screen mode, so the rule lives in the coordinates it is about; a
-        // full-screen alt scroll records no damage band, so nothing downstream would
-        // catch a wrong clamp.
+        // `min_row >= 0` means no retained history (alt screen or zero
+        // scrollback): clear rather than clamping onto row 0.
         if min_row >= 0 || hi < min_row {
             self.clear();
             return false;
@@ -299,10 +269,8 @@ impl TextSelection {
             &mut self.end
         };
         anchor.row = min_row;
-        // BLOCK selections clamp the ROW only. `normalized_start`/`normalized_end`
-        // take the min/max of rows and cols INDEPENDENTLY, so forcing col 0 here
-        // would widen the rectangle to column 0 across EVERY retained row — a
-        // wrong-copy path, not a degradation.
+        // Block selections clamp only the row; resetting `col = 0` would
+        // widen the rectangle across every retained row.
         if self.selection_type != SelectionType::Block {
             anchor.col = 0;
             // `Right` on the head anchor means "start AFTER this cell", which would
@@ -454,9 +422,7 @@ impl TextSelection {
         self.selection_type = selection_type;
         self.start = SelectionAnchor::new(row, col, side);
         self.end = SelectionAnchor::new(row, col, side);
-        // A fresh span has lost nothing. Leaving this set would make the control
-        // socket's `selection`/`copy` replies carry ` incomplete` forever after one
-        // eviction, which `aterm-control`'s conformance check compares exactly.
+        // Reset truncation state for the new selection.
         self.truncated = false;
     }
 
@@ -538,24 +504,16 @@ impl TextSelection {
         }
     }
 
-    /// Adjust selection for scroll.
+    /// Shift selection anchors by `-delta` rows on a terminal scroll.
     ///
-    /// When the terminal scrolls, selection coordinates need to be updated.
-    /// Returns false only if the WHOLE selection left the valid coordinate range
-    /// and was cleared; a single endpoint scrolled below the history floor is
-    /// partial eviction and clamps to the oldest retained row instead (see
-    /// [`Self::truncated`]).
-    ///
-    /// Rows are live-screen coordinates, scrollback negative. The valid range is
-    /// `-floor` (the deepest retained-history row) up to, excluding, `max_rows`; the lower
-    /// bound is the scrollback floor, not the visible height, or ordinary output
-    /// would clear a selection still pinned on screen (#4056).
+    /// Valid rows span `-floor..max_rows` (`0` = top visible row, negative =
+    /// scrollback). Clears and returns `false` if any endpoint lands `>= max_rows`
+    /// or both land `< -floor`; clamps a single endpoint below `-floor`.
     pub fn adjust_for_scroll(&mut self, delta: i32, max_rows: i32, floor: i32) -> bool {
         if self.state == SelectionState::None {
             return true;
         }
 
-        // Nonsensical geometry from an FFI caller (#7541).
         if max_rows <= 0 {
             self.clear();
             return false;
@@ -581,30 +539,12 @@ impl TextSelection {
         self.clamp_head_to_min_row(min_row)
     }
 
-    /// Re-anchor endpoints across a rows-only SHRINK.
+    /// Re-anchor endpoints across a cursor-anchored rows-only shrink.
     ///
-    /// A rows-only shrink rewraps nothing, but the rows the viewport gives up
-    /// become the newest history. Rows-only shapes anchor at the cursor, so this
-    /// is a pure relabel: every row, live and archived, moves by `-removed_rows`:
-    ///
-    /// ```text
-    /// BEFORE (10 rows)          AFTER (6 rows)
-    ///   rel -1: line-54           rel -5: line-54
-    ///   rel  0: line-55           rel -4: line-55
-    ///   rel  7: line-62           rel  3: line-62
-    /// ```
-    ///
-    /// So it is [`Self::adjust_for_scroll`] with `delta = removed_rows`. A
-    /// monotonic map cannot reverse a span; if rows-only shapes ever stop
-    /// anchoring at the cursor, a span straddling the cut would remap reversed
-    /// and wider, and copy rows the user never selected.
-    ///
-    /// Passing 0 (what `take_last_resize_row_shift()` returns on a shrink) leaves
-    /// every anchor `removed_rows` rows off its content.
-    ///
-    /// Returns `false` (and clears) when an endpoint is above the pre-resize live
-    /// bottom — content that never existed; an endpoint evicted below the history
-    /// floor CLAMPS rather than destroying the half the user can still see.
+    /// Rows given up by the viewport become the newest scrollback, shifting
+    /// every live and archived relative row by `-removed_rows` via
+    /// [`Self::adjust_for_scroll`]. Clears and returns `false` if an endpoint
+    /// was above the pre-resize live bottom, or clamps at `-floor`.
     pub fn adjust_for_rows_shrink(
         &mut self,
         kept_rows: i32,
@@ -614,7 +554,6 @@ impl TextSelection {
         if self.state == SelectionState::None {
             return true;
         }
-        // Degenerate geometry: let the uniform range check reject it (#7541).
         if kept_rows <= 0 || removed_rows <= 0 {
             return self.adjust_for_scroll(0, kept_rows, floor);
         }
@@ -636,22 +575,13 @@ impl TextSelection {
         self.end.row = self.end.row.saturating_add(delta);
     }
 
-    /// Re-anchor selection endpoints across a logical row insertion before a
-    /// protected footer.
+    /// Re-anchor selection endpoints across a row insertion of `inserted` rows
+    /// before a fixed footer at `boundary_row`.
     ///
-    /// `boundary_row` is the first pre-insertion row whose content stays fixed
-    /// on screen (the footer). Rows before it move toward scrollback by
-    /// `inserted`; rows at or after it retain their terminal-relative row. This
-    /// is the piecewise counterpart of [`Self::adjust_for_scroll`]: a single
-    /// uniform delta would either detach the footer endpoint or detach the
-    /// archived endpoint.
-    ///
-    /// Returns `false` and clears the selection when a remapped endpoint lands above
-    /// the live bottom, or when BOTH land below the history floor. One endpoint
-    /// below the floor is partial eviction and clamps, exactly as in
-    /// [`Self::adjust_for_scroll`] — a top-anchored archival splice would otherwise
-    /// still destroy a whole selection for one evicted endpoint. Selection state,
-    /// type, columns, and sub-cell sides are otherwise preserved exactly.
+    /// Rows before `boundary_row` shift toward scrollback by `-inserted`; rows
+    /// at or after `boundary_row` keep their relative row. Clears if a remapped
+    /// endpoint lands `>= max_rows` or both land `< -floor`, clamping a single
+    /// endpoint below `-floor`.
     pub fn adjust_for_row_splice(
         &mut self,
         boundary_row: i32,
@@ -687,21 +617,10 @@ impl TextSelection {
         self.clamp_head_to_min_row(min_row)
     }
 
-    /// THE highlight predicate: is this cell painted as selected, with a
-    /// double-width glyph counted whole?
-    ///
-    /// A CJK ideograph, an emoji, or a ZWJ sequence occupies a lead cell and a
-    /// blank continuation cell, and
-    /// [`glyph_cell_span`](aterm_types::selection::glyph_cell_span) names them as
-    /// one indivisible unit. A cell is selected when EITHER of its glyph's
-    /// columns is — which is exactly the rule the copy path's column walk
-    /// obeys, so a drag that stops mid-glyph paints and copies the same run.
-    /// Testing the bare `col` instead splits the glyph: the highlight covers one
-    /// half a column wide while the clipboard receives the whole character.
-    ///
-    /// `is_wide` means the cell at `col` is the LEFT half; `is_wide_continuation`
-    /// means it is the RIGHT half. Both renderers reach this through one seam
-    /// (`RenderInput::selection_hit`), so CPU and GPU cannot diverge either.
+    /// Whether the cell at `(row, col)` is selected, treating a wide glyph
+    /// (`is_wide` lead or `is_wide_continuation` right half) as selected when
+    /// either of its columns via [`glyph_cell_span`](aterm_types::selection::glyph_cell_span)
+    /// is selected so highlight and copy boundaries agree.
     pub fn contains_cell(
         &self,
         row: i32,

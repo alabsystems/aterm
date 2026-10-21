@@ -10,4 +10,4 @@ pass 3000
 see idle
 pass 100
 wait 1000
-expect close t1 turn at=3000
+expect close t1 turn @3000

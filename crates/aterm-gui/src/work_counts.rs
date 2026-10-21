@@ -1,37 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deterministic WORK counters for the many-tab / many-session passes whose
-//! wins are structural (docs/PERF-REGRESSION-DEFENCE.md, W-4) — the
-//! `aterm_grid::test_counters` idiom, for this crate.
-//!
-//! Each counter sits at the site that does the WORK a win removed, never at
-//! the site that makes the decision: a counter on the decision reads the same
-//! whether or not the work behind it came back. The asserting tests live in
-//! `work_count_tests.rs` (or beside the fixtures they need: the harness
-//! card's in `claude_card_tests.rs`) and run in every `verify test`, which no
-//! timing lane does.
-//!
-//! Thread-local, so parallel tests cannot bleed into each other; every counted
-//! site runs on the calling (test) thread. Compiled only under `cfg(test)`.
-//!
-//! So is the test binary's heap counter ([`allocations_in`]): the global
-//! allocator is `System`'s, counted per thread while a test asks.
+//! Thread-local work and heap-allocation counters for `cfg(test)` regression
+//! tests (`work_count_tests.rs`, `claude_card_tests.rs`).
 
 use std::cell::Cell;
 
 thread_local! {
-    /// Layout plans built (`App::plan_tab`): the redraw plan-build
-    /// cardinality, and MPT-2's discarded background-tab plans.
+    /// Layout plans built (`App::plan_tab`).
     static PLANS_BUILT: Cell<usize> = const { Cell::new(0) };
-    /// MPT-3: output stamps touched (swapped or cleared) by the present walk.
+    /// Output stamps touched by the present walk.
     static LATENCY_STAMPS_TOUCHED: Cell<usize> = const { Cell::new(0) };
-    /// MPT-4: sessions probed by the status sweep.
+    /// Sessions probed by the status sweep.
     static STATUS_PROBES: Cell<usize> = const { Cell::new(0) };
-    /// Clipboard workers started (`spawn::install_clipboard`): one per session
-    /// that wrote the clipboard, none for one that never did.
+    /// Clipboard workers started (`spawn::install_clipboard`).
     static CLIPBOARD_WORKERS: Cell<usize> = const { Cell::new(0) };
-    /// MPT-5: tabs walked by the title-drift gate.
+    /// Tabs walked by the title-drift gate.
     static TITLE_TAB_TOUCHES: Cell<usize> = const { Cell::new(0) };
     /// The subscribe idle wake: retained ledger records (shell blocks, turn
     /// records, timeline events) an `events` digest touched.
@@ -46,8 +30,13 @@ thread_local! {
     static IMAGES_ENCODED: Cell<usize> = const { Cell::new(0) };
     /// Engine samples an `events` read took (`subscribe::sample_engine_events`):
     /// the session's term lock, held for its blocks, title, bell and resize
-    /// counters. At most one per `EVENTS_PACE` per watch under a flood.
+    /// counters. At most one per `EVENTS_PACE` per watch under a flood, plus
+    /// one per record (`session_watch::Watchers::ring_record`).
     static ENGINE_SAMPLES: Cell<usize> = const { Cell::new(0) };
+    /// `events` reads a push pass made for an owed read come due, not for a
+    /// ring or a record of its own (`subscribe::pass_streams`): a read that
+    /// waited out the pace.
+    static OWED_EVENTS_READS: Cell<usize> = const { Cell::new(0) };
     /// Subscribe watches read by a push pass (`subscribe::frames_for_watch`):
     /// the watches whose session rang, not every watch per wake.
     static WATCHES_VISITED: Cell<usize> = const { Cell::new(0) };
@@ -148,6 +137,13 @@ pub(crate) fn take_engine_samples() -> usize {
     take(&ENGINE_SAMPLES)
 }
 
+pub(crate) fn owed_events_read() {
+    bump(&OWED_EVENTS_READS);
+}
+pub(crate) fn take_owed_events_reads() -> usize {
+    take(&OWED_EVENTS_READS)
+}
+
 pub(crate) fn watch_visited() {
     bump(&WATCHES_VISITED);
 }
@@ -181,6 +177,68 @@ pub(crate) fn timer_resolved() {
 }
 pub(crate) fn take_timer_resolves() -> usize {
     take(&TIMER_RESOLVES)
+}
+
+// ---------------------------------------------------------------------------
+// The strip's hovers, as pushed
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Each window's tab hovers as its strip was last stamped
+    /// (`App::refresh_window_tabs`): what a native toolbar would show,
+    /// which a headless window has none of. A hover is composed only at a
+    /// push, so a test reads here whether a move stamped the strip again
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3), where
+    /// `App::tab_tooltips`, composed on the call, would always read fresh.
+    static TOOLTIPS_PUSHED: std::cell::RefCell<Vec<(crate::WindowId, Vec<Option<String>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// Strip stamps (`App::refresh_window_tabs`), every window's: one per
+    /// push, so a test can say a move stamped a strip once, not twice.
+    static TOOLTIP_PUSHES: Cell<usize> = const { Cell::new(0) };
+    /// Redraws the hover's restamp asked for (`App::restamp_for_hover`):
+    /// only where the stamp moved the strip's fingerprint.
+    static HOVER_REDRAWS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The strip stamps since the last take.
+pub(crate) fn take_tooltip_pushes() -> usize {
+    take(&TOOLTIP_PUSHES)
+}
+
+/// The hover's restamp asked a window to redraw.
+pub(crate) fn hover_redraw_asked() {
+    bump(&HOVER_REDRAWS);
+}
+
+/// The redraws the hover's restamp asked for since the last take.
+pub(crate) fn take_hover_redraws() -> usize {
+    take(&HOVER_REDRAWS)
+}
+
+/// Window `window`'s strip was stamped with `tooltips`.
+pub(crate) fn tooltips_pushed(window: crate::WindowId, tooltips: &[Option<String>]) {
+    bump(&TOOLTIP_PUSHES);
+    TOOLTIPS_PUSHED.with(|pushed| {
+        let mut pushed = pushed.borrow_mut();
+        match pushed.iter_mut().find(|(wid, _)| *wid == window) {
+            Some((_, tips)) => tooltips.clone_into(tips),
+            None => pushed.push((window, tooltips.to_vec())),
+        }
+    });
+}
+
+/// Window `window`'s tab hovers as its strip was last stamped, if it was.
+pub(crate) fn last_tooltips_pushed(window: crate::WindowId) -> Option<Vec<Option<String>>> {
+    TOOLTIPS_PUSHED.with(|pushed| {
+        pushed
+            .borrow()
+            .iter()
+            .find(|(wid, _)| *wid == window)
+            .map(|(_, tips)| tips.clone())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +396,12 @@ thread_local! {
     static CAPTURE_FORCED_SAMPLES: Cell<usize> = const { Cell::new(0) };
     /// Output→present latency samples booked at every other present.
     static UNFORCED_SAMPLES: Cell<usize> = const { Cell::new(0) };
+    /// Keystroke input→present slices a present booked
+    /// (`metrics::record_present`): this thread's share of `n_input`.
+    static INPUT_SLICES_BOOKED: Cell<usize> = const { Cell::new(0) };
+    /// Of those, the slices a proven prediction closed, before the key's
+    /// echo: this thread's share of `input_predicted`.
+    static INPUT_SLICES_PREDICTED: Cell<usize> = const { Cell::new(0) };
     /// Chip blocks fitted and laid (`App::claude_lights_block`), as against
     /// a pane's block kept from a frame whose fit key was the same.
     static FOOTER_BLOCK_FITS: Cell<usize> = const { Cell::new(0) };
@@ -497,6 +561,19 @@ pub(crate) fn present_sample_booked(capture_forced: bool) {
 /// `(capture-forced, other)` latency samples booked since the last take.
 pub(crate) fn take_present_samples() -> (usize, usize) {
     (take(&CAPTURE_FORCED_SAMPLES), take(&UNFORCED_SAMPLES))
+}
+
+pub(crate) fn input_slices_booked(booked: u32, predicted: u32) {
+    for (counter, n) in [
+        (&INPUT_SLICES_BOOKED, booked),
+        (&INPUT_SLICES_PREDICTED, predicted),
+    ] {
+        counter.with(|c| c.set(c.get() + usize::try_from(n).unwrap_or(usize::MAX)));
+    }
+}
+/// `(booked, of them predicted)` input slices since the last take.
+pub(crate) fn take_input_slices() -> (usize, usize) {
+    (take(&INPUT_SLICES_BOOKED), take(&INPUT_SLICES_PREDICTED))
 }
 
 pub(crate) fn footer_block_fitted() {

@@ -1,18 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Static guards on the Win32 resources `build.rs` links into THE shipped exe.
+//! Static guards on the Win32 resources `build.rs` links into the shipped exe.
 //!
-//! These run on EVERY platform on purpose. The inputs are two committed files
-//! (`assets/aterm.manifest` and aterm-gui's `.ico`), a macOS-only contributor can
-//! break them just as easily as a Windows one, and the failure they guard against
-//! is invisible until someone launches the built binary on Windows and looks at
-//! the title bar.
+//! They run on every platform: the inputs are two committed files (`assets/aterm.manifest`
+//! and aterm-gui's `.ico`), a macOS-only contributor can break them as easily as a Windows
+//! one, and the failure is invisible until someone launches the built binary on Windows.
 //!
-//! What they cannot check: that a resource compiler was actually present and the
-//! `.rsrc` section really landed. That is a property of the built PE, not of the
-//! source tree; `build.rs` covers it with a loud banner plus the opt-in
-//! `ATERM_REQUIRE_WIN_RESOURCES=1` hard failure.
+//! They cannot check that a resource compiler was present and the `.rsrc` section landed:
+//! that is a property of the built PE, which `build.rs` covers with a loud banner and the
+//! opt-in `ATERM_REQUIRE_WIN_RESOURCES=1` hard failure.
 
 use std::path::PathBuf;
 
@@ -25,12 +22,9 @@ fn manifest_text() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
-/// The manifest with every `<!-- … -->` removed.
-///
-/// Needed because the file's own comments discuss the very elements some of these
-/// assertions require to be ABSENT (the `<dpiAware>` explanation, most of all).
-/// Matching on raw text would let a comment satisfy — or falsely fail — a check
-/// about real markup.
+/// The manifest with every `<!-- … -->` removed: the file's own comments discuss elements
+/// some assertions require to be absent (`<dpiAware>` above all), so raw text could satisfy,
+/// or falsely fail, a check about real markup.
 fn manifest_markup() -> String {
     let raw = manifest_text();
     let mut out = String::with_capacity(raw.len());
@@ -39,9 +33,7 @@ fn manifest_markup() -> String {
         out.push_str(&rest[..open]);
         match rest[open..].find("-->") {
             Some(close) => rest = &rest[open + close + 3..],
-            // Unterminated comment: the file is not well-formed XML, and the SxS
-            // parser would reject the whole manifest at load. Say so here rather
-            // than silently swallowing the tail.
+            // Unterminated comment: the SxS parser would reject the whole manifest at load.
             None => panic!("aterm.manifest has an unterminated XML comment"),
         }
     }
@@ -51,8 +43,8 @@ fn manifest_markup() -> String {
 
 /// Common-Controls v6 is the entry with consequences beyond looks: without it the
 /// process binds comctl32 v5, every `MessageBoxW` draws classic grey 3D buttons,
-/// and `TaskDialogIndirect` — the documented follow-up for aterm's close/quit
-/// confirmation — does not exist in the loaded DLL at all.
+/// and `TaskDialogIndirect` (aterm's task-modal confirm) does not exist in the
+/// loaded DLL at all.
 #[test]
 fn manifest_binds_common_controls_v6() {
     let m = manifest_markup();
@@ -120,16 +112,11 @@ fn manifest_requests_as_invoker() {
     );
 }
 
-/// THE TRAP THIS FILE EXISTS FOR.
-///
-/// winit calls `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` itself at
-/// event-loop bring-up. A manifest DPI declaration is applied by the loader, before
-/// any Rust runs, so it wins outright — winit's call then fails with
-/// `ERROR_ACCESS_DENIED` and winit ignores the result *silently*. Adding
-/// `<dpiAware>`/`<dpiAwareness>` here therefore hands ownership of the DPI mode to
-/// a file that nobody would think to check when per-monitor DPI regresses. It is
-/// the single most tempting line to add to a Win32 manifest and the single most
-/// damaging one for this codebase.
+/// winit calls `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` itself at event-loop
+/// bring-up. A manifest DPI declaration is applied by the loader before any Rust runs, so it
+/// wins: winit's call then fails with `ERROR_ACCESS_DENIED`, which winit ignores silently.
+/// A `<dpiAware>`/`<dpiAwareness>` line here would hand the DPI mode to a file nobody checks
+/// when per-monitor DPI regresses.
 #[test]
 fn manifest_leaves_dpi_awareness_to_winit() {
     let m = manifest_markup();

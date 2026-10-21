@@ -508,3 +508,270 @@ fn an_argument_that_holds_an_instant_is_refused_in_tests() {
     });
     assert!(fine.is_ok());
 }
+
+/// A window's host that hears the worker's NEEDS YOU set
+/// ([`crate::supervise::IdleHost::needs_standing`]) and keeps each tell.
+#[derive(Debug, Default)]
+struct Hears {
+    told: std::sync::Mutex<Vec<(Vec<String>, String)>>,
+}
+
+impl crate::supervise::IdleHost for Hears {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<crate::supervise::run::HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn needs_standing(&self, needs: &[String], entry: &str) {
+        self.told
+            .lock()
+            .expect("told")
+            .push((needs.to_vec(), entry.to_string()));
+    }
+}
+
+/// THE NEEDS SET IS A TAPED NOTIFICATION (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §12.2.3, §12.2.6): the taped host tells the window's host the whole set
+/// and the entry's text — and the take-down's `(&[], "")` — and tapes each
+/// as an output at `host.needs_standing`, the set as each need's `Debug`
+/// text in order (the `[T]` and `String` argument forms); a replay of the
+/// same calls answers from the tape alone, equal. NEGATIVE CONTROL: a replay
+/// told another set — one need fewer — diverges at `host.needs_standing`.
+#[test]
+fn needs_standing_is_a_taped_notification() {
+    use astream_effects::EffectRecord;
+
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    let set = vec![
+        "grant Screen Recording to com.aterm.aterm in System Settings ▸ Privacy & Security"
+            .to_string(),
+        "the release credential (~/.aterm/release-credentials.toml) to sign 0.48.0".to_string(),
+    ];
+    let entry = "claude needs you: grant Screen Recording to com.aterm.aterm in System S… (+1 \
+                 more) — carrying on";
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let inner = Arc::new(Hears::default());
+    let host = TapedHost::new(Arc::clone(&inner) as Arc<dyn IdleHost>, tape.fx.clone());
+    IdleHost::needs_standing(&host, &set, entry);
+    IdleHost::needs_standing(&host, &[], "");
+    assert_eq!(
+        *inner.told.lock().expect("told"),
+        [
+            (set.clone(), entry.to_string()),
+            (Vec::new(), String::new())
+        ],
+        "the window's host told each, the set whole"
+    );
+    let read = tape.finish("done");
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+    let told: Vec<(String, String)> = records
+        .iter()
+        .map(|r| match r {
+            EffectRecord::Emit { door, bytes } => {
+                (door.clone(), String::from_utf8_lossy(bytes).into_owned())
+            }
+            other => panic!("a notification is an output: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (
+                "host.needs_standing".to_string(),
+                format!("needs={set:?}\nentry={entry:?}")
+            ),
+            (
+                "host.needs_standing".to_string(),
+                "needs=[]\nentry=\"\"".to_string()
+            ),
+        ]
+    );
+    let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    IdleHost::needs_standing(&replay, &set, entry);
+    IdleHost::needs_standing(&replay, &[], "");
+    assert_eq!(core.left(), 0, "every tell matched on the tape");
+    assert!(core.diverged().is_none());
+
+    // NEGATIVE CONTROL: another set diverges at the door.
+    let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        IdleHost::needs_standing(&replay, &set[..1], entry);
+    }));
+    assert!(told.is_err(), "the replay halts at the divergence");
+    let d = core.diverged().expect("latched");
+    assert_eq!(d.door.as_deref(), Some("host.needs_standing"), "{d:?}");
+}
+
+/// A hold with every field set (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §12.3.3): a hold read at a nudge's yield, its open words two of the
+/// strict reading's own, the repository's counts all non-zero.
+fn a_full_hold() -> crate::harness::acts::LandHeld {
+    use crate::harness::acts::{HoldLeg, LandHeld, OpenWord};
+    LandHeld {
+        since_ms: Some(1_760_000_000_000),
+        nudges: 3,
+        read: true,
+        legs: HoldLeg::ALL.iter().fold(0, |bits, leg| bits | leg.bit()),
+        open: [
+            OpenWord::of("not merged"),
+            OpenWord::of("follow-up"),
+            None,
+            None,
+        ],
+        changed: 1,
+        untracked: 2,
+        stashes: 3,
+        unpushed: 4,
+        unlanded: u16::MAX,
+    }
+}
+
+/// A LAND HOLD IS A TAPE ARGUMENT WITHOUT AN INSTANT (§12.3.6, 3b): its
+/// `Debug` — every field set — passes the request's raw-`Instant` assert,
+/// and prints its open words as the strict reading spelled them, never an
+/// index. NEGATIVE CONTROL: the test's own copy of it with an `Instant`
+/// beside the hold trips that assert.
+#[test]
+fn a_land_hold_is_a_tape_arg_without_an_instant() {
+    let held = a_full_hold();
+    let text = String::from_utf8(request(&[("held", &Some(held))])).expect("utf-8");
+    assert!(!super::super::core::holds_instant(&text), "{text}");
+    assert!(
+        text.starts_with("held=Some(LandHeld { since_ms: Some(1760000000000), nudges: 3,"),
+        "{text}"
+    );
+    assert!(
+        text.contains("open: [Some(\"not merged\"), Some(\"follow-up\"), None, None]"),
+        "{text}"
+    );
+    assert_eq!(
+        request(&[("held", &None::<crate::harness::acts::LandHeld>)]),
+        b"held=None"
+    );
+
+    // NEGATIVE CONTROL: an `Instant` carried beside the hold.
+    #[derive(Debug)]
+    struct HeldAt {
+        #[expect(dead_code, reason = "read through Debug alone")]
+        held: crate::harness::acts::LandHeld,
+        #[expect(dead_code, reason = "read through Debug alone")]
+        at: Instant,
+    }
+    impl TapeArg for HeldAt {}
+    let leaky = HeldAt {
+        held,
+        at: Instant::now(),
+    };
+    let built = std::panic::catch_unwind(|| request(&[("held", &leaky)]));
+    assert!(built.is_err(), "a raw Instant beside the hold is refused");
+}
+
+/// A window's host that hears why Land still holds
+/// ([`crate::supervise::IdleHost::land_held`]) and keeps each tell.
+#[derive(Debug, Default)]
+struct HearsHold {
+    told: std::sync::Mutex<Vec<Option<crate::harness::acts::LandHeld>>>,
+}
+
+impl crate::supervise::IdleHost for HearsHold {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<crate::supervise::run::HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn land_held(&self, held: Option<crate::harness::acts::LandHeld>) {
+        self.told.lock().expect("told").push(held);
+    }
+}
+
+/// THE HOLD IS A TAPED NOTIFICATION (§12.3.3, item 2): the taped host tells
+/// the window's host each hold, and `None`, and tapes each as an output at
+/// `host.land_held`, the hold as its `Debug` text; a replay of the same calls
+/// answers from the tape alone, equal. NEGATIVE CONTROL: a replay told
+/// another hold — one nudge fewer — diverges at `host.land_held`.
+#[test]
+fn land_held_is_a_taped_notification() {
+    use astream_effects::EffectRecord;
+
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    let held = a_full_hold();
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let inner = Arc::new(HearsHold::default());
+    let host = TapedHost::new(Arc::clone(&inner) as Arc<dyn IdleHost>, tape.fx.clone());
+    IdleHost::land_held(&host, Some(held));
+    IdleHost::land_held(&host, None);
+    assert_eq!(
+        *inner.told.lock().expect("told"),
+        [Some(held), None],
+        "the window's host told each"
+    );
+    let read = tape.finish("done");
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+    let told: Vec<(String, String)> = records
+        .iter()
+        .map(|r| match r {
+            EffectRecord::Emit { door, bytes } => {
+                (door.clone(), String::from_utf8_lossy(bytes).into_owned())
+            }
+            other => panic!("a notification is an output: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (
+                "host.land_held".to_string(),
+                format!("held={:?}", Some(held))
+            ),
+            ("host.land_held".to_string(), "held=None".to_string()),
+        ]
+    );
+    let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    IdleHost::land_held(&replay, Some(held));
+    IdleHost::land_held(&replay, None);
+    assert_eq!(core.left(), 0, "every tell matched on the tape");
+    assert!(core.diverged().is_none());
+
+    // NEGATIVE CONTROL: another hold diverges at the door.
+    let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let other = crate::harness::acts::LandHeld {
+        nudges: held.nudges - 1,
+        ..held
+    };
+    let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        IdleHost::land_held(&replay, Some(other));
+    }));
+    assert!(told.is_err(), "the replay halts at the divergence");
+    let d = core.diverged().expect("latched");
+    assert_eq!(d.door.as_deref(), Some("host.land_held"), "{d:?}");
+}

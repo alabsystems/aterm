@@ -40,7 +40,7 @@
 //! * **No `procmacros` attributes** (`function`, `all_functions`, `skip`), and
 //!   `default` is empty rather than `["procmacros"]`. Nothing in the graph uses
 //!   them; the day something does, it fails to resolve at compile time. Fix with
-//!   a pass-through proc-macro crate (precedent: `crates/aterm-tracing-attributes`, deleted at A11Y.6 once unused)
+//!   a pass-through proc-macro crate
 //!   or by dropping the patch row.
 //! * **`profile-with-*` and `type-check` are accepted and ignored.** To get real
 //!   profiler output, drop the `profiling` row from the root

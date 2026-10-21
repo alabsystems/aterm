@@ -106,27 +106,31 @@ fn a_copy_at_another_version_is_not_the_pin() {
     );
 }
 
-/// The refusal names the provider's one command, never a hand install: the pinned fish is
-/// `verify provision`'s, which `aterm init --develop` runs.
+/// The refusal names the provider's one command, never a hand install, and never a command
+/// that does not exist: the pinned fish and pwsh have no provisioning verb until S7 (#89), so
+/// their refusals lead with the variable that finds a copy and say where the official build
+/// comes from.
 #[test]
 fn the_refusal_names_its_provider() {
     let fish = tool("fish").refusal();
     assert!(
-        fish.starts_with("no fish here: `targo --unverified verify provision` builds the pinned ")
-            && fish.contains("(`aterm init --develop` runs it)")
-            && fish.contains("ATERM_TEST_FISH=<path>"),
+        fish.starts_with("no fish here: ATERM_TEST_FISH=<path> names one; ")
+            && fish.contains("github.com/fish-shell/fish-shell/releases"),
         "{fish}"
     );
     let pwsh = tool("pwsh").refusal();
     assert!(
-        pwsh.contains("verify provision` fetches the pinned "),
+        pwsh.starts_with("no pwsh here: ATERM_TEST_PWSH=<path> names one; ")
+            && pwsh.contains("github.com/PowerShell/PowerShell/releases"),
         "{pwsh}"
     );
+    for refusal in [&fish, &pwsh] {
+        assert!(
+            !refusal.contains("verify provision") && !refusal.contains("init --develop"),
+            "no command that does not exist yet: {refusal}"
+        );
+    }
     let bindgen = tool("wasm-bindgen").refusal();
-    assert!(
-        bindgen.contains("verify provision --record`") && !bindgen.contains("init --develop"),
-        "a --record row is not init's: {bindgen}"
-    );
     let vim = tool("vim").refusal();
     assert!(
         vim.contains("operating system, and no command adds it"),
@@ -239,10 +243,12 @@ fn a_missing_tool_ends_could_not_run_naming_its_provider() {
 fn a_tools_variable_is_its_upper_snake_name() {
     assert_eq!(tool("fish").var(), "ATERM_TEST_FISH");
     assert_eq!(tool("wasm-opt").var(), "ATERM_TEST_WASM_OPT");
-    assert_eq!(tool("fish").needs_label(), "fish (verify provision)");
+    assert_eq!(tool("fish").needs_label(), "fish (upstream)");
+    assert_eq!(tool("limactl").needs_label(), "limactl (upstream)");
+    // A pinned tool a command of this tree already fetches names that command.
     assert_eq!(
-        tool("limactl").needs_label(),
-        "limactl (verify provision --linux)"
+        tool("firefox").needs_label(),
+        "firefox (verify fetch-browser)"
     );
     assert_eq!(tool("zsh").needs_label(), "zsh (OS)");
 }

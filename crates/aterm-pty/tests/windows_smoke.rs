@@ -274,7 +274,7 @@ fn bogus_exec_command_fails_closed_no_session() {
 
 // PATHEXT end-to-end: a bare `.cmd` shim name (the npm/yarn shape) must
 // resolve via the resolver's PATHEXT retry and launch through CreateProcessW
-// by its resolved full path — before the fix this spawn failed NotFound.
+// by its resolved full path.
 // Hermetic: probes a stock System32 `.cmd` (SearchPathW always searches
 // System32); a trimmed SKU without it cannot run the test (COULD NOT RUN).
 #[test]

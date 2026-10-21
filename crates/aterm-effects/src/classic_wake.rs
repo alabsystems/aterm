@@ -246,8 +246,9 @@ impl ClassicWake {
     /// The rows the live sparks span, `(first, last)`, for the host's read
     /// of the frame's text ([`CursorGlow::observe_frame_text`]).
     pub(crate) fn row_range(&self) -> Option<(u16, u16)> {
-        let rows = self.sparks.iter().map(|s| s.row);
-        rows.clone().min().zip(rows.max())
+        let mut iter = self.sparks.iter().map(|s| s.row);
+        let first = iter.next()?;
+        Some(iter.fold((first, first), |(lo, hi), r| (lo.min(r), hi.max(r))))
     }
 
     /// The landing ring's cell, for the host-seam tests.
@@ -338,7 +339,9 @@ impl ClassicWake {
 
         // Cool the typing heat lazily (correct across arbitrary idle gaps, and
         // free while the animator is disarmed).
-        if let Some(t0) = self.heat_at {
+        if let Some(t0) = self.heat_at
+            && self.heat > 0.0
+        {
             let dt = now.saturating_duration_since(t0).as_secs_f32();
             if dt > 0.0 {
                 self.heat *= (-dt / Self::HEAT_DECAY_TAU).exp();
@@ -907,10 +910,11 @@ impl ClassicWake {
                     let (ax, ay, bx, by) = (first.x, first.y, last.x, last.y);
                     let (dx, dy) = (bx - ax, by - ay);
                     let len2 = dx * dx + dy * dy;
+                    let across_rows = ay != by && len2 > 0.0;
                     for s in run {
                         let mut v = ink(s);
                         // A jump across rows: on the straight move.
-                        if ay != by && len2 > 0.0 {
+                        if across_rows {
                             let t = (((s.x - ax) * dx + (s.y - ay) * dy) / len2).clamp(0.0, 1.0);
                             v.x = ax + dx * t;
                             v.y = ay + dy * t + drop;

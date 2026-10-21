@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Phase 0.5 — the engine-neutral [`InputEvent`] vocabulary and the [`Source`]
-//! audit tag for the [`App::input`](crate::App::input) convergence seam
-//! (design Addendum A.2, `docs/design/HIERARCHICAL_SESSIONS.md`).
+//! The engine-neutral [`InputEvent`] vocabulary and the [`Source`] audit tag for the
+//! [`App::input`](crate::App::input) convergence seam (design Addendum A.2,
+//! `docs/design/HIERARCHICAL_SESSIONS.md`).
 //!
 //! BEFORE the seam (2026-06-16), human input (the winit `on_key`/`on_mouse_*`/
 //! `on_cursor_moved`/`on_resize`/`on_focus` handlers) and controller input (the
@@ -15,48 +15,19 @@
 //! selection result, dropped events when tracking was off, and never snapped/
 //! cleared/reset-blink.
 //!
-//! This module is the FRONTEND-ONLY data layer: an `InputEvent` is plain data
-//! plus engine *types* (`Key`, `Modifiers`, `MouseButton`, `SelectionSide`,
-//! `SelectionType`) — no fs, no socket, no winit. Both sources BUILD an
-//! `InputEvent` and feed it to the ONE policy site `App::input(ev, src)`, which
-//! is the sole reader of `keyboard_mode()`/`mouse_tracking_enabled()` and the
-//! sole caller of the encoders / `scroll_display` / `reset_blink` /
-//! `apply_term_resize`, and of the press-path viewport snap + selection clear
-//! (`app_input::apply_press_custody`, inlined into the seam's one term-lock
-//! scope).
+//! `snap_to_bottom` is not seam-exclusive: the paste and echo arms that never reach the seam
+//! snap for themselves (`app_input::input_paste`, `dispatch_action`'s `Action::Paste`, the ⌘-V
+//! and IME-composition arms of `on_key`, `on_ime_commit`'s paste arm). A press that writes no
+//! PTY bytes may not take the user's reading position. The predictive-echo gate reads
+//! `Terminal::kitty_suppresses_predictive_echo()`, a display-only projection that never feeds an
+//! encoder. The seam ends at the `SinkWriter` ([`EgressMode`]): whole frames in byte order, and
+//! the UI thread never parks on a wedged foreground's full tty input buffer.
 //!
-//! Two corrections to what this paragraph used to claim. There is no
-//! `fn clear_selection` anywhere in the workspace — the clear is
-//! `text_selection_mut().clear()` under the seam's own lock. And `snap_to_bottom`
-//! is NOT seam-exclusive: after SELECTION CUSTODY its callers outside the seam
-//! are exactly the PASTE-or-ECHO arms, which never reach the seam and so must
-//! snap for themselves —
-//!
-//!   * `app_input::input_paste` and `dispatch_action`'s `Action::Paste`
-//!   * the hardcoded ⌘-V arm of `on_key`
-//!   * the IME-composition arm of `on_key` (a composing key IS typing; the
-//!     preedit paints at the cursor, so a scrolled-back composer would type
-//!     off-screen)
-//!
-//! …plus `app_mouse::select_all`. Every OTHER caller was deleted: a press that
-//! writes no bytes to the PTY expresses no typing intent and may not take the
-//! user's reading position (SELECTION CUSTODY R1). (The predictive-echo
-//! gate additionally reads the NARROW
-//! `Terminal::kitty_suppresses_predictive_echo()` projection of the mode — a
-//! read-only DISPLAY gate deciding whether a local guess may paint; it never
-//! feeds an encoder, so the seam remains the sole byte-producing mode reader.)
-//! The seam ends at the
-//! existing 0e `SinkWriter` (`sink.write_frame_nonparking` — same byte order and
-//! whole-frame atomicity, but the UI thread never parks on a wedged foreground's
-//! full tty input buffer).
-//!
-//! `Source` is AUDIT-ONLY: the seam MUST NEVER branch behaviour on it (the
-//! indistinguishability invariant). The byte-producing core [`seam_egress_receipt`]
-//! takes NO `Source` — it is STRUCTURALLY impossible for it to branch — and the
-//! gesture-state arms of `App::input` read ONLY data carried on the event (never
-//! `self.mods`). The Tier-1 tests prove convergence two ways: the two REAL
-//! builders (`build_key_input`/`cmd_*` parse) produce structurally-EQUAL events
-//! for the same intent, and those events produce byte-identical sink output.
+//! `Source` is audit-only: the seam never branches behaviour on it (the indistinguishability
+//! invariant). The byte-producing core [`seam_egress_receipt`] takes no `Source`, and the
+//! gesture-state arms of `App::input` read only data carried on the event (never `self.mods`).
+//! The Tier-1 tests prove convergence: the human builders and the control-verb parsers produce
+//! equal events for the same intent, and those events produce byte-identical sink output.
 
 use std::sync::Mutex;
 
@@ -69,32 +40,28 @@ use aterm_types::mouse::MouseButton;
 use crate::term_lock;
 
 /// One logical input event, engine-neutral. Built identically by a winit handler
-/// (`Source::Human`) and by a control verb (`Source::Controller`); the seam turns
-/// it into PTY bytes / viewport side-effects the SAME way for both.
+/// (`Source::Human`) and by a control verb (`Source::Controller`); the seam turns it into PTY
+/// bytes and viewport side effects the same way for both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InputEvent {
-    /// A key chord. `base_layout` is the US-QWERTY equivalent of the physical key,
-    /// fed to `encode_key_with_text` so Kitty `REPORT_ALTERNATE_KEYS` carries the
-    /// 3rd CSI-u field identically for both sources (kills divergences f/h).
+    /// A key chord. `base_layout` is the US-QWERTY equivalent of the physical key, fed to
+    /// `encode_key_with_text` so Kitty `REPORT_ALTERNATE_KEYS` carries the third CSI-u field
+    /// identically for both sources.
     Key {
         key: Key,
         mods: Modifiers,
         base_layout: Option<char>,
-        /// The character the ACTIVE LAYOUT typed for a text press, when it is not
-        /// what the engine derives from `key` (the layout's UNSHIFTED key) on its
-        /// own: German Shift+2's `"`, Caps Lock's `A`
-        /// (`keymap::layout_text` builds it from winit's composed text). Fed
-        /// to `encode_key_with_text`, which writes it for a text press and keeps
-        /// `key` for kitty key codes and every Ctrl/Alt chord. `None` from a
-        /// controller (`key`/`ctrl` verbs name no layout) and whenever the US
-        /// derivation already agrees, so the two sources still build EQUAL
-        /// events for the same intent on a US layout.
+        /// The character the active layout typed for a text press, when it is not what the
+        /// engine derives from `key` (the layout's unshifted key) on its own: German Shift+2's
+        /// `"`, Caps Lock's `A` (`keymap::layout_text` builds it from winit's composed text).
+        /// `encode_key_with_text` writes it for a text press and keeps `key` for kitty key codes
+        /// and every Ctrl/Alt chord. `None` from a controller and whenever the US derivation
+        /// agrees, so both sources build equal events for the same intent on a US layout.
         layout_text: Option<char>,
-        /// Press / Repeat / Release. The human winit path only ever builds
-        /// `Press` (releases are dropped at `on_key`); the `key` verb can request
-        /// any via `type=press|repeat|release`, so a controller can drive the
-        /// Kitty keyboard protocol's event-type CSI-u sub-field (`:1`/`:2`/`:3`)
-        /// that a real key-up/repeat produces. Encoded ONCE by `seam_egress`.
+        /// Press / Repeat / Release. The human path builds `Press`, and `Release` for a key-up
+        /// (encoded only under Kitty event-type reporting); the `key` verb's
+        /// `type=press|repeat|release` lets a controller drive the Kitty event-type CSI-u
+        /// sub-field (`:1`/`:2`/`:3`). Encoded once by `seam_egress`.
         event_type: aterm_types::keyboard::KeyEventType,
     },
     /// Literal text to type: the `on_key` bare-`ev.text` fallback and the IME
@@ -103,17 +70,14 @@ pub(crate) enum InputEvent {
     /// one C0 or DEL character alone is a key and stays here). Each char is
     /// encoded as a `Character` key under the current keyboard mode.
     Text(String),
-    /// Raw bytes from an aterm `[key_sequences]` INPUT-POLICY rule: written to the
-    /// PTY VERBATIM (never re-encoded), so a chord the user mapped sends exactly the
-    /// bytes they chose regardless of the keyboard mode. Built only by the human
-    /// `on_key` path today.
+    /// Raw bytes written to the PTY verbatim, never re-encoded: an aterm `[key_sequences]` rule
+    /// (a mapped chord sends exactly the bytes the user chose, whatever the keyboard mode), the
+    /// `send`/`feed` verbs' bytes, bytes aterm types itself (a report, the Claude Code lights'
+    /// Shift+Tab), or the ordered writer's copy of bytes the seam encoded.
     KeySequence(Vec<u8>),
-    /// A mouse button press/release at a grid cell. `mods` is the real modifier
-    /// mask (kills a), `click_count` is the authoritative 1..=3 multi-click depth
-    /// (kills b), `side` is the cell-half for selection boundaries (kills i), and
-    /// `block` is the selection-TYPE intent for a single-click press (kills the
-    /// ambient-state read: a controller can drive block-select, a human's held
-    /// Alt is captured at build time and never leaks past the event).
+    /// A mouse button press/release at a grid cell. `mods` is the real modifier mask,
+    /// `click_count` the authoritative 1..=3 multi-click depth, `side` the cell-half for
+    /// selection boundaries, and `block` the selection-type intent for a single-click press.
     MouseButton {
         button: MouseButton,
         pressed: bool,
@@ -122,10 +86,9 @@ pub(crate) enum InputEvent {
         mods: u8,
         click_count: u8,
         side: SelectionSide,
-        /// Single-click press starts a `Block` (rectangular) selection rather
-        /// than `Simple`. Human: `self.mods.alt_key()` snapshotted at build time.
-        /// Controller: the `block=…` token (default `false`). Read ONLY here, as
-        /// DATA — the seam never re-reads ambient modifier state for the type.
+        /// Single-click press starts a `Block` (rectangular) selection rather than `Simple`.
+        /// Human: `self.mods.alt_key()` snapshotted at build time; controller: the `block=…`
+        /// token (default `false`). Read only as data on the event.
         block: bool,
         /// When `true`, a completed drag-select settled by THIS event's release
         /// must NOT auto-copy to the system clipboard / X11 PRIMARY — the
@@ -140,16 +103,14 @@ pub(crate) enum InputEvent {
         /// `seam_egress` ignores it entirely, so the human/controller byte-equality
         /// invariant is untouched.
         suppress_copy_on_select: bool,
-        /// Sub-cell pixel offset INSIDE the (`row`,`col`) cell, for DEC 1016
-        /// SGR-pixel mouse mode (the genuine winit cursor x/y minus the cell
-        /// origin). The seam combines it with the cell origin + the engine's
-        /// cell pixel size to emit a true pixel coordinate ONLY when 1016 is
-        /// active; the cell-coordinate encodings (X10/SGR/urxvt/utf8) ignore it.
-        /// Human: the real pointer offset. Controller: `(0, 0)` (cell origin).
+        /// Sub-cell pixel offset inside the (`row`,`col`) cell, for DEC 1016 SGR-pixel mode
+        /// (the winit cursor x/y minus the cell origin). The seam adds the cell origin and the
+        /// engine's cell pixel size only when 1016 is active; cell encodings ignore it. Human:
+        /// the real offset; controller: `(0, 0)`.
         px_off: PixelOffset,
     },
-    /// Pointer motion. `buttons == 3` is a no-button hover (motion report code 3);
-    /// `buttons != 3` is a held-button drag (kills c). `side` is the cell-half.
+    /// Pointer motion. `buttons == 3` is a no-button hover (motion report code 3), anything
+    /// else a held-button drag. `side` is the cell-half.
     MouseMove {
         buttons: u8,
         row: u16,
@@ -166,14 +127,9 @@ pub(crate) enum InputEvent {
     /// seam so a non-positive count can never produce a silent human/controller
     /// asymmetry.
     ///
-    /// `dir` is the FOUR-way axis (audit I7), not the old `dir_up: bool`. The
-    /// bool could not express a tilt wheel or a horizontal trackpad swipe at
-    /// all, so `on_mouse_wheel` dropped those gestures at the door and no app
-    /// ever saw xterm's buttons 66/67 — on Windows OR macOS. The horizontal
-    /// half is REPORT-ONLY: aterm's own viewport has no horizontal axis, so the
-    /// seam turns a horizontal wheel into zero local motion (see the `Wheel`
-    /// arm of `seam_egress`), which keeps the tracking-OFF behaviour exactly
-    /// what the old early-return produced.
+    /// `dir` is four-way, so a tilt wheel or horizontal swipe reaches an app as xterm's buttons
+    /// 66/67. The horizontal half is report-only: aterm's viewport has no horizontal axis, so
+    /// with tracking off a horizontal wheel moves nothing (the `Wheel` arm of `seam_egress`).
     Wheel {
         dir: aterm_types::mouse::WheelDir,
         lines: i32,
@@ -198,62 +154,43 @@ pub(crate) enum InputEvent {
     /// Paste text as if typed, framed per [`PasteFraming`] (bracketed when the
     /// app enabled DECSET 2004, unless the gesture already captured that answer).
     Paste(String, PasteFraming),
-    /// A geometry change. Re-clamped against `MAX_GRID_*` in the seam.
+    /// A geometry change, re-clamped against `MAX_GRID_*` in the seam.
     ///
-    /// `echo_to_window` is a TRANSPORT flag (NOT a `Source` branch): the control
-    /// `resize` verb sets it `true` so the seam also asks the window to match the
-    /// new grid pixel size (RES-1 — the verb has no window event of its own); the
-    /// winit `Resized` handler sets it `false` because the window ALREADY has the
-    /// new size and re-`request_inner_size`-ing it would fight an interactive
-    /// edge-drag (the RES-1 regression). It is keyed on WHERE the geometry came
-    /// from, identical for a human-issued vs controller-issued `resize` verb.
+    /// `echo_to_window` is a transport flag, not a `Source` branch: the control `resize` verb
+    /// sets it so the seam also asks the window to match the new grid's pixel size (the verb has
+    /// no window event of its own); the winit `Resized` handler clears it, since the window
+    /// already has that size and re-requesting it would fight an interactive edge drag.
     Resize {
         rows: u16,
         cols: u16,
         echo_to_window: bool,
     },
-    /// A WINDOW-PIXEL geometry change: ask the OS window for this inner size and
-    /// let the grid follow from the `Resized` event the platform delivers, exactly
-    /// as an edge drag does.
+    /// A window-pixel geometry change: ask the OS window for this inner size and let the grid
+    /// follow from the `Resized` event the platform delivers, as an edge drag does.
     ///
-    /// THIS IS NOT `Resize` WITH DIFFERENT UNITS, and the difference is the whole
-    /// point. `Resize` applies the grid FIRST and then echoes the matching pixel
-    /// size to the window, so by the time the window event arrives the columns
-    /// already agree — which means it can never traverse the live-drag path:
-    /// `on_resize_throttled` sees no column change, takes the row-only branch, and
-    /// the width throttle, its coalescing, and its trailing settle are all
-    /// unreachable from the control surface. Every socket-driven resize was
-    /// therefore testing the one arm a drag does not use, and the drag arms could
-    /// only be exercised by a hand on the window edge.
-    ///
-    /// This variant inverts that order: nothing is pre-applied, so the grid is
-    /// derived from the window event by the same code a human's drag runs. Fire a
-    /// few of these in a row and the event loop sees the back-to-back bounds
-    /// changes that make a drag a drag. The residual difference from a hand drag is
-    /// that AppKit is not in its event-tracking run-loop mode; everything inside
-    /// aterm is the same path.
+    /// Not `Resize` in other units: `Resize` applies the grid first and then echoes the pixel
+    /// size, so its window event finds the columns already agreeing and takes
+    /// `on_resize_throttled`'s row-only branch, never the width throttle, its coalescing or its
+    /// trailing settle. Here nothing is pre-applied, so the grid comes from the window event by
+    /// the code a drag runs, and a few in a row look like a drag to the event loop. The one
+    /// difference from a hand drag: AppKit is not in its event-tracking run-loop mode.
     ResizeWindowPx { width: u32, height: u32 },
-    /// Focus gained/lost — DEC 1004 focus reporting (kills j). `true` = focus-in.
+    /// Focus gained/lost, for DEC 1004 focus reporting. `true` = focus-in.
     Focus(bool),
 }
 
 impl InputEvent {
-    /// This event with a KEYPAD key folded onto its main-block twin
-    /// (`Key::main_block_twin`): `Numpad5` -> `Character('5')`, `NumpadEnter`
-    /// -> `Enter`, `NumpadEnd` -> `End`. `None` when there is nothing to fold —
-    /// a main-block key, a non-key event, or `NumpadBegin`, which has no twin.
+    /// This event with a keypad key folded onto its main-block twin (`Key::main_block_twin`):
+    /// `Numpad5` -> `Character('5')`, `NumpadEnter` -> `Enter`, `NumpadEnd` -> `End`. `None`
+    /// when there is nothing to fold: a main-block key, a non-key event, or `NumpadBegin`.
     ///
-    /// For the consumers that read the engine key for its MEANING rather than
-    /// its bytes: the native pages (`App::native_input_event`) and the seam's
-    /// press classifier (`classify_press` / `is_plain_enter`). The PTY encoder
-    /// never sees the folded event — the keypad identity
-    /// `keymap::build_key_input` resolves is exactly what DECKPAM's SS3 forms
-    /// and kitty disambiguate exist to report.
+    /// For consumers that read the key for its meaning, not its bytes: the native pages
+    /// (`App::native_input_event`) and the seam's press classifier (`classify_press` /
+    /// `is_plain_enter`). The PTY encoder never sees the folded event: the keypad identity is
+    /// what DECKPAM's SS3 forms and kitty disambiguate report.
     ///
-    /// A keypad glyph's twin carries itself as its `layout_text`: Shift picks
-    /// a keypad level and never composes, so Shift+KP_5 types the '5' the
-    /// encoder writes for it. Left to [`typed_glyph`], the main row's Shift
-    /// table made it '%' — in a native text field and in the predicted echo.
+    /// A keypad glyph's twin carries itself as its `layout_text`: Shift picks a keypad level and
+    /// never composes, so Shift+KP_5 types '5', not the main row's '%'.
     pub(crate) fn keypad_folded(&self) -> Option<InputEvent> {
         let InputEvent::Key {
             key,
@@ -280,29 +217,21 @@ impl InputEvent {
     }
 }
 
-/// The character a TEXT press of base key `c` types: the layout's own when the
-/// window carried it (`InputEvent::Key::layout_text`), else the engine's US
-/// derivation (Shift's table, Caps Lock's capital) — exactly the glyph the
-/// encoder writes for it, so a reader of the press's MEANING (the press
-/// classifier's predicted echo, a native page's text field) types what the
-/// terminal would have.
+/// The character a text press of base key `c` types: the layout's own when the window carried
+/// it (`InputEvent::Key::layout_text`), else the engine's US derivation (Shift's table, Caps
+/// Lock's capital), the glyph the encoder writes for it.
 #[must_use]
 pub(crate) fn typed_glyph(c: char, mods: Modifiers, layout_text: Option<char>) -> char {
     layout_text.unwrap_or_else(|| aterm_types::keyboard::typed_character(c, mods))
 }
 
-/// Sub-cell pixel offset of the pointer INSIDE its grid cell, carried on every
-/// mouse event so the seam can produce a genuine PIXEL coordinate for DEC 1016
-/// (SGR-pixel) mouse mode without re-reading any winit/GUI state.
+/// Sub-cell pixel offset of the pointer inside its grid cell, carried on every mouse event so the
+/// seam can produce a pixel coordinate for DEC 1016 (SGR-pixel) mode without reading winit state.
 ///
-/// `x`/`y` are the device-pixel distance from the cell's top-left corner; combined
-/// with the cell origin (`col * cell_w`, `row * cell_h`) and the engine's reported
-/// cell pixel size, the seam reconstructs the exact winit cursor pixel. They are
-/// IGNORED by every cell-coordinate encoding (X10/SGR/urxvt/utf8) — only the 1016
-/// encoder consults them — so a non-pixel session's bytes are unaffected. The Human
-/// path fills the real `(x - pad) % cell_w` / per-cell `y`; a Controller (which has
-/// no real pointer) sends [`PixelOffset::CELL_ORIGIN`] (`0, 0`), i.e. the cell's
-/// top-left, so a controller-driven 1016 press still lands on the right cell.
+/// `x`/`y` are device pixels from the cell's top-left corner; with the cell origin and the
+/// engine's cell pixel size the seam reconstructs the cursor pixel. Only the 1016 encoder reads
+/// them. A controller sends [`PixelOffset::CELL_ORIGIN`], so its 1016 press still lands on the
+/// right cell.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PixelOffset {
     /// Horizontal device pixels from the cell's left edge (`0..cell_w`).
@@ -312,26 +241,18 @@ pub(crate) struct PixelOffset {
 }
 
 impl PixelOffset {
-    /// The cell's top-left corner — the offset a Controller (no real pointer)
-    /// uses, so a 1016 report it drives is exactly the cell origin in pixels.
+    /// The cell's top-left corner: the offset a controller (no real pointer) uses.
     pub(crate) const CELL_ORIGIN: Self = Self { x: 0, y: 0 };
 }
 
-/// WHEN the bracketed-paste (DEC 2004) question is answered for one
-/// [`InputEvent::Paste`] — carried ON the event, because the gesture that starts
-/// a paste and the write that lands it are separated by a queue.
+/// When the bracketed-paste (DEC 2004) question is answered for one [`InputEvent::Paste`],
+/// carried on the event because a queue separates the gesture from the write.
 ///
-/// A paste does not egress where it is made: `App::input_paste` enqueues it on the
-/// per-session ordered writer and `seam_egress` produces the bytes later, on that
-/// writer's thread. A program on the other end of the PTY can flip DEC 2004 inside
-/// that window, so "read the mode when the bytes are produced" and "read the mode
-/// when the person made the gesture" are genuinely different answers — and the
-/// multi-line paste confirmation asks its question using the SECOND one. Framing by
-/// the first let the guard and the wire disagree about the same paste in both
-/// directions: a body confirmed as unbracketed arriving bracketed, and (the
-/// dangerous way round) a body judged inert BECAUSE bracketed paste was on arriving
-/// unbracketed at a bare prompt, submitting every line without ever being asked
-/// about.
+/// `App::input_paste` enqueues a paste on the per-session ordered writer, and `seam_egress`
+/// produces its bytes later on that writer's thread; the program can flip DEC 2004 in between.
+/// The multi-line paste confirmation judges by the mode at the gesture, so framing by the mode
+/// at the write could let a body judged inert because bracketed paste was on arrive unbracketed
+/// at a bare prompt and submit every line unasked.
 ///
 /// This is DATA on the event, never a [`Source`] branch: `seam_egress` reads the
 /// same field for a human paste and a controller one, so identical events still
@@ -339,20 +260,18 @@ impl PixelOffset {
 /// untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PasteFraming {
-    /// Read DEC 2004 when the bytes are produced. Nothing was promised about this
-    /// paste: the `paste`/`paste-bin` control verbs (no gesture, no confirmation —
-    /// their documented contract is the terminal's mode at write time) and the
-    /// file drop, which never consults the mode at all.
+    /// Read DEC 2004 when the bytes are produced: the `paste`/`paste-bin` verbs (no gesture, no
+    /// confirmation; their contract is the mode at write time) and the file drop, which never
+    /// consults the mode.
     AtDrain,
-    /// Frame by `bracketed` no matter what the mode says at drain time: the answer
-    /// observed when a person's paste gesture was JUDGED — the same read the
-    /// pastejacking guard decided by, so what they were told is what is sent.
+    /// Frame by `bracketed` whatever the mode says at drain time: the answer read when a
+    /// person's paste gesture was judged, the read the pastejacking guard decided by.
     Gesture { bracketed: bool },
 }
 
 impl PasteFraming {
-    /// The framing decision for a paste being written now, given the terminal's
-    /// LIVE DEC 2004 state. The one place the two answers are reconciled.
+    /// The framing for a paste being written now, given the terminal's live DEC 2004 state: the
+    /// one place the two answers are reconciled.
     #[must_use]
     pub(crate) fn bracketed(self, live: bool) -> bool {
         match self {
@@ -375,35 +294,23 @@ pub(crate) enum ScrollIntent {
     Top,
     /// Jump to the live bottom.
     Bottom,
-    /// Jump the viewport to the previous (older) shell PROMPT — the nearest
-    /// recorded OSC-133 prompt row above the current top visible row (see
-    /// [`jump_prompt_target`] for which rows count as prompts). A no-op when
-    /// shell integration recorded no older prompt.
+    /// Jump the viewport to the previous (older) recorded OSC 133 prompt row above the current
+    /// top visible row (see [`jump_prompt_target`]); a no-op when there is none.
     PrevPrompt,
-    /// Jump the viewport to the next (newer) shell prompt — the nearest
-    /// recorded prompt row below the current top visible row. A no-op when
-    /// there is none.
+    /// Jump the viewport to the next (newer) recorded prompt row below the current top visible
+    /// row; a no-op when there is none.
     NextPrompt,
 }
 
-/// Resolve the target absolute row for a prompt-to-prompt jump: the nearest
-/// recorded PROMPT row strictly ABOVE (`prev = true`) or BELOW (`prev = false`)
-/// the current top visible row. `None` when no prompt lies in that direction
-/// (an edge, or a bare shell with no integration marks). The single source of
-/// truth shared by the seam's `ScrollView` handler and the control-socket
-/// `scroll` verb so their prompt-jump semantics can't drift.
+/// The target absolute row for a prompt-to-prompt jump: the nearest recorded prompt row strictly
+/// above (`prev`) or below the current top visible row, or `None` when there is none. Shared by
+/// the seam's `ScrollView` handler and the `scroll` verb so the two cannot drift.
 ///
-/// Prompt rows come from BOTH indexes, deliberately. `command_marks()` is
-/// populated only by `shell_command_finished` — i.e. only by OSC 133;**D** — so
-/// on its own it indexes COMPLETED COMMANDS, not prompts. That is the wrong
-/// index for a feature whose name and behaviour are "jump to the prompt": a
-/// shell that can mark where its prompt is but cannot mark when a command
-/// starts EXECUTING (cmd.exe has no hook between Enter and the command running,
-/// so it emits A/B and no C/D) records prompts the engine can see and this
-/// reducer could not. `all_blocks()` carries `prompt_start_row` from the instant
-/// A arrives, including the in-progress block. For a fully-marked shell the two
-/// sets agree row-for-row and the union changes nothing — verified by the
-/// bash/zsh/fish/pwsh/wsl path landing on identical targets.
+/// Prompt rows come from both indexes. `command_marks()` is filled only by OSC 133;D
+/// (`shell_command_finished`), so alone it indexes finished commands, not prompts: cmd.exe has
+/// no hook between Enter and the command running and emits A/B with no C/D. `all_blocks()`
+/// carries `prompt_start_row` from the instant A arrives, the in-progress block included. For a
+/// fully-marked shell the two agree row for row.
 pub(crate) fn jump_prompt_target(t: &Terminal, prev: bool) -> Option<u64> {
     let top = t.grid().top_visible_absolute_row();
     let rows = t
@@ -418,26 +325,20 @@ pub(crate) fn jump_prompt_target(t: &Terminal, prev: bool) -> Option<u64> {
     }
 }
 
-/// WHO produced an [`InputEvent`]. ATTRIBUTION-ONLY — the seam MUST NOT branch on
-/// this for a byte (the Tier-1 indistinguishability invariant). Its one reader is
-/// who-typed bookkeeping after the egress: a `Human` press, text, paste, click,
-/// drag, wheel or view scroll stamps the session's `human_ms=`
-/// (`app_input::note_person`), which the
-/// automatic supervisor reads to keep its hands off a person. `Copy`, so the
-/// `Wake::Input` drain loop can pass it by value into every event.
-///
-/// The session-owner connection maps to `Controller` too (an owner is still a
-/// controller, never `Human`): `Human` is built ONLY by the in-thread winit
-/// handlers.
+/// Who produced an [`InputEvent`]. Attribution only: the seam never branches on it for a byte
+/// (the Tier-1 indistinguishability invariant). Its one reader is who-typed bookkeeping after
+/// the egress: a `Human` press, text, paste, click, drag, wheel or view scroll stamps the
+/// session's `human_ms=` (`app_input::note_person`), which the supervisor reads to keep its
+/// hands off a person. Only the in-thread winit handlers build `Human`; the session owner's
+/// connection is a `Controller`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Source {
     /// An in-thread winit handler (real keyboard/mouse/focus on this window).
     Human,
-    /// A control-socket verb — or an input aterm sends ON ITS OWN after a
-    /// person's gesture: the Claude Code lights' follow-up keys (a mode
-    /// return's next shift+tab, `crate::claude_lights`). No person made those at that instant, and
-    /// stamping them would hold the supervisor off the session for its whole
-    /// person grace after every automatic step.
+    /// A control-socket verb, or input aterm sends on its own after a person's gesture (the
+    /// Claude Code lights' follow-up keys, `crate::claude_lights`). No person made those at that
+    /// instant, and stamping them would hold the supervisor off the session for its person
+    /// grace after every automatic step.
     Controller,
 }
 
@@ -449,10 +350,8 @@ pub(crate) enum InputOutcome {
     Ok,
     /// A `Resize` fell outside `1..=MAX_GRID_*` and was not applied.
     RangeRejected,
-    /// The encoded bytes were NOT (fully) written to the PTY — a short write (peer
-    /// closed mid-frame), full ordered-input queue or a hard error (the input seam must not
-    /// report OK for bytes that did not land; it is the reply-fidelity contract that
-    /// `OK` means delivered).
+    /// The encoded bytes were not (fully) written to the PTY: a short write (peer closed
+    /// mid-frame), a full ordered-input queue, or a hard error. `OK` means delivered.
     WriteFailed,
     /// The session's input queue refused the event and NOTHING of it was written
     /// (a refused receipt with no accepted prefix): the program has not read its
@@ -469,11 +368,9 @@ impl InputOutcome {
     }
 }
 
-/// Whether [`seam_egress_receipt`] actually delivered the event's encoded bytes to the PTY.
-/// An event that legitimately encodes to NO bytes (a legacy-mode key release, an
-/// un-encodable modifier — faithful to what a real terminal does) is [`Full`]: there
-/// was nothing to deliver and nothing was lost. Only a short/failed write is
-/// [`Failed`].
+/// Whether [`seam_egress_receipt`] delivered the event's encoded bytes to the PTY. An event that
+/// encodes to no bytes (a legacy-mode key release, an unencodable modifier) is [`Full`]: nothing
+/// was lost. Only a short or failed write is [`Failed`].
 ///
 /// [`Full`]: Delivery::Full
 /// [`Failed`]: Delivery::Failed
@@ -497,14 +394,10 @@ impl Delivery {
     }
 }
 
-/// Classify a sink write result against the intended frame length. A partial
-/// write (`Ok(n)` with `n < intended`, i.e. the peer closed mid-frame) is a FAILURE
-/// just like a hard error — the frame did not land in full. NOTE the wedged-tty
-/// nuance: a frame the sink SPILLED (tty input buffer full) reports `Ok(len)` —
-/// accepted-for-ordered-delivery — and counts as [`Delivery::Full`] even though
-/// the kernel has not consumed it yet; if the session dies before the spill
-/// drains, those bytes are dropped with it (exactly like bytes a dead program
-/// never read from its tty).
+/// Classify a sink write result against the intended frame length. A partial write (`Ok(n)`,
+/// `n < intended`: the peer closed mid-frame) fails like a hard error. A frame the sink spilled
+/// (tty input buffer full) reports `Ok(len)` and counts as [`Delivery::Full`] though the kernel
+/// has not consumed it; if the session dies first, those bytes die with it.
 fn delivered(res: std::io::Result<usize>, intended: usize) -> Delivery {
     match res {
         Ok(n) if n == intended => Delivery::Full,
@@ -512,9 +405,9 @@ fn delivered(res: std::io::Result<usize>, intended: usize) -> Delivery {
     }
 }
 
-/// One sink write's verdict: the delivery, the accepted order, whether the
-/// frame went whole to the kernel directly, and whether the UI thread's egress
-/// REFUSED it rather than park ([`WriteReceiptError::is_refused`]).
+/// One sink write's verdict: the delivery, the accepted order, whether the frame went whole to
+/// the kernel directly, and whether the UI thread's egress refused it rather than park
+/// ([`WriteReceiptError::is_refused`]).
 fn delivered_receipt(
     result: Result<WriteReceipt, WriteReceiptError>,
     intended: usize,
@@ -530,23 +423,19 @@ fn delivered_receipt(
     }
 }
 
-/// What [`seam_egress_receipt`] did with a mouse/wheel event, so `App::input` knows
-/// whether the tracking-OFF local fallback (selection gesture / viewport scroll)
-/// must still run. The byte-producing decision lives ENTIRELY in `seam_egress`;
-/// the viewport/gesture/window side-effects stay in `App::input` (they need the
-/// renderer/window the headless byte test does not have).
+/// What [`seam_egress_receipt`] did with a mouse/wheel event, so `App::input` knows whether the
+/// tracking-off local fallback must still run. The byte decision is all `seam_egress`'s; the
+/// viewport, gesture and window side effects stay in `App::input`, which has the renderer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Egress {
-    /// The event produced a tracking report (or had no local fallback): the seam
-    /// is done with it. Carries whether the encoded bytes actually reached the PTY
-    /// so the reply-bearing caller is told the truth (audit: no false OK).
+    /// The event produced a tracking report (or had no local fallback): the seam is done with
+    /// it. Carries whether the bytes reached the PTY, so a reply-bearing caller is told the
+    /// truth.
     Reported(Delivery),
-    /// Mouse tracking is OFF: `App::input` must run the local fallback (selection
-    /// gesture for a button/move, viewport scroll of `wheel_lines` for a wheel).
-    /// A wheel's fallback also carries the engine facts the viewport scroll
-    /// needs ([`WheelViewport`]), read under the seam's ONE lock so the scroll
-    /// takes no second or third acquisition of its own; `None` from the
-    /// button/move arms, which scroll nothing.
+    /// Mouse tracking is off: `App::input` runs the local fallback (a selection gesture for a
+    /// button/move, a viewport scroll of `wheel_lines` for a wheel). A wheel's fallback carries
+    /// the engine facts the scroll needs ([`WheelViewport`]), read under the seam's one lock;
+    /// `None` from the button/move arms.
     TrackingOff {
         wheel_lines: i32,
         wheel_up: bool,
@@ -554,14 +443,9 @@ pub(crate) enum Egress {
     },
 }
 
-/// The engine facts a tracking-OFF wheel's local viewport scroll consumes,
-/// snapshotted under the seam's single `term_lock` at the instant the route
-/// was decided. `input_wheel` used to take TWO more blocking acquisitions per
-/// line-emitting event to re-read them — `rows()` for the platform's
-/// lines-per-detent (discarded on every non-Windows target), and
-/// `(display_offset, scrollback_lines)` for the glide's base and clamp — each a
-/// fresh queue position behind the PTY reader's `process()` slice, microseconds
-/// after this lock had the same values in hand.
+/// The engine facts a tracking-off wheel's local viewport scroll consumes, snapshotted under the
+/// seam's single `term_lock` when the route was decided, so `input_wheel` takes no further
+/// acquisition (each a fresh queue position behind the PTY reader's `process()` slice).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WheelViewport {
     /// `Grid::display_offset()` — the viewport's current row into history.
@@ -581,21 +465,17 @@ pub(crate) struct WheelViewport {
 pub(crate) struct EgressReceipt {
     pub(crate) egress: Egress,
     accepted_order: Option<AcceptedOrder>,
-    /// The accepted frame reached the kernel WHOLE on the sink's direct lane
-    /// (`WriteReceipt::is_direct`): the echo tracker can settle its spill debt
-    /// without probing the spill mutex. Conservative `false` everywhere else.
+    /// The accepted frame reached the kernel whole on the sink's direct lane
+    /// (`WriteReceipt::is_direct`), so the echo tracker can settle its spill debt without
+    /// probing the spill mutex. Conservative `false` everywhere else.
     direct: bool,
-    /// The event was REFUSED because its session's input queue is full: the
-    /// program has stopped reading and the UI thread's egress would otherwise
-    /// have parked (`WriteReceiptError::is_refused`), or the ordered writer
-    /// did not admit it (`paste_order`: its queue had no room, or the writer
-    /// is gone). Always with `Delivery::Failed`; the App says so once per
-    /// session (`App::refuse_input`).
+    /// Refused because the session's input queue is full: the program stopped reading and the
+    /// UI thread's egress would have parked (`WriteReceiptError::is_refused`), or the ordered
+    /// writer did not admit it (`paste_order`). Always with `Delivery::Failed`; the App says so
+    /// once per session (`App::refuse_input`).
     refused: bool,
-    /// The event was handed to the per-session ordered writer
-    /// ([`Self::deferred_full`]): its bytes, if any, are written there, later.
-    /// A report goes there only with bytes to write (`paste_order`'s report
-    /// route), so for a report this is "bytes are on their way".
+    /// Handed to the per-session ordered writer ([`Self::deferred_full`]), which writes its
+    /// bytes later. A report goes there only with bytes to write.
     queued: bool,
 }
 
@@ -630,9 +510,8 @@ impl EgressReceipt {
         }
     }
 
-    /// FIFO admission is not PTY acceptance.  Keep the public egress contract
-    /// (`Full` means the ordered serializer owns the event) while withholding
-    /// the byte receipt until that serializer performs the real write.
+    /// FIFO admission is not PTY acceptance: `Full` (the ordered serializer owns the event)
+    /// with no byte receipt until that serializer does the real write.
     #[must_use]
     pub(crate) const fn deferred_full() -> Self {
         Self {
@@ -644,10 +523,9 @@ impl EgressReceipt {
         }
     }
 
-    /// The ordered writer REFUSED the event: its session's input queue has no
-    /// room, or its writer is gone (`paste_order`'s admission). No byte moved
-    /// and none ever will — a failed delivery, never a queued one, and never
-    /// written around the FIFO.
+    /// The ordered writer refused the event: its session's input queue has no room, or its
+    /// writer is gone (`paste_order`'s admission). No byte moved and none ever will, and it is
+    /// never written around the FIFO.
     #[must_use]
     pub(crate) const fn queue_full() -> Self {
         Self {
@@ -706,20 +584,11 @@ impl EgressReceipt {
     }
 }
 
-/// Resolve the `(x, y)` numbers a mouse report should carry for `term`'s CURRENT
-/// encoding: a genuine device-PIXEL coordinate for DEC 1016 (SGR-pixel), else the
-/// 0-based grid CELL (`col`, `row`) unchanged.
-///
-/// For 1016 the pixel coordinate is reconstructed from the cell origin
-/// (`col * cell_w`, `row * cell_h`) plus the sub-cell `px_off` the frontend
-/// measured from the real winit cursor — the engine's `cell_pixel_size()` (the
-/// frontend's reported font metrics) supplies the cell size. The result is 0-based;
-/// `encode_mouse` (`encode_sgr`) adds the spec's `+1`, so a pointer at the very
-/// top-left pixel of cell (0,0) reports `1;1`. Saturating arithmetic keeps a huge
-/// grid from wrapping (the SGR field is `u16`-wide as the rest of the pipeline).
-///
-/// This is the SOLE reader of `mouse_encoding()` for coordinate selection; it runs
-/// under the caller's existing `term_lock`, so it adds no extra mode-read window.
+/// The `(x, y)` a mouse report carries under `term`'s current encoding: for DEC 1016
+/// (SGR-pixel), the device-pixel coordinate rebuilt from the cell origin (`col * cell_w`,
+/// `row * cell_h`, from the engine's `cell_pixel_size()`) plus the measured sub-cell `px_off`;
+/// else the cell. 0-based either way (`encode_sgr` adds the `+1`), and saturating, so a huge
+/// grid cannot wrap. Runs under the caller's `term_lock`.
 pub(crate) fn report_coords(t: &Terminal, col: u16, row: u16, px_off: PixelOffset) -> (u16, u16) {
     use aterm_types::mouse::MouseEncoding;
     if t.mouse_encoding() == MouseEncoding::SgrPixel {
@@ -736,22 +605,12 @@ pub(crate) fn report_coords(t: &Terminal, col: u16, row: u16, px_off: PixelOffse
     }
 }
 
-/// Ceiling on the number of times ONE wheel event may write its encoded bytes.
-/// Both bursts the seam can produce are bounded by it: the per-line mouse reports
-/// under a tracking app, and the DEC-1007 alt-scroll arrow presses, whose count is
-/// `lines` times the platform's lines-per-detent and so can exceed `lines` on its
-/// own (Windows' "One screen at a time" multiplies by the viewport height). 512
-/// covers a large flick of many screens; past that a single event is flooding the
-/// PTY, not scrolling.
-///
-/// SOURCE-BLINDNESS. The report burst is clamped at the SEAM's `lines`
-/// normalization, not (only) at the `mouse` verb's `lines=N` parse — the verb's
-/// clamp is `control_input::MAX_WHEEL_LINES`, which IS this constant, so a
-/// controller was already bounded while a HUMAN gesture was not. That gap became
-/// live exposure with the horizontal axis (audit I7): a trackpad's pixel deltas
-/// are divided by the cell WIDTH, so one momentum event can bank far more notches
-/// sideways than the vertical twin ever did. Clamping where both sources converge
-/// makes the ceiling structural instead of a property of one caller.
+/// Ceiling on how many times one wheel event may write its encoded bytes: the per-line mouse
+/// reports under a tracking app, and the DEC 1007 arrow presses, which number `lines` times the
+/// platform's lines-per-detent (Windows' "One screen at a time" multiplies by the viewport
+/// height). Past 512 an event floods the PTY. Clamped where both sources converge, at the seam's
+/// `lines` normalization (`control_input::MAX_WHEEL_LINES` is this constant): a trackpad's
+/// horizontal deltas divide by the cell width, so one momentum event can bank many notches.
 pub(crate) const MAX_WHEEL_BURST: i32 = 512;
 
 /// How far a wheel gesture of `lines` travels, in lines: when `detent` is set
@@ -905,9 +764,8 @@ fn vte_lines_per_detent(page_rows: u16) -> i32 {
     i32::from(page_rows.div_ceil(10)).max(1)
 }
 
-/// Where ONE wheel event goes — the seam's routing decision, factored out of
-/// `seam_egress` so the precedence is a pure, cross-platform-testable truth
-/// table (the byte production stays in the seam, under its single term-lock).
+/// Where one wheel event goes: the seam's routing decision, factored out of `seam_egress` so the
+/// precedence is a pure truth table (the byte production stays in the seam, under its one lock).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WheelRoute {
     /// An app is tracking the mouse: encode wheel reports for it.
@@ -918,47 +776,25 @@ pub(crate) enum WheelRoute {
     Viewport,
 }
 
-/// Resolve a wheel's [`WheelRoute`] from the three facts the seam reads under
-/// its term lock. THE ORDER IS THE CONTRACT:
+/// Resolve a wheel's [`WheelRoute`] from the facts the seam reads under its term lock. The order
+/// is the contract:
 ///
-/// 1. `shift_held` wins over EVERYTHING (audit I12). Shift+wheel is the user's
-///    explicit "scroll ATERM, not the app" gesture — the xterm convention whose
-///    KEYBOARD half aterm already ships (`scrollback_chord`, Shift+PgUp/PgDn,
-///    citing "the xterm / Terminal.app convention"). Without it there is NO
-///    wheel gesture that moves the viewport over fzf / a mouse-enabled REPL.
-///    Checked BEFORE the tracking test so the shifted event can never reach
-///    `encode_mouse_wheel` (which would fold SHIFT_MASK into the report byte —
-///    the bypass must not leak a shifted report to the app), and before the
-///    DEC-1007 arm for the same reason xterm's is: Shift reserves the wheel for
-///    the terminal, full stop. The fallback path never reads the modifier, so
-///    nothing downstream needs to "strip" Shift, and the platform
-///    lines-per-detent multiplier still applies (`wheel_viewport_lines` runs on
-///    every `TrackingOff` wheel).
-/// 2. `alt_local` — Option/Alt held on the MAIN screen (SELECTION CUSTODY
-///    Phase 2): the wheel scrolls THIS terminal's scrollback even while an app
-///    tracks the mouse. Option is aterm's OWN established override modifier
-///    under tracking, not an import: `press_starts_selection` (`app_mouse.rs`,
-///    audit M6) already lets Option-click start a local selection "so a PID can
-///    be copied out of htop" — one modifier, one meaning; this is the wheel
-///    half of the same gesture. The CALLER computes the main-screen scoping
-///    (`ALT_MASK` held AND not alt screen): the alt screen is built with zero
-///    scrollback, so a bypass there buys nothing while costing the DEC-1007
-///    arrows that less/man/git-log scroll by — with Alt on the alt screen the
-///    wheel behaves exactly as it always has.
-/// 3. Mouse tracking: the app grabbed the mouse, it gets real reports.
+/// 1. `shift_held` wins over everything: Shift+wheel is the xterm convention for "scroll the
+///    terminal, not the app" (the keyboard half is Shift+PgUp/PgDn, `scrollback_chord`), and
+///    without it no wheel gesture moves the viewport over fzf or a mouse-enabled REPL. Checked
+///    before tracking, so a shifted report never reaches `encode_mouse_wheel`, and before
+///    DEC 1007, as xterm does. The platform lines-per-detent still applies
+///    (`wheel_viewport_lines`).
+/// 2. `alt_local`, Option/Alt held on the main screen: the wheel scrolls this terminal's
+///    scrollback even under tracking, the wheel half of Option-click selection
+///    (`press_starts_selection`). The caller scopes it to the main screen: the alt screen has
+///    no scrollback, and Alt there keeps the DEC 1007 arrows.
+/// 3. Mouse tracking: the app gets real reports.
 /// 4. Alternate scroll (DEC 1007, alt screen): arrows for less/man/git-log.
 /// 5. Otherwise: the local scrollback viewport.
 ///
-/// REJECTED — stripping Shift in `on_mouse_wheel` (the GUI handler) instead:
-/// that would bypass for the Human path only, silently diverging the controller
-/// `mouse` verb (the seam is deliberately source-blind; a policy split keyed on
-/// the builder is exactly the divergence the A.7 invariant forbids). Also
-/// REJECTED — a platform-conditional bypass modifier (the `link_modifier_held`
-/// shape): the convention is xterm's own and holds on every platform aterm
-/// ships; a per-platform split would buy nothing but a third behaviour matrix.
-/// (macOS trackpads convert a Shift+swipe to a HORIZONTAL delta before winit
-/// sees it, so this arm is naturally rare there — but a Shift+notch on a real
-/// mouse wheel behaves identically everywhere.)
+/// The bypass lives here, not in `on_mouse_wheel`, so the controller `mouse` verb gets it too
+/// (the seam is source-blind), and it is the same on every platform.
 pub(crate) fn wheel_route(
     shift_held: bool,
     alt_local: bool,
@@ -980,20 +816,9 @@ pub(crate) fn wheel_route(
     WheelRoute::Viewport
 }
 
-/// The four FACTS [`wheel_route`] decides on, read from one engine under the
-/// caller's lock. Only reads — the policy is still entirely in `wheel_route`.
-///
-/// Split out of [`seam_egress_receipt`] so the derivation is reachable from a test on
-/// EVERY platform. The seam's own wheel tests used to need a POSIX pipe fd for
-/// `SinkWriter` and were therefore `#[cfg(unix)]`, which left the SELECTION
-/// CUSTODY Phase-2 Option override — the item the design calls load-bearing,
-/// "without this, Phase 4 is unreachable under any mouse-owning TUI" — unpinned
-/// on Windows, the platform where Alt is most likely to collide with something
-/// else. (The byte capture is cross-platform now, so the seam's own wheel tests
-/// run on Windows too; this pure derivation stays because a route test that needs
-/// no PTY at all is still the cheaper and sharper fence.) `alt_local`'s
-/// main-screen scoping lives here because it is a FACT about the engine (the alt
-/// screen carries no scrollback), not a policy choice.
+/// The four facts [`wheel_route`] decides on, read from one engine under the caller's lock; the
+/// policy stays in `wheel_route`. `alt_local`'s main-screen scoping is here because it is a fact
+/// about the engine (the alt screen has no scrollback).
 pub(crate) fn wheel_route_for(t: &Terminal, mods: u8) -> WheelRoute {
     wheel_route(
         mods & aterm_types::mouse::SHIFT_MASK != 0,
@@ -1003,16 +828,10 @@ pub(crate) fn wheel_route_for(t: &Terminal, mods: u8) -> WheelRoute {
     )
 }
 
-/// [`wheel_route_for`]'s LOCK-FREE twin: the same four facts, read from the
-/// session's published [`ModeMirror`] instead of the engine under its mutex.
-///
-/// The mirror is the fold as of the last `process()` batch (or host mutator),
-/// the same word the key encoder already trusts; it can trail a batch that is
-/// running right now by that one batch, never more. Its one caller is the
-/// parked-edge arm of `App::input_wheel`, where the answer only decides whether
-/// the seam is worth its lock at all: a precise delta pushing a band already
-/// parked at a history end, on a route this says is `Viewport`, moves nothing
-/// the seam would have moved.
+/// [`wheel_route_for`]'s lock-free twin: the same four facts from the session's published
+/// [`ModeMirror`], which can trail a running `process()` batch by that one batch. Its one caller,
+/// the parked-edge arm of `App::input_wheel`, only decides whether the seam is worth its lock: a
+/// delta pushing a band already parked at a history end, on a `Viewport` route, moves nothing.
 pub(crate) fn wheel_route_mirrored(mirror: &ModeMirror, mods: u8) -> WheelRoute {
     let alt_screen = mirror.alternate_screen();
     wheel_route(
@@ -1097,37 +916,27 @@ fn wheel_scaled_lines(notch_lines: i32, notch: WheelNotch, page_rows: u16) -> i3
 /// human/controller byte-equality invariant holds for either variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressMode {
-    /// The UI event-loop thread, and a control socket lane writing into a session
-    /// that is not on screen: use the non-parking egress
-    /// (`SinkWriter::write_frame_interactive_with_receipt`) so a wedged foreground
-    /// can NEVER park the loop that serves rendering + input for every window/tab,
-    /// nor a lane the socket's other clients need.
-    /// At the sink's spill cap the frame is REFUSED instead ([`Delivery::Failed`],
-    /// [`EgressReceipt::input_queue_full`]; decided 2026-09-25). On Windows, where
-    /// ConPTY has no non-blocking write, keys and reports never take this mode
-    /// inline: they go through the per-session ordered writer (`paste_order`),
-    /// reports as [`Self::Encode`]d bytes, and one it does not admit is refused.
+    /// The UI event-loop thread, and a control socket lane writing into a session that is not
+    /// on screen: the non-parking egress (`SinkWriter::write_frame_interactive_with_receipt`),
+    /// so a wedged foreground never parks the loop that serves every window, nor a lane other
+    /// socket clients need. At the sink's spill cap the frame is refused ([`Delivery::Failed`],
+    /// [`EgressReceipt::input_queue_full`]). On Windows keys and reports never take this mode
+    /// inline: they go through the per-session ordered writer (`paste_order`).
     Interactive,
-    /// An expendable egress thread (the per-session egress-order writer thread):
-    /// use the blocking, `SPILL_CAP`-enforcing egress, so a machine-rate producer
-    /// into a wedged foreground feels backpressure on THIS thread instead of
-    /// growing the spill without bound. MUST NOT be used on the UI thread or a
-    /// control socket lane.
+    /// An expendable egress thread (the per-session egress-order writer): the blocking,
+    /// `SPILL_CAP`-enforcing egress, so a machine-rate producer into a wedged foreground feels
+    /// backpressure here instead of growing the spill without bound. Never on the UI thread or
+    /// a control socket lane.
     Backpressured,
-    /// The UI thread where a write could block it (Windows: ConPTY has no
-    /// non-blocking write), or behind a queued paste: produce exactly the bytes
-    /// `Interactive` would — the same seam, the modes read once under the
-    /// gesture's own lock — and write NOTHING. [`seam_encode`] hands them back
-    /// for the per-session ordered writer to deliver (`paste_order`'s report
-    /// route), so a mouse, wheel or focus report never waits on the kernel on
-    /// the loop that serves every window.
+    /// The UI thread where a write could block it (Windows: ConPTY has no non-blocking write),
+    /// or behind a queued paste: produce exactly the bytes `Interactive` would and write
+    /// nothing. [`seam_encode`] hands them back for the per-session ordered writer
+    /// (`paste_order`'s report route), so no report waits on the kernel on the UI thread.
     Encode,
 }
 
-/// Deliver `bytes` to `sink` per `mode`. Transport only: the bytes are identical
-/// either way (see [`EgressMode`]); only the parking discipline differs.  The
-/// immediate mode retains the zero-vs-partial distinction needed by the durable
-/// actuator; ordinary modes preserve their existing `Full`/`Failed` contract.
+/// Deliver `bytes` to `sink` per `mode`. Transport only: the bytes are identical either way (see
+/// [`EgressMode`]); only the parking discipline differs.
 fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8], accepted: &mut Accepted) -> Delivery {
     debug_assert!(!bytes.is_empty());
     let (delivery, order, direct, refused) = match mode {
@@ -1170,11 +979,9 @@ fn emit_metered(
     delivery
 }
 
-/// The seam's accepted-frame accumulator: the order of the LAST accepted
-/// non-empty frame, whether that frame went whole to the kernel directly,
-/// whether any frame of the event was refused because the input queue was
-/// full, and — under [`EgressMode::Encode`] only — every frame's bytes, in
-/// order, that nothing wrote.
+/// The seam's accepted-frame accumulator: the last accepted non-empty frame's order, whether it
+/// went whole to the kernel directly, whether any frame was refused for a full input queue, and
+/// (under [`EgressMode::Encode`] only) every frame's bytes, in order, that nothing wrote.
 #[derive(Clone, Debug, Default)]
 struct Accepted {
     order: Option<AcceptedOrder>,
@@ -1236,9 +1043,11 @@ pub(crate) fn seam_egress(
 /// blink/snap/resize side-effects (which need the renderer + window + gesture
 /// state) stay in `App::input`, which calls this and then runs those.
 ///
-/// The receipt preserves the accepted-byte evidence that [`Egress`]
-/// intentionally erases for zero-byte and multi-frame contracts; the
-/// byte-producing decision stays in the one inner seam.
+/// It takes no [`Source`], so a Human and a Controller feeding the same `InputEvent` get
+/// byte-identical output (`bytes_human_eq_controller`; the `Buggy` mutant is its negative
+/// control). [`EgressMode`] is transport and never changes the bytes. Side effects that need the
+/// renderer, window or gesture state stay in `App::input`. The receipt keeps the accepted-byte
+/// evidence [`Egress`] erases for zero-byte and multi-frame events.
 pub(crate) fn seam_egress_receipt(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
@@ -1249,13 +1058,9 @@ pub(crate) fn seam_egress_receipt(
     seam_egress_receipt_metered(term, modes, sink, ev, mode, None)
 }
 
-/// [`seam_egress_receipt`] with a [`BulkMeter`] for a large paste (design
-/// ruling 231): the paste's ONE frame is written through
-/// [`SinkWriter::write_frame_metered_with_receipt`], which reports its
-/// progress and honours its stop. The bytes are the seam's, unchanged — the
-/// meter is transport, like [`EgressMode`], and applies only to a paste
-/// written from an expendable thread (`Backpressured`); every other event and
-/// mode ignores it.
+/// [`seam_egress_receipt`] with a [`BulkMeter`] for a large paste: its one frame goes through
+/// [`SinkWriter::write_frame_metered_with_receipt`], which reports progress and honours the
+/// meter's stop. Transport only, like [`EgressMode`]: only a `Backpressured` paste uses it.
 pub(crate) fn seam_egress_receipt_metered(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
@@ -1289,11 +1094,10 @@ pub(crate) fn seam_egress_receipt_metered(
     }
 }
 
-/// [`seam_egress_receipt`] under [`EgressMode::Encode`]: the event's [`Egress`] — what
-/// the caller's local fallback reads, exactly as an inline write would have
-/// reported it — and the bytes the seam produced for it, which NOTHING has
-/// written. Empty when the event writes nothing (tracking off, a swallowed
-/// wheel, focus reporting off). `sink` is not touched.
+/// [`seam_egress_receipt`] under [`EgressMode::Encode`]: the event's [`Egress`], as an inline
+/// write would have reported it, and the bytes the seam produced, which nothing has written.
+/// Empty when the event writes nothing (tracking off, a swallowed wheel, focus reporting off).
+/// `sink` is not touched.
 pub(crate) fn seam_encode(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
@@ -1342,11 +1146,9 @@ fn seam_egress_inner(
     meter: Option<&BulkMeter>,
     platform: WheelPlatform,
 ) -> Egress {
-    // PAIRING OBLIGATION (debug builds): `modes` must be THIS terminal's mirror.
-    // A mirror derived from some other terminal (or a bare `Default`) would
-    // silently encode every key in legacy mode. Checked only when the mutex is
-    // free — the whole point of the mirror is never to wait on it — which is
-    // every unit test and most real presses; a busy reader just skips the check.
+    // Debug builds check that `modes` is this terminal's mirror (another's, or a `Default`,
+    // would encode every key in legacy mode), only when the mutex is free: the mirror exists so
+    // the seam never waits on it.
     #[cfg(debug_assertions)]
     if let Ok(t) = term.try_lock() {
         debug_assert!(
@@ -1362,10 +1164,8 @@ fn seam_egress_inner(
             layout_text,
             event_type,
         } => {
-            // LOCK-FREE: the keyboard mode comes from the terminal's published
-            // mirror, not from a second `term_lock` behind the PTY reader's
-            // `process()` slice. `process()` republishes it before every hold
-            // ends, so this word is the mode the last completed batch left.
+            // Lock-free: `process()` republishes the mirror before every hold ends, so this is
+            // the mode the last completed batch left.
             let bytes = aterm_types::keyboard::encode_key_with_text(
                 key,
                 *mods,
@@ -1393,9 +1193,7 @@ fn seam_egress_inner(
             Egress::Reported(d)
         }
         InputEvent::KeySequence(bytes) => {
-            // aterm INPUT POLICY: raw user-chosen bytes go to the PTY VERBATIM — no
-            // keyboard-mode read, no encoder. This is the whole point: the chord
-            // sends exactly what the user mapped, overriding the default encoding.
+            // Raw bytes go to the PTY verbatim: no keyboard-mode read, no encoder.
             let d = if bytes.is_empty() {
                 Delivery::Full
             } else {
@@ -1415,9 +1213,7 @@ fn seam_egress_inner(
             let report = {
                 let mut t = term_lock(term);
                 if t.mouse_tracking_enabled() {
-                    // DEC 1016 (SGR-pixel) reports a genuine PIXEL coordinate; every
-                    // other encoding reports the cell. `report_coords` resolves which
-                    // under the SAME lock that reads the mode (no extra read window).
+                    // DEC 1016 reports a pixel coordinate, every other encoding the cell.
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
                     let bytes = if *pressed {
                         t.encode_mouse_press(button.code(), rx, ry, *mods)
@@ -1462,13 +1258,10 @@ fn seam_egress_inner(
                 let mut t = term_lock(term);
                 if t.mouse_tracking_enabled() {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
-                    // ONE REPORT PER POSITION (xterm ctlseqs: button-event motion
-                    // is "reported only if the mouse pointer has moved to a
-                    // different character cell"). Compared in the coordinates the
-                    // report carries, so under DEC 1016 every new pixel is new.
-                    // Here, in the source-blind seam, so a controller's motion and
-                    // a person's are deduplicated alike against the one memo every
-                    // press, release, wheel and motion report writes.
+                    // One report per position (xterm: button-event motion is reported only when
+                    // the pointer moves to another cell), compared in the report's coordinates,
+                    // so under DEC 1016 every new pixel is new. Both sources dedupe against the
+                    // one memo every press, release, wheel and motion report writes.
                     if t.mouse_motion_repeats_last_report(rx, ry) {
                         Some(None)
                     } else {
@@ -1506,56 +1299,39 @@ fn seam_egress_inner(
             mods,
             px_off,
         } => {
-            // The invariant lives HERE: clamp `lines` to `1..=MAX_WHEEL_BURST` so
-            // (low) a non-positive count (a future verb/grammar bug) cannot
-            // silently emit zero reports for one source and N for another, and
-            // (high) one event cannot flood the PTY with reports. `on_mouse_wheel`
-            // already guarantees >= 1 and the `mouse` verb already clamps its
-            // `lines=N` to the same ceiling; doing BOTH here makes the bound
-            // structural for every caller instead of a property of one of them.
+            // Clamp `lines` to `1..=MAX_WHEEL_BURST` here, where every caller converges: a
+            // non-positive count cannot emit zero reports for one source and N for another, and
+            // one event cannot flood the PTY.
             let lines = (*lines).clamp(1, MAX_WHEEL_BURST);
-            // Decide the wheel's egress under the SINGLE term_lock window. Three
-            // source-blind outcomes (Human and Controller converge):
-            //   Write     — emit the bytes `repeat` times: a mouse-wheel report ONCE
-            //               PER LINE when an app is tracking, OR (alt screen + DEC
-            //               1007, audit M5) a synthesized arrow key so a wheel scrolls
-            //               less/man/vim — that one scaled by the platform's
-            //               lines-per-detent, see the arm below;
-            //   Swallow   — Reported with nothing to write (X10 mode-9 press-only, or
-            //               an empty key encoding): the wheel is CONSUMED, the local
-            //               viewport must NOT move;
-            //   Fallback  — tracking off and not alt-scroll, OR Shift held (the
-            //               I12 bypass — see `wheel_route`): `App::input` scrolls
-            //               the local scrollback viewport (`Egress::TrackingOff`)
-            //               — by ZERO lines on the horizontal axis, which has no
-            //               viewport to move (audit I7, see the Fallback arm).
+            // Decided under one term_lock, source-blind:
+            //   Write    — emit `bytes` `repeat` times: one wheel report per line under
+            //              tracking, or (alt screen + DEC 1007) an arrow key scaled by the
+            //              platform's lines-per-detent;
+            //   Swallow  — reported with nothing to write (X10 mode 9 is press-only, or an
+            //              empty key encoding): the local viewport must not move;
+            //   Fallback — `App::input` scrolls the local viewport (`Egress::TrackingOff`), by
+            //              zero lines on the horizontal axis.
             enum WheelPlan {
                 Write {
                     bytes: Vec<u8>,
                     repeat: i32,
                 },
                 Swallow,
-                /// …carrying the viewport facts read under THIS lock, so the
-                /// local scroll never re-locks for them.
+                /// With the viewport facts read under this lock, so the local scroll never
+                /// re-locks for them.
                 Fallback(WheelViewport),
             }
             let plan = {
                 let mut t = term_lock(term);
-                // The precedence (Shift bypass > Alt local-override > tracking >
-                // alt-scroll > viewport) lives in `wheel_route` — pure, so the
-                // table is pinned by tests on every platform. The facts are read
-                // HERE, under this lock; the Alt override's main-screen scoping
-                // (no scrollback on the alt screen — see the contract) is one of
-                // those facts, not policy.
+                // The precedence lives in `wheel_route`; the facts are read here, under this
+                // lock.
                 let route = wheel_route_for(&t, *mods);
                 if route == WheelRoute::Report {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
                     match t.encode_mouse_wheel(*dir, rx, ry, *mods) {
-                        // EXACTLY one report per line, NEVER scaled by the platform's
-                        // lines-per-detent: the app grabbed the mouse and does its own
-                        // notch->lines conversion (vim's `mousescroll`, default 3).
-                        // Multiplying here would hand vim three notches to multiply,
-                        // i.e. nine lines a detent on Windows.
+                        // One report per line, never scaled by lines-per-detent: the app does
+                        // its own notch-to-lines conversion (vim's `mousescroll`), so scaling
+                        // here would give nine lines a detent on Windows.
                         Some(b) => {
                             // A wheel notch is a press (xterm buttons 4-7): it names
                             // the pointer's position like any other.
@@ -1618,9 +1394,7 @@ fn seam_egress_inner(
             };
             match plan {
                 WheelPlan::Write { bytes: b, repeat } => {
-                    // One report / keypress PER unit of `repeat` (kills divergence e —
-                    // `repeat` is computed source-blind, from the terminal's modes and
-                    // the platform's setting, never from `_audit`).
+                    // One report or keypress per unit of `repeat`, computed source-blind.
                     let mut d = Delivery::Full;
                     for _ in 0..repeat {
                         let attempt = emit(sink, mode, &b, accepted_order);
@@ -1631,15 +1405,9 @@ fn seam_egress_inner(
                     Egress::Reported(d)
                 }
                 WheelPlan::Swallow => Egress::Reported(Delivery::Full),
-                // The local-viewport fallback is VERTICAL-ONLY (audit I7). A grid
-                // has one axis: `display_offset` moves through scrollback and
-                // there is no horizontal viewport to pan, so a tilt notch or a
-                // horizontal trackpad swipe reports ZERO lines and `input_wheel`
-                // does nothing with it — byte-identical AND motion-identical to
-                // the old `on_mouse_wheel` early-return, which is the behaviour
-                // the audit explicitly ruled CORRECT with tracking off. Feeding
-                // `lines` through here instead would resurrect the phantom
-                // scroll-DOWN that guard was added to fix.
+                // Vertical only: the grid has no horizontal viewport, so a tilt notch or a
+                // horizontal swipe reports zero lines and `input_wheel` does nothing. Passing
+                // `lines` would scroll a horizontal flick downward (`wheel_up` is false for it).
                 WheelPlan::Fallback(viewport) => Egress::TrackingOff {
                     wheel_lines: if dir.is_horizontal() { 0 } else { lines },
                     wheel_up: dir.vertical_up().unwrap_or(false),
@@ -1648,12 +1416,9 @@ fn seam_egress_inner(
             }
         }
         InputEvent::Paste(text, framing) => {
-            // The framing question is answered by the EVENT (see [`PasteFraming`]):
-            // a paste reaches here on the ordered-writer thread, arbitrarily later
-            // than the gesture that made it, so the live mode is the right answer
-            // only for a paste nobody was promised anything about. Both reads
-            // happen under this one lock, so the fallback still sees the mode the
-            // bytes are being written against.
+            // The event answers the framing question ([`PasteFraming`]): a paste reaches here on
+            // the ordered-writer thread, arbitrarily later than its gesture. Both reads are
+            // under this one lock.
             let out = {
                 let t = term_lock(term);
                 t.format_paste_framed(text, framing.bracketed(t.modes().bracketed_paste))
@@ -1668,11 +1433,9 @@ fn seam_egress_inner(
                     } else {
                         emit(sink, mode, &out, accepted_order)
                     };
-                    // A meter this arm did not write through — the sanitizer
-                    // left nothing to send (64 KiB of controls, unbracketed),
-                    // or a mode the metered write does not serve — is settled
-                    // here, or its watch would never end: the row, and a 4 Hz
-                    // sample with nothing in flight (design ruling 236).
+                    // A meter this arm did not write through (the sanitizer left nothing to
+                    // send, or a mode the metered write does not serve) is settled here, or its
+                    // watch would never end.
                     if let Some(meter) = meter {
                         meter.settle_unmetered(d.is_full());
                     }
@@ -1682,18 +1445,10 @@ fn seam_egress_inner(
             Egress::Reported(d)
         }
         InputEvent::Focus(focused) => {
-            // SOLE focus-report egress: ESC[I / ESC[O under DEC 1004.
-            //
-            // LOCK-FREE like the Key/Text arms, and for a sharper reason than
-            // they had. This arm is now reached from `App::recompute_focus_reports`
-            // on the winit thread on EVERY tab switch and pane-focus move, and
-            // `App::sync_window` — the caller — states in its own body that it
-            // must never acquire the engine mutex (a flooding background pane's
-            // reader holds its terminal for a whole `process()` slice, so a
-            // blocking read here would park the user's gesture behind it). The
-            // armed bit is a published mode, so read it from the mirror: the
-            // common case is nobody having set DEC 1004 at all, and the old
-            // `term_lock` paid a full acquisition per holder move to learn it.
+            // The sole focus-report egress: ESC[I / ESC[O under DEC 1004. Lock-free: this is
+            // reached from `App::recompute_focus_reports` on every tab switch and pane-focus
+            // move, and `App::sync_window` must never take the engine mutex (a flooding pane's
+            // reader holds it for a whole `process()` slice).
             let mut d = Delivery::Full;
             if modes.focus_reporting_enabled() {
                 let seq: &[u8] = if *focused { b"\x1b[I" } else { b"\x1b[O" };
@@ -1701,27 +1456,19 @@ fn seam_egress_inner(
             }
             Egress::Reported(d)
         }
-        // ScrollView / Resize / ResizeWindowPx produce no PTY bytes here;
-        // `App::input` handles their (viewport / geometry) side-effects directly.
-        // `ResizeWindowPx` in particular writes NOTHING to the engine: it only asks
-        // the window for a size, and the PTY learns the new geometry from the
-        // platform's `Resized` event like it does for a drag.
+        // No PTY bytes: `App::input` handles the viewport and geometry side effects.
+        // `ResizeWindowPx` only asks the window for a size; the PTY learns it from `Resized`.
         InputEvent::ScrollView(_)
         | InputEvent::Resize { .. }
         | InputEvent::ResizeWindowPx { .. } => Egress::Reported(Delivery::Full),
     }
 }
 
-/// Escape a dragged-and-dropped file path so it survives as ONE shell argument
-/// when inserted at the prompt. Pure cfg dispatch: POSIX shells escape with
-/// backslashes ([`shell_escape_path_posix`]); on Windows the spawned shell is
-/// pwsh/powershell/cmd (the `aterm-pty` selection order), where backslash is the
-/// PATH SEPARATOR, not an escape — backslash-escaping would split
-/// `C:\Program Files\a.txt` at the space AND double every separator, so Windows
-/// uses double-quote wrapping instead ([`shell_escape_path_windows`]). The
-/// result carries NO trailing space and NO newline; the drop site appends the
-/// single separating space (so an N-file drop concatenates to `p1 p2 p3 `) and
-/// routes the text through the normal paste seam, which never executes it.
+/// Escape a dropped file path so it survives as one shell argument at the prompt: POSIX shells
+/// take backslashes ([`shell_escape_path_posix`]); on Windows the shell is pwsh/powershell/cmd,
+/// where `\` is the path separator, so the path is double-quoted instead
+/// ([`shell_escape_path_windows`]). No trailing space or newline: the drop site appends the one
+/// separating space and routes the text through the paste seam, which never executes it.
 pub(crate) fn shell_escape_path(path: &str) -> String {
     #[cfg(windows)]
     return shell_escape_path_windows(path);
@@ -1729,22 +1476,15 @@ pub(crate) fn shell_escape_path(path: &str) -> String {
     return shell_escape_path_posix(path);
 }
 
-/// Windows drop quoting: wrap the path in double quotes — the ONE quoting form
-/// PowerShell and cmd share — doubling any embedded `"` (`""` is the escaped
-/// quote in both; defensive only, since NTFS forbids `"` and control chars in
-/// names). No backslash escaping: `\` is the path separator and passes through
-/// verbatim. A path of only inert chars (alphanumerics incl. non-ASCII, `\ / :
-/// . - _`) is returned unchanged so tame paths paste clean; anything else —
-/// space, `( )` , `,` (a PowerShell array separator!), `& | < > ; @ $ ' ~` … —
-/// triggers the quotes.
+/// Windows drop quoting: wrap the path in double quotes, the one form PowerShell and cmd share,
+/// doubling any embedded `"` (defensive: NTFS forbids `"` in names). `\` passes through. A path
+/// of only inert characters (alphanumerics, `\ / : . - _`) is returned unchanged; anything else
+/// (space, `( )`, `,` (a PowerShell array separator), `& | < > ; @ $ ' ~` …) is quoted.
 ///
-/// A name whose characters are live inside double quotes
-/// ([`live_in_double_quotes`]: a `$` expansion, which runs `$(…)`, a backtick,
-/// a typographic double quote) goes in single quotes instead
-/// ([`windows_single_quoted`]): a name is chosen by whoever made the file, and
-/// the dropped text runs when the person presses Enter. Known residue: cmd
-/// expands `%VAR%` in either form (an environment value, not code). Defined
-/// winit/fs-free so it is unit-tested on every target.
+/// A name with characters live inside double quotes ([`live_in_double_quotes`]) goes in single
+/// quotes instead ([`windows_single_quoted`]): whoever made the file chose the name, and the
+/// dropped text runs when the person presses Enter. Known residue: cmd expands `%VAR%` in
+/// either form (an environment value, not code).
 #[cfg(any(windows, test))]
 pub(crate) fn shell_escape_path_windows(path: &str) -> String {
     let inert = |c: char| c.is_alphanumeric() || matches!(c, '\\' | '/' | ':' | '.' | '-' | '_');
@@ -1766,12 +1506,11 @@ pub(crate) fn shell_escape_path_windows(path: &str) -> String {
     out
 }
 
-/// Whether `path` holds a character a shell aterm runs on Windows acts on
-/// inside double quotes: PowerShell and Git Bash expand `$name`, `${…}` and
-/// `$(…)` (which RUNS a command) and read a backtick (PowerShell's escape,
-/// bash's command substitution), and PowerShell ends a double-quoted string at
-/// a typographic `“ ” „` as at `"`. A `$` before a separator or at the end
-/// starts nothing (an admin share's `\\host\C$\`), so it stays double-quoted.
+/// Whether `path` holds a character a shell aterm runs on Windows acts on inside double quotes:
+/// PowerShell and Git Bash expand `$name`, `${…}` and `$(…)` (which runs a command) and read a
+/// backtick (PowerShell's escape, bash's command substitution), and PowerShell ends a
+/// double-quoted string at a typographic `“ ” „` as at `"`. A `$` before a separator or at the
+/// end starts nothing (an admin share's `\\host\C$\`), so it stays double-quoted.
 #[cfg(any(windows, test))]
 fn live_in_double_quotes(path: &str) -> bool {
     let mut chars = path.chars().peekable();
@@ -1809,21 +1548,12 @@ fn windows_single_quoted(path: &str) -> String {
     out
 }
 
-/// POSIX drop escaping: backslash-escape the path — byte-for-byte what iTerm2
-/// does on a file drop. The set is iTerm2's `+[NSString
-/// shellEscapableCharacters]` (`NSStringITerm.m`) plus the CR/LF its
-/// dropped-file escaper adds
-/// (`-stringWithEscapedShellCharactersIncludingNewlines:YES`): each listed byte
-/// is prefixed with a backslash so spaces, quotes, globs, command substitution,
-/// history-expansion, redirections, pipes, etc. cannot break the path into
-/// multiple words or run as code. Backslash itself is in the set, so a literal
-/// `\` becomes `\\`; a single forward pass can't double-escape because it reads
-/// only INPUT chars, never the backslashes it just emitted.
-///
-/// Everything outside the set — `/`, `.`, `-`, `_`, `,`, `%`, `:`, letters,
-/// digits, and all multibyte UTF-8 — is shell-inert and passes through verbatim,
-/// so a plain path is returned unchanged. Defined winit/fs-free so it is
-/// unit-tested on every target.
+/// POSIX drop escaping: backslash-escape the path, byte-for-byte what iTerm2 does on a file drop
+/// (`+[NSString shellEscapableCharacters]` in `NSStringITerm.m`, plus the CR/LF of
+/// `-stringWithEscapedShellCharactersIncludingNewlines:YES`), so no listed byte can split the
+/// path or run as code. `\` is in the set; one forward pass reads only input characters, so it
+/// cannot double-escape. Everything else (`/ . - _ , % :`, letters, digits, multibyte UTF-8) is
+/// shell-inert and passes through.
 #[cfg(any(unix, test))]
 pub(crate) fn shell_escape_path_posix(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
@@ -1866,18 +1596,10 @@ pub(crate) fn shell_escape_path_posix(path: &str) -> String {
     out
 }
 
-/// Build the terminal INSERTION for a list of file paths — the clipboard
-/// CF_HDROP paste (audit S9: Ctrl+C a file in Explorer, Ctrl+V in aterm) —
-/// reusing the drag-and-drop contract EXACTLY (`App::drop_file`): each path
-/// shell-escaped ([`shell_escape_path`]) and given ONE trailing space, so a
-/// multi-file copy reproduces iTerm's space-joined `p1 p2 p3 ` and the
-/// insertion ends in a space, NOT a newline — nothing is executed. Empty paths
-/// contribute nothing (mirroring `drop_file`'s empty-path early return).
-/// Winit/fs-free so the join contract is unit-tested on every target; the
-/// escaping itself is pinned by the `shell_escape_path_*` suites above it.
-/// Its one production caller is the Windows `CF_HDROP` arm of
-/// `App::paste_clipboard_into`, hence the Windows-or-test gate (the
-/// `shell_escape_path_posix` shape).
+/// The terminal insertion for a list of file paths (the Windows `CF_HDROP` clipboard paste in
+/// `App::paste_clipboard_into`), on the drag-and-drop contract (`App::drop_file`): each path
+/// shell-escaped and followed by one space, never a newline, so nothing is executed; empty
+/// paths contribute nothing.
 #[cfg(any(windows, test))]
 pub(crate) fn paths_paste_insertion(paths: &[String]) -> String {
     let mut out = String::new();
@@ -1902,31 +1624,16 @@ mod tests {
     use std::os::fd::FromRawFd;
     use std::sync::Arc;
 
-    /// A live PTY-master stand-in whose bytes the test can read back: the harness
-    /// every byte-level test in this module drives [`seam_egress`] against.
+    /// A live PTY-master stand-in whose bytes the test reads back: the harness every byte-level
+    /// test here drives [`seam_egress`] against, on every platform.
     ///
-    /// WHY THIS TYPE EXISTS. Nearly half of this module's byte-level tests used to
-    /// be `#[cfg(unix)]` — including `sgr_pixel_1016_reports_true_pixel_coordinate`,
-    /// which pins the exact DEC 1016 contract the CELL-PX-1 defect broke, so that
-    /// regression could not have been caught on Windows at all. Nothing about the
-    /// SUBSTANCE of those tests is POSIX: `seam_egress` is source-blind, platform-
-    /// blind byte production. Only the HARNESS was — it needed `pipe(2)` and a raw
-    /// fd. Both platforms can supply a readable master, so both now do, and the
-    /// tests run everywhere:
+    /// * POSIX: `pipe(2)`; the `SinkWriter`'s master is the write-end fd.
+    /// * Windows: a `SinkWriter`'s master is a key into aterm-pty's ConPTY session registry, so
+    ///   the capture registers a session whose input handle is a pipe the test reads
+    ///   ([`aterm_pty::adopt_handoff`]), driving the real `write_frame` path and `WriteFile`.
     ///
-    /// * POSIX — `pipe(2)`; the `SinkWriter`'s master IS the write-end fd.
-    /// * Windows — a `SinkWriter`'s master is not a handle at all but a key into
-    ///   aterm-pty's ConPTY session registry, so the equivalent is to REGISTER a
-    ///   session whose input handle is a pipe this test holds the read end of.
-    ///   [`aterm_pty::adopt_handoff`] is exactly that public constructor (it exists
-    ///   for the DefTerm hand-off: "here are the handles, make a session"), so the
-    ///   Windows twin drives the SAME production `write_frame` path — a real
-    ///   `WriteFile` on a real kernel pipe — never a stub.
-    ///
-    /// The remaining `#[cfg(unix)]` tests below are the ones whose ASSERTIONS are
-    /// POSIX (alternate-scroll ARROW COUNTS, which Windows multiplies by
-    /// `SPI_GETWHEELSCROLLLINES`; POSIX backslash path escaping), each marked with
-    /// the reason at its own gate.
+    /// The remaining `#[cfg(unix)]` tests assert POSIX-only facts (alternate-scroll arrow
+    /// counts, which Windows multiplies by `SPI_GETWHEELSCROLLLINES`; backslash escaping).
     #[cfg(unix)]
     struct CaptureSink {
         /// Read end; `-1` once [`Self::drain`] has handed it to a `File`.
@@ -1978,9 +1685,9 @@ mod tests {
         }
     }
 
-    /// See the POSIX twin's docs. On Windows the capture is an anonymous pipe
-    /// registered as a ConPTY session's INPUT handle, so `SinkWriter::write_frame`
-    /// reaches it through the ordinary `aterm_pty::write_some` path.
+    /// See the POSIX twin's docs. On Windows the capture is an anonymous pipe registered as a
+    /// ConPTY session's input handle, so `SinkWriter::write_frame` reaches it through the
+    /// ordinary `aterm_pty::write_some` path.
     #[cfg(windows)]
     struct CaptureSink {
         /// The registry key `SinkWriter` writes through.
@@ -1995,14 +1702,9 @@ mod tests {
 
     #[cfg(windows)]
     impl CaptureSink {
-        /// Pipe buffer. Deliberately far larger than the system default: the
-        /// harness reads only AFTER `seam_egress` returns, and a burst test
-        /// (`MAX_WHEEL_BURST` reports) writing past a 4 KiB buffer with no reader
-        /// would block the blocking `WriteFile` forever — a hang instead of a
-        /// failure, which is a much worse signal. The largest burst the seam can
-        /// produce for ONE event is `MAX_WHEEL_BURST` (512) mouse reports of ten
-        /// bytes each — about 5 KiB — so 256 KiB is ~50x headroom without asking
-        /// the kernel for a megabyte on every capture.
+        /// Pipe buffer, far above the default: the harness reads only after `seam_egress`
+        /// returns, and a burst past a 4 KiB buffer with no reader would block `WriteFile`
+        /// forever. The largest burst (512 reports of ten bytes, ~5 KiB) has ~50x headroom.
         const PIPE_BYTES: u32 = 256 * 1024;
 
         fn new() -> Self {
@@ -2017,19 +1719,16 @@ mod tests {
                 )
             };
             assert_ne!(ok, 0, "CreatePipe for the egress capture");
-            // ONE event object under TWO handles, via the name: the session takes
-            // one as its `client_process` (the waiter only needs something
-            // waitable, and `adopt_handoff` REFUSES a null one), and we keep the
-            // other so `drop` can wake the waiter. A per-capture unique name so two
-            // concurrent tests can never share — or pre-signal — each other's.
+            // One event object under two handles, via the name: the session takes one as its
+            // `client_process` (`adopt_handoff` refuses a null one) and `drop` signals the other
+            // to wake its waiter. The name is unique per capture so concurrent tests never share.
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let name: Vec<u16> = format!("aterm-egress-capture-{}-{nth}\0", std::process::id())
                 .encode_utf16()
                 .collect();
-            // SAFETY: NULL attrs; manual-reset, initially unsignaled; NUL-terminated
-            // wide name. The second call opens the SAME object (documented
-            // `CreateEventW` behaviour for an existing name).
+            // SAFETY: NULL attrs; manual-reset, initially unsignaled; NUL-terminated wide name.
+            // The second call opens the same object (`CreateEventW` on an existing name).
             let ours = unsafe { winapi::CreateEventW(std::ptr::null_mut(), 1, 0, name.as_ptr()) };
             let theirs = unsafe { winapi::CreateEventW(std::ptr::null_mut(), 1, 0, name.as_ptr()) };
             assert!(ours != 0 && theirs != 0, "CreateEventW for the capture");
@@ -2046,11 +1745,10 @@ mod tests {
             self.master
         }
 
-        /// Every byte the sink has written. `PeekNamedPipe` first: the session is
-        /// still live (its write end is open), so a read-to-EOF would block
-        /// forever — the byte COUNT already in the pipe is the exact answer,
-        /// because `write_frame` on Windows is a synchronous blocking `WriteFile`
-        /// that has fully returned before `seam_egress` did.
+        /// Every byte the sink has written. `PeekNamedPipe` first: the session's write end is
+        /// still open, so a read to EOF would block forever, and the count already in the pipe
+        /// is exact because Windows `write_frame` is a synchronous `WriteFile` that returned
+        /// before `seam_egress` did.
         fn drain(&mut self) -> Vec<u8> {
             let mut avail: u32 = 0;
             // SAFETY: live read handle; every optional out-param is NULL-allowed.
@@ -2146,9 +1844,8 @@ mod tests {
         }
     }
 
-    /// Drive ONE [`InputEvent`] through [`seam_egress`] against a real
-    /// [`SinkWriter`] over a readable master, and return the exact bytes that
-    /// reached the "PTY".
+    /// Drive one [`InputEvent`] through [`seam_egress`] against a real [`SinkWriter`] over a
+    /// readable master, and return the exact bytes that reached the "PTY".
     fn egress_bytes(term: &Mutex<Terminal>, ev: &InputEvent) -> Vec<u8> {
         let mut cap = CaptureSink::new();
         let sink = SinkWriter::new(cap.master());
@@ -2163,9 +1860,7 @@ mod tests {
         cap.drain()
     }
 
-    /// `delivered` classifies a `write_frame` result: a full write is `Full`; a
-    /// short write (peer closed mid-frame, `Ok(n<intended)`) or a hard error is
-    /// `Failed` — the property the false-OK fix rests on.
+    /// Only a whole write is `Full`; a short write (peer closed mid-frame) or an error is `Failed`.
     #[test]
     fn delivered_classifies_short_and_failed_writes() {
         assert_eq!(delivered(Ok(5), 5), Delivery::Full);
@@ -2258,12 +1953,9 @@ mod tests {
         assert_eq!(cap.drain(), b"first");
     }
 
-    /// REPLY FIDELITY (audit Finding 1): when the PTY write FAILS, the seam reports
-    /// `Delivery::Failed` (→ `InputOutcome::WriteFailed` → `ERR write failed`), NEVER
-    /// a false OK. An invalid fd makes every write fail deterministically (EBADF, so
-    /// no SIGPIPE). This is the input-seam conformance to the reply-fidelity property
-    /// class: OK iff the bytes actually landed. A faithful empty encoding (a legacy
-    /// key RELEASE — nothing to write) stays `Full`: there was nothing to lose.
+    /// A failed PTY write reports `Delivery::Failed` (`ERR write failed`), never a false OK; an
+    /// invalid fd fails every write deterministically (EBADF, no SIGPIPE). A legacy key release
+    /// encodes to nothing and stays `Full`.
     #[test]
     fn failed_pty_write_is_reported_not_falsely_ok() {
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -2306,11 +1998,8 @@ mod tests {
         );
     }
 
-    /// The `[key_sequences]` egress (`InputEvent::KeySequence`) writes the user's bytes
-    /// to the PTY VERBATIM — no keyboard-mode read, no encoder — even under a mode that
-    /// WOULD re-encode a real key. Empty bytes are a faithful no-op (`Full`), and a
-    /// failed write is reported (`Failed`), never a false OK. (Guards against a future
-    /// refactor "helpfully" routing KeySequence through the encoder.)
+    /// `[key_sequences]` bytes reach the PTY verbatim even under a mode that would re-encode a
+    /// real key; empty bytes are a `Full` no-op and a failed write is `Failed`.
     #[test]
     fn key_sequence_egress_is_verbatim_and_reply_faithful() {
         // Kitty disambiguate + DECCKM: a real ArrowUp here would be re-encoded, but the
@@ -2370,13 +2059,9 @@ mod tests {
         term
     }
 
-    /// P02 — the Key and Text arms encode against the terminal's LOCK-FREE mode
-    /// mirror, never a second `term_lock`. PROOF: this thread HOLDS the terminal
-    /// mutex (the PTY reader mid-`process()` slice) for the whole call and the
-    /// egress must still complete on another thread, byte-exact for the kitty
-    /// mode negotiated before the hold. On the old seam
-    /// (`term_lock(term).keyboard_mode()`) the worker parks behind our guard and
-    /// the receive times out — this test fails red there.
+    /// The Key and Text arms encode against the lock-free mode mirror: with the terminal mutex
+    /// held for the whole call (a reader mid-`process()`), the egress still completes,
+    /// byte-exact for the kitty mode negotiated before the hold.
     #[test]
     fn key_and_text_egress_complete_while_the_terminal_mutex_is_held() {
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -2403,10 +2088,7 @@ mod tests {
                 let _ = tx.send((a, b));
             })
         };
-        // A hang detector, not a latency budget: `held` is dropped only after
-        // this answer, so a seam that parks behind it never answers — a minute
-        // catches that as surely as 5 s did, and a loaded machine cannot fail
-        // the pass.
+        // A hang detector, not a latency budget: `held` drops only after this answer.
         let (a, b) = rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("the seam parked behind the terminal mutex to read keyboard_mode()");
@@ -2440,8 +2122,8 @@ mod tests {
         arrow.repeat(usize::try_from(lines).expect("a non-negative count"))
     }
 
-    /// Drive ONE event through [`seam_egress`] and return the [`Egress`] verdict
-    /// (the variant the viewport side-effects key off), discarding any PTY bytes.
+    /// Drive one event through [`seam_egress`] and return the [`Egress`] verdict, discarding any
+    /// PTY bytes.
     fn egress_of(term: &Mutex<Terminal>, ev: &InputEvent) -> Egress {
         let cap = CaptureSink::new();
         let sink = SinkWriter::new(cap.master());
@@ -2471,7 +2153,7 @@ mod tests {
             super::wheel_route_for(&t, mods)
         };
 
-        // MAIN screen, app grabbing the mouse (SGR tracking).
+        // Main screen, app grabbing the mouse (SGR tracking).
         let tracking = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
         assert_eq!(
             route(&tracking, 0),
@@ -2489,9 +2171,8 @@ mod tests {
             "…and the older Shift bypass is untouched"
         );
 
-        // ALT screen: the override is scoped OUT. There is no scrollback to reach
-        // there, and stealing the wheel would cost the DEC-1007 arrows that
-        // less/man/git-log scroll by.
+        // Alt screen: no override. There is no scrollback there, and taking the wheel would
+        // cost the DEC 1007 arrows less/man/git-log scroll by.
         let alt_tracking = term_with(&[b"\x1b[?1049h", b"\x1b[?1000h", b"\x1b[?1006h"]);
         assert_eq!(
             route(&alt_tracking, ALT_MASK),
@@ -2505,8 +2186,7 @@ mod tests {
             "alternate scroll still converts the wheel to an arrow"
         );
 
-        // No tracking, no alt screen: the wheel was always local, with or without
-        // Option — so the override adds a path, it does not redirect one.
+        // No tracking, no alt screen: the wheel is local with or without Option.
         let plain = term_with(&[]);
         assert_eq!(route(&plain, 0), WheelRoute::Viewport);
         assert_eq!(route(&plain, ALT_MASK), WheelRoute::Viewport);
@@ -2519,10 +2199,8 @@ mod tests {
         assert_eq!(route(&alt_1007_off, 0), WheelRoute::Viewport);
     }
 
-    /// The LOCK-FREE route is the locked one, for every combination of the
-    /// facts it reads: tracking × the alternate screen × DEC 1007 × the
-    /// Shift/Option bypasses — read from the published mode word after the
-    /// same bytes, never from the engine.
+    /// The lock-free route is the locked one for every combination of tracking, the alternate
+    /// screen, DEC 1007 and the Shift/Option bypasses.
     #[test]
     fn the_mirrored_wheel_route_equals_the_locked_one_for_every_mode_combination() {
         use aterm_types::mouse::{ALT_MASK, SHIFT_MASK};
@@ -2600,11 +2278,8 @@ mod tests {
         ));
     }
 
-    /// I12 at the byte level: a tracking + alt-scroll terminal, where mouse
-    /// tracking takes precedence (the unshifted wheel is a real SGR report, never
-    /// a synthesized arrow), but with SHIFT on the event — the seam falls back to the local viewport
-    /// (`TrackingOff` carrying the gesture's lines) and writes NOTHING, so a
-    /// shifted report byte (`64|SHIFT_MASK`) can never leak to the app.
+    /// Over a tracking + alt-scroll terminal a Shift wheel falls back to the local viewport and
+    /// writes nothing, so a shifted report can never leak to the app.
     #[test]
     fn shift_wheel_bypasses_a_tracking_app_with_no_report_bytes() {
         let term = term_with(&[
@@ -2631,17 +2306,15 @@ mod tests {
             }
         ));
         assert!(egress_bytes(&term, &shifted).is_empty());
-        // Control: the unshifted twin still reports (the bypass is the ONLY change).
+        // Control: the unshifted twin still reports.
         assert_eq!(
             egress_bytes(&term, &wheel(WheelDir::Up, 1)),
             b"\x1b[<64;1;1M"
         );
     }
 
-    /// G15 — a tracking-OFF wheel carries the viewport facts the seam read under
-    /// its ONE lock (`display_offset`, `scrollback_lines`, `rows`), so the local
-    /// scroll never re-locks for them. Pinned against the engine's own values at
-    /// the instant of the route, scrolled back so `display_offset` is non-zero.
+    /// A tracking-off wheel carries the viewport facts read under the seam's one lock, matching
+    /// the engine's own values (scrolled back, so `display_offset` is non-zero).
     #[test]
     fn a_viewport_wheel_carries_the_engine_facts_from_its_one_lock() {
         let term = term_with(&[]);
@@ -2732,8 +2405,7 @@ mod tests {
                 ),
                 "{dir:?} must move nothing locally"
             );
-            // …and the same with the alt screen + DEC 1007 armed: alternate scroll
-            // is a VERTICAL substitute (arrows), never a horizontal one.
+            // …and with the alt screen + DEC 1007: alternate scroll is vertical only.
             let pager = term_with(&[b"\x1b[?1049h", b"\x1b[?1007h"]);
             assert!(
                 matches!(
@@ -2752,8 +2424,7 @@ mod tests {
                 ),
                 "{dir:?} must not synthesize arrows for a pager"
             );
-            // …and under the I12 Shift bypass, which asks aterm to take the
-            // gesture: aterm has no horizontal viewport, so it takes nothing.
+            // …and under the Shift bypass: aterm has no horizontal viewport to take it.
             let shifted = InputEvent::Wheel {
                 dir,
                 lines: 2,
@@ -2782,8 +2453,7 @@ mod tests {
                 "shift+{dir:?} bypasses to a viewport that cannot pan"
             );
         }
-        // CONTROL: the vertical twin is untouched — it still carries its lines to
-        // the viewport, which is the behaviour this change must not disturb.
+        // Control: the vertical twin still carries its lines to the viewport.
         let idle = term_with(&[]);
         assert!(matches!(
             seam_egress(
@@ -2819,10 +2489,8 @@ mod tests {
             egress_bytes(&term, &wheel(WheelDir::Up, 3)).len(),
             one.len() * 3
         );
-        // At the ceiling, and clamped just above it. Deliberately only just
-        // above: `egress_bytes` reads its pipe AFTER the write, so an unclamped
-        // burst big enough to exceed the pipe buffer would DEADLOCK the test
-        // instead of failing it, and a hang is a much worse failure signal.
+        // At the ceiling, and just above it: `egress_bytes` reads its pipe after the write, so
+        // an unclamped burst past the pipe buffer would hang instead of failing.
         assert_eq!(
             egress_bytes(&term, &wheel(WheelDir::Up, MAX_WHEEL_BURST)).len(),
             one.len() * MAX_WHEEL_BURST as usize
@@ -2869,15 +2537,13 @@ mod tests {
         // the one that winit's `LineDelta` literally reports.
         assert_eq!(wheel_scaled_lines(1, WheelNotch::Lines(3), 24), 3);
         assert_eq!(wheel_scaled_lines(4, WheelNotch::Lines(3), 24), 12);
-        // A user who set the slider to 1 keeps the old behaviour exactly.
+        // A slider at 1: one line per detent.
         assert_eq!(wheel_scaled_lines(2, WheelNotch::Lines(1), 24), 2);
-        // "One screen at a time" is a PAGE, sized as the viewport so a wheel and
-        // PgUp/PgDn cannot disagree; a degenerate zero-row grid still moves.
+        // "One screen at a time" is one viewport; a zero-row grid still moves.
         assert_eq!(wheel_scaled_lines(1, WheelNotch::Page, 24), 24);
         assert_eq!(wheel_scaled_lines(2, WheelNotch::Page, 50), 100);
         assert_eq!(wheel_scaled_lines(1, WheelNotch::Page, 0), 1);
-        // "Wheel scrolling off" (a literal 0) is honoured as NO motion rather than
-        // clamped up to one line: a user who turned the wheel off meant it.
+        // "Wheel scrolling off" (0) is no motion, not clamped up to one line.
         assert_eq!(wheel_scaled_lines(9, WheelNotch::Lines(0), 24), 0);
         // Absurd values saturate instead of wrapping into a negative scroll.
         assert_eq!(
@@ -3145,10 +2811,9 @@ mod tests {
             }
         };
         let ctrl_ctrl_c = crate::control::parse_ctrl("c").expect("ctrl c parses");
-        // Both encode Ctrl+c; the human path carries the physical base_layout, the
-        // controller carries None. They must produce IDENTICAL BYTES (base_layout
-        // only adds the Kitty 3rd field, which a plain `c` does not change), so we
-        // assert byte-equality through the seam, not struct-equality, here.
+        // Both encode Ctrl+c; the human path carries the physical `base_layout`, the
+        // controller `None`. `base_layout` only adds the Kitty third field, which a plain `c`
+        // leaves unchanged, so compare bytes, not structs.
         for seqs in [&[][..], &[&b"\x1b[>1u"[..]][..]] {
             let term = term_with(seqs);
             assert_eq!(
@@ -3163,8 +2828,8 @@ mod tests {
         let ctrl_press =
             crate::control::parse_mouse("press left 5 9 mods=shift count=2 side=right block=1")
                 .expect("mouse press parses");
-        // Human-equivalent: the on_mouse_input builder fields. mods=SHIFT_MASK,
-        // count=2 from the streak FSM, side=Right (cell half), block from alt held.
+        // Human-equivalent: the `on_mouse_input` builder's fields (count from the streak FSM,
+        // block from Alt held).
         let human_press = InputEvent::MouseButton {
             button: aterm_types::mouse::MouseButton::Left,
             pressed: true,
@@ -3178,8 +2843,7 @@ mod tests {
             // scoped-edge policy is applied by the verb's arm AFTER parsing — so the
             // pure parser output stays struct-identical to the human builder.
             suppress_copy_on_select: false,
-            // The control verb carries no real pointer, so it (and the human
-            // builder, for this struct-equality check) uses the cell origin.
+            // The verb has no real pointer: the cell origin on both sides.
             px_off: PixelOffset::CELL_ORIGIN,
         };
         assert_eq!(human_press, ctrl_press, "mouse-press builder mismatch");
@@ -3210,7 +2874,7 @@ mod tests {
         {
             let mut t = term.lock().unwrap();
             t.set_cell_pixel_size(10, 20); // real font metrics the frontend reports
-            t.process(b"\x1b[?1000h"); // Normal mouse tracking ON
+            t.process(b"\x1b[?1000h"); // Normal mouse tracking on
             t.process(b"\x1b[?1016h"); // SGR-pixel encoding (DEC 1016)
         }
         let press = InputEvent::MouseButton {
@@ -3227,8 +2891,8 @@ mod tests {
         };
         assert_eq!(egress_bytes(&term, &press), b"\x1b[<0;35;48M");
 
-        // The SAME logical press in plain SGR (1006, cell coords) reports the CELL
-        // (col+1, row+1) — proving the pixel math is gated on 1016, not always on.
+        // The same press under plain SGR (1006) reports the cell (col+1, row+1): the pixel
+        // math is gated on 1016.
         let term_cell = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
         assert_eq!(egress_bytes(&term_cell, &press), b"\x1b[<0;4;3M");
     }
@@ -3244,8 +2908,8 @@ mod tests {
     #[test]
     fn jump_prompt_target_finds_prompts_from_an_a_b_only_shell() {
         let mut t = Terminal::new(4, 20);
-        // Two A/B-only prompts separated by enough output to build scrollback,
-        // exactly the shape cmd.exe's PROMPT produces.
+        // Two A/B-only prompts (cmd.exe's PROMPT shape) with enough output between them to
+        // build scrollback.
         t.process(b"\x1b]133;A\x1b\\p1>\x1b]133;B\x1b\\\r\n");
         for _ in 0..6 {
             t.process(b"out\r\n");
@@ -3287,9 +2951,8 @@ mod tests {
         );
     }
 
-    /// The union must not change a fully-marked shell: blocks and command marks
-    /// carry the SAME `prompt_start_row`, so bash/zsh/fish/pwsh/wsl land exactly
-    /// where they did before.
+    /// A fully-marked shell's blocks and command marks carry the same `prompt_start_row`, so the
+    /// union changes nothing for it.
     #[test]
     fn jump_prompt_target_is_unchanged_for_a_fully_marked_shell() {
         let mut t = Terminal::new(4, 20);
@@ -3320,9 +2983,8 @@ mod tests {
         );
     }
 
-    /// `report_coords` is the SOLE coordinate selector: pixel for 1016, cell for
-    /// every other encoding, with the sub-cell offset clamped inside the cell so a
-    /// stray over-range offset can't bleed into the next cell's pixel range.
+    /// `report_coords` gives a pixel for 1016 and the cell for every other encoding, with the
+    /// sub-cell offset clamped inside the cell.
     #[test]
     fn report_coords_selects_pixel_only_for_1016() {
         let mut t = Terminal::new(24, 80);
@@ -3345,10 +3007,8 @@ mod tests {
         );
     }
 
-    /// A drop of a plain path (only shell-inert bytes) is returned BYTE-FOR-BYTE
-    /// unchanged — no spurious escaping, exactly what iTerm2 inserts for a tame
-    /// path. Dots, slashes, dashes, underscores, colons, commas, percent, digits
-    /// and non-ASCII letters all pass through.
+    /// A plain path (only shell-inert bytes) is returned unchanged, as iTerm2 inserts it: dots,
+    /// slashes, dashes, underscores, colons, commas, percent, digits and non-ASCII letters.
     #[test]
     fn shell_escape_path_leaves_plain_paths_unchanged() {
         assert_eq!(
@@ -3363,9 +3023,8 @@ mod tests {
         assert_eq!(shell_escape_path_posix(""), "");
     }
 
-    /// EVERY character in iTerm2's drop escape set (shellEscapableCharacters plus
-    /// CR/LF) is backslash-prefixed, and nothing else is. This pins the exact set
-    /// so a future edit that drops or adds a metacharacter fails loudly.
+    /// Every character in iTerm2's drop escape set (`shellEscapableCharacters` plus CR/LF) is
+    /// backslash-prefixed, and nothing else is.
     #[test]
     fn shell_escape_path_matches_iterm_set_exactly() {
         let set = "\\ ()\"&'!$<>;|*?[]#`\t{}^+=@~\r\n";
@@ -3378,10 +3037,8 @@ mod tests {
         assert_eq!(shell_escape_path_posix(inert), inert);
     }
 
-    /// ADVERSARIAL: a filename crafted to break out of the argument and run code
-    /// is fully neutralised — every shell-significant byte in the OUTPUT is
-    /// preceded by its escaping backslash, so when inserted at the prompt it is an
-    /// inert single argument, never a command substitution / pipe / redirection.
+    /// A filename crafted to break out of the argument is neutralised: every shell-significant
+    /// byte in the output is preceded by its backslash.
     #[test]
     fn shell_escape_path_neutralises_injection() {
         let attack = "/tmp/$(touch pwned);rm -rf ~ `id` | tee >out & evil!.txt";
@@ -3400,21 +3057,17 @@ mod tests {
         }
     }
 
-    /// THE FRAMING FIELD IS THE SEAM'S ONLY ANSWER for a paste: `AtDrain` reads
-    /// DEC 2004 as it stands right now (the write-time contract the control verbs
-    /// keep), and `Gesture` overrides it in BOTH directions — which is the whole
-    /// point, since the writer thread runs arbitrarily later than the gesture and
-    /// the program can move the mode in between.
-    ///
-    /// Sanitize and LF→CR are unaffected either way: only the guards move.
+    /// The framing field is the seam's only answer for a paste: `AtDrain` reads DEC 2004 now
+    /// (the control verbs' write-time contract), and `Gesture` overrides it both ways, since the
+    /// writer thread runs arbitrarily later than the gesture. Sanitizing and LF→CR are
+    /// unaffected.
     #[test]
     fn the_seam_frames_a_paste_by_the_event_not_by_the_moment() {
         let live_off = term_with(&[]);
         let live_on = term_with(&[b"\x1b[?2004h"]);
         let paste = |framing| InputEvent::Paste("ls\nrm -rf ~".to_string(), framing);
 
-        // AtDrain: the live mode — unchanged behaviour for a paste nobody was
-        // promised anything about.
+        // AtDrain: the live mode.
         assert_eq!(
             egress_bytes(&live_off, &paste(PasteFraming::AtDrain)),
             b"ls\rrm -rf ~".to_vec()
@@ -3424,8 +3077,8 @@ mod tests {
             b"\x1b[200~ls\rrm -rf ~\x1b[201~".to_vec()
         );
 
-        // Gesture: the captured answer wins over whatever the mode says NOW, so a
-        // program flipping 2004 under a queued paste changes nothing about it.
+        // Gesture: the captured answer wins over the mode now, so a program flipping 2004
+        // under a queued paste changes nothing.
         assert_eq!(
             egress_bytes(&live_on, &paste(PasteFraming::Gesture { bracketed: false })),
             b"ls\rrm -rf ~".to_vec(),
@@ -3438,17 +3091,10 @@ mod tests {
         );
     }
 
-    /// END-TO-END through the paste seam: the drop site appends one space and
-    /// routes the escaped path through `format_paste`. With bracketed paste OFF
-    /// the bytes are the escaped path + trailing space verbatim (ESC/C1 are still
-    /// stripped); with DEC 2004 ON they are wrapped in the `ESC[200~ … ESC[201~`
-    /// guards — exactly like Cmd-V, and exactly what iTerm sends a 2004-mode app.
-    ///
-    /// STILL `#[cfg(unix)]`: `shell_escape_path` DISPATCHES on the platform, and the
-    /// expected bytes here are the POSIX backslash form (`/p/My\ File`). Windows
-    /// drops quote instead (`shell_escape_path_windows`), which
-    /// `shell_escape_path_windows_*` already pins on every target; only the
-    /// end-to-end paste bytes for the POSIX form live here.
+    /// End to end through the paste seam: the drop site appends one space and pastes the escaped
+    /// path; with DEC 2004 on it is wrapped in `ESC[200~ … ESC[201~`, as Cmd-V is. Unix only:
+    /// the expected bytes are the POSIX form (`/p/My\ File`); `shell_escape_path_windows_*` pin
+    /// the Windows form on every target.
     #[cfg(unix)]
     #[test]
     fn dropped_path_pastes_escaped_with_trailing_space() {
@@ -3457,7 +3103,7 @@ mod tests {
             t.push(' ');
             t
         };
-        // Bracketed paste OFF: literal escaped path + trailing space.
+        // Bracketed paste off: the escaped path and trailing space verbatim.
         let term = term_with(&[]);
         assert_eq!(
             egress_bytes(
@@ -3466,7 +3112,7 @@ mod tests {
             ),
             b"/p/My\\ File ".to_vec()
         );
-        // Bracketed paste ON (DEC 2004): same body inside the bracket guards.
+        // Bracketed paste on (DEC 2004): the same body inside the guards.
         let term = term_with(&[b"\x1b[?2004h"]);
         assert_eq!(
             egress_bytes(
@@ -3477,9 +3123,8 @@ mod tests {
         );
     }
 
-    /// Windows drop quoting: a tame path — separators, drive colon, dots,
-    /// dashes, underscores, non-ASCII letters — passes through verbatim, with
-    /// backslashes NEVER doubled (`\` is the path separator, not an escape).
+    /// Windows drop quoting passes a tame path through verbatim, backslashes never doubled (`\`
+    /// is the separator, not an escape).
     #[test]
     fn shell_escape_path_windows_leaves_plain_paths_unchanged() {
         assert_eq!(
@@ -3493,10 +3138,8 @@ mod tests {
         assert_eq!(shell_escape_path_windows(""), "");
     }
 
-    /// THE flagship Windows case: a path under `Program Files` (embedded space)
-    /// is double-quoted — one argument in PowerShell AND cmd — with every
-    /// backslash intact, not POSIX backslash-escaped into
-    /// `C:\\Program\ Files\\a.txt`.
+    /// A path under `Program Files` (embedded space) is double-quoted, one argument in
+    /// PowerShell and cmd, with every backslash intact.
     #[test]
     fn shell_escape_path_windows_quotes_spaces_keeping_separators() {
         assert_eq!(
@@ -3509,10 +3152,9 @@ mod tests {
         );
     }
 
-    /// PowerShell/cmd metacharacters beyond space — comma (a PowerShell array
-    /// separator!), `& | ; @ $ ' ~` — trigger the quotes; an embedded `"`
-    /// (impossible in NTFS names, defensive for UNC/synthetic input) is doubled,
-    /// the shared escaped-quote form of both shells.
+    /// PowerShell/cmd metacharacters beyond space (`,`, a PowerShell array separator;
+    /// `& | ; @ $ ' ~`) trigger the quotes; an embedded `"` (impossible in NTFS names) is
+    /// doubled, the escaped-quote form both shells share.
     #[test]
     fn shell_escape_path_windows_quotes_metachars_and_doubles_quotes() {
         assert_eq!(shell_escape_path_windows("C:\\a,b.txt"), "\"C:\\a,b.txt\"");
@@ -3523,14 +3165,10 @@ mod tests {
         assert_eq!(shell_escape_path_windows("a\"b"), "\"a\"\"b\"");
     }
 
-    /// A file NAME is chosen by whoever made the file (a download, an archive),
-    /// and a dropped path sits at the prompt until the person presses Enter.
-    /// Inside double quotes PowerShell runs `$(…)` (Git Bash too, and a
-    /// backtick in both), and PowerShell ends a double-quoted string at a
-    /// typographic `”` as at `"`. A name carrying any of them goes in single
-    /// quotes — literal in PowerShell and bash, with every character
-    /// PowerShell reads as a single quote doubled — and cmd, which has no
-    /// single quotes, gets `^` before its separator `&` and its escape `^`.
+    /// A file name is chosen by whoever made the file, and a dropped path runs when the person
+    /// presses Enter. A name with an expansion live inside double quotes (`$(…)`, a backtick, a
+    /// typographic `”`) goes in single quotes, PowerShell's single-quote class doubled and cmd's
+    /// `&` and `^` caret-escaped.
     #[test]
     fn shell_escape_path_windows_never_leaves_an_expansion_live() {
         let dl = "C:\\Users\\me\\Downloads\\";
@@ -3580,8 +3218,7 @@ mod tests {
             paths_paste_insertion(&one),
             format!("{} ", shell_escape_path("C:\\Users\\me\\a.txt"))
         );
-        // Multi-file: iTerm's `p1 p2 p3 ` shape — each escaped, each with its
-        // own trailing space (so the join IS the separator).
+        // Multi-file: iTerm's `p1 p2 p3 ` shape, each path with its own trailing space.
         let many = vec![
             "C:\\Program Files\\a.txt".to_string(),
             "C:\\b (1).png".to_string(),
@@ -3598,17 +3235,13 @@ mod tests {
         assert_eq!(paths_paste_insertion(&[String::new()]), "");
     }
 
-    /// THE I12 DECISION TABLE: Shift bypasses tracking AND alt-scroll — before
-    /// either test, so a shifted wheel can never reach `encode_mouse_wheel`
-    /// (whose SHIFT_MASK fold would leak a shifted report) — while the unshifted
-    /// rows keep the pre-I12 precedence exactly. Pure, so it pins the contract with
-    /// no PTY of any kind — the seam byte tests around it reach the same rows
-    /// through a real `SinkWriter` on every platform ([`CaptureSink`]), but this one
-    /// names the offending ROW when a precedence edit regresses.
+    /// The wheel decision table: Shift bypasses tracking and alt-scroll before either is
+    /// tested, so a shifted wheel never reaches `encode_mouse_wheel` (whose `SHIFT_MASK` fold
+    /// would leak a shifted report). Pure, so a precedence regression names its row.
     #[test]
     fn wheel_route_shift_bypasses_tracking_before_every_other_test() {
         use super::{WheelRoute, wheel_route};
-        // Shift held: the viewport wins over EVERY terminal-mode combination.
+        // Shift held: the viewport wins over every mode combination.
         for tracking in [false, true] {
             for alt_scroll in [false, true] {
                 assert_eq!(
@@ -3618,8 +3251,7 @@ mod tests {
                 );
             }
         }
-        // Unshifted: the pre-I12 ladder, unchanged — tracking first, then
-        // DEC-1007 alt-scroll, then the local viewport.
+        // Unshifted: tracking first, then DEC 1007 alt-scroll, then the local viewport.
         assert_eq!(wheel_route(false, false, true, false), WheelRoute::Report);
         assert_eq!(wheel_route(false, false, true, true), WheelRoute::Report);
         assert_eq!(
@@ -3630,11 +3262,9 @@ mod tests {
             wheel_route(false, false, false, false),
             WheelRoute::Viewport
         );
-        // SELECTION CUSTODY Phase 2: Alt on the main screen reaches local
-        // history over a tracking app — and over nothing else, because the
-        // caller only sets `alt_local` off the alt screen, where `alt_scroll`
-        // can never be true at the same time in practice; the table still
-        // answers every combination.
+        // Alt on the main screen reaches local history over a tracking app. The caller sets
+        // `alt_local` only off the alt screen, so `alt_scroll` is never true beside it in
+        // practice; the table still answers every combination.
         assert_eq!(wheel_route(false, true, true, false), WheelRoute::Viewport);
         assert_eq!(wheel_route(false, true, false, false), WheelRoute::Viewport);
         assert_eq!(wheel_route(false, true, true, true), WheelRoute::Viewport);

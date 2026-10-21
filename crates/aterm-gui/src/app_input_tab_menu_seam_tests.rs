@@ -93,8 +93,7 @@ fn shift_f10_reaches_the_program_by_default_on_both_sources() {
     close(pipe);
 }
 
-/// The card is DRIVABLE from the controller once up — the whole point of
-/// the agreement is that an AI can verify the feature it just built.
+/// Once up, the card is drivable from the controller.
 #[test]
 fn the_controller_walks_and_activates_the_card() {
     let (mut app, wid) = app_with_strip();

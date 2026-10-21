@@ -169,9 +169,7 @@ fn worker_loop(request_rx: Receiver<Request>, proxy: EventLoopProxy<Wake>) {
 
 impl App {
     /// Admit the current Manual source revision to the host lane exactly once.
-    /// Unit-test Apps have no worker and execute the same function inline;
-    /// visible and headless production windows never parse or probe on the
-    /// event loop.
+    /// Production windows, visible or headless, never parse or probe on the event loop.
     pub(crate) fn request_config_host_diagnostics(&mut self, document: DocumentId) {
         let Some(snapshot) = self.document_store.snapshot(document) else {
             return;
@@ -187,10 +185,9 @@ impl App {
         {
             return;
         }
-        // `begin_config_host_analysis` fail-closes every Save face immediately,
-        // including same-document-revision environment refreshes. Publish that
-        // pending state now instead of leaving a cached valid modeline/button
-        // visible until the worker happens to complete.
+        // `begin_config_host_analysis` fail-closes every Save face, including
+        // for an environment refresh at the same revision; publish that now
+        // rather than leave a cached valid modeline/button until the worker ends.
         for (window, instance, view) in self.document_native_views(document) {
             self.invalidate_native_view_cache(window, view, crate::native_app::DamageRegion::All);
             self.refresh_native_presentation(window, instance, view);
@@ -207,11 +204,9 @@ impl App {
             return;
         }
 
-        // A headless launch's UNREDEEMED GPU intent counts as GPU here: the
-        // capability warnings answer "can this run do it", and `ensure_pixel_backend`
-        // may still install the device on the first pixel demand. Reading the live
-        // CPU backend alone would report a denial the same launch would not have
-        // reported before the deferral existed.
+        // An unredeemed headless GPU intent counts as GPU: the capability
+        // warnings answer "can this run do it", and `ensure_pixel_backend` may
+        // still install the device on the first pixel demand.
         let backend_gpu = self.backend.is_gpu() || self.backend_kind_undecided();
         if let Some(lane) = self.native_config_host.as_mut() {
             lane.request(
@@ -225,10 +220,9 @@ impl App {
             return;
         }
 
-        // Unit-test Apps intentionally have no event-loop proxy/worker. Execute
-        // the same complete analysis inline there; a production worker startup
-        // failure is fail-visible and blocks Save instead of moving parse/I/O
-        // work back onto the UI thread.
+        // Unit-test Apps have no event-loop proxy/worker and run the analysis
+        // inline. A production worker that failed to start blocks Save rather
+        // than moving parse/I/O work onto the UI thread.
         let mut analysis = if self.proxy.is_none() {
             let mut analysis = crate::native_config_language::analyze(&snapshot.text);
             analysis.adopt_theme_names(&config_assets.themes);
@@ -332,8 +326,8 @@ mod tests {
             assets(),
         );
         assert!(model.fire("RequestFirst", &mut state));
-        // Generation 2 changes only the environment. This is the byte-equal
-        // asset/font-refresh case the original revision-only latch lost.
+        // Generation 2 changes only the environment: the byte-equal
+        // asset/font-refresh case a revision-only latch would drop.
         lane.request(
             document,
             1,

@@ -55,11 +55,10 @@ use aterm_phase::Program;
 /// The harness lanes written for one program ([`lanes`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lanes {
-    /// THE RELAUNCH ON EXIT: an agent that crashed started again in its own
-    /// tab on its own conversation ([`super::relaunch::on_exit`]; Claude
-    /// Code's `--resume`, Codex's `resume`), under `[harness] relaunch`. It
-    /// gates the stall's remedy too: a frozen agent is ended only where that
-    /// exit is relaunched, so the remedy's lane is this one.
+    /// Relaunch on exit: a crashed agent starts again in its own tab on its
+    /// own conversation ([`super::relaunch::on_exit`]), under
+    /// `[harness] relaunch`. The stall remedy uses this lane too: a frozen
+    /// agent is ended only where its exit is relaunched.
     pub relaunch: bool,
     /// THE LIVE UPGRADE: an idle agent moved onto a newer installed build of
     /// itself ([`super::upgrade_drive`]; Claude Code's restart, and Muse
@@ -68,11 +67,10 @@ pub struct Lanes {
     /// upgrade`. Codex has none: a vendor Codex is shown, never moved, and a
     /// codex-alab upgrades itself (its contract, §5).
     pub upgrade: bool,
-    /// THE RESTART IN PLACE a supervising loop asks for at an idle point
-    /// ([`super::relaunch::restart_here`]: a model's fallback and its return,
-    /// a memory restart, a move to another account): the agent ended there
-    /// and relaunched on its conversation as the worker's own act, under
-    /// `[harness] relaunch`.
+    /// Restart in place: at an idle point a supervising loop asks for
+    /// ([`super::relaunch::restart_here`]: a model fallback and its return, a
+    /// memory restart, an account move), the agent ends and relaunches on its
+    /// own conversation, under `[harness] relaunch`.
     pub restart_in_place: bool,
 }
 

@@ -1,21 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Selection highlight correctness while scrolled into scrollback.
-//!
-//! Selection anchor rows are terminal-relative (0 = top of the live screen,
-//! negative = scrollback). The renderer maps display row `r` to `r -
-//! display_offset` before `contains_cell`, and `selection_to_string` reads
-//! terminal-relative rows. A selection over scrollback made while
-//! `display_offset > 0` copies the scrollback text and highlights the matching
-//! display rows.
+//! A selection made while scrolled back copies the scrollback text and highlights the
+//! matching display rows. Anchor rows are terminal-relative (0 = live top, negative =
+//! scrollback); the renderer maps display row `r` to `r - display_offset`.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 
 #[test]
 fn selection_over_scrollback_highlights_correct_display_rows() {
-    // 5-row screen so it is easy to reason about display vs scrollback.
     let mut term = Terminal::new(5, 20);
     for i in 0..20 {
         term.process(format!("line{i}\r\n").as_bytes());
@@ -66,13 +60,12 @@ fn selection_to_string_bounds_pathological_out_of_range_span() {
 
     {
         let sel = term.text_selection_mut();
-        // Anchor from (0,0) down to a row far past the bottom of the grid.
         sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
         sel.update_selection(i32::MAX, 0, SelectionSide::Right);
         sel.complete_selection();
     }
 
-    // Bounded to the 5 visible rows — returns immediately instead of spinning.
+    // Bounded to the 5 visible rows.
     let copied = term.selection_to_string().expect("selection has text");
     let line_count = copied.split('\n').count();
     assert!(

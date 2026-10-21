@@ -367,9 +367,9 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
     std::fs::write(
         &rc,
         format!(
-            "HISTFILE='{}'\nHISTCONTROL=ignorespace\nalias ls='ls -F'\nPS1='G\\#> '\n. '{}'\n",
-            slashed(&dir.join("history")),
-            slashed(&script)
+            "HISTFILE={}\nHISTCONTROL=ignorespace\nalias ls='ls -F'\nPS1='G\\#> '\n. {}\n",
+            posix_quoted(&dir.join("history")),
+            posix_quoted(&script)
         ),
     )
     .expect("write the rc");
@@ -437,6 +437,126 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
         ),
         "bash {version}: each line's 633;E and 133;D; the console drew: {drawn}"
     );
+}
+
+/// A Git Bash whose `/tmp` went away while it ran still runs every line typed, records it
+/// as typed and gives a line that opens with a subshell its block ([`GIT_BASH_LINES`]),
+/// fresh or with the PS0 a loader of v0.107.0-v0.108.0 left in a running shell. Its
+/// `/tmp` is MSYS2's `usertemp` mount, the TEMP of the session's first MSYS2 process
+/// ([`GIT_BASH`] makes this shell that one, so the folder taken is this test's own), and
+/// `$TMPDIR` is unset, as in a Git Bash tab. Where an MSYS2 process the test did not
+/// start holds the session's `/tmp` (the Git Bash a `cargo test` was typed into), the
+/// test is COULD NOT RUN: it never takes away a folder that is not its own. Measured
+/// 2026-10-21 on Git Bash 5.3.15 before the fix (ATERM-KI-1020-3): after `rmdir /tmp`,
+/// each line printed `bash: function_substitute: cannot open anonymous file for output:
+/// No such file or directory`, ran nothing, and drew the same prompt number again: bash
+/// keeps a `${ ...; }` substitution's output in a file it makes in `/tmp`, and PS0's hook
+/// was one.
+/// NEGATIVE CONTROLS, the same day: with PS0's hook `${| ...; }` but the typed line read
+/// by `${ ...; }` whatever the folder, each line ran with no block (the read failed, in
+/// PS0 and again in the DEBUG trap); without the body's rewrite of an older PS0, the
+/// second start ran no line.
+#[cfg(windows)]
+#[test]
+fn test_git_bash_whose_tmp_went_away_runs_every_line_as_typed() {
+    let Some(bash) = git_bash_exe() else {
+        aterm_spec::host::could_not_run(
+            "git bash without /tmp: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH",
+        );
+    };
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("scripts")
+        .join("aterm_shell_integration.bash");
+    let slashed = |path: &Path| path.display().to_string().replace('\\', "/");
+    for (start, ps0) in [
+        ("fresh", ""),
+        ("v0.108.0's PS0", "PS0='${ __aterm_ps0; }'\n"),
+    ] {
+        let world = PowerShellWorld::new();
+        let dir = world.root.path();
+        let tmp = dir.join("tmp");
+        let rc = dir.join("rc.bash");
+        std::fs::write(
+            &rc,
+            format!(
+                "unset TMPDIR\nHISTFILE={}\nHISTCONTROL=ignorespace\nalias ls='ls -F'\n\
+                 PS1='T\\#> '\n{ps0}. {}\n",
+                posix_quoted(&dir.join("history's")),
+                posix_quoted(&script)
+            ),
+        )
+        .expect("write the rc");
+        let argv: Vec<std::ffi::OsString> = vec![
+            bash.clone().into_os_string(),
+            "--noprofile".into(),
+            "--rcfile".into(),
+            slashed(&rc).into(),
+            "-i".into(),
+        ];
+        let mut shell = ConptyShell::spawn(&world, &argv, &git_bash_test_env(false));
+        shell.wait_for("T1>", &format!("git bash first prompt ({start})"));
+        shell.type_keys(
+            "echo \"R$((40+2))=${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} $(cygpath -m /tmp)\
+             =E$((40+2))\"\r",
+        );
+        shell.wait_for("T2>", &format!("git bash probe ({start})"));
+        let report = drawn_report(&shell.seen);
+        let (version, folder) = report.split_once(' ').unwrap_or_default();
+        let funsub = version.split_once('.').is_some_and(|(major, minor)| {
+            major.parse::<u32>().is_ok_and(|major| {
+                major > 5 || (major == 5 && minor.parse::<u32>().is_ok_and(|minor| minor >= 3))
+            })
+        });
+        if !funsub {
+            aterm_spec::host::could_not_run(format!(
+                "git bash without /tmp: bash {version:?} is older than 5.3, which PS0 needs"
+            ));
+        }
+        assert!(
+            !folder.is_empty(),
+            "git bash ({start}): the probe drew no /tmp; the console drew: {}",
+            shell.drawn()
+        );
+        if !folder.eq_ignore_ascii_case(&slashed(&tmp)) {
+            aterm_spec::host::could_not_run(format!(
+                "git bash without /tmp: /tmp is {folder:?}, the TEMP of an MSYS2 process this \
+                 test did not start (a Git Bash the suite runs from?), not this test's {tmp:?}; \
+                 run the suite from cmd or pwsh with no Git Bash open"
+            ));
+        }
+        std::fs::remove_dir_all(&tmp).expect("take the shell's /tmp away");
+        let skip = shell.seen.len();
+        for (n, &(line, _, _)) in GIT_BASH_LINES.iter().enumerate() {
+            shell.type_keys(&format!("{line}\r"));
+            shell.wait_for(
+                &format!("T{}>", n + 3),
+                &format!("git bash without /tmp ({start}) after {line:?}"),
+            );
+        }
+        let tail = &shell.seen[skip..];
+        let lines = drawn_command_lines(tail);
+        let codes = drawn_exit_codes(tail);
+        let drawn = shell.drawn();
+        shell.type_keys("exit\r");
+        shell.wait_for_exit("git bash exit");
+        drop(shell);
+        assert_eq!(
+            (lines, codes),
+            (
+                GIT_BASH_LINES
+                    .iter()
+                    .map(|&(_, typed, _)| typed.to_owned())
+                    .collect::<Vec<_>>(),
+                GIT_BASH_LINES
+                    .iter()
+                    .map(|&(_, _, code)| code.to_owned())
+                    .collect::<Vec<_>>()
+            ),
+            "git bash without /tmp ({start}): each line's 633;E and 133;D; the console \
+             drew: {drawn}"
+        );
+    }
 }
 
 /// The win32-input-mode record aterm writes for Ctrl+J (`aterm-types`'
@@ -607,8 +727,10 @@ fn drawn_titles(seen: &[u8]) -> Vec<String> {
 /// login profile once and the `~/.bashrc` it reads once, `login_shell` is on, POSIX mode
 /// is off again, the history file is bash's own `~/.bash_history`, `ENV` is gone, and
 /// the integration is loaded. NEGATIVE CONTROL: the `--rcfile` start it had, from the
-/// same folder, loaded Git's prompt three times and `~/.bashrc` twice, in a non-login
-/// shell (the 2026-10-18 verifier's v4-gitbash-start-loads-git-prompt-three-times).
+/// same folder, loads Git's prompt more than once and `~/.bashrc` twice, in a non-login
+/// shell (the 2026-10-18 verifier's v4-gitbash-start-loads-git-prompt-three-times;
+/// how many times depends on Git for Windows' own startup files: three then, five
+/// under 2.56.0.windows.2).
 #[cfg(windows)]
 #[test]
 fn test_a_git_bash_tab_starts_as_a_login_git_bash_that_loads_git_prompt_once() {
@@ -684,9 +806,18 @@ fn test_a_git_bash_tab_starts_as_a_login_git_bash_that_loads_git_prompt_once() {
          integrated:function",
         "a Git Bash tab's start"
     );
+    let control = report(false);
+    let (loads, rest) = control.split_once(',').unwrap_or_default();
+    assert!(
+        loads
+            .strip_prefix("loads:")
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_some_and(|n| n > 1),
+        "CONTROL: the --rcfile start loads Git's prompt more than once: {control:?}"
+    );
     assert_eq!(
-        report(false),
-        "loads:3,profile:1,bashrc:2,login:n,posix:n,hist:.bash_history,env:unset,\
+        rest,
+        "profile:1,bashrc:2,login:n,posix:n,hist:.bash_history,env:unset,\
          integrated:function",
         "CONTROL: the --rcfile start"
     );
@@ -703,7 +834,10 @@ const GIT_BASH_FLAGS_LINE: &str = "__s=\" $(command stty -a | tr '\\n' ' ') \"; 
 /// `stty sane` (the 2026-10-18 verifier's
 /// v4-gitbash-killed-app-echo-repair-gated-on-status). A quick success still takes no
 /// probe, which is the control: the same raw mode left by a bare `stty` stays, until a
-/// failing command repairs it.
+/// failing command repairs it. The control's line restarts the line's clock after its
+/// `stty` (`__aterm_line_t0`), so it reads as quick however long a loaded host takes
+/// to start `stty`: on 2026-10-20, with the whole suite running in the Windows lane, a
+/// bare `stty raw -echo` once took the second and was repaired.
 #[cfg(windows)]
 #[test]
 fn test_git_bash_repairs_its_tty_after_a_raw_program_that_ran_a_second() {
@@ -723,8 +857,8 @@ fn test_git_bash_repairs_its_tty_after_a_raw_program_that_ran_a_second() {
     std::fs::write(
         &rc,
         format!(
-            "HISTFILE=/dev/null\nPS1='T\\#> '\n. '{}'\n",
-            slashed(&script)
+            "HISTFILE=/dev/null\nPS1='T\\#> '\n. {}\n",
+            posix_quoted(&script)
         ),
     )
     .expect("write the rc");
@@ -755,7 +889,10 @@ fn test_git_bash_repairs_its_tty_after_a_raw_program_that_ran_a_second() {
             })
             .unwrap_or_default()
     };
-    run(&mut shell, "stty raw -echo");
+    run(
+        &mut shell,
+        "stty raw -echo; __aterm_line_t0=${EPOCHREALTIME//[!0-9]/}",
+    );
     let quick = flags(&run(&mut shell, GIT_BASH_FLAGS_LINE));
     run(&mut shell, "false");
     let repaired_by_failure = flags(&run(&mut shell, GIT_BASH_FLAGS_LINE));
@@ -887,8 +1024,8 @@ fn test_a_command_title_is_the_whole_line_or_marks_its_cut() {
     std::fs::write(
         &rc,
         format!(
-            "HISTFILE=/dev/null\nPS1='B\\#> '\n. '{}'\n",
-            slashed(&script)
+            "HISTFILE=/dev/null\nPS1='B\\#> '\n. {}\n",
+            posix_quoted(&script)
         ),
     )
     .expect("write the rc");

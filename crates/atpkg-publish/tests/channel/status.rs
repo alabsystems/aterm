@@ -1,9 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `status` over a fake channel: a head past its horizon is still described — verified
-//! but for that horizon, and marked LAPSED — while a quad the client chain does not
-//! accept is refused as ever.
+//! `status` over a fake channel: a head past its horizon is still described (verified but for
+//! that horizon, and marked LAPSED), while a quad the client chain does not accept is refused.
 
 use atpkg_publish::channel::status;
 use atpkg_publish::testkit::Keys;

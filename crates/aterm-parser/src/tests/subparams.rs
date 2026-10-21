@@ -2,8 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Colon subparameter tests: underline styles (curly, dotted, dashed),
-//! mixed colon/semicolon separation, and subparam mask correctness.
+//! Colon subparameters: underline styles, mixed separators and the
+//! subparameter mask.
 
 use super::super::*;
 use super::RecordingSink;
@@ -16,7 +16,6 @@ fn parse_csi_colon_subparams() {
     // SGR 4:3 - curly underline (colon-separated subparameter)
     parser.advance_fast(b"\x1b[4:3m", &mut sink);
 
-    // Should call csi_dispatch_with_subparams since colons are present
     assert_eq!(sink.csi_dispatches.len(), 0);
     assert_eq!(sink.csi_dispatches_with_subparams.len(), 1);
 
@@ -24,7 +23,7 @@ fn parse_csi_colon_subparams() {
     assert_eq!(params, &vec![4, 3]);
     assert_eq!(intermediates, &Vec::<u8>::new());
     assert_eq!(*final_byte, b'm');
-    // Bit 1 should be set (param[1] is a subparameter)
+    // param[1] is a subparameter.
     assert_eq!(*subparam_mask, 0b10);
 }
 

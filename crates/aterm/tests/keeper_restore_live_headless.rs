@@ -112,11 +112,7 @@ impl Drop for Proc {
 fn world(tag: &str) -> World {
     let root = PathBuf::from(format!("/tmp/atkr-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    if root
-        .join("run/aterm/keeper-dev-00000000.sock")
-        .as_os_str()
-        .len()
-        >= headless_boot::MAX_SOCK_PATH
+    if !launch_isolation::sock_fits(&root.join("run/aterm/keeper-dev-00000000.sock"))
         || launch_isolation::prepare(&root).is_err()
     {
         aterm_spec::host::could_not_run("no scratch world with a socket path short enough");

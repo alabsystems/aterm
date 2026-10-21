@@ -338,7 +338,7 @@ const WORD_WINDOW_MAX_ROWS: usize = 64;
 /// word are mapped through those cells
 /// ([`smart_word_in_cells`](aterm_core::terminal::smart_word_in_cells)), never
 /// by re-measuring the text, so the word is selected in the cells the grid
-/// drew it in (ruling 2026-10-11, r16 selection-stride).
+/// drew it in.
 #[must_use]
 pub fn word_span(t: &Terminal, row: i32, col: u16) -> Option<((i32, u16), (i32, u16))> {
     let cols = usize::from(t.cols());
@@ -807,7 +807,7 @@ mod gesture_tests {
         assert_eq!(term.selection_to_string().as_deref(), Some("STRADDLEWORD"));
     }
 
-    /// A double-click on a word AFTER an Indic conjunct selects that word. The
+    /// A double-click on a word after an Indic conjunct selects that word. The
     /// conjunct `न्दी` is one cluster the grid lays out in three cells, so the
     /// window join and the past-the-text guard must charge it three cells, not
     /// its display width of one.
@@ -981,10 +981,8 @@ mod gesture_tests {
     /// A double-click on a wrapped run selects the word in the cells the grid
     /// drew it in when a row holds a VS16 base the grid kept one cell wide in
     /// its last column (it has no room for the spacer), on the screen and from
-    /// scrollback. Re-measuring the row's text counted that base two columns,
-    /// so the run was one column longer than its stride and every word on
-    /// every later row was looked up one cell left of where it is drawn (r16
-    /// selection-stride).
+    /// scrollback. Re-measuring the row's text would count that base as two
+    /// columns and shift every later word one cell left.
     #[test]
     fn a_word_click_after_a_last_column_vs16_base_selects_the_word_drawn_there() {
         let mut term = Terminal::new(4, 10);
@@ -1034,9 +1032,7 @@ mod gesture_tests {
     /// two regional indicators were drawn into neighbouring cells out of order:
     /// the grid folds a flag half only into the cell before the cursor, so they
     /// stay two cells, two columns each, where a walk of the row's text pairs
-    /// them into one two-column flag. That moved every word after them two
-    /// cells left, and padded the row's end, which split the word `pqr`
-    /// straddling the wrap in two (r16 selection-stride).
+    /// them into one two-column flag.
     #[test]
     fn a_word_click_after_regional_indicators_drawn_apart_selects_the_word_drawn_there() {
         let mut term = Terminal::new(4, 10);
@@ -1071,10 +1067,7 @@ mod gesture_tests {
         assert!(word_span(&term, 0, 2).is_none());
 
         // The same run from scrollback, on the ring tier, which draws a row
-        // from its own cells: the halves are still two cells there. Reading
-        // a history row's cells from its stored line paired them, so on the
-        // review's probe a click on `w` found no word and the copy was empty
-        // (r16 selection-stride review).
+        // from its own cells: the halves are still two cells there.
         term.process(b"\r\n1\r\n2\r\n3\r\n4");
         assert_eq!(term.get_line_text(-1, None).as_deref(), Some("qr st"));
         assert!(term.row_continues_previous(-1), "precondition: a soft wrap");
@@ -1107,10 +1100,7 @@ mod gesture_tests {
     /// A word double-clicked in a history row written before a live switch
     /// to `ambiguous_width = "wide"` copies the word drawn there. The row
     /// keeps the cells it was drawn in (two one-cell arrows, `foo` in cells
-    /// 2-4); the copy of a history row re-measured its text under the policy
-    /// now in force, two cells an arrow, so the highlight covered `foo` and
-    /// the clipboard got `→f` (r16 selection-stride review; on origin/main
-    /// the click selected one cell and copied `→`).
+    /// 2-4).
     #[test]
     fn a_word_copied_from_history_after_a_live_ambiguous_switch_is_the_word_drawn_there() {
         let mut term = Terminal::new(4, 20);
@@ -1188,9 +1178,8 @@ mod blocktext_tests {
         FRAMED.with(Cell::get)
     }
 
-    /// The reply the verb gave before its framing left the lock: every line
-    /// collapsed then `trim_end`ed under the lock, and `trim` re-parsing that
-    /// reply to drop rows blank by a spaces-only test.
+    /// Two-step reference framing: every line collapsed and `trim_end`ed, and
+    /// `trim` drops rows that are blank by a spaces-only test.
     fn two_step_reply(text: &str, trim: bool) -> String {
         let rows: Vec<String> = text
             .lines()
@@ -1223,7 +1212,7 @@ mod blocktext_tests {
 
     /// Each row is collapsed and trimmed, `trim` drops exactly the blank tail,
     /// and every reply is the one the two-step framing gave, byte for byte.
-    /// NEGATIVE CONTROL: counting the tail on the raw lines with the spaces-only
+    /// Negative control: counting the tail on the raw lines with the spaces-only
     /// test would keep rows that show nothing.
     #[test]
     fn blocktext_frames_each_row_and_trims_the_blank_tail() {
@@ -1304,7 +1293,7 @@ mod blocktext_tests {
     }
 
     /// `blocktext` frames its reply after the host has released the terminal,
-    /// with or without `trim`; a refusal frames nothing. NEGATIVE CONTROL: the
+    /// with or without `trim`; a refusal frames nothing. Negative control: the
     /// same framing called inside the host's closure is seen inside.
     #[test]
     fn blocktext_frames_after_the_terminal_lock() {

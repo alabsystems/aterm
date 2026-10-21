@@ -21,17 +21,13 @@ pub struct GridCursorState {
     pub saved_cursor: SavedCursor,
     /// Scroll region (DECSTBM).
     pub scroll_region: ScrollRegion,
-    /// Horizontal margins (DECSLRM, VT420+).
-    /// Only active when DECLRMM (mode 69) is enabled.
+    /// Horizontal margins (DECSLRM), active only while DECLRMM (mode 69) is set.
     pub horizontal_margins: HorizontalMargins,
-    /// Tab stops (true = tab stop at this column).
-    /// Default tab stops are every 8 columns.
+    /// Tab stops (true = a stop at this column), every 8 columns by default. Never shorter
+    /// than the grid width: a narrowing keeps the stops past it for a later widen.
     pub tab_stops: Vec<bool>,
-    /// TBC 3 (`CSI 3 g`) cleared all tab stops and no reset has restored the
-    /// defaults since. A resize grows the array seeding every-8 defaults in new
-    /// columns; this flag suppresses that seeding, so a widen cannot resurrect
-    /// cleared stops. The array's length stays the grid width, which the
-    /// checkpoint validates.
+    /// TBC 3 (`CSI 3 g`) cleared every tab stop and no reset has restored the defaults since,
+    /// so a widen seeds no every-8 defaults into the new columns.
     pub tab_defaults_suppressed: bool,
     /// Deferred wrap flag (xterm `do_wrap`).
     ///
@@ -39,18 +35,12 @@ pub struct GridCursorState {
     /// next printable performs the wrap. Cursor movement (CR, LF, BS, CUP, ...)
     /// clears it without wrapping.
     pub pending_wrap: bool,
-    /// BCE (background colour erase) template cell.
-    ///
-    /// Erase operations (ED, EL, ECH, IL, DL, scroll) fill cells with this
-    /// template instead of `Cell::EMPTY`, so erased areas inherit the current
-    /// SGR background. Updated whenever the SGR background changes.
+    /// BCE (background colour erase) template: erases (ED, EL, ECH, IL, DL, scroll) fill with
+    /// it instead of `Cell::EMPTY`, so erased cells take the SGR background.
     pub cursor_template: Cell,
-    /// BCE background RGB for truecolor backgrounds.
-    ///
-    /// When `Some([r, g, b])`, erase/fill/scroll operations write this RGB into
-    /// `RgbColorRing` for every cell they fill with `cursor_template`, since the
-    /// cell's `PackedColors` only records RGB mode. `None` for a default or
-    /// indexed background (self-contained in `cursor_template`).
+    /// The truecolor BCE background, which `cursor_template`'s `PackedColors` records only as
+    /// RGB mode: erases write it into `RgbColorRing` for each cell they fill. `None` for a
+    /// default or indexed background.
     pub cursor_template_bg_rgb: Option<[u8; 3]>,
     /// Presentation-oriented state layered under cursor/region state.
     pub presentation: GridPresentationState,
@@ -165,7 +155,6 @@ impl GridCursorState {
     /// region resets to full screen.
     #[inline]
     pub(crate) fn set_scroll_region(&mut self, top: u16, bottom: u16, visible_rows: u16) {
-        // Clamp bottom to the last visible row (xterm compatibility).
         let bottom = bottom.min(visible_rows.saturating_sub(1));
         if top < bottom {
             self.scroll_region = ScrollRegion { top, bottom };

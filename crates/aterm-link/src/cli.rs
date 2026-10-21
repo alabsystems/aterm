@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-link` — the fabric bridge's command line.
-//!
-//! The two bridge subcommands §11.2 lists (USAGE has the rest):
+//! `aterm-link`: the fabric bridge's command line (`USAGE` lists the subcommands).
 //!
 //! ```text
 //! aterm-link serve --fleet <F> --broker <socket>
@@ -13,51 +11,44 @@
 //!                  --cap-file <path>… [--attention]
 //! ```
 //!
-//! An unknown word is refused BY NAME (exit 2) rather than answered with the
-//! usage text: a typo that prints help reads as a request for help.
+//! An unknown word is refused by name (exit 2) rather than answered with the
+//! usage text: a typo that prints help reads as a request for help. The one
+//! exception is the retired `hook`: a surviving hook entry still runs it on
+//! every prompt, where exit 2 is Claude Code's blocking error, so it answers
+//! exit 0, nothing on stdout, and one line on stderr ([`retired_hook`]).
 //!
-//! The one exception is the retired `hook`: a surviving hook entry still runs
-//! it on every prompt, and exit 2 there is Claude Code's BLOCKING error, so it
-//! answers exit 0, nothing on stdout, one line on stderr ([`retired_hook`]) —
-//! permanently, since no cleanup can reach every project's settings file.
-//!
-//! ## `ls` PRINTS §7'S COLUMNS, AND SAYS WHICH OF THEM HAVE NO WRITER
+//! ## `ls` columns
 //!
 //! §7 pins the row as `<node> <host> <sid> state= inc= role= detail= driving=
-//! holder= hold= fabric= attention=`, and §9.3 sells `ls --attention` as the
-//! human's escalation view: every host's as designed, this machine's nodes' now
-//! that the bus is one machine's (`transport.rs`). Both are printed here, in that
-//! order, and `--attention` keeps only the rows carrying one.
+//! holder= hold= fabric= attention=`, and §9.3 uses `ls --attention` as the
+//! human's escalation view. Both are printed in that order, and `--attention`
+//! keeps only the rows carrying one.
 //!
-//! THREE OF THOSE COLUMNS HAVE NO WRITER IN THIS FABRIC YET, and they print `-`
-//! rather than being dropped, because `-` is the truth ("unknown") and a missing
-//! column is a reader silently disagreeing with the design:
+//! Three of those columns have no writer on session rows and print `-` ("unknown"):
 //!
-//! * `driving=` is in §4.2's presence body but
-//!   [`crate::bridge::Bridge::publish_session_presence`] does not publish it,
-//!   so every row shows `-`. (`role=` and `detail=` are written by
-//!   [`crate::presence`] on a `presence = "meta"` bridge, the default; a
-//!   `minimal` bridge shows `-`.)
-//! * `host=` and `fabric=` are published on the NODE's own presence row only
+//! * `driving=` is in §4.2's presence body, but
+//!   [`crate::bridge::Bridge::publish_session_presence`] does not publish it.
+//!   (`role=` and `detail=` are written by [`crate::presence`] on a
+//!   `presence = "meta"` bridge, the default; a `minimal` bridge shows `-`.)
+//! * `host=` and `fabric=` are published on the node's own presence row only
 //!   (`bridge.rs`'s `bring_presence_up`): `fabric=` on a session row was a
 //!   constant nothing could falsify. A session row shows `-` for both; the
 //!   node row above it carries the answer.
 //!
-//! SIX COLUMNS ARE ADDED to §7's set, at the end, because each has a real
-//! writer and a real reader: `gen=` (§6.6's `<content_seq>:<fp16>`, what a
+//! Six columns are added at the end: `gen=` (§6.6's `<content_seq>:<fp16>`, what a
 //! `gen=`-bound approval is minted against), `observer=` (§11.2's watching,
 //! non-hosting attachment — a row an operator must not read as a host),
 //! `epoch=` (the launch nonce a drive record is fenced on), `phase=` (the
 //! server's `status agent=` verdict, relayed), `context=` (no longer written;
 //! printed for rows an older bridge wrote) and `title=` (the session's `meta
-//! set title` user title, else `-`; NEVER the terminal's title, which the
+//! set title` user title, else `-`; never the terminal's title, which the
 //! program writes — [`crate::presence`]; 128 bytes).
 //!
-//! EVERY PRINTED FIELD IS UNTRUSTED. A presence body is written by whatever node
+//! Every printed field is untrusted: a presence body is written by whatever node
 //! holds `rw,p=<n>:/f/<F>/pub/<n>/>`, and `attention=` is free text a session
-//! chose. Each column is normalised through [`crate::pct`] before it is
-//! printed, so a row is always one whitespace-delimited token per column of
-//! printable ASCII and no body can move an operator's cursor.
+//! chose. Each column is normalised through [`crate::pct`] before printing, so
+//! a row is always one whitespace-delimited token per column of printable ASCII
+//! and no body can move an operator's cursor.
 
 use std::process::ExitCode;
 
@@ -147,10 +138,10 @@ pub fn dispatch_with_inherited_lanes(
 ) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("serve") => run(&args[1..], true, take_lanes),
-        // THE READ-SIDE VERBS DEFAULT THEIR FLAGS from the rendezvous file
+        // The read-side verbs default their flags from the rendezvous file
         // (`crate::enable`); `serve` does not, because aterm launches it with
         // every flag spelled out and a bridge that silently took a different
-        // broker than its config names would be the report lying about itself.
+        // broker than its config names would make the report lie about itself.
         //
         // No rendezvous file and no flags: say what was checked, not "no
         // fabric" — a hand-written `[fabric] command` writes no rendezvous file.
@@ -176,11 +167,11 @@ pub fn dispatch_with_inherited_lanes(
         Some("broker") => broker(&args[1..]),
         Some("mint") => mint(&args[1..]),
         Some("fabric") => crate::fabric::main(&args[1..]),
-        // THE RETIRED `hook` VERB: a silent no-op, never a refusal ([`retired_hook`]).
+        // Retired: a no-op, never a refusal ([`retired_hook`]).
         Some("hook") => retired_hook(),
         // Asked for: stdout, exit 0, like `aterm --help` and `broker -h`.
         Some("-h" | "--help" | "help") => aterm_uds::stdout::answer_exit("aterm link", USAGE, 0),
-        // Refused BY NAME (module doc).
+        // Refused by name (module doc).
         Some(other) => {
             eprintln!("aterm-link: unknown subcommand `{other}`");
             eprint!("{USAGE}");
@@ -198,16 +189,13 @@ pub const RETIRED_HOOK_LINE: &str =
     "aterm-link: `hook` is retired and does nothing — delete this entry from the settings file \
      that runs it";
 
-/// `aterm link hook …`, any arguments: EXIT 0, NOTHING ON STDOUT, one stderr line
-/// ([`RETIRED_HOOK_LINE`]) — kept permanently.
+/// `aterm link hook …`, any arguments: exit 0, nothing on stdout, one stderr line
+/// ([`RETIRED_HOOK_LINE`]). Permanent: no cleanup reaches every project's settings file.
 ///
-/// A hook entry aterm once wrote can survive in a project's
-/// `.claude/settings.local.json` or a running Claude Code, and exit 2 there is
-/// Claude Code's BLOCKING error. Exit 0 is "go on"; stdout stays empty because a
-/// `UserPromptSubmit` or `SessionStart` hook's stdout joins the model's context.
-/// Stdin (the event's JSON, possibly a whole pasted prompt) is drained first, with
-/// no byte cap, so the writer never meets a closed pipe. Never read from a
-/// terminal: a person typing the verb gets the line at once.
+/// A hook entry aterm once wrote can survive in a project's `.claude/settings.local.json` or a
+/// running Claude Code, where exit 2 is a blocking error and a `UserPromptSubmit` or
+/// `SessionStart` hook's stdout joins the model's context. Stdin (the event's JSON) is drained
+/// first, uncapped, so the writer never meets a closed pipe; a terminal is never read.
 fn retired_hook() -> ExitCode {
     use std::io::IsTerminal as _;
     let stdin = std::io::stdin();
@@ -240,9 +228,8 @@ fn run(
             return ExitCode::from(2);
         }
         let mut cfg = parsed.cfg;
-        // `serve` defaults `[fabric] presence` and `[fabric] receipts` from
-        // aterm.toml: they are knobs on what the bridge publishes, not on which
-        // broker it reaches, so they cannot make the report lie about the bus.
+        // `serve` defaults `[fabric] presence` and `receipts` from aterm.toml: they shape what
+        // the bridge publishes, not which broker it reaches.
         if !parsed.presence_given {
             cfg.presence = crate::fabric::presence_from_config();
         }
@@ -294,20 +281,16 @@ pub(crate) struct Parsed {
     pub(crate) log_given: bool,
 }
 
-/// One printed column, made safe and made a single token.
+/// One printed column as one safe token: printable ASCII, no whitespace, no escape sequence,
+/// `-` when empty.
 ///
-/// A presence body is written by another host and `attention=` is free text a
-/// session chose, so a value reaches here already pct-encoded by its writer —
-/// or NOT, if its writer is hostile. Decoding and re-encoding is idempotent on
-/// a well-formed token and total on a malformed one ([`crate::pct`]), and
-/// it is the step that guarantees what the row's shape promises: printable
-/// ASCII, no whitespace, no escape sequence, one token per column.
+/// A value arrives pct-encoded by its writer, or not if the writer is hostile. Decoding and
+/// re-encoding ([`crate::pct`]) is idempotent on a well-formed token and total on a malformed
+/// one.
 fn column(raw: &str) -> String {
     let mut safe = crate::pct::encode(&crate::pct::decode(raw));
-    // BOUNDED by the same [`crate::glance::ATTENTION_CAP`] the bridge's writer
-    // and `glance` use: a row from another host need not have gone through
-    // the bridge's writer. The cut is on an escape boundary, never inside a
-    // `%XX`, and the mark is the ASCII-encoded ellipsis `glance` appends.
+    // Bounded by the cap the bridge's writer and `glance` use (another host's row need not
+    // have gone through that writer), cut on an escape boundary, never inside a `%XX`.
     if safe.len() > crate::glance::ATTENTION_CAP {
         // The mark is inside the cap.
         safe = crate::presence::clamp_pct(&safe, crate::glance::ATTENTION_CAP - ELLIPSIS.len());
@@ -356,8 +339,8 @@ fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
     })
 }
 
-/// One roster line, and whether it is an ESCALATION. Split out of [`roster`]
-/// so §7's column set is testable without a broker.
+/// One roster line, and whether it is an escalation; split out of [`roster`] so §7's column
+/// set is testable without a broker.
 fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
     let segs: Vec<&str> = subject.split('/').collect();
     let node = column(segs.get(4).unwrap_or(&"-"));
@@ -368,9 +351,8 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
             .map_or_else(|| "-".into(), |v| column(v))
     };
     let attention = field("attention");
-    // The same three-way test `notify::Sel::Attention` makes: absent, empty and
-    // the `-` an absent field renders as are all "no escalation", so the two
-    // faces of §9.3's question cannot disagree.
+    // The test `notify::Sel::Attention` makes: absent, empty and `-` are all no escalation, so
+    // `ls --attention` and the notifier cannot disagree.
     let escalating = attention != "-";
     let line = format!(
         "{node} {} {owner} state={} inc={} role={} detail={} driving={} \
@@ -385,12 +367,9 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
         field("holder"),
         field("hold"),
         field("fabric"),
-        // `gen=` and `epoch=` are KNOWN body fields (§4.1), so they are parsed
-        // into `Body` and never reach `unknown` — reading them through the
-        // unknown map would print `-` for every row.
+        // Known body fields (§4.1): parsed into `Body`, so never in `unknown`.
         body.gen.as_deref().map_or_else(|| "-".into(), column),
-        // ABSENT MEANS `0`, not unknown: only an observer attachment writes the
-        // token (§11.2), so a row without one is a host.
+        // Absent means `0`, not unknown: only an observer attachment writes it (§11.2).
         body.unknown
             .get("observer")
             .map_or_else(|| "0".to_string(), |v| column(v)),
@@ -409,12 +388,11 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
     (line, escalating)
 }
 
-/// Parse argv. Every flag takes a value; a flag without one is a usage error
-/// rather than a silently defaulted setting.
+/// Parse argv. A flag that takes a value and has none is a usage error, not a defaulted
+/// setting.
 ///
-/// `pub(crate)` because `aterm fabric` reads the fleet, broker, cap files and
-/// state dir out of `[fabric] command` with THIS parser — the one the bridge it
-/// describes was started with — rather than a second one that could disagree.
+/// `aterm fabric` reads the fleet, broker, cap files and state dir out of `[fabric] command`
+/// with this parser, the one the bridge was started with, so the two cannot disagree.
 pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut attention = false;
     let mut presence_given = false;
@@ -429,8 +407,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         sock: None,
         token: None,
         presence: crate::presence::Mode::Meta,
-        // ON, matching `receipts_from_config`'s absent-key answer and what
-        // `aterm fabric on` writes.
+        // On, matching `receipts_from_config`'s absent-key answer and what `aterm fabric on`
+        // writes.
         receipts: true,
         // OFF, matching `log_from_config`'s absent-key answer (D4 is open).
         log: crate::mirror::LogMode::Off,
@@ -490,10 +468,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     if cfg.state_dir.is_empty() {
         cfg.state_dir = default_state_dir();
     }
-    // Read the way every control client reads an instance token
-    // (`aterm_ctl::read_control_token_file`): a symlink planted at the name is
-    // refused rather than followed, only a regular file is read, and no more
-    // than a token's bound of it.
+    // Read as every control client reads an instance token
+    // (`aterm_ctl::read_control_token_file`): a symlink is refused, only a regular file is
+    // read, and no more than a token's bound of it.
     if let Some(path) = token_file {
         cfg.token = Some(
             aterm_ctl::read_control_token_file(std::path::Path::new(&path))
@@ -517,10 +494,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     })
 }
 
-/// `$XDG_STATE_HOME/aterm-link`, else `$HOME/.local/state/aterm-link`, else the
-/// working directory — never a temp dir, because losing the node id loses the
-/// node's mail lane. `aterm-link notify` reads its journal under the same
-/// directory (§9.3: "beside the bridge's other durable state").
+/// `$XDG_STATE_HOME/aterm-link`, else `$HOME/.local/state/aterm-link`, else
+/// `./aterm-link-state`; never a temp dir, because losing the node id loses the node's mail
+/// lane. `aterm-link notify` keeps its journal under the same directory (§9.3).
 pub(crate) fn default_state_dir() -> String {
     if let Ok(x) = std::env::var("XDG_STATE_HOME") {
         if !x.is_empty() {
@@ -538,19 +514,20 @@ pub(crate) fn default_state_dir() -> String {
 /// `aterm link broker <socket> [log]` — run the bus this instance's bridge talks to.
 ///
 /// A Unix socket created world-connectable — nothing chmods it and no peer uid
-/// is checked — so WHO can connect is bounded by the DIRECTORY you put it in,
-/// 0700. What a connection may SAY is the guard's: with `--secret-file` it is
+/// is checked — so who can connect is bounded by the 0700 directory you put it
+/// in. What a connection may say is the guard's: with `--secret-file` it is
 /// `Broker::open_guarded`, every attach must carry a capability minted under
 /// that secret, and every request is authorized against the grants attached.
-/// THE ROOT'S SECRET GUARDS THE ROOT'S SOCKET: with no `--secret-file`, a
+/// The root's secret guards the root's socket: with no `--secret-file`, a
 /// `mint.secret` beside the socket (`aterm fabric on`'s layout) is the secret,
 /// so a supervisor job written before `on` passed the flag comes back guarded
-/// the next time it starts the broker (an update, a login) — one that cannot be
-/// read is a refusal, never an unguarded broker. Only a socket with no secret
-/// beside it is served unguarded, and the banner says so.
+/// the next time it starts the broker — one that cannot be read is a refusal,
+/// never an unguarded broker. Only a socket with no secret beside it is served
+/// unguarded, and the banner says so.
 ///
 /// The secret is a file, never an argument (an argv is world-readable in `ps`),
-/// and it must be mode 0600 ([`transport::check_private`]).
+/// and it must be mode 0600 or tighter, read by astream's one secret-file rule
+/// ([`transport::read_mint_secret`]).
 ///
 /// `--durability strict|ordered|relaxed` is what an ack promises, guarded or
 /// not ([`crate::durability`]): `strict` acks after the full flush; `ordered`
@@ -560,21 +537,20 @@ pub(crate) fn default_state_dir() -> String {
 /// mark), served strict by astream where the device cannot promise the order;
 /// `relaxed` after the page-cache write, which survives a broker crash and not
 /// a power loss (the table applies there too). A broker of any tier but strict
-/// takes the stop signals: its CLEAN STOP — SIGTERM, SIGINT or SIGHUP, or its
+/// takes the stop signals: its clean stop — SIGTERM, SIGINT or SIGHUP, or its
 /// exit for a replaced build — drops its listener, and astream flushes the log
 /// and records it `Closed`, so a reboot after it moves nothing. A weak run
 /// that never stopped cleanly moves the log's generation, with lineage, at the
 /// first open in another boot ([`astream_broker::LogIdentity`]), so every
 /// bridge and notifier resumes where the log continues instead of trusting an
-/// offset a power loss took. A strict broker keeps the signals' default action,
-/// as before. A bare argv runs the build's default
-/// ([`crate::durability::default_for`]: ordered for a broker whose argv names
-/// `--secret-file`, which astream serves strict where the device cannot keep
-/// the order, and strict for one naming none) and a named
-/// tier — strict included — is kept, so `aterm fabric` reads the tier off the
-/// process table and the tier SERVED off the broker's `Hello`.
+/// offset a power loss took. A strict broker keeps the signals' default action.
+/// A bare argv runs the build's default ([`crate::durability::default_for`]:
+/// ordered for a broker whose argv names `--secret-file`, which astream serves
+/// strict where the device cannot keep the order, and strict for one naming
+/// none) and a named tier — strict included — is kept, so `aterm fabric` reads
+/// the tier off the process table and the tier served off the broker's `Hello`.
 ///
-/// IT EXITS WHEN ITS BUILD IS REPLACED. A supervised broker is a `KeepAlive`
+/// It exits when its build is replaced. A supervised broker is a `KeepAlive`
 /// launchd job or a `Restart=always` unit, and an update swaps the file its
 /// argv names in place: without this the old broker serves until the next
 /// login while every bridge runs the new build, so a broker-side fix — or a
@@ -585,7 +561,7 @@ pub(crate) fn default_state_dir() -> String {
 /// supervises then stays down: run one by hand under something that restarts
 /// it, or restart it yourself.
 ///
-/// IT EXITS WHEN ITS LOG IS POISONED ([`crate::broker_health`]). astream
+/// It exits when its log is poisoned ([`crate::broker_health`]). astream
 /// refuses every write to a log whose full flush failed with acked records at
 /// risk, or whose rollback could not put the file back, until the log is
 /// reopened — and only a new open reopens it. Every
@@ -698,8 +674,7 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
     let durability = parsed.durability.cloned();
     let repair = parsed.repair;
     let words: Vec<&str> = parsed.words.iter().map(|word| word.as_str()).collect();
-    // THE REPAIR SERVES NOTHING: one local file, and no other flag of the
-    // line means anything to it — refused rather than ignored.
+    // `--repair` serves nothing: one local file, and any other flag is refused.
     if repair {
         if secret_file.is_some() || durability.is_some() {
             eprintln!("aterm link broker: --repair takes <log> alone: it serves nothing");
@@ -743,9 +718,9 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
             return usage_error(&format!("unexpected argument `{extra}`"));
         }
     };
-    // THE ROOT'S SECRET GUARDS THE ROOT'S SOCKET (the doc above). Present at
-    // all — a symlink, an unreadable file — is enough to make it the secret,
-    // so a broken one is the reader's refusal below, never an unguarded bus.
+    // A socket broker without `--secret-file` takes the `mint.secret` beside its socket.
+    // Present at all (a symlink, an unreadable file) makes it the secret, so a broken one is
+    // refused below, never served unguarded.
     let secret_file = secret_file.or_else(|| {
         let beside = std::path::Path::new(&endpoint).with_file_name(crate::enable::MINT_SECRET);
         std::fs::symlink_metadata(&beside)
@@ -766,29 +741,28 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
             return ExitCode::FAILURE;
         }
     };
-    // Whether THIS call creates the log, so a refused bind can remove the
-    // empty file it would otherwise leave behind.
+    // Whether this call creates the log, so a refused bind can remove the empty file.
     let log_created_here = !std::path::Path::new(&log).exists();
     // Whether it checks capabilities: what its promise says of a person's own
     // posts ([`crate::durability::describe_served`]).
     let guarded = secret.is_some();
-    // THE TIER, AND THE BOOT IT IS OPENED IN ([`crate::durability::open`]): a
+    // The tier, and the boot it is opened in ([`crate::durability::open`]): a
     // legacy relaxed mark from another boot is read into astream's unclean
     // verdict, under the log's lock, whatever this run's tier. The boot is
     // astream's own reading, the one the bridge's incarnation lease trusts
     // ([`crate::durability::this_boot`]).
     let boot = crate::durability::this_boot();
-    // A BROKER OF ANY TIER BUT STRICT STOPS CLEANLY: from here the stop
+    // A broker of any tier but strict stops cleanly: from here the stop
     // signals wake the loop below instead of killing the process, so its
     // listeners are dropped and astream closes the log cleanly (a full flush,
-    // then `Closed` in its sidecar) before it exits. Taken BEFORE the open:
+    // then `Closed` in its sidecar) before it exits. Taken before the open:
     // astream's writer and acceptors are this process's first threads after
     // main, and each inherits the mask. A strict broker's acks are on the
-    // disk already, and it keeps the default action, as before.
+    // disk already, and it keeps the default action.
     let stop = (durability != crate::durability::Durability::Strict)
         .then(|| take_stop_signals(std::thread::current()))
         .flatten();
-    // THE FAULT SEAM ([`crate::broker_health::Seam`]): nothing in a release
+    // The fault seam ([`crate::broker_health::Seam`]): nothing in a release
     // build. In a dev one, the escalation rules a test adds go into the open,
     // and its `sync` is armed once the log is open and before anything is
     // served, so the first full flush meets it.
@@ -823,7 +797,7 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
         }
         Err(e) => {
             eprintln!("aterm link broker: open {log}: {e}");
-            // THE LAST LINE IS ATERM'S REMEDY, when the refusal has one: the
+            // The last line is aterm's remedy, when the refusal has one: the
             // supervisor appends this stderr to `<root>/broker.err`, whose last
             // line `aterm fabric` and doctor quote ([`log_refusal_remedy`]).
             if let Some(remedy) = log_refusal_remedy(e.kind(), &log) {
@@ -849,14 +823,14 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
             return ExitCode::FAILURE;
         }
     };
-    // THE BROKER'S HEALTH, IN ASTREAM'S FORMAT ([`crate::broker_health`]):
+    // The broker's health, in astream's format ([`crate::broker_health`]):
     // astream keeps `<log>.health` from here — written now, every
     // [`crate::broker_health::HEALTH_EVERY`], at once when the log is
     // poisoned, and a last time when the broker stops cleanly (the loop
     // below drops it: an exit of its own, or a stop signal, which a strict
     // broker does not take — killed, it leaves the last periodic one) — and
     // `aterm fabric` and doctor read it with astream's reader. aterm writes
-    // no health file of its own. Kept once the socket is SERVED, so a refused
+    // no health file of its own. Kept once the socket is served, so a refused
     // bind leaves no snapshot of a broker that never served. One astream
     // cannot write is said here and tried again every period by astream; the
     // broker serves either way, since its health is a report about it, never
@@ -877,14 +851,14 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
     };
     // The readiness line a supervisor waits for (`asb serve`'s word).
     //
-    // WRITTEN, NEVER PRINTED: a supervisor may close the pipe after the first
+    // Written, never `println!`: a supervisor may close the pipe after the first
     // line, and `println!` on a closed stdout panics (Rust ignores SIGPIPE).
     {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "listening {endpoint}");
         let _ = out.flush();
-        // The tier SERVED is the broker's own word (`Hello`'s tag 0x01, the
+        // The tier served is the broker's own word (`Hello`'s tag 0x01, the
         // same answer status and doctor read), never inferred from the flag:
         // astream serves `ordered` strict where the disk cannot promise the
         // order, and the line then says "served strict" and why.
@@ -904,30 +878,28 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
     // executable and, for any tier but strict, waits for a stop signal.
     // `BrokerHandle` has no `join` — `asb serve` parks the same way — and
     // dropping the handle shuts the broker down and unlinks the socket, which
-    // is how it EXITS when its build is replaced, it is stopped, or its log is
+    // is how it exits when its build is replaced, it is stopped, or its log is
     // poisoned (the doc above).
     //
-    // ALWAYS A TIMED PARK, whatever else is watched: the poison look runs
+    // Always a timed park, whatever else is watched: the poison look runs
     // every [`crate::broker_health::POLL`] on every broker, so one whose
-    // executable cannot be watched (no image answer) is cured too — it used to
-    // park here for good, with nothing to wake it but a stop signal. The
+    // executable cannot be watched (no image answer) is cured too. The
     // executable is still looked at every [`EXE_WATCH`] (a `stat`), and a stop
     // signal still unparks the loop at once.
     //
-    // THE LOOK TAKES NO LOCK ([`astream_broker::Broker::poisoned`], one
-    // atomic load since the pin's 4c3d2c7): astream's writer holds the log's
-    // lock across a rollback and the log-identity I/O — slow on the failing
-    // disk this is for — and publishes the poison only after that I/O, so the
-    // look never waits on the device and a poison it sees has its `Lossy`
-    // record already written. It stays a timed park rather than astream's
-    // `wait_poisoned`, because a stop signal wakes this thread by unparking
-    // it, which astream's wait does not hear.
+    // The look takes no lock ([`astream_broker::Broker::poisoned`]): astream's
+    // writer holds the log's lock across a rollback and the log-identity I/O —
+    // slow on the failing disk this is for — and publishes the poison only
+    // after that I/O, so the look never waits on the device and a poison it
+    // sees has its `Lossy` record already written. It stays a timed park
+    // rather than astream's `wait_poisoned`, because a stop signal wakes this
+    // thread by unparking it, which astream's wait does not hear.
     //
-    // ITS LAST SNAPSHOT NAMES THE POISON: the exit below drops the listeners,
+    // Its last snapshot names the poison: the exit below drops the listeners,
     // which stops astream's broker, whose stop writes `<log>.health` a last
     // time and lets it go, so astream's reader calls it the last word of a
     // broker that is gone, never a serving one's. `aterm fabric` reads the
-    // snapshot beside the log a SERVING process names, so while nothing serves
+    // snapshot beside the log a serving process names, so while nothing serves
     // it quotes this exit's line from `broker.err` instead, and the restarted
     // broker's first snapshot replaces the file.
     let keep = handle;
@@ -941,7 +913,7 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
         } else if let Some(reason) = broker.poisoned() {
             use std::io::Write as _;
             if seam.on_poison == crate::broker_health::OnPoison::Stay {
-                // THE NEGATIVE CONTROL's seam (a dev build's only): said once,
+                // The negative control's seam (a dev build's only): said once,
                 // and the broker serves on over its poisoned log.
                 if !poison_said {
                     let _ = writeln!(
@@ -955,13 +927,13 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
                 }
                 continue;
             }
-            // THE CURE ([`crate::broker_health`]): astream refuses every write
+            // The cure ([`crate::broker_health`]): astream refuses every write
             // until the log is reopened, and only a new open reopens it. The
             // listeners go first, then the broker — astream's close stays
             // silent over a poisoned log and records nothing `Closed`, so the
             // run stays as astream left it (`Lossy` after a failed full flush,
             // which moves the generation at the reopen) — and the line naming
-            // astream's reason LAST, so it is `broker.err`'s last word, the one
+            // astream's reason last, so it is `broker.err`'s last word, the one
             // `aterm fabric` and doctor quote.
             let restart = (!crate::broker_health::supervised()).then(|| {
                 let argv: Vec<String> = std::env::args_os()
@@ -996,16 +968,16 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
         use std::io::Write as _;
         let mut err = std::io::stderr();
         let _ = writeln!(err, "aterm link broker: {why}");
-        // THE CLEAN CLOSE: dropping the last listener joins the writer —
+        // The clean close: dropping the last listener joins the writer —
         // nothing acks after it — and astream then flushes the log in full and
         // records it `Closed` before it releases the lock, so a reboot after
         // this keeps the identity at any tier. astream says on stderr, just
         // above this line, if that close failed (the run then stays `Open`,
         // and the next open in another boot moves the generation once: the
-        // safe direction). Over a POISONED log astream closes nothing and says
+        // safe direction). Over a poisoned log astream closes nothing and says
         // nothing, so this line says it.
         //
-        // READ AFTER THE DROP, never before: the writer's join drains the
+        // Read after the drop, never before: the writer's join drains the
         // batch still queued at the signal, and that batch's failed full flush
         // (or rollback) can poison the log inside the drop — after which
         // astream's close returns silently over it. The broker itself is still
@@ -1063,7 +1035,7 @@ fn signal_name(sig: i32) -> &'static str {
     }
 }
 
-/// TAKE THE STOP SIGNALS, so a broker of any tier but strict stops cleanly
+/// Take the stop signals, so a broker of any tier but strict stops cleanly
 /// instead of dying with its run still `Open` in the log's sidecar: SIGTERM
 /// (launchd at logout or shutdown, `launchctl bootout` under `aterm fabric
 /// off`, `systemctl stop`), SIGINT (^C) and SIGHUP (its terminal went away).
@@ -1093,7 +1065,7 @@ fn take_stop_signals(_main: std::thread::Thread) -> Option<StopSignal> {
     None
 }
 
-/// The words that OPEN aterm's remedy for a log astream refuses as CORRUPT —
+/// The words that open aterm's remedy for a log astream refuses as corrupt —
 /// the last line `aterm link broker` writes before it exits, and so the last
 /// word of `<root>/broker.err` that `aterm fabric` and doctor quote. The fix
 /// they print for it ([`crate::enable::fix_for`]) is chosen on these words,
@@ -1102,7 +1074,7 @@ fn take_stop_signals(_main: std::thread::Thread) -> Option<StopSignal> {
 pub const CORRUPT_LOG_REMEDY: &str = "the log has a corrupt record and is not opened: run `aterm \
                                       link broker --repair";
 
-/// The words that OPEN aterm's line for a log astream refuses because a NEWER
+/// The words that open aterm's line for a log astream refuses because a newer
 /// format wrote it (`Unsupported`): no repair applies — truncating would
 /// destroy records the release that wrote them reads — so the remedy is that
 /// release. Chosen on by [`crate::enable::fix_for`], like
@@ -1113,7 +1085,7 @@ pub const NEWER_LOG_REMEDY: &str = "the log was written by a newer aterm and is 
 /// line naming `log` — `None` for a refusal with no remedy of aterm's own (a
 /// lock held, a permission), whose astream words say enough.
 ///
-/// By KIND, never by astream's wording. In aterm's build (no anti-rollback,
+/// By kind, never by astream's wording. In aterm's build (no anti-rollback,
 /// and retention compiled but never run, so no `.base`/`.state` sidecar
 /// exists) `InvalidData` from an open is the corrupt-record refusal, and
 /// `Unsupported` a record format newer than this build reads.
@@ -1134,13 +1106,13 @@ pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String>
 
 /// `aterm link broker --repair <log>`: astream's explicit, operator-invoked
 /// repair (`BrokerLog::open_repair`, the `asb repair` aterm does not ship) —
-/// the log TRUNCATED at its first corrupt record, the bytes dropped counted.
+/// the log truncated at its first corrupt record, the bytes dropped counted.
 /// Idempotent: a log that opens is left as it is and says `nothing to repair`.
 ///
 /// A log that is not there is refused, not created: `open_repair` would leave
 /// an empty log behind a typo. A broker holding the log (astream's exclusive
 /// lock, `AlreadyExists`) is refused — repair it between its supervisor's
-/// restarts, or with the job stopped. A NEWER-format log is refused untouched
+/// restarts, or with the job stopped. A newer-format log is refused untouched
 /// by astream itself. The repair moves the log's identity on, so every bridge
 /// forgets the offsets it held on the cut log at its next attach.
 fn repair_log(log: &str) -> ExitCode {
@@ -1181,7 +1153,7 @@ fn repair_log(log: &str) -> ExitCode {
         }
     };
     use std::io::Write as _;
-    // WRITTEN, NEVER PRINTED: a closed stdout must not panic the repair.
+    // Written, never `println!`: a closed stdout must not panic the repair.
     let _ = writeln!(std::io::stdout().lock(), "{said}");
     ExitCode::SUCCESS
 }
@@ -1190,9 +1162,9 @@ fn repair_log(log: &str) -> ExitCode {
 /// replaced build can wait half a minute and the look is one `stat`.
 const EXE_WATCH: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What a file IS — device, inode, length and modification time — so a
-/// REPLACED executable (a new inode renamed over the path, or the same inode
-/// rewritten) is told from the one a process started from.
+/// A file's identity (device, inode, length, mtime), so a replaced executable (a new inode
+/// renamed over the path, or the same inode rewritten) is told from the one a process started
+/// from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileId {
     dev: u64,
@@ -1203,12 +1175,8 @@ struct FileId {
 }
 
 impl FileId {
-    /// The regular file at `path`, symlinks followed — the file a supervisor
-    /// that runs `path` would start.
-    ///
-    /// # Errors
-    ///
-    /// The `stat`, or a path that is not a regular file.
+    /// The regular file at `path`, symlinks followed: what a supervisor that runs `path` starts.
+    /// Errors on a failed `stat` or a path that is not a regular file.
     fn of(path: &std::path::Path) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let m = std::fs::metadata(path)?;
@@ -1228,10 +1196,9 @@ impl FileId {
     }
 }
 
-/// The mapped image, rather than a pathname that an update may already have
-/// replaced. Linux exposes its full metadata through `/proc`; elsewhere the
-/// report's existing process-image probe can retain the original inode even
-/// when `current_exe` now names another file.
+/// The running image, not a pathname an update may already have replaced: on Linux
+/// `/proc/self/exe`'s metadata; elsewhere `crate::fabric::running_image_inode`, which keeps the
+/// original inode when `current_exe` names another file.
 enum RunningImage {
     File(FileId),
     #[cfg(not(target_os = "linux"))]
@@ -1255,8 +1222,7 @@ impl RunningImage {
             match (file, inode) {
                 (Some(file), Some(inode)) if file.ino == inode => Some(Self::File(file)),
                 (_, Some(inode)) => Some(Self::Inode(inode)),
-                // Without an OS image answer, retain the early file snapshot.
-                // This still covers replacement after broker startup.
+                // No OS image answer: the early file snapshot still catches a later swap.
                 (Some(file), None) => Some(Self::File(file)),
                 (None, None) => None,
             }
@@ -1313,18 +1279,14 @@ impl ExeWatch {
     }
 }
 
-/// Whether the executable a broker started from has been REPLACED, so it
-/// should exit and let its supervisor (`KeepAlive`, `Restart=always`) start
-/// the new build — otherwise an update leaves the old broker serving until the
-/// next login, and broker-side fixes in the new build never run.
+/// Whether the broker's executable has been replaced, so it should exit for its supervisor to
+/// start the new build.
 ///
-/// `start` is the file at start, `seen` the one the PREVIOUS look found, `now`
-/// this look's. Replaced means a different file that is SETTLED: the same on
-/// two looks running, so a build still being written is never the one the
-/// supervisor is sent to start. A path that is gone or is not a regular file
-/// (an update mid-swap, an uninstall) is not a replacement: exiting into a
-/// supervisor with nothing to start is an outage, so the broker keeps serving
-/// and looks again.
+/// `start` is the running image, `seen` the previous look's file, `now` this look's. Replaced
+/// means a different file that is settled (the same on two looks running), so a build still
+/// being written is never the one started. A path that is gone or not a regular file (mid-swap,
+/// an uninstall) is not a replacement: exiting into a supervisor with nothing to start is an
+/// outage, so the broker keeps serving and looks again.
 fn replaced(start: &RunningImage, seen: Option<&FileId>, now: &std::io::Result<FileId>) -> bool {
     matches!(now, Ok(now) if !start.matches(now) && seen == Some(now))
 }
@@ -1333,9 +1295,8 @@ fn replaced(start: &RunningImage, seen: Option<&FileId>, now: &std::io::Result<F
 ///
 /// A cap file is `<grant> <tag-hex>` lines, and `serve --cap-file` reads them.
 ///
-/// The secret is read from a FILE and never an argument: an argv is world-
-/// readable in `ps` for the life of the call, and this one is the key that mints
-/// every capability on the fleet.
+/// The secret is a file, never an argument: an argv is world-readable in `ps`, and this is the
+/// key that mints every capability on the fleet.
 fn mint(args: &[String]) -> ExitCode {
     const USAGE: &str = "\
 usage: aterm link mint <grant> --secret-file <path>
@@ -1380,8 +1341,7 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
-    // The one reader the broker that verifies these caps reads the secret
-    // with: a group-readable or short secret is refused here as it is there.
+    // The broker's own reader: a group-readable or short secret is refused here as there.
     let key = match transport::read_mint_secret(secret_path) {
         Ok(k) => k,
         Err(e) => {
@@ -1489,10 +1449,8 @@ mod tests {
         line.split(' ').map(str::to_string).collect()
     }
 
-    /// A REPLACED BUILD is a different, SETTLED file at the executable's
-    /// path: the same file never is; a new build renamed over the path, or
-    /// the file rewritten in place, is once two looks agree; a path that is
-    /// gone or is not a regular file never is.
+    /// A replacement is a different file, settled over two looks (renamed over the path or
+    /// rewritten in place); the same file, or a gone or non-regular path, never is.
     #[test]
     fn a_broker_exits_only_for_a_settled_replacement_of_its_executable() {
         let dir = std::env::temp_dir().join(format!("atlink-exe-{}", std::process::id()));
@@ -1527,8 +1485,7 @@ mod tests {
             again.as_ref().ok(),
             &FileId::of(&exe)
         ));
-        // Gone, or a directory in its place: never — exiting would leave the
-        // supervisor nothing to start.
+        // Gone, or a directory in its place: never.
         std::fs::remove_file(&exe).expect("remove");
         let gone = FileId::of(&exe);
         assert!(gone.is_err());
@@ -1597,9 +1554,7 @@ mod tests {
             seen: None,
         };
 
-        // An update completes while the broker opens its log and listener,
-        // before it announces readiness. Observations still compare with the
-        // captured running image, rather than adopting the replacement.
+        // An update lands before readiness: the watch still compares with the captured image.
         let replacement = scratch.path().join("aterm.next");
         std::fs::write(&replacement, b"replacement image").expect("replacement");
         std::fs::rename(&replacement, &invocation).expect("replace before readiness");
@@ -1615,8 +1570,7 @@ mod tests {
             "negative control: a baseline captured after readiness misses the update"
         );
 
-        // A path already replaced before the watcher is constructed must
-        // likewise be compared to the OS's mapped image, not its current file.
+        // A path replaced before the watch is built is compared with the OS's mapped image.
         let mut already_replaced = ExeWatch {
             path: invocation,
             start: RunningImage::capture().expect("this process's mapped executable"),
@@ -1711,8 +1665,7 @@ mod tests {
             assert!(line.contains(present), "{present} missing from: {line}");
         }
 
-        // A ROW WITH NO ESCALATION IS NOT ONE, in all three spellings — absent,
-        // empty, and the dash an absent field renders as.
+        // No escalation in all three spellings: absent, empty, and `-`.
         for quiet in [
             &b"v=1 t=1 state=live"[..],
             b"v=1 t=1 state=live attention=",
@@ -1725,8 +1678,7 @@ mod tests {
             assert!(!esc, "{}", String::from_utf8_lossy(quiet));
         }
 
-        // NO BODY MOVES AN OPERATOR'S CURSOR. Every column is one token of
-        // printable ASCII, whatever bytes the writing node chose.
+        // A hostile body still prints one token of printable ASCII per column.
         let (hostile, _) = crate::body::Body::decode(
             "v=1 t=1 state=\u{1b}[2J\u{1b}[H attention=%1B%5B31mred".as_bytes(),
         );
@@ -1757,17 +1709,14 @@ mod tests {
             printed.len()
         );
         assert!(printed.ends_with(ELLIPSIS), "{printed}");
-        // NEVER INSIDE AN ESCAPE: what is printed still decodes to the prefix of
-        // what was published, with no `%C3` stump on the end.
+        // The cut never lands inside a `%XX` escape.
         assert!(
             crate::pct::decode(printed).ends_with('…'),
             "the cut landed inside a %XX escape: {printed}"
         );
     }
 
-    /// `serve --token-file` reads the instance token the way every control
-    /// client reads one: a symlink planted at the named path is refused, never
-    /// followed to whatever file it names.
+    /// `--token-file` refuses a symlink rather than following it.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_token_file_is_refused() {

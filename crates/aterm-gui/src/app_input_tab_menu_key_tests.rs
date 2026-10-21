@@ -27,10 +27,8 @@ fn app_with_strip() -> (App, WindowId) {
     (app, wid)
 }
 
-/// [`app_with_strip`] whose session sink writes to a pipe this test owns, so
-/// a test can say what the PTY received: the only witness that a key the
-/// chrome declined reached the program. Shared with the seam module next
-/// door, which pins the same bytes on the controller route.
+/// [`app_with_strip`] with the session sink on a test-owned pipe, so a test can read what the PTY
+/// received. Shared with the seam tests.
 #[cfg(unix)]
 pub(super) fn app_with_private_pty() -> (App, WindowId, [i32; 2]) {
     let (mut app, _sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -142,8 +140,8 @@ fn an_unowned_key_dismisses_without_reaching_the_terminal() {
     assert!(app.windows[&wid].tab_menu.is_some());
     app.on_key(wid, named(NamedKey::Tab));
     assert!(app.windows[&wid].tab_menu.is_none(), "dismissed");
-    // The press was recorded as CONSUMED, which is what keeps its release
-    // from leaking an orphan report to a Kitty-protocol app.
+    // The press is booked as consumed, which keeps its release from leaking an orphan report to
+    // a Kitty-protocol app.
     assert!(
         app.windows[&wid]
             .consumed_press_keys
@@ -152,12 +150,8 @@ fn an_unowned_key_dismisses_without_reaching_the_terminal() {
     );
 }
 
-// ---------------------------------------------------------------- C5 fixes
-
-/// The Menu key (`NamedKey::ContextMenu => 57363` in the kitty table) goes
-/// to a client that negotiated the enhancement making it reportable: chrome
-/// may only claim a key nobody downstream can hear. Driven through the real
-/// negotiation (`CSI > 1 u` on the front terminal), not by poking a flag.
+/// A client that negotiated the enhancement that makes the Menu key (kitty `57363`) reportable
+/// keeps it: chrome claims only a key nobody downstream can hear. Driven by a real `CSI > 1 u`.
 #[test]
 fn a_kitty_client_that_negotiated_for_the_menu_key_keeps_it() {
     let (mut app, wid) = app_with_strip();

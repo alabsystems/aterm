@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `str::trim`, `str::trim_start` and `str::trim_end`, read on BYTES.
-//!
-//! Every reading walks every row of the screen many times over (each of the
-//! reader's functions finds the composer, the rules and the box for itself),
-//! and the char-wise trims, generic code a debug build compiles unoptimized,
-//! were the reader's heaviest loop: the panic sweep spent more of its CPU in
-//! them than in anything the reader decides. These return the SAME slices —
-//! whitespace is `char::is_whitespace`, Unicode's White_Space, matched on its
-//! UTF-8 bytes — and `the_byte_trims_are_the_char_trims` checks every char.
+//! `str::trim*`, `find` and `contains` on bytes: the reader walks every row
+//! many times, and the char-wise versions, unoptimized in a debug build, are
+//! its heaviest loop. These return the same slices (whitespace is
+//! `char::is_whitespace` matched on its UTF-8 bytes), which
+//! `the_byte_trims_are_the_char_trims` checks for every char.
 
-/// The length in bytes of the char that STARTS at byte `i` of `b` when it is
+/// The length in bytes of the char that starts at byte `i` of `b` when it is
 /// whitespace, else `0` (`i` on a char boundary, `i < b.len()`). White_Space
 /// is U+0009..=U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000..=U+200A,
 /// U+2028, U+2029, U+202F, U+205F and U+3000.
@@ -34,10 +30,9 @@ fn space_at(b: &[u8], i: usize) -> usize {
     }
 }
 
-/// The length in bytes of the char that ENDS at byte `j` of `b` (exclusive)
-/// when it is whitespace, else `0` (`j` on a char boundary, `j > 0`). The
-/// bytes matched for a two- or three-byte char start with a lead byte, so
-/// they are that char whole.
+/// The length in bytes of the char that ends at byte `j` of `b` (exclusive)
+/// when it is whitespace, else `0` (`j` on a char boundary, `j > 0`). Each
+/// multi-byte match starts with a lead byte, so it is that char whole.
 fn space_before(b: &[u8], j: usize) -> usize {
     let last = b[j - 1];
     if last.is_ascii() {

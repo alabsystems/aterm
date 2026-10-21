@@ -5,8 +5,8 @@
 //! stays at its own path and keeps its own `#[test]`s. Their loopback servers
 //! bind port 0 and nothing touches the process environment.
 //!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
+//! With `autotests = false` (`Cargo.toml`), a `tests/*.rs` file that is neither
+//! a `mod` line here nor a `[[test]]` of its own never compiles.
 
 mod loopback;
 mod signature_methods;

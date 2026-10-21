@@ -4,22 +4,19 @@
 //! The device-loss latch, standing in for the device-lost callback Metal does
 //! not have.
 //!
-//! The wgpu path handles loss through `Device::set_device_lost_callback`,
-//! which sets the flag behind `GpuContext::device_lost`, and `aterm-gui`
-//! downgrades to the CPU renderer off it. Metal's signals are per command
-//! buffer instead: `-[MTLCommandBuffer status]` reaching
-//! `MTLCommandBufferStatusError` and the `NSError`'s `MTLCommandBufferError`
-//! code (eGPU removal also surfaces as `DeviceRemoved`). Every submission
-//! (offscreen pass, compute dispatch, present) carries its own status, so this
-//! is its own module; the swapchain consumes it.
+//! The wgpu path learns of loss from `Device::set_device_lost_callback` (the
+//! flag behind `GpuContext::device_lost`). Metal signals per command buffer
+//! instead: `-[MTLCommandBuffer status]` reaching `MTLCommandBufferStatusError`,
+//! with the `NSError`'s `MTLCommandBufferError` code (eGPU removal surfaces as
+//! `DeviceRemoved`). Every submission carries its own status.
 //!
 //! # Classification
 //!
 //! Codes and statuses from `Metal.framework/Headers/MTLCommandBuffer.h`:
 //!
-//! * RETRYABLE (the device and encoded state are fine): `Timeout` (2) and
+//! * Retryable (the device and encoded state are fine): `Timeout` (2) and
 //!   `OutOfMemory` (8).
-//! * LOST: `Internal` (1), `PageFault` (3), `AccessRevoked` (4),
+//! * Lost: `Internal` (1), `PageFault` (3), `AccessRevoked` (4),
 //!   `NotPermitted` (7), `InvalidResource` (9), `Memoryless` (10),
 //!   `DeviceRemoved` (11), `StackOverflow` (12), and, failing closed, any
 //!   unknown code, an `Error` status with a nil `NSError`, and any status
@@ -28,12 +25,9 @@
 //!
 //! # Testing limits
 //!
-//! A real `MTLCommandBufferStatusError` cannot be produced on a healthy GPU
-//! without wrecking GPU state. The error arms are exercised through
-//! [`classify`] (the pure classification that [`outcome_of`] feeds), and the
-//! real FFI path is pinned on the arm a healthy device produces: a committed,
-//! waited command buffer reading `Completed`. eGPU removal cannot occur on
-//! Apple silicon; its code is covered by the injection seam.
+//! A healthy GPU cannot produce a real `MTLCommandBufferStatusError` without
+//! wrecking GPU state, so the error arms are exercised through [`classify`]
+//! (which [`outcome_of`] feeds) and the real FFI path is pinned on `Completed`.
 
 use std::sync::OnceLock;
 
@@ -52,7 +46,7 @@ pub(crate) const STATUS_ERROR: usize = 5;
 // `MTLCommandBufferError` codes (`MTLCommandBuffer.h`). `Blacklisted` is the
 // deprecated spelling of `AccessRevoked` (4).
 /// The header's "no error" code. An `Error` status carrying code 0 is
-/// contradictory and stays LOST (fail closed), but is named.
+/// contradictory and stays lost (fail closed), but is named.
 pub(crate) const ERROR_NONE: isize = 0;
 pub(crate) const ERROR_INTERNAL: isize = 1;
 pub(crate) const ERROR_TIMEOUT: isize = 2;
@@ -191,7 +185,7 @@ pub(crate) struct LossLatch {
     /// Debug-only feed counter — see [`Self::record`] for why it exists.
     #[cfg(debug_assertions)]
     fed: std::sync::atomic::AtomicUsize,
-    /// Set exactly once, by the FIRST `Lost` outcome recorded.
+    /// Set exactly once, by the first `Lost` outcome recorded.
     lost: OnceLock<String>,
     /// Whether an `EncodeSession` holds this latch, so one latch means one
     /// queue (which `Frame::present`'s `Arc::ptr_eq` check relies on). Bound in
@@ -238,14 +232,13 @@ impl LossLatch {
         #[cfg(debug_assertions)]
         self.fed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let CbOutcome::Lost { .. } = outcome {
-            // A second loss keeps the FIRST reason — that is the one that
-            // took the device down, and `OnceLock::set` enforces it.
+            // A second loss keeps the first reason, the one that took the device
+            // down (`OnceLock::set` enforces it).
             let _ = self.lost.set(format!("{outcome:?}"));
         }
     }
 
-    /// Debug-only: outcomes fed through [`Self::record`], so a test can check
-    /// `wait_outcome` feeds the latch on `Completed` too.
+    /// Debug-only: outcomes fed through [`Self::record`].
     #[cfg(debug_assertions)]
     #[cfg(test)]
     pub(crate) fn fed_count(&self) -> usize {
@@ -302,8 +295,7 @@ mod tests {
             );
         }
 
-        // Every other header code is LOST — including the eGPU removal, which
-        // is the rare signal the task brief names.
+        // Every other header code is lost, eGPU removal included.
         for (code, name) in [
             (ERROR_INTERNAL, "MTLCommandBufferErrorInternal"),
             (ERROR_PAGE_FAULT, "MTLCommandBufferErrorPageFault"),
@@ -362,8 +354,7 @@ mod tests {
         );
         assert_eq!(latch.reason(), None);
 
-        // The injected loss — the signal a real page fault would produce,
-        // classified through the same seam `outcome_of` feeds.
+        // An injected page fault, classified through the seam `outcome_of` feeds.
         latch.record(&classify(STATUS_ERROR, Some(ERROR_PAGE_FAULT)));
         assert!(latch.is_lost(), "the first Lost must latch");
         let first = latch
@@ -375,7 +366,7 @@ mod tests {
             "the reason names the classification: {first}"
         );
 
-        // Sticky: neither success nor a DIFFERENT loss moves it.
+        // Sticky: neither success nor a different loss moves it.
         latch.record(&classify(STATUS_COMPLETED, None));
         assert!(latch.is_lost(), "Completed after a loss must not unlatch");
         latch.record(&classify(STATUS_ERROR, Some(ERROR_DEVICE_REMOVED)));

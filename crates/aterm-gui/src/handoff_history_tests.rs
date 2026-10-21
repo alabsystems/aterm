@@ -83,6 +83,7 @@ fn record(local_id: u64) -> SessionRecord {
 
 fn manifest(ids: &[u64]) -> SessionHandoff {
     SessionHandoff {
+        resources: None,
         schema: SessionHandoff::SCHEMA,
         sessions: ids.iter().map(|id| record(*id)).collect(),
         window: None,
@@ -763,8 +764,7 @@ fn a_paused_export_resumes_following_and_finishes_whole() {
     assert!(dir_entries(dir.path()).is_empty(), "nobody took it");
 }
 
-/// A RESUME THAT OVERTAKES A TIMED-OUT PAUSE (round eight of the update
-/// audit, finding 16): the pause times out while the worker's last look waits
+/// When a pause times out while the worker's last look waits
 /// on the terminal lock, the park misses and resumes, and the worker reaches
 /// its wait after the resume. It must go on following: the lines printed
 /// before the next park are in the export, not lost to `Outrun`.
@@ -808,11 +808,10 @@ fn a_resume_that_overtakes_a_timed_out_pause_keeps_the_export_following() {
     assert_eq!(joined.dropped, 0);
 }
 
-/// A VIEW OVER A SCREEN THAT DID NOT CROSS STAYS AT THE BOTTOM (round eight,
-/// finding 38): a session adopted with no screen to restore (its meta did not
+/// A session adopted with no screen to restore (its meta did not
 /// parse) restored no history, so the park's offset has nothing it named here,
 /// and the scrollback the program writes after the update is not it.
-/// NEGATIVE CONTROL: the clamp still lets a view into history that crossed
+/// Negative control: the clamp still lets a view into history that crossed
 /// (`a_view_into_withheld_history_stays_at_the_live_bottom`).
 #[test]
 fn a_view_over_a_screen_that_did_not_cross_stays_at_the_bottom() {
@@ -1370,7 +1369,7 @@ fn a_frame_corrupt_for_any_other_reason_still_refuses_the_sidecar() {
     );
 }
 
-/// AN IMPORT RINGS ITS SESSION'S SCREEN READERS. The attach moves the screen
+/// An import rings its session's screen readers. The attach moves the screen
 /// generation (it invalidates the scroll state) with no output, on the import
 /// worker, so only the end of its own hold can push that to a `screen` or
 /// `cells` subscriber. Negative control: a watcher that reads no screen is not
@@ -1698,18 +1697,15 @@ fn top_row(t: &Terminal) -> String {
         .to_string()
 }
 
-/// ROUND SIX, FINDING 24 (its second half): A PERSON WORKING AT THE PROMPT IS
-/// NOT PULLED UP. Keys typed before Commit replay at Commit, and more follow
-/// it; paste and End do the same at the bottom. None of them moves a view that
-/// is already at the bottom, so "still at the bottom" cannot tell them from
-/// "nobody touched it" — and the import, which runs on a worker after Commit,
-/// scrolled the prompt up the screen mid-command. Each gesture between the
-/// adopt and the import now leaves the view at the bottom. NEGATIVE CONTROL:
-/// with no gesture, and with only output, a bare modifier or a key release in
-/// between (none of which says where the person wants to be), the view is put
-/// back on the line read at the park. The `output` row is the finding's first
-/// half: output the adopted readers parse at Commit, before the import, does
-/// not move the reader off the line they were reading.
+/// Keys typed before Commit replay at Commit, and more follow it; paste and
+/// End do the same at the bottom. None of them moves a view that is already
+/// at the bottom, so "still at the bottom" cannot tell them from "nobody
+/// touched it". Each gesture between the adopt and the import leaves the view
+/// at the bottom. Negative control: with no gesture, and with only output, a
+/// bare modifier or a key release in between (none of which says where the
+/// person wants to be), the view is put back on the line read at the park:
+/// output the adopted readers parse at Commit, before the import, does not
+/// move the reader off the line they were reading.
 #[test]
 fn a_gesture_after_the_adopt_keeps_the_view_at_the_bottom() {
     use crate::app_input::{PressKind, apply_press_custody};
@@ -1864,18 +1860,17 @@ fn a_view_into_withheld_history_stays_at_the_live_bottom() {
     }
 }
 
-/// A HELD PANE'S LEFT-BEHIND LINES SAY WHY (the review of round eight's
-/// finding 39, whose fix said every one as a held pane's by design, a failed
-/// carry included). The producer types the reason ([`HeldLoss`]) from the
-/// attempt's plan ([`ExportResults::take_held`]) and the join
-/// ([`name_held_sidecar`]); the successor reads it back off the two wire keys
-/// ([`HeldLoss::from_wire`]) and books the lines by it ([`incoming_held`]):
+/// A held pane's left-behind lines say why. The producer types the reason
+/// ([`HeldLoss`]) from the attempt's plan ([`ExportResults::take_held`]) and
+/// the join ([`name_held_sidecar`]); the successor reads it back off the two
+/// wire keys ([`HeldLoss::from_wire`]) and books the lines by it
+/// ([`incoming_held`]):
 ///
 /// * a policy that carries no scrollback → the new version's request;
 /// * a hop to an older build, which takes a held screen alone → a held
 ///   pane's, by design;
 /// * an export offered and not reaching the pane, and an export whose fence
-///   a resize moved → a FAILURE, folded into [`LossSummary::held_failed`]
+///   a resize moved → a failure, folded into [`LossSummary::held_failed`]
 ///   (never under "the newest lines came across"), and a record that says
 ///   both keys is read as failed.
 #[test]
@@ -1975,17 +1970,16 @@ fn a_held_panes_left_lines_say_why() {
     assert_eq!(carried_loss([&handed]).held_failed, 0);
 }
 
-/// A HELD PANE NEVER TAKES THE ROOM A LIVE TAB'S FOLLOW NEEDS (the review of
-/// round eight's finding 39). Held panes' exports fill the aggregate after
-/// the handed session's first pass; the handed session keeps printing, more
-/// than the screen carry holds, and its follow evicts the LARGEST held export
-/// for the room, so it follows and its whole history crosses. The evicted
-/// pane is told as not exported (said as a held pane's failed carry) and its
-/// sidecar is gone; the other held pane keeps its export. A frame the handed
-/// session could not take even with every held export gone evicts none.
-/// NEGATIVE CONTROL: the same desk with those panes exported as handed
-/// sessions — whose room nothing takes back, as a held pane's was not before
-/// the review — outruns the join.
+/// A held pane never takes the room a live tab's follow needs. Held panes'
+/// exports fill the aggregate after the handed session's first pass; the
+/// handed session keeps printing, more than the screen carry holds, and its
+/// follow evicts the largest held export for the room, so it follows and its
+/// whole history crosses. The evicted pane is told as not exported (said as a
+/// held pane's failed carry) and its sidecar is gone; the other held pane
+/// keeps its export. A frame the handed session could not take even with
+/// every held export gone evicts none. Negative control: the same desk with
+/// those panes exported as handed sessions — whose room nothing takes back —
+/// outruns the join.
 #[test]
 fn a_held_panes_export_gives_way_to_a_live_tabs_follow() {
     // Session 1 is the live tab; 2 (deep) and 3 (shallow) are held panes.
@@ -2151,7 +2145,7 @@ fn a_held_panes_export_gives_way_to_a_live_tabs_follow() {
     assert!(crossed.joined.dropped > 0);
 }
 
-/// The desk of round eight's #801: a live tab (session 1, 3000 lines deep) and
+/// A live tab (session 1, 3000 lines deep) and
 /// a deep held pane (session 2) whose first pass the test holds where it is,
 /// as a pane of a million lines is held by its own depth until the park.
 fn desk_with_a_deep_held_pane() -> (Arc<Mutex<Terminal>>, Arc<Mutex<Terminal>>, Arc<AtomicU64>) {
@@ -2174,7 +2168,7 @@ fn join_the_tab(tab: &Arc<Mutex<Terminal>>, results: &ExportResults) -> Joined {
 }
 
 /// Wait (a hang detector) until every handed session's export has followed
-/// `term`'s history to its end: the event a fixed sleep used to hope for.
+/// `term`'s history to its end.
 fn await_followed(followed: &AtomicU64, term: &Arc<Mutex<Terminal>>) {
     let end = term.lock().unwrap().history_fence().end;
     aterm_spec::wait::until_within(
@@ -2184,19 +2178,11 @@ fn await_followed(followed: &AtomicU64, term: &Arc<Mutex<Terminal>>) {
     );
 }
 
-/// A HELD PANE'S FIRST PASS NEVER STOPS A LIVE TAB BEING FOLLOWED (round eight
-/// of the update audit, #801). On the launched lane the export ran every first
-/// pass, the held panes' included, before it followed anything: while a deep
-/// `--hold` pane was read, a tab printing a build went unfollowed, the park
-/// paused the export in the middle of the held pass, and the last look (2,048
-/// lines) plus the screen carry (256) could not reach back to where the tab's
-/// export ended — the join was `Outrun` and the tab's whole older scrollback
-/// stayed behind, which with no held pane exported it kept.
-///
-/// The held pass here never finishes (the test holds it). The park gate is
-/// told the export caught up once the TAB's pass is done; the tab prints 3000
-/// lines, the export follows them, and the park pauses it in the middle of the
-/// held pass: the tab's join is whole, and the held pane is told why it has no
+/// A held pane's first pass never stops a live tab being followed. The held
+/// pass here never finishes (the test holds it). The park gate is told the
+/// export caught up once the tab's pass is done; the tab prints 3000 lines,
+/// the export follows them, and the park pauses it in the middle of the held
+/// pass: the tab's join is whole, and the held pane is told why it has no
 /// export.
 #[test]
 fn a_held_pass_never_stops_a_live_tab_being_followed() {
@@ -2252,17 +2238,12 @@ fn a_held_pass_never_stops_a_live_tab_being_followed() {
     );
 }
 
-/// THE PARK GATE WAITS FOR A HELD PANE'S PASS, BOUNDEDLY (round eight of the
-/// update audit, the last review of #801). #801 made the gate wait only for the
-/// HANDED sessions' first passes (`caught_up`), so on the launched lane the park
-/// landed at the dial and stopped a deep `--hold` pane's pass half-way: its
-/// whole scrollback stayed behind, told as [`STOPPED_BEFORE_ITS_PASS`] — the
-/// loss #39 was fixed to stop. The gate now waits for every first pass
-/// (`passed`), within [`EXPORT_PATIENCE`]; the held pass runs between the
-/// tab's follows, so the tab, still printing, is never outrun meanwhile.
+/// The park gate waits for every first pass (`passed`), within
+/// [`EXPORT_PATIENCE`]; the held pass runs between the tab's follows, so the
+/// tab, still printing, is never outrun meanwhile.
 ///
-/// NEGATIVE CONTROL: keyed on `caught_up`, the gate would have parked while
-/// the held pass was still running.
+/// Negative control: keyed on `caught_up`, the gate would park while
+/// the held pass is still running.
 #[test]
 fn the_park_gate_waits_for_a_held_pass_and_its_scrollback_crosses() {
     let late = 3000;
@@ -2328,8 +2309,7 @@ fn the_park_gate_waits_for_a_held_pass_and_its_scrollback_crosses() {
     assert_eq!(joined.fallback, None, "the tab was followed: {joined:?}");
 }
 
-/// A HELD PASS A PAUSE INTERRUPTS GOES ON WHERE IT STOOD (round eight of the
-/// update audit, #801): a park that misses resumes the export, and the held
+/// A park that misses resumes the export, and the held
 /// pane's pass — kept across the pause, not dropped — finishes, while the tab
 /// is followed; the next park hands both over whole.
 #[test]
@@ -2382,18 +2362,11 @@ fn a_paused_held_pass_finishes_after_the_resume() {
     assert_eq!(joined.dropped, 0);
 }
 
-/// THE FORK LANE GIVES HELD PANES LITTLE OF ITS FREEZE (round eight of the
-/// update audit, #801). The fork lane exports with every reader parked, so the
-/// held panes' passes, which come last, lengthened the freeze by up to the
-/// whole [`FORK_EXPORT_WAIT`]; and the export they left unfinished was said as
-/// one that had not reached every tab, though it had. Past the handed
+/// The fork lane exports with every reader parked; past the handed
 /// sessions' passes the held ones get at most their own bound: here a held
 /// pass that never finishes, a wait of a minute and a held bound of nothing,
 /// and the export is handed over at once, the tab's whole, not "unfinished",
 /// and the held pane told why it has none.
-///
-/// FAILS WITHOUT THE FIX: the export waited out the whole wait for the held
-/// pass, and was booked unfinished.
 #[test]
 fn the_fork_lanes_held_passes_wait_only_their_own_bound() {
     let dir = aterm_tempfile::tempdir().unwrap();

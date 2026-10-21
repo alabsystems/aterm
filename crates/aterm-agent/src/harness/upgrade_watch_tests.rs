@@ -1,16 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The record's progress stamp and its deadlines: T1-d, the single writer
-//! stamps [`St::progress_at`] if and only if the progress key moves, and a
-//! rollback never stamps; T1-e, every record owed a step has a deadline
-//! ([`due_by`], [`watch_at`]), including the shapes older builds wrote.
+//! The record's progress stamp, its deadlines and the watch: the single writer stamps
+//! [`St::progress_at`] iff the progress key moves and a rollback never stamps; every record
+//! owed a step has a deadline ([`due_by`], [`watch_at`]), older builds' shapes included; and
+//! the watch records off any point with no hands.
 
 use super::*;
 
-/// A scratch state directory of this test's own, removed when it drops, and
-/// the options that write into it (not a dry run: the writer is what is under
-/// test).
+/// A scratch state directory removed on drop, and options that write into it (not a dry run:
+/// the writer is under test).
 fn scratch(tag: &str) -> (crate::supervise::ScratchDir, Opts) {
     let dir = crate::supervise::ScratchDir::new("upgrade-watch", tag);
     let opts = Opts {
@@ -69,15 +68,11 @@ const STAMPS_EVERY_WRITE: Writer = Writer {
     },
 };
 
-/// Every transition a step makes of the record, in the order an upgrade's
-/// life takes them — the waits a look records (the words of
-/// `upgrade_tests.rs` and `upgrade_stall_tests.rs`: `not-idle:busy`,
-/// `background`, `attended`, `held`, `announce-refused:changed`, …), the
-/// notices, a limit's hold of the re-ask clock, the give-up, the void, the
-/// re-arm, the restart's record and its rollback — each written through
-/// `w`, at one second each. Answers the first write where the stamp moved
-/// and the key did not, or the key moved and the stamp did not, or a
-/// rollback stamped; `Ok` with how many writes moved the key.
+/// Writes every transition a step makes of the record through `w`, one second apart, in an
+/// upgrade's order: the waits a look records, the notices, a limit's hold of the re-ask clock,
+/// the give-up, the void, the re-arm, the restart's record and its rollback. Errs at the
+/// first write where the stamp and the key disagree, or where a rollback stamped; `Ok` with
+/// how many writes moved the key.
 fn walk(w: &Writer, tag: &str) -> Result<usize, String> {
     let (dir, opts) = scratch(tag);
     let to = Candidate {
@@ -207,9 +202,8 @@ fn walk(w: &Writer, tag: &str) -> Result<usize, String> {
     Ok(moved)
 }
 
-/// The rollback's negative-control writer: the real [`save_at`], with a
-/// rollback routed back through it, stamping a put-back record with this
-/// second. Every save is the real one, so only the rollback can catch it.
+/// The rollback's negative control: the real [`save_at`], with the rollback routed through it
+/// (stamping the put-back record), so only the rollback can catch it.
 const RESTORES_THROUGH_SAVE: Writer = Writer {
     save: save_at,
     restore: |opts, session, prior, now| {
@@ -219,14 +213,10 @@ const RESTORES_THROUGH_SAVE: Writer = Writer {
     },
 };
 
-/// T1-d, the single writer: over every transition a step makes,
-/// [`St::progress_at`] moves if and only if the progress key does. Waits, the
-/// held-by list and a stale copy never move it; notices, a limit's hold of the
-/// re-ask clock, the give-up, the re-arm, a stop and the restart's record do;
-/// [`restore`] puts the prior record back with its own stamp. Negative
-/// controls: a writer that stamps every write is caught at the first wait; the
-/// real writer with its rollback routed through [`save_at`] is caught at the
-/// rollback alone.
+/// Over every transition a step makes, [`St::progress_at`] moves iff the progress key does;
+/// [`restore`] puts the prior record back with its own stamp. Negative controls: a writer that
+/// stamps every write (caught at the first wait), and the rollback routed through [`save_at`]
+/// (caught at the rollback alone).
 #[test]
 fn the_progress_stamp_moves_iff_the_key_moves_and_a_rollback_never_stamps() {
     assert_eq!(
@@ -242,14 +232,10 @@ fn the_progress_stamp_moves_iff_the_key_moves_and_a_rollback_never_stamps() {
     assert!(caught.starts_with("restore:"), "{caught}");
 }
 
-/// A notice refused by its own fence is no progress: a pending round whose
-/// notice every look refuses (`wait:announce-refused:changed`) counts the
-/// refusals ([`St::refused`], [`St::refused_at`]) and keeps its step clock, so
-/// its deadline ([`due_by`]) and watch ([`watch_at`]) stay where the round
-/// last moved; otherwise the watch would never come for the failure it exists
-/// to see. The notice that lands moves the key and starts the count over.
-/// Negative control: the writer that stamps every write pushes the deadline on
-/// the first refusal.
+/// A notice its own fence refuses is no progress: the refusals are counted ([`St::refused`],
+/// [`St::refused_at`]) and the step clock stays, so the deadline and the watch stay where the
+/// round last moved. The notice that lands moves the key and resets the count. Negative
+/// control: the writer that stamps every write pushes the deadline at the first refusal.
 #[test]
 fn a_refused_notice_counts_and_never_moves_the_step_clock() {
     let run = |w: &Writer, tag: &str| {
@@ -321,13 +307,10 @@ fn every_phase() -> Vec<Phase> {
     all
 }
 
-/// T1-e, totality: over every phase × every owner's word × the record as this
-/// build writes it and as an older one did (no progress or stop stamp), a
-/// record owed a step has a step deadline and a watch time. The only ones
-/// without are a finished move with no model confirm owed, and a round the
-/// owner's `--skip` of this target holds before it began restarting. A
-/// `--skip` of another build holds nothing, and neither word holds a restart
-/// in flight.
+/// Over every phase × owner's word × the record as this build and an older one wrote it (no
+/// progress or stop stamp), a record owed a step has a step deadline and a watch time. Only a
+/// finished move with no model confirm owed, and a round not yet restarting that `--skip` of
+/// this target holds, have none; a `--skip` of another build holds nothing.
 #[test]
 fn every_record_owed_a_step_has_a_deadline_the_legacy_shapes_included() {
     let requests = [
@@ -356,9 +339,7 @@ fn every_record_owed_a_step_has_a_deadline_the_legacy_shapes_included() {
                     request: request.clone(),
                     ..St::default()
                 };
-                // As this build writes it, and as a build before the stamps
-                // did: the same record with the new fields (and the stop's
-                // stamp) left out.
+                // And as an older build wrote it: without the stamp fields.
                 let mut legacy: Value = aterm_json::from_str(&st.to_json()).expect("json");
                 if let Value::Object(o) = &mut legacy {
                     for k in [
@@ -418,14 +399,12 @@ fn every_record_owed_a_step_has_a_deadline_the_legacy_shapes_included() {
     assert_eq!(watch_at(&looked), Some(T0 + 10_000 + WATCH_GAP));
 }
 
-/// Tab one's record as a 0.94.0 host wrote it (T1-e below says what it holds).
+/// Tab one's record as a 0.94.0 host wrote it.
 const TAB_ONE_RECORD: &str = r#"{"phase":"announced","why":"","from":"2.1.280","to":"2.1.283","source":"managed","marker":"ATERM-UPGRADE-READY-5f3a1c9e","notice_start":"Wed Sep 23 17:13:02 2026","tab":"s-3de30c3c66bf5c4496f8","line":"","noted":"","cause":"","model_before":"","launch_model":"","model_list":"","resumed_on":"","wait":"background","request":"-","request_tab":"","outcome":"","at":1790531333,"asks":1,"salt":1790373043,"last_seq":0,"seq_since":1790373043,"pid":52489,"notice_pid":52489,"shell":0,"mark":0,"confirm_by":0,"resumed_pid":0,"hold_since":0,"hold_seen":0,"ready_since":0,"pending_since":0,"wait_since":1790531333,"done_at":0,"request_at":0}"#;
 
-/// T1-e, tab one's record as an earlier build wrote it: announced (`at`
-/// 1790531333), one ask, to 2.1.283, `wait=background`, minted at `salt`
-/// 1790373043, without the fields later builds add. Read by this build, it last
-/// moved at its notice, its re-ask is 35 minutes after, and its move clock ran
-/// out a day after minting: it is past due at 1790632822.
+/// Tab one's 0.94 record (announced, one ask, no later fields) reads as last moved at its
+/// notice, re-asked [`upgrade::REASK_S`] plus slack after, and past due once its move clock
+/// ran out a day after minting (`salt`).
 #[test]
 fn tab_ones_record_of_the_27th_is_past_due() {
     let text = TAB_ONE_RECORD;
@@ -458,19 +437,19 @@ fn tab_ones_record_of_the_27th_is_past_due() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---------------------------------------------------------------- T1-c the watch
+// ---------------------------------------------------------------- the watch
 
 /// Tab one's id.
 const TAB_ONE: &str = "s-3de30c3c66bf5c4496f8";
 
-/// A clock at which tab one's record is past its watch (T1-e).
+/// A clock at which tab one's record is past its watch.
 const NOW_28TH: u64 = 1_790_632_822;
 
 /// The weekly limit's reset the transcript names: "resets Oct 4 at 12am
 /// (America/Los_Angeles)".
 const RESETS: u64 = 1_791_097_200;
 
-/// The control verbs that only READ: all a dry-run visit may send.
+/// The control verbs that only read: all a dry-run visit may send.
 const READS: [&str; 5] = ["sessions", "text", "cell", "status", "help"];
 
 /// A control socket at `<dir>/t.sock` standing in for tab #1's aterm with no
@@ -494,14 +473,11 @@ fn no_hands_instance(dir: &Path, tab: &'static str) -> (String, crate::harness::
     })
 }
 
-/// Tab one, stood up for the watch: a stand-in agent in the tab running Claude
-/// Code 2.1.280 under conversation [`SESSION`] (its session file, busy); the
-/// transcript ending in the weekly limit's row (`quotaLimits.resetsAt`
-/// [`RESETS`], `upgrade_queued_tests.rs`); tab one's 0.94 record
-/// ([`TAB_ONE_RECORD`]) with its notice's process rewritten to the stand-in's
-/// pid and start (a notice process of another machine reads as owned
-/// elsewhere, `wait:notice-owned-by-other-process`); and the no-hands
-/// instance. `managed` is the build aterm's managed twin names.
+/// Tab one, stood up for the watch: a stand-in agent running Claude Code 2.1.280 under
+/// [`SESSION`] (its session file busy), a transcript ending in the weekly limit's row (reset
+/// [`RESETS`]), tab one's 0.94 record with its notice's process rewritten to the stand-in's (a
+/// notice process of another machine reads as owned elsewhere), and the no-hands instance.
+/// `managed` is the build aterm's managed twin names.
 struct TabOne {
     dir: crate::supervise::ScratchDir,
     opts: Opts,
@@ -569,10 +545,9 @@ impl TabOne {
         }
     }
 
-    /// The watch's read: the real visit of tab #1 ([`visit`]), with the
-    /// managed twin [`Self::targets`] names and a kernel that reads the
-    /// stand-in as its shell's foreground job on the tab's terminal —
-    /// asserting it is handed a dry run of this tab, and counting it.
+    /// The watch's read: the real [`visit`] of tab one, with [`Self::targets`]' managed twin
+    /// and a kernel that reads the stand-in as the tab's foreground job. Asserts it is handed
+    /// a dry run of this tab, and counts it.
     fn read<'a>(&'a self, reads: &'a std::cell::Cell<u32>) -> impl Fn(&Opts) -> Report + 'a {
         move |o: &Opts| {
             assert!(o.dry_run, "the watch reads through a dry run");
@@ -623,8 +598,7 @@ impl Drop for TabOne {
     }
 }
 
-/// Who looks in T1-c: a build, and the loop's word that the limit's wall
-/// withheld its last point.
+/// Who looks: a build, and the loop's word that the limit's wall withheld its last point.
 fn looker() -> Watcher {
     Watcher {
         by: "0.99.0+gtest".to_string(),
@@ -634,19 +608,14 @@ fn looker() -> Watcher {
     }
 }
 
-/// T1-c, the watch, over tab one: a 0.94 record announced for 2.1.283, a weekly
-/// limit in the transcript, 2.1.284 installed, and a loop that offered no
-/// point. One watch at an injected clock ([`NOW_28TH`]), through the real
-/// visit as a dry run and a control socket refusing all but reads: the record
-/// is retargeted to 2.1.284 in place (a READY covers any version: still
-/// announced, marker kept, no release owed; `retargeted:2.1.283->2.1.284` in
-/// the ledger), stamped `looked` by the build that looked with the loop's
-/// guard, and the tab is sent zero input requests. With 2.1.283 still newest,
-/// the watch holds the announced round's re-ask clock to the limit's reset
-/// instead. Negative controls: the visit's read alone leaves the record at
-/// 2.1.283 waiting `background`, byte for byte; a watch whose write finds the
-/// sweep lock held writes and ledgers nothing; a record not yet due is not
-/// read.
+/// The watch over tab one (a 0.94 record announced for 2.1.283, a weekly limit in the
+/// transcript, 2.1.284 installed, no point offered), through the real visit as a dry run and
+/// a socket refusing all but reads: the record is retargeted to 2.1.284 in place (still
+/// announced, marker kept, no release owed, `retargeted:2.1.283->2.1.284` ledgered), its
+/// re-ask clock held to the limit's reset, and stamped `looked` with the loop's guard, with
+/// zero input requests. With 2.1.283 still newest it holds the clock and retargets nothing.
+/// Negative controls: the read alone changes no byte; a held sweep lock writes and ledgers
+/// nothing; a record not yet due is not read.
 #[test]
 fn the_watch_retargets_and_holds_tab_ones_record_off_any_point_with_no_hands() {
     // The retarget.
@@ -819,15 +788,10 @@ fn the_watch_keeps_an_announced_round_whose_model_rides_the_restart_in_place() {
     }
 }
 
-/// A limit row naming no reset leaves the record none: tab one's conversation
-/// ending in an API rate limit's row (`API Error: Rate limit reached`, no
-/// `quotaLimits`). The row holds the session for a re-ask's wait, and the
-/// watch holds the announced round's clock to that wait's end
-/// (`held:<until>`), but the record keeps no reset (`St::limit_until` `0`,
-/// the watch's `limit_until` `None`), so the owner's view never says a reset
-/// passed. Negative control: the weekly row, which names its reset, is kept as
-/// named (`the_watch_retargets_and_holds_tab_ones_record_off_any_point_with_no_hands`:
-/// `RESETS`).
+/// A limit row naming no reset (an API rate limit, no `quotaLimits`) holds the round's clock
+/// for a re-ask's wait (`held:<until>`) but leaves the record no reset (`St::limit_until` `0`,
+/// the watch's `limit_until` `None`), so the owner's view never says a reset passed. A row
+/// naming its reset is the retarget test's (`RESETS`).
 #[test]
 fn the_watch_keeps_no_reset_for_a_limit_row_that_names_none() {
     let one = TabOne::new("t1c-api-limit", "2.1.283");
@@ -852,7 +816,7 @@ fn the_watch_keeps_no_reset_for_a_limit_row_that_names_none() {
     );
     let mut st = one.record();
     assert_eq!(st.limit_until, 0, "no reset kept");
-    // The limit the recorded wait, as a later look records it.
+    // A later look records the wait as `limited`.
     st.wait = "limited".to_string();
     save(&one.opts, SESSION, &st);
     let row = rows(&one.opts)
@@ -864,15 +828,10 @@ fn the_watch_keeps_no_reset_for_a_limit_row_that_names_none() {
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
 }
 
-/// A told watch changes what it must and stamps no look before the record is
-/// due; a due one clears a guard a later point outlived. Over tab one, through
-/// the real visit as a dry run: a due watch holds the round to the limit's
-/// reset and is stamped `looked`; a newer build appears, and a told watch a
-/// minute later (not due) retargets it and leaves `looked_at` as it was
-/// (otherwise frequent told watches would starve the due watch, the only one
-/// that re-parks). A told watch with nothing to change writes nothing. The
-/// next due watch, whose loop offered a point after its last guard, clears
-/// the guard. Zero input requests.
+/// A told watch makes the changes it must but stamps no look before the record is due (else
+/// frequent told watches would starve the due watch, the only one that re-parks); with
+/// nothing to change it writes nothing. A due watch whose loop offered a point after its last
+/// guard clears the guard. Zero input requests.
 #[test]
 fn a_told_watch_stamps_no_look_before_due_and_a_later_point_clears_the_guard() {
     let mut one = TabOne::new("t1c-told", "2.1.283");
@@ -920,12 +879,9 @@ fn a_told_watch_stamps_no_look_before_due_and_a_later_point_clears_the_guard() {
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
 }
 
-/// A record without a tab (older builds recorded the tab only at the
-/// announcement) is watched where the read finds its conversation: tab one's
-/// record with `tab` emptied is watched through the real visit's dry read,
-/// which finds the conversation in the tab and records the tab. Negative
-/// control: another tab's watch, whose read finds no conversation of this
-/// record, does not touch it.
+/// A record with no tab is watched where the read finds its conversation, which records the
+/// tab. Negative control: another tab's watch, whose read finds no conversation of it, leaves
+/// it alone.
 #[test]
 fn a_record_with_no_recorded_tab_is_watched_where_the_read_finds_it() {
     let one = TabOne::new("t1c-untabbed", "2.1.284");
@@ -960,19 +916,12 @@ fn a_record_with_no_recorded_tab_is_watched_where_the_read_finds_it() {
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
 }
 
-/// A word the act's own last checks recorded stands over a read that stops
-/// short of them. The watch's dry read answers `would-announce` before the
-/// notice's fence reads the screen, and `would-restart` before the restart
-/// takes the hand and looks last. So when real visits found the notice refused
-/// by its own fence (`wait:announce-refused:changed`, counted `refused`), a due
-/// watch landing at an idle moment must not record [`upgrade::NEXT_POINT`] over
-/// it, which would silence the `TELL_S` warning (`Row::refused_notice`).
-/// Through the real `watch_with` over tab one's record: the refused notice's
-/// word and warning stand under a `would-announce` read, and a restart's last
-/// look's `changed` under a `would-restart` one (`St::restart_look`). Negative
-/// controls, each recorded `next-point`: a gate's word (`not-idle:busy`, which
-/// the read sees past); the refused notice under another act's read (a READY
-/// heard since); and a `changed` no restart's look said.
+/// A word the act's own last checks recorded stands over a dry read that stops short of them:
+/// a notice its fence refused (`wait:announce-refused:changed`) under a `would-announce` read,
+/// its `TELL_S` warning (`Row::refused_notice`) still told, and a restart's last look's
+/// `changed` under a `would-restart` read (`St::restart_look`). Negative controls, each
+/// recorded `next-point`: a gate's word (`not-idle:busy`), the refused notice under another
+/// act's read, and a `changed` no restart's look said.
 #[test]
 fn a_word_the_acts_own_last_check_recorded_stands_over_a_read_short_of_it() {
     let one = TabOne::new("t1c-past-go", "2.1.283");
@@ -1039,7 +988,7 @@ fn a_word_the_acts_own_last_check_recorded_stands_over_a_read_short_of_it() {
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
 }
 
-// ------------------------------------------- T1-c the derived machine's look
+// ------------------------------------------------ the derived machine's look
 
 /// Tab one at an idle point the loop never takes: the stand-in's Claude reads
 /// `idle` and the transcript holds no limit, so the real read's reducer would
@@ -1062,12 +1011,9 @@ fn tab_one_idle(one: &mut TabOne) {
     .expect("transcript");
 }
 
-/// The derived machine's state for one look at tab #1's record, as
-/// `HarnessUpgradeProgress` reads it: the record's projection
-/// ([`progress_projection`] at `now`), the look's `posture`, the limit's reset
-/// still ahead, nothing under the stand-in agent, no READY — and the gap
-/// latch clear (`keep`, since the read says what holds the point of an act,
-/// `upgrade::held_point`): the machine main is today.
+/// The derived machine's state for one look at tab one's record: its projection
+/// ([`progress_projection`] at `now`), the look's `posture`, the limit's reset still ahead,
+/// nothing under the stand-in agent, no READY, and the `keep` gap latch clear.
 fn tab_one_state(one: &TabOne, posture: i64, now: u64) -> aterm_spec::interp::State {
     let row = rows(&one.opts)
         .into_iter()
@@ -1091,33 +1037,23 @@ fn looked(s: &aterm_spec::interp::State) -> Vec<(&'static str, i64)> {
     LOOKED.iter().map(|k| (*k, s[*k])).collect()
 }
 
-/// T1-c, the watch as the derived machine's look: the real `watch_with`,
-/// through the real visit as a dry run and a control socket refusing all but
-/// reads, at an injected clock, moves tab one's record exactly as
-/// `HarnessUpgradeProgress`'s `Watch` and `WatchRearms` move the machine (both
-/// gap latches clear), the record projected before and after
+/// The real `watch_with` (the real visit as a dry run, a socket refusing all but reads, an
+/// injected clock) moves tab one's record as `HarnessUpgradeProgress`'s `Watch` and
+/// `WatchRearms` move the machine, the record projected before and after
 /// ([`progress_projection`]), with zero input requests:
 ///
-/// * (a) AT THE WALL, its reset ahead: the look records the limit and the
-///   reset the transcript names (`St::limit_until`, which the classifier
-///   faults a limit past), holds the announced round's clock to the reset and
-///   leaves the move clock where it was: a limit before its reset is a
-///   record (ruling 307).
-/// * (b) AT AN IDLE POINT THE LOOP NEVER TAKES (`RecordedWordStands`): the
-///   read would ask again (`would-announce`) and nothing holds its point, so
-///   the look records [`upgrade::NEXT_POINT`] over the word `background` —
-///   aterm's own class, "nothing holds it now" — and clears the processes a
-///   look that waited named. NEGATIVE CONTROL: the `keep` latch's machine
-///   leaves `background`, and the record keeps saying "held by its own work"
-///   of a move that waits only for a point. (The machine's announced round is at its last ask, so
-///   its read gives up where this one, at its first, asks again: both acts,
-///   and both find the point open.)
-/// * (c) A ROUND THAT GAVE UP AND HAS RESTED, AT THE WALL: the watch re-arms
-///   it with no hands and records what holds the NEW round — the limit, as
-///   its dry read said after the act (`would-rearm:unanswered@limited`,
-///   [`upgrade::held_point`]) — never the neutral word, whatever the re-arm
-///   is: `WatchRearms`, then `Watch`, in one pass; the move clock kept (it is
-///   the classifier's horizon for the agent's own work, `Row::own_work`).
+/// * (a) at the wall, its reset ahead: the look records the limit and the reset the transcript
+///   names (`St::limit_until`), holds the announced round's clock to the reset and leaves the
+///   move clock where it was;
+/// * (b) at an idle point the loop never takes: the read would ask again (`would-announce`)
+///   and nothing holds its point, so the look records [`upgrade::NEXT_POINT`] over
+///   `background` and clears the processes a waiting look named (the machine's round, at its
+///   last ask, gives up where this one asks again: both act, with the point open). Negative
+///   control: the `keep` latch's machine (`RecordedWordStands`) leaves `background`;
+/// * (c) a round that gave up and has rested, at the wall: the watch re-arms it with no hands
+///   and records what holds the new round (the limit, `would-rearm:unanswered@limited`),
+///   never the neutral word: `WatchRearms` then `Watch` in one pass. The move clock is kept:
+///   it is the classifier's horizon for the agent's own work (`Row::own_work`).
 #[test]
 fn the_real_watch_is_the_derived_look() {
     use aterm_models_harness::harness_upgrade_progress_model;
@@ -1166,13 +1102,12 @@ fn the_real_watch_is_the_derived_look() {
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
     drop(one);
 
-    // (b) At an idle point the loop never takes: the gap closed.
+    // (b) At an idle point the loop never takes.
     let mut one = TabOne::new("t1c-derived-idle", "2.1.283");
     tab_one_idle(&mut one);
     let before = tab_one_state(&one, 2, NOW_28TH);
-    // The read of [`TabOne::read`], its agent launched as a plain `claude`
-    // from a `zsh` (a pid no process holds, named in the table), so the
-    // notice's line is planned and the read says what it would do.
+    // [`TabOne::read`] with the agent launched as a plain `claude` from a `zsh` (a dead pid
+    // named in the table), so the notice's line is planned and the read says what it would do.
     let shell = dead_pid();
     let mut t = table();
     t.push((shell, 1, "zsh".into()));
@@ -1222,8 +1157,7 @@ fn the_real_watch_is_the_derived_look() {
         "{}",
         row.line(NOW_28TH)
     );
-    // NEGATIVE CONTROL: the `keep` latch's look leaves `background`: the
-    // record keeps its own work.
+    // Negative control: the `keep` latch's look leaves `background`.
     let kept = fire(&today, "Watch", &with_latch(&before, "keep"));
     assert_eq!(kept["cause"], 0, "the old look");
     assert_ne!(
@@ -1277,12 +1211,10 @@ fn the_real_watch_is_the_derived_look() {
     }
 }
 
-/// The watch reads the limit at the second it is GIVEN, its read included —
-/// never the wall clock's (else every watch here handed [`NOW_28TH`] reads the
-/// limit as over once the real clock passes [`RESETS`]). The same tab one,
-/// watched before its reset and past it: before, `limited` and the round's
-/// clock held to the reset; past it, neither, whatever the wall clock says.
-/// And the thread's clock is the wall's again after.
+/// The watch reads the limit at the second it is given, its read included, never the wall
+/// clock's (else every watch here handed [`NOW_28TH`] would read the limit as over once the
+/// real clock passes [`RESETS`]). Before its reset: `limited` and the clock held; past it,
+/// neither. The thread's clock is the wall's again after.
 #[test]
 fn the_watch_reads_the_limit_at_the_second_it_is_given() {
     let before = TabOne::new("t1c-clock-before", "2.1.283");
@@ -1316,7 +1248,7 @@ fn the_watch_reads_the_limit_at_the_second_it_is_given() {
     assert_eq!(reads.get(), 2);
 }
 
-/// `s` with the gap latch `name` set: main's look before that gap closed.
+/// `s` with the gap latch `name` set.
 fn with_latch(s: &aterm_spec::interp::State, name: &'static str) -> aterm_spec::interp::State {
     let mut s = s.clone();
     s.insert(name, 1);

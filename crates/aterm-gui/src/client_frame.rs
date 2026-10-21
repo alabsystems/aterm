@@ -11,8 +11,11 @@
 //! spawns at window creation); it draws none now, and the chrome band is the
 //! header instead:
 //!
-//! - its right end carries the window buttons ([`CaptionButton`], laid out as
-//!   [`crate::tab_bar::TabHit::Caption`] segments of a [`CaptionSlot`]);
+//! - its ends carry the window buttons ([`CaptionButton`], laid out as
+//!   [`crate::tab_bar::TabHit::Caption`] segments of a [`CaptionSlot`]) where
+//!   GNOME's `button-layout` puts them ([`ButtonLayout`], read from the
+//!   Settings portal as sctk-adwaita read it; minimize, maximize and close on
+//!   the right when the desktop has no answer);
 //! - its bare band drags the window, double-clicks to maximize and restore, and
 //!   right-clicks to the compositor's window menu (`handle_tab_strip_click` and
 //!   the right-press arm of `on_mouse_input`);
@@ -48,6 +51,117 @@ pub(crate) enum CaptionButton {
     Close,
 }
 
+/// A button GNOME's `button-layout` names: sctk-adwaita's `ButtonKind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LayoutButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// One end of the header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Side {
+    Left,
+    Right,
+}
+
+/// Where the header's buttons go, each end's left to right: GNOME's
+/// `org.gnome.desktop.wm.preferences button-layout` (`appmenu:close`,
+/// `close,minimize,maximize:`) as sctk-adwaita 0.10.1 read it before LW.5
+/// (tests/recorded/sctk-adwaita-0.10.1-frame.tsv is its answer for each
+/// value, and [`Self::parse`] is held to it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ButtonLayout {
+    left: [Option<LayoutButton>; 3],
+    right: [Option<LayoutButton>; 3],
+}
+
+impl ButtonLayout {
+    /// The desktop has no answer, or one that names no button: minimize,
+    /// maximize and close on the right, sctk-adwaita's default.
+    pub(crate) const FALLBACK: Self = Self {
+        left: [None; 3],
+        right: [
+            Some(LayoutButton::Minimize),
+            Some(LayoutButton::Maximize),
+            Some(LayoutButton::Close),
+        ],
+    };
+
+    /// The two ends `value` names, as sctk-adwaita split it: the text after
+    /// the value's last space (it read `dbus-send`'s line, whose last word is
+    /// the value, so a value with spaces was read from its last one), then
+    /// the first two of its `:`-separated sides. `None` without a `:`.
+    pub(crate) fn sides_of(value: &str) -> Option<(&str, &str)> {
+        let word = value.rsplit(' ').next().unwrap_or(value);
+        let mut sides = word.split(':');
+        Some((sides.next()?, sides.next()?))
+    }
+
+    /// `value` as sctk-adwaita read it ([`Self::sides_of`]): on each end the
+    /// first three comma-separated names, of which `close`, `maximize` and
+    /// `minimize` (exactly; `appmenu`, `spacer` and any other name are
+    /// skipped) are buttons, in the order written. `None` where neither end
+    /// names one: [`Self::FALLBACK`] then.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let (left, right) = Self::sides_of(value)?;
+        let side = |names: &str| {
+            let mut out = [None; 3];
+            let named = names.split(',').take(3).filter_map(|name| match name {
+                "close" => Some(LayoutButton::Close),
+                "maximize" => Some(LayoutButton::Maximize),
+                "minimize" => Some(LayoutButton::Minimize),
+                _ => None,
+            });
+            for (slot, button) in out.iter_mut().zip(named) {
+                *slot = Some(button);
+            }
+            out
+        };
+        let layout = Self {
+            left: side(left),
+            right: side(right),
+        };
+        (layout.left.iter().chain(&layout.right).any(Option::is_some)).then_some(layout)
+    }
+
+    /// The names on `side`, left to right.
+    pub(crate) fn on(self, side: Side) -> impl Iterator<Item = LayoutButton> {
+        match side {
+            Side::Left => self.left,
+            Side::Right => self.right,
+        }
+        .into_iter()
+        .flatten()
+    }
+
+    /// The desktop's layout: the Settings portal's `button-layout`, read
+    /// once a process (sctk-adwaita read it once a frame) and kept;
+    /// [`Self::FALLBACK`] without a running portal, an answer that is not a
+    /// string, or one that names no button.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn desktop() -> Self {
+        static READ: std::sync::OnceLock<ButtonLayout> = std::sync::OnceLock::new();
+        *READ.get_or_init(|| {
+            use crate::portal_settings::{BUTTON_LAYOUT, GNOME_WM_PREFERENCES, read};
+            match read(GNOME_WM_PREFERENCES, BUTTON_LAYOUT, LAYOUT_READ_BOUND) {
+                Some(aterm_dbus::Value::Str(value)) => {
+                    Self::parse(&value).unwrap_or(Self::FALLBACK)
+                }
+                _ => Self::FALLBACK,
+            }
+        })
+    }
+}
+
+/// How long the `button-layout` read may take, the bus's handshake included:
+/// it runs once, on the main thread, at the first client-decorated window's
+/// first `Resized`; past it the desktop has no answer
+/// ([`ButtonLayout::FALLBACK`]). The motion read's bound.
+#[cfg(target_os = "linux")]
+const LAYOUT_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// What a window's own frame offers, from the fork's
 /// `WindowExtWayland::client_decorations`: present only while the window must
 /// draw its decorations itself.
@@ -69,6 +183,8 @@ pub(crate) struct ClientFrame {
     /// caption (no move, no maximize, no window menu), as sctk-adwaita hid its
     /// header there.
     pub(crate) header: bool,
+    /// Where the desktop puts the buttons ([`ButtonLayout::desktop`]).
+    pub(crate) layout: ButtonLayout,
 }
 
 impl ClientFrame {
@@ -84,6 +200,7 @@ impl ClientFrame {
             maximized: d.maximized,
             edges: d.resizable && !d.maximized && !d.fullscreen && !d.tiled,
             header: !d.fullscreen,
+            layout: ButtonLayout::desktop(),
         })
     }
 
@@ -93,26 +210,31 @@ impl ClientFrame {
         self.header
     }
 
-    /// The header's buttons, left to right: minimize, maximize (restore while
-    /// maximized), close, each only where the compositor offers it. Close is
-    /// always there while there is a header; in fullscreen there are none. This
-    /// is the order and the defaults sctk-adwaita used when it could not read
-    /// GNOME's `button-layout` (which it read by spawning `dbus-send`; aterm does
-    /// not read it).
+    /// The header's buttons at its `side`, left to right: the ones the
+    /// layout names there that the compositor offers (minimize and maximize
+    /// only where it can; close always), maximize as restore while the window
+    /// is maximized. None in fullscreen. sctk-adwaita filtered its layout by
+    /// the compositor's capabilities the same way.
+    pub(crate) fn buttons_on(self, side: Side) -> impl Iterator<Item = CaptionButton> {
+        self.layout
+            .on(side)
+            .filter_map(move |button| match button {
+                LayoutButton::Minimize => self.minimize.then_some(CaptionButton::Minimize),
+                LayoutButton::Maximize if self.maximized => {
+                    self.maximize.then_some(CaptionButton::Restore)
+                }
+                LayoutButton::Maximize => self.maximize.then_some(CaptionButton::Maximize),
+                LayoutButton::Close => Some(CaptionButton::Close),
+            })
+            .filter(move |_| self.header)
+    }
+
+    /// Every button, the left end's then the right end's (the tests' view;
+    /// drawing and hit-testing go end by end).
+    #[cfg(test)]
     pub(crate) fn buttons(self) -> impl Iterator<Item = CaptionButton> {
-        let maximize = if self.maximized {
-            CaptionButton::Restore
-        } else {
-            CaptionButton::Maximize
-        };
-        [
-            self.minimize.then_some(CaptionButton::Minimize),
-            self.maximize.then_some(maximize),
-            Some(CaptionButton::Close),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(move |_| self.header)
+        self.buttons_on(Side::Left)
+            .chain(self.buttons_on(Side::Right))
     }
 }
 
@@ -137,20 +259,22 @@ const BUTTON_SLOT_LOGICAL_PX: f32 = 34.0;
 /// The round button's diameter in logical px (Adwaita's, and sctk-adwaita's).
 pub(crate) const BUTTON_LOGICAL_PX: f32 = 24.0;
 
-/// The header's buttons as the strip lays them out at its right end: which
-/// buttons, left to right, and the whole cells each one's slot takes. A strip
-/// cache-key term, so a change of buttons, of the maximized state or of the
-/// slot width repaints the band.
+/// The header's buttons as the strip lays them out at its two ends: which
+/// buttons, each end's left to right, and the whole cells each one's slot
+/// takes. A strip cache-key term, so a change of buttons, of the maximized
+/// state or of the slot width repaints the band.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct CaptionSlot {
-    buttons: [Option<CaptionButton>; 3],
+    left: [Option<CaptionButton>; 3],
+    right: [Option<CaptionButton>; 3],
     button_cols: u16,
 }
 
 impl CaptionSlot {
     /// No buttons: the window system decorates this window.
     pub(crate) const NONE: Self = Self {
-        buttons: [None; 3],
+        left: [None; 3],
+        right: [None; 3],
         button_cols: 0,
     };
 
@@ -172,19 +296,35 @@ impl CaptionSlot {
         } else {
             1
         };
-        let mut buttons = [None; 3];
-        for (slot, button) in buttons.iter_mut().zip(frame.buttons()) {
-            *slot = Some(button);
-        }
+        let side = |side| {
+            let mut out = [None; 3];
+            for (slot, button) in out.iter_mut().zip(frame.buttons_on(side)) {
+                *slot = Some(button);
+            }
+            out
+        };
         Self {
-            buttons,
+            left: side(Side::Left),
+            right: side(Side::Right),
             button_cols,
         }
     }
 
-    /// The buttons, left to right.
+    /// The buttons at `side`, left to right.
+    pub(crate) fn on(self, side: Side) -> impl Iterator<Item = CaptionButton> {
+        match side {
+            Side::Left => self.left,
+            Side::Right => self.right,
+        }
+        .into_iter()
+        .flatten()
+    }
+
+    /// Every button, the left end's then the right end's (the tests' view;
+    /// drawing and hit-testing go end by end).
+    #[cfg(test)]
     pub(crate) fn buttons(self) -> impl Iterator<Item = CaptionButton> {
-        self.buttons.into_iter().flatten()
+        self.on(Side::Left).chain(self.on(Side::Right))
     }
 
     /// The cells one button's slot takes.
@@ -192,16 +332,23 @@ impl CaptionSlot {
         self.button_cols
     }
 
-    /// The cells the whole slot takes.
-    pub(crate) fn cols(self) -> u16 {
-        let n = u16::try_from(self.buttons().count()).unwrap_or(u16::MAX);
+    /// The cells the buttons at `side` take.
+    pub(crate) fn side_cols(self, side: Side) -> u16 {
+        let n = u16::try_from(self.on(side).count()).unwrap_or(u16::MAX);
         n.saturating_mul(self.button_cols)
     }
 
-    /// The slot on a `cols`-wide strip that must keep `floor` cells left of it
-    /// for the tabs and the `+`: minimize goes first, then maximize; close stays
-    /// while it fits at all, and on a strip too narrow even for it there are no
-    /// buttons (the window's edges and the compositor's own keys still work).
+    /// The cells both ends take.
+    pub(crate) fn cols(self) -> u16 {
+        self.side_cols(Side::Left)
+            .saturating_add(self.side_cols(Side::Right))
+    }
+
+    /// The slot on a `cols`-wide strip that must keep `floor` cells between
+    /// its ends for the tabs and the `+`: minimize goes first, then maximize,
+    /// from both ends; close stays while it fits at all, and on a strip too
+    /// narrow even for it there are no buttons (the window's edges and the
+    /// compositor's own keys still work).
     #[must_use]
     pub(crate) fn fit(self, cols: u16, floor: u16) -> Self {
         let mut slot = self;
@@ -213,9 +360,17 @@ impl CaptionSlot {
             if slot.cols().saturating_add(floor) <= cols {
                 return slot;
             }
-            for b in &mut slot.buttons {
+            for b in slot.left.iter_mut().chain(slot.right.iter_mut()) {
                 if *b == Some(drop) {
                     *b = None;
+                }
+            }
+            // Keep each end's buttons packed from its first slot.
+            for end in [&mut slot.left, &mut slot.right] {
+                let kept: Vec<CaptionButton> = end.iter().flatten().copied().collect();
+                *end = [None; 3];
+                for (slot, button) in end.iter_mut().zip(kept) {
+                    *slot = Some(button);
                 }
             }
         }
@@ -403,6 +558,7 @@ mod tests {
         maximized: false,
         edges: true,
         header: true,
+        layout: ButtonLayout::FALLBACK,
     };
 
     #[test]
@@ -441,6 +597,131 @@ mod tests {
         assert_eq!(
             CaptionSlot::measure(Some(fullscreen), 9, 1.0),
             CaptionSlot::NONE
+        );
+    }
+
+    /// sctk-adwaita 0.10.1's own answers (tests/recorder-adwaita): for each
+    /// `button-layout` value, or none, the two ends its config read split it
+    /// into, and the buttons each end showed under each set of compositor
+    /// capabilities.
+    const RECORDED: &str = include_str!("../tests/recorded/sctk-adwaita-0.10.1-frame.tsv");
+
+    fn field<'a>(row: &[&'a str], name: &str) -> &'a str {
+        row.iter()
+            .find_map(|f| f.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no {name} in {row:?}"))
+    }
+
+    fn names(buttons: impl Iterator<Item = CaptionButton>) -> String {
+        let names: Vec<&str> = buttons
+            .map(|b| match b {
+                CaptionButton::Minimize => "minimize",
+                CaptionButton::Maximize => "maximize",
+                CaptionButton::Restore => "restore",
+                CaptionButton::Close => "close",
+            })
+            .collect();
+        if names.is_empty() {
+            "-".into()
+        } else {
+            names.join(",")
+        }
+    }
+
+    #[test]
+    fn the_layout_reads_every_value_as_sctk_adwaita_did() {
+        let mut rows = 0;
+        for line in RECORDED.lines().filter(|l| l.starts_with("layout\t")) {
+            let row: Vec<&str> = line.split('\t').collect();
+            let value = match field(&row, "value") {
+                "<no portal>" => None,
+                quoted => {
+                    let v = quoted
+                        .strip_prefix('"')
+                        .and_then(|v| v.strip_suffix('"'))
+                        .expect("a quoted value");
+                    assert!(!v.contains('\\'), "no escapes in the corpus: {v}");
+                    Some(v)
+                }
+            };
+            let read = value.and_then(ButtonLayout::sides_of);
+            let read_s = read.map_or("-".to_string(), |(l, r)| format!("{l}|{r}"));
+            assert_eq!(read_s, field(&row, "read"), "{line}");
+            let frame = ClientFrame {
+                maximize: field(&row, "maximize") == "1",
+                minimize: field(&row, "minimize") == "1",
+                layout: value
+                    .and_then(ButtonLayout::parse)
+                    .unwrap_or(ButtonLayout::FALLBACK),
+                ..FRAME
+            };
+            assert_eq!(
+                names(frame.buttons_on(Side::Left)),
+                field(&row, "left"),
+                "{line}"
+            );
+            assert_eq!(
+                names(frame.buttons_on(Side::Right)),
+                field(&row, "right"),
+                "{line}"
+            );
+            rows += 1;
+        }
+        assert_eq!(rows, 92, "every recorded row was read");
+    }
+
+    #[test]
+    fn the_fallback_is_minimize_maximize_close_on_the_right() {
+        // NEGATIVE CONTROL for the oracle: LW.5's fixed buttons answer GNOME's
+        // default differently from sctk-adwaita (close alone).
+        let gnome = ButtonLayout::parse("appmenu:close").expect("a layout");
+        assert_ne!(gnome, ButtonLayout::FALLBACK);
+        let frame = ClientFrame {
+            layout: gnome,
+            ..FRAME
+        };
+        assert_eq!(names(frame.buttons()), "close");
+        assert_eq!(
+            names(FRAME.buttons_on(Side::Right)),
+            "minimize,maximize,close"
+        );
+        assert_eq!(names(FRAME.buttons_on(Side::Left)), "-");
+        for nothing in [
+            "",
+            ":",
+            "appmenu:",
+            "minimize,maximize,close",
+            "Close:Minimize",
+        ] {
+            assert_eq!(ButtonLayout::parse(nothing), None, "{nothing:?}");
+        }
+    }
+
+    #[test]
+    fn a_slot_lays_out_both_ends_and_sheds_from_both() {
+        let layout = ButtonLayout::parse("close,minimize:maximize").expect("a layout");
+        let frame = ClientFrame { layout, ..FRAME };
+        let slot = CaptionSlot::measure(Some(frame), 9, 1.0);
+        assert_eq!(names(slot.on(Side::Left)), "close,minimize");
+        assert_eq!(names(slot.on(Side::Right)), "maximize");
+        assert_eq!(slot.side_cols(Side::Left), 8);
+        assert_eq!(slot.side_cols(Side::Right), 4);
+        assert_eq!(slot.cols(), 12);
+        // Narrower: minimize goes, then maximize; close stays.
+        let fit = slot.fit(14, 6);
+        assert_eq!(names(fit.buttons()), "close,maximize");
+        assert_eq!(fit.side_cols(Side::Left), 4);
+        let fit = slot.fit(10, 6);
+        assert_eq!(names(fit.buttons()), "close");
+        assert_eq!(slot.fit(4, 6), CaptionSlot::NONE);
+        // A maximized window's maximize restores, at whichever end it is.
+        let maximized = ClientFrame {
+            maximized: true,
+            ..frame
+        };
+        assert_eq!(
+            names(CaptionSlot::measure(Some(maximized), 9, 1.0).on(Side::Right)),
+            "restore"
         );
     }
 

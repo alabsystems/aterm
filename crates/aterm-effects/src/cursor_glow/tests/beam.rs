@@ -13,7 +13,7 @@ fn beam_parses_to_its_own_style() {
     assert_eq!(GlowStyle::parse("comet"), GlowStyle::Comet);
     assert_eq!(GlowStyle::parse("lumen"), GlowStyle::Lumen);
     assert_eq!(GlowStyle::parse("laser"), GlowStyle::Laser);
-    // The tube leaves STARDUST in its wake (the space theme's motes).
+    // The tube leaves stardust in its wake.
     assert!(GlowStyle::Beam.has_particles());
 }
 
@@ -39,8 +39,8 @@ fn beam_jump_is_one_clean_full_vector_rod() {
         glow.sparks.len()
     );
     assert!(glow.bolts.is_empty(), "a beam is not a lightning weapon");
-    // STARDUST, not exhaust: a modest weightless wake — every mote floats
-    // (zero gravity) and lingers (star-length lives, not spark-length).
+    // Stardust, not exhaust: a modest wake whose motes float (zero gravity) and
+    // linger (star-length lives).
     assert!(!glow.particles.is_empty(), "a warp leap stirs stardust");
     assert!(
         glow.particles.len() <= 14,

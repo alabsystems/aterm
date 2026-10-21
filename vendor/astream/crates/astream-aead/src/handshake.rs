@@ -11,8 +11,9 @@
 //!
 //! # Construction (the NNpsk pattern) — WE own it
 //! We own the whole protocol: the message framing, the transcript binding, and
-//! HMAC-SHA256 / HKDF-SHA256, composed here over the workspace's SHA-256
-//! (`astream-digest`) exactly as `astream-cap` owns its HMAC. The ONE primitive we delegate is the raw X25519
+//! the key schedule. HMAC-SHA256 / HKDF-SHA256 are the workspace's own, in
+//! `astream-digest` (the one HMAC astream-cap tags with too; this crate's copy
+//! moved there, its zeroization with it). The ONE primitive we delegate is the raw X25519
 //! scalar multiplication — hand-rolling constant-time curve25519 field arithmetic
 //! is where DIY crypto breaks — to the vetted `x25519-dalek`.
 //!
@@ -34,7 +35,7 @@
 //! PSK — no explicit confirmation message needed.
 
 use crate::{SealedStream, KEY_LEN};
-use astream_digest::Sha256;
+use astream_digest::{hkdf_expand_32, hkdf_extract};
 use std::io::{self, Read, Write};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
@@ -57,202 +58,18 @@ contract_fn! {
     }
 }
 
-const SHA256_BLOCK: usize = 64;
-const SHA256_OUT: usize = 32;
-const MAX_HKDF_INFO: usize = 1024;
-
-const fn hmac_ipad(k0: &[u8; SHA256_BLOCK]) -> [u8; SHA256_BLOCK] {
-    [
-        k0[0] ^ 0x36,
-        k0[1] ^ 0x36,
-        k0[2] ^ 0x36,
-        k0[3] ^ 0x36,
-        k0[4] ^ 0x36,
-        k0[5] ^ 0x36,
-        k0[6] ^ 0x36,
-        k0[7] ^ 0x36,
-        k0[8] ^ 0x36,
-        k0[9] ^ 0x36,
-        k0[10] ^ 0x36,
-        k0[11] ^ 0x36,
-        k0[12] ^ 0x36,
-        k0[13] ^ 0x36,
-        k0[14] ^ 0x36,
-        k0[15] ^ 0x36,
-        k0[16] ^ 0x36,
-        k0[17] ^ 0x36,
-        k0[18] ^ 0x36,
-        k0[19] ^ 0x36,
-        k0[20] ^ 0x36,
-        k0[21] ^ 0x36,
-        k0[22] ^ 0x36,
-        k0[23] ^ 0x36,
-        k0[24] ^ 0x36,
-        k0[25] ^ 0x36,
-        k0[26] ^ 0x36,
-        k0[27] ^ 0x36,
-        k0[28] ^ 0x36,
-        k0[29] ^ 0x36,
-        k0[30] ^ 0x36,
-        k0[31] ^ 0x36,
-        k0[32] ^ 0x36,
-        k0[33] ^ 0x36,
-        k0[34] ^ 0x36,
-        k0[35] ^ 0x36,
-        k0[36] ^ 0x36,
-        k0[37] ^ 0x36,
-        k0[38] ^ 0x36,
-        k0[39] ^ 0x36,
-        k0[40] ^ 0x36,
-        k0[41] ^ 0x36,
-        k0[42] ^ 0x36,
-        k0[43] ^ 0x36,
-        k0[44] ^ 0x36,
-        k0[45] ^ 0x36,
-        k0[46] ^ 0x36,
-        k0[47] ^ 0x36,
-        k0[48] ^ 0x36,
-        k0[49] ^ 0x36,
-        k0[50] ^ 0x36,
-        k0[51] ^ 0x36,
-        k0[52] ^ 0x36,
-        k0[53] ^ 0x36,
-        k0[54] ^ 0x36,
-        k0[55] ^ 0x36,
-        k0[56] ^ 0x36,
-        k0[57] ^ 0x36,
-        k0[58] ^ 0x36,
-        k0[59] ^ 0x36,
-        k0[60] ^ 0x36,
-        k0[61] ^ 0x36,
-        k0[62] ^ 0x36,
-        k0[63] ^ 0x36,
-    ]
-}
-
-const fn hmac_opad(k0: &[u8; SHA256_BLOCK]) -> [u8; SHA256_BLOCK] {
-    [
-        k0[0] ^ 0x5c,
-        k0[1] ^ 0x5c,
-        k0[2] ^ 0x5c,
-        k0[3] ^ 0x5c,
-        k0[4] ^ 0x5c,
-        k0[5] ^ 0x5c,
-        k0[6] ^ 0x5c,
-        k0[7] ^ 0x5c,
-        k0[8] ^ 0x5c,
-        k0[9] ^ 0x5c,
-        k0[10] ^ 0x5c,
-        k0[11] ^ 0x5c,
-        k0[12] ^ 0x5c,
-        k0[13] ^ 0x5c,
-        k0[14] ^ 0x5c,
-        k0[15] ^ 0x5c,
-        k0[16] ^ 0x5c,
-        k0[17] ^ 0x5c,
-        k0[18] ^ 0x5c,
-        k0[19] ^ 0x5c,
-        k0[20] ^ 0x5c,
-        k0[21] ^ 0x5c,
-        k0[22] ^ 0x5c,
-        k0[23] ^ 0x5c,
-        k0[24] ^ 0x5c,
-        k0[25] ^ 0x5c,
-        k0[26] ^ 0x5c,
-        k0[27] ^ 0x5c,
-        k0[28] ^ 0x5c,
-        k0[29] ^ 0x5c,
-        k0[30] ^ 0x5c,
-        k0[31] ^ 0x5c,
-        k0[32] ^ 0x5c,
-        k0[33] ^ 0x5c,
-        k0[34] ^ 0x5c,
-        k0[35] ^ 0x5c,
-        k0[36] ^ 0x5c,
-        k0[37] ^ 0x5c,
-        k0[38] ^ 0x5c,
-        k0[39] ^ 0x5c,
-        k0[40] ^ 0x5c,
-        k0[41] ^ 0x5c,
-        k0[42] ^ 0x5c,
-        k0[43] ^ 0x5c,
-        k0[44] ^ 0x5c,
-        k0[45] ^ 0x5c,
-        k0[46] ^ 0x5c,
-        k0[47] ^ 0x5c,
-        k0[48] ^ 0x5c,
-        k0[49] ^ 0x5c,
-        k0[50] ^ 0x5c,
-        k0[51] ^ 0x5c,
-        k0[52] ^ 0x5c,
-        k0[53] ^ 0x5c,
-        k0[54] ^ 0x5c,
-        k0[55] ^ 0x5c,
-        k0[56] ^ 0x5c,
-        k0[57] ^ 0x5c,
-        k0[58] ^ 0x5c,
-        k0[59] ^ 0x5c,
-        k0[60] ^ 0x5c,
-        k0[61] ^ 0x5c,
-        k0[62] ^ 0x5c,
-        k0[63] ^ 0x5c,
-    ]
-}
-
-const fn pad_sha256_key(d: [u8; SHA256_OUT]) -> [u8; SHA256_BLOCK] {
-    [
-        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13],
-        d[14], d[15], d[16], d[17], d[18], d[19], d[20], d[21], d[22], d[23], d[24], d[25], d[26],
-        d[27], d[28], d[29], d[30], d[31], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]
-}
-
-/// HMAC-SHA256 (RFC 2104), composed over `astream-digest`. Ours, not a
-/// dependency — the same stance `astream-cap` takes.
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_OUT] {
-    // Derive the block-sized key K0: hash an over-long key, else right-zero-pad.
-    let mut k0 = if key.len() > SHA256_BLOCK {
-        pad_sha256_key(Sha256::digest(key))
-    } else {
-        let mut k0 = [0u8; SHA256_BLOCK];
-        k0[..key.len()].copy_from_slice(key);
-        k0
-    };
-    let mut ipad = hmac_ipad(&k0);
-    let mut opad = hmac_opad(&k0);
-    let inner = {
-        let mut h = Sha256::new();
-        h.update(ipad);
-        h.update(msg);
-        h.finalize()
-    };
-    let mut h = Sha256::new();
-    h.update(opad);
-    h.update(inner);
-    k0.fill(0);
-    ipad.fill(0);
-    opad.fill(0);
-    core::hint::black_box((&mut k0, &mut ipad, &mut opad));
-    h.finalize()
-}
-
 /// HKDF-SHA256 (RFC 5869) producing exactly 32 bytes (a single expand block,
-/// L = 32 ≤ 255·32). Extract then Expand, ours over `hmac_sha256`.
+/// L = 32 ≤ 255·32): `astream-digest`'s Extract then Expand.
+///
+/// Both run through astream-digest's wiping HMAC, which zeroes the key block and
+/// pads it derives from the salt (the PSK, in the NNpsk handshake) and from the
+/// PRK before it returns: the zeroization this crate's own HMAC copy did, until
+/// that copy was replaced by astream-digest's one HMAC (astream-cap's core moved
+/// there too, and aterm's copy has gone the same way). The PRK
+/// itself is this function's to wipe, and it does.
 pub(crate) fn hkdf_sha256_32(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8; 32] {
-    // Extract.
-    let mut prk = hmac_sha256(salt, ikm);
-    // Expand, N = 1: T(1) = HMAC(PRK, T(0)=<empty> ‖ info ‖ 0x01).
-    let clamped = handshake_clamp_info_len(info.len() as u64, MAX_HKDF_INFO as u64) as usize;
-    let info_len = if clamped <= MAX_HKDF_INFO {
-        clamped
-    } else {
-        MAX_HKDF_INFO
-    };
-    let mut t1_input = Vec::with_capacity(info_len + 1);
-    t1_input.extend_from_slice(info);
-    t1_input.push(0x01);
-    let okm = hmac_sha256(&prk, &t1_input);
+    let mut prk = hkdf_extract(salt, ikm);
+    let okm = hkdf_expand_32(&prk, info);
     prk.fill(0); // wipe the intermediate pseudo-random key
     core::hint::black_box(&mut prk);
     okm
@@ -629,71 +446,22 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
-    #[test]
-    fn hmac_sha256_matches_known_answers_across_the_block_size() {
-        // RFC 4231 Test Case 2, then a key of exactly one block (64 bytes: padded,
-        // not hashed) and one of a byte more (65: hashed first), whose answers come
-        // from Python's `hmac` module.
-        let block: Vec<u8> = (0u8..64).collect();
-        let over: Vec<u8> = (0u8..65).collect();
-        for (key, msg, want) in [
-            (
-                &b"Jefe"[..],
-                &b"what do ya want for nothing?"[..],
-                "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
-            ),
-            (
-                &block[..],
-                &b"block-size boundary"[..],
-                "0e28123f03dbcda96a31302c68e4cf3f092abf8b6394c1f825056927622a7a38",
-            ),
-            (
-                &over[..],
-                &b"block-size boundary"[..],
-                "bb5c919dfb366ab7388b18d7785e4bbc90550971b16ccae1c68417455dd03799",
-            ),
-        ] {
-            let mac = hmac_sha256(key, msg);
-            assert_eq!(
-                mac.as_slice(),
-                hex(want).as_slice(),
-                "{}-byte key",
-                key.len()
-            );
-        }
-    }
-
-    #[test]
-    fn hkdf_sha256_matches_rfc5869_a1() {
-        // RFC 5869 Appendix A.1 (SHA-256); we emit the first 32 bytes of the OKM.
-        let ikm = [0x0bu8; 22];
-        let salt = hex("000102030405060708090a0b0c");
-        let info = hex("f0f1f2f3f4f5f6f7f8f9");
-        let okm = hkdf_sha256_32(&salt, &ikm, &info);
-        let expected = hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf");
-        assert_eq!(okm.as_slice(), expected.as_slice());
-    }
-
-    #[test]
-    fn hkdf_sha256_matches_rfc5869_a2() {
-        // RFC 5869 Appendix A.2: an 80-byte salt is longer than the HMAC block, so
-        // Extract hashes it first — the path A.1's 13-byte salt never reaches.
-        let salt: Vec<u8> = (0x60u8..=0xaf).collect();
-        let ikm: Vec<u8> = (0x00u8..=0x4f).collect();
-        let info: Vec<u8> = (0xb0u8..=0xff).collect();
-        let okm = hkdf_sha256_32(&salt, &ikm, &info);
-        let expected = hex("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c");
-        assert_eq!(okm.as_slice(), expected.as_slice());
-    }
-
+    /// Recorded from this crate over the `sha2` crate (0.10.9) on 2026-10-15, before
+    /// it moved to `astream-digest`, and unchanged over it and over the HMAC that
+    /// moved there after it: both ends of a handshake must derive this key, so
+    /// nothing under it may change unless the key does not. The HKDF's own pins (RFC
+    /// 5869, and this same answer from the raw bytes) are astream-digest's; this one
+    /// is the INFO layout's (`build_hs_info`: the label, then the two ephemerals in
+    /// role order), which only this crate builds. Negative control: the ephemerals
+    /// swapped are another key (`transcript_role_order_changes_the_key`), and so is
+    /// another PSK, below.
     #[test]
     fn the_session_key_is_the_recorded_answer() {
-        // Recorded from this crate over the `sha2` crate (0.10.9) on 2026-10-15,
-        // before it moved to `astream-digest`, and unchanged over it: both ends of a handshake must derive
-        // this key, so the hash under it may change only if the key does not.
         let key = derive_session_key(&[9u8; KEY_LEN], &[7u8; 32], &[1u8; 32], &[2u8; 32]);
         let expected = hex("0d5a777ebe43ec2044188fa05d226c609e80df383b6cfce2b3cfa2bacbc64c24");
         assert_eq!(key.as_slice(), expected.as_slice());
+        let other = derive_session_key(&[8u8; KEY_LEN], &[7u8; 32], &[1u8; 32], &[2u8; 32]);
+        assert_ne!(other.as_slice(), expected.as_slice());
     }
 
     #[test]

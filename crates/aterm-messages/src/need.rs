@@ -111,7 +111,7 @@ pub const REASON_CAP: usize = 90;
 pub const STEP_CAP: usize = 90;
 /// The longest a transient row may hold: two minutes (the GUI's crash-last-time
 /// `HOLD_LAUNCH`). Past it a hold is persistent, and only a [`Need::Now`] may persist.
-pub const MAX_TRANSIENT: Duration = Duration::from_secs(120);
+pub const MAX_TRANSIENT: Duration = Duration::from_mins(2);
 /// An open exception files itself (`Retired::Unseen`) after this long: nothing
 /// waits forever, and nothing is lost — the log keeps its words.
 pub const DIGEST_EXPIRY: Duration = Duration::from_hours(14 * 24);

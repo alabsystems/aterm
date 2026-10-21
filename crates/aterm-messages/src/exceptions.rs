@@ -94,6 +94,22 @@ pub enum Family {
     /// the fleet glance states its whole answer at every read, so a read that
     /// reaches a peer again sweeps it.
     FleetUnreadable,
+    /// The folders whose direct entry count makes everything that lists them
+    /// slow (`vitals.huge-dir.<folder>.entries`,
+    /// docs/DESIGN-system-awareness-2026-10-16.md §10.8). A level family: the
+    /// disk walker's raised set is its whole answer, raised at 100,000 entries
+    /// and kept until a count shows the folder under 75,000. Its stem is its
+    /// own, under `vitals.`, so the system view's other level producers (a
+    /// stuck job, memory, zombies, the disk's time to full, §11.11) each take a
+    /// sibling stem and no producer's pass sweeps another's entries.
+    HugeDir,
+    /// The fabric bridge's own state dir (`fabric.state.<cause>`): files found
+    /// torn after an unclean stop in an earlier boot, which the first bridge
+    /// after it moved aside into the dir's quarantine
+    /// (`aterm_link::state::StateDir::set_aside_torn`). Raised
+    /// by event when a bridge says so (`link set-aside`); its stem is its own,
+    /// apart from the band's `fabric.hold` and `fabric.<verb>` rows.
+    FabricState,
 }
 
 impl Family {
@@ -118,6 +134,8 @@ impl Family {
             Self::ApiOutage => "harness.api-outage",
             Self::LongHold => "harness.long-hold",
             Self::FleetUnreadable => "fleet.unreadable",
+            Self::HugeDir => "vitals.huge-dir",
+            Self::FabricState => "fabric.state",
         }
     }
 
@@ -140,7 +158,8 @@ impl Family {
             | Self::Ai
             | Self::ApiOutage
             | Self::LongHold
-            | Self::FleetUnreadable => Mode::Level,
+            | Self::FleetUnreadable
+            | Self::HugeDir => Mode::Level,
             Self::Privacy
             | Self::Update
             | Self::UpgradeHost
@@ -150,12 +169,13 @@ impl Family {
             | Self::Disk
             | Self::Render
             | Self::Terminal
-            | Self::Removed => Mode::Event,
+            | Self::Removed
+            | Self::FabricState => Mode::Event,
         }
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -172,6 +192,8 @@ impl Family {
         Self::ApiOutage,
         Self::LongHold,
         Self::FleetUnreadable,
+        Self::HugeDir,
+        Self::FabricState,
     ];
 
     /// The message tag the family's entries carry.
@@ -189,9 +211,10 @@ impl Family {
             | Self::ApiOutage
             | Self::LongHold => tags::HARNESS,
             Self::Toolchain => tags::TOOLCHAIN,
-            Self::Disk | Self::FleetUnreadable => tags::SYSTEM,
+            Self::Disk | Self::FleetUnreadable | Self::HugeDir => tags::SYSTEM,
             Self::Render => tags::RENDER,
             Self::Terminal | Self::Removed => tags::CONFIG,
+            Self::FabricState => tags::FABRIC,
         }
     }
 }

@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FOLDER A FRESH SHELL STARTS IN (audit #7 finding 48).
+//! The folder a fresh shell starts in.
 //!
-//! A fresh shell is asked to start in a folder by a restored pane (its saved
-//! folder), a New Tab or split (the focused pane's), a new window, a profile or
-//! the `-d` flag. The PTY child `chdir`s there and ignores the result, so a
-//! folder that is gone, or one it may not enter, left the shell in aterm's own
-//! folder — `/` for an app started from Finder — and nothing said so. Now
-//! [`start_folder`] decides before the spawn: such a folder becomes the
-//! person's home folder, and `spawn_session` notes the folder here once the
-//! shell is up ([`StartFolder::say`]). The next park folds every noted folder
-//! into one Messages row per [`Fault`] (`App::fold_folder_faults`). `spawn
-//! cwd=` from the control socket is refused instead (`control_media`), because
-//! its caller named the folder and can act on a refusal.
+//! A fresh shell is asked to start in a folder by a restored pane, a New Tab or
+//! split (the focused pane's), a new window, a profile or `-d`. The PTY child
+//! `chdir`s there and ignores the result, so [`start_folder`] decides before the
+//! spawn: a folder that is gone or may not be entered becomes the person's home
+//! folder, and `spawn_session` notes it once the shell is up
+//! ([`StartFolder::say`]). The next park folds every noted folder into one
+//! Messages row per [`Fault`] (`App::fold_folder_faults`). `spawn cwd=` from the
+//! control socket is refused instead (`control_media`): its caller can act on a
+//! refusal.
 //!
 //! The check runs on a thread of its own and is waited for at most
 //! [`CHECK_BUDGET`]: a folder on a network volume that stopped answering
@@ -123,9 +121,9 @@ static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static CHECKS_RUNNING: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 
 /// Why a shell cannot start in `dir`, or `None` when it can or when that
-/// could not be decided in time (the child's `chdir` then decides, as it
-/// always did). Off unix nothing is judged here — a Windows spawn hands the
-/// folder to `CreateProcessW`, and a WSL tab's POSIX folder is no Windows path.
+/// could not be decided in time (the child's `chdir` then decides). Off unix
+/// nothing is judged here: a Windows spawn hands the folder to `CreateProcessW`,
+/// and a WSL tab's POSIX folder is no Windows path.
 pub(crate) fn folder_fault(dir: &str) -> Option<Fault> {
     #[cfg(unix)]
     {
@@ -1285,13 +1283,9 @@ mod tests {
         fn answers(_: &str) -> Option<Fault> {
             Some(Fault::Missing)
         }
-        // The check CANNOT answer before the gate opens below, so this `None` is
-        // `within` giving up on a check still running — an order. What the order
-        // does NOT see is WHEN it gave up: a `within` that waited a bounded while
-        // past `budget` (under the minute) would pass too. That the wait is
-        // `budget` is its one `recv_timeout(budget)`, and no clock here judges
-        // it. (It was a 2 s sleep under a 1 s bound: a loaded box could cross it
-        // with `within` correct, or let the sleep finish first and hear `Some`.)
+        // The check cannot answer before the gate opens below, so this `None` is
+        // `within` giving up on a check still running. When it gave up is not
+        // judged here: that is its one `recv_timeout(budget)`.
         assert_eq!(
             within(&IN_FLIGHT, Duration::from_millis(50), "/x", hangs),
             None
@@ -2069,10 +2063,9 @@ mod tests {
         );
     }
 
-    /// WHAT `start_folder` DECIDES IS WHAT THE PARK SEES: the fall-back a
-    /// spawn says once its shell is up reaches the queue, in order, each
-    /// folder once, and empty once taken. The negative control is a start
-    /// that used its folder, which notes nothing.
+    /// A fall-back said once its shell is up reaches the queue in order, each
+    /// folder once, and the queue empties when taken; a start that used its
+    /// folder notes nothing.
     #[test]
     fn a_start_that_fell_back_reaches_the_queue_and_one_that_did_not_says_nothing() {
         let _lane = crate::message_inbox::lane_test_guard();
@@ -2101,11 +2094,8 @@ mod tests {
         assert!(take_noted().is_empty(), "drained");
     }
 
-    /// AN SSH PANE'S FOLDER IS NOT TAKEN WHEN IT IS NOT HERE: a program other
-    /// than the pane's shell holds the pane, so the folder may be another
-    /// machine's. NEGATIVE CONTROLS: the same folder from a pane at its own
-    /// prompt is taken (its spawn then says it was not found), and a folder
-    /// that is here is taken from a held pane.
+    /// A held pane's folder (ssh: maybe another machine's) is taken only when it
+    /// is here; the same folder from a pane at its own prompt is taken.
     #[test]
     fn a_held_panes_folder_is_taken_only_when_it_is_here() {
         let gone = |dir: &str| (dir == "/home/me/proj").then_some(Fault::Missing);

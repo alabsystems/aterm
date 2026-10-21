@@ -1,42 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The trail host: the GUI-faithful frame seam that
-//! `tests/copies_are_not_moves.rs` and `tests/moves_are_followed.rs` drive
-//! their case families through, and `tests/erased_under_its_twin.rs`,
-//! `tests/copy_beside_the_line.rs`, `tests/moved_again_without_a_key.rs` and
-//! `tests/composer_multiline_wrap.rs` their laws (`effects_suite` mounts
-//! `common`, whose replay pool runs a law's cases, and `#[macro_use]
-//! trail_host` once; each file imports `crate::trail_host::…`).
+//! The trail host: the GUI-faithful frame seam the case families and laws drive
+//! (`copies_are_not_moves.rs`, `moves_are_followed.rs`, `erased_under_its_twin.rs`,
+//! `copy_beside_the_line.rs`, `moved_again_without_a_key.rs`, `composer_multiline_wrap.rs`).
+//! `effects_suite` mounts it once, with `#[macro_use]`.
 //!
-//! A real `aterm_core::terminal::Terminal` is driven byte for byte. Each frame
-//! (`Core::frame`) is the GUI's: SYNC-1 withholding when asked, the
-//! content-scroll seam first (a scroll or band move is applied and the frame
-//! samples nothing, as `app_render.rs` does), then the frame hold (the caret
-//! row's probe, also its witness sample, and every row
-//! `CursorGlow::ribbon_rows` names into the GUI's `CURSOR_WITNESS_ROWS` slots,
-//! read after the last `process`), then the tick. Family differences are an
-//! explicit [`Opts`]; host options a family sweeps (`far_ok`,
-//! `drop_far_frames`, a pet's frame demand) are fields of [`Core`].
-//! [`PacedHost`] frames time on a flat 16 ms or 8 ms train or at the GUI's real
-//! pacing ([`Pace`]).
+//! A real `aterm_core` [`Terminal`] is driven byte for byte. Each frame ([`Core::frame`]) is the
+//! GUI's: SYNC-1 withholding when asked, the content-scroll seam first (a scroll or band move is
+//! applied and the frame samples nothing, as `app_render.rs` does), then the frame hold (the
+//! caret row's probe and every row `CursorGlow::ribbon_rows` names, read after the last
+//! `process`), then the tick. Family differences are an explicit [`Opts`]; options a family
+//! sweeps (`far_ok`, `drop_far_frames`, a pet) are fields of [`Core`]. [`PacedHost`] frames time
+//! on a flat train or at the GUI's real pacing ([`Pace`]).
 //!
-//! Every case is registered by id ([`case`]) and judged by its family's reading
-//! ([`Outcome::ff`]: `(followed, frames the row no key wrote was lit)` against
-//! `(0, 0)`; [`Outcome::mf`]: lines or moves that went dark under text that
-//! stayed, against `0`). A law runs the cases under one id prefix ([`holds`],
-//! [`holds_where`]); where it states limits, a rule over the ids names them
-//! with its reason ([`holds_but`]), and each named case must still read bad
-//! while every other holds.
+//! Each case is registered by id ([`case`]) and judged by its family's reading ([`Outcome::ff`],
+//! [`Outcome::mf`]). A law runs the cases under one id prefix ([`holds`], [`holds_where`]); a law
+//! with stated limits names them by a rule over the ids ([`holds_but`]), and each named case must
+//! still read bad while every other holds.
 //!
-//! **Grid and spine.** A family's grid is the product of what it sweeps
-//! (widths, key rates, pauses, tear lengths, pacings). A release build, or
-//! `TRAIL_LAWS_FULL=1` (which `verify test` sets:
-//! `aterm_verify::stages::TRAIL_LAWS_FULL`), runs every case; a debug run runs
-//! the spine ([`sweep`]): values crossing each stated threshold on both sides,
-//! so every law holds a case that must hold and every limit rule names one
-//! ([`holds_but`] asserts this). Counts quoted by the laws are of the full
-//! grid.
+//! A family's grid is the product of what it sweeps. A release build, or `TRAIL_LAWS_FULL=1`
+//! (which `verify test` sets), runs every case; a debug run runs the spine ([`sweep`]): values
+//! either side of each stated threshold, so every law keeps a case that must hold and every limit
+//! rule names one. Counts the laws quote are of the full grid.
 #![allow(dead_code)]
 
 use aterm_core::render::GlowQuad;
@@ -46,9 +32,7 @@ use aterm_effects::kitty_pet::{PetBrain, PetSense};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// Outcomes and cases
-// ---------------------------------------------------------------------------
+// Outcomes and cases.
 
 /// One case's reading and verdict.
 #[derive(Clone, Debug, Default)]
@@ -179,9 +163,7 @@ pub fn istr(g: &[i32]) -> String {
         .join("")
 }
 
-// ---------------------------------------------------------------------------
-// The shared host core
-// ---------------------------------------------------------------------------
+// The shared host core.
 
 /// The frame seam's variants, as the case families use them.
 #[derive(Clone, Copy, Debug)]
@@ -204,7 +186,7 @@ pub struct Opts {
     pub pane_columns: bool,
 }
 
-/// The implementer's frame-hold-only host (no scroll seam; every named row read).
+/// The frame-hold-only host (no scroll seam; every named row read).
 pub const LOCK_A: Opts = Opts {
     scroll_seam: false,
     alt_rebaseline: false,
@@ -438,7 +420,7 @@ impl Core {
             .collect()
     }
 
-    /// The bed's quads covering the CENTRE of `row`'s pixel band.
+    /// The bed's quads covering the centre of `row`'s pixel band.
     pub fn row_quads(&self, row: u16) -> impl Iterator<Item = &GlowQuad> {
         let centre = f32::from(self.g.origin_y) + (f32::from(row) + 0.5) * self.g.ch as f32;
         self.glow.under_quads().iter().filter(move |q| {
@@ -448,7 +430,7 @@ impl Core {
         })
     }
 
-    /// Whether any BODY quad covers the CENTRE of `row`'s pixel band.
+    /// Whether any bed quad covers the centre of `row`'s pixel band.
     pub fn lit(&self, row: u16) -> bool {
         self.row_quads(row).next().is_some()
     }
@@ -505,9 +487,7 @@ macro_rules! core_deref {
     };
 }
 
-// ---------------------------------------------------------------------------
-// The paced host
-// ---------------------------------------------------------------------------
+// The paced host.
 
 /// How a [`PacedHost`] frames time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -613,7 +593,7 @@ impl PacedHost {
         }
     }
 
-    /// Output lands NOW and the host presents a frame for it.
+    /// Output lands now and the host presents a frame for it.
     pub fn land(&mut self, bytes: &[u8]) {
         self.term.process(bytes);
         self.frame();
@@ -643,9 +623,7 @@ impl PacedHost {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The grid, and the law runner
-// ---------------------------------------------------------------------------
+// The grid, and the law runner.
 
 /// Whether the laws run every case of each family's grid: in a release
 /// build, or with `TRAIL_LAWS_FULL` set (to anything but `0`). A debug build
@@ -668,18 +646,10 @@ pub fn sweep<T: Clone + PartialEq + std::fmt::Debug>(all: &[T], spine: &[T]) -> 
     }
 }
 
-/// Runs every case of `cases` whose id satisfies `pick` and fails listing,
-/// in order, every one that does not read as it must: bad where `limit`
-/// names it (a limit that holds now is a finding too — restate the law),
-/// held everywhere else. Panics inside a case propagate: an engine assertion
-/// is a failure of the law.
-///
-/// Each case builds its own host on its own clock (`Send + Sync`, nothing
-/// shared), so the cases run on the binary's threads
-/// ([`crate::common::par_map`]) and are judged in order after. Over the full
-/// grid at `RUST_TEST_THREADS=7`, one after another, `moves_are_followed`'s 96
-/// unsynced-composer tears take 41 s and the binary 47.5 s; on the pool the
-/// law takes 8.2 s and the binary 12.4 s.
+/// Runs every case of `cases` whose id satisfies `pick` and fails listing, in order, every one
+/// that does not read as it must: bad where `limit` names it (a limit that now holds is a finding
+/// too: restate the law), held everywhere else. A panic inside a case fails the law. Each case
+/// owns its host and clock, so the cases run on [`crate::common::par_map`]'s pool.
 fn run_law(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -> bool) {
     let picked: Vec<Case> = cases.into_iter().filter(|c| pick(&c.id)).collect();
     assert!(!picked.is_empty(), "the law picks no case");

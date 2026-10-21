@@ -147,6 +147,8 @@ pub struct CursorDroplet {
     last: Option<Instant>,
     /// Latched surge at the last tick, so [`Self::is_active`] needs no clock.
     surge: f32,
+    /// Cached `(ground, (lo, hi))` from [`ramp_band_on`].
+    band_memo: Option<(u32, (f32, f32))>,
 }
 
 impl CursorDroplet {
@@ -210,7 +212,14 @@ impl CursorDroplet {
         };
         let t = match cfg.ground {
             Some(ground) => {
-                let (lo, hi) = ramp_band_on(ground);
+                let (lo, hi) = match self.band_memo {
+                    Some((g, band)) if g == ground => band,
+                    _ => {
+                        let band = ramp_band_on(ground);
+                        self.band_memo = Some((ground, band));
+                        band
+                    }
+                };
                 t.clamp(lo, hi)
             }
             None => t,
@@ -327,6 +336,8 @@ impl CursorDroplet {
 
         // Ripple rings: two flattened ellipses half a life apart, scaled by the
         // surge (invisible on still water).
+        let ring_rgb = water_ramp(0.74 + 0.10 * e);
+        let y0 = cy + radius * 0.88;
         for half in [0.0f32, 0.5] {
             let u = (self.ripple + half).fract();
             let env = (1.0 - u) * (1.0 - u).sqrt() * e;
@@ -337,8 +348,7 @@ impl CursorDroplet {
             let rx = radius * (0.9 + RIPPLE_REACH * u);
             let ry = (rx * 0.22).max(2.0);
             let thick = (rx * 0.12).max(1.5);
-            let ring = premul_rgb(water_ramp(0.74 + 0.10 * e), cov);
-            let y0 = cy + radius * 0.88;
+            let ring = premul_rgb(ring_rgb, cov);
             push_ripple_ring(out, geom, (cx, y0), (rx, ry), thick, ring);
         }
 
@@ -347,13 +357,13 @@ impl CursorDroplet {
         // detaches and accelerates down, fading: a soft round bead, drawn
         // out a little as it falls.
         let belly = cy + radius * 0.80;
+        let body = water_ramp(0.68);
         for &(dx, off, wake) in &DRIP_LANES {
             if e < wake && wake > 0.0 {
                 continue;
             }
             let u = (self.drip + off).fract();
             let x = cx + dx * cw + (phase + off * 7.0).sin() * 1.5;
-            let body = water_ramp(0.68);
             let (y, r, stretch, cov) = if u < 0.30 {
                 // Beading: the drop grows on the belly.
                 let s = u / 0.30;

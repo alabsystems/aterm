@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A REAL CONTROLLING TERMINAL, built rather than inherited: the suite's one pty fixture,
-//! which `provision_cli` drives the binary through.
-//!
-//! `atpkg-keys setup` and `join` talk to `/dev/tty` and refuse to run without one. A test
-//! harness's own terminal is not a fixture, so this builds a pty pair and makes its slave
+//! A real controlling terminal for `provision_cli`: `atpkg-keys setup` and `join` talk to
+//! `/dev/tty` and refuse to run without one, so this builds a pty pair and makes its slave
 //! the child's controlling terminal while stdout and stderr stay pipes.
 //!
-//! The pair is aterm-pty's `open_pty_pair`. Both ends are close-on-exec from the open, so a
-//! child another test spawns meanwhile keeps neither past its exec. A `/dev/ptmx` open that
-//! lost XNU's race for a pty minor to another opener, in this process or any other
-//! (`EREDRIVEOPEN`, -6), is redriven rather than failed: the bare `posix_openpt` this
-//! replaced failed with it, 2 runs in 360 beside a parallel opener. The child takes the
-//! slave by descriptor, not by path, so nothing here calls `ptsname(3)`, and its static
-//! buffer needs no lock.
+//! The pair is aterm-pty's `open_pty_pair`: both ends are close-on-exec from the open, and a
+//! `/dev/ptmx` open that lost XNU's race for a pty minor (`EREDRIVEOPEN`, -6) is redriven
+//! rather than failed. The child takes the slave by descriptor, not path, so nothing calls
+//! `ptsname(3)` and its static buffer needs no lock.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -49,17 +43,13 @@ impl Pty {
         Self { master, slave }
     }
 
-    /// Spawn `cmd` with a null stdin and this pty as its CONTROLLING TERMINAL, while its
-    /// stdout and stderr stay what `cmd` made them (pipes, for every caller).
+    /// Spawn `cmd` with a null stdin and this pty as its controlling terminal, its stdout and
+    /// stderr left as `cmd` made them (pipes, for every caller): the shape of
+    /// `atpkg-keys setup | tee log`.
     ///
-    /// That split is the whole point: `/dev/tty` resolves through the controlling terminal,
-    /// so the child has one even though its stdout is a pipe — which is precisely the shape
-    /// of `atpkg-keys setup | tee log`.
-    ///
-    /// The strip goes first (`inherit_nothing`, before the hook below): the child holds its
-    /// stdio, its terminal and nothing else of this process. A std child on a std without
-    /// the SP-1 strip keeps any descriptor another test thread had open unflagged at the spawn,
-    /// and a session waiting at its prompt would hold that pipe for as long as it waits.
+    /// The strip (`inherit_nothing`) goes before the hook, so the child holds its stdio, its
+    /// terminal and nothing else of this process; otherwise a child waiting at its prompt
+    /// could hold another test thread's unflagged pipe for as long as it waits.
     pub fn spawn(&self, mut cmd: Command) -> Child {
         use aterm_uds::spawnfd::InheritNothing as _;
         let slave = self.slave.as_raw_fd();

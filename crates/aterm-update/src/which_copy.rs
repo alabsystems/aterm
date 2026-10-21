@@ -1,10 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which copy of aterm itself is running — story S12 of
-//! `docs/DESIGN-which-copy-runs-2026-08-27.md`.
+//! Which copy of aterm itself is running.
 //!
-//! The updater replaces only the RUNNING bundle; another `aterm.app` elsewhere
+//! The updater replaces only the running bundle; another `aterm.app` elsewhere
 //! (`~/Applications`, a Caskroom leftover) is left alone (`install::trial_owned_by`).
 //! `aterm --version` and Settings ▸ About name the running copy and any other copy
 //! in the usual places, in the words spelled here and nowhere else:
@@ -19,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// WHY a running copy is inert: [`Running::InertApp`] collapses a dev-marked build,
+/// Why a running copy is inert: [`Running::InertApp`] collapses a dev-marked build,
 /// a mounted-image launch and an App-Translocated launch, which the updater treats
 /// alike but a person does not: two are a mistake one drag undoes, and the third
 /// is no fault at all. Portable so every host can render it; only the
@@ -30,7 +29,7 @@ pub use crate::install_posture::InstallPosture;
 #[cfg(target_os = "macos")]
 pub use crate::bundle::posture_from;
 
-/// The RUNNING copy's [`InstallPosture`], from its resolved executable path (the
+/// The running copy's [`InstallPosture`], from its resolved executable path (the
 /// same shim resolution as [`crate::bundle::resolve_layout`]); `None` when that path
 /// cannot be read.
 #[cfg(target_os = "macos")]
@@ -40,7 +39,7 @@ pub fn running_posture() -> Option<InstallPosture> {
     Some(posture_from(&exe))
 }
 
-/// What the running copy IS — decides whether the other-copy clause ("the updater
+/// What the running copy is — decides whether the other-copy clause ("the updater
 /// leaves it alone") may be made at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Running {
@@ -54,7 +53,7 @@ pub enum Running {
     Binary,
 }
 
-/// One `aterm.app` found at a usual install location that is NOT the running one.
+/// One `aterm.app` found at a usual install location that is not the running one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OtherCopy {
     /// The `.app` root.
@@ -119,7 +118,7 @@ impl WhichCopy {
     }
 }
 
-/// Observe THIS process: the copy it runs from and, on macOS, every other `aterm.app`
+/// Observe this process: the copy it runs from and, on macOS, every other `aterm.app`
 /// in the usual places. `None` only when the executable path itself is unknown.
 #[must_use]
 pub fn observe() -> Option<WhichCopy> {
@@ -200,7 +199,7 @@ fn observe_from(exe: &Path) -> WhichCopy {
 }
 
 /// Pure core of [`observe`]: classify `exe` and probe `candidates` (`.app` roots).
-/// A candidate that does not exist, is not a REAL directory (a symlink planted at a
+/// A candidate that does not exist, is not a real directory (a symlink planted at a
 /// usual place is never followed out of it — not read, not reported; so a symlinked
 /// spelling of the running bundle is not a second copy either), resolves to the
 /// running bundle (`same_install_root`), or duplicates an earlier candidate is
@@ -368,7 +367,7 @@ mod tests {
         // verbatim `\\?\C:\…` spelling.
         #[cfg(unix)]
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-        // A test binary is never a `.app`, so the running path IS the executable.
+        // A test binary is never a `.app`, so the running path is the executable.
         assert_eq!(report.kind, Running::Binary);
         assert_eq!(report.running, exe);
     }
@@ -436,7 +435,7 @@ mod tests {
             std::fs::write(&file, b"not a bundle").unwrap();
             let link = root.join("link.app");
             std::os::unix::fs::symlink(&running_app, &link).unwrap();
-            // A symlink planted at a usual place pointing at a REAL other bundle is
+            // A symlink planted at a usual place pointing at a real other bundle is
             // never followed: not read, not reported.
             let elsewhere = root.join("elsewhere").join("aterm.app");
             make_bundle(&elsewhere, Some(&version_plist("0.1.0")));

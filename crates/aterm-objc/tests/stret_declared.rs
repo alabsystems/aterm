@@ -1,26 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The DECLARED side of an indirect struct return, driven.
+//! The declared side of an indirect struct return, driven. The send side is
+//! [`aterm_objc::msg`], which picks `objc_msgSend_stret` from the prototype's return type
+//! (`tests/abi.rs` checks the threshold). This file covers `declare_class!` trampolines that
+//! return a struct by value, such as `crates/aterm-window`'s
+//! `-firstRectForCharacterRange:actualRange:`: a 32-byte `NSRect` return beside a by-value
+//! `NSRange` and an `NSRange *` out-parameter.
 //!
-//! The SEND side is [`aterm_objc::msg`], which picks `objc_msgSend_stret` from
-//! the prototype's return type (`tests/abi.rs` proves the threshold). This file
-//! covers trampolines registered by `declare_class!` that return a struct by
-//! value, such as `crates/aterm-window`'s `-firstRectForCharacterRange:actualRange:` —
-//! a 32-byte `NSRect` return beside a by-value `NSRange` and an `NSRange *`
-//! out-parameter.
-//!
-//! # The premise this file REFUTES
-//!
-//! The precondition was written as "a 32-byte by-value return that is
-//! `objc_msgSend_stret` on x86_64", i.e. as an x86_64-only shape that this box
-//! could only codegen-prove. It is not. AAPCS64 returns a HOMOGENEOUS
-//! FLOATING-POINT AGGREGATE of up to four members in `v0`–`v3`, and `NSRect` is
-//! four `double`s — so `firstRectForCharacterRange:` is a REGISTER return on
-//! arm64 and never touches the indirect path at all. The indirect path on
-//! arm64 is reached by a >16-byte aggregate that is NOT an HFA, and the
-//! indirect-result pointer lives in `x8`. MEASURED with clang on this box,
-//! `-O1 -S`, reading the IMP's own prologue:
+//! AAPCS64 returns a homogeneous floating-point aggregate of up to four members in `v0`–`v3`, so
+//! `NSRect` is a register return on arm64; only a >16-byte non-HFA aggregate is indirect, through
+//! `x8`. Measured with clang (`-O1 -S`, the IMP's prologue):
 //!
 //! ```text
 //! IMP                       arm64                         x86_64
@@ -29,22 +19,12 @@
 //! -(NSRange)markedRange     x0/x1                         RAX/RDX
 //! ```
 //!
-//! So this file drives THREE return classes on arm64 — HFA (`NSRect`),
-//! INDIRECT (`Triple`, 24 bytes of `long`), and two-register (`NSRange`) — and
-//! the indirect one is EXECUTED here, not merely codegen-proved. The x86_64
-//! half of each row is codegen-proved, as everything about that slice is: this
-//! box cannot execute it.
+//! So the file executes three return classes on arm64: HFA (`NSRect`), indirect (`Triple`) and
+//! two-register (`NSRange`); the x86_64 column is codegen-only.
 //!
-//! # And it is driven REFLECTIVELY, which is the point
-//!
-//! A direct typed send proves the trampoline and the caller agree about
-//! registers. It says nothing about the ENCODING STRING, because a send carries
-//! none. `NSMethodSignature` is where the string is read, so every row here is
-//! also driven through `NSInvocation`: Foundation parses what
-//! `class_addMethod` was handed, computes `methodReturnLength` from it, lays
-//! out the frame and calls the IMP. A lie in the encoding shows up there and
-//! nowhere else — which is exactly the shape of the defect P1 exists to
-//! prevent.
+//! Each row is also driven through `NSInvocation`: a send carries no encoding string, but
+//! Foundation lays out the frame from what `class_addMethod` was handed, so a lie in the encoding
+//! shows up there and nowhere else.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -59,22 +39,16 @@ use aterm_objc::{
     method_types, msg, sel, strip_method_offsets,
 };
 
-/// The witness a libtest worker cannot legitimately mint.
-///
-/// Every class here is an `NSObject` subclass with `()` ivars that touches no
-/// AppKit state and never leaves this worker.
+/// The witness, minted unchecked: libtest runs every test on a worker.
 fn mtm() -> aterm_objc::MainThread {
     // SAFETY: no main-thread affinity; the (empty) ivars are born and dropped
     // on this one thread.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
-/// Twenty-four bytes of `long`: bigger than two eightbytes and NOT a
-/// homogeneous floating-point aggregate, so it returns INDIRECTLY on both Apple
-/// ABIs — `x8` on arm64, the hidden `RDI` pointer on x86_64.
-///
-/// This is the shape `NSRect` is NOT, and having both in one file is what makes
-/// the arm64 evidence real rather than incidental.
+/// Twenty-four bytes of `long`: over two eightbytes and not a homogeneous floating-point aggregate,
+/// so unlike `NSRect` it returns indirectly on both Apple ABIs (`x8` on arm64, the hidden `RDI`
+/// pointer on x86_64).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 struct Triple {
@@ -83,15 +57,12 @@ struct Triple {
     c: i64,
 }
 
-// SAFETY: clang emits `{?=qqq}` for an anonymous `struct { long a, b, c; }` —
-// MEASURED on this box. The struct tag is `?` because the C type is anonymous;
-// a named tag would appear in its place and `NSMethodSignature` reads the
-// FIELDS, not the tag. `#[repr(C)]` with three `i64`s matches the C layout
-// exactly and nothing is packed.
-// SAFETY: three `i64`s; all-zero is `{0, 0, 0}`, a valid `Triple` — which is
-// what a contained `tripleForCharacterRange:` answers.
+// SAFETY: three `i64`s; all-zero is `{0, 0, 0}`, a valid `Triple`, which is what a contained
+// `tripleForCharacterRange:` answers.
 unsafe impl aterm_objc::InertZero for Triple {}
 
+// SAFETY: clang emits `{?=qqq}` for an anonymous `struct { long a, b, c; }`; `NSMethodSignature`
+// reads the fields, not the tag. `#[repr(C)]` with three `i64`s matches the C layout, unpacked.
 unsafe impl Encode for Triple {
     const ENCODING: &'static str = "{?=qqq}";
 }
@@ -103,17 +74,15 @@ declare_class! {
         const NAME: &str = "ATermW3StretProbe";
         type Ivars = ();
 
-        /// `crates/aterm-window`'s `view.rs:376` row, spelling for spelling: a
-        /// by-value `NSRange`, an `NSRange *` out-parameter, a 32-byte
-        /// `NSRect` return. The values returned are DERIVED from the argument
-        /// so that a register shift cannot produce them by accident.
+        /// `crates/aterm-window`'s `view.rs` row, spelling for spelling: a by-value `NSRange`, an
+        /// `NSRange *` out-parameter, a 32-byte `NSRect` return. The result derives from the
+        /// argument, so a register shift cannot produce it by accident.
         @sel(firstRectForCharacterRange:actualRange:)
         fn first_rect(&self, range: NSRange, actual: *mut NSRange) -> CGRect {
             if !actual.is_null() {
-                // SAFETY: the caller (a direct send below, or `NSInvocation`)
-                // passes either null or a pointer to a live, writable
-                // `NSRange` it owns for the duration of the call — the same
-                // contract `NSTextInputClient` states for `actualRange:`.
+                // SAFETY: the caller (a direct send below, or `NSInvocation`) passes null or a
+                // live, writable `NSRange` it owns for the call, as `NSTextInputClient` states
+                // for `actualRange:`.
                 unsafe { actual.write(range) };
             }
             CGRect {
@@ -129,7 +98,7 @@ declare_class! {
             }
         }
 
-        /// The INDIRECT return on BOTH ABIs: `x8` on arm64, `sret` on x86_64.
+        /// The indirect return on both ABIs: `x8` on arm64, `sret` on x86_64.
         @sel(tripleForCharacterRange:)
         fn triple(&self, range: NSRange) -> Triple {
             Triple {
@@ -139,9 +108,7 @@ declare_class! {
             }
         }
 
-        /// The control: sixteen bytes, two integer registers, no indirection
-        /// anywhere. If the checks below cannot tell this apart from the two
-        /// above, they are measuring nothing.
+        /// The control: sixteen bytes in two integer registers, no indirection.
         @sel(markedRange)
         fn marked_range(&self) -> NSRange {
             NSRange {
@@ -156,9 +123,8 @@ declare_class! {
 
 /// `+[NSObject instanceMethodSignatureForSelector:]`, +0.
 fn signature_for(cls: ClassPtr, s: Sel) -> Id {
-    // SAFETY: `+instanceMethodSignatureForSelector:` is `-(id)(Class, SEL)` on
-    // NSObject and returns an AUTORELEASED `NSMethodSignature` (+0), borrowed
-    // here for the length of the enclosing pool.
+    // SAFETY: `+instanceMethodSignatureForSelector:` is `-(id)(Class, SEL)` on NSObject and
+    // returns an autoreleased `NSMethodSignature` (+0), borrowed for the enclosing pool.
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
         f(cls.as_id(), sel!(instanceMethodSignatureForSelector:), s)
@@ -227,20 +193,17 @@ unsafe fn invoke_returning<T: Default>(inv: Id) -> T {
 
 // --------------------------------------------------------------------- tests
 
-/// What the runtime holds for each row is the offset-free form of what clang
-/// emits for the same C signature — measured against the compiler, not asserted.
+/// Each row's registered encoding is clang's for the same C signature, minus offsets.
 #[test]
 fn the_registered_encodings_are_what_clang_emits_for_the_same_signatures() {
     let cls = StretProbe::class();
 
-    // MEASURED with `clang -fobjc-arc -framework Foundation`, reading
-    // `method_getTypeEncoding` off a compiler-built class with these exact
-    // signatures (`scratch/w3o/ret.m`):
+    // `method_getTypeEncoding` of a clang-built class (`-fobjc-arc -framework Foundation`) with
+    // these signatures:
     //
     //   -(NSRect)rectFor:(NSRange)r out:(NSRangePointer)o
-    //     {CGRect={CGPoint=dd}{CGSize=dd}}40@0:8{_NSRange=QQ}16^{_NSRange=QQ}32
-    //   -(Triple)tripleFor:(NSRange)r     {?=qqq}32@0:8{_NSRange=QQ}16
-    //   -(NSRange)markedRange             {_NSRange=QQ}16@0:8
+    //   -(Triple)tripleFor:(NSRange)r
+    //   -(NSRange)markedRange
     for (s, clang_emitted) in [
         (
             sel!(firstRectForCharacterRange:actualRange:),
@@ -305,7 +268,7 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
          the first casualty of a hidden-result-pointer shift"
     );
 
-    // --- INDIRECT on both ABIs.
+    // --- Indirect on both ABIs.
     let triple = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, NSRange) -> Triple = msg();
         f(
@@ -332,10 +295,8 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
         }
     );
 
-    // The SEND side agrees with the crate's own model of this target: on arm64
-    // nothing is indirect (the result pointer is `x8`, which no argument
-    // occupies, so one entry point serves everything); on the x86_64 compat
-    // slice the first two rows are.
+    // `msg`'s model agrees: on arm64 no row needs `_stret` (the result pointer is `x8`, which no
+    // argument occupies); on x86_64 the first two do.
     assert_eq!(
         aterm_objc::returns_indirectly::<CGRect>(),
         cfg!(target_arch = "x86_64")
@@ -347,14 +308,9 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
     assert!(!aterm_objc::returns_indirectly::<NSRange>());
 }
 
-/// The REFLECTIVE drive: Foundation lays out the frame from the registered
-/// string and calls the trampoline itself.
-///
-/// This is the path a direct send cannot exercise and the one that reads the
-/// encoding. `NSInvocation` allocates `methodReturnLength` bytes, calls the IMP
-/// through the ABI the string implies, and copies the result out — so a
-/// declared indirect return that the string did not describe corrupts here and
-/// only here.
+/// The reflective drive: `NSInvocation` sizes the return from the registered string, calls the
+/// IMP through the ABI the string implies and copies the result out, so a declared indirect
+/// return the string misdescribes corrupts here and only here.
 #[test]
 fn nsinvocation_drives_every_return_class_through_the_registered_encoding() {
     aterm_objc::autoreleasepool(|_| {
@@ -415,8 +371,7 @@ fn nsinvocation_drives_every_return_class_through_the_registered_encoding() {
         let triple: Triple = unsafe { invoke_returning(inv) };
         assert_eq!(triple, Triple { a: 8, b: 9, c: 42 });
 
-        // --- and the two-register control, so a "reads 24 bytes of zero"
-        //     failure mode could not pass all three.
+        // --- the two-register control, so a reads-zero failure cannot pass all three.
         let inv = invocation(this, cls, sel!(markedRange));
         // SAFETY: `NSRange` is the recorded return type, 16 bytes.
         let marked: NSRange = unsafe { invoke_returning(inv) };

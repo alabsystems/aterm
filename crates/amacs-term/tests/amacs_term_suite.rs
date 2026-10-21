@@ -9,3 +9,4 @@
 //! `targo --unverified test -p amacs-term --test amacs_term_suite -- <file>::`.
 
 mod decide_table;
+mod tui_loop;

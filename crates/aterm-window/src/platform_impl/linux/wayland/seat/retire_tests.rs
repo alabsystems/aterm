@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
+//
+// Added by the aterm project in 2026 to its copy of winit 0.30.13
+// (see the repository NOTICE).
 
 //! LW.7's capability-removal race, live (d5f7317b01): a window's pointer and text input are
 //! destroyed on the loop's thread even when another thread holds them as their capability goes.
@@ -118,9 +121,11 @@ fn arm(lane: &Lane, retire: bool) -> Outcome {
         else {
             panic!("a Wayland loop");
         };
-        let mut attributes = WindowAttributes::default().with_title("winit retire");
-        attributes.maximized = true;
-        Window::new(target, attributes).expect("a window")
+        let window = Window::new(target, WindowAttributes::default().with_title("winit retire"))
+            .expect("a window");
+        // WC.8: the attributes carry no maximized state on Linux; the window asks once made.
+        window.set_maximized(true);
+        window
     };
     pump(&mut event_loop, "the maximized configure", |_| window.is_maximized());
 

@@ -7,8 +7,10 @@
 //! tap writes the usage figures from its stdin into one private file per process ([`Reading`],
 //! under [`rl_dir`]) and prints the row Claude Code draws under its composer ([`Reading::line`]).
 //! The tab's host reads its own file at decided turn ends, keeps a reading only where it is
-//! [`Fresh`] and records it for the machine's own account ([`super::accounts::note_reading`]). A
-//! reading moves no session.
+//! [`Fresh`] and records it for the machine's own account ([`super::accounts::note_reading`]), with
+//! what the freshness rule saw of it ([`Fresh::beside`]: a figure that dropped under one reset, in a
+//! process served since, is a limit reset used inside the window). A reading moves no session: it
+//! feeds the accounts state and the `usage`, `accounts` and `accounts stats` reports.
 //!
 //! * The switch is `[harness] usage_tap`, off by default. A session tapped while it was on keeps
 //!   its tap until its next relaunch sheds it, and the host reads and records its file till then.
@@ -29,7 +31,9 @@
 //!   every other verbatim, so the resume line a person is shown never carries it.
 //! * The file is `<sid>-<CLAUDE_PID>.json`, `sid` the tab's own id (`ATERM_PARENT_SESSION_ID`; a
 //!   nested aterm's `ATERM_SESSION_ID` is the id it adopts): mode 0600, temp file renamed, in a
-//!   0700 directory. It never holds stdin as it came, nor a token.
+//!   0700 directory. It holds the figures (whole and in tenths, as the vendor sent them), the API
+//!   time, the cache's warmth, the vendor's version, the process's model id and the login
+//!   variables' values; never stdin as it came, nor a token.
 //! * The row, between the composer's bottom rule and the mode row, is never empty
 //!   (`5h 42% · 7d 61%`, or [`NO_FIGURES`]): on 2.1.282 a status line that prints nothing still
 //!   takes a row, and the footer's readers stop at a blank one, short of the mode row.
@@ -234,20 +238,34 @@ pub fn file_name(sid: &str, pid: u32) -> Option<String> {
 // The reading
 // ---------------------------------------------------------------------------
 
-/// One window's figure as Claude Code hands it: whole percent used, and the
-/// instant (Unix seconds) the window resets.
+/// One window's figure as Claude Code hands it: percent used, whole and in
+/// tenths, and the instant (Unix seconds) the window resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
-    /// `used_percentage`.
+    /// `used_percentage`, rounded to a whole percent: what the row prints.
     pub pct: u32,
     /// `resets_at`.
     pub resets_at: i64,
+    /// `used_percentage` in tenths of a percent, as Claude Code hands it
+    /// (one decimal: `Math.round(e*1000)/10`, READ in the 2.1.301 bundle;
+    /// `42.6` in the lab, design F1). `None` in a file an older tap wrote.
+    pub pct_x10: Option<u32>,
+}
+
+impl Window {
+    /// The figure in tenths: [`Self::pct_x10`], else the whole percent.
+    #[must_use]
+    pub fn x10(&self) -> u32 {
+        self.pct_x10.unwrap_or(self.pct.saturating_mul(10))
+    }
 }
 
 /// One run of the tap, as its file holds it (format [`FORMAT_V`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
-    /// When it was written (Unix seconds).
+    /// When its figures were first reported since its process was last
+    /// served (Unix seconds): the run's own clock, kept by every re-report of
+    /// the same figures with no request between ([`run`]).
     pub at: i64,
     /// The tab (`ATERM_PARENT_SESSION_ID`).
     pub sid: String,
@@ -271,6 +289,9 @@ pub struct Reading {
     pub cache_expires_at: Option<i64>,
     /// The vendor's `version`.
     pub version: Option<String>,
+    /// The process's model (`model.id`), where it is a model id. `None` in a
+    /// file an older tap wrote.
+    pub model: Option<String>,
     /// How long the verb took up to its write, microseconds (the tap's own
     /// cost, beside its process's start).
     pub dur_us: u64,
@@ -304,26 +325,29 @@ impl TapVars {
     }
 }
 
-/// A whole percent from the vendor: an integer in `0..=100`, or a finite
-/// number in that range, rounded.
-fn pct_of(value: &Value) -> Option<u32> {
+/// A percent from the vendor, an integer or a finite number in `0..=100`,
+/// as the whole percent it rounds to and in tenths, rounded.
+fn pct_of(value: &Value) -> Option<(u32, u32)> {
     if let Some(n) = value.as_u64() {
-        return u32::try_from(n).ok().filter(|p| *p <= 100);
+        let pct = u32::try_from(n).ok().filter(|p| *p <= 100)?;
+        return Some((pct, pct * 10));
     }
     let f = value
         .as_f64()
         .filter(|f| f.is_finite() && (0.0..=100.0).contains(f))?;
-    // In range by the filter: the cast cannot truncate.
+    // In range by the filter: the casts cannot truncate.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Some(f.round() as u32)
+    Some((f.round() as u32, (f * 10.0).round() as u32))
 }
 
 /// `rate_limits.<name>` as a [`Window`]: both fields, or none.
 fn window_of(limits: Option<&Value>, name: &str) -> Option<Window> {
     let w = limits?.get(name)?;
+    let (pct, x10) = pct_of(w.get("used_percentage")?)?;
     Some(Window {
-        pct: pct_of(w.get("used_percentage")?)?,
+        pct,
         resets_at: w.get("resets_at")?.as_i64().filter(|t| *t > 0)?,
+        pct_x10: Some(x10),
     })
 }
 
@@ -376,6 +400,8 @@ impl Reading {
                 .and_then(|c| c.get("expires_at"))
                 .and_then(Value::as_i64),
             version: word_of(doc.get("version"), 32),
+            model: word_of(doc.get("model").and_then(|m| m.get("id")), 64)
+                .filter(|m| super::upgrade::is_model_id(m)),
             dur_us: 0,
         })
     }
@@ -402,6 +428,7 @@ impl Reading {
                 let mut o = Map::new();
                 o.insert("pct".to_owned(), Value::from(u64::from(w.pct)));
                 o.insert("resets_at".to_owned(), Value::from(w.resets_at));
+                o.insert("pct_x10".to_owned(), Value::from(w.pct_x10));
                 Value::Object(o)
             })
         };
@@ -421,12 +448,15 @@ impl Reading {
         o.insert("seven_day".to_owned(), window(self.seven_day));
         o.insert("cache".to_owned(), Value::Object(cache));
         o.insert("version".to_owned(), Value::from(self.version.clone()));
+        o.insert("model".to_owned(), Value::from(self.model.clone()));
         o.insert("dur_us".to_owned(), Value::from(self.dur_us));
         aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
     }
 
     /// A file's text as a reading: format [`FORMAT_V`] and every field of its
-    /// type, or `None`.
+    /// type, or `None`. The fields a newer tap added (`pct_x10`, `model`,
+    /// `dur_us`) are read where they are there and of their type, and are
+    /// `None` (`0`) otherwise, so a file an older tap wrote still reads.
     #[must_use]
     pub fn of_json(text: &str) -> Option<Reading> {
         let doc = aterm_json::from_str::<Value>(text).ok()?;
@@ -448,6 +478,11 @@ impl Reading {
                         .ok()
                         .filter(|p| *p <= 100)?,
                     resets_at: w.get("resets_at")?.as_i64()?,
+                    pct_x10: w
+                        .get("pct_x10")
+                        .and_then(Value::as_u64)
+                        .and_then(|p| u32::try_from(p).ok())
+                        .filter(|p| *p <= 1000),
                 })),
             }
         };
@@ -465,6 +500,11 @@ impl Reading {
             warm: cache.get("warm").and_then(Value::as_bool),
             cache_expires_at: cache.get("expires_at").and_then(Value::as_i64),
             version: opt_str("version")?,
+            model: doc
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|m| super::upgrade::is_model_id(m))
+                .map(str::to_owned),
             dur_us: doc.get("dur_us").and_then(Value::as_u64).unwrap_or(0),
         })
     }
@@ -486,17 +526,31 @@ impl Reading {
             .map(|r| (r, mtime))
     }
 
-    /// The reading as the accounts state keeps a sample
-    /// ([`accounts::Sample`]): the two windows, at `at`.
+    /// The reading as the accounts state records it
+    /// ([`accounts::note_reading`]): the two windows in tenths, when they
+    /// were served ([`Self::at`]), what the freshness rule saw of it before
+    /// it was admitted (`beside`, [`Fresh::beside`]), and the key of the
+    /// account its home is signed in to (`key`, where the host read one).
     #[must_use]
-    pub fn sample(&self, at: i64) -> accounts::Sample {
-        accounts::Sample {
-            session_pct: self.five_hour.map(|w| w.pct),
-            session_reset: self.five_hour.map(|w| w.resets_at),
-            week_pct: self.seven_day.map(|w| w.pct),
-            week_reset: self.seven_day.map(|w| w.resets_at),
-            at,
-            by: String::new(),
+    pub fn tap_read(
+        &self,
+        beside: Beside,
+        key: Option<super::profile::AccountKey>,
+    ) -> accounts::TapRead {
+        let window = |w: Option<Window>, refilled: Option<u32>| {
+            w.map(|w| accounts::WindowRead {
+                pct_x10: w.x10(),
+                reset: w.resets_at,
+                refilled,
+            })
+        };
+        accounts::TapRead {
+            five_hour: window(self.five_hour, beside.refilled[0]),
+            seven_day: window(self.seven_day, beside.refilled[1]),
+            at: self.at,
+            seen_before: beside.seen,
+            born: None,
+            key,
         }
     }
 }
@@ -555,15 +609,18 @@ fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
     let path = dir.join(name);
     let tmp = dir.join(format!(".{name}.tmp{}", std::process::id()));
     let mut open = std::fs::OpenOptions::new();
-    open.write(true).create(true).truncate(true);
+    open.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let written = open
-        .open(&tmp)
-        .and_then(|mut f| f.write_all(text.as_bytes()));
+    // Until exclusive creation succeeds the candidate belongs to someone
+    // else. In particular, do not open an occupied FIFO or clean up a
+    // regular file left by another writer.
+    let mut file = open.open(&tmp)?;
+    let written = file.write_all(text.as_bytes());
+    drop(file);
     match written.and_then(|()| std::fs::rename(&tmp, &path)) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -571,6 +628,38 @@ fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// WHEN `reading`'S FIGURES WERE FIRST REPORTED since its process was last
+/// served: the `at` of the reading already at `path` where that names the
+/// same tab and process with the same `api_ms` and the same figures — a
+/// re-report, which Claude Code makes every [`TAP_REFRESH_S`] seconds while
+/// idle — else the reading's own. So a reading's `at` is when its figure was
+/// served, however late the host reads the file ([`Reading::tap_read`]);
+/// the silence rule reads the file's modification time, which every write
+/// moves. Never later than the reading's own.
+fn first_reported(path: &Path, reading: &Reading) -> i64 {
+    // An older v1 file has only whole percentages. Adding their equivalent
+    // tenths is the same figure, not a newly served report.
+    let figure = |w: Option<Window>| w.map(|w| (w.x10(), w.resets_at));
+    read_regular(path)
+        .and_then(|text| Reading::of_json(&text))
+        .filter(|held| {
+            (
+                held.sid.as_str(),
+                held.pid,
+                held.api_ms,
+                figure(held.five_hour),
+                figure(held.seven_day),
+            ) == (
+                reading.sid.as_str(),
+                reading.pid,
+                reading.api_ms,
+                figure(reading.five_hour),
+                figure(reading.seven_day),
+            )
+        })
+        .map_or(reading.at, |held| held.at.min(reading.at))
 }
 
 /// Read stdin as the verb takes it: at most [`STDIN_MAX`] bytes of UTF-8,
@@ -593,8 +682,10 @@ fn read_payload(stdin: &mut dyn Read) -> Option<String> {
 
 /// `aterm harness tap`, Claude Code's status-line command: reads the payload from `stdin` (none
 /// where `stdin_is_tty`), writes the reading of the process `vars` name into `dir` (`None`:
-/// nothing written) and prints its row on `out`. Always exits 0 with one non-empty line: a failing
-/// or silent command leaves the row blank or wrong. Reads no variable but the four of [`TapVars`].
+/// nothing written), stamped `now` or as the reading already there where this one re-reports it
+/// ([`first_reported`]), and prints its row on `out`. Always exits 0 with one non-empty line: a
+/// failing or silent command leaves the row blank or wrong. Reads no variable but the four of
+/// [`TapVars`].
 pub fn run(
     stdin: &mut dyn Read,
     stdin_is_tty: bool,
@@ -610,14 +701,15 @@ pub fn run(
         read_payload(stdin)
     };
     let reading = Reading::of_stdin(payload.as_deref().unwrap_or(""), vars, now);
-    if let (Some(reading), Some(dir)) = (&reading, dir) {
+    if let (Some(reading), Some(dir)) = (&reading, dir)
+        && let Some(name) = file_name(&reading.sid, reading.pid)
+    {
         let reading = Reading {
+            at: first_reported(&dir.join(&name), reading),
             dur_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             ..reading.clone()
         };
-        if let Some(name) = file_name(&reading.sid, reading.pid) {
-            let _ = write_reading(dir, &name, &reading.to_json());
-        }
+        let _ = write_reading(dir, &name, &reading.to_json());
     }
     let line = reading
         .as_ref()
@@ -768,7 +860,49 @@ pub struct Fresh {
     last: Option<(u32, u64, Option<Window>, Option<Window>)>,
 }
 
+/// WHAT A FRESH READING SAYS BESIDE THE ONE ADMITTED BEFORE IT ([`Fresh::beside`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Beside {
+    /// The last reading admitted was its own process's: what it reads now
+    /// was served since then ([`accounts::TapRead::seen_before`]).
+    pub seen: bool,
+    /// Per window (five-hour, week), the figure the vendor refilled it from
+    /// ([`accounts::WindowRead::refilled`]): the same process's reading
+    /// before, where it was served since (`api_ms` rose), under the same
+    /// reset, and this reading is lower than it by
+    /// [`accounts::REFILL_MIN_X10`] or more.
+    pub refilled: [Option<u32>; 2],
+}
+
 impl Fresh {
+    /// What `reading` says beside the last reading admitted ([`Beside`]):
+    /// asked BEFORE [`Self::admit`] takes it.
+    #[must_use]
+    pub fn beside(&self, reading: &Reading) -> Beside {
+        let Some((_, api_ms, five, seven)) = self.last.filter(|(pid, ..)| *pid == reading.pid)
+        else {
+            return Beside::default();
+        };
+        let served = reading.api_ms > api_ms;
+        let refilled = |was: Option<Window>, now: Option<Window>| match (was, now) {
+            (Some(was), Some(now))
+                if served
+                    && was.resets_at == now.resets_at
+                    && now.x10().saturating_add(accounts::REFILL_MIN_X10) <= was.x10() =>
+            {
+                Some(was.x10())
+            }
+            _ => None,
+        };
+        Beside {
+            seen: true,
+            refilled: [
+                refilled(five, reading.five_hour),
+                refilled(seven, reading.seven_day),
+            ],
+        }
+    }
+
     /// Whether `reading` is fresh; an admitted one becomes the last.
     pub fn admit(&mut self, reading: &Reading) -> bool {
         if !reading.has_figures() {

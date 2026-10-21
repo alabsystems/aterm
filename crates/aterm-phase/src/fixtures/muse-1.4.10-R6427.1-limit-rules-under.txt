@@ -1,0 +1,14 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-21, the harness's own read of the screen (`aterm ctl text --json tail=40`, seq 2900, from its tape) in a private headless aterm (144x50, aterm 0.108.0+gcc79e8bc1cb4) running the real Muse Code in the lab's jail against its stub of Meta's model API (`targo --unverified lab forever --harness muse --mode wall-hid`, run ml-hid-muse) · the usage wall the land act met (`limit:five_hour`, its time wrapped onto `  AM`), then one `/rules` entered at the empty composer: its three indented rows, a block of their own under a blank row · the 40 rows read, from the 11th of 50, the land act's message cut at their top, trailing blank rows left out · the lab's random project dir is spelled /private/tmp/at.lab0 here
+  rest. Once it is all on remote main, defend that in a few lines starting Nothing left:
+
+◆ Usage limit reached · /upgrade (https://accountscenter.meta.com/muse_code/?ep=xgrade) for increased limits, or wait for usage to reset at 3:34
+  AM
+
+  Rules loaded this session (in precedence order):
+  user: none
+  project: none
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj/hid-wall · Auto-review

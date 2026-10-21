@@ -9,7 +9,8 @@
 //! `sun_path`) holding a scratch `HOME`, an `XDG_CONFIG_HOME` whose
 //! `aterm.toml` turns the automatic lanes and the audible bell off
 //! ([`bell_off`]), and the `XDG_RUNTIME_DIR` its control socket and token
-//! live in. Nothing of the caller's environment
+//! live in. Cache, data, state and temporary roots are private directories
+//! under its HOME, including after an explicit rehome. Nothing of the caller's environment
 //! reaches it, and the control socket is its only door: every `ctl` call
 //! names that socket. It ends by its process group (`SIGTERM`, then
 //! `SIGKILL`), never by name, and it holds a lifeline (a headless aterm reads
@@ -130,6 +131,7 @@ impl World {
                 std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
             }
             std::fs::write(w.cfg.join("aterm/aterm.toml"), bell_off(config))?;
+            private_home_roots(&w.home)?;
             // A two-column `/bin/sh` prompt, so typed text never wraps on a long host name.
             std::fs::write(w.home.join(".profile"), "PS1='$ '\n")?;
             std::fs::write(w.home.join(".shrc"), "PS1='$ '\n")
@@ -155,6 +157,7 @@ impl World {
             std::fs::create_dir(home)?;
             std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
             let home = std::fs::canonicalize(home)?;
+            private_home_roots(&home)?;
             std::fs::write(home.join(".profile"), "PS1='$ '\n")?;
             std::fs::write(home.join(".shrc"), "PS1='$ '\n")?;
             Ok(home)
@@ -174,6 +177,16 @@ impl World {
             ("ENV".into(), s(&self.home.join(".shrc"))),
             ("XDG_CONFIG_HOME".into(), s(&self.cfg)),
             ("XDG_RUNTIME_DIR".into(), s(&self.run)),
+            ("XDG_CACHE_HOME".into(), s(&self.home.join(".cache"))),
+            ("XDG_DATA_HOME".into(), s(&self.home.join(".local/share"))),
+            ("XDG_STATE_HOME".into(), s(&self.home.join(".local/state"))),
+            (
+                "ATERM_STATE_HOME".into(),
+                s(&private_state_home(&self.home)),
+            ),
+            ("TMPDIR".into(), s(&self.home.join("tmp"))),
+            ("TMP".into(), s(&self.home.join("tmp"))),
+            ("TEMP".into(), s(&self.home.join("tmp"))),
             ("HISTFILE".into(), "/dev/null".into()),
             ("xcrun_nocache".into(), "1".into()),
             // Its hosted loops recorded to harness tapes, as a lab's are
@@ -181,6 +194,31 @@ impl World {
             crate::tape::seam(),
         ]
     }
+}
+
+/// Roots for a newly owned HOME, on its volume even when `rehome` moved it.
+fn private_home_roots(home: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    for path in [
+        home.join(".cache"),
+        home.join(".local/share"),
+        home.join(".local/state"),
+        home.join("tmp"),
+        private_state_home(home),
+    ] {
+        std::fs::create_dir_all(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Keep the platform's existing state location explicit; disk and proof
+/// readers already name this same root under the private HOME.
+fn private_state_home(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    return home.join("Library/Application Support/aterm");
+    #[cfg(not(target_os = "macos"))]
+    home.join(".local/state/aterm")
 }
 
 impl Drop for World {
@@ -1080,6 +1118,26 @@ mod owned_world_store_tests {
             std::fs::read(new_home.join(".profile")).unwrap(),
             b"PS1='$ '\n"
         );
+        for (name, value) in world.env() {
+            if matches!(
+                name.as_str(),
+                "TMPDIR"
+                    | "TMP"
+                    | "TEMP"
+                    | "XDG_CACHE_HOME"
+                    | "XDG_DATA_HOME"
+                    | "XDG_STATE_HOME"
+                    | "ATERM_STATE_HOME"
+            ) {
+                let path = Path::new(&value);
+                assert!(path.starts_with(&new_home), "{name} follows the new HOME");
+                assert!(path.is_dir(), "{name} already exists");
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
     }
 
     #[test]
@@ -1093,10 +1151,34 @@ mod owned_world_store_tests {
                 .1,
         );
         assert_eq!(home, world.home);
-        #[cfg(target_os = "macos")]
-        let state = home.join("Library/Application Support/aterm");
-        #[cfg(target_os = "linux")]
-        let state = home.join(".local/state/aterm");
+        for name in [
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "ATERM_STATE_HOME",
+        ] {
+            let path = PathBuf::from(
+                &env.iter()
+                    .find(|(key, _)| key == name)
+                    .expect("explicit private root")
+                    .1,
+            );
+            assert!(path.starts_with(&home), "{name} belongs to the owned HOME");
+            assert!(path.is_dir(), "{name} already exists");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let state = PathBuf::from(
+            &env.iter()
+                .find(|(name, _)| name == "ATERM_STATE_HOME")
+                .unwrap()
+                .1,
+        );
         let root = store::store_under(&state);
         let session = store::session_dir(&root, Some("s-world"));
         std::fs::create_dir_all(&session).expect("fresh owned store");

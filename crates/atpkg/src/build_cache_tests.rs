@@ -1378,3 +1378,153 @@ fn a_workspace_reached_through_a_link_is_never_looked_through() {
     assert!(verdict.is_ok(), "{verdict:?}");
     assert!(looked.contains(&real.join("Cargo.toml")), "{looked:?}");
 }
+
+/// WHAT NO BUILD READS AGAIN GOES FROM A BUILD DIRECTORY THAT STAYS ([`stale`]), on the
+/// real filesystem: a live workspace's incremental crate folder four days unwritten, and its
+/// unit the store's previous compiler built, go together through one recorded stage; the
+/// dry run ([`plan`]) names exactly them first and moves nothing. NEGATIVE CONTROLS: while
+/// a build holds the profile's lock nothing is asked or moved (and the dry run says so); a
+/// refused intent moves every entry back; the fresh crate folder, the current compiler's
+/// unit, the lock and `.rustc_info.json` stay throughout.
+#[cfg(unix)]
+#[test]
+fn a_live_build_directory_loses_only_what_no_build_reads_again() {
+    let f = Fixture::new("build-cache-stale");
+    let root = cache_root(&f.home);
+    let home = Some(f.home.as_path());
+    let live = f.dir("home/live");
+    std::fs::write(live.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let leaf = build_dir(&root, &live);
+    let profile = leaf.join("debug");
+    std::fs::create_dir_all(profile.join("deps")).unwrap();
+    // The store's build 2 is current, its link made now; cargo last built here with it.
+    let program = crate::store::default_prefix(&f.home).join("store/trust");
+    let sysroot = program.join("2");
+    std::fs::create_dir_all(&sysroot).unwrap();
+    // The store is admitted only through folders nobody else may write
+    // (`compiler_store`): each made 0755 whatever this process's umask (a
+    // Linux login's 002 left them group-writable, and the store unknown).
+    for dir in sysroot.ancestors().take_while(|d| d.starts_with(&f.home)) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::os::unix::fs::symlink("2", program.join("current")).unwrap();
+    let info = format!(
+        r#"{{"rustc_fingerprint":1,"outputs":{{"9":{{"success":true,"status":"","code":0,"stdout":"___\nlib___.rlib\n{}\noff\n","stderr":""}}}},"successes":{{}}}}"#,
+        sysroot.display()
+    );
+    std::fs::write(leaf.join(".rustc_info.json"), info).unwrap();
+    let lock = profile.join(".cargo-build-lock");
+    std::fs::write(&lock, b"").unwrap();
+    let unit = |hash: &str, rustc: u64| {
+        let fp = profile.join(format!(".fingerprint/ws-{hash}"));
+        std::fs::create_dir_all(&fp).unwrap();
+        let json = format!(r#"{{"rustc":{rustc},"features":"[]"}}"#);
+        std::fs::write(fp.join("lib-ws.json"), json).unwrap();
+        let rlib = profile.join(format!("deps/libws-{hash}.rlib"));
+        std::fs::write(&rlib, b"rlib").unwrap();
+        (fp, rlib)
+    };
+    // Built after the link was made: compiler 2 is the current one.
+    let (new_fp, new_rlib) = unit("2222222222222222", 2);
+    let (old_fp, old_rlib) = unit("1111111111111111", 1);
+    for p in [old_fp.join("lib-ws.json"), old_fp.clone(), old_rlib.clone()] {
+        age_by(&p, 4 * DAY);
+    }
+    let stale_crate = profile.join("incremental/ws-1k116trr0a0xf");
+    let fresh_crate = profile.join("incremental/ws-3g63pv341xugh");
+    for folder in [&stale_crate, &fresh_crate] {
+        std::fs::create_dir_all(folder.join("s-hneouhc0uf-1tn8o9j-2awpw")).unwrap();
+        std::fs::write(folder.join("s-hneouhc0uf-1tn8o9j.lock"), b"").unwrap();
+    }
+    age_tree(&stale_crate, 4 * DAY);
+    let stage = leaf.with_file_name(DOOMED);
+    let doomed = {
+        let mut d = vec![stale_crate.clone(), old_fp.clone(), old_rlib.clone()];
+        d.sort();
+        d
+    };
+    let why = Unused::Stale {
+        incremental: 1,
+        units: 1,
+        after: RECLAIM_STALE,
+    };
+    let dry = |held: bool| {
+        let mut planned = plan(&root, home, SystemTime::now(), RECLAIM_GONE, None);
+        for p in &mut planned {
+            p.paths.sort();
+        }
+        assert_eq!(
+            planned,
+            vec![Planned {
+                path: leaf.clone(),
+                why,
+                paths: doomed.clone(),
+                held,
+            }]
+        );
+    };
+    let kept = || {
+        for p in [
+            &new_fp,
+            &new_rlib,
+            &fresh_crate,
+            &lock,
+            &leaf.join(".rustc_info.json"),
+        ] {
+            assert!(p.exists(), "{} kept", p.display());
+        }
+    };
+    let pass = |answer: bool, asked: &mut Vec<(PathBuf, Unused, usize)>| {
+        reclaim_watched(
+            &root,
+            home,
+            SystemTime::now(),
+            RECLAIM_GONE,
+            None,
+            &mut |p, w| {
+                let staged = std::fs::read_dir(p).map_or(0, |d| d.count());
+                asked.push((p.to_path_buf(), w, staged));
+                answer
+            },
+        )
+    };
+
+    dry(false);
+    assert!(
+        doomed.iter().all(|p| p.exists()),
+        "the dry run moves nothing"
+    );
+
+    let held = crate::lock::Flock::try_lock(std::fs::File::open(&lock).unwrap()).unwrap();
+    dry(true);
+    let mut asked = Vec::new();
+    assert!(pass(true, &mut asked).is_empty());
+    assert!(
+        asked.is_empty(),
+        "nothing asked while a build holds the lock"
+    );
+    assert!(doomed.iter().all(|p| p.exists()));
+    drop(held);
+
+    assert!(pass(false, &mut asked).is_empty());
+    assert_eq!(
+        asked,
+        vec![(stage.clone(), why, 3)],
+        "the stage holds what goes"
+    );
+    assert!(
+        doomed.iter().all(|p| p.exists()),
+        "refused, every entry moved back"
+    );
+    assert_eq!(std::fs::read(&old_rlib).unwrap(), b"rlib");
+    assert!(!stage.exists());
+    kept();
+
+    asked.clear();
+    assert_eq!(pass(true, &mut asked), vec![(stage.clone(), why)]);
+    assert_eq!(asked, vec![(stage.clone(), why, 3)]);
+    assert!(doomed.iter().all(|p| !p.exists()) && !stage.exists());
+    kept();
+    assert!(plan(&root, home, SystemTime::now(), RECLAIM_GONE, None).is_empty());
+}

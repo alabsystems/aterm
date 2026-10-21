@@ -3,14 +3,11 @@
 
 # aterm-winsign: spec recovery from its 22 unit tests
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 19 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes
-> are deleted. The one test that samples no spec (§4) is deleted with the test-only `Fake` host
-> once the host-level tests are replaced. Nothing here has been proved yet.
+> Each of the 19 specs below is proved through Trust/Clean about the compiled Rust function, and
+> then the tests it subsumes are deleted. The one test that samples no spec (§4) is deleted with
+> the test-only `Fake` host once the host-level tests are replaced.
 
-Source: `crates/aterm-winsign/src/lib.rs`, read only. It is the only source file, and all 22
-`#[test]` fns sit in its `mod tests`. I read every test and the code each one reaches. Nothing
-was compiled or run. The claims below come from reading the code.
+Source: `crates/aterm-winsign/src/lib.rs`, which holds all 22 `#[test]` functions in `mod tests`.
 
 Result: **19 specs**, covering **21 tests**. **1 test is not a spec sample** (§4).
 
@@ -163,7 +160,7 @@ src/lib.rs	verify_reports_an_untrusted_chain_with_exit_one_even_when_inactive	wi
 
 ## 3. Coverage
 
-- I read all 22 original tests. 21 map to one of the 19 specs, and 1 samples no spec (§4).
+- 22 tests read: 21 map to one of the 19 specs, and 1 samples no spec (§4).
 - The biggest collapses are `winsign-verify-leaf` (1 primary test, 4 in all) and
   `winsign-verify-flags` (2 primary, 4 in all). The run specs share 5 tests among 3 specs.
 - `winsign-default-timestamp` and `winsign-config-lane` have no primary test. Each is sampled only

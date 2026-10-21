@@ -1,24 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REGRESSION PIN: the f-bomb reaches the major languages ON THE SHIPPED
-//! DEFAULT, and does not fire on ordinary Chinese.
+//! The f-bomb reaches the major languages on the shipped default and does not fire on ordinary
+//! Chinese.
 //!
-//! `Lexicon` drops every `ambiguous = true` entry whose language is not
-//! un-gated, so an ambiguous flag on a language's only profanity silences it
-//! under the shipped default (`languages = ["en"]`). The gate belongs only on
-//! surfaces that collide with a BENIGN word — Swedish `fan` vs English "fan",
-//! Hebrew `כוס` (also "cup"), Chinese 操/草/干 (everyday words), Romanian
-//! `fut` (prefixes "future"); a surface whose only collision is ANOTHER
-//! language's profanity fires profanity either way, and stays un-gated.
-//!
-//! The second half pins a false positive: the CJK scanner is maximal-munch
-//! from the run start, so the expletive 我操 ("I fuck") matched inside the
-//! common 我操作… ("I operate…"). `exceptions.toml` suppresses it.
+//! An `ambiguous = true` entry loads only when its language is un-gated, so the flag on a
+//! language's only profanity silences it under the default `languages = ["en"]`. The gate belongs
+//! only on surfaces that collide with a benign word (Swedish `fan`, Hebrew `כוס` "cup", Chinese
+//! 操/草/干, Romanian `fut` in "future"); a surface that collides only with another language's
+//! profanity stays un-gated. `exceptions.toml` keeps maximal munch from finding 我操 inside 我操作.
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions};
 
-/// The SHIPPED default: only English ambiguous entries un-gated.
+/// The shipped default: only English ambiguous entries un-gated.
 fn shipped() -> Lexicon {
     Lexicon::with_languages(&["en"])
 }
@@ -32,8 +26,7 @@ fn has_profanity(lx: &Lexicon, text: &str) -> bool {
 #[test]
 fn major_languages_have_a_working_f_bomb_by_default() {
     let lx = shipped();
-    // Each case is the expletive IN RUNNING TEXT, not bare — the scanner has to
-    // find it mid-sentence, which is how anyone actually types it.
+    // Each expletive sits in running text, so the scanner finds it mid-sentence.
     let cases: &[(&str, &str)] = &[
         ("en", "what the fuck is this"),
         ("pl", "ale kurwa co to jest"),
@@ -84,8 +77,8 @@ fn genuinely_ambiguous_surfaces_stay_gated() {
     );
 }
 
-/// THE FALSE POSITIVE. 我操 is a real expletive AND a prefix of ordinary verbs;
-/// maximal munch reached the expletive before 操作 ("operate") was considered.
+/// 我操 is an expletive and a prefix of ordinary verbs (我操作 "I operate"); the exceptions keep
+/// maximal munch from reaching it there.
 #[test]
 fn ordinary_chinese_does_not_detonate() {
     let lx = shipped();
@@ -99,8 +92,7 @@ fn ordinary_chinese_does_not_detonate() {
             "ordinary Chinese detonated an f-bomb: {text}"
         );
     }
-    // …while the genuine expletive still fires, so the fix is a suppression of
-    // the benign compounds and not a removal of the word.
+    // The genuine expletive still fires: the benign compounds are suppressed, not the word.
     assert!(
         has_profanity(&lx, "我操这也太慢了"),
         "the real zh expletive must still fire"

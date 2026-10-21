@@ -3,49 +3,25 @@
 
 //! Unicode facts the engine needs, as compact sorted range tables.
 //!
-//! Four questions come up while compiling and running a pattern, and every one
-//! of them is a property of Unicode rather than of any particular regex
-//! implementation:
+//! * `\s`: [`is_space`], `White_Space`, which is exactly `char::is_whitespace`.
+//! * `\d`: [`is_digit`], General_Category `Nd` ([`ND`]). `std` does not expose it, and
+//!   `char::is_numeric` (`Nd | Nl | No`) would admit `½` and `①`.
+//! * `\w`: [`is_word`], and so `\b`, `\B`, `\<` and `\>`: `Alphabetic | M | Nd | Pc |
+//!   Join_Control`. `char::is_alphabetic` covers the first term; [`MARK`] and [`PC`] the
+//!   two `std` withholds.
+//! * `(?i)`: [`fold_orbit`] and [`fold_range`]. Simple case folding groups code points
+//!   into orbits (`k`, `K` and KELVIN SIGN `\u{212A}`; `σ`, `ς` and `Σ`), and [`FOLD`] is
+//!   those orbits, cycle-linked.
 //!
-//! * `\s` — [`is_space`]. This is `White_Space`, and `char::is_whitespace` in
-//!   the standard library *is* `White_Space`, so there is no table: a test in
-//!   this module proves the two agree over all 0x11_0000 code points.
-//! * `\d` — [`is_digit`]. This is General_Category `Nd` (decimal digits), which
-//!   `std` does not expose (`char::is_numeric` is `Nd | Nl | No`, a strict
-//!   superset that would drag `½` and `①` into `\d`). Hence [`ND`].
-//! * `\w` — [`is_word`], and therefore `\b`, `\B`, `\<` and `\>`. This is
-//!   `Alphabetic | M | Nd | Pc | Join_Control`. `char::is_alphabetic` covers the
-//!   first term; [`MARK`] and [`PC`] cover the two `std` does not expose.
-//! * Case-insensitive (`(?i)`) matching — [`fold_orbit`] and [`fold_range`].
-//!   Simple case folding groups code points into *orbits*: `k`, `K` and
-//!   `\u{212A}` KELVIN SIGN are one orbit, and so are `σ`, `ς` and `Σ`.
-//!   [`FOLD`] is those orbits, cycle-linked.
-//!
-//! ## Where the tables come from, and how they stay honest
-//!
-//! [`FOLD`] is *derived*, not transcribed: the orbits are the connected
-//! components of the undirected graph whose edges are the standard library's
-//! single-code-point `to_lowercase`/`to_uppercase` mappings, minus the one
-//! Turkic-only mapping (`\u{131}` DOTLESS I → `I`) that `CaseFolding.txt` marks
-//! `T` and default folding therefore excludes — **plus three edges that
-//! derivation structurally cannot see**. `CaseFolding.txt` joins `\u{1fd3}` to
-//! `\u{390}`, `\u{1fe3}` to `\u{3b0}` and `\u{fb05}` to `\u{fb06}` with `C`
-//! entries, but every case mapping between those pairs is multi-code-point
-//! (`to_uppercase('\u{fb05}')` is `"ST"`), so no single-code-point edge exists
-//! to find. `fold_table_matches_std` recomputes the derivation from `std` at
-//! test time, adds exactly those three edges, and asserts the baked table is
-//! identical — so a toolchain shipping a newer Unicode cannot silently
-//! desynchronise it, and the three hand-added edges cannot silently vanish.
-//!
-//! [`ND`], [`MARK`] and [`PC`] are the three general categories `std` withholds,
-//! enumerated code point by code point. `perl_classes_are_pinned` in
-//! `tests/differential.rs` pins `\d`, `\s` and the non-alphabetic part of `\w`
-//! across every code point.
-//!
-//! One deliberate divergence from `regex`: `char::is_alphabetic` tracks the
-//! *toolchain's* Unicode version, which is newer than the tables `regex`
-//! bundles, so `\w` here is a superset of `\w` there on the ~4.7k code points
-//! that gained `Alphabetic` in the interim.
+//! [`FOLD`] is derived, not transcribed: the orbits are the connected components of the
+//! graph of `std`'s single-code-point `to_lowercase`/`to_uppercase` mappings, minus the
+//! Turkic-only `\u{131}` → `I` (`T` in `CaseFolding.txt`), plus three `C` edges no
+//! single-code-point mapping expresses (`\u{1fd3}`–`\u{390}`, `\u{1fe3}`–`\u{3b0}`,
+//! `\u{fb05}`–`\u{fb06}`). `fold_table_matches_std` recomputes the derivation and asserts
+//! the baked table equals it, so newer Unicode in the toolchain cannot silently
+//! desynchronise it. `perl_classes_are_pinned` in `tests/differential.rs` pins `\d`, `\s`
+//! and the non-alphabetic part of `\w` over every code point; the crate docs describe how
+//! `\w` diverges from `regex`.
 
 /// Membership test for a sorted, disjoint, inclusive range table.
 fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
@@ -3140,7 +3116,7 @@ static FOLD: &[(u32, u32)] = &[
     (0x1e943, 0x1e921),
 ];
 
-/// General_Category `Nd` (decimal digit) — the `\\d` class. 71 ranges.
+/// General_Category `Nd` (decimal digit), the `\d` class. 71 ranges.
 static ND: &[(u32, u32)] = &[
     (0x00030, 0x00039),
     (0x00660, 0x00669),
@@ -3215,7 +3191,7 @@ static ND: &[(u32, u32)] = &[
     (0x1fbf0, 0x1fbf9),
 ];
 
-/// General_Category `M` (`Mn | Mc | Me`) — one term of `\\w`. 321 ranges.
+/// General_Category `M` (`Mn | Mc | Me`), one term of `\w`. 321 ranges.
 static MARK: &[(u32, u32)] = &[
     (0x00300, 0x0036f),
     (0x00483, 0x00489),
@@ -3540,7 +3516,7 @@ static MARK: &[(u32, u32)] = &[
     (0xe0100, 0xe01ef),
 ];
 
-/// General_Category `Pc` (connector punctuation) — one term of `\\w`. 6 ranges.
+/// General_Category `Pc` (connector punctuation), one term of `\w`. 6 ranges.
 static PC: &[(u32, u32)] = &[
     (0x0005f, 0x0005f),
     (0x0203f, 0x02040),
@@ -3555,23 +3531,15 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// The single Turkic-only case mapping `CaseFolding.txt` marks `T`: `std`
-    /// reports `to_uppercase('\u{131}') == 'I'`, but default (non-Turkic) simple
-    /// folding leaves DOTLESS I in an orbit of its own, so `(?i)i` must not
-    /// match it. Excluded when the table is derived, and excluded again here.
+    /// The one Turkic-only mapping (`T` in `CaseFolding.txt`): `std` maps `\u{131}` to
+    /// `I`, but default simple folding leaves DOTLESS I alone, so `(?i)i` must not match
+    /// it.
     const TURKIC_ONLY: &[char] = &['\u{131}'];
 
-    /// The three fold edges `std` structurally cannot express.
-    ///
-    /// `CaseFolding.txt` joins each of these pairs with a `C` (common) entry —
-    /// `1FD3; C; 0390;`, `1FE3; C; 03B0;`, `FB05; C; FB06;` — but the *case
-    /// mappings* that relate the two code points are multi-code-point in both
-    /// directions (`to_uppercase('\u{1fd3}')` is `\u{399}\u{308}\u{301}`,
-    /// `to_uppercase('\u{fb05}')` is `"ST"`), so the single-code-point
-    /// `to_lowercase`/`to_uppercase` edges this derivation is built from never
-    /// see the link. [`FOLD`] is therefore **not purely derivable from `std`**:
-    /// it is the std derivation *plus* these three edges, and this test says so
-    /// rather than re-deriving the same blind spot and calling it agreement.
+    /// The three fold edges `std` cannot express: `CaseFolding.txt` joins each pair with a
+    /// `C` entry, but the case mappings between them are multi-code-point
+    /// (`to_uppercase('\u{fb05}')` is `"ST"`), so the single-code-point derivation never
+    /// sees the link.
     const NON_DERIVABLE: &[(char, char)] = &[
         ('\u{0390}', '\u{1fd3}'),
         ('\u{03b0}', '\u{1fe3}'),
@@ -3590,10 +3558,8 @@ mod tests {
         it.next().is_none().then_some(first)
     }
 
-    /// Re-derive every fold orbit from the standard library's case mappings and
-    /// assert the baked [`FOLD`] table is that derivation exactly. This is what
-    /// makes the table safe to bake: if the toolchain's Unicode version moves,
-    /// this fails instead of the engine quietly mis-folding.
+    /// Re-derive every fold orbit from `std`'s case mappings and assert [`FOLD`] is that
+    /// derivation exactly, so a toolchain Unicode bump fails here instead of mis-folding.
     #[test]
     fn fold_table_matches_std() {
         // Union-find over the undirected single-code-point case-mapping graph.
@@ -3629,9 +3595,8 @@ mod tests {
                 }
             }
         }
-        // The three `C`-entry edges above, which no single-code-point mapping
-        // reaches. Without them `(?i)\u{390}` would not match `\u{1fd3}`, as
-        // `regex` does — see `case_folding_is_pinned`.
+        // The three `C`-entry edges, which no single-code-point mapping reaches.
+        // `case_folding_is_pinned` holds `(?i)\u{390}` to matching `\u{1fd3}`, as `regex`.
         for &(a, b) in NON_DERIVABLE {
             join(&mut parent, a, b);
         }
@@ -3657,9 +3622,7 @@ mod tests {
              mappings plus the three non-derivable CaseFolding.txt edges"
         );
 
-        // The three edges must be load-bearing, not decorative: dropping them
-        // has to change the answer, or this test has stopped proving anything
-        // about them. Each pair must be a genuine orbit link in the baked table.
+        // Each non-derivable pair must be an orbit link in the baked table.
         for &(a, b) in NON_DERIVABLE {
             let orbit: BTreeSet<char> = fold_orbit(a).collect();
             assert!(
@@ -3686,8 +3649,8 @@ mod tests {
         }
     }
 
-    /// The orbits the campaign's built-in patterns and the search verb actually
-    /// lean on, spelled out so a table regeneration cannot quietly drop them.
+    /// Orbits the built-in patterns and the search verb rely on, spelled out so a table
+    /// regeneration cannot drop them.
     #[test]
     fn named_orbits() {
         let orbit = |c: char| -> Vec<char> {

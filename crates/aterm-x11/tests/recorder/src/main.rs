@@ -12,6 +12,9 @@
 //!   events     event packets, and x11rb-protocol's parse of each
 //!   icccm      WM_SIZE_HINTS / WM_HINTS / WM_CLASS as x11rb writes and reads them
 //!   xrm        resource databases and x11rb-protocol's answer to each query
+//!   xrm-include  resource files with `#include` lines, written to a scratch
+//!              tree, and x11rb-protocol's answer to each query of each file
+//!              read as a home file is (its own directory the base)
 //!
 //! A row is `<case>\t<hex>[\t<fields>]`. Fields are `name=value` pairs in a
 //! fixed order, integers in decimal, byte strings in hex, `-` for None; the
@@ -1774,6 +1777,92 @@ fn xrm() {
     }
 }
 
+/// The tree `xrm_include` writes: `(path, text)`, `@ROOT@` standing for the
+/// tree's absolute path (the replay writes it where it likes).
+fn include_tree() -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = [
+        (".Xresources", "Xft.antialias: 0\n#include \"xres/dpi\"\nXft.rgba: bgr\n"),
+        ("xres/dpi", "Xft.dpi: 144\n#include \"../shared\"\nXft.antialias: 1\n"),
+        ("shared", "*rgba: rgb\nXft.hinting: 1\n"),
+        ("order-before", "Xft.dpi: 96\n#include \"xres/dpi\"\n"),
+        ("order-after", "#include \"xres/dpi\"\nXft.dpi: 96\n"),
+        ("loop", "a.count: once\n#include \"loop\"\na.last: loop\n"),
+        ("missing", "#include \"no-such-file\"\nXft.dpi: 120\n"),
+        ("spaced", "#  include   \"xres/dpi\"   and the rest\n"),
+        (
+            "malformed",
+            "#include xres/dpi\n#include \"xres/dpi\n#includes \"shared\"\n#include\"shared\"\n#define x\n",
+        ),
+        ("a-directory", "#include \"xres\"\nXft.dpi: 72\n"),
+        ("absolute", "#include \"@ROOT@/shared\"\na.abs: yes\n"),
+        ("nested-dir", "#include \"xres/up\"\n"),
+        ("xres/up", "#include \"dpi\"\n"),
+        ("d000", "a.depth: 0\n#include \"d001\"\n"),
+    ]
+    .iter()
+    .map(|(p, t)| ((*p).to_owned(), (*t).to_owned()))
+    .collect();
+    // A chain past Xlib's nesting limit: d<k> sets a.depth to k and includes
+    // d<k+1>, so the answer names the deepest file followed.
+    for k in 1..=102 {
+        files.push((
+            format!("d{k:03}"),
+            format!("a.depth: {k}\n#include \"d{:03}\"\n", k + 1),
+        ));
+    }
+    files
+}
+
+fn xrm_include() {
+    let root = std::env::temp_dir().join(format!("aterm-x11-recorder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let root_text = root.to_str().expect("a UTF-8 scratch path");
+    for (path, text) in include_tree() {
+        let file = root.join(&path);
+        std::fs::create_dir_all(file.parent().expect("a parent")).expect("the tree's directory");
+        std::fs::write(&file, text.replace("@ROOT@", root_text)).expect("a tree file");
+        println!("file\t{path}\t{}", hex(text.as_bytes()));
+    }
+    let roots = [
+        ".Xresources",
+        "xres/dpi",
+        "order-before",
+        "order-after",
+        "loop",
+        "missing",
+        "spaced",
+        "malformed",
+        "a-directory",
+        "absolute",
+        "nested-dir",
+        "d000",
+    ];
+    let queries: &[(&str, &str)] = &[
+        ("Xft.dpi", ""),
+        ("Xft.antialias", ""),
+        ("Xft.rgba", ""),
+        ("Xft.hinting", ""),
+        ("a.depth", ""),
+        ("a.count", ""),
+        ("a.last", ""),
+        ("a.abs", ""),
+    ];
+    for name in roots {
+        let file = root.join(name);
+        let data = std::fs::read(&file).expect("a root file");
+        let base = file.parent().expect("a parent");
+        let db = Database::new_from_data_with_base_directory(&data, base);
+        println!("root\t{name}");
+        for (q, class) in queries {
+            let answer = db
+                .get_bytes(q, class)
+                .map_or("-".to_owned(), |v| format!("={}", hex(v)));
+            println!("q\t{name}\t{q}\t{class}\t{answer}");
+        }
+    }
+    std::fs::remove_dir_all(&root).expect("the scratch tree removed");
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("requests") => requests(),
@@ -1781,8 +1870,9 @@ fn main() {
         Some("events") => events(),
         Some("icccm") => icccm(),
         Some("xrm") => xrm(),
+        Some("xrm-include") => xrm_include(),
         _ => {
-            eprintln!("usage: aterm-x11-recorder requests|replies|events|icccm|xrm");
+            eprintln!("usage: aterm-x11-recorder requests|replies|events|icccm|xrm|xrm-include");
             std::process::exit(2);
         }
     }

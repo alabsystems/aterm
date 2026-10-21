@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S KEEPER LINK — P3 of `docs/DESIGN-pty-keeper-2026-09-26.md`
-//! (opt-in: `[keeper] enabled = true`; off by default, and then NOTHING here
-//! runs: no socket is dialled, no descriptor duplicated).
+//! The window's keeper link (P3 of `docs/DESIGN-pty-keeper-2026-09-26.md`). Opt-in with
+//! `[keeper] enabled = true`; off, nothing here runs: no socket is dialled, no descriptor
+//! duplicated.
 //!
-//! On, this window keeps the PTY keeper told, through `aterm_keeper`'s
-//! `KeeperLink` worker (the main thread makes no socket call; the queue holds
-//! DUPLICATES, never descriptor numbers):
+//! On, this window keeps the PTY keeper told through `aterm_keeper`'s `KeeperLink` worker (the
+//! main thread makes no socket call; the queue holds duplicates, never descriptor numbers):
 //!
 //! * REGISTER — a close-on-exec duplicate of every master, fresh or adopted,
 //!   at the end of `spawn_session` ([`register`]);
@@ -43,7 +42,7 @@
 //! `crash_signal::adopt_app_identity`): before it, the outgoing window owns the
 //! sessions (`PtyKeeperCustody`'s `RegisterA` guard).
 //!
-//! P3 never relaunches: `aterm keeper start` runs the keeper with
+//! Nothing here brings a window back: `aterm keeper start` runs the keeper with
 //! `--no-relaunch`, and the next launch a person makes recovers.
 
 #[cfg(unix)]
@@ -68,9 +67,9 @@ use aterm_update::recovery_ledger::KeeperAtLaunch;
 /// relaxed load per spawn, close and exit.
 static ON: AtomicBool = AtomicBool::new(false);
 
-/// THE UPDATE'S PARENT (`0`: none), which a candidate's adopted sessions
-/// were the parent's sessions of: set once at boot ([`set_predecessor`]), read
-/// by every registration ([`registration_tag`]).
+/// The update's parent (`0`: none), whose sessions a candidate's adopted sessions
+/// were: set once at boot ([`set_predecessor`]), read by every registration
+/// ([`registration_tag`]).
 #[cfg_attr(not(unix), allow(dead_code))]
 static PREDECESSOR: AtomicU32 = AtomicU32::new(0);
 
@@ -83,7 +82,7 @@ pub(crate) fn set_predecessor(pid: u32) {
 }
 
 /// How often the META pump looks at the registered terminals: the design's
-/// 250 ms debounce (§5.3 step 2) — at most four METAs a second per terminal,
+/// 250 ms debounce (§5.3 step 2), at most four METAs a second per terminal
 /// and none while its modes hold still.
 #[cfg(unix)]
 pub(crate) const META_POLL: Duration = Duration::from_millis(250);
@@ -180,7 +179,7 @@ enum Phase {
     /// An update's candidate before its Commit: registrations wait here.
     Armed,
     /// Talking to the keeper. Shared, so a waited op (PENDING, BYE) is
-    /// waited for with the state lock RELEASED: the main thread's register
+    /// waited for with the state lock released: the main thread's register
     /// and release never queue behind an update worker's bounded wait.
     Live(Arc<KeeperLink>),
 }
@@ -333,22 +332,17 @@ fn quit_link_in(st: &mut State) -> Option<Arc<KeeperLink>> {
     }
 }
 
-/// THE RELEASE OBLIGATION of a recovered master: the keeper still holds its
-/// own copy of every master it OFFERED this window (`Offered { to: conn }`
-/// until a claim), so an admitted offer that never becomes a registered
-/// session must be RELEASED, or the keeper keeps the master open — no hangup
-/// reaches the shell, which runs on unseen — and, when this window ends, turns
-/// the record back into an orphan the next launch is offered again, even after
-/// a clean quit (`KeeperCore::peer_died`). Every keeper-sourced
-/// [`crate::spawn::Adopted`] carries one: [`register`] discharges it once the
-/// session it became is registered (its RELEASE is then `Session::drop`'s),
-/// and dropped undischarged — the orphan net with no window to land in, a
-/// spawn that failed — it sends the RELEASE itself, on the link that took the
-/// offer (`KeeperLink::start_marked` keeps the boot connection).
+/// A recovered master's release obligation. The keeper holds its own copy of every master it
+/// offered this window until a claim, so an admitted offer that never becomes a registered
+/// session must be released, or the keeper keeps the master open (no hangup reaches the shell)
+/// and, when this window ends, offers it to the next launch again, even after a clean quit
+/// (`KeeperCore::peer_died`). [`register`] discharges it once the session is registered (its
+/// RELEASE is then `Session::drop`'s); dropped undischarged (the orphan net with no window to
+/// land in, a spawn that failed), it sends the RELEASE itself, on the link that took the offer
+/// (`KeeperLink::start_marked` keeps the boot connection).
 ///
-/// It also says whose the shell was: `owner`, the window that registered it
-/// (the tag's), which [`place_by_owner`] matches against the writer of the
-/// layout a recovery rebuilds.
+/// It also says whose the shell was (`owner`, `handed`, `keyed`), which [`place_by_owner`]
+/// matches against the layout a recovery rebuilds.
 #[derive(Debug)]
 pub(crate) struct Claim {
     rdev: u64,
@@ -479,55 +473,28 @@ fn release_unclaimed(rdev: u64) {
     let _ = rdev;
 }
 
-/// WHOSE SHELL FILLS WHICH PANE (the recovery's matching). Every window mints
-/// its pool ids from 0, so a recovered shell's `local_id` names a leaf only in
-/// the layout ITS window wrote: two windows that both died leave offers
-/// `{0, 1}` and `{0, 1}`, and a match on the id alone put one window's shell
-/// in the other's pane — the wrong folder, title and identity, and the agent
-/// that pane hosted not relaunched because a live shell "filled" it.
+/// Match recovered shells to the panes they filled by putting every id in one namespace keyed
+/// by (writer, id). Every window mints pool ids from 0, so a shell's `local_id` names a leaf
+/// only in the layout its own window wrote; matched on the id alone, one dead window's shell
+/// would fill another's pane.
 ///
-/// So the ids are put in ONE namespace keyed by (writer, id): every terminal
-/// leaf of `layout` window `i` by `writers[i]` (the pid of the crash journal it
-/// came from; `None` for a window whose writer is unknown — a quit's
-/// `session.toml`, which names none), and every keeper-sourced shell by its
-/// [`Claim::owner`]. A shell whose (owner, id) no leaf carries takes an id no
-/// leaf names, and the orphan net places it as a bare tab. The existing
-/// id-matching (`take_handed_off_shell`, the orphan net's identity, the
-/// agent's "filled by a live shell") then matches only a window's own shells.
-/// A shell with no owner, or one not from the keeper, matches nothing.
+/// Each terminal leaf of `layout` window `i` is keyed by `writers[i]` (the pid of the crash
+/// journal it came from; `None` when unknown, as for a quit's `session.toml`), and each
+/// keeper-sourced shell takes the leaf keyed by, in order:
 ///
-/// AN UPDATE'S SUCCESSOR RE-TAGS WHAT IT ADOPTED (round seven of the update
-/// audit, finding 5's second review). At its Commit the successor registers
-/// every adopted shell under ITS window and ITS pool id — a counter that
-/// starts over in it — and the keeper keeps only the latest tag. Its crash
-/// journal is still the PARENT's image, taken over at Commit, whose leaves
-/// carry the parent's ids until the successor's own first image replaces it.
-/// So such a registration also names the parent's (window, id) the shell was
-/// ([`Claim::handed`]), and a shell whose own (owner, id) no leaf carries takes
-/// the leaf that names that pair: a successor that dies between its Commit
-/// and its first image gets every pane its own live shell back — the agent's
-/// pane included, so the agent is never relaunched beside itself.
+/// * its own (owner, id) ([`Claim::owner`]);
+/// * the update parent's pair it was ([`Claim::handed`]): a successor re-registers adopted
+///   shells under its own pid and pool ids while its journal still holds the parent's image,
+///   until its own first image replaces it;
+/// * the pair its registrant's journal image keys it by ([`Claim::keyed`]): after a chain of
+///   updates the image can be older than the parent's own.
 ///
-/// AND ITS OWN IMAGE NAMES WHAT IT WAS HANDED (round eight of the update
-/// audit, finding 46). Once the successor has published its own image, its
-/// leaves carry its own ids; if its re-registration never reached the keeper
-/// (a link that did not start, a crash inside the delivery), the keeper still
-/// holds the parent's tag, which names neither. So the image's header names,
-/// for each such leaf, the pairs it was handed as
-/// (`crash_journal::JournalHeader::handed`, `handed` here: by the image's
-/// writer), and a shell held under one of those pairs takes that leaf —
-/// never over a leaf whose own pair it is.
-///
-/// AND THE IMAGE'S OWN PAIR, ANY NUMBER OF UPDATES ON (round seven of the
-/// update audit, leftover I2b; finding 209, `docs/DESIGN-pty-keeper-2026-09-26.md`
-/// §5.5). `handed` names the registrant's PARENT only. In a chain G → P → S
-/// whose image is still G's when S takes it over (P's first image failed to
-/// write, and P's desk did not change before it updated again), S's shells
-/// named P's pairs, matched none of G's leaves, and went to the orphan net.
-/// So P's handoff record says the pair the image it still holds keys each
-/// shell by (`SessionRecord::journal_key`, `App::journal_keys`), S's
-/// registration names it ([`Claim::keyed`]), and a shell whose own and
-/// parent's pairs match no leaf takes the leaf that names that one.
+/// The `handed` argument (`crash_journal::JournalHeader::handed`, by image writer) adds the
+/// pairs a successor's own image says each leaf was handed, for a re-registration that never
+/// reached the keeper; such a pair never takes a leaf whose own pair it is. A shell matching
+/// nothing (no owner, or not from the keeper) takes an id no leaf names, and the orphan net
+/// places it as a bare tab. The id matching downstream (`take_handed_off_shell`, the orphan
+/// net, the agent's "filled by a live shell") then matches only a window's own shells.
 pub(crate) fn place_by_owner(
     shells: &mut [crate::spawn::Adopted],
     layout: Option<&mut crate::restore::RestoreManifest>,
@@ -768,23 +735,17 @@ fn marker() -> Option<MarkerRef> {
     })
 }
 
-/// Whether a launch is an update's CANDIDATE for its keeper — it registers at
-/// its Commit and takes no offers: its overlap pair was ADMITTED
-/// (`overlap_admitted`, a Commit can come), or it adopted a handoff. The
-/// channel variables alone do not make one: a launch whose pair was refused
-/// with nothing offered boots fresh as a plain window
-/// (`seamless::overlap_intake_exits`), and armed it would stay armed for
-/// life — no boot HELLO, no crashed window's shells taken, every
-/// registration only buffered, its PENDING and BYE unsent.
+/// Whether a launch is an update's candidate for its keeper (it registers at its
+/// Commit and takes no offers): its overlap pair was admitted (a Commit can come),
+/// or it adopted a handoff. The channel variables alone do not make one: a launch
+/// whose pair was refused with nothing offered boots fresh as a plain window
+/// (`seamless::overlap_intake_exits`), and armed it would stay armed for life,
+/// with no boot HELLO, no crashed window's shells taken, every registration only
+/// buffered, its PENDING and BYE unsent.
 pub(crate) fn is_update_candidate(overlap_admitted: bool, adopted_a_handoff: bool) -> bool {
     overlap_admitted || adopted_a_handoff
 }
 
-/// BOOT (`main_entry`, beside `take_incoming`): arm the link when the keeper
-/// is enabled, and — unless this launch is an update's `candidate`, which
-/// waits for its Commit — say the boot HELLO and admit every offer. Returns
-/// the recovery (empty when off, when no keeper answers, or when nothing was
-/// on offer).
 /// Whether a launch takes part in its keeper: every windowed launch, and a
 /// headless one only of a build whose keeper is not the installed app's
 /// ([`boot`]'s App-class rule).
@@ -806,13 +767,11 @@ pub(crate) fn boot(
     if !enabled {
         return Recovery::default();
     }
-    // App-class only (§0 decision 6, §5.1): a HEADLESS launch of the
-    // installed app never joins the installed app's keeper — neither
-    // registering nor taking a crashed window's orphans at its HELLO, which
-    // would move a person's recovered tabs into an instance with no window
-    // (the P3 review's finding). A dev or test build has its own keeper
-    // label (`aterm_keeper::job::place_for`), so its headless instances —
-    // the live end-to-end tests' — still take part.
+    // App-class only (§0 decision 6, §5.1): a headless launch of the installed
+    // app never joins its keeper, neither registering nor taking a crashed
+    // window's orphans, which would move a person's recovered tabs into an
+    // instance with no window. A dev or test build has its own keeper label
+    // (`aterm_keeper::job::place_for`), so its headless instances take part.
     #[cfg(unix)]
     if !takes_part(headless, aterm_keeper::job::own_place().installed) {
         aterm_log::info!("keeper: a headless launch of the installed app takes no part");
@@ -970,9 +929,9 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
     recovery
 }
 
-/// COMMIT (an update's successor, beside `crash_signal::adopt_app_identity`):
+/// Commit (an update's successor, beside `crash_signal::adopt_app_identity`):
 /// from here this process is the window, so the link starts and every
-/// registration its adopted sessions queued is sent — the successor's claim
+/// registration its adopted sessions queued is sent, the successor's claim
 /// that turns the keeper's hold into custody (§5.3 step 8).
 #[cfg(unix)]
 pub(crate) fn activate() {
@@ -1002,7 +961,7 @@ pub(crate) fn activate() {
     }
 }
 
-/// The opaque tag a registration carries: what the NEXT window needs to adopt
+/// The opaque tag a registration carries: what the next window needs to adopt
 /// the session as itself. The keeper never decodes it (§5.2).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Tag {
@@ -1013,20 +972,15 @@ pub(crate) struct Tag {
     pub(crate) rekey: bool,
     pub(crate) loader: bool,
     pub(crate) frozen: bool,
-    /// THE PARENT'S NAME FOR IT (additive, `handed=<pid>:<id>`; a build that
-    /// predates it ignores the key): an update's successor that adopted this
-    /// shell names the parent window and the parent's pool id it had there,
-    /// which the parent's crash journal — taken over at Commit — still keys
-    /// its pane by ([`place_by_owner`]).
+    /// The parent's name for it (additive `handed=<pid>:<id>`, ignored by older builds): for a
+    /// shell an update's successor adopted, the parent window and its pool id there, by which
+    /// the parent's crash journal, taken over at Commit, still keys its pane
+    /// ([`place_by_owner`]).
     pub(crate) handed: Option<(u32, u64)>,
-    /// THE IMAGE'S NAME FOR IT (additive, `keyed=<pid>:<id>`; a build that
-    /// predates it ignores the key; round seven of the update audit, leftover
-    /// I2b): when the parent's journal still held an image OLDER than the
-    /// parent's own — the parent took its own parent's over and never
-    /// replaced it — the (window, id) that image keys this shell's pane by,
-    /// which the parent carried in its handoff record
-    /// (`SessionRecord::journal_key`). `handed` alone names only one
-    /// generation back, and that image's leaves carry none of its ids.
+    /// The image's name for it (additive `keyed=<pid>:<id>`, ignored by older builds): when
+    /// the parent's journal still held an image older than the parent's own, the (window, id)
+    /// that image keys this shell's pane by (`SessionRecord::journal_key`). `handed` names
+    /// only one generation back.
     pub(crate) keyed: Option<(u32, u64)>,
     /// THE SESSION LOG'S EPOCH (additive, `slog_ep=<n>`; a build that
     /// predates it ignores the key; phase 2A of the session log): the epoch
@@ -2073,11 +2027,9 @@ where
 }
 
 impl crate::App {
-    /// `End sessions` (the recovery row): hang up every shell this launch
-    /// reattached from the keeper that is still one of its sessions — the
-    /// verified-identity hang-up a tab close sends (F3) — so each ends as a
-    /// shell that exits does, its tab closing and its master released. The
-    /// count hung up.
+    /// `End sessions` (the recovery row): hang up every shell this launch reattached from the
+    /// keeper that is still one of its sessions, with the verified-identity hang-up a tab close
+    /// sends, so each ends as an exiting shell does. Returns the count hung up.
     pub(crate) fn end_recovered_sessions(&mut self) -> usize {
         let shells = std::mem::take(&mut self.keeper_recovered);
         let mut ended = 0;
@@ -2149,11 +2101,9 @@ mod tests {
         Tag::decode(&bytes).is_some_and(|t| t == long) && bytes.len() <= aterm_keeper::wire::MAX_TAG
     }
 
-    /// APP-CLASS ONLY (§0 decision 6): a headless launch of the installed app
-    /// never joins the installed app's keeper — it would take a crashed
-    /// window's tabs into an instance with no window. A windowed launch does,
-    /// and so does a dev or test build's headless instance, whose keeper is
-    /// its own (the live end-to-end tests').
+    /// A headless launch of the installed app never joins the installed app's keeper; a
+    /// windowed launch does, and so does a dev or test build's headless instance, whose keeper
+    /// is its own.
     #[test]
     fn a_headless_launch_of_the_installed_app_takes_no_part() {
         assert!(!takes_part(true, true));
@@ -2162,9 +2112,8 @@ mod tests {
         assert!(takes_part(false, false));
     }
 
-    /// OFF means off: with `[keeper] enabled = false` the boot does not dial,
-    /// and a spawn's registration, a close's release, the update's PENDING
-    /// and the exit's BYE do nothing (the flag is never raised).
+    /// Off means off: with `[keeper] enabled = false` the boot does not dial, and a spawn's
+    /// registration, a close's release, the update's PENDING and the exit's BYE do nothing.
     #[test]
     fn with_the_keeper_off_nothing_registers() {
         let recovery = boot(false, false, false, None);
@@ -2184,8 +2133,8 @@ mod tests {
         }
     }
 
-    /// The fingerprint masks the per-frame modes (M9): a TUI's DEC 2026 and
-    /// `?25` toggles send no META, while a real mode change does.
+    /// The fingerprint masks the per-frame modes: a TUI's DEC 2026 and `?25` toggles send no
+    /// META, while a real mode change does.
     #[cfg(unix)]
     #[test]
     fn the_fingerprint_ignores_the_per_frame_modes() {
@@ -2208,7 +2157,7 @@ mod tests {
         );
     }
 
-    /// `[keeper] enabled` is OFF unless the file says `true` (P3 is opt-in).
+    /// `[keeper] enabled` is off unless the file says `true`.
     #[test]
     fn the_keeper_is_off_unless_the_file_turns_it_on() {
         let parse = |text: &str| crate::app_config::Config::parse(text).expect("parses");
@@ -2316,17 +2265,16 @@ mod tests {
 
     #[cfg(unix)]
     fn end(sh: &aterm_pty::SpawnedShell) {
-        // SIGKILL (AGENTS.md), then reap.
+        // Hang up, then reap (which escalates to SIGKILL).
         let identity = aterm_pty::record_spawned_shell(sh.pid);
         let _ = aterm_pty::hangup_shell(&identity, sh.master);
         aterm_pty::reap_shell(identity);
         aterm_pty::close_fd(sh.master);
     }
 
-    /// THE ONE ADMISSION, driven with the three shapes §6.4 names: a master
-    /// that is not a tty, a live shell's tty, and a record whose shell is gone
-    /// or whose pid names another process. Each refusal closes the offered
-    /// descriptor through `HandedMaster`'s drop (the no-leak obligation).
+    /// The one admission: a master that is not a tty, a live shell's tty, and a shell gone or
+    /// whose pid names another process. Each refusal closes the offered descriptor through
+    /// `HandedMaster`'s drop.
     #[cfg(unix)]
     #[test]
     fn the_admission_takes_a_live_shell_and_refuses_the_rest() {
@@ -2542,14 +2490,8 @@ mod tests {
         assert!(crate::seamless::recovered_checkpoint(b"", &mut used).is_none());
     }
 
-    /// THE META CARRIES NO IN-FLIGHT OUTPUT STATE (round eight of the update
-    /// audit, finding 502's review). The pump resends the META only when the
-    /// modes change, so at a crash it may be hours old: an OSC 8 link open when
-    /// it was sampled, closed since, would link everything the program prints
-    /// after the recovery, and a long URI alone pushed a 100-column alt-screen
-    /// tab's META past `MAX_META`, so none was sent at all. `keeper_meta`
-    /// sends none of that state, and `recovered_checkpoint` takes none from a
-    /// META that holds it (nor a partial sequence), whichever window sent it.
+    /// The META carries no in-flight output state (`keeper_meta_of` says why), and
+    /// `recovered_checkpoint` takes none, nor a partial sequence, from a META that holds it.
     #[cfg(unix)]
     #[test]
     fn the_meta_carries_no_in_flight_output_state() {
@@ -2625,8 +2567,8 @@ mod tests {
     const TUI_SETUP: &[u8] =
         b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[2;40r";
 
-    /// The META a window before round seventeen sent: the sanitized carry as
-    /// the handoff's JSON, each cursor's stops a bool per column.
+    /// The old-form META: the sanitized carry as the handoff's JSON, each cursor's stops a
+    /// bool per column.
     #[cfg(unix)]
     fn old_form_meta(t: &Terminal) -> Vec<u8> {
         let mut meta = t.carry_meta_abandoning_partial();
@@ -2636,11 +2578,8 @@ mod tests {
         aterm_json::to_string(&meta).expect("json").into_bytes()
     }
 
-    /// `meta` as a window before round seventeen reads it: without the packed
-    /// stops it does not know, each cursor's `tab_stops` the empty list the
-    /// packed form writes. The review of R17-HANDOFF-1 (2026-10-11) fed the
-    /// packed bytes to origin/main's own `recovered_checkpoint` and got what
-    /// this emulation gets.
+    /// `meta` as a window that predates the packed stops reads it: the packed key unknown, so
+    /// each cursor's `tab_stops` is the empty list the packed form writes.
     #[cfg(unix)]
     fn as_an_older_window_reads(meta: &[u8]) -> Vec<u8> {
         let mut value: aterm_json::Value = aterm_json::from_slice(meta).expect("the META is JSON");
@@ -2676,15 +2615,9 @@ mod tests {
         );
     }
 
-    /// THE META FITS AT ANY WIDTH (round seventeen, R17-HANDOFF-1). Each cursor
-    /// carried its tab stops as a JSON bool per column — two cursors on the
-    /// alternate screen, and a vector a grid never shrinks — so from 119 alt-
-    /// screen columns (330 on the main screen, or any pane once that wide) even
-    /// the bare scalars passed `MAX_META`, `keeper_meta` returned nothing, and
-    /// a crash recovery restored the modes from before the program started.
-    /// A 200- and a 400-column alt-screen session, custom stops included, and
-    /// a pane once 400 columns wide now 100: each META fits and its stops
-    /// round-trip, the one past the width included.
+    /// The META fits at any width (`PackedTabStops`): 200- and 400-column alt-screen sessions
+    /// with custom stops, and a pane once 400 columns wide now 100, each fit and round-trip
+    /// their stops, the one past the width included.
     #[cfg(unix)]
     #[test]
     fn a_wide_alt_screen_meta_fits_and_carries_its_tab_stops() {
@@ -2957,13 +2890,11 @@ mod tests {
         );
     }
 
-    /// `meta` with every scalar a shed META keeps at its widest JSON
-    /// (R17-HANDOFF-1's review, 2026-10-11), to bound its size: each bool
-    /// `false` (a byte wider than `true`); each number, and each absent
-    /// optional one, the widest its field takes back unchanged (`u64::MAX`,
-    /// then `u32::MAX`, `u16::MAX`, `null` and `u8::MAX`, tried in that
-    /// order); each enum its longest name; and the widest character sets in
-    /// every slot. The stop vectors are left as they are.
+    /// `meta` with every scalar a shed META keeps at its widest JSON, to bound its size: each
+    /// bool `false` (a byte wider than `true`); each number, and each absent optional one, the
+    /// widest its field takes back unchanged (`u64::MAX`, then `u32::MAX`, `u16::MAX`, `null`
+    /// and `u8::MAX`, tried in that order); each enum its longest name; and the widest
+    /// character sets in every slot. The stop vectors are left as they are.
     #[cfg(unix)]
     fn widest_scalars(
         mut meta: aterm_core::terminal::CheckpointMeta,
@@ -3050,9 +2981,8 @@ mod tests {
         meta
     }
 
-    /// VERSION SKEW, forward: the META a window before round seventeen sent
-    /// (the keeper keeps it across an update, and a crash recovers from it)
-    /// still restores — its bool-per-column stops, its cursor and its modes.
+    /// Version skew, forward: an old-form META (a bool per column for the stops) still
+    /// restores its stops, cursor and modes.
     #[cfg(unix)]
     #[test]
     fn a_meta_an_older_window_sent_still_restores() {
@@ -3074,18 +3004,10 @@ mod tests {
         assert!(cp.cursor.tab_stops[5], "the custom stop crosses");
     }
 
-    /// VERSION SKEW, backward (a rollback, or an older build launched after a
-    /// newer one crashed). A META whose whole carry the old form holds is sent
-    /// in it, byte for byte, so an older window reads it exactly as before. A
-    /// packed one an older window's recovery reads as the handoff's meta, which
-    /// ignores the packed stops it does not know and reads each cursor's
-    /// `tab_stops` as the empty list the new form writes. Its Repaint rung then
-    /// resets each cursor to a blank one at the same position
-    /// (`repaint_checkpoint`'s sanitize), so it keeps every mode and loses only
-    /// the scroll region, margins and custom stops, which a full-screen program
-    /// sets again as it repaints after the size pulse. Where a window before
-    /// round seventeen sent a shed old form instead, that is a trade, not only
-    /// a gain (`where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole`).
+    /// Version skew, backward (a rollback, or an older build launched after a newer one
+    /// crashed): a META the old form holds is sent in it byte for byte, and a packed one read
+    /// by an older window keeps every mode and loses only the region, margins and custom stops
+    /// (`PackedTabStops`).
     #[cfg(unix)]
     #[test]
     fn an_older_window_reads_a_new_meta_with_its_modes() {

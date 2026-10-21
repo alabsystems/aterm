@@ -1,22 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE UPGRADE'S CLASS, TABLE AND WORDS (owner rules, 2026-09-28: "there needs
-//! to be some clear reason why the user must be engaged and what the user
-//! should do"; "batch these exceptions in a single dismissable alert").
+//! The upgrade's class, table, and words.
 //!
 //! [`aterm_agent::harness::upgrade_drive::Row::attention`] classifies every
-//! upgrade state; this file holds the TABLE of the failure modes the owner's
-//! own machine met (`U2`'s 51 states, by id, less the ten of the retired Codex
-//! live upgrade, X01-X10) against the REAL classifier, and
+//! upgrade state; this file holds the table of failure modes (41 states by id)
+//! against the real classifier, and
 //! the words each `Digest` becomes as an entry of the exceptions digest
 //! ([`crate::message_reporters::upgrade_exceptions`]) run through the engine's
 //! vocabulary. A state that moves class fails here by id.
 //!
-//! The classes: `Q` a record (the upgrade is working or somebody else's to
-//! end), `F:kind` aterm's own fault (a Warn record and one `aterm.log` line,
-//! for the owner as the developer), `D:kind` one line of "To look at",
-//! `I:kind` the ONE row that stands (the agent the upgrade ended).
+//! The classes: `Q` a record (the upgrade is working or somebody else's to end), `F:kind`
+//! aterm's own fault (a Warn record and one `aterm.log` line), `D:kind` one line of "To
+//! look at", `I:kind` the one row that stands (the agent the upgrade ended).
 
 use aterm_agent::harness::upgrade::{Agent, GAVE_UP, Phase, Request};
 use aterm_agent::harness::upgrade_drive::{Attention, HeldBy, Row};
@@ -60,7 +56,7 @@ fn state(agent: Agent, age: u64, phase: Phase, wait: &str) -> Row {
     }
 }
 
-/// U2's state `id`, `age` seconds after the move began to wait.
+/// State `id`, `age` seconds after the move began to wait.
 fn fixture(id: &str, age: u64) -> Row {
     let wait_row = |agent: Agent, announced: bool, wait: &str| {
         let phase = if announced {
@@ -193,15 +189,13 @@ fn class(row: &Row) -> String {
     }
 }
 
-/// U2'S 51 STATES, BY ID, AGAINST THE REAL CLASSIFIER: what each is at 20
-/// minutes, 2 hours and a day on. X01-X10 were the Codex live upgrade's
-/// daemon and composer waits, retired with it (2026-10-16); 40 are
-/// `Row`-backed here; the last, M03
-/// ("the upgrade cannot run at all"), is no row of a tab — the HOST raises it
-/// (`Need::upgrade_cannot_run`), checked below. THE OWNER'S LINE this holds:
-/// the only interrupts in the whole table are S06, F02 and F04 (and F03 at
-/// its expiry becomes S06) — an agent the upgrade ended; everything else is a
-/// record, aterm's own fault line, or one line of the digest.
+/// The 41 upgrade states, by id, against the real classifier: what each is at 20
+/// minutes, 2 hours and a day on. 40 are `Row`-backed here; the last, M03
+/// ("the upgrade cannot run at all"), is no row of a tab — the host raises it
+/// (`Need::upgrade_cannot_run`), checked below. The only interrupts in the
+/// whole table are S06, F02 and F04 (and F03 at its expiry becomes S06) — an
+/// agent the upgrade ended; everything else is a record, aterm's own fault
+/// line, or one line of the digest.
 ///
 /// What the design's table lists that this classifier answers otherwise, said
 /// where it differs: G03 and G06 (a turn running, a status lagging an idle
@@ -270,10 +264,10 @@ fn every_upgrade_state_has_its_attention() {
     assert_eq!(cannot.kind, "upgrade-cannot-run");
 }
 
-/// F04 and F03 AT THEIR EXPIRY: a relaunched agent that has reached no prompt
-/// is aterm's fault line at 15 minutes and the ONE interrupt at 30; a returned
-/// prompt the resume line was not typed at converges into the agent-down
-/// interrupt at the stale bound. (`fixture`'s F03/F04 are the early looks.)
+/// F04 and F03 at their expiry: a relaunched agent that has reached no prompt is aterm's
+/// fault line at 15 minutes and an interrupt at 30; a returned prompt the resume line was
+/// not typed at becomes the agent-down interrupt at the stale bound. (`fixture`'s F03/F04
+/// are the early looks.)
 #[test]
 fn the_relaunch_and_the_returned_prompt_reach_their_interrupts_on_time() {
     let relaunched = |waited: u64| {
@@ -309,10 +303,9 @@ fn the_relaunch_and_the_returned_prompt_reach_their_interrupts_on_time() {
     }
 }
 
-/// ONLY AN AGENT THE UPGRADE ENDED INTERRUPTS: across every state of the table
-/// and the ages a session can be behind (a minute to a year), no class but
-/// `agent-down`, `hung-exit` and `relaunch-stuck` is an interrupt. The owner's
-/// standing rule, as a sweep.
+/// Only an agent the upgrade ended interrupts: across every state of the table and ages
+/// from a minute to a year, no class but `agent-down`, `hung-exit` and `relaunch-stuck` is
+/// an interrupt.
 #[test]
 fn no_state_but_an_ended_agent_ever_interrupts() {
     let ids = [
@@ -341,9 +334,9 @@ fn no_state_but_an_ended_agent_ever_interrupts() {
     );
 }
 
-/// AN UNKNOWN WAIT IS NEVER THE OWNER'S: a word this build has never seen is a
-/// record and, once it has stood too long, aterm's own fault line — never a
-/// digest line and never an interrupt, whatever its age, phase or agent.
+/// An unknown wait is never the owner's: a word this build has never seen is a record and,
+/// once it has stood too long, aterm's own fault line; never a digest line or an
+/// interrupt, whatever its age, phase or agent.
 #[test]
 fn an_unknown_wait_is_a_record() {
     for agent in [Agent::Claude, Agent::Codex] {
@@ -374,7 +367,7 @@ fn an_unknown_wait_is_a_record() {
     }
 }
 
-/// THE SPOT OF A TAB, for a row: `in tab N` and the navigation to it.
+/// The spot of a tab, for a row: `in tab N` and the navigation to it.
 fn spot(n: u16) -> UpgradeSpot {
     UpgradeSpot {
         place: format!("in tab {n}"),
@@ -413,7 +406,7 @@ const PLACES: [&str; 4] = [
     "in window 12, tab 10",
 ];
 
-/// EVERY ENTRY THE UPGRADE CAN HAND THE DIGEST — each digest state of the
+/// Every entry the upgrade can hand the digest — each digest state of the
 /// table at each age it is one, named in every form a place takes — with the
 /// digest kind it is.
 pub(crate) fn every_digest_entry() -> Vec<(&'static str, Entry)> {
@@ -438,14 +431,11 @@ pub(crate) fn every_digest_entry() -> Vec<(&'static str, Entry)> {
     all
 }
 
-/// EVERY WORD THE DIGEST GETS PASSES THE ENGINE'S VOCABULARY, for every digest
-/// state of the table at every age it can be one, in one tab or three, in a
-/// window numbered like the owner's: the entry builds (`Entry::message()` is
-/// `Ok`: a glass title, a reason that is not "waiting", one action with no
-/// snooze lead), its key is under the family's prefix and it names its tab
-/// where it has one. A reporter whose words fail is logged and never shown, so
-/// this is where it fails first. (The restart lint reads the same roster in
-/// `message_reporters`.)
+/// Every word the digest gets passes the engine's vocabulary, for every digest state of
+/// the table at every age it can be one, in every form a place takes: the entry builds
+/// (`Entry::message()` is `Ok`: a glass title, a reason that is not "waiting", one action
+/// with no snooze lead) and its key is under the family's prefix. A reporter whose words
+/// fail is logged and never shown, so this is where it fails first.
 #[test]
 fn every_digest_state_says_why_and_what() {
     let all = every_digest_entry();
@@ -478,10 +468,9 @@ fn every_digest_state_says_why_and_what() {
     assert!(entry.message().is_ok(), "{:?}", entry.message());
 }
 
-/// FIVE TABS WAITING ON THEIR OWN WORK ARE ONE LINE (the owner: "fix this
-/// stacking"): one entry per KIND for `own-work`, `typed-draft` and
-/// `daemon-busy`, naming its tabs; one entry per tab for a kind whose action
-/// is done in one tab. The order the rows come in changes nothing.
+/// Several tabs are one entry per kind for `own-work`, `typed-draft` and `daemon-busy`,
+/// naming its tabs, and one entry per tab for a kind whose action is done in one tab. The
+/// order the rows come in changes nothing.
 #[test]
 fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_per_tab() {
     let mut rows = vec![
@@ -553,11 +542,10 @@ fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_p
     assert!(title.contains("window 12"), "{title}");
 }
 
-/// NOTHING BUT A DIGEST ROW IS AN ENTRY: interrupts keep their band row, faults
-/// their record, quiet waits nothing — none of them leaves a line in "To look
-/// at". And the words keep the classifier's severity (a stop that repeats is a
-/// Warn, capped there) and the dismissal span (a choice the owner made holds
-/// longer than a wait somebody could end).
+/// Nothing but a digest row is an entry: interrupts keep their band row, faults their
+/// record, quiet waits nothing. The words keep the classifier's severity (a repeating stop
+/// is a Warn) and the dismissal span (a choice the owner made holds longer than a wait
+/// somebody could end).
 #[test]
 fn only_a_digest_state_is_an_entry_and_its_severity_and_span_follow_its_kind() {
     for id in [
@@ -598,8 +586,8 @@ fn only_a_digest_state_is_an_entry_and_its_severity_and_span_follow_its_kind() {
     for wait in ["G13", "G11", "G18", "S05"] {
         assert_eq!(span(wait), Resurface::WAIT, "{wait}");
     }
-    // The state that GAVE UP with nothing running is no digest at all; with a
-    // whole round unanswered and work under it, it is `own-work`.
+    // A row that gave up (`GAVE_UP`) after a whole round unanswered, with work under it,
+    // is `own-work`.
     let mut gave_up = fixture("G13", 30 * H);
     gave_up.phase = Phase::Failed(GAVE_UP.into());
     gave_up.streak_why = GAVE_UP.into();

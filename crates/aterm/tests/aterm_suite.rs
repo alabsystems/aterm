@@ -32,6 +32,8 @@ mod agent_prime_live_headless;
 #[cfg(unix)]
 mod agent_verdict_live_headless;
 #[cfg(unix)]
+mod amacs_pty;
+#[cfg(unix)]
 mod app_front_hwkey_live_headless;
 #[cfg(unix)]
 mod conn_live_headless;
@@ -59,6 +61,8 @@ mod keeper_restore_live_headless;
 mod lifeline_live_headless;
 #[cfg(unix)]
 mod messages_live_headless;
+#[cfg(unix)]
+mod person_seam_live_headless;
 mod protected_spawn;
 #[cfg(unix)]
 mod quit_signal_live_headless;

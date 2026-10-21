@@ -10,7 +10,11 @@
 //! * **The fake model** ([`serve`]): the Responses API on that port, every
 //!   request answered by the caller's [`Answer`] and logged one JSON object a
 //!   line (`t` its unix milliseconds, `tag` what the answer named it, `u` the
-//!   tail of its last user text, `tool_output`, `status`), with the item and
+//!   tail of its last user text, `tool_output`, `status`, `n` its input
+//!   items and `turn` the Codex turn it belongs to, [`request_marks`]: a
+//!   request sent again carries the same both, a second turn another turn and
+//!   more items; `said` the reply's text, [`said_of`], and `hold_ms` how long
+//!   the answer was held), with the item and
 //!   stream builders an answer is made of ([`message_item`], [`call_item`],
 //!   [`sse`]).
 //! * **The stand-ins**: `/bin/ps` is setuid, which the sandbox refuses to
@@ -272,6 +276,9 @@ fn serve_one(conn: TcpStream, log: &Mutex<PathBuf>, answer: &Answer) {
                 Some(other) => J::s(other.py()),
                 None => J::s("null"),
             };
+            let (n, turn) = request_marks(&parsed);
+            let said = said_of(&a.body);
+            let hold_ms = i64::try_from(a.delay.as_millis()).unwrap_or(i64::MAX);
             let at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis());
@@ -281,6 +288,10 @@ fn serve_one(conn: TcpStream, log: &Mutex<PathBuf>, answer: &Answer) {
                 ("u", J::s(tail)),
                 ("tool_output", tool_output),
                 ("status", J::Int(i64::from(a.status))),
+                ("n", J::Int(i64::try_from(n).unwrap_or(i64::MAX))),
+                ("turn", J::s(turn)),
+                ("said", J::s(said)),
+                ("hold_ms", J::Int(hold_ms)),
             ])
             .dump(PY);
             if let Ok(path) = log.lock() {
@@ -322,6 +333,42 @@ fn serve_one(conn: TcpStream, log: &Mutex<PathBuf>, answer: &Answer) {
         }
         let _ = w.flush();
     }
+}
+
+/// The text of the assistant messages a streamed answer ([`sse`]) holds, one
+/// line each; empty for any other body (a 429's JSON, a tool call alone).
+#[must_use]
+pub fn said_of(body: &str) -> String {
+    body.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| J::parse(d).ok())
+        .filter(|d| d.get("type").and_then(J::as_str) == Some("response.output_item.done"))
+        .filter_map(|d| d.get("item").cloned())
+        .filter(|it| it.get("type").and_then(J::as_str) == Some("message"))
+        .flat_map(|it| {
+            it.get("content")
+                .and_then(J::as_arr)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|c| c.get("text").and_then(J::as_str).map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How many input items a Responses request carries, and the Codex turn it
+/// belongs to (its `client_metadata.turn_id`, `-` where it names none).
+#[must_use]
+pub fn request_marks(body: &J) -> (usize, String) {
+    let n = body.get("input").and_then(J::as_arr).map_or(0, |i| i.len());
+    let turn = body
+        .get("client_metadata")
+        .and_then(|m| m.get("turn_id"))
+        .and_then(J::as_str)
+        .unwrap_or("-")
+        .to_string();
+    (n, turn)
 }
 
 /// The last user text of a Responses request, and its last input item when
@@ -570,6 +617,33 @@ mod tests {
             request_view(&J::parse("{}").unwrap()),
             (String::new(), None)
         );
+        assert_eq!(request_marks(&body), (4, "-".to_string()));
+        let turned = J::parse(
+            r#"{"input":[{"role":"user","content":"x"}],
+                "client_metadata":{"turn_id":"t-2","thread_id":"th"}}"#,
+        )
+        .unwrap();
+        assert_eq!(request_marks(&turned), (1, "t-2".to_string()));
+        assert_eq!(
+            request_marks(&J::parse("{}").unwrap()),
+            (0, "-".to_string())
+        );
+    }
+
+    #[test]
+    fn a_reply_s_text_is_its_messages_and_nothing_else() {
+        let body = sse(vec![
+            message_item("Nothing left: all of it.\nNEEDS YOU: nothing"),
+            call_item("exec_command", &J::obj([("cmd", J::s("true"))])),
+        ]);
+        assert_eq!(
+            said_of(&body),
+            "Nothing left: all of it.\nNEEDS YOU: nothing"
+        );
+        // NEGATIVE CONTROLS: a call alone, and a 429's JSON, say nothing.
+        let call = sse(vec![call_item("exec_command", &J::obj([]))]);
+        assert_eq!(said_of(&call), "");
+        assert_eq!(said_of(r#"{"error":{"type":"usage_limit_reached"}}"#), "");
     }
 
     #[test]

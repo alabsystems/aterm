@@ -54,10 +54,13 @@
 //! assertions compiles out, and a `--release` test build of a crate that calls
 //! other crates' debug-only test seams does not compile (AGENTS.md). So `dev`
 //! (the default) explicitly selects the `test` profile, preserving the original
-//! measurement's build rather than the bench default's release profile. Most
-//! crates on this path — aterm-link, astream-broker,
-//! aterm-gui — are opt-level 0 and its numbers overstate the CPU part of every
-//! cost; and `opt` is the root manifest's `[profile.opt-test]`: release code
+//! measurement's build rather than the bench default's release profile. The
+//! bridge itself, aterm-link, runs at its `[profile.dev.package.aterm-link]`
+//! opt-level 2, but most crates on the path — astream-broker, aterm-gui — are
+//! opt-level 0, and the arm's numbers overstate the CPU part of every cost. A
+//! `dev` before/after across a change to those rows compares unlike builds;
+//! each entry's plan line says which opt-levels it measured. `opt` is the root
+//! manifest's `[profile.opt-test]`: release code
 //! generation with debug assertions on (the arm's table, and why it does not
 //! inherit `dev`, is the bench's `fabric_bench/profile.rs`). Before measuring,
 //! the lane reads cargo's plan for the arm and refuses an opt build with any

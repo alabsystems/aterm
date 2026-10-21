@@ -32,6 +32,7 @@ fn a_zoomed_font_crosses_the_handoff() {
         (None, None, None, None)
     );
     let handoff = |window| SessionHandoff {
+        resources: None,
         schema: SessionHandoff::SCHEMA,
         sessions: Vec::new(),
         window: Some(window),
@@ -189,6 +190,7 @@ fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
     );
 
     let wire = SessionHandoff {
+        resources: None,
         schema: SessionHandoff::SCHEMA,
         sessions: Vec::new(),
         window: parent.handoff_window_carry(0),

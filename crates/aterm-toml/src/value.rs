@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The untyped value tree — what a TOML file MEANS, with the formatting gone.
-//!
-//! This is the shape callers reach for when the document's schema is not known
-//! at compile time (aterm's art assets, a status file being spot-checked in a
-//! test). When the schema IS known, `#[derive(Deserialize)]` and
-//! [`crate::from_str`] skip this representation entirely and build the target
-//! type straight off the parse tree.
+//! The untyped value tree: what a TOML file means, with the formatting gone. For documents
+//! whose schema is not known at compile time; with `#[derive(Deserialize)]`,
+//! [`crate::from_str`] builds the target type straight off the parse tree instead.
 
 use core::fmt;
 use core::str::FromStr;
@@ -16,11 +12,8 @@ use std::collections::btree_map;
 
 use crate::Datetime;
 
-/// A TOML table: keys to values.
-///
-/// Ordered by key rather than by appearance, deliberately: this is the
-/// SEMANTIC view, two files that differ only in key order mean the same thing,
-/// and a caller who needs the authored order wants [`crate::edit`] instead.
+/// A TOML table: keys to values, ordered by key rather than by appearance. For the authored
+/// order, use [`crate::edit`].
 pub type Table = Map<String, Value>;
 
 /// A sorted string-keyed map.
@@ -132,7 +125,7 @@ pub enum Value {
     Datetime(Datetime),
     /// An array. TOML 1.0 does not require the elements to share a type.
     Array(Vec<Value>),
-    /// A table, in either spelling — the value tree does not record which.
+    /// A table, in either spelling; the value tree does not record which.
     Table(Table),
 }
 
@@ -323,18 +316,15 @@ impl FromStr for Value {
 impl FromStr for Table {
     type Err = crate::Error;
 
-    /// Parse a whole document as a table. A TOML file always IS one, so this is
-    /// [`Value::from_str`] with the top-level shape already known.
+    /// Parse a whole document, which is always a table.
     fn from_str(s: &str) -> crate::Result<Self> {
         crate::from_str(s)
     }
 }
 
-/// `value["key"]` and `value[0]`, panicking when the shape or the key is wrong.
-///
-/// Use [`Value::get`] where a miss is expected. This exists because indexing is
-/// how asset and fixture code reads a document it has already decided is
-/// well-formed, and there a panic is the right answer.
+/// `value["key"]` and `value[0]`, panicking when the shape or the key is wrong: for code
+/// that has already decided the document is well-formed. [`Value::get`] is the fallible
+/// form.
 impl<I: Index> core::ops::Index<I> for Value {
     type Output = Value;
 
@@ -344,9 +334,8 @@ impl<I: Index> core::ops::Index<I> for Value {
 }
 
 impl fmt::Display for Value {
-    /// Prints the value as TOML: a table as a whole document, a scalar or array
-    /// as the value alone. Both are useful — the first for dumping a parsed
-    /// file, the second for putting a value in an error message.
+    /// Prints the value as TOML: a table as a whole document, a scalar or array as the
+    /// value alone.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let item = crate::ser::value_to_item(self).map_err(|_| fmt::Error)?;
         fmt::Display::fmt(&item, f)

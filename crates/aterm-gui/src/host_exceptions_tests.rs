@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOST'S OWN FACTS AS EXCEPTIONS (owner rules, 2026-09-28: an alert
-//! persists only where the owner can act, and it says why and what; a fact that
-//! mends itself is a record, and a line of "To look at" only once it has
-//! outlasted its horizon; full-automatic — nothing here blocks on a person).
+//! The host's own facts as exceptions: an alert persists only where the owner can act, and says
+//! why and what; a fact that mends itself is a record, and a "To look at" line only once it
+//! outlasts its horizon; nothing here blocks on a person.
 //!
-//! What is checked, per producer: the words pass the engine's door (90/90
-//! caps, one action, no waiting word, no restart word), the fact is a record
-//! when it begins and a digest line only when it goes on, its end takes the
-//! line away, and none of it marks a tab, seats a band row or re-grids a
+//! Per producer: the words pass the engine's door (90/90 caps, one action, no waiting word, no
+//! restart word), the fact is a record when it begins and a digest line only when it goes on,
+//! its end takes the line away, and none of it marks a tab, seats a band row or re-grids a
 //! window. The roster covers every entry the host can write.
 
 use std::time::{Duration, Instant};
@@ -616,11 +614,9 @@ fn a_removed_table_is_one_line_while_the_file_writes_it() {
     }
 }
 
-/// A FACT THAT MENDS ITSELF IS AN ENTRY ONLY ONCE IT HAS OUTLASTED ITS HORIZON:
-/// `except_after` holds the claim, raises it at its instant (the loop is told
-/// when: `messages_deadline`), and an end before then withdraws it with no line
-/// ever shown. NEGATIVE CONTROLS: the same fact re-asserted does not postpone
-/// itself, and a zero horizon is an entry at once.
+/// A self-mending fact is an entry only once it outlasts its horizon (`except_after`), and an
+/// end before then withdraws it unseen. Negative controls: re-asserting does not postpone it; a
+/// zero horizon is an entry at once.
 #[test]
 fn a_claim_ripens_at_its_horizon_and_an_end_withdraws_it() {
     let mut app = App::headless_for_test();
@@ -648,7 +644,7 @@ fn a_claim_ripens_at_its_horizon_and_an_end_withdraws_it() {
     let mut app = App::headless_for_test();
     app.except_after(&entry, Duration::ZERO);
     assert_eq!(app.messages.digest().len(), 1);
-    // A LEVEL family is refused, as `except` refuses it.
+    // A level family is refused, as `except` refuses it.
     let level = Entry::new(
         Family::Upgrade,
         "",
@@ -661,12 +657,9 @@ fn a_claim_ripens_at_its_horizon_and_an_end_withdraws_it() {
     assert!(app.ripening_deadline().is_none());
 }
 
-/// UPDATE HEALTH: a failing kind is a warning that folds into its record now,
-/// and one line of the digest (`update.review.<kind>`, never the record's
-/// `update.health.<kind>`) once the ledger's own streak has gone on a day —
-/// counted from the streak's start the body dates, so a process that begins on
-/// day six says it at once and a restart never begins the day again. The
-/// healing ends the line. NEGATIVE CONTROL: another kind's healing leaves it.
+/// A failing update kind is a record now and one `update.review.<kind>` line once its streak is
+/// a day old (dated from the body, so a process starting on day six says it at once). Healing
+/// ends it; a proof that only the check works does not.
 #[test]
 fn updates_failing_for_a_day_are_one_line_and_the_healing_ends_it() {
     let stamp = |ago: u64| {
@@ -722,8 +715,8 @@ fn updates_failing_for_a_day_are_one_line_and_the_healing_ends_it() {
     assert_eq!(app.messages.digest().len(), 1);
     assert!(!app.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, ""));
     assert!(app.messages.digest().is_empty(), "the ledger healed");
-    // An established streak keeps its original date, regardless of the month
-    // this test runs in. The relative six-day case above checks the age gate.
+    // An established streak keeps its original date whatever month this runs in (the six-day
+    // case above checks the age gate).
     let historical_body = "20 failed checks in a row since 2026-09-14T22:04:36Z: release \
                            manifests exist but cannot be downloaded.";
     let mut app = App::headless_for_test();
@@ -739,9 +732,8 @@ fn updates_failing_for_a_day_are_one_line_and_the_healing_ends_it() {
     );
 }
 
-/// `health_entry_delay` is the day less what the streak has already spent, never
-/// negative and never more than a day: a body with no readable start counts from
-/// now.
+/// `health_entry_delay` is the day less what the streak has spent, clamped to `0..=1 day`; a
+/// body with no readable start counts from now.
 #[test]
 fn the_entry_delay_is_the_day_less_the_streak_so_far() {
     let now = 1_790_640_000_i64;
@@ -765,9 +757,9 @@ fn the_entry_delay_is_the_day_less_the_streak_so_far() {
     assert_eq!(update_words::health_entry_delay(&dated(-3600), now), DAY);
 }
 
-/// A warning an older parent carried across an update crosses as its excerpt
-/// alone (`since Sep 28`), dated to the END of that day — never early — in the
-/// latest year whose day has begun. `now` is 2026-09-29T00:00:00Z.
+/// A warning an older parent carried across an update crosses as its excerpt alone
+/// (`since Sep 28`), dated to the end of that day in the latest year whose day has begun.
+/// `now` is 2026-09-29T00:00:00Z.
 #[test]
 fn a_carried_excerpt_dates_the_day_from_the_end_of_its_day() {
     let now = 1_790_640_000_i64;
@@ -818,8 +810,8 @@ fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     assert_eq!(records(&app), 1, "one record per episode");
     assert!(app.messages.digest().is_empty(), "not before the hour");
     let t0 = app.supervisor_failing["s-7"].first;
-    // It keeps failing: the latest failure is always within its pause and the
-    // half hour of the next. Fifty-five minutes on, still nothing.
+    // It keeps failing, each failure within its pause and the next half hour: still nothing
+    // a minute before the hour.
     app.supervisor_failing.get_mut("s-7").unwrap().last = t0 + Duration::from_secs(55 * 60);
     let _ = app.settle_messages(t0 + Duration::from_secs(59 * 60));
     assert!(app.messages.digest().is_empty(), "a minute early");
@@ -843,8 +835,7 @@ fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     assert!(app.messages.digest().is_empty());
     app.note_harness_host(failing("again"));
     assert_eq!(records(&app), 2);
-    // NEGATIVE CONTROL: it held for its pause and half an hour with no further
-    // failure — over, and never a line.
+    // Negative control: one that held for its pause and half an hour is over, never a line.
     let t1 = app.supervisor_failing["s-7"].first;
     let _ = app.settle_messages(t1 + pause + Duration::from_secs(31 * 60));
     assert!(
@@ -864,10 +855,8 @@ fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     assert!(app.messages.live_rows().count() == 0, "no band row");
 }
 
-/// A RATING CARD THE HARNESS WILL NOT PRESS: a record now, "press 0 in that tab"
-/// an hour on, gone with the card; never a tab mark. A survey the loop is still
-/// TRYING to close is a record and nothing more (a persisting "still trying" is
-/// the alert the rule forbids).
+/// A rating card the harness will not press: a record now, "press 0 in that tab" an hour on,
+/// gone with the card. A survey the loop is still trying to close is only a record.
 #[test]
 fn a_card_the_harness_will_not_press_is_a_record_then_a_line_after_an_hour() {
     let mut app = App::headless_for_test();
@@ -913,10 +902,8 @@ fn a_card_the_harness_will_not_press_is_a_record_then_a_line_after_an_hour() {
     assert!(app.messages.digest().is_empty(), "gone with the card");
 }
 
-/// THE VOLUME ATERM CANNOT HELP: two 6 h passes that freed nothing are one line
-/// (`disk.low`), the record says the figures and where the space is (the
-/// largest build directories aterm cannot reclaim), and space coming back
-/// ends it.
+/// Two 6 h passes that freed nothing are one `disk.low` line; the record names the figures and
+/// where the space is, and space coming back ends it.
 #[test]
 fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
     let mut app = App::headless_for_test();
@@ -952,8 +939,8 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
         1,
         "one record per episode"
     );
-    // WHERE THE SPACE IS: the line names the two largest build directories
-    // aterm cannot reclaim and what frees each; the record names every one.
+    // The line names the two largest build directories aterm cannot reclaim and what frees
+    // each; the record names every one.
     let detail = app.messages.digest().entries[0].detail.clone();
     assert!(
         detail.iter().any(|l| l.contains(&hogs[0])) && detail.iter().any(|l| l.contains(&hogs[1])),
@@ -1152,14 +1139,9 @@ fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
     assert!(app.messages.digest().is_empty());
 }
 
-/// A `[disk]` SETTING ATERM CANNOT READ, WHICH TURNED ITS CLEANUP OFF, IS ONE
-/// LINE AT ONCE (`disk.settings`, review 30): the look that says it again
-/// restates it and never doubles it, it names what was not read, and the look
-/// that reads the settings again ends it. A volume short while it holds is a
-/// low-disk line of its own form beside it (`disk.low-cleanup-off`): space
-/// back ends that line and leaves the setting's, and the settings read again
-/// end both, since aterm freeing nothing was that line's premise. NEGATIVE
-/// CONTROL: the settings read again leave the passes' `disk.low` standing.
+/// An unreadable `[disk]` setting that turned cleanup off is one `disk.settings` line until a
+/// look reads the settings; a short volume meanwhile is its own `disk.low-cleanup-off` line.
+/// Negative control: reading the settings leaves the passes' `disk.low` standing.
 #[test]
 fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
     let mut app = App::headless_for_test();
@@ -1229,7 +1211,7 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
     app.note_harness_host(HostNote::DiskSettingsRead);
     assert!(app.messages.digest().is_empty());
 
-    // NEGATIVE CONTROL: the passes' line is the volume's alone.
+    // Negative control: the passes' line is the volume's alone.
     app.note_harness_host(HostNote::DiskLow {
         free_gib: 2,
         floor_gib: 10,
@@ -1249,12 +1231,8 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
     assert!(app.messages.digest().is_empty(), "{:?}", keys(&app));
 }
 
-/// A SHORT VOLUME IS ONE LOW-DISK LINE, IN THE FORM OF THE RUN THAT TOLD IT
-/// (review 30): the cleanup-off form takes the place of the passes' line
-/// (the settings broke under a volume already short), and the passes' line
-/// takes the place of the cleanup-off form. Each form is recorded once. The
-/// passes' line giving way is not its cause ending: what the owner filed of
-/// it stays filed until space is back.
+/// A short volume is one low-disk line in the form last told (cleanup-off or the passes'), each
+/// form recorded once; a change of form keeps what the owner filed until space is back.
 #[test]
 fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
     let mut app = App::headless_for_test();
@@ -1292,9 +1270,8 @@ fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
         "each form once"
     );
 
-    // A CHANGE OF FORM IS NOT THE CAUSE ENDING: the volume never got space
-    // back, so the passes' line the owner filed stays filed through the
-    // cleanup-off form, and is quiet when passes tell it again.
+    // A change of form is not the cause ending: with no space back, the passes' line the owner
+    // filed stays filed through the cleanup-off form and is quiet when passes tell it again.
     let mut app = App::headless_for_test();
     app.note_harness_host(passes.clone());
     assert_eq!(app.dismiss_exceptions(), 1);
@@ -1308,17 +1285,15 @@ fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
         "{:?}: the owner's filing holds",
         keys(&app)
     );
-    // NEGATIVE CONTROL: space back is the cause ending, the filing is
-    // forgotten with it, and the next short volume is news.
+    // Negative control: space back ends the cause, the filing goes with it, and the next short
+    // volume is news.
     app.note_harness_host(HostNote::DiskPlenty);
     app.note_harness_host(passes);
     assert_eq!(keys(&app), [mr::DISK_LOW_KEY]);
 }
 
-/// THE UPGRADE THAT CANNOT RUN (its state folder cannot hold the lock) is the
-/// host's fact, `harness.upgrade-host.cannot-run`, in the classifier's words, at
-/// once; it ends when the LAST tab that could not run runs again (or its worker
-/// ends), and a pass over the upgrade's rows never ends it.
+/// An upgrade that cannot run is one `harness.upgrade-host.cannot-run` line, ended when the last
+/// such tab runs again (or its worker ends), never by a pass over the rows.
 #[test]
 fn an_upgrade_that_cannot_run_is_one_line_until_the_last_tab_runs_again() {
     let mut app = App::headless_for_test();
@@ -1608,8 +1583,8 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
         [notice::ACCOUNT_SIGNED_OUT.fill(Some("work-2"), None).todo]
     );
 
-    // The first signs in: the line is the next account's at once, in the
-    // window and in the log — a line of its own, the other one ended.
+    // The first signs in: the line is the next account's at once, in the window and the log,
+    // raised anew.
     assert_eq!(step(&mut app, listed(&["pool-a"])), [login("pool-a")]);
     assert_ne!(app.messages.digest().entries[0].id, id, "raised anew");
     assert_eq!(shown(&app), (false, vec!["pool-a"]));
@@ -1677,15 +1652,14 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     );
     // ...and under another account's name too: the fact is its identity.
     assert!(step(&mut app, listed(&["pool-a"])).is_empty());
-    // NEGATIVE CONTROL: everyone signed in ends the cause, the filing is
-    // forgotten with it, and the next account signed out is news.
+    // Negative control: everyone signed in ends the cause, the filing goes with it, and the
+    // next sign-out is news.
     assert!(step(&mut app, listed(&[])).is_empty());
     assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
 
-    // LINES AN EARLIER PROCESS LEFT OPEN, adopted from its log with none of
-    // its memory. The first note says another account than the adopted line's
-    // action (the owner signed `work-2` in while aterm was down): the line is
-    // this process's own words at once, not the log's.
+    // Lines an earlier process left open, adopted from its log with none of its memory. The
+    // first note names another account than the adopted line's action: the line is this
+    // process's own words at once.
     let adopting = || {
         use aterm_messages::{LogLine, MessageCenter, MessageLog};
         let mut earlier = App::headless_for_test();
@@ -1889,7 +1863,7 @@ fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends
         Some(resume_exception(ExceptionKind::Login)),
     );
     assert!(app.messages.digest().is_empty());
-    // Two tabs at a spend limit: ONE line; a third tab's cleared goal: another.
+    // Two tabs at a spend limit: one line; a third tab's cleared goal: another.
     told(
         &mut app,
         "s-1",
@@ -1947,14 +1921,9 @@ fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends
     assert!(app.messages.digest().is_empty());
 }
 
-/// A TAB'S RELAUNCH, BY THE OWNER'S RULE (2026-09-28: an alert persists only
-/// where the owner can act, and says why and what). A relaunch that keeps
-/// failing is a record and, for a cause a person clears, a line only after an
-/// hour; the owner's own `[harness] relaunch = false` is a record; an agent that
-/// cannot be brought back is the tab's mark when a command is known (a record
-/// here) and one line of the digest when not; and an agent running again ends
-/// every line. NEGATIVE CONTROL: a failure the retry gets past alone is never a
-/// line, whatever its age.
+/// A failing relaunch is a record, and a line only after an hour for a cause a person clears;
+/// `relaunch = false` is a record; an agent that cannot come back is the tab's mark when its
+/// command is known, else one line; the agent running again ends every line.
 #[test]
 fn a_relaunch_is_a_record_and_only_what_a_person_alone_can_mend_is_a_line() {
     let mut app = App::headless_for_test();
@@ -2137,10 +2106,9 @@ fn a_relaunch_is_a_record_and_only_what_a_person_alone_can_mend_is_a_line() {
     assert_eq!(app.messages.digest().entries.len(), 1, "Ended leaves it");
 }
 
-/// The sid of the front tab of a headless App, which the store now knows the
-/// front session by. A REAL-LENGTH one (22 characters, as `aterm ctl ls` prints
-/// them): its digest keys are shortened to the key cap, which is the shape the
-/// host's closed-tab and adoption decisions must work on.
+/// The sid of a headless App's front tab, registered in the store at real length (22
+/// characters, as `aterm ctl ls` prints): its digest keys are shortened to the key cap, the
+/// shape the closed-tab and adoption decisions work on.
 fn front_tab_sid(app: &mut App) -> String {
     let local = app
         .focused_session_id(crate::WindowId(0))
@@ -2454,9 +2422,8 @@ fn a_told_relaunch_mark_alone_ends_with_its_tab_and_nothing_else_moves() {
     assert_eq!(app.messages.digest_revision(), digest_before);
 }
 
-/// A RELAUNCH LINE AN EARLIER PROCESS LEFT is ended by the adoption sweep unless
-/// this process's own worker told of it; one this process told of stands. Short
-/// ids and real-length ones (whose keys carry a shortened subject).
+/// A relaunch line an earlier process left is ended by the adoption sweep unless this process's
+/// worker told of it, for short and real-length ids (whose keys carry a shortened subject).
 #[test]
 fn the_adoption_sweep_ends_relaunch_lines_this_process_did_not_tell() {
     for (old, told) in [("s-old", "s-told"), ("s-1a2b3c4d5e6f708192a3", REAL_SID)] {
@@ -3020,11 +2987,115 @@ fn a_carried_notice_told_again_closes_fixed_when_the_login_is_back() {
     }
 }
 
-/// A LINE AN EARLIER PROCESS LEFT OPEN for a resume exception no loop of this
-/// one tells of ends with the first whole answer after the settle: the family
-/// is a level family, and a level family that is never asked would keep it for
-/// the 14-day expiry. NEGATIVE CONTROL: before the settle nothing is asked, and a
-/// line a loop of this process does tell of stands.
+/// A USAGE LIMIT'S RECORD CLOSES AS THE SWITCH IT WAS, NEVER AS A LOGIN BACK
+/// (the review of the login carry, r8c-7: once a move onto another account
+/// landed, every usage limit's record in Settings ▸ Messages read `Claude's
+/// login is back`, though no login was lost): the host's login-back note
+/// closes the story in its notice's own fix words, its row still standing or
+/// already withdrawn. NEGATIVE CONTROL: a lost login's record closes as its
+/// login back.
+#[test]
+fn a_usage_limits_record_closes_as_a_switch_never_as_a_login_back() {
+    for (text, words) in [
+        (&notice::LIMIT_RENEW, notice::SWITCHED),
+        (&notice::LIMIT_ROSTER, notice::SWITCHED),
+        (&notice::LOGIN_SIGN_IN, notice::BACK),
+    ] {
+        for withdrawn in [false, true] {
+            let mut app = App::headless_for_test();
+            tell_notice(&mut app, "s-1", Some(text));
+            let key = mr::notice_ask_key("s-1", Some(text.code));
+            let id = app.messages.live_by_key(&key).expect("the ask").id;
+            if withdrawn {
+                tell_notice(&mut app, "s-1", None);
+            }
+            app.note_harness_host(HostNote::LoginBack {
+                sid: "s-1".to_string(),
+            });
+            let rec = app.messages.log().get(id).expect("its record");
+            assert_eq!(
+                rec.retired(),
+                Some(&aterm_messages::Retired::Resolved(
+                    aterm_messages::Outcome::Ok
+                )),
+                "{}: {rec:?}",
+                text.id
+            );
+            assert!(
+                rec.title.starts_with(words),
+                "{} (withdrawn {withdrawn}): {:?}",
+                text.id,
+                rec.title
+            );
+            assert_eq!(
+                rec.title.starts_with(notice::BACK),
+                words == notice::BACK,
+                "{}: {:?}",
+                text.id,
+                rec.title
+            );
+        }
+    }
+}
+
+/// A USAGE LIMIT THAT ENDED BY ITSELF CLOSES AS NO SWITCH (the review of
+/// the login carry, r9h-3): the row withdrawn and the story kept whatever
+/// ended the ask, a login back told later — a lost login's, an account move
+/// days on — closed the limit's record `Claude switched accounts`, though
+/// its reset had ended it. The loop's word that the limit ended with no
+/// sign-in that took ([`HostNote::LimitOver`], told at the fold, before the
+/// point's exception) ends the story unfixed; and a story with no word for
+/// its span is over though no loop said so, so a login back after it fixes
+/// nothing either. NEGATIVE CONTROL: withdrawn as its point moved on (the
+/// owner's `/login` dialog over it), inside its span, the login back closes
+/// it as the switch.
+#[test]
+fn a_usage_limit_that_ended_by_itself_closes_as_no_switch() {
+    use crate::exceptions_host::NOTICE_STORY_SPAN;
+    let span = u64::try_from(NOTICE_STORY_SPAN.as_millis()).unwrap();
+    for end in ["moved-on", "limit-over", "past-span"] {
+        let mut app = App::headless_for_test();
+        tell_notice(&mut app, "s-1", Some(&notice::LIMIT_ROSTER));
+        let key = mr::notice_ask_key("s-1", Some(notice::LIMIT_ROSTER.code));
+        let id = app.messages.live_by_key(&key).expect("the ask").id;
+        if end == "limit-over" {
+            app.note_harness_host(HostNote::LimitOver {
+                sid: "s-1".to_string(),
+            });
+        }
+        tell_notice(&mut app, "s-1", None);
+        if end == "past-span" {
+            let story = app.resume_stories.get_mut("s-1").expect("its story");
+            story.last = story.last.saturating_sub(span);
+        }
+        app.note_harness_host(HostNote::LoginBack {
+            sid: "s-1".to_string(),
+        });
+        let rec = app.messages.log().get(id).expect("its record");
+        if end == "moved-on" {
+            assert_eq!(
+                rec.retired(),
+                Some(&aterm_messages::Retired::Resolved(
+                    aterm_messages::Outcome::Ok
+                )),
+                "{end}: {rec:?}"
+            );
+            assert!(rec.title.starts_with(notice::SWITCHED), "{end}: {rec:?}");
+        } else {
+            assert_eq!(
+                rec.retired(),
+                Some(&aterm_messages::Retired::Withdrawn),
+                "{end}: {rec:?}"
+            );
+            assert!(!rec.title.starts_with(notice::SWITCHED), "{end}: {rec:?}");
+        }
+        assert!(!app.resume_stories.contains_key("s-1"), "{end}: over");
+    }
+}
+
+/// A resume line an earlier process left open, which no loop here tells of, ends with the first
+/// whole answer after the settle. Negative controls: before the settle, or while told of, it
+/// stands.
 #[test]
 fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
     let mut app = App::headless_for_test();
@@ -3058,9 +3129,9 @@ fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
     assert_eq!(app.messages.digest().len(), 1, "still told of");
 }
 
-/// The pure half: the same kind in two tabs is ONE entry whose title counts the
-/// tabs and whose detail names them, one tab keeps its own place and its `Show
-/// tab` button, and a lost login (`Now`) is no entry at all.
+/// The pure half: the same kind in two tabs is one entry whose title counts the tabs and whose
+/// detail names them, one tab keeps its own place and its `Show tab` button, and a lost login
+/// (`Now`) is no entry at all.
 #[test]
 fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
     let spot = |n: u16| mr::UpgradeSpot {
@@ -3137,11 +3208,9 @@ fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
     );
 }
 
-/// THE STALL CANARY'S 90-MINUTE RUNG is a record and one `aterm.log` error, once
-/// per episode, and never a line of the digest and never a mark on a tab: the
-/// digest waits for the third hour ([`ExceptionKind::Stalled`]). Its end lets the
-/// next episode be told again. NEGATIVE CONTROL: the same episode told twice
-/// records once.
+/// The stall canary's 90-minute rung is one record and one `aterm.log` error per episode, never
+/// a digest line or a tab mark (the digest waits for the third hour,
+/// [`ExceptionKind::Stalled`]); its end lets the next episode be told.
 #[test]
 fn a_stall_at_ninety_minutes_is_a_record_once_and_no_line() {
     let mut app = App::headless_for_test();
@@ -3429,9 +3498,8 @@ fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
     assert_eq!(message_regrids(), message);
 }
 
-/// A pool session the store knows (so `render.<sid>.unrepaired` can name it),
-/// with its timeline holding an OPEN, at-risk render epoch (the engine owes a
-/// row: the synthetic epoch of a restored engine), and the sid it goes by.
+/// A pool session the store knows (so `render.<sid>.unrepaired` can name it) whose timeline
+/// holds an open, at-risk render epoch (a restored engine's synthetic epoch), and its sid.
 fn session_with_open_epoch(app: &mut App, local: u64) -> (u64, String) {
     use crate::resize_ledger::EngineProbe;
     let session = crate::stub_session(local);
@@ -3465,9 +3533,7 @@ fn session_with_open_epoch(app: &mut App, local: u64) -> (u64, String) {
     (local, sid)
 }
 
-/// THE LINE STANDS WHILE THE EPOCH IS AT RISK, and ends when it heals: a bug
-/// that made the line flash and vanish at the next nudge step would end the
-/// first half; one that never ended it, the second.
+/// A render line stands through every nudge step while its epoch is at risk.
 #[test]
 fn a_render_line_stands_while_its_epoch_is_at_risk_and_ends_when_it_heals() {
     let mut app = App::headless_for_test();
@@ -3507,8 +3573,8 @@ fn a_render_line_stands_while_its_epoch_is_at_risk_and_ends_when_it_heals() {
     assert!(app.messages.digest().is_empty(), "healed: the line ends");
 }
 
-/// AN ADOPTION NUDGE (a blank agent tab) names no epoch of the ledger, so it is
-/// a log line and never a digest line that would flash for one loop turn.
+/// An adoption nudge (a blank agent tab) names no epoch of the ledger, so it is a log line,
+/// never a digest line that would flash for one loop turn.
 #[test]
 fn an_adoption_nudge_that_gave_up_raises_no_digest_line() {
     let mut app = App::headless_for_test();
@@ -3564,8 +3630,8 @@ fn the_ends_of_the_event_families_end_lines_an_earlier_process_raised() {
     assert!(left.is_empty(), "STALE after the end events: {left:?}");
 }
 
-/// A render line whose epoch this process holds AT RISK is not an orphan: the
-/// adoption sweep of `check_render_repairs` leaves it to its epoch.
+/// A render line whose epoch this process holds at risk is not an orphan: the adoption sweep of
+/// `check_render_repairs` leaves it to its epoch.
 #[test]
 fn an_adopted_render_line_ends_but_a_held_one_stands() {
     let mut app = App::headless_for_test();
@@ -3582,12 +3648,9 @@ fn an_adopted_render_line_ends_but_a_held_one_stands() {
     assert_eq!(app.messages.digest().len(), 1, "held: stands");
 }
 
-/// The supervisor lines an earlier process left, that this one has heard
-/// nothing of for its steady time, end; the ones it holds stand. Run for short
-/// ids AND real-length ones (22 characters): a real id does not fit a digest
-/// key, so the key carries a shortened subject, and the sweep must still tell
-/// the line this process holds from the one it does not (review of 2026-09-29:
-/// it read the id back out of the key).
+/// The supervisor lines an earlier process left that this one has heard nothing of for its
+/// steady time end; the ones it holds stand. Run for short and real-length ids: a real id does
+/// not fit a digest key, so the sweep must match the shortened subject.
 #[test]
 fn the_adoption_sweep_ends_supervisor_lines_nothing_has_told_of() {
     for (old, held) in [("s-old", "s-held"), ("s-1a2b3c4d5e6f708192a3", REAL_SID)] {
@@ -3624,9 +3687,9 @@ fn the_adoption_sweep_ends_supervisor_lines_nothing_has_told_of() {
     }
 }
 
-/// THE FULL DISK ACCESS CARD, in the order it is used: the owner presses the
-/// button (`Answered`), the probe then reads the grant, and the regression after
-/// the NEXT update must be news again.
+/// The Full Disk Access card, in the order it is used: the owner presses the button
+/// (`Answered`), the probe then reads the grant, and the regression after the next update is
+/// news again.
 #[test]
 fn a_verified_grant_after_the_owners_answer_makes_the_next_regression_news() {
     use aterm_messages::ActionIndex;
@@ -3659,14 +3722,9 @@ fn a_verified_grant_after_the_owners_answer_makes_the_next_regression_news() {
     );
 }
 
-/// FOREIGN TOOLS REACH THE OWNER (audit 2026-10-09: a foreign rustup `trust` link
-/// and a managed tool shadowed on PATH were prose 30-odd passes printed — `atpkg said:
-/// … not aterm's link; left untouched (fix: …)`, `trust: managed 9192 — SHADOWED by
-/// ~/.local/bin/trustdoc` — logged at INFO, in neither messages.log nor `aterm
-/// exceptions`). atpkg's `foreign:` lines go through the stdout parser into ONE
-/// digest entry per look carrying atpkg's fix, re-said by every pass as the same
-/// entry, and ended by that look's first report that sees nothing — the other look's
-/// entry untouched. NEGATIVE CONTROL: a scope this build cannot read changes nothing.
+/// atpkg's `foreign:` lines (a foreign rustup `trust` link, a managed tool shadowed on PATH) are
+/// one entry per look carrying atpkg's fix, re-said as the same entry and ended by that look's
+/// first report that sees nothing.
 #[test]
 fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none() {
     use atpkg::cli::{FOREIGN_MARKER, FOREIGN_NONE, FOREIGN_PATH, FOREIGN_SEAM};
@@ -3720,7 +3778,7 @@ fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none(
     feed(&mut app, &seam);
     feed(&mut app, &path);
     assert_eq!(app.messages.digest_revision(), revision, "no news");
-    // NEGATIVE CONTROL: a scope this build cannot read changes nothing.
+    // Negative control: a scope this build cannot read changes nothing.
     feed(
         &mut app,
         &format!("atpkg: {FOREIGN_MARKER}elsewhere {FOREIGN_NONE}"),
@@ -3736,8 +3794,8 @@ fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none(
     );
     feed(&mut app, &none(FOREIGN_PATH));
     assert!(app.messages.digest().is_empty());
-    // An item naming no fix is no exception (review of 2026-10-09): the entry's step
-    // says to fix each line as it says, and that line would name nothing.
+    // An item naming no fix is no exception: the entry's step says to fix each line as it
+    // says, and that line would name nothing.
     feed(
         &mut app,
         &format!("atpkg: {FOREIGN_MARKER}{FOREIGN_PATH} gh /u/.local/bin/gh"),

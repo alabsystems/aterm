@@ -1,15 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Terminal grid facade.
-//!
-//! `Grid`, `GridStorage`, `MaterializedRow` and the `impl Grid` methods live in
-//! `aterm-grid`. This module re-exports them and provides import paths for leaf
-//! types and FFI/test shims.
-
-// ============================================================================
-// Leaf-type facade modules
-// ============================================================================
+//! Terminal grid facade: re-exports `aterm-grid`'s `Grid` and its leaf types under the
+//! module paths aterm-core callers use.
 
 /// Packed cell representation (8 bytes). Re-exported from `aterm-grid`.
 pub mod cell {
@@ -54,28 +47,21 @@ pub mod extra_collection {
     pub use aterm_grid::extra_collection::CellExtras;
 }
 
-// ============================================================================
-// Grid ownership — re-exported from aterm-grid
-// ============================================================================
-
 pub use aterm_grid::grid::Grid;
 pub use aterm_grid::grid::{MaterializedRow, materialize_from_line, stored_line_cells};
 
-// The scrollback-reflow offload job types appear in
-// `Terminal::resize_offloading_scrollback`'s public signature; hosts that hold
-// the job across calls (the wasm modules' cooperative offload) name them here
-// without a direct aterm-grid dependency.
+// In `Terminal::resize_offloading_scrollback`'s signature: hosts holding the job across calls
+// (the wasm modules' cooperative offload) name them without an aterm-grid dependency.
 pub use aterm_grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
-// The host-repaint policy `Terminal::resize_with_policy` takes; the GUI picks it
-// per session from the PTY backend (ConPTY on Windows).
+// The host-repaint policy `Terminal::resize_with_policy` takes; the GUI picks it per session
+// from the PTY backend (ConPTY on Windows).
 pub use aterm_grid::grid::reflow::ResizePolicy;
 // The resize law a recording names (`aterm_resize_undo`), which `cast drift`
 // replays it under (`Terminal::set_resize_law`).
 pub use aterm_grid::ResizeLaw;
 
-// The seamless update's history carry (`Terminal::history_fence` and the
-// import). The fence and the built history cross threads and crates in the
-// host (`aterm-gui`'s handoff), which names them from here.
+// The seamless update's history carry (`Terminal::history_fence` and the import), named from
+// here by the host's handoff (`aterm-gui`).
 pub use aterm_grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
@@ -92,10 +78,9 @@ pub use row::{LineSize, Row, RowFlags};
 
 pub use aterm_grid::{CurrentStyle, Cursor, SavedCursor, SavedCursorState};
 
-// Grid dimension ingress bounds (§5.8): constructors and resize clamp to these.
+// Grid dimension bounds: constructors and resize clamp to these.
 pub use aterm_grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
-// The every-8 default tab stop: a host carrying stops compactly names the
-// default by the grid's own rule.
+// The every-8 default tab stop, so a host carrying stops compactly uses the grid's own rule.
 pub use aterm_grid::is_default_tab_stop;
 
 pub(crate) use aterm_grid::row_u16;

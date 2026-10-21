@@ -46,18 +46,14 @@ const PRESS_CUSTODY_ACTIONS: &[&str] = &[
 /// Assert one machine's per-step execution evidence and return the derived summary of
 /// what it does and does not discriminate.
 ///
-/// String coverage only proves each action name is claimed by some anchor, not that the
-/// anchor sits on a function that runs. So the conformance opens a one-step window per
-/// step (`aterm_spec::xref::StepEvidence::step`) and this requires each action's
-/// anchored function to be entered by every window driving that action
-/// (`StepAudit::blind_steps`), and, conversely, no anchored function to be entered by a
+/// String coverage only proves each action name is claimed by some anchor. The
+/// conformance opens a one-step window per step (`aterm_spec::xref::StepEvidence::step`);
+/// this requires each action's anchored function to be entered by every window driving
+/// that action (`StepAudit::blind_steps`) and no anchored function to be entered by a
 /// window driving an action it does not claim (`StepAudit::stray`), which discriminates
-/// inside a `Terminal::process` batch.
-///
-/// Residual, printed in the summary: a function whose entry pattern exactly matches its
-/// claimed actions is indistinguishable from the right seam (`interchangeable` is a
-/// lower bound), and labels on one function can be permuted unobservably. The derived
-/// figures are not a quality score.
+/// inside a `Terminal::process` batch. Residual, printed in the summary: a function whose
+/// entry pattern exactly matches its claimed actions is indistinguishable from the right
+/// seam, and labels on one function can be permuted unobservably.
 ///
 /// Applied to `SelectionCustody` and `PressCustody` only; every other anchored machine
 /// has the string coverage of aterm-models' closure.
@@ -124,11 +120,9 @@ fn assert_step_evidence(
         audit.witnessed_steps,
         audit.steps,
     );
-    // The and, not the OR. `unwitnessed` above passes an action on any one of its
-    // windows, so `Evict` — driven by three steps — was checked on one and unchecked
-    // on two. This requires every window to have entered its own action's function,
-    // which is what stops a step from quietly dropping out of the evidence by being
-    // driven outside `ev.step` while a sibling step still carries the action.
+    // `unwitnessed` passes an action on any one of its windows; this requires every
+    // window to have entered its own action's function, so a step driven outside
+    // `ev.step` cannot drop out of the evidence while a sibling step carries the action.
     assert!(
         audit.blind_steps.is_empty(),
         "{machine}: step window(s) that did NOT enter their own action's annotated \

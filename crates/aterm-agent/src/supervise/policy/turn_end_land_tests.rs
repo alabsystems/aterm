@@ -76,9 +76,21 @@ fn land_reads_the_defense_table_as_labelled() {
 /// of [`LAND_FAMILIES`] taken out, some OPEN defense of the table lands —
 /// so no family is dead weight, and none can be dropped without the table
 /// saying which defense it would let through.
+///
+/// A defense can land without a family only where that family read
+/// something in it, so each family's search reads first the OPEN rows that
+/// spell one of its rows, then every other OPEN row: the same rows, the
+/// likely ones first, and each read is Land's whole reading.
 #[test]
 fn every_land_family_is_load_bearing() {
-    let rows = land_table();
+    // What landing asks of a row apart from the families, read once a row.
+    let open: Vec<(String, String)> = land_table()
+        .into_iter()
+        .filter(|(open, reply)| {
+            *open && needs::defense_line(reply).is_some() && needs::needs_you(reply).is_empty()
+        })
+        .map(|(_, reply)| (reply.to_lowercase(), needs::defense_body(&reply)))
+        .collect();
     for (skip, dropped) in LAND_FAMILIES.iter().enumerate() {
         let families: Vec<LandFamily> = LAND_FAMILIES
             .iter()
@@ -86,13 +98,13 @@ fn every_land_family_is_load_bearing() {
             .filter(|&(k, _)| k != skip)
             .map(|(_, f)| *f)
             .collect();
-        let lands = |reply: &str| {
-            needs::defense_line(reply).is_some()
-                && needs::needs_you(reply).is_empty()
-                && open_work_read(&needs::defense_body(reply), Some(&families)).is_empty()
-        };
+        let spells = |lower: &str| dropped.rows.iter().any(|row| lower.contains(row));
+        let (named, rest): (Vec<_>, Vec<_>) = open.iter().partition(|(lower, _)| spells(lower));
         assert!(
-            rows.iter().any(|(open, reply)| *open && lands(reply)),
+            named
+                .into_iter()
+                .chain(rest)
+                .any(|(_, body)| open_work_read(body, Some(&families)).is_empty()),
             "the {:?} family reads no OPEN row alone",
             dropped.name
         );
@@ -203,4 +215,68 @@ fn a_need_however_headed_holds_the_landing() {
         let reply = format!("{none}\n{defense}");
         assert!(clean_defense(Some(&reply)), "{reply:?}");
     }
+}
+
+/// A HOLDOUT, MEASURED (a tool, not a check): Land's whole reading of every
+/// case of the file `ATERM_LAND_HOLDOUT` names, or of round 3's blind holdout
+/// (`fixtures/land-holdout-2026-10-20.tsv`, ATERM-KI-1020-2) where it names
+/// none: one case a line, `label<TAB>id<TAB>prov<TAB>source<TAB>reply` (`#`
+/// lines skipped, a literal `\n` a line break; a label is `open`, `clean` or
+/// `debatable`). It prints each false landing (an open case read clean), each
+/// false non-landing (a clean case read open, with the words read) and how
+/// each debatable case read, then the counts. It judges nothing: a holdout
+/// that a test held to zero would be a table.
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture; ATERM_LAND_HOLDOUT names another holdout"]
+fn land_reads_a_holdout() {
+    let text = std::env::var_os("ATERM_LAND_HOLDOUT").map_or_else(
+        || include_str!("fixtures/land-holdout-2026-10-20.tsv").to_string(),
+        |path| std::fs::read_to_string(&path).expect("the holdout reads"),
+    );
+    let (mut opens, mut cleans, mut debatable) = (0, 0, 0);
+    let (mut landed, mut nudged) = (Vec::new(), Vec::new());
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+    {
+        let cols: Vec<&str> = line.splitn(5, '\t').collect();
+        let [label, id, prov, _, reply] = cols[..] else {
+            panic!("a case needs five columns: {line:?}");
+        };
+        let reply = reply.replace("\\n", "\n");
+        let clean = clean_defense(Some(&reply));
+        let words = land_open_words(Some(&reply));
+        let needs = needs::needs_you(&reply);
+        match label {
+            "open" => {
+                opens += 1;
+                if clean {
+                    landed.push(format!("{id} ({prov}) {reply:?}"));
+                }
+            }
+            "clean" => {
+                cleans += 1;
+                if !clean {
+                    nudged.push(format!("{id} ({prov}) {words:?} {needs:?} {reply:?}"));
+                }
+            }
+            "debatable" => {
+                debatable += 1;
+                println!("DEBATABLE {id} lands={clean} {words:?} {needs:?}");
+            }
+            _ => panic!("unknown label {label:?}"),
+        }
+    }
+    for l in &landed {
+        println!("FALSE LANDING {l}");
+    }
+    for n in &nudged {
+        println!("FALSE NON-LANDING {n}");
+    }
+    println!(
+        "holdout: {opens} open, {cleans} clean, {debatable} debatable: {} false landings, {} \
+         false non-landings",
+        landed.len(),
+        nudged.len()
+    );
 }

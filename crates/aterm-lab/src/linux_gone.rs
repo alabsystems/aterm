@@ -27,8 +27,13 @@
 //! oracle weston's mid-resize row also holds the fix that incident needed:
 //! aterm-gui must say the resize's surface configure was rejected, the
 //! scope's catch ([`SCOPED`]), or the row did not test it ([`scope_held`]).
+//! An X11 display dies at a third ([`End::MidCapture`]): mid-resize on a turn
+//! that owes the crash journal its capture, so the capture asks the window's
+//! position (`XTranslateCoordinates`, which upstream's X11 backend unwrapped)
+//! of a connection that broke before the loop looked at it, the panic the
+//! proof of 2026-10-20 found (X11-GONE).
 //!
-//! The third row per display is their control: the display stays up and the
+//! The last row per display is their control: the display stays up and the
 //! person quits (`invoke Quit`, the menu's Quit). That end is the person's
 //! choice, so it must exit 0, say nothing about the display, and still save
 //! the layout: only a dead display connection may take the logout's way out.
@@ -36,7 +41,7 @@
 use std::path::Path;
 
 use crate::linux_guest::{self as guest, Display};
-use crate::linux_proof::{Gui, Verdict, field, reply};
+use crate::linux_proof::{Gui, Verdict, field};
 
 /// The displays a proof kills under aterm-gui: X11's and Wayland's, one
 /// server each.
@@ -67,6 +72,14 @@ pub const SCOPED: &str = "configure was rejected";
 /// Rust's exit status for a panic that unwound out of `main`.
 const PANIC_EXIT: i32 = 101;
 
+/// How long the mid-capture row leaves aterm-gui alone before it freezes the
+/// server ([`End::MidCapture`]): three of aterm-gui's crash journal write
+/// intervals (`crash_journal::MIN_WRITE_INTERVAL`, 2 s) and one more second,
+/// time for the capture the row's last wake (`status`) owed and the settling
+/// one after it. Then no capture is owed and none was taken within the
+/// interval, so the next wake that moves anything owes one due at once.
+const CAPTURE_QUIET: std::time::Duration = std::time::Duration::from_secs(7);
+
 /// How a row ends aterm-gui's run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
@@ -77,18 +90,29 @@ pub enum End {
     /// 100` sent, and the server killed once aterm-gui's requests wait unread
     /// in its socket.
     MidResize,
+    /// The display killed mid-capture (X11 only, [`End::applies`]): as
+    /// mid-resize, with aterm-gui left alone first ([`CAPTURE_QUIET`]) so the
+    /// resize's wake owes the crash journal a capture due on its own turn.
+    /// That turn's requests fail once the server dies, and the capture asks
+    /// the window's position (`XTranslateCoordinates`) before the loop's next
+    /// look ends the run, as on the proof of 2026-10-20, where upstream's
+    /// unwrap panicked. Mid-resize itself freezes the server right after the
+    /// row's `status`, within the write interval of the capture before it, so
+    /// its turn has none due and the run ends at the loop's look.
+    MidCapture,
     /// The display left up, and the person quits (`invoke Quit`).
     Quit,
 }
 
 impl End {
-    pub const ALL: [End; 3] = [End::AtRest, End::MidResize, End::Quit];
+    pub const ALL: [End; 4] = [End::AtRest, End::MidResize, End::MidCapture, End::Quit];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             End::AtRest => "display gone at rest",
             End::MidResize => "display gone mid-resize",
+            End::MidCapture => "display gone mid-capture",
             End::Quit => "a person's quit",
         }
     }
@@ -99,6 +123,7 @@ impl End {
         match self {
             End::AtRest => "rest",
             End::MidResize => "resize",
+            End::MidCapture => "capture",
             End::Quit => "quit",
         }
     }
@@ -106,9 +131,19 @@ impl End {
     /// What ended the run, for a line that says aterm-gui outlived it.
     const fn cause(self) -> &'static str {
         match self {
-            End::AtRest | End::MidResize => "its display died",
+            End::AtRest | End::MidResize | End::MidCapture => "its display died",
             End::Quit => "the person's quit",
         }
+    }
+
+    /// Whether this end is a row under `display`: the capture's only where
+    /// asking a window's position is a round trip, X11. A Wayland client
+    /// cannot ask its position (`outer_position` is not supported there), so
+    /// a capture asks the compositor nothing and the row would have no
+    /// request to wait on.
+    #[must_use]
+    pub fn applies(self, display: Display) -> bool {
+        self != End::MidCapture || display.protocol() == "X11"
     }
 }
 
@@ -128,6 +163,9 @@ pub struct Evidence {
     pub journals: Option<Vec<String>>,
     /// The folder the shell reported, which the saved layout must name.
     pub folder: String,
+    /// What the frozen server held unread from aterm-gui when it was killed
+    /// mid-capture (`ss`'s Recv-Q, [`guest::unread_bytes`]), for the record.
+    pub unread: Option<String>,
 }
 
 /// Whether a row's dead display must show the wgpu arm's scoped surface
@@ -235,8 +273,11 @@ pub fn judge(e: &Evidence, end: End, scoped: bool) -> Result<String, String> {
             journals.join(", ")
         ));
     }
+    let unread = e.unread.as_deref().map_or(String::new(), |u| {
+        format!("; the server held {u} unread at its kill")
+    });
     Ok(format!(
-        "exit {code}; said {why}; session.toml holds {}; no crash journal left",
+        "exit {code}; said {why}; session.toml holds {}; no crash journal left{unread}",
         e.folder
     ))
 }
@@ -310,29 +351,16 @@ fn run(
     if !gui.up.sh(&guest::wait_socket(&gui.sock(), 60)).ok() {
         return Err("the control socket never listened (60 s)".into());
     }
-    let expect = |verb: &[&str], ok: &dyn Fn(&str) -> bool| -> Result<String, String> {
-        let out = gui.ctl(verb);
-        let r = reply(&out.text).to_string();
-        if out.ok() && ok(&r) {
-            Ok(r)
-        } else {
-            Err(format!(
-                "`{}` answered {:?}",
-                verb.join(" "),
-                crate::util::one_line(&r, 200)
-            ))
-        }
-    };
-    expect(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
-    expect(&["send", TYPED], &|r| r.starts_with("OK"))?;
-    expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
-    expect(&["await", "match", ECHO, "timeout=60000"], &|r| {
+    gui.expect(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
+    gui.expect(&["send", TYPED], &|r| r.starts_with("OK"))?;
+    gui.expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
+    gui.expect(&["await", "match", ECHO, "timeout=60000"], &|r| {
         r.starts_with("OK match")
     })?;
     // A frame on glass before the kill, so the dead connection meets a live
     // swapchain (the case the lane panicked in), not a window never drawn.
-    expect(&["status"], &|r| field(r, "render") == Some("ok"))?;
-    let units = display.units(&gui.up.runtime);
+    gui.expect(&["status"], &|r| field(r, "render") == Some("ok"))?;
+    let units = display.units(&gui.up.runtime, gui.up.config()?);
     let signal = |signal: &str| -> Result<(), String> {
         for unit in units.iter().rev() {
             let sent = gui.up.sh(&guest::signal_unit(&unit.name, signal));
@@ -348,9 +376,18 @@ fn run(
     };
     if end == End::Quit {
         // The menu's Quit, as a person chooses it; the display stays up.
-        expect(&["invoke", "Quit"], &|r| r.starts_with("OK"))?;
+        gui.expect(&["invoke", "Quit"], &|r| r.starts_with("OK"))?;
     }
-    if end == End::MidResize {
+    // The client talks to the display's own server, the last started.
+    let server = units.last().map_or("", |u| u.name.as_str());
+    let mut unread = String::new();
+    if matches!(end, End::MidResize | End::MidCapture) {
+        if end == End::MidCapture {
+            // Quiet until the captures the row's own wakes owed are taken and
+            // the write interval has run out, so the resize's wake owes one
+            // due on its own turn.
+            std::thread::sleep(CAPTURE_QUIET);
+        }
         signal("SIGSTOP")?;
         // Its reply waits on the frozen server, so it runs as a unit of its own.
         let resize = guest::Unit {
@@ -363,12 +400,18 @@ fn run(
         if !started.ok() {
             return Err(format!("could not send the resize: {}", started.tail(3)));
         }
-        // The client talks to the display's own server, the last started.
-        let server = units.last().map_or("", |u| u.name.as_str());
         if !gui.up.sh(&guest::wait_unread(server, 60)).ok() {
             return Err(format!(
                 "aterm-gui sent the frozen {server} nothing for the resize (60 s)"
             ));
+        }
+        if end == End::MidCapture {
+            unread = gui
+                .up
+                .sh(&guest::unread_bytes(server))
+                .text
+                .trim()
+                .to_string();
         }
     }
     if end != End::Quit {
@@ -401,6 +444,7 @@ fn run(
                 .collect()
         }),
         folder: folder.to_string(),
+        unread: (!unread.is_empty()).then_some(unread),
     })
 }
 
@@ -422,6 +466,7 @@ mod tests {
             session: Some(format!("[[windows]]\ncwd = \"{FOLDER_PATH}\"\n")),
             journals: Some(Vec::new()),
             folder: FOLDER_PATH.into(),
+            unread: None,
         }
     }
 
@@ -436,7 +481,7 @@ mod tests {
 
     #[test]
     fn an_orderly_end_passes() {
-        for end in [End::AtRest, End::MidResize] {
+        for end in [End::AtRest, End::MidResize, End::MidCapture] {
             let detail = judge(&orderly(), end, false).expect("passes");
             assert!(detail.starts_with("exit 69;"), "{detail}");
         }
@@ -576,6 +621,45 @@ mod tests {
         // A row `scope_held` leaves out passes on the exit and the line alone.
         assert!(judge(&orderly(), End::MidResize, false).is_ok());
         assert!(judge(&orderly(), End::AtRest, false).is_ok());
+    }
+
+    /// The capture's row is X11's alone: a Wayland client asks the
+    /// compositor nothing for its position. Its record says what the frozen
+    /// server held, and a panic there (the proof of 2026-10-20, upstream's
+    /// unwrap of `XTranslateCoordinates`) fails it.
+    #[test]
+    fn the_capture_s_row_is_x11_s_and_fails_on_its_panic() {
+        let rows: Vec<Display> = Display::ALL
+            .into_iter()
+            .filter(|&d| End::MidCapture.applies(d))
+            .collect();
+        assert_eq!(rows, [Display::Xvfb, Display::Xwayland]);
+        for end in [End::AtRest, End::MidResize, End::Quit] {
+            assert!(Display::ALL.into_iter().all(|d| end.applies(d)), "{end:?}");
+        }
+        let held = Evidence {
+            unread: Some("24 bytes".into()),
+            ..orderly()
+        };
+        let detail = judge(&held, End::MidCapture, false).expect("passes");
+        assert!(
+            detail.ends_with("the server held 24 bytes unread at its kill"),
+            "{detail}"
+        );
+        let panicked = Evidence {
+            status: Some("101".into()),
+            stderr: "thread 'main' panicked at crates/aterm-window/src/platform_impl/linux/x11/\
+                     window.rs:1193:14:\ncalled `Result::unwrap()` on an `Err` value: \
+                     X11(Connection(1))\n"
+                .into(),
+            session: None,
+            ..held
+        };
+        assert!(
+            judge(&panicked, End::MidCapture, false)
+                .unwrap_err()
+                .contains("panicked")
+        );
     }
 
     /// The typed line never contains its own echo, so the echo's appearance

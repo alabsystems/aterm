@@ -3,46 +3,15 @@
 
 //! A copy that appeared beside a line is not where the line went.
 //!
-//! The follow pass (`rk::witness::Witness::follow_runs`) carries a band onto the
-//! row its text moved to, counting a glyph found there only if it arrived. A copy
-//! of the line that appears beside it after its first keys, while the typed text
-//! still stands, did not arrive and must not carry the band when the line is
-//! erased. Everyday shapes: fzf's list landing after the query's first keys, a
-//! completion popup opening after two keys, a line above the prompt echoing it,
-//! vim's `yyp`, a streamed answer quoting the composer, a job notice re-echoing
-//! the command line.
+//! The follow pass (`rainbow_kitty::witness::Witness::follow_runs`) carries a band onto the row
+//! its text moved to, counting a glyph found there only if it arrived. A copy that appears beside
+//! the line after its first keys, while the typed text still stands, did not arrive and must not
+//! carry the band when the line is erased; one that stood less than `TWIN_MIN` is a torn
+//! repaint's shape and follows (`tests/moves_are_followed.rs`).
 //!
-//! The witness's evidence accumulates (`rk::witness` module doc): on every
-//! frame with rows, each standing record reads what its sampled neighbour rows
-//! hold at its column, and a copy of the glyph there is a sticky `twin`, at once
-//! on the arming frame, otherwise once it has stood `TWIN_MIN` (40 ms of wall
-//! time, seen on every sampled frame between; time rather than frames because
-//! frame spacing ranges from 16 ms to a quarter second). A glyph found at a move
-//! arrived only if its record is not a twin there. A row a band move opens
-//! beside a line is not clear until a frame shows it without the glyph (`yyp`),
-//! and a row a scroll brings in dates a copy on it from the last walk before the
-//! scroll.
-//!
-//! Every law runs at the host seam (`trail_host::Core`): a real
-//! `aterm_core::terminal::Terminal` driven byte for byte; the content-scroll
-//! seam first (`sync_cursor_effect_scroll`; a frame that scrolled or moved a
-//! band samples nothing, as in `app_render.rs`); then the frame hold's rows
-//! (`row_cols_into` after the batch, fed to `CursorGlow::observe_row` /
-//! `observe_ribbon_row` / `ribbon_rows`); then `CursorGlow::tick`, at 16 ms
-//! frames. A failing reading is `(followed, frames of 90 the copy's row was
-//! lit)` against `(0, 0)`.
-//!
-//! The limit: a copy that stood less than `TWIN_MIN` is not yet a twin, since a
-//! program repainting without a synchronized-update bracket can draw the text's
-//! new row up to three frames before erasing the old (a torn repaint, which must
-//! follow; `tests/moves_are_followed.rs`). A copy written in the same batch as
-//! the erase onto a row the witness saw empty, or never saw, is glyph for glyph
-//! the line relocated and follows too.
-//!
-//! These shapes on the full 24-row grid, and both limits, are
-//! `tests/copies_are_not_moves.rs`'s `L3.copy.*` cases, on the flat 16 ms train
-//! and at the GUI's pacing; that file also sweeps them over timing. This file
-//! keeps the split pane: a scroll's copy on the pane's new last row.
+//! The full-grid shapes and the limits are `tests/copies_are_not_moves.rs`'s `L3.copy.*` cases.
+//! This file keeps the split pane: a scroll's copy on the pane's new last row, read as
+//! `(followed, frames of 90 the copy's row was lit)` against `(0, 0)`.
 
 use crate::trail_host::{Core, Opts, Theme};
 use std::time::Duration;
@@ -50,11 +19,9 @@ use std::time::Duration;
 const ROWS: usize = 24;
 const COLS: usize = 80;
 
-/// The GUI's frame seam (`trail_host::Core`): the content-scroll seam first (a
-/// scroll or band move is applied and the frame samples nothing), the
-/// alt-screen re-baseline, then the frame hold (the caret row's probe, also its
-/// witness sample, and the rows the witness names, read after the last
-/// `process`), then the tick.
+/// The GUI's frame seam: the content-scroll seam first (a scroll or band move is applied and the
+/// frame samples nothing), the alt-screen re-baseline, the frame hold (the caret row's probe and
+/// the rows the witness names, read after the last `process`), then the tick.
 const SEAM: Opts = Opts {
     scroll_seam: true,
     alt_rebaseline: true,
@@ -63,8 +30,7 @@ const SEAM: Opts = Opts {
     pane_columns: false,
 };
 
-/// The host: `trail_host`'s frame seam on a pane of a 24×80 window of 8×16
-/// cells, and this file's input gestures.
+/// `trail_host`'s frame seam on a pane of a 24×80 window of 8×16 cells.
 struct Host {
     c: Core,
 }
@@ -147,15 +113,10 @@ fn copy_written_by_a_scroll(mut h: Host, last: u16) -> (u64, usize) {
     h.verdict(f0, last)
 }
 
-/// A copy written on a split pane's new last row by the scroll that made it, in
-/// a stacked split's 12-row top pane of a 24-row window: the line's records
-/// were armed with no row below, and the scroll made that row real. The rows
-/// the pane's scroll brings in are at the pane's bottom (row 11), not the
-/// window's, and `Engine::translate_scroll` dates the rows above the focused
-/// pane's bottom accordingly: the copy that came in with the new row is dated
-/// from the last walk before the scroll (`Witness::translate` starts the
-/// offset's `Seen::pending` clock at `Witness::last_walk`), so the look 48 ms
-/// on finds it has stood `TWIN_MIN`: a twin.
+/// In a stacked split's 12-row top pane of a 24-row window, a scroll writes a copy on the pane's
+/// new last row (row 11, not the window's; `Engine::translate_scroll`). `Witness::translate` dates
+/// that copy from the last walk before the scroll, so the look 48 ms on finds it has stood
+/// `TWIN_MIN`: a twin.
 #[test]
 fn a_copy_written_on_a_split_pane_s_new_last_row_by_a_scroll_is_not_where_the_line_went() {
     let last = 11;

@@ -1,29 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE: A RENDER DESYNC — a net-zero alternate-screen resize flap — read by
-//! the surfaces that exist to see it (`status render=`, `resizes`, `cast
-//! drift`, the screen itself) and repaired by the repaint nudge.
+//! A render desync, a net-zero alternate-screen resize flap, read by the surfaces that exist
+//! to see it (`status render=`, `resizes`, `cast drift`, the screen itself) and repaired by
+//! the repaint nudge.
 //!
-//! THE INCIDENT. aterm re-gridded a window 64 -> 63 -> 64 rows within a
-//! millisecond. On the alternate screen the shrink demotes the top row (the
-//! alt grid keeps no history) and the grow appends a blank row, so the flap
-//! moves the whole screen up one row. Claude Code repaints with ESC[2J only
-//! when its SIGWINCH handler reads a CHANGED size; when both resizes land
-//! before the handler runs it reads an unchanged size, skips the repaint, and
-//! every later diff frame lands on shifted content. The engine now undoes a
-//! flap with NO output between its halves; any output between them drops the
-//! undo (even a mode set that draws nothing), and the ledger still reads one
-//! net-zero run: that flap still shifts, and is what the surfaces judge.
+//! On the alternate screen a flap's shrink demotes the top row (the alt grid keeps no
+//! history) and its grow appends a blank one, so the screen moves up a row. Claude Code
+//! repaints with ESC[2J only when its SIGWINCH handler reads a changed size; when both
+//! resizes land first it reads an unchanged size, skips the repaint, and every later diff
+//! frame lands on shifted content. The engine undoes a flap with no output between its
+//! halves; any output between them (even a mode set that draws nothing) drops the undo, and
+//! the ledger still reads one net-zero run: that flap is what the surfaces judge.
 //!
-//! THE STAND-IN ([`Tui`], played by this binary through
-//! `support/standin.rs`) paints a Claude-shaped frame on the alternate screen
-//! (transcript rows, one of them truecolor, a rule, the composer, a rule, three
-//! footer rows) and holds every SIGWINCH until it reads `g`, so both resizes
-//! land before its handler reads the size: the order is the stand-in's, never
-//! a clock's. The flap is two `resize` requests on one control connection
-//! ([`Between`] says what lands between them, each seen landed before the
-//! grow), and each variant is one test with an instance of its own.
+//! The stand-in ([`Tui`], played by this binary through `support/standin.rs`) paints a
+//! Claude-shaped frame on the alternate screen and holds every SIGWINCH until it reads `g`,
+//! so both resizes land before its handler reads the size: the order is the stand-in's,
+//! never a clock's. The flap is two `resize` requests on one control connection
+//! ([`Between`] says what lands between them, each seen landed before the grow); each variant
+//! is one test with an instance of its own.
 //!
 //! WHEN THE CLOCK IS PART OF THE SCENARIO. The ledger joins two resizes into
 //! one run within its 250 ms run gap when the app DREW between them; without a
@@ -53,7 +48,7 @@ const ENTRY: &str = "render_desync_live_headless::a_quiet_flap_is_undone";
 /// between, are two runs to both.
 const RUN_GAP_MS: f64 = aterm_control::cast_drift::RUN_GAP_SECS * 1000.0;
 
-/// LATE's halves: past the run gap and the ledger's 1 s risk wait.
+/// The far-apart flap's halves: past the run gap and the ledger's 1 s risk wait.
 const LATE_GAP: Duration = Duration::from_millis(1_600);
 
 /// The frame's truecolor row (screen row 3, 200,100,50 on 10,20,30).
@@ -69,8 +64,8 @@ enum Repaint {
     OnChange,
     /// A full repaint whatever it reads (the control).
     Always,
-    /// When the size changed, a repaint by cursor addressing and erase-line
-    /// on every row, NO ESC[2J: one the engine cannot tell from a diff.
+    /// When the size changed, a repaint by cursor addressing and erase-line on every row, no
+    /// ESC[2J: one the engine cannot tell from a diff.
     NoClear,
 }
 
@@ -326,7 +321,7 @@ impl Setup {
 /// grow.
 #[derive(Clone, Copy, Debug)]
 enum Between {
-    /// Nothing: the incident's flap, which the engine's resize undo answers.
+    /// Nothing: a quiet flap, which the engine's resize undo answers.
     Nothing,
     /// A mode set that draws nothing (`?1004h`, seen in `modes`), then the
     /// grow this long after it.
@@ -705,7 +700,7 @@ impl Lane {
         );
     }
 
-    /// The sizes the stand-in READ, in order (`80x24`, …).
+    /// The sizes the stand-in read, in order (`80x24`, …).
     fn sizes_read(&self) -> Vec<String> {
         std::fs::read_to_string(self.inst.tmp.join("home/standin.log"))
             .unwrap_or_default()
@@ -752,10 +747,9 @@ impl Lane {
     }
 }
 
-/// THE INCIDENT'S FLAP, on this engine: nothing between the halves, so the
-/// grow hands the demoted row back. One net-zero run that moved nothing
-/// (`none`, `render=ok` for good), `cast drift` clean, the screen unshifted,
-/// the truecolor row where it was.
+/// A quiet flap (nothing between the halves) is undone: the grow hands the demoted row back.
+/// One net-zero run that moved nothing (`none`, `render=ok` for good), `cast drift` clean,
+/// the screen unshifted, the truecolor row where it was.
 #[test]
 fn a_quiet_flap_is_undone() {
     play_standin_if_asked();
@@ -820,13 +814,10 @@ fn a_split_flap_the_app_drew_over_is_a_desync_risk() {
     lane.expect_shifted();
 }
 
-/// A spinner TICK drawn between the halves (the presence row's attention flap
-/// with the app's spinner ticking): the draw drops the undo as the mode set
-/// does, and the ledger keeps it inside the run — a draw is no sign the
-/// handler read the smaller size — so everything reads as the split flap,
-/// with the tick, not the footer, the replay's bottom row. The draw joins the
-/// halves only within the run gap, so this instance widens the gap to a
-/// minute: the halves are always inside it.
+/// A spinner tick drawn between the halves drops the undo as the mode set does, and the
+/// ledger keeps it inside the run (a draw is no sign the handler read the smaller size), so
+/// it reads as the split flap, with the tick, not the footer, the replay's bottom row. A draw
+/// joins the halves only within the run gap, so this instance widens the gap to a minute.
 #[test]
 fn a_flap_split_by_a_drawn_tick_is_one_run_and_a_desync_risk() {
     let setup = Setup {
@@ -855,9 +846,8 @@ fn a_flap_split_by_a_drawn_tick_is_one_run_and_a_desync_risk() {
     lane.expect_shifted();
 }
 
-/// THE CONTROL: the split flap, and a handler that repaints with ESC[2J
-/// whatever it reads. The run is `healed`, `render=ok` for good, `cast drift`
-/// clean, the screen unshifted.
+/// The control: the split flap, and a handler that repaints with ESC[2J whatever it reads.
+/// The run is `healed`, `render=ok` for good, `cast drift` clean, the screen unshifted.
 #[test]
 fn a_split_flap_the_app_repaints_is_healed() {
     let mut lane = Lane::boot("h", Setup::new(Repaint::Always));
@@ -876,11 +866,10 @@ fn a_split_flap_the_app_repaints_is_healed() {
     lane.expect_unshifted();
 }
 
-/// THE SPLIT FLAP WITH ITS HALVES 1.6 s APART: nothing was drawn between
-/// them, so the shrink's run, displaced and undrawn, waits for the grow
-/// however late — ONE net-zero run one row up, `desync-risk` once drawn on —
-/// and `cast drift` weighs the span from the shrink to the grow as one return
-/// and names it.
+/// The split flap with its halves 1.6 s apart: nothing was drawn between them, so the
+/// shrink's run, displaced and undrawn, waits for the grow however late (one net-zero run one
+/// row up, `desync-risk` once drawn on), and `cast drift` weighs the span from the shrink to
+/// the grow as one return and names it.
 #[test]
 fn a_split_flap_whose_halves_are_far_apart_is_still_one_run() {
     let mut lane = Lane::boot("l", Setup::new(Repaint::OnChange));
@@ -907,10 +896,9 @@ fn a_split_flap_whose_halves_are_far_apart_is_still_one_run() {
     lane.expect_shifted();
 }
 
-/// THE EPOCH JUDGE, the run judge's blind spot: an app frame between the
-/// halves and the grow `after` it, past the run gap, so the run judge sees
-/// two net-changed runs; the engine's render debt, judged as one epoch, is a
-/// `desync-risk` for the agent class.
+/// The epoch judge covers the run judge's blind spot: an app frame between the halves and the
+/// grow `after` it, past the run gap, so the run judge sees two net-changed runs; the
+/// engine's render debt, judged as one epoch, is a `desync-risk` for the agent class.
 fn a_flap_drawn_between_is_judged_by_its_epoch(tag: &str, after: Duration) {
     let mut lane = Lane::boot(tag, Setup::epoch());
     lane.flap(Between::Frame(after));
@@ -951,9 +939,8 @@ fn a_flap_drawn_between_and_grown_1200ms_later_is_judged_by_its_epoch() {
     a_flap_drawn_between_is_judged_by_its_epoch("e12", Duration::from_millis(1_200));
 }
 
-/// The split flap and then SILENCE: the stand-in never reads the size and
-/// nothing is drawn; the epoch alone reads `desync-risk` at the ledger's risk
-/// wait (`drew=0`).
+/// The split flap and then silence: the stand-in never reads the size and nothing is drawn;
+/// the epoch alone reads `desync-risk` at the ledger's risk wait (`drew=0`).
 #[test]
 fn an_undrawn_flap_is_judged_by_its_epoch() {
     let mut lane = Lane::boot("u", Setup::epoch());
@@ -978,11 +965,10 @@ fn an_undrawn_flap_is_judged_by_its_epoch() {
     lane.expect_shifted();
 }
 
-/// THE REPAIR at the compiled default (no `[render]` key): after the drawn
-/// flap aterm sets the PTY one row short and back, the stand-in reads the
-/// short size and then the true one and repaints, and the screen is whole
-/// again. The epoch closed `healed by=nudge`, the engine booked no resize,
-/// and the PTY ends at the engine's size.
+/// The repair at the compiled default (no `[render]` key): after the drawn flap aterm sets
+/// the PTY one row short and back, the stand-in reads the short size, then the true one, and
+/// repaints, and the screen is whole again. The epoch closed `healed by=nudge`, the engine
+/// booked no resize, and the PTY ends at the engine's size.
 #[test]
 fn the_repaint_nudge_repairs_a_desynced_agent() {
     let mut lane = Lane::boot(
@@ -1062,9 +1048,9 @@ fn the_repaint_nudge_in_log_mode_only_logs() {
     );
 }
 
-/// THE CONTAINMENT, not the agent class: a program that repaints by cursor
-/// addressing (no ESC[2J) is indistinguishable from one that missed the
-/// resize, so it is never accused (`render=unjudged`) and never touched.
+/// A program that repaints by cursor addressing (no ESC[2J), not classed as the agent, is
+/// indistinguishable from one that missed the resize, so it is never accused
+/// (`render=unjudged`) and never touched.
 #[test]
 fn a_program_that_repaints_without_clearing_is_never_nudged() {
     let mut lane = Lane::boot(
@@ -1083,9 +1069,8 @@ fn a_program_that_repaints_without_clearing_is_never_nudged() {
     );
 }
 
-/// THE CONTAINMENT, classed as the agent: the nudge tries ONCE, gets no full
-/// repaint back, gives up and stays given up; no resize is booked and the PTY
-/// ends at the engine's size.
+/// The same program classed as the agent: the nudge tries once, gets no full repaint back,
+/// and gives up for good; no resize is booked and the PTY ends at the engine's size.
 #[test]
 fn a_nudge_without_an_answer_gives_up_once() {
     let mut lane = Lane::boot(

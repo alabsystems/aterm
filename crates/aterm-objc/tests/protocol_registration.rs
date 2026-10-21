@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A class may claim a protocol the host's frameworks never registered — and
-//! the claim must be TRUE afterwards, not skipped and not fatal.
+//! A class may claim a protocol no loaded image registered, and the claim then holds: the crate
+//! registers a name-only protocol rather than skipping the claim or panicking. Only an image whose
+//! `__objc_protolist` carries a protocol registers it, and a Rust binary has none; AppKit
+//! registers `NSApplicationDelegate` on some macOS releases (26) and not on others (14.4.1).
 //!
-//! This is the v0.72.0–v0.75.0 launch crash, kept as a tooth. Those releases
-//! asserted in `ClassBuilder::add_protocol` that `objc_getProtocol` finds every
-//! claimed protocol, with a message blaming an unlinked framework. AppKit was
-//! linked; it simply does not register `NSApplicationDelegate` on macOS 14.4.1
-//! (a protocol is registered only by an image whose `__objc_protolist` carries
-//! it, and a Rust binary has none), so the application delegate's class could
-//! not be built and the app died before its first window. The release cutter
-//! runs on macOS 26, where AppKit does register it, so every gate that launched
-//! the binary was green.
-//!
-//! Nothing here depends on which macOS runs the test: the first two tests use
-//! a name NO image can carry, the third a name libobjc itself carries, and the
-//! fourth reports which way this host went.
+//! Nothing here depends on the host's macOS: the first two tests use a name no image carries, the
+//! third a name libobjc carries, and the fourth reports which way this host went.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -31,9 +22,7 @@ use aterm_objc::{
     protocol_or_register, protocols_registered_by_aterm, sel,
 };
 
-/// `+conformsToProtocol:` — the question `-[NSObject conformsToProtocol:]`
-/// forwards to the class, and the one every conformance assertion in the tree
-/// asks.
+/// `+conformsToProtocol:`, which `-[NSObject conformsToProtocol:]` forwards to the class.
 fn conforms(cls: ClassPtr, name: &'static CStr) -> bool {
     let proto = protocol(name);
     if proto.is_null() {
@@ -61,8 +50,7 @@ declare_class! {
 }
 
 declare_class! {
-    /// A SECOND claimant of the same absent protocol: the registration must be
-    /// shared, not repeated.
+    /// A second claimant of the same absent protocol: the registration is shared.
     struct AlsoClaimsAbsent: NSObject {
         const NAME: &str = "ATermObjcAlsoClaimsAbsentProtocol";
         type Ivars = ();
@@ -71,8 +59,7 @@ declare_class! {
 }
 
 declare_class! {
-    /// The application delegate's exact claim, built the way `crates/aterm-window`'s
-    /// `app_state.rs` builds it — the class whose construction was the crash.
+    /// The application delegate's claim, as `crates/aterm-window`'s `app_state.rs` makes it.
     struct ClaimsAppDelegate: NSObject {
         const NAME: &str = "ATermObjcClaimsNSApplicationDelegate";
         type Ivars = ();
@@ -88,8 +75,6 @@ fn claiming_a_protocol_no_image_carries_registers_it_and_the_claim_is_true() {
         "precondition: nothing but this crate can have registered {NEVER_CARRIED:?}"
     );
     let cls = ClaimsAbsent::class();
-    // The protocol exists now, and the class really conforms — the answer the
-    // objc2-era silent skip could never give.
     assert!(
         !protocol(NEVER_CARRIED).is_null(),
         "the claim supplied the protocol"
@@ -144,15 +129,11 @@ fn a_protocol_the_host_registers_is_never_re_registered() {
         !protocols_registered_by_aterm().contains(&c"NSObject"),
         "NSObject is libobjc's, not this crate's"
     );
-    // No length comparison: the registry is process-global and the sibling
-    // tests in this binary push into it from parallel threads, so a count is
-    // not a fact about THIS call; the absence of `NSObject` above is.
+    // No count check: sibling tests push into the process-global registry in parallel.
 }
 
-/// The v0.72.0 crash, exactly: build a class that claims
-/// `NSApplicationDelegate` with AppKit loaded. It must build on every macOS
-/// aterm ships for, and it must conform afterwards, whichever side supplied
-/// the protocol on this host.
+/// A class claiming `NSApplicationDelegate` with AppKit loaded builds and conforms, whichever
+/// side supplies the protocol on this host.
 #[test]
 fn the_application_delegate_claim_builds_on_this_host_and_is_true() {
     unsafe extern "C" {

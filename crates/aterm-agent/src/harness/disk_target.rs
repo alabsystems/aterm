@@ -94,12 +94,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::discover::{Origin, Owned};
-#[cfg(not(windows))]
-use super::walk_bytes;
 use super::{
     CACHEDIR_SIGNATURE, MAX_WALK_ENTRIES, RUSTC_INFO, Removed, Witness, age_days,
     cachedir_tag_signed, mtime_of,
 };
+#[cfg(not(windows))]
+use super::{walk_bytes, walk_bytes_until};
 use held::HeldLock;
 
 /// The build locks cargo takes in each profile: `.cargo-lock` (every cargo),
@@ -529,6 +529,38 @@ pub fn total_bytes(dir: &Path) -> (u64, bool) {
     {
         let dev = dev_of(dir);
         walk_bytes(dir, |meta| same_dev(meta, dev), shared_blocks)
+    }
+}
+
+/// [`total_bytes`] that also stops once `deadline` passes, cut short: a
+/// survey with a wall-clock budget sizes no folder past it. On Windows the
+/// handle walk (`fd::tally`) takes what is left of the budget as its wall.
+#[must_use]
+pub fn total_bytes_until(dir: &Path, deadline: std::time::Instant) -> (u64, bool) {
+    #[cfg(windows)]
+    {
+        let wall = deadline.saturating_duration_since(std::time::Instant::now());
+        if wall.is_zero() {
+            return (0, true);
+        }
+        let t = fd::tally(
+            dir,
+            &fd::Walk {
+                wall: Some(wall),
+                ..fd::Walk::sizes(fd::Count::Shared, None)
+            },
+        );
+        (t.bytes, t.partial)
+    }
+    #[cfg(not(windows))]
+    {
+        let dev = dev_of(dir);
+        walk_bytes_until(
+            dir,
+            |meta| same_dev(meta, dev),
+            shared_blocks,
+            Some(deadline),
+        )
     }
 }
 

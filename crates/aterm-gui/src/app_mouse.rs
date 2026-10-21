@@ -1144,14 +1144,14 @@ impl App {
 
         let mut changed = None;
         if let Some((_, view)) = self.active_native_view(wid)
-            && let Some(state) = self.native_runtime.view_state_mut(view)
+            && self.native_runtime.change_view_state(view, |state| {
+                let common = state.common_mut();
+                let hovered = common.hovered.take().is_some();
+                let pressed = common.pressed.take().is_some();
+                hovered || pressed
+            })
         {
-            let common = state.common_mut();
-            let hovered = common.hovered.take().is_some();
-            let pressed = common.pressed.take().is_some();
-            if hovered || pressed {
-                changed = Some(view);
-            }
+            changed = Some(view);
         }
         if let Some(view) = changed {
             // Hover/pressed are stamp-neutral visual state: damage the one leaf
@@ -1970,11 +1970,11 @@ impl App {
     /// macOS), and the native view's `copy_native_selection(wid)`. Only `MenuAction::Copy`
     /// keeps the frontmost form: a menu item carries no window.
     pub(crate) fn copy_selection_in(&self, wid: WindowId) -> bool {
-        // The keyboard lens's ⌘C copies its selected bar's sentence.
+        // A pinned or keyboard lens's ⌘C copies its instrument's sentence.
         if self.windows.get(&wid).is_some_and(|ws| {
             ws.stats_lens
                 .open
-                .is_some_and(|l| l.how == crate::stats_lens::Opened::Keyboard)
+                .is_some_and(|l| l.how != crate::stats_lens::Opened::Hover)
         }) {
             return self.copy_stats_sentence(wid);
         }
@@ -2600,10 +2600,16 @@ impl App {
                 .as_ref()
                 .filter(|(hit_view, _)| *hit_view == target)
                 .map(|(_, key)| key.clone());
-            if let Some(state) = self.native_runtime.view_state_mut(target)
-                && state.common().hovered != desired
-            {
-                state.common_mut().hovered = desired;
+            // A move that leaves the pointer over what it was over changes
+            // nothing the view renders from: its content revision stays.
+            if self.native_runtime.change_view_state(target, |state| {
+                let common = state.common_mut();
+                let moved = common.hovered != desired;
+                if moved {
+                    common.hovered = desired;
+                }
+                moved
+            }) {
                 hover_changed.push(target);
             }
         }
@@ -5736,6 +5742,25 @@ impl App {
                         ))
                     },
                 );
+                // A press on a control's PICTURE in the strip under a list's
+                // room, where nothing is live, is the list's: it scrolls that
+                // control into the room and works nothing
+                // ([`crate::native_ui::CompiledUi::list_picture_at`]).
+                let picture = if press.is_none() {
+                    self.retained_native_leaf_at_pointer(wid, px, py).and_then(
+                        |(artifact, x, y)| {
+                            let (_, active_view) = self.active_native_view(wid)?;
+                            (artifact.view == active_view
+                                && self.native_runtime.view_generation(artifact.view)
+                                    == Some(artifact.generation))
+                            .then(|| artifact.compiled.list_picture_at(x, y).cloned())
+                            .flatten()
+                            .map(|key| (artifact.view, key))
+                        },
+                    )
+                } else {
+                    None
+                };
                 // THE PRESS GOES WHERE THE POINTER LOOKED: a control the layout
                 // moved under a still pointer since it came to rest (a session
                 // opened or closed above it, a press moved its row) is not
@@ -5821,6 +5846,14 @@ impl App {
                         view,
                         crate::native_app::DamageRegion::All,
                     );
+                    if let Some((target_view, key)) = picture {
+                        let _ = self.dispatch_native_view_event(
+                            wid,
+                            target_view,
+                            crate::native_app::AppEvent::PressListPicture(key),
+                        );
+                        self.request_redraw_all_windows();
+                    }
                 }
             }
             return;
@@ -7660,7 +7693,7 @@ mod tests {
     /// THE WHEEL PUTS A PRESS'S NUDGE BACK ON THE LIST'S STOPS, BY THE WHEEL'S
     /// OWN PATH: a click on a switch the list's bottom edge cuts scrolls the
     /// list by the switch's hidden part (the press nudge,
-    /// `settings_scroll::ScrollPlan::press_nudge`), and the list holds that
+    /// `settings_scroll::ScrollPlan::press_seat_span`), and the list holds that
     /// place; a `pointer wheel` one line down then shows the screen one stop
     /// on that an un-nudged wheel shows, and one line up at the top shows the
     /// top again, as it was before the press.
@@ -8370,6 +8403,156 @@ mod tests {
             "test point must invert through shipping hit geometry"
         );
         native_content_to_window(app, wid, x, paint.rect.y + paint.rect.height * 0.5)
+    }
+
+    /// THE STRIP UNDER A LIST'S ROOM TAKES A PRESS AS A SCROLL (#51): a click
+    /// on the middle of what a list draws of a switch fading in the strip
+    /// under its room — a picture, never live, so a status bar that comes
+    /// takes nothing a person can press — scrolls that switch into the room,
+    /// whole and live, as a press on one the room's edge cuts does, and
+    /// works nothing: its value stays and no change is asked for. The click
+    /// used to do nothing at all.
+    #[test]
+    fn a_press_on_a_switch_drawn_in_the_lists_strip_scrolls_it_in_and_works_nothing() {
+        use crate::native_ui::UiContent;
+        use crate::{App, WindowId};
+        use aterm_window::event::{ElementState, MouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // A window whose Settings list keeps a strip under its room for a
+        // status bar (a short compact one docks the bar and keeps none).
+        app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(760, 460));
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, view) = app.active_native_view(wid).expect("Settings active");
+        let switch_picture = |compiled: &crate::native_ui::CompiledUi| {
+            compiled.list_pictures.iter().find_map(|picture| {
+                let paint = compiled.paint.iter().find(|node| node.key == picture.key)?;
+                let UiContent::Switch(control) = &paint.content else {
+                    return None;
+                };
+                (picture.rect.height >= 12.0).then(|| (picture.clone(), control.value.clone()))
+            })
+        };
+        // The first screen of Top Settings whose strip draws a switch, the
+        // wheel turned a stop at a time.
+        let mut found = switch_picture(&presented_native_ui(&mut app, wid));
+        for _ in 0..40 {
+            if found.is_some() {
+                break;
+            }
+            let _ = app.dispatch_native_view_event(
+                wid,
+                view,
+                crate::native_app::AppEvent::ScrollLines(1),
+            );
+            found = switch_picture(&presented_native_ui(&mut app, wid));
+        }
+        let (picture, value) = found.expect("a screen of Top Settings draws a switch in its strip");
+        let (x, y) = native_content_to_window(
+            &mut app,
+            wid,
+            picture.rect.x + picture.rect.width * 0.5,
+            picture.rect.y + picture.rect.height * 0.5,
+        );
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        let compiled = presented_native_ui(&mut app, wid);
+        let key = &picture.key;
+        let paint = compiled
+            .paint
+            .iter()
+            .find(|node| &node.key == key)
+            .expect("the switch is drawn");
+        let hit = compiled
+            .hits
+            .iter()
+            .find(|hit| &hit.key == key)
+            .unwrap_or_else(|| panic!("{key:?} came into the room, live: {:?}", paint.rect));
+        assert_eq!(hit.rect, paint.rect, "{key:?} is whole in the room");
+        let semantic = compiled.semantic(key).expect("live");
+        assert_eq!(semantic.value, value, "the press worked nothing");
+        assert!(
+            semantic
+                .state
+                .is_some_and(|state| !state.busy && !state.pressed),
+            "and asked for no change: {:?}",
+            semantic.state
+        );
+    }
+
+    /// A press on a looping preview drawn in the strip under a list's room —
+    /// its Pause/Play is no list control — scrolls the stop that draws it
+    /// into the room and pauses nothing: the click found no stop, and was
+    /// lost (Top Settings' cursor-trail preview at 724×488).
+    #[test]
+    fn a_press_on_a_preview_drawn_in_the_lists_strip_scrolls_it_in_and_pauses_nothing() {
+        use crate::native_ui::UiContent;
+        use crate::{App, WindowId};
+        use aterm_window::event::{ElementState, MouseButton};
+
+        let preview_picture = |compiled: &crate::native_ui::CompiledUi| {
+            compiled.list_pictures.iter().find_map(|picture| {
+                let paint = compiled.paint.iter().find(|node| node.key == picture.key)?;
+                let UiContent::SettingsPreview(spec) = &paint.content else {
+                    return None;
+                };
+                (picture.rect.height >= 12.0).then(|| (picture.clone(), spec.paused))
+            })
+        };
+        // The first window and screen of Top Settings whose strip draws its
+        // cursor-trail preview, the wheel turned a stop at a time.
+        let wid = WindowId(0);
+        let mut found = None;
+        for (width, height) in [(760, 520), (1_100, 740), (760, 460)] {
+            let mut app = App::headless_for_test();
+            app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(width, height));
+            assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+            let (_, view) = app.active_native_view(wid).expect("Settings active");
+            for _ in 0..12 {
+                if let Some(picture) = preview_picture(&presented_native_ui(&mut app, wid)) {
+                    found = Some((app, picture));
+                    break;
+                }
+                let _ = app.dispatch_native_view_event(
+                    wid,
+                    view,
+                    crate::native_app::AppEvent::ScrollLines(1),
+                );
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (mut app, (picture, paused)) =
+            found.expect("a screen of Top Settings draws a preview in its strip");
+        let (x, y) = native_content_to_window(
+            &mut app,
+            wid,
+            picture.rect.x + picture.rect.width * 0.5,
+            picture.rect.y + picture.rect.height * 0.5,
+        );
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        let compiled = presented_native_ui(&mut app, wid);
+        let key = &picture.key;
+        let paint = compiled
+            .paint
+            .iter()
+            .find(|node| &node.key == key)
+            .expect("the preview is drawn");
+        let hit = compiled
+            .hits
+            .iter()
+            .find(|hit| &hit.key == key)
+            .unwrap_or_else(|| panic!("{key:?} came into the room, live: {:?}", paint.rect));
+        assert_eq!(hit.rect, paint.rect, "{key:?} is whole in the room");
+        let UiContent::SettingsPreview(spec) = &paint.content else {
+            unreachable!()
+        };
+        assert_eq!(spec.paused, paused, "the press paused nothing");
     }
 
     #[test]

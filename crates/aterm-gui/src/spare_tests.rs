@@ -3054,21 +3054,16 @@ fn an_orphan_born_on_another_terminal_is_no_escape() {
     );
 }
 
-/// An orphan born on another terminal that exec'd only after that terminal's
-/// leader left has lost `P_CONTROLT`, yet still holds its standard
-/// descriptors on the terminal its leader's exit revoked: none of the run's.
-/// As the `locale` a tab's zsh forks for `/etc/zshrc`'s `$(locale LC_CTYPE)`
-/// and execs once its tab has closed: the live spare suite read one as L3's
-/// escape in 960 module runs (`flags=0x21404010`, its session's leader gone
-/// and unlisted), and this orphan reads those flags and `ENOENT` for each of
-/// its descriptors 0, 1 and 2. The processes are real: the orphan waits on a
-/// FIFO for its go, given after the leader is killed and reaped.
-/// NEGATIVE CONTROL: the same orphan with its descriptors read as live (the
-/// run's `setsid` daemon on the shell's terminal) or unreadable is `Escaped`;
-/// on the scan before the descriptors were read, this orphan read `Escaped`.
+/// A dead standard vnode does not prove an orphan's terminal origin. The
+/// real orphan here exec'd after its terminal's leader left and lost
+/// `P_CONTROLT`; its stdio answers dead. But a run-owned orphan with stdio on
+/// a force-unmounted ordinary file has the same observation. Without the
+/// terminal flag or a proven outside leader line, dead/live/unread stdio
+/// cannot overrule the ownership answer. The scan remains conservative.
+/// This fixture observes a revoked PTY, not an actual force-unmount.
 #[cfg(target_os = "macos")]
 #[test]
-fn an_orphan_that_execd_after_its_terminals_leader_left_is_no_escape() {
+fn a_dead_stdio_orphan_is_not_cleared_without_terminal_origin() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let waits = FixtureWaits::new();
     let (_shell, shell_pid, _, _) = session_shell(dir.path(), &waits);
@@ -3128,8 +3123,8 @@ fn an_orphan_that_execd_after_its_terminals_leader_left_is_no_escape() {
     );
     assert_eq!(
         revoked,
-        Scan::Clean,
-        "an orphan on another terminal, exec'd after its leader left"
+        Scan::Escaped,
+        "a dead vnode alone cannot prove this owned-or-unreadable orphan foreign"
     );
     assert_eq!(
         live,

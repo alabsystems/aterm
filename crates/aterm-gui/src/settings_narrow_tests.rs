@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings' system pages at phone width and large text: every word a page
-//! paints is whole in the box it is drawn in, and every control stays inside
-//! its card, from a 22-column window (178pt) up, at 1× and 2× text.
+//! Settings at phone width and large text — the system pages first (round 9),
+//! then every page by the same rules (round 13): every word a page paints is
+//! whole in the box it is drawn in, and every control stays inside its card
+//! and is whole on some screen, from a 22-column window (178pt) up, at 1×,
+//! 1.5× and 2× text.
 
 use super::*;
 
@@ -461,6 +463,14 @@ fn a_text_button_paints_its_labels_lines() {
             .expect("each word fits");
         assert_eq!(lines, ["Open Project", "Site"]);
         assert!(crate::native_ui::native_button_label_lines("Information", 20.0).is_none());
+        // A label with no space has its words at its CJK characters, kinsoku
+        // kept, joined by nothing (before, one word wider than the room: no
+        // lines at all).
+        let cjk_room = crate::native_ui::native_button_label_width("設定を") + 1.0;
+        assert_eq!(
+            crate::native_ui::native_button_label_lines("設定を開く。", cjk_room).as_deref(),
+            Some(&["設定を".to_string(), "開く。".to_string()][..])
+        );
         let single = scaled_control_height();
         let height = crate::native_ui::native_button_height_for_lines(2, single);
         assert!(height > single);
@@ -883,17 +893,29 @@ fn a_page_name_is_whole_in_its_column() {
 /// THE PACKAGES PAGE KEEPS ITS WORDS (the round-9 narrow sweep): its
 /// status, verbs, captions, service line, programs and activity at 22 to 42
 /// columns and on a wide window, 1× and 2× — wrapped to the card's MEASURED
-/// column, never cut, nothing past a card. Its lines were budgeted in
-/// average glyphs per width class (56 a compact line, for 6 words at 2×), its
-/// three verbs held at a fixed width whatever their words, its captions and
-/// its service line's columns fixed.
+/// column, never cut, nothing past a card — before its tool reports and with
+/// its tool live. Its lines were budgeted in average glyphs per width class
+/// (56 a compact line, for 6 words at 2×), its three verbs held at a fixed
+/// width whatever their words, its captions and its service line's columns
+/// fixed; and the hero's "Signed updates from …" was one fixed line, cut to
+/// "Signed updates fr…" at 22 columns once the tool was live.
 #[test]
 fn the_packages_page_keeps_its_words() {
     at_each_text_scale(&[1.0, 2.0], "Packages", |scale| {
         for width in NARROW_WIDTHS.into_iter().chain([744.0]) {
-            for height in [348.0, 900.0] {
-                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
-                for (index, screen) in screens_of(|_, _| {}, SettingsRoute::Packages, width, height)
+            for (height, live) in [348.0, 900.0]
+                .into_iter()
+                .flat_map(|height| [(height, false), (height, true)])
+            {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height} live={live}");
+                let prepare = |runtime: &mut NativeRuntime, _: crate::native_app::ViewId| {
+                    if live {
+                        assert!(
+                            runtime.replace_settings_packages(super::live_packages_state(None), 2)
+                        );
+                    }
+                };
+                for (index, screen) in screens_of(prepare, SettingsRoute::Packages, width, height)
                     .iter()
                     .enumerate()
                 {
@@ -932,11 +954,12 @@ fn messages_small_buttons_stay_on_the_page() {
 }
 
 /// HARNESS KEEPS ITS WORDS WITH SESSIONS OPEN (the round-9 narrow sweep):
-/// the page with two sessions, at 22 to 42 columns, short and tall, 1× and
-/// 2× — every row's title, detail, setting, state and day whole on as many
+/// the page with its sessions — and again with three under Land and a
+/// reading of landings (slice 4c) — at 22 to 42 columns, short and tall, 1×
+/// and 2× — every row's title, detail, setting, state and day whole on as many
 /// lines as its column needs, every face of its buttons whole, nothing past
 /// its card; a row taller than one screen of its card listed a part at a time
-/// ([`harness_page::split_tall_block`]). A short window at 2× crammed the
+/// ([`super::scroll::row_parts`]). A short window at 2× crammed the
 /// buttons five to a line to keep the row on one screen ("Cru…", "…") and cut
 /// the words to the column ("Tab 2 · Cla…").
 #[test]
@@ -945,26 +968,35 @@ fn harness_keeps_its_words_with_sessions_open() {
         let mut parts = 0;
         for width in NARROW_WIDTHS {
             for height in NARROW_HEIGHTS {
-                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
-                let prepare = |runtime: &mut NativeRuntime, _: crate::native_app::ViewId| {
-                    assert!(runtime.replace_settings_harness(super::harness::fixture(), 1));
-                };
-                for (index, screen) in screens_of(prepare, SettingsRoute::Harness, width, height)
-                    .iter()
-                    .enumerate()
-                {
-                    parts += screen
-                        .paint
-                        .iter()
-                        .filter(|node| node.key.as_str().contains("/block/part-"))
-                        .count();
-                    let cut = cut_words(screen, &["harness/"])
-                        .into_iter()
-                        .filter(|line| !says_it_is_under_way(line))
-                        .collect::<Vec<_>>();
-                    assert!(cut.is_empty(), "{context} screen {index}: {cut:#?}");
-                    let spilled = spilled_nodes(screen, &["harness/", "settings/control/"]);
-                    assert!(spilled.is_empty(), "{context} screen {index}: {spilled:#?}");
+                // The page as published, and with landings counted (slice
+                // 4c: the Every row's `landed` and `quiet`, `Landed`, the
+                // done claims checked, today's lines led by landings).
+                for (fixture, state) in [
+                    ("", super::harness::fixture()),
+                    (" landings", super::harness::fixture_landings()),
+                ] {
+                    let context = format!("{scale}\u{d7} {width}\u{d7}{height}{fixture}");
+                    let prepare = |runtime: &mut NativeRuntime, _: crate::native_app::ViewId| {
+                        assert!(runtime.replace_settings_harness(state.clone(), 1));
+                    };
+                    for (index, screen) in
+                        screens_of(prepare, SettingsRoute::Harness, width, height)
+                            .iter()
+                            .enumerate()
+                    {
+                        parts += screen
+                            .paint
+                            .iter()
+                            .filter(|node| node.key.as_str().contains("/block/part-"))
+                            .count();
+                        let cut = cut_words(screen, &["harness/"])
+                            .into_iter()
+                            .filter(|line| !says_it_is_under_way(line))
+                            .collect::<Vec<_>>();
+                        assert!(cut.is_empty(), "{context} screen {index}: {cut:#?}");
+                        let spilled = spilled_nodes(screen, &["harness/", "settings/control/"]);
+                        assert!(spilled.is_empty(), "{context} screen {index}: {spilled:#?}");
+                    }
                 }
             }
         }
@@ -1153,6 +1185,78 @@ fn search_results_and_modified_keep_their_words() {
         }
         if scale > 1.5 {
             assert!(wrapped > 0, "2\u{d7}: a page result's words go on lines");
+        }
+    });
+}
+
+/// THE FLEET FIELD'S WORDS KEEP IT A FIELD (the round-7 Linux lane): where
+/// Settings does not know aterm.toml's folder, the field says "ai-fleet.toml
+/// beside aterm.toml", which went on five lines at 2× text in a 22-column
+/// window on macOS and six in Noto Sans, a field 229pt tall in a 348pt
+/// window's 222pt list, whole on no screen. Now the most leading whole words
+/// two lines hold, "…" after them, else three, at every narrow width.
+#[test]
+fn the_fleet_fields_words_keep_it_a_field() {
+    at_each_text_scale(&[1.0, 2.0], "fleet words", |scale| {
+        for width in NARROW_WIDTHS {
+            let context = format!("{scale}\u{d7} {width}");
+            let (mut runtime, instance, view) = every_page_runtime();
+            {
+                // Where aterm.toml is is not known: the field says it in words.
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.arm_config_file(None, None, ConfigFileArm::inert());
+            }
+            go_to_route(&mut runtime, instance, view, SettingsRoute::Ai);
+            let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_AI_FLEET));
+            let mut seen = false;
+            each_screen(
+                &mut runtime,
+                instance,
+                view,
+                &view_cx_at(width, 516.0),
+                |screen, _| {
+                    let Some(node) = screen.paint.iter().find(|node| node.key == key) else {
+                        return;
+                    };
+                    seen = true;
+                    let painted = painted_text(node).unwrap_or_default();
+                    assert!(
+                        painted.lines().count() <= 3,
+                        "{context}: the fleet field paints {painted:?}"
+                    );
+                },
+            );
+            assert!(seen, "{context}: the fleet field is on the page");
+        }
+    });
+}
+
+/// THE MUSIC STATUS LINE IS WHOLE IN THE NARROW HOST'S COLUMN, whatever
+/// silences the voices: a host with no audio output paints its line on every
+/// Home and Sound screen, and the round-7 Linux lane found "Audio
+/// unavailable" elided there at 1.5× and 2× text (135.9 and 181.3 pt of the
+/// 126-pt column a 178-pt window leaves it). Every reason is laid out here,
+/// not only the one this host's audio gives.
+#[test]
+fn every_music_status_line_is_whole_in_the_narrow_column() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "music status", |scale| {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        for status in [
+            MusicStatus::NoOutput { saved_on: true },
+            MusicStatus::NoOutput { saved_on: false },
+            MusicStatus::VolumeZero,
+            MusicStatus::TypingNotesOff,
+            MusicStatus::MotionPaused(MotionReduction::Setting),
+            MusicStatus::MotionPaused(MotionReduction::System),
+            MusicStatus::MotionPaused(MotionReduction::HeavyLoad),
+        ] {
+            let compiled = crate::native_ui::UiTree::new(top_music_suppression_node(status))
+                .compile(LogicalRect::new(0.0, 0.0, 126.0, page_subtitle_height()))
+                .expect("the status compiles");
+            let cut = cut_words(&compiled, &["settings/top/music-effects/suppression"]);
+            assert!(cut.is_empty(), "{scale}\u{d7} {status:?}: {cut:#?}");
         }
     });
 }
@@ -1538,10 +1642,9 @@ fn paged_screens_of(
             .dispatch(instance, view, AppEvent::ScrollPage(1))
             .unwrap();
         let screen = compile_settings_view(&runtime, instance, view, &cx);
-        if screens
-            .last()
-            .is_some_and(|last| last.paint_audit_lines() == screen.paint_audit_lines())
-        {
+        // The same screen, every part of it: cheaper than comparing the
+        // audits it prints, which it decides.
+        if screens.last() == Some(&screen) {
             return screens;
         }
         screens.push(screen);
@@ -1553,7 +1656,8 @@ fn paged_screens_of(
 /// paging through Software Update, About, Messages, Packages, Security,
 /// Harness, AI CLIs, Keyboard & Input and Window from top to end with Page
 /// Down, at 22 to 42 columns short and tall and at 80 × 24 and 102 × 29, 1×
-/// and 2×, with and without a package tool, each control is drawn whole on
+/// and 2×, with and without a package tool (and Harness as it opens and with
+/// its sessions and landings counted), each control is drawn whole on
 /// at least one screen, and each
 /// block of wrapped words that starts with its own words paints all of them.
 /// The list scrolls by whole rows, and a row taller than what a screen leaves
@@ -1606,6 +1710,15 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                                         assert!(runtime.replace_settings_packages(
                                             packages_without_its_tool(),
                                             3
+                                        ));
+                                    }
+                                    // Harness with its sessions and landings counted
+                                    // (slice 4c): the Every row's parts, Landed, the done
+                                    // claims checked, today's line led by landings.
+                                    if toolless && route == SettingsRoute::Harness {
+                                        assert!(runtime.replace_settings_harness(
+                                            super::harness::fixture_landings(),
+                                            1
                                         ));
                                     }
                                 },
@@ -1671,9 +1784,15 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                         if have.first() != want.first() {
                             continue;
                         }
+                        // A word's own hyphen may end a line, as copy
+                        // breaks there (`painted_words` joins a line ending
+                        // in a hyphen with the next, the hyphen dropped:
+                        // `follow-` and `up` read `followup`).
                         let missing = want
                             .iter()
-                            .filter(|word| !have.contains(word))
+                            .filter(|word| {
+                                !have.contains(word) && !have.contains(&word.replace('-', ""))
+                            })
                             .collect::<Vec<_>>();
                         assert!(
                             missing.is_empty(),
@@ -1681,6 +1800,1523 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                         );
                     }
                 }
+            }
+        }
+    });
+}
+
+/// A Settings runtime holding what every page draws at its fullest: a key
+/// only aterm.toml holds (Modified's and Manual's own group), aterm.toml at a
+/// known path (the fleet document's default beside it), Harness with a
+/// session and Tab Control with this Mac, a LAN Mac and two tabs, their names
+/// as long as a real fleet's, Packages with its tool (its three verbs, its
+/// programs and its activity), and Security with the macOS host's posture
+/// the most of its buttons stand in (every folder denied, other copies to
+/// move to the Trash: the MACOS ACCESS block and the DEVELOPER TOOLS card
+/// over it, which a macOS host always draws and a headless one never does).
+fn every_page_runtime() -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
+    every_page_runtime_over(EVERY_PAGE_SOURCES[0])
+}
+
+/// The aterm.toml sources the every-page sweep runs over: the default
+/// theme, and GitHub Light with a light window (the lab sweep's two), whose
+/// rows Modified, Appearance and Home then draw set.
+const EVERY_PAGE_SOURCES: [&str; 2] = [
+    "agents_auto_prime = false\n",
+    "agents_auto_prime = false\ntheme = \"GitHub Light\"\nwindow_theme = \"light\"\n",
+];
+
+/// [`every_page_runtime`] over aterm.toml `source`.
+pub(super) fn every_page_runtime_over(
+    source: &str,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
+    use crate::harness_screen::{TabComputer, TabControlState, TabSpreadsheetRow};
+    let (mut runtime, instance, view) = setup();
+    replace_settings_source(&mut runtime, view, source.to_string());
+    assert!(runtime.replace_settings_packages(super::live_packages_state(None), 2));
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.arm_config_file(
+            Some(std::path::PathBuf::from(
+                "/Users//someone/.config/aterm/aterm.toml",
+            )),
+            Some(std::path::Path::new("/Users//someone")),
+            ConfigFileArm::inert(),
+        );
+        let posture = crate::security_fixtures::named("denied-folders").expect("a posture");
+        state.replace_macos_access(crate::native_settings::MacosAccess {
+            claimants: Some(crate::security_fixtures::census(true)),
+            ..posture
+        });
+    }
+    let mut harness = super::harness::fixture();
+    let computer = |id: &str, name: &str, lan: bool| TabComputer {
+        id: id.to_string(),
+        name: name.to_string(),
+        address: if lan {
+            "192.168.1.110 \u{b7} m110-MacBook-Pro-M4-Max-48GB-1TB.local".to_string()
+        } else {
+            "local".to_string()
+        },
+        os_version: "Mac16,5 \u{b7} Darwin 26 \u{b7} macOS 26.1 \u{b7} OpenSSH_9.9p2".to_string(),
+        status: if lan { "advertised" } else { "online" }.to_string(),
+        vitals: if lan {
+            String::new()
+        } else {
+            "CPU 14% \u{b7} GPU 6% \u{b7} RAM 38.2/128.0 GiB (30%) \u{b7} up 5d 11h".to_string()
+        },
+        instances: 1,
+        tabs: 2,
+        ai_clis: 1,
+        active_ai: 1,
+    };
+    let tab = |key: &str, title: &str, ai: bool, local_id: u64| TabSpreadsheetRow {
+        key: key.to_string(),
+        computer: "m111-MacBook-Pro-M4-Max-128GB-8TB (this Mac)".to_string(),
+        instance: "this aterm (pid 1000)".to_string(),
+        place: "Tab #0*! (Window 1) \u{b7} 102\u{d7}29".to_string(),
+        sid: "s-7".to_string(),
+        title: title.to_string(),
+        state: "alive".to_string(),
+        program: "Claude Code".to_string(),
+        is_ai_cli: ai,
+        ai_status: "working: Bash \u{b7} targo test (14s)".to_string(),
+        autopilot: "land (supervised)".to_string(),
+        human: "12s ago".to_string(),
+        vitals: "CPU 8.4% \u{b7} RSS 142 MiB".to_string(),
+        show_local_id: Some(local_id),
+    };
+    harness.tabs = TabControlState {
+        computers: vec![
+            computer(
+                "local",
+                "m111-MacBook-Pro-M4-Max-128GB-8TB (this Mac)",
+                false,
+            ),
+            computer(
+                "lan/m110-MacBook-Pro-M4-Max-48GB-1TB",
+                "m110-MacBook-Pro-M4-Max-48GB-1TB",
+                true,
+            ),
+        ],
+        tabs: vec![
+            tab("local/7", "fix the build of the settings page", true, 7),
+            tab("local/8", "zsh", false, 8),
+        ],
+    };
+    assert!(runtime.replace_settings_harness(harness, 1));
+    (runtime, instance, view)
+}
+
+/// What a painted node says in words: a text's, a button's painted label, an
+/// empty field's placeholder.
+fn painted_text(node: &crate::native_ui::PaintNode) -> Option<String> {
+    match &node.content {
+        UiContent::Text(text) => Some(text.text.clone()),
+        UiContent::Button(button) => Some(
+            button
+                .spec
+                .visual_label
+                .clone()
+                .unwrap_or_else(|| button.spec.label.clone()),
+        ),
+        UiContent::TextField(field)
+            if field.spec.input.is_none()
+                && field
+                    .spec
+                    .visual_value
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty() =>
+        {
+            field.spec.placeholder.clone()
+        }
+        _ => None,
+    }
+}
+
+/// `painted` cut inside a word of `whole` (what the same node says where
+/// nothing cuts it): an ellipsis after part of a word, not after a whole one
+/// (a one-line head or a placeholder may end after whole words, "Theme…").
+fn cut_inside_a_word(painted: &str, whole: &str) -> bool {
+    let line = painted.rsplit('\n').next().unwrap_or(painted);
+    let Some(stem) = line.strip_suffix('\u{2026}') else {
+        return false;
+    };
+    if painted_words(painted) == painted_words(whole) {
+        return false;
+    }
+    let stem = stem.trim_start();
+    whole.match_indices(stem).next().is_some_and(|(at, _)| {
+        whole[at + stem.len()..]
+            .chars()
+            .next()
+            .is_some_and(|next| !next.is_whitespace() && next != '\u{2026}')
+    })
+}
+
+/// The places on `screen` where words wrapped onto lines break inside a
+/// word with no mark: a block's line (`<block>/line-<n>`, under the group
+/// that says the block whole, else what its lines say where nothing cuts
+/// them, `whole`) or a button's label line that ends where its next line
+/// goes on in the same word — "Messages" then "." alone, where a word wider
+/// than its box is broken with a hyphen ([`wrap_to_box`]). A line ending in
+/// a hyphen, or a path's `/`, and East Asian text, which breaks between its
+/// characters, are not breaks inside a word.
+fn broken_inside_a_word(
+    screen: &crate::native_ui::CompiledUi,
+    whole: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut wholes = std::collections::HashMap::<&str, &str>::new();
+    let mut blocks =
+        std::collections::BTreeMap::<String, std::collections::BTreeMap<usize, String>>::new();
+    let mut broken = Vec::new();
+    // Whether the line `before` ends where `after` goes on inside one of
+    // `whole`'s words.
+    let inside = |before: &str, after: &str, whole: &str| {
+        let before = before.trim_end();
+        let after = after.trim_start();
+        let (Some(end), Some(start)) = (before.chars().next_back(), after.chars().next()) else {
+            return false;
+        };
+        if matches!(end, '-' | '/' | '\\' | '\u{2026}')
+            || crate::tray_raster::is_east_asian(end)
+            || crate::tray_raster::is_east_asian(start)
+        {
+            return false;
+        }
+        let last = before.rsplit(char::is_whitespace).next().unwrap_or(before);
+        let first = after.split(char::is_whitespace).next().unwrap_or(after);
+        let joined = format!("{last}{first}");
+        let spaced = format!("{last} {first}");
+        whole.contains(&joined) && !whole.contains(&spaced)
+    };
+    for node in screen.paint.iter().filter(|node| !node.peek) {
+        let key = node.key.as_str();
+        match &node.content {
+            UiContent::Group(GroupSpec {
+                label: Some(label), ..
+            }) => {
+                wholes.insert(key, label.as_str());
+            }
+            UiContent::Text(text) => {
+                if let Some((block, line)) = key
+                    .rsplit_once("/line-")
+                    .and_then(|(block, n)| Some((block, n.parse::<usize>().ok()?)))
+                {
+                    blocks
+                        .entry(block.to_string())
+                        .or_default()
+                        .insert(line, text.text.clone());
+                }
+            }
+            UiContent::Button(button) => {
+                let painted = button
+                    .spec
+                    .visual_label
+                    .as_deref()
+                    .unwrap_or(&button.spec.label);
+                let lines = painted.split('\n').collect::<Vec<_>>();
+                for pair in lines.windows(2) {
+                    if inside(pair[0], pair[1], &button.spec.label) {
+                        broken.push(format!("{key}: {painted:?} of {:?}", button.spec.label));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (block, lines) in &blocks {
+        // The block's words: what its group says, else its lines where
+        // nothing cuts them (a setting's note says itself only in them).
+        let said = wholes
+            .get(block.as_str())
+            .filter(|label| !label.is_empty())
+            .map(|label| (*label).to_string())
+            .unwrap_or_else(|| {
+                (0..)
+                    .map_while(|line| whole.get(&format!("{block}/line-{line}")))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+        for (line, text) in lines {
+            if let Some(next) = lines.get(&(line + 1))
+                && inside(text, next, &said)
+            {
+                broken.push(format!("{block}: {text:?} / {next:?} of {said:?}"));
+            }
+        }
+    }
+    broken
+}
+
+/// What each node of `route` says where nothing cuts it: every screen of a
+/// 4000×2400 window, from a runtime `prepare` sets up.
+fn whole_words_of(
+    prepare: impl FnOnce() -> (
+        NativeRuntime,
+        crate::native_app::AppInstanceId,
+        crate::native_app::ViewId,
+    ),
+    route: SettingsRoute,
+) -> std::collections::HashMap<String, String> {
+    let (mut runtime, instance, view) = prepare();
+    go_to_route(&mut runtime, instance, view, route);
+    let mut whole = std::collections::HashMap::new();
+    each_screen(
+        &mut runtime,
+        instance,
+        view,
+        &view_cx_at(4_000.0, 2_400.0),
+        |compiled, _| {
+            for node in &compiled.paint {
+                if let Some(text) = painted_text(node) {
+                    whole.insert(node.key.as_str().to_string(), text);
+                }
+            }
+        },
+    );
+    whole
+}
+
+/// The nodes under `prefixes` on `screen` that cut a word inside itself
+/// ([`cut_inside_a_word`]) of what they say whole (`whole`), or overflow.
+fn words_cut(
+    screen: &crate::native_ui::CompiledUi,
+    whole: &std::collections::HashMap<String, String>,
+    prefixes: &[&str],
+) -> Vec<String> {
+    let mut cut: Vec<String> = screen
+        .fit_failures()
+        .into_iter()
+        .filter(|line| {
+            prefixes
+                .iter()
+                .any(|prefix| line.contains(&format!("key=\"{prefix}")))
+        })
+        .collect();
+    for node in screen.paint.iter().filter(|node| !node.peek) {
+        let key = node.key.as_str();
+        if !prefixes.iter().any(|prefix| key.starts_with(prefix)) {
+            continue;
+        }
+        if let (Some(painted), Some(whole)) = (painted_text(node), whole.get(key))
+            && cut_inside_a_word(&painted, whole)
+        {
+            cut.push(format!("{key}: {painted:?} of {whole:?}"));
+        }
+    }
+    cut
+}
+
+/// EVERY PAGE KEEPS ITS WORDS AND ITS CONTROLS (round 13: the round-9 rules
+/// on every page — a label wraps to its box, a word wider than its box
+/// breaks with a hyphen, a button's words wrap, a tall row is listed a part
+/// at a time): every route, every screen, at 22 to 42 columns short and tall
+/// and the 80×24, 102×29 and 150×48 windows, 1×, 1.5× and 2× text, with a key
+/// only aterm.toml holds, aterm.toml at a known path and a fleet's sessions
+/// and computers, in the default theme and in GitHub Light with a light
+/// window ([`EVERY_PAGE_SOURCES`]), where Modified, Appearance and Home draw
+/// their theme rows set: at 22 to 30 columns there Modified's Color theme
+/// button and its Reset, its window theme's third segment and Appearance's
+/// theme Reset were whole on no screen, a row taller than any screen cut
+/// whole. On every screen nothing overflows, nothing is clipped and
+/// no two marks paint over each other ([`crate::native_ui::CompiledUi::fit_failures`]),
+/// and no word is cut inside itself; and every control is whole on some
+/// screen. Before, Cursor Styles cut every description ("Flames behind what
+/// you type and a red-hot…") and its captions, Home its cursor link and its
+/// cards' titles, Tab Control every computer and tab, Wallpaper its status
+/// and ran Choose Image… past its card, Text & Fonts its display-face
+/// switches, Modified's key only in aterm.toml drew its name in 4pt and its
+/// buttons past the card, and Themes' folder button ran out of the panel.
+/// Themes' own chooser list scrolls inside the page, and its rows are judged
+/// by its own sweep (`every_part_of_the_themes_page_is_whole_on_some_screen`).
+#[test]
+fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
+    let sizes: Vec<(f32, f32)> = NARROW_WIDTHS
+        .into_iter()
+        .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
+        .chain(WIDE_SIZES[..3].iter().copied())
+        .collect();
+    at_each_text_scale(&[1.0, 1.5, 2.0], "every page", |scale| {
+        let pages: Vec<(SettingsRoute, &str)> = SettingsRoute::ALL
+            .into_iter()
+            .flat_map(|route| EVERY_PAGE_SOURCES.map(|source| (route, source)))
+            .collect();
+        on_workers(&pages, "every page", |&(route, source)| {
+            // What each node says where nothing cuts it.
+            let whole = whole_words_of(|| every_page_runtime_over(source), route);
+            for &(width, height) in &sizes {
+                let context = format!(
+                    "{scale}\u{d7} {route:?} {width}\u{d7}{height} {}",
+                    source.trim().replace('\n', "; ")
+                );
+                let (mut runtime, instance, view) = every_page_runtime_over(source);
+                go_to_route(&mut runtime, instance, view, route);
+                let mut controls = std::collections::BTreeMap::<String, bool>::new();
+                each_screen(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &view_cx_at(width, height),
+                    |compiled, top| {
+                        let failures = compiled.fit_failures();
+                        assert!(failures.is_empty(), "{context} screen {top}: {failures:#?}");
+                        let broken = broken_inside_a_word(compiled, &whole);
+                        assert!(broken.is_empty(), "{context} screen {top}: {broken:#?}");
+                        for node in &compiled.paint {
+                            let key = node.key.as_str();
+                            if !node.peek
+                                && let Some(painted) = painted_text(node)
+                                && let Some(whole) = whole.get(key)
+                            {
+                                assert!(
+                                    !cut_inside_a_word(&painted, whole),
+                                    "{context} screen {top}: {key} paints {painted:?} of {whole:?}"
+                                );
+                            }
+                            // A control only ever peeking past a screen's
+                            // edge is one no screen shows whole: it counts.
+                            if matches!(
+                                node.content,
+                                UiContent::Button(_)
+                                    | UiContent::Switch(_)
+                                    | UiContent::Slider(_)
+                                    | UiContent::TextField(_)
+                            ) {
+                                let shown = !node.peek
+                                    && node.fade.is_none()
+                                    && node.clip.height >= node.rect.height - 0.5
+                                    && node.clip.width >= node.rect.width - 0.5;
+                                *controls.entry(key.to_string()).or_default() |= shown;
+                            }
+                        }
+                    },
+                );
+                let unseen = controls
+                    .iter()
+                    .filter(|(key, shown)| !**shown && !key.starts_with("settings/nav/"))
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>();
+                assert!(unseen.is_empty(), "{context}: never whole: {unseen:?}");
+                // PREMISE: the fixture draws what a page draws at its fullest
+                // ([`every_page_runtime`]) — Packages' verbs, Security's
+                // MACOS ACCESS block and DEVELOPER TOOLS card.
+                let drawn: &[&str] = match route {
+                    SettingsRoute::Packages => &[
+                        "packages/check",
+                        "packages/install-default",
+                        "packages/uninstall-all",
+                    ],
+                    SettingsRoute::Security => &[
+                        MACOS_ACCESS_OPEN_FDA,
+                        MACOS_ACCESS_OPEN_FILES,
+                        MACOS_ACCESS_TRASH,
+                        MACOS_ACCESS_OPEN_DEVTOOLS,
+                    ],
+                    _ => &[],
+                };
+                for key in drawn {
+                    assert!(controls.contains_key(*key), "{context}: no {key}");
+                }
+            }
+        });
+    });
+}
+
+/// THE MACOS ACCESS BLOCK AND THE DEVELOPER TOOLS CARD KEEP THEIR WORDS AT
+/// PHONE WIDTH, with the posture a macOS host always publishes (and a
+/// headless lab never does, so no sweep of one saw them): at 22 and 24
+/// columns, short and tall, 1.5× and 2× text, no screen of Security paints a
+/// word of either card cut or past its box, and every button of theirs is
+/// whole on some screen. The block's heading was one fixed line ("MACOS
+/// A…"), its buttons one fixed-height row whatever their words ("Open…",
+/// "Turn O…", "Ask fo…"), the card's floor a 306pt button in a 118pt card
+/// ([`button_line_set`], [`access_card_heading`], [`devtools_floor`]), and
+/// its facts broke a word wider than the card with no mark ("Download" /
+/// "s", [`copy_paragraph_lines`]).
+#[test]
+fn the_macos_access_block_keeps_its_words_at_phone_width() {
+    let ours = |key: &str| key.contains("macos-access") || key.contains("developer-tools");
+    at_each_text_scale(&[1.5, 2.0], "macOS access", |scale| {
+        let whole = whole_words_of(every_page_runtime, SettingsRoute::Security);
+        for width in [178.0, 192.0] {
+            for height in NARROW_HEIGHTS {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+                let (mut runtime, instance, view) = every_page_runtime();
+                go_to_route(&mut runtime, instance, view, SettingsRoute::Security);
+                let mut buttons = std::collections::BTreeMap::<String, bool>::new();
+                each_screen(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &view_cx_at(width, height),
+                    |screen, top| {
+                        let failures = screen
+                            .fit_failures()
+                            .into_iter()
+                            .filter(|line| line.split('"').nth(1).is_some_and(ours))
+                            .collect::<Vec<_>>();
+                        assert!(failures.is_empty(), "{context} screen {top}: {failures:#?}");
+                        let broken = broken_inside_a_word(screen, &whole);
+                        assert!(broken.is_empty(), "{context} screen {top}: {broken:#?}");
+                        for node in &screen.paint {
+                            if let UiContent::Button(_) = node.content
+                                && ours(node.key.as_str())
+                            {
+                                let whole = !node.peek
+                                    && node.fade.is_none()
+                                    && node.clip.height >= node.rect.height - 0.5
+                                    && node.clip.width >= node.rect.width - 0.5;
+                                *buttons.entry(node.key.as_str().to_string()).or_default() |= whole;
+                            }
+                        }
+                    },
+                );
+                assert!(
+                    buttons.contains_key(MACOS_ACCESS_OPEN_FDA)
+                        && buttons.contains_key(MACOS_ACCESS_OPEN_DEVTOOLS),
+                    "{context}: premise, both cards drawn: {buttons:?}"
+                );
+                let unseen = buttons
+                    .iter()
+                    .filter(|(_, whole)| !**whole)
+                    .collect::<Vec<_>>();
+                assert!(unseen.is_empty(), "{context}: never whole: {unseen:?}");
+            }
+        }
+    });
+}
+
+/// A WORD OF COPY WIDER THAN ITS BOX BREAKS AS A LABEL'S DOES
+/// ([`copy_paragraph_lines`]): with a hyphen, its last line never a lone
+/// letter or mark, every line inside the box. The copy walk breaks only at
+/// white space, and broke such a word wherever the box ended: a setting's note
+/// at 2× in a 22-column card painted "Messages" and then "." alone.
+/// CONTROLS: copy whose every word fits wraps at its spaces, as the walk wraps
+/// it, with no hyphen; East Asian text breaks between its characters, with
+/// none.
+#[test]
+fn a_word_of_copy_wider_than_its_box_breaks_with_a_hyphen() {
+    let px = 26.0;
+    let measure = |text: &str| crate::tray_raster::ui_text_width(text, px);
+    let text = "the menu bar and Messages.";
+    let width = measure("Messages") + 1.0;
+    assert!(
+        measure("Messages.") > width + crate::native_ui::TEXT_FIT_SLACK,
+        "premise: the word is wider than the box"
+    );
+    let lines = wrapped_copy_lines(text, px, width);
+    assert!(
+        lines.iter().all(|line| measure(line) <= width + 0.5),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().all(|line| line.chars().count() > 1),
+        "{lines:?}"
+    );
+    let rejoined = lines.iter().fold(String::new(), |mut text, line| {
+        if text.ends_with('-') {
+            text.pop();
+        } else if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(line);
+        text
+    });
+    assert_eq!(rejoined, text, "{lines:?}");
+    assert!(lines.iter().any(|line| line.ends_with('-')), "{lines:?}");
+    // CONTROL: every word fits — the walk's lines.
+    let wide = measure("Messages.") + 1.0;
+    let walked: Vec<String> = crate::tray_raster::ui_text_wrap_ranges(text, px, wide)
+        .into_iter()
+        .map(|range| text[range].trim_end().to_string())
+        .collect();
+    assert_eq!(wrapped_copy_lines(text, px, wide), walked);
+    // CONTROL: East Asian text, no hyphen.
+    let cjk = "設定ファイルを開いて保存します";
+    let lines = wrapped_copy_lines(cjk, px, measure("設定ファイ"));
+    assert!(lines.len() > 1, "{lines:?}");
+    assert!(lines.iter().all(|line| !line.ends_with('-')), "{lines:?}");
+}
+
+/// A CURSOR STYLE SAYS ITS WHOLE NAME AND DESCRIPTION (#71): at 80×24,
+/// 102×29 and 150×48 at 2× text and at 22 columns at 1×, every style row
+/// paints its name and its description whole, wrapped to the room beside the
+/// check mark ([`cursor_style_row`]) — or, where the row would be taller than
+/// a screen (22 columns at 2×), its description in a block of its own under
+/// it. They were cut to one line each: "Flames behind what you type and a
+/// red-hot e…", "Rainbow k… (default)".
+#[test]
+fn a_cursor_style_says_its_whole_name_and_description() {
+    at_each_text_scale(&[1.0, 2.0], "cursor style words", |scale| {
+        let sizes: &[(f32, f32)] = if scale > 1.5 {
+            &[
+                (584.0, 348.0),
+                (744.0, 420.0),
+                (1_095.0, 700.0),
+                (178.0, 348.0),
+            ]
+        } else {
+            &[(178.0, 348.0), (178.0, 516.0)]
+        };
+        for &(width, height) in sizes {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let (mut runtime, instance, view) = setup();
+            go_to_route(&mut runtime, instance, view, SettingsRoute::CursorStyles);
+            let styles = match runtime.view_state(view) {
+                Some(AppViewState::Settings(state)) => listed_cursor_styles(state),
+                _ => unreachable!(),
+            };
+            let mut said: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+            each_screen(
+                &mut runtime,
+                instance,
+                view,
+                &view_cx_at(width, height),
+                |compiled, _| {
+                    for node in compiled.paint.iter().filter(|node| !node.peek) {
+                        if let UiContent::Text(text) = &node.content {
+                            said.entry(node.key.as_str().to_string())
+                                .or_default()
+                                .push(text.text.clone());
+                        }
+                    }
+                },
+            );
+            let block = |key: &str| -> String {
+                let mut lines: Vec<(usize, String)> = said
+                    .iter()
+                    .filter_map(|(drawn, texts)| {
+                        let index = if drawn == key {
+                            0
+                        } else {
+                            drawn
+                                .strip_prefix(key)?
+                                .strip_prefix("/line-")?
+                                .parse()
+                                .ok()?
+                        };
+                        Some((index, texts.last()?.clone()))
+                    })
+                    .collect();
+                lines.sort();
+                painted_words(
+                    &lines
+                        .into_iter()
+                        .map(|(_, line)| line)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            };
+            // Every letter in order: a line a word broke at ends in a hyphen
+            // the break added, or in the word's own ("water-" / "drop").
+            let letters = |text: &str| -> String {
+                text.chars()
+                    .filter(|c| !c.is_whitespace() && *c != '-')
+                    .collect()
+            };
+            for style in styles {
+                let key = cursor_style_row_key(&style.value);
+                assert_eq!(
+                    letters(&block(&format!("{key}/name"))),
+                    letters(&style.label()),
+                    "{context}"
+                );
+                assert_eq!(
+                    letters(&block(&format!("{key}/description"))),
+                    letters(&style.description),
+                    "{context}: {key}"
+                );
+            }
+        }
+    });
+}
+
+/// THE CURSOR LINK SAYS ITS WHOLE LABEL (#72): Home's "Cursor style:
+/// Rainbow kitty (default)" beside More styles… where its words are whole in
+/// two lines there, else over it, at 80×24 and 22 columns, 1× to 2×. At
+/// 80×24 at 2× it read "Cursor style: Rainbow k…". Its button's words stay
+/// whole too, its arrow given up before a word is broken ([`choice_words`]):
+/// at 22 columns and 2× it painted "More" / "styl-" / "es…" beside an arrow
+/// whose room held "styles…" whole.
+#[test]
+fn the_cursor_link_says_its_whole_label() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "cursor link", |scale| {
+        for (width, height) in [(584.0, 348.0), (178.0, 348.0), (744.0, 420.0)] {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let screens = screens_of(|_, _| {}, SettingsRoute::Home, width, height);
+            // Its lines, by key, across the screens that draw them whole.
+            let mut lines = std::collections::BTreeMap::<String, String>::new();
+            for screen in &screens {
+                for node in screen.paint.iter().filter(|node| !node.peek) {
+                    if node
+                        .key
+                        .as_str()
+                        .starts_with("settings/cursor-style-link/label")
+                        && let UiContent::Text(text) = &node.content
+                    {
+                        lines.insert(node.key.as_str().to_string(), text.text.clone());
+                    }
+                }
+            }
+            let mut ordered: Vec<(usize, String)> = lines
+                .into_iter()
+                .map(|(key, text)| {
+                    let index = key
+                        .rsplit_once("/line-")
+                        .and_then(|(_, n)| n.parse().ok())
+                        .unwrap_or(0);
+                    (index, text)
+                })
+                .collect();
+            ordered.sort();
+            let label = painted_words(
+                &ordered
+                    .into_iter()
+                    .map(|(_, text)| text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            assert_eq!(label, "Cursor style: Rainbow kitty (default)", "{context}");
+            let button = screens
+                .iter()
+                .flat_map(|screen| &screen.paint)
+                .find_map(|node| match &node.content {
+                    UiContent::Button(button)
+                        if node.key.as_str() == "settings/control/cursor_trail_style" =>
+                    {
+                        button.spec.visual_label.clone()
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                button.split_whitespace().collect::<Vec<_>>(),
+                ["More", "styles\u{2026}"],
+                "{context}: {button:?}"
+            );
+            for screen in &screens {
+                let spilled = spilled_nodes(
+                    screen,
+                    &[
+                        "settings/cursor-style-link",
+                        "settings/control/cursor_trail_style",
+                    ],
+                );
+                assert!(spilled.is_empty(), "{context}: {spilled:#?}");
+            }
+        }
+    });
+}
+
+/// WALLPAPER KEEPS ITS STATUS AND ITS BUTTONS (#73): "No wallpaper. Dim and
+/// text tint apply once you choose an image." wraps to its card, whole, at
+/// 80×24, 102×29 and 150×48 at 2× text (it was cut on all three); and Choose
+/// Image… and Remove go one under the other, each inside the card, where a
+/// line cannot hold both (they ran past it at 22 columns, 1.5× and 2×).
+#[test]
+fn wallpaper_keeps_its_status_and_its_buttons() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "wallpaper", |scale| {
+        for (width, height) in NARROW_WIDTHS
+            .into_iter()
+            .map(|width| (width, 348.0))
+            .chain(WIDE_SIZES[..3].iter().copied())
+        {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let whole = whole_words_of(setup, SettingsRoute::Wallpaper);
+            for screen in screens_of(|_, _| {}, SettingsRoute::Wallpaper, width, height) {
+                let cut = words_cut(&screen, &whole, &["settings/wallpaper/"]);
+                assert!(cut.is_empty(), "{context}: {cut:#?}");
+                let spilled = spilled_nodes(&screen, &["settings/wallpaper/"]);
+                assert!(spilled.is_empty(), "{context}: {spilled:#?}");
+            }
+        }
+    });
+}
+
+/// TAB CONTROL KEEPS EVERY WORD OF ITS COMPUTERS AND TABS (#74): each
+/// computer's name, state and address, its vitals and its system, each
+/// tab's title and status, the session's line and the cards' headers wrap to
+/// their card at 22 columns to 150×48, 1× and 2× — the tree's branch running
+/// down beside a tab's lines — and its actions go to lines of their own. All
+/// of them were cut to one line ("m110-MacBook-P…", "Mac16,5 · Darwin 26
+/// ·…", "Coding Agent Har…").
+#[test]
+fn tab_control_keeps_every_word_of_its_computers_and_tabs() {
+    at_each_text_scale(&[1.0, 2.0], "tab control", |scale| {
+        for (width, height) in NARROW_WIDTHS
+            .into_iter()
+            .map(|width| (width, 516.0))
+            .chain(WIDE_SIZES[..3].iter().copied())
+        {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let whole = whole_words_of(every_page_runtime, SettingsRoute::Tabs);
+            let (mut runtime, instance, view) = every_page_runtime();
+            go_to_route(&mut runtime, instance, view, SettingsRoute::Tabs);
+            each_screen(
+                &mut runtime,
+                instance,
+                view,
+                &view_cx_at(width, height),
+                |screen, top| {
+                    let cut = words_cut(screen, &whole, &["tabs/"]);
+                    assert!(cut.is_empty(), "{context} screen {top}: {cut:#?}");
+                    let spilled = spilled_nodes(screen, &["tabs/"]);
+                    assert!(spilled.is_empty(), "{context} screen {top}: {spilled:#?}");
+                },
+            );
+        }
+    });
+}
+
+/// A PATH FIELD KEEPS ITS FILE'S NAME (#75): the fleet document's field,
+/// unset, shows where aterm reads it — `ai-fleet.toml` beside aterm.toml, by
+/// its path — and fits that path as a CLI's path is fitted, whole components
+/// either side of an ellipsis ([`crate::native_ui::path_forms`]), its file's
+/// name always, the whole path its accessible value; it read
+/// "ai-fleet.toml…". Where no one line holds a form of it, its longest form
+/// two lines hold goes on lines of the field, else "…/" and its name
+/// ([`path_placeholder_lines`]) — so the field is whole on some screen
+/// whatever the config folder's path: every folder of a long one on lines
+/// made the field 691pt tall in a 268pt list at 2× in a 22-column window. A
+/// path a field holds that is wider than the field keeps whole components
+/// too ("/Users/…/dotfiles/ai-fleet.toml"), never a folder cut inside its
+/// name.
+#[test]
+fn a_path_field_keeps_its_file_name() {
+    let long = "/Volumes/Work Disk/Shared Configuration/profiles/someone/settings/aterm";
+    at_each_text_scale(&[1.0, 2.0], "fleet path", |scale| {
+        for (folder, home) in [
+            ("/Users//someone/.config/aterm", "/Users//someone"),
+            (long, "/Users//someone"),
+        ] {
+            for width in NARROW_WIDTHS {
+                let context = format!("{scale}\u{d7} {width} {folder}");
+                let (mut runtime, instance, view) = every_page_runtime();
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!()
+                    };
+                    state.arm_config_file(
+                        Some(std::path::PathBuf::from(format!("{folder}/aterm.toml"))),
+                        Some(std::path::Path::new(home)),
+                        ConfigFileArm::inert(),
+                    );
+                }
+                go_to_route(&mut runtime, instance, view, SettingsRoute::Ai);
+                let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_AI_FLEET));
+                let (mut seen, mut whole) = (false, false);
+                each_screen(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &view_cx_at(width, 516.0),
+                    |screen, _| {
+                        let Some(node) = screen
+                            .paint
+                            .iter()
+                            .find(|node| node.key == key && !node.peek)
+                        else {
+                            return;
+                        };
+                        seen = true;
+                        whole |= node.clip.height >= node.rect.height - 0.5;
+                        // A form of the path ending in its file's name, whole
+                        // or on lines (a word wider than the field broken
+                        // with a hyphen), on two lines at most where a form
+                        // with a folder is shown.
+                        let painted = painted_text(node).unwrap_or_default();
+                        assert!(
+                            painted_words(&painted)
+                                .replace('-', "")
+                                .ends_with("aifleet.toml"),
+                            "{context}: {painted:?}"
+                        );
+                        assert!(
+                            painted.lines().count() <= 2 || painted.starts_with("\u{2026}/ai-"),
+                            "{context}: {painted:?}"
+                        );
+                        let value = screen.semantic(&key).map(|node| node.value.clone());
+                        assert_eq!(
+                            value,
+                            Some(SemanticValue::Text(format!("{folder}/ai-fleet.toml"))),
+                            "{context}"
+                        );
+                    },
+                );
+                assert!(seen, "{context}: the field is drawn");
+                assert!(whole, "{context}: the field is whole on some screen");
+            }
+        }
+    });
+    // A set path wider than its field.
+    let path = "/Users//someone/Library/Application Support/dotfiles/ai-fleet.toml";
+    let field = Control::new(
+        TextFieldSpec {
+            label: "Fleet document".to_string(),
+            placeholder: None,
+            secret: false,
+            visual_value: Some(path.to_string()),
+            input: None,
+            swatch: None,
+            trailing_hint: None,
+            description: None,
+            end_button: false,
+        },
+        ActionId::new("fleet"),
+    )
+    .value(SemanticValue::Text(path.to_string()));
+    let width =
+        crate::native_ui::text_field_width_for_text("/Users/…/dotfiles/ai-fleet.toml") + 2.0;
+    let compiled = crate::native_ui::UiTree::new(
+        UiNode::new("fleet", UiContent::TextField(field)).layout(
+            Layout::default()
+                .width(Length::Fixed(width))
+                .height(Length::Fixed(32.0)),
+        ),
+    )
+    .compile(LogicalRect::new(0.0, 0.0, width, 32.0))
+    .unwrap();
+    let line = compiled
+        .text_fit_audit_line(&UiKey::new("fleet"))
+        .unwrap_or_default();
+    assert!(
+        line.contains("painted=\"/Users/…/dotfiles/ai-fleet.toml\""),
+        "{line}"
+    );
+}
+
+/// A PINNED SUMMARY NEVER STARVES THE LIST: Modified's count and Reset All
+/// at 22 columns at 2× text took 178pt of a 268pt page and left its rows an
+/// 86pt list, so the row of a key only aterm.toml holds was never whole and
+/// its Reset and its way to Manual were on no screen; the summary is the
+/// list's first stop there, and every control of the page is whole on some
+/// screen. CONTROL: at 80×24 the summary stays pinned.
+#[test]
+fn a_pinned_summary_never_starves_the_list() {
+    at_each_text_scale(&[1.5, 2.0], "Modified summary", |scale| {
+        for width in [178.0, 192.0, 234.0, 276.0] {
+            let context = format!("{scale}\u{d7} {width}");
+            let (mut runtime, instance, view) = every_page_runtime();
+            go_to_route(&mut runtime, instance, view, SettingsRoute::Modified);
+            let mut whole = std::collections::BTreeSet::new();
+            each_screen(
+                &mut runtime,
+                instance,
+                view,
+                &view_cx_at(width, 348.0),
+                |screen, _| {
+                    for node in &screen.paint {
+                        if node.key.as_str().starts_with("settings/modified/")
+                            && matches!(node.content, UiContent::Button(_))
+                            && node.clip == node.rect
+                            && node.fade.is_none()
+                        {
+                            whole.insert(node.key.as_str().to_string());
+                        }
+                    }
+                },
+            );
+            for key in [
+                "settings/modified/reset-all",
+                "settings/modified/manual/reset/agents-auto-prime",
+                "settings/modified/manual/open/agents-auto-prime",
+            ] {
+                assert!(
+                    whole.contains(key),
+                    "{context}: {key} on no screen: {whole:?}"
+                );
+            }
+        }
+    });
+    at_each_text_scale(&[1.0], "Modified summary control", |_| {
+        let (runtime, instance, view) = every_page_runtime();
+        let mut runtime = runtime;
+        go_to_route(&mut runtime, instance, view, SettingsRoute::Modified);
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(584.0, 348.0));
+        let list = compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == "settings/list")
+            .map(|node| node.rect)
+            .expect("the list");
+        let summary = compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == "settings/modified/summary")
+            .map(|node| node.rect)
+            .expect("the summary");
+        assert!(summary.bottom() <= list.y + 0.5, "pinned over the list");
+    });
+}
+
+/// A CHOICE KEEPS ITS WORDS ON LINES: a stacked choice too narrow for its
+/// words on one line, its arrow given up, sets them on as many lines as it
+/// needs and its row grows ([`choice_words`]) — Home's font "Automatic (SF
+/// Mono)" read "Auto…" and the theme "Def…" at 2× text in a 22-column
+/// window, Sound's "Follow th…" at 1.5×; and a colour row's Choose… on a
+/// line of its own wraps its word ("Choos…"), a control row's name over its
+/// slider wraps ("Brightn…"), a Text & Fonts display face's switch stands
+/// inside its card (145.6pt in 110) under its name.
+#[test]
+fn a_narrow_row_keeps_its_words_and_its_controls_in_its_card() {
+    at_each_text_scale(&[1.5, 2.0], "narrow rows", |scale| {
+        for width in [178.0, 192.0] {
+            for route in [
+                SettingsRoute::Home,
+                SettingsRoute::Sound,
+                SettingsRoute::Appearance,
+                SettingsRoute::Terminal,
+                SettingsRoute::TabColor,
+                SettingsRoute::TextFonts,
+            ] {
+                let context = format!("{scale}\u{d7} {route:?} {width}");
+                let whole = whole_words_of(setup, route);
+                for screen in screens_of(|_, _| {}, route, width, 348.0) {
+                    let failures = screen.fit_failures();
+                    assert!(failures.is_empty(), "{context}: {failures:#?}");
+                    let cut = words_cut(
+                        &screen,
+                        &whole,
+                        &[
+                            "settings/control/",
+                            "settings/color-open/",
+                            "settings/color/",
+                            "settings/display-face/",
+                        ],
+                    );
+                    assert!(cut.is_empty(), "{context}: {cut:#?}");
+                    let spilled = spilled_nodes(&screen, &["settings/display-face/"]);
+                    assert!(spilled.is_empty(), "{context}: {spilled:#?}");
+                }
+            }
+        }
+    });
+}
+
+/// A CARD'S CAPTION WRAPS ON EVERY PAGE: a group's caption ("ONLY IN
+/// ATERM.TOML", "DISPLAY FACES"), Cursor Styles' ("ADJUST RAINBOW KITTY",
+/// "COMPANIONS") and a Top card's title ("Colors & appearance") take the
+/// lines their card needs at 22 columns, 1× to 2× — they were cut ("ONLY IN
+/// ATE…", "ADJUST RAINBOW KI…", "Colors & appeara…") or, on a field page,
+/// not drawn at all.
+#[test]
+fn a_cards_caption_wraps_on_every_page() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "captions", |scale| {
+        for route in [
+            SettingsRoute::Home,
+            SettingsRoute::Modified,
+            SettingsRoute::Manual,
+            SettingsRoute::CursorStyles,
+            SettingsRoute::TextFonts,
+        ] {
+            let context = format!("{scale}\u{d7} {route:?}");
+            let whole = whole_words_of(every_page_runtime, route);
+            let (mut runtime, instance, view) = every_page_runtime();
+            go_to_route(&mut runtime, instance, view, route);
+            each_screen(
+                &mut runtime,
+                instance,
+                view,
+                &view_cx_at(178.0, 516.0),
+                |screen, top| {
+                    let cut = words_cut(
+                        screen,
+                        &whole,
+                        &[
+                            "settings/group-heading/",
+                            "settings/manual/only-in-aterm-toml/heading",
+                            "settings/cursor-styles/",
+                            "settings/top/",
+                        ],
+                    );
+                    assert!(cut.is_empty(), "{context} screen {top}: {cut:#?}");
+                },
+            );
+        }
+    });
+}
+
+/// THE THEMES PAGE KEEPS ITS WORDS AND ITS BUTTONS IN ITS PANEL (#78, #61):
+/// at 22 and 24 columns, 1× to 2×, a theme's name wraps in its row
+/// ("Catppuccin L…"), Follow system's name wraps beside its switch
+/// ("Follo…"), Import… and the folder's button go one under the other
+/// inside the panel (the folder's ran out of it), the strip's Customize
+/// wraps ("Custo…") and Community wraps beside its chevron ("Com…").
+#[test]
+fn the_themes_page_keeps_its_words_and_buttons_in_its_panel() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "themes narrow", |scale| {
+        for width in [178.0, 192.0] {
+            for height in NARROW_HEIGHTS {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+                let whole = whole_words_of(setup, SettingsRoute::Themes);
+                for screen in screens_of(|_, _| {}, SettingsRoute::Themes, width, height) {
+                    let failures = screen.fit_failures();
+                    assert!(failures.is_empty(), "{context}: {failures:#?}");
+                    let cut = words_cut(
+                        &screen,
+                        &whole,
+                        &[
+                            "settings/showcase/card/",
+                            "settings/showcase/footer/",
+                            "settings/showcase/customize",
+                            "settings/showcase/pack",
+                            "settings/showcase/open-folder",
+                        ],
+                    );
+                    assert!(cut.is_empty(), "{context}: {cut:#?}");
+                    let spilled = spilled_nodes(&screen, &["settings/showcase/"]);
+                    assert!(spilled.is_empty(), "{context}: {spilled:#?}");
+                }
+            }
+        }
+    });
+}
+
+/// FOLLOW SYSTEM'S NAME GOES OVER ITS SWITCH BEFORE IT BREAKS A WORD: at 2×
+/// text in a 22-column window (178x348) the 33pt the chooser's footer left
+/// beside the switch set "Follow system" a few letters a line ("F-", "ol-",
+/// "lo-", "w", "s-", ...), nine lines that made the footer 324pt, taller
+/// than the 188pt list, so neither its name nor its switch was on any
+/// screen whole. The name now takes the footer's width over the switch, its
+/// words whole, and the two are whole on a screen. CONTROL: at 1× the name
+/// keeps its place beside the switch, its words whole there.
+#[test]
+fn follow_systems_name_goes_over_its_switch_before_it_breaks_a_word() {
+    // The name's painted lines on the last screen that draws them, whether
+    // they sit over the switch (else beside it), and whether some screen
+    // draws the name and the switch whole.
+    let footer = || {
+        let (mut runtime, instance, view) = setup();
+        replace_settings_source(&mut runtime, view, "theme = \"Default\"\n".to_string());
+        go_to_route(&mut runtime, instance, view, SettingsRoute::Themes);
+        let label = "settings/showcase/footer/follow-label";
+        let (mut lines, mut over, mut whole) = (Vec::new(), false, false);
+        each_screen(
+            &mut runtime,
+            instance,
+            view,
+            &view_cx_at(178.0, 348.0),
+            |screen, _| {
+                let drawn = screen
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        node.key.as_str() == label
+                            || node.key.as_str().starts_with(&format!("{label}/"))
+                    })
+                    .filter_map(|node| match &node.content {
+                        UiContent::Text(text) => Some((text.text.clone(), node.rect, node.clip)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let Some(switch) = screen
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "settings/showcase/follow-system")
+                else {
+                    return;
+                };
+                if drawn.is_empty() {
+                    return;
+                }
+                lines = drawn.iter().map(|(text, ..)| text.clone()).collect();
+                over = drawn
+                    .iter()
+                    .all(|(_, rect, _)| rect.bottom() <= switch.rect.y + 0.5);
+                whole |=
+                    switch.clip == switch.rect && drawn.iter().all(|(_, rect, clip)| clip == rect);
+            },
+        );
+        (lines, over, whole)
+    };
+    at_each_text_scale(&[1.0, 2.0], "follow system", |scale| {
+        let (lines, over, whole) = footer();
+        assert_eq!(lines, ["Follow", "system"], "{scale}x: its words whole");
+        assert_eq!(
+            over,
+            scale > 1.5,
+            "{scale}x: over its switch only where beside breaks a word"
+        );
+        assert!(
+            whole,
+            "{scale}x: the name and the switch whole on a screen: {lines:?}"
+        );
+    });
+}
+
+/// A THEME NOT IN USE GIVES UP ITS EMPTY ✓ SLOT BEFORE ITS NAME BREAKS A
+/// WORD: at 2× text in a 22-column window the chooser's "Dracula" broke
+/// "Drac-" / "ula" beside the slot the ✓ of the theme in use stands in,
+/// which paints nothing on any other row; with the slot given up it is
+/// whole. CONTROL: the theme in use keeps its ✓ (and its name the lines it
+/// takes beside it).
+#[test]
+fn a_theme_not_in_use_gives_its_name_the_check_slot() {
+    // Dracula's row in the chooser filtered to it, at 2× in a 22-column
+    // window, on every screen: its name's painted lines and its ✓ slot's
+    // words, if it has one.
+    let row = |source: &str| {
+        let (mut runtime, instance, view) = setup();
+        replace_settings_source(&mut runtime, view, source.to_string());
+        go_to_route(&mut runtime, instance, view, SettingsRoute::Themes);
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.showcase.filter =
+                crate::native_text_input::TextInputState::new("Dracula".to_string());
+        }
+        let name = "settings/showcase/card/dracula/name";
+        let text = |node: &crate::native_ui::PaintNode| match &node.content {
+            UiContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        };
+        let (mut lines, mut check) = (Vec::new(), None);
+        each_screen(
+            &mut runtime,
+            instance,
+            view,
+            &view_cx_at(178.0, 516.0),
+            |screen, _| {
+                let drawn = screen
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        node.key.as_str() == name
+                            || node.key.as_str().starts_with(&format!("{name}/"))
+                    })
+                    .filter_map(text)
+                    .collect::<Vec<_>>();
+                if !drawn.is_empty() {
+                    lines = drawn;
+                    check = screen
+                        .paint
+                        .iter()
+                        .find(|node| node.key.as_str() == "settings/showcase/card/dracula/check")
+                        .and_then(text);
+                }
+            },
+        );
+        (lines, check)
+    };
+    at_each_text_scale(&[2.0], "chooser check slot", |_| {
+        let (lines, check) = row("theme = \"Default\"\n");
+        assert_eq!(lines, ["Dracula"], "the name whole");
+        assert_eq!(check, None, "the empty slot is given up");
+        // CONTROL: Dracula in use.
+        let (lines, check) = row("theme = \"Dracula\"\n");
+        assert_eq!(check.as_deref(), Some("\u{2713}"), "{lines:?}");
+    });
+}
+
+/// A WRAPPED LINE OF WORDS PAINTS NO BOX (#76): words wrapped onto lines
+/// are a plain group over lines that carry their style; the group took the
+/// lines' style, and a group in a card's style is painted as a card, so at
+/// 22 columns at 2× text Packages' "No package activity recorded yet." stood
+/// in an accent-ringed box of its own, its words against the ring — and in a
+/// box per piece where a screen took it a part at a time.
+#[test]
+fn a_wrapped_line_of_words_paints_no_box() {
+    at_each_text_scale(&[2.0], "wrapped words box", |_| {
+        let mut wrapped = 0;
+        for screen in screens_of(|_, _| {}, SettingsRoute::Packages, 178.0, 348.0) {
+            for node in &screen.paint {
+                let key = node.key.as_str();
+                // The card itself, and its runs off the screen, are boxes.
+                if !key.starts_with("packages/activity/")
+                    || key.ends_with("/above")
+                    || key.ends_with("/below")
+                {
+                    continue;
+                }
+                if key.ends_with("/line-1") {
+                    wrapped += 1;
+                }
+                if let UiContent::Group(group) = &node.content {
+                    assert!(
+                        !matches!(
+                            group.style,
+                            StyleRef::Primary | StyleRef::Secondary | StyleRef::Code
+                        ),
+                        "{} paints a box",
+                        node.key.as_str()
+                    );
+                }
+            }
+        }
+        assert!(wrapped > 0, "premise: the activity line wraps");
+    });
+}
+
+/// HARNESS LISTS A TALL SESSION ROW BY THE ONE SPLITTER (#77): a SESSIONS
+/// row taller than its screen is listed a part at a time by the page's list
+/// ([`super::scroll::row_parts`]), the splitter every Settings list keeps —
+/// Harness kept one of its own from before it — and a landed row's parts
+/// read as the one accent card it wears, open where they meet
+/// ([`crate::native_ui::Joins`]); an open Timer's choices are one part.
+#[test]
+fn harness_lists_a_tall_session_row_by_the_one_splitter() {
+    use crate::native_app::SemanticInput;
+    at_each_text_scale(&[2.0], "session parts", |_| {
+        let (mut runtime, instance, view) = setup();
+        assert!(runtime.replace_settings_harness(super::harness::fixture(), 1));
+        go_to_route(&mut runtime, instance, view, SettingsRoute::Harness);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(crate::harness_screen::HARNESS_LAND),
+                    value: Some(SemanticInput::Text("session/7".to_string())),
+                }),
+            )
+            .unwrap();
+        let cx = view_cx_at(178.0, 348.0);
+        let mut pieces = std::collections::BTreeMap::new();
+        each_screen(&mut runtime, instance, view, &cx, |screen, _| {
+            for node in &screen.paint {
+                let key = node.key.as_str();
+                if key == "harness/session/7/block"
+                    || key.starts_with("harness/session/7/block/part-")
+                {
+                    pieces.insert(key.to_string(), node.joins);
+                }
+            }
+        });
+        assert!(
+            pieces.len() > 1,
+            "premise: the row is listed in parts: {pieces:?}"
+        );
+        let last = pieces.len() - 1;
+        for (index, (key, joins)) in pieces.iter().enumerate() {
+            assert_eq!(joins.above, index > 0, "{key}: {joins:?}");
+            assert_eq!(joins.below.is_some(), index < last, "{key}: {joins:?}");
+        }
+    });
+}
+
+/// The wraps of Latin Settings copy as `tests/fixtures/latin-wraps.txt`
+/// records them: [`line_pieces`], [`wrap_to_box`] under a char measure at
+/// five box widths and `ui_text_wrap_ranges` at three, as they broke before
+/// CJK took the shared line breaks (taken from that code, 2026-10-21); the
+/// walk's lines re-taken once a space past the box ended its line, the word
+/// before it kept (a note wrapped a word early, #79), with no empty line
+/// after a text's trailing space.
+fn latin_wraps() -> String {
+    let corpus = [
+        "Cursor blink",
+        "Show the tab bar when only one tab is open",
+        "aarch64-apple-darwin",
+        "~/.config/aterm/aterm.toml \u{b7} edited 3 minutes ago",
+        "https://github.com/alabsystems/aterm/releases --columns 120",
+        "Supervisor architecture \u{b7} Off \u{b7} from theme Dracula",
+        "Pneumonoultramicroscopicsilicovolcanoconiosis is long",
+        "a  b\tc\nd",
+        "",
+        "trailing space ",
+        "/usr/local/bin/aterm-lab-instance-runner",
+        "x-y--z//w/-v",
+        "Couldn't use your keybindings file \u{b7} line 3",
+    ];
+    let mut out = String::new();
+    for text in corpus {
+        out.push_str(&format!("P {text:?} => {:?}\n", line_pieces(text)));
+        for width in [6.0_f32, 10.0, 16.0, 24.0, 40.0] {
+            let lines = wrap_to_box(text, width, &|s: &str| s.chars().count() as f32);
+            out.push_str(&format!("W {text:?} {width} => {lines:?}\n"));
+        }
+        for width in [60.0_f32, 100.0, 160.0] {
+            let ranges = crate::tray_raster::ui_text_wrap_ranges(text, 13.0, width);
+            out.push_str(&format!("R {text:?} {width} => {ranges:?}\n"));
+        }
+    }
+    out
+}
+
+/// LATIN SETTINGS COPY WRAPS WHERE IT ALWAYS DID: breaking between CJK
+/// characters (the shared line breaks, [`aterm_grapheme::line_breaks`])
+/// moved no piece and no line of a Latin name, note or path (the golden
+/// record, taken from the code that broke only at spaces, hyphens and
+/// slashes).
+#[test]
+fn latin_settings_copy_wraps_where_it_always_did() {
+    let golden = include_str!("../tests/fixtures/latin-wraps.txt");
+    let now = latin_wraps();
+    let moved: Vec<(&str, &str)> = golden
+        .lines()
+        .zip(now.lines())
+        .filter(|(was, is)| was != is)
+        .take(8)
+        .collect();
+    assert!(moved.is_empty(), "moved wraps (was, is): {moved:#?}");
+    assert_eq!(golden.lines().count(), now.lines().count());
+}
+
+/// Characters a line may not start with ([`aterm_grapheme::line_breaks`]'
+/// kinsoku): the closers and small kana of the CJK samples below.
+const NO_LINE_START: [char; 6] = [
+    '\u{3002}', '\u{3001}', '\u{300d}', '\u{ff0c}', '\u{30fc}', '\u{30a1}',
+];
+
+/// CJK SETTINGS COPY WRAPS BETWEEN ITS CHARACTERS, at every box a 22- to
+/// 42-column window gives a setting's name or a page's copy, 1× and 2×
+/// text: each line of a name ([`row_name_lines`]) and of copy
+/// ([`wrapped_copy_lines`]) fits its box and is as full as the box holds,
+/// no line starts with a closer or a small kana or ends with an opener, no
+/// hyphen is put inside a CJK word, and the lines rejoined are the text.
+/// NEGATIVE CONTROL: broken only at spaces (else grapheme by grapheme, with
+/// a hyphen in a name), a name read "設定ファイルを読み-" and copy started a
+/// line with "。".
+#[test]
+fn cjk_settings_copy_wraps_between_its_characters() {
+    let samples = [
+        "設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。",
+        "无法保存设置文件，请检查文件夹的权限，然后再试一次。",
+        "コーヒーブレイク中にアップデートをダウンロードしています",
+    ];
+    at_each_text_scale(&[1.0, 2.0], "CJK copy", |scale| {
+        let (px, face) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+        let measure = |line: &str| crate::tray_raster::ui_text_width_for(face, line, px);
+        for text in samples {
+            for width in (48..=318).step_by(6).map(|width| width as f32) {
+                let context = format!("{scale}\u{d7} {width}pt {text:?}");
+                let names = row_name_lines(text, width);
+                let copy = wrapped_copy_lines(text, px, width);
+                // A name's lines are measured as they paint; copy's by the
+                // advances its wrap sums, within half a point of that.
+                for (what, lines, slack) in [
+                    ("name", &names, crate::native_ui::TEXT_FIT_SLACK),
+                    ("copy", &copy, 0.5),
+                ] {
+                    assert!(!lines.is_empty(), "{context}: no {what} lines");
+                    for line in lines.iter() {
+                        assert!(
+                            !line.is_empty(),
+                            "{context}: an empty {what} line {lines:?}"
+                        );
+                        assert!(
+                            !line.ends_with('-'),
+                            "{context}: a hyphen in a CJK {what} {lines:?}"
+                        );
+                        assert!(
+                            measure(line) <= width.max(48.0) + slack || line.chars().count() == 1,
+                            "{context}: {what} line {line:?} is wider than its box"
+                        );
+                    }
+                    for pair in lines.windows(2) {
+                        let (line, next) = (&pair[0], &pair[1]);
+                        let first = next.chars().next().expect("a line has a character");
+                        assert!(
+                            !NO_LINE_START.contains(&first),
+                            "{context}: {what} line {next:?} starts with {first:?}"
+                        );
+                        assert!(
+                            !line.ends_with(['\u{300c}', '\u{ff08}']),
+                            "{context}: {what} line {line:?} ends with an opener"
+                        );
+                    }
+                    assert_eq!(lines.concat(), text, "{context}: the {what} rejoined");
+                }
+                // A name's line is as full as its box holds: the next place
+                // the text may break would not fit it.
+                for pair in names.windows(2) {
+                    let (line, next) = (&pair[0], &pair[1]);
+                    let Some((_, piece)) = line_pieces(next).into_iter().next() else {
+                        continue;
+                    };
+                    assert!(
+                        measure(&format!("{line}{piece}")) > width + 0.01,
+                        "{context}: {line:?} / {next:?} broke early"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// A CJK MESSAGE'S TITLE IS PAINTED ON THE MESSAGES PAGE at every window a
+/// 22- to 42-column terminal gives Settings, short and tall, 1× and 2×,
+/// scrolled through every stop: the head paints the title (whole, or ended
+/// with `…` where its row cuts it, ruling 262), never nothing, never a line
+/// starting with a closer, and each painted line inside its box.
+#[test]
+fn a_cjk_message_title_is_painted_at_every_narrow_width() {
+    let title = "設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません";
+    at_each_text_scale(&[1.0, 2.0], "CJK message", |scale| {
+        for width in NARROW_WIDTHS {
+            for height in NARROW_HEIGHTS {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+                let (mut runtime, instance, view) = super::setup_with_messages();
+                let mut messages = super::sample_messages();
+                for entry in &mut messages.entries {
+                    if entry.id == 40 {
+                        entry.title = title.to_string();
+                    }
+                }
+                assert!(runtime.replace_settings_messages(messages, 8));
+                let cx = view_cx_at(width, height);
+                let mut seen = 0;
+                super::scroll_messages_through(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &cx,
+                    1,
+                    |screen, k| {
+                        let mut painted: Vec<(String, String)> = screen
+                            .paint
+                            .iter()
+                            .filter(|node| {
+                                !node.peek
+                                    && node
+                                        .key
+                                        .as_str()
+                                        .starts_with("settings/messages/row/40/label")
+                            })
+                            .filter_map(|node| match &node.content {
+                                UiContent::Text(text) => {
+                                    Some((node.key.as_str().to_string(), text.text.clone()))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if painted.is_empty() {
+                            return;
+                        }
+                        seen += 1;
+                        painted.sort();
+                        let shown: String = painted.iter().map(|(_, line)| line.as_str()).collect();
+                        let stem = shown.trim_end_matches('\u{2026}');
+                        assert!(
+                            title.starts_with(stem) && !stem.is_empty(),
+                            "{context} screen {k}: {shown:?} is not the title"
+                        );
+                        for (_, line) in painted.iter().skip(1) {
+                            let first = line.chars().next().unwrap_or(' ');
+                            assert!(
+                                !NO_LINE_START.contains(&first),
+                                "{context} screen {k}: a title line starts with {first:?}: {painted:?}"
+                            );
+                        }
+                        let spilled = spilled_nodes(screen, &["settings/messages/row/40/"]);
+                        assert!(spilled.is_empty(), "{context} screen {k}: {spilled:#?}");
+                    },
+                );
+                assert!(seen > 0, "{context}: the title is painted on some screen");
             }
         }
     });

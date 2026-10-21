@@ -21,7 +21,7 @@
 //!
 //! * a quiet child of a parent with no console, either way it was built: a
 //!   console (`GetConsoleProcessList` ≥ 1) with NO window (`GetConsoleWindow`
-//!   NULL) — the fix;
+//!   NULL);
 //! * a detached child: no console at all (list 0) — so "has a console" above is
 //!   a measurement, not a constant;
 //! * a quiet child of a parent that HAS a console: that console, shared (list
@@ -294,7 +294,7 @@ fn play_role(test: &str) -> bool {
     true
 }
 
-/// THE FIX: a parent with no console — the window's state — starts a quiet
+/// A parent with no console — the window's state — starts a quiet
 /// child, and the child has a console with no window (with one, the flash).
 #[test]
 fn a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window() {
@@ -322,7 +322,7 @@ fn a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window() {
     );
 }
 
-/// THE FIX, through the shipped constructor: a parent with no console, started
+/// A parent with no console, started
 /// as the windowed sibling is (`spawnfd::command`, then `set_gui_image_flags` replacing
 /// its choice with `Console::Detached`), starts `spawnfd::command(<this
 /// binary>)` — how every shipped child is built — and the child has a console
@@ -355,7 +355,7 @@ fn spawnfd_command_from_a_parent_with_no_console_gives_a_console_with_no_window(
     );
 }
 
-/// NON-VACUITY, the first other state: a detached child reports NO console, so
+/// Non-vacuity: a detached child reports no console, so
 /// the console the test above reads is one the quiet child was given, not one
 /// every child of this suite would report.
 #[test]
@@ -379,9 +379,9 @@ fn a_detached_child_has_no_console_at_all() {
     );
 }
 
-/// NON-VACUITY, the second other state: a parent that HAS a console — a quiet
+/// Non-vacuity: a parent that has a console — a quiet
 /// child of this suite, which shares the suite's console or, when the suite has
-/// none, gets a windowless one — starts a quiet child, and that child SHARES
+/// none, gets a windowless one — starts a quiet child, and that child shares
 /// the parent's console (two or more attached) instead of getting its own. This
 /// is the branch a terminal's `aterm pkg …` takes: its child's output reaches
 /// the screen and Ctrl+C reaches the child. Both levels are built by
@@ -419,7 +419,7 @@ fn have_console_agrees_with_the_code_page_oracle_here() {
     assert_eq!(facts.have_console, facts.attached > 0, "{facts:?}");
 }
 
-/// NON-VACUITY of `window`, with nothing on screen: a probe started on a ConPTY
+/// Non-vacuity of `window`, with nothing on screen: a probe started on a ConPTY
 /// pseudoconsole — the console of every aterm tab — reports a console whose
 /// `GetConsoleWindow` is NOT NULL (a pseudoconsole hands it an invisible
 /// stand-in window: a `PseudoConsoleWindow` created hidden and never shown,

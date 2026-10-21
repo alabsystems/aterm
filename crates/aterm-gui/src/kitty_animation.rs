@@ -1,25 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! KITTY ANIMATION PLAYBACK, the host's half: the loop's clock for the frames
-//! the engine plays.
+//! Kitty animation playback, the host's half: the loop's clock for the frames
+//! the engine plays ([`aterm_core::terminal::Terminal::advance_kitty_animations`]
+//! shows every due frame and says when the next one is).
 //!
-//! The engine plays a Kitty graphics animation
-//! ([`aterm_core::terminal::Terminal::advance_kitty_animations`]): given the
-//! time, it shows every frame that is due and says when the next one is. This
-//! module keeps that one instant per session and wakes the loop for it, so an
-//! animation is a scheduled wake per frame and never a busy redraw, and a
-//! session with nothing playing on screen folds nothing — an idle terminal
-//! never wakes for it.
-//!
-//! A session's clock is looked at when its program writes
-//! ([`App::tick_kitty_animations`] from the output wake: the bytes may start,
-//! stop or feed an animation) and when its frame comes due
-//! ([`App::service_kitty_animations`] on every wake, the way the other level
-//! clocks are judged, so a busy loop never re-arms a past instant). A frame
-//! that changed repaints every window showing the session. Kitty plays only
-//! what it draws: a session no window shows keeps its animation PARKED, with
-//! no wake, and the first wake that finds it shown again plays it on.
+//! One instant per session wakes the loop, so an animation costs a scheduled wake
+//! per frame, never a busy redraw, and an idle terminal never wakes for it. A
+//! session's clock is looked at when its program writes
+//! ([`App::tick_kitty_animations`] from the output wake) and when its frame comes
+//! due ([`App::service_kitty_animations`] on every wake, so a busy loop never
+//! re-arms a past instant). A session no window shows keeps its animation parked,
+//! with no wake, until a wake finds it shown again.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -214,9 +206,8 @@ mod tests {
         assert_eq!(app.kitty_animation_deadline(), None, "stopped: no wake");
     }
 
-    /// Kitty plays only what it draws: an animation in a tab no window shows
-    /// is PARKED — no wake, its frame held — and the first look after the tab
-    /// is shown again plays it on, arming its next frame.
+    /// An animation in a tab no window shows is parked (no wake, frame held) and
+    /// plays on at the first look after the tab is shown.
     #[test]
     fn an_animation_in_a_hidden_tab_waits_until_the_tab_shows() {
         let mut app = App::headless_for_test();

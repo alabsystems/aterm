@@ -28,8 +28,7 @@
 //!   accepts any input, including upstream's `feature_label = "..."`.
 //! * No `self_test_helper!`: the `self-test` feature is declared and inert.
 //!
-//! The crate retires with wgpu (the gpu-wgpu unit of
-//! docs/AUDIT-third-party-2026-10-15.md).
+//! Retires with `wgpu`.
 
 use proc_macro::{Literal, TokenStream, TokenTree};
 

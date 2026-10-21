@@ -157,9 +157,9 @@ impl KittyTenure {
         }
         match &self.candidate {
             Some((cand, since)) if cand.as_ref() == raw => {
-                if now.duration_since(*since) >= dwell_for(raw) {
-                    let cand = raw.cloned();
-                    self.candidate = None;
+                if now.saturating_duration_since(*since) >= dwell_for(raw)
+                    && let Some((cand, _)) = self.candidate.take()
+                {
                     self.land(cand, now);
                 }
             }
@@ -187,7 +187,9 @@ impl KittyTenure {
     /// armed deadline from spinning the event loop.
     pub fn poll(&mut self, now: Instant) -> bool {
         match self.candidate.take() {
-            Some((cand, since)) if now.duration_since(since) >= dwell_for(cand.as_ref()) => {
+            Some((cand, since))
+                if now.saturating_duration_since(since) >= dwell_for(cand.as_ref()) =>
+            {
                 let moved = cand != self.worn;
                 // Land even when not `moved`: a re-land refreshes the roster stamp
                 // and re-rules `arrival` as the observe path would.
@@ -219,7 +221,7 @@ impl KittyTenure {
         };
         for s in &mut self.roster {
             if s.as_ref().is_some_and(|h| {
-                h.greeted && h.id != id.id && now.duration_since(h.at) >= HOMECOMING
+                h.greeted && h.id != id.id && now.saturating_duration_since(h.at) >= HOMECOMING
             }) {
                 *s = None;
             }
@@ -250,7 +252,7 @@ impl KittyTenure {
     fn floor(&self, now: Instant) -> PetArrival {
         if self
             .last_hello
-            .is_none_or(|t| now.duration_since(t) >= HELLO_FLOOR)
+            .is_none_or(|t| now.saturating_duration_since(t) >= HELLO_FLOOR)
         {
             PetArrival::Ceremony
         } else {
@@ -978,5 +980,21 @@ mod tests {
             (launch, CompanionRung::Launch),
             "the launch kitty is the floor"
         );
+    }
+
+    #[test]
+    fn tenure_gate_saturates_rewound_clocks_without_panicking() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(10);
+        let mut gate = KittyTenure::default();
+        let claude = ident("claude");
+        let vim = ident("vim");
+        assert!(gate.observe(Some(&claude), t1).is_none());
+        assert!(gate.observe(Some(&claude), t0).is_none());
+        assert!(!gate.poll(t0));
+        gate.land(Some(claude), t1);
+        gate.commit_hello(t1);
+        gate.land(Some(vim), t0);
+        assert_eq!(gate.arrival(), PetArrival::Quiet);
     }
 }

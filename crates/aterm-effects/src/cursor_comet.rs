@@ -364,23 +364,22 @@ impl CursorComet {
         let wobble = |ym: f32| 1.0 + 0.05 * (ym * 0.55 / ch.max(1.0) * 10.0 + phase * 1.3).sin();
 
         // The heart, inside the caret cell: the stacked discs, clipped.
+        let (cxi, cyi) = (cx as i32, cy as i32);
         for &(r, cov, color) in &discs {
             let cov = cov as u8;
             if r < 1.0 || cov == 0 {
                 continue;
             }
             let premul = premul_rgb(color, cov);
+            let r2 = r * r;
             let r_i = r as i32;
             let mut dy = -r_i;
             while dy < r_i {
                 let h = slab.min(r_i - dy);
                 let ym = dy as f32 + h as f32 * 0.5;
-                let hw = ((r * r - ym * ym).max(0.0).sqrt() * wobble(ym)) as i32;
-                let (x0, x1) = ((cx as i32 - hw).max(cell_x0), (cx as i32 + hw).min(cell_x1));
-                let (y0, y1) = (
-                    (cy as i32 + dy).max(cell_y0),
-                    (cy as i32 + dy + h).min(cell_y1),
-                );
+                let hw = ((r2 - ym * ym).max(0.0).sqrt() * wobble(ym)) as i32;
+                let (x0, x1) = ((cxi - hw).max(cell_x0), (cxi + hw).min(cell_x1));
+                let (y0, y1) = ((cyi + dy).max(cell_y0), (cyi + dy + h).min(cell_y1));
                 if hw >= 1 && x1 > x0 && y1 > y0 {
                     push_rect(out, geom, x0, y0, x1 - x0, y1 - y0, premul);
                 }
@@ -423,6 +422,8 @@ impl CursorComet {
         // [`GLINT_BUDGET`], so with the rings under it no neighbouring letter
         // takes more than the over-ink budget.
         let glint_r = radius * 0.72;
+        let arm = ((ch * 0.11) as i32).max(1);
+        let cov_base = cov_core * (0.35 + 0.65 * e);
         for i in 0..GLINTS {
             let fi = i as f32;
             let ang = fi / GLINTS as f32 * std::f32::consts::TAU + phase * 0.55;
@@ -431,13 +432,12 @@ impl CursorComet {
             if tw < 0.55 {
                 continue;
             }
-            let cov = (cov_core * (0.35 + 0.65 * e) * (tw - 0.55) / 0.45).min(GLINT_BUDGET) as u8;
+            let cov = (cov_base * (tw - 0.55) / 0.45).min(GLINT_BUDGET) as u8;
             if cov == 0 {
                 continue;
             }
             let gx = (cx + ang.cos() * glint_r) as i32;
             let gy = (cy + ang.sin() * glint_r * 0.9) as i32;
-            let arm = ((ch * 0.11) as i32).max(1);
             let spark = premul_rgb(ICE_WHITE, cov);
             push_rect(out, geom, gx - arm, gy, 2 * arm + 1, 1, spark);
             push_rect(out, geom, gx, gy - arm, 1, arm, spark);
@@ -466,8 +466,11 @@ fn ring_row(
     out: &mut Vec<GlowQuad>,
 ) {
     let ym = y as f32 + h as f32 * 0.5 - cy;
+    let ym2 = ym * ym;
     let wob = wobble(ym);
-    let hw = discs.map(|(r, _, _)| (r * r - ym * ym).max(0.0).sqrt() * wob);
+    let hw = discs.map(|(r, _, _)| (r * r - ym2).max(0.0).sqrt() * wob);
+    let x_edges = hw.map(|w| ((cx - w).round() as i32, (cx + w).round() as i32));
+    let cx_round = cx.round() as i32;
     let (mut sum, mut acc) = (0.0f32, [0.0f32; 3]);
     for i in 0..discs.len() {
         let (_, cov, color) = discs[i];
@@ -475,7 +478,7 @@ fn ring_row(
         for (k, sh) in [16u32, 8, 0].into_iter().enumerate() {
             acc[k] += ((color >> sh) & 0xff) as f32 * cov;
         }
-        let (outer, inner) = (hw[i], hw.get(i + 1).copied().unwrap_or(0.0));
+        let outer = hw[i];
         if outer < 1.0 || sum <= 0.0 {
             continue;
         }
@@ -485,8 +488,8 @@ fn ring_row(
         }
         let avg = |k: usize| ((acc[k] / sum).round() as u32).min(255);
         let premul = premul_rgb((avg(0) << 16) | (avg(1) << 8) | avg(2), cov);
-        let (xo0, xo1) = ((cx - outer).round() as i32, (cx + outer).round() as i32);
-        let (xi0, xi1) = ((cx - inner).round() as i32, (cx + inner).round() as i32);
+        let (xo0, xo1) = x_edges[i];
+        let (xi0, xi1) = x_edges.get(i + 1).copied().unwrap_or((cx_round, cx_round));
         let spans: [(i32, i32); 2] = if xi1 > xi0 {
             [(xo0, xi0), (xi1, xo1)]
         } else {

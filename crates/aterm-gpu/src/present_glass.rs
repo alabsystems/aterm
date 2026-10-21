@@ -1,41 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Present to glass: the span after application present-return that the
-//! frontend's `metrics` ledger cannot see.
+//! Metal drawable present-to-glass latency and skip attribution.
 //!
-//! `aterm-gui`'s `present_latency` and `input_present` stop when
-//! `Frame::present` returns, so they cannot tell a window server holding the
-//! drawable from a parked main thread. On the macOS Metal path,
-//! `Frame::present` hangs an `addPresentedHandler:` on the drawable whenever a
-//! sink is installed. The handler reads `-[MTLDrawable presentedTime]` (on the
-//! `CACurrentMediaTime` clock) and reports the interval from the
-//! `presentDrawable:` registration to that instant. A drawable the compositor
-//! never showed (occluded window, replaced before its vsync, unparented layer)
-//! reports `presentedTime == 0`, delivered as [`GlassSample::Skipped`].
+//! When a [`GlassSink`] is installed via [`install_sink`], macOS Metal
+//! presentation registers an `addPresentedHandler:` callback on the drawable
+//! that measures `presentDrawable:` registration to `-[MTLDrawable presentedTime]`
+//! (`CACurrentMediaTime`), reporting [`GlassSample::OnGlass`] or
+//! [`GlassSample::Skipped`] (`presentedTime == 0`).
 //!
-//! # Attributing skips
+//! # Skip Attribution
 //!
-//! With display sync off, a burst presented faster than the refresh (such as
-//! the `input_hot` pacing bypass after a keystroke) makes the compositor show
-//! the newer drawable and drop the older one. Each present is therefore tagged
-//! at registration, on the registration clock: the presenting thread arms the
-//! pacing facts ([`arm_present`]: bypass state, occlusion hint, refresh period,
-//! previous registration instant), and [`registration_begin`] reads the
-//! registration time, decides whether it is within one refresh of the previous
-//! registration, and mints a serial. Deciding at registration rather than at
-//! arm time matters because a present can park in `nextDrawable` in between.
-//!
-//! A skipped frame is charged to its successor, the registration with the next
-//! serial (from a serial-indexed ring), whichever order handlers fire in. With
-//! several windows the successor may belong to another window; the
-//! process-wide instrument accepts that rather than keeping per-layer state in
-//! a handler that must not allocate. A skip whose successor is `Spaced` (or
-//! that is itself `Occluded`) was not a replacement.
-//!
-//! The frontend installs one sink with [`install_sink`]; with no sink no
-//! handler is registered. The handler runs on a Metal/CoreAnimation thread, so
-//! a sink must be lock-free and must not block or unwind.
+//! Before presenting, the caller arms [`arm_present`]; [`registration_begin`]
+//! records the registration timestamp, classifies the frame's [`PresentTag`]
+//! (`Occluded`, `HotBurst`, `IdleBurst`, or `Spaced`), and publishes it into
+//! a serial-indexed ring. When a frame is skipped, [`GlassReport::skip_attribution`]
+//! charges it to the next serial's tag (the frame that replaced it) or to
+//! `Spaced` / `Occluded` if unreplaced. Sink callbacks run on a
+//! Metal/CoreAnimation thread and must be lock-free and non-blocking.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};

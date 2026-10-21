@@ -2,24 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! A stationary scrolled-back repaint materializes no history rows.
-//!
-//! A scrolled-back viewport keeps its rows in a memo keyed by
-//! `HistoryEpoch`, so repeated frames (pill fade, cursor blink, effects,
-//! selection-drag mouse moves) cost nothing and a wheel notch pays only for
-//! the rows that scrolled in. Counts are exact and machine-independent, so
-//! they guard the structure (a memo that stops memoizing, an O(N) walk, a key
-//! that stops matching); they cannot see a constant-factor slowdown.
-//!
-//! Every zero is two-sided: the first scrolled-back frame must materialize the
-//! whole viewport (else the fixture is not reading history), and a notch must
-//! materialize exactly the rows that moved in.
+//! A stationary scrolled-back repaint materializes no history rows. A scrolled-back viewport
+//! keeps its rows in a memo keyed by `HistoryEpoch`, so repeated frames (cursor blink,
+//! effects, selection drags) cost nothing and a wheel notch pays only for the rows that
+//! scrolled in. The counts are exact, so they guard the structure (a memo that stops
+//! memoizing, an O(N) walk, a key that stops matching), not constant-factor speed. Every zero
+//! is two-sided: the first scrolled-back frame materializes the whole viewport, and a notch
+//! exactly the rows that moved in.
 //!
 //! Key fields covered: the memo hit and store (all fixtures), `content_gen`
-//! (`output_arriving_…`), `renumber` (`a_kitty_unscroll_…`) and `visible_rows`
-//! (all fixtures, through slot-table collisions). `cols` is an equivalent
-//! mutant: a width change reflows history and bumps `content_gen` anyway; it
-//! stays in the key as defence for a future resize path.
+//! (`output_arriving_…`), `renumber` (`a_kitty_unscroll_…`) and `visible_rows` (all
+//! fixtures, through slot-table collisions). `cols` is an equivalent mutant: a width change
+//! reflows history and bumps `content_gen` anyway; it stays in the key for a future resize
+//! path.
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
@@ -29,13 +24,10 @@ use aterm_scrollback::Scrollback;
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
-/// Deep enough that the whole viewport is history at [`DEPTH`], and deep enough
-/// that the rows read live below the ring's newest lines.
+/// Deep enough that the whole viewport is history at [`DEPTH`].
 const FILL: usize = 2_000;
 
-/// Where the scrolled-back arm parks: an ordinary "scrolled up to read the
-/// build output" distance, and comfortably more than [`ROWS`] so not one live
-/// row is on screen.
+/// Where the scrolled-back viewport parks: well past [`ROWS`], so no live row is on screen.
 const DEPTH: i32 = 200;
 
 /// One wheel notch, in lines.
@@ -90,11 +82,8 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
         "live-bottom control: a frame at the bottom reads no history at all"
     );
 
-    // Reach. The first scrolled-back frame finds a cold memo and pays for the
-    // whole viewport plus one: the incoming-row apron (the row just below the
-    // viewport, `Terminal::apron_row_into`) is read once per offset change and
-    // lands in the memo too. Fewer than ROWS + 1 means the fixture is not
-    // reading history.
+    // The first scrolled-back frame finds a cold memo and pays for the viewport plus the
+    // apron row below it (`Terminal::apron_row_into`), read once per offset change.
     term.scroll_display(DEPTH);
     frame(&mut term, &mut scratch);
     assert_eq!(
@@ -105,9 +94,7 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
          reached the SCR-1 path"
     );
 
-    // The claim. Every repaint after that, with the viewport motionless, is
-    // free. This is 24-per-frame -> 0, and it is what the pill fade, the cursor
-    // blink, an effects frame and a selection drag all stopped paying.
+    // Every repaint of the motionless viewport after that is free.
     for _ in 0..16 {
         frame(&mut term, &mut scratch);
     }
@@ -171,14 +158,11 @@ fn output_arriving_while_scrolled_back_reopens_the_bill() {
     );
 }
 
-/// The `history_renumber_epoch` half of the memo key, which `content_gen`
-/// cannot stand in for.
-///
-/// A Kitty CSI `+T` unscroll removes the newest scrollback lines: older rows
-/// keep their content but their absolute keys shift wholesale, and no
-/// content_gen, damage or row-revision signal distinguishes that from an
-/// append. Without `renumber` in `HistoryEpoch` every other test here stays
-/// green.
+/// The `history_renumber_epoch` half of the memo key, which `content_gen` cannot stand in
+/// for: a Kitty CSI `+T` unscroll removes the newest scrollback lines, so older rows keep
+/// their content but their absolute keys shift wholesale, and no content_gen, damage or
+/// row-revision signal tells that from an append. Without `renumber` in `HistoryEpoch` only
+/// this test fails.
 #[test]
 fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
     // A tiered store with a tiny ring, so most of the corpus sits in the tiers
@@ -191,9 +175,7 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
     frame(&mut term, &mut scratch);
     assert_eq!(take_viewport_row_materialize(), 0, "parked and warm");
 
-    // Reach, four ways — this fixture only proves anything while all of these
-    // hold, and three of them are the exact conditions that make the renumber
-    // epoch the sole authority.
+    // Preconditions: the fixture proves anything only while all four hold.
     let lines_before = term.grid().scrollback_lines();
     let gen_before = term.grid().content_gen();
     let renumber_before = term.grid().history_renumber_epoch();
@@ -225,10 +207,9 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
         "the absolute counter moved, so every memo key shifted on its own and \
          the misses below would prove nothing about the epoch"
     );
-    // The viewport keeps its depth across the unscroll, so the same 24 absolute
-    // keys are asked for again — while the line each one names has shifted by
-    // the three the unscroll pulled back onto the screen. Same keys, different
-    // rows: the collision `history_renumber_epoch` exists to prevent.
+    // The viewport keeps its depth, so the same 24 absolute keys are asked for again while
+    // the line each names has shifted by the three the unscroll pulled back: the collision
+    // `history_renumber_epoch` exists to prevent.
     assert_eq!(
         term.grid().display_offset(),
         usize::try_from(DEPTH).expect("DEPTH is positive"),

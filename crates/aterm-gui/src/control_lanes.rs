@@ -1,206 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The control socket's lanes: a request holds a thread, a connection does
-//! not. Supervised agent tabs each hold a persistent `RelayCtl` that is idle
-//! most of the time, so a connection must not pin a thread while idle.
+//! Control-socket lane scheduler: a request holds a thread, an idle connection
+//! does not.
 //!
-//! **A lane never waits on its peer.** It is given a connection only with a
-//! WHOLE request in hand — the line, and the body a frame announces (the
-//! handshake: its line) — and it queues the answer ([`Outbox`]) without waiting
-//! for the peer to read it. Everything else a peer can make a lane wait for is
-//! the PARKER's, multiplexed in its one `poll(2)`: the rest of a handshake, line
-//! or frame it began, the part of an answer it has not read yet, and the line
-//! that acknowledges a guarded artifact's challenge. Before (measured on a
-//! headless instance), eight peers that never finished their `AUTH` line (no
-//! token needed), stopped mid-line or mid-frame, or did not read a large answer
-//! (`help --full`, 190 KB) held all eight request lanes, and every other client
-//! was answered `ERR control server busy; retry` for as long as they liked; a
-//! deadline on each wait only made them reconnect when it ran out (eight such
-//! peers still left 0 of 50 fresh requests answered over 100 s), and a write
-//! bound cut off a pager that paused and was outlived by a reader taking a byte
-//! at a time. Likewise an artifact's handoff (`image`, `window`, `video`): its
-//! answer was written and its acknowledgement read on the request lane, for up
-//! to `ARTIFACT_HANDOFF_TIMEOUT` each, and four captures whose clients never
-//! acknowledged, beside the inline waits, held every lane. Now the outbox
-//! carries the handoff — its permit or guard, its challenge, its deadline — and
-//! the parker delivers it, awaits the one line, and fails it closed at the
-//! deadline. The one exception is the wait that IS the request: a relay, which
-//! carries its peer's bytes both ways on a wait lane.
+//! - **Request lanes** (`CONTROL_WORKERS` fixed threads): authenticate and serve
+//!   complete requests without waiting on the peer. Answers queue in [`Outbox`].
+//! - **Wait lanes** ([`GrowPool`], up to `CONTROL_WAIT_WORKERS` threads): serve
+//!   blocking/event-wait verbs (`await`, `ready`, `wait`, `turn`, bridge waits,
+//!   bounded cross-session paste, remote relays). When wait lanes are full, at
+//!   most `LaneLimits::inline` (`CONTROL_INLINE_WAITS`) request lanes serve waits;
+//!   further waits get a busy reply while keeping the connection open.
+//! - **Parker** ([`Parker`], one thread on Unix): multiplexes idle connections,
+//!   partial requests/handshakes ([`Conn::carry`]), unsent answer tails ([`Outbox`]),
+//!   and guarded-artifact challenge ACKs in one `poll(2)`.
+//! - **Subscription lanes** ([`GrowPool`], up to `LaneLimits::subscriptions`
+//!   threads): serve `subscribe` push streams until EOF.
 //!
-//! **Where a connection is, at any moment — exactly one of:**
+//! **Admission & eviction.** Placed connections are bounded by `LaneLimits::open`
+//! (`control_connections_cap`). At the cap, fresh arrivals replace the stalest
+//! parked connection that [`Conn::gives_way`] (authenticated and holding no live
+//! supervisor/drive claim).
 //!
-//! * on a request lane (`CONTROL_WORKERS` fixed threads), authenticating or
-//!   serving a request. Admission counts these, queued plus running.
-//! * on a WAIT lane ([`GrowPool`], at most `CONTROL_WAIT_WORKERS` threads, grown
-//!   on demand and kept): serving a request whose time is spent WAITING on an
-//!   event — `await`, `ready`, `wait`, `turn`, a `post` or `inbox get @…` that
-//!   parks on the bridge, a paste into another session waiting (bounded) for its
-//!   program to read it — or relaying the connection to a session this
-//!   instance does not host. A request lane that reads
-//!   such a line hands the connection over and is free again at once. No lane
-//!   waits on a program to WRITE to it: a verb's input never parks its lane
-//!   (`control::background_input`).
-//! * on a request lane SERVING A WAIT no wait lane can take — every one is
-//!   taken. At most `LaneLimits::inline` request lanes do so at once
-//!   (`CONTROL_INLINE_WAITS`); a wait past that gets the busy reply on its
-//!   connection, promptly, and the connection stays open. Before that bound, the
-//!   waits past the wait lanes (a 65th at once) took request lanes without
-//!   limit: eight of them held every lane for up to the waits' 600 s clamp, and
-//!   the next request of every parked driver — never refused, only queued —
-//!   waited behind them. Now what those waits and the artifact captures can hold
-//!   together always leaves a request lane free to serve requests. A wait with
-//!   requests PIPELINED behind it moves like any other, taking with it the bytes
-//!   its request lane had already read past it ([`Conn::carry`]): while such
-//!   waits stayed on their request lane the budget's four places turned the
-//!   fifth pipelining client away with most of the wait lanes free.
-//! * PARKED ([`Parker`], one thread): between requests — idle, or waiting on
-//!   its peer: for the rest of its next request (a handshake not yet whole
-//!   included), to take the rest of its last answer ([`Outbox`]), or for the
-//!   line that acknowledges a guarded artifact's challenge. One `poll(2)` over
-//!   every parked descriptor: `POLLOUT` while an answer is owed (nothing more is
-//!   read until it is delivered, so a connection holds at most one answer, and
-//!   of its requests no more than the next one needs and one read past it),
-//!   `POLLIN` otherwise, reading what arrives into [`Conn::carry`]. A
-//!   connection whose next request is whole goes back to the request lanes'
-//!   queue (a frame's header goes back before its body: see
-//!   [`LaneService::frame_header`]); one whose peer hung up with nothing left
-//!   to serve, whose acknowledgement was judged (one line, at most
-//!   `ACK_LINE_MAX` bytes: the guard released or quarantined, a guarded reply
-//!   being its connection's last), or whose handshake or handoff is not over
-//!   when its deadline runs out (`AUTH_READ_TIMEOUT` from admission;
-//!   `ARTIFACT_HANDOFF_TIMEOUT` from the answer) is closed right there — a
-//!   handoff dropped unfinished fails closed (`PendingHandoff`).
-//! * on a SUBSCRIPTION lane (a [`GrowPool`] of at most
-//!   `LaneLimits::subscriptions` threads, `control_subscriptions_cap`; one is
-//!   started with the request lanes, the rest on demand, and every one is
-//!   kept): a `subscribe` flipped it to push, which ended its tenure and gave
-//!   back its open-connection slot, and it is served there until its stream
-//!   ends. A flip no subscription lane can take — every one serving, and the
-//!   cap reached — is answered `ERR subscription capacity busy; retry` at once
-//!   and closed: a subscription may never end, so nothing queues behind one.
+//! **Parked memory budget.** Parked connections hold at most
+//! [`PARKED_BYTES_PER_LANE`] per request lane; excess evicts the stalest byte
+//! holder (sparing active readers via [`Conn::taking`] and claim holders until
+//! last). Unsent answers and incoming requests of at least [`SPILL_FROM`] bytes
+//! spill to private `mmap` regions ([`Spill`]) so their pages return to the OS
+//! immediately on completion or close.
 //!
-//! **Admission.** A fresh connection gets `ERR control server busy; retry`
-//! when every request lane is taken by work. The placed connections are capped
-//! (`control_connections_cap`: a quarter of the soft descriptor limit, at most
-//! `CONTROL_CONNECTIONS_MAX`), and that cap is the parker's capacity, so an
-//! idle connection always has a place to park and never keeps a lane (which
-//! would also starve the resumes queued behind it). The cap bounds open
-//! placed connections, not requests. Pending admissions hold additional sockets:
-//! the parker's inbox and its current batch each hold at most this cap, so up
-//! to three times the cap may occupy these admission/parking stages, apart
-//! from the listener's current socket and the subscription lanes.
-//! This is not a strict physical descriptor cap.
-//! AT the cap a fresh connection is handed to the parker — as many at once as
-//! there are parked connections, each owed one — which parks it to wait for
-//! its handshake like any begun request: in the slots of a connection that
-//! ended since, or else in those of the STALEST parked connection that GIVES
-//! WAY, which it closes ([`Lanes::take_the_stalest_place`]). One gives way
-//! when it has made its handshake and holds no live connection-bound claim (a
-//! claim is a supervisor's or a driver's, and would end with it; one still
-//! making its handshake has not been served once, and ends by its own
-//! deadline, `AUTH_READ_TIMEOUT`, if it never makes it); of those, the one
-//! whose peer has gone longest without sending or taking a byte is the
-//! stalest. A connection closed so while it awaits a guarded artifact's
-//! acknowledgement fails that handoff closed, as any close does. So the placed
-//! cap is never passed, clients arriving together never close one another
-//! before either is served, and a fresh client is turned away busy only for
-//! work or when no parked connection gives way to it. Before (2026-10-19),
-//! one same-user process holding the cap open — idle, half-sent or unread
-//! alike — had every fresh client answered busy for as long as it liked. A
-//! client whose idle connection is closed so rides it out as it does any
-//! hang-up: by dialling again.
-//!
-//! **What the parked hold.** Each parked connection holds at most one answer
-//! its peer has not taken (`help --full` is 279 KB) and one request not yet
-//! whole (a `feed-bin` up to `MAX_FEED_BIN`); an idle one holds no buffer at
-//! all. Across them the parker keeps at most [`PARKED_BYTES_PER_LANE`] per
-//! request lane — an answer at the protocol's line limit for each, so the
-//! answers the lanes make at once are never cut for the budget: past it, it
-//! closes the stalest connection holding bytes, by the same order (a claim
-//! holder last, but not spared, and before it one whose peer is taking its
-//! answer, so a reader working through a large answer is never closed for one
-//! parked unread beside it), until the rest fit — never the last one holding
-//! any, so one answer is never cut for its size alone. An unsent
-//! answer of [`SPILL_FROM`] or more leaves the heap as its connection parks,
-//! for a mapping of its own ([`Outbox::spill`]) whose pages go back to the
-//! system the moment it is delivered or its connection closes (an answer
-//! carrying a secret, `askpass`'s short line, stays in its guarded storage); a
-//! request that will need as much (a `feed-bin`'s body) gathers in such a
-//! mapping too ([`Unread::room_for_the_request`]), and is served from it.
-//! Measured on a headless instance (2026-10-19), rounds of 1024 connections
-//! each owed an unread `help --full`, closed between rounds: with the cap
-//! times one answer as the only bound, 292 MB of live heap; with the budget,
-//! 21 MB live, but the heap kept the pages of every answer freed on the
-//! parker's thread — footprint +256 MB the first round, +510 MB by the
-//! second, none of it given back when every connection closed; with the
-//! spill, +72 MB while owed (the budget's mappings) and +5.5 MB once all
-//! closed, the malloc zone 49 MB to 53 MB. 1024 connections each 200 KB into a
-//! 256 KB `feed-bin` body kept +145 MB after closing with the budget alone,
-//! +8 MB with the request spill.
-//!
-//! **If the parker fails.** Every parked connection lives in the parker, so a
-//! parker that died would strand them all — every supervisor loop and every
-//! long-lived client hung on a request nobody reads — and every connection
-//! parked after it. So its failures are bounded: a panic while one connection
-//! wakes costs that connection (closed, its claims released — what a lane's
-//! panic costs its own), as on the lanes; any other panic restarts its loop over
-//! the same parked set; and a parker that cannot go on (`PARKER_PANICS_IN_A_ROW`
-//! panics with no pass completed between them, or descriptors it cannot poll)
-//! STOPS, loudly (an `error` line) and safely: it closes every connection it
-//! holds (a hang-up, which every client already rides out by dialling again)
-//! and the lanes run as without a parker from then on — never a connection
-//! handed to a thread that is gone.
-//!
-//! **Why the parker polls a set it keeps.** A kqueue/epoll registration per
-//! parked connection (no bell, no inbox lock, no poll set refilled per wake) was
-//! weighed and rejected: it cannot keep the paragraph above. A parked
-//! connection carries its tenure, its unread bytes and its answer, so it is
-//! handed to the parker under a lock either way; a restart after a panic goes
-//! on over the same set; a parker that stops must find every connection it
-//! holds to close it, and nothing may be handed over after its last look,
-//! while a kernel registration set cannot be listed. A handshake's expiry still
-//! needs a scan or a timer per connection, and it would take two backends, the
-//! epoll one never compiled by the macOS build. What it would save — the bell's
-//! byte, two reads and an uncontended lock, all after the answer is out — is on
-//! no request's latency path, and `poll(2)` is linear in the descriptors
-//! either way, at most `CONTROL_CONNECTIONS_MAX`.
-//!
-//! **A connection's I/O.** Its unread bytes are one buffer for its life
-//! ([`Unread`]): a lane reads its requests from it, the parker gathers into it,
-//! and a move takes it along, never copied — save once, into a mapping, for a
-//! large request that parks (above). Its descriptor does not block while
-//! it is parked or while a lane gathers or delivers, and blocks while a request
-//! is served, since a handler may wait on its socket under a timeout of its own
-//! (a guarded artifact, askpass, a relay); the lanes switch it only when the
-//! mode they need differs from the one they last set ([`SocketMode`]), so a
-//! request on a kept connection costs two switches.
-//!
-//! **What is kept.** Per-connection request ORDER: one owner at a time; a
-//! connection moves only between requests; it parks only without a whole
-//! request in hand (a pipelined next request already whole is served where it
-//! is), taking what it holds of the next one along in [`Conn::carry`]; a wait
-//! that moves takes what its lane had read past it along, served first where it
-//! lands, before anything more is read from the socket; and an answer is
-//! delivered whole, in order, before the next request is read. The auth
-//! and uid checks (the listener's, and the handshake on the first lane). Claims
-//! bound to a connection (`meta set supervisor` without `ttl=`) stay bound across
-//! every move and are released when the connection ends, however it ends — the
-//! release is a drop guard ([`ConnTenure`]), so a lane's panic or the parker's
-//! close releases them too. The cut `RelayCtl`'s interrupter makes (a client-side
-//! `shutdown`) reads, wherever the connection is, as the hang-up it always was.
-//! Every queue is bounded and every thread count is capped. Without a parker
-//! (off unix, one that could not start, or one that stopped) a lane reads and
-//! writes its connection waiting, an idle connection stays on its lane, and the
-//! connection bound is the lanes', exactly as before (a handshake still has
-//! `AUTH_READ_TIMEOUT` from the lane's pick-up to be whole, and an artifact's
-//! handoff its deadline: [`Outbox::finish_waiting`], the same states the
-//! parker drives).
-//!
-//! Derived model: `aterm_models_native::control_lane_tenure_model` (a running
-//! parker's lanes; a stopped parker's fallback is the design it rejects, on
-//! purpose); its Tier-1 bind (`control_lanes_conformance.rs`) drives these lanes
-//! with real sockets.
+//! Derived model: `aterm_models_native::control_lane_tenure_model`
+//! (`control_lanes_conformance.rs`).
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Read, Write};
@@ -283,10 +113,7 @@ pub(super) struct LaneLimits {
     pub(super) rpc: usize,
     /// Wait lanes, at most.
     pub(super) wait: usize,
-    /// Request lanes serving a wait at once, at most (a wait no wait lane can
-    /// take); a wait past it gets the busy reply. Production keeps it below
-    /// `rpc`, so a request lane is always left for requests; the scheduling
-    /// tests' old-design rigs set it to `rpc`, the fallback as first shipped.
+    /// Max request lanes serving a wait when all wait lanes are busy.
     pub(super) inline: usize,
     /// Placed connections while the parker runs — its parking capacity.
     /// Pending admissions hold additional sockets (see the module doc).
@@ -305,10 +132,7 @@ const SUBSCRIPTION_BUSY_LINE: &[u8] = b"ERR subscription capacity busy; retry\n"
 #[cfg(unix)]
 const PARKER_PANICS_IN_A_ROW: usize = 3;
 
-/// How recently a parked connection's peer took bytes of its answer for the
-/// byte budget to count it as TAKING its answer ([`Conn::taking`]): far past
-/// the pace of a reader working through one (a chunk per read), so only a
-/// peer that stopped reading, or never began, is closed ahead of it.
+/// Window within which a peer that read answer bytes is treated as actively draining ([`Conn::taking`]).
 #[cfg(unix)]
 const TAKING_SPAN: Duration = Duration::from_secs(1);
 
@@ -316,12 +140,7 @@ const TAKING_SPAN: Duration = Duration::from_secs(1);
 /// from its peer once it is full, and so about the most one read takes.
 const READ_BUFFER: usize = 8 * 1024;
 
-/// The most the parked connections hold at once, together, PER REQUEST LANE —
-/// answers their peers have not taken and requests not whole yet — past which
-/// the parker closes the stalest that hold any (see the module doc): an answer
-/// at the protocol's own line limit (`MAX_CONTROL_REPLY_LINE_BYTES`, an image
-/// reply's row) for each lane, so the answers the lanes make at once are never
-/// cut for the budget. 64 MiB at the production eight lanes.
+/// Parked byte budget per request lane (`MAX_CONTROL_REPLY_LINE_BYTES`, 64 MiB across 8 lanes).
 #[cfg(unix)]
 const PARKED_BYTES_PER_LANE: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
 
@@ -436,16 +255,9 @@ impl Outbox {
         !self.segments.is_empty()
     }
 
-    /// Move the unsent rest of a large answer off the heap, into a mapping of
-    /// its own ([`Spill`]), as its connection parks: its heap buffers are
-    /// freed on the lane that filled them, so the heap churns as it does for
-    /// an answer taken whole, and the parked answer's pages go back to the
-    /// system the moment it is delivered or its connection closes. Held in the
-    /// heap past their lane and freed later on the parker's thread, such
-    /// answers left every freed page dirty and kept (see the module doc). An
-    /// answer holding a secret stays in its guarded storage (`askpass`'s line
-    /// is short), and a mapping that cannot be made keeps the answer where it
-    /// is.
+    /// Move the unsent tail of a large answer (`>= SPILL_FROM`) into an anonymous
+    /// mapping ([`Spill`]) before parking so heap pages are freed on the serving
+    /// lane and `munmap`ped on completion. Secret-bearing buffers are never spilled.
     #[cfg(unix)]
     fn spill(&mut self) {
         if !self
@@ -842,12 +654,8 @@ enum Gathered {
     Broken,
 }
 
-/// Bytes read from a connection's peer and not served yet: ONE buffer for the
-/// connection's life. A lane reads its requests from it ([`LaneReader`]), the
-/// parker gathers the rest of the next one into it, and a wait that moves takes
-/// it along with the connection: nothing is copied out and back between them.
-/// A large request that parks is the one exception: it moves, once, off the
-/// heap ([`Self::room_for_the_request`]), and is served from there.
+/// Per-connection unread byte buffer shared across lanes and the parker.
+/// Large requests (`>= SPILL_FROM`) gather in a [`Spill`] mapping.
 #[derive(Default)]
 pub(super) struct Unread {
     /// Initialized storage: `at..end` is unread, and `end..` is room for the
@@ -993,15 +801,8 @@ impl Unread {
         }
     }
 
-    /// Before the parker reads: a request that needs [`SPILL_FROM`] or more
-    /// goes into a mapping with room for the whole of it — a frame's line and
-    /// the body it announces, once its line is whole; a line not whole yet,
-    /// once the next read could take it past [`SPILL_FROM`], the longest line
-    /// any request may have plus one — moved again if it turns out to need
-    /// more. Read straight into, it is never read past: the heap holds no large
-    /// request while its peer is slow to send it (the same churn as an unsent
-    /// answer, [`Outbox::spill`]). A mapping that cannot be made leaves it on
-    /// the heap.
+    /// Allocate a [`Spill`] mapping when an incoming frame or long line reaches
+    /// [`SPILL_FROM`] so slow peers do not pin heap pages while parked.
     #[cfg(unix)]
     fn room_for_the_request(&mut self, authenticated: bool) {
         let carried = self.as_slice();
@@ -1145,14 +946,10 @@ impl BufRead for LaneReader<'_> {
     }
 }
 
-/// The `O_NONBLOCK` a connection's descriptor has as the lanes last set it, so
-/// they switch it only when the mode they need differs: it does not block while
-/// parked or while a lane gathers or delivers (a lane never waits on its peer),
-/// and blocks while a request is served. `O_NONBLOCK`, not `MSG_DONTWAIT`:
-/// Darwin's `send` ignores the flag on an `AF_UNIX` socket and blocks
-/// (measured on Darwin 25.6). `None` when nobody knows: a fresh connection, and
-/// one a handler has just had, since a handler may switch it itself (the
-/// handshake's and the ACK's detached-peer drain makes it non-blocking).
+/// Cached `O_NONBLOCK` state of a connection descriptor (non-blocking while
+/// parked or gathering/delivering on a lane; blocking during handler execution;
+/// `None` when unknown). Uses `O_NONBLOCK` because Darwin ignores `MSG_DONTWAIT`
+/// on `AF_UNIX` sockets.
 #[derive(Clone, Copy, Debug, Default)]
 struct SocketMode(Option<bool>);
 
@@ -1220,11 +1017,9 @@ pub(super) struct Conn {
     stream: CtlStream,
     /// `None` until the handshake on its first lane.
     scope: Option<Scope>,
-    /// Who presented its token (phase 3A, the session log's `by=`), from the
-    /// handshake.
+    /// Authenticated principal from the handshake.
     principal: Principal,
-    /// Who it is, as its typing is credited (S9): read at its first typing
-    /// verb and kept for its life ([`super::ServingCaller`]).
+    /// Typing caller identity cached on first typing verb ([`super::ServingCaller`]).
     caller: Option<Arc<crate::typed_by::Caller>>,
     tenure: ConnTenure,
     /// Bytes read from the peer and not served yet, read first wherever the
@@ -1270,17 +1065,10 @@ impl Conn {
         self.expires.or_else(|| self.reply.deadline())
     }
 
-    /// End the connection: an explicit shutdown first (a vanished macOS
-    /// AF_UNIX peer can otherwise linger in the kernel), then the tenure's
-    /// release and the open slot as the value drops.
-    ///
-    /// The shutdown is a HANG-UP of each half on its own
-    /// ([`aterm_uds::hangup::hang_up`]). A lane closes on its client's EOF,
-    /// and a client that half-closed after its request (`printf … | nc -U`)
-    /// is still reading; Darwin refuses a both-ways `shutdown` of a socket in
-    /// that state, shutting nothing, so such a client read its EOF only when
-    /// the last copy of this end closed — and a child any thread forked holds
-    /// one until it execs.
+    /// Shut down both socket halves via [`aterm_uds::hangup::hang_up`], release
+    /// connection claims, and free the open slot. Separate half-shutdowns ensure
+    /// half-closed peers (`nc -U`) still observe EOF on Darwin even if a forked
+    /// child inherited the fd.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1452,14 +1240,8 @@ impl<J> GrowPool<J> {
         }
     }
 
-    /// Hand `job` to a thread serving nothing, or to one `start` starts while
-    /// fewer than `max` run. `Err` hands it back.
-    ///
-    /// A new thread is started with no lock held: creating a thread can take a
-    /// while, and every thread that finishes a job and every submitter takes
-    /// this lock. The job is handed to that thread alone ([`Handed`]), counted
-    /// as running from here, so a thread that cannot start gives back its own
-    /// job, never one a thread serving nothing was counted on to take.
+    /// Dispatch `job` to an idle thread or spawn a new one (without holding the pool
+    /// lock) up to `max`. Returns `Err(job)` at capacity or if thread spawn fails.
     fn submit(
         &self,
         job: J,
@@ -2006,16 +1788,8 @@ impl Lanes {
         });
     }
 
-    /// Hand `conn` and the wait it just read to a wait lane: an idle one, or a
-    /// new one while the cap allows. Never queues behind running waits — a
-    /// wait no lane can take at once comes back, to be served where it is
-    /// (boxed: it is built only when no wait lane can take the wait).
-    ///
-    /// A new lane is spawned with no lock held: creating a thread can take a
-    /// while, and every wait lane that finishes a wait and every request lane
-    /// that defers one takes this lock. The wait is handed to that lane alone,
-    /// so a lane that cannot start gives back its own wait, never one an idle
-    /// lane was counted on to take.
+    /// Hand `conn` and `request` to an idle or newly spawned wait lane, or return
+    /// `Err` at capacity so the caller can serve or refuse it inline.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2271,12 +2045,7 @@ impl Lanes {
                     }
                 }
             };
-            // A wait read on a request lane moves to a wait lane when it can —
-            // with whatever this lane had read past it, so a request pipelined
-            // behind it is served after it, where it lands. When no wait lane can
-            // take it, it is served here only within the budget; past it, the
-            // busy reply — nothing served, the connection kept — so waits never
-            // hold more than `limits.inline` request lanes.
+            // Move wait requests (and any pipelined bytes) to a wait lane, or serve inline within `limits.inline`.
             let mut inline = None;
             if lane == Lane::Rpc && service.is_wait(&request, scope) {
                 if may_defer && self.limits.wait > 0 && self.moves_with(&reader) {
@@ -2340,10 +2109,7 @@ impl Lanes {
         self.inline.try_take()
     }
 
-    /// Whether a wait read on a request lane may move with what `reader` holds
-    /// behind it: always. The scheduling tests' negative control restores the
-    /// rule before the carry ([`Self::keep_pipelined_waits`]): only with
-    /// nothing buffered.
+    /// Whether a wait request may move to a wait lane with buffered bytes behind it.
     fn moves_with(&self, reader: &LaneReader<'_>) -> bool {
         #[cfg(all(test, unix))]
         if self.pipelined_waits_stay.load(Ordering::Acquire) {
@@ -2353,10 +2119,7 @@ impl Lanes {
         true
     }
 
-    /// The negative control's rule: a wait with anything buffered behind it
-    /// stays on its request lane (and so takes one of the budget's places, or
-    /// is answered busy, whatever the wait lanes hold) — the lanes before the
-    /// carry.
+    /// Negative-control toggle: keep waits with buffered pipelined bytes on their request lane.
     #[cfg(all(test, unix))]
     pub(super) fn keep_pipelined_waits(&self) {
         self.pipelined_waits_stay.store(true, Ordering::Release);
@@ -2370,9 +2133,7 @@ impl Lanes {
         &self.parker.get().expect("a parker runs").pause
     }
 
-    /// The negative control's rule: the cap refuses every fresh client, however
-    /// many parked connections could make room — the admission before
-    /// 2026-10-19.
+    /// Negative-control toggle: refuse fresh clients at the connection cap instead of evicting.
     #[cfg(all(test, unix))]
     pub(super) fn refuse_at_the_cap(&self) {
         self.cap_refuses.store(true, Ordering::Release);
@@ -2395,14 +2156,8 @@ impl Lanes {
         Err(Box::new(conn))
     }
 
-    /// Park a connection between requests: idle, or waiting on its peer for
-    /// the rest of its next request or to take the rest of its last answer. Its
-    /// socket stops blocking (the parker never waits on one descriptor). The
-    /// open-connection bound is the parker's capacity, so a slot is always free
-    /// here while the parker runs; the check stays, and a refusal keeps the
-    /// connection on its lane, as before — as does a parker that has stopped
-    /// (read under the inbox's lock, so no connection is handed over after its
-    /// last look), or a socket that cannot be made non-blocking.
+    /// Hand an idle or partial connection to the parker in non-blocking mode,
+    /// or return `Err` to keep it on the lane if the parker has stopped.
     #[cfg(unix)]
     #[cfg_attr(
         any(test, debug_assertions),
@@ -2855,13 +2610,8 @@ impl Conn {
         self.carry.hold_only_what_is_owed(self.scope.is_some());
     }
 
-    /// Whether a fresh client at the cap may take its place: it has made its
-    /// handshake and holds no claim. A claim is a supervisor's or a driver's,
-    /// and would end with it. A connection still making its handshake has not
-    /// been served once, and ends by its own deadline (`AUTH_READ_TIMEOUT`) if
-    /// it never makes it: clients arriving together never close one another
-    /// before either is served. (The byte budget spares neither: it closes a
-    /// claim holder last.)
+    /// Whether a fresh client at the connection cap may evict this parked connection
+    /// (authenticated and holding no live supervisor/drive claim).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3011,13 +2761,8 @@ impl Lanes {
         }
     }
 
-    /// Place a fresh connection admitted at the cap
-    /// ([`Self::admit_at_the_cap`]): it is parked, to wait for its handshake
-    /// like any begun request, in the slots — open and parked — of a
-    /// connection that ended since it was admitted (none is closed for it
-    /// then), or else in those of the stalest parked connection that gives way
-    /// ([`Conn::gives_way`]), which is closed for it (its peer sees a hang-up).
-    /// With none to give way, it is turned away busy.
+    /// Place a connection admitted at the cap into a freed slot or by evicting the
+    /// stalest parked connection that [`Conn::gives_way`], or reply busy.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3079,13 +2824,9 @@ impl Lanes {
         Some((open, place))
     }
 
-    /// Keep what the parked connections hold within the budget
-    /// ([`PARKED_BYTES_PER_LANE`] per request lane): close the stalest of
-    /// those holding any until the rest fit, never the last one holding any.
-    /// A claim holder goes last, and before it one whose peer is taking its
-    /// answer ([`Conn::taking`]): a reader working through a large answer is
-    /// never closed for one parked unread beside it, though that one was
-    /// served after the reader's last read. Returns what they hold.
+    /// Enforce the parked byte budget by closing the stalest byte-holding connections
+    /// (sparing active readers and claim holders until last, and never evicting the
+    /// sole byte holder).
     fn keep_parked_bytes_within(&self, parked: &mut Vec<Conn>) -> usize {
         let budget = self.parked_bytes_max.load(Ordering::Acquire);
         let holds = |conn: &Conn| conn.held_bytes() > 0;
@@ -3128,15 +2869,7 @@ impl<T> BoundedDispatch<T> {
     }
 }
 
-/// Of the parked connections `rank` admits, the one to close first when room
-/// is needed: the lowest rank, then the one [`Conn::stirred`] longest ago.
-/// Closing for a fresh client admits only those that give way
-/// ([`Conn::gives_way`]), all ranked alike; the byte budget every one holding
-/// bytes, one holding no claim before one that does (a claim is a
-/// supervisor's or a driver's, and ends with its connection), and one whose
-/// peer is not taking its answer before one whose peer is
-/// ([`Conn::taking`]). `Some` carries the candidate's rank, read once per
-/// scan; `None` excludes it.
+/// Index of the parked connection with the lowest `rank` and oldest [`Conn::stirred`] timestamp.
 #[cfg(unix)]
 fn stalest<R: Ord + Copy>(parked: &[Conn], rank: impl Fn(&Conn) -> Option<R>) -> Option<usize> {
     parked

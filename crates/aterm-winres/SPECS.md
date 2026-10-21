@@ -3,13 +3,11 @@
 
 # aterm-winres: spec recovery from its 6 unit tests
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 6 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes
-> are deleted. No test has been deleted yet.
+> Status: migration worklist. Each of the 6 specs below is proved through Trust/Clean about the
+> compiled Rust function, and then the tests it subsumes are deleted.
 
-Source: `crates/aterm-winres/src/lib.rs`, the crate's only file (read only). I read all 6
-`#[test]` fns in `mod tests` and every function they reach. Nothing was compiled or run; the
-claims below come from reading the code.
+Source: `crates/aterm-winres/src/lib.rs` (all 6 `#[test]` fns in `mod tests` and the functions they
+reach).
 
 Result: **6 specs**, covering **all 6 tests**. **0 tests are not spec samples** (§4).
 

@@ -53,7 +53,7 @@ pub(crate) const PASS: i32 = 0;
 /// At least one finding. See the transcript.
 #[cfg(target_os = "macos")]
 pub(crate) const FINDING: i32 = 1;
-/// The drive could not execute here. NOT a pass.
+/// The drive could not execute here. Not a pass.
 #[cfg(target_os = "macos")]
 pub(crate) const NOT_RUN: i32 = 2;
 /// A modal tracking loop never returned; the watchdog killed the process.
@@ -149,7 +149,8 @@ mod macos {
     }
 
     unsafe fn s_v_id(r: Id, s: Sel, a: Id) {
-        // SAFETY: as above, for `void (id, SEL, id)`.
+        // SAFETY: the caller passes a live receiver that implements `s`, and the
+        // cast is `s`'s exact prototype, here `void (id, SEL, id)`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             f(r, s, a);
@@ -655,8 +656,8 @@ mod macos {
     }
 
     /// Capture `view` through AppKit's `-cacheDisplayInRect:` pair and return
-    /// `(w, h, bytes)`: what `drawRect:` actually put down, so a port that
-    /// registered every encoding correctly and drew the wrong thing is caught.
+    /// `(w, h, bytes)`: what `drawRect:` actually put down, so a class that
+    /// registers every encoding correctly yet draws the wrong thing is caught.
     unsafe fn capture(view: Id) -> Option<(usize, usize, Vec<u8>)> {
         // SAFETY: `view` is a live `NSView` on the main thread; the two sends
         // are the documented caching pair and the rep's accessors are
@@ -823,7 +824,7 @@ mod macos {
         None
     }
 
-    /// One declared class, audited off a LIVE instance.
+    /// One declared class, audited off a live instance.
     struct Declared {
         /// The instance this class was read from, and how it was found.
         found_by: &'static str,

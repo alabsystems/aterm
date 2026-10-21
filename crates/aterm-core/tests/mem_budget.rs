@@ -2,14 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Engine retained-heap ceiling, a deterministic gate.
-//!
-//! It pins the engine's retained heap for a 24x80 grid under a committed ceiling so a
-//! real regression — accidental per-cell boxing, scrollback bloat, a leak on the
-//! process path — fails the build. The number is deterministic: the grid is pre-allocated,
-//! cells are inline, so a full screen of SGR text retains ZERO additional heap.
-//!
-//! The counting global allocator applies only to this test crate.
+//! Engine retained-heap ceiling for a 24x80 grid, so per-cell boxing, scrollback bloat or a
+//! leak on the process path fails the build. The number is deterministic: the grid is
+//! pre-allocated and cells are inline, so a full screen of SGR text retains (within slack) no
+//! more heap than a fresh terminal. The counting global allocator is this binary's alone.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -46,8 +42,8 @@ fn retained<T>(f: impl FnOnce() -> T) -> (i64, T) {
     (held, v)
 }
 
-/// 24 full rows of mixed ASCII + SGR — fills the visible screen without scrolling
-/// far past it, so the measurement is dominated by the grid, not scrollback config.
+/// 24 full rows of mixed ASCII + SGR, placed by CUP: fills the screen without scrolling, so
+/// the grid dominates the measurement.
 fn screen_fill() -> Vec<u8> {
     let mut v = Vec::new();
     for r in 0..24 {
@@ -61,8 +57,7 @@ fn screen_fill() -> Vec<u8> {
     v
 }
 
-/// A full screen of SGR text retains no additional heap (`filled == fresh`);
-/// the ceiling leaves about a third of headroom over the fresh terminal.
+/// Ceiling on a filled terminal's retained heap: about a third of headroom over a fresh one.
 const MEM_BUDGET_24X80_BYTES: i64 = 96 * 1024;
 
 #[test]
@@ -87,8 +82,7 @@ fn engine_retained_heap_within_budget() {
         "engine retained heap {filled}B exceeds MEM-BUDGET ceiling {MEM_BUDGET_24X80_BYTES}B \
          — investigate (per-cell heap? scrollback bloat? leak on the process path?)"
     );
-    // Filling a full screen must not balloon the heap: the grid is pre-allocated and
-    // cells are inline. Lock that property (8KB slack for incidental bookkeeping).
+    // 8 KiB of slack for incidental bookkeeping.
     assert!(
         filled <= fresh + 8 * 1024,
         "filling a 24x80 screen grew retained heap by {}B (fresh={fresh}, filled={filled}) \

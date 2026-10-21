@@ -106,7 +106,7 @@ pub enum StageId {
     /// The JS glue generator on aterm-wasm-abi's toy module
     /// ([`crate::wasm_glue`]).
     WasmGlue,
-    /// Both web modules in headless Chromium and Firefox: a WebGL2 boot,
+    /// Both web modules in headless Chromium, Firefox and WebKit: a WebGL2 boot,
     /// GPU vs CPU pixels, on the page and in a worker (`crate::browser`).
     BrowserLane,
     Forge,
@@ -119,13 +119,19 @@ pub enum StageId {
 }
 
 /// The stages that put a window on the desktop, each with the name its
-/// `--no-windows` skip carries. Every other stage drives a headless instance,
-/// a stand-in, or no binary at all.
+/// `--no-windows` skip carries. A [`WINDOWED_ROWS`] stage opens one in some
+/// of its rows; every other stage drives a headless instance, a stand-in, or
+/// no binary at all.
 pub const WINDOWED: [(StageId, &str); 3] = [
     (StageId::GuiSmoke, "gui smoke"),
     (StageId::RedrawConformance, "redraw conformance"),
     (StageId::ObjcDrives, "objc drives"),
 ];
+
+/// The stages that run under `--no-windows` but answer a named skip, of their
+/// own, for the rows that would open a window: the browser lane's WebKit
+/// session keeps its headless pages in windows (`crate::browser`).
+pub const WINDOWED_ROWS: [StageId; 1] = [StageId::BrowserLane];
 
 /// The stages whose verdicts read the machine's timing: two runs of them on
 /// one machine at once would judge each other. They take a machine-wide
@@ -151,6 +157,13 @@ impl StageId {
                  --no-windows when the desktop is free)"
                 )
             })
+    }
+
+    /// Does `--no-windows` change what this stage does ([`WINDOWED`] or
+    /// [`WINDOWED_ROWS`])? A rerun of its check keeps the flag.
+    #[must_use]
+    pub fn opens_windows(self) -> bool {
+        self.no_windows_skip().is_some() || WINDOWED_ROWS.contains(&self)
     }
 
     /// Does this stage judge timings ([`TIMED`])?
@@ -331,7 +344,7 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::BrowserLane,
-            "browser lane (both web modules in headless Chromium and Firefox: WebGL2, GPU vs CPU pixels)",
+            "browser lane (both web modules in headless Chromium, Firefox and WebKit: WebGL2, GPU vs CPU pixels)",
             Lane::CellsTarget,
         ),
         spec(

@@ -203,6 +203,26 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::StatsBarsDeck => spec("sys.stats_bars.deck", S::Process, A::ConfigMutate, C::Any),
         M::StatsBarsSill => spec("sys.stats_bars.sill", S::Process, A::ConfigMutate, C::Any),
         M::StatsBarsOff => spec("sys.stats_bars.off", S::Process, A::ConfigMutate, C::Any),
+        // The Deck Size radio writes `[sys] stats_deck_size`: the Stats Bars
+        // radio's class.
+        M::DeckSizeAuto => spec(
+            "sys.stats_deck_size.auto",
+            S::Process,
+            A::ConfigMutate,
+            C::Any,
+        ),
+        M::DeckSizeFull => spec(
+            "sys.stats_deck_size.full",
+            S::Process,
+            A::ConfigMutate,
+            C::Any,
+        ),
+        M::DeckSizeFolded => spec(
+            "sys.stats_deck_size.folded",
+            S::Process,
+            A::ConfigMutate,
+            C::Any,
+        ),
         // The lens: a summoned overlay on the front window, runtime view
         // state only (the font zoom's class).
         M::ToggleStatsLens => spec("sys.stats_lens.toggle", S::Window, A::LocalUi, C::Any),
@@ -248,6 +268,20 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
         "editor/goto-line" => spec("document.goto_line", S::Document, A::LocalUi, C::Native),
         "editor/commands" => spec("document.commands", S::Document, A::LocalUi, C::Native),
         "editor/revert" => spec("document.revert", S::Document, A::DocumentWrite, C::Native),
+        // An `edit` view's header row: done saves and closes, abort discards
+        // and closes, each answering the program that waits.
+        "editor/finish" => spec(
+            "document.finish_edit",
+            S::Document,
+            A::DocumentWrite,
+            C::Native,
+        ),
+        "editor/abort" => spec(
+            "document.abort_edit",
+            S::Document,
+            A::DocumentWrite,
+            C::Native,
+        ),
         "editor/config-problem-next" | "editor/config-problem-previous" => {
             spec("config.problem.navigate", S::View, A::LocalUi, C::Native)
         }

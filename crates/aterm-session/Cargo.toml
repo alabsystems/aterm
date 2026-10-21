@@ -2,8 +2,8 @@
 # Copyright 2026 Andrew Yates
 [package]
 name = "aterm-session"
-# Integration tests are declared below, not discovered. With autotests off a
-# `tests/*.rs` file listed nowhere never compiles.
+# Integration tests are declared below: with autotests off, an unlisted `tests/*.rs`
+# never compiles.
 autotests = false
 version.workspace = true
 edition.workspace = true
@@ -15,23 +15,16 @@ description = "Hierarchical-session routing fabric: stable session ids, the per-
 
 [dependencies]
 aterm-pty = { workspace = true }
-# THE workspace's one audited entropy surface (`aterm_uds::rand::fill`:
-# getentropy(2) with a bounded read_exact fallback, BCryptGenRandom on Windows,
-# hex encoding checked exhaustively by
-# `rand::tests::hex_encode_is_exact_lowercase_and_injective`). Session ids and
-# launch nonces mint through it — and it is why this crate needs no `rand_core`.
-# Dependency-free leaf, so it adds no third-party package.
+# The workspace's audited entropy source (`aterm_uds::rand::fill`): session ids and
+# launch nonces mint through it, so this crate needs no `rand_core`.
 aterm-uds = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
-# Derived-spec models (ty_model!) + the in-process interpreter for the fabric's
-# bounded state machines (the edge gate, the sink no-loss loop). The exhaustive
-# TLA+ `ty` model-check is gated on the external `ty` binary; the interpreter-driven
-# proves/catches run unconditionally. Also makes the fd-lifecycle anchors expand
-# under plain `cargo test -p aterm-session` (the `test` cfg in the cfg_attr gate).
+# `ty_model!` models and the interpreter for the conformance tests; the `test` cfg also
+# expands the fd-lifecycle anchors.
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
@@ -40,6 +33,13 @@ aterm-models-session = { workspace = true }
 # end is never drained (a wedged foreground), so the non-parking spill path is
 # exercised end-to-end against a full kernel buffer.
 libc = { workspace = true }
+
+# The Windows suite spawns its programs in real ConPTY sessions
+# (`tests/windows_input_release.rs`), minting the capabilities a spawn takes.
+[target.'cfg(windows)'.dev-dependencies]
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
+aterm-sandbox = { workspace = true }
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

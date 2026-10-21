@@ -1,137 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `SupervisorUsageWall` (aterm-spec
-//! `supervisor_usage_wall_model`): the REAL screen reader (`aterm_phase::read`,
-//! over the measured 2026-09-28 weekly wall with and without the background
-//! shell the tab counted) and the REAL turn-end decider (`decide_turn_end`,
-//! with the real `TurnEndState` it keeps) driven along EVERY reachable state
-//! of the model, so "a wall whose tokens are back does not stand for good" is
-//! the code's, state for state.
+//! Tier-1 conformance test for `SupervisorUsageWall`
+//! (`supervisor_usage_wall_model`), driving `aterm_phase::read` and
+//! `decide_turn_end` (`TurnEndState`) across every reachable model state:
 //!
-//! Each model action is mirrored on the real side. The world (`BackgroundStarts`,
-//! `BackgroundEnds`, the account's `due` tick) is invisible to the decider
-//! except through the SCREEN: `bg` decides whether the done row counts `1 shell
-//! still running` and the footer `· 1 shell ·`, and the real reader must still
-//! hand the decider the wall; a wall appearing is the point `observe`d with
-//! the turn's work; time at the wall is the real clock moved a minute per tick
-//! (`reset_grace` = `Grace`, `limit_backoff` = `Rung1`, `Rung2`); `Act` is the
-//! decider's own act, recorded with `acted`; `Met` is the next point observed
-//! with the wall on the screen again, `Taken` a point with none after real
-//! work. At every state the model's invariant holds and the decider TYPES
-//! exactly where `Act` is enabled (`usage-resume@v1`, the continuation), and
-//! otherwise WAITS until exactly the tick `Act` becomes enabled.
-//!
-//! The reset the decider is handed is the REAL placement's, kept on the real
-//! side as the loop keeps it: a wall seen arriving is placed on its print
-//! ([`place_reset`]); a wall FOUND sitting has no print to go by and is placed
-//! by the session window's rule, its far bare clock in the past (`view = 1`);
-//! and at `Met` the wall is placed on the print again exactly where the loop
-//! reads it as one it watched — a turn seen run before it, or the act left
-//! untaken by the REAL `TurnEndState::untaken_act` (Claude Code held the
-//! line, no turn ran: the walk runs `Met` both ways).
-//! NEGATIVE CONTROLS: the `Buggy = 1` model disagrees (a first act at once); the same walk with the
-//! reader replaced by the precedence of 2026-09-28 (Busy beats a wall, so a
-//! screen that counts a shell reads busy) disagrees at a `bg = 1` wall —
-//! the stall the model's liveness calls `WallMasked`; and the loop of
-//! 2026-10-01, which read a wall standing after an untaken act as no print,
-//! disagrees after an unseen `Met` of a wall found sitting.
-//!
-//! THE LEFT WALL (`NoticeLeaves`, the review of 2026-10-14): the wall's notice
-//! leaves an idle screen — here the measured wall with a person's `/model`
-//! under it on a tab with no shell, which the real reader reads idle with no
-//! wall — and the real decider waits on the reset the notice named and acts
-//! there exactly where the model's `Act` is enabled at `wall == 6`. A person's
-//! turn there that the account serves (`PersonTurnServed`), over before any
-//! read saw it busy, is its prompt and reply drawn under the notice: read by
-//! the real `TurnEndReading::of` and folded in by the real `observe`, it ends
-//! the wait. At every transition the real state's own word on the wait
-//! (`TurnEndState::waits_on_named_reset`) is the model's (`wall != 0`).
-//! The account may lift the limit BEFORE the reset the notice named
-//! (`LimitLiftedEarly`: the decider cannot see it, and a turn served then is
-//! served before the reset). Another conversation `/resume`d there
-//! (`ConversationResumed`) is ITS history on the screen — the measured 2.1.299
-//! screen of a different limit (`resets 10:38am`), a person's turn served
-//! under it — and the real decider, which ties a served turn to the notice of
-//! the limit it waits on, waits on to the reset. So for one `/resume`d while
-//! the wall SHOWS, its countdown armed (`ArmedConversationResumed`, W1 of
-//! ATERM-KI-1015-1): the measured 2.1.300 screen of an older limit the vendor
-//! continued by itself, whose word the real decider ties to that limit's
-//! notice, not this one's.
-//! NEGATIVE CONTROLS: the loop before 2026-10-14, which read a person's turn
-//! no read saw busy as no turn, still waits after a `PersonTurnServed`,
-//! before the reset too — the model's `PersonTurnUnseen`; the loop of
-//! 44ed0f339, which counted a turn served under ANY limit's notice, ends the
-//! wait after a `ConversationResumed` — the model's
-//! `OtherLimitsTurnRead`; and the loop of ef02ee212, which read the vendor's
-//! continuation under ANY limit's notice as this limit's, ends it after every
-//! `ArmedConversationResumed` — the model's `OtherLimitsContinuationRead`.
-//!
-//! THE OWN ACT'S TAKE WINDOW (`OwnActTyped`, `held`; round 16): the continue
-//! policy's act at a turn's end is recorded as typed (`acted`), with the real
-//! take window (30 s, under a tick); a wall that appears while it is open
-//! answered it at once — read with no turn's work, no busy read — and the
-//! real `observe`, which does not judge the act inside its window, tracks the
-//! wall all the same: the real state waits on the reset its notice named
-//! from that first reading, and through its notice leaving inside the
-//! window; the decider waits out the window (the model's `Act` is off while
-//! `held`) and then the reset. NEGATIVE CONTROL: the loop before round 16,
-//! which folded a wall in only at a point, waits on nothing after a wall
-//! that appears inside the window — the model's `TakeWindowDropsWall`.
-//!
-//! THE RETRY'S TAKE WINDOW (`Act` opens `held`; round 16's review): the
-//! decider's own `usage-resume@v1` has the real window too. `MetInWindow` is
-//! the wall answering it at once (the stub's immediate 429): read inside the
-//! window with no turn's work — placed on the print, as the loop places a
-//! wall that answered an act of its own untaken (the real
-//! `TurnEndState::untaken_act`, inside the window or past it) — and its
-//! notice may leave there (`NoticeLeaves`). The window's end, finding no
-//! wall, judges the retry MET, never taken: the real state waits on, and the
-//! decider waits the next rung, where the model's `Act` is enabled again.
-//! NEGATIVE CONTROL: the loop of 1d54a69e9, which read that answer and still
-//! judged the retry taken at the window's end (emulated by a busy read
-//! there, the real `took`), stops waiting exactly after those windows — the
-//! model's `RetryReadAsTaken`.
-//!
-//! THE NOTICE GONE BEFORE ANY READ (`WallAppearsLeft`, `MetLeftUnread`,
-//! `unread`; round 16's residual (a), the lab's `tw16after` on 2.1.300): the
-//! limit answers the act at once and a person's Esc on the vendor's countdown
-//! comes before the loop's first read — the screen it reads is the wall with
-//! the vendor's cancel (`⏺ Automatic continue cancelled · …`) under its
-//! notice, no wall. Read as the loop reads it (the real
-//! `TurnEndState::left_answer` over the real `aterm_phase::left_wall`, the
-//! wall placed on the print as an answer is), the real state waits on the
-//! reset from that reading, through the window, exactly where the model's
-//! wall stands. NEGATIVE CONTROL: the loop of 1afcdade3, which read no limit
-//! there, waits on nothing after a `WallAppearsLeft` and forgets the wall
-//! at the end of a retry's window its answer left unread — the model's
-//! `UnreadLeftDropped` and `UnreadAnswerReadAsTaken`.
-//!
-//! A PERSON'S TURN ANSWERED THE SAME WAY (`PersonWallLeft`, round 17's
-//! residual (a)): the loop looked at a turn's end (an idle point folded in by
-//! the real `observe`), and a person's prompt there meets the limit, their
-//! Esc on the countdown before the loop's next read. The real `left_answer`
-//! reads the cancel under the notice as the answer to a turn asked since that
-//! look, and the real state waits on the reset exactly where the model's wall
-//! stands; the loop of 15248f2b3 (`blind_to_a_persons_left`: it read a cancel's limit
-//! only as an act's answer) waits on nothing after a `PersonWallLeft`. AN
-//! OLDER CANCELLED LIMIT `/resume`d inside the own act's window
-//! (`OlderLeftResumed`): read as the act's answer with nothing to date its
-//! print (the bind is the hostless loop: an answer the screen cannot tell
-//! from the notice already seen is no answer here), its bare clock already
-//! past is placed by the real `place_reset` on the act's print and then kept
-//! within a session window by the real `within_a_session_window` — passed:
-//! the decider acts at the window's end, where the model's `Act` is enabled.
-//! NEGATIVE CONTROL: the loop of 15248f2b3 (`uncapped`), which kept the
-//! act's print's placement, waits a day there — the model's
-//! `OlderLeftPlacedTomorrow`.
-//!
-//! USAGE CREDITS (`Credits`, accounts v2 S5): a turn the credits carry is the
-//! measured `Now using usage credits` footer on a running turn, which the real reader
-//! reads as no wall and the decider leaves alone, as the model's
-//! `NoWallOnCredits` says. NEGATIVE CONTROL: a reader that takes the notice
-//! for a spend wall disagrees at every credits state — the model's
-//! `CreditsReadAsWall`.
+//! - **Wall detection & placement**: verifies walls with or without background
+//!   shells (`bg`), print-based vs session-window placement (`place_reset`),
+//!   and `Met` after a turn or untaken act (`TurnEndState::untaken_act`).
+//! - **Left wall (`NoticeLeaves`)**: verifies waiting when the notice leaves an
+//!   idle screen, early termination on `PersonTurnServed`, and immunity to
+//!   unrelated limits in `ConversationResumed` / `ArmedConversationResumed`.
+//! - **Take windows (`OwnActTyped`, `MetInWindow`)**: verifies walls appearing
+//!   or answering within the 30 s take window (`held`) are tracked and not
+//!   misread as taken when the window expires.
+//! - **Cancelled notices (`WallAppearsLeft`, `MetLeftUnread`, `PersonWallLeft`,
+//!   `OlderLeftResumed`)**: verifies `TurnEndState::left_answer` over
+//!   `aterm_phase::left_wall` when `Esc` cancels the countdown before the first
+//!   read, and bounds older resumed limits within the session window.
+//! - **Usage credits (`Credits`)**: verifies `Now using usage credits` is not
+//!   treated as a spend wall (`NoWallOnCredits`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -151,16 +39,7 @@ use crate::common::cnst;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// The model as this bind reads it: the wall's rows never leave the screen
-/// behind the agent's shell (`Hidden = 0`). A wall that scrolls out of view is
-/// remembered by the loop's `Session` (`wall_memory.rs`), which a reader and a
-/// decider do not reach;
-/// `tier1_the_real_loop_remembers_a_hidden_wall_exactly_where_the_model_does`
-/// (`turn_end_loop_tests.rs`) binds that half, on the real `Session`. A notice
-/// that leaves an IDLE screen (`Leaves = 1`) is the decider's own to wait out
-/// (`turn_end.rs`'s `still_shown`), and is walked here. The own act's take
-/// window is off (`OwnAct = 0`), and the act's window with it ([`timing`]):
-/// [`windowed_model`] walks it.
+/// Base `SupervisorUsageWall` model (`Hidden = 0`, `Leaves = 1`, `OwnAct = 0`).
 fn walled_model() -> Model {
     aterm_spec::interp::with_consts(
         &supervisor_usage_wall_model(),
@@ -222,13 +101,7 @@ fn zone(_: &str) -> Option<i64> {
     Some(PDT)
 }
 
-/// The weekly wall says `resets <a bare clock>`, `ResetAt` ticks (minutes)
-/// after its print, as the vendor prints one for a reset under a day off. The
-/// reset the loop waits for is the REAL placement's ([`place_reset`], the print
-/// known to the done row's minute and the slack): how many minutes after the
-/// print the decider is handed — so the placement is inside the bind, and a
-/// misplacement ([`reset_at`], the session window's five-hour rule) is a
-/// disagreement the walk sees.
+/// Minutes after `PRINT` that `place_reset` places the weekly wall's bare clock.
 fn placed_after_the_print(m: &Model, ticks: i64) -> Duration {
     let clock = 20 * 60 + ticks;
     let spec = ResetSpec::At {
@@ -242,13 +115,8 @@ fn placed_after_the_print(m: &Model, ticks: i64) -> Duration {
     Duration::from_secs(u64::try_from(at - PRINT).unwrap())
 }
 
-/// THE OLDER CANCELLED LIMIT a `/resume`d conversation ends on (`7:30pm`, its
-/// reset half an hour before the print), read as the own act's answer with
-/// nothing to date it: how far from the act the decider is handed its reset —
-/// the real placement on the act's print ([`place_reset`]: tomorrow's,
-/// 23 h 30 m out), kept within a session window by the real
-/// [`within_a_session_window`] unless `uncapped` (the loop of 15248f2b3):
-/// half an hour PASSED. Positive: ahead of the act.
+/// Minutes from the act at which an older resumed limit (`7:30pm` at `8:00pm`)
+/// is placed (`within_a_session_window` unless `uncapped`).
 fn older_left_placed(uncapped: bool) -> i64 {
     let spec = ResetSpec::At {
         date: None,
@@ -511,10 +379,8 @@ fn with_rows_before_the_done_row(mut rows: Vec<String>, extra: &[&str]) -> Vec<S
     rows
 }
 
-/// What the reader hands the decider at `st`, the wall's reset as the real
-/// side placed it (`reset`), as `run` reads it. `masked`: the precedence of
-/// 2026-09-28 — a screen that counts background work is busy, whatever the
-/// turn ended on.
+/// Construct the `TurnEndReading` for `st` under `run` (`masked` keeps a
+/// screen with active background work `Busy` regardless of turn-end text).
 fn reading(
     st: &State,
     worked: Option<Duration>,
@@ -541,12 +407,7 @@ fn reading(
         };
         read.wall = Some(w);
     }
-    // The limit a cancel left that answered a turn — the act awaited, or a
-    // person's asked since the last look — read in the screen's place as the
-    // hostless loop reads it (`Session::turn_end_reading`): an answer the
-    // screen cannot tell from the notice already seen is refused there with
-    // no transcript. The loop of 1afcdade3 read no limit there, the loop of
-    // 15248f2b3 none but an act's.
+    // Resolve a cancelled limit notice via `left_answer` when `read.wall` is absent.
     if read.wall.is_none()
         && !run.blind_to_left
         && let Some(w) = real
@@ -571,14 +432,9 @@ fn reading(
         t.reset_at = None;
         t.wall_message = String::new();
     }
-    // The loop of 44ed0f339: a turn served under ANY limit's notice is one
-    // since the limit waited on (its witness, tied to no limit).
     if run.untied && t.since_limit.as_ref().is_some_and(|s| s.served) {
         t.served_in_transcript = true;
     }
-    // The loop of ef02ee212: the vendor's word that it went on under ANY
-    // limit's notice is this limit's (tied to none): read as if its notice
-    // were the wall's own.
     if run.untied_continuation && t.auto_continue == Some(aterm_phase::AutoContinue::Fired) {
         let own = Screen::Walled
             .read()
@@ -593,11 +449,9 @@ fn reading(
             fired: true,
             model_set: false,
             chosen_model: None,
+            generic: false,
         });
     }
-    // The loop before round 16: inside the own act's take window a wall
-    // was folded in only at the point that judged the act — read here as
-    // no wall, which the policy now folds nowhere either.
     if run.blind_in_window && st["held"] == 1 {
         t.wall = None;
         t.wall_message = String::new();
@@ -607,33 +461,8 @@ fn reading(
     t
 }
 
-/// How the real side runs: `unseen`, a `Met` is the line held under the wall
-/// with no turn run (no busy read), else a turn that ran into it again;
-/// `blind_to_untaken`, the loop of 2026-10-01, which read a wall standing after
-/// an untaken act as no print (the NEGATIVE CONTROL), else the loop as it is;
-/// `blind_to_a_persons_turn`, the loop before 2026-10-14, which read a
-/// person's turn no read saw busy as no turn (the NEGATIVE CONTROL of the left
-/// wall), else the loop as it is; `untied`, the loop of 44ed0f339, which
-/// counted a turn served under any limit's notice as one since the limit it
-/// waits on (the NEGATIVE CONTROL of a resumed conversation);
-/// `blind_in_window`, the loop before round 16, which folded a wall read
-/// inside the own act's take window in only at the point that judged the act
-/// (the NEGATIVE CONTROL of the window); `answer_read_as_taken`, the loop of
-/// 1d54a69e9, which read the wall that answered a retry inside its window
-/// but judged the retry taken at the window's end, its answer's notice gone
-/// (the NEGATIVE CONTROL of the retry's window: emulated by a busy read at
-/// that window's end, the real [`TurnEndState::took`], which is what that
-/// judgement amounts to); `blind_to_left`, the loop of 1afcdade3, which read
-/// no limit where a cancel left the notice that answered the act awaited
-/// (the NEGATIVE CONTROL of the notice gone before any read);
-/// `blind_to_a_persons_left`, the loop of 15248f2b3, which read a cancel's
-/// limit as an answer to an act of its own only (the NEGATIVE CONTROL of a
-/// person's turn answered so); `uncapped`, the same loop, which placed an
-/// older cancelled limit read as an act's answer on that act's print (the
-/// NEGATIVE CONTROL of a `/resume` inside the act's window);
-/// `untied_continuation`, the loop of ef02ee212, which read the vendor's word
-/// that it went on (`Fired`) under any limit's notice as this limit's (the
-/// NEGATIVE CONTROL of a conversation resumed at an armed limit).
+/// Configuration flags for the conformance walk (`unseen` selects whether `Met`
+/// has an intervening turn; the remaining flags enable negative-control mutations).
 #[derive(Clone, Copy, Default)]
 struct Run {
     /// A reader that takes usage credits for a spend wall.
@@ -816,8 +645,6 @@ fn mirror(
         // wait on it runs out, and it reads the point again, which judges the
         // act (`turn_end_now`).
         "Tick" => {
-            // The retry's window ends on its answer, its notice gone:
-            // judged taken by the loop of 1d54a69e9.
             if run.answer_read_as_taken
                 && before["held"] == 1
                 && before["tries"] >= 1
@@ -1053,21 +880,8 @@ fn tier1_the_real_reader_and_decider_continue_a_usage_wall_exactly_where_the_mod
     }
 }
 
-/// THE LOOP OF EF02EE212 is not the model (W1 of ATERM-KI-1015-1, measured
-/// on 2.1.300 on 2026-10-15): it read the vendor's word that it went on
-/// (`Usage limit reset · continuing automatically`) as THIS limit's
-/// continuation under ANY limit's notice, so a person who `/resume`d another
-/// conversation while the wall showed, its countdown armed — that history an
-/// older limit the vendor continued by itself — ended the wait, and the
-/// continue policy typed into the standing limit (the stub's 429, 22 minutes
-/// before the reset) — the model's `OtherLimitsContinuationRead`. Walked with
-/// that reading, the real state stops waiting after EVERY
-/// `ArmedConversationResumed` in the reset's last minute, where the model's
-/// limit stands; the loop as it is (the strict walk) waits on, the vendor's
-/// word tied to this limit's own notice by the reset it names. Earlier than
-/// that minute even the untied reading waits: the vendor goes on at the
-/// reset, so its word read sooner is another day's ([`FIRED_EARLY`],
-/// ATERM-KI-1015-1 LP-1) — a second rule, which the walk counts apart.
+/// Verify `ArmedConversationResumed` does not end the current limit wait when
+/// the resumed conversation's auto-continue belongs to an older limit notice.
 #[test]
 fn the_loop_that_ties_no_continuation_to_its_limit_ends_the_wait_on_a_resume_at_an_armed_wall() {
     let m = walled_model();
@@ -1115,11 +929,7 @@ fn the_loop_that_ties_no_continuation_to_its_limit_ends_the_wait_on_a_resume_at_
     assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
 }
 
-/// THE OWN ACT'S TAKE WINDOW (round 16; round 15's run on Claude Code 2.1.300,
-/// 2026-10-14): the continue policy's act at a turn's end, answered at once by
-/// a limit (no busy read), its notice leaving inside the window — the real
-/// state tracks the limit from its first reading and the decider waits out
-/// the window, then the reset the notice named, exactly where the model does.
+/// Verify `windowed_model` conformance across `OwnActTyped` and retry take windows.
 #[test]
 fn tier1_a_limit_met_inside_the_own_acts_take_window_is_tracked_where_the_model_says() {
     let m = windowed_model();
@@ -1169,11 +979,8 @@ fn tier1_a_limit_met_inside_the_own_acts_take_window_is_tracked_where_the_model_
     }
 }
 
-/// NEGATIVE CONTROLS: the `Buggy = 1` model, and each past loop the module
-/// documentation names, emulated on the real side by its [`Run`] switch,
-/// disagree with the real code somewhere in the walk — so the strict walks
-/// above are not vacuous over the path each one broke. The model's own
-/// counterexamples are the registry sweep's (`aterm-models/tests/non_vacuity.rs`).
+/// Verify the `Buggy = 1` model and each [`Run`] negative-control mutation
+/// disagree with the real implementation.
 #[test]
 fn the_buggy_model_and_every_past_loop_disagree_with_the_real_code() {
     let walled = walled_model();

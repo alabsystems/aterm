@@ -7,11 +7,11 @@ see busy
 see question
 pass 400
 ctl
-expect close t1 turn out=asked conf=heuristic at=0
+expect close t1 turn out=asked conf=heuristic @0
 pass 200
 see busy
 expect open t1 turn
-expect open t2 turn ledger=1 by=harness at=600
+expect open t2 turn ledger=1 by=harness @600
 see idle
 half
 half
@@ -19,4 +19,4 @@ expect close t2 turn out=done
 pass 3600000
 input human
 see busy
-expect open t3 turn by=human at=3601600
+expect open t3 turn by=human @3601600

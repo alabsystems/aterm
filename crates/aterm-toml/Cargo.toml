@@ -13,8 +13,7 @@ repository.workspace = true
 description = "First-party TOML 1.0 for aterm: a serde Deserializer/Serializer (replaces `toml`) and a comment-preserving document model (replaces `toml_edit`)"
 
 [lib]
-# No unit tests live in src/, so a default `targo test` does not build the lib
-# harness (an explicit `--lib` still does, at 0 tests). Doctests still run.
+# No unit tests live in src/, so no lib test harness is built; doctests still run.
 test = false
 [dependencies]
 # serde is the only dependency, on purpose: the tree's `#[derive(Deserialize)]`

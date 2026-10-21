@@ -738,6 +738,7 @@ fn the_await_look_reads_a_close_with_the_flag_it_cleared() {
     g.slog_mut().close_session(
         aterm_slog::SessionOut::ShellExit,
         Actor::Nobody,
+        "-",
         Some(0),
         now,
     );

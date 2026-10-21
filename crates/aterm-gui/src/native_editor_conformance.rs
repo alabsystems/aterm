@@ -134,8 +134,8 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let after_move = project(&model, &store, document, &view, facts);
     assert_transition(&model, &before_move, &after_move, "Move");
 
-    // Negative control: the historical reducer collapsed the active anchor to
-    // the new head. That projection is neither admitted nor invariant-safe.
+    // Negative control: collapsing the active anchor to the new head is neither admitted nor
+    // invariant-safe.
     let mut collapsed_mark = after_move.clone();
     collapsed_mark.insert("anchor", after_move["caret"]);
     assert_eq!(admits(&model, &before_move, &collapsed_mark), None);

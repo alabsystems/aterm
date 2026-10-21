@@ -1,40 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LENS, the stats bars' close-up (`docs/DESIGN-system-awareness-2026-10-16.md`
-//! §12.2): the three bars at full size with their words, 22 pt core tiles
-//! with every channel, the balance bar and the telescope, and a focus well
-//! for the instrument asked about, on a card hung beside the form it opened
-//! from (4 pt under the Deck, 4 pt over the sill). It reserves no row: a
+//! THE LENS, a row's close-up (`docs/DESIGN-stats-deck-v2-2026-10-20.md`
+//! §7.7, §11.3, §11.4): a card hung 4 pt under the Deck (4 pt over the sill)
+//! that says what one instrument's heat is made of. It reserves no row: a
 //! summoned overlay, folded into the window's one tray surface with the bars
 //! (`App::fold_stats_deck`), so `image` captures carry it.
 //!
-//! * **Opening.** The pointer resting on a Deck or sill instrument for
-//!   [`REST`] with no motion (the `StatsLens` deadline, armed by motion over
-//!   an instrument and re-armed at each motion, so passing over never opens
+//! * **Frame.** Line 1 names the instrument, where its reading comes from and
+//!   when, and the keys; the explainer says what its heat measures; Disk
+//!   answers "Wrong?" and the other rows say where they stand now; then the
+//!   body in sections ([`lens_body`]): two columns on a shell 640 pt wide or
+//!   more, one column below, where each section takes its largest form that
+//!   leaves room for the one-line forms after it, and drops, with every
+//!   section after it in the priority order (in either column), when not
+//!   even its one-line form fits. Disk's Space now always shows: the
+//!   explainer and the answer above it are cut short to leave its line.
+//! * **Opening.** The pointer resting on a Deck row, the cores, the header or
+//!   a sill instrument for [`REST`] with no motion (the `StatsLens` deadline,
+//!   armed by motion and re-armed at each motion, so passing over never opens
 //!   it); a click on one, which pins it; or ⌘I (`ToggleStatsLens`), the
-//!   keyboard lens. It never opens itself, not for a stuck job, an agent or a
-//!   value (O33).
+//!   keyboard lens on CPU or on the last instrument a lens showed. It never
+//!   opens itself, not for a stuck job, an agent or a value (O33). Whenever
+//!   Disk becomes the lens's instrument, the "where" survey is asked for
+//!   (`App::disk_lens_opened`, at most hourly).
 //! * **Closing.** An unpinned hover lens closes when the pointer has left the
 //!   lens and the form for [`LEAVE`]; any lens closes on a click outside, on
-//!   focus loss, and on any key the terminal would receive, which then passes
-//!   through (one frame, no spring). The keyboard lens keeps ←/→ (the
-//!   instrument), ↑/↓ (the bar), Return (pin), ⌘C (copy the bar's sentence)
-//!   and Esc (close, consumed).
+//!   focus loss, on ⌘I and on Esc.
+//! * **Keys.** A pinned or keyboard lens takes ←/→ (the instrument, over
+//!   `Instrument::ALL`), ↑/↓ (the scope its lists show), ⌘C or the chord
+//!   Copy is bound to (the instrument's sentence, `words::row_sentence`) and
+//!   Esc; Return pins the keyboard lens. Any other key closes the lens and
+//!   goes on to the terminal (one frame, no spring); a hover lens takes no
+//!   key.
 //! * **Material.** The shell is an opaque step off the band ground with a
-//!   rim and a soft shadow (the header's words sit on it, so nothing of the
-//!   terminal or its effects may show through); every tile and bar sits in a
-//!   well in the band ground, the ground the inks' floors were solved on.
+//!   rim and a soft shadow (its words sit on it, so nothing of the terminal
+//!   or its effects may show through), in the Deck's inks, so the words keep
+//!   their floors over any terminal theme.
 
 use std::time::{Duration, Instant};
 
+use aterm_vitals::Rates;
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
-use aterm_vitals::model::{ProcScope, Snapshot};
-use aterm_vitals::words;
+use aterm_vitals::model::{
+    CpuView, DiskFacts, LinkKind, Pressure, ProcScope, Resource, ResourceView, Snapshot,
+};
+use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform};
 
-use crate::stats_deck::{DeckInput, StatsBars};
-use crate::stats_paint::{Bar, Clause, Hit, Instrument, Mark, Painter, Rect, a, panel};
-use crate::widget::{DrawPrim, rgba};
+use crate::stats_deck::{ASCENT_EM, DESCENT_EM, DeckInput, StatsBars, deck_metrics, kind_ink};
+use crate::stats_paint::{Bar, Instrument, Painter, WellMark, a, panel};
+use crate::stats_plan::FaceMetrics;
+use crate::type_scale::TypeStep;
+use crate::widget::{DrawPrim, Rgba, TextFace, TextWeight, rgba, text_prim};
 
 /// How long the pointer rests on an instrument before the hover lens opens.
 pub(crate) const REST: Duration = Duration::from_millis(250);
@@ -49,7 +66,8 @@ pub(crate) const LENS_PERIOD: Duration = Duration::from_millis(500);
 pub(crate) enum Opened {
     /// The pointer rested on an instrument: it leaves with the pointer.
     Hover,
-    /// A click pinned it: it stays until a click outside, a key or Esc.
+    /// A click pinned it: it stays until a click outside, Esc or a key it
+    /// does not take.
     Pinned,
     /// ⌘I: it takes ←/→/↑/↓, Return, ⌘C and Esc.
     Keyboard,
@@ -58,9 +76,9 @@ pub(crate) enum Opened {
 /// An open lens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Lens {
-    /// The focus well's instrument.
+    /// The instrument it shows.
     pub(crate) focus: Instrument,
-    /// The selected bar (↑/↓; the narrow lens shows only it).
+    /// The scope its lists show (↑/↓).
     pub(crate) bar: Bar,
     pub(crate) how: Opened,
 }
@@ -71,7 +89,7 @@ pub(crate) struct Rest {
     /// When it opens the lens.
     pub(crate) due: Instant,
     /// What the pointer rests on.
-    pub(crate) hit: Hit,
+    pub(crate) hit: crate::stats_paint::Hit,
 }
 
 /// The lens's per-window state.
@@ -83,10 +101,10 @@ pub(crate) struct LensSlot {
     pub(crate) rest: Option<Rest>,
     /// When an unpinned hover lens closes, the pointer having left.
     pub(crate) leave_due: Option<Instant>,
-    /// The lens card's hit regions (card pixels) from its last layout.
-    pub(crate) hits: Vec<Hit>,
     /// The lens card's placement in the frame: `(x, y, w, h)` of the card.
     pub(crate) rect: Option<(u32, u32, u32, u32)>,
+    /// The instrument and scope the last lens showed: ⌘I opens there.
+    pub(crate) last: Option<(Instrument, Bar)>,
 }
 
 /// The lens card's geometry: the card (shell plus shadow margin) in frame
@@ -105,9 +123,22 @@ pub(crate) struct LensGeom {
     pub(crate) font_px: f32,
 }
 
+impl LensGeom {
+    /// The shell's width and height, pt.
+    fn shell_pt(&self) -> (f64, f64) {
+        let s = f64::from(self.scale.max(0.5));
+        (
+            f64::from(self.w - 2.0 * self.margin) / s,
+            f64::from(self.h - 2.0 * self.margin) / s,
+        )
+    }
+}
+
 /// Where the lens hangs for a form card at `(card_dy, card_h)` over a grid
 /// whose left edge is `grid_x`, `grid_w` × `grid_h` device px from
-/// `grid_y`. `None` when the window is too small to hold one.
+/// `grid_y`: `min(1024, grid_w − 24) × min(250, 0.7 · grid_h)` pt, centred
+/// on the grid. `None` when the window is too small to hold one (under
+/// 160 × 90 pt).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lens_geom(
     form: StatsBars,
@@ -146,1122 +177,3410 @@ pub(crate) fn lens_geom(
     })
 }
 
-/// A scope's sentence (`aterm_vitals::words`), the one words function the
-/// lens heading, the accessibility description and `sys` share.
-pub(crate) fn sentence(snap: &Snapshot, bar: Bar, tab_key: Option<u64>, tab_label: &str) -> String {
-    match bar {
-        Bar::Global => words::global_sentence(snap),
-        Bar::Aterm => words::aterm_sentence(snap),
-        Bar::Tab => tab_key
-            .and_then(|k| snap.tab(k))
-            .map_or_else(|| format!("{tab_label}: measuring."), words::tab_sentence),
+/// What the How to read lens says to a reader, and what its ⌘C copies
+/// (§12), naming the machine as the deck does on `platform`.
+pub(crate) fn how_to_read_words(platform: Platform) -> String {
+    format!(
+        "Each row is one resource. The row covers the last 10 minutes, oldest on the left; each \
+         cell is 10 seconds. Colour runs from cold, 0 percent of the resource's maximum, to hot, \
+         100 percent. A mark above a cell means the resource ran over its maximum. An outlined \
+         cell, or a short line, was not read. The bar shows {} in grey, aterm in green and this \
+         tab in bright green.",
+        platform.machine()
+    )
+}
+
+/// The instrument ⌘C copies: the row's sentence (§12), or How to read's.
+pub(crate) fn lens_sentence(
+    snap: &Snapshot,
+    focus: Instrument,
+    tab_key: Option<u64>,
+    loc: &Locale,
+) -> String {
+    match focus.resource() {
+        Some(res) => words::row_sentence(res, snap, tab_key, loc),
+        None => how_to_read_words(loc.platform),
     }
 }
 
-/// A sentence as clauses (split at `; `), so a narrow well folds it from the
-/// end instead of cutting a word.
-fn sentence_clauses(text: &str, ink: Rgb) -> Vec<Clause> {
-    let body = text.trim_end_matches('.');
-    body.split("; ").map(|c| Clause::new(c, ink)).collect()
-}
-
-/// The focus well's readout for an instrument: the words its header shows.
-pub(crate) fn readout(snap: &Snapshot, focus: Instrument) -> String {
-    match focus {
-        Instrument::Cores => snap.cpu.as_ref().map_or_else(
-            || "Cores: not read yet".to_string(),
-            |c| {
-                let names: Vec<String> = c
-                    .clusters
-                    .iter()
-                    .map(|cl| format!("{} \u{00D7}{}", cl.name, cl.cores.len()))
-                    .collect();
-                format!(
-                    "{} of {} cores busy{} \u{00B7} {}",
-                    words::cores(c.busy.level),
-                    c.total(),
-                    c.busy
-                        .motion(words::CORES_GATE)
-                        .word()
-                        .map_or(String::new(), |w| format!(", {w}")),
-                    names.join(", ")
-                )
-            },
-        ),
-        Instrument::Gpu => snap.gpu.as_ref().map_or_else(
-            || "GPU: not readable here".to_string(),
-            |g| {
-                let cores = g
-                    .cores
-                    .map_or_else(String::new, |n| format!("{n} cores, one device \u{00B7} "));
-                format!("GPU \u{00B7} {cores}{:.0}% (whole percent)", (g.load.raw * 100.0).round())
-            },
-        ),
-        Instrument::Memory => snap.mem.as_ref().map_or_else(
-            || "Memory: not read yet".to_string(),
-            |m| {
-                let s = &m.sample;
-                // A class this OS does not report is left out, never 0.
-                let compressed = s.compressed.map_or_else(String::new, |c| {
-                    format!(", compressed {}", words::gib_figure(c))
-                });
-                format!(
-                    "{} of {} GiB used: app {}, wired {}{compressed} \u{00B7} cache {} \u{00B7} pressure {} \u{00B7} swap {}",
-                    words::gib_figure(s.used()),
-                    words::gib_total(s.total),
-                    words::gib_figure(s.app),
-                    words::gib_figure(s.wired),
-                    words::gib_figure(s.cached),
-                    s.pressure.word(),
-                    if s.swap_used == 0 {
-                        "0".to_string()
-                    } else {
-                        words::mem(s.swap_used)
-                    }
-                )
-            },
-        ),
-        Instrument::Disk => snap.volume.as_ref().map_or_else(
-            || "Disk: not read yet".to_string(),
-            |v| {
-                format!(
-                    "{} free of {} on {}",
-                    words::disk(v.available),
-                    words::disk(v.total),
-                    v.mount
-                )
-            },
-        ),
-        Instrument::Jobs => match snap.jobs.as_deref() {
-            None => "Jobs: not read yet".to_string(),
-            Some(view) => {
-                let marks = crate::stats_paint::marks_of(view);
-                if marks.is_empty() {
-                    "nothing stuck, quiet or waiting".to_string()
-                } else {
-                    marks
-                        .iter()
-                        .map(|m| m.words())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }
-            }
-        },
+/// The next instrument ←/→ moves to over `Instrument::ALL`, wrapping; How
+/// to read steps out to the first or the last.
+pub(crate) fn step_instrument(focus: Instrument, forward: bool) -> Instrument {
+    let all = Instrument::ALL;
+    let n = all.len();
+    match all.iter().position(|i| *i == focus) {
+        Some(i) if forward => all[(i + 1) % n],
+        Some(i) => all[(i + n - 1) % n],
+        None if forward => all[0],
+        None => all[n - 1],
     }
 }
 
-/// Paint the lens: its prims and its hit regions (card pixels).
-pub(crate) fn lens_paint(
-    lg: &LensGeom,
-    input: &DeckInput<'_>,
-    lens: &Lens,
-) -> (Vec<DrawPrim>, Vec<Hit>) {
-    let inks = input.inks;
-    let s = lg.scale;
-    let mut p = Painter::new(&inks, s, lg.font_px, input.dwc);
-    let mut hits = Vec::new();
-    let m = lg.margin;
-    let (sx, sy, sw, sh) = (m, m, lg.w - 2.0 * m, lg.h - 2.0 * m);
-    let radius = p.px(10.0);
-    // The soft shadow: black at 18 % over 12 px, laid as rings.
-    let rings = m as usize;
-    for i in (1..=rings).rev() {
-        let d = i as f32;
-        let k = 0.18 * (1.0 - d / (m + 1.0)).powi(2) / rings as f32 * 2.5;
-        p.prims.push(panel(
-            sx - d,
-            sy - d + (d * 0.4).round(),
-            sw + 2.0 * d,
-            sh + 2.0 * d,
-            radius + d,
-            rgba([0, 0, 0], (k * 255.0).round() as u8),
-        ));
-    }
-    let shell = ink::mix(inks.ground, inks.groove, 0.9);
-    p.prims
-        .push(panel(sx, sy, sw, sh, radius, rgba(shell, 0xFF)));
-    p.prims.push(DrawPrim::Stroke {
-        x: sx,
-        y: sy,
-        w: sw,
-        h: sh,
-        radius,
-        width: 1.0,
-        color: a(inks.rim, 0.9),
-    });
-    let pad = p.px(10.0);
-    let head_h = p.px(20.0);
-    let (ix, iy, iw, ih) = (sx + pad, sy + pad, sw - 2.0 * pad, sh - 2.0 * pad);
-    // The header: what this is, what the focus well shows, how to leave.
-    let base = crate::tray_raster::row_baseline(iy, head_h, p.text_px.get());
-    p.label(ix, base, "System".into(), inks.words, true, false);
-    let title_w = p.label_w("System", true, false);
-    let hint = match lens.how {
-        Opened::Keyboard => {
-            "\u{2190}\u{2192} instrument \u{00B7} \u{2191}\u{2193} bar \u{00B7} \u{2318}C copy \u{00B7} esc"
-        }
-        Opened::Pinned => "pinned \u{00B7} esc or click outside",
-        Opened::Hover => "click to pin \u{00B7} \u{2318}I",
-    };
-    let hint_w = p.label_w(hint, false, true);
-    let small_base = crate::tray_raster::row_baseline(iy, head_h, p.small_px.get());
-    p.label(
-        ix + iw - hint_w,
-        small_base,
-        hint.into(),
-        inks.words2,
-        false,
-        true,
-    );
-    let Some(snap) = input.snap else {
-        p.label(
-            ix + title_w + p.px(8.0),
-            base,
-            "Reading the machine\u{2026}".into(),
-            inks.words2,
-            false,
-            false,
-        );
-        return (p.prims, hits);
-    };
-    // The narrow lens shows one bar: a Global · aterm · Tab switch beside the
-    // title says which, and the pointer (or ↑/↓) moves it (§12.2).
-    let wide = iw >= 550.0 * s;
-    let mut head_x = ix + title_w + p.px(10.0);
-    if !wide {
-        for (k, bar) in Bar::ALL.iter().enumerate() {
-            let word = match bar {
-                Bar::Global => "Global",
-                Bar::Aterm => "aterm",
-                Bar::Tab => "Tab",
-            };
-            let on = *bar == lens.bar;
-            let ww = p.label_w(word, on, true);
-            if on {
-                let kh = p.hair().max(1.0) * 2.0;
-                p.prims.push(panel(
-                    head_x,
-                    (iy + head_h - kh).round(),
-                    ww,
-                    kh,
-                    0.0,
-                    rgba(inks.tab, 0xFF),
-                ));
-            }
-            p.label(
-                head_x,
-                small_base,
-                word.into(),
-                if on { inks.words } else { inks.words2 },
-                on,
-                true,
-            );
-            hits.push(Hit {
-                rect: (head_x - p.px(3.0), iy, ww + p.px(6.0), head_h),
-                instrument: lens.focus,
-                bar: *bar,
-            });
-            head_x += ww + p.px(if k + 1 < Bar::ALL.len() { 8.0 } else { 12.0 });
-        }
-    }
-    let head_room = (ix + iw - hint_w - p.px(14.0) - head_x).max(0.0);
-    let readout = readout(snap, lens.focus);
-    let parts = p.fit_clauses(
-        &sentence_clauses(
-            &format!("{} \u{00B7} {readout}", lens.focus.word()),
-            inks.words2,
-        ),
-        head_room,
-        false,
-    );
-    if !parts.is_empty() {
-        let _ = p.clauses(head_x, base, parts, false);
-    }
-
-    let body_y = iy + head_h + p.px(4.0);
-    let body_h = ih - head_h - p.px(4.0);
-    let gap = p.px(6.0);
-    // Wide: three bar wells beside the focus well. Narrow: the selected bar
-    // over the focus well.
-    let (bars, focus_rect): (Vec<(Bar, Rect)>, Rect) = if wide {
-        let focus_w = (314.0 * s).min((iw * 0.42).floor());
-        let bars_w = iw - focus_w - gap;
-        let well_h = ((body_h - 2.0 * gap) / 3.0).floor();
-        let bars = Bar::ALL
-            .iter()
-            .enumerate()
-            .map(|(i, b)| (*b, (ix, body_y + i as f32 * (well_h + gap), bars_w, well_h)))
-            .collect();
-        (bars, (ix + bars_w + gap, body_y, focus_w, body_h))
+/// The scope ↑/↓ moves to, wrapping.
+fn step_bar(bar: Bar, forward: bool) -> Bar {
+    let n = Bar::ALL.len();
+    let i = Bar::ALL.iter().position(|b| *b == bar).unwrap_or(0);
+    Bar::ALL[if forward {
+        (i + 1) % n
     } else {
-        let well_h = ((body_h - gap) * 0.36).floor();
-        (
-            vec![(lens.bar, (ix, body_y, iw, well_h))],
-            (ix, body_y + well_h + gap, iw, body_h - well_h - gap),
-        )
-    };
-    for (bar, rect) in bars {
-        well(
-            &mut p,
-            rect,
-            lens.bar == bar && lens.how == Opened::Keyboard,
-        );
-        hits.push(Hit {
-            rect,
-            instrument: if bar == Bar::Global {
-                Instrument::Cores
-            } else {
-                lens.focus
-            },
-            bar,
-        });
-        match bar {
-            Bar::Global => global_well(&mut p, rect, snap, &mut hits),
-            Bar::Aterm => aterm_well(&mut p, rect, snap, input),
-            Bar::Tab => tab_well(&mut p, rect, snap, input),
-        }
-    }
-    well(&mut p, focus_rect, false);
-    match lens.focus {
-        Instrument::Cores => cores_focus(&mut p, focus_rect, snap, input),
-        Instrument::Gpu => gpu_focus(&mut p, focus_rect, snap),
-        Instrument::Memory => memory_focus(&mut p, focus_rect, snap),
-        Instrument::Disk => disk_focus(&mut p, focus_rect, snap),
-        Instrument::Jobs => jobs_focus(&mut p, focus_rect, snap, input),
-    }
-    (p.prims, hits)
+        (i + n - 1) % n
+    }]
 }
 
-/// A well: the band ground at α 1, a hairline rim (the accent's when the
-/// keyboard has selected it).
-fn well(p: &mut Painter<'_>, (x, y, w, h): Rect, selected: bool) {
-    let inks = *p.inks;
-    let r = p.px(6.0);
-    p.prims.push(panel(x, y, w, h, r, rgba(inks.ground, 0xFF)));
-    p.prims.push(DrawPrim::Stroke {
-        x,
-        y,
-        w,
+// ---------------------------------------------------------------------
+// The frame's measures (§11.3), pt from the shell's top-left corner.
+
+/// The shell's side margin: the explainer wraps to the shell width − 24.
+const SIDE: f64 = 12.0;
+/// Two columns from this shell width.
+const TWO_COLUMNS_PT: f64 = 640.0;
+/// Line 1's baseline.
+const LINE1_BASE: f64 = 18.0;
+/// The explainer's first baseline, and the frame's line pitch.
+const EXPLAINER_BASE: f64 = 34.0;
+const PITCH: f64 = 13.0;
+/// The gap between two stacked sections.
+const GAP: f64 = 4.0;
+/// No ink comes nearer the shell's bottom edge than this.
+const FOOT: f64 = 10.0;
+/// A one-line section: one 10 pt line and its descent.
+const LINE_H: f64 = 13.0;
+/// The name's size on line 1, a section heading's, the words', a note's and
+/// an axis label's.
+const NAME_PT: f64 = 12.0;
+const HEAD_PT: f64 = 10.5;
+const BODY_PT: f64 = 10.0;
+const NOTE_PT: f64 = 9.5;
+const AXIS_PT: f64 = 9.0;
+/// A section's heading baseline under its top, and its first row's.
+const HEAD_BASE: f64 = 10.0;
+const ROW0_BASE: f64 = 24.0;
+/// A tolerance for measured widths.
+const EPS: f64 = 0.01;
+
+/// Where a section is laid: its box, pt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Place {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) w: f64,
+    pub(crate) h: f64,
+}
+
+type Draw<'d> = Box<dyn Fn(&mut Pen<'_>, Place) + 'd>;
+
+/// One form a section can take: its height (the least, for a form that
+/// grows into the room left), and how it draws in its box.
+pub(crate) struct Form<'d> {
+    h: f64,
+    grow: bool,
+    /// A one-line form's label: the one-liners stacked in a column start
+    /// their words at one tab.
+    label: Option<String>,
+    draw: Draw<'d>,
+}
+
+fn form<'d>(h: f64, draw: impl Fn(&mut Pen<'_>, Place) + 'd) -> Form<'d> {
+    Form {
         h,
-        radius: r,
-        width: if selected { p.hair() * 2.0 } else { 1.0 },
-        color: if selected {
-            rgba(inks.tab, 0xFF)
-        } else {
-            a(inks.groove, 1.0)
-        },
-    });
+        grow: false,
+        label: None,
+        draw: Box::new(draw),
+    }
 }
 
-/// A well's heading: its scope's key swatch and sentence, folded to fit.
-/// Returns the baseline row's bottom.
-fn heading(p: &mut Painter<'_>, (x, y, w, _): Rect, bar: Bar, text: &str) -> f32 {
-    let inks = *p.inks;
-    let pad = p.px(6.0);
-    let row_h = p.px(16.0);
-    let base = crate::tray_raster::row_baseline(y + pad / 2.0, row_h, p.small_px.get());
-    let key_w = p.px(2.5).max(2.0);
-    let key_h = (p.small_px.get() * 0.8).round();
-    let ky = (y + pad / 2.0 + (row_h - key_h) / 2.0).round();
-    match bar {
-        Bar::Global => p.ramp_keyline(x + pad, ky, key_w, key_h),
-        Bar::Aterm => p.keyline(x + pad, ky, key_w, key_h, inks.aterm),
-        Bar::Tab => p.keyline(x + pad, ky, key_w, key_h, inks.tab),
+fn grow<'d>(h: f64, draw: impl Fn(&mut Pen<'_>, Place) + 'd) -> Form<'d> {
+    Form {
+        h,
+        grow: true,
+        label: None,
+        draw: Box::new(draw),
     }
-    let tx = x + pad + key_w + p.px(4.0);
-    let parts = p.fit_clauses(&sentence_clauses(text, inks.words), x + w - pad - tx, true);
-    let _ = p.clauses(tx, base, parts, true);
-    y + pad / 2.0 + row_h
 }
 
-/// The Global well: tiles at the ladder's top rung, the GPU tank, memory and
-/// disk.
-fn global_well(p: &mut Painter<'_>, rect: Rect, snap: &Snapshot, hits: &mut Vec<Hit>) {
-    let inks = *p.inks;
-    let (x, y, w, h) = rect;
-    let top = heading(p, rect, Bar::Global, &words::global_sentence(snap));
-    let pad = p.px(6.0);
-    let body_h = (y + h - pad - top).max(0.0);
-    let mut cx = x + pad;
-    if let Some(cpu) = snap.cpu.as_ref() {
-        let gap = p.px(3.0);
-        let lab = p.small_px.get() + p.px(2.0);
-        let tile = (22.0 * p.s).min(body_h - lab).floor().max(6.0);
-        let base = crate::tray_raster::row_baseline(top, lab, p.small_px.get());
-        for cluster in &cpu.clusters {
-            let start = cx;
-            p.label(
-                cx,
-                base,
-                format!("{} \u{00D7}{}", cluster.name, cluster.cores.len()),
-                inks.words2,
-                false,
-                true,
-            );
-            let label_w = p.label_w(
-                &format!("{} \u{00D7}{}", cluster.name, cluster.cores.len()),
-                false,
-                true,
-            );
-            for &core in &cluster.cores {
-                if let Some(view) = cpu.cores.get(core) {
-                    p.tile(
-                        cx,
-                        top + lab,
-                        tile,
-                        Mark::of(&view.load, 1.0, words::LOAD_GATE),
-                        gap * 2.0,
-                    );
-                } else {
-                    p.tile_unmeasured(cx, top + lab, tile, tile);
-                }
-                cx += tile + gap;
-            }
-            cx = cx.max(start + label_w + gap) + p.px(6.0);
-            hits.push(Hit {
-                rect: (start, top, cx - start, body_h),
-                instrument: Instrument::Cores,
-                bar: Bar::Global,
-            });
-        }
-        if let Some(gpu) = snap.gpu.as_ref() {
-            let start = cx;
-            p.label(cx, base, "GPU".into(), inks.words2, false, true);
-            let tw = (tile * 0.62).round();
-            p.tank(
-                (cx, top + lab, tw, tile),
-                Mark::of(&gpu.load, 1.0, words::LOAD_GATE),
-                gpu.cores,
-                gap * 2.0,
-            );
-            cx += tw.max(p.label_w("GPU", false, true)) + p.px(8.0);
-            hits.push(Hit {
-                rect: (start, top, cx - start, body_h),
-                instrument: Instrument::Gpu,
-                bar: Bar::Global,
-            });
-        }
+/// A one-line form: `label`, then the first of `forms` that fits.
+fn line_form<'d>(label: &str, forms: Vec<String>) -> Form<'d> {
+    let owned = label.to_owned();
+    Form {
+        h: LINE_H,
+        grow: false,
+        label: Some(label.to_owned()),
+        draw: Box::new(move |pen, p| one_line(pen, p, &owned, &forms)),
     }
-    // Memory and disk share the rest, a lane and a figure each.
-    let rest = (x + w - pad - cx).max(0.0);
-    if rest < p.px(60.0) {
-        return;
+}
+
+/// One section of a lens's body: its heading and lines as a reader hears
+/// them, its column on a two-column shell, and its forms, largest first; the
+/// last is its one-line form.
+pub(crate) struct Section<'d> {
+    pub(crate) name: String,
+    pub(crate) words: Vec<String>,
+    pub(crate) right: bool,
+    /// The parts it draws under labels of their own (Space now's Freed),
+    /// each a well of its own after the section's: its label and its lines.
+    pub(crate) parts: Vec<(String, String)>,
+    forms: Vec<Form<'d>>,
+}
+
+/// What line 1 and the explainer say, the answer under them, and the body.
+pub(crate) struct LensDoc<'d> {
+    name: &'static str,
+    /// Where the reading comes from and when, longest first.
+    sources: Vec<String>,
+    explainer: String,
+    /// "Wrong?" (Disk) or the row's state now: its label, its words and
+    /// their ink, the state's mark's (§9.3) or words2.
+    answer: Option<(&'static str, String, InkKind)>,
+    /// In priority order: one column stacks them in this order.
+    sections: Vec<Section<'d>>,
+    /// The order two columns stack them in, top down (each column keeps
+    /// its own); empty for the priority order.
+    two_order: Vec<usize>,
+    /// Whether the first section always shows (Disk's Space now, §11.3):
+    /// it takes its largest form that fits whatever drops after it, its
+    /// one-line form only where no other fits, and the explainer and the
+    /// answer leave room for that one-line form, cut short where they would
+    /// not.
+    keeps_first: bool,
+}
+
+/// Whether a shell `lw` pt wide takes two columns, and each column's width.
+fn columns(lw: f64) -> (bool, f64) {
+    if lw >= TWO_COLUMNS_PT {
+        (true, (lw - 3.0 * SIDE) / 2.0)
+    } else {
+        (false, lw - 2.0 * SIDE)
     }
-    let lane_h = p.px(6.0);
-    let row = |i: usize| top + (body_h / 2.0) * i as f32;
-    let fig_w = p
-        .figure_w("88.8/888G", true)
-        .max(p.figure_w("8.88T free", true))
-        + p.px(4.0);
-    let lane_w = (rest - fig_w).max(0.0);
-    if let Some(m) = snap.mem.as_ref() {
-        let ry = row(0);
-        let ly = (ry + (body_h / 2.0 - lane_h) / 2.0).round();
-        crate::stats_deck::global_memory(p, cx, ly, lane_w, lane_h, m);
-        let base = crate::tray_raster::row_baseline(ry, body_h / 2.0, p.small_px.get());
-        p.figure(
-            cx + lane_w + p.px(4.0),
-            base,
-            format!(
-                "{}/{}G",
-                words::gib_figure(m.sample.used()),
-                words::gib_total(m.sample.total)
-            ),
-            inks.words,
-            true,
-        );
-        hits.push(Hit {
-            rect: (cx, ry, rest, body_h / 2.0),
-            instrument: Instrument::Memory,
-            bar: Bar::Global,
-        });
-    }
-    if let Some(v) = snap.volume.as_ref() {
-        let ry = row(1);
-        let ly = (ry + (body_h / 2.0 - lane_h) / 2.0).round();
-        let level = if v.total > 0 {
-            v.total.saturating_sub(v.available) as f32 / v.total as f32
+}
+
+/// One placed section: its index in the doc, the form it took and its box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Placed {
+    pub(crate) section: usize,
+    pub(crate) form: usize,
+    pub(crate) place: Place,
+}
+
+/// The body (§11.3): on a shell `lw` pt wide, two columns of `(lw − 36)/2`
+/// from 640 pt, else one of `lw − 24`, from `top` to `bottom`. The sections
+/// shown are the most of the priority order's first sections that fit, so a
+/// section drops with everything after it in that order, whichever column
+/// it stands in. In each column they stack in order, two columns in
+/// `two_order` (the priority order when it is empty), and each takes its
+/// largest form that leaves room for the one-line forms of the sections
+/// shown after it in its column; a form that grows takes the room those
+/// leave. Where `keeps_first`, the first section takes its largest form
+/// that fits on its own, and the sections after it drop before it shrinks
+/// (Disk's Space now with Freed, `dark_1100_lens_disk_short`).
+pub(crate) fn lens_body(
+    lw: f64,
+    top: f64,
+    bottom: f64,
+    sections: &[Section<'_>],
+    (two_order, keeps_first): (&[usize], bool),
+) -> Vec<Placed> {
+    let (two, cw) = columns(lw);
+    let cols: Vec<(f64, Vec<usize>)> = if two {
+        let order: Vec<usize> = if two_order.is_empty() {
+            (0..sections.len()).collect()
         } else {
-            0.0
+            two_order.to_vec()
         };
-        let slot = (cx - 2.0, ly - 2.0, lane_w + 4.0, lane_h + 4.0);
-        p.lane(
-            cx,
-            ly,
-            lane_w,
-            lane_h,
-            Mark::still(level),
-            inks.mem[0],
-            slot,
-            false,
-        );
-        let base = crate::tray_raster::row_baseline(ry, body_h / 2.0, p.small_px.get());
-        let free = words::disk(v.available)
-            .replace(" TB", "T")
-            .replace(" GB", "G");
-        p.figure(
-            cx + lane_w + p.px(4.0),
-            base,
-            format!("{free} free"),
-            inks.words,
-            true,
-        );
-        hits.push(Hit {
-            rect: (cx, ry, rest, body_h / 2.0),
-            instrument: Instrument::Disk,
-            bar: Bar::Global,
-        });
-    }
+        let side = |right: bool| -> Vec<usize> {
+            order
+                .iter()
+                .copied()
+                .filter(|&i| sections.get(i).is_some_and(|sec| sec.right == right))
+                .collect()
+        };
+        vec![(SIDE, side(false)), (2.0 * SIDE + cw, side(true))]
+    } else {
+        vec![(SIDE, (0..sections.len()).collect())]
+    };
+    (0..=sections.len())
+        .rev()
+        .find_map(|shown| {
+            let mut out = Vec::new();
+            for (x, ids) in &cols {
+                let ids: Vec<usize> = ids.iter().copied().filter(|&i| i < shown).collect();
+                out.extend(stack((*x, cw), (top, bottom), sections, &ids, keeps_first)?);
+            }
+            Some(out)
+        })
+        .unwrap_or_default()
 }
 
-/// The aterm well: the balance bar of what is busy now (Tab │ rest of aterm
-/// │ others, 100 % = busy) and the telescope (Tab ⊂ aterm ⊂ busy ⊂
-/// capacity, on the capacity scale).
-fn aterm_well(p: &mut Painter<'_>, rect: Rect, snap: &Snapshot, input: &DeckInput<'_>) {
-    let inks = *p.inks;
-    let (x, y, w, h) = rect;
-    let top = heading(p, rect, Bar::Aterm, &words::aterm_sentence(snap));
-    let pad = p.px(6.0);
-    let body_h = (y + h - pad - top).max(0.0);
-    let Some(cpu) = snap.cpu.as_ref() else {
-        return;
-    };
-    let capacity = cpu.total().max(1) as f32;
-    let busy = cpu.busy.level.max(0.0);
-    let at = snap
-        .aterm
-        .as_ref()
-        .map_or(0.0, |s| s.cores.level)
-        .min(busy.max(0.0));
-    let tab = input
-        .tab_key
-        .and_then(|k| snap.tab(k))
-        .map_or(0.0, |t| t.scope.cores.level)
-        .min(at);
-    let busy_label = format!("busy {}c", words::cores(busy));
-    // The labels' column fits the wider of its two words, whatever the
-    // figure (`busy 100.0c` on a big machine).
-    let label_w = p
-        .label_w("telescope", false, true)
-        .max(p.label_w(&busy_label, false, true))
-        + p.px(6.0);
-    let bx = x + pad + label_w;
-    let bw = (w - 2.0 * pad - label_w).max(0.0);
-    let bar_h = p.px(8.0);
-    let row_h = body_h / 2.0;
-    // The balance bar.
-    let ry = top;
-    let ly = (ry + (row_h - bar_h) / 2.0).round();
-    let base = crate::tray_raster::row_baseline(ry, row_h, p.small_px.get());
-    p.label(x + pad, base, busy_label, inks.words2, false, true);
-    let r = (bar_h / 2.0).floor();
-    p.prims
-        .push(panel(bx, ly, bw, bar_h, r, rgba(inks.track, 0xFF)));
-    if busy > 0.01 {
-        // Capsules from the left, the telescope's grammar: the others' part
-        // is the whole bar, aterm's laid over it, the tab's over that, each
-        // nearer part with a 1 px rim of the ground at its end, so the parts
-        // stay apart without colour.
-        let parts = [(tab, inks.tab), (at, inks.aterm), (busy, inks.others)];
-        for (i, (end, ink)) in parts.iter().enumerate().rev() {
-            let pw = (end / busy * bw).round().min(bw);
-            if pw < 1.0 {
-                continue;
-            }
-            if i < 2 && pw < bw {
-                p.prims.push(panel(
-                    bx,
-                    ly,
-                    (pw + 1.0).min(bw),
-                    bar_h,
-                    r,
-                    rgba(inks.ground, 0xFF),
-                ));
-            }
-            p.prims
-                .push(panel(bx, ly, pw, bar_h, r.min(pw / 2.0), rgba(*ink, 0xFF)));
+/// One column at `x`, `cw` wide, from `top` to `bottom`, holding every one
+/// of `ids` in order, each in its largest form that leaves room for the
+/// one-line forms after it (section 0 where `keeps_first`: its largest form
+/// that fits); `None` when they do not all fit.
+fn stack(
+    (x, cw): (f64, f64),
+    (top, bottom): (f64, f64),
+    sections: &[Section<'_>],
+    ids: &[usize],
+    keeps_first: bool,
+) -> Option<Vec<Placed>> {
+    let mut out = Vec::with_capacity(ids.len());
+    let mut y = top;
+    for (k, &i) in ids.iter().enumerate() {
+        let after: f64 = if keeps_first && i == 0 {
+            0.0
+        } else {
+            ids[k + 1..]
+                .iter()
+                .map(|&j| {
+                    sections[j]
+                        .forms
+                        .last()
+                        .map_or(f64::INFINITY, |f| GAP + f.h)
+                })
+                .sum()
+        };
+        let room = bottom - y;
+        let fi = sections[i]
+            .forms
+            .iter()
+            .position(|f| f.h + after <= room + EPS)?;
+        let f = &sections[i].forms[fi];
+        let h = if f.grow {
+            (room - after).max(f.h).min(room)
+        } else {
+            f.h
+        };
+        out.push(Placed {
+            section: i,
+            form: fi,
+            place: Place { x, y, w: cw, h },
+        });
+        y += h + GAP;
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------
+// The pen: text, rules, bars and marks in pt from the shell's corner, each
+// edge on a whole device pixel.
+
+/// A drawn text's box (advance, ascent, descent), pt from the shell's
+/// corner: what T-G16 checks.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TextBox {
+    pub(crate) text: String,
+    pub(crate) r: [f64; 4],
+}
+
+pub(crate) struct Pen<'a> {
+    p: Painter<'a>,
+    m: &'a FaceMetrics,
+    inks: VitalsInks,
+    /// Increase Contrast (§9.5).
+    ic: bool,
+    s: f64,
+    /// The shell's corner in the card, device px.
+    ox: f32,
+    oy: f32,
+    /// Draw the prims, or only lay out (T-G16's sweep).
+    draw: bool,
+    /// Where the one-liners stacked in this section's column start their
+    /// words.
+    line_tab: f64,
+    #[cfg(test)]
+    boxes: Vec<TextBox>,
+}
+
+impl<'a> Pen<'a> {
+    /// `v` pt in whole device px: `floor(v·s + 0.5)`.
+    fn px(&self, v: f64) -> f32 {
+        (v * self.s + 0.5).floor() as f32
+    }
+
+    fn width(&self, s: &str, pt: f64, bold: bool) -> f64 {
+        self.m.width(s, pt, bold)
+    }
+
+    /// `s` cut to `room` with "…" (rule F); empty when not even that fits.
+    fn cut(&self, s: &str, room: f64, pt: f64, bold: bool) -> String {
+        self.m.fit(&[s], room, pt, bold)
+    }
+
+    /// `s` at `(x, base)`; answers its advance.
+    fn text(&mut self, x: f64, base: f64, s: &str, pt: f64, bold: bool, ink: Rgb) -> f64 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let w = self.width(s, pt, bold);
+        #[cfg(test)]
+        self.boxes.push(TextBox {
+            text: s.to_owned(),
+            r: [x, base - ASCENT_EM * pt, x + w, base + DESCENT_EM * pt],
+        });
+        if self.draw {
+            let px = (pt * self.s) as f32;
+            let at = (self.ox + self.px(x), self.oy + self.px(base));
+            self.p.prims.push(text_prim(
+                at.0,
+                at.1,
+                s.to_owned(),
+                TypeStep::Caption.px_clamped(px, px, px),
+                TextWeight::Regular,
+                if bold { TextFace::UiBold } else { TextFace::Ui },
+                rgba(ink, 0xFF),
+            ));
+        }
+        w
+    }
+
+    /// `s` ending at `right`; answers its advance.
+    fn text_end(&mut self, right: f64, base: f64, s: &str, pt: f64, bold: bool, ink: Rgb) -> f64 {
+        let w = self.width(s, pt, bold);
+        self.text(right - w, base, s, pt, bold, ink)
+    }
+
+    /// A filled rect from pt edges.
+    fn rect(&mut self, x: f64, y: f64, w: f64, h: f64, radius: f64, ink: Rgba) {
+        if !self.draw {
+            return;
+        }
+        let (x0, y0, x1, y1) = (self.px(x), self.px(y), self.px(x + w), self.px(y + h));
+        if x1 > x0 && y1 > y0 {
+            let r = ((radius * self.s) as f32).min((x1 - x0) / 2.0);
+            self.p
+                .prims
+                .push(panel(self.ox + x0, self.oy + y0, x1 - x0, y1 - y0, r, ink));
         }
     }
-    // The telescope: nested bars on the capacity scale.
-    let ry = top + row_h;
-    let base = crate::tray_raster::row_baseline(ry, row_h, p.small_px.get());
-    p.label(x + pad, base, "telescope".into(), inks.words2, false, true);
-    let ty = (ry + (row_h - bar_h) / 2.0).round();
-    let nest = [
-        (capacity, inks.track, bar_h),
-        (busy, inks.others, bar_h),
-        (at, inks.aterm, (bar_h * 0.7).round()),
-        (tab, inks.tab, (bar_h * 0.4).round()),
-    ];
-    for (v, c, nh) in nest {
-        let nw = (v / capacity * bw).round();
-        if nw >= 1.0 {
-            p.prims.push(panel(
-                bx,
-                ty + ((bar_h - nh) / 2.0).round(),
-                nw,
-                nh,
-                (nh / 2.0).floor(),
-                rgba(c, 0xFF),
+
+    /// A hairline rule one device px tall from `x` over `w` at `y`.
+    fn rule(&mut self, x: f64, y: f64, w: f64, ink: Rgba) {
+        if !self.draw {
+            return;
+        }
+        let (x0, x1, y0) = (self.px(x), self.px(x + w), self.px(y));
+        if x1 > x0 {
+            self.p
+                .prims
+                .push(panel(self.ox + x0, self.oy + y0, x1 - x0, 1.0, 0.0, ink));
+        }
+    }
+
+    /// A 1 pt vertical tick at `x` from `y0` to `y1`.
+    fn tick(&mut self, x: f64, y0: f64, y1: f64, ink: Rgba) {
+        if !self.draw {
+            return;
+        }
+        let lw = self.s.round().max(1.0) as f32;
+        let (a, b) = (self.px(y0), self.px(y1));
+        if b > a {
+            self.p.prims.push(panel(
+                self.ox + self.px(x) - (lw / 2.0).floor(),
+                self.oy + a,
+                lw,
+                b - a,
+                0.0,
+                ink,
             ));
         }
     }
-}
 
-/// The Tab well: the tab's state and words, cores on the capacity scale,
-/// its footprint.
-fn tab_well(p: &mut Painter<'_>, rect: Rect, snap: &Snapshot, input: &DeckInput<'_>) {
-    let inks = *p.inks;
-    let (x, y, w, h) = rect;
-    let text = sentence(snap, Bar::Tab, input.tab_key, &input.tab_label);
-    let top = heading(p, rect, Bar::Tab, &text);
-    let pad = p.px(6.0);
-    let body_h = (y + h - pad - top).max(0.0);
-    let Some(t) = input.tab_key.and_then(|k| snap.tab(k)) else {
-        return;
-    };
-    let capacity = snap.total_cores().unwrap_or(1).max(1) as f32;
-    let lane_h = p.px(6.0);
-    let fig = words::cores_figure(
-        t.scope.cores.level,
-        None,
-        t.scope.cores.motion(words::CORES_GATE),
-    );
-    let fig_w = p.figure_w("88.8c\u{25B4}", true) + p.px(6.0);
-    let mem = t.scope.footprint.map_or_else(String::new, words::mem);
-    let mem_w = p.figure_w("888 MiB", true) + p.px(6.0);
-    let lx = x + pad;
-    let lw = (w - 2.0 * pad - fig_w - mem_w).max(0.0);
-    let ly = (top + (body_h - lane_h) / 2.0).round();
-    let slot = (lx - 2.0, ly - 3.0, lw + 4.0, lane_h + 6.0);
-    p.lane(
-        lx,
-        ly,
-        lw,
-        lane_h,
-        Mark::of(&t.scope.cores, capacity, words::CORES_GATE),
-        inks.tab,
-        slot,
-        false,
-    );
-    let base = crate::tray_raster::row_baseline(top, body_h, p.small_px.get());
-    p.figure(lx + lw + p.px(6.0), base, fig, inks.words, true);
-    p.figure(lx + lw + fig_w, base, mem, inks.words, true);
-}
+    /// A 1 pt segment.
+    fn line(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, ink: Rgba) {
+        if !self.draw {
+            return;
+        }
+        let s = self.s as f32;
+        self.p.prims.push(DrawPrim::Line {
+            x1: self.ox + (x1 * self.s) as f32,
+            y1: self.oy + (y1 * self.s) as f32,
+            x2: self.ox + (x2 * self.s) as f32,
+            y2: self.oy + (y2 * self.s) as f32,
+            width: s,
+            color: ink,
+        });
+    }
 
-/// The Cores focus: a 60 s core × time strip (one row a core, a column a
-/// second, gaps dotted), the busiest processes with their scope, and the
-/// honest sentence about what macOS reports.
-fn cores_focus(p: &mut Painter<'_>, rect: Rect, snap: &Snapshot, input: &DeckInput<'_>) {
-    let inks = *p.inks;
-    let (x, y, w, h) = rect;
-    let pad = p.px(6.0);
-    let row_h = p.px(16.0);
-    let base = crate::tray_raster::row_baseline(y + pad / 2.0, row_h, p.small_px.get());
-    p.label(
-        x + pad,
-        base,
-        "Cores \u{00B7} the last minute".into(),
-        inks.words,
-        true,
-        true,
-    );
-    let Some(cpu) = snap.cpu.as_ref() else {
-        return;
-    };
-    let note = "macOS reports shares, not which core runs a process.";
-    let strip_top = y + pad / 2.0 + row_h;
-    let n = cpu.total().max(1);
-    // The strip keeps a floor of 3 pt a core (never a band of dashes); the
-    // busiest processes take what is left, then the note.
-    let strip_min = (n as f32 * p.px(3.0)).min((h - pad - row_h).max(0.0));
-    let left = (h - pad - row_h - strip_min - p.px(4.0)).max(0.0);
-    let proc_rows = ((left / row_h).floor() as usize).min(snap.top.len().min(4));
-    let left = left - proc_rows as f32 * row_h;
-    let note_h = if left >= row_h { row_h } else { 0.0 };
-    let procs_h = proc_rows as f32 * row_h;
-    let strip_h = (h - pad - row_h - procs_h - note_h - p.px(4.0)).max(strip_min);
-    // A row a core, tall enough for its name when the well has room
-    // (10 pt), down to one pixel for a machine of hundreds.
-    let cell_h = (strip_h / n as f32).floor().clamp(1.0, 10.0 * p.s);
-    let label_w = p.figure_w("E10", true) + p.px(4.0);
-    let cols = aterm_vitals::model::CORE_HISTORY_LEN;
-    let cell_w = ((w - 2.0 * pad - label_w) / cols as f32).floor().max(1.0);
-    let sx = x + pad + label_w;
-    let label_h = p.small_px.get();
-    // A name is drawn only where it does not overlap the one above it: every
-    // core's when its row holds a name, else each cluster's first that fits.
-    let mut label_floor = f32::MIN;
-    let mut row = 0usize;
-    for cluster in &cpu.clusters {
-        for (k, &core) in cluster.cores.iter().enumerate() {
-            let ry = strip_top + row as f32 * cell_h;
-            let every = cell_h >= label_h * 0.9;
-            if (every || k == 0) && ry >= label_floor {
-                let b = crate::tray_raster::row_baseline(ry, cell_h.max(label_h), label_h);
-                p.figure(
-                    x + pad,
-                    b,
-                    format!("{}{}", cluster.short, k + 1),
-                    inks.words2,
-                    true,
-                );
-                label_floor = ry + label_h;
-            }
-            let hist = cpu.core_history.get(core).cloned().unwrap_or_default();
-            let off = cols.saturating_sub(hist.len());
-            for c in 0..cols {
-                let cx = sx + c as f32 * cell_w;
-                match hist.get(c.wrapping_sub(off)).copied().flatten() {
-                    Some(v) if c >= off => p.prims.push(panel(
-                        cx,
-                        ry,
-                        cell_w,
-                        (cell_h - 1.0).max(1.0),
-                        0.0,
-                        rgba(inks.load_at(v), 0xFF),
-                    )),
-                    _ => {
-                        if c % 2 == 0 {
-                            p.prims.push(panel(
-                                cx,
-                                ry + (cell_h / 2.0).floor(),
-                                cell_w,
-                                1.0,
-                                0.0,
-                                a(inks.track, 0.8),
-                            ));
-                        }
-                    }
-                }
-            }
-            row += 1;
+    /// An outlined rect, one device px wide: a span with no reading.
+    fn hollow(&mut self, x: f64, y: f64, w: f64, h: f64, ink: Rgba) {
+        if !self.draw {
+            return;
+        }
+        let (x0, y0, x1, y1) = (self.px(x), self.px(y), self.px(x + w), self.px(y + h));
+        if x1 > x0 && y1 > y0 {
+            self.p.prims.push(DrawPrim::Stroke {
+                x: self.ox + x0,
+                y: self.oy + y0,
+                w: x1 - x0,
+                h: y1 - y0,
+                radius: 0.0,
+                width: 1.0,
+                color: ink,
+            });
         }
     }
-    // The busiest processes, with whose they are.
-    let mut py = strip_top + n as f32 * cell_h + p.px(4.0);
-    for tp in snap.top.iter().take(proc_rows) {
-        let b = crate::tray_raster::row_baseline(py, row_h, p.small_px.get());
-        let (chip, ink) = match tp.scope {
-            ProcScope::Tab(k) => (
-                snap.tab(k)
-                    .map_or_else(|| "tab".to_string(), |t| t.label.to_lowercase()),
-                if Some(k) == input.tab_key {
-                    inks.tab
-                } else {
-                    inks.aterm
-                },
-            ),
-            ProcScope::Aterm => ("aterm".to_string(), inks.aterm),
-            ProcScope::Other => ("other".to_string(), inks.words2),
-        };
-        // A process's name is text whoever built it chose: drawn as the
-        // person's sentence shows it (§13.3), never raw.
-        p.label(
-            x + pad,
-            b,
-            aterm_vitals::jobs::wire::person_name(&tp.name),
-            inks.words,
-            false,
-            true,
-        );
-        let fx = x + w * 0.55;
-        p.figure(
-            fx,
-            b,
-            format!("{}c", words::cores(tp.cores)),
-            inks.words,
-            true,
-        );
-        let cw = p.figure_w("88.8c", true) + p.px(8.0);
-        p.keyline(
-            fx + cw,
-            py + (row_h * 0.3).round(),
-            p.px(2.5).max(2.0),
-            (row_h * 0.4).round(),
+
+    /// A mark `size` pt across centred at `(cx, cy)` (§10).
+    fn mark(&mut self, kind: WellMark, cx: f64, cy: f64, size: f64, frac: f32, ink: Rgb) {
+        if !self.draw {
+            return;
+        }
+        let r = 0.36 * size;
+        let lw = (0.9 * self.s).round().max(1.0) as f32;
+        let s = self.s;
+        let (ox, oy) = (self.ox, self.oy);
+        self.p.mark_in(
+            kind,
+            (ox + (cx * s) as f32, oy + (cy * s) as f32, (r * s) as f32),
+            frac,
             ink,
+            lw,
         );
-        p.label(fx + cw + p.px(6.0), b, chip, inks.words2, false, true);
-        py += row_h;
     }
-    if note_h == 0.0 {
-        return;
+
+    /// ←→ (`across`) or ↑↓ drawn as Lines, the faces lacking the glyphs;
+    /// answers the advance.
+    fn arrows(&mut self, x: f64, base: f64, across: bool) -> f64 {
+        const L: f64 = 3.4;
+        const HW: f64 = 1.8;
+        let ink = rgba(self.inks.words2, 0xFF);
+        if across {
+            let yc = base - 3.0;
+            for (xc, dir) in [(x + 4.0, -1.0), (x + 13.0, 1.0)] {
+                let tip = xc + dir * L;
+                self.line(xc - L, yc, xc + L, yc, ink);
+                self.line(tip, yc, tip - dir * HW, yc - HW, ink);
+                self.line(tip, yc, tip - dir * HW, yc + HW, ink);
+            }
+            20.0
+        } else {
+            let yc = base - 3.4;
+            for (xc, dir) in [(x + 3.0, -1.0), (x + 10.0, 1.0)] {
+                let tip = yc + dir * L;
+                self.line(xc, yc - L, xc, yc + L, ink);
+                self.line(xc, tip, xc - HW, tip - dir * HW, ink);
+                self.line(xc, tip, xc + HW, tip - dir * HW, ink);
+            }
+            16.0
+        }
     }
-    let b = crate::tray_raster::row_baseline(y + h - pad / 2.0 - note_h, note_h, p.small_px.get());
-    let parts = p.fit_clauses(
-        &[Clause::new(note, inks.words2).or_short("macOS reports shares only.")],
-        w - 2.0 * pad,
-        true,
-    );
-    let _ = p.clauses(x + pad, b, parts, true);
+
+    /// Heat step `step`'s ink: `heat_ic` under Increase Contrast.
+    fn heat(&self, v: f32) -> Rgb {
+        let step = usize::from(ink::heat_step(v.max(0.0)).min(6));
+        if self.ic {
+            self.inks.heat_ic[step]
+        } else {
+            self.inks.heat[step]
+        }
+    }
+
+    /// The machine's ink, `machine_ic` under Increase Contrast.
+    fn machine(&self) -> Rgb {
+        if self.ic {
+            self.inks.machine_ic
+        } else {
+            self.inks.machine
+        }
+    }
+
+    /// The shell: a soft shadow laid as rings, the opaque ground a step off
+    /// the band's, and the rim.
+    fn shell(&mut self, lg: &LensGeom) {
+        let inks = self.inks;
+        let m = lg.margin;
+        let (sx, sy, sw, sh) = (m, m, lg.w - 2.0 * m, lg.h - 2.0 * m);
+        let radius = self.px(8.0);
+        let rings = m as usize;
+        for i in (1..=rings).rev() {
+            let d = i as f32;
+            let k = 0.18 * (1.0 - d / (m + 1.0)).powi(2) / rings as f32 * 2.5;
+            self.p.prims.push(panel(
+                sx - d,
+                sy - d + (d * 0.4).round(),
+                sw + 2.0 * d,
+                sh + 2.0 * d,
+                radius + d,
+                rgba([0, 0, 0], (k * 255.0).round() as u8),
+            ));
+        }
+        let shell = ink::mix(inks.ground, inks.words, 0.04);
+        self.p
+            .prims
+            .push(panel(sx, sy, sw, sh, radius, rgba(shell, 0xFF)));
+        self.p.prims.push(DrawPrim::Stroke {
+            x: sx,
+            y: sy,
+            w: sw,
+            h: sh,
+            radius,
+            width: 1.0,
+            color: a(inks.rim, 0.9),
+        });
+    }
 }
 
-/// The GPU focus: the tank at full size with its compartments, the trace.
-fn gpu_focus(p: &mut Painter<'_>, rect: Rect, snap: &Snapshot) {
-    let inks = *p.inks;
-    let (x, y, w, h) = rect;
-    let pad = p.px(6.0);
-    let row_h = p.px(16.0);
-    let base = crate::tray_raster::row_baseline(y + pad / 2.0, row_h, p.small_px.get());
-    p.label(
-        x + pad,
-        base,
-        "GPU \u{00B7} one device".into(),
-        inks.words,
-        true,
-        true,
-    );
-    let Some(g) = snap.gpu.as_ref() else {
-        return;
-    };
-    let top = y + pad / 2.0 + row_h + p.px(4.0);
-    let th = (h - pad - (top - y)).max(0.0);
-    let tw = (th * 0.5).round().min(p.px(60.0));
-    p.tank(
-        (x + pad, top, tw, th),
-        Mark::of(&g.load, 1.0, words::LOAD_GATE),
-        g.cores,
-        p.px(6.0),
-    );
-    let sx = x + pad + tw + p.px(10.0);
-    p.spark(
-        sx,
-        top,
-        (x + w - pad - sx).max(0.0),
-        (th * 0.6).round(),
-        &g.history,
-        inks.load[3],
-    );
-}
-
-/// The Memory focus: the class waffle, 1 GiB a square, with swap as dashed
-/// squares past it, and the classes in words.
-fn memory_focus(p: &mut Painter<'_>, rect: Rect, snap: &Snapshot) {
-    let inks = *p.inks;
-    let (x, y, w, h) = rect;
-    let pad = p.px(6.0);
-    let row_h = p.px(16.0);
-    let base = crate::tray_raster::row_baseline(y + pad / 2.0, row_h, p.small_px.get());
-    p.label(
-        x + pad,
-        base,
-        "Memory \u{00B7} 1 GiB a square".into(),
-        inks.words,
-        true,
-        true,
-    );
-    let Some(m) = snap.mem.as_ref() else {
-        return;
-    };
-    let s = &m.sample;
-    let gib = |b: u64| (b as f64 / f64::from(1u32 << 30)).round() as usize;
-    let classes = [
-        ("app", gib(s.app), inks.mem[0], 1.0),
-        ("wired", gib(s.wired), inks.mem[0], 0.7),
-        (
-            "compressed",
-            gib(s.compressed.unwrap_or(0)),
-            inks.mem[1],
-            1.0,
-        ),
-        ("cache", gib(s.cached), inks.mem[2], 1.0),
-    ];
-    let total = gib(s.total).max(1);
-    let top = y + pad / 2.0 + row_h + p.px(2.0);
-    let legend_h = row_h * 2.0;
-    let area_w = w - 2.0 * pad;
-    let area_h = (h - pad - (top - y) - legend_h).max(0.0);
-    // The largest square that fits every GiB (and swap) in the area.
-    let swap = gib(s.swap_used);
-    let cells = total + swap;
-    let mut side = (14.0 * p.s).round();
-    while side > 3.0 {
-        let per_row = ((area_w + 2.0) / (side + 2.0)).floor().max(1.0) as usize;
-        if (cells.div_ceil(per_row) as f32) * (side + 2.0) <= area_h {
-            break;
-        }
-        side -= 1.0;
-    }
-    let per_row = ((area_w + 2.0) / (side + 2.0)).floor().max(1.0) as usize;
-    let mut i = 0usize;
-    let mut cell = |p: &mut Painter<'_>, fill: Option<(Rgb, f32)>, dashed: bool| {
-        let cx = x + pad + (i % per_row) as f32 * (side + 2.0);
-        let cy = top + (i / per_row) as f32 * (side + 2.0);
-        match fill {
-            Some((c, al)) => {
-                p.prims
-                    .push(panel(cx, cy, side, side, (side * 0.18).round(), a(c, al)))
-            }
-            None if dashed => {
-                let c = a(inks.warn, 0.9);
-                p.dotted(cx, cy, cx + side, cy, 1.0, c);
-                p.dotted(cx, cy + side - 1.0, cx + side, cy + side - 1.0, 1.0, c);
-            }
-            None => p.prims.push(panel(
-                cx,
-                cy,
-                side,
-                side,
-                (side * 0.18).round(),
-                rgba(inks.track, 0xFF),
-            )),
-        }
-        i += 1;
-    };
-    let mut used = 0usize;
-    for (_, n, c, al) in classes {
-        for _ in 0..n.min(total.saturating_sub(used)) {
-            cell(p, Some((c, al)), false);
-        }
-        used = (used + n).min(total);
-    }
-    for _ in used..total {
-        cell(p, None, false);
-    }
-    for _ in 0..swap {
-        cell(p, None, true);
-    }
-    let ly = y + h - pad / 2.0 - legend_h;
-    let mut clauses: Vec<Clause> = classes
-        .iter()
-        .map(|(name, _, _, _)| *name)
-        .zip([Some(s.app), Some(s.wired), s.compressed, Some(s.cached)])
-        // A class this OS does not report is left out of the legend.
-        .filter_map(|(name, b)| {
-            b.map(|b| Clause::new(format!("{name} {}", words::gib_figure(b)), inks.words2))
-        })
-        .collect();
-    clauses.push(Clause::new(
-        format!("free {}", words::gib_figure(s.free)),
-        inks.words2,
-    ));
-    let parts = p.fit_clauses(&clauses, area_w, true);
-    let b = crate::tray_raster::row_baseline(ly, row_h, p.small_px.get());
-    let _ = p.clauses(x + pad, b, parts, true);
-    let pressure_ink = match s.pressure {
-        aterm_vitals::Pressure::Warn => inks.warn,
-        aterm_vitals::Pressure::Critical => inks.critical,
-        _ => inks.words2,
-    };
-    let mut second = vec![Clause::new(
-        format!("pressure {}", s.pressure.word()),
-        pressure_ink,
-    )];
-    second.push(Clause::new(
-        if s.swap_used == 0 {
-            "swap 0".to_string()
+/// `text` wrapped to `width` where the shared rule lets a line break
+/// ([`aterm_grapheme::pieces`]): at word boundaries, and between CJK
+/// characters with nothing put between them; a word wider than a line is
+/// cut, never drawn past it.
+fn wrap(m: &FaceMetrics, text: &str, width: f64, pt: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for piece in aterm_grapheme::pieces(text, aterm_grapheme::BreakKind::is_word_boundary) {
+        let word = piece.text;
+        let t = if line.is_empty() {
+            word.to_owned()
+        } else if piece.spaced {
+            format!("{line} {word}")
         } else {
-            format!("swap {}", words::mem(s.swap_used))
-        },
-        if s.swap_used == 0 {
-            inks.words2
+            format!("{line}{word}")
+        };
+        if line.is_empty() || m.width(&t, pt, false) <= width + EPS {
+            line = t;
         } else {
-            inks.warn
-        },
-    ));
-    // The commit charge against its limit, where the OS keeps one (design
-    // §9.6): Windows enforces it, Linux's overcommit makes it an estimate.
-    if let Some(c) = s.commit {
-        second.push(Clause::new(
-            format!(
-                "commit {} of {} GiB{}",
-                words::gib_figure(c.charge),
-                words::gib_total(c.limit),
-                if c.exact { "" } else { ", estimate" }
-            ),
-            if c.near_limit().is_some() {
-                inks.warn
+            out.push(std::mem::replace(&mut line, word.to_owned()));
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out.into_iter()
+        .map(|l| {
+            if m.width(&l, pt, false) <= width + EPS {
+                l
             } else {
-                inks.words2
-            },
-        ));
-    }
-    let parts = p.fit_clauses(&second, area_w, true);
-    let b = crate::tray_raster::row_baseline(ly + row_h, row_h, p.small_px.get());
-    let _ = p.clauses(x + pad, b, parts, true);
+                m.fit(&[&l], width, pt, false)
+            }
+        })
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
-/// The Disk focus: the volume's container bar and its figures.
-fn disk_focus(p: &mut Painter<'_>, rect: Rect, snap: &Snapshot) {
-    let inks = *p.inks;
-    let (x, y, w, _) = rect;
-    let pad = p.px(6.0);
-    let row_h = p.px(16.0);
-    let base = crate::tray_raster::row_baseline(y + pad / 2.0, row_h, p.small_px.get());
-    p.label(
-        x + pad,
-        base,
-        "Disk \u{00B7} the tab's volume".into(),
-        inks.words,
-        true,
-        true,
-    );
-    let Some(v) = snap.volume.as_ref() else {
-        return;
+/// The first of `forms` that fits `room`; `None` when none does.
+fn first_fit(m: &FaceMetrics, forms: &[String], room: f64, pt: f64, bold: bool) -> Option<String> {
+    forms
+        .iter()
+        .find(|f| m.width(f, pt, bold) <= room + EPS)
+        .cloned()
+}
+
+/// Rule F: the first of `forms` that fits, else the last cut with "…".
+fn fit_cut(m: &FaceMetrics, forms: &[String], room: f64, pt: f64, bold: bool) -> String {
+    let refs: Vec<&str> = forms.iter().map(String::as_str).collect();
+    m.fit(&refs, room, pt, bold)
+}
+
+/// A section heading at `p`'s top, with the first of `subs` that fits
+/// beside it.
+fn heading(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String]) {
+    let base = p.y + HEAD_BASE;
+    let name = pen.cut(name, p.w, HEAD_PT, true);
+    let ink = pen.inks.words;
+    let nw = pen.text(p.x, base, &name, HEAD_PT, true, ink);
+    let room = p.w - nw - 8.0;
+    if let Some(sub) = first_fit(pen.m, subs, room, NOTE_PT, false) {
+        let ink = pen.inks.words2;
+        pen.text(p.x + nw + 8.0, base, &sub, NOTE_PT, false, ink);
+    }
+}
+
+/// Where a one-line section's words start after its label.
+fn tab_after(label_w: f64) -> f64 {
+    [44.0, 52.0, 64.0]
+        .into_iter()
+        .find(|t| label_w + 8.0 <= *t)
+        .unwrap_or(label_w + 8.0)
+}
+
+/// A one-line form: the label, then the first of `forms` that fits, else the
+/// last cut.
+fn one_line(pen: &mut Pen<'_>, p: Place, label: &str, forms: &[String]) {
+    let base = p.y + HEAD_BASE;
+    let label = pen.cut(label, p.w, HEAD_PT, true);
+    let ink = pen.inks.words;
+    let lw = pen.text(p.x, base, &label, HEAD_PT, true, ink);
+    let tab = tab_after(lw).max(pen.line_tab);
+    let s = fit_cut(pen.m, forms, p.w - tab, BODY_PT, false);
+    let ink = pen.inks.words2;
+    pen.text(p.x + tab, base, &s, BODY_PT, false, ink);
+}
+
+/// A section that is one line in every form.
+fn line_section<'d>(name: &str, label: &str, forms: Vec<String>, right: bool) -> Section<'d> {
+    let words = forms.first().cloned().into_iter().collect();
+    Section {
+        name: name.to_owned(),
+        words,
+        right,
+        parts: Vec::new(),
+        forms: vec![line_form(label, forms)],
+    }
+}
+
+// ---------------------------------------------------------------------
+// Lists: a chip, a name, a scope, a bar and a figure a row.
+
+/// One row of a list.
+#[derive(Clone, Debug, PartialEq)]
+struct Row {
+    /// Whose it is: the chip's ink.
+    chip: Option<ProcScope>,
+    name: String,
+    scope: Option<String>,
+    /// The bar's share, `0..=1`.
+    share: Option<f64>,
+    figure: String,
+}
+
+impl Row {
+    fn said(&self) -> String {
+        match &self.scope {
+            Some(scope) => format!("{} in {scope}, {}", self.name, self.figure),
+            None => format!("{}, {}", self.name, self.figure),
+        }
+    }
+}
+
+/// Processes of one name in one scope as one row (`rustc ×9`), their
+/// figures summed, largest first.
+fn grouped<'a>(
+    items: impl IntoIterator<Item = (&'a str, ProcScope, f64)>,
+) -> Vec<(String, ProcScope, f64)> {
+    let mut groups: Vec<(&str, ProcScope, f64, usize)> = Vec::new();
+    for (name, scope, v) in items {
+        match groups.iter_mut().find(|g| g.0 == name && g.1 == scope) {
+            Some(g) => {
+                g.2 += v;
+                g.3 += 1;
+            }
+            None => groups.push((name, scope, v, 1)),
+        }
+    }
+    groups.sort_by(|a, b| b.2.total_cmp(&a.2));
+    groups
+        .into_iter()
+        .map(|(name, scope, v, n)| {
+            let name = aterm_vitals::jobs::wire::person_name(name);
+            let name = if n > 1 {
+                format!("{name} \u{d7}{n}")
+            } else {
+                name
+            };
+            (name, scope, v)
+        })
+        .collect()
+}
+
+/// A list's height: a heading, `n` rows and an optional note line.
+fn rows_h(n: usize, note: bool) -> f64 {
+    PITCH * (n + usize::from(note)) as f64 + 14.0
+}
+
+/// A chip's ink (§11.3): Tab ink only for this window's front tab, aterm ink
+/// for other tabs and aterm itself, the machine's for everything else.
+fn chip_ink(pen: &Pen<'_>, scope: ProcScope, tab_key: Option<u64>) -> Rgb {
+    match scope {
+        ProcScope::Tab(k) if Some(k) == tab_key => {
+            if pen.ic {
+                pen.inks.tab_ic
+            } else {
+                pen.inks.tab
+            }
+        }
+        ProcScope::Tab(_) | ProcScope::Aterm => {
+            if pen.ic {
+                pen.inks.aterm_ic
+            } else {
+                pen.inks.aterm
+            }
+        }
+        ProcScope::Other => pen.machine(),
+    }
+}
+
+/// `rows` under a heading at `p`'s top: a list with no bars and no scopes
+/// gives its names the room the figures leave; any other sizes its name
+/// column to its longest name.
+fn draw_rows(pen: &mut Pen<'_>, p: Place, rows: &[Row], tab_key: Option<u64>) {
+    let fig_w = rows
+        .iter()
+        .map(|r| pen.width(&r.figure, BODY_PT, false))
+        .fold(0.0, f64::max);
+    // Every row starts 10 pt in: a chip's room, kept where there is none so
+    // the names align under the heading's second word.
+    let lead = 10.0;
+    let avail = (p.w - lead - fig_w - 8.0).max(0.0);
+    let has_scope = rows.iter().any(|r| r.scope.is_some());
+    let longest = rows
+        .iter()
+        .map(|r| pen.width(&r.name, BODY_PT, false))
+        .fold(0.0, f64::max);
+    let name_w = if has_scope || rows.iter().any(|r| r.share.is_some()) {
+        (longest + 10.0).clamp(60.0, 160.0).min(avail * 0.5)
+    } else {
+        avail
     };
-    let top = y + pad / 2.0 + row_h + p.px(6.0);
-    let bh = p.px(12.0);
-    let bw = w - 2.0 * pad;
-    let level = if v.total > 0 {
-        v.total.saturating_sub(v.available) as f32 / v.total as f32
+    let scope_w = if has_scope {
+        (avail * 0.1)
+            .clamp(36.0, 52.0)
+            .min((avail - name_w - 4.0).max(0.0))
     } else {
         0.0
     };
-    let slot = (x + pad - 2.0, top - 3.0, bw + 4.0, bh + 6.0);
-    p.lane(
-        x + pad,
-        top,
-        bw,
-        bh,
-        Mark::still(level),
-        inks.mem[0],
-        slot,
-        false,
-    );
-    let lines = [
-        format!(
-            "{} free of {}",
-            words::disk(v.available),
-            words::disk(v.total)
-        ),
-        format!("{} used", words::disk(v.total.saturating_sub(v.available))),
-        format!("on {}", v.mount),
-    ];
-    for (i, line) in lines.into_iter().enumerate() {
-        let ry = top + bh + p.px(4.0) + i as f32 * row_h;
-        let b = crate::tray_raster::row_baseline(ry, row_h, p.small_px.get());
-        let parts = p.fit_clauses(
-            &[Clause::new(
-                line,
-                if i == 0 { inks.words } else { inks.words2 },
-            )],
-            bw,
-            true,
-        );
-        let _ = p.clauses(x + pad, b, parts, true);
+    let bar_x = p.x + lead + name_w + 4.0 + if has_scope { scope_w + 4.0 } else { 0.0 };
+    let bar_w = p.x + p.w - fig_w - 8.0 - bar_x;
+    let inks = pen.inks;
+    for (i, r) in rows.iter().enumerate() {
+        let base = p.y + ROW0_BASE + PITCH * i as f64;
+        if let Some(scope) = r.chip {
+            let ink = chip_ink(pen, scope, tab_key);
+            pen.rect(p.x, base - 7.0, 6.0, 7.0, 1.0, rgba(ink, 0xFF));
+        }
+        let name = pen.cut(&r.name, name_w, BODY_PT, false);
+        pen.text(p.x + lead, base, &name, BODY_PT, false, inks.words);
+        if let Some(scope) = &r.scope {
+            let scope = pen.cut(scope, scope_w, BODY_PT, false);
+            pen.text(
+                p.x + lead + name_w + 4.0,
+                base,
+                &scope,
+                BODY_PT,
+                false,
+                inks.words2,
+            );
+        }
+        if bar_w >= 24.0
+            && let Some(share) = r.share
+        {
+            pen.rect(bar_x, base - 6.5, bar_w, 6.0, 1.0, rgba(inks.track, 0xFF));
+            let fill = (bar_w * share.clamp(0.0, 1.0)).max(2.0 / pen.s);
+            let ink = pen.machine();
+            pen.rect(bar_x, base - 6.5, fill, 6.0, 1.0, rgba(ink, 0xFF));
+        }
+        pen.text_end(p.x + p.w, base, &r.figure, BODY_PT, false, inks.words);
     }
 }
 
-/// The Jobs focus: every job in aterm's tabs that is not fine, worst first
-/// (its mark, its tab, its name, the person's sentence for its verdict),
-/// then the zombie findings; a calm line when there are none.
-fn jobs_focus(p: &mut Painter<'_>, rect: Rect, snap: &Snapshot, input: &DeckInput<'_>) {
-    use crate::stats_paint::WellMark;
-    use aterm_vitals::jobs::{Verdict, wire::person_name};
-    let inks = *p.inks;
-    let (x, y, w, h) = rect;
-    let pad = p.px(6.0);
-    let row_h = p.px(16.0);
-    let base = crate::tray_raster::row_baseline(y + pad / 2.0, row_h, p.small_px.get());
-    p.label(x + pad, base, "Jobs".into(), inks.words, true, true);
-    let tab_number = |key: u64| {
-        snap.tab(key)
-            .map_or_else(|| "a tab".to_string(), |t| t.label.clone())
+/// A list section: its heading and subtitle, `rows`, an optional note; in
+/// two columns all of `rows` (at most `most`); in one, `most` then 2 rows;
+/// and the one-line form `label` `line` last.
+#[expect(clippy::too_many_arguments, reason = "a list's words, rows and forms")]
+fn list_section<'d>(
+    c: Ctx<'d>,
+    name: String,
+    subs: Vec<String>,
+    rows: Vec<Row>,
+    note: Option<String>,
+    most: usize,
+    label: &str,
+    line: Vec<String>,
+    right: bool,
+) -> Section<'d> {
+    let mut words: Vec<String> = rows.iter().map(Row::said).collect();
+    words.extend(note.clone());
+    let tab_key = c.tab_key;
+    let mut forms = Vec::new();
+    let counts: Vec<usize> = if c.two {
+        vec![rows.len().min(most)]
+    } else {
+        let mut v = vec![rows.len().min(most), rows.len().min(2)];
+        v.dedup();
+        v
     };
-    // (mark, the arc, the line's clauses) for each job that is not fine,
-    // worst first. The verdict's sentence folds to its word and age first.
-    let mut lines: Vec<(WellMark, f32, Vec<Clause>)> = Vec::new();
-    if let Some(view) = snap.jobs.as_deref() {
-        let rank = |v: Verdict| match v {
-            Verdict::Stuck => Some((0, WellMark::Stuck)),
-            Verdict::Quiet => Some((2, WellMark::Quiet)),
-            Verdict::WaitingYou => Some((3, WellMark::Waiting)),
-            Verdict::Parked => Some((4, WellMark::Stopped)),
-            _ => None,
-        };
-        let mut rows: Vec<_> = view
-            .rows
-            .iter()
-            .filter_map(|r| rank(r.verdict).map(|k| (k, r)))
-            .collect();
-        rows.sort_by_key(|((order, _), r)| (*order, std::cmp::Reverse(r.quiet_ms.unwrap_or(0))));
-        for ((_, mark), r) in rows {
-            let frac = r.phi_milli.map_or(1.0, crate::stats_paint::quiet_arc);
-            let short = match r.quiet_ms {
-                Some(q) if matches!(r.verdict, Verdict::Stuck | Verdict::Quiet) => {
-                    format!(
-                        "{} {}",
-                        r.verdict.word(),
-                        aterm_vitals::jobs::wire::age_words(q)
-                    )
-                }
-                _ => r.verdict.word().to_string(),
-            };
-            lines.push((
-                mark,
-                frac,
-                vec![
-                    Clause::new(
-                        format!("{} {}", tab_number(r.tab), person_name(&r.exe)),
-                        inks.words,
-                    ),
-                    Clause::new(r.said(), inks.words).or_short(short),
-                ],
-            ));
-        }
-        for z in view.findings.zombies.iter().filter(|z| z.tab.is_some()) {
-            lines.push((
-                WellMark::Zombies,
-                1.0,
-                vec![
-                    Clause::new(
-                        format!(
-                            "{} {}",
-                            z.tab.map_or_else(String::new, tab_number),
-                            person_name(&z.name)
-                        ),
-                        inks.words,
-                    ),
-                    Clause::new(
-                        format!("{} unreaped children of pid {}", z.count, z.ppid),
-                        inks.words,
-                    )
-                    .or_short(format!("{} zombies", z.count)),
-                ],
-            ));
-        }
-        // Zombies rank second, after stuck jobs.
-        lines.sort_by_key(|(mark, _, _)| *mark);
+    for n in counts.into_iter().filter(|&n| n > 0) {
+        let with_note = note.is_some() && c.two;
+        let (rows, subs, name, note) =
+            (rows[..n].to_vec(), subs.clone(), name.clone(), note.clone());
+        forms.push(form(rows_h(n, with_note), move |pen, p| {
+            heading(pen, p, &name, &subs);
+            draw_rows(pen, p, &rows, tab_key);
+            if with_note && let Some(note) = &note {
+                let base = p.y + ROW0_BASE + PITCH * rows.len() as f64;
+                let lead = 10.0;
+                let s = pen.cut(note, p.w - lead, NOTE_PT, false);
+                let ink = pen.inks.words2;
+                pen.text(p.x + lead, base, &s, NOTE_PT, false, ink);
+            }
+        }));
     }
-    if lines.is_empty() {
-        let b = crate::tray_raster::row_baseline(y + pad / 2.0 + row_h, row_h, p.small_px.get());
-        let calm = if snap.jobs.is_some() || !input.marks.is_empty() {
-            "Nothing stuck, quiet or waiting for you."
-        } else {
-            "Reading the jobs\u{2026}"
-        };
-        let parts = p.fit_clauses(&[Clause::new(calm, inks.words2)], w - 2.0 * pad, true);
-        let _ = p.clauses(x + pad, b, parts, true);
+    forms.push(line_form(label, line));
+    Section {
+        name,
+        words,
+        right,
+        parts: Vec::new(),
+        forms,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Step traces (§7.7): a line per bucket, because the axis does not start at
+// zero.
+
+/// A step trace's data and words.
+struct Trace {
+    /// The values, oldest first; `None` was not read.
+    vals: Vec<Option<f64>>,
+    /// The labels under the plot: the share of the width from the left, and
+    /// the words.
+    under: &'static [(f64, &'static str)],
+    /// The least span the axis shows, in the values' unit.
+    min_span: f64,
+    /// A rule at a fractional bucket index, and its label.
+    mark: Option<(f64, String)>,
+    /// What an unread span inside the window says.
+    gap: &'static str,
+}
+
+/// The labels under a 24 hour trace and an hour's.
+const DAY: &[(f64, &str)] = &[
+    (0.0, "24 h ago"),
+    (0.25, "18 h"),
+    (0.5, "12 h"),
+    (0.75, "6 h"),
+    (1.0, "now"),
+];
+const HOUR: &[(f64, &str)] = &[
+    (0.0, "60 min ago"),
+    (0.25, "45 min"),
+    (0.5, "30 min"),
+    (0.75, "15 min"),
+    (1.0, "now"),
+];
+
+/// The smallest of 1, 2 and 5 times a power of ten at or above `v`.
+fn nice_up(v: f64) -> f64 {
+    let e = 10f64.powf(v.max(1e-9).log10().floor());
+    for k in [1.0, 2.0, 5.0, 10.0] {
+        if k * e >= v * (1.0 - 1e-9) {
+            return k * e;
+        }
+    }
+    10.0 * e
+}
+
+/// The smallest axis step at or above `v`: 1, 2, 2.5, 3, 4 or 5 times a
+/// power of ten, so a 24-hour trace of 868 to 911 GB reads 870, 900, 930
+/// rather than 850, 900, 950.
+fn step_up(v: f64) -> f64 {
+    let e = 10f64.powf(v.max(1e-9).log10().floor());
+    [1.0, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0]
+        .into_iter()
+        .map(|k| k * e)
+        .find(|s| *s >= v * (1.0 - 1e-9))
+        .unwrap_or(10.0 * e)
+}
+
+/// An axis of `n` intervals over `lo..hi` (at least `min_span` wide): its
+/// floor and its step.
+fn axis(lo: f64, hi: f64, n: usize, min_span: f64) -> (f64, f64) {
+    let mid = (lo + hi) / 2.0;
+    let (lo, hi) = if hi - lo < min_span {
+        (mid - min_span / 2.0, mid + min_span / 2.0)
+    } else {
+        (lo, hi)
+    };
+    let mut step = step_up((hi - lo) / n as f64);
+    for _ in 0..64 {
+        let floor = (lo / step).floor() * step;
+        if floor + step * n as f64 >= hi - 1e-9 {
+            return (floor, step);
+        }
+        step = step_up(step * 1.0001);
+    }
+    (lo, (hi - lo) / n as f64)
+}
+
+/// The decimals an axis step needs for its labels to be exact (at most 2).
+fn decimals(step: f64) -> usize {
+    (0..2)
+        .find(|&d| {
+            let v = step * 10f64.powi(d as i32);
+            (v - v.round()).abs() < 1e-6
+        })
+        .unwrap_or(2)
+}
+
+/// A trace's height for a plot `ch` pt tall: the heading, the plot and the
+/// labels under it.
+fn trace_h(ch: f64) -> f64 {
+    ch + 32.0
+}
+
+/// The trace `t` in `p` under its heading: gridlines with their figures in a
+/// gutter, a step line per read bucket, an outlined band for an unread span
+/// with its words, the mark's rule and the labels under the plot.
+fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
+    let inks = pen.inks;
+    let read: Vec<f64> = t.vals.iter().flatten().copied().collect();
+    let ch = p.h - 32.0;
+    let (Some(&first), true) = (read.first(), ch >= 8.0) else {
+        return;
+    };
+    let (mn, mx) = read
+        .iter()
+        .fold((first, first), |(a, b), &v| (a.min(v), b.max(v)));
+    let n = if ch >= 60.0 { 3 } else { 2 };
+    let (lo, step) = axis(mn, mx, n, t.min_span);
+    let hi = lo + step * n as f64;
+    let dec = decimals(step).max(decimals(lo));
+    let labels: Vec<String> = (0..=n)
+        .map(|k| format!("{:.*}", dec, lo + step * k as f64))
+        .collect();
+    let gutter = labels
+        .iter()
+        .map(|l| pen.width(l, AXIS_PT, false))
+        .fold(0.0, f64::max)
+        + 4.0;
+    let (x0, x1) = (p.x + gutter, p.x + p.w);
+    let y0 = p.y + 18.0;
+    let y1 = y0 + ch;
+    if x1 - x0 < 24.0 {
         return;
     }
-    let r = (row_h * 0.32).round();
-    let room = ((h - pad - row_h) / row_h).floor().max(1.0) as usize;
-    let more = lines.len().saturating_sub(room);
-    let shown = if more > 0 {
-        room.saturating_sub(1)
-    } else {
-        room
-    };
-    for (i, (mark, frac, line)) in lines.iter().take(shown).enumerate() {
-        let ry = y + pad / 2.0 + row_h * (i as f32 + 1.0);
-        p.mark(*mark, x + pad + r, (ry + row_h / 2.0).round(), r, *frac);
-        let b = crate::tray_raster::row_baseline(ry, row_h, p.small_px.get());
-        let tx = x + pad + 2.0 * r + p.px(6.0);
-        let parts = p.fit_clauses(line, x + w - pad - tx, true);
-        let _ = p.clauses(tx, b, parts, true);
+    for (k, l) in labels.iter().enumerate() {
+        let yy = y1 - ch * k as f64 / n as f64;
+        pen.rule(x0, yy, x1 - x0, rgba(inks.grid, 0xFF));
+        pen.text_end(x0 - 4.0, yy + 3.2, l, AXIS_PT, false, inks.words2);
     }
-    if more > 0 {
-        let ry = y + pad / 2.0 + row_h * (shown as f32 + 1.0);
-        let b = crate::tray_raster::row_baseline(ry, row_h, p.small_px.get());
-        p.label(
-            x + pad,
-            b,
-            format!("+{} more", lines.len() - shown),
-            inks.words2,
+    let cols = t.vals.len().max(1);
+    let pitch = (x1 - x0) / cols as f64;
+    let yv = |v: f64| y1 - (v - lo) / (hi - lo) * ch;
+    let ink = rgba(inks.words2, 0xFF);
+    // Runs of one level draw as one segment.
+    let mut run: Option<(f64, f64)> = None;
+    for (j, v) in t.vals.iter().enumerate() {
+        let xa = x0 + j as f64 * pitch;
+        match (v.map(yv), run) {
+            (Some(yy), Some((sx, sy))) if (yy - sy).abs() < 0.05 => {
+                let _ = sx;
+            }
+            (Some(yy), Some((sx, sy))) => {
+                pen.line(sx, sy, xa, sy, ink);
+                pen.line(xa, sy, xa, yy, ink);
+                run = Some((xa, yy));
+            }
+            (Some(yy), None) => run = Some((xa, yy)),
+            (None, Some((sx, sy))) => {
+                pen.line(sx, sy, xa, sy, ink);
+                run = None;
+            }
+            (None, None) => {}
+        }
+    }
+    if let Some((sx, sy)) = run {
+        pen.line(sx, sy, x1, sy, ink);
+    }
+    // Unread spans: an outlined band, and its words where they fit.
+    let mut said: Vec<(f64, f64)> = Vec::new();
+    let mut j = 0;
+    while j < cols {
+        if t.vals.get(j).is_some_and(Option::is_some) {
+            j += 1;
+            continue;
+        }
+        let start = j;
+        while j < cols && t.vals.get(j).is_some_and(Option::is_none) {
+            j += 1;
+        }
+        let (xa, xb) = (x0 + start as f64 * pitch, x0 + j as f64 * pitch);
+        // An outlined cell a bucket, as a strip's unread cells are; one
+        // outline when the buckets are too narrow to tell apart.
+        if pitch * pen.s >= 3.0 {
+            for k in start..j {
+                let xk = x0 + k as f64 * pitch;
+                pen.hollow(xk, y1 - 4.0, pitch, 4.0, rgba(inks.hollow, 0xFF));
+            }
+        } else {
+            pen.hollow(xa, y1 - 4.0, xb - xa, 4.0, rgba(inks.hollow, 0xFF));
+        }
+        let words = if start == 0 { "not read" } else { t.gap };
+        let lw = pen.width(words, AXIS_PT, false);
+        if ch >= 30.0 && lw <= xb - xa + 16.0 && lw <= x1 - x0 {
+            let lx = ((xa + xb) / 2.0 - lw / 2.0).clamp(x0, x1 - lw);
+            if !said.iter().any(|&(a, b)| lx < b + 6.0 && a < lx + lw + 6.0) {
+                pen.text(lx, y1 - 8.0, words, AXIS_PT, false, inks.words2);
+                said.push((lx, lx + lw));
+            }
+        }
+    }
+    if let Some((at, label)) = &t.mark {
+        let fx = x0 + at * pitch;
+        if (x0..=x1).contains(&fx) {
+            pen.tick(fx, y0 - 2.0, y1, rgba(inks.words, 0xFF));
+            let lw = pen.width(label, AXIS_PT, false);
+            if fx - 4.0 - lw >= x0 {
+                pen.text(fx - 4.0 - lw, y0 + 8.0, label, AXIS_PT, false, inks.words);
+            } else if fx + 4.0 + lw <= x1 {
+                pen.text(fx + 4.0, y0 + 8.0, label, AXIS_PT, false, inks.words);
+            }
+        }
+    }
+    // The labels under the plot: the ends first, then each between that
+    // clears the ones placed.
+    let base = y1 + 12.0;
+    let mut placed: Vec<(f64, f64)> = Vec::new();
+    let last = t.under.len().saturating_sub(1);
+    let order = [0, last].into_iter().chain(1..last);
+    for i in order {
+        let Some(&(share, words)) = t.under.get(i) else {
+            continue;
+        };
+        let lw = pen.width(words, AXIS_PT, false);
+        let ax = x0 + share * (x1 - x0);
+        let lx = if share <= 0.0 {
+            ax
+        } else if share >= 1.0 {
+            ax - lw
+        } else {
+            ax - lw / 2.0
+        };
+        if lw > x1 - x0 {
+            continue;
+        }
+        let lx = lx.clamp(x0, x1 - lw);
+        if placed
+            .iter()
+            .any(|&(a, b)| lx < b + 6.0 && a < lx + lw + 6.0)
+        {
+            continue;
+        }
+        pen.text(lx, base, words, AXIS_PT, false, inks.words2);
+        placed.push((lx, lx + lw));
+    }
+}
+
+/// A trace section: the trace growing in two columns, at `heights` in one,
+/// then its one-line form; only the one-line form while nothing was read.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a trace section's words and forms"
+)]
+fn trace_section<'d>(
+    c: Ctx<'d>,
+    name: &str,
+    subs: Vec<String>,
+    trace: Trace,
+    said: String,
+    label: &str,
+    line: Vec<String>,
+    right: bool,
+) -> Section<'d> {
+    let mut forms = Vec::new();
+    if trace.vals.iter().any(Option::is_some) {
+        let trace = std::rc::Rc::new(trace);
+        let heights: &[f64] = if c.two {
+            &[36.0]
+        } else {
+            &[56.0, 48.0, 40.0, 36.0]
+        };
+        for &ch in heights {
+            let (trace, subs, name) = (std::rc::Rc::clone(&trace), subs.clone(), name.to_owned());
+            let draw = move |pen: &mut Pen<'_>, p: Place| {
+                heading(pen, p, &name, &subs);
+                draw_trace(pen, p, &trace);
+            };
+            forms.push(if c.two {
+                grow(trace_h(ch), draw)
+            } else {
+                form(trace_h(ch), draw)
+            });
+        }
+    }
+    let words = vec![said];
+    forms.push(line_form(label, line));
+    Section {
+        name: name.to_owned(),
+        words,
+        right,
+        parts: Vec::new(),
+        forms,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Words the lens prints.
+
+/// Bytes printed alone, as the deck and its Details print them
+/// ([`words::bytes_lone`], §6.0, §7.7: "69 GB", "8.6 GB", "1.2 TB"), so a
+/// line, a size or a growth reads the same in the lens as on the deck.
+fn gb(bytes: f64) -> String {
+    words::bytes_lone(bytes.max(0.0).round() as u64)
+}
+
+/// A write rate printed alone, as the deck's writes cells print it
+/// ([`words::rate_mb_lone`], §7.7: "31 MB/s", "5.1 MB/s").
+fn mb_s(bytes_per_s: f64) -> String {
+    words::rate_mb_lone(bytes_per_s)
+}
+
+/// `at_unix_ms` as local `HH:MM:SS`.
+fn clock_s(at_unix_ms: i64, utc_offset_s: i64) -> String {
+    let secs = at_unix_ms
+        .div_euclid(1000)
+        .saturating_add(utc_offset_s)
+        .rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
+}
+
+/// The disk's growth (§7.7): "used grew 2.6 GB in the last 10 min, 16 GB in
+/// the last hour", then "+2.6 GB in 10 min, +16 GB in 1 h".
+fn growth_forms(r: &Rates) -> Vec<String> {
+    let change = |g: f64| -> (&'static str, String) {
+        if g.abs() < 1e8 {
+            ("held steady", String::new())
+        } else if g > 0.0 {
+            ("grew", gb(g))
+        } else {
+            ("shrank", gb(-g))
+        }
+    };
+    let join = |verb: &str, amount: &str| {
+        if amount.is_empty() {
+            verb.to_owned()
+        } else {
+            format!("{verb} {amount}")
+        }
+    };
+    let short = |g: f64, span: &str| {
+        if g.abs() < 1e8 {
+            format!("steady in {span}")
+        } else {
+            let sign = if g > 0.0 { "+" } else { "\u{2212}" };
+            format!("{sign}{} in {span}", gb(g.abs()))
+        }
+    };
+    let g10 = r.rate10.map(|v| v * 600.0);
+    let g60 = r.rate60.map(|v| v * 3600.0);
+    match (g10, g60) {
+        (Some(a), Some(b)) => {
+            let ((va, aa), (vb, ab)) = (change(a), change(b));
+            let second = if va == vb && !ab.is_empty() {
+                ab
+            } else {
+                join(vb, &ab)
+            };
+            vec![
+                format!(
+                    "used {} in the last 10 min, {second} in the last hour",
+                    join(va, &aa)
+                ),
+                format!("{}, {}", short(a, "10 min"), short(b, "1 h")),
+            ]
+        }
+        (Some(a), None) => {
+            let (v, amount) = change(a);
+            vec![
+                format!("used {} in the last 10 min", join(v, &amount)),
+                short(a, "10 min"),
+            ]
+        }
+        (None, Some(b)) => {
+            let (v, amount) = change(b);
+            vec![
+                format!("used {} in the last hour", join(v, &amount)),
+                short(b, "1 h"),
+            ]
+        }
+        (None, None) => vec!["growth not read yet".to_owned()],
+    }
+}
+
+/// A trace's sentence: its first and last readings, its unread spans and
+/// its mark.
+fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale) -> String {
+    let (start_ms, bucket_ms) = span;
+    let fmt = |v: f64| {
+        if v >= 100.0 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        }
+    };
+    let n = t.vals.len();
+    let Some((i0, v0)) = t
+        .vals
+        .iter()
+        .enumerate()
+        .find_map(|(i, v)| v.map(|v| (i, v)))
+    else {
+        return format!("{what}: not read yet.");
+    };
+    let last = t.vals.iter().rev().flatten().next().copied().unwrap_or(v0);
+    let ago = |i: usize| {
+        let ms = (n - i) as i64 * bucket_ms;
+        let (k, one, many) = if ms >= 3_600_000 {
+            ((ms as f64 / 3_600_000.0).round() as u64, "hour", "hours")
+        } else {
+            ((ms as f64 / 60_000.0).round() as u64, "minute", "minutes")
+        };
+        format!("{k} {} ago", if k == 1 { one } else { many })
+    };
+    let mut out = format!("{what}: {} {unit} {}, {} now.", fmt(v0), ago(i0), fmt(last));
+    let mut j = i0;
+    let mut gaps = 0;
+    while j < n && gaps < 3 {
+        if t.vals[j].is_some() {
+            j += 1;
+            continue;
+        }
+        let start = j;
+        while j < n && t.vals[j].is_none() {
+            j += 1;
+        }
+        if j < n {
+            // Within the trace's day a time needs no weekday.
+            let at = |i: usize| {
+                let mut t = clock_s(start_ms + i as i64 * bucket_ms, loc.utc_offset_s);
+                t.truncate(5);
+                t
+            };
+            out.push_str(&format!(
+                " Not read from {} to {}, {}.",
+                at(start),
+                at(j),
+                t.gap.trim_end_matches(", not read")
+            ));
+            gaps += 1;
+        }
+    }
+    out
+}
+
+/// Bytes as GiB with one decimal, for the memory lens.
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / 1_073_741_824.0
+}
+
+// ---------------------------------------------------------------------
+// The lenses.
+
+/// What every lens's builder reads.
+#[derive(Clone, Copy)]
+struct Ctx<'d> {
+    snap: &'d Snapshot,
+    m: &'d FaceMetrics,
+    tab_key: Option<u64>,
+    tab_label: &'d str,
+    loc: Locale,
+    bar: Bar,
+    /// Two columns, and a column's width.
+    two: bool,
+    cw: f64,
+}
+
+impl Ctx<'_> {
+    /// Whether a process of `scope` belongs to the scope ↑/↓ chose.
+    fn in_scope(&self, scope: ProcScope) -> bool {
+        match self.bar {
+            Bar::Global => true,
+            Bar::Aterm => scope != ProcScope::Other,
+            Bar::Tab => self.tab_key.is_some_and(|k| scope == ProcScope::Tab(k)),
+        }
+    }
+
+    /// The chosen scope as a list heading's suffix.
+    fn suffix(&self) -> String {
+        match self.bar {
+            Bar::Global => String::new(),
+            Bar::Aterm => " in aterm".to_owned(),
+            Bar::Tab => format!(" in {}", self.tab_label),
+        }
+    }
+
+    /// A process's scope in a word: its tab's label, aterm, or other.
+    fn scope_word(&self, scope: ProcScope) -> String {
+        match scope {
+            ProcScope::Tab(k) => self
+                .snap
+                .tab(k)
+                .map_or_else(|| "a tab".to_owned(), |t| t.label.clone()),
+            ProcScope::Aterm => "aterm".to_owned(),
+            ProcScope::Other => "other".to_owned(),
+        }
+    }
+
+    fn at(&self) -> String {
+        clock_s(self.snap.at_unix_ms, self.loc.utc_offset_s)
+    }
+
+    fn view(&self, res: Resource) -> ResourceView {
+        self.snap.resource(res, self.tab_key)
+    }
+
+    /// The row's state now (the answer of every lens but Disk's): its % of
+    /// max and its amount, and its state's words, in its mark's ink.
+    fn now_answer(&self, res: Resource, of: &str) -> Option<(&'static str, String, InkKind)> {
+        let view = self.view(res);
+        let mut text = match view.now {
+            None => "not read yet".to_owned(),
+            Some(_) => {
+                let amount =
+                    words::amount_forms(res, &view, &self.snap.facts, Ladder::Det, &self.loc)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
+                match view.heat_now {
+                    Some(h) => format!("{} of {of} \u{b7} {amount}", words::pct(Some(h))),
+                    None => amount,
+                }
+            }
+        };
+        let state = words::state(res, self.snap, &self.loc);
+        if let Some(st) = &state
+            && let Some(clause) = st.clauses.first()
+        {
+            text.push_str(&format!(" \u{b7} {clause}"));
+        }
+        Some(("Now", text, state.map_or(InkKind::Words2, |st| st.ink)))
+    }
+}
+
+/// The lens for `c`'s instrument.
+fn doc_for<'d>(c: Ctx<'d>, focus: Instrument) -> LensDoc<'d> {
+    match focus {
+        Instrument::Disk => disk_doc(c),
+        Instrument::Cpu => cpu_doc(c),
+        Instrument::Memory => memory_doc(c),
+        Instrument::Processes => processes_doc(c),
+        Instrument::HowToRead => how_to_read(c),
+        Instrument::Network | Instrument::Tokens | Instrument::Gpu => text_well(c, focus),
+    }
+}
+
+/// The disk watch's facts while it runs (the harness is on).
+fn watched(snap: &Snapshot) -> Option<&DiskFacts> {
+    snap.facts.disk.as_ref().filter(|d| d.watch)
+}
+
+/// The Disk lens (§7.7).
+fn disk_doc(c: Ctx<'_>) -> LensDoc<'_> {
+    let snap = c.snap;
+    let d = watched(snap);
+    let vol = snap.volume.as_ref();
+    let startup = vol.is_none_or(|v| matches!(v.mount.as_str(), "/" | "/System/Volumes/Data"));
+    let disk = if startup {
+        "the startup disk".to_owned()
+    } else {
+        vol.map_or_else(String::new, |v| {
+            v.mount
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or(&v.mount)
+                .to_owned()
+        })
+    };
+    let at = c.at();
+    let sources = vec![format!("{disk} \u{b7} as of {at}"), format!("as of {at}")];
+    let explainer = match d {
+        Some(d) => match (d.warn, d.floor) {
+            (Some(w), Some(f)) => format!(
+                "Heat is how full {disk} is. aterm warns below {} free and cleans its build \
+                 caches below {}.",
+                gb(w as f64),
+                gb(f as f64)
+            ),
+            (Some(w), None) => format!(
+                "Heat is how full {disk} is. aterm warns below {} free.",
+                gb(w as f64)
+            ),
+            _ => format!("Heat is how full {disk} is."),
+        },
+        None => format!(
+            "Heat is how full {disk} is. aterm's disk watch is off, so it sets no warning \
+             lines and cleans nothing."
+        ),
+    };
+    let answer = words::disk_wrong(snap, &c.loc).map(|t| {
+        // A yes takes the row's state ink, as the deck's row draws it.
+        let ink = if t.starts_with("Yes") {
+            words::state(Resource::Disk, snap, &c.loc).map_or(InkKind::Warn, |st| st.ink)
+        } else {
+            InkKind::Words2
+        };
+        ("Wrong?", t, ink)
+    });
+    let sections = vec![
+        space_section(c),
+        filling_section(c),
+        where_section(c),
+        writing_section(c),
+    ];
+    LensDoc {
+        name: "Disk",
+        sources,
+        explainer,
+        answer,
+        sections,
+        // Two columns: Writing now over Where the space is (§7.7).
+        two_order: vec![0, 1, 3, 2],
+        keeps_first: true,
+    }
+}
+
+/// Space now, with Freed (§7.7).
+fn space_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let Some(v) = snap.volume.clone() else {
+        return line_section("Space now", "Space", vec!["not read yet".into()], false);
+    };
+    let d = watched(snap);
+    let space = words::disk_space_line(&v);
+    let lines: Vec<(&str, u64, bool)> = d.map_or_else(Vec::new, |d| {
+        [
+            ("warn", d.warn, false),
+            ("clean", d.floor, false),
+            ("emergency", d.emergency, true),
+        ]
+        .into_iter()
+        .filter_map(|(w, b, critical)| b.map(|b| (w, b, critical)))
+        .collect()
+    });
+    let legend: Vec<String> = if lines.is_empty() {
+        Vec::new()
+    } else {
+        let long: Vec<String> = lines
+            .iter()
+            .map(|(w, b, _)| format!("{w} {}", gb(*b as f64)))
+            .collect();
+        let mut forms = vec![format!("lines: {}", long.join(" \u{b7} "))];
+        if lines.iter().all(|(_, b, _)| *b < 999_500_000_000) {
+            let n = lines.len();
+            let short: Vec<String> = lines
+                .iter()
+                .enumerate()
+                .map(|(i, (w, b, _))| {
+                    let g = gb(*b as f64);
+                    if i + 1 < n {
+                        format!("{w} {}", g.trim_end_matches(" GB"))
+                    } else {
+                        format!("{w} {g}")
+                    }
+                })
+                .collect();
+            forms.push(short.join(" \u{b7} "));
+        }
+        forms
+    };
+    let freed: Option<Vec<String>> = d.and_then(|d| d.freed_today.as_ref()).map(|(b, at, what)| {
+        let t = words::clock(*at, snap.at_unix_ms, c.loc.utc_offset_s);
+        let g = gb(*b as f64);
+        vec![
+            format!("aterm {g} today ({t}, {what})"),
+            format!("aterm {g} today, {t}"),
+            format!("{g} today"),
+        ]
+    });
+    let mut words = vec![space.clone()];
+    words.extend(legend.first().cloned());
+    let parts: Vec<(String, String)> = freed
+        .as_ref()
+        .and_then(|f| f.first())
+        .map(|f| ("Freed".to_owned(), f.clone()))
+        .into_iter()
+        .collect();
+    // The one-line form a short shell keeps (§11.3: Space now with Freed,
+    // always): "1.11 TB used · 0.89 TB free · freed 41 GB", the parts
+    // without their whole, then free alone.
+    let pieces: Vec<&str> = space.split(" \u{b7} ").collect();
+    let parts_line = pieces[..pieces.len().min(2)].join(" \u{b7} ");
+    let free_line = pieces.get(1).copied().unwrap_or(&space).to_owned();
+    let freed_g = d
+        .and_then(|d| d.freed_today.as_ref())
+        .map(|(b, ..)| gb(*b as f64));
+    let line = match &freed_g {
+        Some(g) => vec![
+            format!("{space} \u{b7} aterm freed {g} today"),
+            format!("{parts_line} \u{b7} freed {g}"),
+            parts_line,
+            free_line,
+        ],
+        None => vec![space.clone(), parts_line, free_line],
+    };
+    let h = if freed.is_some() { 56.0 } else { 42.0 };
+    let full = form(h, move |pen, p| {
+        heading(pen, p, "Space now", &[]);
+        let inks = pen.inks;
+        let (by, bh) = (p.y + 16.0, 10.0);
+        let total = v.total.max(1) as f64;
+        pen.rect(p.x, by, p.w, bh, 1.5, rgba(inks.track, 0xFF));
+        let used = p.w * (v.used() as f64 / total).clamp(0.0, 1.0);
+        let machine = pen.machine();
+        pen.rect(p.x, by, used, bh, 1.5, rgba(machine, 0xFF));
+        for (_, b, critical) in &lines {
+            let lx = p.x + p.w * (1.0 - (*b as f64 / total).clamp(0.0, 1.0));
+            let ink = if *critical { inks.critical } else { inks.warn };
+            pen.tick(lx, by - 2.0, by + bh + 2.0, rgba(ink, 0xFF));
+        }
+        let base = p.y + 39.0;
+        let s = pen.cut(&space, p.w, NOTE_PT, false);
+        let lw = pen.text(p.x, base, &s, NOTE_PT, false, inks.words);
+        if let Some(l) = first_fit(pen.m, &legend, p.w - lw - 12.0, NOTE_PT, false) {
+            pen.text_end(p.x + p.w, base, &l, NOTE_PT, false, inks.words2);
+        }
+        if let Some(freed) = &freed {
+            let base = p.y + 53.0;
+            let fw = pen.text(p.x, base, "Freed", HEAD_PT, true, inks.words);
+            let tab = tab_after(fw);
+            let s = fit_cut(pen.m, freed, p.w - tab, BODY_PT, false);
+            pen.text(p.x + tab, base, &s, BODY_PT, false, inks.words2);
+        }
+    });
+    Section {
+        name: "Space now".into(),
+        words,
+        right: false,
+        parts,
+        forms: vec![full, line_form("Space", line)],
+    }
+}
+
+/// GB free, last 24 hours; else its Filling line (§7.7).
+fn filling_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let now = snap.at_unix_ms;
+    const BUCKET_MS: i64 = aterm_vitals::history::FREE_BUCKET_S * 1000;
+    let vals: Vec<Option<f64>> = snap
+        .free_history
+        .window(now)
+        .into_iter()
+        .map(|v| v.map(|b| b as f64 / 1e9))
+        .collect();
+    let n = vals.len() as i64;
+    let start_ms = (now.div_euclid(BUCKET_MS) + 1 - n) * BUCKET_MS;
+    let freed = watched(snap).and_then(|d| d.freed_today.as_ref());
+    let mark = freed.and_then(|(b, at, _)| {
+        let idx = (at - start_ms) as f64 / BUCKET_MS as f64;
+        (0.0..n as f64).contains(&idx).then(|| {
+            let t = words::clock(*at, now, c.loc.utc_offset_s);
+            (idx, format!("aterm freed {} \u{b7} {t}", gb(*b as f64)))
+        })
+    });
+    let growth = growth_forms(&snap.facts.disk_rates);
+    let trace = Trace {
+        vals,
+        under: DAY,
+        min_span: 1.0,
+        mark,
+        gap: "asleep, not read",
+    };
+    let mut said = trace_said(
+        "GB free over the last 24 hours",
+        "gigabytes",
+        &trace,
+        (start_ms, BUCKET_MS),
+        &c.loc,
+    );
+    if let Some((b, at, _)) = freed {
+        said.push_str(&format!(
+            " aterm freed {} at {}.",
+            words::speak(&gb(*b as f64)),
+            words::clock(*at, now, c.loc.utc_offset_s)
+        ));
+    }
+    let mut line = growth.clone();
+    if let Some(f) = snap.facts.filling {
+        line.insert(0, format!("full in {}", words::duration_approx(f.secs)));
+    }
+    trace_section(
+        c,
+        "GB free, last 24 hours",
+        growth,
+        trace,
+        said,
+        "Filling",
+        line,
+        false,
+    )
+}
+
+/// Where the space is (§7.4, §7.7).
+fn where_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let d = snap.facts.disk.as_ref();
+    let hogs = d.map_or(&[][..], |d| d.hogs.as_slice());
+    let sizing = d.is_some_and(|d| d.sizing);
+    let at = d
+        .and_then(|d| d.hogs_at)
+        .map(|t| words::clock(t, snap.at_unix_ms, c.loc.utc_offset_s));
+    let size = |h: &aterm_vitals::model::Hog| {
+        if h.partial {
+            format!("\u{2265} {}", gb(h.bytes as f64))
+        } else {
+            gb(h.bytes as f64)
+        }
+    };
+    let subs: Vec<String> = match (sizing, &at) {
+        (true, Some(t)) => vec![
+            format!("sizing folders\u{2026} last sized {t}"),
+            "sizing folders\u{2026}".into(),
+        ],
+        (true, None) => vec!["sizing folders\u{2026}".into()],
+        (false, Some(t)) => vec![
+            format!("folders aterm can clean, sized at {t}"),
+            format!("sized {t}"),
+        ],
+        (false, None) => Vec::new(),
+    };
+    if hogs.is_empty() {
+        let says = if sizing {
+            "sizing folders\u{2026}"
+        } else {
+            "no folders sized yet"
+        };
+        return line_section("Where the space is", "Where", vec![says.into()], true);
+    }
+    let rows: Vec<Row> = hogs
+        .iter()
+        .take(3)
+        .map(|h| Row {
+            chip: None,
+            name: h.path.clone(),
+            scope: None,
+            share: None,
+            figure: size(h),
+        })
+        .collect();
+    let first = &hogs[0];
+    let rest: Vec<&aterm_vitals::model::Hog> = hogs.iter().skip(1).collect();
+    let mut line = Vec::new();
+    let most = format!("most in {}, {}", first.path, size(first));
+    if !rest.is_empty() {
+        let sum: u64 = rest.iter().map(|h| h.bytes).sum();
+        line.push(format!(
+            "{most} \u{b7} {} more {}, {}",
+            rest.len(),
+            if rest.len() == 1 { "folder" } else { "folders" },
+            gb(sum as f64)
+        ));
+    }
+    line.push(most);
+    list_section(
+        c,
+        "Where the space is".into(),
+        subs,
+        rows,
+        None,
+        3,
+        "Where",
+        line,
+        true,
+    )
+}
+
+/// Writing now (§7.7): this user's busiest writers in the chosen scope.
+fn writing_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let writers = grouped(
+        snap.facts
+            .writers
+            .iter()
+            .filter(|w| c.in_scope(w.scope))
+            .map(|w| (w.name.as_str(), w.scope, w.bytes_per_s)),
+    );
+    let name = format!("Writing now{}", c.suffix());
+    if writers.is_empty() {
+        let says = match c.loc.platform {
+            Platform::Linux => "no process's writes are read on Linux",
+            _ => "nothing written in the last reading",
+        };
+        return line_section(&name, "Writing", vec![says.into()], true);
+    }
+    // The bars stand against the writers' peak, rounded up to 1, 2 or 5.
+    let peak = nice_up(writers.iter().map(|w| w.2).fold(1.0, f64::max));
+    let rows: Vec<Row> = writers
+        .iter()
+        .take(4)
+        .map(|(name, scope, rate)| Row {
+            chip: Some(*scope),
+            name: name.clone(),
+            scope: Some(c.scope_word(*scope)),
+            share: Some(rate / peak),
+            figure: mb_s(*rate),
+        })
+        .collect();
+    let top = &rows[0];
+    let lead = format!(
+        "{} in {}, {}",
+        top.name,
+        top.scope.clone().unwrap_or_default(),
+        top.figure
+    );
+    let mut line = Vec::new();
+    if let Some(all) = snap.resources[Resource::Disk.index()].aterm.now {
+        line.push(format!("{lead} \u{b7} all of aterm {}", mb_s(all)));
+    }
+    line.push(lead);
+    let note = match c.loc.platform {
+        Platform::MacOs => Some("macOS's own writes and other users' are not counted".to_owned()),
+        Platform::Linux | Platform::Windows => {
+            Some("the system's own writes and other users' are not counted".to_owned())
+        }
+    };
+    list_section(
+        c,
+        name,
+        vec![
+            "bytes your processes wrote per second, not net growth".into(),
+            "bytes written per second, not growth".into(),
+        ],
+        rows,
+        note,
+        4,
+        "Writing",
+        line,
+        true,
+    )
+}
+
+/// The CPU lens (§11.4).
+fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
+    let snap = c.snap;
+    let n = snap.total_cores().unwrap_or(0);
+    let at = c.at();
+    let sources = match snap.cpu.as_ref().filter(|_| n > 0) {
+        Some(cpu) => vec![
+            format!(
+                "{n} cores in {} {} \u{b7} as of {at}",
+                cpu.clusters.len(),
+                if cpu.clusters.len() == 1 {
+                    "cluster"
+                } else {
+                    "clusters"
+                }
+            ),
+            format!("{n} cores \u{b7} as of {at}"),
+            format!("as of {at}"),
+        ],
+        None => vec![format!("as of {at}")],
+    };
+    let explainer = if n > 0 {
+        format!(
+            "Heat is how many of the {n} cores were busy, as a share of all of them: 100% is \
+             every core busy all the time, whoever's work it was."
+        )
+    } else {
+        "Heat is how many of the cores were busy, as a share of all of them.".to_owned()
+    };
+    let view = c.view(Resource::Cpu);
+    let over = view
+        .columns(10, 60, snap.at_unix_ms)
+        .iter()
+        .filter(|cell| cell.over)
+        .count();
+    let over_words = match over {
+        0 => "not in the last 10 min".to_owned(),
+        k if k < 6 => format!("{} s of the last 10 min", k * 10),
+        k => format!("{:.0} of the last 10 min", (k as f64 / 6.0).round()),
+    };
+    let load = match (snap.facts.load1, n) {
+        (Some(l), n) if n > 0 => {
+            let waiting = (l - n as f64).round();
+            let base = format!("{l:.1} on {n} cores");
+            vec![
+                if waiting >= 1.0 {
+                    format!("{base}: ~{waiting:.0} waiting for a core")
+                } else {
+                    format!("{base}: none waiting for a core")
+                },
+                base,
+            ]
+        }
+        _ => vec!["not read yet".to_owned()],
+    };
+    let sections = vec![
+        cores_section(c),
+        busiest_section(c),
+        line_section("Load", "Load", load, true),
+        line_section("Over max", "Over max", vec![over_words], true),
+    ];
+    LensDoc {
+        name: "CPU",
+        sources,
+        explainer,
+        answer: c.now_answer(Resource::Cpu, "capacity"),
+        sections,
+        two_order: Vec::new(),
+        keeps_first: false,
+    }
+}
+
+/// Cores, last 60 s: a core × second strip per cluster with its caption.
+fn cores_section(c: Ctx<'_>) -> Section<'_> {
+    let Some(cpu) = c.snap.cpu.as_ref().filter(|cpu| cpu.total() > 0) else {
+        return line_section(
+            "Cores, last 60 s",
+            "Cores",
+            vec!["not read yet".into()],
             false,
+        );
+    };
+    let n = cpu.total();
+    let busy_half = (0..n)
+        .filter(|&core| {
+            let hist: Vec<f32> = cpu
+                .core_history
+                .get(core)
+                .map(|h| h.iter().flatten().copied().collect())
+                .unwrap_or_default();
+            !hist.is_empty() && hist.iter().sum::<f32>() / hist.len() as f32 > 0.5
+        })
+        .count();
+    let captions: Vec<String> = cpu
+        .clusters
+        .iter()
+        .map(|cl| format!("{} {}", cl.cores.len(), cl.name))
+        .collect();
+    let summary = format!("{busy_half} of {n} cores busy over half the last minute");
+    let words = vec![format!("{}; {summary}", captions.join(", "))];
+    let gaps = 3.0 * cpu.clusters.len().saturating_sub(1) as f64;
+    let strip_h = |rh: f64| 16.0 + n as f64 * rh + gaps + 2.0;
+    let subs = vec![
+        "a row a core, a column a second".to_owned(),
+        "a row a core".to_owned(),
+    ];
+    let mut forms = Vec::new();
+    let heights: &[f64] = if c.two { &[1.0] } else { &[4.0, 3.0, 2.0, 1.0] };
+    for &rh in heights {
+        let subs = subs.clone();
+        let draw = move |pen: &mut Pen<'_>, p: Place| {
+            heading(pen, p, "Cores, last 60 s", &subs);
+            draw_cores(pen, p, cpu, gaps);
+        };
+        forms.push(if c.two {
+            grow(strip_h(rh), draw)
+        } else {
+            form(strip_h(rh), draw)
+        });
+    }
+    let line = vec![summary.clone(), format!("{busy_half} of {n} busy")];
+    forms.push(line_form("Cores", line));
+    Section {
+        name: "Cores, last 60 s".into(),
+        words,
+        right: false,
+        parts: Vec::new(),
+        forms,
+    }
+}
+
+/// The strip: each cluster's caption in a gutter, then its cores, a row a
+/// core and a column a second, in heat inks; an unread second is left bare.
+fn draw_cores(pen: &mut Pen<'_>, p: Place, cpu: &CpuView, gaps: f64) {
+    let inks = pen.inks;
+    let n = cpu.total().max(1);
+    let top = p.y + 16.0;
+    let rh = ((p.y + p.h - 2.0 - top - gaps) / n as f64).clamp(1.0 / pen.s, 8.0);
+    let gutter = cpu
+        .clusters
+        .iter()
+        .map(|cl| {
+            pen.width(&cl.cores.len().to_string(), AXIS_PT, true)
+                + 3.0
+                + pen.width(&cl.name, AXIS_PT, false)
+        })
+        .fold(0.0, f64::max)
+        .min(p.w * 0.3)
+        + 6.0;
+    let cols = aterm_vitals::model::CORE_HISTORY_LEN;
+    let gx = p.x + gutter;
+    let cw = (p.w - gutter) / cols as f64;
+    let gap = if rh * pen.s >= 3.0 { 1.0 / pen.s } else { 0.0 };
+    let mut y = top;
+    let mut caption_floor = f64::MIN;
+    for cl in &cpu.clusters {
+        let base = y + 7.0;
+        if base - ASCENT_EM * AXIS_PT >= caption_floor && base + DESCENT_EM * AXIS_PT <= p.y + p.h {
+            let count = cl.cores.len().to_string();
+            let cw0 = pen.text(p.x, base, &count, AXIS_PT, true, inks.words);
+            let name = pen.cut(&cl.name, gutter - 6.0 - cw0 - 3.0, AXIS_PT, false);
+            pen.text(p.x + cw0 + 3.0, base, &name, AXIS_PT, false, inks.words2);
+            caption_floor = base + DESCENT_EM * AXIS_PT + 1.0;
+        }
+        for (r, &core) in cl.cores.iter().enumerate() {
+            let ry = y + r as f64 * rh;
+            let hist = cpu.core_history.get(core).map_or(&[][..], Vec::as_slice);
+            let off = cols.saturating_sub(hist.len());
+            let mut run: Option<(usize, Rgb)> = None;
+            for col in 0..=cols {
+                let ink = (col < cols && col >= off)
+                    .then(|| hist.get(col - off).copied().flatten())
+                    .flatten()
+                    .map(|v| pen.heat(v));
+                match (run, ink) {
+                    (Some((_, a)), Some(b)) if a == b => {}
+                    (prev, next) => {
+                        if let Some((c0, ink)) = prev {
+                            pen.rect(
+                                gx + c0 as f64 * cw,
+                                ry,
+                                (col - c0) as f64 * cw,
+                                rh - gap,
+                                0.0,
+                                rgba(ink, 0xFF),
+                            );
+                        }
+                        run = next.map(|ink| (col, ink));
+                    }
+                }
+            }
+        }
+        y += cl.cores.len() as f64 * rh + 3.0;
+    }
+}
+
+/// Busiest now: the busiest processes in the chosen scope, with whose they
+/// are and their cores-worth.
+fn busiest_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let n = snap.total_cores().unwrap_or(1).max(1) as f64;
+    let rows: Vec<Row> = grouped(
+        snap.top
+            .iter()
+            .filter(|t| c.in_scope(t.scope))
+            .map(|t| (t.name.as_str(), t.scope, f64::from(t.cores))),
+    )
+    .into_iter()
+    .map(|(name, scope, cores)| Row {
+        chip: Some(scope),
+        name,
+        scope: Some(c.scope_word(scope)),
+        share: Some(cores / n),
+        figure: format!("{} cores", words::cores(cores as f32)),
+    })
+    .collect();
+    let name = format!("Busiest now{}", c.suffix());
+    let mut line: Vec<String> = Vec::new();
+    if let Some(b) = snap
+        .facts
+        .busiest
+        .as_ref()
+        .filter(|b| c.bar == Bar::Global || b.scope.is_some_and(|s| c.in_scope(s)))
+    {
+        let who = b
+            .scope
+            .map(|s| format!(" in {}", c.scope_word(s)))
+            .unwrap_or_default();
+        let times = if b.n > 1 {
+            format!(" \u{d7}{}", b.n)
+        } else {
+            String::new()
+        };
+        line.push(format!(
+            "{}{times}{who}, {} cores",
+            aterm_vitals::jobs::wire::person_name(&b.name),
+            words::cores(b.cores)
+        ));
+    }
+    line.extend(rows.first().map(Row::said));
+    if rows.is_empty() {
+        line.push("nothing busy in this scope".into());
+        return line_section(&name, "Busiest", line, true);
+    }
+    list_section(
+        c,
+        name,
+        vec![
+            "cores-worth over the last reading".into(),
+            "cores-worth".into(),
+        ],
+        rows,
+        None,
+        if c.two { 6 } else { 4 },
+        "Busiest",
+        line,
+        true,
+    )
+}
+
+/// The Memory lens (§11.4).
+fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
+    let snap = c.snap;
+    let at = c.at();
+    let sources = match snap.mem.as_ref() {
+        Some(m) => vec![
+            format!(
+                "{} GiB of memory \u{b7} as of {at}",
+                words::gib_total(m.sample.total)
+            ),
+            format!("as of {at}"),
+        ],
+        None => vec![format!("as of {at}")],
+    };
+    let explainer = "Heat is how much memory is in use: apps, wired and compressed. File cache \
+                     is not counted; macOS gives it back when apps need it."
+        .to_owned();
+    let now = snap.at_unix_ms;
+    let vals: Vec<Option<f64>> = c
+        .view(Resource::Memory)
+        .columns(60, 60, now)
+        .iter()
+        .map(|cell| cell.mean.map(|b| b / 1_073_741_824.0))
+        .collect();
+    let trace = Trace {
+        vals,
+        under: HOUR,
+        min_span: 0.5,
+        mark: None,
+        gap: "not read",
+    };
+    let start = (now.div_euclid(60_000) - 59) * 60_000;
+    let said = trace_said(
+        "Used over the last hour",
+        "GiB",
+        &trace,
+        (start, 60_000),
+        &c.loc,
+    );
+    let first = trace.vals.iter().flatten().next().copied();
+    let last = trace.vals.iter().rev().flatten().next().copied();
+    let line = match (first, last) {
+        (Some(a), Some(b)) => vec![format!("{a:.1} to {b:.1} GiB")],
+        _ => vec!["not read yet".to_owned()],
+    };
+    let sections = vec![
+        classes_section(c),
+        trace_section(
+            c,
+            "Used, last hour",
+            vec!["GiB, the minute's mean".into(), "GiB".into()],
+            trace,
+            said,
+            "Last hour",
+            line,
+            false,
+        ),
+        biggest_section(c),
+        swap_section(c),
+        pressure_section(c),
+    ];
+    LensDoc {
+        name: "Memory",
+        sources,
+        explainer,
+        answer: c.now_answer(Resource::Memory, "capacity"),
+        sections,
+        two_order: Vec::new(),
+        keeps_first: false,
+    }
+}
+
+/// Where it is: the classes as one stacked bar, and their legend.
+fn classes_section(c: Ctx<'_>) -> Section<'_> {
+    let Some(m) = c.snap.mem.as_ref() else {
+        return line_section("Where it is", "Classes", vec!["not read yet".into()], false);
+    };
+    let s = &m.sample;
+    // (mem ink index, alpha, long word, short word, bytes)
+    let classes: Vec<(usize, f32, &str, &str, u64)> = [
+        (0, 1.0, "app", "app", Some(s.app)),
+        (0, 0.7, "wired", "wired", Some(s.wired)),
+        (1, 1.0, "compressed", "compr.", s.compressed),
+        (2, 1.0, "file cache", "cache", Some(s.cached)),
+        (3, 1.0, "free", "free", Some(s.free)),
+    ]
+    .into_iter()
+    .filter_map(|(i, al, long, short, b)| b.map(|b| (i, al, long, short, b)))
+    .collect();
+    let total = s.total.max(1);
+    let words: Vec<String> = vec![
+        classes
+            .iter()
+            .map(|(_, _, long, _, b)| format!("{long} {:.1} GiB", gib(*b)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ];
+    let line = vec![
+        classes
+            .iter()
+            .map(|(_, _, long, _, b)| format!("{long} {:.1}", gib(*b)))
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
+            + " GiB",
+    ];
+    let subs = vec![
+        format!(
+            "{} of {} GiB in use",
+            words::gib_figure(s.used()),
+            words::gib_total(s.total)
+        ),
+        format!("{} GiB in use", words::gib_figure(s.used())),
+    ];
+    let full = form(42.0, move |pen, p| {
+        heading(pen, p, "Where it is", &subs);
+        let inks = pen.inks;
+        let (by, bh) = (p.y + 16.0, 10.0);
+        pen.rect(p.x, by, p.w, bh, 1.5, rgba(inks.track, 0xFF));
+        let mut x = p.x;
+        for (i, al, _, _, b) in &classes {
+            if *i == 3 {
+                continue;
+            }
+            // The classes can sum past the total (compressed and cache
+            // overlap, and the reads are not atomic): the bar stops at its
+            // track's end.
+            let w = (p.w * (*b as f64 / total as f64))
+                .min(p.x + p.w - x)
+                .max(0.0);
+            pen.rect(x, by, w, bh, 0.0, a(inks.mem[*i], *al));
+            x += w;
+        }
+        // The legend: a swatch and a figure a class, the first with the
+        // unit, long words while they fit, then short, then as many as fit.
+        let base = p.y + 39.0;
+        let item = |pen: &Pen<'_>, word: &str, b: u64, k: usize| {
+            let unit = if k == 0 { " GiB" } else { "" };
+            let t = format!("{word} {:.1}{unit}", gib(b));
+            let w = pen.width(&t, NOTE_PT, false);
+            (t, w)
+        };
+        let fits = |pen: &Pen<'_>, short: bool| {
+            classes
+                .iter()
+                .enumerate()
+                .map(|(k, (_, _, long, sh, b))| {
+                    item(pen, if short { sh } else { long }, *b, k).1 + 18.0
+                })
+                .sum::<f64>()
+                <= p.w
+        };
+        let short = !fits(pen, false);
+        let mut x = p.x;
+        for (k, (i, al, long, sh, b)) in classes.iter().enumerate() {
+            let (t, w) = item(pen, if short { sh } else { long }, *b, k);
+            if x + 8.0 + w > p.x + p.w {
+                break;
+            }
+            let ink = if *i == 3 {
+                rgba(inks.track, 0xFF)
+            } else {
+                a(inks.mem[*i], *al)
+            };
+            pen.rect(x, base - 6.5, 6.0, 6.0, 1.0, ink);
+            pen.text(x + 8.0, base, &t, NOTE_PT, false, inks.words2);
+            x += 8.0 + w + 10.0;
+        }
+    });
+    Section {
+        name: "Where it is".into(),
+        words,
+        right: false,
+        parts: Vec::new(),
+        forms: vec![full, line_form("Classes", line)],
+    }
+}
+
+/// Biggest now: footprints in the chosen scope, largest first, with aterm's
+/// and the tab's totals beside the heading.
+fn biggest_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let total = snap.mem.as_ref().map_or(1, |m| m.sample.total.max(1)) as f64;
+    let rows: Vec<Row> = grouped(snap.top.iter().filter_map(|t| {
+        t.footprint
+            .filter(|_| c.in_scope(t.scope))
+            .map(|f| (t.name.as_str(), t.scope, f as f64))
+    }))
+    .into_iter()
+    .map(|(name, scope, bytes)| Row {
+        chip: Some(scope),
+        name,
+        scope: Some(c.scope_word(scope)),
+        share: Some(bytes / total),
+        figure: words::mem(bytes as u64),
+    })
+    .collect();
+    let view = c.view(Resource::Memory);
+    let mut scopes = Vec::new();
+    if let Some(b) = view.aterm.now {
+        scopes.push(format!("aterm {}", words::mem(b as u64)));
+    }
+    if let Some(b) = view.tab.now {
+        scopes.push(format!("{} {}", c.tab_label, words::mem(b as u64)));
+    }
+    let subs: Vec<String> = if scopes.is_empty() {
+        vec!["physical footprint".into()]
+    } else {
+        vec![scopes.join(" \u{b7} "), scopes[0].clone()]
+    };
+    let name = format!("Biggest now{}", c.suffix());
+    let mut line: Vec<String> = rows.first().map(Row::said).into_iter().collect();
+    if rows.is_empty() {
+        line.push(
+            subs.first()
+                .cloned()
+                .unwrap_or_else(|| "no footprint read".into()),
+        );
+        return line_section(&name, "Biggest", line, true);
+    }
+    list_section(
+        c,
+        name,
+        subs,
+        rows,
+        None,
+        if c.two { 4 } else { 3 },
+        "Biggest",
+        line,
+        true,
+    )
+}
+
+/// Swap: used, and its traffic.
+fn swap_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let forms = match snap.mem.as_ref() {
+        None => vec!["not read yet".to_owned()],
+        Some(m) => {
+            let used = m.sample.swap_used;
+            let used_w = if used == 0 {
+                "none used".to_owned()
+            } else {
+                format!("{} used", words::mem(used))
+            };
+            match snap.facts.swap_rate {
+                Some(r) if r > 0.0 => vec![
+                    format!("{used_w} \u{b7} {} in and out", words::rate_mb(r)),
+                    used_w,
+                ],
+                Some(_) => vec![format!("{used_w} \u{b7} no traffic"), used_w],
+                None => vec![used_w],
+            }
+        }
+    };
+    line_section("Swap", "Swap", forms, true)
+}
+
+/// What the pressure word means.
+fn pressure_section(c: Ctx<'_>) -> Section<'_> {
+    let forms = match c.snap.mem.as_ref().map(|m| m.sample.pressure) {
+        Some(Pressure::Normal) => vec![
+            "normal: memory is not short; compressing and the file cache give way first".into(),
+            "normal: memory is not short".into(),
+        ],
+        Some(Pressure::Warn) => vec![
+            "warn: macOS is compressing and swapping to keep up".into(),
+            "warn: compressing and swapping".into(),
+        ],
+        Some(Pressure::Critical) => vec![
+            "critical: memory is short, and macOS may ask apps to quit".into(),
+            "critical: memory is short".into(),
+        ],
+        Some(Pressure::Unknown) | None => vec!["not read here".into()],
+    };
+    line_section("Pressure", "Pressure", forms, true)
+}
+
+/// The Processes lens (§11.4).
+fn processes_doc(c: Ctx<'_>) -> LensDoc<'_> {
+    let snap = c.snap;
+    let threads = c.loc.platform == Platform::Linux;
+    let unit = if threads { "threads" } else { "processes" };
+    let at = c.at();
+    let explainer = format!(
+        "Heat is how close the count of {unit} is to the limit that binds first: {}'s, or the \
+         one on your user.",
+        c.loc.platform.machine()
+    );
+    let now = snap.at_unix_ms;
+    let vals: Vec<Option<f64>> = c
+        .view(Resource::Processes)
+        .columns(60, 60, now)
+        .iter()
+        .map(|cell| cell.mean)
+        .collect();
+    let trace = Trace {
+        vals,
+        under: HOUR,
+        min_span: 5.0,
+        mark: None,
+        gap: "not read",
+    };
+    let start = (now.div_euclid(60_000) - 59) * 60_000;
+    let said = trace_said(
+        &format!("Running over the last hour, {unit}"),
+        unit,
+        &trace,
+        (start, 60_000),
+        &c.loc,
+    );
+    let first = trace.vals.iter().flatten().next().copied();
+    let last = trace.vals.iter().rev().flatten().next().copied();
+    let line = match (first, last) {
+        (Some(a), Some(b)) => vec![format!(
+            "{} to {} {unit}",
+            words::grouped(a.round() as u64),
+            words::grouped(b.round() as u64)
+        )],
+        _ => vec!["not read yet".to_owned()],
+    };
+    let sections = vec![
+        counts_section(c, unit),
+        trace_section(
+            c,
+            "Last hour",
+            vec![format!("{unit} running, the minute's mean")],
+            trace,
+            said,
+            "Last hour",
+            line,
+            false,
+        ),
+        jobs_section(c),
+    ];
+    LensDoc {
+        name: "Processes",
+        sources: vec![format!("as of {at}")],
+        explainer,
+        answer: c.now_answer(Resource::Processes, "the limit"),
+        sections,
+        two_order: Vec::new(),
+        keeps_first: false,
+    }
+}
+
+/// Counts against limits: the machine's, yours, aterm's and the tab's.
+fn counts_section<'d>(c: Ctx<'d>, unit: &'static str) -> Section<'d> {
+    let snap = c.snap;
+    let f = &snap.facts;
+    let (system, user) = f.pid_counts;
+    let limits = f.proc_limits;
+    let of = |n: Option<u64>, l: Option<u64>| match (n, l) {
+        (Some(n), Some(l)) => format!("{} of {}", words::grouped(n), words::grouped(l)),
+        (Some(n), None) => words::grouped(n),
+        (None, _) => "not read".into(),
+    };
+    let share = |n: Option<u64>, l: Option<u64>| {
+        n.zip(l)
+            .filter(|(_, l)| *l > 0)
+            .map(|(n, l)| n as f64 / l as f64)
+    };
+    let view = c.view(Resource::Processes);
+    let machine = c.loc.platform.machine();
+    let mut rows = vec![
+        Row {
+            chip: Some(ProcScope::Other),
+            name: machine.into(),
+            scope: None,
+            share: share(system, limits.system),
+            figure: of(system, limits.system),
+        },
+        Row {
+            chip: Some(ProcScope::Other),
+            name: "yours".into(),
+            scope: None,
+            share: share(user, limits.per_user),
+            figure: of(user, limits.per_user),
+        },
+    ];
+    if let Some(n) = view.aterm.now {
+        rows.push(Row {
+            chip: Some(ProcScope::Aterm),
+            name: "aterm".into(),
+            scope: None,
+            share: share(Some(n as u64), limits.system),
+            figure: words::grouped(n.round() as u64),
+        });
+    }
+    if let (Some(n), Some(k)) = (view.tab.now, c.tab_key) {
+        rows.push(Row {
+            chip: Some(ProcScope::Tab(k)),
+            name: c.tab_label.to_owned(),
+            scope: None,
+            share: share(Some(n as u64), limits.system),
+            figure: words::grouped(n.round() as u64),
+        });
+    }
+    let line = vec![
+        format!(
+            "{} \u{b7} yours {}",
+            of(system, limits.system),
+            of(user, limits.per_user)
+        ),
+        of(system, limits.system),
+    ];
+    list_section(
+        c,
+        "Counts".into(),
+        vec![format!("{unit} running, against their limits"), unit.into()],
+        rows,
+        None,
+        4,
+        "Counts",
+        line,
+        false,
+    )
+}
+
+/// The jobs list: every job in the chosen scope that is not fine, worst
+/// first (its mark, its tab, its program, the engine's sentence), then the
+/// zombies a tab holds; past its room it counts the rest.
+fn jobs_section(c: Ctx<'_>) -> Section<'_> {
+    use aterm_vitals::jobs::{Verdict, wire::person_name};
+    let snap = c.snap;
+    let name = format!("Jobs{}", c.suffix());
+    let Some(view) = snap.jobs.as_deref() else {
+        return line_section(&name, "Jobs", vec!["reading the jobs\u{2026}".into()], true);
+    };
+    let tab_ok = |tab: u64| match c.bar {
+        Bar::Tab => c.tab_key == Some(tab),
+        Bar::Global | Bar::Aterm => true,
+    };
+    let tab_word = |key: u64| {
+        snap.tab(key)
+            .map_or_else(|| "a tab".to_owned(), |t| t.label.clone())
+    };
+    // (mark, its arc, who, the sentence, its short form)
+    let mut lines: Vec<(WellMark, f32, String, String, String)> = Vec::new();
+    let rank = |v: Verdict| match v {
+        Verdict::Stuck => Some((0, WellMark::Stuck)),
+        Verdict::Quiet => Some((2, WellMark::Quiet)),
+        Verdict::WaitingYou => Some((3, WellMark::Waiting)),
+        Verdict::Parked => Some((4, WellMark::Stopped)),
+        _ => None,
+    };
+    let mut rows: Vec<_> = view
+        .rows
+        .iter()
+        .filter(|r| tab_ok(r.tab))
+        .filter_map(|r| rank(r.verdict).map(|k| (k, r)))
+        .collect();
+    rows.sort_by_key(|((order, _), r)| (*order, std::cmp::Reverse(r.quiet_ms.unwrap_or(0))));
+    for ((_, mark), r) in rows {
+        // A quiet job with no φ read draws the deck's quarter arc (◔), never
+        // a full disc, which is the pressure dot.
+        let frac = r
+            .phi_milli
+            .map_or(crate::stats_paint::QUIET_ARC, crate::stats_paint::quiet_arc);
+        let short = match r.quiet_ms {
+            Some(q) if matches!(r.verdict, Verdict::Stuck | Verdict::Quiet) => format!(
+                "{} {}",
+                r.verdict.word(),
+                aterm_vitals::jobs::wire::age_words(q)
+            ),
+            _ => r.verdict.word().to_owned(),
+        };
+        lines.push((
+            mark,
+            frac,
+            format!("{} {}", tab_word(r.tab), person_name(&r.exe)),
+            r.said(),
+            short,
+        ));
+    }
+    for z in view
+        .findings
+        .zombies
+        .iter()
+        .filter(|z| z.tab.is_some_and(tab_ok))
+    {
+        lines.push((
+            WellMark::Zombies,
+            1.0,
+            format!(
+                "{} {}",
+                z.tab.map_or_else(String::new, tab_word),
+                person_name(&z.name)
+            ),
+            format!("{} unreaped children of pid {}", z.count, z.ppid),
+            format!("{} zombies", z.count),
+        ));
+    }
+    // Zombies rank second, after stuck jobs.
+    lines.sort_by_key(|(mark, ..)| *mark);
+    let marks = crate::stats_paint::marks_of(view);
+    let summary = if marks.is_empty() {
+        "nothing stuck, quiet or waiting for you".to_owned()
+    } else {
+        marks
+            .iter()
+            .map(|m| m.words())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if lines.is_empty() {
+        return line_section(
+            &name,
+            "Jobs",
+            vec!["nothing stuck, quiet or waiting for you".into()],
             true,
         );
     }
+    let words: Vec<String> = lines
+        .iter()
+        .map(|(m, _, who, said, _)| format!("{} {who}: {said}", m.word()))
+        .collect();
+    let lines = std::rc::Rc::new(lines);
+    let draw_jobs = {
+        let lines = std::rc::Rc::clone(&lines);
+        let name = name.clone();
+        move |pen: &mut Pen<'_>, p: Place| {
+            heading(pen, p, &name, &[]);
+            let inks = pen.inks;
+            let room = (((p.h - 14.0) / PITCH).floor().max(1.0)) as usize;
+            let more = lines.len().saturating_sub(room);
+            let shown = if more > 0 {
+                room.saturating_sub(1)
+            } else {
+                room
+            };
+            for (i, (mark, frac, who, said, short)) in lines.iter().take(shown).enumerate() {
+                let base = p.y + ROW0_BASE + PITCH * i as f64;
+                // The deck's inks for the same marks (§6.7): ⊘ ◔ ◇ in stuck
+                // ink, ☠ in warn.
+                let ink = match mark {
+                    WellMark::Zombies => inks.warn_text,
+                    _ => inks.stuck,
+                };
+                pen.mark(*mark, p.x + 4.0, base - 3.4, BODY_PT, *frac, ink);
+                let who = pen.cut(who, (p.w - 14.0) * 0.4, BODY_PT, false);
+                let ww = pen.text(p.x + 14.0, base, &who, BODY_PT, false, inks.words);
+                let room = p.w - 14.0 - ww - 8.0;
+                let s = fit_cut(pen.m, &[said.clone(), short.clone()], room, BODY_PT, false);
+                pen.text(p.x + 14.0 + ww + 8.0, base, &s, BODY_PT, false, inks.words2);
+            }
+            if more > 0 {
+                let base = p.y + ROW0_BASE + PITCH * shown as f64;
+                let s = format!("+{} more (aterm ctl sys jobs)", lines.len() - shown);
+                let s = pen.cut(&s, p.w, NOTE_PT, false);
+                pen.text(p.x, base, &s, NOTE_PT, false, inks.words2);
+            }
+        }
+    };
+    let n = lines.len();
+    let mut forms = Vec::new();
+    if c.two {
+        forms.push(grow(rows_h(1, false), draw_jobs));
+    } else {
+        let draw = std::rc::Rc::new(draw_jobs);
+        let mut counts = vec![n.min(4), n.min(2)];
+        counts.dedup();
+        for k in counts {
+            let draw = std::rc::Rc::clone(&draw);
+            // A list cut short keeps a line for the count of the rest.
+            let rows = if k < n { k + 1 } else { k };
+            forms.push(form(rows_h(rows, false), move |pen, p| draw(pen, p)));
+        }
+    }
+    let line = vec![summary];
+    forms.push(line_form("Jobs", line));
+    Section {
+        name,
+        words,
+        right: true,
+        parts: Vec::new(),
+        forms,
+    }
+}
+
+/// How to read (§11.4): the grammar every row shares.
+fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
+    let m = c.m;
+    let cw = c.cw;
+    let mut sections = Vec::new();
+    // Heat: the ramp, cold to hot.
+    let heat_words = ["cold, under 5% of the maximum", "under 5%"];
+    let hot_words = ["hot, 95% and over", "95%+"];
+    sections.push(Section {
+        name: "Heat".into(),
+        words: vec![
+            "A cell's colour is its share of the row's maximum: cold under 5 percent, hot at \
+             95 percent and over."
+                .into(),
+        ],
+        right: false,
+        parts: Vec::new(),
+        forms: vec![
+            form(38.0, move |pen, p| {
+                heading(
+                    pen,
+                    p,
+                    "Heat",
+                    &[
+                        "a cell's colour: its share of the row's maximum".into(),
+                        "share of max".into(),
+                    ],
+                );
+                // The ramp: seven steps over at most 280 pt, its ends' words
+                // under its ends.
+                let sw = ((p.w.min(280.0) + 2.0) / 7.0 - 2.0).max(4.0);
+                for k in 0..7 {
+                    let ink = if pen.ic {
+                        pen.inks.heat_ic[k]
+                    } else {
+                        pen.inks.heat[k]
+                    };
+                    pen.rect(
+                        p.x + k as f64 * (sw + 2.0),
+                        p.y + 16.0,
+                        sw,
+                        8.0,
+                        1.0,
+                        rgba(ink, 0xFF),
+                    );
+                }
+                let ramp_w = 7.0 * (sw + 2.0) - 2.0;
+                let base = p.y + 35.0;
+                let words2 = pen.inks.words2;
+                for (cold, hot) in heat_words.iter().zip(&hot_words) {
+                    let (wa, wb) = (
+                        pen.width(cold, AXIS_PT, false),
+                        pen.width(hot, AXIS_PT, false),
+                    );
+                    if wa + wb + 8.0 <= ramp_w.min(p.w) + EPS {
+                        pen.text(p.x, base, cold, AXIS_PT, false, words2);
+                        pen.text_end(p.x + ramp_w, base, hot, AXIS_PT, false, words2);
+                        break;
+                    }
+                }
+            }),
+            line_form(
+                "Heat",
+                vec![
+                    "cold under 5% to hot at 95% of max".into(),
+                    "share of max".into(),
+                ],
+            ),
+        ],
+    });
+    // Cells: over max, not read, now.
+    let cells: Vec<(u8, [String; 2])> = vec![
+        (
+            0,
+            [
+                "a cap above a cell: the resource ran over its maximum".into(),
+                "a cap: over max".into(),
+            ],
+        ),
+        (
+            1,
+            [
+                "an outlined cell, or a short line: not read".into(),
+                "outline: not read".into(),
+            ],
+        ),
+        (
+            2,
+            [
+                "the % at a row's right: now, the last 10 seconds".into(),
+                "%: now".into(),
+            ],
+        ),
+    ];
+    let cells_words: Vec<String> = cells.iter().map(|(_, w)| w[0].clone()).collect();
+    sections.push(Section {
+        name: "Cells".into(),
+        words: cells_words,
+        right: false,
+        parts: Vec::new(),
+        forms: vec![
+            form(rows_h(3, false), move |pen, p| {
+                heading(
+                    pen,
+                    p,
+                    "Cells",
+                    &[
+                        "10 seconds each, 10 minutes a row".into(),
+                        "10 s each".into(),
+                    ],
+                );
+                let inks = pen.inks;
+                for (i, (kind, forms)) in cells.iter().enumerate() {
+                    let base = p.y + ROW0_BASE + PITCH * i as f64;
+                    match kind {
+                        0 => {
+                            let ink = pen.heat(0.7);
+                            pen.rect(p.x, base - 7.0, 8.0, 7.0, 0.0, rgba(ink, 0xFF));
+                            pen.rect(p.x, base - 10.0, 8.0, 1.5, 0.0, rgba(inks.over, 0xFF));
+                        }
+                        1 => pen.hollow(p.x, base - 7.0, 8.0, 7.0, rgba(inks.hollow, 0xFF)),
+                        _ => {
+                            let ink = pen.heat(0.97);
+                            pen.rect(p.x, base - 7.0, 8.0, 7.0, 0.0, rgba(ink, 0xFF));
+                        }
+                    }
+                    let s = fit_cut(pen.m, forms, p.w - 14.0, BODY_PT, false);
+                    pen.text(p.x + 14.0, base, &s, BODY_PT, false, inks.words2);
+                }
+            }),
+            line_form(
+                "Cells",
+                vec!["10 s each \u{b7} a cap: over max \u{b7} an outline: not read".into()],
+            ),
+        ],
+    });
+    // Scopes: the bar's inks.
+    let machine = c.loc.platform.machine();
+    let mut said = format!("{machine} in grey, aterm in green, this tab in bright green.");
+    if let Some(first) = said.get(..1) {
+        said = first.to_uppercase() + said.get(1..).unwrap_or_default();
+    }
+    sections.push(Section {
+        name: "Scopes".into(),
+        words: vec![said],
+        right: true,
+        parts: Vec::new(),
+        forms: vec![
+            form(rows_h(1, false), move |pen, p| {
+                heading(
+                    pen,
+                    p,
+                    "Scopes",
+                    &[
+                        "the bar nests them; up and down choose a lens's scope".into(),
+                        "nested".into(),
+                    ],
+                );
+                let base = p.y + ROW0_BASE;
+                let mut x = p.x;
+                let items = [
+                    (pen.machine(), machine),
+                    (chip_ink(pen, ProcScope::Aterm, None), "aterm"),
+                    (chip_ink(pen, ProcScope::Tab(0), Some(0)), "this tab"),
+                ];
+                let words = pen.inks.words;
+                for (ink, word) in items {
+                    let w = pen.width(word, BODY_PT, false);
+                    if x + 14.0 + w > p.x + p.w {
+                        break;
+                    }
+                    pen.rect(x, base - 7.0, 10.0, 7.0, 1.0, rgba(ink, 0xFF));
+                    pen.text(x + 14.0, base, word, BODY_PT, false, words);
+                    x += 14.0 + w + 14.0;
+                }
+            }),
+            line_form(
+                "Scopes",
+                vec![
+                    format!("this tab within aterm within {machine}"),
+                    format!("tab, aterm, {machine}"),
+                ],
+            ),
+        ],
+    });
+    // Marks: a row's state beside its name.
+    let marks: [(WellMark, &str); 6] = [
+        (WellMark::Stuck, "stuck"),
+        (WellMark::Quiet, "quiet"),
+        (WellMark::Waiting, "waiting for you"),
+        (WellMark::Zombies, "zombies"),
+        (WellMark::Low, "disk low"),
+        (WellMark::Dot, "memory pressure, a GPU reset"),
+    ];
+    let item_w = |w: &str| 14.0 + m.width(w, BODY_PT, false) + 12.0;
+    let mut mark_rows = 1;
+    let mut x = 0.0;
+    for (_, w) in &marks {
+        if x > 0.0 && x + item_w(w) > cw {
+            mark_rows += 1;
+            x = 0.0;
+        }
+        x += item_w(w);
+    }
+    sections.push(Section {
+        name: "Marks".into(),
+        words: vec![
+            "Stuck, quiet, waiting for you, zombies, disk low, memory pressure or a GPU reset."
+                .into(),
+        ],
+        right: true,
+        parts: Vec::new(),
+        forms: vec![
+            form(rows_h(mark_rows, false), move |pen, p| {
+                heading(
+                    pen,
+                    p,
+                    "Marks",
+                    &[
+                        "a row's state, beside its name".into(),
+                        "a row's state".into(),
+                    ],
+                );
+                let inks = pen.inks;
+                let (mut x, mut row) = (0.0, 0usize);
+                for (kind, w) in &marks {
+                    let iw = 14.0 + pen.width(w, BODY_PT, false) + 12.0;
+                    if x > 0.0 && x + iw > p.w {
+                        row += 1;
+                        x = 0.0;
+                    }
+                    let base = p.y + ROW0_BASE + PITCH * row as f64;
+                    // Each mark as the deck's well draws it: ◔ a quarter, in
+                    // stuck ink like ⊘ and ◇.
+                    let ink = match kind {
+                        WellMark::Zombies | WellMark::Low | WellMark::Dot => inks.warn_text,
+                        _ => inks.stuck,
+                    };
+                    pen.mark(
+                        *kind,
+                        p.x + x + 5.0,
+                        base - 3.4,
+                        BODY_PT,
+                        crate::stats_paint::QUIET_ARC,
+                        ink,
+                    );
+                    let s = pen.cut(w, p.w - x - 14.0, BODY_PT, false);
+                    pen.text(p.x + x + 14.0, base, &s, BODY_PT, false, inks.words2);
+                    x += iw;
+                }
+            }),
+            line_form(
+                "Marks",
+                vec!["stuck, quiet, waiting, zombies, low, pressure".into()],
+            ),
+        ],
+    });
+    // Gestures.
+    let gestures: Vec<String> = vec![
+        "rest on a row for its close-up; click to pin it".into(),
+        "command-I opens it from the keyboard".into(),
+        "in it, the arrows choose the row and the scope; esc closes".into(),
+    ];
+    let lines: Vec<String> = gestures
+        .iter()
+        .flat_map(|g| wrap(m, g, cw, BODY_PT))
+        .collect();
+    let mut forms = Vec::new();
+    for k in (1..=lines.len()).rev() {
+        let shown = lines[..k].to_vec();
+        forms.push(form(rows_h(k, false), move |pen, p| {
+            heading(pen, p, "Gestures", &[]);
+            let ink = pen.inks.words2;
+            for (i, l) in shown.iter().enumerate() {
+                pen.text(
+                    p.x,
+                    p.y + ROW0_BASE + PITCH * i as f64,
+                    l,
+                    BODY_PT,
+                    false,
+                    ink,
+                );
+            }
+        }));
+    }
+    forms.push(line_form("Gestures", vec![gestures[0].clone()]));
+    sections.push(Section {
+        name: "Gestures".into(),
+        words: gestures,
+        right: true,
+        parts: Vec::new(),
+        forms,
+    });
+    LensDoc {
+        name: "How to read",
+        sources: vec!["the grammar every row shares".into()],
+        explainer: "Each row is one resource over the last 10 minutes, oldest on the left. \
+                    Each cell is 10 seconds (20 or 30 in a narrow deck), coloured by its share \
+                    of the resource's maximum."
+            .into(),
+        answer: None,
+        sections,
+        two_order: Vec::new(),
+        keeps_first: false,
+    }
+}
+
+/// A text-only well (§11.4): Network, Tokens and GPU say their row's
+/// sentence and their Details long, one per line.
+fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
+    let snap = c.snap;
+    let res = focus.resource().unwrap_or(Resource::Network);
+    let at = c.at();
+    let (name, explainer) = match res {
+        Resource::Network => (
+            "Network",
+            "Heat is the busier direction's rate as a share of its 7-day peak, never above the \
+             link's rate.",
+        ),
+        Resource::Tokens => (
+            "Tokens",
+            "Heat is aterm's output tokens per minute as a share of aterm's busiest 30 seconds \
+             in the last 7 days.",
+        ),
+        _ => ("GPU", "Heat is how much of the time the GPU was busy."),
+    };
+    let details = words::details(res, snap, &c.loc);
+    // The sentence without its Details, which the right column lists.
+    let mut sentence = words::row_sentence(res, snap, c.tab_key, &c.loc);
+    for d in &details {
+        if let Some(i) = sentence.find(&d.spoken) {
+            sentence.replace_range(i..i + d.spoken.len(), "");
+        }
+    }
+    let sentence = sentence.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut lines: Vec<String> = details
+        .iter()
+        .filter_map(|d| d.forms.first().cloned())
+        .collect();
+    let f = &snap.facts;
+    match res {
+        Resource::Network => {
+            // Details names the link and its rate; a link whose bytes are
+            // counted elsewhere says where.
+            let counted = f.link.as_ref().and_then(|link| match link.kind {
+                LinkKind::Vpn => Some(format!(
+                    "{}: VPN, its bytes are counted on the link that carries them",
+                    link.name
+                )),
+                LinkKind::Bridge => Some(format!(
+                    "{}: a bridge, its members' bytes are counted on them",
+                    link.name
+                )),
+                LinkKind::Wifi | LinkKind::Ethernet | LinkKind::Cellular | LinkKind::Other => None,
+            });
+            lines.extend(counted);
+            lines.push("no per-app network figure".into());
+        }
+        Resource::Tokens => {
+            match f.plan.as_ref() {
+                Some(p) => {
+                    let mut w = p.window_word.clone();
+                    if let Some(first) = w.get(..1) {
+                        w = first.to_uppercase() + w.get(1..).unwrap_or_default();
+                    }
+                    lines.push(format!(
+                        "{w} limit {:.0}% used, read at {}",
+                        f64::from(p.used_x10) / 10.0,
+                        words::clock(p.read_at, snap.at_unix_ms, c.loc.utc_offset_s)
+                    ));
+                }
+                None => {
+                    // The long form says what the Details' short one does.
+                    lines.retain(|l| !l.starts_with("plan limit"));
+                    lines.push(
+                        "No current plan reading: Claude Code writes one when you open /usage"
+                            .into(),
+                    );
+                }
+            }
+            lines.push("Codex, Gemini and agy tabs are not counted".into());
+        }
+        _ => {
+            if let Some(g) = f.gpu.as_ref() {
+                let stages: Vec<String> = [("renderer", g.renderer_pct), ("tiler", g.tiler_pct)]
+                    .into_iter()
+                    .filter_map(|(w, p)| p.map(|p| format!("{w} {p}%")))
+                    .collect();
+                if !stages.is_empty() {
+                    lines.push(stages.join(" \u{b7} "));
+                }
+                // Details says the memory in use; the lens adds what is
+                // allocated.
+                if let Some(a) = g.alloc_bytes {
+                    lines.push(format!("{} GPU memory allocated", words::mem(a)));
+                }
+            }
+            match f.gpu_resets {
+                Some((n, since)) => lines.push(format!(
+                    "reset {n}\u{d7} since {}",
+                    words::clock(since, snap.at_unix_ms, c.loc.utc_offset_s)
+                )),
+                None => lines.push(f.gpu.as_ref().and_then(|g| g.recoveries).map_or_else(
+                    || "GPU recovery counter not read".to_owned(),
+                    |count| format!("GPU recovery counter observed: {count}"),
+                )),
+            }
+            lines.push(format!(
+                "no per-app GPU figure on {}",
+                c.loc.platform.name()
+            ));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    lines.retain(|l| seen.insert(l.clone()));
+    let now_lines = wrap(c.m, &sentence, c.cw, BODY_PT);
+    let sections = vec![
+        lines_section("Now", now_lines, vec![sentence.clone()], false),
+        lines_section("Details", lines.clone(), lines, true),
+    ];
+    LensDoc {
+        name,
+        sources: vec![format!("as of {at}")],
+        explainer: explainer.into(),
+        answer: None,
+        sections,
+        two_order: Vec::new(),
+        keeps_first: false,
+    }
+}
+
+/// A heading over `lines`, one a row; fewer lines as room runs out, then its
+/// first line beside its name.
+fn lines_section<'d>(
+    name: &'static str,
+    lines: Vec<String>,
+    words: Vec<String>,
+    right: bool,
+) -> Section<'d> {
+    let mut forms = Vec::new();
+    for k in (1..=lines.len()).rev() {
+        let shown = lines[..k].to_vec();
+        forms.push(form(rows_h(k, false), move |pen, p| {
+            heading(pen, p, name, &[]);
+            let ink = pen.inks.words2;
+            for (i, l) in shown.iter().enumerate() {
+                let s = pen.cut(l, p.w, BODY_PT, false);
+                pen.text(
+                    p.x,
+                    p.y + ROW0_BASE + PITCH * i as f64,
+                    &s,
+                    BODY_PT,
+                    false,
+                    ink,
+                );
+            }
+        }));
+    }
+    let line: Vec<String> = lines.first().cloned().into_iter().collect();
+    forms.push(line_form(name, line));
+    Section {
+        name: name.into(),
+        words,
+        right,
+        parts: Vec::new(),
+        forms,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Line 1, the explainer and the answer.
+
+/// A key hint's pieces: words, or a pair of drawn arrows.
+#[derive(Clone, Copy, Debug)]
+enum Seg {
+    T(&'static str),
+    Across,
+    UpDown,
+}
+
+/// The key hint's forms for a lens opened `how`, longest first (§11.3).
+fn hints(how: Opened) -> &'static [&'static [Seg]] {
+    use Seg::{Across, T, UpDown};
+    match how {
+        Opened::Pinned => &[
+            &[
+                T("pinned \u{b7} "),
+                Across,
+                T("resources \u{b7} "),
+                UpDown,
+                T("scope \u{b7} esc closes"),
+            ],
+            &[T("pinned \u{b7} esc closes")],
+            &[T("esc closes")],
+        ],
+        Opened::Keyboard => &[
+            &[
+                Across,
+                T("resources \u{b7} "),
+                UpDown,
+                T("scope \u{b7} esc closes"),
+            ],
+            &[Across, T("resources \u{b7} esc closes")],
+            &[T("esc closes")],
+        ],
+        Opened::Hover => &[&[T("click pins it")], &[T("click pins")]],
+    }
+}
+
+fn hint_w(m: &FaceMetrics, hint: &[Seg]) -> f64 {
+    hint.iter()
+        .map(|s| match s {
+            Seg::T(t) => m.width(t, NOTE_PT, false),
+            Seg::Across => 20.0,
+            Seg::UpDown => 16.0,
+        })
+        .sum()
+}
+
+/// Line 1, the explainer and the answer, each line drawn only while it
+/// clears the foot, and while it leaves `reserve` pt of body under the rule
+/// (the first section's one-line form, when the doc always keeps it); the
+/// last line drawn of a cut paragraph ends in "…". Answers where the body
+/// starts: the shell's height when nothing is left for it, unless room is
+/// reserved.
+fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, reserve: f64) -> f64 {
+    let m = pen.m;
+    let inks = pen.inks;
+    let limit = lh - FOOT;
+    if LINE1_BASE + DESCENT_EM * NAME_PT > limit {
+        return lh;
+    }
+    let right = lw - SIDE;
+    let name = pen.cut(doc.name, right - SIDE, NAME_PT, true);
+    let nw = pen.text(SIDE, LINE1_BASE, &name, NAME_PT, true, inks.words);
+    let tx = SIDE + nw + 8.0;
+    let hints = hints(how);
+    let mut chosen: Option<(usize, Option<usize>)> = None;
+    'hints: for (hi, hint) in hints.iter().enumerate() {
+        let hw = hint_w(m, hint);
+        for (si, sub) in doc.sources.iter().enumerate() {
+            if tx + m.width(sub, BODY_PT, false) + 12.0 + hw <= right + EPS {
+                chosen = Some((hi, Some(si)));
+                break 'hints;
+            }
+        }
+    }
+    if chosen.is_none() {
+        chosen = hints
+            .iter()
+            .position(|h| tx + hint_w(m, h) <= right + EPS)
+            .map(|hi| (hi, None));
+    }
+    if let Some((hi, si)) = chosen {
+        if let Some(sub) = si.and_then(|si| doc.sources.get(si)) {
+            pen.text(tx, LINE1_BASE, sub, BODY_PT, false, inks.words2);
+        }
+        let hint = hints[hi];
+        let mut x = right - hint_w(m, hint);
+        for seg in hint {
+            x += match seg {
+                Seg::T(t) => pen.text(x, LINE1_BASE, t, NOTE_PT, false, inks.words2),
+                Seg::Across => pen.arrows(x, LINE1_BASE, true),
+                Seg::UpDown => pen.arrows(x, LINE1_BASE, false),
+            };
+        }
+    }
+    let mut last = LINE1_BASE;
+    let mut base = EXPLAINER_BASE;
+    // A line at `base` puts the rule at `base + 7` and the body at
+    // `base + 12`.
+    let fits = |base: f64| {
+        base + DESCENT_EM * HEAD_PT <= limit && (reserve <= 0.0 || base + 12.0 + reserve <= limit)
+    };
+    let mut cut = false;
+    let lines = wrap(m, &doc.explainer, right - SIDE, BODY_PT);
+    let shown = draw_lines(pen, (SIDE, right), &mut base, &lines, inks.words, &fits);
+    if shown > 0 {
+        last = base - PITCH;
+    }
+    cut |= shown < lines.len();
+    if let Some((label, text, kind)) = doc.answer.as_ref().filter(|_| !cut) {
+        let label_w = m.width(label, HEAD_PT, true);
+        let ax = SIDE + (label_w + 8.0).max(52.0);
+        let lines = wrap(m, text, right - ax, BODY_PT);
+        if !lines.is_empty() && fits(base) {
+            pen.text(SIDE, base, label, HEAD_PT, true, inks.words);
+            let ink = kind_ink(&inks, *kind);
+            let shown = draw_lines(pen, (ax, right), &mut base, &lines, ink, &fits);
+            if shown > 0 {
+                last = base - PITCH;
+            }
+            cut |= shown < lines.len();
+        }
+    }
+    if cut && reserve <= 0.0 {
+        return lh;
+    }
+    let rule = last + 7.0;
+    if rule + 5.0 >= limit {
+        return lh;
+    }
+    pen.rule(SIDE, rule, right - SIDE, rgba(inks.grid, 0xFF));
+    rule + 5.0
+}
+
+/// A wrapped paragraph's `lines` from `x`, one a pitch from `*base`, while
+/// `fits` the baseline; the last line drawn ends in "…" when lines are left
+/// over. Leaves `*base` at the next line's baseline; answers how many were
+/// drawn.
+fn draw_lines(
+    pen: &mut Pen<'_>,
+    (x, right): (f64, f64),
+    base: &mut f64,
+    lines: &[String],
+    ink: Rgb,
+    fits: &dyn Fn(f64) -> bool,
+) -> usize {
+    let mut shown = 0;
+    while shown < lines.len() && fits(*base) {
+        let line = match lines.get(shown + 1) {
+            Some(next) if !fits(*base + PITCH) => pen.cut(
+                &format!("{} {next}", lines[shown]),
+                right - x,
+                BODY_PT,
+                false,
+            ),
+            _ => lines[shown].clone(),
+        };
+        pen.text(x, *base, &line, BODY_PT, false, ink);
+        shown += 1;
+        *base += PITCH;
+    }
+    shown
+}
+
+// ---------------------------------------------------------------------
+// Laying the lens.
+
+/// A laid lens: its prims, what a reader hears, and how its body went.
+pub(crate) struct LensLaid {
+    pub(crate) prims: Vec<DrawPrim>,
+    /// "<Name> close-up".
+    pub(crate) title: String,
+    /// The explainer.
+    pub(crate) explainer: String,
+    /// The answer's and each placed section's heading and lines.
+    pub(crate) wells: Vec<(String, String)>,
+    /// Each column's sections in the order it stacks them (one column, or
+    /// the left and the right), by index in the doc.
+    pub(crate) stacks: Vec<Vec<usize>>,
+    /// Each column's placed sections, top down: the section and its form.
+    pub(crate) placed: Vec<Vec<(usize, usize)>>,
+    #[cfg(test)]
+    pub(crate) boxes: Vec<TextBox>,
+}
+
+/// Lay the lens `lens` on `lg` from `input`, measuring its words with `m`,
+/// drawing its prims when `draw`.
+pub(crate) fn lay_lens(
+    lg: &LensGeom,
+    input: &DeckInput<'_>,
+    lens: &Lens,
+    m: &FaceMetrics,
+    draw: bool,
+) -> LensLaid {
+    let mut inks = input.inks;
+    if input.contrast {
+        inks.hollow = inks.words2;
+        inks.rim = inks.words2;
+    }
+    let metrics = m;
+    let s = f64::from(lg.scale.max(0.5));
+    let mut pen = Pen {
+        p: Painter::new(&inks, lg.scale, lg.font_px, input.dwc),
+        m: metrics,
+        inks,
+        ic: input.contrast,
+        s,
+        ox: lg.margin,
+        oy: lg.margin,
+        draw,
+        line_tab: 0.0,
+        #[cfg(test)]
+        boxes: Vec::new(),
+    };
+    if draw {
+        pen.shell(lg);
+    }
+    let (lw, lh) = lg.shell_pt();
+    let (two, cw) = columns(lw);
+    let mut laid = LensLaid {
+        prims: Vec::new(),
+        title: format!("{} close-up", lens.focus.word()),
+        explainer: String::new(),
+        wells: Vec::new(),
+        stacks: Vec::new(),
+        placed: Vec::new(),
+        #[cfg(test)]
+        boxes: Vec::new(),
+    };
+    match input.snap {
+        None => {
+            let doc = LensDoc {
+                name: lens.focus.word(),
+                sources: Vec::new(),
+                explainer: "Reading the machine\u{2026}".into(),
+                answer: None,
+                sections: Vec::new(),
+                two_order: Vec::new(),
+                keeps_first: false,
+            };
+            let _ = head(&mut pen, &doc, lens.how, lw, lh, 0.0);
+            laid.explainer = doc.explainer;
+        }
+        Some(snap) => {
+            let c = Ctx {
+                snap,
+                m: metrics,
+                tab_key: input.tab_key,
+                tab_label: &input.tab_label,
+                loc: input.locale,
+                bar: lens.bar,
+                two,
+                cw,
+            };
+            let doc = doc_for(c, lens.focus);
+            // A doc that always keeps its first section keeps room for its
+            // one-line form under the rule.
+            let reserve = doc
+                .sections
+                .first()
+                .filter(|_| doc.keeps_first)
+                .and_then(|s| s.forms.last())
+                .map_or(0.0, |f| f.h);
+            let top = head(&mut pen, &doc, lens.how, lw, lh, reserve);
+            let placed = lens_body(
+                lw,
+                top,
+                lh - FOOT,
+                &doc.sections,
+                (&doc.two_order, doc.keeps_first),
+            );
+            // The one-liners stacked in a column share the widest label's tab.
+            let tab_of = |x: f64| {
+                placed
+                    .iter()
+                    .filter(|pl| pl.place.x == x)
+                    .filter_map(|pl| doc.sections[pl.section].forms[pl.form].label.as_deref())
+                    .map(|l| tab_after(metrics.width(l, HEAD_PT, true)))
+                    .fold(0.0, f64::max)
+            };
+            for pl in &placed {
+                let sec = &doc.sections[pl.section];
+                pen.line_tab = tab_of(pl.place.x);
+                (sec.forms[pl.form].draw)(&mut pen, pl.place);
+            }
+            if let Some((label, text, _)) = &doc.answer {
+                laid.wells.push(((*label).to_owned(), text.clone()));
+            }
+            for pl in &placed {
+                let sec = &doc.sections[pl.section];
+                laid.wells.push((sec.name.clone(), sec.words.join(" ")));
+                laid.wells.extend(sec.parts.iter().cloned());
+            }
+            let n = doc.sections.len();
+            laid.stacks = if two {
+                let order: Vec<usize> = if doc.two_order.is_empty() {
+                    (0..n).collect()
+                } else {
+                    doc.two_order.clone()
+                };
+                [false, true]
+                    .into_iter()
+                    .map(|right| {
+                        order
+                            .iter()
+                            .copied()
+                            .filter(|&i| doc.sections[i].right == right)
+                            .collect()
+                    })
+                    .collect()
+            } else {
+                vec![(0..n).collect()]
+            };
+            laid.placed = vec![Vec::new(); laid.stacks.len()];
+            for pl in &placed {
+                let col = usize::from(two && pl.place.x > SIDE + EPS);
+                laid.placed[col].push((pl.section, pl.form));
+            }
+            laid.explainer = doc.explainer;
+        }
+    }
+    #[cfg(test)]
+    {
+        laid.boxes = std::mem::take(&mut pen.boxes);
+    }
+    laid.prims = pen.p.prims;
+    laid
+}
+
+/// Paint the lens: its prims (card pixels).
+pub(crate) fn lens_paint(lg: &LensGeom, input: &DeckInput<'_>, lens: &Lens) -> Vec<DrawPrim> {
+    lay_lens(lg, input, lens, &deck_metrics(), true).prims
 }
 
 impl crate::App {
@@ -1310,6 +3629,27 @@ impl crate::App {
             .is_some_and(|f| self.lens_geom_for(wid, &f).is_some())
     }
 
+    /// The lens's input for `wid`: the snapshot, the window's front tab and
+    /// the Deck's inks.
+    fn lens_input(&self, f: &crate::stats_deck::DeckFrame) -> DeckInput<'_> {
+        DeckInput {
+            snap: self.vitals.snapshot.as_deref(),
+            tab_key: f.tab_key,
+            tab_label: f.tab_label.clone(),
+            tab_count: f.tab_count,
+            inks: f.lens_inks,
+            dwc: f.dwc,
+            marks: self.stats_marks(),
+            plate: None,
+            form: f.deck,
+            contrast: f.contrast,
+            locale: Locale {
+                platform: Platform::host(),
+                utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
+            },
+        }
+    }
+
     /// The open lens's fingerprint for `wid` (`0` when none), folded into the
     /// stats term of the `RepaintKey`.
     pub(crate) fn stats_lens_fp(&self, wid: crate::WindowId) -> u64 {
@@ -1323,8 +3663,10 @@ impl crate::App {
         (lg.dx, lg.dy, lg.w.to_bits(), lg.h.to_bits()).hash(&mut h);
         format!("{:?}", f.lens_inks).hash(&mut h);
         f.tab_key.hash(&mut h);
-        f.dwc.hash(&mut h);
-        // The marks come from the snapshot, whose sequence is hashed above.
+        f.tab_label.hash(&mut h);
+        (f.dwc, f.contrast).hash(&mut h);
+        // The words are measured in the UI face: a new one re-lays them.
+        std::sync::Arc::as_ptr(&deck_metrics()).hash(&mut h);
         h.finish().rotate_left(17) | 1
     }
 
@@ -1334,7 +3676,6 @@ impl crate::App {
         let Some((lg, lens, f)) = self.lens_frame(wid) else {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.lens_card = None;
-                ws.stats_lens.hits.clear();
                 ws.stats_lens.rect = None;
                 // A lens the window can no longer show (the bars went off,
                 // the window shrank) is closed, not kept invisibly.
@@ -1352,24 +3693,13 @@ impl crate::App {
         {
             return;
         }
-        let input = DeckInput {
-            snap: self.vitals.snapshot.as_deref(),
-            tab_key: f.tab_key,
-            tab_label: f.tab_label.clone(),
-            tab_count: f.tab_count,
-            inks: lens_inks(&f),
-            seam: f.seam,
-            dwc: f.dwc,
-            marks: self.stats_marks(),
-            plate: None,
-        };
-        let (prims, hits) = lens_paint(&lg, &input, &lens);
+        let input = self.lens_input(&f);
+        let prims = lens_paint(&lg, &input, &lens);
         let (rgba, pw, ph) =
             crate::tray_raster::rasterize_tray(&prims, lg.w as u32, lg.h as u32, 1.0, [0, 0, 0, 0]);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        ws.stats_lens.hits = hits;
         ws.stats_lens.rect = Some((lg.dx, lg.dy, pw, ph));
         ws.lens_card = Some(crate::SettingsCard {
             scrim: None,
@@ -1384,6 +3714,39 @@ impl crate::App {
         });
     }
 
+    /// The open lens laid out, not drawn, for the accessibility tree: its
+    /// title, its explainer and its wells.
+    #[cfg(any(a11y_tree, test))]
+    pub(crate) fn stats_lens_words(
+        &self,
+        wid: crate::WindowId,
+    ) -> Option<(LensGeom, Lens, LensLaid)> {
+        let (lg, lens, f) = self.lens_frame(wid)?;
+        let input = self.lens_input(&f);
+        let laid = lay_lens(&lg, &input, &lens, &deck_metrics(), false);
+        Some((lg, lens, laid))
+    }
+
+    /// Show `lens` in `wid`: remember it for ⌘I, and ask for the "where"
+    /// survey whenever Disk becomes the lens's instrument.
+    fn set_stats_lens(&mut self, wid: crate::WindowId, lens: Lens) {
+        let was = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.stats_lens.open)
+            .map(|l| l.focus);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.stats_lens.open = Some(lens);
+            ws.stats_lens.last = Some((lens.focus, lens.bar));
+            ws.stats_lens.rest = None;
+            ws.stats_lens.leave_due = None;
+        }
+        if lens.focus == Instrument::Disk && was != Some(Instrument::Disk) {
+            self.disk_lens_opened();
+        }
+        self.request_window_redraw(wid);
+    }
+
     /// Open the lens on `wid` at `focus` / `bar`, `how` it was asked.
     pub(crate) fn open_stats_lens(
         &mut self,
@@ -1395,14 +3758,9 @@ impl crate::App {
         if !self.stats_lens_fits(wid) {
             return;
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.stats_lens.open = Some(Lens { focus, bar, how });
-            ws.stats_lens.rest = None;
-            ws.stats_lens.leave_due = None;
-        }
+        self.set_stats_lens(wid, Lens { focus, bar, how });
         // The lens reads at 2 Hz: ask for the next reading now.
         self.vitals.next_due = Some(Instant::now());
-        self.request_window_redraw(wid);
     }
 
     /// Close `wid`'s lens (no spring: the next frame is the first without it).
@@ -1420,7 +3778,8 @@ impl crate::App {
     }
 
     /// ⌘I (`ToggleStatsLens`): open the keyboard lens on the front window,
-    /// or close the open one.
+    /// on the last instrument a lens showed there (CPU at first), or close
+    /// the open one.
     pub(crate) fn toggle_stats_lens(&mut self) -> bool {
         let Some(wid) = self
             .frontmost_window
@@ -1439,7 +3798,12 @@ impl crate::App {
         if !self.stats_lens_fits(wid) {
             return false;
         }
-        self.open_stats_lens(wid, Instrument::Cores, Bar::Global, Opened::Keyboard);
+        let (focus, bar) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.stats_lens.last)
+            .unwrap_or((Instrument::Cpu, Bar::Global));
+        self.open_stats_lens(wid, focus, bar, Opened::Keyboard);
         true
     }
 
@@ -1459,36 +3823,20 @@ impl crate::App {
         ((0.0..f64::from(w)).contains(&fx) && (0.0..f64::from(h)).contains(&fy)).then_some((fx, fy))
     }
 
-    /// Pointer motion over the stats surfaces: arm the rest over an
-    /// instrument, move the open lens's focus with the pointer, start the
-    /// hover lens's leave. True when the stats surfaces own the pointer (the
-    /// Deck's band, a sill instrument, the open lens), so the motion never
-    /// reaches the pane.
+    /// Pointer motion over the stats surfaces (§11.1, §11.2): arm the rest
+    /// over a row, the cores or the header (a hover lens moves to another
+    /// one only after a rest there; a pinned or keyboard lens stays put),
+    /// and start the hover lens's leave. True when the stats surfaces own the
+    /// pointer (the Deck's band, a sill instrument, the open lens), so the
+    /// motion never reaches the pane.
     pub(crate) fn stats_pointer_motion(&mut self, wid: crate::WindowId, now: Instant) -> bool {
         if self.windows.get(&wid).is_none_or(|ws| ws.overlay_open()) {
             return false;
         }
-        // Over the open lens: hovering an instrument moves the focus well.
-        if let Some((lx, ly)) = self.lens_card_point(wid) {
-            let hit = self.windows.get(&wid).and_then(|ws| {
-                ws.stats_lens
-                    .hits
-                    .iter()
-                    .rev()
-                    .find(|h| crate::stats_paint::contains(h.rect, lx, ly))
-                    .copied()
-            });
+        if self.lens_card_point(wid).is_some() {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.stats_lens.leave_due = None;
-                if let (Some(open), Some(hit)) = (ws.stats_lens.open.as_mut(), hit)
-                    && (open.focus != hit.instrument || open.bar != hit.bar)
-                {
-                    open.focus = hit.instrument;
-                    open.bar = hit.bar;
-                    if let Some(w) = ws.os_window.as_ref() {
-                        w.request_redraw();
-                    }
-                }
+                ws.stats_lens.rest = None;
             }
             return true;
         }
@@ -1503,32 +3851,25 @@ impl crate::App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return owns;
         };
+        let open = ws.stats_lens.open;
         match hit {
             Some(hit) => {
                 ws.stats_lens.leave_due = None;
-                match ws.stats_lens.open.as_mut() {
-                    // An open lens follows the pointer across the form.
-                    Some(open) => {
-                        if open.focus != hit.instrument || open.bar != hit.bar {
-                            open.focus = hit.instrument;
-                            open.bar = hit.bar;
-                            if let Some(w) = ws.os_window.as_ref() {
-                                w.request_redraw();
-                            }
-                        }
-                    }
+                ws.stats_lens.rest = match open {
+                    // A pinned or keyboard lens stays where it was put.
+                    Some(l) if l.how != Opened::Hover => None,
+                    // The hover lens shows this one already.
+                    Some(l) if l.focus == hit.instrument() && l.bar == hit.bar() => None,
                     // Re-armed at each motion: the hand pays for the lens.
-                    None => {
-                        ws.stats_lens.rest = Some(Rest {
-                            due: now + REST,
-                            hit,
-                        });
-                    }
-                }
+                    _ => Some(Rest {
+                        due: now + REST,
+                        hit,
+                    }),
+                };
             }
             None => {
                 ws.stats_lens.rest = None;
-                if ws.stats_lens.open.is_some_and(|l| l.how == Opened::Hover)
+                if open.is_some_and(|l| l.how == Opened::Hover)
                     && ws.stats_lens.leave_due.is_none()
                     && !over_card
                 {
@@ -1550,8 +3891,9 @@ impl crate::App {
         }
     }
 
-    /// A press: on an instrument it pins the lens there (true: consumed);
-    /// outside an open lens it closes it (false: the press goes on).
+    /// A press: on the lens it pins a hover lens; on a row, the cores or the
+    /// header it pins the lens there (true: consumed); elsewhere it closes
+    /// an open lens (false: the press goes on, except on the Deck's band).
     pub(crate) fn stats_press(&mut self, wid: crate::WindowId) -> bool {
         if self.windows.get(&wid).is_none_or(|ws| ws.overlay_open()) {
             return false;
@@ -1572,7 +3914,7 @@ impl crate::App {
         let hit = self.stats_hit_under_pointer(wid);
         let over_card = self.stats_card_point(wid).is_some();
         if let Some(hit) = hit {
-            self.open_stats_lens(wid, hit.instrument, hit.bar, Opened::Pinned);
+            self.open_stats_lens(wid, hit.instrument(), hit.bar(), Opened::Pinned);
             return true;
         }
         self.close_stats_lens(wid);
@@ -1594,14 +3936,18 @@ impl crate::App {
         }
     }
 
-    /// The lens's keys: the keyboard lens takes ←/→/↑/↓, Return, ⌘C and Esc
-    /// (true: consumed); any other key closes any lens and passes through
-    /// (false). A bare modifier is inert.
+    /// The lens's keys (§11.4): ⌘I closes any lens; a pinned or keyboard
+    /// lens takes ←/→ (the instrument), ↑/↓ (the scope), ⌘C or `copy_chord`
+    /// (a press of the chord `[keybindings]` binds to Copy, Ctrl+Shift+C off
+    /// macOS: copy the sentence) and Esc, and Return pins the keyboard lens
+    /// (true: consumed). Any other key closes the lens and passes through
+    /// (false), as does every key over a hover lens. A bare modifier is inert.
     pub(crate) fn stats_lens_key(
         &mut self,
         wid: crate::WindowId,
         mods: aterm_window::keyboard::ModifiersState,
         key: &aterm_window::keyboard::Key,
+        copy_chord: bool,
         inert: bool,
     ) -> bool {
         use aterm_window::keyboard::{Key, NamedKey};
@@ -1611,76 +3957,72 @@ impl crate::App {
         if inert {
             return false;
         }
-        if open.how == Opened::Keyboard {
-            let step =
-                |i: usize, n: usize, fwd: bool| if fwd { (i + 1) % n } else { (i + n - 1) % n };
-            let fi = Instrument::ALL
-                .iter()
-                .position(|i| *i == open.focus)
-                .unwrap_or(0);
-            let bi = Bar::ALL.iter().position(|b| *b == open.bar).unwrap_or(0);
+        let command = |c: &str| {
+            mods.super_key() && matches!(key, Key::Character(k) if k.eq_ignore_ascii_case(c))
+        };
+        if command("i") {
+            self.close_stats_lens(wid);
+            return true;
+        }
+        if open.how != Opened::Hover {
             let next = match key {
                 Key::Named(NamedKey::ArrowRight) => Some(Lens {
-                    focus: Instrument::ALL[step(fi, Instrument::ALL.len(), true)],
+                    focus: step_instrument(open.focus, true),
                     ..open
                 }),
                 Key::Named(NamedKey::ArrowLeft) => Some(Lens {
-                    focus: Instrument::ALL[step(fi, Instrument::ALL.len(), false)],
+                    focus: step_instrument(open.focus, false),
                     ..open
                 }),
                 Key::Named(NamedKey::ArrowDown) => Some(Lens {
-                    bar: Bar::ALL[step(bi, Bar::ALL.len(), true)],
+                    bar: step_bar(open.bar, true),
                     ..open
                 }),
                 Key::Named(NamedKey::ArrowUp) => Some(Lens {
-                    bar: Bar::ALL[step(bi, Bar::ALL.len(), false)],
+                    bar: step_bar(open.bar, false),
                     ..open
                 }),
-                Key::Named(NamedKey::Enter) => Some(Lens {
+                Key::Named(NamedKey::Enter) if open.how == Opened::Keyboard => Some(Lens {
                     how: Opened::Pinned,
                     ..open
                 }),
                 _ => None,
             };
             if let Some(next) = next {
-                if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.stats_lens.open = Some(next);
-                }
-                self.request_window_redraw(wid);
+                self.set_stats_lens(wid, next);
                 return true;
             }
             if matches!(key, Key::Named(NamedKey::Escape)) {
                 self.close_stats_lens(wid);
                 return true;
             }
-            if mods.super_key()
-                && let Key::Character(c) = key
-                && c.eq_ignore_ascii_case("c")
-            {
+            if command("c") || copy_chord {
                 let _ = self.copy_stats_sentence(wid);
                 return true;
             }
-        }
-        if open.how == Opened::Pinned && matches!(key, Key::Named(NamedKey::Escape)) {
-            self.close_stats_lens(wid);
-            return true;
         }
         // Any other key closes the lens and goes on to the terminal.
         self.close_stats_lens(wid);
         false
     }
 
-    /// Copy the open lens's selected bar sentence (⌘C in the keyboard lens).
+    /// The open lens's sentence: its row's (`words::row_sentence`, with the
+    /// window's front tab), or How to read's.
+    pub(crate) fn stats_lens_sentence(&self, wid: crate::WindowId) -> Option<String> {
+        let open = self.windows.get(&wid).and_then(|ws| ws.stats_lens.open)?;
+        let snap = self.vitals.snapshot.as_deref()?;
+        let (tab_key, _) = self.deck_tab(wid);
+        let loc = Locale {
+            platform: Platform::host(),
+            utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
+        };
+        Some(lens_sentence(snap, open.focus, tab_key, &loc))
+    }
+
+    /// Copy the open lens's sentence (⌘C in a pinned or keyboard lens).
     pub(crate) fn copy_stats_sentence(&self, wid: crate::WindowId) -> bool {
-        let Some(open) = self.windows.get(&wid).and_then(|ws| ws.stats_lens.open) else {
-            return false;
-        };
-        let Some(snap) = self.vitals.snapshot.as_deref() else {
-            return false;
-        };
-        let (tab_key, tab_label) = self.deck_tab(wid);
-        let text = sentence(snap, open.bar, tab_key, &tab_label);
-        crate::control::pbcopy(&text)
+        self.stats_lens_sentence(wid)
+            .is_some_and(|text| crate::control::pbcopy(&text))
     }
 
     /// The soonest lens deadline: a rest that opens it, a leave that closes
@@ -1714,11 +4056,11 @@ impl crate::App {
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.stats_lens.rest = None;
                 }
-                let still = self
-                    .stats_hit_under_pointer(wid)
-                    .is_some_and(|h| h.instrument == rest.hit.instrument && h.bar == rest.hit.bar);
+                let still = self.stats_hit_under_pointer(wid).is_some_and(|h| {
+                    h.instrument() == rest.hit.instrument() && h.bar() == rest.hit.bar()
+                });
                 if still {
-                    self.open_stats_lens(wid, rest.hit.instrument, rest.hit.bar, Opened::Hover);
+                    self.open_stats_lens(wid, rest.hit.instrument(), rest.hit.bar(), Opened::Hover);
                 }
             }
             if let Some(due) = leave
@@ -1737,324 +4079,10 @@ impl crate::App {
     }
 }
 
-/// The lens's inks: solved on the Deck's band ground for either form, so the
-/// words keep their floors over any terminal theme (the sill's own inks are
-/// solved on the terminal background, which the lens does not sit on).
-fn lens_inks(f: &crate::stats_deck::DeckFrame) -> VitalsInks {
-    f.lens_inks
-}
-
+/// The lens's frame, its sections' forms and T-G16.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::stats_deck::tests::{input, snapshot};
-    use aterm_vitals::Motion;
-    use aterm_vitals::trend::TrendView;
-
-    fn geom() -> LensGeom {
-        lens_geom(
-            StatsBars::Deck,
-            80,
-            124.0,
-            24.0,
-            208.0,
-            2190.0,
-            1652.0,
-            2.0,
-            26.0,
-        )
-        .expect("fits")
-    }
-
-    #[test]
-    fn the_lens_hangs_under_the_deck_and_over_the_sill() {
-        let deck = geom();
-        // Shell 2,048 × 500 at 2×, 8 px under the Deck's foot (80 + 124).
-        assert_eq!(deck.w - 2.0 * deck.margin, 2048.0);
-        assert_eq!(deck.h - 2.0 * deck.margin, 500.0);
-        assert_eq!(deck.dy as f32 + deck.margin, 80.0 + 124.0 + 8.0);
-        let sill = lens_geom(
-            StatsBars::Sill,
-            1876,
-            24.0,
-            24.0,
-            84.0,
-            2190.0,
-            1792.0,
-            2.0,
-            26.0,
-        )
-        .expect("fits");
-        assert_eq!(sill.dy as f32 + sill.margin + 500.0, 1876.0 - 8.0);
-        assert!(
-            lens_geom(
-                StatsBars::Deck,
-                0,
-                124.0,
-                24.0,
-                124.0,
-                200.0,
-                100.0,
-                2.0,
-                26.0
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn the_lens_draws_the_three_wells_and_the_focus() {
-        let snap = snapshot();
-        let i = input(&snap);
-        for focus in Instrument::ALL {
-            let lens = Lens {
-                focus,
-                bar: Bar::Global,
-                how: Opened::Keyboard,
-            };
-            let (prims, hits) = lens_paint(&geom(), &i, &lens);
-            let texts: Vec<&str> = prims
-                .iter()
-                .filter_map(|p| match p {
-                    DrawPrim::Text { s, .. } => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect();
-            for bar in Bar::ALL {
-                assert!(hits.iter().any(|h| h.bar == bar), "{focus:?} {bar:?}");
-            }
-            assert!(
-                texts.iter().any(|t| t.starts_with(focus.word())),
-                "{focus:?}: {texts:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_cores_focus_draws_a_minute_per_core_and_the_busiest() {
-        let mut snap = snapshot();
-        if let Some(cpu) = snap.cpu.as_mut() {
-            cpu.core_history = vec![vec![Some(0.5); 60]; 10];
-        }
-        snap.top = vec![aterm_vitals::model::TopProc {
-            name: "cargo".into(),
-            cores: 2.1,
-            footprint: None,
-            scope: ProcScope::Tab(7),
-        }];
-        let i = input(&snap);
-        let lens = Lens {
-            focus: Instrument::Cores,
-            bar: Bar::Global,
-            how: Opened::Hover,
-        };
-        let (prims, _) = lens_paint(&geom(), &i, &lens);
-        let half = rgba(i.inks.load_at(0.5), 0xFF);
-        let cells = prims
-            .iter()
-            .filter(|p| matches!(p, DrawPrim::Panel { fill, .. } if *fill == half))
-            .count();
-        assert!(cells >= 600, "{cells} cells for 10 cores × 60 s");
-        let texts: Vec<&str> = prims
-            .iter()
-            .filter_map(|p| match p {
-                DrawPrim::Text { s, .. } => Some(s.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(texts.contains(&"cargo"), "{texts:?}");
-    }
-
-    #[test]
-    fn the_narrow_lens_shows_the_selected_bar_over_the_focus() {
-        let snap = snapshot();
-        let i = input(&snap);
-        let lg = lens_geom(
-            StatsBars::Deck,
-            80,
-            124.0,
-            24.0,
-            208.0,
-            900.0,
-            1000.0,
-            2.0,
-            26.0,
-        )
-        .expect("fits");
-        let lens = Lens {
-            focus: Instrument::Memory,
-            bar: Bar::Tab,
-            how: Opened::Keyboard,
-        };
-        let (_, hits) = lens_paint(&lg, &i, &lens);
-        // The body holds the selected bar alone; the header's switch offers
-        // the three bars, one region each, keeping the focus.
-        let body = lg.margin + lg.scale * 10.0 + lg.scale * 20.0;
-        let (switch, wells): (Vec<&Hit>, Vec<&Hit>) = hits.iter().partition(|h| h.rect.1 < body);
-        assert!(wells.iter().all(|h| h.bar == Bar::Tab), "{wells:?}");
-        assert_eq!(switch.len(), 3, "{switch:?}");
-        assert!(switch.iter().all(|h| h.instrument == Instrument::Memory));
-        for bar in Bar::ALL {
-            assert!(switch.iter().any(|h| h.bar == bar), "{bar:?}");
-        }
-        // The wide lens needs no switch: its three wells are all there.
-        let (_, wide_hits) = lens_paint(&geom(), &i, &lens);
-        let header = geom().margin + 2.0 * 10.0 + 2.0 * 20.0;
-        assert!(
-            wide_hits.iter().all(|h| h.rect.1 >= header),
-            "{wide_hits:?}"
-        );
-    }
-
-    /// The Jobs focus lists what is not fine, worst first (stuck, then the
-    /// zombies a tab holds, then quiet), each line its tab, its program and
-    /// the engine's sentence; past its room it counts the rest. A calm view
-    /// says so, and before the first pass it says it is reading.
-    #[test]
-    fn the_jobs_focus_lists_the_engines_rows_worst_first() {
-        use crate::stats_paint::tests::{job_row, zombies};
-        use aterm_vitals::jobs::{Findings, JobsView, Verdict};
-        let lens = Lens {
-            focus: Instrument::Jobs,
-            bar: Bar::Global,
-            how: Opened::Keyboard,
-        };
-        let texts = |snap: &Snapshot| -> Vec<String> {
-            let mut i = input(snap);
-            i.marks = snap
-                .jobs
-                .as_deref()
-                .map(crate::stats_paint::marks_of)
-                .unwrap_or_default();
-            let (prims, _) = lens_paint(&geom(), &i, &lens);
-            prims
-                .iter()
-                .filter_map(|p| match p {
-                    DrawPrim::Text { s, .. } => Some(s.clone()),
-                    _ => None,
-                })
-                .collect()
-        };
-        let mut snap = snapshot();
-        let t = texts(&snap);
-        assert!(t.iter().any(|s| s.starts_with("Reading the jobs")), "{t:?}");
-        snap.jobs = Some(std::sync::Arc::new(JobsView {
-            rows: vec![job_row("j1", Verdict::Fine, None, None)],
-            ..Default::default()
-        }));
-        let t = texts(&snap);
-        assert!(
-            t.iter()
-                .any(|s| s == "Nothing stuck, quiet or waiting for you."),
-            "{t:?}"
-        );
-        snap.jobs = Some(std::sync::Arc::new(JobsView {
-            rows: vec![
-                job_row("j1", Verdict::Quiet, Some(4_000), Some(30_000)),
-                job_row("j2", Verdict::Fine, None, None),
-                job_row("j3", Verdict::Stuck, Some(9_000), Some(90_000)),
-            ],
-            findings: Findings {
-                zombies: vec![zombies(300, 3, Some(7)), zombies(1, 9, None)],
-                ..Default::default()
-            },
-            ..Default::default()
-        }));
-        let t = texts(&snap);
-        // Each line: "<tab> <program>", the separator, the sentence.
-        let lines: Vec<(&str, &str)> = t
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.starts_with("Tab 1 "))
-            .filter_map(|(i, s)| t.get(i + 2).map(|said| (s.as_str(), said.as_str())))
-            .collect();
-        assert_eq!(
-            lines.len(),
-            3,
-            "the fine job and the zombies outside aterm draw no line: {t:?}"
-        );
-        assert_eq!(lines[0].0, "Tab 1 make");
-        assert!(lines[0].1.starts_with("stuck"), "{lines:?}");
-        assert_eq!(lines[1].0, "Tab 1 node");
-        assert!(lines[1].1.starts_with('3'), "{lines:?}");
-        assert_eq!(lines[2].0, "Tab 1 make");
-        assert!(lines[2].1.starts_with("quiet"), "{lines:?}");
-
-        // More jobs than lines: the last line counts the rest.
-        snap.jobs = Some(std::sync::Arc::new(JobsView {
-            rows: (0..40)
-                .map(|n| job_row(&format!("j{n}"), Verdict::Stuck, Some(9_000), Some(90_000)))
-                .collect(),
-            ..Default::default()
-        }));
-        let t = texts(&snap);
-        let shown = t.iter().filter(|s| s.starts_with("Tab 1 ")).count();
-        let more = format!("+{} more", 40 - shown);
-        assert!(shown > 0 && shown < 40, "{shown}");
-        assert!(t.iter().any(|s| s.starts_with(&more)), "{more}: {t:?}");
-    }
-
-    #[test]
-    fn the_readouts_carry_their_instruments_figures() {
-        let snap = snapshot();
-        let cpu = snap.cpu.as_ref().expect("cpu");
-        let cores = readout(&snap, Instrument::Cores);
-        assert!(cores.contains(&words::cores(cpu.busy.level)), "{cores}");
-        assert!(cores.contains(&cpu.total().to_string()), "{cores}");
-        let mem = snap.mem.as_ref().expect("memory");
-        let memory = readout(&snap, Instrument::Memory);
-        assert!(
-            memory.contains(&words::gib_total(mem.sample.total)),
-            "{memory}"
-        );
-        let gpu = snap.gpu.as_ref().expect("gpu");
-        let g = readout(&snap, Instrument::Gpu);
-        assert!(
-            g.contains(&format!("{:.0}%", (gpu.load.raw * 100.0).round())),
-            "{g}"
-        );
-        let vol = snap.volume.as_ref().expect("volume");
-        let disk = readout(&snap, Instrument::Disk);
-        assert!(disk.contains(&words::disk(vol.available)), "{disk}");
-        // Before a reading, each says so rather than inventing a figure.
-        let empty = Snapshot::default();
-        for focus in Instrument::ALL {
-            assert!(
-                !readout(&empty, focus).chars().any(|c| c.is_ascii_digit()),
-                "{focus:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_sentence_folds_at_its_clauses() {
-        let c = sentence_clauses(
-            "Global: 3.1 of 10 cores busy; GPU 4%; disk 1.81 TB free.",
-            [0, 0, 0],
-        );
-        assert_eq!(c.len(), 3);
-        assert_eq!(c[2].full, "disk 1.81 TB free");
-    }
-
-    #[test]
-    fn motion_is_named_in_the_cores_readout() {
-        let mut snap = snapshot();
-        if let Some(cpu) = snap.cpu.as_mut() {
-            cpu.busy = TrendView {
-                level: 4.0,
-                slow: 2.0,
-                raw: 4.0,
-                ..TrendView::flat(4.0)
-            };
-        }
-        let r = readout(&snap, Instrument::Cores);
-        let rising = snap
-            .cpu
-            .as_ref()
-            .is_some_and(|c| c.busy.motion(words::CORES_GATE) == Motion::Rising);
-        assert_eq!(r.contains("rising"), rising, "{r}");
-    }
-}
+#[path = "stats_lens_tests.rs"]
+mod tests;
 
 /// The lens and the sill driven through the App's own pointer, key, focus
 /// and config routing, read off what the tab's program received.

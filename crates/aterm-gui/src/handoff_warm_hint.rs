@@ -1,30 +1,19 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Advisory launch-time warm hint (docs/DESIGN-warm-successor-2026-09-29.md).
+//! Advisory launch-time warm hint.
 //!
-//! A successor runs its warm prologue (config, theme, fonts, backend worker)
-//! before it dials (`main_entry`'s `WarmOrder::BeforeDial`), so the outgoing
-//! window's font zoom is not yet known from the authenticated carry. The
-//! outgoing process names it in the launch environment as [`ENV_WARM_HINT`]:
-//! the zoom pair, plus window and session counts and window 0's grid for the
-//! log's hit/miss line.
+//! A successor runs its warm prologue (config, theme, fonts, backend worker) before it dials
+//! (`WarmOrder::BeforeDial`), before the authenticated carry names the outgoing window's font
+//! zoom. The outgoing process passes it in [`ENV_WARM_HINT`]: the zoom pair, plus window and
+//! session counts and window 0's grid for the log's hit/miss line.
 //!
-//! The hint is advisory and never authenticated:
-//!
-//! * it decides only which px the backend worker builds and pre-warms at;
-//! * the authenticated manifest wins at intake: the launch font is derived from
-//!   the carry (`app_config::successor_font_px`), and a differing build px is
-//!   re-selected at the backend join (`App::warm_miss_px`), so a stale or
-//!   hostile hint costs a logged warm miss and nothing else;
-//! * it is its own type, disjoint from `seamless::IncomingHandoff`, and no
-//!   digest, proof or admission reads it (`HintNotInProof` in
-//!   `NativeUpdateSuccessorWarmBeforeClaim`; `seamless::handoff_env_conformance`
-//!   checks the adoption proof with a stale and a hostile hint present).
-//!
-//! Without a hint (the fork lane) the successor warms at its config's size;
-//! `main_entry`'s `warm_order` is the one switch that moves the prologue back
-//! after intake.
+//! The hint is never authenticated. It decides only the px the backend worker pre-warms at; the
+//! launch font comes from the carry (`app_config::successor_font_px`) and a differing build px
+//! is re-selected at the backend join (`crate::warm_miss_px`), so a stale or hostile hint costs
+//! a logged warm miss. No digest, proof or admission reads it (`HintNotInProof`, checked by
+//! `seamless::handoff_env_conformance`). Without a hint (the fork lane) the successor warms at
+//! its config's size.
 
 /// The launch-environment name. Captured (read and cleared) with every other
 /// handoff name by `HandoffEnv::capture`; read only from that snapshot.
@@ -35,8 +24,8 @@ pub(crate) const ENV_WARM_HINT: crate::handoff_env::HandoffName =
 /// always safe for a guess.
 const VERSION: &str = "w1";
 
-/// Longest value read. The encoded hint is under 80 bytes; anything longer is
-/// not one this build wrote.
+/// Longest value read. An encoded hint is at most 94 bytes; anything longer is not one this
+/// build wrote.
 const MAX_LEN: usize = 256;
 
 /// What the outgoing process expects its capture to carry, at launch time.

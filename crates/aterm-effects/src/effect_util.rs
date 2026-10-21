@@ -60,15 +60,17 @@ pub(crate) fn push_grid_quad(
         return;
     }
     let ch = geom.ch as i32;
+    let x0_u = x0 as u16;
+    let w_u = (x1 - x0) as u16;
     let mut yy = y0;
     while yy < y1 {
         let row = yy / ch;
         let band_end = ((row + 1) * ch).min(y1);
         out.push(GlowQuad {
             row: row as u16,
-            x: x0 as u16,
+            x: x0_u,
             y: yy as u16,
-            w: (x1 - x0) as u16,
+            w: w_u,
             h: (band_end - yy) as u16,
             color: premul,
             alpha,
@@ -139,28 +141,35 @@ pub(crate) fn push_soft_disc(
     if peak < 1.0 || rx < 0.5 || ry < 0.5 {
         return;
     }
+    let inv_rx = 1.0 / rx;
     let (y0, y1) = ((cy - ry).floor() as i32, (cy + ry).ceil() as i32);
     for y in y0..y1 {
         let dy = (y as f32 + 0.5 - cy) / ry;
-        let rest = 1.0 - dy * dy;
+        let dy2 = dy * dy;
+        let rest = 1.0 - dy2;
         if rest <= 0.0 {
             continue;
         }
         let span = rx * rest.sqrt();
         let level = |x: f32| {
-            let w = (1.0 - (x / rx) * (x / rx) - dy * dy).max(0.0);
+            let u = x * inv_rx;
+            let w = (1.0 - u * u - dy2).max(0.0);
             let cov = (peak * w * w).round().clamp(0.0, 255.0) as u8;
             premul_rgb(color, cov)
         };
         let knot = |k: usize| -span + 2.0 * span * k as f32 / (2 * SEGMENTS) as f32;
+        let x0 = knot(0);
+        let mut ia = (cx + x0).round() as i32;
+        let mut a = level(x0);
         for k in 0..2 * SEGMENTS {
-            let (xa, xb) = (knot(k), knot(k + 1));
-            let (ia, ib) = ((cx + xa).round() as i32, (cx + xb).round() as i32);
-            let (a, b) = (level(xa), level(xb));
-            if ib <= ia || (a == 0 && b == 0) {
-                continue;
+            let xb = knot(k + 1);
+            let ib = (cx + xb).round() as i32;
+            let b = level(xb);
+            if ib > ia && (a != 0 || b != 0) {
+                push_fx_ramp(out, geom, ia, y, ib - ia, 1, (a, 0), (b, 0));
             }
-            push_fx_ramp(out, geom, ia, y, ib - ia, 1, (a, 0), (b, 0));
+            ia = ib;
+            a = b;
         }
     }
 }
@@ -225,6 +234,8 @@ pub(crate) fn push_fx_ramp(
     let (c1, a1) = if x1 == x + w { right } else { at(x1) };
     let ch = geom.ch as i32;
     let oy = i32::from(geom.origin_y);
+    let x0_u = x0 as u16;
+    let w_u = (x1 - x0) as u16;
     let mut yy = y0;
     while yy < y1 {
         // Grid-row damage hint anchored at origin_y (above-grid bands tag row 0).
@@ -232,9 +243,9 @@ pub(crate) fn push_fx_ramp(
         let band_end = (oy + (row + 1) * ch).min(y1);
         out.push(GlowQuad {
             row: row.max(0) as u16,
-            x: x0 as u16,
+            x: x0_u,
             y: yy as u16,
-            w: (x1 - x0) as u16,
+            w: w_u,
             h: (band_end - yy) as u16,
             color: c0,
             alpha: a0,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 
-# The aterm-side fabric crate: the `aterm-link serve` bridge (§11.2).
+# The aterm-side fabric crate: the `aterm-link serve` bridge.
 #
 # The astream crates come from `vendor/astream`, a git submodule pinned to one
 # commit; a bus fix lands in astream and arrives here as a submodule bump
@@ -30,13 +30,12 @@ dev-seams = []
 aterm-tempfile = { workspace = true }
 # The bus: `cap` for the bound grant every fabric principal attaches with. Its
 # SHA-256 is astream's own astream-digest, so this crate takes no third-party
-# crate from astream. astream's `aead` (the sealed record layer) is not enabled:
-# the sealed transport was removed on 2026-10-15, before it shipped.
+# crate from astream. astream's `aead` (the sealed record layer) is not enabled.
 # `retention` compiles `Broker::retain_before`, which nothing shipped calls
 # (the unit tests drop a retained record and its dedup entry with it); it is
 # on here, not only in a dev row, so the broker the tests run is the broker
 # that ships and a `-p aterm` build shares every unit a `--workspace` test
-# build compiled (P4). Its one effect on a log aterm writes: an open also
+# build compiled. Its one effect on a log aterm writes: an open also
 # looks for the `.base` and `.state` sidecars, which nothing in aterm creates.
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "retention"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
@@ -73,7 +72,7 @@ aterm-digest = { workspace = true }
 # `aterm ctl instances`/`ls` use, so `aterm fabric` and the bridge's hosted set
 # cannot find different instances than the client does.
 aterm-ctl = { path = "../aterm-ctl" }
-# The session log's bus records (phase 4): the mirror's cursor type, and the
+# The session log's bus records: the mirror's cursor type, and the
 # reader's view and fold `aterm fabric brief` shows. An engine crate: no I/O.
 aterm-slog = { workspace = true }
 # `[fabric] command` is read with the app's own aterm.toml parser, so the report
@@ -87,10 +86,8 @@ aterm-toml = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# The kernel's process records, read in-process where `aterm fabric` once ran
-# `ps -A -ww` (the broker and bridges it looks for) and `lsof -d txt` (the
-# image a broker runs): `fabric::process_table`, `fabric::running_image_inode`.
-# Linux reads `/proc` and keeps `ps`.
+# The kernel's process records, read in-process (`fabric::process_table`,
+# `fabric::running_image_inode`). Linux reads `/proc` and keeps `ps`.
 aterm-sysprobe = { workspace = true }
 
 [dev-dependencies]

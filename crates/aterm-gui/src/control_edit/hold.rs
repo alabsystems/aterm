@@ -14,6 +14,8 @@
 //! A session stays held while any of its tickets does, so two edits one
 //! session asked for (`amacs a & amacs b`) are counted apart (`status
 //! editing=<n>`) and the first to resolve leaves the other's hold standing.
+//! `doc ls` names the tickets holding through a document's views
+//! ([`holds_through`]).
 //!
 //! An edit nothing waits on holds nothing: `edit … wait=0` (`amacs
 //! --no-wait`) marks its ticket [`Unwaited`] while the lane serves it, so the
@@ -194,6 +196,29 @@ pub(crate) fn count_at(session: u64, now: Instant) -> usize {
     live(&mut holds.sessions, session, now).len()
 }
 
+/// The holds standing at `now` through one of `views`, as `(session,
+/// ticket)` pairs ascending: the open edits a program waits on there (`doc
+/// ls`'s `ticket=`). A ticket nobody waits on (`wait=0`, or an orphan whose
+/// hold lapsed) is not among them. The session comes with each, so the caller
+/// keeps the holds of the sessions it hosts: a view id names a view only in
+/// the App that allocated it.
+pub(crate) fn holds_through(views: &[u64], now: Instant) -> Vec<(u64, Ticket)> {
+    let mut holds = edit_hold().lock_or_recover();
+    let sessions: Vec<u64> = holds.sessions.keys().copied().collect();
+    let mut through: Vec<(u64, Ticket)> = Vec::new();
+    for session in sessions {
+        through.extend(
+            live(&mut holds.sessions, session, now)
+                .iter()
+                .filter(|entry| views.contains(&entry.hold.view))
+                .map(|entry| (session, entry.hold.ticket)),
+        );
+    }
+    drop(holds);
+    through.sort_unstable();
+    through
+}
+
 /// `session`'s holds standing at `now`, the lapsed ones dropped from the map.
 fn live(sessions: &mut BTreeMap<u64, Vec<Entry>>, session: u64, now: Instant) -> &[Entry] {
     let Some(entries) = sessions.get_mut(&session) else {
@@ -337,6 +362,42 @@ mod tests {
         assert_eq!(get_at(TWO, now + Duration::from_secs(60)), Some(newer));
         clear(TWO, newer.ticket);
         assert_eq!(get(TWO), None);
+    }
+
+    /// `doc ls`'s tickets: every standing hold through the views asked
+    /// about, across sessions, each with its session and ascending. NEGATIVE
+    /// CONTROL: a hold through another view, and one that lapsed, are not
+    /// named.
+    #[test]
+    fn holds_through_names_the_standing_holds_through_the_views() {
+        const ONE: u64 = u64::MAX - 13;
+        const OTHER: u64 = u64::MAX - 14;
+        // Views no other test holds through: the map is process-wide.
+        const VIEW: u64 = u64::MAX - 1_000;
+        const SIBLING: u64 = u64::MAX - 1_001;
+        const ELSEWHERE: u64 = u64::MAX - 1_002;
+        let hold = |ticket, view| Hold {
+            ticket: Ticket(ticket),
+            view,
+        };
+        set(ONE, hold(31, VIEW));
+        set(OTHER, hold(30, SIBLING));
+        set(OTHER, hold(32, ELSEWHERE));
+        let now = Instant::now();
+        assert_eq!(
+            holds_through(&[VIEW, SIBLING], now),
+            vec![(OTHER, Ticket(30)), (ONE, Ticket(31))]
+        );
+        assert_eq!(holds_through(&[ELSEWHERE], now), vec![(OTHER, Ticket(32))]);
+        set_expiry(ONE, Ticket(31), Some(now));
+        assert_eq!(
+            holds_through(&[VIEW, SIBLING], now),
+            vec![(OTHER, Ticket(30))],
+            "a lapsed hold names no ticket"
+        );
+        clear(OTHER, Ticket(30));
+        clear(OTHER, Ticket(32));
+        assert_eq!(holds_through(&[VIEW, SIBLING, ELSEWHERE], now), Vec::new());
     }
 
     /// Every verb that types into a held session is refused `ERR busy

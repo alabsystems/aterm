@@ -1998,6 +1998,19 @@ mod startup_prepare_tests {
             .is_some(),
             "born before now on the boot clock"
         );
+        if aterm_uds::process::translation() == aterm_uds::process::Translation::Translated {
+            // Rosetta: the translated `mach_absolute_time` counts nanoseconds while start
+            // records count the kernel's ticks, so this process reads no boot clock
+            // (`aterm_uds::process::apple_boot_clock`) and its start orders on the wall clock,
+            // which the assertion above held. The bracket has no boot clock to read.
+            assert_eq!(now, None, "a translated process reads no boot clock");
+            println!(
+                "NOT RUN under Rosetta: metrics::startup::startup_prepare_tests::\
+                 the_boot_clock_reads_in_nanoseconds_through_this_machines_timebase: a translated \
+                 process reads no boot clock"
+            );
+            return;
+        }
         let boot = || aterm_uds::process::boot_clock_now().expect("a native boot clock");
         let (outer0, first, inner0) = (Instant::now(), boot(), Instant::now());
         std::thread::sleep(ms(20));

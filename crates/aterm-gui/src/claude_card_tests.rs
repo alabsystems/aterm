@@ -2567,6 +2567,16 @@ fn set_now(t: Option<Instant>) {
     TEST_NOW.with(|now| now.set(t));
 }
 
+/// The clock [`set_now`] holds, else the wall clock: what a measured pass's
+/// capture drives its cursor effects with, so a harness window and its bare
+/// twin are extracted at one instant, the card's, however long the machine
+/// took between them.
+fn held_now() -> Instant {
+    TEST_NOW
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(Instant::now)
+}
+
 /// THE TAB MENU over the card (`App::splice_tab_menu`, topmost chrome,
 /// painted after the card, hanging from the first grid row where a fresh
 /// card sits): none of the card's light, ink or star shows on the menu's
@@ -3412,7 +3422,7 @@ fn pass_cost(app: &mut App, wid: WindowId) -> PassCost {
 fn keystroke(app: &mut App, wid: WindowId, session: u64, key: u8) {
     let term = app.pool.get(session).expect("session").term.clone();
     crate::term_lock(&term).process(&[key]);
-    app.capture_words(wid, Instant::now());
+    app.capture_words(wid, held_now());
     app.splice_tab_strip(wid);
 }
 
@@ -3828,7 +3838,7 @@ fn feed_both(app: &mut (App, WindowId, u64), bare: &mut (App, WindowId, u64), by
     for (app, wid, session) in [app, bare] {
         let term = app.pool.get(*session).expect("session").term.clone();
         crate::term_lock(&term).process(bytes);
-        app.capture_words(*wid, Instant::now());
+        app.capture_words(*wid, held_now());
         app.splice_tab_strip(*wid);
     }
 }
@@ -3905,8 +3915,13 @@ fn costs_the_floor(
     // A few passes to grow what the change grows (the rows' buffers, a
     // streamed row's text, the streams a chrome row's own animation
     // republishes while it comes in), in both.
+    // Every pass, these and the measured ones below, on the test's clock:
+    // the card's and the captures' (`held_now`).
     const WARM: usize = 6;
     for i in 0..WARM {
+        set_now(Some(
+            t0 + Duration::from_millis(EPISODE_MS + 200 + 9 * i as u64),
+        ));
         step(i, &mut app, &mut bare);
         let _ = pass_cost(&mut app.0, wid);
         let _ = pass_cost(&mut bare.0, bare.1);
@@ -4022,7 +4037,7 @@ fn a_revision_bump_with_no_cell_changed_costs_the_frame_nothing() {
                 if i == 0 {
                     app.tab_strip_rows = strip;
                 }
-                app.capture_words(*wid, Instant::now());
+                app.capture_words(*wid, held_now());
                 app.splice_tab_strip(*wid);
             }
         });
@@ -4064,7 +4079,7 @@ fn a_split_composed_every_frame_costs_the_card_nothing() {
     for i in 0..10u64 {
         set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 100 + 9 * i)));
         for (app, wid) in [(&mut app, wid), (&mut bare, bare_wid)] {
-            app.capture_words(wid, Instant::now());
+            app.capture_words(wid, held_now());
             app.splice_tab_strip(wid);
         }
         let floor = pass_cost(&mut bare, bare_wid);

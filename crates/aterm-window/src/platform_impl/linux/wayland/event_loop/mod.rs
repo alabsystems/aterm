@@ -31,18 +31,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::cursor::OnlyCursorImage;
+use aterm_wayland::proxy::Flushed;
+
 use crate::dpi::LogicalSize;
 use crate::error::{EventLoopError, OsError as RootOsError};
 use crate::event::{Event, InnerSizeWriter, StartCause, WindowEvent};
-use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents};
+use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::common::poll::{self, Waker};
 use crate::platform_impl::platform::min_timeout;
-use crate::platform_impl::{
-    ActiveEventLoop as PlatformActiveEventLoop, OsError, PlatformCustomCursor,
-};
-use crate::window::{CustomCursor as RootCustomCursor, CustomCursorSource};
+use crate::platform_impl::{ActiveEventLoop as PlatformActiveEventLoop, OsError};
 
 mod proxy;
 pub mod sink;
@@ -52,7 +50,6 @@ use sink::EventSink;
 
 use super::clipboard::{ClipboardRequest, WaylandClipboard};
 use super::state::{Connection, WindowCompositorUpdate, WinitState};
-use super::window::state::FrameCallbackState;
 use super::{logical_to_physical_rounded, WaylandError, WindowId};
 
 /// The Wayland event loop.
@@ -148,6 +145,7 @@ impl<T: 'static> EventLoop<T> {
             control_flow: Cell::new(ControlFlow::default()),
             exit: Cell::new(None),
             state: RefCell::new(winit_state),
+            #[cfg(feature = "rwh_06")]
             connection: Arc::clone(&connection),
         };
 
@@ -457,14 +455,7 @@ impl<T: 'static> EventLoop<T> {
                     return Some(WindowEvent::Destroyed);
                 }
 
-                let mut window = state.windows.get_mut().get_mut(window_id)?.lock().unwrap();
-
-                if window.frame_callback_state() == FrameCallbackState::Requested {
-                    return None;
-                }
-
-                // Reset the frame callbacks state.
-                window.frame_callback_reset();
+                state.windows.get_mut().get(window_id)?;
                 let redraw_requested = window_requests
                     .get(window_id)
                     .is_some_and(|requests| requests.take_redraw_requested());
@@ -647,13 +638,14 @@ impl<T: 'static> EventLoop<T> {
         Ok(())
     }
 
-    /// Write the queued requests. A full socket (EAGAIN) is not an error: the rest stays
-    /// queued, and the next wait also waits for the socket to take it. `Err` is what the loop
+    /// Write the queued requests. A full socket is not an error: the rest stays queued, and
+    /// the next wait also waits for the socket to take it ([`Flushed::Queued`]; a display
+    /// libwayland has ended is an error even when its errno is EAGAIN). `Err` is what the loop
     /// ends with, as for a failed dispatch ([`wire_failure`]).
     fn flush(&mut self) -> Result<(), (EventLoopError, i32)> {
-        match self.connection.display().flush() {
-            Ok(()) => self.flush_pending = false,
-            Err(aterm_wayland::proxy::Error::Display(libc::EAGAIN)) => self.flush_pending = true,
+        match self.connection.display().try_flush() {
+            Ok(Flushed::All) => self.flush_pending = false,
+            Ok(Flushed::Queued) => self.flush_pending = true,
             Err(error) => return Err(wire_failure(error, self.hung_up)),
         }
         Ok(())
@@ -735,7 +727,9 @@ pub struct ActiveEventLoop {
     /// Winit state.
     pub state: RefCell<WinitState>,
 
-    /// Connection to the wayland server.
+    /// Connection to the wayland server, for the opt-in `rwh_06` display handle (WC.8: its
+    /// other reader, the owned display handle, is Windows-only now).
+    #[cfg(feature = "rwh_06")]
     pub(crate) connection: Arc<Connection>,
 }
 
@@ -762,15 +756,6 @@ impl ActiveEventLoop {
 
     pub(crate) fn exit_code(&self) -> Option<i32> {
         self.exit.get()
-    }
-
-    #[inline]
-    pub fn listen_device_events(&self, _allowed: DeviceEvents) {}
-
-    pub(crate) fn create_custom_cursor(&self, cursor: CustomCursorSource) -> RootCustomCursor {
-        RootCustomCursor {
-            inner: PlatformCustomCursor::Wayland(OnlyCursorImage(Arc::from(cursor.inner.0))),
-        }
     }
 
     #[cfg(feature = "rwh_06")]

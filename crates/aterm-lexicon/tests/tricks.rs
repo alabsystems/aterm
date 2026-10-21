@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE KITTY-COMMAND VOCABULARY CONTRACT.
+//! The kitty-command vocabulary contract.
 //!
-//! Two kinds of test live here and both matter:
-//!
-//! * DATA tests walk the embedded `data/tricks.toml` through the public API.
-//!   They are DATA-DRIVEN on purpose — they iterate the languages and rows the
-//!   file actually holds — so they keep their meaning when the multilingual
-//!   groups are appended after the English seed. Where a law is VACUOUS for
-//!   an English-only file (gating, the English-dictionary collision, the
-//!   lone-ideograph law), a synthetic twin proves the detector itself fires,
-//!   so "green" never means "blind".
-//! * LOAD-LAW tests feed `TrickLexicon::from_source` documents that BREAK a
-//!   law and assert the loss is named on `conflicts()`, never silent.
+//! * Data tests walk the embedded `data/tricks.toml` through the public API, iterating the
+//!   languages and rows it holds. Where a law could pass vacuously on the data (gating, the
+//!   English-dictionary collision, the lone-ideograph law), a synthetic twin proves the detector
+//!   fires.
+//! * Load-law tests feed `TrickLexicon::from_source` documents that break a law and assert the
+//!   loss is named on `conflicts()`.
 
 use std::collections::HashSet;
 
@@ -193,9 +188,8 @@ fn authored_surfaces_are_lowercase_unique_within_a_language_and_fit_the_token_wi
                 surface.chars().count() <= TrickLexicon::MAX_SURFACE_CHARS,
                 "{surface:?} is longer than the typed-token window"
             );
-            // Keyed on the AUTHORED string, not its fold: `siéntate` beside
-            // `sientate` is the marks-required idiom (two strings, one key),
-            // but the very same string twice in one language is a slip.
+            // Keyed on the authored string: `siéntate` beside `sientate` is the marks-required
+            // idiom (two strings, one key); the same string twice in one language is a slip.
             assert!(
                 seen.insert((row.lang.clone(), surface.to_string())),
                 "{surface:?} is listed twice in language {:?}",
@@ -240,9 +234,8 @@ fn listing_rows_are_grouped_by_language_with_tricks_then_vocatives_then_fillers(
     }
     assert_grouped(&TrickLexicon::all_rows());
 
-    // The synthetic twin: a document that INTERLEAVES languages inside each
-    // array still lists language by language, first appearance first, and
-    // keeps each array's file order inside a language.
+    // A document that interleaves languages inside each array still lists language by language,
+    // first appearance first, keeping each array's file order within a language.
     let src = r#"
         [[trick]]
         id = "sit"
@@ -284,10 +277,9 @@ fn listing_rows_are_grouped_by_language_with_tricks_then_vocatives_then_fillers(
 
 // ---------------------------------------------------- data: the word laws ----
 
-/// Executables, shell builtins and everyday openers of a message to a coding
-/// assistant: words that START ordinary lines. None of them may be a PLAIN
-/// word — a plain word flashes and latches the pet at its trailing space — so
-/// each is either absent from the vocabulary, an address word, or a filler.
+/// Executables, shell builtins and everyday openers of a message to a coding assistant. None may
+/// be a plain word (a plain word flashes and latches the pet at its trailing space), so each is
+/// absent, an address word, or a filler.
 const LINE_OPENERS: &[&str] = &[
     // Commands and builtins that are English words (coreutils, BSD / macOS
     // userland, the shells, the usual developer toolbox).
@@ -313,9 +305,8 @@ const LINE_OPENERS: &[&str] = &[
     "back", "gotcha", "yikes", "wow", "hmm", "oops",
 ];
 
-/// The line openers that are PLAIN anyway, each with the reason the misfire
-/// is accepted. The listener's tentative tier is what pays for them: an
-/// unaddressed fire is revoked the moment the line turns into prose.
+/// The line openers that are plain anyway, each with the reason the misfire is accepted: the
+/// listener's tentative tier revokes an unaddressed fire once the line turns into prose.
 const PLAIN_ON_PURPOSE: &[(&str, &str)] = &[
     (
         "sit",
@@ -382,8 +373,7 @@ fn no_plain_english_word_opens_ordinary_command_lines_or_chat_messages() {
          reason:\n  {}",
         offenders.join("\n  ")
     );
-    // Two-sided: an exception that is no longer an opener, or no longer a
-    // plain word, is a stale sentence in this file.
+    // A stale excuse (no longer an opener, or no longer plain) fails too.
     for (word, _reason) in PLAIN_ON_PURPOSE {
         assert!(
             openers.contains(word),
@@ -396,13 +386,10 @@ fn no_plain_english_word_opens_ordinary_command_lines_or_chat_messages() {
     }
 }
 
-/// THE `sleep 5` RULING. `sleep` is a shell command people type by hand, and
-/// it is PLAIN anyway: a direct request is answered every time, and the
-/// listener's tentative tier makes the collision cheap — `sleep 5` blinks the
-/// word and is revoked at `5`; the pet never moves. The same
-/// holds for every iconic bare verb. Pinned by name because "make `sleep` an
-/// address word" is the first thing a future editor will want to do, and it
-/// turns the feature's most obvious command into one that silently fails.
+/// `sleep` is a shell command people type by hand, and plain anyway: a direct request is answered
+/// every time, and the listener's tentative tier makes the collision cheap (`sleep 5` blinks the
+/// word and is revoked at `5`). The same holds for every iconic bare verb; as address words the
+/// feature's most obvious commands would silently fail.
 #[test]
 fn the_iconic_bare_verbs_answer_unaddressed_and_the_everyday_openers_do_not() {
     let en = TrickLexicon::shared_en();
@@ -435,9 +422,8 @@ fn the_iconic_bare_verbs_answer_unaddressed_and_the_everyday_openers_do_not() {
     }
 }
 
-/// A surface typed at a real shell is often SUBMITTED. An apostrophe opens a
-/// `quote>` continuation there, and bare `zzz` is a real suspend command on
-/// FreeBSD / OpenBSD / Void — so neither may be vocabulary, in any language.
+/// A surface typed at a shell is often submitted: an apostrophe opens a `quote>` continuation,
+/// and bare `zzz` is a suspend command on FreeBSD / OpenBSD / Void, so neither may be vocabulary.
 #[test]
 fn no_surface_would_hurt_someone_who_presses_enter() {
     for row in TrickLexicon::all_rows() {
@@ -456,8 +442,8 @@ fn no_surface_would_hurt_someone_who_presses_enter() {
     }
 }
 
-/// THE ELONGATION FOLD: a held key is still the word. On a miss only, runs
-/// of three or more identical characters collapse to two, then to one.
+/// The elongation fold: on a miss only, runs of three or more identical characters collapse to
+/// two, then to one.
 #[test]
 fn a_drawn_out_word_is_still_the_word() {
     let en = TrickLexicon::shared_en();
@@ -477,8 +463,7 @@ fn a_drawn_out_word_is_still_the_word() {
     ] {
         assert_eq!(classify(en, typed), role, "{typed:?}");
     }
-    // Two first, then one: `goood` is `good`, never `god`-shaped guessing; a
-    // doubled letter is spelling and is never touched, so a TYPO stays a miss.
+    // A doubled letter is spelling and never touched, so a typo stays a miss.
     for typed in [
         "sitt", "sitting", "sleepy", "jumpp", "kitt", "zzz", "zzzzzz", "qqq", "sss", "siiite",
         "pllaaay",
@@ -546,10 +531,8 @@ fn the_cat_speak_the_internet_knows_is_understood() {
     }
 }
 
-/// LAW 3 of the data file: a surface is one token, so a natural multi-word
-/// phrase lands only if EVERY word of it is vocabulary (the listener drops a
-/// line's purity at the first word that is not). These are the phrases the
-/// English seed was shaped around.
+/// A surface is one token, so a natural phrase lands only if every word of it is vocabulary (the
+/// listener drops a line's purity at the first word that is not).
 #[test]
 fn the_natural_phrases_are_made_of_vocabulary_words_only() {
     let en = TrickLexicon::shared_en();
@@ -588,10 +571,8 @@ fn the_natural_phrases_are_made_of_vocabulary_words_only() {
             );
         }
     }
-    // ... and the words that turn a command into a sentence are NOT
-    // vocabulary, so these lines lose their purity and a tentative fire is
-    // revoked: `stretch the image`, `sit tight`, `roll back`, `look at`,
-    // `play with`, `jump to line`, `npm run build`, `git fetch`.
+    // Words that turn a command into a sentence are not vocabulary, so the line goes impure and a
+    // tentative fire is revoked (`stretch the image`, `sit tight`, `npm run build`).
     for word in [
         "the", "tight", "back", "at", "with", "line", "npm", "build", "git",
     ] {
@@ -688,15 +669,13 @@ fn the_cached_english_table_is_the_default_configuration() {
 
 // ------------------------------------------- data: the cross-table laws ----
 
-/// The ONLY trick surfaces allowed to be shared sparkle-lexicon surfaces: the
-/// cat's own voice, and only as feline surfaces under `speak`.
+/// The only trick surfaces that may be sparkle-lexicon surfaces: the cat's own voice, as feline
+/// surfaces under `speak`.
 const SHARED_VOICE: &[&str] = &["meow", "mew", "miaow"];
 
-/// How a surface classifies under the all-languages SHARED sparkle lexicon,
-/// by either route the screen scanner has: the whole-token lookup (spaced
-/// scripts, with its possessive / clitic fallbacks) or a scan of the surface
-/// with every opt-in on (which is how a no-space compound, or a lone
-/// ideograph, would be found on screen).
+/// How a surface classifies under the all-languages sparkle lexicon, by either route the screen
+/// scanner has: the whole-token lookup (with its possessive / clitic fallbacks) or a scan with
+/// every opt-in on (how a no-space compound or lone ideograph is found on screen).
 fn shared_class(shared: &Lexicon, surface: &str) -> Option<Class> {
     let opts = ScanOptions {
         allow_bare_cat: true,
@@ -708,12 +687,11 @@ fn shared_class(shared: &Lexicon, surface: &str) -> Option<Class> {
         .or_else(|| shared.scan(surface, &opts).first().map(|m| m.class))
 }
 
-/// ONE WORD, ONE EMITTER. A typed trick word flashes rainbow where it was
-/// typed; a shared-lexicon surface is ALSO decorated by the screen scanner
-/// when the shell echoes it. So no trick / address / filler surface may be a
-/// shared surface of ANY class in ANY language (`bat`, `duck`, `fish`, `woof`,
-/// `miau` are out), except the cat's own voice. Vocatives are exempt: they
-/// are the feline / canine words on purpose and never flash.
+/// One word, one emitter: a typed trick word flashes where it was typed, and a shared-lexicon
+/// surface is also decorated by the screen scanner when the shell echoes it. So no trick, address
+/// or filler surface may be a shared surface of any class in any language (`bat`, `duck`, `fish`,
+/// `woof`, `miau`), except the cat's own voice. Vocatives are exempt: they are the feline / canine
+/// words on purpose and never flash.
 #[test]
 fn no_trick_address_or_filler_surface_is_a_shared_sparkle_lexicon_surface() {
     let shared = Lexicon::with_languages(&["all"]);
@@ -773,13 +751,11 @@ fn nothing_in_the_vocabulary_is_profanity_in_any_language() {
     }
 }
 
-/// English dictionary words that an UNGATED non-English row may still claim as
-/// a PLAIN word, each with a reason. "English dictionary" here is Webster's
-/// Second (the system word list): every entry below is a headword nobody
-/// types at the start of a line, and most are THE command of their language,
-/// which a gate would switch off for every default user. A word English
-/// speakers really do type (`main`, `gel`, `vino`, `pied`) is never excused —
-/// it rides a gated sibling row instead.
+/// English dictionary words an ungated non-English row may still claim as a plain word, each with
+/// a reason: headwords of the system word list (Webster's Second) that nobody types at the start
+/// of a line, most of them their language's command, which a gate would switch off for every
+/// default user. A word English speakers really type (`main`, `gel`, `vino`, `pied`) is never
+/// excused; it rides a gated sibling row.
 const DICTIONARY_EXCUSED: &[(&str, &str)] = &[
     (
         "aport",
@@ -1013,11 +989,9 @@ const DICTIONARY_EXCUSED: &[(&str, &str)] = &[
     ),
 ];
 
-/// The words of `dictionary` that the DEFAULT configuration (`["en"]`: every
-/// ungated row of every language, no gated row) classifies although no
-/// English row authored them — i.e. an ungated foreign surface that is also
-/// an English word. Judged through `classify`, so a marks-required surface
-/// (fr `couché`) is correctly NOT charged with its bare skeleton (`couche`).
+/// The words of `dictionary` that the default configuration (`["en"]`: every ungated row, no gated
+/// row) classifies as a plain trick although no English row authored them. Judged through
+/// `classify`, so a marks-required surface (fr `couché`) is not charged with its bare skeleton.
 fn ungated_foreign_surfaces_that_are_english_words<'a>(
     rows: &[TrickRow],
     default_config: &TrickLexicon,
@@ -1035,11 +1009,9 @@ fn ungated_foreign_surfaces_that_are_english_words<'a>(
             if w.is_empty() || !w.is_ascii() || english.contains(&w) {
                 return None;
             }
-            // Only a PLAIN word is charged: it is the one role that fires by
-            // itself, at the first space of an ordinary English line. A foreign
-            // address word still needs the pet named, and a foreign vocative or
-            // filler fires nothing at all — gating THOSE would only switch
-            // `bravo`, `la` and `gato` off for the people who mean them.
+            // Only a plain word fires by itself at the first space of an English line; gating a
+            // foreign address word, vocative or filler would only switch `bravo`, `la` and `gato`
+            // off for the people who mean them.
             match classify(default_config, &w) {
                 Some(
                     role @ TrickRole::Trick {
@@ -1056,15 +1028,11 @@ fn ungated_foreign_surfaces_that_are_english_words<'a>(
     offenders
 }
 
-/// LAW 7. Indonesian `main` (play), Turkish `gel` (come), German `spring`
-/// (jump) are English words too, and as ungated PLAIN words they would blink
-/// at the first space of every English line that opens with them. The remedy
-/// is the sparkle lexicon's: `gated = true` — for the words English speakers
-/// really type. The system word list is Webster's Second, though, a quarter
-/// of a million headwords deep: `assis`, `salta`, `sov` are in it and no one
-/// alive opens a line with them, while gating them would switch THE sit
-/// command of French and Swedish off for every default user. Those ride
-/// [`DICTIONARY_EXCUSED`], each with its reason; the gate stays for the rest.
+/// Indonesian `main` (play), Turkish `gel` (come), German `spring` (jump) are English words too:
+/// as ungated plain words they would blink at the first space of every English line opening with
+/// them, so such rows are `gated = true`. The system word list also holds headwords nobody opens
+/// a line with (`assis`, `salta`, `sov`), where a gate would switch a language's command off for
+/// every default user; those are [`DICTIONARY_EXCUSED`], each with its reason.
 #[test]
 fn no_ungated_non_english_surface_is_an_english_dictionary_word() {
     let raw = crate::web2_words();
@@ -1087,8 +1055,8 @@ fn no_ungated_non_english_surface_is_an_english_dictionary_word() {
     );
 }
 
-/// The synthetic twin of the gate above, with its own three-word dictionary,
-/// so the detector is proven to FIRE whatever the embedded file holds.
+/// The synthetic twin of the gate above, with its own three-word dictionary, so the detector is
+/// proven to fire whatever the embedded file holds.
 #[test]
 fn the_dictionary_gate_catches_an_ungated_foreign_english_word_and_clears_a_gated_one() {
     let doc = |gated: bool| {
@@ -1138,17 +1106,15 @@ fn the_dictionary_gate_catches_an_ungated_foreign_english_word_and_clears_a_gate
 
 // ------------------------------------------------------- data: coverage ----
 
-/// The roster the multilingual data is expected to grow into. NOT asserted
-/// present — this test runs over the languages the file actually holds — only
-/// reported, so the run says honestly how far the data has come.
+/// The roster the data is expected to grow into: reported, not asserted, since the test runs
+/// over the languages the file holds.
 const ROSTER: &[&str] = &[
     "en", "es", "fr", "de", "it", "pt", "nl", "sv", "pl", "ru", "uk", "tr", "ar", "he", "fa", "hi",
     "bn", "id", "vi", "th", "zh", "ja", "ko",
 ];
 
-/// `(lang, trick code, why)` — a trick a language honestly cannot reach with
-/// one natural typed token. Two-sided: a listed gap that IS reachable fails,
-/// so the table can only describe reality.
+/// `(lang, trick code, why)`: a trick a language cannot reach with one natural typed token. A
+/// listed gap that is reachable fails.
 const CORE_GAPS: &[(&str, &str, &str)] = &[];
 
 /// Whether `lang` reaches `trick` when the user has listed that language:
@@ -1160,13 +1126,9 @@ fn reaches(rows: &[TrickRow], lex: &TrickLexicon, lang: &str, trick: Trick) -> b
         .any(|s| matches!(classify(lex, s), Some(TrickRole::Trick { trick: t, .. }) if t == trick))
 }
 
-/// EVERY trick, in EVERY language the file holds — not a core four. A trick
-/// added to the enum and authored in English only is NOT a multilingual
-/// vocabulary with one gap in it: the word a French or Korean speaker types
-/// for that trick is almost always still sitting in some OTHER trick's row,
-/// so their request classifies, fires, and is answered with the wrong
-/// performance while every test stays green (`sing` once sat in `speak`'s
-/// rows in 44 languages).
+/// Every trick in every language the file holds. A trick authored only in English is not one gap:
+/// the word another language's speaker types for it usually still sits in some other trick's
+/// row, so the request fires the wrong performance while every other test stays green.
 #[test]
 fn every_language_in_the_file_reaches_every_trick() {
     let rows = TrickLexicon::all_rows();
@@ -1382,9 +1344,8 @@ fn a_surface_claimed_under_two_roles_keeps_the_first_and_says_so() {
     assert_eq!(classify(&lex, "loaf"), plain(Trick::Down));
     assert_eq!(classify(&lex, "kitty"), Some(TrickRole::Vocative));
     assert_eq!(classify(&lex, "please"), Some(TrickRole::Filler));
-    // ... and every loss is named: down (other trick), sit (plain vs
-    // address IS another role), loaf (trick vs vocative), kitty (vocative vs
-    // filler).
+    // Every loss is named: down (other trick), sit (plain vs address is another role), loaf
+    // (trick vs vocative), kitty (vocative vs filler).
     assert_eq!(lex.conflicts().len(), 4, "{:#?}", lex.conflicts());
     for word in ["\"down\"", "\"sit\"", "\"loaf\"", "\"kitty\""] {
         let c = conflict_naming(&lex, word).unwrap_or_else(|| panic!("no conflict names {word}"));
@@ -1392,10 +1353,9 @@ fn a_surface_claimed_under_two_roles_keeps_the_first_and_says_so() {
     }
 }
 
-/// Claims are resolved in LISTING order — language groups in first-appearance
-/// order — so the language that opens the file wins a cross-language claim
-/// with ALL of its rows, wherever they sit in the arrays. That is why the
-/// embedded file must open with English (pinned above).
+/// Claims resolve in listing order (language groups in first-appearance order), so the language
+/// that opens the file wins a cross-language claim with all its rows, wherever they sit. Hence
+/// `english_is_the_first_language_in_the_file`.
 #[test]
 fn a_cross_language_claim_is_won_by_the_language_that_opens_the_file() {
     // German opens this document, so German's plain `spring` beats English's
@@ -1414,8 +1374,8 @@ fn a_cross_language_claim_is_won_by_the_language_that_opens_the_file() {
     assert_eq!(classify(&lex, "spring"), plain(Trick::Jump));
     assert_eq!(lex.conflicts().len(), 1);
 
-    // English opens this one with an unrelated row. Its `spring` row still
-    // comes AFTER the German row in the array — and wins.
+    // English opens this one with an unrelated row; its `spring` row still comes after the
+    // German row in the array, and wins.
     let en_first = r#"
         [[trick]]
         id = "sit"
@@ -1513,8 +1473,8 @@ fn a_cjk_row_takes_no_space_script_surfaces_only_and_matches_the_whole_run() {
     assert_eq!(classify(&lex, "앉아"), plain(Trick::Sit));
     assert_eq!(classify(&lex, "นั่ง"), plain(Trick::Sit));
     assert_eq!(classify(&lex, "ねこ"), Some(TrickRole::Vocative));
-    // WHOLE-RUN EQUALITY, no maximal munch: a longer run that merely contains
-    // (or starts with) a surface is a different word.
+    // Whole-run equality, no maximal munch: a longer run that contains or starts with a surface
+    // is a different word.
     for run in ["坐下来", "请坐下", "坐", "下", "앉아서", "앉", "ねこちゃん"] {
         assert_eq!(classify(&lex, run), None, "{run:?}");
     }
@@ -1550,16 +1510,16 @@ fn a_single_character_no_space_surface_always_needs_the_vocative() {
         cjk = true
     "#;
     let lex = compile(src, &["all"]);
-    // Authored PLAIN, reported as needing the vocative.
+    // Authored plain, reported as needing the vocative.
     assert_eq!(classify(&lex, "坐"), address(Trick::Sit));
     assert_eq!(classify(&lex, "跳"), address(Trick::Jump));
     // A compound keeps the list it was authored in.
     assert_eq!(classify(&lex, "坐下"), plain(Trick::Sit));
     assert_eq!(classify(&lex, "坐好"), address(Trick::Sit));
-    // The law is about TRICK words; a one-character vocative is a vocative.
+    // The law is about trick words; a one-character vocative is a vocative.
     assert_eq!(classify(&lex, "猫"), Some(TrickRole::Vocative));
-    // zh lists 跳 as plain and ja as address: once the lone-ideograph law has
-    // spoken those are the SAME role, so it is a merge, not a conflict.
+    // zh lists 跳 as plain and ja as address; under the lone-ideograph law those are the same
+    // role, so they merge.
     assert!(lex.conflicts().is_empty(), "{:?}", lex.conflicts());
 }
 
@@ -1612,8 +1572,8 @@ fn a_marked_surface_needs_marked_typing_unless_the_bare_spelling_is_listed() {
     "#;
     let lex = compile(src, &["all"]);
     assert!(lex.conflicts().is_empty(), "{:?}", lex.conflicts());
-    // fr `couché` folds to the bare-ASCII key `couche` — which is another
-    // French word (a layer, a nappy). Only MARKED typing reaches it.
+    // fr `couché` folds to the bare-ASCII key `couche`, another French word (a layer, a nappy):
+    // only marked typing reaches it.
     assert_eq!(classify(&lex, "couché"), plain(Trick::Down));
     assert_eq!(classify(&lex, "COUCHÉ"), plain(Trick::Down));
     assert_eq!(classify(&lex, "couche\u{0301}"), plain(Trick::Down));
@@ -1669,23 +1629,21 @@ fn gated_rows_stay_silent_until_their_language_is_listed_and_english_is_never_ga
             Some(TrickRole::Vocative),
             "{config:?}"
         );
-        // The gated English row loaded anyway — and the file is told off.
+        // The gated English row loads anyway and is reported.
         assert_eq!(classify(&lex, "sit"), plain(Trick::Sit), "{config:?}");
         assert_eq!(lex.conflicts().len(), 1, "{:?}", lex.conflicts());
         assert!(conflict_naming(&lex, "English is never gated").is_some());
     }
 }
 
-/// The data-driven twin of the gate test (vacuous for an English-only file):
-/// under the default configuration a gated row's surfaces are silent unless
-/// an ungated row claims the same key.
+/// The data-driven twin of the gate test: under the default configuration a gated row's surfaces
+/// are silent unless an ungated row claims the same key.
 #[test]
 fn gated_rows_of_the_embedded_file_are_silent_by_default() {
     let rows = TrickLexicon::all_rows();
     let default_config = TrickLexicon::with_languages(&["en"]);
-    // Keys an UNGATED row compiles: the raw spelling (no-space rows) and the
-    // fold (spaced rows). A gated surface sharing one of them loads through
-    // that other row, which is not a leak.
+    // Keys an ungated row compiles: the raw spelling (no-space rows) and the fold (spaced rows).
+    // A gated surface sharing one loads through that row, which is not a leak.
     let ungated: HashSet<String> = rows
         .iter()
         .filter(|row| !row.gated)
@@ -1765,12 +1723,10 @@ fn a_row_without_a_language_is_a_conflict_and_a_typo_in_a_key_is_a_parse_error()
 
 // ------------------------------------------- the shared code-context set ----
 
-/// `is_code_adjacent_punct` is exported so the typed-line listener draws the
-/// code / prose line exactly where the screen scanner draws it. This pins the
-/// export AGAINST THE SCANNER'S BEHAVIOUR, not against a restated list: for
-/// every ASCII punctuation character, the scanner refuses `<c>kitty` exactly
-/// when the exported predicate (or the scanner's one extra left rule, a
-/// leading `-` flag) says so.
+/// The typed-line listener uses the exported `is_code_adjacent_punct` to draw the code / prose
+/// line where the screen scanner does. Pinned against the scanner's behaviour: for every ASCII
+/// punctuation character, the scanner refuses `<c>kitty` exactly when the predicate (or its one
+/// extra left rule, a leading `-`) says so.
 #[test]
 fn the_exported_code_context_set_is_the_one_the_scanner_uses() {
     let shared = Lexicon::builtin();

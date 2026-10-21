@@ -39,6 +39,33 @@ pub fn control_sock(root: &Path) -> [std::ffi::OsString; 2] {
     ]
 }
 
+/// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD; a socket path at or over
+/// this is refused before it can fail deep in `bind` or `connect`.
+const MAX_SOCK_PATH: usize = 100;
+
+/// Whether a unix socket at `sock` fits `sun_path` as a client dials it: on its
+/// CANONICAL spelling, which a client that resolves the path dials (`/var` and
+/// `/tmp` are links into `/private` on macOS, eight bytes longer than either
+/// spelling a test boots with). The longest ancestor that exists is resolved
+/// and the rest rejoined, so a world can be measured before it is made.
+#[allow(dead_code)]
+pub fn sock_fits(sock: &Path) -> bool {
+    let mut base = sock;
+    let mut rest = Vec::new();
+    let resolved = loop {
+        if let Ok(canonical) = std::fs::canonicalize(base) {
+            break canonical;
+        }
+        let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+            break base.to_path_buf();
+        };
+        rest.push(name);
+        base = parent;
+    };
+    let dialled = rest.iter().rev().fold(resolved, |p, name| p.join(name));
+    dialled.as_os_str().len() < MAX_SOCK_PATH
+}
+
 /// The automatic lanes, switched off the way Settings switches them off: `[update]
 /// enabled = false` (Check for updates automatically) with `auto_apply = false`,
 /// `[packages] enabled = false` (Automatic updates), the `[machine]` settings left

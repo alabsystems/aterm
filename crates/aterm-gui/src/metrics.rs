@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Process-global render/latency counters, surfaced over the control socket as the
-//! `metrics` verb so an AI driving aterm can MEASURE the terminal's responsiveness —
-//! and DETECT lag — directly, instead of scraping the `$ATERM_TRACE_LATENCY` stderr
-//! log or eyeballing it.
+//! Process-global render/latency counters, read over the control socket by the `metrics`
+//! verb so a driver can measure responsiveness and detect lag directly.
 //!
 //! aterm runs exactly one [`crate::App`] / event loop per process, so one `static`
 //! root, [`METRICS`], is sufficient and avoids threading an `Arc` through the
@@ -16,7 +14,7 @@
 //! these are monotone diagnostics, never used for synchronization — except the
 //! frame count's Release/Acquire pair, which publishes the startup sample.
 //!
-//! ## Detecting lag (not just measuring a moment)
+//! ## Reading the counters
 //!
 //! A single "last frame" number can't reveal sustained jank, so this also keeps the
 //! WORST-CASE and a SLOW-FRAME COUNT since the last [`reset`]:
@@ -117,11 +115,10 @@
 //!   session's own share is `status journal_bytes=`; `pressure` says what the
 //!   shed did.
 //!
-//! A driver detects lag without OS profilers: `metrics reset`, drive the workload,
-//! then `metrics` — if `slow_frames > 0`, or `max_frame_render_ms` is large, or
-//! `backend=cpu` under heavy output, the terminal is lagging.
+//! To detect lag: `metrics reset`, drive the workload, then `metrics`. `slow_frames > 0`,
+//! a large `max_frame_render_ms`, or `backend=cpu` under heavy output means lag.
 //!
-//! ## Two rules this file keeps
+//! ## Two rules
 //!
 //! **An instrument that perturbs the system under test proves nothing.** A
 //! counter here must describe ATERM, not the act of measuring it. Where the two
@@ -407,7 +404,8 @@ window_ledger! {
     /// menu-bar glance, a need publication, the transcript apply's holds).
     pub(crate) struct InputLedger {
         // ---- Input→present latency: the slice a HUMAN feels when typing ----------
-        // (key arrival → the next CONTENT present).
+        // (key arrival → the next CONTENT present, or the present that first
+        // shows the key's proven prediction: PREDICTIONS below).
         //
         // HONESTY BOUNDS: (1) a keystroke that produces NO output (`stty -echo`
         // password prompts, an ignoring app) must not poison the metric when
@@ -443,6 +441,18 @@ window_ledger! {
         // page's answer on glass closes it into this same distribution
         // ([`record_native_content_present`]). Typing latency is one figure
         // whichever surface the keys land in.
+        //
+        // PREDICTIONS. A key whose effect predictive echo shows is on glass
+        // before its echo, as a native page's answer is: a present with no
+        // output that painted the predictor's overlay whole, under its proof
+        // (`predictive_echo = "adaptive"`: every op it shows passed the display
+        // gate), closes the slices of the keys whose prediction it shows
+        // ([`note_prediction_shown`]), and `predicted` counts them. A key that
+        // armed no op, whose op is still dark, or that `always` shows with no
+        // proof waits for its content present, as with prediction off; so do
+        // the keys after it. Over a slow link `input_*` is then the press to
+        // the key's prediction on glass for the keys shown early, and the
+        // press to the echo for the rest; `echo_*` still times the round trip.
         pub(crate) input: Dist,
         /// When the worst `input` slice was booked (`now_ns`).
         pub(crate) input_at: Last,
@@ -459,6 +469,12 @@ window_ledger! {
         /// Keystrokes a full edge ring could not hold (see [`INPUT_EDGE_RING`]).
         /// Their slices are missing from `input`; this count says how many.
         pub(crate) edges_dropped: Counter,
+        /// Of the slices in `input`, those a PREDICTION closed: the key's
+        /// slice ended at the present that first painted its proven
+        /// prediction, before its echo (the PREDICTIONS note on `input`).
+        /// The rest of `n_input` closed at a content present, as with
+        /// prediction off, so an A/B across prediction modes reads this too.
+        pub(crate) predicted: Counter,
         /// Hardware-key arrival → completed PTY write (`key_write`): the
         /// UI-thread key→write component inside `input`, from the BACKDATED
         /// arrival (see the latency trace below `note_grid_committed`).
@@ -1028,16 +1044,13 @@ impl Live {
     }
 }
 
-/// How long after an episode ENDS a present-latency sample is still suspect.
+/// How long after an episode ends a present-latency sample is still suspect.
 ///
-/// The stamp being consumed is per SESSION, and several sessions can hold
-/// stamps armed while the window was off glass; the first present drains the
-/// visible set, but the drop→resume seam is not instantaneous and a park can
-/// re-arm between two of them. One second bounds that drain generously while
-/// staying far below the shortest interval anyone calls a stall, and — unlike a
-/// latch consumed by the next present — it cannot be defeated by a blink
-/// repaint arriving first. Every excluded sample is counted, so an over-broad
-/// tail is visible as `present_tainted` rather than as a missing measurement.
+/// Stamps are per session and several can be armed while the window was off glass; the
+/// drop→resume seam is not instantaneous and a park can re-arm between them. One second
+/// bounds that drain, stays far below any stall, and (unlike a latch consumed by the next
+/// present) cannot be defeated by a blink repaint arriving first. Excluded samples count
+/// in `present_tainted`.
 const PRESENT_TAINT_TAIL_NS: u64 = 1_000_000_000;
 
 /// A pending input slice older than this is a no-echo session (password
@@ -1503,6 +1516,9 @@ pub(crate) struct WindowPresentState {
     /// gap the worst present latency is witnessed against, and the slow-present
     /// line's `prev present`.
     last_present_ns: u64,
+    /// The frame being drawn painted the predictor's overlay whole, under its
+    /// proof, through this op ([`note_prediction_shown`]); taken by its present.
+    shown_through: Option<u64>,
 }
 
 /// The present-side state that belongs to the whole process, owned by the
@@ -1592,6 +1608,9 @@ struct PresentBooking {
     /// in-cap edges armed at or after the reset epoch. The session-routed
     /// stamp is not counted.
     input_booked: u32,
+    /// Of `input_booked`, the keys a proven prediction this present painted
+    /// showed before their echo ([`note_prediction_shown`]).
+    input_predicted: u32,
 }
 
 /// Record one successful application present. `latency_ns` is the
@@ -1632,6 +1651,8 @@ pub(crate) fn record_present(
     if booking.output_tainted.is_some() {
         crate::work_counts::present_sample_booked(capture_forced);
     }
+    #[cfg(test)]
+    crate::work_counts::input_slices_booked(booking.input_booked, booking.input_predicted);
     #[cfg(not(test))]
     let _ = booking;
 }
@@ -1657,7 +1678,8 @@ impl Metrics {
         // Close the RESIZE→PRESENT slice on ANY successful present, not only a
         // content one: what ends the compositor's rescale is a frame at the new
         // size reaching the WSI, whatever drew it. (The input slice below is
-        // deliberately content-gated instead — a blink repaint is not an echo.)
+        // deliberately content-gated instead — a blink repaint is not an echo
+        // — but for the keys a frame shows a proven prediction of, below.)
         if let Some(resize_stamp) = present.resize_stamp.take() {
             let d = now.saturating_sub(resize_stamp);
             if d <= RESIZE_SLICE_CAP_NS {
@@ -1671,6 +1693,7 @@ impl Metrics {
                 .and_then(|w| clock.gap_since(w.last_present_ns)),
             frame_gap_ns: clock.gap_since(observer.last_present_ns),
             input_booked: 0,
+            input_predicted: 0,
         };
         if let Some(tainted) = booking.output_tainted {
             // HONESTY SPLIT (item 10): an output→present slice measured while the
@@ -1738,6 +1761,29 @@ impl Metrics {
                 if d <= INPUT_SLICE_CAP_NS {
                     self.window.input.book_present(d, now);
                 }
+            }
+        }
+        // A present with no output that painted the predictor's overlay whole,
+        // under its proof ([`note_prediction_shown`]): the keys whose prediction
+        // it shows are on glass, so their slices close here, as a native page's
+        // answer closes its keys', and each is counted in `predicted`. A content
+        // present above drained every key already; either way the mark is this
+        // frame's alone.
+        if let Some(w) = window.as_deref_mut() {
+            let shown = w.shown_through.take();
+            if booking.output_tainted.is_none()
+                && let Some(through) = shown
+            {
+                w.pending_input
+                    .drain_shown(now, clock.epoch, through, |edge| {
+                        if edge.before_epoch {
+                            return;
+                        }
+                        self.window.input.book_present(edge.slice_ns, now);
+                        booking.input_booked += 1;
+                        self.window.input.predicted.inc();
+                        booking.input_predicted += 1;
+                    });
             }
         }
         let _ = present.render.record(render_ns);
@@ -2432,6 +2478,10 @@ struct InputEdge {
     /// When the edge was armed — compared against the last [`reset`], because a
     /// backdated arrival can precede a reset the key itself followed.
     armed_ns: u64,
+    /// The predictor's op the key armed (`Predictor::newest_op`), when it armed
+    /// one: a present that shows the prediction through it closes the slice
+    /// ([`note_prediction_shown`]).
+    op: Option<u64>,
 }
 
 /// One window's pending input→present EDGES: every unpresented keystroke routed
@@ -2445,6 +2495,10 @@ struct InputEdge {
 pub(crate) struct PendingInputStamp {
     edges: [InputEdge; INPUT_EDGE_RING],
     len: usize,
+    /// The newest edge is the key being handled and is not yet tagged: set by
+    /// an [`arm`](Self::arm) that held the key, cleared by a refused one, by
+    /// a drain and by [`tag_newest`](Self::tag_newest).
+    fresh: bool,
 }
 
 impl PendingInputStamp {
@@ -2459,14 +2513,69 @@ impl PendingInputStamp {
             self.evict_aged(armed_ns);
         }
         let Some(slot) = self.edges.get_mut(self.len) else {
+            self.fresh = false;
             return false;
         };
         *slot = InputEdge {
             arrival_ns: arrival_ns.max(1),
             armed_ns,
+            op: None,
         };
         self.len += 1;
+        self.fresh = true;
         true
+    }
+
+    /// Tag the key just armed with the predictor's op it armed, or settle it
+    /// as one that armed none (`None`): the press path, right after the
+    /// predictor took the key. A key the full ring refused tags nothing: the
+    /// ring's newest edge is then another key's.
+    pub(crate) fn tag_newest(&mut self, op: Option<u64>) {
+        if self.fresh
+            && let Some(edge) = self
+                .len
+                .checked_sub(1)
+                .and_then(|newest| self.edges.get_mut(newest))
+        {
+            edge.op = op;
+        }
+        self.fresh = false;
+    }
+
+    /// Drain, at a present that showed the prediction through op `through`,
+    /// the leading run of edges whose key armed an op up to it, oldest first,
+    /// as [`drain_into`](Self::drain_into) drains them; the first key it does
+    /// not show (one that armed no op, or a newer op) and every key after it
+    /// stay pending, in order.
+    fn drain_shown(
+        &mut self,
+        now_ns: u64,
+        epoch: u64,
+        through: u64,
+        mut f: impl FnMut(DrainedEdge),
+    ) {
+        let shown = self.edges[..self.len]
+            .iter()
+            .take_while(|edge| edge.op.is_some_and(|op| op <= through))
+            .count();
+        if shown == 0 {
+            return;
+        }
+        for edge in &self.edges[..shown] {
+            let slice_ns = now_ns.saturating_sub(edge.arrival_ns);
+            if slice_ns <= INPUT_SLICE_CAP_NS {
+                f(DrainedEdge {
+                    slice_ns,
+                    before_epoch: edge.armed_ns < epoch,
+                });
+            }
+        }
+        self.edges.copy_within(shown..self.len, 0);
+        for edge in &mut self.edges[self.len - shown..self.len] {
+            *edge = InputEdge::default();
+        }
+        self.len -= shown;
+        self.fresh &= self.len > 0;
     }
 
     /// Drop every edge whose slice would already exceed `INPUT_SLICE_CAP_NS` at
@@ -2510,6 +2619,7 @@ impl PendingInputStamp {
             *edge = InputEdge::default();
         }
         self.len = 0;
+        self.fresh = false;
     }
 
     /// Every drained edge, in order (tests).
@@ -2588,6 +2698,33 @@ impl Metrics {
 /// key a full ring refuses is counted in `input_edges_dropped`.
 pub(crate) fn note_window_input(pending: &mut PendingInputStamp) {
     METRICS.note_window_input(pending, now_ns());
+}
+
+/// The frame being drawn in this window shows the predictor's overlay whole
+/// and under its proof, through op `through` (`Predictor::shown_through`), or
+/// shows none (`None`; the render paths' `closes_input_through`): its present
+/// closes the slice of every key whose prediction it shows, before that key's
+/// echo, as a native page's present closes the keys its answer shows (the
+/// PREDICTIONS note on `InputLedger::input`), and counts it in
+/// `input_predicted`. The mark is that one frame's: the render paths set it
+/// at every frame they compose. `op_is_pending` reads that same predictor:
+/// cancelled or retired ops below `through` are not shown by its overlay.
+pub(crate) fn note_prediction_shown(
+    window: &mut WindowPresentState,
+    through: Option<u64>,
+    mut op_is_pending: impl FnMut(u64) -> bool,
+) {
+    if through.is_some() {
+        // The frame's numeric prefix can skip a cancelled op. Its key stays
+        // pending for a content present, as does an unmodelled key, and it
+        // stops prediction booking of every key after it.
+        for edge in &mut window.pending_input.edges[..window.pending_input.len] {
+            if edge.op.is_some_and(|op| !op_is_pending(op)) {
+                edge.op = None;
+            }
+        }
+    }
+    window.shown_through = through;
 }
 
 /// The exact non-geometric inputs a native input changed. Lifecycle identity
@@ -2697,19 +2834,16 @@ pub(crate) fn record_native_content_present(
     METRICS.record_native_content_present(&mut taken.edges, now_ns());
 }
 
-/// Stamp the arrival of user input bound for the PTY that names a SESSION but no
-/// window (a control `send`/`feed` to a background session, a controller host
-/// write). Keeps the OLDEST unpresented arrival — the worst case is the honest
-/// one — so a burst does not shrink the measured slice. Any window's content
-/// present closes it; window-routed keys use [`note_window_input`] instead.
+/// Stamp the arrival of PTY-bound input that names a session but no window (a control
+/// `send`/`feed` to a background session, a controller host write), keeping the oldest
+/// unpresented arrival; any window's content present closes it. Window-routed keys use
+/// [`note_window_input`].
 ///
-/// INHERITS the pending TRUE key arrival when one is armed (macOS backdates it
-/// by the NSEvent queue age — see [`note_key_arrival_queued`]), so
-/// `input->present` includes time the keystroke spent parked in the OS event
-/// queue: the drawable-park slice a stamp taken here (post-dequeue, mid-handler)
-/// structurally hides. Freshness-gated to 500 ms: a key that never reached the
-/// PTY (a UI shortcut leaves its stamp unconsumed — `note_pty_write` never runs)
-/// must not lend its stale arrival to a later control-verb `send`.
+/// Inherits the pending true key arrival when armed (backdated by the NSEvent queue age;
+/// see [`note_key_arrival_queued`]), so `input->present` includes time parked in the OS
+/// event queue. Freshness-gated to 500 ms: a key that never reached the PTY (a UI
+/// shortcut, where `note_pty_write` never runs) must not lend its arrival to a later
+/// control `send`.
 pub(crate) fn note_input() {
     let m = &METRICS;
     m.window
@@ -2734,13 +2868,10 @@ pub(crate) fn note_resize_arrival() {
     present.reflow_stamp.arm(now);
 }
 
-/// The engine just COMMITTED a new grid geometry (`apply_term_resize` reported a
-/// real change), closing the stale-grid slice a bounds change opened.
-///
-/// Closed here rather than at a present because this is the moment the text stops
-/// trailing the window: the rows/cols the user is reading are now the ones the
-/// window has. A commit with no bounds change behind it (the control `resize`
-/// verb, a font zoom, a config re-grid) finds no stamp and records nothing.
+/// The engine just committed a new grid geometry (`apply_term_resize` reported a real
+/// change), closing the stale-grid slice a bounds change opened: from here the rows/cols
+/// on screen match the window. A commit with no bounds change behind it (the control
+/// `resize` verb, a font zoom, a config re-grid) finds no stamp.
 pub(crate) fn note_grid_committed() {
     let present = &METRICS.window.present;
     let Some(stamp) = present.reflow_stamp.take() else {
@@ -2766,57 +2897,46 @@ pub(crate) fn note_grid_committed() {
 // remain always on.
 static LAT_TRACE_ON: OnceLock<bool> = OnceLock::new();
 
-/// Whether the latency stderr traces are armed: the per-key `KEYWRITE` line here
-/// and the per-present `output->present` line (`App::trace_latency`). A
-/// DEVELOPMENT seam (`$ATERM_TRACE_LATENCY`, [`aterm_types::dev_seam!`]): a shipped
-/// binary never logs them, and the `metrics` verb publishes the same numbers in
-/// every build.
+/// Whether the latency stderr traces are armed: the per-key `KEYWRITE` line here and the
+/// per-present `output->present` line (`present_latency_ns_with_plan`). A development seam
+/// (`$ATERM_TRACE_LATENCY`, [`aterm_types::dev_seam!`]): a shipped binary never logs them,
+/// and `metrics` publishes the same numbers in every build.
 pub(crate) fn latency_trace_on() -> bool {
     *LAT_TRACE_ON.get_or_init(|| aterm_types::dev_seam!("ATERM_TRACE_LATENCY").is_some())
 }
 
-/// Public µs view of the shared metrics clock — the SAME epoch as
-/// [`note_key_arrival`], so the VIDEO introspection's frame stamps and its
-/// input stamps subtract validly (key→frame latency by construction).
+/// Microsecond view of the metrics clock, the epoch of [`note_key_arrival_queued`], so
+/// `video` frame stamps and input stamps subtract validly.
 #[must_use]
 pub(crate) fn now_us() -> u64 {
     now_ns() / 1000
 }
 
-/// Stamp the TRUE arrival of a printable hardware keystroke (winit
-/// `KeyboardInput`, before encode/write), BACKDATED by `queue_ns` — the time the
-/// key's NSEvent sat in the OS event queue before dispatch (macOS and X11:
-/// `platform::current_event_queue_age_ns`; 0 elsewhere). The stamp lands at the
-/// HARDWARE arrival, so `key->write` (and `note_input`'s inherited
-/// `input->present` clock) finally includes queueing a parked event loop
-/// inflicted — the slice the touch-to-glass audit proved every instrument was
-/// blind to. Overwrites (keep-LATEST) so each key is measured against its OWN
-/// write, never accumulating across keys.
+/// Stamp the true arrival of a printable hardware keystroke (winit `KeyboardInput`, before
+/// encode/write), backdated by `queue_ns`, the NSEvent's time in the OS event queue
+/// (macOS and X11: `platform::current_event_queue_age_ns`; 0 elsewhere), so `key->write`
+/// and the inherited `input->present` include queueing a parked loop caused. Keep-latest:
+/// each key is measured against its own write.
 pub(crate) fn note_key_arrival_queued(queue_ns: u64) {
     METRICS.note_key_arrival_queued(queue_ns);
 }
 
-/// Disarm the key-arrival stamp: called after a key's dispatch ends WITHOUT a
-/// PTY write (`note_pty_write` never consumed it), so a later control-verb
-/// `send` can never inherit an unrelated key's arrival through [`note_input`].
-/// A no-op after a writing key (the stamp is already 0).
+/// Disarm the key-arrival stamp after a key's dispatch ends without a PTY write, so a
+/// later control `send` never inherits it through [`note_input`]. A no-op after a writing
+/// key.
 pub(crate) fn clear_key_arrival() {
     METRICS.live.lat_key.store(0, Ordering::Relaxed);
 }
 
-/// The current key's TRUE hardware arrival in ms — the same backdated stamp
-/// [`note_key_arrival_queued`] wrote — as a PEEK; [`note_pty_write`] owns the
-/// consuming swap. `None` when unarmed (a bare modifier, an IME run, a control
-/// verb's `send`, or a key whose write already ran).
+/// The current key's true hardware arrival in ms (the backdated stamp
+/// [`note_key_arrival_queued`] wrote), as a peek; [`note_pty_write`] owns the consuming
+/// swap. `None` when unarmed (a bare modifier, an IME run, a control `send`, or a key
+/// whose write already ran).
 ///
-/// This is the MELODY'S clock (the rainbow-kitty keyed seam stamps its cue
-/// with it): two keys must be heard the interval apart that the fingers
-/// struck them, not the interval their PTY writes happened to return in. It
-/// exists because the write's `swap(0)` runs BEFORE the audio push on the key
-/// path, so the push cannot read the arrival itself — the peek is taken at
-/// the cue's mint, while the stamp is still armed. Same epoch and unit as
-/// `app_render::input_clock_ms` (the metrics clock in ms, never `0`), so the
-/// two seams keep measuring one clock. One relaxed load per key.
+/// The rainbow-kitty melody's clock: two keys are heard the interval apart the fingers
+/// struck them, not the interval their writes returned in. The write's `swap(0)` runs
+/// before the audio push, so the cue's mint peeks while the stamp is armed. Same epoch
+/// and unit as `app_render::input_clock_ms` (metrics clock in ms, never 0).
 #[must_use]
 pub(crate) fn key_arrival_ms() -> Option<u32> {
     match METRICS.live.lat_key.load(Ordering::Relaxed) {
@@ -2825,32 +2945,24 @@ pub(crate) fn key_arrival_ms() -> Option<u32> {
     }
 }
 
-/// The PTY write just RETURNED (after the — on Windows blocking — `WriteFile` and
-/// the press-path `term_lock`s). Record the key→write COMPONENT already contained
-/// by the end-to-end `input_present` clock. Always recorded (cheap atomics) so the
-/// `metrics` verb can surface it; also logged under [`latency_trace_on`].
+/// The PTY write just returned (after the press-path `term_lock`s and, on Windows, the
+/// blocking `WriteFile`). Records the key→write component of `input_present`; always
+/// recorded, and logged under [`latency_trace_on`].
 pub(crate) fn note_pty_write() {
     note_pty_write_at(take_key_arrival());
 }
 
-/// CLAIM the pending key-arrival stamp without recording anything, handing it to
-/// whoever will actually perform the write.
-///
-/// The paste-ordering FIFO defers a keystroke's egress to a writer thread, so the
-/// UI thread's `note_pty_write` was consuming the arrival stamp at ENQUEUE time —
-/// recording the ~microsecond cost of pushing onto a channel and leaving the real
-/// write, which is queued behind up to the whole paste, measured by nothing. The
-/// instrument therefore reported its BEST numbers in precisely the window where a
-/// human's key→write is at its worst. Pair with [`note_pty_write_at`].
+/// Claim the pending key-arrival stamp without recording anything, for whoever performs
+/// the write. The paste-ordering FIFO defers a keystroke's egress to a writer thread;
+/// consuming the stamp at enqueue would time the channel push, not the real write queued
+/// behind the paste. Pair with [`note_pty_write_at`].
 #[must_use]
 pub(crate) fn take_key_arrival() -> u64 {
     METRICS.live.lat_key.swap(0, Ordering::Relaxed)
 }
 
-/// Record a key→write slice against an arrival stamp claimed earlier by
-/// [`take_key_arrival`] — for writes that complete OFF the UI thread. A `0` stamp
-/// (no key behind this write: a control verb, an already-consumed arrival) records
-/// nothing, exactly as the inline path's early return does.
+/// Record a key→write slice against a stamp claimed by [`take_key_arrival`], for writes
+/// that complete off the UI thread. A 0 stamp (no key behind the write) records nothing.
 pub(crate) fn note_pty_write_at(key: u64) {
     if key == 0 {
         return;
@@ -2888,25 +3000,20 @@ pub(crate) fn note_sync_armed() {
     METRICS.window.sync.holds_armed.inc();
 }
 
-/// An armed episode released because the app ended sync (`?2026l`) — the healthy
-/// release cause.
+/// An armed episode released because the app ended sync (`?2026l`): the healthy cause.
 pub(crate) fn note_sync_release_end() {
     METRICS.window.sync.releases_end.inc();
 }
 
-/// An armed episode released by the safety-valve deadline — the app went silent
-/// (or the hold machinery mis-paced) after `?2026h`. Climbing during ordinary
-/// typing = the SYNC-1 failure class.
+/// An armed episode released by the safety-valve deadline: the app went silent (or the
+/// hold mis-paced) after `?2026h`. Climbing during ordinary typing is the ~5 fps failure.
 pub(crate) fn note_sync_release_timeout() {
     METRICS.window.sync.releases_timeout.inc();
 }
 
-/// Per-window lease behind the process-wide synchronized-output hold gauge.
-///
-/// A last-writer boolean is incorrect with multiple windows (or multiple pane
-/// releases): one release can overwrite a sibling's still-active hold. Each
-/// window instead contributes at most one count, idempotently, and dropping a
-/// window releases its contribution automatically.
+/// Per-window lease behind the process-wide synchronized-output hold gauge. A last-writer
+/// boolean would let one window's release clear a sibling's active hold, so each window
+/// contributes at most one count, idempotently, released on drop.
 pub(crate) struct SyncHoldingGauge {
     held: bool,
 }
@@ -2976,7 +3083,7 @@ mod sync_holding_gauge_tests {
     }
 }
 
-/// The `perf_reduced` load-shed latch flipped (called on the EDGE only).
+/// The `perf_reduced` load-shed latch flipped (called on the edge only).
 pub(crate) fn note_shed_transition(reduced: bool) {
     METRICS.live.perf_reduced.store(reduced, Ordering::Relaxed);
     METRICS.window.sync.shed_transitions.inc();
@@ -2999,10 +3106,9 @@ pub(crate) fn note_output_wake_repost() {
     METRICS.window.sync.output_wake_reposts.inc();
 }
 
-/// Record one redraw pass's TOTAL wall time (entry → present done OR failed
-/// surface transaction), which includes the acquire/present wait `frame_render`
-/// deliberately excludes. Failed attempts are load-bearing evidence: omitting
-/// them makes the exact redraw responsible for a stall disappear from metrics.
+/// Record one redraw pass's total wall time (entry → present done or failed surface
+/// transaction), including the acquire/present wait `frame_render` excludes. Failed
+/// attempts count: omitting them would hide the very redraw responsible for a stall.
 pub(crate) fn record_redraw_total(total_ns: u64) {
     let _ = METRICS.window.redraw.total.record(total_ns);
 }
@@ -3017,38 +3123,24 @@ pub(crate) fn note_redraw_early_out() {
     METRICS.window.redraw.early_outs.inc();
 }
 
-/// The presented-path frame extraction completed: which arm refilled the
-/// snapshot (`Scoped` retains undamaged rows; `Full` is the fallback walk), and
-/// on the full arm, WHICH continuity clause refused.
-///
-/// The scoped arm's cost is unchanged (one `fetch_add`, as before); the full
-/// arm pays a second `fetch_add` on a line indexed by the cause's discriminant,
-/// which is noise beside the O(rows x cols) re-extract it just did.
+/// The presented-path frame extraction completed: which arm refilled the snapshot
+/// (`Scoped` keeps undamaged rows; `Full` is the fallback walk) and, on the full arm,
+/// which continuity clause refused.
 pub(crate) fn note_frame_refill(refill: aterm_core::render::FrameRefill) {
     METRICS.window.redraw.note_refill(refill);
 }
 
-/// A presented frame REUSED the existing snapshot: the engine had marked no
-/// damage and processed no bytes since the snapshot was filled, so re-extracting
-/// the grid under the terminal mutex would have reproduced it exactly.
-///
-/// Counted so the reuse gate can never hide work instead of avoiding it —
-/// `frame_refills_scoped + frame_refills_full + frame_refills_skipped` is still
-/// one per presented non-rescan frame.
+/// A presented frame reused the existing snapshot: the engine marked no damage and
+/// processed no bytes since it was filled. Counted so `frame_refills_scoped +
+/// frame_refills_full + frame_refills_skipped` stays one per presented non-rescan frame.
 pub(crate) fn note_frame_refill_skipped() {
     METRICS.window.redraw.refills_skipped.inc();
 }
 
-/// One resident-pet world observation that STOOD, and the cells it classified.
-///
-/// Called wherever the walk really runs — the live presented path, the
-/// composed-focus path, and the explicit-capture path — because all three pay
-/// it and a counter that saw only one of them would read as a saving whenever
-/// the work merely moved. So `pet_world_observations` is NOT bounded by
-/// `frames`: a capture-heavy interval legitimately exceeds it.
-///
-/// A refused observation reports zero cells and is still counted: a walk that
-/// ran and was thrown away is cost, not absence.
+/// One resident-pet world observation that stood, and the cells it classified. Called on
+/// every path that runs the walk (live presented, composed-focus, explicit capture), so
+/// `pet_world_observations` is not bounded by `frames`. A refused observation counts with
+/// zero cells: a walk thrown away is still cost.
 pub(crate) fn note_pet_world_observation(cells: usize) {
     METRICS.window.redraw.note_pet_world(cells);
 }
@@ -3362,10 +3454,9 @@ pub(crate) fn note_redraw_sync_hold() {
     METRICS.window.redraw.sync_holds.inc();
 }
 
-/// A redraw source fired while surface recovery was backed off or parked. This
-/// is cheap and expected for an occasional animation tick; sustained growth
-/// identifies the caller that is still requesting redraws, without repeating
-/// grid extraction or surface acquisition.
+/// A redraw source fired while surface recovery was backed off or parked. Expected for an
+/// occasional animation tick; sustained growth points at a caller still requesting
+/// redraws.
 pub(crate) fn note_redraw_retry_gated() {
     METRICS.window.redraw.retry_gated.inc();
 }
@@ -3888,7 +3979,11 @@ pub(crate) fn reset() {
 ///    long". Read it with `n_present` and the percentiles beside it, never as a
 ///    lone `last_`/`max_`.
 ///  * `input_*` (`key-arrival→content-present-return`): a key typed into a
-///    window is closed only by that window's next content present; input sent
+///    window is closed only by that window's next content present, or, when
+///    a present of that window first shows the key's prediction under its
+///    proof (`predictive_echo = "adaptive"`), by that present, before the
+///    echo (`input_predicted` counts those; the PREDICTIONS note on
+///    `InputLedger::input`); input sent
 ///    to a session (`send`/`feed`) closes on any window's present. Under
 ///    streaming output in the SAME window the closing
 ///    present may be a log-line frame rather than the key's echo (reads low);
@@ -4311,6 +4406,10 @@ pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink)
     // Keystrokes a full per-window edge ring could not hold: their slices are
     // missing from `input_*`, and this says how many.
     s.count("input_edges_dropped", w.input.edges_dropped.get());
+    // Of `n_input`, the keys a proven prediction showed before their echo:
+    // their slices closed at its present (the PREDICTIONS note on
+    // `InputLedger::input`).
+    s.count("input_predicted", w.input.predicted.get());
     emit_quantiles(
         s,
         [
@@ -4655,10 +4754,8 @@ mod ledger_tests {
         );
     }
 
-    /// ITEM 10, the policy half. A drop only taints the output→present
-    /// distribution when it means the present stream STOPPED for an interval
-    /// nobody was watching. Tainting a transient retry would delete the stalls
-    /// the histogram exists to catch — so this pins the narrow set explicitly.
+    /// Only drops that stop the present stream taint output→present; a transient retry
+    /// does not, or the histogram would lose the stalls it exists to catch.
     #[test]
     fn only_unbounded_present_stoppages_taint_the_on_glass_ledger() {
         for reason in [
@@ -4690,7 +4787,7 @@ mod ledger_tests {
         );
     }
 
-    /// ITEM 10, the window half — pure, so it cannot race the process globals.
+    /// The taint window, pure so it cannot race the process globals.
     #[test]
     fn the_taint_window_covers_live_captures_and_the_episode_tail() {
         assert!(
@@ -5048,9 +5145,7 @@ mod gpu_tests {
 mod window_input_attribution_tests {
     use super::{DrainedEdge, INPUT_SLICE_CAP_NS, Metrics, PendingInputStamp};
 
-    /// The two-window streaming scenario: a key typed into window A must not be
-    /// closed by window B's content present. Each window's present can only take
-    /// its OWN stamp, so B's log-line frame leaves A armed, and A's echo frame
+    /// A key typed into window A is not closed by window B's content present; A's echo
     /// books the whole wait.
     #[test]
     fn another_windows_present_cannot_close_this_windows_key() {
@@ -5078,9 +5173,8 @@ mod window_input_attribution_tests {
         );
     }
 
-    /// COORDINATED OMISSION, corrected: N keystrokes typed before one (slow)
-    /// present are N samples, each its own wait — not one sample for the
-    /// oldest with the other N-1 hidden, which is what let a stall read LOW.
+    /// Coordinated omission: N keystrokes before one slow present are N samples, each its
+    /// own wait.
     #[test]
     fn a_burst_before_one_present_books_every_edge() {
         let mut pending = PendingInputStamp::default();
@@ -5153,8 +5247,8 @@ mod window_input_attribution_tests {
             vec![7],
             "only the fresh key books a slice"
         );
-        // The control: a full ring of edges still inside the cap keeps them all
-        // and refuses the newcomer, exactly as before.
+        // The control: a full ring of edges inside the cap keeps them all and refuses the
+        // newcomer.
         for arrival in 1..=super::INPUT_EDGE_RING as u64 {
             assert!(pending.arm(arrival, arrival));
         }
@@ -5423,6 +5517,96 @@ mod present_clock_tests {
         assert_eq!(present_keys(&[aged], reset_at), 0);
         assert_eq!(present_keys(&[aged], 0), 0);
     }
+
+    /// A KEY'S PREDICTION ON GLASS CLOSES ITS SLICE, as a native page's answer
+    /// does: the person sees the key there, before its echo (measured live,
+    /// `aterm-lab predict-live`, 2026-10-20: every key's slice waited for its
+    /// echo's present, 109 ms over a 100 ms link, while its glyph was on glass
+    /// about a millisecond after the press). A present with no output that
+    /// painted the prediction through op 7 books, oldest first, the keys tagged
+    /// with ops up to 7, and stops at the first key it does not show (one that
+    /// armed no op, or a dark op after it): those wait for the echo's content
+    /// present, as before. The controls: a present with no output that painted
+    /// no prediction books nothing (a blink repaint), and the mark is that
+    /// one frame's.
+    #[test]
+    fn a_present_that_shows_a_keys_prediction_closes_its_slice() {
+        let m = Metrics::new();
+        let t = 10_000 * MS;
+        let mut window = WindowPresentState::default();
+        for (i, op) in [Some(5), Some(6), None, Some(7)].into_iter().enumerate() {
+            let key = t + i as u64 * 10 * MS;
+            assert!(window.pending_input.arm(key, key));
+            if let Some(op) = op {
+                window.pending_input.tag_newest(Some(op));
+            }
+        }
+        let mut observer = PresentObserver::default();
+        let blink = present(&m, t + 50 * MS, 0, 0, &mut window, &mut observer);
+        assert_eq!(blink.input_booked, 0, "no prediction shown: nothing booked");
+        super::note_prediction_shown(&mut window, Some(7), |_| true);
+        let shown = present(&m, t + 60 * MS, 0, 0, &mut window, &mut observer);
+        assert_eq!(
+            shown.input_booked, 2,
+            "the keys of ops 5 and 6; the key that armed no op stops the run"
+        );
+        assert_eq!(
+            (shown.input_predicted, m.window.input.predicted.get()),
+            (2, 2),
+            "both counted as closed by the prediction"
+        );
+        assert!(window.pending_input.is_pending());
+        let after = present(&m, t + 70 * MS, 0, 0, &mut window, &mut observer);
+        assert_eq!(after.input_booked, 0, "the mark was the one frame's");
+        let echo = present(&m, t + 200 * MS, 0, MS, &mut window, &mut observer);
+        assert_eq!(
+            echo.input_booked, 2,
+            "the echo's content present books the rest"
+        );
+        assert_eq!(
+            (echo.input_predicted, m.window.input.predicted.get()),
+            (0, 2),
+            "a content present's keys are not counted as predicted"
+        );
+        assert!(!window.pending_input.is_pending());
+    }
+
+    /// A key the full ring dropped is tagged with nothing: its op names no
+    /// other key's edge. Every key the ring holds but the newest is tagged
+    /// with an op the frame shows; the newest armed none (`tag_newest(None)`,
+    /// as an Enter does). The dropped key, pressed next, armed an op the frame
+    /// also shows: written onto the newest edge, it would book that key too.
+    /// So the frame books every key but the newest, and the newest waits for
+    /// its echo (the review of P7, 2026-10-20: an earlier version of this test
+    /// left every edge untagged, and passed with the guard removed).
+    #[test]
+    fn a_dropped_key_tags_no_other_keys_edge() {
+        let m = Metrics::new();
+        let t = 10_000 * MS;
+        let mut window = WindowPresentState::default();
+        let ring = super::INPUT_EDGE_RING as u64;
+        for i in 0..ring {
+            assert!(window.pending_input.arm(t + i, t + i));
+            window.pending_input.tag_newest((i + 1 < ring).then_some(i));
+        }
+        assert!(
+            !window.pending_input.arm(t + 100, t + 100),
+            "the ring is full"
+        );
+        window.pending_input.tag_newest(Some(ring));
+        super::note_prediction_shown(&mut window, Some(ring), |_| true);
+        let mut observer = PresentObserver::default();
+        let shown = present(&m, t + 50 * MS, 0, 0, &mut window, &mut observer);
+        assert_eq!(
+            shown.input_booked,
+            u32::try_from(super::INPUT_EDGE_RING - 1).expect("a small ring"),
+            "every key the frame shows; the ring's newest edge is not the dropped key's"
+        );
+        assert!(
+            window.pending_input.is_pending(),
+            "the newest key waits for its echo"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5500,16 +5684,8 @@ mod lateness_attribution_tests {
         assert_eq!(counts(), (3, 1, 1));
     }
 
-    /// THE ERASURE THIS FIXES. A 400 ms late timer wake is recorded, and the
-    /// very next reader wake — the `WaitCancelled` a PTY output burst produces,
-    /// milliseconds later — stores 0 over it. That is not a bug in itself
-    /// (`wake_late_ms` is documented as the LAST reading), but until these
-    /// maxima existed it meant the terminal could report
-    /// `max_present_latency_ms=560.54 wake_late_ms=0.00 deadline_late_ms=0.00`
-    /// and no reader could tell a starved main thread from an idle stretch.
-    ///
-    /// The last-writer semantics are pinned here too: this must ADD a surviving
-    /// worst case, not change what `wake_late_ms` means.
+    /// A 400 ms late timer wake survives the next reader wake's store of 0 as a named,
+    /// timed max, while `wake_late_ms` keeps its last-writer meaning.
     #[test]
     fn a_late_timer_survives_the_reader_wake_that_erases_the_last_reading() {
         wait_out_the_process_clock();
@@ -5648,11 +5824,9 @@ mod lateness_attribution_tests {
         assert_eq!(present.latency_gap.get(), gap_ns);
     }
 
-    /// The breadcrumb is the half of this that reaches `aterm.log` in a SHIPPED
-    /// binary, so its bounds matter: an ordinary slow frame must not write a
-    /// line, a stall must cost one line when it starts and one when it ends —
-    /// never one per frame or one every few seconds — and a loop waiting only
-    /// on the session-status observer writes nothing.
+    /// The breadcrumb reaches `aterm.log` in a shipped binary: an ordinary slow frame
+    /// writes nothing, a stall costs one line when it starts and one when it ends, and a
+    /// loop waiting only on the session-status observer writes nothing.
     #[test]
     fn the_slow_present_breadcrumb_is_one_line_per_episode() {
         let slow = SLOW_PRESENT_LOG_THRESHOLD_NS + 1;
@@ -5675,8 +5849,8 @@ mod lateness_attribution_tests {
             "the first spike of a process opens an episode, even in its first second"
         );
 
-        // The 2026-09-18 condition: a slow present every 10 s for 27 hours. The
-        // opening line above and the closing line below are the only two.
+        // A slow present every 10 s for 27 hours: the opening line above and the closing
+        // line below are the only two.
         let mut at = 1;
         while at < 27 * 3600 * 1_000_000_000 {
             at += 10_000_000_000;

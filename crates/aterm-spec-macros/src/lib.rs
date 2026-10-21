@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! aterm-spec-macros: Proc macros for TLA+ specification refinement attributes.
+//! `aterm-spec-macros`: proc macros for TLA+ specification refinement attributes.
 //!
-//! The input is read with `aterm-macro-support`, on std `proc_macro` alone: no syn,
-//! proc-macro2 or quote (docs/AUDIT-third-party-2026-10-15.md, SP.8).
+//! Input is parsed with `aterm-macro-support` on std `proc_macro` alone (no `syn`,
+//! `proc-macro2`, or `quote`).
 
 mod item;
 mod model;
@@ -16,36 +16,18 @@ use proc_macro::{Ident, Literal, Span, TokenStream, TokenTree};
 
 use crate::item::FnItem;
 
-// ---------------------------------------------------------------------------
-// Source↔spec ANCHOR EMITTERS (TRUST_NATIVE_TLA, Phase 0).
+// `#[refines]` and `#[spec_unmodeled]` register compile-time records in
+// `aterm_spec_anchor::registry` (`aterm_spec_anchor::xref`), collected at test
+// time by `spec_xref_closure`.
 //
-// `#[refines]` and `#[spec_unmodeled]` were no-ops (parse the
-// args, discard, return the item). They are now ANCHOR EMITTERS: the annotated
-// item is left 100% unchanged at runtime, but each ALSO registers a compile-time-
-// collectable record into an `aterm_spec_anchor::registry` list (the records live in
-// `aterm_spec_anchor::xref`; the anchored crate depends on that std-only crate, never on
-// the models). The set of all bindings is then collectable at test time by
-// the `spec_xref_closure` gate, with NO source-text scanning.
+// Because these attributes sit on methods inside `impl` blocks—where bare
+// anonymous `const` items from `registry::submit!` are illegal—each emitter
+// wraps the submission in a uniquely named associated `const`
+// (`const __aterm_spec_<kind>_<fn>_<action>: () = { registry::submit!{…} };`).
 //
-// EMISSION SHAPE — these attributes sit on `&mut self` methods INSIDE `impl`
-// blocks. `registry::submit!` expands to a module-level anonymous `const`, which
-// is ILLEGAL as a bare impl item ("`const` items in this context need a name").
-// So each emitter wraps the submit inside a UNIQUELY-NAMED associated `const`
-// (`const __aterm_spec_<kind>_<fnident>: () = { registry::submit!{…} };`), where
-// the submit's anonymous const now lives inside a block expression (legal) and the
-// associated const name is unique within its impl (fn idents are unique per impl).
-// Verified to collect across crates from the host crate's unit-test build.
-//
-// TARGETS — the record is emitted only where `registry::submit!` has a load-time
-// constructor section (Apple, Linux, Android, Windows: the list its compile_error
-// names). Elsewhere, wasm32 in practice, nothing could collect it, so the emitters
-// leave the record out and a dev build for that target still compiles; the
-// `refines` entry probe stays, since a thread-local works there.
-//
-// The macro span-captures the source location via `file!()`/`line!()` and the fn
-// path via the fn ident (a best-effort `rust_method` for diagnostics; the precise
-// DefId binding is Phase 3's `trust-ir` job, obligation 2).
-// ---------------------------------------------------------------------------
+// The registry record is emitted only on targets with load-time constructor
+// sections (Apple, Linux, Android, Windows); on other targets (e.g. `wasm32`)
+// only the thread-local entry probe is emitted.
 
 /// The name the anchor's const and `rust_method` take from: the item's `fn` ident, or
 /// `anon` when the item is not a plain fn (defensive; all current usages are methods).
@@ -90,47 +72,18 @@ fn anchor_const(kind: &str, suffix: Option<&str>, fn_ident: &Ident) -> Result<Id
     }
 }
 
-// ---------------------------------------------------------------------------
-// EXECUTION-EVIDENCE PROBE (the runnable half of obligation 2).
+// `#[refines]` prepends `::aterm_spec_anchor::xref::note_entered("<machine>::<action> @ <fn>")`
+// as the first statement of the annotated fn's body, using the same `entry_id`
+// stored in `RefinementAnchor` so Tier-1 conformance tests can verify that every
+// anchored fn actually executed.
 //
-// `#[refines]` used to leave the annotated fn 100% unchanged, which is exactly why
-// a green closure gate was a claim about STRINGS: nothing tied the anchor to a fn
-// that performs the action, and an anchor moved onto `Terminal::is_tmux_mode_active()`
-// (body: `false`, callers: none; since deleted) kept the gate green.
+// In release builds without `test` or `debug_assertions`, `cfg_attr` strips the
+// attribute before expansion. On Trust build/test/check/doc/verify lanes,
+// `aterm_spec_anchor` uses its `macro_rules!` equivalents (`src/attrs.rs`);
+// these proc macros are used on stock compilers and Trust's lint driver.
 //
-// So the emitter now ALSO injects, as the FIRST statement of the annotated fn's
-// body, `::aterm_spec_anchor::xref::note_entered("<machine>::<action> @ <fn>")`. The id is
-// the same literal the submitted `RefinementAnchor` carries in `entry_id`, emitted
-// from this one expansion, so the probe and the record cannot drift. A gate resets
-// the thread-local record, runs the machine's Tier-1 conformance, and requires every
-// anchor of that machine to have been entered.
-//
-// COST. Nothing changes for a release build: the anchors are applied through
-// `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]`, so when
-// that cfg is off the ATTRIBUTE ITSELF is stripped, this macro never runs, and no probe
-// exists to optimize away.
-//
-// WHERE THESE RUN. `aterm_spec_anchor` re-exports these emitters only where Cargo
-// resolved them (a stock compiler, Trust's lint driver). In Trust's build, test, check,
-// doc and verified lanes the anchors are that crate's `macro_rules!` attributes
-// (src/attrs.rs), which emit the same records; its tests/attrs.rs runs this crate's
-// suite (tests/anchors/suite.rs) on them and pins the same digest.
-//
-// BEHAVIOUR. The injection is a statement prepended inside the existing block, so the
-// fn's signature, generics, receiver (including `self` by value), return type and
-// tail expression are untouched; an early `return`, a `?`, a recursive call and a
-// diverging body all still do exactly what they did. A fn carrying SEVERAL anchors
-// gets several probes: attribute macros expand outside-in, so each expansion prepends
-// its own statement to the body the next one will see.
-//
-// NOT INSTRUMENTABLE. Two shapes get no probe and are reported as such (`entry_id: ""`):
-//   * a `const fn` — its body may not call a non-const fn, and adding one would be a
-//     compile error rather than a check (aterm-gpu's `video_slot_transition` and friends
-//     are const);
-//   * anything that is not a fn with a block (e.g. a bodyless trait method).
-// `entry_id: ""` is NOT a pass — a gate demanding execution evidence must fail on it,
-// or parking an anchor on a `const fn` would be a way to opt out of the check.
-// ---------------------------------------------------------------------------
+// `const fn` items and bodyless declarations cannot call `note_entered` and
+// receive `entry_id: ""`, which fails gates that require execution evidence.
 
 /// The execution-evidence key for one anchor: `"<machine>::<action> @ <rust_method>"`.
 /// Human-readable because it is what a failing gate prints.
@@ -140,11 +93,9 @@ fn entry_id_for(machine: &str, action: &str, rust_method: &str) -> String {
 
 /// The annotated fn with the entry probe as the first statement of its body.
 ///
-/// Returns `None` when the item is not an instrumentable fn (see the module note
-/// above); the caller then emits `entry_id: ""` so the gate can see the gap instead of
-/// mistaking an unprobed anchor for an entered one. Inner attributes
-/// (`fn f() { #![allow(…)] … }`) stay first in the body, so the probe cannot displace
-/// them.
+/// Returns `None` when the item is not an instrumentable fn (`const fn` or bodyless
+/// item); the caller then emits `entry_id: ""` so the gate sees the gap. Inner
+/// attributes (`fn f() { #![allow(…)] … }`) stay first in the body.
 fn inject_entry_probe(item: &FnItem, entry_id: &str) -> Option<TokenStream> {
     let probe = q!(
         "::aterm_spec_anchor::xref::note_entered(#id);",
@@ -240,17 +191,11 @@ fn expand_refines(attr: TokenStream, item: TokenStream) -> Result<TokenStream, E
         })?;
     let item = FnItem::new(item);
     let fn_ident = item_fn_ident(&item);
-    // Disambiguate the anchor const by ACTION as well as fn name: a single method
-    // may legitimately implement MORE THAN ONE spec action (e.g. the `write_all`
-    // drain loop is both `Progress` and `Interrupted`), so two `#[refines]` on the
-    // same fn must emit two DISTINCTLY-NAMED consts (a bare `__aterm_spec_refines_
-    // <fn>` would collide). `sanitize_ident` keeps the suffix a legal identifier.
+    // Disambiguate the anchor const by action as well as fn name so multiple
+    // `#[refines]` attributes on one fn emit distinct associated consts.
     let const_name = anchor_const("refines", Some(&sanitize_ident(&action)), &fn_ident)?;
     let rust_method = fn_ident.to_string();
-    // Execution evidence: probe the annotated body and record the SAME id on the
-    // anchor, so the gate can ask "did this fn actually run?" and not just "does this
-    // string exist?". An un-probeable item keeps the old behaviour (item verbatim) and
-    // says so with an empty `entry_id`.
+    // Un-probeable items stay unchanged and emit an empty `entry_id`.
     let candidate_id = entry_id_for(&machine, &action, &rust_method);
     let (item_out, entry_id) = match inject_entry_probe(&item, &candidate_id) {
         Some(probed) => (probed, candidate_id),
@@ -288,16 +233,13 @@ pub fn spec_unmodeled(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
-    // `machine` and `action` are optional: they tie the waiver to a specific machine
-    // action so it discharges that action for the coverage obligation (§2.2 (3)).
+    // Optional `machine` and `action` tie the waiver to a specific model action.
     let keys = Keys::parse(attr, &["reason", "machine", "action"])?;
     let reason = keys.require("reason")?;
     let machine = keys.get("machine").unwrap_or_default();
     let action = keys.get("action").unwrap_or_default();
     let item = FnItem::new(item);
     let fn_ident = item_fn_ident(&item);
-    // Disambiguate by waived action (like `refines`): a fn may waive more than one
-    // spec action, so two `#[spec_unmodeled]` on one fn need distinct const names.
     let const_name = anchor_const("unmodeled", Some(&sanitize_ident(&action)), &fn_ident)?;
     let rust_method = fn_ident.to_string();
     Ok(q!(

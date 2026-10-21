@@ -10,6 +10,10 @@ use crate::native_ui::ActionId;
 #[path = "harness_every_tests.rs"]
 mod every;
 
+/// The page counts landings (design §12.4, slice 4c).
+#[path = "harness_landings_tests.rs"]
+mod landings;
+
 #[cfg(target_os = "macos")]
 #[test]
 fn lan_discovery_uses_only_the_resolved_service_endpoint() {
@@ -1434,8 +1438,9 @@ fn a_failed_reread_beside_a_reading_is_said() {
 /// (`of those`), both windows, where the week had one — said once (the
 /// post-check of wave 1, owner-eye-6: the week holds today, so a suffix
 /// after each window said it twice), and never in the ledger's word
-/// `unproven` (its review, finding 4). NEGATIVE CONTROLS: no `Landed` row;
-/// no `of those` row in a week with none.
+/// `unproven` (its review, finding 4). Land's landings are their own row
+/// over the prompts (§12.4.1), standing where the week had a prompt.
+/// NEGATIVE CONTROL: no `of those` row in a week with none.
 #[test]
 fn what_the_harness_did_draws_every_family_the_fold_keeps() {
     let mut today = HarnessStats::new(0);
@@ -1488,13 +1493,14 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
     assert_eq!(said("unproven"), 0, "never the ledger's word: {rows:?}");
     let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
     assert_eq!(
-        labels[..12],
+        labels[..13],
         [
             "Approved",
             "of those",
             "Declined",
             "Answered",
             "Kept going",
+            "Landed",
             "Land prompts",
             "Resumed",
             "Relaunched",
@@ -1504,8 +1510,8 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
             "Waited at limits",
         ]
     );
-    // NEGATIVE CONTROLS.
-    assert!(!labels.contains(&"Landed"), "{labels:?}");
+    assert_eq!(words("Landed"), "0 today \u{b7} 0 in 7 days");
+    // NEGATIVE CONTROL.
     today.unproven = 0;
     week.unproven = 0;
     state.stats.report = report(&today, &week);
@@ -1690,6 +1696,8 @@ fn a_sessions_row_names_its_agent_once() {
             set_by: None,
             default: Some(Autopilot::Cruise),
             supervised: true,
+            need: None,
+            hold: None,
         }];
         state.projection().sessions[0].detail.clone()
     };
@@ -1811,6 +1819,8 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         armed_at_ms: None,
         today,
         setting: "follows the default".to_string(),
+        need: None,
+        hold: None,
     };
     let row = |view: AutopilotView, glass: ChipGlass| dated(view, glass, TODAY);
     let clock = |h: u16, m: u16| Clock::of_minute(h * 60 + m);
@@ -2003,6 +2013,8 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
         armed_at_ms: None,
         today: TODAY,
         setting: "follows the default".to_string(),
+        need: None,
+        hold: None,
     };
     let stamp = |h: u16, m: u16| Stamp {
         clock: Clock::of_minute(h * 60 + m),
@@ -2938,6 +2950,8 @@ fn each_row_takes_its_own_sessions_day_and_a_name_its_own() {
         set_by: None,
         default: Some(Autopilot::Cruise),
         supervised: true,
+        need: None,
+        hold: None,
     };
     let mut today = HarnessStats::per_session(0);
     today.approved = 9;
@@ -3027,6 +3041,8 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
             set_by: None,
             default: Some(Autopilot::Cruise),
             supervised: false,
+            need: None,
+            hold: None,
         };
         let mut state = HarnessState::unobserved();
         state.observed = true;
@@ -3503,6 +3519,8 @@ fn state_deciding(
         set_by: None,
         default: Some(Autopilot::Cruise),
         supervised: true,
+        need: None,
+        hold: None,
     }];
     state.decided_open = vec![OpenSession {
         sid: "s-9".to_string(),
@@ -4139,4 +4157,244 @@ fn a_fleetless_reading_keeps_the_last_sweep_and_owes_tab_control_one() {
     // CONTROL: a reading of the fleet replaces it.
     land(&mut app, report("sibling/3"));
     assert_eq!(siblings(&app), Some(vec!["sibling/3".to_string()]));
+}
+
+/// A listed Claude Code session for the STATUS card's count, whose published
+/// verdict is `verdict`: its need copied as `App::harness_sessions` copies
+/// it ([`crate::needs::Verdict::harness_ask`]).
+fn listed_with(local_id: u64, verdict: &crate::needs::Verdict) -> HarnessSession {
+    HarnessSession {
+        local_id,
+        sid: format!("s-{local_id}"),
+        title: format!("tab {local_id}"),
+        place: format!("in tab {local_id}"),
+        program: "Claude Code",
+        word: None,
+        view: AutopilotView::Cruise,
+        glass: crate::claude_lights::ChipGlass::default(),
+        armed_at_ms: None,
+        set_by: None,
+        default: Some(Autopilot::Cruise),
+        supervised: true,
+        need: verdict.harness_ask().cloned(),
+        hold: None,
+    }
+}
+
+/// The verdict a lone attention entry of `owner` asking `text` gives.
+fn asked(owner: &str, text: &str) -> crate::needs::Verdict {
+    crate::needs::of(&crate::needs::NeedFacts {
+        attention: vec![crate::needs::AttentionFact {
+            owner: owner.to_string(),
+            text: text.to_string(),
+            kind: Some(aterm_types::needs::AttentionKind::Ask),
+        }],
+        ..crate::needs::NeedFacts::default()
+    })
+}
+
+/// THE STATUS CARD COUNTS THE SESSIONS THAT NEED YOU (Autopilot v5 §12.2.1,
+/// §12.2.6): of four listed sessions — a harness's ask, an unsupervised
+/// approval, another owner's ask, nothing — STATUS's `Sessions` fact says
+/// `4 of 4 supervised · 1 need you`: a harness's own need alone. With none it
+/// says what main says. NEGATIVE CONTROL (run for the landing): the
+/// harness's words read from every ask, whatever its owner (the owner check
+/// dropped from `needs::attention_outcome`), count the other owner's ask too:
+/// `· 2 need you`.
+#[test]
+fn the_status_card_counts_sessions_that_need_you() {
+    let needs = crate::harness_host::NEEDS_ATTENTION_OWNER;
+    let approval = crate::needs::of(&crate::needs::NeedFacts {
+        agent: Some(crate::needs::AgentFact {
+            word: "prompt",
+            detail: Some("bash:not-read-only".to_string()),
+            rev: 3,
+            subject: Some("rm -rf build".to_string()),
+        }),
+        ..crate::needs::NeedFacts::default()
+    });
+    assert_eq!(
+        approval.need.as_ref().map(|n| n.word),
+        Some(aterm_types::needs::NeedWord::Approval)
+    );
+    let verdicts = [
+        asked(
+            needs,
+            "claude needs you: sign 0.48.0 (+1 more) \u{2014} carrying on",
+        ),
+        approval,
+        asked(
+            "lab",
+            "claude needs you: look at the lab \u{2014} carrying on",
+        ),
+        crate::needs::Verdict::default(),
+    ];
+    let mut state = HarnessState::unobserved();
+    state.observed = true;
+    state.posture = HarnessPosture::On(Autopilot::Cruise);
+    state.sessions = verdicts
+        .iter()
+        .zip(1..)
+        .map(|(verdict, id)| listed_with(id, verdict))
+        .collect();
+    let sessions = |state: &HarnessState| {
+        state
+            .status_rows()
+            .into_iter()
+            .find(|(key, _)| key == "Sessions")
+            .map(|(_, value)| value)
+    };
+    assert_eq!(
+        sessions(&state).as_deref(),
+        Some("4 of 4 supervised \u{b7} 1 need you")
+    );
+    state.sessions.truncate(1);
+    state.sessions[0].need = None;
+    assert_eq!(sessions(&state).as_deref(), Some("1 of 1 supervised"));
+}
+
+/// A NEED HEADS THE ROW'S STATE LINE (§12.2.1, §12.2.6): a session whose
+/// harness needs the person while its loop pauses says the need first, in
+/// the worker's words with its count, then `; carrying on`, then the pause:
+/// `needs you: sign 0.48.0 (+1 more); carrying on · pausing until 18:41 (3
+/// short turns in a row)`; with nothing else to say, the need alone.
+/// NEGATIVE CONTROL (run for the landing): main's `state_line`, which reads
+/// no `need`, says the pause first and the need nowhere.
+#[test]
+fn a_need_heads_the_rows_state_line() {
+    use crate::claude_lights::{ChipGlass, Clock, Stamp};
+    use crate::harness_glass::PauseGlass;
+    const TODAY: i64 = 20_007;
+    let ask = asked(
+        crate::harness_host::NEEDS_ATTENTION_OWNER,
+        "claude needs you: sign 0.48.0 (+1 more) \u{2014} carrying on",
+    );
+    let row = |glass: ChipGlass| HarnessSessionRow {
+        local_id: 7,
+        title: "fix the build".to_string(),
+        name: "fix the build".to_string(),
+        day_line: None,
+        detail: String::new(),
+        mode: Some(Autopilot::Cruise),
+        default: Some(Autopilot::Cruise),
+        view: AutopilotView::Cruise,
+        glass,
+        armed_at_ms: None,
+        today: TODAY,
+        setting: "follows the default".to_string(),
+        need: ask.harness_ask().cloned(),
+        hold: None,
+    };
+    let pausing = ChipGlass {
+        pause: Some(PauseGlass {
+            until: Stamp {
+                clock: Clock::of_minute(18 * 60 + 41),
+                day: TODAY,
+            },
+            short: 3,
+        }),
+        ..ChipGlass::default()
+    };
+    assert_eq!(
+        row(pausing).state_line().as_deref(),
+        Some(
+            "needs you: sign 0.48.0 (+1 more); carrying on \u{b7} pausing until 18:41 (3 short \
+             turns in a row)"
+        )
+    );
+    assert_eq!(
+        row(ChipGlass::default()).state_line().as_deref(),
+        Some("needs you: sign 0.48.0 (+1 more); carrying on")
+    );
+}
+
+/// THE PAGE READS THE PUBLISHED NEED WHERE IT LISTS THE SESSION (§12.2.3): a
+/// Claude Code tab whose harness raised its NEEDS YOU entry is listed with
+/// that need in the worker's words once its verdict is published, and STATUS
+/// counts it. NEGATIVE CONTROL: before the publication the row carries none.
+#[test]
+fn the_page_reads_a_published_harness_need() {
+    let mut app = App::headless_for_test();
+    run_claude(&app, 0);
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    ctx.meta
+        .lock()
+        .unwrap()
+        .set_attention_kind(
+            crate::harness_host::NEEDS_ATTENTION_OWNER,
+            Some("claude needs you: sign 0.48.0 (+2 more) \u{2014} carrying on".into()),
+            Some(aterm_types::needs::AttentionKind::Ask),
+        )
+        .expect("a slot");
+    assert_eq!(
+        app.harness_state().sessions[0].need,
+        None,
+        "CONTROL: unpublished"
+    );
+    app.publish_need(0);
+    let state = app.harness_state();
+    let need = state.sessions[0].need.as_ref().expect("the published need");
+    assert_eq!(
+        (need.first.as_str(), need.more, need.program),
+        ("sign 0.48.0", 2, aterm_phase::Program::Claude)
+    );
+    assert!(
+        state
+            .status_rows()
+            .iter()
+            .any(|(key, value)| key == "Sessions" && value.ends_with("\u{b7} 1 need you")),
+        "{:?}",
+        state.status_rows()
+    );
+}
+
+/// THE OPEN PAGE FOLLOWS A HARNESS'S NEED (§12.2.9, "the page is
+/// republished where a verdict moves"): with Settings ▸ Harness open and no
+/// refresh asked for, the drive's refresh of the session (`App::herald`)
+/// publishes the need and republishes the page, which then counts it and
+/// carries it on the session's row; the need taken down republishes it
+/// again without. NEGATIVE CONTROL (run for the landing): `herald` without
+/// its `harness_screen_moved` leaves the page's revision where it was.
+#[test]
+fn the_open_page_follows_a_harness_need() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    run_claude(&app, 0);
+    assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    let set = |text: Option<&str>| {
+        ctx.meta
+            .lock()
+            .unwrap()
+            .set_attention_kind(
+                crate::harness_host::NEEDS_ATTENTION_OWNER,
+                text.map(str::to_string),
+                text.map(|_| aterm_types::needs::AttentionKind::Ask),
+            )
+            .expect("a slot");
+    };
+    let revision = app.harness_screen.revision;
+    set(Some(
+        "claude needs you: sign 0.48.0 (+1 more) \u{2014} carrying on",
+    ));
+    app.refresh_presence_session(0);
+    assert!(
+        app.harness_screen.revision > revision,
+        "the open page was republished with the need"
+    );
+    assert_eq!(
+        app.harness_state().sessions[0]
+            .need
+            .as_ref()
+            .map(|need| (need.first.as_str(), need.more)),
+        Some(("sign 0.48.0", 1))
+    );
+    let revision = app.harness_screen.revision;
+    set(None);
+    app.refresh_presence_session(0);
+    assert!(
+        app.harness_screen.revision > revision,
+        "the open page was republished without it"
+    );
+    assert_eq!(app.harness_state().sessions[0].need, None);
 }

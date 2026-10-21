@@ -356,8 +356,6 @@ struct ColorSubject {
     card_label: String,
     /// The colour in words ([`color_words`]).
     words: String,
-    /// A save of the target is in flight.
-    pending: bool,
 }
 
 impl ColorSubject {
@@ -376,7 +374,6 @@ impl ColorSubject {
                     brightness_label: format!("{} brightness", field.label),
                     card_label: format!("Choose the {noun}"),
                     words: color_words(state, field),
-                    pending: state.config_key_pending(key),
                 })
             }
             ColorTarget::Slot(index) => {
@@ -388,8 +385,6 @@ impl ColorSubject {
                     brightness_label: format!("Brightness of {slot}"),
                     card_label: format!("Choose {slot}"),
                     words: target_now(state, target).map_or_else(String::new, hex),
-                    pending: state.config_key_pending(prefs::EDIT_PALETTE)
-                        || state.config_key_pending(prefs::EDIT_PALETTE_OVERRIDES),
                 })
             }
         }
@@ -430,7 +425,6 @@ fn color_noun(label: &str) -> String {
 /// pressed with no value, sends the keyboard to the hex row.
 fn color_wheel_node(state: &SettingsViewState, subject: &ColorSubject, height: f32) -> UiNode {
     let id = subject.target.id();
-    let pending = subject.pending;
     UiNode::new(
         format!("settings/color/{id}/wheel"),
         UiContent::ColorWheel(
@@ -442,11 +436,7 @@ fn color_wheel_node(state: &SettingsViewState, subject: &ColorSubject, height: f
                 ActionId::new(format!("settings/color-pick/{id}")),
             )
             .value(SemanticValue::Text(subject.words.clone()))
-            .state(ControlState {
-                enabled: !pending,
-                busy: pending,
-                ..ControlState::default()
-            })
+            .state(ControlState::default())
             .style(StyleRef::Setting),
         ),
     )
@@ -461,7 +451,6 @@ fn color_wheel_node(state: &SettingsViewState, subject: &ColorSubject, height: f
 /// percent, its hue and saturation kept. Off while no colour is known.
 fn color_brightness_node(state: &SettingsViewState, subject: &ColorSubject) -> UiNode {
     let id = subject.target.id();
-    let pending = subject.pending;
     let hsv = target_hsv(state, subject.target);
     // Whole percent, the readout's grain, so the slider's value carries no
     // float noise (#CCCCCC is 0.8, not 0.800000011920929).
@@ -488,8 +477,7 @@ fn color_brightness_node(state: &SettingsViewState, subject: &ColorSubject) -> U
                 maximum: 1.0,
             })
             .state(ControlState {
-                enabled: hsv.is_some() && !pending,
-                busy: pending,
+                enabled: hsv.is_some(),
                 focused: state
                     .common
                     .last_focus
@@ -579,7 +567,6 @@ fn cursor_color_button(state: &SettingsViewState, subject: &ColorSubject) -> Opt
     const VISUAL: &str = "Cursor color";
     let button_key = cursor_color_button_key(key);
     let chosen = trail_color_is_cursor(key, state.raw_value(key).as_deref());
-    let pending = subject.pending;
     // The label, the check it wears while chosen, and the button's insets.
     let width = crate::native_ui::native_button_label_width(VISUAL) + 26.0 + 22.0;
     let button = UiNode::new(
@@ -610,8 +597,6 @@ fn cursor_color_button(state: &SettingsViewState, subject: &ColorSubject) -> Opt
                 if chosen { "Chosen" } else { "Not chosen" }.to_string(),
             ))
             .state(ControlState {
-                enabled: !pending,
-                busy: pending,
                 selected: chosen,
                 focused: state
                     .common
@@ -960,7 +945,6 @@ fn link_wallpaper_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
     // The label's room: the button's insets and its forward arrow.
     let shown = crate::native_ui::fit_native_button_label(&visual, (width - 48.0).max(0.0));
     let path = state.raw_value(field.key).unwrap_or_default();
-    let pending = state.config_key_pending(field.key);
     let focused = state
         .common
         .last_focus
@@ -984,8 +968,6 @@ fn link_wallpaper_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
         )
         .value(SemanticValue::Text(path))
         .state(ControlState {
-            enabled: !pending,
-            busy: pending,
             focused,
             ..ControlState::default()
         })
@@ -1050,7 +1032,6 @@ fn link_tab_color_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
     // the Tab Color page's hex field shows, and the colour they name.
     let shown = saved.map_or_else(|| field.placeholder.clone(), hex);
     let words = color_words(state, field);
-    let pending = state.config_key_pending(field.key);
     let focused = state
         .common
         .last_focus
@@ -1074,8 +1055,6 @@ fn link_tab_color_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
         )
         .value(SemanticValue::Text(words))
         .state(ControlState {
-            enabled: !pending,
-            busy: pending,
             focused,
             ..ControlState::default()
         })
@@ -1126,20 +1105,46 @@ fn add_color_chooser(
         // field must show whole whatever is written — "#RRGGBB" (an unset
         // field fits its placeholder to what is left) — so writing or
         // clearing the colour never moves the button or the row's height.
-        let words = crate::native_ui::text_field_width_for("#DDDDDD", true);
+        // So must its placeholder's least whole words ("Theme…" of "Theme
+        // (#282A36)"): beside a Choose… that left it less, it was cut inside
+        // its first word ("Them…").
+        let least = field
+            .placeholder
+            .split_whitespace()
+            .next()
+            .map(|first| {
+                if first.len() < field.placeholder.trim().len() {
+                    format!("{first}\u{2026}")
+                } else {
+                    first.to_string()
+                }
+            })
+            .unwrap_or_default();
+        let words = crate::native_ui::text_field_width_for("#DDDDDD", true)
+            .max(crate::native_ui::text_field_width_for(&least, true));
         if text_width - button_width - 6.0 >= words {
             if let Some(controls) = row.children.get_mut(1) {
                 let at = controls.children.len().min(1);
                 controls.children.insert(at, button);
             }
         } else {
-            let height = scaled_control_height();
+            // On a line of its own the button is never wider than the column,
+            // and its words wrap to it, never cut ("Choos…" at 2× text in
+            // a 22-column window).
+            let mut button = button;
+            let width = button_width.min(text_width);
+            let mut lines = 1;
+            if let UiContent::Button(control) = &mut button.content {
+                let (words, count) = button_words_in(&control.spec, visual, &[], width);
+                control.spec.visual_label = Some(words);
+                lines = count;
+            }
+            let height =
+                crate::native_ui::native_button_height_for_lines(lines, scaled_control_height());
             if let Length::Fixed(row_height) = row.layout.height {
                 row.layout.height = Length::Fixed(row_height + 4.0 + height);
             }
-            // On a line of its own the button is never wider than the column.
-            let mut button = button;
-            button.layout.width = Length::Fixed(button_width.min(text_width));
+            button.layout.width = Length::Fixed(width);
             row.children.push(
                 UiNode::new(
                     format!("settings/color/{key}/chooser-line"),
@@ -1211,7 +1216,7 @@ pub(super) fn tab_color_page(
         ));
         rows
     };
-    let card = |rows: Vec<(UiNode, f32)>| page_group_card("Color", "tab-color", rows);
+    let card = |rows: Vec<(UiNode, f32)>| page_group_card("Color", "tab-color", rows, text_width);
     // THE PICKER: the wheel beside the controls it sets, one stop of the
     // list, so the wheel, the brightness and the hex value it makes are on
     // one screen together, at the shipped default size as well, with or
@@ -1261,11 +1266,17 @@ pub(super) fn tab_color_page(
             // Too narrow or too short for both: the wheel over the
             // controls, yielding height toward its floor before the card
             // would need to scroll, and split between its rows where it
-            // still does not fit.
+            // still does not fit — the wheel's row no taller than the list
+            // itself, so a screen can show it whole: its 120pt floor in the
+            // 100pt list of a 102x12 window at 2x text was cut on every
+            // screen.
             None => card(color_picker_stacked(
                 state,
                 &subject,
-                (width, WHEEL_FLOOR),
+                (
+                    width,
+                    WHEEL_FLOOR.min(steady_room - 4.0).max(TIGHT_WHEEL_FLOOR),
+                ),
                 text_width,
                 steady_room - chrome,
                 &controls,
@@ -1310,9 +1321,6 @@ impl SettingsApp {
                 return;
             }
         };
-        if Self::reject_pending_key(view, key, cx) {
-            return;
-        }
         let hsv = hsv.map(|part| part.clamp(0.0, 1.0));
         let rgb = view.keep_color(key, hsv);
         self.commit_color_value(view, key, hex(rgb), cx);
@@ -1366,9 +1374,6 @@ impl SettingsApp {
         let switch = UiKey::new(cursor_color_button_key(key));
         view.common.last_focus = Some(switch.clone());
         view.reveal_control(switch);
-        if Self::reject_pending_key(view, key, cx) {
-            return;
-        }
         let on = trail_color_is_cursor(key, view.raw_value(key).as_deref());
         if wanted.unwrap_or(!on) == on {
             cx.repaint(crate::native_app::DamageRegion::All);

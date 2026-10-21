@@ -10,7 +10,7 @@ use crate::{Appearance, BiDiMode, CursorStyle, ParagraphDirection, VtLevel};
 
 /// Terminal mode flags.
 //
-// `PartialEq, Eq` enable by-value comparison in `TerminalCheckpoint` (B.3.2):
+// `PartialEq, Eq` enable by-value comparison in `TerminalCheckpoint`:
 // every field is itself `PartialEq, Eq` (bools + Copy enums), so the derive is
 // exact and adds no new invariants.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,17 +44,17 @@ pub struct TerminalModes {
     /// When disabled, aterm-core ignores clipboard query requests and does not
     /// invoke the clipboard callback or emit a response.
     pub allow_osc52_query: bool,
-    /// Allow OSC 52 clipboard write (set) operations from programs (#7782).
+    /// Allow OSC 52 clipboard write (set) operations from programs.
     ///
     /// Gates the `OSC 52 ; <selection> ; <base64> ST` set path. When disabled
     /// (default), PTY-origin clipboard writes are silently dropped before the
     /// clipboard callback is invoked — attacker-controlled bytes never reach
     /// the host clipboard delegate.
     ///
-    /// **Default: `false` (fail-closed, #7782).** Hosts that want programs to
+    /// **Default: `false` (fail-closed).** Hosts that want programs to
     /// write to the system clipboard opt in explicitly via
     /// [`authorize_clipboard_access(ClipboardAccess::Write)`](super::super::Terminal::authorize_clipboard_access)
-    /// after wiring a clipboard callback. This matches the "host policy bit" posture used
+    /// after wiring a clipboard callback. This matches the host-policy posture used
     /// for `allow_window_ops`, `allow_osc52_query`, `allow_notifications`,
     /// and `allow_palette_reconfigure`: wiring the callback is one signal,
     /// but a second explicit policy call is required before parser-origin
@@ -145,12 +145,10 @@ pub struct TerminalModes {
     pub meta_send_escape: bool,
     /// xterm `altSendsEscape` (DEC private mode 1039).
     ///
-    /// When set (the default in this engine, preserving the historical
-    /// "Alt always prefixes ESC" contract), an `Alt`-modified key is prefixed
-    /// with ESC (0x1b) in legacy encoding. When reset, the ESC prefix is
-    /// suppressed and the bare key is sent. Folded into the legacy
-    /// `KeyboardMode` as the negative flag `ALT_NO_ESC` when reset. Default
-    /// `true`, set by [`TerminalModes::new`].
+    /// When set (the default), an `Alt`-modified key is prefixed with ESC (0x1b)
+    /// in legacy encoding. When reset, the ESC prefix is suppressed and the bare
+    /// key is sent. Folded into the legacy `KeyboardMode` as the negative flag
+    /// `ALT_NO_ESC` when reset. Default `true`, set by [`TerminalModes::new`].
     pub alt_send_escape: bool,
     /// DEC private mode 1045: tracked-only xterm private mode.
     ///
@@ -239,14 +237,14 @@ pub struct TerminalModes {
     /// rectangle (exact)"). Set to `true` by [`TerminalModes::new`]; the
     /// derived `Default` is all-false and is not used for live terminals.
     pub stream_attribute_extent: bool,
-    /// Allow CSI t window manipulation operations (#7139).
+    /// Allow CSI t window manipulation operations.
     ///
     /// When disabled (default), CSI t subcommands 1-10 (state changes and
     /// geometry manipulation) are silently ignored, preventing remote servers
     /// from moving, resizing, or iconifying the window. Query operations
     /// (11-21) and title stack (22-23) are always allowed.
     pub allow_window_ops: bool,
-    /// Allow desktop notification OSC sequences (#7878 CF-009, #7918).
+    /// Allow desktop notification OSC sequences.
     ///
     /// Gates OSC 9 (Terminal), OSC 99 (kitty), and OSC 777 (Konsole/Contour)
     /// desktop notification dispatch — including the OSC 99 `p=?` capability
@@ -254,23 +252,16 @@ pub struct TerminalModes {
     /// to the PTY. When disabled, the notification callback is not invoked
     /// and no response bytes are written.
     ///
-    /// **Default: `false` (fail-closed, #7918).** Hosts must explicitly opt
+    /// **Default: `false` (fail-closed).** Hosts must explicitly opt
     /// in via [`set_allow_notifications`](super::super::Terminal::set_allow_notifications)
-    /// after wiring a notification callback. This matches the "host policy bit" posture
-    /// used for `allow_window_ops` and `allow_osc52_query`: wiring the
-    /// callback is one signal, but a second explicit policy call is
-    /// required before parser-origin OSC 9/99/777 sequences can reach the
-    /// callback or generate a response. Parallel to `allow_osc52_set` (#2341).
+    /// after wiring a notification callback, parallel to `allow_osc52_set`.
     pub allow_notifications: bool,
-    /// Retired OSC 133 / OSC 633 `SessionMemory` recording gate (#7878
-    /// CF-010).
+    /// Retired OSC 133 / OSC 633 `SessionMemory` recording gate.
     ///
-    /// The recording sink it gated and the host API that set it are gone, so
-    /// nothing reads this bit and it is always `false` (fail-closed). It stays
-    /// because the session-handoff wire format carries it: handoff metadata
-    /// written by earlier builds names the field.
+    /// Nothing reads this bit and it is always `false` (fail-closed). Kept so
+    /// the session-handoff wire format stays compatible across builds.
     pub allow_session_memory: bool,
-    /// Allow OSC 4 / OSC 21 indexed palette SET operations (#7937 F01-3).
+    /// Allow OSC 4 / OSC 21 indexed palette SET operations.
     ///
     /// When disabled (default), OSC 4 and OSC 21 palette-index SET requests
     /// (`OSC 4;N;spec` or `OSC 21;N=spec`) are silently ignored. Query
@@ -280,51 +271,40 @@ pub struct TerminalModes {
     /// selection_foreground) are also unaffected; those go through the named
     /// dynamic-color path, which has its own semantics.
     ///
-    /// **Default: `false` (fail-closed, #7937).** Hosts that ship a themeable
+    /// **Default: `false` (fail-closed).** Hosts that ship a themeable
     /// palette and want programs to recolor the 256-entry index must opt in
     /// explicitly via `TerminalConfig::allow_palette_reconfigure = true`.
-    /// This parallels `allow_window_ops`, `allow_osc52_query`, and
-    /// `allow_notifications`: reachable over the wire, defaults off, host
-    /// opts in consciously. The aterm app enables this unless its config says
-    /// false (`Config::allow_palette_reconfigure_or_default`).
+    /// The aterm app enables this unless its config says false
+    /// (`Config::allow_palette_reconfigure_or_default`).
     pub allow_palette_reconfigure: bool,
     /// Require OSC 133 / OSC 633 shell-integration sequences to carry an
-    /// `id=<64-hex>` capability nonce (#7937 F01-2, #7960).
+    /// `id=<64-hex>` capability nonce.
     ///
     /// When disabled (default), OSC 133 A/B/C/D and OSC 633 A/B/C/D/E/F/G/H/P
-    /// dispatch exactly as before — any PTY-origin byte stream can forge a
-    /// shell integration cycle. When enabled, every such sequence must include
-    /// an `id=<64-hex>` parameter matching the nonce the host previously
-    /// installed via `Terminal::authorize_shell_integration`. Sequences without
-    /// a matching nonce are silently dropped (no callback, no state transition,
-    /// no response), and the drop is counted in
+    /// dispatch without a nonce. When enabled, every such sequence must include
+    /// an `id=<64-hex>` parameter matching the nonce the host installed via
+    /// `Terminal::authorize_shell_integration`. Sequences without a matching
+    /// nonce are silently dropped (no callback, no state transition, no
+    /// response), and the drop is counted in
     /// `ShellIntegrationAuth::dropped_count` for host-side metrics.
     ///
-    /// Comparison is constant-time (`constant_time_eq_32`).
-    ///
-    /// **Default: `false` (minimum-disruption landing).** This parallels
-    /// `allow_palette_reconfigure`: the security improvement is opt-in until
-    /// host-side preambles (aTerm.app, aterm-alacritty) thread the nonce
-    /// through zsh/bash/fish/nushell shell integration. Hosts that ship a
-    /// nonced preamble enable this bit at session init to close the spoof
-    /// channel.
+    /// Comparison is constant-time (`aterm_digest::ct_eq`, the workspace's one compare).
     pub require_shell_integration_nonce: bool,
     /// Kitty keyboard protocol capability toggle (host policy, default ON).
     ///
     /// When disabled the terminal behaves as if the kitty protocol is
-    /// UNSUPPORTED: the `CSI ? u` progressive-enhancement query gets no
+    /// unsupported: the `CSI ? u` progressive-enhancement query gets no
     /// reply, `CSI > u` / `CSI = u` / `CSI < u` push/set/pop are consumed
     /// and ignored (no state change, like any unrecognized CSI), and the
     /// derived keyboard mode never carries kitty flags. Embedders need this
-    /// where the HOST consumes kitty sequences itself (e.g. Windows ConPTY,
+    /// where the host consumes kitty sequences itself (e.g. Windows ConPTY,
     /// xterm.js `vtExtensions.kittyKeyboard = false`) — answering the query
     /// would make apps emit sequences the terminal never sees.
     ///
-    /// Not an `allow_*` security bit, but the same host-policy posture:
-    /// set only by the embedder, preserved across `Terminal::reset()`/RIS
+    /// Set only by the embedder and preserved across `Terminal::reset()`/RIS
     /// so a program cannot re-enable the capability over the wire.
-    /// `TerminalModes::new` sets it `true` (the historical behavior); the
-    /// derived all-false `Default` is not used for live terminals.
+    /// `TerminalModes::new` sets it `true`; the derived all-false `Default`
+    /// is not used for live terminals.
     pub kitty_keyboard_enabled: bool,
     /// Enable 80/132 column switching (DEC private mode 40).
     ///
@@ -360,21 +340,17 @@ impl TerminalModes {
             cursor_blink: true,
             auto_wrap: true,
             bidi_arrow_swap: true,
-            // #7782: fail-closed. Hosts must opt in via
-            // `authorize_clipboard_access(Write)` after wiring a clipboard
-            // callback. See
-            // `TerminalModes::allow_osc52_set` doc for rationale.
+            // Fail-closed: hosts must opt in via `authorize_clipboard_access(Write)`
+            // after wiring a clipboard callback.
             allow_osc52_set: false,
-            // #7918 HN-P1: fail-closed. Hosts must opt in after wiring a
-            // notification callback. See `TerminalModes::allow_notifications`
-            // doc for rationale.
+            // Fail-closed: hosts must opt in after wiring a notification callback.
             allow_notifications: false,
             // VT520 DECSACE: the power-on extent is Ps = 0 = character
             // stream (xterm's cur_decsace likewise starts non-exact).
             stream_attribute_extent: true,
             // xterm keyboard power-on defaults: `numLock` (mode 1035) and
             // `altSendsEscape` (mode 1039) are ON; `metaSendsEscape` (mode 1036)
-            // is left OFF so the legacy path keeps its prior Meta behavior.
+            // is OFF.
             special_modifiers: true,
             alt_send_escape: true,
             // Kitty keyboard protocol answered/negotiable by default; hosts

@@ -8,9 +8,9 @@
 //! Every explicit apply therefore refreshes the native setter even when saved
 //! values already match. Plan/check only inspect the configured preference.
 
-use crate::items::defaults::{Target, Want};
+use crate::items::defaults::{Pref, Target, Want};
 use crate::items::{Ctx, Item};
-use crate::model::{PValue, Probe, User};
+use crate::model::{PValue, Probe, Read, User};
 use crate::port::System;
 
 const KEY: &str = "com.apple.swipescrolldirection";
@@ -24,6 +24,54 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         return Err("aterm init trackpad settings require exactly one local user".into());
     };
     Ok(vec![Box::new(ScrollDirection { user: user.clone() })])
+}
+
+/// The scrolling behavior captured on the owner's reference Mac: vertical,
+/// horizontal and momentum scrolling enabled for internal and Bluetooth pads,
+/// with the native per-host momentum and scroll-behavior values retained.
+/// Kept separate from the immediate scroll-direction item so every setup surface
+/// can use the same profile without changing the native direction tests.
+///
+/// # Errors
+/// Init did not resolve exactly one user.
+pub fn behavior_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("trackpad behavior requires exactly one local user".into());
+    };
+    let mut items: Vec<Box<dyn Item>> = Vec::new();
+    let mut add = |target: Target, value: PValue| {
+        let id = format!("init.trackpad.{}@{}", target.describe(), user.name);
+        let title = format!("Trackpad scrolling: {}", target.describe());
+        items.push(Box::new(Pref::new(
+            "trackpad",
+            id,
+            title,
+            target,
+            Want::Value(value),
+        )));
+    };
+    for domain in [
+        "com.apple.AppleMultitouchTrackpad",
+        "com.apple.driver.AppleBluetoothMultitouch.trackpad",
+    ] {
+        for key in [
+            "TrackpadScroll",
+            "TrackpadHorizScroll",
+            "TrackpadMomentumScroll",
+        ] {
+            add(Target::user(domain, key, user), PValue::Bool(true));
+        }
+    }
+    // These two exact values were read from the reference user's ByHost globals.
+    add(
+        Target::host("-g", "com.apple.trackpad.momentumScroll", user),
+        PValue::Bool(true),
+    );
+    add(
+        Target::host("-g", "com.apple.trackpad.scrollBehavior", user),
+        PValue::Int(2),
+    );
+    Ok(items)
 }
 
 #[derive(Debug)]
@@ -50,6 +98,19 @@ impl ScrollDirection {
 }
 
 impl Item for ScrollDirection {
+    fn preference_changes(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+    ) -> Result<Vec<(Target, Read<PValue>)>, String> {
+        let target = self.target();
+        let read = target.read(sys);
+        Ok(if Want::Value(PValue::Bool(false)).satisfied_by(&read)? {
+            Vec::new()
+        } else {
+            vec![(target, read)]
+        })
+    }
     fn id(&self) -> String {
         format!("init.trackpad.scroll-direction@{}", self.user.name)
     }

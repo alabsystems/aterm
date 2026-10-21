@@ -79,7 +79,6 @@ fn cell_extra_max_combining() {
     for _ in 0..20 {
         extra.add_combining('\u{0301}');
     }
-    // Should be capped at MAX_COMBINING
     assert_eq!(extra.combining().len(), CellExtra::MAX_COMBINING);
 }
 
@@ -295,7 +294,6 @@ fn test_hyperlink_limit_evicts_oldest_rows_first() {
 
     let mut extras = CellExtras::new();
 
-    // Create MAX+100 entries across rows. Row 0 is oldest.
     let total = MAX_HYPERLINK_ENTRIES + 100;
     for i in 0..total {
         let row = (i / 200) as u16;
@@ -308,8 +306,7 @@ fn test_hyperlink_limit_evicts_oldest_rows_first() {
 
     extras.enforce_hyperlink_limit();
 
-    // Eviction is oldest first: entries sort monotonically in `i`, so the
-    // survivors are exactly the newest suffix.
+    // Entries sort monotonically in `i`, so the survivors are the newest suffix.
     let low_water = MAX_HYPERLINK_ENTRIES * 3 / 4;
     let mut surviving: Vec<usize> = extras
         .data
@@ -337,17 +334,14 @@ fn test_hyperlink_limit_preserves_non_hyperlink_extras() {
 
     let mut extras = CellExtras::new();
 
-    // Add a non-hyperlink extra (combining mark) on row 0, col 0.
     extras
         .get_or_create(CellCoord::new(0, 0))
         .add_combining('\u{0301}');
 
-    // Also add a hyperlink + combining mark on row 0, col 1.
     let entry = extras.get_or_create(CellCoord::new(0, 1));
     entry.set_hyperlink(Some(Arc::from("https://evict.me")));
     entry.add_combining('\u{0302}');
 
-    // Fill the rest to exceed the limit.
     for i in 2..(MAX_HYPERLINK_ENTRIES + 100) {
         let row = (i / 200) as u16;
         let col = (i % 200) as u16;
@@ -359,7 +353,6 @@ fn test_hyperlink_limit_preserves_non_hyperlink_extras() {
 
     extras.enforce_hyperlink_limit();
 
-    // The non-hyperlink extra at (0, 0) should be untouched.
     let entry_0_0 = extras.get(CellCoord::new(0, 0));
     assert!(entry_0_0.is_some(), "non-hyperlink entry should survive");
     assert_eq!(
@@ -368,7 +361,6 @@ fn test_hyperlink_limit_preserves_non_hyperlink_extras() {
         "combining mark at (0,0) should be preserved"
     );
 
-    // The entry at (0, 1) should have lost its hyperlink but kept combining.
     let entry_0_1 = extras.get(CellCoord::new(0, 1));
     assert!(
         entry_0_1.is_some(),
@@ -394,13 +386,11 @@ fn hyperlink_guard_counts_links_not_total_entries() {
     use crate::test_counters::take_hyperlink_walk_ops;
 
     let mut extras = CellExtras::new();
-    // 14_000 entries without a link (an fg RGB stands in for SGR 58).
     for i in 0..14_000u32 {
         extras
             .get_or_create(CellCoord::new((i / 200) as u16, (i % 200) as u16))
             .set_fg_rgb(Some([1, 2, 3]));
     }
-    // 600 hyperlinks — 6 % of the limit, nowhere near it.
     let url: Arc<str> = Arc::from("https://example.com");
     for i in 0..600u32 {
         extras
@@ -433,24 +423,19 @@ fn hyperlink_guard_counts_links_not_total_entries() {
          entries are not the bounded quantity"
     );
 
-    // Behaviour identity: still nothing evicted, still every entry present.
     assert_eq!(extras.hyperlink_entries_slow(), 600);
     assert_eq!(extras.len(), 14_600);
 }
 
-/// A map under the limit never walks, however inflated the counter.
-///
-/// `hyperlink_upper_bound` over-charges on every handout to a link-free entry,
-/// so repainting 1_600 SGR 58 cells drives it past MAX_HYPERLINK_ENTRIES.
-/// `data.len()` is a second upper bound (links <= entries) and says 1_600, so
-/// no walk happens.
+/// A map under the limit never walks, however inflated the counter:
+/// `hyperlink_upper_bound` charges every handout to a link-free entry, but
+/// `data.len()` is a second upper bound (links <= entries).
 #[test]
 fn small_map_never_walks_however_inflated_the_counter() {
     use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
     use crate::test_counters::take_hyperlink_walk_ops;
 
     let mut extras = CellExtras::new();
-    // A status line's worth of coloured underlines: 10 rows x 160 cols.
     for row in 0..10u16 {
         for col in 0..160u16 {
             extras
@@ -466,8 +451,7 @@ fn small_map_never_walks_however_inflated_the_counter() {
 
     let _ = take_hyperlink_walk_ops(); // reset
 
-    // Redraw the same cells until the counter is well past the limit. Each
-    // handout charges again — the entries already exist and hold no link.
+    // Each repaint charges again: the entries exist and hold no link.
     for _ in 0..20 {
         for row in 0..10u16 {
             for col in 0..160u16 {
@@ -495,10 +479,9 @@ fn small_map_never_walks_however_inflated_the_counter() {
     assert_eq!(extras.hyperlink_entries_slow(), 0);
 }
 
-/// The bound never sits below the true hyperlink population, through every
-/// mutation family: per-cell handout, batch run, whole-value set, removal, row
-/// clear, offset scroll + compaction, region scroll, and column shifts. Upward
-/// drift costs one self-repairing walk; downward drift would disable eviction.
+/// The bound never sits below the true hyperlink population through any mutation
+/// family. Upward drift costs one self-repairing walk; downward drift would
+/// disable eviction.
 #[test]
 fn hyperlink_upper_bound_never_under_counts() {
     fn check(extras: &CellExtras, stage: &str) {
@@ -514,7 +497,7 @@ fn hyperlink_upper_bound_never_under_counts() {
     let mut extras = CellExtras::new();
     let url: Arc<str> = Arc::from("https://example.com");
 
-    // 1. Per-cell handout (`handler_write`'s per-character OSC 8 path).
+    // Per-cell handout (`get_or_create`: reflow, checkpoint restore).
     for col in 0..10u16 {
         extras
             .get_or_create(CellCoord::new(0, col))
@@ -522,7 +505,7 @@ fn hyperlink_upper_bound_never_under_counts() {
     }
     check(&extras, "per-cell handout");
 
-    // 2. Batch run (`write_ascii_run_with_extras` -> `set_range_uniform`).
+    // Batch run (`write_ascii_run_with_extras` -> `set_range_uniform`).
     let vals = UniformExtras {
         fg_rgb: None,
         bg_rgb: None,
@@ -533,8 +516,6 @@ fn hyperlink_upper_bound_never_under_counts() {
     };
     extras.set_range_uniform(1, 0, 10, &vals, 24, 80);
     check(&extras, "batch run");
-    // Re-painting the same run must not charge again: the cells already carry
-    // the link, so the population is unchanged.
     let before = extras.hyperlink_upper_bound();
     extras.set_range_uniform(1, 0, 10, &vals, 24, 80);
     assert_eq!(
@@ -543,27 +524,26 @@ fn hyperlink_upper_bound_never_under_counts() {
         "a repaint of an already-linked run must not inflate the bound"
     );
 
-    // 3. Whole-value set (DECCRA's rect copy).
+    // Whole-value set (DECCRA's rect copy).
     let mut carried = CellExtra::default();
     carried.set_hyperlink(Some(url.clone()));
     extras.set(CellCoord::new(2, 0), carried);
     check(&extras, "whole-value set");
 
-    // 4. Single removal refunds.
+    // Removal refunds.
     assert!(extras.remove(CellCoord::new(2, 0)));
     check(&extras, "single removal");
 
-    // 5. Row clear (retain-based; no refund by design — must stay above).
+    // Row clear is retain-based and never refunds, so the bound stays above.
     extras.clear_row(1);
     check(&extras, "row clear");
 
-    // 6. O(1) offset scroll past the compaction threshold.
+    // 300 offset scrolls cross the compaction threshold.
     for _ in 0..300 {
         extras.shift_rows_up_by(0, 1);
     }
     check(&extras, "offset scroll + compaction");
 
-    // 7. Region scroll (drain-rebuild) and column shifts.
     extras.set_range_uniform(3, 0, 10, &vals, 24, 80);
     extras.shift_rows_up_by(1, 1);
     check(&extras, "region scroll");
@@ -572,7 +552,7 @@ fn hyperlink_upper_bound_never_under_counts() {
     extras.shift_cols_left(2, 0, 2, 80);
     check(&extras, "DCH column shift");
 
-    // 8. `clear()` is exact, not conservative.
+    // `clear()` resets the bound exactly.
     extras.clear();
     assert_eq!(extras.hyperlink_upper_bound(), 0);
     assert_eq!(extras.hyperlink_entries_slow(), 0);

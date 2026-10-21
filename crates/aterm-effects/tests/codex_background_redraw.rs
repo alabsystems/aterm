@@ -428,42 +428,50 @@ fn a_far_jump_with_a_press_in_flight_is_judged_at_once() {
 #[test]
 fn a_two_or_three_row_motion_with_a_press_in_flight_is_judged_at_once() {
     for alt in [false, true] {
-        for (to_row, print, held) in [
-            (22_u16, false, false),
-            (23, false, false),
-            (18, false, false),
-            (17, false, false),
-            (22, true, true),
-            (23, true, true),
-            (18, true, true),
-            (17, true, true),
-            (21, false, true),
-            (19, false, true),
-        ] {
-            let mut h = Host::new();
-            if alt {
-                h.program(b"\x1b[?1049h\x1b[21;3H");
-            }
-            for b in b"abcdefgh" {
-                h.key(*b);
-            }
-            h.now += Duration::from_millis(90);
-            h.glow.note_typed_cells(h.now, 1);
-            let before = h.glow.admission_tally();
-            let jump = if print {
-                format!("\x1b[{};29H.", to_row + 1)
-            } else {
-                format!("\x1b[{};30H", to_row + 1)
-            };
-            h.program(jump.as_bytes());
-            let after = h.glow.admission_tally();
-            let judged = (after.licensed + after.declined) - (before.licensed + before.declined);
-            assert_eq!(
-                judged,
-                u64::from(!held),
-                "alt {alt}: a caret moved from row 20 to row {to_row}, print {print}: judged on \
+        for old_print in [false, true] {
+            for (to_row, print, held) in [
+                (22_u16, false, false),
+                (23, false, false),
+                (18, false, false),
+                (17, false, false),
+                (22, true, true),
+                (23, true, true),
+                (18, true, true),
+                (17, true, true),
+                (21, false, true),
+                (19, false, true),
+            ] {
+                let mut h = Host::new();
+                if alt {
+                    h.program(b"\x1b[?1049h\x1b[21;3H");
+                }
+                for b in b"abcdefgh" {
+                    h.key(*b);
+                }
+                if old_print {
+                    // Print at the future landing, then return to the unchanged
+                    // composer in a separate frame before the key is pressed.
+                    h.program(format!("\x1b[{};29H.\x1b[21;11H", to_row + 1).as_bytes());
+                }
+                h.now += Duration::from_millis(90);
+                h.glow.note_typed_cells(h.now, 1);
+                let before = h.glow.admission_tally();
+                let jump = if print {
+                    format!("\x1b[{};29H.", to_row + 1)
+                } else {
+                    format!("\x1b[{};30H", to_row + 1)
+                };
+                h.program(jump.as_bytes());
+                let after = h.glow.admission_tally();
+                let judged =
+                    (after.licensed + after.declined) - (before.licensed + before.declined);
+                assert_eq!(
+                    judged,
+                    u64::from(!held),
+                    "alt {alt}: a caret moved from row 20 to row {to_row}, print {print}, old print {old_print}: judged on \
                  its frame unless held as a park"
-            );
+                );
+            }
         }
     }
 }

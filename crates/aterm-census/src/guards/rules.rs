@@ -474,14 +474,17 @@ fn input_probe(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 // ---------------------------------------------------------------------------
 
 /// aterm-gui's source (the window crate's and its split-out libraries',
-/// `crates/aterm-gui-*`), aterm-cli's, and amacs's host crates
-/// (`crates/amacs-*`: its file admission and its terminal program), which run
-/// in those two processes. The `amacs` engine names no path.
+/// `crates/aterm-gui-*`), aterm-cli's, amacs's host crates (`crates/amacs-*`:
+/// its file admission and its terminal program), which run in those two
+/// processes, and the disk walker's, which stats every path it is handed and
+/// so must take its deny set from consent too. The `amacs` engine names no
+/// path.
 const PROTECTED_SCOPE: &[&str] = &[
     "crates/aterm-gui/src/",
     "crates/aterm-gui-",
     "crates/aterm-cli/src/",
     "crates/amacs-",
+    "crates/aterm-diskwalk/src/",
 ];
 const PROTECTED_HOME_DIRS: &[&str] = &[
     "Documents",
@@ -496,7 +499,7 @@ pub(super) const PROTECTED_FOLDER: Rule = Rule {
     id: "protected-folder",
     why: "touching ~/Documents, ~/Desktop, ~/Downloads, /Volumes or Library/Containers|\
           CloudStorage raises a TCC modal that holds the calling syscall until a person \
-          answers; aterm-gui and aterm-cli take those paths resolved from \
+          answers; aterm-gui, aterm-cli and aterm-diskwalk take those paths resolved from \
           aterm_containment::consent, never as literals",
     scope: PROTECTED_SCOPE,
     check: protected_folder,

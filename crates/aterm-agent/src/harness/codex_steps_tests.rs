@@ -11,6 +11,7 @@ use super::*;
 use crate::harness::codex_rollout::PAGINATED;
 use crate::harness::codex_rollout::fixtures::{count, message, meta, meta_as, settings, stamp};
 use crate::harness::usage::MAX_LINE_BYTES;
+use aterm_phase::anchors::rollout_reduction_stem;
 
 const FP: u64 = 0xc0de_0000_0000_0001;
 const ID: Option<(u64, u64)> = Some((16_777_220, 78));
@@ -587,13 +588,30 @@ fn a_rollout_is_read_within_its_bounds() {
     assert!(fold_rollout(&dir.path().join("none"), &mut fold, 1).is_none());
 }
 
-/// The build a committed reduction is of: `codex-<build>.jsonl` or a leg of
-/// it, `codex-<build>-<leg>.jsonl`, as its header (`# codex <build> · …`)
-/// names it.
+/// The build a committed reduction is of: `<stem>.jsonl` or a leg of it,
+/// `<stem>-<leg>.jsonl` (the stem `rollout_reduction_stem`'s: `codex-<build>`,
+/// an ALab build's `codex-alab-<release>`), as its header (`# codex <build>
+/// · …`) names it.
 fn build_of<'a>(name: &str, header: &'a str) -> Option<&'a str> {
     let build = header.strip_prefix("# codex ")?.split(' ').next()?;
-    let rest = name.strip_prefix("codex-")?.strip_prefix(build)?;
+    let rest = name.strip_prefix(&rollout_reduction_stem(build))?;
     (rest == ".jsonl" || (rest.starts_with('-') && rest.ends_with(".jsonl"))).then_some(build)
+}
+
+/// The committed reductions of `build` ([`build_of`]), by name.
+fn committed_of(build: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = std::fs::read_dir(STEPS_DIR)
+        .expect("the testdata")
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(e.path()).ok()?;
+            let header = text.lines().next().unwrap_or("");
+            (build_of(&name, header) == Some(build)).then_some((name, text))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// EVERY COMMITTED CODEX REDUCTION FOLDS WHOLE (ruling T8's rule, for
@@ -642,9 +660,7 @@ fn every_committed_codex_reduction_folds_whole() {
     assert!(read >= 2, "the lab's rollouts are committed");
     for b in CODEX_MEASURED_BUILDS {
         assert!(
-            std::path::Path::new(STEPS_DIR)
-                .join(format!("codex-{b}.jsonl"))
-                .exists(),
+            !committed_of(b).is_empty(),
             "{b} is named, and its reduction is not committed"
         );
     }
@@ -664,22 +680,38 @@ fn every_committed_codex_reduction_folds_whole() {
         ),
         Some("0.163.0")
     );
+    let alab = "# codex 0.164.0-dev.12521+g3d3eb12d8 · lab reduce";
+    assert_eq!(
+        build_of("codex-alab-0.164.0-dev.12521-first.jsonl", alab),
+        Some("0.164.0-dev.12521+g3d3eb12d8")
+    );
+    // An ALab build is named by its release, never by its whole version.
+    assert_eq!(
+        build_of("codex-0.164.0-dev.12521+g3d3eb12d8-first.jsonl", alab),
+        None
+    );
 }
 
 /// THE CLASS TABLE holds only what a lab rollout showed: `spawn_agent` in
-/// `collaboration` starts a subagent. NEGATIVE CONTROLS: the same name in
-/// another namespace, or none, is `other`, as is every other call.
+/// `collaboration` starts a subagent (0.163.0), and `exec_command` in no
+/// namespace runs a shell command (codex-alab's approval leg). NEGATIVE
+/// CONTROLS: either name in another namespace, or none, is `other`, as is
+/// every other call (0.163.0's `exec`, either build's `request_user_input`).
 #[test]
-fn only_a_spawned_agent_is_classed() {
+fn only_what_a_lab_rollout_showed_is_classed() {
     assert_eq!(
         tool_class(Some("collaboration"), "spawn_agent"),
         ("agent", true)
     );
+    assert_eq!(tool_class(None, "exec_command"), ("shell", false));
     for (namespace, name) in [
         (Some("functions"), "spawn_agent"),
         (None, "spawn_agent"),
         (Some("functions"), "exec"),
+        (None, "exec"),
+        (Some("functions"), "exec_command"),
         (Some("functions"), "request_user_input"),
+        (None, "request_user_input"),
         (Some("collaboration"), "wait_agent"),
     ] {
         assert_eq!(tool_class(namespace, name), ("other", false), "{name}");
@@ -709,4 +741,507 @@ fn no_step_holds_text() {
         let all = format!("{:?}", b.steps);
         assert!(!all.contains("SENTINEL"), "{all}");
     }
+}
+
+/// The codex-alab builds the lab measured (session log 6D-3a): the one
+/// built from its source for the run, and the owner's managed one, read
+/// from its store.
+const ALAB_BUILDS: [&str; 2] = [ALAB, "0.164.0-dev.12479+g07a25d86a"];
+
+/// The build the legs' steps are written out for ([`ALAB_LEGS`]).
+const ALAB: &str = "0.164.0-dev.12521+g3d3eb12d8";
+
+/// What each leg of `lab codex-alab-proof` did on [`ALAB`], as its rollout
+/// folds (6D-3a): the leg, and its steps after the bind.
+const ALAB_LEGS: [(&str, &[&str]); 6] = [
+    // The instance's first session: one turn that ends on the done mark
+    // (its two crash relaunches resume the thread and add only its own
+    // settings lines).
+    (
+        "first",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12521",
+            "end 64 1 1",
+        ],
+    ),
+    // A turn without the done mark, then the one `keep going` continued.
+    (
+        "continue",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12521",
+            "end 35 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000b",
+            "end 8 1 1",
+        ],
+    ),
+    // An escalated `exec_command`, approved once and run, in one turn.
+    (
+        "approval",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12521",
+            "call call_r0010 exec_command shell",
+            "result call_r0010",
+            "end 5083 2 2",
+        ],
+    ),
+    // A `request_user_input` answered with its recommended option.
+    (
+        "question",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12521",
+            "call call_r0010 request_user_input other",
+            "result call_r0010",
+            "end 5048 2 2",
+        ],
+    ),
+    // The model's 429 ends the turn on the usage wall (no tokens served);
+    // waited out, the resumed turn.
+    (
+        "usage",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12521",
+            "end 32 0 0",
+            "wall UsageSession",
+            "prompt 00000000-0000-4000-8000-000000000009",
+            "end 8 1 1",
+        ],
+    ),
+    // The turn `SIGKILL`ed mid-request writes no end (the rollout holds
+    // none); the relaunched process carries it on in a turn of its own.
+    (
+        "carry",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12521",
+            "prompt 00000000-0000-4000-8000-000000000009",
+            "end 10 1 1",
+        ],
+    ),
+];
+
+/// The forever-port codex-alab build the lab measured (B5c): source
+/// `089291d37`, codex-alab's `alab/forever-align`, under the lab's
+/// FOREVER CRUISE / LAND proof, so its Cruise legs take the defend prompt
+/// after each done claim and its legs hold more turns than [`ALAB`]'s; its
+/// steps are written out on their own ([`FOREVER_LEGS`]).
+const FOREVER: &str = "0.164.0-dev.12672+g089291d37";
+
+/// What each leg of `lab codex-alab-proof` did on [`FOREVER`], as its
+/// rollout folds: the leg, and its steps after the bind.
+const FOREVER_LEGS: [(&str, &[&str]); 6] = [
+    // A turn ending on the done mark, then three turns of Cruise's defend
+    // prompt and the defenses after it (its two crash relaunches resume the
+    // thread and add only its own settings lines).
+    (
+        "first",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12672",
+            "end 70 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000b",
+            "end 9 1 1",
+            "prompt 00000000-0000-4000-8000-000000000010",
+            "end 10 1 1",
+            "prompt 00000000-0000-4000-8000-000000000015",
+            "end 8 1 1",
+        ],
+    ),
+    // A turn without the done mark, the one `keep going` continued, and
+    // the continued reply's defend prompt.
+    (
+        "continue",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12672",
+            "end 38 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000b",
+            "end 23 1 1",
+            "prompt 00000000-0000-4000-8000-000000000010",
+            "end 9 1 1",
+        ],
+    ),
+    // An escalated `exec_command`, approved once and run, in one turn; then
+    // two more acts' turns.
+    (
+        "approval",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12672",
+            "call call_r0010 exec_command shell",
+            "result call_r0010",
+            "end 5115 2 2",
+            "prompt 00000000-0000-4000-8000-00000000000f",
+            "end 22 1 1",
+            "prompt 00000000-0000-4000-8000-000000000014",
+            "end 22 1 1",
+        ],
+    ),
+    // A `request_user_input` answered with its recommended option; then
+    // the question asked in prose and Land's answer to it.
+    (
+        "question",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12672",
+            "call call_r0010 request_user_input other",
+            "result call_r0010",
+            "end 5063 2 2",
+            "prompt 00000000-0000-4000-8000-00000000000f",
+            "end 22 1 1",
+            "prompt 00000000-0000-4000-8000-000000000014",
+            "end 22 1 1",
+        ],
+    ),
+    // The model's 429 ends the turn on the usage wall (no tokens served);
+    // waited out, the resumed turn and the continuations after it.
+    (
+        "usage",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12672",
+            "end 37 0 0",
+            "wall UsageSession",
+            "prompt 00000000-0000-4000-8000-000000000009",
+            "end 23 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000e",
+            "end 15 1 1",
+            "prompt 00000000-0000-4000-8000-000000000013",
+            "end 20 1 1",
+            "prompt 00000000-0000-4000-8000-000000000018",
+            "end 22 1 1",
+        ],
+    ),
+    // The turn `SIGKILL`ed mid-request writes no end; the relaunched
+    // process carries it on in a turn of its own, and the defend prompts
+    // follow its done claim.
+    (
+        "carry",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.12672",
+            "prompt 00000000-0000-4000-8000-000000000009",
+            "end 24 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000e",
+            "end 8 1 1",
+            "prompt 00000000-0000-4000-8000-000000000013",
+            "end 9 1 1",
+            "prompt 00000000-0000-4000-8000-000000000018",
+            "end 8 1 1",
+        ],
+    ),
+];
+
+/// Each leg's committed reduction, on [`ALAB`].
+fn alab_leg(leg: &str) -> String {
+    alab_leg_of(ALAB, leg)
+}
+
+/// Each leg's committed reduction, on `build`.
+fn alab_leg_of(build: &str, leg: &str) -> String {
+    let path = format!("{STEPS_DIR}/{}-{leg}.jsonl", rollout_reduction_stem(build));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// What a step is, its numbers and ids aside: its kind, and a call's name.
+fn shape(said: &str) -> String {
+    let mut w = said.split(' ');
+    match (w.next(), w.next(), w.next()) {
+        (Some("call"), _, Some(name)) => format!("call {name}"),
+        (Some(kind), ..) => kind.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// What the rollout itself says of each turn, apart from the fold: the
+/// turns its `turn_context`s open, each `task_complete`'s duration, the
+/// tokens codex-alab's own per-turn record (`token_usage_record`'s
+/// `turn_token_usage`, a count the fold never reads) gives the turn last,
+/// and whether its error is the usage limit; and the calls and outputs by
+/// id. The fold's steps, said as [`said`] says them (no bind, no model).
+fn rollout_says(text: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut opened: Vec<String> = Vec::new();
+    let mut tokens: std::collections::HashMap<String, (u64, u64)> = Default::default();
+    for row in rows(text) {
+        let v: Value = aterm_json::from_str(row).map_err(|e| format!("{e}: {row}"))?;
+        let p = v.get("payload");
+        let s = |k: &str| p.and_then(|p| p.get(k)).and_then(Value::as_str);
+        match (v.get("type").and_then(Value::as_str), s("type")) {
+            (Some("turn_context"), _) => {
+                let t = s("turn_id").ok_or("a turn_context names its turn")?;
+                if !opened.iter().any(|o| o == t) {
+                    opened.push(t.to_string());
+                    out.push(format!("prompt {t}"));
+                }
+            }
+            (Some("token_usage_record"), _) => {
+                let t = s("turn_id").ok_or("a record names its turn")?;
+                let n = |k: &str| {
+                    p.and_then(|p| p.get("turn_token_usage"))
+                        .and_then(|u| u.get(k))
+                        .and_then(Value::as_u64)
+                };
+                let (Some(i), Some(o)) = (n("input_tokens"), n("output_tokens")) else {
+                    return Err(format!("a record with no turn tokens: {row}"));
+                };
+                tokens.insert(t.to_string(), (i, o));
+            }
+            (Some("event_msg"), Some("task_complete")) => {
+                let t = s("turn_id").ok_or("a task_complete names its turn")?;
+                let dur = p
+                    .and_then(|p| p.get("duration_ms"))
+                    .and_then(Value::as_u64)
+                    .ok_or("a task_complete has its duration")?;
+                let (i, o) = tokens.get(t).copied().unwrap_or((0, 0));
+                out.push(format!("end {dur} {i} {o}"));
+                let wall = p
+                    .and_then(|p| p.get("error"))
+                    .and_then(|e| e.get("codex_error_info"))
+                    .and_then(Value::as_str)
+                    == Some("usage_limit_exceeded");
+                if wall {
+                    out.push("wall UsageSession".into());
+                }
+            }
+            (Some("response_item"), Some("function_call")) => {
+                let id = s("call_id").ok_or("a call has its id")?;
+                let name = s("name").ok_or("a call has its name")?;
+                // The approval leg's call ran the shell command its model
+                // asked for; the question leg's asked the person.
+                let cls = match (s("namespace"), name) {
+                    (None, "exec_command") => "shell",
+                    _ => "other",
+                };
+                out.push(format!("call {id} {name} {cls}"));
+            }
+            (Some("response_item"), Some("function_call_output")) => {
+                let id = s("call_id").ok_or("an output has its call")?;
+                out.push(format!("result {id}"));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// THE MEASURED BUILDS, EXACT (session log 6D-3a; rulings T8, T33): each
+/// leg of `lab codex-alab-proof` folds, on each codex-alab build the lab ran
+/// it on ([`ALAB_BUILDS`] and [`FOREVER`]), to what the leg did
+/// ([`ALAB_LEGS`], written out for [`ALAB`], whose managed sibling's legs
+/// take the same steps, numbers and ids aside; [`FOREVER_LEGS`], written out
+/// for the forever-port build, B5c): its turns open once each at their `turn_context`, end at
+/// their `task_complete` with its duration, the usage wall on the 429's,
+/// the calls and their outputs by id, the model once, the build said as its
+/// release. Every step is the rollout's own account too ([`rollout_says`]):
+/// each turn's tokens are the ones codex-alab's own per-turn record gives
+/// it, which the fold never reads; and every step past the bind is exact,
+/// each build being measured. The legs that showed no new step (`hold` is
+/// `continue`'s shape) are not committed. NEGATIVE CONTROLS: a turn record
+/// whose tokens are not the counts' is told apart; and read as an
+/// unmeasured build (its `cli_version` one release on), every step is
+/// partial.
+#[test]
+fn the_codex_alab_legs_fold_exact() {
+    let mut kinds = std::collections::BTreeSet::new();
+    // Each build, the legs its steps are written out by, and whether they
+    // are written out for it (else they are another build's, its own taking
+    // the same steps, numbers and ids aside).
+    let builds = ALAB_BUILDS
+        .iter()
+        .map(|b| (*b, &ALAB_LEGS, *b == ALAB))
+        .chain([(FOREVER, &FOREVER_LEGS, true)]);
+    for (build, legs, own) in builds {
+        assert!(CODEX_MEASURED_BUILDS.contains(&build), "{build}");
+        let release = log_build(build).expect("an id");
+        for (leg, want) in legs.iter().copied() {
+            let text = alab_leg_of(build, leg);
+            let batch = fold(&text);
+            let read = saids(&batch);
+            assert_eq!(read[0], "bind 0", "{build} {leg}");
+            if own {
+                assert_eq!(read[1..], *want, "{build} {leg}");
+            }
+            let wanted: Vec<String> = want.iter().map(|s| shape(s)).collect();
+            let shapes: Vec<String> = read[1..].iter().map(|s| shape(s)).collect();
+            assert_eq!(shapes, wanted, "{build} {leg}");
+            assert!(
+                read.contains(&format!("model gpt-5.5 - {}", release.as_str())),
+                "{build} {leg}"
+            );
+            assert_eq!((batch.lost, batch.overflow), (0, 0), "{build} {leg}");
+            assert!(
+                batch.steps[1..].iter().all(|s| s.state == StepState::On),
+                "{build} {leg}"
+            );
+            let own: Vec<String> = read[1..]
+                .iter()
+                .filter(|s| !s.starts_with("model"))
+                .cloned()
+                .collect();
+            assert_eq!(rollout_says(&text).expect("read"), own, "{build} {leg}");
+            for s in &read[1..] {
+                kinds.insert(s.split(' ').next().unwrap_or("").to_string());
+            }
+        }
+    }
+    // What the build's measurement holds (T8's guard, for Codex): a turn
+    // opened and ended, a call and its output, the usage wall, the model.
+    assert_eq!(
+        kinds.into_iter().collect::<Vec<_>>(),
+        ["call", "end", "model", "prompt", "result", "wall"]
+    );
+    // NEGATIVE CONTROLS.
+    let approval = alab_leg("approval");
+    let off = approval.replacen(
+        "\"turn_token_usage\":{\"input_tokens\":2",
+        "\"turn_token_usage\":{\"input_tokens\":7",
+        1,
+    );
+    assert_ne!(off, approval, "the plant took");
+    let folded: Vec<String> = saids(&fold(&off))[1..]
+        .iter()
+        .filter(|s| !s.starts_with("model"))
+        .cloned()
+        .collect();
+    assert_ne!(rollout_says(&off).expect("read"), folded);
+    let next = alab_leg("first").replace(
+        "\"cli_version\":\"0.164.0-dev.12521+g3d3eb12d8\"",
+        "\"cli_version\":\"0.164.0-dev.12522+g3d3eb12d9\"",
+    );
+    let batch = fold(&next);
+    assert!(
+        batch.steps[1..]
+            .iter()
+            .all(|s| s.state == StepState::Partial)
+    );
+    assert!(saids(&batch).contains(&"model gpt-5.5 - 0.164.0-dev.12522".to_string()));
+}
+
+/// THE BUILD, SAID AND MATCHED (6D-3a): a build that is a log id is said
+/// whole; an ALab build, whose `+` no log id holds, is said as its release
+/// and matched whole; a bind handed the build its tap read says the bind at
+/// that build's state. NEGATIVE CONTROLS: a build that is no id even before
+/// a `+` is said as none, and a bind handed no build, or an unmeasured one,
+/// is partial.
+#[test]
+fn a_build_is_said_as_its_release_and_matched_whole() {
+    assert_eq!(
+        log_build("0.163.0")
+            .map(|b| b.as_str().to_owned())
+            .as_deref(),
+        Some("0.163.0")
+    );
+    assert_eq!(
+        log_build(ALAB).map(|b| b.as_str().to_owned()).as_deref(),
+        Some("0.164.0-dev.12521")
+    );
+    let mut fold = CodexStepFold::new(0);
+    fold.bind_build(FP, ID, 0, Some(ALAB));
+    assert_eq!(fold.take().steps[0].state, StepState::On);
+    // NEGATIVE CONTROLS.
+    assert!(log_build("0 163+x").is_none());
+    for build in [None, Some("0.164.0-dev.12521")] {
+        let mut fold = CodexStepFold::new(0);
+        fold.bind_build(FP, ID, 0, build);
+        assert_eq!(fold.take().steps[0].state, StepState::Partial, "{build:?}");
+    }
+}
+
+/// The other codex-alab build the lab measured (the owner's managed one).
+const ALAB_MANAGED: &str = "0.164.0-dev.12479+g07a25d86a";
+
+/// THE WRITER HOLDS THE ROWS TO ITS BUILD (session log 5G-3): a thread's
+/// `session_meta` names the build that started it, and a thread resumed or
+/// re-exec'd onto another build appends without restating it (measured:
+/// the `first` leg's rollout, written by three processes, holds one
+/// `session_meta`), so where its reader knows the build writing the rows
+/// now ([`CodexStepFold::set_writer`]) the fold holds them to it. The
+/// `continue` leg, started on [`ALAB`]: written by [`ALAB`] it folds as its
+/// golden; by the other measured build, exact still, the build said the
+/// writer's; by a build nobody measured, every step partial; a writer that
+/// moves between its turns says the model again, at its build; and a reader
+/// that stops says `off` once ([`CodexStepFold::stop`]), folding nothing
+/// more. NEGATIVE CONTROLS (scratch, the unit's notes): a state that
+/// ignores the writer reads the unmeasured writer `On`; a model said at the
+/// thread's build names 12521 for the 12479 writer; a move that keeps the
+/// model said says it once.
+#[test]
+fn the_writer_holds_the_rows_to_its_build() {
+    let text = alab_leg("continue");
+    let second = rows(&text)
+        .position(|r| r.contains("\"turn_context\"") && r.contains("8000-00000000000b"))
+        .expect("the continued turn's context");
+    // The leg's rows folded with `writer` writing them, the writer moving to
+    // `moved` at the continued turn's context, or the reader stopping there.
+    let fold_by = |writer: &str, moved: Option<&str>, stop: bool| {
+        let mut fold = CodexStepFold::new(0);
+        fold.set_writer(writer);
+        fold.bind(FP, ID, 0);
+        let mut end = 0u64;
+        for (i, row) in rows(&text).enumerate() {
+            if i == second {
+                if let Some(build) = moved {
+                    fold.set_writer(build);
+                }
+                if stop {
+                    fold.stop(end);
+                }
+            }
+            end += row.len() as u64 + 1;
+            fold.push(row.as_bytes(), end);
+        }
+        fold.take()
+    };
+    let golden = ALAB_LEGS
+        .iter()
+        .find(|(leg, _)| *leg == "continue")
+        .map(|(_, want)| *want)
+        .expect("the continue leg");
+    // (The bind is said before the thread's `session_meta` is read.)
+    let batch = fold_by(ALAB, None, false);
+    assert_eq!(saids(&batch)[1..], *golden);
+    assert!(batch.steps[1..].iter().all(|s| s.state == StepState::On));
+    let at = |release: &str| {
+        golden
+            .iter()
+            .map(|s| s.replace("0.164.0-dev.12521", release))
+            .collect::<Vec<_>>()
+    };
+    let batch = fold_by(ALAB_MANAGED, None, false);
+    assert_eq!(
+        saids(&batch)[1..],
+        at("0.164.0-dev.12479"),
+        "the writer's build"
+    );
+    assert!(batch.steps[1..].iter().all(|s| s.state == StepState::On));
+    let batch = fold_by("0.164.0-dev.99999+g0123abcd", None, false);
+    assert_eq!(saids(&batch)[1..], at("0.164.0-dev.99999"));
+    assert!(
+        batch.steps.iter().all(|s| s.state == StepState::Partial),
+        "no row of a writer nobody measured is exact"
+    );
+    let moved = saids(&fold_by(ALAB, Some(ALAB_MANAGED), false));
+    assert_eq!(
+        moved[1..],
+        [
+            golden[0],
+            golden[1],
+            golden[2],
+            golden[3],
+            "model gpt-5.5 - 0.164.0-dev.12479",
+            golden[4],
+        ],
+        "a writer that moved says the model again"
+    );
+    let stopped = saids(&fold_by(ALAB, None, true));
+    assert_eq!(
+        stopped[1..],
+        [golden[0], golden[1], golden[2], "off unmeasured"],
+        "a reader that stops says off once, and folds nothing more"
+    );
 }

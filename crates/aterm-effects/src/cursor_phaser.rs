@@ -213,18 +213,24 @@ impl CursorPhaser {
         // The block fill: the cursor's own colour tinted toward the beam's hue with charge. The
         // host floors it against the page, so the glyph stays sharp, unless it wears a pinned
         // cursor colour.
-        let beam = hsv2rgb(hue, lerp(SAT_IDLE, SAT_MAX, e), lerp(VAL_IDLE, VAL_MAX, e));
         let fill = match cfg.base {
             // A pinned cursor colour is the settled emitter itself: the beam's
             // hue tints it only with the charge
             // ([`crate::color_math::wear_pinned`]).
-            Some(pinned) => crate::color_math::wear_pinned(
-                pinned,
-                mix_rgb(pinned, beam, lerp(MIX_IDLE, MIX_MAX, e)),
-                e,
-                SETTLED_ENERGY,
-            ),
-            None if dark_theme => mix_rgb(BASE_DARK_THEME, beam, lerp(MIX_IDLE, MIX_MAX, e)),
+            Some(pinned) if e <= SETTLED_ENERGY => pinned & 0x00FF_FFFF,
+            Some(pinned) => {
+                let beam = hsv2rgb(hue, lerp(SAT_IDLE, SAT_MAX, e), lerp(VAL_IDLE, VAL_MAX, e));
+                crate::color_math::wear_pinned(
+                    pinned,
+                    mix_rgb(pinned, beam, lerp(MIX_IDLE, MIX_MAX, e)),
+                    e,
+                    SETTLED_ENERGY,
+                )
+            }
+            None if dark_theme => {
+                let beam = hsv2rgb(hue, lerp(SAT_IDLE, SAT_MAX, e), lerp(VAL_IDLE, VAL_MAX, e));
+                mix_rgb(BASE_DARK_THEME, beam, lerp(MIX_IDLE, MIX_MAX, e))
+            }
             None => light_emitter_fill(hue, e),
         };
 
@@ -289,6 +295,7 @@ impl CursorPhaser {
         // Slab height ~1/8 cell (min 2px): fine enough that the tapering lens
         // reads as a point, not a staircase.
         let slab = ((ch * 0.125) as i32).max(2);
+        let cy_i32 = cy as i32;
         for &(rx, cov_x, fringe, hx) in &WING_LAYERS {
             let r = reach * rx;
             if r < 1.0 {
@@ -301,18 +308,23 @@ impl CursorPhaser {
             // Prism fringe: the left lobe trails the sweep, the right leads it. The core layer
             // (fringe 0) is the pure beam hue on both sides.
             let left_premul = premul_rgb(hsv2rgb(hue - fringe, 0.95, 1.0), cov);
-            let right_premul = premul_rgb(hsv2rgb(hue + fringe, 0.95, 1.0), cov);
+            let right_premul = if fringe == 0.0 {
+                left_premul
+            } else {
+                premul_rgb(hsv2rgb(hue + fringe, 0.95, 1.0), cov)
+            };
             let half_h = (ch * 0.5 * hx).max(1.0);
-            let mut dy = -(half_h as i32);
-            while dy < half_h as i32 {
-                let h = slab.min(half_h as i32 - dy).max(1);
+            let half_h_i32 = half_h as i32;
+            let mut dy = -half_h_i32;
+            while dy < half_h_i32 {
+                let h = slab.min(half_h_i32 - dy).max(1);
                 // Elliptical lens: half-width at the slab's vertical centre,
                 // full reach on the beam axis, tapering to a point at the
                 // layer's top and bottom.
                 let ym = (dy as f32 + h as f32 * 0.5) / half_h;
                 let hw = (r * (1.0 - ym * ym).max(0.0).sqrt()) as i32;
                 if hw >= 1 {
-                    let y = cy as i32 + dy;
+                    let y = cy_i32 + dy;
                     push_rect(out, geom, cell_l - hw, y, hw, h, left_premul);
                     push_rect(out, geom, cell_r, y, hw, h, right_premul);
                 }

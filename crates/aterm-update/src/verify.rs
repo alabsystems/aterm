@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 /// child is a hung child.
 ///
 /// 30s is far above any healthy run and far below "the user thinks the app is
-/// broken". Bundle size does not threaten it: on an 851 MB seeded bundle (§9.1)
+/// broken". Bundle size does not threaten it: on an 851 MB seeded bundle
 /// `codesign --verify --deep --strict` measured 0.09 s wall and `spctl` 0.14-0.21 s;
 /// reaching 30 s would need reads under ~27 MB/s across the payload.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -258,11 +258,11 @@ pub(crate) fn last_stderr_line(stderr: &str) -> Option<&str> {
     stderr.lines().rev().map(str::trim).find(|l| !l.is_empty())
 }
 
-/// PROVE THE CANDIDATE CAN ACTUALLY START, by starting it.
+/// Prove the candidate can actually start, by starting it.
 ///
-/// Everything else this module checks is CRYPTOGRAPHIC — the signature, the Team ID,
+/// Everything else this module checks is cryptographic — the signature, the Team ID,
 /// the sealed identity, the Gatekeeper assessment. None of it establishes that the
-/// binary will LOAD: a wrong-architecture slice, a missing dylib, a Developer ID
+/// binary will load: a wrong-architecture slice, a missing dylib, a Developer ID
 /// Apple revoked after we verified, anything the kernel or dyld rejects before
 /// `main`. That case is the one the crash-loop sentinel cannot cover, because the
 /// sentinel lives inside the new build's own `main` (`install::check_boot_health`):
@@ -275,7 +275,7 @@ pub(crate) fn last_stderr_line(stderr: &str) -> Option<&str> {
 /// the cheapest total path through the binary — it loads every linked library, then
 /// prints and exits without touching config, sockets, PTYs or the updater.
 ///
-/// Bounded like every other helper here, and FAIL-CLOSED: a probe that times out,
+/// Bounded like every other helper here, and fail-closed: a probe that times out,
 /// crashes, or prints the wrong build refuses the apply. The machine keeps the build
 /// it has, which is always a safe outcome; a bricked app is not.
 ///
@@ -291,10 +291,10 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
     })
 }
 
-/// [`probe_bundle_starts`] at STAGE time, on the checker thread, before the ready
+/// [`probe_bundle_starts`] at stage time, on the checker thread, before the ready
 /// marker.
 ///
-/// WHY START IT TWICE. The first exec of a binary this machine has never run pays
+/// The first exec of a binary this machine has never run pays
 /// syspolicyd's assessment — measured 0.75 s (0.75-0.95, n=5) for the 90 MB `aterm`
 /// against ~8 ms for every exec after, and that on a cdhash syspolicyd had already
 /// seen; a genuinely new release also gets the XProtect scan — and nothing else
@@ -305,16 +305,16 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
 /// instead of in the apply's own probe — before the successor's window in the
 /// switch, before any window in a cold launch's boot apply. That probe still runs:
 /// it is the TOCTOU check, now at the warm cost. A cross-volume install copies the
-/// bundle (new inodes) and pays at its apply, as before.
+/// bundle (new inodes) and pays at its apply.
 ///
-/// NEVER STARTED BEFORE THE GATE PASSES. macOS assesses the first exec of a file
-/// AFTER the exec, by path, while the process waits at `_dyld_start`, and killing the
+/// Never started before the gate passes. macOS assesses the first exec of a file
+/// after the exec, by path, while the process waits at `_dyld_start`, and killing the
 /// child does not end the assessment; on macOS 27.0.1 `syspolicyd` crashes (`SIGSEGV`)
 /// when a Mach-O it began assessing is unlinked before the assessment finishes, which
 /// strands every exec on the host at `_dyld_start`. Starting the candidate before the
 /// gate (`POSIX_SPAWN_START_SUSPENDED`) and unlinking `incoming` on a gate refusal or
 /// withdrawal unlinks an assessed file before it ever ran. Running the probe only
-/// AFTER the whole gate (`check_bundle`, `CFBundleVersion`, `ATermGitCommit`, and
+/// after the whole gate (`check_bundle`, `CFBundleVersion`, `ATermGitCommit`, and
 /// `stage_withdrawn`) has passed means a refused bundle was never exec'd at all.
 /// `--version` answers before any lane starts, so the candidate never reaches its
 /// updater, trial counters or state roots.
@@ -417,9 +417,8 @@ fn helper_deadline() -> (Instant, bool) {
 
 /// The rejection a helper that outran [`helper_deadline`] reports.
 ///
-/// A REJECTION, AND A PASSING ONE: the apply refuses
-/// exactly as before — nothing is swapped past a helper that did not answer —
-/// but the reason carries [`crate::PASSING_REFUSAL_KEY`], because a deadline
+/// The apply refuses — nothing is swapped past a helper that did not answer —
+/// and the reason carries [`crate::PASSING_REFUSAL_KEY`], because a deadline
 /// missed says the machine was slow at that moment (a loaded desk, a cold page
 /// cache, `spctl` waiting on the network), not that the bundle is bad. Its
 /// readers retry it on the transient schedule instead of converging the build as
@@ -572,20 +571,17 @@ fn run_refusal(what: &str, error: RunError, timeout: String) -> String {
 
 /// A bundle's policy gate and its sealed reads, with every helper started at once.
 ///
-/// The gate asked one helper at a time — `codesign -R`, `codesign -d`, `spctl`,
-/// then `PlistBuddy` for each read — and waited for each: the sum (~185 ms for
-/// one bundle on a quiet machine; codesign -R 74 ms and spctl 80 ms of it).
 /// Started together and reaped together under one deadline, on this thread with
-/// no other started ([`aterm_uds::deadline::outputs_until`]), they cost the slowest
-/// of them.
+/// no other started ([`aterm_uds::deadline::outputs_until`]), the helpers (`codesign -R`,
+/// `codesign -d`, `spctl`, and `PlistBuddy` for each read) cost the slowest
+/// of them (~80 ms vs ~185 ms serial on a quiet machine).
 ///
-/// THE ANSWERS ARE THE SERIAL GATE'S. Each field is what its own helper says, and
+/// Each field is what its own helper says, and
 /// every caller reads them in the serial order — [`Self::policy`] first — so the
 /// first refusal it meets is the one the serial gate would have returned, wording
 /// and passing classification included. A read that ran beside the gate instead of
 /// after it read the same bytes: nothing writes the bundle while it is verified (a
-/// private staging parent and the apply lock, the same exclusion the serial order
-/// rested on between its verify and its read), and an Info.plist value is still
+/// private staging parent and the apply lock), and an Info.plist value is still
 /// sealed evidence only once [`Self::policy`] is `Ok`. A helper that outlives the
 /// deadline is killed and refused ([`timed_out`]) like a serial one.
 #[derive(Debug)]
@@ -1056,7 +1052,7 @@ fn git_commit_from(out: std::process::Output) -> Result<String, String> {
 /// itself reject anything not signed by a genuine Apple-issued Developer-ID
 /// Application cert whose Team (OU) equals the pin, so the authenticity anchor does
 /// not rest solely on `spctl`/Gatekeeper, which a Gatekeeper-disabled machine turns
-/// into a no-op (F1).
+/// into a no-op.
 ///
 /// Split out so its classification is provable without a codesign that misbehaves on
 /// cue: always a rejection, and a PASSING one ([`mark_passing`]) only when codesign
@@ -1072,7 +1068,7 @@ pub(crate) fn codesign_refusal(
         CodesignError::InvalidTeam(team) => {
             format!("refusing to verify: pinned team id {team:?} is not alphanumeric")
         }
-        // A REFUSAL UNLESS codesign KNOWABLY JUDGED NOTHING: see
+        // A refusal unless codesign knowably judged nothing: see
         // [`codesign_exit_refusal`], which the structural lane and the team-id read
         // share.
         refused @ CodesignError::Refused { .. } => {
@@ -1091,14 +1087,14 @@ pub(crate) fn codesign_refusal(
 /// ([`crate::quote_tool_output`]), marked passing ([`mark_passing`]) only when
 /// codesign knowably judged nothing.
 ///
-/// A RUN THAT ENDED WITHOUT A VERDICT IS NOT ONE. codesign killed by a signal
+/// A run that ended without a verdict is not one. codesign killed by a signal
 /// (jetsam on a loaded desk), or exiting 1 for a file it could not read or
 /// "internal error in Code Signing subsystem", says nothing about the bundle; as a
 /// verdict it would ask a person to reinstall a healthy app or discard a healthy
 /// stage. The rejection stands either way — nothing is swapped past a check that
 /// did not pass — but its readers retry it.
 ///
-/// FAIL CLOSED: only [`CodesignError::judged_nothing_at`] — a signal, or exit 1
+/// Fail closed: only [`CodesignError::judged_nothing_at`] — a signal, or exit 1
 /// whose first line names only a failure to read or to run on `app` itself — is
 /// passing. Every other exit is a verdict, however codesign words it ("a sealed
 /// resource is missing or invalid", "invalid Info.plist", a dangling symlink's "No
@@ -1248,15 +1244,15 @@ fn spctl_verdict(status: std::process::ExitStatus, stderr: &str) -> Result<(), S
 mod tests {
     use super::*;
 
-    /// The aggregate budget binds BEFORE a helper's own ceiling (the rejection names
+    /// The aggregate budget binds before a helper's own ceiling (the rejection names
     /// the budget), so sixteen serial helpers are bounded by a number.
     ///
-    /// A HELPER THAT DID NOT FINISH IS A PASSING REFUSAL: still a rejection — nothing is
+    /// A helper that did not finish is a passing refusal: still a rejection — nothing is
     /// swapped past it — but one its readers retry on the transient schedule, never a
     /// structural verdict and never a person's. Both deadlines that bind a helper say so:
     /// the apply's budget and the helper's own ceiling, and a copy's own `limit` as well.
     ///
-    /// CONTROL: a helper that ran and REFUSED is a verdict and carries no key.
+    /// Control: a helper that ran and refused is a verdict and carries no key.
     #[cfg(unix)]
     #[test]
     fn a_helper_timeout_is_a_passing_refusal() {
@@ -1291,7 +1287,7 @@ mod tests {
         assert!(!crate::is_passing_refusal(&verdict), "{verdict}");
     }
 
-    /// WHICH I/O ERRORS ARE A MOMENT, by errno. The kernel refusing a helper for
+    /// Which I/O errors are a moment, by errno. The kernel refusing a helper for
     /// the process table, memory or descriptors just then — and a lock held past
     /// its wait — pass; a missing helper, a permission, a filesystem without locks
     /// come back the same every time and keep their verdict. The spawn itself is
@@ -1323,7 +1319,7 @@ mod tests {
         assert!(!crate::is_passing_refusal(&missing), "{missing}");
     }
 
-    /// A CHECK-THREAD HELPER ENDS AT ITS OWN LIMIT. The check's `hdiutil` runs
+    /// A check-thread helper ends at its own limit. The check's `hdiutil` runs
     /// hold the check lane and the machine-wide `checker.lock`, so one that never
     /// returned would park the checker: through `output_within` a child past its
     /// limit is killed, reaped within a short reserve, and reported; one that
@@ -1474,8 +1470,7 @@ mod tests {
                 assert_eq!(state["stopped"], i64::from(stopped));
                 assert!(model.check_invariant("StopRequiresExit", &state));
                 if exit != 1 {
-                    // Historical inference: calling kill/wait was treated as
-                    // cleanup, even when neither had established an exit.
+                    // Negative control: treating kill/wait without an observed exit as stopped violates the invariant.
                     state.insert("stopped", 1);
                     assert!(!model.check_invariant("StopRequiresExit", &state));
                 }
@@ -1607,10 +1602,10 @@ mod tests {
         assert!(!crate::is_passing_refusal(&refused), "{refused}");
     }
 
-    /// A codesign run that ended WITHOUT a verdict — a signal, a
+    /// A codesign run that ended without a verdict — a signal, a
     /// wait that failed, or exit 1 naming a fact about this machine (a file it could
     /// not read, its own internal error) — is a passing refusal on both codesign lanes.
-    /// EVERY OTHER EXIT IS A VERDICT, worded as codesign words it and with no key:
+    /// Every other exit is a verdict, worded as codesign words it and with no key:
     /// the signature faults, exit 3's requirement, exit 2's usage error, codesign's
     /// bundle-seal verdicts — and a line nobody measured, which must stay a verdict too
     /// ([`aterm_update_core::codesign::CodesignError::judged_nothing_at`] fails closed).
@@ -1721,10 +1716,10 @@ mod tests {
         }
     }
 
-    /// A TOOL CANNOT SPEAK FOR THE REFUSAL THAT QUOTES IT: a helper's output that
+    /// A tool cannot speak for the refusal that quotes it: a helper's output that
     /// echoes a refusal key (a nested path or a file the bundle named after it) leaves
     /// a verdict a verdict, and still reads the text it quoted. Every door that quotes
-    /// codesign, spctl, PlistBuddy or the candidate's `--version`. CONTROL: a moment
+    /// codesign, spctl, PlistBuddy or the candidate's `--version`. Control: a moment
     /// stays a moment.
     #[test]
     fn a_verdict_that_quotes_a_refusal_key_is_still_a_verdict() {
@@ -1799,14 +1794,14 @@ mod tests {
         assert!(crate::is_passing_refusal(&moment), "{moment}");
     }
 
-    /// A TAMPERED BUNDLE NAMED LIKE A MACHINE FAULT IS A VERDICT, measured on the real
+    /// A tampered bundle named like a machine fault is a verdict, measured on the real
     /// codesign through the structural lane on ad hoc signed `.app`s: a dangling symlink
     /// added after signing (codesign's whole word is `<app>: No such file or
     /// directory`); a symlink out of the bundle named `h: Permission denied`, read from
     /// stderr or both streams; and nested helpers named `h: Permission denied`,
     /// `h\nX: Permission denied` and after the passing key, with a sibling re-signed
     /// after the seal, which codesign names on `--verbose=2` progress lines before its
-    /// verdict. CONTROLS: the untouched bundle verifies, and a sealed resource this user
+    /// verdict. Controls: the untouched bundle verifies, and a sealed resource this user
     /// cannot read is still the passing moment it was.
     #[cfg(target_os = "macos")]
     #[test]
@@ -1915,7 +1910,7 @@ mod tests {
         app
     }
 
-    /// A BUNDLE CODESIGN CANNOT READ TO AN ANSWER IS A VERDICT, refused before any
+    /// A bundle codesign cannot read to an answer is a verdict, refused before any
     /// helper runs. On the real codesign, a FIFO at the seal
     /// (`_CodeSignature/CodeResources`) or at the main executable, a symlink to one in
     /// place of a sealed resource, or a FIFO behind `Contents`, `Contents/MacOS` or
@@ -1925,7 +1920,7 @@ mod tests {
     /// that never asks for a reinstall. Each is a verdict in both tiers and for the
     /// sealed reads beside the gate, inside an apply's budget (where a codesign let run
     /// would answer with the budget's passing refusal), and one named after the passing
-    /// key is still one. CONTROL: the untouched bundle verifies, and so does one whose
+    /// key is still one. Control: the untouched bundle verifies, and so does one whose
     /// sealed symlink names a directory inside it.
     #[cfg(target_os = "macos")]
     #[test]
@@ -2107,8 +2102,8 @@ mod tests {
         app
     }
 
-    /// EVERY HELPER OF A BUNDLE CHECK ANSWERS FOR ITSELF, AND THE VERDICT IS THE
-    /// SERIAL ONE. The helpers run at once, so each field is its own helper's
+    /// Every helper of a bundle check answers for itself, and the verdict is the
+    /// serial one. The helpers run at once, so each field is its own helper's
     /// answer whatever the others said; the policy still reports the first refusal
     /// in the serial order — the seal before the team before Gatekeeper — and a
     /// read that failed refuses only itself.
@@ -2172,7 +2167,7 @@ mod tests {
         );
     }
 
-    /// SEVERAL BUNDLES CHECKED AT ONCE EACH GET THEIR OWN ANSWERS. `check_bundles`
+    /// Several bundles checked at once each get their own answers. `check_bundles`
     /// starts every bundle's helpers together (the boot apply's staged and installed
     /// bundles); each bundle's answers are its own helpers', in the order given, and
     /// the same as `check_bundle` of it alone: a broken seal refuses only its own
@@ -2232,7 +2227,7 @@ mod tests {
         }
     }
 
-    /// A HELPER OF A BUNDLE CHECK THAT NEVER ANSWERS ends at the deadline, as a
+    /// A helper of a bundle check that never answers ends at the deadline, as a
     /// passing refusal naming the budget, and the call comes back: here every
     /// `PlistBuddy` blocks opening an Info.plist that is a FIFO nobody writes, and the
     /// budget is spent before the bundle's walk ([`unanswerable_entry`]) can refuse the

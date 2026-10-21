@@ -18,6 +18,9 @@
 //! - Firefox ([`firefox`]) runs headless and is driven by its pages: each
 //!   POSTs its answer to the server and opens the next. A session whose
 //!   pages report another browser's user agent is NOT RUN.
+//! - WebKit ([`webkit`]), Playwright's build on macOS, is driven by its
+//!   pages as Firefox is. Its headless pages live in windows of its own, so
+//!   under `--no-windows` its session is a named skip.
 //!
 //! Three pages, each fed crates/aterm-gpu-web/tests/cpu_gpu_parity.rs's grid,
 //! theme, px, font and content, one line per frame:
@@ -57,7 +60,8 @@
 //! binds both modules and lays the site in DIR ([`site_main`]), and `verify
 //! browser-drive SITE OUT [--engine NAME]...` runs the sessions on a site
 //! laid before, judged as above, their frames and timings in OUT
-//! ([`drive_main`]). The Linux lane's guest (`targo --unverified lab linux
+//! ([`drive_main`]); WebKit's session, which keeps windows, only when
+//! `--engine webkit` names it. The Linux lane's guest (`targo --unverified lab linux
 //! browser`, docs/LINUX-RUNTIME-LANE.md) drives this Mac's site that way:
 //! the same module bytes, another OS and CPU.
 
@@ -67,9 +71,11 @@ pub(crate) mod firefox;
 pub(crate) mod judge;
 pub(crate) mod recorded;
 pub(crate) mod serve;
+pub(crate) mod webkit;
 
 pub use chromium::fetch_main;
 
+use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -200,6 +206,8 @@ enum Engine {
     Chromium(chromium::Browser, chromium::Angle),
     /// Firefox, driven by its pages.
     Firefox(firefox::Firefox),
+    /// WebKit, driven by its pages; it keeps a window.
+    WebKit(webkit::WebKit),
 }
 
 impl Engine {
@@ -208,6 +216,7 @@ impl Engine {
         match self {
             Engine::Chromium(_, angle) => angle.name(),
             Engine::Firefox(_) => "firefox",
+            Engine::WebKit(_) => "webkit",
         }
     }
 
@@ -216,12 +225,13 @@ impl Engine {
         match self {
             Engine::Chromium(_, angle) => format!("WebGL2 on ANGLE {}", angle.name()),
             Engine::Firefox(_) => "Firefox".to_string(),
+            Engine::WebKit(_) => "WebKit".to_string(),
         }
     }
 
     /// Why a GPU answer was not drawn by this engine, if it was not: a
-    /// Chromium that fell back to another backend, or a Firefox executable
-    /// that is another browser.
+    /// Chromium that fell back to another backend, or a Firefox or WebKit
+    /// executable that is another browser.
     fn not_drawn(&self, gpu: &judge::Answer) -> Option<String> {
         match self {
             Engine::Chromium(_, angle) => (!angle.drew(&gpu.adapter)).then(|| {
@@ -237,6 +247,12 @@ impl Engine {
                     gpu.user_agent
                 )
             }),
+            Engine::WebKit(_) => (!webkit::is_webkit(&gpu.user_agent)).then(|| {
+                format!(
+                    "the browser answered as \"{}\", not WebKit: no webkit session ran",
+                    gpu.user_agent
+                )
+            }),
         }
     }
 
@@ -247,26 +263,53 @@ impl Engine {
                 drive_chromium(browser, site, work, profile, *angle)
             }
             Engine::Firefox(firefox) => drive_firefox(firefox, site, work, profile),
+            Engine::WebKit(webkit) => drive_webkit(webkit, site, work, profile),
         }
     }
 }
 
 /// Every session's name ([`Engine::name`]), as `browser-drive --engine` takes
-/// it: Chromium's ANGLE backends, then Firefox.
-pub(crate) const ENGINES: [&str; 3] = ["metal", "swiftshader", "firefox"];
+/// it: Chromium's ANGLE backends, then Firefox, then WebKit.
+pub(crate) const ENGINES: [&str; 4] = ["metal", "swiftshader", "firefox", "webkit"];
+
+/// The WebKit session's part in a run. Its headless pages keep windows of
+/// their own ([`webkit`]), so it runs only where the caller lets it open
+/// them.
+enum WebKitRow {
+    /// Run it on the WebKit found; without one it is NOT RUN.
+    Run(Result<webkit::WebKit, String>),
+    /// `--no-windows`: a named skip, naming first the fix for a missing
+    /// WebKit (`Some`).
+    Skip(Option<&'static str>),
+    /// Not asked for (`browser-drive` without `--engine webkit`): no row.
+    Off,
+}
 
 /// Build, bind and serve both modules once, then boot the pages in each
 /// browser session: Chromium on each ANGLE backend
-/// ([`chromium::angle_backends`]), then Firefox. Two rows per session.
+/// ([`chromium::angle_backends`]), then Firefox, then WebKit, which keeps a
+/// window and so is a named skip under `--no-windows`. Two rows per session.
 pub fn run(ctx: &Ctx, r: &mut Report) {
     let t0 = Instant::now();
-    let (chromium, firefox) = (chromium::find(), firefox::find());
-    if let (Err(c), Err(f)) = (&chromium, &firefox) {
+    let (chromium, firefox, webkit) = (chromium::find(), firefox::find(), webkit::find());
+    // Finding a WebKit opens nothing; under `--no-windows` only running it
+    // is skipped, and its skip names the fix for a missing one.
+    let webkit_runs = webkit.is_ok() && !ctx.no_windows;
+    if let (Err(c), Err(f), false) = (&chromium, &firefox, webkit_runs) {
+        let w = match &webkit {
+            Err(w) => format!("; {w}"),
+            Ok(_) => String::new(),
+        };
         r.cannot_run(format!(
-            "{LABEL} — {c}; {f} (fix: targo --unverified verify fetch-browser)"
+            "{LABEL} — {c}; {f}{w} (fix: targo --unverified verify fetch-browser)"
         ));
         return;
     }
+    let webkit = if ctx.no_windows {
+        WebKitRow::Skip(webkit.is_err().then(webkit::fix))
+    } else {
+        WebKitRow::Run(webkit)
+    };
     let work = crate::plan::cells_dir(ctx).join("browser");
     let site = work.join("site");
     let Some(cost) = build_site(ctx, r, &site, t0) else {
@@ -279,7 +322,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         scratch: ctx.scratch.clone(),
         ceiling: ctx.child_ceiling,
     };
-    sessions(r, &built, &chromium, &firefox, &[]);
+    sessions(r, &built, &chromium, &firefox, webkit, &[]);
 }
 
 /// Build both modules (`wasm-smoke`'s dev build) and lay the site in `site`
@@ -317,19 +360,21 @@ fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cos
 
 /// Boot the pages in each browser session `wanted` names ([`ENGINES`];
 /// empty is every session this host runs): Chromium on each of its ANGLE
-/// backends, then Firefox. Two rows per session; a wanted session with no
-/// browser, or one this host does not run, is NOT RUN.
+/// backends, then Firefox, then WebKit as `webkit` says. Two rows per
+/// session; a wanted session with no browser, or one this host does not
+/// run, is NOT RUN.
 fn sessions(
     r: &mut Report,
     built: &Built,
     chromium: &Result<chromium::Browser, String>,
     firefox: &Result<firefox::Firefox, String>,
+    webkit: WebKitRow,
     wanted: &[String],
 ) {
     let wants = |name: &str| wanted.is_empty() || wanted.iter().any(|w| w == name);
     for name in wanted {
         let here = chromium::angle_backends().iter().any(|a| a.name() == name);
-        if name != "firefox" && !here {
+        if name != "firefox" && name != "webkit" && !here {
             r.cannot_run(format!(
                 "{LABEL}, WebGL2 on ANGLE {name} — this host's Chromium sessions are {}",
                 chromium::angle_backends()
@@ -374,18 +419,30 @@ fn sessions(
             chromium::FETCH_FIX
         )),
     }
-    if !wants("firefox") {
-        return;
-    }
-    match firefox {
-        Ok(f) => {
-            r.raw(format!("firefox: {} ({})", f.path.display(), f.source));
-            run_one(r, Engine::Firefox(f.clone()));
+    if wants("firefox") {
+        match firefox {
+            Ok(f) => {
+                r.raw(format!("firefox: {} ({})", f.path.display(), f.source));
+                run_one(r, Engine::Firefox(f.clone()));
+            }
+            Err(why) => r.cannot_run(format!(
+                "{LABEL}, Firefox — {why} (fix: {})",
+                firefox::fix()
+            )),
         }
-        Err(why) => r.cannot_run(format!(
-            "{LABEL}, Firefox — {why} (fix: {})",
-            firefox::fix()
-        )),
+    }
+    match webkit {
+        WebKitRow::Off => {}
+        WebKitRow::Skip(missing) => {
+            r.skip(format!("{LABEL}, {}", webkit::no_windows_skip(missing)));
+        }
+        WebKitRow::Run(Ok(w)) => {
+            r.raw(format!("webkit: {} ({})", w.path.display(), w.source));
+            run_one(r, Engine::WebKit(w));
+        }
+        WebKitRow::Run(Err(why)) => {
+            r.cannot_run(format!("{LABEL}, WebKit — {why} (fix: {})", webkit::fix()));
+        }
     }
 }
 
@@ -487,8 +544,9 @@ pub fn site_main(args: &[String], cwd: &Path) -> i32 {
 /// `verify browser-drive SITE OUT [--engine NAME]...`: the lane's sessions
 /// on a site `browser-site` laid ([`sessions`]), judged as `verify browser`
 /// judges, each session's frames and timings in `OUT/<session>/`. It builds
-/// nothing and needs no toolchain: what the Linux lane's guest runs. Exit 0,
-/// 1 when a row failed, 3 when a row could not run.
+/// nothing and needs no toolchain: what the Linux lane's guest runs. WebKit's
+/// session keeps windows, so it runs only when `--engine webkit` names it.
+/// Exit 0, 1 when a row failed, 3 when a row could not run.
 pub fn drive_main(args: &[String]) -> i32 {
     let usage = |why: String| {
         eprintln!(
@@ -540,7 +598,19 @@ pub fn drive_main(args: &[String]) -> i32 {
         ceiling: Some(crate::exec::DEFAULT_CHILD_CEILING),
     };
     let mut r = Report::new(format!("browser-drive ({})", site.display()));
-    sessions(&mut r, &built, &chromium::find(), &firefox::find(), &wanted);
+    let webkit = if wanted.iter().any(|w| w == "webkit") {
+        WebKitRow::Run(webkit::find())
+    } else {
+        WebKitRow::Off
+    };
+    sessions(
+        &mut r,
+        &built,
+        &chromium::find(),
+        &firefox::find(),
+        webkit,
+        &wanted,
+    );
     let _ = std::fs::remove_dir_all(&scratch);
     finish(&r)
 }
@@ -1017,9 +1087,8 @@ fn drive_chromium(
     })
 }
 
-/// Launch Firefox on a fresh profile, under a scratch home, at the cpu page, which runs its lane,
-/// POSTs its answer and opens the gpu page, which opens the worker page;
-/// take the three answers and kill the browser by its pid.
+/// Launch Firefox on a fresh profile, under a scratch home, at the cpu page
+/// ([`drive_by_posts`]).
 fn drive_firefox(
     firefox: &firefox::Firefox,
     site: &Path,
@@ -1032,20 +1101,87 @@ fn drive_firefox(
         return Err(Stop::CouldNotRun(why));
     }
     firefox::make_profile(profile).map_err(Stop::CouldNotRun)?;
+    let home = ScratchHome(firefox::home_of(profile));
+    let pages = drive_by_posts("Firefox", &firefox.path, site, work, &home, |url, home| {
+        (
+            firefox::launch_args(profile, url),
+            firefox::launch_env(std::env::vars_os(), home),
+        )
+    })?;
+    drop(home);
+    let product = firefox::product(&pages.gpu.answer.user_agent);
+    Ok(pages.session(product))
+}
+
+/// Launch WebKit on a fresh profile, under a scratch home, with its
+/// frameworks, at the cpu page ([`drive_by_posts`]).
+fn drive_webkit(
+    webkit: &webkit::WebKit,
+    site: &Path,
+    work: &Path,
+    profile: &Path,
+) -> Result<Session, Stop> {
+    webkit::make_profile(profile).map_err(Stop::CouldNotRun)?;
+    let home = ScratchHome(webkit::home_of(profile));
+    let frameworks = webkit::frameworks_dir(&webkit.path);
+    let pages = drive_by_posts("WebKit", &webkit.path, site, work, &home, |url, home| {
+        (
+            webkit::launch_args(profile, url),
+            webkit::launch_env(std::env::vars_os(), home, &frameworks),
+        )
+    })?;
+    drop(home);
+    let product = webkit::product(&pages.gpu.answer.user_agent);
+    Ok(pages.session(product))
+}
+
+/// The three answers a browser driven by its pages posted.
+struct PostedPages {
+    cpu: Page,
+    gpu: Page,
+    worker: Result<Page, Stop>,
+    served: usize,
+}
+
+impl PostedPages {
+    fn session(self, product: String) -> Session {
+        Session {
+            product,
+            ready_ms: None,
+            cpu: self.cpu,
+            gpu: self.gpu,
+            worker: self.worker,
+            served: self.served,
+        }
+    }
+}
+
+/// Serve `site`, launch `browser` (`what` in a refusal) with the arguments
+/// and environment `launch` gives for the cpu page's URL
+/// (`?post=1&next=gpu,worker`) and its scratch `home`: the cpu page runs its
+/// lane, POSTs its answer and opens the gpu page, which opens the worker
+/// page. Take the three answers and kill the browser by its pid.
+fn drive_by_posts(
+    what: &str,
+    browser: &Path,
+    site: &Path,
+    work: &Path,
+    home: &ScratchHome,
+    launch: impl FnOnce(&str, &Path) -> (Vec<OsString>, Vec<(OsString, OsString)>),
+) -> Result<PostedPages, Stop> {
     let log = work.join("browser.log");
     let (out, err) = log_stdio(&log)?;
     let mut server = serve::Server::start(site).map_err(Stop::CouldNotRun)?;
     let url = format!("{}/cpu.html?post=1&next=gpu,worker", server.origin());
-    let home = ScratchHome(firefox::home_of(profile));
-    let mut cmd = LaneCommand::new(&firefox.path);
-    cmd.args(firefox::launch_args(profile, &url))
-        .env_exactly(firefox::launch_env(std::env::vars_os(), &home.0))
+    let (args, env) = launch(&url, &home.0);
+    let mut cmd = LaneCommand::new(browser);
+    cmd.args(args)
+        .env_exactly(env)
         .stdin(ChildStdio::Null)
         .stdout(out)
         .stderr(err);
-    let child = spawn(cmd).map_err(|e| {
-        Stop::CouldNotRun(format!("could not start {}: {e}", firefox.path.display()))
-    })?;
+    let child = spawn(cmd)
+        .map_err(|e| Stop::CouldNotRun(format!("could not start {}: {e}", browser.display())))?;
     let mut running = Running(child);
     let mut since = Instant::now();
     let mut take = |kind: &str| -> Result<Page, Stop> {
@@ -1055,7 +1191,7 @@ fn drive_firefox(
                 .map_err(|why| match running.ended() {
                     // A browser gone before the first page answered never ran it.
                     Some(status) if kind == "cpu" => Stop::CouldNotRun(format!(
-                        "Firefox exited ({status}) before the cpu page answered\n{}",
+                        "{what} exited ({status}) before the cpu page answered\n{}",
                         log_tail(&log)
                     )),
                     _ => Stop::Fail(format!("the {kind} page: {why}\n{}", log_tail(&log))),
@@ -1074,10 +1210,7 @@ fn drive_firefox(
     let served = server.served();
     drop(server);
     drop(running);
-    drop(home);
-    Ok(Session {
-        product: firefox::product(&gpu.answer.user_agent),
-        ready_ms: None,
+    Ok(PostedPages {
         cpu,
         gpu,
         worker,
@@ -1085,9 +1218,10 @@ fn drive_firefox(
     })
 }
 
-/// Firefox's scratch home, removed ([`firefox::remove_home`]) when dropped:
-/// declared before the browser's [`Running`], it outlives the browser on
-/// every path out of [`drive_firefox`].
+/// A posted-pages browser's scratch home, removed
+/// ([`firefox::remove_home`]) when dropped: made before the browser's
+/// [`Running`], it outlives the browser on every path out of
+/// [`drive_firefox`] and [`drive_webkit`].
 struct ScratchHome(PathBuf);
 
 impl Drop for ScratchHome {
@@ -1262,15 +1396,17 @@ mod tests {
         let site_arg = site.display().to_string();
         assert_eq!(drive_main(&s(&[&site_arg])), exit::USAGE);
         assert_eq!(
-            drive_main(&s(&[&site_arg, "/o", "--engine", "webkit"])),
+            drive_main(&s(&[&site_arg, "/o", "--engine", "safari"])),
             exit::USAGE
         );
         assert_eq!(drive_main(&s(&[&site_arg, "/o", "--fast"])), exit::USAGE);
-        assert_eq!(
-            drive_main(&s(&[&site_arg, "/o", "--engine", "firefox"])),
-            exit::COULD_NOT_RUN,
-            "a site without its gpu glue"
-        );
+        for engine in ["firefox", "webkit"] {
+            assert_eq!(
+                drive_main(&s(&[&site_arg, "/o", "--engine", engine])),
+                exit::COULD_NOT_RUN,
+                "{engine}: a site without its gpu glue"
+            );
+        }
         assert_eq!(site_main(&s(&[]), dir.path()), exit::USAGE);
     }
 

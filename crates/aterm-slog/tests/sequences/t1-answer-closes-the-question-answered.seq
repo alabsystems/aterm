@@ -4,7 +4,7 @@ seq v=1 rig=screen program=claude build=2.1.0
 see busy
 half
 see prompt question
-expect open p1 question par=t1 at=500
+expect open p1 question par=t1 @500
 admit harness act=answer
 accept
 see busy

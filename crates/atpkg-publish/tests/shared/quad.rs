@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The quad verifier is the CLIENT's chain: a quad the shipping signer makes verifies;
+//! The quad verifier is the client's chain: a quad the shipping signer makes verifies;
 //! every way of breaking one is refused.
 
 use std::sync::Arc;

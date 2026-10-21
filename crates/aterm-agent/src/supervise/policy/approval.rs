@@ -148,6 +148,14 @@ pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
 /// continue automatically …` row, at every level, under
 /// [`ApprovalCtx::limit_wait`].
 pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
+/// Gemini CLI's usage-limit dialog that names its reset ([`limit_retry`]):
+/// its `Keep trying`, once that reset (the end of the minute it names) and
+/// the program's grace have passed
+/// ([`ApprovalCtx::limit_retry`]), at every level, under
+/// [`ApprovalCtx::limit_wait`]. Before then the loop waits on the dialog
+/// (`approval_loop.rs`, `limit_retry_hold`): the analogue of Claude Code's
+/// wait row, whose program goes on by itself at the reset.
+pub const RULE_LIMIT_RETRY: &str = "limit-retry@v1";
 /// The usage-limit dialog's grant row ([`limit_reset`]): the one reset on
 /// offer, of a kind the step takes, or the first kind of the owner's list on
 /// offer ([`ApprovalCtx::reset_kinds`]), `Use a <5-hour|weekly|full> reset
@@ -453,8 +461,10 @@ pub enum SecretRule {
 
 /// The default secrets list: key and credential stores, key and token file
 /// shapes (including aterm's `*.token`), shell histories, and under `home`
-/// all of `~/Library` and tool credential directories. Checked on top of the
-/// allow-list ([`ApprovalCtx::read_roots`]).
+/// all of `~/Library` and tool credential directories, `aterm secrets`' among
+/// them (`~/.secrets`, the files it writes, and `~/.config/aterm/secrets`, its
+/// machine key and vault cache: docs/DESIGN-secrets-2026-10-20.md §14.6).
+/// Checked on top of the allow-list ([`ApprovalCtx::read_roots`]).
 pub fn default_secrets(home: Option<&Path>) -> Vec<SecretRule> {
     let mut out: Vec<SecretRule> = [
         ".ssh",
@@ -503,6 +513,8 @@ pub fn default_secrets(home: Option<&Path>) -> Vec<SecretRule> {
             ".claude.json",
             "Library",
             ".cargo/credentials",
+            ".secrets",
+            ".config/aterm/secrets",
         ] {
             out.push(SecretRule::Under(h.join(sub)));
         }
@@ -582,6 +594,14 @@ pub struct ApprovalCtx {
     /// it: with it off the dialog is the wait row's, as it was before a reset
     /// could be taken.
     pub limit_reset: bool,
+    /// GEMINI CLI'S USAGE-LIMIT DIALOG IS DUE ITS `Keep trying`
+    /// ([`RULE_LIMIT_RETRY`], under [`Self::limit_wait`]): the reset its
+    /// `Access resets at <time>.` row names ([`aterm_phase::gemini::limit_reset`])
+    /// and the program's grace after it have passed, by the loop's clock, and
+    /// so has the loop's back-off from its last `Keep trying` (the loop's
+    /// `limit_retry_due`, `approval_loop.rs`). `false`: not yet, and the
+    /// dialog is waited on, never pressed and never a person's for that.
+    pub limit_retry: bool,
     /// The kinds of reset [`Self::limit_reset`] may spend, the owner's first
     /// first (`[harness] limit_reset_kinds`); empty, the dialog's one reset
     /// on offer ([`aterm_phase::reset_row`]).
@@ -757,6 +777,7 @@ impl ApprovalCtx {
             model_fallback: defaults.model_fallback.is_some(),
             limit_wait: defaults.limit_wait,
             limit_reset: defaults.limit_reset,
+            limit_retry: false,
             reset_kinds: defaults.limit_reset_kinds,
             usage_credits: defaults.usage_credits,
             autocompact_offer: defaults.autocompact_offer,
@@ -1124,14 +1145,28 @@ fn draws_claude_boxes(program: Program) -> bool {
     }
 }
 
+/// Whether `program`'s usage-limit dialog is kept trying past the reset it
+/// names ([`limit_retry`], [`RULE_LIMIT_RETRY`]): Gemini CLI's, whose `Keep
+/// trying` sends the turn again. Claude Code's has its wait row, and no other
+/// program's is one the reader vouches for.
+#[must_use]
+pub fn keeps_trying_its_limit(program: Program) -> bool {
+    match program {
+        Program::Gemini => true,
+        Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+    }
+}
+
 /// Why a usage-limit dialog no rule here answers goes to a person: Gemini
 /// CLI's (`Usage limit reached for <model>.` over `1. Keep trying` and `2.
-/// Stop`, measured on 0.46.0) offers no wait — `Keep trying` sends the turn
-/// again into a quota that resets hours later, so pressed by a supervisor it
-/// would be pressed again at every return, and `Stop` ends the turn — and
-/// names its own `/stats model`; any other program's is not one the reader
-/// vouches for. Short: an escalation's reason is cut after 120 cells, and
-/// the dialog's title is already its label.
+/// Stop`, measured on 0.46.0) where it names no reset (a key's per-day
+/// quota) offers no wait — `Keep trying` sends the turn again into a quota
+/// whose reset nothing names, so pressed by a supervisor it would be pressed
+/// again at every return, and `Stop` ends the turn — and names its own
+/// `/stats model` (one that names its reset is [`limit_retry`]'s); any other
+/// program's is not one the reader vouches for. Short: an escalation's
+/// reason is cut after 120 cells, and the dialog's title is already its
+/// label.
 fn foreign_limit(program: Program) -> &'static str {
     match program {
         Program::Gemini => {
@@ -1173,10 +1208,10 @@ fn decide_box(
     if let Some(prompt) = reading.prompt.as_ref()
         && prompt.kind == PromptKind::UsageLimit
     {
-        let decision = if !draws_claude_boxes(reading.program)
-            || reading.phase != Phase::Prompt
-            || !reading.phase_authoritative
-        {
+        let read = reading.phase == Phase::Prompt && reading.phase_authoritative;
+        let decision = if read && keeps_trying_its_limit(reading.program) {
+            limit_retry(prompt, rows, ctx)
+        } else if !draws_claude_boxes(reading.program) || !read {
             Decision::escalate(foreign_limit(reading.program))
         } else {
             limit_reset(prompt, rows, ctx).unwrap_or_else(|| limit_wait(prompt, rows, ctx))
@@ -2606,7 +2641,7 @@ fn read_path_on_disk(path: &str, comps: &[String], ctx: &ApprovalCtx) -> Result<
     }
     // The scan lists folders, so it runs for a path every cheaper test passed:
     // one that is held lists nothing.
-    if let Some(twin) = ctx.probe.hidden_twin(comps)? {
+    if let Some(twin) = ctx.probe.hidden_twin_in(comps, ctx.home.as_deref())? {
         return Err(format!(
             "a Read of {path}: {twin:?} differs from it only by characters the box may not \
              draw (and by case, which the default volume ignores), so the box may not show \
@@ -3620,6 +3655,78 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
         },
         guard: row_guard(title_row),
         subject: label,
+        unproven: None,
+    }
+}
+
+/// GEMINI CLI'S USAGE-LIMIT DIALOG ([`RULE_LIMIT_RETRY`]; aterm-phase's
+/// "THE USAGE-LIMIT DIALOG IS A BOX, NOT A WALL"): a Google account's spent
+/// quota names its reset (`Access resets at 5:06 AM PDT.`,
+/// [`aterm_phase::gemini::limit_reset`]) over exactly `1. Keep trying` and
+/// `2. Stop`. Its `Keep trying` sends the turn's request again, so it is
+/// pressed only once that reset (the end of the minute it names) and the
+/// program's grace have passed
+/// ([`ApprovalCtx::limit_retry`], the loop's clock): the turn goes on where
+/// the quota stopped it, as Claude Code's own continuation does at its
+/// reset. Before then the dialog is the loop's to wait on (it holds the
+/// point, `approval_loop.rs`); a decision made there anyway says so and
+/// hands it over. Never `Stop` (it ends the turn on an error that no longer
+/// says it was the quota). The digit is guarded on the reset's own row, so a
+/// dialog drawn again with another reset is judged again. A dialog that
+/// names no reset (a key's per-day quota), or other options, is a person's
+/// ([`foreign_limit`]), and so is every one with `limit_wait` off.
+fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
+    if !ctx.limit_wait {
+        return Decision::escalate("a usage-limit dialog (limit_wait is off)");
+    }
+    let Some(reset) = aterm_phase::gemini::limit_reset(rows) else {
+        return Decision::escalate(foreign_limit(Program::Gemini));
+    };
+    let labels: Vec<&str> = prompt.options.iter().map(|o| o.label.as_str()).collect();
+    let retry = anchor("gemini.usage.retry");
+    if labels != [retry, "Stop"] {
+        return Decision::escalate(format!(
+            "Gemini CLI's usage limit offers {}: only `{retry}` over `Stop` is pressed",
+            labels.join(" | ")
+        ));
+    }
+    if !ctx.limit_retry {
+        return Decision::escalate(format!(
+            "Gemini CLI's usage limit resets at {reset}: {retry} is pressed past it"
+        ));
+    }
+    let head = anchor("gemini.usage.resets");
+    let first_option = prompt.options[0].row;
+    let Some(reset_row) = rows
+        .iter()
+        .enumerate()
+        .take(first_option.min(rows.len()))
+        .skip(prompt.span.0 + 1)
+        .find(|(_, r)| r.contains(head))
+        .map(|(k, _)| k)
+    else {
+        return Decision::escalate("the usage-limit dialog's reset row is not on the screen");
+    };
+    let choice = match (prompt.select, prompt.options[0].n) {
+        (Select::Digits, Some(n)) => Choice::Digit(n),
+        (Select::ArrowsEnter, _) => {
+            let Some(at) = prompt.options.iter().position(|o| o.focused) else {
+                return Decision::escalate("a usage-limit dialog with no focused option");
+            };
+            Choice::Focus {
+                steps: focus_steps(at, 0),
+                label: retry.to_string(),
+            }
+        }
+        (Select::Digits, None) => {
+            return Decision::escalate("a numbered dialog with an unnumbered option");
+        }
+    };
+    Decision::Approve {
+        rule_id: RULE_LIMIT_RETRY,
+        choice,
+        guard: row_guard(&rows[reset_row]),
+        subject: format!("{retry} (reset {reset})"),
         unproven: None,
     }
 }

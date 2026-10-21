@@ -37,9 +37,9 @@ fn file_with(pid: Option<u32>, heartbeat_unix: u64) -> ProgressFile {
     }
 }
 
-/// The staleness laws (design §3): a dead installer's file can never claim
-/// live progress — cleared pid, stale heartbeat, absurd future heartbeat, and
-/// an exited child all read not running; only fresh + alive reads running.
+/// The staleness laws: a dead installer's file never claims live progress. A cleared pid,
+/// a stale or absurd future heartbeat, and an exited child read not running; only fresh
+/// and alive reads running.
 #[test]
 fn running_verdict_fails_safe() {
     let now = pkg_unix_now();
@@ -237,9 +237,8 @@ fn child_exit_interrupts_a_parked_progress_tailer() {
     let _ = std::fs::remove_dir_all(&prefix);
 }
 
-/// The bump-triggered early pass rate floor (panel-required): at most one per
-/// 5 minutes, and a bump whose every program already failed in the current
-/// pass does not re-trigger — while any un-failed name still does.
+/// The bump-triggered early pass runs at most once per 5 minutes, and a bump whose every
+/// program already failed in the current pass does not re-trigger; an un-failed name does.
 #[test]
 fn bump_rate_floor_and_failure_filter() {
     let now = Instant::now();
@@ -274,10 +273,9 @@ fn bump_rate_floor_and_failure_filter() {
     );
 }
 
-/// A published-index hint actually interrupts a parked successful lane; a
-/// missing hint leaves its full-scan deadline in force, and a contention park
-/// leaves the probe to the holder. The transport is injected, so no network or
-/// five-second timer is needed to exercise the loop's decision.
+/// A published-index hint interrupts a parked successful lane; a missing hint leaves its
+/// full-scan deadline in force, and a contention park leaves the probe to the holder. The
+/// transport is injected, so no network or park slice is involved.
 #[test]
 fn published_index_wakes_the_package_park_without_cutting_failure_backoff() {
     let layout = atpkg::store::Layout {
@@ -701,11 +699,9 @@ fn contention_backoff_doubles_once_then_wedges_and_resets() {
     assert!(!d.wedged());
 }
 
-/// A sibling's file whose writer died mid-pass (dead pid, no `ended_unix`) is
-/// not this window's story while our own child lives: the tailer holds it back
-/// instead of rendering the ⏸ Warn "stopped" row over a pass that is continuing
-/// here. Our own child's file, a running foreign one, and an ended foreign one
-/// are all still posted.
+/// A sibling's file whose writer died mid-pass (dead pid, no `ended_unix`) is held back
+/// while our own child lives, so no "stopped" row covers a pass continuing here. Our own
+/// child's file, a running foreign one, and an ended foreign one are still posted.
 #[test]
 fn a_dead_sibling_writer_is_not_posted_over_our_own_waiting_child() {
     let dead_sibling = PkgProgressSnapshot {
@@ -739,11 +735,9 @@ fn a_dead_sibling_writer_is_not_posted_over_our_own_waiting_child() {
     assert!(!foreign_writer_died_mid_pass(&no_pid, 15441));
 }
 
-/// The wedge tally's input: a running sibling's file whose work moved on between
-/// two reads is the holder advancing; a heartbeat-only refresh (the holder's
-/// tick thread runs whether or not anything happens — a pass parked on a sudo
-/// prompt heartbeats too), our own child's file, and a sibling's not-running
-/// file are not.
+/// The wedge tally's input: a running sibling's file whose work moved between two reads
+/// is the holder advancing; a heartbeat-only refresh (the holder heartbeats even when
+/// parked on a sudo prompt), our own child's file, and a not-running sibling's are not.
 #[test]
 fn a_running_siblings_work_moving_on_is_an_advance_and_a_heartbeat_alone_is_not() {
     let ours = 15441;
@@ -812,10 +806,9 @@ fn a_running_siblings_work_moving_on_is_an_advance_and_a_heartbeat_alone_is_not(
 }
 
 /// A tailer that saw a running sibling's work advance says so at `finish`; one that saw
-/// only heartbeats does not (the "sibling" is this test process). The test waits for
-/// the tailer's first read (its baseline, posted after `holder_work_advanced` takes
-/// it), not a clock; `finish` loads the stop flag before its final read, so no sleep
-/// follows a write.
+/// only heartbeats does not (the "sibling" is this test process). The test waits for the
+/// tailer's first post, which follows `holder_work_advanced` taking its baseline, not a
+/// clock; `finish` loads the stop flag before its final read, so a write needs no sleep.
 #[test]
 fn the_tailer_reports_a_siblings_advance_at_finish() {
     let prefix =
@@ -830,9 +823,8 @@ fn the_tailer_reports_a_siblings_advance_at_finish() {
     let mut file = file_with(Some(std::process::id()), pkg_unix_now());
     write(&file);
     let (tx, rx) = std::sync::mpsc::channel::<Option<Box<PkgProgressSnapshot>>>();
-    // The bound only ends a tailer that never reads; a read that saw the
-    // sibling not running posts nothing and took no baseline, so it ends
-    // here too rather than in a verdict about advances.
+    // The bound only ends a tailer that never reads; a read that saw the sibling not
+    // running posts nothing and takes no baseline, so it fails here too.
     let baseline = |which: &str| {
         let first = rx
             .recv_timeout(Duration::from_secs(60))

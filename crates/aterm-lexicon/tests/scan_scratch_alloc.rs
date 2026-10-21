@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exact allocation regression for the caller-owned scanner workspace.
+//! A warmed `ScanScratch` scan allocates nothing.
 
 use aterm_lexicon::{Lexicon, Match, ScanOptions, ScanScratch};
 

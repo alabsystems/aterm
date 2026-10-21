@@ -15,49 +15,41 @@ pub struct Bundle {
     pub exe: PathBuf,
 }
 
-/// The `Info.plist` key marking a bundle as a LOCAL DEV BUILD the updater must not
+/// The `Info.plist` key marking a bundle as a local dev build the updater must not
 /// replace. `<string>true</string>`; any other value, or absence, is a normal
 /// install. Stamped by `targo --unverified ship dev-app` (its `--no-pin` omits it).
 ///
-/// Layout alone cannot tell a dev build from a release, and the update gate is a
-/// BUILD NUMBER comparison (`github.rs`) against a dev build's HEAD-committer-epoch
-/// number, so without this mark a background check would silently replace an older
-/// commit's build under test.
-///
-/// It lives in `Info.plist` because that file is codesign-sealed: editing it to fake
-/// or strip the mark invalidates the signature, so the mark is tamper-evident.
+/// Layout cannot tell a dev build from a release, and the update gate compares build
+/// numbers against a dev build's HEAD-committer-epoch number, so without the mark a
+/// background check would replace a build under test. `Info.plist` is codesign-sealed,
+/// so faking or stripping the mark breaks the signature.
 pub const DEV_BUILD_KEY: &str = "<key>ATermDevBuild</key>";
 
-/// Whether an `Info.plist`'s text marks a dev build. Pure, so the contract is
-/// unit-testable without a bundle on disk.
+/// Whether an `Info.plist`'s text marks a dev build.
 ///
-/// Fails **open** (not a dev build) on anything unclear — absent key, empty or
-/// non-`true` value, binary/unreadable plist: a corrupt plist must never silently
-/// switch a normal install's updates off.
+/// Fails open (not a dev build) on anything unclear (absent key, non-`true` value, binary
+/// or unreadable plist): a corrupt plist must never switch a normal install's updates off.
 #[must_use]
 pub fn plist_marks_dev_build(text: &str) -> bool {
     crate::manifest::xml_plist_string(text, DEV_BUILD_KEY)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-/// Read the dev mark off a bundle on disk. Unreadable ⇒ false (see
-/// [`plist_marks_dev_build`] for why the failure direction is open). Bounded
-/// (`read_ledger_text`): `which_copy` asks this on every `--version` and About open.
+/// Read the dev mark off a bundle on disk; unreadable is false. Bounded
+/// (`read_ledger_text`): `which_copy` asks on every `--version` and About open.
 pub(crate) fn is_dev_marked(app_root: &Path) -> bool {
     crate::read_ledger_text(&app_root.join("Contents/Info.plist"))
         .is_some_and(|text| plist_marks_dev_build(&text))
 }
 
-/// The `Info.plist` key by which a bundle DECLARES it can take a CHUNKED
-/// rendezvous grant (`aterm-gui`'s `handoff_rendezvous`, `ATRZ2G`): the handoff
-/// descriptors of more sessions than one `SCM_RIGHTS` message carries, sent over
-/// several. Its value is the capability's token, [`HANDOFF_GRANT_CHUNKS_TOKEN`].
+/// The `Info.plist` key by which a bundle declares it takes a chunked rendezvous grant
+/// (`aterm-gui`'s `handoff_rendezvous`, `ATRZ2G`): the descriptors of more sessions than
+/// one `SCM_RIGHTS` message carries, sent over several. Its value is
+/// [`HANDOFF_GRANT_CHUNKS_TOKEN`].
 ///
-/// A DECLARED CAPABILITY, NOT A POLICY KNOB: read only after the candidate's
-/// signature, sealed identity and authorization verified (the handoff pre-verify),
-/// so it is sealed evidence of what the candidate's code does, never a way to relax
-/// a check. Anything but the exact token reads as "not declared"; a read the system
-/// refused FOR NOW is no answer at all ([`declares_grant_chunks`]).
+/// A declared capability, not a policy knob: read only after the candidate's signature,
+/// sealed identity and authorization verified, so it never relaxes a check. Anything but
+/// the exact token is "not declared".
 pub const HANDOFF_GRANT_CHUNKS_KEY: &str = "<key>ATermHandoffGrantChunks</key>";
 
 /// The value [`HANDOFF_GRANT_CHUNKS_KEY`] carries in a bundle that reads chunked
@@ -73,12 +65,9 @@ pub fn plist_declares_grant_chunks(text: &str) -> bool {
         .is_some_and(|value| value == HANDOFF_GRANT_CHUNKS_TOKEN)
 }
 
-/// Read the chunked-grant declaration off a bundle on disk. Called only on a
-/// bundle whose signature has just been verified.
-///
-/// `Err` is a read the system refused FOR NOW ([`grant_chunks_judged`]): the
-/// caller refuses the pre-verification as a passing condition rather than cache
-/// "not declared" with the candidate's pass.
+/// Read the chunked-grant declaration off a bundle whose signature was just verified.
+/// `Err` is a momentary read refusal ([`grant_chunks_judged`]): the caller fails the
+/// pre-verification as passing rather than cache "not declared".
 pub(crate) fn declares_grant_chunks(app_root: &Path) -> Result<bool, String> {
     let path = app_root.join("Contents/Info.plist");
     grant_chunks_judged(&path, crate::read_ledger_text_checked(&path))
@@ -86,12 +75,10 @@ pub(crate) fn declares_grant_chunks(app_root: &Path) -> Result<bool, String> {
 
 /// What the read of the `Info.plist` at `path` says about the chunked grant.
 ///
-/// A MOMENT IS NOT A VERDICT: a read the system refused just then (`EMFILE`, `EIO`,
-/// `ENOMEM`: [`aterm_update_core::handoff_policy::is_momentary_read_error`]) never
-/// reached the bytes, and caching it as "not declared" with the pass would deny a
-/// capable candidate the chunked grant for the cache's life. `Err` names it; an
-/// error the same file would give again (`EACCES`, a FIFO, over the cap, not UTF-8)
-/// stays "not declared".
+/// A momentary refusal ([`aterm_update_core::handoff_policy::is_momentary_read_error`]:
+/// `EMFILE`, `EIO`, `ENOMEM`) never reached the bytes, so it is `Err`, not a "not declared"
+/// cached with the pass for the cache's life. An error the same file would give again
+/// (`EACCES`, a FIFO, over the cap, not UTF-8) is "not declared".
 pub(crate) fn grant_chunks_judged(
     path: &Path,
     read: std::io::Result<Option<String>>,
@@ -105,64 +92,47 @@ pub(crate) fn grant_chunks_judged(
     }
 }
 
-/// Resolve the installed bundle the updater **may replace**, or `None` when it must
-/// not act:
+/// Resolve the installed bundle the updater may replace, or `None` when it must not act:
 ///
-/// * not the `…/<name>.app/Contents/MacOS/<exe>` layout (dev build, `cargo run`,
-///   `target/release` binary) — there is nothing to swap;
-/// * an **App-Translocation** path (`…/AppTranslocation/…`) — a read-only,
-///   randomized ephemeral copy; swapping it would be wrong and would fail;
-/// * a path under `/Volumes/…` — running directly from a mounted DMG (read-only);
-/// * a bundle carrying [`DEV_BUILD_KEY`] — a local build installed in place.
+/// * not the `…/<name>.app/Contents/MacOS/<exe>` layout (a `target/` binary): nothing to
+///   swap;
+/// * an App Translocation path (`…/AppTranslocation/…`): a read-only, randomized copy;
+/// * under `/Volumes/…`: running from a mounted DMG (read-only);
+/// * a bundle carrying [`DEV_BUILD_KEY`]: a local build installed in place.
 ///
-/// Paths that only OBSERVE the installed bundle, or FINALIZE a swap a previous run
-/// already performed, must use [`resolve_layout`] instead.
+/// Paths that only observe the bundle, or finalize a swap a previous run performed, use
+/// [`resolve_layout`].
 pub fn resolve() -> Option<Bundle> {
     let bundle = resolve_layout()?;
-    // Dev-marked: inert for every ACQUIRING path, exactly like a `target/` binary.
-    // Rejoining the channel is then a deliberate act (`tools/install.sh`), never
-    // something a background check decides on the operator's behalf.
+    // A dev-marked bundle rejoins the channel only by a deliberate `tools/install.sh`.
     if is_dev_marked(&bundle.app_root) {
         return None;
     }
     Some(bundle)
 }
 
-/// Resolve the bundle by LAYOUT alone, ignoring the dev mark.
+/// Resolve the bundle by layout alone, ignoring the dev mark.
 ///
-/// For the two kinds of caller that must keep working on a dev-marked install:
-///
-/// * **observation** — reporting provenance/trial facts about the bundle, which are
-///   no less true for a local build;
-/// * **finalization** — boot-health confirmation and crash-loop rollback, which
-///   install nothing but complete a swap a previous run already made. Gating those
-///   would strand an armed trial (post-swap, pre-confirmation) with no way to
-///   confirm or revert if a bundle were marked between the swap and the next launch.
-///
-/// Anything that STAGES or APPLIES goes through [`resolve`].
+/// For callers that must keep working on a dev-marked install: observation (provenance and
+/// trial facts) and finalization (boot-health confirmation, crash-loop rollback), which
+/// complete a swap a previous run made; gating those would strand an armed trial if the
+/// bundle were marked between the swap and the next launch. Anything that stages or
+/// applies goes through [`resolve`].
 pub fn resolve_layout() -> Option<Bundle> {
-    // Deliberate symlink-shim resolution (a `/usr/local/bin/aterm` launcher names
-    // the real bundle executable), not an identity comparison.
+    // Canonicalized so a `/usr/local/bin/aterm` symlink names the real bundle executable.
     let exe = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
     resolve_from(&exe)
 }
 
 pub use crate::install_posture::InstallPosture;
 
-/// Classify a running executable's path — the pure core of the first-open
-/// doctor, testable with a synthetic path exactly like [`resolve_from`].
+/// Classify a running executable's path: the pure core of the first-open doctor.
 ///
-/// ORDER MATTERS. A translocated copy of a DMG launch can match both markers,
-/// and translocation is the more specific truth (the path is randomized, so the
-/// user cannot even find the copy that is running); it is therefore tested
-/// first. Everything else that is bundle-shaped is `Installed` — the dev mark
-/// is deliberately NOT consulted here, because a dev build is a healthy install
-/// as far as the person looking at the report is concerned, and [`resolve`]
-/// already gates acquisition on it separately.
+/// Translocation is tested first: a translocated DMG launch matches both markers, and its
+/// randomized path is the more specific truth. The dev mark is not consulted: a dev build
+/// is a healthy install to the person reading the report, and [`resolve`] gates on it.
 #[must_use]
 pub fn posture_from(exe: &Path) -> InstallPosture {
-    // Lossy is fine and deliberate, exactly as in `resolve_from`: the string is
-    // only substring-matched against ASCII markers, never used as a path.
     let s = exe.to_string_lossy();
     if s.contains("/AppTranslocation/") {
         return InstallPosture::Translocated;
@@ -176,12 +146,10 @@ pub fn posture_from(exe: &Path) -> InstallPosture {
     InstallPosture::Installed
 }
 
-/// Pure core of [`resolve`], split out so it is unit-testable with a synthetic
-/// path (no real filesystem / `current_exe`).
+/// Pure core of [`resolve_layout`], testable with a synthetic path.
 pub fn resolve_from(exe: &Path) -> Option<Bundle> {
-    // Bail on translocated / mounted-image launches: never swap those. The lossy
-    // string is only substring-MATCHED against ASCII markers, never used as a
-    // path, so lossy is fine by design.
+    // Never swap a translocated or mounted-image launch. Lossy is fine: the string is
+    // only matched against ASCII markers, never used as a path.
     let s = exe.to_string_lossy();
     if s.contains("/AppTranslocation/") || s.starts_with("/Volumes/") {
         return None;
@@ -189,10 +157,9 @@ pub fn resolve_from(exe: &Path) -> Option<Bundle> {
     layout_of(exe)
 }
 
-/// The `…/<X>.app/Contents/MacOS/<exe>` SHAPE alone — no translocation, volume or
-/// dev-mark gate. For NAMING the bundle a process runs from (`which_copy`: a DMG
-/// launch is still "running: /Volumes/aterm/aterm.app"), never for acting on it —
-/// every acquiring path goes through [`resolve`] / [`resolve_from`].
+/// The `…/<X>.app/Contents/MacOS/<exe>` shape alone, with no translocation, volume or
+/// dev-mark gate. For naming the bundle a process runs from (`which_copy`: a DMG launch
+/// still names `/Volumes/aterm/aterm.app`), never for acting on it.
 pub(crate) fn layout_of(exe: &Path) -> Option<Bundle> {
     // Require exactly  …/<X>.app/Contents/MacOS/<exe>.
     let macos = exe.parent()?; // …/Contents/MacOS
@@ -213,19 +180,16 @@ pub(crate) fn layout_of(exe: &Path) -> Option<Bundle> {
     })
 }
 
-/// What probing the bundle's PARENT for a write answered ([`probe_parent_write`]).
+/// What probing the bundle's parent for a write answered ([`probe_parent_write`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParentWrite {
     /// An entry was created there: the swap's renames can land.
     Writable,
-    /// This user may not write there — `EACCES`/`EPERM` (an admin-owned or
-    /// MDM-managed `/Applications`), `EROFS` (a read-only volume) — or the error
-    /// is one that answers the same way every time. A person's to clear.
+    /// `EACCES`/`EPERM` (an admin-owned or MDM-managed `/Applications`), `EROFS`, or an
+    /// error that answers the same every time. A person's to clear.
     NotWritable(String),
-    /// The folder may well be writable, but the write failed for a reason of this
-    /// MOMENT: a full disk (`ENOSPC`), a quota (`EDQUOT`), an I/O error (`EIO`), an
-    /// interrupted call, or leftover probe names past every fresh one tried.
-    /// Retried, never a person's.
+    /// A failure of the moment: `ENOSPC`, `EDQUOT`, `EIO`, an interrupted call, or every
+    /// fresh probe name already taken. Retried, never a person's.
     Passing(String),
 }
 
@@ -233,14 +197,11 @@ pub enum ParentWrite {
 /// already taken (a probe a killed process left behind, a sibling mid-probe).
 const PROBE_NAMES: u32 = 8;
 
-/// Whether we can replace the bundle in place: the swap operates in the bundle's
-/// **parent** directory, so that parent must be writable. Probe it directly by
-/// creating + removing a temp entry (more accurate than an `access()` mode guess,
-/// which misreads ACL- and MDM-managed `/Applications`).
+/// Whether the swap's renames can land in the bundle's parent, probed by creating and
+/// removing an entry (an `access()` check misreads ACL- and MDM-managed `/Applications`).
 ///
-/// ONLY A REFUSED WRITE IS "NOT WRITABLE": otherwise the pre-park gate would tell a
-/// person to move the app over a full disk or a leftover probe. A taken name is
-/// probed again under a fresh one; error kinds are split by [`classify_probe_error`].
+/// Only a refused write is `NotWritable`, so the pre-park gate never tells a person to
+/// move the app over a full disk or a leftover probe; a taken name is retried fresh.
 pub fn probe_parent_write(app_root: &Path) -> ParentWrite {
     let Some(parent) = app_root.parent() else {
         return ParentWrite::NotWritable(format!("{} has no parent folder", app_root.display()));
@@ -273,11 +234,9 @@ pub fn probe_parent_write(app_root: &Path) -> ParentWrite {
     ))
 }
 
-/// The verdict a failed probe `create_dir` in `parent` carries. A PERMISSION
-/// answer (`EACCES`, `EPERM`, `EROFS`) is the person's; a MOMENT (`ENOSPC`,
-/// `EDQUOT`, `EIO`, `EINTR`, and the process-table/descriptor/memory moments
-/// [`crate::verify::io_error_is_passing`] names) is passing. Anything else is not
-/// writable, since it answers the same way on every try.
+/// The verdict of a failed probe `create_dir` in `parent`: `ENOSPC`, `EDQUOT`, `EIO`,
+/// `EINTR` and [`crate::verify::io_error_is_passing`]'s errors are passing; anything else
+/// (`EACCES`, `EPERM`, `EROFS`, …) answers the same on every try and is not writable.
 pub(crate) fn classify_probe_error(parent: &Path, error: &std::io::Error) -> ParentWrite {
     let message = format!("create a probe in {}: {error}", parent.display());
     let passing = matches!(
@@ -295,8 +254,6 @@ pub(crate) fn classify_probe_error(parent: &Path, error: &std::io::Error) -> Par
 mod tests {
     use super::*;
 
-    /// Only a refused write is the person's; a full disk, a quota or an I/O error
-    /// is a moment.
     #[test]
     fn a_probe_error_is_the_person_s_only_when_the_write_was_refused() {
         let parent = Path::new("/Applications");
@@ -328,8 +285,7 @@ mod tests {
         }
     }
 
-    /// A probe a killed launch left behind is not "not writable": the probe takes
-    /// a fresh name. And a folder this user cannot write still says so.
+    /// A leftover probe is retried under a fresh name; an unwritable folder still says so.
     #[test]
     fn a_leftover_probe_name_is_probed_again_under_a_fresh_one() {
         use std::os::unix::fs::PermissionsExt;
@@ -432,7 +388,7 @@ mod tests {
         assert!(plist_marks_dev_build(&plist(
             "<key>ATermDevBuild</key>\n\t<string>TRUE</string>"
         )));
-        // Everything unclear fails OPEN — a normal install keeps updating.
+        // Everything unclear fails open: a normal install keeps updating.
         assert!(!plist_marks_dev_build(&plist("")));
         assert!(!plist_marks_dev_build(&plist(
             "<key>ATermDevBuild</key><string>false</string>"
@@ -473,9 +429,7 @@ mod tests {
         assert!(!plist_declares_grant_chunks("\u{0}bplist00 binary garbage"));
     }
 
-    /// THE SHIPPED TEMPLATE DECLARES IT: this build reads chunked grants, so the
-    /// bundle it ships in says so, and the build before it may hand this one more
-    /// sessions than one descriptor message carries.
+    /// This build reads chunked grants, so the bundle it ships in declares them.
     #[test]
     fn the_shipped_info_plist_declares_the_chunked_grant() {
         let template = include_str!("../../../apps/aterm-mac/Info.plist");

@@ -78,11 +78,12 @@
 //!    all of them (thirty keys are most of a page on their own).
 //!
 //! The cards are whole: a control card taller than one screen's room is split
-//! into continued cards ([`chunk_rows`]), a fact card taller than the screen
-//! scrolls by its rows, and the cards are one scrolling list, as on every
-//! Settings page. A heading that would not be whole takes its short words
-//! ([`card_heading`]); a compact page as wide as a Medium one keeps its
-//! control rows on one line.
+//! into continued cards ([`chunk_rows`]), a row taller than a screen is listed
+//! a part at a time by the page's list, as on every page
+//! ([`scroll::row_parts`]), a fact card taller than the screen scrolls by its
+//! rows, and the cards are one scrolling list, as on every Settings page. A
+//! heading that would not be whole takes its short words ([`card_heading`]);
+//! a compact page as wide as a Medium one keeps its control rows on one line.
 
 use super::*;
 use crate::autopilot_timers::TimerChoice;
@@ -482,6 +483,7 @@ impl SettingsApp {
 pub(super) fn harness_page(
     state: &SettingsViewState,
     harness: &HarnessProjection,
+    update: &UpdateProjection,
     width: SettingsWidth,
     cx: &ViewCx<'_>,
 ) -> Vec<UiNode> {
@@ -506,7 +508,7 @@ pub(super) fn harness_page(
     );
     let room = (settings_list_body_height(state, width, viewport) - heading_height)
         .max(scaled_control_height());
-    let cards = harness_cards(state, harness, width, page_width, (room, gap));
+    let cards = harness_cards(state, harness, update, width, page_width, (room, gap));
     let mut out = heading;
     out.push(scroll::list_page_peeking(
         state,
@@ -564,6 +566,7 @@ fn harness_choice_page(
 fn harness_cards(
     state: &SettingsViewState,
     harness: &HarnessProjection,
+    update: &UpdateProjection,
     width: SettingsWidth,
     card_width: f32,
     (room, gap): (f32, f32),
@@ -611,7 +614,7 @@ fn harness_cards(
         session_rows(
             harness,
             rows_width,
-            (inner, room),
+            inner,
             (state.harness_timer_open, state.harness_every_timer_open),
             selected,
         ),
@@ -685,7 +688,106 @@ fn harness_cards(
             card_width,
         ));
     }
+    // HARNESS UPDATES (docs/DESIGN-harness-updates-2026-10-21.md, "What the
+    // person sees") and its links to the pages that update, last: the page
+    // gained it after its order was set, so it moves nothing above it — not
+    // the verdict right after the page's actions (§11.6.1), nor a landing's
+    // screen.
+    cards.extend(facts(
+        "harness/updates",
+        ("HARNESS UPDATES", "UPDATES"),
+        &harness_update_rows(harness, update),
+    ));
+    cards.push(harness_update_actions(card_width));
     cards
+}
+
+/// Running harness provenance and installed CLI facts are distinct: an idle
+/// session may still be waiting to resume on the installed replacement.
+/// These are already captured facts; rendering starts no version probe.
+fn harness_update_rows(
+    harness: &HarnessProjection,
+    update: &UpdateProjection,
+) -> Vec<(String, String)> {
+    let cli = |id| {
+        harness
+            .ai
+            .clis
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| format!("{} · {}", row.title, row.detail))
+            .unwrap_or_else(|| "Not read yet. Open AI CLI versions to refresh.".to_string())
+    };
+    vec![
+        (
+            "Claude harness".to_string(),
+            format!(
+                "aterm {} ({})",
+                crate::build_info::version(),
+                crate::build_info::git_commit()
+            ),
+        ),
+        ("aterm updates".to_string(), update.headline.clone()),
+        ("CLI observations".to_string(), harness.ai.health.clone()),
+        ("Claude CLI".to_string(), cli("claude")),
+        ("Codex CLI".to_string(), cli("codex")),
+        (
+            "Delivery".to_string(),
+            "Claude's harness updates with aterm. Published CLI builds arrive through Packages. Sessions resume on a replacement when it is safe.".to_string(),
+        ),
+        (
+            "This session".to_string(),
+            "In codex-alab, /alab update shows the running build and pending update. codex --version and claude --version show the installed CLI.".to_string(),
+        ),
+    ]
+}
+
+/// Existing update and version pages remain the places that check, install,
+/// and report failures. These links do not initiate an update.
+fn harness_update_actions(card_width: f32) -> (UiNode, f32) {
+    let buttons = [
+        ("software", "Software Update", SettingsRoute::SoftwareUpdate),
+        ("packages", "Packages", SettingsRoute::Packages),
+        ("versions", "AI CLI versions", SettingsRoute::Ai),
+    ]
+    .map(|(key, label, route)| {
+        let (visual, lines) = button_words(label, &[], card_width);
+        let height =
+            crate::native_ui::native_button_height_for_lines(lines, scaled_control_height());
+        (
+            UiNode::new(
+                format!("harness/updates/{key}"),
+                UiContent::Button(
+                    Control::new(
+                        ButtonSpec::new(label).visual_label(visual),
+                        route_action(route),
+                    )
+                    .style(StyleRef::Secondary),
+                ),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(height)),
+            ),
+            height,
+        )
+    });
+    let total = buttons.iter().map(|(_, height)| height).sum::<f32>() + 2.0 * CARD_GAP;
+    (
+        UiNode::new(
+            "harness/update-actions",
+            UiContent::Group(GroupSpec::new("Harness updates")),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fixed(card_width))
+                .height(Length::Fixed(total))
+                .gap(CARD_GAP),
+        )
+        .children(buttons.into_iter().map(|(node, _)| node).collect()),
+        total,
+    )
 }
 
 /// Whether `text` is whole at `width` in the type `role` and `style` paint.
@@ -1154,34 +1256,15 @@ fn row_cards_inset(
         )
     };
     let heading_height = caption(key, false).1.max(caption(key, true).1);
-    // The tallest ROW, a row listed a part at a time ([`split_tall_block`])
-    // counted whole: the padding is the list's, decided by its rows, so a
-    // row above that comes to be listed in parts (or whole again) as a
-    // republish changes its height moves no card's padding under a row
-    // the page has landed on.
-    let mut tallest = 0.0_f32;
-    let mut block: Option<(&str, f32)> = None;
-    for (node, height) in &rows {
-        let key = node.key.as_str();
-        match block.as_mut() {
-            Some((head, total))
-                if key
-                    .strip_prefix(*head)
-                    .is_some_and(|rest| rest.starts_with("/part-")) =>
-            {
-                *total += CARD_GAP + height;
-            }
-            _ => {
-                if let Some((_, total)) = block {
-                    tallest = tallest.max(total);
-                }
-                block = Some((key, *height));
-            }
-        }
-    }
-    if let Some((_, total)) = block {
-        tallest = tallest.max(total);
-    }
+    // The tallest ROW, whole (the page's list lists a row taller than its
+    // screen a part at a time, [`scroll::row_parts`]): the padding is the
+    // list's, decided by its rows, so a row that comes to be listed in parts
+    // (or whole again) as a republish changes its height moves no card's
+    // padding under a row the page has landed on.
+    let tallest = rows
+        .iter()
+        .map(|(_, height)| *height)
+        .fold(0.0_f32, f32::max);
     let pad = if 2.0 * CARD_PAD + heading_height + tallest + CARD_GAP <= room {
         CARD_PAD
     } else {
@@ -1484,7 +1567,7 @@ fn no_session_open() -> String {
 fn session_rows(
     harness: &HarnessProjection,
     width: SettingsWidth,
-    (inner, room): (f32, f32),
+    inner: f32,
     (timer_open, every_open): (Option<u64>, bool),
     selected: Option<u64>,
 ) -> Vec<(UiNode, f32)> {
@@ -1505,31 +1588,28 @@ fn session_rows(
         )];
     }
     let offer = harness.land_at_offer;
-    // What one row of a continued card may take, as `switch_rows` reads it:
-    // a row taller is listed a part at a time — but a row with its Timer
-    // open only where it is taller than the list itself, since one no
-    // taller is drawn whole where it is landed on, its card's caption let
-    // go (the post-landing check's behaviour-1).
-    let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
-    let row_room = (room - 2.0 * TIGHT_CARD_PAD - heading_height - CARD_GAP).max(0.0);
-    let room_for = |open: bool| if open { room.max(0.0) } else { row_room };
+    // Each row is one block: a block taller than the screen shows under its
+    // card's caption is listed a part at a time by the page's list, as every
+    // Settings list lists a tall row ([`scroll::row_parts`]) — except one
+    // with its Timer open no taller than the list itself, which a landing
+    // draws whole, its card's caption let go (the post-landing check's
+    // behaviour-1, [`scroll::holds_open_disclosure`]).
     let measure = RowMeasure::of(&harness.sessions, width, inner);
     let mut rows: Vec<(UiNode, f32)> = harness
         .sessions
         .iter()
-        .flat_map(|row| {
+        .map(|row| {
             let open = timer_open == Some(row.local_id);
             let landed = selected == Some(row.local_id);
             let (node, height) = session_row(row, open, landed, measure, inner);
-            let block = session_timer(
+            session_timer(
                 row,
                 (node, height),
                 row.default.is_some(),
                 offer,
                 (open, landed),
                 inner,
-            );
-            split_tall_block(block, room_for(open))
+            )
         })
         .collect();
     // AFTER every per-session row (design §11.5.1): a session opening or
@@ -1537,109 +1617,15 @@ fn session_rows(
     // it moves none of them under the pointer, and SESSIONS' top is where it
     // was.
     if let Some(every) = &harness.every {
-        rows.extend(split_tall_block(
-            every_row(every, measure, offer, every_open, inner),
-            room_for(every_open),
-        ));
+        rows.push(every_row(every, measure, offer, every_open, inner));
     }
     rows
 }
 
-/// A SESSIONS ROW TALLER THAN ONE CARD'S ROOM, LISTED A PART AT A TIME: its
-/// block's lines — its words, its lines of buttons, its state, day and timer
-/// lines — gathered into parts no taller than `room` (a part a line alone
-/// where one is), each a row of the card and so a stop of the page's list,
-/// every part of a landed row on the accent card the row wears. The first
-/// part keeps the block's key and the row's group (its name and its words,
-/// whole); the rest are keyed `<block>/part-<n>`. A row the room holds is
-/// one block, as before. A short window at large text used to cram the row's
-/// buttons onto fewer lines to fit, cutting their faces to "Cru…" and "…".
-pub(super) fn split_tall_block((block, height): (UiNode, f32), room: f32) -> Vec<(UiNode, f32)> {
-    if height <= room + 0.01 {
-        return vec![(block, height)];
-    }
-    let gap = block.layout.gap;
-    let style = match &block.content {
-        UiContent::Group(group) => group.style,
-        _ => StyleRef::Plain,
-    };
-    let block_key = block.key.as_str().to_string();
-    let mut lines: Vec<UiNode> = Vec::new();
-    // The row's own group (its first child, a column of its words and
-    // buttons) is opened up, its lines listed one by one; the first part
-    // keeps the group, so its name is said once.
-    let mut row_group: Option<UiNode> = None;
-    for (index, child) in block.children.into_iter().enumerate() {
-        if index == 0 && !child.children.is_empty() && matches!(child.content, UiContent::Group(_))
-        {
-            let mut group = child;
-            lines.extend(std::mem::take(&mut group.children));
-            row_group = Some(group);
-        } else {
-            lines.push(child);
-        }
-    }
-    let mut parts: Vec<Vec<UiNode>> = vec![Vec::new()];
-    let mut used = 0.0_f32;
-    for line in lines {
-        let line_height = fixed_height(&line);
-        let part = parts.last_mut().expect("one part");
-        let cost = if part.is_empty() {
-            line_height
-        } else {
-            gap + line_height
-        };
-        if !part.is_empty() && used + cost > room + 0.01 {
-            parts.push(vec![line]);
-            used = line_height;
-        } else {
-            part.push(line);
-            used += cost;
-        }
-    }
-    parts
-        .into_iter()
-        .enumerate()
-        .map(|(index, lines)| {
-            let height = lines.iter().map(fixed_height).sum::<f32>()
-                + gap * lines.len().saturating_sub(1) as f32;
-            let children = match (index, row_group.as_mut()) {
-                (0, Some(group)) => {
-                    let mut group = std::mem::replace(
-                        group,
-                        UiNode::new(
-                            "-",
-                            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                        ),
-                    );
-                    group.layout = group.layout.height(Length::Fixed(height));
-                    group.children = lines;
-                    vec![group]
-                }
-                _ => lines,
-            };
-            let key = if index == 0 {
-                block_key.clone()
-            } else {
-                format!("{block_key}/part-{index}")
-            };
-            (
-                UiNode::new(
-                    key,
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group).style(style)),
-                )
-                .layout(Layout::column().height(Length::Fixed(height)).gap(gap))
-                .children(children),
-                height,
-            )
-        })
-        .collect()
-}
-
 /// AN OPEN TIMER'S CHOICES, ONE PIECE OF ITS ROW: its lines of choices
 /// (`<row>/timer-row/<n>`) in one column, `<row>/timer-choices`, so a row
-/// listed a part at a time — by the page ([`split_tall_block`]) or by the
-/// list ([`scroll::row_parts`]) — keeps every choice the Timer opened in one
+/// listed a part at a time by the page's list ([`scroll::row_parts`]) keeps
+/// every choice the Timer opened in one
 /// part where they fit one, never `1 hour` on one screen and `at 18:00` on
 /// the next (the open `Every session` row at 2× text on a short page). Its
 /// group is unlabeled: each line keeps its own name.
@@ -1658,7 +1644,7 @@ fn timer_choices(key: &str, rows: Vec<(UiNode, f32)>) -> (UiNode, f32) {
 }
 
 /// WHAT A TIMER'S OPENING REVEALS: its first choice, whose stop holds every
-/// choice it opened ([`split_tall_block`] keeps them one part) — the block
+/// choice it opened ([`scroll::row_parts`] keeps them one part) — the block
 /// itself where the room holds it whole, the part listing the choices where
 /// the block is listed a part at a time (the open `Every session` row at 2×
 /// text on a short page: its Timer button's part was revealed, and `at 18:00`
@@ -1724,7 +1710,7 @@ fn every_row(
     const FLOWS: [&[u8]; 3] = [&[4], &[2, 2], &[1, 1, 1, 1]];
     let lines: &'static [u8] = if stacked {
         // Faces whole, always; a row taller than the room is listed a part at
-        // a time ([`split_tall_block`]).
+        // a time ([`scroll::row_parts`]).
         FLOWS
             .iter()
             .position(|flow| {
@@ -2627,7 +2613,7 @@ const ROW_FACES: [&str; 5] = ["Cruise", "Land", "Off", "Timer", "Show"];
 /// which share the row's width, as many to a line as hold their faces whole
 /// — all five; else the three modes, then `Timer` and `Show`; else two to a
 /// line; else one. A row taller than one card of the page is listed a part
-/// at a time ([`split_tall_block`]); its faces are never cut. A fixed button
+/// at a time ([`scroll::row_parts`]); its faces are never cut. A fixed button
 /// is as wide as its widest face.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RowMeasure {
@@ -2664,7 +2650,7 @@ impl RowMeasure {
         };
         // FACES WHOLE, ALWAYS: the fewest lines whose buttons hold every face
         // whole. A row taller than one screen of the card is listed a part at
-        // a time ([`split_tall_block`]), never crammed: the flow used to fall
+        // a time ([`scroll::row_parts`]), never crammed: the flow used to fall
         // back to more buttons a line where its lines would not fit the room,
         // painting "Cru…" and a lone "…" on a short window at large text.
         let lines: &'static [u8] = if stacked {
@@ -2752,7 +2738,7 @@ fn line_button(inner: f32, count: u8) -> f32 {
 /// row (§11.7.7). Every button of the row, and of its open Timer
 /// ([`session_timer`]), waits for a look before a pointer press
 /// (`Control::look_first`, §11.5.7): a state line coming or going in a row
-/// above it (a background done, a timer's fire) moves it under a still
+/// above it (a background landing, a timer's fire) moves it under a still
 /// pointer, and that press then only lights it.
 fn session_row(
     row: &HarnessSessionRow,

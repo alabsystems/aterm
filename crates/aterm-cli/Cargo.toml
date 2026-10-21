@@ -9,20 +9,18 @@ license.workspace = true
 repository.workspace = true
 description = "aterm — the transparent session: runs your shell unchanged, byte for byte, through the protected spawn seam. The live model an AI reads is WINDOW mode; a session models nothing (U1)."
 
+[features]
+# Development seams in an optimized build, forwarded from aterm's `dev-seams`:
+# the amacs terminal face's (`amacs-term`).
+dev-seams = ["amacs-term/dev-seams"]
+
 [dependencies]
-# P0: the daily-driver CLI runs the shell through the PROTECTED spawn seam
-# (cap-gated + fail-closed fork/exec + OS-sandbox-wrapped when the mode demands
-# it + resource-bounded in the confinement modes only, safety/containment — see
-# `session_limits` in lib.rs), exactly like aterm-gui — not raw forkpty/execvp.
+# Protected PTY spawn seam (cap-gated, fail-closed, sandbox-wrapped).
 aterm-pty = { workspace = true }
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 aterm-sandbox = { workspace = true }
 aterm-containment = { workspace = true }
-# Read-only introspection sources for the `aterm` diagnostic subcommands
-# (CLI-DIAG): font enumeration / face metrics for `list-fonts` / `show-face`
-# (aterm-render), and the built-in colour-scheme registry for `list-themes`
-# (aterm-types). Neither is on the shell hot path — they are only reached by a
-# diagnostic subcommand that prints and exits before any PTY spawn.
+# Font/face and built-in theme introspection for diagnostic subcommands.
 aterm-render = { workspace = true }
 aterm-types = { workspace = true }
 # `aterm theme pack | install`: the community theme pack, embedded (no network).
@@ -30,54 +28,32 @@ aterm-theme-pack = { workspace = true }
 # `aterm help rust` calls the REAL toolchain discovery (`atpkg::toolchain`) rather
 # than restating it. The one `aterm` binary links atpkg already.
 atpkg = { workspace = true }
+# `aterm doctor`'s rows are converge items (docs/DESIGN-init-system-2026-10-20.md S5);
+# `crates/aterm` composes them with atpkg's.
+aterm-converge = { workspace = true }
 # `aterm agents`: the coding-agent primer installer. Its own std-only crate so the
 # GUI (auto-prime on every session) and this CLI verb drive ONE installer.
 aterm-primer = { workspace = true }
-# `aterm --version` names WHICH COPY of aterm is running (S12 of
-# docs/DESIGN-which-copy-runs-2026-08-27.md): the running bundle's path and, per other
-# aterm.app in the usual places, the one "another copy: …" sentence — spelled by the
-# updater's own `which_copy` module so About and --version cannot drift. Reached only
-# by the print-and-exit path, never the shell hot path; the one binary links the
-# updater already.
+# `aterm --version` bundle path and duplicate-install reporting (`which_copy`).
 aterm-update = { workspace = true }
-# `aterm help update` names the two update switches by the updater's one name for
-# each (`aterm_update_core::settings::CHECK_LABEL`), the words Settings paints. The
-# updater links it already, so it adds no package.
+# Canonical update setting labels for `aterm help update`.
 aterm-update-core = { workspace = true }
-# `aterm list-kitty-commands` and `aterm help kitty` print the kitty-command
-# vocabulary FROM the table the typed-line listener compiles (aterm-lexicon's
-# `tricks` module), so the listing cannot drift from the words that fire. Pure
-# data and a fold: reached only by those two print-and-exit paths, never the shell
-# hot path, and the one binary links the lexicon already (through the window).
+# Kitty-command vocabulary table for `aterm list-kitty-commands` and `aterm help kitty`.
 aterm-lexicon = { workspace = true }
-# `aterm doctor`'s `instances:` row: the aterm windows and headless instances no
-# control socket reaches, counted by aterm-ctl's census over the SAME rendezvous walk
-# `aterm ctl instances`/`ls`/`windows` make, so the doctor and the client cannot
-# disagree about what is reachable. Reached only by that print-and-exit path; the
-# one binary links aterm-ctl already, and it brings only first-party crates
-# (aterm-types, aterm-uds and aterm-codec).
+# Control-socket instance discovery for `aterm doctor`.
 aterm-ctl = { path = "../aterm-ctl" }
-# `aterm exceptions` and `aterm doctor`'s `exceptions:` row: what needs a look but not
-# now, read from `messages.log` with NO window running, decoded and replayed by the
-# SAME engine the window loads its log with (`LogLine::decode`, `MessageLog::replay_all`)
-# and worded by its pure `exceptions_report`, so the terminal, Settings ▸ Messages and
-# `aterm ctl messages need=later` cannot disagree. Reached only by those print-and-exit
-# paths; the one binary links it already (through aterm-render and the window).
+# Offline `messages.log` reader for `aterm exceptions` and `aterm doctor`.
 aterm-messages = { workspace = true }
-# `aterm_uds::spawnfd::command`: the `Command` every child here is built with, so
-# none inherits a descriptor of this process above stdio (clippy.toml: one child
-# constructor), and on Windows a caller with no console gives it a WINDOWLESS
-# console, where a bare console child opened a visible one (measured 2026-09-30). A
-# dependency-free leaf the one binary links already.
+# `aterm_uds::spawnfd::command` child-process builder.
 aterm-uds = { workspace = true }
-# aterm.toml, read through the parser the window loads the file with: on Windows
-# for `shell` (`aterm doctor` / `show-config` report the shell the WINDOW will
-# spawn), and for `[privacy] observer`, which `aterm doctor`'s `devtools:` row
-# honours as the window's Developer Tools row does (debugger design §9.1 O11).
-# First-party, and already in this binary's graph (aterm-containment and
-# aterm-update link it), so it adds no package; a hand-rolled line scan would be
-# the second parser of one file.
+# `aterm.toml` parser for `aterm doctor` and `show-config`.
 aterm-toml = { workspace = true }
+# `aterm help sys` reads THIS machine at the moment of the call (its OS and CPU
+# words, the cluster layout, memory and swap, the GPU, the load and the home
+# volume) through the readers the window's sampler calls, so the page never
+# states a remembered fact. First-party, std plus libc, and already in this
+# binary's graph through the window.
+aterm-sysprobe = { workspace = true }
 
 # `aterm theme check --format json` and `aterm theme schema`: the documents an agent
 # reads, built and printed by the workspace's one JSON crate (first-party; the one
@@ -93,16 +69,13 @@ amacs-term = { workspace = true }
 # the Windows driver is kernel32 console FFI with no libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-# `aterm doctor`'s `fabric:` row: whether the broker answers, the tier it says
-# it serves, and whether it says its log is poisoned, read by aterm-link's own
-# probe (`aterm_link::fabric::doctor_summary`) — the connect, `Hello` and
-# attach `aterm fabric` makes — so the two doctors read a broker the same way.
-# It reads the command the configuration names; the one place `aterm fabric`
-# looks beyond that, a running instance's bridge, `doctor_summary`'s doc says
-# why it skips and its `off` row names. Reached only by that print-and-exit
-# path; the one binary links aterm-link already on Unix, the only platform it
-# builds for (crates/aterm's Cargo.toml says why), so it adds no package.
+# `aterm_link::fabric::doctor_summary` probe for `aterm doctor`.
 aterm-link = { path = "../aterm-link" }
+
+# The Mac setup doctor's typed, per-key preference backups reuse the machine
+# provisioning library's plist codec.
+[target.'cfg(target_os = "macos")'.dependencies]
+aterm-machines = { workspace = true }
 
 [lints]
 workspace = true

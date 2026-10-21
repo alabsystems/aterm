@@ -116,6 +116,7 @@ fn answer(mut s: UnixStream, pages: &[Page]) {
             head: 0,
             resume: page.resume.clone(),
             durable: None,
+            oldest: None,
         };
         if write_frame(&mut s, &encode_response(&mark)).is_err() {
             return;

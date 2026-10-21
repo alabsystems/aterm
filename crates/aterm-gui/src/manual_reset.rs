@@ -1,78 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MANUAL RESET (2026-09-26): the escape hatch for a terminal the
-//! automatic foreground handback cannot reach — the `reset` control verb
+//! The manual reset: the escape hatch for a terminal the automatic foreground handback
+//! (`crate::foreground_handback`) cannot reach. It is the `reset` control verb
 //! (`aterm ctl @<sid> reset [flush]`) and the Edit ▸ Reset Terminal menu row
 //! (`invoke ResetTerminal`).
 //!
-//! # Why
+//! The handback acts only at a foreground change whose old holder is gone and owned an
+//! input-hijacking mode. Modes armed under a holder that never exits (a live shell), a shifted
+//! charset, an OSC 8 link a killed program left open, or a foreground change the sampler missed
+//! stay stuck. [`aterm_core::terminal::Terminal::manual_handback`] is the handback's byte plan
+//! without its evidence gate (a torn sequence gets `CAN`, every program-negotiable mode goes
+//! back to its host target, an open OSC 8 link is closed, and program-set palette/fg/bg/cursor/
+//! selection colours revert via OSC 104/110-119 with the colour stack kept); it never clears
+//! the screen or the scrollback.
 //!
-//! The foreground handback (2026-09-25, `crate::foreground_handback`) hands the
-//! terminal back only at a foreground change whose old holder is GONE and
-//! owned an input-hijacking mode. The robustness audit of 2026-09-26 found a
-//! live session outside that gate for good: window pid 6874, sid 0 at
-//! `~/publication`, idle about 97 000 s, a zsh prompt under `alt_screen=true
-//! mouse_mode=any mouse_encoding=sgr kitty_keyboard=disambiguate,…
-//! modify_other_keys=2`, with `997;1n997;2n` colour-scheme reports typed into
-//! it. The modes were armed before the handback existed, so the only holder
-//! its reader ever saw was the live zsh — never gone — and nothing could
-//! hand them back: every mouse move typed an SGR report at the prompt and zle
-//! rang the bell at each CSI-u chord, forever. The same holds for a shifted
-//! charset, an OSC 8 link a killed program left open, display modes a
-//! SIGKILLed `less` left, and any foreground change the sampler missed. The
-//! backlog item (robustness backlog #9, 2026-09-26) is this module.
+//! # Where it runs
 //!
-//! # What
+//! On the parse stage of the session's PTY reader, as one more message on the gather→parse
+//! channel ([`ResetLane`]), so it lands between two PTY batches: its synthesized bytes are
+//! recorded on the temporal spine as `RawIn` under the term-lock hold that processed them and
+//! ride the cast/`bytes` taps in order (a replay reaches the live state), and its
+//! `modes-restored` event is written by the thread that writes the automatic ones. A reset run
+//! under the control thread's own term lock would be recorded out of order against the
+//! reader's cast tap.
 //!
-//! [`aterm_core::terminal::Terminal::manual_handback`]: the handback's own
-//! byte plan without its evidence gate (a torn sequence gets `CAN`; every
-//! program-negotiable mode goes back to its host target; an open OSC 8 link
-//! is closed; the theme colours a program set — palette, fg/bg/cursor/
-//! selection — go back through OSC 104/110-119, `reverted=…,colors`, the
-//! colour stack kept), never clearing the screen or the scrollback.
+//! When no reader runs (Windows, an exited reader) or an update has parked the session, the
+//! reset runs directly under the term lock, and on a parked session advances the carry serial
+//! (`fabric::SessionFabric::note_direct_reset`) so a concurrent `Commit` stands down rather than
+//! restoring the pre-reset carry.
 //!
-//! # Where it runs — in the byte stream, like the handback
-//!
-//! The reset runs ON THE PARSE STAGE of the session's PTY reader, as one more
-//! message on the gather→parse channel ([`ResetLane`]). That is what makes it
-//! the handback's twin rather than a sweep: it lands between two PTY batches,
-//! never inside one; its synthesized bytes are recorded on the temporal spine
-//! as `RawIn` under the same term-lock hold that processed them, and ride the
-//! cast/`bytes` taps in the same order, so a replay of either recording
-//! reaches the live state; and the `modes-restored` timeline event it records
-//! (`reason=manual source=<ctl|menu> reverted=<csv|-> bytes=<n>`) is written
-//! by the one thread that writes the automatic ones. A reset issued from the
-//! control thread under its own term lock would have been processed in
-//! engine order but recorded out of order against the reader's cast tap.
-//!
-//! Where no reader runs (Windows, whose single-thread reader has no parse
-//! channel; a session whose reader has exited) the reset runs DIRECTLY under
-//! the term lock on the calling thread and records the timeline event only —
-//! there is no stream left to order it against, or no parse stage to carry it.
-//!
-//! So does a reset on a session an update has PARKED (the park closes the
-//! lane): it lands on this process's engine after the park took the carry the
-//! successor will restore. Committing over it would hand the successor the
-//! stuck modes the reply just reported reverted (the lifecycle audit of
-//! 2026-10-14, handoff finding 2). So a direct reset, once applied, moves the
-//! session's carry serial before it is answered
-//! (`fabric::SessionFabric::note_direct_reset`), which the park reads before
-//! its carry and the Commit compares again under its hold fence: a Commit
-//! that reads it moved stands down — a lossless retry — and this engine,
-//! reset, runs on; one that read it first holds the reset's answer back until
-//! its `_exit` (the reset dies unanswered) or its stand-down (answered then).
-//! Past the verb's wait it is refused [`RESET_BUSY`].
-//!
-//! `flush` (the verb only) then drops the tty input queue — the kernel's and
-//! whatever aterm still holds behind it (`SinkWriter::discard_unread_input`,
-//! the `signal term` remedy's discard, labelled `Discard::Flush` so it is
-//! never taken for that remedy's restart signal) — AFTER the reset, so mouse reports
-//! and CSI-u chords the stuck modes generated up to that moment go with it.
-//! macOS ONLY: the discard needs the slave's input-queue reading
-//! (`aterm_pty::input_queue_len`), which is measured on Darwin alone (a Linux
-//! master's FIONREAD counts the other direction; the `TIOCGPTPEER` reading is
-//! not built). Elsewhere nothing is flushed and the reply says `discarded=-`.
+//! `flush` (the verb only) then drops the tty input queue, the kernel's and whatever aterm
+//! still holds behind it, so the reports the stuck modes typed go too. macOS only: the discard
+//! needs the slave's input-queue reading (`aterm_pty::input_queue_len`), measured on Darwin
+//! alone (a Linux master's FIONREAD counts the other direction). Elsewhere the reply says
+//! `discarded=-`.
 
 use std::sync::Arc;
 #[cfg(unix)]
@@ -122,27 +84,23 @@ pub(crate) struct ResetReport {
     pub(crate) bytes: usize,
 }
 
-/// How long the verb waits for the parse stage. A reader that does not answer
-/// in this long is busy or wedged: the request stays on its channel and runs
-/// when the parse stage reaches it, unless the reader stops first (an update's
-/// park or the session's end drops the channel, and the request with it), and
-/// the reply says so. A request the reader drops while the verb still waits
-/// runs directly ([`request`]). A direct reset waits as long again for a
+/// How long the verb waits for the parse stage. Past it the reply says the request stays
+/// queued: it runs when the parse stage reaches it, unless the reader stops first (a park or
+/// the session's end drops the channel and the request). A request the reader drops while the
+/// verb still waits runs directly ([`request`]). A direct reset waits as long again for a
 /// committing update ([`run_direct`]).
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The verb's answer when a seamless update was committing the session for the
-/// whole of its wait ([`run_direct`]): the reset ran on this process's engine,
-/// which the update is about to replace with one that may not have it. `ERR
-/// busy` is the class a driver retries, and the retry reaches whichever process
-/// then owns the session.
+/// The verb's answer when a seamless update was committing the session for its whole wait
+/// ([`run_direct`]): the reset ran on this process's engine, which the update is replacing.
+/// `ERR busy` is the class a driver retries, and the retry reaches whichever process then owns
+/// the session.
 pub(crate) const RESET_BUSY: &str = "ERR busy update-committing (the reset reached this aterm, \
                                      which an update is replacing; retry)\n";
 
 /// The `modes-restored` payload of a manual reset:
-/// `reason=manual source=<ctl|menu> reverted=<csv|-> bytes=<n>`. An automatic
-/// handback's payload starts `from=`; `reason=manual` is how a reader of the
-/// timeline tells the two apart.
+/// `reason=manual source=<ctl|menu> reverted=<csv|-> bytes=<n>`. An automatic handback's
+/// starts `from=`.
 pub(crate) fn manual_payload(source: ResetSource, report: &ResetReport) -> String {
     let reverted = if report.reverted.is_empty() {
         "-".to_string()
@@ -186,7 +144,13 @@ pub(crate) fn record(
             ResetSource::Verb => aterm_slog::Actor::Nobody,
         };
         let at = tl.slog().now();
-        tl.slog_mut().observe_modes(report.reverted.len(), by, at);
+        tl.slog_mut().observe_modes(
+            crate::session_log::observed::ModesFrom::Reset(source.as_str()),
+            &report.reverted,
+            report.bytes,
+            by,
+            at,
+        );
     }
     aterm_log::info!("session {sid}: manual reset: {payload}");
 }
@@ -239,9 +203,8 @@ pub(crate) fn request(
     };
     let req = ManualReset { source, reply: tx };
     let offer = ctx.reset_lane.offer(&req);
-    // The queued message holds the only reply sender from here on, so a
-    // reader that ends without answering DISCONNECTS the wait below instead
-    // of leaving it to time out.
+    // The queued message holds the only reply sender from here on, so a reader that ends
+    // without answering disconnects the wait below instead of letting it time out.
     drop(req);
     match offer {
         LaneOffer::Queued => {}
@@ -283,16 +246,13 @@ pub(crate) enum LaneOffer {
     Closed,
 }
 
-/// The session's way onto its PTY reader's parse stage: a clone of the
-/// gather→parse sender, installed by each reader when it starts and removed
-/// when it ends (either stage, whichever ends first — see
-/// [`Self::close_if`]). Lives on [`SessionCtx`], which the control thread
-/// and the main thread both hold.
+/// The session's way onto its PTY reader's parse stage: a clone of the gather→parse sender,
+/// installed by each reader when it starts and removed when either stage ends
+/// ([`Self::close_if`]). Lives on [`SessionCtx`], held by the control and main threads.
 ///
-/// It never keeps the channel open on its own account: a parse stage waits on
-/// `recv()` with no timeout, relying on the gather to end the channel, so the
-/// lane's clone is dropped by a guard on the gather's exit path (unwinding
-/// included). The generation stamp keeps a late-exiting old reader from
+/// It must never keep the channel open itself: the parse stage waits on `recv()` with no
+/// timeout and relies on the gather to end the channel, so a guard on the gather's exit path
+/// drops the clone ([`LaneGuard`]). The generation stamp keeps a late-exiting old reader from
 /// removing the sender a re-attached reader just installed.
 #[derive(Default)]
 pub(crate) struct ResetLane {
@@ -369,8 +329,8 @@ impl ResetLane {
     }
 }
 
-/// Closes a [`ResetLane`] generation when dropped — held by the gather thread
-/// so the lane's sender goes with it on every exit path, unwinding included.
+/// Closes a [`ResetLane`] generation when dropped; held by the gather thread so the lane's
+/// sender goes on every exit path, unwinding included.
 #[cfg(unix)]
 pub(crate) struct LaneGuard {
     pub(crate) lane: Arc<ResetLane>,
@@ -386,19 +346,13 @@ impl Drop for LaneGuard {
 
 /// The `reset [flush]` control verb against one session.
 ///
-/// Reply: `OK reset reverted=<csv|-> bytes=<n>`, plus ` discarded=<n>` with
-/// `flush`: the bytes the kernel reported readable (FIONREAD) plus any aterm
-/// still held behind a full queue — or ` discarded=-` where nothing could be
-/// flushed ([`discarded_field`]: every platform but macOS, and a session with
-/// no tty), never a `0` that would read as an empty queue. The flush also drops a PARTIAL line typed
-/// under canonical mode, which FIONREAD does not report — measured on the
-/// live headless try of 2026-09-26: `junkjunk` typed during `sleep 4` answered
-/// `discarded=0` and never reached zle, where the same run without `flush`
-/// put `junkjunk` on the next command line. [`RESET_BUSY`] when a seamless
-/// update was committing the session for the whole of the wait. A HELD session
-/// never gets here: `reset` is in the halt set (`fabric::is_pty_reaching`), so
-/// the dispatch answers `ERR halted …` first — the human's escape hatch under a
-/// hold is the menu row, which no halt gates.
+/// Reply: `OK reset reverted=<csv|-> bytes=<n>`, plus with `flush` ` discarded=<n>` (the bytes
+/// FIONREAD reported plus any aterm still held behind a full queue) or ` discarded=-` where
+/// nothing could be flushed ([`discarded_field`]). The flush also drops a partial line typed
+/// under canonical mode, which FIONREAD does not count. [`RESET_BUSY`] when an update was
+/// committing the session for the whole wait. A held session never gets here: `reset` is in
+/// the halt set (`fabric::is_pty_reaching`); the menu row, which no halt gates, is the
+/// human's escape hatch under a hold.
 pub(crate) fn cmd_reset(
     sid: u64,
     term: &Arc<std::sync::Mutex<Terminal>>,
@@ -412,8 +366,7 @@ pub(crate) fn cmd_reset(
     };
     let report = match request(sid, term, ctx, ResetSource::Verb, Some(REPLY_TIMEOUT)) {
         Ok(Some(report)) => report,
-        // `request` with a `wait` always answers a report; keep the verb
-        // total without a panic path all the same.
+        // Unreachable with a `wait`; answered rather than panicking.
         Ok(None) => return "OK reset queued\n".to_string(),
         Err(refusal) => return refusal,
     };
@@ -430,26 +383,15 @@ pub(crate) fn cmd_reset(
     reply
 }
 
-/// `flush`'s discard: how many unread input bytes went, or `None` when
-/// nothing could be flushed — every platform but macOS, where aterm cannot
-/// measure the slave's input queue ([`aterm_pty::input_queue_len`]), and a
-/// session with no tty behind it. [`aterm_session::sink::SinkWriter::
-/// discard_unread_input`] drops nothing at all in that case, not even the
-/// sink's own spill.
+/// `flush`'s discard: how many unread input bytes went, or `None` when nothing could be
+/// flushed: on every platform but macOS, the only one that measures the slave's input queue
+/// ([`aterm_pty::input_queue_len`]), and for a session with no tty. Then
+/// `SinkWriter::discard_unread_input` drops nothing, not even the sink's spill.
 ///
-/// A FLUSH, NOT A RESTART (robustness review of the manual reset,
-/// 2026-09-26): the discard says so ([`aterm_session::sink::Discard::Flush`]).
-/// It used to be the restart remedy's discard, unlabelled, and on a session
-/// whose program was published `input=stalled` the input watch read it as
-/// `signal term`'s pre-signal drop — five seconds later the server's line
-/// read "… is still running after its restart signal … end it: … signal
-/// kill" and every input verb was refused naming that signal, though no
-/// signal was ever sent (reproduced on a headless instance: `discarded=433`,
-/// then event 6 of the timeline). Now the stall is HELD through the flush
-/// (the dropped queue is not a read) with its frozen line and its `signal
-/// term` remedy unchanged ([`crate::input_stall::Restart`]). The watch is
-/// woken after the drop, as `signal` wakes it after its own, so the hold
-/// dates from the flush rather than from the watch's next recheck
+/// Labelled [`aterm_session::sink::Discard::Flush`] so the input watch never reads it as
+/// `signal term`'s pre-signal drop: a published stall is held through the flush with its line
+/// and remedy unchanged ([`crate::input_stall::Restart`]). The watch is woken after the drop,
+/// as `signal` wakes it, so the hold dates from the flush, not from the next recheck
 /// ([`crate::input_stall::RECHECK`]).
 #[cfg(unix)]
 fn flush_input(ctx: &SessionCtx) -> Option<usize> {
@@ -469,19 +411,9 @@ fn flush_input(_ctx: &SessionCtx) -> Option<usize> {
     None
 }
 
-/// The ` discarded=` field of a `reset flush` reply: the count, or `-` when
-/// NOTHING WAS FLUSHED.
-///
-/// WHY `-` AND NOT `0` (robustness review of the manual reset, 2026-09-26):
-/// the first cut wrote `discard_unread_input().unwrap_or(0)`, so on Linux and
-/// Windows — where the discard returns `None` before it touches the spill or
-/// calls `tcflush`, because the queue is macOS-measured only — `reset flush`
-/// flushed nothing and still answered `discarded=0`: a successful flush that
-/// found an empty queue, to anyone reading it. The mouse reports and CSI-u
-/// chords the stuck modes queued were still there for the shell to read. `0`
-/// and `-` are different facts ("flushed, nothing was queued" against "not
-/// flushed"), the same distinction `reverted=-` draws, so the reply keeps
-/// them apart. Pinned by `reset_flush_that_flushes_nothing_says_so`.
+/// The ` discarded=` field of a `reset flush` reply: the count, or `-` when nothing was
+/// flushed. `0` ("flushed, nothing was queued") and `-` ("not flushed") are different facts,
+/// as with `reverted=-`.
 fn discarded_field(discarded: Option<usize>) -> String {
     match discarded {
         Some(n) => format!(" discarded={n}"),
@@ -490,11 +422,8 @@ fn discarded_field(discarded: Option<usize>) -> String {
 }
 
 impl crate::App {
-    /// Edit ▸ Reset Terminal on `wid`'s focused session: queued on that
-    /// session's PTY reader and NOT waited for — the main thread never blocks
-    /// on a reader. The reader records `modes-restored reason=manual
-    /// source=menu` and posts the output wake that repaints the window; with
-    /// no reader to carry it the reset runs here, directly.
+    /// Edit ▸ Reset Terminal on `wid`'s focused session: queued on its PTY reader and not
+    /// waited for (the main thread never blocks on a reader); with no reader it runs here.
     pub(crate) fn menu_reset_terminal(&self, wid: crate::WindowId) {
         let Some(s) = self
             .focused_session_id(wid)
@@ -535,11 +464,9 @@ mod tests {
         );
     }
 
-    /// Edit ▸ Reset Terminal: enabled over a terminal tab, reachable by its
-    /// `invoke` name at the `WriteInput` class, and — clicked on a session with
-    /// no reader (the stub; the fallback path) — it resets the FOCUSED
-    /// session and records `source=menu`. NEGATIVE CONTROL: the same stuck
-    /// modes are still in force before the click.
+    /// Edit ▸ Reset Terminal: enabled over a terminal tab, reachable by its `invoke` name, writes
+    /// no PTY input, and on a reader-less stub resets the focused session and records
+    /// `source=menu`. Negative control: the stuck modes are in force before the click.
     #[test]
     fn reset_terminal_menu_row_resets_the_focused_session() {
         let mut app = App::headless_for_test();
@@ -594,15 +521,9 @@ mod tests {
         );
     }
 
-    /// `reset flush` where NOTHING can be flushed answers `discarded=-`, never
-    /// `discarded=0` (robustness review of the manual reset, 2026-09-26). The
-    /// stub's sink has no tty behind it (`master = -1`), so its discard
-    /// returns `None` before touching anything — the same `None` every
-    /// session gets on Linux and Windows, where the input queue is not
-    /// measured. NEGATIVE CONTROL: the first cut's `unwrap_or(0)` answers
-    /// `… discarded=0`, a successful flush of an empty queue, and fails the
-    /// first assertion. The `Some` arm still prints the count, `0` included:
-    /// "flushed, nothing was queued" stays a distinct, truthful reply.
+    /// `reset flush` where nothing can be flushed answers `discarded=-`, never `discarded=0`. The
+    /// stub's sink has no tty (`master = -1`), the same `None` every Linux and Windows session
+    /// gets. Negative control: `unwrap_or(0)` fails the first assertion.
     #[test]
     fn reset_flush_that_flushes_nothing_says_so() {
         let s = crate::stub_session(11);
@@ -626,9 +547,7 @@ mod tests {
         assert_eq!(super::discarded_field(Some(9)), " discarded=9");
     }
 
-    /// The macOS twin of the test above: over a real raw pty whose slave has
-    /// an unread SGR mouse report queued (what the stuck modes type), `reset
-    /// flush` drops it and counts it, and the queue reads empty after.
+    /// On a real raw pty with an unread SGR mouse report queued, `reset flush` drops and counts it.
     #[test]
     #[cfg(target_os = "macos")]
     fn reset_flush_on_a_real_tty_discards_and_counts_the_queue() {
@@ -653,14 +572,9 @@ mod tests {
         }
     }
 
-    /// A reader that ends with a reset queued and unanswered (the parse stage
-    /// left its loop — a park for the update handoff, a session closing) must
-    /// not make the verb wait out [`super::REPLY_TIMEOUT`] and then claim the
-    /// reset "stays queued": the queued message dies with the channel, the
-    /// wait DISCONNECTS, and the reset runs directly. NEGATIVE CONTROL: with
-    /// the caller's own copy of the reply sender kept alive past the offer
-    /// (the first cut), the wait never disconnects and this answers `Err` after
-    /// the full timeout.
+    /// A reader that ends with a reset queued and unanswered disconnects the verb's wait, and the
+    /// reset runs directly rather than timing out as "stays queued". Negative control: keeping the
+    /// caller's copy of the reply sender alive past the offer makes this time out.
     #[test]
     #[cfg(unix)]
     fn a_reader_that_ends_without_answering_runs_the_reset_directly() {
@@ -690,9 +604,7 @@ mod tests {
         s.ctx.reset_lane.close_if(generation);
         drop(msg);
         drop(rx);
-        // Answered by the disconnect, not the timeout: the first cut answered `Err`
-        // after the full `REPLY_TIMEOUT`, which `a report, not a timeout` refuses —
-        // no stopwatch needed to tell the two apart.
+        // Answered by the disconnect: a timeout would be an `Err`, which the expect refuses.
         let report = asker
             .join()
             .expect("the asker thread")

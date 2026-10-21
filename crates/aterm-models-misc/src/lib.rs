@@ -16,8 +16,10 @@
 //! tests drive these models dev-depend on this one, so editing a model here rebuilds this crate
 //! and those tests, never a library.
 
+mod models_diskwalk;
 mod models_misc;
 mod models_vitals;
 
+pub use models_diskwalk::*;
 pub use models_misc::*;
 pub use models_vitals::*;

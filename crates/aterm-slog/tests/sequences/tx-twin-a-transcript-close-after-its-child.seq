@@ -9,4 +9,4 @@ pass 500
 see busy
 pass 500
 tx end dated=1000
-expect close t1 turn at=2500
+expect close t1 turn @2500

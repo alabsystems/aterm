@@ -5,7 +5,7 @@ bind 0
 see busy
 pass 6000
 tx prompt v1
-expect close t1 turn out=superseded by=vendor src=transcript conf=exact at=6000
+expect close t1 turn out=superseded by=vendor src=transcript conf=exact @6000
 expect open t1 turn src=screen
 expect open t2 turn vref=v1 src=transcript
 expect turn=t2

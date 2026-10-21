@@ -1925,14 +1925,18 @@ fn repo_under(tag: &str, place: &str, branch: &str) -> (PathBuf, PathBuf, PathBu
     (root, home, repo)
 }
 
-/// A repository inside a sync provider's folder shows no branch rather than
-/// open a file whose system dialog would park the shared footer thread. The
-/// same layout in an ordinary (or merely protected) folder is read.
+/// A repository inside a sync provider's folder or another app's container
+/// shows no branch rather than open a file whose system dialog would park the
+/// shared footer thread. The same layout in an ordinary (or per-folder
+/// protected) folder — including `Library/Caches/y` beside `Library/Containers`
+/// — is read.
 #[test]
 fn read_git_head_opens_nothing_under_a_file_provider_domain() {
     for place in [
         "Library/CloudStorage/x",
         "Library/Mobile Documents/com~apple~CloudDocs",
+        "Library/Containers/x",
+        "Library/Group Containers/group.x",
     ] {
         let (root, home, repo) = repo_under("provider", place, "main");
         assert_eq!(
@@ -1949,7 +1953,12 @@ fn read_git_head_opens_nothing_under_a_file_provider_domain() {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
-    for place in ["Documents", "Library/Application Support", "src"] {
+    for place in [
+        "Documents",
+        "Library/Application Support",
+        "Library/Caches/y",
+        "src",
+    ] {
         let (root, home, repo) = repo_under("ordinary", place, "main");
         assert_eq!(
             read_git_head_in(Some(&home), &repo),
@@ -1960,27 +1969,41 @@ fn read_git_head_opens_nothing_under_a_file_provider_domain() {
     }
 }
 
-/// A worktree outside a provider domain can point its `gitdir:` into one; the
-/// `HEAD` there is not opened either. A symlink into one is caught too. (An
-/// ordinary worktree file is followed: [`git_head_follows_a_worktree_file_and_climbs_to_the_top`].)
+/// A worktree outside a provider domain or app container can point its
+/// `gitdir:` into one; the `HEAD` there is not opened either. A symlink into
+/// one is caught too. (An ordinary worktree file is followed:
+/// [`git_head_follows_a_worktree_file_and_climbs_to_the_top`].)
 #[cfg(unix)]
 #[test]
 fn a_worktree_pointing_into_a_provider_domain_is_absent() {
-    let (root, home, provider_repo) =
-        repo_under("wt-provider", "Library/CloudStorage/x", "elsewhere");
-    let wt = home.join("src").join("wt");
-    std::fs::create_dir_all(&wt).unwrap();
-    std::fs::write(
-        wt.join(".git"),
-        format!("gitdir: {}\n", provider_repo.join(".git").display()),
-    )
-    .unwrap();
-    assert_eq!(read_git_head_in(Some(&home), &wt), GitHeadRead::Absent);
-    // a symlink from an ordinary folder into the provider domain
-    let link = home.join("src").join("link");
-    std::os::unix::fs::symlink(&provider_repo, &link).unwrap();
-    assert_eq!(read_git_head_in(Some(&home), &link), GitHeadRead::Absent);
-    let _ = std::fs::remove_dir_all(&root);
+    for place in [
+        "Library/CloudStorage/x",
+        "Library/Containers/x",
+        "Library/Group Containers/group.x",
+    ] {
+        let (root, home, provider_repo) = repo_under("wt-provider", place, "elsewhere");
+        let wt = home.join("src").join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", provider_repo.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_git_head_in(Some(&home), &wt),
+            GitHeadRead::Absent,
+            "{place}"
+        );
+        // a symlink from an ordinary folder into the guarded root
+        let link = home.join("src").join("link");
+        std::os::unix::fs::symlink(&provider_repo, &link).unwrap();
+        assert_eq!(
+            read_git_head_in(Some(&home), &link),
+            GitHeadRead::Absent,
+            "{place} symlink"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// A kernel refusal is its own answer, not "no repository": `EPERM` (what a
@@ -3941,6 +3964,123 @@ fn the_launch_card_is_read_only_under_a_live_repl() {
             "{bare:?}"
         );
         assert_eq!(mode_row(&rows), None, "{bare:?} is no mode row");
+    }
+}
+
+/// THE CONTEXT INDICATOR HAS GONE only from an empty slot (`context_gone`, slice 4e's review),
+/// on the rows 2.1.306 drew in the real-Claude lab (2026-10-21, 120 columns, a 100 000-token
+/// window compacting at 15%): once its effort notice has gone after `/compact` its mode row
+/// stands with nothing at its end, and an older build's footer rows with no indicator above
+/// the composer say the same. Not gone: the indicator at the mode row's end (at rest, beside a
+/// draft, through a turn) or above the composer; Claude Code's `◐ medium · /effort` in the
+/// slot; the `/` menu, the `@` menu and the shortcuts in the mode row's place; a box above the
+/// composer; no composer. CONTROLS: without the slot test the effort notice reads as gone;
+/// without the footer-row test the menus do; without the box read the box does; without the
+/// reading every shown indicator does.
+#[test]
+fn the_context_indicator_has_gone_only_from_an_empty_slot() {
+    let rule = "─".repeat(120);
+    let screen = |caret: &str, under: &[String]| -> Vec<String> {
+        let mut rows = vec![
+            "⏺ Hi! I am the local lab stub, not a model. (reply 1)".to_string(),
+            String::new(),
+            "✻ Brewed for 0s · done 12:48 AM".to_string(),
+            String::new(),
+            rule.clone(),
+            caret.to_string(),
+            rule.clone(),
+        ];
+        rows.extend(under.iter().cloned());
+        rows.extend([String::new(), String::new()]);
+        rows
+    };
+    let slot = |left: &str, end: &str| aterm_phase::prompt::fixtures::right_aligned(left, end);
+    let rest = "  ⏸ manual mode on · ? for shortcuts";
+    for (what, rows) in [
+        ("after /compact", screen("❯", &[slot(rest, "")])),
+        (
+            "an older build's pill",
+            screen(
+                "❯",
+                &["  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string()],
+            ),
+        ),
+        (
+            "an older build's hint",
+            screen("❯", &["  ? for shortcuts".to_string()]),
+        ),
+    ] {
+        assert!(context_gone(&rows), "{what}: gone");
+    }
+    let mut above = screen("❯", &["  ? for shortcuts".to_string()]);
+    above[3] = format!("{:>120}", "7% until auto-compact");
+    let mut boxed = aterm_phase::prompt::fixtures::bash_one_row();
+    let last = boxed.len() - 1;
+    boxed[last] = slot(rest, "");
+    for (what, rows) in [
+        (
+            "at rest",
+            screen("❯", &[slot(rest, "0% until auto-compact")]),
+        ),
+        (
+            "beside a draft",
+            screen(
+                "❯ /",
+                &[slot("  ⏸ manual mode on", "0% until auto-compact")],
+            ),
+        ),
+        (
+            "through a turn",
+            screen(
+                "❯",
+                &[slot(
+                    "  ⏸ manual mode on · esc to interrupt",
+                    "0% until auto-compact",
+                )],
+            ),
+        ),
+        ("above the composer", above),
+        (
+            "the effort notice",
+            screen("❯ h", &[slot("  ⏸ manual mode on", "◐ medium · /effort")]),
+        ),
+        (
+            "the / menu",
+            screen(
+                "❯ /",
+                &[
+                    "  ❯ /add-dir                    Add a new working directory".to_string(),
+                    "    /autocompact                Set how full the context gets before auto-summarizing".to_string(),
+                ],
+            ),
+        ),
+        (
+            "the @ menu",
+            screen(
+                "❯ @",
+                &[
+                    "    * claude (agent) – Catch-all for any task that doesn't fit a more specific age…".to_string(),
+                    "    * Explore (agent) – Fast read-only search agent for locating code. Use it to fi…".to_string(),
+                ],
+            ),
+        ),
+        (
+            "the shortcuts",
+            screen(
+                "❯",
+                &[
+                    "  ! for shell mode        double tap esc to clear input      ctrl + shift + _ to undo".to_string(),
+                    "  / for commands          shift + tab to auto-accept edits   ctrl + z to suspend".to_string(),
+                ],
+            ),
+        ),
+        ("a box above the composer", boxed),
+        (
+            "no composer",
+            aterm_phase::prompt::fixtures::rows(&["⏺ Done.", "", rest]),
+        ),
+    ] {
+        assert!(!context_gone(&rows), "{what}: no sign it has gone");
     }
 }
 

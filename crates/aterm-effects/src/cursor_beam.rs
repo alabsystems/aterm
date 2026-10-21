@@ -317,6 +317,8 @@ impl CursorBeamRod {
             (0.30, 0.24, cfg.haze, 0.55), // haze glow (beam: nebula; others: deep self-shade)
             (0.55, 0.10, cfg.haze, 0.85), // outer wash (a tint at the neighbour)
         ];
+        let (y0_i, h_i) = (y0 as i32, h as i32);
+        let (cell_y, ch_i) = (oy as i32 + (cr as i32) * ch as i32, ch as i32);
         for (i, &(hw, cmul, target, mix)) in layers.iter().enumerate() {
             let cov = (cov_axis * cmul).min(COV_CAP) as u8;
             if cov == 0 {
@@ -332,18 +334,10 @@ impl CursorBeamRod {
             let premul = premul_rgb(color, cov);
             if i < 2 {
                 // Full rod including the overshoot caps.
-                push_rect(out, geom, x, y0 as i32, w, h as i32, premul);
+                push_rect(out, geom, x, y0_i, w, h_i, premul);
             } else {
                 // Sleeve layers stay inside the cell band.
-                push_rect(
-                    out,
-                    geom,
-                    x,
-                    oy as i32 + (cr as i32) * ch as i32,
-                    w,
-                    ch as i32,
-                    premul,
-                );
+                push_rect(out, geom, x, cell_y, w, ch_i, premul);
             }
         }
     }
@@ -435,7 +429,10 @@ impl CursorBeamRod {
         if !(reach >= 1.0 && f_edge > 0.0 && peak >= 0.5) {
             return;
         }
-        let cell_x0 = (cx - cw * 0.5).round() as i32;
+        let inv_f_edge = 1.0 / f_edge;
+        let inv_rx = 1.0 / rx;
+        let hw = cw * 0.5;
+        let cell_x0 = (cx - hw).round() as i32;
         let cell_x1 = cell_x0 + geom.cw as i32;
         let band_y0 = i32::from(geom.origin_y) + i32::from(cr) * geom.ch as i32;
         let band_y1 = band_y0 + geom.ch as i32;
@@ -444,37 +441,42 @@ impl CursorBeamRod {
         while y < band_y1 {
             let h = row_h.min(band_y1 - y);
             let v = (y as f32 + h as f32 * 0.5 - cy) / ry;
-            let w2 = 1.0 - v * v;
-            let half = rx * w2.max(0.0).sqrt();
-            if w2 > 0.0 && half > cw * 0.5 {
-                // Knot `k`: from the cell's edge (`k = 0`) out to the
-                // ellipse's rim at this row, its offset and premultiplied
-                // light (the hue sliding into the haze toward the rim).
-                let knot = |k: usize| {
-                    let t = k as f32 / AURA_SEGMENTS as f32;
-                    let dx = cw * 0.5 + (half - cw * 0.5) * t;
-                    let rho2 = (dx / rx).powi(2) + v * v;
-                    let f = (1.0 - rho2).max(0.0).powi(2) / f_edge;
-                    let cov = (peak * f).round().min(OVER_INK_COV_CAP) as u8;
-                    let color = lerp_rgb(cfg.color, cfg.haze, 0.75 * rho2.sqrt());
-                    (dx, cov, premul_rgb(color, cov))
-                };
-                let knots: [_; AURA_SEGMENTS + 1] = std::array::from_fn(knot);
-                for pair in knots.windows(2) {
-                    let ((d_in, c_in, inner), (d_out, c_out, outer)) = (pair[0], pair[1]);
-                    if c_in == 0 && c_out == 0 {
-                        continue;
+            let v2 = v * v;
+            let w2 = 1.0 - v2;
+            if w2 > 0.0 {
+                let half = rx * w2.sqrt();
+                if half > hw {
+                    let span = half - hw;
+                    // Knot `k`: from the cell's edge (`k = 0`) out to the
+                    // ellipse's rim at this row, its rounded edges and
+                    // premultiplied light (the hue sliding into the haze
+                    // toward the rim).
+                    let knot = |k: usize| {
+                        let t = k as f32 / AURA_SEGMENTS as f32;
+                        let dx = hw + span * t;
+                        let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
+                        let u = dx * inv_rx;
+                        let rho2 = u * u + v2;
+                        let f = (1.0 - rho2).max(0.0).powi(2) * inv_f_edge;
+                        let cov = (peak * f).round().min(OVER_INK_COV_CAP) as u8;
+                        if cov == 0 {
+                            return (rx_i, lx_i, 0, 0);
+                        }
+                        let color = lerp_rgb(cfg.color, cfg.haze, 0.75 * rho2.sqrt());
+                        (rx_i, lx_i, cov, premul_rgb(color, cov))
+                    };
+                    let knots: [_; AURA_SEGMENTS + 1] = std::array::from_fn(knot);
+                    for pair in knots.windows(2) {
+                        let ((r_in, l_in, c_in, inner), (r_out, l_out, c_out, outer)) =
+                            (pair[0], pair[1]);
+                        if c_in == 0 && c_out == 0 {
+                            continue;
+                        }
+                        let (r0, r1) = (r_in.max(cell_x1), r_out);
+                        push_fx_ramp(out, geom, r0, y, r1 - r0, h, (inner, 0), (outer, 0));
+                        let (l0, l1) = (l_out, l_in.min(cell_x0));
+                        push_fx_ramp(out, geom, l0, y, l1 - l0, h, (outer, 0), (inner, 0));
                     }
-                    let (r0, r1) = (
-                        ((cx + d_in).round() as i32).max(cell_x1),
-                        (cx + d_out).round() as i32,
-                    );
-                    push_fx_ramp(out, geom, r0, y, r1 - r0, h, (inner, 0), (outer, 0));
-                    let (l0, l1) = (
-                        (cx - d_out).round() as i32,
-                        ((cx - d_in).round() as i32).min(cell_x0),
-                    );
-                    push_fx_ramp(out, geom, l0, y, l1 - l0, h, (outer, 0), (inner, 0));
                 }
             }
             y += h;

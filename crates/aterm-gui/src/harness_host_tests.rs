@@ -13,6 +13,15 @@ mod agent_gate_tests;
 #[path = "harness_host_landed_restart_tests.rs"]
 mod landed_restart_tests;
 
+#[path = "harness_needs_store_tests.rs"]
+mod needs_store_tests;
+
+#[path = "harness_hold_store_tests.rs"]
+mod hold_store_tests;
+
+#[path = "harness_needs_whole_tests.rs"]
+mod needs_whole_tests;
+
 /// A single phase wake reads only its tab's Claude record. The same two
 /// workers remain the negative controls for generic and coalesced wakes:
 /// both records are read, including one whose stamp did not move.
@@ -385,6 +394,8 @@ fn hooks(world: &Arc<World>, body: Arc<BodyFn>) -> Hooks {
             w5.told.lock().unwrap().push((sid.to_string(), plan));
         }),
         fact: Arc::new(|_, _| {}),
+        needs: Arc::new(|_, _, _| false),
+        hold: Arc::new(|_, _| false),
         claim_epoch: Arc::new(move || w4.released.load(Ordering::SeqCst)),
         acts: Acts::inert(),
         backoff: Arc::new(quick_backoff),
@@ -2856,6 +2867,8 @@ fn the_disk_watch_searches_where_the_agents_work_and_the_shared_roots() {
         pid: u32::MAX - 2,
         started: None,
         cwd: Some(home.join("work")),
+        profile: None,
+        stored_login: true,
     };
     let running = aterm_agent::harness::disk::discover::Running {
         claudes: vec![claude.clone()],
@@ -7847,6 +7860,8 @@ impl Acting {
             }),
             waiting: Arc::new(|_, _| {}),
             fact: Arc::new(|_, _| {}),
+            needs: Arc::new(|_, _, _| false),
+            hold: Arc::new(|_, _| false),
             claim_epoch: Arc::new(|| 0),
             acts: Acts {
                 tap_born: Arc::new(|_| None),
@@ -7858,6 +7873,7 @@ impl Acting {
                     a16.holds_asked.lock().unwrap().push(group);
                     *a16.holds.lock().unwrap()
                 }),
+                launch: Arc::new(|_| None),
                 due: Arc::new(move |_| {
                     a2.due_says.lock().unwrap().pop_front().unwrap_or(
                         if a2.due.load(Ordering::SeqCst) {
@@ -7888,6 +7904,7 @@ impl Acting {
                 disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
                 disk_board: Acts::inert().disk_board,
                 jobs_board: Acts::inert().jobs_board,
+                program_check: Acts::inert().program_check,
                 resume: Arc::new(move |_, _, carry: CarryPoint| {
                     a9.landing.lock().unwrap().push(carry.land);
                     a9.onlys.lock().unwrap().push(carry.only);
@@ -26261,6 +26278,8 @@ impl Probe {
             badge: Arc::new(|_sid, _text| {}),
             waiting: Arc::new(|_, _| {}),
             fact: Arc::new(|_, _| {}),
+            needs: Arc::new(|_, _, _| false),
+            hold: Arc::new(|_, _| false),
             claim_epoch: Arc::new(move || p4.released.load(Ordering::SeqCst)),
             acts,
             backoff: Arc::new(quick_backoff),
@@ -27282,6 +27301,8 @@ impl LookWorld {
             badge: Arc::new(|_, _| {}),
             waiting: Arc::new(|_, _| {}),
             fact: Arc::new(|_, _| {}),
+            needs: Arc::new(|_, _, _| false),
+            hold: Arc::new(|_, _| false),
             claim_epoch: Arc::new(|| 0),
             acts,
             backoff: Arc::new(quick_backoff),
@@ -32977,6 +32998,170 @@ fn a_fresh_reading_not_taken_is_tried_again() {
     assert_eq!(w.rows(accounts::Kind::Sample), 2);
 }
 
+/// A READING THE NEW LOGIN'S ADOPTION HELD BACK IS TAKEN WHEN SERVED AGAIN
+/// AFTER IT (the review of A1, `accounts::Account::adopting`): the default
+/// home's profile — composed here, read through the allowlist as the host
+/// keys every reading — names account A, whose reading is recorded; then
+/// it names B. The process's next figure, served inside
+/// [`accounts::KEY_ADOPT_S`] of the change, drops A's record and is not
+/// taken (perhaps A's, under B's key); the same figures served after the
+/// bound are recorded at once, not skipped as a repeat of figures taken
+/// until they move or [`accounts::READING_HEARTBEAT_S`] passes. NEGATIVE
+/// CONTROL: A's figures, taken, then served again before the change, are
+/// skipped so.
+#[cfg(unix)]
+#[test]
+fn a_reading_held_back_for_a_new_login_is_taken_when_served_after_it() {
+    let w = TapWorld::new();
+    let home = w.tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    *w.env.lock().unwrap() = vec![format!("HOME={}", home.display())];
+    let (a, b) = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    );
+    let sign_in = |uuid: &str| {
+        let text = format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}"}}}}"#);
+        std::fs::write(home.join(".claude.json"), text).expect("profile");
+    };
+    let key = || {
+        let (state, _) = accounts::Store::at(&w.state()).load(w.clock()).ok()?;
+        state.accounts.get("main")?.key
+    };
+    sign_in(a);
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    w.tap(10, 42, None);
+    idle.usage_tap();
+    assert_eq!(w.sample().and_then(|s| s.session_pct), Some(42));
+    assert_eq!(key(), profile::AccountKey::claude(a));
+    // NEGATIVE CONTROL: figures taken, served again, are not taken again.
+    w.later(10);
+    w.tap(20, 42, None);
+    assert_eq!(idle.tap_step(), None, "a repeat of figures taken");
+    // B signs in; the process serves on inside the bound.
+    sign_in(b);
+    w.later(10);
+    w.tap(30, 50, None);
+    assert_eq!(idle.tap_step(), Some("reading recorded"), "the epoch");
+    assert_eq!(key(), profile::AccountKey::claude(b));
+    assert_eq!(w.sample(), None, "held back");
+    // The same figures, served at the bound: taken.
+    w.later(accounts::KEY_ADOPT_S);
+    w.tap(40, 50, None);
+    assert_eq!(idle.tap_step(), Some("reading recorded"), "served again");
+    assert_eq!(w.sample().and_then(|s| s.session_pct), Some(50));
+    assert_eq!(key(), profile::AccountKey::claude(b));
+}
+
+/// UNDER A ROSTER OF SEVERAL ACCOUNTS A TAP READING CARRIES NO KEY (the
+/// account-stats design §3.1): every row's login serves from the default
+/// home, whose one profile names whichever account it read last, so it is
+/// no reading's account. `home-a`'s session's readings are recorded under
+/// its label while the profile names A and then B (`work-2`'s account,
+/// refreshed): the record holds no key, no `epoch` row is written, and the
+/// second reading is taken at once. NEGATIVE CONTROL: under a roster of one
+/// row the reading is keyed by the profile, and B's name in it is another
+/// account signed in — one `epoch` row, the reading held back.
+#[cfg(unix)]
+#[test]
+fn under_several_accounts_a_tap_reading_carries_no_key() {
+    let one =
+        "[[account]]\nlabel = \"home-a\"\nclass = \"dedicated\"\nemail = \"owner@example.com\"\n";
+    let two = format!(
+        "{one}\n[[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"/logins/work-2\"\n"
+    );
+    let (a, b) = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    );
+    for (roster, keyed) in [(two, false), (one.to_string(), true)] {
+        let w = TapWorld::new();
+        std::fs::write(w.roster_path(), &roster).expect("roster");
+        let home = w.tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        *w.env.lock().unwrap() = vec![format!("HOME={}", home.display())];
+        let sign_in = |uuid: &str| {
+            let text = format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}"}}}}"#);
+            std::fs::write(home.join(".claude.json"), text).expect("profile");
+        };
+        let key = || {
+            let (state, _) = accounts::Store::at(&w.state()).load(w.clock()).ok()?;
+            state.accounts.get("home-a")?.key
+        };
+        sign_in(a);
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        w.tap(10, 42, None);
+        idle.usage_tap();
+        assert_eq!(
+            w.sample_of("home-a").and_then(|s| s.session_pct),
+            Some(42),
+            "{roster}"
+        );
+        assert_eq!(key(), profile::AccountKey::claude(a).filter(|_| keyed));
+        sign_in(b);
+        w.later(10);
+        w.tap(20, 47, None);
+        idle.usage_tap();
+        if keyed {
+            assert_eq!(w.rows(accounts::Kind::Epoch), 1, "{roster}");
+            assert_eq!(w.sample_of("home-a"), None, "held back");
+        } else {
+            assert_eq!(w.rows(accounts::Kind::Epoch), 0, "{roster}");
+            assert_eq!(key(), None);
+            assert_eq!(
+                w.sample_of("home-a").and_then(|s| s.session_pct),
+                Some(47),
+                "taken at once"
+            );
+        }
+    }
+}
+
+/// A FIRST READING UNDER AN EPOCH IS NOT NOTED AS TAKEN (the review of A1):
+/// a process's first reading in a worker's life says nothing of a window a
+/// limit reset refilled after the process began ([`accounts::note_reading`]),
+/// so the same figures served again — the process now seen — are handed to
+/// the record at once, never skipped as a repeat of figures taken until they
+/// move or [`accounts::READING_HEARTBEAT_S`] passes. Here the five hours
+/// read 100% and then 5% (the refill), and a worker started after it (aterm
+/// relaunched) first reads 7%, which says nothing; the 7% served again is
+/// recorded. NEGATIVE CONTROL: the 7% taken, served again, is skipped.
+#[cfg(unix)]
+#[test]
+fn a_first_reading_under_an_epoch_is_tried_again_when_served_again() {
+    let w = TapWorld::new();
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    w.tap(10, 100, None);
+    idle.usage_tap();
+    w.later(10);
+    w.tap(20, 5, None);
+    idle.usage_tap();
+    assert_eq!(
+        w.sample().and_then(|s| s.session_pct),
+        Some(5),
+        "the refill"
+    );
+    assert_eq!(w.rows(accounts::Kind::Reset), 1);
+    // aterm relaunched: a worker with no reading of the process before.
+    let after = w.worker(&tap_on(), tapped_argv(), true);
+    w.later(10);
+    w.tap(30, 7, None);
+    after.usage_tap();
+    assert_eq!(
+        w.sample().and_then(|s| s.session_pct),
+        Some(5),
+        "a first reading under the epoch says nothing"
+    );
+    w.later(10);
+    w.tap(40, 7, None);
+    assert_eq!(after.tap_step(), Some("reading recorded"), "served again");
+    assert_eq!(w.sample().and_then(|s| s.session_pct), Some(7));
+    // NEGATIVE CONTROL.
+    w.later(10);
+    w.tap(50, 7, None);
+    assert_eq!(after.tap_step(), None, "a repeat of figures taken");
+}
+
 /// One [`Acts::startup_mark`] as the deadlines' fakes keep it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Marked {
@@ -36595,6 +36780,104 @@ fn a_panicked_body_leaves_the_face_unknown_before_the_next_runs_start_face() {
     assert_eq!(all[1..], [Task(None), Task(None)]);
 }
 
+/// MACOS'S PROGRAM CHECK STUCK HOLDS THE WORKER AND KEEPS WHAT IT OWES: on a
+/// board that reads the check stuck ([`Acts::program_check`], the test's own) a
+/// supervised Claude Code's continuations are withheld without claiming turn-end
+/// ownership, it asks for no point and sets no wake (a park and a look come due
+/// notwithstanding), its idle point and a break of its background work take no
+/// step (an upgrade due), a stall's remedy ends no frozen agent, and the park and
+/// the look are kept; once the board reads the check answering, the kept park asks
+/// for its point. NEGATIVE CONTROL: the same worker over a board that never read
+/// stuck asks at once, its break takes the due upgrade's notice, and a stall would
+/// relaunch it.
+#[test]
+fn a_stuck_program_check_holds_the_worker_and_keeps_what_it_owes() {
+    use crate::program_check_watch::{Board, step};
+    use aterm_uds::program_check::Look;
+    use aterm_vitals::program_check::{Daemon, Reading, STUCK_AFTER_MS};
+    static STUCK: Mutex<Board> = Mutex::new(Board::new());
+    static CLEAR: Mutex<Board> = Mutex::new(Board::new());
+    let read = |workers, at_limit| {
+        Look::Read(Reading {
+            daemon: Daemon {
+                pid: 690,
+                start_s: 1_791_000_000,
+                start_us: 1,
+            },
+            workers,
+            at_limit,
+            limit: Some(90),
+        })
+    };
+    let look = |at, l| {
+        let _ = step(&mut STUCK.lock().unwrap(), at, l);
+    };
+    look(0, read(95, true));
+    look(STUCK_AFTER_MS, read(95, true));
+    let worker = |sid: &str, board: &'static Mutex<Board>| {
+        let mut hooks = hooks(
+            &Arc::new(World::default()),
+            Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+        );
+        hooks.acts = Acts {
+            program_check: board,
+            due: Arc::new(|_| Due::Yes),
+            notice: Arc::new(|_, _| "announced:1".to_string()),
+            ..Acts::inert()
+        };
+        let w = idle_host(sid, Program::Claude, switched(&on()), hooks);
+        w.park.store(true, Ordering::SeqCst);
+        *w.look_at.lock().unwrap() = Some(Instant::now());
+        w
+    };
+
+    let held = worker("s-check-stuck", &STUCK);
+    assert!(
+        held.withholds_turn_end(),
+        "no keep going while no program can start"
+    );
+    assert!(!held.owns_turn_end(), "no upgrade's ownership");
+    assert!(!held.wants(), "no point asked");
+    assert!(held.wants_at().is_none(), "no wake set");
+    assert!(held.at_idle().is_none(), "nothing typed, no step taken");
+    assert!(held.at_background().is_none(), "no step at a break either");
+    assert!(
+        !held.relaunches_after_stall(),
+        "no frozen agent ended for a start that would not start"
+    );
+    assert!(
+        held.park.load(Ordering::SeqCst) && held.look_at.lock().unwrap().is_some(),
+        "the park and the look are kept"
+    );
+
+    let asks = worker("s-check-clear", &CLEAR);
+    assert!(
+        !asks.withholds_turn_end(),
+        "CONTROL: a board that never read stuck holds nothing"
+    );
+    assert!(asks.wants(), "CONTROL: the park asks at once");
+    assert!(asks.wants_at().is_some(), "CONTROL: the look's wake stands");
+    assert_eq!(
+        asks.at_background().map(|(line, _)| line).as_deref(),
+        Some("upgrade step=announced:1"),
+        "CONTROL: a break takes the due upgrade's notice"
+    );
+    assert!(
+        asks.relaunches_after_stall(),
+        "CONTROL: a stall relaunches the agent"
+    );
+
+    look(STUCK_AFTER_MS + 60_000, read(4, false));
+    assert!(
+        !held.withholds_turn_end(),
+        "the turn ends are the loop's again"
+    );
+    assert!(
+        held.wants(),
+        "the kept park asks for its point once the check clears"
+    );
+}
+
 /// THE FULL DISK STOPS THE CONTINUATIONS AND SPACE BACK RESUMES THE SESSION
 /// ONCE: a supervised Claude Code whose screen says `ENOSPC` while the
 /// volume MEASURES at an emergency is stuck: continuations are withheld
@@ -37721,7 +38004,7 @@ fn the_sweep_counts_the_bytes_of_what_it_swept() {
         PathBuf::from("/c/b/.cargo-build"),
         PathBuf::from("/c/k/.cargo-build"),
     );
-    let sized = [(a.clone(), 3 << 30), (b.clone(), 1 << 30), (kept, 7 << 30)];
+
     let gone = Unused::Gone {
         idle: Duration::from_secs(15 * 60),
         after: atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE,
@@ -37729,6 +38012,11 @@ fn the_sweep_counts_the_bytes_of_what_it_swept() {
     let idle = Unused::Idle {
         idle: Duration::from_secs(31 * 86_400),
     };
+    let sized = [
+        (a.clone(), gone, 3 << 30),
+        (b.clone(), idle, 1 << 30),
+        (kept, Unused::Unfinished, 7 << 30),
+    ];
     let (freed, went) = disk_swept(&[(a, gone), (b, idle)], &sized);
     assert_eq!(freed, 4 << 30);
     assert_eq!(went.len(), 2);
@@ -37741,6 +38029,106 @@ fn the_sweep_counts_the_bytes_of_what_it_swept() {
         "{went:?}"
     );
     assert_eq!(disk_swept(&[], &sized).0, 0);
+
+    // An old stage and live parts moved into that same stage have different
+    // reasons and sizes. Each removal retains its own intent's bytes.
+    let stage = PathBuf::from("/c/a/.cargo-build.removing");
+    let stale = Unused::Stale {
+        incremental: 1,
+        units: 1,
+        after: atpkg::build_cache::RECLAIM_STALE,
+    };
+    let sized = [
+        (stage.clone(), Unused::Unfinished, 2 << 30),
+        (stage.clone(), stale, 5 << 30),
+    ];
+    let swept = [(stage.clone(), Unused::Unfinished), (stage, stale)];
+    assert_eq!(disk_swept(&swept, &sized).0, 7 << 30);
+    assert_eq!(
+        disk_sweep_removals(&swept, &sized),
+        [
+            (2 << 30, crate::disk_board::BUILD_CACHES),
+            (5 << 30, crate::disk_board::BUILD_CACHES)
+        ]
+    );
+}
+
+/// TODAY'S FREED TALLY HEARS EACH REMOVAL ROW ONCE (Stats Deck v2 §7.3): the
+/// no-session sweep gives one entry per directory it swept, at the size its
+/// row carries, a build cache each; a directory it swept without sizing
+/// gives its entry at nothing. A supervised pass gives one entry per
+/// `removed` row, at the bytes its remover released, named by its class.
+/// NEGATIVE CONTROLS: a sized directory the sweep kept gives no entry, and a
+/// look that found plenty gives none.
+#[test]
+fn each_removal_row_gives_the_freed_tally_one_entry() {
+    use aterm_agent::harness::cli::DiskTick;
+    use aterm_agent::harness::disk::{Applied, Class, Removed, Row, Witness};
+    use atpkg::build_cache::Unused;
+    let (a, b, never_sized, kept) = (
+        PathBuf::from("/c/a/.cargo-build"),
+        PathBuf::from("/c/b/.cargo-build"),
+        PathBuf::from("/c/u/.cargo-build"),
+        PathBuf::from("/c/k/.cargo-build"),
+    );
+    let sized = [
+        (a.clone(), Unused::Unfinished, 3 << 30),
+        (b.clone(), Unused::Unfinished, 1 << 30),
+        (kept, Unused::Unfinished, 7 << 30),
+    ];
+    let swept = [
+        (a, Unused::Unfinished),
+        (never_sized, Unused::Unfinished),
+        (b, Unused::Unfinished),
+    ];
+    assert_eq!(
+        disk_sweep_removals(&swept, &sized),
+        [
+            (3 << 30, crate::disk_board::BUILD_CACHES),
+            (0, crate::disk_board::BUILD_CACHES),
+            (1 << 30, crate::disk_board::BUILD_CACHES),
+        ]
+    );
+    assert!(disk_sweep_removals(&[], &sized).is_empty());
+
+    let row = |path: &str| Row {
+        class: Class::CargoTargets,
+        path: PathBuf::from(path),
+        bytes: 9 << 30,
+        bytes_partial: false,
+        witness: Witness::StaleBuildDir {
+            marker: "CACHEDIR.TAG".to_string(),
+            profiles: 1,
+            idle_days: 9,
+            threshold_days: 7,
+            leaves: Vec::new(),
+        },
+        removable: true,
+        blocked: None,
+    };
+    let released = |bytes: u64| Removed {
+        bytes,
+        ..Removed::default()
+    };
+    let tick = DiskTick::Reclaimed(
+        Applied {
+            removed: vec![
+                (row("/w/one/target"), released(5 << 30)),
+                (row("/w/two/target"), released(0)),
+            ],
+            freed_bytes: 5 << 30,
+            ..Applied::default()
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        disk_pass_removals(&tick),
+        [
+            (5 << 30, crate::disk_board::BUILD_CACHES),
+            (0, crate::disk_board::BUILD_CACHES),
+        ]
+    );
+    assert!(disk_pass_removals(&DiskTick::Plenty).is_empty());
 }
 
 /// A SUPERVISED PASS KEPT FROM REMOVING SAYS SO (review ox-17's rule): a
@@ -37785,9 +38173,10 @@ fn a_pass_whose_removals_went_unrecorded_is_not_spent() {
 /// earlier pass left half-removed is sized and its `removing` row written
 /// before it goes, then its `removed` row, its bytes counted in what the
 /// pass freed (the review of d5ba0dc843: the intent stood alone, and the
-/// bytes went uncounted). NEGATIVE CONTROL: a ledger that cannot be written
-/// keeps the stage whole, writes nothing, and says the pass was kept from
-/// removing it.
+/// bytes went uncounted) and, once, in today's freed tally on the board
+/// (Stats Deck v2 §7.3). NEGATIVE CONTROL: a ledger that cannot be written
+/// keeps the stage whole, writes nothing, counts nothing, and says the pass
+/// was kept from removing it.
 #[cfg(unix)]
 #[test]
 fn the_sweep_journals_a_finished_stage_and_counts_it() {
@@ -37800,8 +38189,9 @@ fn the_sweep_journals_a_finished_stage_and_counts_it() {
     let stage = root.join("Users/x/gone/.cargo-build.removing");
     std::fs::create_dir_all(stage.join("debug")).unwrap();
     std::fs::write(stage.join("debug/x"), vec![7u8; 4096]).unwrap();
+    let board = Shelf::new();
     let sweep = |state: &Path| {
-        disk_sweep_journalled(state, 1_790_000_000, |record| {
+        disk_sweep_journalled(state, 1_790_000_000, &board, |record| {
             atpkg::build_cache::reclaim_watched(
                 &root,
                 None,
@@ -37819,6 +38209,7 @@ fn the_sweep_journals_a_finished_stage_and_counts_it() {
     let kept = sweep(&blocked);
     assert!(kept.swept.is_empty() && kept.sized.is_empty() && kept.unrecorded);
     assert!(stage.join("debug/x").is_file(), "kept whole");
+    assert_eq!(board.board_lock().freed.aterm_bytes, 0);
 
     let state = tmp.path().join("state");
     let done = sweep(&state);
@@ -37831,6 +38222,13 @@ fn the_sweep_journals_a_finished_stage_and_counts_it() {
         went[0].ends_with("(left half-removed by an earlier sweep)"),
         "{went:?}"
     );
+    {
+        let b = board.board_lock();
+        assert_eq!(
+            (b.freed.aterm_bytes, b.freed.last_what.as_str()),
+            (freed, "build caches")
+        );
+    }
     let ledger = std::fs::read_to_string(state.join(aterm_agent::harness::cli::DISK_LEDGER))
         .expect("the ledger");
     let actions: Vec<(String, String)> = ledger
@@ -39314,4 +39712,74 @@ fn the_first_disk_reading_runs_beside_the_host_start() {
         Some(state.as_path()),
         "the caller's state directory"
     );
+}
+
+/// THE AGENT'S LAUNCH, AS THIS INSTANCE SAW IT ([`WorkerIdle::launch`], P3 of
+/// `docs/measured/forever-lab-2026-10-20.md`): the tab's last command start
+/// ([`Acts::launch`]) held to the kept agent's process start, whole seconds.
+/// The agent's process began 1.3 s after the command started (Gemini CLI's
+/// measured launch: `host.agent_started` 1792520390 under a read at
+/// 1792520391.315), or in the same second: its launch. NEGATIVE CONTROLS: a
+/// process that began before that start (an `exec`'s, which runs in the
+/// shell's own process), no command start or a person keyed since (the
+/// hook's `None`), and no process read yet (no snapshot) have none.
+#[test]
+fn an_agents_launch_is_the_command_start_its_process_began_at_or_after() {
+    const START: &str = "Thu Sep 24 01:02:03 2026";
+    let began = i64::try_from(
+        aterm_agent::harness::upgrade_models::parse_lstart(START).expect("the start"),
+    )
+    .expect("unix seconds");
+    let ms = began * 1000;
+    let launch = |mark: Option<i64>, kept: bool| {
+        let world = Arc::new(World::default());
+        let mut h = hooks(&world, parking_body(&world));
+        h.acts.launch = Arc::new(move |sid| {
+            assert_eq!(sid, "s-idle");
+            mark
+        });
+        let idle = idle_of(h, Program::Gemini, None);
+        {
+            let mut k = idle.kept.lock().unwrap();
+            match k.snapshot.as_mut() {
+                Some(snap) if kept => snap.start = START.to_string(),
+                _ => k.snapshot = None,
+            }
+        }
+        IdleHost::launch(&idle)
+    };
+    assert_eq!(launch(Some(ms - 1300), true), Some(ms - 1300), "after it");
+    assert_eq!(launch(Some(ms + 400), true), Some(ms + 400), "its second");
+    assert_eq!(launch(Some(ms + 5_000), true), None, "an earlier process");
+    assert_eq!(launch(None, true), None, "no command start");
+    assert_eq!(launch(Some(ms - 1300), false), None, "no process read");
+}
+
+/// [`Acts::launch`] LIVE ([`launch_of`]): a registered tab's launch witness's
+/// last command start, whatever its word (`sh run-gemini.sh` is `other`),
+/// while the tab's person count still equals the one its hold loaded.
+/// NEGATIVE CONTROLS: a person's gesture since, a tab with no command start,
+/// and no such tab read none.
+#[test]
+fn the_live_launch_is_the_witnesss_last_start_with_no_gesture_since() {
+    use crate::launch_witness::{Launch, Why};
+    let store = crate::session_store::new_store();
+    let handle = crate::session_store::test_handle(7301);
+    let sid = handle.sid.as_str().to_string();
+    let ctx = Arc::clone(&handle.ctx);
+    store.write().unwrap().register(handle);
+    assert_eq!(launch_of(&store, &sid), None, "no command start");
+    ctx.launch.mark_at_for_test(
+        Launch {
+            id: 1,
+            seq: ctx.human_input.seq(),
+            word: None,
+            why: Why::Other,
+        },
+        1_792_520_389_950,
+    );
+    assert_eq!(launch_of(&store, &sid), Some(1_792_520_389_950));
+    ctx.human_input.note(0, crate::human_input::Gesture::Other);
+    assert_eq!(launch_of(&store, &sid), None, "a person keyed since");
+    assert_eq!(launch_of(&store, "s-none"), None, "no such tab");
 }

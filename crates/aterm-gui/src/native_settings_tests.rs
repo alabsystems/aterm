@@ -82,16 +82,8 @@ fn node_by_key<'a>(nodes: &'a [UiNode], key: &str) -> Option<&'a UiNode> {
     None
 }
 
-/// THE DEAD CLICK, pinned. "Choose Image…" carried no platform gate at all
-/// while `menu::choose_local_file` was a `None` stub off macOS: it painted
-/// enabled, took focus and hover, opened nothing, and left the status line
-/// saying "No wallpaper" — the one place the Windows build broke the repo's
-/// no-dead-click law.
-///
-/// The button's enabled state must now track the platform picker exactly, so
-/// the row can never again claim an authority the process does not have. On
-/// this machine (Windows, with a real `IFileOpenDialog`) that means ENABLED —
-/// which is also the proof the ungating actually reached this surface.
+/// "Choose Image…" is enabled exactly when the platform has a file picker, so the
+/// row never offers a click that does nothing.
 #[test]
 fn choose_image_is_enabled_exactly_when_a_picker_exists() {
     let state = SettingsViewState::new(&Config::default());
@@ -180,11 +172,8 @@ fn effect_note_contains(effect: &SettingEffectProjection, expected: &str) -> boo
 }
 
 fn authored_visual_state(key: &str, value: Option<&str>) -> SettingsViewState {
-    // The comet-family trail knobs are inert under the additive default (its
-    // typed wake is deliberately cadence-scaled in its signature spectrum
-    // — duration/length/colour do not apply). Preview them under the
-    // COMMITTED comet style whose engine honours them, on BOTH base and
-    // candidate, so each knob's own effect is what the pixels prove.
+    // The comet-family trail knobs are inert under the default style; preview them
+    // under `comet` on base and candidate alike, so the pixels show the knob.
     let config = if matches!(
         key,
         prefs::EDIT_CURSOR_TRAIL_MS
@@ -199,9 +188,9 @@ fn authored_visual_state(key: &str, value: Option<&str>) -> SettingsViewState {
             ..Config::default()
         }
     } else if key == prefs::EDIT_CURSOR_BLINK {
-        // A caret that is typing, or that a rainbow body owns, holds steady
-        // exactly as in a terminal; the blink shows on a resting caret: Off,
-        // with the typing glow (which types even under Off) off too.
+        // A typing caret, or one a rainbow body owns, holds steady as in a
+        // terminal; the blink shows on a resting caret: Off, with the typing
+        // glow (which types even under Off) off too.
         Config {
             cursor_trail_style: Some("off".to_string()),
             cursor_momentum_glow: Some(false),
@@ -280,9 +269,8 @@ fn preview_body_pixels(compiled: &crate::native_ui::CompiledUi, pixels: &[u8]) -
         .rect;
     let x0 = (rect.x + 10.0).ceil().max(0.0) as usize;
     let x1 = (rect.right() - 10.0).floor().max(x0 as f32) as usize;
-    // Paint's terminal canvas begins at header_h(27) + 5. Exclude one
-    // additional AA row so the visible candidate badge cannot satisfy a
-    // body-effect assertion.
+    // The preview's terminal canvas begins at its header (27) + 5; one more AA row
+    // keeps the candidate badge out of the body.
     let y0 = (rect.y + 33.0).ceil().max(0.0) as usize;
     let y1 = (rect.bottom() - 10.0).floor().max(y0 as f32) as usize;
     let mut body = Vec::with_capacity((x1 - x0) * (y1 - y0) * 4);
@@ -366,17 +354,12 @@ fn search_count_states_what_its_result_lists_hold() {
 
 #[test]
 fn every_visual_field_previews_candidate_semantics_fingerprint_pixels_and_isolation() {
-    // The `window_theme` candidate must land on the side OPPOSITE the one
-    // this fixture's Auto resolves to, or the sample titlebar cannot move.
-    // Ask the painter's own resolver which side that is — a hand-kept
-    // per-platform table restates a rule it does not own, and goes quietly
-    // pixel-blind the day the rule changes (Linux Auto follows the host
-    // TERMINAL theme, the other platforms the OS appearance, and both of
-    // those answers moved during the 2026-08 window-chrome work).
+    // The `window_theme` candidate must land opposite the side Auto resolves to here,
+    // so ask the painter's own resolver rather than keep a per-platform table.
     //
-    // A dark OS throughout, so the unset theme draws the dark Default: the
-    // SDR glow boost rolls itself off on a light background
-    // (`sdr_glow_budget`), so its candidate is visible only on a dark one.
+    // A dark OS throughout, so the unset theme draws the dark Default: the SDR
+    // glow boost rolls itself off on a light background (`sdr_glow_budget`),
+    // so its candidate shows only on a dark one.
     let dark_os = crate::native_app::ViewMotionCx {
         system_dark: true,
         ..Default::default()
@@ -403,10 +386,8 @@ fn every_visual_field_previews_candidate_semantics_fingerprint_pixels_and_isolat
         (prefs::EDIT_SELECTION_COLOR, "#335577"),
         (prefs::EDIT_SELECTION_FOREGROUND, "#00FF66"),
         (prefs::EDIT_WINDOW_THEME, window_theme_candidate),
-        // 10, not 4.5: the default palette is deliberately lifted so every
-        // ANSI token already reaches ~4.5:1 on the dark bg (see
-        // `aterm_types::color_palette`) — a 4.5 floor is pixel-neutral by
-        // design, while 10 provably floors the faint/red/blue specimens.
+        // 10, not 4.5: the default palette already reaches ~4.5:1 on the dark bg
+        // (`aterm_types::color_palette`), so a 4.5 floor changes no pixel.
         (prefs::EDIT_MINIMUM_CONTRAST, "10"),
         (prefs::EDIT_SELECTION_INACTIVE, "true"),
         (prefs::EDIT_BOLD_IS_BRIGHT, "false"),
@@ -466,10 +447,8 @@ fn every_visual_field_previews_candidate_semantics_fingerprint_pixels_and_isolat
     .expect("embedded preview renderer");
     renderer.set_runtime_font_discovery(false);
     renderer.prepare_semantic_typography("Bold Italic != => 你好 ∑✓♥ 😀 🚀 👩‍💻");
-    // SETTLED install: `set_chrome_fonts` would park an async prewarm
-    // worker whose landing between two paints of one state could swap the
-    // semantic cascade mid-assertion (cross-test flake under a parallel
-    // suite run). The fixture warms the cascade inline instead.
+    // Settled install: `set_chrome_fonts` parks an async prewarm whose landing
+    // between two paints could swap the semantic cascade mid-assertion.
     crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
 
     for (key, candidate_value) in cases {
@@ -477,12 +456,9 @@ fn every_visual_field_previews_candidate_semantics_fingerprint_pixels_and_isolat
         let candidate_state = authored_visual_state(key, Some(candidate_value));
         let raw_before = candidate_state.raw_values.clone();
         let assets_before = Arc::clone(candidate_state.config_assets());
-        // The frozen animation phase must make each candidate OBSERVABLE
-        // (530ms blink half-periods): 720 is an ODD half-period, hiding a
-        // blinking cursor — exactly what cursor_blink needs (hidden base vs
-        // lit non-blinking candidate) — while cursor colour/style and the
-        // cursor-anchored ligature break need an EVEN phase so the blinking
-        // cursor is LIT in both frames.
+        // Blink half-periods are 530ms: 720 hides a blinking cursor (what
+        // cursor_blink needs), while cursor colour/style and the cursor-anchored
+        // ligature break need 480, where the cursor is lit in both frames.
         let phase_ms = if matches!(
             key,
             prefs::EDIT_CURSOR_COLOR
@@ -667,13 +643,8 @@ fn fallback_raw_projection_covers_dotted_keys() {
     }
 }
 
-/// A carried draft is taken only by a row that takes TEXT — the rule
-/// `field_accepts_text_input` states for `settings/set/`, focus, pointer
-/// entry and `replace_snapshot` alike. The font-size row with a numeric
-/// value is a SLIDER: `take_carried_field_drafts` used to take a draft for
-/// it anyway (it excluded only switches, choices and themes), so the host
-/// read the draft back as landed, said nothing, and the next config
-/// snapshot discarded it (round three review).
+/// A carried draft is taken only by a row that takes text (`field_accepts_text_input`);
+/// the numeric font-size row is a slider and refuses it.
 #[test]
 fn a_carried_draft_is_taken_only_by_a_row_that_takes_text() {
     let service = VersionedConfigService::new("font_px = 14\n".into()).unwrap();
@@ -709,10 +680,8 @@ fn a_carried_draft_is_taken_only_by_a_row_that_takes_text() {
     );
 }
 
-// The production snapshot path for a DEPTH-2 leaf: a hand-set
-// `sparkle_words.profanity.enabled` is explicit with its exact raw value
-// (the full-depth dotted projection, not the whole-table opaque entry),
-// and an absent one is not.
+// A hand-set depth-2 leaf is explicit with its exact raw value through the snapshot
+// path; an absent one is not.
 #[test]
 fn snapshot_projection_covers_depth_two_dotted_keys() {
     let service =
@@ -733,8 +702,8 @@ fn snapshot_projection_covers_depth_two_dotted_keys() {
 /// THE PREVIEW'S COMPANION WEARS THE WINDOW'S CAT: the coat and eyes the
 /// host says the cursor companion wears (`ViewMotionCx::companion_look`: the
 /// favourite, the tenured program cat or the launch kitty) reach the cursor
-/// preview, and a different cat repaints it rather than serving a stale
-/// grey one from the raster memo.
+/// preview, and a different cat repaints it rather than serving a stale grey
+/// one from the raster memo.
 #[test]
 fn the_cursor_preview_wears_the_windows_companion_coat() {
     let state = SettingsViewState::new(&Config::default());
@@ -1145,18 +1114,12 @@ fn renderer_preview_carries_rainbow_variant_identity_from_config() {
 
     let motion = crate::native_app::ViewMotionCx::default();
     for (raw, expected) in [
-        // The underline spelling is a GEOMETRY of the kitty family and
-        // draws the family's companion. It used to answer FlyingKitty here
-        // — not by any rule, but because `style_names_kitty_pet` is a
-        // whole-string equality that it happened not to match, so appending
-        // one geometry word to `rainbow kitty` swapped the animal.
+        // A geometry word (`underline`, `tall`) on `rainbow kitty` keeps the
+        // family's companion animal.
         (
             "rainbow kitty underline",
             PreviewTrailCompanion::Pet(PetSpecies::Cat),
         ),
-        // `… tall` is the sibling spelling, and it draws the sibling's
-        // ANIMAL: the word names the geometry the default already draws,
-        // so it can no more swap the companion than `underline` can.
         (
             "rainbow kitty tall",
             PreviewTrailCompanion::Pet(PetSpecies::Cat),
@@ -1193,10 +1156,8 @@ fn renderer_preview_carries_rainbow_variant_identity_from_config() {
 
 #[test]
 fn preview_activity_comes_from_the_exact_authored_spec() {
-    // The runway ANIMATES because the trail draws on it; the master is asked
-    // for rather than inherited, because its absent-key default is
-    // platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`) and this test
-    // is about the preview's activity resolution, not about the default.
+    // The runway animates because the trail draws on it, so author the master on:
+    // its absent-key default is platform-split (`DEFAULT_DECORATIVE_EFFECTS`).
     let mut home = SettingsViewState::new(&Config {
         cursor_trail: Some(true),
         ..Config::default()
@@ -1488,16 +1449,9 @@ fn top_settings_paints_direct_labels_but_keeps_complete_label_semantics() {
         .find(|field| field.key == prefs::EDIT_THEME)
         .unwrap();
     let expected_visual = field.label.to_string();
-    let row = top_setting_row(
-        state,
-        prefs::EDIT_THEME,
-        None,
-        SettingsWidth::Wide,
-        LogicalRect::new(0.0, 0.0, 900.0, 80.0),
-        true,
-    )
-    .unwrap()
-    .row;
+    let row = top_setting_row(state, prefs::EDIT_THEME, None, SettingsWidth::Wide, true)
+        .unwrap()
+        .row;
     let compiled = UiTree::new(row)
         .compile(LogicalRect::new(0.0, 0.0, 900.0, 80.0))
         .unwrap();
@@ -1720,7 +1674,7 @@ fn highlighted_motion_candidate_resolves_against_live_host_facts_before_commit()
         )));
     };
 
-    // The SHIPPING Motion preview's verdict, not a test-side restatement of it.
+    // The shipping Motion preview's verdict, not a restatement of it.
     let preview_reduced_motion =
         |state: &SettingsViewState, motion: crate::native_app::ViewMotionCx| {
             renderer_preview_spec_for_key_with_font(
@@ -1829,14 +1783,9 @@ fn replace_settings_source(
     **state = SettingsViewState::from_snapshot(&snapshot).expect("project Settings fixture");
 }
 
-/// EVERY RUNG OF THE SOFTWARE UPDATE PAGE ADMITS THE FAILED APPLIES.
-///
-/// The page collapses as the host narrows — hero label, headline, detail,
-/// minimum-detail — and each rung is authored separately, which is how the
-/// `installable` work once fixed a headline and left the card underneath
-/// contradicting it. So the assertion runs the whole ladder: on the owner's
-/// 2026-08-21 state (staged 0.56.0, two dead applies, `ChildDied`) none of them
-/// may read as "Ready", and the widest rungs must name the count AND the cause.
+/// Every rung of the Software Update page (hero label, headline, detail,
+/// minimum detail) admits failed applies: none reads "Ready", and the widest
+/// name the count and the cause.
 #[test]
 fn every_rung_of_the_update_page_admits_a_stage_that_failed_to_apply() {
     use crate::update_apply_trouble::ApplyRetry;
@@ -1888,15 +1837,11 @@ fn every_rung_of_the_update_page_admits_a_stage_that_failed_to_apply() {
     assert_ne!(minimum, compact_update_detail_minimum(&clean));
 }
 
-/// A BUILD ON HOLD IS NEVER STARTED FROM THE PAGE (the audit of
-/// 2026-09-30): its sentence says starting it would roll it back, and the
-/// page's one button still installed it. Nor does the button send a
-/// check, which the updater refuses while a build is staged ("A verified
-/// update is already ready to install"): it sends nothing and says the
-/// build is on hold — also when the ledger no longer names the failures,
-/// where the page says "on hold" at every width, never "ready".
-/// NEGATIVE CONTROL: a build the person is asked to retry (`ManualOnly`)
-/// installs, as before.
+/// The button never installs a build on hold (its sentence says starting it would roll
+/// it back), nor sends a check (the updater refuses one while a build is staged): it
+/// sends nothing and says the build is on hold, at every width, even when the ledger
+/// no longer names the failures. Negative control: a build the person is asked to
+/// retry (`ManualOnly`) installs.
 #[test]
 fn the_update_button_never_starts_a_build_on_hold() {
     use crate::update_apply_trouble::ApplyRetry;
@@ -2096,9 +2041,8 @@ fn view_cx() -> ViewCx<'static> {
 }
 
 fn view_cx_at(width: f32, height: f32) -> ViewCx<'static> {
-    // NativeRuntime view tests bypass App/backend construction. Opt into
-    // the exact host-prepared UI faces at this direct-view fixture boundary
-    // instead of changing the cold font-store constructor under cfg(test).
+    // Direct view tests bypass App construction, so prepare the host's UI faces
+    // here rather than change the cold font-store constructor under cfg(test).
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     ViewCx {
         viewport: LogicalRect::new(0.0, 0.0, width, height),
@@ -2112,7 +2056,7 @@ fn view_cx_at(width: f32, height: f32) -> ViewCx<'static> {
 }
 
 // -----------------------------------------------------------------------
-// The macOS access block (design §3.4, §3.7)
+// The macOS access block
 // -----------------------------------------------------------------------
 
 fn access_fixture(fda: FdaState, dr: DrClass, scope: aterm_containment::FdaScope) -> MacosAccess {
@@ -2226,11 +2170,9 @@ fn the_census_is_on_the_panel_and_the_trash_button_takes_only_what_it_lists() {
     assert!(retired[3].ends_with("The operation couldn’t be completed."));
 }
 
-/// A declined owner alert quiets the block's gestures: presses queued
-/// behind the alert (a control client can queue `key space`) in the SAME
-/// view get no second alert and say why, and so does a view opened
-/// afterwards holding the same record; each decline in a row doubles the
-/// quiet, up to a cap, and a yes clears it.
+/// A declined owner alert quiets the block's gestures: presses queued behind it in
+/// the same view, and a view opened later on the same record, get no second alert
+/// and say why; each decline in a row doubles the quiet up to a cap; a yes clears it.
 #[test]
 fn a_decline_quiets_every_view_and_doubles_in_a_row() {
     use aterm_containment::FdaScope;
@@ -2881,11 +2823,10 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
 }
 
 // -----------------------------------------------------------------------
-// THE DEBUGGER-ACCESS ROW (docs/DESIGN-macos-debugger-access-2026-09-29.md
-// §3.3, §3.4; owner rulings O7 and O8, 2026-09-29). Every press here goes
-// through the injected `confirm` arm: no test reaches `menu::confirm_owner`
-// (AGENTS.md, the aterm-census guard `test-appkit-door`), and none reaches `run_devtools`,
-// which only the host calls.
+// The debugger-access row (docs/DESIGN-macos-debugger-access-2026-09-29.md
+// §3.3, §3.4). Every press goes through the injected `confirm` arm: no test
+// reaches `menu::confirm_owner`'s WindowServer alert (the census guard
+// `test-appkit-door`) or `run_devtools`.
 // -----------------------------------------------------------------------
 
 fn debugger_facts(
@@ -3045,11 +2986,10 @@ fn every_debugger_facts() -> Vec<crate::debugger_access::DebuggerFacts> {
     out
 }
 
-/// §3.3's by-state table, with owner ruling O8: an aterm that is not
-/// hardened (or whose hardening aterm could not read) offers *Allow* too;
-/// an account the switch cannot help, a rule aterm does not recognise, an
-/// unread rule and privacy checks off get no button; a change in flight
-/// draws its button busy and never pressable.
+/// §3.3's by-state table: an unhardened aterm (or one whose hardening could not be
+/// read) offers *Allow* too; an account the switch cannot help, an unrecognised or
+/// unread rule, and privacy checks off get no button; a change in flight draws its
+/// button busy, never pressable.
 #[test]
 fn the_debugger_row_follows_the_observed_state_table() {
     use aterm_containment::consent::{
@@ -3173,12 +3113,11 @@ fn press_debugger(
     state.feedback.clone()
 }
 
-/// The owner's yes records the change on the view for the park — the only
-/// thing the arm does; the host's `begin_debugger_access_change` re-checks
-/// and starts the worker. A press queued behind that yes raises no second
-/// alert, in this view or another holding the same record, until the park
-/// has taken the yes up. O8, the design's §5.4 NotHardened control
-/// inverted: an unhardened aterm's press is taken like a hardened one's.
+/// The owner's yes only records the change for the park; the host's
+/// `begin_debugger_access_change` re-checks and starts the worker. A press queued
+/// behind that yes raises no second alert, in this view or another on the same
+/// record, until the park takes it up. An unhardened aterm's press is taken like a
+/// hardened one's.
 #[test]
 fn a_confirmed_debugger_press_records_one_change_for_the_park() {
     use aterm_containment::consent::{DebuggerChange, DebuggerMember, DebuggerMode, SelfHardening};
@@ -3272,10 +3211,9 @@ fn a_confirmed_debugger_press_records_one_change_for_the_park() {
     }
 }
 
-/// A press the row does not offer asks nothing and records nothing: the
-/// privacy checks off, a change under way, the rule not in the change's
-/// precondition, an account the switch cannot help, and a view with no
-/// posture published at all. None of it is "you declined".
+/// A press the row does not offer asks and records nothing (privacy checks off, a
+/// change under way, the rule outside the change's precondition, an account the
+/// switch cannot help, no posture published), and none of it reads as a decline.
 #[test]
 fn a_debugger_press_the_row_does_not_offer_asks_nothing() {
     use aterm_containment::consent::{DebuggerMember, DebuggerMode, SelfHardening};
@@ -3824,11 +3762,9 @@ fn the_macos_access_block_draws_the_rows_it_measures() {
     }
 }
 
-/// A warm-up the host could not start says why on the page it was
-/// confirmed from, and is drawn — the revision moves, since the host wrote
-/// it outside the reducer. The switch that refused it going off under it
-/// does not take the reason away, and a view that has left the page gets
-/// no line at all.
+/// A warm-up the host could not start says why on the page it was confirmed from,
+/// and the revision moves (the host wrote it outside the reducer). The refusing
+/// switch going off keeps the reason; a view that left the page gets no line.
 #[test]
 fn a_warm_up_refusal_is_drawn_and_outlasts_the_switch_that_caused_it() {
     use aterm_containment::FdaScope;
@@ -3989,9 +3925,9 @@ fn denied_rows() -> Vec<MacosAccessRow> {
     crate::security_fixtures::denied_rows()
 }
 
-/// Unix-only: the fixture's running program is a macOS bundle path, and
-/// the route quotes the bundle root `app_bundle_root` re-joins from its
-/// components — with `\` on Windows, where this macOS card is never shown.
+/// Unix-only: the fixture's running program is a macOS bundle path, and the route
+/// quotes the root `app_bundle_root` re-joins, with `\` on Windows (where this card
+/// is never shown).
 #[cfg(unix)]
 #[test]
 fn macos_access_recovery_names_the_bundle_not_its_executable() {
@@ -4008,12 +3944,11 @@ fn macos_access_recovery_names_the_bundle_not_its_executable() {
     );
 }
 
-/// THE CARD EXPLAINS ITSELF ON AN ORDINARY WINDOW (measured live 2026-10-16:
-/// on a 774x782 window the card had shed to its one row, every sentence of the
-/// explanation unsaid). The full MACOS ACCESS block runs past a screen on any
-/// window, so the card is not held to leaving that block's actions row on the
-/// first screen: it says what one screen holds, the block's heading stays in
-/// view under it, and the list scrolls on to the block's actions row.
+/// The card explains itself on an ordinary window. The full MACOS ACCESS
+/// block runs past a screen on any window, so the card need not leave the
+/// block's actions row on the first screen: it says what one screen holds,
+/// the block's heading stays in view under it, and the list scrolls on to the
+/// actions row.
 #[test]
 fn the_devtools_card_explains_itself_on_an_ordinary_window() {
     use aterm_containment::consent::{DevToolList, DevToolListLabel as LL, DevToolListing as Li};
@@ -4526,9 +4461,8 @@ fn the_reset_offer_follows_the_denials_the_identity_the_tool_and_the_subject() {
     assert!(!access.shows_reset_button());
 }
 
-/// The plan is built from the RUNNING bundle id and from exactly the
-/// folders macOS refused — never a literal, never a folder nobody denied,
-/// and never the every-app form.
+/// The plan uses the running bundle id and exactly the folders macOS refused: never
+/// a literal, a folder nobody denied, or the every-app form.
 #[test]
 fn the_reset_plan_names_the_running_bundle_and_only_the_refused_folders() {
     use crate::consent_warmup::WarmupRow;
@@ -4554,10 +4488,9 @@ fn the_reset_plan_names_the_running_bundle_and_only_the_refused_folders() {
     }
 }
 
-/// The fold, at the exact strength each outcome earned. `AllReset` is the
-/// only value allowed to speak for the whole set; a partial success names
-/// what it cleared and gives every declined invocation its own line with
-/// the exit status. No retry appears anywhere.
+/// The fold at the strength each outcome earned: only `AllReset` speaks for the
+/// whole set; a partial success names what it cleared and gives each declined
+/// invocation its own line with the exit status. No retry appears.
 #[test]
 fn a_partial_reset_is_reported_as_partial_with_one_line_per_failure() {
     let all = MacosAccessReset::from_attempts(&[
@@ -4608,10 +4541,8 @@ fn a_partial_reset_is_reported_as_partial_with_one_line_per_failure() {
     assert!(macos_access_reset_lines(&MacosAccessReset::from_attempts(&[]), true).is_empty());
 }
 
-/// The block is absent until the HOST publishes a posture, and the gesture
-/// arms a view is born with cannot reach the OS. This is the §3.3 guardrail
-/// that keeps a unit test — a headless-constructible `App` by definition —
-/// away from `NSWorkspace` and `tccd`.
+/// The block is absent until the host publishes a posture, and a new view's gesture
+/// arms cannot reach the OS, so a unit test never reaches `NSWorkspace` or `tccd`.
 #[test]
 fn an_unpublished_or_unarmed_settings_view_reaches_no_os_consent_surface() {
     let (mut runtime, instance, view) = setup();
@@ -4643,8 +4574,7 @@ fn an_unpublished_or_unarmed_settings_view_reaches_no_os_consent_surface() {
         );
     }
 
-    // Even pressed directly, the gestures are inert: nothing opens and
-    // nothing spawns.
+    // Even pressed directly, the gestures open and spawn nothing.
     assert!(
         !ConsentGestures::inert().is_live(),
         "the default arms are the inert ones"
@@ -5108,7 +5038,7 @@ fn the_devtools_card_draws_what_it_measures() {
     );
 }
 
-/// *Open Developer Tools…* asks the HOST for the one hand-over
+/// *Open Developer Tools…* asks the host for the one hand-over
 /// (`App::hand_devtools_to_owner`, which shows aterm's helper panel beside the
 /// page): the press records a request and says the page is opening, asks
 /// nothing, reaches no gesture arm and is not the access card's *Open
@@ -5228,7 +5158,7 @@ fn the_developer_tools_button_asks_the_host_for_the_one_hand_over() {
     assert!(!state.note_devtools_hand_over(HandOver::Opened, None));
     assert_eq!(state.feedback, before);
 
-    // NEGATIVE CONTROLS: a view the host never published the page into, and one
+    // Negative controls: a view the host never published the page into, and one
     // published but left with the arms it was born with, ask the host for nothing
     // and say that nothing opened (the inert arm's other Open buttons' words).
     for (published, armed) in [(false, true), (true, false)] {
@@ -5310,8 +5240,8 @@ fn exiting_child(code: i32) -> aterm_uds::spawnfd::Command {
     }
 }
 
-/// Ten minutes, past the minute hang detector that judges it: a wait that
-/// sat the child out instead of killing it at the ceiling takes that long.
+/// Ten minutes, past the one-minute hang detector: a wait that sat the child out
+/// instead of killing it at the ceiling takes that long.
 fn never_exiting_child() -> aterm_uds::spawnfd::Command {
     let mut cmd = if cfg!(windows) {
         let mut cmd = aterm_uds::spawnfd::command("ping");
@@ -5326,14 +5256,9 @@ fn never_exiting_child() -> aterm_uds::spawnfd::Command {
     cmd
 }
 
-/// The main thread may never wait on `tccd` without a ceiling. A child that
-/// never exits must be killed, reaped, and reported as a DECLINE — never as
-/// a success, and never as `ToolAbsent` (the tool did run).
-///
-/// This is the 2026-08-17 hazard class: WindowServer's main thread sat in a
-/// `tccd` preflight for forty seconds and the watchdog took the whole GUI
-/// session down. `run_tccutil_reset` runs on the main thread from the
-/// Settings reducer, so its wait is bounded by construction.
+/// A child that never exits is killed, reaped and reported as a decline: never a
+/// success, never `ToolAbsent` (the tool ran). `run_tccutil_reset` runs on the main
+/// thread from the Settings reducer, so its wait on `tccd` must be bounded.
 #[test]
 fn a_reset_invocation_can_never_hold_the_main_thread_open_ended() {
     let ceiling = std::time::Duration::from_millis(150);
@@ -5345,37 +5270,28 @@ fn a_reset_invocation_can_never_hold_the_main_thread_open_ended() {
     let code = wait_bounded(&mut child, ceiling);
     let waited = started.elapsed();
 
-    // A hang detector, never a latency budget: a wait that ignored its
-    // ceiling would sit out the child's ten minutes.
+    // A hang detector: a wait that ignored its ceiling sits out ten minutes.
     assert!(
         waited < aterm_spec::wait::MUST_HAPPEN,
         "the bounded wait returned after {waited:?}; it must give up at the ceiling"
     );
     // Unix: a signalled child has no exit code. Windows: `Child::kill` is
-    // `TerminateProcess(handle, 1)`, so the killed child reports code 1 —
-    // still non-zero, still a decline, never a success.
+    // `TerminateProcess(handle, 1)`, so the child reports 1, still a decline.
     let killed = if cfg!(windows) { Some(1) } else { None };
     assert_eq!(
         code, killed,
         "a killed child reports what the host's kill leaves, which folds to a decline"
     );
-    // The kill must also REAP: a second wait on a reaped child cannot block.
     assert!(
         !ResetAttempt::from_exit_status(Folder::Documents, code).is_reset(),
         "a timed-out invocation must never read as a successful reset"
     );
 }
 
-/// A child that exits promptly is reported by its real exit code — the
-/// ceiling is a ceiling, not a delay.
-///
-/// The ceiling HERE is a hang detector, not the product's
-/// [`RESET_INVOCATION_CEILING`]: what is proved is that the exit code of
-/// a child that exits comes back, and a `/usr/bin/true` that a loaded machine
-/// takes more than that 1 s to exec and reap is killed and reads `None` (as
-/// under a 24-way CPU load). "Not a delay" is asserted
-/// against it: a wait that sat out its ceiling before looking would take a
-/// whole minute per child.
+/// A child that exits promptly is reported by its real exit code: the ceiling is a
+/// ceiling, not a delay. The ceiling here is a hang detector, not the product's 1 s
+/// [`RESET_INVOCATION_CEILING`], which a loaded host can spend exec'ing and reaping
+/// a `/usr/bin/true`.
 #[test]
 fn a_prompt_invocation_is_reported_by_its_own_exit_code() {
     const CEILING: std::time::Duration = std::time::Duration::from_secs(60);
@@ -5388,8 +5304,7 @@ fn a_prompt_invocation_is_reported_by_its_own_exit_code() {
     assert!(matches!(code, Some(n) if n != 0), "got {code:?}");
     assert!(!ResetAttempt::from_exit_status(Folder::Desktop, code).is_reset());
     let took = started.elapsed();
-    // A hang detector: a wait that sat out each ceiling before looking takes
-    // two of them, twice this bound.
+    // A hang detector: a wait that sat out each ceiling would take two of them.
     assert!(
         took < aterm_spec::wait::MUST_HAPPEN,
         "two prompt children took {took:?}: the ceiling was spent as a delay"
@@ -5468,17 +5383,16 @@ fn walk_open_choice_picker(
     assert_eq!(seen.len(), count, "{key}: every option is reachable");
 }
 
-/// The Home page's welcome flourish: on a roomy host the rainbow banner is
-/// present with a descriptive semantic label, decorative (no action,
-/// unfocusable), and paint-clean; ornamental chrome yields on short hosts
-/// and under Serious Mode.
+/// On a roomy host the Home page's rainbow banner is present with a descriptive
+/// label, decorative (no action, unfocusable) and paint-clean; it yields on short
+/// hosts and under Serious Mode.
 #[test]
 fn top_settings_rainbow_banner_present_and_yielding() {
     let key = UiKey::new("settings/top/rainbow");
     let (runtime, instance, view) = setup();
     // Roomy: the four cards' grid and the banner over it both fit. Where
     // nothing can sound (`trail_audio::output_available`), Music effects
-    // carries its "Audio unavailable" status line, and the grid that line
+    // carries its "No audio" status line, and the grid that line
     // lengthens yields the banner below a taller host.
     let roomy = if crate::trail_audio::output_available() {
         1_000.0
@@ -5493,7 +5407,7 @@ fn top_settings_rainbow_banner_present_and_yielding() {
     assert!(node.action.is_none(), "the banner is pure decoration");
     assert_zero_top_paint(&compiled, &format!("rainbow banner at 1200x{roomy} 1x"));
 
-    // A host below the fit gate keeps today's exact layout.
+    // A host below the fit gate keeps the plain layout.
     let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 700.0));
     assert!(
         compiled.semantic(&key).is_none(),
@@ -5734,16 +5648,11 @@ fn top_settings_cards_show_one_preview_each() {
     }
 }
 
-/// Run `rung` once per Dynamic Type scale, each on a thread of its own and
-/// ALL AT ONCE, so a sweep's wall is its slowest rung, not the sum of its
-/// rungs. Under `cfg(test)` the text scale
-/// ([`crate::native_appearance::install_preferences`]) and the chrome font
-/// stores are PER THREAD, so a fresh thread is a clean context for one
-/// scale and it needs no process of its own — which these rungs used to
-/// re-exec the whole test binary for (a 290 MB image started 2-3 times per
-/// test: measured 2026-09-30, 0.4-0.6 s of CPU per rung saved). Every
-/// thread is joined before anything is asserted, and the failure names
-/// every rung that failed with what it panicked with.
+/// Run `rung` once per Dynamic Type scale, all at once on threads of their own, so a
+/// sweep costs its slowest rung. Under `cfg(test)` the text scale
+/// ([`crate::native_appearance::install_preferences`]) and the chrome font stores are
+/// per thread, so a fresh thread is a clean context. Every thread is joined before
+/// asserting, and the failure names each failed rung with its panic.
 fn at_each_text_scale(rungs: &[f32], what: &str, rung: impl Fn(f32) + Sync) {
     let rung = &rung;
     let failed = std::thread::scope(|scope| {
@@ -5752,7 +5661,7 @@ fn at_each_text_scale(rungs: &[f32], what: &str, rung: impl Fn(f32) + Sync) {
             .map(|&scale| {
                 let run = std::thread::Builder::new()
                     .name(format!("{what} at {scale}\u{d7}"))
-                    // The main thread's, where each rung used to run.
+                    // The main thread's stack size.
                     .stack_size(8 << 20)
                     .spawn_scoped(scope, move || {
                         crate::native_appearance::install_preferences(
@@ -5782,10 +5691,60 @@ fn at_each_text_scale(rungs: &[f32], what: &str, rung: impl Fn(f32) + Sync) {
     assert!(failed.is_empty(), "{what} failed at {}", failed.join(", "));
 }
 
-/// Sample `at` over `from..=to`: every `coarse` points, then bisect each
-/// interval whose two ends disagree down to `resolution`, so the samples
-/// fall where the answer CHANGES — a threshold — and not where it stays
-/// what it was. With `resolution >= coarse` it is the plain uniform sweep.
+/// How many threads [`on_workers`] spreads a rung's items over.
+const SWEEP_WORKERS: usize = 3;
+
+/// Run `job` on each of `items` over [`SWEEP_WORKERS`] threads of their own,
+/// each in this thread's appearance (its text scale), as
+/// [`at_each_text_scale`] runs its rungs: a rung's long axis spread over a few
+/// threads, so the sweep costs a share of its slowest rung. Each worker takes
+/// the next item when it finishes one. Every thread is joined before
+/// asserting, and the failure names each failed item with its panic.
+fn on_workers<T: Sync + std::fmt::Debug>(items: &[T], what: &str, job: impl Fn(&T) + Sync) {
+    let preferences = crate::native_appearance::current_preferences();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for worker in 0..SWEEP_WORKERS.min(items.len()) {
+            let (next, failed, job) = (&next, &failed, &job);
+            std::thread::Builder::new()
+                .name(format!("{what} worker {worker}"))
+                // The main thread's stack size.
+                .stack_size(8 << 20)
+                .spawn_scoped(scope, move || {
+                    crate::native_appearance::install_preferences(preferences);
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(at) else {
+                            return;
+                        };
+                        if let Err(payload) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(item)))
+                        {
+                            let said = payload
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| payload.downcast_ref::<&str>().copied())
+                                .unwrap_or("a non-text panic");
+                            failed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(format!("{item:?} ({said})"));
+                        }
+                    }
+                })
+                .unwrap_or_else(|error| panic!("launch {what} worker {worker}: {error}"));
+        }
+    });
+    let failed = failed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(failed.is_empty(), "{what} failed at {}", failed.join(", "));
+}
+
+/// Sample `at` over `from..=to` every `coarse`, then bisect each interval whose ends
+/// disagree down to `resolution`, so samples land on thresholds. With
+/// `resolution >= coarse` it is the plain uniform sweep.
 fn sample_where_it_changes<T: PartialEq + Copy>(
     from: f32,
     to: f32,
@@ -5823,9 +5782,8 @@ fn assert_zero_top_paint(compiled: &crate::native_ui::CompiledUi, context: &str)
     compiled
         .validate_parity()
         .unwrap_or_else(|error| panic!("{context}: {error:?}"));
-    // The cheap form of the full audit's verdict — zero overflowing text,
-    // zero materially clipped nodes, no clip-truncated editor — and the full
-    // audit is rendered only to explain a failure.
+    // The cheap form of the full audit's verdict (no overflowing text, no materially
+    // clipped node, no clip-truncated editor); the full audit only explains a failure.
     let failures = compiled.fit_failures();
     assert!(
         failures.is_empty(),
@@ -6052,10 +6010,9 @@ fn assert_short_landscape_geometry(
     }
 }
 
-/// Every pager status a Settings page prints, as `(key, total)`: the results
-/// window's `"1–2 of 3"` and the section pager's `"Page 1 of 3"`. Parsed
-/// strictly — a label only counts when both sides are numbers — so this
-/// reads the page the way a user does instead of trusting a key name.
+/// Every pager status a Settings page prints, as `(key, total)`: the results window's
+/// `"1–2 of 3"` and the section pager's `"Page 1 of 3"`. A label counts only when both
+/// sides are numbers, so this reads the page as a user does.
 fn pager_totals(compiled: &crate::native_ui::CompiledUi) -> Vec<(String, usize)> {
     compiled
         .semantics
@@ -6077,11 +6034,11 @@ fn pager_totals(compiled: &crate::native_ui::CompiledUi) -> Vec<(String, usize)>
         .collect()
 }
 
-/// ONE BOUND PER LIST. Every Settings page bounds the scroll reducer with
-/// the bound its own list measured — the least first stop whose screen
-/// reaches the list's last stop — so the wheel, Page Down and the assistive
-/// tree stop exactly at a full last screen, never past it and never short
-/// of the last stop; and no page draws a pager.
+/// One bound per list: every Settings page bounds the scroll reducer with the
+/// bound its own list measured (the least first stop whose screen reaches the
+/// list's last stop), so the wheel, Page Down and the assistive tree stop
+/// exactly at a full last screen, never past it and never short of the last
+/// stop; and no page draws a pager.
 #[test]
 fn every_settings_list_bounds_the_reducer_at_its_last_full_screen() {
     at_each_text_scale(&[1.0, 1.25, 2.0], "Dynamic Type list-bound rung", |scale| {
@@ -6097,16 +6054,13 @@ fn every_settings_list_bounds_the_reducer_at_its_last_full_screen() {
 /// screen there is, not one fixed screen a defect could step around.
 fn list_bound_sweep(scale: f32) {
     let (mut runtime, instance, view) = setup();
-    // Every width class, both sides of the compact/persistent-navigation
-    // boundary, and heights from the window minimum (164×98,
-    // `app_window.rs`) through the short-landscape band, the shipped
-    // default 744×420, the grid row above it, and a roomy desktop page.
+    // Every width class, both sides of the compact/persistent-navigation boundary,
+    // heights from the window minimum (164×98, `app_window.rs`) through the
+    // short-landscape band, the default 744×420, and a roomy desktop page.
     const WIDTHS: [f32; 6] = [320.0, 480.0, 744.0, 760.0, 1040.0, 1200.0];
     const HEIGHTS: [f32; 9] = [98.0, 200.0, 240.0, 320.0, 420.0, 437.0, 522.0, 700.0, 900.0];
-    // A global search is the one state where the caller's fit test and the
-    // renderer that ran disagreed; "" walks the plain category pages. The
-    // search page is route-independent (one Search Results page answers
-    // every route), so the queries walk it once rather than seventeen times.
+    // "" walks the plain category pages; a global search is one Search Results page
+    // for every route, so each query walks it once.
     let mut cell = 0usize;
     for (query, routes) in [
         ("", SettingsRoute::ALL.as_slice()),
@@ -6678,8 +6632,8 @@ fn real_settings_draft_close_lifecycle_conforms_to_derived_model() {
     let blocked = project(&model, &mut runtime, instance, view, 1, 1);
     assert_transition(&model, &preserved, &blocked, "AttemptDirtyClose");
 
-    // Negative control for the other historical shortcut: a dirty view
-    // cannot report Ready or hide recovery after a close attempt.
+    // Negative control: a dirty view cannot report Ready or hide recovery after a
+    // close attempt.
     let mut unsafe_ready = blocked.clone();
     unsafe_ready.insert("close_result", 2);
     unsafe_ready.insert("recovery_visible", 0);
@@ -6719,8 +6673,8 @@ fn real_settings_draft_close_lifecycle_conforms_to_derived_model() {
     let armed_again = project(&model, &mut runtime, instance, view, 0, 1);
     assert_transition(&model, &cancelled, &armed_again, "ArmDiscard");
 
-    // Tier-1 negative control: the historical one-click destructive branch
-    // is neither admitted by Next nor accepted by the named invariant.
+    // Negative control: a one-click discard is neither admitted by Next nor accepted
+    // by the named invariant.
     let mut one_click_loss = armed_again.clone();
     one_click_loss.insert("draft", 0);
     one_click_loss.insert("recovery_visible", 0);
@@ -6759,9 +6713,8 @@ fn real_settings_draft_close_lifecycle_conforms_to_derived_model() {
 fn route_activation_keeps_focus_on_a_surviving_visible_control() {
     let (mut runtime, instance, view) = setup();
 
-    // The macOS-style desktop rail survives a route transition. Keep the
-    // selected destination focused instead of moving focus to the structural
-    // page Group, which is absent from the keyboard focus order.
+    // The desktop rail survives a route transition: focus stays on the selected
+    // destination, not the page Group, which is outside the focus order.
     let desktop_key = UiKey::new("settings/nav/appearance");
     runtime
         .dispatch(
@@ -6795,10 +6748,8 @@ fn route_activation_keeps_focus_on_a_surviving_visible_control() {
             .is_some_and(|state| { state.focused && state.focus_visible && state.selected })
     );
 
-    // The compact category sheet does not survive selection. Its stable
-    // successor is the toolbar's category/back button, including when the
-    // user chooses the already-selected route (which must still close the
-    // sheet).
+    // The compact category sheet closes on selection, also of the current route; its
+    // successor is the toolbar's category/back button.
     runtime
         .dispatch(
             instance,
@@ -6858,9 +6809,8 @@ fn route_activation_keeps_focus_on_a_surviving_visible_control() {
         "choosing the current route must close the compact category sheet"
     );
 
-    // Menu/control navigation has no source row to infer. The most recent
-    // real breakpoint still supplies a surviving target, rather than the
-    // non-focusable page Group used by the old fallback.
+    // Menu/control navigation has no source row; the most recent real breakpoint
+    // still supplies a surviving target, not the non-focusable page Group.
     let (mut external, external_instance, external_view) = setup();
     let wide_cx = view_cx();
     let _ = compile_settings_view(&external, external_instance, external_view, &wide_cx);
@@ -6920,12 +6870,15 @@ fn cmd_z_falls_back_to_last_config_patch_when_no_text_field_owns_undo() {
     let outcome = runtime
         .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Undo))
         .unwrap();
-    assert!(
-        outcome
-            .effects
-            .iter()
-            .any(|effect| { matches!(effect, AppEffect::ConfigUndo { token: 41, .. }) })
-    );
+    assert!(outcome.effects.iter().any(|effect| {
+        matches!(
+            effect,
+            AppEffect::ConfigUndo {
+                target: crate::native_app::UndoTarget::Token(41),
+                ..
+            }
+        )
+    }));
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         panic!("Settings view");
     };
@@ -7231,8 +7184,7 @@ fn focusing_search_closes_invisible_picker_and_confirmation_before_one_escape() 
 fn singleton_controller_supports_distinct_window_local_views() {
     let (mut runtime, instance, first) = setup();
     let mut core_views = ViewStore::default();
-    // Burn the first core id to mirror the id already held by `first`; stable
-    // view ids are globally allocated by App in production.
+    // Burn the first core id to mirror `first`'s; App allocates view ids globally.
     let _ = core_views.insert_native(instance).unwrap();
     let second = core_views.insert_native(instance).unwrap();
     assert_ne!(first, second);
@@ -7839,12 +7791,10 @@ fn config_patches(outcome: &crate::native_app::DispatchOutcome) -> Vec<ConfigPat
         .collect()
 }
 
-/// THE CURSOR STYLES LIST (owner ask: "a page with a list of the working
-/// ones where selecting each one shows a preview in the working theme").
-/// Every listed style is a row of the page's one list. Pointing at a row or
-/// moving the keyboard to it changes only the preview — no write, and the
-/// check stays on the saved style. Choosing one sends one patch, and the
-/// list stays where it was.
+/// The Cursor Styles list: every listed style is a row of the page's one
+/// list. Pointing at a row or moving the keyboard to it changes only the
+/// preview (no write, and the check stays on the saved style). Choosing one
+/// sends one patch, and the list stays where it was.
 #[test]
 fn cursor_style_rows_preview_unsaved_and_save_in_one_patch() {
     let (mut runtime, instance, view) = cursor_styles_runtime(&trail_drawn(""));
@@ -8261,10 +8211,10 @@ fn cursor_styles_land_with_a_list_in_view_at_common_sizes() {
     }
 }
 
-/// SERIOUS MODE STAYS SAID WHILE STYLES ARE TRIED: the note that Serious Mode
+/// Serious Mode stays said while styles are tried: the note that Serious Mode
 /// is on and that choosing a style turns it off is pinned above the list, so
 /// arrowing through the styles (each previewed as if chosen) never scrolls
-/// it away — at the 80×24 window and the shipped 102×29 one.
+/// it away, at the 80×24 window and the shipped 102×29 one.
 #[test]
 fn the_serious_mode_note_stays_in_view_while_styles_are_tried() {
     for (width, height) in [(584.0, 348.0), (738.0, 418.0)] {
@@ -8629,10 +8579,10 @@ fn home_and_end_reach_the_list_ends_from_a_row_on_screen() {
     }
 }
 
-/// THE PREVIEW NEVER JUMPS: choosing a style brings up its status bar, which
+/// The preview never jumps: choosing a style brings up its status bar, which
 /// takes its room from the list, never from the preview, so the preview
-/// keeps its height and the chosen row stays where it was under the pointer
-/// — at every common size, and when the choice turns Serious Mode off (the
+/// keeps its height and the chosen row stays where it was under the pointer,
+/// at every common size and when the choice turns Serious Mode off (the
 /// note it retires keeps its place).
 #[test]
 fn choosing_a_style_keeps_the_preview_and_the_row_in_place() {
@@ -9215,7 +9165,7 @@ fn only_modified_says_it_has_no_modified_settings() {
     }
 }
 
-/// THE PAGE THAT WAS CURSOR KITTY keeps its old address.
+/// The page that was Cursor Kitty keeps its old address.
 #[test]
 fn the_cursor_kitty_address_opens_cursor_styles() {
     assert_eq!(
@@ -9229,8 +9179,8 @@ fn the_cursor_kitty_address_opens_cursor_styles() {
     );
 }
 
-/// THE STYLE'S OWN TUNING. A knob the saved style never reads says which
-/// style ignores it; one it reads carries no such note.
+/// A tuning knob the saved style never reads says which style ignores it;
+/// one it reads carries no such note.
 #[test]
 fn tuning_a_style_does_not_read_says_so() {
     let note = |toml: &str, key: &str| {
@@ -9363,7 +9313,7 @@ fn the_sound_page_s_music_effects_row_paints_its_notes_and_offers_reset() {
     }
 }
 
-/// THE SOUND PAGE'S ROWS say what silences them: the typing sound and the
+/// The Sound page's rows say what silences them: the typing sound and the
 /// output streak's pip answer to Music effects like every synth voice, and
 /// the pip to the output streak too. Music effects itself does not claim
 /// silence while the trail is off: only the typing notes need the trail.
@@ -9456,8 +9406,8 @@ fn sound_rows_name_the_switch_that_silences_them() {
     assert!(status.contains("other sounds still play"), "{status}");
 }
 
-/// THE DEFAULT IS ONE ROW. A picker never lists it twice ("Use default"
-/// beside the same value): the option that is the default says so, is the
+/// The default is one row: a picker never lists it twice ("Use default"
+/// beside the same value). The option that is the default says so, is the
 /// saved one while the key is unset, and choosing it removes the key. Only a
 /// default the list does not offer gets a row of its own, and a saved value
 /// the list does not offer is named in the picker's spelling.
@@ -9632,9 +9582,9 @@ fn picker_titles_are_sentence_case_and_keep_names() {
     );
 }
 
-/// THE KEYBOARD IN AN OPEN PICKER: the arrows move the highlight, and the
-/// preview follows it, with nothing saved; Escape and Cancel close it with
-/// nothing saved and the saved value back in the preview.
+/// In an open picker the arrows move the highlight, and the preview follows
+/// it, with nothing saved; Escape and Cancel close it with nothing saved and
+/// the saved value back in the preview.
 #[test]
 fn picker_arrow_keys_move_the_highlight_and_cancel_saves_nothing() {
     // One theme always, so the Color theme control opens the whole picker.
@@ -9767,11 +9717,11 @@ fn picker_arrow_keys_move_the_highlight_and_cancel_saves_nothing() {
     );
 }
 
-/// THE PICKER IS SIZED TO THE ROOM UNDER THE PREVIEW. At 1200x820 every
-/// theme — its sections, filter and footer with it — is on glass at once,
-/// and the card ends at its last row: no blank band, and no tile wider than
-/// its column. (The 150x48 window scrolls it: a theme tile carries its
-/// swatches, and four sections no longer fit 684 points.)
+/// The picker is sized to the room under the preview: at 1200x820 every
+/// theme (its sections, filter and footer with it) is on glass at once, and
+/// the card ends at its last row: no blank band, and no tile wider than its
+/// column. The 150x48 window scrolls it: a theme tile carries its swatches,
+/// and four sections do not fit 684 points.
 #[test]
 fn top_pickers_show_every_option_where_they_fit() {
     let cx = view_cx_at(1_200.0, 820.0);
@@ -9841,9 +9791,9 @@ fn top_pickers_show_every_option_where_they_fit() {
     }
 }
 
-/// THE DEFAULT 80x24 WINDOW (744x420) and the shorter 584x348 one: the open
-/// theme picker on Top Settings scrolls instead of clipping. Nothing in it
-/// is cut, a thumb says there is more, and the keyboard reaches every option.
+/// At the default 80x24 window (744x420) and the shorter 584x348 one the open
+/// theme picker on Top Settings scrolls instead of clipping: nothing in it is
+/// cut, a thumb says there is more, and the keyboard reaches every option.
 #[test]
 fn compact_pickers_scroll_instead_of_clipping_at_the_default_window() {
     for (width, height) in [(738.0, 418.0), (584.0, 348.0)] {
@@ -9896,8 +9846,8 @@ fn compact_pickers_scroll_instead_of_clipping_at_the_default_window() {
     }
 }
 
-/// A SHORT CHOICE IS ITS ROW. Two or three options that fit are segments in
-/// the row, one click to save, instead of a full-page picker: the saved
+/// A short choice is its row: two or three options that fit are segments in
+/// the row, one click to save, instead of a full-page picker. The saved
 /// segment keeps the setting's own key and action (focus, automation and
 /// introspection find it where they always did), the others save their
 /// option, the default one by removing the key. A saved value the segments
@@ -10257,9 +10207,8 @@ fn packages_service(
     service
 }
 
-/// A live packages snapshot whose machine read has ALSO completed — the exact
-/// path the host takes (`replace_machine_state` after the status worker), so
-/// the card is fed the way it is fed in production.
+/// A live packages snapshot whose machine read has also completed
+/// (`replace_machine_state` after the status worker), as the host feeds the card.
 fn live_packages_state_with_machine(
     busy: Option<crate::packages_screen::PackagesBusy>,
     machine: Result<atpkg::machine::MachineState, String>,
@@ -10267,9 +10216,9 @@ fn live_packages_state_with_machine(
     live_packages_state_with_machine_reads(busy, true, None, vec![machine])
 }
 
-/// The general form: `manager_enabled` and a collection error seed the report
-/// (the package-manager gate), and `reads` are reduced in order — so a read
-/// error AFTER a good record is built the way the host builds it.
+/// The general form: `manager_enabled` and a collection error seed the report, and
+/// `reads` are reduced in order, so a read error after a good record is built as the
+/// host builds it.
 fn live_packages_state_with_machine_reads(
     busy: Option<crate::packages_screen::PackagesBusy>,
     manager_enabled: bool,
@@ -10322,9 +10271,9 @@ fn failed_packages_state() -> PackagesState {
     service.state(true, true, true)
 }
 
-/// The Packages route is a first-class destination: rail entry, special
-/// page with both action buttons, the maintenance switches, the program list,
-/// and the contextual command all derive from one route + one projection.
+/// The Packages route is a first-class destination: rail entry, page with both action
+/// buttons, the maintenance switches, the program list and the contextual command all
+/// derive from one route and one projection.
 #[test]
 fn packages_route_renders_status_actions_switches_and_programs() {
     let (mut runtime, instance, view) = setup();
@@ -10379,8 +10328,7 @@ fn packages_route_renders_status_actions_switches_and_programs() {
             "the {key} consent switch renders on the special page"
         );
     }
-    // ONE switch for updates (Phase 4; 2026-09-23): the retired `auto_update` is no
-    // second one on the page — it is folded into "Automatic updates".
+    // Retired keys get no row: updates have one switch, "Automatic updates".
     for retired in ["packages.auto_update", "packages.seed_install"] {
         assert!(
             compiled
@@ -10427,10 +10375,8 @@ fn packages_route_renders_status_actions_switches_and_programs() {
     assert!(check.enabled);
 }
 
-/// atpkg's whole-toolset pseudo-row is spelled `*toolset*` in its status
-/// ledger; the native page must present the product name, never literal
-/// Markdown-style asterisks (2026-08 settings audit). The raw name stays
-/// in the node key so the row's identity is stable across renames.
+/// atpkg's whole-toolset pseudo-row is `*toolset*` in its status ledger; the page shows
+/// the product name, never literal asterisks. The raw name stays in the node key.
 #[test]
 fn packages_toolset_pseudo_row_paints_its_product_name_without_asterisks() {
     let status = atpkg_status(
@@ -10478,11 +10424,9 @@ fn packages_toolset_pseudo_row_paints_its_product_name_without_asterisks() {
     assert_eq!(package_program_display_name("*"), "*");
 }
 
-/// THE PACKAGES BADGE ON THE SETTINGS RAIL (2026-09-22): a toolchain
-/// failure's one surface is Settings, so while the Packages projection names
-/// one the rail's Packages entry wears the dot and SAYS it — its semantic value
-/// is the page's own headline words, so the dot is never the only carrier —
-/// and no other entry does; once the condition clears, neither remains.
+/// A toolchain failure's one surface is Settings: while the Packages projection names
+/// one, the rail's Packages entry wears the dot and says it (its semantic value is the
+/// page's headline), no other entry does, and once it clears neither remains.
 #[test]
 fn the_packages_rail_entry_wears_the_badge_while_a_failure_is_named() {
     let (mut runtime, instance, view) = setup();
@@ -10575,7 +10519,7 @@ fn the_packages_rail_entry_wears_the_badge_while_a_failure_is_named() {
     }
 }
 
-/// The danger dots a compiled Settings view PAINTS, as centres.
+/// The danger dots a compiled Settings view paints, as centres.
 fn painted_badge_dots(compiled: &crate::native_ui::CompiledUi) -> Vec<(f32, f32)> {
     let theme = aterm_render::Theme::default();
     let danger = crate::settings::Roles::from_theme(theme).danger;
@@ -10621,9 +10565,9 @@ fn wall_now() -> i64 {
     aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0))
 }
 
-/// A Packages page as a working Mac shows it (Phase 4): claude at Anthropic's latest,
-/// codex keeping 0.156.0 after refusing 0.157.0, the ALab toolset on index 44 (one
-/// program held), and `events` lines of package activity, the newest a minute old.
+/// A Packages page as a working Mac shows it: claude at Anthropic's latest, codex
+/// keeping 0.156.0 after refusing 0.157.0, the ALab toolset on index 44 (one program
+/// held), and `events` lines of package activity, the newest a minute old.
 fn packages_state_with_activity(events: usize) -> PackagesState {
     packages_state_with_activity_policy(events, true)
 }
@@ -10756,10 +10700,10 @@ fn packages_page_semantics(
     out
 }
 
-/// THE PROGRAM LIST SAYS EACH ROW'S FACTS (Phase 4): version and source, when it was
-/// updated, the latest known — relative, never raw UTC. A state those words say is not
-/// repeated; a refusal keeps its own words whole under its row, a hold its canonical
-/// words, and a SHADOWED row its per-shell truth.
+/// The program list says each row's facts: version and source, when it was updated,
+/// the latest known, relative, never raw UTC. A state those words say is not
+/// repeated; a refusal keeps its own words under its row, a hold its canonical words,
+/// and a shadowed row its per-shell truth.
 #[test]
 fn program_lines_say_version_source_updated_and_latest_known() {
     let packages = packages_state_with_activity(0).projection();
@@ -10796,7 +10740,7 @@ fn program_lines_say_version_source_updated_and_latest_known() {
             line.text
         );
     }
-    // SHADOWED is said after the facts.
+    // A shadowed row's state is said after the facts.
     let shadowed = packages_state_with_program_state(&atpkg::state::shadowed(
         1971,
         std::path::Path::new("/opt/homebrew/bin/ay"),
@@ -10812,9 +10756,8 @@ fn program_lines_say_version_source_updated_and_latest_known() {
     );
 }
 
-/// A ROW'S WORDS ARE PLAIN, ITS STATE STAYS CANONICAL (2026-09-23 audit, SB-18): the
-/// page paints `ay · build 1971 · up to date`, and the row's one semantic node carries
-/// atpkg's own line after the words — what `status.toml`, `doctor` and the log say.
+/// A row's words are plain and its state canonical: the page paints `ay · build 1971 ·
+/// up to date`, and the row's semantic node carries atpkg's own line after the words.
 #[test]
 fn a_program_rows_accessible_value_is_atpkgs_own_state() {
     let (mut runtime, instance, view) = setup();
@@ -11392,8 +11335,7 @@ fn compact_top_settings_keeps_the_playful_effects_note() {
 
 /// At the shipped 102x29 window (738x420) the status card holds its action
 /// and the Settings ▸ Messages link side by side: the card with them fits the
-/// list's room, so neither is split out to a stop of its own (the next screen
-/// used to open on a lone "Messages →").
+/// list's room, so neither is split out to a stop of its own.
 #[test]
 fn software_update_keeps_its_buttons_in_the_status_card_at_the_default_window() {
     let (mut runtime, instance, view) = setup();
@@ -11592,11 +11534,11 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
             overflowing.join("\n")
         );
     }
-    // WRITTEN — one switch or both, the state anyone who turned one off is in —
-    // each switch keeps the SAME words, says Changed, is never cut off at any
+    // Written (one switch or both, the state anyone who turned one off is in):
+    // each switch keeps the same words, says Changed, is never cut off at any
     // window size, and the two switches stay in one column (the unwritten one
-    // keeps an empty slot where Reset would be). NEGATIVE CONTROL: the unwritten
-    // switch says no Changed.
+    // keeps an empty slot where Reset would be). Negative control: the
+    // unwritten switch says no Changed.
     revision += 1;
     assert!(
         runtime.replace_settings_update(
@@ -11962,11 +11904,9 @@ fn a_short_compact_page_pairs_the_status_card_with_the_check_switch() {
     let whole = page(&mut runtime, &tall, 0);
     assert!(whole.semantic(&checks).is_some() && whole.semantic(&install).is_some());
 
-    // AN ENROLLED LINUX COPY TOO, WHATEVER ITS DETAIL (2026-09-24 review). Its detail
-    // runs longer — the Linux facts, and before them the timing sentence while
-    // automatic checks are off — and at three lines it left the check half no room
-    // beside the status card, so the switch that turns checks back on sat on page 2.
-    // The detail now paints a line fewer there; its whole sentence stays the value.
+    // An enrolled Linux copy too, whatever its detail: the Linux facts (and the timing
+    // sentence while checks are off) run longer, so the detail paints a line fewer
+    // here to keep the check switch on page 1; its whole sentence stays the value.
     let linux = |staged: Option<u64>| aterm_update::LinuxUpdateStatus {
         installed_build: 1,
         installed_version: String::new(),
@@ -12012,12 +11952,10 @@ fn a_short_compact_page_pairs_the_status_card_with_the_check_switch() {
     }
 }
 
-/// ONE "Automatic updates" switch, LIVE (Phase 4; the one-path collapse, 2026-09-23):
-/// `[packages] enabled` off paints the switch off and the service line says nothing
-/// updates by itself — no "next launch", and no retired `auto_update` row beside it
-/// (it is folded into the switch). The install consent keeps its authored value while
-/// the switch is off (dormant: no unattended pass runs to install anything). Replaces
-/// the two-switch master/child page the launch-time gates needed.
+/// One live "Automatic updates" switch: `[packages] enabled` off paints it off, the
+/// service line says nothing updates by itself (no "next launch"), and no retired
+/// `auto_update` row stands beside it. The install consent keeps its authored value
+/// while the switch is off (dormant: no unattended pass installs anything).
 #[test]
 fn packages_page_shows_one_live_switch_and_the_dormant_install_consent() {
     let service = VersionedConfigService::new(
@@ -12029,7 +11967,7 @@ fn packages_page_shows_one_live_switch_and_the_dormant_install_consent() {
         unreachable!();
     };
     **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
-    // The lane runs whatever the switch says (it stands by, live), so the loop is up.
+    // The lane stands by whatever the switch says, so the loop is up.
     assert!(runtime.replace_settings_packages(
         live_packages_state_with_policy(None, false, true, true),
         2,
@@ -12070,15 +12008,12 @@ fn packages_page_shows_one_live_switch_and_the_dormant_install_consent() {
     );
 }
 
-/// A MACHINE THE RETIRED SECOND SWITCH TURNED OFF (review of Phase 4, 2026-09-23),
-/// through the ONE model (the one-path collapse, same day): `enabled = true,
-/// auto_update = false` holds every update off, so "Automatic updates" reads Off — its
-/// seed is the folded `Config::packages_enabled`, the reader the loop's gate shares —
-/// on the page and in Search, and the service line names the retired key and the
-/// control that clears it. Turning it on writes `enabled = true` ALONE, and the one
-/// writer (`prefs::apply_prefs_edits`, `RETIRED_PACKAGES_SPELLINGS`) takes the retired
-/// key out of the file with it: after the patch the file reads on. Off writes
-/// `enabled = false` alone.
+/// `enabled = true` beside the retired `auto_update = false` holds every update off, so
+/// "Automatic updates" reads Off (seeded by `Config::packages_enabled`, the reader the
+/// loop's gate shares) on the page and in Search, and the service line names the
+/// retired key and the control that clears it. On writes `enabled = true` alone, and
+/// `prefs::apply_prefs_edits` (`RETIRED_PACKAGES_SPELLINGS`) removes the retired key
+/// with it. Off writes `enabled = false` alone.
 #[test]
 fn automatic_updates_reads_and_restores_auto_update() {
     let mut service = VersionedConfigService::new(
@@ -12109,8 +12044,7 @@ fn automatic_updates_reads_and_restores_auto_update() {
             }),
         )
         .unwrap();
-    // The switches' card is on whichever page the wide page packs it onto: the wrapped
-    // service line and the retired key's note make it taller than the one-line rows did.
+    // The switches' card is on whichever page the wide page packs it onto.
     let cx = view_cx();
     let control = UiKey::new(format!("settings/control/{}", prefs::EDIT_PACKAGES_ENABLED));
     let compiled = (0..4)
@@ -12206,14 +12140,11 @@ fn automatic_updates_reads_and_restores_auto_update() {
     );
 }
 
-/// A RETIRED `[packages]` SPELLING ON MODIFIED IS NAMED, READ AND RESETTABLE (review of
-/// the Phase 4 merge, 2026-09-23). Under the one model `auto_update` and `seed_install`
-/// have no field, so Modified called each a "Forward-compatible config key" — a key from
-/// a NEWER build, with no Reset — and Reset All, which resets fields, left an
-/// `auto_update = false` holding Automatic updates off after "Reset all settings". Each
-/// row now names the switch it is the retired spelling of and what it does to it, its
-/// Reset removes that key alone, Reset All removes it with the rest (and Undo writes it
-/// back as the Bool atpkg reads), and Search finds each switch by the old name.
+/// A retired `[packages]` spelling (`auto_update`, `seed_install`) on Modified is named,
+/// read and resettable: its row names the switch it is the retired spelling of and
+/// what it does to it, its Reset removes that key alone, Reset All removes it with the
+/// rest (Undo writes it back as the Bool atpkg reads), and Search finds each switch by
+/// the old name.
 #[test]
 fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
     let source = "[packages]\nauto_update = false\nseed_install = false\n";
@@ -12254,7 +12185,7 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
         );
     }
 
-    // The row carries its Reset, which removes that key alone, CAS on the value shown.
+    // The row's Reset removes that key alone, CAS on the value shown.
     state.page_scroll = overrides
         .iter()
         .position(|entry| entry.key == prefs::RETIRED_PACKAGES_AUTO_UPDATE)
@@ -12360,16 +12291,11 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
     }
 }
 
-/// A RETIRED `auto_update = false`'S WAY OUT IS READ WHOLE, AT EVERY WIDTH (review of the
-/// Phase 4 merge, 2026-09-23). The one-line Background service row cut the retired key's
-/// line at every width ("…(turning on Keep ALab tools up…", "…auto_update = false h…"),
-/// and atpkg's sentence rode the hero's one-line detail, which cut its remedy ("…remove
-/// it and se…"); the ordinary Off and On lines lost "Update Now still works" and the
-/// last full check (the hero's detail now) at the medium and compact widths. Now the
-/// service line wraps in its
-/// column and the note is its own wrapped quiet lines under the switch — measured by the
-/// painter at each layout's narrowest viewport and the review's own, every line fits
-/// and every word of the remedy paints; the hero detail no longer carries the note.
+/// A retired `auto_update = false`'s way out reads whole at every width: the service
+/// line wraps in its column and the note is its own wrapped lines under the switch, so
+/// at each layout's narrowest viewport every line fits and every word of the remedy
+/// paints; the ordinary Off and On lines keep "Update Now still works" and the last
+/// full check; the hero detail carries no note.
 #[test]
 fn the_retired_switch_note_and_the_service_line_paint_whole_at_every_width() {
     let note = atpkg::config::auto_update_note(false, Some(true));
@@ -12476,11 +12402,9 @@ fn the_retired_switch_note_and_the_service_line_paint_whole_at_every_width() {
     }
 }
 
-/// A LONG ACTIVITY LINE WRAPS (review of Phase 4, 2026-09-23): the ~700-character refusal
-/// class the program rows were reworked to show was cut by the painter's ellipsis in
-/// Activity. Now it wraps to the page's measure — every line of it painted as trouble,
-/// bounded, the rest in Open Log — and the compact page keeps the danger colour and
-/// names each line as package activity, not "Managed program reason".
+/// A long Activity line (a ~700-character refusal) wraps to the page's measure, every
+/// line painted as trouble, bounded, the rest in Open Log; the compact page keeps the
+/// danger colour and names each line as package activity.
 #[test]
 fn a_long_activity_line_wraps_and_keeps_its_trouble() {
     use crate::packages_screen::{ActivityLine, MAX_ACTIVITY_LINES};
@@ -12531,9 +12455,8 @@ fn a_long_activity_line_wraps_and_keeps_its_trouble() {
     );
 }
 
-/// THE OTHER DOOR THE PROMISE OFFERS. "Apply Now" exists as a button under the
-/// Universal Control row AND as a palette command; the command had no test at all, so its id, its title,
-/// its enabled bit and its absence off the Security route were free to drift.
+/// The palette's "Apply Now" command (`machine/apply`) is offered only on Security,
+/// enabled by the same bit as the button under the Universal Control row.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
@@ -12568,7 +12491,7 @@ fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
         "the command belongs to Security"
     );
 
-    // Security, with something to apply: offered and ENABLED.
+    // Security, with something to apply: offered and enabled.
     {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
@@ -12594,10 +12517,9 @@ fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
     assert!(!settled.enabled, "nothing to apply ⇒ nothing to press");
 }
 
-/// THE SCROLL LIMIT MUST COUNT EVERY STOP THE RENDERER DRAWS. A list's bound came
-/// from a count that omitted the macOS-access card, so on a short window the
-/// rows after it could not be reached: on Security, that is the Universal
-/// Control row and the This Mac status under it.
+/// The scroll limit counts every stop the renderer draws, the macOS-access card
+/// included, so on a short window the rows after it are reachable: on Security,
+/// the Universal Control row and the This Mac status under it.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_short_security_list_reaches_its_last_row_under_the_access_card() {
@@ -12626,7 +12548,7 @@ fn the_short_security_list_reaches_its_last_row_under_the_access_card() {
         3,
     ));
     let cx = view_cx_at(624.0, 348.0);
-    // Scroll with PAGE DOWN, not by writing `page_scroll`: the limit is what
+    // Scroll with Page Down, not by writing `page_scroll`: the limit is what
     // clamps that reducer, so a test that sets the field directly cannot see a
     // limit that is too small.
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -12647,8 +12569,7 @@ fn the_short_security_list_reaches_its_last_row_under_the_access_card() {
             .map(|node| node.key.as_str().to_string())
             .collect();
         // No early break: the first screens are the access card and carry no
-        // control row at all, which is exactly the shape that made the old limit
-        // too short.
+        // control row at all, the shape a limit that skips the card gets wrong.
         seen.extend(rows);
     }
     assert!(
@@ -12790,7 +12711,7 @@ fn package_admission_is_drawn_from_the_tool_before_the_status_read() {
 /// PACKAGES SAYS A MISSING TOOL ONCE, AND KEEPS ITS VERBS IN ITS CARD: the
 /// status card says the package tool is missing, so no switch row repeats it;
 /// the Background service line is plain text, not a card that reads as a
-/// field; and the three verbs are ONE row of the hero (side by side wherever
+/// field; and the three verbs are one row of the hero (side by side wherever
 /// they fit at their own widths), so no screen holds a button apart from the
 /// card it belongs to, at the 80x24, 102x29 and 150x48 windows.
 #[test]
@@ -13386,10 +13307,10 @@ fn the_security_page_shows_this_mac_under_its_row() {
 }
 
 /// `machine/apply` goes through the same reducer as every package verb: refused
-/// honestly before the machine is read (no effect minted), dispatched as the
-/// typed `MachineApply` request when the measured state says something is left
-/// to do, settled through PackagesFinished, refused while a verb runs, and
-/// refused — with the verdict — when there is nothing to apply.
+/// before the machine is read (no effect minted), dispatched as the typed
+/// `MachineApply` request when the measured state says something is left to do,
+/// settled through PackagesFinished, refused while a verb runs, and refused, with
+/// the verdict, when there is nothing to apply.
 #[test]
 fn machine_apply_gates_dispatch_and_finish() {
     use atpkg::machine::{HomePosture, UcPosture};
@@ -13525,8 +13446,7 @@ fn machine_apply_gates_dispatch_and_finish() {
         unreachable!();
     };
     assert!(state.pending.is_empty());
-    // Admission says nothing in the footer (ruling 265): the card's
-    // headline already says the verb is running.
+    // Admission says nothing in the footer: the card's headline says the verb runs.
     assert_eq!(state.feedback, None);
 
     // Busy with the apply itself: a second press is refused without an effect.
@@ -13549,9 +13469,9 @@ fn machine_apply_gates_dispatch_and_finish() {
     );
 }
 
-/// With the package manager inert (no pinned root key) or the status collection
-/// torn, `packages/check` is refused with the true
-/// cause — and `machine/apply`, a local verb, still dispatches.
+/// With the package manager inert (no pinned root key) or the status collection torn,
+/// `packages/check` is refused with the true cause, and `machine/apply`, a local verb,
+/// still dispatches.
 #[test]
 fn machine_apply_dispatches_with_the_manager_off() {
     use atpkg::machine::{HomePosture, UcPosture};
@@ -13644,9 +13564,9 @@ fn machine_apply_dispatches_with_the_manager_off() {
     }
 }
 
-/// The action reducer refuses honestly (unobserved / busy) without minting
-/// an effect, dispatches the typed request when live, and settles pending
-/// state through PackagesFinished — the full effect-quartet contract.
+/// The action reducer refuses (unobserved / busy) without minting an effect,
+/// dispatches the typed request when live, and settles pending state through
+/// PackagesFinished.
 #[test]
 fn packages_actions_gate_dispatch_and_finish() {
     let (mut runtime, instance, view) = setup();
@@ -13719,12 +13639,11 @@ fn packages_actions_gate_dispatch_and_finish() {
         unreachable!();
     };
     assert!(state.pending.is_empty());
-    // Admission says nothing in the footer (ruling 265): the card's
-    // headline already says the verb is running.
+    // Admission says nothing in the footer: the card's headline says the verb runs.
     assert_eq!(state.feedback, None);
 
-    // The worker later exits non-zero while status.toml still contains an
-    // older success. Typed completion must replace the admission message.
+    // The worker exits non-zero while status.toml still holds an older success:
+    // typed completion replaces the admission message.
     assert!(runtime.replace_settings_packages(failed_packages_state(), 4));
     runtime
         .dispatch(instance, view, AppEvent::PackagesChanged { revision: 4 })
@@ -13732,8 +13651,7 @@ fn packages_actions_gate_dispatch_and_finish() {
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         unreachable!();
     };
-    // The failure is the card's headline and detail, not a footer that
-    // repeats them (ruling 265).
+    // The failure is the card's headline and detail, not a footer repeating them.
     assert_eq!(state.feedback, None);
     let card = failed_packages_state().projection();
     assert!(
@@ -13777,8 +13695,7 @@ fn packages_actions_gate_dispatch_and_finish() {
     );
 }
 
-/// A live packages snapshot whose one program carries `state` VERBATIM — the shape
-/// of the 2026-09-14 incident when `state` is the recorded refusal.
+/// A live packages snapshot whose one program carries `state` verbatim.
 fn packages_state_with_program_state(state: &str) -> PackagesState {
     let status = atpkg_status(
         "2026-09-14T00:00:00Z",
@@ -13788,11 +13705,9 @@ fn packages_state_with_program_state(state: &str) -> PackagesState {
     packages_service(packages_report(&status, true)).state(true, true, true)
 }
 
-/// 2026-09-14: the install pass recorded a ~700-character `error: stage: …` state
-/// whose `fix:` clause came LAST; the row ellipsized it to one line, cutting exactly
-/// the fix. Now the fix leads, whole, on continuation lines under its row at every
-/// width — measured by the painter, not just the character budget — and a short
-/// state still paints byte-for-byte as before.
+/// A long `error: stage: …` state whose `fix:` clause comes last: the fix leads,
+/// whole, on continuation lines under its row at every width (measured by the
+/// painter), and a short state paints as before.
 #[test]
 fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
     let incident = crate::packages_screen::INCIDENT_2026_09_14_REASON.to_string();
@@ -13821,7 +13736,7 @@ fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
         assert_eq!(packages_program_lines(&short, width).len(), 1);
     }
 
-    // The incident: the state leaves the row, and the fix is the first line under it.
+    // A long state leaves the row, and the fix is the first line under it.
     let long = packages_state_with_program_state(&incident).projection();
     for width in widths {
         let budget = packages_reason_wrap_chars(width);
@@ -13844,9 +13759,8 @@ fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
                 line.key,
                 format!("packages/programs/ay/reason/{}", index + 1)
             );
-            // The wrap measures glyph ADVANCE, not characters (a line of narrow
-            // glyphs may hold more than `budget` of them); the paint audit below is
-            // what says the line fits the row.
+            // The wrap measures glyph advance, not characters; the paint audit below
+            // says whether the line fits.
             assert!(
                 line.text.chars().count() <= budget * 5 / 4,
                 "{width:?}: {:?}",
@@ -13873,8 +13787,7 @@ fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
         assert_eq!(packages_program_lines(&long, width).len(), lines.len());
     }
 
-    // Painted, every continuation line fits its box at the compact and the wide
-    // viewport — the painter's own overflow audit, not the character budget.
+    // Every painted continuation line fits its box at the compact and wide viewport.
     for (viewport_width, viewport_height) in [(474.0_f32, 658.0_f32), (1_280.0, 800.0)] {
         let (mut runtime, instance, view) = setup();
         assert!(runtime.replace_settings_packages(packages_state_with_program_state(&incident), 2));
@@ -13914,12 +13827,10 @@ fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
     }
 }
 
-/// The program list (§17.2 states verbatim): one flat list with no group headings and
-/// no Install controls — the Extras and Needs-admin groups went with the extras and the
-/// OS-installer protocols (design 2026-09-22 §5.3(b)/(c), 2026-09-24). A vendor row
-/// names its version and source, and a row an older atpkg wrote in a retired
-/// spelling rides verbatim. (No install id reaches the reducer: its packages arms
-/// are exact matches and `PackagesRequest` has no install-one variant.)
+/// The program list: one flat list with no group headings and no Install controls. A
+/// vendor row names its version and source, and a row an older atpkg wrote in a
+/// retired spelling rides verbatim. (No install id reaches the reducer: its packages
+/// arms are exact matches and `PackagesRequest` has no install-one variant.)
 #[test]
 fn packages_rows_are_one_list_with_no_install_controls() {
     let claude = atpkg::vendor_direct::Version::parse("2.1.280")
@@ -13980,9 +13891,9 @@ fn packages_rows_are_one_list_with_no_install_controls() {
     );
 }
 
-/// The two switches on the special page are ordinary registry rows: activation
-/// flips the RESOLVED value through the dotted-key ConfigPatch (both default ON →
-/// the first flip writes false), with per-key OCC expectations.
+/// The two switches on the special page are ordinary registry rows: activation flips
+/// the resolved value through the dotted-key ConfigPatch (both default on, so the
+/// first flip writes false), with per-key OCC expectations.
 #[test]
 fn packages_consent_switches_patch_the_dotted_keys() {
     let (mut runtime, instance, view) = setup();
@@ -14056,7 +13967,7 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales() {
     );
 }
 
-/// One rung of [`visual_preview_matrix_covers_four_viewports_at_three_text_scales`] ([`at_each_text_scale`]).
+/// One rung of [`visual_preview_matrix_covers_four_viewports_at_three_text_scales`].
 fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(scale: f32) {
     let mut renderer = aterm_render::Renderer::from_bytes(
         include_bytes!("../../aterm-render/tests/fixtures/jetbrains-mono.ttf"),
@@ -14066,10 +13977,8 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(sca
     .expect("matrix semantic renderer");
     renderer.set_runtime_font_discovery(false);
     renderer.prepare_semantic_typography("Bold Italic != => 你好 ∑✓♥ 😀 🚀 👩‍💻");
-    // SETTLED install: `set_chrome_fonts` would park an async prewarm
-    // worker whose landing between two paints of one state could swap the
-    // semantic cascade mid-assertion (cross-test flake under a parallel
-    // suite run). The fixture warms the cascade inline instead.
+    // Settled install: `set_chrome_fonts` parks an async prewarm whose landing
+    // between two paints could swap the semantic cascade mid-assertion.
     crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
 
     let compile = |runtime: &NativeRuntime,
@@ -14455,18 +14364,11 @@ fn linux_layout_cx(face: LinuxLayoutFace, width: f32, height: f32) -> Option<Vie
     Some(cx)
 }
 
-/// THE LIVE LINUX UPDATE PAGE, ON EVERY HOST AND IN LINUX'S OWN FACES. This test was
-/// compiled on Linux alone, so a Mac's test run never saw it, and every other check
-/// of the Linux card measured in Helvetica Neue — while in Noto Sans, the Linux UI
-/// face, the merged caption wrapped to seven lines and ran the medium workbench's
-/// two cards 13pt past their section. Now it runs everywhere,
-/// in the host's face, in the Linux ladder's where this host can read it, and with
-/// no UI face at all: an enrolled copy idle (automatic checks on, off, and saved the
-/// other way), with a download, needing attention, and awaiting its startup trial,
-/// at the wide, medium and compact widths and the short phone. In a real face the page
-/// paints clean; with none, where every line is wider than any Linux face draws it,
-/// the cards still fit their sections. Manual authority holds: the apply button is
-/// disabled and names `aterm update apply`, and both `[update]` switches are live.
+/// The live Linux update page on every host, in the host's face, the Linux ladder's
+/// (where readable) and no UI face: an enrolled copy idle (checks on, off, saved the
+/// other way), downloading, needing attention and awaiting its startup trial, at every
+/// width and the short phone. A real face paints clean; with none the cards still fit.
+/// The apply button is disabled and names `aterm update apply`; both switches are live.
 #[test]
 fn linux_update_status_settings_preserves_manual_authority_and_effective_policy() {
     let facts = |staged: Option<u64>| aterm_update::LinuxUpdateStatus {
@@ -14625,8 +14527,7 @@ fn update_route_pages(
     screens
 }
 
-/// The text a compiled page PAINTS (not its semantic labels, which keep complete
-/// sentences whatever fits).
+/// The text a compiled page paints (semantic labels keep complete sentences).
 fn painted_texts(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
     compiled
         .paint
@@ -14638,16 +14539,11 @@ fn painted_texts(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
         .collect()
 }
 
-/// THE macOS STATUS CARD FITS ITS SECTION BESIDE A FAILED CHECK, UNDER EVERY SWITCH
-/// STATE (2026-09-24 post-push review). The merge fitted the Linux card and left the
-/// macOS one: at the medium workbench a non-routine outcome line under the
-/// switch's three-line timing sentence, above the action row and main's Settings ▸
-/// Messages link row, made the card 360pt in a 327pt section — the link button cut
-/// to 23 of its 36pt. The card now steps its outcome, then its detail, down to the
-/// section it is windowed into. Checked for the four running/saved pairs, at the
-/// wide, medium and compact widths and the short phone, in the host's face (clean)
-/// and with no UI face at all (no card outgrows its section), and the failed check's
-/// cause stays on the desktop page.
+/// The macOS status card fits its section beside a failed check under every switch
+/// state: it steps its outcome, then its detail, down to the section it is windowed
+/// into. Checked for the four running/saved pairs at the wide, medium and compact
+/// widths and the short phone, in the host's face (clean) and with no UI face (no card
+/// outgrows its section); the failed check's cause stays on the desktop page.
 #[test]
 fn the_status_card_fits_its_section_beside_a_failed_check_under_every_switch_state() {
     let outcome = "check failed (network): error sending request for url \
@@ -14724,11 +14620,10 @@ fn the_status_card_fits_its_section_beside_a_failed_check_under_every_switch_sta
     }
 }
 
-/// THE LAST CHECK STAYS ON THE macOS PAGE WHILE THE SWITCH EXPLAINS ITSELF (2026-09-24).
 /// With the automatic-checks switch saved one way and running the other (or off both
-/// ways), its timing sentence took the detail slot and "Checked N ago." left the page
-/// until the next launch. Both paint now, on the status card's first page, inside the
-/// section at the wide and medium workbenches, the compact page and the short phone.
+/// ways), its timing sentence and "Checked N ago." both paint on the status card's
+/// first page, inside the section, at the wide and medium workbenches, the compact
+/// page and the short phone.
 #[test]
 fn the_checked_line_paints_beside_the_switch_sentence_at_every_width() {
     let state = |running: bool, saved: bool| {
@@ -14761,12 +14656,9 @@ fn the_checked_line_paints_beside_the_switch_sentence_at_every_width() {
     }
 }
 
-/// A LINUX PAGE IN THE SHORT-LANDSCAPE PAGER STILL PAINTS A FAILED CHECK'S CAUSE
-/// (2026-09-24 post-push review). The full Linux status card carries the updater
-/// outcome in its detail, so it paints no second outcome line; but the pager's
-/// two-column summary says only "See terminal status", and the outcome's own section
-/// there is the one place the cause paints. The merge had silenced it on every Linux
-/// page.
+/// A Linux page in the short-landscape pager still paints a failed check's cause: the
+/// full card carries the outcome in its detail, but the pager's summary says only
+/// "See terminal status", so the outcome's own section is where the cause paints.
 #[test]
 fn a_linux_short_landscape_page_paints_a_failed_checks_cause() {
     let cause = "linux-update: GitHub answered 503 Service Unavailable while listing \
@@ -14820,12 +14712,10 @@ fn a_linux_short_landscape_page_paints_a_failed_checks_cause() {
     }
 }
 
-/// THE COMPACT RUNGS NEVER CALL A PAGE CURRENT WHILE NOTHING CHECKS (2026-09-24
-/// post-push review). The full headline says "Automatic checks are off." while the
-/// running process checks nothing by itself; the compact headline, the short-landscape
-/// summary and the tersest detail rung did not know the switch, and painted "Current"
-/// / "Up to date" beside it. They carry the RUNNING value (a saved flip applies next
-/// launch), below every trouble arm, as the full headline does.
+/// The compact rungs never call a page current while nothing checks: the compact
+/// headline, short-landscape summary and tersest detail carry the running switch
+/// value (a saved flip applies next launch), below every trouble arm, as the full
+/// headline does.
 #[test]
 fn compact_update_rungs_never_call_a_page_current_while_checks_are_off() {
     let healthy = |running: bool, saved: bool| {
@@ -15167,14 +15057,13 @@ fn a_search_paints_the_update_switches_notes_whole() {
     }
 }
 
-/// A HEALTHY UPDATE PAGE (2026-09-23 audit, SB-07/SB-21): "You're up to date." over
-/// "aterm 0.1.0" and when it last checked — no build number (About has it) and no
-/// updater decision sentence, whose cadence detail stays in `aterm ctl update status`
-/// and the log.
+/// A healthy update page: "You're up to date." over "aterm 0.1.0" and when it last
+/// checked; no build number (About has it) and no updater decision sentence (its
+/// cadence stays in `aterm ctl update status` and the log).
 #[test]
 fn a_healthy_update_page_paints_the_version_and_when_it_checked() {
     let mut status = update_status(false);
-    // The decision sentence the updater writes today (`github::cadence_note`).
+    // The decision sentence the updater writes (`github::cadence_note`).
     status.outcome = "up to date (latest release build 1) \u{b7} checks every 30 min".to_string();
     status.updated_at =
         aterm_types::rfc3339::format_rfc3339(aterm_time::unix_secs().unwrap() - 12 * 60);
@@ -15209,12 +15098,10 @@ fn a_healthy_update_page_paints_the_version_and_when_it_checked() {
     );
 }
 
-/// THE NOTES CARD CLAIMS "NEWEST VERSION" ONLY AFTER A COMPARISON (2026-09-27 audit).
-/// A stranded machine records zero ledger failures and falls past the failing arm;
-/// a copy no check has completed on beside "Not checked yet." has compared nothing.
-/// Neither says "is the newest version". A persistent failure whose checks work (an
-/// install streak) never says checks can't run. A checked, healthy page still says
-/// "newest" (the negative control).
+/// The notes card says "newest version" only after a comparison: not for a stranded
+/// machine (zero ledger failures, past the failing arm) nor a copy no check has
+/// completed on. A persistent failure whose checks work (an install streak) never
+/// says checks can't run. Negative control: a checked, healthy page says "newest".
 #[test]
 fn the_notes_card_says_newest_only_after_a_check() {
     let notes = |edit: &dyn Fn(&mut aterm_update::UpdateStatus)| {
@@ -15375,11 +15262,9 @@ fn desktop_and_compact_update_pages_fit_wrapped_long_notes_and_outcome() {
             !outcome_line_keys.is_empty(),
             "{variant}: outcome must use inspectable per-line paint nodes",
         );
-        // The outcome is a BOUNDED summary inside the status card now,
-        // not its own paginated section: at most a few lines, elided
-        // rather than dropped, with the exact ledger string retained on
-        // the semantic parent asserted above. What it must never do is
-        // scramble or reorder what it does show.
+        // The outcome is a bounded summary inside the status card: a few lines,
+        // elided rather than dropped, the exact ledger string on the semantic parent
+        // above; it never scrambles or reorders what it shows.
         assert!(
             outcome_line_keys.len() <= MAX_UPDATE_OUTCOME_LINES,
             "{variant}: outcome is bounded to {MAX_UPDATE_OUTCOME_LINES} lines, saw {}",
@@ -15396,13 +15281,10 @@ fn desktop_and_compact_update_pages_fit_wrapped_long_notes_and_outcome() {
     }
 }
 
-/// Widest UI-face text in an authored subtree, measured EXACTLY as
-/// `native_ui`'s paint audit measures a `Text` node whose role/style resolve
-/// to the Body step in the UI face — every `updates/outcome/line-*` does.
-///
-/// Returns `(worst required width, the box it was given, its key)`, walking
-/// the same padding arithmetic the compiler performs so the answer is the
-/// PAINTED measure, not the authoring intent.
+/// Widest UI-face text in an authored subtree, measured as `native_ui`'s paint audit
+/// measures a Body-step `Text` node (every `updates/outcome/line-*` is one). Returns
+/// `(required width, box given, key)`, applying the compiler's padding arithmetic, so
+/// the answer is the painted measure.
 fn widest_authored_text(node: &UiNode, width: f32) -> Option<(f32, f32, String)> {
     let inner = (width - node.layout.padding.left - node.layout.padding.right).max(0.0);
     let px = 13.0 * crate::native_appearance::text_scale();
@@ -15429,28 +15311,18 @@ fn widest_authored_text(node: &UiNode, width: f32) -> Option<(f32, f32, String)>
     worst
 }
 
-/// MEASURE == PAINT for the compact updater-outcome card, at every text
-/// scale the appearance store can hand it.
-///
-/// The card wraps prose greedily to a measure it is told, and paints those
-/// lines inside a box it authors itself. When those two numbers came from
-/// different subtractions the wrapper packed lines the painter could not
-/// fit: the card was handed the RELEASE-NOTES card's text measure, which
-/// [`update_release_notes_padding`] narrows to 14pt above 1.25× text, while
-/// the card itself insets 16pt. Identical at 1×, four points apart at 2× —
-/// so a greedy line landed in the gap and painted past its own edge
-/// (`updates/outcome/line-2`, required 263.3 in a 262.0 box, Windows 2×).
-///
-/// This pins the property at the seam rather than through one page: the box
-/// is read back off the node's OWN authored padding, so re-padding the card
-/// without re-measuring its prose fails here, on every platform, at 1× too.
+/// Measure equals paint for the compact updater-outcome card at every text scale: the
+/// measure its prose wraps to is the box its own insets leave. The release-notes
+/// measure ([`update_release_notes_padding`], 14pt above 1.25×) differs from the
+/// card's 16pt inset, so wrapping to it lets a greedy line paint past the edge. The
+/// box is read off the node's own padding, so re-padding without re-measuring fails
+/// at 1× too.
 #[test]
 fn compact_update_outcome_wraps_to_the_box_it_paints_in() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let restore = crate::native_appearance::current_preferences();
     let mut status = update_status(true);
-    // Long enough to wrap past the bound at every scale, so no width under
-    // test can pass by having nothing to break.
+    // Long enough to wrap at every scale, so no width passes for want of a break.
     status.outcome =
         "The protected live terminal remains attached until the verified handoff retries."
             .to_string();
@@ -15463,15 +15335,12 @@ fn compact_update_outcome_wraps_to_the_box_it_paints_in() {
                 ..restore
             },
         );
-        // 294.0 is the real short-landscape section width (568×320 at 2×).
+        // 294.0 is the short-landscape section width (568×320 at 2×).
         for card_width in [180.0_f32, 240.0, 294.0, 360.0, 480.0, 620.0] {
             let (card, _) = compact_update_outcome(&projection, card_width)
                 .expect("a non-routine outcome authors the card");
-            // Font-independent half of the property, true on every
-            // platform: the measure the prose wrapped to IS the box the
-            // authored insets leave. Only the second half — whether a
-            // greedy break happens to land in a gap — depends on the host
-            // UI face, which is why this defect could hide off-Windows.
+            // The font-independent half: the wrap measure is the box the insets
+            // leave. Whether a greedy break lands in a gap depends on the UI face.
             let insets = card.layout.padding.left + card.layout.padding.right;
             assert_eq!(
                 compact_update_outcome_text_width(card_width),
@@ -15480,9 +15349,7 @@ fn compact_update_outcome_wraps_to_the_box_it_paints_in() {
             );
             let (required, available, key) =
                 widest_authored_text(&card, card_width).expect("the card paints its wrapped lines");
-            // The paint audit's own overflow predicate
-            // (`native_ui::finish_text_fit`): whatever it would flag, this
-            // flags first.
+            // The paint audit's overflow predicate (`native_ui::finish_text_fit`).
             assert!(
                 required <= available + 0.5,
                 "{scale}x card {card_width}: {key} wraps to \
@@ -15493,14 +15360,10 @@ fn compact_update_outcome_wraps_to_the_box_it_paints_in() {
     crate::native_appearance::install_preferences(restore);
 }
 
-/// Every section of the simplified Update page stays reachable, complete and
-/// overflow-free at the platform maximum Dynamic Type in short landscape —
-/// the shape that used to clip whatever followed the status card.
-///
-/// The retired paginated "LAST UPDATE RESULT" section is what this test
-/// originally audited. The updater outcome is now ONE line inside the status
-/// card, so the property to hold is that it is still surfaced exactly once
-/// and still fits, alongside the two controls the page exists for.
+/// Every section of the Update page stays reachable, complete and overflow-free at
+/// the platform maximum Dynamic Type in short landscape: the updater outcome (one
+/// line inside the status card) surfaces exactly once and fits, beside the page's two
+/// controls.
 #[test]
 fn maximum_type_landscape_update_sections_are_complete() {
     at_each_text_scale(
@@ -15510,7 +15373,7 @@ fn maximum_type_landscape_update_sections_are_complete() {
     );
 }
 
-/// [`maximum_type_landscape_update_sections_are_complete`] at 2.0× ([`at_each_text_scale`]).
+/// The body of [`maximum_type_landscape_update_sections_are_complete`].
 fn maximum_type_landscape_update_sections_are_complete_at_scale(_scale: f32) {
     let mut status = update_status(true);
     status.outcome =
@@ -15549,8 +15412,8 @@ fn maximum_type_landscape_update_sections_are_complete_at_scale(_scale: f32) {
         if let Some(hero) = compiled.semantic(&UiKey::new("updates/hero")) {
             assert_eq!(hero.role, SemanticRole::Status, "{context}: hero is Status");
         }
-        // Whichever screen it lands on, the outcome keeps the EXACT ledger
-        // string on its semantic node — the paint beside it is bounded.
+        // Whichever screen it lands on, the outcome keeps the exact ledger
+        // string on its semantic node; the paint is bounded.
         if let Some(outcome) = compiled.semantic(&UiKey::new("updates/outcome")) {
             assert_eq!(
                 outcome.label, expected_outcome,
@@ -15760,7 +15623,7 @@ fn rail_sibling_pages_share_one_content_left_edge() {
         );
     }
     // The Look & Feel pages share one width too, so their cards do not jump
-    // as you move between them (Appearance was 1040pt, the others 720pt).
+    // as you move between them.
     let appearance = heading(SettingsRoute::Appearance).width;
     for route in [
         SettingsRoute::Wallpaper,
@@ -15776,10 +15639,9 @@ fn rail_sibling_pages_share_one_content_left_edge() {
     }
 }
 
-/// 2026-08 settings audit: the About compiler row ellipsized mid-token
-/// ("release · tr…"). A non-code value that overflows its column now
-/// wraps at its own " · " separators — every token whole, every line
-/// inside the measure — while code identifiers keep two-ended elision.
+/// A non-code value that overflows its column wraps at its own " · " separators,
+/// every token whole and every line inside the measure; code identifiers keep
+/// two-ended elision.
 #[test]
 fn long_noncode_metadata_values_wrap_at_separators_not_mid_token() {
     let value = "trustc 1.99.0-dev (dcc900ad) · trust · release · trust_verify off";
@@ -16157,9 +16019,9 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
     }
 }
 
-/// A fractional-step slider saves the number it shows. Binary floats turned
-/// 6 × 0.05 into 0.30000000000000004, and that is what reached aterm.toml and
-/// the row's readout, from a drag, a semantic set and an arrow key alike.
+/// A fractional-step slider saves the number it shows, never binary-float
+/// noise (6 × 0.05 is 0.30000000000000004), from a drag, a semantic set and
+/// an arrow key alike.
 #[test]
 fn slider_writes_land_on_the_step_grid_without_float_noise() {
     for (key, value, written) in [
@@ -16722,8 +16584,8 @@ fn pointer_text_positions_reduce_to_grapheme_safe_caret_and_selection() {
     assert_eq!(state.search_input.selection().head, 14);
     assert_eq!(state.search_input.selected_text(), "👩‍💻");
 
-    // A hostile/non-boundary byte is still normalized by reducer-owned
-    // TextInputState and can never split the multibyte cluster.
+    // A non-boundary offset is normalized by the reducer's TextInputState and never
+    // splits the multibyte cluster.
     runtime
         .dispatch(
             instance,
@@ -16784,8 +16646,8 @@ fn readline_events_edit_the_search_field_at_the_caret() {
     assert_eq!(state.search_input.value(), "cursor ");
     assert_eq!(state.search, "cursor ");
 
-    // Ctrl-A then Ctrl-D: forward-delete eats the FIRST grapheme, proving
-    // the caret model really sits at the start (not append-at-end).
+    // Ctrl-A then Ctrl-D: forward-delete eats the first grapheme, so the caret is at
+    // the start.
     text_input(&mut runtime, TextInputEvent::Home { extend: false });
     text_input(&mut runtime, TextInputEvent::Delete);
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
@@ -17306,6 +17168,45 @@ fn the_sidebar_names_its_groups_at_every_height() {
     }
 }
 
+/// THE RAIL KEEPS ITS TITLE WHILE ITS LIST HOLDS A ROW WHOLE UNDER IT: at
+/// 220×12 with 2× text (1564×180) the title and the search field left the
+/// rail's list 16pt, and the selected Themes row showed the foot of its name
+/// under the field; the rail gives the title's line to its list there, and
+/// the selected row is whole. CONTROL: a little taller (1564×240) the list
+/// holds a row under the title, and the title stays.
+#[test]
+fn a_rail_too_short_for_a_row_gives_its_title_to_the_list() {
+    at_each_text_scale(&[2.0], "the rail's title", |_| {
+        for (height, titled) in [(180.0, false), (240.0, true)] {
+            let (mut runtime, instance, view) = setup();
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.navigate(SettingsRoute::Themes);
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(1_564.0, height));
+            assert_eq!(
+                compiled
+                    .semantic(&UiKey::new("settings/navigation-title"))
+                    .is_some(),
+                titled,
+                "the title at 1564×{height}"
+            );
+            assert!(
+                compiled.semantic(&UiKey::new("settings/search")).is_some(),
+                "the search field stays at 1564×{height}"
+            );
+            let rows = whole_rail_rows(&compiled);
+            assert!(
+                rows.iter().any(|(key, _)| key == "settings/nav/themes"),
+                "the selected row is whole at 1564×{height}: {rows:?}"
+            );
+            let failures = compiled.fit_failures();
+            assert!(failures.is_empty(), "1564×{height}: {failures:#?}");
+        }
+    });
+}
+
 /// Every sub-page's parent is a permanent rail row, and while the sub-page
 /// shows the rail lists it right after that parent; every other page leaves
 /// the rail at its permanent rows.
@@ -17473,7 +17374,7 @@ fn the_category_sheet_selects_themes_under_appearance() {
     );
 }
 
-/// A COMPACT PAGE'S FIRST SCREEN HOLDS THREE WHOLE ROWS AND THEIR NOTES, at
+/// A compact page's first screen holds three whole rows and their notes at
 /// the shipped 102x29 window (738x418) as at a tall narrow one: a one-line
 /// compact row is the Medium row it is built as (44pt, a 36pt control),
 /// never a taller touch-sized row, so the third setting's control and note
@@ -17554,7 +17455,7 @@ fn compact_route_without_preview_admits_three_complete_rows_and_their_notes() {
     }
 }
 
-/// A ONE-LINE COMPACT ROW IS THE MEDIUM ROW IT IS BUILT AS: the same row and
+/// A one-line compact row is the Medium row it is built as: the same row and
 /// control height on the shipped 102x29 window as at 150x48.
 #[test]
 fn a_one_line_compact_row_is_as_tall_as_its_medium_row() {
@@ -17842,9 +17743,7 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             );
         }
 
-        // Every native advanced category pages its preview and each real
-        // control independently. This covers categories that the older
-        // four-route visual matrix omitted.
+        // Every advanced category pages its preview and each control independently.
         for route in [
             SettingsRoute::Appearance,
             SettingsRoute::TextFonts,
@@ -17908,8 +17807,7 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             );
         }
 
-        // Manual is a first-class native destination too; its only action
-        // must remain whole even at 2× with the status band present.
+        // Manual's only action stays whole at 2× with the status band present.
         let (mut runtime, instance, view) = setup();
         {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -18017,8 +17915,7 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             }
         }
 
-        // About's page count changes with Dynamic Type, so read the actual
-        // accessible range and then audit every one of those slices.
+        // About's page count changes with Dynamic Type: read the range, audit each slice.
         let (mut runtime, instance, view) = setup();
         {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -18050,10 +17947,9 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             );
         }
 
-        // Audit both updater shapes. Sections are the status summary, the
-        // one action, the automatic-updates switch, the outcome, and every
-        // bounded release-notes page — the same set either way, because the
-        // notes panel always says something.
+        // Both updater shapes: the status summary, the action, the automatic-updates
+        // switch, the outcome and each release-notes page (the notes panel always says
+        // something, so the set is the same).
         for staged in [false, true] {
             let status = update_status(staged);
             let update_state = UpdateState::from_status(1, "0.1.0", Some(&status), false);
@@ -18082,10 +17978,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
                     "Update missing {key}: {staged} {scale}× {variant}"
                 );
             }
-            // The page has ONE button (3c2154ae0, 2026-08-06, retired the
-            // three-button page). `updates/check` is still a live reducer arm
-            // and palette command, so this is the one guard against its
-            // button coming back, at any width or Dynamic Type step.
+            // The page has one button. `updates/check` is still a reducer arm and palette
+            // command, so this guards against its button coming back.
             assert!(
                 !keys.contains("updates/check"),
                 "the retired Check button reappeared: {staged} {scale}× {variant}"
@@ -18125,10 +18019,9 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             "packages/check",
             "packages/install-default",
             "packages/service-line",
-            // Phase 4: ONE update switch on the page — "Automatic updates"
-            // (`enabled`, live; the retired `auto_update` folded in, no row of its
-            // own) — the install consent, the reroute's announcement, and the
-            // Activity card with its Open Log.
+            // One update switch, "Automatic updates" (`enabled`; the retired
+            // `auto_update` has no row), the install consent, the reroute's
+            // announcement, and the Activity card with its Open Log.
             "settings/control/packages.enabled",
             "settings/control/packages.auto_install",
             "settings/control/reroute.announce",
@@ -18144,11 +18037,9 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
     }
 }
 
-/// RULING 270 (round 17, day three): at 100 columns (a 774 pt Medium
-/// page) the third Packages verb was cut to `Remove ALab T…` at the hero
-/// card's edge. The three sit in a row only where the card holds them
-/// whole and stack anywhere narrower — every button inside the card at
-/// every width. NEGATIVE CONTROL: a wide page keeps them in one row.
+/// The three Packages verbs sit in a row only where the hero card holds them whole and
+/// stack anywhere narrower, so every button is inside the card at every width (from a
+/// 774 pt, 100-column Medium page up). Negative control: a wide page keeps one row.
 #[test]
 fn the_packages_verbs_stay_inside_their_card_at_every_width() {
     let (mut runtime, instance, view) = setup();
@@ -19589,13 +19480,13 @@ fn typography_list_pins_its_specimen_and_reaches_every_field_at_scale(_scale: f3
     }
 }
 
-/// A SEARCH FOR AN AGENT FINDS ITS SWITCH FIRST: "claude" and "codex" each
+/// A search for an agent finds its switch first: "claude" and "codex" each
 /// put Supervise <product> sessions at the top of the settings found,
 /// above the rows that only list the word as a synonym (the packages
 /// switch, the harness's other rows): the agent's word is the
 /// switch's own name (`prefs::own_name_of`), and on the same rung a hit on
 /// a row's own names ranks before a synonym's (`SearchRank`). Every
-/// supervisable agent, so a new one is held to it. NEGATIVE CONTROL: the
+/// supervisable agent, so a new one is held to it. Negative control: the
 /// synonym rows are still found, below it.
 #[test]
 fn a_search_for_an_agent_finds_its_switch_first() {
@@ -19654,11 +19545,8 @@ fn search_is_global_ranked_and_keeps_category_context() {
         .unwrap()
         .compile(cx.viewport)
         .unwrap();
-    // "clipboard" lands two LIVE native switches on one page, each under
-    // its own category heading — allow_osc52_query joined the ordinary
-    // security policies when the GUI's clipboard callback learned to
-    // answer authorized queries, so the Manual-handoff row this search
-    // used to produce for it no longer exists for this term.
+    // "clipboard" lands two live native switches on one page, each under its own
+    // category heading (`allow_osc52_query` is an ordinary security policy).
     assert!(
         first
             .semantic(&UiKey::new("settings/control/allow_osc52_query"))
@@ -19737,7 +19625,7 @@ fn default_on_boolean_apply_and_reset_round_trip_through_real_config_service() {
         .effects
         .iter()
         .find_map(|effect| match effect {
-            AppEffect::ConfigPatch { patch, reply } => Some((patch.clone(), reply.operation)),
+            AppEffect::ConfigPatch { patch, reply, .. } => Some((patch.clone(), reply.operation)),
             _ => None,
         })
         .expect("Boolean edit reaches config service");
@@ -19789,7 +19677,7 @@ fn default_on_boolean_apply_and_reset_round_trip_through_real_config_service() {
         .effects
         .iter()
         .find_map(|effect| match effect {
-            AppEffect::ConfigPatch { patch, reply } => Some((patch.clone(), reply.operation)),
+            AppEffect::ConfigPatch { patch, reply, .. } => Some((patch.clone(), reply.operation)),
             _ => None,
         })
         .expect("reset reaches config service");
@@ -19865,7 +19753,7 @@ fn indeterminate_config_publication_stays_unverified_until_snapshot_reconciliati
         .effects
         .iter()
         .find_map(|effect| match effect {
-            AppEffect::ConfigPatch { patch, reply } => Some((patch.clone(), reply.operation)),
+            AppEffect::ConfigPatch { patch, reply, .. } => Some((patch.clone(), reply.operation)),
             _ => None,
         })
         .expect("change enters the config writer");
@@ -19914,22 +19802,62 @@ fn indeterminate_config_publication_stays_unverified_until_snapshot_reconciliati
             "{id} remains blocked until reconciliation"
         );
     }
-    let blocked = runtime
+    // The page takes another press while the host reconciles the first
+    // save. This bare reducer emits its request; the host's config lane
+    // holds it behind reconciliation before it may write. The press turns
+    // Copy on select off: on, its default here, would change nothing and
+    // ask for no write.
+    // NEGATIVE CONTROL: a press of its default changes nothing the file
+    // holds, so it is no request at all, fence or none.
+    let unchanged = runtime
         .dispatch(
             instance,
             view,
             AppEvent::Action(ActionInvocation {
                 id: ActionId::new(format!("settings/set/{}", prefs::EDIT_COPY_ON_SELECT)),
-                value: Some(SemanticInput::Bool(true)),
+                value: Some(SemanticInput::Bool(
+                    crate::app_config::Config::default().copy_on_select_or_default(),
+                )),
             }),
         )
         .unwrap();
     assert!(
-        blocked
+        unchanged
             .effects
             .iter()
             .all(|effect| !matches!(effect, AppEffect::ConfigPatch { .. })),
-        "no blind follow-up write is issued"
+        "a press of the default asks for no write"
+    );
+    let queued = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_COPY_ON_SELECT)),
+                value: Some(SemanticInput::Bool(
+                    !crate::app_config::Config::default().copy_on_select_or_default(),
+                )),
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        queued
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, AppEffect::ConfigPatch { .. }))
+            .count(),
+        1,
+        "the later press is a request for the host's fenced lane"
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        panic!("Settings view");
+    };
+    assert!(state.config_reconciliation_required);
+    assert_eq!(state.unverified_patch.as_ref(), Some(&patch));
+    assert_eq!(state.raw_value(prefs::EDIT_CURSOR_BLINK), before_raw);
+    assert!(
+        state.last_undo.is_none(),
+        "the new request verifies no save"
     );
 
     let snapshot = VersionedConfigService::new(String::new())
@@ -20217,7 +20145,7 @@ fn exact_phone_special_routes_have_zero_renderer_text_overflow() {
     );
 }
 
-/// One rung of [`exact_phone_special_routes_have_zero_renderer_text_overflow`] ([`at_each_text_scale`]).
+/// One rung of [`exact_phone_special_routes_have_zero_renderer_text_overflow`].
 fn exact_phone_special_routes_have_zero_renderer_text_overflow_at_scale(scale: f32) {
     let cx = view_cx_at(286.5, 558.0);
     let assert_fits = |compiled: &crate::native_ui::CompiledUi, context: &str| {
@@ -20240,14 +20168,12 @@ fn exact_phone_special_routes_have_zero_renderer_text_overflow_at_scale(scale: f
         );
     };
 
-    // Settings ▸ Messages, its longest entry expanded (the crash record's
-    // absolute path and its second line), through every view the list
-    // scrolls through (ruling 264): every chip, row, meta and detail line
-    // fits its box — no renderer text overflow, no semantic node clipped
-    // below the viewport, paint and semantics in parity — and the expanded
-    // entry's detail, action and Copy, and the next entry, are all reached.
-    // The log of one day, and the same log spread over five days, so its
-    // day headers (ruling 273) ride every view too.
+    // Settings ▸ Messages with its longest entry expanded (the crash record's absolute
+    // path and second line), through every view the list scrolls: every chip, row,
+    // meta and detail line fits (no text overflow, no semantic node clipped, paint and
+    // semantics in parity), and the expanded entry's detail, action and Copy, and the
+    // next entry, are reached. One day's log, and the same over five days, so day
+    // headers ride every view too.
     for (log, fixture) in [
         (sample_messages(), "one day"),
         (multi_day_messages(), "days"),
@@ -20718,8 +20644,13 @@ fn tall_special_pages_publish_zero_bound_and_never_scroll() {
     }
 }
 
+/// A KEY WHOSE WRITE IS ON ITS WAY TAKES THE NEXT PRESS: the switch shows
+/// the first press's value at once and stays pressable, and the second press
+/// is a second write that follows the first and expects what the first
+/// writes (the guard this replaced drew the switch disabled and busy, and
+/// sent nothing for the second press).
 #[test]
-fn pending_config_key_is_busy_and_rejects_a_second_mutation() {
+fn a_key_whose_write_is_on_its_way_takes_the_next_press() {
     let (mut runtime, instance, view) = setup();
     runtime
         .dispatch(
@@ -20732,6 +20663,35 @@ fn pending_config_key_is_busy_and_rejects_a_second_mutation() {
         )
         .unwrap();
     let action = ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_BLINK));
+    let patches = |outcome: &crate::native_app::DispatchOutcome| {
+        outcome
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                AppEffect::ConfigPatch {
+                    patch,
+                    reply,
+                    follows,
+                } => Some((patch.clone(), reply.operation, follows.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let shown = |runtime: &NativeRuntime| {
+        let cx = view_cx();
+        let compiled = runtime
+            .render(instance, view, &cx)
+            .unwrap()
+            .compile(cx.viewport)
+            .unwrap();
+        let control = compiled
+            .semantic(&UiKey::new(format!(
+                "settings/control/{}",
+                prefs::EDIT_CURSOR_BLINK
+            )))
+            .unwrap();
+        (control.value.clone(), control.state.unwrap())
+    };
     let first = runtime
         .dispatch(
             instance,
@@ -20742,14 +20702,12 @@ fn pending_config_key_is_busy_and_rejects_a_second_mutation() {
             }),
         )
         .unwrap();
-    assert_eq!(
-        first
-            .effects
-            .iter()
-            .filter(|effect| matches!(effect, AppEffect::ConfigPatch { .. }))
-            .count(),
-        1
-    );
+    let first = patches(&first);
+    assert_eq!(first.len(), 1);
+    assert!(first[0].2.is_empty(), "nothing on its way to follow");
+    let (value, state) = shown(&runtime);
+    assert_eq!(value, SemanticValue::Bool(false), "shown at once");
+    assert!(state.enabled && !state.busy, "{state:?}");
 
     let second = runtime
         .dispatch(
@@ -20761,33 +20719,21 @@ fn pending_config_key_is_busy_and_rejects_a_second_mutation() {
             }),
         )
         .unwrap();
-    assert!(
-        second
-            .effects
-            .iter()
-            .all(|effect| !matches!(effect, AppEffect::ConfigPatch { .. })),
-        "one key cannot enqueue a second write before its first completion"
+    let second = patches(&second);
+    assert_eq!(second.len(), 1, "the second press is a write");
+    assert_eq!(second[0].2, vec![first[0].1], "it follows the first");
+    assert_eq!(
+        second[0].0.edits[0].expected,
+        ExpectedConfigValue::Exact(Some("false".to_string())),
+        "it expects what the first writes"
     );
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         unreachable!();
     };
-    assert_eq!(state.pending.len(), 1);
-
-    let cx = view_cx();
-    let compiled = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
-    let control = compiled
-        .semantic(&UiKey::new(format!(
-            "settings/control/{}",
-            prefs::EDIT_CURSOR_BLINK
-        )))
-        .unwrap();
-    let state = control.state.unwrap();
-    assert!(!state.enabled);
-    assert!(state.busy);
+    assert_eq!(state.pending.len(), 2);
+    let (value, state) = shown(&runtime);
+    assert_eq!(value, SemanticValue::Bool(true));
+    assert!(state.enabled && !state.busy, "{state:?}");
 }
 
 #[test]
@@ -20862,8 +20808,7 @@ fn clear_search_is_visible_touchable_and_resets_the_complete_query_state() {
             .semantic(&UiKey::new("settings/search-clear"))
             .expect("nonempty search exports visible Clear");
         assert!(clear.rect.width >= 44.0 && clear.rect.height >= 32.0);
-        // 2026-08 settings audit: the fixed 52pt box painted "Cl…" — the
-        // authored width must fit the whole word in the UI face.
+        // The authored width fits the whole word in the UI face.
         let clear_paint = compiled
             .paint_audit_lines()
             .into_iter()
@@ -21782,8 +21727,8 @@ fn authored_weight_axis_survives_until_an_explicit_weight_alias_overrides_it() {
         prefs::EDIT_FONT_WEIGHT.to_string(),
         crate::native_text_input::TextInputState::new("700".to_string()),
     );
-    // The preview intentionally retains a draft after focus moves to a
-    // sibling font field, so it must outrank the committed variation too.
+    // The preview keeps a draft after focus moves to a sibling font field, so it
+    // must outrank the committed variation too.
     retained_draft.editing_field = Some(prefs::EDIT_FONT_FAMILY.to_string());
     assert_eq!(
         axis_value(&preview_font_candidate(&retained_draft)),
@@ -22039,7 +21984,7 @@ fn about_copy_and_update_install_actions_emit_exact_typed_effects_and_complete()
             }),
         )
         .unwrap();
-    // ONE button. With a build staged it installs it.
+    // One button: with a build staged it installs it.
     let relaunch = runtime
         .dispatch(
             instance,
@@ -22084,9 +22029,8 @@ fn about_copy_and_update_install_actions_emit_exact_typed_effects_and_complete()
         "the updater's blocking reason is said: {:?}",
         state.feedback
     );
-    // An install the updater took: the press's line goes with the `Accepted`,
-    // the only completion the request gets — kept, it would still say
-    // "Installing…" above a failed install's headline.
+    // An install the updater took: the press's line goes with the `Accepted`, its only
+    // completion; kept, it would say "Installing…" above a failed install's headline.
     let again = runtime
         .dispatch(
             instance,
@@ -22124,8 +22068,7 @@ fn about_copy_and_update_install_actions_emit_exact_typed_effects_and_complete()
     };
     assert_eq!(state.feedback.as_deref(), None);
 
-    // …and with nothing staged the SAME button goes and looks, so the user
-    // never has to know which updater stage they are in.
+    // …and with nothing staged the same button checks.
     let current = update_status(false);
     let (mut idle_runtime, idle_instance, idle_view) =
         setup_with_update(UpdateState::from_status(1, "0.1.0", Some(&current), false));
@@ -22173,8 +22116,7 @@ fn about_copy_and_update_install_actions_emit_exact_typed_effects_and_complete()
     let Some(AppViewState::Settings(state)) = idle_runtime.view_state(idle_view) else {
         panic!("Settings view")
     };
-    // The check's own headline says it is running and then how it ended: the
-    // footer says nothing (ruling 265).
+    // The check's headline says it is running and how it ended; the footer is silent.
     assert_eq!(state.feedback.as_deref(), None);
 
     // Retry IS a check (`execute_native_update` maps it to one): its press's
@@ -22216,8 +22158,15 @@ fn about_copy_and_update_install_actions_emit_exact_typed_effects_and_complete()
     assert_eq!(state.feedback.as_deref(), None);
 }
 
+/// UNDO IS TAKEN WHILE A CHANGE SAVES: while the page's write is on its way,
+/// Undo (the button and Cmd-Z) names that write, the newest change, and a
+/// press on it follows it in the lane ([`UndoTarget::Landing`]) and shows
+/// what it puts back at once; the last change's token is never spent on
+/// it. Its button then reads Redo, so a second press is taken too. (The
+/// guard this replaced hid Undo and refused Cmd-Z while anything saved:
+/// "Finish applying the current change before Undo.")
 #[test]
-fn pending_config_disables_reset_and_undo_without_consuming_the_undo_token() {
+fn a_write_on_its_way_offers_its_own_undo() {
     let (mut runtime, instance, view) = setup();
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         panic!("Settings view")
@@ -22234,7 +22183,7 @@ fn pending_config_disables_reset_and_undo_without_consuming_the_undo_token() {
         .find(|field| field.key == prefs::EDIT_CURSOR_BLINK)
         .unwrap()
         .seed = Some("false".to_string());
-    runtime
+    let set = runtime
         .dispatch(
             instance,
             view,
@@ -22244,6 +22193,14 @@ fn pending_config_disables_reset_and_undo_without_consuming_the_undo_token() {
             }),
         )
         .unwrap();
+    let write = set
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            AppEffect::ConfigPatch { reply, .. } => Some(reply.operation),
+            _ => None,
+        })
+        .expect("the press writes");
 
     let cx = view_cx();
     let compiled = runtime
@@ -22251,52 +22208,79 @@ fn pending_config_disables_reset_and_undo_without_consuming_the_undo_token() {
         .unwrap()
         .compile(cx.viewport)
         .unwrap();
-    let reset = compiled
-        .semantic(&UiKey::new(format!(
-            "settings/reset/{}",
-            prefs::EDIT_CURSOR_BLINK
-        )))
-        .expect("pending modified row retains disabled Reset semantics");
-    let reset_state = reset.state.unwrap();
-    assert!(!reset_state.enabled && reset_state.busy);
-    assert!(compiled.semantic(&UiKey::new("settings/undo")).is_none());
+    // The press shows at once: Cursor blink is back at its default, and no
+    // control on the page waits on the write.
     assert!(
-        !runtime
+        compiled
+            .semantic(&UiKey::new(format!(
+                "settings/reset/{}",
+                prefs::EDIT_CURSOR_BLINK
+            )))
+            .is_none(),
+        "a row at its default has no Reset"
+    );
+    assert!(
+        compiled
+            .semantics
+            .iter()
+            .all(|node| node.state.is_none_or(|state| !state.busy)),
+        "nothing reads as busy"
+    );
+    let undo_button = |runtime: &NativeRuntime| {
+        let compiled = runtime
+            .render(instance, view, &cx)
+            .unwrap()
+            .compile(cx.viewport)
+            .unwrap();
+        compiled
+            .semantic(&UiKey::new("settings/undo"))
+            .map(|node| node.label.clone())
+    };
+    assert_eq!(
+        undo_button(&runtime).as_deref(),
+        Some("Undo"),
+        "Undo stands beside the press's status while it saves"
+    );
+    assert!(
+        runtime
             .commands(instance, view)
             .unwrap()
             .into_iter()
             .find(|command| command.id.as_str() == "settings/undo")
             .unwrap()
-            .enabled
+            .enabled,
+        "and Cmd-Z takes it"
     );
 
-    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-        panic!("Settings view")
-    };
-    let pending_line = state.feedback.clone();
     let undo = runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/undo"),
-                value: None,
-            }),
-        )
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Undo))
         .unwrap();
-    assert!(
-        undo.effects
-            .iter()
-            .all(|effect| !matches!(effect, AppEffect::ConfigUndo { .. }))
+    let targets: Vec<UndoTarget> = undo
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            AppEffect::ConfigUndo { target, .. } => Some(*target),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        targets,
+        vec![UndoTarget::Landing(write)],
+        "the Undo follows the write it takes back, never the last change's token"
     );
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         panic!("Settings view")
     };
-    assert_eq!(state.last_undo.as_ref().map(|offer| offer.token), Some(77));
-    assert!(
-        state.feedback.is_some() && state.feedback != pending_line,
-        "the refused Undo says so: {:?}",
-        state.feedback
+    assert_eq!(state.feedback.as_deref(), Some("Undoing…"));
+    assert_eq!(
+        state.raw_value(prefs::EDIT_CURSOR_BLINK).as_deref(),
+        Some("false"),
+        "what the Undo puts back shows at once"
+    );
+    assert_eq!(
+        undo_button(&runtime).as_deref(),
+        Some("Redo"),
+        "a second press on it is taken: it redoes the change"
     );
 }
 
@@ -22309,7 +22293,7 @@ fn open_choice_picker_reflows_across_live_dynamic_type_changes() {
     );
 }
 
-/// [`open_choice_picker_reflows_across_live_dynamic_type_changes`] ([`at_each_text_scale`]).
+/// The body of [`open_choice_picker_reflows_across_live_dynamic_type_changes`].
 fn open_choice_picker_reflows_across_live_dynamic_type_changes_at_scale(_scale: f32) {
     let install_scale = |text_scale| {
         crate::native_appearance::install_preferences(
@@ -22376,7 +22360,8 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
     );
 }
 
-/// One rung of [`compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachable`] ([`at_each_text_scale`]).
+/// One rung of
+/// [`compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachable`].
 fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachable_at_scale(
     scale: f32,
 ) {
@@ -22425,8 +22410,11 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
             _ => unreachable!(),
         }
     };
+    // Where the Reset All question would be cut in the toolbar's dock it
+    // takes the page's place ([`reset_all_question_takes_page`]): the page
+    // waits on it, and its own controls come back with Cancel.
     let assert_statuses =
-        |compiled: &crate::native_ui::CompiledUi, variant: &str, context: &str| {
+        |compiled: &crate::native_ui::CompiledUi, variant: &str, context: &str, page: bool| {
             assert_eq!(
                 compiled
                     .semantics
@@ -22474,6 +22462,15 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
                 assert_material_hit(compiled, key, context);
             }
             assert_all_hits_material_and_contained(compiled, context);
+            if !page {
+                assert!(
+                    compiled
+                        .semantic(&UiKey::new("settings/page/reset-all"))
+                        .is_some(),
+                    "{context}: the Reset All question takes the page"
+                );
+                return;
+            }
             let serious = compiled
                 .semantic(&UiKey::new("settings/top/serious-mode"))
                 .unwrap_or_else(|| panic!("{context}: Serious Mode disclosure missing"));
@@ -22493,11 +22490,20 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
         for variant in VARIANTS {
             let (mut runtime, instance, view) = setup();
             replace_settings_source(&mut runtime, view, "serious_mode = true\n".to_string());
-            {
+            let question_page = {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!();
                 };
                 configure(state, variant);
+                reset_all_question_takes_page(state, cx.viewport)
+            };
+            if question_page {
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let context =
+                    format!("{variant} question at {viewport_width}×{viewport_height} {scale}×");
+                assert_zero_top_paint(&compiled, &context);
+                assert_statuses(&compiled, variant, &context, false);
+                continue;
             }
             let mut seen = BTreeSet::new();
             each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
@@ -22505,7 +22511,7 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
                     "{variant} Top screen {top} at {viewport_width}×{viewport_height} {scale}×"
                 );
                 assert_zero_top_paint(compiled, &context);
-                assert_statuses(compiled, variant, &context);
+                assert_statuses(compiled, variant, &context, true);
                 for key in TOP_CONTROLS {
                     let control = format!("settings/control/{key}");
                     // A control a list's edge cuts is live over what shows; it
@@ -22596,7 +22602,7 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
                             "{variant} {key} picker option {index} at {viewport_width}×{viewport_height} {scale}×"
                         );
                         assert_zero_top_paint(compiled, &context);
-                        assert_statuses(compiled, variant, &context);
+                        assert_statuses(compiled, variant, &context, true);
                         assert_picker_descendants_contained(compiled, key, &context);
                         assert_material_hit(compiled, "settings/choice-close", &context);
                         assert_material_hit(
@@ -22631,7 +22637,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow() {
     );
 }
 
-/// One rung of [`top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow`] ([`at_each_text_scale`]).
+/// One rung of [`top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow`].
 fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_scale(scale: f32) {
     let viewports = match scale {
         value if value < 1.25 => vec![(1_200.0, 810.0), (390.0, 558.0), (568.0, 320.0)],
@@ -22692,22 +22698,16 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
             );
         });
 
-        // Commit every built-in value through the same authoritative
-        // snapshot projection used after a real config save. The control
-        // keeps the exact value in semantics while its visual label must
-        // remain within the renderer's authored measure.
+        // Commit every built-in value through the snapshot projection a real save
+        // uses: the control keeps the exact value in semantics while its visual label
+        // stays within the authored measure.
         for (key, values) in &cases {
             for value in values {
                 let (mut runtime, instance, view) = setup();
-                // THE TRAIL CASE AUTHORS ITS MASTER. Top Settings presents the
-                // trail's style and its ENABLEMENT as one honest choice, so a
-                // committed style alone cannot make the control read that style
-                // while the master is off — and the master's absent-key default
-                // is platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`).
-                // Writing both is exactly what the picker itself writes: one
-                // patch carrying the style AND `cursor_trail = true`. The `off`
-                // style still projects "off" through this source, so the value
-                // list keeps its full span.
+                // The trail case authors its master, as the picker's own patch does:
+                // Top Settings presents style and enablement as one choice, and the
+                // master's absent-key default is platform-split. The `off` style still
+                // projects "off", so the value list keeps its full span.
                 let source = if *key == prefs::EDIT_CURSOR_TRAIL_STYLE {
                     format!("cursor_trail = true\n{key} = {}\n", quote(value))
                 } else {
@@ -22813,9 +22813,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         }
     }
 
-    // Serious Mode is a hidden projection state, not a separate route.
-    // Exercise all Top pages and all visual pickers with the disclosure
-    // present, including the tight feedback-owned landscape budget.
+    // Serious Mode is a projection state, not a route: walk all Top pages and visual
+    // pickers with its disclosure, including the tight feedback-owned landscape budget.
     for (viewport_width, viewport_height) in viewports
         .iter()
         .copied()
@@ -22888,9 +22887,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
             "Serious Mode transaction feedback at 286.5×558 2×",
         );
 
-        // Recovery/status surfaces can coexist with any route and used to
-        // bypass the ordinary bounded-feedback projection. Exercise their
-        // longest narrow-host states independently.
+        // Recovery/status surfaces coexist with any route: exercise their longest
+        // narrow-host states independently.
         for confirmation in [false, true] {
             let (mut runtime, instance, view) = setup();
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -22972,8 +22970,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         );
     }
 
-    // Dynamic names are arbitrary user data. Keep them byte-exact in the
-    // semantic value while proving their UTF-8 visual projection is clean.
+    // Dynamic names are user data: byte-exact in the semantic value, clean in the
+    // UTF-8 visual projection.
     if scale >= 2.0 {
         let name = "Aurora 👩‍💻 Observatory — a deliberately very long personal color theme";
         // A file whose own `name =` is its id: the picker shows it as written.
@@ -23003,11 +23001,25 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
             .unwrap();
         assert_eq!(control.value, SemanticValue::Text(name.to_string()));
         assert!(control.label.contains(name));
+        // Its words wrap to the button, whole, never cut ([`choice_words`]).
         assert!(committed.paint_audit_lines().iter().any(|line| {
             line.contains(&format!("key=\"settings/control/{}\"", prefs::EDIT_THEME))
-                && line.contains('…')
+                && !line.contains('…')
                 && line.contains("overflow=false")
         }));
+        let painted = committed
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                UiContent::Button(button)
+                    if node.key.as_str() == format!("settings/control/{}", prefs::EDIT_THEME) =>
+                {
+                    button.spec.visual_label.clone()
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(painted_words(&painted), name, "{painted:?}");
 
         runtime
             .dispatch(
@@ -23139,7 +23151,7 @@ fn text_fonts_still_lists_font_family_and_size() {
 fn top_settings_is_default_native_page_with_requested_controls_and_previews() {
     let (runtime, instance, view) = setup();
     // Where nothing can sound (`trail_audio::output_available`), Music effects
-    // carries its "Audio unavailable" status line, and the grid that line
+    // carries its "No audio" status line, and the grid that line
     // lengthens takes a taller host to hold its four cards (at 1200x820 in
     // Noto Sans its right column is 494pt in 472).
     let roomy = if crate::trail_audio::output_available() {
@@ -24392,10 +24404,9 @@ fn modified_effect_notes(state: &SettingsViewState, key: &str) -> Vec<String> {
     .collect()
 }
 
-/// The Modified row for `key`, which the harness's disk reader names at
-/// `reader` (at the key itself, or below it): the reader's note is its only
-/// effect note and is in its detail lines, its preview is `preview`, never a
-/// story of a key with no effect, and it has no Reset.
+/// The Modified row for `key`, whose disk reader the harness names at `reader` (the
+/// key or below it): the reader's note is its only effect note, in its detail lines;
+/// its preview is `preview`; it has no Reset.
 fn assert_modified_tells_the_disk_fault(
     source: &str,
     key: &str,
@@ -24586,9 +24597,8 @@ fn modified_manual_previews_are_typed_bounded_and_do_not_echo_unknown_values() {
         );
     }
 
-    // The 73rd normalized visible cluster proves truncation immediately;
-    // the multi-megabyte ASCII/whitespace tail is never normalized or
-    // retained merely to paint this 72-cluster glance.
+    // The 73rd visible cluster proves truncation; the multi-megabyte tail is never
+    // normalized or retained to paint a 72-cluster glance.
     let mut huge = "q".repeat(73);
     huge.push_str(&" \n".repeat(1_100_000));
     assert!(huge.len() > 2 * 1024 * 1024);
@@ -24707,7 +24717,7 @@ fn modified_pages_every_manual_override_at_normal_and_large_text() {
     );
 }
 
-/// One rung of [`modified_pages_every_manual_override_at_normal_and_large_text`] ([`at_each_text_scale`]).
+/// One rung of [`modified_pages_every_manual_override_at_normal_and_large_text`].
 fn modified_pages_every_manual_override_at_normal_and_large_text_at_scale(_scale: f32) {
     let source = (0..7)
         .map(|index| format!("future_{index} = {index}\n"))
@@ -24936,11 +24946,8 @@ fn native_sound_menu_is_one_box_on_one_route() {
         .filter(|key| field_visible(key, false, false))
         .collect();
 
-    // The SEVEN rows the ordinary Advanced pane must paint: the volume
-    // slider, the palette, and the five voice toggles. Four of these shipped
-    // but were reachable only by hand-editing `aterm.toml`; one is new. If
-    // any regresses to Manual the menu is partial again and this fails by
-    // name rather than by a silently shorter list.
+    // The seven rows the Advanced pane paints: the volume slider, the palette and the
+    // five voice toggles, by name.
     for required in [
         prefs::EDIT_TRAIL_SOUND_VOLUME,
         prefs::EDIT_TRAIL_SOUND_STYLE,
@@ -24958,14 +24965,14 @@ fn native_sound_menu_is_one_box_on_one_route() {
         );
     }
 
-    // The audible BEL appears exactly where a beep call exists to suppress.
+    // The audible BEL row appears exactly where a beep call exists to suppress.
     assert_eq!(
         shown.contains(&prefs::EDIT_BELL_SOUND),
         cfg!(any(target_os = "macos", windows)),
         "the terminal bell row must not promise a beep this platform never makes"
     );
 
-    // The MASTER switch is no ordinary row: the Sound page leads with the
+    // The master switch is no ordinary row: the Sound page leads with the
     // Top Settings card's own Music effects control (`music_effects_rows`), so
     // the two places run one transaction and cannot disagree.
     assert!(
@@ -25011,10 +25018,10 @@ fn native_sound_menu_is_one_box_on_one_route() {
     }
 }
 
-/// REDUCE MOTION READS AS ITS OPTION LABEL ON EVERY SURFACE: the Motion
+/// Reduce motion reads as its option label on every surface: the Motion
 /// picker's "Reduce motion" is the word for the person's choice on the
 /// Sound page's rows and its Music effects status, and in the cursor
-/// preview's badge and spoken summary; no surface keeps the old "Reduced".
+/// preview's badge and spoken summary; no surface says "Reduced".
 #[test]
 fn reduce_motion_reads_as_its_option_label_on_every_surface() {
     let words = reduce_motion_words();
@@ -25071,8 +25078,8 @@ fn reduce_motion_reads_as_its_option_label_on_every_surface() {
     assert!(status.full().contains(&words), "{}", status.full());
 }
 
-/// A SOUND ROW SAYS "INACTIVE" UNDER A MOTION POLICY EXACTLY WHERE ITS VOICES
-/// ARE SILENT, by the voice table the host plays by
+/// A sound row says "Inactive" under a motion policy exactly where its voices
+/// are silent, by the voice table the host plays by
 /// (`aterm_effects::sound_policy::voice_gain`). Reduce motion, the system's
 /// Reduce Motion and the load shed stop the light of the bonk and the output
 /// streak, so their rows say so; the typing notes and the riff play on, so
@@ -25178,22 +25185,15 @@ fn sound_rows_say_inactive_exactly_where_their_voices_are_silent() {
     );
 }
 
-/// THE SOUND ROWS DISCLOSE THEIR REAL GATES, AND ONLY THEIR REAL GATES.
+/// The Sound rows disclose their real gates and only those (a false "Inactive" says a
+/// control is dead while the sound plays):
 ///
-/// A false "Inactive" note is worse than none — it tells a user a control is
-/// dead while the sound keeps playing. The two families in the Sound box
-/// have DIFFERENT gates and this pins the difference:
+///   * the melody and ambient bed ride `CursorGlow::drain_sound_cues`, so
+///     `cursor_trail = false` silences them;
+///   * the sing-along riff is gated on the glow style, which `resolve_cursor_glow`
+///     derives regardless of `enabled`, so its gate is the master switch.
 ///
-///   * the melody and the ambient bed ride `CursorGlow::drain_sound_cues`,
-///     so `cursor_trail = false` really does silence them;
-///   * the sing-along riff does NOT — it is gated on `glow_cfg.STYLE`, and
-///     `resolve_cursor_glow` derives `style` from the style string
-///     regardless of `enabled`, so the riff still sings with the trail off.
-///     Its honest gate is the master switch.
-///
-/// NON-VACUOUS: each case asserts the note it SHOULD carry as well as the
-/// note it must not, so a projection that stopped disclosing anything at all
-/// fails instead of passing the negative half.
+/// Each case asserts the note it should carry as well as the one it must not.
 #[test]
 fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
     let availability = audited_availability();
@@ -25221,7 +25221,7 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
         assert!(!effect.has_live_effect, "{key}");
     }
 
-    // The riff: NOT trail-gated. It must not inherit that claim…
+    // The riff is not trail-gated…
     let trail_off = projected_effect(
         "cursor_trail = false\n",
         &[],
@@ -25283,7 +25283,7 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
     );
     assert!(!volume_music_off.has_live_effect);
 
-    // …and it must disclose the master switch, which IS one of its gates.
+    // …and discloses the master switch, one of its gates.
     let music_off = projected_effect(
         "trail_sounds = false\n",
         &[],
@@ -25297,8 +25297,7 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
     );
     assert!(!music_off.has_live_effect);
 
-    // The BONK rides the word-decoration tick, not the glow: the trail being
-    // off must not claim it is inactive either.
+    // The bonk rides the word-decoration tick, not the glow: trail off is not its gate.
     let bonk_trail_off = projected_effect(
         "cursor_trail = false\n",
         &[],
@@ -25310,8 +25309,7 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
         !effect_note_contains(&bonk_trail_off, "cursor effects off"),
         "the bonk fires with the trail off: {bonk_trail_off:?}"
     );
-    // Its REAL gate, asserted so the negative above cannot pass merely
-    // because the bonk stopped disclosing anything at all.
+    // Its real gate, so the negative above cannot pass by disclosing nothing.
     let bonk_master_off = projected_effect(
         "[sparkle_words]\nenabled = false\n",
         &[],
@@ -25323,10 +25321,9 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
         effect_note_contains(&bonk_master_off, "all word effects are switched off"),
         "the bonk must disclose the sparkle master that does silence it: {bonk_master_off:?}"
     );
-    // …and the MUSIC master, which since 2026-08-09 also silences it
-    // (`app_render::bonk_sound_gain`'s `trail_sounds` term). Both bonk
-    // rows, because both are sound-only leaves: `bonk_detonation` admits a
-    // cue KIND into the same synth and moves nothing on glass.
+    // …and the Music master (`trail_sounds` in `sound_policy::bonk_sound_gain`). Both
+    // bonk rows: `bonk_detonation` admits a cue kind into the same synth and draws
+    // nothing.
     for key in [
         prefs::EDIT_SPARKLE_BONK,
         prefs::EDIT_SPARKLE_BONK_DETONATION,
@@ -25377,7 +25374,7 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
     );
 }
 
-/// A BOX SAYS WHY ITS ROWS ARE IDLE ONLY WHERE ALL OF THEM ARE. With cursor
+/// A box says why its rows are idle only where all of them are. With cursor
 /// effects off only Tone-adaptive melody and Ambient sound bed fall idle, so
 /// the Sound box says nothing for itself (nothing claims Sound volume or the
 /// bonks) and those two rows paint their own Inactive tag. With
@@ -25497,7 +25494,7 @@ fn a_box_says_why_its_rows_are_idle_only_where_all_of_them_are() {
     );
 }
 
-/// BLOOM IS A GLOW OF LIGHT, which a light background cannot show (a light
+/// Bloom is a glow of light, which a light background cannot show (a light
 /// theme draws trails as ink): on GitHub Light the Bloom switch and its two
 /// sliders say they apply on dark themes only, before Bloom Off's own note;
 /// on the default dark theme they are live, and Bloom Off still idles the
@@ -25545,21 +25542,10 @@ fn bloom_rows_say_they_have_no_effect_on_a_light_theme() {
     assert!(effect_note_contains(&off, "Bloom Off"), "{off:?}");
 }
 
-/// SERIOUS MODE IS DISCLOSED ON EVERY AUDIBLE ROW IT ACTUALLY SILENCES —
-/// and on none that it does not.
-///
-/// The Sound-menu census (`prefs::SOUND_MENU_KEYS`) deliberately keeps
-/// `serious_mode` OUT of this box: it is a whole-product policy with its own
-/// "Effect policy" home, and a second control for one key is exactly the
-/// hazard that keeps the `trail_sounds` master in Top Settings. But it IS a
-/// real gate — `SeriousEffect::TerminalSound` is read at all three
-/// `app_render` sound seams and at `lib.rs::on_bell` — so the honest
-/// surfacing is a per-row note, not a row. Without this every Sound row
-/// reads "On" under Serious Mode while the machine is silent.
-///
-/// NON-VACUOUS: every case asserts the DEFAULT posture is note-free first,
-/// so a projection that started shouting "Serious Mode" at everything (or
-/// that returned the note for reasons unrelated to serious mode) fails.
+/// Serious Mode is disclosed on every audible row it silences, and on none it does
+/// not. `serious_mode` stays out of the Sound box (`prefs::SOUND_MENU_KEYS`; one key,
+/// one control) but is a real gate (`SeriousEffect::TerminalSound`), so it surfaces
+/// as a per-row note. Every case first asserts the default posture is note-free.
 #[test]
 fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
     let availability = audited_availability();
@@ -25579,11 +25565,9 @@ fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
         prefs::EDIT_SPARKLE_BONK,
         prefs::EDIT_SPARKLE_BONK_DETONATION,
     ] {
-        // Both postures AUTHOR the trail master. It is the top rung of the
-        // same disclosure ladder ("Inactive: cursor effects off" outranks the
-        // Serious Mode note), and its absent-key default is platform-split —
-        // so leaving it unwritten would make the quiet case pass for the
-        // wrong reason on Windows and the serious case fail outright.
+        // Both postures author the trail master: "Inactive: cursor effects off"
+        // outranks the Serious Mode note, and its absent-key default is
+        // platform-split.
         let quiet = projected_effect(TRAIL_ON, &[], key, availability, motion);
         assert!(
             !effect_note_contains(&quiet, "Serious Mode"),
@@ -25597,17 +25581,10 @@ fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
         assert!(!serious.has_live_effect, "{key}");
     }
 
-    // THE MASTER TOO — via the cursor-trail block's `motion_suppression`,
-    // not the sound branch above, which deliberately skips it. Pinned here
-    // anyway so the BOX's promise is whole: if the master ever stopped
-    // disclosing this, the Sound surface would have one row lying while its
-    // eight neighbours told the truth.
-    //
-    // Note the distinction the copy gets right: this describes the CURRENT
-    // STATE (with Serious Mode set, Music effects On is suppressed — true),
-    // not the ACTION (toggling this control ON clears Serious Mode rather
-    // than being suppressed by it —
-    // `top_effect_controls_truthfully_escape_the_serious_mode_override`).
+    // The master too, via the cursor-trail block's `motion_suppression`, not the sound
+    // branch above. This describes the current state (Music effects On is suppressed),
+    // not the action: turning it on clears Serious Mode
+    // (`top_effect_controls_truthfully_escape_the_serious_mode_override`).
     let master = projected_effect(
         TRAIL_ON_SERIOUS,
         &[],
@@ -26102,8 +26079,8 @@ fn modified_manual_override_discloses_lifecycle_and_precedence() {
     state.environment_overrides.insert(
         "packages.account".to_string(),
         crate::app_config::ActiveEnvironmentOverride {
-            // A fixture label: no `[packages]` key has a real environment
-            // override (2026-09-23); the disclosure's rendering is the subject.
+            // A fixture label: no `[packages]` key has a real environment override;
+            // the disclosure's rendering is the subject.
             variable: "$ATERM_FIXTURE_OVERRIDE",
             effective: "machine-owner".to_string(),
         },
@@ -26379,8 +26356,7 @@ fn unavailable_runtime_controls_stay_truthful_in_modified() {
         .iter()
         .any(|note| note.kind == EffectNoteKind::Unavailable)
     };
-    // allow_osc52_query is a LIVE policy now (the GUI answers authorized
-    // queries), so it must NOT read as unavailable anywhere.
+    // `allow_osc52_query` is a live policy (the GUI answers authorized queries).
     assert!(!unavailable(prefs::EDIT_ALLOW_OSC52_QUERY));
     assert_eq!(
         !unavailable(prefs::EDIT_SECURE_KEYBOARD_ENTRY),
@@ -26402,18 +26378,11 @@ fn unavailable_runtime_controls_stay_truthful_in_modified() {
     );
 }
 
-/// PARITY, at the one surface that states availability in WORDS. A headless
-/// launch keeps its GPU as an intent and runs the CPU renderer until
-/// something demands a pixel. Sourcing these rows from the live renderer told
-/// the user that HDR glow, cursor bloom, the P3 colour space and backdrop
-/// materials are unavailable — about a device the same launch was always
-/// entitled to build and would build on its first `image`. Settings reads the
-/// CAPABILITY its host presented (`ViewMotionCx::backend_gpu`, which
-/// `App::gpu_capable` answers for an unredeemed intent too — that half is
-/// `the_settings_capability_read_follows_the_intent_the_app_holds`), and a run
-/// that has SETTLED on the CPU renderer — `--cpu`, a windowed CPU launch, a
-/// redemption that failed — still says so. The view reads no process global,
-/// so nothing another test does can move either reading.
+/// Settings reads the GPU capability its host presented (`ViewMotionCx::backend_gpu`;
+/// `App::gpu_capable` answers it for an unredeemed headless intent too, pinned by
+/// `the_settings_capability_read_follows_the_intent_the_app_holds`), so a deferred GPU
+/// does not make HDR glow, bloom, P3 or backdrop materials read unavailable, while a
+/// run settled on the CPU renderer still says so. The view reads no process global.
 #[test]
 fn a_deferred_gpu_intent_projects_the_same_availability_as_a_live_device() {
     let presented = |backend_gpu: bool| {
@@ -26454,9 +26423,8 @@ fn a_deferred_gpu_intent_projects_the_same_availability_as_a_live_device() {
         "a GPU-capable run never carries the denial"
     );
 
-    // THE ROUTING, through a real call site rather than a restatement of it:
-    // `manual_override_disclosure` is one of the `for_state` callers and returns
-    // the sentence a user reads.
+    // The routing through a real call site: `manual_override_disclosure` calls
+    // `for_state` and returns the sentence a user reads.
     let authored = ManualOverride {
         key: key.to_string(),
         label: "Bloom".to_string(),
@@ -26479,10 +26447,8 @@ fn a_deferred_gpu_intent_projects_the_same_availability_as_a_live_device() {
 
 #[test]
 fn config_feedback_projection_distinguishes_unavailable_from_mixed_live_edits() {
-    // HDR glow only has a live consumer while the trail is producing glow
-    // quads, so the trail master is authored here rather than inherited from
-    // a platform-split default — this test classifies edits as live vs
-    // unavailable, and that classification must be exercised on every host.
+    // HDR glow has a live consumer only while the trail draws glow quads, so author the
+    // master rather than inherit a platform-split default.
     let state = SettingsViewState::new(&Config {
         cursor_trail: Some(true),
         ..Config::default()
@@ -26840,7 +26806,7 @@ fn effect_projection_exhaustively_names_platform_backend_and_admission_gates() {
     }
     // ONE reason a setting does nothing: without its package tool, Install ALab
     // tools says that alone, not also that it waits on Keep ALab tools up to
-    // date. NEGATIVE CONTROL: with the tool there, the wait is the reason.
+    // date. Negative control: with the tool there, the wait is the reason.
     for (admission, expected) in [
         (PackageAdmission::MissingBinary, "Package tool missing"),
         (
@@ -26868,7 +26834,7 @@ fn effect_projection_exhaustively_names_platform_backend_and_admission_gates() {
 
 /// An Off install consent waits for nothing: with Keep ALab tools up to date
 /// off, Install ALab tools turned Off says no "Waits until …" (nothing
-/// installs, now or later). NEGATIVE CONTROL: turned On, it waits.
+/// installs, now or later). Negative control: turned On, it waits.
 #[test]
 fn an_off_install_consent_does_not_wait_for_keep_up_to_date() {
     let availability = SettingsAvailability {
@@ -26891,11 +26857,11 @@ fn an_off_install_consent_does_not_wait_for_keep_up_to_date() {
     }
 }
 
-/// A Packages switch row measures its label beside the switch AND Reset's
+/// A Packages switch row measures its label beside the switch and Reset's
 /// place, which an unwritten row keeps too: at 80x24 (a 512pt row) the
 /// "Install ALab tools · Waits until …" line does not fit beside both, so the
 /// note goes under the name, wrapped, and the label is never cut off.
-/// CONTROL: the same row written (Changed, Reset drawn) lays out the same way.
+/// Control: the same row written (Changed, Reset drawn) lays out the same way.
 #[test]
 fn a_packages_switch_note_wraps_under_the_name_beside_resets_place() {
     let (label_px, label_face) =
@@ -27025,17 +26991,10 @@ fn effect_projection_exhaustively_gates_disabled_effect_families() {
     }
 }
 
-/// A TYPO'D STYLE TAKES NO TUNING ROW OFF THE AIR. The sweep above only ever
-/// exercised `cursor_trail = false`, which is why the silent-disable
-/// semantics could be replaced by a rendering fallback while fourteen rows
-/// kept projecting `has_live_effect = false` beside a sentence that told a
-/// float or colour row ITS value was unregistered.
-///
-/// The constraint is stated as an EQUALITY against a valid-style baseline:
-/// an unrecognized `cursor_trail_style` must not change whether a tuning row
-/// is live, because `resolve_trail_style` substitutes the default style and
-/// the trail renders. The style row itself is the one row whose authored
-/// value really is unusable, and it keeps the Unavailable shape.
+/// An unrecognized `cursor_trail_style` does not change whether a tuning row is live,
+/// stated as an equality against a valid-style baseline: `resolve_trail_style`
+/// substitutes the default style and the trail renders. The style row itself is the
+/// one whose authored value is unusable, and it keeps the Unavailable shape.
 #[test]
 fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
     let availability = audited_availability();
@@ -27092,7 +27051,7 @@ fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
                 "{key}: a live tuning row must name the trail it is tuning: {fallback:?}"
             );
         } else if *key == prefs::EDIT_CURSOR_FIRE_SHIMMER {
-            // Dark for ITS OWN reason: the resolved fallback is the rainbow
+            // Dark for its own reason: the resolved fallback is the rainbow
             // pet, not Fire.
             assert!(
                 effect_note_contains(&fallback, "Fire style only"),
@@ -27175,8 +27134,7 @@ fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
         "{key}: a switch must not be told ITS value is unregistered: {fallback:?}"
     );
 
-    // The STYLE row is the one row whose authored value is genuinely
-    // unusable, and it keeps the generic invalid-choice shape.
+    // The style row keeps the generic invalid-choice shape.
     let style_row = projected_effect(
         "cursor_trail = true\n",
         &[(prefs::EDIT_CURSOR_TRAIL_STYLE, typo)],
@@ -27232,8 +27190,8 @@ fn the_momentum_glow_row_discloses_the_cursor_trail_master_and_nothing_else() {
     }
 }
 
-/// REDUCE MOTION UNDER HEAVY LOAD SAYS IT IS IDLE UNDER ALWAYS ANIMATE, AND
-/// NOWHERE ELSE: the host never sheds while Motion is Always animate
+/// Reduce motion under heavy load says it is idle under Always animate, and
+/// nowhere else: the host never sheds while Motion is Always animate
 /// (`MotionMode::admits_load_shed`), so there the switch is saved and does
 /// nothing whichever way it is set, a pending Motion change included; under
 /// Automatic or Reduce motion the shed is still live.
@@ -27412,8 +27370,8 @@ fn effect_projection_covers_live_motion_and_specific_child_dependencies() {
         assert!(!effect.has_live_effect, "{key}");
     }
 
-    // With Automatic updates ON the install consent is live: it is what the next
-    // unattended pass reads.
+    // With Automatic updates on the install consent is live: the next unattended pass
+    // reads it.
     let auto_install = projected_effect(
         "[packages]\nenabled = true\n",
         &[(prefs::EDIT_PACKAGES_AUTO_INSTALL, "false")],
@@ -27676,10 +27634,10 @@ fn invalid_registered_enum_and_color_values_disclose_runtime_fallbacks() {
     assert!(!effect_note_contains(&valid, "Invalid color"));
 }
 
-/// A SETTING WITH NO EFFECT PAINTS IDLE, as one waiting on another does: a
+/// A setting with no effect paints idle, as one waiting on another does: a
 /// saved value the runtime cannot use ("Invalid choice · Runtime fallback
 /// active") mutes its control (`ControlState::muted`: quiet ink, never the
-/// live accent), and it stays operable to repair. NEGATIVE CONTROL: a value
+/// live accent), and it stays operable to repair. Negative control: a value
 /// the runtime uses leaves it live.
 #[test]
 fn a_setting_with_no_effect_here_paints_idle() {
@@ -28177,14 +28135,14 @@ fn row_and_completion_share_the_exact_effect_projection() {
     assert!(mixed.suppression_notes.contains(&inactive.feedback));
 }
 
-/// THE HARNESS ROW SPEAKS THE TABLE SETTINGS HOLDS, a pending patch included:
+/// The harness row speaks the table Settings holds, a pending patch included:
 /// `Automatic` while every key is at its full-power default, the table
 /// Settings rebuilds from its dotted leaves read exactly as the supervisor's
 /// reader reads the file (a root `harness.<key>` the same table as a
 /// `[harness]` header; a saved string, bool and integer leaf each read), a
 /// saved limit gone once a pending reset clears it, and off once a pending
 /// patch turns the switch off (the painted words are `HarnessPolicy::badge`'s,
-/// tested in `app_config`). NEGATIVE CONTROL: a written key AT its default
+/// tested in `app_config`). Negative control: a written key at its default
 /// limits nothing.
 #[test]
 fn the_harness_row_says_automatic_and_names_each_limit() {
@@ -28534,7 +28492,7 @@ fn a_held_back_top_padding_says_it_once() {
     );
 }
 
-/// A ROW PAINTS ITS DISCLOSURE AS WRITTEN: the note's words follow the row's
+/// A row paints its disclosure as written: the note's words follow the row's
 /// name and its one separator exactly, with no case or punctuation guessed
 /// at paint time (an ordinary word after the colon stays lower case, a name
 /// keeps its capital), so the row reads as its status line does.
@@ -28619,9 +28577,7 @@ fn setting_row_paints_its_disclosure_verbatim() {
         "{effect:?}"
     );
     // Painted as written, a disclosure is one phrase: the row's separator is
-    // the only dot on its line, so no note may carry a dot of its own (the
-    // harness rows' "Inactive · Supervision Off" painted "Approve permission
-    // boxes · Inactive · Supervision Off" once nothing rewrote it). Every
+    // the only dot on its line, so no note may carry a dot of its own. Every
     // row, under states that idle whole families of them.
     let still = crate::native_app::ViewMotionCx::default();
     let mut idle = BTreeSet::new();
@@ -28672,7 +28628,7 @@ fn setting_row_paints_its_disclosure_verbatim() {
     }
 }
 
-/// A ZERO SAYS WHAT IT MEANS ONCE ON GLASS: the row's note ("0 keeps every
+/// A zero says what it means once on glass: the row's note ("0 keeps every
 /// line.", "...0 searches only the screen.") is the one painted statement of
 /// it, and the control's spoken name carries the state (a text field's note
 /// is paint-only), so the two neighbouring rows paint alike: their name and
@@ -28817,24 +28773,15 @@ fn generic_search_hides_absent_compatibility_keys_but_modified_retains_authored_
     )));
 }
 
-/// THE OPT-OUT IS A SWITCH (the harness round-3 review of 2026-09-24,
-/// major). The owner decision approves every Claude Code permission box
-/// "unless there is a setting added later by the user explicitly to NOT do
-/// this", and every shipped surface tells the user to search Settings for
-/// "approve". From the DEFAULT config (the key absent) that search must
-/// draw the `harness.approve` row as a native control — the harness master
-/// switch a native row beside it — not only the Manual count: before the
-/// fix the row appeared under Modified alone, once the key was already
-/// written. The question answer and its priority (2026-09-25) are native
-/// rows the same way, drawn by a search for "question" and "priority", and
-/// so is the default Autopilot (2026-10-15), drawn by its name, a mode's
-/// word and the owner's "wrap up" (its key was missing from
-/// [`native_advanced_effect`], so Search drew only the Manual count); each
-/// row's effect is the harness runtime (the host restarts its workers under
-/// a changed policy). Negative controls: the Manual sweep does not count the
-/// key too (a native row and a Manual match for one key would be two
-/// answers), and a search a row does not answer to draws no row for it, so
-/// the draw is the search's.
+/// The opt-out is a switch: every shipped surface tells the user to search Settings
+/// for "approve", and from the default config (key absent) that search draws
+/// `harness.approve` as a native control, the harness master switch a native row
+/// beside it, not only the Manual count. The question answer and its priority are
+/// native rows the same way ("question", "priority"), and so is the default
+/// Autopilot (its name, a mode's word, "wrap up"); each row's effect is the harness
+/// runtime (the host restarts its workers under a changed policy). Negative controls:
+/// the Manual sweep does not count the key too (one key would be two answers), and a
+/// search a row does not answer to draws no row for it.
 #[test]
 fn a_search_draws_each_harness_row_as_a_native_control() {
     let state = SettingsViewState::new(&Config::default());
@@ -29476,9 +29423,8 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
         };
         Some((painted_rung, short))
     };
-    // From 120pt: this product's own window floor is 164 LOGICAL points wide
-    // (`App::whole_cell_min_size`), so the narrow band below the old 240pt
-    // sweep start is shipping geometry, not a synthetic one.
+    // From 120pt: the window floor is 164 logical points wide
+    // (`App::whole_cell_min_size`), so the narrow band is shipping geometry.
     // 336pt tall is a short landscape compact host at 480-760pt.
     for height in [558.0_f32, 336.0, 400.0, 820.0] {
         sample_where_it_changes(120.0, 1_320.0, coarse, resolution, |width| {
@@ -29514,37 +29460,11 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
     }
 
     if scale == 2.0 {
-        // THE RED THAT EXTENDED THIS LADDER (2026-09-17). A 240pt host at 2×
-        // gives the hero a 164.0pt column; `Andrew Yates` measured 164.6pt in
-        // the UI face of the x86_64 Linux host that left that red (3091ede3b),
-        // so the old floor rung painted "Andrew Yat…" there.
-        //
-        // THAT 0.6pt IS THE WHOLE MARGIN, and it is a font measurement, not
-        // a layout one: the column is arithmetic (164.0pt on every host, so
-        // it is asserted below), while the string's width is whatever this
-        // host's UI face makes it. Measured 2026-09-17 on a 2017 MacBook Pro
-        // (macOS 13.7.8, x86_64): the same name measures 156.884pt there and
-        // FITS, so asserting the overflow made the ladder's law unprovable on
-        // that host rather than wrong. The law is therefore READ from the
-        // measurement — the painted rung is the longest that fits, whichever
-        // that is — and the arm the host cannot exercise says so on stderr
-        // instead of passing quietly.
-        //
-        // MEASURED AGAIN 2026-09-18 on an Apple silicon Mac (Darwin 25.6,
-        // this repo's Trust toolchain), where main carried this test as red
-        // at 3091ede3b: the assertion that failed there was the premise
-        // `width_of(author) > hero.column` — "the full name really does not
-        // fit the 240pt column: 156.884 vs 164" — the very number the Intel
-        // Mac gave. Both Macs load the same UI face and measure it to the
-        // same 156.884pt, so the 164.6pt was the Linux host's face and not
-        // an x86_64-versus-arm64 or a headless-harness difference (the
-        // harness on this host finds the UI face; `ui_text_width` only
-        // falls back to 0.6 em per char when no face loads, which would
-        // measure the name at 12 × 15.6pt = 187.2pt and step it DOWN). The
-        // ladder code was right on every host; the test's premise was one
-        // host's font width, and a16b7707e/c507804d2 replaced it with the
-        // measurement below. Green here 5× alone and inside the full
-        // `targo --unverified test -p aterm-gui --lib` on 2026-09-18.
+        // A 240pt host at 2× gives the hero a 164.0pt column (asserted below). Whether
+        // `Andrew Yates` fits is the UI face's: 164.6pt in the x86_64 Linux host's face
+        // (the floor rung would elide), 156.884pt in macOS's (it fits). So the law is
+        // read from the measurement, the longest rung that fits, and the arm this host
+        // cannot exercise says so on stderr.
         let hero = byline_at(240.0, 558.0).expect("a 240pt host paints the full About hero");
         assert!(!hero.short);
         assert!(
@@ -29552,11 +29472,8 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
             "the 240pt hero column: {}",
             hero.column
         );
-        // THE RUNG THIS HOST'S FACE LEAVES, read the whole ladder down rather
-        // than assumed one step in: the longest rung that fits is what must be
-        // painted, and if the face is wide enough that even the short form
-        // overflows, the honest answer is no byline at all — the same law the
-        // 150pt arm below asserts. Nothing here is a font premise.
+        // Read the whole ladder down: the longest rung that fits is painted, and if
+        // even the short form overflows, no byline at all (as the 150pt arm asserts).
         let name_width = width_of(author);
         let want = [author, author_short]
             .into_iter()
@@ -29585,12 +29502,9 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
             ),
         }
         if want == Some(author) {
-            // ONE comparison governs both the law above and this line: it is
-            // keyed off the rung that was chosen, never a second copy of the
-            // condition. Written to the stderr handle rather than `eprintln!`
-            // so a waived measurement shows in every run, not only a failing
-            // one: libtest captures the macro's output and keeps it from a
-            // passing test.
+            // Keyed off the chosen rung, not a second copy of the condition. Written
+            // to the stderr handle, not `eprintln!`, so libtest does not capture it
+            // from a passing test.
             use std::io::Write as _;
             let line = format!(
                 "native_about_byline_steps_down_to_the_longest_form_its_column_fits: the \
@@ -29605,8 +29519,8 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
             let _ = std::io::stderr().write_all(line.as_bytes());
         }
 
-        // And the decision below the last rung: a column too small for even
-        // the short form authors NO byline rather than an elided name.
+        // Below the last rung: a column too small for the short form authors no
+        // byline rather than an elided name.
         let hero = byline_at(150.0, 558.0).expect("a 150pt host still paints the About hero");
         assert!(
             width_of(author_short) > hero.column,
@@ -29617,10 +29531,8 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
             hero.painted.is_none(),
             "a column no rung fits paints no byline at all"
         );
-        // What makes that omission survivable rather than a loss: author,
-        // company and site are PROVENANCE rows, so the route's own
-        // `Copy Build Information` block still carries every fact the
-        // byline would have said. That is why the hero may drop the line.
+        // Author, company and site are provenance rows, so `Copy Build Information`
+        // still carries every fact the byline would have said.
         let provenance = crate::about::provenance_text();
         for fact in [
             crate::build_info::AUTHOR_ATTRIBUTION,
@@ -29680,11 +29592,8 @@ fn watcher_warning_is_global_separate_from_action_feedback_and_recovery_clears_i
     );
 }
 
-/// 2026-08 settings audit: a wide global search whose top match drives the
-/// renderer preview ("kitty") painted page 1 as '1–1 of 3' with the Manual
-/// editor card alone — ZERO native result rows — while every actual
-/// control hid on later pages. The native rows lead the list; the Manual
-/// card follows them.
+/// A wide global search whose top match drives the renderer preview ("kitty") leads
+/// with its native rows; the Manual card follows them.
 #[test]
 fn wide_search_page_one_lists_native_rows_beside_the_manual_result() {
     let (mut runtime, instance, view) = setup();
@@ -29819,7 +29728,7 @@ fn long_settings_copy_wraps_instead_of_one_elided_line() {
 }
 
 // -----------------------------------------------------------------------
-// Settings ▸ Messages (design §4.6).
+// Settings ▸ Messages
 // -----------------------------------------------------------------------
 
 /// Forty entries as the host would publish them (`App::messages_state`):
@@ -29929,11 +29838,10 @@ fn sample_messages() -> MessagesState {
     }
 }
 
-/// [`sample_messages`] spread over the reader's calendar (design ruling
-/// 273), newest first, the reader at UTC on Sunday 2025-09-21 15:53:20:
-/// #40–#38 today, #37–#31 yesterday, #30–#21 on Thursday, #20–#11 on
-/// Friday 12 September, #10–#1 on 17 August 2024 — each group a minute
-/// apart from 3:10 PM down.
+/// [`sample_messages`] spread over the reader's calendar, newest first, the reader at
+/// UTC on Sunday 2025-09-21 15:53:20: #40–#38 today, #37–#31 yesterday, #30–#21 on
+/// Thursday, #20–#11 on Friday 12 September, #10–#1 on 17 August 2024, each group a
+/// minute apart from 3:10 PM down.
 fn multi_day_messages() -> MessagesState {
     const DAY: u64 = 86_400_000;
     let mut state = sample_messages();
@@ -30055,11 +29963,9 @@ fn messages_view_state(
     }
 }
 
-/// THE LOG SCROLLED END TO END (ruling 264): compile the page at `cx`,
-/// hand each view to `visit` with its index, and scroll `step` entries on
-/// — the `ScrollLines` the wheel, the arrow keys and a screen reader's
-/// scroll on the list all send — until the list stops at its end.
-/// Returns how many views it visited.
+/// Scroll the log end to end: compile the page at `cx`, hand each view to `visit`
+/// with its index, and scroll `step` entries on (the `ScrollLines` the wheel, arrow
+/// keys and a screen reader send) until the list stops. Returns the views visited.
 fn scroll_messages_through(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -30085,16 +29991,13 @@ fn scroll_messages_through(
     panic!("the list never reached its end");
 }
 
-/// DAY HEADERS (design ruling 273): a log that spans more than one of
-/// the reader's local days is sectioned newest first — `Today`,
-/// `Yesterday`, the weekday within the week, then the date, with the year
-/// only off this year. A header is a heading for a screen reader and
-/// never a control (no action, not in the focus order, skipped by the
-/// arrow keys); it stands at the lead column's time x, every title keeps
-/// one origin, and a row under a past day says its local time. The list's
-/// top entry always carries its day's header, wherever the scroll stands.
-/// A filter hides a day it admits nothing from; a log of one day carries
-/// none.
+/// Day headers: a log spanning more than one of the reader's local days is sectioned
+/// newest first (`Today`, `Yesterday`, the weekday within the week, then the date,
+/// with the year only off this year). A header is a heading for a screen reader,
+/// never a control (no action, not focusable, skipped by the arrow keys); it stands
+/// at the lead column's time x, every title keeps one origin, and a row under a past
+/// day says its local time. The top entry always carries its day's header. A filter
+/// hides a day it admits nothing from; a one-day log carries none.
 #[test]
 fn the_log_is_sectioned_by_the_readers_local_day() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -30227,22 +30130,14 @@ fn the_log_is_sectioned_by_the_readers_local_day() {
     assert_eq!(when(&compiled, 40).as_deref(), Some("1 min ago"));
 }
 
-// `a_stamp_from_tomorrow_is_todays` (ruling 281) pins the day clock alone and
-// moved with it to the engine: `aterm_messages::page_tests` (design ruling 382).
-
-/// ONE PAST DAY IS STILL HEADED, AND THE TITLES NEVER MOVE WITH THE
-/// FILTER (round 18, day four, D12/D13): a filter that left one past day
-/// showed no header and a raw `2026-09-24` in the time column, and the
-/// title column stood at x 816, 788 or 718 as the filter changed.
-/// NEGATIVE CONTROL: a list of only today still carries no header (the
-/// test above).
+/// One past day is still headed (not a raw date in the time column), and the title
+/// column holds its x as the filter changes. Negative control: a list of only today
+/// carries no header (the test above).
 #[test]
 fn one_past_day_is_headed_and_the_titles_hold_their_x_across_filters() {
     const DAY: u64 = 86_400_000;
     let cx = view_cx_at(1_200.0, 820.0);
-    // Every entry on ONE past local day (Thursday, three days back), a
-    // minute apart: the rule before D12's fix (headed only when the
-    // entries span two days) heads none of it.
+    // Every entry on one past local day (Thursday, three days back), a minute apart.
     let mut past = sample_messages();
     let thursday = past.now_unix_ms - 3 * DAY;
     for entry in &mut past.entries {
@@ -30373,9 +30268,9 @@ fn a_screen_reader_scrolls_the_log_list() {
     assert_eq!(last.state.and_then(|state| state.expanded), Some(false));
 }
 
-/// The page is the log newest first; the chips are the tags PRESENT, in
-/// the fixed order with their counts; a chip narrows the rows and the
-/// status line counts what it admits; All puts everything back.
+/// The page is the log newest first; the chips are the tags present, in the fixed
+/// order with their counts; a chip narrows the rows and the status line counts what
+/// it admits; All puts everything back.
 #[test]
 fn messages_page_lists_newest_first_and_filters_by_tag() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -30431,9 +30326,8 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
         "the severity segments, then the tags' plain chip names (rulings 66 and \
          262); the action keys keep the tags"
     );
-    // ONE SCROLLING LIST (ruling 264): no pages and no pager; the
-    // reducer's bound is the stop the list scrolls to, where its view
-    // ends on the oldest entry.
+    // One scrolling list, no pager: the reducer's bound is where the list stops, its
+    // view ending on the oldest entry.
     assert!(
         compiled
             .semantic(&UiKey::new("settings/messages/pagination"))
@@ -30503,8 +30397,8 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
             .any(|(label, selected)| label == "Config \u{00b7} 37" && *selected)
     );
 
-    // The severity COMBINES with the tag (ruling 262): config's
-    // warnings, the crash (another tag) out.
+    // The severity combines with the tag: config's warnings, the crash (another tag)
+    // out.
     messages_action(
         &mut runtime,
         instance,
@@ -30574,8 +30468,7 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
             .map(|node| node.label.as_str()),
         Some(MESSAGES_EMPTY)
     );
-    // An empty log hides the filters and the count, and has nothing to
-    // copy (ruling 262).
+    // An empty log hides the filters and the count, and has nothing to copy.
     assert!(
         compiled
             .semantic(&UiKey::new("settings/messages/status"))
@@ -30602,11 +30495,10 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
     );
 }
 
-/// THE LOG'S LEAD COLUMN (design ruling 262): every row's title begins at
-/// the same x — the severity mark, when and the tag's chip name take one
-/// fixed width, measured once per page — the tag reads as its chip's plain
-/// words in the page's own face, and a screen reader hears the row's
-/// severity, chip and time in words, never the wire's.
+/// The log's lead column: every row's title begins at the same x (the severity mark,
+/// time and tag name take one fixed width, measured once per page), the tag reads as
+/// its chip's words in the page's face, and a screen reader hears severity, chip and
+/// time in words, never the wire's.
 #[test]
 fn the_log_rows_share_one_lead_column_and_speak_plain_words() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -30694,9 +30586,8 @@ fn the_log_rows_share_one_lead_column_and_speak_plain_words() {
         described.starts_with("Error, Crashes, ") && !described.contains('\u{00b7}'),
         "{described}"
     );
-    // The arrow keys move between rows: the focus steps down, and a
-    // step past the view's last row scrolls the list by that one row
-    // (ruling 264).
+    // The arrow keys move between rows; a step past the view's last row scrolls the
+    // list by one row.
     {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!()
@@ -30742,9 +30633,9 @@ fn the_log_rows_share_one_lead_column_and_speak_plain_words() {
     );
 }
 
-/// A title press expands its row in place — the meta line, the detail
-/// lines wrapped to the page, every authored button with its live
-/// enablement, Copy — and a second press folds it back.
+/// A title press expands its row in place (the meta line, detail lines wrapped to the
+/// page, every authored button with its live enablement, Copy), and a second press
+/// folds it back.
 #[test]
 fn selecting_a_row_expands_its_detail_lines_and_actions() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -30768,7 +30659,7 @@ fn selecting_a_row_expands_its_detail_lines_and_actions() {
             .map(|node| node.label.clone())
             .unwrap_or_else(|| panic!("{key} renders"))
     };
-    // A DISCLOSURE (ruling 262): expanded, never `selected`.
+    // A disclosure: expanded, never `selected`.
     let title = compiled
         .semantic(&UiKey::new("settings/messages/row/39/title"))
         .and_then(|node| node.state)
@@ -30783,8 +30674,8 @@ fn selecting_a_row_expands_its_detail_lines_and_actions() {
         Some(false),
         "a closed entry says so"
     );
-    // The meta line: the reader's local time and the state; the lead
-    // column already says the tag and the severity.
+    // The meta line: the reader's local time and the state (the lead column says the
+    // tag and severity).
     let meta = label("settings/messages/row/39/meta/0");
     assert!(
         meta.ends_with("3:51:20 PM \u{00b7} waiting to show") && !meta.contains("UTC"),
@@ -30820,8 +30711,8 @@ fn selecting_a_row_expands_its_detail_lines_and_actions() {
             .is_none(),
         "one row expands at a time"
     );
-    // The expanded row is charged at its height: the rows below it still
-    // fit the page, and the page is paged one row later than before.
+    // The expanded row is charged at its height: the rows below still fit, and the
+    // page pages one row later.
     for node in &compiled.semantics {
         if node.key.as_str().starts_with("settings/messages/row/") {
             assert!(
@@ -30848,17 +30739,11 @@ fn selecting_a_row_expands_its_detail_lines_and_actions() {
     );
 }
 
-/// THE PRIMARY IS THE FIRST INTENT A PRESS CAN STILL PERFORM (round 38,
-/// day ten, D2; ruling 401). #39's `Install now` names a build no longer
-/// staged: it stays, disabled (ruling 265: an intent that can come back),
-/// and it was drawn in the accent beside a plain `Open Software Update`
-/// that could be pressed — ruling 265's own complaint ("A dead `Stop
-/// paste` drawn as the accent Primary read as the thing to do.") about
-/// an intent it keeps. The accent, and a bare Return (`default_action`:
-/// the first ENABLED Primary), go to the first later intent that can act
-/// and is not a decline (ruling 403). The controls: #40's `Open log`,
-/// pressable and first, leads as before; a card with nothing pressable
-/// has no Primary, and Copy is never one.
+/// The Primary is the first intent a press can still perform: #39's `Install now`
+/// names a build no longer staged, so it stays, disabled, and the accent and a bare
+/// Return (`default_action`: the first enabled Primary) go to the first later intent
+/// that can act and is not a decline. Controls: #40's `Open log`, pressable and
+/// first, leads; a card with nothing pressable has no Primary; Copy is never one.
 #[test]
 fn the_primary_is_the_first_intent_a_press_can_still_perform() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -30933,18 +30818,12 @@ fn the_primary_is_the_first_intent_a_press_can_still_perform() {
     );
 }
 
-/// A DECLINE IS NEVER PROMOTED TO THE PRIMARY (round 38's review,
-/// findings 2 and 6; ruling 403). Ruling 401 moved the Primary past a
-/// first intent a press cannot perform, and on an upgrade card whose
-/// `Upgrade now` went dead it handed the accent, and a bare Return
-/// (`default_action`), to `Skip version`: a decision drawn as the thing
-/// to do, and pressed by a Return that did nothing there before. The
-/// band never paints a decline in the accent (`Intent::is_consequential`).
-/// Now a dead first intent hands the Primary only to a later intent that
-/// is not a decline; with none, nothing leads and Return stays inert.
-/// The controls: a dead `Install now` still hands it to `Open Software
-/// Update` (ruling 401), and a first `Not today` a press can perform
-/// keeps it (ruling 265: the reporter's order leads).
+/// A decline is never promoted to the Primary: on an upgrade card whose `Upgrade now`
+/// went dead, `Skip version` does not take the accent or a bare Return
+/// (`default_action`); the band never paints a decline in the accent
+/// (`Intent::is_consequential`). With no later non-decline intent nothing leads and
+/// Return stays inert. Controls: a dead `Install now` still hands it to `Open Software
+/// Update`, and a first `Not today` a press can perform keeps it.
 #[test]
 fn a_decline_is_never_promoted_to_the_primary() {
     use crate::messages_host::MessageActionView;
@@ -31037,14 +30916,11 @@ fn a_decline_is_never_promoted_to_the_primary() {
     );
 }
 
-/// THE FOOTER'S PRIMARY IS A POSITION IN THE OFFERED INTENTS, NOT AN
-/// `ActionIndex` (the round-39 review; ruling 408): the engine's
-/// `primary_index` answers a position in `entry.actions`, while each
-/// button's key keeps the intent's own index, and an intent whose moment
-/// passed is not offered (ruling 265), so the offered indices can start
-/// past 0. Every other fixture has index equal to position. Here: the
-/// first offered intent (`action/1`) leads, and past a dead `action/1` the
-/// pressable `action/2` does, never the dead one.
+/// The footer's Primary is a position in the offered intents, not an `ActionIndex`:
+/// `primary_index` answers a position in `entry.actions`, each button's key keeps the
+/// intent's own index, and a passed intent is not offered, so offered indices can
+/// start past 0. Here the first offered intent (`action/1`) leads, and past a dead
+/// `action/1` the pressable `action/2` does.
 #[test]
 fn the_footer_primary_is_a_position_in_the_offered_intents() {
     use crate::messages_host::MessageActionView;
@@ -31091,12 +30967,9 @@ fn the_footer_primary_is_a_position_in_the_offered_intents() {
     );
 }
 
-/// Ruling 314 (day eight E2): a tab's upgrade record set `it asks again on
-/// its own at 12:55 AM; Upgrade now asks it …` — the next step, for a
-/// person — as monospace code under Technical details, cut mid-sentence
-/// across two code lines. The entry's leading `sentences` lines are the
-/// sentence; the move and the shell spelling stay technical. Control: at
-/// one sentence line the remedy is technical, as it was.
+/// An entry's leading `sentences` lines are the sentence (a next step for a person,
+/// not monospace under Technical details); the move and the shell spelling stay
+/// technical. Control: at one sentence line the remedy is technical.
 #[test]
 fn an_upgrade_records_why_and_next_step_are_its_sentence() {
     let state = sample_messages();
@@ -31140,13 +31013,11 @@ fn an_upgrade_records_why_and_next_step_are_its_sentence() {
     );
 }
 
-/// A DIAGRAM KEEPS ITS COLUMNS (design ruling 36): a `toml` parse error,
-/// worded by the config lane from the REAL parser, paints every detail
-/// row in the monospace face and reaches the painter row for row — the
-/// caret row verbatim, leading whitespace and all, so the caret sits
-/// under the column it points at. On a measure too narrow for a row the
-/// row is CUT, never reflowed: its pieces join back to it byte for byte
-/// and none is wider than the box. A prose entry keeps the body face.
+/// A diagram keeps its columns: a `toml` parse error, worded by the config lane from
+/// the real parser, paints every detail row in monospace and reaches the painter row
+/// for row, the caret row verbatim so the caret sits under its column. On a measure
+/// too narrow for a row the row is cut, never reflowed: its pieces join back byte for
+/// byte and none is wider than the box. A prose entry keeps the body face.
 #[test]
 fn a_diagram_entry_paints_its_rows_in_the_monospace_face_and_cuts_them() {
     let error = "x = [bad\n"
@@ -31198,8 +31069,8 @@ fn a_diagram_entry_paints_its_rows_in_the_monospace_face_and_cuts_them() {
         )
         .unwrap();
     let cx = view_cx();
-    // A diagram is TECHNICAL whole (ruling 262): its rows are the entry's
-    // technical-details lines, in the small monospace.
+    // A diagram is technical whole: its rows are the entry's technical-details lines,
+    // in the small monospace.
     let painted_code = |compiled: &crate::native_ui::CompiledUi, id: u64| {
         let prefix = format!("settings/messages/row/{id}/code/");
         compiled
@@ -31259,7 +31130,7 @@ fn a_diagram_entry_paints_its_rows_in_the_monospace_face_and_cuts_them() {
         prose.iter().all(|(_, style)| *style == StyleRef::Primary),
         "{prose:?}"
     );
-    // Too narrow for the row: CUT, the pieces joining back to it.
+    // Too narrow for the row: cut, the pieces joining back to it.
     let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Code);
     let long = format!("{caret}{}", " here".repeat(40));
     let pieces = messages_cut_code(&long, 120.0);
@@ -31272,11 +31143,9 @@ fn a_diagram_entry_paints_its_rows_in_the_monospace_face_and_cuts_them() {
     }
 }
 
-/// THE DEEP LINK MEASURES THE LIST IT LEAVES (rulings 263 and 264): a
-/// chip showing one entry is a list of one, which never scrolls; a reveal
-/// that drops the chip lands by the whole log's list, so an entry deep in
-/// it is on the reader's screen, open — the stale list would land it at
-/// the top, where it is not.
+/// The deep link measures the list it lands in: a chip showing one entry is a list of
+/// one, which never scrolls; a reveal that drops the chip lands by the whole log's
+/// list, so an entry deep in it is on screen, open.
 #[test]
 fn the_deep_link_lands_by_the_filter_it_leaves() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -31316,13 +31185,11 @@ fn the_deep_link_lands_by_the_filter_it_leaves() {
     );
 }
 
-/// THE DEEP LINK (design §4.5; ruling 264): `settings/messages/select`
-/// expands the entry, drops a chip that would hide it, and LANDS on it —
-/// the list stays where the entry is already on the screen, else scrolls
-/// it to the top as far as the list scrolls — on the wide page and on a
-/// compact one, whose header scrolls away with the list. A link that
-/// comes before any render (a Settings view opened for it) is landed by
-/// that render, and the list moves on from where it drew.
+/// The deep link (design §4.5): `settings/messages/select` expands the entry, drops a
+/// chip that would hide it, and lands on it (the list stays if the entry is already
+/// on screen, else scrolls it toward the top), on the wide page and on a compact one
+/// whose header scrolls with the list. A link before any render is landed by that
+/// render, and the list moves on from where it drew.
 #[test]
 fn the_deep_link_selects_and_lands_on_the_entry() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -31402,8 +31269,7 @@ fn the_deep_link_selects_and_lands_on_the_entry() {
             .is_some()
     );
 
-    // Before any render: the render lands it, and the next scroll moves
-    // on from the stop it drew.
+    // Before any render: the render lands it, and the next scroll moves on from there.
     for (width, height) in [(1_200.0, 820.0), (320.0, 568.0)] {
         let (mut runtime, instance, view) = setup_with_messages();
         select_message(&mut runtime, instance, view, 5);
@@ -32179,7 +32045,7 @@ fn copy_all_puts_every_shown_entry_and_the_build_on_the_clipboard() {
     let crash = text.find("aterm closed unexpectedly").unwrap();
     let older = text.find("config warning 1\n").unwrap();
     assert!(crash < older, "newest first");
-    // NEGATIVE CONTROL: the crash chip down, and only the crash is copied.
+    // Negative control: with the crash chip down, only the crash is copied.
     let _ = messages_action(
         &mut runtime,
         instance,
@@ -32198,8 +32064,8 @@ fn copy_all_puts_every_shown_entry_and_the_build_on_the_clipboard() {
     assert!(commands.iter().any(|c| c.id.as_str() == MESSAGES_COPY_ALL));
 }
 
-/// OPEN LOG FOLDER asks the host for its own log directory — the effect
-/// carries no path, ever — and, off macOS, the page names the folder instead.
+/// Open Log Folder asks the host for its own log directory (the effect carries no
+/// path) and, off macOS, the page names the folder instead.
 #[test]
 fn open_log_folder_asks_the_host_and_never_names_a_path() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -32247,8 +32113,8 @@ fn open_log_folder_asks_the_host_and_never_names_a_path() {
     assert!(state.feedback.is_some(), "says so");
 }
 
-/// A PAGE WITHOUT A WRITER SAYS ITS MESSAGES ARE NOT SAVED: the log dir was
-/// read-only or the disk full, and the ring lives only until aterm quits.
+/// A page without a writer (log dir read-only, disk full) says its messages are not
+/// saved: the ring lives only until aterm quits.
 #[test]
 fn a_page_without_a_writer_says_its_messages_are_not_saved() {
     for (width, height) in [(1_200.0, 820.0), (320.0, 568.0)] {
@@ -32272,9 +32138,8 @@ fn a_page_without_a_writer_says_its_messages_are_not_saved() {
     }
 }
 
-/// SOFTWARE UPDATE'S LINK OPENS MESSAGES ON THE UPDATE CHIP (design ruling
-/// 41 kept): the navigation first (it clears the filter), then the chip a
-/// press on it would set; with no update entries, the All chip — never a
+/// Software Update's link opens Messages on the update chip: the navigation first (it
+/// clears the filter), then the chip; with no update entries, the All chip, never a
 /// blank page.
 #[test]
 fn the_software_update_link_opens_messages_on_the_update_chip() {
@@ -32286,7 +32151,7 @@ fn the_software_update_link_opens_messages_on_the_update_chip() {
     };
     assert_eq!(state.route, SettingsRoute::Messages);
     assert_eq!(state.messages_filter.tag.as_deref(), Some("update"));
-    // NEGATIVE CONTROL: no update entries — the All chip.
+    // Negative control: no update entries, so the All chip.
     let (mut runtime, instance, view) = setup();
     let mut no_update = sample_messages();
     no_update.tags.retain(|(tag, _)| tag != "update");
@@ -32453,11 +32318,9 @@ fn page_keys_turn_a_whole_screen_and_the_wheel_a_row() {
     }
 }
 
-/// ROUND 16, DAY TWO (ruling 267): on the compact page the header scrolls
-/// away with the log, and Down on a filter chip scrolled it — the chip
-/// left the tree and the keyboard with it (no focused node, no ring). The
-/// keyboard is on a control the page SHOWS after every step, and moves
-/// into the list when its control scrolls away.
+/// On the compact page the header scrolls away with the log; after every step the
+/// keyboard is on a control the page shows, moving into the list when its control
+/// scrolls away.
 #[test]
 fn the_keyboard_never_scrolls_away_with_the_compact_header() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -32526,10 +32389,8 @@ fn the_messages_pages_confirmation_takes_no_room_from_the_list() {
         "{:?}",
         status.label
     );
-    // ROUND 17 REVIEW (V4): a LONG note — Open Log Folder's path, a sent
-    // word — is fitted beside the count, never a reason to move the
-    // buttons under it: the list keeps its rows, and the whole note is
-    // still the count line's label.
+    // A long note (Open Log Folder's path) fits beside the count without moving the
+    // buttons: the list keeps its rows, and the whole note is the count line's label.
     let long = "The log folder is /Users//someone/Library/Application Support/aterm/messages";
     for (w, h) in [(774.0, 612.0), (474.0, 572.0)] {
         let cx = view_cx_at(w, h);
@@ -32725,11 +32586,9 @@ fn a_count_lines_note_never_moves_its_buttons() {
     );
 }
 
-/// ROUND 16, DAY TWO (ruling 267): `Copied` stood on the page for five
-/// minutes and across filters. The next action on the page clears it, and
-/// so does the first projection five seconds after one has seen it; a
-/// copy of the shown messages says `Copied`, never the About page's
-/// `Build information copied`.
+/// `Copied` clears on the page's next action, or at the first projection five seconds
+/// after one has seen it; a copy of the shown messages says `Copied`, never the About
+/// page's `Build information copied`.
 #[test]
 fn the_messages_pages_confirmation_is_transient() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -32766,8 +32625,8 @@ fn the_messages_pages_confirmation_is_transient() {
         "settings/messages/filter/warn",
     );
     assert_eq!(messages_view_state(&runtime, view).feedback, None);
-    // Left alone: the projection that first sees it starts the clock, one
-    // five seconds on clears it.
+    // Left alone: the projection that first sees it starts the clock, and one five
+    // seconds on clears it.
     copy(&mut runtime);
     let publish = |runtime: &mut NativeRuntime, now: u64, revision: u64| {
         let mut state = sample_messages();
@@ -32861,7 +32720,7 @@ fn the_tag_chips_wrap_as_one_aligned_balanced_block() {
         (spans[0] - spans[1]).abs() < widest,
         "balanced within one chip: {spans:?} (widest {widest})"
     );
-    // The balancer, against the greedy packing it replaced.
+    // The balancer, against greedy packing.
     assert_eq!(
         messages_chip_row_lengths(&[100.0; 10], 6.0, 700.0),
         vec![5, 5]
@@ -32874,11 +32733,10 @@ fn the_tag_chips_wrap_as_one_aligned_balanced_block() {
     );
 }
 
-/// DAY NINE, D4 (ruling 368): an entry's Technical details never shows
-/// its `… (N more lines)` marker alone. Room for one line keeps one real
-/// line and the marker when that fits, else no block at all (Copy keeps
-/// every line); two lines are never one and a marker for the other.
-/// Control: room for everything cuts nothing.
+/// Technical details never shows its `… (N more lines)` marker alone: room for one
+/// line keeps one real line and the marker when that fits, else no block (Copy keeps
+/// every line); two lines are never one plus a marker. Control: room for everything
+/// cuts nothing.
 #[test]
 fn technical_details_never_show_the_more_lines_marker_alone() {
     let body = |technical: &[&str]| MessagesBody {
@@ -32926,10 +32784,8 @@ fn technical_details_never_show_the_more_lines_marker_alone() {
     assert_eq!(fitted.technical.len(), 5);
 }
 
-/// ROUND 16, DAY TWO (ruling 267): every script tag is a filter, and a
-/// wider page lays its tags out as chips — seven script tags made three
-/// lines of them. Past two lines the page takes the `Tag: …` pop-up, which
-/// holds any number; the fixture's four tags stay chips.
+/// Every script tag is a filter; past two lines of chips the page takes the `Tag: …`
+/// pop-up, which holds any number. The fixture's four tags stay chips.
 #[test]
 fn a_wide_pages_tags_move_to_the_pop_up_past_two_lines() {
     let cx = view_cx_at(760.0, 820.0);
@@ -32965,10 +32821,8 @@ fn a_wide_pages_tags_move_to_the_pop_up_past_two_lines() {
     );
 }
 
-/// ROUND 16, DAY TWO (ruling 267): a row's description (`Error, Crashes,
-/// …`) and its disclosure state reached no observer but the paint node —
-/// not the accessibility projection, not `inspect … tree`. Both carry
-/// them now.
+/// A row's description (`Error, Crashes, …`) and disclosure state reach the
+/// accessibility projection and `inspect … tree`, not only the paint node.
 #[test]
 fn a_rows_description_and_disclosure_reach_every_observer() {
     let (runtime, instance, view) = setup_with_messages();
@@ -33005,24 +32859,13 @@ fn a_rows_description_and_disclosure_reach_every_observer() {
     }
 }
 
-/// REVIEW PIN (Phase 2, lens A, 2026-09-22): THE 80×24 WINDOW'S PAGE —
-/// 584×348 at scale 1, a SHORT LANDSCAPE compact host — seats no item it
-/// clips. `compact_page_budget` reads its insets through
-/// `page_insets_for_viewport`, which zeroes the vertical insets of a
-/// short landscape host, and so counts a 296 pt column; the page frame
-/// takes its insets from `responsive_page_insets`, which keeps 12 pt
-/// there, so the section the items were packed into is 272 pt. Captured
-/// live on the headless 80×24 instance: the expanded entry's Copy laid
-/// out at 38 pt (a control is 44), and the fourth head of a full page
-/// hanging past the section with its stamp line cut. Every item the
-/// list seats, in every view it scrolls through (ruling 264), must end
-/// inside its section at its authored height — the page's own law
-/// ("never promises a row it clips", design §4.4).
+/// The 80×24 window's page (584×348, a short-landscape compact host) seats no item it
+/// clips: every item the list seats, in every view it scrolls through, ends inside its
+/// section at its authored height (design §4.4).
 #[test]
 fn messages_page_seats_no_item_it_clips_at_584x348() {
     let cx = view_cx_at(584.0, 348.0);
-    // The one-day log, and the same log over five days, whose day headers
-    // (ruling 273) are seated whole as well.
+    // The one-day log and the five-day one, whose day headers are seated whole too.
     for log in [sample_messages(), multi_day_messages()] {
         let (mut runtime, instance, view) = setup_with_messages();
         assert!(runtime.replace_settings_messages(log, 8));
@@ -33116,11 +32959,10 @@ fn full_ring_messages() -> MessagesState {
     state
 }
 
-/// One render's WORK, counted on this thread through the real code path:
-/// the entry rows `messages_head_node` built, and the times it entered the
-/// font store (`crate::tray_raster::font_store_visits`) — every text
-/// measure enters it once. Counts, not a stopwatch: a loaded machine
-/// stretches a render's time but not its work.
+/// One render's work, counted on this thread through the real code path: the entry
+/// rows `messages_head_node` built, and the font-store entries
+/// (`crate::tray_raster::font_store_visits`), one per text measure. Counts, not a
+/// stopwatch: load stretches a render's time, not its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MessagesRenderWork {
     rows: usize,
@@ -33140,32 +32982,21 @@ fn messages_render_work(
     (compiled, work)
 }
 
-/// THE RING AT ITS CAP IS ONE LIST, BUILT ONLY WHERE IT IS SEEN (ruling
-/// 264): 512 entries lay out with only the rows the view shows built —
-/// the page's semantic tree is the size of the forty-entry log's — at the
-/// wide and the compact width; Cmd-End scrolls to the oldest entry, and a
-/// deep link to it lands it on the screen, open. The render's WORK is
-/// counted, not timed ([`MessagesRenderWork`]): it builds exactly the rows
-/// its view shows; an entry out of view costs it nothing, neither a row
-/// nor a measured word; and its text work stays within twice the
-/// forty-entry page's.
+/// The ring at its cap is one list built only where it is seen: 512 entries lay out
+/// with only the rows in view built (the semantic tree is the forty-entry log's size)
+/// at the wide and compact width; Cmd-End reaches the oldest entry, and a deep link to
+/// it lands it on screen, open. The render's work ([`MessagesRenderWork`]) is exactly
+/// the rows in view; an entry out of view costs nothing; text work stays within twice
+/// the forty-entry page's.
 #[test]
 fn the_log_at_its_ring_cap_builds_only_the_rows_in_view() {
-    // A stopwatch cannot say this: the best of nine timed renders read
-    // 25.7 ms at 512 entries beside 6.4 ms at 40 in one loaded
-    // whole-workspace run, 29 ms beside 5.7 ms in another, where the same
-    // build takes 3.8 ms beside 3.1 ms of thread CPU alone — while a lead
-    // column that measures every entry's words passed, alone, at 16.4 ms
-    // beside 3.6 ms, inside the "twice plus 10 ms" it was held to. Nor can
-    // the semantic tree alone: the compiler materializes no clipped
-    // subtree in any observer, so rows built and then clipped away — or
-    // built and dropped — leave it the same size (both measured
-    // 2026-09-27).
+    // Neither a stopwatch nor the semantic tree can say this: timings swing under
+    // load, and the compiler materializes no clipped subtree, so rows built then
+    // clipped or dropped leave the tree the same size.
     let full = full_ring_messages();
     assert_eq!(full.entries.len(), aterm_messages::LOG_CAP);
-    // The same log less its OLDEST entry, which no view below starts at:
-    // its time words and its tag are its neighbours', so every row shown
-    // and every word the lead column measures are the full ring's.
+    // The same log less its oldest entry, which no view below starts at: every row
+    // shown and every word the lead column measures are the full ring's.
     let mut less = full.clone();
     let oldest = less.entries.pop().expect("a full ring");
     for (tag, count) in &mut less.tags {
@@ -33299,25 +33130,21 @@ fn the_log_at_its_ring_cap_builds_only_the_rows_in_view() {
             big.semantics.len(),
             small.semantics.len()
         );
-        // VIRTUAL: the render built the rows its view shows and no
-        // others — not all 512, and none built only to be dropped.
+        // Virtual: the render built the rows its view shows and no others.
         assert_eq!(
             big_work.rows,
             rows.len(),
             "{width}: the render builds the rows in view, of {} entries",
             full.entries.len()
         );
-        // An entry out of view costs the render NOTHING: without the
-        // oldest entry the ring renders with the same rows built and the
-        // same text measured, so no work grows with the log's length.
+        // An entry out of view costs nothing: without the oldest entry the render
+        // builds the same rows and measures the same text.
         assert_eq!(
             big_work, less_work,
             "{width}: the oldest entry, out of view, costs the render work"
         );
-        // What the cap does cost is the lead column's distinct words (a
-        // few dozen "N min ago"s, each measured once): 136 font-store
-        // entries beside the forty's 109 at 1200 wide, 116 beside 89 at
-        // 320 (2026-10-01) — within twice.
+        // The cap does cost the lead column's distinct words (a few dozen "N min ago"s,
+        // each measured once), within twice the forty's.
         assert!(
             big_work.font_visits <= 2 * small_work.font_visits,
             "{width}: 512 entries measure text {} times, 40 entries {} times",
@@ -33353,7 +33180,7 @@ fn the_log_at_its_ring_cap_builds_only_the_rows_in_view() {
 }
 
 // -----------------------------------------------------------------------
-// Settings ▸ Messages, captured (round 14).
+// Settings ▸ Messages, captured
 // -----------------------------------------------------------------------
 
 /// A Settings controller holding `messages`, its view on Messages.
@@ -33391,8 +33218,8 @@ fn go_to_route(
 }
 
 // ---------------------------------------------------------------------------
-// Settings ▸ Messages: the keyboard, the scroll and the status line after an
-// action, a publication or a scroll (ruling 441 (k)–(t)).
+// Settings ▸ Messages: the keyboard, the scroll and the status line after an action,
+// a publication or a scroll.
 // ---------------------------------------------------------------------------
 
 /// The Settings view's focused key, compiled at `cx`, and whether the page
@@ -33455,8 +33282,8 @@ fn forty_tag_messages() -> MessagesState {
     script_tag_messages(40)
 }
 
-/// [`sample_messages`] with `n` one-entry tags on top (`script00`, …), as a
-/// script that names its own tags posts them (ruling 267).
+/// [`sample_messages`] with `n` one-entry tags on top (`script00`, …), as a script
+/// naming its own tags posts them.
 fn script_tag_messages(n: u64) -> MessagesState {
     let mut state = sample_messages();
     for k in 0..n {
@@ -33470,10 +33297,8 @@ fn script_tag_messages(n: u64) -> MessagesState {
     state
 }
 
-/// Ruling 441 (k), ruling 267 (the keyboard never leaves the page with no
-/// focused node) and the choice picker's own close: a tag chosen from the
-/// Tag pop-up with the keyboard puts focus back on the control that opened
-/// it, never on a chip the closed pop-up took out of the tree.
+/// A tag chosen from the Tag pop-up with the keyboard puts focus back on the control
+/// that opened it, never on a chip the closed pop-up took out of the tree.
 #[test]
 fn a_tag_chosen_from_the_pop_up_leaves_focus_on_its_button() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -33511,10 +33336,9 @@ fn a_tag_chosen_from_the_pop_up_leaves_focus_on_its_button() {
     );
 }
 
-/// Ruling 441 (l), ruling 264: on Messages `page_scroll` counts list stops,
-/// bounded by the plan the Messages render records; a config publication
-/// leaves the log where the reader is, never clamped to the Settings field
-/// count.
+/// On Messages `page_scroll` counts list stops, bounded by the plan the Messages
+/// render records; a config publication leaves the log where the reader is, never
+/// clamped to the Settings field count.
 #[test]
 fn a_config_publication_leaves_a_deep_messages_scroll_where_it_is() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -33556,9 +33380,8 @@ fn a_config_publication_leaves_a_deep_messages_scroll_where_it_is() {
     assert_eq!(message_rows(&compiled), rows, "the same entries shown");
 }
 
-/// Ruling 441 (m), ruling 264: the scroll moves on from the stop the reader
-/// saw. A page action (an entry's Copy) handled before the next render must
-/// not leave a following wheel event clamped to a limit of 0.
+/// The scroll moves on from the stop the reader saw: a page action (an entry's Copy)
+/// handled before the next render does not clamp the next wheel event to a limit of 0.
 #[test]
 fn a_scroll_after_a_page_action_moves_on_from_the_stop_shown() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -33616,10 +33439,8 @@ fn focus_never_moves_to_an_unseated_entry_under_a_tall_header() {
     }
 }
 
-/// Ruling 441 (o), rulings 264 and 267: FOCUS NEVER SCROLLS AWAY. A focused
-/// footer button of the open entry that the scroll unseats hands the
-/// keyboard to what the view still shows, on the wide page and the compact
-/// one.
+/// Focus never scrolls away: a focused footer button of the open entry that the scroll
+/// unseats hands the keyboard to what the view still shows, wide and compact.
 #[test]
 fn a_focused_footer_button_never_scrolls_away_with_its_entry() {
     for (w, h) in [(1_200.0, 820.0), (474.0, 572.0)] {
@@ -33655,9 +33476,8 @@ fn a_focused_footer_button_never_scrolls_away_with_its_entry() {
     }
 }
 
-/// Ruling 441 (p): Escape closes the Tag pop-up, as `cancel_transient`
-/// closes Settings' other pop-up (the choice picker), with focus back on
-/// the control that opened it; it never throws the reader off the log.
+/// Escape closes the Tag pop-up, as `cancel_transient` closes the choice picker, with
+/// focus back on the control that opened it; it never throws the reader off the log.
 #[test]
 fn escape_closes_the_tag_pop_up_and_stays_on_the_log() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -33700,13 +33520,9 @@ fn escape_closes_the_tag_pop_up_and_stays_on_the_log() {
     );
 }
 
-/// Ruling 441 (p), its review: Escape closes the Tag pop-up with the
-/// keyboard back on its button — a button the page SHOWS. On a compact page
-/// the header scrolls with the log, and a pop-up whose chips scroll its own
-/// button away left Escape's focus on a control the page no longer seats:
-/// no ring, and the next Return fell through to the page's default action
-/// (the failure (k) fixes for a chip's choice, which scrolls the list to
-/// its top).
+/// Escape closes the Tag pop-up with the keyboard back on a button the page shows: on
+/// a compact page whose pop-up chips scroll its button away, focus goes to a seated
+/// control, so the next Return does not fall through to the page's default action.
 #[test]
 fn escape_from_a_scrolled_tag_pop_up_seats_its_button() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -33747,12 +33563,9 @@ fn escape_from_a_scrolled_tag_pop_up_seats_its_button() {
     );
 }
 
-/// Ruling 441 (p), its second review: the Tag pop-up takes Escape only
-/// where the page draws it. Search Results and the compact category list
-/// replace the page, and a pop-up left open under either took the first
-/// Escape for a button the tree no longer held: the search stood, the list
-/// stayed open, and the keyboard had no ring. Both close the pop-up as they
-/// close the choice picker, and Escape does what it does there.
+/// The Tag pop-up takes Escape only where the page draws it: Search Results and the
+/// compact category list replace the page and close the pop-up as they close the
+/// choice picker, so Escape does what it does there.
 #[test]
 fn a_tag_pop_up_under_search_or_the_category_list_takes_no_escape() {
     let cx = view_cx_at(474.0, 572.0);
@@ -33774,8 +33587,7 @@ fn a_tag_pop_up_under_search_or_the_category_list_takes_no_escape() {
             .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
             .unwrap();
     };
-    // Search Results over the page, reached as a person reaches them: the
-    // search field, then typing.
+    // Search Results over the page, reached by the search field and typing.
     let (mut runtime, instance, view) = open_pop_up();
     focus_key(&mut runtime, instance, view, "settings/search");
     runtime
@@ -33820,13 +33632,10 @@ fn a_tag_pop_up_under_search_or_the_category_list_takes_no_escape() {
     );
 }
 
-/// Ruling 441 (k) and (p), their second review: the pop-up's button is
-/// the keyboard's place only where the page draws it. A compact page
-/// widened under an open pop-up lays its tags out as chips, the pop-up
-/// still open in the state and drawn nowhere: a chip chosen there keeps
-/// the keyboard (it went to the absent button, and the next Return fell
-/// through to the open entry's Primary), and Escape is not the hidden
-/// pop-up's.
+/// The pop-up's button is the keyboard's place only where the page draws it: on a
+/// compact page widened under an open pop-up (its tags now chips, the pop-up open in
+/// state and drawn nowhere), a chip chosen keeps the keyboard, and Escape is not the
+/// hidden pop-up's.
 #[test]
 fn a_pop_up_the_wider_page_does_not_draw_never_takes_the_keyboard() {
     let compact = view_cx_at(474.0, 572.0);
@@ -33873,9 +33682,8 @@ fn a_pop_up_the_wider_page_does_not_draw_never_takes_the_keyboard() {
     );
 }
 
-/// Ruling 441 (q), rulings 267/268: only the line a Messages action set is
-/// transient. A config patch's result that replaced it stands, as on every
-/// other page.
+/// Only the line a Messages action set is transient: a config patch's result that
+/// replaced it stands, as on every other page.
 #[test]
 fn the_messages_clock_clears_only_the_line_it_set() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -33947,9 +33755,8 @@ fn the_messages_clock_clears_only_the_line_it_set() {
     );
 }
 
-/// Ruling 441 (r), ruling 264: an entry opened low in the view is read
-/// whole. A new record posted at the head of the list (the next publish)
-/// must not push the entry just opened out of the view.
+/// An entry opened low in the view is read whole: a new record posted at the head of
+/// the list does not push it out of the view.
 #[test]
 fn a_new_record_never_pushes_the_open_entry_out_of_view() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -33980,9 +33787,8 @@ fn a_new_record_never_pushes_the_open_entry_out_of_view() {
     );
 }
 
-/// The host's next publication of [`sample_messages`]: a config warning,
-/// #41, posted at the head, and with `evict`, #1 — the oldest — gone from
-/// the ring to make room for it.
+/// The host's next publication of [`sample_messages`]: a config warning, #41, at the
+/// head, and with `evict`, #1 (the oldest) gone from the ring to make room.
 fn post_newest(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -34010,12 +33816,10 @@ fn post_newest(
         .unwrap();
 }
 
-/// Ruling 441 (o) and (r), their second review: FOCUS NEVER MOVES AWAY
-/// (ruling 267) under a publication either. A list at its newest entry
-/// takes a new record at its top ((r) keeps no anchor there), so an entry
-/// opened low in that view leaves it whole, its footer button with it; and
-/// an entry the ring evicts leaves the list. Each left the keyboard on a
-/// control the page no longer showed.
+/// Focus never moves away under a publication either: a list at its newest entry
+/// takes a new record at its top (no anchor there), so an entry opened low in that
+/// view leaves it, footer button and all, and an evicted entry leaves the list; in
+/// both cases the keyboard moves to a control the page still shows.
 #[test]
 fn a_publication_never_leaves_the_keyboard_on_an_entry_it_moved_away() {
     let cx = view_cx_at(774.0, 612.0);
@@ -34040,7 +33844,7 @@ fn a_publication_never_leaves_the_keyboard_on_an_entry_it_moved_away() {
         if messages_view_state(&runtime, view).page_scroll != 0
             || compiled.semantic(&UiKey::new(copy.clone())).is_none()
         {
-            // Opened by a scroll: (r)'s case, a test of its own.
+            // Opened by a scroll: `a_new_record_never_pushes_the_open_entry_out_of_view`.
             continue;
         }
         focus_key(&mut runtime, instance, view, &copy);
@@ -34325,9 +34129,8 @@ fn a_publication_that_folds_the_tag_chips_moves_the_keyboard_with_them() {
     );
 }
 
-/// Ruling 441 (s), ruling 267: "The status line an action on the Messages
-/// page sets is transient: the next action on the page clears it". A
-/// refused entry press's line is such a line.
+/// The status line an action on Messages sets is transient (the next action clears
+/// it), and a refused entry press's line is one.
 #[test]
 fn a_refused_entry_press_line_is_transient_too() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -34351,11 +34154,9 @@ fn a_refused_entry_press_line_is_transient_too() {
     );
 }
 
-/// Ruling 441 (t): the page says what happened, as its other outcomes do (a
-/// refused `Open log` is `Could not open the log`): Open Log Folder's
-/// `Opening the log folder…` is answered by the open's outcome, so a
-/// failure can correct it, and the answer is transient like the page's
-/// other lines.
+/// Open Log Folder's `Opening the log folder…` is answered by the open's outcome (as a
+/// refused `Open log` says `Could not open the log`), so a failure corrects it, and
+/// the answer is transient like the page's other lines.
 #[cfg(target_os = "macos")]
 #[test]
 fn open_log_folder_waits_for_its_outcome() {
@@ -34441,12 +34242,11 @@ fn page_controls(compiled: &crate::native_ui::CompiledUi) -> BTreeSet<String> {
         .collect()
 }
 
-/// EVERY CONTROL IS REACHED BY SCROLLING (the scroll-list ruling). For every
-/// route at 584×348, 738×418 and 1074×684, every control the route draws in a
-/// window of the same width tall enough to hold it all is on some screen of
-/// its list, whole and inside the window; a screen that shows a preview also
-/// shows a stop of the list under it; and the category sheet holds many
-/// routes on a screen.
+/// Every control is reached by scrolling: for every route at 584×348, 738×418
+/// and 1074×684, every control the route draws in a window of the same width
+/// tall enough to hold it all is on some screen of its list, whole and inside
+/// the window; a screen that shows a preview also shows a stop of the list
+/// under it; and the category sheet holds many routes on a screen.
 #[test]
 fn every_route_reaches_every_control_by_scrolling_at_every_window_size() {
     for (width, height) in [(584.0, 348.0), (738.0, 418.0), (1_074.0, 684.0)] {
@@ -34523,11 +34323,10 @@ fn every_route_reaches_every_control_by_scrolling_at_every_window_size() {
     }
 }
 
-/// THE PINNED PREVIEW STILL PREVIEWS. A typography specimen paints whole
-/// rows only, so where a screen has room for one row beside the list it
-/// keeps that row (at 48pt the Text & Fonts preview showed its header and no
-/// text); and a screen of the list never shows one stop where the preview,
-/// yielding to its floor, would have made room for two.
+/// The pinned preview still previews: a typography specimen paints whole rows
+/// only, so where a screen has room for one row beside the list it keeps that
+/// row, never its header alone; and a screen of the list never shows one stop
+/// where the preview, yielding to its floor, would have made room for two.
 #[test]
 fn the_pinned_preview_keeps_a_specimen_row_and_yields_for_a_second_stop() {
     for (route, width, height) in [
@@ -34767,10 +34566,10 @@ fn up_and_down_walk_the_page_controls_and_the_list_follows() {
     );
 }
 
-/// A SAVE NEVER MOVES THE ROW UNDER THE POINTER. On a compact window the
+/// A save never moves the row under the pointer: on a compact window the
 /// status bar a change brings up takes room from the list, and the list keeps
-/// the control the person just used in view — reached by the keyboard, or
-/// changed by an action alone; a wider page keeps the bar's room, so the list
+/// the control the person just used in view (reached by the keyboard, or
+/// changed by an action alone); a wider page keeps the bar's room, so the list
 /// does not move at all.
 #[test]
 fn the_status_bar_never_scrolls_the_edited_row_away() {
@@ -34850,7 +34649,7 @@ fn the_status_bar_never_scrolls_the_edited_row_away() {
     }
 }
 
-/// A GROWN WINDOW RE-CLAMPS THE LIST: scrolled to its end in a small window,
+/// A grown window re-clamps the list: scrolled to its end in a small window,
 /// the list in a taller one starts where its last screen is full, and the
 /// next event adopts that scroll.
 #[test]
@@ -34894,7 +34693,7 @@ fn a_grown_window_reclamps_the_scroll_to_a_full_last_screen() {
 
 /// Serious Mode hides the playful rainbow on Top Settings, so it hides the
 /// rainbow wash behind every Settings page too: the page that announces it is
-/// hiding playful effects no longer sits on one.
+/// hiding playful effects does not sit on one.
 #[test]
 fn serious_mode_paints_the_settings_canvas_plain() {
     let (runtime, instance, view) = setup();
@@ -34930,9 +34729,9 @@ fn patch_edits(outcome: &crate::native_app::DispatchOutcome) -> Vec<(String, Opt
         .collect()
 }
 
-/// Arriving on the Wallpaper page opens nothing: on macOS a visit with no
-/// wallpaper set used to raise the modal file picker, from the sidebar and
-/// from `open app settings /wallpaper` alike. Only the button opens it.
+/// Arriving on the Wallpaper page with no wallpaper set opens nothing, from the
+/// sidebar and from `open app settings /wallpaper` alike: only the button opens
+/// the modal file picker.
 #[test]
 fn visiting_the_wallpaper_page_opens_no_picker() {
     let (mut runtime, instance, view) = setup();
@@ -34959,7 +34758,7 @@ fn visiting_the_wallpaper_page_opens_no_picker() {
 }
 
 /// The Wallpaper page names the file, says on its own line why it did not
-/// load, and carries the dim and text tint rows that used to be Manual-only.
+/// load, and carries the dim and text tint rows.
 #[test]
 fn the_wallpaper_page_names_the_file_and_the_failure_and_owns_dim_and_tint() {
     let mut state = SettingsViewState::new(&Config::default());
@@ -35094,7 +34893,7 @@ fn painted_text(compiled: &crate::native_ui::CompiledUi, key: &str) -> String {
         .unwrap_or_else(|| panic!("{key} paints text"))
 }
 
-/// THE WINDOW PAGE'S TAB COLOR ROW SHOWS THE COLOR IT NAMES: the row that
+/// The Window page's Tab Color row shows the color it names: the row that
 /// goes to Tab Color wears the chip the hex field wears, at the regular and
 /// the compact widths; unset, the automatic colour the window paints.
 #[test]
@@ -35149,8 +34948,8 @@ fn the_window_tab_color_row_shows_the_color_it_names() {
 #[test]
 fn tab_color_shows_the_wheel_and_what_it_sets_on_one_screen() {
     // The shipped 102x29 window, and 80x24's live viewport (584x348), where a
-    // pick's Undo bar used to switch the page to its stacked layout and
-    // scroll the wheel away.
+    // pick's Undo bar must not switch the page to its stacked layout or scroll
+    // the wheel away.
     for (width, height) in [(744.0_f32, 420.0_f32), (584.0, 348.0)] {
         for source in ["", "active_tab_color = \"#E67A00\"\n"] {
             let snapshot = VersionedConfigService::new(source.to_string())
@@ -35185,10 +34984,9 @@ fn tab_color_shows_the_wheel_and_what_it_sets_on_one_screen() {
             }
         }
     }
-    // THE WHEEL STAYS UNDER THE POINTER: on one config, the Undo bar a pick
-    // brings up moves and resizes nothing of the picker (80x24 used to open
-    // with a 179pt wheel that became a 161pt one 35pt higher on the first
-    // pick, so a second click at the same spot chose another color).
+    // The wheel stays under the pointer: on one config, the Undo bar a pick
+    // brings up moves and resizes nothing of the picker, so a second click at
+    // the same spot picks the same color.
     for (width, height) in [(744.0_f32, 420.0_f32), (584.0, 348.0)] {
         let snapshot = VersionedConfigService::new("active_tab_color = \"#33CC66\"\n".to_string())
             .unwrap()
@@ -35585,9 +35383,9 @@ fn painted_text_contrast(
         .collect()
 }
 
-/// LIGHT-THEME CONTRAST OF THE MESSAGES CHROME: on GitHub Light every resting
-/// word the filters and the count line paint — the count, the no-match line,
-/// each chip and segment not chosen, the tag pop-up — holds 4.5:1 against what
+/// Light-theme contrast of the Messages chrome: on GitHub Light every resting
+/// word the filters and the count line paint (the count, the no-match line,
+/// each chip and segment not chosen, the tag pop-up) holds 4.5:1 against what
 /// is painted under it, the wallpaper wash included; and every resting tag
 /// chip paints an opaque fill and an edge of its own, so it reads as a button
 /// on the wash. (A chosen chip is inked in the accent, floored at 3:1 against
@@ -35977,7 +35775,7 @@ fn a_copy_that_cannot_update_offers_no_live_update_button() {
     assert!(!check.enabled, "and greys it with the button");
 }
 
-/// A FILTER THAT ADMITS NOTHING SAYS SO. With messages in the log and the
+/// A filter that admits nothing says so: with messages in the log and the
 /// filters set so none passes, the page says no messages match and offers
 /// Show All, which lifts both filters; Copy All is greyed (and its command
 /// with it), and a press on it copies nothing.
@@ -36049,10 +35847,10 @@ fn a_filter_that_matches_nothing_says_so_and_copies_nothing() {
     );
 }
 
-/// ABOUT SAYS WHO AND WHERE ONCE. The hero's byline names the author, company
-/// and site in quiet text — it is not a link, Open Project Site is — and no
-/// second card repeats the site: the build information is the one card under
-/// the hero, at the page's width.
+/// About says who and where once: the hero's byline names the author, company
+/// and site in quiet text (not a link; Open Project Site is), and no second
+/// card repeats the site: the build information is the one card under the
+/// hero, at the page's width.
 #[test]
 fn about_names_its_site_once_and_the_byline_is_not_a_link() {
     let (mut runtime, instance, view) = setup();
@@ -36314,7 +36112,7 @@ fn the_about_hero_wraps_its_tagline_and_measures_its_labels() {
     });
 }
 
-/// A COPY WITHOUT ITS PACKAGE TOOL SAYS ONE THING. Its headline names the
+/// A copy without its package tool says one thing: its headline names the
 /// missing tool and the detail says how to get one; nothing on the page
 /// promises that Check & Update Now works, or that switches take effect,
 /// where every button is greyed; and no "Signed updates" line stands under a
@@ -36575,8 +36373,8 @@ fn open_theme_picker(runtime: &NativeRuntime, view: crate::native_app::ViewId) -
 const MY_THEME: &str = "foreground = #c0caf5\nbackground = #1a1b26\n";
 const BROKEN_THEME: &str = "foreground = #c0caf5\nbackground = #1a1b26\ncursor-colour = #ffffff\n";
 
-/// SEL-10: the filter matches label, id, description and appearance by the
-/// search ladder, and the rows it leaves are the only ones drawn.
+/// The filter matches label, id, description and appearance by the search
+/// ladder, and the rows it leaves are the only ones drawn.
 #[test]
 fn theme_picker_filter_nord_leaves_only_nord_rows() {
     let themes = theme_catalog_with("filter", &[("my-theme.conf", MY_THEME)]);
@@ -36654,9 +36452,8 @@ fn theme_picker_filter_nord_leaves_only_nord_rows() {
     assert_eq!(open_theme_picker(&runtime, view).shown.len(), everything);
 }
 
-/// SEL-9: a theme file that did not load is a disabled Needs-attention row
-/// with its reason and an Open file action; choosing it is refused on every
-/// path.
+/// A theme file that did not load is a disabled Needs-attention row with its
+/// reason and an Open file action; choosing it is refused on every path.
 #[test]
 fn an_invalid_theme_file_is_a_disabled_row_with_its_reason_and_choosing_it_is_refused() {
     let themes = theme_catalog_with(
@@ -36767,7 +36564,7 @@ fn an_invalid_theme_file_is_a_disabled_row_with_its_reason_and_choosing_it_is_re
     )));
 }
 
-/// SEL-12: a theme's label is its own name as written, never sentence-cased.
+/// A theme's label is its own name as written, never sentence-cased.
 #[test]
 fn a_user_theme_is_labelled_as_written() {
     let themes = theme_catalog_with(
@@ -36829,8 +36626,8 @@ fn a_user_theme_is_labelled_as_written() {
     );
 }
 
-/// SEL-14: every loadable theme row carries its background and 16 colours,
-/// and an accessibility sentence with its contrast.
+/// Every loadable theme row carries its background and 16 colours, and an
+/// accessibility sentence with its contrast.
 #[test]
 fn theme_rows_carry_a_colour_strip_and_a_contrast_sentence() {
     let (runtime, instance, view) = theme_picker_runtime(crate::app_config::ThemeCatalog::empty());
@@ -36890,8 +36687,8 @@ fn theme_rows_carry_a_colour_strip_and_a_contrast_sentence() {
     );
 }
 
-/// SEL-10 (search): a theme's name finds the Theme control, and opening the
-/// picker from that search starts filtered to it.
+/// A theme's name finds the Theme control in search, and opening the picker
+/// from that search starts filtered to it.
 #[test]
 fn a_theme_name_finds_the_theme_control_and_seeds_the_picker_filter() {
     let themes = theme_catalog_with("search", &[("harbour.conf", MY_THEME)]);
@@ -37491,8 +37288,8 @@ fn theme_row(runtime: &NativeRuntime, view: crate::native_app::ViewId, id: &str)
         .unwrap_or_else(|| panic!("a {id} row"))
 }
 
-/// SEL-7/T9: turning Follow system on writes the theme on its own side and
-/// its pair on the other; off writes the side on screen.
+/// Turning Follow system on writes the theme on its own side and its pair on
+/// the other; off writes the side on screen.
 #[test]
 fn follow_system_prefs_switch_writes_the_pair_and_back_the_visible_side() {
     let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Gruvbox Dark\"\n", true);
@@ -37682,7 +37479,7 @@ fn follow_system_off_then_on_gives_the_pair_back() {
                 .effects
                 .iter()
                 .find_map(|effect| match effect {
-                    AppEffect::ConfigPatch { patch, reply } => patch
+                    AppEffect::ConfigPatch { patch, reply, .. } => patch
                         .edits
                         .iter()
                         .find(|edit| edit.key == prefs::EDIT_THEME)
@@ -38521,8 +38318,8 @@ fn an_automatic_window_sample_takes_the_terminal_themes_side_on_any_os() {
     }
 }
 
-/// SEL-7: a slot writes only its own side, and the Default row there names
-/// Default rather than resetting the pair away.
+/// A slot writes only its own side, and the Default row there names Default
+/// rather than resetting the pair away.
 #[test]
 fn follow_system_prefs_slot_edit_keeps_the_other_side() {
     let (mut runtime, instance, view) =
@@ -38614,9 +38411,9 @@ fn follow_system_prefs_slot_edit_keeps_the_other_side() {
     );
 }
 
-/// SEL-7: the theme control itself, on a split, opens the side on screen,
-/// so a single pick can never silently replace the pair. Negative control:
-/// on a plain name the same pick writes the plain name.
+/// The theme control itself, on a split, opens the side on screen, so a
+/// single pick can never silently replace the pair. Negative control: on a
+/// plain name the same pick writes the plain name.
 #[test]
 fn follow_system_prefs_single_pick_never_replaces_a_split() {
     let choose = |source: &str, system_dark: bool| {
@@ -38660,8 +38457,8 @@ fn follow_system_prefs_single_pick_never_replaces_a_split() {
     );
 }
 
-/// APPEAR-6: the preview draws the side the OS appearance picks, and the
-/// side switch turns it to the other side without writing anything.
+/// The preview draws the side the OS appearance picks, and the side switch
+/// turns it to the other side without writing anything.
 #[test]
 fn follow_system_prefs_preview_draws_the_os_side_and_the_side_switch_turns_it() {
     let (mut runtime, instance, view) =
@@ -39552,8 +39349,7 @@ fn every_picker_host_leaves_the_theme_picker_a_heading_over_two_rows() {
 
 /// What the theme picker's list paints never ends on a section heading: the
 /// rows that peek in under the window bring a heading only with some of its
-/// first row of cells, so no caption stands alone at the list's bottom (the
-/// shipped 102x29 window painted a bare THEME FILES there).
+/// first row of cells, so no caption stands alone at the list's bottom.
 #[test]
 fn a_theme_picker_list_never_ends_on_a_bare_heading() {
     let section = format!("settings/choice-section/{}/", prefs::EDIT_THEME);
@@ -39602,10 +39398,9 @@ fn a_theme_picker_list_never_ends_on_a_bare_heading() {
 
 /// Every screen of a headed theme picker names the section its choices are
 /// in: a window scrolled into a section carries the section's heading over
-/// its first row, so the list always starts on a heading. The 167x36 picker
-/// opened on GitHub Light showed three rows of light themes and no LIGHT.
-/// Negative control: without the carried heading, a window that starts
-/// inside a section paints a row of choices first.
+/// its first row, so the list always starts on a heading. Negative control:
+/// without the carried heading, a window that starts inside a section paints
+/// a row of choices first.
 #[test]
 fn a_theme_picker_scrolled_into_a_section_names_it() {
     let section = format!("settings/choice-section/{}/", prefs::EDIT_THEME);
@@ -39830,7 +39625,7 @@ fn the_compact_theme_pickers_action_cells_are_reachable_by_keyboard() {
     }
 }
 
-/// SETTINGS ▸ THEMES, the Theme Showcase.
+/// Settings ▸ Themes, the Theme Showcase.
 #[path = "native_settings_showcase_tests.rs"]
 mod showcase;
 
@@ -40256,7 +40051,7 @@ fn the_update_pages_last_screen_draws_the_status_cards_cut_buttons_live() {
     );
 }
 
-/// The owner's sudo off-switch press records its DIRECTION on the view for the
+/// The owner's sudo off-switch press records its direction on the view for the
 /// park after the injected owner answers yes; the park consumes that one-use answer
 /// when it persists the marker.
 #[test]
@@ -40854,10 +40649,17 @@ fn cursor_styles_marks_the_default_style_whichever_is_saved() {
             assert!(painted.ends_with(" (default)"), "{painted:?}");
         }
     }
-    // A narrow row elides the name, never the mark.
-    let narrow = fit_keeping_default_note("Rainbow kitty (default)", 110.0);
+    // A narrow row wraps the name, the mark whole on its last line.
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let narrow = wrap_to_box("Rainbow kitty (default)", 110.0, &|line| {
+        crate::tray_raster::ui_text_width_for(face, line, px)
+    });
     assert!(
-        narrow.ends_with(" (default)") && narrow.contains('\u{2026}'),
+        narrow.len() > 1
+            && narrow
+                .last()
+                .is_some_and(|line| line.ends_with("(default)"))
+            && narrow.join(" ") == "Rainbow kitty (default)",
         "{narrow:?}"
     );
     let (mut runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"comet\"\n");
@@ -41634,7 +41436,7 @@ fn session_controls_save_reset_and_disclose_observed_runtime() {
                 .effects
                 .iter()
                 .find_map(|effect| match effect {
-                    AppEffect::ConfigPatch { patch, reply } => Some((patch, reply.operation)),
+                    AppEffect::ConfigPatch { patch, reply, .. } => Some((patch, reply.operation)),
                     _ => None,
                 })
                 .expect("actual Settings control emits config patch");
@@ -42559,9 +42361,12 @@ fn the_packages_consent_note_wraps_to_its_column() {
                             else {
                                 continue;
                             };
-                            let audit = compiled
-                                .text_fit_audit_line(&node.key)
-                                .unwrap_or_else(|| panic!("{context}: line {index} is audited"));
+                            let Some(audit) = compiled.text_fit_audit_line(&node.key) else {
+                                // A line the list's top edge cuts through
+                                // paints no words there (`UiNode::room`).
+                                assert!(node.cut_edges.any(), "{context}: line {index} is audited");
+                                continue;
+                            };
                             assert!(
                                 audit.contains(" overflow=false "),
                                 "{context} screen {top}: {audit}"

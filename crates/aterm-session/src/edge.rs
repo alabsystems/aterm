@@ -5,9 +5,8 @@
 //!
 //! An [`Edge`] is one directed `src → dst` authority for one [`Op`]. A cycle
 //! `A → B → A` is two independent rows; a self-loop `A → A` is the one row
-//! `(A, A, op)`. [`decide_edge`] is a per-call point lookup, never a
-//! reachability walk, so no graph shape can cause recursion or transitive
-//! authority accumulation in the gate.
+//! `(A, A, op)`. [`decide_edge`] is a point lookup, never a reachability walk, so no
+//! graph shape can accumulate authority transitively.
 
 use std::collections::HashMap;
 
@@ -246,10 +245,8 @@ impl EdgeTable {
     /// Mint and record a new edge, returning the bearer token the source
     /// presents. `nonce` is the destination's current launch nonce, so the edge
     /// fails closed across a restart.
-    // Skip: `HashMap::insert` can formally panic on capacity overflow,
-    // unreachable: one row per grant, each an Owner's request (rows are not
-    // bounded by live sessions — a wire grant mints one per call; resource
-    // hunt 2026-10-09, C1); the key's derived Hash/Eq is panic-free.
+    // Skip: `HashMap::insert` can formally panic on capacity overflow, unreachable at
+    // one row per owner-requested grant; the key's derived Hash/Eq is panic-free.
     // Audited-alloc class; verify-only.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn grant(
@@ -527,7 +524,6 @@ mod tests {
         let mut tbl = EdgeTable::new();
         let tok = tbl.grant(a.clone(), b.clone(), Op::WriteInput, nonce);
 
-        // Exact match permits.
         assert_eq!(
             decide_edge(&tbl, &tok, &b, Op::WriteInput, &nonce),
             EdgeDecision::Permit
@@ -604,8 +600,7 @@ mod tests {
         let mut got = tbl.edges();
         assert_eq!(got.len(), 2, "both granted edges enumerate");
         got.sort_by_key(|e| e.op.as_str());
-        // The triples are the granted (src, dst, op); an Edge carries only those
-        // fields, so no token is reachable through them.
+        // An Edge carries only (src, dst, op), so no token is reachable through it.
         assert_eq!(
             got[0],
             Edge {
@@ -623,7 +618,6 @@ mod tests {
             }
         );
 
-        // Revoking one drops it from the enumeration.
         let to_revoke = *tbl.rows.keys().next().expect("a token");
         tbl.revoke(&to_revoke);
         assert_eq!(tbl.edges().len(), 1, "revoked edge no longer enumerates");
@@ -701,7 +695,6 @@ mod tests {
         );
         assert!(decide_edge(&tbl, &t3, &b, Op::WriteInput, &nonce).is_permitted());
 
-        // A second sweep of the now-absent source removes nothing.
         assert_eq!(tbl.revoke_src(&a), 0);
         assert_eq!(tbl.len(), 1);
     }
@@ -766,14 +759,12 @@ mod tests {
     fn grant_connection_mints_exactly_the_kinds_ops() {
         let (a, b, nonce) = ids();
 
-        // Pull mints exactly the one read edge.
         let mut tbl = EdgeTable::new();
         let pulled = tbl.grant_connection(&a, &b, ConnectionKind::Pull, &nonce);
         assert_eq!(pulled.len(), 1);
         assert_eq!(pulled[0].0, Op::ReadScreen);
         assert_eq!(tbl.len(), 1, "one row per minted op, nothing extra");
 
-        // Both mints exactly the three human-fidelity ops.
         let mut tbl = EdgeTable::new();
         let both = tbl.grant_connection(&a, &b, ConnectionKind::Both, &nonce);
         let ops: Vec<Op> = both.iter().map(|(op, _)| *op).collect();
@@ -805,7 +796,6 @@ mod tests {
         let minted = tbl.grant_connection(&a, &b, ConnectionKind::Push, &nonce);
         assert_eq!(minted.len(), 2);
 
-        // Each minted token is a real, live edge: it authorizes its own op.
         for (op, tok) in &minted {
             assert!(decide_edge(&tbl, tok, &b, *op, &nonce).is_permitted());
         }

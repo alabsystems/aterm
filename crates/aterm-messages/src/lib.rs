@@ -150,7 +150,8 @@ pub(crate) const CAPSULE_GAP: usize = 1;
 /// Below this many cells the excerpt is dropped, never stubbed, unless its
 /// whole lead clause fits (`behind for 7 h`, `text::lead_clause`).
 pub(crate) const DETAIL_FLOOR: usize = 20;
-/// The title elides no further; capsules never drop.
+/// The cells a title elides to and no further, in whole words (its first
+/// word where none fits them); capsules never drop.
 pub(crate) const TITLE_MIN: usize = 12;
 /// The joint between a detail's pieces, the one every words builder writes;
 /// [`text::shape_detail`] sheds pieces at it.
@@ -163,9 +164,9 @@ pub(crate) const HOLD_INFO: Duration = Duration::from_secs(30);
 /// A Warn row's default hold.
 pub const HOLD_WARN: Duration = Duration::from_secs(45);
 /// An Error row's default hold — an error earns a longer read than a warning.
-pub(crate) const HOLD_ERROR: Duration = Duration::from_secs(60);
+pub(crate) const HOLD_ERROR: Duration = Duration::from_mins(1);
 /// A staged update that applies only on a press.
-pub const HOLD_STAGED_MANUAL: Duration = Duration::from_secs(60);
+pub const HOLD_STAGED_MANUAL: Duration = Duration::from_mins(1);
 /// A decision row's hold.
 pub const HOLD_ASK: Duration = Duration::from_mins(10);
 /// A route row after Open Settings: a terse restate of the question's row.
@@ -184,7 +185,7 @@ pub const STALE_HANDOFF: Duration = Duration::from_secs(125);
 /// Band hysteresis: grow now, shrink after this much quiet.
 pub const SHRINK_QUIET: Duration = Duration::from_millis(1500);
 /// A queued row folds unseen after `max(hold, this)`.
-pub(crate) const OVERFLOW_PATIENCE_MIN: Duration = Duration::from_secs(60);
+pub(crate) const OVERFLOW_PATIENCE_MIN: Duration = Duration::from_mins(1);
 
 // ---- Attention and motion --------------------------------------------------
 
@@ -198,7 +199,7 @@ pub const ANIM_FRAME: Duration = Duration::from_millis(33);
 /// edge and the crossing ends as its tail clears the right edge
 /// ([`COMET_PERMILLE`] more than the row). The next comet enters as this one
 /// leaves, so the row is never empty for longer than a frame.
-pub const COMET_PERIOD: Duration = Duration::from_millis(3000);
+pub const COMET_PERIOD: Duration = Duration::from_secs(3);
 /// The comet's length in permille of the row, soft leading edge included: a
 /// tail rising as the square of its length toward the hot head, then the
 /// leading edge falling to the track over [`COMET_LEAD_PERMILLE`]. A quarter
@@ -211,7 +212,7 @@ pub(crate) const COMET_LEAD_PERMILLE: u32 = 80;
 /// The comet's hot head, lifted toward the glint (0–255).
 pub(crate) const COMET_HEAD_LIFT: u8 = 150;
 /// The glint's cycle over a determinate bar: a travel, then rest.
-pub const GLINT_PERIOD: Duration = Duration::from_millis(4000);
+pub const GLINT_PERIOD: Duration = Duration::from_secs(4);
 /// The glint's travel along the fill; the rest of [`GLINT_PERIOD`] asks no frames.
 pub const GLINT_TRAVEL: Duration = Duration::from_millis(1600);
 /// The first glint, after the motion epoch.
@@ -317,7 +318,7 @@ pub const DONE_WORD: &str = "done";
 /// A wire progress row's staleness cap: an abandoned row fades (`Stale`, a
 /// Vanish echo) this long after its last line; a live script re-sends its line
 /// (an identical line costs nothing painted and re-arms the cap).
-pub(crate) const STALE_WIRE: Duration = Duration::from_secs(120);
+pub(crate) const STALE_WIRE: Duration = Duration::from_mins(2);
 /// The most wire rows live at once: the glass's [`MAX_ROWS`], overflow row
 /// included, so everything one script has in flight is on the glass. A
 /// restate or a same-key supersede does not count against it.
@@ -337,7 +338,7 @@ pub(crate) const WIRE_PRESSES_PER_WINDOW: usize = 10;
 /// aterm's own history out of the ring.
 pub(crate) const WIRE_LOG_SHARE: usize = 128;
 /// That window.
-pub(crate) const WIRE_MINT_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const WIRE_MINT_WINDOW: Duration = Duration::from_mins(1);
 /// The least gap between two paints a wire line causes: one motion frame.
 pub const WIRE_PAINT_GAP: Duration = ANIM_FRAME;
 /// The wire's key namespace: `notice` can only name a key under it, so it can

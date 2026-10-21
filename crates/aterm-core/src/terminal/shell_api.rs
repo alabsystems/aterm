@@ -2,16 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Shell integration API for [`Terminal`].
-//!
-//! Provides access to OSC 133 shell integration state:
-//! - [`Terminal::shell_state`] - current state machine state
-//! - [`Terminal::command_marks`] - completed command boundaries
-//! - [`Terminal::terminal_marks`] - user-set bookmarks
-//! - [`Terminal::annotations`] - Terminal-style inline annotations
-//!
-//! OSC 133 sequences are sent by shell integrations (bash, zsh, fish)
-//! to mark prompt, command, and output boundaries.
+//! Shell integration API for [`Terminal`]: OSC 133 state and command marks, OSC 1337 marks,
+//! annotations and cell pixel size, and the program's progress (OSC 9;4) and state
+//! (OSC 7501) reports.
 
 use super::TaskbarProgress;
 use super::shell::{ANNOTATIONS_MAX, TERMINAL_MARKS_MAX};
@@ -33,36 +26,25 @@ pub struct InputRegionStart {
 }
 
 impl Terminal {
-    // =========================================================================
-    // Shell integration (OSC 133)
-    // =========================================================================
+    // ---- Shell integration (OSC 133) ----
 
-    /// Get the current shell integration state.
-    ///
-    /// This reflects the state machine driven by OSC 133 sequences:
-    /// - `Ground`: Waiting for prompt (initial state)
-    /// - `ReceivingPrompt`: After OSC 133;A, prompt is being displayed
-    /// - `EnteringCommand`: After OSC 133;B, user is typing command
-    /// - `Executing`: After OSC 133;C, command is running
+    /// The OSC 133 shell-integration state: `Ground` (waiting for a prompt),
+    /// `ReceivingPrompt` (after `A`), `EnteringCommand` (after `B`), `Executing` (after `C`).
     #[must_use]
     pub fn shell_state(&self) -> ShellState {
         self.shell.state
     }
 
-    /// Get all completed command marks.
-    ///
-    /// Command marks track the boundaries of prompts, commands, and output
-    /// in the terminal. Each mark represents a completed command with its
-    /// prompt range, command range, output range, and exit code.
+    /// All completed command marks: each a command's prompt, command and output ranges and
+    /// exit code.
     #[must_use]
     pub fn command_marks(&self) -> &[CommandMark] {
         self.shell.command_marks.as_slices().0
     }
 
-    /// Monotonic count of completed commands (OSC 133;D). Strictly increases
-    /// once per completion — pair with [`Self::last_completed_command`] for an
-    /// unambiguous "a new command just finished" edge (same-millisecond
-    /// completions share an end timestamp but never a seq). Survives `reset`.
+    /// Monotonic count of completed commands (OSC 133;D). With
+    /// [`Self::last_completed_command`] it is an unambiguous "a command just finished" edge
+    /// (same-millisecond completions share an end time, never a seq). Survives `reset`.
     #[must_use]
     pub fn completed_command_seq(&self) -> u64 {
         self.shell.completed_seq
@@ -82,10 +64,9 @@ impl Terminal {
         self.shell.started_seq
     }
 
-    /// Which integration body the shell signs that it runs: the 16-hex address
-    /// of its script folder, from the last signed `633;P;AtermIntegration=`
-    /// mark or carried across a seamless update. `None` until one arrives
-    /// (scripts without a loader never send one).
+    /// Which integration body the shell signs that it runs: the 16-hex address of its
+    /// script folder, from the last signed `633;P;AtermIntegration=` mark or carried across
+    /// a seamless update. `None` until one arrives (scripts without a loader send none).
     #[must_use]
     pub fn shell_integration_rev(&self) -> Option<&str> {
         self.shell
@@ -217,15 +198,10 @@ impl Terminal {
             .find(|m| m.is_complete())
     }
 
-    // =========================================================================
-    // Terminal Extensions (OSC 1337)
-    // =========================================================================
+    // ---- Terminal extensions (OSC 1337, OSC 9;4, OSC 7501) ----
 
-    /// Get all terminal marks (OSC 1337 SetMark).
-    ///
-    /// Terminal marks are user/application-created navigation points,
-    /// allowing users to jump back to important locations in output.
-    /// Unlike command marks (OSC 133), these are explicitly set.
+    /// All terminal marks (OSC 1337 SetMark): navigation points an application or user set
+    /// explicitly, unlike OSC 133 command marks.
     #[must_use]
     pub fn terminal_marks(&self) -> &[TerminalMark] {
         self.marks_state.marks.as_slices().0
@@ -239,7 +215,6 @@ impl Terminal {
         let row = self.grid.visible_to_absolute(cursor.row);
         let mut mark = TerminalMark::new(id, row, cursor.col);
         mark.name = Some(name.to_string());
-        // FIFO eviction if at capacity
         if self.marks_state.marks.len() >= TERMINAL_MARKS_MAX {
             self.marks_state.marks.pop_front();
         }
@@ -248,10 +223,8 @@ impl Terminal {
         id
     }
 
-    /// Get all annotations (OSC 1337 AddAnnotation).
-    ///
-    /// Annotations are metadata/notes attached to specific regions of
-    /// terminal output. They can be visible or hidden.
+    /// All annotations (OSC 1337 AddAnnotation): notes attached to regions of output,
+    /// visible or hidden.
     #[must_use]
     pub fn annotations(&self) -> &[Annotation] {
         self.marks_state.annotations.as_slices().0
@@ -264,7 +237,6 @@ impl Terminal {
         self.marks_state.next_annotation_id += 1;
         let row = self.grid.visible_to_absolute(cursor.row);
         let annotation = Annotation::new(id, row, cursor.col, message.to_string());
-        // FIFO eviction if at capacity
         if self.marks_state.annotations.len() >= ANNOTATIONS_MAX {
             self.marks_state.annotations.pop_front();
         }
@@ -308,27 +280,18 @@ impl Terminal {
         }
     }
 
-    /// The cell pixel size used for inline-image footprint math (OSC 1337).
-    ///
-    /// Always a usable pair — the [`DEFAULT_CELL_PX`](super::grouped_state) 8×16
-    /// placeholder until a host reports. Use [`Self::host_cell_pixel_size`] when
-    /// the caller must not pass the placeholder off as a measurement.
+    /// The cell pixel size for inline-image footprint math (OSC 1337): always usable, the
+    /// [`DEFAULT_CELL_PX`](super::grouped_state) 8×16 placeholder until a host reports. Use
+    /// [`Self::host_cell_pixel_size`] where the placeholder must not pass for a measurement.
     #[must_use]
     pub fn cell_pixel_size(&self) -> (u16, u16) {
         self.iterm2.cell_px
     }
 
-    /// The cell pixel size a host actually reported, or `None` if none has.
-    ///
-    /// The engine cannot measure a glyph — only the frontend holding the
-    /// rasterizer can. So this is `None` for a headless engine, and for a live
-    /// session whose renderer has not published metrics yet. A zero on either
-    /// axis is treated as unreported too: it is not a cell box any font could
-    /// have, and reporting it would tell an application to divide by zero.
-    ///
-    /// Callers that answer a wire query must use this and stay silent on `None`
-    /// rather than fall back to [`Self::cell_pixel_size`]; see
-    /// `handler_window`'s XTWINOPS pixel reports.
+    /// The cell pixel size a host actually reported, or `None` if none has (always for a
+    /// headless engine: only the frontend holding the rasterizer can measure a glyph). A
+    /// zero on either axis is unreported too. A wire query answers from this and stays
+    /// silent on `None` (`handler_window`'s XTWINOPS pixel reports).
     #[must_use]
     pub fn host_cell_pixel_size(&self) -> Option<(u16, u16)> {
         self.iterm2.host_cell_px()
@@ -350,10 +313,10 @@ impl Terminal {
         self.taskbar_progress
     }
 
-    /// The program's own state report (OSC 7501): the last report it made and
-    /// the sequence that moves with each one, a `clear` and a full reset
-    /// included ([`super::program_state`]). A claim for display, never
-    /// evidence a decision rests on.
+    /// The program's own state report (OSC 7501, [`super::program_state`]): the report
+    /// standing, a sequence that moves with each report (a `clear` and a reset that
+    /// drops one included), and the count of turns the reports began. The program's
+    /// claim about itself, never evidence a typing decision rests on.
     ///
     /// # Example
     /// ```
@@ -375,16 +338,13 @@ impl Terminal {
 mod tests {
     use crate::terminal::Terminal;
 
-    /// `completed_command_seq` strictly increases once per OSC 133;D — two
-    /// commands completing within the same millisecond (indistinguishable by
-    /// `command_end_time_ms`) still read as two edges — and it survives a
-    /// terminal reset (a reset must never replay an old value to observers).
+    /// `completed_command_seq` rises once per OSC 133;D, even for two completions in one
+    /// millisecond, and survives a reset.
     #[test]
     fn completed_command_seq_is_strictly_per_completion() {
         let mut term = Terminal::new(6, 40);
         assert_eq!(term.completed_command_seq(), 0);
-        // Two full command cycles back-to-back in one `process` burst — the
-        // same wall-clock ms, the exact collapse case for timestamp keying.
+        // Two command cycles in one `process` burst: the same wall-clock millisecond.
         term.process(
             b"\x1b]133;A\x07$ a\x1b]133;B\x07\r\n\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07\
               \x1b]133;A\x07$ b\x1b]133;B\x07\r\n\x1b]133;C\x07no\r\n\x1b]133;D;1\x07",
@@ -419,8 +379,8 @@ mod tests {
         // A C with no B before it is refused by the gate.
         term.process(b"\x1b]133;A\x07\x1b]133;C\x07");
         assert_eq!(term.started_command_seq(), 1, "out of order: no start");
-        // `reset` at a prompt: its C counts, the RIS takes its block and the
-        // phase, so the shell's D is refused and no D is counted.
+        // `reset`: its C counts; the RIS takes its block and the phase, so the
+        // gate refuses the shell's D.
         term.process(prompt);
         term.process(b"reset\r\n\x1b]133;C\x07\x1bc\x1b]133;D;0\x07");
         assert_eq!(term.started_command_seq(), 2);

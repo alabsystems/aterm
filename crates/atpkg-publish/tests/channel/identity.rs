@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The index signer's identity checks (`identity::signer_for`): each common mistake is
-//! refused before anything is signed, naming the fix that works — the self-check's own
-//! refusal is deliberately opaque (§8: no verification oracle).
+//! refused before anything is signed, naming the fix; the self-check's own refusal stays
+//! opaque (no verification oracle).
 
 use std::sync::Arc;
 
@@ -25,8 +25,7 @@ fn a_rostered_machine_signs_as_itself() {
 }
 
 /// A listed entry past its `not_after` signs what every client refuses: refused, and
-/// revocation still outranks it (a producer bug that leaves an id both listed and
-/// revoked is read as revoked).
+/// revocation outranks it (an id both listed and revoked is read as revoked).
 #[test]
 fn an_expired_or_revoked_entry_is_refused_even_while_listed() {
     let tmp = scratch("id-expired");

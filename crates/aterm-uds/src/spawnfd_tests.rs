@@ -2,10 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! `spawnfd`'s tests. The ones that must own the descriptor table — a source on
-//! 3 or 4, an unflagged descriptor above the old 65 536 cap, a thread racing the
-//! spawn — run in a fresh exec of this test binary (a STAGED child), started
-//! through the module's own strip, so its table holds stdio and nothing else and
-//! what it stages leaks into no sibling test's child.
+//! 3 or 4, an unflagged descriptor above 65,536, a thread racing the spawn — run
+//! in a fresh exec of this test binary (a staged child), started through the
+//! module's own strip, so its table holds stdio and nothing else and what it
+//! stages leaks into no sibling test's child.
 
 use super::*;
 use crate::host::could_not_run;
@@ -99,14 +99,12 @@ fn round_trip_probe(
 }
 
 /// The numbers a stage that must find them free is started with held: 3 and 4,
-/// where the lanes land, and 5 to 8, where `std`'s exec-status pipe would. A
-/// fresh exec does not leave them free everywhere. What a binary translator
-/// opens at the exec takes the lowest free numbers: Rosetta holds the binary it
-/// translates (binfmt_misc's `O` flag hands it over), itself, and two AOT cache
-/// files, measured on 3, 4, 6 and 7 in every process it runs (2026-10-17). So
-/// [`run_staged_held`]'s launcher holds these across the exec, whatever the
-/// translator opens lands above them, and the staged child frees exactly these
-/// ([`release_held`]) before it stages.
+/// where the lanes land, and 5 to 8, where `std`'s exec-status pipe would.
+/// What a binary translator opens at the exec takes the lowest free numbers:
+/// Rosetta holds the binary it translates (`binfmt_misc`'s `O` flag hands it
+/// over), itself, and two AOT cache files on 3, 4, 6, and 7. [`run_staged_held`]'s
+/// launcher holds these across the exec so whatever the translator opens lands
+/// above them, and the staged child frees them ([`release_held`]) before staging.
 const HELD: std::ops::RangeInclusive<RawFd> = 3..=8;
 
 /// Present in a staged child's environment when its launcher holds [`HELD`].
@@ -117,6 +115,19 @@ const HELD_ENV: &str = "ATERM_UDS_SPAWNFD_HELD";
 pub(super) fn run_staged(test: &str, stage: &str) -> String {
     let mut launch = std::process::Command::new(std::env::current_exe().expect("the test binary"));
     launch.args(["--exact", test, "--nocapture", "--test-threads=1"]);
+    launch_staged(launch, stage)
+}
+
+/// [`run_staged`] with `SIGHUP` ignored across the exec, as `nohup` (or any
+/// launcher that ignores it) leaves a test run: a stage whose cases need a
+/// signal's default disposition must set it, never inherit it.
+pub(super) fn run_staged_hup_ignored(test: &str, stage: &str) -> String {
+    let mut launch = std::process::Command::new("/bin/sh");
+    launch
+        .arg("-c")
+        .arg("trap '' HUP; exec \"$0\" \"$@\"")
+        .arg(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", test, "--nocapture", "--test-threads=1"]);
     launch_staged(launch, stage)
 }
 
@@ -230,7 +241,7 @@ fn place(fd: OwnedFd, number: RawFd) -> OwnedFd {
 
 /// An unflagged duplicate of `/dev/null` at the lowest free number at or above
 /// `floor`: the stand-in for a descriptor a framework opened without
-/// close-on-exec (Metal's shader cache, measured 2026-09-27).
+/// close-on-exec (such as Metal's shader cache).
 pub(super) fn unflagged_at_or_above(floor: RawFd) -> OwnedFd {
     const F_DUPFD: i32 = 0;
     let file = std::fs::File::open("/dev/null").expect("open /dev/null");
@@ -295,10 +306,9 @@ pub(super) fn raise_soft_limit(want: u64) -> u64 {
 // The lanes, end to end
 // ---------------------------------------------------------------------------
 
-/// **THE LANE CHILD INHERITS ITS TWO LANES AND NOTHING ELSE ABOVE STDIO.** An
+/// The lane child inherits its two lanes and nothing else above stdio. An
 /// unflagged descriptor of this process (from 64 up) must not reach it, while
-/// fds 3 and 4 still round-trip. (In process: the stand-in lives for the one
-/// spawn; the staged tests below own the cases that need the whole table.)
+/// fds 3 and 4 still round-trip.
 #[test]
 fn the_two_fd_child_inherits_nothing_but_its_two_lanes() {
     let held = unflagged_at_or_above(64);
@@ -376,12 +386,10 @@ fn staged_placement(which: &str) {
     println!("STAGED {which} ok");
 }
 
-/// **EVERY SOURCE REACHES ITS NUMBER, WHEREVER IT STARTED.** A source on its own
-/// target (3, or 4), the two sources on each other's targets, and sources at
-/// 10 240 and 20 000 (where Darwin's libc refuses a file action; 20 000 or the
-/// host's highest number) — each in a fresh table where those numbers are
-/// exactly where the staging put them (held across the exec, [`HELD`]). A host
-/// that cannot hand out a number above 10 240 skips the high stage, saying so.
+/// Every source reaches its number, wherever it started: on its own target (3 or
+/// 4), on each other's targets, and at 10,240 and 20,000 (where Darwin's libc
+/// refuses a file action) — each in a fresh table where those numbers are
+/// held across the exec ([`HELD`]).
 #[test]
 fn every_lane_source_reaches_its_number_wherever_it_started() {
     const NAME: &str = "spawnfd::tests::every_lane_source_reaches_its_number_wherever_it_started";
@@ -488,8 +496,8 @@ fn staged_exec_failure() {
     println!("STAGED exec-failure ok");
 }
 
-/// **A FAILED EXEC IS AN ERROR, NEVER A CHILD** — with the numbers a status
-/// pipe would take free, the one layout where the old `pre_exec` lost it.
+/// A failed exec is an error, never a child — with the numbers a status pipe
+/// would take free, where a `pre_exec` `dup2` onto 3 and 4 would clobber it.
 #[test]
 fn a_failed_exec_is_an_error_never_a_child() {
     const NAME: &str = "spawnfd::tests::a_failed_exec_is_an_error_never_a_child";
@@ -562,10 +570,9 @@ fn a_bare_name_is_searched_on_the_childs_path_and_the_environment_is_exact() {
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
 }
 
-/// A key named twice is set ONCE, to its last value — what the `PATH` search
-/// used and what the child's block holds agree. (Before: the search took the
-/// last `PATH` while the child's `getenv` read the first, and the block carried
-/// both.) `env`, found on that `PATH`, prints the block exactly as it got it.
+/// A key named twice is set once, to its last value — what the `PATH` search
+/// used and what the child's block holds agree. `env`, found on that `PATH`,
+/// prints the block as it got it.
 #[test]
 fn a_key_named_twice_is_its_last_value_for_the_search_and_the_child_alike() {
     let (mut out, child_out) = UnixStream::pair().expect("socketpair");
@@ -671,19 +678,19 @@ fn a_helper_spawned_without_lanes_holds_its_stdio_and_nothing_else() {
 }
 
 // ---------------------------------------------------------------------------
-// Above the old cap, and racing the spawn
+// Above 65,536, and racing the spawn
 // ---------------------------------------------------------------------------
 
-/// The old strip's ceiling: the soft limit, capped at 65 536.
+/// A 65,536 ceiling below Darwin's `kern.maxfilesperproc`.
 const OLD_CAP: RawFd = 65_536;
 
-/// Free numbers kept between an above-the-cap stand-in and the host's maximum.
+/// Free numbers kept between a high stand-in and the host's maximum.
 const HEADROOM: RawFd = 8;
 
-/// The number the above-the-cap stand-ins sit at: 70 000 (past the old cap,
-/// below 92 160, one Mac's `kern.maxfilesperproc`), or just under this host's
+/// The number the high stand-ins sit at: 70,000 (above [`OLD_CAP`], below
+/// 92,160, one Mac's `kern.maxfilesperproc`), or just under this host's
 /// maximum when that is lower. `None` when the host hands out no number above
-/// the old cap — no such descriptor can exist there, so none can leak.
+/// [`OLD_CAP`].
 fn above_old_cap() -> Option<RawFd> {
     let fd = 70_000.min(descriptor_bound().saturating_sub(HEADROOM));
     (fd > OLD_CAP).then_some(fd)
@@ -754,12 +761,9 @@ fn staged_above_old_cap() {
     println!("STAGED above-old-cap ok fd={fd}");
 }
 
-/// **AN UNFLAGGED DESCRIPTOR ABOVE 65 536 REACHES NEITHER CHILD.** The old strip
-/// stopped at 65 536 while Darwin allocates up to `kern.maxfilesperproc`; a
-/// stand-in at 70 000 rode every bridge launch. Staged: it must reach a leaky
-/// spawn (the control) and neither the lane spawn nor an [`InheritStrip`]ped
-/// one. A host whose maximum leaves no number above the old cap skips, saying
-/// so ([`above_old_cap`]).
+/// An unflagged descriptor above 65,536 reaches neither child. Darwin allocates
+/// up to `kern.maxfilesperproc`; a stand-in at 70,000 must reach a leaky spawn
+/// (the control) and neither the lane spawn nor an [`InheritStrip`]ped one.
 #[test]
 fn an_unflagged_descriptor_above_the_old_cap_reaches_no_child() {
     const NAME: &str = "spawnfd::tests::an_unflagged_descriptor_above_the_old_cap_reaches_no_child";
@@ -779,15 +783,12 @@ fn an_unflagged_descriptor_above_the_old_cap_reaches_no_child() {
 const RACE_SPAWNS: usize = 500;
 const RACE_CONTROL_SPAWNS: usize = 100;
 
-/// The numbers the racing thread opens unflagged: the low range (where a
-/// ceiling read under a lowered soft limit stops short) and one above the old
-/// cap.
+/// The low descriptor number the racing thread opens unflagged.
 const RACE_LOW: RawFd = 2000;
 
-/// THE RACER: lower the soft limit, raise it, open unflagged descriptors at
-/// [`RACE_LOW`] and at `high` (an [`above_old_cap`] number, when staged), hold
-/// them a moment, close them — until `stop`. Each turn is the window the old
-/// ceiling read before the fork could fall into.
+/// Lower the soft limit, raise it, open unflagged descriptors at [`RACE_LOW`]
+/// and `high` (an [`above_old_cap`] number, when staged), hold them briefly,
+/// and close them until `stop`.
 fn race(stop: &std::sync::atomic::AtomicBool, high_soft: u64, high: Option<RawFd>) {
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
@@ -884,12 +885,9 @@ fn staged_race() {
     assert_eq!(lost_lane, 0, "a lane child lacked fd 3 or 4: {tally:?}");
 }
 
-/// **ZERO LEAKS UNDER A RACING THREAD, OVER 500 SPAWNS.** A thread lowers and
-/// raises the soft limit and opens unflagged descriptors (at 2000, and above
-/// the old cap) while this one spawns — the window the old parent-side ceiling
-/// read could fall into (measured on the old code: see the commit). A leaky
-/// spawn under the same race is the control. A host unable to stage both
-/// ranges ends COULD NOT RUN before the racer starts.
+/// Zero leaks under a racing thread over 500 spawns. A thread lowers and raises
+/// the soft limit and opens unflagged descriptors (at 2000 and above 65,536)
+/// while this one spawns. A leaky spawn under the same race is the control.
 #[test]
 fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
     const NAME: &str =
@@ -907,7 +905,7 @@ fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
 // The strip and its bound
 // ---------------------------------------------------------------------------
 
-/// **A STRIPPED CHILD INHERITS NOTHING ABOVE STDIO.** A descriptor this process
+/// A stripped child inherits nothing above stdio. A descriptor this process
 /// holds without close-on-exec rides a leaky spawn (the control) and not a
 /// fork that runs the strip, while the child's stdio still arrives.
 #[test]
@@ -954,9 +952,9 @@ fn the_descriptor_bound_is_the_kernels_per_process_maximum() {
 /// table that fits one listing is vouched for whole — an unflagged descriptor
 /// is flagged with no number probed — and one that overflows it is vouched for
 /// up to its last entry, the rest left to the loop, which reaches the table's
-/// end and no further (not `kern.maxfilesperproc`: a spawn with 2 100
-/// descriptors open cost 10–13 ms probing that far, review of 2026-10-01) and
-/// still keeps a descriptor beyond the listing out of a stripped child.
+/// end and no further (not `kern.maxfilesperproc`: a spawn with 2,100
+/// descriptors open costs 10–13 ms probing that far) and still keeps a
+/// descriptor beyond the listing out of a stripped child.
 #[cfg(target_vendor = "apple")]
 fn staged_listing() {
     let bound = descriptor_bound();
@@ -1007,9 +1005,9 @@ fn staged_listing() {
     );
 }
 
-/// **THE DARWIN STRIP LISTS THE TABLE.** One `PROC_PIDLISTFDS` vouches for a
-/// table that fits it — the strip that cost ~8 ms per shell spawn as a loop to
-/// `kern.maxfilesperproc` — and a table past one listing still leaks nothing.
+/// One `PROC_PIDLISTFDS` vouches for a table that fits it — avoiding an ~8 ms
+/// per-spawn loop to `kern.maxfilesperproc` — and a table past one listing
+/// still leaks nothing.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_darwin_strip_lists_the_table_and_probes_only_past_a_full_listing() {
@@ -1090,15 +1088,11 @@ fn staged_libnotify_gate(stage: &str) {
     println!("STAGED {stage} ok");
 }
 
-/// **A PREPARED FORK CANNOT CATCH libnotify's GATE HALF TAKEN.** In a fresh
-/// process (a staged child), where nothing has touched libnotify,
+/// In a fresh process (a staged child), where nothing has touched libnotify,
 /// [`InheritStrip::prepare`] leaves its once-gate passed, so a fork after it
-/// finds libnotify's globals built whatever another thread is calling — the
-/// gate whose half-taken state killed forked children in aterm-pty's test
-/// process ([`pass_libnotify_gate`]). The race itself is microseconds wide and
-/// cannot be scheduled from a test, so the gate's own word is what is read,
-/// with a calibration stage showing that the word is libnotify's and that only
-/// the libnotify call in `prepare` moves it.
+/// finds libnotify's globals built whatever another thread is calling
+/// ([`pass_libnotify_gate`]). A calibration stage verifies that slot 0 is
+/// libnotify's gate and that only `pass_libnotify_gate` moves it.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn preparing_a_fork_passes_the_libnotify_gate() {
@@ -1141,15 +1135,11 @@ fn adoption_takes_an_exclusively_owned_inherited_socket() {
 #[cfg(target_vendor = "apple")]
 const CONTENDED: RawFd = 1500;
 
-/// **AN OPEN SOCKET IS ADOPTED WHILE ANOTHER THREAD LOOKS ITS NUMBER UP.** The bridge's
-/// adoption of its lanes once read them by `/dev/fd` path, which on Darwin answers `EBADF`
-/// for an open descriptor when another lookup of the same number lands mid-call
-/// ([`descriptor_metadata`]): `aterm link serve` refused the lane it was handed whenever
-/// anything else looked up `/dev/fd/3` at that instant. Each round makes an inheritable
-/// socket at one number and adopts it while another thread looks that number up
-/// ([`test_support::racing_lookups`], whose path `stat`s failing are the negative control);
-/// every adoption must take its socket. On the path-reading adoption, 50 of 50 runs here
-/// were refused (`descriptor 1500 is not open (Bad file descriptor)`).
+/// Adopting an inherited socket succeeds while another thread looks its number
+/// up on `/dev/fd` (which on Darwin causes a `/dev/fd` path lookup of the same
+/// number to fail with `EBADF`; see [`descriptor_metadata`]). Each round makes
+/// an inheritable socket at [`CONTENDED`] and adopts it under
+/// [`test_support::racing_lookups`].
 #[cfg(target_vendor = "apple")]
 #[test]
 fn an_inherited_socket_is_adopted_while_its_number_is_looked_up_elsewhere() {
@@ -1190,18 +1180,10 @@ fn an_inherited_socket_is_adopted_while_its_number_is_looked_up_elsewhere() {
 #[cfg(target_vendor = "apple")]
 const SHELL_PROBED: [RawFd; 2] = [7, 1700];
 
-/// **THE SHELL PROBE READS A CONTENDED NUMBER EXACTLY.** [`crate::host::sh_held_any`] is
-/// every crate's shell read of what a child holds. A path lookup in its place
-/// (`[ -e /dev/fd/N ]`) reads a held descriptor as absent while another process or thread
-/// looks the number up ([`descriptor_metadata`] has Darwin's reasons), which failed tests
-/// that expected a descriptor held and passed tests whose descriptor had leaked. Staged, so
-/// the numbers are this test's alone: each round a shell holding [`SHELL_PROBED`]'s number,
-/// and not the one above it, reads both 50 times, while another thread looks the held
-/// number up ([`test_support::racing_lookups`], whose path `stat`s failing are the
-/// negative control); every read must be right. Measured 2026-10-20 with
-/// `[ -e /dev/fd/N ]` as the probe: 20 of 20 runs failed at fd 7, most of their shells
-/// misreading it, and 20 of 20 at fd 1700 with that probe for the listed numbers alone;
-/// with this probe, 0 of 20.
+/// [`crate::host::sh_held_any`] reads a contended descriptor number accurately
+/// while another thread looks the held number up on `/dev/fd`
+/// ([`test_support::racing_lookups`]; see [`descriptor_metadata`] for why
+/// `[ -e /dev/fd/N ]` misreads under contention).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_shell_probe_reads_a_contended_number_exactly() {
@@ -1273,14 +1255,11 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// **A DESCRIPTOR GUARDED AGAINST COPIES IS READ, NEVER COPIED.** Darwin kills a process
-/// that duplicates a descriptor guarded with `GUARD_DUP` (`EXC_GUARD`: SIGKILL, measured),
-/// and a guard is always the process's own (guarding forces close-on-exec), set by
-/// whatever opened it, a system library among them. [`descriptor_metadata`] once read
-/// through a copy, so the lifeline sweep, which reads every number the process holds, and
-/// the bridge's lane adoption killed a process holding one. Staged, so a kill is the
-/// stage's failure: with a socket guarded against copies and closing held, the adoption
-/// refuses it untouched (close-on-exec) and the sweep closes exactly the lifeline's copy.
+/// Darwin kills a process that duplicates a descriptor guarded with `GUARD_DUP`
+/// (`EXC_GUARD`: `SIGKILL`), and a guard forces close-on-exec. Staged so a kill
+/// is the stage's failure: with a socket guarded against copies and closing
+/// held, adoption refuses it untouched (close-on-exec) and the lifeline sweep
+/// closes only the lifeline's copy without duplicating the guarded descriptor.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_descriptor_guarded_against_copies_is_read_never_copied() {
@@ -1335,12 +1314,11 @@ fn staged_guarded() {
     println!("STAGED guarded ok");
 }
 
-/// THE LANE SPAWN TRIES A PROGRAM STILL OPEN FOR WRITING AGAIN, as [`Command`] does
-/// (2026-10-18): Linux refuses the exec (`ETXTBSY`) while anything holds the file open for
-/// writing, the lane arm's child reports that on its status pipe, and the spawn pauses and
-/// tries again, here the moment this test's writer lets go. A writer that stays is still
-/// refused once the window has passed. NEGATIVE CONTROL: the lane arm with one try was
-/// refused, `Text file busy`, in the first assertion.
+/// The lane spawn retries a program still open for writing, as [`Command`]
+/// does: Linux refuses the exec (`ETXTBSY`) while anything holds the file open
+/// for writing, the lane arm's child reports that on its status pipe, and the
+/// spawn pauses and retries once the writer lets go. A writer that stays is
+/// refused once the retry window passes.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_lane_spawn_refused_as_text_busy_starts_once_the_writer_lets_go() {

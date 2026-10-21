@@ -27,9 +27,7 @@
 //! screen alone (`reason=no-archive`).
 //!
 //! Every report is read in Claude Code's grammar: aterm reads no Codex
-//! screen (its Codex screen lane, which read a Codex worker's report in
-//! Codex's grammar and from the main screen's scrollback, was retired on
-//! 2026-10-16), and a worker on the main screen gets `reason=main-screen`.
+//! screen, and a worker on the main screen gets `reason=main-screen`.
 
 use std::fmt;
 

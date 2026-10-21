@@ -1,32 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared cursor-trail path primitives: the cell sweeps every trail engine
-//! (fire, rainbow kitty, phaser, comet, ...) lays its wake with, so continuity
-//! is solved once while each style keeps its own tuning.
+//! Shared cursor-trail path primitives: the cell sweeps trail engines (fire,
+//! rainbow kitty, phaser, comet, ...) lay their wakes with, so continuity is
+//! solved once while each style keeps its own tuning.
 //!
-//! ## Continuity contract
-//!
-//! Every primitive returns a path whose consecutive cells are
-//! Chebyshev-adjacent (no step larger than 1 in either axis), so a trail laid
-//! along it has no interior hole. The tests pin this for every primitive.
-//!
-//! ## Why trails get gaps
-//!
-//! Engines observe the cursor once per frame, so fast typing, key-repeat or a
-//! batching PTY can move it several cells between observations, and ConPTY
-//! hides the cursor during each echo repaint. A gapless trail (a) sweeps the
-//! full vector of every observed move, (b) renders real jumps as one
-//! pixel-space streak, and (c) bridges the OS hide window
-//! ([`crate::cursor_trail::HIDE_BRIDGE_MS`]). These primitives cover (a) plus
-//! wrap/coalesce:
+//! Consecutive cells of every path are Chebyshev-adjacent (no step larger than
+//! 1 in either axis; the wrap fold's seam is the one designed exception), so a
+//! trail laid along it has no interior hole. Engines observe the cursor once
+//! per frame, so fast typing, key-repeat or a batching PTY can move it several
+//! cells between observations (and ConPTY hides the cursor during each echo
+//! repaint, bridged by [`crate::cursor_trail::HIDE_BRIDGE_MS`]).
 //!
 //! * [`line_cells_tail`]: the bounded Bresenham sweep (tail->head), identical
 //!   to the forward walk and O(limit) whatever the jump distance.
-//! * `row_sweep_cells`: the same-row typed-coalesce sweep, the cells a batched
-//!   echo skipped between two observations.
-//! * `wrap_fold_cells`: the typewriter fold; a typing wrap finishes the old row
-//!   and continues from the new row's start instead of sweeping a diagonal.
+//! * `row_sweep_cells` and `wrap_fold_cells` (test-only): the same-row
+//!   typed-coalesce and typewriter-fold laws the engines' sweeps follow.
+//! * [`physical_margin_fold`]: the exact margin-fold move shape for a pane.
 
 /// Walk the straight cell-line from `origin` toward `destination` and return
 /// (in `out`) the up-to-`limit` cells nearest the destination, ordered
@@ -53,7 +43,38 @@ pub fn line_cells_tail(
     // 0..=major. Keep the nearest suffix without materialising its prefix.
     let available = major + i64::from(include_destination);
     let keep = available.min(i64::try_from(limit).unwrap_or(i64::MAX));
+    if keep <= 0 {
+        return;
+    }
+    out.reserve(keep as usize);
     let start = available - keep;
+    if dr == 0 {
+        let sc = if origin.1 < destination.1 {
+            1i64
+        } else {
+            -1i64
+        };
+        let r = origin.0;
+        let c0 = i64::from(origin.1);
+        for k in start..available {
+            let c_steps = if major == 0 { 0 } else { k };
+            out.push((r, (c0 + sc * c_steps) as i32));
+        }
+        return;
+    }
+    if dc == 0 {
+        let sr = if origin.0 < destination.0 {
+            1i64
+        } else {
+            -1i64
+        };
+        let r0 = i64::from(origin.0);
+        let c = origin.1;
+        for k in start..available {
+            out.push(((r0 + sr * k) as i32, c));
+        }
+        return;
+    }
     let sr = if origin.0 < destination.0 {
         1i128
     } else {
@@ -68,9 +89,7 @@ pub fn line_cells_tail(
 
     for k in start..available {
         let k = i128::from(k);
-        let (r_steps, c_steps) = if major == 0 {
-            (0, 0)
-        } else if dc >= dr {
+        let (r_steps, c_steps) = if dc >= dr {
             ((k * i128::from(dr) + bias) / i128::from(major), k)
         } else {
             (k, (k * i128::from(dc) + bias) / i128::from(major))
@@ -95,13 +114,12 @@ pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_co
     }
 }
 
-/// The typewriter fold for a typing wrap: finish the old row from the origin
-/// to the right edge, then continue from the new row's left edge to the
-/// landing cell, instead of sweeping a diagonal across unvisited cells or
-/// leaving the rows disjoint. `prev` must be at/near the right edge and `cur`
-/// at/near the new row's start (the caller classified the wrap shape); `cols`
-/// is the grid width. Ordered tail->head, origin excluded, destination
-/// included.
+/// The typewriter fold for a typing wrap: finish the old row from the origin to
+/// the right edge, then continue from the new row's left edge to the landing
+/// cell, instead of sweeping a diagonal across unvisited cells. `prev` is
+/// at/near the right edge and `cur` at/near the new row's start (the caller
+/// classified the wrap); `cols` is the grid width. Ordered tail->head, origin
+/// excluded, destination included.
 #[cfg(test)]
 pub fn wrap_fold_cells(out: &mut Vec<(i32, i32)>, prev: (i32, i32), cur: (i32, i32), cols: i32) {
     wrap_fold_cells_in_pane(out, prev, cur, 0, cols);
@@ -224,9 +242,8 @@ mod tests {
         }
     }
 
-    /// wrap_fold_cells: the old row is finished, the new row is started, the
-    /// only non-adjacent step is the fold seam itself, and both segments are
-    /// internally gap-free.
+    /// wrap_fold_cells: finishes the old row, starts the new one; the only
+    /// non-adjacent step is the fold seam.
     #[test]
     fn wrap_fold_finishes_old_row_and_starts_new() {
         let mut out = Vec::new();

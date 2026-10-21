@@ -4,38 +4,24 @@
 //! Tier-1 conformance of the SHIPPING authorization gate to
 //! `aterm_models_session::authorize_soundness_model` (`AuthorizeSoundness`).
 //!
-//! The model states the trust core's central predicate as a four-guard
-//! conjunction — the presented token is in the table (`token`), its row's
-//! destination is the resolved target (`dst`), its row's op is the op the verb
-//! needs (`op`), and its row's launch nonce is the target's current one
-//! (`nonce`) — and proves `PermitImpliesAllGuards`: a permit (`decided = 2`)
-//! implies every guard held. Its `Buggy = 1` member WAIVES the `dst` conjunct,
-//! the confused-deputy escalation where a token minted for one session
-//! authorizes a different one.
+//! The model's predicate is a four-guard conjunction: the token is in the table
+//! (`token`), its row's destination is the target (`dst`), its op is the verb's
+//! (`op`), and its launch nonce is the target's current one (`nonce`).
+//! `PermitImpliesAllGuards` says a permit (`decided = 2`) implies every guard held;
+//! the `Buggy = 1` member waives `dst`, the confused deputy where a token minted for
+//! one session authorizes another.
 //!
-//! This test is what makes that a property of the code rather than of the
-//! description. It drives the REAL `decide_edge` over all sixteen guard
-//! combinations, and `EdgeTable::authorize` — the connect-time form of the same
-//! predicate — over the eight its inputs reach. `authorize` takes no op: it
-//! RETURNS the op the token carries, and its shipping callers compare it to
-//! nothing — the control server's connect-time auth discards it (per-request
-//! `decide_edge` re-derives it) and `whoami` only reports it. So for that gate
-//! the `op` guard is not applicable and is projected as held. Each call is
-//! projected onto the model: the guards are
-//! whether each conjunct holds for the grant the presentation claims (a fresh
-//! token stands in for a forgery of it), and `decided` is the real verdict.
-//! Every real `Present`/`Authorize` step must be a transition the committed
-//! model admits (interpreter always, `ty trace validate` wherever installed,
-//! with the two tiers required to agree).
+//! The real `decide_edge` runs over all sixteen guard combinations, and
+//! `EdgeTable::authorize` (the connect-time form) over the eight its inputs reach: it
+//! returns the token's op rather than taking one, and its callers do not compare it
+//! (per-request `decide_edge` re-derives it), so its `op` guard is projected as held.
+//! Each call is projected onto the model (a fresh token stands in for a forgery), and
+//! every real `Present`/`Authorize` step must be a transition the model admits
+//! (interpreter always, `ty trace validate` where installed, the tiers agreeing).
 //!
-//! NEGATIVE CONTROL. The same real transitions are replayed against the
-//! `Buggy = 1` model, which must REJECT the wrong-destination presentation the
-//! real gate denies and the mutant permits — so a pass is never vacuous. That
-//! replay judges transitions only: a gate that permits the wrong destination
-//! is then ADMITTED by the mutant, and the control fails. Delete
-//! `e.dst == *dst` from `decide_edge` and both tests fail: the conformance on
-//! the permit the committed model rejects, the control on the mutant it now
-//! matches.
+//! Negative control: the same transitions replayed against the `Buggy = 1` model must
+//! be rejected at the wrong-destination presentation the real gate denies and the
+//! mutant permits. Deleting `e.dst == *dst` from `decide_edge` fails both tests.
 
 use std::collections::BTreeMap;
 
@@ -151,11 +137,11 @@ const GATES: [Gate; 2] = [
     },
 ];
 
-/// Whether `model` admits the real two-step trace Init -Present-> presented
-/// -Authorize-> decided for every presentation through `gate`, naming the first
-/// it rejects; on success, every decided state. Transitions only: the invariant
-/// is the conforming test's to check, so a mutant replay parts from the real
-/// gate on a TRANSITION or not at all.
+/// Whether `model` admits the real trace Init -Present-> presented -Authorize->
+/// decided for every presentation through `gate`, naming the first it rejects; on
+/// success, every decided state. Transitions only: the invariant is the conforming
+/// test's to check, so a mutant replay parts from the real gate on a transition or
+/// not at all.
 fn replay(model: &Model, gate: &Gate) -> Result<Vec<State>, String> {
     let label = format!("{}({})", model.name, gate.name);
     let init = model.init_state();

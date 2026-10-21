@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Serialization: `serde::Serializer` onto the document model.
+//! Serialization: a `serde::Serializer` that builds an [`crate::edit::Item`] tree and hands
+//! it to the encoder that prints a parsed document, so TOML syntax is produced in one place
+//! and values print before sub-tables (a value after a header would land in that table).
 //!
 //! The serializer does not write text. It BUILDS an [`crate::edit::Item`] tree
 //! and hands it to the same encoder that prints a parsed document, which buys
@@ -107,10 +109,9 @@ pub(crate) fn value_to_item(value: &crate::Value) -> Result<Item> {
     })
 }
 
-/// Decide whether a sequence is an ARRAY OF TABLES (`[[key]]`) or a plain
-/// array. A sequence whose every element is a table gets the header spelling,
-/// which is what makes `Vec<Struct>` read back as it was written; anything
-/// mixed or scalar becomes a bracketed array with the tables inlined.
+/// Decide whether a sequence is an array of tables (`[[key]]`) or a plain array. A
+/// non-empty sequence of tables gets the header spelling, so `Vec<Struct>` reads back as
+/// written; anything mixed or scalar becomes a bracketed array with the tables inlined.
 fn seq_to_item(items: Vec<Item>) -> Result<Item> {
     if !items.is_empty() && items.iter().all(Item::is_table) {
         let mut array = ArrayOfTables::new();

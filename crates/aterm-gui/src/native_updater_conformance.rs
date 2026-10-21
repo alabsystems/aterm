@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the process-global native updater reducer.
-//!
-//! The trace is emitted by the genuine service while it accepts a worker result
-//! and an apply preflight. The test projects those scalar states onto the
-//! `NativeUpdater` model independently; it does not reconstruct an expected state
-//! from the action definition.
+//! Tier-1 conformance for the native updater: the shipping service, predicates and `App`
+//! arcs, each bound to its `aterm_spec::derive` model. Each test projects shipping state onto
+//! the model independently; none reconstructs an expected state from the action definition.
 
 #![cfg(test)]
 
@@ -142,8 +139,8 @@ fn real_updater_service_conforms_for_single_flight_stage_defer_and_safe_apply() 
     assert_eq!(service.model_state(), running);
     assert!(service.last_transitions().is_empty());
 
-    // The shipping updater API performs check+download+verify+stage in one worker. The
-    // genuine reducer exposes the three logical transitions as one atomic completion.
+    // The updater API checks, downloads, verifies and stages in one worker; the reducer
+    // exposes the three model transitions as one atomic completion.
     assert_eq!(
         service.finish_check(check, status(Some(11), 0)),
         CheckCompletion::Reduced
@@ -216,8 +213,8 @@ fn real_service_retries_and_drops_a_stale_stage_completion() {
     );
     assert_last_batch(&model, &service);
 
-    // Independent stale-stage negative control: an old artifact generation marked staged
-    // violates the named invariant, proving the conformance assertion is non-vacuous.
+    // Negative control: an old artifact generation marked staged violates
+    // `CurrentStagedArtifact`, so the conformance assertion is not vacuous.
     let current = project(&model, service.model_state());
     let mut stale = current.clone();
     stale.insert("artifact_generation", current["request_generation"] - 1);
@@ -445,11 +442,9 @@ fn admission_before(model: &Model, facts: AdmissionFacts) -> State {
     if facts.live_ptys > 0 || facts.foreground_jobs > 0 {
         state = model.successors("ObserveForegroundJob", &state)[0].clone();
     }
-    // `unknown_foregrounds` is not a native-state fact: it says whether a
-    // destructive replacement (the cold lane only) would hang up a running
-    // job. It enters the model through `ObserveForegroundJob` (fired whenever
-    // `live_ptys > 0`; the matrix never generates `unknown_foregrounds >
-    // live_ptys`).
+    // `unknown_foregrounds` matters only to the cold lane; it enters the model through
+    // `ObserveForegroundJob` (fired whenever `live_ptys > 0`; the matrix never has
+    // `unknown_foregrounds > live_ptys`).
     if !facts.native_state_certified {
         state = model.successors("ObserveUnsafeNativeState", &state)[0].clone();
     }
@@ -494,10 +489,9 @@ fn admission_action(decision: AdmissionDecision) -> &'static str {
         AdmissionDecision::Block(AdmissionBlock::NativeStateUncertified) => {
             "BlockUnsafeNativeState"
         }
-        // An unprobeable foreground blocks for the same reason as
-        // `LivePtysNeedSeamless` (a destructive swap could hang up something
-        // on a PTY and the lossless lane is unavailable), so it refines the
-        // same model action.
+        // An unprobeable foreground blocks for the same reason as `LivePtysNeedSeamless`
+        // (a destructive swap could hang up a PTY job and the lossless lane is unavailable),
+        // so it refines the same action.
         AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown)
         | AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless) => {
             "BlockForegroundWithoutSeamless"
@@ -585,7 +579,7 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
     regressed.insert("retry_eligible", 1);
     assert!(!model.check_invariant("ForegroundJobsDoNotBlockSeamless", &regressed));
     assert_eq!(admits(&model, &before, &regressed), None);
-    // The same block is exactly the model's named v0.53 mutant, which the
+    // The same block is the model's `BlockForegroundDespiteSeamless` mutant, which the
     // healthy model never admits and the progress law refuses.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let v053 = buggy.successors("BlockForegroundDespiteSeamless", &before)[0].clone();
@@ -596,10 +590,9 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
     assert_eq!(admits(&model, &before, &v053), None);
     assert!(!buggy.check_invariant("ForegroundJobsDoNotBlockSeamless", &v053));
 
-    // Negative control for the cold lane: with the seamless lane gone and a live
-    // job on a PTY, the real classifier blocks. Without its live-session check,
-    // a release macOS build (whose cold arm re-checks only by `debug_assert!`)
-    // would run the destructive re-exec over the job.
+    // Negative control for the cold lane: with no seamless lane and a live job on a PTY the
+    // real classifier blocks; without that check a release macOS build (whose cold arm
+    // re-checks only by `debug_assert!`) would re-exec over the job.
     let facts = AdmissionFacts {
         seamless_capable: false,
         ..facts
@@ -658,17 +651,7 @@ fn assert_exact_model_action(model: &Model, action: &'static str, before: &State
 /// facts the model expresses (the model's `quiet` is the ladder's first phase
 /// asking for a quiet moment; `grace_expired` is every later phase).
 ///
-/// The masters are enumerated too: `masters_quiet` comes from the real peek
-/// over real PTY masters (a quiet live session, a live one with unread output,
-/// and an exited one whose slave hung up with bytes still queued), and the
-/// gate must park exactly where the model does and the masters allow. A live
-/// session's unread output holds it until the `Land` bound has waited
-/// `PRELAUNCH_LAND_MAX_WAITS` times; an exited pane is never counted as output
-/// and holds it only as a dead session, until its pane closes.
-///
-/// Unix-only like the gate it binds: the `app_update_handoff` items below are
-/// `#[cfg(unix)]` (the in-place handoff has no Windows lane). The model-side
-/// checks above run everywhere.
+/// Unix-only like the gate: the in-place handoff has no Windows lane.
 #[cfg(unix)]
 #[test]
 fn real_park_gate_admits_exactly_the_model_s_reader_park() {
@@ -701,11 +684,9 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
         consent_warmup: false,
         harness_restored_pending: false,
     };
-    // Real masters. An exited pane: its command wrote, then its slave closed —
-    // the state a `--hold` pane sits in for as long as it stays open.
-    // Close-on-exec from birth: a child another test spawns meanwhile never
-    // keeps the slave open past its exec, so a closed slave reads as hung up
-    // (the fd-copy sweep of 2026-09-27).
+    // Real masters. An exited pane: its command wrote, then its slave closed, the state a
+    // `--hold` pane sits in while it stays open. The pair is close-on-exec, so a child another
+    // test spawns never keeps the slave open past its exec.
     let openpty = || aterm_pty::open_pty_pair().expect("open_pty_pair");
     let write_byte = |fd: i32| {
         // SAFETY: bounded write of a stack byte to a test-owned slave.
@@ -718,9 +699,8 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
     write_byte(exited_slave);
     aterm_pty::close_fd(exited_slave);
     let exited = vec![(3u64, exited_master, 4003i32)];
-    // A hang detector, not 2 s: the hang-up waits for every copy of the slave,
-    // and a child another test is forking holds one until it execs (the fd-copy
-    // sweep of 2026-09-27). A slave that never closes still fails.
+    // A hang detector: the hang-up waits for every copy of the slave, and a child another
+    // test is forking holds one until it execs. A slave that never closes still fails.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !handoff_masters_closed(&exited) {
         assert!(
@@ -920,16 +900,13 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
 
 /// The `Lapse` and `ParkMissed` model steps, bound to shipping code.
 ///
-/// `Lapse`: a physical-failure latch lapsing resumes the ladder where the clock
-/// is. `lapse_expired_auto_apply_manual_only` releases the latch and leaves
-/// `App::auto_apply_ladder` alone, so `automatic_apply_phase` after the lapse
-/// is the model's post-`Lapse` phase (`Land` when the latch held past the
-/// bound), never `PreferIdle` again.
+/// `Lapse`: `lapse_expired_auto_apply_manual_only` releases a physical-failure latch and
+/// leaves `App::auto_apply_ladder` alone, so `automatic_apply_phase` after the lapse is the
+/// model's post-`Lapse` phase (`Land` when the latch held past the bound), never `PreferIdle`.
 ///
-/// `ParkMissed`: a park that missed every freeze rung stands its successor
-/// down as activity. `park_miss_disposition` answers `ActivityRevoked`, and
-/// `HandoffFailureLane::classify` keeps that outcome out of every physical
-/// shape, so the model's `manual_only` stays 0, as the real latch does.
+/// `ParkMissed`: a park that missed every freeze rung stands down as activity
+/// (`park_miss_disposition` answers `ActivityRevoked`), which `HandoffFailureLane::classify`
+/// keeps out of every physical shape, so the model's `manual_only` stays 0.
 #[cfg(unix)]
 #[test]
 fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
@@ -1021,18 +998,15 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
     }
 }
 
-/// The `BundleSwap` model step: when the failed candidate had already
-/// boot-applied the bundle, the next reconcile retires the download for the
-/// installed-bundle activation of the same update and keeps the latch and its
-/// deadline.
+/// The `BundleSwap` model step: when the failed candidate had already boot-applied the
+/// bundle, the next reconcile retires the download for the installed-bundle activation of the
+/// same update and keeps the latch and its deadline.
 ///
-/// The shipping arc runs for real: a structural failure returns through
-/// `abort_reaped_native_apply_before_reconcile` (a latch ten minutes out), then
-/// `reconcile_native_update_facts` is fed the disk that failure left (the
-/// installed bundle is the target build). The real latch, projected onto the
-/// model's `latched`/`due`/`swapped`, must be exactly the post-`BundleSwap`
-/// state. Negative control: the mutant `BundleSwapClearsLatch` (clearing the
-/// latch lets the confirming retry run 0.5 s after the failure) is caught by
+/// A structural failure returns through `abort_reaped_native_apply_before_reconcile`, then
+/// `reconcile_native_update_facts` is fed the disk that failure left (the installed bundle is
+/// the target build); the real latch, projected onto `latched`/`due`/`swapped`, must be exactly
+/// the post-`BundleSwap` state. Negative control: `BundleSwapClearsLatch` (clearing the latch
+/// lets the confirming retry, ten minutes out, run seconds after the failure) is caught by
 /// `NoEarlyRelease`.
 #[test]
 fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
@@ -1136,12 +1110,13 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
 /// automatic modes, even with the main thread's activity flag raised: the
 /// model's healthy `CaptureRefused` (`quiet` and `refusals` untouched).
 ///
-/// Negative control: mapping every capture `Err` to `ParkAttempt::Missed`,
-/// replayed through the shipping functions (the last rung's
-/// `park_miss_disposition` stands the successor down as `ActivityRevoked` and
-/// `classify` files that in the activity lane). Projected onto the model it is
-/// the mutant `CaptureRefusedAsActivity`, which `RefusalNeverRetriesAsActivity`
-/// catches.
+/// Every `CaptureFailure` variant goes through the shipping `classify_capture_failure`: timing
+/// and storage are `Missed` (the model's `ParkMissed`, re-parked on the next rung); a `Refused`
+/// is `Refused`, its stand-down typed `CaptureRefused`, which `HandoffFailureLane::classify`
+/// files in the refusal lane on both automatic modes even with the activity flag raised (the
+/// model's healthy `CaptureRefused`). Negative control: mapping every `Err` to
+/// `ParkAttempt::Missed`, replayed through the shipping functions, ends in the activity lane:
+/// the model's `CaptureRefusedAsActivity`, which `RefusalNeverRetriesAsActivity` catches.
 #[cfg(unix)]
 #[test]
 fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
@@ -1433,9 +1408,8 @@ pub(crate) struct StructuralLatchObservation {
     /// be read (`App::native_installed_trial` is not the latch's); `room` is
     /// then no reading.
     pub(crate) unread: bool,
-    /// …and the latest read could not PROVE the installed bundle at all
-    /// (`App::native_installed_trial_unproven`, round eight #80): the model's
-    /// `unread = 2`.
+    /// …and the latest read could not prove the installed bundle at all
+    /// (`App::native_installed_trial_unproven`): the model's `unread = 2`.
     pub(crate) unproven: bool,
     /// Due looks in a row that found no count
     /// (`AutoApplyStructuralVerdict::unmeasured_looks`).
@@ -1627,14 +1601,12 @@ fn due_look(app: &mut crate::App) -> bool {
 /// and spends the re-sample; a hold keeps it, spends the re-sample and is
 /// said), must be exactly the model's `Decide` successor.
 ///
-/// Negative control: the `Buggy = 1` `Decide` from the same states answers a
-/// newer release looked at before the day with one more attempt at the older
-/// build (room) or a release held for the Version menu (no room), and strands
-/// the latch with a trial-blind re-sample where nothing newer is on offer. The
-/// shipping decision differs wherever anything was earned, and the invariants
-/// catch it there. For a newer release looked at after the day, `Buggy = 1`
-/// starts the retire as the shipping look does; its defect is the refusal
-/// that follows (`SupersedeRefused`, bound in
+/// Negative control: the `Buggy = 1` `Decide` answers a newer release looked at before the day
+/// with one more attempt at the older build (room) or a release held for the Version menu (no
+/// room), and strands the latch with a trial-blind re-sample where nothing newer is on offer;
+/// the shipping decision differs wherever anything was earned, and the invariants catch it
+/// there. After the day, `Buggy = 1` starts the retire as the shipping look does; its defect is
+/// the refusal that follows (`SupersedeRefused`, bound in
 /// [`real_structural_latch_arc_is_the_model_s_arc`]).
 #[test]
 fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
@@ -1702,9 +1674,9 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
         // each over a new observation): kept by a look that is not due,
         // cleared by a reading.
         let mut looks_after = if unread { looks } else { 0 };
-        // The host's count of due looks over UNPROVEN reads (round eight, #80's
-        // review; `App::look_over_unproven_reads`): kept by a look that is not
-        // due, cleared by any proven read.
+        // The host's count of due looks over unproven reads
+        // (`App::look_over_unproven_reads`): kept by a look that is not due,
+        // cleared by any proven read.
         let doubts = u8::try_from(state["doubts"]).expect("a small count");
         let mut doubts_after = if unproven { doubts } else { 0 };
         let mut moved = false;
@@ -1732,7 +1704,7 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
                 );
                 if unproven {
                     if doubts >= crate::app_native::STRUCTURAL_TRIAL_UNPROVEN_LOOKS {
-                        // THE UNPROVEN BOUND: the re-sample moves to the next
+                        // The unproven bound: the re-sample moves to the next
                         // day, still owed; nothing asked, nothing held.
                         unproven_moved += 1;
                         doubts_after = 0;
@@ -1744,7 +1716,7 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
                     }
                     (true, false, false, false, false)
                 } else if looks >= crate::app_native::STRUCTURAL_TRIAL_UNMEASURED_LOOKS {
-                    // THE BOUND: held, nothing promised, said.
+                    // The bound: held, nothing promised, said.
                     unread_held += 1;
                     looks_after = 0;
                     (true, true, false, true, false)
@@ -1831,12 +1803,11 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
     );
 }
 
-/// The shipping arc, projected step by step: the real `App` converges on the
-/// installed activation of build 11 through the completion lane, and every
-/// step after is projected off the real latch, verdict, retire and notice and
-/// checked against the model's own step:
+/// The shipping arc, projected step by step: the real `App` converges on build 11's installed
+/// activation through the completion lane, and every later step, read off the real latch,
+/// verdict, retire and notice, is checked against the model's own step:
 ///
-/// * the first count read after it (`TrialHasRoom`/`TrialIsSpent`, `Decide`);
+/// * the first count read (`TrialHasRoom`/`TrialIsSpent`, `Decide`);
 /// * a re-publish of 11 offered (`ArmSameBuild`);
 /// * a verified download of 12 reconciled (`NewerArrives`, `Decide`: the
 ///   retire of 11 starts);
@@ -1848,13 +1819,10 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
 ///   release outranks it), the retry coming due (`RetryDue`, `Decide`: the
 ///   retire starts again) and landing (`Supersede`).
 ///
-/// Run with room in the boot trial and with the trial one launch from its
-/// revert, where the first count withdraws the promised re-sample and a newer
-/// release supersedes all the same. The day's one re-sample with nothing newer
-/// on disk (`DayPasses`, `Decide`, `AttemptFails`) is its own arc below.
-///
-/// Each anchored shipping function is entered on the way (the `#[refines]`
-/// probes), so the bind is about the code that runs.
+/// Run with room in the boot trial and with the trial one launch from its revert, where the
+/// first count withdraws the promised re-sample and a newer release supersedes all the same.
+/// The day's one re-sample with nothing newer on disk (`DayPasses`, `Decide`, `AttemptFails`)
+/// is its own arc below. Every `#[refines]` anchor of the machine must be entered on the way.
 #[test]
 fn real_structural_latch_arc_is_the_model_s_arc() {
     use crate::app_native::ActivationSupersedeCompletion;
@@ -2218,21 +2186,15 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
     }
 }
 
-/// A latch whose activation leaves the installed facts is decided within a
-/// bound, projected step by step onto the model. The real `App` converges on
-/// the installed activation of build 11 and reads its first count
-/// (`TrialHasRoom`, `Decide`); then the channel's floor rises above 11 and the
-/// facts worker drops it from every observation (`installed: None`,
-/// `TrialUnreadable`, `Decide`), so its boot trial is never measured again. The
-/// day's re-sample comes due (`DayPasses`) and every look answers `Unmeasured`.
-/// Each due look over a new observation counts (`Decide`, `looks`), and at
-/// `STRUCTURAL_TRIAL_UNMEASURED_LOOKS` the re-sample is held, the latch loses
-/// its deadline and the hold is said (`Decide`'s bound arm). A due look with no
-/// new observation behind it (the facts worker saturated, or no observation
-/// could be asked for) counts nothing. Negative controls: the `Buggy = 1` look
-/// at the bound, which keeps the promise, is caught; and a reading that comes
-/// back (`TrialReadAgain`) clears the count and, with room, releases the
-/// re-sample.
+/// A latch whose activation leaves the installed facts is decided within a bound, projected
+/// step by step onto the model. After build 11's first count (`TrialHasRoom`), the channel's
+/// floor rises above 11 and the facts worker drops it from every observation
+/// (`installed: None`, `TrialUnreadable`), so its boot trial is never measured again. Once the
+/// day's re-sample is due, each due look over a new observation counts (`looks`); at
+/// `STRUCTURAL_TRIAL_UNMEASURED_LOOKS` the re-sample is held, the latch loses its deadline and
+/// the hold is said. A due look with no new observation behind it counts nothing. Negative
+/// controls: the `Buggy = 1` look at the bound, which keeps the promise, is caught; a reading
+/// that comes back (`TrialReadAgain`) clears the count and, with room, releases the re-sample.
 #[test]
 fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound() {
     use crate::app_native::STRUCTURAL_TRIAL_UNMEASURED_LOOKS;
@@ -2371,22 +2333,16 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
     }
 }
 
-/// A COUNT THAT COULD NOT BE CHECKED IS NOT A COUNT THAT IS GONE (round eight,
-/// #80, and its review), projected step by step onto the model. The latch on build
-/// 11 has room and its day's re-sample comes due on a captive-portal network: every
-/// facts read finds the installed bundle but cannot PROVE it (`spctl` past its
-/// ceiling — a passing refusal, `installed_unproven`), so `installed` is `None`.
-///
-/// The bound on a count that is not coming (finding 55) counted those reads as
-/// observations: three due looks dropped the re-sample for good and the latch held
-/// with no deadline, so the network's recovery released nothing (L4; #80). #80 as
-/// first landed made each such look a stutter, which re-armed the latch every 75 s
-/// — a deep `codesign` and an `spctl` each time — for as long as the filter stood,
-/// and said nothing (L5; its review). Now an unproven read is `TrialUnproven`: each
+/// A count that could not be checked is not a count that is gone, projected step by step onto
+/// the model. The latch on build 11 has room and its day's re-sample comes due on a
+/// captive-portal network: every facts read finds the installed bundle but cannot prove it
+/// (`spctl` past its ceiling, `installed_unproven`), so `installed` is `None`. Counting those
+/// reads as gone would drop the re-sample for good; ignoring them would re-arm the latch (a
+/// deep `codesign` and an `spctl`) on every look. So an unproven read is `TrialUnproven`: each
 /// due look over a new one counts on its own bound (`doubts`), and at
-/// `STRUCTURAL_TRIAL_UNPROVEN_LOOKS` the re-sample moves to the next day, still owed,
-/// recorded on `update status` and raised nowhere. The next day counts afresh, and
-/// the first PROVEN read with room releases the re-sample.
+/// `STRUCTURAL_TRIAL_UNPROVEN_LOOKS` the re-sample moves to the next day, still owed, recorded
+/// on `update status` and raised nowhere. The next day counts afresh, and the first proven read
+/// with room releases the re-sample.
 ///
 /// NEGATIVE CONTROL: the `Buggy = 1` look at the bound, which keeps the day due and
 /// asks again, is not the shipping one and is caught (`UnprovenLooksAreBounded`).

@@ -55,14 +55,13 @@ fn blank(r: &str) -> bool {
     r.trim().is_empty()
 }
 
-/// THE PLAN DIALOG'S GAIN, NAMED: `claude-2.1.281-plan-approval.txt` is 44
+/// `claude-2.1.281-plan-approval.txt` is 44
 /// rows drawn to its foot with a 13-row gap, so its zone begins on row 0 and
 /// the last 40 rows begin on row 4. Its head — the `Ready to code?` frame —
-/// sat above that cut: read there it was a box with no head (`Other`, its
-/// title a body row); read in the zone it is the whole plan approval. The
-/// supervisor's tail read now sees it whole too, so the approval policy's
-/// plan rule can apply where it used to escalate a box of no kind.
-/// NEGATIVE CONTROL: the same rows with the gap filled read as they did,
+/// sits above that cut: read in the last 40 rows it is a box with no head
+/// (`Other`, its title a body row), whereas read in the live zone it is the
+/// whole plan approval.
+/// Negative control: the same rows with the gap filled read identically
 /// through either window.
 #[test]
 fn the_plan_approval_is_read_whole_through_its_zone() {

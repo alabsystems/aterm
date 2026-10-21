@@ -19,7 +19,7 @@
 //!    CLI product name, live AI CLI status and duration, Autopilot mode, human
 //!    activity, and a `Show tab` button for local tabs.
 
-use super::harness_page::{CARD_GAP, metadata_cards, row_cards};
+use super::harness_page::{metadata_cards, row_cards};
 use super::*;
 use crate::harness_screen::{TabComputer, TabControlProjection, TabSpreadsheetRow};
 use crate::native_app::HarnessRequest;
@@ -167,7 +167,7 @@ fn tabs_cards(
             "Sessions and tabs spreadsheet",
             ("SESSIONS & TABS SPREADSHEET", "SESSIONS & TABS"),
         ),
-        spreadsheet_rows(tabs, width, inner),
+        spreadsheet_rows(tabs, width, inner, room),
         room,
         card_width,
     ));
@@ -184,9 +184,11 @@ fn tabs_cards(
     cards
 }
 
+/// Refresh, Coding Agent Harness and AI CLIs: as many to a line as the card
+/// holds, each at its words' width, a label wider than the line on as many
+/// lines as it needs ([`page_button_lines`]) — never cut ("Coding Agent
+/// Har…" at 22 columns).
 fn tabs_actions(tabs: &TabControlProjection, card_width: f32) -> (UiNode, f32) {
-    let control_height = scaled_control_height();
-    let need = |label: &str| crate::native_ui::native_button_label_width(label) + 40.0;
     let specs = [
         (
             TABS_REFRESH,
@@ -210,24 +212,13 @@ fn tabs_actions(tabs: &TabControlProjection, card_width: f32) -> (UiNode, f32) {
             route_action(SettingsRoute::Ai),
         ),
     ];
-    let total_need: f32 = specs
-        .iter()
-        .map(|(_, label, _, _, _)| need(label))
-        .sum::<f32>()
-        + (specs.len().saturating_sub(1) as f32) * CARD_GAP;
-    let row = total_need <= card_width;
     let buttons = specs
         .into_iter()
         .map(|(key, label, busy, style, action)| {
-            let btn_width = need(label);
-            let visual = crate::native_ui::fit_native_button_label(
-                label,
-                ((if row { btn_width } else { card_width }) - 24.0).max(0.0),
-            );
             UiNode::new(
                 key,
                 UiContent::Button(
-                    Control::new(ButtonSpec::new(label).visual_label(visual), action)
+                    Control::new(ButtonSpec::new(label), action)
                         .state(ControlState {
                             busy,
                             ..ControlState::default()
@@ -235,52 +226,57 @@ fn tabs_actions(tabs: &TabControlProjection, card_width: f32) -> (UiNode, f32) {
                         .style(style),
                 ),
             )
-            .layout(
-                Layout::default()
-                    .width(if row {
-                        Length::Fixed(btn_width)
-                    } else {
-                        Length::Fill
-                    })
-                    .height(Length::Fixed(control_height)),
-            )
         })
         .collect();
-    let height = if row {
-        control_height
-    } else {
-        3.0 * control_height + 2.0 * CARD_GAP
-    };
-    let layout = if row { Layout::row() } else { Layout::column() };
-    (
-        UiNode::new(
-            "tabs/actions",
-            UiContent::Group(GroupSpec::new("Tab Control actions")),
-        )
-        .layout(layout.height(Length::Fixed(height)).gap(CARD_GAP))
-        .children(buttons),
-        height,
+    let (mut node, height) = page_button_lines("tabs/actions", buttons, card_width);
+    node.content = UiContent::Group(GroupSpec::new("Tab Control actions"));
+    (node, height)
+}
+
+/// A line of the page's words, wrapped to its card's column, never cut
+/// ([`wrapped_words_node`]).
+fn header_line(key: &str, text: &str, width: f32) -> (UiNode, f32) {
+    wrapped_words_node(
+        key,
+        text,
+        (SemanticRole::Status, StyleRef::Quiet),
+        width,
+        detail_line_height(),
     )
 }
 
-fn header_line(key: &str, text: &str, width: f32) -> (UiNode, f32) {
-    let height = 20.0_f32.max(16.0 * settings_text_scale());
-    (
-        UiNode::new(
-            key,
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_status_label(text, width),
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        ),
-        height,
-    )
+/// One line of a row's title.
+fn title_line_height() -> f32 {
+    22.0_f32.max(18.0 * settings_text_scale())
+}
+
+/// One line of a row's detail.
+fn detail_line_height() -> f32 {
+    18.0_f32.max(16.0 * settings_text_scale())
+}
+
+/// `text` in the row's title type, wrapped to `width`, paint-only.
+fn title_words(key: String, text: &str, width: f32) -> (UiNode, f32) {
+    let (node, height) = wrapped_words_node(
+        &key,
+        text,
+        (SemanticRole::Text, StyleRef::Primary),
+        width,
+        title_line_height(),
+    );
+    (node.paint_only(), height)
+}
+
+/// `text` in the row's detail type, wrapped to `width`, paint-only.
+fn detail_words(key: String, text: &str, width: f32) -> (UiNode, f32) {
+    let (node, height) = wrapped_words_node(
+        &key,
+        text,
+        (SemanticRole::Status, StyleRef::Quiet),
+        width,
+        detail_line_height(),
+    );
+    (node.paint_only(), height)
 }
 
 fn computer_rows(
@@ -314,16 +310,10 @@ fn computer_rows(
     rows
 }
 
+/// One accessible computer: its name, state and address, its vitals where it
+/// reports them, and its system and sessions, each wrapped to the card's
+/// column, never cut ("m110-MacBook-P…" at 22 columns).
 fn computer_row(comp: &TabComputer, inner: f32) -> (UiNode, f32) {
-    let scale = settings_text_scale();
-    let title_height = 22.0_f32.max(18.0 * scale);
-    let detail_height = 18.0_f32.max(16.0 * scale);
-    let has_vitals = !comp.vitals.is_empty();
-    let total_height = if has_vitals {
-        title_height + 4.0 + detail_height + 4.0 + detail_height
-    } else {
-        title_height + 4.0 + detail_height
-    };
     let key = format!("tabs/computer/{}", comp.id);
     let line1 = format!(
         "{} \u{b7} {} \u{b7} {}",
@@ -359,61 +349,19 @@ fn computer_row(comp: &TabComputer, inner: f32) -> (UiNode, f32) {
             }
         )
     };
+    let has_vitals = !comp.vitals.is_empty();
     let full_label = if has_vitals {
         format!("{line1} \u{2014} {} \u{2014} {line2}", comp.vitals)
     } else {
         format!("{line1} \u{2014} {line2}")
     };
-    let mut children = vec![
-        UiNode::new(
-            format!("{key}/title"),
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_text_label(&line1, inner),
-                role: SemanticRole::Text,
-                style: StyleRef::Primary,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(title_height)),
-        )
-        .paint_only(),
-    ];
+    let mut parts = vec![title_words(format!("{key}/title"), &line1, inner)];
     if has_vitals {
-        children.push(
-            UiNode::new(
-                format!("{key}/vitals"),
-                UiContent::Text(TextSpec {
-                    text: crate::native_ui::fit_native_status_label(&comp.vitals, inner),
-                    role: SemanticRole::Status,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(detail_height)),
-            )
-            .paint_only(),
-        );
+        parts.push(detail_words(format!("{key}/vitals"), &comp.vitals, inner));
     }
-    children.push(
-        UiNode::new(
-            format!("{key}/detail"),
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_status_label(&line2, inner),
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(detail_height)),
-        )
-        .paint_only(),
-    );
+    parts.push(detail_words(format!("{key}/detail"), &line2, inner));
+    let total_height = parts.iter().map(|(_, height)| height).sum::<f32>()
+        + 4.0 * parts.len().saturating_sub(1) as f32;
     let node = UiNode::new(key, UiContent::Group(GroupSpec::new(full_label)))
         .layout(
             Layout::column()
@@ -421,7 +369,7 @@ fn computer_row(comp: &TabComputer, inner: f32) -> (UiNode, f32) {
                 .height(Length::Fixed(total_height))
                 .gap(4.0),
         )
-        .children(children);
+        .children(parts.into_iter().map(|(node, _)| node).collect());
     (node, total_height)
 }
 
@@ -429,6 +377,7 @@ fn spreadsheet_rows(
     tabs: &TabControlProjection,
     width: SettingsWidth,
     inner: f32,
+    room: f32,
 ) -> Vec<(UiNode, f32)> {
     if !tabs.observed {
         return vec![header_line(
@@ -472,7 +421,7 @@ fn spreadsheet_rows(
         let count = group_rows.len();
         for (idx, row) in group_rows.into_iter().enumerate() {
             let is_last = idx + 1 == count;
-            rows.push(spreadsheet_row(row, is_last, width, inner));
+            rows.push(spreadsheet_row(row, is_last, width, (inner, room)));
         }
     }
     rows
@@ -485,8 +434,6 @@ fn session_group_header_row(
     group_rows: &[&TabSpreadsheetRow],
     inner: f32,
 ) -> (UiNode, f32) {
-    let scale = settings_text_scale();
-    let height = 22.0_f32.max(18.0 * scale);
     let key = format!("tabs/session/{group_idx}");
     let dims = group_rows
         .iter()
@@ -527,33 +474,34 @@ fn session_group_header_row(
         active_ai,
         progs.join(", ")
     );
-    (
-        UiNode::new(
-            key,
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_text_label(&text, inner),
-                role: SemanticRole::Text,
-                style: StyleRef::Primary,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        ),
-        height,
+    wrapped_words_node(
+        &key,
+        &text,
+        (SemanticRole::Text, StyleRef::Primary),
+        inner,
+        title_line_height(),
     )
 }
 
+/// One open tab: its place, title, program and state, then its AI CLI's
+/// or its program's status, each wrapped to the words' column, never cut,
+/// under the tree's branch (which runs down beside every line of a row that
+/// another follows); and `Show tab` for a local tab, beside the words where
+/// the card holds both and the list holds the row whole (`room`), else
+/// under them.
+///
+/// A ROW TALLER THAN THE LIST IS LISTED A LINE AT A TIME: its words are a
+/// column of lines, each with its part of the branch beside it, so the
+/// list cuts the row between its lines into parts each screen shows whole
+/// ([`scroll::row_parts`]). Laid out as one block beside one tall stem, the
+/// row (a long title and status at 2× text: 296pt in the 268pt list of an
+/// 80x24 window, 1748pt at 22 columns) was cut on every screen.
 fn spreadsheet_row(
     row: &TabSpreadsheetRow,
     is_last: bool,
     width: SettingsWidth,
-    inner: f32,
+    (inner, room): (f32, f32),
 ) -> (UiNode, f32) {
-    let scale = settings_text_scale();
-    let title_height = 22.0_f32.max(18.0 * scale);
-    let detail_height = 18.0_f32.max(16.0 * scale);
     let control_height = scaled_control_height();
     let compact = width == SettingsWidth::Compact;
     let key = format!("tabs/row/{}", row.key);
@@ -562,43 +510,33 @@ fn spreadsheet_row(
     let show_button = row.show_local_id.map(|local_id| {
         let action = show_tab_action(local_id);
         let spoken = format!("Show tab: {} ({})", row.title, row.place);
-        let visual =
-            crate::native_ui::fit_native_button_label("Show tab", (button_width - 20.0).max(0.0));
+        let spec = ButtonSpec::new(spoken);
+        let (visual, lines) = button_words_in(&spec, "Show tab", &[], button_width);
         UiNode::new(
             action.clone(),
             UiContent::Button(
-                Control::new(
-                    ButtonSpec::new(spoken).visual_label(visual),
-                    ActionId::new(action),
-                )
-                .style(StyleRef::Secondary),
+                Control::new(spec.visual_label(visual), ActionId::new(action))
+                    .style(StyleRef::Secondary),
             ),
         )
-        .layout(
-            Layout::default()
-                .width(if compact {
-                    Length::Fill
-                } else {
-                    Length::Fixed(button_width)
-                })
-                .height(Length::Fixed(control_height)),
-        )
+        .layout(Layout::default().width(Length::Fixed(button_width)).height(
+            Length::Fixed(crate::native_ui::native_button_height_for_lines(
+                lines,
+                control_height,
+            )),
+        ))
     });
+    let button_height = show_button.as_ref().map_or(0.0, fixed_height);
 
-    let text_width = if show_button.is_some() && !compact {
-        (inner - button_width - ROW_GAP).max(0.0)
+    // The words' column: the row's words beside the branch, as wide as the
+    // branch and the space after it in the title's type.
+    let (branch, indent) = if is_last {
+        ("   \u{2514}\u{2500}", "      ")
     } else {
-        inner
+        ("   \u{251c}\u{2500}", "   \u{2502}  ")
     };
-
-    let branch = if is_last {
-        "   \u{2514}\u{2500}"
-    } else {
-        "   \u{251c}\u{2500}"
-    };
-    let indent = if is_last { "      " } else { "   \u{2502}  " };
-    let line1 = format!(
-        "{branch} {} \u{2014} \"{}\" \u{b7} {} \u{b7} {} ({})",
+    let title = format!(
+        "{} \u{2014} \"{}\" \u{b7} {} \u{b7} {} ({})",
         row.place, row.title, row.program, row.state, row.sid
     );
     let vitals_suffix = if row.vitals.is_empty() {
@@ -606,19 +544,127 @@ fn spreadsheet_row(
     } else {
         format!(" \u{b7} vitals: {}", row.vitals)
     };
-    let line2 = if row.is_ai_cli {
+    let status = if row.is_ai_cli {
         format!(
-            "{indent}AI CLI: {} \u{b7} autopilot: {} \u{b7} human: {}{vitals_suffix}",
+            "AI CLI: {} \u{b7} autopilot: {} \u{b7} human: {}{vitals_suffix}",
             row.ai_status, row.autopilot, row.human
         )
     } else {
         format!(
-            "{indent}status: {} \u{b7} program: {} \u{b7} human: {}{vitals_suffix}",
+            "status: {} \u{b7} program: {} \u{b7} human: {}{vitals_suffix}",
             row.state, row.program, row.human
         )
     };
-    let full_label = format!("{line1} \u{2014} {line2}");
-    let text_height = title_height + 4.0 + detail_height;
+    let full_label = format!("{branch} {title} \u{2014} {indent}{status}");
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let branch_width =
+        crate::tray_raster::ui_text_width_for(face, &format!("{branch} "), px).ceil();
+    // The row's lines in a words column beside the branch, `text_width`
+    // wide with it: the title's, then the status's, each wrapped there,
+    // never cut; and how tall they stand.
+    let lines_in = |text_width: f32| {
+        let words_width = (text_width - branch_width).max(0.0);
+        let wrap = |text: &str, (role, style): (SemanticRole, StyleRef)| {
+            let (px, face) = crate::native_ui::text_paint_metrics(role, style);
+            wrap_to_box(text, words_width, &|line| {
+                crate::tray_raster::ui_text_width_for(face, line, px)
+            })
+        };
+        let title = wrap(&title, (SemanticRole::Text, StyleRef::Primary));
+        let status = wrap(&status, (SemanticRole::Status, StyleRef::Quiet));
+        let height = title.len().max(1) as f32 * title_line_height()
+            + 4.0
+            + status.len().max(1) as f32 * detail_line_height();
+        (title, status, height, words_width)
+    };
+    // Show tab beside the words only where the card holds both and the list
+    // holds the row whole so; else under them, the row a column the list can
+    // list a line at a time.
+    let beside_width = (inner - button_width - ROW_GAP).max(0.0);
+    let beside = show_button.is_some()
+        && !compact
+        && lines_in(beside_width).2.max(button_height) <= room + 0.01;
+    let text_width = if beside { beside_width } else { inner };
+    let (title_lines, status_lines, text_height, words_width) = lines_in(text_width);
+    // Each line beside its part of the branch: the branch at the title's
+    // first line, its stem beside every other line of a row another follows.
+    let stem = if is_last { "" } else { "   \u{2502}" };
+    let line_row = |index: usize,
+                    glyph: &str,
+                    text: String,
+                    (role, style): (SemanticRole, StyleRef),
+                    height: f32| {
+        UiNode::new(
+            format!("{key}/line-{index}"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(
+            Layout::row()
+                .width(Length::Fill)
+                .height(Length::Fixed(height)),
+        )
+        .children(vec![
+            UiNode::new(
+                format!("{key}/branch/{index}"),
+                UiContent::Text(TextSpec {
+                    text: glyph.to_string(),
+                    role: SemanticRole::Text,
+                    style: StyleRef::Primary,
+                }),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fixed(branch_width))
+                    .height(Length::Fill),
+            )
+            .paint_only(),
+            UiNode::new(
+                format!("{key}/words/{index}"),
+                UiContent::Text(TextSpec { text, role, style }),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fixed(words_width))
+                    .height(Length::Fill),
+            )
+            .paint_only(),
+        ])
+        .paint_only()
+    };
+    let title_count = title_lines.len().max(1);
+    let mut lines: Vec<UiNode> = Vec::new();
+    for (index, text) in title_lines.into_iter().enumerate() {
+        let glyph = if index == 0 { branch } else { stem };
+        lines.push(line_row(
+            index,
+            glyph,
+            text,
+            (SemanticRole::Text, StyleRef::Primary),
+            title_line_height(),
+        ));
+    }
+    // The 4pt between the title and the status.
+    lines.push(
+        UiNode::new(
+            format!("{key}/gap"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fill)
+                .height(Length::Fixed(4.0)),
+        )
+        .paint_only(),
+    );
+    for (index, text) in status_lines.into_iter().enumerate() {
+        lines.push(line_row(
+            title_count + index,
+            stem,
+            text,
+            (SemanticRole::Status, StyleRef::Quiet),
+            detail_line_height(),
+        ));
+    }
     let text_col = UiNode::new(
         if show_button.is_some() {
             format!("{key}/words")
@@ -629,49 +675,19 @@ fn spreadsheet_row(
     )
     .layout(
         Layout::column()
-            .width(if show_button.is_some() && !compact {
+            .width(if beside {
                 Length::Fixed(text_width)
             } else {
                 Length::Fill
             })
-            .height(Length::Fixed(text_height))
-            .gap(4.0),
+            .height(Length::Fixed(text_height)),
     )
-    .children(vec![
-        UiNode::new(
-            format!("{key}/title"),
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_text_label(&line1, text_width),
-                role: SemanticRole::Text,
-                style: StyleRef::Primary,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(title_height)),
-        )
-        .paint_only(),
-        UiNode::new(
-            format!("{key}/status"),
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_status_label(&line2, text_width),
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(detail_height)),
-        )
-        .paint_only(),
-    ]);
+    .children(lines);
 
-    match (show_button, compact) {
+    match (show_button, beside) {
         (None, _) => (text_col, text_height),
-        (Some(btn), true) => {
-            let total = text_height + 6.0 + control_height;
+        (Some(btn), false) => {
+            let total = text_height + 6.0 + button_height;
             (
                 UiNode::new(key, UiContent::Group(GroupSpec::new(full_label)))
                     .layout(
@@ -684,8 +700,8 @@ fn spreadsheet_row(
                 total,
             )
         }
-        (Some(btn), false) => {
-            let total = text_height.max(control_height);
+        (Some(btn), true) => {
+            let total = text_height.max(button_height);
             (
                 UiNode::new(key, UiContent::Group(GroupSpec::new(full_label)))
                     .layout(

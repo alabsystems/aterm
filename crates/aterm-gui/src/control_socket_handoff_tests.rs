@@ -26,9 +26,8 @@ fn fixture() -> (aterm_tempfile::TempDir, control_auth::SocketPlan) {
     (dir, plan)
 }
 
-/// The instance that bound `plan` leaves: its socket and token go. By path,
-/// because the fixture's files are that instance's own; the identity rule an
-/// exit really removes by is `owned_endpoint`'s, tested there.
+/// The instance that bound `plan` exits: its socket and token go, by path (a real exit removes
+/// by `owned_endpoint`'s identity rule, tested there).
 fn leave(plan: &control_auth::SocketPlan) {
     let _ = std::fs::remove_file(&plan.sock_path);
     let _ = std::fs::remove_file(&plan.token_path);
@@ -64,8 +63,7 @@ fn incoming_control_preparation_requires_both_real_service_lanes() {
                 model.action_enabled("Proof", &state),
             );
             if !ready {
-                // Old readiness ignored whether either pool could allocate a
-                // worker; this exact resource-failure control must block proof.
+                // A pool that cannot allocate a worker must block proof.
                 assert_eq!(preparation.state(), ControlPreparationState::Failed);
                 preparation.finish(true);
                 assert_eq!(preparation.state(), ControlPreparationState::Failed);
@@ -92,28 +90,25 @@ fn incoming_control_preparation_requires_both_real_service_lanes() {
 /// ("nothing done within 30 ms") passes vacuously whenever the worker is slow
 /// to get there, which a loaded machine makes the common case.
 ///
-/// ALONE IN ITS OWN PROCESS. `drop(parent)` closes the predecessor's listener
-/// only when it closes its LAST descriptor, and a child that any sibling test
-/// forks holds a copy until it execs (macOS 26.6 honors no `FD_CLOFORK`): the
-/// copy kept the listener listening, the worker kept finding its predecessor,
-/// and past its 2 s handoff deadline it stood down without binding.
+/// Alone in its own process: `drop(parent)` closes the predecessor's listener
+/// only when it closes its last descriptor, and a child that any sibling test
+/// forks holds a copy until it execs (macOS 26.6 honors no `FD_CLOFORK`),
+/// keeping the listener live past the 2 s handoff deadline.
 ///
-/// The handoff wait is a HANG DETECTOR here ([`bind_control_listener_within`]):
-/// production's 2 s runs from the release, and every step of this test between
-/// the release and `drop(parent)` had to fit inside it — a test thread stalled
-/// past it made a correct worker stand down, read as "ended over a live
-/// parent". Production's own bound is not this test's subject.
+/// The handoff wait is a hang detector here ([`bind_control_listener_within`]):
+/// production's 2 s runs from the release, and a test thread stalled past it
+/// between the release and `drop(parent)` would make a correct worker stand
+/// down. Production's own bound is not this test's subject.
 ///
-/// The listener closes at the WORST instant, every run: the worker's third
+/// The listener closes at the worst instant, every run: the worker's third
 /// dial is held between its connect and the ownership question until the
 /// listener is gone. The test accepts only the two probes, so that dial is
 /// still queued, and closing the listener aborts it: XNU answers its
 /// `LOCAL_PEERPID` with the owner before the close and `ENOTCONN` after, as
 /// it does for any dial the predecessor's teardown reaches (its exit closes
 /// the connections it accepted, too). That is the teardown the worker waits
-/// for, which it once read as a foreign owner and stood down (7 runs in 6000
-/// at 128 loaded copies, 2026-10-16). The probe after it is refused and the
-/// worker binds, so the plain close is walked too.
+/// for rather than reading as a foreign owner. The probe after it is refused
+/// and the worker binds, so the plain close is walked too.
 #[test]
 fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     if !crate::test_alone::alone() {
@@ -185,9 +180,8 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     let model = native_update_control_socket_handoff_model();
     let mut state = model.init_state();
 
-    // Before the Commit: the worker parks on the closed gate. Parked there it
-    // can leave only by the release, so what it has not done yet — asked
-    // about its parent, finished, touched the token — is judged now.
+    // Before the Commit the worker parks on the closed gate, which only the release opens, so
+    // what it has not done yet is judged now.
     until_within(MUST_HAPPEN, "the worker parks on the closed gate", || {
         (gate.parked() == 1 || asked() > 0 || child.is_finished()).then_some(())
     });
@@ -286,8 +280,8 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
         crate::control_socket_identity::SocketIdentity::capture(&plan, &parent, token.as_str())
             .unwrap();
     let before = std::fs::read(&plan.token_path).unwrap();
-    // Historical behavior: starting the successor before Commit loses its
-    // control listener. Keep this negative control against the genuine binder.
+    // Starting the successor before Commit loses its control listener. Keep
+    // this negative control against the genuine binder.
     assert!(bind_control_listener(&plan, None, |_| true, |_| false, None).is_none());
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
 
@@ -421,9 +415,7 @@ fn a_failed_handoff_bind_never_retries_over_a_foreign_full_backlog() {
             let _ = send.send(result);
         })
     };
-    // The bind's answer MUST arrive: a hang detector, never a 2 s budget a
-    // loaded machine overruns. A regressed probe that blocks on the full
-    // backlog is still named — at the minute, as a timeout below.
+    // A hang detector: a regressed probe that blocks on the full backlog shows as a timeout.
     let result = received.recv_timeout(MUST_HAPPEN);
     let untouched = identity.matches_current(&plan)
         && std::fs::read(&plan.token_path).is_ok_and(|after| after == before);
@@ -465,7 +457,7 @@ fn a_transient_handoff_bind_failure_recovers_without_rewriting_credentials() {
         |path| {
             attempts += 1;
             if attempts == 1 {
-                // Historical single-attempt policy stopped here permanently.
+                // One transient failure the retry must recover from.
                 Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
             } else {
                 CtlListener::bind(path)

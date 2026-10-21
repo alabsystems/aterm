@@ -22,21 +22,9 @@ impl Terminal {
             .map(Arc::as_ref)
     }
 
-    /// The hyperlink URL attached to the cell at viewport row `visible_row` —
-    /// the display-offset-AWARE twin of [`Self::hyperlink_at`], and the one a
-    /// host must ask when it is answering for what a person is looking at.
-    ///
-    /// [`Self::hyperlink_at`] keys the extras map by the live screen row, so
-    /// scrolled back it answers about a line eight rows further down (or about
-    /// a blank one) while the frame under the pointer was drawn from history.
-    /// This resolves through the same [`Grid::visible_row_view`] the frame
-    /// itself is drawn from ([`Self::render_row`]), so the answer and the
-    /// underline the renderer stamped always describe one cell. The two
-    /// coincide at `display_offset == 0`.
-    ///
-    /// Owned rather than borrowed because a scrolled-off row is materialized:
-    /// its extras belong to the view, so no reference can outlive the
-    /// resolution.
+    /// Hyperlink URL attached to the cell at viewport-relative `(visible_row, col)`,
+    /// accounting for `display_offset` via [`Grid::visible_row_view`] (coincides
+    /// with [`Self::hyperlink_at`] at `display_offset == 0`).
     ///
     /// [`Grid::visible_row_view`]: aterm_grid::Grid::visible_row_view
     #[must_use]
@@ -187,17 +175,8 @@ impl Terminal {
         self.color.cursor_color
     }
 
-    /// Whether a program has recoloured the cursor over the host's baseline —
-    /// a live OSC 12 that OSC 112 / RIS has not yet reset.
-    ///
-    /// [`Self::set_default_cursor_color`] seeds both the live value and the
-    /// reset baseline from the theme, so [`Self::cursor_color`] being `Some`
-    /// says nothing about whether anyone asked for that colour: on every
-    /// default window it is the theme's own seed. The two slots diverge only
-    /// when OSC 12 writes the live one, and re-converge when OSC 112 restores
-    /// the baseline. That divergence is the one honest answer to "did a
-    /// program pin this colour?", and it is what a cursor effect needs to
-    /// decide whether the caret wears the terminal's colour or its own.
+    /// Whether a program has overridden the cursor color via OSC 12 relative to
+    /// the host baseline set by [`Self::set_default_cursor_color`].
     #[must_use]
     pub fn cursor_color_recoloured(&self) -> bool {
         self.color.cursor_color != self.color.configured_cursor

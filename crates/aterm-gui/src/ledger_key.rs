@@ -5,13 +5,11 @@
 //! macOS; the `open_ledger` action in `[keybindings]`) runs
 //! `aterm drive ledger @<sid> --format html --out <file>` and opens the file.
 //!
-//! The ledger is the watcher's timeline: the human's turns, reply sizes, the
-//! watcher's journal lines and the session's mail with the worker (the long form of
-//! the presence band's `◇ quiet` summary). It runs as a child process because it
-//! gathers over the control socket (`history`, `timeline`, `inbox --peek`), which
-//! in-process on the main thread would block the event loop on its own socket. The
-//! child gets `drive --socket <this instance's socket>` ([`with_socket`]) so it reads
-//! this instance's sessions; the CLI creates the file `0600`.
+//! The ledger is the watcher's timeline (the long form of the presence band's
+//! `◇ quiet` summary). It runs as a child process because it gathers over the
+//! control socket, which on the main thread would block the event loop on its own
+//! socket. The child gets `drive --socket <this instance's socket>` ([`with_socket`]);
+//! the CLI creates the file `0600`.
 //!
 //! A headless instance composes the plan and launches nothing.
 
@@ -97,11 +95,10 @@ pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
         move || {
             // Waits on a CLI child the human is not blocked on.
             let cli = aterm_cli();
-            // `aterm.exe` is the CONSOLE image: started bare by the window (which
-            // has no console) every key press opened a VISIBLE console window for
-            // the child's whole run on Windows (measured 2026-09-30);
-            // `spawnfd::command` gives it a windowless one. Not `qos::command`:
-            // the child is an aterm, which must not inherit a clamp.
+            // `aterm.exe` is a console image: started bare from the window it
+            // opens a visible console on Windows; `spawnfd::command` gives it a
+            // windowless one. Not `qos::command`: an aterm child must not
+            // inherit a clamp.
             let mut cmd = aterm_uds::spawnfd::command(&cli);
             cmd.args(with_socket(&plan.argv, sock.as_deref()));
             match cmd.output() {

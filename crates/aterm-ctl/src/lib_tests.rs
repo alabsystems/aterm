@@ -4410,3 +4410,180 @@ fn a_busy_answer_that_beat_the_timeouts_is_still_read() {
         "std's own zero-timeout refusal carries no errno and is not a hang-up"
     );
 }
+
+/// `sys` names the session it runs in (`caller=` from `$ATERM_PARENT_SESSION_ID`)
+/// unless the request already does, and only with a sid the server's grammar
+/// takes; every other verb is left alone.
+#[test]
+fn a_sys_request_names_its_caller_once_and_only_a_valid_sid() {
+    let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    for (request, sid, want) in [
+        ("sys", Some("s-ab12"), "sys caller=s-ab12"),
+        (
+            "sys cores --json",
+            Some("s-ab12"),
+            "sys cores --json caller=s-ab12",
+        ),
+        (
+            "@s-x sys procs",
+            Some("s-ab12"),
+            "@s-x sys procs caller=s-ab12",
+        ),
+        ("sys caller=s-mine", Some("s-ab12"), "sys caller=s-mine"),
+        ("sys", None, "sys"),
+        ("sys", Some(""), "sys"),
+        ("sys", Some("s-a b"), "sys"),
+        ("sys", Some("s-a;rm"), "sys"),
+        ("status", Some("s-ab12"), "status"),
+        ("await sys cpu<5%", Some("s-ab12"), "await sys cpu<5%"),
+    ] {
+        let mut parts = p(request);
+        add_sys_caller(&mut parts, sid);
+        assert_eq!(parts, p(want), "{request:?} with {sid:?}");
+    }
+    let mut long = p("sys");
+    add_sys_caller(&mut long, Some(&"a".repeat(65)));
+    assert_eq!(long, p("sys"), "a sid past 64 bytes is not added");
+}
+
+/// `instances=all` is a client fold for `sys` alone.
+#[test]
+fn only_sys_with_instances_all_is_folded_by_the_client() {
+    let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    assert!(is_sys_instances_all(&p("sys instances=all")));
+    assert!(is_sys_instances_all(&p("sys mem --json instances=all")));
+    assert!(is_sys_instances_all(&p("@s-x sys instances=all")));
+    assert!(!is_sys_instances_all(&p("sys")));
+    assert!(!is_sys_instances_all(&p("sys instances=one")));
+    assert!(!is_sys_instances_all(&p("status instances=all")));
+}
+
+/// The fold: text puts each instance's body under `instance pid=<pid>` and
+/// reads a miss as words; JSON wraps each reply object in one
+/// `sys.instances` object; a socket whose pid is gone is skipped.
+#[test]
+fn the_sys_instances_fold_keeps_each_reply_in_turn() {
+    let at = |pid: u32| format!("/run/aterm/{pid}.sock");
+    let probes = vec![
+        (
+            11,
+            at(11),
+            Probe::Answered(vec!["global cpu=10%".into(), "aterm cpu=2%".into()]),
+        ),
+        (12, at(12), Probe::Timeout),
+        (
+            13,
+            at(13),
+            Probe::Refused {
+                pid_running: Some(false),
+            },
+        ),
+        (14, at(14), Probe::Replied("ERR usage: sys".into())),
+        (
+            0,
+            "/tmp/x/s.sock".into(),
+            Probe::Answered(vec!["global cpu=10%".into()]),
+        ),
+    ];
+    let text = fold_sys_instances(&probes, false);
+    assert_eq!(
+        text.lines,
+        vec![
+            "instance pid=11",
+            "global cpu=10%",
+            "aterm cpu=2%",
+            "instance pid=12 unavailable(timeout)",
+            "instance pid=14 ERR usage: sys",
+            "instance sock=/tmp/x/s.sock",
+            "global cpu=10%",
+        ]
+    );
+    assert_eq!(text.answered, 2);
+    assert_eq!(text.notes.len(), 2, "{:?}", text.notes);
+    assert!(
+        text.notes[0].starts_with("instance pid=12: "),
+        "{:?}",
+        text.notes
+    );
+
+    let json = fold_sys_instances(
+        &[
+            (
+                11,
+                at(11),
+                Probe::Answered(vec![r#"{"schema":1,"kind":"sys.mem"}"#.into()]),
+            ),
+            (12, at(12), Probe::Timeout),
+            (
+                0,
+                "/tmp/\"q\"/s.sock".into(),
+                Probe::Answered(vec![r#"{"schema":1,"kind":"sys.mem"}"#.into()]),
+            ),
+        ],
+        true,
+    );
+    assert_eq!(
+        json.lines,
+        vec![
+            r#"{"schema":1,"kind":"sys.instances","instances":[{"pid":11,"sock":"/run/aterm/11.sock","reply":{"schema":1,"kind":"sys.mem"}},{"pid":0,"sock":"/tmp/\"q\"/s.sock","reply":{"schema":1,"kind":"sys.mem"}}]}"#
+        ]
+    );
+    assert_eq!(json.answered, 2);
+    assert_eq!(json.notes.len(), 1);
+    let none = fold_sys_instances(&[], true);
+    assert_eq!(
+        none.lines,
+        vec![r#"{"schema":1,"kind":"sys.instances","instances":[]}"#]
+    );
+}
+
+/// A whole run of `sys … instances=all` against one `--sock` instance: the
+/// request that reaches the socket has lost the fold word and the selector,
+/// and the run succeeds on that instance's answer.
+#[cfg(unix)]
+#[test]
+fn a_sys_instances_all_run_sends_the_plain_request_to_each_instance() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("aterm-ctl-sysall-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("s.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    let srv = std::thread::spawn(move || {
+        let (conn, _) = listener.accept().expect("accept");
+        let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+        let mut line = String::new();
+        r.read_line(&mut line).expect("request");
+        let mut w = conn;
+        w.write_all(b"OK 1 sys v=1 view=mem as_of=12:00:00.000 age_ms=5 window_ms=1000 next=a.1\n{\"schema\":1,\"kind\":\"sys.mem\"}\n")
+            .expect("reply");
+        w.flush().expect("flush");
+        line
+    });
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let argv = [
+        "--sock",
+        path.as_str(),
+        "@s-x",
+        "sys",
+        "mem",
+        "--json",
+        "instances=all",
+    ];
+    let code = real_main(
+        strings(&argv).into_iter().map(Into::into).collect(),
+        LocalVerbs::NONE,
+    )
+    .expect("the fold runs");
+    assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    let sent = srv.join().expect("server");
+    assert!(sent.starts_with("sys mem --json"), "{sent:?}");
+    assert!(
+        !sent.contains("instances=all") && !sent.contains("@s-x"),
+        "{sent:?}"
+    );
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir(&dir);
+}

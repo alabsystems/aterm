@@ -276,6 +276,19 @@ impl CapsLockKey {
 }
 
 impl Item for CapsLockKey {
+    fn preference_changes(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+    ) -> Result<Vec<(Target, Read<PValue>)>, String> {
+        let target = self.target();
+        let read = target.read(sys);
+        Ok(if plan(&read, self.mode)?.is_some() {
+            vec![(target, read)]
+        } else {
+            Vec::new()
+        })
+    }
     fn id(&self) -> String {
         format!(
             "keyboard.caps-lock.{}@{}",
@@ -393,6 +406,18 @@ impl SeenKeyboards {
 }
 
 impl Item for SeenKeyboards {
+    fn preference_changes(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+    ) -> Result<Vec<(Target, Read<PValue>)>, String> {
+        Ok(self
+            .plans(sys)?
+            .into_iter()
+            .filter(|p| p.want.is_some())
+            .map(|p| (self.target(p.model), p.read))
+            .collect())
+    }
     fn id(&self) -> String {
         format!("keyboard.caps-lock.seen@{}", self.user.name)
     }

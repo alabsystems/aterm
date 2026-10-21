@@ -9,10 +9,8 @@
 //! terminal acts on. The other stream stays a pipe and gets the bytes as they
 //! came (`inbox_metadata.rs` holds the pipe branch for every framing).
 //!
-//! The pty's line discipline maps `\n` to `\r\n` on output (`ONLCR`) — and
-//! macOS's can write that CR twice when its queue fills mid-line — so CRs read
-//! back right before a line break are the terminal's, not the CLI's, and are
-//! folded away; any other CR would be the server's.
+//! The line discipline maps `\n` to `\r\n` (`ONLCR`), and macOS's can write that CR twice
+//! when its queue fills mid-line, so CRs right before a line break are folded away.
 
 #![cfg(unix)]
 
@@ -182,10 +180,8 @@ fn active(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// A peer's mail read with `inbox get` on a terminal (OUT-1): the body that
-/// retitled the reader's tab and drew a forged `trust=human` line over the
-/// header arrives as text, every word of it; the header on the stderr pipe
-/// is the server's line as it came.
+/// A hostile mail body from `inbox get` reaches the terminal as text, every word of it; the
+/// header on the stderr pipe is the server's line as it came.
 #[test]
 fn a_mail_body_on_a_terminal_is_shown_not_obeyed() {
     let body: &[u8] = b"Deploy report from the build node:\n\x1b]2;PWNED-BY-PEER\x07\x1b[1A\

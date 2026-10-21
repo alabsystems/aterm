@@ -229,7 +229,13 @@ pub struct FooterFacts {
     /// Volatile email, subscription and weekly quota from the selected process's own
     /// profile. Replaced on every read, including account changes and missing data.
     pub subscription: Option<super::profile::SubscriptionDisplay>,
-    /// Standardized context budget indicator (`ctx 84% left` or `ctx auto`).
+    /// The window that binds this process's model ([`super::profile::plan_usage_for`]),
+    /// from the same read as [`Self::subscription`]
+    /// ([`super::profile::subscription_and_plan_for`]) and replaced with it. Not shown in
+    /// the footer: the Stats Deck reads it.
+    pub plan: Option<super::profile::PlanUsage>,
+    /// The context left, as read off the agent's own indicator on the glass (`ctx 84% left`).
+    /// `None` until one is read: no reading is no fact, never a placeholder.
     pub context: Option<String>,
 }
 
@@ -2276,13 +2282,16 @@ fn is_eperm(error: &std::io::Error) -> bool {
 }
 
 /// Whether `path` is inside a file-provider domain of `home` (iCloud Drive, a
-/// third-party sync provider): the one class a Full Disk Access grant does not
-/// cover, whose open raises a system dialog with no timeout that parks the
-/// opening thread (here the footer-resolver thread every Claude session
-/// shares). The path is resolved first (`realpath` is not gated,
-/// docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.5), so a symlink out of an
-/// ordinary folder is caught; the predicate itself is lexical. No `home`:
-/// nothing to fence against.
+/// third-party sync provider) or another app's data (`~/Library/Containers`,
+/// `~/Library/Group Containers`): the classes whose open raises a system
+/// dialog with no timeout that parks the opening thread (here the
+/// footer-resolver thread every Claude session shares, and the supervisor's
+/// Claude settings reader) either even under Full Disk Access (file-provider
+/// domains, §3.4) or on every launch without it because an Allow is forgotten
+/// when the responsible process exits (App Data, §1.6a). The path is resolved
+/// first (`realpath` is not gated, docs/DESIGN-macos-tcc-prompts-2026-08-30.md
+/// §1.5), so a symlink out of an ordinary folder is caught; the predicate
+/// itself is lexical. No `home`: nothing to fence against.
 pub(crate) fn under_file_provider_domain(home: Option<&Path>, path: &Path) -> bool {
     let Some(home) = home else {
         return false;
@@ -2290,6 +2299,7 @@ pub(crate) fn under_file_provider_domain(home: Option<&Path>, path: &Path) -> bo
     let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     atpkg::protected::under_file_provider_domain(&home, &resolved)
+        || atpkg::protected::under_app_data(&home, &resolved)
 }
 
 /// [`git_head`], saying why there is no answer when the kernel refused a read.
@@ -2558,6 +2568,7 @@ fn facts_for_entry_from(
         upgrade: None,
         account: None,
         subscription: None,
+        plan: None,
         context: None,
     }
 }
@@ -2798,6 +2809,34 @@ pub fn live_repl_row(rows: &[String]) -> Option<usize> {
     let bottom = aterm_phase::phase::composer_bottom(rows)?;
     mode_row_under(rows, bottom)
         .or_else(|| under_composer(rows, bottom).find(|&i| is_bare_footer_row(&rows[i])))
+}
+
+/// Whether Claude Code's screen says its context indicator has GONE (as after `/compact`), for
+/// the context fact, which follows the indicator ([`FooterFacts::context`]): the composer
+/// frame stands, neither place [`aterm_phase::phase::context_left_shown`] reads holds it, and
+/// right under the bottom rule stands Claude Code's own footer row ([`is_mode_row`],
+/// [`is_bare_footer_row`]) with nothing against the rule's right edge, the slot 2.1.305 draws
+/// the indicator in. Measured on 2.1.306 in the real-Claude lab (2026-10-21, a 100 000-token
+/// window compacting at 15%): the slot reads `0% until auto-compact` at rest, beside a draft
+/// and through a turn; Claude Code's own `◐ medium · /effort` takes it for a while after the
+/// first keystroke and for 6-10 s after a compaction; the `/` and `@` menus and the `?`
+/// shortcuts stand in the mode row's place while open; once the notice has gone after
+/// `/compact`, the slot is empty (after `/clear` it read `100% until auto-compact`). So a slot
+/// that holds anything says nothing of the indicator, and neither does a box (over the
+/// composer, so no frame, or above it: the supervisor's watch reads a box the same way), the
+/// `/` or `@` menu or the shortcuts in the footer row's place (no footer row right under the
+/// rule), or a screen with no composer. The box is read last, and only on a screen that would
+/// otherwise say the indicator has gone.
+#[must_use]
+pub fn context_gone(rows: &[String]) -> bool {
+    let Some(bottom) = aterm_phase::phase::composer_bottom(rows) else {
+        return false;
+    };
+    let width = rows[bottom].trim_end().chars().count();
+    rows.get(bottom + 1).is_some_and(|row| {
+        (is_mode_row(row) || is_bare_footer_row(row)) && row.trim_end().chars().count() + 3 < width
+    }) && aterm_phase::phase::context_left_shown(rows).is_none()
+        && aterm_phase::prompt::parse_prompt_v2(rows).is_none()
 }
 
 /// Whether `row` is Claude Code's pill-less footer row: after a two-space

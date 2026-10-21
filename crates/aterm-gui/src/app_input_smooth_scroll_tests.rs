@@ -241,7 +241,7 @@ fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
     // moving, inside the rest window. On the wall clock `TRACK_REST_MS`
     // could pass between the sends and the rest-settle would move the band.
     let t0 = std::time::Instant::now();
-    crate::app_input::pin_wheel_clock(Some(t0));
+    crate::app_input::pin_input_clock(Some(t0));
 
     let before = acq();
     app.on_mouse_wheel(
@@ -294,14 +294,14 @@ fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
     assert_eq!(term_lock(&term).grid().display_offset(), 1);
     // And a finger that rests past the rest window settles: the same second
     // delta sent after `TRACK_REST_MS` finds the band part-way home.
-    crate::app_input::pin_wheel_clock(Some(
+    crate::app_input::pin_input_clock(Some(
         t0 + std::time::Duration::from_millis(crate::scroll_motion::TRACK_REST_MS + 60),
     ));
     app.on_mouse_wheel(
         wid,
         MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 1.0)),
     );
-    crate::app_input::pin_wheel_clock(None);
+    crate::app_input::pin_input_clock(None);
     let rested = i64::from(app.windows[&wid].scroll_frac_px);
     assert!(
         rested > cell_h - dy as i64 - 2 && rested < cell_h,
@@ -326,7 +326,7 @@ fn a_sub_row_precise_delta_under_the_tab_menu_is_swallowed_like_a_notch() {
     let dy = (cell_h / 4) as f64;
     let acq = crate::term_lock_acquisitions_on_this_thread;
     let t0 = std::time::Instant::now();
-    crate::app_input::pin_wheel_clock(Some(t0));
+    crate::app_input::pin_input_clock(Some(t0));
     assert!(
         app.open_tab_context_menu_at_chip(wid, 0),
         "the card opens at the chip"
@@ -366,7 +366,7 @@ fn a_sub_row_precise_delta_under_the_tab_menu_is_swallowed_like_a_notch() {
         wid,
         MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy)),
     );
-    crate::app_input::pin_wheel_clock(None);
+    crate::app_input::pin_input_clock(None);
     let ws = &app.windows[&wid];
     assert!(
         ws.scroll_glide.is_some(),
@@ -441,7 +441,7 @@ fn a_constant_speed_precise_stream_moves_the_band_evenly() {
     let mut finger = 0.0f64;
     let mut prev = presented(&app);
     let mut vels: Vec<i64> = Vec::new();
-    crate::app_input::pin_wheel_clock(Some(std::time::Instant::now()));
+    crate::app_input::pin_input_clock(Some(std::time::Instant::now()));
     for i in 1..=60u32 {
         app.on_mouse_wheel(
             wid,
@@ -458,7 +458,7 @@ fn a_constant_speed_precise_stream_moves_the_band_evenly() {
         }
         prev = pos;
     }
-    crate::app_input::pin_wheel_clock(None);
+    crate::app_input::pin_input_clock(None);
     let (mx, mn) = (*vels.iter().max().unwrap(), *vels.iter().min().unwrap());
     assert!(
         mn >= 1 && mx <= 2 * mn,
@@ -612,7 +612,7 @@ fn a_precise_push_past_the_live_bottom_takes_no_lock_once_parked() {
     let acq = crate::term_lock_acquisitions_on_this_thread;
     // One instant for the whole gesture: the band never reaches its rest
     // window between two deltas of the same finger.
-    crate::app_input::pin_wheel_clock(Some(std::time::Instant::now()));
+    crate::app_input::pin_input_clock(Some(std::time::Instant::now()));
 
     let before = acq();
     app.on_mouse_wheel(wid, precise(-c / 2.0));
@@ -651,7 +651,7 @@ fn a_precise_push_past_the_live_bottom_takes_no_lock_once_parked() {
         "off the edge, no bounce"
     );
     assert_eq!(term_lock(&term).grid().display_offset(), 1);
-    crate::app_input::pin_wheel_clock(None);
+    crate::app_input::pin_input_clock(None);
 }
 
 /// A band parked on live when a pager comes up (alt screen + DEC 1007) is no
@@ -673,7 +673,7 @@ fn a_pager_that_comes_up_under_a_parked_band_still_gets_its_arrows() {
     let term = seed_history(&app, wid);
     let c = app.win_cell_size(wid).1.max(1) as f64;
     let precise = |dy: f64| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy));
-    crate::app_input::pin_wheel_clock(Some(std::time::Instant::now()));
+    crate::app_input::pin_input_clock(Some(std::time::Instant::now()));
     // Park the band on live.
     app.on_mouse_wheel(wid, precise(-c / 2.0));
     assert!(
@@ -686,7 +686,7 @@ fn a_pager_that_comes_up_under_a_parked_band_still_gets_its_arrows() {
     for _ in 0..4 {
         app.on_mouse_wheel(wid, precise(-c / 2.0));
     }
-    crate::app_input::pin_wheel_clock(None);
+    crate::app_input::pin_input_clock(None);
     let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
     let mut got = Vec::new();
     let mut buf = [0u8; 4096];
@@ -937,7 +937,7 @@ fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
         px_off: crate::input::PixelOffset::CELL_ORIGIN,
     };
     let t0 = std::time::Instant::now();
-    crate::app_input::pin_wheel_clock(Some(t0));
+    crate::app_input::pin_input_clock(Some(t0));
     app.input(wid, verb(2), Source::Controller);
     let (end, target) = {
         let st = app.windows[&wid]
@@ -952,9 +952,9 @@ fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
         "whole rows, from the verb's `lines=`"
     );
     assert_eq!(app.windows[&wid].wheel_precise_px, None);
-    crate::app_input::pin_wheel_clock(Some(t0 + Duration::from_millis(5)));
+    crate::app_input::pin_input_clock(Some(t0 + Duration::from_millis(5)));
     app.input(wid, verb(1), Source::Controller);
-    crate::app_input::pin_wheel_clock(None);
+    crate::app_input::pin_input_clock(None);
     {
         let st = app.windows[&wid]
             .scroll_glide

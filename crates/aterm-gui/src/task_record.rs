@@ -112,13 +112,19 @@ impl TaskState {
     }
 }
 
+/// The `why=` of the one `done` a harness writes: Autopilot Land LANDED the
+/// work ([`TASK_WHY`]'s first word). Every surface that words a landing
+/// reads it to say `landed`, and an older build's `marker|done-check` keeps
+/// `done` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4).
+pub(crate) const WHY_LANDED: &str = "landed";
+
 /// The closed `why=` vocabulary: what moved a task to its state. A word
 /// outside it is refused, so a reader can switch on it.
 pub(crate) const TASK_WHY: &[&str] = &[
     // `done`: Autopilot Land landed the work: a clean `Nothing left:`
     // defense at a land act's yield, over a repository holding nothing the
     // remote main lacks (FOREVER LAND). The one `done` a harness writes.
-    "landed",
+    WHY_LANDED,
     // `done`, READ ONLY: an older build's retired token rule. A record it
     // carried across a seamless update (or a rollback) still parses; no
     // harness writes it, and it seeds no landing.

@@ -220,6 +220,8 @@ impl Terminal {
         &mut self,
         reflowed: aterm_grid::ReflowedScrollback,
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
+        // Re-attachment may move the live rows and their cursor again.
+        self.transient.sync_end_caret = None;
         // The re-attach's deficit fill moves the screen down by the lines it
         // pulls back; the saved cursors and the fence's anchors move with it.
         self.lend_saved_cursors();
@@ -330,6 +332,9 @@ impl Terminal {
         rows_before: u16,
         origin: super::resize_journal::ResizeOrigin,
     ) {
+        // Even a later resize back to the same dimensions cannot reuse a
+        // pre-resize cell as an ordered close's caret.
+        self.transient.sync_end_caret = None;
         // Read before the journal drains the shape: a grow that handed a whole
         // resize undo back puts the pre-flap selection back below.
         let undone = self.grid.last_resize_shape().undone;

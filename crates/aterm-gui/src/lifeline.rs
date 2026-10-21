@@ -1,62 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LIFELINE — `--lifeline-fd <n>`: a harness's headless instance ends with the
-//! process that started it.
+//! `--lifeline-fd <n>`: a harness's headless instance ends with the process that started it.
+//! The descriptor protocol lives in `aterm_uds::lifeline`; this is the window's wiring:
 //!
-//! A test run or a script that boots `aterm --headless` used to end it only from
-//! its own cleanup, and a killed process runs none: one such instance ran for
-//! eleven days holding a shell, reachable by no `aterm ctl ls` (gap #36). The
-//! descriptor protocol and both of its ends live in `aterm_uds::lifeline`; this
-//! is the window's half of the wiring, in three steps, each at the one place in
-//! the launch where it is safe:
+//! 1. [`check_or_exit`], right after the command line is parsed: a descriptor that cannot be
+//!    a lifeline is a usage error before anything runs. A harness that asked for a lifeline
+//!    and silently did not get one would leak the instance.
+//! 2. [`adopt_or_exit`], after the boot apply: the descriptor moves to a private close-on-exec
+//!    copy (a stdio number gets `/dev/null` back), and any inherited copy of the launcher's end
+//!    is closed (the instance would otherwise wait on itself).
+//! 3. [`watch`], once the event loop's proxy exists: a thread blocks in `read` until
+//!    end-of-file and posts [`crate::Wake::LifelineCut`]; the event loop answers with the
+//!    ordinary quit (`App::on_lifeline_cut` → `on_quit_requested`), which unlinks the socket
+//!    and hangs up every shell. A process still alive [`SHUTDOWN_GRACE`] later leaves through
+//!    `crash_signal::clean_exit_now`, so a wedged main thread does not leak.
 //!
-//! 1. [`adopt_or_exit`], right after the boot apply (below; [`check_or_exit`]
-//!    refuses a descriptor that cannot be one before the apply runs): the inherited
-//!    descriptor moves to a private close-on-exec copy — no shell, helper or
-//!    successor this instance spawns carries it — and `/dev/null` goes back on
-//!    stdin; any copy of the launcher's end the instance inherited at another
-//!    number is closed, since the instance would otherwise wait on itself. A
-//!    descriptor that cannot be a lifeline stops the launch with a
-//!    usage error before any session runs: a harness that asked for a lifeline and
-//!    silently did not get one would leak exactly the instance it asked about.
-//! 2. [`watch`], once the event loop's proxy exists: one thread blocks in `read`
-//!    until end-of-file, then posts [`crate::Wake::LifelineCut`].
-//! 3. The event loop answers it with the ordinary quit
-//!    (`App::on_lifeline_cut` → `on_quit_requested`): the teardown Cmd-Q runs —
-//!    the socket and its token unlinked, the discovery entries withdrawn, and the
-//!    PTYs closed with the process, so every shell gets its hangup.
-//!
-//! A wedged main thread must not turn a cut lifeline back into a leak, so the
-//! watcher keeps a BACKSTOP: a process still here [`SHUTDOWN_GRACE`] after the
-//! wake leaves through `crash_signal::clean_exit_now`. Only an instance started
-//! with the flag has a watcher at all; every other launch is untouched.
-//!
-//! THE LIFELINE CROSSES THE INSTANCE'S OWN RELAUNCHES (round eight of the update
-//! audit, #28). Three paths replace this image with another one of the same
-//! launch, and each used to tell the new image `--lifeline-fd <n>` for a number
-//! step 1 had already retired — a usage error and exit 2, so the harness lost its
-//! instance to an update:
-//!
-//! * the BOOT SWAP's re-exec and the CRASH-LOOP REVERT's run inside the boot apply,
-//!   so step 1 now runs after it (`main_entry`): until then the number is the
-//!   launcher's, exactly as the new image must find it. The apply's helpers run
-//!   with `/dev/null` on stdin, and a copy of a lifeline's READ end they hold for
-//!   their bounded run keeps nobody alive;
-//! * the COLD LANE's `exec` runs long after step 1, so step 1 keeps a second
-//!   close-on-exec copy ([`relaunch_descriptor`]) that the lane names in the
-//!   successor's argv and makes inheritable for the `exec` alone
-//!   ([`inherit_across_exec`]).
+//! The lifeline crosses the instance's own relaunches. The boot swap's re-exec and the
+//! crash-loop revert run inside the boot apply, which is why adoption waits until after it:
+//! the new image must find the launcher's number intact. (The apply's helpers run with
+//! `/dev/null` on stdin; a read-end copy they hold keeps nobody alive.) The cold lane's `exec`
+//! runs later, so adoption keeps a second close-on-exec copy ([`relaunch_descriptor`]) that
+//! the lane names in the successor's argv and makes inheritable for the `exec` alone
+//! ([`inherit_across_exec`]).
 
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use aterm_window::event_loop::EventLoopProxy;
 
-/// How long a cut lifeline waits for the ordinary quit before the backstop ends
-/// the process. Generous on purpose: the quit's teardown can wait on a video
-/// export's cleanup, and the backstop is for a main thread that is not coming
-/// back, not for a slow one.
+/// How long a cut lifeline waits for the ordinary quit before the backstop ends the process.
+/// Generous: the teardown can wait on a video export's cleanup; the backstop is for a main
+/// thread that is not coming back.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// An adopted lifeline: the private copy, and the number the launcher named (for
@@ -66,22 +41,15 @@ pub(crate) struct Adopted {
     number: i32,
 }
 
-/// The copy of the lifeline a relaunch of this image hands on (see the module
-/// doc): a second close-on-exec descriptor of the same read end, kept for the
-/// process's life. A READ end keeps no launcher alive, so holding it changes
-/// nothing about when the lifeline is cut; a successor handed it reads the same
-/// end-of-file the watcher would have.
+/// The copy a relaunch of this image hands on: a second close-on-exec descriptor of the same
+/// read end, kept for the process's life. A read end keeps no launcher alive, so holding it
+/// does not delay the cut.
 static RELAUNCH_COPY: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
 
-/// End the launch with [`adopt_or_exit`]'s usage error (exit 2) now if descriptor
-/// `number` could not be taken over as a lifeline — changing nothing when it could
-/// (`aterm_uds::lifeline::check`). Called right after the command line is parsed,
-/// BEFORE the boot apply (round eight of the update audit, #28's review): the
-/// adoption itself waits until after the apply, whose re-exec must find the
-/// number as the launcher left it, and a usage error found only then had already
-/// let the apply swap a staged build in, re-exec and count a trial launch of it —
-/// three `--lifeline-fd 0` slips at a prompt walked a healthy build into its
-/// revert. A usage error stops the launch before anything runs, as it always did.
+/// Exit 2 with [`adopt_or_exit`]'s usage error now if descriptor `number` could not be
+/// adopted as a lifeline; changes nothing otherwise (`aterm_uds::lifeline::check`). Runs before
+/// the boot apply, so a bad flag cannot first let the apply swap in a staged build, re-exec and
+/// count a trial launch of it.
 pub(crate) fn check_or_exit(number: i32) {
     if let Err(e) = aterm_uds::lifeline::check(number) {
         crate::logging::stderr_line!("aterm-gui: {e} (try --help)");
@@ -100,9 +68,9 @@ pub(crate) fn adopt_or_exit(number: i32) -> Adopted {
             std::process::exit(2);
         }
     };
-    // A copy of the launcher's end inherited at another number would keep this
-    // instance waiting on itself (bash 3.2 leaks one into an `exec`'d program);
-    // `close_inherited_copies` says why. Still single-threaded here, as it needs.
+    // A copy of the launcher's end inherited at another number would keep this instance
+    // waiting on itself (bash 3.2 leaks one into an `exec`'d program). The sweep must run
+    // single-threaded, as the launch still is here.
     let copies = match aterm_uds::lifeline::close_inherited_copies(&fd) {
         Ok(closed) if closed.is_empty() => String::new(),
         Ok(closed) => {
@@ -113,18 +81,16 @@ pub(crate) fn adopt_or_exit(number: i32) -> Adopted {
                 numbers.join(", ")
             )
         }
-        // Unsure, so say so: the lifeline still works unless this process holds a
-        // copy of its launcher's end, and that is what could not be checked.
+        // The lifeline still works unless this process holds a copy of the launcher's end,
+        // which is what could not be checked.
         Err(e) => format!(
             " (could not check for inherited copies of it: {e}; one held here would keep it \
              from ending)"
         ),
     };
-    // The relaunch copy — AFTER the sweep above, which closes every other
-    // descriptor of this FIFO and would take the copy with it. `try_clone` is
-    // `F_DUPFD_CLOEXEC`: flagged from birth, numbered 3 or above. Without it a
-    // relaunch drops the flag (`running_window_successor_args`): the successor then
-    // runs unwatched, which its launcher's cleanup still ends.
+    // The relaunch copy is made after the sweep above, which would close it too. `try_clone`
+    // is `F_DUPFD_CLOEXEC`, so it is close-on-exec from birth. Without a copy a relaunch drops
+    // the flag (`running_window_successor_args`) and the successor runs unwatched.
     match fd.try_clone() {
         Ok(copy) => {
             let _ = RELAUNCH_COPY.set(copy);
@@ -134,8 +100,7 @@ pub(crate) fn adopt_or_exit(number: i32) -> Adopted {
              runs without one"
         ),
     }
-    // Said once, like the headless announcement beside it: a harness that armed a
-    // lifeline can read in its instance's log that it took.
+    // Said once, so a harness can read in its instance's log that the lifeline took.
     crate::logging::stderr_line!(
         "aterm-gui: lifeline armed on fd {number}: this instance shuts down when the process \
          that started it is gone{copies}"
@@ -149,19 +114,15 @@ pub(crate) fn relaunch_descriptor() -> Option<i32> {
     RELAUNCH_COPY.get().map(std::os::fd::AsRawFd::as_raw_fd)
 }
 
-/// Raised by the watcher the moment its read returns — before the wake that
-/// quits. A FIFO hands its end-of-file to ONE read (`aterm_uds::lifeline`'s
-/// measurement), so a lifeline already cut here would never read cut in a
-/// successor: it must not be handed on.
+/// Set by the watcher as soon as its read returns, before the quit wake. macOS hands a FIFO's
+/// end-of-file to one reader only, so a lifeline already cut here must not be handed on.
 static CUT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The relaunch copy made inheritable until the guard drops: taken right before an
-/// `exec` that hands it on, dropped when the `exec` returned — which puts
-/// close-on-exec back, so no shell or helper this process spawns after a failed
-/// relaunch holds it. `None` with no lifeline, with one already cut (this instance
-/// is on its way out, and a successor handed it would wait for an end-of-file that
-/// was already read — it is told a number it will not find instead, and exits), or
-/// when the flag could not be cleared.
+/// The relaunch copy made inheritable until the guard drops: taken right before an `exec`
+/// that hands it on; dropping it after a failed `exec` restores close-on-exec. `None` with no
+/// lifeline, with one already cut (a successor would wait for an end-of-file already read; it
+/// is told a number it will not find instead, and exits), or when the flag could not be
+/// cleared.
 pub(crate) fn inherit_across_exec() -> Option<InheritedAcrossExec> {
     if CUT_SEEN.load(std::sync::atomic::Ordering::Acquire) {
         return None;
@@ -202,20 +163,18 @@ fn set_close_on_exec(fd: i32, on: bool) -> bool {
     }
 }
 
-/// Watch `adopted` on its own thread: at end-of-file (or a read that fails) post
+/// Watch `adopted` on its own thread: at end-of-file (or a failed read) post
 /// [`crate::Wake::LifelineCut`] through `proxy`, then hold the backstop.
 ///
-/// FAIL SAFE when the thread cannot start: an armed lifeline nobody reads is the
-/// leak this exists to end, so the instance does not run on without one — it says
-/// so and exits, which its harness sees as an instance that failed to boot.
+/// Fails safe: if the thread cannot start the instance exits (EX_OSERR) rather than run with
+/// a lifeline nobody reads.
 pub(crate) fn watch(adopted: Adopted, proxy: EventLoopProxy<crate::Wake>) {
     let Adopted { fd, number } = adopted;
     let spawned = std::thread::Builder::new()
         .name("aterm-lifeline".to_string())
         .spawn(move || {
-            // Never Housekeeping: the backstop is a deadline, and a starved
-            // watcher would leak the very process it exists to end (the reapers'
-            // rule in `qos::Role::Housekeeping`).
+            // Never Housekeeping: the backstop is a deadline, and a starved watcher would leak
+            // the process it exists to end (`qos::Role::Housekeeping`).
             crate::qos::set_self(crate::qos::Role::Background);
             let cut = aterm_uds::lifeline::wait_for_cut(fd);
             CUT_SEEN.store(true, std::sync::atomic::Ordering::Release);
@@ -230,8 +189,7 @@ pub(crate) fn watch(adopted: Adopted, proxy: EventLoopProxy<crate::Wake>) {
                  gone; shutting down"
             );
             crate::logging::stderr_line!("aterm-gui: lifeline cut ({why}); shutting down");
-            // A send that fails means the event loop is already gone — the process
-            // is on its way out, and the backstop below covers it either way.
+            // A failed send means the event loop is already gone; the backstop covers it.
             let _ = proxy.send_event(crate::Wake::LifelineCut);
             std::thread::sleep(SHUTDOWN_GRACE);
             aterm_log::error!(
@@ -254,10 +212,10 @@ pub(crate) fn watch(adopted: Adopted, proxy: EventLoopProxy<crate::Wake>) {
     }
 }
 
-/// THE READY SIGNAL — `--ready-fd <n>`: a harness's headless instance says, once,
+/// `--ready-fd <n>`: a harness's headless instance says, once,
 /// that its control socket listens, so the harness waits on an event instead of
 /// polling the socket. The harness hands the write end of a pipe (a FIFO's, as
-/// `aterm_agent::ready` makes it) at number `n`; this instance writes ONE byte to
+/// `aterm_agent::ready` makes it) at number `n`; this instance writes one byte to
 /// it once the control listener is bound ([`signal_ready`], from the
 /// `Wake::ControlPrepared` the control thread posts after its bind), then closes
 /// it. Closed with nothing written, the instance has no socket to offer — the
@@ -385,10 +343,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aterm-lifeline-r8-28-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (held, far) = aterm_uds::lifeline::Lifeline::open(&dir).unwrap();
-        // The launcher's end is IN this process, so the adoption's sweep closes it
-        // as the copy a bash 3.2 launch leaks: it is never dropped here — not even
-        // by a failing assertion's unwind — or its number, closed and then reused
-        // by another test's file, would be closed a second time under that test.
+        // The launcher's end is in this process, so the sweep closes it (as a bash 3.2 leak);
+        // it is never dropped, even on unwind, or its reused number would be closed a second
+        // time under another test.
         let _held = std::mem::ManuallyDrop::new(held);
         // The instance's end is handed over by number.
         let number = far.into_raw_fd();

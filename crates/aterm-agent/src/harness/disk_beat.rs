@@ -12,7 +12,13 @@
 //! The host registers the one handler ([`set_handler`]); without one a beat
 //! does nothing. The count is one atomic add per entry and a lock only every
 //! [`EVERY`] entries.
+//!
+//! A walk that is not the watch's (the Stats Deck's read-only "where"
+//! survey, which runs whether or not the harness is on) walks the same trees
+//! through the same code, so it runs [`quietly`]: its thread beats nothing,
+//! and a stalled watch is not read as alive while a survey runs.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -25,6 +31,30 @@ pub type Handler = Arc<dyn Fn() + Send + Sync>;
 static HANDLER: Mutex<Option<Handler>> = Mutex::new(None);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// This thread runs a walk that is not the watch's ([`quietly`]).
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with this thread's beats silenced: every [`beat`] and [`tick`]
+/// it makes is no sign of the watch's progress and counts toward none.
+pub fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    /// The flag as it was, put back however `f` ends.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QUIET.with(|q| q.set(self.0));
+        }
+    }
+    let _restore = Restore(QUIET.with(|q| q.replace(true)));
+    f()
+}
+
+/// Whether this thread's beats are silenced ([`quietly`]).
+fn quiet() -> bool {
+    QUIET.with(Cell::get)
+}
+
 /// Register the one handler (the window's disk board), replacing any.
 pub fn set_handler(handler: Handler) {
     *HANDLER.lock().unwrap_or_else(PoisonError::into_inner) = Some(handler);
@@ -33,6 +63,9 @@ pub fn set_handler(handler: Handler) {
 /// Beat now: a step of a pass finished (a look began or ended, a directory
 /// was sized, a unit's step was taken).
 pub fn beat() {
+    if quiet() {
+        return;
+    }
     COUNT.store(0, Ordering::Relaxed);
     let handler = HANDLER
         .lock()
@@ -46,6 +79,9 @@ pub fn beat() {
 /// Count `n` entries a walk read or a delete removed, beating once every
 /// [`EVERY`].
 pub fn tick(n: usize) {
+    if quiet() {
+        return;
+    }
     let before = COUNT.fetch_add(n, Ordering::Relaxed);
     if crosses(before, n) {
         beat();
@@ -73,5 +109,38 @@ mod tests {
         assert!(!crosses(EVERY, EVERY - 1));
         assert!(crosses(10, 3 * EVERY));
         assert!(!crosses(0, 0));
+    }
+
+    /// A quiet thread's beats and entries reach no handler, however many it
+    /// counts, and its beats are heard again once the quiet call returns,
+    /// even one that panicked. Only this thread's beats are counted: other
+    /// tests walk on threads of their own.
+    #[test]
+    fn a_quiet_thread_never_beats() {
+        static HEARD: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+        set_handler(Arc::new(|| {
+            HEARD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(std::thread::current().id());
+        }));
+        let me = std::thread::current().id();
+        let heard = || {
+            HEARD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|t| **t == me)
+                .count()
+        };
+        quietly(|| {
+            beat();
+            tick(3 * EVERY);
+        });
+        assert_eq!(heard(), 0, "a quiet walk beat");
+        let failed = std::panic::catch_unwind(|| quietly(|| panic!("a survey that fails")));
+        assert!(failed.is_err());
+        beat();
+        assert_eq!(heard(), 1, "the watch's own beat is heard");
     }
 }

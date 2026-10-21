@@ -1,0 +1,30 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Sonnet bucket limit (seven_day_sonnet, 100 s) past its reset: Claude Code went on by itself (Usage limit reset · continuing automatically)
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.tcBP/proj
+
+
+❯ start the task
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Crunched for 0s · done 6:56 PM
+
+❯ carry on with the task
+  ⎿  You've hit your Sonnet limit · resets 6:57pm (America/Los_Angeles)
+     /upgrade to increase your usage limit.
+
+⏺ Usage limit reached · continuing automatically at 6:57pm · esc to cancel
+
+✻ Crunched for 0s · done 6:56 PM
+
+⏺ Usage limit reset · continuing automatically
+
+⏺ Hi! I am the local lab stub, not a model. (reply 3)
+
+✻ Crunched for 0s · done 6:59 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

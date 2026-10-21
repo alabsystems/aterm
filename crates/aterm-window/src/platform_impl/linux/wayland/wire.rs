@@ -85,6 +85,30 @@ impl Owned {
         Owned { proxy, destroy, listener }
     }
 
+    /// Own `proxy` and hand its events to `handler`, which runs inside the dispatch and records
+    /// nothing in the inbox (a `wl_buffer`'s `release`, which only its owner reads).
+    ///
+    /// # Safety
+    /// As [`Owned::listened`].
+    pub(crate) unsafe fn handled(
+        proxy: Proxy,
+        destroy: unsafe fn(Proxy),
+        handler: impl Fn(Proxy, u32, &[EventArg<'_>]) + Send + 'static,
+    ) -> Owned {
+        // SAFETY: the caller's contract; the listener is freed after the object is destroyed
+        // (Drop).
+        let listener =
+            unsafe { proxy.listen(move |object, opcode, args| handler(object, opcode, args)) };
+        let listener = match listener {
+            Ok(listener) => Some(listener),
+            Err(_error) => {
+                tracing::warn!("wayland: an object has no listener: {_error}");
+                None
+            },
+        };
+        Owned { proxy, destroy, listener }
+    }
+
     /// The object.
     pub(crate) fn proxy(&self) -> Proxy {
         self.proxy
@@ -164,8 +188,6 @@ pub(crate) enum Wire {
     Surface { surface: WindowId, event: SurfaceEvent },
     /// `wp_fractional_scale_v1.preferred_scale`: the window's scale, in 120ths.
     PreferredScale { window: WindowId, scale: u32 },
-    /// The window's frame callback is done.
-    Frame { window: WindowId },
     /// The seat's `zwp_text_input_v3`.
     TextInput { seat: u32, event: TextInputEvent },
     /// The window's attention request has its activation token.
@@ -387,11 +409,11 @@ mod tests {
     fn the_inbox_hands_out_what_it_heard_in_order_once() {
         let inbox = Inbox::default();
         let listener = inbox.clone();
-        listener.push(Wire::Frame { window: WindowId(1) });
+        listener.push(Wire::PreferredScale { window: WindowId(1), scale: 120 });
         listener.push(Wire::PreferredScale { window: WindowId(2), scale: 180 });
         let got = inbox.take();
         assert!(matches!(got.as_slice(), [
-            Wire::Frame { window: WindowId(1) },
+            Wire::PreferredScale { window: WindowId(1), scale: 120 },
             Wire::PreferredScale { window: WindowId(2), scale: 180 }
         ]));
         assert!(inbox.take().is_empty());

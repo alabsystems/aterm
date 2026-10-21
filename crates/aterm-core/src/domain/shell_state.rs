@@ -3,11 +3,8 @@
 
 //! Shell integration protocol state ([`ShellState`], OSC 133).
 
-/// OSC 133 shell integration states (FinalTerm protocol):
-/// - A: Prompt is starting
-/// - B: Command input is starting (prompt finished)
-/// - C: Command execution is starting (user pressed enter)
-/// - D: Command execution finished (with exit code)
+/// OSC 133 shell integration state (FinalTerm protocol). `D` (command finished) returns to
+/// [`Ground`](Self::Ground).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ShellState {

@@ -14,21 +14,12 @@ use aterm_messages::ink::{AnsiHues, BarBase, ThemeInks};
 use aterm_messages::tokens::{AuthoredChrome, ChromeSeeds, ChromeTokens};
 use aterm_render::Theme;
 
-// ---- The OS-forced chrome palette (Windows High Contrast) ---------------------------
-//
-// While a High Contrast scheme is active the OS palette owns every chrome surface:
-// `platform_win::apply_chrome_appearance` defers the caption, and this palette makes
-// the tab strip, find bar and message band follow it too.
-//
-// The terminal grid does not follow HC: its colour scheme is user content (Windows
-// Terminal keeps the profile scheme under HC too), so chrome follows the OS and
-// content follows the user.
-//
-// The palette is a process-global latch rather than an argument because every chrome
-// tone derives from a `Theme` alone (`band_colors`, `tab_bar::strip_colors`,
-// `tab_bar::blank_cell`, `tab_bar::strip_bleed_tones`) at many paint sites, and there
-// is one desktop and one HC scheme. Its one writer is
-// `platform_win::resync_forced_chrome_palette`; on other platforms it stays `None`.
+// The OS-forced chrome palette (Windows High Contrast). While a High Contrast scheme is
+// active the OS palette owns every chrome surface: `platform_win::apply_chrome_appearance`
+// defers the caption, and this palette drives the tab strip, find bar and message band.
+// The terminal grid keeps its scheme, which is user content. A process-global latch, not
+// an argument, because every chrome tone derives from a `Theme` alone at many paint sites;
+// its one writer is `platform_win::resync_forced_chrome_palette`.
 
 /// The OS-forced chrome palette: the five Win32 system colours chrome is painted from
 /// while a High Contrast scheme is active ([`aterm_messages::ink::ForcedPalette`]).
@@ -39,16 +30,14 @@ pub(crate) type ForcedChrome = aterm_messages::ink::ForcedPalette;
 /// `u32::MAX` cannot collide with a real colour.
 const FORCED_ABSENT: u32 = u32::MAX;
 
-/// The published palette, packed `0x00RRGGBB`, in [`ForcedChrome`] field order.
-///
-/// Relaxed atomics rather than a `Mutex<Option<_>>`, since `band_colors` /
-/// `strip_colors` run on paint paths.
+/// The published palette, packed `0x00RRGGBB`, in [`ForcedChrome`] field order. Atomics
+/// rather than a `Mutex<Option<_>>`, since `band_colors` / `strip_colors` run on paint
+/// paths.
 ///
 /// Publication protocol: slot 0 is the gate, written last when installing and first
 /// when clearing, so a reader sees either `FORCED_ABSENT` (and paints the ordinary
-/// theme tones) or a fully written set. Writer and readers share the winit main
-/// thread in production; [`published_forced_chrome_is_all_or_nothing`] holds the
-/// order.
+/// theme tones) or a fully written set. Writer and readers share the winit main thread
+/// in production; `published_forced_chrome_is_all_or_nothing` holds the order.
 static FORCED_CHROME: [AtomicU32; 5] = [
     AtomicU32::new(FORCED_ABSENT),
     AtomicU32::new(0),
@@ -65,15 +54,11 @@ thread_local! {
     static TEST_FORCED_CHROME: Cell<Option<ForcedChrome>> = const { Cell::new(None) };
 }
 
-/// Publish (or retract, with `None`) the OS-forced chrome palette. Returns `true`
-/// only when the palette moved, so the host can skip a strip-cache invalidation and
-/// repaint, and arms [`crate::native_appearance::note_chrome_inputs_moved`] so the
-/// settling re-sample learns of the move even if another reader consumed this edge
-/// (window attach and startup both republish the palette).
-///
-/// Write side only, hence the `cfg`: Windows
-/// (`platform_win::resync_forced_chrome_palette`) and [`hc_fixtures::with_forced`] are
-/// the only callers. The read side ([`forced_chrome`]) is unconditional.
+/// Publish (or retract, with `None`) the OS-forced chrome palette. Returns `true` only
+/// when the palette moved, so the host can skip a strip-cache invalidation and repaint.
+/// A move also arms [`crate::native_appearance::note_chrome_inputs_moved`], so the
+/// settling re-sample learns of it even when another caller got the `true` (window attach
+/// and startup both republish the palette).
 #[cfg(any(windows, test))]
 pub(crate) fn install_forced_chrome(palette: Option<ForcedChrome>) -> bool {
     let moved = {
@@ -141,8 +126,7 @@ fn publish_sequence(p: ForcedChrome) -> [(usize, u32); 6] {
     ]
 }
 
-/// The shipping half of [`forced_chrome`]. See [`publish_forced_chrome`] for why it
-/// is compiled unconditionally.
+/// The shipping half of [`forced_chrome`]; not `cfg`-gated, because every platform reads.
 fn published_forced_chrome() -> Option<ForcedChrome> {
     let window = FORCED_CHROME[0].load(Ordering::Acquire);
     if window == FORCED_ABSENT {
@@ -434,8 +418,8 @@ pub(crate) fn presence_tones(p: impl Into<ChromePalette>) -> PresenceTones {
     aterm_messages::presence::tones(rgb(p.theme.bg), &band_colors(p), forced_chrome())
 }
 
-/// Build one render cell for compact chrome — the renderer's (`aterm_render::band`,
-/// design ruling 331: the one table the native window and the web module share).
+/// Build one render cell for compact chrome: `aterm_render::band::cell`, the one table
+/// the native window and the web module share.
 pub(crate) use aterm_render::band::cell;
 
 /// A theme-derived blank band cell with a top seam.
@@ -453,8 +437,10 @@ pub(crate) fn blank_cell(p: impl Into<ChromePalette>) -> RenderCell {
 /// [`cell`] with `seam: false`), leaving the rule only where there are no words.
 /// Drawing it here across the finished row keeps it continuous.
 ///
-/// `ink` is the seam's own tone rather than each cell's `fg`, since a title row can
-/// carry several inks and a structural edge must not change tone under the words.
+/// [`blank_cell`] and `settings::blank_row` stamp the seam, but writers rebuild the cells
+/// they write (`settings::write_str` passes `seam: false`), so the rule would survive only
+/// where there are no words. `ink` is the seam's own tone, not each cell's `fg`: a title
+/// row can carry several inks, and a structural edge keeps one.
 pub(crate) fn seal_band_top(row: &mut [RenderCell], ink: [u8; 3]) {
     for cell in row.iter_mut() {
         cell.overline = true;
@@ -772,11 +758,11 @@ mod tests {
     fn meter_floors(name: &str, colors: &BandColors) {
         for fill in [colors.accent, colors.warn] {
             let inks = crate::message_band::MeterInks::of(colors, fill);
-            // The HEAD is a comet's: its inks are the comet's (a bar has none).
+            // The head is a comet's: its inks are the comet's (a bar has none).
             let comet = crate::message_band::MeterInks::comet(colors, fill).0;
             let head = crate::message_band::tone_rgb(aterm_messages::Tone::HEAD, &comet);
             let words = crate::message_band::fill_ink(colors, fill);
-            // The glint IS the fill's one step away from those words.
+            // The glint is the fill's one step away from those words.
             assert_eq!(
                 inks.glint,
                 crate::message_band::glint_step(fill, words, false),
@@ -885,8 +871,7 @@ mod tests {
 
     #[test]
     fn band_colors_meet_wcag_aa_on_every_builtin_scheme() {
-        // This test measures the theme-derived tones, which exist only with no OS
-        // palette; asserting it makes a leaked palette fail with a clear message.
+        // Theme-derived tones exist only with no OS palette; a leaked palette fails here.
         assert_eq!(
             forced_chrome(),
             None,
@@ -906,8 +891,8 @@ mod tests {
                     "{name} {role} must meet WCAG-AA"
                 );
             }
-            // The inset well carries the find query + its caret: both must clear AA
-            // against the WELL's background, not the band's.
+            // The inset well carries the find query and its caret, which must clear AA
+            // against the well's background, not the band's.
             assert!(
                 contrast(colors.caret, colors.field_bg) >= 4.5,
                 "{name} caret must meet WCAG-AA in the well"
@@ -928,8 +913,7 @@ mod tests {
                 contrast(colors.bar_bg, colors.accent) >= 3.0,
                 "{name} Primary capsule ink must clear 3:1 on the accent fill"
             );
-            // The indicator wears the cursor accent; its glint and hot head keep their
-            // floor.
+            // The meter's glint and hot head keep their floors.
             meter_floors(name, &colors);
             // The lit Primary keeps that floor with the same ink and is a visible step
             // off the resting accent wherever the ink is not the accent itself, so a
@@ -972,8 +956,8 @@ mod tests {
                 colors.capsule_primary_hover, colors.capsule_hover,
                 "{name}: the lit Primary is not the grey hover"
             );
-            // …and the hover fill is a REAL step off the band on every scheme
-            // where the ink allows one, so a hovered chip is visibly raised.
+            // …and the hover fill is a real step off the band wherever the ink allows
+            // one, so a hovered chip is visibly raised.
             if contrast(colors.value, mix3(colors.bar_bg, rgb(theme.fg), 0.05)) >= 4.5 {
                 assert_ne!(
                     colors.capsule_hover, colors.bar_bg,
@@ -983,12 +967,10 @@ mod tests {
         }
     }
 
-    /// The fault wash stays in its hull: a Fault echo hands the fill's coverage to warn
-    /// as a premultiplied cross-fade in linear light (`fill · (1 − u)` of the fill,
-    /// `fill · u` of warn), so on every builtin
-    /// scheme, both fills a row can wear (accent, warn) and every stock High Contrast
-    /// palette, each step lies inside the track–fill–warn triangle, with the fill (or
-    /// track) and warn as its ends.
+    /// The fault wash stays in its hull: a Fault echo cross-fades the fill's coverage to
+    /// warn (premultiplied, linear light), so on every builtin scheme and stock High
+    /// Contrast palette, for both fills a row can wear (accent, warn), each step lies
+    /// inside the track–fill–warn triangle with the fill (or track) and warn as its ends.
     #[test]
     fn the_fault_wash_stays_inside_the_track_fill_warn_hull() {
         let check = |name: &str, colors: &BandColors| {

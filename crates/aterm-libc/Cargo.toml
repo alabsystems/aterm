@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-# Package `libc` (directory `aterm-libc`, as with crates/aterm-cfg-if):
-# `[patch.crates-io]` matches on package name, so this name redirects every
-# consumer's `libc = "0.2"`; the directory prefix marks it as ours.
+# Named `libc` because `[patch.crates-io]` matches on package name: this
+# redirects every consumer's `libc = "0.2"` here.
 name = "libc"
 # NOT `version.workspace = true`: a semver contract with consumers. The
 # strictest requirement was `^0.2.182` (rustix 1.1.4, which left the lock at
@@ -21,7 +20,7 @@ description = "First-party platform ABI declarations for aterm (replaces the cra
 [lib]
 name = "libc"
 path = "src/lib.rs"
-# No unit tests in src/; doctests still run.
+# src/ has no unit tests; one added there would not run.
 test = false
 
 [features]
@@ -33,10 +32,9 @@ test = false
 # gates.
 default = ["std"]
 extra_traits = []
-# The rest are inert: this crate is always `no_std`; `align` and
-# `const-extern-fn` effects are unconditional in the generated cells;
-# `rustc-dep-of-std` deliberately omits upstream's `rustc-std-workspace-core`
-# (this crate cannot build `std` itself, and nothing in aterm asks it to).
+# Inert: the crate is always `no_std`, the generated cells apply `align` and
+# `const-extern-fn` unconditionally, and `rustc-dep-of-std` omits upstream's
+# `rustc-std-workspace-core` (nothing in aterm builds `std` from this crate).
 std = []
 use_std = ["std"]
 align = []

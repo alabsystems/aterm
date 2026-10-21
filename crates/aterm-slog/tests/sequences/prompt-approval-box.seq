@@ -4,7 +4,7 @@ seq v=1 rig=screen program=claude build=2.1.0
 see busy
 half
 see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
-expect open p1 approval par=t1 box=bash:not-read-only src=screen conf=strong at=500
+expect open p1 approval par=t1 box=bash:not-read-only src=screen conf=strong @500
 expect need=approval:bash
 expect clause=approval · bash
 see busy

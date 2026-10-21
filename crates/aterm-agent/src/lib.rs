@@ -34,9 +34,9 @@ use std::io::{Read, Write};
 
 /// AI connections: one working login per AI CLI, its doctor, and reviews across AIs.
 pub mod ai;
-/// The `aterm drive` CLI (binary-era `aterm-drive`), callable in-process.
+/// The `aterm drive` CLI, callable in-process.
 pub mod drive_cli;
-/// The `aterm fleet` CLI (binary-era `aterm-fleet`), callable in-process.
+/// The `aterm fleet` CLI, callable in-process.
 pub mod fleet_cli;
 /// `aterm fleet init|join|peers|allow|leave`: this machine's membership in a
 /// fleet.
@@ -61,7 +61,7 @@ pub mod supervise;
 /// The verb the one binary answers a control request on: `aterm ctl …`.
 pub const CTL_VERB: &str = "ctl";
 
-/// THIS PROCESS'S OWN EXECUTABLE, resolved through any argv0 alias link
+/// This process's own executable, resolved through any argv0 alias link
 /// (`aterm-drive` -> `aterm`), for a control client run as `<it> ctl …`
 /// ([`CtlClient::own_at`]): the one binary answers `aterm ctl`. No sibling
 /// `aterm-ctl` and no `PATH` lookup: the client is always this build's own.
@@ -232,18 +232,20 @@ pub struct RelayClient<S: Read + Write> {
     help: Vec<(String, (String, String))>,
 }
 
-/// THE VERBS A READ-ONLY CONNECTION MAY SEND ([`RelayClient::reads_only`]):
+/// The verbs a read-only connection may send ([`RelayClient::reads_only`]):
 /// each observes, and none changes the session, its screen, its leases or its
 /// processes. `meta` only bare (its `set`/`unset` change the session's
-/// metadata). Anything not named here is refused: an allowlist, so a verb
-/// added to the server is no read until it is named.
+/// metadata), and `doc` only as `ls`, `read` and `log` (its `apply` and
+/// `save` change a document). Anything not named here is refused: an
+/// allowlist, so a verb added to the server is no read until it is named.
 pub const READ_VERBS: &[&str] = &[
     "text", "screen", "line", "cell", "cursor", "modes", "blocks", "history", "status", "timeline",
-    "metrics", "await", "who", "sessions", "help", "meta", "ls",
+    "metrics", "await", "who", "sessions", "help", "meta", "ls", "doc",
 ];
 
 /// Whether the control request `line` (an optional `@<sid>` selector, then the
-/// verb) is one [`READ_VERBS`] names, and a bare `meta` when it is `meta`.
+/// verb) is one [`READ_VERBS`] names, and a bare `meta` when it is `meta`
+/// (a read form of `metrics` and `doc` when it is one of those).
 fn is_read_request(line: &str) -> bool {
     let mut words = line.split_whitespace().skip_while(|w| w.starts_with('@'));
     match words.next() {
@@ -256,6 +258,9 @@ fn is_read_request(line: &str) -> bool {
             let mut command = words.filter(|w| !matches!(*w, "json" | "--json"));
             matches!(command.next(), None | Some("percentiles")) && command.next().is_none()
         }
+        // `doc ls`, `doc read` and `doc log` read documents; `doc apply` and
+        // `doc save` write them.
+        Some("doc") => matches!(words.next(), Some("ls" | "read" | "log")),
         Some(verb) => READ_VERBS.contains(&verb),
         None => false,
     }
@@ -319,14 +324,11 @@ impl<S: Read + Write> RelayClient<S> {
         Ok(reply)
     }
 
-    /// Read the FIRST line of a reply: [`Self::read_line`], except that a
-    /// forward's HOST-GONE line
-    /// ([`aterm_types::control_verbs::host_gone_line`]) is no answer — the
-    /// aterm hosting the session went away under the forward before it
-    /// answered, and the connection closes after it: the same fact as a direct
-    /// connection's end of file, and read as one (`UnexpectedEof`, naming the
-    /// host), so every caller that rides out a hang-up rides this out too.
-    /// Only where a reply begins: a body row reads as whatever it says.
+    /// Read the first line of a reply. A forward's host-gone line
+    /// ([`aterm_types::control_verbs::host_gone_line`]) is no answer: the aterm
+    /// hosting the session went away and the connection closes, so it reads as
+    /// end of file (`UnexpectedEof`, naming the host) and every caller that
+    /// rides out a hang-up rides it out too. Body rows are not checked.
     fn read_reply(&mut self) -> std::io::Result<String> {
         let line = self.read_line()?;
         match aterm_types::control_verbs::host_gone(&line) {
@@ -1196,11 +1198,9 @@ mod tests {
         assert!(client.io.sent.is_empty());
     }
 
-    /// THE HOST THAT WENT AWAY UNDER A FORWARD IS THE CONNECTION CLOSING, NOT
-    /// AN ANSWER. A forwarding aterm's last line, `ERR gone pid=<host>
-    /// sock=<its socket>`, is the same fact as a direct connection's EOF; read
-    /// as a refusal, the supervisor stopped (`Fail::Hard`) where it rides out a
-    /// hang-up. Every read sees it as the connection that closed, saying whose.
+    /// A forwarding aterm's last line, `ERR gone pid=<host> sock=<its socket>`,
+    /// is the same fact as a direct connection's EOF; every read sees it as the
+    /// connection closing, naming the host.
     #[test]
     fn relay_client_reads_the_host_gone_line_as_the_connection_closing() {
         let mut client = RelayClient::new(RecordingTransport::new(
@@ -1262,13 +1262,12 @@ mod tests {
         assert_eq!(client.io.sent, b"help turn\nhelp turn\n");
     }
 
-    /// A READ-ONLY CONNECTION HAS NO HANDS: the read verbs go out as written
-    /// (`text`, `status`, `await`, a bare `meta`, with or without a selector);
-    /// an input verb, a signal, a lease, a `meta set`, a verb it does not name
-    /// and a length-framed write are each refused with nothing written.
-    /// NEGATIVE CONTROL: the same requests on an ordinary connection are sent.
-    /// A read-only connection admits the server's metric reads, including
-    /// either JSON spelling, but no reset or metadata edit reaches its transport.
+    /// A read-only connection sends the read verbs as written (`text`, `status`,
+    /// `await`, a bare `meta`, and metric reads under either JSON spelling, with
+    /// or without a selector); an input verb, a signal, a lease, a `meta set`, a
+    /// metric reset, a verb it does not name and a length-framed write are each
+    /// refused with nothing written. Negative control: an ordinary connection
+    /// sends them.
     #[test]
     fn a_read_only_connection_refuses_every_mutating_subform() {
         let reads = [
@@ -1317,6 +1316,44 @@ mod tests {
         );
     }
 
+    /// `doc` is a read in its read forms alone: `ls`, `read` and `log` are
+    /// sent, aimed or not, and `apply`, `save`, an unknown form and the bare
+    /// verb write nothing. NEGATIVE CONTROL: an ordinary connection sends a
+    /// write form.
+    #[test]
+    fn a_read_only_connection_sends_doc_reads_alone() {
+        let reads = [
+            "doc ls",
+            "doc ls uri=file:///tmp/x.txt",
+            "@s-1 doc read 3 lines=1-20",
+            "doc read file:///tmp/x.txt",
+            "doc log 3 since=2",
+        ];
+        let writes = [
+            "doc apply 3 base=4 len=12",
+            "@s-1 doc save 3",
+            "doc",
+            "doc frob 3",
+        ];
+        let mut ro =
+            RelayClient::new(RecordingTransport::new(&b"OK 0\n".repeat(reads.len()))).reads_only();
+        for read in reads {
+            assert!(ro.request_line(read).is_ok(), "{read}");
+        }
+        let sent = ro.io.sent.clone();
+        for write in writes {
+            let refused = ro.request_line(write).expect_err(write);
+            assert_eq!(
+                refused.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{write}"
+            );
+        }
+        assert_eq!(ro.io.sent, sent, "no write form wrote a byte");
+        let mut plain = RelayClient::new(RecordingTransport::new(b"OK\n"));
+        assert!(plain.request_line("doc save 3").is_ok());
+    }
+
     #[test]
     fn a_read_only_connection_sends_the_read_verbs_alone() {
         let reads = [
@@ -1351,10 +1388,9 @@ mod tests {
         assert!(plain.request_line("@s-1 meta set attention x").is_ok());
     }
 
-    /// THE CLIENT IS THIS BUILD'S OWN `ctl` VERB: [`CtlClient::own_at`] runs
-    /// `<exe> ctl --sock <sock> <args>`, in that order, and [`own_exe`] names a
-    /// file that exists (this test binary). NEGATIVE CONTROL: a client built
-    /// with [`CtlClient::new`] puts nothing before `--sock`.
+    /// [`CtlClient::own_at`] runs `<exe> ctl --sock <sock> <args>` in that
+    /// order, and [`own_exe`] names a file that exists (this test binary).
+    /// Negative control: [`CtlClient::new`] puts nothing before `--sock`.
     #[cfg(unix)]
     #[test]
     fn the_own_client_runs_the_ctl_verb_first() {

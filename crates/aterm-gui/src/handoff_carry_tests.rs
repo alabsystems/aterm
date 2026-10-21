@@ -132,10 +132,9 @@ fn the_tail_starts_after_the_eighth_newest_submitted_turn() {
     assert!(carry.turns.iter().all(|r| r.carried));
 }
 
-/// The tail never stops short of what the adopting differ may point back at
-/// (`aterm-core` widens it to its reach: the last eight screens of rows), so a
-/// scroll-back past the turns' marks after the handoff is recognized as the
-/// old process would have. Here the eight turns are close together.
+/// The tail never stops short of what the adopting differ may point back at (`aterm-core`
+/// widens it to the last eight screens of rows), so a scroll-back past the turns' marks is
+/// recognized after the handoff. Here the eight turns are close together.
 #[test]
 fn the_tail_reaches_back_as_far_as_the_differ_can_point() {
     let (term, turns) = session(300);
@@ -165,10 +164,9 @@ fn with_no_turn_the_newest_rows_are_carried_up_to_the_cap() {
     assert_eq!(archive.rows.len(), t.alt_archive().len());
 }
 
-/// H1 / the freeze-budget path: a lock another thread keeps, or an archive
-/// that moved since the freeze, carries the counters alone — the rows count
-/// as lost — and past half the budget the freeze leaves the differ's state
-/// out as well. Never an error.
+/// A lock another thread keeps, or an archive that moved since the freeze, carries the
+/// counters alone (the rows count as lost), and past half the budget the freeze leaves the
+/// differ's state out as well. Never an error.
 #[test]
 fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
     let (term, turns) = session(80);
@@ -261,10 +259,8 @@ fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
     assert!(archive.differ.is_none(), "the differ moved: not taken");
 }
 
-/// Round eight, finding 731: a lock the export gives up on is SAID, by
-/// session and cause, as every other carry loss is — the ledger it leaves
-/// behind and the archive rows it counts lost no longer read like a session
-/// nobody drove. A carry that took both locks notes nothing.
+/// A lock the export gives up on is logged by session and cause, like every other carry loss;
+/// a carry that took both locks notes nothing.
 #[test]
 fn a_lock_the_export_gives_up_on_is_said_by_session_and_cause() {
     let (term, turns) = session(80);
@@ -593,8 +589,8 @@ fn the_sidecar_round_trips_and_tolerates_what_it_does_not_know() {
     );
     assert!(decode(b"").is_none());
 
-    // A status word this build does not print drops that record only — and
-    // the carry no longer vouches for its id (round eight, finding 714).
+    // A status word this build does not print drops that record only, and the carry no longer
+    // vouches for its id.
     let odd = text.replacen("\"settled\"", "\"exploded\"", 1);
     let odd = decode(odd.as_bytes()).unwrap();
     assert_eq!(odd.turns.len(), want.len() - 1);
@@ -657,8 +653,8 @@ fn a_turn_id_past_the_manifest_range_is_left_out() {
         let carry = decode(spoiled.as_bytes()).unwrap();
         let high = carry.high_turn_id().unwrap();
         assert!(high <= MAX_TURN_ID && high.checked_add(1).is_some());
-        // A record left out is one the carry no longer vouches for (round
-        // eight, finding 714), held to the range like the sender's floor.
+        // A record left out is one the carry no longer vouches for, held to the range like
+        // the sender's floor.
         let floor = if kept { 0 } else { MAX_TURN_ID + 1 };
         assert_eq!(carry.unheld_below, floor, "id {id}");
     }
@@ -675,19 +671,8 @@ fn a_turn_id_past_the_manifest_range_is_left_out() {
     );
 }
 
-/// Round eight, finding 714: a record the receiver cannot read is left out,
-/// and its id is no longer vouched for — and a hop to an OLDER build spells
-/// every record in that build's words, so it is not left out at all.
-///
-/// (a) A status word this build does not know (a later build's, when this
-/// one is the rollback target) leaves the record out and raises
-/// `unheld_below` past it: a resumed `since-turn=` below it is told
-/// (`GAP … events-resync=`), and `history` says it (`unheld_below=`).
-/// (b) v0.98.0 knows `settled` and `timeout` alone, and leaves out a
-/// `hangup` record while its floor still vouches for it; the export to a
-/// build from before `hangup` says `timeout` instead, so all three records
-/// cross. (c) A rollback to v0.100.0 or later, which reads `hangup`, still
-/// gets the word as it is, as it did before this export respelled any.
+/// A record the receiver cannot read is left out and its id no longer vouched for, and a hop
+/// to an older build spells every record in that build's words so none is left out.
 #[test]
 fn a_record_the_receiver_cannot_read_is_not_vouched_for() {
     let (term, turns) = session(30);
@@ -917,11 +902,9 @@ fn an_adopted_ledger_says_which_turn_ids_it_cannot_vouch_for() {
     assert_eq!(ledger.low_id(), Some(40), "a held record is the low-water");
 }
 
-/// Round seven, finding 23: a `turn` still waiting when the park exported
-/// the ledger records into the exiting process afterwards (the frozen screen
-/// latches its idle settle). The carried ledger never gets that record, so it
-/// must not vouch for its id: a subscriber resuming from before it is told,
-/// and one resuming from it is not.
+/// A `turn` still waiting when the park exported records into the exiting process afterwards,
+/// so the carry must not vouch for its id: a subscriber resuming from before it is told, one
+/// resuming from it is not.
 #[test]
 fn a_turn_open_at_the_export_is_not_vouched_for_by_the_carry() {
     let ledger = Arc::new(Mutex::new(TurnLedger::default()));
@@ -947,14 +930,11 @@ fn a_turn_open_at_the_export_is_not_vouched_for_by_the_carry() {
     assert!(4 + 1 >= low, "anchor 4 saw it, and is not told (low {low})");
 }
 
-/// Round eight, finding 40: a turn still open at the export whose record
-/// lands under an id minted AFTER it — `TurnLedger::record` re-numbers a
-/// record that lands behind a later one (round seven, finding 43) — is just
-/// as lost to the successor as one under its own id (finding 23). The carry
-/// does not vouch for any id that record can land under: every id the
-/// exiting process may still mint, up to the turn-id ceiling its manifest
-/// carries. Two shapes: a preempted turn at or below a newer record, and two
-/// turns open at once that record in the other order.
+/// A turn open at the export whose record lands under an id minted after it
+/// (`TurnLedger::record` re-numbers a record that lands behind a later one) is as lost to the
+/// successor as one under its own id, so the carry vouches for no id up to the manifest's
+/// turn-id ceiling. Two shapes: a preempted turn below a newer record, and two open turns
+/// that record in the other order.
 #[test]
 fn a_preempted_open_turn_renumbered_after_the_export_is_not_vouched_for() {
     let ceiling = crate::control::turn_ids_for_handoff();
@@ -1007,13 +987,9 @@ fn a_preempted_open_turn_renumbered_after_the_export_is_not_vouched_for() {
     assert!(ceiling < low, "turn {ceiling} is vouched for (low {low})");
 }
 
-/// Round eight, finding 41 (what remained of round seven's 37): when the
-/// ledgers ALONE overflow the aggregate, it is shared out, not spent first
-/// come, first served. Every session keeps its newest records — a short
-/// ledger keeps all of it, wherever it stands in pool order — and the long
-/// ones are cut evenly, by no more than the aggregate needs; each carry
-/// names the ids it shed (`unheld_below`). Greedy, the first sessions kept
-/// their whole ledgers and the last lost theirs entirely, every update.
+/// When the ledgers alone overflow the aggregate it is shared out: every session keeps its
+/// newest records (a short ledger all of them, wherever it stands in pool order), the long
+/// ones are cut evenly by no more than needed, and each carry names the ids it shed.
 #[test]
 fn a_desk_whose_ledgers_overflow_the_aggregate_keeps_every_sessions_newest_turns() {
     let (term, _) = session(20);
@@ -1062,11 +1038,8 @@ fn a_desk_whose_ledgers_overflow_the_aggregate_keeps_every_sessions_newest_turns
     assert_eq!(carries[64].unheld_below, 0);
 }
 
-/// Round seven, finding 37: the aggregate is spent on every session's
-/// ledger and counters first, and on archive rows only with what is left.
-/// Spent first come, first served, a crowded desk's first sessions carried
-/// their optional rows and the last ones lost their whole ledger, on every
-/// update.
+/// The aggregate goes to every session's ledger and counters first, and to archive rows only
+/// with what is left.
 #[test]
 fn a_crowded_desk_keeps_every_sessions_ledger() {
     let (term, turns) = session_every(8000, 2000);
@@ -1120,10 +1093,9 @@ impl Rng {
     }
 }
 
-/// M2, the decoder half: a valid sidecar mangled — bytes flipped, cut
-/// short, spliced, numbers swapped for huge ones — either decodes to
-/// something the adopting engine installs, or to nothing; and the engine
-/// then takes random frames, at random sizes, without a panic.
+/// A mangled sidecar (bytes flipped, cut short, spliced, numbers swapped for huge ones)
+/// decodes to something the adopting engine installs or to nothing, and the engine then takes
+/// random frames at random sizes without a panic.
 #[test]
 fn a_mangled_sidecar_never_panics_the_adopting_engine() {
     let (term, turns) = session(90);
@@ -1233,7 +1205,7 @@ fn timeline_with_log(n: usize) -> Arc<Mutex<crate::session_timeline::SessionTime
     {
         let mut g = tl.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         for _ in 0..n {
             g.slog_mut().human_input(true, now);
         }
@@ -1386,6 +1358,7 @@ fn a_bad_or_oversized_log_costs_only_the_log() {
             mirror: None,
         },
         false,
+        None,
         aterm_slog::Stamp::new(1_760_000_000_000, 5),
     );
     let first = log.log().window().next().expect("a record");
@@ -1561,6 +1534,7 @@ fn a_mirrored_logs_cursor_crosses_beside_its_log_and_a_refused_carry_still_owes_
             mirror: Some(prior),
         },
         false,
+        None,
         aterm_slog::Stamp::new(1_760_000_000_000, 5),
     );
     assert_eq!(
@@ -1645,6 +1619,7 @@ fn a_mangled_log_member_never_panics_the_adopting_log() {
                 mirror: None,
             },
             false,
+            None,
             aterm_slog::Stamp::new(1_760_000_000_000, 5),
         );
         let seqs: Vec<u64> = log.log().window().map(|r| r.seq).collect();

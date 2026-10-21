@@ -13,7 +13,7 @@
 (deny file-write* (regex #"^/private/tmp/(at|labprobe)\.[^/]+(/|$)"))
 (allow file-write* (subpath "@SOCKDIR@"))
 @TMP_REPLICA@
-;; THE CONTROL SOCKET: the lab's unjailed client dereferences whatever stands at these two paths, so a jailed process may
+;; THE CONTROL SOCKET: the lab's client dereferences whatever stands at these two paths, so a jailed process may
 ;; neither remove nor move them nor their directory (a link planted in their place made the client drive another lab's tab
 ;; and send the aterm token to a jailed listener); the door also refuses a link
 (deny file-write-unlink (literal "@SOCKDIR@/a.sock") (literal "@SOCKDIR@/a.sock.token") (literal "@SOCKDIR@"))
@@ -45,13 +45,27 @@
 ;; (a bare-name open call lands on the lab's recorder instead)
 @MACH_DENY_OPEN@
 (deny process-exec (literal "/usr/bin/open"))
+;; PREFERENCES: moving HOME does not move the UID account's CFPreferences daemons, shared memory or domains.
+;; Deny the channels themselves without asking a daemon for the owner's preferences.
+(deny mach-lookup
+    (global-name "com.apple.cfprefsd.daemon")
+    (global-name "com.apple.cfprefsd.agent")
+    (local-name "com.apple.cfprefsd.agent"))
+(deny ipc-posix-shm-read*
+    (ipc-posix-name-prefix "apple.cfprefs.")
+    (ipc-posix-name-prefix "/apple.cfprefs."))
+(deny user-preference-read)
+;; HOME CONTENTS: guard the actual UID account independently of the caller's HOME. Reopen only the selected lab's
+;; state/source/builds and scratch/project, then let the narrower protected-data rules below deny their contents.
+@HOME_READ_DENY@
+(allow file-read-data @TRUSTED@ (subpath "@RUN@/scratch") (subpath "@SOCKDIR@/proj"))
 ;; THE OWNER'S DATA, neither read nor written: one rule for each entry of the protected list
 @PROTECTED@
 @AGENT_STORE@
 ;; WRITES: nowhere in the owner's home, nor in what aterm-lab trusts from outside the jail (its state dir, whose runs/*/env.sh
 ;; it reads, its program and source, the aterm it runs and the checkout's target/debug and target/release another lab's up may
 ;; run), nor in the lab's run directory, but its scratch
-(deny file-write* (subpath "@HOME@"))
+@HOME_WRITE_DENY@
 (deny file-write* @TRUSTED@)
 ;; ... and no parent of those may be moved (a directory put in a parent's place would hand aterm-lab another state dir)
 (deny file-write-unlink @TRUSTED_PARENTS@)

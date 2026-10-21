@@ -40,16 +40,17 @@ const DEVTOOLS_PATH: &str = "/usr/sbin/DevToolsSecurity";
 const DEVTOOLS_PATH_CONST: &str = "DEVTOOLSSECURITY_PATH";
 /// The flags a printed or probed path may carry: neither changes anything.
 const DEVTOOLS_QUIET_FLAGS: &[&str] = &["-status", "-disable"];
-/// What names the tool where a process is built: the tool, its path constant,
-/// the revert line (copy for a human, never spawned), an argv builder
-/// (`devtools_<x>_command`) and the change type.
+/// Words that name the tool where a process is built, beside its name and a
+/// `devtools_<x>_command` builder ([`names_the_tool`]): its path constant, the
+/// revert line (copy for a human, never spawned) and the change type.
 const DEVTOOLS_TOOL_WORDS: &[&str] = &[
     "DEVTOOLSSECURITY_PATH",
     "DEBUGGER_ACCESS_REVERT",
     "DebuggerChange",
 ];
-/// What builds or runs a process on a line: a `Command`, the spawn door, an
-/// argv, `posix_spawn`, and consent.rs's own runners.
+/// The calls that build or run a process: an argv, `posix_spawn`, the `exec`
+/// family and consent.rs's runners ([`builds_a_process`] adds `Command::new` and
+/// `spawnfd::command`).
 const SPAWN_CALLS: &[&str] = &[
     "arg",
     "args",
@@ -206,8 +207,8 @@ fn path_argv_flag(text: &str) -> Option<&str> {
     })
 }
 
-/// A full tool path with neither quiet flag after it — but the definition of
-/// the path constant itself (`defines`).
+/// A full tool path with neither quiet flag after it, unless the line defines
+/// the path constant (`defines`).
 fn bare_path(text: &str, defines: bool) -> Option<String> {
     hits(text, DEVTOOLS_PATH, Bound::Sub).find_map(|start| {
         let after = text[start + DEVTOOLS_PATH.len()..].trim_start_matches([' ', '\t']);
@@ -470,10 +471,7 @@ fn core_signal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 
 /// The first shape on `line` that ends a process by a core-dump signal, named.
 /// Read over a script's lines and a Rust file's text view (a script in a Rust
-/// string counts): a Python or Node abort, a private faulthandler helper, a
-/// NULL `ctypes.string_at`, a kill call naming a core signal (Python also by
-/// number), `kill`/`pkill`/`killall` or `timeout -s` given one as a shell
-/// word, and one as an argv string (`"-ABRT"`, or `"-s", "SEGV"`).
+/// string counts).
 fn core_shape(line: &str) -> Option<String> {
     if !CORE_WORDS.iter().any(|w| line.contains(w)) {
         return None;

@@ -33,9 +33,8 @@ thread_local! {
     static REFLOW_CELL_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// Scrollback lines taken by the rewrap passthrough (clone of width-invariant
-// single-row logical lines) instead of decompose+rebuild. Asserted both ways:
-// a mixed corpus drives it above zero, a wrap-changing corpus leaves it at 0.
+// Scrollback lines the rewrap clones through (width-invariant single-row logical lines)
+// instead of decompose+rebuild: above zero on a mixed corpus, zero on a wrap-changing one.
 thread_local! {
     static REFLOW_PASSTHROUGH_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -147,8 +146,8 @@ pub(crate) fn take_reflow_cell_ops() -> usize {
     })
 }
 
-/// Increment the rewrap-passthrough counter by `n` (lines clone-through-ed by
-/// the RFL-4a wrap-invariance fast path in `reflow_scrollback_lines`).
+/// Increment the rewrap-passthrough counter by `n` (lines `reflow_scrollback_lines` cloned
+/// through unchanged).
 pub(crate) fn count_reflow_passthrough_lines(n: usize) {
     REFLOW_PASSTHROUGH_LINES.with(|c| c.set(c.get() + n));
 }
@@ -226,9 +225,8 @@ pub(crate) fn take_scrollback_reflow_sync_lines() -> usize {
     })
 }
 
-// Ring-tier history rows materialized directly from their stored `Row` +
-// `ScrolledRowExtras` instead of the Row -> Line -> cells round trip. The
-// parity test asserts it both ways: above zero on a realistic corpus, zero for
+// Ring-tier history rows materialized straight from their stored `Row` + `ScrolledRowExtras`
+// instead of the Row -> Line -> cells round trip: above zero on a realistic corpus, zero for
 // reads that land in the warm/cold tiers.
 thread_local! {
     static RING_FAST_MATERIALIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -278,11 +276,9 @@ pub fn take_viewport_row_materialize() -> usize {
     })
 }
 
-// Counter for the cells a resize's RGB harvest
-// (`Grid::migrate_rgb_ring_to_extras`) examined for ring-stored truecolor. The
-// early-out contract is a COUNT, not a clock: a screen that has written no
-// truecolor since the last resize has no RGB ring and the harvest must visit no
-// cell (`tests/reflow/rgb_across_resize.rs`).
+// Cells a resize's RGB harvest (`Grid::migrate_rgb_ring_to_extras`) examined for
+// ring-stored truecolor: with no truecolor written since the last resize there is no RGB
+// ring and the harvest visits no cell (`tests/reflow/rgb_across_resize.rs`).
 thread_local! {
     static RGB_HARVEST_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

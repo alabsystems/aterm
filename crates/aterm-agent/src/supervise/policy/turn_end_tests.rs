@@ -16,8 +16,7 @@ const MIN: Duration = Duration::from_secs(60);
 /// A turn's work past [`EXCHANGE_WORK`]: a job, even one a person opened.
 const JOB: Duration = Duration::from_secs(12 * 60);
 
-/// [`TurnEndTiming::reset_grace`], the default: how long past a reset the
-/// first continuation waits (150 s, past the vendor's own auto-continue).
+/// [`TurnEndTiming::reset_grace`]'s default: the wait past a reset before the first continuation.
 const GRACE: Duration = Duration::from_secs(150);
 
 fn cfg() -> SupervisorConfig {
@@ -58,8 +57,7 @@ fn answered() -> TurnEndAction {
     }
 }
 
-/// The reversible-only answer a decision naming an irreversible act gets
-/// (D1).
+/// The reversible-only answer a decision naming an irreversible act gets (D1).
 fn answered_reversibly() -> TurnEndAction {
     TurnEndAction::Type {
         text: reversible_answer(None),
@@ -72,14 +70,12 @@ fn waits_until(a: &TurnEndAction, until: Instant) -> bool {
     matches!(a, TurnEndAction::WaitUntil { until: u, .. } if *u == until)
 }
 
-/// A base clock far enough from the process start that `now - d` never
-/// underflows.
+/// A base clock far enough from the process start that `now - d` never underflows.
 fn t0() -> Instant {
     Instant::now() + Duration::from_secs(10 * 3600)
 }
 
-/// An idle point that ended a turn of `worked` busy work, the worker's last
-/// words `said`.
+/// An idle point ending a turn of `worked` busy work, the worker's last words `said`.
 fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
     TurnEndReading {
         phase: if said.trim_end().ends_with('?') {
@@ -99,6 +95,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         said_cut: false,
         turn_said: None,
         opened_by: None,
+        message_drawn: false,
         worked,
         rules: None,
         pending_input: false,
@@ -119,6 +116,8 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         since_limit: None,
         background: false,
         served_in_transcript: false,
+        chosen_in_transcript: None,
+        conversation: Conversation::Hostless,
         notice_elsewhere: false,
         reset_clock: None,
         program: aterm_phase::Program::Claude,
@@ -195,8 +194,7 @@ fn typed(rule: &'static str) -> TurnEndAction {
     }
 }
 
-/// A wall's act as typed: the wall's kind in aterm's words
-/// ([`wall_retry_text`]), `cause` the one the case means.
+/// A wall's act as typed ([`wall_retry_text`]); `cause` is the one the case means.
 fn retried(rule: &'static str, cause: ApiCause, r: &TurnEndReading) -> TurnEndAction {
     let kind = r.wall.expect("an API wall");
     let of = match kind {
@@ -236,16 +234,14 @@ fn the_workers_suggestion_is_accepted_once() {
             rule_id: RULE_SUGGESTION
         }
     );
-    // The same point decided again before the next point is seen (the loop
-    // observes a point once, when it is new): nothing more is typed; the act's
-    // point is waited for, to its deadline.
+    // Decided again, not observed (the loop observes a point once, when new): nothing more is
+    // typed; the act's point is awaited.
     let again = TurnEndReading {
         worked: None,
         ..r.clone()
     };
     assert!(awaits(&decide_turn_end(&st, &again, &cfg(), now), now));
-    // A suggestion that is not a continuation is not accepted: the
-    // continuation text is typed over it.
+    // A suggestion that is no continuation is typed over.
     let mut st = TurnEndState::default();
     r.composer = Composer::Placeholder("delete the branch".to_string());
     assert_eq!(at(&mut st, &r, now), typed(RULE_CONTINUE));
@@ -772,15 +768,13 @@ const AUTO_CONTINUE_ARMED: &str =
 /// · /rate-limit-options to re-arm`, no wall, minutes before the reset.
 const AUTO_CONTINUE_CANCELLED: &str =
     aterm_phase::prompt::fixtures::WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED;
-/// The same wall after its reset: the vendor went on by itself (`⏺ Usage
-/// limit reset · continuing automatically`), and the turn the stub answered
-/// at once ended before any read saw it busy.
+/// The same wall after its reset: the vendor went on by itself (`⏺ Usage limit reset ·
+/// continuing automatically`), the stub's reply over before any read saw it busy.
 const RESUMED_BY_ITSELF: &str =
     aterm_phase::prompt::fixtures::WALL_SESSION_RESUMED_BY_ITSELF_MEASURED;
 
-/// A captured screen read as the loop reads a point: the real reader, then
-/// the turn-end reading with the reset the loop placed for its wall and this
-/// session's jitter; no busy read since.
+/// A captured screen read as the loop reads a point: the real reader, the loop's reset for its
+/// wall and this session's jitter, no busy read since.
 fn captured(text: &str, reset: Option<Instant>, jitter: Duration) -> TurnEndReading {
     let rows = screen(text);
     let reading = aterm_phase::read(Some("claude"), &rows, Some(2));
@@ -810,7 +804,7 @@ fn a_limit_whose_notice_left_the_screen_waits_for_the_reset_it_named() {
     let cancelled = captured(AUTO_CONTINUE_CANCELLED, None, Duration::ZERO);
     assert_eq!(cancelled.wall, None, "{cancelled:#?}");
 
-    // Gone with its countdown still drawn: the countdown at its word.
+    // Gone with its countdown still drawn: the countdown's `auto_resume_grace` past the reset.
     let counting = TurnEndReading {
         auto_continue: Some(aterm_phase::AutoContinue::Armed),
         ..cancelled.clone()
@@ -909,7 +903,7 @@ fn the_limit_a_cancel_left_answers_the_act_it_was_not_typed_over() {
     assert!(answer.screen_tells && answer.since == t, "{answer:?}");
     assert_eq!(answer.wall.kind, WallKind::UsageSession);
 
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     let fresh = TurnEndState::default();
     assert!(fresh.left_answer(&rows).is_none(), "no act awaited");
     let mut over = TurnEndState::default();
@@ -985,7 +979,7 @@ fn the_limit_a_cancel_left_answers_a_persons_turn_asked_since_the_last_look() {
         "the notice already seen"
     );
 
-    // NEGATIVE CONTROLS.
+    // Negative controls.
     assert!(
         TurnEndState::default().left_answer(&rows).is_none(),
         "no look yet"
@@ -1015,20 +1009,8 @@ fn the_limit_a_cancel_left_answers_a_persons_turn_asked_since_the_last_look() {
     );
 }
 
-/// A LOST LOGIN NO POINT DECIDED IS DECIDED AS THE WALL IT LEFT (round 16's
-/// review, 2026-10-14). The policy's `keep going` was answered at once by
-/// `⏺ Login expired · Please run /login` — read inside the act's take
-/// window, where the point is not the act's yet and the wall's rule decides
-/// nothing — and a person's local command under it (`/model`) took the row
-/// off the screen before the window's end. Measured before: the track the
-/// window's reading opened held the point as a login the owner had been told
-/// of (`/login` typed at its row), so nothing was typed and nobody was told,
-/// for hours. The wall's own rule decides it where no point did: `/login`,
-/// typed once and escalated as it is typed, with the wall's words — then
-/// held, as the login whose row a dismissed dialog left is. A draft standing
-/// there is escalated with the wall's words, never submitted into the lost
-/// login. NEGATIVE CONTROL: a login decided at its point (`/login` typed
-/// there), its row then gone, is held with nothing typed.
+/// A lost login read inside an act's take window, its row gone by the window's end, gets the
+/// wall's own rule: `/login` once, told with the wall's words, then held; a draft is escalated.
 #[test]
 fn a_lost_login_no_point_decided_is_decided_as_the_wall_it_left() {
     let t = t0();
@@ -1099,7 +1081,7 @@ fn a_lost_login_no_point_decided_is_decided_as_the_wall_it_left() {
         "{a:?}"
     );
 
-    // NEGATIVE CONTROL: the login decided at its point, then its row gone.
+    // Negative control: the login decided at its point, then its row gone.
     let mut st = TurnEndState::default();
     assert!(matches!(
         act(&mut st, &walled, t),
@@ -1113,17 +1095,8 @@ fn a_lost_login_no_point_decided_is_decided_as_the_wall_it_left() {
     }
 }
 
-/// A SLEEP OF THE MAC'S IS TIME ON THE POLICY'S PAUSES AND RESETS
-/// ([`TurnEndState::slept`]; the handoff's residual (a) of 2026-10-09).
-/// `Instant` does not count a sleep, so every stamp kept across one reads too
-/// recent; told the sleep, the policy moves the stamps its pauses count from
-/// and the resets it keeps. The server's ladder: a rung of an hour that eight
-/// hours of sleep went through ten minutes in is over, and the retry goes. A
-/// reset a left notice named three hours out, eight hours slept: continued.
-/// The hour's window: an act typed before the night is out of it. NEGATIVE
-/// CONTROLS: without the sleep each still stands; and the worker's own clock
-/// is not moved — the time an act has to be taken counts from where it did,
-/// since the worker slept too.
+/// A sleep ([`TurnEndState::slept`]; `Instant` does not count one) counts on the policy's pauses,
+/// kept resets and the hour's window, never on the take window: the worker slept too.
 #[test]
 fn a_sleep_is_time_on_the_policys_pauses_and_resets_and_not_on_the_workers_clock() {
     let t = t0();
@@ -1183,7 +1156,7 @@ fn a_sleep_is_time_on_the_policys_pauses_and_resets_and_not_on_the_workers_clock
     assert_eq!(st.acts_in_window(t + MIN), 1);
     st.slept(night);
     assert_eq!(st.acts_in_window(t + MIN), 0);
-    // NEGATIVE CONTROL: the worker's own clock.
+    // Negative control: the worker's own clock.
     let unseen = idle("Fixed the parser.", None);
     let mut st = TurnEndState::default();
     act(&mut st, &done, t);
@@ -1242,7 +1215,7 @@ fn a_sleep_never_reopens_the_hot_loop_breakers() {
         matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.starts_with("a breaker:")),
         "{a:?}"
     );
-    // CONTROL: the owner's budget counts the sleep.
+    // Control: the owner's `continue_per_hour` counts the sleep.
     assert_eq!(st.acts_in_window(now), 0);
     // The account moves.
     let wall = session_wall(t + 30 * MIN);
@@ -1285,9 +1258,8 @@ fn a_limit_the_vendor_continued_by_itself_gets_no_usage_resume() {
     let t = t0();
     let reset = t + 4 * MIN;
     let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
-    // The measured continuation, under THIS limit's notice (`3:15pm`): the
-    // vendor's word is a limit's own only there
-    // ([`a_resumed_conversations_older_vendor_continuation_ends_no_wait`]).
+    // The measured continuation under this limit's own notice (`3:15pm`), the only place the
+    // vendor's word is this limit's.
     let resumed = captured_rows(&continued_by_the_vendor_at("3:15pm"));
     let after = reset + Duration::from_secs(70);
     let mut st = TurnEndState::default();
@@ -3186,6 +3158,10 @@ fn at_a_limits_reset_another_conversations_words_get_the_continue_policys_act() 
         )
     };
     let decided = |r: &TurnEndReading, c: &SupervisorConfig| {
+        let mut armed = armed.clone();
+        if matches!(r.conversation, Conversation::Named(_)) {
+            armed.conversation = Conversation::Named("B".to_owned());
+        }
         let mut st = TurnEndState::default();
         st.observe(&armed, t);
         let _ = decide_turn_end(&st, &armed, c, t);
@@ -3203,6 +3179,13 @@ fn at_a_limits_reset_another_conversations_words_get_the_continue_policys_act() 
     };
     let mut wrong = Vec::new();
     for (name, r) in [
+        (
+            "named other conversation, same clock",
+            TurnEndReading {
+                conversation: Conversation::Named("A".to_owned()),
+                ..history("6pm", reply)
+            },
+        ),
         ("an older limit's notice", history("3pm", reply)),
         (
             "this limit's clock, another conversation's row",
@@ -3227,6 +3210,12 @@ fn at_a_limits_reset_another_conversations_words_get_the_continue_policys_act() 
     if a.rule_id() != Some(RULE_DONE_CHECK) {
         wrong.push(format!("a done report, Cruise: {a:?}"));
     }
+    let r = TurnEndReading {
+        conversation: Conversation::Named("A".to_owned()),
+        ..history("6pm", done)
+    };
+    assert_eq!(decided(&r, &no_continue()), TurnEndAction::Nothing);
+    assert_eq!(decided(&r, &cfg()).rule_id(), Some(RULE_DONE_CHECK));
     assert!(wrong.is_empty(), "{wrong:#?}");
 
     // NEGATIVE CONTROLS: the limit's own conversation.
@@ -4354,6 +4343,75 @@ fn a_buckets_notice_nothing_dates_is_read_by_the_fallbacks_latch_alone() {
     let _ = at(&mut st, &ran, t + 10 * MIN);
     st.notice_written_at(None);
     assert!(!st.bucket_left(&armed), "a turn asked since: the wall");
+}
+
+/// A BUCKET THE FALLBACK'S RELAUNCH LEFT HOLDS NO POINT FOR AN UNREAD
+/// CONVERSATION ([`TurnEndState::relaunched_off`]; the review of ddf58eaf8b).
+/// A host that cannot read the session's transcript leaves a remembered
+/// limit's conversation unread, and the limit is looked at again with
+/// nothing decided on its account. The lab's Sonnet bucket, relaunched on
+/// `opus` by the loop's own restart: that move needs no transcript, and the
+/// bucket binds nothing the session runs. Its redraw, and a relaunch that
+/// redraws none, are the continue policy's point: the short turn's back-off,
+/// then `continue@v1`. Measured before: the look, five minutes on, at every
+/// point for good, the reset two days off and then past. NEGATIVE CONTROLS,
+/// each the look: the relaunch not made (the bucket still binds the
+/// session), and the bucket answering again after a turn asked on the
+/// fallback (its reset named again), its notice then left.
+#[test]
+fn a_bucket_the_fallbacks_relaunch_left_holds_no_point_for_an_unread_conversation() {
+    let t = t0();
+    let reset = t + 2 * 24 * 60 * MIN;
+    let unread = |r: TurnEndReading| TurnEndReading {
+        conversation: Conversation::Unknown,
+        restartable: true,
+        ..r
+    };
+    let armed = unread(captured(SONNET_BUCKET_ARMED, Some(reset), Duration::ZERO));
+    let resumed = unread(captured(
+        aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+        None,
+        Duration::ZERO,
+    ));
+    let fallback = Restart::Model {
+        to: "opus".to_string(),
+    };
+    let looks = |a: &TurnEndAction| {
+        matches!(a, TurnEndAction::WaitUntil { why, .. }
+            if why == "the remembered limit's conversation is unread; no act on its account")
+    };
+    // The relaunch asked at the bucket, made or not.
+    let relaunched = |made: bool| {
+        let mut st = TurnEndState::default();
+        let a = at(&mut st, &armed, t);
+        assert!(restarts(&a, &fallback, RULE_MODEL_FALLBACK), "{a:?}");
+        st.restarted(&fallback, made, &armed, t);
+        st
+    };
+    // The continue policy's point: its back-off, at whose end `continue@v1`.
+    let continues = |st: &TurnEndState, r: &TurnEndReading, a: &TurnEndAction| {
+        matches!(a, TurnEndAction::WaitUntil { until, .. }
+            if !looks(a) && decide_turn_end(st, r, &cfg(), *until) == typed(RULE_CONTINUE))
+    };
+    for (name, r) in [("the redraw", &armed), ("no redraw", &resumed)] {
+        let mut st = relaunched(true);
+        let a = at(&mut st, r, t + MIN);
+        assert!(continues(&st, r, &a), "{name}: {a:?}");
+    }
+    // NEGATIVE CONTROLS.
+    let mut st = relaunched(false);
+    let a = at(&mut st, &resumed, t + MIN);
+    assert!(looks(&a), "the relaunch not made: {a:?}");
+    let mut st = relaunched(true);
+    let a = act(&mut st, &resumed, t + MIN);
+    let a = match a {
+        TurnEndAction::WaitUntil { until, .. } => act(&mut st, &resumed, until),
+        other => other,
+    };
+    assert_eq!(a, typed(RULE_CONTINUE), "a turn asked on the fallback");
+    let _ = at(&mut st, &armed, t + 5 * MIN);
+    let a = at(&mut st, &resumed, t + 6 * MIN);
+    assert!(looks(&a), "the bucket answering again, then left: {a:?}");
 }
 
 /// A BUCKET WAITED ON IS TAKEN UP BY THE LOOP THAT FOLLOWS (the review of
@@ -7472,6 +7530,34 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
         sent + fast + TurnEndTiming::default().take_within,
     );
     assert!(!st.task_done(), "a check the hook stopped");
+    // An awaited prompt/record can be identical in another conversation.
+    // Only same-context evidence may infer work that retires a scoped wall;
+    // all ordinary Hostless controls above retain their behavior.
+    for (conversation, ours) in [
+        (Conversation::Unknown, false),
+        (Conversation::Hostless, false),
+        (Conversation::Named("A".to_owned()), false),
+        (Conversation::Named("B".to_owned()), true),
+    ] {
+        let (mut st, sent) = checking(Some(LAND));
+        st.seed_named_reset(
+            WallKind::UsageSession,
+            "session limit",
+            sent + 3 * 60 * MIN,
+            Duration::ZERO,
+            false,
+            None,
+            sent,
+        );
+        st.seed_limit_conversation(Conversation::Named("B".to_owned()), None);
+        let r = TurnEndReading {
+            conversation,
+            ..closing(IDLE, DONE_CHECK, Some(Duration::ZERO))
+        };
+        assert_eq!(st.answered_unseen(&r, sent + fast).is_some(), ours);
+        st.observe(&r, sent + fast);
+        assert_eq!(st.has_limit_track(), !ours, "{r:?}");
+    }
 }
 
 /// The measured screen of a prompt a UserPromptSubmit hook stopped
@@ -12377,10 +12463,10 @@ fn a_move_that_could_not_be_made_is_not_asked_again_while_the_wall_stands() {
     let r = advised(&wall, "work-2");
     let today = at(&mut TurnEndState::default(), &wall, t);
     let mut st = TurnEndState::default();
-    st.seed_account_unmade();
+    st.seed_account_unmade(Unmade::Again, None);
     assert_eq!(at(&mut st, &r, t), today);
     let mut st = TurnEndState::default();
-    st.seed_account_unmade();
+    st.seed_account_unmade(Unmade::Again, None);
     at(&mut st, &idle("Working.", None), t);
     assert!(!st.account_refused());
 }
@@ -14871,7 +14957,7 @@ fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_fl
     }
     // A move the host refused at the wall being worked: no account point.
     let mut latched = st.clone();
-    latched.seed_account_unmade();
+    latched.seed_account_unmade(Unmade::Again, None);
     assert!(!gate(&latched, &again, &cfg()), "a refused move's latch");
     assert_eq!(word(&latched, &again, &cfg()), Some("not-turn-end"));
 
@@ -14949,7 +15035,7 @@ fn the_accounts_news_ends_a_latch_at_a_wall_and_ahead_of_one() {
     ));
     // A latch a previous loop left is ended the same way.
     let mut st = TurnEndState::default();
-    st.seed_account_unmade();
+    st.seed_account_unmade(Unmade::Again, None);
     st.account_news();
     assert!(restarts(
         &at(&mut st, &wall, t),
@@ -15100,6 +15186,7 @@ fn a_seeded_resume_is_owed_while_the_notice_it_left_stands_unserved() {
             fired: false,
             model_set: false,
             chosen_model: None,
+            generic: false,
         }),
         ..idle("Automatic continue cancelled", None)
     };
@@ -17876,6 +17963,13 @@ fn a_lost_login_is_its_logins_own_end_only_with_no_move_behind_it() {
 /// never the renewal again. Over a draft that is the draft, and once the
 /// composer is empty the session moves by itself; where nothing relaunches
 /// it, the owner's `/login` in the tab, the one step always in reach.
+///
+/// THE DRAFT'S STEP IS ITS OWN (the review of the login carry, r8h-1, as
+/// r7h-4 at a usage limit): aterm's own words are cleared, never sent — sent,
+/// they would be the owner's prompt — and a draft under Claude Code's menu,
+/// whose Enter runs the menu's entry, is reached by closing the menu; the
+/// loop's escalation never says "send" for aterm's own words either.
+/// NEGATIVE CONTROL: a person's draft alone is told to be sent as it stands.
 #[test]
 fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
     use super::super::exception::{Urgency, exception_for};
@@ -17896,11 +17990,21 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
     };
     let mut drafted = gone.clone();
     drafted.composer = Composer::Typed;
+    let own = TurnEndReading {
+        composer: Composer::Own,
+        ..gone.clone()
+    };
+    let diverted = TurnEndReading {
+        composer: Composer::Diverted,
+        ..gone.clone()
+    };
     let cases = [
         (&gone, &no_relaunch),
         (&gone, &no_resume),
         (&unrestartable, &cfg()),
         (&drafted, &cfg()),
+        (&own, &cfg()),
+        (&diverted, &cfg()),
     ];
     for (shown, under) in cases {
         let ended = renewable(shown, "m7-a");
@@ -17941,9 +18045,42 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
             "the login named: {e:?}"
         );
         if shown.composer.drafted() {
-            assert!(is_escalate(&a, "send or clear it"), "{a:?}");
-            assert_eq!(id, Some(super::super::notice::RENEWED_DRAFT.id), "{e:?}");
-            assert_eq!(e.action, super::super::notice::RENEWED_DRAFT.todo);
+            use super::super::notice::RENEWED_DRAFT;
+            let reason = match shown.composer {
+                Composer::Own => "clear them, and the tab moves",
+                Composer::Diverted => "close the menu",
+                _ => "send or clear it",
+            };
+            assert!(is_escalate(&a, reason), "{:?}: {a:?}", shown.composer);
+            // aterm's own words are never told to be sent, by the loop's
+            // escalation or by the notice's step (r8h-1).
+            assert!(
+                matches!(&a, TurnEndAction::Escalate { reason }
+                    if reason.contains("send") == (shown.composer != Composer::Own)),
+                "{:?}: {a:?}",
+                shown.composer
+            );
+            assert_eq!(id, Some(RENEWED_DRAFT.id), "{:?}: {e:?}", shown.composer);
+            assert_eq!(
+                e.action.to_lowercase().contains("send"),
+                shown.composer != Composer::Own,
+                "{:?}: {e:?}",
+                shown.composer
+            );
+            // A draft under the menu is told to close it first.
+            assert_eq!(
+                e.action.contains("menu"),
+                shown.composer == Composer::Diverted,
+                "{:?}: {e:?}",
+                shown.composer
+            );
+            // The person's draft alone is sent as it stands.
+            assert_eq!(
+                e.action == RENEWED_DRAFT.todo,
+                shown.composer == Composer::Typed,
+                "{:?}: {e:?}",
+                shown.composer
+            );
             // …and so it does, once the composer is empty: the host advises
             // the move onto the renewed login, made at the wall.
             let sent = advised(
@@ -18441,6 +18578,13 @@ fn a_done_check_a_loop_before_this_one_asked_is_answered_for_this_one() {
 mod face {
     use super::*;
     include!("turn_end_face_tests.rs");
+}
+
+/// Why Land still holds (`turn_end_hold_tests.rs`; the Autopilot design's
+/// §12.3, slice 3a).
+mod hold {
+    use super::*;
+    include!("turn_end_hold_tests.rs");
 }
 
 /// Land's strict reading over the labelled defense table
@@ -19654,6 +19798,320 @@ fn usage_credits_move_to_the_advised_account_first() {
     assert!(waits_until(&a, reset + GRACE), "{a:?}");
 }
 
+/// A Sonnet bucket whose reset is under 24 h away (Claude Code 2.1.302, the
+/// lab): no dialog, Claude Code's own continue armed, the transcript's
+/// GENERIC countdown row under the turn's notice (`resets 7:09pm`).
+const BUCKET_ARMED_UNDER_24H: &str =
+    aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_ARMED_UNDER_24H_2_1_302;
+
+/// [`BUCKET_ARMED_UNDER_24H`]'s kind past its reset: the vendor went on by
+/// itself under the generic row, its reply drawn, no `❯` row — its clock
+/// (`6:57pm`, another lab run's) named `clock`.
+fn bucket_continued_by_the_vendor_at(clock: &str) -> Vec<String> {
+    screen(aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_RESUMED_BY_ITSELF_UNDER_24H_2_1_302)
+        .into_iter()
+        .map(|r| r.replace("6:57pm", clock))
+        .collect()
+}
+
+/// A BUCKET THE VENDOR CONTINUED UNDER ITS GENERIC ROW GETS NO USAGE-RESUME
+/// (ATERM-KI-1015-1, LP-1 (c); live as `r21lebk4` on Claude Code 2.1.302,
+/// 2026-10-16: the vendor's `⏺ Usage limit reset · continuing automatically`
+/// at 18:59:07, the stub's reply under it, then `usage-resume@v1 keep going`
+/// typed by the harness at 19:00:05). A Sonnet bucket under 24 h from its
+/// reset is waited on as the vendor's own continue (`model-bucket goes on
+/// by itself`); the vendor goes on, under the GENERIC row its countdown
+/// left in the transcript beneath the bucket's notice. That word is THIS
+/// bucket's: the wait ends, the point is the continue policy's (a short
+/// turn's back-off, then `continue@v1`), and no usage-resume is typed.
+/// NEGATIVE CONTROL: the same bucket's countdown cancelled is waited out to
+/// its reset and the grace, then resumed.
+#[test]
+fn a_bucket_the_vendor_continued_under_its_generic_row_gets_no_usage_resume() {
+    let t = t0();
+    let reset = t + 4 * MIN;
+    let armed = captured(BUCKET_ARMED_UNDER_24H, Some(reset), Duration::ZERO);
+    assert_eq!(
+        armed.wall,
+        Some(WallKind::ModelBucket { consent: false }),
+        "{armed:#?}"
+    );
+    let continued = captured_rows(&bucket_continued_by_the_vendor_at("7:09pm"));
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &armed, t);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("goes on by itself")),
+        "the vendor's own continue: {a:?}"
+    );
+    let a = at(&mut st, &continued, reset + Duration::from_secs(70));
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
+        "the continue policy's back-off: {a:?}"
+    );
+    assert!(!st.waits_on_named_reset(), "the bucket went on");
+    assert_eq!(
+        at(&mut st, &continued, reset + 10 * MIN),
+        typed(RULE_CONTINUE)
+    );
+    // NEGATIVE CONTROL: the countdown cancelled.
+    let cancelled = captured(
+        aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_CANCELLED_UNDER_24H_2_1_302,
+        None,
+        Duration::ZERO,
+    );
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    let a = at(&mut st, &cancelled, t + MIN);
+    assert!(waits_until(&a, reset + GRACE), "{a:?}");
+    assert_eq!(
+        at(&mut st, &cancelled, reset + GRACE),
+        typed(RULE_LIMIT_RESUME)
+    );
+}
+
+/// A BUCKET'S CANCELLED LIMIT ANSWERS THE ACT TOO (ATERM-KI-1015-1, LP-1
+/// (d)). The policy's `keep going` met a Sonnet bucket under 24 h from its
+/// reset (Claude Code 2.1.302: no dialog, its own continue armed at once)
+/// and a person's Esc on the countdown came before the loop's first read:
+/// that read is the cancel under the generic row, no wall. Read as the
+/// act's answer, the wall it was is the BUCKET — its kind, its words (the
+/// model it limits read off them), its reset — as a usage window's is
+/// ([`the_limit_a_cancel_left_answers_the_act_it_was_not_typed_over`]).
+/// Measured before: read as a `usage-session` limit (the generic row's own
+/// words, LP-1 (c)); and, with the row read as the bucket, no answer at all
+/// (only a usage window's cancel answered a turn).
+#[test]
+fn a_buckets_cancelled_limit_answers_the_act_it_was_not_typed_over() {
+    let t = t0();
+    let ended = idle("Fixed the parser; the suite is green.", Some(3 * MIN));
+    let rows: Vec<String> =
+        screen(aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_CANCELLED_UNDER_24H_2_1_302)
+            .into_iter()
+            .map(|r| r.replace("❯ carry on with the task", "❯ keep going"))
+            .collect();
+    assert_eq!(captured_rows(&rows).wall, None, "the reader reads no wall");
+    let mut st = TurnEndState::default();
+    st.observe(&ended, t);
+    st.acted(&typed(RULE_CONTINUE), &ended, t);
+    let answer = st.left_answer(&rows).expect("the act's answer");
+    assert!(answer.screen_tells && answer.since == t, "{answer:?}");
+    let w = &answer.wall;
+    assert_eq!(
+        (w.kind, w.reset.as_deref()),
+        (WallKind::ModelBucket { consent: false }, Some("7:09pm"))
+    );
+    assert_eq!(bucket_model(&w.message).as_deref(), Some("sonnet"), "{w:?}");
+}
+
+/// The last `n` rows of `rows`: what a pane `n` rows tall draws of the same
+/// screen — Claude Code writes its conversation into the primary screen, and
+/// a short pane shows its bottom rows at the same width.
+fn last_rows(rows: Vec<String>, n: usize) -> Vec<String> {
+    let cut = rows.len().saturating_sub(n);
+    rows[cut..].to_vec()
+}
+
+/// A BUCKET THE VENDOR CONTINUED ON A SHORT PANE GETS NO USAGE-RESUME
+/// (ATERM-KI-1015-1, LP-1 (c), the review of its fix; live as `r21amc15b` on
+/// Claude Code 2.1.302, 2026-10-17, a pane 15 rows tall: the vendor went on
+/// at 01:57:26, and `usage-resume@v1 keep going` was typed at 01:59:19). The
+/// armed screen still draws the bucket's `⎿  You've hit your Sonnet limit ·
+/// resets 7:09pm (…)`, so the wall is the bucket; once Claude Code went on
+/// by itself that notice has scrolled off, and the GENERIC `⏺ Usage limit
+/// reached · continuing automatically at 7:09pm · …` row is the newest
+/// notice drawn (the last 14 rows here: a pane of 15, whose last row Claude
+/// Code leaves blank; on 14 the generic row is off too, and the vendor's
+/// `Usage limit reset` row with no notice above it ends the wait, measured
+/// as `r21amc14b`). Read as its own words (a usage window's), the vendor's
+/// continuation was tied to no bucket: the wait ran on, and
+/// `usage-resume@v1` was typed after the vendor's own continuation. The
+/// generic row names no limit, and is read as the bucket whose reset it
+/// names: the wait ends, the point is the continue policy's. The same on the
+/// pane measured (`r21amc15b`'s captures). NEGATIVE CONTROL: the generic row
+/// naming another clock — no word of this bucket's, whose wait stands to its
+/// reset and grace.
+#[test]
+fn a_bucket_the_vendor_continued_on_a_short_pane_gets_no_usage_resume() {
+    use aterm_phase::prompt::fixtures::{
+        WALL_SONNET_BUCKET_ARMED_UNDER_24H_15_ROWS_2_1_302,
+        WALL_SONNET_BUCKET_RESUMED_BY_ITSELF_UNDER_24H_15_ROWS_2_1_302,
+    };
+    let t = t0();
+    let reset = t + 4 * MIN;
+    // The pane measured: the vendor's continuation tied to the bucket.
+    let measured = |clock: &str| {
+        captured_rows(
+            &screen(WALL_SONNET_BUCKET_RESUMED_BY_ITSELF_UNDER_24H_15_ROWS_2_1_302)
+                .into_iter()
+                .map(|r| r.replace("1:56am", clock))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let armed = captured(
+        WALL_SONNET_BUCKET_ARMED_UNDER_24H_15_ROWS_2_1_302,
+        Some(reset),
+        Duration::ZERO,
+    );
+    assert_eq!(
+        armed.wall,
+        Some(WallKind::ModelBucket { consent: false }),
+        "{armed:#?}"
+    );
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    let a = at(
+        &mut st,
+        &measured("1:56am"),
+        reset + Duration::from_secs(70),
+    );
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
+        "the measured pane: the continue policy's back-off: {a:?}"
+    );
+    assert!(
+        !st.waits_on_named_reset(),
+        "the measured pane: the bucket went on"
+    );
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    let a = at(
+        &mut st,
+        &measured("1:57am"),
+        reset + Duration::from_secs(70),
+    );
+    assert!(waits_until(&a, reset + GRACE), "another clock: {a:?}");
+    let armed_rows = last_rows(screen(BUCKET_ARMED_UNDER_24H), 14);
+    assert!(
+        armed_rows.iter().any(|r| r.contains("Sonnet limit")),
+        "the armed pane still draws the bucket's notice: {armed_rows:#?}"
+    );
+    let armed = TurnEndReading {
+        reset_at: Some(reset),
+        ..captured_rows(&armed_rows)
+    };
+    assert_eq!(
+        armed.wall,
+        Some(WallKind::ModelBucket { consent: false }),
+        "{armed:#?}"
+    );
+    let continued_at = |clock: &str| last_rows(bucket_continued_by_the_vendor_at(clock), 14);
+    let rows = continued_at("7:09pm");
+    assert!(
+        !rows.iter().any(|r| r.contains("Sonnet limit"))
+            && rows.iter().any(|r| r.starts_with("⏺ Usage limit reached")),
+        "the bucket's notice scrolled off, the generic row drawn: {rows:#?}"
+    );
+    let continued = captured_rows(&rows);
+    assert_eq!(
+        continued.auto_continue,
+        Some(aterm_phase::AutoContinue::Fired)
+    );
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &armed, t);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("goes on by itself")),
+        "the vendor's own continue: {a:?}"
+    );
+    let a = at(&mut st, &continued, reset + Duration::from_secs(70));
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
+        "the continue policy's back-off: {a:?}"
+    );
+    assert!(!st.waits_on_named_reset(), "the bucket went on");
+    assert_eq!(
+        at(&mut st, &continued, reset + 10 * MIN),
+        typed(RULE_CONTINUE)
+    );
+    // NEGATIVE CONTROL: the generic row of another clock.
+    let other = captured_rows(&continued_at("7:10pm"));
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    let a = at(&mut st, &other, reset + Duration::from_secs(70));
+    assert!(waits_until(&a, reset + GRACE), "{a:?}");
+    assert!(st.waits_on_named_reset());
+}
+
+/// A `/MODEL` OFF A BUCKET UNDER ITS GENERIC ROW ALONE MOVES THE SESSION OFF
+/// IT (ATERM-KI-1015-1, LP-1 (e), the review of its fix; live as
+/// `r21ames18b` on Claude Code 2.1.302, 2026-10-17, a pane 18 rows tall: the
+/// wait stood over the choice, `model-bucket resets`). A Sonnet bucket under
+/// 24 h from its reset (no dialog, its own continue armed), Esc on the
+/// countdown, then a person's `/model opus`: the switch box's rows push the
+/// bucket's own notice off the top, and the generic countdown row is the
+/// only notice drawn above the choice (on 18 to 20 rows; on 14 to 17 the
+/// generic row goes off too, the screen draws no notice, and the
+/// transcript's record of the choice moved the session at once, measured as
+/// `r21ame14b` and `r21ames15b`..`r21ames17b`; the last 14 rows here stand
+/// for the state, not a pane height). Read as
+/// its own words (a usage window's), the choice was tied to no bucket and
+/// the wait ran to the bucket's reset — where, with the notice drawn, the
+/// session went on at once. The generic row is read as the bucket whose
+/// reset it names: the choice leaves the model it limits, and the limit's
+/// resume goes at once. CONTROL: the same rows with the notice drawn.
+/// NEGATIVE CONTROL: a choice of the bucket's own family (`Sonnet 5.5`): the
+/// wait stands.
+#[test]
+fn a_model_chosen_off_a_bucket_under_its_generic_row_alone_moves_the_session_off_it() {
+    use aterm_phase::prompt::fixtures::SONNET_BUCKET_UNDER_24H_CANCELLED_THEN_MODEL_18_ROWS_2_1_302;
+    let t = t0();
+    let reset = t + 4 * MIN;
+    let armed = captured(BUCKET_ARMED_UNDER_24H, Some(reset), Duration::ZERO);
+    // The pane measured (`r21ames18b`, 18 rows), its clock the armed screen's.
+    let measured = |clock: &str| {
+        screen(SONNET_BUCKET_UNDER_24H_CANCELLED_THEN_MODEL_18_ROWS_2_1_302)
+            .into_iter()
+            .map(|r| r.replace("2:25am", clock))
+            .collect::<Vec<_>>()
+    };
+    let cancelled =
+        screen(aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_CANCELLED_UNDER_24H_2_1_302);
+    let cancel = cancelled
+        .iter()
+        .position(|r| r.starts_with("⏺ Automatic continue cancelled"))
+        .expect("the cancel");
+    let chose = |model: &str| {
+        let mut rows: Vec<String> = cancelled[..=cancel].to_vec();
+        rows.extend([
+            String::new(),
+            "❯ /model opus".to_string(),
+            format!("  ⎿  Set model to {model} and saved as your default for new sessions"),
+        ]);
+        rows.extend(cancelled[cancel + 1..].iter().cloned());
+        rows
+    };
+    let short = last_rows(chose("Opus 5.5"), 14);
+    assert!(
+        !short.iter().any(|r| r.contains("Sonnet limit"))
+            && short.iter().any(|r| r.starts_with("⏺ Usage limit reached")),
+        "on 14 rows the bucket's notice scrolled off, the generic row drawn: {short:#?}"
+    );
+    let decided = |rows: &[String]| {
+        let mut st = TurnEndState::default();
+        at(&mut st, &armed, t);
+        at(&mut st, &captured_rows(rows), t + MIN)
+    };
+    assert_eq!(decided(&short), typed(RULE_LIMIT_RESUME), "the short pane");
+    assert_eq!(
+        decided(&measured("7:09pm")),
+        typed(RULE_LIMIT_RESUME),
+        "the pane measured"
+    );
+    let other = decided(&measured("7:10pm"));
+    assert!(
+        waits_until(&other, reset + GRACE),
+        "another clock: {other:?}"
+    );
+    // CONTROL: the notice drawn.
+    assert_eq!(
+        decided(&chose("Opus 5.5")),
+        typed(RULE_LIMIT_RESUME),
+        "the notice drawn"
+    );
+    // NEGATIVE CONTROL: the bucket's own family.
+    let same = decided(&last_rows(chose("Sonnet 5.5"), 14));
+    assert!(waits_until(&same, reset + GRACE), "{same:?}");
+}
+
 /// EVERY WALL ACT ENDS ON THE NEEDS YOU SENTENCE (FOREVER CRUISE / FOREVER
 /// LAND: loud, never blocking): an API wall's retry, its cut-off act and its
 /// act once the API is back, for every cause and every program, and a lost
@@ -19802,6 +20260,61 @@ fn login_back_at_a_usage_limit_resumes_at_once_instead_of_leaving_to_person() {
     let a = at(&mut st, &signed_in, t + Duration::from_secs(30));
     assert_eq!(a, typed(RULE_LIMIT_RESUME));
     assert!(!st.task_done(), "must not latch left-to-person");
+}
+
+/// A PERSON'S SIGN-IN AT A USAGE LIMIT IS NO SWITCH UNTIL THE WORKER WORKS
+/// PAST THE LIMIT (the review of the login carry, r9h-2): `/login` signs in
+/// whatever account the browser holds, the same one included, and read as
+/// the login back at `Login successful`, the limit's record closed as
+/// `Claude switched accounts` though the same limit then met the
+/// continuation. The sign-in tells nothing; the same limit meeting the
+/// continuation tells nothing, nor does the worker's work past that limit at
+/// its reset (the limit ended by itself). NEGATIVE CONTROL: the continuation
+/// served — the account signed in has no limit — tells the login back.
+#[test]
+fn a_sign_in_at_a_usage_limit_is_no_switch_until_the_worker_works_past_it() {
+    for served in [false, true] {
+        let t = t0();
+        let reset = t + 6 * 24 * 60 * MIN;
+        let mut limit = walled(
+            WallKind::UsageWeekly,
+            "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+            Some(JOB),
+        );
+        limit.reset_at = Some(reset);
+        limit.resumes_by_itself = true;
+        let mut st = TurnEndState::default();
+        let _ = act(&mut st, &limit, t);
+        assert!(!st.take_login_returned(), "{served}");
+        let mut signed_in = idle("Login successful", Some(Duration::from_secs(28)));
+        signed_in.person = Some(Duration::from_secs(5));
+        signed_in.login_back = true;
+        let a = act(&mut st, &signed_in, t + Duration::from_secs(30));
+        assert_eq!(a, typed(RULE_LIMIT_RESUME), "{served}");
+        assert!(
+            !st.take_login_returned(),
+            "{served}: the sign-in alone is no switch"
+        );
+        let done = idle("The suite passes.", Some(5 * MIN));
+        if served {
+            let _ = act(&mut st, &done, t + 6 * MIN);
+            assert!(st.limit_ended(), "the limit's track ended");
+            assert!(
+                st.take_login_returned(),
+                "worked past the limit: the switch"
+            );
+            continue;
+        }
+        // The same account signed in: the continuation meets its limit.
+        let mut met = limit.clone();
+        met.worked = Some(Duration::from_secs(2));
+        let _ = act(&mut st, &met, t + MIN);
+        assert!(!st.take_login_returned(), "the limit met again: no switch");
+        // The reset: the worker works past the limit, which ended by itself.
+        let _ = act(&mut st, &done, reset + 10 * MIN);
+        assert!(st.limit_ended(), "the limit's track ended");
+        assert!(!st.take_login_returned(), "the reset is no switch");
+    }
 }
 
 /// A PERSON'S `/login` AT A LIMIT A LANDED TASK MET LANDS NOTHING AND OPENS
@@ -20260,4 +20773,582 @@ fn a_lost_login_over_a_landing_is_told_the_task_is_landed() {
             .is_none_or(|n| n.id != notice::LOGIN_NOT_RUN.id),
         "CONTROL"
     );
+}
+
+/// Gemini CLI's screen at a point whose last words `said` answer the message
+/// `msg` drawn over them ([`TurnEndReading::opened_by`]), no read of the turn
+/// busy.
+fn opened(said: &str, msg: &str) -> TurnEndReading {
+    TurnEndReading {
+        program: aterm_phase::Program::Gemini,
+        opened_by: Some(crate::supervise::approvals::words_lead(msg)),
+        ..idle(said, None)
+    }
+}
+
+/// A wait of the short streak's back-off at its `n`th short turn.
+fn backs_off(a: &TurnEndAction, n: u32) -> bool {
+    matches!(a, TurnEndAction::WaitUntil { why, .. }
+        if why.contains(&format!("{n} short turn(s) in a row")))
+}
+
+/// P4 OF THE FOREVER LAB, THE ACT: AN ACT ANSWERED BEFORE ANY READ SAW IT RUN
+/// IS TAKEN BY THE MESSAGE THAT OPENED ITS TURN on the programs whose screens
+/// draw one (Gemini CLI's band, agy's message, Muse Code's `❯` row,
+/// [`TurnEndReading::opened_by`]). FAILS WITHOUT THE FIX: Gemini CLI's land
+/// act, answered at once with a clean defense, stood untaken to its take
+/// window (`WAITING … the worker to take the land@v1 act`), was judged not
+/// taken there, and the defense landed nothing — the land act owed again
+/// over a landed task. Taken where the defense stands under the land act's
+/// own message, the screen it was typed at having shown another message's
+/// turn: landed at that read. NEGATIVE CONTROLS, each untaken to its window as
+/// before: the screen it was typed at (the act not taken); the act typed over
+/// a turn its own words opened (nothing on the screen tells the two apart);
+/// its message with no reply under it; its words still a draft; a wall under
+/// it; a person's Esc; and another message's turn — someone else's prompt
+/// sent over the act.
+#[test]
+fn an_act_answered_before_any_read_saw_it_run_is_taken_by_the_message_opening_its_turn() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    let fast = Duration::from_millis(600);
+    // The worker's first report read busy, then the land instruction typed
+    // at the screen whose turn `over` opened.
+    let landing = |over: &str| {
+        let mut st = TurnEndState::default();
+        let first = land(TurnEndReading {
+            worked: Some(3 * MIN),
+            ..opened("Stage 1 landed.", over)
+        });
+        let sent = t0();
+        assert_eq!(act(&mut st, &first, sent), land_instruction());
+        (st, sent)
+    };
+    // TAKEN AND ANSWERED: the defense under the land act's own message.
+    let (mut st, sent) = landing(PROMPT);
+    let a = at(&mut st, &land(opened(DEFENSE, LAND)), sent + fast);
+    assert_eq!(a, TurnEndAction::Nothing, "{st:?}");
+    assert!(st.landed() && st.task_done(), "{st:?}");
+    assert_eq!(st.followed(), Some(RULE_LAND), "{st:?}");
+    // …and read again, it stays the landing: judged once.
+    let a = at(&mut st, &land(opened(DEFENSE, LAND)), sent + 20 * fast);
+    assert_eq!(a, TurnEndAction::Nothing, "{st:?}");
+    assert!(st.landed(), "{st:?}");
+    // NEGATIVE CONTROLS.
+    let untaken = |what: &str, r: TurnEndReading, over: &str| {
+        let (mut st, sent) = landing(over);
+        let a = at(&mut st, &land(r), sent + fast);
+        assert!(awaits(&a, sent + fast), "{what}: {a:?}");
+        assert!(!st.task_done(), "{what}: {st:?}");
+    };
+    untaken(
+        "the screen it was typed at",
+        opened("Stage 1 landed.", PROMPT),
+        PROMPT,
+    );
+    untaken("over its own words", opened(DEFENSE, LAND), LAND);
+    untaken(
+        "no reply under it",
+        TurnEndReading {
+            said_tail: None,
+            ..opened("", LAND)
+        },
+        PROMPT,
+    );
+    untaken(
+        "a draft",
+        TurnEndReading {
+            composer: Composer::Typed,
+            ..opened(DEFENSE, LAND)
+        },
+        PROMPT,
+    );
+    untaken(
+        "a wall",
+        TurnEndReading {
+            wall: Some(WallKind::Overloaded),
+            wall_message: "API Error: 529 Overloaded.".to_string(),
+            ..opened(DEFENSE, LAND)
+        },
+        PROMPT,
+    );
+    untaken(
+        "a person's Esc",
+        TurnEndReading {
+            interrupted: true,
+            ..opened(DEFENSE, LAND)
+        },
+        PROMPT,
+    );
+    untaken(
+        "another message's turn",
+        opened(DEFENSE, "what stands now?"),
+        PROMPT,
+    );
+}
+
+/// P4 OF THE FOREVER LAB, A DRAFT SUBMITTED: A STANDING DRAFT SUBMITTED IN
+/// THE ACT'S PLACE ([`TurnEndAction::Submit`]), ANSWERED BEFORE ANY READ SAW
+/// IT RUN, IS TAKEN BY THE TURN ANOTHER MESSAGE OPENED SINCE — its words the
+/// draft's, which the policy never held. Measured (p4c-gemini, Gemini CLI
+/// 0.46.0, 2026-10-20): a person's prompt left standing was submitted under
+/// the done check's rule, answered at once, and stood untaken to its take
+/// window (`WAITING … the worker to take the continue-done-check@v1 act`),
+/// judged there 30 s late. FAILS WITHOUT THE FIX: each answered case awaits
+/// the window. Taken where a reply stands under another message than the
+/// screen the Enter was pressed at showed (Gemini CLI's band, agy's message,
+/// Muse Code's `❯` row), or under another `❯` prompt than that screen's
+/// (Claude Code's): the point judged there, once. NEGATIVE CONTROLS, each
+/// untaken to its window as before: the screen it was submitted at; other
+/// words under the same message (nothing tells its turn from the one
+/// before); no message in sight where it was submitted, or none now; no
+/// reply under it; and an act whose words the policy holds, typed, which only
+/// its own words' message takes.
+#[test]
+fn a_draft_submitted_and_answered_before_any_read_saw_it_run_is_taken_by_the_turn_it_opened() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const DRAFT: &str = "a person asks: what stands now";
+    const REPLY: &str = "Here is where it stands: the parser module is written and tested.";
+    const FIRST: &str = "Wrote the parser module.";
+    let fast = Duration::from_millis(600);
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+        let shown = |said: &str, msg: &str| match program {
+            aterm_phase::Program::Claude => closing(said, msg, None),
+            _ => opened(said, msg),
+        };
+        // A long first turn ended under `over`, a draft standing: submitted
+        // in the continuation's place.
+        let submitted = |over: TurnEndReading| {
+            let mut st = TurnEndState::default();
+            let first = TurnEndReading {
+                worked: Some(3 * MIN),
+                composer: Composer::Typed,
+                ..over
+            };
+            let sent = t0();
+            let a = act(&mut st, &first, sent);
+            assert_eq!(
+                a,
+                TurnEndAction::Submit {
+                    rule_id: RULE_CONTINUE
+                },
+                "{program:?}"
+            );
+            (st, sent)
+        };
+        // TAKEN AND ANSWERED: the reply under the draft's own message.
+        let (mut st, sent) = submitted(shown(FIRST, PROMPT));
+        let a = at(&mut st, &shown(REPLY, DRAFT), sent + fast);
+        assert!(!awaits(&a, sent + fast), "{program:?}: {a:?}");
+        assert!(backs_off(&a, 1), "{program:?}: {a:?}");
+        assert_eq!(st.followed(), Some(RULE_CONTINUE), "{program:?}: {st:?}");
+        let judged = st.point_number();
+        // …read again, it is that point still: judged once.
+        let a = at(&mut st, &shown(REPLY, DRAFT), sent + 20 * fast);
+        assert!(backs_off(&a, 1), "{program:?}: {a:?}");
+        assert_eq!(st.point_number(), judged, "{program:?}: judged once");
+        // NEGATIVE CONTROLS.
+        let untaken = |what: &str, over: TurnEndReading, r: TurnEndReading| {
+            let (mut st, sent) = submitted(over);
+            let a = at(&mut st, &r, sent + fast);
+            assert!(awaits(&a, sent + fast), "{program:?} {what}: {a:?}");
+        };
+        untaken(
+            "the screen it was submitted at",
+            shown(FIRST, PROMPT),
+            shown(FIRST, PROMPT),
+        );
+        untaken(
+            "other words under the same message",
+            shown(FIRST, PROMPT),
+            shown(REPLY, PROMPT),
+        );
+        untaken(
+            "no message in sight where it was submitted",
+            TurnEndReading {
+                answered: None,
+                opened_by: None,
+                ..shown(FIRST, PROMPT)
+            },
+            shown(REPLY, DRAFT),
+        );
+        untaken(
+            "no message in sight now",
+            shown(FIRST, PROMPT),
+            TurnEndReading {
+                answered: None,
+                opened_by: None,
+                ..shown(REPLY, DRAFT)
+            },
+        );
+        if program != aterm_phase::Program::Claude {
+            untaken(
+                "no reply under it",
+                shown(FIRST, PROMPT),
+                TurnEndReading {
+                    said_tail: None,
+                    ..shown("", DRAFT)
+                },
+            );
+        }
+    }
+    // An act whose words the policy holds is taken only by its own words'
+    // message (the arm above), never by any other.
+    let mut st = TurnEndState::default();
+    let first = TurnEndReading {
+        worked: Some(3 * MIN),
+        ..opened(FIRST, PROMPT)
+    };
+    let sent = t0();
+    assert!(matches!(
+        act(&mut st, &first, sent),
+        TurnEndAction::Type { .. }
+    ));
+    let a = at(&mut st, &opened(REPLY, DRAFT), sent + fast);
+    assert!(
+        awaits(&a, sent + fast),
+        "a typed act under another message: {a:?}"
+    );
+}
+
+/// P4 OF THE FOREVER LAB, SOMEONE ELSE'S TURN: A TURN NO READ SAW RUN, ENDED
+/// SINCE THE POINT JUDGED LAST, IS JUDGED WHERE IT SHOWS, ONCE
+/// ([`TurnEndState::unseen_turn`]). A person's prompt (an orchestrator's)
+/// answered between two of the loop's reads, under another message than the
+/// point before showed (Claude Code's `❯` row, Gemini CLI's band), is a turn
+/// of someone else's that ended there, its work unmeasured: a short one, the
+/// streak lengthened and backed off from there; with a person's keystroke in
+/// it, their own exchange, left to them. FAILS WITHOUT THE FIX: read as the
+/// point it came after, nothing was judged or decided there — the back-off
+/// of the point before ran on, and its act was typed over the person's
+/// answer. NEGATIVE CONTROLS, each the point before, read again: the same
+/// screen; the same message with other words under it (a reply drawn on, a
+/// redraw); a message out of sight; a draft in the composer; a launch card;
+/// and another message's turn while an act of the policy's is awaited (the
+/// act's to judge, by its take window). The turn judged, read again, is
+/// judged no second time.
+#[test]
+fn a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const ASK: &str = "a person asks: what stands now?";
+    const REPLY: &str = "Here is where it stands: the parser module is written and tested.";
+    const FIRST: &str = "Wrote the parser module.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+        let shown = |said: &str, msg: &str| match program {
+            aterm_phase::Program::Claude => closing(said, msg, None),
+            _ => opened(said, msg),
+        };
+        // The first point: a short first reply, backed off.
+        let start = || {
+            let mut st = TurnEndState::default();
+            let first = TurnEndReading {
+                worked: Some(secs(6)),
+                ..shown(FIRST, PROMPT)
+            };
+            let a = at(&mut st, &first, t);
+            assert!(backs_off(&a, 1), "{program:?}: {a:?}");
+            st
+        };
+        // SOMEONE ELSE'S TURN: judged at once, the streak lengthened.
+        let mut st = start();
+        let before = st.point_number();
+        let theirs = shown(REPLY, ASK);
+        let a = at(&mut st, &theirs, t + secs(10));
+        assert!(backs_off(&a, 2), "{program:?}: {a:?}");
+        assert_eq!(st.short_streak(), 2, "{program:?}: {st:?}");
+        assert_ne!(st.point_number(), before, "{program:?}: {st:?}");
+        assert_eq!(st.followed(), None, "{program:?}: someone else's");
+        // …read again, it is that point still: judged once.
+        let judged = st.point_number();
+        let a = at(&mut st, &theirs, t + secs(30));
+        assert!(backs_off(&a, 2), "{program:?}: {a:?}");
+        assert_eq!(
+            (st.short_streak(), st.point_number()),
+            (2, judged),
+            "{program:?}"
+        );
+        // A PERSON'S KEYSTROKE IN IT: their own exchange, left to them.
+        let mut st = start();
+        let a = at(
+            &mut st,
+            &TurnEndReading {
+                person: Some(secs(3)),
+                ..theirs.clone()
+            },
+            t + secs(10),
+        );
+        assert!(st.left_to_person(), "{program:?}: {a:?} {st:?}");
+        // NEGATIVE CONTROLS: the point before, read again.
+        let same = |r: TurnEndReading| {
+            let mut st = start();
+            let before = st.point_number();
+            let a = at(&mut st, &r, t + secs(10));
+            assert!(backs_off(&a, 1), "{program:?}: {a:?}");
+            assert_eq!(
+                (st.short_streak(), st.point_number()),
+                (1, before),
+                "{program:?}: {r:?}"
+            );
+        };
+        same(shown(FIRST, PROMPT));
+        same(shown("Wrote the parser module and its tests.", PROMPT));
+        same(TurnEndReading {
+            program,
+            ..idle(REPLY, None)
+        });
+        same(TurnEndReading {
+            composer: Composer::Typed,
+            ..theirs.clone()
+        });
+        let mut st = start();
+        let before = st.point_number();
+        at(
+            &mut st,
+            &TurnEndReading {
+                taskless: true,
+                ..theirs.clone()
+            },
+            t + secs(10),
+        );
+        assert_eq!(
+            (st.short_streak(), st.point_number()),
+            (1, before),
+            "{program:?}"
+        );
+        // An act awaited: another message's turn is no answer of its, and no
+        // turn of someone else's either — the act's take window judges it.
+        let mut st = start();
+        let (a, sent) = past_backoff(&mut st, &shown(FIRST, PROMPT), t);
+        assert!(
+            matches!(a, TurnEndAction::Type { .. }),
+            "{program:?}: {a:?}"
+        );
+        st.acted(&a, &shown(FIRST, PROMPT), sent);
+        let a = at(&mut st, &theirs, sent + secs(1));
+        assert!(awaits(&a, sent + secs(1)), "{program:?}: {a:?}");
+    }
+}
+
+/// THE REVIEW OF `b9/forever-gaps`, RV-1: A TURN ALREADY JUDGED IS NOT JUDGED
+/// AGAIN WHEN ITS OPENER COMES INTO SIGHT ([`TurnEndState::unseen_turn`]).
+/// Cruise, Claude Code: a short first reply under the task's `❯` row, the
+/// continuation typed past its back-off, then ten minutes of work read busy
+/// ending on a done claim whose act's `❯` row is above the screen (Claude
+/// Code's `answered` is read off the screen alone: none). Then the tab grows
+/// and aterm's resize reveals history at the top: the same turn, its own
+/// `❯` row now in sight, nothing run. FAILS WITHOUT THE FIX: the reveal was
+/// folded in as someone else's turn ended since (the opener kept from the
+/// first turn's point differed) — a third short turn, the back-off restarted
+/// at 8 min and the done check skipped; with a person's wheel 5 s before the
+/// read (scrolling to read the report), the worker's own report became the
+/// person's exchange, left to them, and Cruise was never continued.
+///
+/// The guard is the words: a turn whose last words END WITH the point's
+/// (the same words, or more of the same report read above them — its head
+/// revealed) is that point redrawn, whatever opener it now shows.
+/// NEGATIVE CONTROL: another opener over other words, no turn read running,
+/// is still someone else's turn ended since — judged once, after a tall
+/// turn whose opener was never in sight too (P4 kept there)
+/// ([`a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once`]
+/// holds the rest of that rule).
+#[test]
+fn a_judged_turn_whose_opener_comes_into_sight_is_not_judged_again() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const FIRST: &str = "Wrote the parser module.";
+    const REPORT: &str = "All done. Nothing left to do.";
+    const HEAD: &str = "The report: every item of the parser is written and tested.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    // The continuation typed past the first reply's back-off, then its
+    // answer: ten minutes of work read busy, a done claim, the act's `❯`
+    // row above the screen. The claim backs off at its second short turn.
+    let start = || {
+        let mut st = TurnEndState::default();
+        let first = TurnEndReading {
+            worked: Some(secs(6)),
+            ..closing(FIRST, PROMPT, None)
+        };
+        let (a, sent) = past_backoff(&mut st, &first, t);
+        let TurnEndAction::Type { text, .. } = &a else {
+            panic!("the continuation: {a:?}")
+        };
+        let text = text.clone();
+        st.acted(&a, &closing(FIRST, PROMPT, None), sent);
+        let tall = TurnEndReading {
+            worked: Some(secs(600)),
+            ..idle(REPORT, None)
+        };
+        let done_at = sent + secs(600);
+        let a = at(&mut st, &tall, done_at);
+        assert!(backs_off(&a, 2), "the claim backed off: {a:?}");
+        (st, text, done_at)
+    };
+    // The same screen read again is the same point.
+    let (mut st, _, done_at) = start();
+    let judged = st.point_number();
+    let a = at(&mut st, &idle(REPORT, None), done_at + secs(30));
+    assert!(backs_off(&a, 2), "{a:?}");
+    assert_eq!((st.short_streak(), st.point_number()), (2, judged));
+    // The same turn, its own `❯` row now in sight over the same words.
+    let (mut st, text, done_at) = start();
+    let judged = st.point_number();
+    let revealed = closing(REPORT, &text, Some(secs(602)));
+    let a = at(&mut st, &revealed, done_at + secs(30));
+    assert!(
+        backs_off(&a, 2),
+        "the same point, not a third short turn: {a:?}"
+    );
+    assert_eq!((st.short_streak(), st.point_number()), (2, judged));
+    let (a, _) = past_backoff(&mut st, &revealed, done_at + secs(30));
+    assert_eq!(a, checked(), "the claim's check, owed and typed: {a:?}");
+    // …with a person's wheel 5 s before the read: still the worker's report,
+    // owed its check, never the person's exchange.
+    let (mut st, text, done_at) = start();
+    let wheeled = TurnEndReading {
+        person: Some(secs(5)),
+        ..closing(REPORT, &text, Some(secs(602)))
+    };
+    let a = at(&mut st, &wheeled, done_at + secs(30));
+    assert!(!st.left_to_person(), "not the person's: {a:?} {st:?}");
+    let (a, _) = past_backoff(
+        &mut st,
+        &closing(REPORT, &text, Some(secs(602))),
+        done_at + secs(60),
+    );
+    assert_eq!(a, checked(), "continued once they left: {a:?}");
+    // A TALL REPORT'S HEAD REVEALED: the last words read longer than the
+    // point read them (the mark moved), the act's own `❯` row over them.
+    let (mut st, text, done_at) = start();
+    let judged = st.point_number();
+    let whole = closing(&format!("{HEAD}\n{REPORT}"), &text, Some(secs(602)));
+    let a = at(&mut st, &whole, done_at + secs(30));
+    assert!(backs_off(&a, 2), "the same turn, its head in sight: {a:?}");
+    assert_eq!((st.short_streak(), st.point_number()), (2, judged));
+    // NEGATIVE CONTROL: another opener over other words, nothing read
+    // running — a turn of someone else's ended since, judged once.
+    let (mut st, _, done_at) = start();
+    let judged = st.point_number();
+    let theirs = closing(
+        "Here is where it stands: the parser is written.",
+        "what stands now",
+        Some(secs(1)),
+    );
+    let a = at(&mut st, &theirs, done_at + secs(30));
+    assert!(backs_off(&a, 3), "someone else's turn: {a:?}");
+    assert_ne!(st.point_number(), judged);
+}
+
+/// RV-1 UNDER LAND: A LANDING STANDS THROUGH A REVEAL OF ITS NUDGE'S `❯` ROW.
+/// The land act answered short (its `❯` row in sight, work still open), the
+/// nudge typed past the back-off, and its long landing turn read busy lands
+/// the task with the nudge's `❯` row above the screen. Then the same
+/// screen with that row revealed, nothing run. FAILS WITHOUT THE FIX: the
+/// reveal was folded in as someone else's turn (`landed` false: the record
+/// is not read there) and, past the back-off, Land's nudge was typed into
+/// landed work — the landing's quiet broken, the face landed → open, a
+/// second DONE at the re-landing. The same reveal over a tall defense's head
+/// (more of the same words) is held alike.
+#[test]
+fn a_revealed_opener_keeps_a_landed_task_landed() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const OPEN: &str = "The lexer is still open; I will finish it next.";
+    const HEAD: &str = "Landed in three merges, the last one the lexer.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    let landed = || {
+        let mut st = TurnEndState::default();
+        let first = land(TurnEndReading {
+            worked: Some(3 * MIN),
+            ..closing("Stage 1 landed.", PROMPT, None)
+        });
+        assert_eq!(act(&mut st, &first, t), land_instruction());
+        let open = land(TurnEndReading {
+            worked: Some(secs(20)),
+            ..closing(OPEN, LAND, None)
+        });
+        let (a, sent) = past_backoff(&mut st, &open, t + secs(20));
+        let TurnEndAction::Type { text, rule_id } = &a else {
+            panic!("Land's next act: {a:?}")
+        };
+        assert_eq!(*rule_id, RULE_LAND_NUDGE);
+        let nudge = text.clone();
+        st.acted(&a, &land(closing(OPEN, LAND, None)), sent);
+        let landed_at = sent + secs(600);
+        let a = at(
+            &mut st,
+            &land(TurnEndReading {
+                worked: Some(secs(600)),
+                ..idle(DEFENSE, None)
+            }),
+            landed_at,
+        );
+        assert_eq!(a, TurnEndAction::Nothing, "{st:?}");
+        assert!(st.landed() && st.task_done(), "landed: {st:?}");
+        (st, nudge, landed_at)
+    };
+    // Read again as judged, it stays landed.
+    let (mut st, _, landed_at) = landed();
+    let a = at(&mut st, &land(idle(DEFENSE, None)), landed_at + secs(30));
+    assert_eq!(a, TurnEndAction::Nothing);
+    assert!(st.landed());
+    // The nudge's own `❯` row in sight over the same defense, then over its
+    // head too: still landed, nothing typed past any back-off.
+    for (case, said) in [
+        ("the same words", DEFENSE.to_string()),
+        ("the defense's head", format!("{HEAD}\n{DEFENSE}")),
+    ] {
+        let (mut st, nudge, landed_at) = landed();
+        let revealed = land(closing(&said, &nudge, Some(secs(602))));
+        let a = at(&mut st, &revealed, landed_at + secs(60));
+        assert_eq!(a, TurnEndAction::Nothing, "{case}: {st:?}");
+        assert!(st.landed() && st.task_done(), "{case}: landed: {st:?}");
+        let (a, _) = past_backoff(&mut st, &revealed, landed_at + secs(60));
+        assert_eq!(a, TurnEndAction::Nothing, "{case}: nothing typed: {a:?}");
+    }
+}
+
+/// THE REVIEW OF `b9/forever-gaps`, RV-1b: AN OPENER REDRAWN AT ANOTHER WIDTH
+/// OVER THE SAME WORDS IS NO NEW TURN. A token longer than the line is split
+/// where the width falls, so one `❯` prompt hashes as another opener at
+/// another width ([`TurnEndReading::answered`] joins its rows with a space);
+/// read before the point's back-off ran out, it was folded in as someone
+/// else's turn ended since. FAILS WITHOUT THE FIX (the words' guard): a
+/// second short turn, the back-off doubled, the act's due moved. NEGATIVE
+/// CONTROL: the same rewrapped opener over other words is a turn.
+#[test]
+fn an_opener_rewrapped_over_the_same_words_is_no_new_turn() {
+    const NARROW: &str = "review https://example.com/org/repo/pull/12345/fi les#diff-0123456789";
+    const WIDE: &str = "review https://example.com/org/repo/pull/12345/files#diff-012345 6789";
+    const SAID: &str = "Reviewed: the change is sound.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    let judged = || {
+        let mut st = TurnEndState::default();
+        let first = TurnEndReading {
+            worked: Some(secs(6)),
+            ..closing(SAID, NARROW, None)
+        };
+        let a = at(&mut st, &first, t);
+        assert!(backs_off(&a, 1), "{a:?}");
+        st
+    };
+    assert_ne!(
+        crate::supervise::approvals::words_hash(NARROW),
+        crate::supervise::approvals::words_hash(WIDE),
+        "two openers by their hash"
+    );
+    let mut st = judged();
+    let point = st.point_number();
+    let a = at(&mut st, &closing(SAID, WIDE, Some(secs(6))), t + secs(20));
+    assert!(backs_off(&a, 1), "the same point, rewrapped: {a:?}");
+    assert_eq!((st.short_streak(), st.point_number()), (1, point));
+    // NEGATIVE CONTROL: other words under it.
+    let mut st = judged();
+    let a = at(
+        &mut st,
+        &closing("Reviewed again: one nit.", WIDE, Some(secs(1))),
+        t + secs(20),
+    );
+    assert!(backs_off(&a, 2), "a turn: {a:?}");
 }

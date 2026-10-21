@@ -99,7 +99,7 @@ struct Take(std::fs::File);
 
 /// Which way a chunk went: `O` the program wrote it, `I` it was passed to the program.
 #[derive(Clone, Copy)]
-enum Way {
+pub(crate) enum Way {
     Out,
     In,
 }
@@ -119,7 +119,7 @@ impl Take {
 }
 
 /// A take's line (module doc): the stamp, the way, the bytes in lower-case hex.
-fn take_line(t_ns: u64, way: Way, bytes: &[u8]) -> String {
+pub(crate) fn take_line(t_ns: u64, way: Way, bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut line = String::with_capacity(bytes.len() * 2 + 24);
     let _ = write!(
@@ -365,24 +365,32 @@ fn relay(command: &[String], mut log: Option<std::fs::File>, mut take: Option<Ta
     })
 }
 
-/// `aterm-lab ctty -- command…`: take stdin's terminal as this session's
-/// controlling terminal, then become `command`. The relay starts its program
-/// this way, in a session of its own, so the kernel tells the program of every
-/// size change (SIGWINCH goes to a terminal's foreground group) without code
-/// between a fork and an exec.
+/// `aterm-lab ctty [--arg0 NAME] -- command…`: take stdin's terminal as this
+/// session's controlling terminal, then become `command` (its `argv[0]` NAME
+/// when given: the link relay starts a login shell as `-zsh`,
+/// [`crate::link`]). The relay starts its program this way, in a session of
+/// its own, so the kernel tells the program of every size change (SIGWINCH
+/// goes to a terminal's foreground group) without code between a fork and an
+/// exec.
 #[must_use]
 pub fn ctty(args: &[String]) -> i32 {
+    let (arg0, args) = match args {
+        [flag, name, rest @ ..] if flag == "--arg0" => (Some(name.as_str()), rest),
+        _ => (None, args),
+    };
     let Some((None, command)) = parse_args(args) else {
-        eprintln!("usage: aterm-lab ctty -- command [args...]");
+        eprintln!("usage: aterm-lab ctty [--arg0 NAME] -- command [args...]");
         return 2;
     };
     if let Err(e) = sys::take_controlling_tty(0) {
         eprintln!("relay: TIOCSCTTY: {e}");
         return 1;
     }
-    let err = aterm_uds::spawnfd::command(&command[0])
-        .args(&command[1..])
-        .exec();
+    let mut exec = aterm_uds::spawnfd::command(&command[0]);
+    if let Some(name) = arg0 {
+        exec.arg0(name);
+    }
+    let err = exec.args(&command[1..]).exec();
     eprintln!("relay: exec {}: {err}", command[0]);
     127
 }

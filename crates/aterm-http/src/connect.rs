@@ -38,8 +38,8 @@ pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpSt
     }
 }
 
-/// Winsock, hand-rolled (the house style for flat Win32): the vendored `windows-sys`
-/// carries only its consumers' closure, which names none of these.
+/// Winsock, hand-rolled (the house style for flat Win32): aterm-win32 carries
+/// only its consumers' closure of windows-sys, which names none of these.
 #[cfg(windows)]
 mod winsock {
     use std::ffi::c_void;

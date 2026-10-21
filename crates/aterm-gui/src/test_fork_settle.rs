@@ -1,17 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE TEST PROCESS FORKS ONLY ONCE libnotify IS UP.
+//! The test process forks only once libnotify is up.
 //!
 //! A thread inside libnotify's once-gate when another thread forks loses the
-//! child inside `fork()` — `BUG IN CLIENT OF LIBPLATFORM: os_once_t is
-//! corrupt`, "crashed on child side of fork pre-exec", SIGKILL — and the
-//! parent never learns: the child's copy of std's CLOEXEC error pipe closes
-//! with it, the EOF reads as an exec that succeeded, and `Command::spawn`
-//! answers `Ok` for a child that is already dead.
-//! `aterm_uds::spawnfd::pass_libnotify_gate` has the mechanism; every fork
-//! that strips its child passes the gate first (`InheritStrip::prepare`), but
-//! this binary's test helpers fork on their own.
+//! child inside `fork()` (`BUG IN CLIENT OF LIBPLATFORM: os_once_t is corrupt`,
+//! SIGKILL), and the parent never learns: the child's copy of std's CLOEXEC
+//! error pipe closes with it, the EOF reads as a successful exec, and
+//! `Command::spawn` answers `Ok` for a child already dead.
+//! `aterm_uds::spawnfd::pass_libnotify_gate` has the mechanism; every fork that
+//! strips its child passes the gate first (`InheritStrip::prepare`), but this
+//! binary's test helpers fork on their own.
 //!
 //! Explicit native observer tests still reach NSWorkspace while process tests
 //! fork. Test Apps use inert preference probes; the native runtime tests and

@@ -1526,7 +1526,12 @@ fn fish_history_reading(
         if appended {
             let after_the_start = unix_secs() + 1;
             append(after_the_start);
-            until_the_clock_reads(after_the_start);
+            // The release's `history merge` takes what was stamped before the
+            // second it runs in: fish 3.7 (the Linux lane's) left out entries of
+            // its own second, so a release in `after_the_start` read the warm
+            // tab without them in 3 of 4 lane runs. A cold start reads what was
+            // stamped before its start the same way.
+            until_the_clock_reads(after_the_start + 1);
         }
         tell(host, "go");
     }

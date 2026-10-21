@@ -162,7 +162,6 @@ fn threads(pid: c_int) -> Option<(Vec<ThreadReading>, bool)> {
     handles.truncate(n.min(handles.len()));
     let truncated = handles.len() > MAX_THREADS;
     handles.truncate(MAX_THREADS);
-    let (numer, denom) = timebase();
     let mut out = Vec::with_capacity(handles.len());
     for h in handles {
         // SAFETY: plain integers and bytes; all-zero is valid.
@@ -184,11 +183,10 @@ fn threads(pid: c_int) -> Option<(Vec<ThreadReading>, bool)> {
         out.push(ThreadReading {
             id: h,
             state: RunState::from_mach_thread(info.pth_run_state),
-            cpu_ns: Some(ticks_to_ns(
-                info.pth_user_time.saturating_add(info.pth_system_time),
-                numer,
-                denom,
-            )),
+            // Nanoseconds already: the kernel fills these from the thread's
+            // `time_value_t` (seconds and microseconds), unlike the task's
+            // `rusage` and `proc_taskinfo` times, which are Mach ticks.
+            cpu_ns: Some(info.pth_user_time.saturating_add(info.pth_system_time)),
             wchan: None,
         });
     }
@@ -520,7 +518,6 @@ const L7_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 /// L7: a thread of this process blocked reading its own pipe shows
 /// `PIPE_WANTR` on that end (waited for under [`L7_HANG`]); then one byte
 /// lets it go.
-#[cfg(not(target_arch = "wasm32"))]
 fn check_pipe_flags() -> Lane {
     let Some([r, w]) = own_pipe() else {
         return Lane::Off("no-pipe");

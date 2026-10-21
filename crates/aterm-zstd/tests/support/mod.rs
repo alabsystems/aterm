@@ -478,8 +478,7 @@ impl Census {
 }
 
 /// `f` of each of `items`, on every core, in `items`' order: a sweep's cuts
-/// and flips are independent decodes, and the test profile's unoptimised
-/// decoder ran them in turn for seconds (2026-10-17).
+/// and flips are independent decodes.
 pub fn on_every_core<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);

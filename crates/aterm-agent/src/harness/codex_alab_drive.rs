@@ -40,7 +40,7 @@ use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
     SAME_PROGRAM, STALE_S, St, TabLife, alive, base_name, connect, cwd_of, exe_of, file_holders,
-    first_word, ids, ledger, load, lsof_open_files, now_s, process_in_tab, registry_graph,
+    first_word, ids, ledger, load, lsof_open_files, now_s, pause, process_in_tab, registry_graph,
     registry_life, roster, said, save, squash, state_dir, table, type_relaunch_line_with, upgrade,
     wait_until,
 };
@@ -479,7 +479,7 @@ fn relaunch_held(
     }
     hand.keep(c);
     // The shell draws its prompt after it takes the terminal back.
-    std::thread::sleep(Duration::from_millis(600));
+    pause(Duration::from_millis(600));
     let tab = st.tab.clone();
     let home = PathBuf::from(&st.codex_home);
     if find_rollout(&home, &st.thread).is_none() {

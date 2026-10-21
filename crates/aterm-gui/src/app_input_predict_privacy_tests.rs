@@ -7,8 +7,10 @@
 //! Driven end to end on a headless App: presses go through [`App::input`] (the
 //! press path that arms guesses), the program's output goes into the focused
 //! pane's terminal, and the composed present (`redraw_compose`) reconciles and
-//! paints. The echo latency the Adaptive gate measures is injected through the
-//! frame instant handed to the present, never slept.
+//! paints. Every press and every frame is stamped on the rig's own clock
+//! (`pin_input_clock`, the present's instant), never the wall clock: the echo
+//! latency the Adaptive gate measures is that clock moved forward, never slept,
+//! and no stall of the test thread ages a guess past its glitch window.
 //!
 //! Each scenario first shows the rig can paint a ghost (an echoing line on a
 //! slow link), so "the secret is not on glass" is not vacuous.
@@ -49,6 +51,9 @@ struct Rig {
     focus: u64,
     other: u64,
     bottom: usize,
+    /// The rig's clock: the instant its next press is stamped and its next frame
+    /// presented. Only [`Self::present_after`] moves it.
+    now: Instant,
 }
 
 impl Rig {
@@ -86,6 +91,7 @@ impl Rig {
             focus,
             other,
             bottom: rows - 1,
+            now: Instant::now(),
         };
         rig.feed(&"\r\n".repeat(rows + 4));
         rig.feed("$ ");
@@ -114,18 +120,26 @@ impl Rig {
         (usize::from(c.row), usize::from(c.col))
     }
 
+    /// Press `ev` at the rig's clock.
     fn key(&mut self, ev: InputEvent) {
+        crate::app_input::pin_input_clock(Some(self.now));
         let _ = self.app.input(self.wid, ev, Source::Human);
     }
 
-    /// One presented frame at `now`. The background pane is damaged so a frame
-    /// presents even when the focused pane did not change.
-    fn present(&mut self, now: Instant) {
+    /// One presented frame at the rig's clock. The background pane is damaged so
+    /// a frame presents even when the focused pane did not change.
+    fn present(&mut self) {
+        self.present_after(Duration::ZERO);
+    }
+
+    /// Move the rig's clock on by `elapsed`, then present a frame there.
+    fn present_after(&mut self, elapsed: Duration) {
+        self.now += elapsed;
         let term = self.app.pool.get(self.other).expect("other").term.clone();
         term_lock(&term).process(b".");
         assert!(
             self.app
-                .redraw_compose(self.wid, ROWS, COLS, false, false, None, 0, now)
+                .redraw_compose(self.wid, ROWS, COLS, false, false, None, 0, self.now)
                 .is_some(),
             "the frame presents"
         );
@@ -150,14 +164,14 @@ impl Rig {
     fn displaying(&self) -> bool {
         self.app.windows[&self.wid]
             .predictor
-            .is_displaying(Instant::now())
+            .is_displaying(self.now)
     }
 
     /// Type `c`; the program echoes it one slow RTT later.
     fn type_echoed(&mut self, c: char) {
         self.key(glyph(c));
         self.feed(&c.to_string());
-        self.present(Instant::now() + RTT);
+        self.present_after(RTT);
     }
 
     /// Type a command on the slow link until Adaptive paints, and show it does:
@@ -170,7 +184,7 @@ impl Rig {
         let last = last.chars().next().expect("a non-empty command");
         let (row, col) = self.cursor();
         self.key(glyph(last));
-        self.present(Instant::now());
+        self.present();
         assert!(self.displaying(), "control: a slow, echoing line paints");
         assert_eq!(
             self.on_glass(row, col),
@@ -178,7 +192,7 @@ impl Rig {
             "control: the rig paints a ghost before the echo"
         );
         self.feed(&last.to_string());
-        self.present(Instant::now() + RTT);
+        self.present_after(RTT);
     }
 
     /// The person types one secret glyph at a prompt that never echoes; return
@@ -187,7 +201,7 @@ impl Rig {
         let (row, col) = self.cursor();
         self.key(glyph(secret));
         let displaying = self.displaying();
-        self.present(Instant::now());
+        self.present();
         displaying || self.on_glass(row, col) == secret
     }
 }
@@ -201,11 +215,11 @@ fn a_prompt_scrolled_onto_the_echoing_row_does_not_inherit_its_proof() {
     rig.type_command_on_a_slow_link("./go");
     rig.key(press(Key::Named(NamedKey::Enter), Modifiers::empty()));
     rig.feed("\r\nProceed? [y/N] ");
-    rig.present(Instant::now() + RTT);
+    rig.present_after(RTT);
     // `read -n1`: the answer echoes and ends the line by itself.
     rig.type_echoed('y');
     rig.feed(&format!("\r\n{PROMPT}"));
-    rig.present(Instant::now() + RTT);
+    rig.present_after(RTT);
     assert_eq!(
         rig.cursor(),
         (rig.bottom, PROMPT.len()),
@@ -229,7 +243,7 @@ fn a_prompt_printed_beside_an_echoed_answer_does_not_inherit_its_proof() {
     rig.type_command_on_a_slow_link("./go");
     rig.key(press(Key::Named(NamedKey::Enter), Modifiers::empty()));
     rig.feed("\r\nProceed? ");
-    rig.present(Instant::now() + RTT);
+    rig.present_after(RTT);
     rig.type_echoed('y');
     assert!(
         rig.app.windows[&rig.wid].predictor.idle(),
@@ -287,7 +301,7 @@ fn a_typed_ahead_word_outlives_only_a_line_terminator() {
         for c in "foo".chars() {
             rig.key(glyph(c));
         }
-        rig.present(Instant::now());
+        rig.present();
         assert_eq!(
             rig.on_glass(row, col),
             'f',
@@ -314,7 +328,7 @@ fn a_typed_ahead_word_outlives_only_a_line_terminator() {
         let mut rig = Rig::new("adaptive");
         let (row, col) = typed_ahead_foo(&mut rig);
         rig.key(submit);
-        rig.present(Instant::now());
+        rig.present();
         let tail: String = (col..col + 3).map(|c| rig.on_glass(row, c)).collect();
         assert_eq!(
             tail, "foo",
@@ -338,7 +352,7 @@ fn a_typed_ahead_word_outlives_only_a_line_terminator() {
         rig.key(erase);
         rig.feed(echo);
         assert_eq!(rig.cursor(), (row, col + end), "{label}: fixture");
-        rig.present(Instant::now() + RTT);
+        rig.present_after(RTT);
         let erased: String = (col + end..col + 3).map(|c| rig.on_glass(row, c)).collect();
         assert!(
             !erased.contains(['f', 'o']),
@@ -414,7 +428,7 @@ fn a_tty_that_will_not_echo_is_never_predicted() {
     rig.type_command_on_a_slow_link("./go");
     rig.key(press(Key::Named(NamedKey::Enter), Modifiers::empty()));
     rig.feed("\r\nProceed? ");
-    rig.present(Instant::now() + RTT);
+    rig.present_after(RTT);
     set_lflag(slave, |l| *l = (*l | libc::ECHO) & !libc::ICANON); // read -n1
     rig.type_echoed('y');
     rig.feed(" Password: ");
@@ -480,7 +494,7 @@ fn the_composed_cursor_never_covers_half_of_a_wide_glyph() {
         2,
         "fixture: both glyphs are guessed"
     );
-    rig.present(Instant::now());
+    rig.present();
     assert_eq!(
         rig.on_glass(rig.bottom, 2),
         'b',
@@ -524,16 +538,16 @@ fn an_arrow_on_a_proven_line_shows_once_a_motion_has_echoed() {
         !rig.app.windows[&rig.wid].predictor.idle(),
         "the arrow is tracked as an edit op"
     );
-    rig.present(Instant::now());
+    rig.present();
     assert!(!rig.displaying(), "the first motion stays dark");
     rig.feed("\x08");
-    rig.present(Instant::now() + RTT);
+    rig.present_after(RTT);
     assert!(
         rig.app.windows[&rig.wid].predictor.idle(),
         "its echo retired it"
     );
     rig.key(left());
-    rig.present(Instant::now());
+    rig.present();
     assert!(rig.displaying(), "the second motion shows");
     let ws = &rig.app.windows[&rig.wid];
     let tree = &ws.layouts[ws.tabs.active];
@@ -557,7 +571,7 @@ fn an_arrow_on_a_proven_line_shows_once_a_motion_has_echoed() {
     rig.key(left());
     let predictor = &rig.app.windows[&rig.wid].predictor;
     assert!(
-        predictor.idle() && !predictor.is_displaying(Instant::now()),
+        predictor.idle() && !predictor.is_displaying(rig.now),
         "editing off: the arrow is input the predictor does not model"
     );
 }

@@ -1,154 +1,77 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RESIZE LEDGER: every grid resize a session took, who asked for it, the
-//! runs they form, and whether the application has drawn over content a
+//! Resize ledger: records every grid resize a session takes, who asked for it,
+//! the runs they form, and whether the application has drawn over content a
 //! resize displaced (`resizes`, `status render=`, `EVENT <local> resize`,
 //! `EVENT <local> render desync-risk|healed`).
 //!
-//! WHY IT EXISTS (measured 2026-09-28 against a live Claude Code session). The
-//! window re-gridded 64→63→64 rows within a millisecond about once a minute.
-//! On the alternate screen the shrink DEMOTES the top row (the alt grid keeps
-//! no history, so it is dropped) and the grow appends a blank row, so a
-//! net-zero flap leaves every row one higher than the app painted it. Claude
-//! Code repaints (ED 2) only when its SIGWINCH handler reads a CHANGED size;
-//! once in 52 flaps both resizes landed before the handler ran, it read
-//! 64 == 64, skipped the repaint, and its diff frames landed on shifted
-//! content for good. The geometry is unchanged across such a flap and a
-//! per-read watermark misses it, so no surface could say it happened. The
-//! engine now journals what each resize did to the rows
-//! (`aterm_core::terminal::ResizeReport`); this ledger reads that journal.
-//! The engine also UNDOES such a flap when no output landed between its
-//! halves (the grid's resize undo hands the demoted row back, counted in
-//! `revealed` and said as `restored=`), so a quiet flap nets to zero here and
-//! reads `none`; what the judge below still sees is a flap that output split
-//! (a mode set, a query, a spinner frame), which dropped the undo but not the
-//! run.
+//! ## Purpose
+//! On the alternate screen, a shrink demotes the top row (which has no history
+//! and is dropped) and a grow appends a blank row, so a net-zero flap leaves
+//! every row one higher than the app painted it. When an app repaints (`ED 2`)
+//! only after its `SIGWINCH` handler reads a changed size, a rapid net-zero flap
+//! can complete before the handler runs; the handler reads an unchanged size,
+//! skips the repaint, and subsequent diff frames land on shifted rows. The engine
+//! journals what each resize did to the rows (`aterm_core::terminal::ResizeReport`)
+//! and undoes quiet flaps when no output landed between halves (`restored=`);
+//! this ledger reads that journal and evaluates flaps split by intervening output.
 //!
-//! RUNS. A resize joins the newest run (one not yet settled: `none`,
-//! `reflow` or `silent`) on the same screen, with no full clear and no screen
-//! switch since the previous resize, when
+//! ## Runs
+//! A resize joins the newest unsettled run (`none`, `reflow`, or `silent`) on
+//! the same screen, with no full clear or screen switch since the previous
+//! resize, when:
 //!
 //! * it came at most [`RUN_GAP_MS`] after the previous one and nothing
-//!   changed the screen between them (`ResizeReport::adjoins`): the proxy for
-//!   "the app's SIGWINCH handler could only see the final size";
+//!   changed the screen between them (`ResizeReport::adjoins`);
 //! * it came at most [`RUN_GAP_MS`] after the previous one, the run is
-//!   `silent` (it displaced rows) and this resize takes the previous one back
-//!   (its `to` is the previous `from`: a flap's second half), whatever the
-//!   app drew between them: a draw is no evidence that the handler read the
-//!   intermediate size (a spinner tick is drawn by a frame laid out for the
-//!   size the app last read), and a handler that did read it and repaints
-//!   from scratch shows as the clear that splits the run. A draw closes the
-//!   run to any other resize — to one that moved nothing (the app drew on an
-//!   undisplaced screen, a fresh baseline), and to one going on to a third
-//!   size, so a drag the app follows frame by frame is not one long run; or
-//! * the run is `silent` and never drawn over, and nothing changed the screen
-//!   since the previous resize, however late: the displacement is still the
-//!   run's, and a grow the engine's resize undo answers (`restored=`) puts it
-//!   back, so the pair nets to zero rather than leaving two `silent` halves.
+//!   `silent` (it displaced rows), and this resize reverses the previous one
+//!   (`to` == previous `from`), regardless of intervening draws (a draw closes
+//!   the run to any resize that moved nothing or moves to a third size); or
+//! * the run is `silent` and undrawn, and nothing changed the screen since the
+//!   previous resize, regardless of elapsed time, so a late undo grow
+//!   (`restored=`) still nets the run to zero.
 //!
-//! The gap is measured from the previous row's booking time only when the
-//! path that ran it booked it: a backfilled row (`site=-`) is stamped when a
-//! reader found it, so after one only the first and last cases join.
+//! The gap is measured from the previous row's booking time only when booked by
+//! the path that ran it (`timed`); for a backfilled row (`site=-`), only the
+//! first and third cases join.
 //!
-//! A run is NET-ZERO when its geometry ends where it began; `flaps=` counts
-//! the net-zero runs of two or more resizes. Rows a grow hands back from the
-//! engine's resize undo (`restored=`) go back to the run whose shrink stashed
-//! them, newest first as the undo pops them ([`ResizeLedger::credit`]): the
-//! run the grow joins nets them in its own shift, and a run the grow did NOT
-//! join (a newer run opened between, or a run the grouping above closed while
-//! the undo still held its rows) is credited with them and the grow's own run
-//! does not count them, so a quiet flap moves nothing here however its halves
-//! were grouped.
+//! A run is net-zero when its geometry ends where it began; `flaps=` counts
+//! net-zero runs of two or more resizes. Rows restored from the engine's resize
+//! undo (`restored=`) are credited LIFO to the run whose shrink stashed them
+//! ([`ResizeLedger::credit`]).
 //!
-//! THE JUDGE. A run is judged only on the alternate screen, where apps address
-//! rows absolutely and nothing can move a demoted row back; the primary
-//! screen's content is history-backed and moves with the cursor (a rewrap
-//! there is terminal-owned: `reflow`). A judged run is one that moved content
-//! (`displaced`) or pushed rows off the bottom (`pushed`). It is:
+//! ## Verdicts
+//! Only alternate-screen runs that displaced content (`displaced`) or pushed rows
+//! off the bottom (`pushed`) are judged (primary-screen rewraps are `reflow`):
 //!
 //! * `silent` while the app has not drawn since, or drew less than
-//!   [`RISK_AFTER_MS`] ago (its changed-size repaint may still be arriving);
-//! * `desync-risk`, for a NET-ZERO run only, once the app has drawn (after
-//!   the grow back, or between the halves: a frame on displaced content) and
-//!   [`RISK_AFTER_MS`] passed with no heal: its handler, whenever it ran, read
-//!   an unchanged size, and it drew over the displaced content without
-//!   clearing it — t=2649, and the presence row's attention flap whose halves
-//!   a spinner tick split (2026-09-28: `appended=1 restored=0`, the top row
-//!   lost, which the ledger then split into two `net=changed` runs);
-//! * `unverified`, for a run whose geometry stayed CHANGED, once the app has
-//!   drawn and [`RISK_AFTER_MS`] passed with no heal: its handler read the
-//!   change and most apps repaint with a clear (which heals it), but a repaint
-//!   that does not clear is invisible to every counter here, and so is a
-//!   spinner tick drawn on the moved rows before the handler ran. The ledger
-//!   does not vouch either way; `cast drift` replays the recording and
-//!   decides: a size that later came back, however long after, it weighs as
-//!   a flap the app may have missed (a RETURN), and one that stayed changed
-//!   is the app's to repaint. (Until 2026-09-28 this was `repainted`, the
-//!   draw TAKEN as the repaint: a single net-changed resize the app never
-//!   repainted read as fine. No engine counter can prove a non-clearing
-//!   repaint — a row written since the resize may be one cell of it — so the
-//!   verdict says what is known.) A later heal still moves it to `healed`;
-//! * `healed` once the engine's full-clear or screen-replacement count moved
-//!   past the run's (ED 2, a home ED 0, an alt-screen switch, RIS);
-//! * `none` for a run that moved nothing (a trim), `reflow` for a primary
-//!   width change.
+//!   [`RISK_AFTER_MS`] ago;
+//! * `desync-risk` for a net-zero run once the app has drawn and
+//!   [`RISK_AFTER_MS`] has passed with no heal;
+//! * `unverified` for a net-changed run once the app has drawn and
+//!   [`RISK_AFTER_MS`] has passed with no heal (a non-clearing repaint cannot be
+//!   distinguished from a diff tick here; `cast drift` audits these);
+//! * `healed` once `full_clears` or `screen_replaced` advances past the run's;
+//! * `none` for a run that moved nothing, `reflow` for a primary width change.
 //!
-//! THE RULE, in the journal's fields. A shrink that displaced alt-screen rows
-//! (`demoted`, `pushed`) and the grow back to its starting geometry, in one
-//! run, sum to a net displacement (`shift()`, `net_pushed()`: a grow the
-//! resize undo answered carries it back in `restored=`, one after output
-//! only appends). The pair is a risk when that sum is nonzero, whatever
-//! output (`content_seq`) landed between the halves, unless the app repainted
-//! the screen from scratch: a `full_clears`/`screen_replaced` advance between
-//! the halves splits the run (the shrink's run is `healed`, the grow's moved
-//! nothing), and one after the grow heals the joined run. Fully restored, the
-//! sum is zero: `none`, and `render=ok`.
-//!
-//! The verdict is a RISK, not a proof. Its blind spots, stated: a flap whose
-//! halves more than [`RUN_GAP_MS`] separate, with the app drawing between them,
-//! is two net-changed runs, never `desync-risk` (the app's handler had that
-//! long to read the intermediate size) — the half that displaced reads
-//! `unverified` once drawn on, and `cast drift` audits it (a RETURN, a lossy
-//! shrink through the resize that brings the size back however long after,
-//! holds the halves time split); a changed-size repaint that does not clear,
-//! between the halves of a flap, still reads as a draw on displaced content (a
-//! false `desync-risk`) — a window dragged down and straight back on the
-//! alternate screen, the app redrawing each size without ED 2, is such a flap
-//! at the turn; and a `desync-risk` (or an `unverified`) stays until a full
-//! clear or a screen switch, even when the app repaints every row without
-//! clearing.
-//! The first of those is closed by the second judge, the engine's render debt
-//! read as one EPOCH ([`crate::resize_epoch`]), and what that judge finds
-//! for the one program whose repaint contract was measured (Claude Code) is
-//! repaired by a closed loop that never resizes the engine
-//! ([`crate::app_nudge`], `[render] repaint_nudge`; the header of a `resizes`
-//! reply says where it is, `nudge=<phase> nudged=<n>`, and an epoch it
-//! repainted closes `by=nudge`). The
-//! formal statement is `aterm_models_render::resize_render_model`
-//! (`ResizeRender`); the Tier-1 bind to this code is
+//! A second judge tracks the engine's cumulative render debt as one epoch
+//! ([`crate::resize_epoch`]) to catch flaps whose halves are separated by both a
+//! draw and more than [`RUN_GAP_MS`], and triggers [`crate::app_nudge`] when
+//! configured (`[render] repaint_nudge`). Formal model:
+//! `aterm_models_render::resize_render_model` (`ResizeRender`), bound by
 //! `tests::resize_render_conformance`.
 //!
-//! WHO WRITES IT. The host's resize paths copy the engine's journal INSIDE the
-//! `term_lock` hold the resize already takes ([`JournalCopy::take`], at most
-//! `RESIZE_JOURNAL_CAP` reports) and ingest it after releasing that lock, under
-//! the session timeline's own leaf lock, with their attribution: the window
-//! pass (`App::resize_panes_scoped_with_active_plan`, `site=` the entry point
-//! it runs under, [`SiteScope`]) and the cross-session `resize`
-//! (`site=ctl-cross`). Readers ([`EngineProbe`], five integers sampled under a
-//! hold they already take) evaluate. Two threads copy and book in either
-//! order, so a copy or a probe can arrive LATE: every reading carries the
-//! engine's lifetime token and resize ordinal, a copy older than what is
-//! booked only hands over its attribution, and a probe is compared only with
-//! the runs it is not older than (and with their content only when it saw
-//! exactly what is booked). A resize no path recorded is found by the
-//! SELF-AUDIT: an engine ordinal past the ledger's is backfilled from the
-//! journal with `site=-` and counted (`unledgered=`); one that fell out of the
-//! journal first is counted as `lost=`. No lock is taken under another here,
-//! and every operation is bounded by the two rings.
+//! ## Concurrency & Ordering
+//! Resize paths copy the engine's journal under the existing `term_lock` hold
+//! ([`JournalCopy::take`]) and ingest it under the session timeline's leaf lock
+//! with their [`SiteScope`] attribution. Readers sample [`EngineProbe`] under a
+//! `term_lock` hold they already take and evaluate under the timeline lock.
+//! Out-of-order copies and probes are ordered by the engine's lifetime token and
+//! resize ordinal; unrecorded ordinals are backfilled as `site=-` (`unledgered=`)
+//! or counted as `lost=` if evicted from the journal ring.
 //!
-//! No clock is read here: the host stamps each row and passes `now_ms` (the
-//! timeline clock, [`crate::turn_ledger::now_ms`]).
+//! No clock is read here; callers pass `now_ms` ([`crate::turn_ledger::now_ms`]).
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -189,9 +112,9 @@ pub(crate) const RISK_AFTER_MS: u64 = 1_000;
 /// the last and the chain says `...`.
 const GEOMS_KEPT: usize = 8;
 
-/// Which kind of entry point asked for a window pass (`site=`): the OUTERMOST
-/// one on the main thread's stack when the pass ran, a stable word an operator
-/// can read on any build. Where in the source it was is `at=`.
+/// Which kind of entry point asked for a window pass (`site=`): the outermost
+/// one on the main thread's stack when the pass ran. Where in the source it was
+/// called is recorded as `at=`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Cause {
     /// The input dispatch (`App::input_to_session`): an `InputEvent::Resize`,
@@ -254,15 +177,10 @@ thread_local! {
     static SCOPE: Cell<Option<Site>> = const { Cell::new(None) };
 }
 
-/// Marks a resize ENTRY POINT for the ledger's `site=`: a one-line shim in
-/// front of an ordinary body (`on_resize`, `input_to_session`, …) enters the
-/// scope with the source line that CALLED it (`#[track_caller]` on the shim
-/// alone, so no panic or `term_lock` tripwire inside the body is re-pointed at
-/// the caller), and the window pass reads [`SiteScope::current`]. The
-/// OUTERMOST entry point wins — a chrome re-grid that runs `on_resize` is
-/// `chrome` — and dropping the guard (a panic's unwind included) leaves the
-/// scope. Main-thread state only, hence a thread-local rather than a field
-/// every `App` constructor would carry.
+/// Marks a resize entry point for the ledger's `site=`. A one-line `#[track_caller]`
+/// shim enters the scope with its caller's location, and the window pass reads
+/// [`SiteScope::current`]. The outermost entry point wins, and dropping the guard
+/// (including on unwind) clears the scope.
 #[must_use = "the scope lasts as long as the guard"]
 pub(crate) struct SiteScope {
     outer: bool,
@@ -650,10 +568,8 @@ impl Run {
         };
     }
 
-    /// The alternate screen, no rewrap, and content moved or pushed off —
-    /// moved EITHER way: a drawn net-zero run whose content moved down is a
-    /// `desync-risk` as one moved up is (`ResizeRender`'s `lr` reads both; its
-    /// `led` sums only the up-moved ones, which keeps its space bounded).
+    /// Alternate screen, no rewrap, and content moved (either direction) or
+    /// pushed off the bottom.
     fn judged(&self) -> bool {
         self.alt && !self.reflowed && (self.displaced != 0 || self.pushed > 0)
     }
@@ -663,8 +579,7 @@ impl Run {
     }
 
     /// A judged run that can turn `desync-risk`: its geometry ended where it
-    /// began, so the app's handler read no change whenever it ran. A run whose
-    /// geometry stayed changed is the app's to repaint.
+    /// began, so the app's handler read no change whenever it ran.
     fn eligible(&self) -> bool {
         self.judged() && self.net_zero()
     }
@@ -674,8 +589,7 @@ impl Run {
         self.n >= 2 && self.changed && self.net_zero()
     }
 
-    /// Either heal counter advanced PAST the run's (both only grow, so an
-    /// older reading never passes for a heal).
+    /// Either heal counter advanced past the run's.
     fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
     }
@@ -827,17 +741,11 @@ pub(crate) struct ResizeLedger {
 }
 
 impl ResizeLedger {
-    /// Book `copy`'s reports past the ledger's watermark, then evaluate against
-    /// its probe. `attribution` belongs to the resize the caller just ran: the
-    /// journal's newest report. Every other new report is backfilled as
-    /// `site=-` (`unledgered=`); a report already booked by a backfill takes
-    /// `attribution` over, so the path that ran it keeps the credit.
-    ///
-    /// A copy OLDER than what is booked (same engine, lower ordinal: another
-    /// thread copied later and booked first) only hands over its attribution —
-    /// its reports are booked and its probe predates them. A copy of ANOTHER
-    /// engine lifetime (a restored engine, ordinals restarting at 0) rebases
-    /// the ledger onto it.
+    /// Books `copy`'s reports past the ledger's watermark, then evaluates against
+    /// its probe. `attribution` belongs to the newest report; any earlier unbooked
+    /// reports are backfilled as `site=-` (`unledgered=`). A copy older than
+    /// `last_ordinal` only hands over its attribution; a copy from another engine
+    /// lifetime rebases the ledger onto it.
     pub(crate) fn ingest(
         &mut self,
         copy: &JournalCopy,
@@ -1000,18 +908,10 @@ impl ResizeLedger {
         }
     }
 
-    /// Return the rows `report` handed back from the engine's resize undo
-    /// (`restored_top`, `restored_bottom`) to the runs whose shrinks stashed
-    /// them, newest first, as the undo pops them (LIFO), and say how many went
-    /// to runs OTHER than `joining` (the run `report` is about to join, whose
-    /// own shift already nets them). A run holding rows has drawn nothing
-    /// since (any output drops the undo), so it is still `silent` or `none`;
-    /// credited back to zero it moved nothing and reads `none`. This is what
-    /// keeps a quiet flap an identity here when more than [`RUN_GAP_MS`]
-    /// split its halves: time closed the shrink's run, the undo still held the
-    /// row, and the grow's own run would otherwise count it as a shift down.
-    /// The pairing needs every stash booked: after a `lost=` report nothing is
-    /// held (see [`Run::held`]), and a hand-back then credits no run.
+    /// Credits rows restored from the engine's resize undo (`restored_top`,
+    /// `restored_bottom`) LIFO to the runs whose shrinks stashed them, returning
+    /// `(top, bottom)` credited to runs other than `joining` (which nets its own
+    /// shift directly).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1493,11 +1393,9 @@ fn wire_run(out: &mut String, run: &Run) {
     );
 }
 
-/// `resizes [<n>] [since=<id>]`: the TARGET session's ledger. Cross-session
-/// correct like `timeline` (both locks are the target's). The journal is
-/// copied under a brief `term_lock`, released, then the timeline's leaf lock
-/// backfills anything no path booked and evaluates: never nested. A copy that
-/// arrives after a resize path booked a newer one is stale and books nothing.
+/// `resizes [<n>] [since=<id>]`: returns the target session's ledger. Copies the
+/// journal under a brief `term_lock`, releases it, then backfills and evaluates
+/// under the timeline's leaf lock.
 pub(crate) fn cmd_resizes(
     ctx: &crate::SessionCtx,
     term: &std::sync::Mutex<Terminal>,
@@ -1622,9 +1520,9 @@ mod tests {
         );
         assert_eq!((apart.high_run, apart.flaps), (2, 0));
 
-        // The app drew between the halves of a flap that displaced rows (a
-        // spinner tick, 2026-09-28): still one run, and it saw the draw — a
-        // draw is no evidence that the handler read the smaller size.
+        // The app drew between the halves of a flap that displaced rows:
+        // still one run, and it saw the draw — a draw is no evidence that the
+        // handler read the smaller size.
         let mut drawn = ResizeLedger::default();
         drawn.ingest(&copy_of(&[shrink], probe(1, 11, 0)), Some(here()), 1_000);
         let mut grow_after_draw = report(2, 23, 24, true, (15, 16));
@@ -1763,18 +1661,9 @@ mod tests {
         assert_eq!((quiet.high_run, quiet.flaps), (1, 1));
     }
 
-    /// Rows a grow hands back from the engine's resize undo go back to the run
-    /// whose shrink stashed them, newest first (the undo pops LIFO). Two
-    /// shrinks, each stashing a demoted row, then two grows handing them back,
-    /// 300 ms apart: a run that displaced rows and was never drawn over waits
-    /// for its next resize however late, so the four are ONE run whose own
-    /// shift nets the hand-backs, it moves nothing, and a draw after it is no
-    /// verdict at all; inside the gap the same. The control: the second grow
-    /// finds the undo dropped (it appends), so the run is a net-zero one that
-    /// lost a row, and a draw on it is a RISK. And a run the grow does NOT
-    /// join (here: `credit` asked directly, as for a run a grouping closed
-    /// while the undo still held its rows) is credited with the row it
-    /// stashed, and the grow's own run does not count it.
+    /// Rows restored from the engine's resize undo are credited LIFO to the run
+    /// whose shrink stashed them, both when the grow joins that run and when it
+    /// credits an earlier closed run without joining it.
     #[test]
     fn a_grow_hands_rows_back_to_the_run_that_stashed_them() {
         let shrink = |ordinal, from, to, seq: u64| {
@@ -1864,15 +1753,9 @@ mod tests {
         );
     }
 
-    /// A stash the ledger never saw breaks the newest-first pairing: the
-    /// journal dropped a shrink's report (`lost=`), so the grow that hands its
-    /// row back must not credit an OLDER run, whose own row output that drew
-    /// nothing (a mode set) already dropped from the undo. That run keeps its
-    /// shift and reads `unverified` once drawn on, never `none`. Two things
-    /// hold it: the `lost=` branch gives every hold up, and, before it, the
-    /// lost shrink's own re-layout moved the content past the run's, which the
-    /// next booking reads as a draw (so this passes without the first too,
-    /// measured 2026-09-28; the branch keeps it from resting on that).
+    /// When a journal overrun (`lost=`) drops a shrink report, [`Run::held`] is
+    /// cleared on existing runs so a subsequent undo restore cannot credit an
+    /// older run whose own stashed row was already dropped.
     #[test]
     fn a_lost_report_credits_no_older_run() {
         let mut ledger = ResizeLedger::default();
@@ -2364,16 +2247,9 @@ mod tests {
         assert_eq!(SiteScope::current(), None, "an unwind leaves the scope");
     }
 
-    /// THE BAND'S AND THE STRIP'S RE-GRIDS ARE CHROME (2026-09-29): the
-    /// every-window chrome re-grid (`App::regrid_for_chrome_rows`) is an entry
-    /// point of its own, `site=chrome`, attributed to the line that asked.
-    /// Measured on main `8b24e99a4`: the band's re-grids were booked
-    /// `site=window at=crates/aterm-gui/src/app_config.rs:9301` — the
-    /// `on_resize` call inside it, under `on_resize`'s own scope — so the
-    /// `resizes` rows named a band flap an OS window resize, while the presence
-    /// row's own re-grid read `site=chrome`. The NEGATIVE CONTROL is
-    /// the recorded scope itself: without the shim the body runs under none,
-    /// and `on_resize` then books its own `site=window`.
+    /// Every-window chrome re-grids (`App::regrid_for_chrome_rows`) enter their
+    /// own [`Cause::Chrome`] scope, attributed to the caller's line, rather than
+    /// booking under the inner `on_resize`'s `site=window`.
     #[test]
     fn the_bands_and_the_strips_regrid_is_booked_as_chrome_from_the_line_that_asked() {
         let mut app = crate::App::headless_for_test();
@@ -3036,19 +2912,8 @@ mod tests {
         conform_answered(&mut Answers::new(model), schedule, seen)
     }
 
-    /// What ONE model already answered about the states a walk projected: the
-    /// successor `fire` gave each action it enabled, and the states every
-    /// invariant held at.
-    ///
-    /// WHY (test-run speed): [`resize_render_conformance`] replays
-    /// each schedule from a fresh rig, so every prefix's states are asked
-    /// about again for each of its extensions — and the interpreter's answers
-    /// were 61% of the test's samples (`check_invariant` 48%, `fire` 9%,
-    /// `action_enabled` 4%): 8.8 CPU-s run alone, 3.8 with them kept. The
-    /// answers are pure functions of the model, the action and the state, and
-    /// an entry is written only after the model said yes to exactly that
-    /// question, so a remembered answer is the one asking again would get, and
-    /// every real transition is still compared with it.
+    /// Caches pure model transition and invariant answers across prefix-sharing
+    /// schedules in [`resize_render_conformance`].
     struct Answers<'m> {
         model: &'m aterm_spec::derive::Model,
         fired: BTreeMap<Projected, BTreeMap<&'static str, Projected>>,
@@ -3212,15 +3077,9 @@ mod tests {
         inside
     }
 
-    /// Every schedule of rig steps up to depth 6 (a step never repeated back
-    /// to back, which adds no state), each replayed on a real alternate-screen
-    /// Terminal and the real ledger.
-    ///
-    /// Each schedule is replayed on a fresh rig, so the subtrees below the
-    /// schedules of length two are independent: they are walked side by side
-    /// (26 s walked in turn on a 6-core host), every schedule still replayed
-    /// exactly once, and the tallies are summed before the assertions, which
-    /// read the whole walk as before.
+    /// Replays every schedule of rig steps up to depth 6 (without back-to-back
+    /// duplicate steps) on a real alternate-screen `Terminal` and `ResizeLedger`,
+    /// walking independent length-2 subtrees in parallel.
     #[test]
     fn resize_render_conformance() {
         let model = resize_render_model();
@@ -3305,15 +3164,9 @@ mod tests {
         assert!(schedules > 1_000, "{schedules} schedules");
     }
 
-    /// A RUN BROUGHT BACK TO ZERO KEEPS THE DRAW IT SAW (review of the
-    /// integration, 2026-09-29): past the exhaustive depth, a time-closed
-    /// run's rows still in the undo open a run the next grow hands them back
-    /// to (`rd = -1`), a draw lands inside the gap (`rw = 1`), and the shrink
-    /// that follows joins and brings `rd` back to 0 — no longer judged, so the
-    /// ledger's verdict is `None`, but its `drew` stands, as the model's `rw`
-    /// does. The projection read the draw only while `Silent` and answered
-    /// `rw = 0` (8 schedules of 673,093 at depth 9, all this class). No
-    /// verdict moved (`br` already forced `unverified`); the successor did.
+    /// When a run's net displacement returns to zero (`rd == 0`, `Verdict::None`)
+    /// after a draw inside the run gap, `rw` retains the draw (`rw == 1`) to match
+    /// the model.
     #[test]
     fn a_run_brought_back_to_zero_keeps_the_draw_it_saw() {
         let model = resize_render_model();
@@ -3347,21 +3200,12 @@ mod tests {
         true
     }
 
-    /// THE SPLIT FLAP, on the real engine (2026-09-28, live on main: an
-    /// attention set/unset 2-15 ms apart with the app ticking). A diff frame
-    /// between the halves drops the engine's undo, so the grow appends and the
-    /// top row is lost; the ledger keeps the frame inside the run and flags
-    /// the net-zero run it is. The negative control: the real journal shows
-    /// the frame between the halves (`adjoins` fails: a judge that closes a
-    /// run on any draw split the pair there into two net-changed runs), and
-    /// the model at `Buggy = 5` (that judge) answers `unverified` on the same
-    /// schedule, breaking `RiskIsFlagged`.
-    ///
-    /// And the flap the undo RESTORED with its halves further apart than the
-    /// run gap (the attention held, nothing drawn): one net-zero run that
-    /// moved nothing, `render=ok`, where a judge that closes a run on time
-    /// alone left two `silent` halves and `render=displaced` for good
-    /// (`Buggy = 3` breaks `NoFalseDisplaced`).
+    /// A flap split by a diff frame within [`RUN_GAP_MS`] stays one net-zero run
+    /// and is flagged as `desync-risk` (negative control: `Buggy = 5` splits on
+    /// any draw and breaks `RiskIsFlagged`); a quiet flap restored by the resize
+    /// undo after [`RUN_GAP_MS`] joins as one net-zero run with `render=ok`
+    /// (negative control: `Buggy = 3` closes on time alone and breaks
+    /// `NoFalseDisplaced`).
     #[test]
     fn a_flap_split_by_a_frame_or_by_time_is_judged_on_the_real_engine() {
         let model = resize_render_model();
@@ -3469,17 +3313,10 @@ mod tests {
         assert!(!old.check_invariant("RiskIsFlagged", &missed), "{missed:?}");
     }
 
-    /// THE INCIDENT'S SCHEDULE, on the fixed engine and on the historical one.
-    ///
-    /// Fixed: the grow hands the demoted row back (the resize undo), the app's
-    /// diff frame lands on what it painted, and the ledger reads `none`.
-    ///
-    /// THE NEGATIVE CONTROL: the same schedule on the historical engine (the
-    /// undo dropped before the grow, so it can only append). The real ledger
-    /// calls it a desync risk; the size-difference judge (the historical bug:
-    /// flag a render only while the grid's size differs from the app's) answers
-    /// ok; and the model at `Buggy = 1` on the same schedule breaks
-    /// `QuietFlapIsIdentity` and `RiskIsFlagged`.
+    /// Quiet net-zero flap on the current engine (restored by the resize undo,
+    /// `verdict=none`) versus the negative control without resize undo
+    /// (`historical = true` / `Buggy = 1`, breaking `QuietFlapIsIdentity` and
+    /// `RiskIsFlagged`).
     #[test]
     fn the_t2649_flap_is_undone_and_the_historical_engine_is_caught() {
         let model = resize_render_model();
@@ -3553,16 +3390,9 @@ mod tests {
         );
     }
 
-    /// THE SECOND NEGATIVE CONTROL: a spinner tick on the moved rows of a
-    /// shrink whose size has not come back, on the real engine and ledger.
-    /// The screen is one row up and the app drew on it; the real ledger says
-    /// `unverified`. The assumed-repaint judge the ledger first landed with
-    /// (`repainted`, never in a release; the model's `Buggy = 2`) answers ok
-    /// on the same schedule and breaks `NoSilentPass`. (Before the
-    /// integration with the split-flap grouping this control was the flap a
-    /// tick splits; that one is now a single net-zero run and a RISK, which
-    /// `a_flap_split_by_a_frame_or_by_time_is_judged_on_the_real_engine`
-    /// pins.)
+    /// Negative control for `Buggy = 2`: a diff tick on moved rows after a
+    /// net-changed shrink reads `unverified` on the real ledger, whereas an
+    /// assumed-repaint judge answers `ok` and breaks `NoSilentPass`.
     #[test]
     fn the_assumed_repaint_answers_ok_on_a_tick_at_a_changed_size() {
         let model = resize_render_model();
@@ -3597,17 +3427,9 @@ mod tests {
         );
     }
 
-    /// THE LATE RUN AND THE CREDIT, on the real engine and ledger: a quiet
-    /// flap whose halves only TIME split (nothing was drawn) is still an
-    /// identity on the screen, since the undo kept the demoted row. The
-    /// shrink's run, `silent` and undrawn, waits for the grow however late,
-    /// and the grow that hands the row back credits it there: one run that
-    /// moved nothing, and a spinner tick after it reads ok. Once a mode set
-    /// drops the undo the grow can only append, and the same run is a
-    /// net-zero one that lost a row: the tick on it is a RISK. The model that
-    /// closes a run on time alone (`Buggy = 3`, neither the late run nor the
-    /// credit) reads the first schedule `unverified` over a screen that is
-    /// exactly the app's and breaks `NoFalseVerdict`.
+    /// A quiet flap separated only by time (`> RUN_GAP_MS`) joins into one run
+    /// credited back by the resize undo (`render=ok`), whereas `Buggy = 3` closes
+    /// on time alone and breaks `NoFalseVerdict`.
     #[test]
     fn a_quiet_flap_only_time_split_is_one_run_credited_back() {
         let model = resize_render_model();
@@ -3697,11 +3519,8 @@ mod tests {
     /// on the moved rows between them) and only the engine's debt sees the flap.
     const LATE_GROW: u64 = RUN_GAP_MS + 50;
 
-    /// The flap with an app frame BETWEEN its halves, more than a run gap apart:
-    /// the shrink demotes, the program draws a diff onto the moved rows (the
-    /// content sequence jumps), the grow can only append. Two net-changed runs
-    /// (the run judge joins a draw inside the gap, since 3b207a6db, so the halves
-    /// are put past it here); the engine owes one row.
+    /// Flap with an app frame between its halves and separated by more than
+    /// [`RUN_GAP_MS`]: forms two net-changed runs while the engine owes one row.
     fn split_flap(ledger: &mut ResizeLedger, at: u64) {
         let mut shrink = report(1, 24, 23, true, (10, 11));
         (shrink.demoted, shrink.stashed) = (1, 1);
@@ -4106,14 +3925,9 @@ mod tests {
         assert_eq!(ledger.render(), Render::DesyncRisk);
     }
 
-    /// S2R-F3 (ATERM-KI-1015-1, the sweep of 2026-10-15 against Claude Code):
-    /// a held net-zero COLUMN flap on the alternate screen, on the real engine.
-    /// The shrink cuts the last cell of every full-width rule the program drew,
-    /// a frame lands in the narrower grid, and the grow back appends blank
-    /// cells; a program whose handler read only the final width never repaints,
-    /// so the rules stay one cell short. No row moved, and a judge that counted
-    /// rows only read `render=ok` with no epoch and no nudge: only `cast drift`
-    /// saw it. Cut cells are debt as moved rows are.
+    /// A net-zero column flap on the alternate screen that cuts drawn cells and
+    /// draws before growing back accrues column debt (`cut=1`) and is judged as
+    /// `desync-risk` until repainted.
     #[test]
     fn a_column_flap_that_cut_cells_is_judged_until_a_repaint() {
         let mut term = Terminal::new(ROWS, COLS);

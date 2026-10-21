@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE WALK CENSUS HOST** (2026-09-27) — shared by
-//! `tests/walk_continuity_census.rs` (the sweep) and the reproductions it
-//! turned up (each declares `mod walk_census;`). The frame seam is
-//! `tests/claude_wrap_band.rs`'s LOCK A; [`Shell`] is a readline-shaped line
-//! editor on the primary screen, folding its line at the margin as the
-//! program behind it does ([`Fold`]); [`Snap::judge`] reads one frame's text
-//! cells in walk order and flags every discontinuity the walk's law
-//! forbids; [`recolours`] reads the same cells across frames.
+//! The walk census host (`crate::walk_census`), shared by `walk_continuity_census.rs` and other
+//! suite tests. [`Shell`] is a readline-shaped line editor on the primary screen that folds at
+//! the margin as the program behind it does ([`Fold`]); [`Snap::judge`] flags every
+//! discontinuity in one frame's text cells read in walk order; [`recolours`] reads them across
+//! frames.
 #![allow(dead_code)]
 
 use aterm_core::render::GlowQuad;
@@ -24,7 +21,7 @@ use std::time::{Duration, Instant};
 pub const CW: usize = 8;
 pub const CH: usize = 16;
 pub const ROWS: usize = 24;
-/// A column is LIT at this planned coverage (the glass census's 20/255).
+/// A column is lit at this planned coverage (the glass census's 20/255).
 pub const LIT_COV: u8 = 20;
 /// `app_render.rs`'s `BLINK_RECENT_MAX`.
 pub const BLINK_RECENT: Duration = Duration::from_secs(1);
@@ -107,7 +104,7 @@ pub struct Snap {
     /// Text index the line's walk started at (a line kill restarts it).
     pub start: usize,
     pub pos: Vec<Pos>,
-    /// Indices `i` after which `pos[i + 1]` is NOT the walk's next cell (a
+    /// Indices `i` after which `pos[i + 1]` is not the walk's next cell (a
     /// composer's row end: its rows are judged apart).
     pub breaks: Vec<usize>,
     /// `(flag, text index)`: for a step flag, the index of the pair's left
@@ -270,7 +267,9 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// `tests/claude_wrap_band.rs`'s LOCK A, verbatim in order.
+    /// `tests/claude_wrap_band.rs`'s frame order: content-scroll sync, the blink edge, the
+    /// context, the caret row probe (trust and neighbours), the print anchor, every ribbon row,
+    /// then the tick.
     pub fn frame(&mut self) {
         let scroll = self.term.content_scroll_state();
         match ContentScrollState::delta_since(self.scroll, scroll) {
@@ -338,9 +337,8 @@ impl Host {
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
     }
 
-    /// Run the frame train through every frame due at or before `t`;
-    /// returns how many ran. SYNC-1: no present while a `?2026` bracket is
-    /// open and dirty.
+    /// Runs every frame due at or before `t`, calling `each` after each one presented.
+    /// SYNC-1: no present while a `?2026` bracket is open and dirty.
     pub fn frames_to(&mut self, t: Instant, mut each: impl FnMut(&mut Self)) {
         if self.paced {
             let fd = Duration::from_millis(16);
@@ -430,22 +428,19 @@ pub enum Echo {
 ///   column 0 on that key and the fold glyph is an ordinary same-row key;
 /// * zsh 5.9 zle: `<glyph> \r\x1b[K`, then the next glyph bare, then
 ///   `\r<glyph><glyph>` for the one after (the row reprinted from column 0);
+/// * the kernel's cooked-mode echo (`cat`, `read` without `-e`): every glyph
+///   as typed, folded by the terminal's deferred autowrap.
 ///
-/// while the bare shape is the kernel's cooked-mode echo (`cat`, `read`
-/// without `-e`): every glyph as typed, folded by the terminal's deferred
-/// autowrap. Only the key ending exactly at the margin differs; a reprint
+/// Only the key ending exactly at the margin differs; a reprint
 /// ([`Shell::reprint`]) or a paste crossing the margin folds by autowrap in
 /// every shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fold {
-    /// bash readline: `<glyph> \r` on the key that fills the margin. The
-    /// default ([`Shell::new`]): the census's shell is readline-shaped.
+    /// bash readline, the default ([`Shell::new`]).
     Readline,
-    /// zsh 5.9 zle: `<glyph> \r\x1b[K`, the next glyph bare, then
-    /// `\r<glyph><glyph>`.
+    /// zsh 5.9 zle.
     Zle,
-    /// The kernel's cooked-mode echo: every glyph bare, the terminal's
-    /// deferred autowrap folds the line on the glyph AFTER the margin's.
+    /// The kernel's cooked-mode echo.
     Kernel,
 }
 
@@ -469,10 +464,8 @@ thread_local! {
     static DEFAULT_FOLD: std::cell::Cell<Fold> = const { std::cell::Cell::new(Fold::Readline) };
 }
 
-/// Every shape of the fold: `f` runs with every [`Shell`] that names no fold
-/// ([`Shell::folding`]) folding as `fold` does, so the census reads each
-/// scenario behind bash readline, zsh's zle and the kernel's echo. A shell
-/// that names its fold keeps it.
+/// Runs `f` with every [`Shell`] that names no fold ([`Shell::folding`]) folding as `fold` does,
+/// so the census reads each scenario behind bash readline, zsh's zle and the kernel's echo.
 pub fn with_default_fold<T>(fold: Fold, f: impl FnOnce() -> T) -> T {
     let old = DEFAULT_FOLD.with(|d| d.replace(fold));
     let out = f();
@@ -480,10 +473,8 @@ pub fn with_default_fold<T>(fold: Fold, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// A readline-shaped line editor at a `$ ` prompt on the primary screen,
-/// folding its line at the margin as bash readline does unless
-/// [`Shell::folding`] names another program's fold ([`Fold`]) or the shell
-/// is built under [`with_default_fold`].
+/// A readline-shaped line editor at a `$ ` prompt on the primary screen. It folds as
+/// [`Fold::Readline`] unless [`Shell::folding`] or [`with_default_fold`] names another fold.
 pub struct Shell {
     pub h: Host,
     cols: usize,
@@ -537,8 +528,7 @@ impl Shell {
         s
     }
 
-    /// The same shell folding its line as `fold` does ([`Fold`]; a new
-    /// shell folds as readline, or as [`with_default_fold`] names).
+    /// The same shell folding its line as `fold` does.
     pub fn folding(mut self, fold: Fold) -> Self {
         self.fold = fold;
         self
@@ -953,12 +943,10 @@ pub fn dump(snaps: &[Snap], from: usize, to: usize) -> String {
 /// colours moving under unchanged text): `(text index, snap, t before, t after)`.
 pub fn recolours(snaps: &[Snap]) -> Vec<(usize, usize, f32, f32)> {
     let n = snaps.iter().map(|s| s.pos.len()).max().unwrap_or(0);
-    // Text index `i` stays "under unchanged text" only while EVERY snap's
-    // first `i + 1` chars equal the one before's (any change resets `prev`),
-    // so comparing a snap with its predecessor alone is comparing it with the
-    // snap `prev` came from: each snap needs only the chars it shares with the
-    // one before, not a prefix String per (index, snap): quadratic in the
-    // line, and a tenth of `walk_continuity_census`'s CPU (2026-10-05).
+    // Text index `i` stays under unchanged text only while every snap's first `i + 1` chars
+    // equal the one before's (any change resets `prev`), so each snap needs only the length of
+    // the prefix it shares with the one before; a prefix String per (index, snap) is quadratic
+    // in the line.
     let texts: Vec<Vec<char>> = snaps.iter().map(|s| s.text.chars().collect()).collect();
     let shared: Vec<usize> = (0..texts.len())
         .map(|k| match k.checked_sub(1) {
@@ -1029,9 +1017,7 @@ pub fn prose(n: usize) -> String {
     s
 }
 
-// ---------------------------------------------------------------------------
 // Real bytes: the captured Claude Code composer takes
-// ---------------------------------------------------------------------------
 
 pub enum Rec {
     Out(Vec<u8>),

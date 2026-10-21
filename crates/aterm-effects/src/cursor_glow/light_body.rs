@@ -72,10 +72,16 @@ fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
 /// answers 255.
 #[must_use]
 pub(crate) fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: f32) -> f32 {
-    use crate::color_math::contrast_ratio;
+    use crate::color_math::{relative_luminance_table, relative_luminance_with};
+    let table = relative_luminance_table();
     let (fg, bg) = (theme_fg & 0x00FF_FFFF, theme_bg & 0x00FF_FFFF);
-    let want = contrast_ratio(fg, bg) * keep;
-    let holds = |a: u8| contrast_ratio(fg, over_at(bg, ink, a)) >= want;
+    let lum_fg = relative_luminance_with(table, fg);
+    let ratio = |c: u32| {
+        let l = relative_luminance_with(table, c);
+        (lum_fg.max(l) + 0.05) / (lum_fg.min(l) + 0.05)
+    };
+    let want = ratio(bg) * keep;
+    let holds = |a: u8| ratio(over_at(bg, ink, a)) >= want;
     if holds(u8::MAX) {
         return f32::from(u8::MAX);
     }
@@ -119,7 +125,13 @@ pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f3
     if a_max == 0 {
         return ink;
     }
-    let lum_at = |w: f32| relative_luminance(over_at(theme_bg, toward_white(ink, w), a_max));
+    let table = crate::color_math::relative_luminance_table();
+    let lum_at = |w: f32| {
+        crate::color_math::relative_luminance_with(
+            table,
+            over_at(theme_bg, toward_white(ink, w), a_max),
+        )
+    };
     if lum_at(0.0) >= floor {
         return ink;
     }
@@ -252,17 +264,15 @@ pub(crate) fn push_ink_ring(
         }
     };
     let ri = (r - rim_w).max(0.0);
+    let (r2, ri2) = (r * r, ri * ri);
     for y in y0..y1 {
         let dy = (y as f32 + 0.5 - cy).abs();
         if dy >= r {
             continue;
         }
-        let outer = (r * r - dy * dy).sqrt();
-        let inner = if dy < ri {
-            (ri * ri - dy * dy).sqrt()
-        } else {
-            0.0
-        };
+        let dy2 = dy * dy;
+        let outer = (r2 - dy2).sqrt();
+        let inner = if dy < ri { (ri2 - dy2).sqrt() } else { 0.0 };
         span(under, y, cx - outer, cx - inner, rim);
         span(under, y, cx - inner, cx + inner, fill);
         span(under, y, cx + inner, cx + outer, rim);
@@ -345,21 +355,21 @@ fn soft_ellipse(
         lift: 0.0,
         lift_span: 0.0,
     }; STEPS + 1];
-    let x_at = |i: usize| {
+    let us_xs: [(f32, f32); STEPS + 1] = std::array::from_fn(|i| {
         let u = i as f32 / STEPS as f32 * 2.0 - 1.0;
-        cx + u * if u < 0.0 { left } else { right }
-    };
+        (u, cx + u * if u < 0.0 { left } else { right })
+    });
     for (i, v) in verts.iter_mut().enumerate() {
-        let u = i as f32 / STEPS as f32 * 2.0 - 1.0;
+        let (u, x) = us_xs[i];
         // The ellipse's height at this x, and a falloff toward its rim.
         let round = (1.0 - u * u).max(0.0).sqrt();
         let r = (reach * round).max(0.5);
-        v.x = x_at(i);
+        v.x = x;
         v.up = r;
         v.dn = r;
         v.core_up = r * 0.3;
         v.core_dn = r * 0.3;
-        let kept = share(x_at(i.saturating_sub(1)), x_at((i + 1).min(STEPS))).clamp(0.0, 1.0);
+        let kept = share(us_xs[i.saturating_sub(1)].1, us_xs[(i + 1).min(STEPS)].1).clamp(0.0, 1.0);
         v.cov = peak * round * round * kept;
     }
     let stride = (geom.cw / 8).max(1);
@@ -372,17 +382,21 @@ fn soft_ellipse(
 /// each quad's ink (a run's colour along its path, or one ink for all).
 pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&GlowQuad) -> u32) {
     for q in quads {
-        let ink = ink_at(q);
         let a = ((q.color & 0xff) as u8).min(cap);
         let a2 = ((q.color2 & 0xff) as u8).min(cap);
+        if a == 0 && a2 == 0 {
+            q.color = 0;
+            q.color2 = 0;
+            q.alpha = 0;
+            q.alpha2 = 0;
+            continue;
+        }
+        let ink = ink_at(q);
         // A quad is additive at both ends or source-over at both ends.
-        let (a, a2) = if a == 0 && a2 == 0 {
-            (0, 0)
-        } else {
-            (a.max(1), a2.max(1))
-        };
-        q.color = premul_rgb(ink, a);
-        q.color2 = premul_rgb(ink, a2);
+        let (a, a2) = (a.max(1), a2.max(1));
+        let c1 = premul_rgb(ink, a);
+        q.color = c1;
+        q.color2 = if a == a2 { c1 } else { premul_rgb(ink, a2) };
         q.alpha = a;
         q.alpha2 = a2;
     }

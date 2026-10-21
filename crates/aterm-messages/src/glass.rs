@@ -33,12 +33,23 @@
 //!    column 0 for the painter to clip. Rows are always exactly `cols` cells, never a
 //!    panic, and authored capsules are never dropped.
 //!
+//!    A TITLE IS CUT ONLY AFTER A WHOLE WORD ([`title_in`]): its words that fit, then
+//!    `…`, never a word cut mid-way (`Keybinding…`, never `Keybindin…`); the row body
+//!    opens Details, where it reads whole, and the row is spoken whole. Its floor is
+//!    the words that fit [`TITLE_MIN`] cells (its first word where none does), so the
+//!    cells a cut word took are the step's or the extras'. In the degenerate step,
+//!    where not even its first word fits beside the capsules, the second clear cell
+//!    before them goes to it (one stays), and where it still does not, the title goes.
+//!
 //!    An action excerpt (a painted `detail[0]` on a moving row, which the host paints
 //!    only when it changes what the person does) is the one thing on such a row the
 //!    person must read. Its joint and first [`DETAIL_FLOOR`] cells join `fixed`
 //!    (`3 + min(width, DETAIL_FLOOR)`), so the short capsules and the title's elision
 //!    pay for it; it goes only when the title at [`TITLE_MIN`] still cannot, before the
-//!    degenerate step. Its row's load slot is then an extra after the excerpt.
+//!    degenerate step, and the head is then fitted again around the title alone from the
+//!    top (the short title where the row has one) — `Details ›`, the long capsules, the
+//!    title's words — so the cells the excerpt took are not left blank. Its row's load
+//!    slot is then an extra after the excerpt.
 //!
 //!    An ask's one step (a now ask whose `detail[0]` is its step, [`RowSpec::step`]) is
 //!    an action excerpt reserved WHOLE (`3 + width`): the implicit `Details ›`, the short
@@ -78,8 +89,11 @@
 //! form cut: never as a cut of the whole title where the row has a short one. What is
 //! gone at one width is gone at every narrower one — save at the widths where a title
 //! or an ask's step gives way to its short form, whose head is fitted anew around the
-//! shorter words (the capsules' long words and `Details ›` come back there; the title's
-//! whole words and the whole step never do); the meter is never on the list.
+//! shorter words, and at the width where an action excerpt goes, whose head is fitted
+//! anew around the title alone (the capsules' long words and `Details ›` come back
+//! there, and at the excerpt's going the title's cut words; the whole title's words
+//! where the row has a short one, and the whole step, never do); the meter is never on
+//! the list.
 //!
 //! Cells on a row: `glyph title · excerpt ␠␠pct|␠elapsed ␠eta ␠␠stats … load ␠␠capsules`,
 //! all over the meter. The percent is right-aligned in its four cells and the time words
@@ -91,7 +105,7 @@ use std::cmp::Reverse;
 
 use crate::center::Live;
 use crate::model::{ActionIndex, Hold, Intent, Load, Loads, MessageId, Severity};
-use crate::text::{lead_clause, shape_detail, truncate};
+use crate::text::{lead_clause, shape_detail};
 use crate::{
     BEFORE_CAPSULES, CAPSULE_GAP, DETAIL_FLOOR, ELAPSED_SHORT_W, ELAPSED_W, ETA_SHORT_W, ETA_W,
     GLYPH_COL, Instant, MARGIN, PCT_W, TITLE_COL, TITLE_MIN,
@@ -788,14 +802,59 @@ fn overflow_spoken(words: &str) -> String {
     }
 }
 
-/// `s` fitted into `max` cells under `width`, ending in `…` when cut.
-fn fit_width(s: &str, max: usize, width: &dyn Fn(&str) -> usize) -> String {
-    let mut t = truncate(s, max);
-    while width(&t) > max && !t.is_empty() {
-        let n = t.chars().count();
-        t = truncate(&t, n - 1);
+/// What a cut title may leave trailing before its `…`: the space, and a
+/// joint or stop that ended the last word it keeps (a CJK title's too:
+/// `、` `。` `，` `：` `；` `・`).
+const TITLE_CUT_TRAIL: [char; 14] = [
+    ' ', ',', ';', ':', '.', '\u{b7}', '\u{2014}', '\u{2013}', '\u{3001}', '\u{3002}', '\u{ff0c}',
+    '\u{ff1a}', '\u{ff1b}', '\u{30fb}',
+];
+
+/// `title` in at most `max` cells under `width`, CUT ONLY AFTER A WHOLE
+/// WORD: whole where it fits, else as many of its words as fit with `…`
+/// after them (a joint or stop left trailing goes with the cut), else
+/// `None`, not even its first word fitting so. A cut word reads as another
+/// word or none (`Keybindin…`, `Couldn't u…` at 22 columns, the review of
+/// the band over Settings), while the words a cut keeps read as what they
+/// are and the `…` says more follow: the row body opens Details, where the
+/// title reads whole, and the row is spoken whole. A word ends at a space,
+/// and in a script written without spaces at each of its characters, kinsoku
+/// kept ([`aterm_grapheme::word_breaks`], the rule every wrap of the chrome
+/// reads): cut only at spaces, an all-CJK title had no word to keep and was
+/// left out at a narrow width.
+fn title_in(title: &str, max: usize, width: &dyn Fn(&str) -> usize) -> Option<String> {
+    if width(title) <= max {
+        return Some(title.to_string());
     }
-    t
+    let mut kept = None;
+    for brk in aterm_grapheme::word_breaks(title) {
+        let head = title[..brk.at].trim_end_matches(TITLE_CUT_TRAIL);
+        if head.is_empty() {
+            continue;
+        }
+        let cut = format!("{head}\u{2026}");
+        // Each later cut holds this one's words and more: none fits after
+        // the first that does not.
+        if width(&cut) > max {
+            break;
+        }
+        kept = Some(cut);
+    }
+    kept
+}
+
+/// The first word of `title` ([`title_in`]'s words), `…` after it where
+/// more follow: what the title keeps at its floor where not even that word
+/// fits [`TITLE_MIN`] cells. The head then runs over the budget, and the
+/// degenerate step settles the row.
+fn first_word(title: &str) -> String {
+    match aterm_grapheme::word_breaks(title).first() {
+        Some(brk) => format!(
+            "{}\u{2026}",
+            title[..brk.at].trim_end_matches(TITLE_CUT_TRAIL)
+        ),
+        None => title.to_string(),
+    }
 }
 
 /// The first cell right of the title that another piece of `row` paints —
@@ -841,11 +900,8 @@ pub(crate) fn finish_title(
     let room = next_piece(row, cols)
         .saturating_sub(row.title.0 + 1)
         .max(laid);
-    let mut title = if width(words) > room {
-        fit_width(words, room, width)
-    } else {
-        words.to_string()
-    };
+    // In whole words, as the live title was cut ([`title_in`]).
+    let mut title = title_in(words, room, width).unwrap_or_default();
     let short = laid.saturating_sub(width(&title));
     title.extend(std::iter::repeat_n(' ', short));
     row.title.1 = title;
@@ -980,6 +1036,9 @@ fn excerpt_floor(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) ->
 /// ([`fit_head`]), else its elision down to [`TITLE_MIN`].
 struct Head {
     title: String,
+    /// The words `title` stands for: the whole title, or its short form
+    /// where the head was fitted around that. A cut is always of these.
+    words: String,
     /// The capsules' cells, and the clearance before them.
     caps: usize,
     before: usize,
@@ -1058,6 +1117,7 @@ fn head_around(
     ex: usize,
     width: &dyn Fn(&str) -> usize,
 ) -> Head {
+    let words = title.to_string();
     let title = title.to_string();
     let mut short = false;
     let mut caps = capsules_width(&spec.capsules, false, width);
@@ -1093,6 +1153,7 @@ fn head_around(
     }
     Head {
         title,
+        words,
         caps,
         before,
         short,
@@ -1101,14 +1162,10 @@ fn head_around(
     }
 }
 
-/// `title` elided to the `allowed` cells, never below [`TITLE_MIN`].
+/// `title` elided to the `allowed` cells in whole words ([`title_in`]),
+/// never below [`TITLE_MIN`] cells, nor below its first word.
 fn elide(title: &str, allowed: usize, width: &dyn Fn(&str) -> usize) -> String {
-    let allowed = allowed.max(TITLE_MIN);
-    if allowed < width(title) {
-        fit_width(title, allowed, width)
-    } else {
-        title.to_string()
-    }
+    title_in(title, allowed.max(TITLE_MIN), width).unwrap_or_else(|| first_word(title))
 }
 
 /// Step 1: capsules long → short, then the title, then the degenerate step.
@@ -1170,27 +1227,33 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         ex = left.max(3 + DETAIL_FLOOR).min(ex);
         head.fixed = 2 + width(&head.title) + a + ex + head.before + head.caps;
     }
+    if head.fixed > budget && ex > 0 {
+        // Even the elided title cannot pay for the action excerpt: it goes
+        // (for good: every narrower row is shorter still), and the head is
+        // fitted anew around the title alone, from the top — the short
+        // title, where the row has one: the whole title went at a wider
+        // width — so the cells the excerpt took are the row's again:
+        // `Details ›` where it fits (the way to the step the row no longer
+        // shows), the capsules' long words, the title's. (A re-elision of
+        // the title alone into those cells left them blank beside the short
+        // capsules: `Login expired`, 16 blank cells and `Tab 1` at 47
+        // columns, no step and no `Details ›`.)
+        ex = 0;
+        let alone = Titles {
+            full: titles.short.unwrap_or(full_title),
+            short: None,
+        };
+        head = fit_head(spec, alone, budget, a, ex, width);
+    }
     let Head {
         mut title,
+        words: title_words,
         mut caps,
         before,
         short,
         mut details_dropped,
-        mut fixed,
+        fixed,
     } = head;
-    if fixed > budget && ex > 0 {
-        // Even the elided title cannot pay for the action excerpt: it goes
-        // (for good: every narrower row is shorter still), and the title
-        // takes back what it can of the cells — the short title's, where the
-        // row has one: the whole title went at a wider width.
-        ex = 0;
-        title = elide(
-            titles.short.unwrap_or(full_title),
-            budget.saturating_sub(2 + a + before + caps),
-            width,
-        );
-        fixed = 2 + width(&title) + a + before + caps;
-    }
     if fixed > budget {
         // Degenerate: the activity's words go whole (pct or elapsed, and the
         // load slot, together; the meter and the track stay, they cost
@@ -1198,14 +1261,31 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         // capsule goes before any authored one is touched.
         activity = Activity::None;
         a = 0;
-        let mut others = 2 + a + before + caps;
-        if others > budget && spec.capsules.last().is_some_and(|c| c.action.is_details()) {
+        let mut clear = before;
+        if 2 + a + clear + caps > budget
+            && spec.capsules.last().is_some_and(|c| c.action.is_details())
+        {
             details_dropped = true;
             let kept = &spec.capsules[..spec.capsules.len() - 1];
             caps = capsules_width(kept, true, width);
-            others = 2 + clearance(kept, true) + caps;
+            clear = clearance(kept, true);
         }
-        title = fit_width(&title, budget.saturating_sub(others), width);
+        // The title takes what is left in whole words ([`title_in`]): where
+        // not even its first word fits, the second clear cell before the
+        // capsules goes to it (`Keybinding…` and `Edit` at 22 columns, never
+        // `Keybindin…`), and where it still does not, the title goes whole —
+        // the row body opens Details, where it reads whole.
+        let left = budget.saturating_sub(2 + clear + caps);
+        let spare = clear.saturating_sub(1);
+        title = title_in(&title_words, left, width)
+            .or_else(|| {
+                if spare > 0 {
+                    title_in(&title_words, left + spare, width)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
     }
     Fit {
         short,
@@ -1766,6 +1846,43 @@ pub(crate) mod tests {
         s.chars().count()
     }
 
+    /// Whether `shown` is `words` whole, or cut only after a whole word of
+    /// them: its words, then `…` ([`title_in`]'s rule, read off the shown
+    /// title alone).
+    pub(crate) fn whole_words_of(shown: &str, words: &str) -> bool {
+        if shown == words {
+            return true;
+        }
+        let Some(stem) = shown.strip_suffix('\u{2026}') else {
+            return false;
+        };
+        !stem.is_empty()
+            && aterm_grapheme::word_breaks(words)
+                .iter()
+                .any(|brk| words[..brk.at].trim_end_matches(TITLE_CUT_TRAIL) == stem)
+    }
+
+    /// Whether `row`'s title took the second clear cell before its capsules
+    /// because a whole word needed it: one cell narrower, none of the
+    /// spec's title words would have stood (the degenerate step,
+    /// [`fit_fixed`]).
+    pub(crate) fn spent_clear_cell(
+        spec: &RowSpec<'_>,
+        row: &RowLayout,
+        width: &dyn Fn(&str) -> usize,
+    ) -> bool {
+        let shown = &row.title.1;
+        let cells = width(shown);
+        cells > 0
+            && [Some(spec.title), spec.title_short]
+                .into_iter()
+                .flatten()
+                .any(|words| {
+                    title_in(words, cells, width).as_deref() == Some(shown.as_str())
+                        && title_in(words, cells - 1, width).is_none()
+                })
+    }
+
     fn id(n: u64) -> MessageId {
         MessageId::from_raw(n).unwrap()
     }
@@ -2222,8 +2339,11 @@ pub(crate) mod tests {
                     && !row.title.1.is_empty()
                 {
                     assert!(first.col >= left_end, "{name}@{cols}: overlap: {painted:?}");
+                    // Both clear cells, save the second where the degenerate
+                    // step spent it on a whole word of the title.
                     assert!(
-                        first.col >= left_end + BEFORE_CAPSULES,
+                        first.col >= left_end + BEFORE_CAPSULES
+                            || first.col == left_end + 1 && spent_clear_cell(&spec, &row, &chars),
                         "{name}@{cols}: {painted:?}"
                     );
                     let last = row.capsules.last().unwrap();
@@ -3093,5 +3213,120 @@ pub(crate) mod tests {
         );
         assert_eq!(install(80).stats.map(|s| s.1).as_deref(), Some("~3 GB"));
         assert!(install(80).load.is_some(), "80: the load words too");
+    }
+
+    /// The cuts of a Latin title, detail and sentence, every width from
+    /// none to whole, as `tests/fixtures/latin-cuts.txt` records them: what
+    /// [`title_in`], [`first_word`], `trim_words` and `split_sentence` gave
+    /// when they cut only at spaces (taken from that code, 2026-10-21).
+    fn latin_cuts() -> String {
+        let corpus = [
+            "Couldn't use your keybindings file",
+            "Keybinding conflict: \u{2318}K",
+            "Claude usage limit reached, resets at 4pm",
+            "3 keybindings ignored",
+            "aterm closed unexpectedly \u{b7} last session restored",
+            "Update ready \u{2014} restart to finish",
+            "A-very-long-hyphenated-title here",
+            "word",
+            "",
+            "two  spaces, here.",
+        ];
+        let mut out = String::new();
+        for text in corpus {
+            let n = text.chars().count();
+            for max in 0..=n + 1 {
+                out.push_str(&format!(
+                    "T {text:?} {max} => {:?}\n",
+                    title_in(text, max, &crate::text::char_width)
+                ));
+                out.push_str(&format!(
+                    "M {text:?} {max} => {:?}\n",
+                    crate::text::trim_words(text, max)
+                ));
+                out.push_str(&format!(
+                    "S {text:?} {max} => {:?}\n",
+                    crate::text::split_sentence(text, max)
+                ));
+            }
+            out.push_str(&format!("F {text:?} => {:?}\n", first_word(text)));
+        }
+        out
+    }
+
+    /// LATIN TEXT IS CUT WHERE IT ALWAYS WAS: breaking between CJK
+    /// characters (the shared line breaks) moved no cut of a Latin title,
+    /// detail or sentence at any width (the golden record, taken from the
+    /// code that cut only at spaces).
+    #[test]
+    fn latin_text_is_cut_where_it_always_was() {
+        let golden = include_str!("../tests/fixtures/latin-cuts.txt");
+        let now = latin_cuts();
+        let moved: Vec<(&str, &str)> = golden
+            .lines()
+            .zip(now.lines())
+            .filter(|(was, is)| was != is)
+            .take(8)
+            .collect();
+        assert!(moved.is_empty(), "moved cuts (was, is): {moved:#?}");
+        assert_eq!(golden.lines().count(), now.lines().count());
+    }
+
+    /// AN ALL-CJK TITLE IS CUT BETWEEN ITS CHARACTERS, never left out: with
+    /// no space to cut at, the cut keeps the characters that fit (kinsoku
+    /// kept: never before a closer like `。` or `」`), then `…`; its first
+    /// word is its first character. NEGATIVE CONTROL: cut only at spaces,
+    /// the same title had no word to keep (`None` at every width under it).
+    #[test]
+    fn an_all_cjk_title_is_cut_between_its_characters() {
+        let cells = |s: &str| aterm_grapheme::str_width(s);
+        let title = "設定ファイルを読み込めませんでした";
+        let whole = cells(title);
+        for max in 3..whole {
+            let cut = title_in(title, max, &cells).expect("some characters fit");
+            let stem = cut.strip_suffix('\u{2026}').expect("cut with an ellipsis");
+            assert!(title.starts_with(stem) && !stem.is_empty(), "{max}: {cut}");
+            assert!(cells(&cut) <= max, "{max}: {cut} is {} cells", cells(&cut));
+            assert!(whole_words_of(&cut, title), "{max}: {cut}");
+            // As many characters as fit: the cut at the next place it may
+            // break would not (`ファ` is one: a small kana starts no line).
+            let next = aterm_grapheme::word_breaks(title)
+                .into_iter()
+                .find(|brk| brk.at > stem.len())
+                .map_or(title.len(), |brk| brk.at);
+            if next < title.len() {
+                assert!(
+                    cells(&format!("{}\u{2026}", &title[..next])) > max,
+                    "{max}: {cut}"
+                );
+            }
+        }
+        assert_eq!(title_in(title, whole, &cells).as_deref(), Some(title));
+        assert_eq!(first_word(title), "設\u{2026}");
+        // A closer stays with the character before it.
+        let quoted = "「設定」を保存しました。";
+        for max in 3..cells(quoted) {
+            if let Some(cut) = title_in(quoted, max, &cells) {
+                let stem = cut.trim_end_matches('\u{2026}');
+                assert!(!stem.ends_with('「'), "{max}: {cut}");
+                let after = quoted[stem.len()..]
+                    .trim_start_matches(TITLE_CUT_TRAIL)
+                    .chars()
+                    .next();
+                assert!(
+                    !matches!(after, Some('」' | '。')),
+                    "{max}: {cut} leaves {after:?} to start the rest"
+                );
+            }
+        }
+        // The old cut, at spaces only, kept nothing of it.
+        let spaces_only = |title: &str, max: usize| {
+            title
+                .match_indices(' ')
+                .map(|(at, _)| format!("{}\u{2026}", &title[..at]))
+                .take_while(|cut| cells(cut) <= max)
+                .last()
+        };
+        assert_eq!(spaces_only(title, whole - 1), None, "negative control");
     }
 }

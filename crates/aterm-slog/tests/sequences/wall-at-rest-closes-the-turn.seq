@@ -9,13 +9,13 @@ wait 500
 expect turn=open
 wait 500
 expect close p1 wall out=gone
-expect close t1 turn out=wall:usage-session steps=1 walls=1 at=0
+expect close t1 turn out=wall:usage-session steps=1 walls=1 @0
 expect open p2 wall par=r1 wall=usage-session detail=3:15pm cont=p1 orphan=1
 expect need=wall:usage-session
 expect clause=limit · 3:15pm
 see busy
 expect close p2 wall out=passed dur_ms=1000
 expect open t1 turn
-expect open t2 turn at=1000
+expect open t2 turn @1000
 expect need=none
 wait 1000

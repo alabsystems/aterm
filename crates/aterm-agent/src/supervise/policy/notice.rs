@@ -126,6 +126,11 @@ pub struct NoticeText {
     /// build's `login-notice` verb fills it with — never a clause this
     /// notice is not raised for.
     pub whys: &'static [&'static str],
+    /// THE WORDS ITS RECORD CLOSES FIXED IN once the tab runs on a working
+    /// login again (the host's login-back note: the login back, or a move
+    /// onto another account landed): [`BACK`] for a lost or renewed login,
+    /// [`SWITCHED`] for a usage limit, where no login was lost.
+    pub back: &'static str,
 }
 
 /// A notice with its placeholders filled: what an exception carries to the
@@ -154,12 +159,23 @@ pub struct Notice {
     /// [`Filled::undo`]: how to end what the step starts, a line of Details
     /// after the expectation.
     pub undo: Option<String>,
+    /// [`NoticeText::back`].
+    pub back: &'static str,
 }
 
-/// What a tab's notice says once its login is back: the host closes the
-/// notice's one row in Settings ▸ Messages fixed in these words (the tab's
-/// place fitted on), so the record says how the loss ended.
+/// What a lost login's notice says once its login is back: the host closes
+/// the notice's one row in Settings ▸ Messages fixed in these words (the
+/// tab's place fitted on), so the record says how the loss ended
+/// ([`NoticeText::back`]).
 pub const BACK: &str = "Claude's login is back";
+
+/// What a usage limit's notice says once the tab runs on another account
+/// (the move onto it landed, or the owner signed another account in): no
+/// login was lost, so its record never reads [`BACK`] (the review of the
+/// login carry, r8c-7: every usage limit's record closed as `Claude's login
+/// is back`). No label: the account the tab landed on may be another than
+/// the one the notice named.
+pub const SWITCHED: &str = "Claude switched accounts";
 
 /// The placeholder a roster label fills.
 pub const LABEL: &str = "{label}";
@@ -256,12 +272,13 @@ pub const LOGIN_SIGN_IN: NoticeText = NoticeText {
     short_title: "Login expired",
     happened: EXPIRED,
     did: "aterm typed /login in the tab and opened the sign-in in your browser.",
-    todo: "Finish signing in in your browser.",
+    todo: "Finish the browser sign-in.",
     todo_as: None,
     expect: CONTINUES,
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// [`LOGIN_SIGN_IN`] for a session whose login is a roster row
@@ -281,6 +298,7 @@ pub const LOGIN_SIGN_IN_AS: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// The method picker of the `/login` aterm typed, which aterm does not
@@ -302,6 +320,7 @@ pub const LOGIN_CHOOSE: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// The `/login` aterm typed was left before it signed in (`Login
@@ -320,6 +339,7 @@ pub const LOGIN_CANCELLED: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// THE LOGIN CAME BACK IN ANOTHER TAB while the dialog of the `/login`
@@ -343,6 +363,7 @@ pub const LOGIN_BACK_DIALOG: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// A RENEWAL MADE WHILE THE `/login` aterm TYPED HERE STILL STANDS (its
@@ -367,6 +388,7 @@ pub const LOGIN_RENEWED_DIALOG: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// A person's own `/login` at a lost login, left before it signed in
@@ -385,6 +407,7 @@ pub const LOGIN_LEFT: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// The dialog stopped short of a login on a state of its own (an OAuth
@@ -403,6 +426,7 @@ pub const LOGIN_STOPPED: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// `/login` not typed at all, and not about to be (`{why}`: one of
@@ -420,6 +444,7 @@ pub const LOGIN_NOT_RUN: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: WHYS,
+    back: BACK,
 };
 
 /// `/login` not typed because a draft stands in the composer: the wall
@@ -439,10 +464,13 @@ pub const LOGIN_NOT_RUN_DRAFT: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// The login `{label}` was renewed, and only a draft in the composer holds
-/// the tab's move onto it.
+/// the tab's move onto it. The exception selects a safe step for the actual
+/// draft: send the person's text, close its completion menu first, or clear
+/// aterm's own text.
 pub const RENEWED_DRAFT: NoticeText = NoticeText {
     id: "renewed-draft",
     code: "rd",
@@ -456,6 +484,7 @@ pub const RENEWED_DRAFT: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// The login `{label}` was renewed, and nothing here can move the tab onto
@@ -478,6 +507,7 @@ pub const RENEWED_BY_HAND: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: BY_HAND_WHYS,
+    back: BACK,
 };
 
 /// A roster account is signed out: no session is moved onto it.
@@ -494,6 +524,7 @@ pub const ACCOUNT_SIGNED_OUT: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// A renewal signed in an account other than its row's: nothing live
@@ -511,6 +542,7 @@ pub const RENEWAL_WRONG_ACCOUNT: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: &[],
+    back: BACK,
 };
 
 /// Claude Code hit a multi-day usage limit and no other account in the
@@ -530,6 +562,7 @@ pub const LIMIT_SIGN_IN: NoticeText = NoticeText {
     expect_reset: Some("The tab continues once you sign in, else after the reset {reset}."),
     undo: None,
     whys: &[],
+    back: SWITCHED,
 };
 
 /// What a weekly limit on a roster row asks of nobody: a sign-in in the tab,
@@ -548,8 +581,9 @@ const LIMIT_MOVES: &str = "Once {label} is signed in, aterm switches this tab to
 const LIMIT_MOVES_RESET: &str =
     "The tab moves to it once signed in, else continues after the reset {reset}.";
 
-/// What follows a usage limit no listed account can take over, its reset
-/// known: aterm continues the tab past it (`resume_limits`).
+/// What follows a usage limit where aterm cannot tell which account is next
+/// ([`LIMIT_UNREAD`]), its reset known: aterm continues the tab past it
+/// (`resume_limits`).
 const LIMIT_RESUMES: &str = "aterm continues the tab by itself after the reset {reset}.";
 
 /// [`LIMIT_MOVES`] where the roster holds the tab at its limit even once
@@ -559,11 +593,26 @@ const LIMIT_RESUMES: &str = "aterm continues the tab by itself after the reset {
 const LIMIT_NEXT: &str = "Once {label} is signed in, aterm names the next step to move the tab.";
 
 /// What follows a step after which aterm names another, the limit's reset
-/// known: the tab continues past it if nobody takes them.
+/// known (`resume_limits` on): BOTH OUTCOMES, EACH WITH ITS CONDITION — the
+/// step taken, aterm names the next one; not taken, the tab resumes at the
+/// reset. A bare `else` left the owner unsure what it hung on (the review
+/// of the band, 2026-10-20: `aterm names the next step, else the tab
+/// continues after the reset`). True of each step it follows: a row's
+/// sign-in by name ([`LIMIT_RENEW_HELD`], [`LIMIT_LOGIN_HELD`]), the lines
+/// of aterm.toml ([`LIMIT_STAY_HELD`]), another account added
+/// ([`LIMIT_ROSTER`], whose `accounts add` prints the line that signs it
+/// in).
 const LIMIT_NEXT_RESET: &str =
-    "aterm names the next step, else the tab continues after the reset {reset}.";
+    "If you do, aterm names the next step, and if not, the tab resumes {reset}.";
 
-/// What follows a usage limit's roster report where aterm continues nothing
+/// What follows a step after which aterm names the one that moves the tab to
+/// another account, whichever that is: the account [`LIMIT_ROSTER`] asks to
+/// be added (`accounts add` prints the line that signs it in, and once it is
+/// ready the tab moves, or the notice that follows names what does), or the
+/// lines of aterm.toml [`LIMIT_STAY_HELD`] asks to be set.
+const LIMIT_NEXT_ANY: &str = "aterm then names the next step to move this tab to another account.";
+
+/// What follows a usage limit's notice where aterm continues nothing
 /// past the limit's reset: the owner's `resume_limits = false`.
 const LIMIT_NOT_RESUMED: &str =
     "aterm does not continue this tab after the limit resets, as resume_limits is off.";
@@ -588,6 +637,7 @@ pub const LIMIT_RENEW: NoticeText = NoticeText {
     expect_reset: Some(LIMIT_MOVES_RESET),
     undo: None,
     whys: &[],
+    back: SWITCHED,
 };
 
 /// [`LIMIT_RENEW`] for a row `{label}` with no email: it signs in through
@@ -605,6 +655,7 @@ pub const LIMIT_LOGIN: NoticeText = NoticeText {
     expect_reset: Some(LIMIT_MOVES_RESET),
     undo: None,
     whys: &[],
+    back: SWITCHED,
 };
 
 /// [`LIMIT_RENEW`] where the roster holds the tab at this limit even once
@@ -694,6 +745,121 @@ pub const LIMIT_USE: NoticeText = NoticeText {
         "aterm harness accounts use --auto ends the pin, and aterm then moves sessions between accounts by itself again.",
     ),
     whys: USE_WHYS,
+    back: SWITCHED,
+};
+
+/// A multi-day usage limit on a roster row's login, another row `{label}`
+/// ready that nothing of the roster's holds the tab off, and only a draft in
+/// the tab's prompt keeps aterm from asking the switch: the relaunch needs an
+/// empty prompt, and a draft is never typed over (the review of the login
+/// carry, r6h-1: told nothing, the tab waited for the reset, days away,
+/// beside a ready account). Raised for every draft the prompt holds — a
+/// person's, one over Claude Code's completion menu, aterm's own words left
+/// standing: sent, the limit answers it again and the switch is asked at
+/// once; cleared, the switch is asked at once too ([`DRAFT_HOLDS`]); left,
+/// the limit lifts at its reset. A draft that must not be sent as it stands
+/// has a step of its own ([`LIMIT_DRAFT_OWN`], [`LIMIT_DRAFT_MENU`]), as at a
+/// renewed login ([`RENEWED_DRAFT`]'s step chosen by the draft). Never while
+/// an upgrade holds the point (it asks nothing either), nor where the switch
+/// was refused ([`LIMIT_USE`], [`LIMIT_UNMADE`]).
+pub const LIMIT_DRAFT: NoticeText = NoticeText {
+    id: "limit-draft",
+    code: "ld",
+    title: "Claude usage limit reached",
+    short_title: "Usage limit",
+    happened: "Claude Code hit this account's usage limit, and the tab has a draft in its prompt.",
+    did: "aterm does not switch the tab to {label} while it has an unsent draft.",
+    todo: "Send the draft in the tab.",
+    todo_as: None,
+    expect: "aterm then switches the tab to {label} by itself.",
+    // The reset as a fact: left unsent, a person's draft is sent at the
+    // reset, while aterm's own words and a draft over the menu are told
+    // then — so the line says when the limit ends, not what aterm does.
+    expect_reset: Some("aterm then switches the tab, else its limit resets {reset}."),
+    undo: None,
+    whys: &[],
+    back: SWITCHED,
+};
+
+/// [`LIMIT_DRAFT`] where the words in the prompt are aterm's own
+/// (`super::turn_end::Composer::Own`: its upgrade's notice left part-typed),
+/// which aterm never sends and asks a person to clear
+/// (`super::turn_end::OWN_WORDS_STAND`): sent, they would be the owner's
+/// prompt to the model, carried into the conversation the switch resumes
+/// (the review of the login carry, r7h-4: told to send them). Cleared, the
+/// switch is asked at once.
+pub const LIMIT_DRAFT_OWN: NoticeText = NoticeText {
+    id: "limit-draft-own",
+    code: "lc",
+    happened: "Claude Code hit this account's usage limit, and its prompt holds aterm's own words.",
+    did: "aterm does not switch the tab to {label} while its prompt holds words.",
+    todo: "Clear aterm's words from the prompt in the tab.",
+    ..LIMIT_DRAFT
+};
+
+/// [`LIMIT_DRAFT`] where the draft stands under Claude Code's open
+/// completion menu (`super::turn_end::Composer::Diverted`): Enter there runs
+/// or completes the menu's highlighted entry (`/clear` for a `/cl` left
+/// standing), not the draft (`super::turn_end::MENU_DIVERTS`; r7h-4: told to
+/// send it). The step closes the menu first; the draft sent or cleared then,
+/// the switch is asked at once.
+pub const LIMIT_DRAFT_MENU: NoticeText = NoticeText {
+    id: "limit-draft-menu",
+    code: "lm",
+    happened: "Claude Code hit this account's usage limit, and the tab has a draft under an open menu.",
+    todo: "Close the menu in the tab, then send the draft.",
+    ..LIMIT_DRAFT
+};
+
+/// The notices a draft in the prompt alone raises, whose step is the
+/// draft's going: the point each stands at is decided again the moment the
+/// prompt reads otherwise, sent or cleared (the review of the login carry,
+/// r7h-3: cleared, the tab waited for the reset under a notice whose step
+/// was done).
+pub const DRAFT_HOLDS: &[&str] = &[
+    LIMIT_DRAFT.id,
+    LIMIT_DRAFT_OWN.id,
+    LIMIT_DRAFT_MENU.id,
+    RENEWED_DRAFT.id,
+];
+
+/// What [`LIMIT_UNMADE`]'s `{why}` names where the tab's own program is
+/// Claude Code (`refused:not-a-shell-job`): ended, it would come back in no
+/// shell, so aterm never ends it to restart it.
+pub const WHY_UNMADE_NO_SHELL: &str = "the tab runs Claude Code with no shell";
+
+/// Every clause [`LIMIT_UNMADE`]'s `{why}` is filled with: the tab with no
+/// shell, and any other refusal or failure of this launch's restart
+/// ([`WHY_USE_UNMADE`]).
+pub const UNMADE_WHYS: &[&str] = &[WHY_UNMADE_NO_SHELL, WHY_USE_UNMADE];
+
+/// A multi-day usage limit on a roster row's login, another row `{label}`
+/// ready, and the restart onto it refused for THIS LAUNCH
+/// (`super::turn_end::Unmade::Launch`: `refused:*`, `failed:*`): asked again,
+/// it is refused the same way, so the owner's `accounts use` would pin every
+/// other session and leave this tab where it is (the review of the login
+/// carry, r6h-2: [`LIMIT_USE`] promised "this tab included", the step ended
+/// the latch, the move was refused again and the same notice came back).
+/// Nothing promises a switch of this launch: the step is the one that ends
+/// the cause — the conversation resumed in a shell, a launch aterm restarts —
+/// and the expectation says what aterm can do then, and, where aterm
+/// continues tabs past a limit, that the tab goes on after the reset
+/// whatever the owner does.
+pub const LIMIT_UNMADE: NoticeText = NoticeText {
+    id: "limit-unmade",
+    code: "lx",
+    title: "Claude usage limit reached",
+    short_title: "Usage limit",
+    happened: "Claude Code hit this account's usage limit, and aterm cannot move it to another account.",
+    did: "aterm found {label} ready, but {why}.",
+    todo: "Quit Claude Code, then resume it in a shell tab.",
+    todo_as: None,
+    // No reset named: `resume_limits` is off, and nothing goes on by itself.
+    expect: "aterm can then switch it to {label} when it meets the limit again.",
+    expect_reset: Some("aterm can then switch it, else continues the tab after the reset {reset}."),
+    undo: None,
+    whys: UNMADE_WHYS,
+    back: SWITCHED,
 };
 
 /// What [`LIMIT_STAY`]'s `{why}` names: the lines of aterm.toml's
@@ -753,6 +919,7 @@ pub const LIMIT_STAY: NoticeText = NoticeText {
     expect_reset: Some("aterm then switches the tab, else continues it after the reset {reset}."),
     undo: None,
     whys: STAY_WHYS,
+    back: SWITCHED,
 };
 
 /// [`LIMIT_STAY`] where, with those lines set, the roster still holds the tab
@@ -764,15 +931,23 @@ pub const LIMIT_STAY: NoticeText = NoticeText {
 pub const LIMIT_STAY_HELD: NoticeText = NoticeText {
     id: "limit-stay-held",
     code: "lh",
-    expect: "aterm then names the next step to move this tab to another account.",
+    expect: LIMIT_NEXT_ANY,
     expect_reset: Some(LIMIT_NEXT_RESET),
     ..LIMIT_STAY
 };
 
 /// A multi-day usage limit on a roster row's login, and no other row is
 /// ready or left to sign in: the tab stays on its own account (a sign-in in
-/// the tab would sign another account into the row's login), and the roster
-/// report says why no account is next.
+/// the tab would sign another account into the row's login). THE ONE STEP
+/// THAT CHANGES THAT IS ANOTHER ACCOUNT (the review of the login carry,
+/// r8c-3: the step was the roster report, which only says no account is
+/// next, so the band carried neither something to do nor what to expect):
+/// `accounts add` lists it and prints the line that signs it in, and the
+/// expectation says that aterm names each step after it — and, where the
+/// limit's reset is known, that the tab continues after it whatever the owner
+/// does. The step is the command alone, so the band at the default window
+/// (80 columns) shows it whole beside the short title: with words before it
+/// the band put [`COMMAND_UNDER_DETAILS`] in its place.
 pub const LIMIT_ROSTER: NoticeText = NoticeText {
     id: "limit-roster",
     code: "lo",
@@ -780,19 +955,21 @@ pub const LIMIT_ROSTER: NoticeText = NoticeText {
     short_title: "Usage limit",
     happened: "Claude Code hit this account's usage limit, and no other listed account can take over.",
     did: "aterm keeps this tab on its own account, so no other account replaces its login.",
-    todo: "Run aterm harness accounts",
+    todo: "Run aterm harness accounts add <label>",
     todo_as: None,
-    expect: "The session continues by itself once an account is ready.",
-    expect_reset: Some(LIMIT_RESUMES),
+    expect: LIMIT_NEXT_ANY,
+    expect_reset: Some(LIMIT_NEXT_RESET),
     undo: None,
     whys: &[],
+    back: SWITCHED,
 };
 
 /// A multi-day usage limit where the roster is refused, the accounts' state
 /// could not be read, or the login the tab's process runs on could not be
 /// (the review's acct-7; acct3-1): whose the login is, or which row could
 /// take over, is not known, so no sign-in in the tab is asked for, and the
-/// roster report says what is wrong.
+/// roster report says what is wrong (its refusal, or the state it could not
+/// read, ahead of anything else it prints).
 pub const LIMIT_UNREAD: NoticeText = NoticeText {
     id: "limit-unread",
     code: "lu",
@@ -806,17 +983,31 @@ pub const LIMIT_UNREAD: NoticeText = NoticeText {
     expect_reset: Some(LIMIT_RESUMES),
     undo: None,
     whys: &[],
+    back: SWITCHED,
 };
 
+/// What follows [`LIMIT_ROSTER_KEPT`]'s step: `accounts add` prints the line
+/// that signs the account in, and once it is signed in the point is decided
+/// again on the accounts' news (`crate::supervise::run`'s `account_edge`,
+/// heard where the decision read the roster and did nothing), whose notice
+/// names the line of aterm.toml that lets the tab switch ([`LIMIT_STAY`],
+/// [`LIMIT_STAY_HELD`]); and nothing resumes the tab at the reset.
+const LIMIT_NEXT_KEPT: &str =
+    "aterm then names the next step, and with resume_limits off, no reset resumes the tab.";
+
 /// [`LIMIT_ROSTER`] where aterm continues nothing past the limit's reset
-/// (`resume_limits = false`, at a person's `/login` left at the limit): no
-/// account the roster makes ready continues the tab either, so the
-/// expectation says so (the review of the login carry, r4h-3: it said the
-/// session continues by itself once an account is ready).
+/// (`resume_limits = false`, at a person's `/login` left at the limit): the
+/// account added does not continue the tab by itself either (the notice
+/// that follows its sign-in names the line that lets it, [`LIMIT_STAY`]), so
+/// the expectation says so (the review of the login carry, r4h-3: it said
+/// the session continues by itself once an account is ready) — and says
+/// that aterm names that next step (r9h-1: it said only that nothing
+/// resumes, and nothing decided the point again once the account was
+/// signed in, so the notice kept asking for a step already taken).
 pub const LIMIT_ROSTER_KEPT: NoticeText = NoticeText {
     id: "limit-roster-kept",
     code: "lp",
-    expect: LIMIT_NOT_RESUMED,
+    expect: LIMIT_NEXT_KEPT,
     expect_reset: None,
     ..LIMIT_ROSTER
 };
@@ -853,6 +1044,10 @@ pub const ALL: &[NoticeText] = &[
     LIMIT_LOGIN,
     LIMIT_LOGIN_HELD,
     LIMIT_USE,
+    LIMIT_DRAFT,
+    LIMIT_DRAFT_OWN,
+    LIMIT_DRAFT_MENU,
+    LIMIT_UNMADE,
     LIMIT_STAY,
     LIMIT_STAY_HELD,
     LIMIT_ROSTER,

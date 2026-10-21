@@ -12,8 +12,8 @@
 // It never connects to X11 or Wayland or silently substitutes for a failed display.
 // A proxy wakes it across threads; ControlFlow governs polling and deadlines.
 // Init emits NewEvents, Resumed, user events and AboutToWait; later turns omit
-// Resumed, and exit emits LoopExiting. Window creation is an explicit error,
-// monitor enumeration is empty, and display-only cursor creation is unsupported.
+// Resumed, and exit emits LoopExiting. Window creation is an explicit error, and
+// monitor enumeration is empty.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -23,12 +23,11 @@ use std::time::{Duration, Instant};
 
 use crate::error::EventLoopError;
 use crate::event::{Event, StartCause};
-use crate::event_loop::{ActiveEventLoop as RootELW, ControlFlow, DeviceEvents, EventLoopClosed};
+use crate::event_loop::{ActiveEventLoop as RootELW, ControlFlow, EventLoopClosed};
 use crate::platform::pump_events::PumpStatus;
-use crate::window::{CustomCursor, CustomCursorSource};
 
 use super::common::poll::{self, Waker};
-use super::{MonitorHandle, OwnedDisplayHandle};
+use super::MonitorHandle;
 
 /// A proxy's half of the loop: the queue carries the events, the waker only "something
 /// was posted" (`common::poll::Waker`, which never blocks the sender).
@@ -71,14 +70,6 @@ impl ActiveEventLoop {
     }
 
     #[inline]
-    pub fn create_custom_cursor(&self, _source: CustomCursorSource) -> CustomCursor {
-        unimplemented!(
-            "a headless event loop has no display to define a cursor on; this backend is \
-             selected only by an explicit `with_headless`, so reaching here is a caller bug"
-        )
-    }
-
-    #[inline]
     pub fn available_monitors(&self) -> VecDeque<MonitorHandle> {
         VecDeque::new()
     }
@@ -86,13 +77,6 @@ impl ActiveEventLoop {
     #[inline]
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
         None
-    }
-
-    #[inline]
-    pub fn listen_device_events(&self, _allowed: DeviceEvents) {
-        // No device source exists without a display server, so device-event filtering has
-        // nothing to widen or narrow. Silently accepting the request is right: the caller
-        // is expressing a preference about events this backend simply never emits.
     }
 
     #[inline]
@@ -115,21 +99,16 @@ impl ActiveEventLoop {
         self.exit.get().is_some()
     }
 
-    #[allow(dead_code)]
+    // Reached only through the dispatcher's, which the Wayland loop calls.
+    #[cfg(wayland_platform)]
     #[inline]
     pub(crate) fn set_exit_code(&self, code: i32) {
         self.exit.set(Some(code));
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn exit_code(&self) -> Option<i32> {
         self.exit.get()
-    }
-
-    #[inline]
-    pub(crate) fn owned_display_handle(&self) -> OwnedDisplayHandle {
-        OwnedDisplayHandle::Headless
     }
 
     /// There is no display, so there is no handle to hand out. `NotSupported` is the

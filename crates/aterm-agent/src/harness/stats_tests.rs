@@ -5,15 +5,17 @@ use super::*;
 use crate::harness::upgrade_drive::{self, Instances, Opts, Report};
 use crate::supervise::ScratchDir;
 use crate::supervise::approvals::Row;
+use crate::supervise::config::CONTINUE_TEXT;
 use crate::supervise::journal::ATTENTION_KEPT;
 use crate::supervise::policy::approval::{
     RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM, RULE_LIMIT_WAIT, RULE_READ_ONLY,
 };
 use crate::supervise::policy::question::RULE_ANSWER_RECOMMENDED;
 use crate::supervise::policy::turn_end::{
-    LAND_ANSWER, RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY,
-    RULE_COMPACT, RULE_CONTINUE, RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LAND_ANSWER,
-    RULE_LIMIT_RESUME, RULE_LOGIN, RULE_MODEL_FALLBACK, RULE_SUGGESTION, RULE_USAGE_PROBE,
+    LAND_ANSWER, LAND_NUDGE_COMMITTED_BEFORE, RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK,
+    RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONSENT, RULE_CONTINUE, RULE_DONE_CHECK,
+    RULE_HOST_TURN, RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_LIMIT_RESUME, RULE_LOGIN,
+    RULE_MODEL_FALLBACK, RULE_SUGGESTION, RULE_USAGE_PROBE, WAKE_KEPT,
 };
 
 /// One approval ledger row as the loop writes it ([`Row::to_json`]).
@@ -1156,7 +1158,9 @@ fn now_ms() -> i64 {
 ///   rows today; a limit's wall written before today's start whose resume
 ///   comes after it, and a box approved yesterday; its journal with an
 ///   escalation raised yesterday and cleared today, one raised and cleared
-///   today, the recorded `CHOSE`, and a line that is no record.
+///   today, the recorded `CHOSE`, a line that is no record, and Land's
+///   landings: one yesterday after its instruction, restated today by a
+///   restarted loop (its `ended`), and one today after a nudge.
 /// * `s-2`: a ledger and journal last written yesterday (UNTOUCHED TODAY):
 ///   a decline, a continuation, a line that is no row, an escalation.
 /// * `s-3`: a ledger CUT back to its kept rows, every one today.
@@ -1222,6 +1226,23 @@ fn one_pass_tree(today: i64, week: i64) -> (ScratchDir, PathBuf, PathBuf, Vec<Pa
         r.t += shift;
         r
     }));
+    let landed_at = today - 9 * hour;
+    s1_journal.extend(journal(&format!(
+        "{} s-1 CONTINUED seq=90 rule={RULE_LAND} land it",
+        landed_at - hour
+    )));
+    s1_journal.push(land_note(landed_at, "s-1", DEFENDED, None));
+    s1_journal.push(land_note(
+        today + 30 * 60_000,
+        "s-1",
+        DEFENDED,
+        Some(landed_at),
+    ));
+    s1_journal.extend(journal(&format!(
+        "{} s-1 CONTINUED seq=300 rule={RULE_LAND_NUDGE} still landing",
+        today + 3 * hour
+    )));
+    s1_journal.push(land_note(today + 3 * hour + 60_000, "s-1", DEFENDED, None));
     let mut lines: Vec<String> = s1_journal.iter().map(JournalRecord::to_json).collect();
     lines.insert(2, "{\"t\":".to_string());
     let s1_journal = drive.join("s-1.journal.jsonl");
@@ -1373,6 +1394,11 @@ fn one_pass_folds_both_windows_as_two_readings_do() {
     );
     assert!(two_today.cut && two_week.cut, "s-3 began inside both");
     assert_eq!((two_today.sessions, two_week.sessions), (2, 3));
+    assert_eq!(
+        (two_today.landed, two_week.landed),
+        (1, 2),
+        "s-1's landings: today's, and yesterday's restated today"
+    );
     // NEGATIVE CONTROL: today folding s-2's untouched file.
     let mut forced = HarnessStats::new(today);
     for line in tail_lines(&state.join("drive").join("s-2.jsonl"), READ_MAX_ROWS).expect("s-2") {
@@ -1461,6 +1487,7 @@ fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
         sum.answered += t.answered;
         sum.continued += t.continued;
         sum.land_prompts += t.land_prompts;
+        sum.landed += t.landed;
         sum.resumed += t.resumed;
         sum.escalated += t.escalated;
         sum.needs_told += t.needs_told;
@@ -1477,6 +1504,7 @@ fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
         answered: acc.answered,
         continued: acc.continued,
         land_prompts: acc.land_prompts,
+        landed: acc.landed,
         resumed: acc.resumed,
         escalated: acc.escalated,
         needs_told: acc.needs_told,
@@ -1500,6 +1528,7 @@ fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
         (2, 1, 2, 2, 1)
     );
     assert_eq!(s1.last_escalated_ms, Some(today + 2 * 3_600_000));
+    assert_eq!((s1.landed, acc.landed), (1, 1), "today's landing is s-1's");
     assert!(!s1.cut, "s-1 is whole");
     assert!(shares["s-3"].cut, "the cut file's own session");
     assert_eq!(shares["s-3"].continued, approvals::KEEP_ROWS as u64);
@@ -2564,4 +2593,327 @@ fn a_need_told_is_counted_apart_from_escalations_and_waits() {
         acc.needs_told, 1,
         "only the one inside the window: {acc:#?}"
     );
+}
+
+/// A landing's note as the loop writes it (`turn_end_loop.rs`,
+/// `task_edge_with`), at `t` for `sid`, restating the landing first noted at
+/// `ended` where there is one.
+fn land_note(t: i64, sid: &str, why: &str, ended: Option<i64>) -> JournalRecord {
+    let mut r = JournalRecord::of_line(
+        t,
+        Some(sid),
+        &format!(
+            "DONE seq=104 rule={RULE_LAND} {why} (autopilot land): nothing more is typed until \
+             a person or an orchestrator types"
+        ),
+        None,
+    );
+    r.ended = ended;
+    r
+}
+
+/// The words of a clean defense's note.
+const DEFENDED: &str = "the worker defended that everything is landed on the remote main branch";
+
+/// A LANDING COUNTS ONCE THROUGH A RESTATEMENT AND A WAKE (design §12.4.3,
+/// item 2; §12.4.6): Land's instruction, its landing's note, the note the
+/// task's own wake restates it in ([`WAKE_KEPT`], its `ended`), the loop's
+/// end and a successor's restatement (its `ended`) are ONE landing, at its own note's
+/// time, in the window's total and the session's share. A Cruise done claim
+/// is none: the ledger's done check and the `task-done@v1` row an older
+/// build wrote at it, and the journal's older `DONE` notes under another
+/// rule. NEGATIVE CONTROLS: the journal holds three `DONE … rule=land@v1`
+/// notes (a reader of every note counts 3); a window that opens after the
+/// landing's note counts none, however new its restatements; the land
+/// prompt is a land prompt, never a landing.
+#[test]
+fn a_landing_counts_once_through_a_restatement_and_a_wake() {
+    let mut recs = journal(&format!(
+        "1000 s-1 CONTINUED seq=100 rule={RULE_LAND} [aterm harness] Autopilot is Land: land ALL of this work
+         1500 s-1 EVENT idle seq=104 - Nothing left: all of it is merged into the remote main branch."
+    ));
+    recs.push(land_note(2_000, "s-1", DEFENDED, None));
+    recs.push(land_note(3_000, "s-1", WAKE_KEPT, Some(2_000)));
+    recs.extend(journal("4000 s-1 EXIT stopped"));
+    recs.push(land_note(5_000, "s-1", DEFENDED, Some(2_000)));
+    // An older build's notes of a Cruise done claim: no landing.
+    recs.extend(journal(
+        "6000 s-2 DONE seq=110 rule=continue-done-check@v1 the worker said it is done after the done check
+         6500 s-2 DONE seq=111 rule=finished@v1 the worker reported ATERM-TASK-DONE: its task is finished",
+    ));
+    let notes = recs
+        .iter()
+        .filter(|r| r.line.starts_with("DONE ") && r.line.contains(&format!("rule={RULE_LAND} ")))
+        .count();
+    assert_eq!(notes, 3, "CONTROL: three notes of the one landing");
+    let mut acc = HarnessStats::per_session(0);
+    fold_journal(&mut acc, &recs);
+    // The Cruise done claim the ledger holds: the done check typed, and the
+    // `task-done@v1` row older builds wrote at its done reply.
+    for line in [
+        row(
+            6_100,
+            "s-2",
+            RULE_DONE_CHECK,
+            Outcome::Typed,
+            "Before you stop: …",
+            "-",
+        ),
+        row(
+            6_200,
+            "s-2",
+            approvals::RULE_TASK_DONE,
+            Outcome::Waiting,
+            "",
+            approvals::TASK_DONE,
+        ),
+        row(900, "s-1", RULE_LAND, Outcome::Typed, "land it", "-"),
+    ] {
+        fold_ledger_line(&mut acc, &line);
+    }
+    acc.end_reading();
+    assert_eq!(acc.landed, 1, "{acc:#?}");
+    let shares = acc.by_session.as_ref().expect("shares");
+    assert_eq!(shares["s-1"].landed, 1);
+    assert_eq!(shares["s-2"].landed, 0, "a Cruise done claim is no landing");
+    assert_eq!(
+        (acc.land_prompts, acc.continued),
+        (1, 1),
+        "the land prompt and the done check, each its own count"
+    );
+    // NEGATIVE CONTROL: the window opens after the landing's note.
+    let mut later = HarnessStats::new(2_001);
+    fold_journal(&mut later, &recs);
+    assert_eq!(later.landed, 0, "{later:#?}");
+    let mut at = HarnessStats::new(2_000);
+    fold_journal(&mut at, &recs);
+    assert_eq!(at.landed, 1, "a note at the window's start is inside it");
+}
+
+/// EACH LANDING COUNTS, AND AN OLDER BUILD'S NOTES READ AS THE LANDINGS THEY
+/// WERE (§12.4.3, item 2, as built): a landing comes only at a land act's
+/// yield, so a session's landing note counts where it is the first in its
+/// file or a land act (`land@v1`, `land-nudge@v1`, `land-answer@v1`) was
+/// journaled since its last one. The journals are the real sequences of
+/// 2026-10-16's Together run, which builds before 2026-10-19 wrote: `s-a`
+/// landed once, then two later loops noted `DONE seq=46004 rule=land@v1`
+/// over someone else's done turn with no `ended` (one landing); `s-b` landed
+/// three times, each after its own land act (three). A third session's
+/// first note, its land act cut away, counts. NEGATIVE CONTROLS: none of
+/// `s-a`'s notes carries `ended` or the wake's words, so a count of every
+/// such note reads 3 there; a restatement (`ended`) that comes first in a
+/// file counts nothing (a cold restore's tab restates under its own id the
+/// landing its earlier tab's journal noted), nor does an older build's note
+/// after it with no land act between; an act that is no land act (a
+/// `/usage` probe, a continuation) between a landing and an older build's
+/// restatement leaves it a restatement; and land acts with no note count no
+/// landing.
+#[test]
+fn each_landing_counts_and_an_older_builds_notes_read_as_the_landings_they_were() {
+    let older = "the worker said it is done after the land instruction";
+    let act = |t: i64, sid: &str, rule: &str| {
+        JournalRecord::of_line(
+            t,
+            Some(sid),
+            &format!("CONTINUED seq=7 rule={rule} [aterm harness] Autopilot is set to Land"),
+            None,
+        )
+    };
+    let exit = |t: i64, sid: &str| JournalRecord::of_line(t, Some(sid), "EXIT stopped", None);
+    let recs = vec![
+        // s-a: one landing, then two loops' notes over someone else's turn.
+        act(1_000, "s-a", RULE_LAND),
+        land_note(2_000, "s-a", older, None),
+        exit(2_100, "s-a"),
+        land_note(3_000, "s-a", older, None),
+        exit(3_100, "s-a"),
+        land_note(4_000, "s-a", older, None),
+        // s-b: three landings, each after its own land act.
+        act(5_000, "s-b", RULE_LAND_ANSWER),
+        act(5_100, "s-b", RULE_LAND),
+        land_note(6_000, "s-b", older, None),
+        act(7_000, "s-b", RULE_LAND),
+        land_note(8_000, "s-b", older, None),
+        act(9_000, "s-b", RULE_LAND_NUDGE),
+        land_note(10_000, "s-b", older, None),
+        // s-c: a file whose land act was cut away; s-d: a cold restore's tab.
+        land_note(11_000, "s-c", DEFENDED, None),
+        land_note(12_000, "s-d", DEFENDED, Some(11_500)),
+        // s-e: land acts, and no landing after them.
+        act(13_000, "s-e", RULE_LAND),
+        act(14_000, "s-e", RULE_LAND_NUDGE),
+        // s-f: one landing, then acts that are no land act (a `/usage` probe
+        // at the landed point, a continuation) before a later loop's note.
+        act(15_000, "s-f", RULE_LAND),
+        land_note(16_000, "s-f", older, None),
+        JournalRecord::of_line(
+            16_500,
+            Some("s-f"),
+            &format!("TYPED seq=8 rule={RULE_USAGE_PROBE} /usage"),
+            None,
+        ),
+        JournalRecord::of_line(
+            16_600,
+            Some("s-f"),
+            &format!(
+                "CONTINUED seq=9 rule={RULE_CONTINUE} {}",
+                clipped(CONTINUE_TEXT)
+            ),
+            None,
+        ),
+        exit(16_700, "s-f"),
+        land_note(17_000, "s-f", older, None),
+        // s-g: a cold restore's restatement first, then an older build's
+        // later loop noting the same landing with no `ended`.
+        land_note(18_000, "s-g", DEFENDED, Some(11_500)),
+        exit(18_100, "s-g"),
+        land_note(19_000, "s-g", older, None),
+    ];
+    let a_notes: Vec<&JournalRecord> = recs
+        .iter()
+        .filter(|r| r.sid.as_deref() == Some("s-a") && r.line.starts_with("DONE "))
+        .collect();
+    assert_eq!(a_notes.len(), 3);
+    assert!(
+        a_notes
+            .iter()
+            .all(|r| r.ended.is_none() && !r.line.contains(WAKE_KEPT)),
+        "CONTROL: the older build's notes look like landings of their own"
+    );
+    let mut acc = HarnessStats::per_session(0);
+    fold_journal(&mut acc, &recs);
+    acc.end_reading();
+    let shares = acc.by_session.as_ref().expect("shares");
+    let landed = |sid: &str| shares.get(sid).map_or(0, |t| t.landed);
+    assert_eq!(
+        [
+            landed("s-a"),
+            landed("s-b"),
+            landed("s-c"),
+            landed("s-d"),
+            landed("s-e"),
+            landed("s-f"),
+            landed("s-g")
+        ],
+        [1, 3, 1, 0, 0, 1, 0],
+        "{shares:#?}"
+    );
+    assert_eq!(acc.landed, 6);
+}
+
+/// The words a loop's line journals of `text` (`turn_end_loop.rs`'s
+/// `clip`): its first [`LINE_CHARS`] characters.
+fn clipped(text: &str) -> String {
+    text.chars().take(LINE_CHARS).collect()
+}
+
+/// A WALL'S CONTINUATION IN LAND'S OWN WORDS IS THE LAND ACT A LANDING COMES
+/// AT (THE LANDINGS; the engine's `land_text`): under Land a wall's
+/// continuation types [`LAND`] or [`LAND_NUDGE`] under the WALL's rule
+/// (`continue_as`: a limit's resume, a credits consent, a `/compact`'s
+/// continuation), and its clean defense lands the task. A landed tab
+/// reopened by someone else's turn that ends at a limit lands again at the
+/// reset's resume with no `land@v1`/`land-nudge@v1` act since its last
+/// landing: that is a second landing. The real journal of one live run
+/// (aterm on this branch driving Muse Code 1.4.11 under the forever lab's
+/// usage walls, 2026-10-21) holds three landings, two of them at a
+/// `usage-resume@v1` resume. NEGATIVE CONTROLS: a guard that reads a land act
+/// off the rule alone reads 1 in each synthetic session and 2 in the real
+/// journal; a wall's continuation in other words (Cruise's continuation,
+/// an older build's retired nudge) is no land act, so the note after it
+/// restates the landing before.
+#[test]
+fn a_walls_continuation_in_lands_words_is_the_land_act_a_landing_comes_at() {
+    let rec = |t: i64, sid: &str, line: String| JournalRecord::of_line(t, Some(sid), &line, None);
+    let mut recs = Vec::new();
+    let mut sids = Vec::new();
+    for (i, rule) in [RULE_LIMIT_RESUME, RULE_CONSENT, RULE_COMPACT]
+        .into_iter()
+        .enumerate()
+    {
+        for (j, words) in [LAND, LAND_NUDGE].into_iter().enumerate() {
+            let sid = format!("s-{i}{j}");
+            let t = i64::try_from(10 * (2 * i + j)).expect("small") * 1_000;
+            recs.extend([
+                rec(
+                    t + 1_000,
+                    &sid,
+                    format!("CONTINUED seq=100 rule={RULE_LAND} {}", clipped(LAND)),
+                ),
+                land_note(t + 2_000, &sid, DEFENDED, None),
+                rec(
+                    t + 3_000,
+                    &sid,
+                    "EVENT turn seq=150 Added the flag.".to_string(),
+                ),
+                rec(
+                    t + 4_000,
+                    &sid,
+                    format!("CONTINUED seq=200 rule={rule} {}", clipped(words)),
+                ),
+                land_note(t + 5_000, &sid, DEFENDED, None),
+            ]);
+            sids.push(sid);
+        }
+    }
+    // A wall's continuation in other words: Cruise's, and an older build's
+    // retired nudge under the limit's resume. The next notes restate.
+    for (sid, words) in [
+        ("s-other", CONTINUE_TEXT),
+        ("s-retired", LAND_NUDGE_COMMITTED_BEFORE),
+    ] {
+        recs.extend([
+            rec(
+                70_000,
+                sid,
+                format!("CONTINUED seq=100 rule={RULE_LAND} {}", clipped(LAND)),
+            ),
+            land_note(71_000, sid, DEFENDED, None),
+            rec(
+                72_000,
+                sid,
+                format!(
+                    "CONTINUED seq=200 rule={RULE_LIMIT_RESUME} {}",
+                    clipped(words)
+                ),
+            ),
+            land_note(73_000, sid, DEFENDED, None),
+        ]);
+    }
+    // The live run's journal, as its loop wrote it.
+    let live: Vec<JournalRecord> =
+        include_str!("../supervise/fixtures/muse-1.4.11-journal-land-at-wall-resumes.jsonl")
+            .lines()
+            .map(|l| JournalRecord::from_json(l).expect("a journal record"))
+            .collect();
+    let resumes = live
+        .iter()
+        .filter(|r| r.kind == "continued" && r.phase == RULE_LIMIT_RESUME)
+        .count();
+    let notes = live
+        .iter()
+        .filter(|r| r.line.starts_with("DONE seq=") && r.ended.is_none())
+        .count();
+    assert_eq!(
+        (resumes, notes),
+        (2, 3),
+        "CONTROL: the run's acts and notes"
+    );
+    let mut acc = HarnessStats::per_session(0);
+    fold_journal(&mut acc, &recs);
+    acc.end_reading();
+    let shares = acc.by_session.as_ref().expect("shares");
+    let landed = |sid: &str| shares.get(sid).map_or(0, |t| t.landed);
+    let mut live_acc = HarnessStats::per_session(0);
+    fold_journal(&mut live_acc, &live);
+    // (each wall rule's sessions, Cruise's words, a retired nudge, the
+    // total, the live run)
+    let got = (
+        sids.iter().map(|sid| landed(sid)).collect::<Vec<_>>(),
+        landed("s-other"),
+        landed("s-retired"),
+        acc.landed,
+        live_acc.landed,
+    );
+    assert_eq!(got, (vec![2; 6], 1, 1, 2 * 6 + 2, 3), "{shares:#?}");
 }

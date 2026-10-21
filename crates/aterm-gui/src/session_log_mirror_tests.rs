@@ -35,7 +35,7 @@ fn session(store: &crate::session_store::Store, id: u64) -> crate::session_store
     {
         let mut tl = h.ctx.timeline.lock().unwrap();
         let now = tl.slog().now();
-        tl.slog_mut().open_session(None, now);
+        tl.slog_mut().open_session(None, None, now);
     }
     commands(&h, 3);
     h
@@ -199,7 +199,7 @@ fn a_landing_before_adoption_keeps_the_pin_and_lands_after_adoption() {
         {
             let mut tl = h.ctx.timeline.lock().unwrap();
             let now = tl.slog().now();
-            tl.slog_mut().open_session(None, now);
+            tl.slog_mut().open_session(None, None, now);
         }
         commands(&h, 2);
         // The carried cursor the export drew: the session's open landed.
@@ -493,6 +493,7 @@ fn an_uncarried_adoption_owes_the_old_spaces_tail() {
             mirror: Some(prior),
         },
         false,
+        None,
         at,
     );
     assert_eq!(slog.log().mirror_prior(), Some(prior));
@@ -514,6 +515,7 @@ fn an_uncarried_adoption_owes_the_old_spaces_tail() {
             ..Default::default()
         },
         true,
+        None,
         at,
     );
     assert_eq!(crashed.log().mirror_prior(), None);

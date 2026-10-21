@@ -2,12 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal style types shared between grid and checkpoint systems.
-//!
-//! These types represent terminal rendering state (current style attributes,
-//! saved cursor state) that both the grid cell model and checkpoint
-//! serialization need access to. Placed in aterm-grid because they depend
-//! on grid primitives (`PackedColor`, `CellFlags`, `Cursor`).
+//! Terminal rendition state (the current style and the DECSC saved-cursor state) shared by
+//! the grid cell model and checkpoint serialization.
 
 use crate::cell::{CellFlags, PackedColor};
 use crate::cell_colors::PackedColors;
@@ -94,11 +90,8 @@ impl CurrentStyle {
         self.cached_colors
     }
 
-    /// Extract the background RGB value for BCE, if the background is truecolor.
-    ///
-    /// Returns `Some([r, g, b])` when `self.bg.is_rgb()`, `None` otherwise.
-    /// Used by `set_cursor_template` callers to propagate truecolor backgrounds
-    /// through erase/fill/scroll operations.
+    /// The background RGB for BCE when the background is truecolor, which
+    /// `set_cursor_template` callers carry through erase/fill/scroll operations.
     #[must_use]
     #[inline]
     pub fn bce_bg_rgb(&self) -> Option<[u8; 3]> {
@@ -117,9 +110,8 @@ impl CurrentStyle {
         self.cached_has_style_extras
     }
 
-    /// Whether the style is completely default (no colors, no flags, not protected).
-    ///
-    /// When true, the ultra-fast `write_ascii_blast` path can be used.
+    /// Whether the style is completely default (no colors, no flags, not protected), so the
+    /// `write_ascii_blast` path applies.
     #[must_use]
     #[inline]
     pub fn is_default(&self) -> bool {
@@ -140,12 +132,8 @@ impl CurrentStyle {
             && !self.protected;
     }
 
-    /// Recompute only the flag-derived caches after a flags-only SGR change.
-    ///
-    /// A flags-only SGR (e.g. `\x1b[1m`, `\x1b[7m`, `\x1b[22m`) leaves
-    /// `fg`/`bg` alone, so `cached_colors` stays valid and only the two
-    /// flag-dependent booleans are refreshed, avoiding `convert_colors` on every
-    /// attribute toggle.
+    /// Recompute only the flag-derived caches after a flags-only SGR change (e.g. `\x1b[1m`),
+    /// which leaves `cached_colors` valid and skips `convert_colors`.
     #[inline]
     pub fn update_flags_cache(&mut self) {
         self.cached_has_style_extras =
@@ -163,10 +151,8 @@ impl CurrentStyle {
         *self = Self::default();
     }
 
-    /// Reset SGR attributes only (colors and flags).
-    ///
-    /// This does NOT reset the DECSCA protection attribute, as per VT510 spec.
-    /// SGR 0 resets character rendition attributes but not selective erase.
+    /// Reset SGR attributes only (colors and flags). Per VT510, SGR 0 does not reset the
+    /// DECSCA protection attribute.
     pub fn reset_sgr(&mut self) {
         let protected = self.protected;
         *self = Self::default();
@@ -178,13 +164,8 @@ impl CurrentStyle {
 
 /// Saved cursor state for DECSC/DECRC.
 ///
-/// Per VT510 specification, DECSC saves:
-/// - Cursor position
-/// - Character attributes (SGR)
-/// - Character set (G0-G3, GL mapping, single shift)
-/// - Wrap flag (DECAWM state)
-/// - Origin mode (DECOM state)
-/// - Selective erase attribute (DECSCA protection status)
+/// Per VT510, DECSC saves the cursor position, SGR attributes, character sets (G0-G3, GL,
+/// single shift), DECAWM, DECOM and the DECSCA protection attribute.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SavedCursorState {
     /// Cursor position.
@@ -209,10 +190,6 @@ pub struct SavedCursorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // =========================================================================
-    // CurrentStyle::default, and one attribute or colour changed from it
-    // =========================================================================
 
     #[test]
     fn default_style_is_empty_and_cached_as_default() {

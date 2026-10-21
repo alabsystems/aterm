@@ -119,10 +119,14 @@
 //!   KEY's gate shut at every coordinate move as it was before this file
 //!   found it should not be; run beside the signed Adaptive runs of `Full`,
 //!   for the lines each witnesses (`Stats::witnessed_lines`, printed a run).
+//! * `PaintedOverText`: `Full` with `Rule::DarkOverText` off, a guess waiting
+//!   on the screen as it was painted over the line's text, as before this file
+//!   measured what that cost `Always`; run beside the 32 `Always` runs of
+//!   `Full`, for the mispredicted cells and wrong episodes each shows.
 //!
-//! `Phase0`, `Full` and `ShutAtScroll` run with the theorem's checker on, so
-//! every clause holds on every frame of every run of them; `Baseline` and
-//! `Sticky` break clauses by design, and run with it off
+//! `Phase0`, `Full`, `ShutAtScroll` and `PaintedOverText` run with the
+//! theorem's checker on, so every clause holds on every frame of every run of
+//! them; `Baseline` and `Sticky` break clauses by design, and run with it off
 //! (`Sim::without_checks`), what they show measured.
 //!
 //! ## What is asserted
@@ -143,6 +147,9 @@
 //! 7. No cell is shown wrong for longer than the longest glitch window the
 //!    predictor can have (`LIFETIME_BOUND_US`, 2 s), in any run of the main
 //!    matrix: every variant, mode and link.
+//! 8. `Full`, `Always`, shows no more mispredicted cells and no more wrong
+//!    episodes than `Baseline`, the predictor before the plan, in every run,
+//!    and fewer mispredicted cells than `PaintedOverText` in every run.
 //!
 //! And the metric's own negative controls: `Sticky` shows wrong lines on the
 //! switch corpus, and `Baseline` does on the main one, wrong episodes and
@@ -174,6 +181,18 @@
 //! predictor before the plan flushed it at the next frame: the wait the
 //! review of phase 0 added beside a suggestion, which no rule switched off.
 //! It is `Rule::ScreenAsItWas` now, off in `Baseline` with the rest.
+//! And that the wait cost `Always` more wrong cells than the predictor before
+//! the plan showed, over ssh most (123 against 45 at 30 ms, 152 against 67 at
+//! 100 ms): `Always` painted the waiting glyph over the line's text, unshifted,
+//! until its echo. The wait itself keeps a run typed a round trip after
+//! Ctrl-K, whose glyphs land as appends once Ctrl-K's echo has erased the text
+//! their presses read (the six keys readline shows at 250 ms in Adaptive), so
+//! it stays; a guess waiting where the line's end is not known now waits off
+//! the glass, with every guess typed after it (`Rule::DarkOverText`,
+//! `PaintedOverText` beside it), and so does the run's first guess typed over
+//! the line's text behind a first glyph that hides nothing (`sudo ` typed on
+//! the `s` of `systemctl`): 2 and 35 mispredicted cells over ssh at 30 and
+//! 100 ms, and no key fewer before its echo in any run of `Full`.
 //!
 //! Run: `targo --unverified test -p aterm-predict --test predict_suite editing_win -- --nocapture`;
 //! the tables it prints are `docs/DESIGN-predictive-editing-2026-10-20.md`'s.
@@ -837,6 +856,11 @@ enum Variant {
     /// at every coordinate move, as before this file found it should not be.
     /// Run beside `Full` at the signed runs only, for the lines witnessed.
     ShutAtScroll,
+    /// `Full` with `Rule::DarkOverText` off: a guess waiting on the screen as
+    /// it was painted over the line's text, as before this file measured what
+    /// that cost `Always`. Run beside `Full` at the `Always` runs only, for the
+    /// mispredicted cells and wrong episodes each shows.
+    PaintedOverText,
 }
 
 /// The variants of the main matrix (`ShutAtScroll` runs beside it).
@@ -855,6 +879,7 @@ impl Variant {
             Self::Full => "full",
             Self::Sticky => "sticky",
             Self::ShutAtScroll => "shut-at-scroll",
+            Self::PaintedOverText => "painted-over-text",
         }
     }
 
@@ -882,6 +907,10 @@ impl Variant {
             Self::ShutAtScroll => sim
                 .predictor_mut()
                 .disable_rule_for_test(Rule::ScrollKeepsFirstKey),
+            // More is painted, but only in `Always`, which claims no fidelity.
+            Self::PaintedOverText => sim
+                .predictor_mut()
+                .disable_rule_for_test(Rule::DarkOverText),
         }
     }
 }
@@ -1600,8 +1629,8 @@ const FULL_FLOORS: [(Editor, bool, u32, PredictMode, u64); 64] = [
     (Editor::Readline, false, 600, PredictMode::Always, 5192),
 ];
 
-/// THE EDITING WIN, the main matrix: the report, and assertions 1, 2, 3, 5, 6 and 7
-/// (module docs).
+/// THE EDITING WIN, the main matrix: the report, and assertions 1, 2, 3, 5, 6, 7
+/// and 8 (module docs).
 #[test]
 fn predictive_editing_wins_and_never_shows_a_wrong_line() {
     let lines = corpus();
@@ -1696,18 +1725,80 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
             ));
         }
     }
-    eprintln!("{report}");
-    assert!(
-        witness_failures.is_empty(),
-        "{}",
-        witness_failures.join("\n")
-    );
     let find = |run: Run| {
         all.iter()
             .find(|(r, _)| *r == run)
             .map(|(_, t)| t)
             .expect("every run of the matrix ran")
     };
+    // WHAT THIS FILE FOUND IN `Always`, per run: the mispredicted cells and
+    // wrong episodes of the predictor before the plan (`Baseline`), of `Full`,
+    // and of `Full` painting a guess that waits over the line's text, as it did
+    // (`PaintedOverText`).
+    let painted_runs: Vec<Run> = all
+        .iter()
+        .map(|(r, _)| *r)
+        .filter(|r| r.variant == Variant::Full && r.mode == PredictMode::Always)
+        .map(|r| Run {
+            variant: Variant::PaintedOverText,
+            ..r
+        })
+        .collect();
+    let painted = tallies(&painted_runs, measure_all(&lines, &painted_runs, false));
+    let mut always_failures = Vec::new();
+    for (run, t) in &painted {
+        let full = find(Run {
+            variant: Variant::Full,
+            ..*run
+        });
+        let base = find(Run {
+            variant: Variant::Baseline,
+            ..*run
+        });
+        let _ = writeln!(
+            report,
+            "mispredicted cells (wrong episodes), {:?} {} Always rtt={}: baseline {} ({}), full \
+             {} ({}), {} {} ({})",
+            run.editor,
+            if run.integration { "signed" } else { "remote" },
+            run.rtt_ms,
+            base.wrong_cells,
+            base.wrong_runs,
+            full.wrong_cells,
+            full.wrong_runs,
+            run.variant.name(),
+            t.wrong_cells,
+            t.wrong_runs
+        );
+        // 8. `Always` shows no more wrong than the predictor before the plan.
+        if full.wrong_cells > base.wrong_cells || full.wrong_runs > base.wrong_runs {
+            always_failures.push(format!(
+                "{}: {} mispredicted cells in {} wrong episodes, before the plan {} in {}",
+                run.label(),
+                full.wrong_cells,
+                full.wrong_runs,
+                base.wrong_cells,
+                base.wrong_runs
+            ));
+        }
+        // The measurement's own control: a guess painted over the line's text
+        // shows more cells wrong.
+        if full.wrong_cells >= t.wrong_cells {
+            always_failures.push(format!(
+                "{}: full showed {} mispredicted cells, painted over the text {}",
+                run.label(),
+                full.wrong_cells,
+                t.wrong_cells
+            ));
+        }
+    }
+    eprintln!("{report}");
+    assert!(
+        witness_failures.is_empty() && always_failures.is_empty(),
+        "{}\n{}",
+        witness_failures.join("\n"),
+        always_failures.join("\n")
+    );
     let mut failures = Vec::new();
     // 7. No cell shown wrong for longer than the longest glitch window, in any
     // run: every variant, mode and link.

@@ -2,20 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Scope-cardinality census (OB-13..OB-16): the "one enforcer, N instances"
-//! class as a fail-closed obligation.
+//! Scope-cardinality census (OB-13..OB-16): "one enforcer, N instances" as a
+//! fail-closed obligation.
 //!
-//! A model can verify a local property of one instance of an enforcing
-//! structure while the property that matters is global across all live
-//! instances. `FlashLimiter` proves at most 2 ignitions per rolling second for
-//! one limiter; if every split pane had its own `WordDecorations`, each limiter
-//! would satisfy that while the viewer sees 2N flashes per second. WCAG 2.3.1
-//! is window-wide.
+//! A model can verify a property of one instance of an enforcing structure
+//! while the property that matters is global across all live instances. The
+//! `FlashLimiter` model proves at most 2 ignitions per rolling second for one
+//! limiter; if every split pane had its own `WordDecorations`, the viewer would
+//! see 2N flashes per second. WCAG 2.3.1 is window-wide.
 //!
 //! A [`ScopeClaim`] declares the ownership chain from the scope root down to the
-//! enforcing state, plus the closure of every other place that state may live.
-//! The census re-derives both from the tree on every run, so multiplying an
-//! enforcer either re-types a pinned link (OB-13) or opens the closure (OB-14).
+//! enforcing state, plus every other place that state may live. The census
+//! re-derives both from the tree on every run, so multiplying an enforcer
+//! either re-types a pinned link (OB-13) or opens the closure (OB-14).
 //!
 //! Obligations (`[OB-n]` tags in the diagnostics):
 //!
@@ -213,7 +212,7 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                 decl: "persist: FxHashMap<u64, Episode>,",
             },
         ],
-        // The leaf type `HashMap<u64, Episode>` is too common to close over;
+        // The leaf type `FxHashMap<u64, Episode>` is too common to close over;
         // this claim relies on OB-13 (the chain) and OB-15 (the aggregator).
         closed_tokens: &[],
         replicas: &[Replica {
@@ -261,9 +260,9 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
 /// closed token.
 const SELF_EXCLUDED_DIR: &str = "crates/aterm-census/src";
 
-/// The honest limits of this census, printed verbatim in every RED diagnostic.
-// NOTE: a plain multi-line literal (no `\` continuations, which would strip the
-// leading indentation the diagnostic relies on).
+/// The honest limits of this census, printed in every red diagnostic.
+// A plain multi-line literal: `\` continuations would strip the leading
+// indentation the diagnostic relies on.
 pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL, declaration-text based. A chain link is pinned by the VERBATIM
         field declaration inside a `struct <owner> {` body, comments and string
@@ -490,7 +489,7 @@ fn rel(root: &Path, path: &Path) -> String {
 
 // The census.
 
-/// The scope-cardinality census over the live registry. See the module doc.
+/// The scope-cardinality census over the live registry.
 #[must_use]
 pub fn run_scope_census(root: &Path) -> CensusOutcome {
     run_scope_census_over(root, SCOPE_CLAIMS)

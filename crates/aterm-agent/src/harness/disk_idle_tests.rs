@@ -281,6 +281,7 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
         fstype: "apfs".to_owned(),
         local: true,
         automounted: false,
+        removable: false,
         read_only: false,
         container: None,
     });
@@ -957,6 +958,7 @@ fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
             fstype: if local { "ext4" } else { "nfs" }.to_owned(),
             local,
             automounted: false,
+            removable: false,
             read_only: false,
             container: None,
         }],

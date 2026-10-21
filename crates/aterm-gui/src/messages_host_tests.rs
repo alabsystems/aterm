@@ -13,10 +13,9 @@ fn warn(title: &str) -> Message {
 
 use crate::toolchain_words::held_row;
 
-/// A settle this far past a resolve commits the band's quiet shrink:
-/// [`aterm_messages::SHRINK_QUIET`], or the longest echo (a Complete from
-/// an empty fill) when that is later — a quiet shrink waits for every echo
-/// to end (design ruling 415 (b)) — plus a millisecond.
+/// A settle this far past a resolve commits the band's quiet shrink: the later of
+/// [`aterm_messages::SHRINK_QUIET`] and the longest echo (a quiet shrink waits for every
+/// echo to end), plus a millisecond.
 fn quiet_past_echoes() -> std::time::Duration {
     let longest = aterm_messages::animate::echo_span(aterm_messages::EchoKind::Complete, 0, true);
     aterm_messages::SHRINK_QUIET.max(longest) + std::time::Duration::from_millis(1)
@@ -78,10 +77,9 @@ fn the_deadline_is_none_when_idle_and_the_holds_freeze_under_a_handoff() {
     assert!(app.message_band_rows > 1);
 }
 
-/// A shrink pending when a handoff freezes the band is not a wake: only
-/// `commit_rows` takes it, and the freeze skips `commit_rows`, so an
-/// armed shrink would come due and stay due for the whole park → proof
-/// → exec window (the audit's stale-arm finding).
+/// A shrink pending when a handoff freezes the band is not a wake: only `commit_rows`
+/// takes it and the freeze skips `commit_rows`, so an armed shrink would stay due for the
+/// whole park → proof → exec window.
 #[test]
 fn a_frozen_band_never_arms_its_pending_shrink() {
     let mut app = App::headless_for_test();
@@ -131,6 +129,90 @@ fn the_pre_app_inbox_drains_into_the_center_with_its_own_stamp() {
     );
 }
 
+#[test]
+fn finished_workstation_setup_clears_existing_and_queued_exceptions() {
+    let _lane = crate::message_inbox::lane_test_guard();
+    let _ = crate::message_inbox::take_queued();
+    let _ = crate::message_inbox::take_workstation_setup_finished();
+    let mut app = App::headless_for_test();
+    let account = crate::message_reporters::workstation_accounts_entry();
+    let settings = crate::message_reporters::workstation_setup_failure_entry();
+    let other = crate::message_reporters::devtools_entry(atpkg::devtools::Step::Add);
+    app.except(&account);
+    app.except(&settings);
+    app.except(&other);
+    assert!(app.owes_exception(&account.key()));
+    assert!(app.owes_exception(&settings.key()));
+    crate::report_workstation_setup();
+    crate::report_workstation_setup_failure();
+    crate::report_workstation_setup_finished();
+    app.drain_message_inbox();
+    assert!(!app.owes_exception(&account.key()));
+    assert!(!app.owes_exception(&settings.key()));
+    assert!(
+        app.owes_exception(&other.key()),
+        "unrelated privacy entries remain"
+    );
+
+    // Completion must also reach the center when there are no queued messages.
+    app.except(&settings);
+    assert!(app.owes_exception(&settings.key()));
+    crate::report_workstation_setup_finished();
+    app.drain_message_inbox();
+    assert!(!app.owes_exception(&settings.key()));
+}
+
+/// TORN FABRIC STATE FILES ARE A FACT FOR LATER (finding F1): the bridge's
+/// `link set-aside files=<n>`, handed to the store as the fabric's registry
+/// ([`crate::fabric::Registry::torn_state_set_aside`]), is queued on the
+/// endpoint's thread and raised at the next park as ONE exceptions entry
+/// (`fabric.state.torn`, the event family `FabricState`) whose words pass the
+/// rule — never a band row; a later count restates the same entry, never a
+/// second one.
+#[test]
+fn torn_fabric_state_set_aside_is_one_exceptions_entry_at_the_next_park() {
+    use crate::fabric::Registry as _;
+    let _lane = crate::message_inbox::lane_test_guard();
+    let _ = crate::message_inbox::take_queued();
+    let _ = crate::message_inbox::take_queued_exceptions();
+    let mut app = App::headless_for_test();
+    let entry = crate::message_reporters::torn_state_set_aside_entry(3);
+    let key = entry.key();
+    assert_eq!(key, "fabric.state.torn");
+    assert_eq!(
+        entry.family(),
+        aterm_messages::exceptions::Family::FabricState
+    );
+    entry.message().expect("the words pass the rule");
+    let store = crate::session_store::new_store();
+    store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .torn_state_set_aside(3);
+    assert!(!app.owes_exception(&key), "queued, not yet raised");
+    app.drain_message_inbox();
+    assert!(app.owes_exception(&key), "raised at the park");
+    assert_eq!(
+        app.messages.live_rows().count(),
+        0,
+        "a fact for later, never a row on the glass"
+    );
+    store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .torn_state_set_aside(1);
+    app.drain_message_inbox();
+    assert_eq!(
+        app.messages
+            .digest_keys_under("fabric.state.")
+            .iter()
+            .filter(|k| **k == key)
+            .count(),
+        1,
+        "one entry however many cuts"
+    );
+}
+
 /// The start that fell back to the home folder for `dir`, said as
 /// `spawn_session` says it once the shell is up.
 fn fell_back(dir: &str, fault: crate::spawn_folder::Fault) {
@@ -141,12 +223,9 @@ fn fell_back(dir: &str, fault: crate::spawn_folder::Fault) {
     .say();
 }
 
-/// AUDIT #7 FINDING 48 — the folders fresh shells could not start in fold
-/// into ONE row per fault at the park: a restore that meets two gone
-/// folders is one row naming both, a New Tab from a third while that row
-/// is up joins it, a folder that could not be entered is its own row, and
-/// once the person has dismissed a row the next folder is a fresh row
-/// naming only itself.
+/// Folders fresh shells could not start in fold into one row per fault: a restore's two
+/// gone folders are one row, a third joins it while it is up, a folder not entered is
+/// its own row, and after a dismiss the next folder is a fresh row naming only itself.
 #[test]
 fn folders_that_were_not_found_fold_into_one_row_while_it_is_up() {
     use crate::spawn_folder::Fault;
@@ -248,10 +327,8 @@ fn a_config_reload_resolves_the_old_config_rows_then_posts_the_new() {
         .map(|l| l.id)
         .expect("the typo's row");
 
-    // The reload fixed the chord and left the typo: the chord's row is
-    // resolved, and the typo's — the same words — STANDS, untouched: no
-    // resolve, no second post, no second announcement (review
-    // 2026-09-24).
+    // The reload fixed the chord and left the typo: the chord's row is resolved, and
+    // the typo's (the same words) stands untouched: no resolve, no second post.
     let mut reload = ConfigWarnings::default();
     reload.push(
         ConfigFamily::IgnoredKeys,
@@ -276,12 +353,10 @@ fn a_config_reload_resolves_the_old_config_rows_then_posts_the_new() {
     assert_eq!(app.messages.live_rows().count(), 2);
 }
 
-/// A REPEAT GOES TO THE LOG (review 2026-09-24). A reload runs on every
-/// Settings patch, Presence toggle and Serious Mode write, so once the
-/// `Unknown key` row has left the glass — its hold ran out, or it was
-/// read — the next unrelated toggle must not put the same words back and
-/// announce them again: they are a RECORD. A CHANGED problem (a new typo)
-/// raises its row; a FIXED one that comes back later is news again.
+/// A reload runs on every Settings patch, Presence toggle and Serious Mode write, so once
+/// a config row has left the glass (its hold ran out, or it was read) the same words are
+/// a record, not a new row. A changed problem raises its row; a fixed one that comes back
+/// is news again.
 #[test]
 fn a_repeated_config_warning_is_a_record_once_its_row_left_the_glass() {
     use crate::message_reporters::{ConfigFamily, ConfigWarnings};
@@ -323,7 +398,7 @@ fn a_repeated_config_warning_is_a_record_once_its_row_left_the_glass() {
         0,
         "the band wants no row for it"
     );
-    // A CHANGED problem is news: its row is raised.
+    // A changed problem is news: its row is raised.
     app.replace_config_messages(typo(5, "colums"));
     let changed = app.messages.live_by_key(key).expect("a new typo's row");
     assert!(changed.msg.detail.iter().any(|d| d.contains("colums")));
@@ -337,8 +412,8 @@ fn a_repeated_config_warning_is_a_record_once_its_row_left_the_glass() {
         .live_by_key(key)
         .map(|l| l.id)
         .expect("a problem that came back after its fix is raised again");
-    // …and when the row had ALREADY left the glass when the fix landed
-    // (read, then fixed, then broken the same way): news again too.
+    // …and when the row had already left the glass when the fix landed: news again
+    // too.
     assert!(app.messages.mark_seen(again, Instant::now()));
     app.sync_messages();
     app.replace_config_messages(typo(5, "colums"));
@@ -354,12 +429,9 @@ fn a_repeated_config_warning_is_a_record_once_its_row_left_the_glass() {
     );
 }
 
-/// The CONTENT-EQUAL reload re-derives only the two text-read families,
-/// so its replace resolves only those (and the launch load failure a
-/// file that now parses has answered): a still-true keybinding row
-/// survives a comment-only save, where the prefix resolve took it down
-/// and logged it `resolved` for a config that was still broken
-/// (ruling 28).
+/// A content-equal reload re-derives only the two text-read families, so its replace
+/// resolves only those (and the launch load failure, which a file that now parses
+/// answers): a still-true keybinding row survives a comment-only save.
 #[test]
 fn a_content_equal_reload_resolves_only_the_families_it_re_derived() {
     use crate::message_reporters::{
@@ -420,12 +492,9 @@ fn a_content_equal_reload_resolves_only_the_families_it_re_derived() {
     );
 }
 
-/// A CHANGED PROBLEM IS NOT A FIXED ONE (design ruling 266). Two bad
-/// chords with one fixed, or one typo joined by a second, change the
-/// family's words while it is still broken: the old row is SUPERSEDED in
-/// place, and its record keeps its title and its ⚠ — never `Keybinding
-/// fixed` / `Misspelled setting fixed` under a ✓ that left Problems. Only
-/// the reload that takes the family away logs the fix's words.
+/// When a family's words change while it is still broken, the old row is superseded and
+/// its record keeps its title and ⚠, never a `… fixed` title under a ✓. Only the reload
+/// that takes the family away logs the fix's words.
 #[test]
 fn a_config_family_whose_words_changed_is_not_logged_fixed() {
     use crate::message_reporters::{ConfigFamily, ConfigWarnings};
@@ -473,7 +542,7 @@ fn a_config_family_whose_words_changed_is_not_logged_fixed() {
         "the problem stays in Problems, as the new row"
     );
 
-    // The last chord fixed: the family is gone, and now it IS fixed.
+    // The last chord fixed: the family is gone, and now it is fixed.
     app.replace_config_messages(Vec::new());
     assert!(app.messages.live_by_key(key).is_none());
     let rec = app.messages.log().get(one).expect("logged");
@@ -504,11 +573,10 @@ fn a_config_family_whose_words_changed_is_not_logged_fixed() {
     assert!(app.messages.live_by_key(key).is_some());
 }
 
-/// A RETIRED SPELLING IS A RECORD ON EVERY PATH (design ruling 42): the
-/// launch's and every reload's `collect_key_notices` puts
-/// `[packages] auto_update = false` in `ConfigFamily::RetiredKeys`, and the
-/// replace logs it without a row, so a comment-only save never puts it back
-/// on glass. The typo beside it keeps its row.
+/// A retired spelling is a record on every path: `collect_key_notices` puts
+/// `[packages] auto_update = false` in `ConfigFamily::RetiredKeys` and the replace logs it
+/// without a row, so a comment-only save never puts it on glass. The typo beside it keeps
+/// its row.
 #[test]
 fn a_retired_spelling_reaches_the_log_and_never_the_glass() {
     use crate::message_reporters::{ConfigFamily, ConfigWarnings};
@@ -710,7 +778,7 @@ fn a_details_press_marks_the_row_seen_and_folds_a_held_one() {
         app.messages.revision(),
         "…at the center's revision AFTER the fold, so the entry reads as folded"
     );
-    // A STANDING row folds once read too (design §10.4.3 E3, ruling 79).
+    // A standing row folds once read too.
     let standing = app.post_message(
         Message::new(tags::UPDATE, Severity::Warn, "checks failing").hold(Hold::STANDING),
     );
@@ -736,10 +804,8 @@ fn a_details_press_marks_the_row_seen_and_folds_a_held_one() {
     assert!(!app.open_messages_entry(WindowId(77), Some(standing)));
 }
 
-/// A "TO LOOK AT" LINE IN THE MENU lands on ITS entry: the page already
-/// open on another selection moves to the pressed one (a plain route
-/// change left it where it was), and with no frontmost window the first
-/// window shows it rather than the press doing nothing.
+/// A "To look at" menu line lands on its entry: a page open on another selection moves
+/// to it, and with no frontmost window the first window shows it.
 #[test]
 fn a_menu_line_opens_messages_at_its_entry() {
     let mut app = App::headless_for_test();
@@ -1052,16 +1118,10 @@ fn publish_is_rate_limited_and_only_while_settings_exists() {
     assert_eq!(app.messages_published_revision, app.messages.revision());
 }
 
-/// REVIEW PIN (Phase 2, lens B, 2026-09-22): THE MINUTE TICK IS A WAKE
-/// THE LOOP MUST BE ASKED BACK FOR. Design §4.2: the projection
-/// republishes once per 60 s while any Settings view is on the Messages
-/// route so the relative times tick. `publish_native_messages_state_if_due`
-/// honours the tick when the loop happens to run, but `messages_deadline`
-/// folds only the 2 Hz hold-back (`messages_publish_due_at` is `None`
-/// while the center is quiet), so an idle window on the page — no key,
-/// no byte, no pointer — is never woken for it and `3 min ago` stays
-/// `3 min ago`. With a standing row (the center arms nothing of its
-/// own) and a view on the route, the deadline must be the tick.
+/// The projection republishes every 60 s while a Settings view is on the Messages route,
+/// so relative times tick; `messages_deadline` must arm that tick as a wake, or an idle
+/// window on the page is never woken and `3 min ago` stays `3 min ago`. With a standing
+/// row (the center arms nothing) and a view on the route, the deadline is the tick.
 #[test]
 fn the_minute_tick_arms_a_wake_while_a_view_is_on_the_route() {
     use crate::app_native::MESSAGES_PUBLISH_TICK as TICK;
@@ -1090,8 +1150,8 @@ fn the_minute_tick_arms_a_wake_while_a_view_is_on_the_route() {
         Some(published + TICK),
         "the tick must be armed as a wake while a view is on the route"
     );
-    // A page nobody can see — the window occluded, minimized or headless
-    // — arms no tick (audit 2026-09-24); revealed, it arms again.
+    // A page nobody can see (the window occluded, minimized or headless) arms no tick;
+    // revealed, it arms again.
     app.windows.get_mut(&wid).unwrap().occluded = true;
     assert_eq!(app.messages_deadline(), None, "a hidden page is no wake");
     app.windows.get_mut(&wid).unwrap().occluded = false;
@@ -1423,13 +1483,11 @@ fn a_digest_press_whose_page_does_not_open_brings_its_line_back() {
     }
 }
 
-/// `Open log` opens only an absolute, regular file under the log dir —
-/// not a relative path, not a missing file, not a regular file OUTSIDE
-/// the dir, not a `..` that lexically starts under the dir and escapes
-/// it, not the dir itself, and not a SYMLINK planted in the dir (whatever
-/// it points at, inside or out) — and a refusal is a Warn row naming the
-/// path. The validator is pinned against a scratch dir standing in for
-/// the log dir; the real one is asked only for what it must refuse.
+/// `Open log` opens only an absolute regular file under the log dir: not a relative path,
+/// a missing file, a file outside the dir, a `..` that starts under the dir and escapes
+/// it, the dir itself, or a symlink in the dir (wherever it points); a refusal is a row
+/// naming the path. The validator runs against a scratch dir standing in for the log dir;
+/// the real one is asked only what it must refuse.
 #[test]
 fn open_path_external_refuses_paths_outside_the_log_dir_and_symlinks() {
     assert!(!open_path_external("relative/crash.log"));
@@ -1912,9 +1970,8 @@ fn an_answer_folds_a_live_row_no_child_is_latched_behind() {
 }
 
 #[cfg(unix)]
-/// A parked outgoing handoff — the PARENT's half of the freeze predicate
-/// — with nothing live behind it (the `app_update_handoff` tests' own
-/// fixture, `parked_record`).
+/// A parked outgoing handoff (the parent's half of the freeze predicate) with nothing live
+/// behind it, like the handoff tests' `parked_record`.
 pub(crate) fn parked() -> crate::PendingUpdateHandoff {
     let (cancel, _cancelled) = std::sync::mpsc::sync_channel(1);
     crate::PendingUpdateHandoff {
@@ -1974,13 +2031,10 @@ pub(super) fn window_carry(
 }
 
 #[cfg(unix)]
-/// THE PARENT'S RECORD IS ITS OWN TO THE END (design §3.7, revised on
-/// review 2026-09-22), in PRODUCTION ORDER: the manifest captures the
-/// carry, THEN the attempt parks (`app_update_handoff`, both sites). A
-/// row posted under the park drains to the writer at once while its
-/// hold waits; the flush the parent runs before it execs lands it on
-/// disk; the carry ships rows, never lines. The SUCCESSOR's drain is the
-/// one that waits — until Commit — so a refused successor wrote nothing.
+/// In production order (the manifest captures the carry, then the attempt parks): a row
+/// posted under the park drains to the writer at once while its hold waits, the flush the
+/// parent runs before it execs lands it on disk, and the carry ships rows, never lines.
+/// The successor's drain waits until Commit, so a refused successor writes nothing.
 #[test]
 fn the_parents_record_is_its_own_to_the_end_and_the_successors_waits_for_commit() {
     let dir = std::env::temp_dir().join(format!("aterm-messages-freeze-{}", std::process::id()));
@@ -2031,7 +2085,7 @@ fn the_parents_record_is_its_own_to_the_end_and_the_successors_waits_for_commit(
     assert!(lines[1].contains("during the park"), "{}", lines[1]);
     drop(app.messages_log.take());
 
-    // THE SUCCESSOR before Commit: its lines wait; Commit drains them.
+    // The successor before Commit: its lines wait; Commit drains them.
     let successor_path = dir.join("successor.log");
     let mut successor = App::headless_for_test();
     successor.messages_log = crate::messages_store::Writer::spawn(&successor_path);
@@ -2072,7 +2126,7 @@ fn a_handoff_carries_live_rows() {
     parent.pending_update_handoff = Some(parked());
     let carry = window_carry(parent.message_band_rows, parent.carried_messages());
 
-    // THE SUCCESSOR, before Commit.
+    // The successor, before Commit.
     let mut successor = App::headless_for_test();
     successor.incoming_handoff_pending = true;
     successor.message_band_rows = carry.status_bar_rows.min(MAX_ROWS);
@@ -2127,9 +2181,9 @@ fn a_handoff_carries_live_rows() {
             .is_none()
     );
 
-    // An OLDER parent's `bars` (the status bars' carry, read until Phase 6):
-    // the manifest still decodes — serde skips the key — and seeds nothing,
-    // so the successor's own reporters say those lanes at Commit.
+    // An older parent's `bars` (the status bars' carry): the manifest still decodes
+    // (serde skips the key) and seeds nothing; the successor's own reporters say those
+    // lanes at Commit.
     let old: crate::session_store::WindowCarry = aterm_toml::from_str(
         "rows = 24\ncols = 80\nstatus_bar_rows = 1\n\n[[bars]]\nlane = \"toolchain\"\n\
          glyph = \"!\"\ntitle = \"ALab toolchain\"\ndetail = \"\"\ntone = \"warn\"\n\
@@ -2155,13 +2209,10 @@ fn a_handoff_carries_live_rows() {
 }
 
 #[cfg(unix)]
-/// THE PARKED PARENT'S BAND IS RESERVED BEFORE THE SEED (design ruling
-/// 415 (d)): the successor's boot ring holds ANOTHER writer's record under
-/// the number of a row the parent carries. The seed moves that record to a
-/// fresh id, and that id is above the band the parked parent keeps minting
-/// in (`PARKED_PARENT_ID_RESERVE`) — never the parent's own next id, which
-/// the parent hands to its next record before Commit. Reserving after the
-/// seed (the order before round 43) put the squatter at `next_message_id`.
+/// The parked parent's id band is reserved before the seed: when the successor's boot
+/// ring holds another writer's record under a carried row's number, the seed moves that
+/// record to a fresh id above the band the parked parent keeps minting in
+/// (`PARKED_PARENT_ID_RESERVE`), never the parent's own next id.
 #[test]
 fn a_record_the_seed_moves_off_a_carried_id_lands_above_the_parked_band() {
     let mut parent = App::headless_for_test();
@@ -2212,12 +2263,10 @@ fn a_record_the_seed_moves_off_a_carried_id_lands_above_the_parked_band() {
 }
 
 #[cfg(unix)]
-/// THE LANDING ANSWERS THE APPLY LANE'S LAST OUTCOME (round-seven update
-/// audit, finding 30): "Update waits for you" (the automatic lane blocked,
-/// then retried) and "Couldn't install aterm vX · Install now" (pressed,
-/// and it landed) are carried on glass across the handoff that installed
-/// the build; the successor's landing takes them down rather than
-/// re-arming a fresh 45 s hold beside "Updated to aterm vX".
+/// The landing answers the apply lane's last outcome: "Update waits for you" and
+/// "Couldn't install aterm vX · Install now", carried on glass across the handoff that
+/// installed the build, come down at the successor's landing rather than re-arming a
+/// fresh hold beside "Updated to aterm vX".
 #[test]
 fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
     for outcome in [
@@ -2327,20 +2376,10 @@ fn successor_beat(checks: u64, deferrals: u64) -> aterm_update::checker_watch::C
 }
 
 #[cfg(unix)]
-/// ROUND-EIGHT UPDATE AUDIT, FINDING 15 (the finding's own test) — A
-/// CARRIED STALL THAT NEVER HEALED DOES NOT SILENCE THE SUCCESSOR'S OWN
-/// WATCHDOG. The parent's checker stalled holding the check lane, so its
-/// replacement could never check and the warning never healed; its row
-/// folded, and a build staged before the stall landed on the automatic
-/// lane. Round 44 latched every carried kind the landing does not answer,
-/// and the successor had no proof that lifts a latched stall (an
-/// up-to-date check is no progress, and its watchdog had announced
-/// nothing): when its OWN fresh checker stalled, hours later, that was
-/// "already said this launch" — a log line, no row — and nothing healed it
-/// after. The carried stall is now the successor's watchdog's to heal, never
-/// a latch: its own stall is said, with its row, and its first completed
-/// check heals it. NEGATIVE CONTROL: a successor that carried nothing says
-/// its stall the same way.
+/// A carried stall that never healed (the parent's checker stalled holding the check lane,
+/// its row folded, then an automatic landing) is the successor's watchdog's to heal, never
+/// a latch: the successor's own later stall is said with its row, and its first completed
+/// check heals it. Control: a successor that carried nothing says its stall the same way.
 #[test]
 fn a_carried_unhealed_stall_never_silences_the_successors_own_watchdog() {
     use crate::update_checker_watch::CheckerStall;
@@ -2497,13 +2536,9 @@ fn a_carried_check_warning_heals_by_the_successors_first_healthy_check() {
 }
 
 #[cfg(unix)]
-/// A CARRIED WARNING'S "TO LOOK AT" LINE SAYS WHAT ITS PARENT'S WOULD HAVE:
-/// "failing since Sep 14" and the updater's sentence, its cause. The
-/// successor claimed it from the row's first line alone (`since Sep 14`,
-/// all the carry held), so the line said when and never why. Both seamless
-/// lanes, and the cold lane's carry through its wire. NEGATIVE CONTROL: a
-/// parent older than the sentence's carry hands the excerpt alone, and the
-/// line, still owed, says no more than that.
+/// A carried warning's "To look at" line says what its parent's would have (when and
+/// why), on both seamless lanes and the cold lane. Control: a parent older than the
+/// sentence's carry hands the excerpt alone.
 #[test]
 fn a_carried_warnings_digest_line_says_what_the_parents_would_have() {
     let check = update_words::HealthKind::Check;
@@ -2636,18 +2671,11 @@ fn a_carried_lock_held_warning_is_the_successors_watchdog_to_heal() {
 }
 
 #[cfg(unix)]
-/// ROUND-SEVEN UPDATE AUDIT, GROUP RL (the review of the take-up) — ONLY A
-/// WARNING THE LEDGER RAISED IS THE SUCCESSOR'S UPDATER'S TO HEAL. The window
-/// reads a title it does not know as the check kind, and the strand notice
-/// ("aterm is not updating on this machine", a channel this Mac cannot read)
-/// is one: deliberately no ledger failure. Adopted as `manifest`, the
-/// successor's first cycle found the ledger not failing — it never was — and
-/// sent the check class's recovery: the strand's row came down and "aterm
-/// updates work again" went on record over a machine still stranded. It is
-/// now only remembered, with nothing handed to the updater; the successor
-/// says its own strand once, as every process does, in one row.
-/// CONTROLS: an older build's words for the check class are still a ledger
-/// class, and adopted; a title this build does not know is not.
+/// Only a warning the ledger raised is the successor's updater's to heal: the strand
+/// notice reads as the check kind but is no ledger failure, so it is only remembered (an
+/// adopted class would heal it over a machine still stranded) and the successor says its
+/// own strand in one row. Controls: an older build's words for a ledger class are adopted;
+/// a title this build does not know is not.
 #[test]
 fn a_carried_strand_notice_is_not_the_updaters_to_heal() {
     let check = update_words::HealthKind::Check;
@@ -2677,7 +2705,7 @@ fn a_carried_strand_notice_is_not_the_updaters_to_heal() {
             "no healing on record while the machine is stranded (automatic: {automatic})"
         );
     }
-    // CONTROLS: the words decide, not the kind they are read as.
+    // Controls: the words decide, not the kind they are read as.
     for (title, handed) in [
         ("aterm can't check for updates", vec!["manifest"]),
         ("Couldn't download updates", vec!["pipeline"]),
@@ -2692,16 +2720,10 @@ fn a_carried_strand_notice_is_not_the_updaters_to_heal() {
 }
 
 #[cfg(unix)]
-/// ROUND-EIGHT UPDATE AUDIT, FINDING 79 — A COLD-LANE LANDING RECORDS THE
-/// HEALING OF THE PARENT'S INSTALL WARNING. The parent had said "Couldn't
-/// install updates", then left with no terminal open: the cold lane `exec`s,
-/// and its successor started with no memory of the warning — the window
-/// carry is the seamless lanes' — so its landing recorded no healing and
-/// Settings ▸ Messages kept the warning as the install lane's last word.
-/// What the parent's warnings said now crosses the `exec`
-/// (`bind_cold_lane_health_said`), and the successor takes it up before its
-/// landing. NEGATIVE CONTROL: the same landing with nothing carried records
-/// nothing; a value that does not parse is nothing.
+/// The cold lane carries what the parent's warnings said across its `exec`
+/// (`bind_cold_lane_health_said`), so the successor's landing records the healing of the
+/// parent's install warning. Control: nothing carried, or a value that does not parse,
+/// records nothing.
 #[test]
 fn a_cold_lane_landing_records_the_healing_of_the_parents_install_warning() {
     let body = "3 failed attempts to install in a row since 2026-09-24T01:00:00Z: why.";
@@ -2746,21 +2768,17 @@ fn a_cold_lane_landing_records_the_healing_of_the_parents_install_warning() {
     );
 }
 
-/// The Commit flush in the park tests, whose subject is what the successor
-/// reads once the parent's lines have landed, never how fast they land:
-/// a hang detector. Under the production 250 ms
-/// (`MESSAGES_FLUSH_COMMIT_WAIT`) the writer was starved past it at load
-/// 110-140 in 2 of 3 full `aterm-gui` runs (2026-09-30).
+/// The Commit flush in the park tests: their subject is what the successor reads once the
+/// parent's lines have landed, not how fast they land, so the wait is a hang detector, not
+/// the production `MESSAGES_FLUSH_COMMIT_WAIT` (250 ms), which a starved writer can miss
+/// under load.
 #[cfg(unix)]
 const COMMIT_FLUSH_IN_TESTS: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 #[cfg(unix)]
-/// THE LATE-PARK SUCCESSOR SEES WHAT ITS PARENT WROTE AFTER ITS BOOT
-/// (round-seven update audit, finding 41): the successor loads the file at
-/// its boot and its parent keeps recording until Commit. After Commit the
-/// successor reads the file again — the parent flushed its last line
-/// first — so a row the parent resolved after the boot is Resolved in its
-/// history, never Stale, and a record written after the boot is there.
+/// The successor re-reads the file after Commit, so a row the parent resolved after the
+/// successor's boot is Resolved in its history (never Stale) and a record written after
+/// the boot is there.
 #[test]
 fn a_late_park_successor_sees_the_parents_records_written_after_its_boot() {
     let dir = std::env::temp_dir().join(format!("aterm-messages-late-park-{}", std::process::id()));
@@ -2821,21 +2839,9 @@ fn a_late_park_successor_sees_the_parents_records_written_after_its_boot() {
 }
 
 #[cfg(unix)]
-/// Round eight of the update audit, lead U62 (r8d #761): THE PARKED PARENT'S
-/// ENDINGS HOLD IN THE SUCCESSOR. Rows cross only in the carry captured at the
-/// park, and the parent's event loop runs on until Commit: a reporter's
-/// resolve, a heal, a person's press there ended a row the carry still held
-/// live. The successor kept every carried row live at Commit (the file's
-/// ending notwithstanding), re-armed its full hold, and a healed warning came
-/// back, healed a second time on the successor's own proof. A carried row
-/// still in its carried words that the parent ended meanwhile ends here
-/// WITHOUT a second log line, as a digest entry the parent filed already did,
-/// and a health warning the parent healed is no longer this process's to heal.
-///
-/// NEGATIVE CONTROL: a carried row the parent left open stays live (the
-/// engine's own test, `adversarial`'s
-/// `a_carried_row_the_parent_ended_after_the_capture_ends_in_the_successor`,
-/// keeps a fold on the parent's glass and a row restated here live too).
+/// A carried row the parked parent ended after the capture stays ended in the successor,
+/// with no second log line, and a warning it healed is no longer this process's to heal.
+/// Control: a row nobody ended stays live.
 #[test]
 fn a_row_the_parked_parent_ended_after_the_capture_stays_ended() {
     let ids = std::cell::Cell::new(None);
@@ -2875,16 +2881,9 @@ fn a_row_the_parked_parent_ended_after_the_capture_stays_ended() {
 }
 
 #[cfg(unix)]
-/// The review of round eight's lead U62 (r8d #761): ONLY A HEAL HAS PUT A
-/// HEALING ON RECORD. The successor ends a carried health warning the parked
-/// parent ended in any of four ways, and it used to forget what the warning
-/// said and its latch for every one of them. A person's ✕ in the parent ends
-/// the row and records no healing — the parent keeps what it said — so the
-/// successor that forgot it recorded no healing when the failure later
-/// healed. The row still ends; what it said and its day's entry stay, and
-/// its healing is recorded once, by the proof here. CONTROL: a heal in the
-/// parent puts the healing on record and leaves the successor nothing to
-/// record, as the test above and the one below pin.
+/// A warning the parked parent dismissed stays dismissed in the successor, but a
+/// dismissal records no healing: what it said and its day's entry stay, and the proof
+/// here records its healing once.
 #[test]
 fn a_health_warning_the_parked_parent_dismissed_is_still_healed_on_record() {
     let (mut successor, dir) = committed_after_park(
@@ -2922,12 +2921,10 @@ fn a_health_warning_the_parked_parent_dismissed_is_still_healed_on_record() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The parent of a seamless update, writing `messages.log` in a scratch
-/// folder named for `name`: it does `raise`, the park captures its carry, it
-/// does `while_parked` (its loop runs on until Commit) and flushes and
-/// `_exit`s; its successor seeds that carry and commits, reading the file
-/// again. Returns the committed successor, its writer still open, and the
-/// folder.
+/// A seamless parent writing `messages.log` in a scratch folder named for `name`: it does
+/// `raise`, parks (capturing its carry), does `while_parked`, flushes and exits; its
+/// successor seeds the carry and commits, re-reading the file. Returns the successor
+/// (writer open) and the folder.
 #[cfg(unix)]
 fn committed_after_park(
     name: &str,
@@ -2978,23 +2975,10 @@ fn healing_count(app: &App) -> usize {
 }
 
 #[cfg(unix)]
-/// The second review of round eight's lead U62 (r8d #761): A HEALING THE
-/// PARKED PARENT RECORDED IS ON RECORD ONCE, WHATEVER ITS ROW DID. The
-/// parent records a healing from what the warning said, not from its row:
-/// a heal there with no live row still records it. The successor decided by
-/// how the row ended, and two ways recorded it twice — a person's ✕ on the
-/// warning before the heal (the first review's own regression: a dismissed
-/// row kept the memory), and a warning that had folded off the glass before
-/// the park, the usual state 45 s after it was said (no carried row at
-/// all). The successor now reads the parent's record of the healing in the
-/// file: what the warning said, its latch and its day's entry leave, and
-/// its own proof records nothing more. A DOWNLOAD warning the parent's check
-/// did not answer stays, healed on record here by its own proof.
-///
-/// And no row of the healed warning stands after Commit (the U5 group's
-/// review): `a_kind_the_parked_parent_healed_leaves_no_row_whatever_the_file_says_of_it`
-/// and `a_healed_warning_s_row_ends_though_another_writer_took_its_number`
-/// are the arms where its ending in the file does not end it.
+/// A healing the parked parent recorded is on record once, whatever its row did
+/// (dismissed in the park, or folded before it): the successor reads the healing in the
+/// file and drops what the warning said, its latch and its day's entry. A download
+/// warning the parent did not heal stays for the proof here.
 #[test]
 fn a_healing_the_parked_parent_recorded_is_on_record_once_whatever_its_row_did() {
     for (name, before_park, in_park) in [
@@ -3069,8 +3053,7 @@ fn a_healing_the_parked_parent_recorded_is_on_record_once_whatever_its_row_did()
             1,
             "{name}: the successor's own proof records no second healing"
         );
-        // CONTROL: the kind the parent's check did not answer is still this
-        // process's.
+        // Control: the kind the parent's check did not answer is still this process's.
         assert!(
             successor
                 .update_health_said
@@ -3090,12 +3073,9 @@ fn a_healing_the_parked_parent_recorded_is_on_record_once_whatever_its_row_did()
 }
 
 #[cfg(unix)]
-/// NEGATIVE CONTROL for the record the successor reads: only a healing
-/// the parked parent wrote AFTER the capture (at or above the carry's next
-/// id) answers a carried warning. A parent whose failure healed and then
-/// came back in the very same words carries the second episode, and the
-/// first episode's healing, below the carry's next id, is not its healing:
-/// the second is recorded here, by the proof that answers it.
+/// Control: only a healing the parked parent wrote after the capture (at or above the
+/// carry's next id) answers a carried warning; an earlier episode's healing in the same
+/// words does not.
 #[test]
 fn an_earlier_healing_in_the_same_words_does_not_answer_a_carried_warning() {
     let (mut successor, dir) = committed_after_park(
@@ -3130,18 +3110,9 @@ fn an_earlier_healing_in_the_same_words_does_not_answer_a_carried_warning() {
 }
 
 #[cfg(unix)]
-/// A KIND THE PARKED PARENT HEALED LEAVES NO ROW HERE, WHATEVER THE FILE
-/// SAYS OF ITS ROW (round eight, the U5 group's review of lead U62). The
-/// successor ends a carried row by the parent's ending of it in the file,
-/// and only by the four endings that are verdicts on the row
-/// (`end_carried_rows_the_parent_ended`); a healing the parent recorded is
-/// read apart from that, as the healing it is. So a carried warning whose
-/// row's ending the file does not give (here: none at all, the healer's
-/// file holding only its own row and its healing) stood live with the
-/// memory behind it gone, and came back on glass with a fresh hold at
-/// Commit, healed — though the doc said the forgetting heals "as
-/// `heal_update_health_where` does, less the record", which resolves every
-/// live row of the kind. RED before the fix: the row stood.
+/// A carried warning of a kind the parked parent healed ends with its memory, even when
+/// the file gives no ending for its row (`end_carried_rows_the_parent_ended` ends rows
+/// only by the four verdicts on the row).
 #[test]
 fn a_kind_the_parked_parent_healed_leaves_no_row_whatever_the_file_says_of_it() {
     let mut parent = App::headless_for_test();
@@ -3189,15 +3160,9 @@ fn a_kind_the_parked_parent_healed_leaves_no_row_whatever_the_file_says_of_it() 
 }
 
 #[cfg(unix)]
-/// A HEALED WARNING'S ROW ENDS THOUGH ANOTHER WRITER TOOK ITS NUMBER (round
-/// eight, the U5 group's review of lead U62). A window sharing
-/// `messages.log` posted under the very number the parent's warning row then
-/// took; the parent healed that warning in the park, its row live, which
-/// resolved the row. The file loads the other window's record under the
-/// number and the parent's under a fresh id, so the successor, reading the
-/// row's ending by the number alone, met the other record, kept the carried
-/// row live, and put the healed "Couldn't check for updates" back on glass
-/// at Commit. RED before the fix.
+/// A healed warning's row ends though another window took its number first: the file
+/// loads the parent's record under a fresh id, so the row's ending is not read by the
+/// number alone.
 #[test]
 fn a_healed_warning_s_row_ends_though_another_writer_took_its_number() {
     let name = "parked-collided-heal";
@@ -3238,26 +3203,10 @@ fn a_healed_warning_s_row_ends_though_another_writer_took_its_number() {
 }
 
 #[cfg(unix)]
-/// ANOTHER WINDOW'S HEALING IS NOT THE PARKED PARENT'S (round eight, the U5
-/// group's review of lead U62). Every aterm of the user appends to one
-/// `messages.log`, each minting ids from its own counter. Here a second
-/// window, W2, said the same check warning (the same words: `since` is a
-/// day) and healed it; the parent's own episode of it is still failing, is
-/// carried, and is not healed in the park. The successor must still hold it
-/// and still owe its day's entry. Before, any record in the healing's words
-/// at an id at or above the carry's next id was taken for the parent's, and
-/// three of W2's passed that:
-///
-/// * `w2-above-band-before`: W2's counter runs far above the parent's (it
-///   launched later), and it healed before the capture;
-/// * `w2-above-band-in-park`: the same, healed while the parent was parked
-///   (after the capture): only the parent's id band tells it apart;
-/// * `w2-in-band-before`: W2's healing took the very number the parent
-///   would mint next, before the capture: only the capture's stamp tells it
-///   apart.
-///
-/// RED before the fix on every arm: the warning, its latch and its day's
-/// entry were dropped while it still failed (L5).
+/// Another window's healing in the same words is not the parked parent's: every aterm
+/// appends to one `messages.log` with its own id counter, so W2's healing is told apart by
+/// the parent's id band (W2 far above it) or by the capture's stamp (W2 on the parent's
+/// next number), and the parent's still-failing warning stays this process's to heal.
 #[test]
 fn another_writers_healing_in_the_same_words_is_not_the_parked_parents() {
     for (name, w2_above_band, in_park) in [
@@ -3341,14 +3290,10 @@ fn another_writers_healing_in_the_same_words_is_not_the_parked_parents() {
 }
 
 #[cfg(unix)]
-/// NO ID IS HANDED OUT TWICE ACROSS THE PARK (round-seven update audit,
-/// finding 18, as reviewed): the carry's next id is taken at the park, and
-/// the parked parent still records — an `appnotice`, a harness note — while
-/// the successor records before Commit and at it ("Updated to aterm vX").
-/// A reader that followed the parent to its last id K reads `since=K` from
-/// the successor after Commit and sees every record the successor made;
-/// the parent's parked records are in the successor's history, merged at
-/// Commit before the landing; and messages.log names each id once.
+/// No id is handed out twice across the park: the parked parent records on past the
+/// carry's next id while the successor records before and at Commit; a `since=` reader
+/// past the parent's last id sees every successor record, and messages.log names each
+/// id once.
 #[test]
 fn a_record_the_parked_parent_makes_never_shares_an_id_with_the_successor() {
     let dir = std::env::temp_dir().join(format!("aterm-messages-park-ids-{}", std::process::id()));
@@ -3475,10 +3420,9 @@ fn a_notice_while_parked_is_refused_for_a_retry_and_mints_nothing() {
 }
 
 #[cfg(unix)]
-/// A ROW ABOUT THE OLD PROCESS LEAVES WITH IT (round-seven update audit,
-/// finding 42): "Screen reader access lost · restart aterm to retry" is
-/// answered by the successor, a new process with its own publisher, so a
-/// carried one never stands (Standing) over access that works.
+/// A row about the old process leaves with it: "Screen reader access lost · restart aterm
+/// to retry" is answered by the successor, a new process with its own publisher, so a
+/// carried one never stands over access that works.
 #[test]
 fn a_carried_dead_publisher_row_leaves_with_the_process_it_described() {
     let mut parent = App::headless_for_test();
@@ -3513,12 +3457,10 @@ fn a_carried_dead_publisher_row_leaves_with_the_process_it_described() {
 }
 
 #[cfg(unix)]
-/// AN INTENT ONLY THE OLD PROCESS COULD PERFORM DOES NOT CROSS (ruling 265 /
-/// 417 (j), 441 (w)): the keeper's recovery row carried across a seamless
-/// update lands in a successor that reattached no shells itself
-/// (`keeper_recovered` is empty), where `End sessions` would end nothing and
-/// the page would say the running sessions "had already ended". The row
-/// keeps its words; a successor that did reattach keeps the press.
+/// An intent only the old process could perform does not cross: the keeper's recovery row
+/// carried into a successor that reattached no shells itself (`keeper_recovered` empty)
+/// keeps its words but not `End sessions`, which would end nothing; a successor that did
+/// reattach keeps the press.
 #[test]
 fn a_carried_recovery_row_offers_no_end_sessions_that_ends_nothing() {
     let mut parent = App::headless_for_test();
@@ -3618,9 +3560,8 @@ fn a_queued_carried_row_converges_on_the_centers_count_at_commit() {
 
 // ---- Attention and motion (design §10.5, §10.8, §10.12) --------------
 
-/// A LIGHT routine read: the same pass as [`net_read`] with a plan far
-/// under [`toolchain_words::HEAVY_PASS_BYTES`] — the pass that paints
-/// nothing.
+/// A light routine read: [`net_read`]'s pass with a plan far under
+/// [`toolchain_words::HEAVY_PASS_BYTES`], the pass that paints nothing.
 fn light_read(running: bool, started: u64) -> crate::PkgProgressSnapshot {
     let mut snap = net_read(running, started);
     snap.file.overall.bytes_done = 12_000_000;
@@ -3699,9 +3640,9 @@ fn an_automatic_update_costs_no_regrid_and_a_persons_at_most_two() {
     }
 }
 
-/// A download nobody is waiting on that FAILS is a record in the flow's
-/// words, the version its report did not carry kept from the quiet
-/// download (design ruling 220): no row came, so no echo goes.
+/// A download nobody is waiting on that fails is a record in the flow's words, with the
+/// version its report did not carry kept from the quiet download: no row came, so no
+/// echo goes.
 #[test]
 fn an_automatic_download_that_fails_is_a_record_with_its_version() {
     let mut app = App::headless_for_test();
@@ -3725,13 +3666,9 @@ fn an_automatic_download_that_fails_is_a_record_with_its_version() {
     );
 }
 
-/// A RATE-LIMITED DOWNLOAD DID NOT FAIL (review 2026-09-24): a GitHub
-/// rate limit (`Progress::Deferred`) heals by itself and retries on the
-/// next check, so the revealed download row leaves with no outcome to
-/// claim — a fade, never `⚠ failed` — and the deferral is a record. Nor
-/// did a release WITHHELD while it downloaded (round eight #72: its signer
-/// revoked, a yank, a quarantine). A real failure still ends in its Fault
-/// echo.
+/// A rate limit (`Progress::Deferred`) or a release withheld mid-download is no failure:
+/// the revealed download row fades (no `⚠ failed`) and the deferral is a record. A real
+/// failure still ends in its Fault echo.
 #[test]
 fn a_deferred_download_fades_and_a_failed_one_faults() {
     for (progress, kind) in [
@@ -3757,7 +3694,7 @@ fn a_deferred_download_fades_and_a_failed_one_faults() {
         ),
     ] {
         let mut app = App::headless_for_test();
-        // A person's check: its download has the row (design ruling 220).
+        // A person's check: its download has the row.
         app.note_update_check_asked(true);
         app.note_update_progress(&aterm_update::Progress::Downloading {
             version: "9.9.9".into(),
@@ -3776,8 +3713,8 @@ fn a_deferred_download_fades_and_a_failed_one_faults() {
     }
 }
 
-/// THE LANDING (design §10.5 H4): the live Finishing row is resolved
-/// `Ok` — its Complete echo plays — and the good news is a record.
+/// The landing resolves the live Finishing row `Ok` (its Complete echo plays), and the
+/// good news is a record.
 #[test]
 fn the_landing_resolves_the_finishing_row_and_records_the_words() {
     let mut app = App::headless_for_test();
@@ -3815,8 +3752,8 @@ fn the_landing_resolves_the_finishing_row_and_records_the_words() {
     assert_eq!(landed.retired(), Some(&Retired::Recorded));
 }
 
-/// A NAVIGATION press that took the person to fix the thing READ the row
-/// (design §10.5 H6): a held row folds; a live row stays.
+/// A navigation press that took the person to fix the thing read the row: a held row
+/// folds; a live row stays.
 #[test]
 fn a_navigation_press_folds_a_held_row() {
     let mut app = App::headless_for_test();
@@ -3839,9 +3776,8 @@ fn a_navigation_press_folds_a_held_row() {
     assert!(app.messages.live(live).is_some(), "work in flight stays");
 }
 
-/// A REFUSED INSTALL (design §10.2 #7): the Installing row an explicit
-/// apply added resolves `Warn` — a refusal is not a delivery — and its
-/// indicator ends in the Fault echo.
+/// A refused install: the Installing row an explicit apply added resolves `Warn` (a
+/// refusal is not a delivery) and its indicator ends in the Fault echo.
 #[test]
 fn a_refused_install_resolves_warn_and_echoes_fault() {
     let mut app = App::headless_for_test();
@@ -3958,7 +3894,7 @@ fn a_persons_check_takes_its_row_after_the_grace_and_ends_in_its_words() {
     let mut t = past_the_grace();
     app.settle_messages(t);
     assert_eq!(app.message_band_rows, 1, "the wait lasted: revealed");
-    // The plan lands: a LIGHT pass paints, because a person waits.
+    // The plan lands: a light pass paints, because a person waits.
     app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
     let live = app.messages.live_rows().next().expect("restated");
     assert_eq!(app.messages.live_rows().count(), 1, "in place");
@@ -4068,11 +4004,10 @@ fn a_queued_check_drops_the_holders_frame_when_the_holder_ends() {
     assert_eq!(run(&mut planned, true), "ALab tools updated");
 }
 
-/// A PERSON'S INSTALL (ruling 225): the minutes-long ~3 GB wait Settings
-/// starts shows the size once atpkg announces it (`10 programs · ~3 GB`),
-/// then the plan's fill under the install's own title, and a failed one
-/// ends in a Fault echo (the page says why; the Packages badge and the
-/// record keep it). A Remove is busy with the disk as its load.
+/// A person's install (the minutes-long ~3 GB wait Settings starts) shows the size once
+/// atpkg announces it (`10 programs · ~3 GB`), then the plan's fill under the install's
+/// own title; a failed one ends in a Fault echo (the page, the Packages badge and the
+/// record say why). A Remove is busy with the disk as its load.
 #[test]
 fn a_persons_install_and_remove_take_their_rows() {
     use crate::message_reporters::{Attention, PackagesVerb, attention};
@@ -4114,7 +4049,7 @@ fn a_persons_install_and_remove_take_their_rows() {
     assert_eq!(rm.messages.live_rows().count(), 0);
 }
 
-/// A person's Check behind a FIRST RUN: the lane's latched row keeps
+/// A person's Check behind a first run: the lane's latched row keeps
 /// showing the install they wait behind, the person's end leaves it to the
 /// lane, and the lane's exit ends it and puts the person's row back (after
 /// the grace) if their verb still runs.
@@ -4132,9 +4067,8 @@ fn a_check_behind_a_first_run_leaves_the_first_run_its_row() {
             .map(|l| l.msg.title.clone())
     };
     assert_eq!(title(&app).as_deref(), Some("Installing ALab tools"));
-    // The person's own tailer follows the same file (`first_run` false):
-    // the lane's tailer paints the first run, in the first run's words
-    // (ruling 229) — no turn-about with `Updating`, and its echo is not
+    // The person's own tailer follows the same file (`first_run` false): the lane's tailer
+    // paints the first run in the first run's words, never `Updating`, and its echo is not
     // the Check's `ALab tools updated`.
     let mut later = net_read(true, 1_700_000_000);
     later.file.overall.bytes_done += 1_000_000;
@@ -4228,7 +4162,7 @@ fn a_first_run_that_ends_short_leaves_a_failure_row() {
         "a clean exit raises nothing"
     );
 
-    // A heavy ROUTINE pass that fails: the record only.
+    // A heavy routine pass that fails: the record only.
     let mut heavy = App::headless_for_test();
     let mut read = net_read(true, 1_700_000_000);
     read.file.overall.bytes_total = toolchain_words::HEAVY_PASS_BYTES * 2;
@@ -4247,8 +4181,8 @@ fn a_first_run_that_ends_short_leaves_a_failure_row() {
     assert!(failure_rows(&idle).is_empty());
 }
 
-/// A headless App with its first window put ON SCREEN (the test seam for
-/// a real OS window) and focused — the one place the band moves.
+/// A headless App with its first window put on screen (the test seam for a real OS
+/// window) and focused: the one place the band moves.
 fn on_screen_app() -> App {
     let mut app = App::headless_for_test();
     let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
@@ -4290,7 +4224,7 @@ fn a_frame_drawn_in_another_look_is_due_at_once() {
 }
 
 // -----------------------------------------------------------------------
-// The update lane on the band (the ux/status-reporting merge, 2026-09-23).
+// The update lane on the band.
 // -----------------------------------------------------------------------
 
 fn download(version: &str) -> aterm_update::Progress {
@@ -4488,12 +4422,9 @@ fn an_update_flow_costs_one_grow_and_one_shrink() {
     assert_eq!(message_regrids(), regrids + 2, "and one shrink");
 }
 
-/// UNSAVED EDITOR WORK HOLDING THE INSTALL IS A ROW OF ITS OWN: the one
-/// blocker only the person can clear, painted (ruling 77) — the automatic
-/// lane raises no row of its own to carry it (the owner's silent path,
-/// 2026-09-24). Where the lane retries by itself the row STANDS (round eight,
-/// lead U38: the wait has no deadline, and the overdue notice is off while it
-/// holds); a press nothing retries keeps the transient outcome row.
+/// Unsaved editor work holding the install is a row of its own, painted: the one blocker
+/// only the person can clear. Where the lane retries by itself the row stands (the wait
+/// has no deadline); a press nothing retries keeps the transient outcome row.
 #[test]
 fn an_editor_holding_the_install_is_a_row_of_its_own() {
     let mut app = App::headless_for_test();
@@ -4548,17 +4479,15 @@ fn an_editor_holding_the_install_is_a_row_of_its_own() {
     );
 }
 
-/// A HELD UPDATE ROW REPLACED BY A NEWER ONE IS RESOLVED ON RECORD (main's
-/// rule, kept by ruling 143): one outcome row replaced by another leaves a
-/// finished activity on `appstatus` — a superseded row would record
-/// nothing. A failed download is a record of its own (a self-retry), and
-/// the live download row it ends is resolved `Warn`, on record too.
+/// A held update row replaced by a newer one is resolved on record: one outcome row
+/// replaced by another leaves a finished activity on `appstatus` (a superseded row would
+/// record nothing). A failed download is a record of its own (a self-retry), and the live
+/// download row it ends is resolved `Warn`, on record too.
 #[test]
 fn a_held_update_row_replaced_by_a_newer_one_is_resolved_on_record() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
-    // A person asked (Check for Updates): the download is their wait
-    // and takes the row (design ruling 220).
+    // A person asked (Check for Updates): the download is their wait and takes the row.
     app.note_update_check_asked(true);
     app.note_update_progress(&download("9.9.9"));
     app.note_update_progress(&aterm_update::Progress::Failed {
@@ -4588,13 +4517,13 @@ fn a_held_update_row_replaced_by_a_newer_one_is_resolved_on_record() {
     );
 }
 
-/// THE LANDING IS ON RECORD WITH HOW LONG THE UPDATE TOOK — from THIS
-/// build's finished download, carried across the handoff; never for a build
-/// met already on disk, nor for another build's download.
+/// The landing is on record with how long the update took, from this build's finished
+/// download carried across the handoff; never for a build met already on disk, nor for
+/// another build's download.
 #[test]
 fn the_landing_is_on_record_with_how_long_the_update_took() {
-    // One landing, one entry: the duration is a line of the landing
-    // record, never a second record (audit 2026-09-24).
+    // One landing, one entry: the duration is a line of the landing record, never a
+    // second record.
     let took = |app: &App| {
         app.messages
             .log()
@@ -4707,9 +4636,9 @@ fn a_failing_title_is_announced_once_whoever_raises_it() {
     );
 }
 
-/// A WARNING SAID AGAIN IN NEW WORDS (its promised retry withdrawn): the
-/// row up takes them in place, no second row; once it has folded, a
-/// record in them follows, so Messages keeps no withdrawn promise.
+/// A warning said again in new words (its promised retry withdrawn): the row up takes them
+/// in place, no second row; once it has folded, a record in them follows, so Messages
+/// keeps no withdrawn promise.
 #[test]
 fn a_restated_health_warning_takes_its_new_words_where_it_stands() {
     let apply = aterm_update::health_failing_title("apply");
@@ -4741,12 +4670,10 @@ fn a_restated_health_warning_takes_its_new_words_where_it_stands() {
     );
 }
 
-/// THE LEDGER'S HEAL PROVES THE CLASS IT NAMES, NOT EVERY WARNING: an
-/// install warning the convergence or overdue notice raised is not
-/// answered by the updater healing a download streak it had announced —
-/// that read put "aterm updates work again" on record over a build still
-/// stranded. The heal of the apply class, or a heal that names no class
-/// (the updater before it named one), still answers it.
+/// The ledger's heal proves the class it names, not every warning: an install warning the
+/// convergence or overdue notice raised is not answered by the updater healing a download
+/// streak. The heal of the apply class, or a heal that names no class (an older
+/// updater's), still answers it.
 #[test]
 fn the_ledgers_heal_answers_only_the_class_it_counted() {
     let apply = aterm_update::health_failing_title("apply");
@@ -4875,22 +4802,9 @@ fn the_landing_records_the_healing_with_no_progress_row_and_after_the_fold() {
     assert!(!text.contains("update_health_said"), "{text}");
 }
 
-/// THE HEAL IS KEYED BY KIND, AND AN OLDER BUILD'S WORDS STILL HEAL (design
-/// ruling 311). The health titles took the family grammar (`Couldn't
-/// download updates`), so nothing may match them word for word any more:
-/// the row wears its kind's key, and the heal proof, the latch and the
-/// record read that. A row an older build raised under the family key, in
-/// its own words (`aterm can't download updates`, carried across a plain
-/// restart), is read back to its kind — healed by the proof that answers
-/// it and by no weaker one, and replaced when this build says the same
-/// warning again.
-///
-/// NEGATIVE CONTROLS: the carried download row is NOT healed by a download
-/// merely starting (the least proof, which is where an unread title would
-/// fall); an install-KEYED row worded like a download is healed only by a
-/// landing — the key, not the words, decides; and a stall row an older
-/// build carried heals on a completed check, not by a download proof it
-/// does not need.
+/// The heal is keyed by kind, not by the title's words: a row an older build raised under
+/// the family key in its own words is read back to its kind, healed only by the proof that
+/// answers it, and replaced when this build says the same warning again.
 #[test]
 fn the_heal_is_keyed_by_kind_and_an_older_builds_words_still_heal() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4906,7 +4820,7 @@ fn the_heal_is_keyed_by_kind_and_an_older_builds_words_still_heal() {
             .map(|l| (l.msg.key.clone().unwrap_or_default(), l.msg.title.clone()))
             .collect::<Vec<_>>()
     };
-    // An older build's row: the family key, the words before ruling 311.
+    // An older build's row: the family key and its own words.
     let older = |title: &str| {
         let mut msg = update_words::health_warning(update_words::HealthKind::Check, title, body);
         msg.key = Some(update_words::KEY_HEALTH.to_string());
@@ -4971,8 +4885,8 @@ fn the_heal_is_keyed_by_kind_and_an_older_builds_words_still_heal() {
         vec!["after \"Couldn't download updates\", since Sep 14".to_string()]
     );
 
-    // THE KEY DECIDES, NOT THE WORDS: an install warning worded like a
-    // download is not healed by a staged build.
+    // The key decides, not the words: an install warning worded like a download is not
+    // healed by a staged build.
     let mut app = App::headless_for_test();
     app.post_message(update_words::health_warning(
         update_words::HealthKind::Install,
@@ -4985,16 +4899,9 @@ fn the_heal_is_keyed_by_kind_and_an_older_builds_words_still_heal() {
     assert!(health_rows(&app).is_empty());
 }
 
-/// TWO KINDS LIVE, TWO RECORDS OF HEALING (design ruling 318, completing
-/// 311). Two halves failing in one launch are two rows, so each keeps its
-/// own words for its own record: a later kind never takes an earlier one's
-/// record of healing with it, and a proof that answers both writes both.
-///
-/// NEGATIVE CONTROLS: after Download then Install, a staged build records
-/// the download's healing and NOT the install's (whose row stays up); the
-/// watchdog's stall heal records only the stall, never a ledger warning
-/// beside it; and each record is written once — a second landing adds
-/// nothing.
+/// Two failing halves are two rows, each healed on record by its own proof in its own
+/// words: a later kind never takes an earlier one's healing, and each record is written
+/// once.
 #[test]
 fn two_health_kinds_live_each_record_their_own_healing() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5043,11 +4950,9 @@ fn two_health_kinds_live_each_record_their_own_healing() {
     app.post_update_landed("9.9.9", 7, 0);
     assert_eq!(healed(&app).len(), 2, "NEGATIVE: each healing once");
 
-    // Install, then Download: the landing answers the install only
-    // (round-seven update audit, finding 54 — the build may have been
-    // staged before the download streak began, and the ledger keeps it);
-    // a staged build then answers the download. Both are on record, each
-    // against its own words — not only the later, lesser warning.
+    // Install, then Download: the landing answers the install only (the build may have
+    // been staged before the download streak began, and the ledger keeps it); a staged
+    // build then answers the download. Both are on record, each against its own words.
     let mut app = App::headless_for_test();
     assert!(app.note_update_health(install, body));
     assert!(app.note_update_health(download, body));
@@ -5094,8 +4999,7 @@ fn two_health_kinds_live_each_record_their_own_healing() {
 fn every_update_moment_is_a_line_in_the_log() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
-    // A person asked (Check for Updates): the download is their wait
-    // and takes the row (design ruling 220).
+    // A person asked (Check for Updates): the download is their wait and takes the row.
     app.note_update_check_asked(true);
     app.note_update_progress(&download("9.9.9"));
     app.note_update_progress(&aterm_update::Progress::Verifying {
@@ -5127,10 +5031,9 @@ fn every_update_moment_is_a_line_in_the_log() {
     );
 }
 
-/// ONE FACT, ONE ENTRY at the switch (design ruling 213): an attempt
-/// that POSTED its own Installing row has that line in the log already,
-/// so the switch record is not written beside it; with no row up (the
-/// automatic lane) the record is the attempt's only line.
+/// One fact, one entry at the switch: an attempt that posted its own Installing row has
+/// that line in the log already, so the switch record is not written beside it; with no
+/// row up (the automatic lane) the record is the attempt's only line.
 #[cfg(unix)]
 #[test]
 fn the_switch_record_never_doubles_a_posted_installing_row() {
@@ -5188,10 +5091,9 @@ fn a_harness_note_is_recorded_and_never_takes_a_row() {
     );
 }
 
-/// AN UNCHANGED MANAGED-CURRENT MARKER IS RECORDED ONCE; NEWS IS RECORDED
-/// AGAIN (design ruling 58): atpkg prints it every pass, and the shared ring
-/// is for news — a moved version is a new record, and a frozen tab counted
-/// re-words the record already written, in place (audit 2026-10-09).
+/// An unchanged managed-current marker is recorded once; news is recorded again: atpkg
+/// prints it every pass and the shared ring is for news, so a moved version is a new
+/// record, and a frozen tab counted re-words the record already written, in place.
 #[test]
 fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
     let mut app = App::headless_for_test();
@@ -5256,7 +5158,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
     );
 }
 
-// ---- the wire's verbs: `notice` and `messages` (design rulings 163-179) ----
+// ---- The wire's verbs: `notice` and `messages` -----------------------------
 
 /// One `notice` line through the control thread's parse and the main
 /// thread's apply, as `cmd_notice` runs them.
@@ -5441,12 +5343,10 @@ fn r44_host2_a_reload_that_never_rederived_the_font_family_leaves_its_row() {
     }
 }
 
-/// Round 44's review of HOST-2 (ruling 417 (i)): a reload whose FONT WORK
-/// ran does re-derive the family — the catalog worker admits it, or says
-/// `config font_family: …` under `config.fonts` — so one that ADMITTED it
-/// (the owner cleared the family) answers the launch thread's rejection:
-/// its row closes fixed, as a reload closed it before round 44. One that
-/// rejected the family again leaves the row: its problem stands.
+/// A reload whose font work ran does re-derive the family (the catalog worker admits it,
+/// or says `config font_family: …` under `config.fonts`), so one that admitted it answers
+/// the launch thread's rejection: its row closes fixed. One that rejected the family
+/// again leaves the row: its problem stands.
 #[test]
 fn r44_review_a_reload_whose_font_work_admits_the_family_closes_its_rejection() {
     fn reload(app: &mut App, dir: &std::path::Path, warnings: Vec<String>) {
@@ -6431,4 +6331,68 @@ fn a_fixed_config_problem_is_logged_in_the_words_of_how_it_ended() {
             "in_front={in_front}: {rec:?}"
         );
     }
+}
+
+/// A RESTATEMENT CARRIES THE TITLE'S SHORT FORM (the review of round 6:
+/// [`restatement_of`], "every field a builder authored", left it out, and a
+/// restatement that changes the title drops the short form it had — so a
+/// tab's notice re-worded in place under a new title read, where the whole
+/// title does not fit, as a cut of it, never its short form): a row
+/// restated to a builder's new words takes their short form with their
+/// title, as an ask's step keeps its own short form, and the narrow band
+/// paints it. NEGATIVE CONTROL: the old restatement, the short form left
+/// unset, leaves the row none, and the band cuts the new whole title.
+#[test]
+fn a_restatement_carries_the_titles_short_form() {
+    use aterm_agent::supervise::policy::exception::Exception;
+    use aterm_agent::supervise::policy::notice;
+    let spot = crate::message_reporters::UpgradeSpot {
+        place: "in tab 1".to_string(),
+        nav: Some(aterm_messages::Intent::ShowTab { tab: 1, window: 1 }),
+    };
+    let ask = |text: &notice::NoticeText| {
+        crate::message_reporters::resume_ask(
+            "s-1",
+            &spot,
+            &Exception::of_notice(text, None, None, "x"),
+        )
+    };
+    let first = ask(&notice::LOGIN_SIGN_IN);
+    let then = ask(&notice::LIMIT_SIGN_IN);
+    assert_ne!(first.title, then.title, "the title changes");
+    let short = then.short_title.clone().expect("a short form");
+    let restated = |r: Restatement| {
+        let now = aterm_messages::Instant::now();
+        let mut c = aterm_messages::MessageCenter::new(aterm_messages::MessageLog::empty(), now);
+        let id = c
+            .post(first.clone(), aterm_messages::WallStamp { unix_ms: 1 }, now)
+            .id;
+        assert!(c.restate(id, r, now), "the row is live");
+        let kept = c.live(id).and_then(|l| l.msg.short_title.clone());
+        let later = now + aterm_messages::PROGRESS_GRACE + aterm_messages::Duration::from_millis(1);
+        let _ = c.settle(later, true);
+        c.commit_rows(later, 3);
+        // A band too narrow for the whole title beside its capsules.
+        let mut p = c.presentation(
+            40,
+            &crate::message_band::cell_width,
+            None,
+            aterm_messages::Links::Painted,
+        );
+        assert_eq!(p.rows.len(), 1, "one row on the band");
+        (kept, p.rows.remove(0).title.1)
+    };
+    let (kept, shown) = restated(restatement_of(&then));
+    assert_eq!(kept.as_deref(), Some(short.as_str()));
+    assert_eq!(shown, short, "the band paints the new short form");
+    // NEGATIVE CONTROL: the old restatement.
+    let (kept, shown) = restated(Restatement {
+        short_title: None,
+        ..restatement_of(&then)
+    });
+    assert_eq!(kept, None, "the title's change drops the short form");
+    assert!(
+        shown.ends_with('\u{2026}') && then.title.starts_with(shown.trim_end_matches('\u{2026}')),
+        "the control: a cut of the whole title: {shown:?}"
+    );
 }

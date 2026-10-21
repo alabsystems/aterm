@@ -21,8 +21,8 @@ fn global_scrollback_budget_is_capped_and_unknown_ram_takes_the_ceiling() {
     );
 }
 
-/// Under the aggregate cap ⇒ shed nothing. At/over ⇒ shed the largest consumers first,
-/// stopping as soon as the projected sum is back under the cap.
+/// Under the aggregate cap nothing sheds; at or over it the largest consumers shed first,
+/// stopping once the projected sum is back under the cap.
 #[test]
 fn global_shed_order_picks_largest_until_under_cap() {
     let mib = 1usize << 20;
@@ -30,11 +30,9 @@ fn global_shed_order_picks_largest_until_under_cap() {
     // projects 150 MiB ≤ cap, so only it is chosen.
     let usages = [(1u64, 150 * mib), (2, 100 * mib), (3, 50 * mib)];
     assert_eq!(global_shed_order(&usages, 250 * mib), vec![1]);
-    // Already under the cap ⇒ empty.
     assert!(global_shed_order(&usages, 400 * mib).is_empty());
     assert!(global_shed_order(&[], 10).is_empty());
-    // Tightening the cap pulls in the next-largest until projected-under.
-    // 300 total, cap 120: shed 150 → 150 (still >120), shed 100 → 50 (≤120). Stops.
+    // Cap 120 MiB: shedding 150 leaves 150 (still over), shedding 100 too leaves 50.
     assert_eq!(global_shed_order(&usages, 120 * mib), vec![1, 2]);
 }
 
@@ -53,8 +51,7 @@ fn shipping_lane_admission_matches_the_derived_model() {
     assert_eq!(output["blocking_lock"], 0);
     assert_eq!(output["unbounded_work"], 0);
 
-    // Tier-1: drive the genuine App gate and project the real terminal
-    // state before/after. This is not just a test of the pure classifier.
+    // The real App gate leaves the terminal's checkpoint unchanged.
     let mut app = App::headless_for_test();
     let terminal = app
         .pool
@@ -76,9 +73,9 @@ fn shipping_lane_admission_matches_the_derived_model() {
         after, before,
         "ordinary output must be mutation-free in the shipping App"
     );
-    // The output-wake cap check is not replayed here: it evicts only past
-    // `global_scrollback_budget_bytes`, a no-op on test-sized fixtures. Its
-    // `Buggy=1` ObserveOutput is pinned at Tier-0 in `derived_ring_ty.rs`.
+    // The output wake's cap check is not replayed: it evicts only past
+    // `global_scrollback_budget_bytes`, a no-op at test sizes. `Buggy=1`'s ObserveOutput (an
+    // eviction on the output path) is pinned in `aterm-spec/tests/derived_ring_ty.rs`.
 
     let mut pressure = model.init_state();
     assert!(model.fire("ObserveMemoryPressure", &mut pressure));
@@ -98,10 +95,9 @@ fn shipping_lane_admission_matches_the_derived_model() {
 const ALT_TEST_BUDGET: usize = 8 * 1024 * 1024;
 
 /// A headless App whose one session has a real tiered store holding 30k lines of
-/// pseudo-random history, then sits on the alternate screen (`CSI ?1049h`).
-/// Returns the App and the history bytes before any shed: above the 1 MiB floor
-/// and under half the budget. The bytes follow the cold codec's ratio: on LZ4,
-/// 30k lines hold about 3.0 MB and 50k would not fit under half.
+/// pseudo-random history, then sits on the alternate screen (`CSI ?1049h`). Returns the App
+/// and the history bytes before any shed: above the 1 MiB floor and under half the budget at
+/// the cold codec's ratio (on LZ4, 30k lines hold about 3.0 MB; 50k would exceed half).
 fn app_with_alt_screen_history() -> (App, usize) {
     let app = App::headless_for_test();
     let session = app.pool.iter().next().expect("headless session");
@@ -195,8 +191,7 @@ fn pressure_shed_trims_the_history_of_an_alt_screen_tab() {
     );
 }
 
-/// The aggregate cap counts an alt-screen tab's history toward the sum and sheds
-/// it.
+/// The aggregate cap counts an alt-screen tab's history toward the sum and sheds it.
 #[test]
 fn global_cap_counts_and_sheds_an_alt_screen_tab() {
     let (mut app, before) = app_with_alt_screen_history();

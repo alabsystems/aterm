@@ -233,12 +233,92 @@ impl World {
     }
 }
 
+/// `PRIO_DARWIN_ROLE` (`<sys/resource.h>`, private): `setpriority`'s darwin-role
+/// selector. Not in `libc` (aterm-pty and aterm-lab name it the same way).
+#[cfg(target_os = "macos")]
+const PRIO_DARWIN_ROLE: libc::c_int = 6;
+
+/// `PRIO_DARWIN_ROLE_UI_FOCAL`: the role LaunchServices gives the frontmost app.
+#[cfg(target_os = "macos")]
+const ROLE_UI_FOCAL: libc::c_int = 1;
+
+/// The scheduling band the subject runs in: aterm.app's, whatever launched
+/// the measurement.
+///
+/// A spawned process holds no darwin role, whatever its launcher holds: roles
+/// are not inherited (measured 2026-10-20: a parent holding role 2 spawned a
+/// child that read 0), so even from an aterm shell, which holds one, the
+/// subject starts with none. macOS squashes the user-interactive threads of
+/// an app-type task without a role to the legacy band, 31: the band every
+/// build runs in.
+/// aterm.app runs at its role's: `UI_FOCAL` when it is the app being typed
+/// into, its main thread at 47. In 31 the subject's render loop waits behind
+/// the machine's other work and its recorder misses presents, so a take
+/// measures the role-less band, not the artifact's. Measured 2026-10-20
+/// (DESK-2, M4 Pro; the streamer paint row beside 12 busy loops, load 16-35,
+/// 6 takes an arm): role-less, the recorder's nominal interval was 18.9-19.4
+/// ms and its widest hole 22.4-36.3 ms, and one `verify measure` at load 8
+/// starved the row at 56.9 ms; at `UI_FOCAL` every take held 17.7 ms with
+/// holes of 17.9-18.4 (`docs/measured/desk2-2026-10-20.md`).
+///
+/// Only the role: the subject stays in its launcher's resource coalition,
+/// where aterm.app heads one of its own (aterm-lab's `Band::App` gives an
+/// instance both). The role alone held the cadence; a coalition of its own
+/// was not measured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Band {
+    /// The subject holds `UI_FOCAL`, aterm.app's band when frontmost.
+    Focal,
+    /// The kernel refused the role, with its errno (a DAEMON-type task, such
+    /// as a launchd job's, gets `ENOTSUP`): the subject runs in the role-less
+    /// band.
+    Refused(i32),
+    /// Not macOS: there are no darwin roles.
+    NoRoles,
+}
+
+impl Band {
+    /// Give `pid`, a child of this process, aterm.app's band. The role is the
+    /// whole task's, so the threads it already started move with it.
+    #[must_use]
+    pub fn take(pid: u32) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: `setpriority` takes no pointers.
+            if unsafe { libc::setpriority(PRIO_DARWIN_ROLE, pid, ROLE_UI_FOCAL) } == 0 {
+                Self::Focal
+            } else {
+                Self::Refused(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pid;
+            Self::NoRoles
+        }
+    }
+}
+
+impl std::fmt::Display for Band {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Focal => f.write_str("ui_focal"),
+            Self::Refused(errno) => {
+                write!(f, "refused({})", std::io::Error::from_raw_os_error(*errno))
+            }
+            Self::NoRoles => f.write_str("no_roles"),
+        }
+    }
+}
+
 /// A running headless instance. Dropping it kills and reaps it.
 pub struct Instance {
     child: spawnfd::Child,
     _lifeline: aterm_uds::lifeline::Lifeline,
     pub log: PathBuf,
     pub ctl: Ctl,
+    /// The band the subject runs in.
+    pub band: Band,
 }
 
 impl Instance {
@@ -272,6 +352,7 @@ impl Instance {
         let child = cmd
             .spawn()
             .map_err(|e| CouldNotRun(format!("cannot launch {}: {e}", bin.display())))?;
+        let band = Band::take(child.id());
         let mut inst = Self {
             child,
             _lifeline: lifeline,
@@ -282,6 +363,7 @@ impl Instance {
                 home: world.home.clone(),
                 budget,
             },
+            band,
         };
         let sock = world.sock.clone();
         budget.await_event("the control socket listening", || {
@@ -517,5 +599,43 @@ mod tests {
         assert!(client(60).ok(&["status"]).is_ok());
         assert_eq!(client(0).call(&["status"]).code, None);
         assert!(client(0).ok(&["status"]).is_err());
+    }
+
+    /// A child starts with no role (the band the subject ran in before), and
+    /// [`Band::take`] moves it to `UI_FOCAL`, or names the kernel's refusal
+    /// with the child still role-less. A refusal is the kernel's only when it
+    /// is `EPERM` or `ENOTSUP`: `EINVAL` (no such role) or `ESRCH` (no such
+    /// process) is this code asking wrongly, and fails.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_child_takes_the_app_band_or_names_the_refusal() {
+        // SAFETY: `getpriority` takes no pointers.
+        let role = |pid: u32| unsafe { libc::getpriority(PRIO_DARWIN_ROLE, pid) };
+        let mut child = spawnfd::command("/bin/sleep")
+            .arg("60")
+            .stdin(spawnfd::Stdio::null())
+            .stdout(spawnfd::Stdio::null())
+            .stderr(spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn a sleep");
+        let pid = child.id();
+        let before = role(pid);
+        let band = Band::take(pid);
+        let after = role(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(before, 0, "a spawned child holds no role");
+        match band {
+            Band::Focal => assert_eq!(after, ROLE_UI_FOCAL, "the child holds UI_FOCAL"),
+            Band::Refused(errno) => {
+                assert!(
+                    errno == libc::EPERM || errno == libc::ENOTSUP,
+                    "the kernel's refusal, not a wrong request: {}",
+                    Band::Refused(errno)
+                );
+                assert_eq!(after, 0, "a refused child keeps no role");
+            }
+            Band::NoRoles => panic!("macOS has darwin roles"),
+        }
     }
 }

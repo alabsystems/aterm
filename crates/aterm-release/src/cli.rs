@@ -304,8 +304,8 @@ USAGE
                            and demote its channel release to a prerelease
 ";
 
-/// A parsed invocation. `Cut.abandon` rides outside [`publish::CutOptions`]
-/// because abandoning is not a cut — it never reaches the pipeline.
+/// A parsed invocation. `Cut.abandon` rides outside [`publish::CutOptions`] because
+/// abandoning is not a cut and never reaches the pipeline.
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
     Help,
@@ -315,8 +315,8 @@ pub enum Cmd {
         commit: String,
         out: std::path::PathBuf,
     },
-    /// `build` — the release bundle, or HEAD's provisional bundle
-    /// between releases ([`crate::artifact::run_build`]).
+    /// `build`: the release bundle, or HEAD's provisional bundle between releases
+    /// ([`crate::artifact::run_build`]).
     Build,
     Cut {
         opts: publish::CutOptions,
@@ -325,16 +325,15 @@ pub enum Cmd {
     Provision {
         id: String,
         check: bool,
-        /// `--cert-dir`: the ONE visible folder the browser errand may use — the request
-        /// is copied there and the certificate looked for there. `None` keeps every read
+        /// `--cert-dir`: the one visible folder the browser errand may use (the request is
+        /// copied there and the certificate looked for there). `None` keeps every read
         /// inside `~/.aterm/apple`; `~/Downloads` is never touched unasked.
         cert_dir: Option<std::path::PathBuf>,
     },
-    /// `release …` — the one release command ([`crate::release`]).
+    /// `release`: the one release command ([`crate::release`]).
     Release(crate::release::ReleaseOptions),
     Status,
-    /// `check [--commit REV] [--engine DIR] [--cut] [--export] [--wasm32]` — would a
-    /// release of one commit pass ([`crate::release_steps::check`]).
+    /// `check`: would a release of one commit pass ([`crate::release_steps::check`]).
     Check(crate::release_steps::CheckOptions),
     Recover {
         version: String,
@@ -347,29 +346,28 @@ pub enum Cmd {
     Verify {
         version: Option<String>,
     },
-    /// `dev-app …` — this checkout as `aterm (dev).app` ([`crate::dev_app`]).
+    /// `dev-app`: this checkout as `aterm (dev).app` ([`crate::dev_app`]).
     DevApp(crate::dev_app::Cmd),
-    /// `trust <verb>` — the whole-tree Trust lane's facts and their judge
+    /// `trust <verb>`: the whole-tree Trust lane's facts and their judge
     /// ([`crate::trust_facts`]).
     Trust(crate::trust_facts::TrustCmd),
-    /// `site …` — alab.systems brought to a release ([`crate::site`]); its own flags.
+    /// `site`: alab.systems brought to a release ([`crate::site`]), which parses its flags.
     Site(Vec<String>),
-    /// `hook <name> …` — the publication engine's hooks ([`crate::hook`]).
+    /// `hook <name>`: the publication engine's hooks ([`crate::hook`]).
     Hook(Vec<String>),
     /// `tap deploy …` — the Homebrew tap's structure, mirrored ([`crate::tap`]).
     Tap(Vec<String>),
     Yank {
         build: u64,
-        /// A yank PUBLISHES a successor before it deletes anything, so it takes
-        /// the cut's signing inputs — and since the paper master was armed it
-        /// must, or that cut refuses pre-claim. See [`verify::YankOptions`].
+        /// A yank publishes a successor before it deletes anything, so it takes the cut's
+        /// signing inputs. See [`verify::YankOptions`].
         opts: verify::YankOptions,
     },
 }
 
-/// Entry point for the whole binary — `main()` delegates here so every code
-/// path (parsing included) is reachable from tests without spawning a
-/// process. Exit codes: 0 ok, 1 pipeline failure, 2 usage error.
+/// Entry point for the whole binary: `main()` delegates here so every path, parsing
+/// included, is reachable from tests. Exit codes: 0 ok, 1 pipeline failure, 2 usage error
+/// (the trust, check, site, hook and release verbs answer with their own, below).
 pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match parse(&args) {
@@ -379,12 +377,9 @@ pub fn run() -> i32 {
             return 2;
         }
     };
-    // The trust verbs answer three ways (0 / 1 / 2: pass, fail, could not
-    // run), which the lane and the release scripts read; every other verb is
-    // ok or not.
-    // `trust prover` and a `trust conclude` that files nothing read no git, so
-    // a directory that is no checkout (the lane's self-test) is no refusal;
-    // the verbs that do read git fail there on their own.
+    // The trust verbs answer 0 / 1 / 2 (pass, fail, could not run), which the lane and the
+    // release scripts read. `trust prover` and a `trust conclude` that files nothing read
+    // no git, so a directory that is no checkout (the lane's self-test) is no refusal.
     if let Cmd::Trust(t) = cmd {
         let root = repo_root()
             .ok()
@@ -431,20 +426,15 @@ pub fn run() -> i32 {
         return code;
     }
     let outcome = dispatch(cmd);
-    // The ONE flush in the binary, and it earns its place. Everything above prints to
-    // stdout; this prints to stderr. Under `… 2>&1 | tee provision.log` — the obvious
-    // thing to do with a run you may have to show someone — stdout block-buffers while
-    // stderr does not, so the summary landed ABOVE the evidence it summarises. Two lines
-    // of code and the log becomes the document the terminal showed.
+    // Verbs print to stdout, the failure line to stderr: under `2>&1 | tee` stdout
+    // block-buffers, so without this flush the line lands above its evidence.
     let _ = std::io::Write::flush(&mut std::io::stdout());
     match outcome {
         Ok(()) => 0,
         Err(e) => {
-            // A message that names its own verdict word KEEPS it: "NOT DONE — 1 waiting",
-            // "CHECK ONLY — nothing was written", "… COULD NOT RUN", "… NARROWED", "…
-            // FAILED — fix the tree". Printing FAILED in front of those contradicts the
-            // message, or doubles it. The exit code stays 1 either way: a script must
-            // never read "waiting" as ready.
+            // A message that names its own verdict ("NOT DONE — 1 waiting", "… COULD NOT
+            // RUN") keeps it rather than gaining a contradicting FAILED; the exit code is
+            // 1 either way, so a script never reads "waiting" as ready.
             eprintln!("{}", failure_line(&e.to_string()));
             1
         }
@@ -474,7 +464,7 @@ pub fn failure_line(msg: &str) -> String {
     }
 }
 
-/// The parser (unit-tested in tests/it/resume.rs), pure.
+/// The parser, pure (tested in tests/it/resume.rs).
 pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
     let mut it = args.iter().map(String::as_str);
     let Some(cmd) = it.next() else {
@@ -634,8 +624,8 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                     "recover requires --old-publisher-stopped, got {acknowledgement:?}"
                 ));
             }
-            // Recovery signs, so it accepts the credentials flag: the key must be
-            // named, never ambient.
+            // Recovery signs, so it takes the credentials flag: the key is named, never
+            // ambient.
             let mut release_credentials: Option<std::path::PathBuf> = None;
             let mut no_draft_posted = false;
             while let Some(arg) = it.next() {
@@ -733,11 +723,8 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
     }
 }
 
-/// `release [--bump | --commit REV] (--mac-only | --linux-artifacts DIR …)
-/// [--release-credentials P] [--engine DIR] [--dry-run] [--verbose] [--prepare]
-/// [--forget]`.
-/// The Linux declaration is not required here: a release in progress has it
-/// journaled, and step 1 refuses its absence with the remedy.
+/// `release`'s flags. The Linux declaration is not required here: a release in progress
+/// has it journaled, and step 1 refuses its absence with the remedy.
 fn parse_release<'a>(
     it: &mut impl Iterator<Item = &'a str>,
 ) -> std::result::Result<crate::release::ReleaseOptions, String> {
@@ -806,8 +793,7 @@ fn parse_release<'a>(
                 .into(),
         );
     }
-    // --forget drops the journal and exits, so every flag of a run is one it would
-    // ignore — a dry run's "nothing changes" among them
+    // --forget drops the journal and exits, so any flag of a run would be ignored.
     if opts.forget
         && (opts.bump
             || opts.commit.is_some()
@@ -833,8 +819,8 @@ fn parse_release<'a>(
 }
 
 /// The Linux declaration a cut makes, and a yank forwards to its successor cut:
-/// `--linux-artifacts DIRECTORY [--linux-target ARCH]... [--linux-worker
-/// ARCH=HOST:REPO]... | --mac-only`.
+/// `--linux-artifacts DIRECTORY [--linux-target ARCH]... [--linux-worker ARCH=HOST:REPO]...
+/// | --mac-only`.
 struct LinuxFlags<'o> {
     artifacts: &'o mut Option<std::path::PathBuf>,
     targets: &'o mut Vec<String>,
@@ -953,9 +939,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             other => return Err(format!("unknown cut flag {other:?}")),
         }
     }
-    // Mode exclusivity: each of abandon/resume is a whole flow of its own —
-    // silently ignoring a second flag would do something the operator did not
-    // ask for, on the one command where that costs a burned ledger number.
+    // Abandon and resume are each a whole flow: silently ignoring a second flag would do
+    // something unasked on the one command where that burns a ledger number.
     if abandon.is_some()
         && (opts.dry_run
             || opts.resume
@@ -986,11 +971,10 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
         mac_only: &mut opts.mac_only,
     }
     .check()?;
-    // LINUX IS DECLARED, NEVER DEFAULTED AWAY. A cut without `--linux-artifacts`
-    // would go out Mac-only in silence, leaving every Linux install on the build it
-    // had. Refused here — before a gate, a
-    // lease or a claim — unless the operator says `--mac-only` out loud. A dry
-    // run publishes nothing and a resume or abandon already has its shape.
+    // Linux is declared, never defaulted away: a cut without `--linux-artifacts` would
+    // leave every Linux install on the build it had, so it is refused here, before any
+    // gate, lease or claim, unless it says `--mac-only`. A dry run publishes nothing, and a
+    // resume or abandon already has its shape.
     if abandon.is_none()
         && !opts.resume
         && !opts.dry_run
@@ -1002,8 +986,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
     Ok(Cmd::Cut { opts, abandon })
 }
 
-/// Accept "0.2.0" or "v0.2.0"; store the bare canonical MAJOR.MINOR.PATCH
-/// everywhere. Two-component spellings are the retired scheme and are refused.
+/// Accept "0.2.0" or "v0.2.0" and store the bare canonical MAJOR.MINOR.PATCH.
 fn normalize_version(v: &str) -> std::result::Result<String, String> {
     let bare = v.strip_prefix('v').unwrap_or(v);
     ledger::check_version_shape(bare).map_err(|e| e.to_string())?;
@@ -1061,10 +1044,8 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             release_credentials,
             no_draft_posted,
         } => {
-            // Recovery signs too, so it resolves credentials the SAME one-path way
-            // as a fresh cut: the flag when given, else this machine's provisioned
-            // identity. Different resolution here would mean a cut and its recovery
-            // could sign as different machines.
+            // Recovery resolves credentials exactly as a fresh cut does, so a cut and its
+            // recovery cannot sign as different machines.
             let creds = crate::sign::ReleaseCredentials::resolve(
                 release_credentials.as_deref(),
                 &repo_root()?,
@@ -1117,8 +1098,8 @@ fn own_code(cmd: &Cmd) -> Option<i32> {
     }
 }
 
-/// The workspace root, from git — the `targo --unverified ship` alias may be invoked from
-/// any subdirectory of the checkout, and every pipeline path is repo-relative.
+/// The workspace root, from git: `ship` may run from any subdirectory, and every pipeline
+/// path is repo-relative.
 fn repo_root() -> ledger::Result<std::path::PathBuf> {
     let out = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])

@@ -132,12 +132,20 @@ pub fn cursor_cat_color_key(
     ];
     let pack =
         |rgb: [u8; 3]| (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
-    'rows: for line in (r0..=r1).map(|row| cells.get(row)) {
+    let mut last_bg: Option<([u8; 3], u8)> = None;
+    'rows: for row in r0..=r1 {
+        let line = cells.get(row).map_or(&[][..], Vec::as_slice);
         for col in c0..=c1 {
-            let cell = line.and_then(|line| line.get(col));
+            let cell = line.get(col);
             let background_rgb = cell.map_or(fallback_bg_rgb, |cell| cell.bg);
-            let background = pack(background_rgb);
-            let band = CatColorKey::background_band(background);
+            let band = match last_bg {
+                Some((prev_rgb, prev_band)) if prev_rgb == background_rgb => prev_band,
+                _ => {
+                    let b = CatColorKey::background_band(pack(background_rgb));
+                    last_bg = Some((background_rgb, b));
+                    b
+                }
+            };
             min_background_band = min_background_band.min(band);
             max_background_band = max_background_band.max(band);
             for (dst, src) in bg_sum.iter_mut().zip(background_rgb) {
@@ -613,33 +621,50 @@ struct Latches {
     /// `(session, wrap_serial)`: the wrap-fact latch, compared with `!=` (see
     /// [`wrap_fact_edge`]).
     wrap_serial: Option<(u64, u64)>,
-    /// `(session, grid, (caret, painted))` as of the last present the program
-    /// had finished: what a torn frame's hidden write cursor is read as. The
-    /// grid (`(rows, cols)`) keys it with the session: a caret read before a
-    /// resize is a cell of another grid.
-    finished_caret: Option<(u64, (u16, u16), CaretReading)>,
-    /// The session whose program has bracketed a frame (DEC 2026): its
-    /// finished frames' hidden cursor is the caret, the torn ones its write
-    /// position.
-    synced: Option<u64>,
+    /// `((session, alt_screen), grid, (caret, painted))` as of the last present
+    /// the program had finished: what a torn frame's hidden write cursor is
+    /// read as. The surface (`(session, alt_screen)`) and grid (`(rows, cols)`)
+    /// key it: a caret read on the other screen buffer or before a resize is a
+    /// cell of another surface.
+    finished_caret: Option<FinishedCaret>,
+    /// `((session, alt_screen), Terminal::sync_end_seq)` as the last present
+    /// read them: a frame whose count has moved on was closed in the stream.
+    /// Only a current caret equal to that close's recorded cell is taken
+    /// immediately (`HIDDEN_REST` is for later unbracketed moves).
+    brackets: Option<((u64, bool), u64)>,
     /// A hidden cursor's move, not yet taken ([`HIDDEN_REST`]).
     hidden_rest: Option<HiddenRest>,
+}
+
+/// [`Latches::finished_caret`]: the caret reading of the last finished present
+/// on one surface's grid.
+#[derive(Clone, Copy, Debug)]
+struct FinishedCaret {
+    surface: (u64, bool),
+    grid: (u16, u16),
+    reading: CaretReading,
 }
 
 /// A program that does not bracket its frames moves its hidden cursor through
 /// every repaint (the spinner's row, the status line) and back to the caret.
 /// A present between can catch it anywhere, and the companions took that cell
 /// as the caret: the flying head went seventeen rows up the transcript and
-/// back, one present each way (2026-10-20). A hidden cursor's move is taken
-/// once the cursor has rested at the cell this long; a repaint's write
-/// position never does.
+/// back, one present each way (2026-10-20). A hidden cursor's move that no
+/// bracket closed is taken once the cursor has rested at the cell this long;
+/// a repaint's write position never does. A move a bracket closed is the
+/// program's finished frame and is taken at once: latched only by a torn
+/// frame the companions caught, the program's bracketing went unseen in
+/// Claude Code, whose presents all land between brackets, and every caret
+/// move it made reached the cat two presents late. At a wrap the stale caret
+/// sent it hopping down the line it had left before it bounded back to the
+/// new one.
 const HIDDEN_REST: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// [`Latches::hidden_rest`]: the caret taken, and the cell the hidden cursor
-/// has stood at since when, on one session's grid.
+/// has stood at since when, on one surface's grid.
 #[derive(Clone, Copy, Debug)]
 struct HiddenRest {
-    session: u64,
+    surface: (u64, bool),
     grid: (u16, u16),
     taken: Option<(u16, u16)>,
     seen: (Option<(u16, u16)>, Instant),
@@ -869,25 +894,27 @@ impl CompanionOwner {
     }
 
     /// The caret of a finished frame, as the companions take it: the cursor
-    /// itself, except a hidden one in a program that does not bracket its
-    /// frames, which is taken at a new cell only once it has rested there
-    /// [`HIDDEN_REST`] ([`Latches::hidden_rest`]); until then the caret taken
-    /// before stands. The first reading on a session's grid is taken at once.
-    /// A capture reads the state and moves none of it.
+    /// itself, except a hidden one that moved with no bracket closing
+    /// (`bracketed` false: no newly closed frame ended at that cell), which
+    /// is taken at a new cell only once it has
+    /// rested there [`HIDDEN_REST`] ([`Latches::hidden_rest`]); until then
+    /// the caret taken before stands. The first reading on a session's grid
+    /// is taken at once. A capture reads the state and moves none of it.
     fn rested_caret(
         &mut self,
         facts: &TerminalFacts,
         grid: (u16, u16),
         now: Instant,
         present: bool,
+        bracketed: bool,
     ) -> Option<(u16, u16)> {
-        let unsynced = self.latches.synced != Some(facts.session);
+        let surface = (facts.session, facts.alt_screen);
         let held = self
             .latches
             .hidden_rest
-            .filter(|r| r.session == facts.session && r.grid == grid);
+            .filter(|r| r.surface == surface && r.grid == grid);
         let rest = match held {
-            Some(mut rest) if !facts.cursor_visible && unsynced => {
+            Some(mut rest) if !facts.cursor_visible && !bracketed => {
                 if rest.taken == facts.caret || rest.seen.0 != facts.caret {
                     rest.seen = (facts.caret, now);
                 } else if now.saturating_duration_since(rest.seen.1) >= HIDDEN_REST {
@@ -896,7 +923,7 @@ impl CompanionOwner {
                 rest
             }
             _ => HiddenRest {
-                session: facts.session,
+                surface,
                 grid,
                 taken: facts.caret,
                 seen: (facts.caret, now),
@@ -947,24 +974,35 @@ impl CompanionOwner {
         // would have shown. `None` would not do: a hidden caret the console cannot
         // hold fades the pet.
         let write_cursor = facts.frame_unfinished && !facts.cursor_visible;
+        let surface = (facts.session, facts.alt_screen);
         let grid = (host.geometry.rows, host.geometry.cols);
-        if present && facts.frame_unfinished {
-            self.latches.synced = Some(facts.session);
+        // A close since the last present certifies its own end cell, not a
+        // write position reached by later unbracketed output before this present.
+        let bracketed = facts
+            .sync_end_caret
+            .is_some_and(|end| facts.caret == Some(end))
+            && self.latches.brackets.is_some_and(|(at_surface, seq)| {
+                at_surface == surface && seq != facts.sync_end_seq
+            });
+        if present {
+            self.latches.brackets = Some((surface, facts.sync_end_seq));
         }
         let (caret, caret_painted) = if write_cursor {
             self.latches
                 .finished_caret
-                .filter(|&(session, at, _)| {
-                    session == facts.session && at == grid && facts.live_viewport
-                })
-                .map_or((None, false), |(_, _, reading)| reading)
+                .filter(|fc| fc.surface == surface && fc.grid == grid && facts.live_viewport)
+                .map_or((None, false), |fc| fc.reading)
         } else {
             let reading = (
-                self.rested_caret(facts, grid, now, present),
+                self.rested_caret(facts, grid, now, present, bracketed),
                 facts.cursor_visible,
             );
             if present {
-                self.latches.finished_caret = Some((facts.session, grid, reading));
+                self.latches.finished_caret = Some(FinishedCaret {
+                    surface,
+                    grid,
+                    reading,
+                });
             }
             reading
         };
@@ -1208,14 +1246,13 @@ impl CompanionOwner {
         // focus switch: it fades there while the arriver comes up at the new pane).
         // Anywhere else it is dropped and the replacement fades in alone.
         if let Some(drawn) = self.resight_frame.take() {
-            let free = self.own_glass.iter().position(Option::is_none);
             if drawn.cell != frame_px.cell {
                 self.pet.forget_resight();
             } else if drawn.origin == frame_px.origin {
                 // The same glass, a new surface on it.
             } else if offered
                 && drawn.glass.origin != frame_px.glass.origin
-                && let Some(free) = free
+                && let Some(free) = self.own_glass.iter().position(Option::is_none)
             {
                 self.glass_key = self.glass_key.wrapping_add(1).max(1);
                 self.pet.displace_resight(self.glass_key);
@@ -1298,17 +1335,15 @@ impl CompanionOwner {
         cues: std::vec::Drain<'_, PeekCue>,
         cell: (u16, u16),
     ) {
-        let (cw, ch) = (f32::from(cell.0.max(1)), f32::from(cell.1.max(1)));
+        if !self.last_visible {
+            return;
+        }
+        let inv_2cw = 0.5 / f32::from(cell.0.max(1));
+        let inv_2ch = 0.5 / f32::from(cell.1.max(1));
         for cue in cues {
-            if !self.last_visible {
-                continue;
-            }
             let (x0, x1, y0, y1) = cue.head_px;
-            self.pet.note_peek(
-                now,
-                (x0 + x1) as f32 * 0.5 / cw,
-                (y0 + y1) as f32 * 0.5 / ch,
-            );
+            self.pet
+                .note_peek(now, (x0 + x1) as f32 * inv_2cw, (y0 + y1) as f32 * inv_2ch);
         }
     }
 
@@ -1502,16 +1537,23 @@ impl CompanionOwner {
         PressOutcome::Pet
     }
 
-    /// Retire the resident's surface-relative state (the brain's coordinates and
-    /// the hit rect) at a presentability boundary. Session-keyed latches and
-    /// durable identity (species, worn look, contentment) survive. Idempotent.
-    pub fn retire_coordinate_space(&mut self) {
-        self.pet.retire_coordinate_space();
+    fn clear_surface_state(&mut self) {
         self.hit_rect = None;
         self.drawn_frame = None;
         self.resight_frame = None;
         self.own_glass = [None; OWN_GLASS_MAX];
         self.resight_offered = false;
+        self.last_alpha = 0;
+        self.last_visible = false;
+        self.last_sync = None;
+    }
+
+    /// Retire the resident's surface-relative state (the brain's coordinates and
+    /// the hit rect) at a presentability boundary. Session-keyed latches and
+    /// durable identity (species, worn look, contentment) survive. Idempotent.
+    pub fn retire_coordinate_space(&mut self) {
+        self.pet.retire_coordinate_space();
+        self.clear_surface_state();
     }
 
     /// The same surface, re-gridded (a resize, a font step, a DPI change, a divider
@@ -1520,6 +1562,8 @@ impl CompanionOwner {
     pub fn rebase_geometry(&mut self) {
         self.pet.rebase_geometry();
         self.hit_rect = None;
+        self.latches.finished_caret = None;
+        self.latches.hidden_rest = None;
     }
 
     /// The surface was replaced under a body that may be on glass (another
@@ -1542,6 +1586,9 @@ impl CompanionOwner {
             own.offered = false;
         }
         self.hit_rect = None;
+        self.last_alpha = 0;
+        self.last_visible = false;
+        self.last_sync = None;
     }
 
     /// The host withdrew this frame's drawn body (a torn projection, a route that
@@ -1551,12 +1598,12 @@ impl CompanionOwner {
     }
 
     /// The terminal under this surface was replaced: everything
-    /// [`Self::retire_coordinate_space`] retires, and the command/content probes
-    /// re-baseline so the old stream's completion is not replayed. Idempotent.
+    /// [`Self::retire_coordinate_space`] retires, and the stream latches
+    /// re-baseline so the old stream's completion, wrap, and caret state are
+    /// not replayed. Idempotent.
     pub fn retire_owner(&mut self) {
         self.retire_coordinate_space();
-        self.latches.cmd_seq = None;
-        self.latches.content_seq = None;
+        self.latches = Latches::default();
     }
 
     /// [`Self::retire_owner`] with the re-sighting crossfade: what the hosts'
@@ -1564,20 +1611,14 @@ impl CompanionOwner {
     /// quarter-second crossfade instead of vanishing.
     pub fn resight_owner(&mut self) {
         self.resight_coordinate_space();
-        self.latches.cmd_seq = None;
-        self.latches.content_seq = None;
+        self.latches = Latches::default();
     }
 
     /// Drop everything the brain owns (body, motes, departures, cadence debt)
     /// because its owner went away. Identity survives for the next appearance.
     pub fn retire(&mut self) {
         self.pet.retire_unowned();
-        self.hit_rect = None;
-        self.drawn_frame = None;
-        self.resight_frame = None;
-        self.own_glass = [None; OWN_GLASS_MAX];
-        self.resight_offered = false;
-        self.last_alpha = 0;
+        self.clear_surface_state();
         self.last_static = false;
         self.last_shed_tick = None;
     }
@@ -1586,13 +1627,7 @@ impl CompanionOwner {
     /// verdict in hand survive. Idempotent.
     pub fn drain(&mut self) {
         self.pet = self.pet.reborn();
-        self.hit_rect = None;
-        self.drawn_frame = None;
-        self.resight_frame = None;
-        self.own_glass = [None; OWN_GLASS_MAX];
-        self.resight_offered = false;
-        self.last_alpha = 0;
-        self.last_visible = false;
+        self.clear_surface_state();
         self.last_static = false;
         self.last_shed_tick = None;
     }
@@ -2113,6 +2148,8 @@ mod owner_tests {
             caret,
             cursor_visible: caret.is_some(),
             frame_unfinished: false,
+            sync_end_seq: 0,
+            sync_end_caret: None,
             display_offset: 0,
             live_viewport: true,
             content_seq: 0,
@@ -2690,8 +2727,11 @@ mod owner_tests {
             let (escort, sensed) = prep(&torn, 32);
             assert_eq!(escort, Some((20, 7)), "pet {pet_mode}: no write cursor");
             assert_eq!(sensed.is_some(), pet_mode, "only an owned pet senses it");
+            // The bracket closes: the frame it finished shows its caret.
             let mut hidden = facts_with(Some((5, 9)));
             hidden.cursor_visible = false;
+            hidden.sync_end_seq = 1;
+            hidden.sync_end_caret = hidden.caret;
             assert_eq!(prep(&hidden, 48).0, Some((5, 9)), "pet {pet_mode}");
             let mut other = torn;
             other.session = 2;
@@ -2702,10 +2742,11 @@ mod owner_tests {
     /// A program that never brackets its frames moves its hidden cursor through
     /// a repaint and back. A present that caught it at the write position, or
     /// two 16 ms apart, does not move the escort caret; a hidden cursor that
-    /// rests at its new cell [`HIDDEN_REST`] is taken (typing on), and once the
-    /// program brackets a frame its finished frames' hidden cursor is taken at
-    /// once. Negative control: a visible cursor is taken at once wherever it
-    /// goes.
+    /// rests at its new cell [`HIDDEN_REST`] is taken (typing on), and a move
+    /// a bracket closed (the terminal's DEC 2026 count moved on since the
+    /// last present) is a finished frame's and is taken at once, the next
+    /// unbracketed move waiting its rest again. Negative control: a visible
+    /// cursor is taken at once wherever it goes.
     #[test]
     fn an_unbracketed_repaint_s_write_position_is_no_caret() {
         let mut decos = WordDecorations::default();
@@ -2751,7 +2792,7 @@ mod owner_tests {
         let mut shown = facts_with(Some((3, 60)));
         shown.cursor_visible = true;
         assert_eq!(prep(&shown, 160).0, Some((3, 60)), "negative control");
-        // Once the program brackets a frame, a finished hidden cursor is taken.
+        // A torn frame reads the last finished caret.
         let mut torn = hidden((3, 0));
         torn.frame_unfinished = true;
         assert_eq!(
@@ -2759,11 +2800,151 @@ mod owner_tests {
             Some((3, 60)),
             "a torn frame reads the last finished"
         );
+        // A frame its program closed: the hidden cursor it finished at is
+        // taken on the present that shows it.
+        let mut closed = hidden((9, 9));
+        closed.sync_end_seq = 1;
+        closed.sync_end_caret = closed.caret;
         assert_eq!(
-            prep(&hidden((9, 9)), 192).0,
+            prep(&closed, 192).0,
             Some((9, 9)),
-            "a synced program's caret"
+            "a finished frame's caret"
         );
+        let mut again = hidden((9, 10));
+        again.sync_end_seq = 2;
+        again.sync_end_caret = again.caret;
+        assert_eq!(prep(&again, 208).0, Some((9, 10)), "and the next");
+        // A move no bracket closed waits its rest, whatever came before.
+        let mut unclosed = hidden((3, 60));
+        unclosed.sync_end_seq = 2;
+        assert_eq!(
+            prep(&unclosed, 224).0,
+            Some((9, 10)),
+            "an unbracketed write position after bracketed frames"
+        );
+
+        // Real parser provenance, including both actions in ONE process
+        // batch before ONE present: a close ends at its own cursor cell,
+        // not the later unbracketed write position.
+        let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
+        let mut owner = an_enabled_owner();
+        let mut decos = WordDecorations::default();
+        let clock = |ms| aterm_core::terminal::ClockReading {
+            monotonic: now + Duration::from_millis(ms),
+            wall_ms: None,
+        };
+        let mut take = |term: &aterm_core::terminal::Terminal, ms| {
+            let facts = TerminalFacts::read(term, 1, false);
+            let tick = prepared(
+                &mut owner,
+                &mut decos,
+                &facts,
+                &host_at(now + Duration::from_millis(ms)),
+                false,
+            );
+            let caret = tick.escort_caret();
+            let _ = owner.tick(tick);
+            caret
+        };
+        terminal.process_at(b"\x1b[?25l\x1b[20;11H", clock(0));
+        assert_eq!(take(&terminal, 0), Some((19, 10)), "first sight");
+        terminal.process_at(b"\x1b[?2026h\x1b[20;12H\x1b[?2026l", clock(16));
+        assert_eq!(terminal.sync_end_caret(), Some((19, 11)));
+        assert_eq!(
+            take(&terminal, 16),
+            Some((19, 11)),
+            "closed move: immediate"
+        );
+
+        terminal.process_at(
+            b"\x1b[?2026h\x1b[20;13H\x1b[?2026l\x1b[3;1Hwrite",
+            clock(32),
+        );
+        assert_eq!(terminal.sync_end_seq(), 2, "a new close really occurred");
+        assert!(
+            !terminal.sync_frame_unfinished(),
+            "later write is unbracketed"
+        );
+        assert_eq!(terminal.sync_end_caret(), Some((19, 12)));
+        assert_eq!((terminal.cursor().row, terminal.cursor().col), (2, 5));
+        assert_eq!(
+            take(&terminal, 32),
+            Some((19, 11)),
+            "the close did not end here"
+        );
+        assert_eq!(take(&terminal, 48), Some((19, 11)), "16 ms is no rest");
+        assert_eq!(
+            take(&terminal, 64),
+            Some((2, 5)),
+            "a genuine rest still arrives"
+        );
+
+        terminal.process_at(b"\x1b[?2026h\x1b[20;14H\x1b[?2026l\x1b[?2026h", clock(80));
+        assert!(!terminal.sync_frame_unfinished(), "empty reopened bracket");
+        assert_eq!(
+            take(&terminal, 80),
+            Some((19, 13)),
+            "closed move still immediate"
+        );
+        terminal.process_at(b"\x1b[3;1Hpartial", clock(96));
+        assert_eq!(take(&terminal, 96), Some((19, 13)), "torn frame stays held");
+        terminal.process_at(b"", clock(2100));
+        assert!(!terminal.modes().synchronized_output(), "timeout control");
+        assert!(
+            terminal.sync_frame_unfinished(),
+            "timeout is no program close"
+        );
+        assert_eq!(terminal.sync_end_caret(), None, "latest count is a timeout");
+        assert_eq!(take(&terminal, 2100), Some((19, 13)));
+        terminal.process_at(b"\x1b[?2026l", clock(2116));
+        assert_eq!(
+            take(&terminal, 2116),
+            Some((2, 7)),
+            "real close after timeout"
+        );
+
+        terminal.process_at(b"\x1b[!p", clock(2132));
+        assert_eq!(terminal.sync_end_caret(), None, "soft reset invalidates");
+        terminal.process_at(b"\x1b[?2026h\x1b[?2026l\x1bc", clock(2148));
+        assert_eq!(terminal.sync_end_caret(), None, "full reset invalidates");
+        terminal.process_at(b"\x1b[?2026h\x1b[?2026l\x1b[?1049h", clock(2164));
+        assert_eq!(terminal.sync_end_caret(), None, "screen switch invalidates");
+        terminal.process_at(b"\x1b[?1049l\x1b[?2026h\x1b[?2026l", clock(2180));
+        assert!(
+            terminal.sync_end_caret().is_some(),
+            "fresh main-screen close"
+        );
+        terminal.resize(24, 81);
+        terminal.resize(24, 80);
+        assert_eq!(
+            terminal.sync_end_caret(),
+            None,
+            "regrid back cannot revive it"
+        );
+        terminal.process_at(b"\x1b[?2026h\x1b[?2026l", clock(2196));
+        assert!(terminal.sync_end_caret().is_some());
+        let checkpoint = terminal.checkpoint();
+        terminal.restore_checkpoint(&checkpoint);
+        assert_eq!(
+            terminal.sync_end_caret(),
+            None,
+            "in-place restore invalidates"
+        );
+        let restored = aterm_core::terminal::Terminal::from_checkpoint(&checkpoint);
+        assert_eq!(
+            restored.sync_end_caret(),
+            None,
+            "fresh restore starts unknown"
+        );
+        terminal.process_at(b"\x1b[?2026h\x1b[?2026l", clock(2212));
+        assert!(terminal.sync_end_caret().is_some());
+        let _ = terminal.cell_frame(24, 80);
+        assert!(
+            terminal.sync_end_caret().is_some(),
+            "cell_frame snapshot preserves close cell for TerminalFacts::read"
+        );
+        let _ = terminal.grid_mut();
+        assert_eq!(terminal.sync_end_caret(), None, "mutable grid boundary");
     }
 
     /// The finished caret is a cell of the grid it was read on: a torn frame
@@ -4000,6 +4181,11 @@ mod owner_tests {
                 None,
                 "either retire drops the frame's coordinate artifact"
             );
+            assert_eq!(
+                owner.alpha(),
+                0,
+                "either retire clears the cached frame alpha ({owner_edge})"
+            );
             assert!(
                 !owner.brain().is_active() && !owner.needs_frames(),
                 "either retire drops the body and its lane claim ({owner_edge})"
@@ -4027,6 +4213,99 @@ mod owner_tests {
                     "a surface retire keeps feeling this session's completions"
                 );
             }
+        }
+    }
+
+    /// Switching between the main and alternate screen buffers, or replacing/
+    /// re-gridding the owner, never leaks `finished_caret` or `hidden_rest`
+    /// from the prior surface.
+    #[test]
+    fn alt_screen_switch_and_owner_retire_do_not_leak_finished_caret_or_hidden_rest() {
+        let mut decos = WordDecorations::default();
+        let mut owner = an_enabled_owner();
+        let t0 = Instant::now();
+
+        // Main screen finished frame with hidden cursor at (3, 15).
+        let mut main_facts = facts_with(Some((3, 15)));
+        main_facts.cursor_visible = false;
+        let host0 = host_at(t0);
+        let tick0 = owner.prepare(pet_facts(&main_facts, &host0), &mut decos);
+        assert_eq!(tick0.escort_caret, Some((3, 15)));
+
+        // Enter alt screen (`alt_screen = true`) on a torn frame (`frame_unfinished = true`)
+        // with a hidden cursor at (20, 5): must NOT read the main screen's (3, 15).
+        let t1 = t0 + Duration::from_millis(5);
+        let mut alt_torn = facts_with(Some((20, 5)));
+        alt_torn.alt_screen = true;
+        alt_torn.cursor_visible = false;
+        alt_torn.frame_unfinished = true;
+        let host1 = host_at(t1);
+        let tick1 = owner.prepare(pet_facts(&alt_torn, &host1), &mut decos);
+        assert_eq!(
+            tick1.escort_caret, None,
+            "torn alt-screen frame must not inherit main-screen finished_caret"
+        );
+
+        // Finished alt-screen frame with unbracketed hidden cursor at (20, 5)
+        // before HIDDEN_REST (5 ms < 30 ms): first reading on the alt surface is
+        // taken at once, not held at the main screen's (3, 15).
+        let mut alt_finished = alt_torn;
+        alt_finished.frame_unfinished = false;
+        let tick2 = owner.prepare(pet_facts(&alt_finished, &host1), &mut decos);
+        assert_eq!(
+            tick2.escort_caret,
+            Some((20, 5)),
+            "first hidden-cursor reading on alt screen is taken immediately"
+        );
+
+        // `rebase_geometry` clears `finished_caret` and `hidden_rest` even at the
+        // same `(rows, cols)` (e.g. a font-step or DPI change).
+        owner.rebase_geometry();
+        let t2 = t1 + Duration::from_millis(5);
+        let host2 = host_at(t2);
+        let tick3 = owner.prepare(pet_facts(&alt_torn, &host2), &mut decos);
+        assert_eq!(
+            tick3.escort_caret, None,
+            "rebase_geometry clears finished_caret"
+        );
+
+        // Re-seed `finished_caret`, `hidden_rest`, and `wrap_serial`, then verify
+        // `retire_owner` and `resight_owner` clear all of them.
+        for use_resight in [false, true] {
+            let mut m = main_facts;
+            m.wrap_serial = 7;
+            let _ = owner.prepare(pet_facts(&m, &host2), &mut decos);
+            owner.last_alpha = 200;
+            owner.last_visible = true;
+            if use_resight {
+                owner.resight_owner();
+            } else {
+                owner.retire_owner();
+            }
+            assert_eq!(
+                owner.alpha(),
+                0,
+                "use_resight={use_resight}: retired/resighted owner immediately reports alpha 0 before next tick"
+            );
+            assert!(
+                !owner.last_visible,
+                "use_resight={use_resight}: retired/resighted owner immediately clears last_visible"
+            );
+            let mut next = m;
+            next.caret = Some((9, 2));
+            next.wrap_serial = 99;
+            let t3 = t2 + Duration::from_millis(5);
+            let host3 = host_at(t3);
+            let tick4 = owner.prepare(pet_facts(&next, &host3), &mut decos);
+            assert_eq!(
+                tick4.escort_caret,
+                Some((9, 2)),
+                "use_resight={use_resight}: replacement owner takes its first hidden caret immediately"
+            );
+            assert!(
+                !tick4.sense.wrapped,
+                "use_resight={use_resight}: replacement owner baselines wrap_serial silently"
+            );
         }
     }
 }

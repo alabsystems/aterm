@@ -1,29 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typing-reactive rainbow cursor: the block cursor glows and changes colour
-//! with typing momentum. Two envelopes drive it:
+//! The typing-reactive rainbow cursor: the block cursor glows and changes colour with typing
+//! momentum. Two envelopes drive it:
 //!
 //! * the body (hue spin, halo, flare) rides the caller's cadence `energy`
-//!   ([`crate::cursor_trail::TypingCadence::intensity`], `0..1`, already gated
-//!   by reduced motion), a fast ignition heat that is zero shortly after the
-//!   last key;
-//! * the colour rides [`RainbowConfig::paint`], the ribbon's display spine, so
-//!   the block wears its trail's colour for as long as the trail wears it.
+//!   ([`crate::cursor_trail::TypingCadence::intensity`], `0..1`, already gated by reduced
+//!   motion), a fast ignition heat that is zero shortly after the last key;
+//! * the colour rides [`RainbowConfig::paint`], the ribbon's display spine, so the block wears
+//!   its trail's colour for as long as the trail wears it.
 //!
-//! Hosted beside the ribbon, the hue samples
-//! [`crate::cursor_glow::CursorGlow::rainbow_phase`] so both marks share one
-//! spectrum clock; standalone, a slow baseline spin accelerates under typing.
-//! Either way the hue resolves through the rainbow family's reflected sweep at
-//! the caret's field position, so block and ribbon are one continuous rainbow.
-//! The block blooms from its base colour toward a vivid rainbow as energy
-//! climbs, wrapped in an additive rainbow halo whose rings are each solved to
-//! one light ([`RIM_LIGHT`]).
+//! Hosted beside the ribbon, the hue samples [`crate::cursor_glow::CursorGlow::rainbow_phase`]
+//! so both marks share one spectrum clock; standalone, a slow baseline spin accelerates under
+//! typing. Either way the hue resolves through the family's reflected sweep at the caret's
+//! field position, so block and ribbon are one continuous rainbow, wrapped in an additive halo
+//! whose rings are each solved to one light ([`RIM_LIGHT`]).
 //!
-//! Under the rainbow the block never blinks (owner, 2026-09-08): the host pins
-//! the shape steady.
-//! A short star flare fires on upward crossings of [`MOMENTUM_FLARE_STEPS`]
-//! instead, as a pure clock function completing in [`TWINKLE_DUR`].
+//! Under the rainbow the block never blinks (the host pins the shape steady); on a blinking-block
+//! config a short star flare fires on upward crossings of [`MOMENTUM_FLARE_STEPS`] instead,
+//! completing in [`TWINKLE_DUR`].
 //!
 //! Text safety: the host floors the fill against the page
 //! (`crate::cursor_fx::floor_block_fill`) unless it wears a pinned cursor
@@ -91,14 +86,11 @@ const MIX_MAX: f32 = 0.82;
 const MIX_IDLE_LIGHT: f32 = MIX_IDLE;
 const MIX_MAX_LIGHT: f32 = 0.95;
 
-/// Halo geometry and brightness: thin concentric additive rings whose coverage
-/// falls off quadratically from the block, so they read as one soft rim. Radius
-/// and intensity grow with energy over a small idle floor.
-///
-/// The rings stack per pixel, so the budget is set on the summed coverage at
-/// the column just outside the cell: four layers at radius 0.22 and base 28
-/// stay within [`crate::cursor_glow::OVER_INK_COV_CAP`] and keep the rim in the
-/// inter-character gutter (owner, 2026-07-24).
+/// Halo geometry and brightness: thin concentric additive rings whose coverage falls off
+/// quadratically from the block, so they read as one soft rim. Radius and intensity grow with
+/// energy over a small idle floor. The rings stack per pixel: four layers at radius 0.22 and
+/// base 28 keep the summed coverage just outside the cell within
+/// [`crate::cursor_glow::OVER_INK_COV_CAP`] and the rim in the inter-character gutter.
 const HALO_LAYERS: i32 = 4;
 const HALO_RADIUS_IDLE: f32 = 0.06; // cells
 const HALO_RADIUS_MAX: f32 = 0.22;
@@ -113,27 +105,16 @@ const HALO_IDLE_FLOOR: f32 = 0.30;
 /// on the caret's paint: a tenth of the wheel at rest, a third under a fast hand.
 const HALO_HUE_SPREAD_IDLE: f32 = 0.10;
 const HALO_HUE_SPREAD_MAX: f32 = 0.34;
-/// Momentum spin (turns per second at full paint): the rim's spectrum rotates
-/// in proportion to the display spine, on top of the family phase, so speed
-/// reads as motion. Integrated into [`CursorRainbow::spin`] only across a
-/// painted interval; `Spine::at_rest` requires `disp == 0.0` exactly, so a
-/// resting rim's offset is constant, its fingerprint settles and
-/// [`CursorRainbow::is_active`] releases the tick. No idle spin or breath.
+/// Momentum spin (turns per second at full paint): the rim's spectrum rotates in proportion to
+/// the display spine, on top of the family phase, so speed reads as motion. Integrated into
+/// [`CursorRainbow::spin`] only across a painted interval; `Spine::at_rest` requires
+/// `disp == 0.0` exactly, so a resting rim's offset is constant and its fingerprint settles.
 const RIM_SPIN_TURNS_PER_S: f32 = 0.45;
 
-/// The rim's light is hue-invariant: every ring is laid at the light a grey
-/// ring of this relative luminance (linear, `0..1`) would add to the page at
-/// the same coverage, solved on the premultiplied bytes over the page by
-/// [`ring_light_on_page`]. The arc colour is pulled toward white where dark and
-/// toward black where bright, hue intact.
-///
-/// The spinning arc's own luminance spans about thirty-fold (indigo to
-/// yellow); without this law the rim would brighten and dim with wherever the
-/// spin parked it, reading as a pulse after every pause. The solve is done on
-/// the glass, not the colour: additive light lands in sRGB bytes and the EDR
-/// aurora re-emits it linearly ([`light_on_glass`] names both), so only the
-/// displayed light is hue-flat
-/// (`the_rim_light_is_hue_invariant_and_monotone_in_paint`).
+/// The rim's light is hue-invariant: every ring is laid at the light a grey ring of this
+/// relative luminance (linear, `0..1`) would add to the page at the same coverage, solved on
+/// the premultiplied bytes over the page by [`ring_light_on_page`]. The arc colour is pulled
+/// toward white where dark and toward black where bright, hue intact.
 ///
 /// With every ring at one light, the rim's light is a function of
 /// `halo_energy` alone, which is monotone in the paint. `0.462` is the arc's
@@ -143,9 +124,9 @@ const RIM_LIGHT: f32 = 0.462;
 /// The grey of relative luminance [`RIM_LIGHT`] (sRGB byte `181`).
 const RIM_LIGHT_GREY: u32 = 0x00B5_B5B5;
 
-/// Energy below which the cursor is settled: the animator reports inactive so
-/// the host stops the 60 fps tick. A settled caret is a solid block inside its
-/// resting rim; the blink is never armed while the rainbow owns the caret.
+/// Energy below which the cursor is settled: the animator reports inactive so the host stops
+/// the frame tick. A settled caret is a solid block inside its resting rim; the blink is never
+/// armed while the rainbow owns the caret.
 const SETTLED_ENERGY: f32 = 0.02;
 
 // ── the twinkle (the "glitter star") ────────────────────────────────────────
@@ -239,6 +220,34 @@ enum SettleWake {
     Cadence,
 }
 
+/// Exact input key for [`CursorRainbow::equalise_rim_light`] and (when no
+/// twinkle is active) [`CursorRainbow::rim_light_peak`]. When the integer ring
+/// offsets, coverages, arc colours, page and grid bounds repeat between frames
+/// (resting carets, or cooling frames between u8/px steps), the equalised ring
+/// colours and peak light are reused without re-rasterizing the pile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RimMemoKey {
+    cur: (u16, u16),
+    cw: usize,
+    ch: usize,
+    rows: usize,
+    cols: usize,
+    origin_x: u16,
+    origin_y: u16,
+    head: u16,
+    gxy: [(i32, i32); HALO_LAYERS as usize],
+    page: u32,
+    n_rings: u8,
+    rings: [(usize, u8, u32, u32); HALO_LAYERS as usize],
+}
+
+#[derive(Clone, Copy)]
+struct RimMemo {
+    key: RimMemoKey,
+    best: Option<[u32; HALO_LAYERS as usize]>,
+    peak_dark_no_twinkle: Option<f32>,
+}
+
 /// Extrapolate a released envelope `ahead` seconds past its last sample pair
 /// with a first-order log-linear fit.
 ///
@@ -256,7 +265,11 @@ fn release_forecast(now_v: f32, prev_v: f32, dt: f32, ahead: f32) -> Option<f32>
         return None;
     }
     if dt <= 0.0 || prev_v <= now_v {
-        return Some(now_v);
+        // A live (> `SETTLED_ENERGY`) envelope that has not begun decaying
+        // (such as `caret_paint`'s 180 ms flat landing re-light hold) cannot be
+        // extrapolated as stationary across `SETTLE_POLL_CAP`: return `None` so
+        // the caller stays on frame cadence until the decay slope is observed.
+        return (now_v <= SETTLED_ENERGY).then_some(now_v);
     }
     let ratio = (now_v / prev_v).clamp(1e-3, 1.0);
     Some(now_v * ratio.powf(ahead / dt))
@@ -306,15 +319,12 @@ pub struct RainbowConfig {
     /// `None` uses the default page for the polarity
     /// ([`GROUND_DARK_THEME`] / [`GROUND_LIGHT_THEME`]).
     pub ground: Option<u32>,
-    /// The instant a v2 meteor's frame-0 flare fired (`RAINBOW-KITTY-V2.md`
-    /// §7.1), copied from [`crate::cursor_glow::CursorGlow::caret_flare_at`].
-    /// While `Some`: the block fills `#FFFFFF` on the firing frame (the vivid
-    /// hue on a light theme), then springs back to its field stop on a
-    /// critically damped `spring-snap` (response 0.18 s, no undershoot), and the
-    /// halo rings pop radius ×1.4 relaxing τ 120 ms. The engine clears it once
-    /// the relax settles.
-    ///
-    /// `None` is the identity: the tick emits exactly the no-flare bytes.
+    /// The instant a v2 meteor's frame-0 flare fired (`RAINBOW-KITTY-V2.md` §7.1), copied from
+    /// [`crate::cursor_glow::CursorGlow::caret_flare_at`], which reads `None` once the relax
+    /// settles. While `Some`: the block fills `#FFFFFF` on the firing frame (the vivid hue on a
+    /// light theme), then springs back to its field stop on a critically damped `spring-snap`
+    /// (response 0.18 s), and the halo rings pop radius ×1.4 relaxing τ 120 ms. `None` emits
+    /// exactly the no-flare bytes.
     pub flare_at: Option<Instant>,
 }
 
@@ -340,7 +350,7 @@ pub struct CursorRainbow {
     /// Idle-breath phase in turns `0..1`.
     pulse: f32,
     last: Option<Instant>,
-    /// Latched energy at the last tick (so [`is_active`] answers without a clock).
+    /// Latched energy at the last tick (so [`Self::is_active`] answers without a clock).
     energy: f32,
     /// Latched colour envelope at the last tick (the paint spine folded with
     /// the energy, [`RainbowConfig::paint`]). It outlives `energy`, so
@@ -362,20 +372,26 @@ pub struct CursorRainbow {
     /// Advanced by `dt · RIM_SPIN_TURNS_PER_S · paint` across a painted
     /// interval, frozen otherwise, like `phase`.
     spin: f32,
-    /// Latched "a flare is mid-flight" at the last tick (the [`is_active`]
-    /// clockless answer, like `energy`).
+    /// Latched "a flare is mid-flight" at the last tick (the [`Self::is_active`] clockless
+    /// answer, like `energy`).
     twinkling: bool,
-    /// The fingerprints of the last two ticks, so [`is_active`] answers from
-    /// the u8-level delta the host would present rather than from
-    /// `paint > SETTLED_ENERGY`: the colour envelope cools slowly while the u8
-    /// fill often repeats frame after frame. A frame equal to the previous one
-    /// asks for no tick; a cooling caret then names its next change
+    /// Latched "a v2 meteor flare (`cfg.flare_at`) is mid-flight" at the last tick
+    /// (`age < SPRING_SNAP_RESPONSE_S`), so [`Self::is_active`] keeps the frame train through
+    /// the spring-snap relax and `caret_paint`'s 180 ms landing hold.
+    flaring: bool,
+    /// The fingerprints of the last two ticks, so [`Self::is_active`] answers from the u8-level
+    /// delta the host would present rather than from `paint > SETTLED_ENERGY`: the colour
+    /// envelope cools slowly while the u8 fill often repeats frame after frame. A frame equal to
+    /// the previous one asks for no tick; a cooling caret then names its next change
     /// ([`Self::settling`], [`Self::next_change_deadline`]).
     fp_last: u64,
     fp_prev: u64,
     /// Scratch pixel buffer for [`Self::rim_light_peak`], retained across
     /// frames.
     rim_scratch: Vec<u32>,
+    /// Memoised [`Self::equalise_rim_light`] and no-twinkle [`Self::rim_light_peak`]
+    /// for the last integer ring geometry and palette.
+    rim_memo: Option<RimMemo>,
     /// The last real tick's inputs, for the colour release's dry run. `None`
     /// before the first tick and across every inert early-out.
     settle_probe: Option<SettleProbe>,
@@ -397,42 +413,30 @@ impl CursorRainbow {
         // keeps it only while its last two frames differed.
         self.energy > SETTLED_ENERGY
             || self.twinkling
+            || self.flaring
             || (self.paint > SETTLED_ENERGY && self.fp_last != self.fp_prev)
     }
 
-    /// The colour release still owes frames, but not at frame cadence: the
-    /// caret is painted (`paint > SETTLED_ENERGY`) and its last two frames were
-    /// identical.
-    ///
-    /// Not "settled": a fading fill steps one u8 level every few frames, so two
-    /// identical frames occur long before the fade ends. The host keeps the
-    /// lane live and paces it by [`Self::next_change_deadline`] on its coarse
-    /// one-shot arm.
-    ///
-    /// Disjoint from [`Self::is_active`]; their OR is "anything still moving":
-    /// `energy > SETTLED || twinkling || paint > SETTLED`.
+    /// The colour release still owes frames, but not at frame cadence: the caret is painted
+    /// (`paint > SETTLED_ENERGY`) and its last two frames were identical. A fading fill steps
+    /// one u8 level every few frames, so this is not "settled"; the host paces it by
+    /// [`Self::next_change_deadline`]. Disjoint from [`Self::is_active`].
     #[must_use]
     pub fn settling(&self) -> bool {
         !self.is_active() && self.paint > SETTLED_ENERGY
     }
 
-    /// When this caret's next visible step is due, so a colour release neither
-    /// freezes mid-fade nor pins the frame cadence.
+    /// When this caret's next visible step is due, so a colour release neither freezes
+    /// mid-fade nor pins the frame cadence: `Some(now + frame_interval)` while
+    /// [`Self::is_active`], `None` once nothing is painted, and across a [`Self::settling`]
+    /// release one frame before the first dry-run frame that differs from the one on glass.
     ///
-    /// `Some(now + frame_interval)` while [`Self::is_active`], `None` once
-    /// nothing is painted, and across a [`Self::settling`] release one frame
-    /// before the first dry-run frame that differs from the one on glass.
-    ///
-    /// The deadline is a dry run of this engine's own tick on a copy, stepped
-    /// along the frame grid with the latched inputs and the two host envelopes
-    /// extrapolated ([`release_forecast`]), for at most [`SETTLE_LOOKAHEAD`]
-    /// steps and never past [`SETTLE_POLL_CAP`]. Using the tick itself keeps
-    /// the schedule in step with every colour law.
-    ///
-    /// The wake is one frame early because the extrapolation's residual has no
-    /// fixed sign and a late step is visible; the real tick re-measures. Every
-    /// drawn frame is a real tick; the probe predicts only the schedule.
-    /// Memoised per real tick; allocates nothing after the first call.
+    /// The dry run ticks a copy of this engine along the frame grid with the latched inputs
+    /// and the two host envelopes extrapolated ([`release_forecast`]), for at most
+    /// [`SETTLE_LOOKAHEAD`] steps and never past [`SETTLE_POLL_CAP`], so the schedule keeps
+    /// step with every colour law. It wakes one frame early because the extrapolation's
+    /// residual has no fixed sign and a late step is visible. Memoised per real tick;
+    /// allocates nothing after the first call.
     #[must_use]
     pub fn next_change_deadline(
         &mut self,
@@ -494,6 +498,7 @@ impl CursorRainbow {
             let ahead = at.saturating_duration_since(origin).as_secs_f32();
             let paint = match (probe_in.paint_prev, probe_in.cfg.paint) {
                 (Some(prev), Some(p)) => release_forecast(p, prev, probe_in.sample_dt, ahead),
+                (None, Some(p)) if p > SETTLED_ENERGY => None,
                 (_, p) => Some(p.unwrap_or(0.0)),
             };
             let energy = release_forecast(
@@ -508,6 +513,10 @@ impl CursorRainbow {
             };
             let cfg = RainbowConfig {
                 paint: probe_in.cfg.paint.map(|_| paint),
+                flare_at: probe_in.cfg.flare_at.filter(|&t| {
+                    at.saturating_duration_since(t).as_secs_f32()
+                        < crate::rainbow_kitty::timing::SPRING_SNAP_RESPONSE_S
+                }),
                 ..probe_in.cfg
             };
             out.clear();
@@ -565,12 +574,12 @@ impl CursorRainbow {
 
     /// [`Self::tick`] phase-locked to the rainbow kitty ribbon's family clock.
     ///
-    /// Read `family_phase` from [`crate::cursor_glow::CursorGlow::rainbow_phase`]
-    /// immediately after ticking that engine for the same frame. The block,
-    /// halo rings, glitter, fresh-ink rail, and ribbon then all sample the same
-    /// `0..1024` clock and the same reflected spectrum resolver. The private
-    /// energy clock still advances while locked so falling back later is
-    /// continuous in its own domain; it never contributes colour on this path.
+    /// Read `family_phase` and `family_field` from
+    /// [`crate::cursor_glow::CursorGlow::rainbow_phase`] and `rainbow_field` immediately after
+    /// ticking that engine for the same frame, so the block, its halo and glitter, and the
+    /// ribbon sample one `0..1024` clock and one reflected spectrum resolver. The private energy
+    /// clock still advances while locked, so falling back later is continuous in its own
+    /// domain; it never contributes colour on this path.
     #[allow(clippy::too_many_arguments)]
     pub fn tick_with_family_phase(
         &mut self,
@@ -625,6 +634,7 @@ impl CursorRainbow {
             self.flare_rung = 0;
             self.twinkle_at = None;
             self.twinkling = false;
+            self.flaring = false;
             self.fp_prev = self.fp_last;
             self.fp_last = 0;
             // Drop the dry run's inputs so a re-enable never runs this caret
@@ -761,8 +771,7 @@ impl CursorRainbow {
         // rail under this cell resolves it. A hidden cursor uses column 0.
         let col = cur.map_or(0, |(_, cc)| cc);
         let sweep = spectrum_field.unwrap_or_else(|| rainbow_sweep_at(col, spectrum_phase));
-        let band = spectrum_at(sweep, 0.0);
-        let head_rgb = cfg.head_rgb.unwrap_or(band);
+        let head_rgb = cfg.head_rgb.unwrap_or_else(|| spectrum_at(sweep, 0.0));
         let rainbow = shade(head_rgb, sat, val);
 
         // Block fill: tint from the base toward the rainbow with the paint. The
@@ -780,9 +789,6 @@ impl CursorRainbow {
         } else {
             (MIX_IDLE_LIGHT, MIX_MAX_LIGHT)
         };
-        // The straight line from an unrelated base to the arc colour can cross
-        // a hue neither end has (a green cursor toward blue passes turquoise);
-        // `caret_fill` below corrects the emitted byte.
         let mut fill = mix_rgb(base, rainbow, lerp(mix_idle, mix_max, paint));
         // A pinned cursor colour is the settled block itself, with no whisper
         // of the arc: the spectrum comes in only with the paint
@@ -821,6 +827,8 @@ impl CursorRainbow {
         let flare_age = cfg
             .flare_at
             .map(|t| now.saturating_duration_since(t).as_secs_f32());
+        self.flaring =
+            flare_age.is_some_and(|age| age < crate::rainbow_kitty::timing::SPRING_SNAP_RESPONSE_S);
         let mut fill = match flare_age {
             None => fill,
             Some(age) => {
@@ -844,6 +852,8 @@ impl CursorRainbow {
         // and bleeds off over a few seconds when the hand stops.
         let breath = 0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin(); // 0..1
         let halo_energy = HALO_IDLE_FLOOR * (0.35 + PULSE_DEPTH * breath) + paint;
+        let mut flare_pop = 1.0f32;
+        let mut rim_key: Option<RimMemoKey> = None;
         if let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
@@ -854,13 +864,10 @@ impl CursorRainbow {
             // Window-absolute cell anchor (the window-space effects layer).
             let cx = geom.origin_x as i32 + cc as i32 * cw;
             let cy = geom.origin_y as i32 + cr as i32 * ch;
-            // Separate horizontal and vertical reach: each axis grows by a
-            // fraction of the cell's own size, bounded by `HALO_RADIUS_MAX`, so
-            // the light hugs the block instead of reaching a full cell width
-            // into neighbours, and no two layers land the same rect.
-            // §7.1: rings pop ×1.4 on the flare edge and relax τ 120 ms; `1.0`
-            // with no flare is the bit-exact identity.
-            let flare_pop = flare_age.map_or(1.0, |age| {
+            // Per-axis reach, a fraction of the cell's own size bounded by `HALO_RADIUS_MAX`, so
+            // the light hugs the block and no two layers land the same rect. The flare pop
+            // (`1.0` with no flare, the bit-exact identity) widens it on the flare edge.
+            flare_pop = flare_age.map_or(1.0, |age| {
                 1.0 + FLARE_RING_POP * (-age / FLARE_RING_TAU_S).exp()
             });
             let radius_x =
@@ -879,11 +886,19 @@ impl CursorRainbow {
             } else {
                 GROUND_LIGHT_THEME
             }) & 0x00FF_FFFF;
-            // Where each ring's quads start in `out`, its coverage and its arc
-            // colour — what `equalise_rim_light` needs to re-solve the pile.
+            // Where each ring's quads start in `out`, its coverage, its arc
+            // colour and its initial solved light — what `equalise_rim_light`
+            // needs to re-solve the pile without heap allocation.
             let rings_from = out.len();
-            let mut rings = [(0usize, 0u8, 0u32); HALO_LAYERS as usize];
+            let mut rings = [(0usize, 0u8, 0u32, 0u32); HALO_LAYERS as usize];
+            let mut gxy = [(0i32, 0i32); HALO_LAYERS as usize];
             let mut n_rings = 0usize;
+            let prev_rings = self.rim_memo.filter(|m| m.key.page == page).map(|m| {
+                (
+                    usize::from(m.key.n_rings).min(HALO_LAYERS as usize),
+                    m.key.rings,
+                )
+            });
             for layer in 0..HALO_LAYERS {
                 // t: 0 = innermost ring hugging the block, 1 = outermost at `radius`.
                 // Coverage falls off as (1-t)² so the overlapping thin rings blend into
@@ -901,21 +916,28 @@ impl CursorRainbow {
                 let ring_arc = if layer == 0 {
                     // The innermost ring touches the ribbon nozzle and wears
                     // its exact emitted hue; outer rings fan through the family.
-                    shade(head_rgb, sat, val)
+                    rainbow
                 } else {
                     shade(spectrum_at(ring_sweep, t * hue_spread), sat, val)
                 };
                 // Every ring is laid at one light (`RIM_LIGHT`): hue from the
                 // arc, added light from a grey ring; `cov` alone sets
-                // brightness.
-                let ring_light = ring_light_on_page(ring_arc, cov, page, 1.0);
-                rings[n_rings] = (out.len() - rings_from, cov, ring_arc);
+                // brightness. Reuse the solved byte from the previous frame
+                // when `(page, cov, ring_arc)` repeats.
+                let ring_light = prev_rings
+                    .and_then(|(prev_n, prev)| {
+                        prev[..prev_n]
+                            .iter()
+                            .find(|&&(_, pcov, parc, _)| pcov == cov && parc == ring_arc)
+                            .map(|&(_, _, _, plight)| plight)
+                    })
+                    .unwrap_or_else(|| ring_light_on_page(ring_arc, cov, page, 1.0));
+                rings[n_rings] = (out.len() - rings_from, cov, ring_arc, ring_light);
+                gxy[n_rings] = (gx, gy);
                 n_rings += 1;
                 push_ring(
                     out,
                     geom,
-                    // Tight per-axis growth (`gx`/`gy`) so the rim hugs the
-                    // block and stays out of neighbour glyphs.
                     cx - gx,
                     cy - gy,
                     cw + 2 * gx,
@@ -923,9 +945,35 @@ impl CursorRainbow {
                     ring_light,
                 );
             }
-            // Equalise the pile as a whole: stacked rings gain from the
-            // transfer's convexity by a colour-dependent amount.
-            self.equalise_rim_light(&mut out[rings_from..], &rings[..n_rings], page);
+            let key = RimMemoKey {
+                cur: (cr, cc),
+                cw: geom.cw,
+                ch: geom.ch,
+                rows: geom.rows,
+                cols: geom.cols,
+                origin_x: geom.origin_x,
+                origin_y: geom.origin_y,
+                head: geom.head,
+                gxy,
+                page,
+                n_rings: n_rings as u8,
+                rings,
+            };
+            rim_key = Some(key);
+            if let Some(memo) = self.rim_memo.filter(|m| m.key == key) {
+                if let Some(best) = memo.best {
+                    Self::apply_equalised_rings(&mut out[rings_from..], &rings[..n_rings], &best);
+                }
+            } else {
+                // Equalise the pile as a whole: stacked rings gain from the
+                // transfer's convexity by a colour-dependent amount.
+                let best = self.equalise_rim_light(&mut out[rings_from..], &rings[..n_rings], page);
+                self.rim_memo = Some(RimMemo {
+                    key,
+                    best,
+                    peak_dark_no_twinkle: None,
+                });
+            }
         }
 
         // The twinkle star: additive arms through the cell centre overhanging
@@ -975,7 +1023,7 @@ impl CursorRainbow {
                 );
             }
             // Glitter dots: two per flare, corners and 1 px jitter picked by an
-            // integer hash of the flip counter (deterministic). A pop² envelope
+            // integer hash of the flare counter (deterministic). A pop² envelope
             // makes them wink after the arms bloom.
             let dot_cov = (TWINKLE_DOT_COV * pop * pop * cfg.intensity).min(OVER_INK_COV_CAP) as u8;
             if dot_cov > 0 {
@@ -1000,13 +1048,28 @@ impl CursorRainbow {
 
         // The rim's own light, measured on the pixel: every ring, arm and dot
         // this tick emitted, composited as `aterm_render` will.
-        let rim_peak = self.rim_light_peak(&out[emitted_from..], dark_theme);
         // The rim lands outside the opaque block, after the ribbon has spent
         // the field's light budget, so its peak can exceed a blue-end block's
         // floor. Lift the block's centre above the measured peak of the final
         // pile by the family's usual margin, weighted by the live floor so a
         // settled OSC-12 cursor stays exactly its configured colour.
-        if dark_theme {
+        if dark_theme && caret_floor > 0.0 {
+            let rim_peak = if pop == 0.0
+                && let Some(key) = rim_key
+                && self.rim_memo.is_some_and(|m| m.key == key)
+            {
+                if let Some(peak) = self.rim_memo.and_then(|m| m.peak_dark_no_twinkle) {
+                    peak
+                } else {
+                    let peak = self.rim_light_peak(&out[emitted_from..], dark_theme);
+                    if let Some(m) = self.rim_memo.as_mut() {
+                        m.peak_dark_no_twinkle = Some(peak);
+                    }
+                    peak
+                }
+            } else {
+                self.rim_light_peak(&out[emitted_from..], dark_theme)
+            };
             let floor_weight = (caret_floor / RAINBOW_CARET_LIGHT_FLOOR).clamp(0.0, 1.0);
             let promised_margin =
                 RAINBOW_CARET_LIGHT_FLOOR * (1.0 - RAINBOW_SPARKLE_LIGHT_SHARE) - 2.0;
@@ -1016,13 +1079,23 @@ impl CursorRainbow {
             );
         }
 
-        // Fingerprint: quantized phase, energy and fill, so a settled cursor
-        // early-outs the present while any visible step forces a repaint. The
-        // flare folds in only while lit (`pop > 0`), leaving no residue.
+        // Fingerprint: quantized phase, energy, fill and cursor cell, so a
+        // settled cursor early-outs the present while any visible step (or
+        // row/visibility move) forces a repaint. The flare folds in only while
+        // lit (`pop > 0`), leaving no residue.
         let twinkle_fp = if pop > 0.0 {
             (((pop * 255.0) as u64) << 24).wrapping_add(u64::from(self.twinkle_seq) << 40)
         } else {
             0
+        };
+        let cur_fp = match cur {
+            Some((cr, cc)) if (cr as usize) < geom.rows && (cc as usize) < geom.cols => {
+                (((u64::from(cr) << 16) | u64::from(cc) | (1 << 32))
+                    ^ ((u64::from(geom.origin_x) << 33) | (u64::from(geom.origin_y) << 49))
+                    ^ ((geom.cw as u64).rotate_left(21) ^ (geom.ch as u64).rotate_left(37)))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            }
+            _ => 0,
         };
         // Key the spectrum by its resolved period-two position, so equal
         // visible phases (including a full ring wrap) share a key.
@@ -1033,7 +1106,9 @@ impl CursorRainbow {
             .wrapping_add((halo_energy * 255.0) as u64)
             .wrapping_add(((fill as u64) << 12) ^ ((self.pulse * 64.0) as u64))
             .wrapping_add(((self.spin * 1024.0) as u64).wrapping_mul(7_919))
-            .wrapping_add(twinkle_fp);
+            .wrapping_add((((flare_pop - 1.0) * 1024.0) as u64).wrapping_mul(131_071))
+            .wrapping_add(twinkle_fp)
+            .wrapping_add(cur_fp);
         self.fp_prev = self.fp_last;
         self.fp_last = fp;
         // Latch this tick's inputs and the previous sample of each host
@@ -1070,14 +1145,31 @@ impl CursorRainbow {
     /// [`Self::RIM_LIGHT_SLACK`], one scalar on every ring's target is bisected
     /// (eight halvings) and the rings re-solved; hues are untouched. Skipped
     /// when already within the slack.
+    fn apply_equalised_rings(
+        quads: &mut [GlowQuad],
+        rings: &[(usize, u8, u32, u32)],
+        best: &[u32; HALO_LAYERS as usize],
+    ) {
+        for (i, &(start, _, _, _)) in rings.iter().enumerate() {
+            let end = rings
+                .get(i + 1)
+                .map_or(quads.len(), |&(next, _, _, _)| next);
+            for q in &mut quads[start..end] {
+                q.color = best[i];
+                // The ring's quads are flat: both ends take the equalised colour.
+                q.color2 = best[i];
+            }
+        }
+    }
+
     fn equalise_rim_light(
         &mut self,
         quads: &mut [GlowQuad],
-        rings: &[(usize, u8, u32)],
+        rings: &[(usize, u8, u32, u32)],
         page: u32,
-    ) {
+    ) -> Option<[u32; HALO_LAYERS as usize]> {
         if rings.len() < 2 {
-            return;
+            return None;
         }
         let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
         for q in quads.iter() {
@@ -1091,8 +1183,9 @@ impl CursorRainbow {
             (y1.saturating_sub(y0)) as usize,
         );
         if w == 0 || h == 0 || w * h > Self::CARET_RASTER_MAX {
-            return;
+            return None;
         }
+        let table = crate::color_math::relative_luminance_table();
         let base = light_on_glass(page, 0);
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         // The pile's light over the page with ring `i` wearing `colour(i)`,
@@ -1103,15 +1196,19 @@ impl CursorRainbow {
             scratch.clear();
             scratch.resize(w * h, page);
             let mut aurora = 0.0f32;
-            for (i, &(start, _, _)) in rings.iter().enumerate() {
-                let end = rings.get(i + 1).map_or(quads.len(), |&(next, _, _)| next);
+            for (i, &(start, _, _, _)) in rings.iter().enumerate() {
+                let end = rings
+                    .get(i + 1)
+                    .map_or(quads.len(), |&(next, _, _, _)| next);
                 let c = colour(i);
-                let c_light = crate::color_math::relative_luminance(c);
+                let c_light = crate::color_math::relative_luminance_with(table, c);
                 for q in &quads[start..end] {
+                    let x_off = (u32::from(q.x) - x0) as usize;
+                    let qw = usize::from(q.w);
                     for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
-                        for xx in u32::from(q.x)..u32::from(q.x) + u32::from(q.w) {
-                            let k = (yy - y0) as usize * w + (xx - x0) as usize;
-                            scratch[k] = crate::spectrum::compose_on_glass(scratch[k], c, q.alpha);
+                        let row_start = (yy - y0) as usize * w + x_off;
+                        for px in &mut scratch[row_start..row_start + qw] {
+                            *px = crate::spectrum::compose_on_glass(*px, c, q.alpha);
                             aurora += c_light;
                         }
                     }
@@ -1119,53 +1216,62 @@ impl CursorRainbow {
             }
             scratch
                 .iter()
-                .map(|&px| (crate::color_math::relative_luminance(px) - base).max(0.0))
+                .map(|&px| {
+                    if px == page {
+                        0.0
+                    } else {
+                        (crate::color_math::relative_luminance_with(table, px) - base).max(0.0)
+                    }
+                })
                 .sum::<f32>()
                 + aterm_render::hdr::HDR_GLOW_BOOST * aurora
         };
         let target = pile_light(quads, &|i| premul_rgb(RIM_LIGHT_GREY, rings[i].1));
-        let emitted: Vec<u32> = rings
-            .iter()
-            .map(|&(start, _, _)| quads[start].color)
-            .collect();
-        let have = pile_light(quads, &|i| emitted[i]);
+        let have = pile_light(quads, &|i| rings[i].3);
         if target <= 0.0 || (have - target).abs() <= target * Self::RIM_LIGHT_SLACK {
             self.rim_scratch = scratch;
-            return;
+            return None;
         }
         let solve = |scale: f32| -> [u32; HALO_LAYERS as usize] {
             let mut c = [0u32; HALO_LAYERS as usize];
-            for (i, &(_, cov, arc)) in rings.iter().enumerate() {
+            for (i, &(_, cov, arc, _)) in rings.iter().enumerate() {
                 c[i] = ring_light_on_page(arc, cov, page, scale);
             }
             c
         };
         let (mut lo, mut hi) = (0.5f32, 1.5f32);
+        let mut lo_solved: Option<([u32; HALO_LAYERS as usize], f32)> = None;
+        let mut hi_solved: Option<([u32; HALO_LAYERS as usize], f32)> = None;
         for _ in 0..8 {
             let mid = 0.5 * (lo + hi);
             let c = solve(mid);
-            if pile_light(quads, &|i| c[i]) < target {
+            let l = pile_light(quads, &|i| c[i]);
+            if l < target {
                 lo = mid;
+                lo_solved = Some((c, l));
             } else {
                 hi = mid;
+                hi_solved = Some((c, l));
             }
         }
-        let (a, b) = (solve(lo), solve(hi));
-        let (la, lb) = (pile_light(quads, &|i| a[i]), pile_light(quads, &|i| b[i]));
+        let (a, la) = lo_solved.unwrap_or_else(|| {
+            let a = solve(lo);
+            let la = pile_light(quads, &|i| a[i]);
+            (a, la)
+        });
+        let (b, lb) = hi_solved.unwrap_or_else(|| {
+            let b = solve(hi);
+            let lb = pile_light(quads, &|i| b[i]);
+            (b, lb)
+        });
         let best = if (la - target).abs() <= (lb - target).abs() {
             a
         } else {
             b
         };
-        for (i, &(start, _, _)) in rings.iter().enumerate() {
-            let end = rings.get(i + 1).map_or(quads.len(), |&(next, _, _)| next);
-            for q in &mut quads[start..end] {
-                q.color = best[i];
-                // The ring's quads are flat: both ends take the equalised colour.
-                q.color2 = best[i];
-            }
-        }
+        Self::apply_equalised_rings(quads, rings, &best);
         self.rim_scratch = scratch;
+        Some(best)
     }
 
     /// How far the ring-by-ring rim may sit from the grey pile's light before
@@ -1206,21 +1312,29 @@ impl CursorRainbow {
         if w == 0 || h == 0 || w * h > Self::CARET_RASTER_MAX {
             return 255.0;
         }
+        let table = crate::color_math::relative_luminance_table();
         let level = RAINBOW_FIELD_LEVEL.round() as u32;
         let field = (level << 16) | (level << 8) | level;
+        let field_peak = crate::color_math::relative_luminance_with(table, field) * 255.0;
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         scratch.clear();
         scratch.resize(w * h, field);
         for q in quads {
+            let x_off = (u32::from(q.x) - x0) as usize;
+            let qw = usize::from(q.w);
             for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
-                for xx in u32::from(q.x)..u32::from(q.x) + u32::from(q.w) {
-                    let i = (yy - y0) as usize * w + (xx - x0) as usize;
-                    scratch[i] = crate::spectrum::compose_on_glass(scratch[i], q.color, q.alpha);
+                let row_start = (yy - y0) as usize * w + x_off;
+                for px in &mut scratch[row_start..row_start + qw] {
+                    *px = crate::spectrum::compose_on_glass(*px, q.color, q.alpha);
                 }
             }
         }
-        let peak = scratch.iter().copied().fold(0.0f32, |peak, px| {
-            peak.max(crate::color_math::relative_luminance(px) * 255.0)
+        let peak = scratch.iter().copied().fold(field_peak, |peak, px| {
+            if px == field {
+                peak
+            } else {
+                peak.max(crate::color_math::relative_luminance_with(table, px) * 255.0)
+            }
         });
         self.rim_scratch = scratch;
         peak
@@ -1255,9 +1369,8 @@ fn push_ring(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32
     );
 }
 
-/// Clamp a pixel rect to the window interior and split it into per-cell-row
-/// [`GlowQuad`]s, so the dirty gate and scissor stay exact (the aurora's
-/// `push_rect` contract).
+/// Clamp a pixel rect to the effects box and split it into per-cell-row [`GlowQuad`]s, so the
+/// dirty gate and scissor stay exact (the `effect_util::push_fx_rect` contract).
 fn push_ring_rect(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -1293,8 +1406,7 @@ fn push_ring_rect(
             w: (x1 - x0) as u16,
             h: (band_end - yy) as u16,
             color: premul,
-            // Additive light — this emitter has no other mode (see
-            // [`GlowQuad::alpha`]).
+            // Additive: this emitter has no other mode.
             alpha: 0,
             color2: premul,
             alpha2: 0,
@@ -1303,25 +1415,27 @@ fn push_ring_rect(
     }
 }
 
-/// The family's spectrum at the caret's column, so the block and the ribbon
-/// leaving its cell resolve the same seven anchors.
+/// The family's spectrum at the caret's column, so the block and the ribbon leaving its cell
+/// resolve the same seven anchors.
 ///
-/// `phase` is the ribbon's shared phase-ring clock on the locked path; a
-/// standalone host passes the block's energy-responsive spin ([`IDLE_SPIN`] /
-/// [`ACTIVE_SPIN`]) lifted by [`rainbow_phase_from_unit_turn`] onto one full
-/// sweep. `off` steps further along the sweep (halo rings, glitter dots),
-/// folded by the family's reflection so it never wraps violet into red.
+/// `sweep` is the caret's family position: the ribbon's laid field when hosted, else
+/// [`rainbow_sweep_at`] of its column on the ribbon's phase or on the standalone spin
+/// ([`IDLE_SPIN`] / [`ACTIVE_SPIN`]) lifted by [`rainbow_phase_from_unit_turn`]. `off` steps
+/// further along the sweep (halo rings, glitter dots), folded by the family's reflection so it
+/// never wraps violet into red.
 #[inline]
 fn spectrum_at(sweep: f32, off: f32) -> u32 {
     rainbow_thing_of(rainbow_sweep_reflect(sweep + off))
 }
 
-/// A family colour re-mixed at saturation `s` and value `v`, hue intact: each
-/// channel is pulled toward the peak by `1 − s`, then scaled by `v`. At
-/// `s = 1, v = 1` it is the identity, so a full-energy caret is exactly the
-/// ribbon's colour (`caret_ribbon_and_streaks_share_one_spectrum`).
+/// A family colour re-mixed at saturation `s` and value `v`, hue intact: each channel is pulled
+/// toward the peak by `1 − s`, then scaled by `v`. At `s = 1, v = 1` it is the identity, so a
+/// full-energy caret is exactly the ribbon's colour.
 #[inline]
 fn shade(rgb: u32, s: f32, v: f32) -> u32 {
+    if s == 1.0 && v == 1.0 {
+        return rgb & 0x00FF_FFFF;
+    }
     let (r, g, b) = (
         ((rgb >> 16) & 0xff) as f32,
         ((rgb >> 8) & 0xff) as f32,
@@ -1341,11 +1455,15 @@ const CARET_LIGHT_KNEE: f32 = 0.25;
 /// Toward white adds light without moving hue; only saturation drops.
 /// Bisected (twenty halvings) because the sRGB transfer is nonlinear.
 pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
-    let light = |c: u32| crate::color_math::relative_luminance(c) * 255.0;
     // A caller may ask above the displayable range (the raster backstop adds a
     // margin); white is the answer there.
     let floor = floor.clamp(0.0, 255.0);
-    if floor <= 0.0 || light(rgb) >= floor {
+    if floor <= 0.0 {
+        return rgb;
+    }
+    let table = crate::color_math::relative_luminance_table();
+    let light = |c: u32| crate::color_math::relative_luminance_with(table, c) * 255.0;
+    if light(rgb) >= floor {
         return rgb;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -1364,7 +1482,7 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
 /// over `page`'s own: the functional the rim's light law ([`RIM_LIGHT`])
 /// equalises. Two terms, because the glass draws the glow stream twice:
 ///
-/// 1. `fs_glow` (aterm-gpu `renderer.rs`) adds the premultiplied bytes raw
+/// 1. `fs_glow` (aterm-gpu `shaders/cell.metal`) adds the premultiplied bytes raw
 ///    (byte-exact [`aterm_render::add_sat`], as
 ///    [`crate::spectrum::compose_on_glass`] computes); the blit decodes to
 ///    linear, so this term is `s2l(page + b) − s2l(page)`.
@@ -1377,8 +1495,20 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
 /// headroom clamp is not modelled (rim bytes are far below it). SDR panels and
 /// the CPU renderer skip the aurora pass.
 fn light_on_glass(page: u32, premul: u32) -> f32 {
-    crate::color_math::relative_luminance(crate::spectrum::compose_on_glass(page, premul, 0))
-        + aterm_render::hdr::HDR_GLOW_BOOST * crate::color_math::relative_luminance(premul)
+    light_on_glass_with(crate::color_math::relative_luminance_table(), page, premul)
+}
+
+#[inline]
+fn light_on_glass_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    page: u32,
+    premul: u32,
+) -> f32 {
+    crate::color_math::relative_luminance_with(
+        table,
+        crate::spectrum::compose_on_glass(page, premul, 0),
+    ) + aterm_render::hdr::HDR_GLOW_BOOST
+        * crate::color_math::relative_luminance_with(table, premul)
 }
 
 /// One ring's premultiplied light, solved on the page: the rim's light law
@@ -1400,8 +1530,9 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
         (crate::color_math::relative_luminance(RIM_LIGHT_GREY) - RIM_LIGHT).abs() < 0.005,
         "RIM_LIGHT_GREY is not the encode of RIM_LIGHT"
     );
-    let light = |premul: u32| -> f32 { light_on_glass(page, premul) };
-    let base = light_on_glass(page, 0);
+    let table = crate::color_math::relative_luminance_table();
+    let light = |premul: u32| -> f32 { light_on_glass_with(table, page, premul) };
+    let base = light(0);
     let target = (light(premul_rgb(RIM_LIGHT_GREY, cov)) - base) * scale;
     let candidate = |u: f32| -> u32 {
         if u < 0.0 {
@@ -1410,19 +1541,41 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
             premul_rgb(mix_rgb(arc, 0x00FF_FFFF, u), cov)
         }
     };
-    let added = |u: f32| light(candidate(u)) - base;
     let (mut lo, mut hi) = (-1.0f32, 1.0f32);
+    let mut lo_eval: Option<(u32, f32)> = None;
+    let mut hi_eval: Option<(u32, f32)> = None;
     for _ in 0..22 {
         let mid = 0.5 * (lo + hi);
-        if added(mid) < target {
+        let c = candidate(mid);
+        let added = light(c) - base;
+        if added < target {
             lo = mid;
+            lo_eval = Some((c, added));
         } else {
             hi = mid;
+            hi_eval = Some((c, added));
         }
     }
-    let (a, b) = (candidate(lo), candidate(hi));
     let err = |premul: u32| (light(premul) - base - target).abs();
-    let mut best = if err(a) <= err(b) { a } else { b };
+    let (a, err_a) = match lo_eval {
+        Some((c, added)) => (c, (added - target).abs()),
+        None => {
+            let c = candidate(lo);
+            (c, err(c))
+        }
+    };
+    let (b, err_b) = match hi_eval {
+        Some((c, added)) => (c, (added - target).abs()),
+        None => {
+            let c = candidate(hi);
+            (c, err(c))
+        }
+    };
+    let (mut best, mut best_err) = if err_a <= err_b {
+        (a, err_a)
+    } else {
+        (b, err_b)
+    };
     // Then the last byte: the ray steps all three channels together, so its
     // light is quantised coarsely. Among triples one level away per channel
     // in the same hue sector, pick the nearest to the target (blue's small
@@ -1443,22 +1596,36 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
     };
     let seed = ch(best);
     let sector = sector_of(seed);
-    let mut best_err = err(best);
     for dr in -1..=1 {
+        let r = seed[0] + dr;
+        if !(0..=255).contains(&r) {
+            continue;
+        }
+        let r_packed = (r as u32) << 16;
         for dg in -1..=1 {
+            let g = seed[1] + dg;
+            if !(0..=255).contains(&g) {
+                continue;
+            }
+            let rg_sig = (r - g).signum();
+            if rg_sig != 0 && rg_sig != sector[0] {
+                continue;
+            }
+            let rg_packed = r_packed | ((g as u32) << 8);
             for db in -1..=1 {
-                let c = [seed[0] + dr, seed[1] + dg, seed[2] + db];
-                if c.iter().any(|&v| !(0..=255).contains(&v)) {
+                if dr == 0 && dg == 0 && db == 0 {
                     continue;
                 }
-                if sector_of(c)
-                    .iter()
-                    .zip(sector)
-                    .any(|(&now, was)| now != 0 && now != was)
-                {
+                let b = seed[2] + db;
+                if !(0..=255).contains(&b) {
                     continue;
                 }
-                let packed = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+                let gb_sig = (g - b).signum();
+                let rb_sig = (r - b).signum();
+                if (gb_sig != 0 && gb_sig != sector[1]) || (rb_sig != 0 && rb_sig != sector[2]) {
+                    continue;
+                }
+                let packed = rg_packed | b as u32;
                 let e = err(packed);
                 if e < best_err {
                     best_err = e;
@@ -1498,8 +1665,8 @@ mod tests {
             // No host base: these fixtures pin the theme-polar bloom.
             base: None,
             head_rgb: None,
-            // No host ribbon spine: the colour envelope is `energy`. The
-            // `Some(_)` path is covered by `the_caret_cools_with_its_trail`.
+            // No host ribbon spine: the colour envelope is `energy`. The `Some(_)` path is
+            // covered by `the_caret_cools_with_its_trail_and_not_with_the_ignition_heat`.
             paint: None,
             // …and no host page either, so the light-law solves against the
             // shipped ground for the polarity each fixture names.
@@ -1540,16 +1707,11 @@ mod tests {
         assert_eq!(a, b, "a settled flare's halo is the plain halo");
     }
 
-    /// §7.1 and D4, the landing's caret law on the real seam: after a v2
-    /// meteor's one white frame the block mixes toward its own field stop
-    /// (`spectrum(tri(field_t))`, phase-locked at the spawn) and stays there
-    /// for the whole dwell, with no colour step, even when the abandoned band
-    /// retires mid-dwell.
-    ///
-    /// Drives the host's order: `CursorGlow` with v2 engaged, then the caret
-    /// at the same `now` with the `RainbowConfig` `app_render.rs` builds, at
-    /// 120 Hz: nine typed cells, an idle long enough that the band's exit
-    /// swoosh ends inside the dwell, a 20-cell nav jump and a 400 ms dwell.
+    /// §7.1 and D4, the landing's caret law on the real seam: after a v2 meteor's one white
+    /// frame the block mixes toward its own field stop (`spectrum(tri(field_t))`) and stays
+    /// there for the whole dwell with no colour step, even when the abandoned band retires
+    /// mid-dwell. Drives the host's order at 120 Hz: nine typed cells, an idle, a 20-cell nav
+    /// jump and a 400 ms dwell.
     #[test]
     fn the_caret_settles_on_its_own_stop_without_a_pop() {
         use crate::cursor_glow::{CursorGlow, GlowConfig, GlowStyle};
@@ -1779,9 +1941,8 @@ mod tests {
         worst + 1
     }
 
-    /// The caret's colour law, composed: what the block emits for a base,
-    /// rainbow and mix at energy `e`. The tick and every pin that
-    /// reconstructs a fill go through it.
+    /// The caret's colour law as the tick composes it: what the block emits for a base, rainbow
+    /// and mix at energy `e`. Every pin that reconstructs a fill goes through it.
     fn caret_law(base: u32, rainbow: u32, mix: f32, e: f32) -> u32 {
         lift_to_light_floor(
             mix_rgb(base, rainbow, mix),
@@ -1829,7 +1990,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// The blinking-block variant: flips of the passed phase fire twinkles.
+    /// The blinking-block variant: the only one whose momentum rungs fire twinkles.
     fn blink_cfg() -> RainbowConfig {
         RainbowConfig {
             blinking: true,
@@ -2920,19 +3081,10 @@ mod tests {
         );
     }
 
-    /// The rim's light is a function of the paint and nothing else: the pin
-    /// behind [`RIM_LIGHT`], rasterized because the rim is a pile.
-    ///
-    /// For every shipped caret base, over both shipped dark pages, at five
-    /// paints, the rim is laid at 129 positions along the family sweep (every
-    /// hue the spin can park it on) with a fresh engine at one `now` and
-    /// rasterized over the page through the family's blend. The pile's light
-    /// (summed relative-luminance excess over the page) must agree across
-    /// positions within [`RIM_LIGHT_TOLERANCE`] and rise strictly with paint.
-    ///
-    /// Non-vacuity: the raw arc
-    /// (`shade(spectrum_at(sweep, 0), SAT_MAX, VAL_MAX)`) must spread far
-    /// beyond the tolerance.
+    /// The rim's light is a function of the paint alone ([`RIM_LIGHT`]): for every shipped caret
+    /// base, both shipped dark pages and five paints, the rim rasterized over the page at 129
+    /// sweep positions agrees within `RIM_LIGHT_TOLERANCE` and rises strictly with paint. The
+    /// raw arc must spread far beyond the tolerance (non-vacuity).
     #[test]
     fn the_rim_light_is_hue_invariant_and_monotone_in_paint() {
         /// Ratio `max/min` of the pile's light across the sweep. The budget is
@@ -3120,7 +3272,7 @@ mod tests {
         /// The shipped Default theme's `cursor_color`, which is what
         /// `app_render` hands the block as `base`.
         const BASE: u32 = 0x0050_FA7B;
-        /// The laid field the capture reported.
+        /// The ribbon's laid field at the caret.
         const FIELD: f32 = 0.05;
         /// The burst: 43 characters at about 92 ms/key.
         const KEYS: u32 = 43;
@@ -3193,7 +3345,7 @@ mod tests {
             "…and it must be nowhere near the arc it is leading (#{arc:06X})"
         );
 
-        // ── the fix ─────────────────────────────────────────────────────────
+        // ── colour on the paint spine ───────────────────────────────────────
         let (new, state) = render(quarter, Some(spine.value(quarter)));
         assert!(
             rgb_max_delta(new, arc) < rgb_max_delta(new, BASE),
@@ -3215,16 +3367,12 @@ mod tests {
 
         // ── the release: one continuous walk down the spine ─────────────────
         //
-        // The ceiling is derived from the spine's own step. The colour terms
-        // it drives span `MIX_MAX - MIX_IDLE`, `SAT_MAX - SAT_IDLE` and
-        // `VAL_MAX - VAL_IDLE`, each moving a channel by at most 255 per unit.
-        // Four flat levels are added: `2` of `f32 -> u8` rounding (`shade` and
-        // `mix_rgb` at each end of a step) and `2` for
-        // [`lift_to_light_floor`]'s per-frame re-solve, which is a regression
-        // pin on the shipped caret rather than a derivation.
-        //
-        // A caret that snapped to its base moves tens of levels in a step the
-        // spine barely moved.
+        // The ceiling derives from the spine's own step: the colour terms span
+        // `MIX_MAX - MIX_IDLE`, `SAT_MAX - SAT_IDLE` and `VAL_MAX - VAL_IDLE`, each moving a
+        // channel by at most 255 per unit, plus four flat levels: 2 of `f32 -> u8` rounding
+        // (`shade` and `mix_rgb`) and 2 for [`lift_to_light_floor`]'s per-frame re-solve (a
+        // regression pin, not a derivation). A caret that snapped to its base moves tens of
+        // levels in a step the spine barely moved.
         const STEP: Duration = Duration::from_millis(16);
         let colour_span =
             ((MIX_MAX - MIX_IDLE) + (SAT_MAX - SAT_IDLE) + (VAL_MAX - VAL_IDLE)) * 255.0;
@@ -3405,7 +3553,7 @@ mod tests {
         );
         assert!(
             // The caret walks the arc while the mark unrolls (seven distinct
-            // stops) and then holds the head (owner, 2026-08-30).
+            // stops) and then holds the head.
             colours.len() >= 5,
             "the streaming run must traverse the unroll's colours: {colours:#x?}"
         );
@@ -3413,30 +3561,36 @@ mod tests {
 
     /// The settle split is a partition: [`CursorRainbow::settling`] is disjoint
     /// from [`CursorRainbow::is_active`], and together they are exactly
-    /// `energy > SETTLED || paint > SETTLED || twinkling` for every latched
-    /// combination, with the last two frames equal or not.
+    /// `energy > SETTLED || paint > SETTLED || twinkling || flaring` for every
+    /// latched combination, with the last two frames equal or not.
     #[test]
     fn the_settle_split_is_a_partition_of_still_moving() {
         let levels = [0.0_f32, SETTLED_ENERGY, SETTLED_ENERGY + 1e-4, 0.3, 1.0];
         for &energy in &levels {
             for &paint in &levels {
                 for twinkling in [false, true] {
-                    for repeated in [false, true] {
-                        let rb = CursorRainbow {
-                            energy,
-                            paint,
-                            twinkling,
-                            fp_last: 7,
-                            fp_prev: if repeated { 7 } else { 8 },
-                            ..CursorRainbow::default()
-                        };
-                        let moving = energy > SETTLED_ENERGY || paint > SETTLED_ENERGY || twinkling;
-                        let at = format!(
-                            "energy={energy} paint={paint} twinkling={twinkling} \
-                             repeated={repeated}"
-                        );
-                        assert_eq!(rb.is_active() || rb.settling(), moving, "cover: {at}");
-                        assert!(!(rb.is_active() && rb.settling()), "disjoint: {at}");
+                    for flaring in [false, true] {
+                        for repeated in [false, true] {
+                            let rb = CursorRainbow {
+                                energy,
+                                paint,
+                                twinkling,
+                                flaring,
+                                fp_last: 7,
+                                fp_prev: if repeated { 7 } else { 8 },
+                                ..CursorRainbow::default()
+                            };
+                            let moving = energy > SETTLED_ENERGY
+                                || paint > SETTLED_ENERGY
+                                || twinkling
+                                || flaring;
+                            let at = format!(
+                                "energy={energy} paint={paint} twinkling={twinkling} \
+                                 flaring={flaring} repeated={repeated}"
+                            );
+                            assert_eq!(rb.is_active() || rb.settling(), moving, "cover: {at}");
+                            assert!(!(rb.is_active() && rb.settling()), "disjoint: {at}");
+                        }
                     }
                 }
             }
@@ -3463,23 +3617,17 @@ mod tests {
         out
     }
 
-    /// The colour release is drawn to its last step, on demand.
+    /// The colour release is drawn to its last step, on demand. The caret keeps cooling on the
+    /// paint spine one u8 step every few frames, so two identical frames arrive long before the
+    /// fade ends. Three twins read the same host truth per hand:
     ///
-    /// The body settles quickly but the caret keeps cooling on the paint spine
-    /// one u8 step every few frames, so two identical frames arrive long before
-    /// the fade ends. Three twins read the same host truth per hand (burst
-    /// peak, lane period, theme, caret base):
-    ///
-    /// * level: ticked every frame until the caret releases
-    ///   (`!is_active() && !settling()`); the ground truth.
-    /// * park-on-inactive: ticked while `is_active()` and parked on the first
-    ///   `false`; the negative control, which parks mid-fade.
+    /// * level: ticked every frame until the caret releases; the ground truth.
+    /// * park-on-inactive: parked on the first `!is_active()`; the negative control.
     /// * demand: the frame train while `is_active()`,
     ///   [`CursorRainbow::next_change_deadline`] while `settling()`.
     ///
-    /// Demand must release on the same frame as level, and a copy forked at
-    /// each wake and ticked every frame with the true inputs may not change
-    /// before the next wake.
+    /// Demand must release on the same frame as level, and a copy forked at each wake and
+    /// ticked every frame with the true inputs may not change before the next wake.
     #[test]
     fn the_caret_colour_release_is_drawn_to_its_last_step_on_demand() {
         const HEAD: u32 = 0x00FF_5A4E;
@@ -3578,7 +3726,7 @@ mod tests {
                 parked.settling()
             );
 
-            // Demand: the host rule after the port.
+            // Demand: the host rule.
             let mut demand = CursorRainbow::default();
             let mut demand_ticks = 0_usize;
             let mut ms = 0_u64;
@@ -3704,5 +3852,234 @@ mod tests {
             !rb.settling() && rb.next_change_deadline(first + frame, frame).is_none(),
             "an inert tick drops the latched inputs and the release with them"
         );
+    }
+
+    #[test]
+    fn flare_pop_drives_fingerprint_on_a_pinned_white_cursor() {
+        let t0 = Instant::now();
+        let wide_geom = Geom {
+            cw: 93,
+            ch: 186,
+            rows: 12,
+            cols: 40,
+            win_w: 3720,
+            win_h: 2232,
+            ..geom()
+        };
+        // Both samples sit inside `FLARE_WHITE_HOLD_S` (4 ms), so `fill` is
+        // pinned to `0x00FF_FFFF` for both, while `flare_pop` decays and pulls
+        // the outer halo rings inward.
+        let mut out_0 = Vec::new();
+        let f_0 = CursorRainbow::default().tick(
+            Some((2, 5)),
+            t0,
+            0.0,
+            false,
+            true,
+            wide_geom,
+            &RainbowConfig {
+                paint: Some(1.0),
+                flare_at: Some(t0),
+                ..cfg()
+            },
+            &mut out_0,
+        );
+        let mut out_3ms = Vec::new();
+        let f_3ms = CursorRainbow::default().tick(
+            Some((2, 5)),
+            t0,
+            0.0,
+            false,
+            true,
+            wide_geom,
+            &RainbowConfig {
+                paint: Some(1.0),
+                flare_at: Some(t0 - Duration::from_millis(3)),
+                ..cfg()
+            },
+            &mut out_3ms,
+        );
+        assert_eq!(
+            f_0.fill, f_3ms.fill,
+            "fixture: white hold keeps fill identical across the first 3 ms of the flare"
+        );
+        assert_ne!(
+            out_0, out_3ms,
+            "fixture: flare_pop decay moves the halo rings during the white hold"
+        );
+        assert_ne!(
+            f_0.fp, f_3ms.fp,
+            "the flare ring pop must change the frame fingerprint even when fill and phase are identical"
+        );
+    }
+
+    #[test]
+    fn meteor_flare_and_relight_hold_keep_caret_active_and_wake_for_decay() {
+        let t0 = Instant::now();
+        let frame = Duration::from_millis(20);
+        let mut rb = CursorRainbow::default();
+        let mut out = Vec::new();
+        let steady_cfg = |paint: f32, flare_at: Option<Instant>| RainbowConfig {
+            blinking: false,
+            paint: Some(paint),
+            flare_at,
+            ..cfg()
+        };
+
+        // Across the 180 ms spring-snap flare (`age < SPRING_SNAP_RESPONSE_S`),
+        // a cold navigation jump (`energy == 0.0`, `blinking == false` so no
+        // twinkle) keeps `is_active() == true` even near the end of the relax
+        // when consecutive quantized frames match.
+        for step in 0..9_u64 {
+            let at = t0 + Duration::from_millis(step * 20);
+            out.clear();
+            rb.tick_with_family_phase(
+                Some((2, 5)),
+                at,
+                0.0,
+                256.0,
+                0.25,
+                false,
+                true,
+                geom(),
+                &steady_cfg(1.0, Some(t0)),
+                &mut out,
+            );
+            assert!(
+                rb.is_active() && !rb.settling(),
+                "step {step} ({} ms): caret must stay active while flare_at is within 180 ms",
+                step * 20
+            );
+        }
+
+        // At 180 ms (`age == SPRING_SNAP_RESPONSE_S`), `flare_at` expires while
+        // `caret_paint` is still at the end of its flat `1.0` hold (`paint == 1.0`,
+        // `paint_prev == 1.0`). If the quantized fingerprint repeated on that
+        // boundary frame, `next_change_deadline` must wake on the very next frame
+        // (`at + frame`) rather than sleeping across `SETTLE_POLL_CAP` (250 ms).
+        let boundary = t0 + Duration::from_millis(180);
+        out.clear();
+        rb.tick_with_family_phase(
+            Some((2, 5)),
+            boundary,
+            0.0,
+            256.0,
+            0.25,
+            false,
+            true,
+            geom(),
+            &steady_cfg(1.0, None),
+            &mut out,
+        );
+        assert_eq!(
+            rb.next_change_deadline(boundary, frame),
+            Some(boundary + frame),
+            "flat live paint plateau at the end of the 180 ms relight hold must wake on the next frame"
+        );
+    }
+
+    #[test]
+    fn cursor_cell_and_visibility_drive_fp_and_rim_memo_skips_repeat_rasters() {
+        let t0 = Instant::now();
+        let g = geom();
+        let c = RainbowConfig {
+            blinking: false,
+            paint: Some(0.8),
+            ..cfg()
+        };
+        let mut rb = CursorRainbow::default();
+        let mut out_a = Vec::new();
+        let mut out_b = Vec::new();
+
+        // 1. Vertical move at the same column (and under a constant v2 field
+        // stop) moves the halo quads and must change `RainbowFrame.fp`.
+        let fa = rb.tick_with_family_phase(
+            Some((2, 5)),
+            t0,
+            0.0,
+            128.0,
+            0.25,
+            false,
+            true,
+            g,
+            &c,
+            &mut out_a,
+        );
+        let fb = rb.tick_with_family_phase(
+            Some((3, 5)),
+            t0,
+            0.0,
+            128.0,
+            0.25,
+            false,
+            true,
+            g,
+            &c,
+            &mut out_b,
+        );
+        assert_eq!(fa.fill, fb.fill);
+        assert_ne!(out_a, out_b, "halo rings move with the cursor row");
+        assert_ne!(
+            fa.fp, fb.fp,
+            "a cursor row move must change RainbowFrame.fp"
+        );
+
+        // Hiding the cursor (`Some((0, 0))` -> `None`) drops the halo quads and
+        // changes `fp` without arming `is_active()` at rest.
+        let mut rest_rb = CursorRainbow::default();
+        out_a.clear();
+        let f_vis = rest_rb.tick(Some((0, 0)), t0, 0.0, false, true, g, &cfg(), &mut out_a);
+        out_b.clear();
+        let f_hid = rest_rb.tick(None, t0, 0.0, false, true, g, &cfg(), &mut out_b);
+        assert!(!out_a.is_empty() && out_b.is_empty());
+        assert_ne!(
+            f_vis.fp, f_hid.fp,
+            "hiding the cursor must change RainbowFrame.fp"
+        );
+        assert!(
+            !rest_rb.is_active(),
+            "a resting cursor visibility change does not arm the animation timer"
+        );
+
+        // 2. When the integer ring geometry and palette repeat on the next
+        // frame, `rim_memo` serves both `equalise_rim_light` and `rim_light_peak`
+        // without touching `rim_scratch`, producing bit-identical output to a
+        // fresh un-memoised instance.
+        let mut memo_rb = CursorRainbow::default();
+        out_a.clear();
+        let first = memo_rb.tick_with_family_phase(
+            Some((2, 5)),
+            t0,
+            0.0,
+            128.0,
+            0.25,
+            false,
+            true,
+            g,
+            &c,
+            &mut out_a,
+        );
+        let first_quads = out_a.clone();
+        memo_rb.rim_scratch = Vec::new();
+        out_b.clear();
+        let second = memo_rb.tick_with_family_phase(
+            Some((2, 5)),
+            t0,
+            0.0,
+            128.0,
+            0.25,
+            false,
+            true,
+            g,
+            &c,
+            &mut out_b,
+        );
+        assert_eq!(
+            memo_rb.rim_scratch.capacity(),
+            0,
+            "rim_memo hit must skip both equalise_rim_light and rim_light_peak rasterizations"
+        );
+        assert_eq!((first.fill, first.fp), (second.fill, second.fp));
+        assert_eq!(first_quads, out_b);
     }
 }

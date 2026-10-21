@@ -313,6 +313,9 @@ pub(crate) struct PaletteLive {
     /// View ▸ Stats Bars' radio: the form the App applies (`[sys]
     /// stats_bars`); `None` in a pure test that names none.
     pub stats_bars: Option<crate::stats_deck::StatsBars>,
+    /// View ▸ Deck Size's radio: the choice the App applies (`[sys]
+    /// stats_deck_size`); `None` in a pure test that names none.
+    pub deck_size: Option<crate::stats_plan::DeckSizePref>,
     /// The Agents rows' live bits: a local need (Next That Needs You), a
     /// fleet (Read the Fleet, Fleet Machines), a window (Overview), and why
     /// Summarize cannot start, `None` when it can.
@@ -747,6 +750,14 @@ impl PaletteState {
                             == action
                                 .stats_bars_form()
                                 .unwrap_or(crate::stats_deck::StatsBars::Deck),
+                    );
+                }
+                MenuAction::DeckSizeAuto
+                | MenuAction::DeckSizeFull
+                | MenuAction::DeckSizeFolded => {
+                    row.checked = Some(
+                        live.deck_size.unwrap_or_default()
+                            == action.deck_size_pref().unwrap_or_default(),
                     );
                 }
                 // The lens hangs from the bars: none to hang from, nothing to open.

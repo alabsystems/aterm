@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for stable tab and view identity.
-//!
-//! This test drives the genuine [`TabSet`], [`ViewStore`], and monotonic
-//! [`IdAllocator`] implementation.  Its projection is deliberately independent
-//! of vector indices: tab order is projected as chrome order, while live views
-//! are ordered by their stable wire identity.  Every real operation must be an
-//! admitted transition of the drift-free `NativeTabIdentity` model.
+//! Conformance of the real [`TabSet`], [`ViewStore`] and [`IdAllocator`] to the
+//! `NativeTabIdentity` model. Tabs project in chrome order and live views in stable
+//! wire-identity order, never in storage order.
 
 #![cfg(test)]
 
@@ -121,8 +117,8 @@ impl RealTabs {
             );
         }
 
-        // HashMap iteration order is intentionally irrelevant. Stable identity
-        // order gives the model its compact live-view slots after a removal.
+        // Sorted by identity, so HashMap order is irrelevant and the live-view
+        // slots stay compact after a removal.
         let mut live: Vec<ViewId> = self.views.iter().map(|(id, _)| id).collect();
         live.sort_unstable();
         for (index, key) in ["live_view_one", "live_view_two", "live_view_three"]
@@ -213,8 +209,8 @@ fn real_tab_set_conforms_across_open_select_reorder_and_close() {
         assert!(real.tabs.reorder(second, 2));
     });
 
-    // Close the selected first tab. The shipping TabSet moves selection and
-    // focus to the live tab now occupying that chrome position.
+    // Closing the selected first tab moves selection and focus to the tab now
+    // in that chrome position.
     drive(&model, &mut real, "SelectFirst", |real| {
         assert!(real.tabs.switch_to_index(0));
     });
@@ -223,17 +219,15 @@ fn real_tab_set_conforms_across_open_select_reorder_and_close() {
     let after_close = real.project(&model);
     assert_transition(&model, &before_close, &after_close, "CloseFirst");
 
-    // Negative control: a close router that leaves active/focus addressed to
-    // retired identities is rejected and violates the named live-reference
-    // invariant. This projection does not read the corrected TabSet selection.
+    // Negative control, hand-built: a close that leaves active/focus on retired
+    // identities is not admitted and breaks the live-reference invariant.
     let mut dangling = after_close.clone();
     dangling.insert("active_tab", after_close["retired_tab_id"]);
     dangling.insert("focused_view", after_close["retired_view_id"]);
     assert_eq!(admits(&model, &before_close, &dangling), None);
     assert!(!model.check_invariant("ActiveReferencesLiveTab", &dangling));
 
-    // A subsequent allocation comes from both genuine monotonic allocators,
-    // never either retired identity.
+    // The next allocation reuses neither retired identity.
     let before_reopen = real.project(&model);
     real.open();
     let after_reopen = real.project(&model);

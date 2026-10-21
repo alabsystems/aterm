@@ -67,7 +67,7 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::acts::{Act, TaskFace};
+use aterm_agent::harness::acts::{Act, HoldLeg, LandHeld, TaskFace};
 
 use crate::App;
 use crate::claude_lights::{ChipGlass, Clock, Weekday};
@@ -324,7 +324,7 @@ impl PauseGlass {
         allow(
             dead_code,
             reason = "the chips' accessibility nodes describe it; the tree is built only under \
-                      the `a11y_tree` cfg (Linux)"
+                      the `a11y_tree` cfg (Linux, macOS and Windows)"
         )
     )]
     #[must_use]
@@ -416,6 +416,16 @@ pub(crate) struct SessionGlass {
     end: Option<EndGlass>,
     /// How many ends this session told: the next end's [`EndGlass::serial`].
     ends: u32,
+    /// WHY LAND STILL HOLDS (§12.3.3 item 3, slice 3c), as the session's
+    /// loop last told it ([`on_land_held`]), with its `since` stamped once:
+    /// what the SESSIONS state line, the tab's hover and the Overview, the
+    /// menu bar's worker row and the chip's title (the W4 title slice) say
+    /// of a landing that has not landed — each only while the session's
+    /// Autopilot is Land and its chip wears `⤓ land` ([`App::shown_hold`]).
+    /// Never on [`ChipGlass`], in `LightsKey` or the chip's term: a move
+    /// bumps the trail's generation, which a title is built again from only
+    /// while someone reads it.
+    hold: Option<HeldGlass>,
 }
 
 /// THE KIND OF A TASK'S END (§11.2.3, item 1): under FOREVER CRUISE /
@@ -494,6 +504,13 @@ impl SessionGlass {
     #[must_use]
     pub(crate) const fn end(&self) -> Option<EndGlass> {
         self.end
+    }
+
+    /// Land's hold as the session's loop last told it, whatever the
+    /// session's word now ([`App::shown_hold`] reads it under Land alone).
+    #[must_use]
+    pub(crate) const fn hold(&self) -> Option<HeldGlass> {
+        self.hold
     }
 
     /// AN END IS TOLD (`App::note_harness_end`): `face`, at the task face's
@@ -686,7 +703,7 @@ impl SessionGlass {
         allow(
             dead_code,
             reason = "the chips' accessibility nodes describe it; the tree is built only under \
-                      the `a11y_tree` cfg (Linux)"
+                      the `a11y_tree` cfg (Linux, macOS and Windows)"
         )
     )]
     #[must_use]
@@ -747,7 +764,7 @@ pub(crate) fn trail_title(
     allow(
         dead_code,
         reason = "the chips' accessibility nodes describe it; the tree is built only under the \
-                  `a11y_tree` cfg (Linux)"
+                  `a11y_tree` cfg (Linux, macOS and Windows)"
     )
 )]
 pub(crate) fn spoken_last_now(
@@ -842,7 +859,352 @@ pub(crate) fn on_pause(app: &mut App, session: u64, plan: Option<crate::PausePla
     true
 }
 
+/// LAND'S HOLD of session `session` moved to `held` (`None`: none stands;
+/// `HarnessFact::LandHeld`, §12.3.3 item 3, slice 3c): kept on the
+/// session's glass with its `since` stamped ONCE — its local clock and day,
+/// read here where the hold's `since` is new and kept as it was where only
+/// the legs or the nudges moved ([`HeldGlass::of`]). The hold moves nothing
+/// the chip draws at rest, so the trail's generation moves instead: a title
+/// someone is reading is built again, and a frame at rest keys nothing new.
+/// Whether the glass moved.
+pub(crate) fn on_land_held(app: &mut App, session: u64, held: Option<LandHeld>) -> bool {
+    let was = app.harness_glass.get(&session).copied().unwrap_or_default();
+    let hold = held.map(|held| HeldGlass::of(held, was.hold));
+    if was.hold == hold {
+        return false;
+    }
+    let mut now = was;
+    now.hold = hold;
+    now.trail_gen = now.trail_gen.wrapping_add(1);
+    app.harness_glass.insert(session, now);
+    true
+}
+
+/// LAND'S HOLD ON THE GLASS (§12.3.1, §12.3.3 item 3): the hold the loop
+/// told ([`LandHeld`]: its legs, open words and counts, its nudges) and its
+/// `since` as the local clock and day its unix second falls on, read once
+/// where the hold arrived — never a countdown: nothing repaints it. `Copy`,
+/// no text: its words are built where a reader asks ([`hold_words`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct HeldGlass {
+    /// The hold as told.
+    pub(crate) held: LandHeld,
+    /// When the land act that began it was ledgered, as a clock and day;
+    /// `None` where the loop could not say (an older ledger's episode).
+    pub(crate) since: Option<Stamp>,
+}
+
+impl HeldGlass {
+    /// The glass of `held`, its `since` stamped where it is new: kept from
+    /// `was` where that held the same `since_ms` (a nudge, a yield's legs),
+    /// else read in the zone's offset at that instant — UTC's where the zone
+    /// cannot be read, the trail's rule.
+    #[must_use]
+    pub(crate) fn of(held: LandHeld, was: Option<HeldGlass>) -> Self {
+        let since = match was {
+            Some(was) if was.held.since_ms == held.since_ms => was.since,
+            _ => held.since_ms.map(|ms| {
+                let at_unix = ms.div_euclid(1000);
+                Stamp::at(at_unix).unwrap_or_else(|| {
+                    let minute = at_unix.rem_euclid(86_400) / 60;
+                    Stamp {
+                        clock: Clock::of_minute(u16::try_from(minute).unwrap_or(0)),
+                        day: at_unix.div_euclid(86_400),
+                    }
+                })
+            }),
+        };
+        Self { held, since }
+    }
+
+    /// Whether a land act's yield was read and its legs stand (`not landed
+    /// yet: …`); else the hold says only `landing since …`.
+    #[must_use]
+    pub(crate) const fn read(self) -> bool {
+        self.held.read && self.held.legs != 0
+    }
+}
+
+/// THE FIVE FORMS OF A HOLD'S WORDS ([`hold_words`], §12.3.1): where they
+/// are read, and how much room and which clock that place has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoldForm {
+    /// The chip's title, after `autopilot: land — ` (the W4 title slice
+    /// wires it): its legs title-safe, its `since` and nudges after ` · `.
+    Title,
+    /// Settings ▸ Harness's SESSIONS state line: wrapped, never cut, its
+    /// clock with its weekday on another day.
+    Line,
+    /// The tab's hover, after `driven by aterm (land: `: no clock (it is
+    /// composed at a push and read long after), the need named by `needs
+    /// you` alone (its own lines stand above it).
+    Hover,
+    /// The menu bar's landing worker row's tip, and the Overview's line
+    /// under a held chip: the hover's legs and the nudges, no clock (the
+    /// menu keeps ages, composed at paint; the Overview is composed at a
+    /// glance's rebuild and read long after).
+    Tip,
+    /// The chip's accessibility description's lead (the W4 title slice
+    /// wires it): one sentence a leg, glyph-free.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "built and tested here (slice 3c); the W4 title slice puts it in the \
+                      chip's accessibility description"
+        )
+    )]
+    Spoken,
+}
+
+/// WHY LAND STILL HOLDS, IN WORDS (§12.3.1): ONE function, five forms
+/// ([`HoldForm`]). Where a land act's yield was read ([`HeldGlass::read`]):
+/// `not landed yet:` and its legs in the order the owner can act on them —
+/// a need (`needs you: <the need>[ (+N more)]`, the published need's own
+/// words `need` where one stands, else `a need named earlier in its
+/// reply`), the repository's counts (each only where not zero: `1 changed
+/// file`, `1 untracked file`, `1 stash`, `2 unpushed commits`, `4 commits
+/// not on the remote main`), the open work Land's strict reading named
+/// (`open work in its report: follow-up, unchecked box`, [`open_leg`]), no
+/// defense (`no “Nothing left:” defense yet`), a reply too tall (`a reply
+/// too tall to read whole`) — joined `; `, and inside them nothing else separates them, so
+/// a title's cut marks hold. Then, where the form has a clock, `landing
+/// since 14:02` (`Fri 14:02` on another day than `today`) and the nudges.
+/// Before a yield is read only that clock part stands, the hover says
+/// nothing (`None`: main's `land`) and the tip only the nudges where there
+/// are any. Composed where a reader asks, never per frame.
+#[must_use]
+pub(crate) fn hold_words(
+    hold: &HeldGlass,
+    need: Option<&crate::needs::HarnessAsk>,
+    form: HoldForm,
+    today: Option<i64>,
+) -> Option<String> {
+    let sep = crate::native_ui::FACT_SEPARATOR;
+    let held = hold.held;
+    let nudges = match held.nudges {
+        0 => None,
+        1 => Some("1 nudge".to_owned()),
+        n => Some(format!("{n} nudges")),
+    };
+    let since = |between: &str| {
+        let head = match hold.since {
+            Some(at) => format!("landing since {}", at.words(today)),
+            None => "landing".to_owned(),
+        };
+        match &nudges {
+            Some(n) => format!("{head}{between}{n}"),
+            None => head,
+        }
+    };
+    let legs = || {
+        held.legs_held()
+            .map(|leg| leg_words(held, leg, need, form))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    match form {
+        HoldForm::Title if hold.read() => {
+            Some(format!("not landed yet: {}{sep}{}", legs(), since(", ")))
+        }
+        HoldForm::Title => Some(since(", ")),
+        HoldForm::Line if hold.read() => {
+            Some(format!("not landed yet: {}{sep}{}", legs(), since(sep)))
+        }
+        HoldForm::Line => Some(since(sep)),
+        HoldForm::Hover => hold.read().then(|| format!("not landed yet, {}", legs())),
+        HoldForm::Tip if hold.read() => Some(match nudges {
+            Some(n) => format!("not landed yet: {}{sep}{n}", legs()),
+            None => format!("not landed yet: {}", legs()),
+        }),
+        HoldForm::Tip => nudges,
+        HoldForm::Spoken => {
+            let head = match hold.since {
+                Some(at) => match at.day_words(today, true) {
+                    Some(day) => format!("Landing since {day} at {}", at.clock.as_str()),
+                    None => format!("Landing since {}", at.clock.as_str()),
+                },
+                None => "Landing".to_owned(),
+            };
+            let since = match &nudges {
+                Some(n) => format!("{head}, {n}."),
+                None => format!("{head}."),
+            };
+            if !hold.read() {
+                return Some(since);
+            }
+            let mut out = String::from("Not landed yet.");
+            for leg in held.legs_held() {
+                out.push(' ');
+                out.push_str(&spoken_leg(held, leg, need));
+            }
+            out.push(' ');
+            out.push_str(&since);
+            Some(out)
+        }
+    }
+}
+
+/// One leg of a hold in `form`'s words ([`hold_words`]): the title's need
+/// made title-safe, the hover's and tip's need `needs you` alone.
+fn leg_words(
+    held: LandHeld,
+    leg: HoldLeg,
+    need: Option<&crate::needs::HarnessAsk>,
+    form: HoldForm,
+) -> String {
+    match leg {
+        HoldLeg::Needs => match (form, need) {
+            (HoldForm::Hover | HoldForm::Tip, _) => "needs you".to_owned(),
+            (_, Some(ask)) => {
+                let words = format!("needs you: {}{}", ask.first, ask.more_words());
+                if form == HoldForm::Title {
+                    title_safe(&words)
+                } else {
+                    words
+                }
+            }
+            (_, None) => "a need named earlier in its reply".to_owned(),
+        },
+        HoldLeg::Repo => repo_words(held),
+        HoldLeg::Open => open_leg(held.open_words()),
+        HoldLeg::Defense => "no \u{201c}Nothing left:\u{201d} defense yet".to_owned(),
+        HoldLeg::Cut => "a reply too tall to read whole".to_owned(),
+    }
+}
+
+/// One leg as a screen reader hears it: a sentence, glyph-free.
+fn spoken_leg(held: LandHeld, leg: HoldLeg, need: Option<&crate::needs::HarnessAsk>) -> String {
+    match leg {
+        HoldLeg::Needs => match need {
+            Some(ask) => {
+                let more = match ask.more {
+                    0 => String::new(),
+                    n => format!(" And {n} more."),
+                };
+                format!("Needs you: {}.{more}", speakable(&ask.first))
+            }
+            None => "A need named earlier in its reply.".to_owned(),
+        },
+        HoldLeg::Repo => format!("{}.", repo_words(held)),
+        // The line's words, each said (`#n` `number n`, `%` `percent`).
+        HoldLeg::Open => {
+            let words: Vec<String> = held
+                .open_words()
+                .map(speakable)
+                .filter(|w| !w.is_empty())
+                .collect();
+            if words.is_empty() {
+                "Open work in its report.".to_owned()
+            } else {
+                format!("Open work in its report: {}.", words.join(", "))
+            }
+        }
+        HoldLeg::Defense => "No Nothing left defense yet.".to_owned(),
+        HoldLeg::Cut => "A reply too tall to read whole.".to_owned(),
+    }
+}
+
+/// THE OPEN LEG (§12.3.1, §12.3.5): the open work Land's strict reading
+/// named, in the words its nudge's suffix gave the agent (`Your report still
+/// names open work (unchecked box, a part)`): `open work in its report:
+/// unchecked box, a part`. Never in quotation marks: the strict reading
+/// names a line by a spelling it matched (`follow-up`), by its own word for
+/// a kind of line (`unchecked box`, `%`, `a question`) or by its family's
+/// word for a row (`local`, `a part`), and one spelling can be either
+/// (`not done` is a status row and a family's word), so a quote would say
+/// the report holds words it may not. The owner sees the word the nudge
+/// named, the misread in one look. `open work in its report` where the
+/// hold kept no word.
+fn open_leg<'a>(words: impl Iterator<Item = &'a str>) -> String {
+    let words: Vec<&str> = words.collect();
+    if words.is_empty() {
+        "open work in its report".to_owned()
+    } else {
+        format!("open work in its report: {}", words.join(", "))
+    }
+}
+
+/// The repository's work in words: each count only where it is not zero,
+/// joined `, ` (a leg's own words hold no `; `); the probe's own words where
+/// it named work and counted none.
+fn repo_words(held: LandHeld) -> String {
+    let count = |n: u16, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    let parts: Vec<String> = [
+        count(held.changed, "changed file", "changed files"),
+        count(held.untracked, "untracked file", "untracked files"),
+        count(held.stashes, "stash", "stashes"),
+        count(held.unpushed, "unpushed commit", "unpushed commits"),
+        count(
+            held.unlanded,
+            "commit not on the remote main",
+            "commits not on the remote main",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        "work no remote main has".to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// A worker's words made safe for the chip's title (§12.2.3 item 6): its
+/// ` · ` and ` — `, which the title reads as its cut marks, become `, `.
+fn title_safe(words: &str) -> String {
+    words
+        .replace(crate::native_ui::FACT_SEPARATOR, ", ")
+        .replace(" \u{2014} ", ", ")
+}
+
+/// Words as a screen reader says them (§12.2.3 item 6, the face table's
+/// rule): letters, digits, spaces and `.:,` alone — `&` said `and`, `%`
+/// `percent` and `#` `number` (`#45`, `90%`: words, where dropped they said
+/// nothing), `▸` a comma, a hyphen or a dash a space, anything else dropped
+/// — and the spaces folded.
+fn speakable(words: &str) -> String {
+    let mut out = String::with_capacity(words.len());
+    for c in words.chars() {
+        match c {
+            '&' => out.push_str(" and "),
+            '%' => out.push_str(" percent "),
+            '#' => out.push_str(" number "),
+            '\u{25b8}' => out.push(','),
+            '-' | '\u{2010}'..='\u{2014}' => out.push(' '),
+            c if c.is_alphanumeric() || matches!(c, '.' | ':' | ',') => out.push(c),
+            c if c.is_whitespace() => out.push(' '),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl App {
+    /// LAND'S HOLD OF SESSION `session` AS ITS SURFACES SHOW IT (§12.3.3
+    /// item 3, 3b's contract in §12.3.10): the hold on its glass, only while
+    /// its chip's face is `⤓ land` ([`crate::claude_lights::ChipFace::of`]
+    /// over its view and glass: its own word, else the default, is Land, a
+    /// harness runs it, and its task is open or unknown). The loop reads the
+    /// word only where it decides, so a switch from Land to Cruise at a held
+    /// point is told `None` only at the loop's next read; the window owns
+    /// the word and sees it change at once, so its surfaces never say
+    /// `landing since …` beside a `∞` chip. One map lookup, and the
+    /// session's Autopilot (leaf locks) only where a hold stands.
+    #[must_use]
+    pub(crate) fn shown_hold(&self, session: u64) -> Option<HeldGlass> {
+        let hold = self.harness_glass.get(&session)?.hold?;
+        let glass = self.chip_glass(session);
+        (crate::claude_lights::ChipFace::of(self.session_autopilot(session).1, &glass)
+            == crate::claude_lights::ChipFace::Land)
+            .then_some(hold)
+    }
+
     /// Whether the act ticker's label is shown at all: `[claude_footer]
     /// acts` on (the default) and serious mode off
     /// (`SeriousEffect::HarnessTicker`). Off either way, acts still go into
@@ -957,3 +1319,7 @@ mod tests;
 #[cfg(test)]
 #[path = "harness_cheer_tests.rs"]
 mod cheer_tests;
+
+#[cfg(test)]
+#[path = "harness_hold_tests.rs"]
+pub(crate) mod hold_tests;

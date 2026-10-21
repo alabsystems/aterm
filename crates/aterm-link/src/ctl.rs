@@ -34,7 +34,7 @@
 //! just its last field, or an attacker-sized earlier field leaves the line over
 //! the bound and the record with nowhere to go.
 //!
-//! THE FRAMING IS THE WRITER'S TOO. aterm ends a request at its first `\n` and
+//! The framing is the writer's too. aterm ends a request at its first `\n` and
 //! splits its fields on any whitespace, and the bridge's lane is owner-class
 //! over the active session — so one value that carried a `\n` onto a line would
 //! be a second verb run with that authority, and one that carried a `\r`, a tab
@@ -61,19 +61,18 @@ use std::os::unix::net::UnixStream;
 
 use aterm_types::control_verbs::{framing_of, Framing};
 
-/// The largest request line this client will WRITE, newline excluded.
+/// The largest request line this client will write, newline excluded.
 ///
 /// One byte under aterm's `MAX_REQUEST_LINE` (64 KiB, newline excluded): an
 /// off-by-one in either implementation must cost an error, not a fleet halt.
 pub const REQUEST_LINE_MAX: usize = aterm_types::control_verbs::MAX_REQUEST_LINE - 1;
 
-/// The largest framed BODY this client will read, and the ceiling on the byte
+/// The largest framed body this client will read, and the ceiling on the byte
 /// count a reply header may declare.
 ///
-/// `OK <n>` is written by whatever is on the socket — and `notify` points this
-/// client at an operator-named `--sock`, which may be stale or squatted — so an
-/// unchecked count is an allocation request (`OK 18446744073709551615` aborts).
-/// `aterm-ctl`'s `MAX_BODY_BYTES` caps the same value for the same reason.
+/// `OK <n>` is written by whatever is on the socket, which may be stale or squatted
+/// (`serve --sock`, a discovered instance), so an unchecked count is an allocation request
+/// (`OK 18446744073709551615` aborts). `aterm-ctl`'s `MAX_BODY_BYTES` caps it likewise.
 ///
 /// The largest legitimate reply is one `outbox` drain: `OUTBOX_DRAIN_BYTES_MAX`
 /// (4 MiB) plus one `BODY_MAX` (256 KiB) post; 16 MiB leaves headroom. Over it
@@ -176,12 +175,12 @@ impl Ctl {
         })
     }
 
-    /// Connect to a control socket and authenticate with the instance token —
-    /// OBSERVER MODE. The caller must check `whoami` before claiming delivery.
+    /// Connect to a control socket and authenticate with the instance token: observer
+    /// mode. The caller must check `whoami` before claiming delivery.
     ///
     /// # Errors
     ///
-    /// The connect, the token read, or the write.
+    /// The connect or the write.
     pub fn connect(sock: &str, token: &str) -> io::Result<Self> {
         Self::authenticate(UnixStream::connect(sock)?, token)
     }
@@ -219,18 +218,16 @@ impl Ctl {
         &self.writer
     }
 
-    /// Whether this connection has been LOST — an I/O failure on the lane, as
-    /// opposed to a line this client refused to send.
+    /// Whether this connection is lost: an I/O failure on the lane, as opposed to a line
+    /// this client refused to send ([`io::ErrorKind::InvalidInput`], nothing written).
     ///
-    /// A refusal ([`io::ErrorKind::InvalidInput`], nothing written) is recorded
-    /// and carried on from; a loss is aterm going away, and the process must
-    /// exit so its supervisor can relaunch it.
+    /// A loss is aterm going away; the process must exit so its supervisor can relaunch it.
     #[must_use]
     pub fn lost(&self) -> bool {
         self.lost
     }
 
-    /// Run one request, LATCHING the connection on an I/O failure.
+    /// Run one request, latching the connection as lost on an I/O failure.
     ///
     /// A fired deadline surfaces as `WouldBlock` or `TimedOut` by platform, with
     /// a message naming neither; both become one `TimedOut` that says so.
@@ -419,8 +416,7 @@ mod tests {
         );
     }
 
-    /// The framing is read from the VERB TABLE, sub-forms included — the one
-    /// thing this client must not keep its own copy of.
+    /// The framing comes from the verb table, sub-forms included.
     #[test]
     fn the_framing_comes_from_the_table_including_sub_forms() {
         for (line, want) in [
@@ -510,7 +506,7 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{line:?}: {err}");
             assert!(!ctl.lost(), "a refusal is not a lost connection: {line:?}");
         }
-        // EXACTLY AT THE BOUND still goes, and so does a character that is
+        // Exactly at the bound still goes, and so does a character that is
         // neither a control nor a space: the check is about framing, not ASCII.
         let at = format!("x{}", "y".repeat(REQUEST_LINE_MAX - 1));
         assert_eq!(at.len(), REQUEST_LINE_MAX);

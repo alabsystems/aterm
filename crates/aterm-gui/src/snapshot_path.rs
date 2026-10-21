@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a SIGUSR1 screen snapshot may land, and how it is written.
+//! Where a SIGUSR1 screen snapshot lands, and how it is written.
 //!
-//! The snapshot carries sensitive terminal/window content, so it gets the same
-//! posture as the control socket's `image` verb (see `control_auth`): by default the
-//! PNG/.txt/.done files land in the per-user `0700` control directory under a
-//! per-process name (`aterm_snapshot-<pid>.png`) and are written `0600`. That is
-//! the ONE destination: the `$ATERM_SNAPSHOT_PATH` override was deleted
-//! (2026-09-24, no environment variable changes a shipped aterm) — a capture
-//! anywhere else is `aterm ctl image <file>`.
+//! The snapshot carries sensitive terminal content, so it gets the control socket's
+//! `image` posture (`control_auth`): the PNG/.txt/.done files land in the per-user `0700`
+//! control directory under a per-process name (`aterm_snapshot-<pid>.png`), written
+//! `0600`. That is the only destination (no environment variable moves it); a capture
+//! elsewhere is `aterm ctl image <file>`.
 
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -80,9 +78,8 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     Ok(result)
 }
 
-/// Compatibility wrapper around the retained-handle writer. The directory and
-/// exact final file remain pinned until durable write and identity validation
-/// have both completed.
+/// Write `path` through the retained-handle writer; the directory and file stay pinned
+/// until the durable write and identity validation complete.
 #[cfg(test)]
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().ok_or_else(|| {
@@ -130,11 +127,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn write_private_refuses_symlinked_target() {
-        // A symlink planted at the target name must NOT be followed
-        // (FILE_FLAG_OPEN_REPARSE_POINT + reparse-attr reject): the write must fail
-        // rather than clobber the link target. Skips when symlink creation is
-        // unprivileged (no Developer Mode / SeCreateSymbolicLink), which is expected
-        // on a locked-down CI box — the guard under test still compiles + links.
+        // A symlink at the target name is not followed (FILE_FLAG_OPEN_REPARSE_POINT plus
+        // the reparse-attribute reject). Skips without symlink privilege (no Developer
+        // Mode / SeCreateSymbolicLink).
         let dir = std::env::temp_dir().join(format!("aterm-snap-win-sym-{}", std::process::id()));
         ensure_private_dir(&dir).unwrap();
         let victim = dir.join("victim.txt");
@@ -162,7 +157,7 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        // A pre-existing loose file is truncated AND tightened to 0600.
+        // A pre-existing loose file is truncated and tightened to 0600.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         write_private(&path, b"x").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

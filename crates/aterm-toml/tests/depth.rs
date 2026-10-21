@@ -1,21 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Nesting is bounded, and the bound is tested with real deep input.
-//!
-//! Recursion on untrusted data that has no depth limit is not a bug that
-//! returns an error — it aborts the process on a guard-page hit, from inside a
-//! config load, with no chance to fall back to defaults. aterm parses TOML that
-//! arrives over the update channel and out of package manifests, so "the file
-//! was too deep" has to be an `Err` a caller can handle.
-//!
-//! Four shapes recurse and are therefore all covered here: arrays, inline
-//! tables, dotted keys (the parse is a loop, but the TREE it builds is walked
-//! recursively by `Drop`, by the encoder, and by the deserializer), and table
-//! headers.
+//! Nesting is bounded, tested with real deep input. Unbounded recursion on untrusted input
+//! overflows the stack and kills the process inside a config load, so "too deep" must be
+//! an `Err` a caller can handle. Arrays, inline tables, dotted keys and table headers all
+//! deepen the tree that `Drop`, the encoder and the deserializer walk recursively, so all
+//! four are covered.
 
-/// Deliberately far past the limit, so the test proves an ERROR rather than a
-/// slightly-larger limit.
+/// Far past the limit, so the test proves an error rather than a slightly larger limit.
 const FAR_TOO_DEEP: usize = 10_000;
 
 fn deep_arrays(levels: usize) -> String {
@@ -72,8 +64,7 @@ fn deeply_nested_input_returns_an_error_instead_of_overflowing_the_stack() {
     }
 }
 
-/// The bound has to be generous enough that no real document trips it. 32
-/// levels is far past anything a config or a manifest contains.
+/// No real document trips the bound: 32 levels is far past any config or manifest.
 #[test]
 fn ordinary_nesting_is_untouched() {
     for (name, source) in [
@@ -95,10 +86,9 @@ fn ordinary_nesting_is_untouched() {
     }
 }
 
-/// Inline tables nested 128 deep, each entry a dotted key as long as the budget
-/// left at its depth allows: `k = { a.a.….a = { a.….a = { … } } }`. Every
-/// construct stays inside the limit on its own, yet the TREE is
-/// 128 + 127 + … + 1 = 8,256 tables deep — from a 17 KB document.
+/// Inline tables nested 128 deep, each entry a dotted key as long as the budget left at
+/// its depth allows (`k = { a.a.….a = { a.….a = { … } } }`): every construct fits the
+/// limit on its own, but the tree is 128 + 127 + … + 1 = 8,256 tables deep.
 fn dotted_staircase(limit: usize) -> String {
     let mut out = String::from("k = ");
     for depth in 0..limit {
@@ -112,12 +102,8 @@ fn dotted_staircase(limit: usize) -> String {
     out
 }
 
-/// The bound is on the depth of the TREE, not on each construct alone: header
-/// segments, dotted-key segments and array/inline-table nesting all deepen the
-/// same tree that `Drop`, the encoder and the deserializer walk recursively.
-/// Budgeting them separately let the staircase above through, and
-/// `from_str::<Value>` on it overflowed the stack — an abort from inside a
-/// config load.
+/// The bound is on the tree's depth, not on each construct alone: header segments,
+/// dotted-key segments and array/inline-table nesting all spend from one budget.
 #[test]
 fn constructs_that_each_fit_the_limit_cannot_stack_past_it() {
     let path = (0..64)
@@ -137,9 +123,8 @@ fn constructs_that_each_fit_the_limit_cannot_stack_past_it() {
     ] {
         let parsed = source.parse::<aterm_toml::edit::DocumentMut>();
         let refused = parsed.is_err();
-        // An accepted tree is thousands of levels deep and even DROPPING it
-        // recurses, so it is leaked: the assertion, not a stack overflow, has
-        // to be what reports the failure.
+        // An accepted tree is thousands of levels deep and dropping it recurses, so it
+        // is leaked: the assertion, not a stack overflow, reports the failure.
         core::mem::forget(parsed);
         assert!(refused, "{name}: the document half accepted it");
         let error = aterm_toml::from_str::<aterm_toml::Value>(&source)

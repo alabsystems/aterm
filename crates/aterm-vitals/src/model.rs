@@ -17,9 +17,20 @@
 //! so a sweep of N processes costs O(N). A process seen for the first time has
 //! no earlier CPU time to subtract, so it counts from its second sweep: the
 //! figures are "live" (exited work between sweeps is not credited back).
+//!
+//! The deck's rows (`docs/DESIGN-stats-deck-v2-2026-10-20.md`, "v2" below)
+//! come from the same pass: one [`ResourceView`] per [`Resource`], each an
+//! hour ring of raw readings ([`crate::ring`]), "now" (the trailing 10 s
+//! mean), its capacity and basis, its state, and the aterm and Tab figures.
+//! A counter delta yields a rate only across an interval the gap rule admits
+//! (v2 §5.4), so a sleep or a stalled reader draws hollow, never as a rate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use crate::history::{self, Filling, FreeHistory, Rates};
+use crate::peaks::{DailyMax, NET_LEARN_S, Peaks, TOKENS_LEARN_S};
+use crate::ring::{BUCKET_MS, BucketRing, Cell, NOW_WINDOW_MS, Recent, columns_of};
 use crate::trend::{History, Trend, TrendView};
 
 /// One logical core's cumulative ticks.
@@ -41,10 +52,12 @@ pub struct ClusterSpec {
 }
 
 /// One process in a sweep.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcSample {
     /// The pid.
     pub pid: u32,
+    /// Its kernel start record, compared only within this boot.
+    pub start: Option<u64>,
     /// Its parent's pid.
     pub ppid: u32,
     /// Cumulative CPU time, ns; `None` where the OS refused it.
@@ -53,6 +66,109 @@ pub struct ProcSample {
     pub footprint: Option<u64>,
     /// The short command name.
     pub name: String,
+    /// Cumulative bytes written to storage; `None` where unreadable (another
+    /// user's process, Linux).
+    pub disk_written: Option<u64>,
+    /// Its real user, where read.
+    pub uid: Option<u32>,
+    /// Its process group (0: unknown).
+    pub pgid: u32,
+    /// Its scheduler state.
+    pub state: ProcState,
+    /// Cumulative time runnable (running or waiting for a core), ns; `None`
+    /// where refused or not read.
+    pub runnable_ns: Option<u64>,
+    /// Its largest footprint so far, bytes; `None` where unread.
+    pub peak: Option<u64>,
+    /// When its counters were read, ns on the [`Sample::at_ns`] clock; `None`
+    /// where unknown, and the sweep's window stands in. Each process's CPU
+    /// and wait rates are over its own two reads, so an uneven sweep does
+    /// not misstate them.
+    pub at_ns: Option<u64>,
+}
+
+/// A process's scheduler state. `Run` means only "neither stopped nor a
+/// zombie": macOS reports a process blocked in `read(2)` as running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProcState {
+    /// Running or sleeping.
+    Run,
+    /// Stopped.
+    Stopped,
+    /// Exited, not yet reaped.
+    Zombie,
+    /// Not read.
+    #[default]
+    Unknown,
+}
+
+impl ProcState {
+    /// The word `sys procs` prints.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Stopped => "stopped",
+            Self::Zombie => "zombie",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The machine's throttle level, mapped from the OS's own (macOS thermal
+/// state nominal / fair / serious / critical).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Throttle {
+    /// Not throttled.
+    #[default]
+    None,
+    /// Lightly.
+    Light,
+    /// Heavily: the chip runs well below its top clock.
+    Heavy,
+    /// Severely.
+    Severe,
+}
+
+impl Throttle {
+    /// The word every surface prints.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Light => "light",
+            Self::Heavy => "heavy",
+            Self::Severe => "severe",
+        }
+    }
+
+    /// A word back to its level.
+    #[must_use]
+    pub fn from_word(w: &str) -> Option<Self> {
+        Some(match w {
+            "none" => Self::None,
+            "light" => Self::Light,
+            "heavy" => Self::Heavy,
+            "severe" => Self::Severe,
+            _ => return None,
+        })
+    }
+}
+
+/// The machine's thermal state and power mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Thermal {
+    /// The portable level.
+    pub level: Throttle,
+    /// The OS's own number (macOS `NSProcessInfoThermalState`, 0–3; Linux
+    /// the level's rank, 0–3).
+    pub raw: u8,
+    /// Low Power Mode, where the OS says.
+    pub low_power: Option<bool>,
+    /// The OS said the level (macOS); `false` for a heuristic level (Linux:
+    /// thermal zones against their trip points, and whether the throttle
+    /// counters rose).
+    pub exact: bool,
 }
 
 /// The kernel's memory pressure.
@@ -80,7 +196,73 @@ impl Pressure {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Its rank in `normal < warn < critical`; `None` while unknown.
+    #[must_use]
+    pub fn rank(self) -> Option<u8> {
+        match self {
+            Self::Normal => Some(0),
+            Self::Warn => Some(1),
+            Self::Critical => Some(2),
+            Self::Unknown => None,
+        }
+    }
+
+    /// A word back to its level (`unknown` is not a level).
+    #[must_use]
+    pub fn from_word(w: &str) -> Option<Self> {
+        Some(match w {
+            "normal" => Self::Normal,
+            "warn" => Self::Warn,
+            "critical" => Self::Critical,
+            _ => return None,
+        })
+    }
 }
+
+/// The VM's cumulative counters (two readings give rates).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemCounters {
+    /// Bytes swapped in.
+    pub swapin_bytes: u64,
+    /// Bytes swapped out.
+    pub swapout_bytes: u64,
+    /// Pages decompressed.
+    pub decompressions: u64,
+    /// Pages compressed.
+    pub compressions: u64,
+    /// Pages read in from files.
+    pub pageins: u64,
+}
+
+/// Paging per second over the memory reading's window.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MemRates {
+    /// Bytes swapped in per second.
+    pub swapin_bps: f64,
+    /// Bytes swapped out per second.
+    pub swapout_bps: f64,
+    /// Pages decompressed per second.
+    pub decompress_ps: f64,
+    /// Pages compressed per second.
+    pub compress_ps: f64,
+    /// Pages read in per second.
+    pub pagein_ps: f64,
+    /// The window, ns.
+    pub window_ns: u64,
+}
+
+impl MemRates {
+    /// Swap traffic, in plus out, bytes per second.
+    #[must_use]
+    pub fn swap_bps(&self) -> f64 {
+        self.swapin_bps + self.swapout_bps
+    }
+}
+
+/// Swap traffic at or above this, while pressure is warn or critical, is
+/// thrashing (design §9.2, `AgentMemory::strain()`'s condition).
+pub const THRASH_SWAP_KIB_S: f64 = 4096.0;
 
 /// The machine's memory by the OS's classes, bytes (design §9.1 macOS,
 /// §9.6 Linux and Windows). Only macOS partitions physical memory exactly;
@@ -116,6 +298,11 @@ pub struct MemSample {
     pub swap_total: u64,
     /// The pressure level.
     pub pressure: Pressure,
+    /// The VM's counters, where read.
+    pub counters: Option<MemCounters>,
+    /// The percent the kernel counts available (macOS
+    /// `kern.memorystatus_level`), where read.
+    pub kernel_available_pct: Option<u8>,
     /// The commit charge against its limit, where the OS keeps one.
     pub commit: Option<CommitSample>,
 }
@@ -179,6 +366,17 @@ pub struct GpuSample {
     pub cores: Option<u16>,
     /// A short name for it.
     pub name: Option<String>,
+    /// GPU memory in use, bytes.
+    pub in_use_bytes: Option<u64>,
+    /// GPU memory the driver has allocated, in use or not, bytes.
+    pub alloc_bytes: Option<u64>,
+    /// How many times the driver has recovered the GPU from a fault since it
+    /// started.
+    pub recoveries: Option<u64>,
+    /// Renderer utilization, whole percent.
+    pub renderer_pct: Option<u8>,
+    /// Tiler utilization, whole percent.
+    pub tiler_pct: Option<u8>,
 }
 
 /// The volume a path lives on, bytes.
@@ -216,6 +414,195 @@ pub struct TabRoot {
     pub program: String,
 }
 
+/// Current identity-proven members of one explicitly delegated job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegatedJob {
+    /// The registered process root.
+    pub root: crate::delegated::ProcessKey,
+    /// The owning live tab, or no tab after its session closed.
+    pub tab: Option<u64>,
+    /// Live members attributed by the host's start-checked ownership ledger.
+    pub members: Vec<crate::delegated::ProcessKey>,
+}
+
+/// One delegated job's contribution from the same sweep as the normal scopes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegatedUsage {
+    /// The registered process root.
+    pub root: crate::delegated::ProcessKey,
+    /// Current CPU in cores over the sweep interval.
+    pub cores: f32,
+    /// Current physical footprint, where readable.
+    pub footprint: Option<u64>,
+    /// Current process count.
+    pub procs: u32,
+}
+
+/// A volume's standing against the disk watch's lines (v2 §6.4), as the host
+/// maps the harness's level onto it: this crate names no harness type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskLevel {
+    /// At or above the warning line.
+    Ok,
+    /// Under the warning line.
+    Low,
+    /// Under the cleaning line: aterm is cleaning.
+    Short,
+    /// Under the emergency line.
+    Emergency,
+    /// Out of file slots (the inode emergency line), whatever bytes are free.
+    EmergencyFiles,
+}
+
+impl DiskLevel {
+    /// The state a volume at this level puts the Disk row in: low and short
+    /// warn, either emergency is critical.
+    #[must_use]
+    pub fn state(self) -> Option<State> {
+        match self {
+            Self::Ok => None,
+            Self::Low | Self::Short => Some(State::Warn),
+            Self::Emergency | Self::EmergencyFiles => Some(State::Critical),
+        }
+    }
+}
+
+/// A folder the "where" survey or a cleanup pass sized (v2 §7.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hog {
+    /// The folder, as the lens prints it (`~/aterm/target`).
+    pub path: String,
+    /// Its size, bytes.
+    pub bytes: u64,
+    /// Whether the size was cut short by its bound (printed "≥ 96 GB").
+    pub partial: bool,
+    /// What would free it, in words.
+    pub remedy: String,
+}
+
+/// What a network link is: the host's mirror of the probe's kinds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LinkKind {
+    /// Wi-Fi.
+    Wifi,
+    /// Ethernet: built in, USB or Thunderbolt.
+    Ethernet,
+    /// Cellular data.
+    Cellular,
+    /// A tunnel, whose bytes are counted again on the link carrying them.
+    Vpn,
+    /// A bridge, which counts its members' bytes again.
+    Bridge,
+    /// Anything else.
+    #[default]
+    Other,
+}
+
+/// An account among the tabs', as the host numbers them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct AccountIx(pub u8);
+
+/// One network link's cumulative counters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkSample {
+    /// Its name (`en0`).
+    pub name: String,
+    /// What it is.
+    pub kind: LinkKind,
+    /// Whether its bytes are the machine's own (not a loopback, tunnel,
+    /// bridge or companion radio, whose bytes are counted elsewhere).
+    pub counts: bool,
+    /// Bytes received, cumulative.
+    pub rx: u64,
+    /// Bytes sent, cumulative.
+    pub tx: u64,
+    /// The link rate the driver reports, bits per second.
+    pub rate_bps: Option<u64>,
+}
+
+/// The most processes the machine and one user may run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcLimits {
+    /// The whole machine's limit (threads on Linux).
+    pub system: Option<u64>,
+    /// One user's limit; `None` where unknown or unlimited.
+    pub per_user: Option<u64>,
+}
+
+/// What the disk watch knows (v2 §7.1), as the host copies it from the
+/// harness's board. With the harness off, `watch` is false and the watch's
+/// facts are empty; the "where" survey's rows (`hogs`, `sizing`) still come,
+/// since the survey runs either way (v2 §7.6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiskFacts {
+    /// The home volume's level; `None` when the watch has not judged it.
+    pub level: Option<DiskLevel>,
+    /// The warning line, bytes free.
+    pub warn: Option<u64>,
+    /// The cleaning line, bytes free.
+    pub floor: Option<u64>,
+    /// The emergency line, bytes free.
+    pub emergency: Option<u64>,
+    /// Sessions stuck on a full disk.
+    pub stuck: u16,
+    /// Other volumes the watch judges: name, level and bytes free.
+    pub others: Vec<(String, DiskLevel, u64)>,
+    /// When the watch's beat stalled (unix ms), while it is stalled.
+    pub stalled_since: Option<i64>,
+    /// What aterm freed today: bytes, when the last pass ran (unix ms), and
+    /// what it removed.
+    pub freed_today: Option<(u64, i64, String)>,
+    /// The largest folders, largest first: the "where" survey's, or the last
+    /// cleanup pass's where that is newer (v2 §7.4).
+    pub hogs: Vec<Hog>,
+    /// When `hogs` were sized (unix ms).
+    pub hogs_at: Option<i64>,
+    /// Whether the watch runs (the harness is on).
+    pub watch: bool,
+    /// A "where" survey is sizing folders now: the lens says "sizing
+    /// folders…" beside the time of the `hogs` it still shows (v2 §7.4).
+    pub sizing: bool,
+}
+
+/// One agent session's cumulative token totals (v2 §8.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TabTokens {
+    /// The tab it runs in (its [`TabRoot::key`]).
+    pub key: u64,
+    /// The session's id; the host sends each session once.
+    pub session: String,
+    /// Output tokens, cumulative.
+    pub out_total: u64,
+    /// Input tokens, cumulative (cache reads included).
+    pub in_total: u64,
+    /// Transcripts the fold has not read yet.
+    pub unread: usize,
+    /// Whether more transcripts wait beyond `unread`.
+    pub unread_more: bool,
+    /// Whether the totals came from a complete fold.
+    pub complete: bool,
+    /// When the fold that gave the totals read them, on the sample's
+    /// monotonic clock ([`Sample::mono_ms`]; negative before its origin).
+    /// The host folds a session every few seconds, not at every reading: a
+    /// rate is taken over the time between two folds, and a reading that
+    /// brings no new fold holds the last one's rate (v2 §8.3). `None` where
+    /// the host cannot say: each reading is then a fold.
+    pub read_ms: Option<i64>,
+}
+
+/// The plan's usage, a dated fact (v2 §8.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanFact {
+    /// The binding window, in words (`weekly`, `Opus weekly`, `5-hour`).
+    pub window_word: String,
+    /// Its share used, tenths of a percent.
+    pub used_x10: u16,
+    /// When it was read (unix ms).
+    pub read_at: i64,
+    /// Whose account it is.
+    pub account: AccountIx,
+}
+
 /// One sample of everything, from the host's probe thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
@@ -237,6 +624,45 @@ pub struct Sample {
     pub self_pid: u32,
     /// Every tab, in the host's order.
     pub tabs: Vec<TabRoot>,
+    /// Explicit jobs whose process identities were validated in this sweep.
+    pub delegated: Vec<DelegatedJob>,
+    /// The wall clock at the reading, unix ms: the hour rings' buckets and
+    /// the peaks' days follow it (v2 §5.1).
+    pub at_unix_ms: i64,
+    /// The monotonic clock at the reading, ms. It stops while the Mac sleeps,
+    /// which is how the gap rule tells a sleep (v2 §5.4).
+    pub mono_ms: u64,
+    /// The reading cadence in force when this reading was taken, ms (v2
+    /// §5.3).
+    pub cadence_ms: u32,
+    /// A hidden deck's reading (v2 §5.3): the machine counters only, no
+    /// process sweep, so the aterm and Tab figures wait for a full one.
+    pub machine_only: bool,
+    /// The 1-minute load average.
+    pub load1: Option<f64>,
+    /// KiB swapped in plus out since boot.
+    pub swapped_kib: Option<u64>,
+    /// Every network link's counters.
+    pub links: Option<Vec<LinkSample>>,
+    /// The process limits.
+    pub proc_limits: ProcLimits,
+    /// Processes running on the whole machine (threads on Linux) and as this
+    /// user.
+    pub pid_counts: (Option<u64>, Option<u64>),
+    /// This process's user: only its processes' writes are counted.
+    pub self_uid: Option<u32>,
+    /// The disk watch's facts; `None` where the host read none.
+    pub disk: Option<DiskFacts>,
+    /// Every agent session's token totals, one row per session.
+    pub tokens: Vec<TabTokens>,
+    /// The front tab's account's plan usage, while current.
+    pub plan: Option<PlanFact>,
+    /// The thermal state, where read.
+    pub thermal: Option<Thermal>,
+    /// The 1, 5 and 15 minute load averages, where read.
+    pub load: Option<[f64; 3]>,
+    /// Whether the process sweep stopped at its cap.
+    pub procs_truncated: bool,
 }
 
 /// One core's load.
@@ -294,6 +720,8 @@ pub struct GpuView {
     pub name: Option<String>,
     /// The utilization over the last two minutes, `0..=1`.
     pub history: Vec<Option<f32>>,
+    /// The sample's figures as read.
+    pub sample: GpuSample,
 }
 
 /// Memory.
@@ -305,6 +733,19 @@ pub struct MemView {
     pub used_gib: TrendView,
     /// Used GiB over the last two minutes.
     pub history: Vec<Option<f32>>,
+    /// Paging per second; `None` until two readings with counters exist.
+    pub rates: Option<MemRates>,
+}
+
+impl MemView {
+    /// Thrashing: pressure warn or critical and swap traffic at or above
+    /// [`THRASH_SWAP_KIB_S`]; `None` while the rates or the level are unknown.
+    #[must_use]
+    pub fn thrashing(&self) -> Option<bool> {
+        let rank = self.sample.pressure.rank()?;
+        let rates = self.rates?;
+        Some(rank >= 1 && rates.swap_bps() >= THRASH_SWAP_KIB_S * 1024.0)
+    }
 }
 
 /// One scope: the machine, aterm, or a tab.
@@ -322,6 +763,117 @@ pub struct ScopeView {
     pub history: Vec<Option<f32>>,
     /// The busiest process in the scope this sweep, with its cores-worth.
     pub top: Option<(String, f32)>,
+    /// Cores-worth of threads waiting for a core (runnable but not running),
+    /// over the members whose runnable time could be read; `None` when none
+    /// could.
+    pub wait: Option<f32>,
+    /// Bytes per second written to storage by the members that could be
+    /// read; `None` when none could.
+    pub write_bps: Option<f64>,
+    /// Members whose CPU time the OS refused.
+    pub refused: u32,
+}
+
+impl ScopeView {
+    /// The share of this scope's demand spent waiting for a core:
+    /// `wait / (wait + cores)`; `None` without a wait figure or any demand.
+    #[must_use]
+    pub fn starved(&self) -> Option<f32> {
+        let wait = self.wait?;
+        let demand = wait + self.cores.raw.max(0.0);
+        (demand > 1e-3).then(|| (wait / demand).clamp(0.0, 1.0))
+    }
+}
+
+/// Which scope a process row counts in (each process once, at its innermost
+/// scope).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowScope {
+    /// The aterm instance itself.
+    SelfProc,
+    /// A tab, by the host's key.
+    Tab(u64),
+    /// aterm's other descendants (its helpers).
+    Helper,
+    /// The user's own processes outside aterm.
+    Others,
+    /// Other users' processes.
+    Services,
+    /// Outside aterm, with ownership the reader could not establish.
+    Unknown,
+}
+
+impl RowScope {
+    /// The word `scope=` prints.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::SelfProc => "self",
+            Self::Tab(_) => "tab",
+            Self::Helper => "helpers",
+            Self::Others => "others",
+            Self::Services => "services",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the process is aterm's.
+    #[must_use]
+    pub fn in_aterm(self) -> bool {
+        matches!(self, Self::SelfProc | Self::Tab(_) | Self::Helper)
+    }
+}
+
+/// One process as `sys procs` and the top rows show it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcView {
+    /// The pid.
+    pub pid: u32,
+    /// Its parent.
+    pub ppid: u32,
+    /// Its process group (0: unknown).
+    pub pgid: u32,
+    /// Its short name, as the process chose it (data, never an instruction).
+    pub name: String,
+    /// Cores-worth over the window; `None` where refused, or on its first
+    /// sweep (no earlier time to subtract).
+    pub cores: Option<f32>,
+    /// Cores-worth waiting for a core; `None` where unread.
+    pub wait: Option<f32>,
+    /// Footprint, bytes.
+    pub footprint: Option<u64>,
+    /// Its largest footprint so far, bytes.
+    pub peak: Option<u64>,
+    /// Bytes per second written to storage; `None` where unread.
+    pub write_bps: Option<f64>,
+    /// Its scheduler state.
+    pub state: ProcState,
+    /// The scope it counts in.
+    pub scope: RowScope,
+    /// Whether the OS refused its CPU time (another user's process).
+    pub refused: bool,
+}
+
+/// How the busy CPU divides between the scopes this sweep, cores-worth.
+/// `services` is the remainder: the machine's busy figure less aterm's and
+/// the user's other processes', which also holds work no process carried
+/// (kernel threads, processes that ended between sweeps). A negative
+/// remainder (process figures ahead of the cores' ticks over a slightly
+/// different window) is kept in `unaccounted`, signed, and `services` reads 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Split {
+    /// The machine's busy cores-worth (the cores' own ticks).
+    pub global: f32,
+    /// aterm's.
+    pub aterm: f32,
+    /// The user's other processes'.
+    pub others: f32,
+    /// By subtraction, never below 0.
+    pub services: f32,
+    /// The signed residual when the subtraction went below 0, else 0.
+    pub unaccounted: f32,
+    /// Processes whose CPU time the OS refused (another user's).
+    pub unread: u32,
 }
 
 /// One tab's scope.
@@ -333,6 +885,8 @@ pub struct TabView {
     pub label: String,
     /// The program in front.
     pub program: String,
+    /// Its shell's pid (the root of its process tree).
+    pub shell_pid: u32,
     /// Its load.
     pub scope: ScopeView,
 }
@@ -361,10 +915,405 @@ pub struct TopProc {
     pub scope: ProcScope,
 }
 
+/// The busiest program this sweep ([`RowFacts::busiest`]): every process of
+/// one name, over the whole sweep, so `rustc ×9` counts all nine.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Busiest {
+    /// The name they share.
+    pub name: String,
+    /// Their cores-worth over the sweep interval, summed.
+    pub cores: f32,
+    /// How many processes.
+    pub n: usize,
+    /// Whose they all are; `None` when they differ.
+    pub scope: Option<ProcScope>,
+}
+
 /// Processes [`Snapshot::top`] keeps.
 pub const TOP_PROCS: usize = 6;
 /// Seconds each core's history keeps ([`CpuView::core_history`]): a minute.
 pub const CORE_HISTORY_LEN: usize = 60;
+
+/// A rate needs its interval within this many reading cadences (v2 §5.4).
+pub const GAP_CADENCES: u64 = 3;
+/// How far the wall and monotonic clocks may disagree across one interval
+/// before it reads as a sleep, ms (v2 §5.4).
+pub const SLEEP_SKEW_MS: i64 = 1_000;
+/// CPU is over when, with the load average above the core count, at least
+/// this share of the cores is busy (v2 §6.1).
+pub const CPU_OVER_BUSY: f64 = 0.95;
+/// Memory is over at this much swap traffic, bytes per second (v2 §6.3).
+pub const SWAP_OVER_BPS: f64 = 4.0 * 1024.0 * 1024.0;
+/// A session's output above this many tokens per second of interval is
+/// dropped, not carried (v2 §8.3).
+pub const TOKENS_CAP_PER_S: f64 = 5_000.0;
+/// The window the Tokens row's "now" averages over, ms: output tokens per
+/// minute over the last minute (v2 §6.6, §8.1).
+pub const TOKENS_WINDOW_MS: i64 = 60_000;
+/// How long a session's last fold rate holds while no new fold comes, ms:
+/// the Tokens row's window. A session not folded for longer gives no rate.
+pub const TOKENS_HOLD_MS: i64 = 60_000;
+/// Writers [`RowFacts::writers`] keeps.
+pub const TOP_WRITERS: usize = 4;
+/// Readings in a row another counted link must lead the one the network is
+/// measured against before it takes over (v2 §6.5).
+pub const LINK_LEAD_READINGS: u32 = 5;
+/// What leading takes: moving at least this many bytes per second, and more
+/// than twice the held link's bytes. Idle chatter never moves a link's
+/// capacity.
+pub const LINK_LEAD_BPS: f64 = 64_000.0;
+
+/// One row of the deck (v2 §1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Resource {
+    /// Busy cores against the core count.
+    Cpu,
+    /// The share of time the GPU was busy.
+    Gpu,
+    /// Memory in use against physical memory.
+    Memory,
+    /// The home volume's bytes used against its size.
+    Disk,
+    /// The busier direction's rate against its peak.
+    Network,
+    /// aterm's output tokens per minute against its peak.
+    Tokens,
+    /// Processes against the binding limit.
+    Processes,
+}
+
+impl Resource {
+    /// Every row, in the deck's order.
+    pub const ALL: [Self; 7] = [
+        Self::Cpu,
+        Self::Gpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Network,
+        Self::Tokens,
+        Self::Processes,
+    ];
+
+    /// Its index in [`Self::ALL`] and [`Snapshot::resources`].
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// A row's state: what its well marks, in the well's order (v2 §6.0 "Well"),
+/// least first, so the worst of several is their `max`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum State {
+    /// A job stopped by job control.
+    Stopped,
+    /// A job waiting for the person (◇).
+    Waiting,
+    /// A job gone quiet (◔).
+    Quiet,
+    /// Zombies left unreaped by a tab's process (☠).
+    Zombies,
+    /// A stuck job (⊘).
+    Stuck,
+    /// Warn (◢ disk, ● memory or GPU).
+    Warn,
+    /// Critical (◢ disk, ● memory).
+    Critical,
+}
+
+impl State {
+    /// The Processes row's state from the stuck engine's view: the worst of
+    /// its stuck, zombie, quiet, waiting and parked marks, as the well draws
+    /// them; `None` for a calm machine.
+    #[must_use]
+    pub fn of_jobs(view: &crate::jobs::JobsView) -> Option<Self> {
+        use crate::jobs::Verdict;
+        let rows = view.rows.iter().filter_map(|r| match r.verdict {
+            Verdict::Stuck => Some(Self::Stuck),
+            Verdict::Quiet => Some(Self::Quiet),
+            Verdict::WaitingYou => Some(Self::Waiting),
+            Verdict::Parked => Some(Self::Stopped),
+            _ => None,
+        });
+        let zombies = view
+            .findings
+            .zombies
+            .iter()
+            .any(|z| z.tab.is_some() && z.count > 0)
+            .then_some(Self::Zombies);
+        rows.chain(zombies).max()
+    }
+}
+
+/// What a row's capacity is measured against (v2 §6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CapBasis {
+    /// A fixed maximum: cores, busy all the time, physical memory, the
+    /// volume's size, the process limit.
+    #[default]
+    Fixed,
+    /// The largest sustained rate of the last 7 days.
+    Peak,
+    /// The measured link's rate, while the network learns its peak.
+    Link,
+    /// Learning its peak with nothing to measure against yet.
+    Learning,
+}
+
+impl CapBasis {
+    /// The most heat a share on this basis shows. A peak or a link is the
+    /// most the row measures against, so heat stops at 1 there (v2 §6.5:
+    /// "heat ≤ 100 %") until the peak catches up; a fixed capacity lets it
+    /// pass 1, the over mark's excess.
+    #[must_use]
+    pub fn heat_ceiling(self) -> f32 {
+        match self {
+            Self::Peak | Self::Link => 1.0,
+            Self::Fixed | Self::Learning => f32::INFINITY,
+        }
+    }
+}
+
+/// Why a scope has no figure, where that is not "not read yet".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoFigure {
+    /// The OS keeps no per-app figure (GPU, network).
+    NotPerApp,
+    /// The sweep read no process's counter (writes on Linux).
+    NotReadHere,
+    /// No agent runs in the scope (tokens).
+    NoAgent,
+}
+
+/// One scope's figure in a row: aterm's or a tab's.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScopeFig {
+    /// The trailing mean in the row's unit (cores, bytes of footprint, bytes
+    /// written per second, tokens per minute, processes); `None` until a full
+    /// reading gives one.
+    pub now: Option<f64>,
+    /// Why there is no figure at all, where that is known.
+    pub missing: Option<NoFigure>,
+}
+
+/// One series of a row: its "now", capacity and hour of cells.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Series {
+    /// The trailing mean of its readings (v2 §5.2), raw.
+    pub now: Option<f64>,
+    /// Its capacity now, raw; `None` where unknown.
+    pub capacity: Option<f64>,
+    /// Its hour of 10 s cells, oldest first, raw; the last is the open
+    /// bucket ([`ResourceView::ring_k`]).
+    pub ring: Arc<[Cell]>,
+    /// Whether this series binds now (its share of capacity is the row's).
+    pub binds: bool,
+}
+
+/// One row of the deck: raw readings, capacity applied when painted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResourceView {
+    /// The trailing 10 s mean of the readings, raw (v2 §5.2): what the %,
+    /// the amount and the bar print. One value, whatever the layout.
+    pub now: Option<f64>,
+    /// The capacity now, raw; `None` where unknown or still learning.
+    pub capacity: Option<f64>,
+    /// "now" as a share of capacity (the larger of the two series' shares
+    /// for a two-series row). On a fixed capacity it may pass 1, the over
+    /// mark's excess; on a peak or a link it stops at 1
+    /// ([`CapBasis::heat_ceiling`]).
+    pub heat_now: Option<f32>,
+    /// Whether the open bucket is over the resource's maximum (CPU, memory).
+    pub over: bool,
+    /// The row's worst state.
+    pub state: Option<State>,
+    /// The hour of 10 s cells, oldest first, raw.
+    pub ring: Arc<[Cell]>,
+    /// The key of `ring`'s last cell, the open bucket: it covers unix
+    /// seconds `[10 ring_k, 10 ring_k + 10)`.
+    pub ring_k: i64,
+    /// aterm's figure.
+    pub aterm: ScopeFig,
+    /// The tab [`Snapshot::resource`] was asked for; in
+    /// [`Snapshot::resources`], the figure of a tab with no reading.
+    pub tab: ScopeFig,
+    /// Every tab's figure, by key, in the host's order.
+    pub tabs: Vec<(u64, ScopeFig)>,
+    /// What the capacity is.
+    pub basis: CapBasis,
+    /// The second series of a two-series row: Network's send direction
+    /// (receive is the first), Processes' own-user count against the
+    /// per-user limit (the machine's count is the first). The amount and the
+    /// % follow whichever binds.
+    pub second: Option<Series>,
+}
+
+/// One painted strip cell: its heat, with capacity applied now.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeatCell {
+    /// The column's mean as a share of capacity now; `None` is hollow.
+    pub heat: Option<f32>,
+    /// Its largest reading as a share of capacity now.
+    pub max: Option<f32>,
+    /// Over the resource's maximum.
+    pub over: bool,
+}
+
+impl ResourceView {
+    /// The first series' raw columns ([`BucketRing::columns`]).
+    #[must_use]
+    pub fn columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<Cell> {
+        columns_of(&self.ring, self.ring_k, per_s, ncols, now_unix_ms)
+    }
+
+    /// The strip's columns as heat against today's capacity: a peak that rose
+    /// re-normalises every past column at once. A two-series row's column is
+    /// the larger of its series' shares. Heat stops at the basis's ceiling
+    /// ([`CapBasis::heat_ceiling`]).
+    #[must_use]
+    pub fn heat_columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<HeatCell> {
+        let ceiling = self.basis.heat_ceiling();
+        let cells = |s: &Series| {
+            columns_of(&s.ring, self.ring_k, per_s, ncols, now_unix_ms)
+                .into_iter()
+                .map(|c| HeatCell {
+                    heat: heat_of(c.mean, s.capacity).map(|h| h.min(ceiling)),
+                    max: heat_of(c.max, s.capacity).map(|h| h.min(ceiling)),
+                    over: c.over,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut out = cells(&self.first());
+        if let Some(second) = self.second.as_ref() {
+            for (a, b) in out.iter_mut().zip(cells(second)) {
+                a.heat = larger(a.heat, b.heat);
+                a.max = larger(a.max, b.max);
+                a.over |= b.over;
+            }
+        }
+        out
+    }
+
+    /// The first series, as [`Series`].
+    #[must_use]
+    pub fn first(&self) -> Series {
+        Series {
+            now: self.now,
+            capacity: self.capacity,
+            ring: Arc::clone(&self.ring),
+            binds: self.second.as_ref().is_none_or(|s| !s.binds),
+        }
+    }
+
+    /// The series whose share is the row's: the amount and the % print it.
+    #[must_use]
+    pub fn binding(&self) -> Series {
+        match self.second.as_ref() {
+            Some(s) if s.binds => s.clone(),
+            _ => self.first(),
+        }
+    }
+
+    /// A row of `first` and `second` on `basis`. The binding series is the
+    /// one with the larger share before the ceiling, so the direction that
+    /// passed its peak by more binds.
+    fn of(first: Series, second: Option<Series>, ring_k: i64, over: bool, basis: CapBasis) -> Self {
+        let a = heat_of(first.now, first.capacity);
+        let b = second.as_ref().and_then(|s| heat_of(s.now, s.capacity));
+        let second_binds = match (a, b) {
+            (Some(a), Some(b)) => b > a,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        Self {
+            now: first.now,
+            capacity: first.capacity,
+            heat_now: larger(a, b).map(|h| h.min(basis.heat_ceiling())),
+            over,
+            basis,
+            ring: first.ring,
+            ring_k,
+            second: second.map(|s| Series {
+                binds: second_binds,
+                ..s
+            }),
+            ..Self::default()
+        }
+    }
+}
+
+/// `v` as a share of `cap`; `None` when either is unknown. A zero capacity
+/// reads 0 for a zero reading and full for any other.
+fn heat_of(v: Option<f64>, cap: Option<f64>) -> Option<f32> {
+    let (v, cap) = (v?, cap?);
+    Some(if cap > 0.0 {
+        (v / cap).max(0.0) as f32
+    } else if v > 0.0 {
+        1.0
+    } else {
+        0.0
+    })
+}
+
+/// The larger of two optional shares, a known one over an unknown one.
+fn larger(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// A process writing to storage this sweep ([`RowFacts::writers`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Writer {
+    /// Its name.
+    pub name: String,
+    /// Bytes written per second over the sweep interval.
+    pub bytes_per_s: f64,
+    /// Whose it is.
+    pub scope: ProcScope,
+}
+
+/// The facts a row's Details and lens say beside its heat (v2 §6.1–§6.7).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowFacts {
+    /// CPU: the 1-minute load average.
+    pub load1: Option<f64>,
+    /// CPU: the busiest program this sweep, its processes grouped by name.
+    pub busiest: Option<Busiest>,
+    /// Memory: swap traffic, bytes per second.
+    pub swap_rate: Option<f64>,
+    /// GPU: the latest reading, with its memory and stages.
+    pub gpu: Option<GpuSample>,
+    /// GPU: resets during this run, and when the first was seen (unix ms).
+    pub gpu_resets: Option<(u64, i64)>,
+    /// Disk: the watch's facts, where the host read them.
+    pub disk: Option<DiskFacts>,
+    /// Disk: growth of bytes used.
+    pub disk_rates: Rates,
+    /// Disk: the filling clause, when it applies.
+    pub filling: Option<Filling>,
+    /// Disk: this user's busiest writers this sweep, busiest first, at most
+    /// [`TOP_WRITERS`].
+    pub writers: Vec<Writer>,
+    /// Network: the counted link it is measured against, the busiest, held
+    /// until another has led it for a while (`Rows::pick_link`).
+    pub link: Option<LinkSample>,
+    /// Network: seconds of readings toward learning its peak.
+    pub net_read_s: u32,
+    /// Tokens: aterm's input tokens per minute over the last minute.
+    pub tokens_in: Option<f64>,
+    /// Tokens: agent sessions read this sample.
+    pub agents: usize,
+    /// Tokens: seconds of readings toward learning the peak.
+    pub tokens_read_s: u32,
+    /// Tokens: the plan's usage, while current.
+    pub plan: Option<PlanFact>,
+    /// Processes: running on the machine and as this user.
+    pub pid_counts: (Option<u64>, Option<u64>),
+    /// Processes: the limits.
+    pub proc_limits: ProcLimits,
+}
 
 /// Everything at one moment. Immutable once made; the host shares it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -395,13 +1344,68 @@ pub struct Snapshot {
     /// may be an earlier reading's view. `None` until the first, and where
     /// the host reads no jobs. [`Vitals::absorb`] leaves it `None`.
     pub jobs: Option<std::sync::Arc<crate::jobs::JobsView>>,
+    /// Delegated-job totals, from exactly the same process rates as the scopes.
+    pub delegated: Vec<DelegatedUsage>,
+    /// Whether this reading omitted the process sweep and read machine counters only.
+    pub machine_only: bool,
+    /// The sample's wall clock, unix ms.
+    pub at_unix_ms: i64,
+    /// The deck's rows, in [`Resource::ALL`] order.
+    pub resources: [ResourceView; 7],
+    /// The home volume's free space over the last 24 hours.
+    pub free_history: FreeHistory,
+    /// What each row's Details and lens say beside its heat.
+    pub facts: RowFacts,
+    /// The process sweep's window, ns (`None` until two sweeps exist).
+    pub procs_window_ns: Option<u64>,
+    /// The cores' window, ns (`None` until two readings exist).
+    pub cores_window_ns: Option<u64>,
+    /// How busy CPU divides between the scopes; `None` until the cores and two
+    /// sweeps are read together and ownership outside aterm is known.
+    pub split: Option<Split>,
+    /// Process rows: every aterm process (at most [`ATERM_ROWS`]), and the
+    /// machine's top [`TOP_ROWS`] by CPU and by footprint, busiest first.
+    pub procs: Vec<ProcView>,
+    /// Whether the process sweep stopped at its cap.
+    pub procs_truncated: bool,
+    /// The thermal state, where read.
+    pub thermal: Option<Thermal>,
+    /// The 1, 5 and 15 minute load averages, where read.
+    pub load: Option<[f64; 3]>,
+    /// This instance's pid.
+    pub self_pid: u32,
+    /// The events this sample raised ([`crate::events`]).
+    pub events: Vec<crate::events::Event>,
 }
+
+/// aterm's own process rows kept per snapshot, busiest first.
+pub const ATERM_ROWS: usize = 512;
+/// The machine's rows kept per snapshot by CPU and, separately, by footprint.
+pub const TOP_ROWS: usize = 64;
 
 impl Snapshot {
     /// The tab with key `key`.
     #[must_use]
     pub fn tab(&self, key: u64) -> Option<&TabView> {
         self.tabs.iter().find(|t| t.key == key)
+    }
+
+    /// Row `res` with [`ResourceView::tab`] set to tab `tab`'s figure (the
+    /// window's front tab), or to the figure of a tab with no reading.
+    #[must_use]
+    pub fn resource(&self, res: Resource, tab: Option<u64>) -> ResourceView {
+        let mut v = self.resources[res.index()].clone();
+        if let Some(fig) = tab.and_then(|key| v.tabs.iter().find(|(k, _)| *k == key)) {
+            v.tab = fig.1;
+        }
+        v
+    }
+
+    /// Take the stuck engine's view, and with it the Processes row's state.
+    pub fn set_jobs(&mut self, jobs: Option<std::sync::Arc<crate::jobs::JobsView>>) {
+        self.resources[Resource::Processes.index()].state =
+            jobs.as_deref().and_then(State::of_jobs);
+        self.jobs = jobs;
     }
 
     /// Logical cores, where known.
@@ -435,6 +1439,9 @@ impl ScopeState {
             procs: acc.procs,
             history: self.history.to_vec(),
             top: acc.top.clone(),
+            wait: acc.wait,
+            write_bps: acc.writes,
+            refused: acc.refused,
         }
     }
 }
@@ -445,13 +1452,30 @@ struct ScopeAcc {
     footprint: Option<u64>,
     procs: u32,
     top: Option<(String, f32)>,
+    /// Bytes written per second, where any member's counter gave a delta.
+    writes: Option<f64>,
+    /// Cores-worth waiting for a core, where any member's runnable time gave
+    /// a delta.
+    wait: Option<f32>,
+    /// Members whose CPU time the OS refused.
+    refused: u32,
 }
 
 impl ScopeAcc {
-    fn add(&mut self, p: &ProcSample, cores: f32) {
+    fn add(&mut self, p: &ProcSample, r: &ProcRates) {
+        let cores = r.cores.unwrap_or(0.0);
         self.cores += cores;
         if let Some(f) = p.footprint {
             self.footprint = Some(self.footprint.unwrap_or(0).saturating_add(f));
+        }
+        if let Some(w) = r.write_bps {
+            self.writes = Some(self.writes.unwrap_or(0.0) + w);
+        }
+        if let Some(w) = r.wait {
+            self.wait = Some(self.wait.unwrap_or(0.0) + w);
+        }
+        if p.cpu_ns.is_none() {
+            self.refused += 1;
         }
         self.procs += 1;
         if cores > 0.0 && self.top.as_ref().is_none_or(|(_, c)| cores > *c) {
@@ -460,9 +1484,204 @@ impl ScopeAcc {
     }
 }
 
+/// One process's rates: CPU and wait over its own two reads (or the sweep's
+/// window), writes over the interval the gap rule admits.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcRates {
+    cores: Option<f32>,
+    wait: Option<f32>,
+    write_bps: Option<f64>,
+}
+
+/// When a reading was taken, on both clocks, and the cadence then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Stamp {
+    wall_ms: i64,
+    mono_ms: u64,
+    cadence_ms: u32,
+}
+
+impl Stamp {
+    fn of(s: &Sample) -> Self {
+        Self {
+            wall_ms: s.at_unix_ms,
+            mono_ms: s.mono_ms,
+            cadence_ms: s.cadence_ms,
+        }
+    }
+
+    /// The gap rule (v2 §5.4): seconds since `then` when a counter delta
+    /// across the two readings is a rate. The interval must be at most
+    /// [`GAP_CADENCES`] times the longer of the two cadences, and the wall
+    /// and monotonic clocks must have moved together (else the Mac slept, or
+    /// the clock was set). Anything else is a new baseline.
+    fn rate_dt(self, then: Option<Self>) -> Option<f64> {
+        let then = then?;
+        let dt = self.mono_ms.checked_sub(then.mono_ms).filter(|&d| d > 0)?;
+        let wall = self.wall_ms.checked_sub(then.wall_ms)?;
+        let skew = wall.checked_sub(i64::try_from(dt).ok()?)?;
+        let limit = GAP_CADENCES * u64::from(then.cadence_ms.max(self.cadence_ms));
+        ((-SLEEP_SKEW_MS..=SLEEP_SKEW_MS).contains(&skew) && dt <= limit)
+            .then(|| dt as f64 / 1000.0)
+    }
+}
+
+/// One agent session's last fold: its totals, when they were read, and the
+/// rate the fold before it gave.
+#[derive(Clone, Debug)]
+struct Session {
+    /// The last reading that carried the session: the gap rule's baseline.
+    seen: Stamp,
+    /// When the fold read the totals (monotonic ms).
+    read_ms: i64,
+    /// A fold carried across a gap cannot start the next rate interval.
+    baseline: bool,
+    out: u64,
+    input: u64,
+    unread: usize,
+    unread_more: bool,
+    complete: bool,
+    /// Output and input tokens per minute between the last two folds, held
+    /// until the next fold.
+    held: Option<(f64, f64)>,
+}
+
+impl Session {
+    fn of(t: &TabTokens, seen: Stamp, read_ms: i64, held: Option<(f64, f64)>) -> Self {
+        Self {
+            seen,
+            read_ms,
+            baseline: true,
+            out: t.out_total,
+            input: t.in_total,
+            unread: t.unread,
+            unread_more: t.unread_more,
+            complete: t.complete,
+            held,
+        }
+    }
+
+    fn same_fold(&self, t: &TabTokens) -> bool {
+        self.out == t.out_total
+            && self.input == t.in_total
+            && self.unread == t.unread
+            && self.unread_more == t.unread_more
+            && self.complete == t.complete
+    }
+
+    /// Output and input tokens per minute from `self`'s fold to the fold
+    /// that read `t` at `read_ms`, under the rate hygiene of v2 §8.3: both
+    /// folds complete with the same unread work, and output under
+    /// [`TOKENS_CAP_PER_S`] per second between them. A fold that fails any
+    /// of these yields nothing and is not carried. The gap rule is the
+    /// readings' ([`Vitals::absorb_tokens`]).
+    fn rates_to(&self, t: &TabTokens, read_ms: i64) -> Option<(f64, f64)> {
+        if !self.baseline
+            || self.unread != t.unread
+            || self.unread_more != t.unread_more
+            || !self.complete
+            || !t.complete
+        {
+            return None;
+        }
+        let dt = read_ms.checked_sub(self.read_ms).filter(|&d| d > 0)? as f64 / 1000.0;
+        let out = t.out_total.checked_sub(self.out)? as f64;
+        let input = t.in_total.checked_sub(self.input)? as f64;
+        (out <= TOKENS_CAP_PER_S * dt).then(|| (out / dt * 60.0, input / dt * 60.0))
+    }
+}
+
+/// One sample's token rates.
+#[derive(Debug, Default)]
+struct TokenPass {
+    /// aterm's output and input tokens per minute, where a session gave one.
+    out: Option<f64>,
+    input: Option<f64>,
+    /// Each tab's output tokens per minute, where a session gave one.
+    tabs: HashMap<u64, f64>,
+    /// Tabs with an agent session.
+    with_agent: HashSet<u64>,
+    /// Sessions read.
+    agents: usize,
+}
+
+/// What one process sweep gives the rows' scope figures.
+#[derive(Debug, Default)]
+struct SweepFigs {
+    aterm: ScopeAcc,
+    /// In the sample's tab order.
+    tabs: Vec<ScopeAcc>,
+    /// Whether any process's write counter was read.
+    writes_read: bool,
+    writers: Vec<Writer>,
+    busiest: Option<Busiest>,
+}
+
+/// [`Vitals::absorb_procs`]'s result.
+#[derive(Debug, Default)]
+struct ProcPass {
+    aterm: Option<ScopeView>,
+    tabs: Vec<TabView>,
+    top: Vec<TopProc>,
+    delegated: Vec<DelegatedUsage>,
+    figs: Option<SweepFigs>,
+    /// `sys procs`' rows ([`keep_rows`]).
+    rows: Vec<ProcView>,
+    /// aterm's and the user's other processes' cores-worth, and the
+    /// processes whose CPU the OS refused, for [`Split`].
+    split_parts: Option<(f32, f32, u32)>,
+    /// The sweep's window, ns.
+    window_ns: Option<u64>,
+}
+
+/// The rows' running state (v2 §5, §6).
+#[derive(Debug, Default)]
+struct Rows {
+    /// Each row's hour ring, in [`Resource::ALL`] order: the first series.
+    rings: [BucketRing; 7],
+    /// Network's send direction.
+    net_tx: BucketRing,
+    /// Processes run by this user.
+    yours: BucketRing,
+    /// The last known fixed capacity of each row, so a reading that failed
+    /// once does not hollow the whole strip.
+    caps: [Option<f64>; 7],
+    /// aterm's figures' recent readings, by row.
+    aterm: [Recent; 7],
+    /// Each tab's, by key.
+    tabs: HashMap<u64, [Recent; 7]>,
+    /// aterm's input tokens per minute.
+    tokens_in: Recent,
+    peaks: Peaks,
+    free: FreeHistory,
+    cores_at: Option<Stamp>,
+    sweep_at: Option<Stamp>,
+    /// Each process's cumulative bytes written at the last sweep.
+    written: HashMap<u32, u64>,
+    links_at: Option<Stamp>,
+    /// Each link's counters at the last reading, by name.
+    links: HashMap<String, (u64, u64)>,
+    /// The counted link the network is measured against, by name
+    /// ([`Rows::pick_link`]).
+    link_pick: Option<String>,
+    /// Another counted link leading it, and for how many readings in a row.
+    link_lead: Option<(String, u32)>,
+    /// Swap's counter and when it was read.
+    swap: Option<(Stamp, u64)>,
+    sessions: HashMap<String, Session>,
+    /// Since when `rate60` has been positive, on the monotonic clock (ms),
+    /// which neither steps back with the wall clock nor runs while the Mac
+    /// sleeps.
+    filling_since: Option<u64>,
+    /// The GPU's reset count at the first reading, and when it first rose.
+    gpu_recoveries: Option<u64>,
+    gpu_rose_at: Option<i64>,
+}
+
 /// The model's running state. One per host instance.
 #[derive(Debug, Default)]
 pub struct Vitals {
+    rows: Rows,
     seq: u64,
     last_cores_at: Option<u64>,
     last_gpu_at: Option<u64>,
@@ -476,11 +1695,15 @@ pub struct Vitals {
     gpu_history: History,
     mem: Trend,
     mem_history: History,
+    last_counters: Option<(u64, MemCounters)>,
     last_sweep_at: Option<u64>,
-    last_cpu: HashMap<u32, u64>,
+    last_cpu: HashMap<u32, (Option<u64>, u64)>,
+    last_runnable: HashMap<u32, u64>,
+    last_read_at: HashMap<u32, u64>,
     global_foot: Trend,
     aterm: ScopeState,
     tabs: HashMap<u64, ScopeState>,
+    detector: crate::events::Detector,
 }
 
 impl Vitals {
@@ -490,17 +1713,50 @@ impl Vitals {
         Self::default()
     }
 
+    /// The peaks learned so far, for the host to persist.
+    #[must_use]
+    pub fn peaks(&self) -> &Peaks {
+        &self.rows.peaks
+    }
+
+    /// Take peaks the host persisted in an earlier run.
+    pub fn restore_peaks(&mut self, peaks: Peaks) {
+        self.rows.peaks = peaks;
+    }
+
+    /// How many samples it has absorbed.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Absorb one sample and return the snapshot it makes.
     pub fn absorb(&mut self, s: &Sample) -> Snapshot {
         self.seq += 1;
+        let stamp = Stamp::of(s);
+        // The gap rule's baselines move with every reading of their counter.
+        let cores_dt = match s.cores.as_deref() {
+            Some(c) if !c.is_empty() => stamp.rate_dt(self.rows.cores_at.replace(stamp)),
+            _ => None,
+        };
+        let sweep_dt = s
+            .procs
+            .as_ref()
+            .and_then(|_| stamp.rate_dt(self.rows.sweep_at.replace(stamp)));
+        let mut cores_window_ns = None;
         let cpu = s
             .cores
             .as_deref()
             .filter(|cores| !cores.is_empty())
             .and_then(|cores| {
-                let dt_s = interval_s(self.last_cores_at, s.at_ns);
+                let before = self.last_cores_at;
+                let dt_s = interval_s(before, s.at_ns);
                 self.last_cores_at = Some(s.at_ns);
-                self.absorb_cores(cores, &s.clusters, dt_s, s.at_ns)
+                let view = self.absorb_cores(cores, &s.clusters, dt_s, s.at_ns);
+                if view.is_some() {
+                    cores_window_ns = before.filter(|&t| s.at_ns > t).map(|t| s.at_ns - t);
+                }
+                view
             });
         if cpu.is_none() {
             self.busy_history.push_at(None, s.at_ns);
@@ -517,6 +1773,7 @@ impl Vitals {
                     cores: g.cores,
                     name: g.name.clone(),
                     history: self.gpu_history.to_vec(),
+                    sample: g.clone(),
                 })
             }
             _ => {
@@ -531,10 +1788,19 @@ impl Vitals {
             self.mem.push(used, mem_dt_s);
             self.last_mem_at = Some(s.at_ns);
             self.mem_history.push_at(Some(used), s.at_ns);
+            let rates = m.counters.and_then(|now| {
+                let before = self.last_counters.replace((s.at_ns, now));
+                let (then_ns, then) = before?;
+                mem_rates(then, now, s.at_ns.checked_sub(then_ns)?)
+            });
+            if m.counters.is_none() {
+                self.last_counters = None;
+            }
             Some(MemView {
                 sample: m,
                 used_gib: self.mem.view(),
                 history: self.mem_history.to_vec(),
+                rates,
             })
         } else {
             self.mem_history.push_at(None, s.at_ns);
@@ -552,18 +1818,38 @@ impl Vitals {
             global.footprint_gib = self.global_foot.view();
         }
 
-        let (aterm, tabs, top) = match s.procs.as_deref() {
-            Some(procs) => self.absorb_procs(procs, s, &mut global),
+        let pass = match s.procs.as_deref() {
+            Some(procs) => self.absorb_procs(procs, s, &mut global, sweep_dt),
             None => {
                 self.aterm.history.push_at(None, s.at_ns);
                 for state in self.tabs.values_mut() {
                     state.history.push_at(None, s.at_ns);
                 }
-                (None, Vec::new(), Vec::new())
+                ProcPass::default()
             }
         };
+        let busy = cpu
+            .as_ref()
+            .filter(|_| cores_dt.is_some())
+            .map(|c| f64::from(c.busy.raw));
+        let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
+        let (resources, facts) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        let split = match (cpu.as_ref(), pass.split_parts) {
+            (Some(c), Some((aterm, others, unread))) => {
+                let rest = c.busy.raw - aterm - others;
+                Some(Split {
+                    global: c.busy.raw,
+                    aterm,
+                    others,
+                    services: rest.max(0.0),
+                    unaccounted: rest.min(0.0),
+                    unread,
+                })
+            }
+            _ => None,
+        };
 
-        Snapshot {
+        let mut snap = Snapshot {
             at_ns: s.at_ns,
             seq: self.seq,
             cpu,
@@ -571,11 +1857,28 @@ impl Vitals {
             mem,
             volume: s.volume.clone(),
             global,
-            aterm,
-            tabs,
-            top,
+            aterm: pass.aterm,
+            tabs: pass.tabs,
+            top: pass.top,
             jobs: None,
-        }
+            delegated: pass.delegated,
+            machine_only: s.machine_only,
+            at_unix_ms: s.at_unix_ms,
+            resources,
+            free_history: self.rows.free.clone(),
+            facts,
+            procs_window_ns: pass.window_ns,
+            cores_window_ns,
+            split,
+            procs: pass.rows,
+            procs_truncated: s.procs_truncated,
+            thermal: s.thermal,
+            load: s.load,
+            self_pid: s.self_pid,
+            events: Vec::new(),
+        };
+        snap.events = self.detector.detect(&snap);
+        snap
     }
 
     fn absorb_cores(
@@ -632,52 +1935,119 @@ impl Vitals {
         procs: &[ProcSample],
         s: &Sample,
         global: &mut ScopeView,
-    ) -> (Option<ScopeView>, Vec<TabView>, Vec<TopProc>) {
+        sweep_dt: Option<f64>,
+    ) -> ProcPass {
+        // Bytes written per second, per pid, across an interval the gap rule
+        // admits. A pid reused with a smaller counter wrote 0.
+        let mut written = HashMap::with_capacity(procs.len());
+        let mut writes = HashMap::new();
+        for p in procs {
+            if let Some(w) = p.disk_written {
+                written.insert(p.pid, w);
+                if let (Some(dt), Some(&before)) = (sweep_dt, self.rows.written.get(&p.pid)) {
+                    writes.insert(p.pid, w.saturating_sub(before) as f64 / dt);
+                }
+            }
+        }
+        let writes_read = !written.is_empty();
+        self.rows.written = written;
+
         let wall_ns = self
             .last_sweep_at
             .filter(|&t| s.at_ns > t)
             .map(|t| s.at_ns - t);
         self.last_sweep_at = Some(s.at_ns);
         let mut next_cpu = HashMap::with_capacity(procs.len());
-        let mut rate = HashMap::with_capacity(procs.len());
+        let mut next_runnable = HashMap::with_capacity(procs.len());
+        let mut next_read_at = HashMap::with_capacity(procs.len());
+        let mut rates: Vec<ProcRates> = Vec::with_capacity(procs.len());
         for p in procs {
-            if let Some(ns) = p.cpu_ns {
-                next_cpu.insert(p.pid, ns);
-                let cores = match (wall_ns, self.last_cpu.get(&p.pid)) {
-                    (Some(wall), Some(&before)) if wall > 0 => {
-                        ns.saturating_sub(before) as f32 / wall as f32
-                    }
-                    _ => 0.0,
-                };
-                rate.insert(p.pid, cores);
+            let mut r = ProcRates {
+                write_bps: writes.get(&p.pid).copied(),
+                ..ProcRates::default()
+            };
+            // This process's own window where both reads carry a stamp, else
+            // the sweep's.
+            let wall_ns = match (p.at_ns, self.last_read_at.get(&p.pid)) {
+                (Some(now), Some(&then)) if now > then => Some(now - then),
+                _ => wall_ns,
+            };
+            if let Some(at) = p.at_ns {
+                next_read_at.insert(p.pid, at);
             }
+            if let Some(ns) = p.cpu_ns {
+                next_cpu.insert(p.pid, (p.start, ns));
+                if let (Some(wall), Some(&(birth, before))) = (wall_ns, self.last_cpu.get(&p.pid))
+                    && wall > 0
+                    && birth == p.start
+                {
+                    r.cores = Some(ns.saturating_sub(before) as f32 / wall as f32);
+                }
+            }
+            if let Some(run) = p.runnable_ns {
+                next_runnable.insert(p.pid, run);
+                if let (Some(wall), Some(&before), Some(ns), Some(&(birth, cpu_before))) = (
+                    wall_ns,
+                    self.last_runnable.get(&p.pid),
+                    p.cpu_ns,
+                    self.last_cpu.get(&p.pid),
+                ) && wall > 0
+                    && birth == p.start
+                {
+                    let d_run = run.saturating_sub(before);
+                    let d_cpu = ns.saturating_sub(cpu_before);
+                    r.wait = Some(d_run.saturating_sub(d_cpu) as f32 / wall as f32);
+                }
+            }
+            rates.push(r);
         }
         self.last_cpu = next_cpu;
+        self.last_runnable = next_runnable;
+        self.last_read_at = next_read_at;
         global.procs = u32::try_from(procs.len()).unwrap_or(u32::MAX);
         let Some(wall_ns) = wall_ns else {
             // The first sweep has nothing to subtract.
-            return (None, Vec::new(), Vec::new());
+            return ProcPass::default();
         };
         let dt_s = wall_ns as f32 / 1e9;
 
-        let membership = attribute(procs, s.self_pid, &s.tabs);
+        let (membership, delegated_members) =
+            attribute_delegated(procs, s.self_pid, &s.tabs, &s.delegated);
         let mut aterm_acc = ScopeAcc::default();
+        let mut global_acc = ScopeAcc::default();
         let mut tab_acc: Vec<ScopeAcc> = vec![ScopeAcc::default(); s.tabs.len()];
-        let mut global_top: Option<(String, f32)> = None;
+        let mut others = 0.0f32;
+        let mut ownership_known = s.self_uid.is_some();
+        let mut rows: Vec<ProcView> = Vec::with_capacity(procs.len());
+        let mut job_acc: Vec<ScopeAcc> = vec![ScopeAcc::default(); s.delegated.len()];
         let mut top: Vec<TopProc> = Vec::with_capacity(TOP_PROCS + 1);
-        for (p, m) in procs.iter().zip(membership.iter()) {
-            let cores = rate.get(&p.pid).copied().unwrap_or(0.0);
+        let mut writers: Vec<Writer> = Vec::new();
+        // Busy processes grouped by name, in the order first seen.
+        let mut groups: Vec<Busiest> = Vec::new();
+        let mut group_of: HashMap<&str, usize> = HashMap::new();
+        for (index, ((p, m), r)) in procs
+            .iter()
+            .zip(membership.iter())
+            .zip(rates.iter())
+            .enumerate()
+        {
+            global_acc.add(p, r);
+            let cores = r.cores.unwrap_or(0.0);
+            let wrote = r.write_bps;
+            if let Some(job) = delegated_members[index] {
+                job_acc[job].add(p, r);
+            }
+            let scope = || match (m.tab, m.aterm) {
+                (Some(t), _) => s
+                    .tabs
+                    .get(t)
+                    .map_or(ProcScope::Aterm, |r| ProcScope::Tab(r.key)),
+                (None, true) => ProcScope::Aterm,
+                (None, false) => ProcScope::Other,
+            };
             if cores >= 0.01
                 && (top.len() < TOP_PROCS || top.last().is_some_and(|t| cores > t.cores))
             {
-                let scope = match (m.tab, m.aterm) {
-                    (Some(t), _) => s
-                        .tabs
-                        .get(t)
-                        .map_or(ProcScope::Aterm, |r| ProcScope::Tab(r.key)),
-                    (None, true) => ProcScope::Aterm,
-                    (None, false) => ProcScope::Other,
-                };
                 let at = top.partition_point(|t| t.cores >= cores);
                 top.insert(
                     at,
@@ -685,23 +2055,95 @@ impl Vitals {
                         name: p.name.clone(),
                         cores,
                         footprint: p.footprint,
-                        scope,
+                        scope: scope(),
                     },
                 );
                 top.truncate(TOP_PROCS);
             }
-            if cores > 0.0 && global_top.as_ref().is_none_or(|(_, c)| cores > *c) {
-                global_top = Some((p.name.clone(), cores));
+            // Only this user's writes are counted: another user's counters
+            // are not this process's to read.
+            if let Some(w) = wrote.filter(|w| *w > 0.0)
+                && s.self_uid.is_none_or(|u| p.uid == Some(u))
+            {
+                writers.push(Writer {
+                    name: p.name.clone(),
+                    bytes_per_s: w,
+                    scope: scope(),
+                });
+            }
+            if cores > 0.0 {
+                let scope = scope();
+                match group_of.get(p.name.as_str()) {
+                    Some(&g) => {
+                        let g = &mut groups[g];
+                        g.cores += cores;
+                        g.n += 1;
+                        if g.scope != Some(scope) {
+                            g.scope = None;
+                        }
+                    }
+                    None => {
+                        group_of.insert(&p.name, groups.len());
+                        groups.push(Busiest {
+                            name: p.name.clone(),
+                            cores,
+                            n: 1,
+                            scope: Some(scope),
+                        });
+                    }
+                }
             }
             if m.aterm {
-                aterm_acc.add(p, cores);
+                aterm_acc.add(p, r);
             }
             if let Some(t) = m.tab {
-                tab_acc[t].add(p, cores);
+                tab_acc[t].add(p, r);
             }
+            let row_scope = if p.pid == s.self_pid {
+                RowScope::SelfProc
+            } else if let Some(t) = m.tab {
+                RowScope::Tab(s.tabs[t].key)
+            } else if m.aterm {
+                RowScope::Helper
+            } else {
+                match (p.uid, s.self_uid) {
+                    (Some(u), Some(me)) if u == me => RowScope::Others,
+                    (Some(_), Some(_)) => RowScope::Services,
+                    _ => {
+                        ownership_known = false;
+                        RowScope::Unknown
+                    }
+                }
+            };
+            if row_scope == RowScope::Others {
+                others += cores;
+            }
+            rows.push(ProcView {
+                pid: p.pid,
+                ppid: p.ppid,
+                pgid: p.pgid,
+                name: p.name.clone(),
+                cores: r.cores,
+                wait: r.wait,
+                footprint: p.footprint,
+                peak: p.peak,
+                write_bps: r.write_bps,
+                state: p.state,
+                scope: row_scope,
+                refused: p.cpu_ns.is_none(),
+            });
         }
-        global.top = global_top;
+        global.top = global_acc.top.clone();
+        global.wait = global_acc.wait;
+        global.write_bps = global_acc.writes;
+        global.refused = global_acc.refused;
+        writers.sort_by(|a, b| b.bytes_per_s.total_cmp(&a.bytes_per_s));
+        writers.truncate(TOP_WRITERS);
+        let busiest = groups
+            .into_iter()
+            .reduce(|a, b| if b.cores > a.cores { b } else { a });
 
+        let aterm_cores = aterm_acc.cores;
         let aterm = self.aterm.absorb(&aterm_acc, dt_s, s.at_ns);
         let named = front_names(procs, &s.tabs);
         let mut live = std::collections::HashSet::with_capacity(s.tabs.len());
@@ -716,6 +2158,7 @@ impl Vitals {
                 TabView {
                     key: root.key,
                     label: root.label.clone(),
+                    shell_pid: root.shell_pid,
                     program: if root.program.is_empty() {
                         named
                     } else {
@@ -726,8 +2169,546 @@ impl Vitals {
             })
             .collect();
         self.tabs.retain(|k, _| live.contains(k));
-        (Some(aterm), tabs, top)
+        let delegated = s
+            .delegated
+            .iter()
+            .zip(job_acc)
+            // A retained registration with no matching process row has no
+            // current reading; it must not become a fresh zero-usage result.
+            .filter(|(_, acc)| acc.procs > 0)
+            .map(|(job, acc)| DelegatedUsage {
+                root: job.root,
+                cores: acc.cores,
+                footprint: acc.footprint,
+                procs: acc.procs,
+            })
+            .collect();
+        ProcPass {
+            aterm: Some(aterm),
+            tabs,
+            top,
+            delegated,
+            figs: Some(SweepFigs {
+                aterm: aterm_acc,
+                tabs: tab_acc,
+                writes_read,
+                writers,
+                busiest,
+            }),
+            rows: keep_rows(rows),
+            split_parts: ownership_known.then_some((aterm_cores, others, global_acc.refused)),
+            window_ns: Some(wall_ns),
+        }
     }
+}
+
+/// Paging rates from two counter readings `window_ns` apart; `None` for an
+/// empty window or a counter that stepped backwards (a new epoch).
+fn mem_rates(then: MemCounters, now: MemCounters, window_ns: u64) -> Option<MemRates> {
+    if window_ns == 0 {
+        return None;
+    }
+    let d = |a: u64, b: u64| b.checked_sub(a);
+    let per_s = |v: u64| v as f64 * 1e9 / window_ns as f64;
+    Some(MemRates {
+        swapin_bps: per_s(d(then.swapin_bytes, now.swapin_bytes)?),
+        swapout_bps: per_s(d(then.swapout_bytes, now.swapout_bytes)?),
+        decompress_ps: per_s(d(then.decompressions, now.decompressions)?),
+        compress_ps: per_s(d(then.compressions, now.compressions)?),
+        pagein_ps: per_s(d(then.pageins, now.pageins)?),
+        window_ns,
+    })
+}
+
+/// Busiest first: CPU (unknown last), then footprint.
+fn busiest_first(a: &ProcView, b: &ProcView) -> std::cmp::Ordering {
+    b.cores
+        .unwrap_or(-1.0)
+        .total_cmp(&a.cores.unwrap_or(-1.0))
+        .then(b.footprint.unwrap_or(0).cmp(&a.footprint.unwrap_or(0)))
+        .then(a.pid.cmp(&b.pid))
+}
+
+/// The rows a snapshot keeps: aterm's (at most [`ATERM_ROWS`]) and the rest
+/// of the machine's top [`TOP_ROWS`] by CPU and by footprint, busiest first.
+fn keep_rows(rows: Vec<ProcView>) -> Vec<ProcView> {
+    let (mut mine, mut rest): (Vec<ProcView>, Vec<ProcView>) =
+        rows.into_iter().partition(|r| r.scope.in_aterm());
+    mine.sort_by(busiest_first);
+    mine.truncate(ATERM_ROWS);
+    rest.sort_by(busiest_first);
+    let mut kept: Vec<ProcView> = rest.iter().take(TOP_ROWS).cloned().collect();
+    let mut by_foot: Vec<&ProcView> = rest.iter().skip(TOP_ROWS).collect();
+    by_foot.sort_by_key(|p| std::cmp::Reverse(p.footprint.unwrap_or(0)));
+    kept.extend(by_foot.into_iter().take(TOP_ROWS).cloned());
+    mine.extend(kept);
+    mine.sort_by(busiest_first);
+    mine
+}
+
+impl Rows {
+    /// Fold one sample into the rows: ring pushes, scope figures, peaks,
+    /// states and facts. `busy` is the cores' busy count where the gap rule
+    /// admitted their interval; `figs` the sweep's scopes on a full reading.
+    fn absorb(
+        &mut self,
+        s: &Sample,
+        stamp: Stamp,
+        busy: Option<f64>,
+        figs: Option<&SweepFigs>,
+        sweep_dt: Option<f64>,
+    ) -> ([ResourceView; 7], RowFacts) {
+        use Resource::{Cpu, Disk, Gpu, Memory, Network, Processes, Tokens};
+        let now = s.at_unix_ms;
+        let mut facts = RowFacts {
+            load1: s.load1,
+            gpu: s.gpu.clone(),
+            disk: s.disk.clone(),
+            plan: s.plan.clone(),
+            pid_counts: s.pid_counts,
+            proc_limits: s.proc_limits,
+            ..RowFacts::default()
+        };
+
+        // CPU: busy cores of N; over while the load average passes N with
+        // the cores nearly all busy.
+        let n_cores = s.cores.as_ref().map(Vec::len).filter(|&n| n > 0);
+        if let Some(n) = n_cores {
+            self.caps[Cpu.index()] = Some(n as f64);
+        }
+        let cpu_over = match (busy, n_cores, s.load1) {
+            (Some(b), Some(n), Some(load)) => load > n as f64 && b >= CPU_OVER_BUSY * n as f64,
+            _ => false,
+        };
+        self.rings[Cpu.index()].push(now, busy, cpu_over);
+
+        // GPU: busy percent of the time; a reset during this run warns.
+        let gpu_pct = s
+            .gpu
+            .as_ref()
+            .and_then(|g| g.device_pct)
+            .map(|p| f64::from(p.min(100)));
+        self.caps[Gpu.index()] = Some(100.0);
+        self.rings[Gpu.index()].push(now, gpu_pct, false);
+        if let Some(r) = s.gpu.as_ref().and_then(|g| g.recoveries) {
+            let first = *self.gpu_recoveries.get_or_insert(r);
+            if r > first {
+                let since = *self.gpu_rose_at.get_or_insert(now);
+                facts.gpu_resets = Some((r - first, since));
+            }
+        }
+
+        // Memory: bytes used of physical; over while swap traffic is heavy.
+        let mem = s.mem.filter(|m| m.total > 0);
+        if let Some(m) = mem {
+            self.caps[Memory.index()] = Some(m.total as f64);
+        }
+        if let Some(kib) = s.swapped_kib {
+            facts.swap_rate = self.swap.and_then(|(then, before)| {
+                let dt = stamp.rate_dt(Some(then))?;
+                Some(kib.checked_sub(before)? as f64 * 1024.0 / dt)
+            });
+            self.swap = Some((stamp, kib));
+        }
+        let mem_over = facts.swap_rate.is_some_and(|r| r >= SWAP_OVER_BPS);
+        self.rings[Memory.index()].push(now, mem.map(|m| m.used() as f64), mem_over);
+
+        // Disk: bytes used of the home volume; its free history, rates and
+        // the filling clause.
+        let vol = s.volume.as_ref().filter(|v| v.total > 0);
+        if let Some(v) = vol {
+            self.caps[Disk.index()] = Some(v.total as f64);
+            self.free.note(now, v.available);
+        }
+        self.rings[Disk.index()].push(now, vol.map(|v| v.used() as f64), false);
+        if let Some(v) = vol {
+            facts.disk_rates = history::rates(&self.rings[Disk.index()]);
+            // An hour not covered is unknown, not "not filling": only a
+            // known rate that is not positive restarts the clock.
+            match facts.disk_rates.rate60 {
+                Some(r) if r > 0.0 => {
+                    let _ = self.filling_since.get_or_insert(stamp.mono_ms);
+                }
+                Some(_) => self.filling_since = None,
+                None => {}
+            }
+            let filling_for = self.filling_since.map_or(0, |t| {
+                i64::try_from(stamp.mono_ms.saturating_sub(t)).unwrap_or(i64::MAX)
+            });
+            let ttf = history::time_to_full(v.available, facts.disk_rates.rate60, filling_for);
+            facts.filling = history::filling(v.available, &facts.disk_rates, ttf);
+        }
+
+        // Network: bytes per second each way over the counted links.
+        let (rx, tx) = self.absorb_links(s.links.as_deref(), stamp, &mut facts);
+        let closed_rx = self.rings[Network.index()].push(now, rx, false);
+        let closed_tx = self.net_tx.push(now, tx, false);
+        note_peak(
+            &self.rings[Network.index()],
+            closed_rx,
+            &mut self.peaks.net_rx,
+        );
+        note_peak(&self.net_tx, closed_tx, &mut self.peaks.net_tx);
+
+        // Tokens: aterm's output tokens per minute.
+        let tokens = self.absorb_tokens(&s.tokens, stamp);
+        let closed = self.rings[Tokens.index()].push(now, tokens.out, false);
+        note_peak(&self.rings[Tokens.index()], closed, &mut self.peaks.tokens);
+        if let Some(input) = tokens.input {
+            self.tokens_in.push(now, input);
+        }
+        facts.tokens_in = self.tokens_in.mean(now, TOKENS_WINDOW_MS);
+        facts.agents = tokens.agents;
+
+        // Processes: the machine's count and this user's.
+        let (all, yours) = s.pid_counts;
+        self.rings[Processes.index()].push(now, all.map(|n| n as f64), false);
+        self.yours.push(now, yours.map(|n| n as f64), false);
+
+        // Capacities that are peaks: learned, else the link while learning.
+        let today = day_of(now);
+        let link_cap = facts
+            .link
+            .as_ref()
+            .and_then(|l| l.rate_bps)
+            .map(|bps| bps as f64 / 8.0);
+        let (net_basis, rx_cap, tx_cap) = net_capacity(&self.peaks, today, link_cap);
+        facts.net_read_s = self.peaks.net_rx.read_s.min(self.peaks.net_tx.read_s);
+        let (tok_basis, tok_cap) = if self.peaks.tokens.learned(TOKENS_LEARN_S) {
+            (CapBasis::Peak, self.peaks.tokens.peak(today))
+        } else {
+            (CapBasis::Learning, None)
+        };
+        facts.tokens_read_s = self.peaks.tokens.read_s;
+
+        // The aterm and Tab figures, from full readings only.
+        let live: HashSet<u64> = s.tabs.iter().map(|t| t.key).collect();
+        self.tabs.retain(|k, _| live.contains(k));
+        if let Some(f) = figs {
+            let vals = |acc: &ScopeAcc, tokens: Option<f64>| -> [Option<f64>; 7] {
+                let mut v = [None; 7];
+                v[Cpu.index()] = sweep_dt.map(|_| f64::from(acc.cores));
+                v[Memory.index()] = acc.footprint.map(|b| b as f64);
+                v[Disk.index()] = sweep_dt.and(acc.writes);
+                v[Tokens.index()] = tokens;
+                v[Processes.index()] = Some(f64::from(acc.procs));
+                v
+            };
+            push_figs(&mut self.aterm, now, vals(&f.aterm, tokens.out));
+            for (root, acc) in s.tabs.iter().zip(&f.tabs) {
+                let recents = self.tabs.entry(root.key).or_default();
+                push_figs(recents, now, vals(acc, tokens.tabs.get(&root.key).copied()));
+            }
+            facts.writers = f.writers.clone();
+            facts.busiest = f.busiest.clone();
+        }
+        let missing = |res: Resource, agent: bool| -> Option<NoFigure> {
+            match res {
+                Gpu | Network => Some(NoFigure::NotPerApp),
+                Disk if figs.is_some_and(|f| !f.writes_read) => Some(NoFigure::NotReadHere),
+                Tokens if !agent => Some(NoFigure::NoAgent),
+                _ => None,
+            }
+        };
+        let fig = |recent: Option<&Recent>, res: Resource, agent: bool| ScopeFig {
+            now: figs.and(recent).and_then(|r| r.mean(now, window_of(res))),
+            missing: missing(res, agent),
+        };
+
+        let disk_state = disk_state(s.disk.as_ref(), facts.filling.as_ref());
+        let mem_state = match mem.map(|m| m.pressure) {
+            Some(Pressure::Warn) => Some(State::Warn),
+            Some(Pressure::Critical) => Some(State::Critical),
+            _ => None,
+        };
+        let gpu_state = facts.gpu_resets.map(|_| State::Warn);
+        let resources = Resource::ALL.map(|res| {
+            let i = res.index();
+            let ring = &self.rings[i];
+            let (capacity, basis) = match res {
+                Network => (rx_cap, net_basis),
+                Tokens => (tok_cap, tok_basis),
+                Processes => (s.proc_limits.system.map(|n| n as f64), CapBasis::Fixed),
+                _ => (self.caps[i], CapBasis::Fixed),
+            };
+            let second = match res {
+                Network => Some(series(&self.net_tx, now, NOW_WINDOW_MS, tx_cap)),
+                Processes => Some(series(
+                    &self.yours,
+                    now,
+                    NOW_WINDOW_MS,
+                    s.proc_limits.per_user.map(|n| n as f64),
+                )),
+                _ => None,
+            };
+            let mut view = ResourceView::of(
+                series(ring, now, window_of(res), capacity),
+                second,
+                ring.open_k().unwrap_or(0),
+                ring.open_over(),
+                basis,
+            );
+            view.state = match res {
+                Gpu => gpu_state,
+                Memory => mem_state,
+                Disk => disk_state,
+                _ => None,
+            };
+            view.aterm = fig(Some(&self.aterm[i]), res, tokens.agents > 0);
+            view.tab = fig(None, res, false);
+            view.tabs = s
+                .tabs
+                .iter()
+                .map(|t| {
+                    let agent = tokens.with_agent.contains(&t.key);
+                    (t.key, fig(self.tabs.get(&t.key).map(|r| &r[i]), res, agent))
+                })
+                .collect();
+            view
+        });
+        (resources, facts)
+    }
+
+    /// Bytes per second received and sent over the counted links since the
+    /// last reading, when the gap rule admits the interval and some counted
+    /// link gave a delta; the link the network is measured against into
+    /// `facts` ([`Rows::pick_link`]). A link seen for the first time, or
+    /// whose counters went back, is a new baseline and adds nothing this
+    /// once; with no link measured there is no rate, never a zero.
+    fn absorb_links(
+        &mut self,
+        links: Option<&[LinkSample]>,
+        stamp: Stamp,
+        facts: &mut RowFacts,
+    ) -> (Option<f64>, Option<f64>) {
+        let Some(links) = links else {
+            return (None, None);
+        };
+        let dt = stamp.rate_dt(self.links_at.replace(stamp));
+        let (mut rx, mut tx) = (0u64, 0u64);
+        let mut measured = false;
+        let mut moved_by: Vec<(&LinkSample, u64)> = Vec::new();
+        for l in links.iter().filter(|l| l.counts) {
+            let delta = match (dt, self.links.get(&l.name)) {
+                (Some(_), Some(&(brx, btx))) => l.rx.checked_sub(brx).zip(l.tx.checked_sub(btx)),
+                _ => None,
+            };
+            let moved = delta.map_or(0, |(d_rx, d_tx)| {
+                rx = rx.saturating_add(d_rx);
+                tx = tx.saturating_add(d_tx);
+                measured = true;
+                d_rx.saturating_add(d_tx)
+            });
+            moved_by.push((l, moved));
+        }
+        facts.link = self.pick_link(&moved_by, dt).cloned();
+        self.links = links
+            .iter()
+            .map(|l| (l.name.clone(), (l.rx, l.tx)))
+            .collect();
+        match dt.filter(|_| measured) {
+            Some(dt) => (Some(rx as f64 / dt), Some(tx as f64 / dt)),
+            None => (None, None),
+        }
+    }
+
+    /// The counted link the network's capacity is measured against (v2
+    /// §6.5), from each counted link's bytes moved this reading over `dt`
+    /// seconds. The first pick, and the pick after the held link went, is
+    /// this reading's busiest (the faster on a tie, so before any interval
+    /// the fastest). After that the held link stays while it is counted: a
+    /// busier one takes over only once it has led for
+    /// [`LINK_LEAD_READINGS`] readings in a row, leading being at least
+    /// [`LINK_LEAD_BPS`] and more than twice the held link's bytes. With
+    /// two links up, an idle interval's few stray bytes on either never
+    /// swing the capacity (and the whole strip's scale) between them.
+    fn pick_link<'a>(
+        &mut self,
+        moved: &[(&'a LinkSample, u64)],
+        dt: Option<f64>,
+    ) -> Option<&'a LinkSample> {
+        let key = |&(l, m): &(&LinkSample, u64)| (m, l.rate_bps.unwrap_or(0));
+        let busiest = moved
+            .iter()
+            .copied()
+            .reduce(|best, b| if key(&b) > key(&best) { b } else { best });
+        let Some(busiest) = busiest else {
+            self.link_pick = None;
+            self.link_lead = None;
+            return None;
+        };
+        let held = self
+            .link_pick
+            .as_deref()
+            .and_then(|name| moved.iter().copied().find(|(l, _)| l.name == name));
+        let Some(held) = held else {
+            self.link_pick = Some(busiest.0.name.clone());
+            self.link_lead = None;
+            return Some(busiest.0);
+        };
+        let leads = busiest.0.name != held.0.name
+            && dt.is_some_and(|dt| busiest.1 as f64 >= LINK_LEAD_BPS * dt)
+            && busiest.1 > held.1.saturating_mul(2);
+        if !leads {
+            self.link_lead = None;
+            return Some(held.0);
+        }
+        let n = match &self.link_lead {
+            Some((name, n)) if *name == busiest.0.name => n + 1,
+            _ => 1,
+        };
+        if n >= LINK_LEAD_READINGS {
+            self.link_pick = Some(busiest.0.name.clone());
+            self.link_lead = None;
+            Some(busiest.0)
+        } else {
+            self.link_lead = Some((busiest.0.name.clone(), n));
+            Some(held.0)
+        }
+    }
+
+    /// Each session's token rates under the rate hygiene, summed into aterm
+    /// and its tabs. A new fold gives the rate since the last one; a reading
+    /// with the identical fold holds that rate for [`TOKENS_HOLD_MS`] of
+    /// the fold (separate reads may round to the same millisecond);
+    /// a reading the gap rule refuses (a missed reading, a sleep) starts a
+    /// new baseline. A session that gives no rate this tick adds nothing; a
+    /// session gone drops its baseline.
+    fn absorb_tokens(&mut self, tokens: &[TabTokens], stamp: Stamp) -> TokenPass {
+        let mut pass = TokenPass::default();
+        let mut seen: HashSet<&str> = HashSet::with_capacity(tokens.len());
+        for t in tokens {
+            if !seen.insert(t.session.as_str()) {
+                continue;
+            }
+            pass.agents += 1;
+            pass.with_agent.insert(t.key);
+            let now_ms = i64::try_from(stamp.mono_ms).unwrap_or(i64::MAX);
+            let read_ms = t.read_ms.unwrap_or(now_ms);
+            let rate = match self.sessions.get_mut(t.session.as_str()) {
+                Some(b) if stamp.rate_dt(Some(b.seen)).is_some() => {
+                    if read_ms == b.read_ms && b.same_fold(t) {
+                        b.seen = stamp;
+                        b.held
+                            .filter(|_| now_ms.saturating_sub(read_ms) <= TOKENS_HOLD_MS)
+                    } else {
+                        let rate = b.rates_to(t, read_ms);
+                        *b = Session::of(t, stamp, read_ms, rate);
+                        rate
+                    }
+                }
+                Some(b) => {
+                    // A newly read fold is a baseline. A stale fold still
+                    // carried after the gap must wait for that new baseline.
+                    let baseline = read_ms != b.read_ms;
+                    *b = Session::of(t, stamp, read_ms, None);
+                    b.baseline = baseline;
+                    None
+                }
+                None => {
+                    self.sessions
+                        .insert(t.session.clone(), Session::of(t, stamp, read_ms, None));
+                    None
+                }
+            };
+            if let Some((out, input)) = rate {
+                pass.out = Some(pass.out.unwrap_or(0.0) + out);
+                pass.input = Some(pass.input.unwrap_or(0.0) + input);
+                *pass.tabs.entry(t.key).or_default() += out;
+            }
+        }
+        self.sessions.retain(|k, _| seen.contains(k.as_str()));
+        pass
+    }
+}
+
+/// The window a row's "now" averages over: the last 10 s, the last minute
+/// for tokens.
+fn window_of(res: Resource) -> i64 {
+    if res == Resource::Tokens {
+        TOKENS_WINDOW_MS
+    } else {
+        NOW_WINDOW_MS
+    }
+}
+
+/// One series of `ring` as of `now`.
+fn series(ring: &BucketRing, now: i64, window_ms: i64, capacity: Option<f64>) -> Series {
+    Series {
+        now: ring.now_mean(now, window_ms),
+        capacity,
+        ring: ring.cells().into(),
+        binds: false,
+    }
+}
+
+/// Record one scope's readings, row by row.
+fn push_figs(recents: &mut [Recent; 7], now: i64, vals: [Option<f64>; 7]) {
+    for (r, v) in recents.iter_mut().zip(vals) {
+        if let Some(v) = v {
+            r.push(now, v);
+        }
+    }
+}
+
+/// Note the sustained-30 s value ending at the bucket that just closed.
+fn note_peak(ring: &BucketRing, closed: Option<i64>, peak: &mut DailyMax) {
+    if let Some(k) = closed
+        && let Some(v) = ring.sustained(k)
+    {
+        peak.note_bucket(day_of(k * BUCKET_MS), v);
+    }
+}
+
+/// The network's capacity each way (v2 §6.5): each direction's 7-day peak,
+/// clamped to the measured link's rate ([`Rows::pick_link`]), once 24 hours
+/// were read.
+/// Without both peaks it is the link's rate: before 24 hours were read, and
+/// after when no peak is left in the 7 days (a week away). With no link
+/// either there is nothing to measure against: on the peak basis once
+/// learned (no peak in 7 days), on the learning one before.
+fn net_capacity(
+    peaks: &Peaks,
+    today: u32,
+    link: Option<f64>,
+) -> (CapBasis, Option<f64>, Option<f64>) {
+    let clamp = |p: f64| link.map_or(p, |l| p.min(l));
+    let learned = peaks.net_rx.learned(NET_LEARN_S) && peaks.net_tx.learned(NET_LEARN_S);
+    match (peaks.net_rx.peak(today), peaks.net_tx.peak(today)) {
+        (Some(rx), Some(tx)) if learned => (CapBasis::Peak, Some(clamp(rx)), Some(clamp(tx))),
+        _ if link.is_some() => (CapBasis::Link, link, link),
+        _ if learned => (CapBasis::Peak, None, None),
+        _ => (CapBasis::Learning, None, None),
+    }
+}
+
+/// The Disk row's worst state (v2 §6.4): the home volume's level, sessions
+/// stuck on a full disk, a stalled watch, another volume low, and filling
+/// within the hour. The watch's facts count only while it runs (v2 §7.6);
+/// filling comes from the readings, so it warns with the harness off too.
+fn disk_state(facts: Option<&DiskFacts>, filling: Option<&Filling>) -> Option<State> {
+    let mut states = Vec::new();
+    if let Some(f) = facts.filter(|f| f.watch) {
+        states.extend(f.level.and_then(DiskLevel::state));
+        if f.stuck > 0 {
+            states.push(State::Critical);
+        }
+        if f.stalled_since.is_some() {
+            states.push(State::Warn);
+        }
+        if f.others.iter().any(|(_, level, _)| *level != DiskLevel::Ok) {
+            states.push(State::Warn);
+        }
+    }
+    if filling.is_some_and(Filling::outranks_level) {
+        states.push(State::Warn);
+    }
+    states.into_iter().max()
+}
+
+/// The unix day (UTC) of `unix_ms`.
+fn day_of(unix_ms: i64) -> u32 {
+    u32::try_from(unix_ms.div_euclid(86_400_000)).unwrap_or(0)
 }
 
 /// Seconds since this quantity's last usable reading, with the existing
@@ -784,6 +2765,46 @@ pub fn attribute(procs: &[ProcSample], self_pid: u32, tabs: &[TabRoot]) -> Vec<M
         .iter()
         .map(|p| resolve(p.pid, self_pid, &parent, &shells, &mut memo))
         .collect()
+}
+
+/// Add explicit, identity-bound members to normal process-tree attribution.
+/// Every process is counted once. Conflicting explicit claims are refused,
+/// and no explicit root lends ownership to an unproven PID-only descendant.
+fn attribute_delegated(
+    procs: &[ProcSample],
+    self_pid: u32,
+    tabs: &[TabRoot],
+    jobs: &[DelegatedJob],
+) -> (Vec<Membership>, Vec<Option<usize>>) {
+    let mut membership = attribute(procs, self_pid, tabs);
+    let mut claims = HashMap::new();
+    for (index, job) in jobs.iter().enumerate() {
+        for &key in &job.members {
+            claims
+                .entry(key)
+                .and_modify(|claim| *claim = None)
+                .or_insert(Some(index));
+        }
+    }
+    let owners: Vec<_> = procs
+        .iter()
+        .enumerate()
+        .map(|(index, process)| {
+            let key = crate::delegated::ProcessKey {
+                pid: process.pid,
+                start: process.start?,
+            };
+            let job = claims.get(&key).copied().flatten()?;
+            membership[index] = Membership {
+                aterm: true,
+                tab: jobs[job]
+                    .tab
+                    .and_then(|key| tabs.iter().position(|tab| tab.key == key)),
+            };
+            Some(job)
+        })
+        .collect();
+    (membership, owners)
 }
 
 fn resolve(
@@ -893,10 +2914,12 @@ mod tests {
     fn proc(pid: u32, ppid: u32, cpu_ms: u64, foot_mib: u64, name: &str) -> ProcSample {
         ProcSample {
             pid,
+            start: Some(1),
             ppid,
             cpu_ns: Some(cpu_ms * 1_000_000),
             footprint: Some(foot_mib << 20),
             name: name.into(),
+            ..ProcSample::default()
         }
     }
 
@@ -907,6 +2930,143 @@ mod tests {
             label: label.into(),
             program: program.into(),
         }
+    }
+
+    #[test]
+    fn delegated_jobs_charge_two_tabs_once_without_their_shared_daemon() {
+        use crate::delegated::ProcessKey;
+        let member = |pid| ProcessKey {
+            pid,
+            start: u64::from(pid),
+        };
+        let processes = |second: bool| {
+            [
+                (900, 1, 800, 300),
+                (901, 900, 50, 10),
+                (902, 901, 200, 20),
+                (903, 900, 100, 30),
+                (904, 903, 400, 40),
+            ]
+            .into_iter()
+            .map(|(pid, ppid, cpu, mem)| {
+                let mut sample = proc(pid, ppid, if second { cpu } else { 0 }, mem, "work");
+                sample.start = Some(u64::from(pid));
+                sample
+            })
+            .collect()
+        };
+        let mut sample = Sample {
+            at_ns: 1_000_000_000,
+            at_unix_ms: 1000,
+            mono_ms: 1000,
+            cadence_ms: 1000,
+            self_pid: 100,
+            tabs: vec![
+                tab(1, 200, "Tab 1", "codex"),
+                tab(2, 300, "Tab 2", "claude"),
+            ],
+            procs: Some(processes(false)),
+            delegated: vec![
+                DelegatedJob {
+                    root: member(901),
+                    tab: Some(1),
+                    members: vec![member(901), member(902)],
+                },
+                DelegatedJob {
+                    root: member(903),
+                    tab: Some(2),
+                    members: vec![member(903), member(904)],
+                },
+            ],
+            ..Sample::default()
+        };
+        let mut vitals = Vitals::new();
+        vitals.absorb(&sample);
+        sample.at_ns += 1_000_000_000;
+        sample.at_unix_ms += 1000;
+        sample.mono_ms += 1000;
+        sample.procs = Some(processes(true));
+        let snapshot = vitals.absorb(&sample);
+        assert_eq!(snapshot.aterm.as_ref().unwrap().cores.raw, 0.75);
+        assert_eq!(snapshot.aterm.as_ref().unwrap().footprint, Some(100 << 20));
+        assert_eq!(snapshot.tab(1).unwrap().scope.cores.raw, 0.25);
+        assert_eq!(snapshot.tab(2).unwrap().scope.cores.raw, 0.5);
+        let cpu = &snapshot.resources[Resource::Cpu.index()];
+        assert_eq!(cpu.aterm.now, Some(0.75));
+        assert_eq!(
+            snapshot.resource(Resource::Cpu, Some(1)).tab.now,
+            Some(0.25)
+        );
+        assert_eq!(snapshot.resource(Resource::Cpu, Some(2)).tab.now, Some(0.5));
+        assert_eq!(
+            snapshot.resources[Resource::Memory.index()].aterm.now,
+            Some((100 << 20) as f64)
+        );
+        assert_eq!(
+            snapshot.resources[Resource::Processes.index()].aterm.now,
+            Some(4.0)
+        );
+        assert_eq!(
+            snapshot.delegated.iter().map(|job| job.procs).sum::<u32>(),
+            4
+        );
+        assert_eq!(
+            snapshot.delegated.iter().map(|job| job.cores).sum::<f32>(),
+            0.75
+        );
+    }
+
+    #[test]
+    fn reused_pid_inherits_neither_delegation_nor_previous_cpu() {
+        use crate::delegated::ProcessKey;
+        let mut process = proc(900, 1, 1000, 10, "old");
+        let root = ProcessKey { pid: 900, start: 1 };
+        let mut sample = Sample {
+            at_ns: 1,
+            self_pid: 100,
+            procs: Some(vec![process.clone()]),
+            delegated: vec![DelegatedJob {
+                root,
+                tab: None,
+                members: vec![root],
+            }],
+            ..Sample::default()
+        };
+        let mut vitals = Vitals::new();
+        vitals.absorb(&sample);
+        process.start = Some(2);
+        process.cpu_ns = Some(2_000_000_000);
+        sample.at_ns += 1_000_000_000;
+        sample.procs = Some(vec![process]);
+        let snapshot = vitals.absorb(&sample);
+        assert_eq!(snapshot.aterm.unwrap().cores.raw, 0.0);
+        assert!(
+            snapshot.delegated.is_empty(),
+            "reused PID is not a zero reading of the old job"
+        );
+        assert!(snapshot.top.is_empty());
+    }
+
+    #[test]
+    fn conflicting_explicit_claims_are_not_counted_twice() {
+        use crate::delegated::ProcessKey;
+        let process = proc(900, 1, 1, 1, "shared");
+        let key = ProcessKey { pid: 900, start: 1 };
+        let jobs = vec![
+            DelegatedJob {
+                root: key,
+                tab: Some(1),
+                members: vec![key],
+            },
+            DelegatedJob {
+                root: key,
+                tab: Some(2),
+                members: vec![key],
+            },
+        ];
+        let (membership, jobs) = attribute_delegated(&[process], 100, &[], &jobs);
+        assert_eq!(membership, vec![Membership::default()]);
+        assert_eq!(jobs, vec![None]);
     }
 
     #[test]
@@ -1011,17 +3171,51 @@ mod tests {
                 swap_total: 0,
                 pressure: Pressure::Normal,
                 commit: None,
+                ..MemSample::default()
             }),
             gpu: Some(GpuSample {
                 device_pct: Some(4),
                 cores: Some(10),
-                name: None,
+                ..GpuSample::default()
             }),
             volume: None,
             procs: Some(procs),
             self_pid: 100,
             tabs: vec![tab(7, 200, "Tab 1", "cargo")],
+            ..Sample::default()
         }
+    }
+
+    /// A process read early in one sweep and late in the next is rated over
+    /// its own two reads, not the sweep-to-sweep window: 1.9 s of CPU over
+    /// its own 1.9 s is one core, where the 1 s sweep window would say 1.9.
+    /// NEGATIVE CONTROL: an unstamped process keeps the sweep's window.
+    #[test]
+    fn each_process_is_rated_over_its_own_reads() {
+        let stamped = |cpu_ms, at_ms: u64| ProcSample {
+            at_ns: Some(at_ms * 1_000_000),
+            ..proc(201, 200, cpu_ms, 300, "cargo")
+        };
+        let mut v = Vitals::new();
+        v.absorb(&sample(
+            10,
+            &[0, 0, 0, 0],
+            vec![stamped(0, 9_000), proc(900, 1, 0, 900, "Safari")],
+        ));
+        let s = v.absorb(&sample(
+            11,
+            &[0, 0, 100, 100],
+            vec![stamped(1_900, 10_900), proc(900, 1, 1_900, 900, "Safari")],
+        ));
+        let cores = |pid| {
+            s.procs
+                .iter()
+                .find(|p| p.pid == pid)
+                .and_then(|p| p.cores)
+                .expect("a rate")
+        };
+        assert!((cores(201) - 1.0).abs() < 1e-6, "{}", cores(201));
+        assert!((cores(900) - 1.9).abs() < 1e-6, "{}", cores(900));
     }
 
     #[test]
@@ -1067,6 +3261,40 @@ mod tests {
         let s = v.absorb(&sample(100, &[0, 0, 9000, 4500], Vec::new()));
         let cpu = s.cpu.as_ref().expect("an interval");
         assert!(cpu.core_history.iter().all(|h| h.len() <= CORE_HISTORY_LEN));
+    }
+
+    #[test]
+    fn the_busiest_program_counts_every_process_of_its_name() {
+        // Nine rustc in Tab 1, 0.6 cores each, and one cargo at 2 cores: the
+        // busiest process is cargo, the busiest program the nine rustc,
+        // more than the top list keeps.
+        let procs = |rustc_ms: u64, cargo_ms: u64| {
+            let mut p = vec![
+                proc(100, 1, 0, 200, "aterm"),
+                proc(200, 100, 0, 5, "zsh"),
+                proc(201, 200, cargo_ms, 300, "cargo"),
+            ];
+            p.extend((0..9).map(|i| proc(300 + i, 201, rustc_ms, 100, "rustc")));
+            p
+        };
+        let mut v = Vitals::new();
+        let _ = v.absorb(&sample(10, &[0, 0, 0, 0], procs(0, 0)));
+        let s = v.absorb(&sample(11, &[0, 0, 100, 100], procs(600, 2_000)));
+        assert_eq!(s.top.len(), TOP_PROCS);
+        assert_eq!(s.top[0].name, "cargo");
+        let b = s.facts.busiest.expect("a busy program");
+        assert_eq!(
+            (b.name.as_str(), b.n, b.scope),
+            ("rustc", 9, Some(ProcScope::Tab(7)))
+        );
+        assert!((b.cores - 5.4).abs() < 1e-4, "{b:?}");
+        // One of them elsewhere: the group still counts it, and names no
+        // single scope.
+        let mut mixed = procs(1_200, 4_000);
+        mixed[3].ppid = 1;
+        let s = v.absorb(&sample(12, &[0, 0, 200, 200], mixed));
+        let b = s.facts.busiest.expect("a busy program");
+        assert_eq!((b.n, b.scope), (9, None));
     }
 
     #[test]
@@ -1332,5 +3560,913 @@ mod tests {
         assert_eq!(c(150, 100, false).pct(), Some(150));
         assert_eq!(c(5, 0, true).pct(), None);
         assert_eq!(c(5, 0, true).near_limit(), None);
+    }
+
+    // The deck's rows (v2 §15.1).
+
+    use Resource::{Cpu, Disk, Gpu, Memory, Network, Processes, Tokens};
+
+    /// 10:00:00 on some day, unix ms: a multiple of 30 s.
+    const T0: i64 = 1_792_000_800_000;
+
+    /// A machine for the rows' tests at monotonic `mono_ms`, read at wall
+    /// clock `T0 + wall_ms` under cadence `cadence_ms`: two cores busy 1.5
+    /// between them, 8 of 32 GiB used, the GPU busy 12 %, half of a 2 TB
+    /// volume used, one counted 100 Mbit/s link moving 1 MB/s in and
+    /// 0.25 MB/s out, 900 processes (500 this user's), and aterm with one tab
+    /// whose shell's child writes 2 MB/s and whose agent outputs 600 tokens a
+    /// second. Every counter grows with the monotonic clock.
+    fn rig(mono_ms: u64, wall_ms: i64, cadence_ms: u32) -> Sample {
+        let ticks = mono_ms / 10;
+        let mine = |p: ProcSample, written: u64| ProcSample {
+            disk_written: Some(written),
+            uid: Some(501),
+            ..p
+        };
+        Sample {
+            at_ns: mono_ms * 1_000_000,
+            cores: Some(vec![
+                Ticks {
+                    busy: ticks,
+                    total: ticks,
+                },
+                Ticks {
+                    busy: ticks / 2,
+                    total: ticks,
+                },
+            ]),
+            mem: Some(MemSample {
+                total: 32 << 30,
+                app: 8 << 30,
+                ..MemSample::default()
+            }),
+            gpu: Some(GpuSample {
+                device_pct: Some(12),
+                ..GpuSample::default()
+            }),
+            volume: Some(VolumeSample {
+                total: 2_000_000_000_000,
+                free: 1_000_000_000_000,
+                available: 1_000_000_000_000,
+                mount: "/".into(),
+            }),
+            procs: Some(vec![
+                mine(proc(100, 1, mono_ms / 10, 200, "aterm"), 0),
+                mine(proc(200, 100, 0, 5, "zsh"), 0),
+                mine(proc(201, 200, mono_ms / 2, 300, "cargo"), 2_000 * mono_ms),
+            ]),
+            self_pid: 100,
+            tabs: vec![tab(7, 200, "Tab 1", "claude")],
+            at_unix_ms: T0 + wall_ms,
+            mono_ms,
+            cadence_ms,
+            load1: Some(0.5),
+            links: Some(vec![LinkSample {
+                name: "en0".into(),
+                kind: LinkKind::Wifi,
+                counts: true,
+                rx: 1_000 * mono_ms,
+                tx: 250 * mono_ms,
+                rate_bps: Some(100_000_000),
+            }]),
+            proc_limits: ProcLimits {
+                system: Some(16_000),
+                per_user: Some(10_666),
+            },
+            pid_counts: (Some(900), Some(500)),
+            self_uid: Some(501),
+            tokens: vec![TabTokens {
+                key: 7,
+                session: "s1".into(),
+                out_total: 600 * mono_ms / 1000,
+                in_total: 6_000 * mono_ms / 1000,
+                complete: true,
+                ..TabTokens::default()
+            }],
+            ..Sample::default()
+        }
+    }
+
+    /// A reading at `t_ms` on both clocks.
+    fn at(t_ms: u64, cadence_ms: u32) -> Sample {
+        rig(t_ms, t_ms as i64, cadence_ms)
+    }
+
+    /// The open bucket's mean: what this reading added when it is the
+    /// bucket's only one.
+    fn open(s: &Snapshot, r: Resource) -> Option<f64> {
+        s.resources[r.index()].ring.last().and_then(|c| c.mean)
+    }
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|a| (a - b).abs() <= 1e-6 * b.abs().max(1.0))
+    }
+
+    #[test]
+    fn unknown_is_never_zero() {
+        let mut v = Vitals::new();
+        let blank = |t: i64| Sample {
+            at_unix_ms: T0 + t * 1000,
+            mono_ms: t as u64 * 1000,
+            cadence_ms: 1000,
+            tabs: vec![tab(7, 200, "Tab 1", "zsh")],
+            ..Sample::default()
+        };
+        let mut s = Snapshot::default();
+        for t in 0..25 {
+            s = v.absorb(&blank(t));
+        }
+        for res in Resource::ALL {
+            let r = s.resource(res, Some(7));
+            assert_eq!((r.now, r.heat_now), (None, None), "{res:?}");
+            assert!(r.ring.iter().all(|c| c.mean.is_none()), "{res:?}");
+            for per in [10, 20, 30] {
+                assert!(
+                    r.heat_columns(per, 20, s.at_unix_ms)
+                        .iter()
+                        .all(|c| c.heat.is_none() && c.max.is_none()),
+                    "{res:?}"
+                );
+            }
+            assert_eq!(r.aterm.now, None);
+            assert_eq!(r.tab.now, None);
+        }
+        // A real zero is a reading: an idle GPU is 0 %, not hollow.
+        let mut idle = blank(25);
+        idle.gpu = Some(GpuSample {
+            device_pct: Some(0),
+            ..GpuSample::default()
+        });
+        let s = v.absorb(&idle);
+        let gpu = &s.resources[Gpu.index()];
+        assert_eq!((gpu.now, gpu.heat_now), (Some(0.0), Some(0.0)));
+    }
+
+    #[test]
+    fn a_gap_is_a_baseline_not_a_rate() {
+        // A checked subtraction can produce MIN exactly. A clock jump that
+        // large is a gap, never an overflowing signed absolute value or a rate.
+        let baseline = Stamp {
+            wall_ms: 0,
+            mono_ms: 0,
+            cadence_ms: 1,
+        };
+        let rate_at = |wall_ms| {
+            Stamp {
+                wall_ms,
+                mono_ms: 1,
+                cadence_ms: 1,
+            }
+            .rate_dt(Some(baseline))
+        };
+        for wall in [i64::MIN, i64::MIN + 1, i64::MAX] {
+            assert_eq!(rate_at(wall), None, "extreme clock jump {wall}");
+        }
+        // Ordinary skews at either allowed edge still yield the interval;
+        // one millisecond beyond either edge remains a new baseline.
+        for wall in [-999, 1001] {
+            assert_eq!(rate_at(wall), Some(0.001));
+        }
+        for wall in [-1000, 1002] {
+            assert_eq!(rate_at(wall), None);
+        }
+
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in 0..5 {
+            s = v.absorb(&at(t * 1000, 1000));
+        }
+        assert!(close(open(&s, Cpu), 1.5));
+        assert!(close(open(&s, Network), 1e6));
+        assert!(close(open(&s, Tokens), 36_000.0));
+        assert!(close(s.resources[Disk.index()].aterm.now, 2e6));
+
+        // The Mac sleeps: the wall clock moves 600 s, the monotonic 10 s. The
+        // counters' deltas across it are no rate.
+        let s = v.absorb(&rig(14_000, 604_000, 1000));
+        for res in [Cpu, Network, Tokens] {
+            assert_eq!(open(&s, res), None, "{res:?}");
+            assert_eq!(s.resources[res.index()].now, None, "{res:?}");
+        }
+        let tx = s.resources[Network.index()].second.as_ref().expect("send");
+        assert_eq!(tx.ring.last().and_then(|c| c.mean), None);
+        assert_eq!(s.resources[Disk.index()].aterm.now, None, "bytes written");
+        assert_eq!(s.resource(Disk, Some(7)).tab.now, None);
+        // Levels are readings, not deltas: they read as ever.
+        assert!(close(open(&s, Memory), (8u64 << 30) as f64));
+        assert!(close(open(&s, Disk), 1e12));
+
+        // The next reading measures from the new baseline.
+        let s = v.absorb(&rig(15_000, 605_000, 1000));
+        assert!(close(open(&s, Cpu), 1.5));
+        assert!(close(open(&s, Network), 1e6));
+        assert!(close(open(&s, Tokens), 36_000.0));
+        assert!(close(s.resources[Disk.index()].aterm.now, 2e6));
+        assert!(close(s.resource(Disk, Some(7)).tab.now, 2e6));
+
+        // The only counted link replugged under a new name: its first
+        // reading is a baseline, not 0 MB/s, though the interval is fine.
+        // Each reading at a 10 s cadence opens its own bucket.
+        let renamed = |mono_ms: u64| {
+            let mut r = rig(mono_ms, mono_ms as i64 + 590_000, 10_000);
+            if let Some(l) = r.links.as_mut().and_then(|l| l.first_mut()) {
+                l.name = "en1".into();
+            }
+            r
+        };
+        let s = v.absorb(&renamed(25_000));
+        assert!(close(open(&s, Cpu), 1.5), "the interval is admitted");
+        assert_eq!(open(&s, Network), None);
+        let tx = s.resources[Network.index()].second.as_ref().expect("send");
+        assert_eq!(tx.ring.last().and_then(|c| c.mean), None);
+        let s = v.absorb(&renamed(35_000));
+        assert!(close(open(&s, Network), 1e6));
+    }
+
+    #[test]
+    fn heat_formulas() {
+        let day = day_of(T0);
+        let learned = |peak: f64, read_s: u32| DailyMax {
+            days: vec![(day, peak)],
+            read_s,
+        };
+        let mut v = Vitals::new();
+        v.restore_peaks(Peaks {
+            net_rx: learned(50e6, NET_LEARN_S),
+            net_tx: learned(1e6, NET_LEARN_S),
+            tokens: learned(72_000.0, TOKENS_LEARN_S),
+        });
+        let mut s = Snapshot::default();
+        for t in 0..6 {
+            s = v.absorb(&at(t * 1000, 1000));
+        }
+        let heat = |s: &Snapshot, r: Resource| s.resources[r.index()].heat_now.map(f64::from);
+        // CPU: busy cores of N.
+        assert_eq!(s.resources[Cpu.index()].capacity, Some(2.0));
+        assert!(close(heat(&s, Cpu), 0.75));
+        // GPU: busy percent of the time.
+        assert!(close(heat(&s, Gpu), 0.12));
+        // Memory: linear, and exactly the amount over the total.
+        let mem = &s.resources[Memory.index()];
+        assert!(close(heat(&s, Memory), 0.25));
+        assert!(close(
+            heat(&s, Memory),
+            mem.now.expect("read") / mem.capacity.expect("read")
+        ));
+        // Disk: used of the volume.
+        assert!(close(heat(&s, Disk), 0.5));
+        // Network: each direction against its own peak, each clamped to the
+        // link's rate (100 Mbit/s is 12.5 MB/s); the busier share binds.
+        let net = &s.resources[Network.index()];
+        assert_eq!(net.basis, CapBasis::Peak);
+        assert_eq!(net.capacity, Some(12.5e6), "50 MB/s clamped to the link");
+        let tx = net.second.as_ref().expect("send");
+        assert_eq!(tx.capacity, Some(1e6));
+        assert!(close(heat(&s, Network), 0.25), "{net:?}");
+        assert!(tx.binds && !net.first().binds);
+        assert_eq!(net.binding().now, tx.now);
+        // Tokens: aterm's rate against its peak.
+        assert_eq!(s.resources[Tokens.index()].basis, CapBasis::Peak);
+        assert!(close(heat(&s, Tokens), 0.5));
+        // Processes: the larger of the machine's and the user's shares.
+        assert!(close(heat(&s, Processes), 900.0 / 16_000.0));
+        assert!(
+            !s.resources[Processes.index()]
+                .second
+                .as_ref()
+                .expect("yours")
+                .binds
+        );
+        let mut crowded = at(6000, 1000);
+        crowded.pid_counts = (Some(900), Some(9_000));
+        let s = v.absorb(&crowded);
+        // "Now" averages the last 10 s: six readings of 500 and one of 9,000.
+        let yours = s.resources[Processes.index()]
+            .second
+            .clone()
+            .expect("yours");
+        assert!(yours.binds);
+        assert!(close(
+            heat(&s, Processes),
+            (6.0 * 500.0 + 9_000.0) / 7.0 / 10_666.0
+        ));
+
+        // Capacity is applied at paint: a peak that rises re-normalises every
+        // past column.
+        let col = |s: &Snapshot| {
+            s.resources[Tokens.index()].heat_columns(10, 1, T0 + 6_000)[0]
+                .heat
+                .map(f64::from)
+        };
+        assert!(close(col(&s), 0.5));
+        let mut raised = v.peaks().clone();
+        raised.tokens = learned(144_000.0, TOKENS_LEARN_S);
+        v.restore_peaks(raised);
+        let s = v.absorb(&at(7000, 1000));
+        assert!(close(col(&s), 0.25));
+
+        // A burst far past the peak: heat on a peak stops at 1 (v2 §6.5),
+        // the capacity stays the peak until a sustained bucket raises it,
+        // and receiving, past its peak by more, binds.
+        let mut burst = at(8000, 1000);
+        if let Some(l) = burst.links.as_mut().and_then(|l| l.first_mut()) {
+            l.rx += 1_000_000_000;
+        }
+        let s = v.absorb(&burst);
+        let net = &s.resources[Network.index()];
+        assert_eq!(net.heat_now, Some(1.0));
+        assert_eq!(net.capacity, Some(12.5e6));
+        assert!(net.first().binds);
+        let cells = net.heat_columns(10, 60, T0 + 8000);
+        assert!(
+            cells
+                .iter()
+                .all(|c| c.heat.is_none_or(|h| h <= 1.0) && c.max.is_none_or(|m| m <= 1.0)),
+            "{cells:?}"
+        );
+        assert_eq!(cells.last().and_then(|c| c.max), Some(1.0));
+
+        // Before the peaks are learned: the network on the link's basis, and
+        // tokens with nothing to measure against.
+        let mut fresh = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in 0..3 {
+            s = fresh.absorb(&at(t * 1000, 1000));
+        }
+        let net = &s.resources[Network.index()];
+        assert_eq!((net.basis, net.capacity), (CapBasis::Link, Some(12.5e6)));
+        assert!(close(heat(&s, Network), 0.08));
+        let tok = &s.resources[Tokens.index()];
+        assert_eq!((tok.basis, tok.capacity), (CapBasis::Learning, None));
+        assert_eq!(tok.heat_now, None);
+        assert!(
+            tok.now.is_some(),
+            "the rate is read while the peak is learned"
+        );
+    }
+
+    #[test]
+    fn gap_rule_across_cadence_switches() {
+        // 1 s → 5 s → 0.5 s → 10 s → 1 s. Each switch's first reading opens
+        // its own bucket, so that bucket is that reading alone.
+        let mut readings: Vec<(u64, u32, bool)> =
+            (0..10).map(|t| (t * 1000, 1000, false)).collect();
+        readings.push((14_000, 5_000, true));
+        readings.push((19_000, 5_000, false));
+        readings.push((20_000, 500, true));
+        readings.extend((1..20).map(|i| (20_000 + i * 500, 500, false)));
+        readings.push((39_500, 10_000, true));
+        readings.push((49_500, 10_000, false));
+        // A hidden deck shown again: the first 1 s reading comes 9 s after
+        // the last 10 s one, within 3 of the cadence then though not of the
+        // cadence now.
+        readings.push((58_500, 1_000, true));
+        readings.push((59_500, 1_000, false));
+        let mut v = Vitals::new();
+        for (t, cadence, first) in readings {
+            let s = v.absorb(&at(t, cadence));
+            if first {
+                for res in [Cpu, Network, Tokens] {
+                    assert!(
+                        open(&s, res).is_some(),
+                        "{res:?} after the switch at {t} ms"
+                    );
+                }
+                assert!(s.resources[Disk.index()].aterm.now.is_some(), "{t} ms");
+            }
+        }
+        // NEGATIVE CONTROLS. Readings missed: 10 s at a 1 s cadence.
+        let s = v.absorb(&at(69_500, 1_000));
+        for res in [Cpu, Network, Tokens] {
+            assert_eq!(open(&s, res), None, "{res:?} after missed readings");
+        }
+        // A sleep: at a 10 s cadence the monotonic clock moved 10 s, the wall
+        // clock 600 s.
+        let s = v.absorb(&at(79_500, 10_000));
+        assert!(open(&s, Cpu).is_some());
+        let s = v.absorb(&rig(89_500, 669_500, 10_000));
+        for res in [Cpu, Network, Tokens] {
+            assert_eq!(open(&s, res), None, "{res:?} across a sleep");
+        }
+    }
+
+    #[test]
+    fn now_is_one_value() {
+        let mut v = Vitals::new();
+        // Memory in use grows 64 MiB a second.
+        let used = |i: u64| (8u64 << 30) + i * (64 << 20);
+        let mut s = Snapshot::default();
+        for i in 0..75u64 {
+            let mut r = at(i * 1000, 1000);
+            r.mem.as_mut().expect("memory").app = used(i);
+            if let Some(p) = r.procs.as_mut().and_then(|p| p.first_mut()) {
+                p.footprint = Some((200 + 10 * i) << 20);
+            }
+            s = v.absorb(&r);
+        }
+        // "Now" is the mean of the last 10 s of readings, 65..=74.
+        let want = (65..75).map(|i| used(i) as f64).sum::<f64>() / 10.0;
+        let mem = s.resource(Memory, Some(7));
+        assert!(close(mem.now, want), "{:?} vs {want}", mem.now);
+        assert!(close(
+            mem.heat_now.map(f64::from),
+            want / (32u64 << 30) as f64
+        ));
+        // aterm's footprint is aterm's, its shell's and the build's.
+        let want_aterm = (65..75u64)
+            .map(|i| ((200 + 10 * i + 5 + 300) << 20) as f64)
+            .sum::<f64>()
+            / 10.0;
+        assert!(close(mem.aterm.now, want_aterm));
+        assert!(close(mem.tab.now, (305u64 << 20) as f64));
+        // The open column depends on the strip's period; "now" does not.
+        let opens: Vec<Option<f64>> = [(10, 60), (20, 30), (30, 20)]
+            .into_iter()
+            .map(|(per, n)| {
+                mem.columns(per, n, s.at_unix_ms)
+                    .last()
+                    .and_then(|c| c.mean)
+            })
+            .collect();
+        for o in &opens {
+            assert!(o.is_some_and(|o| (o - want).abs() > 1.0), "{opens:?}");
+        }
+        assert_ne!(opens[0], opens[1]);
+        // A window drawing another tab, or none, reads the same "now".
+        assert_eq!(s.resource(Memory, None).now, mem.now);
+        assert_eq!(s.resource(Memory, Some(99)).aterm, mem.aterm);
+    }
+
+    #[test]
+    fn hidden_reads_fill_global_rows() {
+        let mut v = Vitals::new();
+        let hidden = |t_s: u64| Sample {
+            procs: None,
+            machine_only: true,
+            ..at(t_s * 1000, 10_000)
+        };
+        let mut s = Snapshot::default();
+        for i in 0..=60 {
+            s = v.absorb(&hidden(10 * i));
+        }
+        for res in Resource::ALL {
+            let r = s.resource(res, Some(7));
+            let read: Vec<bool> = r.ring.iter().map(|c| c.mean.is_some()).collect();
+            assert_eq!(read.len(), 61, "{res:?}: one bucket per 10 s");
+            // A counter's first reading is its baseline.
+            let counter = matches!(res, Cpu | Network | Tokens);
+            assert_eq!(read[0], !counter, "{res:?}");
+            assert!(read[1..].iter().all(|&r| r), "{res:?}: {read:?}");
+            assert!(r.now.is_some(), "{res:?}");
+            assert_eq!((r.aterm.now, r.tab.now), (None, None), "{res:?}");
+        }
+        // A full reading comes back (the first sweep is the CPU's baseline,
+        // the second gives every figure).
+        let _ = v.absorb(&at(601_000, 1000));
+        let s = v.absorb(&at(602_000, 1000));
+        for res in [Cpu, Memory, Disk, Tokens, Processes] {
+            let r = s.resource(res, Some(7));
+            assert!(r.aterm.now.is_some() && r.tab.now.is_some(), "{res:?}");
+        }
+        // GPU and network keep no per-app figure.
+        for res in [Gpu, Network] {
+            let r = s.resource(res, Some(7));
+            assert_eq!(r.aterm.missing, Some(NoFigure::NotPerApp));
+            assert_eq!(r.tab.missing, Some(NoFigure::NotPerApp));
+        }
+    }
+
+    #[test]
+    fn token_rate_hygiene() {
+        let mut v = Vitals::new();
+        let tok = |i: i64, out: u64, unread: usize, more: bool, complete: bool| Sample {
+            at_unix_ms: T0 + i * 10_000,
+            mono_ms: i as u64 * 10_000,
+            cadence_ms: 10_000,
+            tabs: vec![tab(7, 200, "Tab 1", "claude"), tab(8, 300, "Tab 2", "zsh")],
+            tokens: vec![TabTokens {
+                key: 7,
+                session: "s".into(),
+                out_total: out,
+                in_total: out * 10,
+                unread,
+                unread_more: more,
+                complete,
+                read_ms: None,
+            }],
+            ..Sample::default()
+        };
+        // Each reading 10 s after the last opens its own bucket. 6,000
+        // tokens in 10 s is 36,000 a minute.
+        let steps: [(u64, usize, bool, bool, Option<f64>); 11] = [
+            (0, 0, false, true, None),
+            (6_000, 0, false, true, Some(36_000.0)),
+            // A transcript joined the fold: its catch-up is no rate.
+            (12_000, 1, false, true, None),
+            (18_000, 1, false, true, Some(36_000.0)),
+            (24_000, 1, true, true, None),
+            (30_000, 1, true, true, Some(36_000.0)),
+            // An incomplete fold, and the tick after it.
+            (36_000, 1, true, false, None),
+            (42_000, 1, true, true, None),
+            (48_000, 1, true, true, Some(36_000.0)),
+            // 6,000 a second is over the cap: dropped, not carried.
+            (108_000, 1, true, true, None),
+            (114_000, 1, true, true, Some(36_000.0)),
+        ];
+        for (i, (out, unread, more, complete, want)) in steps.into_iter().enumerate() {
+            let s = v.absorb(&tok(i as i64, out, unread, more, complete));
+            match want {
+                Some(w) => assert!(
+                    close(open(&s, Tokens), w),
+                    "step {i}: {:?}",
+                    open(&s, Tokens)
+                ),
+                None => assert_eq!(open(&s, Tokens), None, "step {i}"),
+            }
+            assert_eq!(s.facts.agents, 1);
+            let t2 = s.resource(Tokens, Some(8)).tab;
+            assert_eq!(t2.missing, Some(NoFigure::NoAgent), "Tab 2 runs no agent");
+        }
+        // One spike bucket, under the cap, does not set the day's maximum.
+        let mut out = 114_000;
+        for i in 11..22 {
+            out += if i == 16 { 30_000 } else { 6_000 };
+            let _ = v.absorb(&tok(i, out, 1, true, true));
+        }
+        assert_eq!(v.peaks().tokens.peak(day_of(T0)), Some(36_000.0));
+    }
+
+    /// v2 §8.3 over folds: a session folded every 15 s and read every
+    /// second gives, at every reading, the rate between its last two folds
+    /// (3,000 tokens a second: under the cap per second of the folds'
+    /// interval, though over it per second of a reading's). The rate holds
+    /// for [`TOKENS_HOLD_MS`] past the last fold and no longer; a fold after
+    /// a long silence gives the mean since the one before; a sleep (the wall
+    /// clock leaping past the monotonic one) drops the rate. NEGATIVE
+    /// CONTROLS: before a second fold, past the hold and after the sleep,
+    /// nothing is read.
+    #[test]
+    fn token_rates_span_folds_not_readings() {
+        let mut v = Vitals::new();
+        // Reading `i` (seconds) carrying the fold read at `fold_s` with
+        // `k` × 45,000 output tokens.
+        let reading = |i: u64, k: u64, fold_s: i64, slept_ms: i64| Sample {
+            at_unix_ms: T0 + i as i64 * 1000 + slept_ms,
+            mono_ms: i * 1000,
+            cadence_ms: 1000,
+            tabs: vec![tab(7, 200, "Tab 1", "claude")],
+            tokens: vec![TabTokens {
+                key: 7,
+                session: "s".into(),
+                out_total: 45_000 * k,
+                in_total: 450_000 * k,
+                complete: true,
+                read_ms: Some(fold_s * 1000),
+                ..TabTokens::default()
+            }],
+            ..Sample::default()
+        };
+        let per_min = 3_000.0 * 60.0;
+        for i in 0..=100u64 {
+            // Folds at 0, 15 and 30 s; none after.
+            let k = (i / 15).min(2);
+            let s = v.absorb(&reading(i, k, k as i64 * 15, 0));
+            let now = s.resource(Tokens, None).now;
+            match i {
+                0..15 => assert_eq!(open(&s, Tokens), None, "{i}: one fold"),
+                15..=90 => {
+                    assert!(
+                        close(open(&s, Tokens), per_min),
+                        "{i}: {:?}",
+                        open(&s, Tokens)
+                    );
+                    assert!(close(now, per_min), "{i}: now {now:?}");
+                }
+                // The bucket of 100..110 s holds only readings past the hold.
+                100 => assert_eq!(open(&s, Tokens), None, "past the hold"),
+                _ => {}
+            }
+        }
+        // A fold 71 s after the last: the mean between them, then held.
+        let since = 45_000.0 / 71.0 * 60.0;
+        let s = v.absorb(&reading(101, 3, 101, 0));
+        assert!(close(open(&s, Tokens), since), "{:?}", open(&s, Tokens));
+        let s = v.absorb(&reading(102, 3, 101, 0));
+        assert!(close(open(&s, Tokens), since), "held");
+        // The Mac slept: a new baseline, and nothing is held from before.
+        let s = v.absorb(&reading(103, 3, 101, 120_000));
+        assert_eq!(open(&s, Tokens), None, "a sleep drops the rate");
+        let s = v.absorb(&reading(104, 3, 101, 120_000));
+        assert_eq!(open(&s, Tokens), None, "no new fold since the sleep");
+        // The first fresh fold after that stale copy is the baseline, not
+        // an interval reaching back across the sleep. Separate buckets keep
+        // an earlier reading from hiding a refusal.
+        let spaced = |i, k, fold_s, slept_ms| Sample {
+            cadence_ms: 10_000,
+            ..reading(i, k, fold_s, slept_ms)
+        };
+        let s = v.absorb(&spaced(111, 4, 111, 120_000));
+        assert_eq!(open(&s, Tokens), None, "the first fresh post-sleep fold");
+        let s = v.absorb(&spaced(121, 5, 121, 120_000));
+        assert!(close(open(&s, Tokens), 4_500.0 * 60.0), "new interval");
+
+        // Distinct footer reads can round to the same millisecond. Only an
+        // identical fold may reuse the held rate; changed totals or a newly
+        // incomplete fold are fresh baselines, even at that same read_ms.
+        let mut v = Vitals::new();
+        let _ = v.absorb(&spaced(0, 0, 0, 0));
+        let s = v.absorb(&spaced(10, 1, 10, 0));
+        assert!(close(open(&s, Tokens), 4_500.0 * 60.0));
+        let s = v.absorb(&spaced(20, 2, 10, 0));
+        assert_eq!(open(&s, Tokens), None, "changed totals at the same ms");
+        let s = v.absorb(&spaced(30, 3, 30, 0));
+        assert!(
+            close(open(&s, Tokens), 2_250.0 * 60.0),
+            "new totals baseline"
+        );
+        let s = v.absorb(&spaced(40, 3, 30, 0));
+        assert!(
+            close(open(&s, Tokens), 2_250.0 * 60.0),
+            "identical fold held"
+        );
+        let mut incomplete = spaced(50, 3, 30, 0);
+        incomplete.tokens[0].complete = false;
+        let s = v.absorb(&incomplete);
+        assert_eq!(open(&s, Tokens), None, "incomplete at the same ms");
+        let mut repeated = spaced(60, 3, 30, 0);
+        repeated.tokens[0].complete = false;
+        let s = v.absorb(&repeated);
+        assert_eq!(open(&s, Tokens), None, "an incomplete fold holds no rate");
+        let s = v.absorb(&spaced(70, 4, 70, 0));
+        assert_eq!(open(&s, Tokens), None, "both folds must be complete");
+        let s = v.absorb(&spaced(80, 5, 80, 0));
+        assert!(close(open(&s, Tokens), 4_500.0 * 60.0), "complete again");
+    }
+
+    /// A Disk reading `i` 10 s apart on both clocks, `available` bytes free
+    /// of 2 TB, with the watch's `facts`.
+    fn disk_reading(i: i64, available: u64, facts: Option<DiskFacts>) -> Sample {
+        Sample {
+            at_unix_ms: T0 + i * 10_000,
+            mono_ms: i as u64 * 10_000,
+            cadence_ms: 10_000,
+            volume: Some(VolumeSample {
+                total: 2_000_000_000_000,
+                free: available,
+                available,
+                mount: "/".into(),
+            }),
+            disk: facts,
+            ..Sample::default()
+        }
+    }
+
+    /// The facts of a running watch that judged the home volume at `level`.
+    fn watched(level: DiskLevel) -> Option<DiskFacts> {
+        Some(DiskFacts {
+            level: Some(level),
+            watch: true,
+            ..DiskFacts::default()
+        })
+    }
+
+    #[test]
+    fn disk_history_and_rates() {
+        let mut v = Vitals::new();
+        // Filling at 10 MB/s from 500 GB free.
+        let mut free = 500_000_000_000u64;
+        let mut s = Snapshot::default();
+        for i in 0..420 {
+            s = v.absorb(&disk_reading(i, free, watched(DiskLevel::Ok)));
+            match i {
+                // The hour's start is not read yet.
+                356 => assert_eq!(s.facts.disk_rates.rate60, None),
+                // The hour less the slack: rate60, but not yet 10 minutes of
+                // filling.
+                357 => {
+                    assert!(close(s.facts.disk_rates.rate60, 1e7));
+                    assert!(close(s.facts.disk_rates.rate10, 1e7));
+                    assert!(close(s.facts.disk_rates.rate5, 1e7));
+                    assert_eq!(s.facts.filling, None);
+                }
+                416 => assert_eq!(s.facts.filling, None),
+                _ => {}
+            }
+            free -= 100_000_000;
+        }
+        // Ten minutes of filling: full in about 12.7 h, said, under the level.
+        let f = s.facts.filling.expect("time to full under a day");
+        assert!(!f.burst && !f.outranks_level());
+        assert!((f.secs - 458.1e9 / 1e7).abs() < 1.0, "{f:?}");
+        assert_eq!(s.resources[Disk.index()].state, None);
+        // A burst at 200 MB/s for 5 minutes, with the harness off: it fills
+        // the disk within the hour, so the filling clause warns on its own
+        // (v2 §7.6).
+        for i in 420..450 {
+            free -= 2_000_000_000;
+            s = v.absorb(&disk_reading(i, free, None));
+        }
+        let f = s.facts.filling.expect("a burst");
+        assert!(f.burst && f.outranks_level(), "{f:?}");
+        assert_eq!(s.resources[Disk.index()].state, Some(State::Warn));
+        // The free history: 10-minute minima since the first reading.
+        let w = s.free_history.window(s.at_unix_ms);
+        let read: Vec<u64> = w.iter().flatten().copied().collect();
+        assert_eq!(read.len(), 8, "75 minutes span 8 ten-minute buckets");
+        assert_eq!(read.last(), Some(&free), "the least free space");
+        assert!(read.windows(2).all(|p| p[1] < p[0]));
+        // Five minutes after the burst the hour's rate fills the disk in
+        // hours: said, and the row is calm.
+        for i in 450..480 {
+            s = v.absorb(&disk_reading(i, free, None));
+        }
+        let f = s.facts.filling.expect("full within a day");
+        assert!(!f.burst && !f.outranks_level(), "{f:?}");
+        assert_eq!(s.resources[Disk.index()].state, None);
+        // A level and stuck sessions the host still sends with the watch off
+        // are not the row's, as its words have it.
+        let off = DiskFacts {
+            level: Some(DiskLevel::Low),
+            stuck: 2,
+            watch: false,
+            ..DiskFacts::default()
+        };
+        let s = v.absorb(&disk_reading(480, free, Some(off)));
+        assert_eq!(s.resources[Disk.index()].state, None);
+        let s = v.absorb(&disk_reading(481, free, watched(DiskLevel::Low)));
+        assert_eq!(s.resources[Disk.index()].state, Some(State::Warn));
+        // A full disk's emergency is critical whatever it fills at.
+        let s = v.absorb(&disk_reading(482, free, watched(DiskLevel::EmergencyFiles)));
+        assert_eq!(s.resources[Disk.index()].state, Some(State::Critical));
+    }
+
+    #[test]
+    fn missed_readings_and_clock_steps_keep_the_filling_clause() {
+        // Filling at 10 MB/s with one reading missed, then four in a row.
+        let mut v = Vitals::new();
+        let free = |i: i64| 500_000_000_000 - i as u64 * 100_000_000;
+        let missed = |i: i64| i == 100 || (200..204).contains(&i);
+        for i in (0..640).filter(|&i| !missed(i)) {
+            let s = v.absorb(&disk_reading(i, free(i), None));
+            if i < 417 {
+                continue;
+            }
+            // The one missed bucket leaving the hour (at 459) changes
+            // nothing. The four are past the slack: the hour is unknown
+            // while they start it, and the clause is back the moment it is
+            // known again, not ten minutes later.
+            let unknown = (559..561).contains(&i);
+            assert_eq!(s.facts.disk_rates.rate60.is_none(), unknown, "{i}");
+            assert_eq!(s.facts.filling.is_some(), !unknown, "{i}");
+        }
+        // The wall clock steps back 2 hours: the history re-bases, the
+        // filling clock runs on the monotonic one, and the free history's
+        // window at the stepped-back clock holds the reading.
+        let mut back = disk_reading(640, free(640), None);
+        back.at_unix_ms -= 7_200_000;
+        let s = v.absorb(&back);
+        assert!(close(s.facts.disk_rates.rate60, 1e7));
+        assert!(s.facts.filling.is_some());
+        assert_eq!(
+            s.free_history
+                .window(s.at_unix_ms)
+                .last()
+                .copied()
+                .flatten(),
+            Some(free(640))
+        );
+    }
+
+    #[test]
+    fn over_is_a_queue_on_the_cores_or_heavy_swapping() {
+        // CPU: every core busy with more runnable than cores is over; busy
+        // without a queue, or a queue without the cores busy, is not.
+        let run = |load1: f64, busy_half: bool, swap_kib_per_s: u64| {
+            let mut v = Vitals::new();
+            let mut s = Snapshot::default();
+            for t in 0..5u64 {
+                let mut r = at(t * 1000, 1000);
+                r.load1 = Some(load1);
+                if !busy_half && let Some(c) = r.cores.as_mut() {
+                    c[1].busy = c[1].total;
+                }
+                r.swapped_kib = Some(swap_kib_per_s * t);
+                s = v.absorb(&r);
+            }
+            (
+                s.resources[Cpu.index()].over,
+                s.resources[Memory.index()].over,
+            )
+        };
+        assert_eq!(run(2.5, false, 0), (true, false));
+        assert_eq!(run(1.5, false, 0), (false, false), "no queue");
+        assert_eq!(run(2.5, true, 0), (false, false), "1.5 of 2 cores busy");
+        // Memory: swap traffic of 4 MiB/s or more.
+        assert_eq!(run(0.5, true, 4 * 1024), (false, true));
+        assert_eq!(run(0.5, true, 3 * 1024), (false, false));
+    }
+
+    #[test]
+    fn the_processes_state_follows_the_jobs_well() {
+        use crate::jobs::{Findings, JobsView, ZombieParent};
+        let zombie = |tab| ZombieParent {
+            ppid: 9,
+            name: "server".into(),
+            count: 3,
+            per_min_deci: 0,
+            tab,
+        };
+        let mut s = Snapshot::default();
+        s.set_jobs(Some(Arc::new(JobsView::default())));
+        assert_eq!(s.resources[Processes.index()].state, None, "a calm machine");
+        let view = |tab| JobsView {
+            findings: Findings {
+                zombies: vec![zombie(tab)],
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        s.set_jobs(Some(Arc::new(view(Some(7)))));
+        assert_eq!(s.resources[Processes.index()].state, Some(State::Zombies));
+        // Another user's zombies are not this instance's to mark.
+        s.set_jobs(Some(Arc::new(view(None))));
+        assert_eq!(s.resources[Processes.index()].state, None);
+        assert!(State::Critical > State::Warn && State::Warn > State::Stuck);
+        assert!(State::Stuck > State::Zombies && State::Quiet > State::Waiting);
+        assert!(State::Waiting > State::Stopped);
+    }
+
+    /// With Wi-Fi and Ethernet both up, the link the network is measured
+    /// against holds while the mix holds: idle intervals, whichever link
+    /// their stray bytes cross, never swing the capacity between the links
+    /// (6.7 against 125 MB/s on the owner's Mac). Real traffic on the other
+    /// link moves it after [`LINK_LEAD_READINGS`] readings, and a link that
+    /// goes takes its pick with it at once.
+    #[test]
+    fn the_measured_link_holds_while_the_mix_holds() {
+        let link = |name: &str, kind, total: u64, rate_bps| LinkSample {
+            name: name.into(),
+            kind,
+            counts: true,
+            rx: total,
+            tx: 0,
+            rate_bps: Some(rate_bps),
+        };
+        let wifi = |total| link("en0", LinkKind::Wifi, total, 54_000_000);
+        let wired = |total| link("en7", LinkKind::Ethernet, total, 1_000_000_000);
+        let mut v = Vitals::new();
+        let mut read = |t: u64, links: Vec<LinkSample>| {
+            let mut s = at(t * 1000, 1000);
+            s.links = Some(links);
+            let snap = v.absorb(&s);
+            let l = snap.facts.link.expect("a counted link");
+            let cap = snap.resources[Network.index()].capacity;
+            (l.name, cap)
+        };
+        // Before any interval the faster link is measured.
+        let (mut w, mut e) = (1_000u64, 1_000u64);
+        assert_eq!(
+            read(0, vec![wifi(w), wired(e)]),
+            ("en7".into(), Some(125e6))
+        );
+        // Idle: a few hundred bytes cross one link or the other.
+        for t in 1..40 {
+            if t % 3 == 0 {
+                w += 300;
+            } else {
+                e += 200;
+            }
+            assert_eq!(
+                read(t, vec![wifi(w), wired(e)]).0,
+                "en7",
+                "idle reading {t}"
+            );
+        }
+        // Traffic on Wi-Fi: it takes over on its fifth reading in a row.
+        for t in 40..40 + u64::from(LINK_LEAD_READINGS) {
+            w += 2_000_000;
+            let want = if t + 1 < 40 + u64::from(LINK_LEAD_READINGS) {
+                "en7"
+            } else {
+                "en0"
+            };
+            assert_eq!(read(t, vec![wifi(w), wired(e)]).0, want, "busy reading {t}");
+        }
+        assert_eq!(
+            read(45, vec![wifi(w + 2_000_000), wired(e)]),
+            ("en0".into(), Some(6.75e6))
+        );
+        // A lead broken by one quiet reading starts over.
+        let mut t = 46;
+        for burst in [true, true, false, true, true, true, true] {
+            if burst {
+                e += 10_000_000;
+            }
+            assert_eq!(read(t, vec![wifi(w + 2_000_000), wired(e)]).0, "en0");
+            t += 1;
+        }
+        // The held link goes: the busiest left is measured at once.
+        assert_eq!(read(t, vec![wired(e + 10_000_000)]).0, "en7");
     }
 }

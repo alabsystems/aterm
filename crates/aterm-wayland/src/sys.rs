@@ -52,6 +52,8 @@ aterm_dl::table! {
     pub struct Client {
         display_connect = c"wl_display_connect":
             unsafe extern "C" fn(*const c_char) -> *mut WlDisplay;
+        display_connect_to_fd = c"wl_display_connect_to_fd":
+            unsafe extern "C" fn(c_int) -> *mut WlDisplay;
         display_disconnect = c"wl_display_disconnect": unsafe extern "C" fn(*mut WlDisplay);
         display_get_fd = c"wl_display_get_fd": unsafe extern "C" fn(*mut WlDisplay) -> c_int;
         display_get_error = c"wl_display_get_error": unsafe extern "C" fn(*mut WlDisplay) -> c_int;

@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Deterministic fault injection.
+//! Deterministic fault injection: a thread-local registry of armed fault points, so tests can
+//! force rare error branches and assert the path fails closed without panicking.
 //!
-//! A thread-local registry of armed fault points, so tests can force rare
-//! error branches (a failed allocation, an I/O error) and assert the path fails
-//! closed without panicking or corrupting state.
+//! Without `cfg(test)` or the `fault-injection` feature, [`triggered`] is an inlined `false`
+//! and `arm`/`disarm` do not exist.
 //!
 //! Production builds pay nothing: [`triggered`] is an `#[inline]` `const
 //! false`. The registry and `arm`/`disarm` exist only in a test or debug build,

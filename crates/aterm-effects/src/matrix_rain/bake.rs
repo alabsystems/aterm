@@ -211,19 +211,26 @@ impl RainBaker {
             let (a, b) = (y * MASTER_H, (y + 1) * MASTER_H);
             let (my0, my1) = (a / ch, (b - 1) / ch);
             let my_end = my1.min(MASTER_H - 1);
-            for (i, slot) in src[my0..=my_end].iter_mut().enumerate() {
-                let my = my0 + i;
-                let wy = (b.min((my + 1) * ch) - a.max(my * ch)) as u32;
-                *slot = (wy, rom.row(tile, my));
+            let mut src_len = 0;
+            for my in my0..=my_end {
+                let row = rom.row(tile, my);
+                if row != 0 {
+                    let wy = (b.min((my + 1) * ch) - a.max(my * ch)) as u32;
+                    src[src_len] = (wy, row);
+                    src_len += 1;
+                }
             }
-            let src_row = &src[my0..=my_end];
+            let src_row = &src[..src_len];
+            let row_base = (oy + y) * atlas_w + ox;
             for x in 0..cw {
-                let seg = &self.col_seg[self.col_off[x] as usize..self.col_off[x + 1] as usize];
                 let mut num: u32 = 0;
-                for &(wy, row) in src_row {
-                    for &(mx, wx) in seg {
-                        if (row >> mx) & 1 == 1 {
-                            num += wx * wy;
+                if !src_row.is_empty() {
+                    let seg = &self.col_seg[self.col_off[x] as usize..self.col_off[x + 1] as usize];
+                    for &(wy, row) in src_row {
+                        for &(mx, wx) in seg {
+                            if (row >> mx) & 1 == 1 {
+                                num += wx * wy;
+                            }
                         }
                     }
                 }
@@ -231,11 +238,8 @@ impl RainBaker {
                 // MASTER_W*MASTER_H = DEN at full coverage, so the rounded
                 // alpha is at most 255 without a clamp.
                 let alpha = ((num * 255 + DEN / 2) / DEN) as u8;
-                let idx = ((oy + y) * atlas_w + ox + x) * 4;
-                self.rgba[idx] = 255;
-                self.rgba[idx + 1] = 255;
-                self.rgba[idx + 2] = 255;
-                self.rgba[idx + 3] = alpha;
+                let idx = (row_base + x) * 4;
+                self.rgba[idx..idx + 4].copy_from_slice(&[255, 255, 255, alpha]);
             }
         }
     }

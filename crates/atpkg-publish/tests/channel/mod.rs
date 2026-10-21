@@ -1,12 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Work package 2's tests: the index plan and its compare-and-swap, the mirror, the
-//! `rustc` group's preflight and re-checks, the seed pin, the release host adapter, and
-//! the producer→client proof.
+//! The channel's tests: the index plan and its compare-and-swap, the mirror, the `rustc`
+//! group's preflight and re-checks, the candidate gate, the seed pin, the release host
+//! adapter, the signer's identity, and the producer→client proof.
 //!
-//! Every host is a [`FakeHost`] (or a wrapper adding one failure mode), every key is
-//! minted in-process by the shipping signer, and every "verified" is the client's chain.
+//! Every host is a [`FakeHost`] (or a wrapper adding one failure mode), every key is minted
+//! in-process by the shipping signer, and every "verified" is the client's chain.
 
 mod conformance_index_publish;
 mod gh;

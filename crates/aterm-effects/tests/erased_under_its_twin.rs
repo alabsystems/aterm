@@ -1,47 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A line erased under its twin is not a move, even when its keys echo
-//! together.
+//! A line erased under its twin is not a move, even when its keys echo together.
 //!
-//! The follow pass (`rk::witness::Witness::follow_runs`) carries a band onto the
-//! row its text moved to on the glyphs that arrived there. A glyph that stood at
-//! that offset beside the record while the record's own glyph stood is a twin
-//! (`Seen::twin`): neutral, neither found nor a hole. A line killed under an
-//! identical line (`$ cd ..` typed under `$ cd ..`, then Ctrl-U) has only twins
-//! at that offset, so nothing may follow onto the line above (a previous
-//! command, fzf's best match, vim's duplicate line).
+//! The follow pass (`rainbow_kitty::witness::Witness::follow_runs`) carries a band onto the row
+//! its text moved to on the glyphs that arrived there. A glyph that stood at that offset beside
+//! the record while the record's own glyph stood is a twin (`Seen::twin`): neutral, neither found
+//! nor a hole. A line killed under an identical line (`$ cd ..` under `$ cd ..`, then Ctrl-U) has
+//! only twins there, so nothing may follow onto the line above. A twin is learned two ways, both
+//! pinned here:
 //!
-//! A twin is learned two ways, both pinned here:
+//! * at arming: a copy beside a record on its arming frame is a twin at once (`Seen::observe`
+//!   with `at_arm`). The line has no band yet to name its neighbour rows on that frame, so the
+//!   host names a waiting key's row and its `±1` (`Engine::ribbon_rows_for`) in their own slots
+//!   (`CURSOR_WITNESS_ROWS`). This covers an erase within `TWIN_MIN` of the last echo (a fast
+//!   final bigram, a paste, a whole command in one frame);
+//! * by time: a copy seen beside the standing record on every sampled frame for `TWIN_MIN`
+//!   (40 ms) is a twin (`Seen::pending`).
 //!
-//! * **At arming**: a copy beside a record on the frame it is armed was there
-//!   first and is a twin at once (`Seen::observe` with `at_arm`). The neighbour
-//!   rows must be sampled on the arming frame, before the line has a band to
-//!   name them, so the host names a waiting key's row and the rows above and
-//!   below (`rk::Engine::ribbon_rows_for`), in their own slots after the bands'
-//!   (`CURSOR_WITNESS_ROWS`).
-//! * **By time**: a copy seen beside the standing record on every sampled frame
-//!   for `TWIN_MIN` (40 ms) is a twin (`Seen::pending`).
+//! What the witness never saw is no evidence either way. Laws run at the host seam
+//! (`trail_host::Core`, the frame hold), read as `(followed, frames the twin row was lit)` against
+//! `(0, 0)`; `tests/copies_are_not_moves.rs` sweeps these shapes over timing and host.
 //!
-//! What the witness never saw is no evidence either way. The time rule covers a
-//! line typed at human pace and erased later; the arm-time twin covers an erase
-//! within `TWIN_MIN` of the last keys' echo (a fast final bigram then Ctrl-U, a
-//! paste then Ctrl-U, a whole command echoed in one frame).
-//!
-//! Every law runs at the host seam (`trail_host::Core`, the frame hold): a real
-//! `aterm_core::terminal::Terminal` driven byte for byte, rows sampled as
-//! `app_render.rs`'s frame hold does (the caret row's probe, then every row
-//! `CursorGlow::ribbon_rows` names, after the batch), ticked through
-//! `CursorGlow::tick`. The reading is `(followed, frames the twin row was lit
-//! over the next ~1.4 s)` against `(0, 0)`. `tests/copies_are_not_moves.rs`
-//! sweeps these shapes over keys per frame, echo lag, erase key and the
-//! composed host.
-//!
-//! The limit: a line identical to the one above (or one column off, `step 2:`
-//! under `step 1:`) that genuinely moves up onto it is glyph for glyph the same
-//! as one erased under an identical line, so it melts instead of following
-//! (`tests/composer_multiline_wrap.rs`'s
-//! `the_limit_a_line_identical_to_the_one_above_it_or_one_column_off_melts_instead_of_following`).
+//! The limit: a line identical to the one above (or one column off) that genuinely moves up onto
+//! it melts instead of following (`tests/composer_multiline_wrap.rs`).
 
 use crate::trail_host::{Core, LOCK_A, Theme};
 use aterm_effects::cursor_glow::InsertWidth;
@@ -51,8 +33,7 @@ use std::time::Duration;
 const ROWS: usize = 24;
 const COLS: usize = 80;
 
-/// The host: `trail_host`'s frame-hold seam on a 24×80 grid of 8×16
-/// cells, and this file's input gestures.
+/// `trail_host`'s frame-hold seam on a 24×80 grid of 8×16 cells.
 struct Host {
     c: Core,
 }
@@ -144,8 +125,8 @@ impl Host {
         self.frame();
     }
 
-    /// The frames, over the next ~1.4 s (90 idle frames — longer than the
-    /// 1.3 s a false follow kept the row lit), on which `row` is lit.
+    /// The frames over the next ~1.4 s (90 idle frames, longer than a false follow keeps a row
+    /// lit) on which `row` is lit.
     fn lit_frames(&mut self, row: u16) -> usize {
         let mut n = 0;
         for _ in 0..90 {
@@ -155,8 +136,7 @@ impl Host {
         n
     }
 
-    /// The verdict every law below states: nothing followed, and `row` —
-    /// the twin line no key wrote — never lit.
+    /// The verdict every law states: nothing followed, and `row` (the twin no key wrote) never lit.
     fn assert_never_followed_onto(&mut self, row: u16, what: &str) {
         let followed = self.followed();
         let cells = self.cells(row);
@@ -233,9 +213,8 @@ fn a_ctrl_u_right_after_the_last_echo_under_its_twin_follows_nothing() {
     }
 }
 
-/// The remote shell: keys 90 ms apart, but the first echo is late (an SSH round
-/// trip) and arrives with the second on one frame; then one echo per frame. The
-/// network, not the hand, put two records on one frame.
+/// A remote shell: the first echo is late (an SSH round trip) and lands with the second on one
+/// frame, so the network, not the hand, put two records on one frame.
 #[test]
 fn a_redraw_erasing_a_line_typed_under_its_twin_over_a_slow_link_follows_nothing() {
     let mut h = under_git_status();
@@ -263,11 +242,9 @@ fn a_redraw_erasing_a_line_typed_under_its_twin_over_a_slow_link_follows_nothing
     h.assert_never_followed_onto(4, "a late first echo");
 }
 
-/// fzf clearing the query under its best match (default layout,
-/// `--info=hidden`): `src/lib.rs` stands directly above the prompt, pointer at
-/// column 0, item at column 2 (the query's columns). `src/li` is typed (`sr` in
-/// one render), fzf redraws the same item each key, then Ctrl-U resets the
-/// query row to `> `. The list row never lights.
+/// fzf (default layout, `--info=hidden`) with `src/lib.rs` directly above the prompt at the
+/// query's columns: `src/li` typed (`sr` in one render), the item redrawn each key, then Ctrl-U.
+/// The list row never lights.
 #[test]
 fn an_fzf_query_cleared_under_its_best_match_follows_nothing() {
     let mut h = Host::at_row(21);
@@ -294,10 +271,8 @@ fn an_fzf_query_cleared_under_its_best_match_follows_nothing() {
     h.assert_never_followed_onto(20, "fzf's Ctrl-U");
 }
 
-/// vim: a line typed under its duplicate, then undone. Row 2 holds
-/// `    let total = 0;`; `o` opens a line below (`IL`, autoindent writes four
-/// blanks) and the same statement is typed on row 3 (`le` in one frame); Esc `u`
-/// deletes the line (`DL`) and the caret goes back up. Row 2 never changed.
+/// vim: `o` opens a line under `    let total = 0;` (`IL`, autoindent), the same statement is typed
+/// (`le` in one frame), then Esc `u` deletes it (`DL`). Row 2 never changed.
 #[test]
 fn a_vim_line_typed_under_its_duplicate_then_undone_follows_nothing() {
     let mut h = Host::at_row(3);
@@ -318,9 +293,8 @@ fn a_vim_line_typed_under_its_duplicate_then_undone_follows_nothing() {
     h.assert_never_followed_onto(2, "vim's undo");
 }
 
-/// Four short bands typed a moment ago on rows 1, 4, 7 and 10: with each one's
-/// row and both landing rows they want twelve witness samples, filling the
-/// bands' `WITNESS_ROWS` budget.
+/// Four short bands on rows 1, 4, 7 and 10: with each one's row and both landing rows they fill
+/// the bands' `WITNESS_ROWS` budget.
 fn four_older_bands() -> Host {
     let mut h = Host::at_row(0);
     for row in [1u16, 4, 7, 10] {
@@ -336,12 +310,9 @@ fn four_older_bands() -> Host {
     h
 }
 
-/// A full row budget, and the erase under the twin still follows nothing: four
-/// older bands fill the budget when a line is started under `$ git status`
-/// (first two keys in one frame, erased 64 ms after the last), and `cd ..` is
-/// echoed in one frame under `$ cd ..` and erased 16 ms later. The arming rows'
-/// own slots (`rk::Engine::ribbon_rows_for`) keep row 14's copy seen on every
-/// arming frame.
+/// With four older bands filling the budget, a line erased under `$ git status` and `cd ..`
+/// echoed in one frame under `$ cd ..` still follow nothing: the arming rows' own slots
+/// (`Engine::ribbon_rows_for`) see row 14's copy on every arming frame.
 #[test]
 fn a_full_row_budget_still_arms_a_line_s_first_keys_on_what_stood_above_them() {
     let mut h = four_older_bands();
@@ -363,11 +334,9 @@ fn a_full_row_budget_still_arms_a_line_s_first_keys_on_what_stood_above_them() {
     h.assert_never_followed_onto(14, "a full row budget, `cd ..` in one frame");
 }
 
-/// A full row budget, and a line moved two rows still carries its band: `hi` on
-/// row 15 with four older bands, then a program erases row 15 and redraws `hi`
-/// on row 17 with the caret. Row 17 is the caret's, always read, and nothing
-/// seen says `hi` stood there before: an unseen row is no evidence against a
-/// move.
+/// With the budget full, a line moved two rows still carries its band: `hi` erased on row 15 and
+/// redrawn on row 17 with the caret. The caret's row is always read, and an unseen row is no
+/// evidence against a move.
 #[test]
 fn a_full_row_budget_still_lets_a_line_moved_two_rows_down_carry_its_band() {
     let mut h = four_older_bands();

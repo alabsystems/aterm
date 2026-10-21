@@ -3,41 +3,28 @@
 
 //! The TOML 1.0.0 parser.
 //!
-//! One parser serves both halves of the crate: it builds the formatting-
-//! preserving document, and [`crate::de`] deserializes out of that same tree.
-//! There is no second, faster, lossy parser: two parsers would give two
-//! answers to "is this file valid".
+//! One parser builds the formatting-preserving document, and [`crate::de`]
+//! deserializes out of that same tree, so there is one answer to "is this file
+//! valid".
 //!
-//! # What this rejects, and why that matters
-//!
-//! A config parser that silently accepts a duplicate key is a security bug: the
-//! file the operator reads and the file the program obeys stop being the same
-//! document, and which of the two wins is an implementation detail. So every
-//! redefinition rule in the spec is enforced here —
+//! A silently accepted duplicate key makes the file an operator reads and the
+//! file the program obeys different documents, so every redefinition rule in the
+//! spec is an error:
 //!
 //! * a key defined twice in one table;
 //! * a `[header]` for a table that already exists explicitly;
 //! * a `[header]` naming a table a dotted key already defined (`a.b = 1` then
-//!   `[a.b]`) — though a header may still add a SUB-table beneath one
-//!   (`[a.b.c]`), which is what the spec's own worked example does;
+//!   `[a.b]`), though a header may add a sub-table beneath one (`[a.b.c]`), as
+//!   the spec's own example does;
 //! * a `[header]` reaching through an inline table, which is closed outright;
 //! * `[a]` and `[[a]]` naming the same thing;
 //! * a `[header]` shadowing a plain value.
 //!
-//! # Depth
-//!
-//! Inline tables and arrays nest, and nesting is parsed by recursion, so a
-//! hostile `[[[[[…` would otherwise be a stack overflow — an abort, not an
-//! error. [`ParseLimits::max_depth`] bounds it; `tests/depth.rs` drives a
-//! generated 10,000-deep document at it.
-//!
-//! The bound is on the depth of the TREE, and every construct that deepens it
-//! spends from the one budget: header segments, dotted-key segments, arrays
-//! and inline tables alike. `Drop`, the encoder and the deserializer all walk
-//! that tree recursively, whichever construct built it. Budgeting the
-//! constructs separately let a 17 KB document of dotted keys inside nested
-//! inline tables — each within the limit on its own — build a tree 8,256
-//! tables deep, and `from_str` overflowed the stack on it.
+//! [`ParseLimits::max_depth`] bounds the depth of the tree, so hostile input is
+//! an error, not a stack overflow. Every construct that deepens the tree spends
+//! from the one budget (header segments, dotted-key segments, arrays, inline
+//! tables), because `Drop`, the encoder and the deserializer all walk it
+//! recursively whichever construct built it.
 
 use core::ops::Range;
 
@@ -53,8 +40,7 @@ pub(crate) struct ParseLimits {
     /// Maximum depth of the tree below the root: every table, array and
     /// inline table between the document root and a value counts, however it
     /// was spelled (a header segment, a dotted-key segment, a `[` or a `{`).
-    /// 128 is aterm's own bound, the same as aterm-json's `RECURSION_LIMIT`
-    /// and `serde_json`'s; the retired `toml_edit` refused at 80.
+    /// 128, the same as aterm-json's `RECURSION_LIMIT`.
     pub(crate) max_depth: usize,
 }
 
@@ -80,7 +66,7 @@ struct Parser<'a> {
     /// Monotonic counter over authored headers; a table's copy of it is what
     /// makes `[a.b]` written before `[a]` print back in that order.
     position: usize,
-    /// Monotonic counter over authored key-value LINES, stamped on each leaf
+    /// Monotonic counter over authored key-value lines, stamped on each leaf
     /// key so flattening a dotted tree can restore the written order.
     key_order: usize,
 }
@@ -97,13 +83,9 @@ pub(crate) fn parse_document(src: &str, limits: ParseLimits) -> Result<DocumentM
     p.document()
 }
 
-/// Parse a STANDALONE value (`Value::from_str`).
-///
-/// Strict, and deliberately so. MEASURED against `toml_edit`
-/// 0.22.27 refuses ` 1 `, `1\n`, `# c\n1` and `1 # c` — a value is the WHOLE
-/// input or the input is not a value. Trivia around a value belongs to the line
-/// that carries it, and a parser that accepted `1 ` but not ` 1` would be a
-/// worse contract than either. `tests/edit.rs` pins the agreement.
+/// Parse a standalone value (`Value::from_str`). The value must be the whole
+/// input: surrounding whitespace and comments belong to a line, so ` 1 `, `1\n`
+/// and `1 # c` are refused (`tests/edit.rs` pins it).
 pub(crate) fn parse_value(src: &str) -> Result<Value> {
     let mut p = Parser {
         src,
@@ -124,7 +106,7 @@ pub(crate) fn parse_value(src: &str) -> Result<Value> {
     Ok(value)
 }
 
-/// Parse a dotted key EXPRESSION on its own (`Key::parse`).
+/// Parse a dotted key expression on its own (`Key::parse`).
 pub(crate) fn parse_key_path(repr: &str) -> Result<Vec<Key>> {
     let mut p = Parser {
         src: repr,
@@ -163,14 +145,8 @@ impl<'a> Parser<'a> {
         Err(Error::at(self.src, span, message))
     }
 
-    /// A one-CHARACTER span at the current position.
-    ///
-    /// Character, not byte: `self.pos + 1` lands inside a multi-byte character
-    /// whenever the offending byte is the lead of one, and a span that splits a
-    /// character cannot be sliced out of the source to render it. That is a
-    /// panic in the diagnostic printer, reached only by the input that was
-    /// already malformed — found by `tests/fuzz.rs`, which mutates real
-    /// documents a byte at a time.
+    /// A one-character span at the current position. Not `pos + 1`: that can
+    /// split a multi-byte character, and the diagnostic printer panics slicing it.
     fn here<T>(&self, message: impl Into<String>) -> Result<T> {
         self.err(self.pos..self.next_boundary(self.pos), message)
     }
@@ -184,13 +160,9 @@ impl<'a> Parser<'a> {
         end.max(at)
     }
 
-    /// Refuse a tree deeper than the limit.
-    ///
-    /// The bound is not only about parse recursion. A 10,000-segment dotted key
-    /// parses in a loop, but the TREE it builds is 10,000 tables deep, and
-    /// dropping it, printing it, or deserializing it each walk that depth
-    /// recursively — so an unbounded key path is a stack overflow with extra
-    /// steps.
+    /// Refuse a tree deeper than the limit. The bound is on the tree, not the
+    /// recursion: a long dotted key parses in a loop, but dropping, printing and
+    /// deserializing what it builds all recurse.
     fn check_depth(&self, depth: usize, at: usize) -> Result<()> {
         if depth > self.limits.max_depth {
             return self.err(
@@ -218,14 +190,9 @@ impl<'a> Parser<'a> {
             if c == b'\n' || c == b'\r' {
                 break;
             }
-            // TOML 1.0 `non-eol`: tab, %x20-7E, and non-ASCII. Every other
-            // control byte is rejected rather than smuggled through a comment.
-            //
-            // 0x7E, not the 0x7F the published ABNF prints: that upper bound is
-            // a known erratum, and the canonical suite lists
-            // `invalid/control/comment-del.toml` as INVALID. Both retired
-            // crates reject DEL here, so following the literal text would be
-            // the one place this parser failed OPEN.
+            // TOML 1.0 `non-eol`: tab, %x20-7E, and non-ASCII. 0x7E, not the 0x7F the
+            // ABNF prints: that is a known erratum, and the canonical suite lists
+            // `invalid/control/comment-del.toml` as invalid.
             if c == b'\t' || (0x20..=0x7e).contains(&c) || c >= 0x80 {
                 self.pos += 1;
             } else {
@@ -271,10 +238,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Everything from the end of a value or header to the start of the next
-    /// line: whitespace, an optional comment, and the terminator itself.
-    ///
-    /// The terminator is INCLUDED — see the module docs on why the newline
-    /// belongs to the suffix.
+    /// line: whitespace, an optional comment, and the terminator itself, which
+    /// belongs to the suffix (see the `edit` module docs).
     fn eat_line_end(&mut self) -> Result<()> {
         self.eat_ws();
         if self.peek() == Some(b'#') {
@@ -293,20 +258,13 @@ impl<'a> Parser<'a> {
 
     fn document(&mut self) -> Result<DocumentMut> {
         let mut doc = DocumentMut::new();
-        // The open table, as the POSITION of each header segment in its
-        // parent — see `current_table` for why not the names.
+        // The open table, as the position of each header segment in its
+        // parent (see `current_table` for why not the names).
         let mut path: Vec<usize> = Vec::new();
-        // A leading UTF-8 BOM is not a key. `toml_edit` strips it outright
-        // (`src/parser/document.rs`, `opt(b"\xEF\xBB\xBF")`), and PowerShell 5's
-        // `Out-File`/`Set-Content` write one by default — a user who saves
-        // `aterm.toml` from a Windows editor must not get a config that fails
-        // to load, with a diagnostic pointing at an invisible byte. We step OVER
-        // it and the DOCUMENT keeps it (`DocumentMut::bom`), printed first, so
-        // the file still round-trips byte for byte, which is strictly better
-        // than the oracle, which drops the mark. Filed in the first entry's
-        // prefix, it moved with that text: removing the entry handed it to
-        // whatever printed next, and a key added in front of that left it
-        // mid-file, unparseable.
+        // A leading UTF-8 BOM is not a key; Windows tools (PowerShell 5's `Out-File`)
+        // write one by default. Step over it and record it on the document
+        // (`DocumentMut::bom`), printed first, so the file round-trips. Kept off the first
+        // entry's prefix so removing or inserting entries cannot strand it mid-file.
         if self.src.starts_with('\u{feff}') {
             self.pos = 3;
             doc.bom = true;
@@ -407,8 +365,7 @@ impl<'a> Parser<'a> {
         header_repr: RawString,
         span: Range<usize>,
     ) -> Result<Vec<usize>> {
-        // Consumed by whichever branch reaches the LAST segment; the walk over
-        // the earlier segments must not move them out of scope.
+        // Consumed by whichever branch reaches the last segment.
         let mut decor = Some(decor);
         let mut header_repr = Some(header_repr);
         let mut span = Some(span);
@@ -431,17 +388,10 @@ impl<'a> Parser<'a> {
                     .get_at_mut(position)
                     .expect("a position the map just returned");
                 node = match existing {
-                    // `closed` is NOT consulted here, on purpose. The spec
-                    // closes a dotted-created table to REDEFINITION, not to
-                    // sub-table creation: its own worked example annotates
-                    // `[fruit.apple.texture]` with "you can add sub-tables"
-                    // after `apple.color = "red"`. Refusing the walk rejected
-                    // that example verbatim, along with `a.b = 1` + `[a.c]` and
-                    // six further shapes both retired crates accept. The
-                    // genuinely invalid case — a header landing ON the dotted
-                    // table — is caught by the last-segment arm below, where
-                    // `t.implicit && !t.closed` fails and falls through to
-                    // "`{name}` is defined twice".
+                    // `closed` is not consulted: the spec closes a dotted-created table to
+                    // redefinition, not to sub-tables (its example adds
+                    // `[fruit.apple.texture]` after `apple.color = "red"`). A header landing
+                    // on the dotted table itself fails in the last-segment arm below.
                     Item::Table(t) => t,
                     Item::ArrayOfTables(a) => a
                         .values
@@ -526,9 +476,7 @@ impl<'a> Parser<'a> {
     fn keyval(&mut self, doc: &mut DocumentMut, path: &[usize], trivia_start: usize) -> Result<()> {
         let key_start = self.pos;
         let segs = self.key_path()?;
-        // The tree the header path and this dotted key build together is as
-        // deep as their lengths add up to, and dropping it, encoding it, and
-        // deserializing it all recurse — so the bound has to cover the sum.
+        // The header path and the dotted key deepen the same tree (see the module docs).
         self.check_depth(path.len() + segs.len(), key_start)?;
         if self.peek() != Some(b'=') {
             return self.here("expected `=` after a key");
@@ -673,9 +621,8 @@ impl<'a> Parser<'a> {
         match self.peek() {
             None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}' | b'#') => Ok(()),
             Some(_) => {
-                // The whole offending CHARACTER: `self.pos + 1` splits a
-                // multi-byte one, and `Error::span()` is public API that a
-                // caller may slice the source with. Same reasoning as `here()`.
+                // The whole offending character: callers slice the source with the
+                // public `Error::span()` (see `here()`).
                 let end = self.next_boundary(self.pos);
                 self.err(start..end, "unexpected characters after a value")
             }
@@ -686,10 +633,9 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         if let Some((dt, used)) = parse_datetime(&self.b[self.pos..]) {
             self.pos += used;
-            // A date-time is the only value whose token may contain a space, so
-            // this is also the only place the terminator check can be fooled by
-            // a trailing `1979-05-27 ` — `parse_datetime` only consumes the
-            // space when a time really follows.
+            // A date-time is the only token that may contain a space, so a trailing
+            // `1979-05-27 ` must not fool the terminator check: `parse_datetime`
+            // consumes the space only when a time follows.
             if self.end_of_scalar(start).is_ok() {
                 let raw = self.src[start..self.pos].to_owned();
                 return Ok(Value::Datetime(parsed(dt, &raw, start..self.pos)));
@@ -730,13 +676,9 @@ impl<'a> Parser<'a> {
                 return Ok(array);
             }
             if self.eof() {
-                // AT the end of input, not from `[` to it. MEASURED against the
-                // oracle, which reports an EMPTY span at EOF for every
-                // unterminated array (`x = [1, 2\n` -> 10..10, `x = [ ` ->
-                // 6..6). The difference is load-bearing downstream: the config
-                // editor's `parser_diagnostic_range` turns an empty end-of-input
-                // span into a caret on the last AUTHORED byte, and a span that
-                // covers the whole array instead underlines the opening bracket.
+                // An empty span at end of input, not `[`..EOF: the config editor's
+                // `parser_diagnostic_range` turns that into a caret on the last authored
+                // byte, where a whole-array span would underline the opening bracket.
                 return self.err(self.b.len()..self.b.len(), "unterminated array");
             }
             let prefix = self.src[trivia_start..self.pos].to_owned();
@@ -933,12 +875,8 @@ impl<'a> Parser<'a> {
                 b'\\' if quote == b'"' => self.escape(&mut out, true)?,
                 b'\r' => {
                     if self.at(1) == Some(b'\n') {
-                        // Normalized to a bare `\n`, matching both retired
-                        // crates (`toml_edit` `src/parser/strings.rs`,
-                        // `t.replace("\r\n", "\n")`). A config authored on
-                        // Windows must not yield string VALUES with embedded
-                        // carriage returns. The raw repr is stored separately,
-                        // so byte-identical round-tripping is unaffected.
+                        // Normalized to `\n` so a Windows-authored config has no
+                        // carriage returns in its values; the raw repr keeps the bytes.
                         out.push('\n');
                         self.pos += 2;
                     } else {
@@ -1013,10 +951,8 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => {
-                // The offending CHARACTER, not the offending byte. `c` may be
-                // the lead of a multi-byte one, in which case `start..self.pos`
-                // splits it and `char::from(c)` reports `\é` as `` `\Ã` ``.
-                // `start + 1` is always a boundary — a backslash is ASCII.
+                // The offending character, not byte: `c` may lead a multi-byte one.
+                // `start + 1` is a boundary because a backslash is ASCII.
                 let ch = self.src[start + 1..]
                     .chars()
                     .next()
@@ -1034,13 +970,10 @@ impl<'a> Parser<'a> {
         if self.pos + digits > self.b.len() {
             return self.err(start..self.b.len(), "truncated unicode escape");
         }
-        // Validate the digit window as BYTES: `self.pos + digits` can land
-        // inside a multi-byte character (`x = "\uab€"`), so slicing `self.src`
-        // first would panic. Once all `digits` bytes are ASCII the offset is a
-        // char boundary, which also makes the two spans below safe.
-        //
-        // `is_ascii_hexdigit`, not `from_str_radix` alone: that accepts a
-        // leading `+`, and TOML 1.0's `4HEXDIG` rejects `"\u+041"`.
+        // Check the window as bytes: `self.pos + digits` can land inside a multi-byte
+        // character (`x = "\uab€"`), so slicing `self.src` first would panic. Once all
+        // `digits` bytes are ASCII the offset is a char boundary. `is_ascii_hexdigit`
+        // because `from_str_radix` accepts a leading `+`, which `4HEXDIG` rejects.
         let window = &self.b[self.pos..self.pos + digits];
         if !window.iter().all(u8::is_ascii_hexdigit) {
             return self.err(
@@ -1125,9 +1058,8 @@ fn parse_number(raw: &str) -> Option<Number> {
         if digits.len() > 1 && digits.starts_with('0') {
             return None;
         }
-        // Parsed WITH the sign attached, not negated afterwards: `i64::MIN` has
-        // no positive counterpart, so `-9223372036854775808` would otherwise
-        // overflow on the way in and be refused as invalid TOML.
+        // Parsed with the sign attached: `i64::MIN` has no positive counterpart, so
+        // negating afterwards would refuse `-9223372036854775808`.
         let signed = if sign < 0 {
             format!("-{digits}")
         } else {
@@ -1138,9 +1070,8 @@ fn parse_number(raw: &str) -> Option<Number> {
 
     let normalized = validate_float(rest)?;
     let value = normalized.parse::<f64>().ok()?;
-    // `1e400` parses to infinity rather than failing, and TOML has a separate,
-    // explicit spelling for infinity — so a finite literal that overflows is a
-    // malformed float, not a very large one.
+    // `1e400` parses to infinity, but TOML spells infinity `inf`, so a finite
+    // literal that overflows is malformed.
     if value.is_infinite() {
         return None;
     }
@@ -1225,12 +1156,9 @@ fn validate_float(text: &str) -> Option<String> {
 /// Resolve the table a key-value line belongs to, following the header path
 /// built by [`Parser::open_table`].
 ///
-/// The path is POSITIONS, not names, and that is a complexity bound, not a
-/// micro-optimisation: this runs once per key-value line, and looking each
-/// segment up by name hashes the header's whole text every time (10^11
-/// byte-steps for a 1 MB `[header]` over 100,000 lines). By position it is one
-/// step per segment, and the parse stays linear in its input. Positions are stable here
-/// because the parser only ever appends.
+/// The path holds positions, not names: this runs once per key-value line, and a name lookup
+/// hashes the header's whole text each time (quadratic for a 1 MB header over 100,000 lines).
+/// Positions are stable because the parser only appends.
 fn current_table<'t>(root: &'t mut Item, path: &[usize]) -> &'t mut Table {
     let mut node = root
         .as_table_mut()

@@ -1,44 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE KITTY-COMMAND VOCABULARY ("tricks"): the words a person TYPES at the
-//! terminal to the cursor pet — `sit`, `nap`, `kitty jump`, `good kitty` —
-//! compiled from `data/tricks.toml` into one folded-key table.
+//! The kitty-command vocabulary ("tricks"): the words a person types to the cursor pet (`sit`,
+//! `nap`, `kitty jump`, `good kitty`), compiled from `data/tricks.toml` into one folded-key table.
 //!
-//! # Why a separate table and not a [`Class`](crate::Class)
-//!
-//! The sparkle lexicon is the SCREEN scanner's vocabulary: every surface in
-//! it is matched against every row of program output, becomes an occurrence,
-//! and costs per-frame work. Pet commands are ordinary English verbs (`sit`,
-//! `play`, `roll`) that fill every build log and README; as a `Class` they
-//! would light up the whole screen. So they live here, in a table the screen
-//! scanner never sees, and the only caller is the typed-line listener, which
-//! asks about ONE token at a word boundary the person just typed.
-//!
-//! # What the table answers
+//! It is not a [`Class`](crate::Class): the screen scanner matches every sparkle surface against
+//! every row of output, and pet commands are ordinary verbs (`sit`, `play`, `roll`) that fill
+//! build logs. The only caller is the typed-line listener, asking about one token at a word
+//! boundary.
 //!
 //! [`TrickLexicon::classify`] maps one isolated token to a [`TrickRole`]:
 //!
-//! * a **trick** word — `plain` (`needs_vocative = false`: it may fire on its
-//!   own, on a line that holds nothing but pet vocabulary) or an **address**
-//!   word (`needs_vocative = true`: it fires only when the line also names
-//!   the pet, because the bare word opens too many ordinary lines — `sleep 5`,
-//!   `roll back the commit`, `good catch`);
-//! * a **vocative** — a name for the pet (`kitty`, `cat`, `pup`, `boy`);
-//! * a **filler** — a word that may sit in a pet-directed line without
-//!   breaking it (`please`, `now`, `who's a`).
+//! * a **trick** word: plain (`needs_vocative = false`: may fire on a line of nothing but pet
+//!   vocabulary) or address (`needs_vocative = true`: fires only when the line also names the
+//!   pet, because the bare word opens too many ordinary lines: `sleep 5`, `good catch`);
+//! * a **vocative**: a name for the pet (`kitty`, `cat`, `pup`, `boy`);
+//! * a **filler**: a word that keeps a pet-directed line pure (`please`, `now`, `who's a`).
 //!
-//! WHAT IT DOES NOT ANSWER, on purpose: whether the token sat in a code
-//! context, whether the line was pure, whether the key was typed or pasted.
-//! That is the listener's policy; this module is vocabulary and nothing else.
-//! It is whole-token by construction — `site`, `sitting` and `sleepy` are
-//! different keys from `sit` and `sleep` and are simply absent.
+//! Code context, line purity and typed-versus-pasted are the listener's policy, not this table's.
+//! Matching is whole-token: `site` and `sleepy` are simply absent keys.
 //!
-//! # Load laws (each one recorded on [`TrickLexicon::conflicts`], never silent)
+//! # Load laws
 //!
-//! * A surface is ONE token: letters / digits / `_` with `'` `’` `-` as
-//!   interior joiners (the scanner's own token law). Anything else can never
-//!   be typed as one word and is skipped.
+//! Every skipped row or surface is reported on [`TrickLexicon::conflicts`].
+//!
+//! * A surface is one token: letters, digits and `_`, with `'` `’` `-` as interior joiners (the
+//!   scanner's token law). Anything else is skipped.
 //! * An unknown trick `id` skips its row.
 //! * A surface claimed twice with DIFFERENT roles keeps the first claimant
 //!   (file order, English first). The SAME role claimed again is not a
@@ -72,9 +59,8 @@
 //! * a command word that, glued to the name, spells another word: `喂猫咪` is
 //!   feed the kitty, Thai `แมวมอง` a talent scout.
 //!
-//! Nothing on this module's compile path touches the sparkle lexicon's cached
-//! accessor; the cross-table collision laws are test-side
-//! (`tests/tricks.rs`), where both tables are built independently.
+//! The compile path never touches the sparkle lexicon; the cross-table collision laws are
+//! test-side (`tests/tricks.rs`), where both tables are built independently.
 
 use crate::{DebugText, Langs, LexError, fold, is_matchable_token, is_no_space_surface};
 use aterm_hash::FxHashMap;
@@ -82,11 +68,9 @@ use std::sync::OnceLock;
 
 const BUILTIN_TRICKS: &str = include_str!("../data/tricks.toml");
 
-/// One thing the cursor pet can be told to do. The variant order is the
-/// listing order ([`Trick::ALL`]) and the `data/tricks.toml` row order.
-///
-/// Every consumer matches this EXHAUSTIVELY (no wildcard arm): an eighteenth
-/// trick must break the build at each place that has to learn it.
+/// One thing the cursor pet can be told to do, in listing order ([`Trick::ALL`]) and
+/// `data/tricks.toml` row order. Consumers match it exhaustively (no wildcard arm), so a new trick
+/// breaks the build wherever it must be learned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Trick {
     /// Sit up and pay attention.
@@ -172,10 +156,8 @@ impl Trick {
         }
     }
 
-    /// The inverse of [`code`](Self::code). It walks [`ALL`](Self::ALL)
-    /// instead of restating the seventeen strings, so `code` stays the ONE
-    /// spelling table and the two can never disagree. Exact match only: the
-    /// ids are data keys, not typed words, so nothing is folded.
+    /// The inverse of [`code`](Self::code), walking [`ALL`](Self::ALL) so `code` stays the one
+    /// spelling table. Exact match: ids are data keys, not typed words.
     #[must_use]
     pub fn from_code(code: &str) -> Option<Trick> {
         Trick::ALL.into_iter().find(|trick| trick.code() == code)
@@ -209,18 +191,16 @@ impl Trick {
     }
 }
 
-/// What one typed token means to the pet. See the module docs for the three
-/// families and for what this deliberately does NOT decide.
+/// What one typed token means to the pet (see the module docs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum TrickRole {
     /// A command word.
     Trick {
         /// Which trick it asks for.
         trick: Trick,
-        /// `false`: a PLAIN word — it may fire unaddressed, on a line that is
-        /// nothing but pet vocabulary. `true`: an ADDRESS word — it fires only
-        /// when the same line also carries a [`TrickRole::Vocative`]. Always
-        /// `true` for a single-character no-space surface.
+        /// `false`: a plain word, which may fire on a line of nothing but pet vocabulary.
+        /// `true`: an address word, which fires only when the line also carries a
+        /// [`TrickRole::Vocative`]. Always `true` for a single-character no-space surface.
         needs_vocative: bool,
     },
     /// A name for the pet. Fires nothing by itself; it is what turns an
@@ -241,9 +221,8 @@ pub enum RowKind {
     Filler,
 }
 
-/// One authored row of `data/tricks.toml`, as the listings show it: the
-/// ORIGINAL spellings (diacritics and all — never the folded keys), whether or
-/// not the configured languages would load them.
+/// One authored row of `data/tricks.toml` as the listings show it: the original spellings, never
+/// the folded keys, whether or not the configured languages load them.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TrickRow {
     /// Trick / vocative / filler.
@@ -257,16 +236,14 @@ pub struct TrickRow {
     /// `true`: loads only when the configured languages list [`lang`](Self::lang)
     /// (or `"all"`).
     pub gated: bool,
-    /// `true`: a no-space script row — surfaces are RAW keys and the whole
-    /// typed run must equal one.
+    /// `true`: a no-space-script row, whose surfaces are raw keys the whole typed run must equal.
     pub cjk: bool,
     /// Surfaces of this row that are never half of a glued name + command run
     /// (module docs). Not part of [`row_line`]: it changes no role.
     pub unglued: Vec<String>,
 }
 
-/// THE one listing formatter — the CLI prints exactly these lines and the
-/// manual documents exactly this shape, so there is one spelling to pin:
+/// The one listing formatter: the CLI prints these lines and the manual documents this shape.
 ///
 /// ```text
 /// command trick=down lang=en gated=0 words=loaf,sploot address=down,rest does=lies_down_in_a_loaf
@@ -274,10 +251,9 @@ pub struct TrickRow {
 /// filler lang=en gated=0 words=please,now
 /// ```
 ///
-/// One line, space-separated `key=value` fields, no spaces inside a value
-/// (surfaces are single tokens by the load law; the blurb's spaces become
-/// `_`), an empty list spelled `-`. Composed with `push_str` — this crate
-/// keeps std format macros out of its non-test bodies (see `DebugText`).
+/// Space-separated `key=value` fields with no spaces inside a value (surfaces are single tokens;
+/// the blurb's spaces become `_`), an empty list spelled `-`. Composed with `push_str` (see
+/// `DebugText`).
 #[must_use]
 pub fn row_line(row: &TrickRow) -> String {
     let mut line = String::new();
@@ -305,9 +281,8 @@ pub fn row_line(row: &TrickRow) -> String {
                 line.push(if c == ' ' { '_' } else { c });
             }
         }
-        // Only a trick row HAS an address list or a performance; printing
-        // `address=- does=-` on the other two would be noise that reads as
-        // missing data.
+        // Only a trick row has an address list and a performance; `address=- does=-` on the
+        // others would read as missing data.
         RowKind::Vocative | RowKind::Filler => {}
     }
     line
@@ -328,11 +303,8 @@ fn push_surface_list(line: &mut String, surfaces: &[String]) {
     }
 }
 
-// ---- TOML shapes ----
-//
-// `deny_unknown_fields` on all three: a typo'd key (`adress = [...]`) must be
-// a parse error the test suite trips over, not a list that silently never
-// loads.
+// TOML shapes: `deny_unknown_fields` throughout, so a typo'd key (`adress`) is a parse error,
+// not a list that silently never loads.
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -385,24 +357,20 @@ struct RawWordRow {
 /// Compiled value behind one key.
 #[derive(Clone, Copy, Debug)]
 struct TrickEntry {
-    /// The role AS AUTHORED (which list the surface sat in).
+    /// The role as authored (which list the surface sat in).
     role: TrickRole,
-    /// The marks-required gate, the sparkle lexicon's law verbatim: every
-    /// claiming surface lost diacritics in folding AND landed on a bare-ASCII
-    /// key, so unmarked typing spells a different word that merely shares the
-    /// skeleton. Such a key admits only a token that itself carries
-    /// folded-away marks.
+    /// The marks-required gate, as in the sparkle lexicon: every claiming surface folded marks
+    /// away into a bare-ASCII key, which unmarked typing spells as another word, so the key admits
+    /// only a token that itself carries folded-away marks.
     marks_required: bool,
-    /// A one-character no-space surface. [`effective_role`] forces
-    /// `needs_vocative` for it, whichever list it was authored in.
+    /// A one-character no-space surface; [`effective_role`] forces `needs_vocative` for it.
     single_cjk: bool,
     /// Never half of a glued run ([`TrickLexicon::classify_glued_half`]).
     unglued: bool,
 }
 
-/// The role a lookup reports: the authored role, with the lone-ideograph law
-/// applied. ONE function, used by both the lookup and the load-time
-/// double-claim comparison, so "same role" means the same thing in both.
+/// The role a lookup reports: the authored role with the lone-ideograph law applied. The lookup
+/// and the load-time double-claim check share it, so "same role" means one thing.
 fn effective_role(entry: &TrickEntry) -> TrickRole {
     match entry.role {
         TrickRole::Trick {
@@ -417,13 +385,11 @@ fn effective_role(entry: &TrickEntry) -> TrickRole {
     }
 }
 
-/// The compiled kitty-command vocabulary: folded whole-token key (or RAW
-/// no-space-script key) → role. The two key spaces cannot alias: a folded
-/// spaced key begins and ends with a token character and a raw key is made
-/// only of no-space-script characters, which are never token characters.
+/// The compiled kitty-command vocabulary: folded whole-token key (or raw no-space-script key) →
+/// role. The key spaces cannot alias: a folded key begins and ends with a token character, and
+/// no-space-script characters are never token characters.
 ///
-/// `Default` is the EMPTY vocabulary (classifies nothing, no conflicts) — what
-/// a host holds before its off-thread compile lands.
+/// `Default` is the empty vocabulary, what a host holds before its off-thread compile lands.
 #[derive(Debug, Clone, Default)]
 pub struct TrickLexicon {
     table: FxHashMap<String, TrickEntry>,
@@ -434,49 +400,37 @@ pub struct TrickLexicon {
 }
 
 impl TrickLexicon {
-    /// The longest surface, in characters, that can ever fire. The typed-line
-    /// listener holds the current token in a fixed window of exactly this many
-    /// characters and the flash holds the word in an inline buffer of the same
-    /// size; a longer token poisons itself. Owning the number HERE lets the
-    /// loader refuse a surface that could never be typed into that window,
-    /// instead of shipping a word that silently never works.
+    /// The longest surface, in characters, that can ever fire: the typed-line listener's token
+    /// window and the flash's inline word buffer hold this many, and a longer token poisons
+    /// itself. The loader refuses a longer surface rather than ship a word that never works.
     pub const MAX_SURFACE_CHARS: usize = 32;
 
-    /// The embedded vocabulary with `gated` rows loaded for `langs` (`["all"]`
-    /// un-gates everything). Ungated rows — all of English — load for every
-    /// configuration. Panics only if the EMBEDDED data fails to parse, which
-    /// the test suite forbids.
+    /// The embedded vocabulary with `gated` rows loaded for `langs` (`["all"]` un-gates
+    /// everything); ungated rows, all of English among them, always load. Panics only if the
+    /// embedded data fails to parse, which the test suite forbids.
     #[must_use]
     pub fn with_languages(langs: &[&str]) -> TrickLexicon {
-        // Explicit match instead of `.expect(..)`, mirroring
-        // `Lexicon::with_languages`: `expect`'s panic-freedom is not modeled by
-        // the verifier, and the message is the one `expect` would have built.
+        // A match, not `.expect(..)`, as in `Lexicon::with_languages`.
         match Self::from_source(BUILTIN_TRICKS, langs) {
             Ok(tricks) => tricks,
             Err(e) => std::panic::panic_any(embedded_parse_panic(&e)),
         }
     }
 
-    /// The embedded vocabulary with nothing un-gated beyond English (the
-    /// default `languages = ["en"]`). Built once and cached.
-    ///
-    /// For tests and tools. A HOST compiles [`with_languages`](Self::with_languages)
-    /// from its configured languages off the keystroke path and keeps the
-    /// result; it must not first-touch this cell on the input thread.
+    /// The embedded vocabulary with nothing un-gated beyond English (the default
+    /// `languages = ["en"]`), built once and cached. For tests and tools: a host compiles
+    /// [`with_languages`](Self::with_languages) off the keystroke path and must not first-touch
+    /// this cell on the input thread.
     #[must_use]
     pub fn shared_en() -> &'static TrickLexicon {
         static TRICKS_EN: OnceLock<TrickLexicon> = OnceLock::new();
         TRICKS_EN.get_or_init(|| Self::with_languages(&["en"]))
     }
 
-    /// Compile a vocabulary from a `tricks.toml`-shaped document. `langs`
-    /// selects which `gated` rows load. A malformed document is an `Err`; a
-    /// well-formed document with bad rows compiles, with each dropped row or
-    /// surface named on [`conflicts`](Self::conflicts).
-    ///
-    /// Public for the same reason `Lexicon::from_sources` is: the load laws
-    /// are testable only against documents that BREAK them, and a listener
-    /// test needs scripts the embedded seed may not carry yet.
+    /// Compile a vocabulary from a `tricks.toml`-shaped document; `langs` selects which `gated`
+    /// rows load. A malformed document is an `Err`; bad rows compile with each dropped row or
+    /// surface named on [`conflicts`](Self::conflicts). Public so tests can load documents that
+    /// break the load laws or carry scripts the embedded seed lacks.
     pub fn from_source(tricks_toml: &str, langs: &[&str]) -> Result<TrickLexicon, LexError> {
         let raw: RawTricks = aterm_toml::from_str(tricks_toml).map_err(LexError::Toml)?;
         let mut conflicts = Vec::new();
@@ -484,10 +438,8 @@ impl TrickLexicon {
         Ok(compile(&rows, &Langs::new(langs), conflicts))
     }
 
-    /// The listing rows of a `tricks.toml`-shaped document, in the order
-    /// [`all_rows`](Self::all_rows) documents — the SAME rows, in the same
-    /// order, that [`from_source`](Self::from_source) compiles, so a validator
-    /// can hold the authored spellings beside the compiled table.
+    /// The listing rows of a `tricks.toml`-shaped document: the rows
+    /// [`from_source`](Self::from_source) compiles, in [`all_rows`](Self::all_rows) order.
     pub fn rows_from_source(tricks_toml: &str) -> Result<Vec<TrickRow>, LexError> {
         let raw: RawTricks = aterm_toml::from_str(tricks_toml).map_err(LexError::Toml)?;
         // The discarded conflicts are the row-shape ones (unknown id, no
@@ -495,26 +447,18 @@ impl TrickLexicon {
         Ok(ordered_rows(raw, &mut Vec::new()))
     }
 
-    /// Classify one already-isolated token. `scratch` is the caller's resident
-    /// fold buffer: after it has grown to the longest token seen, a call
-    /// allocates nothing (pinned by `tests/tricks_alloc.rs`).
+    /// Classify one already-isolated token. `scratch` is the caller's resident fold buffer: once
+    /// it has grown to the longest token seen, a call allocates nothing (`tests/tricks_alloc.rs`).
     ///
-    /// The cost is one fold plus one hash probe — or, for a token made only
-    /// of no-space-script characters, the probe alone: those keys are RAW, so
-    /// the whole typed run must equal a surface (there is no maximal-munch
-    /// search here; `坐下来` is not `坐下`). Then the marks-required gate, then
-    /// the lone-ideograph law. No possessive or clitic fallbacks: `kitty's`
-    /// is not something one says TO a cat.
+    /// One fold plus one hash probe, or for a no-space-script token the probe alone: those keys
+    /// are raw, so the whole typed run must equal a surface (`坐下来` is not `坐下`). Then the
+    /// marks-required gate and the lone-ideograph law. No possessive or clitic fallbacks:
+    /// `kitty's` is not said to a cat.
     ///
-    /// THE ELONGATION FOLD. People draw a word out when they talk to a pet —
-    /// `goooood kitty`, `purrrrr`, `nooo`, `staaay` — and no list can hold
-    /// every length. So on a MISS only, and only for a spaced token that
-    /// carries a run of three or more identical characters, the lookup is
-    /// retried with every such run collapsed to two (`goooood` → `good`,
-    /// `purrrrr` → `purr`, `pssssst` → `psst`), then to one (`nooo` → `no`,
-    /// `staaay` → `stay`, `meooow` → `meow`); the first hit wins. A run of
-    /// exactly two is never touched, so `kitty` stays `kitty` and `sitt` stays
-    /// a miss: the fold answers a held key, it does not forgive a typo.
+    /// Elongation fold: on a miss, a spaced token with a run of three or more identical characters
+    /// is retried with every such run collapsed to two (`goooood` → `good`, `pssssst` → `psst`),
+    /// then to one (`nooo` → `no`, `staaay` → `stay`); the first hit wins. A run of two is never
+    /// touched, so `sitt` stays a miss: the fold answers a held key, not a typo.
     #[must_use]
     pub fn classify(&self, token: &str, scratch: &mut String) -> Option<TrickRole> {
         self.lookup(token, scratch).map(effective_role)
@@ -595,16 +539,13 @@ impl TrickLexicon {
         self.table.len()
     }
 
-    /// Every well-formed row of the EMBEDDED file, every language, gated or
-    /// not, for listings. Cold path: one TOML parse per call.
+    /// Every well-formed row of the embedded file, every language, gated or not, for listings.
+    /// Cold path: one TOML parse per call.
     ///
-    /// ORDER: grouped by language in first-appearance order (English first,
-    /// by the data file's own law), and within a language the trick rows in
-    /// file order, then its vocative rows, then its filler rows. For a file
-    /// authored language-group by language-group that IS file order; a TOML
-    /// document does not record how three different arrays-of-tables
-    /// interleave, so this is the one order both the loader and the listing
-    /// can share. It is also the first-claimant order of the load law.
+    /// Grouped by language in first-appearance order (English first); within a language its
+    /// trick rows in file order, then vocatives, then fillers. TOML does not record how three
+    /// arrays-of-tables interleave, so this is the one order the loader and the listing share,
+    /// and the load law's first-claimant order.
     #[must_use]
     pub fn all_rows() -> Vec<TrickRow> {
         match Self::rows_from_source(BUILTIN_TRICKS) {
@@ -722,9 +663,8 @@ fn ordered_rows(raw: RawTricks, conflicts: &mut Vec<String>) -> Vec<TrickRow> {
         }
     }
 
-    // Group by language, first appearance first. `sort_by_key` is STABLE, so
-    // inside one language the staging order above (tricks in file order, then
-    // vocatives, then fillers) survives untouched.
+    // Group by language, first appearance first; the stable sort keeps the staging order
+    // (tricks in file order, then vocatives, then fillers) within a language.
     let mut langs: Vec<String> = Vec::new();
     for row in &rows {
         if !langs.contains(&row.lang) {
@@ -792,10 +732,8 @@ fn compile(rows: &[TrickRow], langs: &Langs, mut conflicts: Vec<String>) -> Tric
         }
         if row.gated {
             if row.lang == "en" {
-                // English is the priority language: a gated English row would
-                // vanish for a user who configures `languages = ["fr"]`, and
-                // the feature would stop answering `sit`. Load it anyway and
-                // say so.
+                // A gated English row would vanish under `languages = ["fr"]` and `sit` would
+                // stop answering: load it anyway and report it.
                 let mut msg = String::from("English row marked gated (");
                 push_kind_label(&mut msg, row.kind);
                 msg.push_str("): English is never gated, loaded anyway");
@@ -865,11 +803,8 @@ fn claim_surface(
         )
     } else {
         let key = fold::fold(surface);
-        // The scanner's own single-token law, judged on the folded key exactly
-        // as the sparkle lexicon does. It also refuses a no-space-script
-        // surface in a row that forgot `cjk = true` (those are not token
-        // characters), which would otherwise compile to a key no typed token
-        // can reach.
+        // The scanner's single-token law on the folded key. It also refuses a no-space surface in
+        // a row missing `cjk = true`, which would compile to a key no typed token reaches.
         if key.is_empty() || !is_matchable_token(&key) {
             push_surface_conflict(
                 conflicts,
@@ -893,10 +828,8 @@ fn claim_surface(
     };
     match table.get_mut(&key) {
         Some(prev) if effective_role(prev) == effective_role(&entry) => {
-            // The same claim again — the bare spelling beside the marked one,
-            // or a second language sharing the imperative. One claimant
-            // listing the BARE spelling makes the key typeable without marks:
-            // explicit data is consent (the `scheisse` beside `scheiße` law).
+            // The same claim again (the bare spelling beside the marked one, or two languages
+            // sharing an imperative): one bare claimant makes the key typeable without marks.
             prev.marks_required &= entry.marks_required;
             // One claimant keeping it out of the glued reading keeps it out.
             prev.unglued |= entry.unglued;

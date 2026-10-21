@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The first-party platform certificate verifier — the OS trust store, called
+//! The first-party platform certificate verifier: the OS trust store, called
 //! directly.
-//!
-//! [`crate::tls`] records WHY server certificates are checked against the
-//! operating system's trust store and never against a root set compiled into
-//! the aterm binary; this module is its implementation.
-//!
-//! # What each platform runs
 //!
 //! | platform | who decides | revocation |
 //! | --- | --- | --- |
@@ -44,18 +38,26 @@
 //! * Nothing derived from the peer's chain is ever `unwrap`ped, `expect`ed, or
 //!   indexed. It is attacker-controlled input.
 //!
-//! # The anchor seam, and why it is not in your binary
+//! The failure that matters is a forged certificate accepted, so acceptance is
+//! hard to reach by accident:
 //!
-//! Testing the ACCEPT path offline needs a chain the machine trusts, which needs
-//! a way to add an anchor: [`PlatformVerifier::new_with_extra_roots`], which is
-//! `#[cfg(test)]`: it does not exist in a shipped build, so no caller
-//! can reach it and no configuration can turn it on. The seam that lets a caller
-//! add trust anchors is the same primitive an attacker wants, and the only thing
-//! that needs it is [`tests`].
+//! * [`PlatformVerifier::verify_server_cert`] produces
+//!   `ServerCertVerified::assertion()` only after an arm returned `Ok(())`, and
+//!   no arm returns `Ok` except on an explicit positive result from the OS —
+//!   `true` from `SecTrustEvaluateWithError`, `dwError == 0` from the Windows
+//!   SSL policy, `Ok` from `WebPkiServerVerifier`.
+//! * A failed FFI call, a certificate the OS will not parse, a hostname that
+//!   will not encode, an empty root store: all `Err`. A `trustd` that does not
+//!   reply within the deadline (`aterm_uds::deadline`) is a refusal
+//!   [`is_service_unanswered`] names, never a hang or an acceptance.
+//! * Nothing derived from the peer's chain is `unwrap`ped, `expect`ed or
+//!   indexed: it is attacker-controlled input.
 //!
-//! [`crate::tls::client_config`] therefore always builds this verifier with an
-//! empty anchor set; `the_shipped_constructor_trusts_no_fixture_anchor` in
-//! [`tests`] asserts exactly that.
+//! Testing the accept path offline needs an extra trust anchor, so
+//! `PlatformVerifier::new_with_extra_roots` exists only under `#[cfg(test)]`:
+//! no shipped caller or configuration can add an anchor.
+//! [`crate::tls::client_config`] always builds this verifier with none
+//! (`the_shipped_constructor_trusts_no_fixture_anchor` pins it).
 
 use std::fmt;
 use std::sync::Arc;
@@ -90,11 +92,9 @@ mod unix;
 #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
 use unix as imp;
 
-// Everything else — wasm32, Android, and any target that is neither Windows nor
-// a non-Android Unix. The arms above are mutually exclusive (Windows is not
-// `unix`, and Apple is excluded from the Unix arm), so this is the exact
-// complement of their union: no target gets two verifiers, and no target gets
-// none.
+// Everything else — wasm32, Android, any target that is neither Windows nor a
+// non-Android Unix: the exact complement of the arms above, so every target
+// gets exactly one verifier.
 #[cfg(not(any(
     target_vendor = "apple",
     windows,
@@ -108,20 +108,12 @@ mod unsupported;
 )))]
 use unsupported as imp;
 
-// ---------------------------------------------------------------------------
-// Errors
-//
-// Three of the arms report the same condition through three unrelated
-// vocabularies (an Apple `OSStatus`, a Windows `dwError`, a webpki
-// `CertificateError`). These constructors are the one place that translation
-// lands, so a caller sees one set of outcomes.
-//
-// What is deliberately NOT translated: anything finer than these. macOS returns
-// `errSecCertificateExpired` for a NOT-YET-VALID certificate as well as an
-// expired one, and returns different codes for "self-signed leaf" and
-// "untrusted root" where webpki returns `UnknownIssuer` for both. Inventing a
-// distinction the platform did not make would be inventing information.
-// ---------------------------------------------------------------------------
+// Error constructors: the one place the arms' vocabularies (an Apple
+// `OSStatus`, a Windows `dwError`, a webpki `CertificateError`) become one set
+// of outcomes. Nothing finer is translated: macOS returns
+// `errSecCertificateExpired` for a not-yet-valid certificate too, and
+// distinguishes "self-signed leaf" from "untrusted root" where webpki says
+// `UnknownIssuer` for both; inventing a distinction would invent information.
 
 /// A rejection carrying a platform-specific explanation.
 #[derive(Debug)]
@@ -138,9 +130,8 @@ impl std::error::Error for PlatformRejection {}
 /// The end-entity certificate's extended key usage does not permit server
 /// authentication (or, on Apple, is absent where Apple requires it).
 ///
-/// The `Display` text matches `rustls-platform-verifier`'s `EkuError`
-/// deliberately: it is how [`tests`] recognises this outcome without the type
-/// being exposed.
+/// The `Display` text matches `rustls-platform-verifier`'s `EkuError`, which is
+/// how the tests recognise this outcome without the type being exposed.
 #[derive(Debug)]
 struct EkuError;
 
@@ -152,10 +143,8 @@ impl fmt::Display for EkuError {
 
 impl std::error::Error for EkuError {}
 
-/// The peer sent bytes that are not a parseable certificate.
-///
-/// This is NOT a trust verdict and must never be counted as one: it is reported
-/// before any chain evaluation happens.
+/// The peer sent bytes that are not a parseable certificate. Reported before
+/// any chain evaluation: not a trust verdict.
 #[cfg(any(target_vendor = "apple", windows))]
 fn bad_encoding() -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
@@ -187,13 +176,9 @@ fn eku_rejected() -> rustls::Error {
 }
 
 /// The OS trust service did not answer within the evaluation deadline, or an
-/// earlier evaluation has been waiting on it past the suspect age, so the
-/// chain was REFUSED without a verdict. Not a judgement of the certificate —
-/// the platform never gave one — and not a pass: fail closed.
-///
-/// A distinct type, so a caller that wants to tell a person "the Mac's
-/// certificate service is stuck" apart from "this certificate is bad" asks
-/// [`is_service_unanswered`] instead of matching on prose.
+/// earlier evaluation has waited on it past the suspect age, so the chain was
+/// refused without a verdict. A distinct type so [`is_service_unanswered`] can
+/// tell a stuck `trustd` from a bad certificate.
 #[cfg(target_vendor = "apple")]
 #[derive(Debug)]
 struct ServiceUnanswered;
@@ -219,9 +204,9 @@ fn service_unanswered() -> rustls::Error {
     rustls::Error::Other(rustls::OtherError(Arc::new(ServiceUnanswered)))
 }
 
-/// Whether `error` is the platform verifier refusing a connection because the
-/// OS trust service did not answer in time (macOS's `trustd`), rather than a
-/// verdict on the certificate. Always `false` where there is no such service.
+/// Whether `error` is the platform verifier refusing because the OS trust
+/// service (macOS's `trustd`) did not answer in time, rather than a verdict on
+/// the certificate. Always `false` where there is no such service.
 #[must_use]
 pub fn is_service_unanswered(error: &rustls::Error) -> bool {
     #[cfg(target_vendor = "apple")]
@@ -241,10 +226,6 @@ fn invalid_certificate(reason: impl Into<String>) -> rustls::Error {
         Arc::new(PlatformRejection(reason.into())),
     )))
 }
-
-// ---------------------------------------------------------------------------
-// The verifier
-// ---------------------------------------------------------------------------
 
 /// Verifies server certificates against the operating system's trust store.
 ///
@@ -282,14 +263,11 @@ impl PlatformVerifier {
     }
 
     /// The one constructor both entry points funnel through, so the shipped
-    /// path and the tested path are literally the same code with an empty
-    /// `extra_roots` rather than two code paths that resemble each other.
+    /// path is the tested path with an empty `extra_roots`.
     fn build(
         extra_roots: Vec<CertificateDer<'static>>,
         provider: Arc<CryptoProvider>,
     ) -> Result<Self, rustls::Error> {
-        // Every arm takes the same two arguments, so there is no `#[cfg]` fork
-        // here: one call, one shape, on all four platforms.
         let inner = imp::Verifier::new(extra_roots, Arc::clone(&provider))?;
         Ok(Self { inner, provider })
     }
@@ -304,14 +282,11 @@ impl ServerCertVerifier for PlatformVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        // `to_str` renders an `IpAddress` name in its textual form, which is
-        // what the Apple and Windows policies want; the Unix arm gets the
-        // `ServerName` itself and does its own IP-vs-DNS matching.
+        // `to_str` renders an IP name as text, which the Apple and Windows
+        // policies want; the Unix arm matches on the `ServerName` itself.
         let server_text = server_name.to_str();
-        // FAIL CLOSED on a name there is nothing to check against. A verifier
-        // handed an empty name would be asking the platform "is this chain good
-        // for "?" — and on macOS an ABSENT name switches name checking off
-        // entirely, so a value that could degrade into one is refused here.
+        // Fail closed on an empty name: on macOS an absent name switches name
+        // checking off entirely.
         if server_text.is_empty() {
             return Err(invalid_certificate(
                 "refusing to verify a certificate against an empty server name",
@@ -319,8 +294,7 @@ impl ServerCertVerifier for PlatformVerifier {
         }
         let ocsp_response = (!ocsp_response.is_empty()).then_some(ocsp_response);
 
-        // The ONLY route to `assertion()`. `?` means every arm's `Err` — and
-        // every arm's default is `Err` — leaves here as a rejection.
+        // The only route to `assertion()`: every arm's `Err` leaves as a rejection.
         self.inner.verify(
             end_entity,
             intermediates,

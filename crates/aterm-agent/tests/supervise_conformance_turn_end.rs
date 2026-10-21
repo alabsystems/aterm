@@ -27,9 +27,9 @@
 //! Every walk runs over what the turn ends on: a report (`continue@v1`'s `keep
 //! going`) and a choice asked in prose (`answer@v1`'s `answer_text`, and the
 //! `prose-long-term@v1`/`prose-short-term@v1` texts per question priority):
-//! the harness answers and goes on (owner, 2026-09-25).
+//! the harness answers and goes on.
 //!
-//! FOREVER CRUISE: a continuation's reply that claims done
+//! Forever cruise: a continuation's reply that claims done
 //! (`WorkedClaimsDone`, the retired token on its last line) ends nothing —
 //! the point's act is the defend-and-find-more prompt
 //! (`continue-done-check@v1`) in the continuation's place, on the same gates
@@ -184,6 +184,7 @@ fn reading(
         said_cut: false,
         turn_said: None,
         opened_by: None,
+        message_drawn: false,
         worked,
         rules: None,
         pending_input,
@@ -204,6 +205,8 @@ fn reading(
         since_limit: None,
         background: false,
         served_in_transcript: false,
+        chosen_in_transcript: None,
+        conversation: aterm_agent::supervise::policy::turn_end::Conversation::Hostless,
         notice_elsewhere: false,
         reset_clock: None,
         program: aterm_phase::Program::Claude,
@@ -259,8 +262,7 @@ impl Real {
 }
 
 /// The real state against the model's at `st`: someone else's live turn,
-/// the needs standing, the task never done and its face open (FOREVER
-/// CRUISE).
+/// the needs standing, the task never done and its face open.
 fn faces(real: &Real, st: &State) {
     assert_eq!(
         real.st.other_turn(),
@@ -326,7 +328,7 @@ fn expected(m: &Model, st: &State) -> Verdict {
         return expected(m, &judged);
     }
     // No task: nothing ended here. Nor while someone else's turn runs. (A
-    // done claim ends nothing: FOREVER CRUISE.)
+    // done claim ends nothing.)
     if st["tasked"] == 0 || st["other"] == 1 {
         return Verdict::Nothing;
     }
@@ -581,7 +583,7 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
         }
         // No silent latch: at a free point of a session with a task the
         // real decider says something — at a done claim and a standing need
-        // too (FOREVER CRUISE).
+        // too.
         if st["tasked"] == 1
             && st["other"] == 0
             && st["box_up"] == 0
@@ -607,7 +609,7 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
             }
             let mut r = real.clone();
             mirror(action.name, &st, &next, &mut r, take, variant);
-            // Along EVERY transition, not only at a state's first visit: a
+            // Along every transition, not only at a state's first visit: a
             // state the walk reached before by another path is checked here
             // on this one.
             faces(&r, &next);
@@ -700,7 +702,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         );
     }
 
-    // FOREVER CRUISE: at a continuation's done claim, past the back-off it
+    // Forever cruise: at a continuation's done claim, past the back-off it
     // earned, the Buggy model has ended the task (nothing enabled, the
     // policy before it) — the real decider types the defend prompt, and its
     // task is not done.
@@ -743,7 +745,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     assert!(!transcript_tasked(&record, &ours()));
     assert!(transcript_tasked(&record, &[]));
 
-    // N1: after the worker's real work, the upgrade's two turns — its
+    // After the worker's real work, the upgrade's two turns — its
     // notice's READY and its carry-on's reply, each short — leave the point
     // free when the host's turns are registered as typed; the same answers
     // read as someone else's turns back the point off.

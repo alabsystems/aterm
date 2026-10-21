@@ -2,29 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Back-removal operations for [`ColdTier`].
-//!
-//! Extracted from `cold_tier.rs` for file-size compliance.
-//! These methods support `remove_newest` (#5918).
+//! Back removal for [`ColdTier`], behind `remove_newest`.
 
 use super::{ColdPage, ColdTier};
 
 impl ColdTier {
     /// Remove the newest `n` lines from the back of the cold tier.
     ///
-    /// Drops whole pages from the back without decompression. For the
-    /// boundary page (partially within the remove range), decompresses it,
-    /// trims the consumed lines from the back, and re-compresses the survivors.
+    /// Whole pages drop without decompression; the boundary page is
+    /// decompressed, trimmed and re-compressed.
     ///
-    /// Error safety (#4638): the boundary page is decompressed before any state
-    /// is modified. On decompression failure, state is unchanged.
+    /// Error safety: the boundary page is decompressed and re-encoded before
+    /// any state is modified, so a failure leaves the tier unchanged.
     ///
     /// # Panics
     ///
     /// Debug-asserts that `n <= self.line_count`.
-    // Skip: the residue is the blanket-unmodeled drain/iterator class plus the
-    // boundary rebuild's alloc — the arithmetic is now saturating and proven
-    // (twin of the warm tier's). ARENA-SCROLL tested.
+    // Skip: the unmodeled drain/iterator class plus the boundary rebuild's
+    // alloc.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_back_lines(&mut self, n: usize) -> Result<(), crate::ScrollbackError> {
         if n == 0 {
@@ -40,9 +35,8 @@ impl ColdTier {
         let mut whole_pages = 0;
         let mut remaining = n;
         for page in self.pages.iter().rev() {
-            // saturating index/arith — the exact twin of the warm tier's commit
-            // path: the guards prove the bounds but do not reach the ops in the
-            // verifier's model. Identical on every real path.
+            // Saturating ops: the guards prove the bounds, but the verifier's model
+            // does not carry them to the ops.
             let page_idx_from_back = whole_pages;
             let actual_idx = self
                 .pages
@@ -121,18 +115,14 @@ impl ColdTier {
         }
         self.line_count = self.line_count.saturating_sub(n);
 
-        // Reset front_offset when all pages are gone. Without this, a stale
-        // front_offset would incorrectly skip lines from the first page if
-        // new pages are appended later. Matches warm tier cleanup in
-        // tier_back_removal.rs.
+        // With no page left, a stale front_offset would skip lines of the next
+        // page appended (as in tier_back_removal.rs).
         if self.pages.is_empty() {
             self.front_offset = 0;
         }
 
-        // Rebuild cumulative index from pages — a full rebuild rebases to
-        // zero, so the front-drop cursor and absolute base reset with it
-        // (back removal is the rare path; O(P) here is the pre-existing
-        // cost, untouched by the front-drop redesign).
+        // A full rebuild rebases the index to zero, so the front-drop cursor
+        // and base reset with it.
         self.cumulative_lines.clear();
         self.cum_start = 0;
         self.cumulative_base = 0;

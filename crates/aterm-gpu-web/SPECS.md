@@ -3,32 +3,19 @@
 
 # aterm-gpu-web: spec recovery from its 93 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 8 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+> Status: migration worklist. Each of the 46 specs below is proved through Trust/Clean about the
+> compiled Rust function, and then the tests it subsumes are deleted. The 1 test in §4 samples no
+> spec and is to be deleted. In the shared `predict_api.rs`, a shift's moved glyph is emitted as a
+> triple like a typed one (`a_shift_s_moved_text_comes_out_as_triples`, §2), and every `KeySample`
+> hands the engine's `wrap_pending` flag, `below: None` and `input_start: None` (`predict-facade-gates`:
+> the web reads no signed prompt marks, so Home, End, Ctrl-A, Ctrl-E and Delete stay unmodelled input).
 
-> 2026-10-20, predictive editing increment 3: the shared `predict_api.rs` gains
-> `a_shift_s_moved_text_comes_out_as_triples` (§2), and `predict-facade-gates` says a shift's moved glyph
-> is a triple like a typed one.
-
-> 2026-10-20, predictive editing increment 4: every `KeySample` the shared `predict_api.rs` builds hands
-> `input_start: None` (`predict-facade-gates`): the web reads no signed prompt marks, so Home, End, Ctrl-A, Ctrl-E
-> and Delete stay unmodelled input. No export or test changes.
->
-> 2026-10-20, after review of increment 4: every `KeySample` also hands the engine's deferred-wrap flag
-> (`wrap_pending`) and no row under the cursor (`below: None`). No export or test changes.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 46 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it
-> subsumes are deleted. The 1 test in §4 samples no spec and is to be deleted now.
-
-Source: `crates/aterm-gpu-web` (read only). Every `#[test]` was read: `src/lib.rs` 38,
-`src/messages_api.rs` 9, `src/notifications_api.rs` 5, `src/predict_api.rs` 12,
-`src/scroll_input_api.rs` 14, `src/scrollback_tiers_api.rs` 2, shared `facade_api.rs` 1, shared `theme_api.rs` 11
-and `tests/cpu_gpu_parity.rs` 1, for 93 in all. The production code they reach in `src/lib.rs`, `src/effects_api.rs` and the
-API modules was read too. Nothing was compiled or run; the claims below come from reading the
-code. Gap numbers refer to the gap table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
+Source: `crates/aterm-gpu-web` (`src/lib.rs` 38, `src/messages_api.rs` 9,
+`src/notifications_api.rs` 5, `src/predict_api.rs` 12, `src/scroll_input_api.rs` 14,
+`src/scrollback_tiers_api.rs` 2, shared `facade_api.rs` 1, shared `theme_api.rs` 11 and
+`tests/cpu_gpu_parity.rs` 1, for 93 tests in all, plus the production code in `src/lib.rs`,
+`src/effects_api.rs` and the API modules). Gap numbers refer to the gap table in
+`AUDIT-trust-for-test-migration-2026-10-15.md` §7.
 
 Result: **46 specs**, covering **92 tests**. **1 test is not a spec sample** (§4).
 

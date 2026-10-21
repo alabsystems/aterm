@@ -3,156 +3,47 @@
 
 //! `cfg-if` — aterm's first-party `cfg_if!` macro.
 //!
-//! This crate is published into the build under the package name `cfg-if` (the
-//! directory is `crates/aterm-cfg-if`; see the manifest for why the two names
-//! differ) so that `[patch.crates-io]` can redirect every consumer of the
-//! crates.io package at code we own. It is one `macro_rules!` and nothing else:
-//! no types, no functions, no modules, no consts, no dependencies, `no_std`.
+//! Published into the build under the package name `cfg-if` (`crates/aterm-cfg-if`)
+//! so `[patch.crates-io]` redirects third-party consumers to first-party code.
+//! One `macro_rules!`, `no_std`, no dependencies.
 //!
-//! # Who asks for it, and why a call-site census misses this crate
+//! # Invariants
 //!
-//! **No aterm crate uses `cfg_if!` at all.** `grep -rn cfg_if crates/ tools/
-//! apps/ --include='*.rs'` returns zero. Every consumer is third-party, which
-//! is precisely why the patch table is the only lever — rewriting our own call
-//! sites would have rewritten nothing. Measured with
-//! `targo tree --workspace --target <cell> -e normal,build -i cfg-if --depth 1`
-//! on all four cells (re-measured 2026-10-16: since the census before it,
-//! `getrandom 0.2` became first-party and asks for no `cfg-if` on any cell,
-//! `ahash` and `getrandom 0.3` left linux, and on mac the GPU stack — `wgpu`,
-//! `wgpu-hal`, `naga`, `half` — and `parking_lot_core` left too):
+//! `cfg_if!` takes a chain of `if #[cfg(..)] { … } else if #[cfg(..)] { … } else { … }`
+//! arms and emits the tokens of the first arm whose predicate holds, in the
+//! caller's token context, with nothing wrapped around them:
 //!
-//! * **mac-arm**, 1 — `ring 0.17.14`.
-//! * **win-msvc**, 6 — `half 2.7.1`, `naga 29.0.3`, `parking_lot_core 0.9.12`,
-//!   `ring 0.17.14`, `wgpu 29.0.3`, `wgpu-hal 29.0.3`.
-//! * **linux-gnu**, 6 — `async-io 2.6.0`, `async-process 2.5.0`,
-//!   `async-signal 0.2.14`, `libloading 0.8.9`, `polling 3.11.0` and
-//!   `ring 0.17.14` (re-measured 2026-10-17, after linux-windowing LW.5 took
-//!   `tiny-skia 0.11.4` out with `sctk-adwaita`).
-//! * **wasm32**, 2 — `ring 0.17.14` and `wasm-bindgen 0.2.108`, through
-//!   workspace members no shipped module compiles for wasm32 (re-measured
-//!   2026-10-17, when the GPU module left wgpu and wasm-bindgen at
-//!   wasm-platform WP.8, taking `half`, `naga`, `parking_lot_core`, `wgpu`
-//!   and `wgpu-hal` with it). Per shipped module (`-p aterm-gpu-web` /
-//!   `-p aterm-wasm` in place of `--workspace`), neither reaches it: the CPU
-//!   module left at WP.7, the GPU module at WP.8.
+//! 1. **First-match-wins negates previous arms.** Arm `k` is emitted under
+//!    `#[cfg(all(meta_k, not(any(meta_1, …, meta_k-1))))]`. Negating following
+//!    arms instead would implement last-match-wins and select the wrong
+//!    platform code when multiple arms hold (e.g. `target_os = "linux"` before
+//!    `unix` in `parking_lot_core`).
+//! 2. **Each arm's tokens route through one `@__group` call.** A `#[cfg]`
+//!    written directly in front of `$( $tokens )*` attaches to the first item
+//!    only, leaving subsequent items in a multi-item arm unconditional.
+//!    Routing the arm through a macro call makes it a single syntax node for
+//!    the attribute.
+//! 3. **The terminal arm expands to nothing** (not `()`, `;`, or `{}`), so
+//!    `cfg_if!` works both as a tail expression and as a statement followed by
+//!    more code.
+//! 4. **Caller hygiene.** Tokens are re-emitted with the caller's syntax
+//!    context, so bindings introduced inside an arm remain visible after the
+//!    invocation.
+//! 5. **Non-selected arms are never expanded.** `#[cfg]` prevents expansion,
+//!    so `compile_error!` guards in unselected fallback arms do not fire.
 //!
-//! A patch also redirects DEV and BUILD edges, so a test build compiles more
-//! `cfg_if!` call sites than the census above (`-e normal,build,dev` lists
-//! them).
+//! # Differences from upstream `cfg-if`
 //!
-//! # Why this replacement is safe
-//!
-//! The contract is small enough to state completely. `cfg_if!` takes a chain of
-//! `if #[cfg(..)] { … } else if #[cfg(..)] { … } else { … }` arms and emits the
-//! tokens of the FIRST arm whose predicate holds, in the caller's own token
-//! context, with nothing wrapped around them. Three structural facts carry that
-//! sentence, and every one of them is a way to get this wrong silently:
-//!
-//! 1. **First-match-wins is implemented by negating the PREVIOUS arms.** Arm `k`
-//!    is emitted under `#[cfg(all(meta_k, not(any(meta_1, …, meta_k-1))))]`. An
-//!    implementation that negates the FOLLOWING arms instead is *last*-match-
-//!    wins: exactly one arm still compiles, every cell still builds green, and
-//!    the wrong platform code ships. That is not hypothetical —
-//!    `parking_lot_core`'s `thread_parker/mod.rs:53` opens
-//!    `if #[cfg(any(target_os = "linux", target_os = "android"))] … else if
-//!    #[cfg(unix)] …`, and on Linux BOTH hold: first-match gives the futex
-//!    parker, last-match silently gives the pthread-condvar parker for every
-//!    lock in the process. `wgpu-hal`'s `lib.rs:312` and `half`'s
-//!    `binary16/arch.rs:19` have the same overlapping shape.
-//! 2. **Each arm's tokens are re-emitted through one `@__group` call.** A
-//!    `#[cfg]` written directly in front of `$( $tokens )*` attaches to the
-//!    FIRST item only; every later item in the arm then compiles
-//!    unconditionally. This is upstream's issue #90, and nearly every arm in
-//!    aterm's graph is multi-item (`mod pclmulqdq; pub use self::pclmulqdq::
-//!    State;` in `crc32fast`, twenty-eight `mod X; pub use X::*;` pairs in
-//!    `getrandom`'s backend chain). Routing the arm through a macro call makes
-//!    it a single node for the attribute to include or exclude, and the call
-//!    expands to the tokens unchanged.
-//! 3. **The terminal arm expands to literally nothing.** Not `()`, not `;`, not
-//!    an empty block. `cfg_if!` is routinely the whole body of a function whose
-//!    value it must produce (`ring`'s `sha2_32.rs:29` on all four cells,
-//!    `wgpu`'s `util/mutex.rs:42`, ~90 sites in `tiny-skia`), and it is equally
-//!    routinely a statement followed by more code (`nix`'s `addr.rs:584`,
-//!    followed by `Ok(())`). Both work only because the selected arm's tokens
-//!    land directly in the caller's block with nothing after them.
-//!
-//! Two more properties fall out of being a `macro_rules!` rather than anything
-//! cleverer, and both are relied on:
-//!
-//! * **Hygiene is the caller's.** The tokens are re-emitted with the caller's
-//!   syntax context, so a `let` bound inside an arm is visible *after* the
-//!   invocation — `naga`'s `error.rs:114` binds `inner` in every arm and then
-//!   writes `Self { inner }` outside the macro. A proc macro that re-spanned
-//!   the tokens would break that, and would break shadowing cases silently
-//!   first.
-//! * **A non-selected arm is never expanded.** `#[cfg]` prevents expansion; it
-//!   does not discard output afterwards. Twenty sites in the graph park a
-//!   `compile_error!` in a fallback arm as an unsupported-platform guard, and
-//!   an implementation that expanded every arm and filtered later would turn
-//!   each of those into an unconditional build failure.
-//!
-//! # What was verified, and the command to re-check it
-//!
-//! ```text
-//! cargo test -p cfg-if
-//! ```
-//!
-//! That runs two independent proofs:
-//!
-//! * **`tests/differential.rs`** — every chain answered twice: once by this
-//!   macro, once by a hand-written `cfg!()` cascade over the identical
-//!   predicates, asserting the two agree. `cfg!()` is rustc evaluating the same
-//!   predicate this macro hands to `#[cfg]`, so it is the ground truth rather
-//!   than a second opinion. Several chains are built from `#[cfg(all())]`
-//!   (always true) and `#[cfg(any())]` (always false) so that MULTIPLE
-//!   predicates hold at once on every cell — the only shape that can catch a
-//!   wrong-arm implementation, since a chain with one true predicate selects
-//!   the same arm under every plausible bug. The file also arms its tripwires
-//!   before it asserts anything: it defines a deliberately last-match-wins
-//!   macro and a deliberately un-grouped one, shows each produces a *different*
-//!   answer on the same input, and only then asserts this macro's answer.
-//!
-//!   The reference is `cfg!()` and NOT a dev-dependency on the upstream crate,
-//!   for a measured reason:
-//!   `[patch.crates-io]` rewrites dev edges too, so a `cfg-if` dev-dependency
-//!   resolves back to THIS crate and the differential silently compares the
-//!   shim to itself. The manifest records the `cargo metadata` output that
-//!   showed it.
-//! * **The doctests below**, including a `compile_fail` control that proves
-//!   `compile_error!` really does fire when it lands in a SELECTED arm.
-//!
-//! # Where this is NOT the crates.io crate
-//!
-//! Four differences, none reachable from aterm, all stated because an honest
-//! divergence is worth more than a claim that does not hold on every cell:
-//!
-//! * **`rustc-dep-of-std` is a no-op here.** Upstream defines it as
-//!   `["core"]`, pulling `rustc-std-workspace-core`; this crate declares the
-//!   feature and wires it to nothing, because adding that dependency would put
-//!   a package back into the graph. So this shim cannot be used to build `std`
-//!   itself. Nothing in aterm's four cells enables the feature (features
-//!   resolve to `default` only), and if that ever changes the build breaks
-//!   loudly rather than quietly.
-//! * **The internal arm names differ** — `@__arms` and `@__group` here,
-//!   `@__items` and `@__temp_group` upstream. Verified free: zero matches for
-//!   any of those tokens across all twenty-three consuming packages, so nothing
-//!   invokes them directly. Anything that started to would get a
-//!   no-rules-expected-this-token error, which is loud.
-//! * **The licence is Apache-2.0**, not upstream's `MIT OR Apache-2.0`, because
-//!   this is aterm's own code rather than a redistribution. It carries no
-//!   retained `LICENSE-MIT`/`LICENSE-APACHE`, no `NOTICE` line and no review
-//!   row — deliberately, and the classifier depends on it:
-//!   `aterm_census::scan_set::redistribution_evidence` treats any `LICENSE*`
-//!   file in a patch target's directory as proof of redistribution, and a
-//!   `crates/` path showing that is a hard error rather than a reclassification.
-//! * **Edition 2024, not upstream's 2018.** Safe here for a specific reason
-//!   rather than by luck: the only fragment specifiers in this macro are `tt`,
-//!   and `tt` matching is edition-independent. The 2021→2024 change that bites
-//!   macros is the `expr` fragment, which this macro does not use — and must
-//!   not, because `half`'s `binary16/arch.rs:19` invokes `cfg_if!` from inside
-//!   another `macro_rules!` with `$f16c:expr` substituted into an arm body, and
-//!   an opaque expression fragment matches `tt` but matches neither `item` nor
-//!   `stmt` nor `block`.
+//! * **`rustc-dep-of-std` is a no-op** rather than pulling
+//!   `rustc-std-workspace-core`.
+//! * **Internal rule names** are `@__arms` and `@__group` instead of
+//!   `@__items` and `@__temp_group`.
+//! * **License is Apache-2.0**, with no retained `LICENSE-MIT` (which
+//!   `aterm_census::scan_set::redistribution_evidence` treats as redistribution
+//!   evidence).
+//! * **Edition 2024.** Every fragment specifier is `tt`, which is
+//!   edition-independent and accepts opaque `$e:expr` fragments substituted by
+//!   outer macros.
 
 #![no_std]
 #![warn(missing_docs)]

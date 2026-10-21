@@ -54,6 +54,7 @@ fn two_drives() -> Table {
         fstype: String::new(),
         local: true,
         automounted: false,
+        removable: false,
         read_only: false,
         container: Some(format!("Volume{{{guid}}}")),
     };
@@ -65,6 +66,7 @@ fn two_drives() -> Table {
                 fstype: String::new(),
                 local: false,
                 automounted: false,
+                removable: false,
                 read_only: false,
                 container: None,
             },

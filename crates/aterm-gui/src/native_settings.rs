@@ -34,7 +34,7 @@ use crate::native_app::{
     ConfigEdit, ConfigEditorOutcome, ConfigEditorTarget, ConfigPatch, ConfigPatchOutcome,
     EventResult, ExpectedConfigValue, ExternalOpenOutcome, ExternalOpenRequest, MessageActOutcome,
     NativeAppModel, OperationId, PackagesOutcome, PackagesRequest, SemanticInput, TextInputEvent,
-    ThemesOutcome, ThemesRequest, UpdateCx, UpdateOutcome, UpdateRequest, ViewCx,
+    ThemesOutcome, ThemesRequest, UndoTarget, UpdateCx, UpdateOutcome, UpdateRequest, ViewCx,
 };
 use crate::native_config_language::SearchRank;
 use crate::native_ui::{
@@ -78,17 +78,17 @@ pub(crate) enum SettingsRoute {
     Themes,
     TextFonts,
     CursorMotion,
-    /// The Cursor Styles page: the live cursor preview over the list of
-    /// styles and the selected style's own tuning — a SPECIAL page over its
-    /// [`Section::CursorStyles`] keys.
+    /// The live cursor preview over the list of styles and the selected
+    /// style's own tuning: a special page over its [`Section::CursorStyles`]
+    /// keys.
     CursorStyles,
     WindowTabs,
     /// The selected tab's color (HSV wheel, brightness, the hex row and
-    /// Reset) — a SPECIAL page over the ONE `active_tab_color` key.
+    /// Reset): a special page over the `active_tab_color` key.
     TabColor,
-    /// The terminal-tab backdrop image — a SPECIAL page over the `wallpaper`
-    /// key (Choose Image… opens the system picker; Remove clears it) and the
-    /// dim and text tint rows.
+    /// The terminal-tab backdrop image: a special page over the `wallpaper` key
+    /// (Choose Image… opens the system picker; Remove clears it) and the dim
+    /// and text tint rows.
     Wallpaper,
     KeyboardInput,
     Terminal,
@@ -105,14 +105,14 @@ pub(crate) enum SettingsRoute {
     /// [`Section::Harness`]'s registry rows itself, which stay owned by that
     /// section so Search and Modified still find them.
     Harness,
-    /// SETTINGS ▸ HARNESS ▸ AI CLIS (docs/DESIGN-ai-connections-2026-10-16.md
+    /// Harness's AI CLIs sub-page (`docs/DESIGN-ai-connections-2026-10-16.md`
     /// §10): the AI CLIs aterm keeps a login to — this machine's preferred
     /// CLI, the look's switch, each CLI's state with its "Use on this machine"
     /// switch and a Sign in where it needs a person, the reviews grant and
-    /// the fleet document, read-only. A SPECIAL page (`ai_page`) over the
+    /// the fleet document, read-only. A special page (`ai_page`) over the
     /// host's [`crate::ai_screen::AiState`], which the Harness snapshot
-    /// carries. Harness's own sub-page on the rail (the rail has no room for a
-    /// twentieth row), reached from the Harness page, the palette,
+    /// carries. A sub-page because the rail has no room for a twentieth row;
+    /// reached from the Harness page, the palette,
     /// `Mover::open_settings("/ai")` and `aterm ctl open app settings /ai`.
     Ai,
     /// SETTINGS ▸ HARNESS ▸ TAB CONTROL (`/tabs`): accessible computers (`this
@@ -211,11 +211,11 @@ impl SettingsRoute {
     }
 
     pub(crate) fn from_path(path: &str) -> Option<Self> {
-        // The page was the Cursor Kitty before it listed every style.
+        // The page's former path still opens it.
         if path == "/cursor-kitty" {
             return Some(Self::CursorStyles);
         }
-        // Settings briefly called the harness page Agents.
+        // A former path of the harness page still opens it.
         if path == "/agents" {
             return Some(Self::Harness);
         }
@@ -269,12 +269,10 @@ impl SettingsRoute {
             Self::Terminal => Some(Section::Terminal),
             Self::Security => Some(Section::Security),
             Self::Harness => Some(Section::Harness),
-            // Tab Color, Wallpaper, Software Update, Packages, Harness and
-            // Messages are SPECIAL pages (each renders its own controls over
-            // its key(s)); no ordinary page lists those keys as rows, so Search
-            // and Modified find them without a page double-listing them. (The
-            // Display Faces toggles ride the Text & Fonts page's showcase
-            // slot, not a route of their own.)
+            // Special pages render their own controls over their keys; no
+            // ordinary page lists those keys as rows, so Search and Modified
+            // find them without a page listing them twice. The Display Faces
+            // toggles ride the Text & Fonts page's showcase slot.
             Self::Home
             | Self::Modified
             | Self::Manual
@@ -296,6 +294,95 @@ impl SettingsRoute {
 struct PendingConfig {
     patch: ConfigPatch,
     submitted: Vec<(String, crate::native_text_input::TextInputState)>,
+    /// The page's earlier writes, still on their way when this one was made,
+    /// to a key it writes: it was composed over the values they show
+    /// ([`SettingsApp::send_config`]).
+    follows: Vec<OperationId>,
+    /// What the write is: what its landing says it did.
+    kind: WriteKind,
+}
+
+/// WHAT A WRITE IS, for the words its landing or its refusal says: a change
+/// of the rows it writes, named from what it changes ([`change_words`]), or
+/// one of the page's own operations, named as that operation, as its words
+/// while it saves named it. A Themes Revert writes the theme and its type
+/// settings back, and Keep colours only the theme and a pin of each type
+/// setting; named from that diff, their landings said "Color theme set to
+/// Dracula" or "Changed 3 settings" (and a refused Revert "Couldn't apply"),
+/// never that it reverted or kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WriteKind {
+    /// A change of the rows it writes.
+    Change,
+    /// Themes' Revert of a kept trial, back to the theme named `to`.
+    Revert { to: String },
+    /// Themes' Keep colours only of the theme named `label`: its colors and
+    /// the type settings in force.
+    KeepColours { label: String },
+}
+
+impl WriteKind {
+    /// The words this write's landing says, over `change` (the words its
+    /// diff names, which its Undo keeps).
+    fn landing_words(&self, change: ChangeWords) -> ChangeWords {
+        let status = match self {
+            Self::Change => return change,
+            Self::Revert { to } => format!("Reverted to {to}"),
+            Self::KeepColours { label } => {
+                format!("Kept {label}'s colors and your type settings")
+            }
+        };
+        ChangeWords { status, ..change }
+    }
+
+    /// The words this write's refusal says, `why` after them: `None` for a
+    /// change of rows, which its rows name.
+    fn refused_words(&self, why: &str) -> Option<String> {
+        match self {
+            Self::Change => None,
+            Self::Revert { to } => Some(format!("Couldn\u{2019}t revert to {to}: {why}")),
+            Self::KeepColours { label } => {
+                Some(format!("Couldn\u{2019}t keep {label}'s colors: {why}"))
+            }
+        }
+    }
+}
+
+/// What a key showed before the page laid its own writes on their way over
+/// it ([`SettingsViewState::lay_over`]): what aterm.toml holds for it, as
+/// its raw value and its row's seed (`None` where the key has no row).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Underlay {
+    raw: Option<String>,
+    seed: Option<Option<String>>,
+}
+
+/// Show `value` for `key` in `fields` and `raw` as aterm.toml holding it
+/// would: its raw value, and its row's seed. A Boolean seed is its effective
+/// display state, so a removed switch shows its default; treating `None` as
+/// false would make a default-on control lie.
+fn show_config_value(
+    fields: &mut [EditField],
+    raw: &mut BTreeMap<String, String>,
+    index: Option<usize>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value {
+        raw.insert(key.to_string(), value.to_string());
+    } else {
+        raw.remove(key);
+    }
+    let Some(field) = index.and_then(|index| fields.get_mut(index)) else {
+        return;
+    };
+    if !matches!(field.kind, EditKind::Bool) {
+        field.seed = value.map(str::to_string);
+    } else if let Some(value) = value {
+        field.seed = Some(value.to_string());
+    } else if let Some(default) = switch_default(key) {
+        field.seed = Some(default.to_string());
+    }
 }
 
 enum PendingAction {
@@ -317,6 +404,28 @@ enum PendingAction {
     LogFolder,
     /// The theme picker's Open themes folder, Open file or Import….
     Themes,
+}
+
+impl PendingAction {
+    /// The values this request puts in aterm.toml, key by key, which the
+    /// page shows while it is on its way: a config write's edits, an Undo's
+    /// restored values; nothing for any other request.
+    fn shown_edits(&self) -> Vec<(&str, Option<&str>)> {
+        match self {
+            Self::Config(request) => request
+                .patch
+                .edits
+                .iter()
+                .map(|edit| (edit.key.as_str(), edit.value.as_deref()))
+                .collect(),
+            Self::Undo(offer) => offer
+                .restores
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_deref()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -604,7 +713,7 @@ enum PickerCell {
     /// The option at this index.
     Option(usize),
     /// The compact theme picker's trailing action cell: 0 is Open themes
-    /// folder, 1 is Import…, 2 is All themes….
+    /// folder, 1 is Import…, 2 is Browse all themes….
     Action(usize),
 }
 
@@ -743,7 +852,7 @@ struct ChoicePicker {
     themes: Option<ThemePickerExtras>,
     /// Action cells listed after the shown options: a compact theme picker,
     /// which has no row to spare for a footer, lists Open themes folder,
-    /// Import… and All themes… as its last cells instead.
+    /// Import… and Browse all themes… as its last cells instead.
     /// Presentation-derived, like [`Self::room`].
     trailing: Cell<usize>,
     /// The Follow-system side this theme picker edits: choosing a row writes
@@ -783,7 +892,7 @@ impl ChoicePicker {
             .into_iter()
             .map(|value| ChoiceOption::plain(option_label(&value), Some(value)))
             .collect::<Vec<_>>();
-        // The default is ONE row. Where it is one of the options, that option
+        // The default is one row. Where it is one of the options, that option
         // says so and choosing it removes the key; only a default the list
         // does not offer gets a row of its own, and only when there is an
         // override for it to remove.
@@ -1666,7 +1775,10 @@ pub(crate) struct CarriedFieldDrafts {
 /// Undo for the last change aterm.toml took, and the words around it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UndoOffer {
-    pub(crate) token: u64,
+    /// What it takes back: the change by the token it landed with, or the
+    /// page's newest write while it is still on its way
+    /// ([`SettingsViewState::next_undo`]).
+    pub(crate) target: UndoTarget,
     /// The status the change put up: "Color theme set to Nord".
     pub(crate) status: String,
     /// What Undo says once it has put the old values back: "Restored Color
@@ -1682,6 +1794,11 @@ pub(crate) struct UndoOffer {
     /// away, since the status no longer says what the file holds.
     pub(crate) keys: Vec<String>,
     pub(crate) revision: u64,
+    /// The values the offer puts back, key by key, and the ones the change
+    /// it takes away wrote: the page shows the first while the Undo is on
+    /// its way, and the offer after it puts the second back.
+    pub(crate) restores: Vec<(String, Option<String>)>,
+    pub(crate) reapplies: Vec<(String, Option<String>)>,
 }
 
 impl UndoOffer {
@@ -1689,13 +1806,15 @@ impl UndoOffer {
     #[cfg(test)]
     pub(crate) fn showing(token: u64, status: &str) -> Self {
         Self {
-            token,
+            target: UndoTarget::Token(token),
             status: status.to_string(),
             undone: "Restored".to_string(),
             redone: "Restored".to_string(),
             redo: false,
             keys: Vec::new(),
             revision: 0,
+            restores: Vec::new(),
+            reapplies: Vec::new(),
         }
     }
 }
@@ -1716,30 +1835,34 @@ pub(crate) struct SettingsViewState {
     pub(crate) route: SettingsRoute,
     pub(crate) search: String,
     pub(crate) legacy: SettingsState,
-    /// `key -> index into legacy.fields`, rebuilt in lockstep with that vector by
-    /// [`Self::set_fields`] (its only two writers). `editable_fields` is ~170 rows
-    /// and a single Settings frame resolves values by key dozens of times per row
-    /// (the preview spec alone makes ~50 lookups), so the `iter().find()` this
-    /// replaces was thousands of `&str` compares per view build. First-wins
-    /// (`entry().or_insert`) so a lookup returns exactly what `Iterator::find`
-    /// would if a duplicate key ever appeared.
+    /// `key -> index into legacy.fields`, rebuilt with that vector by the
+    /// constructor and [`Self::set_fields`]. A frame looks values up by key dozens
+    /// of times per row over ~170 rows, so a linear find costs thousands of
+    /// compares per build. First-wins (`entry().or_insert`), as `Iterator::find`
+    /// would be on a duplicate key.
     field_index: aterm_hash::FxHashMap<&'static str, usize>,
-    /// Values that are literally present in `aterm.toml`, normalized through
-    /// the same parser used by the process-wide transaction service.  This is
-    /// intentionally separate from `EditField::seed`: Boolean seeds carry the
-    /// effective default so a switch can paint truthfully even when its key is
+    /// Values literally present in `aterm.toml`, normalized by the transaction
+    /// service's parser. Separate from `EditField::seed`, whose Boolean seeds
+    /// carry the effective default so a switch paints truthfully when its key is
     /// absent.
     raw_values: BTreeMap<String, String>,
-    /// What the harness's `[disk]` reader does not read as written in the same
-    /// text, from the same snapshot as `raw_values`
+    /// What the agent harness's `[disk]` reader does not read as written, from the
+    /// same snapshot as `raw_values`
     /// ([`crate::native_config_service::ConfigSnapshot::disk_faults`]). A key it
-    /// names, or one that holds such a key, is told in the reader's words, not
-    /// as an unknown or compatibility-only key: a removal knob there turns every
-    /// removal off (a misplaced `warn_free_gib` changes nothing, and its note
-    /// says so).
+    /// names, or one holding such a key, is described in the reader's words, not
+    /// as unknown or compatibility-only: a removal knob there turns every removal
+    /// off (a misplaced `warn_free_gib` changes nothing, and its note says so).
     disk_faults: crate::native_config_service::DiskFaults,
     pub(crate) about: AboutState,
     pending: BTreeMap<OperationId, PendingAction>,
+    /// What the keys the page's writes on their way cover held before them
+    /// ([`Self::lay_over`]): a key is here exactly while a request in
+    /// `pending` writes it, and goes back to this where every one failed.
+    underlay: BTreeMap<String, Underlay>,
+    /// The page's writes that failed while a later one composed over them was
+    /// still on its way: that later one fails for the same reason, and the
+    /// status keeps the first one's words.
+    failed_writes: BTreeSet<OperationId>,
     /// An atomic replacement may have happened even when its writer could not
     /// prove final publication. Keep the user's exact attempted patch while
     /// blocking blind follow-up writes until a fresh ConfigChanged snapshot
@@ -1755,6 +1878,15 @@ pub(crate) struct SettingsViewState {
     /// The last change's Undo, offered only while the status it put up is
     /// still the one showing ([`SettingsViewState::undo_offer`]).
     pub(crate) last_undo: Option<UndoOffer>,
+    /// The Undo of the page's newest write (or Undo) while it is on its way:
+    /// its target is what that request lands with
+    /// ([`UndoTarget::Landing`]), and it is offered in the last change's
+    /// place beside the status the press put up
+    /// (`next_undo_seated`, [`SettingsViewState::seat_next_undo`]), so
+    /// Undo, Cmd-Z and a second press on Undo (its Redo) are taken while
+    /// the change saves.
+    next_undo: Option<UndoOffer>,
+    next_undo_seated: bool,
     pub(crate) page_scroll: usize,
     /// Settings ▸ Harness's SETTINGS IN ATERM.TOML card lists every
     /// `[harness]` key (its disclosure open) or only the person's own.
@@ -1862,6 +1994,10 @@ pub(crate) struct SettingsViewState {
     /// invocation only discloses its complete aterm.toml scope; the explicit
     /// confirmation action is the sole path that emits a clearing patch.
     reset_all_confirmation: bool,
+    /// The page's list as the Reset All question found it, in a compact
+    /// window, where the question may take the list's place and scrolls on
+    /// its own ([`SettingsViewState::open_question_scroll`]).
+    question_scroll: Option<(scroll::ScrollContext, usize)>,
     /// Discarding retained text drafts is independently destructive and must
     /// never inherit Reset All's confirmation edge.
     draft_discard_confirmation: bool,
@@ -1887,11 +2023,11 @@ pub(crate) struct SettingsViewState {
     /// previews never independently resolve a path or observe assets from two
     /// different revisions.
     assets: Arc<crate::app_config::ConfigAssetCatalog>,
-    /// Typed shared-setting consumers from the exact inline + Toy Pack table
-    /// admitted for this snapshot. `None` explicitly means the worker has not
-    /// published that table yet; it is never an invitation to infer authority
-    /// from authored paths. Empty-word, graphic-only, shadowed, and zero-chance
-    /// recipes must not make unrelated tuning rows look effective.
+    /// Typed shared-setting consumers from the inline + Toy Pack table admitted
+    /// for this snapshot. `None` means the worker has not published that table
+    /// yet; authority is never inferred from authored paths. Empty-word,
+    /// graphic-only, shadowed and zero-chance recipes must not make unrelated
+    /// tuning rows look effective.
     sparkle_spec_consumers: Option<aterm_effects::spec::SpecConsumerCapabilities>,
     /// Launch-time environment/CLI values that outrank aterm.toml. Captured
     /// once into immutable view state so semantic compilation never polls the
@@ -1899,12 +2035,11 @@ pub(crate) struct SettingsViewState {
     /// value.
     environment_overrides: BTreeMap<String, crate::app_config::ActiveEnvironmentOverride>,
     /// The macOS file-access posture the host published (design §3.4). `None`
-    /// means nothing has been observed — a headless instance, a unit test and
-    /// every non-macOS build stay here, and the Security page then carries no
-    /// macOS access block at all rather than an invented one.
+    /// means nothing was observed (headless, unit tests, non-macOS), and the
+    /// Security page then shows no macOS access block.
     macos_access: Option<MacosAccess>,
-    /// The injected arms for this block's two OS gestures. Inert by default,
-    /// so a view nobody armed cannot reach `NSWorkspace` or spawn `tccutil`.
+    /// The injected arms for this block's OS gestures ([`ConsentGestures`]). Inert by
+    /// default, so a view nobody armed cannot reach the OS.
     consent_gestures: ConsentGestures,
     /// aterm.toml's path as the host resolved it, home written `~` for the
     /// page; `None` until the host publishes it.
@@ -1935,14 +2070,11 @@ pub(crate) struct SettingsViewState {
     /// The copies an owner press of *Move to Trash* asked for, not yet handed
     /// to `App::begin_claimant_retire` (drained like the warm-up request).
     claimant_retire_request: Option<Vec<std::path::PathBuf>>,
-    /// The debugger-access change (*Allow debugger access…* / *Turn off…*,
-    /// `docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.4 step 2) the owner
-    /// confirmed in aterm's alert and the host has not taken up yet. The flow,
-    /// its worker and its markers are `App`-owned (`debugger_access`), so the
-    /// press is recorded here and drained by
-    /// `App::sync_settings_consent_posture` like the warm-up. One slot: a
-    /// press carries its direction, and a second press while one waits
-    /// replaces nothing the host has not refused already.
+    /// The debugger-access change (*Allow debugger access…* / *Turn off…*) the owner
+    /// confirmed and the host has not taken up yet
+    /// (`docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.4). The flow is
+    /// `App`-owned, so the press is recorded here and drained by
+    /// `App::sync_settings_consent_posture`. One slot; a press carries its direction.
     debugger_change_request: Option<(aterm_containment::consent::DebuggerChange, OwnerAnswer)>,
     /// A pending `sudo` off-switch press, `Some(off)` carrying its direction,
     /// for the park to persist (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.1).
@@ -1965,29 +2097,22 @@ pub(crate) struct SettingsViewState {
     /// line. It goes once that value changes, however it changed — a hand
     /// edit, a control verb, a Reset — so the line never outlives its value.
     value_line: Option<(&'static str, Option<String>, String)>,
-    /// The owner's recent declines of this block's alerts — one record for the
-    /// whole process, which the host arms into every view
-    /// ([`SettingsViewState::arm_owner_quiet`]); see
-    /// [`SettingsViewState::owner_confirms`].
+    /// The owner's recent declines of this block's alerts: one process-wide record
+    /// the host arms into every view ([`Self::arm_owner_quiet`]); see
+    /// [`Self::owner_confirms`].
     owner_quiet: SharedOwnerQuiet,
-    /// Settings ▸ Messages: which chip is down (design §4.2). View-local;
-    /// `navigate` clears it.
+    /// Settings ▸ Messages: which chip is down. View-local; `navigate` clears it.
     pub(crate) messages_filter: MessagesFilter,
     /// Settings ▸ Messages: the entry expanded in place, by raw id.
     pub(crate) messages_selected: Option<u64>,
-    /// The compact page's tag pop-up is open (design ruling 262).
+    /// The compact page's tag pop-up is open.
     pub(crate) messages_tag_menu: bool,
-    /// The stop the last Messages render drew at the top of its list (the
-    /// log is one scrolling list, design ruling 264) — the
-    /// `result_page_limit` discipline: layout-derived reducer state through
-    /// interior mutability, never a change to the rendered projection. The
-    /// reducer adopts it where a landing was left to the render
-    /// ([`Self::messages_reveal`]).
+    /// The stop the last Messages render drew at the top of its one scrolling
+    /// list: layout-derived reducer state, like `result_page_limit`. The reducer
+    /// adopts it where a landing was left to the render ([`Self::messages_reveal`]).
     messages_drawn: Cell<Option<usize>>,
-    /// The width class and viewport the last Messages render laid out in, so
-    /// the reducer measures the list exactly as the renderer seats it — for
-    /// the filter and the open entry it just set ([`messages_plan`], rulings
-    /// 263 and 264).
+    /// The width class and viewport the last Messages render laid out in, so the
+    /// reducer measures the list as the renderer seats it ([`messages_plan`]).
     messages_page_geometry: Cell<Option<(SettingsWidth, LogicalRect)>>,
     /// Whether the last Messages render drew its Tag pop-up open, and the stops
     /// its list counted before the first entry then
@@ -2017,10 +2142,10 @@ pub(crate) struct SettingsViewState {
     /// entry, or on the first one under it still listed where it left the
     /// list ([`SettingsApp::keep_messages_anchor`]).
     messages_anchor: RefCell<Option<MessagesAnchor>>,
-    /// How many list stops the last render showed at once — the page Page Up
-    /// and Page Down move by (design ruling 267). `None` where the render
-    /// seated no list; the key then keeps its old eight. Reset at every
-    /// render, so a page that shows none never inherits another's.
+    /// How many list stops the last render showed at once: what Page Up/Down
+    /// move by. `None` where the render seated no list (the key then moves
+    /// eight). Reset every render, so a page that shows none never inherits
+    /// another's.
     page_window: Cell<Option<usize>>,
     /// How far the sidebar's list is scrolled, in points. The rail keeps a
     /// fixed rhythm and scrolls where its rows outgrow the window; the wheel
@@ -2044,10 +2169,32 @@ pub(crate) struct SettingsViewState {
     /// list is scrolled past its first screen keeps the chrome it has while
     /// both stay ([`page`]).
     page_chrome_at: Cell<Option<(LogicalRect, f32)>>,
+    /// The chrome [`page`] last chose and what it chose it from
+    /// ([`ChromeInputs`]): a render from the same inputs — a preview's
+    /// animation frame, a repaint — reuses it instead of seating the page
+    /// under each rung of the ladder again.
+    page_chrome_memo: RefCell<Option<(ChromeInputs, PageChrome)>>,
+    /// Where a field page last placed its summary and its live preview, and
+    /// where ([`PinnedPlace`]): what it keeps until its list scrolls.
+    pinned_place: Cell<Option<PinnedPlace>>,
     /// Whether the render is measuring the page as it seats with no status
     /// bar up ([`page`]): the bars read as taking nothing while it does, so
     /// the chrome a page keeps is the same with a bar and without.
     measuring_calm: Cell<bool>,
+    /// What the plain status bar up takes beyond the room the page keeps
+    /// for one, while [`page`] builds it ([`plain_status_extra`]): the page
+    /// is laid out as with the room it kept, and its list's screens give
+    /// this up from their bottom ([`scroll::list_page_peeking`]).
+    status_extra: Cell<f32>,
+    /// The most a plain status's bar may be tall this render, where taller
+    /// it would leave the list less room than the control the person is on
+    /// needs whole ([`page`], [`plain_bar_layout`]): its words end where
+    /// that bar ends.
+    status_bar_most: Cell<Option<f32>>,
+    /// How much more a plain status's bar took from the list, as the page
+    /// was last seated, than leaves the control the person is on whole in
+    /// its room ([`SettingsViewState::note_status_room`]).
+    status_overrun: Cell<f32>,
     /// A control every render keeps in view until the list is scrolled: the
     /// one the keyboard just reached, or the row a change was just made on
     /// (a status bar the change brings up must not scroll it away).
@@ -2126,17 +2273,13 @@ pub(crate) struct SettingsViewState {
 }
 
 /// `config.prepare_sparkle_runtime().consumer_capabilities()` for
-/// [`SettingsViewState::new`], prepared once per distinct config in a test
-/// process.
+/// [`SettingsViewState::new`], memoized per distinct config in a test process.
 ///
-/// A config that names no lexicon and no Toy Pack makes the preparation read no
-/// file and no environment variable: the answer is a function of the config
-/// alone, and an equal config gets the answer it got before. Preparing it
-/// compiles the builtin word lexicon and the kitty-command vocabulary from
-/// their TOML, unoptimized in a test build — measured 2026-09-30 by `sample`
-/// across the `-p aterm-gui --lib` run at `RUST_TEST_THREADS=7`, 8.5% of the
-/// binary's CPU samples were this preparation under this constructor. A config
-/// that names either file is prepared every time, as before.
+/// A config that names no lexicon and no Toy Pack reads no file or environment
+/// variable, so its answer is a function of the config. Preparing it compiles the
+/// builtin word lexicon and kitty-command vocabulary from TOML, unoptimized in a
+/// test build (8.5% of the `aterm-gui --lib` test run's CPU). A config that names
+/// either file is prepared every time.
 #[cfg(test)]
 fn sparkle_consumers_for_test(config: &Config) -> aterm_effects::spec::SpecConsumerCapabilities {
     static PREPARED: std::sync::Mutex<
@@ -2166,8 +2309,8 @@ fn sparkle_consumers_for_test(config: &Config) -> aterm_effects::spec::SpecConsu
 }
 
 impl SettingsViewState {
-    /// Compatibility/test constructor. It is deliberately manifest-IO-free;
-    /// production uses `from_snapshot`, which carries the canonical catalog.
+    /// Test constructor, free of manifest IO; production uses `from_snapshot`,
+    /// which carries the canonical catalog.
     #[cfg(test)]
     pub(crate) fn new(config: &Config) -> Self {
         let mut assets = (*crate::app_config::ConfigAssetCatalog::empty()).clone();
@@ -2218,12 +2361,16 @@ impl SettingsViewState {
             disk_faults: Arc::default(),
             about: AboutState::new(),
             pending: BTreeMap::new(),
+            underlay: BTreeMap::new(),
+            failed_writes: BTreeSet::new(),
             config_reconciliation_required: false,
             unverified_patch: None,
             feedback: None,
             config_watch_status: None,
             session_runtime: None,
             last_undo: None,
+            next_undo: None,
+            next_undo_seated: false,
             page_scroll: 0,
             harness_config_open: false,
             harness_timer_open: None,
@@ -2252,6 +2399,7 @@ impl SettingsViewState {
             theme_preview_side: None,
             theme_follow_kept: None,
             reset_all_confirmation: false,
+            question_scroll: None,
             draft_discard_confirmation: false,
             preview_paused: false,
             preview_subject: Cell::new(None),
@@ -2293,7 +2441,12 @@ impl SettingsViewState {
             scroll_record: RefCell::new(None),
             page_chrome: Cell::new(PageChrome::FULL),
             page_chrome_at: Cell::new(None),
+            page_chrome_memo: RefCell::new(None),
+            pinned_place: Cell::new(None),
             measuring_calm: Cell::new(false),
+            status_extra: Cell::new(0.0),
+            status_bar_most: Cell::new(None),
+            status_overrun: Cell::new(0.0),
             page_reveal: None,
             list_carried: None,
             reveal_as: scroll::Reveal::Keep,
@@ -2355,9 +2508,8 @@ impl SettingsViewState {
         Some((value, label))
     }
 
-    /// Construct from the transaction service's canonical snapshot.  Production
-    /// callers use this path so raw presence, OCC expectations, and displayed
-    /// effective values all start from one durable source of truth.
+    /// Construct from the transaction service's canonical snapshot, so raw
+    /// presence, OCC expectations and displayed effective values share one source.
     pub(crate) fn from_snapshot(
         snapshot: &crate::native_config_service::ConfigSnapshot,
     ) -> Result<Self, String> {
@@ -2375,8 +2527,36 @@ impl SettingsViewState {
         snapshot: &crate::native_config_service::ConfigSnapshot,
     ) -> Result<(), String> {
         let config = Arc::clone(&snapshot.config);
-        let fields = self.theme_seeded_fields(&config, &snapshot.assets.themes);
-        let raw_values = snapshot.values()?;
+        let mut fields = self.theme_seeded_fields(&config, &snapshot.assets.themes);
+        let mut raw_values = snapshot.values()?;
+        // The page's own writes on their way: this snapshot may be one of
+        // them landing. What it holds is what a key they write goes back to
+        // should they fail ([`Underlay`]), and they stay laid over it,
+        // oldest first, so a control shows the value the person chose until
+        // its write reports.
+        let own_writes = self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, PendingAction::Config(_) | PendingAction::Undo(_)));
+        let written: Vec<(String, Option<String>)> = self
+            .pending
+            .values()
+            .flat_map(PendingAction::shown_edits)
+            .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
+            .collect();
+        {
+            let index = build_field_index(&fields);
+            for (key, under) in &mut self.underlay {
+                *under = Underlay {
+                    raw: raw_values.get(key).cloned(),
+                    seed: index.get(key.as_str()).map(|&at| fields[at].seed.clone()),
+                };
+            }
+            for (key, value) in &written {
+                let at = index.get(key.as_str()).copied();
+                show_config_value(&mut fields, &mut raw_values, at, key, value.as_deref());
+            }
+        }
         let highlighted = self.showcase_highlight_before_change();
         let active_edit = self.editing_field.clone();
         let mut retained_inputs = BTreeMap::new();
@@ -2388,7 +2568,7 @@ impl SettingsViewState {
             else {
                 continue;
             };
-            // Still the OUTGOING generation here — `set_fields` runs below, so the
+            // Still the outgoing generation here (`set_fields` runs below), so the
             // index this resolves through still describes `legacy.fields`.
             let previous_seed = self
                 .field_by_key(key)
@@ -2442,8 +2622,25 @@ impl SettingsViewState {
                 )
             });
         }
-        self.choice_picker = None;
-        self.reset_all_confirmation = false;
+        // A change from outside Settings closes what was opened over the old
+        // values: a picker, Reset All's question. The page's own write
+        // landing keeps what the person opened since, as long as it still
+        // says what is true: a picker not for a key the write was to, over
+        // the same themes; the question, saying what Reset All resets now.
+        let picker_stands = own_writes
+            && !themes_changed
+            && self
+                .choice_picker
+                .as_ref()
+                .is_some_and(|picker| !written.iter().any(|(key, _)| *key == picker.key));
+        if !picker_stands {
+            self.choice_picker = None;
+        }
+        if own_writes && self.reset_all_confirmation {
+            self.feedback = Some(reset_all_scope(self));
+        } else {
+            self.reset_all_confirmation = false;
+        }
         self.draft_discard_confirmation = false;
         self.config_reconciliation_required = false;
         self.unverified_patch = None;
@@ -2465,23 +2662,21 @@ impl SettingsViewState {
         Ok(())
     }
 
-    /// The ONLY writer of `legacy.fields` on this view, so the key index cannot
-    /// drift from the vector it indexes. (The other mutations of that vector —
-    /// `seed` rewrites — never touch a key, so the index survives them.)
+    /// The only writer of `legacy.fields` after construction, so the key index
+    /// cannot drift from it (`seed` rewrites never touch a key).
     fn set_fields(&mut self, fields: Vec<EditField>) {
         self.field_index = build_field_index(&fields);
         self.legacy.fields = fields;
     }
 
-    /// O(1) replacement for `legacy.fields.iter().find(|f| f.key == key)`; see
-    /// [`Self::field_index`]. Byte-identical to `find` including the duplicate-key
-    /// case (the index is first-wins).
+    /// O(1) `legacy.fields.iter().find(|f| f.key == key)` via [`Self::field_index`],
+    /// duplicate keys included (the index is first-wins).
     fn field_by_key(&self, key: &str) -> Option<&EditField> {
         self.field_index_of(key)
             .and_then(|index| self.legacy.fields.get(index))
     }
 
-    /// The row POSITION for `key`. The reducers want this rather than
+    /// The row position for `key`. The reducers want this rather than
     /// [`Self::field_by_key`]: a `usize` ends the borrow of `self` at the call,
     /// so the resolved row can be read out of `legacy.fields` while other view
     /// fields are being mutated.
@@ -2558,10 +2753,9 @@ impl SettingsViewState {
         }
     }
 
-    /// Adopt the stop the last Messages render drew where it landed a deep
-    /// link itself ([`Self::messages_reveal`], ruling 264), so the list moves
-    /// on from what the reader saw. A no-op on every other page, and before
-    /// that render.
+    /// Adopt the stop the last Messages render drew where it landed a deep link
+    /// itself ([`Self::messages_reveal`]), so the list moves on from what the
+    /// reader saw. A no-op elsewhere, and before that render.
     fn settle_messages_scroll(&mut self) {
         if !self.messages_reveal {
             return;
@@ -2892,13 +3086,11 @@ impl SettingsViewState {
     }
 
     pub(crate) fn replace_macos_access(&mut self, mut access: MacosAccess) -> bool {
-        // The last *Ask again* report belongs to this view: the reducer ran it
-        // and the host never has one to publish, so a republish keeps it while
-        // it is still news — with the privacy checks on, no warm-up under way,
-        // and the warm-up's answers unchanged since (a pass whose answers
-        // differ has answered it) — and never after the view leaves the page
-        // (`navigate`).
-        // Its advice is worded at render time for the warm-up switch as it is.
+        // The last *Ask again* report belongs to this view (the reducer ran it; the
+        // host has none to publish), so a republish keeps it while it is news:
+        // privacy checks on, no warm-up under way, the warm-up's answers unchanged.
+        // `navigate` drops it when the view leaves the page. Its advice is worded
+        // at render time.
         if access.reset.is_none()
             && access.enabled
             && !access.warmup_live
@@ -2909,10 +3101,10 @@ impl SettingsViewState {
         {
             access.reset = self.macos_access.as_ref().and_then(|a| a.reset.clone());
         }
-        // A line one of this block's buttons wrote may give advice that no
-        // longer holds — if it is still the line on the bar: any of them goes
-        // when the switches under it change, and the *Ask again* line when the
-        // report it came with is dropped.
+        // A line this block's buttons wrote goes, while it is still on the bar,
+        // once its advice no longer holds: a button's line when the switches
+        // change, the *Ask again* line when its report is dropped, the warm-up and
+        // Trash lines once that work has settled.
         let old = self.macos_access.as_ref();
         let switched = old.is_some_and(|old| {
             (old.enabled, old.warmup_offered) != (access.enabled, access.warmup_offered)
@@ -2946,9 +3138,13 @@ impl SettingsViewState {
     }
 
     /// Install the live gesture arms. Only a windowed host calls this; a view
-    /// that is never armed keeps the arms that cannot reach the OS.
-    pub(crate) fn arm_consent_gestures(&mut self, gestures: ConsentGestures) {
+    /// that is never armed keeps the arms that cannot reach the OS. Whether
+    /// the arms changed kind (the live ones for the inert), which the page
+    /// draws from: the host's pass before every wait arms them each time.
+    pub(crate) fn arm_consent_gestures(&mut self, gestures: ConsentGestures) -> bool {
+        let changed = self.consent_gestures.live != gestures.live;
         self.consent_gestures = gestures;
+        changed
     }
 
     /// Publish where aterm.toml lives and how the Manual page may show it.
@@ -2977,8 +3173,7 @@ impl SettingsViewState {
         self.macos_access.as_ref()
     }
 
-    /// Take the outstanding *Ask for folder access now* press, if there is one.
-    /// Draining is the host's job, and it is the only caller.
+    /// Take the outstanding *Ask for folder access now* press (the host drains it).
     pub(crate) fn take_consent_warmup_request(&mut self) -> bool {
         std::mem::take(&mut self.consent_warmup_requests) > 0
     }
@@ -3002,12 +3197,12 @@ impl SettingsViewState {
 
     /// What the host's hand-over did for this view's *Open Developer Tools…*
     /// press, on the bar in place of its *Opening…* line, and whether the page
-    /// must be drawn again. `openURL:` reports that System Settings TOOK the
+    /// must be drawn again. `openURL:` reports that System Settings took the
     /// URL, never that it scrolled to the row, so the route in words goes out
     /// on every outcome. `unlisted`: why `spctl developer-mode enable-terminal`
     /// failed when the hand-over ran it first, said beside an opening (macOS may
     /// show no list there), as `aterm doctor`'s did-line says it. Only on the
-    /// Security page it was pressed on — a view that has left it gets no line on
+    /// Security page it was pressed on: a view that has left it gets no line on
     /// another page.
     pub(crate) fn note_devtools_hand_over(
         &mut self,
@@ -3127,13 +3322,11 @@ impl SettingsViewState {
         self.warmup_feedback = self.feedback.clone();
     }
 
-    /// The host could not start the warm-up this view's owner confirmed: say
-    /// why on the bar, in place of the *Asking macOS…* line, and whether the
-    /// page must be drawn again. Only on the Security page it was confirmed
-    /// from — a view that has left it gets no line on another page. The line
-    /// is not under way, and it is not one the switches under it withdraw: a
-    /// refusal because a switch went off explains that switch, so it stays
-    /// until the view leaves the page or another line replaces it.
+    /// The host could not start the warm-up this view's owner confirmed: put why on
+    /// the bar in place of the *Asking macOS…* line, and return whether to redraw.
+    /// Only on the Security page. A switch change does not withdraw the line (a
+    /// refusal because a switch went off explains that switch); it stays until the
+    /// view leaves the page or another line replaces it.
     pub(crate) fn note_warmup_refused(&mut self, why: &str) -> bool {
         if self.route != SettingsRoute::Security {
             return false;
@@ -3147,8 +3340,12 @@ impl SettingsViewState {
 
     /// Share the process's record of the owner's declines with this view, so a
     /// view opened after a decline is as quiet as the one it was declined in.
-    pub(crate) fn arm_owner_quiet(&mut self, quiet: SharedOwnerQuiet) {
+    /// Whether it was another record than the view held: the host's pass
+    /// before every wait shares it each time.
+    pub(crate) fn arm_owner_quiet(&mut self, quiet: SharedOwnerQuiet) -> bool {
+        let changed = !std::sync::Arc::ptr_eq(&self.owner_quiet, &quiet);
         self.owner_quiet = quiet;
+        changed
     }
 
     /// Ask the owner before a gesture that changes this Mac. A control client can
@@ -3188,13 +3385,39 @@ impl SettingsViewState {
         self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
     }
 
-    /// The Undo on offer: the last change's, while the status that names it
-    /// is still the one showing and nothing else is being saved. Another
-    /// message, a new page or a pending save hides it, Cmd-Z included.
+    /// The Undo on offer, while the status that names it is still the one
+    /// showing: the newest change's while the page's writes are on their way
+    /// (its Undo then follows it in the lane, [`UndoTarget::Landing`]), the
+    /// last change's once nothing is. Another message or a new page hides it,
+    /// Cmd-Z included; so does a save whose landing is not confirmed.
     fn undo_offer(&self) -> Option<&UndoOffer> {
-        self.last_undo.as_ref().filter(|offer| {
-            !self.config_patch_pending() && self.feedback.as_deref() == Some(offer.status.as_str())
+        let offer = if self.own_writes_in_flight() {
+            self.next_undo.as_ref()
+        } else {
+            self.last_undo.as_ref()
+        };
+        offer.filter(|offer| {
+            !self.config_reconciliation_required
+                && self.feedback.as_deref() == Some(offer.status.as_str())
         })
+    }
+
+    /// Whether a write or an Undo of the page's is on its way to aterm.toml.
+    fn own_writes_in_flight(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, PendingAction::Config(_) | PendingAction::Undo(_)))
+    }
+
+    /// The Undo of a write just sent stands beside the status its press put
+    /// up, which is set once the press is reduced ([`Self::next_undo`]).
+    fn seat_next_undo(&mut self) {
+        if !self.next_undo_seated
+            && let Some(offer) = self.next_undo.as_mut()
+        {
+            offer.status = self.feedback.clone().unwrap_or_default();
+            self.next_undo_seated = true;
+        }
     }
 
     fn clear_field_edit(&mut self) {
@@ -3279,7 +3502,12 @@ impl SettingsViewState {
     }
 
     /// Book a config request with the exact matching drafts it owns now.
-    fn pend_config(&mut self, operation: OperationId, patch: ConfigPatch) {
+    fn pend_config(
+        &mut self,
+        operation: OperationId,
+        patch: ConfigPatch,
+        follows: Vec<OperationId>,
+    ) {
         let submitted = patch
             .edits
             .iter()
@@ -3293,19 +3521,153 @@ impl SettingsViewState {
             .collect();
         self.pending.insert(
             operation,
-            PendingAction::Config(PendingConfig { patch, submitted }),
+            PendingAction::Config(PendingConfig {
+                patch,
+                submitted,
+                follows,
+                kind: WriteKind::Change,
+            }),
         );
     }
 
-    fn config_key_pending(&self, key: &str) -> bool {
-        self.config_reconciliation_required
-            || self.pending.values().any(|pending| {
-                matches!(
-                    pending,
-                    PendingAction::Config(request)
-                        if request.patch.edits.iter().any(|edit| edit.key == key)
-                )
+    /// Say what the booked write `operation` is ([`WriteKind`]): what its
+    /// landing says it did.
+    fn name_write(&mut self, operation: OperationId, kind: WriteKind) {
+        if let Some(PendingAction::Config(request)) = self.pending.get_mut(&operation) {
+            request.kind = kind;
+        }
+    }
+
+    /// The page's requests on their way that write any of `keys`.
+    fn in_flight_writes_to(&self, keys: &BTreeSet<&str>) -> Vec<OperationId> {
+        self.pending
+            .iter()
+            .filter(|(_, pending)| {
+                pending
+                    .shown_edits()
+                    .iter()
+                    .any(|(key, _)| keys.contains(key))
             })
+            .map(|(operation, _)| *operation)
+            .collect()
+    }
+
+    /// SHOW A WRITE THE MOMENT IT IS MADE: lay `edits` (a request just booked
+    /// in `pending`) over what the keys show, keeping what each held before
+    /// the page's first write to it on its way ([`Underlay`]), so the next
+    /// press reads, and composes over, the value the person chose.
+    fn lay_over(&mut self, edits: &[(String, Option<String>)]) {
+        let highlighted = self.showcase_highlight_before_change();
+        for (key, value) in edits {
+            if !self.underlay.contains_key(key) {
+                let under = Underlay {
+                    raw: self.raw_value(key),
+                    seed: self.field_by_key(key).map(|field| field.seed.clone()),
+                };
+                self.underlay.insert(key.clone(), under);
+            }
+            let index = self.field_index_of(key);
+            show_config_value(
+                &mut self.legacy.fields,
+                &mut self.raw_values,
+                index,
+                key,
+                value.as_deref(),
+            );
+        }
+        // A segment just chosen carries the setting's own key now, and a
+        // theme just put in use is the one Themes highlights: the keyboard
+        // goes with each.
+        self.reseat_segment_focus();
+        self.follow_showcase_change(highlighted);
+    }
+
+    /// A request left `pending` (`finished`, its values): its keys show
+    /// again what aterm.toml holds — the values it wrote where it `landed`
+    /// before the snapshot that holds them came in — with the page's writes
+    /// still on their way laid over them, oldest first. A failed write's
+    /// keys go back to the file's values this way.
+    fn relay_in_flight(&mut self, finished: &[(String, Option<String>)], landed: bool) {
+        let highlighted = self.showcase_highlight_before_change();
+        let keys: BTreeSet<&str> = finished.iter().map(|(key, _)| key.as_str()).collect();
+        for key in &keys {
+            let Some(under) = self.underlay.get(*key).cloned() else {
+                continue;
+            };
+            if let Some(raw) = under.raw {
+                self.raw_values.insert((*key).to_string(), raw);
+            } else {
+                self.raw_values.remove(*key);
+            }
+            if let (Some(seed), Some(index)) = (under.seed, self.field_index_of(key)) {
+                self.legacy.fields[index].seed = seed;
+            }
+        }
+        if landed {
+            for (key, value) in finished {
+                let index = self.field_index_of(key);
+                show_config_value(
+                    &mut self.legacy.fields,
+                    &mut self.raw_values,
+                    index,
+                    key,
+                    value.as_deref(),
+                );
+                if let Some(under) = self.underlay.get_mut(key) {
+                    *under = Underlay {
+                        raw: self.raw_values.get(key).cloned(),
+                        seed: index.map(|index| self.legacy.fields[index].seed.clone()),
+                    };
+                }
+            }
+        }
+        let still: Vec<(String, Option<String>)> = self
+            .pending
+            .values()
+            .flat_map(PendingAction::shown_edits)
+            .filter(|(key, _)| keys.contains(key))
+            .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
+            .collect();
+        for (key, value) in &still {
+            let index = self.field_index_of(key);
+            show_config_value(
+                &mut self.legacy.fields,
+                &mut self.raw_values,
+                index,
+                key,
+                value.as_deref(),
+            );
+        }
+        let written: BTreeSet<String> = self
+            .pending
+            .values()
+            .flat_map(PendingAction::shown_edits)
+            .map(|(key, _)| key.to_string())
+            .collect();
+        self.underlay.retain(|key, _| written.contains(key));
+        self.reseat_segment_focus();
+        self.follow_showcase_change(highlighted);
+        if !self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, PendingAction::Config(_) | PendingAction::Undo(_)))
+        {
+            self.failed_writes.clear();
+        }
+        self.invalidate_result_page_limit();
+        self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
+    }
+
+    /// Whether a write of the page's to `key` is on its way to aterm.toml.
+    /// Nothing waits on it: the key already shows what that write puts there
+    /// ([`Self::lay_over`]).
+    fn writes_in_flight(&self, key: &str) -> bool {
+        self.pending.values().any(|pending| {
+            pending
+                .shown_edits()
+                .iter()
+                .any(|(written, _)| *written == key)
+        })
     }
 
     fn config_patch_pending(&self) -> bool {
@@ -3316,10 +3678,9 @@ impl SettingsViewState {
                 .any(|pending| matches!(pending, PendingAction::Config(_)))
     }
 
-    /// Walks the SPARSE draft map, not the ~170-row field vector: a draft can only
-    /// exist where `field_inputs` has an entry (a control that was focused or
-    /// edited), which is normally empty. The dense form asked all ~170 rows and a
-    /// single view build asks this predicate ~8 times.
+    /// Walks the sparse draft map, not the ~170-row field vector: a draft exists
+    /// only where `field_inputs` has an entry, normally none, and a view build
+    /// asks this ~8 times.
     fn has_unsaved_field_drafts(&self) -> bool {
         self.field_inputs
             .keys()
@@ -3327,8 +3688,7 @@ impl SettingsViewState {
     }
 
     fn field_has_unsaved_draft(&self, key: &str) -> bool {
-        // Map lookup FIRST: no draft entry means no draft, whatever the field says,
-        // so the common case never resolves the field at all.
+        // No draft entry means no draft, so the common case never resolves the field.
         let Some(input) = self.field_inputs.get(key) else {
             return false;
         };
@@ -3338,9 +3698,8 @@ impl SettingsViewState {
         input.value() != field.seed.as_deref().unwrap_or_default() || input.preedit().is_some()
     }
 
-    /// Counts drafted KEYS, which is the same number as the drafted FIELDS the
-    /// dense sweep used to count — field keys are unique
-    /// (`editable_field_keys_are_unique_and_lowercase` pins that).
+    /// Counts drafted keys, one per field: keys are unique
+    /// (`editable_field_keys_are_unique_and_lowercase`).
     fn unsaved_field_draft_count(&self) -> usize {
         self.field_inputs
             .keys()
@@ -3349,15 +3708,12 @@ impl SettingsViewState {
     }
 
     /// This view's unsaved field drafts as a seamless update would carry them
-    /// (`App::capture_handoff_layout`, `App::native_update_close_preflight`):
-    /// every draft whose committed text is carriable
-    /// ([`crate::restore::settings_draft_is_carriable`]) rides, in key order;
-    /// a draft still being composed by an input method, or too long to carry,
-    /// is HELD — the update waits for it as it waited for every draft before.
-    ///
-    /// A composing draft is held rather than carried as its committed text:
-    /// the marked text is on screen and not yet the field's, and carrying the
-    /// value without it would reopen something the person never saw.
+    /// (`App::capture_handoff_layout`, `App::native_update_close_preflight`): each
+    /// draft whose committed text is carriable
+    /// ([`crate::restore::settings_draft_is_carriable`]) rides, in key order; one
+    /// too long to carry, or still being composed by an input method, is held and
+    /// the update waits for it. A composing draft is not carried as its committed
+    /// text: the marked text on screen is not yet the field's.
     pub(crate) fn carried_field_drafts(&self) -> CarriedFieldDrafts {
         let mut carried = Vec::new();
         let mut held = 0usize;
@@ -3390,21 +3746,12 @@ impl SettingsViewState {
         input.preedit().is_none() && crate::restore::settings_draft_is_carriable(key, input.value())
     }
 
-    /// Take the drafts a seamless update carried into this freshly reopened
-    /// view: each key this build still edits as text becomes a draft holding
-    /// exactly the carried text, unsaved. A key this build does not edit as
-    /// text (a row removed, or turned into a switch or a slider since) is
-    /// skipped — the host reads back which drafts landed and says which did not
+    /// Take the drafts a seamless update carried into this freshly reopened view:
+    /// each key this build still edits as text ([`field_accepts_text_input`], the
+    /// rule that opens and keeps a text draft) becomes an unsaved draft holding the
+    /// carried text. Other keys (a row removed, or now a switch or slider) are
+    /// skipped; the host reads back which landed and reports the rest
     /// (`App::reopen_carried_settings_drafts`).
-    ///
-    /// The rule is [`field_accepts_text_input`] — the one `settings/set/<key>`,
-    /// focus and pointer entry open a text draft by, and the one
-    /// `replace_snapshot` keeps a draft by. It used to be every kind but a
-    /// switch, a choice or a theme, which also took a draft for a numeric
-    /// SLIDER row: the host read it back as landed and said nothing, the row
-    /// could neither show nor edit it, and the next config snapshot discarded
-    /// it (round three review). A draft this view cannot hold as the outgoing
-    /// view held it must be said, not taken.
     fn take_carried_field_drafts(&mut self, drafts: Vec<crate::restore::SettingsDraftRestore>) {
         for draft in drafts {
             let holds_text = self
@@ -3440,13 +3787,10 @@ impl SettingsViewState {
     pub(crate) fn navigate(&mut self, route: SettingsRoute) {
         self.clear_field_edit();
         let search_cleared = self.clear_search();
-        // Route activation must leave keyboard focus on a control that survives
-        // the transition. The desktop rail remains visible, while choosing from
-        // the compact category sheet replaces that sheet with the toolbar's
-        // back/category affordance. A structural page Group is useful for naming
-        // the destination, but it is not in `CompiledUi::focus_order`; focusing it
-        // made the next Tab restart at Search instead of continuing from the
-        // route the user just chose.
+        // Route activation leaves keyboard focus on a control that survives the
+        // transition: the desktop rail stays visible, while a compact sheet choice
+        // gives way to the toolbar's back/category control. The page Group is not
+        // in `CompiledUi::focus_order`, so focusing it would restart Tab at Search.
         let from_desktop_navigation = self
             .common
             .last_focus
@@ -3492,6 +3836,7 @@ impl SettingsViewState {
         self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
         self.feedback = None;
         self.last_undo = None;
+        self.next_undo = None;
         // A refused value's reason lives exactly as long as its draft: the
         // Modified row the recovery bar leads to, and the page again, still
         // say why it was not saved.
@@ -3757,11 +4102,10 @@ impl SettingsViewState {
     /// THE LIST'S KEYS STAY THE LIST'S: whether the keyboard is on the
     /// control the list's own keys carried it to ([`Self::list_carried`])
     /// and the person has not worked that control since — no press, no
-    /// typing, no arrow across it. A slider takes Page Up/Down and Home/End,
-    /// and a colour wheel Up and Down, for itself only once the person works
-    /// it: a Page Up that took the keyboard to Text & Fonts' Weight slider
-    /// made every Page Up after it a step down the font's weight, written to
-    /// aterm.toml.
+    /// typing, no arrow across it. A colour wheel takes Up and Down for its
+    /// saturation only once the person works it: Down through Tab Color's
+    /// list turned the wheel it reached. (Page Up/Down and Home/End are the
+    /// list's on every control, a slider included.)
     fn list_keys_carried(&self) -> bool {
         self.list_carried.is_some() && self.list_carried == self.common.last_focus
     }
@@ -4089,13 +4433,11 @@ impl SettingsViewState {
             }
             return;
         }
-        // Settings ▸ Messages' Tag pop-up is the page's other pop-up: Escape
-        // closes it, the keyboard back on the control that opened it, and
-        // the reader stays on the log (ruling 441 (p): it fell through to
-        // Home, dropping the filter, the open entry and the scroll). Only a
-        // pop-up the page draws reaches here: Search and the category list
-        // close it, and the `Cancel` handler closes one a widened page lays
-        // out as chips (`SettingsApp::messages_tag_menu_drawn`).
+        // Settings ▸ Messages' Tag pop-up: Escape closes it, returns focus to its
+        // opener and keeps the reader on the log. Only a drawn pop-up reaches
+        // here: Search and the category list close it, and the `Cancel` handler
+        // closes one a widened page lays out as chips
+        // (`SettingsApp::messages_tag_menu_drawn`).
         if self.route == SettingsRoute::Messages && self.messages_tag_menu {
             self.messages_tag_menu = false;
             self.common.last_focus = Some(UiKey::new(MESSAGES_TAG_MENU));
@@ -4138,27 +4480,25 @@ pub(crate) struct SettingsApp {
     update: UpdateState,
     packages_revision: u64,
     /// Boxed: the snapshot is large and replaced whole on every revision, and
-    /// inline it made `SettingsApp` the variant `NativeApp` is sized by.
+    /// inline it would grow `SettingsApp`, the variant `NativeApp` is sized by.
     packages: Box<PackagesState>,
-    /// The Settings ▸ Messages projection the host last published (design
-    /// §4.2) — built once from the center and the log, shared by every view.
+    /// The Settings ▸ Messages projection the host last published, built once
+    /// from the center and the log and shared by every view.
     messages_revision: u64,
     messages: MessagesState,
-    /// The Settings ▸ Harness projection the host last published (design
-    /// §4), boxed for the reason `packages` is.
+    /// The Settings ▸ Harness projection the host last published, boxed for
+    /// the reason `packages` is.
     harness_revision: u64,
     harness: Box<HarnessState>,
-    /// `prepare_close` is instance-owned by the native-app ABI, so retain the
-    /// exact per-view dirty projection produced after every reducer event.
-    /// View ids are monotonic and a dirty view cannot detach while this set
-    /// blocks its close transaction.
+    /// Per-view dirty projection after every reducer event, kept here because
+    /// `prepare_close` is instance-owned by the native-app ABI. View ids are
+    /// monotonic, and a dirty view cannot detach while this blocks its close.
     ///
-    /// The value says whether the view holds a draft no seamless update
-    /// carries ([`SettingsViewState::carried_field_drafts`]'s `held`): a
-    /// `CarriedRelaunch` close is Ready for every other drafted view, because
-    /// the handoff layout reopens it with its drafts (plan P2-2). One map, not
-    /// a second set beside it: `SettingsApp` is the variant `NativeApp` is
-    /// sized by.
+    /// The value says whether the view holds a draft no seamless update carries
+    /// ([`SettingsViewState::carried_field_drafts`]'s `held`); a `CarriedRelaunch`
+    /// close is Ready for every other drafted view, since the handoff layout
+    /// reopens it with its drafts. One map, not two sets: `SettingsApp` is the
+    /// variant `NativeApp` is sized by.
     draft_views: BTreeMap<crate::native_app::ViewId, bool>,
 }
 
@@ -4168,19 +4508,17 @@ impl SettingsApp {
         Self::new_at_config_revision(update, 1)
     }
 
-    /// Construct against the exact snapshot used to seed the first Settings
-    /// view.  The transaction service permits safe stale rebases, but a freshly
-    /// opened Settings controller is not stale: using revision 1 after the
-    /// watcher has already advanced would manufacture a conflict for a key the
-    /// user is looking at in the current snapshot.
+    /// Construct at the revision of the snapshot that seeds the first view. A
+    /// fresh controller is not stale: starting at revision 1 after the watcher
+    /// advanced would manufacture a conflict for a key the user is looking at.
     pub(crate) fn new_at_config_revision(update: UpdateState, config_revision: u64) -> Self {
         Self {
             config_revision: config_revision.max(1),
             update_revision: 1,
             update,
             packages_revision: 1,
-            // Honest zero state until the host publishes a worker observation
-            // (the page says "Reading package status…", claims nothing).
+            // Unobserved until the host publishes a worker observation (the page
+            // says "Reading package status…" and claims nothing).
             packages: Box::new(PackagesState::unobserved()),
             // Nothing until the host publishes the log (it does so whenever
             // Settings surfaces, and again as the center moves).
@@ -4310,10 +4648,6 @@ impl SettingsApp {
             view.draft_discard_confirmation = false;
             view.invalidate_result_page_limit();
             if submit {
-                if Self::reject_pending_key(view, &key, cx) {
-                    view.finish_field_edit(&key);
-                    return;
-                }
                 let value = view
                     .field_inputs
                     .get(&key)
@@ -4426,20 +4760,6 @@ impl SettingsApp {
         true
     }
 
-    fn reject_pending_key(view: &mut SettingsViewState, key: &str, cx: &mut UpdateCx<'_>) -> bool {
-        if view.config_reconciliation_required {
-            view.feedback = Some("Save not confirmed · Reload aterm.toml first".to_string());
-            cx.repaint(crate::native_app::DamageRegion::All);
-            return true;
-        }
-        if !view.config_key_pending(key) {
-            return false;
-        }
-        view.feedback = Some("That setting is already being applied…".to_string());
-        cx.repaint(crate::native_app::DamageRegion::All);
-        true
-    }
-
     /// THE PAGE'S ONE WAY TO WRITE. Every edit whose value is its key's
     /// default becomes a removal — the rule the config service enforces for
     /// every writer ([`prefs::unset_equivalent_edits`]), applied here first so
@@ -4466,9 +4786,60 @@ impl SettingsApp {
         if patch.edits.iter().all(edit_changes_nothing) {
             return None;
         }
-        let operation = cx.config_patch(patch.clone());
-        view.pend_config(operation, patch);
-        Some(operation)
+        Some(Self::send_config(view, cx, patch))
+    }
+
+    /// THE PAGE'S ONE WAY TO SEND A WRITE. A press is never refused because
+    /// an earlier one is still saving: the write is booked and shown at once
+    /// ([`SettingsViewState::lay_over`]), so the control takes the next press
+    /// on the value the person chose, and that next write follows the page's
+    /// writes still on their way to a key it writes (`follows`): the config
+    /// lane runs them in order and checks the follower against what they
+    /// wrote, so two clicks on a switch within one save are two toggles.
+    /// Every write is its own step, with its own Undo. One that fails says
+    /// why and its keys go back to what the file holds
+    /// ([`SettingsViewState::relay_in_flight`]).
+    fn send_config(
+        view: &mut SettingsViewState,
+        cx: &mut UpdateCx<'_>,
+        patch: ConfigPatch,
+    ) -> OperationId {
+        let follows = {
+            let keys: BTreeSet<&str> = patch.edits.iter().map(|edit| edit.key.as_str()).collect();
+            view.in_flight_writes_to(&keys)
+        };
+        let edits: Vec<(String, Option<String>)> = patch
+            .edits
+            .iter()
+            .map(|edit| (edit.key.clone(), edit.value.clone()))
+            .collect();
+        // Its Undo, offered at once: it puts back what the write expected,
+        // once the write lands, named before the values move.
+        let words = change_words(view, &patch);
+        let restores = patch
+            .edits
+            .iter()
+            .map(|edit| {
+                let ExpectedConfigValue::Exact(before) = &edit.expected;
+                (edit.key.clone(), before.clone())
+            })
+            .collect();
+        let operation = cx.config_patch(patch.clone(), follows.clone());
+        view.next_undo = Some(UndoOffer {
+            target: UndoTarget::Landing(operation),
+            status: String::new(),
+            undone: words.undone,
+            redone: words.redone,
+            redo: false,
+            keys: edits.iter().map(|(key, _)| key.clone()).collect(),
+            revision: 0,
+            restores,
+            reapplies: edits.clone(),
+        });
+        view.next_undo_seated = false;
+        view.pend_config(operation, patch, follows);
+        view.lay_over(&edits);
+        operation
     }
 
     /// Write `value` to `theme`, guarded on the value the view shows, the
@@ -4490,21 +4861,6 @@ impl SettingsApp {
         if Self::submit_config(view, cx, patch).is_some() {
             view.feedback = Some("Applying…".to_string());
         }
-    }
-
-    /// Under Serious Mode, turning a Top effect ON commits the whole escape
-    /// transaction, so it is refused (with `reject_pending_key`'s feedback)
-    /// while any key of that transaction is still being applied.
-    fn reject_pending_serious_mode_escape(
-        view: &mut SettingsViewState,
-        turns_on: bool,
-        cx: &mut UpdateCx<'_>,
-    ) -> bool {
-        turns_on
-            && field_bool(view, prefs::EDIT_SERIOUS_MODE, false)
-            && TOP_EFFECT_TRANSACTION_KEYS
-                .into_iter()
-                .any(|pending_key| Self::reject_pending_key(view, pending_key, cx))
     }
 
     /// Submit one Top effect's `edits` as a single guarded patch, first pinning
@@ -4532,29 +4888,21 @@ impl SettingsApp {
         EventResult::Handled
     }
 
-    /// A focused slider's keys: a step (an arrow; Shift, Page Up and Page
-    /// Down ten), or to an end of its domain (Home, End), as platform sliders
-    /// take them. Saved at once, as a drag is.
-    fn reduce_slider_move(
+    /// A focused slider's arrow keys: `delta` steps, ten each where `big`
+    /// (Shift). Saved at once, as a release is. Its value keys are the
+    /// arrows alone: Page Up, Page Down, Home and End turn and scroll the
+    /// page's list wherever the keyboard is, never a value.
+    fn reduce_slider_step(
         &mut self,
         view: &mut SettingsViewState,
-        motion: SliderMove,
+        delta: isize,
+        big: bool,
         cx: &mut UpdateCx<'_>,
     ) {
+        let steps = if big { 10.0 } else { 1.0 } * delta as f64;
         if let Some(target) = view.focused_color_brightness() {
             if let Some([_, _, brightness]) = color_picker::color_target_hsv(view, target) {
-                let value = match motion {
-                    SliderMove::Step { delta, big } => {
-                        f64::from(brightness) + 0.05 * if big { 10.0 } else { 1.0 } * delta as f64
-                    }
-                    SliderMove::Edge { home } => {
-                        if home {
-                            0.0
-                        } else {
-                            1.0
-                        }
-                    }
-                };
+                let value = f64::from(brightness) + 0.05 * steps;
                 self.commit_color_brightness(view, target, value, cx);
             }
             return;
@@ -4563,9 +4911,6 @@ impl SettingsApp {
             return;
         };
         let key = key.to_string();
-        if Self::reject_pending_key(view, &key, cx) {
-            return;
-        }
         let Some(index) = view.field_index_of(&key) else {
             return;
         };
@@ -4576,18 +4921,7 @@ impl SettingsApp {
         let Some(range) = slider_domain(view, field.key) else {
             return;
         };
-        let target = match motion {
-            SliderMove::Step { delta, big } => {
-                current + range.step * if big { 10.0 } else { 1.0 } * delta as f64
-            }
-            SliderMove::Edge { home } => {
-                if home {
-                    range.min
-                } else {
-                    range.max
-                }
-            }
-        };
+        let target = current + range.step * steps;
         let Some(value) = normalize_slider_value(target, range) else {
             return;
         };
@@ -4643,12 +4977,6 @@ impl SettingsApp {
             })
         {
             view.reveal_pressed(UiKey::new(format!("settings/control/{key}")));
-        }
-        if let Some(key) = action.strip_prefix("settings/set/")
-            && Self::reject_pending_key(view, key, cx)
-        {
-            view.clear_field_edit();
-            return EventResult::Handled;
         }
         // A narrow toolbar's Search button opens the field across the bar with
         // the keyboard in it; its Cancel empties and closes it, the keyboard
@@ -4940,9 +5268,9 @@ impl SettingsApp {
             return EventResult::Handled;
         }
 
-        // A CURSOR STYLE ROW saves its style through the one style
-        // transaction ([`trail_style_edits`]); the list stays put and its
-        // check moves when the change lands.
+        // A cursor style row saves its style through the one style transaction
+        // ([`trail_style_edits`]); the list stays put and its check moves when
+        // the change lands.
         if action.starts_with("settings/cursor-style/") {
             let Some(style) = cursor_style_for_row(view, action) else {
                 return EventResult::Handled;
@@ -4950,9 +5278,6 @@ impl SettingsApp {
             view.common.last_focus = Some(UiKey::new(action.to_string()));
             // Chosen, whatever happens to its write: no longer a trial.
             view.chosen_style_row = Some(UiKey::new(action.to_string()));
-            if Self::reject_pending_key(view, prefs::EDIT_CURSOR_TRAIL_STYLE, cx) {
-                return EventResult::Handled;
-            }
             if cursor_style_is_saved(view, &style) {
                 // The terminal draws it and aterm.toml names it: nothing to
                 // write.
@@ -4960,9 +5285,6 @@ impl SettingsApp {
                 return EventResult::Handled;
             }
             let (edits, enables) = trail_style_edits(view, &style);
-            if Self::reject_pending_serious_mode_escape(view, enables, cx) {
-                return EventResult::Handled;
-            }
             return self.commit_top_effect_edits(
                 view,
                 TopEffectSetting::CursorTrail,
@@ -4988,9 +5310,6 @@ impl SettingsApp {
             // pair it replaced. Either way the mode is the value: the memory
             // is the view's, and only a name still equal to what Off wrote
             // reads it.
-            if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
-                return EventResult::Handled;
-            }
             let current = view.raw_value(prefs::EDIT_THEME);
             let following = prefs::theme_mode(current.as_deref()) == prefs::ThemeMode::FollowSystem;
             let wanted = match invocation.value {
@@ -5074,9 +5393,6 @@ impl SettingsApp {
             // A list's slot Reset puts aterm's own theme back on that side
             // and keeps the other; the pair still follows the system (the
             // Follow system switch is the way back to one theme).
-            if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
-                return EventResult::Handled;
-            }
             if view
                 .choice_picker
                 .as_ref()
@@ -5182,10 +5498,6 @@ impl SettingsApp {
             && let Some((key, raw_index)) = rest.rsplit_once('/')
             && let Ok(index) = raw_index.parse::<usize>()
         {
-            if Self::reject_pending_key(view, key, cx) {
-                view.choice_picker = None;
-                return EventResult::Handled;
-            }
             let option = view
                 .choice_picker
                 .as_ref()
@@ -5334,9 +5646,6 @@ impl SettingsApp {
             }) else {
                 return EventResult::Handled;
             };
-            if Self::reject_pending_key(view, key, cx) {
-                return EventResult::Handled;
-            }
             // The default option removes the key ([`Self::submit_config`]).
             let value = Some(choice.value);
             let patch = ConfigPatch {
@@ -5347,22 +5656,21 @@ impl SettingsApp {
                     value,
                 }],
             };
+            // The keyboard is on the segment pressed; once it shows as the
+            // chosen one it carries the setting's own key, and the keyboard
+            // goes with it ([`SettingsViewState::lay_over`]).
+            view.common.last_focus = Some(UiKey::new(action.to_string()));
             if Self::submit_config(view, cx, patch).is_some() {
                 view.feedback = Some("Applying…".to_string());
             }
-            view.common.last_focus = Some(UiKey::new(action.to_string()));
             cx.repaint(crate::native_app::DamageRegion::All);
             return EventResult::Handled;
         }
 
-        // Display faces card: one switch per face over the `display_font` mix.
-        // A single ConfigEdit with the optimistic-concurrency guard, like
-        // every write.
+        // Display faces card: one switch per face over the `display_font` mix,
+        // each written as one guarded ConfigEdit.
         if let Some(id) = action.strip_prefix("settings/display-face/") {
             if !prefs::DISPLAY_FONT_OPTIONS.contains(&id) {
-                return EventResult::Handled;
-            }
-            if Self::reject_pending_key(view, prefs::EDIT_DISPLAY_FONT, cx) {
                 return EventResult::Handled;
             }
             let current = view.raw_value(prefs::EDIT_DISPLAY_FONT);
@@ -5425,20 +5733,16 @@ impl SettingsApp {
             return result;
         }
 
-        // Wallpaper page: open the system image picker. The HOST owns the modal
-        // and the config write (the versioned lane re-decodes the picked image),
-        // so the reducer only requests it — the view converges through the
-        // ordinary config-change projection.
+        // Wallpaper page: open the system image picker. The host owns the modal
+        // and the config write (the versioned lane re-decodes the picked image);
+        // the view converges through the ordinary config-change projection.
         if action == "settings/wallpaper/choose" {
             cx.choose_wallpaper_image();
             return EventResult::Handled;
         }
-        // Wallpaper page: Remove clears the ONE `wallpaper` key — every
-        // terminal tab returns to the flat theme background.
+        // Wallpaper page: Remove clears the `wallpaper` key, returning every
+        // terminal tab to the flat theme background.
         if action == "settings/wallpaper/detach" {
-            if Self::reject_pending_key(view, prefs::EDIT_WALLPAPER, cx) {
-                return EventResult::Handled;
-            }
             let patch = ConfigPatch {
                 base_revision: self.config_revision,
                 edits: vec![ConfigEdit {
@@ -5510,16 +5814,6 @@ impl SettingsApp {
             }
             view.field_errors.remove(key);
             if key == SPARKLE_WORDS_KEY || key == KEYWORD_KITTIES_KEY {
-                for pending_key in [
-                    SPARKLE_MASTER_KEY,
-                    SPARKLE_WORDS_KEY,
-                    KEYWORD_KITTIES_KEY,
-                    prefs::EDIT_SERIOUS_MODE,
-                ] {
-                    if Self::reject_pending_key(view, pending_key, cx) {
-                        return EventResult::Handled;
-                    }
-                }
                 let show_authored = view.route == SettingsRoute::Modified && view.search.is_empty();
                 let current_words = if show_authored {
                     top_authored_toy_value(view, SPARKLE_WORDS_KEY)
@@ -5546,19 +5840,14 @@ impl SettingsApp {
                 } else {
                     top_authored_toy_value(view, KEYWORD_KITTIES_KEY)
                 };
-                // Migrate the old shared master away on the first product-level
-                // edit. Each toy is default-on, so `None` represents ON and an
-                // explicit `false` represents OFF. This keeps the two switches
-                // genuinely independent and leaves Modified free of default-valued
-                // implementation-detail overrides.
+                // Every edit clears the shared master (`SPARKLE_MASTER_KEY`). Each
+                // toy is default-on, so `None` is on and `false` off: the switches
+                // stay independent and Modified lists no default-valued override.
                 let edits = vec![
                     (SPARKLE_MASTER_KEY, None),
                     (SPARKLE_WORDS_KEY, (!words).then(|| "false".to_string())),
                     (KEYWORD_KITTIES_KEY, (!kitties).then(|| "false".to_string())),
                 ];
-                if Self::reject_pending_serious_mode_escape(view, desired, cx) {
-                    return EventResult::Handled;
-                }
                 let edits = edits
                     .into_iter()
                     .map(|(key, value)| ConfigEdit {
@@ -5585,9 +5874,6 @@ impl SettingsApp {
                     Some(SemanticInput::Bool(value)) => *value,
                     _ => !current,
                 };
-                if Self::reject_pending_serious_mode_escape(view, desired, cx) {
-                    return EventResult::Handled;
-                }
                 let edits = vec![ConfigEdit {
                     key: key.to_string(),
                     expected: ExpectedConfigValue::Exact(view.raw_value(key)),
@@ -5622,9 +5908,6 @@ impl SettingsApp {
                             .eq_ignore_ascii_case("off"),
                     ),
                 };
-                if Self::reject_pending_serious_mode_escape(view, enables_trail, cx) {
-                    return EventResult::Handled;
-                }
                 return self.commit_top_effect_edits(
                     view,
                     TopEffectSetting::CursorTrail,
@@ -5802,9 +6085,6 @@ impl SettingsApp {
                 cx.repaint(crate::native_app::DamageRegion::All);
                 return EventResult::Handled;
             }
-            if Self::reject_pending_key(view, entry.key, cx) {
-                return EventResult::Handled;
-            }
             let patch = ConfigPatch {
                 base_revision: self.config_revision,
                 edits: vec![ConfigEdit {
@@ -5836,9 +6116,6 @@ impl SettingsApp {
                 cx.repaint(crate::native_app::DamageRegion::All);
                 return EventResult::Handled;
             }
-            if Self::reject_pending_key(view, retired, cx) {
-                return EventResult::Handled;
-            }
             let patch = ConfigPatch {
                 base_revision: self.config_revision,
                 edits: vec![ConfigEdit {
@@ -5856,9 +6133,6 @@ impl SettingsApp {
 
         if let Some(key) = action.strip_prefix("settings/reset/") {
             if view.field_index_of(key).is_some() {
-                if Self::reject_pending_key(view, key, cx) {
-                    return EventResult::Handled;
-                }
                 if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
                     let patch = ConfigPatch {
                         base_revision: self.config_revision,
@@ -5895,15 +6169,6 @@ impl SettingsApp {
 
         match action {
             "settings/reset-all" => {
-                if view.config_patch_pending() {
-                    view.feedback = Some(if view.config_reconciliation_required {
-                        "Save not confirmed · Reload aterm.toml first".to_string()
-                    } else {
-                        "Settings changes are already being applied…".to_string()
-                    });
-                    cx.repaint(crate::native_app::DamageRegion::All);
-                    return EventResult::Handled;
-                }
                 let count = reset_all_count(view);
                 if count == 0 {
                     view.feedback = Some(reset_all_nothing_words(view).to_string());
@@ -5913,6 +6178,17 @@ impl SettingsApp {
                     // The keyboard goes to the safe answer, never stays on
                     // the Reset All… the question turns off.
                     view.common.last_focus = Some(UiKey::new("settings/reset-all-cancel"));
+                    // In a compact window the question can take the page's
+                    // list's place ([`reset_all_question_page`]), and in any
+                    // window shorter than its bar it does: it reads from its
+                    // top, and the list keeps its place.
+                    let takes_page = view
+                        .page_chrome_at
+                        .get()
+                        .is_some_and(|(viewport, _)| reset_all_question_takes_page(view, viewport));
+                    if view.presented_width.get() == Some(SettingsWidth::Compact) || takes_page {
+                        view.open_question_scroll();
+                    }
                 }
                 cx.repaint(crate::native_app::DamageRegion::All);
                 EventResult::Handled
@@ -5927,15 +6203,6 @@ impl SettingsApp {
             "settings/reset-all-confirm" => {
                 if !view.reset_all_confirmation {
                     // A stale semantic action cannot bypass the disclosure step.
-                    return EventResult::Handled;
-                }
-                if view.config_patch_pending() {
-                    view.feedback = Some(if view.config_reconciliation_required {
-                        "Save not confirmed · Reload aterm.toml first".to_string()
-                    } else {
-                        "Settings changes are already being applied…".to_string()
-                    });
-                    cx.repaint(crate::native_app::DamageRegion::All);
                     return EventResult::Handled;
                 }
                 // Each key is expected to hold what the confirmation counted,
@@ -5964,15 +6231,13 @@ impl SettingsApp {
                 EventResult::Handled
             }
             "settings/undo" => {
-                if view.config_patch_pending() {
-                    view.feedback = Some(if view.config_reconciliation_required {
-                        "Save not confirmed · Reload aterm.toml first".to_string()
-                    } else {
-                        "Finish applying the current change before Undo.".to_string()
-                    });
+                if view.config_reconciliation_required {
+                    view.feedback = Some("Save not confirmed · checking aterm.toml".to_string());
                     cx.repaint(crate::native_app::DamageRegion::All);
                     return EventResult::Handled;
                 }
+                // Taken while the change it names is saving too: its Undo
+                // follows it in the lane ([`UndoTarget::Landing`]).
                 if let Some(offer) = view.undo_offer().cloned() {
                     view.last_undo = None;
                     view.style_trial_undo = view
@@ -5982,41 +6247,57 @@ impl SettingsApp {
                         .filter(|_| cursor_style_list_live(view))
                         .filter(|key| key.as_str().starts_with("settings/cursor-style/"))
                         .map(|key| (key, None));
-                    let operation = cx.config_undo(offer.token);
+                    let operation = cx.config_undo(offer.target);
+                    let restores = offer.restores.clone();
+                    // Pressed again while this is on its way, Undo redoes
+                    // what this takes back, once this lands. A Redo says
+                    // so: it is no Undo.
+                    let status = if offer.redo {
+                        "Redoing…"
+                    } else {
+                        "Undoing…"
+                    }
+                    .to_string();
+                    view.next_undo = Some(UndoOffer {
+                        target: UndoTarget::Landing(operation),
+                        status: status.clone(),
+                        undone: offer.redone.clone(),
+                        redone: offer.undone.clone(),
+                        redo: !offer.redo,
+                        keys: offer.keys.clone(),
+                        revision: 0,
+                        restores: offer.reapplies.clone(),
+                        reapplies: offer.restores.clone(),
+                    });
+                    view.next_undo_seated = true;
                     view.pending.insert(operation, PendingAction::Undo(offer));
-                    view.feedback = Some("Undoing…".to_string());
+                    // The values it puts back show at once, as a change's do.
+                    view.lay_over(&restores);
+                    view.feedback = Some(status);
                     cx.repaint(crate::native_app::DamageRegion::All);
                 }
                 EventResult::Handled
             }
-            // ---------------------------------------------------------------
-            // The macOS access block's owner gestures (§3.4, §3.7).
-            //
-            // Every one of them requires this press. None is a `VERBS` row and
-            // `act` refuses them (`MACOS_ACCESS_GESTURE_PREFIX`). `key`
-            // drives this page like a hand, by design, so the warm-up, the
-            // reset and *Move to Trash* also ask the owner in an AppKit alert
-            // that no control verb can answer and whose default is Cancel
-            // (`SettingsViewState::owner_confirms`), and the three Open buttons —
-            // which only bring System Settings forward — record nothing that
-            // replaces the owner's answer to the access card. A consent-raising
-            // or destructive action a program inside a session could fire would
-            // be a surface an agent controls, which is the rule §3.5 and §3.7
-            // share.
-            // ---------------------------------------------------------------
+            // The macOS access block's owner gestures (§3.4, §3.7). None is a `VERBS`
+            // row and `act` refuses them (`MACOS_ACCESS_GESTURE_PREFIX`), but `key`
+            // presses this page like a hand, so those that change this Mac also ask in
+            // an AppKit alert no control verb can answer, defaulting to Cancel
+            // (`SettingsViewState::owner_confirms`). The three Open buttons bring
+            // System Settings forward (*Open Developer Tools…* through the host's
+            // hand-over) and record nothing that replaces the owner's answer.
             MACOS_ACCESS_OPEN_DEVTOOLS => {
-                // THE ONE HAND-OVER (`App::hand_devtools_to_owner`, owner ask
-                // 2026-10-15): the page, and aterm's helper panel beside it
-                // while aterm is not on, the way the digest line's press and the
-                // window's own hand-over bring it. That lane is `App`'s, which a
-                // reducer cannot reach, so the press is recorded here and the
-                // park performs it (`App::drain_settings_gesture_requests`),
-                // then says on this bar what it did. An owner's press: it opens
-                // whatever aterm read or the owner declined before.
-                // Only a view the host published the page into and armed with its
-                // live gestures asks: a view born unarmed, a headless instance's or
-                // one never published records nothing and says nothing opened, as
-                // the inert arm's other Open buttons do.
+                // The hand-over (`App::hand_devtools_to_owner`): the page, and
+                // aterm's helper panel beside it while aterm is not on, as the
+                // digest line's press and the window's own hand-over bring it.
+                // That lane is `App`'s, which a reducer cannot reach, so the
+                // press is recorded here and the park performs it
+                // (`App::drain_settings_gesture_requests`), then says on this
+                // bar what it did. An owner's press opens whatever aterm read or
+                // the owner declined before. Only a view the host published the
+                // page into and armed with its live gestures asks: a view born
+                // unarmed, a headless instance's or one never published records
+                // nothing and says nothing opened, as the inert arm's other Open
+                // buttons do.
                 let words = crate::menu::privacy_settings_path_words(
                     crate::menu::PrivacyPane::DeveloperTools,
                 );
@@ -6380,13 +6661,11 @@ impl SettingsApp {
                 }
                 EventResult::Handled
             }
-            // ONE verb. The page no longer asks the user which updater stage
-            // they are in: install what is already staged, otherwise go look.
-            // `updates/check` remains as the command-palette entry point and
-            // routes to exactly the same reducer. A build ON HOLD sends
-            // nothing: its next start is the one its boot trial rolls back,
-            // and the updater runs no check while a build is staged
-            // (`CheckBlock::UpdateAlreadyStaged`). The press says so.
+            // One verb: install what is staged, otherwise check. `updates/check`
+            // (the command-palette entry) routes here too. A build on hold sends
+            // nothing and says so: its next start is the one its boot trial rolls
+            // back, and the updater runs no check while a build is staged
+            // (`CheckBlock::UpdateAlreadyStaged`).
             "updates/install-now" | "updates/check" => {
                 let update = self.update.projection();
                 if let Some((build, version)) =
@@ -6490,7 +6769,7 @@ impl SettingsApp {
         }
     }
 
-    /// Shared admission for the two Packages action buttons: refuse honestly
+    /// Shared admission for the Packages verbs and This Mac's apply: refuse
     /// (unavailable / inert / busy) without minting an effect, else hand the
     /// request to the host executor and track the pending operation.
     fn reduce_packages_verb(
@@ -6502,8 +6781,8 @@ impl SettingsApp {
     ) {
         let packages = self.packages.projection();
         // `atpkg machine apply` is a local verb: it needs the co-located binary and
-        // an idle worker slot, but NOT the package manager — it works with the
-        // manager switched off, exactly as the host executor admits it.
+        // an idle worker slot but not the package manager, so it works with the
+        // manager switched off, as the host executor admits it.
         let machine_apply = matches!(request, PackagesRequest::MachineApply);
         if packages.tool_observed && !packages.available {
             view.feedback = Some("This copy of aterm has no package tool.".to_string());
@@ -6525,9 +6804,8 @@ impl SettingsApp {
                     crate::packages_screen::MACHINE_NOTHING_TO_APPLY.to_string()
                 }));
         } else if !machine_apply && !packages.manager_enabled {
-            // The projection's detail line names the inert cause (an unpinned build —
-            // the only one since the environment kill switch went, 2026-09-23) —
-            // reuse it rather than restating it here.
+            // The projection's detail line names the inert cause (an unpinned
+            // build); reuse it.
             view.feedback = Some(
                 packages
                     .detail
@@ -6558,6 +6836,45 @@ impl SettingsApp {
         let Some(pending) = view.pending.remove(&operation) else {
             return;
         };
+        // What this write put in aterm.toml, which its keys showed while it
+        // was on its way: from here they show what the file holds.
+        let finished: Vec<(String, Option<String>)> = pending
+            .shown_edits()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
+            .collect();
+        // It landed before the snapshot that holds it came in (the host
+        // publishes the snapshot first, so this is rare): its values are
+        // what the file holds until that snapshot says so.
+        let landed = matches!(outcome, ConfigPatchOutcome::Applied { revision, .. }
+            if view.snapshot_revision < revision);
+        // A write composed over one that failed fails with it, for the same
+        // reason, as does an Undo of it: the status keeps the first one's
+        // words.
+        let after_failure = match &pending {
+            PendingAction::Config(request) => request
+                .follows
+                .iter()
+                .any(|earlier| view.failed_writes.contains(earlier)),
+            PendingAction::Undo(offer) => matches!(offer.target,
+                UndoTarget::Landing(earlier) if view.failed_writes.contains(&earlier)),
+            _ => false,
+        };
+        if !matches!(outcome, ConfigPatchOutcome::Applied { .. }) {
+            view.failed_writes.insert(operation);
+        }
+        // The newest of the page's requests on their way has its answer: its
+        // Undo, offered while it saved, gives way to what it landed with.
+        if view
+            .next_undo
+            .as_ref()
+            .is_some_and(|offer| offer.target == UndoTarget::Landing(operation))
+        {
+            view.next_undo = None;
+        }
+        // A newer request of the page's still on its way: the status keeps
+        // naming the newest press while this older one lands.
+        let newer_on_its_way = view.own_writes_in_flight();
         let keep_refused = Self::finish_showcase_keep(
             view,
             operation,
@@ -6568,7 +6885,11 @@ impl SettingsApp {
                 self.config_revision = self.config_revision.max(revision);
                 // Named before the values move.
                 let words = match &pending {
-                    PendingAction::Config(request) => Some(change_words(view, &request.patch)),
+                    PendingAction::Config(request) => Some(
+                        request
+                            .kind
+                            .landing_words(change_words(view, &request.patch)),
+                    ),
                     _ => None,
                 };
                 if let PendingAction::Undo(offer) = &pending {
@@ -6576,22 +6897,24 @@ impl SettingsApp {
                         *landed = Some(revision);
                     }
                     view.settle_style_trial_after_undo();
-                    view.feedback = Some(offer.undone.clone());
+                    if !newer_on_its_way {
+                        view.feedback = Some(offer.undone.clone());
+                    }
                     // What follows an Undo redoes the change, and says so on
                     // its button: pressing "Undo" again must never quietly
                     // reapply what was just undone.
                     view.last_undo = undo.map(|token| UndoOffer {
-                        token,
+                        target: UndoTarget::Token(token),
                         status: offer.undone.clone(),
                         undone: offer.redone.clone(),
                         redone: offer.undone.clone(),
                         redo: !offer.redo,
                         keys: offer.keys.clone(),
                         revision,
+                        restores: offer.reapplies.clone(),
+                        reapplies: offer.restores.clone(),
                     });
-                    view.invalidate_result_page_limit();
-                    view.common.presentation_revision =
-                        view.common.presentation_revision.saturating_add(1);
+                    view.relay_in_flight(&finished, landed);
                     return;
                 }
                 let written: Vec<String> = match &pending {
@@ -6600,6 +6923,19 @@ impl SettingsApp {
                         .edits
                         .iter()
                         .map(|edit| edit.key.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                // What its Undo puts back: each key's value before it.
+                let restores: Vec<(String, Option<String>)> = match &pending {
+                    PendingAction::Config(request) => request
+                        .patch
+                        .edits
+                        .iter()
+                        .map(|edit| {
+                            let ExpectedConfigValue::Exact(before) = &edit.expected;
+                            (edit.key.clone(), before.clone())
+                        })
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -6625,36 +6961,6 @@ impl SettingsApp {
                             view.field_inputs.remove(&edit.key);
                             if view.editing_field.as_deref() == Some(edit.key.as_str()) {
                                 view.editing_field = None;
-                            }
-                        }
-                        // The host publishes the snapshot before the
-                        // completion: once it is in, it is what the file
-                        // holds, and projecting the edit over it could only
-                        // make the view stale.
-                        if view.snapshot_revision >= revision {
-                            continue;
-                        }
-                        if let Some(value) = edit.value.as_ref() {
-                            view.raw_values.insert(edit.key.clone(), value.clone());
-                        } else {
-                            view.raw_values.remove(&edit.key);
-                        }
-                        if let Some(field) = view
-                            .legacy
-                            .fields
-                            .iter_mut()
-                            .find(|field| field.key == edit.key)
-                        {
-                            // A Boolean seed is its effective display state, so
-                            // a removed switch shows its default; treating `None`
-                            // as false would make default-on controls visibly lie
-                            // until the following ConfigChanged snapshot.
-                            if !matches!(field.kind, EditKind::Bool) {
-                                field.seed = edit.value;
-                            } else if let Some(value) = edit.value {
-                                field.seed = Some(value);
-                            } else if let Some(default) = switch_default(&edit.key) {
-                                field.seed = Some(default.to_string());
                             }
                         }
                     }
@@ -6692,19 +6998,25 @@ impl SettingsApp {
                 }
                 let status = feedback.join(FACT_SEPARATOR);
                 view.last_undo = undo.map(|token| UndoOffer {
-                    token,
+                    target: UndoTarget::Token(token),
                     status: status.clone(),
                     undone: words.undone,
                     redone: words.redone,
                     redo: false,
                     keys: written,
                     revision,
+                    restores,
+                    reapplies: finished.clone(),
                 });
-                view.feedback = Some(status);
+                if !newer_on_its_way {
+                    view.feedback = Some(status);
+                }
             }
             ConfigPatchOutcome::Conflict { revision } => {
                 self.config_revision = self.config_revision.max(revision);
-                view.feedback = Some("Changed externally · Review before retrying".to_string());
+                if !after_failure {
+                    view.feedback = Some("Changed externally · Review before retrying".to_string());
+                }
             }
             ConfigPatchOutcome::Indeterminate { message } => {
                 view.config_reconciliation_required = true;
@@ -6726,27 +7038,60 @@ impl SettingsApp {
                 // publication is unknown. Keep the attempted edit above, but
                 // claim neither success nor a clean/undoable state.
                 view.last_undo = None;
-                view.feedback = Some(format!(
-                    "Save not confirmed: {message} · Reload aterm.toml before another change"
-                ));
+                if !after_failure {
+                    // The lane reads aterm.toml again before it writes
+                    // anything else; a press meanwhile waits behind that and
+                    // is checked against what it finds.
+                    view.feedback = Some(format!(
+                        "Save not confirmed: {message} · checking aterm.toml"
+                    ));
+                }
             }
             ConfigPatchOutcome::Rejected { message } => {
-                // In the row's words: one setting by its name, never its key.
-                let one = match &pending {
-                    PendingAction::Config(request) if request.patch.edits.len() == 1 => {
-                        Some(request.patch.edits[0].key.clone())
-                    }
-                    _ => None,
+                // In the row's words: one setting by its name, never its key;
+                // one of the page's own operations as that operation.
+                let (one, kind) = match &pending {
+                    PendingAction::Config(request) => (
+                        (request.patch.edits.len() == 1)
+                            .then(|| request.patch.edits[0].key.clone()),
+                        Some(&request.kind),
+                    ),
+                    _ => (None, None),
                 };
-                view.feedback = Some(match one {
-                    Some(key) => {
+                if !after_failure {
+                    let named = one.map(|key| {
                         let name = row_name(view, &key);
                         let message =
                             message.replace(&format!("for {key}"), &format!("for {name}"));
-                        format!("{name} was not saved: {message}")
-                    }
-                    None => format!("Couldn’t apply: {message}"),
-                });
+                        (name, message)
+                    });
+                    let why = named
+                        .as_ref()
+                        .map_or(message.as_str(), |(_, message)| message.as_str());
+                    view.feedback = Some(
+                        match (kind.and_then(|kind| kind.refused_words(why)), named) {
+                            (Some(words), _) => words,
+                            (None, Some((name, message))) => {
+                                format!("{name} was not saved: {message}")
+                            }
+                            (None, None) => format!("Couldn’t apply: {message}"),
+                        },
+                    );
+                }
+            }
+        }
+        // A write that failed goes back to what the file holds: its keys show
+        // it again, under the page's writes still on their way.
+        let failed = view.failed_writes.contains(&operation);
+        view.relay_in_flight(&finished, landed);
+        if view.reset_all_confirmation {
+            if failed {
+                // Why the change did not land, rather than a question about
+                // values that just went back.
+                view.reset_all_confirmation = false;
+            } else {
+                // The question stays, and says what Reset All would reset now.
+                view.feedback = Some(reset_all_scope(view));
             }
         }
         // A Keep that did not land: the Themes strip says why, beside the
@@ -6770,9 +7115,8 @@ impl SettingsApp {
                     ExternalOpenOutcome::Denied { message } => format!("Open denied: {message}"),
                 });
             }
-            // Open Log Folder's outcome (ruling 441 (t)): the page says what
-            // happened, transient as its other lines, as a refused `Open log`
-            // says `Could not open the log`.
+            // Open Log Folder's outcome: the page says what happened, transient
+            // like its other lines.
             Some(PendingAction::LogFolder) => {
                 view.feedback = Some(match outcome {
                     ExternalOpenOutcome::Opened => "Opened the log folder".to_string(),
@@ -6876,11 +7220,10 @@ impl SettingsApp {
             return;
         }
         view.feedback = Some(match outcome {
-            // Accepted = the worker is running, and it is the ONLY completion this
-            // request gets: how an install or check ends reaches the headline, never
-            // this footer. So the footer says nothing (ruling 265, as for packages) —
-            // a kept "Installing…" would outlive a failed install. A check's headline
-            // says `Checking for updates…`; an install's row says `Installing aterm vX`.
+            // Accepted means the worker is running, and it is this request's only
+            // completion: how an install or check ends reaches the headline, never
+            // this footer, so the footer says nothing (a kept "Installing…" would
+            // outlive a failed install).
             UpdateOutcome::Accepted => {
                 view.feedback = None;
                 return;
@@ -6898,10 +7241,9 @@ impl SettingsApp {
             }
             UpdateOutcome::Failed { message } => format!("Update failed: {message}"),
             #[cfg(any(unix, test))]
-            // The record's own words (`capture_refused_waiting`), its cause
-            // named where the Version menu names it; the ledger's text is
-            // aterm.log's. No spacing: a press here is `Immediate`, which a
-            // refusal answers `Failed` and never arms the lane's spacing for.
+            // The record's own words (`capture_refused_waiting`), with no spacing:
+            // a press here is `Immediate`, and a refusal never arms the lane's
+            // spacing for it.
             UpdateOutcome::CaptureRefused { message } => {
                 let said = crate::update_words::capture_refused_waiting(
                     &message,
@@ -6927,11 +7269,9 @@ impl SettingsApp {
             return;
         }
         view.feedback = match outcome {
-            // Accepted = the worker is running; its completion arrives through
-            // the packages projection revision, which repaints the status card
-            // — its headline says `Checking…` and then how it ended, so the
-            // footer says nothing (ruling 265: `Packages request accepted`
-            // and a third `Package check completed` were CYA).
+            // Accepted means the worker is running; its completion arrives through
+            // the packages projection, whose status card says `Checking…` and then
+            // how it ended, so the footer says nothing.
             PackagesOutcome::Accepted => None,
             PackagesOutcome::Blocked { message } => Some(format!("Packages: {message}")),
             PackagesOutcome::Failed { message } => {
@@ -6983,13 +7323,13 @@ impl SettingsApp {
         view.mark_transient_status();
     }
 
-    /// SETTINGS ▸ MESSAGES' REDUCER ARMS (design §4.4). A chip sets the
-    /// filter and returns to the top; a title press toggles its entry open;
-    /// `settings/messages/select` is the DEEP LINK — select, drop a chip
-    /// that would hide the entry, page to it; a button on an entry names it
-    /// and the button by identity (`AppEffect::MessageAct` — never a path);
-    /// Copy puts the entry's text on the clipboard. Every arm repaints from
-    /// the shared projection; none touches the center.
+    /// Settings ▸ Messages' reducer arms (design §4.4). A chip sets the filter and
+    /// returns to the top; a title press toggles its entry open;
+    /// `settings/messages/select` is the deep link (select, drop a chip that would
+    /// hide the entry, scroll to it); an entry's button names the entry and button
+    /// by identity (`AppEffect::MessageAct`, never a path); Copy puts the entry's
+    /// text on the clipboard. Every arm repaints from the shared projection; none
+    /// touches the center.
     fn reduce_messages_action(
         &self,
         view: &mut SettingsViewState,
@@ -7000,8 +7340,7 @@ impl SettingsApp {
         let Some(rest) = action.strip_prefix(MESSAGES_ACTION_PREFIX) else {
             return EventResult::Bubble;
         };
-        // Every arm moves on from the stop the reader saw (ruling 264); the
-        // deep link lands afresh.
+        // Every arm but the deep link moves on from the stop the reader saw.
         if rest != "select" {
             view.settle_messages_scroll();
         }
@@ -7009,8 +7348,7 @@ impl SettingsApp {
         // button set it (`reduce_messages_row_action`).
         view.messages_note_entry = None;
         match rest {
-            // The severity and the tag COMBINE (ruling 262): each press sets its
-            // own filter and keeps the other.
+            // The severity and tag filters combine: each press sets its own.
             "filter/all" => {
                 view.messages_filter.warn_only = false;
                 view.page_scroll = 0;
@@ -7052,10 +7390,9 @@ impl SettingsApp {
                 };
                 self.reveal_message(view, id);
             }
-            // THE REPORT (design ruling 65): the entries the chip shows, newest
-            // first, each as its own Copy puts it, under the build information —
-            // what a report needs, in one press. The text is the engine's
-            // (ruling 397); the build information is this host's.
+            // The report: the entries the chip shows, newest first, each as its own
+            // Copy puts it, under the build information. The text is the engine's
+            // (`copy_all_text`); the build information is this host's.
             "copy-all" => {
                 let shown = messages_visible(&self.messages, &view.messages_filter);
                 if shown.is_empty() {
@@ -7071,8 +7408,7 @@ impl SettingsApp {
                     text,
                     sensitive: false,
                 });
-                // Its completion says `Copied` — never the About page's
-                // `Build information copied` (ruling 267).
+                // Its completion says `Copied`, not About's `Build information copied`.
                 view.pending.insert(operation, PendingAction::MessageCopy);
                 view.show_transient_line(format!(
                     "Copying {} message{}\u{2026}",
@@ -7082,10 +7418,9 @@ impl SettingsApp {
                 self.seat_messages_note(view);
                 return EventResult::Handled;
             }
-            // The folder the logs live in, opened by the host through NSWorkspace
-            // (never a shell, never a path from the view); named where there is
-            // no NSWorkspace. The open ANSWERS (ruling 441 (t)): its outcome
-            // replaces `Opening the log folder…`, so a failure is said.
+            // The logs' folder, opened by the host through NSWorkspace (never a
+            // shell, never a path from the view), or named where there is no
+            // NSWorkspace. Its outcome replaces `Opening the log folder…`.
             "open-folder" => {
                 let line = match self.messages.log_folder.as_deref() {
                     Some(_) if cfg!(target_os = "macos") => {
@@ -7104,10 +7439,9 @@ impl SettingsApp {
             _ => {
                 if let Some(tag) = rest.strip_prefix("show/") {
                     // A link from another page (Software Update's "View
-                    // Messages"): navigate FIRST — the navigation clears the
-                    // filter — then put the tag's chip down when the log holds
-                    // any of it (else the All chip: an empty filter would be a
-                    // blank page).
+                    // Messages"): navigate first, since navigation clears the
+                    // filter, then put the tag's chip down when the log holds any
+                    // of it (else All: an empty filter would be a blank page).
                     view.navigate(SettingsRoute::Messages);
                     view.messages_filter = if self
                         .messages
@@ -7274,10 +7608,9 @@ impl SettingsApp {
         }
     }
 
-    /// Move the keyboard from the focused message row `lines` rows down (up
-    /// when negative), the list following it by the least scroll that shows
-    /// the row (rulings 262 and 264). `false` — the ordinary scroll — when the
-    /// focus is not on a message row.
+    /// Move the keyboard from the focused message row `lines` rows down (up when
+    /// negative), the list following by the least scroll that shows the row.
+    /// `false` (the ordinary scroll) when focus is not on a message row.
     fn step_message_focus(&self, view: &mut SettingsViewState, lines: i32) -> bool {
         if view.route != SettingsRoute::Messages {
             return false;
@@ -7310,11 +7643,10 @@ impl SettingsApp {
         true
     }
 
-    /// The page Page Up / Page Down move by (ruling 267): on Messages the stops
-    /// the view from here shows — the compact header items it seats and the
-    /// entries — measured as the renderer seats them; elsewhere the window the
-    /// last render recorded ([`SettingsViewState::page_window`]); else the
-    /// historical eight. Never less than one.
+    /// What Page Up/Down move by: on Messages the stops the view from here shows
+    /// (the compact header items it seats and the entries), measured as the
+    /// renderer seats them; elsewhere the window the last render recorded
+    /// ([`SettingsViewState::page_window`]), else eight. Never less than one.
     fn shown_page(&self, view: &SettingsViewState) -> usize {
         if view.route == SettingsRoute::Messages
             && !view.compact_navigation
@@ -7329,14 +7661,11 @@ impl SettingsApp {
         view.page_window.get().unwrap_or(8).max(1)
     }
 
-    /// The bound the page-scroll reducer holds `page_scroll` to. On Settings
-    /// ▸ Messages it is the list's own [`MessagesPlan::limit`], measured as
-    /// the renderer seats the list in the geometry it last laid out in — the
-    /// one function the renderer and the reducer share (ruling 264), as
-    /// [`Self::step_message_focus`] and [`Self::shown_page`] measure: a page
-    /// action invalidates the limit the render recorded, and a wheel event
-    /// handled before the next render read that as 0 and snapped the list to
-    /// its top (ruling 441 (m)). Everywhere else, and before any Messages
+    /// The bound `page_scroll` is held to. On Settings ▸ Messages it is the list's
+    /// [`MessagesPlan::limit`], measured as the renderer seats the list in the
+    /// geometry it last laid out in, not the limit the render recorded: a page
+    /// action invalidates that, and a wheel event before the next render would
+    /// read 0 and snap the list to its top. Elsewhere, and before any Messages
     /// render, [`settings_page_scroll_limit`].
     fn page_scroll_limit(&self, view: &SettingsViewState) -> usize {
         if view.route == SettingsRoute::Messages
@@ -7533,14 +7862,12 @@ impl SettingsApp {
                 Some(true) => return,
                 Some(false) => {}
                 None => {
-                    // Not in the header. The sidebar and the footer are not
-                    // the header's to seat; a Tag control is: a publication
-                    // changes the header's FORM (ruling 262's two lines) —
-                    // new tags fold the chips into the `Tag: …` pop-up, an
-                    // eviction lets them out again, and a chip's tag can
-                    // leave the log — and takes the focused one out of the
-                    // tree. A chip goes to the pop-up's button where the
-                    // page seats it, as `close_messages_tag_menu` puts it.
+                    // Not in the header. The sidebar and footer are not the
+                    // header's to seat; a Tag control is: a publication can
+                    // change the header's form (new tags fold the chips into
+                    // the `Tag: …` pop-up, an eviction lets them out, a chip's
+                    // tag can leave the log) and take the focused control out of
+                    // the tree. A chip goes to the pop-up's button where seated.
                     let chip = focus.as_str().starts_with(MESSAGES_TAG_CHIPS);
                     if !chip && focus.as_str() != MESSAGES_TAG_MENU {
                         return;
@@ -7641,14 +7968,11 @@ impl SettingsApp {
         }
     }
 
-    /// Close Settings ▸ Messages' Tag pop-up after a choice in it: its chips
-    /// leave the tree with it, so a keyboard on one goes back to the control
-    /// that opened it ([`MESSAGES_TAG_MENU`]), as the choice picker's close
-    /// puts it back on its control (ruling 441 (k): it stayed on a chip that
-    /// was gone, and the next Return fell through to the page's Primary).
-    /// Only where the page draws that control and not the chip: a page that
-    /// lays its tags out as chips (a wider one, widened under the open
-    /// pop-up) keeps the keyboard on the chip chosen.
+    /// Close Settings ▸ Messages' Tag pop-up after a choice in it: its chips leave
+    /// the tree with it, so a keyboard on one goes back to the control that opened
+    /// it ([`MESSAGES_TAG_MENU`]), as the choice picker's close does. Only where the
+    /// page draws that control and not the chip: a page laying its tags out as
+    /// chips keeps the keyboard on the chip chosen.
     fn close_messages_tag_menu(&self, view: &mut SettingsViewState) {
         let was_open = std::mem::replace(&mut view.messages_tag_menu, false);
         let Some(chip) = view
@@ -7803,27 +8127,23 @@ fn settings_field_result_count(view: &SettingsViewState) -> usize {
         + usize::from(global_search && manual_search_has_match(view, &query))
         + search_page_hits(view, &query).len()
         + if modified_only {
-            // One row per selected key, so the key set's length IS the row
-            // count — the labels and value previews are pure render decoration.
+            // One row per selected key; labels and previews are decoration.
             authored_manual_override_keys(view).len()
         } else {
             0
         }
 }
 
-/// Select the authored leaves/opaque structures that the native Modified rows
-/// do not represent. `ConfigSnapshot::values` also contains intermediate table
-/// projections; suppressing a parent when a descendant exists prevents one
-/// `[packages]` header from masquerading as seven independent overrides.
-/// Unknown keys intentionally survive as Manual overrides for forward
-/// compatibility, but never gain a guessed destructive action.
+/// Select the authored leaves and opaque structures the native Modified rows do not
+/// represent. `ConfigSnapshot::values` also holds intermediate table projections; a
+/// parent with a present descendant is suppressed, so one `[packages]` header is not
+/// seven overrides. Unknown keys survive as Manual overrides for forward compatibility
+/// but never gain a guessed destructive action.
 ///
-/// The selection lives apart from the row decoration because global search
-/// needs the same bounded key set without paying for a label and a value
-/// preview per key. Both callers must consume this one selector: Search's
-/// card opens the key at a button's place in the matches, so a second
-/// hand-written predicate that drifted from this one would silently open the
-/// wrong key. Keys arrive already sorted — `raw_values` is a `BTreeMap`.
+/// Kept apart from the row decoration so global search gets the same key set without
+/// a label and preview per key. Both callers must use this one selector: Search's
+/// card opens the key at a button's place in the matches, so a drifted copy would
+/// open the wrong key. Keys arrive sorted (`raw_values` is a `BTreeMap`).
 fn authored_manual_override_keys(view: &SettingsViewState) -> Vec<&str> {
     let represented = view
         .legacy
@@ -7832,8 +8152,6 @@ fn authored_manual_override_keys(view: &SettingsViewState) -> Vec<&str> {
         .filter(|field| settings_field_is_visible(view, field.key, true, false))
         .map(|field| field.key)
         .collect::<BTreeSet<_>>();
-    // Borrowed, not cloned: both this scan and the range probe below only read
-    // `raw_values`, so the grouped parents never need owned copies.
     let grouped_structures = view
         .raw_values
         .keys()
@@ -7854,9 +8172,6 @@ fn authored_manual_override_keys(view: &SettingsViewState) -> Vec<&str> {
         .filter(|key| {
             let key = *key;
             let grouped_parent = grouped_structures.contains(&key);
-            // `strip_prefix` asks the same question the old `format!("{parent}.")`
-            // prefix did — is `key` under `parent`? — without allocating one
-            // throwaway `String` per (key x grouped structure) pair.
             let grouped_descendant = grouped_structures.iter().any(|parent| {
                 key.strip_prefix(*parent)
                     .is_some_and(|rest| rest.starts_with('.'))
@@ -7875,12 +8190,8 @@ fn authored_manual_override_keys(view: &SettingsViewState) -> Vec<&str> {
                 // A table projection is structural, not another setting, when
                 // one of its authored descendants is already present.
                 && (grouped_parent || {
-                    // Built lazily — a grouped parent never needs it — and now
-                    // MOVED into the range bound instead of cloned for it. The
-                    // membership test is the same `starts_with("{key}.")`,
-                    // spelled against `key` so the prefix need not outlive the
-                    // range. Ranging from `key` itself instead would be wrong:
-                    // any sibling byte below '.' sorts between "key" and "key.".
+                    // Built only when needed. Ranging from `key` itself would be
+                    // wrong: a sibling byte below '.' sorts between "key" and "key.".
                     let prefix = format!("{key}.");
                     !view.raw_values.range(prefix..).next().is_some_and(
                         |(candidate, _)| {
@@ -7956,13 +8267,14 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
     overrides
 }
 
-/// What Modified says of a key the harness's `[disk]` reader does not read as written
-/// (a `disk` that is not a table, a `[disk]` knob of another type, or one written below
-/// another table's header, which TOML files under that table), or of a key that holds one, as an array or a grouped
-/// map listed as one row does: a value aterm couldn't use. A removal knob of these turns every
-/// removal off, so the row is never "No effect", "Compatibility-only" or "Unknown key",
-/// and it has no Reset: removing a removal knob of these turns the removal back on. The
-/// reader's own note is the row's effect note ([`disk_fault_note`]).
+/// What Modified says of a key the harness's `[disk]` reader does not read as written (a
+/// `disk` that is not a table, a `[disk]` knob of another type, or one written below
+/// another table's header, which TOML files under that table), or of a key holding one
+/// (an array, or a grouped map listed as one row): a value aterm couldn't use. A removal
+/// knob of these turns every removal off, so the row is never "No effect",
+/// "Compatibility-only" or "Unknown key", and it has no Reset (removing the knob would
+/// turn the removal back on). The reader's note is the row's effect note
+/// ([`disk_fault_note`]).
 fn disk_fault_override(view: &SettingsViewState, key: &str) -> Option<ManualOverride> {
     let (at, _) = crate::native_config_language::disk_fault_at(&view.disk_faults, key)?;
     let watch = crate::native_config_language::config_schema_entry("disk")
@@ -8018,13 +8330,10 @@ fn disk_fault_note(
     ))
 }
 
-/// A RETIRED `[packages]` SPELLING ON SETTINGS ▸ MODIFIED (review of the Phase 4 merge,
-/// 2026-09-23): named as what it is — the retired spelling of the switch that reads it —
-/// with what it does to that switch now, and resettable. It has no field under the one
-/// model, so it fell through to "Forward-compatible config key", a key from a NEWER build,
-/// while the config editor called it deprecated and Settings ▸ Packages retired: three
-/// stories about one key, and the one on Modified told a person whose updates it held off
-/// that it was inert. The effect is the resolvers' own fold (`Config::packages_enabled`:
+/// A retired `[packages]` spelling on Settings ▸ Modified: named as the retired spelling
+/// of the switch that reads it, with what it does to that switch now, and resettable. It
+/// has no field, so without this it would read as a forward-compatible key from a newer
+/// build. The effect is the resolvers' own fold (`Config::packages_enabled`:
 /// `auto_update = false` is off whatever `enabled` says; `packages_auto_install`:
 /// `seed_install` only while `auto_install` is unset).
 fn retired_packages_override(view: &SettingsViewState, key: &str) -> Option<ManualOverride> {
@@ -8146,12 +8455,10 @@ fn manual_override_reset_action(key: &str) -> Option<ActionId> {
 const MANUAL_OVERRIDE_VALUE_PREVIEW_GRAPHEMES: usize = 72;
 
 fn bounded_manual_override_value(raw: &str) -> String {
-    // Normalize line/control whitespace before bounding, but keep every
-    // user-visible unit atomic. A scalar/byte cap can detach an accent,
-    // regional-indicator half, or one member of a ZWJ emoji sequence. Stream
-    // the projection: Manual values can be multi-megabyte strings, while this
-    // glance surface never needs to retain more than 72 clusters plus proof
-    // that a 73rd visible cluster exists.
+    // Normalize control whitespace, then bound by grapheme so no visible unit
+    // splits (an accent, half a regional indicator, a ZWJ member). Streamed:
+    // Manual values can be megabytes, and this needs only 72 clusters plus proof
+    // that a 73rd exists.
     let mut preview = String::new();
     let mut retained = 0usize;
     let mut previous_space = true;
@@ -8467,6 +8774,38 @@ fn theme_pair_words(dark: &str, light: &str) -> String {
 
 /// A row's value in the words its control shows, from the raw values `raw`
 /// reads; an absent key reads as its default.
+/// What the type setting `key` reads where aterm.toml leaves it to the theme
+/// `theme` (a `theme` value) on the side the page shows: the theme's value as
+/// the row shows it, and whose ("Studio’s 1.15×"); `None` where that theme
+/// sets none.
+fn theme_type_words(view: &SettingsViewState, key: &str, theme: Option<String>) -> Option<String> {
+    let side = theme_visible_side(view, view.presented_motion.get().system_dark);
+    let typo = Config {
+        theme,
+        ..Config::default()
+    }
+    .resolved_typography_with_flag(side, &view.assets.themes, None);
+    let value = prefs::theme_value_for(&Config::default(), &typo, key)?;
+    let label = view
+        .assets
+        .themes
+        .meta(&typo.id)
+        .map_or_else(|| typo.id.clone(), |meta| meta.display_name);
+    let shown = match view.field_by_key(key).map(|field| field.kind) {
+        Some(EditKind::Float | EditKind::Integer) => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+            .map_or_else(
+                || value.clone(),
+                |number| slider_readout(key, number, compact_f64(number)),
+            ),
+        _ => value,
+    };
+    Some(format!("{label}\u{2019}s {shown}"))
+}
+
 fn row_words(view: &SettingsViewState, key: &str, raw: &dyn Fn(&str) -> Option<String>) -> String {
     let default = || modified_default_words(view, key).unwrap_or_else(|| "its default".to_string());
     if key == prefs::EDIT_PALETTE_OVERRIDES {
@@ -8540,6 +8879,13 @@ fn row_words(view: &SettingsViewState, key: &str, raw: &dyn Fn(&str) -> Option<S
         // One theme reads as the name its card shows (a themes-folder file
         // goes by its `name`, never its file id).
         return meta.display_name;
+    }
+    // A type setting aterm.toml leaves to a theme that sets it reads as the
+    // theme's value, the one drawn, never aterm's own default.
+    if raw(key).is_none()
+        && let Some(words) = theme_type_words(view, key, raw(prefs::EDIT_THEME))
+    {
+        return words;
     }
     let value = raw(key);
     match view.field_by_key(key).map(|field| field.kind) {
@@ -8836,9 +9182,8 @@ fn for_each_authored_manual_match(
     query: &str,
     mut visit: impl FnMut(&str, SearchRank) -> bool,
 ) {
-    // The key selector, not the decorated rows: this path reads only `.key`, so
-    // building a label and a value preview per authored override would be pure
-    // waste on every keystroke while search is active.
+    // The key selector, not the decorated rows: only `.key` is read, and this
+    // runs on every search keystroke.
     let mut folded = String::new();
     for key in authored_manual_override_keys(view) {
         // Schema membership decides this on its own and now costs a binary
@@ -8850,9 +9195,8 @@ fn for_each_authored_manual_match(
         {
             continue;
         }
-        // One reused buffer instead of a fresh `to_ascii_lowercase` per key.
-        // `char::to_ascii_lowercase` leaves non-ASCII untouched exactly as the
-        // byte-wise `str::to_ascii_lowercase` did.
+        // One reused buffer; `char::to_ascii_lowercase` leaves non-ASCII untouched,
+        // as `str::to_ascii_lowercase` does.
         folded.clear();
         folded.extend(key.chars().map(|character| character.to_ascii_lowercase()));
         if let Some(score) = crate::native_config_language::query_match_score(
@@ -8891,11 +9235,9 @@ fn manual_search_matching_keys(view: &SettingsViewState, query: &str) -> Vec<Str
     keys.into_iter().map(|(_, _, key)| key).collect()
 }
 
-/// Boolean twin of `manual_search_matching_keys` for the one caller that only
-/// asks whether Search lists an aterm.toml card at all. Authored overrides
-/// can only ADD keys to the set, so an early `true` from the schema sweep is
-/// the same answer the fully materialized set would give — and it skips the
-/// authored scan entirely.
+/// Boolean twin of `manual_search_matching_keys` for the caller that asks only
+/// whether Search lists an aterm.toml card at all. Authored overrides only add
+/// keys, so an early `true` from the schema sweep is the full set's answer.
 fn manual_search_has_match(view: &SettingsViewState, query: &str) -> bool {
     if query.is_empty() {
         return false;
@@ -9036,22 +9378,19 @@ fn native_updater_here(availability: SettingsAvailability) -> bool {
     row_available_here(prefs::EDIT_UPDATE_ENABLED, availability)
 }
 
-/// Audited shipping consumer for an ordinary Advanced control. This is more
-/// specific than a visibility allowlist: every retained row must name the
-/// subsystem that consumes it. The enum identifies ownership, while
-/// [`prefs::application_timing`] discloses when the complete effect is visible;
-/// [`prefs::application_has_live_effect`] also identifies timing-disclosed
-/// mixed cases such as next-input width policy and session-overridable Matrix
-/// Rain, plus HDR glow's live-disable/deferred-enable split. Compatibility keys
-/// and values with no shipping effect cannot drift back into the form merely
-/// because they still deserialize.
+/// Audited shipping consumer for an ordinary Advanced control: every retained row
+/// names the subsystem that consumes it. [`prefs::application_timing`] discloses
+/// when the effect is visible, and [`prefs::application_has_live_effect`] covers
+/// mixed cases (next-input width policy, session-overridable Matrix Rain, HDR
+/// glow's live-disable/deferred-enable split). Keys with no shipping effect cannot
+/// drift back into the form merely because they still deserialize.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdvancedEffectPath {
     RendererPalette,
-    /// The SPLIT COMPOSITOR — the pass that builds one window frame out of
-    /// several panes' snapshots and the divider gaps between them. Distinct from
-    /// `RendererPalette`: nothing here reaches a renderer knob, the value is read
-    /// while composing each frame's cells.
+    /// The split compositor: the pass that builds one window frame from several
+    /// panes' snapshots and the divider gaps between them. Unlike
+    /// `RendererPalette`, the value reaches no renderer knob; it is read while
+    /// composing each frame's cells.
     Compositor,
     RendererTypography,
     CursorAndMotion,
@@ -9090,7 +9429,31 @@ enum AdvancedEffectPath {
 /// explicit overrides also remain visible in Modified. New config keys default
 /// to Manual until both their shipping consumer and application timing have
 /// been audited here.
+///
+/// The answer is the key's alone ([`advanced_effect_of`]), and every page a
+/// render lays out asks it of every field, so this thread keeps each.
 fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
+    thread_local! {
+        static ANSWERS: RefCell<aterm_hash::FxHashMap<Box<str>, Option<AdvancedEffectPath>>> =
+            RefCell::new(aterm_hash::FxHashMap::default());
+    }
+    if let Some(answer) = ANSWERS.with_borrow(|answers| answers.get(key).copied()) {
+        return answer;
+    }
+    let answer = advanced_effect_of(key);
+    ANSWERS.with_borrow_mut(|answers| {
+        // The registry's keys and a config's own: a bound only a config of
+        // thousands of keys reaches.
+        if answers.len() >= 4_096 {
+            answers.clear();
+        }
+        answers.insert(key.into(), answer);
+    });
+    answer
+}
+
+/// [`native_advanced_effect`]'s map.
+fn advanced_effect_of(key: &str) -> Option<AdvancedEffectPath> {
     use AdvancedEffectPath as Effect;
 
     // The consumer is named on every platform; where this platform lacks it
@@ -9167,7 +9530,7 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         // Manual, so a user whose only complaint is "too bright" had no slider
         // to move and had to file a bug instead.
         | prefs::EDIT_CURSOR_TRAIL_INTENSITY
-        // THE STYLE TUNING the Cursor Styles page shows for the selected
+        // The style tuning the Cursor Styles page shows for the selected
         // style: each is read when the glow config resolves
         // (`aterm_effects::cursor_fx::resolve_glow_config`) or by the GPU post
         // pass (bloom, shimmer), live on the next frame.
@@ -9219,37 +9582,23 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_SEARCH_HISTORY_LINES
         | prefs::EDIT_BIDI
         | prefs::EDIT_AMBIGUOUS_WIDTH => Some(Effect::TerminalRuntime),
-        // `confirm_multiline_paste` is live EVERYWHERE now: macOS asks through
-        // the window sheet, Windows through MessageBoxW, and Linux through the
-        // in-window banner (`paste_banner`) — the "no prompt elsewhere" gate
-        // this arm used to carry described the audited silent no-op.
+        // `confirm_multiline_paste` is live everywhere: macOS asks through the
+        // window sheet, Windows through MessageBoxW, Linux through the in-window
+        // banner (`paste_banner`).
         prefs::EDIT_COPY_ON_SELECT
         | prefs::EDIT_OPTION_AS_META
         | prefs::EDIT_PREDICTIVE_ECHO
         | prefs::EDIT_PREDICTIVE_ECHO_EDITING
         | prefs::EDIT_CONFIRM_MULTILINE_PASTE => Some(Effect::InputRuntime),
         prefs::EDIT_MATRIX_RAIN_ENABLED
-        // Sound VOLUME and PALETTE (2026-07-24 UX audit): both shipped and
-        // both consumed by `trail_audio`, neither reachable from Settings —
-        // the same gap as the intensity dial above.
+        // Sound volume and palette, both consumed by `trail_audio`.
         | prefs::EDIT_TRAIL_SOUND_VOLUME
         | prefs::EDIT_TRAIL_SOUND_STYLE
-        // THE SOUND MENU (owner ask: "add the volume and SFX menu to
-        // settings"). Each of these was already shipping, already consumed,
-        // and reachable ONLY by hand-editing `aterm.toml` — the exact defect
-        // the intensity dial above was retained to fix, repeated across every
-        // remaining audible knob:
-        //   * `tone_melody`     — `app_render`/`app_input` read
-        //                         `Config::tone_melody_or_default` to pick the
-        //                         synth's scale table;
-        //   * `trail_sound_bed` — `app_render` stamps
-        //                         `Config::trail_sound_bed_or_default` on every
-        //                         emitted event as `SoundEvent::bed`;
-        //   * `trail_sound_riff`— the sing-along's own gate (see below);
-        //   * the two BONK keys — `drain_curse_bonk_cues` reads them per tick;
-        //                         they are `[sparkle_words]` leaves in the file
-        //                         but SFX in the UI, so they belong in this
-        //                         menu rather than two panes away.
+        // The Sound menu. `tone_melody` picks the synth's scale table
+        // (`Config::tone_melody_or_default`); `trail_sound_bed` is stamped on every
+        // event as `SoundEvent::bed`; `trail_sound_riff` gates the sing-along; the
+        // two bonk keys, read per tick by `drain_curse_bonk_cues`, are
+        // `[sparkle_words]` leaves in the file but SFX in the UI.
         | prefs::EDIT_TONE_MELODY
         | prefs::EDIT_TRAIL_SOUND_BED
         | prefs::EDIT_TRAIL_SOUND_RIFF
@@ -9258,7 +9607,7 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         // The output streak's pip: `app_render` reads
         // `Config::output_streak_sound_or_default` when the streak plays it.
         | prefs::EDIT_OUTPUT_STREAK_SOUND
-        // PRISM WAKE itself: every streak seam reads `App::output_streak_shows`
+        // Prism Wake itself: every streak seam reads `App::output_streak_shows`
         // each frame, beside Matrix rain in the Effects group.
         | prefs::EDIT_OUTPUT_STREAK_ENABLED => Some(Effect::EffectsRuntime),
         // THE AUDIBLE BEL. Unlike every key above it is NOT a synth voice —
@@ -9349,21 +9698,11 @@ fn settings_page_scroll_limit(view: &SettingsViewState) -> usize {
     settings_field_result_count(view).saturating_sub(1)
 }
 
-impl NativeAppModel for SettingsApp {
-    type ViewState = SettingsViewState;
-
-    fn descriptor(&self) -> AppDescriptor {
-        AppDescriptor {
-            kind: crate::native_app::AppKind::Settings,
-            name: "Settings",
-            icon: AppIcon::Settings,
-            singleton: true,
-        }
-    }
-
-    fn update(
+impl SettingsApp {
+    /// [`NativeAppModel::update`]'s reduction of one event.
+    fn update_event(
         &mut self,
-        view: &mut Self::ViewState,
+        view: &mut SettingsViewState,
         event: AppEvent,
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
@@ -9468,6 +9807,11 @@ impl NativeAppModel for SettingsApp {
             // screen: the list scrolls as `act` scrolls it before a press.
             #[cfg(any(a11y_tree, test))]
             AppEvent::RevealControl(key) => view.reveal_listed_control(&key),
+            // A press on a control's picture in the strip under the list's
+            // room scrolls it into the room, as a press on one an edge cuts
+            // does, and works nothing: the strip holds no live control a bar
+            // that comes could take from under the pointer.
+            AppEvent::PressListPicture(key) => view.press_list_picture(key),
             AppEvent::FocusChanged(focus) => {
                 if focus
                     .as_ref()
@@ -9629,69 +9973,24 @@ impl NativeAppModel for SettingsApp {
                 }
                 true
             }
+            // A FOCUSED SLIDER'S VALUE KEYS ARE ITS ARROWS: a step, ten with
+            // Shift. Page Up, Page Down, Home and End stay the list's keys
+            // on a slider too, however the keyboard got there: a key that
+            // turns the page from one control must never write aterm.toml
+            // from the next (a Page Down that landed on Font size made every
+            // Page Down after it ten pixels more).
             AppEvent::TextInput(TextInputEvent::Left { extend }) if view.focused_slider() => {
-                self.reduce_slider_move(
-                    view,
-                    SliderMove::Step {
-                        delta: -1,
-                        big: extend,
-                    },
-                    cx,
-                );
+                self.reduce_slider_step(view, -1, extend, cx);
                 true
             }
             AppEvent::TextInput(TextInputEvent::Right { extend }) if view.focused_slider() => {
-                self.reduce_slider_move(
-                    view,
-                    SliderMove::Step {
-                        delta: 1,
-                        big: extend,
-                    },
-                    cx,
-                );
-                true
-            }
-            // A FOCUSED SLIDER TAKES HOME AND END to its domain's ends, and
-            // Page Up and Page Down as ten steps, as platform sliders do; the
-            // keyboard stays on it. (The list's own Home/End and page keys
-            // act from every other control, and from a slider those keys
-            // carried the keyboard to until the person works it:
-            // [`SettingsViewState::list_keys_carried`].)
-            AppEvent::TextInput(
-                edge @ (TextInputEvent::Home { .. } | TextInputEvent::End { .. }),
-            ) if view.focused_slider()
-                && view.choice_picker.is_none()
-                && !view.list_keys_carried() =>
-            {
-                self.reduce_slider_move(
-                    view,
-                    SliderMove::Edge {
-                        home: matches!(edge, TextInputEvent::Home { .. }),
-                    },
-                    cx,
-                );
-                true
-            }
-            AppEvent::ScrollPage(direction)
-                if view.focused_slider()
-                    && view.choice_picker.is_none()
-                    && !view.list_keys_carried() =>
-            {
-                self.reduce_slider_move(
-                    view,
-                    SliderMove::Step {
-                        delta: if direction < 0 { -1 } else { 1 },
-                        big: true,
-                    },
-                    cx,
-                );
+                self.reduce_slider_step(view, 1, extend, cx);
                 true
             }
             AppEvent::TextInput(TextInputEvent::Cancel) => {
-                // A Tag pop-up the page does not draw (a page widened under
-                // it lays its tags out as chips) closes without taking the
-                // Escape, which goes on to what the glass shows (ruling 441
-                // (p)): never the keyboard on a button the tree lacks.
+                // A Tag pop-up the page does not draw (a page widened under it
+                // shows chips) closes without taking the Escape, which goes on to
+                // what the page shows.
                 if view.messages_tag_menu && !self.messages_tag_menu_drawn(view) {
                     view.messages_tag_menu = false;
                 }
@@ -9702,6 +10001,10 @@ impl NativeAppModel for SettingsApp {
                     None
                 };
                 view.cancel_transient();
+                // Escape over a Keep on its way is its Revert: a write.
+                if view.showcase.revert_asked {
+                    self.revert_trial(view, cx);
+                }
                 // The Tag pop-up closed with the keyboard back on its button:
                 // the list keeps its place where the smaller card pins the
                 // header again, and the page shows that button (ruling 441
@@ -9740,8 +10043,8 @@ impl NativeAppModel for SettingsApp {
             // choice, a message row's first or last row. In the page's list
             // (the category sheet's included) they move the list to its top
             // or bottom and take the keyboard to its first or last control,
-            // ringed, wherever on the list it was, so the next arrow steps on
-            // from there and Cursor Styles previews the row it lands on.
+            // ringed, so the next arrow steps on from there and Cursor Styles
+            // previews the row it lands on.
             AppEvent::TextInput(
                 edge @ (TextInputEvent::Home { .. } | TextInputEvent::End { .. }),
             ) if !view.text_entry_active() => {
@@ -9780,12 +10083,10 @@ impl NativeAppModel for SettingsApp {
                 true
             }
             AppEvent::ScrollLines(lines) => {
-                // THE LOG'S ARROW KEYS (rulings 262 and 264): on a message row
-                // they move between rows and the list follows; Space and
-                // Return open and close it. Elsewhere — the wheel, a screen
-                // reader's scroll on the list — the list scrolls by entry,
-                // and a control the compact page scrolls away hands the
-                // keyboard to the list (ruling 267).
+                // On a message row the arrows move between rows and the list
+                // follows; Space and Return open and close it. Elsewhere (the
+                // wheel, a screen reader's scroll) the list scrolls by entry, and
+                // a control the compact page scrolls away hands the keyboard on.
                 view.settle_messages_scroll();
                 if !self.step_message_focus(view, lines) {
                     view.page_reveal = None;
@@ -9833,10 +10134,10 @@ impl NativeAppModel for SettingsApp {
                 true
             }
             AppEvent::StepFocus(lines) => {
-                // UP AND DOWN (ruling 264): on a message row they move
-                // between rows; on any other control in the page's list they
-                // move to the control before or after it, and the list
-                // follows; elsewhere the list scrolls a row.
+                // Up and Down: on a message row they move between rows; on any
+                // other control in the page's list they move to the control
+                // before or after it, and the list follows; elsewhere the list
+                // scrolls a row.
                 view.settle_messages_scroll();
                 if !self.step_message_focus(view, lines) && !view.step_list_focus(lines) {
                     view.page_reveal = None;
@@ -9863,15 +10164,12 @@ impl NativeAppModel for SettingsApp {
                 view.step_highlight(step)
             }
             AppEvent::ScrollPage(direction) => {
-                // PAGE UP / PAGE DOWN MOVE BY THE PAGE SHOWN (ruling 267):
-                // the compact category list's six rows are six, not eight.
-                // From a sidebar row they turn the page's list and take the
-                // keyboard into it, to the first control the new screen
-                // shows, for Page Up too (the keyboard comes from outside the
-                // list, so it starts at the screen's top; at the list's top a
-                // Page Up never sends it down to the screen's last control),
-                // so Home and End then act on the list too, never on the
-                // sidebar the keyboard has left.
+                // Page Up/Down move by the page shown (`shown_page`). From a
+                // sidebar row they turn the page's list and take the keyboard
+                // into it, to the first control the new screen shows, as a
+                // turn from inside the list does
+                // ([`SettingsViewState::keep_list_focus_on_screen`]), so Home
+                // and End then act on the list, not on the sidebar.
                 view.settle_messages_scroll();
                 let from_sidebar = view.navigation_has_focus();
                 let direction = direction.signum();
@@ -9889,9 +10187,9 @@ impl NativeAppModel for SettingsApp {
                         self.keep_message_focus_seated(view);
                     }
                     if from_sidebar {
-                        view.focus_list_screen(true);
+                        view.focus_list_screen();
                     } else {
-                        view.keep_list_focus_on_screen(direction > 0);
+                        view.keep_list_focus_on_screen();
                     }
                 }
                 true
@@ -9902,13 +10200,11 @@ impl NativeAppModel for SettingsApp {
                     .feedback
                     .as_deref()
                     .is_some_and(|message| message.starts_with("Config reload failed:"));
-                // Snapshot publication is monotonic. A delayed older event must
-                // never roll a native view back, and a byte-identical watcher
-                // observation (same revision, newer host-analysis generation)
-                // must not dismiss an open picker or in-progress field edit.
-                // Equal revisions remain meaningful only while reconciling an
-                // indeterminate write or clearing a previously surfaced reload
-                // failure; those paths deliberately re-admit the stable bytes.
+                // Snapshot publication is monotonic: an older event never rolls a
+                // view back, and a byte-identical watcher observation (same
+                // revision, newer analysis generation) must not dismiss an open
+                // picker or field edit. An equal revision is re-admitted only to
+                // reconcile an indeterminate write or clear a reload failure.
                 if snapshot.revision < view.snapshot_revision
                     || (snapshot.revision == view.snapshot_revision
                         && !reconciled_unverified_publication
@@ -9994,9 +10290,8 @@ impl NativeAppModel for SettingsApp {
             }
             AppEvent::PackagesChanged { revision } => {
                 self.packages_revision = self.packages_revision.max(revision);
-                // The worker's typed completion reaches the card's headline
-                // and detail (a failure names its cause there); the footer
-                // never repeats it (ruling 265).
+                // The worker's typed completion reaches the card's headline and
+                // detail; the footer never repeats it.
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
                 true
@@ -10048,9 +10343,8 @@ impl NativeAppModel for SettingsApp {
                     self.seat_followed_focus(view, id);
                 }
                 // A list at its newest entry takes the record at its top and
-                // pushes an entry opened low in it out whole; the ring can
-                // evict the focused entry. Either took its focused control
-                // out of the tree (ruling 441 (o), as a scroll does).
+                // pushes an entry opened low in it out whole, and the ring can
+                // evict the focused entry: either can unseat the focused control.
                 self.keep_message_focus_seated(view);
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
@@ -10084,6 +10378,35 @@ impl NativeAppModel for SettingsApp {
             EventResult::Bubble
         }
     }
+}
+
+impl NativeAppModel for SettingsApp {
+    type ViewState = SettingsViewState;
+
+    fn descriptor(&self) -> AppDescriptor {
+        AppDescriptor {
+            kind: crate::native_app::AppKind::Settings,
+            name: "Settings",
+            icon: AppIcon::Settings,
+            singleton: true,
+        }
+    }
+
+    fn update(
+        &mut self,
+        view: &mut Self::ViewState,
+        event: AppEvent,
+        cx: &mut UpdateCx<'_>,
+    ) -> EventResult {
+        let result = self.update_event(view, event, cx);
+        // A write this event sent offers its Undo beside the status the
+        // press put up ([`SettingsViewState::next_undo`]).
+        view.seat_next_undo();
+        // The Reset All question this event closed gives the page's list
+        // back where it was.
+        view.settle_question_scroll();
+        result
+    }
 
     fn view(&self, view: &Self::ViewState, cx: &ViewCx<'_>) -> UiTree {
         settings_tree(
@@ -10100,13 +10423,10 @@ impl NativeAppModel for SettingsApp {
         out.push(Command {
             id: ActionId::new("settings/search"),
             title: "Settings: Search".to_string(),
-            // AUDIT I9 — the advertised chord must be the one that WORKS here.
-            // Off macOS `find` is seeded to `ctrl+shift+f` (`PLATFORM_DEFAULT_
-            // PAIRS`) and `find_requested` focuses `settings/search` when Settings
-            // is frontmost, so Ctrl+Shift+F genuinely opens this — while the
-            // literal "Cmd-F" would mean WIN+F, which the shell owns. Named at
-            // the SOURCE rather than left to `platform_accel`'s blanking because
-            // a true chord is better than no chord.
+            // The chord that works here: off macOS `find` is seeded to
+            // `ctrl+shift+f` (`PLATFORM_DEFAULT_PAIRS`) and `find_requested`
+            // focuses `settings/search` when Settings is frontmost; "Cmd-F" there
+            // would mean Win+F, which the shell owns.
             shortcut: Some(
                 if cfg!(target_os = "macos") {
                     "Cmd-F"
@@ -10120,15 +10440,11 @@ impl NativeAppModel for SettingsApp {
         out.push(Command {
             id: ActionId::new("settings/undo"),
             title: "Settings: Undo Last Change".to_string(),
-            // AUDIT I9 — CORRECTING THE AUDIT. The backlog listed this "Cmd-Z"
-            // as dead on macOS too; it is not. `app_native`'s key lowering has
-            // `Key::Character('z') if command` -> `TextInput(Undo)`, and this
-            // app's reducer turns that into `settings/undo` whenever no field is
-            // being edited and search has no focus — so ⌘Z genuinely undoes the
-            // last settings change. `command` is `SUPER | CTRL`, so the same arm
-            // makes **Ctrl+Z** live off macOS (nothing in the keybinding table
-            // claims `ctrl+z` first). The label was not a lie, it was a
-            // MISTRANSLATION: name the modifier this keyboard actually has.
+            // `app_native` lowers `Key::Character('z') if command` to
+            // `TextInput(Undo)`, which this reducer turns into `settings/undo` when
+            // no field is edited and search has no focus. `command` is
+            // `SUPER | CTRL`, so Ctrl+Z works off macOS (no keybinding claims
+            // `ctrl+z` first).
             shortcut: Some(
                 if cfg!(target_os = "macos") {
                     "Cmd-Z"
@@ -10145,7 +10461,7 @@ impl NativeAppModel for SettingsApp {
             shortcut: None,
             // In step with Modified's Reset All button: off when it would
             // reset nothing.
-            enabled: !view.config_patch_pending() && reset_all_count(view) > 0,
+            enabled: reset_all_count(view) > 0,
         });
         if view.has_unsaved_field_drafts() {
             out.extend(Self::draft_recovery_commands());
@@ -10265,11 +10581,10 @@ impl NativeAppModel for SettingsApp {
     }
 
     fn prepare_close(&mut self, request: CloseRequest, cx: &mut UpdateCx<'_>) -> CloseReadiness {
-        // A SEAMLESS UPDATE CARRIES THE DRAFTS: its successor reopens this view
-        // from the handoff layout holding them, unsaved (plan P2-2). Every
-        // other scope — a close, a quit, an update whose successor reopens
-        // nothing — would drop them, so it is held for review as before; so is
-        // a view holding a draft the layout cannot carry.
+        // A seamless update carries the drafts: its successor reopens this view from
+        // the handoff layout holding them, unsaved. Every other scope (a close, a
+        // quit, an update whose successor reopens nothing) would drop them, so it
+        // is held for review; so is a view holding a draft the layout cannot carry.
         let blocked = match self.draft_views.get(&cx.view_id()) {
             None => false,
             Some(&held) => held || request.scope != crate::native_app::CloseScope::CarriedRelaunch,
@@ -10285,11 +10600,9 @@ impl NativeAppModel for SettingsApp {
     }
 }
 
-/// Build the `key -> index` side table for [`SettingsViewState::field_index`].
-/// FIRST occurrence wins, which is exactly what `fields.iter().find(..)` returns,
-/// so a duplicate key (there are none today — see
-/// `editable_field_keys_are_unique_and_lowercase`) cannot change what a lookup
-/// resolves to, only how fast it resolves.
+/// Build the `key -> index` table for [`SettingsViewState::field_index`]. First
+/// occurrence wins, as `fields.iter().find(..)` does, so a duplicate key (none
+/// exist: `editable_field_keys_are_unique_and_lowercase`) changes only speed.
 fn build_field_index(fields: &[EditField]) -> aterm_hash::FxHashMap<&'static str, usize> {
     let mut index =
         aterm_hash::FxHashMap::with_capacity_and_hasher(fields.len(), aterm_hash::FxBuildHasher);
@@ -10327,26 +10640,23 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
     let emphasis = sparkle.and_then(|s| s.emphasis.as_ref());
     match key {
         "gpu" => config.gpu,
-        // The dotted `[matrix_rain] enabled` key (Recipe A): the CONFIGURED
-        // value only — an absent table/key stays `None` (not explicit),
-        // mirroring the snapshot projection.
+        // The dotted `[matrix_rain] enabled` key: the configured value only; an
+        // absent table or key stays `None`, as in the snapshot projection.
         prefs::EDIT_MATRIX_RAIN_ENABLED => config.matrix_rain.as_ref().and_then(|mr| mr.enabled),
         prefs::EDIT_OUTPUT_STREAK_ENABLED => config
             .output_streak
             .as_ref()
             .and_then(|streak| streak.enabled),
-        // The dotted `[packages]` switches, same contract as above: the CONFIGURED
-        // value only, so the fallback path reports a written `enabled`/`auto_install`
-        // as explicit (correct OCC expectations).
+        // The dotted `[packages]` switches: the configured value only, so a written
+        // `enabled`/`auto_install` reads as explicit (correct OCC expectations).
         prefs::EDIT_PACKAGES_ENABLED => config.packages.as_ref().and_then(|p| p.enabled),
         prefs::EDIT_PACKAGES_AUTO_INSTALL => config.packages.as_ref().and_then(|p| p.auto_install),
         prefs::EDIT_UPDATE_ENABLED => config.update.as_ref().and_then(|u| u.enabled),
         prefs::EDIT_REROUTE_ANNOUNCE => config.reroute.as_ref().and_then(|r| r.announce),
         "sparkle_words.enabled" => sparkle.and_then(|s| s.enabled),
-        // The DEPTH-2 `[sparkle_words.*]` Bool leaves (every Bool registered in
-        // `prefs::NESTED_LEAVES` two tables down), same contract again: the
-        // snapshot projection flattens dotted paths at any depth, and the
-        // fallback must agree on what counts as explicitly configured.
+        // The depth-2 `[sparkle_words.*]` Bool leaves (`prefs::NESTED_LEAVES`): the
+        // snapshot flattens dotted paths at any depth, and the fallback must agree
+        // on what is explicitly configured.
         "sparkle_words.profanity.enabled" => profanity.and_then(|p| p.enabled),
         "sparkle_words.profanity.magic" => profanity.and_then(|p| p.magic),
         "sparkle_words.feline.enabled" => feline.and_then(|f| f.enabled),
@@ -10886,7 +11196,7 @@ fn cursor_style_candidate(state: &SettingsViewState) -> Option<String> {
     if !cursor_style_list_live(state) {
         return None;
     }
-    let writing = state.config_key_pending(prefs::EDIT_CURSOR_TRAIL_STYLE);
+    let writing = state.writes_in_flight(prefs::EDIT_CURSOR_TRAIL_STYLE);
     let found = [
         state.common.hovered.as_ref(),
         state.common.last_focus.as_ref(),
@@ -12126,18 +12436,14 @@ fn preview_font_candidate(state: &SettingsViewState) -> crate::widget::SemanticF
             return (!active.effective.trim().is_empty())
                 .then(|| active.effective.trim().to_string());
         }
-        // Every preserved draft participates in the specimen, not just the
-        // field that currently owns focus. This lets someone type Regular,
-        // tab into Bold/Italic/Bold Italic, and compare the complete family
-        // before Return commits any ConfigPatch.
+        // Every preserved draft takes part, not just the focused one, so a whole
+        // family can be compared before Return commits.
         if let Some(value) = state.field_inputs.get(key) {
             return (!value.value().trim().is_empty()).then(|| value.value().trim().to_string());
         }
-        // The snapshot's raw map proves authored presence and supplies OCC
-        // identity, but list-valued entries are canonical TOML (for example
-        // `["wght=450"]`).  Candidate parsing consumes the already-parsed,
-        // normalized EditField seed so quotes/brackets can never become a font
-        // family or hide a variation axis.
+        // The raw map proves presence and supplies OCC identity, but list values
+        // are canonical TOML (`["wght=450"]`): parse the normalized EditField seed
+        // so quotes and brackets never become a family or hide an axis.
         if !state.raw_values.contains_key(key) {
             return None;
         }
@@ -12164,12 +12470,10 @@ fn preview_font_candidate(state: &SettingsViewState) -> crate::widget::SemanticF
         .map(|(tag, value)| crate::widget::SemanticVariation::new(tag, value))
         .collect::<Vec<_>>();
     // `font_weight` is an alias that wins over an authored `wght` axis, but an
-    // absent alias is not an authored `wght=400`.  Keeping those states
-    // distinct matters twice: an untouched config must retain the committed
-    // host renderer identity, and `font_variation = ["wght=450"]` must not be
-    // silently replaced by the alias's display default.  Retained drafts take
-    // part even after focus moves, matching the family slots above; the launch
-    // environment remains the effective-value authority.
+    // absent alias is not an authored `wght=400`: an untouched config keeps the
+    // committed renderer identity, and `font_variation = ["wght=450"]` is not
+    // replaced by the alias's display default. Retained drafts take part after
+    // focus moves; the launch environment is the effective-value authority.
     let authored_weight = authored_value(prefs::EDIT_FONT_WEIGHT)
         .as_deref()
         .and_then(|value| value.split_whitespace().next())
@@ -12460,10 +12764,9 @@ fn renderer_preview_spec_for_key_with_font(
     // The style row under the pointer or the keyboard on the Cursor Styles
     // page is what the preview shows, unsaved.
     let style_candidate = cursor_style_candidate(state);
-    // A non-Off style candidate is a preview of the atomic post-commit state:
-    // choosing it removes Serious Mode while pinning every sibling effect off.
-    // Runtime effects remain suppressed until then, but the preview must still
-    // demonstrate the choice the user is about to save.
+    // A non-Off style candidate previews the atomic post-commit state (Serious
+    // Mode removed, siblings pinned off): runtime effects stay suppressed until
+    // it is chosen, but the preview shows the choice about to be saved.
     let previews_serious_mode_exit = motion.serious
         && focused_key == prefs::EDIT_CURSOR_TRAIL_STYLE
         && style_candidate
@@ -12559,10 +12862,9 @@ fn renderer_preview_spec_for_key_with_font(
     let committed_kitty_sprite = state
         .raw_value(prefs::EDIT_CURSOR_NYAN_SPRITE)
         .unwrap_or_default();
-    // Asset resolution reads only AUTHORED sources — the live draft, else the
-    // committed raw value. The field's DISPLAY text is presentation metadata
-    // whose "built-in sprite" placeholder must never masquerade as an authored
-    // (and thus unvalidated → Invalid) candidate for the DEFAULT state.
+    // Asset resolution reads only authored sources (the live draft, else the
+    // committed raw value): the display text's "built-in sprite" placeholder must
+    // not become an authored (unvalidated, so Invalid) candidate for the default.
     let kitty_sprite_value = state
         .field_inputs
         .get(prefs::EDIT_CURSOR_NYAN_SPRITE)
@@ -12693,11 +12995,9 @@ fn renderer_preview_spec_for_key_with_font(
         SettingsRoute::CursorMotion | SettingsRoute::CursorStyles => PreviewScene::CursorMotion,
         _ => return None,
     };
-    // Only the Cursor & Motion scene paints live cursor policy. The other
-    // constructors deliberately install a visible, non-blinking cursor so
-    // their `PreviewAnimation::None` contract is also pixel-true. Overwriting
-    // that cursor here made their pixels cross blink edges without changing
-    // the retained fingerprint or arming the scheduler.
+    // Only the Cursor & Motion scene paints live cursor policy; the other
+    // constructors install a visible, non-blinking cursor so their
+    // `PreviewAnimation::None` contract is pixel-true.
     if matches!(
         route,
         SettingsRoute::CursorMotion | SettingsRoute::CursorStyles
@@ -13063,22 +13363,19 @@ fn page_subtitle_height() -> f32 {
     24.0_f32.max(20.0 * settings_text_scale())
 }
 
-/// The group card's own heading label row. [`group_heading_height`] MUST stay
-/// `28 + this` (the card's 14px vertical padding pair), or the card's fixed
-/// height allocation silently clips its last control at intermediate Dynamic
-/// Type scales.
+/// One line of a group card's own heading: a group's head is `28` (the
+/// card's 14px vertical padding pair) and its caption's lines
+/// ([`group_caption_height`]), or the card's fixed height clips its last
+/// control at intermediate Dynamic Type scales.
 fn group_heading_label_height() -> f32 {
     22.0_f32.max(16.0 * settings_text_scale())
 }
 
-fn group_heading_height() -> f32 {
-    28.0 + group_heading_label_height()
-}
-
 /// The sidebar's route row: ONE RHYTHM at every window height. The rail
 /// scrolls where its rows outgrow the window ([`navigation`]); it never
-/// squeezes them, sheds its title or gives its place to the compact category
-/// sheet, so the width class is the window's width alone.
+/// squeezes them or gives its place to the compact category sheet, so the
+/// width class is the window's width alone, and it sheds its title only
+/// where keeping it would leave its list no whole row.
 fn navigation_row_height(scale: f32) -> f32 {
     32.0_f32.max(24.0 * scale)
 }
@@ -13112,25 +13409,47 @@ fn settings_tree(
     cx: &ViewCx<'_>,
 ) -> UiTree {
     state.page_window.set(None);
+    // Seated under a status's whole bar until the page says otherwise
+    // ([`page`]).
+    state.status_bar_most.set(None);
     state.record_runtime_presentation(cx.motion, packages, update);
     // The width class is the window's width alone: the sidebar scrolls where
     // its rows outgrow a short window.
     let width = SettingsWidth::for_viewport(cx.viewport.width);
+    // Whether this window's list is shorter than a stacked row, measured as
+    // the page seats with no bar up, so a status that comes re-lays no row
+    // ([`large_text_rows_stack`]).
+    let calm = state.measuring_calm.replace(true);
+    let list = settings_list_body_height(state, width, cx.viewport);
+    state.measuring_calm.set(calm);
+    let _rows = RowsTooTallToStack::set(
+        (width == SettingsWidth::Compact && SettingsWidth::Compact.row_height() > list + 0.01)
+            .then_some(list),
+    );
     let watch_status_height = config_watch_status_bar_height(state);
     let available_height = (cx.viewport.height - watch_status_height).max(0.0);
     state.record_presented_width(width);
     let compact_status_docked =
         width == SettingsWidth::Compact && compact_status_dock_required(state, cx.viewport);
+    // The Reset All question in the page's place, where the dock would cut
+    // it: no bar says it again.
+    let question_page = reset_all_question_takes_page(state, cx.viewport);
     state
         .presented_plain_dock
         .set(compact_status_docked && state.plain_status());
-    let feedback = (!compact_status_docked)
-        .then(|| feedback_bar(state, width, cx.viewport))
-        .flatten();
     let watch_status = (!compact_status_docked)
         .then(|| config_watch_status_bar(state, cx.viewport))
         .flatten();
-    let page = page(state, update, packages, messages, harness, cx, width);
+    let page = if question_page {
+        reset_all_question_page(state, cx.viewport)
+    } else {
+        page(state, update, packages, messages, harness, cx, width)
+    };
+    // After the page: a bar it shortened for the control the person is on
+    // ([`SettingsViewState::status_bar_most`]) is built that tall.
+    let feedback = (!compact_status_docked && !question_page)
+        .then(|| feedback_bar(state, width, cx.viewport))
+        .flatten();
     let (body, root_feedback) = match width {
         SettingsWidth::Compact => {
             let body = UiNode::new(
@@ -13145,12 +13464,10 @@ fn settings_tree(
             (body, feedback)
         }
         SettingsWidth::Medium | SettingsWidth::Wide => {
-            // Mutation feedback belongs to the content pane, not the application
-            // frame. A full-width persistent Undo bar used to take height away from
-            // the navigation rail and clip Software Update/About—the exact moment a
-            // user needed Undo was also the moment primary destinations vanished.
-            // Keep the rail full-height and let only the current page yield its last
-            // control row to feedback.
+            // Mutation feedback belongs to the content pane, not the app frame: a
+            // full-width bar would take height from the navigation rail and clip
+            // destinations. The rail stays full-height; only the page yields its
+            // last control row to feedback.
             let mut content_children = vec![page];
             if let Some(feedback) = feedback {
                 content_children.push(feedback);
@@ -13428,11 +13745,10 @@ fn settings_search_bar(state: &SettingsViewState, placeholder: &str, height: Len
             .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
     ];
     if !state.search_input.value().is_empty() || !state.search.is_empty() {
-        // The button's text box is its width minus the 20pt padding pair, so
-        // the box must be authored from what "Clear" MEASURES in the UI face
-        // at the live scale — the old fixed 52pt handed a 33.5pt word a 32pt
-        // box and painted "Cl…" (2026-08 settings audit). Floored at the 44pt
-        // touch target; the search field is the Fill neighbour that yields.
+        // The button's text box is its width minus the 20pt padding pair, so size
+        // it from what "Clear" measures in the UI face at the live scale, floored
+        // at the 44pt touch target; the search field is the Fill neighbour that
+        // yields.
         let clear_width =
             (crate::tray_raster::ui_text_width("Clear", 13.0 * settings_text_scale()) + 24.0)
                 .max(44.0);
@@ -13795,20 +14111,12 @@ fn feedback_bar(
             actions.layout.width = Length::Fixed(buttons);
             actions.layout.height = Length::Fill;
             Layout::row()
-                .height(Length::Fixed(feedback_bar_height(
-                    state,
-                    width,
-                    viewport.width,
-                )))
+                .height(Length::Fixed(feedback_bar_height(state, width, viewport)))
                 .padding(Insets::symmetric(16.0, 5.0))
                 .gap(8.0)
         } else {
             Layout::column()
-                .height(Length::Fixed(feedback_bar_height(
-                    state,
-                    width,
-                    viewport.width,
-                )))
+                .height(Length::Fixed(feedback_bar_height(state, width, viewport)))
                 .padding(Insets::all(8.0))
                 .gap(4.0)
         };
@@ -13908,30 +14216,20 @@ fn feedback_bar(
             )
             .layout(
                 Layout::column()
-                    .height(Length::Fixed(feedback_bar_height(
-                        state,
-                        width,
-                        viewport.width,
-                    )))
+                    .height(Length::Fixed(feedback_bar_height(state, width, viewport)))
                     .padding(Insets::all(10.0))
                     .gap(4.0),
             )
             .children(children),
         );
     }
-    let undo_width = if state.undo_offer().is_some() {
-        bar_undo_width() + 8.0
+    // Its words whole, on the lines they take ([`plain_bar_layout`]); the
+    // bar is as tall as they are.
+    let bar = plain_bar_layout(state, feedback, width, viewport);
+    let words_height = if bar.undo_under {
+        Length::Fixed(bar.height - 4.0 - scaled_control_height())
     } else {
-        0.0
-    };
-    let status_width = (viewport.width - navigation_width - 32.0 - undo_width).max(0.0);
-    let complete_visual = crate::native_ui::fit_native_status_label(feedback, status_width);
-    let visual_feedback = if complete_visual == *feedback {
-        complete_visual
-    } else if feedback == "Applying… Serious Mode will turn off; other effects stay off." {
-        crate::native_ui::fit_native_status_label("Applying… Serious off", status_width)
-    } else {
-        complete_visual
+        Length::Fill
     };
     let mut children = vec![
         UiNode::new(
@@ -13942,19 +14240,13 @@ fn feedback_bar(
                 style: StyleRef::Plain,
             }),
         )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-        .children(vec![
-            UiNode::new(
-                "settings/status/visual",
-                UiContent::Text(TextSpec {
-                    text: visual_feedback,
-                    role: SemanticRole::Status,
-                    style: StyleRef::Plain,
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .paint_only(),
-        ]),
+        .layout(Layout::default().width(Length::Fill).height(words_height))
+        .children(vec![status_words_node(
+            "settings/status/visual",
+            feedback,
+            bar.words_width,
+            bar.most_lines,
+        )]),
     ];
     if state.undo_offer().is_some() {
         children.push(
@@ -13971,20 +14263,25 @@ fn feedback_bar(
             .layout(
                 Layout::default()
                     .width(Length::Fixed(bar_undo_width()))
-                    .height(Length::Fill),
+                    // A control's row at the bar's top, beside its words'
+                    // first line, however many lines they take.
+                    .height(Length::Fixed(scaled_control_height() - 10.0)),
             ),
         );
     }
+    let flow = if bar.undo_under {
+        Layout::column().gap(4.0)
+    } else {
+        Layout::row().gap(8.0)
+    };
     Some(
         UiNode::new(
             "settings/feedback",
             UiContent::Group(GroupSpec::new("Settings status").style(StyleRef::Secondary)),
         )
         .layout(
-            Layout::row()
-                .height(Length::Fixed(scaled_control_height()))
-                .padding(Insets::symmetric(16.0, 5.0))
-                .gap(8.0),
+            flow.height(Length::Fixed(bar.height))
+                .padding(Insets::symmetric(16.0, 5.0)),
         )
         .children(children),
     )
@@ -14429,8 +14726,9 @@ fn draft_bar_row_actions_width(bar: &DraftBar, room: f32) -> Option<f32> {
 fn feedback_bar_height(
     state: &SettingsViewState,
     width: SettingsWidth,
-    viewport_width: f32,
+    viewport: LogicalRect,
 ) -> f32 {
+    let viewport_width = viewport.width;
     if state.has_unsaved_field_drafts() {
         let bar = DraftBar::of(state);
         let room = (viewport_width - settings_navigation_width(width) - 16.0).max(0.0);
@@ -14445,20 +14743,257 @@ fn feedback_bar_height(
         let room = (viewport_width - settings_navigation_width(width) - 20.0).max(0.0);
         let (_, status_height, _) = reset_all_question_lines(state, room);
         20.0 + status_height + 4.0 + bar_actions_height(&reset_all_buttons(state), room)
-    } else if state.bar_feedback().is_some() && !messages_feedback_inline(state) {
-        scaled_control_height()
+    } else if let Some(feedback) = state
+        .bar_feedback()
+        .filter(|_| !messages_feedback_inline(state))
+    {
+        plain_bar_layout(state, feedback, width, viewport).height
     } else {
         0.0
     }
 }
 
-/// THE MESSAGES PAGE SAYS ITS OWN CONFIRMATION ON ITS COUNT LINE (ruling
-/// 270; day three: `Copied` in the page's bottom bar took the list's room
-/// for five seconds, so an open entry that fitted no longer did, and the
-/// list dropped from seven rows to four and grew back). A plain status line
-/// on the Messages route — no draft recovery, no Reset All confirmation, no
-/// Undo to offer, no search results in place of the page — is drawn beside
-/// the count (`9 messages · Copied`) and takes no height from the list.
+/// The line a status's words are set on, as the Reset All question's are.
+fn status_line_height() -> f32 {
+    22.0_f32.max(16.0 * settings_text_scale())
+}
+
+/// A STATUS IS READ WHOLE: its words on as many lines of a box `width` wide
+/// as they need, each whole — never cut to one line, which at 2× text
+/// read "Color theme was not saved…" and hid why — broken where every line
+/// of aterm's chrome breaks ([`wrap_to_box`]: between words, between CJK
+/// characters, a path at its folders), and inside a word only where it is
+/// wider than the box, with a hyphen that says it goes on. Wrapped by the
+/// terminal's own rule it broke a path inside a folder's name
+/// ("…/labs/r1" / "3d-p4/cfg/aterm").
+fn status_word_lines(text: &str, width: f32) -> Vec<String> {
+    wrap_to_box(text, width.max(1.0), &status_words_width)
+        .into_iter()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// How wide a status's words paint.
+fn status_words_width(text: &str) -> f32 {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Plain);
+    crate::tray_raster::ui_text_width_for(face, text, px)
+}
+
+/// [`status_word_lines`], no more than `most` of them: where the bar holds
+/// fewer lines than the words take — the window under the toolbar (a
+/// phone-width window at 2× text), or the room the list keeps for the
+/// control the person is on ([`SettingsViewState::status_bar_most`]) — A
+/// STATUS GIVES UP ITS MIDDLE, NEVER ITS ENDS: what it is about and how it
+/// ended (a setting's name, then "turned on", or why it was not saved and
+/// what to do) stay, the least run of words (or of a path's folders) at its
+/// middle taken out for "…" ([`status_middle_cut`]); only where even its
+/// first and last word take more does its last line end in an ellipsis.
+/// Cut at its end, "Allow programs to read the clipboard turned on" read
+/// "Allow programs to read the clipboard…", and a failure lost why. The
+/// whole status stays the bar's semantic label.
+fn status_word_lines_at_most(text: &str, width: f32, most: usize) -> Vec<String> {
+    let mut lines = status_word_lines(text, width);
+    let most = most.max(1);
+    if lines.len() <= most {
+        return lines;
+    }
+    if let Some(cut) = status_middle_cut(text, |cut| status_word_lines(cut, width).len() <= most) {
+        return status_word_lines(&cut, width);
+    }
+    lines.truncate(most);
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Plain);
+    if let Some(last) = lines.pop() {
+        lines.push(elide_wrapped_copy_tail(&last, px, face, width));
+    }
+    lines
+}
+
+/// `text` with the least run of its middle taken out for "…" that `fits`:
+/// its words, and a path's folders inside a word, are what it gives up, as
+/// many from each side of its middle, its first and last kept. `None` where
+/// even that does not fit.
+fn status_middle_cut(text: &str, fits: impl Fn(&str) -> bool) -> Option<String> {
+    // Where each word, or folder of a path, starts and ends.
+    let mut units = Vec::new();
+    let mut start = None;
+    for (at, c) in text.char_indices() {
+        let part = !(c.is_whitespace() || c == '/');
+        match (part, start) {
+            (true, None) => start = Some(at),
+            (false, Some(from)) => {
+                units.push((from, at));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        units.push((from, text.len()));
+    }
+    let n = units.len();
+    (1..n.saturating_sub(1)).find_map(|taken| {
+        let first = (n - taken) / 2;
+        let last = first + taken - 1;
+        let cut = format!(
+            "{}\u{2026}{}",
+            &text[..units[first].0],
+            &text[units[last].1..]
+        );
+        fits(&cut).then_some(cut)
+    })
+}
+
+/// How many words a box `width` wide sets across two lines: the lines
+/// [`status_word_lines`] starts inside a word, where the word is wider than
+/// the box (between CJK characters, after a folder's `/` or a `-`, a line
+/// starts where a line may).
+fn broken_words(text: &str, width: f32) -> usize {
+    let base = text.as_ptr() as usize;
+    let starts: std::collections::BTreeSet<usize> = line_pieces(text)
+        .into_iter()
+        .map(|(_, piece)| piece.as_ptr() as usize - base)
+        .collect();
+    wrap_to_box_from(text, width.max(1.0), &status_words_width, "-")
+        .into_iter()
+        .skip(1)
+        .filter(|(at, _)| !starts.contains(at))
+        .count()
+}
+
+/// How the plain status bar lays out ([`plain_bar_layout`]).
+struct PlainBarLayout {
+    /// How wide its words' box is.
+    words_width: f32,
+    /// The most lines of words the bar sets.
+    most_lines: usize,
+    /// Whether its Undo (or Redo) goes under its words rather than beside.
+    undo_under: bool,
+    /// How tall the bar is.
+    height: f32,
+}
+
+/// THE PLAIN STATUS BAR, measured for `feedback`: its words on the lines
+/// they take ([`status_word_lines`]) beside its Undo (or Redo) — where that
+/// box sets every word whole that the bar's whole width does — else over
+/// it, the words the bar's whole width (22 columns at 2× text set
+/// "Restored" across two lines of the box beside Undo). As tall as its
+/// words, or a control's row: a long status's bar is taller than the room
+/// the page keeps for one, and takes the rest from the list, which is laid
+/// out again under it.
+fn plain_bar_layout(
+    state: &SettingsViewState,
+    feedback: &str,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> PlainBarLayout {
+    let full = (viewport.width - settings_navigation_width(width) - 32.0).max(0.0);
+    let undo = state.undo_offer().is_some();
+    let beside = if undo {
+        (full - bar_undo_width() - 8.0).max(0.0)
+    } else {
+        full
+    };
+    let undo_under = undo && broken_words(feedback, beside) > broken_words(feedback, full);
+    let words_width = if undo_under { full } else { beside };
+    // No taller than the window under the compact toolbar.
+    let over = if width == SettingsWidth::Compact {
+        compact_toolbar_height()
+    } else {
+        0.0
+    };
+    let undo_row = if undo_under {
+        4.0 + scaled_control_height() - 10.0
+    } else {
+        0.0
+    };
+    let most_lines = ((viewport.height - over - 10.0 - undo_row) / status_line_height())
+        .floor()
+        .max(1.0) as usize;
+    // Nor taller than leaves the list the control the person is on whole
+    // ([`SettingsViewState::status_bar_most`]).
+    let most_lines = state.status_bar_most.get().map_or(most_lines, |most| {
+        let words = if undo_under {
+            most - 4.0 - scaled_control_height()
+        } else {
+            most - 10.0
+        };
+        most_lines.min((words / status_line_height()).floor().max(1.0) as usize)
+    });
+    let words = status_word_lines(feedback, words_width)
+        .len()
+        .clamp(1, most_lines) as f32
+        * status_line_height();
+    let height = if undo_under {
+        // The bar's 5pt padding, the words, a gap and Undo's row.
+        words + 4.0 + scaled_control_height()
+    } else {
+        scaled_control_height().max(words + 10.0)
+    };
+    PlainBarLayout {
+        words_width,
+        most_lines,
+        undo_under,
+        height,
+    }
+}
+
+/// `feedback`'s words as a status shows them in a box `width` wide (inside
+/// the bar's padding): one line filling the row where it is one, else a
+/// column of whole lines, each [`status_line_height`] tall, from the top.
+fn status_words_node(key: &str, feedback: &str, width: f32, most: usize) -> UiNode {
+    let lines = status_word_lines_at_most(feedback, width, most);
+    if lines.len() <= 1 {
+        return UiNode::new(
+            key,
+            UiContent::Text(TextSpec {
+                text: lines.into_iter().next().unwrap_or_default(),
+                role: SemanticRole::Status,
+                style: StyleRef::Plain,
+            }),
+        )
+        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+        .paint_only();
+    }
+    let line_height = status_line_height();
+    UiNode::new(
+        key,
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(lines.len() as f32 * line_height)),
+    )
+    .children(
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                UiNode::new(
+                    format!("{key}/line-{index}"),
+                    UiContent::Text(TextSpec {
+                        text,
+                        role: SemanticRole::Status,
+                        style: StyleRef::Plain,
+                    }),
+                )
+                .layout(
+                    Layout::default()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(line_height)),
+                )
+                .paint_only()
+            })
+            .collect(),
+    )
+    .paint_only()
+}
+
+/// The Messages page puts a plain status line on its count line
+/// (`9 messages · Copied`), taking no height from the list: on the Messages
+/// route with no draft recovery, no Reset All confirmation, no Undo to offer, and
+/// no search results in place of the page.
 fn messages_feedback_inline(state: &SettingsViewState) -> bool {
     state.route == SettingsRoute::Messages
         && state.feedback.is_some()
@@ -14480,12 +15015,12 @@ fn config_watch_status_bar_height(state: &SettingsViewState) -> f32 {
 fn settings_status_bars_height(
     state: &SettingsViewState,
     width: SettingsWidth,
-    viewport_width: f32,
+    viewport: LogicalRect,
 ) -> f32 {
     if state.measuring_calm.get() {
         return 0.0;
     }
-    feedback_bar_height(state, width, viewport_width) + config_watch_status_bar_height(state)
+    feedback_bar_height(state, width, viewport) + config_watch_status_bar_height(state)
 }
 
 /// The actions a status shows beside its words: none, Undo (or Redo), or a
@@ -14557,6 +15092,7 @@ fn compact_dock_layout(
     actions: &DockActions,
     watcher: bool,
     plain: bool,
+    words: Option<&str>,
 ) -> CompactDockLayout {
     let (_, leading) = compact_toolbar_leading(state, viewport, true);
     let dock_width = (viewport.width - 20.0 - leading - 8.0).max(0.0);
@@ -14568,9 +15104,19 @@ fn compact_dock_layout(
     };
     let room = dock_width - if watcher { watcher_width + 8.0 } else { 0.0 };
     let beside = (room - 8.0 - DOCK_WORDS_MIN * scale).max(0.0);
+    // A plain status's words, where they are known (`words`), keep every
+    // word whole beside Undo that the dock's whole width keeps whole, else
+    // Undo goes under them ([`broken_words`]).
+    let breaks_more = |narrow: f32, wide: f32| {
+        words.is_some_and(|words| {
+            broken_words(words, (narrow - 10.0).max(0.0))
+                > broken_words(words, (wide - 10.0).max(0.0))
+        })
+    };
     let inline_actions = match actions {
         DockActions::None => Some(0.0),
-        DockActions::Undo => Some(dock_undo_width()).filter(|width| *width <= beside + 0.01),
+        DockActions::Undo => Some(dock_undo_width())
+            .filter(|width| *width <= beside + 0.01 && !breaks_more(room - width - 8.0, room)),
         DockActions::Buttons(buttons) => match bar_button_fit(buttons, beside) {
             BarFit::Row { widths, .. } => {
                 Some(widths.iter().sum::<f32>() + 8.0 * buttons.len() as f32)
@@ -14598,9 +15144,14 @@ fn compact_dock_layout(
         } else {
             0.0
         };
-    // A plain status gives Search back on a press ([`dock_search_button`]).
+    // A plain status gives Search back on a press ([`dock_search_button`]),
+    // where its words keep their least with it, every word they keep whole
+    // without it whole too.
     let search = dock_search_width() + 8.0;
-    let search_width = if plain && words_width - search >= DOCK_WORDS_LEAST * scale - 0.01 {
+    let search_width = if plain
+        && words_width - search >= DOCK_WORDS_LEAST * scale - 0.01
+        && !breaks_more(words_width - search, words_width)
+    {
         words_width -= search;
         search
     } else {
@@ -14656,14 +15207,199 @@ fn dock_search_button() -> UiNode {
 /// takes one. Either way the list keeps the same room with a bar and
 /// without.
 fn compact_status_dock_required(state: &SettingsViewState, viewport: LogicalRect) -> bool {
+    compact_status_dock_wanted(state, viewport) && !reset_all_question_takes_page(state, viewport)
+}
+
+/// [`compact_status_dock_required`] before the Reset All question takes the
+/// page's place where the dock would cut it ([`reset_all_question_takes_page`]).
+fn compact_status_dock_wanted(state: &SettingsViewState, viewport: LogicalRect) -> bool {
+    let words = dock_plain_words(state);
     compact_status_dock_required_at(
         state,
         viewport,
-        settings_status_bars_height(state, SettingsWidth::Compact, viewport.width),
+        settings_status_bars_height(state, SettingsWidth::Compact, viewport),
         &DockActions::of(state),
         compact_dock_watcher(state),
         state.plain_status(),
+        words,
+    ) && words.is_none_or(|words| {
+        // A STATUS DOCKS ONLY WHERE THE DOCK READS IT AS WHOLE AS THE BAR:
+        // where the toolbar's box beside its back button sets a word across
+        // two lines that the bar under the page keeps whole (a phone-width
+        // window at 2× text: "Restore" / "d Color"), it stands under the
+        // page instead.
+        let docked = compact_dock_layout(
+            state,
+            viewport,
+            &DockActions::of(state),
+            compact_dock_watcher(state),
+            true,
+            Some(words),
+        );
+        let bar = plain_bar_layout(state, words, SettingsWidth::Compact, viewport);
+        broken_words(words, (docked.words_width - 10.0).max(0.0))
+            <= broken_words(words, bar.words_width)
+    })
+}
+
+/// The plain status the compact toolbar's dock would set, its words.
+fn dock_plain_words(state: &SettingsViewState) -> Option<&str> {
+    state
+        .bar_feedback()
+        .filter(|_| state.plain_status())
+        .map(String::as_str)
+}
+
+/// THE RESET ALL QUESTION IS READ WHOLE BEFORE IT IS ANSWERED: where a
+/// compact window would dock it in the toolbar and the dock's one line cuts
+/// its words (80x24 with 2x text: "Reset 5 settings? It a…", the downloads
+/// it may bring cut off), or where its bar under the page is taller than
+/// the window holds (220x12 at 2× text: 192pt, Cancel and Reset All cut by
+/// the window's bottom), it takes the page's place instead, its words
+/// wrapped whole in a list of their own that scrolls where the window is
+/// shorter than they are, Cancel and Reset All under it
+/// ([`reset_all_question_page`]).
+fn reset_all_question_takes_page(state: &SettingsViewState, viewport: LogicalRect) -> bool {
+    if !state.reset_all_confirmation || state.has_unsaved_field_drafts() {
+        return false;
+    }
+    let width = SettingsWidth::for_viewport(viewport.width);
+    if width != SettingsWidth::Compact {
+        return feedback_bar_height(state, width, viewport)
+            > viewport.height - config_watch_status_bar_height(state) + 0.01;
+    }
+    if !compact_status_dock_wanted(state, viewport) {
+        return false;
+    }
+    let layout = compact_dock_layout(
+        state,
+        viewport,
+        &DockActions::of(state),
+        compact_dock_watcher(state),
+        state.plain_status(),
+        dock_plain_words(state),
+    );
+    let words = reset_all_question_line(state);
+    crate::native_ui::fit_native_status_label(&words, (layout.words_width - 10.0).max(0.0)) != words
+}
+
+/// The Reset All question's words on one line, as the dock paints them: its
+/// count, and what it reaches beyond the window ([`reset_all_reach_sentence`]).
+fn reset_all_question_line(state: &SettingsViewState) -> String {
+    let question = format!(
+        "Reset {}?",
+        counted_value_label("setting", "settings", reset_all_count(state))
+    );
+    match reset_all_reach_sentence(state) {
+        Some(sentence) => format!("{question} {sentence}"),
+        None => question,
+    }
+}
+
+/// THE RESET ALL QUESTION IN THE PAGE'S PLACE ([`reset_all_question_takes_page`]):
+/// its words wrapped whole to the page's column, each line a stop of a list
+/// that scrolls where the window is shorter than they are (from its top: it
+/// scrolls on its own, [`SettingsViewState::open_question_scroll`]), and
+/// Cancel and Reset All under the list, always on screen, the keyboard on
+/// Cancel. Its words are the question bar's ([`reset_all_question_lines`]).
+fn reset_all_question_page(state: &SettingsViewState, viewport: LogicalRect) -> UiNode {
+    let width = SettingsWidth::for_viewport(viewport.width);
+    let insets = page_frame_insets(
+        state,
+        viewport,
+        width,
+        PageLayout::shown(state).maximum(width),
+    );
+    let gap = settings_page_gap(state, width, viewport);
+    // The page's column: the window's, beside the sidebar where there is
+    // one.
+    let column = (viewport.width
+        - if width == SettingsWidth::Compact {
+            0.0
+        } else {
+            settings_navigation_width(width)
+        }
+        - insets.left
+        - insets.right)
+        .max(0.0);
+    let buttons = reset_all_buttons(state);
+    let actions_height = bar_actions_height(&buttons, column);
+    let mut actions = bar_actions(
+        "settings/reset-all/actions",
+        "Reset All confirmation actions",
+        &buttons,
+        column,
+    );
+    actions.layout.height = Length::Fixed(actions_height);
+    let body = viewport.height
+        - if width == SettingsWidth::Compact {
+            compact_header_height(state, viewport)
+        } else {
+            0.0
+        }
+        - config_watch_status_bar_height(state);
+    let room = (body - insets.top - insets.bottom - gap - actions_height).max(0.0);
+    // On the bar's backdrop, inside its padding, as the bar says it.
+    const PADDING: f32 = 10.0;
+    let (lines, status_height, line_height) =
+        reset_all_question_lines(state, (column - 2.0 * PADDING).max(0.0));
+    let words_height = status_height + 2.0 * PADDING;
+    let words = UiNode::new(
+        "settings/status",
+        UiContent::Group(GroupSpec {
+            label: Some(reset_all_scope(state)),
+            role: SemanticRole::Status,
+            style: StyleRef::Secondary,
+        }),
     )
+    .layout(
+        Layout::column()
+            .height(Length::Fixed(words_height))
+            .padding(Insets::all(PADDING))
+            .gap(4.0),
+    )
+    .children(
+        lines
+            .into_iter()
+            .map(|(key, text, style)| {
+                UiNode::new(
+                    key,
+                    UiContent::Text(TextSpec {
+                        text,
+                        role: SemanticRole::Text,
+                        style,
+                    }),
+                )
+                .layout(Layout::default().height(Length::Fixed(line_height)))
+                .paint_only()
+            })
+            .collect(),
+    );
+    let mut children = vec![
+        scroll::list_page(
+            state,
+            "settings/reset-all/question",
+            "Reset All question",
+            vec![ListItem::of(words, words_height)],
+            room,
+            4.0,
+        ),
+        actions,
+    ];
+    scroll::seat_page_scroller(&mut children, insets.right);
+    UiNode::new(
+        "settings/page/reset-all",
+        UiContent::Group(GroupSpec::new("Reset All")),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(insets)
+            .gap(gap)
+            .clipped(),
+    )
+    .children(children)
 }
 
 /// Whether the reload warning shares the dock with another status.
@@ -14684,6 +15420,7 @@ fn compact_status_dock_required_at(
     actions: &DockActions,
     watcher: bool,
     plain: bool,
+    words: Option<&str>,
 ) -> bool {
     if status_height <= 0.0 {
         return false;
@@ -14707,7 +15444,9 @@ fn compact_status_dock_required_at(
     // whole before it is answered, and the page waits on it: the page keeps
     // only its heading, and the question docks only where it could not
     // stand whole over the page.
-    let floor = if status_height <= scaled_control_height() + 0.01 {
+    // A plain status is whole docked too, on the lines its words take
+    // ([`dock_words_height`]).
+    let floor = if status_height <= scaled_control_height() + 0.01 || plain {
         compact_page_floor(state)
     } else if state.reset_all_confirmation && reset_all_reach_sentence(state).is_some() {
         page_heading_height() / settings_text_scale()
@@ -14717,10 +15456,22 @@ fn compact_status_dock_required_at(
     if stacked_content >= floor {
         return false;
     }
-    compact_dock_layout(state, viewport, actions, watcher, plain)
-        .under
-        .is_none()
-        || stacked_content < COMPACT_BODY_LEAST.min(floor)
+    let layout = compact_dock_layout(state, viewport, actions, watcher, plain, words);
+    // A PLAIN STATUS ALONE DOCKS IN THE TOOLBAR'S OWN ROW OR NOT AT ALL: its
+    // words whole there beside its Undo ([`dock_words_height`]). One whose
+    // Undo or lines would grow the toolbar stands under the page instead,
+    // where what it takes comes from the list's bottom and the page over it
+    // stays where it was: grown at the top, the toolbar moved every row
+    // down, the switch just pressed with them, and re-laid out the
+    // preview pinned under it.
+    if plain && !watcher {
+        return layout.under.is_none()
+            && words.is_none_or(|_| {
+                dock_words_height(state, layout.words_width)
+                    <= compact_toolbar_height() - 16.0 + 0.01
+            });
+    }
+    layout.under.is_none() || stacked_content < COMPACT_BODY_LEAST.min(floor)
 }
 
 /// The least height a compact page keeps for its own heading, preview and
@@ -14749,19 +15500,39 @@ fn compact_header_height(state: &SettingsViewState, viewport: LogicalRect) -> f3
     if !compact_status_dock_required(state, viewport) {
         return compact_toolbar_height();
     }
-    match compact_dock_layout(
+    let layout = compact_dock_layout(
         state,
         viewport,
         &DockActions::of(state),
         compact_dock_watcher(state),
         state.plain_status(),
-    )
-    .under
-    {
+        dock_plain_words(state),
+    );
+    // A plain status's words whole on their lines ([`dock_words_height`]):
+    // the toolbar grows where they take more than its row.
+    let words = dock_words_height(state, layout.words_width);
+    match layout.under {
         // Eight points of toolbar padding above and below, the words' touch
-        // row, a gap and the actions' rows.
-        Some(under) => scaled_control_height() + 8.0 + under + 16.0,
-        None => compact_toolbar_height(),
+        // row (or their lines), a gap and the actions' rows.
+        Some(under) => scaled_control_height().max(words) + 8.0 + under + 16.0,
+        None => compact_toolbar_height().max(words + 16.0),
+    }
+}
+
+/// How tall a docked plain status's words are on the lines a words box
+/// `words_width` wide sets them on (inside the status's 10pt inset,
+/// [`status_word_lines`]); nothing for any other status, which the dock
+/// sets on its one line (the draft bar's short words) or which takes the
+/// page where that would cut it (the Reset All question).
+fn dock_words_height(state: &SettingsViewState, words_width: f32) -> f32 {
+    let Some(feedback) = state.bar_feedback().filter(|_| state.plain_status()) else {
+        return 0.0;
+    };
+    let lines = status_word_lines(feedback, (words_width - 10.0).max(0.0)).len();
+    if lines <= 1 {
+        0.0
+    } else {
+        lines as f32 * status_line_height()
     }
 }
 
@@ -14835,7 +15606,6 @@ fn compact_feedback_parts(
     if state.reset_all_confirmation {
         // The same words as the wide bar's: the question with its count and
         // what it reaches beyond the window, and Cancel and Reset All.
-        let count = reset_all_count(state);
         let buttons = reset_all_buttons(state);
         let mut actions = bar_actions(
             "settings/reset-all/actions",
@@ -14844,14 +15614,7 @@ fn compact_feedback_parts(
             actions_room,
         );
         actions.layout.height = Length::Fill;
-        let question = format!(
-            "Reset {}?",
-            counted_value_label("setting", "settings", count)
-        );
-        let preferred = match reset_all_reach_sentence(state) {
-            Some(sentence) => format!("{question} {sentence}"),
-            None => question,
-        };
+        let preferred = reset_all_question_line(state);
         return Some(CompactFeedbackParts {
             status: paint_status("settings/status", reset_all_scope(state), preferred),
             actions: Some(actions),
@@ -14859,12 +15622,6 @@ fn compact_feedback_parts(
         });
     }
 
-    let preferred = if feedback == "Applying… Serious Mode will turn off; other effects stay off."
-    {
-        "Applying… Serious off"
-    } else {
-        feedback
-    };
     let undo = state.undo_offer().is_some().then(|| {
         UiNode::new(
             "settings/status-dock/undo-action",
@@ -14885,8 +15642,33 @@ fn compact_feedback_parts(
             .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
         ])
     });
+    // Its words whole, on the lines they take, the toolbar grown for them
+    // ([`compact_header_height`]).
+    let status = UiNode::new(
+        "settings/status",
+        UiContent::Group(GroupSpec {
+            label: Some(feedback.clone()),
+            role: SemanticRole::Status,
+            style: StyleRef::Plain,
+        }),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Insets {
+                left: 10.0,
+                ..Insets::default()
+            }),
+    )
+    .children(vec![status_words_node(
+        "settings/status/visual",
+        feedback,
+        (visual_width - 10.0).max(0.0),
+        usize::MAX,
+    )]);
     Some(CompactFeedbackParts {
-        status: paint_status("settings/status", feedback.clone(), preferred.to_string()),
+        status,
         actions: undo,
         group_label: "Settings status",
     })
@@ -14984,7 +15766,14 @@ fn compact_status_dock(state: &SettingsViewState, viewport: LogicalRect) -> Opti
     }
     let actions = DockActions::of(state);
     let both = watcher_present && feedback_present;
-    let layout = compact_dock_layout(state, viewport, &actions, both, state.plain_status());
+    let layout = compact_dock_layout(
+        state,
+        viewport,
+        &actions,
+        both,
+        state.plain_status(),
+        dock_plain_words(state),
+    );
     let watcher_width = if both {
         layout.watcher_width
     } else {
@@ -15014,9 +15803,11 @@ fn compact_status_dock(state: &SettingsViewState, viewport: LogicalRect) -> Opti
             )
             .children(status_children);
             let mut children = vec![status_row];
+            // A control's row, or the lines a plain status's words take.
+            let row = scaled_control_height().max(dock_words_height(state, layout.words_width));
             let layout_kind = if let Some(under) = layout.under {
                 // The actions go under the words, the toolbar grown for them.
-                children[0].layout.height = Length::Fixed(scaled_control_height());
+                children[0].layout.height = Length::Fixed(row);
                 if let Some(mut actions) = parts.actions.take() {
                     actions.layout.width = Length::Fill;
                     actions.layout.height = Length::Fixed(under);
@@ -15024,13 +15815,18 @@ fn compact_status_dock(state: &SettingsViewState, viewport: LogicalRect) -> Opti
                 }
                 Layout::column()
             } else {
+                // Beside the words, the actions keep a control's row at the
+                // toolbar's top, however many lines the words take.
+                let beside = (compact_toolbar_height() - 16.0).min(row);
                 if let Some(mut actions) = parts.actions.take() {
                     actions.layout.width = Length::Fixed(layout.actions_width);
-                    actions.layout.height = Length::Fill;
+                    actions.layout.height = Length::Fixed(beside);
                     children.push(actions);
                 }
                 if layout.search_width > 0.0 {
-                    children.push(dock_search_button());
+                    let mut search = dock_search_button();
+                    search.layout.height = Length::Fixed(beside);
+                    children.push(search);
                 }
                 Layout::row()
             };
@@ -15073,12 +15869,11 @@ fn route_control(
     }
 }
 
-/// THE PACKAGES BADGE (2026-09-22): a toolchain failure's one surface is Settings
-/// — the owner's "reviewed in settings where it doesn't interrupt the working user"
-/// — so the Packages entry wears a dot while [`PackagesProjection::attention`]
-/// names anything, and states it (`Needs attention: …`, the page's own headline
-/// words) as its semantic value. `None` for every other route, and once the
-/// condition clears.
+/// The Packages badge: a toolchain failure's one surface is Settings, where it does
+/// not interrupt work, so the Packages entry wears a dot while
+/// [`PackagesProjection::attention`] names anything, and states it (`Needs attention:
+/// …`, the page's headline words) as its semantic value. `None` for every other
+/// route, and once the condition clears.
 fn packages_route_attention(route: SettingsRoute, packages: &PackagesProjection) -> Option<String> {
     if route != SettingsRoute::Packages {
         return None;
@@ -15187,8 +15982,8 @@ fn navigation_groups(current: SettingsRoute) -> Vec<(&'static str, Vec<SettingsR
 /// How far a sub-page's row (Settings ▸ Themes) sits in from its parent's.
 const SUB_ROW_INDENT: f32 = 14.0;
 
-/// THE SIDEBAR: a fixed header — the "Settings" title and the search field —
-/// over its list of group headings and route rows at one rhythm
+/// THE SIDEBAR: a fixed header — the "Settings" title, where the list still
+/// holds a whole row under it, and the search field — over its list of group headings and route rows at one rhythm
 /// ([`navigation_row_height`]). Where the list outgrows the window it
 /// scrolls (`navigation_scroll`): the wheel over it and an assistive
 /// technology move it, a row the edge cuts is drawn as a peek that answers
@@ -15219,9 +16014,20 @@ fn navigation(
     .max(14.0 * text_scale);
     let row_height = navigation_row_height(text_scale);
     let gap = NAVIGATION_GAP;
-    let list_height =
+    // THE RAIL KEEPS ITS TITLE WHILE ITS LIST HOLDS A ROW WHOLE UNDER IT: a
+    // window too short for that (180pt at 2× text, where the title and the
+    // search field left the list 16pt and the selected row showed the foot
+    // of its name under the field) gives the title's line to the list, as a
+    // short page gives its subtitle's; the search field stays.
+    let titled_list =
         (available_height - vertical_padding * 2.0 - title_height - search_height - gap * 2.0)
             .max(0.0);
+    let titled = titled_list + 0.01 >= row_height;
+    let list_height = if titled {
+        titled_list
+    } else {
+        (available_height - vertical_padding * 2.0 - search_height - gap).max(0.0)
+    };
 
     // The list's items, each with its height and, for a route row, its key.
     let mut items: Vec<(UiNode, f32, Option<UiKey>)> = Vec::new();
@@ -15426,25 +16232,25 @@ fn navigation(
         list
     };
 
-    let header = vec![
+    let title = titled.then(|| {
         UiNode::new(
             "settings/navigation-title",
             UiContent::Text(TextSpec::heading("Settings")),
         )
-        .layout(Layout::default().height(Length::Fixed(title_height))),
-        settings_search_bar(
-            state,
-            if text_scale > 1.25 {
-                "Search…"
-            } else {
-                // The sidebar text field has 168px after its insets on Linux;
-                // the longer hint overruns that measure with the native UI face.
-                // Its semantic label still names everything search finds.
-                "Search settings…"
-            },
-            Length::Fixed(search_height),
-        ),
-    ];
+        .layout(Layout::default().height(Length::Fixed(title_height)))
+    });
+    let header = title.into_iter().chain(std::iter::once(settings_search_bar(
+        state,
+        if text_scale > 1.25 {
+            "Search…"
+        } else {
+            // The sidebar text field has 168px after its insets on Linux;
+            // the longer hint overruns that measure with the native UI face.
+            // Its semantic label still names everything search finds.
+            "Search settings…"
+        },
+        Length::Fixed(search_height),
+    )));
     UiNode::new(
         "settings/navigation",
         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Navigation)),
@@ -15460,7 +16266,7 @@ fn navigation(
             .gap(gap)
             .clipped(),
     )
-    .children(header.into_iter().chain(std::iter::once(body)).collect())
+    .children(header.chain(std::iter::once(body)).collect())
 }
 
 const fn route_icon(route: SettingsRoute) -> ButtonIcon {
@@ -15519,13 +16325,21 @@ fn page(
     // re-seats what the list holds (a preview sized to the room, a card
     // split into stops by it): its measure is the page's with no bar, and
     // the page is then seated under that chrome with its bars.
-    let bars = settings_status_bars_height(state, width, cx.viewport.width) > 0.0;
+    let bars = settings_status_bars_height(state, width, cx.viewport) > 0.0;
+    // The page seated under `chrome`, and what its list's screens then hold:
+    // whether the first holds the page's lead, how many stops the screen
+    // starting with each cuts, and how many groups' captions the screen
+    // starting with their first stop lets go.
     let seat = |chrome: PageChrome, calm: bool| {
         state.scroll_record.replace(record.clone());
         state.page_chrome.set(chrome);
         state.measuring_calm.set(calm);
+        state
+            .status_extra
+            .set(plain_status_extra(state, width, cx.viewport));
         let built = page_children(state, update, packages, messages, harness, cx, width);
-        let holds = if state.route == SettingsRoute::Messages
+        state.status_extra.set(0.0);
+        let (holds, cuts) = if state.route == SettingsRoute::Messages
             && state.search.trim().is_empty()
             && !state.compact_navigation
         {
@@ -15534,7 +16348,7 @@ fn page(
             // one (a tall one makes the header scroll away with the list)
             // never changes the chrome under the pointer.
             let visible = messages_visible(messages, &state.messages_filter);
-            visible.is_empty()
+            let holds = visible.is_empty()
                 || !messages_plan_opening(
                     state,
                     messages,
@@ -15546,14 +16360,18 @@ fn page(
                 )
                 .view(0)
                 .rows
-                .is_empty()
+                .is_empty();
+            (holds, (0, 0))
         } else {
-            state
-                .scroll_plan()
-                .is_none_or(|plan| plan.first_screen_need() <= plan.room() + 0.01)
+            state.scroll_plan().map_or((true, (0, 0)), |plan| {
+                (
+                    plan.first_screen_need() <= plan.room() + 0.01,
+                    (plan.cut_stops(), plan.bare_captions()),
+                )
+            })
         };
         state.measuring_calm.set(false);
-        (built, holds)
+        (built, holds, cuts)
     };
     // Only a step that lets the first screen hold the lead is taken: where
     // even the leanest chrome cannot, the lead leaves the first screen
@@ -15564,31 +16382,161 @@ fn page(
     // session's word on Settings ▸ Harness) never moves the screen the
     // person is reading — and a text size changed under it chooses again, as
     // the page at that size chooses (a 1× chrome was kept for a 2× page).
+    // NOR DOES A CHANGE THE PERSON JUST MADE ON ITS FIRST SCREEN, by the
+    // pointer or the keyboard (a control it keeps in view,
+    // [`SettingsViewState::page_reveal`]): Sound's Music effects switch at
+    // 60x20, turned off, took the rows it rules with it, the first screen
+    // then held the page's lead under its fuller chrome, and the page moved
+    // 8pt down under the pointer; Follow system turned on from the keyboard
+    // at 80x16 grew the theme card, the page gave the bar's room to its
+    // list, and the switch jumped 78pt up. Only where that chrome leaves the
+    // stop kept in view no room whole (a colour picker opened under its
+    // row) is it chosen again.
     let seated_at = (cx.viewport, settings_text_scale());
-    let kept = record
-        .as_ref()
-        .filter(|record| record.top() > 0 && record.same_context(state))
-        .and_then(|_| state.page_chrome_at.get())
-        .filter(|at| *at == seated_at)
-        .map(|_| state.page_chrome.get());
-    let chosen = match kept {
-        Some(chrome) => {
-            let (built, _) = seat(chrome, bars);
-            Some((chrome, built))
+    let decide = || {
+        let kept = record
+            .as_ref()
+            .filter(|record| {
+                (record.top() > 0 || state.page_reveal.is_some()) && record.same_context(state)
+            })
+            .and_then(|_| state.page_chrome_at.get())
+            .filter(|at| *at == seated_at)
+            .map(|_| state.page_chrome.get());
+        if let Some(chrome) = kept {
+            // The bar's room as it was too.
+            let built = seat(chrome, bars).0;
+            let scrolled = record.as_ref().is_some_and(|record| record.top() > 0);
+            if scrolled || state.revealed_stop_fits() {
+                return (chrome, built);
+            }
         }
-        None => PageChrome::ladder(width, cx.viewport)
+        let chosen = PageChrome::ladder(width, cx.viewport)
             .into_iter()
             .find_map(|chrome| {
-                let (built, holds) = seat(chrome, bars);
-                holds.then_some((chrome, built))
-            }),
+                let (built, holds, cuts) = seat(chrome, bars);
+                holds.then_some((chrome, built, cuts))
+            });
+        let (chrome, built, cuts) = chosen.unwrap_or_else(|| {
+            let (built, _, cuts) = seat(PageChrome::FULL, bars);
+            (PageChrome::FULL, built, cuts)
+        });
+        // THE BAR'S ROOM AND THE CHROME NEVER STARVE THE LIST ([`PageChrome`]):
+        // where the screens cut stops the list's room would show whole, or
+        // let go of a group's caption to show its first stop whole, the list
+        // takes the room kept for a status bar, then each further rung of the
+        // ladder with it — the first that cuts none and lets no caption go,
+        // else the one that cuts fewest and of those lets fewest go, the
+        // fullest of those — and only where that does better.
+        if cuts == (0, 0) {
+            return (chrome, built);
+        }
+        let ladder = PageChrome::ladder(width, cx.viewport);
+        let further = ladder
+            .iter()
+            .position(|rung| *rung == chrome)
+            .map_or(ladder.len(), |at| at + 1);
+        let mut best = (chrome, None, cuts);
+        let mut last = chrome;
+        let rungs = std::iter::once(chrome).chain(ladder[further..].iter().copied());
+        let sheds = rungs.clone().map(PageChrome::giving_bar_room);
+        // Where the leanest chrome still cuts stops, a page that pins a
+        // preview lists it instead, under the fullest chrome that then cuts
+        // none: the preview is the page's point, the chrome is not. Only
+        // for whole stops: a caption is never worth the pinned preview.
+        let lists = lists_its_preview_when_starved(state.route)
+            .then(|| {
+                rungs.flat_map(|rung| {
+                    [
+                        rung.listing_preview(),
+                        rung.giving_bar_room().listing_preview(),
+                    ]
+                })
+            })
+            .into_iter()
+            .flatten();
+        for trial in sheds.chain(lists) {
+            let listing = trial.preview_listed && !chrome.preview_listed;
+            if listing && best.2.0 == 0 {
+                break;
+            }
+            let (trial_built, _, trial_cuts) = seat(trial, bars);
+            last = trial;
+            let better = if listing {
+                trial_cuts.0 < best.2.0
+            } else {
+                trial_cuts < best.2
+            };
+            if better {
+                best = (trial, Some(trial_built), trial_cuts);
+            }
+            if trial_cuts == (0, 0) || (better && listing && trial_cuts.0 == 0) {
+                break;
+            }
+        }
+        match best {
+            (taken, Some(built), _) if taken == last => (taken, built),
+            // Seated again under the chrome taken: everything a later trial's
+            // render recorded (the list's place, its bound, its window) is
+            // that chrome's again.
+            (taken, _, _) => (taken, seat(taken, bars).0),
+        }
     };
-    let (mut children, layout) = match chosen {
-        // Measured with no bar up: seated again under that chrome with its
-        // bars.
-        Some((chrome, _)) if bars => seat(chrome, false).0,
-        Some((_, built)) => built,
-        None => seat(PageChrome::FULL, false).0,
+    // THE CHROME IS DECIDED ONCE PER LAYOUT INPUT, NOT EVERY FRAME: a render
+    // from the inputs the last decision read ([`ChromeInputs`]: the view's
+    // content revision, the window, the text size, the fonts and the motion
+    // the page measures with) takes the chrome that decision chose and seats
+    // the page once — a short window's animated preview re-rendered the page
+    // under every rung of the ladder on every frame (Top Settings and
+    // Cursor Styles: 4.7 ms a frame in a debug build, against 0.2 ms at a
+    // shipped size).
+    let inputs = ChromeInputs::of(state, cx);
+    let remembered = state
+        .page_chrome_memo
+        .borrow()
+        .as_ref()
+        .filter(|(at, _)| *at == inputs)
+        .map(|(_, chrome)| *chrome);
+    let (chrome, built) = match remembered {
+        Some(chrome) => {
+            // THE SAME RESULT: every render the tests make from remembered
+            // inputs decides again, and must choose what was remembered.
+            #[cfg(test)]
+            {
+                CHROME_REMEMBERED.with(|count| count.set(count.get() + 1));
+                let (decided, _) = decide();
+                assert_eq!(
+                    decided, chrome,
+                    "the chrome remembered for these inputs is the chrome the page chooses"
+                );
+            }
+            (chrome, None)
+        }
+        None => {
+            let (chrome, built) = decide();
+            state.page_chrome_memo.replace(Some((inputs, chrome)));
+            (chrome, Some(built))
+        }
+    };
+    // Measured with no bar up: seated again under that chrome with its bars
+    // (or, remembered, seated under it for the first time this render).
+    let (mut children, layout) = match built {
+        Some(built) if !bars => built,
+        _ => {
+            // A STATUS NEVER COVERS WHAT THE PERSON IS ON: where the bar
+            // leaves the list less than the control the person is on needs
+            // whole ([`SettingsViewState::note_status_room`]), the page is
+            // seated again under a bar that much shorter.
+            state.status_overrun.set(0.0);
+            let seated = seat(chrome, false).0;
+            let overrun = state.status_overrun.replace(0.0);
+            if overrun > 0.01 {
+                let height = feedback_bar_height(state, width, cx.viewport);
+                state.status_bar_most.set(Some((height - overrun).max(0.0)));
+                seat(chrome, false).0
+            } else {
+                seated
+            }
+        }
     };
     // The window and the text size the page is seated at: what a later
     // render scrolled past its first screen keeps the chrome under.
@@ -15669,7 +16617,9 @@ fn page_children(
                         cx.viewport.width,
                         cx.viewport.height,
                     ),
-                    SettingsRoute::Harness => harness_page::harness_page(state, harness, width, cx),
+                    SettingsRoute::Harness => {
+                        harness_page::harness_page(state, harness, update, width, cx)
+                    }
                     SettingsRoute::Ai => ai_page::ai_page(state, &harness.ai, width, cx),
                     SettingsRoute::Tabs => tabs_page::tabs_page(state, &harness.tabs, width, cx),
                     SettingsRoute::Messages => messages_page(state, messages, width, cx.viewport),
@@ -15960,12 +16910,10 @@ fn page_insets(viewport_width: f32, width: SettingsWidth, maximum: f32) -> Inset
         let horizontal = ((canvas - maximum) / 2.0).max(minimum);
         return Insets::symmetric(horizontal, vertical);
     }
-    // Every rail sibling shares ONE left edge: the inset the widest route's
-    // centered content would get. Centering each page around its OWN maximum
-    // made the content column jump ~130pt when navigating Home → an ordinary
-    // form page (2026-08 settings audit); now a narrower maximum gives the
-    // difference back on the RIGHT instead. The left+right sum is unchanged
-    // for every (viewport, maximum) pair, so no page's content width moves.
+    // Every rail sibling shares one left edge, the inset the widest route's
+    // centered content would get, so navigating does not shift the column. A
+    // narrower maximum gives the difference back on the right; left+right is
+    // unchanged, so no page's content width moves.
     let left = ((canvas - widest_page_maximum(width)) / 2.0).max(minimum);
     let right = (canvas - left - maximum).max(minimum);
     Insets {
@@ -16043,6 +16991,28 @@ fn page_chrome(
 /// least that lets the first screen hold it. Where even the leanest cannot,
 /// the lead leaves the first screen whatever the chrome, and the page keeps
 /// all of its own. The heading, which names the page, stays.
+///
+/// THE BAR'S ROOM AND THE CHROME NEVER STARVE THE LIST: the room a page
+/// keeps under its list for the status bar a change brings up
+/// ([`settings_status_bar_kept`]) is the list's where keeping it leaves the
+/// list's screens less than one whole stop — a stop its room cuts that the
+/// room with the bar's would hold whole (Settings ▸ Themes at 220×12 at 2×
+/// text kept 64pt for a bar that was not up and cut every 72pt row of its
+/// chooser to 68) — or shows a group's first stop whole only by letting the
+/// group's caption go ([`scroll::ScrollPlan::bare_captions`]: kept for a
+/// bar, Sound's 72pt list at 220×12 drew TERMINAL BELL on no screen whole,
+/// only in the strip under the room or scrolled off by its lead, and Window
+/// & Tabs' PRESENCE, TAB STATUS and TABS & PANES likewise) — and where the
+/// list still cuts stops, or lets captions go, with it, the page sheds its
+/// subtitle and its insets too, a rung at a time, as far as whole stops
+/// need and then as far as their captions do (Top Settings' font rows at
+/// 220×12 at 2× text). Only where it still cuts stops does a page that pins
+/// a preview over its list list it as the list's first stop
+/// ([`lists_its_preview_when_starved`]): the preview is the page's point,
+/// the chrome is not, and no caption is worth unpinning it. Measured, as
+/// the chrome is, with no bar up; a bar that comes then takes its room from
+/// the list, which is laid out again under it (or the compact toolbar docks
+/// it, [`compact_status_dock_required`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PageChrome {
     /// The page gave its subtitle's line to its list.
@@ -16050,6 +17020,11 @@ pub(crate) struct PageChrome {
     /// The vertical inset the page keeps over and under itself where it gave
     /// some of the window's own ([`responsive_page_insets`]) to its list.
     inset: Option<f32>,
+    /// The page gave the room it keeps for a status bar to its list.
+    bar_room_given: bool,
+    /// The page lists the preview it pins as its list's first stop
+    /// ([`lists_its_preview_when_starved`]).
+    preview_listed: bool,
 }
 
 impl PageChrome {
@@ -16057,7 +17032,26 @@ impl PageChrome {
     const FULL: Self = Self {
         no_subtitle: false,
         inset: None,
+        bar_room_given: false,
+        preview_listed: false,
     };
+
+    /// This chrome, the room it keeps for a status bar given to the list.
+    const fn giving_bar_room(self) -> Self {
+        Self {
+            bar_room_given: true,
+            ..self
+        }
+    }
+
+    /// This chrome, the preview the page pins listed as its list's first
+    /// stop instead.
+    const fn listing_preview(self) -> Self {
+        Self {
+            preview_listed: true,
+            ..self
+        }
+    }
 
     /// The chrome a page on `viewport` may keep, fullest first, each step
     /// shedding more: the subtitle where the window shows one, then the
@@ -16068,7 +17062,7 @@ impl PageChrome {
         if window_page_chrome(width, viewport).1 {
             ladder.push(Self {
                 no_subtitle: true,
-                inset: None,
+                ..Self::FULL
             });
         }
         for inset in [12.0, 4.0] {
@@ -16076,10 +17070,82 @@ impl PageChrome {
                 ladder.push(Self {
                     no_subtitle: true,
                     inset: Some(inset),
+                    ..Self::FULL
                 });
             }
         }
         ladder
+    }
+}
+
+/// Where a field page placed what it pins over its list
+/// ([`settings_fields_page`]), on a route, window, text size and chrome: its
+/// summary pinned or listed as the list's first stop, and its live preview
+/// pinned so tall, or listed (`None`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PinnedPlace {
+    route: SettingsRoute,
+    viewport: LogicalRect,
+    scale: f32,
+    chrome: PageChrome,
+    summary_listed: bool,
+    preview: Option<f32>,
+}
+
+impl PinnedPlace {
+    /// Whether `other` is on the same route, window, text size and chrome.
+    fn same_place(&self, other: &Self) -> bool {
+        self.route == other.route
+            && self.viewport == other.viewport
+            && (self.scale - other.scale).abs() < 0.001
+            && self.chrome == other.chrome
+    }
+}
+
+/// Whether `route`'s page pins a preview it lists as its list's first stop
+/// where its leanest chrome still leaves stops cut under it
+/// ([`PageChrome::listing_preview`]): Cursor Styles. A field page places its
+/// preview by the room it leaves ([`settings_fields_page`]).
+fn lists_its_preview_when_starved(route: SettingsRoute) -> bool {
+    route == SettingsRoute::CursorStyles
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many renders took the chrome remembered for their inputs, on this
+    /// thread ([`page`]).
+    pub(crate) static CHROME_REMEMBERED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// What a page's chrome is decided from ([`page`]): the view's content
+/// revision (`native_app::CommonViewState::content_epoch`, which moves with
+/// every event, host change and published projection), the window, the text
+/// size and the appearance it is measured at, the terminal's size and font
+/// the previews take their rows from, the motion they are drawn with, and
+/// the UI faces' generation. The clock is not one: a preview's animation
+/// frame changes no layout.
+#[derive(Clone, Debug, PartialEq)]
+struct ChromeInputs {
+    content: u64,
+    viewport: LogicalRect,
+    appearance: crate::native_appearance::AppearancePreferences,
+    terminal: (f32, f32),
+    semantic_font: Option<crate::tray_raster::PreparedSemanticFont>,
+    motion: crate::native_app::ViewMotionCx,
+    faces: u64,
+}
+
+impl ChromeInputs {
+    fn of(state: &SettingsViewState, cx: &ViewCx<'_>) -> Self {
+        Self {
+            content: state.common.content_epoch,
+            viewport: cx.viewport,
+            appearance: crate::native_appearance::current_preferences(),
+            terminal: (cx.terminal_font_px, cx.terminal_scale),
+            semantic_font: cx.semantic_font.clone(),
+            motion: cx.motion,
+            faces: crate::tray_raster::strip_band_font_epoch(),
+        }
     }
 }
 
@@ -16092,12 +17158,48 @@ fn page_frame_insets(
     width: SettingsWidth,
     maximum: f32,
 ) -> Insets {
+    let mut insets = page_chrome_insets(state, viewport, width, maximum);
+    insets.bottom -= status_bottom_inset_given(state, width, viewport);
+    insets
+}
+
+/// [`page_frame_insets`] with no plain status's bar under the page.
+fn page_chrome_insets(
+    state: &SettingsViewState,
+    viewport: LogicalRect,
+    width: SettingsWidth,
+    maximum: f32,
+) -> Insets {
     let mut insets = responsive_page_insets(viewport.width, viewport.height, width, maximum);
     if let Some(inset) = state.page_chrome.get().inset {
         insets.top = insets.top.min(inset);
         insets.bottom = insets.bottom.min(inset);
     }
     insets
+}
+
+/// The leanest vertical inset a page keeps ([`PageChrome::ladder`]).
+const LEANEST_PAGE_INSET: f32 = 4.0;
+
+/// A STATUS'S BAR TAKES THE PAGE'S BOTTOM INSET BEFORE ITS LIST: of what a
+/// plain status's bar takes beyond the room the page keeps for one
+/// ([`plain_status_overflow`]), the page's own inset under its list, down
+/// to the leanest a page keeps — the bar's own padding stands between them
+/// — so the list gives up only the rest, and nothing over it moves. At
+/// 220x12 at 2× text Sound's Music effects switch, pressed, was cut 20pt
+/// by its one-line bar's top while the page kept 24pt of blank between
+/// them.
+fn status_bottom_inset_given(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    let over = plain_status_overflow(state, width, viewport);
+    if over <= 0.01 {
+        return 0.0;
+    }
+    let bottom = page_chrome_insets(state, viewport, width, FORM_MEASURE).bottom;
+    over.min((bottom - LEANEST_PAGE_INSET).max(0.0))
 }
 
 /// A page's pinned heading under [`page_chrome`], and the height it takes
@@ -16176,7 +17278,7 @@ fn pinned_heading(
 
 /// The height a scrolling page's pinned header and list share: the page's
 /// body, keeping the room the status bar a change brings up will take
-/// ([`settings_status_bar_cost`]), so a save never re-windows the list under
+/// ([`settings_status_bar_kept`]), so a save never re-windows the list under
 /// the pointer. While no bar takes that room the list draws its peek on into
 /// it ([`settings_list_overhang`]), a picture: the rows a screen shows, and
 /// the keyboard, stay above it, so a bar that comes takes only the peek. A
@@ -16189,8 +17291,65 @@ fn settings_list_body_height(
 ) -> f32 {
     let body = settings_page_body_height(state, width, viewport);
     let taken = settings_status_bars_taken(state, width, viewport);
-    let cost = settings_status_bar_cost(state, width, viewport);
-    (body - (cost - taken).max(0.0)).max(0.0)
+    let cost = settings_status_bar_kept(state, width, viewport);
+    (body - (cost - taken).max(0.0)).max(0.0) + plain_status_extra(state, width, viewport)
+}
+
+/// NOTHING THE PERSON PRESSED MOVES FOR A STATUS: what a plain status's bar
+/// takes beyond the room the page keeps for the bar a change brings up (its
+/// words on more lines than that bar's one, or all of it where the page
+/// gave that room to its list) and beyond the page's bottom inset, which
+/// it takes first ([`status_bottom_inset_given`]). The page is laid out as with
+/// the room it kept — its heading, its preview, the stops its list is cut
+/// into, the form it chose — and only the list's screens give the rest up
+/// ([`scroll::seat_room`], [`SettingsViewState::status_extra`]), from their
+/// bottom: laid out under the taller bar, a two-line "Color theme set to…"
+/// at 60x20 unpinned Appearance's preview and moved the switch just pressed
+/// 79pt up, and Top Settings and Security cut the pressed row into other
+/// stops. Only a bar that stands until it is answered (draft recovery, the
+/// Reset All question) or a reload warning lays the page out again under
+/// it.
+fn plain_status_extra(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    (plain_status_overflow(state, width, viewport)
+        - status_bottom_inset_given(state, width, viewport))
+    .max(0.0)
+}
+
+/// What a plain status's bar takes beyond the room the page keeps for the
+/// bar a change brings up: its page's bottom inset first
+/// ([`status_bottom_inset_given`]), then its list's room
+/// ([`plain_status_extra`]).
+fn plain_status_overflow(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    if !state.plain_status() || state.config_watch_status.is_some() || state.measuring_calm.get() {
+        return 0.0;
+    }
+    (settings_status_bars_taken(state, width, viewport)
+        - settings_status_bar_kept(state, width, viewport))
+    .max(0.0)
+}
+
+/// The room a page keeps under its list for the status bar a change brings
+/// up: what that bar takes when it comes ([`settings_status_bar_cost`]), or
+/// none where keeping it would starve the list and the page gave it to the
+/// list instead ([`PageChrome`]).
+fn settings_status_bar_kept(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    if state.page_chrome.get().bar_room_given {
+        0.0
+    } else {
+        settings_status_bar_cost(state, width, viewport)
+    }
 }
 
 /// What the status bar a change brings up (its words and Undo) takes from the
@@ -16206,12 +17365,20 @@ fn settings_status_bar_cost(
     let bar = scaled_control_height();
     let watcher = state.config_watch_status.is_some() && !state.measuring_calm.get();
     let docks = width == SettingsWidth::Compact
-        && compact_status_dock_required_at(state, viewport, bar, &DockActions::Undo, watcher, true);
+        && compact_status_dock_required_at(
+            state,
+            viewport,
+            bar,
+            &DockActions::Undo,
+            watcher,
+            true,
+            None,
+        );
     if !docks {
         return bar;
     }
     // Docked beside its Undo it takes nothing; under it, the toolbar's growth.
-    compact_dock_layout(state, viewport, &DockActions::Undo, watcher, true)
+    compact_dock_layout(state, viewport, &DockActions::Undo, watcher, true, None)
         .under
         .map_or(0.0, |under| {
             scaled_control_height() + 8.0 + under + 16.0 - compact_toolbar_height()
@@ -16236,11 +17403,11 @@ fn settings_status_bars_taken(
     if width == SettingsWidth::Compact && compact_status_dock_required(state, viewport) {
         compact_header_height(state, viewport) - compact_toolbar_height()
     } else {
-        settings_status_bars_height(state, width, viewport.width)
+        settings_status_bars_height(state, width, viewport)
     }
 }
 
-/// THE PINNED PREVIEW NEVER JUMPS: the room a page's pinned header and list
+/// The pinned preview never jumps: the room a page's pinned header and list
 /// share with the status bar a change brings up showing, whether or not one
 /// is. A page sizes its pinned preview against it, so the preview keeps its
 /// height when a bar comes or goes and the list gives up the room instead:
@@ -16256,7 +17423,7 @@ fn settings_steady_body_height(
 ) -> f32 {
     (settings_page_body_height(state, width, viewport)
         + settings_status_bars_taken(state, width, viewport)
-        - settings_status_bar_cost(state, width, viewport))
+        - settings_status_bar_kept(state, width, viewport))
     .max(0.0)
 }
 
@@ -16275,7 +17442,7 @@ fn settings_list_overhang(
         now: (settings_page_body_height(state, width, viewport)
             - settings_list_body_height(state, width, viewport))
         .max(0.0),
-        kept: settings_status_bar_cost(state, width, viewport),
+        kept: settings_status_bar_kept(state, width, viewport),
     }
 }
 
@@ -16329,7 +17496,11 @@ fn noncompact_page_content_height(
         maximum,
     );
     (viewport_height
-        - settings_status_bars_height(state, width, viewport_width)
+        - settings_status_bars_height(
+            state,
+            width,
+            LogicalRect::new(0.0, 0.0, viewport_width, viewport_height),
+        )
         - insets.top
         - insets.bottom)
         .max(0.0)
@@ -16372,13 +17543,11 @@ fn settings_page_content_width(viewport_width: f32, width: SettingsWidth, maximu
     (viewport_width - navigation - insets.left - insets.right).max(0.0)
 }
 
-/// The vertical measure a page's own children really get: the viewport less
-/// the chrome above and below it and the page's own insets.
+/// The vertical measure a page's own children really get: the viewport less the
+/// chrome above and below it and the page's own insets.
 ///
-/// `page` is a CLIPPED column, so a card that outgrows this does not push the
-/// page taller — it pushes its own last child under the clip, and on the
-/// Wallpaper page that last child is a button. A clipped hit target is a
-/// broken promise, which is why wrapped copy is bounded against this.
+/// `page` is a clipped column: a card that outgrows this pushes its own last child
+/// (on Wallpaper, a button) under the clip, so wrapped copy is bounded against it.
 fn settings_page_body_height(
     state: &SettingsViewState,
     width: SettingsWidth,
@@ -16393,10 +17562,10 @@ fn settings_page_body_height(
             + if compact_status_dock_required(state, viewport) {
                 0.0
             } else {
-                settings_status_bars_height(state, width, viewport.width)
+                settings_status_bars_height(state, width, viewport)
             }
     } else {
-        settings_status_bars_height(state, width, viewport.width)
+        settings_status_bars_height(state, width, viewport)
     };
     (viewport.height - chrome - insets.top - insets.bottom).max(0.0)
 }
@@ -16428,20 +17597,41 @@ fn settings_card_text_width(viewport: LogicalRect, width: SettingsWidth) -> f32 
 fn wrapped_copy_lines(text: &str, px: f32, available_width: f32) -> Vec<String> {
     let available_width = available_width.max(48.0);
     text.split('\n')
-        .flat_map(|paragraph| {
-            crate::tray_raster::ui_text_wrap_ranges(paragraph, px, available_width)
-                .into_iter()
-                .map(move |range| paragraph[range].trim_end().to_string())
-        })
+        .flat_map(|paragraph| copy_paragraph_lines(paragraph, px, available_width))
         .collect()
 }
 
-/// Trim `line` until it plus an ellipsis fits `max_width`.
-///
-/// Pushing the ellipsis onto a line the wrapper had already packed to the full
-/// measure puts it fractionally past its box — a real painted overflow the
-/// renderer audit measures. [`bound_outcome_lines`] was corrected for exactly
-/// that on the Update page in 2026-08; this is the same correction.
+/// One paragraph of copy (no `\n`) on the lines of a box `width` wide, in
+/// the UI face at `px`: the copy walk's lines
+/// ([`crate::tray_raster::ui_text_wrap_ranges`]), each without its trailing
+/// space — except A PARAGRAPH WITH A WORD WIDER THAN THE BOX, which takes the
+/// rule every label keeps for one ([`wrap_to_box`]): a path broken at its
+/// folders, a word broken with a hyphen, its last line never a lone letter.
+/// The walk breaks only at white space, and broke such a word wherever the
+/// box ended, with no mark: a note at 2× in a 22-column card painted
+/// "Messages" and then "." alone on the next line. East Asian text breaks
+/// between its characters, as the walk breaks it.
+fn copy_paragraph_lines(paragraph: &str, px: f32, width: f32) -> Vec<String> {
+    use crate::tray_raster::{LinesRule, kept_lines};
+    use crate::widget::TextFace;
+    kept_lines(LinesRule::Copy, TextFace::Ui, paragraph, px, width, || {
+        let measure = |text: &str| crate::tray_raster::ui_text_width(text, px);
+        let wider = paragraph.split_whitespace().any(|word| {
+            !word.chars().any(crate::tray_raster::is_east_asian)
+                && measure(word) > width + crate::native_ui::TEXT_FIT_SLACK
+        });
+        if wider {
+            return wrap_to_box(paragraph, width, &measure);
+        }
+        crate::tray_raster::ui_text_wrap_ranges(paragraph, px, width)
+            .into_iter()
+            .map(|range| paragraph[range].trim_end().to_string())
+            .collect()
+    })
+}
+
+/// Trim `line` until it plus an ellipsis fits `max_width`: an ellipsis pushed onto
+/// a line packed to the full measure would overflow its box.
 fn elide_wrapped_copy_tail(
     line: &str,
     px: f32,
@@ -16662,7 +17852,12 @@ impl ChoicePickerFit {
         } else {
             Insets::all(12.0)
         };
-        let height = (settings_list_body_height(state, width, viewport) - used).max(0.0);
+        // The page's room under a status's taller bar too: a card, not a
+        // list whose screens give it up ([`plain_status_extra`]).
+        let height = (settings_list_body_height(state, width, viewport)
+            - plain_status_extra(state, width, viewport)
+            - used)
+            .max(0.0);
         let tile_gap = 6.0;
         // The full form spends a row on the theme filter and a row on the
         // footer. A host too short to keep a section heading over two rows
@@ -16939,7 +18134,7 @@ fn choice_picker_card(
                         .scrolled(scrolled)
                         .clipped(),
                 )
-                .room(inner, false)
+                .under_caption(inner)
                 .children(option_rows),
             ]
         }
@@ -17227,24 +18422,6 @@ fn choice_option_button(option: &ChoiceOption, text_width: f32, fonts: bool) -> 
     button
 }
 
-/// A body label fitted to `text_width` keeping a trailing " (default)" whole:
-/// the name gives way first, as [`reset_row_visual`] does for a button face.
-fn fit_keeping_default_note(label: &str, text_width: f32) -> String {
-    let width = crate::native_ui::native_text_label_width;
-    let Some(name) = label.strip_suffix(" (default)") else {
-        return crate::native_ui::fit_native_text_label(label, text_width);
-    };
-    if width(label) <= text_width {
-        return label.to_string();
-    }
-    let tail = " (default)";
-    let shown = crate::native_ui::fit_native_text_label(name, text_width - width(tail));
-    if shown.trim_end_matches('\u{2026}').is_empty() {
-        return crate::native_ui::fit_native_text_label(label, text_width);
-    }
-    format!("{shown}{tail}")
-}
-
 /// A reset row's painted words in `text_width`: its whole label ("Match
 /// macOS (default)", "Use default (No blur)") where it fits, else the
 /// default's name before its note ("No blur (default)"), shortened where it
@@ -17324,11 +18501,10 @@ fn choice_option_node(
                     enabled: !disabled,
                     ..ControlState::default()
                 })
-                // Choice candidates are discrete decisions, not
-                // destinations in the persistent sidebar. Keep a
-                // quiet card outline at rest so pointer users can
-                // discover the full hit target; focus/selection
-                // still promotes the same native accent states.
+                // Candidates are decisions, not sidebar
+                // destinations: a quiet outline at rest shows the
+                // whole hit target; focus and selection still
+                // promote the accent states.
                 .style(StyleRef::Secondary),
         ),
     )
@@ -17800,12 +18976,9 @@ fn upsert_top_effect_edit(
     });
 }
 
-/// Removing Serious Mode is a product-level transition, not merely a write to
-/// `serious_mode`. Every playful Top Settings control currently projects OFF
-/// while the policy is active. Before removing the policy, pin each default-on
-/// sibling that would otherwise spring back to life. Explicitly-off siblings
-/// and a legacy-off sparkle master already preserve that projection and remain
-/// byte-for-byte untouched.
+/// Removing Serious Mode is a product-level transition: every playful Top control
+/// projects off under it, so pin each default-on sibling off before removing the
+/// policy. Siblings already off (or a legacy-off sparkle master) stay untouched.
 fn preserve_suppressed_top_effect_siblings(
     state: &SettingsViewState,
     target: TopEffectSetting,
@@ -17927,7 +19100,7 @@ fn top_authored_music_value(state: &SettingsViewState) -> bool {
     field_bool(state, prefs::EDIT_TRAIL_SOUNDS, true)
 }
 
-/// WHAT THE MUSIC EFFECTS SWITCH'S STATUS LINE SAYS, where its voices are
+/// What the Music effects switch's status line says, where its voices are
 /// silent or partly so. A type, not a sentence: each status has its full
 /// words (the status group's accessible label) and its short painted form,
 /// and the cause it names is the setting's own word for it.
@@ -17964,13 +19137,17 @@ impl MusicStatus {
     }
 
     /// The one painted line, short enough to stay whole at 2x text on the
-    /// narrow host; the status group carries [`Self::full`].
+    /// narrow host in every platform's face; the status group carries
+    /// [`Self::full`]. "Audio unavailable", the line a host with no audio
+    /// output paints on Home and Sound, needed 181.3 pt of the column's 126
+    /// at 2x in the Linux lane's face (2026-10-21), and "Some sounds paused"
+    /// was cut on macOS too (its "Some paused" still needed 145.2).
     fn visual(self) -> &'static str {
         match self {
-            Self::NoOutput { .. } => "Audio unavailable",
+            Self::NoOutput { .. } => "No audio",
             Self::VolumeZero => "Volume 0",
-            Self::TypingNotesOff => "Typing notes off",
-            Self::MotionPaused(_) => "Some sounds paused",
+            Self::TypingNotesOff => "Notes off",
+            Self::MotionPaused(_) => "Some off",
         }
     }
 }
@@ -18040,7 +19217,7 @@ fn top_music_suppression_reason_for_output(
         return Some(MusicStatus::VolumeZero);
     }
     // Only the keystroke notes ride the trail: the chime, the bonk, the riff
-    // and the output sounds play without it. The STYLE decides, not the
+    // and the output sounds play without it. The style decides, not the
     // spelling: an unrecognized value falls back to the default and still
     // plays, so only a resolution that draws nothing — `off` — quiets the
     // notes.
@@ -18128,16 +19305,6 @@ fn top_word_effects_off_node() -> UiNode {
     ])
 }
 
-fn top_compact_choice_text_width(viewport: LogicalRect) -> f32 {
-    // Compact Top choices live inside a card with 12pt horizontal padding on
-    // each side.
-    let control_width =
-        settings_page_content_width(viewport.width, SettingsWidth::Compact, 720.0) - 24.0;
-    // Native choice buttons reserve 10pt leading space plus 38pt for their
-    // trailing chevron. This is the painter's exact authored text measure.
-    (control_width - 48.0).max(0.0)
-}
-
 /// The authored width of a Top choice button on a REGULAR-width host, where the
 /// row paints its value without eliding it.
 ///
@@ -18178,14 +19345,9 @@ fn top_regular_choice_control_width(field: &EditField) -> f32 {
             crate::native_ui::native_button_label_width(&setting_choice_label(field.key, option))
         })
         .fold(0.0_f32, f32::max);
-    // The same 10pt leading plus 38pt trailing-chevron reserve
-    // `top_compact_choice_text_width` subtracts, added back — and then a real
-    // margin past it. The painter derives its text box from the control's painted EDGES
-    // (`right - 38` less `x + 10`), so a width authored to EXACTLY the measured
-    // label lands a hair under it once the row's origin has run through that
-    // subtraction, and the label loses its last grapheme to an ellipsis: at
-    // 1200×810 the exact fit audited required=142.4 against available=142.4 and
-    // still painted "Rainbow kitty underli…".
+    // The button's 48pt of lead and chevron, added back with a margin: the
+    // painter derives the text box from the painted edges
+    // (`right - 38` less `x + 10`), so an exact fit loses its last grapheme.
     (widest + 50.0).max(180.0 * settings_text_scale())
 }
 
@@ -18200,7 +19362,6 @@ fn top_setting_row(
     key: &str,
     projected_value: Option<String>,
     width: SettingsWidth,
-    viewport: LogicalRect,
     direct: bool,
 ) -> Option<TopRow> {
     let (index, field) = state
@@ -18250,26 +19411,17 @@ fn top_setting_row(
         } else {
             row.children.get_mut(1)
         };
-        if let Some(control) = control {
-            if width == SettingsWidth::Compact
-                && let UiContent::Button(button) = &mut control.content
-            {
-                let full = button
-                    .spec
-                    .visual_label
-                    .as_deref()
-                    .unwrap_or(&button.spec.label);
-                button.spec.visual_label = Some(crate::native_ui::fit_native_button_label(
-                    full,
-                    top_compact_choice_text_width(viewport),
-                ));
-            } else if width != SettingsWidth::Compact {
-                // Segments keep what their labels need ([`segmented_choices`]).
-                control.layout.width = Length::Fixed(
-                    top_regular_choice_control_width(field)
-                        .max(segmented_width_need(&projected).unwrap_or_default()),
-                );
-            }
+        // A stacked choice's words are fitted where the row is finished, by
+        // the choice's own ladder ([`fit_row_choice_label`]), never cut here
+        // first ("Def…" at 2× text on a phone-width card).
+        if let Some(control) = control
+            && width != SettingsWidth::Compact
+        {
+            // Segments keep what their labels need ([`segmented_choices`]).
+            control.layout.width = Length::Fixed(
+                top_regular_choice_control_width(field)
+                    .max(segmented_width_need(&projected).unwrap_or_default()),
+            );
         }
     }
     Some(TopRow {
@@ -18655,7 +19807,9 @@ fn fit_stacked_controls(row: &mut UiNode, text_width: f32) {
 /// fitted are the button's whole visual label; its semantic label stays
 /// complete.
 fn fit_theme_row_buttons(row: &mut UiNode, text_width: f32) {
-    fn fit_line(line: &mut UiNode, text_width: f32) {
+    /// Fits a line's buttons; returns how much taller its tallest grew.
+    fn fit_line(line: &mut UiNode, text_width: f32) -> f32 {
+        let mut grow = 0.0_f32;
         let gaps = line.layout.gap * line.children.len().saturating_sub(1) as f32;
         let fixed: f32 = line
             .children
@@ -18688,12 +19842,14 @@ fn fit_theme_row_buttons(row: &mut UiNode, text_width: f32) {
                     .clone()
                     .filter(|words| !words.is_empty())
             {
-                button.spec.visual_label = Some(crate::native_ui::fit_native_button_label(
-                    &words,
-                    crate::native_ui::text_button_label_room(&button.spec, width),
-                ));
+                // By the choice's own ladder ([`choice_words`]), never cut.
+                let lines = choice_words(&mut button.spec, &words, width);
+                let single = scaled_control_height();
+                grow = grow
+                    .max(crate::native_ui::native_button_height_for_lines(lines, single) - single);
             }
         }
+        grow
     }
     let one_line = !row
         .children
@@ -18701,16 +19857,35 @@ fn fit_theme_row_buttons(row: &mut UiNode, text_width: f32) {
         .any(|child| child.key.as_str().starts_with("settings/controls/"));
     if one_line {
         // The label fills what the controls leave: it is no button.
-        fit_line(row, text_width);
+        let grow = fit_line(row, text_width);
+        if grow > 0.0
+            && let Length::Fixed(height) = row.layout.height
+        {
+            row.layout.height = Length::Fixed(height + grow);
+        }
         return;
     }
+    // A line whose button's words take more lines is as much taller, and
+    // the row with it.
+    let mut grown = 0.0;
     for child in &mut row.children {
         if child.key.as_str().starts_with("settings/controls/")
             || child.key.as_str().starts_with("settings/label-line/")
             || child.key.as_str().starts_with("settings/reset-line/")
         {
-            fit_line(child, text_width);
+            let grow = fit_line(child, text_width);
+            if grow > 0.0
+                && let Length::Fixed(height) = child.layout.height
+            {
+                child.layout.height = Length::Fixed(height + grow);
+            }
+            grown += grow;
         }
+    }
+    if grown > 0.0
+        && let Length::Fixed(height) = row.layout.height
+    {
+        row.layout.height = Length::Fixed(height + grown);
     }
 }
 
@@ -18755,7 +19930,6 @@ fn theme_slot_row(
         aterm_types::Appearance::Light => "Light theme",
     };
     let action = theme_slot_action(side);
-    let pending = state.config_key_pending(prefs::EDIT_THEME);
     let shown = state
         .assets
         .themes
@@ -18813,8 +19987,6 @@ fn theme_slot_row(
             )
             .value(SemanticValue::Text(shown.clone()))
             .state(ControlState {
-                enabled: !pending,
-                busy: pending,
                 focused: state
                     .common
                     .last_focus
@@ -18866,7 +20038,6 @@ fn theme_slot_row(
             reset_action.clone(),
             ButtonSpec::new(format!("Reset {title} to {default}")).visual_label("Reset"),
             reset_action,
-            pending,
         )
     });
     theme_card_row(
@@ -18960,7 +20131,6 @@ fn theme_mode_row(
     width: SettingsWidth,
     text_width: f32,
 ) -> UiNode {
-    let pending = state.config_key_pending(prefs::EDIT_THEME);
     let own =
         |name: &str, side| name.eq_ignore_ascii_case(crate::app_config::default_pair_side(side));
     let at_own_pair = following && state.is_explicit(prefs::EDIT_THEME) && {
@@ -18976,7 +20146,6 @@ fn theme_mode_row(
             action.clone(),
             ButtonSpec::new("Reset Color theme to Default").visual_label("Reset"),
             action,
-            pending,
         )
     });
     let name = "Follow system light/dark";
@@ -19028,8 +20197,6 @@ fn theme_mode_row(
                 )
                 .value(SemanticValue::Bool(following))
                 .state(ControlState {
-                    enabled: !pending,
-                    busy: pending,
                     focused: state
                         .common
                         .last_focus
@@ -19190,7 +20357,7 @@ fn top_cards(
     previews: TopPreviews,
 ) -> [SplitCard; 4] {
     let row = |key: &str, projected: Option<String>| {
-        top_card_row(state, key, projected, width, cx.viewport, text_width, true)
+        top_card_row(state, key, projected, width, text_width, true)
     };
     let preview = |key: &str, semantic_key: &str, height: f32| {
         top_preview_at(state, key, semantic_key, height, cx)
@@ -19203,15 +20370,7 @@ fn top_cards(
     // anything above the switch, which stays under the pointer.
     let mut color_rows: Vec<(UiNode, f32)> =
         theme_card_rows(state, ThemeRowsHost::Top, width, text_width, || {
-            top_card_row(
-                state,
-                prefs::EDIT_THEME,
-                None,
-                width,
-                cx.viewport,
-                text_width,
-                true,
-            )
+            top_card_row(state, prefs::EDIT_THEME, None, width, text_width, true)
         });
     let sample_at = usize::from(!color_rows.is_empty());
     if let Some(sample) = preview(
@@ -19310,8 +20469,8 @@ fn top_cards(
         PLAYFUL_EFFECTS_TITLE,
         None,
         Some((
-            // One line on the two-column grid, as the card's old note was;
-            // each row's own note says it in full in search and Modified.
+            // One line on the two-column grid; each row's own note says it in
+            // full in search and Modified.
             if compact {
                 "Swear words sparkle; a cat peeks at cat words."
             } else {
@@ -19400,7 +20559,6 @@ fn top_card_row(
     key: &str,
     projected: Option<String>,
     width: SettingsWidth,
-    viewport: LogicalRect,
     text_width: f32,
     direct: bool,
 ) -> Option<(UiNode, f32)> {
@@ -19409,7 +20567,7 @@ fn top_card_row(
     let inline = width == SettingsWidth::Compact
         && kind.is_some_and(|kind| compact_row_inline(&kind, text_width, with_reset));
     let mut row_width = if inline { SettingsWidth::Medium } else { width };
-    let mut top = top_setting_row(state, key, projected.clone(), row_width, viewport, direct)?;
+    let mut top = top_setting_row(state, key, projected.clone(), row_width, direct)?;
     if row_width != SettingsWidth::Compact
         && let Some(kind) = kind
     {
@@ -19435,7 +20593,7 @@ fn top_card_row(
                 }
                 _ => {
                     row_width = SettingsWidth::Compact;
-                    top = top_setting_row(state, key, projected, row_width, viewport, direct)?;
+                    top = top_setting_row(state, key, projected, row_width, direct)?;
                 }
             }
         }
@@ -19466,6 +20624,10 @@ fn top_card_row(
             wrap_segments(&mut row, key, text_width);
         }
         seat_stacked_reset(&mut row, &name, text_width);
+        // Its choice keeps its words, as a page's stacked row's does
+        // ([`fit_row_choice_label`]): "Automatic (SF Mono)" read "Auto…" and
+        // the theme "Def…" at 2× text on a phone-width card.
+        fit_row_choice_label(&mut row, text_width);
     }
     let room = row_label_room(&row, stacked, text_width);
     let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, false);
@@ -19481,7 +20643,7 @@ fn top_card_row(
     Some((row, height))
 }
 
-/// THE MUSIC EFFECTS SWITCH, with its status where it is silent or partly
+/// The Music effects switch, with its status where it is silent or partly
 /// so: one builder for the Top Settings playful card (`top`, its direct
 /// form) and the Sound page (the ordinary row form, notes and Reset), so the
 /// two cannot disagree (the switch's escape from Serious Mode is the same
@@ -19505,7 +20667,6 @@ fn music_effects_rows(
         prefs::EDIT_TRAIL_SOUNDS,
         Some(top_projected_music_value(state).to_string()),
         width,
-        cx.viewport,
         text_width,
         top,
     );
@@ -19644,8 +20805,12 @@ fn top_card_title_with_note(
     let [(heading, heading_height)] = card.head.as_slice() else {
         return None;
     };
-    // The heading is a semantic group over its painted copy.
-    let UiContent::Text(title) = &heading.children.first()?.content else {
+    // The heading is a semantic group over its painted copy: one line of it
+    // (a title wrapped onto more keeps its own row).
+    let [painted] = heading.children.as_slice() else {
+        return None;
+    };
+    let UiContent::Text(title) = &painted.content else {
         return None;
     };
     let UiContent::Group(GroupSpec {
@@ -19770,11 +20935,13 @@ fn display_face_rows(
 ) -> Vec<(UiNode, f32)> {
     let active = display_layer_in_effect(state, None);
     let full = active.len() >= aterm_render::DISPLAY_FACE_MIX_MAX;
-    let pending = state.config_key_pending(prefs::EDIT_DISPLAY_FONT);
-    let switch_width = 104.0 * settings_text_scale().min(1.4);
+    // A SWITCH IS NEVER WIDER THAN ITS LINE ([`switch_control_width`]): a
+    // fixed 145.6pt at 2× text ran out of a 110pt card at 22 columns.
+    let switch_width = switch_control_width(text_width);
     let row_gap = 12.0;
     let tail = switch_tail(width, text_width);
     let name_height = display_face_name_height();
+    let reset_room = tail.map_or(0.0, |gap| gap + reset_slot_width());
     // A face's name sits beside its switch at every width, so a compact
     // page's stacked-row height (a label over a control) does not apply: a
     // face row is as tall as the page's one-line switch rows, or its name.
@@ -19844,9 +21011,7 @@ fn display_face_rows(
                 )
                 .value(SemanticValue::Bool(on))
                 .state(ControlState {
-                    enabled: !pending,
                     focused,
-                    busy: pending,
                     ..ControlState::default()
                 })
                 .style(StyleRef::Setting),
@@ -19859,23 +21024,79 @@ fn display_face_rows(
         );
         // The switch ends where the page's switch rows' switches end: before
         // Reset's place, which a face keeps as those rows do ([`switch_tail`]).
-        let mut children = vec![text, control];
-        if tail.is_some() {
-            children.push(reset_slot(&format!("display-face/{}", font.id)));
+        // THE ROW RULE: the name beside the switch where the line leaves it
+        // its floor ([`one_line_name_floor`]), else the switch under it, at
+        // the line's trailing edge, as a stacked switch row sets it.
+        let beside =
+            text_width - switch_width - reset_room - row_gap >= one_line_name_floor(font.label);
+        let row = UiNode::new(
+            format!("settings/display-face/row/{}", font.id),
+            UiContent::Group(GroupSpec::new(font.label)),
+        );
+        if beside {
+            let mut children = vec![text, control];
+            if tail.is_some() {
+                children.push(reset_slot(&format!("display-face/{}", font.id)));
+            }
+            rows.push((
+                row.layout(
+                    Layout::row()
+                        .height(Length::Fixed(row_height))
+                        .padding(Insets::symmetric(0.0, 4.0))
+                        .gap(tail.unwrap_or(row_gap)),
+                )
+                .children(children),
+                row_height,
+            ));
+            continue;
         }
-        rows.push((
+        let control_height = scaled_control_height();
+        let mut text = text;
+        text.layout.height = Length::Fixed(name_height);
+        // NO CONTROL IS WIDER THAN ITS LINE: the switch keeps what the line
+        // leaves it beside the gaps and Reset's place ([`fit_stacked_controls`]).
+        let gap = tail.unwrap_or(row_gap);
+        let beside_switch = if tail.is_some() {
+            2.0 * gap + reset_slot_width()
+        } else {
+            gap
+        };
+        let mut control = control;
+        control.layout.width =
+            Length::Fixed(switch_width.min((text_width - beside_switch).max(0.0)));
+        let mut line = vec![
             UiNode::new(
-                format!("settings/display-face/row/{}", font.id),
-                UiContent::Group(GroupSpec::new(font.label)),
+                format!("settings/display-face/spacer/{}", font.id),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
             )
-            .layout(
-                Layout::row()
-                    .height(Length::Fixed(row_height))
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+            control,
+        ];
+        if tail.is_some() {
+            line.push(reset_slot(&format!("display-face/{}", font.id)));
+        }
+        let height = name_height + 4.0 + control_height + 8.0;
+        rows.push((
+            row.layout(
+                Layout::column()
+                    .height(Length::Fixed(height))
                     .padding(Insets::symmetric(0.0, 4.0))
-                    .gap(tail.unwrap_or(row_gap)),
+                    .gap(4.0),
             )
-            .children(children),
-            row_height,
+            .children(vec![
+                text,
+                UiNode::new(
+                    format!("settings/display-face/controls/{}", font.id),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(
+                    Layout::row()
+                        .height(Length::Fixed(control_height))
+                        .gap(tail.unwrap_or(row_gap)),
+                )
+                .children(line),
+            ]),
+            height,
         ));
     }
     rows
@@ -19933,9 +21154,9 @@ fn display_faces_card(
             .collect(),
     );
     rows.push((note, note_height));
-    // A group card like FONT and RENDERING beside it: the caption in small
+    // A group card like Font and Rendering beside it: the caption in small
     // capitals, the same padding and gaps.
-    let card = page_group_card("Display faces", "display-faces", rows);
+    let card = page_group_card("Display faces", "display-faces", rows, text_width);
     let height = card.height();
     (card.node(0..card.rows.len()), height)
 }
@@ -19945,15 +21166,15 @@ fn display_face_name_height() -> f32 {
     26.0_f32.max(22.0 * settings_text_scale())
 }
 
-/// THE CURSOR STYLES PAGE (owner ask: "a page with a list of the working
-/// [cursor styles] where selecting each one shows a preview in the working
-/// theme"). The live preview is pinned under the heading, in the terminal's
-/// own theme. The list holds Off, then every style that draws (one row each:
-/// its name, what it draws, a check on the saved one) under small captions,
-/// then the saved style's own tuning; the cursor's shape is on Cursor &
-/// Motion, and the preview draws it. Pointing at a row or moving the keyboard
-/// to it previews that style unsaved ([`cursor_style_candidate`]); clicking
-/// it or pressing Return saves it, and the list stays where it is.
+/// The Cursor Styles page: the working cursor styles, each previewed in the
+/// working theme when selected. The live preview is pinned under the heading,
+/// in the terminal's own theme. The list holds Off, then every style that
+/// draws (one row each: its name, what it draws, a check on the saved one)
+/// under small captions, then the saved style's own tuning; the cursor's shape
+/// is on Cursor & Motion, and the preview draws it. Pointing at a row or
+/// moving the keyboard to it previews that style unsaved
+/// ([`cursor_style_candidate`]); clicking it or pressing Return saves it, and
+/// the list stays where it is.
 fn cursor_styles_page(
     state: &SettingsViewState,
     width: SettingsWidth,
@@ -19973,7 +21194,7 @@ fn cursor_styles_page(
     let body = steady_body.min(page_body);
     let overhang = scroll::Overhang {
         now: (page_body - body).max(0.0),
-        kept: settings_status_bar_cost(state, width, cx.viewport),
+        kept: settings_status_bar_kept(state, width, cx.viewport),
     };
     let (mut out, mut used) = pinned_heading(
         state,
@@ -20034,60 +21255,82 @@ fn cursor_styles_page(
         Vec::new()
     };
     let saved = saved_cursor_style(state);
-    let pending = state.config_key_pending(prefs::EDIT_CURSOR_TRAIL_STYLE);
     let styles = listed_cursor_styles(state);
-    let row_height = cursor_style_row_height();
-    // The longest group card's caption, row count and row pitch.
-    let mut group_run: (f32, usize, f32) = (0.0, 0, 0.0);
+    // The most a style row may take and still be whole on a screen of the
+    // list: the room the list has under the page's leanest chrome, its
+    // preview listed ([`PageChrome`]) — a short window sheds its chrome
+    // before a row gives up its description.
+    let row_room = {
+        let chrome = state.page_chrome.get();
+        let leanest = PageChrome::ladder(width, cx.viewport)
+            .last()
+            .copied()
+            .unwrap_or(PageChrome::FULL)
+            .giving_bar_room()
+            .listing_preview();
+        state.page_chrome.set(leanest);
+        let body = settings_steady_body_height(state, width, cx.viewport)
+            .min(settings_page_body_height(state, width, cx.viewport));
+        let (_, used) = pinned_heading(
+            state,
+            width,
+            cx.viewport,
+            settings_page_gap(state, width, cx.viewport),
+            route.label(),
+            route_subtitle(route),
+        );
+        state.page_chrome.set(chrome);
+        (body - used).max(scaled_control_height())
+    };
+    // The group cards' captions and their rows' heights: a screen further
+    // down the list shows a group's caption over its rows.
+    let mut group_runs: Vec<(f32, Vec<f32>, f32)> = Vec::new();
     // Off is one row of its own at the head of the list, outside any card:
     // it is the way back to no trail, not a kind of trail.
     for style in styles
         .iter()
         .filter(|style| style.group == CursorStyleGroup::Off)
     {
-        let row = cursor_style_row(
+        for (row, height) in cursor_style_row(
             style,
             style.value.eq_ignore_ascii_case(&saved),
-            pending,
-            row_height,
             text_width + 24.0,
-        );
-        items.push(ListItem::Card(Box::new(row), row_height));
+            row_room,
+        ) {
+            items.push(ListItem::Card(Box::new(row), height));
+        }
     }
     for group in [CursorStyleGroup::Companions, CursorStyleGroup::Trails] {
+        let caption = group.caption();
+        // What the card's padding, caption and gap take of a screen.
+        let chrome = cursor_styles_card("-", caption, "-", Vec::new(), text_width).height() + 6.0;
         let rows = styles
             .iter()
             .filter(|style| style.group == group)
-            .map(|style| {
-                (
-                    cursor_style_row(
-                        style,
-                        style.value.eq_ignore_ascii_case(&saved),
-                        pending,
-                        row_height,
-                        text_width,
-                    ),
-                    row_height,
+            .flat_map(|style| {
+                cursor_style_row(
+                    style,
+                    style.value.eq_ignore_ascii_case(&saved),
+                    text_width,
+                    row_room - chrome,
                 )
             })
             .collect::<Vec<_>>();
         if rows.is_empty() {
             continue;
         }
-        let caption = group.caption();
         let card = cursor_styles_card(
             &format!("{group:?}").to_ascii_lowercase(),
             caption,
             caption.unwrap_or("No trail"),
             rows,
+            text_width,
         );
-        // A screen further down the list shows its group's caption over its
-        // rows: what `rows` of one group take there.
-        if card.rows.len() > group_run.1 {
-            let head = card.height_of_head();
-            let row = row_height + card.gap;
-            group_run = (head, card.rows.len(), row);
-        }
+        group_runs.push((
+            card.height_of_head(),
+            card.rows.iter().map(|(_, height)| *height).collect(),
+            card.gap,
+        ));
         items.push(ListItem::Split(card));
     }
     // The saved style's Adjust card goes under the styles once the preview
@@ -20127,10 +21370,10 @@ fn cursor_styles_page(
     .min(natural);
     // The status note is pinned where the page keeps the preview's least
     // height and a whole stop of the list beside it; a host too short for
-    // that lists it as the list's first stop, as before. Measured as the page
-    // is with no bar up, whether or not one is, so a bar never moves the note
-    // between the two.
-    let pin_room = steady_room + settings_status_bar_cost(state, width, cx.viewport);
+    // that lists it as the list's first stop. Measured as the page is with no
+    // bar up, whether or not one is, so a bar never moves the note between
+    // the two.
+    let pin_room = steady_room + settings_status_bar_kept(state, width, cx.viewport);
     let tallest_in = |items: &[ListItem], room: f32| {
         let card = tuning_bound(gap, room);
         scroll::tallest_span(items, gap, room).max(card)
@@ -20166,12 +21409,16 @@ fn cursor_styles_page(
         // `styles` style rows where the page lands, and for as many of one
         // group's rows on a screen further down, under its caption.
         let span_for = |styles: usize, room: f32| {
-            let (head, longest, pitch) = group_run;
-            let in_group = if longest >= styles {
-                head + styles as f32 * pitch
-            } else {
-                0.0
-            };
+            // The tallest run of `styles` rows of one group under its
+            // caption: rows whose words wrap are taller than the rest.
+            let in_group = group_runs
+                .iter()
+                .filter(|(_, rows, _)| rows.len() >= styles)
+                .flat_map(|(head, rows, gap)| {
+                    rows.windows(styles.max(1))
+                        .map(move |run| head + run.iter().map(|row| row + gap).sum::<f32>())
+                })
+                .fold(0.0_f32, f32::max);
             scroll::leading_span(&items, gap, room, stops_before_styles + 1 + styles).max(in_group)
         };
         let most = styles.len().saturating_sub(1).clamp(1, 2);
@@ -20188,10 +21435,27 @@ fn cursor_styles_page(
         .min(room - gap)
         .max(floor);
         preview.layout.height = Length::Fixed(height);
-        out.push(preview);
-        used += height + gap;
-    }
-    if let Some(card) = tuning((body - used).max(0.0)) {
+        // THE PREVIEW IS PINNED UNLESS THE PAGE'S CHROME LISTS IT
+        // ([`PageChrome`]): where the page's leanest chrome, the bar's room
+        // given, still leaves stops cut under the pinned preview (a short
+        // window at large text: at 220×12 at 2× text it pinned 64pt over a
+        // 56pt list and cut every style row), the preview is the list's first
+        // stop instead, as a field page's preview is
+        // ([`settings_fields_page`]): it scrolls with the list and is always
+        // reachable, sized as a landing would show it beside the next stop.
+        if state.page_chrome.get().preview_listed {
+            let status_height = status.as_ref().map_or(0.0, |(_, height)| height + gap);
+            let list_room = (body - used - status_height).max(0.0);
+            let next = scroll::leading_span(&items, gap, list_room, 1);
+            let height = (list_room - gap - next).clamp(floor, natural.min(list_room).max(floor));
+            preview.layout.height = Length::Fixed(height);
+            items.insert(0, ListItem::Card(Box::new(preview), height));
+        } else {
+            out.push(preview);
+            used += height + gap;
+        }
+        items.extend(tuning((body - used).max(0.0)).map(ListItem::Split));
+    } else if let Some(card) = tuning((body - used).max(0.0)) {
         items.push(ListItem::Split(card));
     }
     if let Some((node, height)) = status {
@@ -20254,27 +21518,22 @@ fn cursor_style_status(
     Some((note, None))
 }
 
-/// A card of the Cursor Styles list, listed row by row under its caption.
+/// A card of the Cursor Styles list, listed row by row under its caption,
+/// its rows `text_width` wide: the caption wraps to that column, never cut
+/// ([`caption_node`]; "ADJUST RAINBOW KI…" at 22 columns).
 fn cursor_styles_card(
     key: &str,
     caption: Option<&str>,
     label: &str,
     rows: Vec<(UiNode, f32)>,
+    text_width: f32,
 ) -> SplitCard {
     let head = caption
         .map(|caption| {
-            let height = group_heading_label_height();
-            (
-                UiNode::new(
-                    format!("settings/cursor-styles/{key}/heading"),
-                    UiContent::Text(TextSpec {
-                        text: caption.to_ascii_uppercase(),
-                        role: SemanticRole::Heading,
-                        style: StyleRef::Quiet,
-                    }),
-                )
-                .layout(Layout::default().height(Length::Fixed(height))),
-                height,
+            caption_node(
+                &format!("settings/cursor-styles/{key}/heading"),
+                &caption.to_ascii_uppercase(),
+                text_width,
             )
         })
         .into_iter()
@@ -20289,34 +21548,70 @@ fn cursor_styles_card(
     }
 }
 
-/// One style row's height: its name over its one-line description.
-fn cursor_style_row_height() -> f32 {
-    let scale = settings_text_scale();
-    (16.0 + 38.0 * scale).max(scaled_control_height())
-}
-
-/// One style row: a selectable button named for the style, its description
-/// read after the name, selected and checked where it is the saved style.
-/// The name and description are painted over it.
+/// One style row, `row_width` wide: a selectable button named for the
+/// style, its description read after the name, selected and checked where it
+/// is the saved style. Its name and its description are painted over it,
+/// each wrapped to the room beside the check mark's slot ([`wrapped_words_node`]):
+/// a narrow window or large text gives them more lines, never a cut
+/// ("Flames behind what you type and a red-hot e…", "Rainbow k… (default)").
+/// A ROW TALLER THAN `limit` (a narrow window at large text) keeps only
+/// its name on the button and lists its description as a block of its own
+/// under it, paint-only (the button still says it): so the button is whole
+/// on some screen, as a setting row's note goes under its row where the two
+/// outgrow the room ([`finished_row_stops`]). Returns the row (or the button
+/// and its description) and the heights.
 fn cursor_style_row(
     style: &ListedCursorStyle,
     saved: bool,
-    pending: bool,
-    height: f32,
     row_width: f32,
-) -> UiNode {
+    limit: f32,
+) -> Vec<(UiNode, f32)> {
     const LEAD: f32 = 12.0;
     // The check mark's slot.
     const TAIL: f32 = 44.0;
+    // Over and under the words.
+    const PAD: f32 = 8.0;
     let key = cursor_style_row_key(&style.value);
     let scale = settings_text_scale();
-    let text_width = (row_width - LEAD - TAIL).max(0.0);
-    // Its name with the default mark, heard and painted; the mark survives
-    // the elision ("Rainbow k… (default)").
+    // The check mark's slot is given up where a word of the name would not
+    // be whole beside it (a phone-width row at large text): the saved row
+    // still wears the selected wash and says it is selected, as a choice
+    // gives up its arrow before its words ([`fit_row_choice_label`]).
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
+    let checked = pieces_fit(&style.label(), (row_width - LEAD - TAIL).max(0.0), &measure);
+    let tail = if checked { TAIL } else { LEAD };
+    let text_width = (row_width - LEAD - tail).max(0.0);
+    // Its name with the default mark, heard and painted.
     let mut spec = ButtonSpec::new(style.label()).visual_label(String::new());
     spec.description = Some(style.description.clone());
-    if saved {
+    if saved && checked {
         spec = spec.trailing_icon(ButtonIcon::Check);
+    }
+    let (name, name_height) = wrapped_words_node(
+        &format!("{key}/name"),
+        &style.label(),
+        (SemanticRole::Text, StyleRef::Primary),
+        text_width,
+        20.0 * scale,
+    );
+    let (description, description_height) = wrapped_words_node(
+        &format!("{key}/description"),
+        &style.description,
+        (SemanticRole::Status, StyleRef::Quiet),
+        text_width,
+        18.0 * scale,
+    );
+    let whole = (2.0 * PAD + name_height + description_height).max(scaled_control_height());
+    let apart = whole > limit + 0.01;
+    let height = if apart {
+        (2.0 * PAD + name_height).max(scaled_control_height())
+    } else {
+        whole
+    };
+    let mut painted = vec![name.paint_only()];
+    if !apart {
+        painted.push(description.paint_only());
     }
     let words = UiNode::new(
         format!("{key}/words"),
@@ -20327,58 +21622,58 @@ fn cursor_style_row(
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(Insets {
-                top: 8.0,
-                right: TAIL,
-                bottom: 8.0,
+                top: PAD,
+                right: tail,
+                bottom: PAD,
                 left: LEAD,
             }),
     )
-    .children(vec![
+    .children(painted)
+    .paint_only();
+    let button = (
         UiNode::new(
-            format!("{key}/name"),
-            UiContent::Text(TextSpec {
-                text: fit_keeping_default_note(&style.label(), text_width),
-                role: SemanticRole::Text,
-                style: StyleRef::Primary,
-            }),
+            key.clone(),
+            UiContent::Button(
+                Control::new(spec, ActionId::new(key.clone()))
+                    .state(ControlState {
+                        selected: saved,
+                        ..ControlState::default()
+                    })
+                    .style(StyleRef::Secondary),
+            ),
         )
         .layout(
             Layout::default()
                 .width(Length::Fill)
-                .height(Length::Fixed(20.0 * scale)),
+                .height(Length::Fixed(height)),
         )
-        .paint_only(),
-        UiNode::new(
-            format!("{key}/description"),
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_status_label(&style.description, text_width),
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-        .paint_only(),
-    ])
-    .paint_only();
-    UiNode::new(
-        key.clone(),
-        UiContent::Button(
-            Control::new(spec, ActionId::new(key))
-                .state(ControlState {
-                    selected: saved,
-                    enabled: !pending,
-                    busy: pending,
-                    ..ControlState::default()
-                })
-                .style(StyleRef::Secondary),
-        ),
+        .children(vec![words]),
+        height,
+    );
+    if !apart {
+        return vec![button];
+    }
+    // Under the button, inset as its words are, wrapped to its own box.
+    let (description, description_height) = wrapped_words_node(
+        &format!("{key}/description"),
+        &style.description,
+        (SemanticRole::Status, StyleRef::Quiet),
+        (row_width - 2.0 * LEAD).max(0.0),
+        18.0 * scale,
+    );
+    let block = UiNode::new(
+        format!("{key}/about"),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Status)),
     )
     .layout(
-        Layout::default()
+        Layout::column()
             .width(Length::Fill)
-            .height(Length::Fixed(height)),
+            .height(Length::Fixed(description_height))
+            .padding(Insets::symmetric(LEAD, 0.0)),
     )
-    .children(vec![words])
+    .children(vec![description.paint_only()])
+    .paint_only();
+    vec![button, (block, description_height)]
 }
 
 /// The tallest stop the Adjust card of any listed style can take in a list
@@ -20437,6 +21732,7 @@ fn cursor_style_tuning_bound(
             Some("Adjust"),
             "Adjust",
             rows,
+            text_width,
         ))]
     };
     move |gap: f32, room: f32| scroll::tallest_span(&card, gap, room)
@@ -20470,7 +21766,7 @@ fn cursor_style_tuning_card(
     // caption and the gap after it (the first row's stop carries them), so
     // the picker is sized against the room less that chrome.
     let chrome = {
-        let empty = cursor_styles_card("tuning", Some(&caption), &caption, Vec::new());
+        let empty = cursor_styles_card("tuning", Some(&caption), &caption, Vec::new(), text_width);
         empty.height() + empty.gap
     };
     let room = (room - chrome).max(0.0);
@@ -20516,14 +21812,20 @@ fn cursor_style_tuning_card(
     if rows.is_empty() {
         return None;
     }
-    Some(cursor_styles_card("tuning", Some(&caption), &caption, rows))
+    Some(cursor_styles_card(
+        "tuning",
+        Some(&caption),
+        &caption,
+        rows,
+        text_width,
+    ))
 }
 
 /// "Cursor style: Rainbow kitty" and the way to every style: one row for Top
 /// Settings and Cursor & Motion. Its button carries the style row's control
 /// key, so the pages that preview the style still find it.
 fn cursor_style_link_row(state: &SettingsViewState, text_width: f32) -> (UiNode, f32) {
-    let height = scaled_control_height();
+    let control = scaled_control_height();
     let saved = saved_cursor_style(state);
     let name = cursor_style_name(&saved);
     // Unset, the style is the default, and says so as the controls beside it
@@ -20536,76 +21838,115 @@ fn cursor_style_link_row(state: &SettingsViewState, text_width: f32) -> (UiNode,
         name
     };
     let label = format!("Cursor style: {name}");
-    // The painter's 10pt lead and 38pt chevron slot, and a margin past them
-    // so the label paints whole (`top_regular_choice_control_width`).
-    let button_width = (crate::native_ui::native_button_label_width("More styles…") + 56.0)
-        .min((text_width * 0.5).max(96.0));
-    let label_width = (text_width - button_width - 12.0).max(0.0);
-    let pending = state.config_key_pending(prefs::EDIT_CURSOR_TRAIL_STYLE);
     let focused = state.common.last_focus.as_ref().is_some_and(|key| {
         key.as_str() == format!("settings/control/{}", prefs::EDIT_CURSOR_TRAIL_STYLE)
     });
+    let mut spec = ButtonSpec {
+        // Named by the words it paints (its value says the style now drawn).
+        label: "More styles".to_string(),
+        visual_label: None,
+        visual_icon: None,
+        trailing_icon: Some(ButtonIcon::Forward),
+        // What the saved style draws leads, then where the button goes.
+        description: Some(
+            listed_cursor_styles(state)
+                .into_iter()
+                .find(|style| style.value.eq_ignore_ascii_case(&saved))
+                .map_or_else(String::new, |style| format!("{}. ", style.description))
+                + "Opens Cursor Styles, where every style previews as you point at it",
+        ),
+        badge: false,
+        swatches: Vec::new(),
+        chip: None,
+    };
+    // THE ROW RULE: the button beside the label where the label's words are
+    // whole in what it leaves them, on two lines at most ([`wrap_to_box`]),
+    // and the button's words whole in it; else the button under the label,
+    // each the row's whole width. The label used to be cut to what the
+    // button left it ("Cursor style: Rainbow k…").
+    // The painter's 10pt lead and 38pt chevron slot, and a margin past them
+    // so the label paints whole (`top_regular_choice_control_width`).
+    let natural = (crate::native_ui::native_button_label_width("More styles…") + 56.0)
+        .min((text_width * 0.5).max(96.0));
+    let beside_room = text_width - natural - 12.0;
+    let beside = pieces_fit(&label, beside_room, &row_label_width)
+        && wrap_to_box(&label, beside_room, &row_label_width).len() <= 2
+        && whole_button_words_in(&spec, "More styles…", &[], natural).is_some();
+    // Stacked, the button takes the row's width, as a stacked setting row's
+    // control does.
+    let (label_width, button_width) = if beside {
+        (beside_room, natural)
+    } else {
+        (text_width, text_width)
+    };
+    // Its words by the ladder a button that opens a list keeps
+    // ([`choice_words`]): the arrow given up before a word is broken.
+    let lines = choice_words(&mut spec, "More styles…", button_width);
+    let button_height = crate::native_ui::native_button_height_for_lines(lines, control);
+    let line_height = 22.0_f32.max(20.0 * settings_text_scale());
+    let (label_node, label_height) = wrapped_words_node(
+        "settings/cursor-style-link/label",
+        &label,
+        (SemanticRole::Text, StyleRef::Primary),
+        label_width,
+        line_height,
+    );
+    let height = if beside {
+        label_height.max(button_height)
+    } else {
+        label_height + 4.0 + button_height
+    };
+    let button = UiNode::new(
+        format!("settings/control/{}", prefs::EDIT_CURSOR_TRAIL_STYLE),
+        UiContent::Button(
+            Control::new(
+                spec,
+                ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_TRAIL_STYLE)),
+            )
+            .value(SemanticValue::Text(name.clone()))
+            .state(ControlState {
+                focused,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Setting),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(button_width))
+            .height(Length::Fixed(button_height)),
+    );
+    // Beside the button, the label's lines stand centred on it.
+    let label_node = if beside {
+        UiNode::new(
+            "settings/cursor-style-link/words",
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fixed(label_width))
+                .height(Length::Fixed(height))
+                .padding(Insets {
+                    top: ((height - label_height) / 2.0).max(0.0),
+                    ..Insets::default()
+                }),
+        )
+        .children(vec![label_node.paint_only()])
+        .paint_only()
+    } else {
+        label_node.paint_only()
+    };
+    let layout = if beside {
+        Layout::row().height(Length::Fixed(height)).gap(12.0)
+    } else {
+        Layout::column().height(Length::Fixed(height)).gap(4.0)
+    };
     let row = UiNode::new(
         "settings/cursor-style-link",
         UiContent::Group(GroupSpec::new(label.clone())),
     )
-    .layout(Layout::row().height(Length::Fixed(height)).gap(12.0))
-    .children(vec![
-        UiNode::new(
-            "settings/cursor-style-link/label",
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_text_label(&label, label_width),
-                role: SemanticRole::Text,
-                style: StyleRef::Primary,
-            }),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-        .paint_only(),
-        UiNode::new(
-            format!("settings/control/{}", prefs::EDIT_CURSOR_TRAIL_STYLE),
-            UiContent::Button(
-                Control::new(
-                    ButtonSpec {
-                        // Named by the words it paints (its value says the
-                        // style now drawn).
-                        label: "More styles".to_string(),
-                        visual_label: Some(crate::native_ui::fit_native_button_label(
-                            "More styles…",
-                            (button_width - 50.0).max(0.0),
-                        )),
-                        visual_icon: None,
-                        trailing_icon: Some(ButtonIcon::Forward),
-                        // What the saved style draws leads, then where the
-                        // button goes.
-                        description: Some(
-                            listed_cursor_styles(state)
-                                .into_iter()
-                                .find(|style| style.value.eq_ignore_ascii_case(&saved))
-                                .map_or_else(String::new, |style| format!("{}. ", style.description))
-                                + "Opens Cursor Styles, where every style previews as you point at it",
-                        ),
-                        badge: false,
-                        swatches: Vec::new(),
-                        chip: None,
-                    },
-                    ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_TRAIL_STYLE)),
-                )
-                .value(SemanticValue::Text(name.clone()))
-                .state(ControlState {
-                    enabled: !pending,
-                    busy: pending,
-                    focused,
-                    ..ControlState::default()
-                })
-                .style(StyleRef::Setting),
-            ),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fixed(button_width))
-                .height(Length::Fill),
-        ),
-    ]);
+    .layout(layout)
+    .children(vec![label_node, button]);
     (row, height)
 }
 
@@ -20614,9 +21955,9 @@ fn cursor_style_link_row(state: &SettingsViewState, text_width: f32) -> (UiNode,
 ///
 /// `title` is the card's one name, in its semantics at every width. What the
 /// heading PAINTS is fitted to `text_width` in the face it is painted in: the
-/// title where it fits, else `short`, else the shorter of the two elided —
-/// a visual copy under a semantic heading that keeps the whole name, as every
-/// responsive label does.
+/// title where it fits one line, else `short`, else the title's words on as
+/// many lines as the column needs — a visual copy under a semantic heading
+/// that keeps the whole name, as every responsive label does.
 fn top_split_card(
     semantic_key: &str,
     title: &str,
@@ -20626,20 +21967,25 @@ fn top_split_card(
     width: SettingsWidth,
     text_width: f32,
 ) -> SplitCard {
-    let heading_height = group_heading_label_height();
+    let line_height = group_heading_label_height();
     let style = if width == SettingsWidth::Compact && settings_text_scale() > 1.25 {
         StyleRef::Quiet
     } else {
         StyleRef::Primary
     };
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, style);
+    let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
+    // The title on one line where it fits, else its short words, else the
+    // title's words on as many lines as the column needs ([`wrap_to_box`]):
+    // never cut ("Cursor & Mo…" at 22 columns).
     let painted = std::iter::once(title)
         .chain(short)
-        .find(|text| crate::tray_raster::ui_text_width_for(face, text, px) <= text_width)
+        .find(|text| measure(text) <= text_width + crate::native_ui::TEXT_FIT_SLACK)
         .map_or_else(
-            || crate::native_ui::elide_text_label(short.unwrap_or(title), text_width, px, face),
-            str::to_string,
+            || wrap_to_box(title, text_width, &measure),
+            |text| vec![text.to_string()],
         );
+    let heading_height = painted.len().max(1) as f32 * line_height;
     let heading = UiNode::new(
         format!("settings/top/{semantic_key}/heading"),
         UiContent::Group(GroupSpec {
@@ -20648,19 +21994,33 @@ fn top_split_card(
             style: StyleRef::Plain,
         }),
     )
-    .layout(Layout::default().height(Length::Fixed(heading_height)))
-    .children(vec![
-        UiNode::new(
-            format!("settings/top/{semantic_key}/heading/visual"),
-            UiContent::Text(TextSpec {
-                text: painted,
-                role: SemanticRole::Heading,
-                style,
-            }),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-        .paint_only(),
-    ]);
+    .layout(Layout::column().height(Length::Fixed(heading_height)))
+    .children(
+        painted
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                UiNode::new(
+                    if index == 0 {
+                        format!("settings/top/{semantic_key}/heading/visual")
+                    } else {
+                        format!("settings/top/{semantic_key}/heading/visual/line-{index}")
+                    },
+                    UiContent::Text(TextSpec {
+                        text,
+                        role: SemanticRole::Heading,
+                        style,
+                    }),
+                )
+                .layout(
+                    Layout::default()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(line_height)),
+                )
+                .paint_only()
+            })
+            .collect(),
+    );
     let mut body = Vec::new();
     if let Some((text, lines)) = description {
         body.push(wrapped_copy_node(
@@ -20712,20 +22072,34 @@ fn page_control_row(
     } else {
         width
     };
-    let label_node = UiNode::new(
-        format!("{key}/label"),
-        UiContent::Text(TextSpec {
-            text: label.to_string(),
-            role: SemanticRole::Text,
-            style: StyleRef::Primary,
-        }),
-    )
-    .layout(Layout::default().width(Length::Fill).height(if compact {
-        Length::Fixed(22.0_f32.max(20.0 * settings_text_scale()))
+    // Over its control the label wraps to the column ([`wrapped_words_node`]),
+    // a word wider than it broken with a hyphen, never cut ("Brightn…" at 2×
+    // text in a 22-column window); the row is as much taller.
+    let line_height = 22.0_f32.max(20.0 * settings_text_scale());
+    let (label_node, grow) = if compact {
+        let (node, height) = wrapped_words_node(
+            &format!("{key}/label"),
+            label,
+            (SemanticRole::Text, StyleRef::Primary),
+            text_width,
+            line_height,
+        );
+        (node, (height - line_height).max(0.0))
     } else {
-        Length::Fill
-    }))
-    .paint_only();
+        (
+            UiNode::new(
+                format!("{key}/label"),
+                UiContent::Text(TextSpec {
+                    text: label.to_string(),
+                    role: SemanticRole::Text,
+                    style: StyleRef::Primary,
+                }),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+            0.0,
+        )
+    };
+    let label_node = label_node.paint_only();
     control.layout.width = if compact {
         Length::Fill
     } else {
@@ -20736,7 +22110,7 @@ fn page_control_row(
         compact_inline_row_height()
     } else {
         width.row_height()
-    };
+    } + grow;
     let layout = if compact {
         Layout::column().height(Length::Fixed(height)).gap(4.0)
     } else {
@@ -20769,17 +22143,17 @@ const SETTINGS_GROUP_CARD_INSET: f32 = 14.0;
 ///
 /// The card's key names the group alone, as its heading's does — its caption
 /// and its first row's anchor — never the page drawing it.
-fn page_group_card(caption: &str, anchor: &str, rows: Vec<(UiNode, f32)>) -> SplitCard {
-    let label_height = group_heading_label_height();
-    let heading = UiNode::new(
-        format!("settings/group-heading/{}/{anchor}", key_fragment(caption)),
-        UiContent::Text(TextSpec {
-            text: caption.to_ascii_uppercase(),
-            role: SemanticRole::Heading,
-            style: StyleRef::Quiet,
-        }),
-    )
-    .layout(Layout::default().height(Length::Fixed(label_height)));
+fn page_group_card(
+    caption: &str,
+    anchor: &str,
+    rows: Vec<(UiNode, f32)>,
+    text_width: f32,
+) -> SplitCard {
+    let (heading, label_height) = group_caption_node(
+        &format!("settings/group-heading/{}/{anchor}", key_fragment(caption)),
+        caption,
+        text_width,
+    );
     SplitCard {
         key: format!("settings/group/{}/{anchor}", key_fragment(caption)),
         spec: GroupSpec::new(caption).style(StyleRef::Secondary),
@@ -20926,18 +22300,134 @@ fn page_button(key: &str, label: &str, primary: bool, enabled: bool, busy: bool)
     )
 }
 
-/// A row of page buttons, side by side from the leading edge.
-fn page_button_row(key: &str, buttons: Vec<UiNode>) -> (UiNode, f32) {
-    let height = scaled_control_height();
+/// PAGE BUTTONS IN LINES — one rule for a page's buttons: each as wide as
+/// its words and the painter's padding, as many to a line as `text_width`
+/// holds, 8pt apart, the next line where the next does not fit; a label
+/// wider than the whole line sets its words on lines ([`button_words_in`]) in
+/// a button the line's width, as tall as they take. Never one line whose
+/// buttons run past their box (Wallpaper's Choose Image… and Remove at 22
+/// columns and large text), and never a label cut. Returns the node, keyed
+/// `key`, and its height.
+fn page_button_lines(key: &str, buttons: Vec<UiNode>, text_width: f32) -> (UiNode, f32) {
+    let shape = ButtonLines {
+        single: scaled_control_height(),
+        least: 72.0,
+        slack: 6.0,
+        gap: 8.0,
+    };
+    button_lines(key, buttons, text_width, shape)
+}
+
+/// How [`button_lines`] sets its buttons: one line of words `single` tall,
+/// each at least `least` wide and `slack` wider than its words and the
+/// painter's padding, `gap` apart.
+#[derive(Clone, Copy, Debug)]
+struct ButtonLines {
+    single: f32,
+    least: f32,
+    slack: f32,
+    gap: f32,
+}
+
+/// [`page_button_lines`] for buttons in the `shape` a page gives them (the
+/// Themes chooser's small footer buttons).
+fn button_lines(
+    key: &str,
+    buttons: Vec<UiNode>,
+    text_width: f32,
+    shape: ButtonLines,
+) -> (UiNode, f32) {
+    let gap = shape.gap;
+    let mut lines = button_line_set(buttons, text_width, shape);
+    let height = button_line_set_height(&lines, gap);
+    let group = || UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group));
+    if lines.len() <= 1 {
+        let buttons = lines.pop().map(|(line, _)| line).unwrap_or_default();
+        return (
+            UiNode::new(key, group())
+                .layout(Layout::row().height(Length::Fixed(height)).gap(gap))
+                .children(buttons),
+            height,
+        );
+    }
     (
-        UiNode::new(
-            key,
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(Layout::row().height(Length::Fixed(height)).gap(8.0))
-        .children(buttons),
+        UiNode::new(key, group())
+            .layout(Layout::column().height(Length::Fixed(height)).gap(gap))
+            .children(
+                lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (line, tall))| {
+                        UiNode::new(format!("{key}/buttons-{index}"), group())
+                            .layout(Layout::row().height(Length::Fixed(tall)).gap(gap))
+                            .children(line)
+                    })
+                    .collect(),
+            ),
         height,
     )
+}
+
+/// The lines [`button_lines`] sets `buttons` on in `text_width`, each its
+/// buttons (sized, their words fitted) and its height: for a block that lays
+/// its lines out itself and measures how far down a line ends (the MACOS
+/// ACCESS block, [`macos_access_action_rows`]).
+fn button_line_set(
+    buttons: Vec<UiNode>,
+    text_width: f32,
+    shape: ButtonLines,
+) -> Vec<(Vec<UiNode>, f32)> {
+    let ButtonLines {
+        single,
+        least,
+        slack,
+        gap,
+    } = shape;
+    let mut lines: Vec<(Vec<UiNode>, f32, f32)> = Vec::new();
+    for mut button in buttons {
+        let UiContent::Button(control) = &mut button.content else {
+            continue;
+        };
+        let full = control
+            .spec
+            .visual_label
+            .clone()
+            .unwrap_or_else(|| control.spec.label.clone());
+        let (words, count) = button_words_in(&control.spec, &full, &[], text_width);
+        // What the painter keeps beside a label: its lead, its end, and an
+        // arrow's or a chip's room.
+        let padding = 1_000.0 - crate::native_ui::text_button_label_room(&control.spec, 1_000.0);
+        let width = if count > 1 {
+            text_width
+        } else {
+            (crate::native_ui::native_button_label_width(&words) + padding + slack)
+                .max(least)
+                .min(text_width)
+        };
+        let height = crate::native_ui::native_button_height_for_lines(count, single);
+        control.spec.visual_label = Some(words);
+        button.layout = button
+            .layout
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height));
+        match lines.last_mut() {
+            Some((line, used, tall)) if *used + gap + width <= text_width + 0.01 => {
+                *used += gap + width;
+                *tall = tall.max(height);
+                line.push(button);
+            }
+            _ => lines.push((vec![button], width, height)),
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(line, _, tall)| (line, tall))
+        .collect()
+}
+
+/// How tall `lines` of buttons ([`button_line_set`]) stand, `gap` apart.
+fn button_line_set_height(lines: &[(Vec<UiNode>, f32)], gap: f32) -> f32 {
+    lines.iter().map(|(_, tall)| tall).sum::<f32>() + gap * lines.len().saturating_sub(1) as f32
 }
 
 /// THE WALLPAPER IN WORDS, wherever Settings names it (the Wallpaper page's
@@ -20982,7 +22472,6 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
     let room =
         (settings_list_body_height(state, width, viewport) - used).max(scaled_control_height());
     let current = state.raw_value(prefs::EDIT_WALLPAPER);
-    let pending = state.config_key_pending(prefs::EDIT_WALLPAPER);
     let line_height = page_subtitle_height();
     let mut rows: Vec<(UiNode, f32)> = Vec::new();
 
@@ -20997,6 +22486,16 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         },
         |(visual, spoken)| (visual, format!("Wallpaper: {spoken}")),
     );
+    // Its words wrap to the card's column, never cut ("No wallpaper. Dim and
+    // text tint apply once you choose an image" lost its end at 2× text even
+    // on a wide window).
+    let (visual_node, visual_height) = wrapped_words_node(
+        "settings/wallpaper/current/visual",
+        &visual,
+        (SemanticRole::Text, StyleRef::Primary),
+        text_width,
+        line_height,
+    );
     rows.push((
         UiNode::new(
             "settings/wallpaper/current",
@@ -21007,23 +22506,12 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
             }),
         )
         .layout(
-            Layout::default()
+            Layout::column()
                 .width(Length::Fill)
-                .height(Length::Fixed(line_height)),
+                .height(Length::Fixed(visual_height)),
         )
-        .children(vec![
-            UiNode::new(
-                "settings/wallpaper/current/visual",
-                UiContent::Text(TextSpec {
-                    text: crate::native_ui::fit_native_text_label(&visual, text_width),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Primary,
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .paint_only(),
-        ]),
-        line_height,
+        .children(vec![visual_node.paint_only()]),
+        visual_height,
     ));
     // The picture itself, under a terminal's session, dimmed and tinted as
     // a tab draws it, sized so a screen of the list still holds it whole.
@@ -21031,7 +22519,7 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         state,
         cx,
         width,
-        room - 2.0 * SETTINGS_GROUP_CARD_INSET - line_height - 8.0,
+        room - 2.0 * SETTINGS_GROUP_CARD_INSET - visual_height - 8.0,
     ));
     // Why the file did not load, on its own line, wrapped so the reason is
     // never cut off.
@@ -21049,28 +22537,28 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
             None,
         ));
     }
-    // The button is only as real as the platform's picker: it asks the same
-    // predicate the palette's File rows use, so a platform without one greys
-    // it out instead of offering a dead click.
+    // The button is only as live as the platform's picker: it asks the predicate
+    // the palette's File rows use, so a host without a picker greys it out.
     let picker = crate::menu::local_file_picker_available();
-    rows.push(page_button_row(
+    rows.push(page_button_lines(
         "settings/wallpaper/actions",
         vec![
             page_button(
                 "settings/wallpaper/choose",
                 "Choose Image…",
                 true,
-                picker && !pending,
-                pending,
+                picker,
+                false,
             ),
             page_button(
                 "settings/wallpaper/detach",
                 "Remove",
                 false,
-                current.is_some() && !pending,
-                pending,
+                current.is_some(),
+                false,
             ),
         ],
+        text_width,
     ));
     let keys = [prefs::EDIT_WALLPAPER_DIM, prefs::EDIT_WALLPAPER_TEXT_TINT];
     let shared = current
@@ -21099,7 +22587,12 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         state,
         "settings/wallpaper/list",
         "Wallpaper",
-        vec![ListItem::Split(page_group_card("Image", "wallpaper", rows))],
+        vec![ListItem::Split(page_group_card(
+            "Image",
+            "wallpaper",
+            rows,
+            text_width,
+        ))],
         room,
         gap,
         settings_list_overhang(state, width, viewport),
@@ -21193,6 +22686,7 @@ fn top_settings_page(
                 .as_ref()
                 .is_some_and(|picker| picker.themes.is_some());
             let room = settings_list_body_height(state, width, cx.viewport)
+                - plain_status_extra(state, width, cx.viewport)
                 - used
                 - gap
                 - choice_picker_floor(themed, width);
@@ -21213,9 +22707,9 @@ fn top_settings_page(
         return (out, PageLayout::shown(state));
     }
 
-    // A one-line descriptive subtitle cannot stay whole at large Dynamic Type on
-    // anything narrower than the Wide page (the Medium page is 720pt and this
-    // sentence needs ~860pt at 2×), so it yields there, as route subtitles do.
+    // A one-line subtitle cannot stay whole at large Dynamic Type narrower than the
+    // Wide page (the Medium page is 720pt; this sentence needs ~860pt at 2×), so it
+    // yields there, as route subtitles do.
     let subtitle_yields = width != SettingsWidth::Wide && settings_text_scale() > 1.25;
     let gap = settings_page_gap(state, width, cx.viewport);
     let body = settings_list_body_height(state, width, cx.viewport);
@@ -21233,9 +22727,9 @@ fn top_settings_page(
             "Every control saves immediately."
         },
     );
-    // Serious Mode's consequence is NOT decorative, so a page without the
-    // subtitle hands it to the dedicated status node — which keeps the
-    // COMPLETE sentence in its semantic label and paints a short caption.
+    // Serious Mode's consequence is not decorative: a page without the subtitle
+    // hands it to the status node (full sentence in its semantic label, a short
+    // caption).
     if compact_serious_disclosure || (subtitle_yields && cx.motion.serious) {
         out.push(top_serious_mode_disclosure());
         used += top_serious_mode_disclosure_height() + gap;
@@ -21287,16 +22781,8 @@ fn top_settings_page(
         ThemeRowsHost::Top,
         width,
         text_width,
-        top_card_row(
-            state,
-            prefs::EDIT_THEME,
-            None,
-            width,
-            cx.viewport,
-            text_width,
-            true,
-        )
-        .map(|(_, height)| height),
+        top_card_row(state, prefs::EDIT_THEME, None, width, text_width, true)
+            .map(|(_, height)| height),
         6.0,
     );
     out.push(scroll::list_page_peeking(
@@ -21480,7 +22966,7 @@ fn top_text_band(
     let half = ((inner - COLUMN_GAP) / 2.0).max(48.0);
     let rows: Vec<(UiNode, f32)> = [prefs::EDIT_FONT_FAMILY, prefs::EDIT_FONT_PX]
         .into_iter()
-        .filter_map(|key| top_card_row(state, key, None, width, cx.viewport, half, true))
+        .filter_map(|key| top_card_row(state, key, None, width, half, true))
         .collect();
     if rows.len() != 2 {
         return None;
@@ -21564,11 +23050,10 @@ fn top_text_band(
 /// column).
 const RAINBOW_BANNER_HEIGHT: f32 = 96.0;
 
-/// Whether the Home page may show its welcome flourish. Ornamental chrome
-/// yields FIRST: never on Compact (every line there belongs to controls), not
-/// at large Dynamic Type (the same rule the route subtitles apply), never
-/// under Serious Mode (a rainbow is unapologetically playful), and only on
-/// tall hosts; the page draws it only where the grid still fits under it.
+/// Whether the Home page may show its welcome flourish, which yields first:
+/// never on Compact, not at large Dynamic Type, never under Serious Mode, and
+/// only on tall hosts; the page draws it only where the grid still fits under
+/// it.
 fn rainbow_banner_fits(width: SettingsWidth, cx: &ViewCx<'_>) -> bool {
     width != SettingsWidth::Compact
         && !cx.motion.serious
@@ -21601,25 +23086,6 @@ fn rainbow_banner_node() -> UiNode {
     )
 }
 
-/// `path` fitted to `width` from its end: the file's name and the folders
-/// nearest it stay, and the start gives way to an ellipsis.
-fn fit_path_from_end(path: &str, width: f32) -> String {
-    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Plain);
-    let fits = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px) <= width;
-    if fits(path) {
-        return path.to_string();
-    }
-    let mut graphemes = path.graphemes().collect::<Vec<_>>();
-    while !graphemes.is_empty() {
-        graphemes.remove(0);
-        let candidate = format!("\u{2026}{}", graphemes.concat());
-        if fits(&candidate) {
-            return candidate;
-        }
-    }
-    "\u{2026}".to_string()
-}
-
 /// What the platform's file viewer is called.
 fn file_viewer_name() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -21645,11 +23111,21 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
             - 28.0)
             .max(48.0);
     let control = scaled_control_height();
-    let path_height = 22.0_f32.max(18.0 * settings_text_scale());
+    let line_height = 22.0_f32.max(18.0 * settings_text_scale());
     let shown = state
         .config_file
         .as_ref()
         .map_or("aterm.toml", |(_, shown)| shown.as_str());
+    // The path wraps at its folders ([`wrap_to_box`]), whole on as many
+    // lines as the column needs: its start used to give way to an ellipsis
+    // ("…rm.toml" at 2× text in a 22-column window).
+    let (visual, path_height) = wrapped_words_node(
+        "settings/manual/path/visual",
+        shown,
+        (SemanticRole::Text, StyleRef::Plain),
+        text_width,
+        line_height,
+    );
     let path = UiNode::new(
         "settings/manual/path",
         UiContent::Group(GroupSpec {
@@ -21658,18 +23134,8 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
             style: StyleRef::Plain,
         }),
     )
-    .layout(Layout::default().height(Length::Fixed(path_height)))
-    .children(vec![
-        UiNode::new(
-            "settings/manual/path/visual",
-            UiContent::Text(TextSpec {
-                text: fit_path_from_end(shown, text_width),
-                role: SemanticRole::Text,
-                style: StyleRef::Plain,
-            }),
-        )
-        .paint_only(),
-    ]);
+    .layout(Layout::column().height(Length::Fixed(path_height)))
+    .children(vec![visual.paint_only()]);
     let has_path = state.config_file.is_some();
     let button = |key: &str, spec: ButtonSpec, style: StyleRef, enabled: bool| {
         UiNode::new(
@@ -21768,7 +23234,7 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
             SemanticRole::Text,
             StyleRef::Plain,
             text_width,
-            path_height,
+            line_height,
             None,
         );
         rows.push(node);
@@ -21824,17 +23290,10 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
             spec: GroupSpec::new(MANUAL_ONLY_GROUP).style(StyleRef::Secondary),
             padding: Insets::all(SETTINGS_GROUP_CARD_INSET),
             gap: 4.0,
-            head: vec![(
-                UiNode::new(
-                    "settings/manual/only-in-aterm-toml/heading",
-                    UiContent::Text(TextSpec {
-                        text: MANUAL_ONLY_GROUP.to_ascii_uppercase(),
-                        role: SemanticRole::Heading,
-                        style: StyleRef::Quiet,
-                    }),
-                )
-                .layout(Layout::default().height(Length::Fixed(group_heading_label_height()))),
-                group_heading_label_height(),
+            head: vec![group_caption_node(
+                "settings/manual/only-in-aterm-toml/heading",
+                MANUAL_ONLY_GROUP,
+                group_width,
             )],
             rows,
         }));
@@ -22572,11 +24031,21 @@ fn manual_override_node(
         } else {
             0.0
         };
-    let column = (text_width - trailing).max(96.0);
     let name = if authored.known {
         authored.label.as_str()
     } else {
         authored.key.as_str()
+    };
+    // THE ROW RULE: its words beside its buttons where the line leaves the
+    // name its floor ([`one_line_name_floor`]), else over them, the whole
+    // column theirs. The words used to keep a 96pt floor beside the buttons
+    // whatever the column, so a 22-column card drew them in what was left —
+    // 4pt, every line cut to nothing — and the buttons past its edge.
+    let beside = text_width - trailing >= one_line_name_floor(name);
+    let column = if beside {
+        text_width - trailing
+    } else {
+        text_width
     };
     let notes = manual_override_disclosure(state, authored);
     let detail = if notes.is_empty() {
@@ -22584,26 +24053,54 @@ fn manual_override_node(
     } else {
         format!("{} · {notes}", authored.preview)
     };
-    let (name_node, name_height) = wrapped_copy_node(
+    let (name_node, name_height) = wrapped_words_node(
         &format!("settings/modified/manual/label/{fragment}"),
         name,
-        SemanticRole::Text,
-        StyleRef::Plain,
+        (SemanticRole::Text, StyleRef::Plain),
         column,
         22.0_f32.max(20.0 * scale),
-        None,
     );
-    let (detail_node, detail_height) = wrapped_copy_node(
+    let (detail_node, detail_height) = wrapped_words_node(
         &format!("settings/modified/manual/value/{fragment}"),
         &detail,
-        SemanticRole::Text,
-        StyleRef::Quiet,
+        (SemanticRole::Text, StyleRef::Quiet),
         column,
         20.0_f32.max(17.0 * scale),
-        None,
     );
     let text_height = name_height + detail_height;
-    let height = (text_height + 8.0).max(control_height + 8.0);
+    // Under the words, Reset and the chevron share a line where it holds
+    // both (after the spacer that seats them at its end, and its gap), else
+    // take one each, Reset's words wrapped to what its line leaves it.
+    let one_line = trailing <= text_width + 0.01;
+    let reset_width = if beside || one_line {
+        reset_width
+    } else {
+        reset_width.min((text_width - 6.0).max(0.0))
+    };
+    let reset_spec = authored
+        .reset_safe
+        .then(|| manual_override_reset_button(authored))
+        .map(|spec| {
+            let visual = spec
+                .visual_label
+                .clone()
+                .unwrap_or_else(|| spec.label.clone());
+            let (words, lines) = button_words_in(&spec, &visual, &[], reset_width);
+            (spec.visual_label(words), lines)
+        });
+    let reset_height = reset_spec.as_ref().map_or(control_height, |(_, lines)| {
+        crate::native_ui::native_button_height_for_lines(*lines, control_height)
+    });
+    let buttons_height = if one_line || !authored.reset_safe {
+        reset_height.max(control_height)
+    } else {
+        reset_height + 4.0 + control_height
+    };
+    let height = if beside {
+        (text_height + 8.0).max(control_height + 8.0)
+    } else {
+        text_height + 4.0 + buttons_height + 8.0
+    };
     let mut children = vec![
         UiNode::new(
             format!("settings/modified/manual/text/{fragment}"),
@@ -22627,15 +24124,17 @@ fn manual_override_node(
                 .height(Length::Fixed(control_height)),
         )
     };
-    if authored.reset_safe {
+    if let Some((spec, _)) = reset_spec {
         let reset = manual_override_reset_action(&authored.key)
             .expect("a reset-safe Manual override has a reset action");
-        children.push(trailing_button(
+        let mut button = trailing_button(
             format!("settings/modified/manual/reset/{fragment}"),
-            manual_override_reset_button(authored),
+            spec,
             reset,
             reset_width,
-        ));
+        );
+        button.layout.height = Length::Fixed(reset_height);
+        children.push(button);
     }
     children.push(trailing_button(
         format!("settings/modified/manual/open/{fragment}"),
@@ -22643,17 +24142,54 @@ fn manual_override_node(
         ActionId::new(format!("settings/manual/open-override/{ordinal}")),
         open_width,
     ));
-    UiNode::new(
+    let row = UiNode::new(
         format!("settings/modified/manual/row/{fragment}"),
         UiContent::Group(GroupSpec::new(format!("{name}: {detail}"))),
-    )
-    .layout(
-        Layout::row()
+    );
+    if beside {
+        return row
+            .layout(
+                Layout::row()
+                    .height(Length::Fixed(height))
+                    .padding(Insets::symmetric(0.0, 4.0))
+                    .gap(6.0),
+            )
+            .children(children);
+    }
+    // Over its buttons, which end the lines under it, as a stacked row's
+    // controls do.
+    let words = children.remove(0);
+    let line = |index: usize, buttons: Vec<UiNode>, height: f32| {
+        let mut line = vec![
+            UiNode::new(
+                format!("settings/modified/manual/spacer/{fragment}/{index}"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+        ];
+        line.extend(buttons);
+        UiNode::new(
+            format!("settings/modified/manual/buttons/{fragment}/{index}"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::row().height(Length::Fixed(height)).gap(6.0))
+        .children(line)
+    };
+    let mut lines = vec![words];
+    if one_line || children.len() < 2 {
+        lines.push(line(0, children, buttons_height));
+    } else {
+        let open = children.pop().expect("the chevron");
+        lines.push(line(0, children, reset_height));
+        lines.push(line(1, vec![open], control_height));
+    }
+    row.layout(
+        Layout::column()
             .height(Length::Fixed(height))
             .padding(Insets::symmetric(0.0, 4.0))
-            .gap(6.0),
+            .gap(4.0),
     )
-    .children(children)
+    .children(lines)
 }
 
 fn group_footnote_line_height() -> f32 {
@@ -22661,17 +24197,10 @@ fn group_footnote_line_height() -> f32 {
 }
 
 /// `note` wrapped to `available_width` at the footnote's own size, one entry
-/// per painted line.
+/// per painted line, its trailing space dropped (it paints nothing, and
+/// would measure a space wider than the box, [`wrapped_copy_lines`]).
 fn group_footnote_lines(note: &str, available_width: f32) -> Vec<String> {
-    let available_width = available_width.max(48.0);
-    let text_px = group_footnote_text_px();
-    note.split('\n')
-        .flat_map(|line| {
-            crate::tray_raster::ui_text_wrap_ranges(line, text_px, available_width)
-                .into_iter()
-                .map(move |range| line[range].to_string())
-        })
-        .collect()
+    wrapped_copy_lines(note, group_footnote_text_px(), available_width)
 }
 
 fn group_footnote_text_px() -> f32 {
@@ -22686,12 +24215,18 @@ fn settings_group_text_width(viewport: LogicalRect, width: SettingsWidth) -> f32
     (settings_page_content_width(viewport.width, width, FORM_MEASURE) - 28.0).max(48.0)
 }
 
-fn settings_group_heading_fits(caption: &str, available_width: f32) -> bool {
-    crate::tray_raster::ui_text_width_for(
-        crate::widget::TextFace::UiBold,
-        &caption.to_ascii_uppercase(),
-        group_footnote_text_px(),
-    ) <= available_width
+/// A group card's caption, keyed `key`, in small capitals over its rows:
+/// on as many lines as the card's text column `text_width` needs
+/// ([`caption_node`]), each as tall as one caption line, never cut ("ONLY IN
+/// ATE…", "DISPLAY FAC…" at 22 columns and large text) and never dropped.
+/// Returns the node and its height.
+fn group_caption_node(key: &str, caption: &str, text_width: f32) -> (UiNode, f32) {
+    caption_node(key, &caption.to_ascii_uppercase(), text_width)
+}
+
+/// The height [`group_caption_node`] takes for `caption` in `text_width`.
+fn group_caption_height(caption: &str, text_width: f32) -> f32 {
+    group_caption_node("-", caption, text_width).1
 }
 
 /// One stop of a field page's list: a leading card, a setting row by its
@@ -22771,8 +24306,47 @@ fn compact_inline_row_height() -> f32 {
 /// label a useful measure beside the control; a narrower column stacks the
 /// control under its label.
 fn compact_row_inline(kind: &EditKind, text_width: f32, with_reset: bool) -> bool {
-    settings_text_scale() <= 1.25
+    !large_text_rows_stack()
         && inline_row_label_width(kind, text_width, with_reset) >= COMPACT_INLINE_LABEL_MIN
+}
+
+thread_local! {
+    /// While a compact page is built whose list cannot hold a stacked row:
+    /// how tall that list is ([`large_text_rows_stack`], [`settings_tree`]).
+    static ROWS_TOO_TALL_TO_STACK: Cell<Option<f32>> = const { Cell::new(None) };
+}
+
+/// [`ROWS_TOO_TALL_TO_STACK`].
+fn rows_too_tall_to_stack() -> Option<f32> {
+    ROWS_TOO_TALL_TO_STACK.with(Cell::get)
+}
+
+/// [`ROWS_TOO_TALL_TO_STACK`] for one render, put back when it ends.
+struct RowsTooTallToStack(Option<f32>);
+
+impl RowsTooTallToStack {
+    fn set(room: Option<f32>) -> Self {
+        Self(ROWS_TOO_TALL_TO_STACK.with(|cell| cell.replace(room)))
+    }
+}
+
+impl Drop for RowsTooTallToStack {
+    fn drop(&mut self) {
+        ROWS_TOO_TALL_TO_STACK.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Whether a compact row at this text size stacks its control under its
+/// name: at large text, where the column's one line would leave its name
+/// too little — but A WHOLE ROW BEATS ITS STACK: not where the page's list
+/// is shorter than a stacked row, which would set its name and its control
+/// on screens of their own (102x12 at 2× text: a 40pt name over a 64pt
+/// control in a 100pt list, every switch and slider of every page on a
+/// screen without its name). There the row goes on one line wherever the
+/// column leaves its name its measure beside the control, as at smaller
+/// text.
+fn large_text_rows_stack() -> bool {
+    settings_text_scale() > 1.25 && rows_too_tall_to_stack().is_none()
 }
 
 fn settings_fields_page(
@@ -22825,7 +24399,7 @@ fn settings_fields_page(
     // The This Mac status points at the Debugger access row only where the
     // access block is on the page.
     let debugger_row_drawn = state.macos_access.is_some() && show_macos_access;
-    // THE DEVELOPER TOOLS CARD leads the macOS access block, from the same
+    // The Developer Tools card leads the macOS access block, from the same
     // published posture and under the same slot rules.
     let devtools_showcase = state
         .macos_access
@@ -23072,9 +24646,7 @@ fn settings_fields_page(
                     ActionId::new("settings/reset-all"),
                 )
                 .state(ControlState {
-                    enabled: resettable > 0
-                        && !state.config_patch_pending()
-                        && !state.reset_all_confirmation,
+                    enabled: resettable > 0 && !state.reset_all_confirmation,
                     ..ControlState::default()
                 })
                 .style(StyleRef::Quiet),
@@ -23123,8 +24695,18 @@ fn settings_fields_page(
     // The summary is pinned only where the body still holds it, as the
     // preview is: where a tall question over a short window leaves the page
     // little more than its heading, it is not drawn, rather than cut by the
-    // page's edge.
+    // page's edge. And A PINNED HEADER NEVER TAKES MORE OF THE BODY THAN IT
+    // LEAVES THE LIST (a card's head keeps the same rule,
+    // [`scroll::SplitCard::fitted`]): where it would, it is the list's first
+    // stop instead, so the rows under it are whole on some screen. At 2× in a
+    // 22-column window the count's three lines and Reset All took 178pt of
+    // 268 and left every row to an 86pt list.
     let summary = summary.filter(|_| used + summary_height <= body + 0.01);
+    let starves = summary_height > body - used - summary_height - gap + 0.01;
+    let (summary, listed_summary) = match summary {
+        Some(node) if starves => (None, Some(node)),
+        summary => (summary, None),
+    };
     if summary.is_some() {
         used += summary_height + gap;
     }
@@ -23242,10 +24824,11 @@ fn settings_fields_page(
         let repeats_its_row = !global_search
             && cursor - start == 1
             && fields[start].2.label.eq_ignore_ascii_case(&caption);
-        let shows_caption =
-            !repeats_its_row && settings_group_heading_fits(&caption, group_text_width);
+        // The caption wraps to the card's column ([`caption_node`]), never
+        // dropped or cut where it is wider than one line.
+        let shows_caption = !repeats_its_row;
         let head = if shows_caption {
-            group_heading_height()
+            28.0 + group_caption_height(&caption, group_text_width)
         } else {
             // The card keeps its padding and semantic label without the
             // painted caption.
@@ -23356,17 +24939,34 @@ fn settings_fields_page(
                         }
                         _ => node,
                     };
-                    plan.row(id, fixed_height(&node) + 4.0, scroll::focus_keys(&node));
-                    plan.measure(&node, fixed_height(&node));
-                    plan.add_segments(&node);
-                    stops.push(if ordinal == 0 {
-                        FieldStop::Row {
-                            position,
-                            node: Box::new(node),
-                        }
+                    // A card row taller than the list's whole room is
+                    // listed a part at a time, as a row is (below): the
+                    // Follow system and Color theme rows at 2x text in a
+                    // 102x12 window, 112pt in a 100pt list, were on no
+                    // screen whole. One the room holds is a whole stop,
+                    // its caption let go where the two cannot share a
+                    // screen ([`scroll::ScrollPlan::starts_bare`]).
+                    let height = fixed_height(&node);
+                    let limit = footnote_room - head - 4.0;
+                    let parts = if height > body - used + 0.01 {
+                        scroll::row_parts((node, height), limit.max(1.0), body - used - 4.0, 4.0)
                     } else {
-                        FieldStop::Under(Box::new(node))
-                    });
+                        vec![(node, height)]
+                    };
+                    for (part, (node, height)) in parts.into_iter().enumerate() {
+                        plan.row(id, height + 4.0, scroll::focus_keys(&node));
+                        plan.set_ids(vec![node.key.clone()]);
+                        plan.measure(&node, height);
+                        plan.add_segments(&node);
+                        stops.push(if ordinal == 0 && part == 0 {
+                            FieldStop::Row {
+                                position,
+                                node: Box::new(node),
+                            }
+                        } else {
+                            FieldStop::Under(Box::new(node))
+                        });
+                    }
                 }
                 continue;
             }
@@ -23389,10 +24989,9 @@ fn settings_fields_page(
                 (footnote_room - head - 4.0, body - used - head - 4.0),
             );
             let row_height = fixed_height(&row);
-            // A row's controls, a saving (busy) one too: the list keeps it
-            // in view while its change applies. A colour row's Choose…
-            // follows its field, ahead of a Reset, as the row lays it out,
-            // and its open picker's wheel and Brightness after them.
+            // A row's controls: its own, any the page adds, its Reset (or
+            // Modified's Discard) and an open colour picker's wheel and
+            // Brightness, put in the order the row draws them below.
             // Modified's Display face row holds a switch per face, its
             // controls ([`display_face_rows`]).
             let mut keys = if modified_only && field.key == prefs::EDIT_DISPLAY_FONT {
@@ -23410,18 +25009,33 @@ fn settings_fields_page(
                 keys.push(UiKey::new(format!("settings/reset/{}", field.key)));
             }
             keys.extend(color_picker::open_color_picker_keys(state, field.key));
+            // IN THE ORDER THE ROW DRAWS THEM, which Tab and the list's keys
+            // walk: a stacked row ends its label line with its Reset, over
+            // its control, where a one-line row's Reset follows the control.
+            // Listed control first, Tab from a stacked slider went back up
+            // to its Reset, and from there down to the slider again: the
+            // keyboard never left the row (Appearance's Faint text opacity
+            // at 80x24 with 2x text).
+            let drawn_order = scroll::focus_keys(&row);
+            keys.sort_by_key(|key| {
+                drawn_order
+                    .iter()
+                    .position(|drawn| scroll::same_control(drawn, key))
+                    .unwrap_or(usize::MAX)
+            });
             // A ROW STILL TALLER THAN A SCREEN SHOWS UNDER ITS GROUP'S HEAD
             // (its name on six lines over its switch at 2× text in a
             // 22-column window) is listed a part at a time, as a card's row
             // is ([`scroll::row_parts`]): its first part the row's stop, the
             // rest the stops right after it, each control with the part that
-            // draws it. Its switch was on no screen. A row with an open
-            // picker the room holds stays one with it.
+            // draws it, and with the words that name it wherever the two fit
+            // the list's room. Its switch was on no screen. A row with an
+            // open picker the room holds stays one with it.
             let limit = footnote_room - head - 4.0;
             let parts = if row_height > limit + 0.01
                 && !(scroll::holds_open_disclosure(&row) && row_height <= footnote_room + 0.01)
             {
-                scroll::row_parts((row, row_height), limit.max(1.0))
+                scroll::row_parts((row, row_height), limit.max(1.0), body - used - 4.0, 4.0)
             } else {
                 vec![(row, row_height)]
             };
@@ -23443,6 +25057,7 @@ fn settings_fields_page(
                     .cloned()
                     .collect::<Vec<_>>();
                 plan.row(id, height + 4.0, part_keys);
+                plan.set_ids(vec![node.key.clone()]);
                 plan.measure(&node, height);
                 plan.add_segments(&node);
                 stops.push(if part == 0 {
@@ -23456,6 +25071,7 @@ fn settings_fields_page(
             }
             for (node, height) in split_note {
                 plan.row(id, height + 4.0, Vec::new());
+                plan.set_ids(vec![node.key.clone()]);
                 plan.measure(&node, height);
                 stops.push(FieldStop::Under(Box::new(node)));
             }
@@ -23463,6 +25079,7 @@ fn settings_fields_page(
             // after its last row.
             for (node, height) in finished.shared_note_stops(Some(footnote_room - head - 4.0)) {
                 plan.row(id, height + 4.0, Vec::new());
+                plan.set_ids(vec![node.key.clone()]);
                 stops.push(FieldStop::Under(Box::new(node)));
             }
             // The This Mac status is the stop after its row, Apply Now in it.
@@ -23481,10 +25098,14 @@ fn settings_fields_page(
                 // sentence on nine lines at 2× text in a 22-column window), a
                 // part at a time, each a stop ([`scroll::row_parts`]): its end
                 // was on no screen.
-                for (node, height) in
-                    scroll::row_parts((node, height), (footnote_room - head - 4.0).max(1.0))
-                {
+                for (node, height) in scroll::row_parts(
+                    (node, height),
+                    (footnote_room - head - 4.0).max(1.0),
+                    body - used - 4.0,
+                    4.0,
+                ) {
                     plan.row(id, height + 4.0, scroll::focus_keys(&node));
+                    plan.set_ids(vec![node.key.clone()]);
                     plan.measure(&node, height);
                     plan.add_segments(&node);
                     stops.push(FieldStop::Under(Box::new(node)));
@@ -23521,12 +25142,13 @@ fn settings_fields_page(
     // that fragment alike (a dotted literal and its nested path) are told
     // apart by their place.
     if !manual_overrides.is_empty() {
-        let id = plan.group(group_heading_height(), group_heading_height() - 10.0);
+        let head = 28.0 + group_caption_height(MANUAL_ONLY_GROUP, group_text_width);
+        let id = plan.group(head, head - 10.0);
         plan.set_row_gap(id, 4.0);
         plan.set_caption(
             id,
             SETTINGS_GROUP_CARD_INSET,
-            group_heading_height() - SETTINGS_GROUP_CARD_INSET,
+            head - SETTINGS_GROUP_CARD_INSET,
         );
         debug_assert_eq!(id, groups.len());
         groups.push(FieldGroup::Settings {
@@ -23539,10 +25161,24 @@ fn settings_fields_page(
         for (ordinal, authored) in manual_overrides.iter().enumerate() {
             let fragment = unique_key_fragment(&authored.key, ordinal, &mut fragments);
             let node = manual_override_node(state, authored, ordinal, &fragment, group_text_width);
-            plan.row(id, fixed_height(&node) + 4.0, scroll::focus_keys(&node));
-            plan.measure(&node, fixed_height(&node));
-            plan.add_segments(&node);
-            stops.push(FieldStop::ManualRow(node));
+            // A row taller than a screen shows under the group's head is
+            // listed a part at a time, as every row is ([`scroll::row_parts`]):
+            // its words, then each line of its buttons, so each is whole on
+            // some screen (its Reset was on none at 1.5× in 22 columns).
+            let height = fixed_height(&node);
+            let parts = scroll::row_parts(
+                (node, height),
+                (footnote_room - head - 4.0).max(1.0),
+                body - used - 4.0,
+                4.0,
+            );
+            for (part, height) in parts {
+                plan.row(id, height + 4.0, scroll::focus_keys(&part));
+                plan.set_ids(vec![part.key.clone()]);
+                plan.measure(&part, height);
+                plan.add_segments(&part);
+                stops.push(FieldStop::ManualRow(part));
+            }
         }
     }
 
@@ -23562,7 +25198,7 @@ fn settings_fields_page(
         );
     }
 
-    // THE LIVE PREVIEW IS PINNED, never a page of its own, and keeps one
+    // The live preview is pinned, never a page of its own, and keeps one
     // height on every screen: it yields height toward its floor before any
     // screen of the list would lose its second stop (so every screen holds
     // two stops wherever two adjacent ones can share one). Where even at its
@@ -23579,6 +25215,58 @@ fn settings_fields_page(
     let tallest_pair = (0..plan.len())
         .map(|stop| plan.span(stop..(stop + 2).min(plan.len())))
         .fold(0.0, f32::max);
+    // THE PINNED SUMMARY AND PREVIEW KEEP THEIR PLACE UNTIL THE LIST SCROLLS:
+    // a change that makes a stop taller or shorter (Follow system turned
+    // on, the theme card's rows taller; off, the Color theme row back)
+    // never pins them or lists them under the pointer that made it — but
+    // where pinned they would cut the stop the change keeps in view (a
+    // colour picker opened under its row), which the list then needs the
+    // room for. At 80x16 the preview went into the list and the Follow
+    // system switch just pressed jumped 78pt up; at 80x24 at 2× text
+    // Modified's summary did, and the switch jumped 68pt. A scroll, or
+    // another window, text size or chrome, places them again.
+    let revealed = state
+        .page_reveal
+        .as_ref()
+        .and_then(|key| plan.stop_holding(key).or_else(|| plan.stop_of(key)))
+        .map_or(0.0, |stop| plan.span(stop..stop + 1));
+    let here = PinnedPlace {
+        route: state.route,
+        viewport: cx.viewport,
+        scale: settings_text_scale(),
+        chrome: state.page_chrome.get(),
+        summary_listed: false,
+        preview: None,
+    };
+    let held = state.pinned_place.get().filter(|place| {
+        place.same_place(&here)
+            && state.page_reveal.is_some()
+            && state
+                .scroll_record
+                .borrow()
+                .as_ref()
+                .is_some_and(|record| record.same_context(state))
+    });
+    // THE SUMMARY IS PINNED ONLY WHERE THE LIST KEEPS ROOM UNDER IT FOR ITS
+    // TALLEST STOP; else it is the list's first stop, scrolling with it and
+    // always reachable: Modified's "Nothing changed" and Reset All, pinned
+    // at 2x text in a 102x12 window, left its 48pt empty-state line a 32pt
+    // list, cut on every screen.
+    let summary_listed = held
+        .map(|place| place.summary_listed)
+        .filter(|listed| *listed || revealed <= body - used + 0.01)
+        .unwrap_or(body - used < tallest - 0.01);
+    let summary = match summary {
+        Some(node) if summary_listed => {
+            used -= summary_height + gap;
+            plan.insert_card(0, summary_height, scroll::focus_keys(&node));
+            plan.set_ids_of(0, vec![node.key.clone()]);
+            stops.insert(0, FieldStop::Card(node));
+            None
+        }
+        summary => summary,
+    };
+    let mut placed_preview = None;
     if let (Some(mut preview), Some(floor)) = (preview, preview_floor) {
         let natural = fixed_height(&preview);
         // Sized against the room with a status bar up, the preview keeps its
@@ -23588,10 +25276,21 @@ fn settings_fields_page(
         // (a compact page short of room docks the bar instead, and keeps
         // it all).
         let room = (steady - used).min(body - used);
-        if room - gap - floor >= tallest {
-            let height = (room - gap - tallest_pair)
-                .clamp(floor, natural)
-                .min(room - gap - tallest);
+        // Where it was placed, while nothing has scrolled the list (above).
+        let held = held
+            .map(|place| place.preview.map(|height| height.clamp(floor, natural)))
+            .filter(|pinned| {
+                pinned.is_none_or(|height| revealed <= body - used - height - gap + 0.01)
+            });
+        let pinned = held.unwrap_or_else(|| {
+            (room - gap - floor >= tallest).then(|| {
+                (room - gap - tallest_pair)
+                    .clamp(floor, natural)
+                    .min(room - gap - tallest)
+            })
+        });
+        placed_preview = pinned;
+        if let Some(height) = pinned {
             preview.layout.height = Length::Fixed(height);
             out.push(preview);
             used += height + gap;
@@ -23604,11 +25303,31 @@ fn settings_fields_page(
             let height = (list_room - gap - next).clamp(floor, natural.min(list_room).max(floor));
             preview.layout.height = Length::Fixed(height);
             plan.insert_card(0, height, Vec::new());
+            plan.set_ids_of(0, vec![preview.key.clone()]);
             stops.insert(0, FieldStop::Card(preview));
         }
     }
+    if !state.measuring_calm.get() {
+        state.pinned_place.set(Some(PinnedPlace {
+            summary_listed,
+            preview: placed_preview,
+            ..here
+        }));
+    }
     out.extend(summary);
-    scroll::seat_room(
+    // A summary that would starve the list is its first stop, under a
+    // preview listed there.
+    if let Some(node) = listed_summary {
+        let at = usize::from(matches!(
+            stops.first(),
+            Some(FieldStop::Card(first)) if first.key.as_str().starts_with("settings/preview")
+        ));
+        plan.insert_card(at, summary_height, scroll::focus_keys(&node));
+        plan.set_ids_of(at, vec![node.key.clone()]);
+        stops.insert(at, FieldStop::Card(node));
+    }
+    scroll::seat_room_under_status(
+        state,
         &mut plan,
         (body - used).max(0.0),
         settings_list_overhang(state, width, cx.viewport),
@@ -23663,19 +25382,16 @@ fn settings_fields_page(
                 }
                 let anchor = anchor.unwrap_or_else(|| group_anchor.clone());
                 let label = shows_caption.then(|| {
-                    UiNode::new(
-                        format!(
+                    group_caption_node(
+                        &format!(
                             "settings/group-heading/{}/{}",
                             key_fragment(caption),
                             anchor
                         ),
-                        UiContent::Text(TextSpec {
-                            text: caption.to_ascii_uppercase(),
-                            role: SemanticRole::Heading,
-                            style: StyleRef::Quiet,
-                        }),
+                        caption,
+                        group_text_width,
                     )
-                    .layout(Layout::default().height(Length::Fixed(group_heading_label_height())))
+                    .0
                 });
                 // Why the box's rows are idle, under its caption.
                 let reason = reason.as_ref().map(|(sentence, lines, height)| {
@@ -23828,6 +25544,12 @@ fn push_field_card(
                         .flat_map(|(row, _)| scroll::focus_keys(row))
                         .collect(),
                 );
+                plan.set_ids(
+                    split.rows[rows.clone()]
+                        .iter()
+                        .map(|(row, _)| row.key.clone())
+                        .collect(),
+                );
                 plan.set_control_rows(split.control_rows(rows.clone()));
                 plan.set_ink(split.ink(rows.clone()));
                 plan.set_ink_top(split.ink_top(rows.clone()));
@@ -23842,12 +25564,14 @@ fn push_field_card(
         ListItem::Split(split) => {
             let node = split.node(0..split.rows.len());
             plan.card(split.height(), scroll::focus_keys(&node));
+            plan.set_ids(vec![node.key.clone()]);
             plan.measure(&node, split.height());
             plan.add_segments(&node);
             stops.push(FieldStop::Card(node));
         }
         ListItem::Card(node, height) => {
             plan.card(height, scroll::focus_keys(&node));
+            plan.set_ids(vec![node.key.clone()]);
             plan.measure(&node, height);
             plan.add_segments(&node);
             stops.push(FieldStop::Card(*node));
@@ -23897,11 +25621,10 @@ impl PackageAdmission {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SettingsAvailability {
-    /// CAN this run use a GPU — never "is a device live at this instant": the host's
-    /// `ViewMotionCx::backend_gpu` (`App::gpu_capable`). A headless launch holding an
-    /// unredeemed GPU intent runs the CPU renderer until its first pixel demand, and
-    /// telling it in words that its GPU-backed keys are unavailable would be a denial
-    /// the first `image` immediately contradicts.
+    /// Whether this run can use a GPU, not whether a device is live now: the host's
+    /// `ViewMotionCx::backend_gpu` (`App::gpu_capable`). A headless launch holding
+    /// an unredeemed GPU intent runs the CPU renderer until its first pixel demand,
+    /// so calling its GPU-backed keys unavailable would be wrong.
     backend_gpu: bool,
     macos: bool,
     windows: bool,
@@ -23926,10 +25649,10 @@ impl SettingsAvailability {
         }
     }
 
-    /// The availability the view last PRESENTED: the host's GPU capability and the
+    /// The availability the view last presented: the host's GPU capability and the
     /// package admission recorded with that presentation
-    /// ([`SettingsViewState::record_runtime_presentation`]), so a row and the save
-    /// feedback after it read one fact, and no view reads a process global.
+    /// ([`SettingsViewState::record_runtime_presentation`]), so a row and its save
+    /// feedback read one fact, and no view reads a process global.
     fn for_state(state: &SettingsViewState) -> Self {
         Self {
             packages: state.presented_package_admission.get(),
@@ -24246,7 +25969,7 @@ pub(crate) fn reduce_motion_words() -> String {
     setting_choice_label(prefs::EDIT_MOTION, "reduced")
 }
 
-/// WHY THE MOTION POLICY IS REDUCED, from what the person set and the state
+/// Why the motion policy is reduced, from what the person set and the state
 /// the system reports, never this window's focus: Motion set to Reduce
 /// motion, Automatic following the system's Reduce Motion, or the load shed
 /// (which an explicit Always animate refuses, [`MotionMode::admits_load_shed`]).
@@ -24351,7 +26074,7 @@ fn serious_mode_note() -> EffectDisclosure {
     )
 }
 
-/// What idles a decorative EFFECT here: Serious Mode, this window being in
+/// What idles a decorative effect here: Serious Mode, this window being in
 /// the background, or a reduced motion policy ([`MotionReduction`]).
 fn motion_suppression(
     state: &SettingsViewState,
@@ -24372,7 +26095,7 @@ fn motion_suppression(
     MotionReduction::resolve(state, patch, motion).map(MotionReduction::disclosure)
 }
 
-/// The motion note a SOUND row carries, for a row whose sound is `voices`:
+/// The motion note a sound row carries, for a row whose sound is `voices`:
 /// a reduced motion policy idles the row only where it stops every one of
 /// its voices, the voices whose light it stops ([`Voice::motion_twin`]: the
 /// bonk, the output streak's note). So Music effects and its volume, whose
@@ -24424,25 +26147,19 @@ const TRAIL_TUNING_KEYS: &[&str] = &[
     // The melody and the bed ride the keystroke click, whose key seam opens
     // only while the trail is on (`sound_seam::trail_on`: the effects switch,
     // a style that draws, a nonzero intensity), so with no trail both are
-    // genuinely silent. Listing them earns each row the honest "Inactive:
-    // Cursor style Off" disclosure; they leave the block before its motion
-    // notes, since no motion policy silences a keystroke.
+    // silent and get the "Inactive: Cursor style Off" disclosure. They leave
+    // the block before its motion notes: no motion policy silences a keystroke.
     prefs::EDIT_TONE_MELODY,
     prefs::EDIT_TRAIL_SOUND_BED,
-    // DELIBERATELY ABSENT — each of these is still audible with the trail off,
-    // so claiming otherwise would be a false disclosure, which is worse than
-    // none:
-    //   * `trail_sound_riff` — the sing-along is gated on `glow_cfg.STYLE`, and
-    //     `resolve_cursor_glow` derives `style` from the style STRING
-    //     independently of `enabled` ("invalid/off values carry a harmless
-    //     concrete enum"). With `cursor_trail = false` and the default rainbow
-    //     kitty style the riff still sings. It gets its own Music-effects
-    //     disclosure below instead, which IS one of its real gates.
-    //   * `trail_sound_style` — it voices the curse BONK as well as the trail,
-    //     and the bonk rides the word-decoration tick, not the glow.
-    //   * the BONK keys and the terminal BELL — same reason, and the bell has no
+    // Deliberately absent, because each stays audible with the trail off:
+    //   * `trail_sound_riff`: the sing-along is gated on `glow_cfg.style`, which
+    //     `resolve_cursor_glow` derives from the style string regardless of
+    //     `enabled`; it gets its own Music-effects disclosure instead.
+    //   * `trail_sound_style`: it also voices the curse bonk, which rides the
+    //     word-decoration tick, not the glow.
+    //   * the bonk keys and the terminal bell: same reason; the bell has no
     //     trail relationship at all.
-    //   * `trail_sound_volume` — it scales every synth voice, and the chime,
+    //   * `trail_sound_volume`: it scales every synth voice, and the chime,
     //     the bonk, the riff and the output sounds play without a trail.
 ];
 
@@ -24718,13 +26435,9 @@ fn platform_unavailability(
             "macOS only: no effect here",
             "macOS only; no effect on this platform",
         )),
-        // Every SYNTH voice shares one output device, so they share one
-        // unavailability truth. The arm grew with the Sound menu: a user who can
-        // now see "Ambient sound bed" or "Sing-along riff" on a platform with no
-        // audio output deserves the same honest note the master and volume
-        // already carried. The terminal BELL is excluded on purpose — it is an
-        // OS alert sound, not a `trail_audio` voice, so it can still be audible
-        // where `trail_audio` is not.
+        // Every synth voice shares one output device, so one unavailability note
+        // covers them. The terminal bell is excluded: it is an OS alert sound, not
+        // a `trail_audio` voice, and can be audible where `trail_audio` is not.
         prefs::EDIT_TRAIL_SOUNDS
         | prefs::EDIT_TRAIL_SOUND_VOLUME
         | prefs::EDIT_TRAIL_SOUND_STYLE
@@ -25094,7 +26807,7 @@ fn parent_or_motion_inactivity(
             "Currently inactive: ligatures are Off",
         ));
     }
-    // THE HARNESS'S MASTER SWITCH wins over every finer row
+    // The harness's master switch wins over every finer row
     // (`SupervisorConfig::on_for` is `enabled && !off.contains(agent)`, and
     // the host runs no supervisor at all while it is off), so with it Off
     // they are saved and do nothing. It is stated first: a row under both
@@ -25116,7 +26829,7 @@ fn parent_or_motion_inactivity(
             "Currently inactive: Supervise coding agents is Off",
         ));
     }
-    // HOW a question is answered needs the switch that says WHETHER: with
+    // How a question is answered needs the switch that says whether: with
     // Answer questions Off every question goes to the menu bar.
     if key == prefs::EDIT_HARNESS_QUESTION_PRIORITY
         && !candidate_setting_bool(state, patch, prefs::EDIT_HARNESS_ANSWER_QUESTIONS, true)
@@ -25128,7 +26841,7 @@ fn parent_or_motion_inactivity(
         ));
     }
 
-    // THE LOAD SHED yields to an explicit Always animate (the host's latch and
+    // The load shed yields to an explicit Always animate (the host's latch and
     // envelope read `MotionMode::admits_load_shed`), so with Motion set to it
     // this switch is saved and does nothing, whichever way it is set. Reduce
     // motion and Automatic still admit the shed, so they say nothing here.
@@ -25198,25 +26911,14 @@ fn parent_or_motion_inactivity(
         ));
     }
 
-    // SERIOUS MODE IS A REAL GATE ON EVERY AUDIBLE ROW, and it is stated FIRST
-    // because it is an OVERRIDE: it suppresses the sound whatever the row's own
-    // family gate says, so a "Cursor style Off" note underneath it would
-    // send the user to fix the wrong switch. Same precedence
-    // [`motion_suppression`] uses for every other effect it covers.
-    //
-    // The three synth seams read it directly
-    // (`app_render` resolves gain through
-    // `SeriousEffect::TerminalSound` at the single-pane tick, the single-pane
-    // present and the split-pane compose) and so does `lib.rs::on_bell`, so
-    // every one of these rows really is silent while it is on.
-    //
-    // EXCLUDES the rows that ALREADY carry this note from another branch, so it
-    // is authored once per row rather than raced between two blocks:
-    // `trail_sounds` takes it from its own rule below ([`serious_mode_note`]),
-    // and the two BONK keys take it from the
-    // keyword-toy branch (they are `sparkle_words.*` leaves). Every audible row
-    // ends up disclosing it — pinned by
-    // `serious_mode_is_disclosed_on_the_sound_rows_it_silences`.
+    // Serious Mode gates every audible row and is stated first because it
+    // overrides the row's own family gate (a "Cursor style Off" note under it
+    // would point at the wrong switch), the precedence [`motion_suppression`]
+    // uses. The synth seams (`app_render`, via `SeriousEffect::TerminalSound`) and
+    // `on_bell` read it directly. Excludes rows that get this note elsewhere:
+    // `trail_sounds` from its own rule below ([`serious_mode_note`]), the two
+    // bonk keys from the keyword-toy branch
+    // (`serious_mode_is_disclosed_on_the_sound_rows_it_silences`).
     if matches!(
         key,
         prefs::EDIT_TRAIL_SOUND_VOLUME
@@ -25235,12 +26937,11 @@ fn parent_or_motion_inactivity(
         ));
     }
 
-    // THE SING-ALONG RIFF's real gate, stated BEFORE the cursor-trail block so
-    // it cannot inherit that block's claim. The riff is NOT trail-gated — it is
-    // gated on the trail STYLE, which `resolve_cursor_glow` derives from the
-    // style string whether or not the trail is enabled — so it still sings with
-    // `cursor_trail = false`. What DOES silence it is the master switch, which
-    // its gain call reads directly.
+    // The sing-along riff's real gate, stated before the cursor-trail block so it
+    // cannot inherit that block's claim: the riff is gated on the trail style
+    // (which `resolve_cursor_glow` derives regardless of `enabled`), so it sings
+    // with `cursor_trail = false`; the master switch, which its gain reads,
+    // silences it.
     if key == prefs::EDIT_TRAIL_SOUND_RIFF {
         if !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true) {
             return Some(inactive(
@@ -25262,7 +26963,7 @@ fn parent_or_motion_inactivity(
         }
     }
 
-    // THE VOLUME scales every synth voice, and most of them play without a
+    // The volume scales every synth voice, and most of them play without a
     // trail, so the trail is not its gate: the Music effects switch is. A
     // reduced motion policy pauses only the voices whose light it stops, so
     // it never idles the volume of them all.
@@ -25294,7 +26995,7 @@ fn parent_or_motion_inactivity(
         ));
     }
 
-    // THE OUTPUT STREAK's pip: a synth voice (`voice_gain` reads the Music
+    // The output streak's pip: a synth voice (`voice_gain` reads the Music
     // effects switch) that only the output streak plays.
     if key == prefs::EDIT_OUTPUT_STREAK_SOUND {
         if !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true) {
@@ -25326,7 +27027,7 @@ fn parent_or_motion_inactivity(
         );
     }
 
-    // PRISM WAKE's switch, while On: a decoration, so Serious Mode takes it
+    // Prism Wake's switch, while On: a decoration, so Serious Mode takes it
     // (`SeriousEffect::OutputStreak`), and its comet is motion
     // (`MotionEffect::OutputStreak`) the motion policy stops.
     if key == prefs::EDIT_OUTPUT_STREAK_ENABLED {
@@ -25401,7 +27102,7 @@ fn parent_or_motion_inactivity(
                     "Currently inactive: the cursor style is Off",
                 ));
             }
-            // THE MELODY AND THE BED ride the keystroke click (`sound_seam`):
+            // The melody and the bed ride the keystroke click (`sound_seam`):
             // past the trail gates above, its other gates are Music effects and
             // a trail lit at all (intensity 0 is the person's own off,
             // `sound_seam::trail_on`). No motion policy silences a keystroke,
@@ -25625,21 +27326,12 @@ fn parent_or_motion_inactivity(
                 "Currently inactive: Serious Mode",
             ));
         }
-        // THE TWO BONK KEYS ARE SFX, NOT DECORATIONS. They live under
-        // `[sparkle_words.profanity]` in the FILE, but the only thing either
-        // one moves is a synth voice pushed into `TrailAudio`
-        // (`app_render::bonk_sound_gain`) — so they inherit the Music-effects
-        // master exactly as the riff, the volume, the melody and the bed do.
-        // Stated HERE, below the Sparkle-Words master (which stops the cues
-        // being recorded at all, a more fundamental silence) and above the
-        // per-family branches, because it is the gate a user flipping the row
-        // is most likely to be surprised by: the row is in a keyword-toy group
-        // but the switch that silences it is in Top Settings.
-        //
-        // This disclosure only became TRUE with the 2026-08-09 fix that gave
-        // `bonk_sound_gain` its `trail_sounds` term; before it the bonk was the
-        // one synth voice that ignored the master, and claiming this note then
-        // would itself have been the lie.
+        // The two bonk keys are SFX, not decorations: they live under
+        // `[sparkle_words.profanity]` in the file but move only a synth voice
+        // (`bonk_sound_gain`), so they inherit the Music-effects master like the
+        // riff, volume, melody and bed. Stated below the Sparkle Words master,
+        // which stops the cues being recorded at all, and above the per-family
+        // branches.
         if matches!(
             key,
             prefs::EDIT_SPARKLE_BONK | prefs::EDIT_SPARKLE_BONK_DETONATION
@@ -25858,18 +27550,17 @@ fn parent_or_motion_inactivity(
         }
     }
 
-    // THE INSTALL CONSENT IS DORMANT WHILE "KEEP ALAB TOOLS UP TO DATE" IS OFF: with
-    // `[packages] enabled = false` no unattended pass runs to install anything, so
-    // the consent has nothing to consent to until the switch comes back on — the
+    // The install consent waits while "Keep ALab tools up to date" is off: with
+    // `[packages] enabled = false` no unattended pass installs anything, and
     // explicit opt-outs always win (`cli::should_complete_set`). Only while the
-    // consent is On: an Off consent is in effect already (nothing installs, now or
-    // once Keep is back on), so it waits for nothing.
+    // consent is On: an Off consent is in effect already, so it waits for
+    // nothing.
     if key == prefs::EDIT_PACKAGES_AUTO_INSTALL
         && candidate_setting_bool(state, patch, prefs::EDIT_PACKAGES_AUTO_INSTALL, true)
         && !candidate_setting_bool(state, patch, prefs::EDIT_PACKAGES_ENABLED, true)
     {
         // A sentence, not the house "<status>: <Setting> Off": this setting's
-        // name is a verb phrase, and "… up to date Off" read as an order.
+        // name is a verb phrase, and "… up to date Off" reads as an order.
         return Some(inactive(
             "Install ALab tools is saved, and waits until Keep ALab tools up to date is on",
             "Waits until Keep ALab tools up to date is on",
@@ -25942,13 +27633,12 @@ fn cross_field_constraints(
         EffectDisclosure::new(EffectNoteKind::Constraint, semantic, visual, feedback)
     };
 
-    // THE HARNESS ROW SPEAKS THE RULE (owner, 2026-09-24: "batteries included,
-    // on by default, configuration limits power"): its accessible name says
-    // what supervision IS — `Automatic`, or what limits it, in the Harness
-    // rows' words and never the file's — read from the `[harness]` table by
-    // the supervisor's own reader. On glass the switch already says On or
-    // Off and each limiting key that has a row says Changed there, so the
-    // row paints only a limit no row shows.
+    // The harness row states the rule: its accessible name says what
+    // supervision is (`Automatic`, or what limits it, in the Harness rows'
+    // words and never the file's), read from `[harness]` by the supervisor's
+    // own reader. On glass the switch already says On or Off and each limiting
+    // key that has a row says Changed there, so the row paints only a limit no
+    // row shows.
     if key == prefs::EDIT_HARNESS_ENABLED {
         let policy = harness_table_policy(state, patch);
         let words = policy.words();
@@ -26319,22 +28009,18 @@ fn config_application_projection(
 // * **nothing promises elimination.** The owner's ruling is that mitigating
 //   this annoyance is acceptable; the panel mitigates and says so.
 //
-// # What it never reports
+// Spikes §7 S1 and S4 (how far a grant reaches, which folders it covers) have not
+// run, so the block states no scope (`fda_scope` stays on the `privacy` verb;
+// `the_macos_access_panel_renders_every_state_and_never_speaks_about_scope` fails if
+// one appears), names no folder a grant covers (`SpikeEvidence::fda_coverage_measured`
+// gates the coverage sentence, so a stronger claim is a field flip, not a rewrite),
+// and promises no elimination. It never mirrors the System Settings toggle, which can
+// read on while every check fails (§1.2's stale `csreq`): every state is aterm's own
+// probe.
 //
-// The System Settings toggle. "Toggle ON while every check silently fails" is
-// the most misleading failure in this area (§1.2's stale-`csreq` case), and a
-// toggle mirror would hide exactly the thing worth surfacing. Every state here
-// comes from aterm's OWN probe, and one line says so out loud.
-//
-// # Why the OS gestures are function pointers
-//
-// Opening System Settings touches `NSWorkspace`, and `tccutil reset` mutates
-// the human's privacy state. Both are reachable from a reducer that a unit test
-// can drive, which is the exact shape that killed `WindowServer` on 2026-08-17
-// (`AGENTS.md`). So they take the
-// `lock_modifiers` / `ConsentProbes` treatment: [`ConsentGestures`] is a bundle
-// of injected pointers whose default is the INERT arm, and only a windowed host
-// installs the live one.
+// The OS gestures (`NSWorkspace`, `tccutil reset`) are reachable from a reducer a
+// unit test drives, so they are injected pointers, inert by default
+// ([`ConsentGestures`]); only a windowed host installs the live arm.
 
 /// One folder's published row: the folder, and what the warm-up observed.
 pub(crate) type MacosAccessRow = (Folder, crate::consent_warmup::WarmupRow);
@@ -26392,7 +28078,7 @@ pub(crate) struct MacosAccess {
     pub(crate) install: &'static str,
     /// The canonical path this process runs from.
     pub(crate) running: Option<String>,
-    /// Whether macOS can still FIND the code a grant is keyed to. `running`
+    /// Whether macOS can still find the code a grant is keyed to. `running`
     /// above is the exec-time path, frozen for the life of the process, so it
     /// reads healthy in exactly the state where the bundle was renamed or
     /// deleted under a live process — which an in-place apply does.
@@ -26438,25 +28124,24 @@ pub(crate) struct MacosAccess {
     /// membership, aterm's own hardening, and the owner's change as the host's
     /// lane holds it. The zero value offers nothing.
     pub(crate) debugger: crate::debugger_access::DebuggerFacts,
-    /// The DEVELOPER TOOLS card's facts (debugger design §9.1; owner ask
-    /// 2026-10-15): the switch's row in the system TCC.db, tccd's newest answer
-    /// for this bundle id, their joined verdict, and when aterm last opened the
-    /// page. The zero value is "not checked".
+    /// The Developer Tools card's facts (debugger design §9.1): the switch's row
+    /// in the system TCC.db, tccd's newest answer for this bundle id, their
+    /// joined verdict, and when aterm last opened the page. The zero value is
+    /// "not checked".
     pub(crate) devtools: DevToolsFacts,
-    /// Whether the owner has turned the `sudo` askpass relay OFF (the
+    /// Whether the owner has turned the `sudo` askpass relay off (the
     /// `<state>/askpass-off` marker; `docs/DESIGN-sudo-askpass-2026-10-15.md`
     /// §3.1). Published so the Security row renders the right toggle; the
     /// control verb reads the marker on its own lane, never this field.
     pub(crate) askpass_relay_off: bool,
 }
 
-/// What the DEVELOPER TOOLS card renders: the cached reading (the switch's row,
-/// tccd's answer and the verdict they join to — the one the digest line and the
-/// helper panel act on), how many whole minutes old tccd's newest answer is,
-/// and how many since aterm last opened the page. Minutes, not milliseconds,
-/// because the host republishes this block every park, equality-gated: a
-/// millisecond age would repaint the page on every park, a minute's on at most
-/// one a minute. `Copy`: nothing here owns a string.
+/// What the Developer Tools card renders: the cached reading (the switch's row,
+/// tccd's answer and the verdict they join to, the one the digest line and the
+/// helper panel act on), how many whole minutes old tccd's newest answer is, and
+/// how many since aterm last opened the page. Minutes, because the host
+/// republishes this block every park, equality-gated: a minute's age repaints at
+/// most once a minute. `Copy`: nothing here owns a string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DevToolsFacts {
     /// `[privacy] enabled` and `check`. `false` means aterm read nothing.
@@ -26497,7 +28182,7 @@ impl Default for DevToolsFacts {
 }
 
 impl Default for MacosAccess {
-    /// The honest zero state: nothing observed, nothing claimed.
+    /// The zero state: nothing observed, nothing claimed.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -26610,31 +28295,29 @@ impl MacosAccess {
     }
 }
 
-/// THE FENCE for this panel's two OS gestures.
+/// The fence for this panel's OS gestures.
 ///
-/// * [`ConsentGestures::live`] — a windowed instance: the real `NSWorkspace`
-///   open and the real `tccutil` spawn.
-/// * [`ConsentGestures::inert`] — a headless instance and every unit test:
-///   answers without reaching the OS.
+/// * [`ConsentGestures::live`]: a windowed instance, with the real `NSWorkspace`
+///   open, `tccutil` spawn, alert and devtools worker.
+/// * [`ConsentGestures::inert`]: a headless instance and every unit test; answers
+///   without reaching the OS.
 ///
-/// Published INTO the view rather than held on the controller, because the
-/// host can reach a view's state (`view_state_mut`) and cannot reach the
-/// process-singleton controller. The default is the inert arm, so a
-/// construction that forgets to choose gets the arms that cannot reach the OS.
+/// Published into the view, not held on the controller, because the host can
+/// reach a view's state (`view_state_mut`) but not the process-singleton
+/// controller. The default is the inert arm.
 #[derive(Clone, Copy)]
 pub(crate) struct ConsentGestures {
     /// Owner gesture, main thread. Returns what the shell actually achieved so
     /// the panel can degrade to naming the route in words.
     open_settings: fn(crate::menu::PrivacyPane) -> crate::menu::SettingsOpen,
-    /// Runs each invocation of a [`ResetPlan`] SEPARATELY and records one
-    /// attempt per folder. No retry, no loop: the plan carries each folder
-    /// exactly once and this walks it exactly once.
+    /// Runs each invocation of a [`ResetPlan`] separately and records one attempt
+    /// per folder, once each: no retry, no loop.
     run_reset: fn(&ResetPlan) -> Vec<ResetAttempt>,
     /// The owner's answer before a persistent Security change (the warm-up,
-    /// reset, Trash, debugger access or sudo relay preference): an AppKit alert. `key` drives this page
-    /// exactly like a hand, so the alert — which no control verb can answer — is
-    /// what keeps these gestures the owner's. `None` when no alert could be
-    /// shown: nobody was asked, which is not a decline.
+    /// reset, Trash, debugger access or sudo relay preference): an AppKit
+    /// alert. `key` drives this page like a hand, so the alert, which no
+    /// control verb can answer, keeps these gestures the owner's. `None` when
+    /// no alert could be shown: nobody was asked, which is not a decline.
     confirm: fn(&str, &str, &str) -> Option<bool>,
     /// The owner's debugger-access change (design §3.4 step 3), AFTER aterm's
     /// alert: the live arm starts ONE detached `consent-devtools` worker that
@@ -26643,8 +28326,8 @@ pub(crate) struct ConsentGestures {
     /// macOS then asks for an administrator in its own dialog (spike D2, measured).
     /// The inert arm starts nothing.
     run_devtools: fn(crate::debugger_access::DevtoolsJob) -> crate::debugger_access::DevtoolsSpawn,
-    /// Whether the DEVELOPER TOOLS card's *Open Developer Tools…* may ask the host
-    /// for the one hand-over (`App::hand_devtools_to_owner`, which a reducer cannot
+    /// Whether the Developer Tools card's *Open Developer Tools…* may ask the host
+    /// for the hand-over (`App::hand_devtools_to_owner`, which a reducer cannot
     /// reach): the live arm yes, the inert arm no, so a view born unarmed, or a
     /// headless instance's, asks for nothing.
     asks_devtools_hand_over: fn() -> bool,
@@ -26749,9 +28432,8 @@ impl ConsentGestures {
         }
     }
 
-    /// Whether these are the live arms. Read by the tests that prove an
-    /// unarmed view cannot reach the OS; production never branches on it,
-    /// because the arms themselves are the branch.
+    /// Whether these are the live arms, for the tests that prove an unarmed view
+    /// cannot reach the OS; production never branches on it.
     #[cfg(test)]
     pub(crate) const fn is_live(self) -> bool {
         self.live
@@ -26922,8 +28604,8 @@ const fn inert_open_settings(_pane: crate::menu::PrivacyPane) -> crate::menu::Se
     crate::menu::SettingsOpen::Refused
 }
 
-/// The inert reset: nothing ran, and every folder says so. `ToolAbsent` is the
-/// honest value — it is NOT a decline, and `reset_outcome` folds it apart.
+/// The inert reset: nothing ran, so every folder is `ToolAbsent`, which is not a
+/// decline (`reset_outcome` folds it apart).
 fn inert_run_reset(plan: &ResetPlan) -> Vec<ResetAttempt> {
     plan.folders()
         .iter()
@@ -26931,31 +28613,25 @@ fn inert_run_reset(plan: &ResetPlan) -> Vec<ResetAttempt> {
         .collect()
 }
 
-/// How long ONE `tccutil` invocation may hold the main thread before it is
+/// How long one `tccutil` invocation may hold the main thread before it is
 /// killed. `tccutil reset` answers in milliseconds; this is a ceiling, not a
-/// budget to spend.
+/// budget.
 ///
-/// **Why a ceiling exists at all.** This runs on the main thread from the
-/// Settings reducer, and `tccutil` talks to `tccd`. A synchronous main-thread
-/// wait on `tccd` is the exact shape that killed WindowServer on this machine
-/// on 2026-08-17 (its main thread sat in a `tccd` preflight for forty seconds
-/// and the watchdog took the whole GUI session down — `AGENTS.md`). An
-/// owner gesture may cost a visible moment; it may never cost the event loop.
+/// It runs on the main thread from the reducer and talks to `tccd`, and an
+/// unbounded main-thread wait on `tccd` can stall the event loop until the
+/// WindowServer watchdog takes the GUI session down. An owner gesture may cost a
+/// visible moment, never the event loop.
 const RESET_INVOCATION_CEILING: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// How often the bounded wait looks at the child. Small enough that the common
 /// case (a few milliseconds) returns promptly, large enough not to spin.
 const RESET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Wait for `child` for at most [`RESET_INVOCATION_CEILING`], then kill and REAP
-/// it. Returns the exit code, or `None` when the child was signalled — which is
-/// what a killed child reports, and which
-/// [`ResetAttempt::from_exit_status`] already folds to `Declined { code: None }`.
-/// A timeout is therefore reported as a decline, never as a success, and never
-/// as `ToolAbsent` (the tool DID run).
-///
-/// The returned `Option` is deliberately the same shape `Child::wait` gives, so
-/// no caller can tell a timeout apart from an ordinary signal and accidentally
+/// Wait for `child` for at most `ceiling`, then kill and reap it. Returns the exit
+/// code, or `None` when the child was signalled (as a killed child is), which
+/// [`ResetAttempt::from_exit_status`] folds to `Declined { code: None }`: a
+/// timeout is a decline, never a success or `ToolAbsent` (the tool did run). The
+/// shape is `Child::wait`'s, so no caller can tell a timeout from a signal and
 /// claim more than was observed.
 fn wait_bounded(
     child: &mut aterm_uds::spawnfd::Child,
@@ -26968,8 +28644,7 @@ fn wait_bounded(
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
-                    // REAP: without this the child stays a zombie for the life
-                    // of the process.
+                    // Reap, or the child stays a zombie for the life of the process.
                     return child.wait().ok().and_then(|s| s.code());
                 }
                 std::thread::sleep(RESET_POLL_INTERVAL);
@@ -26979,13 +28654,10 @@ fn wait_bounded(
     }
 }
 
-/// THE ONLY SPAWN in this file. One `tccutil` invocation per folder, in plan
-/// order, each recorded independently — §3.7's failure handling is written for
-/// exactly this shape. A folder whose invocation could not even start is
-/// `ToolAbsent`, not a decline; the fold keeps those apart.
-///
-/// Each invocation is bounded by [`RESET_INVOCATION_CEILING`] — see its comment
-/// for why a main-thread wait on `tccd` may never be unbounded here.
+/// The only spawn in this file: one `tccutil` invocation per folder, in plan
+/// order, each recorded independently (§3.7). A folder whose invocation could not
+/// start is `ToolAbsent`, not a decline. Each is bounded by
+/// [`RESET_INVOCATION_CEILING`].
 fn run_tccutil_reset(plan: &ResetPlan) -> Vec<ResetAttempt> {
     plan.commands()
         .into_iter()
@@ -26993,8 +28665,7 @@ fn run_tccutil_reset(plan: &ResetPlan) -> Vec<ResetAttempt> {
             let Some((program, args)) = argv.split_first() else {
                 return ResetAttempt::tool_absent(folder);
             };
-            // The window has no console: on Windows `spawnfd::command` gives a
-            // console tool a windowless one, where a bare child opened a window.
+            // On Windows `spawnfd::command` gives a console tool a windowless console.
             match aterm_uds::spawnfd::command(program).args(args).spawn() {
                 // The tool could not even start: not a decline.
                 Err(_) => ResetAttempt::tool_absent(folder),
@@ -27017,7 +28688,7 @@ pub(crate) struct MacosAccessCopy {
     pub(crate) headline: String,
     /// Why the probe said that — including "no syscall was performed".
     pub(crate) probe_detail: String,
-    /// What a grant is, and what aterm has NOT measured about it.
+    /// What a grant is, and what aterm has not measured about it.
     pub(crate) coverage: String,
     /// The trade, in one sentence, unsoftened.
     pub(crate) trade: String,
@@ -27089,7 +28760,7 @@ pub(crate) struct DevToolsCardCopy {
     /// The list was refused for want of Full Disk Access: the card below grants
     /// it. `None` otherwise.
     pub(crate) unread: Option<String>,
-    /// What the list is, in Apple's words, and what it is NOT: debugger access,
+    /// What the list is, in Apple's words, and what it is not: debugger access,
     /// the "Developer Tools Access" password dialog.
     pub(crate) kind: String,
     /// Why aterm asks (`atpkg::devtools::why`).
@@ -27106,8 +28777,8 @@ pub(crate) struct DevToolsCardCopy {
     pub(crate) route: String,
     /// The trade (`atpkg::devtools::trade`).
     pub(crate) trade: String,
-    /// Which switch matters (`atpkg::devtools::only_aterm`): the owner who
-    /// switched Terminal on (2026-10-15) because nothing said why it was there.
+    /// Which switch matters (`atpkg::devtools::only_aterm`), so an owner does not
+    /// switch Terminal on for want of a word on why it is listed.
     pub(crate) only: String,
     /// When aterm last opened the page for the owner. `None` when it never has.
     pub(crate) opened: Option<String>,
@@ -27117,16 +28788,15 @@ pub(crate) struct DevToolsCardCopy {
 }
 
 /// The debugger-access row (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
-/// §3.3; owner rulings O7 and O8, 2026-09-29), in render order. Built by
-/// [`debugger_row_copy`] as a total function of the published facts: what it
-/// says the rule IS comes only from the cached `-status` probe, never from a
-/// change's exit code.
+/// §3.3), in render order. Built by [`debugger_row_copy`] as a total function of
+/// the published facts: what it says the rule is comes only from the cached
+/// `-status` probe, never from a change's exit code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DebuggerRowCopy {
     /// "Debugger access — allowed / not allowed / not recognised / not
     /// observed", or not checked when the privacy checks are off.
     pub(crate) headline: String,
-    /// What the row is, and what it is NOT: the Developer Tools list.
+    /// What the row is, and what it is not: the Developer Tools list.
     pub(crate) kind: String,
     /// The observed state in words (the design's by-state table), with the
     /// not-hardened sentence where the button it explains is drawn.
@@ -27186,14 +28856,10 @@ fn macos_access_folder_label(folder: Folder) -> String {
     folder.label().to_string()
 }
 
-/// A service class in words, from the verb's token. Every class the consent
-/// roster knows goes through [`macos_access_folder_label`] so this file still
-/// holds no protected-folder literal of any shape (the aterm-census guard `protected-folder`).
-///
-/// `app-data` is no longer spelled here: it is a roster member now, so
-/// [`Folder::parse`] answers it and the one string table says it once. The
-/// remaining arms are coverage classes nothing warms up — they have no
-/// promptable roster entry of their own.
+/// A service class in words, from the verb's token. Every roster class goes
+/// through [`macos_access_folder_label`], so this file holds no protected-folder
+/// literal (the aterm-census guard `protected-folder`); the other arms are
+/// coverage classes nothing warms up.
 fn macos_access_service_label(service: &str) -> String {
     match Folder::parse(service) {
         Some(folder) => macos_access_folder_label(folder),
@@ -27230,11 +28896,11 @@ fn macos_access_row_label(folder: Folder, row: crate::consent_warmup::WarmupRow)
     }
 }
 
-/// THE WHOLE STRING TABLE, as a total function of the published facts.
+/// The whole string table, as a total function of the published facts.
 ///
-/// Read the module header before changing a sentence here: the coverage line is
-/// the service rows distinguish Apple's documented host coverage from measured
-/// propagation, and nothing promises that interruptions are eliminated.
+/// Read the section header above before changing a sentence: the service rows
+/// distinguish Apple's documented coverage from measured propagation, and
+/// nothing promises that interruptions are eliminated.
 pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     let headline = if !access.enabled {
         "File access \u{2014} not checked. aterm's privacy checks are switched off in aterm.toml."
@@ -27276,16 +28942,13 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             "There is no macOS privacy database on this system.".to_string()
         }
     };
-    // GATED ON MEASURED EVIDENCE (§7 S4): `fda_coverage_measured` is false
-    // everywhere on this tree, so the second arm is what ships. Neither arm
-    // names a folder or claims a class as measured; the app-data class (the
-    // "access data from other applications" request, measured 2026-09-19 on
-    // macOS 26.6) is the one thing the grant is stated to do.
-    // ONE LINE (the card paints each line at a fixed height and elides the
-    // rest): what the grant is for. The tall card's service rows say class by
-    // class what is measured, not measured, or out of its reach; the compact
-    // card paints none, so the shipping arm does not point at them (the
-    // measured arm must drop its pointer on compact before the flag flips).
+    // Gated on measured evidence (§7 S4): `fda_coverage_measured` is false on this
+    // tree, so the second arm ships. Neither arm names a folder or claims a class
+    // measured beyond app-data (the "access data from other applications" request,
+    // measured on macOS 26.6). One line, since the card paints each line at a fixed
+    // height. The tall card's service rows say class by class what is measured;
+    // the compact card paints none, so the shipping arm does not point at them
+    // (the measured arm must drop its pointer on compact before the flag flips).
     let coverage = if access.evidence.fda_coverage_measured {
         "Full Disk Access stops macOS's \"access data from other applications\" request; the \
          rows below list what else it reaches on this Mac."
@@ -27312,15 +28975,11 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             None => format!("Running {posture} \u{2014} {consequence}"),
         }
     };
-    // THE ONE STATE THE REST OF THIS PANEL CANNOT SHOW. A grant is checked
-    // against the running code; if the bundle is gone from that name, macOS
-    // has nothing to check and every request is asked again — while the
-    // headline can still read "granted", because the probe gates on the
-    // exec-time path, which a swap leaves healthy. macOS keeps one record of
-    // what aterm's code should look like, and a copy it cannot match
-    // overwrites it, clearing the access of every copy. Said as a fact, with
-    // no instruction: the sentence that would (quit, reopen) is fenced by the
-    // phrase guard, and the recovery is aterm's to perform, not theirs.
+    // The one state the rest of the panel cannot show: the bundle is gone from its
+    // name, so macOS has nothing to check a grant against and asks again for
+    // everything, while the headline can still read "granted" (the probe checks the
+    // exec-time path). A copy macOS cannot match also clears every copy's access.
+    // Stated as a fact with no instruction; the recovery is aterm's to perform.
     let anchor_fault = access.anchor.grant_unverifiable().then(|| {
         "This aterm's bundle has moved or been deleted: macOS asks again for everything and \
          clears every copy's access."
@@ -27360,9 +29019,8 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             ));
         }
         for service in access.unmeasured.iter() {
-            // App-data sits here whenever THIS host's grant is not observed,
-            // but the class itself was measured (2026-09-19, macOS 26.6):
-            // say what the grant does.
+            // App-data sits here whenever this host's grant is not observed, but
+            // the class itself was measured (macOS 26.6): say what the grant does.
             rows.push(if *service == "app-data" {
                 "Other applications' data \u{2014} stopped once Full Disk Access is granted"
                     .to_string()
@@ -27388,10 +29046,9 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     let grants = "Who grants: Only you, in System Settings. aterm opens the page; macOS has no \
                   dialog for this.";
     let lasts = "Lasts: While this aterm keeps its signature. Applies to programs run in aterm.";
-    // A HELD GRANT READS DIFFERENTLY FROM A MISSING ONE (2026-09-10). With the
-    // coverage measurement unrun, `prompt_possible` stays true after the owner
-    // grants Full Disk Access, and the line used to stay byte-identical — so
-    // the screen meant to confirm the fix could not show it working.
+    // A held grant reads differently from a missing one: with the coverage
+    // measurement unrun, `prompt_possible` stays true after a grant, so this line
+    // must still show that the grant took.
     let prompt = if access.prompt_possible() && access.fda == FdaState::Granted {
         // The coverage line above already says what was measured and what
         // was not; this line says what that leaves, pointing at the rows.
@@ -27533,9 +29190,9 @@ fn debugger_not_hardened_sentence(
     }
 }
 
-/// The rule the debugger row's headline STATES: the completed cached probe's
-/// mode, or `None` when aterm did not look or the probe is still out. Never an
-/// exit code or an outcome — the Tier-1 bind reads a surface's claim here
+/// The rule the debugger row's headline states: the completed cached probe's mode,
+/// or `None` when aterm did not look or the probe is still out. Never an exit code
+/// or an outcome: the Tier-1 bind reads a surface's claim here
 /// (`DebuggerAccessChange`'s `claim`).
 pub(crate) fn debugger_row_states(
     facts: &crate::debugger_access::DebuggerFacts,
@@ -27544,10 +29201,9 @@ pub(crate) fn debugger_row_states(
         .then_some(facts.probe.mode)
 }
 
-/// THE DEBUGGER ROW'S STRING TABLE (debugger design §3.3, with owner ruling O8:
-/// an aterm that is not hardened offers *Allow* too, and says what that
-/// exposes). A total function of the published facts; the rule's state comes
-/// only from the cached probe.
+/// The debugger row's string table (debugger design §3.3): an aterm that is not
+/// hardened offers *Allow* too and says what that exposes. A total function of the
+/// published facts; the rule's state comes only from the cached probe.
 pub(crate) fn debugger_row_copy(access: &MacosAccess) -> DebuggerRowCopy {
     use crate::debugger_access::{Origin, Outcome};
     use aterm_containment::consent::{
@@ -27805,11 +29461,10 @@ fn devtools_opened_words(minutes: u64) -> String {
     }
 }
 
-/// THE DEVELOPER TOOLS CARD'S STRING TABLE (debugger design §9.1, rulings
-/// O10–O15; owner ask 2026-10-15). A total function of the published facts and
-/// `evidence`. The state line follows the JOINED verdict — the one the digest
-/// line and the helper panel act on, so the three never disagree — and says
-/// where it came from:
+/// The Developer Tools card's string table (debugger design §9.1): a total
+/// function of the published facts and `evidence`. The state line follows the
+/// joined verdict (the one the digest line and the helper panel act on, so the
+/// three never disagree) and says where it came from:
 ///
 /// * the switch's row, when aterm read the list: on (since the day it last
 ///   changed), off, absent, or on while tccd's newer answer still checks;
@@ -27902,7 +29557,7 @@ pub(crate) fn devtools_card_copy(access: &MacosAccess) -> DevToolsCardCopy {
             }
             G::NotGranted => match probe.state {
                 S::Unlisted => format!("{}: aterm is not on the list.", latest()),
-                // GATED ON D13: which listed state a `denied` is stays
+                // Gated on spike D13: which listed state a `denied` is stays
                 // unmeasured until then, so it reads "did not allow it".
                 S::Denied if shapes => format!("{}: aterm is on the list, switched off.", latest()),
                 S::Denied | S::Allowed | S::Unknown => match facts.answer_minutes {
@@ -28008,10 +29663,9 @@ pub(crate) fn devtools_card_copy(access: &MacosAccess) -> DevToolsCardCopy {
 }
 
 /// Why a press of the debugger row's button for `change` is not taken, in the
-/// owner's words for "Nothing was changed: {why}." — `None` exactly when
-/// [`crate::debugger_access::DebuggerFacts::offers`] says the button is live,
-/// so the arm and the drawn button cannot disagree. Never aterm's own
-/// hardening (O8).
+/// owner's words for "Nothing was changed: {why}.": `None` exactly when
+/// [`crate::debugger_access::DebuggerFacts::offers`] says the button is live, so
+/// the arm and the drawn button agree. Never aterm's own hardening.
 fn debugger_press_refusal(
     facts: &crate::debugger_access::DebuggerFacts,
     change: aterm_containment::consent::DebuggerChange,
@@ -28350,23 +30004,23 @@ pub(crate) const MACOS_ACCESS_TRASH: &str = "settings/macos-access/trash-copies"
 pub(crate) const MACOS_ACCESS_DEBUGGER_ON: &str = "settings/macos-access/debugger-on";
 /// *Turn Off Debugger Access…*.
 pub(crate) const MACOS_ACCESS_DEBUGGER_OFF: &str = "settings/macos-access/debugger-off";
-/// The owner's `sudo` askpass relay off switch (`docs/DESIGN-sudo-askpass-2026-10-15.md`
-/// §3.1). Two ids so a press carries its direction, like the debugger pair: it
-/// writes/removes aterm's own state-dir marker. `act` refuses the prefix; controller
-/// keys still drive the page, so the reducer also requires the owner's confirmation.
+/// The owner's `sudo` askpass relay off switch
+/// (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.1). Two ids so a press carries
+/// its direction, like the debugger pair: it writes or removes aterm's own
+/// state-dir marker. `act` refuses the prefix; controller keys still drive the
+/// page, so the reducer also requires the owner's confirmation.
 pub(crate) const MACOS_ACCESS_ASKPASS_OFF: &str = "settings/macos-access/askpass-off";
 /// *Allow sudo Password Prompts* — the other direction of the off switch.
 pub(crate) const MACOS_ACCESS_ASKPASS_ON: &str = "settings/macos-access/askpass-on";
-/// *Open Developer Tools…*, the DEVELOPER TOOLS card's one button: brings
-/// System Settings forward at the Developer Tools list (debugger design §9.1,
-/// O14, O25) — through the one hand-over (`App::hand_devtools_to_owner`), which
-/// also shows aterm's helper panel beside it while aterm is not on. It never
-/// puts aterm on the list or flips a switch, and asks nothing. On a list read
-/// whole and EMPTY — where macOS shows no Developer Tools page at all — the
-/// press first runs `spctl developer-mode enable-terminal`, which adds
-/// Terminal, switched off, so the page exists; its bar says so while it runs,
-/// and the panel says Terminal is aterm's doing and stays off. Under the
-/// prefix, so `act` refuses it.
+/// *Open Developer Tools…*, the Developer Tools card's one button: brings
+/// System Settings forward at the Developer Tools list (debugger design §9.1)
+/// through the hand-over (`App::hand_devtools_to_owner`), which also shows
+/// aterm's helper panel beside it while aterm is not on. It never puts aterm on
+/// the list or flips a switch, and asks nothing. On a list read whole and empty,
+/// where macOS shows no Developer Tools page at all, the press first runs
+/// `spctl developer-mode enable-terminal`, which adds Terminal, switched off, so
+/// the page exists; its bar says so while it runs, and the panel says Terminal
+/// is aterm's doing and stays off. Under the prefix, so `act` refuses it.
 pub(crate) const MACOS_ACCESS_OPEN_DEVTOOLS: &str = "settings/macos-access/developer-tools";
 
 /// The first decline's quiet; each decline in a row doubles it, up to
@@ -28385,9 +30039,9 @@ const OWNER_QUIET_FORGET: std::time::Duration = std::time::Duration::from_secs(1
 pub(crate) struct OwnerQuiet {
     until: Option<QuietStamp>,
     declines: u32,
-    /// A warm-up the owner said yes to, in any view, that the park has not
-    /// taken up yet: a press queued in ANOTHER view behind that alert reads it
-    /// and does not ask again.
+    /// A warm-up the owner said yes to, in any view, that the park has not taken
+    /// up yet: a press queued in another view behind that alert reads it and does
+    /// not ask again.
     warmup_confirmed: bool,
     /// The same for a move to the Trash.
     retire_confirmed: bool,
@@ -28402,10 +30056,10 @@ pub(crate) struct OwnerQuiet {
     debugger_answered: bool,
 }
 
-/// A moment on two clocks. `Instant` stops while the Mac sleeps, so a quiet
-/// timed by it alone would outlast a night asleep, and the wall clock can be
-/// set back; a quiet ends when EITHER clock says it has. A wall clock set
-/// forward only ends one early, and the alert is still the fence.
+/// A moment on two clocks. `Instant` stops while the Mac sleeps, so a quiet timed
+/// by it alone would outlast a night asleep, and the wall clock can be set back; a
+/// quiet ends when either clock says it has. A wall clock set forward only ends
+/// one early, and the alert is still the fence.
 #[derive(Clone, Copy, Debug)]
 struct QuietStamp {
     awake: std::time::Instant,
@@ -28468,11 +30122,11 @@ impl OwnerQuiet {
         self.declines = 0;
     }
 
-    /// Count a decline the owner gave OUTSIDE aterm's alert: a debugger-access
+    /// Count a decline the owner gave outside aterm's alert: a debugger-access
     /// change whose re-probe reads the rule unchanged (Cancel in macOS's
-    /// administrator dialog, a wrong password, a write that failed — design
-    /// §3.4 step 4). The same doubling quiet as an alert's Cancel, so a
-    /// program pressing the button again meets a quiet page, not a dialog.
+    /// administrator dialog, a wrong password, a failed write; design §3.4 step 4).
+    /// The same doubling quiet as an alert's Cancel, so a program pressing again
+    /// meets a quiet page, not a dialog.
     pub(crate) fn note_decline(&mut self) {
         self.declined(QuietStamp::now());
     }
@@ -28546,10 +30200,10 @@ impl OwnerQuiet {
 /// palette entry or band action in this crate can start the change without the
 /// owner's yes. The containment runner beneath it,
 /// `aterm_containment::consent::run_devtools_change`, is `pub` across the crate
-/// boundary, so no type here fences it: the aterm-census guard `devtools-door`
-/// keeps it to its one caller, `debugger_access::spawn_devtools_worker`. Neither `Clone` nor
-/// `Copy`: one alert's yes is spent by one change. The sudo preference writer
-/// likewise consumes one before changing its marker.
+/// boundary; the aterm-census guard `devtools-door` keeps it to its one caller,
+/// `debugger_access::spawn_devtools_worker`. Neither `Clone` nor `Copy`: one yes
+/// is spent by one change. The sudo preference writer likewise consumes one
+/// before changing its marker.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OwnerYes(());
 
@@ -28685,10 +30339,9 @@ fn owner_text(text: &str) -> String {
     out
 }
 
-/// Whether the Security page carries the block right now. It exists only when
-/// the host has PUBLISHED a posture — a headless instance, a unit test, and
-/// every non-macOS build publish nothing, so the block is simply absent rather
-/// than rendering an invented "unknown" card.
+/// Whether the Security page carries the block right now: only once the host has
+/// published a posture (a headless instance, a unit test and every non-macOS
+/// build publish none, so the block is absent rather than an invented card).
 fn prefers_macos_access(state: &SettingsViewState) -> bool {
     state.route == SettingsRoute::Security
         && state.search.trim().is_empty()
@@ -28701,17 +30354,13 @@ fn prefers_macos_access(state: &SettingsViewState) -> bool {
 fn macos_access_height(access: &MacosAccess, lead: AccessLead, text_width: f32) -> f32 {
     let scale = settings_text_scale();
     let line_height = 24.0_f32.max(20.0 * scale);
-    let heading_height = 28.0_f32.max(22.0 * scale);
+    let heading_height = access_card_heading(MACOS_ACCESS_HEADING, "MACOS ACCESS", text_width).1;
     let copy = macos_access_copy(access);
     let (above, below) = macos_access_rows(&copy, access, lead);
     let lines = macos_access_visual_lines(&above, text_width)
         + macos_access_visual_lines(&below, text_width)
         + macos_access_visual_lines(&debugger_row_lines(&copy.debugger), text_width);
-    let debugger_actions = if copy.debugger.button.is_some() {
-        scaled_control_height()
-    } else {
-        0.0
-    };
+    let debugger_actions = debugger_access_actions(&copy, text_width).map_or(0.0, |(_, h)| h);
     heading_height
         + lines as f32 * line_height
         + macos_access_actions_height(access, text_width)
@@ -28934,14 +30583,14 @@ fn macos_access_reach(
 ) -> f32 {
     let scale = settings_text_scale();
     let line_height = 24.0_f32.max(20.0 * scale);
-    let heading_height = 28.0_f32.max(22.0 * scale);
+    let heading_height = access_card_heading(MACOS_ACCESS_HEADING, "MACOS ACCESS", text_width).1;
     let (above, _) = macos_access_rows(&macos_access_copy(access), access, lead);
-    let all = macos_access_action_rows(access, text_width).len().max(1);
+    let lines = macos_access_action_rows(access, text_width);
+    let all = lines.len().max(1);
     let rows = rows.map_or(all, |rows| rows.clamp(1, all));
     12.0 + heading_height
         + macos_access_visual_lines(&above, text_width) as f32 * line_height
-        + rows as f32 * scaled_control_height()
-        + (rows - 1) as f32 * 8.0
+        + button_line_set_height(&lines[..rows.min(lines.len())], MACOS_ACCESS_BUTTON_GAP)
 }
 
 /// How many visual lines `line` takes in the block's `text_width`: a fact
@@ -29033,45 +30682,95 @@ fn macos_access_buttons(access: &MacosAccess) -> Vec<UiNode> {
     buttons
 }
 
-/// THE BLOCK'S BUTTONS IN ROWS, EACH AT ITS LABEL'S WIDTH: as many to a row as
+/// THE BLOCK'S BUTTONS IN ROWS, EACH AT ITS LABEL'S WIDTH, by the one rule a
+/// page's buttons keep ([`button_line_set`]): as many to a row as
 /// `text_width` holds, the next row where the next does not fit — never one
 /// row whose buttons split it and elide every label (five buttons painted
 /// "Open Privacy &…", "Ask for Folder Ac…" on a 1074pt window, seen once a
 /// headless instance could carry a posture, s-24). A label wider than the
-/// whole measure takes a row of its own at that measure.
-fn macos_access_action_rows(access: &MacosAccess, text_width: f32) -> Vec<Vec<UiNode>> {
-    let mut rows: Vec<Vec<UiNode>> = Vec::new();
-    let mut used = 0.0_f32;
-    for mut button in macos_access_buttons(access) {
-        let label = match &button.content {
-            UiContent::Button(control) => control
-                .spec
-                .visual_label
-                .clone()
-                .unwrap_or_else(|| control.spec.label.clone()),
-            _ => String::new(),
-        };
-        let width = page_button_width(&label, text_width);
-        button.layout.width = Length::Fixed(width);
-        match rows.last_mut() {
-            Some(row) if used + 8.0 + width <= text_width + 0.01 => {
-                used += 8.0 + width;
-                row.push(button);
-            }
-            _ => {
-                used = width;
-                rows.push(vec![button]);
-            }
-        }
-    }
-    rows
+/// whole measure takes a row of its own at that measure, its words on as
+/// many lines as it needs: a fixed one-line row cut them ("Open…", "Turn O…"
+/// at 2× text in a 22-column window). Each row with its height.
+fn macos_access_action_rows(access: &MacosAccess, text_width: f32) -> Vec<(Vec<UiNode>, f32)> {
+    button_line_set(
+        macos_access_buttons(access),
+        text_width,
+        macos_access_button_lines(),
+    )
 }
+
+/// How the block's buttons are set ([`button_line_set`]): each its label's
+/// width and 28pt ([`page_button_width`]), 72pt at least, 8pt apart.
+fn macos_access_button_lines() -> ButtonLines {
+    ButtonLines {
+        single: scaled_control_height(),
+        least: 72.0,
+        slack: 8.0,
+        gap: MACOS_ACCESS_BUTTON_GAP,
+    }
+}
+
+/// The gap between the block's buttons, and between their rows.
+const MACOS_ACCESS_BUTTON_GAP: f32 = 8.0;
+
+/// The block's heading's key.
+const MACOS_ACCESS_HEADING: &str = "settings/macos-access/heading";
 
 /// The height the block's button rows take in `text_width`
 /// ([`macos_access_action_rows`]).
 fn macos_access_actions_height(access: &MacosAccess, text_width: f32) -> f32 {
-    let rows = macos_access_action_rows(access, text_width).len().max(1);
-    rows as f32 * scaled_control_height() + (rows - 1) as f32 * 8.0
+    button_line_set_height(
+        &macos_access_action_rows(access, text_width),
+        MACOS_ACCESS_BUTTON_GAP,
+    )
+    .max(scaled_control_height())
+}
+
+/// The heading of the MACOS ACCESS block or of the DEVELOPER TOOLS card over
+/// it, keyed `key`: its small capitals in the heading's own slot where one
+/// line holds them, as always; else wrapped to the card's column `text_width`
+/// ([`caption_node`]), a caption line each, the same air under them — never
+/// cut ("MACOS A…" at 2× text in a 22-column window). Returns the node and
+/// its height.
+fn access_card_heading(key: &str, caption: &str, text_width: f32) -> (UiNode, f32) {
+    let slot = 28.0_f32.max(22.0 * settings_text_scale());
+    let (mut node, lines) = caption_node(key, caption, text_width);
+    let height = lines + (slot - caption_line_height()).max(0.0);
+    node.layout.height = Length::Fixed(height);
+    (node, height)
+}
+
+/// The debugger row's button, where the row offers one, on its own line by
+/// the block's rule ([`macos_access_action_rows`]): its label's width, its
+/// words on lines where it is wider than `text_width`. Returns the line and
+/// its height.
+fn debugger_access_actions(copy: &MacosAccessCopy, text_width: f32) -> Option<(UiNode, f32)> {
+    let button = copy.debugger.button.as_ref()?;
+    let mut lines = button_line_set(
+        vec![macos_access_button(
+            button.action(),
+            button.label(),
+            button.enabled,
+            button.busy,
+        )],
+        text_width,
+        macos_access_button_lines(),
+    );
+    let (buttons, height) = lines.pop()?;
+    Some((
+        UiNode::new(
+            "settings/macos-access/debugger/actions",
+            UiContent::Group(GroupSpec::new("Debugger access actions")),
+        )
+        .layout(
+            Layout::row()
+                .width(Length::Fill)
+                .height(Length::Fixed(height))
+                .gap(MACOS_ACCESS_BUTTON_GAP),
+        )
+        .children(buttons),
+        height,
+    ))
 }
 
 /// The debugger row's text lines in render order: `(key, text, role, style)`:
@@ -29125,9 +30824,9 @@ fn debugger_row_lines(copy: &DebuggerRowCopy) -> Vec<(String, String, SemanticRo
 }
 
 /// One button in the block. Every one of them is an owner gesture on the main
-/// thread; none of them is reachable without a press. Buttons sharing a row
-/// split it; a button alone in its row keeps its own width
-/// ([`lone_button_width`]).
+/// thread; none of them is reachable without a press. Each is as wide as its
+/// label where it is set in its lines ([`macos_access_button_lines`]); alone
+/// in its row too, since a bar that fills the card reads as a text field.
 fn macos_access_button(action: &str, label: &str, enabled: bool, busy: bool) -> UiNode {
     UiNode::new(
         action.to_string(),
@@ -29148,39 +30847,14 @@ fn macos_access_button(action: &str, label: &str, enabled: bool, busy: bool) -> 
     )
 }
 
-/// A button alone in its row is as wide as its label, not the row: a bar that
-/// fills the card reads as a text field.
-fn lone_button_width(buttons: &mut [UiNode]) {
-    if let [button] = buttons
-        && let UiContent::Button(control) = &button.content
-    {
-        let label = control
-            .spec
-            .visual_label
-            .clone()
-            .unwrap_or_else(|| control.spec.label.clone());
-        button.layout.width = Length::Fixed(page_button_width(&label, f32::INFINITY));
-    }
-}
-
 /// The block itself.
 fn macos_access_card(access: &MacosAccess, lead: AccessLead, text_width: f32) -> UiNode {
     let line_height = 24.0_f32.max(20.0 * settings_text_scale());
-    let heading_height = 28.0_f32.max(22.0 * settings_text_scale());
     let copy = macos_access_copy(access);
     let line = |line: MacosAccessLine| macos_access_line_node(line, text_width, line_height);
     let (above, below) = macos_access_rows(&copy, access, lead);
-    let mut children = vec![
-        UiNode::new(
-            "settings/macos-access/heading",
-            UiContent::Text(TextSpec {
-                text: "MACOS ACCESS".to_string(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(heading_height))),
-    ];
+    let mut children =
+        vec![access_card_heading(MACOS_ACCESS_HEADING, "MACOS ACCESS", text_width).0];
     children.extend(above.into_iter().map(line));
     let rows = macos_access_action_rows(access, text_width);
     let actions_height = macos_access_actions_height(access, text_width);
@@ -29193,12 +30867,12 @@ fn macos_access_card(access: &MacosAccess, lead: AccessLead, text_width: f32) ->
             Layout::column()
                 .width(Length::Fill)
                 .height(Length::Fixed(actions_height))
-                .gap(8.0),
+                .gap(MACOS_ACCESS_BUTTON_GAP),
         )
         .children(
             rows.into_iter()
                 .enumerate()
-                .map(|(index, row)| {
+                .map(|(index, (row, height))| {
                     UiNode::new(
                         format!("settings/macos-access/actions/row-{index}"),
                         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -29206,8 +30880,8 @@ fn macos_access_card(access: &MacosAccess, lead: AccessLead, text_width: f32) ->
                     .layout(
                         Layout::row()
                             .width(Length::Fill)
-                            .height(Length::Fixed(scaled_control_height()))
-                            .gap(8.0),
+                            .height(Length::Fixed(height))
+                            .gap(MACOS_ACCESS_BUTTON_GAP),
                     )
                     .children(row)
                 })
@@ -29218,31 +30892,10 @@ fn macos_access_card(access: &MacosAccess, lead: AccessLead, text_width: f32) ->
     children.extend(below.into_iter().map(line));
     // THE DEBUGGER ROW, the Full Disk Access row's peer (debugger design §3.3).
     children.extend(debugger_row_lines(&copy.debugger).into_iter().map(line));
-    if let Some(button) = copy.debugger.button {
-        children.push(
-            UiNode::new(
-                "settings/macos-access/debugger/actions",
-                UiContent::Group(GroupSpec::new("Debugger access actions")),
-            )
-            .layout(
-                Layout::row()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(scaled_control_height()))
-                    .gap(8.0),
-            )
-            .children({
-                let mut buttons = vec![macos_access_button(
-                    button.action(),
-                    button.label(),
-                    button.enabled,
-                    button.busy,
-                )];
-                lone_button_width(&mut buttons);
-                buttons
-            }),
-        );
+    if let Some((actions, _)) = debugger_access_actions(&copy, text_width) {
+        children.push(actions);
     }
-    // The Developer Tools list is the DEVELOPER TOOLS card's, above this one
+    // The Developer Tools list is the Developer Tools card's, above this one
     // ([`devtools_card`]).
     UiNode::new(
         "settings/macos-access",
@@ -29938,6 +31591,55 @@ fn finished_setting_row(
     shared_reason: Option<&str>,
     control_width: Option<f32>,
 ) -> FinishedRow {
+    let finished = finished_setting_row_as(
+        state,
+        index,
+        field,
+        modified_only,
+        (width, text_width),
+        note,
+        shared_reason,
+        control_width,
+        false,
+    );
+    // A row laid on one line because the list is shorter than its stack
+    // ([`large_text_rows_stack`]) stays so only where that line — the row
+    // itself, its note listed after it — is whole in the list: one taller
+    // (its name on lines of their own beside the control: Ai's Machine and
+    // Fleet rows, 190pt in a 100pt list) stacks after all, its name and its
+    // control each whole on a screen.
+    match rows_too_tall_to_stack() {
+        Some(room) if !finished.stacked && fixed_height(&finished.split(room).0) > room + 0.01 => {
+            finished_setting_row_as(
+                state,
+                index,
+                field,
+                modified_only,
+                (width, text_width),
+                note,
+                shared_reason,
+                control_width,
+                true,
+            )
+        }
+        _ => finished,
+    }
+}
+
+/// [`finished_setting_row`], stacked (`stack`) or as its width's rule lays
+/// it out.
+#[allow(clippy::too_many_arguments)]
+fn finished_setting_row_as(
+    state: &SettingsViewState,
+    index: usize,
+    field: &EditField,
+    modified_only: bool,
+    (width, text_width): (SettingsWidth, f32),
+    note: Option<prefs::RowNote<'_>>,
+    shared_reason: Option<&str>,
+    control_width: Option<f32>,
+    stack: bool,
+) -> FinishedRow {
     let display_face = modified_only && field.key == prefs::EDIT_DISPLAY_FONT;
     let segment_need = segmented_width_need(field);
     // The row laid out one line (`inline_control`: its control's width
@@ -30016,10 +31718,10 @@ fn finished_setting_row(
         );
         (SettingRowParts { row, ..parts }, stacked)
     };
-    let mut inline_control = (width == SettingsWidth::Compact && !display_face)
+    let mut inline_control = (width == SettingsWidth::Compact && !display_face && !stack)
         .then(|| compact_inline_choice_width(field, segment_need, text_width))
         .flatten();
-    let (mut parts, mut stacked) = build(inline_control, false);
+    let (mut parts, mut stacked) = build(inline_control, stack);
     let floor = |parts: &SettingRowParts| one_line_name_floor(&parts.name);
     // ONE MEASURE FOR THE WHOLE LINE: a one-line row leaves its label its
     // floor ([`one_line_name_floor`]) beside EVERYTHING the line holds, so
@@ -30593,7 +32295,7 @@ fn compact_inline_choice_width(
         return compact_inline_control_width(&field.kind, text_width);
     };
     let scale = settings_text_scale();
-    if scale > 1.25 {
+    if large_text_rows_stack() {
         return None;
     }
     let spare = one_line_label_measure(0.0, text_width, true) - COMPACT_INLINE_LABEL_MIN;
@@ -30608,7 +32310,7 @@ fn compact_inline_choice_width(
 /// (a choice never below the slot its segments are measured against).
 fn compact_inline_control_width(kind: &EditKind, text_width: f32) -> Option<f32> {
     let scale = settings_text_scale();
-    if scale > 1.25 {
+    if large_text_rows_stack() {
         return None;
     }
     let (least, most) = match kind {
@@ -30717,9 +32419,13 @@ struct RowTagFit {
 /// narrow window or large text would cut off. The row's semantic label still
 /// says it whole.
 fn row_name_lines(name: &str, label_width: f32) -> Vec<String> {
+    use crate::tray_raster::{LinesRule, kept_lines};
     // The one measured rule every line of a setting's or a fact's words
     // keeps: whole pieces, as many to a line as its box holds.
-    wrap_to_box(name, label_width, &row_label_width)
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    kept_lines(LinesRule::RowName, face, name, px, label_width, || {
+        wrap_to_box(name, label_width, &row_label_width)
+    })
 }
 
 /// `base` and each of `tags` after it, joined by [`FACT_SEPARATOR`].
@@ -31224,24 +32930,115 @@ fn devtools_card_line_height() -> f32 {
     24.0_f32.max(20.0 * settings_text_scale())
 }
 
-/// The DEVELOPER TOOLS card's heading height: the MACOS ACCESS card's.
-fn devtools_card_heading_height() -> f32 {
-    28.0_f32.max(22.0 * settings_text_scale())
+/// The Developer Tools card's heading, as the macOS access card's is set
+/// ([`access_card_heading`]), and its height.
+fn devtools_card_heading(text_width: f32) -> (UiNode, f32) {
+    access_card_heading(
+        "settings/macos-access/devtools/heading",
+        "DEVELOPER TOOLS",
+        text_width,
+    )
 }
 
-/// What the DEVELOPER TOOLS card is allowed to be: the column its copy wraps
+/// The Developer Tools card's one button, set as the block's buttons are
+/// ([`macos_access_button_lines`]): its label's width, its words on lines
+/// where `text_width` does not hold them on one. Returns it and its height.
+fn devtools_open_button(text_width: f32) -> (UiNode, f32) {
+    let button = || {
+        macos_access_button(
+            MACOS_ACCESS_OPEN_DEVTOOLS,
+            "Open Developer Tools\u{2026}",
+            true,
+            false,
+        )
+    };
+    button_line_set(vec![button()], text_width, macos_access_button_lines())
+        .pop()
+        .and_then(|(mut line, height)| line.pop().map(|button| (button, height)))
+        .unwrap_or_else(|| (button(), scaled_control_height()))
+}
+
+/// THE CARD'S FLOOR, its least form: the state in a word or two beside the
+/// button ([`devtools_floor_state`]) where the row holds both whole, else the
+/// state named in its words over the button, each the card's whole column —
+/// never the button past the card (a fixed 306pt button in a 118pt card at
+/// 2× text in a 22-column window). The group's label carries the whole
+/// sentence for assistive technology. Returns the floor and its height, the
+/// card's padding not counted.
+fn devtools_floor(copy: &DevToolsCardCopy, text_width: f32) -> (UiNode, f32) {
+    let (button, button_height) = devtools_open_button(text_width);
+    let button_width = match button.layout.width {
+        Length::Fixed(width) => width,
+        _ => text_width,
+    };
+    let room = text_width - button_width - 8.0;
+    let state = devtools_floor_state(copy.state_short, room);
+    let beside = room > 0.0
+        && crate::native_ui::fit_native_text_label(&state, room) == state
+        && !state.is_empty();
+    let group = UiNode::new(
+        "settings/macos-access/devtools/actions",
+        UiContent::Group(GroupSpec::new(format!("Developer Tools: {}", copy.state))),
+    );
+    if beside {
+        return (
+            group
+                .layout(
+                    Layout::row()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(button_height))
+                        .gap(8.0),
+                )
+                .children(vec![
+                    UiNode::new(
+                        "settings/macos-access/devtools/state",
+                        UiContent::Text(TextSpec {
+                            text: state,
+                            role: SemanticRole::Status,
+                            style: copy.state_style,
+                        }),
+                    )
+                    .layout(
+                        Layout::default()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(button_height)),
+                    ),
+                    button,
+                ]),
+            button_height,
+        );
+    }
+    let (words, words_height) = wrapped_words_node(
+        "settings/macos-access/devtools/state",
+        &format!("Developer Tools \u{2014} {}", copy.state_short),
+        (SemanticRole::Status, copy.state_style),
+        text_width,
+        devtools_card_line_height(),
+    );
+    let height = words_height + 8.0 + button_height;
+    (
+        group
+            .layout(
+                Layout::column()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(height))
+                    .gap(8.0),
+            )
+            .children(vec![words, button]),
+        height,
+    )
+}
+
+/// What the Developer Tools card is allowed to be: the column its copy wraps
 /// to, and how many visual lines of copy it may draw. The card's sentences are
-/// the explanation the owner asked for (2026-10-15), so they WRAP rather than
-/// elide — the row they replace in the MACOS ACCESS card drew each as one
-/// 24-point line and cut most of them short — and the page charges the height
-/// they wrap to. The card is held to one screen of the list, less what it
-/// keeps in view of the MACOS ACCESS card under it
+/// its explanation, so they wrap rather than elide, and the page charges the
+/// height they wrap to. The card is held to one screen of the list, less what
+/// it keeps in view of the macOS access card under it
 /// ([`macos_access_kept_in_view`]), so the first screen shows the card whole
 /// and that block beginning: on a short window the card keeps its state line
 /// and sheds its other lines by [`devtools_card_priority`], on a tall one it
-/// says everything, and with no line to spare at all it is one row — the
-/// state beside the button — which is drawn whatever is left, being the least
-/// the card can be.
+/// says everything, and with no line to spare at all it is one row (the state
+/// beside the button), drawn whatever is left, being the least the card can be.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DevToolsCardFit {
     text_width: f32,
@@ -31275,7 +33072,10 @@ impl DevToolsCardFit {
     /// The card's own heading, button and padding come out of `height`, and
     /// what is left is counted in whole lines.
     fn within(text_width: f32, height: f32) -> Self {
-        let spare = height - devtools_card_heading_height() - scaled_control_height() - 2.0 * 12.0;
+        let spare = height
+            - devtools_card_heading(text_width).1
+            - devtools_open_button(text_width).1
+            - 2.0 * 12.0;
         Self {
             text_width,
             line_budget: (spare / devtools_card_line_height()).floor().max(0.0) as usize,
@@ -31322,7 +33122,7 @@ fn macos_access_lead(
     let gap = settings_page_gap(state, width, viewport);
     let text_width = settings_card_text_width(viewport, width);
     let room = fields_page_list_room(state, width, viewport);
-    let devtools_least = scaled_control_height() + 2.0 * 12.0;
+    let devtools_least = devtools_floor(&devtools_card_copy(access), text_width).1 + 2.0 * 12.0;
     AccessLead::ALL
         .into_iter()
         .find(|lead| {
@@ -31334,12 +33134,11 @@ fn macos_access_lead(
 
 /// Which of the card's lines a short page keeps first, after the state line
 /// (which it always keeps): how to add aterm, then the trade the owner makes
-/// by doing it, then what the list is not (the owner's own words for it,
-/// 2026-10-15, were the "Developer Tools Access" password dialog's, so the
-/// card keeps saying it is not that one before it says more), why aterm asks,
-/// where the switch is, which switch matters, the Full Disk Access pointer,
-/// the measured cost, the owner's Not now and the last opening. Lower keeps
-/// first.
+/// by doing it, then what the list is not (a person may take it for the
+/// "Developer Tools Access" password dialog, so the card says it is not that
+/// one before it says more), why aterm asks, where the switch is, which switch
+/// matters, the Full Disk Access pointer, the measured cost, the owner's Not
+/// now and the last opening. Lower keeps first.
 fn devtools_card_priority(key: &str) -> u8 {
     match key {
         "state" => 0,
@@ -31466,17 +33265,26 @@ fn devtools_floor_state(short: &str, room: f32) -> String {
     })
 }
 
-/// The state line in the floor's words on one line ([`devtools_floor_state`]), for a
-/// card whose budget seats fewer lines than the state sentence wraps to: the
+/// The state line in the floor's words ([`devtools_floor_state`]), for a card
+/// whose budget seats fewer lines than the state sentence wraps to: the
 /// sentence's verdict often comes last ("… and did not allow it."), so a sentence
-/// cut short can drop exactly the verdict, or read as good news. The group's label
-/// keeps the whole sentence for assistive technology.
+/// cut short can drop exactly the verdict, or read as good news. One line where
+/// the column holds them; else they wrap to it, never cut ("Not checked" at 2×
+/// text in a 22-column window). The group's label keeps the whole sentence for
+/// assistive technology.
 fn devtools_state_short_node(
     copy: &DevToolsCardCopy,
     text_width: f32,
     line_height: f32,
 ) -> (UiNode, f32) {
     let key = "settings/macos-access/devtools/state";
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, copy.state_style);
+    let lines = wrap_to_box(
+        &devtools_floor_state(copy.state_short, text_width),
+        text_width,
+        &|line| crate::tray_raster::ui_text_width_for(face, line, px),
+    );
+    let height = lines.len().max(1) as f32 * line_height;
     (
         UiNode::new(
             key,
@@ -31489,28 +33297,33 @@ fn devtools_state_short_node(
         .layout(
             Layout::column()
                 .width(Length::Fill)
-                .height(Length::Fixed(line_height))
+                .height(Length::Fixed(height))
                 .gap(0.0),
         )
-        .children(vec![
-            UiNode::new(
-                format!("{key}/line-0"),
-                UiContent::Text(TextSpec {
-                    text: devtools_floor_state(copy.state_short, text_width),
-                    role: SemanticRole::Status,
-                    style: copy.state_style,
-                }),
-            )
-            .layout(Layout::default().height(Length::Fixed(line_height)))
-            .paint_only(),
-        ]),
-        line_height,
+        .children(
+            lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    UiNode::new(
+                        format!("{key}/line-{index}"),
+                        UiContent::Text(TextSpec {
+                            text,
+                            role: SemanticRole::Status,
+                            style: copy.state_style,
+                        }),
+                    )
+                    .layout(Layout::default().height(Length::Fixed(line_height)))
+                    .paint_only()
+                })
+                .collect(),
+        ),
+        height,
     )
 }
 
-/// THE DEVELOPER TOOLS CARD (owner ask 2026-10-15: "make sure that there is a
-/// status screen in settings on this"), leading the Security page above MACOS
-/// ACCESS: whether aterm is on the list, why it asks, how to add it, the trade,
+/// The Developer Tools card, leading the Security page above the macOS access
+/// block: whether aterm is on the list, why it asks, how to add it, the trade,
 /// when aterm last opened the page, and *Open Developer Tools…*. Its copy wraps
 /// to `fit` and keeps what `fit`'s budget seats ([`DevToolsCardFit`]); the node
 /// and its exact height come back together, so the page charges the card it
@@ -31518,14 +33331,7 @@ fn devtools_state_short_node(
 /// [`MACOS_ACCESS_GESTURE_PREFIX`], so `act` refuses its button.
 fn devtools_card(access: &MacosAccess, fit: DevToolsCardFit) -> (UiNode, f32) {
     let line_height = devtools_card_line_height();
-    let heading_height = devtools_card_heading_height();
     let copy = devtools_card_copy(access);
-    let open = macos_access_button(
-        MACOS_ACCESS_OPEN_DEVTOOLS,
-        "Open Developer Tools\u{2026}",
-        true,
-        false,
-    );
     let card = |children: Vec<UiNode>, height: f32| {
         (
             UiNode::new(
@@ -31544,58 +33350,15 @@ fn devtools_card(access: &MacosAccess, fit: DevToolsCardFit) -> (UiNode, f32) {
         )
     };
     if fit.line_budget == 0 {
-        // THE FLOOR: no line to spare under a heading, so one row — the state in
-        // a word or two beside the button, never the sentence cut short:
-        // named ("Developer Tools — off") where that fits beside the button,
-        // else the words alone, the button naming the list. The row's label
-        // carries the whole sentence for assistive technology.
-        let mut button = open;
-        let button_width =
-            crate::native_ui::native_button_label_width("Open Developer Tools\u{2026}") + 28.0;
-        button.layout.width = Length::Fixed(button_width);
-        let row = UiNode::new(
-            "settings/macos-access/devtools/actions",
-            UiContent::Group(GroupSpec::new(format!("Developer Tools: {}", copy.state))),
-        )
-        .layout(
-            Layout::row()
-                .width(Length::Fill)
-                .height(Length::Fixed(scaled_control_height()))
-                .gap(8.0),
-        )
-        .children(vec![
-            UiNode::new(
-                "settings/macos-access/devtools/state",
-                UiContent::Text(TextSpec {
-                    text: devtools_floor_state(
-                        copy.state_short,
-                        fit.text_width - button_width - 8.0,
-                    ),
-                    role: SemanticRole::Status,
-                    style: copy.state_style,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(scaled_control_height())),
-            ),
-            button,
-        ]);
-        return card(vec![row], scaled_control_height() + 2.0 * 12.0);
+        // The floor: no line to spare under a heading, so the least the card
+        // can be ([`devtools_floor`]) — never the sentence cut short.
+        let (floor, height) = devtools_floor(&copy, fit.text_width);
+        return card(vec![floor], height + 2.0 * 12.0);
     }
-    let mut height = heading_height + scaled_control_height() + 2.0 * 12.0;
-    let mut children = vec![
-        UiNode::new(
-            "settings/macos-access/devtools/heading",
-            UiContent::Text(TextSpec {
-                text: "DEVELOPER TOOLS".to_string(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(heading_height))),
-    ];
+    let (open, open_height) = devtools_open_button(fit.text_width);
+    let (heading, heading_height) = devtools_card_heading(fit.text_width);
+    let mut height = heading_height + open_height + 2.0 * 12.0;
+    let mut children = vec![heading];
     // Wrap every line, then keep lines in priority order while the budget
     // seats the next one, and draw them in reading order: a short page shows
     // the state, then how, then the trade… never a later line in place of an
@@ -31617,7 +33380,8 @@ fn devtools_card(access: &MacosAccess, fit: DevToolsCardFit) -> (UiNode, f32) {
             let lines = (lines_height / line_height).round() as usize;
             if key == "state" && lines > fit.line_budget {
                 let (node, height) = devtools_state_short_node(&copy, fit.text_width, line_height);
-                return (key, node, height, 1, false);
+                let lines = (height / line_height).round() as usize;
+                return (key, node, height, lines, false);
             }
             (key, node, lines_height, lines, false)
         })
@@ -31639,7 +33403,7 @@ fn devtools_card(access: &MacosAccess, fit: DevToolsCardFit) -> (UiNode, f32) {
             children.push(node);
         }
     }
-    // The one button, in every form: it only opens System Settings (O14).
+    // The one button, in every form: it only opens System Settings.
     children.push(
         UiNode::new(
             "settings/macos-access/devtools/actions",
@@ -31648,7 +33412,7 @@ fn devtools_card(access: &MacosAccess, fit: DevToolsCardFit) -> (UiNode, f32) {
         .layout(
             Layout::row()
                 .width(Length::Fill)
-                .height(Length::Fixed(scaled_control_height()))
+                .height(Length::Fixed(open_height))
                 .gap(8.0),
         )
         .children(vec![open]),
@@ -31662,31 +33426,25 @@ const OVERRIDES_THEME_WORD: &str = "Overrides theme";
 
 /// The quiet Reset after a row's control: it removes the row's key from
 /// aterm.toml.
-fn setting_reset_button(field: &EditField, pending: bool) -> UiNode {
-    setting_reset_button_to(field, pending, None)
+fn setting_reset_button(field: &EditField) -> UiNode {
+    setting_reset_button_to(field, None)
 }
 
 /// [`setting_reset_button`] for a row whose removal lands on the saved
 /// theme's value (`theme`: the value and the theme's label): it reads "Use
-/// theme's" and says which value it returns to.
-fn setting_reset_button_to(
-    field: &EditField,
-    pending: bool,
-    theme: Option<&(String, String)>,
-) -> UiNode {
+/// theme's", and its name says those words and which value it returns to.
+fn setting_reset_button_to(field: &EditField, theme: Option<&(String, String)>) -> UiNode {
     let spec = match theme {
-        Some((value, label)) => ButtonSpec::new(format!(
-            "Reset {} to theme {label}'s ({value})",
-            field.label
-        ))
-        .visual_label("Use theme's"),
+        Some((value, label)) => {
+            ButtonSpec::new(format!("Use theme's {} ({label}: {value})", field.label))
+                .visual_label("Use theme's")
+        }
         None => ButtonSpec::new(format!("Reset {}", field.label)).visual_label("Reset"),
     };
     row_trailing_button(
         format!("settings/reset/{}", field.key),
         spec,
         format!("settings/reset/{}", field.key),
-        pending,
     )
 }
 
@@ -31721,16 +33479,12 @@ fn reserve_reset_slot(row: &mut UiNode, key: &str) {
     }
 }
 
-fn row_trailing_button(key: String, spec: ButtonSpec, action: String, pending: bool) -> UiNode {
+fn row_trailing_button(key: String, spec: ButtonSpec, action: String) -> UiNode {
     UiNode::new(
         key,
         UiContent::Button(
             Control::new(spec, ActionId::new(action))
-                .state(ControlState {
-                    enabled: !pending,
-                    busy: pending,
-                    ..ControlState::default()
-                })
+                .state(ControlState::default())
                 .style(StyleRef::Quiet),
         ),
     )
@@ -32038,7 +33792,6 @@ fn setting_row_parts_in(
         .last_focus
         .as_ref()
         .is_some_and(|key| key.as_str() == format!("settings/control/{}", field.key));
-    let pending = state.config_key_pending(field.key);
     // A color draft that is not a hex color (nor, for the trail color, the
     // cursor's color by its word) is marked where it is typed.
     let invalid = field.kind == EditKind::Color
@@ -32047,14 +33800,12 @@ fn setting_row_parts_in(
             !draft.is_empty() && !prefs::color_value_is_valid(field.key, draft)
         });
     let control_state = ControlState {
-        enabled: !pending,
         focused,
         invalid: invalid
             || field_error.is_some()
             || state.font_refusal(field.key).is_some_and(|refusal| {
                 refusal.reason == crate::native_font_catalog::FontRefusalReason::NotFound
             }),
-        busy: pending,
         // What it sets does nothing for now — it waits on another setting, or
         // has no effect here: it paints quiet, and still works.
         muted: setting_effect.idle(),
@@ -32227,11 +33978,18 @@ fn setting_row_parts_in(
                         })
                 })
                 .flatten();
+            // An unset field says what it stands for; a path's default, by
+            // the path (`~/.config/aterm/ai-fleet.toml`), whole in its value.
+            let (placeholder, default_path) = field_placeholder(state, field);
+            let semantic_text = match default_path {
+                Some(path) if field_text.trim().is_empty() => path,
+                _ => semantic_text,
+            };
             UiContent::TextField(
                 Control::new(
                     TextFieldSpec {
                         label: semantic_field_label.clone(),
-                        placeholder: Some(field.placeholder.clone()),
+                        placeholder: Some(placeholder),
                         secret: false,
                         visual_value: Some(field_text),
                         input: editing_input
@@ -32361,10 +34119,9 @@ fn setting_row_parts_in(
                 format!("settings/draft-discard/{}", field.key),
                 ButtonSpec::new("Discard Draft").visual_label("Discard"),
                 format!("settings/drafts/discard/{}", field.key),
-                pending,
             )
         } else {
-            setting_reset_button_to(field, pending, theme_fallback.as_ref())
+            setting_reset_button_to(field, theme_fallback.as_ref())
         })
     } else if reserve_reset_slot {
         // The Reset's place, kept while the row has none, so the control
@@ -32455,6 +34212,31 @@ fn setting_row_parts_in(
     }
 }
 
+/// The words an unset text field shows, and, where they are a path, that
+/// path whole for its accessible value. The fleet document's default is the
+/// file `ai-fleet.toml` beside aterm.toml: by its path where Settings knows
+/// where aterm.toml is (the field fits a path keeping its file's name,
+/// [`crate::native_ui::path_forms`]), else in those words. It used to say
+/// "ai-fleet.toml beside aterm.toml" in every field, which a narrow field
+/// could only cut to "ai-fleet.toml…".
+fn field_placeholder(state: &SettingsViewState, field: &EditField) -> (String, Option<String>) {
+    if field.key == prefs::EDIT_AI_FLEET
+        && let Some((path, shown)) = state.config_file.as_ref()
+        && let Some(dir) = path.parent()
+    {
+        // aterm.toml's folder as Settings shows it, its own separator kept
+        // (`C:\…\aterm\` on Windows).
+        let folder = &shown[..crate::native_ui::path_name_start(shown)];
+        let painted = format!("{folder}{}", aterm_agent::ai::config::FLEET_FILE);
+        let spoken = dir
+            .join(aterm_agent::ai::config::FLEET_FILE)
+            .display()
+            .to_string();
+        return (painted, Some(spoken));
+    }
+    (field.placeholder.clone(), None)
+}
+
 /// Fit a stacked row's choice button label to the row's `max_width` while
 /// its semantic label and value stay complete. Doing this before compilation
 /// distinguishes deliberate responsive copy from an accidental painter
@@ -32489,16 +34271,33 @@ fn fit_row_choice_label(row: &mut UiNode, max_width: f32) {
         .visual_label
         .clone()
         .unwrap_or_else(|| button.spec.label.clone());
-    // THE CHOICE KEEPS ITS WORDS (one measured ladder, the room the painter
-    // fits to: the button's lead, its trailing arrow and whatever its end
-    // wears — a colour chip, a badge): the whole choice; else the choice
-    // without its "(default)", which the row's absent Reset says; else, the
-    // arrow given up (the button still opens what it opens), each of those
-    // again; else, where the button wears the colour it names, that colour
-    // alone, its chip; only then the choice cut to the room. A stacked colour
-    // row at 22 columns painted "Automatic (default)" as "Auto…" beside room
-    // for "Automatic"; AI CLIs' "Claude (default)" read "Claude (…" at 2×.
-    // The semantic label and value remain complete.
+    let lines = choice_words(&mut button.spec, &complete, max_width);
+    let single = scaled_control_height();
+    let grow = crate::native_ui::native_button_height_for_lines(lines, single) - single;
+    if grow > 0.0 {
+        grow_row(row, grow);
+    }
+}
+
+/// THE CHOICE KEEPS ITS WORDS — one measured ladder for a button that shows
+/// a choice (`complete`, its words), in the room the painter fits a button
+/// `max_width` wide to (its lead, its trailing arrow and whatever its end
+/// wears — a colour chip, a badge): the whole choice; else the choice
+/// without its "(default)", which the row's absent Reset says; else, the
+/// arrow given up (the button still opens what it opens), each of those
+/// again; else, where the button wears the colour it names, that colour
+/// alone, its chip; else the choice's words on as many lines as the button
+/// needs, whole, the arrow kept where they are whole beside it and given up
+/// where only that keeps them whole ([`whole_button_words_in`]); and only
+/// where a word is wider than the whole button, broken with a hyphen in it,
+/// the arrow given up ([`button_words_in`]) — never cut. A stacked colour row
+/// at 22 columns painted "Automatic (default)" as "Auto…" beside room for
+/// "Automatic"; AI CLIs' "Claude (default)" read "Claude (…" at 2×, a font
+/// row "Automatic (S…" at 22 columns and the theme "Def…"; and Home's "More
+/// styles…" broke "styl-" / "es…" beside an arrow whose room held it whole.
+/// The semantic label and value remain complete. Sets the painted words on
+/// `spec` and returns how many lines they take.
+fn choice_words(spec: &mut ButtonSpec, complete: &str, max_width: f32) -> usize {
     let fits = |spec: &ButtonSpec, words: &str| {
         crate::native_ui::native_button_label_width(words)
             <= crate::native_ui::text_button_label_room(spec, max_width)
@@ -32508,28 +34307,47 @@ fn fit_row_choice_label(row: &mut UiNode, max_width: f32) {
         .strip_suffix(" (default)")
         .filter(|bare| !bare.is_empty())
         .map(str::to_string);
-    let forms: Vec<String> = std::iter::once(complete.clone()).chain(bare).collect();
-    if let Some(words) = forms.iter().find(|words| fits(&button.spec, words)) {
-        button.spec.visual_label = Some(words.clone());
-        return;
+    let forms: Vec<String> = std::iter::once(complete.to_string()).chain(bare).collect();
+    if let Some(words) = forms.iter().find(|words| fits(spec, words)) {
+        spec.visual_label = Some(words.clone());
+        return 1;
     }
-    if button.spec.trailing_icon.is_some() {
-        let mut bare_spec = button.spec.clone();
+    if spec.trailing_icon.is_some() {
+        let mut bare_spec = spec.clone();
         bare_spec.trailing_icon = None;
         if let Some(words) = forms.iter().find(|words| fits(&bare_spec, words)) {
-            button.spec.trailing_icon = None;
-            button.spec.visual_label = Some(words.clone());
-            return;
+            spec.trailing_icon = None;
+            spec.visual_label = Some(words.clone());
+            return 1;
         }
     }
-    if button.spec.chip.is_some() {
-        button.spec.visual_label = Some(String::new());
-        return;
+    if spec.chip.is_some() {
+        spec.visual_label = Some(String::new());
+        return 1;
     }
-    button.spec.visual_label = Some(crate::native_ui::fit_native_button_label(
-        forms.last().unwrap_or(&complete),
-        crate::native_ui::text_button_label_room(&button.spec, max_width),
-    ));
+    let short = forms[1..].iter().map(String::as_str).collect::<Vec<_>>();
+    if let Some((words, lines)) = whole_button_words_in(spec, complete, &short, max_width) {
+        spec.visual_label = Some(words);
+        return lines;
+    }
+    spec.trailing_icon = None;
+    let (words, lines) = button_words_in(spec, complete, &short, max_width);
+    spec.visual_label = Some(words);
+    lines
+}
+
+/// `row` (a setting's row, its control line under or beside its name) taller
+/// by `grow`: its control line takes it, as the row's other lines keep their
+/// heights.
+fn grow_row(row: &mut UiNode, grow: f32) {
+    if let Length::Fixed(height) = row.layout.height {
+        row.layout.height = Length::Fixed(height + grow);
+    }
+    if let Some(controls) = row.children.get_mut(1)
+        && let Length::Fixed(height) = controls.layout.height
+    {
+        controls.layout.height = Length::Fixed(height + grow);
+    }
 }
 
 /// A row's text field shows its placeholder fitted to the width the row
@@ -32539,7 +34357,8 @@ fn fit_row_choice_label(row: &mut UiNode, max_width: f32) {
 /// so "Automatic (default)" reads "Automatic" in a narrow field instead of
 /// being cut mid-glyph; the semantic value keeps the whole words.
 fn fit_row_field_placeholder(row: &mut UiNode, text_width: f32) {
-    fn fit(node: &mut UiNode, room: f32) -> bool {
+    // How many more lines than one the placeholder takes, and how tall one is.
+    fn fit(node: &mut UiNode, room: f32) -> Option<usize> {
         let siblings: f32 = node
             .children
             .iter()
@@ -32557,22 +34376,123 @@ fn fit_row_field_placeholder(row: &mut UiNode, text_width: f32) {
                     Length::Fixed(width) => width,
                     _ => room - siblings,
                 };
+                let swatch = field.spec.swatch.is_some();
+                let mut extra = 0;
                 if let Some(placeholder) = field.spec.placeholder.as_mut() {
-                    *placeholder = crate::native_ui::fit_native_field_placeholder(
-                        placeholder,
-                        width,
-                        field.spec.swatch.is_some(),
-                    );
+                    let fitted =
+                        crate::native_ui::fit_native_field_placeholder(placeholder, width, swatch);
+                    // WHERE NO ONE-LINE FORM KEEPS ITS WORDS WHOLE (a colour
+                    // field at 2× text in a 22-column window: "The…",
+                    // "Automa…"), its plain words go on lines of the field, a
+                    // word wider than it broken with a hyphen
+                    // ([`wrap_to_box`]), never cut; the row is as much taller.
+                    let plain = crate::native_ui::plain_placeholder(placeholder);
+                    // A path's ellipsis stands for whole folders
+                    // ([`crate::native_ui::path_forms`]); only its file's name
+                    // cut inside itself is a cut.
+                    let path = crate::native_ui::reads_as_path(placeholder);
+                    let cut_inside_a_word = if path {
+                        fitted.ends_with('\u{2026}')
+                    } else {
+                        fitted.strip_suffix('\u{2026}').is_some_and(|stem| {
+                            !plain
+                                .strip_prefix(stem)
+                                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                        })
+                    };
+                    if cut_inside_a_word {
+                        let px = crate::native_ui::native_type_px(
+                            crate::type_scale::TypeStep::Secondary,
+                        )
+                        .get();
+                        let room = crate::native_ui::field_placeholder_room(width, swatch);
+                        let measure = |line: &str| crate::tray_raster::ui_text_width(line, px);
+                        let lines = if path {
+                            path_placeholder_lines(placeholder, room, &measure)
+                        } else {
+                            word_placeholder_lines(&plain, room, &measure)
+                        };
+                        extra = lines.len().saturating_sub(1);
+                        *placeholder = lines.join("\n");
+                    } else {
+                        *placeholder = fitted;
+                    }
                 }
-                return true;
+                return Some(extra);
             }
-            if fit(child, room) {
-                return true;
+            if let Some(extra) = fit(child, room) {
+                return Some(extra);
             }
         }
-        false
+        None
     }
-    fit(row, text_width);
+    if let Some(extra) = fit(row, text_width).filter(|extra| *extra > 0) {
+        grow_row(
+            row,
+            extra as f32 * crate::native_ui::native_button_line_height(),
+        );
+    }
+}
+
+/// A PATH PLACEHOLDER ON LINES KEEPS ITS FIELD A FIELD: the longest of its
+/// forms two lines of `room` hold — the whole path, then whole folders
+/// either side of "…" ([`crate::native_ui::path_forms`]) — broken at its
+/// folders ([`wrap_to_box`]); else "…" and its file's name, on the lines
+/// that takes. Its every folder on lines made the fleet document's field
+/// 691pt tall in a 268pt list at 2× text in a 22-column window, whole on no
+/// screen, for a config folder with a long path. The field's value still
+/// says the whole path.
+fn path_placeholder_lines(path: &str, room: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
+    let start = crate::native_ui::path_name_start(path);
+    let tail = format!(
+        "{}{}",
+        crate::native_ui::TEXT_FIELD_ELLIPSIS,
+        &path[start.saturating_sub(1)..]
+    );
+    std::iter::once(path.to_string())
+        .chain(
+            crate::native_ui::path_forms(path)
+                .into_iter()
+                .map(|(form, _, _)| form),
+        )
+        .map(|form| wrap_to_box(&form, room, measure))
+        .find(|lines| lines.len() <= 2)
+        .unwrap_or_else(|| wrap_to_box(&tail, room, measure))
+}
+
+/// WORDS ON LINES KEEP THEIR FIELD A FIELD, as a path does
+/// ([`path_placeholder_lines`]): the words whole on the lines `room` gives
+/// them where two hold them, else the most leading whole words two lines
+/// hold with "…" saying more follows, else three. The fleet document's
+/// "ai-fleet.toml beside aterm.toml" (its words where Settings does not know
+/// aterm.toml's folder) took five lines at 2× text in a 22-column window on
+/// macOS and six in the Linux lane's Noto Sans, a field taller than the
+/// 348-pt window's list, whole on no screen; it now reads "ai-" /
+/// "fleet.toml" / "beside…". The field's semantic value keeps every word.
+fn word_placeholder_lines(plain: &str, room: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
+    let whole = wrap_to_box(plain, room, measure);
+    let words: Vec<&str> = plain.split_whitespace().collect();
+    for most in [2, 3] {
+        if whole.len() <= most {
+            return whole;
+        }
+        let led = (1..words.len()).rev().find_map(|n| {
+            let lines = wrap_to_box(
+                &format!(
+                    "{}{}",
+                    words[..n].join(" "),
+                    crate::native_ui::TEXT_FIELD_ELLIPSIS
+                ),
+                room,
+                measure,
+            );
+            (lines.len() <= most).then_some(lines)
+        });
+        if let Some(lines) = led {
+            return lines;
+        }
+    }
+    whole
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32778,15 +34698,6 @@ fn bounded_numeric_disclosure(
 /// stays the number.
 fn slider_readout(key: &str, numeric: f64, shown: String) -> String {
     prefs::numeric_reading(key, numeric, &shown).unwrap_or(shown)
-}
-
-/// How a focused slider's key moves it ([`SettingsApp::reduce_slider_move`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SliderMove {
-    /// `delta` steps, ten each where `big`.
-    Step { delta: isize, big: bool },
-    /// To its domain's first end (`home`) or last.
-    Edge { home: bool },
 }
 
 /// THE VALUES A NUMERIC ROW MAY HOLD, the one domain its keys, its drag,
@@ -33230,8 +35141,24 @@ fn about_page(
             px,
         ) <= short_column
     };
-    let short_compact =
-        width == SettingsWidth::Compact && full_hero_height > room + 0.01 && version_fits_short;
+    // The short hero's row, wordmark beside its words, is one stop the
+    // list cannot cut between them: it is taken only where it fits the room
+    // whole. Taller (its words beside the wordmark on five lines at 2× text
+    // in a 102x12 window, 126pt in a 100pt list), it was cut on every
+    // screen; the full hero is listed a row at a time and split where it
+    // outgrows the room ([`scroll::SplitCard`]).
+    let short_fits = {
+        let tagline = tagline_in(short_column).map_or(0.0, |(_, height)| height);
+        let byline = byline_in(short_column).map_or(0.0, |_| capability_height);
+        let lines = usize::from(tagline > 0.0) + 1 + usize::from(byline > 0.0);
+        let words =
+            tagline + version_in(short_column).1 + byline + lines.saturating_sub(1) as f32 * 4.0;
+        wordmark_base_height.max(words) + hero_vertical_padding * 2.0 <= room + 0.01
+    };
+    let short_compact = width == SettingsWidth::Compact
+        && full_hero_height > room + 0.01
+        && version_fits_short
+        && short_fits;
     let text_column = if short_compact {
         short_column
     } else {
@@ -33565,60 +35492,28 @@ fn metadata_value_text_width(text: &str, px: f32, code: bool) -> f32 {
 /// taller than a screen is listed a part at a time by the page's list.
 const MAX_METADATA_VALUE_LINES: usize = 64;
 
-/// THE PIECES A LINE OF WORDS BREAKS BETWEEN, `(joiner, piece)` each: its
-/// words (joined by a space), and inside a word after a `/` (a path wraps at
-/// its folders instead of losing its end) or a `-` (`aarch64-` /
-/// `apple-darwin`), as a setting's name breaks ([`row_name_lines`]). A fact
-/// separator (` · `) stays with the word before it, so no line starts with
-/// one.
+/// THE PIECES A LINE OF WORDS BREAKS BETWEEN, `(joiner, piece)` each, at
+/// every place a line of it may break ([`aterm_grapheme::pieces`], the one
+/// cut every wrap of aterm's chrome lays its lines from): its words (joined
+/// by a space); between CJK characters, kinsoku kept (joined by nothing);
+/// and inside a word after a `/` (a path wraps at its folders instead of
+/// losing its end) or a `-` (`aarch64-` / `apple-darwin`), as a setting's
+/// name breaks ([`row_name_lines`]). A fact separator (` · `) stays with the
+/// piece before it, so no line starts with one.
 fn line_pieces(text: &str) -> Vec<(&str, &str)> {
-    // Each word's byte range, in order.
-    let mut words: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut start = None;
-    for (at, c) in text.char_indices() {
-        match (c.is_whitespace(), start) {
-            (true, Some(from)) => {
-                words.push(from..at);
-                start = None;
-            }
-            (false, None) => start = Some(at),
-            _ => {}
-        }
-    }
-    if let Some(from) = start {
-        words.push(from..text.len());
-    }
     let separator = FACT_SEPARATOR.trim();
     let mut pieces: Vec<(&str, &str)> = Vec::new();
-    // The byte range the last piece covers, so a separator can join it.
-    let mut last: Option<std::ops::Range<usize>> = None;
-    for word in words {
-        if &text[word.clone()] == separator
-            && let (Some(range), Some(piece)) = (last.as_mut(), pieces.last_mut())
+    // Where the last piece starts, so a separator can join it.
+    let mut last = 0;
+    for piece in aterm_grapheme::pieces(text, |_| true) {
+        if piece.text == separator
+            && let Some(joined) = pieces.last_mut()
         {
-            range.end = word.end;
-            piece.1 = &text[range.clone()];
+            joined.1 = &text[last..piece.at + piece.text.len()];
             continue;
         }
-        let mut joiner = if pieces.is_empty() { "" } else { " " };
-        let mut from = word.start;
-        // After a `/` or a `-` that another character follows, but not
-        // inside a run of them (`https://`, `--columns`).
-        let chars = text[word.clone()].char_indices().collect::<Vec<_>>();
-        let breaks = chars
-            .windows(2)
-            .filter(|pair| {
-                let ((_, mark), (_, next)) = (pair[0], pair[1]);
-                matches!(mark, '/' | '-') && mark != next && !matches!(next, '/' | '-')
-            })
-            .map(|pair| word.start + pair[1].0)
-            .collect::<Vec<_>>();
-        for to in breaks.into_iter().chain([word.end]) {
-            pieces.push((joiner, &text[from..to]));
-            last = Some(from..to);
-            from = to;
-            joiner = "";
-        }
+        pieces.push((if piece.spaced { " " } else { "" }, piece.text));
+        last = piece.at;
     }
     pieces
 }
@@ -33642,9 +35537,27 @@ fn wrap_to_box_marked(
     measure: &dyn Fn(&str) -> f32,
     mark: &str,
 ) -> Vec<String> {
+    wrap_to_box_from(text, width, measure, mark)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// [`wrap_to_box_marked`]'s lines, each with the byte of `text` it starts
+/// at: what a caller that keeps some lines and says the rest another way
+/// takes the rest from (a CJK line goes on with no space between).
+fn wrap_to_box_from(
+    text: &str,
+    width: f32,
+    measure: &dyn Fn(&str) -> f32,
+    mark: &str,
+) -> Vec<(usize, String)> {
     let fits = |line: &str| measure(line) <= width + crate::native_ui::TEXT_FIT_SLACK;
-    let mut lines: Vec<String> = Vec::new();
+    // Every piece is a slice of `text`: where it starts.
+    let at = |piece: &str| piece.as_ptr() as usize - text.as_ptr() as usize;
+    let mut lines: Vec<(usize, String)> = Vec::new();
     let mut line = String::new();
+    let mut line_at = 0;
     for (joiner, piece) in line_pieces(text) {
         let candidate = if line.is_empty() {
             piece.to_string()
@@ -33652,14 +35565,18 @@ fn wrap_to_box_marked(
             format!("{line}{joiner}{piece}")
         };
         if fits(&candidate) {
+            if line.is_empty() {
+                line_at = at(piece);
+            }
             line = candidate;
             continue;
         }
         if !line.is_empty() {
-            lines.push(std::mem::take(&mut line));
+            lines.push((line_at, std::mem::take(&mut line)));
         }
         if fits(piece) {
             line = piece.to_string();
+            line_at = at(piece);
             continue;
         }
         // A piece wider than the whole box breaks inside itself, grapheme
@@ -33692,16 +35609,16 @@ fn wrap_to_box_marked(
                 }
             }
         }
-        let tail = chunks.pop().expect("one chunk").concat();
-        lines.extend(
-            chunks
-                .into_iter()
-                .map(|chunk| format!("{}{mark}", chunk.concat())),
-        );
-        line = tail;
+        let tail = chunks.pop().expect("one chunk");
+        lines.extend(chunks.into_iter().map(|chunk| {
+            let start = chunk.first().map_or(at(piece), |grapheme| at(grapheme));
+            (start, format!("{}{mark}", chunk.concat()))
+        }));
+        line_at = tail.first().map_or(at(piece), |grapheme| at(grapheme));
+        line = tail.concat();
     }
     if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
+        lines.push((line_at, line));
     }
     lines
 }
@@ -33879,6 +35796,13 @@ fn caption_node(key: &str, text: &str, width: f32) -> (UiNode, f32) {
 /// text node keyed `key`; more are a group of that key, in that role, that
 /// says the whole text, its lines paint-only under it. Returns the node and
 /// its height.
+///
+/// THE GROUP PAINTS NOTHING OF ITS OWN: its lines carry the type's style,
+/// and the group is [`StyleRef::Plain`]. It used to wear the lines' style,
+/// and a group in a card's style is painted as a card: every wrapped line
+/// of Primary words (Packages' "No package activity recorded yet." at 2×)
+/// stood in an accent-ringed box of its own, its words against the ring,
+/// and a box per piece where a screen took it a part at a time.
 fn wrapped_words_node(
     key: &str,
     text: &str,
@@ -33908,7 +35832,7 @@ fn wrapped_words_node(
             UiContent::Group(GroupSpec {
                 label: Some(text.to_string()),
                 role,
-                style,
+                style: StyleRef::Plain,
             }),
         )
         .layout(Layout::column().height(Length::Fixed(height)))
@@ -34088,11 +36012,9 @@ fn wrap_native_lines(lines: &[String], max_width: f32, px: f32) -> Vec<String> {
             wrapped.push(String::new());
             continue;
         }
-        wrapped.extend(
-            crate::tray_raster::ui_text_wrap_ranges(source, px, max_width)
-                .into_iter()
-                .map(|range| source[range].to_string()),
-        );
+        // Each line without its trailing space, a word wider than the box
+        // broken as a label's is ([`copy_paragraph_lines`]).
+        wrapped.extend(copy_paragraph_lines(source, px, max_width));
     }
     wrapped
 }
@@ -34178,17 +36100,15 @@ fn update_release_notes_card(update: &UpdateProjection, room: f32, text_width: f
     .children(children)
 }
 
-/// "The engine has tried this stage and it did not work" — the state every compact
-/// rung of the page must refuse to call "Ready".
+/// The engine tried this stage and it did not work: the state no compact rung of
+/// the page may call "Ready".
 ///
-/// TWO CARRIERS, BOTH REQUIRED. [`UpdateProjection::apply_trouble`] is the precise
-/// one — it names the artifact, the count and the cause, and it speaks from the
-/// FIRST failure, which is the window the page used to spend saying "Ready".
-/// `apply_is_failing` is the ESCALATION streak, which cannot name an artifact and
-/// therefore survives a ledger this build cannot pin to the stage on offer (an
-/// upgrade from before `apply_failure_build` existed). Keying on the precise one
-/// alone would have made a loudly-failing lane read as ready again on exactly those
-/// machines — the old bug, relocated.
+/// Two carriers, both required. [`UpdateProjection::apply_trouble`] is precise (it
+/// names the artifact, the count and the cause) from the first failure.
+/// `apply_is_failing` is the escalation streak, which cannot name an artifact and
+/// so survives a ledger this build cannot pin to the stage on offer (one from
+/// before `apply_failure_build`). Keying on the precise one alone would read a
+/// failing lane as ready on those machines.
 fn not_applying(update: &UpdateProjection) -> bool {
     update.apply_trouble.is_some() || (update.staged.is_some() && update.apply_is_failing)
 }
@@ -34241,22 +36161,21 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
     } else if update.failing_persistent {
         "Failing".to_string()
     } else if update.dev_build {
-        // Left alone on purpose (gap #30): the headline says where it stands.
+        // Left alone on purpose: the headline says where it stands.
         "Dev build".to_string()
     } else if update.installable.cannot_install() {
         // Not "Current": nothing was compared, and this copy could not take a newer
-        // build if one existed (2026-08-19 round-6 audit).
+        // build if one existed.
         "Can\u{2019}t update".to_string()
     } else if update.channel_unreadable {
-        // The stranded verdict: not "Current" — the channel cannot be read, so no
-        // comparison ever happened and none ever will until an operator acts.
+        // Not "Current": the channel cannot be read, so no comparison ran and none
+        // will until an operator acts.
         "Can\u{2019}t check".to_string()
     } else if !update.enabled {
         "No updater".to_string()
     } else if !update.automatic_checks {
-        // Not "Current": nothing in this process checks by itself, so the claim would be
-        // about a check that is not running — the full headline's "Automatic checks are
-        // off." (2026-09-24 post-push review). Every trouble arm above outranks it.
+        // Not "Current": nothing in this process checks by itself (the full
+        // headline's "Automatic checks are off."). Every trouble arm above outranks it.
         "Checks off".to_string()
     } else {
         "Current".to_string()
@@ -34283,9 +36202,8 @@ pub(crate) fn compact_update_detail(update: &UpdateProjection) -> String {
             crate::update_words::NEWER_RELEASE_REPLACES
         )
     } else if not_applying(update) {
-        // Escalated, but the ledger cannot pin the streak to THIS artifact (see
-        // `UpdateState::apply_failure_build`): no count, no cause, but still not
-        // "Ready to install."
+        // Escalated, but the ledger cannot pin the streak to this artifact (see
+        // `UpdateState::apply_failure_build`): no count or cause, yet not "Ready".
         "Downloaded, but it keeps failing to install.".to_string()
     } else if update.staged.is_some() && update.failing_persistent {
         "Ready to install; update checks are failing.".to_string()
@@ -34326,8 +36244,8 @@ pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String
         .to_string();
     }
     if let Some(trouble) = update.apply_trouble.as_ref().filter(|_| !update.checking) {
-        // The tersest rung keeps the COUNT rather than a mood word: "2 tries failed"
-        // is the one fact that separates this from a stage waiting its turn.
+        // The tersest rung keeps the count ("2 tries failed"): the one fact that
+        // separates this from a stage waiting its turn.
         return trouble.micro();
     }
     if update.checking {
@@ -34396,8 +36314,7 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
     } else if update.staged.is_some() {
         "Ready"
     } else if update.failing_persistent {
-        // Beside the Danger "Failing" headline; "None staged" there read as a
-        // second, contradicting verdict (2026-08-19 audit).
+        // Beside the Danger "Failing" headline; "None staged" would contradict it.
         "Checks failing"
     } else if update.dev_build {
         // Beside the "Dev build" headline: why nothing moves it, not the same words.
@@ -34405,12 +36322,12 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
     } else if update.installable.cannot_install() {
         "Needs an installed copy"
     } else if update.channel_unreadable {
-        // Beside "Can't check"; "Up to date" there claimed a comparison that never ran.
+        // Beside "Can't check"; "Up to date" would claim a comparison that never ran.
         "Channel unreadable"
     } else if !update.enabled {
         "Unavailable"
     } else if !update.automatic_checks {
-        // Beside "Checks off" (2026-09-24 post-push review).
+        // Beside "Checks off".
         "Manual checks"
     } else {
         "Up to date"
@@ -34826,11 +36743,8 @@ fn compact_update_detail_line(update: &UpdateProjection, width: f32) -> Option<(
 /// push the two controls off the page again.
 const MAX_UPDATE_OUTCOME_LINES: usize = 3;
 
-/// Bound wrapped outcome prose to [`MAX_UPDATE_OUTCOME_LINES`], eliding the
-/// last retained line so the appended ellipsis still FITS the wrap measure.
-/// Pushing '\u{2026}' onto a line the wrapper had already packed to
-/// `max_width` put the final line fractionally past its box — a real painted
-/// overflow the renderer audit measures (desktop Update page, 2026-08).
+/// Bound wrapped outcome prose to [`MAX_UPDATE_OUTCOME_LINES`], eliding the last kept
+/// line so the appended ellipsis still fits the wrap measure.
 fn bound_outcome_lines(lines: &mut Vec<String>, max_width: f32) {
     bound_update_lines(lines, max_width, MAX_UPDATE_OUTCOME_LINES);
 }
@@ -34861,15 +36775,9 @@ fn bound_update_lines(lines: &mut Vec<String>, max_width: f32, max_lines: usize)
     }
 }
 
-/// The outcome card's own padding: the ONE place the value is written, read
-/// both by the card's layout and by the measure its prose wraps to.
-///
-/// Splitting those two readings is exactly how the wrapper came to pack a line
-/// wider than the box the painter hands it: the card was authored with a fixed
-/// 16pt inset but wrapped to the RELEASE-NOTES card's measure, and
-/// [`update_release_notes_padding`] narrows to 14pt above 1.25× text. Identical
-/// at 1×, four points apart at 2× — a greedy line could then land in the gap
-/// and paint past its own edge (2× short-landscape Update page, 2026-08).
+/// The outcome card's own padding, written once and read by both the card's layout
+/// and the measure its prose wraps to, so a wrapped line cannot exceed its box (not
+/// [`update_release_notes_padding`], which narrows above 1.25× text).
 const COMPACT_UPDATE_OUTCOME_PADDING: f32 = 16.0;
 
 /// The text measure this card's own box leaves, derived from the card width the
@@ -34879,16 +36787,12 @@ fn compact_update_outcome_text_width(card_width: f32) -> f32 {
     (card_width - COMPACT_UPDATE_OUTCOME_PADDING * 2.0).max(0.0)
 }
 
-/// The last updater outcome as a stop of its own.
+/// The last updater outcome as a stop of its own, for the short-landscape host
+/// only, where the status card collapses to [`compact_update_summary`] with no
+/// room for a result line.
 ///
-/// Only the short-landscape host needs this: there the status card collapses to
-/// [`compact_update_summary`], which has no room for a result line, and losing
-/// the one message that explains a stalled update would be the worst possible
-/// thing to drop.
-///
-/// Takes the CARD width, not a pre-subtracted text measure: the padding it
-/// wraps to has to be the padding it paints with, and only this function knows
-/// that inset.
+/// Takes the card width, not a text measure: the padding it wraps to must be the
+/// padding it paints with.
 fn compact_update_outcome(update: &UpdateProjection, card_width: f32) -> Option<(UiNode, f32)> {
     let display = update_outcome_line(update)?;
     let scale = settings_text_scale();
@@ -35108,12 +37012,8 @@ fn page_button_width(label: &str, room: f32) -> f32 {
         .min(room.max(0.0))
 }
 
-/// What the release-notes panel shows.
-///
-/// A staged build's own notes when there is one. Otherwise ONE honest line:
-/// this panel is now a permanent section of the page rather than something that
-/// only exists mid-update, and an empty card reads as a rendering fault instead
-/// of "nothing new".
+/// What the release-notes panel shows: a staged build's notes, else one line, since
+/// the panel is a permanent section and an empty card reads as a rendering fault.
 fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
     if update.linux_host {
         return vec!["No release notes on Linux.".to_string()];
@@ -35124,9 +37024,8 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
     vec![if update.checking {
         "Checking for a newer version\u{2026}".to_string()
     } else if let Some((_, version)) = update.staged.as_ref() {
-        // A staged build without notes (an ACTIVATION of a bundle already on disk,
-        // or a manifest that omits a changelog) is still a staged build — saying
-        // "is the latest build" under "Update ready" was a lie (2026-08-19 audit).
+        // A staged build without notes (activating a bundle already on disk, or a
+        // manifest that omits a changelog) is still staged.
         let state = if update.staged_on_hold {
             "is on hold"
         } else {
@@ -35142,10 +37041,9 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
         // cause; this card does not repeat it.
         "Release notes appear here when an update is ready.".to_string()
     } else if update.enabled && (update.channel_unreadable || update.checked_at.is_none()) {
-        // NEVER "is the newest version" without a comparison behind it: a stranded
-        // machine records zero ledger failures, so the failing_persistent arm above
-        // never catches it, and before any check completes the status card says
-        // "Not checked yet."
+        // Never "is the newest version" without a comparison behind it: a stranded
+        // machine records no ledger failures, so the arm above misses it, and before
+        // any check the status card says "Not checked yet."
         "Release notes appear here when an update is ready.".to_string()
     } else if update.enabled {
         format!(
@@ -35383,11 +37281,9 @@ fn update_status_card(
         }
         wrapped
     };
-    // On Linux the detail line already carries the outcome, verbatim (2026-09-24 merge:
-    // painted twice, the two copies plus the Settings ▸ Messages link pushed the medium
-    // workbench's status card past its section on a failed check). Only THIS card's: the
-    // short-landscape list's summary paints no detail, so its outcome stop
-    // ([`compact_update_outcome`]) is the one place the cause paints there.
+    // On Linux the detail line already carries the outcome verbatim, so this card
+    // skips it; the short-landscape list's summary paints no detail, so its outcome
+    // stop ([`compact_update_outcome`]) is where the cause paints there.
     let outcome = update_outcome_line(update).filter(|_| !update.linux_host);
     // The outcome is authored prose of unknown length. Wrap it to the card's
     // real measure, bounded, instead of painting one line off the edge — the
@@ -35480,9 +37376,8 @@ fn update_status_card(
             UiNode::new(
                 "updates/outcome",
                 UiContent::Group(GroupSpec {
-                    // The EXACT ledger string, unflattened and unprefixed:
-                    // assistive technology and `controls update` read the real
-                    // outcome, while the paint below is the bounded summary.
+                    // The exact ledger string: assistive technology and `controls
+                    // update` read the real outcome; the paint is the bounded summary.
                     label: Some(update.outcome.clone()),
                     role: SemanticRole::Status,
                     style: StyleRef::Quiet,
@@ -35512,9 +37407,9 @@ fn update_status_card(
         );
     }
     let has_action = action.is_some();
-    // The link to Settings ▸ Messages on the update chip (where every update's record
-    // is) rides beside the action where the card's measure holds both, and on a row of
-    // its own where it does not (a compact page lists it after the card: `update_page`).
+    // The link to Settings ▸ Messages (every update's record) rides beside the action
+    // where the card's measure holds both, else on its own row; a compact page lists
+    // it after the card (`update_page`).
     let compact = width == SettingsWidth::Compact;
     let link = messages_link_button("updates/messages", messages_link_width(), action_height);
     let action_width = action
@@ -35576,12 +37471,10 @@ fn update_status_card(
     )
 }
 
-/// The status card's detail sentence: the projection's own detail where it has one;
-/// otherwise the checker's state — when the last check ran, on a healthy page — and
-/// then, where the automatic-checks switch is not simply on, what it means for this
-/// process (`UpdateProjection::automatic_checks_note`). The last check comes FIRST: it
-/// is short, so no rung of the card's line budget can cut it (2026-09-24: the switch's
-/// sentence used to take the slot, and "Checked …" left the page until next launch).
+/// The status card's detail: the projection's own detail when it has one; otherwise
+/// when the last check ran, then, where automatic checks are not simply on, what that
+/// means for this process (`UpdateProjection::automatic_checks_note`). The last check
+/// comes first: it is short, so no line budget can cut it.
 fn update_status_detail(update: &UpdateProjection, width: SettingsWidth) -> String {
     if let Some(detail) = &update.detail {
         return detail.clone();
@@ -35610,17 +37503,14 @@ fn update_checked_sentence(update: &UpdateProjection) -> String {
         .map_or_else(|| "Not checked yet.".to_string(), |line| format!("{line}."))
 }
 
-/// The last updater outcome, folded to one line — ONLY where it says something the
-/// page does not. Never a healthy decision ("up to date", a build staged: the headline
-/// and the "Checked …" line say those, and its lane detail stays in `aterm ctl update
-/// status` and the log), never a check the updater retries by itself (its record is on
-/// Settings ▸ Messages), and never a cause the detail line already carries (a stranded or
-/// persistently failing machine, a staged build's trouble, a copy that cannot update).
+/// The last updater outcome as one line, only where it says something the page does
+/// not: never a healthy decision (the headline and "Checked …" line say those), never
+/// a check the updater retries by itself (its record is on Settings ▸ Messages), and
+/// never a cause the detail line already carries.
 ///
-/// A Linux page's full status card also skips it — its detail is the installed build,
-/// this outcome and the next step (`UpdateState::detail`'s Linux arm) — but that is the
-/// CARD's decision ([`update_status_card`]), not this line's: the short-landscape
-/// list's summary paints no detail, and its outcome stop is where the cause paints.
+/// A Linux page's full status card skips it (its detail carries it), but that is
+/// [`update_status_card`]'s decision: the short-landscape summary paints no detail,
+/// so its outcome stop is where the cause paints.
 fn update_outcome_line(update: &UpdateProjection) -> Option<String> {
     let outcome = update.outcome.trim();
     let routine = outcome.is_empty()
@@ -35753,17 +37643,16 @@ fn update_switch_tags(changed: bool) -> RowTags {
 /// leaves the Settings editor writes, through the same row builder every other boolean
 /// setting uses — so they inherit the switch control, the pending/busy state, the
 /// application-timing disclosure (`[update] enabled`: "Applies next launch") and the
-/// accessibility semantics for free, and cannot drift from the values the updater
-/// actually reads. Live wherever a native updater reads them — macOS, and Linux
-/// (`linux_updater`, where enrollment is a separate status fact, not this policy) —
-/// and disabled, never hidden, everywhere else. ONE card under its heading: each row
-/// on one line where the worst case fits beside the switch, else the label over the
-/// switch, as a narrow page lays any row out. A written switch says Changed and
-/// offers Reset, and an unwritten one keeps an empty slot of Reset's width, so
-/// the two switches stay in one column that turning either never moves. Within
-/// `height_budget` (the room the page's section gets) its caption steps down to the
-/// compact sentence, then goes, so the card fits in ANY UI face rather than only the
-/// one it was drafted in.
+/// accessibility semantics, and cannot drift from the values the updater reads.
+/// Live wherever a native updater reads them (macOS, and Linux's `linux_updater`,
+/// where enrollment is a separate status fact, not this policy) and disabled, never
+/// hidden, everywhere else. One card under its heading: each row on one line where
+/// the worst case fits beside the switch, else the label over the switch, as a
+/// narrow page lays any row out. A written switch says Changed and offers Reset, and
+/// an unwritten one keeps an empty slot of Reset's width, so the two switches stay
+/// in one column that turning either never moves. Within `height_budget` (the room
+/// the page's section gets) its caption steps down to the compact sentence, then
+/// goes, so the card fits in any UI face.
 fn update_automatic_cards(
     state: &SettingsViewState,
     linux_updater: bool,
@@ -35915,11 +37804,8 @@ fn update_automatic_cards(
             availability.update_installable,
         ));
     }
-    // Where no rung fits, the host has room for the switches or for the sentence
-    // explaining them, not both. Keep the CONTROLS: each row's own semantic label already
-    // carries the complete policy text for assistive technology, so dropping the caption
-    // costs decoration, not meaning. It is all-or-nothing on purpose — half a sentence is
-    // worse than none.
+    // Where no rung fits, keep the controls and drop the caption whole: each row's
+    // semantic label carries the full policy, and half a sentence is worse than none.
     let (caption_text, caption) = rungs
         .into_iter()
         .map(|text| {
@@ -36011,14 +37897,8 @@ fn update_automatic_cards(
     )]
 }
 
-/// The Software Update page: what you are running, ONE button that takes you to
-/// the newest build, the two automatic-update switches, and the release notes.
-///
-/// It used to also carry a three-row "THIS INSTALLATION" card that restated the
-/// status line, a "How aterm updates" explainer describing a policy the user
-/// cannot act on, a paginated "LAST UPDATE RESULT" section, and three competing
-/// install buttons — which together pushed the only two controls that matter
-/// off the first screen.
+/// The Software Update page: what you are running, one button that takes you to the
+/// newest build, the two automatic-update switches, and the release notes.
 fn update_page(
     state: &SettingsViewState,
     update: &UpdateProjection,
@@ -36035,10 +37915,9 @@ fn update_page(
         update
     } else {
         honest = UpdateProjection {
-            // Hero-sized and one line: the Medium workbench gives the headline
-            // ~320pt, which "Automatic updates are off." (26 chars) fit and a
-            // 33-char sentence did not. The platform limitation rides in the
-            // page subtitle and the switch caption instead.
+            // Hero-sized, so short enough for one line in the Medium workbench's
+            // ~320pt; the platform limitation rides in the page subtitle and the
+            // switch caption.
             headline: "No in-app updater here.".to_string(),
             // The platform sentence REPLACES any authored detail: with the
             // updater lane absent, every macOS-shaped detail ("Move aterm.app
@@ -36070,7 +37949,6 @@ fn update_page(
         .max(scaled_control_height());
     let overhang = settings_list_overhang(state, width, viewport);
     let compact_section_height = room;
-    let action_height = 36.0_f32.max(32.0 * text_scale);
 
     // The two cards are measured for the side-by-side layout's measure; where
     // they stack, the page is a form ([`PageLayout`]) and every card takes
@@ -36100,11 +37978,52 @@ fn update_page(
         crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Hero);
     let headline_width =
         crate::tray_raster::ui_text_width_for(headline_face, &update.headline, headline_px);
+    let action_height = 36.0_f32.max(32.0 * text_scale);
+    // AND ONLY WHERE THE PAIR FITS THE LIST'S ROOM, side by side one stop
+    // (its tersest status rung, as the page builds it): taller than any
+    // screen (218pt in the 72pt list of a 220x12 window), the workbench was
+    // cut on every screen and its switches were on none; stacked, each card
+    // is listed row by row and split where it outgrows the room
+    // ([`scroll::SplitCard`]).
+    let side_by_side_fits = |share: f32| {
+        let status_width = (shared * share - 44.0).max(0.0);
+        let action = update_action_node(update, action_height, status_width);
+        let status = std::iter::once(StatusLineBudget::FULL)
+            .chain(StatusLineBudget::desktop_ladder().skip(1))
+            .map(|lines| {
+                update_status_card(
+                    update,
+                    width,
+                    StatusCardShape {
+                        titled: card_titled,
+                    },
+                    status_width,
+                    Some(action.clone()),
+                    action_height,
+                    lines,
+                )
+                .1
+            })
+            .fold(f32::INFINITY, f32::min);
+        let automatic = update_automatic_cards(
+            state,
+            update.linux_host,
+            availability,
+            width,
+            side_text_width(share),
+            Some(room),
+        )
+        .into_iter()
+        .map(|(_, height)| height)
+        .fold(0.0, f32::max);
+        status.max(automatic) <= room + 0.01
+    };
     let status_share = (!compact)
         .then(|| {
             [0.62_f32, 0.5].into_iter().find(|share| {
                 update_switches_fit_inline(state, side_text_width(*share))
                     && headline_width <= shared * share - 44.0
+                    && side_by_side_fits(*share)
             })
         })
         .flatten();
@@ -36180,13 +38099,10 @@ fn update_page(
         (status, status_height, automatic)
     };
     let mut built = build(StatusLineBudget::FULL);
-    // A DESKTOP STATUS CARD FITS THE SECTION IT IS WINDOWED INTO (2026-09-24 post-push
-    // review), as the automatic card's caption steps down within the same budget. On
-    // macOS at the medium workbench a non-routine outcome line under the
-    // switch's three-line timing sentence, above the action row and the Settings ▸
-    // Messages link's own row, made the card 360pt in a 327pt section: the link button
-    // was cut to 23 of its 36pt. The outcome steps down first, then the detail
-    // ([`StatusLineBudget::desktop_ladder`]); where no rung fits, the tersest one paints.
+    // A desktop status card fits the section it is windowed into, as the automatic
+    // card's caption steps down within the same budget: the outcome steps down first,
+    // then the detail ([`StatusLineBudget::desktop_ladder`]); where no rung fits, the
+    // tersest one paints.
     if let Some(room) = noncompact_section_room
         && built.1 > room
     {
@@ -36346,8 +38262,8 @@ fn with_heights(sections: Vec<UiNode>) -> Vec<(UiNode, f32)> {
         .collect()
 }
 
-/// Bounded PROGRAM rows. 16 holds the whole shipped index (twelve programs at index 46)
-/// with room to grow; past it, the overflow line says how many are elided.
+/// Bounded program rows: 16 holds the whole shipped index with room to grow; past
+/// it, the overflow line says how many are elided.
 const MAX_PACKAGE_PROGRAM_ROWS: usize = 16;
 
 /// The budget one program-row line gets before it wraps, per layout, in the wrap's
@@ -36379,22 +38295,20 @@ struct ProgramLine {
     /// (`packages_screen::reason_lines`). Text only, full width; the compact page
     /// gives it neither a label nor a control.
     continuation: bool,
-    /// Painted quiet: a row's detail line (Phase 4 — updated, latest known), under
-    /// the row's own words.
+    /// A row's detail line (updated, latest known), painted quiet under the row's own
+    /// words.
     quiet: bool,
-    /// atpkg's canonical state line, VERBATIM, on a program row whose words say it
-    /// plainly instead: the row's accessible value (its semantic label's second line),
-    /// so assistive tech and `controls` introspection still read what `status.toml`,
+    /// atpkg's canonical state line, verbatim, on a program row whose words say it
+    /// plainly instead: the row's accessible value (its semantic label's second
+    /// line), so assistive tech and `controls` introspection read what `status.toml`,
     /// `doctor` and the log say.
     state: Option<String>,
 }
 
-/// The program list (an agent program's row with its vendor · license · size). Pure: the
-/// wide page, the compact page and the row counts all read this one derivation. `width`
-/// sets the character budget a long reason wraps to (`packages_reason_wrap_chars`); a
-/// state that fits rides inline, exactly as before. (The Extras and Needs-admin groups,
-/// with their Install controls, went with the extras and the OS-installer protocols,
-/// design 2026-09-22 §5.3(b)/(c), 2026-09-24.)
+/// The program list (an agent program's row with its vendor · license · size). Pure:
+/// the wide page, the compact page and the row counts all read this one derivation.
+/// `width` sets the budget a long reason wraps to (`packages_reason_wrap_chars`); a
+/// state that fits rides inline.
 fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -> Vec<ProgramLine> {
     let plain = |key: &str, text: String| ProgramLine {
         key: key.to_string(),
@@ -36424,15 +38338,13 @@ fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -
         shown += 1;
         let wrap = packages_reason_wrap_chars(width);
         let mut text = package_program_display_name(&row.name);
-        // AN INSTALLED PROGRAM IS NAMED BY ITS FACTS (Phase 4) IN PLAIN WORDS
-        // (2026-09-23 audit, SB-18): its version (a vendor build's, never its store id;
-        // an index build's number) and what its state says — `up to date`, `latest
-        // from Anthropic`, `you pinned it` — with when it was updated and any newer
-        // build known on the detail. A row with no installed build (an agent program on
-        // its way, a system binary) says its state in words too. A
-        // state with no plain words — a FAULT, anything this page does not parse —
-        // still rides the row verbatim, its own words whole (below). Either way the
-        // canonical line is the row's accessible value.
+        // An installed program is named by its facts in plain words: its version (a
+        // vendor build's, never its store id; an index build's number) and what its
+        // state says (`up to date`, `latest from Anthropic`, `you pinned it`), with
+        // when it was updated and any newer build on the detail line. A row with no
+        // installed build says its state in words too. A state with no plain words (a
+        // fault, anything this page does not parse) rides the row verbatim. Either
+        // way the canonical line is the row's accessible value.
         let plain = crate::packages_screen::plain_state(&row.kind, &row.state);
         let show_state = match row.words.as_ref() {
             Some(words) => {
@@ -36463,11 +38375,10 @@ fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -
             tail.push_str(FACT_SEPARATOR);
             tail.push_str(annotation);
         }
-        // A state that fits the row — with everything else the row says — rides
-        // inline, VERBATIM: the canonical spellings, byte-for-byte. One that does not
-        // (the 2026-09-14 ~700-character refusal; since Phase 4 also a short state
-        // beside a row's facts) moves BELOW its row as continuation lines, fix first,
-        // so nothing of it meets the painter's ellipsis.
+        // A state that fits the row rides inline verbatim (the canonical spellings,
+        // byte-for-byte); one that does not (a long refusal, or a short state beside a
+        // row's facts) moves below its row as continuation lines, fix first, so none
+        // of it meets the painter's ellipsis.
         let state_lines = if show_state && !row.state.is_empty() {
             crate::packages_screen::reason_lines(&row.state, wrap)
         } else {
@@ -36487,10 +38398,10 @@ fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -
         } else {
             state_lines
         };
-        // The detail — why a kept row is not current, when it was updated, the latest
-        // build known — rides inline, right after the row's own words, when the whole
-        // line fits and nothing else goes below; else under the row, QUIET (the row's
-        // own words stay the line a person scans), wrapped between its parts.
+        // The detail (why a kept row is not current, when it was updated, the latest
+        // build known) rides inline after the row's own words when the whole line fits
+        // and nothing else goes below; else under the row, quiet, wrapped between its
+        // parts.
         let detail = row.words.as_ref().and_then(|w| w.detail.clone());
         let detail_lines = match detail {
             Some(detail)
@@ -36603,9 +38514,9 @@ fn packages_program_line_node(line: &ProgramLine, row_height: f32) -> UiNode {
     text.layout(Layout::default().height(Length::Fixed(row_height)))
 }
 
-/// A row whose words replace atpkg's state keeps that state as its accessible value: ONE
-/// semantic node — the words, then the canonical line `status.toml`, `doctor` and the log
-/// say — over the painted words (the wide row, and the compact row's value column).
+/// A row whose words replace atpkg's state keeps that state as its accessible value:
+/// one semantic node (the words, then the canonical line `status.toml`, `doctor` and
+/// the log say) over the painted words.
 fn program_state_node(key: String, painted: UiContent, words: &str, state: &str) -> UiNode {
     UiNode::new(
         key.clone(),
@@ -36652,18 +38563,16 @@ fn packages_has_service_line(packages: &PackagesProjection) -> bool {
         && !packages.index_source.is_empty()
 }
 
-// ---------------------------------------------------------------------------
-// Settings ▸ Messages (design §4; the log's form, ruling 262).
-// ---------------------------------------------------------------------------
+// Settings ▸ Messages (design §4).
 
 /// Every action the Messages page authors starts here; the reducer routes
 /// the family in one arm (`SettingsApp::reduce_messages_action`).
 const MESSAGES_ACTION_PREFIX: &str = "settings/messages/";
 
-/// The DEEP LINK's action (design §4.5): `settings/messages/select` with
-/// `SemanticInput::Text("<id>")` — text, not `Number(f64)`, which is inexact
-/// above 2^53 (the `settings/search` precedent). The host dispatches it
-/// after `open_settings_tab_in_window` (`App::open_messages_entry`).
+/// The deep link's action (design §4.5): `settings/messages/select` with
+/// `SemanticInput::Text("<id>")`, text rather than `Number(f64)`, which is inexact
+/// above 2^53. The host dispatches it after `open_settings_tab_in_window`
+/// (`App::open_messages_entry`).
 pub(crate) const MESSAGES_SELECT: &str = "settings/messages/select";
 
 /// Settings ▸ Messages with a tag chip down: `settings/messages/show/<tag>` —
@@ -36671,14 +38580,13 @@ pub(crate) const MESSAGES_SELECT: &str = "settings/messages/select";
 /// filter. Software Update's "View Messages" link is the update chip.
 pub(crate) const MESSAGES_SHOW_UPDATE: &str = "settings/messages/show/update";
 
-/// The most lines the Messages filters take as chips on a wider page
-/// (ruling 262); past it the tags go in the pop-up (ruling 267).
+/// The most lines the Messages filters take as chips on a wider page; past it the
+/// tags go in the pop-up.
 const MESSAGES_FILTER_LINES_MAX: usize = 2;
 
-/// How long the Messages page's status line stands at least, once a
-/// projection has seen it (ruling 267). The host arms the publish that
-/// clears it (`App::messages_publish_due_at`), so it stands about this long,
-/// not until the next minute tick.
+/// How long the Messages page's status line stands at least, once a projection has
+/// seen it. The host arms the publish that clears it (`App::messages_publish_due_at`),
+/// so it stands about this long, not until the next minute tick.
 pub(crate) const MESSAGES_FEEDBACK_MS: u64 = 5_000;
 
 /// Whether `node` or anything under it is keyed `key`.
@@ -36782,13 +38690,13 @@ const MESSAGES_TAGS_ALL: &str = "settings/messages/filter/tags-all";
 /// `…/filter/tag/<tag>`.
 const MESSAGES_TAG_CHIPS: &str = "settings/messages/filter/tag";
 
-/// A collapsed entry: one line, 30·s pt (design ruling 262).
+/// A collapsed entry: one line, 30·s pt.
 fn messages_row_height() -> f32 {
     30.0 * settings_text_scale()
 }
 
-/// A DAY HEADER over a day's entries (design ruling 273): 26·s pt, its
-/// caption sitting low, near the rows it names.
+/// A day header over a day's entries: 26·s pt, its caption low, near the rows it
+/// names.
 fn messages_day_height() -> f32 {
     26.0 * settings_text_scale()
 }
@@ -36837,10 +38745,9 @@ fn messages_page_subtitle(messages: &MessagesState) -> &'static str {
     messages.subtitle()
 }
 
-/// A status-sized line whose WHOLE text is the semantic node's label and
-/// whose painted child is fitted to `width` (the pager's own pattern), so a
-/// narrow page at large type paints `12 of 4…` rather than overflowing its
-/// box.
+/// A status-sized line whose whole text is the semantic node's label and whose painted
+/// child is fitted to `width` (the pager's pattern), so a narrow page at large type
+/// paints `12 of 4…` rather than overflowing its box.
 fn messages_fitted_status(key: &str, words: String, width: Length, fit_width: f32) -> UiNode {
     let visual = crate::native_ui::fit_native_status_label(&words, (fit_width - 4.0).max(24.0));
     UiNode::new(
@@ -36964,8 +38871,8 @@ fn messages_small_button(key: &str, label: &str, semantic: &str, enabled: bool) 
     (node, width)
 }
 
-/// THE COUNT LINE (ruling 262): the count on the left, Copy All and Open Log
-/// Folder small on the right. An empty log has no count, and nothing to copy.
+/// The count line: the count on the left, Copy All and Open Log Folder small on the
+/// right. An empty log has no count, and nothing to copy.
 fn messages_count_line(
     words: Option<String>,
     note: Option<&str>,
@@ -36973,11 +38880,9 @@ fn messages_count_line(
     can_copy: bool,
 ) -> (UiNode, f32) {
     let (spx, sface) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
-    // Where the buttons go is the COUNT's decision alone (round 17 review,
-    // V4): a note that joined it first (`The log folder is <path>`, `Sent
-    // Skip version; …`) pushed both buttons under the count for five
-    // seconds — the list lost a row and the button just pressed moved from
-    // under the pointer. The note is fitted into the status width left.
+    // Where the buttons go is the count's decision alone: a note joining it (`The log
+    // folder is <path>`) must not push the buttons under the count and move the one
+    // just pressed. The note is fitted into the status width left.
     let words_w = words.as_deref().map_or(0.0, |w| {
         crate::tray_raster::ui_text_width_for(sface, w, spx) + 8.0
     });
@@ -37114,11 +39019,9 @@ fn messages_count_line(
     )
 }
 
-/// THE SEVERITY FILTER (ruling 262): `All · 42 | Problems · 23`, a segmented
-/// control whose counts are what a press would show under the tag that is
-/// down. Independent of the tag, and combined with it. "Problems" is the
-/// warnings and the errors together, and it is that one word everywhere — the
-/// painted label and the accessible name alike (ruling 264).
+/// The severity filter: `All · 42 | Problems · 23`, a segmented control whose counts
+/// are what a press would show under the tag that is down, combined with the tag.
+/// "Problems" is the warnings and errors together, the same word painted and spoken.
 fn messages_severity_segments(
     messages: &MessagesState,
     filter: &MessagesFilter,
@@ -37129,9 +39032,8 @@ fn messages_severity_segments(
     let measure = |label: &str| {
         crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px) + 28.0
     };
-    // The counts and their words are the engine's (rulings 391 and 395): the
-    // web page's `all=`/`problems=` and `all_words=`/`problems_words=` are the
-    // same calls.
+    // The counts and their words are the engine's: the web page's `all=`/`problems=`
+    // and `all_words=`/`problems_words=` are the same calls.
     let (all, alarms) = messages.severity_counts(filter.tag.as_deref());
     let (all_words, problems_words) = aterm_messages::page::severity_segment_words(all, alarms);
     let segments = [
@@ -37275,9 +39177,8 @@ fn messages_tag_chip_rows(
             crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px),
         ) + 26.0
     };
-    // One chip per chip NAME, keyed by the first tag that shows under it —
-    // the engine's chips (ruling 391) and their words (ruling 395), the web
-    // page's `chip` lines and its `all_tags=`.
+    // One chip per chip name, keyed by the first tag that shows under it: the
+    // engine's chips and words (the web page's `chip` lines and `all_tags=`).
     let mut chips: Vec<(String, String, bool)> = vec![(
         MESSAGES_TAGS_ALL.to_string(),
         aterm_messages::page::ALL_TAGS.to_string(),
@@ -37293,9 +39194,9 @@ fn messages_tag_chip_rows(
                 .is_some_and(|t| messages_same_chip(t, &chip.tag)),
         )
     }));
-    // The severity segments lead the first row where the page seats them
-    // there (the wider pages: filters in at most two rows, ruling 262), and
-    // the chips' block starts where they end.
+    // The severity segments lead the first row where the page seats them there (the
+    // wider pages, filters in at most two rows), and the chips' block starts where
+    // they end.
     let indent = first.as_ref().map_or(0.0, |(_, width)| width + 6.0);
     let room = (content_width - indent).max(48.0);
     let widths: Vec<f32> = chips
@@ -37347,10 +39248,10 @@ fn messages_tag_chip_rows(
         .collect()
 }
 
-/// How many chips each row of the tag block holds: as few rows as `room`
-/// allows, BALANCED — the narrowest row width that still packs the chips into
-/// that many rows, so no row is a full line over a stub (design ruling 312).
-/// A chip is never split, and one wider than `room` has a row of its own.
+/// How many chips each row of the tag block holds: as few rows as `room` allows,
+/// balanced (the narrowest width that still packs the chips into that many rows, so
+/// no row is a full line over a stub). A chip is never split; one wider than `room`
+/// has a row of its own.
 fn messages_chip_row_lengths(widths: &[f32], gap: f32, room: f32) -> Vec<usize> {
     let pack = |cap: f32| {
         let mut rows: Vec<usize> = Vec::new();
@@ -37451,13 +39352,11 @@ fn messages_rule(key: &str) -> UiNode {
     .paint_only()
 }
 
-/// THE LEAD COLUMN (ruling 262): the severity mark, when, and the tag's chip
-/// name — one fixed width for every row of the page, so every title begins at
-/// the same x. `when` is the widest the relative words take (measured); `tag`
-/// the longest chip name the log holds, capped at about twelve ems and
-/// ellipsized past it. Measured over the WHOLE log, never the filtered list
-/// (round 18, day four, D13: the titles moved from x 816 to 788 to 718 as
-/// the filter changed, the list jumping sideways under the pointer).
+/// The lead column: the severity mark, when, and the tag's chip name, one fixed width
+/// for every row so every title begins at the same x. `when` is the widest the
+/// relative words take (measured); `tag` the longest chip name the log holds, capped
+/// (about twelve ems, seven compact) and ellipsized past it. Measured over the whole
+/// log, never the filtered list, so titles do not move as the filter changes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MessagesLead {
     mark: f32,
@@ -37492,8 +39391,8 @@ impl MessagesLead {
         let scale = settings_text_scale();
         let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
         let width = |s: &str| crate::tray_raster::ui_text_width_for(face, s, px);
-        // Each distinct word measured once: a full ring (512 entries, ruling
-        // 264) says a few dozen times and a handful of tags.
+        // Each distinct word is measured once: a full ring holds only a few dozen
+        // distinct times and a handful of tags.
         let whens: std::collections::BTreeSet<String> =
             visible.iter().map(|e| clock.when(e.at_unix_ms)).collect();
         let when = [
@@ -37576,10 +39475,9 @@ impl MessagesLead {
     }
 }
 
-// TEST-ONLY WORK CENSUS: the entry rows `messages_head_node` has built ON THIS
-// THREAD. The list is virtual (ruling 264), so a render builds the rows its
-// view shows and no others, whatever the log holds; the ring-cap test counts
-// that here instead of timing it.
+// Test-only work census: the entry rows `messages_head_node` has built on this
+// thread. The list is virtual, so a render builds only the rows its view shows; the
+// ring-cap test counts that instead of timing it.
 #[cfg(test)]
 thread_local! {
     static MESSAGES_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -37606,14 +39504,23 @@ fn messages_head_title(
     }
     let under = (content_width - lead.gap - MESSAGES_CHEVRON_END).max(24.0);
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-    let mut lines = wrap_to_box(&entry.title, under, &|line| {
-        crate::tray_raster::ui_text_width_for(face, line, px)
-    });
+    let mut lines = wrap_to_box_from(
+        &entry.title,
+        under,
+        &|line| crate::tray_raster::ui_text_width_for(face, line, px),
+        "-",
+    );
     if lines.len() <= lead.title_lines {
-        return (lines, false);
+        return (lines.into_iter().map(|(_, line)| line).collect(), false);
     }
-    let rest = lines.split_off(lead.title_lines - 1).join(" ");
-    lines.push(crate::native_ui::fit_native_text_label(&rest, under));
+    // The title from the last line it keeps on, as it is written: a CJK
+    // title goes on with no space where its lines broke.
+    let rest = lines
+        .split_off(lead.title_lines - 1)
+        .first()
+        .map_or("", |(at, _)| &entry.title[*at..]);
+    let mut lines: Vec<String> = lines.into_iter().map(|(_, line)| line).collect();
+    lines.push(crate::native_ui::fit_native_text_label(rest, under));
     (lines, true)
 }
 
@@ -37890,10 +39797,10 @@ fn messages_head_node(
     .children(vec![button, visual])
 }
 
-/// An expanded entry's body, laid out (ruling 262): the meta line (the local
-/// time, and the state where it says something), the plain sentence — the
-/// cause and the next step, `detail[0]` — the buttons in a footer, and the
-/// technical details in small monospace last.
+/// An expanded entry's body, laid out: the meta line (the local time, and the state
+/// where it says something), the plain sentence (the cause and the next step,
+/// `detail[0]`), the buttons in a footer, and the technical details in small
+/// monospace last.
 #[derive(Clone, Debug, PartialEq)]
 struct MessagesBody {
     /// The entry's title whole, on the body's lines, where its head cut it
@@ -37935,21 +39842,18 @@ fn messages_footer_row_height(row: &[MessagesButton]) -> f32 {
 }
 
 impl MessagesBody {
-    /// The body of `entry` at `text_width`, its technical details bounded to
-    /// `room` points (at least one line; `… (N more lines)` where cut).
+    /// The body of `entry` at `text_width`; [`Self::fit`] bounds it to a height.
     fn of(entry: &MessageView, text_width: f32, utc_offset_s: i64, now_unix_ms: u64) -> Self {
         let (qpx, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
         let (ppx, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-        // The meta line's words are the engine's (ruling 395, the web page's
-        // `meta=`); the wrap is the layout's.
+        // The meta line's words are the engine's (the web page's `meta=`); the wrap
+        // is the layout's.
         let meta = entry.meta_words(now_unix_ms, utc_offset_s);
-        // The split is the engine's (ruling 391, the web page's `sentence=`
-        // and `technical=`): a diagram (a caret under a column) is technical
-        // whole; else the entry's leading `sentences` lines (ruling 314: one,
-        // but a tab's upgrade row's why and next step) are the sentence and
-        // the rest the details; the `shown for` line a record carries is the
-        // meta line's already. Each sentence line wraps to at most three
-        // lines.
+        // The split is the engine's (the web page's `sentence=` and `technical=`): a
+        // diagram (a caret under a column) is technical whole; else the entry's
+        // leading `sentences` lines are the sentence and the rest the details; the
+        // `shown for` line is the meta line's. Each sentence line wraps to at most
+        // three lines.
         let (sentence, technical) = entry.sentence_and_technical();
         let diagram = entry.is_diagram();
         // Every line of it, whole: an entry taller than the room is read a
@@ -37958,8 +39862,8 @@ impl MessagesBody {
             .into_iter()
             .flat_map(|first| wrapped_copy_lines(first, ppx, text_width))
             .collect();
-        // A diagram's rows are CUT (a column stays a column); a prose line in
-        // the monospace face wraps at its spaces.
+        // A diagram's rows are cut (a column stays a column); a prose line in the
+        // monospace face wraps at its spaces.
         let technical = technical
             .into_iter()
             .flat_map(|line| {
@@ -38045,12 +39949,11 @@ impl MessagesBody {
         }
     }
 
-    /// The technical lines bounded to `lines`: the last kept line says how
-    /// many more there are, and at least ONE real line stands above it — a
-    /// bound of one keeps two rows (day nine: `Technical details` over a
-    /// bare `… (2 more lines)` said nothing; ruling 368), and [`Self::fit`]
-    /// drops the whole block when even that does not fit. Two lines are
-    /// never one line and a marker for the other. Copy keeps them all.
+    /// The technical lines bounded to `lines`: the last kept line says how many more
+    /// there are, with at least one real line above it (a bound of one keeps two
+    /// rows, since a bare `… (2 more lines)` says nothing), and [`Self::fit`] drops
+    /// the block when even that does not fit. Two lines are never one line and a
+    /// marker. Copy keeps them all.
     fn bound(&mut self, lines: usize) {
         let keep = lines.saturating_sub(1).max(1);
         if self.technical.len() > keep + 1 {
@@ -38110,8 +40013,8 @@ impl MessagesBody {
     }
 }
 
-/// One technical line CUT to the measure in the monospace face it paints in
-/// (a column stays a column: never reflowed), one grapheme at a time.
+/// One technical line cut to the measure in the monospace face it paints in (a column
+/// stays a column: never reflowed), one grapheme at a time.
 fn messages_cut_code(line: &str, available_width: f32) -> Vec<String> {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Code);
     let advance = |grapheme: &str| {
@@ -38138,8 +40041,8 @@ fn messages_cut_code(line: &str, available_width: f32) -> Vec<String> {
     rows
 }
 
-/// One technical line WRAPPED at its spaces to the measure in the monospace
-/// face it paints in; a word longer than the measure is cut.
+/// One technical line wrapped at its spaces to the measure in the monospace face it
+/// paints in; a word longer than the measure is cut.
 fn messages_wrap_code(line: &str, available_width: f32) -> Vec<String> {
     let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Code);
     let width =
@@ -38365,13 +40268,11 @@ fn messages_day_words(plan: &MessagesPlan, day: i64) -> String {
     }
 }
 
-/// A DAY HEADER (design ruling 273): the day's name — `Today`, `Yesterday`,
-/// `Thursday`, `Friday, 18 September` — in the caption heading (the page's
-/// quiet caption ink, bold), from the lead column's time words' x so it
-/// stands over the times it dates. A heading for a screen reader, never a
-/// control: the keyboard steps from entry to entry past it, and it takes no
-/// stop of the list's scroll — the list's top entry always carries its own
-/// day's header, so the view never loses its date.
+/// A day header: the day's name (`Today`, `Yesterday`, `Thursday`, `Friday, 18
+/// September`) in the caption heading, from the lead column's time x so it stands over
+/// the times it dates. A heading for a screen reader, never a control: the keyboard
+/// steps past it and it takes no scroll stop; the list's top entry always carries its
+/// day's header.
 fn messages_day_node(day: i64, plan: &MessagesPlan) -> UiNode {
     let key = format!("settings/messages/day/{day}");
     UiNode::new(
@@ -38402,12 +40303,10 @@ fn messages_day_node(day: i64, plan: &MessagesPlan) -> UiNode {
     ])
 }
 
-/// The log's CARD (rulings 262 and 264): the entries the view shows, one line
-/// each with hairlines between them, the open one with its body under it —
-/// its technical details already bounded to the room by the plan that seated
-/// it ([`MessagesPlan::view`]), so the card is exactly as tall as the plan
-/// measured. The card is the screen reader's scrolling list
-/// ([`SemanticRole::List`]).
+/// The log's card: the entries the view shows, one line each with hairlines between,
+/// the open one with its body under it (already fitted by the plan that seated it,
+/// [`messages_plan`]), so the card is exactly as tall as the plan measured. The card
+/// is the screen reader's scrolling list ([`SemanticRole::List`]).
 fn messages_list_node(
     rows: &[&MessageView],
     (first, part): (usize, Option<usize>),
@@ -38539,11 +40438,10 @@ fn messages_list_node(
     (node, height)
 }
 
-/// The card with its SCROLL INDICATOR laid over it (ruling 264): where the
-/// view shows only some of the `total` entries, a thin thumb down the card's
-/// trailing edge says that the list scrolls and where the view is
-/// ([`crate::native_ui::MESSAGES_SCROLL_AUDIT`], paint-only); where it shows
-/// them all, the card alone.
+/// The card with its scroll indicator laid over it: where the view shows only some
+/// of the `total` entries, a thin thumb down the card's trailing edge says the list
+/// scrolls and where the view is ([`crate::native_ui::MESSAGES_SCROLL_AUDIT`],
+/// paint-only); where it shows them all, the card alone.
 fn messages_scroll_node(
     card: UiNode,
     height: f32,
@@ -38580,10 +40478,10 @@ fn messages_scroll_node(
     .children(vec![card, thumb])
 }
 
-/// The filters and the count (ruling 262), top to bottom, with their heights:
-/// the severity segments; the tag chips (wide), or the `Tag: …` pop-up and,
-/// open, its chips (compact); and the count line. An empty log has neither
-/// filters nor count — only the report buttons.
+/// The filters and the count, top to bottom, with their heights: the severity
+/// segments; the tag chips (wide), or the `Tag: …` pop-up and, open, its chips
+/// (compact); and the count line. An empty log has neither filters nor count, only
+/// the report buttons.
 fn messages_filter_items(
     state: &SettingsViewState,
     messages: &MessagesState,
@@ -38605,13 +40503,11 @@ fn messages_filter_items(
     if total > 0 {
         let (segments, segments_h) =
             messages_severity_segments(messages, filter, content_width, chip_h + 6.0);
-        // THE FILTERS STAY IN TWO LINES (ruling 262): a wider page lays its
-        // tags out as chips only while the segments and the chips fit in two;
-        // past that — a script can name any tag it likes, and day two's seven
-        // made three lines of chips at 60 columns — it takes the compact
-        // page's `Tag: …` pop-up, which holds any number (ruling 267). The
-        // chips' block sits beside the segments where it fits in two rows
-        // there, else on one full line under them (ruling 312).
+        // The filters stay in two lines: a wider page lays its tags out as chips only
+        // while segments and chips fit in two; past that (a script can name any tag)
+        // it takes the compact page's `Tag: …` pop-up, which holds any number. The
+        // chips' block sits beside the segments where it fits in two rows there, else
+        // on full lines under them.
         let segments_lead = segments_h <= chip_h + 6.0;
         let lead_width = match segments.layout.width {
             Length::Fixed(width) => width,
@@ -38737,51 +40633,31 @@ fn messages_filter_items(
     };
     // A CARD NO TALLER THAN THE LIST (a compact page's, which scrolls it as
     // stops): where the card is taller than the room, it is listed a part at
-    // a time, each a card of the same face no taller than the room (a part
-    // an item alone where one is), so every control is whole on some screen.
+    // a time by the one rule every list keeps ([`scroll::row_parts`]: a part
+    // an item alone where one is), so every control is whole on some screen,
+    // and its parts read as the one card they are, open where they meet.
     // At 2× on a 22 × 24 window the one card was 405pt in a 268pt list,
     // Copy All half under its edge and Open Log Folder on no screen at all.
-    let mut parts: Vec<Vec<(UiNode, f32)>> = vec![Vec::new()];
-    for item in items {
-        let part = parts.last_mut().expect("one part");
-        part.push(item);
-        if part.len() > 1 && room.is_some_and(|room| card_height(part) > room + 0.01) {
-            let item = part.pop().expect("the item just pushed");
-            parts.push(vec![item]);
-        }
+    let height = card_height(&items);
+    let card = UiNode::new(
+        "settings/messages/filters",
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group).style(StyleRef::Secondary)),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(height))
+            .padding(Insets::symmetric(
+                MESSAGES_FILTERS_PAD_X,
+                MESSAGES_FILTERS_PAD_Y,
+            ))
+            .gap(gap),
+    )
+    .children(items.into_iter().map(|(node, _)| node).collect());
+    match room {
+        Some(room) => scroll::row_parts((card, height), room, room, MESSAGES_ROW_GAP),
+        None => vec![(card, height)],
     }
-    parts
-        .into_iter()
-        .enumerate()
-        .map(|(index, items)| {
-            let height = card_height(&items);
-            let key = if index == 0 {
-                "settings/messages/filters".to_string()
-            } else {
-                format!("settings/messages/filters/part-{index}")
-            };
-            (
-                UiNode::new(
-                    key,
-                    UiContent::Group(
-                        GroupSpec::unlabeled(SemanticRole::Group).style(StyleRef::Secondary),
-                    ),
-                )
-                .layout(
-                    Layout::column()
-                        .width(Length::Fill)
-                        .height(Length::Fixed(height))
-                        .padding(Insets::symmetric(
-                            MESSAGES_FILTERS_PAD_X,
-                            MESSAGES_FILTERS_PAD_Y,
-                        ))
-                        .gap(gap),
-                )
-                .children(items.into_iter().map(|(node, _)| node).collect()),
-                height,
-            )
-        })
-        .collect()
 }
 
 /// The filters card's own padding ([`messages_filter_items`]): the one place
@@ -38884,7 +40760,7 @@ struct MessagesPlan {
     heights: Vec<f32>,
     /// The open entry and its body, fitted to the room.
     body: Option<(u64, MessagesBody)>,
-    /// The reader's calendar (ruling 273).
+    /// The reader's calendar.
     clock: MessagesClock,
     /// Each admitted entry's section day when the list carries day headers
     /// ([`MessagesClock::sections`]); `None` for a log of one day.
@@ -39045,8 +40921,8 @@ impl MessagesPlan {
         }
     }
 
-    /// The card's height holding `rows`: its padding, the rows, a hairline
-    /// between each two, and the day headers among them (ruling 273).
+    /// The card's height holding `rows`: its padding, the rows, a hairline between
+    /// each two, and the day headers among them.
     fn card_height(&self, rows: std::ops::Range<usize>) -> f32 {
         if rows.is_empty() {
             return 0.0;
@@ -39062,10 +40938,9 @@ impl MessagesPlan {
             + days as f32 * self.day_h
     }
 
-    /// The day whose HEADER stands above entry `k` in a view whose first
-    /// entry is `first` (ruling 273): where the section's day changes, and
-    /// over the view's first entry whatever its place in its day. `None` in
-    /// a list of one day.
+    /// The day whose header stands above entry `k` in a view whose first entry is
+    /// `first`: where the section's day changes, and over the view's first entry
+    /// whatever its place in its day. `None` in a list of one day.
     fn day_before(&self, k: usize, first: usize) -> Option<i64> {
         let sections = self.sections.as_ref()?;
         let day = *sections.get(k)?;
@@ -39207,9 +41082,8 @@ impl MessagesPlan {
         next.min(limit)
     }
 
-    /// A DEEP LINK'S LANDING: where the view from `top` already shows entry
-    /// `index` whole, there; else the entry at the top of the list, as far
-    /// as the list scrolls.
+    /// A deep link's landing: where the view from `top` already shows entry `index`
+    /// whole, there; else the entry at the top of the list, as far as it scrolls.
     fn land(&self, index: usize, top: usize) -> usize {
         let limit = self.limit();
         let top = top.min(limit);
@@ -39334,9 +41208,8 @@ fn messages_plan_opening(
         (whole - header_h - gap, gap)
     };
     let clock = MessagesClock::of(visible, messages.now_unix_ms, messages.utc_offset_s);
-    // The lead column is the LOG's, whatever the filter admits (D13): the
-    // whole log's words under its own calendar are every word a filtered
-    // list can say (a list is headed only when the log is).
+    // The lead column is the log's, whatever the filter admits: the whole log's words
+    // under its own calendar are every word a filtered list can say.
     let all: Vec<&MessageView> = messages.entries.iter().collect();
     let log_clock = MessagesClock::of(&all, messages.now_unix_ms, messages.utc_offset_s);
     let mut lead = MessagesLead::measure(&all, log_clock, compact, content_width);
@@ -39416,6 +41289,21 @@ fn messages_plan_opening(
             _ => head,
         })
         .collect();
+    // NOR DOES A WIDER PAGE'S PINNED HEADER LEAVE NO ENTRY WHOLE: where the
+    // room under it is shorter than the newest entry closed, the header
+    // scrolls away with the list, as on a compact page — and the first
+    // screen, holding no entry then, sheds the page's chrome where that
+    // brings one under the header ([`PageChrome`]). At 220x12 at 1× text
+    // the filters and count line left the list 12pt under the page's full
+    // insets, its 30pt entries clipped on every screen.
+    if !compact
+        && !plan.scrolls
+        && !visible.is_empty()
+        && head + day_h + 2.0 * MESSAGES_LIST_PAD > room + 0.01
+    {
+        plan.scrolls = true;
+        plan.room = whole;
+    }
     // The open entry, where even fitted it is taller than the room, is read
     // a part at a time ([`MessagesTall`]), each part whole on its screen.
     plan.tall = plan
@@ -39880,12 +41768,11 @@ fn packages_page_subtitle() -> &'static str {
     "ALab tools and coding agents."
 }
 
-/// One registry-backed Switch row for the Packages page. The control uses the
-/// SAME `settings/set/<key>` action, focus key, pending gate, and semantic
-/// value shape as an ordinary [`setting_row`] Bool, so OCC saves, Undo, and
-/// accessibility behave identically — only the placement is special. Returns
-/// the row and its height: `row_height`, and a line or two more where the
-/// row's note goes under its name.
+/// One registry-backed Switch row for the Packages page. The control uses the same
+/// `settings/set/<key>` action, focus key, pending gate and semantic value shape as an
+/// ordinary [`setting_row`] Bool, so OCC saves, Undo and accessibility behave
+/// identically; only the placement is special. Returns the row and its height:
+/// `row_height`, and a line or two more where the row's note goes under its name.
 fn packages_switch_row(
     state: &SettingsViewState,
     key: &str,
@@ -39924,15 +41811,14 @@ fn registry_switch_row(
     let availability = SettingsAvailability::for_state(state);
     let effect =
         setting_effect_projection(state, None, key, availability, state.presented_motion.get());
-    // The row shows the RESOLVED value its field was seeded with: for "Keep ALab tools
-    // up to date" that is `Config::packages_enabled`, the retired `auto_update` folded
-    // in — what the loop runs — so a machine that key turned off reads Off (review of
-    // Phase 4, 2026-09-23), and writing the switch drops the retired key
-    // (`prefs::RETIRED_PACKAGES_SPELLINGS`): one reader, one writer.
+    // The row shows the resolved value its field was seeded with: for "Keep ALab
+    // tools up to date" that is `Config::packages_enabled`, the retired `auto_update`
+    // folded in, so a machine that key turned off reads Off, and writing the switch
+    // drops the retired key (`prefs::RETIRED_PACKAGES_SPELLINGS`): one reader, one
+    // writer.
     let value = SettingsState::display_value(field)
         .parse::<bool>()
         .unwrap_or(false);
-    let pending = state.config_key_pending(key);
     let focused = state
         .common
         .last_focus
@@ -39974,7 +41860,7 @@ fn registry_switch_row(
     let stacked = width == SettingsWidth::Compact;
     // Reset, or the place it keeps, so the switch never moves when it comes.
     let reset = if changed {
-        setting_reset_button(field, pending)
+        setting_reset_button(field)
     } else {
         reset_slot(key)
     };
@@ -40019,9 +41905,7 @@ fn registry_switch_row(
             )
             .value(SemanticValue::Bool(value))
             .state(ControlState {
-                enabled: !pending,
                 focused,
-                busy: pending,
                 ..ControlState::default()
             })
             .style(StyleRef::Setting),
@@ -40363,8 +42247,8 @@ fn packages_program_line_row(line: &ProgramLine, row_height: f32, width: f32) ->
     (wrapped, height)
 }
 
-/// A Packages verb button's width in a row, the gap between two, and the
-/// hero card's horizontal padding: the row's measure (ruling 270).
+/// A Packages verb button's width in a row, the gap between two, and the hero card's
+/// horizontal padding: the row's measure.
 const PACKAGES_ACTION_WIDTH: f32 = 196.0;
 const PACKAGES_ACTION_GAP: f32 = 8.0;
 const PACKAGES_HERO_PAD_X: f32 = 22.0;
@@ -40492,11 +42376,10 @@ fn packages_page(
             PackagesBusy::Install,
             false,
         ),
-        // The EXIT, sitting beside the entrance. A first launch downloads multiple GB
-        // without a prompt (`packages.auto_install`), and trashing
-        // aterm.app leaves every one of them orphaned under Application Support. An
-        // unprompted install whose only removal path is a CLI verb the user has to
-        // discover is the asymmetry that makes it feel like something done TO them.
+        // The exit beside the entrance: a first launch downloads multiple GB without
+        // a prompt (`packages.auto_install`), and trashing aterm.app orphans them under
+        // Application Support, so removal must not be a CLI verb the user has to
+        // discover.
         action_button(
             "packages/uninstall-all",
             remove_label,
@@ -40504,7 +42387,7 @@ fn packages_page(
             false,
         ),
     ];
-    // ONE row of the hero either way, so the list keeps the buttons together
+    // One row of the hero either way, so the list keeps the buttons together
     // with the status they act on wherever the card fits a screen, and never
     // leaves a button alone on a screen of its own.
     let action_rows: Vec<(UiNode, f32)> = if stack_actions {
@@ -40538,20 +42421,26 @@ fn packages_page(
         )]
     };
 
-    // Status hero: headline + detail from the shared projection (screen ==
-    // introspection: the strings come from ONE derivation in packages_screen).
-    // Where the signed builds come from, said once; the pinned key's fingerprint is
-    // `aterm pkg doctor`'s to show.
+    // Status hero: headline and detail from the shared projection (one derivation in
+    // packages_screen serves screen and introspection). Where the signed builds come
+    // from is said once; the pinned key's fingerprint is `aterm pkg doctor`'s.
     let service_line = if packages_has_service_line(packages) {
         format!("Signed updates from {}", packages.index_source)
     } else {
         String::new()
     };
-    let service_height = if service_line.is_empty() {
-        0.0
-    } else {
-        22.0_f32.max(18.0 * text_scale)
-    };
+    // The source wraps to the hero's measure, as the detail does: one line
+    // ran 43pt past the hero's column at 2× text in a 60x20 window.
+    let service = (!service_line.is_empty()).then(|| {
+        wrapped_words_node(
+            "packages/service-line",
+            &service_line,
+            (SemanticRole::Status, StyleRef::Quiet),
+            hero_inner,
+            22.0_f32.max(18.0 * text_scale),
+        )
+    });
+    let service_height = service.as_ref().map_or(0.0, |(_, height)| *height);
     // The detail wraps to the hero's measure: a remedy cut by an ellipsis
     // loses exactly the part that says what to do.
     // The whole sentence, at the hero's own measure: the hero is listed row
@@ -40586,18 +42475,8 @@ fn packages_page(
         headline,
         detail,
     ];
-    if !service_line.is_empty() {
-        status_lines.push(
-            UiNode::new(
-                "packages/service-line",
-                UiContent::Text(TextSpec {
-                    text: service_line,
-                    role: SemanticRole::Status,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(Layout::default().height(Length::Fixed(service_height))),
-        );
+    if let Some((line, _)) = service {
+        status_lines.push(line);
     }
     let status_height = title_height
         + headline_height
@@ -40628,7 +42507,7 @@ fn packages_page(
     };
 
     // Consent switches: registry-backed dotted keys through the ordinary
-    // ConfigPatch/OCC path — flipping auto_install here IS the §11 consent.
+    // ConfigPatch/OCC path; flipping auto_install here is the §11 consent.
     // A compact card lays a switch out on one line wherever its label has
     // the room, as the field pages do.
     let consent_text_width = hero_inner + 2.0 * PACKAGES_HERO_PAD_X - 40.0;
@@ -40741,9 +42620,9 @@ fn packages_page(
         rows: consent_rows,
     };
 
-    // The program list (§17.2's canonical states verbatim; an agent program's row with
-    // its vendor, license and size). Bounded rows keep the card height deterministic;
-    // the overflow line says exactly how much is elided.
+    // The program list (canonical states verbatim; an agent program's row with its
+    // vendor, license and size). Bounded rows keep the card height deterministic; the
+    // overflow line says how much is elided.
     let row_height = 24.0_f32.max(20.0 * text_scale);
     let programs = SplitCard {
         key: "packages/programs".to_string(),
@@ -40851,16 +42730,12 @@ fn field_match_score(
     field_match_score_in(field, query, &mut String::new(), themes)
 }
 
-/// Rank `field` against an ALREADY-LOWERCASED `query` (`None` = no match), folding
-/// only what actually needs folding.
+/// Rank `field` against an already-lowercased `query` (`None` = no match).
 ///
-/// `field.key` and every keyword from `keywords_of` are ASCII-lowercase by
-/// construction (pinned by `editable_field_keys_are_unique_and_lowercase`), so they are
-/// compared as they are: folding them allocated a `String` per keyword plus one
-/// per key plus the collecting `Vec` — about six throwaway allocations per field,
-/// over all ~170 fields, for every character typed into the search box. The label
-/// is the one candidate with genuine mixed case, and it folds into the caller's
-/// `scratch`, which the sweep reuses across fields.
+/// `field.key` and every keyword from `keywords_of` are lowercase by construction
+/// (`editable_field_keys_are_unique_and_lowercase`), so only the mixed-case label
+/// folds, into the caller's reusable `scratch`: no allocation per key or keyword on
+/// every keystroke.
 fn field_match_score_in(
     field: &EditField,
     query: &str,
@@ -40874,7 +42749,7 @@ fn field_match_score_in(
     if field.key != prefs::EDIT_THEME {
         return own;
     }
-    // THEME NAMES ARE THE THEME ROW'S CORPUS TOO: "nord" finds the Theme
+    // Theme names are the Theme row's corpus too: "nord" finds the Theme
     // control, whose picker then opens filtered to it. A theme name ranks
     // below the control's own words (it is a value, not the setting: a
     // synonym, a rung down), and only where the query starts a word of it: a
@@ -40941,12 +42816,10 @@ fn field_own_match_score(
     let own = [scratch.as_str(), field.key]
         .into_iter()
         .chain(prefs::own_name_of(field.key));
-    // THE ladder lives once, in the config-schema authority, so Settings search and
-    // Manual completion cannot drift into ranking the same query differently. Every
-    // candidate here is already lowercase — `scratch` is the folded label, and keys
-    // and keywords are lowercase by construction (pinned by
-    // `editable_field_keys_are_unique_and_lowercase`) — which is the precondition
-    // that ladder documents.
+    // The ladder lives once, in the config-schema authority, so Settings search and
+    // Manual completion rank alike. Every candidate here is already lowercase (the
+    // folded label; keys and keywords by construction), the precondition that ladder
+    // documents.
     crate::native_config_language::query_match_rank(
         own,
         prefs::keywords_of(field.key).iter().copied(),

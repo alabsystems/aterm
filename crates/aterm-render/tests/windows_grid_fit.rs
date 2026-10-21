@@ -1,45 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WINDOWS CRISPNESS: grid fitting on the platform that shipped with none.
+//! Windows system variable-font grid-fitting tests.
 //!
-//! Without it the Windows raster chain falls through to a raw outline
-//! fill — stems land at fractional pixel phases and horizontal features
-//! straddle two rows — on the one platform whose reference renderers (Windows
-//! Terminal, VS Code, conhost) are all DirectWrite-hinted in the next window.
-//!
-//! The seam itself (`font_hinting` full ⇄ off actually changes coverage while
-//! never moving the cell box) is bound cross-platform in
-//! `font_hinting_config.rs`. THIS file binds the half that is Windows-specific
-//! and that a static test font cannot reach: Windows 11's own Cascadia Mono,
-//! `C:\Windows\Fonts\CascadiaMono.ttf` — what `font_family = "Cascadia Mono"`
-//! names; the bundled faces, the unconfigured default among them, are STATIC — is
-//! a VARIABLE font with no separate Bold file, so
-//!
-//! * the regular cut is an `fvar` instance, and
-//! * bold is the `wght`≈700 instance of the SAME bytes (W9),
-//!
-//! and both have to be grid-fitted AT THEIR INSTANCE. A hinter pinned to the
-//! font's default location would still "work" — it would just silently draw
-//! the wrong weight — which is precisely the failure
-//! [`bold_stays_bold_when_grid_fitted`] exists to catch.
-//!
-//! DELIBERATELY NOT SKIPPABLE. A test that quietly returns when it cannot find
-//! its fixture passes forever and proves nothing, so this one FAILS with the
-//! inventory in the message instead. Every Windows 11 image ships Cascadia
-//! Mono, and Windows 10 ships Bahnschrift, so the requirement — one `.ttf`
-//! under `%WINDIR%\Fonts` with a `wght` axis reaching a bold cut — is met by
-//! any desktop install this app targets.
+//! Verifies that Windows 11's variable `CascadiaMono.ttf` (or another
+//! `%WINDIR%\Fonts` variable face with a bold `wght` instance) is grid-fitted
+//! at both its regular and bold (`wght` ≈ 700) `fvar` instance coordinates
+//! without altering cell box dimensions.
 
 #![cfg(all(windows, feature = "embedded-font"))]
 
 use aterm_render::{Renderer, StyleBits, Theme};
 
-/// Locate a VARIABLE system face to instantiate: Cascadia Mono first (Windows
-/// 11 ships it, and `font_family = "Cascadia Mono"` names it), then any other
-/// `%WINDIR%\Fonts` face whose `wght` axis reaches a real bold cut — the
-/// precondition W9's `vf_bold_coords` needs before bold is an INSTANCE rather
-/// than synthetic dilation, which is what these tests are about.
+/// Locate `CascadiaMono.ttf` or another `%WINDIR%\Fonts` variable font whose
+/// `wght` axis reaches a bold instance (`vf_bold_coords`).
 fn variable_system_face() -> (String, Vec<u8>) {
     let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
     let mut candidates: Vec<String> = vec![format!("{dir}\\Fonts\\CascadiaMono.ttf")];
@@ -138,11 +112,8 @@ fn variable_primary_is_grid_fitted_at_12px() {
             "{path} @{px}px: grid fitting must raise whole-ink texels \
              (off {s_off} -> full {s_full})"
         );
-        // The smooth target snaps a stem's edges and keeps its width, so a
-        // stem whose width has a fraction keeps one fringe column: Cascadia
-        // Mono 2102.025's `l` at 16px is ~1.7px, 203|219 raw and 255|183
-        // fitted, 20 fringe texels either way (measured 2026-10-17). At the
-        // desktop 12px the fringe must fall; at no size may it grow.
+        // Smooth hinting snaps stem edges while preserving fractional stem
+        // width: fringe texels must decrease at 12px and never increase.
         if px == 12.0 {
             assert!(
                 f_full < f_off,
@@ -166,12 +137,8 @@ fn variable_primary_is_grid_fitted_at_12px() {
     }
 }
 
-/// The instance half, and the reason `hinted_glyph` carries `(coords, slot)`
-/// at all: Cascadia Mono has no Bold FILE, so a bold cell draws the `wght`≈700
-/// INSTANCE. Grid-fitting it must fit THAT outline — a hinter built at the
-/// font's default location would quietly hand back the 400 cut, and bold would
-/// stop being bold. Bound as "the hinted bold still out-inks the hinted
-/// regular by as much as the unhinted pair does".
+/// Verify `hinted_glyph` grid-fits the bold `fvar` instance (`wght` ≈ 700)
+/// rather than the default weight, preserving the bold-to-regular ink ratio.
 #[test]
 fn bold_stays_bold_when_grid_fitted() {
     let (path, bytes) = variable_system_face();

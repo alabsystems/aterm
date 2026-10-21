@@ -35,8 +35,7 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
             command.env_remove(key);
         }
     }
-    // No `--timeout 2`: the CLI's exchange deadline is not what these tests
-    // judge, and 2 s of it timed how soon this process was scheduled to answer.
+    // No `--timeout`: the exchange deadline is not what these tests judge.
     let mut cli = command
         .arg("--sock")
         .arg(&socket)
@@ -47,10 +46,8 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // The wait ends on the CLI, never on a clock: the CLI either connects or
-    // exits. A fresh executable's first exec can stall for seconds in macOS's
-    // policy assessment on a loaded machine, so a fixed bound would blame the
-    // CLI for its own start-up.
+    // The wait ends on the CLI connecting or exiting, never on a clock: a fresh
+    // executable's first exec can stall for seconds in macOS's policy assessment.
     let mut connection = loop {
         match listener.accept() {
             Ok((connection, _)) => break connection,

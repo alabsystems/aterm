@@ -878,3 +878,27 @@ fn the_capability_report_says_what_each_tree_can_give() {
         assert_eq!(word(&rows, name), want, "{name} of {rows:?}");
     }
 }
+
+/// The machine words: the first CPU's model (x86 `model name`, an ARM
+/// board's `Model`) and the OS's pretty name, unquoted. NEGATIVE CONTROLS:
+/// a cpuinfo with neither key and an empty `PRETTY_NAME` read nothing.
+#[test]
+fn machine_words_are_the_first_cpu_model_and_the_os_pretty_name() {
+    let cpuinfo = "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU\n";
+    let os = "NAME=\"Ubuntu\"\nPRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\n";
+    let root = tree(&[("proc/cpuinfo", cpuinfo), ("etc/os-release", os)]);
+    let words = Root::new(root.path()).machine_words();
+    assert_eq!(words.cpu.as_deref(), Some("Intel(R) Xeon(R) CPU"));
+    assert_eq!(words.os.as_deref(), Some("Ubuntu 24.04.1 LTS"));
+    assert_eq!(
+        linux::cpu_model("Model\t\t: Raspberry Pi 5\n").as_deref(),
+        Some("Raspberry Pi 5")
+    );
+    assert_eq!(linux::cpu_model("processor: 0\n"), None);
+    assert_eq!(linux::os_pretty_name("PRETTY_NAME=\"\"\n"), None);
+    let empty = tree(&[]);
+    assert_eq!(
+        Root::new(empty.path()).machine_words(),
+        crate::MachineWords::default()
+    );
+}

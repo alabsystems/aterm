@@ -1,25 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Keys typed at the start of a lit line step one stop a key (found by
-//! `tests/walk_continuity_census.rs`, scenario `home-type`).
+//! Keys typed at the start of a lit line step one stop a key.
 //!
-//! The take: a shell line typed at 12 cps, Home (the host stamps a navigation
-//! key: `clear_typed`, `note_motion`), and `XYZ ` typed at the line's start
-//! inside the grace, each key an insert the shell answers by reprinting the
-//! line one column on. The shift pass (`Ribbon::shift_run`) re-reads each
-//! pushed cell's stop at the column it moved to and leaves the walk's anchor
-//! (`Cohort::anchor_col`) in place: the colour stays with the screen column
-//! (C2) while the light rides the glyph. The keys take the line's first stops
-//! `0, 1/16, 2/16, 3/16`, and the pushed text walks on from `4/16`.
+//! A shell line typed at 12 cps, Home (stamped `clear_typed`, `note_motion`), then `XYZ ` typed at
+//! the line's start inside the grace, each key an insert the shell answers by reprinting the line
+//! one column on. The shift pass (`Ribbon::shift_run`) re-reads each pushed cell's stop at the
+//! column it moved to and leaves the walk's anchor (`Cohort::anchor_col`) in place: the colour
+//! stays with the screen column (C2) while the light rides the glyph. The keys take the line's
+//! first stops `0, 1/16, 2/16, 3/16`, and the pushed text walks on from `4/16`. Mid-line inserts
+//! are `tests/midline_insert_band.rs` (holes) and `tests/midline_insert_colour_seam.rs` (colour).
 //!
-//! This is the insert family (`tests/midline_insert_band.rs` reads mid-line
-//! inserts for holes, `tests/midline_insert_colour_seam.rs` for colour).
-//!
-//! The law is the walk's own: text-adjacent lit cells of one line never repeat
-//! a stop and never step backward; every column lit before the insert shows the
-//! stop it showed. Controls: the same keys typed at the line's end each step
-//! forward, and one key at the start steps into the pushed line.
+//! The law is the walk's own: text-adjacent lit cells of one line never repeat a stop or step
+//! backward, and every column lit before the insert keeps its stop. Controls: the same keys typed
+//! at the line's end step forward, and one key at the start steps into the pushed line.
 
 use crate::walk_census::*;
 
@@ -88,7 +82,7 @@ fn keys_typed_at_the_start_of_a_lit_line_step_one_stop_a_key() {
         "the premise: the whole line is lit\n{}",
         s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
     );
-    // The law this file was written for: the keys step forward.
+    // The law: the keys step forward.
     let bad = not_forward(&after, 0, k);
     assert!(
         bad.is_empty(),
@@ -97,9 +91,8 @@ fn keys_typed_at_the_start_of_a_lit_line_step_one_stop_a_key() {
         &after[..=k],
         s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
     );
-    // §41: every column lit before the insert shows the stop it showed (the
-    // colour stays with the screen column while the text slides under it).
-    // Checked before the keys' own law so a §41 regression reads as such.
+    // §41: every column lit before the insert keeps its stop (the colour stays with the screen
+    // column while the text slides under it).
     for i in 0..LINE_CELLS {
         let (b, a) = (before[i].expect("lit"), after[i].expect("lit"));
         assert!(
@@ -109,8 +102,7 @@ fn keys_typed_at_the_start_of_a_lit_line_step_one_stop_a_key() {
             s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
         );
     }
-    // And the whole phrase — keys, the pushed text, and the text pushed
-    // past the old end — walks on.
+    // The whole phrase (keys, pushed text, text pushed past the old end) walks on.
     let bad = not_forward(&after, 0, LINE_CELLS + k - 1);
     assert!(
         bad.is_empty(),

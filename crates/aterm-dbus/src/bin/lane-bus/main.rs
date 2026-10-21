@@ -35,6 +35,10 @@
 //!   it before a finger step reaches it, which the lab awaits with a file.
 //!   The session ends once the frame is inactive again. An `<app>` of `-`
 //!   awaits no frame: the client paces the steps with files of its own;
+//! * `cast <mutter-pid> <out.png>`: one frame of that Mutter's primary
+//!   monitor, composited, as a PNG: a ScreenCast session of its own (the
+//!   cursor hidden) whose PipeWire stream `gst-launch-1.0` reads one buffer
+//!   of, the compositor's side of a present under Mutter;
 //! * `xseat <app> <app-pid> <step>...`: `seat`'s steps faked through XTEST on
 //!   the X display `DISPLAY` names ([`xtest`]): the input of weston's x11
 //!   backend nested in that display, whose seat reads its X window. Its
@@ -47,7 +51,13 @@
 //!   client on the display `DISPLAY` names, that drags `<uri>` over the X
 //!   window `<window>` and away, then over it and drops it ([`xdnd`]);
 //! * `xgrab <window> <out>`: the X window's pixels as the server holds them,
-//!   as a PPM ([`xgrab`]), the server's side of a CPU present.
+//!   as a PPM ([`xgrab`]), the server's side of a CPU present;
+//! * `xhide <display> <server> <extension>,...|-`: X display
+//!   `<display>`, a proxy to `<server>` that answers the named extensions
+//!   absent (`xhide`), for the lane's servers without XInput 2 or XKB;
+//! * `wlhide <listen> <server> <rule>...`: a Wayland socket that
+//!   proxies the compositor `<server>` with some of its globals hidden or
+//!   announced at an older version (`wlhide`).
 //!
 //! Each verb picks its peer by process id, not by name: one guest's buses
 //! carry every lane's aterm and every lane's Mutter, and a second Mutter
@@ -80,11 +90,17 @@
 use std::process::ExitCode;
 
 #[cfg(unix)]
+mod relay;
+#[cfg(unix)]
 mod unix;
+#[cfg(unix)]
+mod wlhide;
 #[cfg(unix)]
 mod xdnd;
 #[cfg(unix)]
 mod xgrab;
+#[cfg(unix)]
+mod xhide;
 #[cfg(unix)]
 mod xtest;
 

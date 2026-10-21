@@ -3,19 +3,22 @@
 
 //! A read-only ZIP central-directory reader for the `zip` vendor payload lane.
 //!
-//! # Why first-party
+//! First-party because a third-party zip crate would be a supply-chain edge in the crate
+//! whose subject is supply chain (as `src/tarread.rs` is for tar), and `/usr/bin/ditto -x
+//! -k` writes every member to disk before anything can vet it.
 //!
-//! No zip crate is in the workspace's pinned dependency set, and the two alternatives
-//! were both worse than ~300 lines of parser:
+//! This reader only parses. Every member goes to the same [`super::Layer`] as the tar lanes
+//! as `(raw path, kind, mode, body)`, so the slip vet, `strip_components`, the caps, the
+//! mode sanitizing, the in-root symlink rule and the `tree_root` fold are inherited.
+//! Inflate is `aterm_codec::inflate::stream`.
 //!
-//! * a NEW third-party zip crate is a supply-chain edge on the one crate whose whole
-//!   subject is supply chain (the `tar` crate was retired from the shipped graph for
-//!   exactly this reason — `src/tarread.rs` is first-party for the same argument);
-//! * `/usr/bin/ditto -x -k` writes every member to disk BEFORE anything of ours can vet
-//!   it, so a slip entry has already landed by the time a post-walk could refuse it —
-//!   the opposite of the "vetted before a byte is written" discipline every other lane
-//!   keeps — and its mode/xattr/AppleDouble handling is not something the `tree_root`
-//!   contract can be pinned to.
+//! The central directory is the authority, never the local headers (whose sizes a
+//! streaming writer may not have known): the end record is found by a bounded backward
+//! scan, ZIP64 locator/record and extra fields are honoured when a fixed field is
+//! saturated, and a local header only says where the body starts. Methods `0` (store) and
+//! `8` (deflate). Unix (`3`) and Darwin (`19`) hosts supply `st_mode` in the external
+//! attributes, which decides regular/directory/symlink and the exec bit; any other host
+//! yields mode 0, laid down `0644`.
 //!
 //! This reader only PARSES. Every member is handed to the same [`super::Layer`] as the
 //! tar lanes with `(raw path, kind, mode, body)`, so the slip vet, `strip_components`,
@@ -41,13 +44,12 @@
 //! containing NUL or a backslash, any record/name/extra/body that overruns its span or
 //! the file, a central directory whose size disagrees with its records, trailing bytes
 //! after the end record, a stored member whose two sizes disagree, a body whose length
-//! disagrees with the declared uncompressed size, a symlink target over `PATH_MAX`, and
-//! every kind that is not a file, directory or (where admitted) symlink.
+//! disagrees with the declared size, a symlink target over `PATH_MAX`, and any kind but
+//! file, directory or (where admitted) symlink.
 //!
-//! CRC-32 is deliberately NOT verified: the download's `sha256` gate already ran over
-//! the whole file, and the signed `tree_root` re-verify over the laid-down bytes is a
-//! strictly stronger integrity check than a per-member CRC — a corrupt inflate stream
-//! produces wrong bytes, which produce a mismatching root, which fails the stage closed.
+//! CRC-32 is not verified: the download's `sha256` already covered the file, and the
+//! signed `tree_root` re-verify over the laid-down bytes is a stronger check (a corrupt
+//! inflate stream yields a mismatching root).
 
 use std::cell::Cell;
 use std::fs::File;
@@ -285,7 +287,7 @@ fn read_record(file: &mut File, at: u64, end: u64) -> io::Result<(Record, u64)> 
     let mut local_offset = u64::from(lho);
     let mut disk = u32::from(disk_start);
     if comp == 0xFFFF_FFFF || uncomp == 0xFFFF_FFFF || lho == 0xFFFF_FFFF || disk_start == 0xFFFF {
-        // The ZIP64 extra field lists, IN THIS ORDER, only the fields the fixed record
+        // The ZIP64 extra field lists, in this order, only the fields the fixed record
         // saturated.
         let mut p: usize = 0;
         let mut found = false;
@@ -403,9 +405,9 @@ fn name_to_path(bytes: &[u8]) -> io::Result<PathBuf> {
     }
 }
 
-/// The body of `rec` as a reader of its UNCOMPRESSED bytes, bounded on the compressed
-/// side by `Take` (so a body can never read past its own span) and on the
-/// uncompressed side by the caller's cap.
+/// The body of `rec` as a reader of its uncompressed bytes, bounded on the compressed side
+/// by `Take` (a body never reads past its own span) and on the uncompressed side by the
+/// caller's cap.
 fn open_body<'f>(
     file: &'f mut File,
     rec: &Record,
@@ -458,7 +460,7 @@ pub(super) fn extract(
     let mut seen: u64 = 0;
     while seen < cd.entries {
         seen = seen.saturating_add(1);
-        // The entry cap FIRST, so a record count nothing backs is bounded by it.
+        // The entry cap first, so a record count nothing backs is bounded by it.
         layer.next_entry()?;
         let (rec, next) = read_record(&mut file, at, end)?;
         at = next;

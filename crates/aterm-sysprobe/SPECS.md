@@ -72,6 +72,16 @@
 > `tests/iflist_sdk.rs` (a green run and its negative control). Their specs are not recovered here yet
 > either.
 >
+> Later on 2026-10-20 `net_links_into` and `pid_counts` joined. `net_links_into` reads the links into a
+> buffer the caller keeps (the macOS arm's `iflist::read_growing` now reads into that buffer, the Linux
+> arm is `linux::links_under_into`, which replaced `linux::links_under`); `net_links` is a wrapper that
+> makes one per call. `pid_counts` counts the machine's processes and one user's: on macOS
+> `proc_listallpids` and `proc_listpids(PROC_RUID_ONLY)` through the pure
+> `machine::{pid_room, listed_count, owned_count}` (a uid that owns no process counts zero), on Linux
+> `/proc/loadavg`'s total through the pure `linux::loadavg_tasks` and `linux::Root::tasks`, on Windows
+> `K32GetPerformanceInfo`'s process count. Their tests are 1 more in `src/iflist.rs` (every host) and 3
+> more in `src/tests.rs` (on every host). Their specs are not recovered here yet either.
+>
 > On 2026-10-20 `stdin_sharers` (the members of a group that read its leader's own input device: a
 > program an agent handed its terminal to, which a bare Ctrl-R/Ctrl-S then reaches) and its Linux
 > parser `linux::children` joined, with a spec and a test each: the tables below state 17 specs over

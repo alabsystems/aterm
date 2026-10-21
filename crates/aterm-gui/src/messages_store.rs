@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MESSAGE LOG ON DISK — `<log_dir>/messages.log`, the durable half of
-//! the unified message system (docs/DESIGN-unified-messages-2026-09-21.md
-//! §3.7, D4). The engine encodes lines and keeps the ring
-//! (`aterm_messages::log`); this module is the IO it never does: the bounded
-//! tail read at launch, the named writer thread every drain appends through,
-//! and the rotation that keeps the file near the ring's own size.
+//! `<log_dir>/messages.log`, the durable half of the unified message system
+//! (docs/DESIGN-unified-messages-2026-09-21.md §3.7). `aterm_messages::log` encodes
+//! lines and keeps the ring; this module does the IO: the bounded tail read at launch,
+//! the writer thread every drain appends through, and rotation.
 //!
 //! # Contract
 //!
@@ -81,18 +79,14 @@ use crate::logging::{RotatingFile, RotationBudget};
 
 /// The file's name under the log directory.
 pub(crate) const FILE_NAME: &str = "messages.log";
-/// How much of the file's tail a launch reads. The ring holds `LOG_CAP`
-/// records and a record at every cap is under 32 KiB, so the tail is the
-/// ring's ceiling, generously; a crash record with a 1.5 KiB head is the
-/// largest producer in practice (DESIGN-unified-messages owner question 9;
-/// its interim default, that the retention constants stand, was taken as
-/// decided on 2026-09-25).
+/// How much of the file's tail a launch reads. The largest record in practice is a
+/// crash record with a 1.5 KiB head, so 1 MiB holds a full `LOG_CAP` ring of real
+/// records (not of records at every cap, which run up to 32 KiB).
 pub(crate) const TAIL_BYTES: u64 = 1024 * 1024;
-/// The file's rotation: renamed to `messages.log.1` past the [`TAIL_BYTES`] a
-/// launch reads, so the pair stays near 2 MiB; every writer looks within
-/// 64 KiB or 30 s, as `aterm.log` does — the `LogRotation` model's rate
-/// assumption (a file takes longer than one look to fill) holds a
-/// thousandfold for a log that grows kilobytes a day.
+/// The file's rotation: renamed to `messages.log.1` past the [`TAIL_BYTES`] a launch
+/// reads, so the pair stays near 2 MiB; every writer looks within 64 KiB or 30 s, as
+/// `aterm.log` does (the `LogRotation` model's assumption that a file takes longer than
+/// one look to fill holds easily for a log that grows kilobytes a day).
 pub(crate) const BUDGET: crate::logging::RotationBudget = crate::logging::RotationBudget {
     rotate_at: TAIL_BYTES,
     check_bytes: 64 * 1024,
@@ -101,11 +95,11 @@ pub(crate) const BUDGET: crate::logging::RotationBudget = crate::logging::Rotati
 /// The writer channel's depth: how many lines may wait for the thread before
 /// the next ones wait in the writer's overflow.
 pub(crate) const QUEUE_CAP: usize = 512;
-/// The wire's file, beside [`FILE_NAME`] (design ruling 200).
+/// The wire's file, beside [`FILE_NAME`].
 pub(crate) const WIRE_FILE_NAME: &str = "messages.wire.log";
-/// The wire's file rotates past this, and a launch reads this much of its
-/// tail: 256 KiB holds the ring's wire share ([`aterm_messages::WIRE_LOG_SHARE`])
-/// of ordinary notices several times over, and the pair stays near 512 KiB.
+/// The wire's file rotates past this, and a launch reads this much of its tail: 256 KiB
+/// holds the ring's wire share (`aterm_messages`'s `WIRE_LOG_SHARE`) of ordinary notices
+/// several times over.
 pub(crate) const WIRE_TAIL_BYTES: u64 = 256 * 1024;
 /// The wire file's rotation: [`BUDGET`]'s looks at [`WIRE_TAIL_BYTES`].
 pub(crate) const WIRE_BUDGET: RotationBudget = RotationBudget {
@@ -147,20 +141,17 @@ pub(crate) fn load_for_launch(path: &Path) -> Loaded {
     loaded
 }
 
-/// A bounded, no-follow read of the last `tail` bytes of the log ACROSS ITS
-/// ROTATION: when `path` holds fewer than `tail` bytes, the rest comes from the
-/// end of `messages.log.1` first — oldest first, so ids keep rising and a
-/// `Posted` in the older copy meets its `Retired` in the current file (an
-/// orphan `Retired` is ignored by the replay). Each file is read only as a
-/// REGULAR file; the partial first line of a cut is dropped, every whole line
-/// is offered to the codec, junk is counted and skipped. A symlink, a
-/// directory or an unreadable file is nothing — a message log is never worth
-/// refusing to launch over.
+/// A bounded, no-follow read of the last `tail` bytes of the log across its rotation:
+/// when `path` holds fewer than `tail` bytes, the rest comes from the end of
+/// `messages.log.1`, read first so ids keep rising and a `Posted` in the older copy
+/// meets its `Retired` (the replay ignores an orphan `Retired`). Only regular files are
+/// read; the partial first line of a cut is dropped and junk is counted and skipped. A
+/// symlink, a directory or an unreadable file reads as nothing: a message log is never
+/// worth refusing to launch over.
 ///
-/// The wire's pair ([`wire_path`]) is read the same way, at most
-/// [`WIRE_TAIL_BYTES`], and the two are replayed as ONE sequence ordered by
-/// id — a stable sort, so a record's own lines (all in one file) keep their
-/// order and the ring stays oldest-first (design ruling 200).
+/// The wire's pair ([`wire_path`]) is read the same way, at most [`WIRE_TAIL_BYTES`],
+/// and the two are replayed as one sequence by a stable sort on id, so a record's own
+/// lines (all in one file) keep their order.
 pub(crate) fn load_tail(path: &Path, tail: u64) -> Loaded {
     let (lines, skipped) = tail_lines(path, tail);
     let mut log = MessageLog::empty();
@@ -168,11 +159,11 @@ pub(crate) fn load_tail(path: &Path, tail: u64) -> Loaded {
     Loaded { log, skipped }
 }
 
-/// The decoded lines of the last `tail` bytes across the pair (and the wire's
-/// pair), in replay order, and how many the codec refused. The launch load
-/// builds the ring from them; a successor's Commit reads them AGAIN
-/// ([`aterm_messages::MessageCenter::catch_up`]) for what its parent wrote
-/// while the two overlapped.
+/// The decoded lines of the last `tail` bytes across the pair (and the wire's pair), in
+/// replay order, and how many the codec refused. The launch load builds the ring from
+/// them; a successor's Commit reads them again
+/// ([`aterm_messages::MessageCenter::catch_up`]) for what its parent wrote while the two
+/// overlapped.
 pub(crate) fn tail_lines(path: &Path, tail: u64) -> (Vec<LogLine>, usize) {
     let mut lines = Vec::new();
     let mut skipped = read_pair(path, tail, &mut lines);
@@ -255,8 +246,8 @@ fn encoded(line: &LogLine) -> String {
     s
 }
 
-/// The two appenders behind the one lock: aterm's own file, and the wire's
-/// (design ruling 200), opened at its first line.
+/// The two appenders behind the one lock: aterm's own file, and the wire's, opened at
+/// its first line.
 struct Files {
     host: RotatingFile,
     wire: WireFile,
@@ -334,8 +325,7 @@ pub(crate) struct Writer {
     overflowed: Arc<AtomicUsize>,
     files: Arc<Mutex<Files>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The folder the file lives in — the log dir, where `aterm.log`,
-    /// `packages.log` and the crash reports sit beside it.
+    /// The folder the file lives in: the log dir.
     folder: Option<PathBuf>,
 }
 
@@ -718,8 +708,7 @@ mod tests {
     fn append_never_drops_and_keeps_the_engines_order_past_the_channels_depth() {
         let dir = scratch("append");
         let path = dir.join(FILE_NAME);
-        // The thread died (its receiver is gone): every line is written by
-        // the caller, in order, and none is lost.
+        // A dead thread (receiver gone): the caller writes every line, in order.
         let (writer, rx) = Writer::unattended(&path, 2);
         drop(rx);
         let lines: Vec<LogLine> = (1..=5).map(|i| posted(i, &format!("m{i}"))).collect();
@@ -737,10 +726,8 @@ mod tests {
             );
         }
         drop(writer);
-        // The real thread, pushed past the channel's depth in one append:
-        // every line reaches the file by the time the writer is dropped
-        // (drop joins the thread), IN THE ORDER APPENDED — the caller waited
-        // for a slot rather than writing ahead of the queue.
+        // The real thread, pushed past the channel's depth in one append: every line
+        // lands in the order appended (the caller waited for a slot).
         let path = dir.join("threaded.log");
         let writer = Writer::spawn(&path).expect("a writer over a temp file");
         let many: Vec<LogLine> = (1..=(QUEUE_CAP as u64 + 50))
@@ -867,11 +854,8 @@ mod tests {
         check_every: std::time::Duration::ZERO,
     };
 
-    /// THE LOG ROTATES WHILE RUNNING AND STAYS BOUNDED (design ruling 65):
-    /// a writer that appends three budgets' worth of records leaves the current
-    /// file and one older copy, each within the budget plus one look and one
-    /// line, and no second older copy — however long the process runs, and
-    /// without a launch in between.
+    /// Three budgets' worth of appends leave the current file and one older copy, each
+    /// within the budget plus one look and one line.
     #[test]
     fn the_log_rotates_while_running_and_stays_bounded() {
         let dir = scratch("rotate");
@@ -899,10 +883,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A LAUNCH READS ACROSS THE ROTATION: the older copy's tail first, then the
-    /// current file — every record, the ids rising past the newest, and a
-    /// `Posted` in `.1` meeting its `Retired` in the current file (so it is not
-    /// a dead process's open row).
+    /// The older copy's tail is read first: a `Posted` in `.1` meets its `Retired` in
+    /// the current file, and ids rise past the newest.
     #[test]
     fn a_launch_reads_across_the_rotation() {
         let dir = scratch("across");
@@ -964,11 +946,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A SCRIPT'S FLOOD NEVER ROTATES ATERM'S RECORD OFF DISK (design ruling
-    /// 200): one host record, then three wire budgets of wire records. The
-    /// wire's lines land in `messages.wire.log` and rotate there, bounded;
-    /// `messages.log` holds the host line alone and never rotated; a launch
-    /// reads the host record back beside the wire's newest.
+    /// Wire lines rotate in `messages.wire.log`, bounded; `messages.log` keeps its one
+    /// host record unrotated, and a launch reads it back beside the wire's newest.
     #[test]
     fn a_wire_flood_never_rotates_aterms_own_record_off_disk() {
         let dir = scratch("wire-shelf");
@@ -1019,10 +998,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A LAUNCH MERGES THE TWO FILES BY ID (design ruling 200): records
-    /// interleaved across `messages.log` and `messages.wire.log` load
-    /// oldest-first by id, each meeting its own `Retired`, and ids continue
-    /// past the newest of either; the wire's tail is read at most
+    /// Records interleaved across the two files load oldest-first by id, each meeting
+    /// its own `Retired`; ids continue past the newest; the wire's tail is read at most
     /// [`WIRE_TAIL_BYTES`].
     #[test]
     fn a_launch_merges_the_two_files_by_id() {

@@ -68,14 +68,12 @@ impl Scene {
                 (y1 - y0) as f32 / f32::from(CELL_H),
                 (x1 - x0) as f32 / f32::from(CELL_W),
             );
-            // The caret's own keep-off ring is not protected pixels to its
-            // escort: `STATION_LEAD` seats the pet one cell past the caret,
-            // inside that 3x3 ring. Selections, images and uncertified rows
-            // still fail here, and the caret cell itself stays uncovered at
-            // rest because the station puts the body beside it.
+            // The caret's keep-off ring is not protected from its own escort: `STATION_LEAD` seats
+            // the pet one cell past the caret, inside that 3x3 ring. Selections, images and
+            // uncertified rows still fail here.
             assert!(world.under_text_clearance_past_caret(rect, 0.0) == Some(true));
-            // Real ink under the drawn body is always in front of it. The
-            // caret's ring is protection, not ink: it does not send it under.
+            // Real ink under the drawn body is in front of it; the caret's ring is protection,
+            // not ink.
             assert!(frame.under_ink || world.ink_clearance(rect, 0.0) == Some(true));
         }
         frame
@@ -164,9 +162,8 @@ fn hidden_cursor_home_stays_put_while_real_output_scrolls() {
     }
     s.work();
     let moving = s.tick(16);
-    // A new output interest directs the gaze instead of commissioning a
-    // distant perch trip. Actual flight/landing ownership is separately
-    // exercised by console_handoff_conformance's real local-hop fixture.
+    // New output interest turns the gaze; it does not start a perch trip. Flight and landing are
+    // covered by `console_handoff_conformance`.
     assert!(
         !s.brain.needs_frames(),
         "output interest must not move the base"
@@ -203,9 +200,8 @@ fn output_over_the_old_perch_keeps_the_full_body_and_settles_without_polling() {
     let before = s.settle();
     let anchor = s.brain.console_anchor_id().expect("real executing block");
     let old_top = PetWorldFacts::read(&s.term, 7).stamp.top_absolute_row;
-    // The old body lived beside a short output line. This real output burst
-    // both scrolls its content away and fills its old columns with new text,
-    // while leaving a wide, certified gutter beside the current output.
+    // The burst scrolls the old body's content away and fills its columns with new text, leaving a
+    // wide certified gutter beside the current output.
     for _ in 0..30 {
         s.term.process(b"\r\nterrain observation line");
     }

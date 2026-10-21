@@ -647,8 +647,8 @@ const fn resync(bytes: &[u8], pos: usize, budget: usize) -> Resync {
 }
 
 /// Whether a complete, CRC-valid frame starts anywhere after `pos` (never at
-/// `pos` itself), answered conservatively under a linear CRC-byte budget
-/// ([`resync_budget`]). A crash leaves nothing decodable behind its partial
+/// `pos` itself), answered conservatively under a linear CRC-byte budget.
+/// A crash leaves nothing decodable behind its partial
 /// frame, unless that frame's own body nests one, which this test cannot tell
 /// from a frame that follows it (the module doc says what that costs). Scanning
 /// byte by byte is the honest test: a damaged header carries no trustworthy

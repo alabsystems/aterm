@@ -18,8 +18,8 @@ at 2050 see wall:usage-session
 expect open p1 wall par=t1 wall=usage-session src=screen conf=strong
 expect need=wall:usage-session
 wait 1000
-expect close p1 wall out=gone src=screen at=2050
-expect close t1 turn out=wall:usage-session steps=1 walls=1 src=screen at=2050
+expect close p1 wall out=gone src=screen @2050
+expect close t1 turn out=wall:usage-session steps=1 walls=1 src=screen @2050
 expect open p2 wall par=r1 wall=usage-session cont=p1 orphan=1 src=screen
 at 3600 tx prompt v1 dated=0 off=27679 slice=2.1.303:36-40
 expect amend t1 turn vref=v1 by=vendor src=transcript conf=exact

@@ -20,8 +20,8 @@ fn root(comm: &str, children: &[i32]) -> RootAnswer {
 #[test]
 fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
     let sh = root("zsh", &[]);
-    // NEGATIVE CONTROL: a shell at its prompt, holding its own foreground,
-    // with no child, ran nothing — and a login shell's `-zsh` is a shell.
+    // Negative control: a shell at its prompt, holding its own foreground, with no child, ran
+    // nothing; a login shell's `-zsh` is a shell.
     assert_eq!(leaf_program(100, 100, &sh, Some((100, "zsh"))), None);
     assert_eq!(leaf_program(100, 100, &root("-zsh", &[]), None), None);
     // A foreground job, named only for its own group (the quit's test).
@@ -33,7 +33,7 @@ fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
         leaf_program(200, 100, &sh, Some((100, "zsh"))).as_deref(),
         Some("")
     );
-    // R1: the root is the program (`aterm -e claude`, `exec vim`).
+    // The root is the program (`aterm -e claude`, `exec vim`).
     assert_eq!(
         leaf_program(100, 100, &root("2.1.281", &[]), Some((100, "claude"))).as_deref(),
         Some("claude")
@@ -43,7 +43,7 @@ fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
         Some(""),
         "a name resolved before the exec still says the shell: unnamed"
     );
-    // R2: a background or suspended job leaves the foreground at the shell.
+    // A background or suspended job leaves the foreground at the shell.
     assert_eq!(
         leaf_program(100, 100, &root("bash", &[4242]), None).as_deref(),
         Some("")
@@ -57,14 +57,10 @@ fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
     assert_eq!(leaf_program(100, 100, &RootAnswer::Unasked, None), None);
 }
 
-/// A PTY pair with BOTH ends close-on-exec from birth
-/// (`aterm_pty::open_pty_pair`). Never `openpty(3)`, whose ends are
-/// inheritable: the leader spawned onto its pair kept a copy of its own
-/// master, so closing the test's copy never hung the terminal up, and at
-/// the leader's exit the tty waited for output whose only reader was the
-/// exiting process. MEASURED 2026-09-30: eleven `bash` / `sh -i` / `sleep
-/// 30` processes sat in `?E` for a day, each holding its own pty's
-/// `/dev/ptmx`; a `tcflush` of the slave's output released them.
+/// A PTY pair with both ends close-on-exec from birth (`aterm_pty::open_pty_pair`). Never
+/// `openpty(3)`, whose ends are inheritable: a leader spawned onto its pair keeps a copy of its
+/// own master, so closing the test's copy never hangs the terminal up, and at the leader's exit
+/// the tty waits in `?E` for output whose only reader is the exiting process.
 fn open_pty_pair() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
@@ -261,9 +257,8 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     name_group(&app, 5, exec.1, "sh");
     let bg_jobs = children(bg.1);
 
-    // Ruling 293: tab 2's leaf carries the agent its session hosts (as
-    // the journal's capture fills it), so its entry is marked as that
-    // agent; every other entry is not (the negative control).
+    // Tab 2's leaf carries the agent its session hosts (as the journal's capture fills it), so
+    // its entry is marked as that agent; no other entry is (the negative control).
     let mut manifest = app.capture_restore_manifest();
     let hosted = restore::AgentRestore {
         word: String::new(),
@@ -300,15 +295,9 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
         "tabs 0 (no process) and 1 (a shell at its prompt) have none"
     );
 
-    // TAB 2'S, 4'S AND 3'S SESSIONS SHOWN AGAIN IN A SECOND WINDOW (`Open
-    // Session in New Window`; restore audit, 2026-10-02). The agent comes
-    // back once, at its first place, and is lost in neither tab that
-    // showed it; `sleep` was running in both of its tabs; the `sleep &`
-    // counts in both of its tabs and as one program. RED before: the
-    // capture counted each session once, so the second window's `sleep`
-    // tab went unsaid — and an image with an entry per leaf (an older
-    // writer's) said the relaunched agent was lost in the second; a
-    // per-leaf capture without the mark counted the unnamed job twice.
+    // Tabs 2, 4 and 3 shown again in a second window (`Open Session in New Window`): the agent
+    // comes back once, at its first place, and is lost in neither tab; `sleep` counts in both of
+    // its tabs; the `sleep &` counts in both tabs as one program.
     let mut coview = manifest.windows[0].clone();
     coview.restored_tabs = vec![
         coview.restored_tabs[2].clone(),
@@ -353,18 +342,14 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     kill_all(&pids, &[idle.0, fg.0, bg.0, exe.0, exec.0]);
 }
 
-/// AUDIT #8 — A PANE A PROGRAM HELD DOES NOT COME BACK SAYING ANOTHER
-/// MACHINE'S FOLDER IS MISSING. Two real sessions report a folder that is
-/// not here, under another host's name, as ssh's remote shell does: tab 2
-/// with a foreground `sleep` standing in for ssh, tab 1 a shell at its
-/// prompt (the NEGATIVE CONTROL). The durable capture marks tab 2's leaf
-/// held and not tab 1's; the seamless update's layout marks neither, and
-/// nor does the durable capture once tab 2's program is the agent aterm
-/// hosts there. Through the wire, the held leaf's restore does not ask
-/// for that folder and the reopened row counts it apart, while the
-/// shell's pane still asks (its spawn falls back to the home folder and
-/// says so) and is counted as gone. A held pane whose folder IS here
-/// keeps it.
+/// A pane a program held does not come back saying another machine's folder is missing. Two
+/// real sessions report a folder that is not here, under another host's name, as ssh's remote
+/// shell does: tab 2 with a foreground `sleep` standing in for ssh, tab 1 a shell at its prompt
+/// (the negative control). The durable capture marks tab 2's leaf held and not tab 1's; the
+/// update's layout marks neither, nor does the durable capture once tab 2's program is the agent
+/// aterm hosts. Through the wire the held leaf's restore does not ask for that folder and the
+/// reopened row counts it apart, while the shell's pane still asks and is counted as gone. A
+/// held pane whose folder is here keeps it.
 #[test]
 fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
     let home = aterm_tempfile::tempdir().expect("scratch home");
@@ -507,10 +492,9 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
     kill_all(&[group, idle.1, held.1], &[idle.0, held.0]);
 }
 
-/// R3 — a program starting in a tab marks the journal's lane dirty even
-/// when nothing else would wake a capture (the status sweep's foreground
-/// group change). NEGATIVE CONTROL: a sweep that sees the same group
-/// leaves the lane clean.
+/// A program starting in a tab marks the journal's lane dirty even when nothing else would wake
+/// a capture (the sweep's foreground group change). Negative control: a sweep that sees the same
+/// group leaves the lane clean.
 #[test]
 fn a_foreground_change_owes_the_journal_a_capture() {
     let mut app = App::headless_for_test();

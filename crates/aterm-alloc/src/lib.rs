@@ -14,20 +14,19 @@
 //! ## `ArrayVec` is also republished as the `arrayvec` package
 //!
 //! `crates/aterm-arrayvec` is a shim whose `[package] name` is `arrayvec`; it
-//! re-exports [`ArrayVec`] and nothing else of substance, so that
-//! `[patch.crates-io]` can point `naga` / `wgpu` / `wgpu-core` / `wgpu-hal`
-//! (and, until LW.5, `tiny-skia`) at this implementation. Anything you change in
-//! `array_vec.rs` is therefore load-bearing for third-party GPU code as well as
-//! for aterm's parser — read `crates/aterm-arrayvec/src/lib.rs` first.
+//! re-exports [`ArrayVec`] so that `[patch.crates-io]` can point `naga` /
+//! `wgpu` / `wgpu-core` / `wgpu-hal` at this implementation. Anything you
+//! change in `array_vec.rs` is therefore load-bearing for third-party GPU code
+//! as well as for aterm's parser — read `crates/aterm-arrayvec/src/lib.rs`
+//! first.
 //!
 //! ## `SmallVec` is also the storage of the `smallvec` package
 //!
 //! `crates/aterm-smallvec` (package `smallvec`) wraps [`SmallVec<T, N>`] as
-//! upstream's `SmallVec<[T; N]>` for parking_lot_core and the wgpu crates
-//! (wayland-backend too, until linux-windowing LW.7). It adds no unsafe code:
-//! every `MaybeUninit`
-//! those consumers reach is in `small_vec.rs`, so a change there is checked by
-//! that crate's tests too (`targo --unverified test -p smallvec`).
+//! upstream's `SmallVec<[T; N]>` for `parking_lot_core` and the `wgpu` crates.
+//! It adds no unsafe code: every `MaybeUninit` those consumers reach is in
+//! `small_vec.rs`, so a change there is checked by that crate's tests too
+//! (`targo --unverified test -p smallvec`).
 
 // `no_std` + `alloc`: `ArrayVec` names only `core`, and `SmallVec`'s heap
 // fallback needs only `alloc::vec::Vec`. That keeps the `arrayvec` shim's
@@ -59,10 +58,9 @@ use core::mem::MaybeUninit;
 /// destructor panics, the rest are still dropped before the panic carries on
 /// (a second panic aborts, as for any slice). Every bulk drop in this crate —
 /// `clear`, `truncate`, the vectors' `Drop`, a by-value iterator's `Drop` —
-/// goes through here, which is how std `Vec` and upstream `arrayvec` drop a
-/// cut range (ruling 2026-10-10: a slot-by-slot loop stopped at the first
-/// panic and leaked every later element). The caller lowers its length (or
-/// cursor) first, so the unwind cannot reach these slots again.
+/// goes through here, matching std `Vec` and upstream `arrayvec`. The caller
+/// lowers its length (or cursor) first, so the unwind cannot reach these slots
+/// again.
 ///
 /// # Safety
 ///

@@ -1139,3 +1139,60 @@ fn a_rows_button_a_state_line_moved_under_a_still_pointer_waits_for_a_look() {
     assert_ne!(state(&app), still, "the next click presses {row}");
     host.shutdown_and_join();
 }
+
+/// THE EVERY ROW READS EACH SESSION'S CHIP (design §12.4.3, item 3, slice
+/// 4c): on the App, a session under Land is counted by the face its chip
+/// wears, from the glass the loop's facts set. Of five sessions, Land every
+/// session lands the two cruising ones beside the one under Land by its own
+/// word; the loop tells one landed and one a person's own exchange. The row
+/// says `1 landing, 1 landed, 1 quiet`, the Cruise press says the same of
+/// what it moves, and moves all three (read by those parts: the rest of
+/// each line is other features' words). NEGATIVE CONTROL (run by hand,
+/// recorded in the slice's commit): counting modes says `3 landing`.
+#[test]
+fn the_every_row_reads_each_sessions_chip_face() {
+    use crate::claude_lights::ChipFace;
+    use crate::harness_screen::EveryPress;
+    use aterm_agent::harness::acts::TaskFace;
+    let (mut app, host, ids) = five_sessions("");
+    let [a, b, _off, land, _agy] = ids;
+    assert_eq!(
+        app.press_autopilot_every(EveryPress::Mode(Autopilot::Land)),
+        2,
+        "the two that cruise"
+    );
+    let sid = |app: &App, s: u64| app.pool.get(s).unwrap().ctx.self_id.as_str().to_string();
+    let (landed, quiet) = (sid(&app, land), sid(&app, b));
+    app.apply_harness_fact(&landed, crate::HarnessFact::Task(Some(TaskFace::Landed)));
+    app.apply_harness_fact(&quiet, crate::HarnessFact::Task(Some(TaskFace::Theirs)));
+    let state = app.harness_state();
+    let face = |s: u64| {
+        state
+            .sessions
+            .iter()
+            .find(|row| row.local_id == s)
+            .map(|row| ChipFace::of(row.view, &row.glass))
+    };
+    assert_eq!(
+        [face(a), face(b), face(land)],
+        [
+            Some(ChipFace::Land),
+            Some(ChipFace::Theirs),
+            Some(ChipFace::Landed)
+        ],
+        "the page holds each chip's face"
+    );
+    let every = state.every_row().expect("five sessions");
+    assert_eq!((every.landing, every.landed, every.quiet), (1, 1, 1));
+    let cruise = EveryPress::Mode(Autopilot::Cruise);
+    let (line, description) = (every.line(), every.description(cruise));
+    for part in ["1 landing", "1 landed", "1 quiet"] {
+        assert!(super::landings::says(&line, part), "{part}: {line}");
+        assert!(
+            super::landings::says(&description, part),
+            "{part}: {description}"
+        );
+    }
+    assert_eq!(app.press_autopilot_every(cruise), 3, "all three it names");
+    host.shutdown_and_join();
+}

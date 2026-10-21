@@ -276,6 +276,8 @@ fn a_demand_is_registered_poked_and_met_by_a_pass() {
                     held_back: false,
                     hogs: 0,
                     largest: 0,
+                    left: Vec::new(),
+                    ended_at_unix: None,
                 });
             });
         })
@@ -316,6 +318,8 @@ fn a_spent_pass_answers_unmet_with_counts_not_paths() {
         held_back: false,
         hogs: 5,
         largest: 100 * GIB,
+        left: Vec::new(),
+        ended_at_unix: None,
     };
     let watch = {
         let shelf = Arc::clone(&shelf);
@@ -621,6 +625,7 @@ fn an_8_3_spelling_carries_on_its_volumes_row() {
         fstype: String::new(),
         local: true,
         automounted: false,
+        removable: false,
         read_only: false,
         container: Some("Volume{6140fc3b-044f-43d7-b060-cb98170c7a63}".to_owned()),
     };

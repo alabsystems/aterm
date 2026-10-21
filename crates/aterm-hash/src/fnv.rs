@@ -13,7 +13,7 @@
 //! (`astream_wire::hash::{fnv1a_64_update, FNV1A_64_INIT}`), the function
 //! astream's `assign_partition` hashes a partition key with: one FNV across
 //! aterm and the bus it builds on. Both compute the published algorithm, so
-//! every value aterm has persisted is the same value it was. What stays here
+//! persisted values match. What stays here
 //! is what astream exports no counterpart for: the prime (for the word fold
 //! below), the 128-bit member, and the fixed-width little-endian feeds.
 //!
@@ -267,13 +267,13 @@ mod tests {
 
     /// FNV's published vectors; a wrong prime can agree in the low 40 bits only.
     /// These are the conformance check on astream-wire's byte loop: every
-    /// value aterm persisted (`hash=`, node ids, cache names) was one of these
-    /// functions' outputs before the loop moved, so they must not change.
+    /// value aterm persisted (`hash=`, node ids, cache names) is one of these
+    /// functions' outputs, so they must not change.
     /// Each 64-bit vector is also taken through this file's word fold
     /// ([`fnv_mix_u64`] over the bytes widened), the only path here that
     /// multiplies by [`FNV64_PRIME`]: `fnv1a_64` multiplies by astream's own
-    /// private prime, so without those rows a wrong `FNV64_PRIME` passed this
-    /// test (it did, with bit 41 flipped, before they were added).
+    /// private prime, so without those rows a wrong `FNV64_PRIME` would pass
+    /// this test.
     #[test]
     fn matches_the_published_vectors() {
         let word_fold = |bytes: &[u8]| {

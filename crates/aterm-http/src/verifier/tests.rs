@@ -2,9 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! The platform verifier over a locally minted fixture corpus, each case with
-//! its MEASURED verdict per platform.
+//! its measured verdict per platform.
 //!
-//! Coverage, stated plainly:
+//! Exercised here: the Apple arm, accept and reject, offline, and the Unix
+//! arm's chain math ([`the_webpki_chain_math_matches_its_recorded_expectations`]);
+//! the Unix store discovery is in `unix::tests`. The Windows arm is not exercised.
 //!
 //! * **Apple arm** — fully exercised here, accept and reject, offline.
 //! * **Unix arm** — exercised by the same corpus on a Unix host (the `webpki`
@@ -81,7 +83,7 @@ const HOST: &str = "test.aterm.invalid";
 /// `wronghost.der`'s own name.
 const OTHER_HOST: &str = "other.aterm.invalid";
 
-// Pinned instants. NEVER the wall clock — see the module header.
+// Pinned instants, never the wall clock (see the module docs).
 /// 2025-06-15T12:00:00Z — before the `good` window, inside `expired`'s.
 const T25: u64 = 1_749_988_800;
 /// 2026-06-15T12:00:00Z — inside the `good` window.
@@ -94,15 +96,13 @@ const T_GH: u64 = 1_787_986_773;
 
 // --- outcomes --------------------------------------------------------------
 
-/// One verification's result, reduced to accept/reject plus the mapped error
-/// kinds. It
-/// deliberately stops there: every other platform failure arrives as an opaque
-/// `Other(..)` carrying the OS's own words, and asserting on those strings would
-/// be asserting on a macOS release note.
+/// One verification's result: accept/reject plus the mapped error kinds. Every
+/// other failure is an opaque `Other(..)` in the OS's own words, and asserting
+/// on those would pin a macOS release.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Outcome {
     Accept,
-    /// The bytes are not a certificate. NOT a trust verdict.
+    /// The bytes are not a certificate. Not a trust verdict.
     BadEncoding,
     NotValidForName,
     UnknownIssuer,
@@ -117,17 +117,15 @@ enum Outcome {
 }
 
 impl Outcome {
-    /// Did this verification ACCEPT the chain? The only question that matters
-    /// for the security property; everything else is diagnosis.
+    /// Did this verification accept the chain? The only question for the
+    /// security property; everything else is diagnosis.
     fn accepted(self) -> bool {
         matches!(self, Self::Accept)
     }
 }
 
-/// A trustd that stopped answering is the machine's, not a verdict: once one
-/// evaluation in the process is past its suspect age, every later one is
-/// refused at once, so it is never counted as `Rejected` (or as a failed
-/// `Accept`). The gate's own deadline is the only hang detector.
+/// A silent trustd is the machine's, not a verdict, so it is never counted as
+/// `Rejected` or a failed `Accept`. The gate's own deadline is the hang detector.
 const TRUSTD_SILENT: &str =
     "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
 
@@ -169,11 +167,11 @@ fn der(bytes: &'static [u8]) -> CertificateDer<'static> {
 /// One chain, one name, one instant.
 struct Case {
     what: &'static str,
-    /// End-entity FIRST, then intermediates in the order a server would send them.
+    /// End-entity first, then intermediates in the order a server would send them.
     chain: &'static [&'static [u8]],
     server: &'static str,
     now: u64,
-    /// What an Apple platform does with this input. MEASURED.
+    /// What an Apple platform does with this input, measured.
     apple: Outcome,
     /// What the webpki chain math (the Unix arm) does with it. MEASURED.
     webpki: Outcome,
@@ -211,7 +209,7 @@ impl Case {
     }
 }
 
-/// THE CORPUS.
+/// The corpus.
 ///
 /// Every reject case is ARMED: it is paired with at least one case that differs
 /// in exactly ONE variable and must ACCEPT. If a rejection were happening for
@@ -509,15 +507,11 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
 
 #[test]
 fn the_system_trust_store_is_actually_consulted() {
-    // The one control the local corpus cannot provide: a chain that a REAL
-    // system anchor validates. Without it, a verifier that consulted no store at
-    // all would still pass everything above.
-    //
-    // github.com because `aterm-update-core` fetches from github.com and
-    // api.github.com. `now` is pinned inside the captured leaf's window, so this
-    // does not rot when the leaf expires — it needs recapturing only when the
-    // Sectigo/USERTrust ECC anchor leaves the platform store. See
-    // `src/testdata/tls/README.md`.
+    // The control the local corpus cannot provide: a chain a real system anchor
+    // validates, else a verifier that consulted no store would pass. github.com
+    // because `aterm-update-core` fetches from it; `now` is pinned inside the
+    // leaf's window, so it needs recapture only when its anchor leaves the
+    // platform store (`src/testdata/tls/README.md`).
     let real = Case {
         what: "the captured github.com chain, under the system anchors",
         chain: &[GH_LEAF, GH_INT0, GH_INT1],
@@ -555,17 +549,11 @@ fn the_system_trust_store_is_actually_consulted() {
 
 #[test]
 fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
-    // `SecTrustSetAnchorCertificates` DISABLES every other anchor unless
-    // `SecTrustSetAnchorCertificatesOnly(false)` follows it. Getting that
-    // backwards is invisible to every LOCAL fixture — none of them chains to a
-    // public root, so add-semantics and replace-semantics give identical
-    // verdicts across the whole corpus. (Confirmed by mutation: flipping that
-    // one argument to `1` left every other test in this file green.)
-    //
-    // The captured real chain is what tells the two apart: under a verifier that
-    // has been given the fixture root as an EXTRA anchor, github.com must still
-    // validate through the SYSTEM anchors. If extras replaced the system set it
-    // would not.
+    // `SecTrustSetAnchorCertificates` disables every other anchor unless
+    // `SecTrustSetAnchorCertificatesOnly(false)` follows. No local fixture chains
+    // to a public root, so only the captured github.com chain tells add from
+    // replace: with the fixture root as an extra anchor it must still validate
+    // through the system anchors.
     let chain = Case {
         what: "the captured github.com chain, under a verifier with extra anchors",
         chain: &[GH_LEAF, GH_INT0, GH_INT1],
@@ -655,10 +643,9 @@ fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
         "name checking is not happening at all"
     );
 
-    // `rustls` cannot currently build an empty `ServerName`, so the shell's
-    // empty-name guard is defence in depth rather than a reachable path. The
-    // platform arm is reachable directly, so the degenerate value is driven
-    // through IT, and must be refused.
+    // `rustls` cannot build an empty `ServerName`, so the shell's guard is
+    // defence in depth; the platform arm is driven with the degenerate value
+    // directly.
     #[cfg(target_vendor = "apple")]
     {
         let arm = super::apple::Verifier::new(vec![der(ROOT)], provider())

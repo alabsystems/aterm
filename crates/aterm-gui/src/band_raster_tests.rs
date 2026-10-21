@@ -531,8 +531,7 @@ fn an_echo_tail_keeps_its_words_legible_to_the_midpoint() {
 
 /// The Complete echo's one sweep: after the fill reaches the right edge, one
 /// glint about four cells wide crosses the row once, left to right, lifting
-/// the full bar by the glint's own step, the same on dark, light and Solarized
-/// grounds.
+/// the full bar by the glint's own step, on every builtin scheme.
 #[test]
 fn the_complete_echo_sweeps_once_across_the_row() {
     for (name, theme) in themes() {
@@ -839,8 +838,8 @@ fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
             &[base.field_bg, base.bar_bg, base.value],
         );
         let c = palette.colors();
-        // A pastel fill (Catppuccin Latte only) is the cursor as
-        // the theme gives it; every other cursor fill is its accent.
+        // A pastel fill is the cursor as the theme gives it; every
+        // other cursor fill is its accent.
         let cursor_fill = if c.meter_edge.is_some() {
             cursor
         } else {
@@ -885,14 +884,13 @@ fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
     }
 }
 
-/// The pastel fill: a scheme whose cursor is a pastel the 3:1 floor would
-/// turn brown keeps the pastel for the progress fill and ends it in a darker
-/// edge line that stands 3:1 from the track, visibly darker than the fill,
-/// with the words on the fill at AA. No builtin needs it since Catppuccin
-/// Latte's cursor was deepened to 3:1 on its background, so the subject is a
-/// user theme that keeps Latte's upstream rosewater cursor `#dc8a78`. Every
-/// builtin is the ordinary bar: hue floored to 3:1 on the band, track tinted
-/// from it, no edge, and no line in the raster.
+/// The pastel fill: a cursor that is a pastel the 3:1 floor would turn brown
+/// stays the pastel for the progress fill and ends it in a darker edge line,
+/// 3:1 from the track and visibly darker than the fill, with the words on the
+/// fill at AA. No builtin has such a cursor, so the subject is Catppuccin
+/// Latte with upstream's rosewater cursor `#dc8a78`. Every builtin floors its
+/// hue to 3:1 on the band, tints the track from it, and has no edge and no
+/// line in the raster.
 #[test]
 fn only_a_pastel_cursor_keeps_a_pastel_fill_with_a_darker_edge() {
     use aterm_messages::palette::{MeterHue, oklch as ok};

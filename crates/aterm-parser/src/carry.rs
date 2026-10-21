@@ -1,34 +1,28 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The parser's partial state as DATA, for the seamless-update carry.
+//! The parser's partial state as data, for the seamless-update carry.
 //!
-//! A seamless update hands every session's PTY to a successor process. The
-//! PTY output queued behind the handoff reaches the successor's parser, so a
-//! sequence the outgoing parser was in the middle of — a CSI split across two
-//! reads, a UTF-8 glyph split the same way, an OSC title still arriving —
-//! must continue in the successor exactly where it stopped. Otherwise its
-//! tail is read from Ground and prints as text (`6mX` where a colour was
-//! meant, replacement characters where a glyph was).
+//! A seamless update hands every session's PTY to a successor process, whose
+//! parser must continue a sequence the outgoing one was in the middle of (a
+//! split CSI or UTF-8 character, an OSC title still arriving), or its tail
+//! prints as text from Ground.
 //!
 //! [`Parser::carry`] projects the partial state into a [`ParserCarry`];
-//! [`Parser::restore_carry`] validates one and installs it. The carry is
-//! written by one build and read by another, so the reader treats it as
-//! untrusted: it accepts only the states listed on [`Parser::restore_carry`],
-//! with every field inside the bounds the live parser itself keeps, and
-//! refuses anything else with a [`CarryRefusal`] — it never panics. The worst
-//! an accepted carry can do is put the parser in a validated non-Ground state,
-//! which CAN, SUB and ESC leave as they always do.
+//! [`Parser::restore_carry`] validates one and installs it. The carry comes
+//! from another build, so it is untrusted: anything outside the states and
+//! bounds the live parser keeps is refused with a [`CarryRefusal`], never a
+//! panic. The worst an accepted carry can do is put the parser in a validated
+//! non-Ground state, which CAN, SUB and ESC leave as always.
 
 use crate::state::State;
 use crate::tmux::TmuxPassthrough;
 use crate::utf8::Utf8Prefix;
 use crate::{MAX_INTERMEDIATES, MAX_OSC_DATA, MAX_PARAMS, Parser};
 
-/// The most OSC payload bytes a carry holds. An OSC whose collected head is
-/// longer (a clipboard write, an inline image) is carried as
-/// [`ParserCarry::osc_overflowed`] — the successor swallows its tail and
-/// dispatches nothing — so the carry stays small whatever the payload.
+/// The most OSC payload bytes a carry holds. A longer OSC (a clipboard write,
+/// an inline image) is carried as [`ParserCarry::osc_overflowed`]: the
+/// successor swallows its tail and dispatches nothing.
 pub const OSC_CARRY_CAP: usize = 4096;
 
 /// The most bytes of a split UTF-8 character a carry holds: a four-byte
@@ -36,11 +30,9 @@ pub const OSC_CARRY_CAP: usize = 4096;
 pub const UTF8_TAIL_MAX: usize = 3;
 
 /// The state a hooked DCS string is carried in ([`Parser::carry_unhooking`]):
-/// the SOS/PM/APC string state, restored with no APC consumer, whose
-/// transitions are `DcsPassthrough`'s for every byte
-/// (`tests::carry::the_hooked_string_carry_reads_every_byte_as_the_hooked_string`
-/// pins the table and drives both parsers through every one- and two-byte
-/// tail, in both C1 modes).
+/// the SOS/PM/APC string state with no APC consumer, whose transitions are
+/// `DcsPassthrough`'s for every byte
+/// (`tests::carry::the_hooked_string_carry_reads_every_byte_as_the_hooked_string`).
 pub const HOOKED_STRING_CARRY: State = State::SosPmApcString;
 
 /// A parser's partial state, as data (see the module docs).
@@ -51,23 +43,16 @@ pub const HOOKED_STRING_CARRY: State = State::SosPmApcString;
 /// `DcsIntermediate`; `intermediates` in `EscapeIntermediate` and those four;
 /// `osc`/`osc_overflowed` in `OscString`; `utf8_tail`/`utf8_expected` in
 /// `Ground`; `string_utf8_tail` in `DcsIgnore` and `SosPmApcString`. Every
-/// other field is empty — [`Parser::carry`] writes it so and
+/// other field is empty: [`Parser::carry`] writes it so and
 /// [`Parser::restore_carry`] demands it.
 ///
-/// A DCS header (`DcsEntry`, `DcsParam`, `DcsIntermediate`) is carried as
-/// itself, as a CSI is: it holds only its parameters and intermediates, and
-/// the successor hooks the string at its final byte. An ignored DCS
-/// (`DcsIgnore`) is carried as itself, and SOS, PM and APC strings as
-/// `SosPmApcString` with no APC consumer: the successor swallows the rest of
-/// the string up to its terminator instead of printing it (the tail of a
-/// sixel or kitty-graphics payload is base64 as text). A HOOKED DCS string,
-/// when the caller asks for one ([`Parser::carry_unhooking`]), is carried as
-/// `SosPmApcString` with no consumer too: that state reads every byte exactly
-/// as `DcsPassthrough` does.
-///
-/// A carry that crosses to another build takes
-/// [`ParserCarry::for_older_builds`] along beside it: the form a build from
-/// before DCS header carries reads in its place.
+/// A DCS header is carried as itself, as a CSI is; the successor hooks the
+/// string at its final byte. An ignored DCS is carried as itself, and SOS, PM
+/// and APC strings as `SosPmApcString` with no APC consumer, so the successor
+/// swallows the rest to the terminator instead of printing it. A hooked DCS
+/// string is carried only on request ([`Parser::carry_unhooking`]). A carry
+/// that crosses to another build takes [`ParserCarry::for_older_builds`]
+/// beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParserCarry {
     /// The parser state.
@@ -96,10 +81,8 @@ pub struct ParserCarry {
     pub utf8_expected: u8,
     /// The head of a split UTF-8 character that a DCS or APC string's payload
     /// ends in (at most [`UTF8_TAIL_MAX`] bytes): with C1 controls off, a
-    /// `0x9C` that continues it is the character's byte, not the 8-bit ST, so
-    /// the successor must know it is there. A carry from a build before this
-    /// field has none, and one this build writes reads, to such a build, as a
-    /// string whose next `0x9C` ends it (serde ignores the unknown field).
+    /// `0x9C` that continues it is the character's byte, not ST. An older build
+    /// ignores the field (serde) and reads the next `0x9C` as ST.
     pub string_utf8_tail: Vec<u8>,
     /// The tmux passthrough wrapper the parser stands in
     /// ([`TmuxPassthrough::Open`] or [`TmuxPassthrough::Escape`], with the
@@ -121,17 +104,11 @@ impl ParserCarry {
     /// The carry a build that predates DCS header carries reads in this one's
     /// place, or `None` when such a build reads this one as it is.
     ///
-    /// Until 2026-10-10 a DCS header (`DcsEntry`, `DcsParam`,
-    /// `DcsIntermediate`) was carried as `DcsIgnore` holding nothing, and
-    /// `restore_carry` refused a header: a successor of that vintage handed one
-    /// resumes at Ground and prints the string. The header is now carried as
-    /// itself (round fifteen, R15-PARSER-P1), so a carry that crosses to
-    /// another build (`aterm-core`'s wire form) writes this coarse form beside
-    /// it (ruling 2026-10-10): an older successor reads the `DcsIgnore` it
-    /// wrote itself and swallows the string to its terminator, as it always
-    /// did, and this build and every later one read the exact carry. A newer
-    /// successor handed an older producer's `DcsIgnore` reads it as that
-    /// producer meant it.
+    /// Such a build refuses a DCS header (`DcsEntry`, `DcsParam`,
+    /// `DcsIntermediate`) and resumes at Ground, printing the string. A carry
+    /// that crosses builds (`aterm-core`'s wire form) writes this coarse form,
+    /// `DcsIgnore` holding nothing, beside it: an older successor swallows the
+    /// string to its terminator; this build and later read the exact carry.
     #[must_use]
     pub fn for_older_builds(&self) -> Option<ParserCarry> {
         matches!(
@@ -190,7 +167,7 @@ impl std::fmt::Display for CarryRefusal {
 impl std::error::Error for CarryRefusal {}
 
 impl Parser {
-    /// The parser's partial state as a [`ParserCarry`] — a pure read.
+    /// The parser's partial state as a [`ParserCarry`]; a pure read.
     ///
     /// `None` only for a hooked DCS string ([`Parser::in_hooked_dcs`]: in
     /// `DcsPassthrough`, or at the ESC that may begin its ST): its state lives
@@ -296,20 +273,17 @@ impl Parser {
     }
 
     /// Whether [`Parser::carry`] holds this parser's partial sequence only as
-    /// one to SWALLOW, where the live parser would still have delivered it:
+    /// one to swallow, where the live parser would still deliver it:
     ///
-    /// * an OSC string whose collected payload is over [`OSC_CARRY_CAP`] — the
-    ///   live parser keeps up to [`MAX_OSC_DATA`], so an OSC 52 clipboard
-    ///   write or an OSC 1337 image dispatches here and is dropped by the
-    ///   carry (one the live parser already discards past that is not lost);
-    /// * an APC string with its consumer started (`apc_start` was sent, e.g. a
-    ///   kitty-graphics command), whose consumer the carry cannot reach.
+    /// * an OSC string whose payload is over [`OSC_CARRY_CAP`] (the live parser
+    ///   keeps up to [`MAX_OSC_DATA`], so an OSC 52 write or OSC 1337 image
+    ///   would dispatch);
+    /// * an APC string whose consumer was started (`apc_start`), which the carry
+    ///   cannot reach.
     ///
-    /// An SOS or PM string, a `DcsIgnore` and a discarded CSI are swallowed by
-    /// the live parser too, so their carry loses nothing, and a DCS header is
-    /// carried as itself (since 2026-10-10; it was carried as `DcsIgnore`
-    /// before) and hooked by the successor. `false` at Ground and for
-    /// `DcsPassthrough` (which no carry holds at all). A pure read.
+    /// SOS, PM, `DcsIgnore` and a discarded CSI lose nothing (the live parser
+    /// swallows them too), and a DCS header is carried as itself. `false` at
+    /// Ground and in `DcsPassthrough`. A pure read.
     #[must_use]
     pub fn carry_swallows_sequence(&self) -> bool {
         match self.state {
@@ -320,10 +294,9 @@ impl Parser {
     }
 
     /// Whether the sequence [`Parser::carry_swallows_sequence`] names is a
-    /// PICTURE — an APC string with its consumer started (a kitty-graphics
-    /// command) or an OSC 1337 payload (an iTerm2 inline image) — whose loss
-    /// a graphics stream's next frame makes good. An OSC 52 clipboard write
-    /// and any other OSC are not: nothing replaces them. A pure read.
+    /// picture a graphics stream's next frame replaces: an APC string with its
+    /// consumer started (kitty graphics) or an OSC 1337 payload (an inline
+    /// image). An OSC 52 write or any other OSC is not. A pure read.
     #[must_use]
     pub fn carry_swallows_picture(&self) -> bool {
         self.carry_swallows_sequence()
@@ -337,20 +310,15 @@ impl Parser {
     /// Install `carry` (see [`Parser::carry`]) after validating it; on `Err`
     /// the parser is untouched.
     ///
-    /// Accepted states: every state but `DcsPassthrough` — `Ground`, `Escape`,
-    /// `EscapeIntermediate`, the four CSI states, the three DCS header states
-    /// (`DcsEntry`, `DcsParam`, `DcsIntermediate`), `OscString`, and the two
-    /// ignore states, `DcsIgnore` and `SosPmApcString` (restored with no APC
-    /// consumer). A restored header is a sequence like a restored CSI: the
-    /// program's next byte decides what it dispatches, and no DCS or APC
-    /// consumer is armed by a restore. Enforced: at most [`MAX_PARAMS`]
+    /// Accepts every state but `DcsPassthrough`; `SosPmApcString` is restored
+    /// with no APC consumer, and a restored DCS header, like a CSI, arms no
+    /// consumer until the program's next byte. Enforces at most [`MAX_PARAMS`]
     /// parameters, subparameter bits only below `params.len()`, at most
-    /// [`MAX_INTERMEDIATES`] intermediates in `0x20..=0x2F` (and the private
-    /// markers `0x3C..=0x3F` in a CSI or DCS header state), an OSC payload of at
-    /// most [`OSC_CARRY_CAP`] bytes, UTF-8 tails that are prefixes the parser
-    /// itself collects, and every field the state does not use empty.
-    ///
-    /// C1-control interpretation is this parser's own setting and is kept.
+    /// [`MAX_INTERMEDIATES`] intermediates in `0x20..=0x2F` (plus the private
+    /// markers `0x3C..=0x3F` in a CSI or DCS header), an OSC payload of at most
+    /// [`OSC_CARRY_CAP`] bytes, UTF-8 tails that are prefixes the parser itself
+    /// collects, and every field the state does not use empty. The parser keeps
+    /// its own C1 setting.
     pub fn restore_carry(&mut self, carry: &ParserCarry) -> Result<(), CarryRefusal> {
         Self::validate_carry(carry)?;
         self.reset();
@@ -445,8 +413,8 @@ impl Parser {
             return Err(CarryRefusal::Osc);
         }
 
-        // The UTF-8 tail: exactly a prefix `start_utf8` + `process_utf8_byte`
-        // can hold, and only at Ground (UTF-8 is collected nowhere else).
+        // The UTF-8 tail: a prefix `start_utf8` + `process_utf8_byte` can hold,
+        // only at Ground (UTF-8 is collected nowhere else).
         if (!carry.utf8_tail.is_empty() || carry.utf8_expected != 0) && carry.state != State::Ground
         {
             return Err(CarryRefusal::FieldOutsideState);

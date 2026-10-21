@@ -2,24 +2,19 @@
 // Copyright 2026 Andrew Yates
 
 //! The real [`crate::release::Backend`]: what `targo --unverified ship release` asks of
-//! git, the publication engine, verification records, the release cache,
-//! the children it runs (the build, `verify release`, `pub stage`/`pub
-//! publish`, the cut, the site hook), the channel and the owner's aterm.
+//! git, the publication engine, verification records, the release cache, the children it
+//! runs (the build, `verify release`, `pub stage`/`pub publish`, the cut), the site sync,
+//! the channel and the owner's aterm.
 //!
-//! Every child is built with the release's ONE build environment: each variable that
-//! steers a build ([`clears`]) is removed — no caller's `RUSTFLAGS`, wrapper, profile or
-//! target directory reaches the build, `verify release` or the public gate `pub
-//! stage` runs — `TRUST_STAGE2_BIN` names the release's prover
-//! and `PUBLICATION_ENGINE` the one engine the release judges (`--engine`), so the cut
-//! and `pub publish`'s pre-promote read the ledger the release read. Every child the
-//! release waits on that can take long — a step's, the preflight's, git, gh or curl
-//! talking to a remote — starts through ONE spawn path ([`Real::spawn_forwarded`]): in
-//! a session and process group of its own with no controlling terminal ([`detach`]
-//! says why), so it can never stop on the terminal, and an interrupt is handed to its
-//! group (never to a trustd in it) while the release waits for it. A step's output
-//! goes to the step's log (`~/.local/state/aterm-release/logs/<stamp>-<pid>/
-//! <nn>-<step>.log`), and to the terminal too, as it arrives, under `--verbose` — and
-//! always for `verify release`, whose one line per check is the step's progress.
+//! Every child gets the release's one build environment: each variable that steers a
+//! build ([`clears`]) is removed, `TRUST_STAGE2_BIN` names the release's prover and
+//! `PUBLICATION_ENGINE` the one engine the release judges (`--engine`). Every child the
+//! release waits on that can take long (a step's, `ship check`'s, git, gh or curl talking
+//! to a remote) starts through [`Real::spawn_forwarded`]: in its own session and process
+//! group with no controlling terminal ([`detach`]), so it can never stop on the terminal,
+//! and an interrupt is handed to its group (never to a trustd in it). A step's output goes
+//! to its log (`~/.local/state/aterm-release/logs/<stamp>-<pid>/<nn>-<step>.log`), and to
+//! the terminal as it arrives under `--verbose`, and always for `verify release`.
 
 use aterm_uds::spawnfd::{Command, Stdio, command};
 use std::io::Write as _;
@@ -36,10 +31,8 @@ use crate::release::{
 
 /// Where `ship check`'s export and wasm32 gates keep what they leave behind (each run's
 /// own [`Scratch`] under `runs/`, the shared wasm32 target directory): `preflight/` of
-/// the clone's ONE release cache, `<clone>-release.noindex`
-/// ([`crate::snapshot::CacheRoot`]) — outside the clone, so nothing a check does makes
-/// the tree dirty; persistent, so the wasm32 build is warm; private and `.noindex`, so
-/// Spotlight never indexes the source copies.
+/// the clone's release cache ([`crate::snapshot::CacheRoot`]), outside the clone so the
+/// tree stays clean, persistent so the wasm32 build is warm.
 fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
     let dir = crate::snapshot::CacheRoot::for_repo(repo)?.preflight();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -54,20 +47,14 @@ pub const RELEASE_CUTTER_ENV: &str = "ATERM_RELEASE_CUTTER";
 /// person ([`crate::credential_wait::ask_no_one`]: no prompt, no askpass), and — on Unix — the child the leader of a NEW SESSION (`setsid`), which also
 /// makes it the leader of its own process group, the group the interrupt forwards to.
 ///
-/// WHY A SESSION, NOT THE TERMINAL'S FOREGROUND. A child in a background process group
-/// of the release's session that reads its terminal (ssh asking for a key passphrase
-/// during a `git push`) is stopped by SIGTTIN, and the release's `wait` hangs with
-/// nothing said. A child with no controlling terminal cannot be: `/dev/tty` does not
-/// open (ENXIO), so ssh fails at once, and its words land in the step's log and the
-/// refusal. Handing the child the terminal's foreground instead (`tcsetpgrp`, as a
-/// shell does) would let it prompt — but the release runs unattended for hours with
-/// the step's output in its log, so a prompt is a silent wait all the same; it would
-/// take the operator's Ctrl-C and Ctrl-Z away from the release (which would then have
-/// to infer an interrupt from the child's status, and stop and continue the child as
-/// a job-control shell does); and it does nothing for a release that is a background
-/// job or under `nohup`, whose terminal is not its own to hand over. A session works
-/// the same in every one of those. stdin is the caller's to set (`/dev/null` for
-/// every step), and a hangup reaches the child only through the release.
+/// A session, not the terminal's foreground: a background-group child that reads the
+/// terminal (ssh asking for a passphrase during a `git push`) is stopped by SIGTTIN and
+/// the release's `wait` hangs silently, while a child with no controlling terminal fails
+/// at once (`/dev/tty` gives ENXIO) and its words land in the step's log. Handing it the
+/// foreground (`tcsetpgrp`) would make an unattended prompt a silent wait all the same,
+/// take Ctrl-C and Ctrl-Z away from the release, and not work for a background or
+/// `nohup` release. stdin is the caller's to set (`/dev/null` for every step), and a
+/// hangup reaches the child only through the release.
 fn detach(cmd: &mut Command) {
     crate::credential_wait::ask_no_one(cmd);
     #[cfg(unix)]
@@ -322,11 +309,10 @@ impl Real {
         }
     }
 
-    /// THE ONE SPAWN PATH for a child the release waits on: an interrupted release
-    /// starts none (`ErrorKind::Interrupted`); the child is [`detach`]ed (its own
-    /// session and group, no terminal), named in a note of its own while it runs
-    /// ([`crate::release::child_note`], a real run), and the interrupt is handed to its
-    /// group ([`interrupt::Running`]) until the guard returned with it drops.
+    /// The one spawn path for a child the release waits on: an interrupted release starts
+    /// none (`ErrorKind::Interrupted`); the child is [`detach`]ed, named in a note of its
+    /// own while it runs ([`crate::release::child_note`], a real run), and handed the
+    /// interrupt ([`interrupt::Running`]) until the returned guard drops.
     fn spawn_forwarded(
         &self,
         cmd: &mut Command,
@@ -445,8 +431,8 @@ impl Real {
             return not_started();
         }
         cmd.stdin(Stdio::null());
-        // Streamed: ONE pipe for both streams, as `2>&1 | tee` had it — every line
-        // reaches the log and the terminal as it is written, in the order written.
+        // Streamed: one pipe for both streams (like `2>&1 | tee`), so every line reaches
+        // the log and the terminal as it is written, in the order written.
         let pipe = if stream {
             let made = std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w)));
             match made {
@@ -516,9 +502,9 @@ impl Real {
         }
     }
 
-    /// [`crate::release::child_note`]: the step's child, while it runs (a real run only),
-    /// one note per child — a step runs several beside each other; the note's path, for
-    /// the guard that removes it.
+    /// Note the step's child `pid` while it runs ([`crate::release::child_note`], a real run
+    /// only), one note per child since a step runs several beside each other: the note's
+    /// path, for the guard that removes it.
     fn note_child(&self, pid: u32) -> Option<PathBuf> {
         (!self.scratch_logs).then(|| note_child_in(&self.release, self.step, pid))
     }
@@ -536,7 +522,7 @@ impl Real {
             .join(format!("{:02}-{}-{what}.log", step.number(), step.name()))
     }
 
-    /// THE ENGINE AT ITS OWN origin/main, its appended audit rows kept (the pub-sync
+    /// The engine to its own origin/main, its appended audit rows kept (the pub-sync
     /// pattern): `pub stage` refuses an engine that is not exactly its origin/main, and
     /// every dry run and stage appends a row to the tracked `verification-log.jsonl`.
     fn engine_sync(&self) -> Result<(), Refusal> {
@@ -561,7 +547,7 @@ impl Real {
             .filter(|l| l.starts_with('{'))
             .map(str::to_string)
             .collect();
-        // APPENDED, never rewritten: a later sync's empty diff must not overwrite the
+        // appended, never rewritten: a later sync's empty diff must not overwrite the
         // rows an earlier one kept and could not record
         let kept = self.logs.join("audit-rows.jsonl");
         if !rows.is_empty()
@@ -652,7 +638,7 @@ impl Real {
         })
     }
 
-    /// The ONE clean-tree judge ([`crate::clean`]): the tree's own `.gitignore` rules,
+    /// The one clean-tree judge ([`crate::clean`]): the tree's own `.gitignore` rules,
     /// never `.git/info/exclude` or `core.excludesFile`. `Err` when git could not answer.
     fn dirty(&self) -> Result<Vec<String>, String> {
         crate::gates::dirty_paths(&self.repo).map_err(|e| e.to_string())
@@ -747,13 +733,12 @@ impl Real {
         })
     }
 
-    /// THE ENGINE A READ-ONLY RUN DRIVES: a `git clone --shared` of the engine in the
-    /// run's own scratch directory, at its origin's main (fetched now), origin set to
-    /// the engine's own — what a release's sync would bring the engine to. The copy
-    /// passes the engine's own checks (on main, clean, exactly its origin's main), and
-    /// its audit row and repo lock land in the copy: the engine's checkout is never
-    /// written, and no read-only run contends with a release or another check. `Err` is
-    /// a could-not-run with its fix.
+    /// The engine a read-only run drives: a `git clone --shared` of the engine in the run's
+    /// own scratch directory, at its origin's main (fetched now), origin set to the engine's
+    /// own, as a release's sync would leave the engine. The copy passes the engine's own
+    /// checks (on main, clean, exactly its origin's main) and takes its audit row and repo
+    /// lock, so the engine's checkout is never written and no read-only run contends with a
+    /// release or another check. `Err` is a could-not-run with its fix.
     fn scratch_engine(&self, scratch: &Scratch) -> Result<PathBuf, Refusal> {
         if let Some(why) = self.no_engine() {
             return Err(why);
@@ -840,16 +825,14 @@ impl Real {
         })
     }
 
-    /// THE EXPORT GUARDS, `ship check --export`: the engine's own dry run, `pub stage
-    /// aterm --dry-run --no-check --commit R --repo-path <scratch clone>` — every export
-    /// guard `pub stage` runs (forbidden content, private references, gitleaks, the cargo
-    /// metadata closure, README versions, dead links) in one pass, over a scratch clone
-    /// of R, never this checkout's `publish/.out`, where a real stage's attestation waits
-    /// for `pub publish`, and on a [`Real::scratch_engine`] copy, so the engine's
-    /// checkout is never written (a release's step 4 runs the real `pub stage`). The
-    /// engine stages only a commit on its origin's main and reads its remotes, so
-    /// unpushed work, or no network, is a could-not-run, never a pass. Returns the
-    /// export the guards judged, for the wasm32 engine.
+    /// The export guards, `ship check --export`: the engine's own dry run, `pub stage aterm
+    /// --dry-run --no-check --commit R --repo-path <scratch clone>`, every export guard `pub
+    /// stage` runs (forbidden content, private references, gitleaks, the cargo metadata
+    /// closure, README versions, dead links) in one pass, over a scratch clone of R (never
+    /// this checkout's `publish/.out`, where a real stage's attestation waits for `pub
+    /// publish`) and a [`Real::scratch_engine`] copy. The engine stages only a commit on its
+    /// origin's main and reads its remotes, so unpushed work, or no network, is a
+    /// could-not-run, never a pass. Returns the export the guards judged, for the wasm32 gate.
     pub(crate) fn export_gate(&mut self, scratch: &Scratch, r: &str) -> (Outcome, Option<PathBuf>) {
         let not_run = |why: Refusal| (Outcome::CouldNotRun(why), None);
         if !self.is_ancestor(r, "refs/remotes/origin/main") {
@@ -1307,8 +1290,8 @@ impl Real {
         })
     }
 
-    /// `ship build` as the build step's child — R's own cutter (this binary): it reads the
-    /// journal's reservation and builds its bundle once into the release cache — and the
+    /// `ship build` as the build step's child (R's own cutter, this binary: it reads the
+    /// journal's reservation and builds its bundle once into the release cache), and the
     /// COMPLETE entry it left, read back by the key it built under.
     fn build_run(
         &self,
@@ -1395,14 +1378,11 @@ impl Real {
             .map_err(|e| format!("the release JSON of {tag} is not JSON: {e}"))
     }
 
-    /// THE EVERGREEN POINTER, read from what github.com serves a stranger: the first
-    /// hop of `releases/latest/download/aterm-appcast.toml` is a 302 to exactly this
-    /// tag's appcast, and the appcast served there names this version and binds its
-    /// `url` to this tag and its DMG. `Err` when GitHub could not be READ (the HEAD
-    /// failed, an answer that is neither 302 nor 404, the appcast's fetch failed):
-    /// nothing is known about the release's shape then, so the caller says COULD NOT
-    /// RUN and a re-run asks again — never the shape refusal, whose remedy ends a
-    /// published release.
+    /// The evergreen pointer as github.com serves a stranger: the first hop of
+    /// `releases/latest/download/aterm-appcast.toml` is a 302 to exactly this tag's
+    /// appcast, which names this version and binds its `url` to this tag and its DMG.
+    /// `Err` when GitHub could not be read (the HEAD failed, an answer neither 302 nor 404,
+    /// the appcast fetch failed): the caller says COULD NOT RUN, never the shape refusal.
     fn pointer_problems(
         &self,
         slug: &str,
@@ -1463,8 +1443,8 @@ impl Real {
     }
 
     /// `ship site --latest`, in this process: its transcript into the step's log (and the
-    /// terminal under `--verbose`), every child it starts without the release's scrub list
-    /// and under the release's child rules ([`StepChildren`]).
+    /// terminal under `--verbose`), every child it starts without the variables [`scrub`]
+    /// removes and under the release's child rules ([`StepChildren`]).
     fn site(&mut self, slug: &str) -> Result<AfterCut, Refusal> {
         if interrupt::caught().is_some() {
             return Err(Refusal::new(
@@ -1546,11 +1526,9 @@ impl std::io::Write for StepLog {
 }
 
 /// The after-cut step's refusal of a published release whose shape is wrong. Its cut
-/// FINISHED, and a published release is never re-cut, so no re-run of this release can
-/// end it: the remedy is its successor, and it names the way there — `--forget` this
-/// clone's journal of it, then `--bump`, or a bare run
-/// where main already declares a version no release has used (the `--bump` refusal of
-/// that case says "drop --bump", which only a forgotten journal makes a way out).
+/// finished and a published release is never re-cut, so the remedy is its successor:
+/// `--forget` this clone's journal of it, then `--bump`, or a bare run where main already
+/// declares a version no release has used.
 #[must_use]
 pub fn shape_refusal(slug: &str, tag: &str, problems: Vec<String>) -> Refusal {
     Refusal::new(
@@ -1572,9 +1550,8 @@ pub fn shape_refusal(slug: &str, tag: &str, problems: Vec<String>) -> Refusal {
 
 /// What `ship site --latest` ending with `ended` means for the after-cut step; `detail`
 /// is the end of its transcript. No usable site checkout here (none configured or found,
-/// or one without its build and deploy scripts) touched nothing: a hand step on a
-/// machine that has one, recorded, never a stop — a re-run here could only meet it
-/// again ([`AfterCut::site_deferred`]).
+/// or one without its build and deploy scripts) touched nothing and is a hand step on a
+/// machine that has one, recorded, never a stop ([`AfterCut::site_deferred`]).
 ///
 /// # Errors
 /// A deployed site the live site does not show yet, and every failure of the sync.
@@ -1634,10 +1611,9 @@ pub fn site_outcome(
     }
 }
 
-/// Whether the journal's bundle is BUILT for this release: its store entry COMPLETE in
-/// the release cache with its bytes re-proved, and built by the release's prover. Not
-/// built — none named, none COMPLETE, bytes that changed, another prover's — is step
-/// 7's to build (before the claim nothing is burned by building again).
+/// Whether the journal's bundle is built for this release: its store entry COMPLETE in the
+/// release cache, its bytes re-proved, built by the release's prover. Anything else is
+/// the build step's to build (before the claim nothing is burned by building again).
 fn built_answer(repo: &Path, artifact: Option<&Artifact>, prover: &Prover) -> Answer {
     let Some(a) = artifact else {
         return Answer::no("no bundle is built for it yet");
@@ -1693,12 +1669,11 @@ fn parse_offset(z: &str) -> Option<i64> {
     Some(sign * (h * 3600 + m * 60))
 }
 
-/// The variables cleared from every child: every one that steers what a build compiles or
-/// how a test decides — each `RUST*` and `CARGO*` but the inert knobs (job count,
-/// incremental, logging, backtraces, cargo's terminal output), and the C toolchain's (the
-/// `cc` crate's names, also as `<NAME>_<target>`, `TARGET_<NAME>`, `HOST_<NAME>`) — so
-/// every step builds what the operator's shell would. The target directory overrides go
-/// with them.
+/// The variables cleared from every child, so every step builds what the operator's shell
+/// would: each `RUST*` and `CARGO*` (target-directory overrides included) but the inert
+/// knobs (job count, incremental, logging, backtraces, cargo's terminal output), and the C
+/// toolchain's (the `cc` crate's names, also as `<NAME>_<target>`, `TARGET_<NAME>`,
+/// `HOST_<NAME>`).
 pub(crate) fn clears(name: &str) -> bool {
     const INERT: [&str; 8] = [
         "CARGO_BUILD_JOBS",
@@ -1734,10 +1709,10 @@ pub(crate) fn clears(name: &str) -> bool {
     })
 }
 
-/// What `targo run` handed this process as its launcher (`CARGO`, `CARGO_MANIFEST_*`,
-/// `CARGO_PKG_*`, their `TARGO_*` twins, `TRUST_TARGO_FRONTEND`,
-/// `DYLD_FALLBACK_LIBRARY_PATH`): cleared too, silently — every step runs as it would
-/// from the operator's shell, never as a child of the alias.
+/// What `targo run` handed this process as its launcher (`CARGO`, `CARGO_PRIMARY_PACKAGE`,
+/// `CARGO_MANIFEST_*`, `CARGO_PKG_*`, their `TARGO_*` twins, `TRUST_TARGO_FRONTEND`,
+/// `DYLD_FALLBACK_LIBRARY_PATH`): cleared too, silently, so every step runs as from the
+/// operator's shell, never as a child of the alias.
 pub(crate) fn launcher_env(name: &str) -> bool {
     matches!(
         name,
@@ -2331,8 +2306,9 @@ pub fn wasm_clause(config: &str) -> Result<WasmClause, Refusal> {
     })
 }
 
-/// The source manifest pair a completed `pub publish` leaves on the channel. Its
-/// ledger row precedes sign-release, so it cannot stand in for these live assets.
+/// The problems with the source manifest pair a completed `pub publish` leaves on the
+/// channel (each asset exactly once). The publish's ledger row precedes sign-release, so
+/// it cannot stand in for these live assets.
 fn source_attestation_findings(release: &aterm_json::Value) -> Vec<String> {
     crate::channel::SOURCE_ATTESTATION_ASSETS
         .into_iter()
@@ -2358,23 +2334,21 @@ fn source_attestation_findings(release: &aterm_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// The lean-download shape of a published release, from what GitHub serves (its
-/// release JSON): the problems, empty when it carries the shape. It reads the
-/// published objects, never the files the cut wrote, by the release commit's own
-/// rules (the release re-ran as that commit's cutter; v0.63.0 shipped a 1.07 GB
-/// seeded DMG from a cutter built from an older tree) — and only a release that
-/// passes is put on the site's download button.
+/// The lean-download shape of a published release, from what GitHub serves (its release
+/// JSON, never the files the cut wrote): the problems, empty when it carries the shape.
+/// Only a release that passes is put on the site's download button.
 ///
 /// * `aterm-<v>.dmg` exists and is under the lean ceiling (200 MB);
 /// * `aterm-<v>-mac.zip` exists; the evergreen twins `aterm.dmg` / `aterm-mac.zip`
 ///   exist and are byte copies (the same size as what they alias);
-/// * a `.sha256` sidecar for each of those four; `aterm-appcast.toml` exists;
+/// * a `.sha256` sidecar for each of those four; `aterm-appcast.toml` and the signed
+///   source manifest exist;
 /// * no retired macOS name (`-x86_64.dmg`, `-lite.dmg`, `aterm-offline.dmg`);
 /// * the body does not sell the download as seeded;
 /// * the Linux lane: canonical raw ELF names for x86_64/aarch64 with bounded sizes and
 ///   all four appcast/roster proof objects beside them; historical `.tar.gz` pairs
 ///   complete; no other architecture or version. An inventory, never an authenticity
-///   claim — the cut's own proofs verify the bytes.
+///   claim: the cut's own proofs verify the bytes.
 #[must_use]
 pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> {
     const MAX_DMG_BYTES: u64 = 200 * 1000 * 1000;
@@ -2561,9 +2535,9 @@ fn linux_inventory(
     bad
 }
 
-/// What the after-cut step makes of the pointer's answer: its shape problems, or
-/// — when GitHub could not be READ — a COULD NOT RUN refusal whose remedy is to
-/// run it again, never a shape problem, whose refusal ends a published release.
+/// What the after-cut step makes of the pointer's answer: its shape problems, or, when
+/// GitHub could not be read, a COULD NOT RUN refusal (never a shape problem, whose
+/// refusal ends a published release).
 fn pointer_verdict(read: Result<Vec<String>, String>) -> Result<Vec<String>, Refusal> {
     read.map_err(|why| {
         Refusal::new(
@@ -2574,11 +2548,10 @@ fn pointer_verdict(read: Result<Vec<String>, String>) -> Result<Vec<String>, Ref
     })
 }
 
-/// The pointer's first hop judged: `Ok(None)` when it is a 302 to exactly `want`;
-/// `Ok(Some(problem))` for a SHAPE fact — 404 (no published release holds the
-/// pointer) or a 302 elsewhere (another release holds GitHub's latest); `Err` for
-/// any other answer, which says nothing about the release (a 5xx, a 403 rate
-/// limit): the caller's COULD NOT RUN.
+/// The pointer's first hop judged: `Ok(None)` for a 302 to exactly `want`;
+/// `Ok(Some(problem))` for a shape fact (404: no published release holds the pointer; a
+/// 302 elsewhere: another release holds GitHub's latest); `Err` for any other answer (a
+/// 5xx, a 403 rate limit), the caller's COULD NOT RUN.
 fn pointer_hop_problem(
     ptr: &str,
     want: &str,
@@ -2756,9 +2729,8 @@ impl Backend for Real {
                 bin.display()
             ));
         }
-        // THE ONE PROVER, pinned for this process before anything resolves a toolchain:
-        // the provisioning audit's toolchain, verifier and front-door lines judge it,
-        // never the store's current build (which a resume's journaled prover may not be)
+        // pinned for this process before anything resolves a toolchain, so the
+        // provisioning audit judges this prover, never the store's current build
         crate::gates::pin_trust_stage2_bin(&bin).map_err(|e| e.to_string())?;
         Ok(Prover {
             bin,
@@ -2952,15 +2924,12 @@ impl Backend for Real {
         engine_rows_in(&text, commit)
     }
 
-    /// THE ENGINE THAT PUBLISHES IS THE ENGINE THAT STAGED: its HEAD at its origin/main
-    /// (as the sync step left it), a fast-forward of `staged`, and no path changed since
-    /// `staged` but the engine's own data plane — the set its stage's drift check
-    /// (`revalidate_push_inputs`) lets move: `verification-log.jsonl` (every stage and dry
-    /// run appends to it, the sync commits it), `mappings.json` (every publish of any
-    /// repository appends to it) and `handoff/`. A `staged` the engine no longer holds, or
-    /// one its origin/main does not contain, is code that moved: the stage runs again
-    /// (`pub stage` clears publish/.out and attests anew); only git not answering is an
-    /// `Err`. Read-only: no fetch (step 2's sync fetched it), no checkout.
+    /// Whether the engine that would publish is the one that staged: its HEAD at its
+    /// origin/main, a fast-forward of `staged`, and nothing changed since `staged` but the
+    /// data plane its stage's drift check (`revalidate_push_inputs`) lets move
+    /// (`verification-log.jsonl`, `mappings.json`, `handoff/`). A `staged` the engine no
+    /// longer holds, or its origin/main does not contain, is code that moved: the stage
+    /// runs again. Only git not answering is an `Err`. Read-only: no fetch, no checkout.
     fn engine_now(&mut self, staged: &str) -> Result<EngineNow, String> {
         let e = self.engine.display().to_string();
         let head = self.engine_commit("HEAD")?;
@@ -3098,13 +3067,12 @@ impl Backend for Real {
         ))
     }
 
-    /// THE BUMP, committed on origin/main's tip and pushed there before anything is
-    /// staged (`pub stage --commit` stages only an ancestor of origin/main, and merging
-    /// an old-base bump into a newer main leaves the lockfile behind): the engine's own
-    /// edit (`bin/pub-bump-edit`: the version and the intra-workspace requirements) on
-    /// THIS clone, then the lockfile with the prover's `targo`, a check that nothing but
-    /// version lines moved, one commit, one push. A push that loses a race rebuilds the
-    /// bump on the new tip, three times at most.
+    /// The bump, committed on origin/main's tip and pushed before anything is staged (`pub
+    /// stage --commit` stages only an ancestor of origin/main, and merging an old-base bump
+    /// into a newer main leaves the lockfile behind): the engine's `bin/pub-bump-edit` (the
+    /// version and the intra-workspace requirements) on this clone, the lockfile with the
+    /// prover's `targo`, a check that only version lines moved, one commit, one push. A
+    /// push that loses a race rebuilds the bump on the new tip, three times at most.
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal> {
         let edit = self.engine.join("bin/pub-bump-edit");
         if !edit.is_file() {
@@ -3156,10 +3124,9 @@ impl Backend for Real {
                     ));
                 }
             }
-            // Whole paths, one per line: tracked changes, then untracked files.
-            // Never `status --porcelain` sliced at a column: `git_out` trims, and
-            // the first row's leading status blank went with it (` M Cargo.lock`
-            // read `argo.lock`), so every bump that moved the lockfile refused.
+            // Whole paths, one per line: tracked changes, then untracked files. Never
+            // `status --porcelain` sliced at a column: `git_out` trims the first row's
+            // leading status blank.
             let moved: Vec<String> = [
                 &["diff", "--name-only", "HEAD"][..],
                 &["ls-files", "--others", "--exclude-standard"][..],
@@ -3243,9 +3210,9 @@ impl Backend for Real {
     }
 
     fn reexec(&mut self, prover: &Prover) -> Refusal {
-        // as from the operator's shell: R's cutter is built under the release's own
-        // scrubbed environment, never the alias's launcher variables or a RUSTFLAGS —
-        // from the clone's root, so with this run's arguments as anchored at its start
+        // R's cutter is built as from the operator's shell (the scrubbed environment, no
+        // launcher variables or RUSTFLAGS), from the clone's root, with this run's
+        // arguments as anchored at its start
         let mut cmd = self.scrubbed(prover.bin.join("targo"));
         cmd.args(["--unverified", "ship"])
             .args(&self.argv)
@@ -3335,11 +3302,10 @@ impl Backend for Real {
 
     fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal> {
         let mut blocks: Vec<Refusal> = Vec::new();
-        // R's own pre-claim gates that read only the commit — the changelog, the
-        // predecessor's handoff fixtures, the handoff policy — judged for the
-        // release's version: a bump not made yet is judged on its parent with the
-        // version it will declare, which is all a bump changes. A real run is R's own
-        // cutter (it re-execs as R's); a dry run says when it is not.
+        // R's own pre-claim gates that read only the commit (the changelog, the
+        // predecessor's handoff fixtures, the handoff policy), for the release's version:
+        // an unmade bump is judged on its parent with the version it will declare. A real
+        // run is R's own cutter; a dry run says when it is not.
         let git = self.git();
         if dry && let Err(not) = crate::gates::own_cutter(&git, &c.commit) {
             self.say(&format!(
@@ -3362,8 +3328,8 @@ impl Backend for Real {
                 "handoff policy",
                 crate::gates::handoff_policy_gate_at(&git, commit, version).map(|_| ()),
             ),
-            // the committed Cargo.lock resolves the workspace offline, unchanged — read
-            // in the clone, which a real run has put at R (step 3)
+            // the committed Cargo.lock resolves the workspace offline, unchanged: read in the
+            // clone, which a real run has put at R (step 3)
             (
                 "locked metadata",
                 crate::gates::locked_metadata_gate(&self.repo),
@@ -3383,11 +3349,10 @@ impl Backend for Real {
                 aterm_uds::host::tool("gitleaks").remedy(),
             ));
         }
-        // the stage comes before the long steps, so for hours publish/.out holds a
-        // promotable attestation of an R not yet verified: the pre-promote
-        // hook (it asks R's verify record) is then the one guard between
-        // that attestation and public main for a `pub publish` by hand — an engine that
-        // would skip it silently is refused before it stages, in seconds
+        // the stage comes before the long steps, so for hours publish/.out holds a promotable
+        // attestation of an R not yet verified: the pre-promote hook (it asks R's verify record)
+        // is then the one guard between that attestation and public main for a `pub publish` by
+        // hand, so an engine that would skip it is refused before it stages
         let seam = std::fs::read_to_string(self.engine.join("bin/pub"))
             .is_ok_and(|t| t.contains("run_pre_promote_hook"));
         if !seam {
@@ -3544,7 +3509,7 @@ impl Backend for Real {
         })
     }
 
-    /// BESIDE EACH OTHER: the fixture generator on a thread of its own (its own target
+    /// Beside each other: the fixture generator on a thread of its own (its own target
     /// directory, `target-fixture-guard`, and log), `ship build` on this one (the release
     /// cache's target directories).
     fn build(
@@ -3676,9 +3641,9 @@ impl Backend for Real {
         problems.extend(pointer_verdict(
             self.pointer_problems(&slug, &tag, version),
         )?);
-        // The site links the newest stable release carrying its DMG, not a named tag —
-        // as the site's own election picks it, asked here, never restated: when that is
-        // another release, its shape is checked too.
+        // The site links the newest stable release carrying its DMG, as the site's own
+        // election picks it (`site_tag`); when that is another release, its shape is checked
+        // too.
         let site_tag = match self.site_tag(&slug) {
             Ok(t) => t,
             Err(why) => {
@@ -4027,8 +3992,8 @@ pub const WASM32_GATE: &str = "wasm32 engine";
 mod tests {
     use super::*;
 
-    /// Hold the vulnerable pipe/fcntl interval open deterministically. Neither a
-    /// detached step nor the snapshot's git may carry that unrelated descriptor.
+    /// A descriptor without FD_CLOEXEC, held open as one is between a `pipe` and its
+    /// `fcntl`: neither a detached step nor the snapshot's git may inherit it.
     #[cfg(unix)]
     #[test]
     fn forwarded_steps_and_object_git_exclude_an_unflagged_descriptor() {
@@ -4071,10 +4036,9 @@ mod tests {
         );
     }
 
-    /// THE SITE SYNC'S CHILDREN KEEP THE RELEASE'S RULES: each leads a session and group of
-    /// its own (where the interrupt is forwarded, and no terminal it could stop on), git's
-    /// prompt is off, and it is named in the running-child note while it runs — the note
-    /// gone once it has ended.
+    /// The site sync's children keep the release's rules: each leads a session and group of
+    /// its own (where the interrupt is forwarded, with no terminal to stop on), git's prompt
+    /// is off, and a running-child note names it while it runs and is gone once it ends.
     #[cfg(unix)]
     #[test]
     fn the_site_syncs_children_keep_the_releases_rules() {
@@ -4126,10 +4090,8 @@ mod tests {
         assert!(crate::release::child_notes(dir.path()).is_empty());
     }
 
-    /// The pointer's first hop: only a 404 or a 302 elsewhere is the release's
-    /// SHAPE (the refusal whose remedy ends a published release); an answer that
-    /// says nothing about the release — a 5xx, a rate-limit 403 — is a read that
-    /// failed (COULD NOT RUN: run it again), never a reason to ship a successor.
+    /// Only a 404 or a 302 elsewhere is the pointer's shape; a read that says nothing about
+    /// the release (a 5xx, a rate-limit 403) is COULD NOT RUN.
     #[test]
     fn a_pointer_that_could_not_be_read_is_could_not_run() {
         let refused = pointer_verdict(Err("https://x/latest could not be read: timeout".into()))
@@ -4209,8 +4171,7 @@ mod tests {
         }
     }
 
-    /// The outside look's every check (check-release-shape's, ported): the lean shape
-    /// passes; each way a release is out of shape is named.
+    /// The lean shape passes; each way a release is out of shape is named.
     #[test]
     fn a_release_is_judged_by_the_lean_shape_github_serves() {
         assert_eq!(
@@ -4473,7 +4434,7 @@ mod tests {
 
     /// `ship check --export` end to end, offline: a stub engine whose `bin/pub` prints
     /// what its commit says, its origin and the candidate's origin local. The check
-    /// drives a scratch copy of the engine at its ORIGIN's main (the local engine may
+    /// drives a scratch copy of the engine at its origin's main (the local engine may
     /// lag), never writes the engine's checkout, judges only a commit on origin/main,
     /// and maps each answer to its exit.
     #[test]
@@ -4820,9 +4781,9 @@ mod tests {
         assert!(staging_moved_from(&twice, &s).is_some());
     }
 
-    /// `--engine` reaches every child: the cut, the stage and `pub publish`'s
-    /// pre-promote (`ship check`, by R's own cutter: the running release's binary) read
-    /// the one engine ledger the release judged, never `~/publication` by default.
+    /// `--engine` reaches every child: the cut, the stage and `pub publish`'s pre-promote
+    /// (`ship check` by R's own cutter, the running release's binary) read the one engine
+    /// the release judged, never `~/publication` by default.
     #[test]
     fn the_engine_the_release_judges_is_the_one_every_child_reads() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -4900,10 +4861,9 @@ mod tests {
         );
     }
 
-    /// `nohup` PROTECTS A RUN: a signal the release was started ignoring stays ignored
-    /// (and so for its children), while every other one it catches. The probe is this
-    /// test binary re-run as the release would start: under `nohup`, and — the control —
-    /// with SIGHUP at its default, whatever the gate running this test inherited.
+    /// A signal the release was started ignoring (`nohup`) stays ignored, and every other
+    /// one is caught. The probe is this test binary re-run under `nohup`, and (the control)
+    /// with SIGHUP at its default.
     #[cfg(unix)]
     #[test]
     fn an_inherited_sig_ign_is_kept_and_the_others_are_caught() {

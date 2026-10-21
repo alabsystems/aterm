@@ -1,28 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Scratch directories that live as long as the TEST PROCESS, not one test.
+//! Scratch directories that live as long as the test process, not one test.
 //!
-//! A test-body scratch directory is an [`aterm_tempfile::TempDir`]: it goes when
-//! the test's guard drops. Some scratch cannot have a guard in a test body,
-//! because the process holds it: the update-root override every headless `App`
-//! installs once and never restores ([`crate::prime_test_update_root`]), the
-//! parent the draft journals of every `system_default()` store hang under, and
-//! a handoff fixture's scratch, which the process-wide `HOME` and
-//! `XDG_RUNTIME_DIR` name while the fixture lives — a thread that read them
-//! just before the fixture put them back can re-create it after its removal
-//! (`seamless::tests::ScratchEnv`). The first two used to
-//! be named by pid alone and removed by nobody, so every test run left them in
-//! the shared temp dir (631 update roots there on 2026-09-30).
+//! A test-body scratch directory is an [`aterm_tempfile::TempDir`], gone when its
+//! guard drops. Some scratch the process itself holds: the update-root override
+//! every headless `App` installs once and never restores
+//! ([`crate::prime_test_update_root`]), the parent of every `system_default()`
+//! store's draft journals, and a handoff fixture's scratch, which the
+//! process-wide `HOME` and `XDG_RUNTIME_DIR` name while the fixture lives (a
+//! thread that read them just before the fixture put them back can re-create it
+//! after its removal, `seamless::tests::ScratchEnv`).
 //!
 //! [`process_root`] names such a directory `<prefix><pid>-<stamp>` and takes
-//! back the ones no live process owns, at two moments:
+//! back the ones no live process owns:
 //!
-//! - **At exit** (`exit(3)`, unix): this process's own roots go, and so do
-//!   those of every process that has died since — the child test processes it
-//!   started among them.
-//! - **At first use of a prefix**: the roots of every dead process go — the
-//!   runs that were killed, aborted or crashed before their exit handler ran.
+//! - At exit (`exit(3)`, unix): this process's own roots, and those of every
+//!   process that has died since, its child test processes among them.
+//! - At first use of a prefix: the roots of every dead process, the runs killed
+//!   or crashed before their exit handler ran.
 //!
 //! A root is taken back only when its owner is provably gone: its pid is ours
 //! (ours is not created yet when the first-use sweep runs, and the exit sweep
@@ -38,10 +34,9 @@ use std::sync::{Mutex, PoisonError};
 static ROOTS: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
 
 /// This process's scratch root for `prefix`, under the system temp dir: the
-/// same path for every call with the same prefix, NOT created (its first user
-/// creates it, with whatever mode that user needs), and removed when the
-/// process exits. The first call for a prefix sweeps the roots dead processes
-/// left under it.
+/// same path for every call with the same prefix, not created (its first user
+/// creates it, with the mode it needs), and removed when the process exits.
+/// The first call for a prefix sweeps the roots dead processes left under it.
 pub(crate) fn process_root(prefix: &'static str) -> PathBuf {
     let mut roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((_, root)) = roots.iter().find(|(known, _)| *known == prefix) {
@@ -52,7 +47,7 @@ pub(crate) fn process_root(prefix: &'static str) -> PathBuf {
     }
     let temp = std::env::temp_dir();
     sweep(&temp, prefix);
-    // The stamp makes the name unique per process INSTANCE: a recycled pid
+    // The stamp makes the name unique per process instance: a recycled pid
     // never resolves to a dead run's root even if its sweep failed part-way.
     let stamp = aterm_time::since_epoch().unwrap_or_default().as_nanos();
     let root = temp.join(format!("{prefix}{}-{stamp:x}", std::process::id()));
@@ -82,8 +77,8 @@ fn sweep(temp: &Path, prefix: &str) {
     }
 }
 
-/// The owner pid in a root name: `<prefix><pid>` followed by the end or a `-`.
-/// The bare `<prefix><pid>` form is the pre-stamp name, swept the same way.
+/// The owner pid in a root name: `<prefix><pid>` followed by the end or a `-`
+/// (an unstamped name is swept the same way).
 fn owner_pid(name: &str, prefix: &str) -> Option<u32> {
     let rest = name.strip_prefix(prefix)?;
     let pid = rest.split_once('-').map_or(rest, |(pid, _)| pid);

@@ -16,33 +16,33 @@ use crate::platform_impl;
 
 // LOCAL PATCH (aterm), 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
 // video modes serve only exclusive fullscreen, which no aterm crate asks for. The macOS backend
-// no longer implements either, so `VideoModeHandle` and `video_modes` are
-// `#[cfg(not(macos_platform))]` until the Windows and Linux carves delete them.
+// no longer implements either, nor (2026-10-21, WC.8) the Linux module, so `VideoModeHandle`
+// and `video_modes` are `#[cfg(windows_platform)]` until the Windows carve deletes them.
 
 /// Describes a fullscreen video mode of a monitor.
 ///
 /// Can be acquired with [`MonitorHandle::video_modes`].
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct VideoModeHandle {
     pub(crate) video_mode: platform_impl::VideoModeHandle,
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl std::fmt::Debug for VideoModeHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.video_mode.fmt(f)
     }
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl PartialOrd for VideoModeHandle {
     fn partial_cmp(&self, other: &VideoModeHandle) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl Ord for VideoModeHandle {
     fn cmp(&self, other: &VideoModeHandle) -> std::cmp::Ordering {
         self.monitor().cmp(&other.monitor()).then(
@@ -58,7 +58,7 @@ impl Ord for VideoModeHandle {
     }
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl VideoModeHandle {
     /// Returns the resolution of this video mode.
     #[inline]
@@ -93,7 +93,7 @@ impl VideoModeHandle {
     }
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl std::fmt::Display for VideoModeHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -121,6 +121,9 @@ impl MonitorHandle {
     /// Returns a human-readable name of the monitor.
     ///
     /// Returns `None` if the monitor doesn't exist anymore.
+    ///
+    /// Not built on X11 or Wayland (WC.8: no aterm crate asks there).
+    #[cfg(any(macos_platform, windows_platform))]
     #[inline]
     pub fn name(&self) -> Option<String> {
         self.inner.name()
@@ -173,7 +176,7 @@ impl MonitorHandle {
     /// ## Platform-specific
     ///
     /// - **Web:** Always returns an empty iterator
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn video_modes(&self) -> impl Iterator<Item = VideoModeHandle> {
         self.inner.video_modes().map(|video_mode| VideoModeHandle { video_mode })

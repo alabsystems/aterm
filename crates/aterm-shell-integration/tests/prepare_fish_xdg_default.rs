@@ -2,15 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Integration test: when XDG_DATA_DIRS is unset, `prepare_fish` must fall
-//! back to the XDG Base Directory spec default (`/usr/local/share:/usr/share`)
-//! rather than emit only our injection dir — otherwise fish would lose its
-//! own vendor conf.d lookup paths.
+//! With XDG_DATA_DIRS unset, `prepare_fish` falls back to the XDG Base Directory default
+//! (`/usr/local/share:/usr/share`) instead of only our injection dir, so fish keeps its
+//! vendor conf.d paths.
 //!
-//! This test MUTATES the process environment and `prepare_fish` READS it, so
-//! it lives outside the crate's unit-test binary, where sibling tests call
-//! `prepare_into` on parallel threads; inside `shell_suite` the one lock of
-//! `aterm_log::env::scoped_unset` serialises it with the other env test.
+//! It mutates the process environment, so it lives outside the unit-test binary (whose tests
+//! call `prepare_into` in parallel); `aterm_log::env::scoped_unset`'s lock serialises it with
+//! the other env test in `shell_suite` and restores the variable even on a panic.
 
 use aterm_shell_integration::{ShellType, prepare_into};
 
@@ -18,10 +16,6 @@ use aterm_shell_integration::{ShellType, prepare_into};
 fn prepare_fish_xdg_includes_default_fallback() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let base = dir.path().join("si");
-    // XDG_DATA_DIRS is cleared for exactly the length of the `prepare_into` call
-    // and restored on the way out — on a panic as well as a return — by the
-    // workspace's one lock-scoped env helper, so nothing leaks into a test added
-    // to this binary later or into a same-process embedder of this harness.
     let result =
         aterm_log::env::scoped_unset("XDG_DATA_DIRS", || prepare_into(ShellType::Fish, &base))
             .unwrap()

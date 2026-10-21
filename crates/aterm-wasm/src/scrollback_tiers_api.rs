@@ -1,60 +1,21 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! Tiered-scrollback attachment + byte budgets for the wasm engine (audit E1).
+//! Tiered-scrollback attachment and byte budgets for the wasm engine, shared
+//! with `aterm-gpu-web` via `#[path]`.
 //!
-//! The wasm ctor was ring-only: deep history was raw uncompressed cells
-//! (~640 B/line at 80 cols, content-independent) and the crate's LZ4 tiers,
-//! DeferredLine lazy promotion, and off-thread-style history reflow all sat
-//! dormant in the shipped renderer. The ctor now builds the ENGINE-DEFAULT
-//! tiered terminal (`TerminalBuilder::tiered_scrollback_defaults`): a
-//! 1000-line hot ring in front of the hot/warm(/cold) compressed store, ONE
-//! total retention limit across ring + staged + store, and the store's byte
-//! budget enforced by eviction.
+//! [`tiered_terminal`] builds a terminal with `tiered_scrollback_defaults()`
+//! and `set_compress_offload_active(true)` so ingest only stages scrolled-off
+//! lines while `render()` (or [`WebTerminal::drain_scrollback_backlog`] when
+//! rendering is throttled) promotes a bounded batch per frame via
+//! `Terminal::trickle_lazy_bounded`.
 //!
-//! ## Compression stays off the ingest path (SCROLL-1)
-//!
-//! Inline LZ4 promotion on the PTY-drain path collapsed native cat-flood
-//! throughput 193 → 59 MB/s (the SCROLL-1 regression), which is why native
-//! sessions hand the lazy backlog to a worker thread. wasm has no worker, but
-//! it has a frame boundary: the ctor arms `set_compress_offload_active(true)`
-//! (ingest only STAGES scrolled-off lines — O(cells) snapshot, no codec) and
-//! `render()` drains a bounded batch per frame. Staged lines remain readable
-//! and retention-accounted; under a sustained flood past the engine's staging
-//! cap (what the store's memory budget has left, never under ~20k lines) the
-//! OLDEST staged lines are dropped O(1) — the same deliberate
-//! throughput-over-depth trade the native session makes, counted out of band
-//! and marked in the history by one dim row at the cut. The per-frame drain
-//! is a trickle OPPORTUNITY (`Terminal::trickle_lazy_bounded`): while the
-//! flood is cutting and still delivering a batch or more per frame it skips,
-//! since promoting the marker would only open a new cut behind it — one flood,
-//! one marker.
-//!
-//! GLUE CONTRACT (for the embedding host): a pane that keeps processing while
-//! its `render()` is throttled (hidden pane, occluded window) should call
-//! [`WebTerminal::drain_scrollback_backlog`] on a coarse timer so retention
-//! does not fall back to ring + staged cap; the call is a bounded no-op when
-//! the backlog is empty.
-//!
-//! ## Budgets (per-pane + global)
-//!
-//! Every pane carries the store's per-pane byte budget
-//! ([`WebTerminal::set_scrollback_budget`]); all panes of one wasm module
-//! (one worker) additionally share the module-global budget
-//! ([`WebTerminal::set_scrollback_global_budget`]) under the engine's
-//! equal-share policy (`aterm_core::terminal::scrollback_shared_budget`,
-//! spec-modeled): effective = `min(per-pane, global / live-panes)`, applied at
-//! each pane's own render/drain points (bounded staleness, no cross-pane
-//! locking).
-//!
-//! ## Build-truth tier capabilities
-//!
-//! Every build's tier shape is a RAM-only store with LZ4 cold pages: the engine
-//! has no disk spill. [`WebTerminal::tier_capabilities_json`] reports that so
-//! a host sizing budgets never assumes one.
-//!
-//! Shared with `aterm-gpu-web`, which mounts this file by `#[path]`;
-//! [`WebTerminal`] is each crate's own terminal type.
+//! Each pane carries a per-pane budget ([`WebTerminal::set_scrollback_budget`])
+//! and shares a module-global budget
+//! ([`WebTerminal::set_scrollback_global_budget`]) under
+//! `aterm_core::terminal::scrollback_shared_budget` (`min(per-pane, global /
+//! live-panes)`). [`WebTerminal::tier_capabilities_json`] reports the RAM-only
+//! LZ4 tier configuration.
 
 use aterm_core::terminal::scrollback_shared_budget::{
     set_global_scrollback_budget, ScrollbackBudgetShare,
@@ -63,22 +24,16 @@ use aterm_core::terminal::{Terminal, TerminalBuilder};
 
 use crate::WebTerminal;
 
-/// Staged lines promoted (LZ4) into the store per `render()` frame. At 60 fps
-/// this drains ~120k lines/s — far above interactive output rates, so the
-/// backlog only accumulates during genuine floods — while bounding the
-/// per-frame promotion spike to ~2k lines (≈ the reflow pump's budget class).
+/// Staged lines promoted into the compressed store per `render()` frame.
 pub(crate) const RENDER_DRAIN_BATCH_LINES: usize = 2_048;
 
-/// Build the wasm engine's terminal: the ENGINE-DEFAULT tiered store behind
-/// the default hot ring, with ingest-path compression handed to the frame
-/// boundary (see module docs).
+/// Build a wasm terminal with default tiered scrollback and frame-boundary
+/// compression offload enabled.
 pub(crate) fn tiered_terminal(rows: u16, cols: u16) -> Terminal {
     let mut term = TerminalBuilder::new()
         .size(rows, cols)
         .tiered_scrollback_defaults()
         .build();
-    // Ingest stages; render() promotes. Without this the feeding call pays
-    // inline LZ4 every ~1000 scrolled lines (the SCROLL-1 collapse).
     term.set_compress_offload_active(true);
     term
 }
@@ -176,23 +131,16 @@ macro_rules! bind {
                 u32::try_from(self.term.lazy_backlog_len()).unwrap_or(u32::MAX)
             }
 
-            /// Monotonic count of history lines LOST to non-user-requested truncation
-            /// (audit E10a): flood-backpressure staged-line drops the configured limit
-            /// would have kept, reflow-window cap drops, and memory-pressure store
-            /// evictions. The OUT-OF-BAND truncation signal: the host polls this (e.g.
-            /// per frame settle) and surfaces the loss in its own chrome. A flood cut
-            /// is ALSO marked in content, by one dim `— aterm dropped N lines here …`
-            /// row where the lines are missing; store-pressure evictions take the
-            /// oldest lines and leave no mark. `f64` because a sustained flood can
+            /// Monotonic count of history lines lost to non-user-requested truncation:
+            /// flood-backpressure staged-line drops, reflow-window cap drops, and
+            /// memory-pressure store evictions. `f64` because a sustained flood can
             /// outgrow `u32` (exact to 2^53).
             pub fn scrollback_truncated_lines(&self) -> f64 {
                 self.term.scrollback_truncated_lines() as f64
             }
 
             /// Current scrollback memory-pressure watermark: 0 = green, 1 = yellow
-            /// (eager compression active), 2 = red (throttle recommended) — the
-            /// store's budget watermark, co-landed with the truncation counter
-            /// (audit E10a) so budget pressure is observable before loss begins.
+            /// (eager compression active), 2 = red (throttle recommended).
             pub fn scrollback_pressure(&self) -> u8 {
                 match self.term.scrollback_pressure_level() {
                     aterm_core::scrollback::WatermarkLevel::Green => 0,

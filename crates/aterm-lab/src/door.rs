@@ -9,7 +9,8 @@
 //! `--sock` win); and the client's environment is scrubbed and points at the
 //! lab's scratch, never at the owner's state. The shape alone cannot tell the
 //! lab's socket from another agent's private instance (they share it): the
-//! jail does.
+//! jail does. Spawned clients enter the run's recorded jail before aterm
+//! starts; a scratch HOME alone does not confine services that use the uid.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
@@ -93,11 +94,14 @@ impl<'a> Door<'a> {
     }
 
     /// The aterm under test with `args`, its environment scrubbed and aimed at
-    /// the lab's scratch; `path` is its `PATH`.
+    /// the lab's scratch, under its recorded jail; `path` is its `PATH`.
     fn command(&self, args: &[&str], path: &str) -> Command {
         let w = &self.run.w;
-        let mut cmd = aterm_uds::spawnfd::command(&self.aterm);
-        cmd.env_clear()
+        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
+        cmd.arg("-f")
+            .arg(self.run.run.join("jail.sb"))
+            .arg(&self.aterm)
+            .env_clear()
             .env("PATH", path)
             .env("xcrun_nocache", "1")
             .env("HOME", w.join("home"))
@@ -133,6 +137,38 @@ impl<'a> Door<'a> {
             .stdin(Stdio::null())
             .output()
             .map_err(|e| format!("could not run {}: {e}", self.aterm.display()))?;
+        Ok(Reply {
+            code: out.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    /// `aterm ctl <args>` against this lab with `input` on its standard
+    /// input (a worker's task for `spawn agent=claude … -`), captured.
+    ///
+    /// # Errors
+    /// A rule refused it, or the client could not start.
+    pub fn ctl_input(&self, args: &[&str], input: &[u8]) -> Result<Reply, String> {
+        use std::io::Write as _;
+        let v = self.ctl_args(args)?;
+        let mut child = self
+            .command(&v, "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run {}: {e}", self.aterm.display()))?;
+        // the pipe closes at the end of the statement: the client reads to EOF
+        let wrote = child
+            .stdin
+            .take()
+            .map_or(Ok(()), |mut pipe| pipe.write_all(input));
+        // waited on whatever the write came to: no client is left unreaped
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("could not run {}: {e}", self.aterm.display()))?;
+        wrote.map_err(|e| format!("could not write the client's input: {e}"))?;
         Ok(Reply {
             code: out.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),

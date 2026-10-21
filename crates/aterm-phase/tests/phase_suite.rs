@@ -5,7 +5,7 @@
 //! stays at its own path and keeps its own `#[test]`s.
 //!
 //! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
+//! `mod` line here nor a `[[test]]` of its own never compiles.
 //!
 //! Run one file's tests with
 //! `targo --unverified test -p aterm-phase --test phase_suite -- <file>::`.
@@ -17,8 +17,7 @@ mod busy_zone_sweep;
 mod live_zone_sweep;
 
 /// `f` of each of `items`, on every core, in `items`' order. The sweeps'
-/// screens are independent, each read by every reader, and one thread
-/// reading them all was each sweep's wall (10 s, 2026-10-17).
+/// screens are independent and each is read by every reader.
 fn on_every_core<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);

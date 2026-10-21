@@ -208,9 +208,9 @@ fn refuse2(head: &str, detail: &str) -> FlowError {
 
 /// Admit an artifact row before any byte moves, by its `protocol`:
 ///
-/// * `github-release` ([`check_release_row`]): only a bare `asset` name and no `dmg` payload
-///   (below); the release lane's other gates are the signed `sha256`/`tree_root` at stage
-///   time;
+/// * `github-release` ([`check_release_row`]): only a bare `asset` name, no `dmg` payload
+///   (below) and, on a release bundle (`payload = ""`), a non-empty `tree_root`; the release
+///   lane's other gates are the signed `sha256`/`tree_root` at stage time;
 /// * `https`: an allow-listed bare host, a known `payload` matching the `kind`
 ///   (`dmg` ⇔ `app-bundle`), a shimmable exposed `entry` for the single-binary lanes,
 ///   `strip_components` on archives only, `links` keys exposed and targets in-tree (none on
@@ -254,6 +254,18 @@ fn check_release_row(artifact: &Artifact) -> Result<(), FlowError> {
     // the dmg lane would attach an image as an https one would: refused the same way.
     if artifact.payload == "dmg" {
         return Err(refuse(DMG_REFUSED));
+    }
+    // A release bundle signs the root of the tree it extracts to, which the stage re-verifies
+    // (`install::verify_and_stage` step 3). Every published one does: on 2026-10-20 all 84
+    // `payload = ""` rows of the 125 `pkg-*.toml` manifests the index generations
+    // atpkg-index-6..76 name carried a 64-hex root (docs/measured/mac-owed-2026-10-20.md,
+    // ZC-TREE-ROOT). So a row without one is an authoring slip, refused here rather than
+    // staged under the frame-checksum backstop alone (`install::stage_payload_modes`), which stays
+    // for the callers that stage a row without admitting it.
+    if artifact.payload.is_empty() && artifact.tree_root.is_empty() {
+        return Err(refuse(
+            "tree_root is required for a release bundle (payload = \"\")",
+        ));
     }
     Ok(())
 }
@@ -359,7 +371,7 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
     check_links(&artifact.links, exposes)?;
     // 6. The signed digests must be present and well-formed: the extracted tree is the
     //    only thing the client can re-verify at apply time, so an empty root is a refusal
-    //    for this protocol even though a loose release manifest tolerates one.
+    //    here as on a release bundle ([`check_release_row`]).
     if artifact.size == 0 {
         return Err(refuse("size must be > 0 (it is the exact download cap)"));
     }
@@ -777,22 +789,32 @@ mod tests {
         }
     }
 
-    /// A `github-release` row with a bare `asset` is admitted whatever its other keys hold:
-    /// the release lane has no vendor checks beyond the asset name.
+    /// A `github-release` row with a bare `asset` and a signed root is admitted whatever its
+    /// other keys hold: the release lane has no vendor checks beyond the asset name and, on a
+    /// release bundle, the root. The control is the same bundle with no root, refused: every
+    /// published bundle signs one (ZC-TREE-ROOT, 2026-10-20).
     #[test]
-    fn a_github_release_row_is_unchanged_by_admission() {
+    fn a_github_release_row_is_admitted_on_its_asset_and_root_alone() {
         let mut a = row();
         a.protocol = "github-release".into();
         a.url = String::new();
         a.payload = String::new();
         a.entry = String::new();
-        a.tree_root = String::new();
         a.size = 0;
         a.sha256 = "d".into();
         check_row(&a, &[]).expect("the release lane has no vendor admission");
         // …even with the retired-shape keys hanging off it.
         a.url = "http://evil.example/x".into();
         check_row(&a, &[]).expect("release rows ignore url");
+
+        a.tree_root = String::new();
+        assert!(
+            refused(&a, &[]).contains("tree_root is required for a release bundle"),
+            "a bundle that signs no root is refused"
+        );
+        // Another lane over the release protocol keeps its frame-checksum backstop.
+        a.payload = "tar-zst".into();
+        check_row(&a, &[]).expect("only the bundle lane must sign a root");
     }
 
     /// A `github-release` row's `asset` is the download's local name in the staging

@@ -1294,8 +1294,10 @@ impl StepFold {
             _ => None,
         };
         let mut late = None;
+        // A row the log takes: past the seed, and no older than the floor.
+        let live = fresh && at_ms.is_some_and(|t| t >= self.floor_ms);
         let row = match kind {
-            Some("assistant") => self.assistant(t, obj, fresh, &mut out, &mut bad),
+            Some("assistant") => self.assistant(t, obj, live, &mut out, &mut bad),
             Some("user") => {
                 let (row, first) = self.user(t, obj, opens, (fresh, at_ms), &mut out, &mut bad);
                 late = first;
@@ -1477,11 +1479,13 @@ impl StepFold {
         }
     }
 
+    /// `live`: a row the log takes, past the seed and no older than the
+    /// floor (the model is said only on one).
     fn assistant(
         &mut self,
         line: &str,
         obj: &Map,
-        fresh: bool,
+        live: bool,
         out: &mut Vec<StepEvent>,
         bad: &mut bool,
     ) -> EndRow {
@@ -1500,12 +1504,13 @@ impl StepFold {
         if flag(obj, KEY_API_ERROR) {
             return EndRow::Entry(EndClass::Notice, Some(notice_of(line)));
         }
-        // The model is said from the first row past the seed on: the
-        // history's model is the run's to name, never this fold's.
+        // The model is said from the first row the log takes on: the
+        // history's (below the seed or the floor) is the run's to name,
+        // never this fold's, so a later row on the same model still says it.
         if let Some(model) = message
             .and_then(|m| m.get("model"))
             .and_then(Value::as_str)
-            .filter(|m| fresh && super::upgrade::is_model_id(m))
+            .filter(|m| live && super::upgrade::is_model_id(m))
             .and_then(StepId::new)
         {
             let effort = obj

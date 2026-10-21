@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The BUNDLED TERMINAL FONT STACK (non-macOS), and Iosevka Term (everywhere).
+//! The bundled terminal font stack (non-macOS), and Iosevka Term (everywhere).
 //!
-//! Owner decision (2026-09-24): the fonts a stock Linux ships are poor and
-//! incomplete — `fc-match monospace` answers DejaVu Sans Mono, and nothing on a
-//! Debian-family default install covers `⏵` U+23F5 (Claude Code's `⏵⏵ bypass
-//! permissions on`), `⏺`, `⎿` or most of Misc Technical — so aterm SHIPS its own
-//! stack there, with **JetBrains Mono** as the primary. The chain a default
-//! Linux window resolves through is:
+//! A stock Linux's fonts are poor and incomplete: `fc-match monospace` answers DejaVu Sans
+//! Mono, and a Debian-family default install covers neither `⏵` U+23F5, `⏺`, `⎿` nor most of
+//! Misc Technical. So aterm ships its own stack there. A default Linux window resolves
+//! through:
 //!
 //! ```text
 //! JetBrains Mono (real Bold / Italic / BoldItalic faces)      primary
@@ -201,12 +199,9 @@
 //!
 //! # Why not macOS
 //!
-//! The macOS default (SF Mono, W9-instantiated, plus Apple Symbols / STIX Two
-//! Math in the symbol tier) is unchanged by the decision, so on macOS nothing
-//! here would ever be selected by default — and a universal binary would carry
-//! the ~2.8 MB twice. [`ACTIVE`] is therefore `false` there and every function
-//! below answers "no bundled face" but for Iosevka Term's four identities,
-//! reducing each default call site exactly to its pre-stack behaviour.
+//! The macOS default (SF Mono, Apple Symbols, STIX Two Math) would never select a bundled
+//! face, and a universal binary would carry the faces twice. So [`ACTIVE`] is `false` there
+//! and only Iosevka Term's four identities resolve.
 
 /// Whether the bundled stack — the defaults and the chain faces — is compiled
 /// into this build. Iosevka Term has its own switch ([`IOSEVKA_ACTIVE`]).
@@ -224,11 +219,11 @@ pub const SCHEME: &str = "bundled:";
 pub const JETBRAINS_FAMILY: &str = "JetBrains Mono";
 /// The bundled JetBrains Mono's virtual identity (regular face).
 pub const JETBRAINS_ID: &str = "bundled:JetBrains Mono";
-/// The bundled JetBrains Mono's BOLD face identity.
+/// The bundled JetBrains Mono's bold face identity.
 pub const JETBRAINS_BOLD_ID: &str = "bundled:JetBrains Mono Bold";
-/// The bundled JetBrains Mono's ITALIC face identity.
+/// The bundled JetBrains Mono's italic face identity.
 pub const JETBRAINS_ITALIC_ID: &str = "bundled:JetBrains Mono Italic";
-/// The bundled JetBrains Mono's BOLD-ITALIC face identity.
+/// The bundled JetBrains Mono's bold-italic face identity.
 pub const JETBRAINS_BOLD_ITALIC_ID: &str = "bundled:JetBrains Mono Bold Italic";
 
 /// Cascadia Mono PL's family name, as a user types it (name ID 1 of all four
@@ -236,11 +231,11 @@ pub const JETBRAINS_BOLD_ITALIC_ID: &str = "bundled:JetBrains Mono Bold Italic";
 pub const CASCADIA_FAMILY: &str = "Cascadia Mono PL";
 /// The bundled Cascadia Mono PL's virtual identity (regular face).
 pub const CASCADIA_ID: &str = "bundled:Cascadia Mono PL";
-/// The bundled Cascadia Mono PL's BOLD face identity.
+/// The bundled Cascadia Mono PL's bold face identity.
 pub const CASCADIA_BOLD_ID: &str = "bundled:Cascadia Mono PL Bold";
-/// The bundled Cascadia Mono PL's ITALIC face identity.
+/// The bundled Cascadia Mono PL's italic face identity.
 pub const CASCADIA_ITALIC_ID: &str = "bundled:Cascadia Mono PL Italic";
-/// The bundled Cascadia Mono PL's BOLD-ITALIC face identity.
+/// The bundled Cascadia Mono PL's bold-italic face identity.
 pub const CASCADIA_BOLD_ITALIC_ID: &str = "bundled:Cascadia Mono PL Bold Italic";
 
 /// Whether this build compiles in the Iosevka Term faces: wherever the stack
@@ -255,11 +250,11 @@ pub const IOSEVKA_ACTIVE: bool = cfg!(feature = "embedded-font");
 pub const IOSEVKA_FAMILY: &str = "Iosevka Term";
 /// The bundled Iosevka Term's virtual identity (regular face).
 pub const IOSEVKA_ID: &str = "bundled:Iosevka Term";
-/// The bundled Iosevka Term's BOLD face identity.
+/// The bundled Iosevka Term's bold face identity.
 pub const IOSEVKA_BOLD_ID: &str = "bundled:Iosevka Term Bold";
-/// The bundled Iosevka Term's ITALIC face identity.
+/// The bundled Iosevka Term's italic face identity.
 pub const IOSEVKA_ITALIC_ID: &str = "bundled:Iosevka Term Italic";
-/// The bundled Iosevka Term's BOLD-ITALIC face identity.
+/// The bundled Iosevka Term's bold-italic face identity.
 pub const IOSEVKA_BOLD_ITALIC_ID: &str = "bundled:Iosevka Term Bold Italic";
 
 /// Whether this build compiles in the Iosevka Term SEMIBOLD faces, the Windows
@@ -298,30 +293,30 @@ pub const PRIMARY_ID: &str = IOSEVKA_SEMIBOLD_ID;
 /// The bundled primary's virtual identity (regular face).
 #[cfg(not(windows))]
 pub const PRIMARY_ID: &str = JETBRAINS_ID;
-/// The bundled primary's BOLD face identity.
+/// The bundled primary's bold face identity.
 #[cfg(windows)]
 pub const PRIMARY_BOLD_ID: &str = IOSEVKA_SEMIBOLD_BOLD_ID;
 /// The bundled primary's BOLD face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_BOLD_ID: &str = JETBRAINS_BOLD_ID;
-/// The bundled primary's ITALIC face identity.
+/// The bundled primary's italic face identity.
 #[cfg(windows)]
 pub const PRIMARY_ITALIC_ID: &str = IOSEVKA_SEMIBOLD_ITALIC_ID;
 /// The bundled primary's ITALIC face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_ITALIC_ID: &str = JETBRAINS_ITALIC_ID;
-/// The bundled primary's BOLD-ITALIC face identity.
+/// The bundled primary's bold-italic face identity.
 #[cfg(windows)]
 pub const PRIMARY_BOLD_ITALIC_ID: &str = IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID;
 /// The bundled primary's BOLD-ITALIC face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_BOLD_ITALIC_ID: &str = JETBRAINS_BOLD_ITALIC_ID;
 
-/// The embedded DejaVu Sans Mono, as a BROAD-tier chain entry.
+/// The embedded DejaVu Sans Mono, as a broad-tier chain entry.
 pub const DEJAVU_ID: &str = "bundled:DejaVu Sans Mono";
-/// Noto Sans Symbols 2, as a SYMBOL-tier chain entry.
+/// Noto Sans Symbols 2, as a symbol-tier chain entry.
 pub const NOTO_SYMBOLS2_ID: &str = "bundled:Noto Sans Symbols 2";
-/// Noto Sans Math, as a SYMBOL-tier chain entry.
+/// Noto Sans Math, as a symbol-tier chain entry.
 pub const NOTO_MATH_ID: &str = "bundled:Noto Sans Math";
 
 /// Every identity this module can name, in declaration order. A build answers
@@ -466,9 +461,8 @@ pub fn is_bundled_id(path: &str) -> bool {
     face_for_id(path).is_some()
 }
 
-/// Whether `family` is spelled as a bundled virtual IDENTITY (`bundled:…`)
-/// rather than a family name — the spelling that always means the compiled-in
-/// face, never an installed one.
+/// Whether `family` is spelled as a bundled virtual identity (`bundled:…`) rather than a
+/// family name: the spelling that always means the compiled-in face, never an installed one.
 #[must_use]
 pub fn is_identity(family: &str) -> bool {
     family.trim().starts_with(SCHEME)
@@ -585,17 +579,13 @@ const PRIMARY_FAMILIES: [[&str; 4]; 4] = [
     IOSEVKA_SEMIBOLD_FACES,
 ];
 
-/// THE CELL HOLDS THE FACE'S OWN LETTERS: when `bytes` is one of a bundled
-/// primary family's faces, how far the deepest LATIN LETTER of the whole
-/// family (all four faces: a bold cell is drawn in the regular face's cell)
-/// reaches below the baseline, per em and NEGATIVE (the descent convention);
-/// `None` for every other face. Where this is deeper than the face's own line
-/// descent, the renderer's cell descent is this plus one pixel for the hinter
-/// (`letter_floored_descent` in the crate root); a family whose letters keep
-/// inside its line is untouched.
+/// When `bytes` is one of a bundled primary family's faces, how far the deepest Latin letter
+/// of the whole family reaches below the baseline, per em and negative (all four faces count:
+/// a bold cell is drawn in the regular face's cell); `None` for every other face. Where this
+/// is deeper than the face's line descent, the cell descent is this plus one pixel for the
+/// hinter (`letter_floored_descent` in the crate root).
 ///
-/// MEASURED 2026-09-30 over every letter of U+0041..U+024F (Basic Latin,
-/// Latin-1, Latin Extended-A and -B) in each face's `glyf` boxes:
+/// Measured over U+0041..U+024F in each face's `glyf` boxes:
 ///
 /// * Cascadia Mono PL 2407.24: the comma-below and cedilla letters — Romanian
 ///   `ș ț Ș Ț`, Latvian `ķ ļ ņ ŗ Ģ Ķ Ļ Ņ Ŗ` — reach 568 of 2048 units (Regular,
@@ -621,9 +611,7 @@ const PRIMARY_FAMILIES: [[&str; 4]; 4] = [
 ///   the floor's (on a 1.0 line at 17 px a `j` ends on the row an `Š`'s caron
 ///   starts under it).
 ///
-/// Only the bundled families, whose bytes this module owns and which were
-/// measured. An installed face — the system's variable Cascadia Mono has the
-/// same 480 descent — keeps its vendor line, as it always drew.
+/// Only the bundled families are floored; an installed face keeps its vendor line.
 #[must_use]
 pub fn letter_descent_floor(bytes: &[u8]) -> Option<f32> {
     static MEMO: [std::sync::OnceLock<Option<f32>>; PRIMARY_FAMILIES.len()] =
@@ -635,10 +623,8 @@ pub fn letter_descent_floor(bytes: &[u8]) -> Option<f32> {
     *MEMO[family].get_or_init(|| deepest_latin_letter(&PRIMARY_FAMILIES[family]))
 }
 
-/// Whether `bytes` ARE the bundled `face`: the same allocation, or the same
-/// contents (a renderer may hold its own copy of the bytes, through the face
-/// store or a host push). The length check keeps a different face from
-/// costing a comparison.
+/// Whether `bytes` are the bundled `face`: the same allocation or the same contents (a
+/// renderer may hold its own copy). The length check spares a different face the comparison.
 fn same_face(face: &[u8], bytes: &[u8]) -> bool {
     face.len() == bytes.len() && (std::ptr::eq(face.as_ptr(), bytes.as_ptr()) || face == bytes)
 }
@@ -649,42 +635,17 @@ fn same_face(face: &[u8], bytes: &[u8]) -> bool {
 /// family added there, or a new default, cannot move the yield.
 const PRIVATE_USE_YIELDING_IDS: [&str; 4] = CASCADIA_FACES;
 
-/// THE ICONS COME FROM ONE FACE: whether `bytes` are a bundled face that
-/// leaves every PRIVATE-USE code point the embedded Symbols Nerd Font maps to
-/// that face, instead of drawing it itself. True for the four Cascadia Mono PL
-/// faces (compiled in on Windows only, so `false` everywhere else), whichever
-/// slot holds them — the primary, an injected bold face, a styled slot. The
-/// renderer reads it once per loaded face and applies it per code point
-/// (`Renderer::primary_unicode_gid` and its styled twins), only while the
-/// runtime tier that answers from the Nerd face is open.
+/// Whether `bytes` are one of the four Cascadia Mono PL faces (Windows only), in whichever
+/// slot: such a face leaves every private-use point the embedded Symbols Nerd Font maps to
+/// that face. The renderer reads it once per loaded face and applies it per code point
+/// (`Renderer::primary_unicode_gid` and its styled twins), only while the runtime tier that
+/// answers from the Nerd face is open.
 ///
-/// MEASURED 2026-10-01 on the 2407.24 static faces and the embedded Symbols
-/// Nerd Font Mono, cmaps read with WPF's `GlyphTypeface`, renders by aterm
-/// 0.101.0 at the default 16 px:
-///
-/// * each of the four faces maps 38 private code points — the Powerline
-///   U+E0A0..E0A3 and Powerline-extra U+E0B0..E0C8, U+E0CA, U+E0CC..E0D2,
-///   U+E0D4 — and the Nerd face maps every one of them;
-/// * those glyphs are drawn for a taller line than the face's own: the
-///   trapezoid U+E0D2 reaches 0.159 em above the 0.928 em ascent and down to
-///   the 0.234 em descent, 1.32 em in all. In the 9x21 cell (baseline row 15)
-///   it is 22 px tall, rows -3..18: three rows painted into the row above and
-///   rows 19..20 left showing the next segment's colour. The flame U+E0C0 and
-///   the branch U+E0A0 did the same, on GPU and CPU alike. Under JetBrains
-///   Mono the same points kept inside the cell.
-///
-/// Yielding sends them to the face every other Nerd Font icon on Windows is
-/// drawn from (`FOREIGN_PRIVATE_USE_FACES` in the crate root routes Segoe UI
-/// Symbol's and Arial's there too), through the fallback FIT: the ink is
-/// fitted to the cell box, kept level with its own centre and clamped to the
-/// row band. The separators U+E0B0..E0BF never reach a face: the procedural
-/// tier draws them first, cell-exact. What the fit gives the rest, measured
-/// at 16 px and pinned by `the_yielded_powerline_glyphs_draw_inside_their_cell_at_16_px`:
-/// the branch and the lock keep their height (17 and 15 of 21 rows), while
-/// the 1-em-wide Powerline-extra flames and trapezoids shrink to the 9-px
-/// cell by their width — 9 rows, centred, no longer the full-height
-/// separators the face's own glyphs were meant to be, exactly as they drew
-/// under JetBrains Mono.
+/// Each face maps 38 private points (Powerline U+E0A0..E0A3, Powerline-extra U+E0B0..E0C8,
+/// U+E0CA, U+E0CC..E0D2, U+E0D4), all of which the Nerd face maps, drawn for a taller line:
+/// at 16 px U+E0D2 is 22 px tall in a 21 px cell. Yielded, they take the fallback fit like
+/// every other Nerd Font icon on Windows (`FOREIGN_PRIVATE_USE_FACES`). The separators
+/// U+E0B0..E0BF never reach a face: the procedural tier draws them first.
 ///
 /// BY THE BYTES, like [`letter_descent_floor`], because a face can arrive
 /// without its identity (`Renderer::set_primary_font` takes bytes; the host's
@@ -1016,25 +977,18 @@ pub fn default_primary_candidates() -> &'static [&'static str] {
     if ACTIVE { &[PRIMARY_ID] } else { &[] }
 }
 
-/// The bundled BROAD-tier chain entries, placed after the user's configured
-/// `fallback_fonts` and ahead of every system discovery path. Additive: the
-/// scan keeps going past them to the system per-script faces and backstop.
+/// The bundled broad-tier chain entries, after the configured `fallback_fonts` and ahead of
+/// every system discovery path. Additive.
 ///
-/// DejaVu Sans Mono alone, on Windows too. JetBrains Mono ahead of it there
-/// was tried and measured worse (2026-09-30, renders at the default 16 px):
-/// its arrows and keycaps fill or overhang its 0.6 em advance (`⇔` 0.76 em,
-/// `⌫` 0.82 em), wider than Cascadia Mono PL's 9 px cell, so the symbol fit
-/// shrinks each by its own hinted raster's fringe: `⇐` drew 7x8 px beside a
-/// 9x10 `⇒`, `⇔ ⌘ ⌫` shrank to blobs and `∴ ∵` spread their dots. DejaVu's
-/// arrows (0.538 em of ink) fit the cell unscaled, mirrored pairs draw alike,
-/// and `⇦ ⇨` come from one face. What JetBrains Mono drew better (`✗` as a
-/// plain cross, a filled `⚠`) is a style, not a defect.
+/// DejaVu Sans Mono alone, on Windows too: JetBrains Mono's arrows and keycaps overhang its
+/// 0.6 em advance (`⇔` 0.76 em, `⌫` 0.82 em), so in Cascadia Mono PL's 9 px cell the symbol
+/// fit shrank each unevenly. DejaVu's arrows (0.538 em of ink) fit the cell unscaled.
 #[must_use]
 pub fn broad_fallback_ids() -> &'static [&'static str] {
     if ACTIVE { &[DEJAVU_ID] } else { &[] }
 }
 
-/// The bundled SYMBOL-tier chain entries, in order, placed after a configured
+/// The bundled symbol-tier chain entries, in order, placed after a configured
 /// `symbol_font` and ahead of the system symbol faces. Additive.
 #[must_use]
 pub fn symbol_fallback_ids() -> &'static [&'static str] {
@@ -1045,16 +999,14 @@ pub fn symbol_fallback_ids() -> &'static [&'static str] {
     }
 }
 
-/// The FILE NAMES of the system faces the bundled symbol tier already
-/// carries — the same upstream Noto files, compiled in.
+/// The file names of the system faces the bundled symbol tier already carries (the same
+/// upstream Noto files).
 const SUPERSEDED_SYSTEM_FILES: &[&str] =
     &["NotoSansSymbols2-Regular.ttf", "NotoSansMath-Regular.ttf"];
 
-/// Whether a built-in SYSTEM candidate `path` names a face the bundled stack
-/// already serves ahead of it, by file name. Such an entry can only ever
-/// answer a code point the bundled copy answered first, so the discovery list
-/// drops it — and with it the font-tree walk that relocating a missing copy
-/// used to start on every launch of a host that does not install it.
+/// Whether a built-in system candidate `path` names, by file name, a face the bundled stack
+/// already serves ahead of it. Such an entry can only answer a point the bundled copy
+/// answered first, so the discovery list drops it (and the font-tree walk to relocate it).
 #[must_use]
 pub fn supersedes_system_face(path: &str) -> bool {
     ACTIVE
@@ -1123,8 +1075,7 @@ mod tests {
             face_for_family("JetBrains Mono Bold Italic").map(|(id, _)| id),
             ACTIVE.then_some(JETBRAINS_BOLD_ITALIC_ID)
         );
-        // Cascadia Mono PL resolves by name, in all four styles, exactly where
-        // it is compiled in (Windows), and nowhere else.
+        // Cascadia Mono PL resolves in all four styles on Windows only.
         for (spelling, id) in [
             ("Cascadia Mono PL", CASCADIA_ID),
             ("cascadia-mono-pl", CASCADIA_ID),
@@ -1141,8 +1092,7 @@ mod tests {
                 "{spelling:?}"
             );
         }
-        // Iosevka Term resolves by name, in all four styles, wherever the stack
-        // feature is on — macOS included.
+        // Iosevka Term resolves in all four styles wherever the stack feature is on.
         for (spelling, id) in [
             ("Iosevka Term", IOSEVKA_ID),
             ("iosevka-term", IOSEVKA_ID),
@@ -1745,7 +1695,7 @@ mod tests {
             StyleBits::ITALIC,
             StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0),
         ];
-        // The VISIBLE ink rows `[top, bottom)` of `ch` in its cell.
+        // The visible ink rows `[top, bottom)` of `ch` in its cell.
         let ink = |r: &mut Renderer, ch: char, style: StyleBits| -> (i32, i32) {
             let baseline = r.baseline();
             let key = r.glyph_key_styled(ch, style);
@@ -1831,9 +1781,8 @@ mod tests {
         }
     }
 
-    /// BOLD / ITALIC RESOLUTION: the bundled primary's three styled slots are
-    /// filled from its REAL compiled-in faces — never a sibling FILE lookup,
-    /// never the synthetic dilation/shear.
+    /// The bundled primary's three styled slots hold its real compiled-in faces, never a
+    /// sibling file lookup or the synthetic dilation / shear.
     #[test]
     #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn the_bundled_primary_resolves_real_bold_italic_and_bold_italic_faces() {
@@ -2173,11 +2122,8 @@ mod tests {
         }
     }
 
-    /// The bundled faces whose private-use glyphs YIELD are exactly the four
-    /// Cascadia Mono PL faces, recognised by their bytes wherever those live
-    /// (a renderer may hold a copy); every other bundled face keeps its own.
-    /// Off Windows no Cascadia bytes exist, so nothing yields there and the
-    /// Linux default (JetBrains Mono) is untouched.
+    /// Exactly the four Cascadia Mono PL faces yield their private use, recognised by their
+    /// bytes wherever those live; off Windows nothing yields.
     #[test]
     fn exactly_the_cascadia_mono_pl_faces_yield_their_private_use() {
         let mut yielding = Vec::new();
@@ -2266,15 +2212,8 @@ mod tests {
         let mut r = cascadia_sealed(16.0);
         assert_eq!(r.cell_size(), (9, 21));
         assert_eq!(r.baseline(), 15);
-        // The ink boxes the Nerd lane gives, MEASURED and pinned. The branch and
-        // the lock keep their full height (17 and 15 rows). The flame and the
-        // trapezoid do NOT reach the cell's bottom, and are not meant to by
-        // this lane: the fit sizes a symbol by its ink about its ADVANCE
-        // CENTRE (`fallback_ink_fit_scale`). Both have a 1-em advance; the
-        // flame's ink fills it and the trapezoid's sits to one side of its
-        // centre, so each shrinks to the 9-px cell by its WIDTH, to 9 rows
-        // centred in the band — as they drew under JetBrains Mono, which
-        // never carried them. Inside the cell is the whole claim here.
+        // The measured ink boxes: the branch and the lock keep their height; the 1-em-wide
+        // flame and trapezoid shrink by width to the 9 px cell (`fallback_ink_fit_scale`).
         let expected = [
             ('\u{E0A0}', [0, 2, 8, 19]),
             ('\u{E0A2}', [0, 3, 9, 18]),
@@ -2308,14 +2247,9 @@ mod tests {
         );
     }
 
-    /// A face that is NOT the bundled Cascadia Mono PL keeps every private-use
-    /// glyph it maps, whoever configures it — here JetBrains Mono, which maps
-    /// the branch U+E0A0 itself, pushed as bytes the way a host pushes a
-    /// user's font. And the yield follows the FACE, not the renderer: swapping
-    /// to it (`set_primary_font`) stops the yield, swapping back to a copy of
-    /// the Cascadia bytes restores it. A bundled Cascadia face injected as the
-    /// BOLD or a STYLED face of such a primary yields too: the bold / italic
-    /// cell keeps the primary's routing instead of drawing Cascadia's glyph.
+    /// A face that is not the bundled Cascadia Mono PL (here JetBrains Mono, pushed as bytes)
+    /// keeps its private-use glyphs, and the yield follows the face: a Cascadia face injected
+    /// as bold or styled yields too, and swapping the primary to Cascadia's bytes restores it.
     #[test]
     #[cfg(all(windows, feature = "embedded-font"))]
     fn a_face_that_is_not_the_bundled_cascadia_keeps_its_own_private_use_glyphs() {
@@ -2411,8 +2345,7 @@ mod tests {
         use aterm_core::terminal::Terminal;
         let text = "a\u{E0A0}\u{E0A2}b";
         let cols: u16 = 8;
-        // CONTROL: on the face itself, a run holding the branch and the lock
-        // comes back with both columns changed.
+        // Control: on the face itself, the branch and the lock come back changed.
         let features = engine_features(&build_feature_list(&[], true));
         let face =
             aterm_font::shape::ShapeFace::from_slice(face_for_id(CASCADIA_ID).unwrap(), 0).unwrap();
@@ -2545,7 +2478,7 @@ mod tests {
     fn a_bundled_chain_face_never_takes_an_emoji_default_or_private_use_point() {
         let mut r = default_sealed();
         let mut checked = 0usize;
-        // Every bundled CHAIN face this build places.
+        // Every bundled chain face this build places.
         for &id in broad_fallback_ids().iter().chain(symbol_fallback_ids()) {
             let face = aterm_font::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
             let mut incidental = Vec::new();
@@ -2562,8 +2495,7 @@ mod tests {
                 }
             }
             for ch in incidental {
-                // The PRIMARY answering is not a chain pick: a primary face's
-                // own glyph always wins, bundled or installed, as it always has.
+                // The primary's own glyph is not a chain pick: it always wins.
                 let got = resolved_face(&mut r, ch);
                 assert!(
                     got.starts_with("primary:") || !got.contains(SCHEME),
@@ -2579,12 +2511,9 @@ mod tests {
         );
     }
 
-    /// THE STARTUP / SETTINGS READ PATH: every consumer of a RESOLVED identity
-    /// (`resolve_config_font`'s answer) reads it through `read_resolved_font`,
-    /// which serves a bundled identity from compiled-in bytes. The GUI's
-    /// startup styled-face admission (`font_family_bold = "JetBrains Mono
-    /// Bold"`) and the Settings preview must never hand the identity to the
-    /// filesystem, where it fails with ENOENT.
+    /// A resolved identity (`resolve_config_font`'s answer) reads through
+    /// `read_resolved_font` as compiled-in bytes; handed to the filesystem it fails with
+    /// ENOENT (the GUI's styled-face admission and the Settings preview read this way).
     #[test]
     #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn a_resolved_bundled_identity_reads_as_its_compiled_in_bytes() {
@@ -3417,7 +3346,7 @@ mod tests {
             );
             assert_ne!(got, "NOTDEF", "{ch} is tofu");
         }
-        // CONTROL: an uncontested point still comes from Noto Sans Symbols 2.
+        // Control: an uncontested point still comes from Noto Sans Symbols 2.
         assert_eq!(
             resolved_face(&mut r, '⏵'),
             format!("symbol:{NOTO_SYMBOLS2_ID}")

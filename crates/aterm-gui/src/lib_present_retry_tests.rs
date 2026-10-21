@@ -21,11 +21,9 @@ use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 enum Drop {
     /// A real scripted CPU-surface failure, through `cpu_surface_transaction`.
     Cpu(crate::present::scripted::ScriptedOutcome),
-    /// A GPU-surface outcome. No GPU exists in a unit test, so the frame
-    /// drops at the scripted CPU acquire (the same "composed, damage
-    /// consumed, nothing on glass" state a failed GPU present leaves) and
-    /// the retry episode is then the one `rearm_dropped_present` arms for
-    /// this reason — the call the GPU arm's failure makes.
+    /// A GPU-surface outcome. A unit test has no GPU, so the frame drops at the scripted
+    /// CPU acquire (the composed, damage-consumed, nothing-on-glass state a failed GPU
+    /// present leaves) and the retry is the one `rearm_dropped_present` arms for it.
     Gpu(PresentDropReason),
 }
 
@@ -180,9 +178,8 @@ fn project(
     now: Instant,
     bootstrap_available: bool,
 ) -> BTreeMap<&'static str, i64> {
-    // The host increments `autonomous_retries` when it SCHEDULES; the model
-    // spends `remaining` when that deadline WAKES. Add the still-pending
-    // slot back so both describe the same lifecycle instant.
+    // The host increments `autonomous_retries` when it schedules; the model spends
+    // `remaining` when that deadline wakes. Adding the pending slot back aligns them.
     let pending = u8::from(retry.deadline.is_some());
     let train = retry.autonomous_retries.saturating_sub(pending);
     let remaining = PRESENT_RETRY_CAP
@@ -233,8 +230,8 @@ fn failed_present_device_loss_route_conforms_to_derived_model() {
     assert_eq!(state["lost"], 1);
     assert_eq!(state["route"], 2);
 
-    // Negative control: the deleted retry decision projects exactly to the
-    // forbidden state, proving the binding is not a vacuous enum comparison.
+    // Negative control: routing a lost device to the surface retry is the forbidden
+    // state, so the binding is not a vacuous enum comparison.
     let mut deleted = state;
     deleted.insert("route", 1);
     assert!(!model.check_invariant("LostUsesFallback", &deleted));
@@ -257,10 +254,9 @@ fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
         ),
     ] {
         let mut app = App::headless_for_test();
-        // The seam begins after the route has observed a live GPU loss. A
-        // CPU-backed headless fixture is sufficient because the transaction
-        // immediately replaces that backend with the real freshly-built CPU
-        // renderer; no GPU device is fabricated by this test.
+        // The seam begins after the route observed a live GPU loss; a CPU-backed
+        // fixture suffices because the transaction replaces the backend with a freshly
+        // built CPU renderer.
         app.use_gpu = true;
         // A `--scale 2` headless boot seal: nothing re-tunes a window without
         // glass (`apply_window_scale`), so the swap itself must keep it.
@@ -318,10 +314,8 @@ fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
         assert_eq!(state["cpu_presented"], 0);
         assert_eq!(state["drops"], expected_drops);
         assert_eq!(state["reason"], expected_reason);
-        // Invariant check (the slip itself would leave `requested` above
-        // unequal to the retry state `request_gpu_recovery_redraw` writes):
-        // `SourceReadyRequested` without its `request_redraw` leaves a ready
-        // CPU target nothing will present.
+        // Negative control: `SourceReadyRequested` without its `request_redraw` leaves a
+        // ready CPU target nothing will present.
         let mut frozen = state.clone();
         frozen.insert("requested", 0);
         assert!(!model.check_invariant("ReadyCpuOwnsRedrawUntilPresent", &frozen));
@@ -387,10 +381,9 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
     let model = aterm_models_core::gpu_loss_recovery_model();
     let wid = WindowId(0);
 
-    // A successful present resets any prior surface retry history before
-    // the device-lost callback is sampled. Start from exhausted state to
-    // make that precondition load-bearing, then invoke the exact transaction
-    // with the post-present (`failed_reason=None`) shape.
+    // A successful present resets prior retry history before the device-lost callback
+    // is sampled: start exhausted, present, then run the post-present
+    // (`failed_reason=None`) transaction.
     let mut app = App::headless_for_test();
     let mut clock = Instant::now();
     {
@@ -504,9 +497,8 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
     );
     assert!(!model.check_invariant("FailedFallbackIsDiagnosed", &undiagnosed));
 
-    // If a failed-present path had already spent all retry fuel, bounded
-    // recovery parks honestly. This is not the fresh post-success path and
-    // the model does not overclaim an autonomous wake for it.
+    // A failed-present path that already spent all retry fuel parks; the model claims
+    // no autonomous wake for it.
     let mut app = App::headless_for_test();
     let mut clock = Instant::now();
     {
@@ -545,8 +537,8 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
     unparked.insert("parked", 0);
     assert!(!model.check_invariant("ExhaustedFailureIsParked", &unparked));
 
-    // Negative controls: the two historical outcomes are forbidden by the
-    // same model whose transitions the production helper just matched.
+    // Negative controls: no retry after a failed fallback, and one frame's drop counted
+    // twice, both violate the model the helper just matched.
     let mut no_retry = model.init_state();
     assert!(model.fire("FailFallbackAfterPresent", &mut no_retry));
     no_retry.insert("retry", 0);
@@ -600,9 +592,8 @@ fn unresolved_recovery_stimulus_delivers_redraw_and_conforms() {
     assert_eq!(state["presented"], 1);
     assert_eq!(retry, PresentRetry::default());
 
-    // The hard case: a due retry was consumed and its winit redraw got
-    // suppressed. The gate is open, but non-default episode state still
-    // requires the next external input/focus to deliver another edge.
+    // A due retry was consumed and its winit redraw suppressed: the gate is open, but
+    // the non-default episode still makes the next input or focus deliver another edge.
     let mut retry = PresentRetry::default();
     let deadline = retry
         .on_drop(PresentDropReason::GpuTimeout, Instant::now())
@@ -884,7 +875,7 @@ fn bounded_present_retry_conforms_to_derived_model() {
     assert!(!retry.present_attempt_allowed());
     assert_matches(&model_state, &retry, now, bootstrap_available);
 
-    // A real surface stimulus starts a FRESH bounded episode.
+    // A real surface stimulus starts a fresh bounded episode.
     assert!(model.fire("Stimulus", &mut model_state));
     let mut stimulus_requests = 0;
     assert!(rearm_present_and_request(&mut retry, false, || {
@@ -900,9 +891,8 @@ fn bounded_present_retry_conforms_to_derived_model() {
     bootstrap_available = false;
     assert_matches(&model_state, &retry, now, bootstrap_available);
 
-    // An ordinary external input while completely idle is a no-op in both
-    // systems; a genuine surface/expose event is the distinct forced edge
-    // and therefore owns an outstanding redraw immediately.
+    // Ordinary input while idle is a no-op in both; a genuine surface/expose event is
+    // the forced edge and owns an outstanding redraw at once.
     assert!(model.successors("Stimulus", &model_state).is_empty());
     assert!(!rearm_present_and_request(&mut retry, false, || {
         panic!("idle non-forced stimulus must not manufacture a redraw")
@@ -955,9 +945,8 @@ fn bounded_present_retry_conforms_to_derived_model() {
     }));
 }
 
-/// Non-transient surface conditions park immediately, and the negative
-/// control projects the deleted immediate-redraw behavior as `retry=2`,
-/// which the derived invariant rejects.
+/// Non-transient surface conditions park immediately. Negative control: an immediate
+/// (past) retry projects as `retry=2`, which the derived invariant rejects.
 #[test]
 fn persistent_drop_parks_and_past_deadline_is_rejected() {
     let now = Instant::now();
@@ -1026,10 +1015,9 @@ fn parked_input_state_rearms_only_on_external_input_intent() {
     let _ = app.input(wid, release, Source::Human);
     assert!(app.windows[&wid].present_retry.parked);
 
-    // Passive hover and held-button motion can arrive once per pixel for as
-    // long as the pointer moves. Neither may continuously refill a finite
-    // retry train while the drawable remains unavailable; the subsequent
-    // discrete click/key/wheel is the recovery stimulus instead.
+    // Hover and held-button motion can arrive once per pixel: neither may refill the
+    // finite retry train while the drawable is unavailable; a discrete click, key or
+    // wheel is the recovery stimulus.
     for buttons in [3, 0] {
         let motion = InputEvent::MouseMove {
             buttons,

@@ -7,10 +7,7 @@
 //! First-party Zstandard (RFC 8878) for aterm.
 //!
 //! aterm reads `.tar.zst` in exactly one place, atpkg's installer, and every
-//! test that feeds that installer needs a valid frame. This crate replaced the
-//! `zstd` / `zstd-safe` / `zstd-sys` family (libzstd's C behind a cc build
-//! script) in steps ZC.3-ZC.6 (docs/AUDIT-third-party-2026-10-15.md, unit
-//! zstd-c). It holds:
+//! test that feeds that installer needs a valid frame. It holds:
 //!
 //! * [`Decoder`]: a [`std::io::Read`] adapter over a stream of frames, the
 //!   shape of `zstd::Decoder`. Carved from ruzstd 0.8.3's decode core, with a

@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REPLY GRAMMAR OVER THE REAL SOCKET for `controls`, `open … close`,
-//! `await`, `temporal` and `history`, read back as a client reads it — the
-//! status line, then exactly the
-//! frame its `Framing` promises (`OK <n>` + n rows for Lines, `OK <nbytes>` +
-//! exactly those bytes for Bytes, one line for Status) — through a real
-//! `aterm --headless`.
+//! The reply grammar over the real socket for `controls`, `open … close`, `await`,
+//! `temporal` and `history`, read as a client reads it through a real `aterm --headless`:
+//! the status line, then exactly the frame its `Framing` promises (`OK <n>` + n rows for
+//! Lines, `OK <nbytes>` + exactly those bytes for Bytes, one line for Status).
 //!
 //! The client speaks the wire directly (`TOKEN <owner token> <verb …>`), so a
 //! frame the server over- or under-writes is a failure here, not something a
@@ -31,8 +29,7 @@ use crate::headless_boot;
 
 use headless_boot::Instance;
 
-/// How long a reply may take before it is read as a hang (AGENTS.md: a hang
-/// detector is a minute, never a latency budget).
+/// How long a reply may take before it is read as a hang.
 const REPLY_DEADLINE: Duration = Duration::from_secs(60);
 
 fn token(inst: &Instance) -> String {
@@ -77,9 +74,8 @@ enum Reply {
     Bytes(String, Vec<u8>),
 }
 
-/// Send `line` and read ONE reply as `verb`'s table framing says: the status
-/// line, then — only on `OK` — the rows or bytes its count names. Anything the
-/// status line does not account for (a missing row, a short body) fails.
+/// Send `line` and read one reply as `verb`'s table framing says: the status line, then (on
+/// `OK` only) the rows or bytes its count names. A missing row or a short body fails.
 fn wire(inst: &Instance, line: &str) -> Reply {
     let verb = line.split_whitespace().next().expect("a verb");
     assert!(
@@ -250,8 +246,8 @@ fn the_audit_verbs_frame_their_replies_as_the_table_says() {
         other => panic!("{other:?}"),
     }
 
-    // The connection is still in sync after every frame above: a fresh read
-    // answers its own status line, not a leftover row.
+    // The connection is still in sync after every frame above: a fresh read answers its own
+    // status line, not a leftover row.
     match wire(&inst, "history 1") {
         Reply::Lines(s, rows) => assert_eq!(s, format!("OK {}", rows.len())),
         other => panic!("{other:?}"),

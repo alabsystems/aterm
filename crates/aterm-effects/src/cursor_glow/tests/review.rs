@@ -552,11 +552,10 @@ fn a_press_the_tty_will_not_echo_banks_nothing_for_a_same_row_program_hop() {
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     glow.tick(Some((3, 4)), t0, &c, g, &mut out);
-    let mut last = t0;
-    for i in 0..3u64 {
-        last = t0 + Duration::from_millis(85 * (i + 1));
+    for _ in 0..3 {
         glow.note_typed_swallowed_no_echo();
     }
+    let last = t0 + Duration::from_millis(255);
     assert!(
         !glow.move_licensed(last),
         "a withheld press stamps no typed licence"

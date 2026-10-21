@@ -1,27 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Raw Win32 declarations for the AF_UNIX-over-winsock transport — the ONLY
-//! FFI in this crate, kept in one auditable file. `ws2_32` (sockets),
-//! `kernel32` (short-path fallback + pid liveness and start + console presence for
-//! `crate::spawn`; the path-user scan's process, module and handle reads; the
-//! machine's own names for `crate::process`),
-//! `advapi32` (this process's token, for `crate::elevation` and the scan's
-//! owner test), `ntdll` (the scan's handle-table and object-name reads),
-//! `wtsapi32` (the scan's listing of every process with its owner),
-//! `bcrypt` (CSPRNG). All import libraries ship with every Windows SDK, so
-//! `#[link]` is clean on stable with zero dependencies.
+//! Raw Win32 declarations for the AF_UNIX-over-winsock transport and process
+//! inspection (`ws2_32`, `kernel32`, `advapi32`, `ntdll`, `wtsapi32`, `bcrypt`).
 //!
-//! The path-user scan (`crate::holders`: `holders_paths.rs`, its `mod win`, and
-//! `holders.rs`'s `mod win_pids`) reads other processes of this account: what
-//! they run, where they work, which modules they map and which files they hold
-//! open. What one runs and where it works — its image and its process
-//! environment block — it reads through `aterm_sysprobe::peb`, the one reader
-//! of a process's parameters, whose declarations and layouts live there. Every
-//! structure the scan reads itself is declared here with its 64-bit layout,
-//! and pinned by a size/offset test at the bottom of this file. The scan's
-//! tests' child processes map a module, block in a directory watch and refuse
-//! the scan's reads of them through the `#[cfg(test)]` declarations below.
+//! Process image and PEB parameter reads go through `aterm_sysprobe::peb`; the
+//! remaining 64-bit structures used by `crate::holders` are declared here and
+//! layout-tested below.
 
 #![allow(non_snake_case, reason = "Win32 API names are camel-case by contract")]
 

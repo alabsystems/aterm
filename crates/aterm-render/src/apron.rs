@@ -1,32 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! M1b INCOMING-ROW APRON — the CPU raster of the row a sub-row up-glide is
-//! sliding in at the bottom of the grid band (see the `scroll_translate`
-//! module doc, "Exposed strip: the incoming-row apron").
+//! The incoming-row apron: the CPU raster of the row a sub-row up-glide slides in at the
+//! bottom of the grid band (see the `scroll_translate` module doc on the exposed strip).
 //!
-//! The row arrives on [`RenderInput::apron_row`] (the engine's one-past-the-
-//! viewport row) and is rastered here into a RESIDENT one-row scratch through
-//! the SAME phase runner every viewport row takes (`composite_free`, then
-//! `draw_cursor`), as row 0 of a one-row `RenderInput` — so its glyphs,
-//! decorations, DEC line size and caret are raster-identical to what the row
-//! gets the moment it lands as an ordinary viewport row. The scratch is
-//! `w × (grid_top + cell_h)` px: the renderer's row→px law places row 0 at
-//! `grid_top` (see `row_ctx`), and the pad rows above it exist only so an
-//! upward glyph overshoot has somewhere to land; only the `cell_h`-row band is
-//! ever read back ([`ApronScratch::band`]).
+//! The row arrives on [`RenderInput::apron_row`] (the row one past the viewport) and is
+//! rastered as row 0 of a one-row `RenderInput` through the same phase runner every
+//! viewport row takes (`composite_free`, then `draw_cursor`), so it is raster-identical
+//! to the row once it lands. The scratch is `w × (grid_top + cell_h)` px because the
+//! row→px law places row 0 at `grid_top` (see `row_ctx`); the pad above catches upward
+//! glyph overshoot, and only the `cell_h`-row band is read back ([`ApronScratch::band`]).
 //!
-//! Cost: ONE row raster per sub-row frame that owes a strip (`frac > 0`, a
-//! present apron) — nothing on whole-row frames, nothing on a bounce, nothing
-//! once the glide lands. No per-frame allocation once warm: the one-row input
-//! refills in place and the pixel buffer keeps its capacity.
+//! Cost: at most one row raster per sub-row frame that owes a strip, none on whole-row
+//! frames, and no per-frame allocation once warm.
 
 use aterm_core::render::RenderInput;
 
 use crate::{ImageCache, Renderer};
 
-/// Resident scratch for the incoming-row raster — one per presenter
-/// (`WindowCpu` holds one; a GPU window holds one too and uploads
+/// Resident scratch for the incoming-row raster, one per presenter (a GPU window uploads
 /// [`band`](Self::band) as the strip's texels).
 #[derive(Default)]
 pub struct ApronScratch {
@@ -40,22 +32,18 @@ pub struct ApronScratch {
     w: usize,
     /// The `cell_h`-row band inside `pixels` holding the rastered row.
     band: std::ops::Range<usize>,
-    /// Everything the last raster depended on — so a sub-row frame whose apron
-    /// and frame facts are unchanged (a glide INSIDE one engine row: ~119 of
-    /// every 120 trackpad frames) rasters nothing and keeps the band.
+    /// What the last raster depended on: a glide inside one engine row (~119 of every
+    /// 120 trackpad frames) hits it and rasters nothing.
     key: Option<ApronKey>,
-    /// Bumped on every REAL raster; the GPU arms key their strip pack on it.
+    /// Bumped whenever the band is rewritten; the GPU arms key their strip pack on it.
     generation: u64,
 }
 
-/// The inputs a rastered apron band is a pure function of, besides the row
-/// itself (compared in place against row 0 of the one-row input the last
-/// raster ran over, [`ApronScratch::input`]): the frame facts the
-/// one-row input copies, the renderer geometry the row→px law reads, and the
-/// RENDERER state the raster reads that no input field carries. Appearance
-/// changes no term here sees (text blending, minimum contrast, font thicken,
-/// stem gamma, hinting, the theme's cursor/fg fallbacks) reach it through
-/// [`ApronScratch::invalidate`], which the hosts' own cache invalidation calls.
+/// What a rastered apron band depends on besides the row itself (which is compared in
+/// place against the last raster's input): the frame facts the one-row input copies, the
+/// geometry the row→px law reads, and renderer state no input field carries. Appearance
+/// changes outside the key (blending, contrast, font knobs, the theme's fallbacks) reach
+/// the band through [`ApronScratch::invalidate`].
 #[derive(Clone, Copy, PartialEq)]
 struct ApronKey {
     present: bool,
@@ -79,16 +67,16 @@ struct ApronKey {
 }
 
 impl ApronScratch {
-    /// Forget the rastered row, so the next sub-row frame re-rasters it. Called
-    /// by the hosts' appearance invalidation (`WindowCpu::invalidate`,
-    /// `WindowGpu::invalidate_present`) for the changes no key term can see.
+    /// Forget the rastered row, so the next sub-row frame re-rasters it. The hosts'
+    /// appearance invalidation (`WindowCpu::invalidate`, `WindowGpu::invalidate_present`)
+    /// calls it for changes the key cannot see.
     pub fn invalidate(&mut self) {
         self.key = None;
     }
 
-    /// The rastered incoming row: `rows()` rows of `width()` packed pixels,
-    /// its TOP row first — the source [`crate::scroll_translate::paint_incoming_strip`]
-    /// reads. Empty until [`Renderer::rasterize_apron_row`] has run.
+    /// The rastered incoming row: `rows()` rows of `width()` packed pixels, top row first,
+    /// as [`crate::scroll_translate::paint_incoming_strip`] reads it. Empty until
+    /// [`Renderer::rasterize_apron_row`] has run.
     #[must_use]
     pub fn band(&self) -> &[u32] {
         &self.pixels[self.band.clone()]
@@ -100,14 +88,14 @@ impl ApronScratch {
         self.w
     }
 
-    /// Rows in [`band`](Self::band) (`cell_h` after a raster, else `0`).
+    /// Rows in [`band`](Self::band) (`cell_h` once written, else `0`).
     #[must_use]
     pub fn rows(&self) -> usize {
         self.band.len().checked_div(self.w).unwrap_or(0)
     }
 
     /// The raster generation: advances exactly when [`Renderer::rasterize_apron_row`]
-    /// really rastered (a key miss); unchanged on a hit.
+    /// rewrites the band (a key miss); unchanged on a hit.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
@@ -115,18 +103,17 @@ impl ApronScratch {
 }
 
 impl Renderer {
-    /// Raster `input.apron_row` into `scratch` as row 0 of a one-row frame
-    /// (see the module doc). When `ap.present` is false (bottom overscroll at
-    /// `display_offset == 0`), fills the strip with `band_bg` so the upward
-    /// translate does not leave a duplicate copy of the bottom row behind.
+    /// Raster `input.apron_row` into `scratch` as row 0 of a one-row frame (see the module
+    /// doc). An absent apron (bottom overscroll at `display_offset == 0`) fills the band
+    /// with the frame's base bg instead, so the upward translate leaves no duplicate of the
+    /// bottom row. Returns `false`, leaving `scratch` empty, only when the frame has no
+    /// columns.
     ///
-    /// Everything the row needs travels on the one-row input: its cells,
-    /// clusters, combining marks and line size; the frame's live default bg,
-    /// default fg and cursor colour (the base fill must be the frame's); and
-    /// the cursor style family (the caret rides in only when
-    /// [`ApronRow::cursor_col`] says the projected cursor is on this row).
-    /// Nothing else: no selection, no effect stream, no image, no wallpaper
-    /// (`incoming_row_applies` refuses a wallpaper frame before this runs).
+    /// The one-row input carries the row's cells, clusters, combining marks and line size,
+    /// the frame's default bg, default fg and cursor colour, and the cursor style (the
+    /// caret only when [`ApronRow::cursor_col`] puts the cursor on this row). No
+    /// selection, effect stream, image or wallpaper (`incoming_row_applies` refuses a
+    /// wallpaper frame first).
     ///
     /// [`ApronRow::cursor_col`]: aterm_core::render::ApronRow::cursor_col
     pub fn rasterize_apron_row(&mut self, input: &RenderInput, scratch: &mut ApronScratch) -> bool {
@@ -141,7 +128,7 @@ impl Renderer {
         let grid_top = self.grid_top();
         let h = grid_top + self.cell_h;
         let band_bg = self.frame_bg(input) | (self.bg_transmittance() << 24);
-        // THE KEY: a hit keeps the band and rasters nothing (see `ApronKey`).
+        // A key hit keeps the band and rasters nothing.
         let key = ApronKey {
             present: ap.present,
             cols,
@@ -170,8 +157,8 @@ impl Renderer {
             scratch.generation = scratch.generation.wrapping_add(1);
             return true;
         }
-        // The row itself: the one-row input still holds exactly what the last
-        // raster ran over (only the refill below writes it), so compare in place.
+        // The one-row input still holds what the last raster ran over, so compare the
+        // row in place.
         let mi = &scratch.input;
         if scratch.w != 0
             && scratch.key == Some(key)
@@ -183,7 +170,7 @@ impl Renderer {
         {
             return true;
         }
-        // Refill the one-row input IN PLACE (the per-row Vecs keep capacity).
+        // Refill the one-row input in place (the per-row Vecs keep capacity).
         let mi = &mut scratch.input;
         mi.rows = 1;
         mi.cols = cols;
@@ -210,20 +197,16 @@ impl Renderer {
         mi.cursor_row = 0;
         mi.cursor_col = ap.cursor_col.unwrap_or(0);
         mi.cursor_visible = ap.cursor_col.is_some();
-        // The band's base, exactly as `full_render`'s clear lays it (the frame
-        // default bg carrying the background-opacity transmittance byte), so the
-        // row's bg pass elides the same runs it elides on a viewport row.
+        // The band's base as `full_render`'s clear lays it (default bg plus the
+        // transmittance byte), so the bg pass elides the same runs as on a viewport row.
         scratch.pixels.clear();
         scratch.pixels.resize(w.saturating_mul(h), band_bg);
-        // Frame-scope the cursor-row plan on BOTH sides of the one-row raster:
-        // the resident plan describes the caller's frame, never this row, and
-        // this row's plan must not outlive it either (`glyph_plan_row`).
+        // Clear the cursor-row plan on both sides: the resident plan describes the
+        // caller's frame, and this row's must not outlive it (`glyph_plan_row`).
         self.glyph_plan_row = None;
-        // The row is rastered as ROW 0 of a one-row frame, but it is NOT a
-        // chrome row: `composite_free` would hand row 0 the host's `ChromeBleed`
-        // (gutter fills, the `[0, grid_top)` lip, the seam) and the strip would
-        // carry tab-strip colour the landed row never has. Suspend the bleed for
-        // the raster and restore it after — it belongs to the caller's frame.
+        // Row 0 of this one-row frame is not a chrome row: suspend the host's
+        // `ChromeBleed` (gutter fills, the `[0, grid_top)` lip, the seam) for the
+        // raster, or the strip carries tab-strip colour the landed row never has.
         let bleed = self.chrome_bleed.take();
         let ApronScratch {
             input: mi,
@@ -274,13 +257,9 @@ mod tests {
         input
     }
 
-    /// THE KEY SEES WHAT THE RASTER READS: a landed fallback face (a
-    /// `font_epoch` bump) and every appearance change the hosts answer with a
-    /// cache invalidation (blending, contrast, font knobs) must re-raster the
-    /// strip. A hit still rasters nothing;
-    /// an epoch bump, a direct invalidation and the CPU window's own
-    /// `invalidate` each force exactly one re-raster; and the caret-only terms
-    /// (blink phase) cannot churn a row that carries no caret.
+    /// The key sees what the raster reads: a hit rasters nothing, a `font_epoch` bump, a
+    /// direct invalidation and the CPU window's `invalidate` each force one re-raster, and
+    /// the blink phase cannot churn a row with no caret.
     #[test]
     fn the_apron_raster_follows_the_font_epoch_and_every_invalidation() {
         let mut r = renderer();

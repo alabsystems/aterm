@@ -2,32 +2,24 @@
 // Copyright 2026 Andrew Yates
 
 //! macOS / iOS: server-certificate verification straight over Security.framework.
+//! It and CoreFoundation are OS dylibs; only the entry points below are declared.
 //!
-//! Build a trust object over the presented chain, pin the verification date to
-//! the instant `rustls` supplied, forbid network fetches, evaluate, and
-//! translate the failure. Security.framework and CoreFoundation
-//! are OS dylibs, so nothing is vendored and nothing is compiled — only the
-//! entry points below are declared.
+//! The call sequence, in order:
 //!
-//! # The call sequence, and why it is in this order
-//!
-//! 1. `SecCertificateCreateWithData` for the end-entity certificate FIRST, then
-//!    each intermediate in the order the peer sent them. Apple requires the
-//!    certificate being verified to be element 0 of the array.
-//! 2. `SecPolicyCreateSSL(server: true, hostname)`. **The hostname argument is
-//!    nullable and a NULL disables name checking entirely** — see
-//!    [`super::PlatformVerifier`]'s module docs and `cf_string` below. Every
-//!    path that cannot produce a CFString returns an error instead.
-//! 3. `SecTrustCreateWithCertificates`, which is `CF_RETURNS_RETAINED`.
-//! 4. `SecTrustSetVerifyDate` with `now`, so a fixture-driven test can pin the
-//!    verdict and a certificate's validity window is judged against the same
-//!    instant `rustls` used, not against whatever the clock says mid-handshake.
-//! 5. `SecTrustSetNetworkFetchAllowed(false)`. **Deliberately stricter than
-//!    `rustls-platform-verifier`, which does not call it.** Without it a chain
-//!    that is missing its intermediate but carries an `authorityInfoAccess` URL
-//!    can be REPAIRED by macOS downloading the issuer — turning a rejection into
-//!    an acceptance, and adding a synchronous network round-trip inside a
-//!    handshake that `stream.rs` has already put on a deadline.
+//! 1. `SecCertificateCreateWithData` for the end-entity certificate first, then
+//!    each intermediate in the peer's order: Apple requires the certificate
+//!    being verified at element 0.
+//! 2. `SecPolicyCreateSSL(server: true, hostname)`. A NULL hostname disables
+//!    name checking entirely, so every path that cannot produce a CFString
+//!    (`cf_string`) returns an error instead.
+//! 3. `SecTrustCreateWithCertificates` (`CF_RETURNS_RETAINED`).
+//! 4. `SecTrustSetVerifyDate` with `now`, so validity is judged at the instant
+//!    `rustls` used and a fixture-driven test can pin the verdict.
+//! 5. `SecTrustSetNetworkFetchAllowed(false)`, stricter than
+//!    `rustls-platform-verifier`: otherwise macOS can repair a chain missing its
+//!    intermediate by downloading the issuer from `authorityInfoAccess`, turning
+//!    a rejection into an acceptance and putting a network round-trip inside a
+//!    deadlined handshake.
 //! 6. Extra anchors, test-only (see [`super::PlatformVerifier`]).
 //! 7. The stapled OCSP response, if the peer sent one.
 //! 8. `SecTrustEvaluateWithError`, which returns C `_Bool` — **not** an
@@ -61,12 +53,10 @@
 //! often as it likes. Every +1 object here is wrapped in [`CfOwned`], which is
 //! the only place `CFRelease` is called, exactly once, on drop.
 //!
-//! CHECKED, not asserted: `leaks --atExit` over the whole of `super::tests`
-//! (every accept case, every reject case, both real-chain runs) reports **0
-//! leaks for 0 total leaked bytes**. And the check is live rather than
-//! vacuous — suppressing the single `CFRelease` of the `SecTrust` turns that
-//! into 4,920 leaks / 755,488 bytes, which is the shape of the bug this
-//! discipline exists to prevent.
+//! `SecTrustCreateWithCertificates` and the out-error of
+//! `SecTrustEvaluateWithError` are +1; a hostile endpoint can drive the failure
+//! path at will, so a leak there is attacker-triggerable. Every +1 object is a
+//! [`CfOwned`], the only place `CFRelease` is called, once, on drop.
 
 use std::ffi::{c_char, c_void};
 use std::ptr;
@@ -83,11 +73,7 @@ use super::{
 };
 use aterm_uds::deadline::{Refused, TRUST};
 
-// ---------------------------------------------------------------------------
-// Core Foundation / Security types. Every CF object is an opaque pointer; the
-// only layout this module asserts is `CFArrayCallBacks`, whose ADDRESS (never
-// its contents) is handed to `CFArrayCreate`.
-// ---------------------------------------------------------------------------
+// Core Foundation / Security types: every CF object is an opaque pointer.
 
 type CFTypeRef = *const c_void;
 type CFStringRef = *const c_void;
@@ -109,14 +95,9 @@ type Boolean = u8;
 /// `kCFStringEncodingUTF8`.
 const CF_STRING_ENCODING_UTF8: CFStringEncoding = 0x0800_0100;
 
-// The four `OSStatus` values this module translates into a specific
-// `rustls::CertificateError`. They are exactly the four that
-// `rustls-platform-verifier` 0.6.2 maps (`src/verification/apple.rs`), so
-// `super::tests` can assert error KINDS and not only accept/reject. Every
-// other code becomes an opaque rejection carrying the raw number — macOS
-// reuses codes across unrelated causes (it returns
-// `errSecCertificateExpired` for a NOT-YET-VALID certificate too), so inventing
-// finer distinctions here would be inventing information.
+// The four `OSStatus` codes translated to a specific `rustls::CertificateError`:
+// the four `rustls-platform-verifier` maps, so the tests can assert error kinds.
+// Every other code is an opaque rejection carrying the number.
 /// `errSecHostNameMismatch`.
 const ERR_SEC_HOST_NAME_MISMATCH: CFIndex = -67602;
 /// `errSecCreateChainFailed`.
@@ -142,8 +123,8 @@ struct CFArrayCallBacks {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    /// Retain/release callbacks — this is what makes a `CFArray` OWN the CF
-    /// objects put into it, so the array keeps the certificates alive.
+    /// Retain/release callbacks: what makes a `CFArray` own the CF objects put
+    /// into it, so the array keeps the certificates alive.
     static kCFTypeArrayCallBacks: CFArrayCallBacks;
     /// `978307200.0` — seconds between the UNIX epoch and the CF epoch.
     static kCFAbsoluteTimeIntervalSince1970: CFTimeInterval;
@@ -197,14 +178,10 @@ unsafe extern "C" {
     fn SecTrustSetOCSPResponse(trust: SecTrustRef, response_data: CFTypeRef) -> OSStatus;
     fn SecTrustSetAnchorCertificates(trust: SecTrustRef, anchors: CFArrayRef) -> OSStatus;
     fn SecTrustSetAnchorCertificatesOnly(trust: SecTrustRef, only: Boolean) -> OSStatus;
-    /// Returns C `_Bool`: `true` iff the chain is TRUSTED. **Not** an
-    /// `OSStatus` — see this module's header. `error` is `CF_RETURNS_RETAINED`.
+    /// Returns C `_Bool`: `true` iff the chain is trusted. Not an `OSStatus`
+    /// (see the module docs). `error` is `CF_RETURNS_RETAINED`.
     fn SecTrustEvaluateWithError(trust: SecTrustRef, error: *mut CFErrorRef) -> bool;
 }
-
-// ---------------------------------------------------------------------------
-// CF plumbing
-// ---------------------------------------------------------------------------
 
 /// An owned (+1) CF object, released exactly once on drop.
 struct CfOwned(CFTypeRef);
@@ -220,13 +197,11 @@ impl Drop for CfOwned {
     }
 }
 
-/// Build a `CFString` from a Rust string.
+/// Build a `CFString` from a Rust string; `None` when CF refuses the bytes.
 ///
-/// `None` when CF refuses the bytes, which for well-formed UTF-8 means an
-/// allocation failure. **A `None` here must never become a NULL hostname**: a
-/// NULL hostname passed to `SecPolicyCreateSSL` switches name checking OFF
-/// entirely and every certificate for every name starts being accepted. The
-/// only caller propagates it as an error.
+/// A `None` must never become a NULL hostname: NULL passed to
+/// `SecPolicyCreateSSL` switches name checking off entirely. The only caller
+/// propagates it as an error.
 fn cf_string(s: &str) -> Option<CfOwned> {
     // SAFETY: the pointer/length pair describes `s`, which outlives the call;
     // `CFStringCreateWithBytes` copies. `is_external_representation` is false —
@@ -271,13 +246,13 @@ fn cf_string_to_string(s: CFStringRef) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-/// A `CFArray` that OWNS (retains) the objects in `items`.
+/// A `CFArray` that owns (retains) the objects in `items`.
 fn cf_array(items: &[CfOwned]) -> Option<CfOwned> {
     let raw: Vec<CFTypeRef> = items.iter().map(|item| item.0).collect();
     // SAFETY: `raw` is valid for `raw.len()` elements for the duration of the
     // call, every element is a live CF object, and `kCFTypeArrayCallBacks` is a
     // CF-owned immutable static whose address is all that is passed. The array
-    // RETAINS each element, so it stays valid independently of `items`. A slice
+    // retains each element, so it stays valid independently of `items`. A slice
     // longer than `isize::MAX` cannot exist.
     let r = unsafe {
         CFArrayCreate(
@@ -290,10 +265,8 @@ fn cf_array(items: &[CfOwned]) -> Option<CfOwned> {
     (!r.is_null()).then(|| CfOwned(r))
 }
 
-/// Wrap one DER certificate as a `SecCertificate`.
-///
-/// `None` when the bytes are not a parseable certificate — attacker-controlled
-/// input, so this is an ordinary outcome and never a panic.
+/// Wrap one DER certificate as a `SecCertificate`; `None` when the
+/// (attacker-controlled) bytes do not parse.
 fn sec_certificate(der: &[u8]) -> Option<CfOwned> {
     // SAFETY: the pointer/length pair describes `der`, which outlives the call;
     // `CFDataCreate` copies. A slice longer than `isize::MAX` cannot exist.
@@ -309,20 +282,13 @@ fn sec_certificate(der: &[u8]) -> Option<CfOwned> {
     (!cert.is_null()).then(|| CfOwned(cert))
 }
 
-// ---------------------------------------------------------------------------
-// The verifier
-// ---------------------------------------------------------------------------
-
 /// How long one certificate evaluation may take before it is refused.
 ///
-/// A healthy evaluation takes milliseconds: network fetching is off (step 5),
-/// so revocation comes only from a stapled response, and the whole decision is
-/// local to `trustd`. Even its slowest honest case — `trustd` launched on
-/// demand by the first evaluation after boot, on a loaded machine that is
-/// paging — finishes in a second or two. Thirty seconds is more than ten times
-/// that, so a slow machine is never refused for being slow, and it is half the
-/// minute past which a wait reads as a hang to the person behind it. Only the
-/// calls that started before [`SUSPECT_AFTER`] ran out ever wait it.
+/// A healthy evaluation is local to `trustd` (no network fetch, step 5) and
+/// takes milliseconds; the slowest honest case, `trustd` launched on demand on
+/// a loaded machine, a second or two. Thirty seconds is ten times that and half
+/// the minute past which a wait reads as a hang. Only calls started before
+/// [`SUSPECT_AFTER`] ran out ever wait it.
 const EVALUATION_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How long an evaluation may run before `trustd` is taken to be not
@@ -334,22 +300,19 @@ const SUSPECT_AFTER: Duration = Duration::from_secs(5);
 
 /// Apple-platform chain verification.
 ///
-/// `extra_roots` holds DER, not live `SecCertificateRef`s, on purpose: nothing
-/// CF-allocated is shared between threads, so this type needs no `unsafe impl
-/// Send`/`Sync`, and the shipped path (`extra_roots` empty) does no CF work for
-/// it at all. The DER is validated once at construction so a bad anchor is
-/// reported there rather than on the first handshake.
+/// `extra_roots` holds DER, not live `SecCertificateRef`s, so nothing
+/// CF-allocated crosses threads and the type needs no `unsafe impl Send`/`Sync`.
 #[derive(Debug)]
 pub(super) struct Verifier {
     extra_roots: Arc<[Vec<u8>]>,
 }
 
-/// One evaluation's inputs, OWNED, so the helper thread that evaluates them
+/// One evaluation's inputs, owned, so the helper thread that evaluates them
 /// borrows nothing from the caller and can outlive it (see
 /// [`aterm_uds::deadline`]). Every CF object is created and released inside
 /// [`evaluate`], on the helper; none crosses a thread.
 struct Job {
-    /// End-entity FIRST, then the intermediates in the peer's order.
+    /// End-entity first, then the intermediates in the peer's order.
     chain: Vec<Vec<u8>>,
     server_text: String,
     ocsp_response: Option<Vec<u8>>,
@@ -358,17 +321,15 @@ struct Job {
 }
 
 impl Verifier {
-    /// `extra_roots` is EMPTY on every shipped path; see [`super::PlatformVerifier`].
-    ///
-    /// `_provider` is unused here — Security.framework brings its own crypto —
-    /// but every arm takes the same two arguments so `super::PlatformVerifier`
-    /// has ONE constructor call rather than a `#[cfg]` fork per platform.
+    /// `extra_roots` is empty on every shipped path. `_provider` is unused
+    /// (Security.framework brings its own crypto); every arm takes the same
+    /// arguments so `PlatformVerifier::build` needs no `#[cfg]` fork.
     pub(super) fn new(
         extra_roots: Vec<CertificateDer<'static>>,
         _provider: Arc<CryptoProvider>,
     ) -> Result<Self, rustls::Error> {
         for root in &extra_roots {
-            // Reject an unusable anchor at construction, like the incumbent does.
+            // Reject an unusable anchor at construction, not at first handshake.
             if sec_certificate(root.as_ref()).is_none() {
                 return Err(bad_encoding());
             }
@@ -380,11 +341,9 @@ impl Verifier {
 
     /// The presented chain, judged by Security.framework.
     ///
-    /// Returns `Ok(())` ONLY when `SecTrustEvaluateWithError` explicitly
-    /// reported the chain trusted. Every other outcome — an FFI call that
-    /// failed, a certificate CF would not parse, a hostname CF would not encode,
-    /// a `trustd` that did not answer within [`EVALUATION_DEADLINE`] — returns
-    /// `Err`.
+    /// `Ok(())` only when `SecTrustEvaluateWithError` explicitly reported the
+    /// chain trusted; a failed FFI call, an unparseable certificate, an
+    /// unencodable hostname or an unanswered `trustd` is `Err`.
     pub(super) fn verify(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -404,9 +363,8 @@ impl Verifier {
             now,
             extra_roots: Arc::clone(&self.extra_roots),
         };
-        // Every evaluation goes through the process's one `trustd` gate, so a wedge
-        // is detected once and then refused at once, instead of each connection
-        // discovering it for itself and leaving one more stuck thread.
+        // The process's one `trustd` gate: a wedge is detected once, then every
+        // later evaluation is refused at once.
         match TRUST.run(SUSPECT_AFTER, EVALUATION_DEADLINE, move || evaluate(&job)) {
             Ok(verdict) => verdict,
             Err(Refused::Unanswered) => Err(service_unanswered()),
@@ -429,7 +387,7 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
         now,
         extra_roots,
     } = job;
-    // (1) End-entity FIRST, then the intermediates in the peer's order.
+    // (1) The chain, end-entity first.
     let mut certs = Vec::with_capacity(chain.len());
     for der in chain {
         certs.push(sec_certificate(der).ok_or_else(bad_encoding)?);
@@ -438,11 +396,11 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
         .ok_or_else(|| invalid_certificate("CFArrayCreate refused the certificate chain"))?;
 
     // (2) The SSL policy, carrying the name the certificate must match.
-    // `cf_string` returning `None` is an ERROR, never a NULL hostname.
+    // `cf_string` returning `None` is an error, never a NULL hostname.
     let hostname = cf_string(server_text).ok_or_else(|| {
         invalid_certificate("the server name could not be encoded for the trust policy")
     })?;
-    // SAFETY: `hostname` is a live, NON-NULL CFString for the duration of
+    // SAFETY: `hostname` is a live, non-null CFString for the duration of
     // the call; `SecPolicyCreateSSL` copies it. `server: true` selects the
     // server-authentication policy (we are the client).
     let policy = unsafe { SecPolicyCreateSSL(1, hostname.0) };
@@ -497,14 +455,9 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
         )));
     }
 
-    // (6) Test-only extra anchors. EMPTY on every shipped path, so this
-    // whole branch is dead in a real build.
-    //
-    // `_anchors` and `_anchor_array` are bound at FUNCTION scope, not inside
-    // the `if`. `SecTrustSetAnchorCertificates` is documented to retain what
-    // it is given — but a use-after-free here would be invisible in a passing
-    // test, so the objects are simply kept alive until the evaluation is over. Same for
-    // the OCSP data below. It costs nothing and removes the question.
+    // (6) Test-only extra anchors; empty on every shipped path. The anchor and
+    // OCSP objects are bound at function scope so they outlive the evaluation
+    // whatever the setters retain.
     let mut _anchors: Vec<CfOwned> = Vec::new();
     let mut _anchor_array: Option<CfOwned> = None;
     let mut _ocsp_data: Option<CfOwned> = None;
@@ -526,8 +479,8 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
                 "SecTrustSetAnchorCertificates failed: {status}"
             )));
         }
-        // `SecTrustSetAnchorCertificates` DISABLES every other anchor by
-        // default. `false` restores the system roots alongside the extras.
+        // `SecTrustSetAnchorCertificates` disables every other anchor by
+        // default; `false` restores the system roots alongside the extras.
         // SAFETY: `trust` is live; the flag is a `Boolean`.
         let status = unsafe { SecTrustSetAnchorCertificatesOnly(trust.0, 0) };
         if status != 0 {
@@ -563,7 +516,7 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
         }
     }
 
-    // (8) Evaluate. `trusted` is C `_Bool`, NOT an OSStatus.
+    // (8) Evaluate. `trusted` is C `_Bool`, not an OSStatus.
     let mut raw_error: CFErrorRef = ptr::null();
     // SAFETY: `trust` is a live, fully configured SecTrust and `raw_error`
     // is a valid place to write one `CFErrorRef`. The out-error is +1 when
@@ -571,11 +524,9 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
     let trusted = unsafe { SecTrustEvaluateWithError(trust.0, &mut raw_error) };
     let error = (!raw_error.is_null()).then(|| CfOwned(raw_error));
 
-    // ACCEPTANCE NEEDS AN EXPLICIT `true`. The extra `error.is_none()` is
-    // defence in depth, not a documented case: Apple leaves the out-error
-    // untouched on success, so a `true` alongside a populated CFError would
-    // mean the contract is not what we think it is — and the safe reading of
-    // "I do not understand this result" is to reject.
+    // Acceptance needs an explicit `true`. Apple leaves the out-error untouched
+    // on success, so `true` with a CFError is a contract we do not understand:
+    // reject.
     if trusted && error.is_none() {
         return Ok(());
     }

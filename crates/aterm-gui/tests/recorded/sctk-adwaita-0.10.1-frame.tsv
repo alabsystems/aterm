@@ -1,0 +1,118 @@
+# The client frame sctk-adwaita 0.10.1 drew before LW.5 (MIT, Copyright (c)
+# 2022 Bartłomiej Maryńczak), recorded 2026-10-20 by tests/recorder-adwaita
+# (L-HEADER-LW7, lw5-button-layout-shadow) from the crate's own buttons.rs,
+# config.rs, theme.rs and shadow.rs. layout: GNOME's button-layout value as
+# config.rs read it through dbus-send (<no portal>: none), the read's two
+# sides (read=left|right, - for none), the compositor's capabilities, and
+# the buttons each side shows left to right. shadow: the alpha shadow.rs
+# paints across a border part from the window outward, along its middle
+# line. size: the frame's sizes in logical px.
+layout	value=<no portal>	read=-	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value=<no portal>	read=-	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value=<no portal>	read=-	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value=<no portal>	read=-	maximize=0	minimize=0	left=-	right=close
+layout	value="appmenu:close"	read=appmenu|close	maximize=1	minimize=1	left=-	right=close
+layout	value="appmenu:close"	read=appmenu|close	maximize=1	minimize=0	left=-	right=close
+layout	value="appmenu:close"	read=appmenu|close	maximize=0	minimize=1	left=-	right=close
+layout	value="appmenu:close"	read=appmenu|close	maximize=0	minimize=0	left=-	right=close
+layout	value="appmenu:minimize,maximize,close"	read=appmenu|minimize,maximize,close	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value="appmenu:minimize,maximize,close"	read=appmenu|minimize,maximize,close	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value="appmenu:minimize,maximize,close"	read=appmenu|minimize,maximize,close	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value="appmenu:minimize,maximize,close"	read=appmenu|minimize,maximize,close	maximize=0	minimize=0	left=-	right=close
+layout	value="close,minimize,maximize:"	read=close,minimize,maximize|	maximize=1	minimize=1	left=close,minimize,maximize	right=-
+layout	value="close,minimize,maximize:"	read=close,minimize,maximize|	maximize=1	minimize=0	left=close,maximize	right=-
+layout	value="close,minimize,maximize:"	read=close,minimize,maximize|	maximize=0	minimize=1	left=close,minimize	right=-
+layout	value="close,minimize,maximize:"	read=close,minimize,maximize|	maximize=0	minimize=0	left=close	right=-
+layout	value="close:"	read=close|	maximize=1	minimize=1	left=close	right=-
+layout	value="close:"	read=close|	maximize=1	minimize=0	left=close	right=-
+layout	value="close:"	read=close|	maximize=0	minimize=1	left=close	right=-
+layout	value="close:"	read=close|	maximize=0	minimize=0	left=close	right=-
+layout	value=":close"	read=|close	maximize=1	minimize=1	left=-	right=close
+layout	value=":close"	read=|close	maximize=1	minimize=0	left=-	right=close
+layout	value=":close"	read=|close	maximize=0	minimize=1	left=-	right=close
+layout	value=":close"	read=|close	maximize=0	minimize=0	left=-	right=close
+layout	value="minimize,maximize,close:appmenu"	read=minimize,maximize,close|appmenu	maximize=1	minimize=1	left=minimize,maximize,close	right=-
+layout	value="minimize,maximize,close:appmenu"	read=minimize,maximize,close|appmenu	maximize=1	minimize=0	left=maximize,close	right=-
+layout	value="minimize,maximize,close:appmenu"	read=minimize,maximize,close|appmenu	maximize=0	minimize=1	left=minimize,close	right=-
+layout	value="minimize,maximize,close:appmenu"	read=minimize,maximize,close|appmenu	maximize=0	minimize=0	left=close	right=-
+layout	value="close,maximize,minimize:menu"	read=close,maximize,minimize|menu	maximize=1	minimize=1	left=close,maximize,minimize	right=-
+layout	value="close,maximize,minimize:menu"	read=close,maximize,minimize|menu	maximize=1	minimize=0	left=close,maximize	right=-
+layout	value="close,maximize,minimize:menu"	read=close,maximize,minimize|menu	maximize=0	minimize=1	left=close,minimize	right=-
+layout	value="close,maximize,minimize:menu"	read=close,maximize,minimize|menu	maximize=0	minimize=0	left=close	right=-
+layout	value="icon:minimize,maximize,close"	read=icon|minimize,maximize,close	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value="icon:minimize,maximize,close"	read=icon|minimize,maximize,close	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value="icon:minimize,maximize,close"	read=icon|minimize,maximize,close	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value="icon:minimize,maximize,close"	read=icon|minimize,maximize,close	maximize=0	minimize=0	left=-	right=close
+layout	value="menu:minimize, maximize ,close"	read=-	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value="menu:minimize, maximize ,close"	read=-	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value="menu:minimize, maximize ,close"	read=-	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value="menu:minimize, maximize ,close"	read=-	maximize=0	minimize=0	left=-	right=close
+layout	value="minimize,maximize,close"	read=-	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value="minimize,maximize,close"	read=-	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value="minimize,maximize,close"	read=-	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value="minimize,maximize,close"	read=-	maximize=0	minimize=0	left=-	right=close
+layout	value=":"	read=|	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value=":"	read=|	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value=":"	read=|	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value=":"	read=|	maximize=0	minimize=0	left=-	right=close
+layout	value=""	read=-	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value=""	read=-	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value=""	read=-	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value=""	read=-	maximize=0	minimize=0	left=-	right=close
+layout	value="appmenu:"	read=appmenu|	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value="appmenu:"	read=appmenu|	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value="appmenu:"	read=appmenu|	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value="appmenu:"	read=appmenu|	maximize=0	minimize=0	left=-	right=close
+layout	value="appmenu:spacer"	read=appmenu|spacer	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value="appmenu:spacer"	read=appmenu|spacer	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value="appmenu:spacer"	read=appmenu|spacer	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value="appmenu:spacer"	read=appmenu|spacer	maximize=0	minimize=0	left=-	right=close
+layout	value="close:close"	read=close|close	maximize=1	minimize=1	left=close	right=close
+layout	value="close:close"	read=close|close	maximize=1	minimize=0	left=close	right=close
+layout	value="close:close"	read=close|close	maximize=0	minimize=1	left=close	right=close
+layout	value="close:close"	read=close|close	maximize=0	minimize=0	left=close	right=close
+layout	value="maximize:minimize"	read=maximize|minimize	maximize=1	minimize=1	left=maximize	right=minimize
+layout	value="maximize:minimize"	read=maximize|minimize	maximize=1	minimize=0	left=maximize	right=-
+layout	value="maximize:minimize"	read=maximize|minimize	maximize=0	minimize=1	left=-	right=minimize
+layout	value="maximize:minimize"	read=maximize|minimize	maximize=0	minimize=0	left=-	right=-
+layout	value="minimize:maximize:close"	read=minimize|maximize	maximize=1	minimize=1	left=minimize	right=maximize
+layout	value="minimize:maximize:close"	read=minimize|maximize	maximize=1	minimize=0	left=-	right=maximize
+layout	value="minimize:maximize:close"	read=minimize|maximize	maximize=0	minimize=1	left=minimize	right=-
+layout	value="minimize:maximize:close"	read=minimize|maximize	maximize=0	minimize=0	left=-	right=-
+layout	value="appmenu,close,minimize,maximize:"	read=appmenu,close,minimize,maximize|	maximize=1	minimize=1	left=close,minimize	right=-
+layout	value="appmenu,close,minimize,maximize:"	read=appmenu,close,minimize,maximize|	maximize=1	minimize=0	left=close	right=-
+layout	value="appmenu,close,minimize,maximize:"	read=appmenu,close,minimize,maximize|	maximize=0	minimize=1	left=close,minimize	right=-
+layout	value="appmenu,close,minimize,maximize:"	read=appmenu,close,minimize,maximize|	maximize=0	minimize=0	left=close	right=-
+layout	value=":appmenu,close,minimize,maximize"	read=|appmenu,close,minimize,maximize	maximize=1	minimize=1	left=-	right=close,minimize
+layout	value=":appmenu,close,minimize,maximize"	read=|appmenu,close,minimize,maximize	maximize=1	minimize=0	left=-	right=close
+layout	value=":appmenu,close,minimize,maximize"	read=|appmenu,close,minimize,maximize	maximize=0	minimize=1	left=-	right=close,minimize
+layout	value=":appmenu,close,minimize,maximize"	read=|appmenu,close,minimize,maximize	maximize=0	minimize=0	left=-	right=close
+layout	value=":close,close,close,close"	read=|close,close,close,close	maximize=1	minimize=1	left=-	right=close,close,close
+layout	value=":close,close,close,close"	read=|close,close,close,close	maximize=1	minimize=0	left=-	right=close,close,close
+layout	value=":close,close,close,close"	read=|close,close,close,close	maximize=0	minimize=1	left=-	right=close,close,close
+layout	value=":close,close,close,close"	read=|close,close,close,close	maximize=0	minimize=0	left=-	right=close,close,close
+layout	value="Close:Minimize"	read=Close|Minimize	maximize=1	minimize=1	left=-	right=minimize,maximize,close
+layout	value="Close:Minimize"	read=Close|Minimize	maximize=1	minimize=0	left=-	right=maximize,close
+layout	value="Close:Minimize"	read=Close|Minimize	maximize=0	minimize=1	left=-	right=minimize,close
+layout	value="Close:Minimize"	read=Close|Minimize	maximize=0	minimize=0	left=-	right=close
+layout	value="close,minimize,maximize:minimize,maximize,close"	read=close,minimize,maximize|minimize,maximize,close	maximize=1	minimize=1	left=close,minimize,maximize	right=minimize,maximize,close
+layout	value="close,minimize,maximize:minimize,maximize,close"	read=close,minimize,maximize|minimize,maximize,close	maximize=1	minimize=0	left=close,maximize	right=maximize,close
+layout	value="close,minimize,maximize:minimize,maximize,close"	read=close,minimize,maximize|minimize,maximize,close	maximize=0	minimize=1	left=close,minimize	right=minimize,close
+layout	value="close,minimize,maximize:minimize,maximize,close"	read=close,minimize,maximize|minimize,maximize,close	maximize=0	minimize=0	left=close	right=close
+shadow	part=top	scale=1	active=1	alpha=50,45,40,36,33,29,27,24,22,19,17,16,14,13,11,10,9,8,7,7,6,5,5,4,4,4,3,3,3,2,2,2,2,1,1,1,1,1,1,1,1,1,0,0
+shadow	part=top	scale=1	active=0	alpha=39,32,26,21,18,14,12,10,8,7,5,5,4,3,3,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0
+shadow	part=top	scale=2	active=1	alpha=51,49,46,44,41,39,37,35,34,32,30,29,27,26,25,23,22,21,20,19,18,17,16,15,14,14,13,12,12,11,11,10,9,9,9,8,8,7,7,7,6,6,6,5,5,5,4,4,4,4,4,3,3,3,3,3,3,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0
+shadow	part=top	scale=2	active=0	alpha=41,37,34,30,28,25,23,20,18,17,15,14,12,11,10,9,8,8,7,6,6,5,5,4,4,4,3,3,3,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+shadow	part=left	scale=1	active=1	alpha=0,50,45,40,36,33,29,27,24,22,19,17,16,14,13,11,10,9,8,7,7,6,5,5,4,4,4,3,3,3,2,2,2,2,1,1,1,1,1,1,1,1,1,0
+shadow	part=left	scale=1	active=0	alpha=0,39,32,26,21,18,14,12,10,8,7,5,5,4,3,3,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0
+shadow	part=left	scale=2	active=1	alpha=0,0,51,49,46,44,41,39,37,35,34,32,30,29,27,26,25,23,22,21,20,19,18,17,16,15,14,14,13,12,12,11,11,10,9,9,9,8,8,7,7,7,6,6,6,5,5,5,4,4,4,4,4,3,3,3,3,3,3,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0
+shadow	part=left	scale=2	active=0	alpha=0,0,41,37,34,30,28,25,23,20,18,17,15,14,12,11,10,9,8,8,7,6,6,5,5,4,4,4,3,3,3,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+shadow	part=right	scale=1	active=1	alpha=0,50,45,40,36,33,29,27,24,22,19,17,16,14,13,11,10,9,8,7,7,6,5,5,4,4,4,3,3,3,2,2,2,2,1,1,1,1,1,1,1,1,1,0
+shadow	part=right	scale=1	active=0	alpha=0,39,32,26,21,18,14,12,10,8,7,5,5,4,3,3,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0
+shadow	part=right	scale=2	active=1	alpha=0,0,51,49,46,44,41,39,37,35,34,32,30,29,27,26,25,23,22,21,20,19,18,17,16,15,14,14,13,12,12,11,11,10,9,9,9,8,8,7,7,7,6,6,6,5,5,5,4,4,4,4,4,3,3,3,3,3,3,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0
+shadow	part=right	scale=2	active=0	alpha=0,0,41,37,34,30,28,25,23,20,18,17,15,14,12,11,10,9,8,8,7,6,6,5,5,4,4,4,3,3,3,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+shadow	part=bottom	scale=1	active=1	alpha=0,50,45,40,36,33,29,27,24,22,19,17,16,14,13,11,10,9,8,7,7,6,5,5,4,4,4,3,3,3,2,2,2,2,1,1,1,1,1,1,1,1,1,0
+shadow	part=bottom	scale=1	active=0	alpha=0,39,32,26,21,18,14,12,10,8,7,5,5,4,3,3,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0
+shadow	part=bottom	scale=2	active=1	alpha=0,0,51,49,46,44,41,39,37,35,34,32,30,29,27,26,25,23,22,21,20,19,18,17,16,15,14,14,13,12,12,11,11,10,9,9,9,8,8,7,7,7,6,6,6,5,5,5,4,4,4,4,4,3,3,3,3,3,3,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0
+shadow	part=bottom	scale=2	active=0	alpha=0,0,41,37,34,30,28,25,23,20,18,17,15,14,12,11,10,9,8,8,7,6,6,5,5,4,4,4,3,3,3,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+size	shadow=43	visible_border=1	border=44	header=35	corner_radius=10	resize_handle=12	resize_handle_corner=24

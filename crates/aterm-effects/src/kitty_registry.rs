@@ -72,17 +72,22 @@ pub fn app_basename(commandline: &str) -> Option<String> {
             continue;
         }
         let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
-        let mut base = base.to_ascii_lowercase();
-        if let Some(stripped) = base.strip_suffix(".exe") {
-            base = stripped.to_owned();
-        }
-        if base.is_empty() {
+        let base = if base
+            .get(base.len().saturating_sub(4)..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"))
+        {
+            &base[..base.len() - 4]
+        } else {
+            base
+        };
+        if base.is_empty()
+            || TRANSPARENT_PREFIXES
+                .iter()
+                .any(|p| base.eq_ignore_ascii_case(p))
+        {
             continue;
         }
-        if TRANSPARENT_PREFIXES.contains(&base.as_str()) {
-            continue;
-        }
-        return Some(base);
+        return Some(base.to_ascii_lowercase());
     }
     None
 }
@@ -665,6 +670,11 @@ mod tests {
             app_basename("sudo env FOO=bar npx somenewtool --flag"),
             Some("somenewtool".into()),
             "every transparent prefix defers to the token after it"
+        );
+        assert_eq!(
+            app_basename(r"SUDO.EXE ENV.exe NPX.EXE C:\Bin\Agy.EXE --version"),
+            Some("agy".into()),
+            "case-insensitive .exe and launcher prefixes strip cleanly"
         );
         assert_eq!(
             app_basename("sudo -E cargo test"),

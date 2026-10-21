@@ -2,22 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Variable-font instantiation (W9).
+//! Variable-font instantiation.
 //!
-//! macOS ships SF Mono as a VARIABLE font (`SFNSMono.ttf`) whose `fvar`
-//! default instance is "SF NS Mono Light" (`wght` default ≈ 294.67) — so
-//! loading the file at its default instance renders faint, thin text (the
-//! reason the built-in candidate order once demoted it below Menlo; with this
-//! fix in place SF Mono now LEADS the candidates). The root fix
-//! is to INSTANTIATE the face: parse `fvar` at load, resolve the `Regular`
-//! named instance (or `wght = 400` clamped to the axis) by default, overlay
-//! the user's `font_variation` / `font_weight` config, and apply the ONE
-//! resulting coordinate list everywhere a face is consumed — the CoreText
-//! descriptor (`kCTFontVariationAttribute`, via
-//! `CTFontDescriptorCreateCopyWithVariation`), the run shaper's face
-//! (`aterm_font::Face::set_variation`), and the aterm-font metrics derivation
-//! (`Face::set_variation`, HVAR/MVAR-aware) — so raster, shaping and cell
-//! geometry can never disagree about which instance is on screen.
+//! macOS ships SF Mono as a variable font (`SFNSMono.ttf`) whose `fvar` default
+//! instance is Light (`wght` ≈ 294.67), so loading it at the default renders faint,
+//! thin text. The face is instantiated instead: parse `fvar` at load, resolve the
+//! `Regular` named instance (or `wght = 400` clamped to the axis), overlay the user's
+//! `font_variation` / `font_weight`, and apply that one coordinate list everywhere a face
+//! is consumed: the CoreText descriptor (`kCTFontVariationAttribute` via
+//! `CTFontDescriptorCreateCopyWithVariation`) and the shaping and metrics
+//! `aterm_font::Face` (`Face::set_variation`, HVAR/MVAR-aware), so raster, shaping and
+//! cell geometry agree on the instance.
 //!
 //! This module holds the PURE policy: axis clamping, named-instance / weight
 //! resolution, config-spec parsing, and the dark-theme weight-nudge safety
@@ -27,14 +22,10 @@
 //! metric measurements, all bounds-checked and total (`None` on malformed
 //! input, never a panic).
 //!
-//! PORTABLE RASTER (FONT-2): fontdue has no variation API, so the portable path
-//! (non-macOS, and `ATERM_RASTERIZER=fontdue`) cannot ask fontdue for an instance.
-//! [`varied_glyph_raster`] closes that gap: aterm-font applies the resolved coords to
-//! the glyph OUTLINE and a [`crate::raster`] coverage fill (nonzero winding + AA)
-//! rasterizes it, so the portable path now draws the RESOLVED instance — not the `fvar`
-//! default — matching the CoreText path's instance (grid geometry + shaping already
-//! followed the coords). The renderer routes the primary face through it on that path
-//! (`Renderer::vf_primary_gid_raster` / `vf_primary_char_raster`).
+//! On the portable raster path, [`varied_glyph_raster`] applies the resolved coords to
+//! the glyph outline and fills it with [`crate::raster`], so the primary face draws the
+//! resolved instance rather than the `fvar` default (`Renderer::vf_primary_gid_raster`
+//! / `vf_primary_char_raster`).
 
 /// The `wght` (weight) axis tag, big-endian packed like every OpenType tag.
 pub const WGHT_TAG: u32 = u32::from_be_bytes(*b"wght");
@@ -43,13 +34,10 @@ pub const REGULAR_WGHT: f32 = 400.0;
 /// CSS/OpenType Bold weight — the real-instance replacement for synthetic
 /// dilation when the primary face carries a `wght` axis.
 pub const BOLD_WGHT: f32 = 700.0;
-/// The dark-theme weight nudge is permitted ONLY when the nudged instance's
-/// `'M'` advance equals the default instance's within this many device px
-/// (`|adv_nudged − adv_default| <= 0.25`): monospace variable fonts hold
-/// advances constant across the weight axis, which is what makes a weight
-/// nudge uniquely safe in a fixed grid — a face that fails this is not
-/// advance-stable and must NOT be nudged (the W2 linear-corrected remap,
-/// already on by default, remains its weight compensation).
+/// The dark-theme weight nudge is permitted only when the nudged instance's `'M'`
+/// advance is within this many device px of the default instance's. Monospace variable
+/// fonts hold advances constant across the weight axis, which is what makes a nudge safe
+/// in a fixed grid; a face that fails is not nudged.
 pub const DARK_NUDGE_ADVANCE_TOL_PX: f32 = 0.25;
 
 /// One `fvar` axis, normalized like aterm-font does at parse: `min <= def <=
@@ -85,9 +73,8 @@ pub struct VfProbe {
 /// `tests/variation_instantiation.rs`.
 #[must_use]
 pub fn clamp_axis(axis: &VfAxis, req: f32) -> f32 {
-    // Axis bounds come from `VfAxis` construction (min <= def <= max, all
-    // finite); a degenerate axis (non-finite fields from a hand-built value)
-    // fails the range test below and falls back to the default.
+    // `VfAxis` construction guarantees min <= def <= max, all finite; a hand-built
+    // degenerate axis fails the range test and falls back to the default.
     if req.is_finite() && axis.min.is_finite() && axis.max.is_finite() && axis.min <= axis.max {
         req.clamp(axis.min, axis.max)
     } else if axis.def.is_finite() {
@@ -97,16 +84,10 @@ pub fn clamp_axis(axis: &VfAxis, req: f32) -> f32 {
     }
 }
 
-/// Resolve the DEFAULT instantiation coords for `axes` (one design-space
-/// value per axis, same order):
-///
-/// * the `Regular` named instance's coords when the font declares one
-///   (each clamped to its axis, so a malformed instance can never escape
-///   the axis bounds), else
-/// * every axis at its default EXCEPT `wght`, which is pulled to
-///   `400` clamped to the axis — the root fix for SF Mono's Light default.
-///
-/// Total by construction: every output value is `clamp_axis`-bounded.
+/// Resolve the default instantiation coords for `axes` (one value per axis, same
+/// order): the `Regular` named instance's coords when the font declares one, each
+/// clamped to its axis; else every axis at its default except `wght`, pulled to `400`
+/// clamped to the axis (SF Mono's default is Light).
 #[must_use]
 pub fn resolve_default_coords(axes: &[VfAxis], regular: Option<&[f32]>) -> Vec<f32> {
     if let Some(reg) = regular
@@ -184,13 +165,11 @@ pub fn dark_nudge_permitted(adv_nudged_px: f32, adv_default_px: f32) -> bool {
         && (adv_nudged_px - adv_default_px).abs() <= DARK_NUDGE_ADVANCE_TOL_PX
 }
 
-/// Parse face `index` of `bytes` for its variation facts: the `fvar` axes
-/// (via aterm-font, which normalizes `min <= def <= max`) plus the `Regular`
-/// named instance's coords (parsed from the raw `fvar` instance records —
-/// aterm-font exposes axes only — with the subfamily name resolved through
-/// the `name` table, case-insensitive). `None` for a non-variable or
-/// malformed face; a malformed INSTANCE array degrades to `regular_coords:
-/// None` (the wght=400 clamp then applies), never a panic — every read is
+/// Parse face `index` of `bytes` for its variation facts: the `fvar` axes (via
+/// aterm-font, which normalizes `min <= def <= max`) and the `Regular` named instance's
+/// coords (from the raw `fvar` records, since aterm-font exposes axes only, with the
+/// subfamily resolved through `name`). `None` for a non-variable or malformed face; a
+/// malformed instance array degrades to `regular_coords: None`. Every read is
 /// bounds-checked.
 #[must_use]
 pub fn probe(bytes: &[u8], index: u32) -> Option<VfProbe> {
@@ -275,32 +254,28 @@ fn name_is_regular(face: &aterm_font::Face<'_>, name_id: u16) -> bool {
     })
 }
 
-/// Coordinate-applied face metrics in device px, derived through aterm-font
-/// with every `(tag, value)` coord set (HVAR advances; MVAR / typo-aware
-/// vertical metrics — `Face::ascender` prefers the OS/2 typo metrics when
-/// the face sets `USE_TYPO_METRICS`, the same law `geometry_metrics`
-/// applies on the unvaried path).
+/// Coordinate-applied face metrics in device px, through aterm-font with every coord set
+/// (HVAR advances; MVAR and typo-aware vertical metrics: `Face::ascender` prefers OS/2
+/// typo metrics under `USE_TYPO_METRICS`, as `geometry_metrics` does unvaried).
 #[derive(Clone, Copy, Debug)]
 pub struct VariedMetricsPx {
     /// Above the baseline, positive.
     pub ascent: f32,
-    /// Below the baseline, NEGATIVE (fontdue's convention).
+    /// Below the baseline, negative.
     pub descent: f32,
     pub line_gap: f32,
     /// `'M'` advance (the monospace cell-width probe).
     pub m_advance: f32,
 }
 
-/// The same metrics in the face's own units, before any size is applied:
-/// what [`VariedMetricsPx`] is derived from at every px
-/// ([`VariedMetricsUnits::at_px`]). Two instances with EQUAL units have equal
-/// px metrics at every px — the one derivation of equal inputs — so a cell box
-/// derived from them is the same at every size a window can ask for.
+/// The same metrics in the face's own units, from which [`VariedMetricsUnits::at_px`]
+/// derives [`VariedMetricsPx`] at any size. Two instances with equal units have equal px
+/// metrics, so a cell box derived from them matches at every size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VariedMetricsUnits {
     pub units_per_em: u16,
     pub ascent: i16,
-    /// NEGATIVE below the baseline.
+    /// Negative below the baseline.
     pub descent: i16,
     pub line_gap: i16,
     pub m_advance: u16,
@@ -335,9 +310,8 @@ pub fn varied_metrics_units(
 ) -> Option<VariedMetricsUnits> {
     let mut face = aterm_font::Face::parse(bytes, index).ok()?;
     for &(tag, value) in coords {
-        // `None` here means "not variable / no such axis" — the axis list the
-        // coords were resolved against came from this same face, so ignore a
-        // (theoretically unreachable) miss rather than failing the metrics.
+        // A miss means no such axis, unreachable since the coords were resolved
+        // against this face's own axes; ignore it rather than fail the metrics.
         let _ = face.set_variation(aterm_font::Tag(tag), value);
     }
     let gid = face.glyph_index('M')?;
@@ -350,11 +324,10 @@ pub fn varied_metrics_units(
     })
 }
 
-/// Measure [`VariedMetricsPx`] for face `index` of `bytes` at `px` with
-/// `coords` applied: [`varied_metrics_units`] at `px`. `None` when the face
-/// is malformed, has no `'M'`, or a degenerate `units_per_em` — the caller
-/// falls back to the unvaried (fontdue) metrics, so this is always a safe
-/// enhancement.
+/// Measure [`VariedMetricsPx`] for face `index` of `bytes` at `px` with `coords`
+/// applied: [`varied_metrics_units`] at `px`. `None` for a malformed face, no `'M'`, a
+/// degenerate `units_per_em` or a non-finite `px`; the caller then uses the unvaried
+/// metrics.
 #[must_use]
 pub fn varied_metrics_px(
     bytes: &[u8],
@@ -365,20 +338,12 @@ pub fn varied_metrics_px(
     varied_metrics_units(bytes, index, coords)?.at_px(px)
 }
 
-/// FONT-2: rasterize glyph `gid` of face `index` at `px` with `coords` (the resolved
-/// variable instance) APPLIED, in the fontdue-compatible tuple
-/// `(width, height, xmin, ymin, advance_width, coverage)`. This closes the portable
-/// raster's variation gap — fontdue has no variation API, so off macOS (or under
-/// `ATERM_RASTERIZER=fontdue`) a variable primary would draw only its `fvar` DEFAULT
-/// instance; here aterm-font applies the coords to the OUTLINE and a coverage
-/// rasterizer (nonzero winding + AA) fills it, so text renders at the resolved weight.
-///
-/// Metrics match fontdue's convention so the tuple drops into the raster path: `xmin`
-/// is the left-side bearing in px, `ymin` the baseline→bottom offset (negative below
-/// the baseline), coverage is `width*height` alpha bytes top-row first. `None` on a
-/// malformed face, a missing/oversized glyph, or a degenerate size — the caller then
-/// falls back to fontdue (default instance), so this is always a SAFE enhancement. A
-/// blank glyph (space: no outline) returns a 0×0 raster carrying just the advance.
+/// Rasterize glyph `gid` of face `index` at `px` with `coords` (the resolved instance)
+/// applied, as `(width, height, xmin, ymin, advance_width, coverage)`: `xmin` the left
+/// bearing in px, `ymin` the baseline→bottom offset (negative below the baseline),
+/// coverage `width*height` alpha bytes top row first. `None` on a malformed face, a
+/// missing or oversized glyph, or a degenerate size, and the caller falls back to the
+/// default instance. A blank glyph (space) is a 0×0 raster carrying the advance.
 #[must_use]
 pub fn varied_glyph_raster(
     bytes: &[u8],
@@ -390,11 +355,9 @@ pub fn varied_glyph_raster(
     VariedFace::parse(bytes, index, coords)?.glyph_raster(gid, px)
 }
 
-/// A face parsed ONCE with its variation coords applied — the amortized form of
-/// [`varied_glyph_raster`] for a caller that rasters MANY glyphs of one instance
-/// (a shaped label, a specimen line): one `Face::parse` + coord replay per run
-/// instead of per glyph, without the caller taking an `aterm_font` dependency of
-/// its own. Each raster is byte-identical to the byte-slice wrapper's.
+/// A face parsed once with its variation coords applied: the amortized
+/// [`varied_glyph_raster`] for a caller that rasters many glyphs of one instance,
+/// without an `aterm_font` dependency of its own. Each raster matches the wrapper's.
 pub struct VariedFace<'a> {
     face: aterm_font::Face<'a>,
 }
@@ -424,10 +387,9 @@ impl<'a> VariedFace<'a> {
         varied_glyph_raster_with_face(&self.face, gid, px)
     }
 
-    /// Glyph `gid`'s LINEAR advance at `px` on this instance: exactly the bits
-    /// [`Self::glyph_raster`] reports for it, which is what lets the grid-fitted
-    /// raster ([`crate::hinted`]) report an advance identical to the unhinted
-    /// one at the same instance. `None` on a degenerate size.
+    /// Glyph `gid`'s linear advance at `px` on this instance, bit-identical to what
+    /// [`Self::glyph_raster`] reports, so the grid-fitted raster ([`crate::hinted`])
+    /// reports the same advance as the unhinted one. `None` on a degenerate size.
     #[cfg(any(
         all(unix, not(target_os = "macos")),
         windows,
@@ -439,37 +401,48 @@ impl<'a> VariedFace<'a> {
     }
 }
 
-/// `px / units_per_em`: the one scale every unhinted raster and linear advance
-/// in this module multiplies design units by. `None` for a degenerate size or
-/// `units_per_em`.
+/// `px / units_per_em`, the scale every unhinted raster and linear advance in this module
+/// applies to design units. `None` for a degenerate size or `units_per_em`.
 fn px_scale(face: &aterm_font::Face, px: f32) -> Option<f32> {
     let upem = f32::from(face.units_per_em());
     (upem > 0.0 && px.is_finite() && px > 0.0).then(|| px / upem)
 }
 
-/// Glyph `g`'s linear advance at `scale`: the face's `hmtx` advance (with
-/// `HVAR` applied at the face's coordinates; `0` past the table) times `scale`
-/// — the same product `font::Font` reports for a static face.
+/// Glyph `g`'s linear advance at `scale`: its `hmtx` advance (`HVAR` applied at the
+/// face's coords, `0` past the table) times `scale`, the product `font::Font` reports for
+/// a static face.
 fn linear_advance(face: &aterm_font::Face, g: aterm_font::GlyphId, scale: f32) -> f32 {
     f32::from(face.glyph_hor_advance(g).unwrap_or(0)) * scale
 }
 
-/// [`varied_glyph_raster`] on an ALREADY-PARSED face — the hot-path form. The
-/// raster is identical; only the `Face::parse` + `set_variation` replay moves to
-/// the caller, which can amortize it (e.g. a caller that must resolve the gid
-/// through the same face's cmap first, instead of parsing the bytes twice).
-///
-/// The caller is responsible for building `face` at the correct collection
-/// `index` and applying the variation coords BEFORE calling this — the byte-slice
-/// [`varied_glyph_raster`] wrapper above does exactly that. (Same convention as
-/// `ligature_shaping::RowShaper::new`.)
+/// [`varied_glyph_raster`] on an already-parsed face with the coords applied, so the
+/// caller can amortize the parse (e.g. after resolving the gid through the same face's
+/// cmap). The caller must build `face` at the right collection index and apply the
+/// variation coords first, as [`varied_glyph_raster`] does.
 #[must_use]
 pub fn varied_glyph_raster_with_face(
     face: &aterm_font::Face,
     gid: u16,
     px: f32,
 ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
+    varied_glyph_raster_with_face_at(face, gid, px, 0.0)
+}
+
+/// [`varied_glyph_raster_with_face`] with the outline moved `dx` px right
+/// (a pen's fraction of a pixel, `0.0..1.0`) before it is filled: the
+/// coverage a glyph placed at a fractional pen position has, so a run of
+/// small text keeps its true spacing instead of each glyph snapping to a
+/// whole pixel. `xmin` is the moved ink box's left edge; at `dx = 0` the
+/// raster is exactly [`varied_glyph_raster_with_face`]'s.
+#[must_use]
+pub fn varied_glyph_raster_with_face_at(
+    face: &aterm_font::Face,
+    gid: u16,
+    px: f32,
+    dx: f32,
+) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
     let scale = px_scale(face, px)?;
+    let dx = if dx.is_finite() { dx } else { 0.0 };
     let g = aterm_font::GlyphId(gid);
     let advance = linear_advance(face, g, scale);
     // No bounding box ⇒ a blank glyph (e.g. space): 0×0 raster, advance only.
@@ -477,8 +450,8 @@ pub fn varied_glyph_raster_with_face(
         return Some((0, 0, 0, 0, advance, Vec::new()));
     };
     // Pixel-space ink box (floor/ceil so the outline always fits inside the raster).
-    let x_min = (f32::from(bbox.x_min) * scale).floor();
-    let x_max = (f32::from(bbox.x_max) * scale).ceil();
+    let x_min = (f32::from(bbox.x_min) * scale + dx).floor();
+    let x_max = (f32::from(bbox.x_max) * scale + dx).ceil();
     let y_min = (f32::from(bbox.y_min) * scale).floor();
     let y_max = (f32::from(bbox.y_max) * scale).ceil();
     let w = (x_max - x_min) as i32;
@@ -487,29 +460,20 @@ pub fn varied_glyph_raster_with_face(
         return None;
     }
     let (w, h) = (w as usize, h as usize);
-    // Fill into a grid with RASTER_PAD px of slack on every side, the outline
-    // translated into its interior, then crop: the outline must never sit ON
-    // the grid boundary (see RASTER_PAD). A design-space `x_min` of 0 — which
-    // most glyphs of most fonts have — scales to an exactly-0 left edge, which
-    // is precisely the case that detonates.
+    // Fill with RASTER_PAD px of slack on every side, then crop: the outline must never
+    // sit on the grid boundary (see RASTER_PAD), and a design-space `x_min` of 0, which
+    // most glyphs have, scales to exactly that.
     //
-    // The grid is sized from the font's DECLARED `glyph_bounding_box`, not from
-    // the outline's observed extrema (`hinted.rs` derives its box from the pen's
-    // extrema and so cannot escape at all). A font whose `glyf` data exceeds its
-    // own declared box therefore pushes points outside this grid — legitimately,
-    // in fonts with a slightly loose bbox, and deliberately in a hostile one.
-    // The outline is NOT clamped here: clipping real ink to a mis-declared box
-    // would visibly cut glyphs from ordinary fonts. Containment is
-    // `crate::raster`'s job instead, where every escape path is bounds-clamped
-    // and every flattening loop capped, so an escape costs the area that left
-    // the grid and nothing else — see that module's `# Hardening` section and
-    // its escape-path tests.
+    // The grid is sized from the font's declared `glyph_bounding_box`, which its `glyf`
+    // data can exceed (a loose bbox, or a hostile font). The outline is not clamped,
+    // since clipping real ink would cut ordinary glyphs; containment is `crate::raster`'s
+    // job (its `# Hardening` section).
     let pad = RASTER_PAD as f32;
     let mut ras = crate::raster::Rasterizer::new(w + 2 * RASTER_PAD, h + 2 * RASTER_PAD);
     let mut b = OutlineToRaster {
         ras: &mut ras,
         scale,
-        ox: x_min - pad,
+        ox: x_min - pad - dx,
         oy: y_max + pad,
         last: crate::raster::point(0.0, 0.0),
         start: crate::raster::point(0.0, 0.0),
@@ -522,46 +486,24 @@ pub fn varied_glyph_raster_with_face(
     Some((w, h, x_min as i32, y_min as i32, advance, cov))
 }
 
-/// Slack, in px, between the ink box and the coverage grid every
-/// [`crate::raster`] fill in this crate actually rasterizes into. The
-/// outline is translated by this much so it can NEVER touch the grid's
-/// boundary; [`crop_padded_coverage`] reads the ink box back out, so the
-/// returned mask and its `(width, height, xmin, ymin)` metrics are unchanged.
+/// Slack, in px, between the ink box and the coverage grid every [`crate::raster`] fill
+/// in this crate rasterizes into. The outline is translated by this much so it never
+/// touches the grid boundary; [`crop_padded_coverage`] reads the ink box back out, so the
+/// mask and its `(width, height, xmin, ymin)` metrics are unchanged.
 ///
-/// WHY (the ppem-19 broken-digit bug): the rasterizer marches a
-/// segment's `x` INCREMENTALLY down its scanlines (`x += dxdy * dy`), so `x`
-/// at the last scanline drifts a fraction of an ULP off the segment's true
-/// endpoint. That is harmless in the grid's interior — but a segment sitting
-/// EXACTLY on `x = 0` drifts to `-1.19e-7`, whose `floor()` is `-1`, and the
-/// rasterizer has no clamp: `linestart + x0i < 0` makes it `continue`, DROPPING
-/// that whole scanline's area (or, on a row past the first, crediting it to the
-/// PREVIOUS row). Because `for_each_pixel` carries ONE running accumulator
-/// across the entire flat buffer — each row's contributions are trusted to sum
-/// to zero so the accumulator resets at the row boundary — the lost area never
-/// comes back: every texel after it is offset by a constant, and a glyph paints
-/// as a broken filled block.
-///
-/// A segment exactly on `x = 0` is not exotic; GRID FITTING MAKES IT THE
-/// COMMON CASE, because the autohinter snaps stem edges to whole pixels and the
-/// ink box's left edge is `floor(min_x)` — i.e. that very integer. Measured over
-/// 62 304 (face, hint mode, ppem 6..=64, glyph) combinations across DejaVu Sans
-/// Mono Regular/Bold, Noto Sans CJK and Symbols Nerd Font, it detonated on
-/// exactly two: the DEFAULT face's `'?'` at ppem 17 and `'2'` at ppem 19 — and
-/// ppem 19 is `round(15 * 1.25)`, the Linux auto-scale law at the most common
-/// fractional desktop scale, so every 125% user saw broken digits by default.
-/// The same reasoning applies at the right edge (`x1i == width` writes into the
-/// next row) and is fixed by the same slack.
-///
-/// [`crate::subpixel`] needs no change: its ink box is already widened by 1 px
-/// per side for the FIR5 filter spread, which is 3 subpixel samples of slack at
-/// its 3× horizontal resolution.
+/// The rasterizer marches a segment's `x` incrementally (`x += dxdy * dy`), so a segment
+/// exactly on `x = 0` can drift to `-1.19e-7`, floor to `-1`, and hit the far-left skip,
+/// dropping that scanline's area. One accumulator runs across the whole buffer, so every
+/// later texel is offset and the glyph paints as a broken block. Grid fitting makes such
+/// an edge common: the autohinter snaps stems to whole pixels and the ink box's left
+/// edge is `floor(min_x)`. The right edge (`x1i == width` writes into the next row)
+/// needs the same slack. `crate::subpixel` already has it: its 1 px FIR5 pad is three
+/// samples at 3×.
 pub(crate) const RASTER_PAD: usize = 1;
 
-/// Read the `w`×`h` ink box back out of a coverage grid that was filled with
-/// [`RASTER_PAD`] px of slack on every side (i.e. a `(w + 2*PAD)`×`(h + 2*PAD)`
-/// rasterizer whose outline was translated by `+PAD` in both axes). The padding
-/// ring is discarded: by construction it can only hold antialiasing spill from
-/// an edge that is already inside the box.
+/// Read the `w`×`h` ink box back out of a grid filled with [`RASTER_PAD`] px of slack on
+/// every side (the outline translated by `+PAD` on both axes). The padding ring can only
+/// hold antialiasing spill from an edge already inside the box, so it is discarded.
 pub(crate) fn crop_padded_coverage(ras: &crate::raster::Rasterizer, w: usize, h: usize) -> Vec<u8> {
     let pad = RASTER_PAD;
     let gw = w + 2 * pad;
@@ -578,8 +520,8 @@ pub(crate) fn crop_padded_coverage(ras: &crate::raster::Rasterizer, w: usize, h:
     cov
 }
 
-/// Feeds an aterm-font glyph outline (design units, y-UP) into a [`crate::raster`]
-/// coverage grid (pixels, y-DOWN, origin at the ink box's top-left).
+/// Feeds an aterm-font glyph outline (design units, y up) into a [`crate::raster`]
+/// coverage grid (pixels, y down, origin at the ink box's top-left).
 struct OutlineToRaster<'a> {
     ras: &'a mut crate::raster::Rasterizer,
     scale: f32,
@@ -594,8 +536,8 @@ impl OutlineToRaster<'_> {
     fn map(&self, x: f32, y: f32) -> crate::raster::Point {
         crate::raster::point(x * self.scale - self.ox, self.oy - y * self.scale)
     }
-    /// Close the current contour with an implicit segment back to its start (TrueType/
-    /// CFF outlines are implicitly closed; the rasterizer needs the closing edge for winding).
+    /// Close the current contour back to its start: outlines are implicitly closed, and
+    /// the rasterizer needs the closing edge for winding.
     fn close_contour(&mut self) {
         if self.last != self.start {
             self.ras.draw_line(self.last, self.start);
@@ -634,11 +576,9 @@ impl aterm_font::OutlineSink for OutlineToRaster<'_> {
     }
 }
 
-/// TEST-ONLY: the checked-in variable face (`assets/game/Cinzel-var.ttf`, OFL) with
-/// its `wght` axis and a common glyph that LAYS INK at the axis-min instance, for the
-/// FONT-2 variation tests (here and the end-to-end fontdue-path test in `lib.rs`): the
-/// same face on every host, so no test depends on what the machine has installed.
-/// Returns `(bytes, wght, char, gid)`.
+/// The checked-in variable face (`assets/game/Cinzel-var.ttf`, OFL), its `wght` axis and
+/// a common glyph that lays ink at the axis-min instance, as `(bytes, wght, char, gid)`,
+/// for the variation tests here and in `lib.rs`.
 #[cfg(test)]
 pub(crate) fn inked_wght_font() -> (Vec<u8>, VfAxis, char, u16) {
     let bytes = include_bytes!("../assets/game/Cinzel-var.ttf").to_vec();
@@ -721,13 +661,10 @@ mod tests {
         );
     }
 
-    /// The PORTABLE raster's half of the [`RASTER_PAD`] law: coverage may not
-    /// depend on how much empty grid surrounds the outline. The trap is the
-    /// same one the hinted seam fell into — a design-space `x_min` whose scaled
-    /// value is a whole pixel (a `bbox.x_min` of 0, which most glyphs of most
-    /// fonts have, always is) puts the outline flush against the grid's left
-    /// edge. Held to a 4×-slack refill over every printable ASCII code point
-    /// and the box-drawing run, at every desktop ppem, on the bundled face.
+    /// The portable raster's coverage does not depend on how much empty grid surrounds
+    /// the outline (a scaled `bbox.x_min` of 0 puts it flush against the left edge):
+    /// held against a 4×-slack refill over printable ASCII and the box-drawing run at
+    /// every desktop ppem on the bundled face.
     #[test]
     #[cfg(feature = "embedded-font")]
     fn varied_raster_is_invariant_to_grid_slack() {
@@ -753,8 +690,7 @@ mod tests {
                     continue;
                 }
                 checked += 1;
-                // The same outline, same mapping, into a grid with four times
-                // the production slack.
+                // The same outline and mapping, with four times the production slack.
                 let bbox = face
                     .glyph_bounding_box(g)
                     .expect("an inked glyph has a bbox");
@@ -804,8 +740,8 @@ mod tests {
         );
     }
 
-    /// A blank glyph (no outline) rasters to a 0x0 tile carrying just the advance —
-    /// never a panic or a phantom bitmap. Over the bundled JetBrains Mono's space.
+    /// A blank glyph (the bundled JetBrains Mono's space) rasters to a 0x0 tile carrying
+    /// just the advance.
     #[test]
     fn varied_raster_blank_glyph_is_zero_sized() {
         let bytes = include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");

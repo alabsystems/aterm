@@ -174,7 +174,7 @@ impl ShellIntegrationAuth {
             return false;
         };
 
-        if constant_time_eq_32(&claimed, expected) {
+        if aterm_digest::ct_eq(&claimed, expected) {
             // The shell has the key: a re-key it had not taken is in use now, and a typed
             // one is past taking back.
             self.awaiting_first_mark = false;
@@ -265,18 +265,6 @@ fn hex_digit(b: u8) -> (u8, u8) {
         b'A'..=b'F' => (b - b'A' + 10, 0),
         _ => (0, 1),
     }
-}
-
-/// Constant-time equality of two 32-byte nonces: OR-accumulate every XOR difference and
-/// test once; [`std::hint::black_box`] keeps LLVM from rewriting the loop into an early
-/// exit that would leak the mismatch position through timing.
-#[inline]
-fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff: u8 = 0;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    std::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]

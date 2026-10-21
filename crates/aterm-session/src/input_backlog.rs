@@ -6,34 +6,29 @@
 //! and the pure rules that turn one reading into a word and a gate.
 //!
 //! `aterm_pty::input_queue_len` (FIONREAD) says how many bytes are unread; this
-//! module says how long the oldest has waited, which separates a program busy
-//! for a moment from one that has stopped reading (and whose unchanged screen
-//! would pass every screen fence while a driver's key queues behind unread input).
+//! module says how long the oldest has waited, which separates a program busy for
+//! a moment from one that has stopped reading (whose unchanged screen would pass
+//! every screen fence while a driver's key queues behind unread input).
 //!
-//! The ledger records when the kernel accepted each byte the sink handed it.
 //! The kernel queue is FIFO, so the `unread` bytes FIONREAD counts are the newest
-//! `unread` accepted, and the oldest sits at offset `accepted - unread`. One
-//! probe dates it, with no history of earlier probes (the event loop probes only
-//! when it wakes, and a cross-session control write posts no wake).
+//! `unread` accepted, and the oldest sits at offset `accepted - unread`. One probe
+//! dates it, with no history of earlier probes (the event loop probes only when it
+//! wakes, and a cross-session control write posts no wake).
 //!
 //! Every answer is a lower bound on the true wait: stamps are taken after the
 //! syscall returns, coalescing keeps the newer instant, a merged run is dated by
 //! the run it joins, bytes that predate the sink are dated from its birth, and a
-//! write in flight moves the computed offset newer. The one over-claim is a
-//! writer the ledger does not see (another process's `TIOCSTI`), which this
-//! code cannot detect.
+//! write in flight moves the computed offset newer. The one over-claim is a writer
+//! the ledger does not see (another process's `TIOCSTI`), which this code cannot
+//! detect.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// A raw-mode reader drains its queue within one event-loop turn, so a byte a
-/// raw program has left unread this long is worth saying: an input-writing
-/// control verb still writes, and its `OK` carries `warn=input-unread
-/// input_bytes=<n> input_wait_ms=<ms>` ([`Gate::Warn`]).
-///
-/// A warning, not a refusal: on a heavily loaded machine a healthy program can
-/// take longer than a second to read. Refusing needs the watch's evidence that
-/// the program is not reading ([`Gate::Refuse`]).
+/// A raw-mode reader drains its queue within one event-loop turn, so raw input unread
+/// this long earns a warning ([`Gate::Warn`]), not a refusal: a healthy program on a
+/// loaded machine can take over a second, and refusing needs the watch's evidence
+/// ([`Gate::Refuse`]).
 pub const WARN_AFTER: Duration = Duration::from_secs(1);
 
 /// The base age at which a stall is published (the `stalled` word, the rim,
@@ -43,25 +38,21 @@ pub const WARN_AFTER: Duration = Duration::from_secs(1);
 /// frozen. Ten times [`WARN_AFTER`] so a multi-second GC pause does not flap.
 pub const STALL_AFTER: Duration = Duration::from_secs(10);
 
-/// The base age at which a program asleep (little CPU, nothing drawn) with
-/// input waiting is published as stalled, stretched like [`STALL_AFTER`]. An old
-/// byte alone does not mean frozen: `less` in front of a slow `git log -S`, or
-/// zsh during a slow completion widget, holds a typed key at ~0 CPU with aterm's
-/// output queue empty. A deadlock looks the same, so the sleeper is exempt only
-/// long enough for a slow producer to finish. A program still drawing is never
-/// published ([`Liveness::Watched`]'s `drew`).
+/// The base age at which a program asleep (little CPU, nothing drawn) with input
+/// waiting is published as stalled, stretched like [`STALL_AFTER`]. An old byte
+/// alone is not a freeze: `less` in front of a slow `git log -S`, or zsh in a slow
+/// completion widget, holds a typed key at ~0 CPU. A deadlock looks the same, so
+/// the sleeper is exempt only this long. A program still drawing is never
+/// published.
 pub const QUIET_STALL_AFTER: Duration = Duration::from_secs(300);
 
 /// How contended the machine's CPUs are while a watch looks: runnable load per
 /// CPU in thousandths (`load average / online CPUs × 1000`); [`Default`] is idle.
 ///
 /// A runnable but unscheduled program draws nothing, reads nothing and burns
-/// little CPU, just like the sleeper [`QUIET_STALL_AFTER`] catches, and every
-/// second of its work takes several of wall time. So thresholds stretch by this
-/// ratio ([`Self::stretch`]), up to [`Self::MAX_STRETCH`]: at 8.3 runnable
-/// threads per CPU a spinning program is published at 83 s instead of 10 s. A
-/// program seen spinning is being scheduled, and one seen drawing is never
-/// published; the stretch only delays the call on the starved.
+/// little CPU, like the sleeper [`QUIET_STALL_AFTER`] catches, so thresholds
+/// stretch by this ratio ([`Self::stretch`]) up to [`Self::MAX_STRETCH`]: at 8.3
+/// runnable threads per CPU a spinning program is published at 83 s, not 10 s.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Contention {
     /// Runnable threads per online CPU, times 1000.
@@ -251,26 +242,21 @@ pub enum Liveness {
     Published,
 }
 
-/// When the kernel accepted each input byte a sink handed it: the
-/// kernel-acceptance ledger.
+/// When the kernel accepted each input byte a sink handed it.
 ///
 /// Offsets count every byte any sink site handed the kernel, in kernel order:
 /// every production master write happens under the sink's fd lock, bracketed
-/// [`Self::begin`] … [`Self::end`] around its one `write(2)`, so runs are
-/// appended in queue order with monotone instants.
+/// [`Self::begin`] … [`Self::end`] around its one `write(2)`, so runs append in
+/// queue order with monotone instants.
 ///
 /// Bounded at [`Self::CAPACITY`] runs. A write within [`Self::COALESCE`] of the
-/// newest run joins it, and a full ring merges two adjacent runs, never drops
-/// one, so every accepted byte keeps a run. Both date bytes later than accepted,
-/// which only shortens a computed wait.
-///
-/// The ring merges the run that loses the smallest share of its oldest byte's
-/// age (`merge_cheapest`): recent bytes keep fine dates, old ones share coarse
-/// runs, and an isolated old byte (the unread Enter a frozen program left
-/// behind later keystrokes) keeps its own. Evicting the oldest, or merging the
-/// closest pair in absolute time, would date that byte by newer input and hide
-/// the stall. The tests check every byte of a stream sixteen times the ring's
-/// length is dated within 15% of its true age.
+/// newest run joins it, and a full ring merges two adjacent runs, never drops one;
+/// both date bytes later than accepted, which only shortens a computed wait. The
+/// merge picks the run that loses the smallest share of its oldest byte's age
+/// (`merge_cheapest`), so an isolated old byte (the unread Enter a frozen program
+/// left behind later keystrokes) keeps its own date; evicting the oldest, or
+/// merging the closest pair in absolute time, would date it by newer input and
+/// hide the stall.
 #[derive(Clone, Debug)]
 pub struct InputLedger {
     /// Bytes the kernel has accepted (every `end` adds its count).
@@ -498,10 +484,10 @@ impl InputBacklog {
         self.queued.saturating_add(self.spilled.unwrap_or(0))
     }
 
-    /// Whether writing exactly `bytes` now becomes a signal rather than input:
-    /// one byte, one of the slave's signal characters while `ISIG` is set
-    /// ([`aterm_pty::TtySignals`]), and a kernel that takes it now (nothing
-    /// spilled ahead, room in the queue per [`KERNEL_QUEUE_ROOM`]).
+    /// Whether writing exactly `bytes` now becomes a signal rather than input: one byte
+    /// that is one of the slave's signal characters under `ISIG`
+    /// ([`aterm_pty::TtySignals`]), a spill known to be empty (a busy one answers
+    /// `false`), and room in the queue ([`KERNEL_QUEUE_ROOM`]).
     ///
     /// Such a write is not queued behind the unread bytes: the line discipline
     /// turns it into SIGINT, SIGQUIT or SIGTSTP and (unless `NOFLSH`) flushes the
@@ -577,14 +563,11 @@ impl InputWord {
 ///    `Stalled`, where `stretch` is [`Contention::stretch`] at the look;
 /// 7. otherwise → `Pending`.
 ///
-/// Rule 6's evidence gates only entry. A program blocked writing to an aterm
-/// that is not draining its output is waiting for aterm and is not blamed. An
-/// unread byte alone is not a freeze: a sleeping `less` or zsh widget, or a
-/// cbreak program still drawing, leaves one too. On an oversubscribed machine a
-/// healthy program is slower, so the ages stretch with the load. Once published
-/// (rule 5), none of these clears the stall, so the word does not flap; a byte
-/// younger than the base [`STALL_AFTER`] does, since the program has read what
-/// it was published for.
+/// Rule 6's evidence gates only entry: a program blocked on aterm's unread output
+/// is not blamed, and a sleeping `less` or zsh widget, or a cbreak program still
+/// drawing, leaves an unread byte too. Once published (rule 5) the stall holds
+/// until the oldest byte is younger than the base [`STALL_AFTER`], i.e. the program
+/// read what it was published for.
 #[must_use]
 pub fn classify(b: Option<&InputBacklog>, stopped: bool, liveness: Liveness) -> InputWord {
     let Some(b) = b else {
@@ -730,9 +713,8 @@ mod tests {
         );
     }
 
-    /// In flight: the kernel may have accepted any prefix of a write inside
-    /// `write(2)`, so unread bytes that could all be that prefix have no date,
-    /// and an older unread byte is dated as if the whole write had landed (newer).
+    /// Bytes that could all be an in-flight prefix have no date; an older byte is
+    /// dated as if the whole write had landed.
     #[test]
     fn ledger_in_flight_bytes_move_the_answer_newer() {
         let t0 = Instant::now();
@@ -754,11 +736,8 @@ mod tests {
         assert_eq!(l.oldest_unread_at(1), Some(t0 + ms(400)));
     }
 
-    /// Why the sink parks outside the bracket: a blocking writer on a full queue
-    /// can wait in `poll(POLLOUT)` as long as the program stays frozen. Inside
-    /// the bracket its whole chunk would count as in flight, and any unread
-    /// count up to the chunk (a full raw queue is smaller than the drainer's
-    /// 8 KiB chunk) would read "no date". This row pins that blindness.
+    /// Why the sink parks outside the bracket: a bracket held across a park counts
+    /// the whole chunk as in flight, and the probe reads "no date".
     #[test]
     fn ledger_a_bracket_held_across_a_park_would_blind_the_probe() {
         let t0 = Instant::now();
@@ -814,10 +793,8 @@ mod tests {
         );
     }
 
-    /// Past capacity: an Enter a frozen program never read, then more keystrokes
-    /// than the ring has runs. The Enter dates the stall; merging it into the
-    /// keystrokes would cost it almost all its age (and lift a published stall),
-    /// so it keeps its date after every one of them.
+    /// An unread Enter followed by more keystrokes than the ring has runs keeps its
+    /// own date.
     #[test]
     fn ledger_a_full_ring_keeps_the_date_of_the_stalled_byte() {
         let t0 = Instant::now();
@@ -836,12 +813,9 @@ mod tests {
         assert_eq!(l.ring.len(), InputLedger::CAPACITY);
     }
 
-    /// A ring full of old history rules out merging the pair closest in absolute
-    /// time: 600 commands over five hours (nine keys 150 ms apart, then a 30 s
-    /// pause), the Enter the program freezes on, and 9 s later a burst of mouse
-    /// reports. By absolute gap the Enter would join the reports and read ~1 s
-    /// old instead of 10.7 s; by relative error that merge costs all its age, so
-    /// the history compresses instead.
+    /// Five hours of history, the Enter the program freezes on, then a burst 9 s
+    /// later: merging by absolute gap would date the Enter ~1 s old instead of 10.7 s;
+    /// merging by relative error compresses the history instead.
     #[test]
     fn ledger_a_ring_full_of_history_keeps_the_date_of_the_stalled_byte() {
         let t0 = Instant::now();
@@ -902,10 +876,8 @@ mod tests {
         assert_eq!(l.oldest_unread_at(1), Some(t0 + ms(100)));
     }
 
-    /// The discard mark counts only bytes accepted after its discard, so a
-    /// program that survives `signal term` and reads again is no longer
-    /// published as frozen. A write in flight at the mark counts as before it,
-    /// and a short one under-counts what follows: both claim no read.
+    /// The discard mark counts only bytes accepted after it; a write in flight at the
+    /// mark counts as before it, and a short one under-counts what follows.
     #[test]
     fn ledger_the_discard_mark_counts_what_was_accepted_after_it() {
         let t0 = Instant::now();
@@ -952,11 +924,8 @@ mod tests {
         }
     }
 
-    /// The gate: raw input unread for a second warns (the write goes ahead) and
-    /// 0.99 s is open; canonical type-ahead is open at any age; the only
-    /// refusals are a stopped job with input queued (any mode) and a published
-    /// stall whose oldest byte is still [`STALL_AFTER`] old. Nothing queued is
-    /// open, a published stall included.
+    /// The gate table: age warns, and only a stopped job or a published, still-stale
+    /// stall refuses.
     #[test]
     fn the_gate_warns_on_age_and_refuses_only_a_published_stall_or_a_stopped_job() {
         use Gate as G;
@@ -1006,9 +975,8 @@ mod tests {
         assert!(!lagging(&canonical) && !lagging(&raw(0, 60_000)));
     }
 
-    /// The stretch: an idle machine, or one at or below one runnable thread per
-    /// CPU, judges at the base thresholds; a loaded one stretches them by its
-    /// load per CPU, up to ten times.
+    /// At or below one runnable thread per CPU the base thresholds hold; above, they
+    /// stretch by the load per CPU, up to ten times.
     #[test]
     fn contention_stretches_the_stall_thresholds_with_the_load_per_cpu() {
         let s = |load: f64, cpus: usize| Contention::of_load(load, cpus).stretch(STALL_AFTER);
@@ -1100,12 +1068,8 @@ mod tests {
         );
     }
 
-    /// The liveness gate on entry: a byte ten seconds unread is `stalled` only
-    /// for a program seen spinning and drawing nothing, or seen asleep for
-    /// [`QUIET_STALL_AFTER`]; a program seen drawing, or a one-off reading with
-    /// nothing seen, is never entered. Negative controls: three known false
-    /// positives as the watch sees them (`queued=1`, cbreak, output queue empty,
-    /// twelve seconds).
+    /// Entry needs evidence: spinning and silent, or asleep for [`QUIET_STALL_AFTER`].
+    /// Negative controls: three known false positives as the watch sees them.
     #[test]
     fn classify_enters_a_stall_only_on_evidence_the_program_is_stuck() {
         use InputWord as W;
@@ -1157,11 +1121,8 @@ mod tests {
         assert_eq!(gate(&at(12), false, false), Gate::Warn);
     }
 
-    /// A contended machine (load 150 on 18 CPUs) stretches the thresholds 8.33
-    /// times: a spinning, silent program is entered at 83.3 s, not 10 s, and a
-    /// sleeper at 41.7 min, not 5; an idle machine enters the same readings at
-    /// once. A published stall is not re-judged by load: it stays while its byte
-    /// is [`STALL_AFTER`] old.
+    /// Load 150 on 18 CPUs stretches entry 8.33 times (83.3 s spinning, 41.7 min
+    /// asleep); a published stall stays at the base [`STALL_AFTER`] whatever the load.
     #[test]
     fn classify_stretches_entry_by_the_machines_contention() {
         use InputWord as W;
@@ -1239,10 +1200,8 @@ mod tests {
         assert!(!words.contains(&"frozen"));
     }
 
-    /// A signal character is not input while ISIG is set: exactly one byte, one
-    /// of the tty's own signal characters (as remapped or disabled), with nothing
-    /// spilled ahead and room in the queue. Raw mode, two bytes, an unknown or
-    /// non-empty spill, or a full queue is input the gate still judges.
+    /// Under ISIG, one byte that is one of the tty's signal characters, with nothing
+    /// spilled ahead and room in the queue, is not input; anything else is.
     #[test]
     fn a_lone_signal_character_under_isig_is_not_input() {
         let cbreak = InputBacklog {

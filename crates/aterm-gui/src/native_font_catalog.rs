@@ -11,10 +11,9 @@ use crate::app_config::{Config, ConfigAssetCatalog, FontConfig};
 use crate::native_config_service::ConfigDiskObservation;
 use crate::{Wake, effective_font_family};
 
-/// How the worker's refusal of the configured `font_family` opens — its
-/// warning under `config.fonts`. A reload whose prepared fonts carry none
-/// ADMITTED the family, and so answers the launch thread's own verdict
-/// (`App::replace_config_messages_after_font_work`, round 44's review).
+/// How the worker's refusal of the configured `font_family` opens — its warning under
+/// `config.fonts`. Prepared fonts that carry no such warning admitted the family, so the reload
+/// answers the launch thread's own verdict (`App::replace_config_messages_after_font_work`).
 pub(crate) const FAMILY_REFUSED: &str = "config font_family:";
 
 /// How the worker's refusal of a font a THEME names opens. It never answers

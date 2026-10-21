@@ -4,15 +4,13 @@
 
 //! key-material: no release-trust secret in the checkout.
 //!
-//! Two shapes nothing else scans for (the publication engine's secret scan
-//! matches PEM headers, and only over the export):
-//! * the paper master, written down as 52 bare base32 symbols
-//!   (`0-9a-z` minus `i l o u`, bare or as 13 groups of 4), on the key surface:
-//!   the trust anchors, the cutter's machine roster and prompt, the owner-side
-//!   key tool and the key document. Path-scoped because truncated hashes of
-//!   that length occur elsewhere. A phrase whose symbols step through the
-//!   alphabet in order, in reverse or not at all (its last, check symbol aside)
-//!   is a fixture, which no random master is;
+//! Two shapes no other scan sees (the publication engine's secret scan matches
+//! PEM headers, and only over the export):
+//! * the paper master, 52 base32 symbols (`0-9a-z` minus `i l o u`, bare or as
+//!   13 groups of 4), on the key surface ([`KEY_SURFACE`], [`KEY_TOOL`]):
+//!   path-scoped because truncated hashes of that length occur elsewhere. A
+//!   phrase whose symbols step through the alphabet in order, in reverse or not
+//!   at all (its last, check symbol aside) is a fixture, which no random master is;
 //! * a key file: the machine key is binary pkcs8 with no text marker, so its
 //!   name gives it away (`machine|master|release|signing|root.key`, `*.pkcs8`),
 //!   anywhere in the checkout but `.git`, build output and the directories

@@ -72,7 +72,7 @@ fn a_plain_backspace_arms_the_host_exactly_like_a_kill() {
         CursorGlow::KILL_HINT_POLL_INTERVAL,
         "…at the same coarse poll a kill chord takes"
     );
-    // PARITY, stated directly: the two licences schedule identically.
+    // Parity: the two licences schedule identically.
     let mut kill = CursorGlow::default();
     kill.note_kill(t0, false);
     assert_eq!(
@@ -149,8 +149,7 @@ fn a_witnessed_erase_releases_the_fallback_grace_early() {
     let echo = key + Duration::from_millis(8);
     glow.observe_row(2, 0, &row("pulled up"), echo);
     glow.tick(Some((2, 0)), echo, &c, g, &mut out);
-    // PRE-FIX PREDICATE, stated so this cannot pass vacuously: the timed
-    // grace alone is still WIDE open at this instant.
+    // Non-vacuity: the timed grace alone is still open at this instant.
     assert!(
         echo.saturating_duration_since(key).as_secs_f32() < CursorGlow::POOF_FALLBACK_GRACE,
         "precondition: the old timer would still be holding the poof back"
@@ -161,7 +160,7 @@ fn a_witnessed_erase_releases_the_fallback_grace_early() {
          — not {} ms later",
         (CursorGlow::POOF_FALLBACK_GRACE * 1000.0) as u32 - 8
     );
-    // …and it consumed its licence, so this is still ONE kill, one poof.
+    // …and it consumed its licence: one kill, one poof.
     assert!(glow.kill_hint.is_none(), "the fallback consumed the hint");
     let answered = glow.vapor.len();
     let later = echo + Duration::from_millis(120);
@@ -192,7 +191,7 @@ fn an_unwitnessed_kill_still_serves_the_full_grace() {
     glow.tick(Some((2, 7)), t0, &c, g, &mut out);
     let key = t0 + Duration::from_millis(16);
     glow.note_kill(key, false);
-    // Inside the grace, row UNCHANGED: no witness, so nothing may fire.
+    // Inside the grace, row unchanged: no witness, so nothing may fire.
     let inside = key + Duration::from_millis(8);
     glow.observe_row(2, 7, &row("$ hello world"), inside);
     glow.tick(Some((2, 7)), inside, &c, g, &mut out);
@@ -200,7 +199,7 @@ fn an_unwitnessed_kill_still_serves_the_full_grace() {
         glow.vapor.is_empty() && glow.last_poof.is_none(),
         "no shrink since the key ⇒ the span branch keeps its whole window"
     );
-    // Past the grace, still unchanged: the timer answers, as it always did.
+    // Past the grace, still unchanged: the timer answers.
     let past = key + Duration::from_millis(70);
     glow.observe_row(2, 7, &row("$ hello world"), past);
     glow.tick(Some((2, 7)), past, &c, g, &mut out);
@@ -226,7 +225,7 @@ fn reflow_kill_poofs_at_the_caret() {
         v.resize(40, ' ');
         v
     };
-    // Control first: the same replacement with NO hint is silent.
+    // Control first: the same replacement with no hint is silent.
     glow.observe_row(2, 0, &row("rainbow ribbon typing through the wrap"), t0);
     glow.tick(Some((2, 0)), t0, &c, g, &mut out);
     let t1 = t0 + Duration::from_millis(16);
@@ -236,8 +235,8 @@ fn reflow_kill_poofs_at_the_caret() {
         glow.vapor.is_empty(),
         "a hint-less replacement (repaint/reflow storm) never poofs"
     );
-    // Now the kill: caret at col 0, Ctrl-K, and the TUI reflows — the row
-    // is REPLACED by the (shorter) line that moved up from below.
+    // Now the kill: caret at col 0, Ctrl-K, and the TUI reflows; the row is
+    // replaced by the (shorter) line that moved up from below.
     glow.note_kill(t1 + Duration::from_millis(10), false);
     let t2 = t1 + Duration::from_millis(32);
     glow.observe_row(2, 0, &row("shorter pulled-up"), t2);
@@ -251,7 +250,7 @@ fn reflow_kill_poofs_at_the_caret() {
         !glow.vapor.is_empty(),
         "a reflow kill still gets its poof (caret-anchored fallback)"
     );
-    // Modest and AT the caret: every puff within a few cells of col 0.
+    // Modest and at the caret: every puff within a few cells of col 0.
     for v in &glow.vapor {
         assert!(
             v.x0 <= (8 * 8) as f32,
@@ -281,7 +280,7 @@ fn ctrl_k_shrink_poofs_once() {
     glow.tick(Some((2, 7)), t0, &c, g, &mut out);
     // Ctrl-K…
     glow.note_kill(t0 + Duration::from_millis(30), false);
-    // …and the echo frame rewrites the row SHORTER (cols 7..13 vanished).
+    // …and the echo frame rewrites the row shorter (cols 7..13 vanished).
     let t1 = t0 + Duration::from_millis(46);
     glow.observe_row(2, 7, &row("$ hello"), t1);
     let fp = glow.tick(Some((2, 7)), t1, &c, g, &mut out);
@@ -292,7 +291,7 @@ fn ctrl_k_shrink_poofs_once() {
         "a non-fire kill sheds the neutral POOF"
     );
     assert_ne!(fp, 0, "the poof is visible frame state");
-    // The puffs sit ON the vanished span [7..13) — never over survivors.
+    // The puffs sit on the vanished span [7..13), never over survivors.
     for v in &glow.vapor {
         assert!(
             v.x0 >= (7 * 8 - 8) as f32 && v.x0 <= (13 * 8 + 8) as f32,
@@ -300,8 +299,8 @@ fn ctrl_k_shrink_poofs_once() {
             v.x0
         );
     }
-    // The identical shrunken row on the next frame is SILENT: the hint was
-    // consumed by the poof (one kill = one poof).
+    // The identical shrunken row on the next frame is silent: the poof consumed
+    // the hint (one kill, one poof).
     let t2 = t0 + Duration::from_millis(62);
     glow.observe_row(2, 7, &row("$ hello"), t2);
     glow.tick(Some((2, 7)), t2, &c, g, &mut out);
@@ -421,19 +420,16 @@ fn a_bigger_erase_makes_a_bigger_cloud_not_a_thinner_one() {
         "a 38-column kill's cloud spans {widest} px — it must CLUSTER at the \
          collapse point (cap {cap} px), not trace the whole dead line"
     );
-    // NON-VACUITY: the cap actually bites — the span it was given is far
-    // wider than the cloud it produced.
+    // Non-vacuity: the span given is far wider than the cloud produced.
     assert!(
         widest < 38.0 * 8.0 * 0.6,
         "precondition: the even-spread implementation would have spanned ~304 px"
     );
 }
 
-/// Poof cue law, both halves on the same machinery:
-///
-/// * a plain Backspace never adds the tier-3 `Kill` swoosh over the poof it
-///   already spoke on its retreat; its cloud cues [`SoundKind::Poof`];
-/// * a kill chord still swooshes.
+/// A plain Backspace's poof cues `SoundKind::Poof`, never the `Kill` swoosh (its
+/// retreat already spoke); a kill chord swooshes and a word kill speaks
+/// `KillWord`.
 #[test]
 fn a_plain_backspace_never_throws_the_kill_swoosh() {
     use crate::trail_sound::SoundKind;
@@ -514,8 +510,8 @@ fn a_plain_backspace_never_throws_the_kill_swoosh() {
         "…and never the clause swoosh (cued {cues:?})"
     );
 
-    // …and the NEXT line-scale chord is back to the swoosh: the word mark
-    // is a property of the licence, not a latch.
+    // …and the next line-scale chord is back to the swoosh: the word mark is a
+    // property of the licence, not a latch.
     let _ = glow.drain_sound_cues().count();
     glow.note_kill(t1 + Duration::from_millis(400), false);
     let t2 = t1 + Duration::from_millis(416);
@@ -541,15 +537,15 @@ fn no_op_backspace_poofs_nothing_but_a_real_one_does() {
         v.resize(40, ' ');
         v
     };
-    // NO-OP: caret at column 0 on an EMPTY row; Backspace erases nothing.
+    // No-op: caret at column 0 on an empty row; Backspace erases nothing.
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
     glow.observe_row(2, 0, &row(""), t0);
     glow.tick(Some((2, 0)), t0, &c, g, &mut out);
     glow.note_backspace(t0 + Duration::from_millis(10));
-    // Tick PAST the fallback grace (0.06 s) with the row UNCHANGED (no
-    // shrink): an unguarded caret fallback would puff here.
+    // Tick past the fallback grace with the row unchanged: an unguarded caret
+    // fallback would puff here.
     let t1 = t0 + Duration::from_millis(90);
     glow.observe_row(2, 0, &row(""), t1);
     glow.tick(Some((2, 0)), t1, &c, g, &mut out);
@@ -562,7 +558,7 @@ fn no_op_backspace_poofs_nothing_but_a_real_one_does() {
         "no sparkles or smoke for a backspace that vanished no cell"
     );
 
-    // REAL: a glyph genuinely vanishes (the row shrinks) → the poof fires.
+    // Real: a glyph vanishes (the row shrinks), so the poof fires.
     let mut real = CursorGlow::default();
     real.observe_row(2, 3, &row("abc"), t0);
     real.tick(Some((2, 3)), t0, &c, g, &mut out);
@@ -644,7 +640,7 @@ fn ink_repaint_same_text_is_silent() {
         glow.tick(Some((2, 9)), t, &c, g, &mut out);
     }
     assert!(glow.vapor.is_empty(), "identical repaints shed nothing");
-    // A shrink WITHOUT a kill hint (app truncated its own output): silent.
+    // A shrink without a kill hint (app truncated its own output): silent.
     let t = t0 + Duration::from_millis(120);
     glow.observe_row(2, 9, &row("> typing"), t);
     glow.tick(Some((2, 9)), t, &c, g, &mut out);
@@ -675,15 +671,15 @@ fn repaint_same_text_with_stale_hint_is_silent() {
         glow.observe_row(2, 7, &row("$ hello world"), t);
         glow.tick(Some((2, 7)), t, &c, g, &mut out);
     }
-    // The echo-less kill answered ONCE at the caret (post-grace fallback)…
+    // The echo-less kill answered once at the caret (post-grace fallback)…
     let answered = glow.vapor.len();
     assert!(answered > 0, "an echo-less kill still answers at the caret");
     assert!(
         glow.kill_hint.is_none(),
         "the fallback consumed the hint — one kill, one poof"
     );
-    // …so a shrink arriving now (0.6 s later) is NOT the kill's echo and
-    // adds nothing (the old vapor may have decayed; none may be BORN).
+    // …so a shrink arriving now (0.6 s later) is not the kill's echo and adds
+    // nothing (the old vapor may have decayed; none may be born).
     let t = t0 + Duration::from_millis(700);
     glow.observe_row(2, 7, &row("$ hello"), t);
     glow.tick(Some((2, 7)), t, &c, g, &mut out);
@@ -693,12 +689,10 @@ fn repaint_same_text_with_stale_hint_is_silent() {
     );
 }
 
-/// Kill feedback: an observed stable-row shrink earns a precise poof, and a
-/// stationary echo-less kill may use the bounded caret fallback, including when
-/// the survivor row is replaced and re-rowed at once (Claude Code's
-/// bottom-anchored box reflowing on a kill). A kill key was pressed, which is
-/// the licence (`docs/design/EFFECTS-LICENSE-REDESIGN.md`). Bounded by one kill,
-/// one poof; a stale hint answers nothing.
+/// A kill whose survivor row is re-rowed at once (Claude Code's bottom-anchored
+/// box reflowing on a kill) gets the caret fallback once and a stale hint
+/// nothing; a same-row content replacement stays silent
+/// (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
 #[test]
 fn a_re_rowed_kill_answers_once_and_a_stale_hint_never_does() {
     let g = geom();
@@ -741,8 +735,8 @@ fn a_re_rowed_kill_answers_once_and_a_stale_hint_never_does() {
         "a stale kill licenses no further poof"
     );
 
-    // Same row + fresh hint, content REPLACED (reflow-or-scroll): the
-    // unproven cursor relocation is the same fail-closed boundary.
+    // Same row + fresh hint, content replaced (reflow or scroll): the unproven
+    // cursor relocation is the same fail-closed boundary.
     let mut replaced = CursorGlow::default();
     replaced.observe_row(5, 13, &row("$ hello world"), t0);
     replaced.tick(Some((5, 13)), t0, &c, g, &mut out);
@@ -758,10 +752,9 @@ fn a_re_rowed_kill_answers_once_and_a_stale_hint_never_does() {
     );
 }
 
-/// Style dispatch: a rainbow kitty kill sheds star sparkles over a grey cloud
-/// (all [`VaporKind::Poof`], never [`VaporKind::Steam`]); a Fire kill flashes
-/// quench steam and visibly escalates the quench meter (the standing blaze dies
-/// as the steam rises).
+/// Style dispatch: a rainbow kitty kill sheds a grey cloud (all
+/// [`VaporKind::Poof`], never [`VaporKind::Steam`]); a Fire kill flashes quench
+/// steam and escalates the quench meter.
 #[test]
 fn rainbow_kill_poofs_fire_kill_steams() {
     let g = geom();
@@ -847,12 +840,12 @@ fn kill_repeat_rate_limits_to_one_poof() {
 /// floor.
 #[test]
 fn erase_poof_drive_grows_with_momentum_and_weight() {
-    // MOMENTUM bites at a fixed span.
+    // Momentum bites at a fixed span.
     assert!(
         erase_poof_drive(1.0, 1) > erase_poof_drive(0.0, 1),
         "a hot delete run poofs harder than a cold one"
     );
-    // WEIGHT bites at a fixed momentum, and keeps biting up the range.
+    // Weight bites at a fixed momentum, and keeps biting up the range.
     assert!(
         erase_poof_drive(0.5, 8) > erase_poof_drive(0.5, 1),
         "a word kill outweighs a character"
@@ -861,7 +854,7 @@ fn erase_poof_drive_grows_with_momentum_and_weight() {
         erase_poof_drive(0.5, 40) > erase_poof_drive(0.5, 8),
         "a line kill outweighs a word"
     );
-    // Monotone non-decreasing in BOTH arguments across the range.
+    // Monotone non-decreasing in both arguments across the range.
     for cells in [1u16, 2, 5, 13, 40, 200] {
         let mut prev = -1.0;
         for i in 0..=20 {
@@ -876,16 +869,13 @@ fn erase_poof_drive_grows_with_momentum_and_weight() {
         assert!(v >= prev - 1e-6, "drive rises with the erased span");
         prev = v;
     }
-    // BOUNDED: the weight term saturates, so a 4000-column kill cannot ask
-    // for an unbounded cloud.
+    // Bounded: the weight term saturates, so a 4000-column kill cannot ask for
+    // an unbounded cloud.
     assert!(
         erase_poof_drive(1.0, u16::MAX) <= ERASE_WEIGHT_CAP + 1e-6,
         "the energy law is bounded at the top"
     );
-    // The floor: a cold single character still throws a few grains. With
-    // ERASE_POOF_STARS = 7 the erase's weight is in the hero grain's size and
-    // debris speed, so the cold floor is three visible grains
-    // (owner, 2026-08-08).
+    // The floor: a cold single character still throws at least three grains.
     assert!(
         (ERASE_POOF_STARS * erase_poof_drive(0.0, 1)) as usize >= 3,
         "a cold single-character erase still throws a visible few sparkles"

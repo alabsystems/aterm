@@ -1,18 +1,14 @@
 // Copyright 2026 Andrew Yates, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Platform directory resolution (zero external dependencies).
-//!
-//! Replaces the `dirs` crate with direct environment variable lookups
-//! and platform-specific conventions.
+//! Platform directory resolution from environment variables and platform conventions, with
+//! no external dependencies.
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-/// Return the user's home directory.
-///
-/// - **Unix/macOS**: `$HOME`, falling back to `/etc/passwd` lookup
-/// - **Windows**: `%USERPROFILE%`
+/// Return the user's home directory: `$HOME` (else `/etc/passwd`) on Unix, `%USERPROFILE%` on
+/// Windows.
 #[must_use]
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
@@ -43,9 +39,8 @@ unsafe extern "C" {
     fn libc_getuid() -> u32;
 }
 
-/// `$HOME` as a home, or `None`: an EMPTY or RELATIVE value is no home at all
-/// (it would make every caller's prefix relative to the cwd), so it falls
-/// through to the passwd lookup like an unset one.
+/// `$HOME` as a home, or `None`: an empty or relative value (which would make every path
+/// cwd-relative) falls through to the passwd lookup like an unset one.
 #[cfg(unix)]
 fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     value.map(PathBuf::from).filter(|home| home.is_absolute())
@@ -80,44 +75,31 @@ fn passwd_file() -> PathBuf {
 
 /// Testable helper: extract home dir for `uid` from passwd-format bytes.
 #[cfg(unix)]
-// Skip: the passwd line split walks std iterators (absent bodies); every malformed line is skipped.
+// Skip: the line split walks std iterators (absent bodies).
 #[cfg_attr(trust_verify, trust::skip)]
 fn home_from_passwd(contents: &[u8], uid: u32) -> Option<PathBuf> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let uid_str = uid.to_string();
-    // `split(b'\n')` + trailing-`\r` strip is `str::lines` on bytes; the one
-    // difference — a trailing empty piece after a final newline — parses to a
-    // single empty field and is skipped by the `>= 6` guard, like any other
-    // malformed line.
+    // `str::lines` on bytes; the empty piece after a final newline is a short line.
     for line in contents.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        // `splitn(7, ..)`: passwd lines have exactly 7 `:`-fields, and only
-        // fields 2 (uid) and 5 (home) are read — `splitn` yields the first 6
-        // splits identically to `split` and can only differ in field 6 (the
-        // shell, never read here), so the lookup is unchanged while the
-        // `collect` gets a literal element bound for the Trust gate.
+        // Only fields 2 (uid) and 5 (home) are read; `splitn(7, ..)` gives the `collect` a
+        // literal bound for the Trust gate.
         let fields: Vec<&[u8]> = line.splitn(7, |&b| b == b':').collect();
-        // Total `get`s (not indexing): the `len() >= 6` guard proves the bounds
-        // but does not reach the index in the verifier's model; the None arms
-        // are unreachable and simply skip the line, as a short line would.
+        // Total `get`s, not indexing, for the verifier; a short line is skipped.
         let (Some(&uid_field), Some(&home)) = (fields.get(2), fields.get(5)) else {
             continue;
         };
         if uid_field == uid_str.as_bytes() && !home.is_empty() {
-            // Byte-exact `OsStr` bridge: on Unix `PathBuf::from(str)` and
-            // `PathBuf::from(OsStr::from_bytes(..))` build the identical
-            // path from the identical bytes.
             return Some(PathBuf::from(OsStr::from_bytes(home)));
         }
     }
     None
 }
 
-/// THE `aterm.toml` path: the file the window loads and hot-reloads, the one
-/// `aterm-gui --write-config` writes, and the one the CLI's `explain-config` and
-/// `doctor` name. Resolved, never created. [`resolve_aterm_config_path`] is the
-/// rule; this reads the three variables it consults.
+/// The `aterm.toml` path: the file the window loads and hot-reloads, `--write-config` writes,
+/// and the CLI's `explain-config` and `doctor` name. Resolved, never created.
 #[must_use]
 pub fn aterm_config_path() -> Option<PathBuf> {
     resolve_aterm_config_path(
@@ -127,25 +109,16 @@ pub fn aterm_config_path() -> Option<PathBuf> {
     )
 }
 
-/// The rule behind [`aterm_config_path`], pure so it is testable on every host:
+/// The rule behind [`aterm_config_path`], pure for testing:
 ///
-/// 1. `$XDG_CONFIG_HOME/aterm/aterm.toml` when the variable is set and
-///    non-empty — on EVERY platform, so an explicit XDG override wins even on
-///    Windows;
-/// 2. **Windows only**: `%APPDATA%\aterm\aterm.toml` when set and non-empty,
-///    the roaming per-user config dir (Windows has no XDG and usually no
-///    `HOME`; `appdata` is ignored elsewhere, so a stray `APPDATA` on a Unix
-///    box changes nothing);
-/// 3. `$HOME/.config/aterm/aterm.toml` — macOS AND Linux: `aterm.toml` predates
-///    the macOS Application Support convention and stays where its users
-///    already edit it.
+/// 1. `$XDG_CONFIG_HOME/aterm/aterm.toml` when set and non-empty, on every platform;
+/// 2. Windows only: `%APPDATA%\aterm\aterm.toml` when set and non-empty;
+/// 3. `$HOME/.config/aterm/aterm.toml`, macOS included: `aterm.toml` predates the
+///    Application Support convention and stays where its users edit it.
 ///
-/// This is deliberately NOT `<OS config dir>/aterm/aterm.toml`. That convention
-/// (Application Support on macOS, no XDG on Windows) and this rule disagree on
-/// exactly the machines where a wrong path is a silent
-/// no-op — settings that never load and a hot-reload watcher that watches
-/// nothing. `aterm-gui`'s `app_config::config_path` delegates here, so the
-/// window and every CLI diagnostic name ONE file.
+/// Deliberately not `<OS config dir>/aterm/aterm.toml`: where the two disagree a wrong path
+/// is silent (settings never load, the watcher watches nothing). `aterm-gui`'s
+/// `app_config::config_path` delegates here.
 #[must_use]
 pub fn resolve_aterm_config_path(
     xdg_config_home: Option<&OsStr>,
@@ -155,10 +128,8 @@ pub fn resolve_aterm_config_path(
     resolve_aterm_config_dir(xdg_config_home, appdata, home).map(|dir| dir.join("aterm.toml"))
 }
 
-/// THE aterm config directory: the folder that holds `aterm.toml`, and so the
-/// one everything that must sit beside it (the `themes` folder) is named from.
-/// Resolved, never created. [`resolve_aterm_config_dir`] is the rule; this
-/// reads the three variables it consults.
+/// The aterm config directory: the folder holding `aterm.toml` and what sits beside it (the
+/// `themes` folder). Resolved, never created.
 #[must_use]
 pub fn aterm_config_dir() -> Option<PathBuf> {
     resolve_aterm_config_dir(
@@ -247,8 +218,8 @@ pub fn data_dir() -> Option<PathBuf> {
     }
 }
 
-/// The platform inputs [`resolve_data_dir`] and [`resolve_aterm_data_dir`] read,
-/// captured so the rule is testable without mutating the process environment.
+/// The platform inputs [`resolve_data_dir`] and [`resolve_aterm_data_dir`] read, captured for
+/// testing.
 #[derive(Debug, Default, Clone)]
 pub struct DataPlatform {
     /// `$HOME` (`%USERPROFILE%`), as [`home_dir`] gives it; read on macOS and Linux.
@@ -310,7 +281,11 @@ pub fn resolve_data_dir(platform: DataPlatform) -> Option<PathBuf> {
 /// - otherwise [`data_dir`]`/aterm` (on Linux `$XDG_DATA_HOME`/`.local/share`,
 ///   NOT [`state_dir`]'s `.local/state`: a shipped path does not move).
 ///
-/// `None` only when nothing resolves (a relative override, or no data dir).
+/// - in a development build only, the `ATERM_STATE_HOME` seam ([`crate::dev_seam!`]) is the
+///   root itself (a relative value is `None`, as in [`state_dir`]), so a private instance never
+///   takes the owner's `session.toml` or crash journals;
+/// - otherwise [`data_dir`]`/aterm` (on Linux the data dir, not [`state_dir`]'s
+///   `.local/state`: a shipped path does not move).
 #[must_use]
 pub fn aterm_data_dir() -> Option<PathBuf> {
     resolve_aterm_data_dir(state_override(), data_platform())
@@ -323,7 +298,7 @@ pub fn resolve_aterm_data_dir(
     platform: DataPlatform,
 ) -> Option<PathBuf> {
     if let Some(root) = override_root {
-        // Relative is refused, not resolved, as `resolve_state_dir` refuses it.
+        // A relative root is refused, as in `resolve_state_dir`.
         return root.is_absolute().then_some(root);
     }
     resolve_data_dir(platform).map(|data| data.join("aterm"))
@@ -336,16 +311,72 @@ pub fn resolve_aterm_data_dir(
 /// resolves no root ([`aterm_data_dir`], [`state_dir`]), but the process asked for one
 /// of its own, so it never stands in for the person whose `$HOME` it shares.
 ///
-/// What it gates is what such a process writes to the MACHINE (ruling 409):
-/// the `[machine]` settings (Universal Control, Spotlight) are the Mac's,
-/// not the instance's, so a launch's daily apply (`atpkg::machine::launch_apply_due`),
-/// a package pass's carried `[machine]` edit and Settings' Apply stand aside under
-/// it, and a window says so to the passes it spawns (`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`,
-/// ruling 410), since the `atpkg` beside a development build may compile no seam. `aterm
-/// pkg machine apply` typed by a person still applies.
+/// It gates writes to the machine: the `[machine]` settings (Universal Control, Spotlight) are
+/// the Mac's, so the launch's daily apply (`atpkg::machine::launch_apply_due`), a package
+/// pass's `[machine]` edit and Settings' Apply stand aside, and a window passes
+/// `atpkg::cli::PRIVATE_STATE_ROOT_FLAG` to the passes it spawns (the `atpkg` beside a
+/// development build may compile no seam). `aterm pkg machine apply` typed by a person still
+/// applies.
 #[must_use]
 pub fn runs_under_private_state_root() -> bool {
     crate::dev_seam!("ATERM_STATE_HOME").is_some() || test_root().is_some()
+}
+
+/// Why this process is not a shell of its user's own account, or `None` when it is: the
+/// precondition of every converge item that changes the account's files
+/// (docs/DESIGN-init-system-2026-10-20.md §3.2, `Requires::Account`), which `aterm doctor`
+/// and `aterm pkg repair` state in their scope. Not under a private state root
+/// ([`runs_under_private_state_root`]), not root (`sudo` keeps `$HOME`, so root would write
+/// root-owned files into the person's tree), and `$HOME` the account record's home
+/// (`getpwuid`), so a scratch `$HOME` never receives what its journal, under the account's
+/// state root ([`account_state_dir`]), records. Off Unix only the private state root
+/// counts.
+#[must_use]
+pub fn not_own_account() -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        not_own_account_with(
+            runs_under_private_state_root(),
+            aterm_uds::peer::our_uid(),
+            home_dir().as_deref(),
+            aterm_uds::account::home().as_deref(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        runs_under_private_state_root().then_some(NOT_OWN_PRIVATE_ROOT)
+    }
+}
+
+/// [`not_own_account`]'s reason under a private state root.
+const NOT_OWN_PRIVATE_ROOT: &str = "it runs under a private state root, as an isolated aterm \
+                                    instance does";
+
+/// The pure half of [`not_own_account`]: `private` whether the process runs under a
+/// private state root, `euid` its effective uid, `home` its `$HOME` and `account_home` the
+/// account record's. The two homes are the same when equal as written or as resolved.
+#[must_use]
+pub fn not_own_account_with(
+    private: bool,
+    euid: u32,
+    home: Option<&std::path::Path>,
+    account_home: Option<&std::path::Path>,
+) -> Option<&'static str> {
+    if private {
+        return Some(NOT_OWN_PRIVATE_ROOT);
+    }
+    if euid == 0 {
+        return Some("it runs as root");
+    }
+    let same = match (home, account_home) {
+        (Some(home), Some(account)) => {
+            home == account
+                || std::fs::canonicalize(home)
+                    .is_ok_and(|home| std::fs::canonicalize(account).is_ok_and(|a| a == home))
+        }
+        _ => false,
+    };
+    (!same).then_some("its HOME is not this account's home")
 }
 
 /// aterm's own STATE root — where it keeps what it owns across launches (the
@@ -359,11 +390,8 @@ pub fn runs_under_private_state_root() -> bool {
 ///   `$XDG_STATE_HOME` off macOS) is how a release launch is isolated;
 /// - else, in a Cargo test binary, its `<root>/state` ([`test_root`]);
 /// - **macOS**: `$HOME/Library/Application Support/aterm`;
-/// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm` (absolute) or
-///   `$HOME/.local/state/aterm`;
+/// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm` (absolute) or `$HOME/.local/state/aterm`;
 /// - **Windows**: `%LOCALAPPDATA%\aterm`.
-///
-/// `None` only when nothing resolves (no override and no home).
 #[must_use]
 pub fn state_dir() -> Option<PathBuf> {
     resolve_state_dir(
@@ -376,8 +404,48 @@ pub fn state_dir() -> Option<PathBuf> {
     )
 }
 
-/// The platform inputs [`resolve_state_dir`] reads, captured so the rule is
-/// testable without mutating the process environment.
+/// The state root of THE ACCOUNT this process runs as, where its converge journal lives
+/// (docs/DESIGN-init-system-2026-10-20.md §3.3): the state directory of the account
+/// record's home (`getpwuid`; `%USERPROFILE%` on Windows), never `$HOME`'s, so `sudo aterm
+/// machines here` keeps root's journal under root's home and never writes into the tree of
+/// the person who typed `sudo`. A process under a private state root
+/// ([`runs_under_private_state_root`]: a test binary, a development build's
+/// `ATERM_STATE_HOME`) uses that root as it is. One rule for every surface that journals:
+/// `aterm init`, `aterm machines here`, `aterm doctor` and `aterm pkg repair`.
+#[must_use]
+pub fn account_state_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    let account_home = aterm_uds::account::home();
+    #[cfg(not(unix))]
+    let account_home = home_dir();
+    account_state_dir_with(
+        runs_under_private_state_root().then(state_dir),
+        account_home,
+    )
+}
+
+/// The pure half of [`account_state_dir`]. `private` is `Some` when the process runs under
+/// a private state root, holding what that root resolves to, which is used as it is (and
+/// `None` inside it, a relative `ATERM_STATE_HOME`, resolves no root rather than the
+/// account's). Otherwise the root is the state directory of `account_home`.
+#[must_use]
+pub fn account_state_dir_with(
+    private: Option<Option<PathBuf>>,
+    account_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match private {
+        Some(root) => root,
+        None => resolve_state_dir(
+            None,
+            StatePlatform {
+                home: account_home,
+                ..StatePlatform::default()
+            },
+        ),
+    }
+}
+
+/// The platform inputs [`resolve_state_dir`] reads, captured for testing.
 #[derive(Debug, Default, Clone)]
 pub struct StatePlatform {
     /// `$HOME` (`%USERPROFILE%`), as [`home_dir`] gives it.
@@ -429,9 +497,8 @@ pub fn resolve_state_dir(
     }
 }
 
-/// aterm's per-user LOG directory — ONE rule for every process that writes a log there
-/// (the window's and the session's `aterm.log`, and atpkg's `packages.log`, which every
-/// package lane appends to), so the files a person is told to look at sit side by side:
+/// aterm's per-user log directory, one rule for every process that logs there (the window's
+/// and session's `aterm.log`, atpkg's `packages.log`) so the files sit side by side:
 ///
 /// - in a development build only, `$ATERM_STATE_HOME/logs` when that seam is set
 ///   ([`crate::dev_seam!`], as [`state_dir`] reads it; a relative value is refused as
@@ -440,12 +507,10 @@ pub fn resolve_state_dir(
 /// - else, in a Cargo test binary, its `<root>/state/logs` ([`test_root`]);
 /// - **macOS**: `$HOME/Library/Logs/aterm` (Console.app's convention);
 /// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm/logs` (absolute) or
-///   `$HOME/.local/state/aterm/logs` — a Linux home has no business growing a `~/Library`;
-/// - **Windows**: `%LOCALAPPDATA%\aterm\logs`, falling back through the home dir's
-///   `AppData\Local`.
+///   `$HOME/.local/state/aterm/logs`;
+/// - **Windows**: `%LOCALAPPDATA%\aterm\logs`, else the home dir's `AppData\Local`.
 ///
-/// Resolution only: the caller creates the directory with the posture it needs (the
-/// window's logger makes it `0700`). `None` only when nothing resolves.
+/// Resolution only: the caller creates the directory with the mode it needs.
 #[must_use]
 pub fn logs_dir() -> Option<PathBuf> {
     resolve_logs_dir(
@@ -497,9 +562,8 @@ pub fn resolve_logs_dir(
     }
 }
 
-/// Where session identities live: `<state_dir>/identities/<name>/` — one
-/// directory per name, each holding the agents' relocated config dirs
-/// (`.claude/`, `.codex/`, …; see `aterm_primer::agent_homes`).
+/// Where session identities live: `<state_dir>/identities/<name>/`, each holding the agents'
+/// relocated config dirs (`.claude/`, `.codex/`, …; see `aterm_primer::agent_homes`).
 #[must_use]
 pub fn identities_dir() -> Option<PathBuf> {
     state_dir().map(|state| state.join("identities"))
@@ -508,6 +572,36 @@ pub fn identities_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The account's own shell is the one whose `$HOME` is the account record's home (as
+    /// written or as resolved), not root and not under a private state root; each other
+    /// case names itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_accounts_own_shell_is_its_home_not_root_and_no_private_root() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let dir = scratch.path();
+        let home = dir.join("home");
+        std::fs::create_dir(&home).unwrap();
+        let link = dir.join("home-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let own = |private, euid, env: &std::path::Path| {
+            not_own_account_with(private, euid, Some(env), Some(&home))
+        };
+        assert_eq!(own(false, 501, &home), None);
+        assert_eq!(own(false, 501, &link), None, "the same home, resolved");
+        assert_eq!(own(false, 0, &home), Some("it runs as root"));
+        assert_eq!(
+            own(false, 501, dir),
+            Some("its HOME is not this account's home")
+        );
+        assert_eq!(own(true, 501, &home), Some(NOT_OWN_PRIVATE_ROOT));
+        assert_eq!(
+            not_own_account_with(false, 501, None, Some(&home)),
+            Some("its HOME is not this account's home"),
+            "no HOME is no match"
+        );
+    }
 
     /// An empty or relative `$HOME` is not a home.
     #[cfg(unix)]
@@ -524,11 +618,8 @@ mod tests {
         );
     }
 
-    /// THE aterm.toml RULE, pure: a set XDG_CONFIG_HOME wins on
-    /// every platform; Windows then takes %APPDATA%; everyone else HOME/.config
-    /// — the macOS arm included, which is the one way this differs from the OS
-    /// config-dir convention (Application Support). An empty value is an unset
-    /// one.
+    /// The aterm.toml rule: a set `XDG_CONFIG_HOME` wins everywhere, then `%APPDATA%` on
+    /// Windows, else `HOME/.config` (macOS included); an empty value is unset.
     #[test]
     fn aterm_config_path_follows_the_one_rule_the_window_loads_by() {
         let xdg = OsStr::new("/xdg");
@@ -582,12 +673,8 @@ mod tests {
         );
     }
 
-    /// THE CONFIG DIRECTORY RULE: across the XDG / APPDATA-only / HOME-only /
-    /// none matrix, the directory is exactly the folder that holds `aterm.toml`
-    /// and the themes folder is `<that directory>/themes`, so the themes always
-    /// sit beside the config the window loads. The APPDATA-only row is the
-    /// Windows case that used to have no themes folder at all (the old rule
-    /// read only XDG_CONFIG_HOME and HOME).
+    /// The config directory: on every row of the XDG / APPDATA-only / HOME-only / none matrix
+    /// it is the folder holding `aterm.toml`, and the themes folder sits beside that file.
     #[test]
     fn the_themes_folder_sits_beside_aterm_toml_on_every_row_of_the_matrix() {
         let xdg = OsStr::new("/xdg");
@@ -663,9 +750,8 @@ mod tests {
         );
     }
 
-    /// THE STATE ROOT RULE, pure: the
-    /// override wins when absolute and is refused when relative; without it the
-    /// platform default applies; and `identities_dir` is one segment below.
+    /// The state root: an absolute override wins, a relative one is refused, and otherwise the
+    /// platform default applies.
     #[test]
     fn state_dir_honours_an_absolute_override_and_refuses_a_relative_one() {
         let platform = StatePlatform {
@@ -673,7 +759,7 @@ mod tests {
             xdg_state_home: Some(PathBuf::from("/xdg/state")),
             local_app_data: Some(PathBuf::from(r"C:\Users\who\AppData\Local")),
         };
-        // Spelled per host: `/tmp/...` is NOT absolute on Windows.
+        // Per host: `/tmp/...` is not absolute on Windows.
         #[cfg(not(windows))]
         let absolute_override = PathBuf::from("/tmp/aterm-state");
         #[cfg(windows)]
@@ -718,11 +804,9 @@ mod tests {
         );
     }
 
-    /// THE LOG DIRECTORY RULE, pure: macOS
-    /// keeps Console.app's `~/Library/Logs/aterm`, other Unix the XDG state dir's
-    /// `aterm/logs` (a relative XDG value falls through to the home default), and nothing
-    /// to resolve from is `None`. An instance given its own state root logs under it
-    /// and a relative one is refused like the state root it would be.
+    /// The log directory: macOS `~/Library/Logs/aterm`, other Unix the XDG state dir's
+    /// `aterm/logs` (a relative XDG value falls through to home), under an absolute override
+    /// root, and `None` for a relative override or nothing to resolve from.
     #[test]
     fn logs_dir_follows_each_platforms_convention() {
         let platform = StatePlatform {
@@ -730,8 +814,7 @@ mod tests {
             xdg_state_home: Some(PathBuf::from("/xdg/state")),
             local_app_data: Some(PathBuf::from("C:\\Users\\who\\AppData\\Local")),
         };
-        // Per host, for the reason `state_dir_honours_an_absolute_override_…`
-        // gives: `/tmp/...` is not an absolute path on Windows.
+        // Per host: `/tmp/...` is not absolute on Windows.
         #[cfg(not(windows))]
         let absolute_override = PathBuf::from("/tmp/aterm-state");
         #[cfg(windows)]
@@ -770,11 +853,8 @@ mod tests {
         assert_eq!(resolve_logs_dir(None, StatePlatform::default()), None);
     }
 
-    /// THE DATA ROOT RULE (ruling 406), pure: the state-home seam is the
-    /// data root itself when absolute — the restore manifest and the crash journals
-    /// follow an instance given its own state root — and is refused when relative,
-    /// never falling through to the owner's folder; unset, it is the OS data dir's
-    /// `aterm`, the path they always had, on each platform arm.
+    /// The data root: an absolute state-home seam is the root itself, a relative one is
+    /// refused, and unset it is the OS data dir's `aterm` on each platform arm.
     #[test]
     fn aterm_data_dir_follows_the_state_home_seam_and_else_the_os_data_dir() {
         let platform = DataPlatform {
@@ -782,7 +862,7 @@ mod tests {
             xdg_data_home: Some(PathBuf::from("/xdg/data")),
             local_app_data: Some(PathBuf::from(r"C:\Users\who\AppData\Local")),
         };
-        // Per host, for the reason `state_dir_honours_an_absolute_override_…` gives.
+        // Per host: `/tmp/...` is not absolute on Windows.
         #[cfg(not(windows))]
         let absolute_override = PathBuf::from("/tmp/aterm-state");
         #[cfg(windows)]

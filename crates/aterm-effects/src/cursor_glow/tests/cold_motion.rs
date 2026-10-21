@@ -5,13 +5,10 @@
 
 use super::*;
 
-/// A cold cursor delta (a token streamer's one-cell step, a spinner/TUI
-/// warp) emits no light in any channel, in every selectable style.
-///
-/// Asserts presented output (frame fingerprint plus the six accessor planes
-/// the compositor copies), not just empty jump pools: an unlicensed move
-/// returns before `classify_move`, so nothing can fall through to sparks,
-/// rings or a crown.
+/// A cold cursor delta (a token streamer's one-cell step, a spinner/TUI warp)
+/// emits no light in any channel, in every selectable style. Asserts presented
+/// output (frame fingerprint plus the six accessor planes the compositor
+/// copies), not just empty jump pools.
 #[test]
 fn cold_program_motion_emits_no_rainbow_light() {
     let g = geom();
@@ -501,10 +498,8 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
         (peak, prev, worst, most_gone)
     };
 
-    // The bar, in coverage. A ribbon cell's body (ink plus the baseline
-    // strip, about `1.9x` the ink; see [`RAINBOW_STRIP_GAIN`]) is well above
-    // this, and a deleting drain removes cells at that value. A cell leaving
-    // at or under the bar has shed at least two thirds of its body.
+    // The bar, in coverage: a ribbon cell's body is well above it, and a
+    // deleting drain removes cells at body coverage.
     const SPENT: u32 = 34;
 
     // Classic tall body.

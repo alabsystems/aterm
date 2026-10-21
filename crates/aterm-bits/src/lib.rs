@@ -40,10 +40,6 @@
 use core::mem::{align_of, size_of, size_of_val};
 use core::slice;
 
-// ---------------------------------------------------------------------------
-// Traits
-// ---------------------------------------------------------------------------
-
 /// Types whose all-zero bit pattern is a valid value.
 ///
 /// # Safety
@@ -87,10 +83,6 @@ pub unsafe trait Zeroable: Sized {
 /// 6. Every field of the type is itself `Pod`.
 pub unsafe trait Pod: Zeroable + Copy + 'static {}
 
-// ---------------------------------------------------------------------------
-// Primitive impls
-// ---------------------------------------------------------------------------
-
 macro_rules! impl_pod_zeroable_primitive {
     ($($t:ty),* $(,)?) => {
         $(
@@ -131,10 +123,6 @@ unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
 /// Reason a byte cast failed at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -163,10 +151,6 @@ impl core::fmt::Display for PodCastError {
 }
 
 impl core::error::Error for PodCastError {}
-
-// ---------------------------------------------------------------------------
-// Slice casting
-// ---------------------------------------------------------------------------
 
 /// Panics with `"<op> failed: <message>"` where `<message>` is byte-identical
 /// to the [`PodCastError`] `Display` text (keep the literals in sync with
@@ -240,13 +224,7 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
         return Err(PodCastError::SizeMismatch);
     }
 
-    // Derive the output pointer from the slice's own data pointer.
-    // `<[A]>::as_ptr` and the raw-pointer `cast` method are the pointer
-    // derivations the Trust verifier models (provenance-preserving);
-    // `ptr::from_ref` is an opaque call boundary to its typed-TrustIr
-    // lowering, and a fat-pointer `as` cast on `*const [A]` with a generic
-    // pointee is an unsupported MIR cast to it. Semantically identical:
-    // all three routes yield `src`'s data pointer reinterpreted as `*const B`.
+    // Use `<[A]>::as_ptr().cast::<B>()` so the Trust verifier preserves pointer provenance.
     let ptr_a = src.as_ptr();
 
     // Alignment check — source pointer must already be aligned for B,
@@ -283,10 +261,6 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
     Ok(unsafe { slice::from_raw_parts(ptr_b, out_len) })
 }
 
-// ---------------------------------------------------------------------------
-// Single-value views
-// ---------------------------------------------------------------------------
-
 /// View a single `Pod` value as its raw bytes.
 #[inline]
 #[must_use]
@@ -307,10 +281,6 @@ pub fn bytes_of<T: Pod>(value: &T) -> &[u8] {
     // so its lifetime is bounded correctly.
     unsafe { slice::from_raw_parts(ptr, size_of::<T>()) }
 }
-
-// ---------------------------------------------------------------------------
-// Verified const fn POD layout & cast wire codecs
-// ---------------------------------------------------------------------------
 
 /// Wire size in bytes of an encoded POD layout descriptor (`"PODL"`).
 pub const POD_LAYOUT_WIRE_BYTES: usize = 16;
@@ -478,10 +448,6 @@ pub const fn decode_pod_cast_wire(bytes: &[u8]) -> Option<(u32, u32, u16, Option
     let dst_align = (bytes[12] as u16) | ((bytes[13] as u16) << 8);
     Some((src_byte_len, dst_elem_size, dst_align, err))
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

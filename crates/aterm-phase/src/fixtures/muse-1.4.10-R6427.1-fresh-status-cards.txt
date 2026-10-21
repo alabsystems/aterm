@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.108.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · a fresh session (no turn yet): /status, /usage, then /status twice more, each (the menu's only row) and Enter at the empty composer, until no row draws the banner · the lab's random project dir is spelled /private/tmp/at.lab0 here, the session id is spelled 00000000-0000-0000-0000-000000000000 here
+│    Total      0    │
+│                    │
+│    Turns         0 │
+│    Subagents  none │
+└────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  MUSE CODE 1.4.10 / radiant-carina                                             IDLE │
+│                                                                                     │
+│  MODEL          lab-stub · high                                                     │
+│                 meta · native-basic                                                 │
+│                                                                                     │
+│  WORKSPACE      /private/tmp/at.lab0/proj                                           │
+│                 trusted · not found                                                 │
+│  ACCESS         Auto-review                                                         │
+│                 META_API_KEY environment                                            │
+│                                                                                     │
+│  USAGE          0 tokens · 0 turns · 0 subagents                                    │
+│  CONTEXT        not projected · 200K limit                                          │
+│                 Usage: cumulative session tokens; context: current prompt estimate. │
+│                                                                                     │
+│  SESSION        00000000-0000-0000-0000-000000000000                                │
+│  ACTIVITY       no tasks                                                            │
+│                 0 terminals · inbox clear                                           │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  MUSE CODE 1.4.10 / radiant-carina                                             IDLE │
+│                                                                                     │
+│  MODEL          lab-stub · high                                                     │
+│                 meta · native-basic                                                 │
+│                                                                                     │
+│  WORKSPACE      /private/tmp/at.lab0/proj                                           │
+│                 trusted · not found                                                 │
+│  ACCESS         Auto-review                                                         │
+│                 META_API_KEY environment                                            │
+│                                                                                     │
+│  USAGE          0 tokens · 0 turns · 0 subagents                                    │
+│  CONTEXT        not projected · 200K limit                                          │
+│                 Usage: cumulative session tokens; context: current prompt estimate. │
+│                                                                                     │
+│  SESSION        00000000-0000-0000-0000-000000000000                                │
+│  ACTIVITY       no tasks                                                            │
+│                 0 terminals · inbox clear                                           │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

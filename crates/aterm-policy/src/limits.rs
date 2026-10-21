@@ -48,10 +48,6 @@ use aterm_time::Instant;
 
 use crate::{Policy, RateLimit};
 
-// ---------------------------------------------------------------------------
-// TimeSource abstraction
-// ---------------------------------------------------------------------------
-
 /// Abstraction over [`Instant::now`] so tests can step the clock without
 /// sleeping. Production callers use [`SystemClock`].
 pub trait TimeSource {
@@ -70,19 +66,10 @@ impl TimeSource for SystemClock {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TokenBucket
-// ---------------------------------------------------------------------------
-
 /// Token-bucket state for one named [`RateLimit`] entry.
 ///
-/// Built from a [`RateLimit`] configuration via [`Self::from_config`]. The
-/// bucket starts full (balance == `capacity_bytes`) so the first
-/// `try_consume` call never spuriously denies at startup.
-///
-/// All knobs (`capacity_bytes`, `refill_per_second`, `per_sequence_max`)
-/// are captured as `u64` to keep the arithmetic regular; the on-wire
-/// schema uses `u32` (see [`RateLimit`]) which widens losslessly.
+/// Built from a [`RateLimit`] configuration via [`Self::from_config`]. Starts
+/// full (`tokens == capacity_bytes`).
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     /// Current token balance. Saturates at `capacity_bytes` after refill.
@@ -136,16 +123,12 @@ impl TokenBucket {
     /// pathological caller cannot drain the tokens available to
     /// well-behaved peers.
     pub fn try_consume<T: TimeSource>(&mut self, amount: u64, clock: &T) -> bool {
-        // Case 1: hard block.
         if self.capacity_bytes == 0 {
             return false;
         }
-        // Case 2: per-call cap. `per_sequence_max == 0` means "disabled".
         if self.per_sequence_max > 0 && amount > self.per_sequence_max {
             return false;
         }
-        // Case 3: oversized. An amount larger than capacity cannot fit
-        // even with a full bucket; drop without debiting.
         if amount > self.capacity_bytes {
             return false;
         }
@@ -195,7 +178,6 @@ impl TokenBucket {
         self.last_refill = Some(now);
     }
 
-    /// Current burst capacity. Test-only.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn capacity_bytes(&self) -> u64 {
@@ -203,37 +185,13 @@ impl TokenBucket {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RateLimiterSet
-// ---------------------------------------------------------------------------
-
-/// A rate-limit id resolved to its bucket, once.
+/// A rate-limit id pre-resolved to its bucket index in a [`RateLimiterSet`].
 ///
-/// Debiting a named bucket by string id costs a hash of that id on every
-/// call, and the ids production debits are compile-time literals: the
-/// response sink hands `"response"` to [`RateLimiterSet::try_consume`] on
-/// EVERY reply, so a `DSR`/`DA` flood re-hashes the same eight bytes at full
-/// parser rate. The answer can only change when a policy is installed, so a
-/// caller that holds a policy for many dispatches resolves the id once with
-/// [`RateLimiterSet::slot`] and then debits through
-/// [`RateLimiterSet::try_consume_slot`], which is an index.
-///
-/// # Undeclared ids
-///
-/// [`RateLimiterSet::slot`] answers [`Self::UNDECLARED`] for an id the active
-/// policy does not declare, and [`RateLimiterSet::try_consume_slot`] answers
-/// `true` for it — the same deliberate "unknown id ⇒ allow" branch
-/// [`RateLimiterSet::try_consume`] has (see its docs). Resolving early does
-/// not change which ids are unlimited.
-///
-/// # A slot belongs to the set that issued it
-///
-/// A slot indexes ONE set's bucket vector. Using a slot from set A against
-/// set B cannot be unsound — an index past the end answers `true`, exactly as
-/// an undeclared id does — but it can debit a different bucket than the id
-/// named, so a caller must re-resolve whenever it swaps policies. The
-/// terminal's `PolicyState` does that by construction: it recompiles every
-/// cached slot in the same statement that installs or clears the engine.
+/// Resolves via [`RateLimiterSet::slot`] and debits via
+/// [`RateLimiterSet::try_consume_slot`] to avoid hashing the string id on every
+/// dispatch. [`Self::UNDECLARED`] (and any out-of-range index from a different
+/// set) allows, matching [`RateLimiterSet::try_consume`]; callers must
+/// re-resolve slots when swapping policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RateLimitSlot(Option<usize>);
 
@@ -362,25 +320,18 @@ impl RateLimiterSet {
         }
     }
 
-    /// Borrow a bucket by id. Returns `None` when no bucket with that id has
-    /// been declared by the policy. Test-only.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn get(&self, id: &str) -> Option<&TokenBucket> {
         self.buckets.get(*self.slots.get(id)?)
     }
 
-    /// Number of buckets. Test-only.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.buckets.len()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

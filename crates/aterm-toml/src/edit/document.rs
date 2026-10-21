@@ -12,9 +12,7 @@ use super::{Item, RawString, Table};
 #[derive(Debug, Clone)]
 pub struct DocumentMut {
     pub(crate) root: Item,
-    /// Whitespace and comments after the last entry. They belong to no node, so
-    /// the document holds them; without this, a file's closing comment block
-    /// would vanish on the first save.
+    /// Whitespace and comments after the last entry, which belong to no node.
     pub(crate) trailing: RawString,
     /// The file opened with a UTF-8 byte-order mark. It is the file's, not any
     /// line's, so it prints first whatever an edit removes or adds.
@@ -83,10 +81,9 @@ impl DocumentMut {
         self.remove_path(&[key])
     }
 
-    /// Delete the entry at a key path — `["net", "listen"]` for `net.listen` —
-    /// through either table spelling. `None`, with nothing changed, when a
-    /// step is missing or is not a table; the tables along the path stay, even
-    /// emptied.
+    /// Delete the entry at a key path (`["net", "listen"]` for `net.listen`) through either
+    /// table spelling. `None`, with nothing changed, when a step is missing or is not a
+    /// table; the tables along the path stay, even emptied.
     ///
     /// A removed key-value line goes with its own text, its same-line comment
     /// included, and nothing else. The comment and blank lines written ABOVE it
@@ -213,9 +210,8 @@ impl Index<&str> for DocumentMut {
 }
 
 impl IndexMut<&str> for DocumentMut {
-    /// Indexing for WRITE vivifies the key, so `doc["font_px"] = item` works on
-    /// a key the file never had — the assignment path the Preferences window
-    /// takes for a setting the user is enabling for the first time.
+    /// Indexing for write inserts a missing key, so `doc["font_px"] = item` works on a key
+    /// the file never had.
     fn index_mut(&mut self, key: &str) -> &mut Item {
         let table = self.as_table_mut();
         if !table.contains_key(key) {

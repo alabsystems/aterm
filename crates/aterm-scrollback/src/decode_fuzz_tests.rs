@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Robustness fuzz for the scrollback DECODE surfaces, as unit tests.
+//! Never-panic fuzz of the scrollback decode surfaces, as unit tests.
 //!
 //! Warm- and cold-tier blocks and checkpoint bodies are read back and may be
 //! CORRUPT (truncated writes, crashed sessions, hostile checkpoints). Every byte-level
@@ -51,11 +51,9 @@ impl Lcg {
     }
 }
 
-/// LZ4 block decoder: fully attacker-controlled 4-byte size prefix +
-/// arbitrary "compressed" body. Exercises the size-prefix bounds check, the
-/// compression-bomb ratio gate, the back-reference offset validation, and the
-/// final size-mismatch check. Must always return Ok/Err, never panic, and an
-/// Ok is exactly the length the prefix claims.
+/// LZ4 block decoder over an attacker-controlled size prefix and body: the
+/// prefix bound, the compression-bomb ratio gate, back-reference validation
+/// and the size-mismatch check. An `Ok` is exactly the length the prefix claims.
 #[test]
 fn fuzz_lz4_decompress_never_panics() {
     let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15);
@@ -107,18 +105,16 @@ fn fuzz_lz4_decompress_never_panics() {
     }
 }
 
-/// Single-line decoder over arbitrary bytes. Drives the v0/v1/v2/v3 format
-/// branches, the content-length / run-count / hyperlink-count / url-len /
-/// id-len parsing (all attacker-controlled), and the UTF-8 validation. Biased
-/// to start with valid version bytes so the deeper parse branches are reached.
+/// Single-line decoder over arbitrary bytes, biased to valid version bytes so
+/// the length, count and UTF-8 checks of each format branch are reached.
 #[test]
 fn fuzz_line_deserialize_never_panics() {
     let mut rng = Lcg::new(0xD1B5_4A32_D192_ED03);
     for i in 0..ITERS {
         let mut input = rng.bytes(128);
         if !input.is_empty() {
-            // Force the version byte across {0,1,2,3,255} to cover every branch
-            // (legacy, v1 attrs, v2 hyperlinks, v3 hyperlinks+ids, unknown).
+            // Legacy, v1 attrs, v2 hyperlinks, v3 hyperlink ids, and 255, which
+            // takes the v4 underline-colour path (every version >= 4 does).
             input[0] = match i % 5 {
                 0 => 0,
                 1 => 1,
@@ -155,9 +151,9 @@ fn fuzz_deserialize_lines_never_panics() {
             };
             input[..4].copy_from_slice(&count.to_le_bytes());
 
-            // Sprinkle plausible version bytes through the record area so the
-            // size-computation helpers (line_size_v0 / line_size_v1v2 /
-            // hyperlinks_size_*) take their non-trivial branches.
+            // Plausible version bytes through the record area send the size
+            // helpers (`line_size_v0`, `line_size_v1v2`, `hyperlinks_size_*`)
+            // down their non-trivial branches.
             let mut p = 4;
             while p < input.len() {
                 input[p] = (rng.next_u32() % 4) as u8; // version 0..3

@@ -8,37 +8,31 @@
 //! # Why: Code Integrity, not SmartScreen
 //!
 //! With Smart App Control on, Windows 11 runs an unsigned exe only while
-//! Microsoft's reputation service allows it. Measured 2026-09-15: the installed
-//! `aterm-gui.exe` ran for a day, then Code Integrity refused it (event 3077,
-//! "did not meet the Enterprise signing level requirements") for good. The only
-//! durable answer is a signature whose chain that policy trusts: **Azure
-//! Artifact Signing** (formerly Trusted Signing) or a **publicly trusted
-//! code-signing certificate** (EV gets reputation at once; OV earns it). A
-//! self-signed certificate satisfies neither, so it is not a lane here.
+//! Microsoft's reputation service allows it; once Code Integrity refuses it
+//! (event 3077), only a signature chaining to a trusted root satisfies the
+//! policy: **Azure Artifact Signing** (formerly Trusted Signing) or a
+//! **publicly trusted code-signing certificate** (EV or OV). A self-signed
+//! certificate satisfies neither, so it is not a lane here.
 //!
 //! # The two states, and nothing in between
 //!
-//! Tier WINDOWS is driven by ONE committed constant,
+//! Tier WINDOWS is driven by one committed constant,
 //! `aterm_update_core::pins::WINDOWS_SIGNING_PUBLISHER`:
 //!
 //! * **anchor empty → [`Tier::Inactive`].** Signing is optional: with a lane
 //!   configured the exe is signed and the result reported; without one the
 //!   verbs say what is missing and exit non-zero, so a script that expected a
-//!   signature does not read silence as success. No PUBLISHER is required here:
-//!   the tier itself refuses nothing ([`judge`] is `Ok` for every report). The
-//!   verdict is still the one Code Integrity will reach, though, so an exe that
-//!   is unsigned — or whose chain the Authenticode policy does not trust — is
-//!   reported and exits 1 even in this state.
-//! * **anchor set → [`Tier::Active`].** Signing is REQUIRED, and after signing
+//!   signature does not read silence as success. No publisher is required here
+//!   ([`judge`] is `Ok` for every report), though an unsigned exe or untrusted
+//!   chain still exits 1.
+//! * **anchor set → [`Tier::Active`].** Signing is required, and after signing
 //!   the tool reads the signature back off the file: it must verify under the
-//!   default Authenticode policy, its leaf must be issued to exactly the
-//!   anchored publisher, and it must carry a timestamp — or the verb fails.
-//!   The anchor is the leaf certificate's subject Common Name as `signtool
-//!   verify /v` prints it after the LAST, most indented `Issued to:` of the
-//!   signing chain (signtool lists the root first; see
-//!   [`parse_verify_output`]), and as `winsign verify` prints it after
-//!   `signed by`. It is committed, never read from the environment, so a build
-//!   signed by the wrong identity cannot pass.
+//!   default Authenticode policy, its leaf must be issued to the anchored
+//!   publisher, and it must carry a timestamp — or the verb fails. The anchor
+//!   is the leaf certificate's subject Common Name as `signtool verify /v`
+//!   prints it after the last, most indented `Issued to:` of the signing chain
+//!   (signtool lists the root first; see [`parse_verify_output`]), and as
+//!   `winsign verify` prints it after `signed by`.
 //!
 //! # Where each value comes from
 //!
@@ -47,11 +41,11 @@
 //! cutter's `key = "value"` grammar, keys `winsign_*`). No lane takes a
 //! password: the thumbprint lane names a certificate already in the user's
 //! store (`signtool /sha1`, never `/f <pfx> /p <password>`), and the Trusted
-//! Signing lane authenticates through Azure identity (measured with client
-//! 1.0.95: an `az login` session or the `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` /
-//! `AZURE_CLIENT_SECRET` triple when present, else a browser sign-in). The
-//! plug-in is a .NET 8 component; a user-local runtime (`dotnet-install.ps1`)
-//! is handed to signtool as `DOTNET_ROOT`.
+//! Signing lane authenticates through Azure identity (an `az login` session or
+//! the `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` triple
+//! when present, else a browser sign-in). The plug-in is a .NET 8 component; a
+//! user-local runtime (`dotnet-install.ps1`) is handed to signtool as
+//! `DOTNET_ROOT`.
 //!
 //! # What it drives
 //!
@@ -286,7 +280,7 @@ impl Host for RealHost {
 // Configuration: flags > environment > credentials profile
 // ---------------------------------------------------------------------------
 
-/// The signing lane — WHICH identity signs, and through what.
+/// The signing lane — which identity signs, and through what.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lane {
     /// Azure Trusted Signing: the account and certificate profile on the
@@ -448,7 +442,7 @@ pub fn default_timestamp(lane: &Lane) -> &'static str {
 // Finding the tools
 // ---------------------------------------------------------------------------
 
-/// Join components onto a WINDOWS path with `\`, whatever the build host.
+/// Join components onto a Windows path with `\`, whatever the build host.
 ///
 /// Every path assembled here (SDK layout, NuGet cache, dotnet root) lives on
 /// the machine that signs. `Path::join` uses the build host's separator, so
@@ -548,9 +542,8 @@ pub fn find_signtool(host: &dyn Host, configured: Option<&Path>) -> Result<PathB
 }
 
 /// The NuGet package ids that carry the signtool plug-in, newest lineage first.
-/// `Microsoft.Trusted.Signing.Client` (unlisted at 1.0.95) was renamed
-/// `Microsoft.ArtifactSigning.Client` at the service's GA (January 2026); the
-/// dll, metadata file and `net8.0` runtime config are the same, so both are
+/// `Microsoft.Trusted.Signing.Client` was renamed `Microsoft.ArtifactSigning.Client`;
+/// the dll, metadata file and `net8.0` runtime config are the same, so both are
 /// searched and an older cache still signs.
 pub const DLIB_PACKAGES: &[&str] = &[
     "microsoft.artifactsigning.client",
@@ -635,7 +628,7 @@ fn dotnet_version_under(host: &dyn Host, root: &Path) -> Option<String> {
 /// Find a .NET runtime the dlib can load, in the order the host loader itself
 /// resolves one: `DOTNET_ROOT`, the machine-wide install under Program Files,
 /// then the user-local install `dotnet-install.ps1` makes without admin — which
-/// the loader does NOT find by itself, so that one is passed as `DOTNET_ROOT`.
+/// the loader does not find by itself, so that one is passed as `DOTNET_ROOT`.
 pub fn find_dotnet_runtime(host: &dyn Host) -> Result<DotnetRuntime, String> {
     let mut looked = Vec::new();
     let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
@@ -782,22 +775,12 @@ pub struct VerifyReport {
 /// purpose: absence of a marker reads as absence of the property, never as a
 /// panic, and the raw text is what the verb prints when something is off.
 ///
-/// # The leaf is the LAST certificate of the chain, and the most indented
-///
-/// `signtool verify /pa /v` prints the Signing Certificate Chain from the ROOT
-/// down. Each certificate is indented one level deeper than its issuer, so the
-/// signer's own certificate comes last and deepest. Microsoft's documented
-/// `verify /v` example has this shape, and so does any Windows binary's output.
-/// The parser used to keep the first `Issued to:`, which is the root's name. A
-/// publisher pin copied from that would accept every exe chaining to the same
-/// root, and a pin on the real leaf would refuse every correctly signed one.
-///
-/// Ruling 2026-10-10: the leaf is the last certificate in the block, and only
-/// when it is indented deeper than every certificate before it. A block that
-/// does not have that shape, such as one listing two certificates at one depth,
-/// is not signtool's chain. Such a block yields no leaf, and an active tier
-/// refuses it ("printed no signing certificate chain"); a guess would pin the
-/// wrong certificate. A one-certificate chain (self-signed) is its own leaf.
+/// `signtool verify /pa /v` prints the Signing Certificate Chain from the root
+/// down, with each certificate indented one level deeper than its issuer, so
+/// the signer's leaf certificate comes last and deepest. The leaf is accepted
+/// only when it is indented deeper than every certificate before it in the
+/// block (a single-certificate self-signed chain is its own leaf); a flat or
+/// malformed block yields no leaf so an active tier refuses it.
 #[must_use]
 pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
     /// One certificate of the printed chain: its depth (leading whitespace) and
@@ -1206,10 +1189,9 @@ fn doctor(host: &dyn Host, tier: &Tier, config: &Config) -> i32 {
                     ok = false;
                 }
             }
-            // Measured 2026-09-15 (client 1.0.95): the default metadata
-            // excludes no Azure.Identity credential, so with nothing else set
-            // the plug-in opens a browser sign-in. A missing unattended route
-            // is therefore not a failure; the present one is reported.
+            // Default metadata excludes no Azure.Identity credential, so with
+            // nothing else set the plug-in opens a browser sign-in; a missing
+            // unattended route is not a failure.
             let sp = ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"]
                 .iter()
                 .all(|k| host.env(k).is_some());
@@ -1261,7 +1243,7 @@ mod tests {
     /// Both spellings reach the fake ([`win_join`] writes `\`; [`find_on_path`]
     /// and the temp metadata file use host joins).
     ///
-    /// Case is deliberately NOT folded, though Windows would: the fake should
+    /// Case is deliberately not folded, though Windows would: the fake should
     /// never answer to a name no test wrote.
     fn win_path(path: &Path) -> String {
         let s = path.to_string_lossy().replace('/', "\\");
@@ -1348,11 +1330,9 @@ mod tests {
         }
     }
 
-    /// `signtool verify /pa /v` over an Artifact Signing signature, in the
-    /// layout signtool prints (Microsoft's documented `verify /v` example has
-    /// it too): each chain from the ROOT down, every certificate one level
-    /// deeper than its issuer, the signer's leaf last. The SHA1 values are
-    /// placeholders.
+    /// `signtool verify /pa /v` over an Artifact Signing signature: each chain
+    /// from the root down, every certificate one level deeper than its issuer,
+    /// the signer's leaf last.
     const VERIFIED: &str = "Verifying: aterm.exe
 
 Signature Index: 0 (Primary Signature)
@@ -1437,11 +1417,8 @@ Number of errors: 1
         );
     }
 
-    /// THE SIGNER IS THE LEAF, which signtool prints LAST (ruling 2026-10-10).
-    /// The parser used to keep the chain's first `Issued to:`, the root. So
-    /// `winsign verify` printed the root as the signer, and a pin copied from
-    /// it accepted every exe under that root. Same reading with Windows line
-    /// endings.
+    /// The signer is the leaf certificate (printed last in the chain), with LF
+    /// or CRLF line endings.
     #[test]
     fn a_verified_chain_is_read_back_as_its_leaf_not_its_root() {
         for text in [VERIFIED.to_string(), VERIFIED.replace('\n', "\r\n")] {
@@ -1455,11 +1432,9 @@ Number of errors: 1
         }
     }
 
-    /// NEGATIVE CONTROLS. Another customer's leaf under the same root is
-    /// refused by the pin, and so is a pin on the root's name (what the old
-    /// parser printed as the signer). A block that is not signtool's chain
-    /// shape (two certificates at one depth, as this crate's old fixture was
-    /// written) names no leaf and is refused rather than guessed at.
+    /// Another customer's leaf under the same root is refused by the pin, as is
+    /// a pin on the root's name or a flat block with two certificates at the
+    /// same depth.
     #[test]
     fn the_pin_names_one_leaf_and_never_the_root_it_chains_to() {
         let root = "Microsoft Identity Verification Root Certificate Authority 2020";
@@ -1603,7 +1578,7 @@ Successfully verified: aterm.exe
         let mut env = Values::new();
         env.insert("timestamp".into(), "http://env".into());
         env.insert("thumbprint".into(), "ab".repeat(20));
-        // ONE backslash in the file: the grammar is verbatim between the quotes.
+        // One backslash in the file: the grammar is verbatim between the quotes.
         let prof = values_from_profile(
             "# comment\nsigning_key = \"ignored-by-us\"\nwinsign_timestamp = \"http://profile\"\nwinsign_signtool = \"C:\\st.exe\"\n",
         )
@@ -1655,7 +1630,7 @@ Successfully verified: aterm.exe
                 .unwrap()
                 .is_empty()
         );
-        // Between the quotes is VERBATIM, like the release cutter's
+        // Between the quotes is verbatim, like the release cutter's
         // `credentials_value`: no escape processing, so `\\` stays doubled.
         let v = values_from_profile("winsign_signtool = \"C:\\st.exe\"\n").unwrap();
         assert_eq!(v.get("signtool").map(String::as_str), Some(r"C:\st.exe"));
@@ -1699,7 +1674,7 @@ Successfully verified: aterm.exe
             bin.clone(),
             vec!["10.0.9600.0".into(), "10.0.26100.0".into(), "x64".into()],
         );
-        // BOTH SDKs have a signtool.exe, so this measures "newest first".
+        // Both SDKs have a signtool.exe, so this checks "newest first".
         let want = win_join(&bin, ["10.0.26100.0", "x64", "signtool.exe"]);
         h.files
             .push(win_join(&bin, ["10.0.9600.0", "x64", "signtool.exe"]));

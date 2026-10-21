@@ -11,6 +11,9 @@ rust-version.workspace = true
 # Zero third-party dependencies — std only (threads, sync, UnixListener) plus the
 # in-tree wire vocabulary. The broker is a substrate crate, so forbid(unsafe).
 [features]
+# Retention compiles in by default (REQUIREMENTS R4; aterm's ruling U23(a)): a broker
+# given no rules never compacts and behaves exactly as one built without it.
+default = ["retention"]
 # Off by default: enforce capabilities on the accept path. Pulls astream-cap and
 # its SHA-256, astream-digest -- both in-tree, so even a `cap` broker takes no
 # third-party crate.
@@ -36,9 +39,11 @@ at-rest = ["aead"]
 # Maintains an authenticated monotonic head watermark (a `<log>.hw` sidecar) so a
 # write-capable attacker cannot silently truncate/roll back the log. Implies at-rest.
 anti-rollback = ["at-rest"]
-# Off by default: retention (Broker::retain_before / BrokerLog::retain_before) —
-# compact the log by dropping records below a floor offset, keeping surviving
-# offsets absolute. std-only; works on plaintext and encrypted logs.
+# ON by default (`default` above): retention — the caller's compactions
+# (Broker::retain_before / BrokerLog::retain_before, keeping surviving offsets absolute),
+# the writer's caps, and the retention rules (Broker::set_retention: the prefix rule's
+# cut, the held store `<log>.held`, the broker's retention tick). std-only; works on
+# plaintext and encrypted logs. `--no-default-features` builds the broker without it.
 retention = []
 
 [dependencies]

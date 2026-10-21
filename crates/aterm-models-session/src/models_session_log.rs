@@ -1591,6 +1591,167 @@ pub fn session_log_mark_quota_model() -> Model {
     }
 }
 
+/// SESSION LOG PROGRAM SHARE (phase 6, 6F-3; T6, ruling U17): the program
+/// marks (OSC 7501's reports) hanging from one node hold at most its share of
+/// the ring, and the share keeps that by taking only that node's program
+/// marks, the oldest first, never the record just appended and never one the
+/// readers' fence holds, each counted lost: a flapping program spends its own
+/// share, never another node's nor the facts beside it.
+///
+/// Variables: `seq` the last seq assigned, `lost` the records the log counts
+/// lost; live records split by whether the fence holds them: `uo`/`fo` other
+/// records (a mail mark, a bell), `ua`/`fa` the program marks of node `a` (a
+/// run), `ub`/`fb` those of node `b` (the session, or another run); `fence`
+/// whether readers are fenced; `nwp` which node's program mark the newest
+/// record is (0 none, 1 `a`, 2 `b`) and `nwf` whether it is fenced (no
+/// eviction takes it); `qoth` the records the share took that were not the
+/// over-share node's program marks, and `fgone` the fenced records anything
+/// took (both ghosts). `Ps` is the share (64 at a session's bound; 2 here,
+/// a 64-record ring's).
+///
+/// `AppendA`/`AppendB` are `aterm_slog::Log::enforce_program_share` inline:
+/// they take as many of the node's older unfenced program marks as its live
+/// ones pass `Ps` by (at most all of them). `Lift` (the fence lifted) runs it
+/// again for both nodes. `EvictOther`/`EvictA`/`EvictB` are the level-aware
+/// batch, whose order the ring model holds: here it may take any unfenced
+/// record but the newest.
+///
+/// Laws: `ProgramShare`: a node's program marks pass the share only while
+/// the fence holds some, and then by the newest alone; `NoSilentLoss`: every
+/// seq is live or counted lost; `ShareTakesOnlyProgram`: the share takes the
+/// over-share node's program marks and nothing else; `FenceHolds` (R4).
+///
+/// `Buggy = 1` adds one dead mutant per law: a program mark appended
+/// without the share (`ProgramShare`), a share that evicts any record, an
+/// observation (`ProgramShareEvictsAny`) or the other node's program mark
+/// (`ShareTakesOtherNode`), both `ShareTakesOnlyProgram`'s, one whose taking
+/// is uncounted (`NoSilentLoss`), and one that takes a fenced program mark
+/// (`FenceHolds`). Tier-1: aterm-slog's
+/// `slog_program_share_conforms_to_derived_model`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn session_log_program_share_model() -> Model {
+    aterm_spec::ty_model! {
+        SessionLogProgramShare {
+            const Buggy = 0;
+            const MaxSeq = 7;
+            const Ps = 2;
+            var seq = 0;
+            var lost = 0;
+            var uo = 0;
+            var fo = 0;
+            var ua = 0;
+            var fa = 0;
+            var ub = 0;
+            var fb = 0;
+            var fence = 0;
+            var nwp = 0;
+            var nwf = 0;
+            var qoth = 0;
+            var fgone = 0;
+
+            action AppendOther when (MaxSeq > seq) {
+                uo = uo + 1;
+                seq = seq + 1;
+                nwp = 0;
+                nwf = 0;
+            }
+            action AppendA when (MaxSeq > seq) {
+                lost = lost + (if fa + ua + 1 > Ps { if ua > fa + ua + 1 - Ps { fa + ua + 1 - Ps } else { ua } } else { 0 });
+                ua = ua + 1 - (if fa + ua + 1 > Ps { if ua > fa + ua + 1 - Ps { fa + ua + 1 - Ps } else { ua } } else { 0 });
+                seq = seq + 1;
+                nwp = 1;
+                nwf = 0;
+            }
+            action AppendB when (MaxSeq > seq) {
+                lost = lost + (if fb + ub + 1 > Ps { if ub > fb + ub + 1 - Ps { fb + ub + 1 - Ps } else { ub } } else { 0 });
+                ub = ub + 1 - (if fb + ub + 1 > Ps { if ub > fb + ub + 1 - Ps { fb + ub + 1 - Ps } else { ub } } else { 0 });
+                seq = seq + 1;
+                nwp = 2;
+                nwf = 0;
+            }
+            action Fence when (fence == 0) {
+                fo = fo + uo;
+                fa = fa + ua;
+                fb = fb + ub;
+                uo = 0;
+                ua = 0;
+                ub = 0;
+                fence = 1;
+                nwf = if seq > 0 { 1 } else { 0 };
+            }
+            action Lift when (fence == 1) {
+                lost = lost + (if fa + ua > Ps { fa + ua - Ps } else { 0 }) + (if fb + ub > Ps { fb + ub - Ps } else { 0 });
+                ua = if fa + ua > Ps { Ps } else { fa + ua };
+                ub = if fb + ub > Ps { Ps } else { fb + ub };
+                uo = uo + fo;
+                fo = 0;
+                fa = 0;
+                fb = 0;
+                fence = 0;
+                nwf = 0;
+            }
+            action EvictOther when (uo > (if nwp == 0 && nwf == 0 { 1 } else { 0 })) {
+                uo = uo - 1;
+                lost = lost + 1;
+            }
+            action EvictA when (ua > (if nwp == 1 && nwf == 0 { 1 } else { 0 })) {
+                ua = ua - 1;
+                lost = lost + 1;
+            }
+            action EvictB when (ub > (if nwp == 2 && nwf == 0 { 1 } else { 0 })) {
+                ub = ub - 1;
+                lost = lost + 1;
+            }
+            action AppendAUnshared when (Buggy == 1 && MaxSeq > seq) {
+                ua = ua + 1;
+                seq = seq + 1;
+                nwp = 1;
+                nwf = 0;
+            }
+            action ProgramShareEvictsAny when (Buggy == 1 && MaxSeq > seq && uo > 0) {
+                lost = lost + 1 + (if fa + ua + 1 > Ps { if ua > fa + ua + 1 - Ps { fa + ua + 1 - Ps } else { ua } } else { 0 });
+                ua = ua + 1 - (if fa + ua + 1 > Ps { if ua > fa + ua + 1 - Ps { fa + ua + 1 - Ps } else { ua } } else { 0 });
+                uo = uo - 1;
+                qoth = qoth + 1;
+                seq = seq + 1;
+                nwp = 1;
+                nwf = 0;
+            }
+            action ShareTakesOtherNode when (Buggy == 1 && MaxSeq > seq && ub > 0) {
+                lost = lost + 1 + (if fa + ua + 1 > Ps { if ua > fa + ua + 1 - Ps { fa + ua + 1 - Ps } else { ua } } else { 0 });
+                ua = ua + 1 - (if fa + ua + 1 > Ps { if ua > fa + ua + 1 - Ps { fa + ua + 1 - Ps } else { ua } } else { 0 });
+                ub = ub - 1;
+                qoth = qoth + 1;
+                seq = seq + 1;
+                nwp = 1;
+                nwf = 0;
+            }
+            action ShareUncounted when (Buggy == 1 && MaxSeq > seq) {
+                ua = ua + 1 - (if fa + ua + 1 > Ps { if ua > fa + ua + 1 - Ps { fa + ua + 1 - Ps } else { ua } } else { 0 });
+                seq = seq + 1;
+                nwp = 1;
+                nwf = 0;
+            }
+            action ShareTakesFenced when (Buggy == 1 && MaxSeq > seq && fa > 0) {
+                fa = fa - 1;
+                fgone = fgone + 1;
+                lost = lost + 1;
+                ua = ua + 1;
+                seq = seq + 1;
+                nwp = 1;
+                nwf = 0;
+            }
+
+            invariant ProgramShare: (fa + ua <= Ps || ua <= 1) && (fb + ub <= Ps || ub <= 1);
+            invariant NoSilentLoss: lost + uo + fo + ua + fa + ub + fb == seq;
+            invariant ShareTakesOnlyProgram: qoth == 0;
+            invariant FenceHolds: fgone == 0;
+            bound StateBounded: seq <= MaxSeq && lost <= MaxSeq && uo <= MaxSeq && fo <= MaxSeq && ua <= MaxSeq && fa <= MaxSeq && ub <= MaxSeq && fb <= MaxSeq && fence <= 1 && nwp <= 2 && nwf <= 1 && qoth <= MaxSeq && fgone <= MaxSeq;
+        }
+    }
+}
+
 /// SESSION LOG CLAIMS (phase 3A, design §3.7 and §7.3; rulings R13 and the
 /// plan's correction 5, and the fixer's review): the claim half of the fold.
 /// A claim is an attributed opinion: it never lifts an observed need, a need

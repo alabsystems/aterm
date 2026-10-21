@@ -900,6 +900,57 @@ fn derived_session_log_mark_quota_proves_and_catches_each_law() {
     assert_eq!((s["um"], s["mq"], s["lost"]), (1, 1, 4), "a lowered share");
 }
 
+/// The program share (phase 6, 6F-3; T6, ruling U17): each of its four laws
+/// is the only one some single `Buggy = 1` step breaks, every mutant is dead
+/// at the committed config and caught on its own, and the paths: a third
+/// program mark of a node takes its first and nothing beside it, another
+/// node's marks are its own share, a fence keeps its marks past the share
+/// (only the newest beside them), and lifting it trims each node to its
+/// share. Tier-1: aterm-slog's `slog_program_share_conforms_to_derived_model`.
+#[test]
+fn derived_session_log_program_share_proves_and_catches_each_law() {
+    let model = aterm_models_session::session_log_program_share_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_breaks_first(&model);
+    assert_committed_dead_are_caught_mutants(
+        &model,
+        &[
+            "AppendAUnshared",
+            "ProgramShareEvictsAny",
+            "ShareTakesOtherNode",
+            "ShareUncounted",
+            "ShareTakesFenced",
+        ],
+    );
+    let fire = |s: &mut aterm_spec::interp::State, path: &[&str]| {
+        for action in path {
+            assert!(model.fire(action, s), "{action}: {s:?}");
+        }
+    };
+    let mut s = model.init_state();
+    fire(
+        &mut s,
+        &["AppendOther", "AppendA", "AppendB", "AppendA", "AppendA"],
+    );
+    assert_eq!(
+        (s["uo"], s["ua"], s["ub"], s["lost"]),
+        (1, 2, 1, 1),
+        "the run's oldest program mark went, and nothing beside it"
+    );
+    fire(&mut s, &["Fence", "AppendA", "AppendA"]);
+    assert_eq!(
+        (s["fa"], s["ua"], s["lost"]),
+        (2, 1, 2),
+        "the fence keeps its marks; only the newest stands beside them"
+    );
+    fire(&mut s, &["Lift"]);
+    assert_eq!(
+        (s["ua"], s["ub"], s["uo"], s["lost"]),
+        (2, 1, 1, 3),
+        "lifted, the share trims the run alone"
+    );
+}
+
 /// The claims (phase 3A, §3.7, §7.3; ruling R13 and the fixer's review):
 /// each of its seven laws is the only one some single `Buggy = 1` step
 /// breaks, every mutant is dead at the committed config and caught on its

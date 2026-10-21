@@ -64,8 +64,6 @@ mod ctl_accept;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-const MAX_SOCK_PATH: usize = 100;
-
 /// The server's request lanes (`CONTROL_WORKERS` in `aterm-gui/src/control.rs`),
 /// its wait lanes (`CONTROL_WAIT_WORKERS`) and the request lanes that may serve
 /// a wait at once (`CONTROL_INLINE_WAITS`: what the artifact captures,
@@ -158,7 +156,7 @@ fn world(tag: &str) -> World {
     let name = format!("atln{tag}-{}", std::process::id());
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
         let root = base.join(&name);
-        if root.join("run/aterm/lanes.sock.token").as_os_str().len() >= MAX_SOCK_PATH {
+        if !launch_isolation::sock_fits(&root.join("run/aterm/lanes.sock.token")) {
             continue;
         }
         if launch_isolation::prepare(&root).is_ok() {

@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Performance proof tests for scrollback tier operations.
-//!
-//! Extracted from tests.rs to keep file sizes under 1000 lines.
-//! Tests prove scaling behavior of push_line, truncate, and remove_newest.
+//! Scaling tests for push_line, truncate and remove_newest across tiers.
 
 use super::*;
 
@@ -14,14 +11,11 @@ use super::*;
 /// #5893: cold tier front_offset gives O(1) truncate, where a decompress-all
 /// truncate costs O(total_lines) per push to a full scrollback.
 ///
-/// COUNTED, NOT TIMED (wall-clock ratios failed on a loaded machine). The
-/// work a decompress-all truncate does is DECODING: every block it reads walks
-/// its serialized records. So the proof counts the records walked
-/// ([`crate::line::take_records_walked`], counted at the one walk every block
-/// read goes through) while `batch` pushes run against a full scrollback, at a
-/// 500-line and a 10K-line limit. The only decoding either may do is the
-/// warm->cold eviction's framing check, once per line aging out of the warm
-/// tier — so both counts are the batch, whatever the limit.
+/// Counted, not timed: a decompress-all truncate's work is decoding, so this
+/// counts the records walked ([`crate::line::take_records_walked`]) over `batch`
+/// pushes to a full scrollback at a 500- and a 10K-line limit. The only decode
+/// allowed is the warm→cold eviction's framing check, once per line aging out of
+/// warm, so both counts equal the batch.
 #[test]
 fn push_with_line_limit_constant_time_truncate() {
     fn records_walked_pushing_with_limit(limit: usize, batch: usize) -> usize {
@@ -45,10 +39,8 @@ fn push_with_line_limit_constant_time_truncate() {
     let small = records_walked_pushing_with_limit(500, batch);
     let large = records_walked_pushing_with_limit(10_000, batch);
     eprintln!("push_line+truncate records walked: limit=500 -> {small}, limit=10K -> {large}");
-    // At steady state every pushed line pushes one line out of warm, and the
-    // eviction's framing check walks each such line exactly once: the count IS
-    // the batch, at either limit. The #5893 shape walked the whole scrollback on
-    // EVERY push (>= 500 x limit).
+    // Each push ages one line out of warm, and the eviction's framing check
+    // walks it once: the count is the batch at either limit.
     for (limit, walked) in [(500, small), (10_000, large)] {
         assert_eq!(
             walked, batch,
@@ -71,8 +63,8 @@ fn push_with_line_limit_constant_time_truncate() {
 /// level — NOT doubling from full-materialization.
 #[test]
 fn remove_newest_memory_bounded_cross_tier() {
-    // Small hot tier (5 lines) forces remove_newest(1) to cross into warm
-    // when hot is empty. block_size=50 means at most ~50 lines decompressed.
+    // A 5-line hot limit clamps block_size to 5, so a cross-tier
+    // remove_newest(1) decompresses at most one 5-line block.
     let mut sb = Scrollback::with_block_size(5, 200, 500_000_000, 50);
 
     // Fill with enough data to populate all three tiers.
@@ -100,9 +92,8 @@ fn remove_newest_memory_bounded_cross_tier() {
 
     let mem_after = sb.total_memory_used();
 
-    // Memory should stay in the same ballpark. The old O(N) approach would
-    // roughly double memory (full materialization + rebuild). Allow up to
-    // 50% increase for warm block decompression/recompression overhead.
+    // Full materialization would roughly double memory; allow 50% for the warm
+    // block's decompression and recompression.
     let ratio = mem_after as f64 / mem_before.max(1) as f64;
     eprintln!("remove_newest(1) memory: before={mem_before}, after={mem_after}, ratio={ratio:.2}x");
     assert!(
@@ -112,11 +103,11 @@ fn remove_newest_memory_bounded_cross_tier() {
     );
 }
 
-/// #5918: Prove that `remove_newest` work does not grow with total scrollback size.
+/// `remove_newest` decode work does not grow with total scrollback size.
 ///
-/// Count decoded records: removing one line reads its 50-line boundary block
-/// once, with identical work at 1K and 50K lines. Materializing the whole
-/// history or decoding the boundary twice violates this bound.
+/// Counted, not timed: removing one line reads its 50-line boundary block once,
+/// identically at 1K and 50K lines. Materializing the history or decoding the
+/// boundary twice breaks the bound.
 #[test]
 fn remove_newest_work_sublinear_in_total_size() {
     fn records_walked_removing_one(total: usize) -> usize {

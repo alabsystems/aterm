@@ -9,18 +9,18 @@ admit harness act=approve
 accept
 at 100 person
 at 300 see prompt edit
-expect open p1 approval par=t1 box=edit at=300
+expect open p1 approval par=t1 box=edit @300
 at 400 see busy
-expect close p1 approval out=passed by=human at=400
+expect close p1 approval out=passed by=human @400
 at 1000 person
 at 1100 admit ctl act=approve
 accept
 at 1200 see prompt edit
-expect open p2 approval par=t1 box=edit at=1200
+expect open p2 approval par=t1 box=edit @1200
 at 1300 see busy
-expect close p2 approval out=passed by=ctl at=1300
+expect close p2 approval out=passed by=ctl @1300
 at 2000 person
 at 2700 see prompt edit
-expect open p3 approval par=t1 box=edit at=2700
+expect open p3 approval par=t1 box=edit @2700
 see busy
-expect close p3 approval out=passed by=- at=2700
+expect close p3 approval out=passed by=- @2700

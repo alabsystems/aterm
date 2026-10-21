@@ -210,6 +210,7 @@ impl Real {
                     )
                 };
                 let mut manifest = SessionHandoff {
+                    resources: None,
                     schema: SessionHandoff::SCHEMA,
                     sessions: vec![record()],
                     window: None,

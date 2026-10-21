@@ -1,28 +1,26 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Machine settings `aterm pkg machine apply` applies per the doctor's own findings (R5,
-//! owner decisions 2026-09-10; a pass applies them only after an edit to the `[machine]`
-//! table since Phase 3, [`changed_since_applied`]): the POLICY half — what to do given what `defaults`
-//! answered — kept pure and behind a port so no test ever touches the real
-//! `com.apple.universalcontrol` domain.
+//! Machine settings `aterm pkg machine apply` applies per the doctor's findings: the policy
+//! half (what to do given what `defaults` answered), kept pure and behind a port so no test
+//! touches the real `com.apple.universalcontrol` domain. A pass applies them only after an
+//! edit to the `[machine]` table ([`changed_since_applied`]); a launch, once a day
+//! ([`launch_apply_due`]).
 //!
-//! Universal Control is macOS's cursor/keyboard roaming between Macs and iPads signed
-//! into the same Apple account. The owner runs with it disabled (`Disable = 1`), and a
-//! fresh machine sits at the OS default with neither key set; the keys, their polarity
-//! and what the switch costs are measured in
-//! `docs/measured/macos-doctor-universal-control-2026-09-06.md`. The switch is per-host
-//! and per-user (`defaults -currentHost`), no sudo — so a first-open pass can apply it,
-//! and one pasted line reverts it: [`UNIVERSAL_CONTROL_REVERT`].
+//! Universal Control is macOS's cursor/keyboard roaming between Macs and iPads on the same
+//! Apple account. A fresh machine sits at the OS default with neither key set; the keys,
+//! their polarity and the switch's cost are measured in
+//! `docs/measured/macos-doctor-universal-control-2026-09-06.md`. The switch is per-host and
+//! per-user (`defaults -currentHost`), no sudo, and one pasted line reverts it:
+//! [`UNIVERSAL_CONTROL_REVERT`].
 
 use crate::config::UniversalControlPolicy;
 
-/// The one-line revert every surface that mentions the change must print (the window's
-/// `appstatus` ledger entry, doctor, this pass's log). The pass writes BOTH per-host keys
-/// (`platform::universal_control_disable`), so the revert deletes both: `Disable` is
-/// the feature, `DisableMagicEdges` the screen-edge hand-off, and deleting one leaves
-/// the other set. Joined by `;`, not `&&`: `defaults delete` exits 1 on a key that is
-/// already absent, and the second delete must run regardless.
+/// The one-line revert every surface that mentions the change prints (the window's
+/// `appstatus` ledger entry, doctor, this pass's log). The pass writes both per-host keys
+/// (`platform::universal_control_disable`), so the revert deletes both: `Disable` is the
+/// feature, `DisableMagicEdges` the screen-edge hand-off. Joined by `;`, not `&&`:
+/// `defaults delete` exits 1 on an absent key, and the second delete must still run.
 pub const UNIVERSAL_CONTROL_REVERT: &str = "defaults -currentHost delete \
     com.apple.universalcontrol Disable; defaults -currentHost delete \
     com.apple.universalcontrol DisableMagicEdges";
@@ -80,8 +78,8 @@ impl UniversalControlState {
 const DAILY_OFF: &str = "aterm turns it off once a day, at the first window or terminal session";
 
 impl UniversalControlState {
-    /// Fully disabled — BOTH keys true. One key alone is a half state the pass
-    /// completes rather than reports as done.
+    /// Fully disabled: both keys true. One key alone is a half state the pass completes
+    /// rather than reports as done.
     #[must_use]
     pub fn disabled(&self) -> bool {
         self.disable == Some(true) && self.magic_edges == Some(true)
@@ -137,11 +135,9 @@ impl UniversalControlState {
             };
         }
         if self.disabled() {
-            // THE REVERT ALONE DOES NOT HOLD. With the default policy the next daily apply
-            // (the day's first window or terminal session) disables it again, so a line that
-            // offers only the two `defaults delete`s sends the reader to a change that lasts until
-            // then. The command stays byte-identical ([`UNIVERSAL_CONTROL_REVERT`] is
-            // a contract string); the setting named before it is the half that makes it stick.
+            // The revert alone does not hold: under the default policy the next daily apply
+            // disables it again, so the line names the setting that makes it stick before the
+            // revert command (byte-identical: [`UNIVERSAL_CONTROL_REVERT`] is a contract).
             let keep = match policy {
                 UniversalControlPolicy::Off => "set [machine] universal_control = \"leave\" and ",
                 UniversalControlPolicy::Leave => "",
@@ -154,9 +150,7 @@ impl UniversalControlState {
                 ),
             };
         }
-        // A HALF-DISABLED HOST IS NOT AT THE OS DEFAULT. One key set is a state someone
-        // (or a previous half-finished pass) made, and calling it the default while the
-        // parenthetical says which key IS set contradicted itself in one sentence.
+        // A half-disabled host is not at the OS default: one key set is a state someone made.
         let posture = if self.partial() {
             format!("half disabled{}", self.partial_note())
         } else {
@@ -188,7 +182,7 @@ impl UniversalControlState {
         !self.disabled() && (self.disable == Some(true) || self.magic_edges == Some(true))
     }
 
-    /// `, Disable set but not DisableMagicEdges` style note for a half state.
+    /// The parenthetical naming which key a half state sets.
     fn partial_note(&self) -> &'static str {
         match (self.disable, self.magic_edges) {
             (Some(true), _) => " (Disable is set, DisableMagicEdges is not)",
@@ -262,9 +256,9 @@ pub enum UniversalControlOutcome {
     WriteFailed,
 }
 
-/// Apply `policy` through `port`: `Disabled` ONLY when this pass changed something,
-/// which is what the `machine-settings:` marker reports. Idempotent — a disabled host
-/// reads `AlreadyDisabled` on every later pass and the marker stays silent.
+/// Apply `policy` through `port`: `Disabled` only when this pass changed something, which
+/// is what the `machine-settings:` marker reports. Idempotent: a disabled host reads
+/// `AlreadyDisabled` on every later pass and the marker stays silent.
 #[must_use]
 pub fn apply_universal_control(
     policy: UniversalControlPolicy,
@@ -287,10 +281,8 @@ pub fn apply_universal_control(
     }
 }
 
-// ---------------------------------------------------------------------------------------
-// The READ verb's state — one byte-stable line the window parses, and the one pure
-// verdict both the CLI's `next —` line and the window's Apply button derive from.
-// ---------------------------------------------------------------------------------------
+// The read verb's state: one byte-stable line the window parses, and the one pure verdict
+// both the CLI's `next —` line and the window's Apply button derive from.
 
 /// Universal Control, as the two per-host keys read — the coarse posture a report
 /// names, derived from [`UniversalControlState`] and nothing else.
@@ -332,11 +324,9 @@ impl UcPosture {
 }
 
 impl UniversalControlState {
-    /// The coarse posture. `Unknown` only when NEITHER key could be read as a switch —
-    /// `[None, None]` is the OS default (an absent key is the ordinary state of a
-    /// machine that never turned the feature off), which is why the platform layer
-    /// returns `None` for absent and this cannot tell absent from unreadable; the
-    /// distinction the doctor makes is carried by `disable_read`'s prose, not here.
+    /// The coarse posture: `Unknown` when either read measured nothing; otherwise both keys
+    /// true is `Disabled`, one is `Partial`, and neither is the OS default (an absent key is
+    /// the ordinary state of a machine that never turned the feature off).
     #[must_use]
     pub fn posture(&self) -> UcPosture {
         // An UNMEASURED read is `Unknown`, which is the variant's whole purpose: before
@@ -400,18 +390,17 @@ pub struct MachineState {
     /// The synthetic-home rule's answer.
     pub home: HomePosture,
     /// The config file exists and does not parse, so the opt-out could not be read and
-    /// nothing may be applied ([`crate::config::MachineConfig::unreadable`]).
-    ///
-    /// OPTIONAL IN THE RECORD, and `false` when absent.
+    /// nothing may be applied ([`crate::config::MachineConfig::unreadable`]). Optional in
+    /// the record; absent is `false`.
     pub config_unreadable: bool,
 }
 
 impl MachineState {
-    /// THE verdict: whether an apply would change this machine — the CLI's `next —` line
-    /// and the window's Apply button both read it, so the two surfaces cannot drift.
-    /// Nothing is next when nothing may be applied (a synthetic home, or a config whose
-    /// opt-out could not be read), when the policy says leave, or when Universal Control
-    /// is already off; an unreadable posture is applied again, never skipped.
+    /// Whether an apply would change this machine: the CLI's `next —` line and the window's
+    /// Apply button both read it, so the two cannot drift. Nothing is next when nothing may
+    /// be applied (a synthetic home, a config whose opt-out could not be read), when the
+    /// policy says leave, or when Universal Control is already off; an unreadable posture is
+    /// applied again, never skipped.
     #[must_use]
     pub fn next(&self) -> bool {
         self.home == HomePosture::Account
@@ -440,10 +429,9 @@ pub fn machine_state_line(s: &MachineState) -> String {
     }
 }
 
-/// Parse a [`machine_state_line`] body. Every field required, order free, unknown
-/// keys ignored (a newer atpkg may add one); a missing or malformed field is `None`,
-/// never a default — a window that guessed a posture would be the false confidence the
-/// pass had before 2026-09-14.
+/// Parse a [`machine_state_line`] body. Every field required, order free, unknown keys
+/// ignored (a newer atpkg may add one); a missing or malformed field is `None`, never a
+/// default: a window must not guess a posture.
 #[must_use]
 pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     let mut uc = None;
@@ -478,8 +466,8 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     })
 }
 
-/// The `[machine]` table as one stable text — what [`record_applied`] keeps and
-/// [`changed_since_applied`] compares — spelled from the table as WRITTEN (the raw
+/// The `[machine]` table as one stable text, what [`record_applied`] keeps and
+/// [`changed_since_applied`] compares, spelled from the table as written (the raw
 /// `Option`s), so an edit is a change even when it lands on a default.
 #[must_use]
 pub fn applied_fingerprint(cfg: &crate::config::MachineConfig) -> String {
@@ -506,10 +494,9 @@ pub fn changed_since_applied(
         .map_or(true, |had| had != applied_fingerprint(cfg))
 }
 
-/// Forget the applied table, so the next pass's edge applies it again — what an apply that
-/// did not FINISH leaves (a `defaults` write that failed):
-/// the passes carry only a changed table, so without this nothing but the next day's launch
-/// apply ([`launch_apply_due`]) would retry what it missed. Best-effort.
+/// Forget the applied table, so the next pass applies it again: what an apply that did not
+/// finish (a failed `defaults` write) leaves. Passes carry only a changed table, so
+/// otherwise only the next day's launch apply ([`launch_apply_due`]) would retry. Best-effort.
 pub fn forget_applied(layout: &crate::store::Layout) {
     let _ = std::fs::remove_file(applied_stamp_path(layout));
 }
@@ -555,11 +542,9 @@ pub enum LaunchApply {
 }
 
 impl LaunchApply {
-    /// Whether the launch runs the apply. A skip under a private state root hands its one
-    /// line to `say` first, which the callers log at info in their own log (the window's
-    /// `aterm.log`, the session's): the decision is the launch's, not a pass's, so
-    /// `packages.log`, which records passes, has no place for it, and atpkg's notice route
-    /// (`crate::notice::say`) would log it at warn, which a skip on purpose is not.
+    /// Whether the launch runs the apply. A skip under a private state root first hands its
+    /// line to `say`, which the callers log at info in their own log: not `packages.log`,
+    /// which records passes, nor `crate::notice::say`, which logs at warn.
     pub fn runs(self, say: impl FnOnce(&'static str)) -> bool {
         match self {
             Self::Due => true,
@@ -574,17 +559,15 @@ impl LaunchApply {
 
 /// Whether this launch runs the day's `aterm pkg machine apply`: it claims the one daily
 /// slot in `machine-apply.stamp` ([`aterm_update_core::pkg_check::claim`]). A terminal
-/// session and a window opening both claim it here, so their `defaults` writes run once a
-/// day between them, not at every tab and every window; an edit to `[machine]` rides the
-/// next pass ([`changed_since_applied`]) and Settings' Apply Now runs at once, unclaimed.
+/// session and a window both claim it here, so their `defaults` writes run once a day
+/// between them; an edit to `[machine]` rides the next pass ([`changed_since_applied`]) and
+/// Settings' Apply Now runs at once, unclaimed.
 ///
-/// NOT UNDER A PRIVATE STATE ROOT (ruling 409, 2026-09-29): a development build given its
-/// own `ATERM_STATE_HOME` (AGENTS.md's recipe for a real Claude Code session keeps the
-/// owner's `$HOME`) shares this prefix, so it would take the owner's slot for the day and
-/// apply its own `[machine]` table to the owner's Mac. It stands aside BEFORE the claim
-/// (`launch_apply_decision`, below). The seam is read here, not by the callers, and the
-/// half that takes the answer injected is private to this module, so no launch lane can
-/// claim without asking (ruling 410); a shipped binary reads no seam and is unchanged.
+/// Under a private state root it stands aside before the claim: a development build with
+/// its own `ATERM_STATE_HOME` keeps the owner's `$HOME` and so shares this prefix, and would
+/// otherwise take the owner's slot and apply its own `[machine]` table to the owner's Mac.
+/// The seam is read here and the half that takes the answer injected is private, so no
+/// launch lane can claim without asking.
 #[must_use]
 pub fn launch_apply_due(layout: &crate::store::Layout, now_unix: i64) -> LaunchApply {
     launch_apply_decision(
@@ -594,9 +577,8 @@ pub fn launch_apply_due(layout: &crate::store::Layout, now_unix: i64) -> LaunchA
     )
 }
 
-/// [`launch_apply_due`] with the private-state-root answer injected: under one, the launch
-/// stands aside before anything is claimed; otherwise it claims the day's slot. Private,
-/// so only this module's tests pass the answer in.
+/// [`launch_apply_due`] with the private-state-root answer injected; private, so only this
+/// module's tests pass it in.
 #[must_use]
 fn launch_apply_decision(
     layout: &crate::store::Layout,
@@ -622,8 +604,8 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    /// ONE DAILY SLOT: the first launch of the day claims it, every later one — a tab or a
-    /// window, whichever lane — spawns nothing until a day has passed.
+    /// The first launch of the day claims the slot; every later one, whichever lane, runs
+    /// nothing until a day has passed.
     #[test]
     fn the_launch_apply_is_claimed_once_a_day() {
         let prefix = crate::testdir::dir("atpkg-machine-daily-");
@@ -643,11 +625,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
-    /// A PRIVATE STATE ROOT LEAVES THE DAY'S SLOT TO THE OWNER (ruling 409). Under it a
-    /// launch runs nothing and claims nothing: no stamp is written, however often it asks,
-    /// so the owner's first launch of the day still claims the slot and applies. Unset, the
-    /// decision is today's (the test above). `runs` says the skip's one line and nothing
-    /// else does.
+    /// Under a private state root a launch runs and claims nothing, however often it asks,
+    /// so the owner's first launch of the day still claims the slot; only the skip says a
+    /// line.
     #[test]
     fn a_private_state_root_skips_the_launch_apply_before_the_claim() {
         let prefix = crate::testdir::dir("atpkg-machine-private-");
@@ -787,9 +767,9 @@ mod tests {
         assert_eq!(parse_defaults_bool(b"truee"), None);
     }
 
-    // The policy over the fake: the OS default is disabled ONCE (the pass's entry),
-    // a disabled host is left alone on every later pass, a half state is completed,
-    // `leave` never reads or writes, and a failed write is not announced.
+    // The policy over the fake: the OS default is disabled once, a disabled host is left alone,
+    // a half state is completed, `leave` never reads or writes, and a failed write is not
+    // announced.
     #[test]
     fn the_pass_disables_once_and_never_touches_a_disabled_host_or_a_leave_policy() {
         if !cfg!(target_os = "macos") {
@@ -814,7 +794,7 @@ mod tests {
             UniversalControlOutcome::AlreadyDisabled
         );
         assert_eq!(fake.writes.get(), 1);
-        // A half state (the owner's machine before DisableMagicEdges existed) completes.
+        // A half state completes.
         let half = Fake::at(Some(true), None);
         assert!(!universal_control_state(&half).disabled());
         assert_eq!(
@@ -913,8 +893,7 @@ mod tests {
         }
     }
 
-    /// THE VERDICT TABLE — the read verb's `next —` line and the window's Apply button
-    /// both read it.
+    /// The verdict the read verb's `next —` line and the window's Apply button both read.
     #[test]
     fn an_apply_is_next_only_where_it_would_change_universal_control() {
         use UcPosture::*;

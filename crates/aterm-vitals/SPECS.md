@@ -3,13 +3,11 @@
 
 # aterm-vitals: specs behind the stuck-process engine's 49 tests
 
-> Status 2026-10-20: written with the stuck-process engine (`src/jobs/`, design
-> `docs/DESIGN-system-awareness-2026-10-16.md` §11). Each spec below is held by the tests named in its
-> `subsumes` column; none is proved through Trust/Clean yet. The crate's earlier modules (`model.rs`,
-> `trend.rs`, `words.rs`, `ink.rs`, which landed with the Deck on 2026-10-19) carry 30 more tests whose
-> specs are not recovered here yet; §3 lists them. JB-NOPROGRESS joined the same day with slice 1 of
-> `docs/DESIGN-hung-background-call-2026-10-20.md` (D2): its fixtures are rows of the table test, so the
-> test count is unchanged.
+> Status: specs for the stuck-process engine (`src/jobs/`, design
+> `docs/DESIGN-system-awareness-2026-10-16.md` §11 and `docs/DESIGN-hung-background-call-2026-10-20.md`
+> D2). Each spec below is held by the tests named in its `subsumes` column; none is proved through
+> Trust/Clean yet. The crate's Deck modules (`model.rs`, `trend.rs`, `words.rs`, `ink.rs`) carry 30
+> additional tests listed in §3.
 
 Source: `crates/aterm-vitals/src/jobs/` (`mod.rs`, `units.rs`, `step.rs`, `wait.rs`, `wire.rs`), with the
 tests in `src/jobs/tests.rs`, `tests/stuck_scenarios.rs` and `tests/conformance_stuck_verdict.rs`, and the
@@ -132,11 +130,11 @@ None.
 
 ## 5. Implied specs that look wrong, or disagree with the design
 
-- JB-NOPROGRESS's bound, `NO_PROGRESS_CPU_NS_PER_MIN` (1 ms a minute), is the design's first value. D2 says
-  slice 1 measures it; only a partial reading exists (2026-10-20, `proc_pid_rusage` over 60 s): a live
-  `targo --unverified test` call's waiting members (its `zsh -c`, `targo`, an idle forked test child) used
-  0 ns and 0 wakeups. A hung test binary itself (libtest's main thread in `recv` after its 60 s note, and any
-  threads the finished tests left running) is unmeasured; measure it before slice 2 relies on the bound.
+- JB-NOPROGRESS's bound, `NO_PROGRESS_CPU_NS_PER_MIN` (1 ms a minute), is the design's initial value (D2).
+  A partial `proc_pid_rusage` reading over 60 s showed a live `targo --unverified test` call's waiting
+  members (`zsh -c`, `targo`, an idle forked test child) used 0 ns and 0 wakeups; a hung test binary itself
+  (libtest's main thread in `recv` after its 60 s note, and any threads finished tests left running) remains
+  to be measured before relying on the bound.
 - JB-NOPROGRESS sums the members' own CPU only. Children born and reaped between two readings are never
   members, so work done in them counts as zero, and a call whose work runs only in such short forks under
   a sleeping parent can say the word while it uses CPU. Adding the reaped children's CPU to the run (not to

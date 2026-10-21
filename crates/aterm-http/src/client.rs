@@ -11,27 +11,16 @@
 //! There is no connection pool and no HTTP/2, because a caller making one
 //! bounded call at a time needs neither.
 //!
-//! # Hardening
-//!
-//! * Header names and values are REJECTED if they contain CR, LF or NUL, so a
-//!   value built from configuration cannot inject a second request. The request
-//!   target is likewise never re-encoded ([`crate::uri`]).
-//! * The response body is bounded by [`RequestBuilder::limit`]; exceeding it is
-//!   an error rather than a truncation, so a hostile or broken endpoint cannot
-//!   drive this process into swap by streaming forever.
-//! * The header block is bounded too: an endpoint that never stops sending
-//!   headers hits [`MAX_HEADER_BYTES`] instead of growing a buffer without end.
-//! * `Content-Length` and `Transfer-Encoding` arriving TOGETHER is a
-//!   request-smuggling signature and is rejected outright, and so is every
-//!   other response whose end is ambiguous: duplicate `Content-Length` headers
-//!   that disagree, a length that is not `1*DIGIT`, and a transfer coding other
-//!   than exactly `chunked` (`decide_framing`, RFC 9112 §6.3).
-//! * Interim 1xx responses are read past to the final one (`read_head`, RFC
-//!   9110 §15.2), on the CONNECT exchange as on every other.
-//! * An unusable endpoint is refused WITHOUT echoing it, since the one shape
-//!   the URI policy exists to refuse (userinfo) carries a credential. An
-//!   unusable proxy setting fails the request the same way, naming its variable
-//!   ([`crate::proxy`]); it never falls back to a direct connection.
+//! * Header names and values containing CR, LF or NUL are rejected, so a
+//!   configured value cannot inject a second request; the request target is
+//!   never re-encoded ([`crate::uri`]).
+//! * The body is bounded by [`RequestBuilder::limit`] and the head by
+//!   [`MAX_HEADER_BYTES`]; exceeding either is an error, not a truncation.
+//! * Every response whose end is ambiguous is refused (`decide_framing`).
+//! * Interim 1xx responses are read past, on CONNECT too (`read_head`).
+//! * An unusable endpoint is refused without echoing it (userinfo carries a
+//!   credential); an unusable proxy setting fails the request, naming its
+//!   variable, and never falls back to a direct connection ([`crate::proxy`]).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, OnceLock};
@@ -125,14 +114,10 @@ impl TlsConfigCache {
 
 /// Client configuration shared by every request it issues.
 ///
-/// Clones share one lazy TLS configuration. Plain HTTP never constructs it;
-/// the first HTTPS request snapshots the configured roots (or platform trust
-/// verifier) and every later HTTPS request from this client reuses that result.
-/// On non-Apple Unix, that means `SSL_CERT_FILE`/`SSL_CERT_DIR` and the on-disk
-/// platform store are read at the first HTTPS request; create a new client to
-/// adopt later trust-store changes. Proxy environment variables are different:
-/// [`RequestBuilder::send`] resolves them afresh for every request, and each
-/// builder retains its own authority [`Guard`].
+/// Clones share one lazy TLS configuration, built at the first HTTPS request
+/// and reused after (on non-Apple Unix that is when `SSL_CERT_FILE`,
+/// `SSL_CERT_DIR` and the on-disk store are read; a new client adopts later
+/// trust-store changes). Proxy variables are resolved afresh per request.
 #[derive(Clone)]
 pub struct Client {
     trust: Arc<Trust>,
@@ -165,11 +150,8 @@ impl Client {
         Self::with_shared_trust(Arc::new(trust), proxy_mode, timeout)
     }
 
-    /// A client that shares an already-owned trust model.
-    ///
-    /// This is useful for caches that retain custom CA roots as their identity:
-    /// the cache and every cloned client then share the DER allocation instead
-    /// of copying it at each client construction.
+    /// A client that shares an already-owned trust model, so a cache keyed by
+    /// custom CA roots and its clients share one DER allocation.
     #[must_use]
     pub fn with_shared_trust(trust: Arc<Trust>, proxy_mode: ProxyMode, timeout: Duration) -> Self {
         Self {
@@ -192,9 +174,28 @@ impl Client {
     /// Begin a POST to `endpoint`.
     #[must_use]
     pub fn post(&self, endpoint: &str) -> RequestBuilder<'_> {
+        self.request("POST", endpoint)
+    }
+
+    /// Begin a PUT to `endpoint`. Its body is framed by `Content-Length`, as a
+    /// POST's is.
+    #[must_use]
+    pub fn put(&self, endpoint: &str) -> RequestBuilder<'_> {
+        self.request("PUT", endpoint)
+    }
+
+    /// Begin a GET to `endpoint`. Send it with an empty body: the head then
+    /// carries no `Content-Length` (RFC 9110 §8.6: a GET anticipates no
+    /// content).
+    #[must_use]
+    pub fn get(&self, endpoint: &str) -> RequestBuilder<'_> {
+        self.request("GET", endpoint)
+    }
+
+    fn request(&self, method: &'static str, endpoint: &str) -> RequestBuilder<'_> {
         RequestBuilder {
             client: self,
-            method: "POST",
+            method,
             endpoint: endpoint.to_owned(),
             headers: Vec::new(),
             limit: usize::MAX,
@@ -316,7 +317,7 @@ impl Client {
             // tunnel is needed.
             (Scheme::Http, _) => Ok(Stream::plain(tcp, Arc::clone(guard), deadline)),
             // HTTPS through a proxy: CONNECT first, then handshake against the
-            // ORIGIN name so the proxy cannot substitute its own certificate.
+            // origin name so the proxy cannot substitute its own certificate.
             (Scheme::Https, Some(proxy)) => {
                 let mut plain = Stream::plain(tcp, Arc::clone(guard), deadline);
                 connect_tunnel(&mut plain, target, proxy.basic_auth())?;
@@ -367,12 +368,9 @@ fn connect_tunnel(
     request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
-    // Read the tunnel response UNBUFFERED, one byte at a time. A BufReader here
-    // would read past the blank line and swallow the first bytes of the peer's
-    // TLS ServerHello into a buffer that is dropped with it — the handshake
-    // would then stall on data that had already arrived. The head is read by
-    // the same `read_head` as every other response, interim 1xx included; a
-    // 2xx's framing headers are ignored, as RFC 9110 §9.3.6 requires.
+    // Unbuffered on purpose: a BufReader would read past the blank line and
+    // drop the first bytes of the TLS ServerHello. A 2xx's framing headers
+    // are ignored (RFC 9110 §9.3.6).
     let head = read_head(stream)?;
     if !(200..300).contains(&head.code) {
         return Err(Error::Protocol(format!(
@@ -413,16 +411,17 @@ fn render_request(
     // One request per connection: no pool to keep warm, and an explicit close
     // makes the response's end unambiguous.
     head.push_str("Connection: close\r\n");
-    head.push_str(&format!("Content-Length: {body_len}\r\n"));
+    // A bodiless GET or HEAD carries no length (RFC 9110 §8.6: a user agent
+    // SHOULD NOT send one when the method anticipates no content); every
+    // other request, an empty POST included, names its length.
+    if body_len > 0 || !matches!(method, "GET" | "HEAD") {
+        head.push_str(&format!("Content-Length: {body_len}\r\n"));
+    }
     head.push_str("Accept: */*\r\n");
     for (name, value) in headers {
-        // A caller-supplied header must never DUPLICATE one this function
-        // generates. Two `Host` or two `Content-Length` lines is a
-        // request-smuggling signature — intermediaries disagree about which
-        // one is authoritative — and a second `Connection` header could
-        // resurrect keep-alive under a body framing that assumes close. The
-        // body is sent verbatim, so Transfer-Encoding cannot override its
-        // generated Content-Length either.
+        // A caller header never duplicates a generated one: two `Host` or
+        // `Content-Length` lines is a request-smuggling signature, and a second
+        // `Connection` could revive keep-alive under close framing.
         if RESERVED_HEADERS
             .iter()
             .any(|generated| name.eq_ignore_ascii_case(generated))
@@ -561,11 +560,9 @@ fn read_line<R: Read>(reader: &mut R, consumed: &mut usize) -> Result<String, Er
     String::from_utf8(raw).map_err(|_| Error::Protocol("header line is not UTF-8".to_owned()))
 }
 
-/// A number in HTTP's own grammar — `1*DIGIT` (radix 10) or `1*HEXDIG` (radix
-/// 16) — and nothing else. Rust's integer parsers also take a leading `+`,
-/// which none of HTTP's number grammars allow, so EVERY number read off the
-/// wire (status code, `Content-Length`, chunk size) goes through here rather
-/// than straight to `from_str_radix`. Overflow is `None` too.
+/// A number in HTTP's grammar — `1*DIGIT` (radix 10) or `1*HEXDIG` (radix 16).
+/// Rust's integer parsers also take a leading `+`, so every number read off
+/// the wire goes through here. Overflow is `None`.
 fn parse_http_number(text: &str, radix: u32) -> Option<usize> {
     if text.is_empty() || !text.chars().all(|c| c.is_digit(radix)) {
         return None;
@@ -618,20 +615,30 @@ fn read_header_fields<R: Read>(
     }
 }
 
-/// Read the FINAL response head, skipping every interim (1xx) one before it.
+/// Read the final response head, skipping every interim (1xx) one before it.
 ///
-/// RFC 9110 §15.2: a client MUST be able to parse one or more 1xx responses
-/// before the final one, even when it did not ask for any — a server may answer
-/// every POST with `100 Continue`, or send `103 Early Hints` — and each of them
-/// ends at its empty line (RFC 9112 §6.3). Taking the first head as THE
-/// response hands the caller a 1xx status with the real response as its "body",
-/// and makes a proxy's CONNECT look refused. `101 Switching Protocols` is no
-/// interim response here: this client never asks to upgrade. Every head shares
-/// ONE [`MAX_HEADER_BYTES`] budget, so a peer cannot stream 1xx heads forever.
+/// RFC 9110 §15.2: a client must parse 1xx responses it did not ask for
+/// (`100 Continue`, `103 Early Hints`); taking the first head would return a
+/// 1xx with the real response as its body and make a CONNECT look refused.
+/// `101` is an error: this client never asks to upgrade. All heads share one
+/// [`MAX_HEADER_BYTES`] budget, so a peer cannot stream 1xx heads forever.
+///
+/// A peer that closes before its first byte sent no response: [`Error::Io`]
+/// (`UnexpectedEof`), never [`Error::Protocol`], so a caller tells "nothing
+/// answered" (a later try may get past it) from "what answered is not HTTP".
 fn read_head<R: Read>(reader: &mut R) -> Result<Head, Error> {
     let mut consumed = 0usize;
     loop {
-        let code = read_status_line(reader, &mut consumed)?;
+        let code = match read_status_line(reader, &mut consumed) {
+            // Every byte read counts against the budget, so none was read.
+            Err(Error::Protocol(_)) if consumed == 0 => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the connection closed before any response",
+                )));
+            }
+            code => code?,
+        };
         let headers = read_header_fields(reader, &mut consumed)?;
         match code {
             101 => {
@@ -650,9 +657,8 @@ fn read_response(stream: Stream, limit: usize) -> Result<Response, Error> {
     read_response_from(&mut BufReader::new(stream), limit)
 }
 
-/// The response parser over any buffered reader: the live socket above, or the
-/// in-memory bytes the unit tests feed it, so both run ONE framing path rather
-/// than the tests exercising a copy that could drift from what ships.
+/// The response parser over any buffered reader, so the unit tests run the
+/// same framing path as the live socket.
 fn read_response_from<R: BufRead>(reader: &mut R, limit: usize) -> Result<Response, Error> {
     let Head { code, headers } = read_head(reader)?;
     let body = match decide_framing(code, &headers)? {
@@ -666,7 +672,6 @@ fn read_response_from<R: BufRead>(reader: &mut R, limit: usize) -> Result<Respon
             reader.read_exact(&mut body)?;
             body
         }
-        // No framing header: the body runs to EOF (we sent Connection: close).
         Framing::ToEof => read_to_limit(reader, limit)?,
     };
     Ok(Response {
@@ -693,20 +698,14 @@ enum Framing {
 /// Resolve the response framing (RFC 9112 §6.3), refusing every ambiguous
 /// combination.
 ///
-/// A 1xx, 204 or 304 response ends at its header block WHATEVER framing
-/// headers it carries (rule 1; a 304 may name the length of the representation
-/// it did not send). Otherwise rejected: `Transfer-Encoding` and
-/// `Content-Length` together, whatever the coding (rule 3: the transfer coding
-/// overrides the length, and the pair is the smuggling signature), duplicate
-/// `Content-Length` headers that disagree, a length that is not `1*DIGIT`
-/// ([`parse_http_number`]), and any transfer coding list other
-/// than exactly `chunked`. This client decodes chunked and nothing else: a
-/// non-final chunked does not frame the body at all (rule 4), and any other
-/// coding would leave the caller holding coded bytes it takes for the content.
-/// EVERY `Transfer-Encoding` header is read, not only the first: `gzip` in one
-/// header and `chunked` in the next is the list `gzip, chunked`.
+/// 1xx, 204 and 304 end at their header block whatever they declare (rule 1).
+/// Refused: `Transfer-Encoding` with `Content-Length` (rule 3), disagreeing
+/// duplicate `Content-Length`s, a length that is not `1*DIGIT`, and any coding
+/// list other than exactly `chunked` — this client decodes nothing else, and a
+/// non-final chunked does not frame the body (rule 4). Every
+/// `Transfer-Encoding` header counts: `gzip` then `chunked` is `gzip, chunked`.
 fn decide_framing(status: u16, headers: &[(String, String)]) -> Result<Framing, Error> {
-    /// EVERY value under `name`, not just the first — duplicates are the point.
+    /// Every value under `name`, not just the first: duplicates are the point.
     fn values<'a>(headers: &'a [(String, String)], name: &'a str) -> impl Iterator<Item = &'a str> {
         headers
             .iter()
@@ -738,8 +737,8 @@ fn decide_framing(status: u16, headers: &[(String, String)]) -> Result<Framing, 
                 format!("Content-Length is not a decimal byte count: {text:?}")
             })
         })?;
-        // Repeating the SAME value is legal and harmless; repeating a different
-        // one leaves two parties disagreeing about where this response ends.
+        // Repeating the same value is harmless; a different one leaves two parties
+        // disagreeing about where this response ends.
         match declared {
             Some(first) if first != parsed => {
                 return Err(Error::Protocol(
@@ -962,8 +961,7 @@ mod tests {
     fn plain_http_never_constructs_the_deferred_tls_configuration() {
         let (endpoint, server) =
             plain_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        // This trust input is intentionally unusable. The HTTP request must
-        // still succeed because only HTTPS is allowed to touch the lazy cache.
+        // Unusable trust: only an HTTPS request may build the lazy TLS config.
         let client = Client::new(Trust::Roots(Vec::new()), ProxyMode::Direct, HANG_DETECTOR);
         let response = client.post(&endpoint).send(b"{}").unwrap();
         assert_eq!(server.join().unwrap(), b"{}");
@@ -985,6 +983,38 @@ mod tests {
         assert!(head.contains("Content-Length: 7\r\n"), "{head}");
         assert!(head.contains("Connection: close\r\n"), "{head}");
         assert!(head.ends_with("\r\n\r\n"), "{head}");
+    }
+
+    #[test]
+    fn a_bodiless_get_names_no_length_and_every_other_request_does() {
+        let target = uri("http://127.0.0.1:7484/v1/alab?after=3");
+        let get = render_request("GET", &target, None, &[], 0);
+        assert!(
+            get.starts_with("GET /v1/alab?after=3 HTTP/1.1\r\n"),
+            "{get}"
+        );
+        assert!(
+            !get.to_ascii_lowercase().contains("content-length"),
+            "{get}"
+        );
+        assert!(get.contains("Connection: close\r\n"), "{get}");
+        assert!(get.ends_with("\r\n\r\n"), "{get}");
+        // A caller's own length cannot sneak one back in.
+        let caller = [("Content-Length".to_owned(), "5".to_owned())];
+        let get = render_request("GET", &target, None, &caller, 0);
+        assert!(
+            !get.to_ascii_lowercase().contains("content-length"),
+            "{get}"
+        );
+        // An empty PUT or POST still frames its (empty) body.
+        for method in ["PUT", "POST"] {
+            let head = render_request(method, &target, None, &[], 0);
+            assert!(head.starts_with(&format!("{method} /v1/alab?after=3 ")));
+            assert!(head.contains("Content-Length: 0\r\n"), "{head}");
+        }
+        // A GET handed a body frames it rather than leaving it unframed.
+        let get = render_request("GET", &target, None, &[], 2);
+        assert!(get.contains("Content-Length: 2\r\n"), "{get}");
     }
 
     #[test]
@@ -1057,8 +1087,6 @@ mod tests {
 
     #[test]
     fn a_caller_cannot_duplicate_a_generated_header() {
-        // Two Host or two Content-Length lines is a smuggling signature:
-        // intermediaries disagree about which is authoritative.
         let head = render_request(
             "POST",
             &uri("http://a.test/x"),
@@ -1086,7 +1114,7 @@ mod tests {
             "{head}"
         );
         assert!(head.contains("Connection: close\r\n"), "{head}");
-        // A header that does NOT collide is still passed through.
+        // A header that does not collide passes through.
         assert!(
             head.contains("Content-Type: application/json\r\n"),
             "{head}"
@@ -1160,8 +1188,6 @@ mod tests {
     }
 
     fn parse(raw: &[u8], limit: usize) -> Result<Response, Error> {
-        // The SAME parser read_response runs on a live socket, over an
-        // in-memory reader.
         read_response_from(&mut BufReader::new(raw), limit)
     }
 
@@ -1174,8 +1200,6 @@ mod tests {
 
     #[test]
     fn framing_refuses_every_response_whose_end_is_ambiguous() {
-        // One function owns this decision because a body whose end two parties
-        // disagree about IS the smuggling class.
         assert_eq!(decide_framing(200, &headers(&[])).unwrap(), Framing::ToEof);
         assert_eq!(
             decide_framing(200, &headers(&[("Content-Length", "7")])).unwrap(),
@@ -1185,7 +1209,7 @@ mod tests {
             decide_framing(200, &headers(&[("Transfer-Encoding", "chunked")])).unwrap(),
             Framing::Chunked
         );
-        // Repeating the SAME length is legal; disagreeing is not.
+        // Repeating the same length is legal; disagreeing is not.
         assert_eq!(
             decide_framing(
                 200,
@@ -1203,8 +1227,7 @@ mod tests {
             vec![("Content-Length", "5"), ("Content-Length", "9")],
             vec![("Content-Length", "5"), ("Transfer-Encoding", "chunked")],
             vec![("Content-Length", "5"), ("Transfer-Encoding", "gzip")],
-            // EVERY Transfer-Encoding header is read: these two are the list
-            // `gzip, chunked`, refused.
+            // Two Transfer-Encoding headers are the list `gzip, chunked`.
             vec![
                 ("Transfer-Encoding", "gzip"),
                 ("Transfer-Encoding", "chunked"),
@@ -1280,9 +1303,8 @@ mod tests {
 
     #[test]
     fn a_chunk_size_is_hex_digits_and_nothing_else() {
-        // RFC 9112 §7.1: chunk-size = 1*HEXDIG, with BWS allowed only BEFORE a
-        // chunk extension's `;`. `usize::from_str_radix` also takes a leading
-        // `+` — the same leniency `Content-Length` is already guarded against.
+        // RFC 9112 §7.1: chunk-size = 1*HEXDIG, with BWS allowed only before a
+        // chunk extension's `;`.
         for size in ["+2", " 2", "\t2", "0x2", ""] {
             let raw = format!(
                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size}\r\nhi\r\n0\r\n\r\n"
@@ -1346,10 +1368,7 @@ mod tests {
 
     #[test]
     fn interim_1xx_responses_are_skipped_to_the_final_one() {
-        // RFC 9110 §15.2: a client MUST parse 1xx responses before the final
-        // one even unasked — a server may answer every POST with `100
-        // Continue`, or send `103 Early Hints`. The first head is not THE
-        // response, and the final one is not its body.
+        // RFC 9110 §15.2: 1xx heads may precede the final response, even unasked.
         let raw = b"HTTP/1.1 100 Continue\r\n\r\n\
 HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n\
 HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -1367,12 +1386,32 @@ HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     }
 
     #[test]
+    fn a_peer_that_closes_unanswered_is_a_transport_failure() {
+        // No byte at all is no response: the transport's failure, as a reset is.
+        assert!(
+            matches!(parse(b"", 1024), Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{:?}",
+            parse(b"", 1024)
+        );
+        // A head cut short once it began did answer, and is malformed; so is
+        // the end after an interim head.
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\n"[..],
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"\r\n",
+        ] {
+            assert!(
+                matches!(parse(raw, 1024), Err(Error::Protocol(_))),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
     fn bodiless_statuses_end_at_their_header_block_whatever_they_declare() {
-        // RFC 9112 §6.3 rule 1: 204 and 304 carry no content regardless of
-        // their framing headers (a 304 may name the length of the
-        // representation it did NOT send). Reading the declared length would
-        // wait for bytes that never come — an error here, a stall until the
-        // deadline against a server that keeps the connection open.
+        // RFC 9112 §6.3 rule 1: 204 and 304 carry no content whatever their
+        // framing headers declare; reading the length would wait for bytes that
+        // never come.
         for raw in [
             &b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n"[..],
             &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n"[..],
@@ -1386,11 +1425,7 @@ HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
     #[test]
     fn a_transfer_coding_this_client_cannot_decode_is_refused() {
-        // RFC 9112 §6.3: Transfer-Encoding OVERRIDES Content-Length (so the two
-        // together are an error whatever the coding), and only a FINAL chunked
-        // frames the body. This client decodes chunked and nothing else, so any
-        // other coding would hand the caller coded bytes as if they were the
-        // content.
+        // Only a final `chunked` frames a body this client can decode.
         for raw in [
             &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 2\r\n\r\nhi"[..],
             &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nhi"[..],

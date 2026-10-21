@@ -5,24 +5,16 @@
 //! `aterm_models_update::native_update_precommit_input_model`
 //! (`NativeUpdatePreCommitInput`, gap #33).
 //!
-//! Every schedule of the model up to four steps — enough to reach every state
-//! the model can reach, which the test checks — is replayed on the SHIPPING
-//! App: a headless App with its incoming handoff pending, and the three seams
-//! production drives the queue through — `queue_pre_commit_input` (what
-//! `window_event` does with deferrable input before Commit), `on_focus` (the
-//! `Focused` arm, which a successor hears from winit for every window it
-//! creates, and from the user) and `settle_replayed_handoff_input` (the Commit
-//! arm, after the queue is taken and replayed). The test plays the user and
-//! the platform: it types, it takes focus away, it overfills the queue, and at
-//! Commit it leaves ⌘ armed, as a replayed stream whose release was lost or
-//! reordered would. Every real step is projected onto the model and checked as
-//! a transition the committed model admits (interpreter, and `ty` wherever
-//! installed), and every reached state satisfies every invariant.
+//! Every model schedule up to four steps (enough to reach every model state, which the test
+//! checks) is replayed on a headless App with its incoming handoff pending, through the
+//! production seams: `queue_pre_commit_input` (input deferred before Commit), `on_focus`
+//! (`LoseFocus`) and `settle_replayed_handoff_input` (the Commit arm, run with ⌘ left armed, as a
+//! replayed stream whose release was lost would leave it). Every real step must be a transition
+//! the model admits (interpreter, and `ty` wherever installed), and every reached state
+//! satisfies every invariant.
 //!
-//! NEGATIVE CONTROL: the same real steps against `Buggy = 1` — the latch this
-//! replaced, which marks the queue on every focus loss, and the silent drop,
-//! which marks nothing on an overflow — must be rejected at the first focus
-//! loss with nothing queued and at the overflow, so a pass is never vacuous.
+//! Negative control: `Buggy = 1` (every focus loss marks the queue; an overflow marks nothing)
+//! must reject the real steps at the first focus loss with nothing queued and at the overflow.
 
 use std::collections::BTreeMap;
 
@@ -49,9 +41,9 @@ struct Rig {
     app: crate::App,
     winit: aterm_window::window::WindowId,
     window: WindowId,
-    /// TRUTH: input for the window was queued.
+    /// Truth: input for the window was queued.
     typed: bool,
-    /// TRUTH: the window lost focus with input already queued for it.
+    /// Truth: the window lost focus with input already queued for it.
     reordered: bool,
     settled: Option<Settled>,
 }
@@ -182,8 +174,8 @@ fn replay(schedule: &[&'static str]) -> (State, Vec<Step>) {
     (initial, steps)
 }
 
-/// `(label, conforms)` per step of `schedule` against `model`, BOTH tiers
-/// (interpreter, and `ty` wherever installed).
+/// `(label, conforms)` per step of `schedule` against `model`, both tiers (interpreter, and
+/// `ty` wherever installed).
 fn verdicts(model: &Model, schedule: &[&'static str], tag: &str) -> Vec<(String, bool)> {
     let (initial, steps) = replay(schedule);
     let mut out = vec![(
@@ -199,19 +191,15 @@ fn verdicts(model: &Model, schedule: &[&'static str], tag: &str) -> Vec<(String,
     out
 }
 
-/// The shipping queue, focus arm and settle refine `NativeUpdatePreCommitInput`
-/// on every schedule up to four steps, every state they reach satisfies every
-/// invariant, and between them they reach EVERY state the model can reach.
-/// Each step is admitted by the interpreter; each DISTINCT real transition is
-/// then validated once on both tiers — the state space is small, and `ty` is a
-/// process per call.
+/// The shipping queue, focus arm and settle refine `NativeUpdatePreCommitInput` on every
+/// schedule up to four steps, every state they reach satisfies every invariant, and together
+/// they reach every state the model can reach. Each step is admitted by the interpreter; each
+/// distinct real transition is then validated once on both tiers (`ty` is a process per call).
 #[test]
 fn the_real_pre_commit_queue_conforms_to_the_model() {
-    // THE COUNTERS' LOCK, for the whole replay. Every `Drop` step refuses a
-    // real event (`input_dropped=` + 1) and every incoherent `Settle` repairs
-    // a real replay (`input_incoherent=` + 1): process-wide counters the focus
-    // and metrics tests pin exactly. Unheld, the focus test failed 9 runs in
-    // 12 when run beside these replays (measured 2026-09-26).
+    // Hold the counters' lock for the whole replay: every `Drop` step refuses a real event
+    // (`input_dropped=` + 1) and every incoherent `Settle` repairs one (`input_incoherent=` + 1),
+    // process-wide counters the focus and metrics tests pin exactly.
     let _counters = crate::metrics::HANDOFF_INPUT_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -260,7 +248,7 @@ fn the_real_pre_commit_queue_conforms_to_the_model() {
             "{label} does not conform to NativeUpdatePreCommitInput"
         );
     }
-    // The schedules the gap was written for are among them.
+    // The schedules the model exists for are among them.
     for owners in [
         vec!["LoseFocus", "LoseFocus", "Settle"],
         vec!["LoseFocus", "Type", "Settle"],
@@ -274,11 +262,10 @@ fn the_real_pre_commit_queue_conforms_to_the_model() {
     }
 }
 
-/// NEGATIVE CONTROL: the latch this replaced (`Buggy = 1`: every focus loss
-/// marks the queue) is rejected by the real steps at the first focus loss with
-/// nothing queued — winit's startup event for a new window — because the real
-/// code left the queue coherent; and the silent drop (`Buggy = 1`: an
-/// overflow marks nothing) at the overflow, because the real queue marked it.
+/// Negative control: the latch (`Buggy = 1`: every focus loss marks the queue) rejects the real
+/// steps at the first focus loss with nothing queued (winit's startup event for a new window),
+/// where the real code leaves the queue coherent; the silent drop (`Buggy = 1`: an overflow
+/// marks nothing) rejects them at the overflow, which the real queue marks.
 #[test]
 fn the_old_latch_rejects_the_real_steps() {
     // Its overflow schedule moves the process-wide counters too.
@@ -295,8 +282,7 @@ fn the_old_latch_rejects_the_real_steps() {
     assert!(rejected(&startup, "LoseFocus"), "{startup:?}");
     let typed_after = verdicts(&buggy, &["LoseFocus", "Type", "Settle"], "buggy-typed");
     assert!(rejected(&typed_after, "LoseFocus"), "{typed_after:?}");
-    // …and a loss AFTER typing is where the old latch was right: the committed
-    // and the buggy machine agree there, so the control is about the noise.
+    // …and a loss after typing is where the buggy latch is right: both machines agree there.
     let tabbed = verdicts(&buggy, &["Type", "LoseFocus", "Settle"], "buggy-tabbed");
     assert!(tabbed.iter().all(|(_, ok)| *ok), "{tabbed:?}");
     // The silent drop: the real queue marks the overflow the buggy one ignores.

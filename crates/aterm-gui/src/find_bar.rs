@@ -31,13 +31,8 @@
 //! caret in view, and — the invariant that matters while typing — of a width that
 //! depends on the WINDOW only, never on how wide the status text happens to be.
 //!
-//! The key hints move to their own row, so the field row is never squeezed by them.
-//! The bracketed `[Aa]` / `[.*]` toggles reverse when active (visible across the
-//! window, same width in both states) and are CLICKABLE via the [`FindBarPaint`]
-//! geometry the splice records for the mouse path. The answer — `2/7`, `no matches`,
-//! `bad regex` — outranks them: on a narrow window the toggles are dropped so the
-//! readout survives, and a failed search additionally tints the QUERY ITSELF, because
-//! that is where the eye already is.
+//! A count is painted bare only when it is an exact census of the present screen. Two
+//! qualifiers survive at every width (the ladder drops the `i/` position, never the mark):
 //!
 //! Windows sets the field row as a toolbar ([`FIND_TOOLBAR`]): the well with
 //! padded ` Aa ` / ` .* ` toggle buttons right after it, each on a resting
@@ -63,32 +58,14 @@
 //! screen. Two qualifiers say otherwise and survive at EVERY width — the ladder
 //! shortens by dropping the `i/` position, never the marker:
 //!
-//! * `+` — the total is a floor. Where the status zone is wide enough the bar
-//!   names why: the depth cap (`none in newest 100,000 lines`, narrower
-//!   `none in newest 100k`; `3/7+ (newest 100,000 lines)` for hits; the limit
-//!   is `search_history_lines`), the match limit (`1/100000+ (match limit)`),
-//!   or a rewrap (below); a floor with none of these still reads
-//!   `(partial history)`.
-//! * `…` — the terminal changed since the count was taken (output arrived, the
-//!   screen repainted). The search is deliberately not re-run per PTY batch, so
-//!   the number is a past census and can be wrong in EITHER direction; it
-//!   refreshes on the next edit or ⌘S/⌘R. Spelled out as `(stale)`.
+//! While a width change's rewrap holds the history away, a zero-match is not a miss (the
+//! search reruns at the re-attach): no width says `no matches`, and the ladder runs from
+//! `none yet, history rewrapping` down to `rewrap`, in the label tone. Where the status zone
+//! is dropped, the band's `Rewrapping scrollback` row carries the wait.
 //!
-//! While a width change's rewrap holds the history AWAY (design ruling 237), a
-//! zero-match is not a miss — the text may be there, and the search runs again by
-//! itself at the re-attach — so no width says `no matches`: the ladder is `none
-//! yet, history rewrapping` › `none yet (rewrapping)` › `rewrapping history` ›
-//! `rewrapping` › `rewrap`, in the label tone, and the query is not tinted as a
-//! failure. Below 49 columns the status zone is dropped for the field (for every
-//! result), and the band's `Rewrapping scrollback` row carries the wait.
-//!
-//! Pure + themed like the paste banner and the link caption (it reuses
-//! [`crate::settings::blank_row`]/[`crate::settings::write_str`] +
-//! [`crate::chrome_band::band_colors`]), so the band builder unit-tests with no window
-//! and is drawn by `App::splice_find_bar` (app_render.rs), which OVERWRITES its rows
-//! in place — the top of the grid normally, or the BOTTOM when the current match
-//! would otherwise sit under the panel (adaptive placement, so the match is never
-//! hidden).
+//! Pure and themed, so it unit-tests with no window. `App::splice_find_bar` (app_render.rs)
+//! overwrites grid rows with it: at the top normally, at the bottom when the current match
+//! would sit under the panel.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -129,8 +106,7 @@ pub(crate) enum FindSeam {
     BottomUnderline,
 }
 
-/// Left indent of the `Find:` prompt (like the notice bands, but roomier — this is a
-/// panel, not a status line).
+/// Left indent of the `Find:` prompt.
 const LEFT_PAD: usize = 2;
 
 /// Right margin kept clear of the window edge.
@@ -142,24 +118,18 @@ const GAP: usize = 3;
 /// The `Find: ` prompt drawn ahead of the well. Its width fixes where the well begins.
 const PROMPT: &str = "Find: ";
 
-/// The input well never shrinks below this many cells: the right side is dropped
-/// (indicators first, then the status) before the field is squeezed. Only a window
-/// narrower than `LEFT_PAD + PROMPT + MIN_FIELD + RIGHT_PAD` gets a shorter field.
+/// The input well never shrinks below this many cells: the right side is dropped first. Only
+/// a window narrower than `LEFT_PAD + PROMPT + MIN_FIELD + RIGHT_PAD` gets a shorter field.
 const MIN_FIELD: usize = 28;
 
-/// …and never grows past this: a 100-cell trough of terminal-coloured void reads as a
-/// hole, not a field. The surplus stays band, so the layout still breathes on a wide
-/// window.
+/// …and never grows past this: a wider trough reads as a hole, not a field.
 const MAX_FIELD: usize = 48;
 
-/// `[Aa] [.*]` — both toggles, bracketed so they read as controls at a fixed width in
-/// BOTH states (the ON state reverses the same 4 cells rather than resizing anything).
+/// `[Aa] [.*]`: both toggles; the on state reverses the same cells.
 const IND_W: usize = 9;
 
-/// Cells reserved for the status readout, as a function of the WINDOW width only —
-/// never of the status text. That independence is the point: the well's geometry must
-/// not shift under the caret when the count changes from `1/3` to `no matches` while
-/// you are typing into it.
+/// Cells reserved for the status readout, from the window width only, so the well does not
+/// shift under the caret when the count changes.
 fn status_zone(cols: usize) -> usize {
     (cols / 6).clamp(6, 28)
 }
@@ -167,18 +137,15 @@ fn status_zone(cols: usize) -> usize {
 /// Shown dimmed in an empty well — the same affordance a native search field has.
 const PLACEHOLDER: &str = "search the screen + scrollback";
 
-/// Drawn in the well's edge cell when the query is scrolled past it, so a clipped
-/// query never masquerades as the whole query.
+/// Drawn in the well's edge cell when the query continues past it.
 const SCROLL_LEFT: char = '‹';
 const SCROLL_RIGHT: char = '›';
 
-/// The find state the panel paints — a value copy the splice takes under its disjoint
-/// borrow, so the pure builder needs no `App`/window handle.
+/// The find state the panel paints: a value copy, so the pure builder needs no `App`.
 pub(crate) struct FindBarView {
     pub query: String,
-    /// Edit position as a BYTE offset into `query` (the field's caret), matching
-    /// [`crate::app_search::SearchState::cursor`]. Clamped + floored to a char
-    /// boundary here, so a desynced value can never panic the painter.
+    /// The caret as a byte offset into `query`, matching
+    /// [`crate::app_search::SearchState::cursor`].
     pub cursor: usize,
     /// 1-based position of the current match (meaningful only when `total > 0`).
     pub idx: usize,
@@ -187,40 +154,27 @@ pub(crate) struct FindBarView {
     pub is_regex: bool,
     /// The query was an invalid regex (regex mode only) — shown as `bad regex`.
     pub regex_error: bool,
-    /// The count is a floor (`+`): older history went unsearched, the list hit the
-    /// match limit, or a rewrap held the history away. A zero-match is then never a
-    /// bare `no matches`.
+    /// The count is a floor (`+`): older history went unsearched, the match limit hit, a long
+    /// line was cut short, or a rewrap held the history away.
     pub truncated: bool,
-    /// How many of the newest lines the depth cap let the search read; `None` when
-    /// it read the whole buffer. A zero-match reads `no matches in newest 100,000
-    /// lines` where it fits.
+    /// How many of the newest lines the depth cap let the search read; `None` for the whole
+    /// buffer.
     pub searched_lines: Option<usize>,
     /// The list stopped at the match limit: `1/100000+ (match limit)`.
     pub match_capped: bool,
-    /// A regex scan could not finish some line within its budget, so the rest
-    /// of that line went unsearched: `3/7+ (long line partly searched)`.
+    /// A regex scan could not finish some line within its budget: `3/7+ (line cut short)`.
     pub cut_short: bool,
-    /// The terminal changed since `total` was counted — new output, a repaint, a
-    /// `clear` — and the search is deliberately NOT re-run per PTY batch (that is
-    /// one full scan per burst on the UI thread). The count is therefore a past
-    /// census of a screen that has since moved, so the bar marks it `…` instead
-    /// of asserting `1/6` at a window that now holds eight hits.
-    ///
-    /// Distinct from [`Self::truncated`] on purpose: `+` says "at least this
-    /// many", a floor; `…` says "this many, as of before the last output" and
-    /// can be wrong in EITHER direction. Both can hold at once (`1/6+…`).
+    /// The terminal changed since `total` was counted (`…`); it can hold with
+    /// [`Self::truncated`] (`1/6+…`).
     pub stale: bool,
-    /// The search ran while a rewrap held the session's history detached (design
-    /// ruling 237). The text may be there; the history is away. So a zero-match
-    /// is `none yet`/`rewrapping`, never `no matches`, at EVERY width, and the
-    /// query is not tinted as a failure. Implies [`Self::truncated`].
+    /// The search ran while a rewrap held the history detached: a miss is `none yet` /
+    /// `rewrapping`, never `no matches`, and not tinted. Implies [`Self::truncated`].
     pub history_away: bool,
 }
 
 impl FindBarView {
-    /// The caret's position as a CHARACTER index into the query (0..=len). Clamped to
-    /// the query and floored onto a char boundary: the painter must never panic on a
-    /// cursor that raced ahead of the text it was captured with.
+    /// The caret as a character index into the query, clamped and floored onto a char
+    /// boundary so a cursor that raced ahead of the text cannot panic the painter.
     fn cursor_chars(&self) -> usize {
         let mut byte = self.cursor.min(self.query.len());
         while byte > 0 && !self.query.is_char_boundary(byte) {
@@ -230,9 +184,8 @@ impl FindBarView {
     }
 }
 
-/// Where the painted panel put the things the mouse + the splice need to find again:
-/// the rows themselves, which one is the editable field, the clickable toggle spans,
-/// and the well geometry a click maps back into a caret position.
+/// The painted panel and the geometry the mouse and the splice need: the field row, the
+/// toggle spans, and the well a click maps back into a caret position.
 pub(crate) struct FindBarPaint {
     pub rows: Vec<Vec<RenderCell>>,
     /// Index within [`Self::rows`] of the row carrying the well + indicators.
@@ -249,9 +202,8 @@ pub(crate) struct FindBarPaint {
     pub close_cols: Option<Range<usize>>,
     /// Columns of the input well on the field row.
     pub field_cols: Range<usize>,
-    /// Character index of the query shown in the well's FIRST cell — the horizontal
-    /// scroll offset. `field_cols.start + (i − field_scroll)` is where character `i`
-    /// landed, so a click maps back to an edit position with no re-layout.
+    /// Character index of the query shown in the well's first cell (the horizontal scroll):
+    /// character `i` landed at `field_cols.start + (i − field_scroll)`.
     pub field_scroll: usize,
     /// The separator rule's tone, which the splice paints a [`FindSeam::BottomRail`]
     /// in, so the rail and the cell-drawn seams cannot disagree.
@@ -342,29 +294,15 @@ fn write_segs(row: &mut [RenderCell], cols: usize, mut col: usize, segs: &[Seg],
     }
 }
 
-/// The status readout, widest form that fits `zone` cells first: bad-regex, match
-/// position, or a (truncation-honest) no-match. `None` when the query is empty (panel
-/// just opened — nothing to report yet) or when even the shortest form won't fit.
-///
-/// The ANSWER outranks the ornament: the caller drops the `Aa`/`.*` indicators before
-/// it drops this, because a search that found nothing and one that found seven must
-/// never look identical.
+/// The status readout, widest form that fits `zone` cells first: bad regex, match position,
+/// or an honest no-match. `None` for an empty query or when even the shortest form won't
+/// fit. The caller drops the toggles before this.
 fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     if v.query.is_empty() {
         return None;
     }
-    // The qualifiers, in one place because every form below carries them and
-    // NO form is allowed to drop them to fit: a shortened count that has quietly
-    // shed its `+` or `…` is a bare assertion the bar knows is not true. The
-    // ladder therefore shortens the WORDS first (`100,000` to `100k`, then the
-    // marks alone), then drops the `i/` position (which the user can still read
-    // off the highlight), and never the marker.
-    //
-    // `+`: the count is a floor — the depth cap stopped the search (`newest
-    // 100,000 lines`), the list hit the match limit, a regex could not finish a
-    // long line (`long line partly searched`), or a rewrap held the history
-    // away. `…`: the terminal has changed since `total` was counted, so it is a
-    // past census and can be off in either direction.
+    // Each ladder shortens the words first (`100,000` to `100k`, then the marks alone), then
+    // drops the `i/` position, never a mark.
     let facts = crate::app_search::CountFacts {
         truncated: v.truncated,
         stale: v.stale,
@@ -382,12 +320,8 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
             true,
         )
     } else if v.history_away && v.total == 0 {
-        // RULING 237: the history is away for a rewrap, so nothing found is NOT
-        // a miss — the search runs again by itself at the re-attach. No form
-        // says `no matches`; the plain word `rewrapping` survives down to the
-        // narrowest status zone that shows anything, and the long form where it
-        // fits. Not the warn tone: nothing failed. (No `…`: that mark is the
-        // bar's word for "stale", and a result that re-runs itself is moot.)
+        // Not a miss while the history is away (module doc), so no `no matches` and no warn
+        // tone; no `…` either: a result that reruns itself is not stale.
         (
             vec![
                 crate::app_search::HISTORY_AWAY_NONE.to_string(),
@@ -407,13 +341,11 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
             parenthesized(&facts.none_words())
         )];
         if let Some(word) = facts.cut_short_word(true) {
-            // A regex could not finish a long line: the miss is not a census,
-            // and the bar's zone has room to say why.
+            // A regex could not finish a long line: the miss is not a census.
             forms.push(format!("no matches ({word}){stale_mark}"));
         }
         if let (Some(long), Some(short)) = (facts.depth(false), facts.depth(true)) {
-            // The depth cap stopped it: how far it searched outlives every
-            // other word, down to the bare mark.
+            // The depth cap stopped it: how far it searched outlives every other word.
             let short_count = short.trim_end_matches(" lines");
             forms.push(format!("none in {long}{stale_mark}"));
             forms.push(format!("none in {short}{stale_mark}"));
@@ -423,8 +355,7 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
         forms.push(format!("0 hits{mark}"));
         (forms, c.warn, false)
     } else {
-        // Hits: the cause where it fits (`match limit`, `newest 100,000 lines`,
-        // `rewrapping`, `stale`), then the marks alone.
+        // Hits: the cause where it fits, then the marks alone.
         use crate::app_search::parenthesized;
         let (i, n, plus) = (v.idx, v.total, facts.plus());
         (
@@ -444,9 +375,8 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
         .map(|text| seg(text, fg, bold))
 }
 
-/// The `[Aa]` / `[.*]` toggle indicators. Bracketed so they read as CONTROLS, and
-/// REVERSED (ink and ground swapped) when active — a state you can see across the
-/// window, at a width that never changes as it flips, so nothing reflows on a toggle.
+/// The `[Aa]` / `[.*]` toggles: bracketed so they read as controls, reversed when active, at
+/// a width that never changes as they flip.
 fn indicator_segs(v: &FindBarView, c: &BandColors) -> Vec<Seg> {
     let toggle = |text: &str, on: bool| {
         let mut s = seg(text, if on { c.bar_bg } else { c.label }, on);
@@ -551,11 +481,9 @@ fn hint_text(cols: usize) -> &'static str {
     TINY
 }
 
-/// Build the find panel: `height` rows, each exactly `cols` cells wide (so the splice
-/// overwrites whole grid rows in place). `height` is normally [`FIND_BAR_ROWS`]; a
-/// terminal too short degrades gracefully — 2 rows drop the pad, 1 row keeps only the
-/// field. Pure + width-clamped: an over-long query, status or hint is truncated, never
-/// panics, and every returned row is exactly `cols` long.
+/// Build the find panel: `height` rows (normally [`FIND_BAR_ROWS`]; fewer drop the pad,
+/// then the hints), each exactly `cols` cells wide so the splice overwrites whole grid rows.
+/// Over-long text is truncated, never a panic.
 ///
 /// `seam` places the thin separator rule on the edge that faces the terminal content
 /// ([`FindSeam`]): along the band's bottom edge when the panel sits at the TOP (content
@@ -829,19 +757,13 @@ fn query_ink(v: &FindBarView, c: &BandColors) -> [u8; 3] {
     }
 }
 
-/// Paint the input WELL: a recessed run of cells (the terminal's own background)
-/// holding the visible slice of the query, with a REVERSE-VIDEO block caret on the
-/// character at the edit position — the terminal's own cursor idiom, so the caret costs
-/// no cell and the text never shifts when it moves. Returns the horizontal scroll (the
-/// character index shown in the well's first cell).
+/// Paint the input well: the visible slice of the query on the terminal's own background,
+/// with a reverse-video block caret at the edit position (no cell cost, no text shift).
+/// Returns the horizontal scroll (the character index in the well's first cell).
 ///
-/// The view scrolls the minimum needed to keep the caret inside, preferring to show as
-/// much trailing text as fits — so typing past the right edge scrolls the text while
-/// the caret stays put, and ^A jumps the view back to the head, exactly like a native
-/// single-line field. `‹`/`›` mark an edge the query continues past.
-///
-/// A search that FOUND NOTHING tints the query itself with the warn tone: the answer
-/// belongs where the eye already is, not only in a readout at the far side of the row.
+/// The view scrolls the minimum needed to keep the caret inside, preferring trailing text,
+/// like a native single-line field; `‹`/`›` mark an edge the query continues past. A failed
+/// search tints the query with the warn tone.
 fn paint_well(
     row: &mut [RenderCell],
     v: &FindBarView,
@@ -877,8 +799,7 @@ fn paint_well(
             break;
         }
     }
-    // An empty field says what it searches, dimmed, after the caret — the native
-    // search-field affordance, and the honest answer to "does this search history?".
+    // An empty field says what it searches, dimmed, after the caret.
     if chars.is_empty() && width >= PLACEHOLDER.chars().count() + 2 {
         write_str(
             row,
@@ -890,8 +811,7 @@ fn paint_well(
             false,
         );
     }
-    // Clipped-edge markers, never over the caret (the caret's cell is the one place the
-    // user is looking, and it already proves where the edit position is).
+    // Clipped-edge markers, never over the caret.
     if scroll > 0 && cursor != scroll {
         row[field.start] = chrome_band::cell(SCROLL_LEFT, c.label, c.field_bg, false, false);
     }
@@ -899,12 +819,8 @@ fn paint_well(
     if last < chars.len() && cursor != last {
         row[field.end - 1] = chrome_band::cell(SCROLL_RIGHT, c.label, c.field_bg, false, false);
     }
-    // BORDER, when the fill cannot carry the boundary. Stamped LAST so it covers every
-    // cell the passes above wrote — text, caret, placeholder and edge markers alike —
-    // and applied only where `band_colors` says the well and the band share a tone
-    // (every Windows High-Contrast scheme; no theme-derived one). Without it an HC
-    // user sees an editable field with no edge at all: the fill is the only thing this
-    // well ever drew to say "you can type here". See [`BandColors::well_rule`].
+    // A border where the fill cannot carry the boundary (`well_rule`: every Windows
+    // High-Contrast scheme). Stamped last so it covers every cell written above.
     if let Some(rule) = c.well_rule {
         for cell in &mut row[field] {
             cell.underline = aterm_core::terminal::UnderlineStyle::Single;
@@ -914,11 +830,8 @@ fn paint_well(
     scroll
 }
 
-/// Where the field row's three pieces land. The WELL's geometry is a function of `cols`
-/// alone — the status is right-aligned inside a reserved zone whose width comes from
-/// [`status_zone`], never from the status text — so the field cannot resize under the
-/// caret as the match count changes while you type. The SINGLE source of the row's
-/// geometry, so the click hit-test can never drift from the paint.
+/// Where the field row's pieces land: the single source of the row's geometry, so the click
+/// hit-test cannot drift from the paint. The well depends on `cols` alone ([`status_zone`]).
 struct FieldLayout {
     well: Range<usize>,
     /// `(start_col, segs)` of the `[Aa] [.*]` run, when it fits.
@@ -991,8 +904,8 @@ fn toolbar_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usiz
 fn field_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize) -> FieldLayout {
     let zone = status_zone(cols);
     let room = cols.saturating_sub(well_start + RIGHT_PAD);
-    // Widest reserve the window can afford while the well keeps MIN_FIELD cells. The
-    // ANSWER (status) outranks the toggles: the indicators go first.
+    // Widest reserve the window can afford while the well keeps MIN_FIELD cells; the
+    // indicators go before the status.
     let (reserve, with_indicators) = if room >= MIN_FIELD + GAP + zone + 1 + IND_W {
         (GAP + zone + 1 + IND_W, true)
     } else if room >= MIN_FIELD + GAP + zone {
@@ -1020,8 +933,8 @@ fn field_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize)
     if with_indicators {
         layout.indicators = Some((indicator_start, indicator_segs(v, c)));
     }
-    // The status sits in the `zone` cells left of the indicators (or of the right
-    // margin when they were dropped), right-aligned so the readout hugs one fixed edge.
+    // The status is right-aligned in the `zone` cells left of the indicators (or of the
+    // right margin when they were dropped).
     let status_right = if with_indicators {
         indicator_start.saturating_sub(1)
     } else {
@@ -1844,8 +1757,7 @@ mod tests {
         row.iter().map(|cell| cell.ch).collect()
     }
 
-    /// The whole panel as one string (rows joined) — for content assertions that don't
-    /// care which row a run landed on.
+    /// The whole panel as one string, rows joined.
     fn all(p: &FindBarPaint) -> String {
         p.rows
             .iter()
@@ -1914,8 +1826,7 @@ mod tests {
         }
     }
 
-    /// The caret is a REVERSE-VIDEO block on the character at the edit position — it
-    /// costs no cell, so the text never shifts as it moves (the phantom-space bug).
+    /// The caret is a reverse-video block that costs no cell, so the text never shifts.
     #[test]
     fn caret_is_a_block_that_does_not_move_the_text() {
         let cols = 90;
@@ -1957,9 +1868,7 @@ mod tests {
         );
     }
 
-    /// A query longer than the well scrolls horizontally so the caret stays visible —
-    /// at the end (tail shown), at the start (head shown), and in between — and the
-    /// clipped edges are MARKED, so a truncated query never reads as the whole query.
+    /// An overlong query scrolls to keep the caret visible, with the clipped edges marked.
     #[test]
     fn overlong_query_scrolls_to_the_caret() {
         let cols = 90;
@@ -2576,7 +2485,7 @@ mod tests {
                             && cell.underline_color == c.well_rule),
                     "{name}: the well must carry an unbroken border, caret cell included"
                 );
-                // And it must stop AT the well: the band around it is not a field.
+                // It stops at the well: the band around it is not a field.
                 assert_eq!(
                     p.rows[p.field_row][p.field_cols.start - 1].underline,
                     UnderlineStyle::None,
@@ -2689,15 +2598,11 @@ mod tests {
         assert!(row.contains("1/3+"), "{row}");
     }
 
-    /// A count is painted BARE only when it is an exact census of the present
-    /// screen. Output since the count marks it `…`; a capped index marks it `+`;
-    /// both mark it `+…`. And no width sheds a marker to fit — the ladder gives
-    /// up the `i/` position first, because a shortened `1/6` that has quietly
-    /// dropped its qualifier is the exact lie this marker exists to prevent.
+    /// A count is painted bare only when it is an exact census: output since marks it `…`, a
+    /// floor `+`, both `+…`, and no width sheds a marker to fit.
     #[test]
     fn a_count_the_screen_has_moved_past_is_never_painted_bare() {
-        // The STATUS row only: the key-hint row spells `Ctrl+S`, and a `+` there
-        // is not a qualifier.
+        // The status row only: the hint row spells `Ctrl+S`, and a `+` there is not a qualifier.
         let status_row = |v: &FindBarView, cols: usize| {
             let p = paint(v, cols);
             text(&p.rows[p.field_row])
@@ -2720,11 +2625,8 @@ mod tests {
             stale: true,
             ..view("needle")
         };
-        // Wherever the exact form finds room to state a number, the qualified
-        // form finds room to qualify it — the ladder shortens the POSITION, not
-        // the marker. (A window too narrow for any status at all paints none;
-        // that is the pre-existing "even the shortest form won't fit" arm, and
-        // saying nothing is not a false claim.)
+        // Wherever the exact form has room for a number, the qualified form keeps its mark
+        // (a window too narrow for any status paints none).
         let mut widths_checked = 0;
         for cols in [40usize, 50, 60, 72, 90, 140, 200] {
             if !status_row(&counted, cols).contains("1/6") {
@@ -2761,9 +2663,8 @@ mod tests {
         assert!(narrow.contains('…'), "{narrow}");
     }
 
-    /// Every width × height stays exactly `cols` wide and never panics — including a
-    /// query far wider than the row, a zero-width window, and the degraded 1/2-row
-    /// bands a very short terminal gets.
+    /// Every width × height (zero-width, degraded 1/2-row, overlong query) stays exactly
+    /// `cols` wide and never panics.
     #[test]
     fn narrow_short_and_overlong_never_panic() {
         for cols in [0usize, 1, 4, 8, 12, 20, 40, 200] {
@@ -2798,8 +2699,7 @@ mod tests {
         assert!(text(&one.rows[0]).contains("kept"));
     }
 
-    /// A multi-byte query is painted (and scrolled) by CHARACTER, and a cursor that
-    /// lands mid-codepoint is floored rather than panicking.
+    /// A multi-byte query is painted and scrolled by character; a mid-codepoint cursor floors.
     #[test]
     fn multibyte_query_is_char_indexed() {
         let cols = 90;

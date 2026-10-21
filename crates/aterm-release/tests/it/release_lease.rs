@@ -152,9 +152,8 @@ impl GitRunner for FenceProbeBarrier {
     }
 }
 
-/// Pause both publishers only after each captured the same absent-ref answer.
-/// Their subsequent pushes therefore exercise the remote's real atomic
-/// create behavior rather than a conveniently serialized test schedule.
+/// Pause both publishers after each saw the same absent ref, so the remote's atomic create,
+/// not the test schedule, picks the winner.
 struct FirstProbeBarrier {
     inner: Git,
     barrier: Arc<Barrier>,
@@ -419,8 +418,7 @@ fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
         fence.token()
     );
 
-    // Fixture cleanup deliberately bypasses production APIs after proving the
-    // incoherent state was left untouched.
+    // Cleanup bypasses the production APIs, which refuse this incoherent state.
     command(&repo, &["push", "origin", &format!(":{RELEASE_LEASE_REF}")]);
     command(
         &repo,
@@ -430,9 +428,7 @@ fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
 
 #[test]
 fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
-    // Format 6 admitted one dirty state: the exact cask pin written/staged by a
-    // crash mid-`step_cask`. Format 7 removed that step, so recovery now admits
-    // NOTHING — a clean tree passes and any dirty path at all fails closed.
+    // Recovery admits no dirty state: a clean tree passes, any dirty path fails closed.
     let fixture = bare_fixture("clean-tree-recovery");
     let repo = fixture.repo_a.clone();
     std::fs::write(repo.join(".gitignore"), "dist/\n").unwrap();

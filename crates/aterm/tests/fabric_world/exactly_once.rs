@@ -393,7 +393,7 @@ fn a_deduped_first_send_is_a_collision_that_rolls_the_incarnation() {
     // incarnation LEASE, `aterm-link`'s `state.rs`): the reattach takes the next.
     let inc = aterm_link::state::StateDir::peek(&w.state).incarnation();
     assert!(inc >= 1, "the bridge attached under an incarnation");
-    let claimed = ((inc + 1) << 32) + 1;
+    let claimed = astream_broker::incarnation_base(inc + 1).expect("within the layout") + 1;
     let scratch = w.tmp.join("claim.sock");
     let (claimed_off, deduped) = {
         let broker = astream_broker::Broker::open_guarded(&w.broker_log, harness::SECRET.to_vec())

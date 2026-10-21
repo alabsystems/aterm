@@ -10,7 +10,10 @@
 // the loop, as `EventLoopError::DisplayLost` when its transport failed and as an error of its
 // own when libxcb closed it: `end_if_connection_lost`. The server is spoken to through
 // first-party `aterm-x11` and the loop waits in `common::poll`, where upstream used x11rb,
-// x11-dl and calloop: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
+// x11-dl and calloop: docs/AUDIT-third-party-2026-10-15.md, LW.7. No failed request panics:
+// a request the backend makes for the application reports its failure (`XConnection::report`),
+// and one the loop makes to start ends it with an error, the display's loss when it has gone:
+// X11-GONE.)
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -30,21 +33,23 @@ use tracing::warn;
 
 use crate::error::{EventLoopError, OsError as RootOsError};
 use crate::event::{Event, StartCause, WindowEvent};
-use crate::event_loop::{ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents, EventLoopClosed};
+use crate::event_loop::{ActiveEventLoop as RootAEL, ControlFlow, EventLoopClosed};
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::common::poll::{self, Waker};
 use crate::platform_impl::common::xkb::Context;
 use crate::platform_impl::platform::{min_timeout, WindowId};
-use crate::platform_impl::{
-    ActiveEventLoop as PlatformActiveEventLoop, OsError, PlatformCustomCursor,
-};
-use crate::window::{CustomCursor as RootCustomCursor, CustomCursorSource, WindowAttributes};
+use crate::platform_impl::{ActiveEventLoop as PlatformActiveEventLoop, OsError};
+use crate::window::WindowAttributes;
 
 mod atoms;
 mod dnd;
 mod event_processor;
 pub mod ffi;
+#[cfg(all(test, target_os = "linux"))]
+mod gone_tests;
 mod ime;
+#[cfg(test)]
+mod level_tests;
 mod monitor;
 mod startup_notify;
 mod util;
@@ -52,13 +57,11 @@ mod window;
 mod xdisplay;
 mod xsettings;
 
-pub use util::CustomCursor;
-
 use atoms::*;
 use dnd::{Dnd, DndState};
 use event_processor::{EventProcessor, MAX_MOD_REPLAY_LEN};
 use ime::{Ime, ImeCreationError, ImeReceiver, ImeRequest, ImeSender};
-pub(crate) use monitor::{MonitorHandle, VideoModeHandle};
+pub(crate) use monitor::MonitorHandle;
 use window::UnownedWindow;
 pub(crate) use xdisplay::{XConnection, XError, XNotSupported};
 
@@ -139,7 +142,6 @@ pub struct ActiveEventLoop {
     ime: Option<RefCell<Ime>>,
     windows: RefCell<HashMap<WindowId, Weak<UnownedWindow>>>,
     redraw_sender: WakeSender<WindowId>,
-    device_events: Cell<DeviceEvents>,
 }
 
 pub struct EventLoop<T: 'static> {
@@ -165,15 +167,17 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
 }
 
 impl<T: 'static> EventLoop<T> {
-    pub(crate) fn new(xconn: Arc<XConnection>) -> EventLoop<T> {
+    /// The loop on `xconn`. A request it makes to set up that fails ends it here, as the
+    /// failure ([`startup_failure`]): a display that went while it started is
+    /// [`EventLoopError::DisplayLost`], where upstream's `expect`s panicked.
+    pub(crate) fn new(xconn: Arc<XConnection>) -> Result<EventLoop<T>, EventLoopError> {
         let root = xconn.default_root().root;
         let atoms = xconn.atoms();
 
         let wm_delete_window = atoms[WM_DELETE_WINDOW];
         let net_wm_ping = atoms[_NET_WM_PING];
 
-        let dnd = Dnd::new(Arc::clone(&xconn))
-            .expect("Failed to call XInternAtoms when initializing drag and drop");
+        let dnd = Dnd::new(Arc::clone(&xconn)).map_err(|e| startup_failure(&xconn, e))?;
 
         let (ime_sender, ime_receiver) = mpsc::channel();
         let (ime_event_sender, ime_event_receiver) = mpsc::channel();
@@ -210,29 +214,29 @@ impl<T: 'static> EventLoop<T> {
 
         let ime = ime.ok().map(RefCell::new);
 
-        let randr_event_offset =
-            xconn.select_xrandr_input(root).expect("Failed to query XRandR extension");
+        let failed = |e: X11Error| startup_failure(&xconn, e);
+        let randr_event_offset = xconn.select_xrandr_input(root).map_err(failed)?;
 
-        let xi2ext = xconn
-            .xcb_connection()
-            .extension(xinput::NAME)
-            .expect("Failed to query XInput extension")
-            .expect("X server missing XInput extension");
-        let xkbext = xconn
-            .xcb_connection()
-            .extension(xdisplay::XKB_EXTENSION_NAME)
-            .expect("Failed to query XKB extension")
-            .expect("X server missing XKB extension");
+        // `XConnection::new` refused a server without XInput 2 or XKB, so a missing one here
+        // is a server that changed under it.
+        let extension = |name: &'static [u8], missing: &'static str| {
+            xconn
+                .xcb_connection()
+                .extension(name)
+                .map_err(X11Error::from)
+                .and_then(|info| info.ok_or(X11Error::MissingExtension(missing)))
+                .map_err(failed)
+        };
+        let xi2ext = extension(xinput::NAME, "XInputExtension")?;
+        let xkbext = extension(xdisplay::XKB_EXTENSION_NAME, "XKEYBOARD")?;
 
         // Check for XInput2 support.
-        xconn
-            .request(xinput::xi_query_version(xi2ext.major_opcode, 2, 3))
-            .expect("Error while checking for XInput2 query version reply");
+        xconn.request(xinput::xi_query_version(xi2ext.major_opcode, 2, 3)).map_err(failed)?;
 
         xconn.update_cached_wm_info(root);
 
         // The loop waits on the X connection's socket and this waker.
-        let waker = Waker::new().expect("Failed to create event loop waker");
+        let waker = Waker::new().map_err(|e| failed(X11Error::Io(e)))?;
 
         // Create a channel for handling redraw requests.
         let (redraw_sender, redraw_channel) = mpsc::channel();
@@ -240,7 +244,10 @@ impl<T: 'static> EventLoop<T> {
         // Create a channel for sending user events.
         let (user_sender, user_channel) = mpsc::channel();
 
-        let xkb_context = Context::from_x11_xkb(xconn.xcb_connection().as_raw().as_ptr()).unwrap();
+        let xkb_context =
+            Context::from_x11_xkb(xconn.xcb_connection().as_raw().as_ptr()).map_err(|_| {
+                failed(X11Error::MissingExtension("XKEYBOARD (xkb_x11_setup_xkb_extension)"))
+            })?;
 
         let mut xmodmap = util::ModifierKeymap::new();
         xmodmap.reload_from_x_connection(&xconn);
@@ -259,11 +266,7 @@ impl<T: 'static> EventLoop<T> {
                 sender: redraw_sender, // not used again so no clone
                 waker: waker.clone(),
             },
-            device_events: Default::default(),
         };
-
-        // Set initial device event filter.
-        window_target.update_listen_device_events(true);
 
         let root_window_target =
             RootAEL { p: PlatformActiveEventLoop::X(window_target), _marker: PhantomData };
@@ -294,18 +297,19 @@ impl<T: 'static> EventLoop<T> {
 
         xconn
             .select_xinput_events(root, ALL_DEVICES, xinput::event_mask::HIERARCHY)
-            .expect_then_ignore_error("Failed to register for XInput2 device hotplug events");
+            .map_err(|e| startup_failure(xconn, e))?
+            .ignore_error();
 
         xconn
             .select_xkb_events(
                 ffi::XKB_USE_CORE_KBD, // Use the "core keyboard device"
                 XKB_NEW_KEYBOARD_NOTIFY_MASK | XKB_MAP_NOTIFY_MASK | XKB_STATE_NOTIFY_MASK,
             )
-            .unwrap();
+            .map_err(|e| startup_failure(xconn, e))?;
 
         event_processor.init_device(ALL_DEVICES);
 
-        EventLoop {
+        Ok(EventLoop {
             loop_running: false,
             failure: None,
             waker,
@@ -313,7 +317,7 @@ impl<T: 'static> EventLoop<T> {
             redraw_receiver: PeekableReceiver::from_recv(redraw_channel),
             user_receiver: PeekableReceiver::from_recv(user_channel),
             user_sender,
-        }
+        })
     }
 
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
@@ -412,12 +416,7 @@ impl<T: 'static> EventLoop<T> {
             return false;
         };
         if self.exit_code().is_none() {
-            self.failure = Some(match end {
-                xdisplay::ConnectionEnd::Transport(why) => EventLoopError::DisplayLost(why),
-                xdisplay::ConnectionEnd::Closed(error) => {
-                    EventLoopError::Os(os_error!(OsError::XError(Arc::new(X11Error::X11(error)))))
-                },
-            });
+            self.failure = Some(connection_ended(end));
             self.set_exit_code(1);
         }
         true
@@ -620,6 +619,26 @@ impl<T: 'static> EventLoop<T> {
     }
 }
 
+/// What a run ends with once its connection ended: [`EventLoopError::DisplayLost`] when its
+/// transport failed, libxcb's error when it closed the connection for a reason of its own.
+fn connection_ended(end: xdisplay::ConnectionEnd) -> EventLoopError {
+    match end {
+        xdisplay::ConnectionEnd::Transport(why) => EventLoopError::DisplayLost(why),
+        xdisplay::ConnectionEnd::Closed(error) => {
+            EventLoopError::Os(os_error!(OsError::XError(Arc::new(X11Error::X11(error)))))
+        },
+    }
+}
+
+/// What a request that failed while the loop started ends it with: the connection's end when
+/// it has ended ([`connection_ended`]), as a running loop's would be; else the failure itself.
+fn startup_failure(xconn: &XConnection, error: impl Into<X11Error>) -> EventLoopError {
+    match xconn.connection_end(false) {
+        Some(end) => connection_ended(end),
+        None => EventLoopError::Os(os_error!(OsError::XError(Arc::new(error.into())))),
+    }
+}
+
 impl ActiveEventLoop {
     /// Returns the `XConnection` of this events loop.
     #[inline]
@@ -633,33 +652,6 @@ impl ActiveEventLoop {
 
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
         self.xconn.primary_monitor().ok()
-    }
-
-    pub(crate) fn create_custom_cursor(&self, cursor: CustomCursorSource) -> RootCustomCursor {
-        RootCustomCursor { inner: PlatformCustomCursor::X(CustomCursor::new(self, cursor.inner)) }
-    }
-
-    pub fn listen_device_events(&self, allowed: DeviceEvents) {
-        self.device_events.set(allowed);
-    }
-
-    /// Update the device event based on window focus.
-    pub fn update_listen_device_events(&self, focus: bool) {
-        let device_events = self.device_events.get() == DeviceEvents::Always
-            || (focus && self.device_events.get() == DeviceEvents::WhenFocused);
-
-        let mut mask = 0;
-        if device_events {
-            mask = xinput::event_mask::RAW_MOTION
-                | xinput::event_mask::RAW_BUTTON_PRESS
-                | xinput::event_mask::RAW_BUTTON_RELEASE
-                | xinput::event_mask::RAW_KEY_PRESS
-                | xinput::event_mask::RAW_KEY_RELEASE;
-        }
-
-        self.xconn
-            .select_xinput_events(self.root, ALL_MASTER_DEVICES, mask)
-            .expect_then_ignore_error("Failed to update device event filter");
     }
 
     #[cfg(feature = "rwh_06")]
@@ -805,9 +797,6 @@ pub enum X11Error {
     /// An extension that we rely on is not available.
     MissingExtension(&'static str),
 
-    /// Could not find a matching X11 visual for this visualid
-    NoSuchVisual(xproto::Visualid),
-
     /// Unable to parse xsettings.
     XsettingsParse(xsettings::ParserError),
 
@@ -826,9 +815,6 @@ impl fmt::Display for X11Error {
             X11Error::X11(e) => write!(f, "X11 error: {e}"),
             X11Error::UnexpectedNull(s) => write!(f, "Xlib function returned null: {s}"),
             X11Error::MissingExtension(s) => write!(f, "Missing X11 extension: {s}"),
-            X11Error::NoSuchVisual(visualid) => {
-                write!(f, "Could not find a matching X11 visual for ID `{visualid:x}`")
-            },
             X11Error::XsettingsParse(err) => {
                 write!(f, "Failed to parse xsettings: {err:?}")
             },
@@ -894,15 +880,48 @@ impl IgnoreError for VoidCookie<'_> {
     fn ignore_error(self) {}
 }
 
-/// Extension trait for `Result<VoidCookie, E>`.
-trait CookieResultExt {
-    /// Unwrap the send error and ignore the result.
-    fn expect_then_ignore_error(self, msg: &str);
+impl XConnection {
+    /// A request the backend made for the application failed (`what`, the error): it goes to
+    /// stderr, unless the connection is broken. Nothing here ends the process: a request to a
+    /// display that has gone fails, and the event loop's next look at the connection ends the
+    /// run with the loss (`EventLoop::end_if_connection_lost`, `EventLoopError::DisplayLost`),
+    /// which says how it went, so a broken connection's failures say nothing more. Upstream
+    /// unwrapped these, and a display lost between two of the loop's looks panicked whoever
+    /// asked (the Linux lane, 2026-10-20: the crash journal's `outer_position` at
+    /// `XTranslateCoordinates`, `docs/LINUX-RUNTIME-LANE.md`, "The display gone"). The line
+    /// is stderr's, not `tracing`'s, for the reason `EventLoop::run_on_demand` gives.
+    pub(crate) fn report(&self, what: &str, error: impl fmt::Display) {
+        if !self.is_broken() {
+            eprintln!("aterm-window: {what}: {error}");
+        }
+    }
 }
 
-impl<E: fmt::Debug> CookieResultExt for Result<VoidCookie<'_>, E> {
-    fn expect_then_ignore_error(self, msg: &str) {
-        self.expect(msg).ignore_error()
+/// Extension trait for `Result<VoidCookie, E>`.
+trait CookieResultExt {
+    /// Ignore the request's reply as [`IgnoreError::ignore_error`] does; a request that could
+    /// not be sent is [`XConnection::report`]ed as `what`.
+    fn ignore_error_or_report(self, xconn: &XConnection, what: &str);
+}
+
+impl<E: fmt::Display> CookieResultExt for Result<VoidCookie<'_>, E> {
+    fn ignore_error_or_report(self, xconn: &XConnection, what: &str) {
+        match self {
+            Ok(cookie) => cookie.ignore_error(),
+            Err(error) => xconn.report(what, error),
+        }
+    }
+}
+
+/// Extension trait for a request's `Result`.
+trait ReportExt<T> {
+    /// The value, or `None` once the failure is [`XConnection::report`]ed as `what`.
+    fn or_report(self, xconn: &XConnection, what: &str) -> Option<T>;
+}
+
+impl<T, E: fmt::Display> ReportExt<T> for Result<T, E> {
+    fn or_report(self, xconn: &XConnection, what: &str) -> Option<T> {
+        self.map_err(|error| xconn.report(what, error)).ok()
     }
 }
 

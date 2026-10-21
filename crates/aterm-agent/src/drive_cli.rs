@@ -1400,8 +1400,7 @@ mod tests {
         }
     }
 
-    /// The ledger needs a worker: the `@sid` given, or the one the journal's
-    /// own lines name (and nothing to go on is an actionable error).
+    /// The ledger's worker is the `@sid` given, else the one the journal's lines name.
     #[test]
     fn the_ledger_takes_its_worker_from_the_journal_when_none_is_named() {
         let dir = std::env::temp_dir().join(format!("aterm-drive-ledger-{}", std::process::id()));

@@ -1,0 +1,344 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The client frame's oracle recorder (L-HEADER-LW7 of
+//! docs/AUDIT-third-party-2026-10-15.md, lw5-button-layout-shadow), built
+//! outside the aterm workspace (see Cargo.toml): sctk-adwaita 0.10.1's own
+//! `buttons.rs`, `config.rs`, `theme.rs` and `shadow.rs` (MIT, Copyright (c)
+//! 2022 Bartłomiej Maryńczak, copied from the registry by build.rs) answer,
+//! and aterm-gui's `client_frame` is held to the committed rows.
+//!
+//!   layout   for a `button-layout` value (or none: no portal), what
+//!            `config::get_button_layout_config` read through `dbus-send`
+//!            and where `Buttons` put each button once the compositor's
+//!            capabilities (`update_buttons(maximize, minimize)`) filtered
+//!            them, read back by `find_button` across an 800 px header
+//!   shadow   the alpha `Shadow::draw` paints across each border part (the
+//!            parts sctk-adwaita placed outside the window), at scale 1 and
+//!            2, focused and not, along the part's middle line from the
+//!            window outward
+//!   size     the frame's sizes in logical px (theme.rs, shadow.rs)
+//!
+//! `record planes` prints the other recording instead, for aterm-window's
+//! carved shadow (crates/aterm-window/tests/recorded/
+//! sctk-adwaita-0.10.1-shadow.tsv):
+//!
+//!   plane    every pixel `Shadow::draw` paints into one border part's
+//!            buffer (premultiplied RGBA, as tiny-skia lays it out), as an
+//!            FNV-1a 64 of the bytes, beside its alpha summed and the
+//!            buffer's size, for a window's size, scale and focus
+//!
+//! A row is tab-separated: its kind, then `name=value` fields in a fixed
+//! order; `-` for none.
+
+#![allow(dead_code, unused_imports, mismatched_lifetime_syntaxes, clippy::all)]
+
+mod buttons {
+    include!(concat!(env!("OUT_DIR"), "/buttons.rs"));
+}
+mod config {
+    include!(concat!(env!("OUT_DIR"), "/config.rs"));
+}
+mod theme {
+    include!(concat!(env!("OUT_DIR"), "/theme.rs"));
+}
+mod shadow {
+    include!(concat!(env!("OUT_DIR"), "/shadow.rs"));
+}
+
+/// parts.rs's part numbers (parts.rs itself makes subsurfaces through
+/// smithay-client-toolkit, which this recorder does not build).
+mod parts {
+    pub struct DecorationParts;
+    impl DecorationParts {
+        pub const TOP: usize = 0;
+        pub const LEFT: usize = 1;
+        pub const RIGHT: usize = 2;
+        pub const BOTTOM: usize = 3;
+        pub const HEADER: usize = 4;
+    }
+}
+
+/// The two smithay-client-toolkit (wayland-csd-frame 0.3.0) types
+/// `buttons.rs` names, with that crate's bits for the flags it reads.
+mod smithay_client_toolkit {
+    pub mod reexports {
+        pub mod csd_frame {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            pub struct WindowState(u16);
+            impl WindowState {
+                pub const MAXIMIZED: Self = Self(0b0000_0000_0000_0001);
+                pub fn contains(&self, other: Self) -> bool {
+                    self.0 & other.0 == other.0
+                }
+            }
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            pub struct WindowManagerCapabilities(u16);
+            impl WindowManagerCapabilities {
+                pub const MAXIMIZE: Self = Self(0b0000_0000_0000_0010);
+                pub const MINIMIZE: Self = Self(0b0000_0000_0000_1000);
+                pub fn contains(&self, other: Self) -> bool {
+                    self.0 & other.0 == other.0
+                }
+            }
+        }
+    }
+}
+
+/// pointer.rs's `Location`, as it is defined there (pointer.rs itself
+/// needs the frame's whole state machine).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum Location {
+    #[default]
+    None,
+    Head,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+    TopLeft,
+    Button(buttons::ButtonKind),
+}
+
+/// lib.rs's alias.
+type SkiaResult = Option<()>;
+
+use std::path::PathBuf;
+
+/// The header width the layout is read across, wide enough that no button
+/// of one side overlaps the other's.
+const HEADER_W: u32 = 800;
+
+/// The values the `layout` rows read: GNOME's default, the common ones, and
+/// what the parse makes of odd ones (spaces, a lone side, too many buttons,
+/// repeats, unknown names, empty sides, three sides).
+const VALUES: &[&str] = &[
+    "appmenu:close",
+    "appmenu:minimize,maximize,close",
+    "close,minimize,maximize:",
+    "close:",
+    ":close",
+    "minimize,maximize,close:appmenu",
+    "close,maximize,minimize:menu",
+    "icon:minimize,maximize,close",
+    "menu:minimize, maximize ,close",
+    "minimize,maximize,close",
+    ":",
+    "",
+    "appmenu:",
+    "appmenu:spacer",
+    "close:close",
+    "maximize:minimize",
+    "minimize:maximize:close",
+    "appmenu,close,minimize,maximize:",
+    ":appmenu,close,minimize,maximize",
+    ":close,close,close,close",
+    "Close:Minimize",
+    "close,minimize,maximize:minimize,maximize,close",
+];
+
+fn kind_name(k: buttons::ButtonKind) -> &'static str {
+    match k {
+        buttons::ButtonKind::Close => "close",
+        buttons::ButtonKind::Maximize => "maximize",
+        buttons::ButtonKind::Minimize => "minimize",
+    }
+}
+
+/// What `config::get_button_layout_config` reads with `value` set (`None`:
+/// no portal), through this crate's `dbus-send` first on PATH.
+fn read_config(value: Option<&str>, fake_dir: &std::path::Path) -> Option<(String, String)> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![fake_dir.to_path_buf()];
+    dirs.extend(std::env::split_paths(&path));
+    // The child `config.rs` spawns inherits both (the recorder is one thread).
+    std::env::set_var("PATH", std::env::join_paths(dirs).expect("PATH"));
+    match value {
+        Some(v) => std::env::set_var("RECORDER_BUTTON_LAYOUT", v),
+        None => std::env::remove_var("RECORDER_BUTTON_LAYOUT"),
+    }
+    let read = config::get_button_layout_config();
+    std::env::set_var("PATH", path);
+    read
+}
+
+fn join(v: &[&str]) -> String {
+    if v.is_empty() {
+        "-".into()
+    } else {
+        v.join(",")
+    }
+}
+
+/// The window sizes (logical px) the `plane` rows draw the parts of: the
+/// lane's Mutter window, the profile rows' window, a full output, an odd
+/// size, and one smaller than the shadow's corners.
+const PLANE_SIZES: &[(u32, u32)] = &[(744, 528), (400, 300), (1280, 800), (401, 299), (30, 20)];
+
+/// FNV-1a 64.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The `plane` rows: each border part's buffer as aterm draws its parts
+/// around a `w`×`h` window (no separate header: the top and bottom parts
+/// span the window and both borders, the sides the window's height).
+fn planes() {
+    let depth = theme::BORDER_SIZE;
+    for &(w, h) in PLANE_SIZES {
+        for (name, idx) in [
+            ("top", parts::DecorationParts::TOP),
+            ("left", parts::DecorationParts::LEFT),
+            ("right", parts::DecorationParts::RIGHT),
+            ("bottom", parts::DecorationParts::BOTTOM),
+        ] {
+            for scale in [1u32, 2, 3] {
+                for active in [true, false] {
+                    let (pw, ph) = match idx {
+                        parts::DecorationParts::TOP | parts::DecorationParts::BOTTOM => {
+                            (w + 2 * depth, depth)
+                        }
+                        _ => (depth, h),
+                    };
+                    let (pw, ph) = (pw * scale, ph * scale);
+                    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).expect("a part's pixmap");
+                    let mut shadow = shadow::Shadow::default();
+                    shadow.draw(&mut pixmap.as_mut(), scale, active, idx);
+                    let alpha: u64 = pixmap.pixels().iter().map(|p| u64::from(p.alpha())).sum();
+                    println!(
+                        "plane\tpart={name}\twindow={w}x{h}\tscale={scale}\tactive={}\tbuffer={pw}x{ph}\talpha_sum={alpha}\tfnv={:016x}",
+                        u8::from(active),
+                        fnv(pixmap.data()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("planes") {
+        planes();
+        return;
+    }
+    let fake_dir: PathBuf = std::env::current_exe()
+        .expect("current_exe")
+        .parent()
+        .expect("the binaries' directory")
+        .to_path_buf();
+    assert!(
+        fake_dir.join("dbus-send").is_file(),
+        "build the dbus-send stand-in first (`targo --unverified build --release --locked`)"
+    );
+    let mut values: Vec<Option<&str>> = vec![None];
+    values.extend(VALUES.iter().copied().map(Some));
+    for value in values {
+        let read = read_config(value, &fake_dir);
+        let read_s = match &read {
+            Some((l, r)) => format!("{l}|{r}"),
+            None => "-".into(),
+        };
+        for (max, min) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut b = buttons::Buttons::new(read.clone());
+            b.update_buttons(max, min);
+            b.arrange(HEADER_W, 0.0);
+            let (left, right) = sides(&b);
+            println!(
+                "layout\tvalue={}\tread={read_s}\tmaximize={}\tminimize={}\tleft={}\tright={}",
+                value.map_or("<no portal>".to_string(), |v| format!("{v:?}")),
+                u8::from(max),
+                u8::from(min),
+                join(&left),
+                join(&right),
+            );
+        }
+    }
+    for part in [
+        ("top", parts::DecorationParts::TOP),
+        ("left", parts::DecorationParts::LEFT),
+        ("right", parts::DecorationParts::RIGHT),
+        ("bottom", parts::DecorationParts::BOTTOM),
+    ] {
+        for scale in [1u32, 2] {
+            for active in [true, false] {
+                println!(
+                    "shadow\tpart={}\tscale={scale}\tactive={}\talpha={}",
+                    part.0,
+                    u8::from(active),
+                    profile(part.1, scale, active)
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+    }
+    println!(
+        "size\tshadow={}\tvisible_border={}\tborder={}\theader={}\tcorner_radius={}\tresize_handle={}\tresize_handle_corner={}",
+        shadow::SHADOW_SIZE,
+        theme::VISIBLE_BORDER_SIZE,
+        theme::BORDER_SIZE,
+        theme::HEADER_SIZE,
+        theme::CORNER_RADIUS,
+        theme::RESIZE_HANDLE_SIZE,
+        theme::RESIZE_HANDLE_CORNER_SIZE,
+    );
+}
+
+/// The buttons on each side, left to right, as `find_button` answers across
+/// the header's button row: each run of one button's pixels is one button, a
+/// run left of the middle on the left side.
+fn sides(b: &buttons::Buttons) -> (Vec<&'static str>, Vec<&'static str>) {
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    let mut last = Location::None;
+    // The row's middle (BUTTON_MARGIN 5 + half of BUTTON_SIZE 24).
+    let y = 17.0;
+    for x in 0..HEADER_W {
+        let at = b.find_button(f64::from(x) + 0.5, y);
+        if at != last {
+            if let Location::Button(k) = at {
+                if x < HEADER_W / 2 {
+                    left.push(kind_name(k));
+                } else {
+                    right.push(kind_name(k));
+                }
+            }
+        }
+        last = at;
+    }
+    (left, right)
+}
+
+/// The alpha `Shadow::draw` paints across part `idx` of a 400×300 window,
+/// from the window's edge outward, along the part's middle line (past the
+/// corners). A part is `theme::BORDER_SIZE` deep and as long as
+/// `parts.rs`'s `resize` makes it: the top and bottom the window's width
+/// and both borders, the sides the window's height and the header's.
+fn profile(idx: usize, scale: u32, active: bool) -> Vec<u8> {
+    let (w, h) = (400u32, 300u32);
+    let depth = theme::BORDER_SIZE;
+    let (pw, ph) = match idx {
+        parts::DecorationParts::TOP | parts::DecorationParts::BOTTOM => (w + 2 * depth, depth),
+        _ => (depth, h + theme::HEADER_SIZE),
+    };
+    let (pw, ph) = (pw * scale, ph * scale);
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).expect("a part's pixmap");
+    let mut shadow = shadow::Shadow::default();
+    shadow.draw(&mut pixmap.as_mut(), scale, active, idx);
+    let at = |x: u32, y: u32| pixmap.pixels()[(y * pw + x) as usize].alpha();
+    let d = depth * scale;
+    match idx {
+        // The top part's bottom row meets the header.
+        parts::DecorationParts::TOP => (0..d).map(|i| at(pw / 2, ph - 1 - i)).collect(),
+        // The left part's right column meets the window.
+        parts::DecorationParts::LEFT => (0..d).map(|i| at(pw - 1 - i, ph / 2)).collect(),
+        parts::DecorationParts::RIGHT => (0..d).map(|i| at(i, ph / 2)).collect(),
+        _ => (0..d).map(|i| at(pw / 2, i)).collect(),
+    }
+}

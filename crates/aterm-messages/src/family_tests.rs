@@ -228,8 +228,9 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
     // The level families are the ones whose reporters state their whole answer
     // (the upgrade's and the resume loop's looks, the AI CLIs' look — each
     // states every CLI that needs a person — the need publication's API
-    // outage, the window's long holds, the fleet glance's read); everything
-    // else raises by event and is never swept.
+    // outage, the window's long holds, the fleet glance's read, the disk
+    // walker's raised huge folders); everything else raises by event and is
+    // never swept.
     let level: Vec<Family> = all
         .into_iter()
         .filter(|f| f.mode() == Mode::Level)
@@ -242,7 +243,8 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::Ai,
             Family::ApiOutage,
             Family::LongHold,
-            Family::FleetUnreadable
+            Family::FleetUnreadable,
+            Family::HugeDir
         ]
     );
     assert_eq!(Family::Ai.stem(), "ai");

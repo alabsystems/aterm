@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Byte-stream RIS (ESC c) preserves host policy flags.
-//!
-//! RIS is reachable from the untrusted PTY stream. If it cleared
-//! `require_shell_integration_nonce`, a program could send `\x1b c` and then
-//! forge OSC 133/633 marks without a nonce. Both reset paths,
-//! `Terminal::reset()` and `handler_esc::reset_terminal_state`, keep the flag.
+//! RIS (ESC c) keeps host policy flags. It is reachable from the untrusted PTY stream:
+//! clearing `require_shell_integration_nonce` would let a program send `\x1b c` and then forge
+//! OSC 133/633 marks without a nonce. Both reset paths, `Terminal::reset()` and
+//! `handler_esc::reset_terminal_state`, keep the flag.
 
 use aterm_core::terminal::Terminal;
 

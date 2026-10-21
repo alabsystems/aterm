@@ -44,9 +44,9 @@ pub(crate) use crate::cadence_bounds::{
     INTERVAL_SECS, JITTER_PCT, MAX_BACKOFF, MAX_BACKOFF_INTERVALS, WAKE_SETTLE,
 };
 
-/// A wall-clock jump larger than the requested sleep by this much means the machine
-/// was not running: system sleep, hibernation, a suspended VM, or a large clock step.
-/// Well above any scheduling delay or routine NTP slew.
+/// A wall-clock jump this much longer than the requested sleep means the machine was not
+/// running (sleep, hibernation, VM suspend, a clock step); well above scheduling delay or
+/// NTP slew.
 pub(crate) const SLEEP_GAP: Duration = Duration::from_secs(90);
 
 /// How long after a detected wake a failed check is still taken as the network coming
@@ -69,14 +69,11 @@ pub(crate) fn after_wake(woke_at: Option<Instant>, check_began: Instant) -> bool
 /// How long an unchanged failure message stays suppressed before being repeated.
 pub(crate) const STILL_FAILING_AFTER: Duration = Duration::from_secs(30 * 60);
 
-/// The waits after a check that could not reach the network at all
-/// ([`is_network_unreachable`]): the first retry comes after 20 s, then 60 s, 2 min
-/// and 5 min, and after those the ordinary ladder takes over from the base interval.
-/// A Mac that has just booted, woken or joined a network cannot resolve a name for a
-/// few seconds, and a whole interval after that is one in which a new release goes
-/// unnoticed. Four quick tries cost four tiny requests on the unmetered download host;
-/// a longer outage falls back to the backoff. Never longer than the ordinary ladder's own wait at that point
-/// ([`Cadence::nominal_at`]).
+/// The waits after a check that could not reach the network ([`is_network_unreachable`]):
+/// 20 s, 60 s, 2 min, 5 min, then the ordinary ladder from the base interval. A Mac that
+/// just booted, woke or joined a network cannot resolve names for a few seconds, and a
+/// whole interval after that leaves a new release unnoticed. Never longer than the
+/// ordinary ladder's wait at that point ([`Cadence::nominal_at`]).
 pub(crate) const OFFLINE_RETRY: [Duration; 4] = [
     Duration::from_secs(20),
     Duration::from_secs(60),
@@ -84,16 +81,13 @@ pub(crate) const OFFLINE_RETRY: [Duration; 4] = [
     Duration::from_secs(5 * 60),
 ];
 
-/// Whether a failed check's message says the network could not be reached at all:
-/// curl exit 6 (could not resolve the host), 7 (could not connect) or 28 (timed out),
-/// in either spelling the transport writes — `curl: (6) …` from curl's own stderr, or
-/// `(exit status: 6)` from the exit status the transport quotes. Only a message that
-/// names curl counts: another tool's exit 7 (a `ditto` that failed to extract) is not
-/// a network that is down. Anything else — an HTTP status, a signature, a refused
-/// redirect — is a failure the network carried, and waits on the ordinary ladder. The
-/// check loop also asks the health ledger: the same exit on the container download,
-/// after the channel answered, is not a network that is down either
-/// (`unreachable_before_the_channel` in the crate root).
+/// Whether a failed check's message says the network could not be reached at all: curl
+/// exit 6 (resolve), 7 (connect) or 28 (timeout), as `curl: (6) …` from curl's stderr or
+/// `(exit status: 6)` from the transport. Only a message naming curl counts (a `ditto`
+/// exit 7 is not a network that is down); an HTTP status, a signature or a refused
+/// redirect is a failure the network carried. The check loop also asks the health
+/// ledger (`unreachable_before_the_channel` in the crate root): the same exit on the
+/// container download, after the channel answered, is not an outage either.
 pub(crate) fn is_network_unreachable(message: &str) -> bool {
     const UNREACHABLE: [u32; 3] = [6, 7, 28];
     if !message.contains("curl") {
@@ -113,7 +107,7 @@ pub(crate) fn is_network_unreachable(message: &str) -> bool {
     code_after("curl: (") || code_after("exit status: ") || code_after("(exit ")
 }
 
-/// The wait after a healthy check that found the channel head's APP BUILD IN FLIGHT —
+/// The wait after a healthy check that found the channel head's app build in flight —
 /// a release published source-first, whose `aterm-appcast.toml` the download host does
 /// not carry yet, and whose tag outranks the last one the machine authorized
 /// (`github::app_build_in_flight`): one minute, for as many as [`IN_FLIGHT_CHECKS`]
@@ -125,10 +119,8 @@ pub(crate) fn is_network_unreachable(message: &str) -> bool {
 /// sees the head in flight. So this wait, not the interval, decides how soon after the
 /// assets land the machine sees them: about 30 s on average where the two-minute
 /// interval takes about 61 s (each wait spread ±[`JITTER_PCT`]%). It costs about ten
-/// more HEADs and appcast GETs per release on the unmetered download host. The 2-, 4-
-/// and 8-minute ladder this replaced was cut for a 10-minute interval, and under the
-/// two-minute one every rung was the interval: it did nothing. Never longer than the
-/// ordinary ladder's own wait ([`Cadence::nominal_at`]).
+/// more HEADs and appcast GETs per release on the unmetered download host. Never longer
+/// than the ordinary ladder's own wait ([`Cadence::nominal_at`]).
 pub(crate) const IN_FLIGHT_RETRY: Duration = Duration::from_secs(60);
 
 /// How many consecutive checks that found the head's app build in flight wait
@@ -148,34 +140,27 @@ pub(crate) fn in_flight_retry(checks: u32) -> Option<Duration> {
         .then_some(IN_FLIGHT_RETRY)
 }
 
-/// The floor on a HELD wait that is still in force. A hold a few seconds out (a
-/// sibling's window was nearly over when this process skipped) must not become a
-/// near-zero wait: the loop would re-check at once, read the same fresh ledger stamp,
-/// skip, and spin through `wait` with nothing to wait for. A hold whose epoch has
-/// already PASSED is not floored — it is simply over, and the ordinary ladder (base ×
-/// the failure count, which a hold never raised) applies.
+/// The floor on a hold still in force: a hold seconds away must not become a near-zero
+/// wait that re-checks, reads the same fresh stamp, skips, and spins. A hold already
+/// past is over, and the ordinary ladder applies.
 pub(crate) const HOLD_FLOOR: Duration = Duration::from_secs(60);
 
-/// The interval schedule: a base cadence plus the current consecutive-failure count,
-/// and — after a skip behind a sibling's fresh check — the instant that sibling's
-/// window ends.
+/// The interval schedule: a base cadence, the consecutive-failure count, and after a
+/// skip behind a sibling's fresh check, the instant that sibling's window ends.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cadence {
     base: Duration,
     failures: u32,
-    /// Consecutive checks, ending with the latest, that could not reach the network
-    /// ([`Self::failed_offline`]). While it is within [`OFFLINE_RETRY`] the next wait
-    /// is that rung and `failures` has not moved; past it, each one counts as an
-    /// ordinary failure.
+    /// Consecutive checks, ending with the latest, that could not reach the network.
+    /// Within [`OFFLINE_RETRY`] the next wait is that rung and `failures` stays; past it,
+    /// each counts as an ordinary failure.
     offline: u32,
-    /// How many consecutive completed checks, machine-wide, have found the channel
-    /// head's app build in flight, as of this process's latest healthy check
-    /// ([`Self::succeeded`]). While it names an [`IN_FLIGHT_RETRY`] rung the next wait
-    /// is that rung; `0` is none. Any other outcome clears it.
+    /// Consecutive completed checks, machine-wide, that found the channel head's app build
+    /// in flight, as of this process's latest healthy check; names an [`IN_FLIGHT_RETRY`]
+    /// rung, `0` none. Any other outcome clears it.
     in_flight: u32,
-    /// When set and still in the future, the next wait ends HERE (bounded by
-    /// [`Self::cap`], floored by [`HOLD_FLOOR`], un-jittered — the epoch already
-    /// carries the loop's 0–60 s scatter) instead of on the doubling ladder.
+    /// While in the future, the next wait ends here (capped by [`Self::cap`], floored by
+    /// [`HOLD_FLOOR`], unjittered) instead of on the doubling ladder.
     hold: Option<Instant>,
 }
 
@@ -191,14 +176,13 @@ impl Cadence {
         }
     }
 
-    /// Hold the next check until `until` — the end of a sibling's fresh window. Does
-    /// NOT count as a failure: the doubling ladder is for outages of unknown length.
+    /// Hold the next check until `until`, the end of a sibling's fresh window. Not a
+    /// failure: the doubling ladder is for outages of unknown length.
     pub(crate) fn hold_until(&mut self, until: Instant) {
         self.hold = Some(until);
     }
 
-    /// The current base interval — the cross-process checker gate sizes its
-    /// freshness window from it (see the check loop in `lib.rs`).
+    /// The base interval; the cross-process checker gate sizes its freshness window from it.
     #[cfg(target_os = "macos")]
     pub(crate) fn base(&self) -> Duration {
         self.base
@@ -213,11 +197,10 @@ impl Cadence {
         self.hold = None;
     }
 
-    /// Note a DEFERRAL — the host asked this machine to slow down — as a failure (the
-    /// doubling ladder lengthens) whose next wait also ends no earlier than
-    /// `window_end`: the end of the machine-wide deferred window this very check
-    /// stamped on the receipt (`checker_skip_for` in the crate root; the caller
-    /// scatters it). `None` (no receipt could be read) is a plain [`Self::failed`].
+    /// Note a deferral (the host asked this machine to slow down) as a failure whose next
+    /// wait also ends no earlier than `window_end`, the end of the machine-wide deferred
+    /// window this check stamped on the receipt (`checker_skip_for` in the crate root).
+    /// `None` (no readable receipt) is a plain [`Self::failed`].
     ///
     /// The ladder's first rung is ONE base interval (±[`JITTER_PCT`]%) and the
     /// deferred window is at least 1.4 of them (`DEFERRED_WINDOW_INTERVALS`) and never
@@ -244,10 +227,9 @@ impl Cadence {
         self.hold = Some(end.max(drawn));
     }
 
-    /// Note a check that could not reach the network at all
-    /// ([`is_network_unreachable`]). The next wait is the next [`OFFLINE_RETRY`] rung;
-    /// once those are spent, this counts as an ordinary [`Self::failed`] and the
-    /// doubling ladder goes on from the base interval.
+    /// Note a check that could not reach the network ([`is_network_unreachable`]): the
+    /// next wait is the next [`OFFLINE_RETRY`] rung; once those are spent it counts as
+    /// an ordinary [`Self::failed`].
     pub(crate) fn failed_offline(&mut self) {
         self.offline = self.offline.saturating_add(1);
         if self.offline as usize > OFFLINE_RETRY.len() {
@@ -257,17 +239,15 @@ impl Cadence {
         self.hold = None;
     }
 
-    /// Whether the next wait is one of the quick [`OFFLINE_RETRY`] rungs — a network
-    /// that is not up YET, which the check loop logs as news rather than a warning.
+    /// Whether the next wait is a quick [`OFFLINE_RETRY`] rung: a network not up yet,
+    /// which the check loop logs as news rather than a warning.
     pub(crate) fn retrying_offline(&self) -> bool {
         self.offline > 0 && self.offline as usize <= OFFLINE_RETRY.len()
     }
 
-    /// Note a successful check — the next wait returns to the base interval
-    /// immediately, or, when `head_in_flight_checks` names an [`IN_FLIGHT_RETRY`]
-    /// rung, to that rung: the check found the channel head's app build in flight
-    /// that many times running (`github::head_in_flight`), and its assets are
-    /// minutes away. Recovery must not be rate-limited by how long the outage was.
+    /// Note a successful check: the next wait returns to the base interval at once, or to
+    /// the [`IN_FLIGHT_RETRY`] rung `head_in_flight_checks` names (the head's app build was
+    /// found in flight that many times running, `github::head_in_flight`).
     pub(crate) fn succeeded(&mut self, head_in_flight_checks: u32) {
         self.failures = 0;
         self.offline = 0;
@@ -275,8 +255,7 @@ impl Cadence {
         self.hold = None;
     }
 
-    /// A wake resets the backoff: the network the failures were about is gone, and
-    /// the machine is in a genuinely new state.
+    /// A wake resets the backoff: the network the failures were about is gone.
     pub(crate) fn woke(&mut self) {
         self.failures = 0;
         self.offline = 0;
@@ -284,8 +263,7 @@ impl Cadence {
         self.hold = None;
     }
 
-    /// The consecutive-failure count — what the doubling ladder is keyed on. Exposed
-    /// for tests, so "the quick rungs are not the ladder's" is assertable on the count.
+    /// The consecutive-failure count the doubling ladder is keyed on.
     #[cfg(test)]
     pub(crate) fn failures(&self) -> u32 {
         self.failures
@@ -299,34 +277,26 @@ impl Cadence {
         Some(remaining.max(HOLD_FLOOR).min(self.cap()))
     }
 
-    /// The ceiling on [`Self::nominal`] for THIS base: at least [`MAX_BACKOFF`], at
-    /// least the base itself (a configured interval is a floor on the wait, never
-    /// something a cap may shorten), and at most [`MAX_BACKOFF_INTERVALS`] × base —
-    /// the term that keeps the ceiling strictly above the base, so a slow base still
-    /// backs off instead of clamping to where it started.
+    /// The ceiling on [`Self::nominal`]: `max(MAX_BACKOFF, MAX_BACKOFF_INTERVALS × base)`.
+    /// The interval term keeps it above the base, so a slow base still backs off and a
+    /// configured interval is never shortened.
     fn cap(&self) -> Duration {
         MAX_BACKOFF.max(self.base.saturating_mul(MAX_BACKOFF_INTERVALS))
     }
 
-    /// The longest one [`wait`] of this schedule can take, plus the post-wake
-    /// [`WAKE_SETTLE`] the loop may add after it: the ceiling, spread by the
-    /// jitter's upper edge (a hold is capped at the ceiling and never spread).
+    /// The longest one [`wait`] can take, plus the post-wake [`WAKE_SETTLE`]: the ceiling
+    /// at the jitter's upper edge (a hold is capped at the ceiling and never spread).
     ///
-    /// The check loop publishes it as its heartbeat's budget while it waits
-    /// (`checker_watch`): the longest silence between two stamps that is
-    /// still a healthy loop. Derived here, from the same ceiling and jitter
-    /// [`Self::delay_at`] uses, so a later change to either cannot leave the
-    /// watchdog judging a wait it no longer knows the length of.
+    /// The check loop's heartbeat budget while it waits (`checker_watch`); derived from
+    /// the ceiling and jitter [`Self::delay_at`] uses, so the watchdog follows a change.
     pub(crate) fn max_wait(&self) -> Duration {
         let cap = u64::try_from(self.cap().as_millis()).unwrap_or(u64::MAX);
         Duration::from_millis(cap.saturating_mul(100 + JITTER_PCT) / 100) + WAKE_SETTLE
     }
 
-    /// The nominal (pre-jitter) wait: `base` doubled once per consecutive failure,
-    /// clamped to [`Self::cap`] — or, while a run of unreachable-network failures is
-    /// within [`OFFLINE_RETRY`], that rung; or, after a healthy check that found the
-    /// head's app build in flight, its [`IN_FLIGHT_RETRY`] rung. Exposed for tests;
-    /// [`Self::delay`] is what the loop uses.
+    /// The pre-jitter wait: `base` doubled per consecutive failure up to [`Self::cap`],
+    /// or the current [`OFFLINE_RETRY`] or [`IN_FLIGHT_RETRY`] rung. The loop uses
+    /// [`Self::delay`].
     #[cfg(test)]
     pub(crate) fn nominal(&self) -> Duration {
         self.nominal_at(Instant::now())
@@ -338,8 +308,7 @@ impl Cadence {
         if let Some(held) = self.hold_remaining(now) {
             return held;
         }
-        // `1 << 20` already exceeds any sane base × ceiling ratio; the shift is
-        // clamped so a long outage can never overflow the multiply.
+        // Clamped so a long outage cannot overflow; `1 << 20` exceeds any ceiling ratio.
         let doublings = self.failures.saturating_sub(1).min(20);
         let ladder = self.base.saturating_mul(1u32 << doublings).min(self.cap());
         match self.offline.checked_sub(1) {
@@ -348,11 +317,9 @@ impl Cadence {
         }
     }
 
-    /// The actual wait: [`Self::nominal`] spread by ±[`JITTER_PCT`]%. `entropy` is a
-    /// uniformly random byte; the caller supplies it so this stays pure and testable.
-    /// A HELD wait is not spread: the epoch is already scattered by the loop's own
-    /// 0–60 s, and −20 % of it would wake this machine inside the sibling's window —
-    /// the one thing a hold exists to avoid.
+    /// The actual wait: [`Self::nominal`] spread by ±[`JITTER_PCT`]%, from a uniformly
+    /// random `entropy` byte. A held wait is not spread: its epoch already carries the
+    /// loop's 0–60 s scatter, and −20 % would wake inside the sibling's window.
     pub(crate) fn delay(&self, entropy: u8) -> Duration {
         self.delay_at(Instant::now(), entropy)
     }
@@ -366,8 +333,7 @@ impl Cadence {
     }
 }
 
-/// Spread `d` by ±[`JITTER_PCT`]% using one random byte. Saturating throughout, so
-/// no input can panic.
+/// Spread `d` by ±[`JITTER_PCT`]% using one random byte; saturating, so it cannot panic.
 fn jitter(d: Duration, entropy: u8) -> Duration {
     let span = 2 * JITTER_PCT; // the full width, in percent
     let offset = (u64::from(entropy) * (span + 1)) / 256; // 0..=span
@@ -376,9 +342,8 @@ fn jitter(d: Duration, entropy: u8) -> Duration {
     Duration::from_millis(millis.saturating_mul(scale) / 100)
 }
 
-/// One random byte from the audited entropy surface, or a fixed midpoint if it is
-/// unavailable. A missing byte must degrade to "no jitter", never to a panic or a
-/// hand-rolled `/dev/urandom` read. Shared with the skip timer's scatter.
+/// One random byte from `aterm_uds::rand`, or the midpoint (no jitter) if it is
+/// unavailable. Shared with the skip timer's scatter.
 #[cfg(target_os = "macos")]
 pub(crate) fn entropy_byte() -> u8 {
     let mut b = [128u8; 1];
@@ -391,20 +356,18 @@ pub(crate) fn entropy_byte() -> u8 {
 pub(crate) enum Waited {
     /// The full delay elapsed normally.
     Elapsed,
-    /// The machine was not running for part of the wait (system sleep / hibernation /
-    /// VM suspend / clock step). Carries the observed gap, for the log.
+    /// The machine was not running for part of the wait (sleep, hibernation, VM suspend,
+    /// clock step); carries the observed gap.
     Woke(Duration),
 }
 
-/// Whether a slice that requested `slice` but consumed `observed` wall-clock seconds
-/// means the machine stopped running. Pure, so the threshold is testable without
-/// sleeping a Mac.
+/// Whether a slice that requested `slice` but consumed `observed` wall-clock time means
+/// the machine stopped running.
 ///
-/// Deliberately compares wall time against the REQUESTED duration rather than against
-/// an [`Instant`]: whether `Instant` advances across system sleep is a
-/// platform-and-libc detail that has changed under us before, while "I asked to sleep
-/// 15 seconds and 3 hours of wall clock went by" is true on every platform and also
-/// catches hibernation and VM suspend.
+/// Compares wall time against the requested duration, not an [`Instant`]: whether
+/// `Instant` advances across system sleep is a platform-and-libc detail, while a 15 s
+/// sleep that took 3 hours of wall clock is a wake everywhere, hibernation and VM
+/// suspend included.
 pub(crate) fn is_wake_gap(slice: Duration, observed: Duration) -> bool {
     observed.saturating_sub(slice) >= SLEEP_GAP
 }
@@ -509,10 +472,8 @@ pub(crate) fn wait(cadence: &Cadence, signal: &WakeSignal, seen: u64) -> (Durati
     })
 }
 
-/// [`wait`] over an injected sleep. The next check is published for exactly as long as
-/// the wait lasts: once it is over the loop is settling after a wake or checking, the
-/// instant it named is past, and `next_check=` says nothing until the next wait names
-/// another.
+/// [`wait`] over an injected sleep. The next check is published only while the wait
+/// lasts; after it the loop is settling or checking and the instant is past.
 fn wait_with(
     cadence: &Cadence,
     entropy: u8,
@@ -525,12 +486,10 @@ fn wait_with(
     (delay, waited)
 }
 
-/// When this process's check loop looks next, as Unix seconds (`0`: no wait is under
-/// way — the loop has not started one, or is past it and checking) — set by [`wait`]
-/// as each wait starts and cleared as it ends, read by `crate::next_check_at` for
-/// `aterm ctl update status`'s `next_check=`. The loop's own schedule, not the
-/// machine's: a sibling process may check sooner, and this one then skips behind its
-/// receipt.
+/// When this process's check loop looks next, as Unix seconds (`0`: no wait under way),
+/// set and cleared by [`wait`], read by `crate::next_check_at` for `aterm ctl update
+/// status`'s `next_check=`. This loop's schedule, not the machine's: a sibling may check
+/// sooner, and this one then skips behind its receipt.
 static NEXT_CHECK_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record that the loop's next check is `delay` after `now`.
@@ -546,8 +505,8 @@ pub(crate) fn next_check_unix() -> Option<u64> {
     Some(NEXT_CHECK_UNIX.load(std::sync::atomic::Ordering::Relaxed)).filter(|at| *at > 0)
 }
 
-/// What the loop should do about a check result's log line. Returned instead of
-/// logging directly so the whole policy is testable without an installed logger.
+/// What the loop should do about a check result's log line; returned, not logged, so the
+/// policy is testable without a logger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LogAction {
     /// Say nothing — an identical failure was reported recently.
@@ -558,21 +517,18 @@ pub(crate) enum LogAction {
     Log(String),
 }
 
-/// Collapses repeated identical failures, so they do not bury the lines that matter.
-/// Policy:
+/// Collapses repeated identical failures:
 ///
-/// * a message DIFFERENT from the last one is always warned (a changed failure is
-///   news: DNS → auth, say) — or said at INFO while the network is expected to be
-///   down, on the quick [`OFFLINE_RETRY`] rungs ([`Self::failure_expected`]);
-/// * an identical repeat is suppressed until [`STILL_FAILING_AFTER`], then warned
-///   once with the consecutive count, so the log always shows an ongoing outage
-///   without showing it 48 times an hour;
+/// * a message different from the last is warned (a changed failure is news), or said at
+///   INFO on the quick [`OFFLINE_RETRY`] rungs ([`Self::failure_expected`]);
+/// * an identical repeat is suppressed until [`STILL_FAILING_AFTER`], then warned once
+///   with the consecutive count;
 /// * recovery is always logged, with how many failures it took.
 #[derive(Debug, Default)]
 pub(crate) struct FailureLog {
     last: Option<String>,
-    /// Whether the last emitted line was a warning — a failure first said at INFO is
-    /// said again, as a warning, the moment it stops being expected.
+    /// Whether the last emitted line was a warning: a failure first said at INFO is
+    /// warned the moment it stops being expected.
     last_warned: bool,
     /// Failures observed since the last emitted line (the first one included).
     since_emit: u32,
@@ -587,10 +543,9 @@ impl FailureLog {
         self.failure_expected(message, false)
     }
 
-    /// [`Self::failure`], said at INFO instead of as a warning when `expected`: a
-    /// network that is not up yet while the quick [`OFFLINE_RETRY`] rungs still run
-    /// (the boot and wake case) is news, not a fault. The same failure, still there
-    /// once `expected` is false, is warned at once rather than suppressed as a repeat.
+    /// [`Self::failure`], said at INFO when `expected`: a network not up yet while the
+    /// quick [`OFFLINE_RETRY`] rungs run is news, not a fault. The same failure, once
+    /// `expected` is false, is warned at once rather than suppressed as a repeat.
     pub(crate) fn failure_expected(&mut self, message: &str, expected: bool) -> LogAction {
         self.streak = self.streak.saturating_add(1);
         self.since_emit = self.since_emit.saturating_add(1);
@@ -663,7 +618,6 @@ mod tests {
 
     const BASE: Duration = Duration::from_secs(75);
 
-    /// THE WATCHDOG'S BUDGET COVERS EVERY WAIT THE SCHEDULE CAN TAKE.
     /// `max_wait` is what the heartbeat is judged against while the loop waits, so
     /// a wait longer than it would read as a stall of a healthy loop: swept over
     /// the shipped interval and a fast test base, every failure depth, the offline
@@ -693,8 +647,7 @@ mod tests {
             let mut held = Cadence::new(base);
             held.hold_until(now + Duration::from_secs(24 * 3600));
             schedules.push(held);
-            // A deferral held to its own window (`Cadence::deferred`, the rate-limited
-            // arm): the window the check stamped, and one far past the ceiling.
+            // A deferral held to the window it stamped, and to one far past the ceiling.
             for window in [base * 14 / 10, Duration::from_secs(24 * 3600)] {
                 for entropy in [0u8, 255] {
                     let mut deferred = Cadence::new(base);
@@ -788,8 +741,6 @@ mod tests {
         assert_eq!(c.nominal(), base, "a wake ends it too");
     }
 
-    /// The quick rungs never wait LONGER than the ordinary ladder would: on a base
-    /// shorter than the 2- and 5-minute rungs, those rungs are the base interval.
     #[test]
     fn the_short_ladder_never_outwaits_the_ordinary_one() {
         let mut c = Cadence::new(BASE);
@@ -803,8 +754,6 @@ mod tests {
         assert_eq!(c.nominal(), BASE);
     }
 
-    /// A failure the network carried (an HTTP status, a signature) is not a network
-    /// that is down: it ends the quick rungs and waits on the ordinary ladder.
     #[test]
     fn an_ordinary_failure_ends_the_short_ladder() {
         let base = Duration::from_secs(INTERVAL_SECS);
@@ -817,13 +766,13 @@ mod tests {
         assert_eq!(c.nominal(), base, "the ordinary ladder's first rung");
     }
 
-    /// A NETWORK STILL COMING UP AFTER A WAKE IS NO FAULT, WHATEVER IT FAILED ON. The
+    /// A network still coming up after a wake is no fault, whatever it failed on. The
     /// settle is three seconds, so the first check after the lid opens can meet Wi-Fi
     /// half associated, a VPN reconnecting or a captive portal: a TLS failure (35), a
     /// reset (56), a portal's error page (22) — none of them an exit
     /// `is_network_unreachable` names. Inside the grace each takes the quick rungs
     /// (20 s, 60 s, then the base) at INFO and the doubling ladder never moves.
-    /// NEGATIVE CONTROL: the same failure past the grace, or with no wake seen, is a
+    /// Negative control: the same failure past the grace, or with no wake seen, is a
     /// fault — warned, and the ladder moves.
     #[test]
     fn a_failure_inside_the_wake_grace_takes_the_quick_rungs_at_info_whatever_it_was() {
@@ -869,13 +818,12 @@ mod tests {
         }
     }
 
-    /// THE SOURCE-FIRST RELEASE, AT THE SHIPPED INTERVAL. A healthy check that found the
-    /// head's app build in flight waits a minute — keyed on the machine-wide count the
-    /// check receipt carries — for [`IN_FLIGHT_CHECKS`] checks, and the ordinary
-    /// interval after those; a healthy check that found none (the negative control,
-    /// `0`) waits the base interval exactly as before. Every other outcome — a failure,
-    /// an unreachable network, a wake — ends the quick waits, and a hold wins over them.
-    /// The 2/4/8-minute ladder this replaced waited the interval itself at every rung.
+    /// A healthy check that found the head's app build in flight waits a minute —
+    /// keyed on the machine-wide count the check receipt carries — for
+    /// [`IN_FLIGHT_CHECKS`] checks, and the ordinary interval after those; a healthy
+    /// check that found none (the negative control, `0`) waits the base interval. Every
+    /// other outcome — a failure, an unreachable network, a wake — ends the quick
+    /// waits, and a hold wins over them.
     #[test]
     fn a_head_whose_app_build_is_in_flight_is_rechecked_within_a_minute() {
         let base = Duration::from_secs(INTERVAL_SECS);
@@ -929,9 +877,6 @@ mod tests {
         assert_eq!(in_flight_retry(IN_FLIGHT_CHECKS + 1), None, "spent");
     }
 
-    /// Exits 6, 7 and 28 — could not resolve, could not connect, timed out — in both
-    /// spellings the transport writes are an unreachable network; every other curl
-    /// failure, and another tool's exit 7, is not.
     #[test]
     fn only_dns_connect_and_timeout_failures_count_as_an_unreachable_network() {
         for unreachable in [
@@ -1013,8 +958,7 @@ mod tests {
         assert_eq!(c.nominal(), anon, "recovery snaps back to the base");
     }
 
-    /// A hold (a sibling's window end) is waited out EXACTLY — not doubled, not
-    /// jittered — however many failures preceded it.
+    /// A hold is waited out exactly, not doubled or jittered.
     #[test]
     fn a_hold_waits_until_the_reset_not_a_doubling() {
         let anon = Duration::from_secs(INTERVAL_SECS);
@@ -1040,14 +984,11 @@ mod tests {
         // A hold still in force but within the floor waits the floor, never ~zero.
         c.hold_until(now + Duration::from_secs(1));
         assert_eq!(c.nominal_at(now), HOLD_FLOOR);
-        // A hold already in the past (a reset the clock skewed behind us) is over:
-        // the ladder applies again — and a hold never raised it, so this is still 4×.
+        // A hold already past is over: the ladder applies, still 4× (a hold never raised it).
         c.hold_until(now - Duration::from_secs(1));
         assert_eq!(c.nominal_at(now), anon * 4);
     }
 
-    /// A hold can never exceed the ladder's own ceiling, and every event that clears
-    /// the ladder clears the hold too.
     #[test]
     fn a_hold_is_bounded_by_the_cap_and_cleared_by_success_or_wake() {
         let anon = Duration::from_secs(INTERVAL_SECS);
@@ -1081,10 +1022,9 @@ mod tests {
         );
     }
 
-    /// A DEFERRAL HOLDS ITS OWN PROCESS TO THE WINDOW IT STAMPED (the first rung, one
-    /// base ±20 %, is shorter than the 1.4-base window). Every entropy byte waits at least to the window's end; a rung that
-    /// already outlasts the window keeps its ordinary jittered wait; no window known is
-    /// a plain failure. The count moves exactly as `failed` moves it.
+    /// The first rung (one base ±20 %) is shorter than the 1.4-base window, so a deferral
+    /// holds its process to the window's end; a rung that outlasts the window keeps its
+    /// jittered wait, and no known window is a plain failure.
     #[test]
     fn a_deferral_never_wakes_inside_its_own_window() {
         let base = Duration::from_secs(INTERVAL_SECS);
@@ -1096,7 +1036,7 @@ mod tests {
             assert_eq!(c.failures(), 1);
             let wait = c.delay_at(now, entropy);
             assert!(wait >= base * 14 / 10, "entropy {entropy}: {wait:?}");
-            // NEGATIVE CONTROL: the ladder alone wakes inside the window, every byte.
+            // Negative control: the ladder alone wakes inside the window, every byte.
             let mut ladder = Cadence::new(base);
             ladder.failed();
             assert!(ladder.delay_at(now, entropy) < base * 14 / 10);
@@ -1120,10 +1060,7 @@ mod tests {
         assert_eq!(c.nominal_at(now), base);
     }
 
-    /// The loop publishes when it looks next (`aterm ctl update status`'s
-    /// `next_check=`): now plus the wait it is about to start — for as long as that
-    /// wait lasts, and no longer. Once the wait is over (elapsed, or cut short by a
-    /// wake and its settle) the loop is checking, and a past instant is not shown.
+    /// `next_check=` is now plus the wait about to start, published only while it runs.
     #[test]
     fn the_loop_publishes_its_next_check() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_280_801);
@@ -1221,16 +1158,14 @@ mod tests {
             LogAction::Warn(_)
         ));
         assert_eq!(log.failure("could not resolve host"), LogAction::Suppress);
-        // DNS failure → auth failure is genuinely new information.
+        // DNS failure → auth failure is new information.
         let LogAction::Warn(text) = log.failure("GitHub auth failed (HTTP 401)") else {
             panic!("a changed message must be reported");
         };
         assert!(text.contains("3 in a row"), "the streak is carried: {text}");
     }
 
-    /// A network that is not up yet is said at INFO while the quick rungs run, and the
-    /// same failure is WARNED — not suppressed as a repeat — the moment it outlasts
-    /// them. Once warned, repeats collapse as before.
+    /// The same failure, once it outlasts the quick rungs, is warned, not suppressed.
     #[test]
     fn an_expected_failure_is_info_until_it_outlasts_the_short_ladder() {
         let mut log = FailureLog::default();
@@ -1279,10 +1214,9 @@ mod tests {
         );
     }
 
-    /// A POSTED WAKE ENDS THE WAIT AT ONCE. A day-long wait on a signal another thread
-    /// posts past the count the waiter answered returns `Woke` — through this test's
-    /// one-minute hang detector, which a wait that only watched the clock (the old
-    /// 15 s slices, never posted to) would trip. A post the waiter has already
+    /// A day-long wait on a signal another thread posts past the count the waiter
+    /// answered returns `Woke` — through this test's one-minute hang detector, which a
+    /// wait that only watched the clock would trip. A post the waiter has already
     /// answered is not a wake: that wait runs to its end (the negative control).
     #[test]
     fn a_posted_wake_ends_the_wait_at_once() {

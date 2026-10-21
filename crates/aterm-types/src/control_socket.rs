@@ -1,36 +1,23 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pure lifecycle decisions for the introspection control socket.
+//! Pure lifecycle decisions for the introspection control socket, shared by the server
+//! (`aterm-gui`) and the client (`aterm-ctl`). The socket grants full power over a live
+//! terminal and every running instance binds its own, so these must be exact:
 //!
-//! The control socket grants full power over a live terminal, and every
-//! running instance binds its own socket, so three decisions must be exactly
-//! right and exactly shared between the server (`aterm-gui`) and the client
-//! (`aterm-ctl`):
+//! 1. **Whether to bind at all.** `--control-sock 0` / `off` (or `--no-control-sock`) disables
+//!    the socket.
+//! 2. **Per-socket naming.** Each instance owns `aterm-<pid>.sock` and `aterm-<pid>.token`, so a
+//!    second instance never hijacks the first one's socket; an `aterm.sock` symlink points at
+//!    the newest instance. An explicit `--control-sock` socket gets a token named after it
+//!    ([`token_name_for_sock`]), so two instances in one directory keep separate tokens.
+//! 3. **Stale-file tolerance.** A crashed instance's files are removable once their embedded
+//!    pid is dead, or, for a socket, once nothing listens on it.
 //!
-//! 1. **Whether to bind at all.** `--control-sock 0` / `off` (or
-//!    `--no-control-sock`) disables the socket entirely.
-//! 2. **Per-socket naming.** Each instance owns `aterm-<pid>.sock` plus a
-//!    matching `aterm-<pid>.token`, so a second instance never hijacks the
-//!    first one's socket; a `aterm.sock` symlink points at the newest
-//!    instance so single-instance usage is unchanged. An instance on an
-//!    explicit `--control-sock` path pairs the same way — its token is
-//!    named after ITS socket ([`token_name_for_sock`]) — because the two
-//!    private headless instances an agent boots in one scratch directory
-//!    otherwise shared one token file and locked each other's clients out.
-//! 3. **Stale-file tolerance.** A crashed instance leaves its files behind;
-//!    they are removable exactly when their embedded pid is dead.
-//!
-//! Hosts read their launch flags / directory / `kill(pid, 0)` and pass the
-//! results in; the decisions themselves stay platform-free and testable.
-//!
-//! Platform note: on Windows the `latest` alias ([`LATEST_SOCK_FILE`]) is a
-//! regular POINTER FILE (NTFS symlinks need privilege/dev-mode) whose
-//! contents are the SAME relative instance name a Unix `readlink` returns
-//! (`aterm-<pid>.sock`), so [`symlink_targets_pid`], [`token_name_for_sock`],
-//! and [`instance_pid`] apply to those contents unchanged — every pure
-//! function here is reused as-is on both platforms (the alias mechanics live
-//! in `aterm-uds::latest`).
+//! Hosts read their flags, directory and `kill(pid, 0)` and pass the results in. On Windows the
+//! `latest` alias ([`LATEST_SOCK_FILE`]) is a pointer file (NTFS symlinks need privilege)
+//! holding the same relative `aterm-<pid>.sock` a Unix `readlink` returns, so every function
+//! here applies unchanged; the alias mechanics live in `aterm-uds::latest`.
 
 use std::path::Path;
 
@@ -38,24 +25,14 @@ use std::path::Path;
 /// newest instance's `aterm-<pid>.sock`, so clients with no flags reach it.
 pub const LATEST_SOCK_FILE: &str = "aterm.sock";
 
-/// The LEGACY shared token filename: the ONE file every explicit-socket
-/// instance in a directory used to write, and therefore to overwrite for each
-/// other — the second private headless instance in a scratch directory took
-/// the first one's credential with it, and every client of the first was
-/// refused `ERR auth` while it was still listening (F9).
-///
-/// Nothing writes it any more; [`token_name_for_sock`] gives every socket a
-/// token of its own. It survives as the LAST candidate a client reads
-/// ([`token_names_for_sock`]) so a client from this build still authenticates
+/// The legacy shared token filename. Nothing writes it ([`token_name_for_sock`] gives every
+/// socket its own token); a client reads it last ([`token_names_for_sock`]) to authenticate
 /// against an instance from a build that wrote it.
 pub const SIBLING_TOKEN_FILE: &str = "aterm.token";
 
-/// Prefix that keeps the token of an oddly-named socket out of the two
-/// RESERVED names — [`SIBLING_TOKEN_FILE`] and the per-instance
-/// `aterm-<pid>.token`. Appending `.token` to a socket named `aterm` yields
-/// the first and to one named `aterm-4242` the second, so those names (any
-/// name not ending in `.sock`) are prefixed instead. Without it the rule
-/// stops being injective, which is the one property the whole fix rests on.
+/// Prefix that keeps an oddly-named socket's token off the two reserved names,
+/// [`SIBLING_TOKEN_FILE`] and `aterm-<pid>.token`: appending `.token` to `aterm` or `aterm-4242`
+/// would yield them, so a name not ending in `.sock` is prefixed. It keeps the rule injective.
 const EXPLICIT_TOKEN_PREFIX: &str = "aterm-sock-";
 
 /// What the host should do about the control socket, decided from its launch
@@ -71,12 +48,9 @@ pub enum SocketDirective {
     Disabled,
 }
 
-/// Decide the socket disposition from the `--control-sock` value and the
-/// `--no-control-sock` switch (`None` = not given; the switch engages by
-/// [`env_flag_engaged`]'s reading).
-///
-/// `--control-sock 0` or `off` (case-insensitive) disables the socket, as does
-/// `--no-control-sock`. Any other non-empty `--control-sock` value is an
+/// Decide the socket disposition from the `--control-sock` value and the `--no-control-sock`
+/// switch (`None` = not given; the switch reads as [`env_flag_engaged`]). `0` or `off`
+/// (case-insensitive) or the switch disables the socket; any other non-empty value is an
 /// explicit path; absent or empty means the per-instance default.
 #[must_use]
 pub fn socket_directive(
@@ -93,15 +67,10 @@ pub fn socket_directive(
     }
 }
 
-/// **THE ONE READING of a boolean `ATERM_NO_*` / veto value** (`None` =
-/// unset): engaged only by a value that is non-empty and not `"0"` — the rule
-/// the retired control-socket kill switch always used, promoted to a name so every
-/// boolean switch shares it. Unset, EMPTY and `"0"` are "not engaged".
-///
-/// WHY THIS EXISTS: `var_os(..).is_some()` treats a present-but-empty variable
-/// as engaged, and empty env vars travel — a shell exporting `ATERM_X=` hands
-/// every descendant an is_some() veto nothing intended (one once disabled the
-/// seamless updater on a daily driver). Flag readers go through here.
+/// The one reading of a boolean `ATERM_NO_*` / veto value (`None` = unset): engaged only by a
+/// non-empty value other than `"0"`. Flag readers go through here because
+/// `var_os(..).is_some()` treats a present-but-empty variable as engaged, and empty env vars
+/// are inherited: a shell exporting `ATERM_X=` would veto in every descendant.
 #[must_use]
 pub fn env_flag_engaged(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
@@ -112,8 +81,8 @@ pub fn env_flag_engaged(value: Option<&str>) -> bool {
 /// path the directory is reached by.
 #[must_use]
 pub fn instance_sock_name(pid: u32) -> String {
-    // Trust gate: concatenation instead of `format!` — runtime-argument
-    // `format_args!` cannot be lowered natively. Byte-identical output.
+    // Trust gate: concatenation, not `format!` (runtime-argument `format_args!` cannot be
+    // lowered natively).
     let mut name = String::from("aterm-");
     name.push_str(&pid.to_string());
     name.push_str(".sock");
@@ -149,14 +118,10 @@ pub fn instance_pid(name: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-/// The pid a SOCKET filename encodes (`aterm-<pid>.sock`), and only that
-/// spelling. [`instance_pid`] also accepts `aterm-<pid>.token` because the
-/// stale sweep walks both kinds of leftover; the token rule must not, because
-/// it answers "which file authenticates THIS socket" — handed a socket path
-/// ending `.token`, the tolerant parse names the socket file ITSELF, and the
-/// server would then write its capability token over its own listening
-/// socket. It also keeps this rule byte-identical to the `aterm-uds` mirror,
-/// which has always keyed on `.sock` alone.
+/// The pid a socket filename encodes, for the `aterm-<pid>.sock` spelling only. [`instance_pid`]
+/// also accepts `.token` for the stale sweep; the token rule must not, or a socket path ending
+/// `.token` would name itself and the server would write its token over its own socket. Keyed
+/// on `.sock` alone, like the `aterm-uds` mirror.
 fn sock_name_pid(sock_name: &str) -> Option<u32> {
     if !sock_name.ends_with(".sock") {
         return None;
@@ -164,33 +129,23 @@ fn sock_name_pid(sock_name: &str) -> Option<u32> {
     instance_pid(sock_name)
 }
 
-/// The token filename that authenticates the socket named `sock_name` — the
-/// one name the server WRITES beside that socket, and the first one a client
-/// reads.
+/// The token filename that authenticates the socket named `sock_name`: the name the server
+/// writes beside it and the first a client reads.
 ///
-/// * `aterm-<pid>.sock` → `aterm-<pid>.token`: byte for byte the pairing
-///   every release has shipped, so no default install changes.
-/// * any other name — an explicit `--control-sock` path — → that
-///   socket's OWN filename with `.token` appended (`a.sock` → `a.sock.token`),
-///   carrying [`EXPLICIT_TOKEN_PREFIX`] when the name does not end in `.sock`.
+/// * `aterm-<pid>.sock` → `aterm-<pid>.token`.
+/// * any other name (an explicit `--control-sock` path) → that filename with `.token` appended
+///   (`a.sock` → `a.sock.token`), prefixed [`EXPLICIT_TOKEN_PREFIX`] when it does not end in
+///   `.sock`.
 ///
-/// The rule is INJECTIVE over socket filenames, and that is the whole point:
-/// two sockets in one directory can never name one token file. It used to
-/// collapse every non-instance name onto the shared [`SIBLING_TOKEN_FILE`],
-/// so a second explicit-socket instance in a directory overwrote the first
-/// one's token and locked out its clients while it was still listening (F9).
-///
-/// Note the pid ROUND-TRIP: the digits are parsed to a `u32` and re-formatted,
-/// so `aterm-01.sock` pairs with `aterm-1.token` (not `aterm-01.token`) and a
-/// pid past `u32::MAX` falls through to the explicit form. That is unchanged
-/// behaviour, and `pid.to_string()` never emits a leading zero, so no name the
-/// server itself creates can reach it.
+/// The rule is injective over socket filenames, so two sockets in one directory never share a
+/// token file. The pid round-trips through `u32`: `aterm-01.sock` pairs with `aterm-1.token`
+/// and a pid past `u32::MAX` takes the explicit form; no name the server creates has either.
 #[must_use]
 pub fn token_name_for_sock(sock_name: &str) -> String {
     if let Some(pid) = sock_name_pid(sock_name) {
         return instance_token_name(pid);
     }
-    // Trust gate: concatenation instead of `format!` — see `instance_sock_name`.
+    // Concatenation, not `format!`: see `instance_sock_name`.
     let mut name = String::new();
     if !sock_name.ends_with(".sock") {
         name.push_str(EXPLICIT_TOKEN_PREFIX);
@@ -200,27 +155,15 @@ pub fn token_name_for_sock(sock_name: &str) -> String {
     name
 }
 
-/// Every token filename a CLIENT may read for the socket named `sock_name`,
-/// in the order it must try them. The first is always
-/// [`token_name_for_sock`] — the file this build's server writes.
+/// Every token filename a client may read for the socket named `sock_name`, in order. The
+/// first is always [`token_name_for_sock`], the file the server writes.
 ///
-/// An explicit socket adds exactly one fallback, the legacy
-/// [`SIBLING_TOKEN_FILE`]: that is what a server built BEFORE the per-socket
-/// token wrote for the very same socket, so a client from this build still
-/// authenticates against an older instance instead of failing for a reason
-/// no message could explain. It is a read-only bridge — nothing writes that
-/// name any more — and it can be deleted once no supported build does.
-///
-/// It cannot be used to present a DIFFERENT instance's token. A server
-/// compares `AUTH` against the token it minted in memory for itself, never
-/// against a file, so a shared `aterm.token` belonging to some other instance
-/// yields `ERR auth` — precisely what presenting nothing yields. And it is
-/// reached ONLY when the per-socket file is ABSENT, so an instance that wrote
-/// its own token can never have a client of its own fall off it.
-///
-/// A per-instance `aterm-<pid>.sock` gets NO fallback: it has paired with
-/// `aterm-<pid>.token` since the first release, so a miss there means the
-/// instance is gone, and the shared file could only ever be someone else's.
+/// An explicit socket adds one fallback, the legacy [`SIBLING_TOKEN_FILE`], so a client still
+/// authenticates against an instance from a build that wrote it. That cannot present another
+/// instance's token: a server compares `AUTH` against the token it holds in memory, so a
+/// foreign file yields `ERR auth` as presenting nothing does, and the fallback is read only when
+/// the per-socket file is absent. A per-instance `aterm-<pid>.sock` gets no fallback: a missing
+/// `aterm-<pid>.token` means the instance is gone.
 #[must_use]
 pub fn token_names_for_sock(sock_name: &str) -> Vec<String> {
     let mut names = Vec::with_capacity(2);
@@ -231,11 +174,9 @@ pub fn token_names_for_sock(sock_name: &str) -> Vec<String> {
     names
 }
 
-/// The `sock <abs-path>` line of a discovery graph entry (`<dir>/graph/<sid>`,
-/// written by the server, read by the server's sibling forward AND by
-/// `aterm-ctl`'s in-session self-location). ONE parser for the on-disk format
-/// so the two ends can never drift; the nonce line is server-only and parsed
-/// beside this. `None` for a missing/empty `sock` line.
+/// The `sock <abs-path>` line of a discovery graph entry (`<dir>/graph/<sid>`), which the server
+/// writes and both its sibling forward and `aterm-ctl`'s self-location read: one parser, so the
+/// ends cannot drift. `None` for a missing or empty `sock` line.
 #[must_use]
 pub fn graph_entry_sock(body: &str) -> Option<String> {
     body.lines()
@@ -244,28 +185,19 @@ pub fn graph_entry_sock(body: &str) -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
-/// ONE spelling per socket file, whichever way a path arrived at it.
+/// One spelling per socket file, however a path arrived at it: the key both the writer and the
+/// reader of the discovery graph use. It strips the verbatim-disk prefix and, on Windows, folds
+/// ASCII case (NTFS compares case-insensitively); off Windows it changes no real path.
 ///
-/// The discovery graph carries socket paths written by TWO code paths: the
-/// instance's own bind path as the launch plan spelled it, and the
-/// canonicalized form `proxy::set_self_sock` records for every later
-/// registration. On unix those agree once symlinks are resolved. On Windows
-/// `std::fs::canonicalize` answers the verbatim `\\?\C:\…` form, so the same
-/// `aterm-<pid>.sock` reached the client as `C:\…\aterm-16172.sock` from one
-/// session's entry and `\\?\C:\…\aterm-16172.sock` from the next — and the
-/// client's dedupe, which canonicalizes each side and compares, could not
-/// collapse them because Windows refuses to `canonicalize` an AF_UNIX socket
-/// file at all (it is a reparse point CreateFile will not open), so
-/// `aterm ctl instances` printed the one live instance twice.
-///
-/// This strips the verbatim-disk prefix and, on Windows, folds ASCII case
-/// (NTFS paths compare case-insensitively), and is the key both the writer
-/// and the reader use. Off Windows it is the identity.
+/// The graph carries both the bind path as the launch plan spelled it and the canonical form
+/// `proxy::set_self_sock` records. On Windows `canonicalize` answers `\\?\C:\…` and refuses an
+/// AF_UNIX socket file outright (a reparse point), so a client cannot reconcile the two by
+/// canonicalizing.
 #[must_use]
 pub fn socket_key(path: &str) -> String {
     let stripped = path.strip_prefix(r"\\?\").unwrap_or(path);
-    // Only a DRIVE path is un-verbatimed; `\\?\UNC\server\share` has no shorter
-    // spelling every API accepts, and a unix path never carries the prefix.
+    // Only a drive path is un-verbatimed: `\\?\UNC\server\share` has no shorter spelling every
+    // API accepts, and a unix path never carries the prefix.
     let drive = stripped.len() >= 2
         && stripped.as_bytes()[1] == b':'
         && stripped.as_bytes()[0].is_ascii_alphabetic();
@@ -277,14 +209,10 @@ pub fn socket_key(path: &str) -> String {
     }
 }
 
-/// The `pid <n>` line of a discovery graph entry — the pid of the HOSTING
-/// instance that wrote the entry. Written so `aterm-ctl`'s `instances`/`ls`
-/// discovery can report a pid even for an EXPLICIT-`--control-sock`
-/// instance whose socket filename does NOT encode one (`instance_pid` only
-/// recovers a pid from the `aterm-<pid>.sock` naming). ONE parser, shared with
-/// the writer, so the two ends can never drift. Additive: an older entry with
-/// no `pid` line — or a malformed value — parses to `None`, and the caller
-/// falls back to a `0` placeholder rather than dropping the instance.
+/// The `pid <n>` line of a discovery graph entry: the pid of the instance that wrote it, so
+/// `aterm-ctl`'s `instances`/`ls` can report a pid for an explicit-`--control-sock` instance
+/// whose socket name carries none. `None` for a missing `pid` line (an older entry) or a
+/// malformed value; the caller then shows `0` rather than dropping the instance.
 #[must_use]
 // Skip: `str::parse` absent std body; fail-closed like `instance_pid`.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -315,47 +243,30 @@ pub fn stale_instance_files(names: &[&str], pid_alive: &dyn Fn(u32) -> bool) -> 
 pub struct SockFileFacts<'a> {
     /// The bare filename (`aterm-4242.sock`, `private.sock`, `images`, …).
     pub name: &'a str,
-    /// Byte length. A bound AF_UNIX socket file is ZERO bytes on every
-    /// platform (on Windows it is a zero-byte reparse point), so anything with
-    /// bytes in it — the Windows `latest` pointer file, a token — is not a
-    /// socket leftover and is never touched.
+    /// Byte length. A bound AF_UNIX socket file is zero bytes on every platform (a zero-byte
+    /// reparse point on Windows), so a file with bytes in it (the Windows `latest` pointer file,
+    /// a token) is never touched.
     pub len: u64,
     /// Seconds since the file was last written; `0` when the clock cannot say.
     pub age_secs: u64,
 }
 
-/// How long a zero-length socket file must have sat untouched before the
-/// launch sweep will even probe it: one day. A younger file may belong to an
-/// instance between its `bind` and its first `accept` — a window measured in
-/// milliseconds — and the day-long margin makes that race unreachable rather
-/// than merely unlikely.
+/// How long a zero-length socket file must sit untouched before the launch sweep probes it: one
+/// day, which keeps an instance between its `bind` and first `accept` (milliseconds) out of reach.
 pub const STALE_SOCK_MIN_AGE_SECS: u64 = 24 * 60 * 60;
 
-/// From a socket-directory listing, the zero-length `*.sock` files at least
-/// `min_age_secs` old that NOTHING listens on — leftovers of instances that
-/// were killed (`Stop-Process`, SIGKILL) or that bound in a directory no
-/// current build uses — safe to remove. The complement of
-/// [`stale_instance_files`]: that rule needs a pid in the name and trusts it,
-/// which misses a leftover whose pid the OS has since recycled and every
-/// socket whose name carries no pid at all.
+/// From a socket-directory listing, the zero-length `*.sock` files at least `min_age_secs` old
+/// that nothing listens on: leftovers of killed instances, safe to remove. Complements
+/// [`stale_instance_files`], which trusts the pid in a name and so misses a recycled pid and a
+/// name with no pid.
 ///
-/// A file is stale when ALL of these hold, checked in this order:
-/// 1. it is named `*.sock`, is not the `latest` alias ([`LATEST_SOCK_FILE`],
-///    which is a symlink or pointer file, never a socket), and is not the
-///    socket that alias names (`aliased`) — the exemption the host's dead-pid
-///    sweep (the one applying [`stale_instance_files`]) makes too: the alias's
-///    target goes at the sweep after the alias moves on, never while it still
-///    names it;
+/// A file is stale when all of these hold, checked in this order:
+/// 1. it is named `*.sock`, is not the `latest` alias ([`LATEST_SOCK_FILE`]), and is not the
+///    socket that alias names (`aliased`), which waits for a sweep after the alias moves on;
 /// 2. it is zero bytes long (see [`SockFileFacts::len`]);
 /// 3. it is at least `min_age_secs` old;
-/// 4. nothing listens on it: a pid in its name is dead (`pid_alive` says so —
-///    a dead owner cannot be listening, so the socket is not probed), or
-///    `listening` reports no listener behind the file. A live listener is
-///    NEVER swept, whatever the file's name or age says.
-///
-/// `listening` is only consulted when the name gives no verdict, so a
-/// long-running instance's socket is probed once per launch of a sibling and
-/// a dead instance's is not probed at all.
+/// 4. nothing listens on it: the pid in its name is dead (then it is not probed), or
+///    `listening` finds no listener. A live listener is never swept.
 #[must_use]
 pub fn stale_socket_files(
     files: &[SockFileFacts<'_>],
@@ -395,8 +306,8 @@ pub fn symlink_targets_pid(target: &str, pid: u32) -> bool {
 mod tests {
     use super::*;
 
-    /// The two spellings Windows hands the discovery graph for ONE socket must
-    /// key the same; a UNC verbatim path and a unix path must pass untouched.
+    /// The two spellings Windows hands the discovery graph for one socket key the same; a UNC
+    /// verbatim path and a unix path pass untouched.
     #[test]
     fn socket_key_collapses_the_verbatim_drive_spelling_and_nothing_else() {
         let plain = r"C:\Users\u\AppData\Local\Temp\aterm\aterm-16172.sock";
@@ -497,8 +408,7 @@ mod tests {
             graph_entry_pid("sock /tmp/app.sock\nnonce abcd\npid 4242\n"),
             Some(4242)
         );
-        // Additive: an OLDER entry with no `pid` line parses to `None` (the
-        // discovery caller falls back to a 0 placeholder, never drops it).
+        // An entry with no `pid` line parses to `None`.
         assert_eq!(graph_entry_pid("sock /tmp/app.sock\nnonce abcd\n"), None);
         // Malformed values fail closed (no `+`/whitespace/non-digit tolerance).
         assert_eq!(graph_entry_pid("pid \n"), None);
@@ -508,17 +418,16 @@ mod tests {
 
     #[test]
     fn token_choice_follows_symlink_target() {
-        // The `latest` symlink resolves to an instance sock BEFORE the name
-        // rule is applied (the client `readlink`s first), so the pairing that
-        // matters for a flagless client is this one — unchanged for ever.
+        // A flagless client `readlink`s the `latest` alias before applying the rule, so this
+        // is the pairing it meets.
         assert_eq!(token_name_for_sock("aterm-7.sock"), "aterm-7.token");
         assert_eq!(token_name_for_sock("aterm-1.sock"), "aterm-1.token");
         assert_eq!(
             token_name_for_sock("aterm-4294967295.sock"),
             "aterm-4294967295.token"
         );
-        // The pid ROUND-TRIPS through `u32`: leading zeros normalize, and a pid
-        // past `u32::MAX` is not an instance name at all.
+        // The pid round-trips through `u32`: leading zeros normalize, and a pid past
+        // `u32::MAX` is not an instance name at all.
         assert_eq!(token_name_for_sock("aterm-01.sock"), "aterm-1.token");
         assert_eq!(
             token_name_for_sock("aterm-99999999999.sock"),
@@ -526,25 +435,19 @@ mod tests {
         );
     }
 
-    /// F9: two explicit sockets in ONE directory must not name one token file.
-    /// Each carries its own socket filename, so the second instance to start
-    /// cannot overwrite the first one's credential.
+    /// Two explicit sockets in one directory never name one token file.
     #[test]
     fn explicit_sockets_get_their_own_token_each() {
         assert_eq!(token_name_for_sock("a.sock"), "a.sock.token");
         assert_eq!(token_name_for_sock("b.sock"), "b.sock.token");
         assert_ne!(token_name_for_sock("a.sock"), token_name_for_sock("b.sock"));
-        // A socket literally named `aterm.sock` is only ever REACHED here when
-        // it is a real socket (the alias is resolved first), and it too gets
-        // its own file rather than the legacy shared one.
+        // A real socket named `aterm.sock` (the alias resolves first) gets its own file too.
         assert_eq!(token_name_for_sock("aterm.sock"), "aterm.sock.token");
         assert_ne!(token_name_for_sock("aterm.sock"), SIBLING_TOKEN_FILE);
     }
 
-    /// Odd names stay inside the rule, and — the load-bearing part — outside
-    /// the two RESERVED names. A bare `.token` append would hand a socket
-    /// named `aterm` the legacy shared file and one named `aterm-4242` pid
-    /// 4242's file, re-creating the collision under a different spelling.
+    /// Odd names stay off the two reserved names: a bare `.token` append would give `aterm` the
+    /// legacy shared file and `aterm-4242` pid 4242's.
     #[test]
     fn odd_socket_names_never_land_on_a_reserved_token_name() {
         for (sock, token) in [
@@ -568,9 +471,7 @@ mod tests {
         }
     }
 
-    /// The property the whole fix rests on: distinct socket filenames derive
-    /// distinct token filenames, so no directory can host two sockets sharing
-    /// one credential file.
+    /// Distinct socket filenames derive distinct token filenames.
     #[test]
     fn the_token_name_rule_is_injective_over_socket_names() {
         let names = [
@@ -592,9 +493,8 @@ mod tests {
         assert_eq!(tokens.len(), count, "two socket names shared a token name");
     }
 
-    /// A client tries the per-socket file first and the legacy shared name
-    /// only for an explicit socket — never for `aterm-<pid>.sock`, whose token
-    /// has never been shared and whose absence means the instance is gone.
+    /// A client tries the per-socket file first, and the legacy shared name only for an
+    /// explicit socket.
     #[test]
     fn read_candidates_put_the_per_socket_token_first() {
         assert_eq!(token_names_for_sock("aterm-7.sock"), vec!["aterm-7.token"]);
@@ -642,8 +542,8 @@ mod tests {
         }
     }
 
-    /// A probe that records which files it was asked about, so a test can
-    /// prove a verdict was reached WITHOUT dialling (dead pid, young file).
+    /// A probe that records which files it was asked about, so a test can prove a verdict was
+    /// reached without dialling (dead pid, young file).
     fn recording_probe(
         answer: bool,
     ) -> (
@@ -658,8 +558,7 @@ mod tests {
         })
     }
 
-    /// The Stop-Process / SIGKILL case: a zero-byte `aterm-<pid>.sock` whose
-    /// pid is dead is stale on the name alone — the socket is never dialled.
+    /// A zero-byte `aterm-<pid>.sock` of a dead pid is stale on its name alone, never dialled.
     #[test]
     fn aged_empty_sock_of_a_dead_pid_is_stale_without_a_probe() {
         let files = [aged("aterm-100.sock", 0), aged("aterm-200.sock", 0)];
@@ -676,9 +575,8 @@ mod tests {
         assert_eq!(*asked.borrow(), vec!["aterm-200.sock"]);
     }
 
-    /// The recycled-pid case (Windows hands a killed instance's pid to the
-    /// next process almost immediately): the pid reads alive, so only the
-    /// probe can tell — and a file nothing listens on is stale.
+    /// A recycled pid reads alive, so only the probe can tell; a file nothing listens on is
+    /// stale.
     #[test]
     fn aged_empty_sock_nobody_listens_on_is_stale_even_when_its_pid_is_alive() {
         let files = [aged("aterm-100.sock", 0)];
@@ -687,8 +585,7 @@ mod tests {
         assert_eq!(stale, vec!["aterm-100.sock"]);
     }
 
-    /// The one inviolable rule: a socket with a live listener is never swept,
-    /// however old the file is and whatever its name says about its pid.
+    /// A socket with a live listener is never swept, whatever its age or name.
     #[test]
     fn a_live_listener_is_never_stale() {
         let files = [aged("aterm-100.sock", 0), aged("private.sock", 0)];
@@ -735,9 +632,8 @@ mod tests {
         );
     }
 
-    /// Everything that is not a zero-length `*.sock` is ignored: the `latest`
-    /// alias by NAME (even a zero-byte one), files with bytes in them (the
-    /// Windows pointer file, tokens), and non-socket names.
+    /// Only a zero-length `*.sock` is a candidate, and never the `latest` alias (excluded by
+    /// name).
     #[test]
     fn only_zero_length_sock_files_other_than_the_latest_alias_are_candidates() {
         let files = [
@@ -755,10 +651,8 @@ mod tests {
         assert_eq!(*asked.borrow(), vec!["private.sock"]);
     }
 
-    /// The socket the `latest` alias names is kept, dead pid and all, and is
-    /// not even probed: it goes at the sweep after the alias moves on, the
-    /// rule the host's dead-pid sweep keeps too. Its neighbour, as dead and
-    /// as old, goes.
+    /// The socket the `latest` alias names is kept, unprobed, until the alias moves on; an
+    /// equally dead and old neighbour goes.
     #[test]
     fn the_socket_the_alias_names_is_kept_until_the_alias_moves_on() {
         let files = [aged("aterm-100.sock", 0), aged("aterm-200.sock", 0)];

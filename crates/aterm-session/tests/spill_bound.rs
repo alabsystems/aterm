@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The non-parking egress must bound its spill.
+//! The non-parking egress bounds its spill.
 //!
 //! `SinkWriter::write_frame_nonparking` (the off-thread small-frame egress) normally
 //! skips the `SPILL_CAP` backpressure the blocking
@@ -12,11 +12,11 @@
 //! thread uses `write_frame_interactive_with_receipt` instead.
 //!
 //! A blocking pipe whose read end is never drained stands in for the wedged
-//! foreground; a detached producer pumps small frames; a counting global
-//! allocator (this binary only) checks that retained heap stays near the 2 MiB
-//! `SPILL_CAP`. A pipe, not a pty: a raw-mode wedged pty backpressures the same
-//! way, but a canonical-mode pty discards overflow input at the line discipline
-//! and would make the test vacuous. Unix-only: a ConPTY handle has no spill path.
+//! foreground, a detached producer pumps small frames, and a counting global allocator
+//! (this binary only) checks that retained heap stays near the 2 MiB `SPILL_CAP`. A
+//! pipe, not a pty: a canonical-mode pty discards overflow input at the line
+//! discipline, which would make the test vacuous. Unix-only: a ConPTY handle has no
+//! spill path.
 #![cfg(unix)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -51,14 +51,12 @@ fn net() -> i64 {
     NET.load(Ordering::Relaxed)
 }
 
-/// `SPILL_CAP` in sink.rs is 2 MiB. With the fix, the spill `VecDeque` is bounded to
-/// ~that plus one frame; its backing allocation can be up to ~2× via doubling. 8 MiB
-/// leaves generous margin over the ~2–4 MiB steady state while still catching the
-/// unbounded case (which climbs into the hundreds of MiB in well under a second).
+/// `SPILL_CAP` (2 MiB) bounds the spill to about that plus one frame, and `VecDeque`
+/// doubling can take its allocation to ~2×; 8 MiB leaves margin over the ~2–4 MiB
+/// steady state while catching unbounded growth (hundreds of MiB in under a second).
 const HEAP_CEILING: i64 = 8 * 1024 * 1024;
-/// The spill must actually be exercised: if we never wedge the pty, retained heap
-/// stays tiny and the ceiling assert would pass vacuously. Require the buffer to have
-/// grown past this, proving the non-parking spill path really ran.
+/// The spill must actually run: without a wedge retained heap stays tiny and the
+/// ceiling check passes vacuously, so the delta must first pass this.
 const REPRODUCED_FLOOR: i64 = 256 * 1024;
 
 /// Small enough to take the non-parking path (`<= NONPARK_MAX = 4096`); large enough
@@ -67,10 +65,9 @@ const FRAME: usize = 4096;
 
 #[test]
 fn nonparking_spill_is_bounded_against_a_wedged_pty() {
-    // A blocking pipe stands in for the wedged foreground: the write end is the sink's
-    // "master" (blocking, matching the sink's contract); the read end is kept open but
-    // NEVER read, so the kernel buffer fills and further writes block — driving the
-    // spill exactly as a wedged raw-mode pty would.
+    // The write end is the sink's (blocking) master; the read end stays open but is
+    // never read, so the kernel buffer fills and the spill runs as on a wedged
+    // raw-mode pty.
     let mut fds: [libc::c_int; 2] = [0; 2];
     // SAFETY: `fds` is two writable c_int slots, as pipe(2) requires.
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -78,7 +75,7 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
 
     let sink = Arc::new(SinkWriter::new(fds[1]));
 
-    // Baseline AFTER setup so the delta is attributable to spill growth alone.
+    // Baseline after setup, so the delta is spill growth alone.
     let baseline = net();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -87,11 +84,9 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
         let stop = Arc::clone(&stop);
         thread::spawn(move || {
             let frame = vec![b'x'; FRAME];
-            // Machine-rate small-frame flood, like an automated control-verb driver.
-            // With the fix, this blocks on the cap once the pty wedges; without it,
-            // it spins forever growing the spill. Either way we never join it — the
-            // process reclaims it at exit — but honour `stop` for a clean shutdown
-            // on the (blocking) fast path.
+            // A machine-rate small-frame flood. Bounded, it parks on the cap once the
+            // pipe wedges; unbounded, it grows the spill forever. Never joined (the
+            // process reaps it at exit); `stop` only ends the loop on the fast path.
             while !stop.load(Ordering::Relaxed) {
                 if sink.write_frame_nonparking(&frame).is_err() {
                     break;
@@ -100,18 +95,13 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
         })
     };
 
-    // Sample retained heap. Two independent signals, checked on every sample so the
-    // wall-clock window never gates correctness (a slow machine just takes longer
-    // to fill the pipe one byte per syscall):
-    //   * REGRESSION (fail fast): delta crosses the ceiling. Without the cap the spill
-    //     climbs into the hundreds of MiB in well under a second, so this trips almost
-    //     immediately — and it is checked continuously, so a leak can never slip past
-    //     an early `break`.
-    //   * BOUNDED (pass): once the spill has reproduced (peak >= floor) it stops
-    //     growing and holds flat for STABLE_TARGET consecutive samples. Unbounded
-    //     growth never stabilises, so it can only exit via the ceiling assert.
-    // A generous absolute timeout distinguishes "never wedged" (a broken test setup)
-    // from either real outcome.
+    // Two signals, checked on every sample so wall-clock never gates correctness (a
+    // slow machine just fills the pipe more slowly):
+    //   * regression: the delta crosses the ceiling (unbounded growth reaches hundreds
+    //     of MiB in under a second), checked continuously so no early `break` hides it;
+    //   * bounded: once reproduced (peak >= floor) the delta holds flat for
+    //     STABLE_TARGET consecutive samples, which unbounded growth never does.
+    // The absolute timeout tells "never wedged" (a broken setup) from either outcome.
     const STABLE_TARGET: u32 = 8; // ~160ms of no growth above the running peak
     let reproduce_deadline = Instant::now() + Duration::from_secs(60);
     let mut peak: i64 = 0;
@@ -147,8 +137,8 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
     }
 
     stop.store(true, Ordering::Relaxed);
-    // Do NOT join: with the fix the producer is parked in the blocking cap wait and
-    // will not observe `stop` until the wedge clears; the process reaps it at exit.
+    // Not joined: the producer is parked in the blocking cap wait and will not see
+    // `stop` until the wedge clears; the process reaps it at exit.
     drop(producer);
 
     eprintln!(

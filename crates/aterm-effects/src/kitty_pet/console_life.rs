@@ -71,40 +71,33 @@ const SEAT_KEPT: f32 = 0.5;
 
 /// How long the resident holds still for an unpainted caret before the
 /// ordinary ladder takes over again. A DECTCEM hide means "I am repainting",
-/// which takes milliseconds, so a quarter second is many repaints' worth of
-/// patience. Past it the caret is still known (the host feeds it hidden or
-/// not), so the pet follows it rather than sitting through a long build or
-/// pager with its cursor hidden.
+/// which takes milliseconds; past this the pet follows the (still known) caret
+/// rather than sitting through a long build or pager with its cursor hidden.
 const HIDDEN_HOLD_MAX: f32 = 0.25;
 
 /// How long a spent interest (a content perch with no live event left) may
-/// hold the resident before the pet gets its own life back. Without it the
-/// console layer would answer `console_frames() == Some(false)` and
-/// `console_deadline() == None` forever, and the pet could never breathe,
-/// blink, settle, sleep or notice the caret leaving.
+/// hold the resident before the pet gets its own life back; unbounded, the pet
+/// could never breathe, blink, settle, sleep or notice the caret leaving.
 const PERCH_DWELL: f32 = 3.0;
 
-/// The visibility hold's dwell, in both directions. Per-frame presence from
-/// screen content can reverse every ~158 ms during typing; a shorter hold
-/// only slows that strobe, so this is 1.6x longer. It is also the budget the
-/// pet has to walk out of the way before it must fade instead.
+/// The visibility hold's dwell, in both directions. Per-frame presence can reverse every
+/// ~158 ms during typing and a shorter hold only slows that strobe, so this is 1.6× that.
+/// It is also the budget the pet has to walk out of the way before it must fade instead.
 const VETO_DWELL: f32 = 0.25;
 /// When an obstruction is real and sustained the pet yields over a ramp, not a
-/// hard cut: a fifth of a second reads as the cat stepping aside without
-/// painting over the user's text for long. The ramp back in is normally the
-/// pet's own 0.30 s arrival fade, because a body hidden long enough to be
-/// reseated returns at a new station (`reseat_unshown_console_body`), which
-/// retires the held verdict.
+/// hard cut: a fifth of a second reads as the cat stepping aside. The ramp back
+/// in is normally the pet's own [`FADE_IN`], because a body hidden long enough
+/// to be reseated returns at a new station (`reseat_unshown_console_body`),
+/// which retires the held verdict.
 const VETO_FADE: f32 = 0.20;
 /// An unbroken run of unknown verdicts this long (a surface that never
 /// regains coherence) counts as obstruction, so a retired world cannot strand
 /// an opaque pet on glass. Counts only unknowns about a body being emitted; a
 /// frame with no body goes to [`VisibilityHold::idle`].
 const VETO_BLIND: f32 = 0.50;
-/// Coming back IN FRONT of the glyphs waits this long with the drawn body
-/// clear of ink. [`VETO_DWELL`]'s reasoning — longer than a keystroke's
-/// half-period, so a body crossing the last typed glyph on every key cannot
-/// strobe — and its value, so the two perception holds cannot drift apart.
+/// Coming back in front of the glyphs waits this long with the drawn body clear
+/// of ink: [`VETO_DWELL`]'s value and reasoning (longer than a keystroke's
+/// half-period, so a body crossing the last typed glyph cannot strobe).
 const Z_DWELL: f32 = VETO_DWELL;
 
 /// What the resident does about a body beside a live caret — see
@@ -120,18 +113,11 @@ enum CaretSeat {
     Yield,
 }
 
-/// The pet's presence as a held state rather than a per-frame boolean.
-///
-/// Fed the three-valued clearance verdict for the emitted sprite rectangle, it
-/// answers a 0..=1 cover factor:
-///
-///  * an `Unknown` verdict neither flips the state nor resets a run in
-///    progress;
-///  * contrary evidence must persist for [`VETO_DWELL`] before the held
-///    verdict changes, and the cover then ramps over [`VETO_FADE`].
-///
-/// So a single obstructed frame cannot blank the pet, and a single clear
-/// frame cannot snap it back.
+/// The pet's presence as a held state rather than a per-frame boolean. Fed the
+/// three-valued clearance verdict for the emitted sprite rectangle, it answers
+/// a 0..=1 cover factor: a `None` verdict neither flips the state nor resets a
+/// run in progress, and contrary evidence must persist for [`VETO_DWELL`]
+/// before the held verdict changes, the cover then ramping over [`VETO_FADE`].
 #[derive(Clone, Copy, Debug)]
 struct VisibilityHold {
     /// The held verdict: may the pet be on glass at all?
@@ -155,8 +141,8 @@ struct VisibilityHold {
 
 impl Default for VisibilityHold {
     fn default() -> Self {
-        // Shown and opaque: the pet's OWN arrival fade owns the ramp-in, and
-        // a hold that started hidden would fight it.
+        // Shown and opaque: the pet's own arrival fade owns the ramp-in, and a
+        // hold that started hidden would fight it.
         Self {
             shown: true,
             contrary_since: None,
@@ -213,12 +199,12 @@ impl VisibilityHold {
         self.ramp(dt)
     }
 
-    /// Nothing was drawn at all, which is a different `None` from "I cannot
-    /// see there". The emitter often produces no body (an arrival fade not yet
-    /// started, a finished retirement, no caret); with no rectangle there is
-    /// nothing to be blind about, so this advances the ramp without touching
-    /// any run, and in particular never feeds [`VETO_BLIND`].
+    /// Nothing was drawn at all, a different `None` from "I cannot see there":
+    /// retire any incomplete dwell or blind run about a body no longer on glass
+    /// and advance the ramp, never feeding [`VETO_BLIND`].
     fn idle(&mut self, now: Instant) -> f32 {
+        self.contrary_since = None;
+        self.blind_since = None;
         let dt = self.advance(now);
         self.ramp(dt)
     }
@@ -245,8 +231,8 @@ impl VisibilityHold {
         self.cover
     }
 
-    /// Put the envelope where the glass already is: hidden and settled, with
-    /// no run in flight. For the paths that yield AT ONCE by design.
+    /// Put the envelope where the glass already is: hidden and settled, with no
+    /// run in flight. For the paths that yield at once by design.
     fn hide_now(&mut self, now: Instant) {
         self.shown = false;
         self.cover = 0.0;
@@ -266,16 +252,10 @@ impl VisibilityHold {
     }
 }
 
-/// The emitted Z-ORDER (`PetFrame::under_ink`) as a HELD STATE.
-///
-/// Recomputed per frame it flipped at the keystroke rate — 50 flips over
-/// one 80 ms/key pangram — and every flip swaps the cat between beneath and
-/// above the glyphs, the ribbon light, the caret halo and the sparkles.
-/// The two directions are not symmetric, on purpose: going UNDER is
-/// immediate, because a body is never painted in front of the user's text;
-/// coming back OVER needs the body clear of ink for [`Z_DWELL`]. A frame
-/// that draws nothing releases the hold — a flip is only visible between
-/// two drawn frames, so the next drawn one reads the ground afresh.
+/// The emitted z-order (`PetFrame::under_ink`) as a held state; recomputed per frame it
+/// would flip at the keystroke rate. Going under is immediate (a body is never painted in
+/// front of the user's text); coming back over needs the body clear of ink for
+/// [`Z_DWELL`]. A frame that draws nothing releases the hold.
 #[derive(Clone, Copy, Debug, Default)]
 struct ZHold {
     under: bool,
@@ -284,7 +264,7 @@ struct ZHold {
 }
 
 impl ZHold {
-    /// Advance one DRAWN frame; `ink` is real ink under the drawn body.
+    /// Advance one drawn frame; `ink` is real ink under the drawn body.
     fn update(&mut self, now: Instant, ink: bool) -> bool {
         if ink {
             self.under = true;
@@ -305,11 +285,9 @@ impl ZHold {
     }
 }
 
-/// Fold the hold's cover into an emitted opacity byte. Floored at 1 while
-/// any cover remains, for the reason the arrival ramp is floored: hosts gate
-/// "is the pet on glass" on `alpha > 0`, and rounding a faint-but-present
-/// body to zero would drop the sprite, its hit box and its motes for a frame
-/// — the exact cut this envelope exists to remove.
+/// Fold the hold's cover into an emitted opacity byte, floored at 1 while any
+/// cover remains: hosts gate "is the pet on glass" on `alpha > 0`, and rounding
+/// a faint body to zero would drop the sprite, its hit box and its motes.
 fn cover_alpha(alpha: u8, cover: f32) -> u8 {
     if alpha == 0 || cover <= 0.0 {
         return 0;
@@ -392,12 +370,12 @@ struct InputEpisode {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PerchTrip {
-    from: (f32, f32),
-    to: (f32, f32),
-    elapsed: f32,
-    duration: f32,
-    hop: bool,
+pub(super) struct PerchTrip {
+    pub(super) from: (f32, f32),
+    pub(super) to: (f32, f32),
+    pub(super) elapsed: f32,
+    pub(super) duration: f32,
+    pub(super) hop: bool,
 }
 
 #[derive(Default)]
@@ -414,7 +392,7 @@ pub(super) struct ConsoleLife {
     attention: PetAttention,
     reason: &'static str,
     anchor: Option<PetAnchor>,
-    target: Option<PetRect>,
+    pub(super) target: Option<PetRect>,
     gaze: Option<(f32, f32)>,
     resident: bool,
     resident_handoff: bool,
@@ -434,11 +412,11 @@ pub(super) struct ConsoleLife {
     caret_held: bool,
     tick_stamp: Option<PetWorldStamp>,
     repair_until: Option<Instant>,
-    repair_target: Option<(f32, f32)>,
+    pub(super) repair_target: Option<(f32, f32)>,
     progress_key: Option<u64>,
     progress: Option<TaskbarProgress>,
     progress_at: Option<Instant>,
-    trip: Option<PerchTrip>,
+    pub(super) trip: Option<PerchTrip>,
     lift: f32,
     source_seq: u64,
     completion_seq: u64,
@@ -447,11 +425,10 @@ pub(super) struct ConsoleLife {
     /// The brain's own `(col, row)` when [`Self::last_body`] was drawn: what
     /// the no-caret hold re-seats from. The drawn rect is not a seat — it
     /// carries the pose's lift and the row-0 pixel clamp.
-    last_seat: Option<(f32, f32)>,
-    /// THE ONE EXPLICIT FACT the reseat needs: did the last emission actually
-    /// put pixels on glass? This used to be inferred from `last_body` being
-    /// `None`, which the visibility veto ALSO wrote — so a vetoed frame read
-    /// as "never drawn", teleported the pet and restarted its fade from zero.
+    pub(super) last_seat: Option<(f32, f32)>,
+    /// Whether the last emission put pixels on glass. Not inferable from
+    /// `last_body` being `None`: the visibility veto also writes that, so a
+    /// vetoed frame would read as never drawn.
     on_glass: bool,
     hold: VisibilityHold,
     z: ZHold,
@@ -473,7 +450,7 @@ pub(super) struct ConsoleLife {
     /// and within [`REST_REACH`] of the stand, so the cat moves only when
     /// its ground is taken. Written from that `&self` reading (both the
     /// escort and the resident ask it); dropped with the surface.
-    rest_seat: std::cell::Cell<Option<(f32, f32)>>,
+    pub(super) rest_seat: std::cell::Cell<Option<(f32, f32)>>,
     /// Whether the station [`PetBrain::console_station`] last answered is
     /// that rest seat: ground that stays put while the caret moves, so a
     /// flight to it aims at it, with no caret drift
@@ -496,20 +473,19 @@ pub(super) struct ConsoleLife {
 /// One pane row's characters as a hash (FNV-1a), for [`ConsoleLife::row_sig`];
 /// 0 for a row with nothing written on it.
 fn row_signature(row: &[aterm_core::terminal::RenderCell]) -> u64 {
-    if row.iter().all(|cell| matches!(cell.ch, ' ' | '\0')) {
-        return 0;
+    let mut blank = true;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for cell in row {
+        blank &= matches!(cell.ch, ' ' | '\0');
+        h = (h ^ u64::from(u32::from(cell.ch))).wrapping_mul(0x0100_0000_01b3);
     }
-    row.iter()
-        .fold(0xcbf2_9ce4_8422_2325, |h, cell| {
-            (h ^ u64::from(u32::from(cell.ch))).wrapping_mul(0x0100_0000_01b3)
-        })
-        .max(1)
+    if blank { 0 } else { h.max(1) }
 }
 
 impl ConsoleLife {
     /// A fresh console life for a retired coordinate space. It keeps only the
-    /// world's buffer, retired exactly as a default map, as the spare the
-    /// next observation fills.
+    /// world's buffer and row-signature scratch vectors, retired and cleared
+    /// as the spare capacity the next observation fills.
     pub(super) fn retired(&mut self) -> Self {
         let spare_world = self
             .world
@@ -519,8 +495,17 @@ impl ConsoleLife {
                 world
             })
             .or_else(|| self.spare_world.take());
+        let mut row_sig = core::mem::take(&mut self.row_sig);
+        let mut row_sig_prev = core::mem::take(&mut self.row_sig_prev);
+        let mut row_sig_next = core::mem::take(&mut self.row_sig_next);
+        row_sig.clear();
+        row_sig_prev.clear();
+        row_sig_next.clear();
         Self {
             spare_world,
+            row_sig,
+            row_sig_prev,
+            row_sig_next,
             ..Self::default()
         }
     }
@@ -552,12 +537,10 @@ impl PetBrain {
             at: now,
             target: self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c))),
         });
-        // The kitty command's one re-stamp: a latched trick waits out the
-        // user's own typing, and this note is exactly one per admitted press.
-        // The move sensor must not re-stamp (program output moves the caret
-        // too, and a build log would hold the latch for its whole cap).
-        // Navigation, paste and kill chords re-stamp nothing: the listener has
-        // already poisoned or reset the line.
+        // The kitty command's one re-stamp: a latched trick waits out the user's own
+        // typing, one note per admitted press. The move sensor must not re-stamp (a build
+        // log would hold the latch for its whole cap); navigation, paste and kill chords
+        // re-stamp nothing (the listener has already poisoned or reset the line).
         if matches!(
             kind,
             PetInputKind::Text | PetInputKind::Delete | PetInputKind::Submit
@@ -631,12 +614,10 @@ impl PetBrain {
         self.observe_console_with_exclusions(input, facts, pane, &[]);
     }
 
-    /// Cells the last world observation classified: the pet's per-frame walk
-    /// size (min(rows,64) × min(cols,256), on every presented frame), exposed
-    /// so a running product can report the cost.
-    ///
-    /// Zero before any coherent observation and after a refused one
-    /// ([`PetWorld::retire`] clears the count).
+    /// Cells the last world observation classified (at most
+    /// `MAX_WORLD_ROWS` × `MAX_WORLD_COLS` per presented frame), so a running
+    /// product can report the cost. Zero before any coherent observation and
+    /// after a refused one ([`PetWorld::retire`] clears the count).
     #[must_use]
     pub fn observed_cells(&self) -> usize {
         self.console
@@ -737,13 +718,13 @@ impl PetBrain {
         if fixed_view {
             // Multiple coherent reads may precede one tick. A duplicate
             // observation cannot erase new local ink already observed.
-            let new_ink = self
-                .console
-                .last_body
-                .and_then(|r| local_ink(world, r, typed));
-            self.console.contact_changed |= old_ink
-                .zip(new_ink)
-                .is_some_and(|(a, b)| a.iter().zip(b).any(|(old, new)| new & !old != 0));
+            if let Some(old) = old_ink
+                && let Some(r) = self.console.last_body
+                && let Some(new) = local_ink(world, r, typed)
+            {
+                self.console.contact_changed |=
+                    old.iter().zip(new).any(|(old, new)| new & !old != 0);
+            }
         } else {
             // Moving existing ink through a pane-local mask is not contact
             // from newly displayed text. Reflow/unknown snapshots revoke too.
@@ -792,8 +773,12 @@ impl PetBrain {
             console.row_sig_prev.clear();
             return;
         };
-        console.row_sig_next.clear();
         let rows = pane.rows.min(input.cells.len().saturating_sub(pane.row));
+        // Coordinate/content identity does not cover render-time projection:
+        // SCP can reorder these characters without advancing content_seq.
+        // Read the actual pane rows before deciding that their signatures match.
+        console.row_sig_next.clear();
+        console.row_sig_next.reserve(rows);
         for r in pane.row..pane.row + rows {
             let row = &input.cells[r];
             let end = (pane.col + pane.cols).min(row.len());
@@ -824,13 +809,12 @@ impl PetBrain {
         }
         let top = (rect.row.floor() as i64 - 1).max(0) as usize;
         let bottom = ((rect.row + rect.rows).ceil() as i64 - 1).max(0) as usize;
-        let rows = top..=bottom;
+        let prev_rows = prev.get(top..=bottom)?;
+        if prev_rows == &cur[top..=bottom] || !prev_rows.iter().any(|&s| s != 0) {
+            return None;
+        }
         (1..=RIDE_ROWS_MAX).find_map(|k| {
-            (bottom + k < cur.len()
-                && rows.clone().all(|r| prev[r] == cur[r + k])
-                && rows.clone().any(|r| prev[r] != 0)
-                && rows.clone().any(|r| prev[r] != cur[r]))
-            .then_some(k as f32)
+            (bottom + k < cur.len() && prev_rows == &cur[top + k..=bottom + k]).then_some(k as f32)
         })
     }
 
@@ -853,10 +837,9 @@ impl PetBrain {
             let first = a.floor() as usize;
             let end = b.ceil() as usize;
             if end > first && end - first <= crate::pet_world::MAX_WORLD_COLS {
+                let r = row.round() as usize;
                 return (first..end).try_fold(false, |occupied, c| {
-                    world
-                        .locomotion_ink_at(row.round() as usize, c)
-                        .map(|ink| occupied || ink)
+                    world.locomotion_ink_at(r, c).map(|ink| occupied || ink)
                 });
             }
         }
@@ -882,6 +865,8 @@ impl PetBrain {
             // the previous custodian are not evidence about this one.
             self.console.hold = VisibilityHold::default();
             self.console.z = ZHold::default();
+            self.console.rest_seat.set(None);
+            self.console.rest_seated.set(false);
         }
         self.console.presentable = presentable;
     }
@@ -923,8 +908,8 @@ impl PetBrain {
     /// (the pane is all the cat's), or where no stage is within reach: it
     /// cheers where it stands, as it faces. A stage with no `at` where it
     /// already stands on one. Else where to land, `(col, row)`, the brain's
-    /// own seat: `prefer` (the stage a cut flight was bound for) while it is
-    /// still clear and reachable, else the nearest. The search below is
+    /// own seat: `prefer` (the stage it last set out for) while it is still
+    /// clear and reachable, else the nearest. The search below is
     /// pinned by `a_home_under_the_footer_cheers_on_the_ground_below_it` and
     /// `a_landing_in_a_narrow_pane_shows_its_notes`.
     pub(super) fn cheer_stage(
@@ -994,24 +979,33 @@ impl PetBrain {
             [Some(CheerAir::Compact), None],
         ];
         for tier in tiers {
-            let stages: Vec<(CheerAir, PetRect)> = tier
-                .into_iter()
-                .flatten()
-                .map(|air| (air, stage_at(air, (self.col, self.row))))
-                .collect();
-            if let Some(&(air, _)) = stages
+            let stages = tier.map(|opt| {
+                opt.map(|air| {
+                    let stage = stage_at(air, (self.col, self.row));
+                    let center = stage.col - CLEARANCE - half_px;
+                    let c_lo =
+                        ((center - CHEER_STAGE_COLS).floor().max(0.0) as u16).min(sense.cols);
+                    let c_hi = (((center + CHEER_STAGE_COLS).ceil().max(0.0) as u16)
+                        .saturating_add(1))
+                    .min(sense.cols);
+                    (air, stage, c_lo, c_hi)
+                })
+            });
+            if let Some(&(air, _, _, _)) = stages
                 .iter()
-                .find(|(_, stage)| world.clear(*stage, CLEARANCE))
+                .flatten()
+                .find(|(_, stage, _, _)| world.clear(*stage, CLEARANCE))
             {
                 return Some(CheerStage { at: None, air });
             }
-            // A flight the console law cut short is flown again to the stage
-            // it was bound for: the search below climbs first, and the stage
-            // may lie below where the cut flight came down.
+            // A cat that came down off the stage it set out for goes there
+            // again: the search below climbs first, and the stage may lie
+            // below where it came down.
             if let Some((col, row)) = prefer
-                && let Some(&(air, _)) = stages
+                && let Some(&(air, _, _, _)) = stages
                     .iter()
-                    .find(|&&(air, _)| reachable(air, (col - self.col, row - self.row)))
+                    .flatten()
+                    .find(|&&(air, _, _, _)| reachable(air, (col - self.col, row - self.row)))
             {
                 return Some(CheerStage {
                     at: Some((col, row)),
@@ -1031,13 +1025,17 @@ impl PetBrain {
                         continue;
                     }
                     let dr = dir * 0.1 * f32::from(step);
-                    for &(air, stage) in &stages {
+                    let row_dist = 2.0 * dr.abs();
+                    if row_dist > CHEER_STAGE_COLS || best.is_some_and(|(d, _, _)| row_dist >= d) {
+                        break;
+                    }
+                    for &(air, stage, c_lo, c_hi) in stages.iter().flatten() {
                         // Unseen cells are never clear, so the grid bounds the
                         // search and the map's coverage window bounds the
                         // answers.
-                        for c in 0..sense.cols {
+                        for c in c_lo..c_hi {
                             let dc = f32::from(c) + CLEARANCE + half_px - stage.col;
-                            let distance = (2.0 * dr.abs()).max(dc.abs());
+                            let distance = row_dist.max(dc.abs());
                             if distance > CHEER_STAGE_COLS
                                 || best.is_some_and(|(d, _, _)| distance >= d)
                             {
@@ -1116,15 +1114,12 @@ impl PetBrain {
         self.console_still_rect_verdict(self.col, self.row, self.last_stance) == Some(true)
     }
 
-    /// [`Self::console_still_body_clear`]'s verdict for a still body standing
-    /// at `(col, row)` of the same map in `stance` — a ghost still on glass
-    /// there at the boundary (`Departure::own_clear`), at the stance it is
-    /// drawn at (`Departure::stance0`) — three-valued over what the map
-    /// sees of it (`PetWorld::seen_under_text_clearance_past_caret`): `None`
-    /// where the part of it this map covers is clear and the rest is outside
-    /// the coverage window (unseen, which is not evidence of anything), and
-    /// `Some(false)` over a protected cell the map sees, or with no certified
-    /// map at all, which admits nothing.
+    /// [`Self::console_still_body_clear`]'s verdict for a still body at
+    /// `(col, row)` in `stance` (a ghost still on glass at the boundary,
+    /// `Departure::own_clear`), over what the map sees of it
+    /// (`PetWorld::seen_under_text_clearance_past_caret`): `None` where the
+    /// covered part is clear and the rest unseen, `Some(false)` over a
+    /// protected cell or with no certified map.
     pub(super) fn console_still_rect_verdict(
         &self,
         col: f32,
@@ -1194,16 +1189,13 @@ impl PetBrain {
     /// predicate authorizes a teleport, so it acts only on a certified
     /// `Some(false)`.
     ///
-    /// The caret is not an obstruction to its own escort: [`STATION_LEAD`]
-    /// seats the escort one cell past the caret, inside its 3x3 keep-off ring,
-    /// so reading the ring as protected would evict a cat sitting exactly
-    /// where the escort rule puts it. Glyphs are `ink_overlaps`'s to judge;
-    /// selections, images and uncertified geometry are this one's.
+    /// The caret is not an obstruction to its own escort: [`STATION_LEAD`] seats the escort
+    /// one cell past the caret, inside its 3x3 keep-off ring. Glyphs are `ink_overlaps`'s to
+    /// judge; selections, images and uncertified geometry are this one's.
     pub(super) fn console_obstructed(&self, sense: PetSense) -> bool {
         self.console.presentable
             && self.console.world.as_ref().is_some_and(|world| {
-                world.under_text_clearance_past_caret(self.console_body(sense), CLEARANCE)
-                    == Some(false)
+                Self::stand_clearance(world, self.console_body(sense)) == Some(false)
             })
     }
 
@@ -1231,10 +1223,9 @@ impl PetBrain {
                 self.row = row;
                 self.alpha = 0.0;
                 self.last_caret = None;
-                // A held verdict is a fact about a place, and this body just
-                // moved to a safe one, so retire the accumulated evidence. This
-                // also keeps recovery to one fade instead of this envelope's
-                // dwell and ramp on top of the 0.30 s arrival.
+                // A held verdict is a fact about a place and this body just
+                // moved to a safe one, so retire the evidence: recovery is one
+                // arrival fade, not this envelope's dwell and ramp on top.
                 self.console.hold = VisibilityHold::default();
             }
         }
@@ -1247,8 +1238,8 @@ impl PetBrain {
         // Taken, not read: only the spent-perch arm below re-establishes it,
         // so every other verdict restarts the dwell.
         let perched_since = self.console.perched_since.take();
-        // A body still gliding to its station has not settled yet, so the
-        // dwell measures SETTLED time and a long trip cannot eat it.
+        // A body still gliding to its station has not settled, so the dwell
+        // measures settled time and a long trip cannot eat it.
         let settled_since = if self.console.moving {
             sense.now
         } else {
@@ -1264,6 +1255,7 @@ impl PetBrain {
         let Some(stamp) = self.console.world.as_ref().and_then(|w| w.stamp()) else {
             self.console.cursor_home = None;
             self.console.rest_seat.set(None);
+            self.console.rest_seated.set(false);
             self.console.resident = false;
             self.console.trip = None;
             return;
@@ -1278,6 +1270,7 @@ impl PetBrain {
             self.console.anchor = None;
             self.console.target = None;
             self.console.rest_seat.set(None);
+            self.console.rest_seated.set(false);
             self.console.trip = None;
             self.console.progress_key = None;
             self.console.progress_at = None;
@@ -1287,6 +1280,8 @@ impl PetBrain {
         }
         if !self.console.presentable {
             self.console.cursor_home = None;
+            self.console.rest_seat.set(None);
+            self.console.rest_seated.set(false);
             self.console.resident = false;
             self.console.trip = None;
             self.console.anchor = None;
@@ -1299,7 +1294,7 @@ impl PetBrain {
             self.console.last_seat = None;
             return;
         }
-        // Only a PAINTED caret is a home: an unpainted one is a program's
+        // Only a painted caret is a home: an unpainted one is a program's
         // repaint, and its cell may be the program's write position.
         if let Some(caret) = sense.caret.filter(|_| sense.caret_drawn) {
             self.console.cursor_home = Some(caret);
@@ -1330,13 +1325,12 @@ impl PetBrain {
             self.pending_vigil_pounce = false;
             self.vigil_cheer = None;
             self.quiet = 0.0;
-            // A commanded seat stands down on its quiet clock, and a "heard
-            // you" beat the hand typed over owes its verb no longer: a key that
-            // does not move the caret is still the hand going back to work.
-            // The trick latch is kept: the word's own Enter is a fresh input,
-            // and the verb is owed to the prompt that follows.
+            // A commanded seat stands down on its quiet clock, and a "heard you" beat the
+            // hand typed over owes its verb no longer. The trick latch is kept: the word's
+            // own Enter is a fresh input, and the verb is owed to the prompt that follows.
             self.clear_trick_settle();
             self.drop_trick_go();
+            self.song_left = 0;
             // Intent is enough for attention even if the caret stays still.
             if self.alpha > 0.0 && self.action == PetAction::Sleep && sense.caret.is_some() {
                 self.set_action(PetAction::Waking);
@@ -1374,6 +1368,7 @@ impl PetBrain {
             self.pending_sulk = false;
             self.pending_cheer = None;
             self.drop_room_cheer();
+            self.drop_room_cue();
             self.pending_vigil_pounce = false;
             self.vigil_cheer = None;
             self.console.pose = Some(if gaze.0 < self.row - 0.5 {
@@ -1387,8 +1382,9 @@ impl PetBrain {
             return;
         }
 
-        // A small repair holds its local subject. Long deletion releases it
-        // to the existing retreat gait; arrow movement cannot create a repair.
+        // A small repair holds its local subject until the caret overlaps the body
+        // or the stand moves off its row or past it. Long deletion releases it to
+        // the retreat gait; arrow movement cannot create a repair.
         let repairing = self.console.repair_until.is_some_and(|end| sense.now < end)
             && self
                 .console
@@ -1449,7 +1445,6 @@ impl PetBrain {
             // input alone or a duplicate frame of the same ink. Read past the
             // caret's blank ring, or a cat at the caret's shoulder is never
             // `roomy` and `contact_armed` never re-arms.
-            let safe = world.clear_past_caret(body, CLEARANCE);
             let roomy = world.clear_past_caret(body, CONTACT_MARGIN);
             if roomy
                 && self
@@ -1477,7 +1472,7 @@ impl PetBrain {
                 self.console.attention = PetAttention::Contact;
                 self.console.reason = "advancing-ink";
                 self.console.pose = Some(if age(at) < 0.14 {
-                    if safe && self.facing_left {
+                    if self.facing_left && world.clear_past_caret(body, CLEARANCE) {
                         PetGlyphId::PetTailTuck
                     } else {
                         PetGlyphId::PetContactBrace
@@ -1489,13 +1484,9 @@ impl PetBrain {
             return;
         }
 
-        // Eligible direct affection outranks program watching; the petting
-        // owner consumes the contact and its finite hold unchanged.
-        //
-        // A typed kitty command is the same kind of address while it has the
-        // cat's attention or body ([`PetBrain::trick_engaged`]): the latch, its
-        // opening beat, a one-shot still playing, a commanded seat still held.
-        // Each term is finite or interruptible, and none is in
+        // Eligible direct affection outranks program watching, and a typed kitty command is
+        // the same kind of address while it holds the cat's attention or body
+        // ([`PetBrain::trick_engaged`]). Each term is finite or interruptible and none is in
         // `console_frames`, so a resident that owns the tick still parks.
         //
         // So is a landing's cheer (`PetBrain::note_room_landed`, §11.3 of
@@ -1521,9 +1512,36 @@ impl PetBrain {
                 self.room_cheer = false;
             }
         }
-        if self.pending_pet > 0 || self.pet_hold_t > 0.0 || self.trick_engaged() || self.room_cheer
+        if self.room_cue_act && !self.room_cue_in_play() {
+            self.room_cue_act = false;
+        }
+        let cue_ready = self.action.settled()
+            && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
+            && ((self.pending_room.is_some()
+                && self.room_at.is_some_and(|at| age(at) <= ROOM_CUE_TTL))
+                || (self.pending_bat.is_some()
+                    && self.bat_at.is_some_and(|at| age(at) <= BAT_TTL))
+                || (self.pending_look.is_some()
+                    && self.look_at.is_some_and(|at| age(at) <= LOOK_TTL))
+                || self
+                    .pending_perk
+                    .is_some_and(|at| sense.now >= at && age(at) <= V2_PERK_LATE)
+                || (self.catch_cool <= 0.0
+                    && self
+                        .pending_catch
+                        .is_some_and(|star| age(star.born) <= V2_CATCH_TTL)))
+            && home.is_some_and(|stand| self.caret_seat(world, body, stand) == CaretSeat::Hold);
+        if self.pending_pet > 0
+            || self.pet_hold_t > 0.0
+            || self.pending_bell.is_some()
+            || self.flinch_t > 0.0
+            || self.trick_engaged()
+            || self.room_cheer
+            || self.room_cue_act
+            || cue_ready
         {
             self.console.resident = false;
+            self.console.target = None;
             self.console.trip = None;
             self.console.pose = None;
             return;
@@ -1549,8 +1567,8 @@ impl PetBrain {
                     Some(sense.now + Duration::from_secs_f32(RESULT_HOLD));
             }
         }
-        // The located response replaces the old unbounded latch, never adds
-        // a later cheer after the user has already resumed another activity.
+        // The located response replaces the cheer/sulk latches: no cheer lands
+        // after the user has already resumed another activity.
         if completion.is_some() || self.console.result_at.is_some() {
             self.pending_sulk = false;
             self.pending_cheer = None;
@@ -1603,15 +1621,15 @@ impl PetBrain {
             let interactive_caret = sense.caret.filter(|&(cr, _)| {
                 sense.caret_drawn
                     && (subject.row > f32::from(cr) + 0.5
+                        || self.console.faux_caret.is_some()
                         || self.console.input.is_some_and(|e| {
-                            age(e.at) < LOAF_AFTER
-                                && matches!(
-                                    e.kind,
-                                    PetInputKind::Text
-                                        | PetInputKind::Delete
-                                        | PetInputKind::Navigate
-                                        | PetInputKind::Paste
-                                )
+                            matches!(
+                                e.kind,
+                                PetInputKind::Text
+                                    | PetInputKind::Delete
+                                    | PetInputKind::Navigate
+                                    | PetInputKind::Paste
+                            )
                         }))
             });
             self.console.gaze = Some(if let Some((cr, cc)) = interactive_caret {
@@ -1656,8 +1674,8 @@ impl PetBrain {
             self.console.still = true;
         } else if let Some(anchor) = self.console.anchor.and_then(|a| {
             world.resolve(a).or_else(|| {
-                // A coalesced output scroll can remove the old row while
-                // later rows of the SAME observed block remain on screen.
+                // A coalesced output scroll can remove the old row while later
+                // rows of the same observed block remain on screen.
                 world
                     .anchors()
                     .iter()
@@ -1666,13 +1684,9 @@ impl PetBrain {
                     .copied()
             })
         }) {
-            // One existing content anchor may survive a completed command; no
-            // timer grants another excursion around the same screen.
-            //
-            // The perch is a visit, not a tenancy: with no live event behind
-            // it, held forever it would pin pose, scale, lift and motes with no
-            // frame train and no wake. [`PERCH_DWELL`] bounds the visit and
-            // `console_deadline` offers its end.
+            // One content anchor may survive a completed command; no timer
+            // grants another excursion. The perch is a visit, not a tenancy:
+            // [`PERCH_DWELL`] bounds it and `console_deadline` offers its end.
             if sense
                 .now
                 .saturating_duration_since(settled_since)
@@ -1683,7 +1697,13 @@ impl PetBrain {
                 self.console.attention = PetAttention::Exploring;
                 self.console.reason = "content-perch";
                 self.console.gaze = Some((anchor.row, anchor.col));
-                self.console.pose = Some(PetGlyphId::PetEdgePerch);
+                self.console.pose = Some(if anchor.row < self.row - 0.5 {
+                    PetGlyphId::PetEdgeLookUp
+                } else if anchor.row > self.row + 0.5 {
+                    PetGlyphId::PetEdgeLookDown
+                } else {
+                    PetGlyphId::PetEdgePerch
+                });
                 self.choose_console_perch(anchor, body, home, stamp, prior);
                 self.console.resident = true;
                 self.console.still = true;
@@ -1733,19 +1753,27 @@ impl PetBrain {
                     let dy = (stamp.top_absolute_row - old.top_absolute_row) as f32;
                     target.row -= dy;
                     body.row -= dy;
-                    // The content may carry the body only while it stays on
-                    // glass. `dy` is a whole inter-tick scroll, and without a
-                    // floor the row would go negative and be clamped to the top
-                    // row by `emit`. So a scroll that would carry the body off
-                    // the top does not move it: the pet keeps its visible seat,
-                    // gives up the perch (the anchor left the view), and the
-                    // caret's escort re-stations it.
+                    // The content carries the body only while it stays on
+                    // glass: a scroll that would carry it off the top (where
+                    // `emit` would clamp it to row 0) leaves it in its visible
+                    // seat, gives up the perch, and lets the escort re-station it.
                     let scrolled_off_top = self.row - dy < 0.0;
                     if !scrolled_off_top {
                         self.row -= dy;
                         if let Some(trip) = self.console.trip.as_mut() {
                             trip.from.1 -= dy;
                             trip.to.1 -= dy;
+                        }
+                        if let Some(look) = self.adopted_look.as_mut() {
+                            look.seat.1 -= dy;
+                        }
+                        for d in self
+                            .departures
+                            .iter_mut()
+                            .flatten()
+                            .filter(|d| d.still && !d.resight && d.own_glass.is_none())
+                        {
+                            d.row -= dy;
                         }
                     }
                     leaving_view = dy > 0.0 && (target.row < 2.0 || scrolled_off_top);
@@ -1765,10 +1793,9 @@ impl PetBrain {
                 return;
             }
         }
-        // Output directs attention; the caret remains home, and home is the
-        // escort's stand ([`Self::console_seat`]). A certified resident is
-        // kept even on ordinary ink, avoiding a fresh search per identical
-        // frame.
+        // Output directs attention; the caret remains home, and home is the escort's stand
+        // ([`Self::console_seat`]). A certified resident is kept even on ordinary ink,
+        // avoiding a fresh search per identical frame.
         let next = self.console_seat(world, body, home);
         self.console.anchor = Some(subject);
         self.console.target = next;
@@ -1793,23 +1820,15 @@ impl PetBrain {
         self.console.resident_handoff
     }
 
-    /// THE REPAINT HOLD. A DECTCEM hide means "I am repainting", so for up to
-    /// [`HIDDEN_HOLD_MAX`] an unpainted caret is read as the last caret this
-    /// surface PAINTED ([`ConsoleLife::cursor_home`], while the observation
-    /// still vouches for it), as painted. The brain then sees a caret that has
-    /// not moved, and every arm runs as on a painted frame: no chase, no move
-    /// event, a flight lands where it was going, a sleeper sleeps. Past the
-    /// bound the unpainted caret passes through and is followed, starting as
-    /// a re-sighting: the pet did not see where it went, so the chase takes
-    /// it quietly from the pet's own feet, as it would a caret that
-    /// reappeared.
+    /// The repaint hold: for up to [`HIDDEN_HOLD_MAX`] an unpainted caret (a DECTCEM hide
+    /// means "I am repainting") reads as the last caret this surface painted
+    /// (`ConsoleLife::cursor_home`, while the observation vouches for it), so the brain sees
+    /// a painted caret that has not moved: nothing chases, a flight lands where it was going,
+    /// a sleeper sleeps. Past the bound the unpainted caret is followed as a re-sighting,
+    /// the chase taking it quietly from the pet's own feet.
     ///
-    /// The hold used to pin the resident's body instead, and a same-tick
-    /// escort resign handed the hidden caret straight to the ordinary ladder:
-    /// the pet chased the program's write position, stored it as its last
-    /// caret so the caret's return read as a line change, loafed a sleeper
-    /// awake, and was re-seated from its drawn rect with a flight's lift and
-    /// the row-0 clamp baked into its feet.
+    /// It holds the caret, not the body: pinning the body would let a same-tick escort
+    /// resign hand the hidden caret (the program's write position) to the ordinary ladder.
     pub(super) fn hold_unpainted_caret(&mut self, sense: PetSense, dt: f32) -> PetSense {
         if sense.caret_drawn && sense.caret.is_some() {
             self.console.hidden_hold = 0.0;
@@ -1872,30 +1891,15 @@ impl PetBrain {
         width: f32,
         dt: f32,
     ) -> Option<PetFrame> {
-        // A CARET THE PET CANNOT TAKE AT ITS WORD. The host says separately
-        // whether a caret EXISTS and whether it is PAINTED ([`PetSense::caret`]
-        // / [`PetSense::caret_drawn`]) since 2026-09-19, when a pet fed `None`
-        // for a hidden cursor sat 20.04 s at row 0 while a DECTCEM-hiding TUI
-        // worked on row 44, then crossed 28.4 cells in one frame (the owner's
-        // *"trapped at the top of the screen"*). Two cases reach here:
-        //
-        //  * caret ABSENT — the viewport is scrolled into history. There is
-        //    no better place for the cat than where it stands, so the
-        //    resident holds it there, unbounded, without inventing a caret for
-        //    the move sensor. It is re-seated at the brain's own seat from the
-        //    last drawn frame: `choose_console_perch`'s scroll compensation may
-        //    have moved it this tick, and output may not carry the resident
-        //    away from input (`hidden_cursor_home_stays_put_while_real_output_scrolls`).
-        //    A flight in the air is left to the no-caret arm, which eases its
-        //    lift down as it fades: re-seating it from the drawn rect used to
-        //    freeze the cat mid-air, its lift baked into its feet.
-        //  * caret PRESENT but unpainted past [`HIDDEN_HOLD_MAX`] (inside the
-        //    bound [`Self::hold_unpainted_caret`] already read it as the
-        //    painted home) — a build or a pager, not a repaint.
-        //
-        // Admission happens AFTER begin_console_tick has handled real
-        // selection, input, and OSC command facts: a hold does not erase
-        // attention ownership or lose a completion.
+        // Two carets the pet cannot take at its word:
+        //  * caret absent (the viewport is scrolled into history): hold the cat where it
+        //    stands, unbounded, without inventing a caret for the move sensor. It is
+        //    re-seated at `last_seat`: this tick's scroll compensation may have moved it,
+        //    and output may not carry the resident away from input. A flight in the air is
+        //    left to the no-caret arm, which eases its lift down.
+        //  * caret present but unpainted past [`HIDDEN_HOLD_MAX`]: a build or a pager.
+        // Admission follows `begin_console_tick`'s selection, input and OSC command
+        // handling, so a hold neither erases attention nor loses a completion.
         let holding = self.console.presentable
             && sense.caret.is_none()
             && self.console.cursor_home.is_some()
@@ -1921,13 +1925,10 @@ impl PetBrain {
             // no-caret arm this one stands in for.
             self.last_caret = None;
         } else if !sense.caret_drawn && sense.caret.is_some() && self.console.presentable {
-            // THE HOLD OUTLASTED THE REPAINT IT WAS FOR, and the caret is in
-            // plain sight of the brain even though the emulator is not drawing
-            // it. Residency would survive the bound on its own, and a resident
-            // sits at `console.target`, so hand the body back to the caret's
-            // own escort, which follows it (measured before this: the cat kept
-            // a stale seat for the whole of a 20 s build). A frame that paints
-            // the caret again re-establishes residency through the usual door.
+            // The hold outlasted its repaint and the caret is in plain sight of
+            // the brain though not drawn. Residency would survive on its own at
+            // a stale seat, so hand the body back to the caret's escort; a frame
+            // that paints the caret again re-establishes residency.
             self.console.resident = false;
             self.console.target = None;
             self.console.trip = None;
@@ -1961,20 +1962,47 @@ impl PetBrain {
             return None;
         }
         self.console.resident_handoff = false;
-        // A resident branch has already yielded affection to protected
-        // reading or another interest; retire its suppressed latch even with
-        // no safe footprint, so it cannot keep a hidden pet polling or replay
-        // when the selection is released.
+        // A gentle hand stroked over a settled watching resident earns the same
+        // affection as on an idle pet, while protected reading, repair holds,
+        // hidden-caret holds and transit reset any partial stroke.
+        let stroke_point = if !holding
+            && !sense.reduced_motion
+            && self.alpha > 0.0
+            && self.last_caret.is_some()
+            && sense.caret == self.last_caret
+            && self.console.trip.is_none()
+            && !self.console.clipped
+            && matches!(
+                self.console.attention,
+                PetAttention::Output
+                    | PetAttention::Progress
+                    | PetAttention::Result
+                    | PetAttention::Exploring
+            ) {
+            self.stroke_point(&sense, width)
+        } else {
+            None
+        };
+        if self.stroke.sample(sense.now, stroke_point, width) {
+            self.note_petted(sense.now);
+            self.console.resident = false;
+            self.console.target = None;
+            self.console.trip = None;
+            self.console.pose = None;
+            return None;
+        }
+        // A resident branch has already yielded affection to protected reading or another
+        // interest; retire its suppressed latch even with no safe footprint, so it cannot
+        // keep a hidden pet polling or replay when the selection is released.
         self.pet_hold_t = 0.0;
         self.pending_pet = 0;
         self.pet_at = None;
         // The kitty command goes the same way, so a held selection or hidden
-        // caret cannot replay a stale verb later. Exception, for the latch
-        // only: while a repair is live. Fixing a typo is still typing the word
-        // (`sot`, two backspaces, `it`, Space fires with the repair's hold
-        // standing), and the hold ([`EDIT_HOLD`] from the last key) is well
-        // inside the latch's TTL. Keyed on the repair's own clock, since
-        // advancing ink labels a repair as `Contact` at first.
+        // caret cannot replay a stale verb later. The exception is the latch
+        // only: while a repair is live, fixing a typo is still typing the word,
+        // and the repair's hold ([`EDIT_HOLD`]) is well inside the latch's TTL.
+        // Keyed on the repair's own clock, since advancing ink labels a repair
+        // `Contact` at first.
         let repairing = self.console.repair_until.is_some_and(|end| sense.now < end);
         let latched = self.pending_trick.filter(|_| repairing);
         self.drop_tricks();
@@ -1982,20 +2010,13 @@ impl PetBrain {
         let body = self.console_body(sense);
         let world = self.console.world.as_ref()?;
         let home = self.console_caret_home(sense, width);
-        // The escort delivers, the resident holds. Beside a live caret the seat
-        // is decided from the escort's stand every frame, never carried over
-        // from a target chosen while the body was elsewhere. A body not yet at
-        // the stand is the cursor follower's to move (its pace, row-hop path,
-        // lead decay and wall hysteresis) to the rect this arm calls home. A
-        // body off glass or under reduced motion is placed directly.
-        //
-        // A repair or a result holds its local subject: those arms claim the
-        // body where it is (an inspection, an exit flourish), admitted only on
-        // a body that may stand, within [`HOME_REACH`] of the stand, else the
-        // caret has first claim.
-        //
-        // With the caret hidden (or no home) there is no stand, so the
-        // admitted body is held where it stands.
+        // The escort delivers, the resident holds. Beside a live caret the seat is decided
+        // from the escort's stand every frame: a body not yet there is the cursor follower's
+        // to move, one off glass or under reduced motion is placed directly. A result claims
+        // the body where it is if it may stand within [`HOME_REACH`] of the stand; a repair
+        // does too unless the caret overlaps the body or the body sits off the stand's row
+        // or on the caret's side of it. With the caret hidden (or no home) the admitted body
+        // is held where it is.
         let caret_overlaps_body = sense.caret.is_some_and(|(cr, cc)| {
             let cr = f32::from(cr);
             let cc = f32::from(cc);
@@ -2056,6 +2077,23 @@ impl PetBrain {
             self.console.trip = None;
             self.speed = 0.0;
             self.last_caret = sense.caret;
+            self.last_burst = sense.output_burst;
+            self.twitch_t = 0.0;
+            self.stumble_t = 0.0;
+            self.clear_play();
+            self.pending_pounce = false;
+            self.pending_big_jump = false;
+            self.pending_bell = None;
+            self.pending_flow = None;
+            self.pending_perk = None;
+            self.pending_catch = None;
+            self.pending_look = None;
+            self.watch_heat = 0.0;
+            self.stream = false;
+            self.motes = [None; PET_MOTES_MAX];
+            self.land_t = 0.0;
+            self.retired_flight_lift = None;
+            self.drop_room_cue();
             return Some(self.emit(sense, width));
         };
         // A certificate for the current displayed body means stay here;
@@ -2077,13 +2115,44 @@ impl PetBrain {
         };
         self.last_caret = sense.caret; // the real caret only, including None
         self.quiet += dt;
+        let burst_edge = sense.output_burst && !self.last_burst;
+        self.last_burst = sense.output_burst;
+        self.twitch_t = if sense.reduced_motion {
+            0.0
+        } else {
+            (self.twitch_t - dt).max(0.0)
+        };
+        self.stumble_t = 0.0;
+        let prev_pointer = (
+            self.last_pointer,
+            self.pointer_vx,
+            self.pointer_vy,
+            self.pointer_speed,
+            self.pointer_heat,
+        );
+        let prev_v2 = (self.pending_perk, self.pending_catch);
         self.clear_play();
+        self.catch_cool = if sense.reduced_motion {
+            0.0
+        } else {
+            (self.catch_cool - dt).max(0.0)
+        };
+        let v2_live = !holding
+            && !sense.reduced_motion
+            && !self.console.clipped
+            && self.console.attention != PetAttention::Reading;
+        let age = |at: Instant| sense.now.saturating_duration_since(at).as_secs_f32();
         self.pending_pounce = false;
         self.pending_big_jump = false;
         self.pending_bell = None;
         self.pending_flow = None;
-        self.pending_perk = None;
-        self.pending_catch = None;
+        self.pending_perk = prev_v2.0.filter(|at| v2_live && age(*at) <= V2_PERK_LATE);
+        self.pending_catch = prev_v2
+            .1
+            .filter(|star| v2_live && age(star.born) <= V2_CATCH_TTL);
+        if !v2_live || self.room_at.is_none_or(|at| age(at) > ROOM_CUE_TTL) {
+            self.drop_room_cue();
+        }
         self.pending_bat = None;
         self.pending_look = None;
         self.watch_heat = 0.0;
@@ -2140,13 +2209,24 @@ impl PetBrain {
                 });
                 trip.elapsed += dt;
                 let u = (trip.elapsed / trip.duration).clamp(0.0, 1.0);
-                let x = trip.from.0 + (trip.to.0 - trip.from.0) * u;
-                let y = trip.from.1 + (trip.to.1 - trip.from.1) * u;
+                let s = if trip.hop { u } else { u * u * (3.0 - 2.0 * u) };
+                let x = trip.from.0 + (trip.to.0 - trip.from.0) * s;
+                let y = trip.from.1 + (trip.to.1 - trip.from.1) * s;
                 let travelled = (x - self.col).abs();
-                self.speed = (trip.to.0 - trip.from.0) / trip.duration;
+                self.speed = if dt > 0.0 && u < 1.0 {
+                    (x - self.col) / dt
+                } else {
+                    0.0
+                };
+                let amble = !trip.hop && (trip.to.0 - trip.from.0).abs() <= 2.0;
+                let step = if amble {
+                    LAT_STRIDE_CELLS
+                } else {
+                    STRIDE_CELLS
+                };
                 self.col = x;
                 self.row = y;
-                self.stride = (self.stride + travelled / STRIDE_CELLS).rem_euclid(1024.0);
+                self.stride = (self.stride + travelled / step).rem_euclid(1024.0);
                 self.console.moving = u < 1.0;
                 // A row transfer tucks its paws. It uses a shallow arc only
                 // when the entire swept footprint above the path is clear.
@@ -2166,7 +2246,15 @@ impl PetBrain {
                     self.console.lift = 0.0;
                 } else {
                     self.console.pose = Some(if trip.hop {
-                        PetGlyphId::PetHop
+                        if u < 0.25 {
+                            PetGlyphId::PetLeapRise
+                        } else if u < 0.65 {
+                            PetGlyphId::PetHop
+                        } else {
+                            PetGlyphId::PetLeapDescend
+                        }
+                    } else if amble {
+                        Self::CYCLE_LWALK[self.gait_index(Self::CYCLE_LWALK.len())]
                     } else {
                         Self::CYCLE_WALK[self.gait_index(Self::CYCLE_WALK.len())]
                     });
@@ -2184,28 +2272,112 @@ impl PetBrain {
         }
         if !self.console.moving {
             self.speed = 0.0;
-            if let Some((r, c)) = self.console.gaze {
+            self.plant_stride(dt);
+            if !holding
+                && !sense.reduced_motion
+                && !self.console.clipped
+                && self.action != PetAction::Sleep
+                && matches!(
+                    self.console.attention,
+                    PetAttention::Output | PetAttention::Exploring
+                )
+            {
+                (
+                    self.last_pointer,
+                    self.pointer_vx,
+                    self.pointer_vy,
+                    self.pointer_speed,
+                    self.pointer_heat,
+                ) = prev_pointer;
+                match sense.pointer {
+                    Some((px, py)) if px.is_finite() && py.is_finite() => {
+                        if let Some((lx, ly)) = self.last_pointer
+                            && dt > 1e-4
+                        {
+                            let k = 1.0 - (-dt / DASH_WINDOW).exp();
+                            self.pointer_vx += ((px - lx) / dt - self.pointer_vx) * k;
+                            self.pointer_vy += ((py - ly) / dt - self.pointer_vy) * k;
+                            let inst = ((px - lx) / dt).hypot((py - ly) / dt);
+                            self.pointer_speed += (inst - self.pointer_speed) * k;
+                        }
+                        self.last_pointer = Some((px, py));
+                        self.pointer_heat =
+                            if self.pointer_speed >= GAZE_FOLLOW_MIN / GAZE_FOLLOW_WINDOW {
+                                (self.pointer_heat + dt * POINTER_RISE).min(1.0)
+                            } else {
+                                (self.pointer_heat - dt * POINTER_FALL).max(0.0)
+                            };
+                    }
+                    _ => {
+                        self.last_pointer = None;
+                        self.pointer_vx = 0.0;
+                        self.pointer_vy = 0.0;
+                        self.pointer_speed = 0.0;
+                        self.pointer_heat = 0.0;
+                    }
+                }
+            }
+            let pointer_gaze = (self.pointer_heat > 0.0)
+                .then_some(self.last_pointer)
+                .flatten()
+                .map(|(px, py)| (py, px));
+            if let Some((r, c)) = pointer_gaze.or(self.console.gaze) {
                 self.facing_left = c < self.col + width * 0.5;
                 // First placement and the last transit frame use the gaze
                 // from the final station. No idle redraw is needed to settle.
                 if matches!(
                     self.console.attention,
-                    PetAttention::Reading | PetAttention::Output
-                ) && self.console.pose != Some(PetGlyphId::PetSit)
+                    PetAttention::Reading | PetAttention::Output | PetAttention::Exploring
+                ) && (self.console.pose != Some(PetGlyphId::PetSit)
+                    || pointer_gaze.is_some_and(|(pr, _)| (pr - self.row).abs() > 0.5))
                 {
                     self.console.pose = Some(if r < self.row - 0.5 {
                         PetGlyphId::PetEdgeLookUp
                     } else if r > self.row + 0.5 {
                         PetGlyphId::PetEdgeLookDown
-                    } else if self.console.attention == PetAttention::Reading {
+                    } else if self.console.pose == Some(PetGlyphId::PetSit) {
+                        PetGlyphId::PetSit
+                    } else if matches!(
+                        self.console.attention,
+                        PetAttention::Reading | PetAttention::Exploring
+                    ) {
                         PetGlyphId::PetEdgePerch
                     } else {
                         PetGlyphId::PetEdgeLean
                     });
                 }
             }
-        } else {
+            if !holding
+                && !sense.reduced_motion
+                && !self.console.clipped
+                && self.action != PetAction::Sleep
+                && self.console.pose == Some(PetGlyphId::PetSit)
+            {
+                if burst_edge && self.twitch_t <= 0.0 {
+                    self.twitch_t = TWITCH_DUR;
+                    self.twitch_up = self.mote_serial.is_multiple_of(2);
+                    self.mote_serial = self.mote_serial.wrapping_add(1);
+                }
+                if self.twitch_t > 0.0 {
+                    self.console.pose = Some(if self.twitch_up {
+                        PetGlyphId::PetSitEar
+                    } else {
+                        PetGlyphId::PetSitEarFar
+                    });
+                }
+            } else {
+                self.twitch_t = 0.0;
+            }
+        } else if self.speed.abs() > f32::EPSILON {
+            self.twitch_t = 0.0;
             self.facing_left = self.speed < 0.0;
+        } else if let Some(trip) = self.console.trip
+            && (trip.to.0 - trip.from.0).abs() > f32::EPSILON
+        {
+            self.twitch_t = 0.0;
+            self.facing_left = trip.to.0 < trip.from.0;
+        } else {
+            self.twitch_t = 0.0;
         }
         Some(self.emit(sense, width))
     }
@@ -2220,6 +2392,46 @@ impl PetBrain {
     /// parked on the cursor.
     fn console_may_stand(world: &PetWorld, rect: PetRect, margin: f32) -> bool {
         world.under_text_clearance_past_caret(rect, margin) == Some(true)
+    }
+
+    /// A stand's body as its clearance is judged ([`Self::stand_clearance`]):
+    /// [`CLEARANCE`] short at the feet, so the margin round it stops at the
+    /// ground it stands on.
+    fn on_its_feet(body: PetRect) -> PetRect {
+        PetRect::new(
+            body.row,
+            body.col,
+            (body.rows - CLEARANCE).max(f32::EPSILON),
+            body.cols,
+        )
+    }
+
+    /// Whether a stand at `body` is clear behind text past the caret
+    /// ([`PetWorld::under_text_clearance_past_caret`]), with [`CLEARANCE`] to
+    /// spare above and to the sides and none under the feet. A cat stands on
+    /// the row below it; its paws on that row's top edge cover nothing there.
+    /// Judged with the margin under the feet too, the stand on Claude Code's
+    /// composer row was refused wherever the host's chips sat on the rule
+    /// under it (all but the first fifth of the line with the footer on), and
+    /// the cat waited on the blank row over the composer, sixty cells behind
+    /// the caret, until a kept seat ran out of reach and it leapt the line
+    /// (2026-10-20, real Claude Code 2.1.305, windowed).
+    fn stand_clearance(world: &PetWorld, body: PetRect) -> Option<bool> {
+        let (feet, margin) = Self::stand_rect(world, body);
+        world.under_text_clearance_past_caret(feet, margin)
+    }
+
+    /// What a stand at `body` is judged by: [`Self::on_its_feet`], and
+    /// [`CLEARANCE`] round it, less against the pane's edge
+    /// ([`PetWorld::margin_in_map`]). Grown past the right edge, the reading
+    /// answered unknown, which a stand takes as clear: at the right margin
+    /// the escort's stand under the composer's reserved upper rule was
+    /// accepted, the cat flew onto the rule, and the console law, finding
+    /// nowhere to step it, hid it there until the wrap (2026-10-20, real
+    /// Claude Code 2.1.305 with the harness on, windowed).
+    fn stand_rect(world: &PetWorld, body: PetRect) -> (PetRect, f32) {
+        let feet = Self::on_its_feet(body);
+        (feet, world.margin_in_map(feet, CLEARANCE))
     }
 
     /// Whether this body must move: the same reading asked the other way.
@@ -2295,22 +2507,70 @@ impl PetBrain {
         world.stamp()?;
         let body = Self::console_stand_rect(desired, sense_dims.0, width);
         let from = self.rest_reach_from(world, sense_dims.0, width);
-        let walled = from.is_some_and(|from| Self::console_walled(world, from, body));
-        if !walled && world.under_text_clearance_past_caret(body, CLEARANCE) != Some(false) {
+        // Walled is a walk's: a stand on another row is a flight away, and
+        // a flight passes over the host's chrome.
+        let walled = from.is_some_and(|from| {
+            PetWorld::same_ground(from, body) && Self::console_walled(world, from, body)
+        });
+        if !walled && Self::stand_clearance(world, body) != Some(false) {
             self.console.rest_seat.set(None);
             return None;
         }
         // No perch in reach is `None`, not "stay where you are": both callers
         // fall back to the baseline station, so the pet keeps following the
         // caret.
-        if !walled && world.ground_under_text_clearance_past_caret(body, CLEARANCE) != Some(false) {
+        if !walled && {
+            let (feet, margin) = Self::stand_rect(world, body);
+            world.ground_under_text_clearance_past_caret(feet, margin) != Some(false)
+        } {
             let next = world.nearest_under_text_perch(body, CLEARANCE, HOME_REACH)?;
             return Some((next.col, next.foot_row()));
+        }
+        let resting = (self.flight.is_none() && self.alpha > 0.0).then_some((self.col, self.row));
+        // A cat on the stand's own line, escorting the caret along it, waits
+        // on it: at the last of the line's ground short of the refused stand,
+        // judged as a stand is and walked to, while the stand is within
+        // [`REST_REACH`]. The host's label on the composer's upper rule
+        // refuses the stands under it at the line's end; sent to a seat off
+        // the line, the cat hopped up off the line there and down again at
+        // the wrap, two flights where the wrap's one does (2026-10-20, real
+        // Claude Code 2.1.305, windowed).
+        let on_the_line = |row: f32| (row - desired.1).abs() < 0.5;
+        let held_seat = self.console.rest_seat.get();
+        if let Some((col, _)) = resting.filter(|&(_, row)| {
+            on_the_line(row) && held_seat.is_none_or(|(_, seat_row)| on_the_line(seat_row))
+        }) {
+            let at = |c: f32| Self::console_stand_rect((c, desired.1), sense_dims.0, width);
+            let may = |c: f32| {
+                let rect = at(c);
+                Self::stand_clearance(world, rect) == Some(true)
+                    && from.is_none_or(|from| !Self::console_walled(world, from, rect))
+            };
+            if (desired.0 - col).abs() <= REST_REACH && may(col) {
+                const STEP: f32 = 0.25;
+                let toward = STEP * (col - desired.0).signum();
+                let steps = ((desired.0 - col).abs() / STEP).floor() as usize;
+                let wait = (1..=steps)
+                    .map(|k| desired.0 + toward * k as f32)
+                    .find(|&c| may(c))
+                    .unwrap_or(col);
+                let seat = (wait, desired.1);
+                self.console.rest_seat.set(Some(seat));
+                self.console.rest_seated.set(true);
+                return Some(seat);
+            }
         }
         // The seat kept: the search's own acceptance, at the seat alone. A
         // seat gone, the ground the cat rests on is kept in its place while
         // it is a seat: the seat can move on while the cat stays (a frolic,
         // a startle), and a caret run back toward it is no reason to leave.
+        let pane_reach = || {
+            let across = body
+                .col
+                .abs()
+                .max((f32::from(sense_dims.1) - body.col).abs());
+            (2.0 * f32::from(sense_dims.0)).hypot(across)
+        };
         let keep = |seat: (f32, f32)| {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
             ((2.0 * (held.row - body.row)).hypot(held.col - body.col) <= REST_REACH)
@@ -2321,31 +2581,18 @@ impl PetBrain {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
             world.nearest_clear_perch(held, CLEARANCE, SEAT_KEPT, from)
         };
-        let resting = (self.flight.is_none() && self.alpha > 0.0).then_some((self.col, self.row));
-        let kept = self
-            .console
-            .rest_seat
-            .get()
-            .and_then(keep)
-            .or_else(|| resting.and_then(keep));
+        let kept = held_seat.and_then(keep).or_else(|| resting.and_then(keep));
         if let Some(next) = kept
             .or_else(|| world.nearest_clear_perch(body, CLEARANCE, REST_REACH, from))
             .or_else(|| {
-                self.console
-                    .rest_seat
-                    .get()
+                held_seat
                     .and_then(keep_any_clear)
                     .or_else(|| resting.and_then(keep_any_clear))
             })
             .or_else(|| {
                 // The search requires a finite reach. Cover the whole pane,
                 // including a stand whose column lies outside it.
-                let across = body
-                    .col
-                    .abs()
-                    .max((f32::from(sense_dims.1) - body.col).abs());
-                let reach = (2.0 * f32::from(sense_dims.0)).hypot(across);
-                world.nearest_clear_perch(body, CLEARANCE, reach, from)
+                world.nearest_clear_perch(body, CLEARANCE, pane_reach(), from)
             })
         {
             let seat = (next.col, next.foot_row());
@@ -2363,28 +2610,16 @@ impl PetBrain {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
             world.nearest_under_text_perch_from(held, CLEARANCE, SEAT_KEPT, from)
         };
-        let next = self
-            .console
-            .rest_seat
-            .get()
+        let next = held_seat
             .and_then(keep_under)
             .or_else(|| resting.and_then(keep_under))
             .or_else(|| world.nearest_under_text_perch_from(body, CLEARANCE, HOME_REACH, from))
             .or_else(|| {
-                self.console
-                    .rest_seat
-                    .get()
+                held_seat
                     .and_then(keep_any_under)
                     .or_else(|| resting.and_then(keep_any_under))
             })
-            .or_else(|| {
-                let across = body
-                    .col
-                    .abs()
-                    .max((f32::from(sense_dims.1) - body.col).abs());
-                let reach = (2.0 * f32::from(sense_dims.0)).hypot(across);
-                world.nearest_under_text_perch_from(body, CLEARANCE, reach, from)
-            });
+            .or_else(|| world.nearest_under_text_perch_from(body, CLEARANCE, pane_reach(), from));
         if let Some(next) = next {
             let seat = (next.col, next.foot_row());
             self.console.rest_seat.set(Some(seat));
@@ -2393,54 +2628,6 @@ impl PetBrain {
         }
         self.console.rest_seat.set(None);
         None
-    }
-
-    /// The arc a flight from the body to `to` (`(col, foot row)`) may rise
-    /// by: `arc`, or half, a quarter or none of it, the highest whose path
-    /// keeps the body (padded for the flight's stretch) off every cell the
-    /// console protects. The corridor a seat is chosen by is the box between
-    /// the two bodies on the ground ([`Self::console_walled`]); a bound's
-    /// rise is not in it. Launched from beside the host's chips on a
-    /// composer's rule, the bound rose into them in its first frames and
-    /// the console law stepped the body a column and more sideways in the
-    /// air (2026-10-20). `arc` unchanged where the ground path itself is
-    /// not clear: flattening could not help it.
-    pub(super) fn console_clear_arc(&self, to: (f32, f32), arc: f32, big: bool) -> f32 {
-        const PAD_COLS: f32 = 0.5;
-        const PAD_ROWS: f32 = 0.1;
-        if !self.console.presentable || arc <= 0.0 {
-            return arc;
-        }
-        let Some(world) = self.console.world.as_ref().filter(|w| w.stamp().is_some()) else {
-            return arc;
-        };
-        let width = art_cols(self.last_cell_w.max(1), self.last_cell_h.max(1));
-        let from = (self.col, self.row);
-        let steps = ((to.0 - from.0).abs().max((to.1 - from.1).abs() * 2.0) * 2.0)
-            .ceil()
-            .clamp(4.0, 256.0) as usize;
-        let clips = |a: f32| {
-            (0..=steps).any(|i| {
-                let u = i as f32 / steps as f32;
-                let col = from.0 + (to.0 - from.0) * u;
-                let row = from.1 + (to.1 - from.1) * u - Self::flight_lift(a, u, big);
-                let body = PetRect::new(row + 1.0 - ART_ROWS, col, ART_ROWS, width);
-                let padded = PetRect::new(
-                    body.row - PAD_ROWS,
-                    body.col - PAD_COLS,
-                    body.rows + PAD_ROWS,
-                    body.cols + 2.0 * PAD_COLS,
-                );
-                Self::console_must_yield(world, padded)
-            })
-        };
-        if !clips(arc) || clips(0.0) {
-            return arc;
-        }
-        [0.5 * arc, 0.25 * arc]
-            .into_iter()
-            .find(|&a| !clips(a))
-            .unwrap_or(0.0)
     }
 
     /// Where a rest seat must be reachable from ([`Self::console_station`]):
@@ -2496,7 +2683,7 @@ impl PetBrain {
             return false;
         };
         let body = Self::console_stand_rect(desired, rows, width);
-        world.under_text_clearance_past_caret(body, CLEARANCE) == Some(false)
+        Self::stand_clearance(world, body) == Some(false)
             || self
                 .rest_reach_from(world, rows, width)
                 .is_some_and(|from| Self::console_walled(world, from, body))
@@ -2517,14 +2704,11 @@ impl PetBrain {
         )
     }
 
-    /// The resident's home is the escort's stand: one distance from the caret.
-    /// (`tests/pet_resident_standoff.rs` pins that they agree.)
-    ///
-    /// Uses the escort's rule as `station_safe` gives it to the chase: the
-    /// lead-free [`PetBrain::station`] (a parked hand has no rhythm to lead)
-    /// with a controller lease's far stand folded in, run through the ink
-    /// ladder, and corrected by [`Self::console_station`] where the escort's
-    /// stand would be.
+    /// The resident's home is the escort's stand, one distance from the caret
+    /// (`tests/pet_resident_standoff.rs` pins that they agree): the lead-free
+    /// [`PetBrain::station`] with a controller lease's far stand folded in, kept
+    /// on the caret's left while the pet holds the wall side, run through the ink
+    /// ladder against this caret, and corrected by [`Self::console_station`].
     fn console_caret_home(&self, sense: PetSense, width: f32) -> Option<PetRect> {
         let (r, c) = sense.caret.or(self.console.cursor_home)?;
         let want = if self.wall_side && f32::from(sense.cols) - width > 0.0 {
@@ -2549,24 +2733,22 @@ impl PetBrain {
     /// What the resident does about a body beside a live caret whose home is
     /// `stand` ([`Self::console_caret_home`]). In order:
     ///
-    ///  * [`CaretSeat::Hold`]: a body the escort has delivered stays. It is at
-    ///    rest (`speed` under the `needs_frames` floor), within the chase's
-    ///    [`ARRIVED`] tolerance of the stand on its row, and may stand there.
-    ///    Correcting the chase's small arrival residue would slide a settled
-    ///    cat every time a command started.
-    ///  * [`CaretSeat::Escort`]: anywhere else is the escort's to close. Only
-    ///    a positive observation of a protected surface refuses the stand
-    ///    ([`Self::console_must_yield`]); the keep-off ring and ordinary ink do
-    ///    not. This arm does not walk the body itself: the chase already does,
-    ///    to the same rect, and a second mover is what
+    ///  * [`CaretSeat::Hold`]: a body the escort has delivered stays: at rest,
+    ///    within the chase's [`ARRIVED`] tolerance of the stand on its row, and
+    ///    allowed to stand there. Correcting the chase's arrival residue would
+    ///    slide a settled cat every time a command started.
+    ///  * [`CaretSeat::Escort`]: anywhere else is the escort's to close. Only a
+    ///    positive observation of a protected surface refuses the stand
+    ///    ([`Self::console_must_yield`]). This arm does not walk the body: the
+    ///    chase already does, and a second mover is what
     ///    `pet_position_authority` refuses.
-    ///  * [`CaretSeat::Yield`]: a protected stand. `console_caret_home` already
-    ///    applied the escort's correction ([`Self::console_station`]), so the
-    ///    caller asks [`PetWorld::nearest_under_text_perch`] once more and
-    ///    yields on `None`.
+    ///  * [`CaretSeat::Yield`]: a protected stand the escort's correction
+    ///    could not fix; the caller asks [`PetWorld::nearest_under_text_perch`]
+    ///    once more and yields on `None`.
     fn caret_seat(&self, world: &PetWorld, body: PetRect, stand: PetRect) -> CaretSeat {
         if self.speed.abs() <= 0.01
-            && Self::at_console_stand(body, stand)
+            && self.carry_speed() < FLIP_SPEED
+            && self.at_escort_stand(body, stand)
             && Self::console_may_stand(world, body, CLEARANCE)
         {
             CaretSeat::Hold
@@ -2575,6 +2757,29 @@ impl PetBrain {
         } else {
             CaretSeat::Yield
         }
+    }
+
+    /// Whether `body` is arrived at the stand the escort delivers to: either
+    /// the lead-free `stand` ([`Self::at_console_stand`]), or up to the
+    /// escort's held keep-ahead ([`Self::lead`]) ahead of `stand` when the
+    /// escort parked it beside this caret (`held_for`).
+    fn at_escort_stand(&self, body: PetRect, stand: PetRect) -> bool {
+        if Self::at_console_stand(body, stand) {
+            return true;
+        }
+        let lead = if !self.wall_side
+            && !self.console.rest_seated.get()
+            && self.console.cursor_home.is_some()
+            && self.held_for == self.console.cursor_home
+        {
+            self.lead()
+        } else {
+            0.0
+        };
+        lead > 0.0
+            && (body.row - stand.row).abs() < 0.25
+            && body.col >= stand.col - ARRIVED
+            && body.col <= stand.col + lead + ARRIVED
     }
 
     /// The seat as a target rect for the arms that only record one
@@ -2629,20 +2834,49 @@ impl PetBrain {
         if self.console.clipped || frame.alpha == 0 {
             return;
         }
+        // A body in the air is passing: over a rule, over the host's chips,
+        // over the words, for the fraction of a second its arc takes, and
+        // what it lands on is its stand or seat, chosen clear. The law is for
+        // a body that stays. Stepped aside in the air, a bound across the
+        // composer's rule was turned back off the rule at every frame and
+        // the cat leapt in place; walled off from such stands, it rested out
+        // of the caret's reach and took two flights at every wrap; and its
+        // arcs, flattened to keep off the chips, glided across the pane with
+        // no rise (2026-10-20).
+        if frame.action == PetAction::Leap {
+            return;
+        }
         let Some(world) = self.console.world.as_ref() else {
             return;
         };
         let Some(rect) = body_rect(frame, sense) else {
             return;
         };
-        // The console layer is not a second opinion about position. Distance
-        // from the caret is the escort's business (its chase at the shipped
-        // speed, and the resident handoff in [`Self::tick_console_resident`]).
-        // Pulling a far body home here would make two writers with different
-        // paces fight over it. What remains is the one correction the escort
-        // cannot make: a body on a selection, an image, or a row with no
-        // certified cell-to-pixel projection.
+        // Not a second opinion about position: distance from the caret is the escort's
+        // business, and pulling a far body home here would make two writers fight. What
+        // remains is the one correction the escort cannot make: a body on a protected surface.
+        //
+        // Its place is its body at its own size, as its stand was judged: a coil's
+        // squash and a landing's spread widen the drawn body by up to half a cell
+        // for a tenth of a second, over the blank margin a stand keeps from the
+        // host's chrome. Stepped aside for that, the cat waiting on the composer's
+        // line short of the harness switch jumped six pixels sideways as it
+        // gathered for the wrap's bound (2026-10-20, the generating replay with
+        // the harness's switch reserved).
         if !Self::console_must_yield(world, rect) {
+            return;
+        }
+        if (frame.scale_x != 1.0 || frame.scale_y != 1.0)
+            && body_rect(
+                &PetFrame {
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    ..*frame
+                },
+                sense,
+            )
+            .is_none_or(|natural| !Self::console_must_yield(world, natural))
+        {
             return;
         }
         // The rows round the body moved down together and brought the
@@ -2696,18 +2930,38 @@ impl PetBrain {
 
     /// Move the drawn body to `to` and every motion coordinate with it, or
     /// the next tick's lerp would restore the body to where it was.
-    fn carry_console_body(&mut self, frame: &mut PetFrame, to: PetFrame, ground_dy: f32) {
+    pub(super) fn carry_console_body(
+        &mut self,
+        frame: &mut PetFrame,
+        to: PetFrame,
+        ground_dy: f32,
+    ) {
         let (dx, dy) = (to.col - frame.col, to.row - frame.row);
+        let old_seat = (self.col, self.row);
         *frame = to;
         self.col += dx;
         self.row += ground_dy;
+        self.home += dx;
         self.col_at_tick += dx;
-        // A STILL GHOST IS THIS BODY A FRAME AGO — the fading half of an
-        // in-place crossfade — so it steps aside with the body, or the swap
-        // frame splits one cat into two a perch apart. A running ghost is
-        // its own motion and keeps its door, and a re-sighting ghost is not
-        // this body at all: it is the replaced surface's body, standing where
-        // the user saw it (on its own glass, in another pane's cells).
+        self.skid_from += dx;
+        if let Some(over) = self.brake_over.as_mut() {
+            *over += dx;
+        }
+        if let Some((tc, tr)) = self.play_to.as_mut()
+            && (*tc - old_seat.0).abs() <= 1e-4
+            && (*tr - old_seat.1).abs() <= 1e-4
+        {
+            *tc += dx;
+            *tr += ground_dy;
+        }
+        if let Some(look) = self.adopted_look.as_mut() {
+            look.seat.0 += dx;
+            look.seat.1 += ground_dy;
+        }
+        // A still ghost is this body a frame ago (the fading half of an
+        // in-place crossfade), so it steps aside with the body or the swap
+        // frame splits one cat in two. A running ghost keeps its own motion,
+        // and a re-sighting ghost is the replaced surface's body, not this one.
         for (record, drawn) in self.departures.iter_mut().zip(frame.departures.iter_mut()) {
             if let Some(record) = record.as_mut().filter(|d| d.still && !d.resight) {
                 record.from_col += dx;
@@ -2750,15 +3004,17 @@ impl PetBrain {
             return;
         }
         if let Some(pose) = self.console.pose {
-            // The contact is a pose over the existing displacement; flights
-            // keep their own silhouette unless this is the console's trip. A
-            // settled cat's own animation (sit, loaf, groom, sleep) is left
-            // alone while typing: the layer has nothing to correct there.
-            // Contact (advancing ink running into the body, a 0.40 s hold)
-            // still applies.
+            // The contact is a pose over the existing displacement; flights keep
+            // their own silhouette unless this is the console's trip. A settled
+            // cat's own animation (sit, loaf, groom, sleep) is left alone while
+            // typing; contact ([`CONTACT_HOLD`]) still applies. A body the chase
+            // is walking wears its gait: a brace or its recovery drawn over a
+            // walk slid the still pose along the row.
+            let travelling = matches!(self.action, PetAction::Walk | PetAction::Run);
             if !self.console_legacy_motion_pending()
                 && self.action != PetAction::Land
-                && (self.console.resident || self.console.attention == PetAttention::Contact)
+                && (self.console.resident
+                    || (self.console.attention == PetAttention::Contact && !travelling))
             {
                 frame.pose = self.species.skin(pose);
                 self.last_pose = pose;
@@ -2787,25 +3043,17 @@ impl PetBrain {
             return;
         };
         if world.stamp().is_none() {
-            // NO CERTIFIED MAP AT ALL — not "I cannot see this rectangle" but
-            // "I cannot see anything": a stale snapshot, a resize frame whose
-            // cells and facts straddle two grids. Nothing new is licensed
-            // here — the tick froze the body where it stood, and no station,
-            // perch or ghost is judged against a map that does not exist.
+            // No certified map at all (a stale snapshot, a resize frame whose
+            // cells and facts straddle two grids): nothing new is licensed, and
+            // the tick froze the body where it stood.
             frame.motes = [None; PET_MOTES_MAX];
             self.console.attention = PetAttention::Yielding;
             self.console.reason = "incoherent-surface";
             if self.console.on_glass && frame.alpha > 0 {
-                // A BODY ALREADY ON GLASS IS HELD, not cut (2026-10-01). It
-                // stands exactly where the last certified frame judged it,
-                // and "I cannot see" is the visibility hold's own unknown: it
-                // keeps the verdict that body already had, and only an
-                // unbroken blind run of [`VETO_BLIND`] counts as obstruction
-                // and fades it over [`VETO_FADE`]. Cutting to alpha zero here
-                // — the shipped rule until then — blinked the resident for
-                // one frame on every incoherent read: a resize frame, a
-                // snapshot a present reused. The z-order is held for the
-                // same reason: a body under the glyphs stays under them.
+                // A body already on glass is held, not cut: "I cannot see" is the
+                // visibility hold's own unknown, so only an unbroken blind run of
+                // [`VETO_BLIND`] fades it, and the z-order is held too. Cutting would blink
+                // the resident on every incoherent read (a resize frame, a reused snapshot).
                 let cover = self.console.hold.update(sense.now, None);
                 frame.alpha = cover_alpha(frame.alpha, cover);
                 frame.lane_alpha = cover_alpha(frame.lane_alpha, cover);
@@ -2823,17 +3071,16 @@ impl PetBrain {
                 self.console.on_glass = frame.alpha > 0;
                 return;
             }
-            // NOTHING WAS ON GLASS: the pet is drawn only over pixels an
+            // Nothing was on glass: the pet is drawn only over pixels an
             // observation certified, so a first appearance on an incoherent
-            // surface draws nothing.
-            //
-            // This bypasses the visibility hold: momentary incoherence is not
-            // evidence of ink, must not spend the dwell, and must not clear
-            // `on_glass` (which would grant the next reseat a teleport).
+            // surface draws nothing. This bypasses the visibility hold:
+            // momentary incoherence is not evidence of ink, must not spend the
+            // dwell, and must not clear `on_glass` (granting a reseat teleport).
             frame.alpha = 0;
             frame.lane_alpha = 0;
             frame.departures = [None; PET_DEPARTURES_MAX];
             self.console.clipped = true;
+            self.console.hold.idle(sense.now);
             self.console.z = ZHold::default();
             return;
         }
@@ -2865,19 +3112,11 @@ impl PetBrain {
                 self.console.reason = "protected-footprint";
             }
         } else {
-            // The visibility verdict is three-valued: `None` ("cannot see
-            // there", e.g. outside the caret-centred coverage window) is not
-            // evidence of ink, and the hold keeps the previous verdict on it.
-            //
-            // `under_text_clearance_past_caret`:
-            //
-            //  * under text: ordinary ink in front of the body is a z-order
-            //    fact (`frame.under_ink` below), not a reason to hide;
-            //  * past caret: placement keeps the caret protected so the pet
-            //    never rests on it, but a pet walking past it must not vanish
-            //    for the frames it overlaps. The escort lives in that ring.
-            //
-            // A frame with no body goes to `idle`, not `update`.
+            // The visibility verdict is three-valued: `None` ("cannot see there", e.g.
+            // outside the caret-centred coverage window) keeps the hold's previous verdict.
+            // Under text: ink in front of the body is a z-order fact, not a reason to hide.
+            // Past caret: a pet walking past the caret (the escort lives in that ring) must
+            // not vanish.
             let verdict = body.map(|rect| world.under_text_clearance_past_caret(rect, 0.0));
             let cover = match verdict {
                 Some(verdict) => self.console.hold.update(sense.now, verdict),
@@ -2897,13 +3136,10 @@ impl PetBrain {
                 // `clipped` waits for the cover to reach zero.
                 self.console.clipped |= frame.alpha == 0;
             }
-            // ORDINARY TERMINAL INK IS IN FRONT OF THE FULL BODY. A busy
-            // prompt must not switch a resident off or shrink it — it
-            // changes the z-order and nothing else, and that z-order is
-            // HELD (`ZHold`). Only real INK is asked about, never the
-            // caret's keep-off ring: an unobserved rectangle still answers
-            // inked and draws under the text, the safe direction for a
-            // layering decision.
+            // Ordinary ink in front of the body changes the held z-order (`ZHold`) and
+            // nothing else. Only real ink is asked about, never the caret's keep-off ring;
+            // an unobserved rectangle answers inked and draws under the text, the safe
+            // direction for layering.
             match body.filter(|_| frame.alpha > 0) {
                 Some(rect) => {
                     let ink = world.ink_clearance(rect, 0.0) != Some(true);
@@ -2922,13 +3158,16 @@ impl PetBrain {
         self.console.on_glass = frame.alpha > 0;
         // The whole emitted sprite, including motes and departing bodies,
         // is subordinate to selected text and the current occupancy map.
+        let min_ch = f32::from(sense.cell_h.max(6));
+        let cw = f32::from(sense.cell_w.max(1));
+        let ch = f32::from(sense.cell_h.max(1));
         for mote in &mut frame.motes {
             if mote.is_some_and(|m| {
                 // Conservative around the center, including minimum tile
                 // size, scaling and pixel rounding on every side.
-                let radius = f32::from(sense.cell_h.max(6)) * m.scale + 1.0;
-                let rw = radius / f32::from(sense.cell_w.max(1));
-                let rh = radius / f32::from(sense.cell_h.max(1));
+                let radius = min_ch * m.scale + 1.0;
+                let rw = radius / cw;
+                let rh = radius / ch;
                 !world.clear(
                     PetRect::new(m.row - rh, m.col - rw, 2.0 * rh, 2.0 * rw),
                     CLEARANCE,
@@ -2937,123 +3176,83 @@ impl PetBrain {
                 *mote = None;
             }
         }
-        // One crossfade, one visibility rule. The emitter draws a departing
-        // ghost at `d.alpha × lane_alpha / 255`, and `lane_alpha` carries this
-        // frame's cover, so body and ghost ramp together (a body at alpha 0
-        // took every ghost with it above). The ghost's own rectangle gets the
-        // body's rule:
+        // One crossfade, one visibility rule: the emitter draws a departing ghost at
+        // `d.alpha × lane_alpha / 255`, and `lane_alpha` carries this frame's cover, so body
+        // and ghost ramp together. A ghost gets the body's rule: selected text subordinates
+        // it at once, nothing else culls it, and one with no on-grid rectangle is dropped.
         //
-        //  * selected text subordinates it at once;
-        //  * nothing else culls a ghost by itself (an obstruction gets the
-        //    body's dwell and ramp).
-        //
-        // A ghost with no on-grid rectangle at all is dropped: there is
-        // nothing to draw.
-        //
-        // THE RE-SIGHTING GHOST is the one exception, because it is the one
-        // ghost whose rectangle the body never stood on in THIS world: it is
-        // the old surface's body fading on glass a new screen now owns
-        // (`Departure::resight`). It is kept only where this map certifies
-        // nothing protected — no selection, image or overlay — and it goes
-        // under whatever ink the new screen has there, so the text in front
-        // of it stays legible. Where this map cannot see it (outside its
-        // caret-centred coverage window: a tall screen whose caret is far
-        // from where the old body stood), it keeps the verdict its own
-        // surface gave it at the boundary (`Departure::own_clear`), beneath
-        // whatever ink is there — unknown is not evidence, the visibility
-        // hold's rule for a body already on glass — while any protected cell
-        // the map does see under it still refuses it
-        // (`PetWorld::seen_under_text_clearance_past_caret`). Culling it
-        // there left the arriver alone at its ramp's floor (measured: 15/255
-        // on the first frame of a 90-row alternate screen). So its guarantee
-        // is NEVER OVER A PROTECTED CELL THIS MAP SEES: a protected cell of
-        // the new screen outside the window is unknown, and the ghost may
-        // fade over it for its quarter second, beneath the ink (an inline
-        // image is drawn above the under-text layer in both renderers, and
-        // a double-width row's glyphs over the ghost). Over anything
-        // protected it sees it is dropped, and its presence is not lost: it
-        // goes to its arriver from this frame on (below), so the cat stands
-        // at its new station at the presence the user saw instead of
-        // vanishing to the floor.
-        //
-        // A GHOST ON ITS OWN GLASS (`Departure::own_glass`) is not on this
-        // map at all: it stands in the pane the focus left, in that pane's
-        // cells, and this world is the new pane's. Its own surface admitted it
-        // at the boundary (`PetBrain::displace_resight`), and it stays
-        // beneath that pane's ink, which nobody observes after it.
-        let base = *frame;
-        let selection = world.selection_rect();
-        // The presence of the crossfade ghosts refused this frame, as drawn,
-        // and their envelopes, which the arriver's ramp takes over below.
-        let mut refused = 0u16;
-        let mut handed = 0.0f32;
-        for (departure, live) in frame.departures.iter_mut().zip(self.departures.iter_mut()) {
-            let Some(d) = departure.as_mut() else {
-                continue;
-            };
-            if live.is_some_and(|l| l.own_glass.is_some()) {
-                d.under_ink = true;
-                continue;
+        // Exceptions: a re-sighting ghost (`Departure::resight`, the old surface's body
+        // fading on glass a new screen owns) is kept only where this map sees nothing
+        // protected, beneath the new screen's ink; where the map cannot see, it keeps its
+        // boundary verdict (`Departure::own_clear`), since unknown is not evidence. Refused,
+        // its presence goes to its arriver. A ghost on its own glass (`Departure::own_glass`,
+        // admitted by `PetBrain::displace_resight`) stays beneath that pane's ink.
+        if frame.departures.iter().any(Option::is_some) {
+            let base = *frame;
+            let selection = world.selection_rect();
+            // The presence of the crossfade ghosts refused this frame, as drawn,
+            // and their envelopes, which the arriver's ramp takes over below.
+            let mut refused = 0u16;
+            let mut handed = 0.0f32;
+            for (departure, live) in frame.departures.iter_mut().zip(self.departures.iter_mut()) {
+                let Some(d) = departure.as_mut() else {
+                    continue;
+                };
+                if live.is_some_and(|l| l.own_glass.is_some()) {
+                    d.under_ink = true;
+                    continue;
+                }
+                // Copying the frame before setting the ghost fields also avoids
+                // a stock-rustc MIR ICE for PetFrame's const-sized arrays on
+                // foreign targets (Linux ARM and Windows).
+                let mut ghost = base;
+                ghost.alpha = d.alpha;
+                ghost.col = d.col;
+                ghost.row = d.row;
+                // Judged where it is drawn: at its own stance
+                // (`Departure::stance0`), not the body's.
+                ghost.lift = d.lift;
+                ghost.scale_x = d.scale_x;
+                ghost.scale_y = d.scale_y;
+                let keep = match body_rect(&ghost, sense) {
+                    None => false,
+                    Some(rect) if selection.is_some_and(|s| rect.overlaps(s)) => false,
+                    Some(rect) if live.is_some_and(|l| l.resight) => {
+                        d.under_ink = world.ink_clearance(rect, 0.0) != Some(true);
+                        world
+                            .seen_under_text_clearance_past_caret(rect)
+                            .unwrap_or_else(|| live.is_some_and(|l| l.own_clear))
+                    }
+                    Some(_) => true,
+                };
+                if !keep {
+                    if let Some(l) = live.take_if(|l| l.resight) {
+                        refused += u16::from(d.alpha) * u16::from(base.lane_alpha) / 255;
+                        handed += l.envelope((self.lane_clock - l.born) as f32);
+                    }
+                    *departure = None;
+                }
             }
-            // Copying the frame before setting the ghost fields also avoids
-            // a stock-rustc MIR ICE for PetFrame's const-sized arrays on
-            // foreign targets (Linux ARM and Windows).
-            let mut ghost = base;
-            ghost.alpha = d.alpha;
-            ghost.col = d.col;
-            ghost.row = d.row;
-            // Judged where it is drawn: at its own stance
-            // (`Departure::stance0`), not the body's.
-            ghost.lift = d.lift;
-            ghost.scale_x = d.scale_x;
-            ghost.scale_y = d.scale_y;
-            let keep = match body_rect(&ghost, sense) {
-                None => false,
-                Some(rect) if selection.is_some_and(|s| rect.overlaps(s)) => false,
-                Some(rect) if live.is_some_and(|l| l.resight) => {
-                    d.under_ink = world.ink_clearance(rect, 0.0) != Some(true);
-                    world
-                        .seen_under_text_clearance_past_caret(rect)
-                        .unwrap_or_else(|| live.is_some_and(|l| l.own_clear))
-                }
-                Some(_) => true,
-            };
-            if !keep {
-                if let Some(l) = live.take_if(|l| l.resight) {
-                    refused += u16::from(d.alpha) * u16::from(base.lane_alpha) / 255;
-                    handed += l.envelope((self.lane_clock - l.born) as f32);
-                }
-                *departure = None;
+            // A refused crossfade ghost hands its presence to its arriver (one cat changing
+            // places on one ramp): the arriver shows what the ghost would have, never more
+            // than the lane's presence.
+            if refused > 0 {
+                frame.alpha =
+                    (u16::from(frame.alpha) + refused).min(u16::from(frame.lane_alpha)) as u8;
+            }
+            // The hand-over is for good: the refused ghost left the lane above, and lifting
+            // `arrive_from` by `envelope / remaining` adds exactly the ghost's envelope to every
+            // later frame's arrival; judging the refusal afresh each frame would count it twice.
+            // With no ramp left nothing is owed.
+            let remaining = self.arrive_t / self.arrive_in;
+            if handed > 0.0 && remaining > 0.0 {
+                self.arrive_from = (self.arrive_from + handed / remaining).min(1.0);
             }
         }
-        // A REFUSED CROSSFADE GHOST HANDS ITS PRESENCE TO ITS ARRIVER. The
-        // ghost and the arriver are one cat changing places on one ramp; a
-        // ghost that may not be drawn — something protected under it in this
-        // world, or no rectangle on this grid — puts what it would have shown
-        // on the arriver instead, never more than the lane's presence. The
-        // cat moves to its new station at once rather than vanishing to the
-        // ramp's floor and fading back in.
-        if refused > 0 {
-            frame.alpha = (u16::from(frame.alpha) + refused).min(u16::from(frame.lane_alpha)) as u8;
-        }
-        // THE HAND-OVER IS FOR GOOD. The refused ghost left the lane above,
-        // and the arriver's ramp starts from its share: lifting `arrive_from`
-        // by `envelope / remaining` adds exactly the ghost's envelope to every
-        // later frame's arrival, `envelope × remaining_then / remaining_now`
-        // (equal to the ghost's own fade on the ramp they share, its peak
-        // times what is left). A refusal judged afresh on every frame,
-        // with the ghost kept in the lane, counted it twice: carried to the
-        // next boundary beside the boosted body as presence the user saw
-        // (measured: a protected alternate screen quit two frames after it
-        // was entered summed 492/255 on the first frame back, a cat popping
-        // in beside the ghost), and re-admitted when the protection lifted
-        // mid-fade (the arriver fell 206/255 in one frame while the ghost
-        // reappeared at the old seat). No ramp left, nothing is owed: the
-        // arriver is already at the lane's presence.
-        let remaining = self.arrive_t / self.arrive_in;
-        if handed > 0.0 && remaining > 0.0 {
-            self.arrive_from = (self.arrive_from + handed / remaining).min(1.0);
-        }
+    }
+
+    pub(super) fn console_hold_settled(&self) -> bool {
+        self.console.hold.settled()
     }
 
     pub(super) fn console_frames(&self) -> Option<bool> {
@@ -3079,7 +3278,14 @@ impl PetBrain {
                 || self.console.completion.is_some()
                 || self.console.seq != self.console.consumed
                 || self.pending_pet > 0
-                || (!self.console.clipped && (self.console.moving || self.alpha < 1.0)),
+                || self.pending_bell.is_some()
+                || self.pending_bat.is_some()
+                || self.pending_look.is_some()
+                || (!self.console.clipped
+                    && (self.console.moving
+                        || self.alpha < 1.0
+                        || self.pointer_heat > 0.0
+                        || self.twitch_t > 0.0)),
         )
     }
 
@@ -3113,6 +3319,7 @@ impl PetBrain {
             .console
             .perched_since
             .map(|at| at + Duration::from_secs_f32(PERCH_DWELL));
+        let floor = self.last_now.unwrap_or(now);
         [
             input,
             contact_recover,
@@ -3128,9 +3335,9 @@ impl PetBrain {
         ]
         .into_iter()
         .flatten()
-        .filter(|at| *at > self.last_now.unwrap_or(now))
-        .map(|at| at.max(now + ARM_MIN))
+        .filter(|at| *at > floor)
         .min()
+        .map(|at| at.max(now + ARM_MIN))
     }
 
     pub(super) fn note_console_completion(&mut self, now: Instant, failed: bool) {
@@ -3151,12 +3358,10 @@ impl PetBrain {
     }
 }
 
-/// A body standing still at `(col, row)` in `stance` — [`Stance::NEUTRAL`]
-/// for the natural body, no lift, no squash — in fractional grid cells: the
-/// `PetFrame::body_px` projection itself (`drawn_body_px`), including the
-/// origin, the feet and the grid clamp. Fractional flight landings can
-/// straddle a protected cell before rounding even though the actual
-/// displayed body clears it.
+/// A body standing still at `(col, row)` in `stance` (no lift, no squash), in fractional
+/// grid cells: the `PetFrame::body_px` projection itself (`drawn_body_px`), origin, feet and
+/// grid clamp included, since a fractional landing can straddle a protected cell that the
+/// rounded body clears.
 fn still_body_rect(
     seat: (f32, f32),
     stance: Stance,
@@ -3191,14 +3396,12 @@ fn body_rect(frame: &PetFrame, sense: PetSense) -> Option<PetRect> {
         })
 }
 
-/// The caret's OWN writing this frame, pane-local `(row, first, end)`: the
-/// cells between the last ticked caret and the visible one on its row (the
-/// cell just behind the caret when the caret changed rows or went unseen),
-/// at most [`TYPED_RUN_MAX`]. A glyph typed there is the escort's next step,
-/// not ink arriving at the cat: counted as contact it braced the escort on
-/// the first key of every burst, the brace sliding sideways under the chase.
-/// Ink anywhere else — a completion, output, text the caret did not write —
-/// still touches.
+/// The caret's own writing this frame, pane-local `(row, first, end)`: the
+/// cells between the last ticked caret and the visible one on its row (the cell
+/// just behind the caret when it changed rows or went unseen), at most
+/// [`TYPED_RUN_MAX`]. A glyph typed there is the escort's next step, not ink
+/// arriving at the cat (as contact it would brace the escort on every burst's
+/// first key); ink anywhere else still touches.
 fn typed_run(
     input: &aterm_core::render::RenderInput,
     pane: PetPane,
@@ -3221,7 +3424,7 @@ fn typed_run(
     Some((row, first.max(col.saturating_sub(TYPED_RUN_MAX)), col))
 }
 
-/// Compare occupied ink at the SAME body rectangle before/after observation.
+/// Compare occupied ink at the same body rectangle before/after observation.
 /// Moving a cat or a caret toward old ink cannot manufacture contact. This
 /// tiny independent mask includes at most 16×32 cells; overflow is no claim.
 /// Cells of the caret's own `typed` run ([`typed_run`]) read as blank.
@@ -3240,14 +3443,13 @@ fn local_ink(
     }
     let mut bits = [0; 8];
     for r in r0..r1 {
+        let row_base = (r - r0) * 32;
+        let typed_cols = typed.and_then(|(row, first, end)| (row == r).then_some(first..end));
         for c in c0..c1 {
             match world.ink_at(r, c) {
                 None => return None,
-                Some(true)
-                    if !typed
-                        .is_some_and(|(row, first, end)| r == row && (first..end).contains(&c)) =>
-                {
-                    let i = (r - r0) * 32 + c - c0;
+                Some(true) if !typed_cols.as_ref().is_some_and(|cols| cols.contains(&c)) => {
+                    let i = row_base + c - c0;
                     bits[i / 64] |= 1 << (i % 64);
                 }
                 Some(_) => {}
@@ -3428,8 +3630,11 @@ mod tests {
     #[test]
     fn contact_requires_new_local_ink_not_a_redraw_or_body_motion() {
         let mut s = Scene::new();
-        // Record this exact footprint with blank space at its near edge.
+        // Record this exact footprint with blank space at its near edge. The
+        // held lead makes col 20 the station (caret 16 + 1 + 3): the cat has
+        // arrived, so the brace is drawn on a body at rest.
         s.pet.col = 20.0;
+        s.pet.held_lead = 3.0;
         s.pet.console.last_body = Some(PetRect::new(4.3, 20.0, 1.7, 5.6));
         s.input(PetInputKind::Text);
         s.term.process(b"\x1b[15;3Hunrelated\x1b[6;17H");
@@ -3460,6 +3665,115 @@ mod tests {
         assert_eq!(s.pet.last_pose, PetGlyphId::PetContactRecover);
         s.frame(1.0);
         assert_ne!(s.pet.console_attention(), PetAttention::Contact);
+
+        // SCP reprojects stored characters without changing the world stamp.
+        // Refresh the row history from the rendered cells, then retain that
+        // history when the exact same observation is read again.
+        let mut term = Terminal::new(4, 12);
+        term.set_default_background(aterm_types::Rgb { r: 0, g: 0, b: 0 });
+        term.set_palette_color_components(1, 255, 0, 0);
+        let clock = aterm_core::terminal::ClockReading {
+            monotonic: s.now,
+            wall_ms: Some(1_000),
+        };
+        term.process_at(
+            "abc \u{05D0}\u{05D1}\u{05D2}\x1b[3;1H│> \x1b[41m \x1b[0mabc   │\x1b[4;1H\x1b[?25l"
+                .as_bytes(),
+            clock,
+        );
+        term.process_at(b"\x1b[2 k", clock);
+        let rtl = term.cell_frame(4, 12);
+        let before_facts = PetWorldFacts::read(&term, 17);
+        let mut pet = PetBrain::default();
+        pet.observe_console(&rtl, &before_facts, PetPane::full(&rtl));
+        let before = pet.console.row_sig.clone();
+        assert_eq!(pet.console.faux_caret, Some((2, 3)));
+
+        term.process_at(b"\x1b[1 k", clock);
+        let ltr = term.cell_frame(4, 12);
+        let after_facts = PetWorldFacts::read(&term, 17);
+        assert_eq!(before_facts.stamp, after_facts.stamp);
+        assert_ne!(after_facts.stamp.content_seq, 0);
+        let chars = |input: &aterm_core::render::RenderInput| {
+            input.cells[0]
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(chars(&rtl), chars(&ltr), "SCP reprojects the same row");
+        pet.observe_console(&ltr, &after_facts, PetPane::full(&ltr));
+        assert_ne!(pet.console.row_sig, before, "changed glass refreshes rows");
+        assert_eq!(pet.console.row_sig_prev, before);
+        let after = pet.console.row_sig.clone();
+        pet.observe_console(&ltr, &after_facts, PetPane::full(&ltr));
+        assert_eq!(pet.console.row_sig, after);
+        assert_eq!(
+            pet.console.row_sig_prev, before,
+            "a duplicate read retains the previous different rows"
+        );
+
+        // A palette-only change preserves the characters and stamp, but the
+        // inverse-colour painted caret has gone. Detect the actual text tail.
+        assert_ne!(ltr.cells[2][3].bg, ltr.cells[2][1].bg);
+        term.set_palette_color(1, term.default_background());
+        let recoloured = term.cell_frame(4, 12);
+        let recoloured_facts = PetWorldFacts::read(&term, 17);
+        assert_eq!(after_facts.stamp, recoloured_facts.stamp);
+        assert_eq!(recoloured.cells[2][3].bg, recoloured.cells[2][1].bg);
+        pet.observe_console(&recoloured, &recoloured_facts, PetPane::full(&recoloured));
+        assert_eq!(pet.console.row_sig, after);
+        assert_eq!(
+            pet.console.faux_caret,
+            Some((2, 7)),
+            "palette changes revalidate the painted caret"
+        );
+    }
+
+    /// A contact on a body the chase is walking keeps the walk on glass: the
+    /// brace and its recovery are poses of a body at rest, and drawn over a
+    /// walk they slid along the row (the long-insert replay: 15 frames of
+    /// `PetContactRecover` gliding a cell and a quarter). The contact itself
+    /// is still noticed and held. Negative control: the same ink on the same
+    /// body at rest is braced (`contact_requires_new_local_ink_…`).
+    #[test]
+    fn a_walking_body_wears_its_gait_through_a_contact() {
+        let mut s = Scene::new();
+        // No held lead: the station is col 17, three cells behind the body.
+        s.pet.col = 20.0;
+        s.pet.console.last_body = Some(PetRect::new(4.3, 20.0, 1.7, 5.6));
+        s.input(PetInputKind::Text);
+        s.term.process(b"\x1b[6;20HX\x1b[6;17H");
+        let f = s.frame(0.016);
+        assert_eq!(s.pet.console_attention(), PetAttention::Contact);
+        let gait = |p: PetGlyphId| {
+            matches!(
+                p,
+                PetGlyphId::PetWalk0
+                    | PetGlyphId::PetWalk1
+                    | PetGlyphId::PetWalk2
+                    | PetGlyphId::PetWalk3
+                    | PetGlyphId::PetLwalk0
+                    | PetGlyphId::PetLwalk1
+                    | PetGlyphId::PetLwalk2
+                    | PetGlyphId::PetLwalk3
+                    | PetGlyphId::PetRun0
+                    | PetGlyphId::PetRun1
+                    | PetGlyphId::PetRun2
+                    | PetGlyphId::PetRun3
+            )
+        };
+        assert_eq!(f.action, PetAction::Walk, "fixture: the chase walks it");
+        assert!(
+            gait(f.pose),
+            "a walking body wears its gait, not {:?}",
+            f.pose
+        );
+        for _ in 0..20 {
+            let f = s.frame(0.016);
+            if matches!(f.action, PetAction::Walk | PetAction::Run) {
+                assert!(gait(f.pose), "through the hold too, not {:?}", f.pose);
+            }
+        }
     }
 
     #[test]
@@ -3505,17 +3819,11 @@ mod tests {
         assert!(s.pet.next_change_deadline(s.now).is_none());
     }
 
-    /// THE INCOHERENT FRAME HOLDS, AND ONLY HOLDS (2026-10-01). A stale
-    /// snapshot — the cells read before the terminal changed — certifies
-    /// nothing, so it licenses nothing: no move toward the caret it reports,
-    /// no legacy placement, no first appearance. But a body ALREADY on glass
-    /// is the visibility hold's unknown, not its obstruction: it stays where
-    /// the last certified frame judged it, at its opacity, until an unbroken
-    /// blind run of `VETO_BLIND` counts as obstruction and fades it over
-    /// `VETO_FADE`. The shipped rule cut it to alpha zero on the first
-    /// incoherent frame — the one-frame blink of a resize frame or a reused
-    /// snapshot. CONTROLS: the hold ends (an unbroken blind run fades the
-    /// body out), and a pet that was not on glass still draws nothing.
+    /// An incoherent snapshot licenses nothing (no move toward its caret, no
+    /// legacy placement, no first appearance), but a body already on glass
+    /// holds where the last certified frame judged it until an unbroken blind
+    /// run of `VETO_BLIND` fades it. Controls: the hold ends, and a pet not on
+    /// glass draws nothing.
     #[test]
     fn an_incoherent_observation_never_falls_back_to_uncertified_legacy_placement() {
         let incoherent = |s: &mut Scene, ms: u64| {
@@ -3561,8 +3869,7 @@ mod tests {
         assert_eq!(last.alpha, 0, "an unbroken blind run fades the body out");
         assert_eq!((last.col, last.row), (before.col, before.row));
 
-        // A pet that was not on glass is never MATERIALIZED by an
-        // uncertified map — the original law, unchanged.
+        // A pet that was not on glass is never materialized by an uncertified map.
         let mut cold = Scene::new();
         cold.pet.console.on_glass = false;
         let f = incoherent(&mut cold, 16);
@@ -3639,9 +3946,8 @@ mod tests {
             s.pet.needs_frames() || s.pet.next_change_deadline(s.now).is_some(),
             "a resident with nothing left to react to must still own a future"
         );
-        // That future is its own life: the perch is spent, so the pet goes back
-        // to escorting the caret and the idle ladder. The budget is derived
-        // from [`PERCH_DWELL`] so the test runs past the bound on its own.
+        // That future is its own life: the perch is spent, so the pet goes back to
+        // escorting the caret. The budget runs just past `PERCH_DWELL`.
         for _ in 0..((PERCH_DWELL / 0.016).ceil() as usize + 2) {
             s.frame(0.016);
         }
@@ -3656,13 +3962,10 @@ mod tests {
         );
     }
 
-    /// The escort: when no perch is in reach, `console_station` answers `None`
-    /// rather than "stay where you are", so the pet keeps following the caret.
-    ///
-    /// The fixture uses double-width lines: a resident may stand under
-    /// ordinary ink, but a DECDWL line has no certified cell-to-pixel
-    /// projection, so every cell is `Protected` and the search comes back
-    /// empty.
+    /// The escort: with no perch in reach, `console_station` answers `None` rather than
+    /// "stay where you are", so the pet keeps following the caret. The fixture's DECDWL
+    /// lines have no certified cell-to-pixel projection, so every cell is `Protected` and
+    /// the search comes back empty.
     #[test]
     fn no_perch_in_reach_is_not_an_opinion_about_where_the_pet_belongs() {
         let mut s = Scene::new();
@@ -3792,9 +4095,8 @@ mod tests {
         }
     }
 
-    /// Tier 1 checks the genuine retained brain field, not just a body that
-    /// might happen to remain nearby after losing its owner. Every snapshot
-    /// comes from a real Terminal; no input intent is manufactured.
+    /// Checks the retained brain field itself, not a body that happens to stay nearby.
+    /// Every snapshot comes from a real Terminal; no input intent is manufactured.
     #[test]
     fn hidden_cursor_home_continuity_conforms_to_real_terminal_motion() {
         use aterm_core::terminal::{ContentScrollDelta, ContentScrollState};
@@ -3928,6 +4230,91 @@ mod tests {
             leaked.insert("home", 1);
             assert!(!model.check_invariant("UnknownClearsHome", &leaked));
         }
+
+        // Multi-step trace on one Scene: KnownMove -> UnknownMove -> Observe -> KnownMove.
+        let mut s = Scene::new();
+        let state_of = |s: &Scene, event: i64| {
+            BTreeMap::from([
+                ("home", i64::from(s.pet.console.cursor_home.is_some())),
+                ("hidden", i64::from(!s.term.cursor_visible())),
+                ("event", event),
+            ])
+        };
+        let mut model_state = model.init_state();
+        assert_eq!(state_of(&s, 0), model_state);
+
+        // 1. KnownMove: hide cursor and scroll within region.
+        s.term
+            .process(b"\x1b[?25l\x1b7\x1b[1;18r\x1b[18;1H\n\x1b[r\x1b8");
+        s.frame(0.016);
+        let next = state_of(&s, 1);
+        assert!(model.successors("KnownMove", &model_state).contains(&next));
+        model_state = next;
+
+        // 2. UnknownMove: switch to alternate screen while hidden.
+        s.term.process(b"\x1b[?1049h\x1b[?25l");
+        s.frame(0.016);
+        let next = state_of(&s, 2);
+        assert!(
+            model
+                .successors("UnknownMove", &model_state)
+                .contains(&next)
+        );
+        assert!(
+            model.successors("KnownMove", &next).is_empty(),
+            "KnownMove is disabled once home is cleared"
+        );
+        model_state = next;
+
+        // 3. Observe: show cursor on the new surface to re-establish home.
+        s.term.process(b"\x1b[6;9H\x1b[?25h");
+        s.frame(0.016);
+        let next = state_of(&s, 0);
+        assert!(model.successors("Observe", &model_state).contains(&next));
+        assert_eq!(s.pet.console.cursor_home, Some((5, 8)));
+        model_state = next;
+
+        // 4. KnownMove on the re-established home preserves it.
+        s.term.process(b"\x1b[?25l\x1b7\x1b[20;1H\n\x1b8");
+        s.frame(0.016);
+        let next = state_of(&s, 1);
+        assert!(model.successors("KnownMove", &model_state).contains(&next));
+        assert_eq!(s.pet.console.cursor_home, Some((5, 8)));
+    }
+
+    #[test]
+    fn no_caret_retirement_settles_pending_visibility_runs_and_releases_frames() {
+        let mut s = Scene::new();
+        s.pet.col = 17.0;
+        // Settle the resident into deep sleep on glass (`elapsed` clamps at 5.0s).
+        for _ in 0..10 {
+            s.frame(5.0);
+        }
+        assert_eq!(s.pet.action(), PetAction::Sleep);
+        assert!(s.pet.console.on_glass);
+        assert!(s.pet.console.hold.settled());
+
+        // Start a blind run on glass (unsettled while shown).
+        let _ = s.pet.console.hold.update(s.now, None);
+        assert!(!s.pet.console.hold.settled());
+        assert!(s.pet.needs_frames());
+
+        // Retire the caret on a new surface so the pet fades to alpha 0 in sleep
+        // (`FADE_OUT` = 0.45s < `VETO_BLIND` = 0.50s).
+        s.term.process(b"\x1b[?1049h\x1b[?25l");
+        for _ in 0..35 {
+            s.frame(0.016);
+        }
+        s.frame(5.0);
+        assert_eq!(s.pet.alpha, 0.0);
+        assert!(
+            s.pet.console.hold.settled(),
+            "idle emission must clear pending visibility runs once the body fades off glass"
+        );
+        assert!(
+            !s.pet.needs_frames(),
+            "a faded-out sleeper must not stay on the 60 fps train"
+        );
     }
     /// A look swap that lands while a command's output owns the resident must
     /// still ramp the incoming cat in, not leave it at partial opacity until
@@ -4059,15 +4446,11 @@ mod tests {
         );
     }
 
-    /// THE GHOST ON ITS OWN GLASS IS ADMITTED BY ITS OWN WORLD, AT THE
-    /// BOUNDARY (`PetBrain::displace_resight`): a split-pane focus switch
-    /// spends the old body in the pane the focus left only where that pane's
-    /// last observation — the one the body was drawn against — certified
-    /// nothing protected under it. Spent, it stands at the old body's cell
-    /// beneath that pane's text while the arriver comes up at its own
-    /// station. CONTROL: a selection under the body in that observation
-    /// refuses it (what the arriver does with its presence then is
-    /// `pet_coordinate_seams`' `a_ghost_its_own_glass_refuses_…`).
+    /// A ghost on its own glass (`PetBrain::displace_resight`) is spent in the
+    /// pane the focus left only where that pane's last observation certified
+    /// nothing protected under it; it then stands beneath that pane's text
+    /// while the arriver comes up at its own station. Control: a selection
+    /// under the body refuses it.
     #[test]
     fn a_ghost_on_its_own_glass_needs_its_own_worlds_admission() {
         let switch = |select: bool| {
@@ -4114,11 +4497,9 @@ mod tests {
         );
     }
 
-    /// A GHOST IS CARRIED ACROSS A BOUNDARY AT WHAT ITS OWN SLOT DREW
-    /// (`PetBrain::last_drawn`), slot for slot: one in the lane's second slot
-    /// behind an empty first is carried at that slot's presence — a cover
-    /// that dimmed it to 0.4, not its envelope's full peak. CONTROL: a slot
-    /// that drew nothing is not carried.
+    /// A ghost is carried across a boundary at what its own slot drew
+    /// (`PetBrain::last_drawn`), slot for slot. Control: a slot that drew
+    /// nothing is not carried.
     #[test]
     fn a_carried_ghost_keeps_what_its_own_slot_drew() {
         let carry = |drawn: f32| {
@@ -4158,16 +4539,9 @@ mod tests {
         assert!(carry(0.0).is_empty(), "control: a ghost that drew nothing");
     }
 
-    /// MEASURED ON GLASS (0.83.0 with the crossfade fix, the Claude-Code-
-    /// shaped streamer, a look swap landing between two bracketed repaints
-    /// while `protected-displacement` held the body — the skeptic's
-    /// after-cascade_typing take, frames 398-412): the presented frame
-    /// carried the ARRIVER at 36 % and NO ghost, then the 0.25 s ramp. The
-    /// freeze was gone; the blink was not. The resident arm emptied the
-    /// departure lane on its first tick and `finish_console_frame` emptied
-    /// the frame's again, while the arriving body on the very same tick was
-    /// drawn through the hold like any other — two halves of one crossfade
-    /// under two laws.
+    /// A look swap landing while a hidden-caret resident holds the body keeps
+    /// both halves of the crossfade: the arriver ramps in and the departing
+    /// ghost is drawn under the same hold.
     #[test]
     fn a_look_swap_landing_under_a_hidden_caret_resident_keeps_both_halves_of_the_crossfade() {
         let mut s = Scene::new();
@@ -4182,8 +4556,8 @@ mod tests {
             (3, 1),
             "fixture: the homecoming parks"
         );
-        // The debounced handoff lands on a FREE tick — the streamer's
-        // caret-visible frame between two repaints — never on a resident's.
+        // The debounced handoff lands on a free tick (the streamer's
+        // caret-visible frame between two repaints), never on a resident's.
         let mut landing = None;
         for _ in 0..400 {
             let f = s.frame(0.016);
@@ -4333,11 +4707,9 @@ mod tests {
     }
 
     // ── the typed kitty commands, with an observed world ─────────────────
-    //
     // The brain's own trick tests run with no console world, so
     // `begin_console_tick` returns before it can wipe a latch or seat a
-    // resident. These drive the real terminal, input notes and OSC 133 block
-    // states.
+    // resident. These drive the real terminal, input notes and OSC 133 states.
 
     impl Scene {
         /// Type `text` the way the host does: one input note per key, then
@@ -4469,7 +4841,7 @@ mod tests {
         assert_eq!(s.pet.console_attention(), PetAttention::Output);
     }
 
-    /// …and so does a ONE-SHOT: a roll asked for during a build plays out
+    /// …and so does a one-shot: a roll asked for during a build plays out
     /// instead of being cut to its first pose by the resident's forced seat.
     #[test]
     fn a_roll_plays_through_an_executing_block() {
@@ -4564,12 +4936,15 @@ mod tests {
     /// narrower pane ([`AgentPane::narrow`]).
     struct AgentPane(Scene, Option<PetRect>, PaneGeom);
 
-    /// An agent pane's width and cell metrics (30 rows), and the host's
-    /// chrome over its composer's rules: the harness card's line on the
-    /// upper rule (its last 38 columns) and the footer's chips on the lower.
+    /// An agent pane's size and cell metrics, and the host's chrome over
+    /// its composer's rules: the harness card's line on the upper rule (its
+    /// last 38 columns) and the footer's chips on the lower.
     #[derive(Clone, Copy, Debug)]
     struct PaneGeom {
         cols: u16,
+        /// 30 (open ground under the composer), or 16: the composer at the
+        /// pane's foot, as a session's pane is once its transcript fills it.
+        rows: u16,
         cell: (u16, u16),
     }
 
@@ -4577,6 +4952,7 @@ mod tests {
         /// The lab's pane: 100 x 30 at 2x (15 x 28 px cells).
         const WIDE: Self = Self {
             cols: 100,
+            rows: 30,
             cell: (15, 28),
         };
 
@@ -4620,6 +4996,11 @@ mod tests {
         /// harness's prompt on its band, the clean defense wrapped onto two
         /// rows, and the done line beside open ground, over the composer.
         fn narrow(cols: u16, cell: (u16, u16)) -> Self {
+            Self::narrow_at(cols, 30, cell)
+        }
+
+        /// [`Self::narrow`], `rows` tall ([`PaneGeom::rows`]).
+        fn narrow_at(cols: u16, rows: u16, cell: (u16, u16)) -> Self {
             Self::with_geom(
                 "\x1b[2J\x1b[1;1H  pushed to origin/main.\r\n\r\n\
                  \u{273b} Baked for 40s \u{b7} done 1:39 PM\r\n\r\n\
@@ -4629,12 +5010,12 @@ mod tests {
                  \x20 pushed to origin/main.\r\n\r\n\
                  \u{273b} Cooked for 40s \u{b7} done 1:41 PM\r\n\r\n",
                 200,
-                PaneGeom { cols, cell },
+                PaneGeom { cols, rows, cell },
             )
         }
 
         fn with_geom(transcript: &str, warm: usize, geom: PaneGeom) -> Self {
-            let mut term = Terminal::new(30, geom.cols);
+            let mut term = Terminal::new(geom.rows, geom.cols);
             term.process(b"\x1b]11;#000000\x07");
             term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07claude\r\n\x1b]133;C\x07");
             term.process(transcript.as_bytes());
@@ -4681,7 +5062,9 @@ mod tests {
         fn observe(&mut self) {
             let (extra, geom) = (self.1, self.2);
             let s = &mut self.0;
-            let input = s.term.cell_frame(30, usize::from(geom.cols));
+            let input = s
+                .term
+                .cell_frame(usize::from(geom.rows), usize::from(geom.cols));
             let facts = PetWorldFacts::read(&s.term, 17);
             let [card, chips] = geom.chrome();
             let chrome = [card, chips, extra.unwrap_or_default()];
@@ -4706,7 +5089,7 @@ mod tests {
                 now: s.now,
                 caret: Some((c.row, c.col)),
                 wrapped: false,
-                rows: 30,
+                rows: geom.rows,
                 cols: geom.cols,
                 cell_w: geom.cell.0,
                 cell_h: geom.cell.1,
@@ -5171,6 +5554,7 @@ mod tests {
             let PaneGeom {
                 cols,
                 cell: (cw, ch),
+                ..
             } = self.2;
             let (cw, ch) = (i32::from(cw), i32::from(ch));
             frames
@@ -5181,7 +5565,8 @@ mod tests {
                         && matches!(f.pose, PetGlyphId::PetStretch | PetGlyphId::PetStretchHind)
                 })
                 .filter_map(|(k, f)| {
-                    let (x0, x1, y0, y1) = f.body_px(self.2.cell.0, self.2.cell.1, cols, 30)?;
+                    let (x0, x1, y0, y1) =
+                        f.body_px(self.2.cell.0, self.2.cell.1, cols, self.2.rows)?;
                     let under: Vec<_> = (y0.div_euclid(ch)..(y1 + ch - 1).div_euclid(ch))
                         .flat_map(|r| {
                             (x0.div_euclid(cw)..(x1 + cw - 1).div_euclid(cw)).map(move |c| (r, c))
@@ -5360,9 +5745,10 @@ mod tests {
             );
             let PaneGeom {
                 cols,
+                rows,
                 cell: (cw, ch),
             } = self.2;
-            let (x0, x1, y0, y1) = f.body_px(cw, ch, cols, 30).expect("on glass");
+            let (x0, x1, y0, y1) = f.body_px(cw, ch, cols, rows).expect("on glass");
             let world = self.0.pet.console_world().expect("observed");
             let (cw, ch) = (i32::from(cw), i32::from(ch));
             let under: Vec<_> = (y0.div_euclid(ch)..(y1 + ch - 1).div_euclid(ch))
@@ -5462,7 +5848,7 @@ mod tests {
         /// how many times two of their drawn tiles meet
         /// (`crate::kitty_pet::mote_box_px`, the emitter's own placement).
         fn notes_on_glass(&self, frames: &[PetFrame]) -> (usize, usize) {
-            let PaneGeom { cols, cell } = self.2;
+            let PaneGeom { cols, rows, cell } = self.2;
             let mut most = 0;
             let mut meets = 0;
             for f in frames.iter().filter(|f| f.alpha > 0) {
@@ -5474,7 +5860,7 @@ mod tests {
                         matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart) && m.alpha > 0
                     })
                     .filter_map(|m| {
-                        crate::kitty_pet::mote_box_px((m.col, m.row), m.scale, cell, (cols, 30))
+                        crate::kitty_pet::mote_box_px((m.col, m.row), m.scale, cell, (cols, rows))
                     })
                     .collect();
                 most = most.max(boxes.len());
@@ -5507,6 +5893,11 @@ mod tests {
     /// tiles meeting; at 41 columns at 1x, where no lanes' air is within
     /// reach, they rise in the compact spray, close but on glass. None
     /// takes more than one flight (`a_stage_is_reached_in_one_flight`).
+    /// These panes end at the composer's footer, as a session's does once
+    /// its transcript fills it: the cat rests above the composer, by the
+    /// reply. With open ground under the composer, the cat rests there
+    /// (clean ground a bound over the composer's rules), and at 41 columns
+    /// at 1x the lanes have air beside it.
     /// NEGATIVE CONTROLS (as run, each failing this test): the lanes' air
     /// kept on both sides (the `Lanes` arm of `cheer_air` symmetric), at 44
     /// columns at 1x the compact spray, the lanes' air nowhere within reach;
@@ -5515,13 +5906,14 @@ mod tests {
     /// at 41 columns at 1x.
     #[test]
     fn a_landing_in_a_narrow_pane_shows_its_notes() {
-        for (cols, cell, compact) in [
-            (44, (15, 28), false),
-            (44, (7, 14), false),
-            (41, (7, 14), true),
+        for (cols, rows, cell, compact) in [
+            (44, 16, (15, 28), false),
+            (44, 16, (7, 14), false),
+            (41, 16, (7, 14), true),
+            (41, 30, (7, 14), false),
         ] {
-            let why = format!("{cols} columns at {} x {} px", cell.0, cell.1);
-            let mut p = AgentPane::narrow(cols, cell);
+            let why = format!("{cols} x {rows} at {} x {} px", cell.0, cell.1);
+            let mut p = AgentPane::narrow_at(cols, rows, cell);
             assert!(p.parks_within(10.0), "{why}: fixture: the cat parks");
             let (frames, air) = p.landing();
             let frolic = frames
@@ -5627,21 +6019,17 @@ mod tests {
     /// THE HOST RESERVES THE RULE AS THE LANDING COMES DOWN (§11.3): the cat
     /// was at its caret home on the composer's row (where the escort sat it
     /// before its rest seat moved to clean ground), and on the frame the end
-    /// lands the composer's upper rule is reserved whole over it. The console
-    /// law steps its first flight aside onto open ground on its first frame,
-    /// the whole arc translated with it, so it comes down off its stage;
-    /// where it lands is judged again, and it flies once more to the stage it
-    /// was bound for, and cheers there with its three ♪/♥ on glass; then it
-    /// goes home on clean ground and parks. The cat is seated there by hand:
-    /// the fixture's home is clean ground now, from which no flight is cut,
-    /// and the test held only by a second hop half a pixel long (a stage
-    /// judged at its shifted copy, not at the seat as drawn; 2026-10-20).
-    /// NEGATIVE CONTROLS (as run, each failing this test): one trip
-    /// (`CHEER_STAGE_TRIPS` 1), it cheers where the cut flight came down,
-    /// after one flight; the re-plan without the stage it was bound for
-    /// (`prefer` ignored), it cheers elsewhere.
+    /// lands the composer's upper rule is reserved whole over it. Its flight
+    /// to its stage passes over the rule: the console law leaves a body in
+    /// the air alone, so the cat comes down on the stage it set out for after
+    /// one flight and cheers there with its three ♪/♥ on glass; then it goes
+    /// home on clean ground and parks. The cat is seated there by hand: the
+    /// fixture's home is clean ground now.
+    /// NEGATIVE CONTROL (as run, failing this test): the law stepping a body
+    /// in the air aside, as it did, the cat's flights over the composer's
+    /// rules are turned back off them and it never parks.
     #[test]
-    fn a_cut_flight_flies_again_to_the_stage_it_was_bound_for() {
+    fn a_flight_over_a_reserved_rule_reaches_its_stage_in_one() {
         let mut p = AgentPane::new();
         assert!(p.parks_within(10.0), "fixture: the cat parks at home");
         assert!(p.0.pet.console.on_glass, "fixture: on glass");
@@ -5663,16 +6051,18 @@ mod tests {
             .filter(|w| w[1].action == PetAction::Leap && w[0].action != PetAction::Leap)
             .count()
             + usize::from(frames[0].action == PetAction::Leap);
-        assert_eq!(flights, 2, "the first flight was cut, and flown again");
+        assert_eq!(flights, 1, "one flight, over the rule, to its stage");
         let bound_for = bound_for.expect("it set out for a stage");
         let frolic = frames
             .iter()
             .position(|f| f.action == PetAction::Frolic)
             .expect("the landing frolics");
-        assert_eq!(
-            (frames[frolic].col, frames[frolic].row),
-            bound_for,
-            "it cheers on the stage it was first bound for"
+        // The landing eases onto the stage; within half a pixel (15 px cells)
+        // it is there.
+        let at = (frames[frolic].col, frames[frolic].row);
+        assert!(
+            (at.0 - bound_for.0).abs() * 15.0 < 0.5 && at.1 == bound_for.1,
+            "it cheers on the stage it set out for: at {at:?}, bound for {bound_for:?}"
         );
         assert_eq!(
             frames[frolic..]
@@ -5682,11 +6072,7 @@ mod tests {
             Some(3),
             "its three ♪/♥ on glass together"
         );
-        assert_eq!(
-            p.0.pet.room_cheer_trips, 2,
-            "the first flight was cut, and flown again"
-        );
-        p.assert_home_on_clean_ground("the cut flight's cheer", None);
+        p.assert_home_on_clean_ground("the cheer over the rule", None);
     }
 
     /// A HOME UNDER THE FOOTER CHEERS ON THE GROUND BELOW IT (§11.3): in a
@@ -6513,14 +6899,16 @@ mod tests {
     /// ground nearest the new caret is under the new footer, beyond that
     /// rule. Chased, the console law stepped every flight back off the rule,
     /// and the cat leapt in place on `✻ Co🐱ked` for the whole 20 s window
-    /// (about 890 frames under video). It now takes the nearest clean seat
-    /// it can walk to, beside the turn's last line above the rule, and
-    /// parks there.
+    /// (about 890 frames under video); walled off from it instead, the cat
+    /// parked out of the caret's way above the rule and took two flights at
+    /// the next wrap. The law leaves a body in the air alone, so the cat
+    /// makes one bound over the rule to the clean ground under the new
+    /// footer, beside the caret, and parks there.
     ///
-    /// NEGATIVE CONTROL: with no reach (`rest_reach_from` answering `None`)
-    /// the cat chases the seat beyond the rule and never parks.
+    /// NEGATIVE CONTROL (as run): the law stepping a body in the air aside,
+    /// as it did, the cat never parks.
     #[test]
-    fn a_turn_under_the_resting_cat_parks_it_on_clean_ground_it_can_walk_to() {
+    fn a_turn_under_the_resting_cat_bounds_once_to_the_clean_ground_by_the_caret() {
         let mut s = Console::agent(
             40,
             120,
@@ -6535,11 +6923,22 @@ mod tests {
             rested.row
         );
         s.repaint(&claude_screen(120, 11, &TURN), claude_chrome(120, 11, true));
-        let (leaps, parked, last) = s.watch(4.0);
+        let mut hops = Hops::default();
+        let mut parked = None;
+        for i in 0..(4 * 60) {
+            hops.frame(&mut s);
+            if parked.is_none() && !s.pet.needs_frames() {
+                parked = Some(i);
+            }
+        }
+        let last = s.frame();
         assert!(
-            parked.is_some() && leaps < 60,
-            "the cat parks after one trip: first parked at {parked:?} s, {leaps} leap \
-             frames, at ({}, {}) {:?}",
+            parked.is_some() && hops.leaps == 1 && hops.asides == 0 && hops.missed.is_empty(),
+            "the cat parks after one bound: parked at frame {parked:?}, {} flights, {} frames \
+             stepped aside, landings off their aim {:?}, at ({}, {}) {:?}",
+            hops.leaps,
+            hops.asides,
+            hops.missed,
             last.col,
             last.row,
             last.action
@@ -6560,8 +6959,8 @@ mod tests {
             last.row
         );
         assert!(
-            last.row < 11.0,
-            "on the near side of the upper rule, got ({}, {})",
+            last.row > 14.0 && last.col < 12.0,
+            "on the clean ground under the new footer, by the caret, got ({}, {})",
             last.col,
             last.row
         );
@@ -6612,12 +7011,13 @@ mod tests {
         (out, chrome)
     }
 
-    /// The pane a turn leaves, the cat resting above the composer's upper
-    /// rule (`a_turn_under_the_resting_cat_parks_it_on_clean_ground_it_can_walk_to`),
-    /// the host's ink probe fed as the host feeds it.
+    /// The pane a turn leaves, its composer at the pane's foot (a session's
+    /// usual pane: no clean ground under the footer), the cat resting on the
+    /// nearest clean ground, above the composer's upper rule, the host's ink
+    /// probe fed as the host feeds it.
     fn resting_above_the_composer() -> Console {
         let mut s = Console::agent(
-            40,
+            16,
             120,
             &claude_screen(120, 5, &[]),
             claude_chrome(120, 5, true),
@@ -6645,14 +7045,18 @@ mod tests {
 
     /// A watch for hops, frame by frame: the flights it starts, its frames
     /// the console law stepped back off protected ground (`cursor-home`),
-    /// and each landing on none of the seats the station kept while it flew.
+    /// and each landing neither where the flight was last aimed nor on any of
+    /// the seats the station kept while it flew.
     #[derive(Default)]
     struct Hops {
         leaps: usize,
         asides: usize,
         missed: Vec<Landing>,
         seats: Vec<(f32, f32)>,
+        aim: Option<(f32, f32)>,
         aloft: bool,
+        /// Where the last frame drew the body, `(col, row)`.
+        at: Option<(f32, f32)>,
     }
 
     impl Hops {
@@ -6666,10 +7070,13 @@ mod tests {
             if let Some(seat) = s.pet.console.rest_seat.get() {
                 self.seats.push(seat);
             }
+            if let Some(flight) = s.pet.flight.as_ref() {
+                self.aim = Some((flight.to_col, flight.to_row));
+            }
             if self.aloft && !aloft {
                 let on =
                     |&(c, r): &(f32, f32)| (f.col - c).abs() <= 1.0 && (f.row - r).abs() < 0.25;
-                if !self.seats.iter().any(on) {
+                if !self.seats.iter().any(on) && !self.aim.as_ref().is_some_and(on) {
                     self.seats.dedup();
                     self.missed
                         .push(((f.col, f.row), std::mem::take(&mut self.seats)));
@@ -6679,33 +7086,136 @@ mod tests {
             if s.pet.console.reason == "cursor-home" {
                 self.asides += 1;
             }
+            self.at = Some((f.col, f.row));
         }
     }
 
-    /// TYPING INTO AN AGENT'S COMPOSER NEVER SENDS THE CAT HOPPING (lab
-    /// `tt-3`, Claude Code 2.1.304 at 120 x 40: 200 keys typed into the
-    /// composer, then 200 backspaces, the cat resting above the composer's
-    /// upper rule, which the host reserves whole). A draft wrapped onto the
-    /// composer's second line puts the caret's stand inside the composer
-    /// box, where nothing under the body is protected; chased, every flight
-    /// across the rule was stepped back off it by the console law, and the
-    /// cat hopped in place on its side of the rule. A stand the body on
-    /// glass cannot walk to is no stand: the cat keeps a seat it can reach
-    /// (`PetBrain::console_station`). And a flight to a seat lands on it: a
-    /// seat does not run with the caret, so the aim leads by no drift
-    /// (`PetBrain::aims_ahead`; aimed ahead, it landed five columns past).
-    /// The seat moves only when the stand is past [`REST_REACH`]: twice
-    /// here as the draft is typed, once along the first line and once at the
-    /// wrap, and twice as the backspaces run the caret back over the wrap and
-    /// along the first line (a held delete frightens the cat once and no
-    /// longer freezes it until the deletes stop).
+    /// TYPED UP TO A LABEL ON THE RULE, THE CAT WAITS ON THE LINE (lab,
+    /// real Claude Code 2.1.305 with the harness off, windowed, 2026-10-20).
+    /// With the harness off the host still draws its switch's label at the
+    /// right end of the composer's upper rule (`claude harness ○ off [on]`),
+    /// and it is the host's chrome: the stands under it are refused. The cat
+    /// escorting the caret along the composer's line was sent to a seat off
+    /// the line there, so it hopped up off the line at the label and down
+    /// again at the wrap. It now waits on the line, at the last stand short
+    /// of the label, and the wrap is its one bound.
     ///
-    /// NEGATIVE CONTROLS (as run, each failing this test): the stand never
-    /// walled (`console_walled` answering `false`), 6 leaps and 13 frames
-    /// stepped back off the rule; the aim led by the caret's drift at a seat
-    /// too (`aims_ahead` as `rhythm_open`), both landings five columns past
-    /// their seats; no resting ground kept once the seat has moved on, a
-    /// third leap as the backspaces run the caret back.
+    /// NEGATIVE CONTROL (as run): sent to a seat off the line, the cat hops
+    /// up off it at key 75, a flight before the wrap.
+    #[test]
+    fn typed_up_to_a_label_on_the_rule_the_cat_waits_on_the_line() {
+        let mut s = resting_above_the_composer();
+        let draft = "the quick brown fox jumps over the lazy dog ".repeat(4);
+        // The harness off: no card, the label at the upper rule's right end,
+        // the chips on the lower rule.
+        let chrome_off = |chrome: Vec<PetRect>| {
+            let lower = chrome[2].row;
+            vec![
+                PetRect::new(11.0, 88.0, 1.0, 32.0),
+                PetRect::new(lower, 3.0, 1.0, 5.0),
+                PetRect::new(lower, 84.0, 1.0, 35.0),
+            ]
+        };
+        let mut hops = Hops::default();
+        let mut on_line = None;
+        let mut off_line = Vec::new();
+        let mut wrap_leaps = None;
+        for n in 1..=125usize {
+            s.pet.note_console_input(s.now, PetInputKind::Text);
+            let (bottom, chrome) = composer_with(&draft[..n]);
+            s.term.process(bottom.as_bytes());
+            s.chrome = chrome_off(chrome);
+            if n == 119 {
+                wrap_leaps = Some(hops.leaps);
+            }
+            for _ in 0..6 {
+                hops.frame(&mut s);
+                let (col, row) = hops.at.expect("a frame");
+                if n < 119 && !hops.aloft {
+                    if (row - 12.0).abs() < 0.01 {
+                        on_line = on_line.or(Some((n, hops.leaps)));
+                    } else if on_line.is_some() {
+                        off_line.push((n, col, row, s.pet.action));
+                    }
+                }
+            }
+        }
+        let (from_key, leaps_on) =
+            on_line.expect("fixture: the cat comes onto the composer's line");
+        let before_wrap = wrap_leaps.expect("the draft wraps") - leaps_on;
+        let at_wrap = hops.leaps - wrap_leaps.unwrap_or(0);
+        assert!(
+            off_line.is_empty() && before_wrap == 0 && at_wrap == 1,
+            "on the line from key {from_key}: {before_wrap} flights before the wrap, {at_wrap} \
+             at it, frames off the line {:?}",
+            &off_line[..off_line.len().min(4)]
+        );
+    }
+
+    /// TYPED TO THE RIGHT MARGIN, THE CAT STAYS ON GLASS (lab, real Claude
+    /// Code 2.1.305 with the harness on, windowed, 2026-10-20). The
+    /// composer's upper rule is reserved whole, so the stand on its first
+    /// line is refused and the cat rests off it. As the caret nears the
+    /// right margin the escort's stand is clamped against the pane's edge,
+    /// where its clearance margin ran past the pane: the reading left the
+    /// map, answered unknown, and the stand was taken as clear. The cat
+    /// flew onto the reserved rule and the console law, finding nowhere to
+    /// step it, hid it there until the wrap. The margin now stops at the
+    /// pane's edge (`PetBrain::stand_rect`): typed to the margin, no frame
+    /// hides the cat.
+    ///
+    /// NEGATIVE CONTROL (as run): the margin grown past the edge, the cat
+    /// lands on the rule at key 113 and is hidden for 31 frames
+    /// (`protected-home-unavailable`).
+    #[test]
+    fn typed_to_the_right_margin_the_cat_stays_on_glass() {
+        let mut s = resting_above_the_composer();
+        let draft = "the quick brown fox jumps over the lazy dog ".repeat(3);
+        let mut hidden = Vec::new();
+        for n in 1..=118usize {
+            s.pet.note_console_input(s.now, PetInputKind::Text);
+            let (bottom, chrome) = composer_with(&draft[..n]);
+            s.term.process(bottom.as_bytes());
+            s.chrome = chrome;
+            for _ in 0..6 {
+                let f = s.frame();
+                if f.alpha == 0 || s.pet.console.clipped {
+                    hidden.push((n, f.col, f.row, s.pet.console.reason));
+                }
+            }
+        }
+        assert!(
+            hidden.is_empty(),
+            "{} frames hid the cat (key, col, row, why): {:?}",
+            hidden.len(),
+            &hidden[..hidden.len().min(4)]
+        );
+    }
+
+    /// TYPING INTO AN AGENT'S COMPOSER NEVER SENDS THE CAT HOPPING (lab
+    /// `tt-3`, Claude Code 2.1.304 at 120 x 40: keys typed into the composer
+    /// and backspaced again, the cat resting above the composer's upper
+    /// rule, which the host reserves whole). The stand on the composer's
+    /// first line reaches into that rule, so while the first line is typed
+    /// the cat keeps its seat, and the seat moves only when the stand is past
+    /// [`REST_REACH`] (once here) and a flight to it lands on it: a seat does
+    /// not run with the caret, so the aim leads by no drift
+    /// (`PetBrain::aims_ahead`; aimed ahead, it landed five columns past).
+    /// A draft wrapped onto the second line puts the stand inside the box,
+    /// clear: the cat bounds over the rule onto it, once, and walks the line
+    /// with the caret. Chased with the console law stepping a body in the
+    /// air aside, every flight across the rule was turned back off it and the
+    /// cat hopped in place; walled off from the stand instead, it rested out
+    /// of reach of the caret it escorts. Backspacing, a held delete
+    /// frightens it once and it follows the caret back (a bound when the
+    /// caret runs from it), and when the draft unwraps it leaves the line
+    /// for a seat; the line it stood on becomes the rule, and its crouch
+    /// there, its body clear at its own size, is never stepped aside.
+    ///
+    /// NEGATIVE CONTROLS (as run, each failing this test): the law stepping
+    /// a body in the air aside (as it did), the aim led by the caret's drift
+    /// at a seat too (`aims_ahead` as `rhythm_open`), the law judging the
+    /// crouch at its drawn width (one frame stepped aside, 0.20 cells).
     #[test]
     fn typing_into_an_agents_composer_never_sends_the_cat_hopping() {
         let mut s = resting_above_the_composer();
@@ -6732,17 +7242,17 @@ mod tests {
         }
         let deleted_leaps = hops.leaps - typed_leaps;
         assert!(
-            hops.asides == 0 && typed_leaps <= 2 && deleted_leaps <= 2 && hops.missed.is_empty(),
-            "the cat keeps a seat it can reach and lands on it: {typed_leaps} leaps typing and \
-             {deleted_leaps} deleting, {} frames stepped back off the rule, landings off the \
-             seat {:?}",
+            hops.asides == 0 && typed_leaps <= 2 && deleted_leaps <= 3 && hops.missed.is_empty(),
+            "the cat goes where the caret goes and lands where it aims: {typed_leaps} leaps \
+             typing and {deleted_leaps} deleting, {} frames stepped aside, landings off their \
+             aim {:?}",
             hops.asides,
             hops.missed
         );
         let (_, parked, last) = s.watch(6.0);
         assert!(
-            parked.is_some() && last.row < 11.0 && s.covered(&last).is_empty(),
-            "and parks above the rule on clean ground, at ({}, {})",
+            parked.is_some() && s.covered(&last).is_empty(),
+            "and parks on clean ground, at ({}, {})",
             last.col,
             last.row
         );
@@ -6867,8 +7377,10 @@ mod tests {
     /// live plane (selections counted), the cat moves off its seat.
     #[test]
     fn a_selection_over_the_rest_seat_hides_the_cat_in_place() {
+        // The composer at the pane's foot: the clean ground is beside the
+        // turn's last line, where the hand selects.
         let mut s = Console::agent(
-            40,
+            16,
             120,
             &claude_screen(120, 5, &[]),
             claude_chrome(120, 5, true),
@@ -7093,6 +7605,11 @@ mod tests {
         }
     }
 
+    /// A FULL TRANSCRIPT ABOVE THE COMPOSER: with no clean ground near the
+    /// composer, the cat keeps the nearest under-text seat (behind the
+    /// footer's words, a bound over the composer's rules, or behind the
+    /// reply's), and typing never hops it, braces it as foreign contact or
+    /// pops it to its feet at every key.
     #[test]
     fn full_transcript_above_the_composer_keeps_an_under_text_seat_without_hopping_or_bobbing() {
         let mut s = resting_above_the_composer();
@@ -7105,8 +7622,8 @@ mod tests {
         );
         let rested = s.rest(4.0);
         assert!(
-            rested.row < 11.0 && matches!(rested.action, PetAction::Sit | PetAction::Loaf),
-            "fixture: seated on under-text ground above the rule, got ({}, {}) {:?}",
+            matches!(rested.action, PetAction::Sit | PetAction::Loaf),
+            "fixture: seated on the nearest under-text ground, got ({}, {}) {:?}",
             rested.col,
             rested.row,
             rested.action
@@ -7151,5 +7668,447 @@ mod tests {
             stands <= 30,
             "seated cat on its rest seat does not pop into Stand on every key (got {stands} Stand frames)"
         );
+    }
+
+    #[test]
+    fn interactive_typing_in_executing_block_holds_escort_lead_and_keeps_caret_gaze_past_loaf_after()
+     {
+        let mut s = Scene::new();
+        s.executing();
+        s.type_text("hello world");
+        assert!(
+            s.pet.held_lead > ARRIVED,
+            "fixture: forward typing run earned a held lead ({})",
+            s.pet.held_lead
+        );
+        let frames = s.watch(3.5);
+        assert!(
+            s.pet.console.resident && !s.pet.needs_frames(),
+            "resident holds the escort's led stand and parks without oscillating (resident={}, needs_frames={})",
+            s.pet.console.resident,
+            s.pet.needs_frames()
+        );
+        let last = frames.last().expect("frames");
+        assert_eq!(
+            last.pose,
+            PetGlyphId::PetSit,
+            "interactive session in an executing block keeps PetSit past LOAF_AFTER without snapping to PetEdgeLean"
+        );
+    }
+
+    #[test]
+    fn gentle_pointer_stroke_pets_settled_console_resident_and_returns_to_watch() {
+        let mut s = Scene::new();
+        s.executing();
+        let _ = s.watch(1.1);
+        let col = s.pet.col;
+        let row = s.pet.row;
+        let mut frames = Vec::new();
+        for step in 0..=30 {
+            let u = step as f32 / 30.0;
+            let px = col + 1.0 + u * 3.2;
+            let py = row - 0.1;
+            s.now += Duration::from_secs_f32(0.016);
+            let input = s.term.cell_frame(20, 80);
+            let facts = PetWorldFacts::read(&s.term, 17);
+            s.pet.observe_console(&input, &facts, PetPane::full(&input));
+            s.pet.set_console_presentable(true);
+            let c = s.term.cursor();
+            frames.push(s.pet.tick(PetSense {
+                caret_drawn: true,
+                now: s.now,
+                caret: Some((c.row, c.col)),
+                wrapped: false,
+                rows: 20,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: Some((px, py)),
+            }));
+        }
+        frames.extend(s.watch(2.5));
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Purr),
+            "gentle pointer stroke over a settled console resident earns Purr"
+        );
+        assert!(
+            s.pet.console.resident && s.pet.console_attention() == PetAttention::Output,
+            "resident watch resumes once the affection hold finishes"
+        );
+    }
+
+    #[test]
+    fn terminal_bell_flinches_settled_console_resident_and_returns_to_watch() {
+        let mut s = Scene::new();
+        s.executing();
+        assert!(!s.pet.needs_frames());
+        s.pet.note_bell(s.now);
+        assert!(
+            s.pet.needs_frames(),
+            "pending bell wakes the frame train even while a console resident is parked"
+        );
+        let first = s.frame(0.016);
+        assert!(
+            !s.pet.console.resident && (first.action == PetAction::Perk || s.pet.flinch_t > 0.0),
+            "bell flinches the resident instead of being silently swallowed (resident={}, action={:?}, flinch_t={})",
+            s.pet.console.resident,
+            first.action,
+            s.pet.flinch_t
+        );
+        let _ = s.watch(1.5);
+        assert!(
+            s.pet.console.resident && s.pet.console_attention() == PetAttention::Output,
+            "resident watch resumes after the bell flinch completes"
+        );
+    }
+
+    #[test]
+    fn exploring_content_perch_orients_vertical_gaze_toward_anchor_row() {
+        let mut s = Scene::new();
+        s.executing();
+        s.term.process(b"\x1b]133;D;0\x07");
+        let _ = s.watch(RESULT_HOLD + 0.2);
+        // Move the caret and cat to row 12 while the completed block's anchor stays on row 8.
+        s.term.process(b"\x1b[13;17H");
+        for _ in 0..90 {
+            s.frame(0.016);
+            if s.pet.console.resident
+                && s.pet.console_attention() == PetAttention::Exploring
+                && !s.pet.needs_frames()
+            {
+                break;
+            }
+        }
+        assert_eq!(s.pet.console_attention(), PetAttention::Exploring);
+        let settled = s.frame(0.016);
+        assert_eq!(
+            settled.pose,
+            PetGlyphId::PetEdgeLookUp,
+            "content-perch below the observed anchor looks up toward the anchor row"
+        );
+    }
+
+    #[test]
+    fn perch_trip_hop_cycles_rise_tuck_and_descend_poses() {
+        let mut s = Scene::new();
+        s.executing();
+        s.term.process(b"\x1b[?25l");
+        s.pet.console.cursor_home = None;
+        s.pet.row -= 2.0;
+        let mut poses = Vec::new();
+        for _ in 0..30 {
+            let f = s.frame(0.016);
+            if s.pet.console.moving {
+                poses.push(f.pose);
+            } else if !poses.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            poses.contains(&PetGlyphId::PetLeapRise)
+                && poses.contains(&PetGlyphId::PetHop)
+                && poses.contains(&PetGlyphId::PetLeapDescend),
+            "vertical PerchTrip hop should progress through rise, tuck, and descend poses: {poses:?}"
+        );
+    }
+
+    #[test]
+    fn room_mail_and_sibling_cues_play_over_executing_resident_and_return_to_watch() {
+        let mut s = Scene::new();
+        s.executing();
+        s.pet.note_room_inbox(s.now, RoomInbox::default());
+        s.pet.note_room_inbox(
+            s.now,
+            RoomInbox {
+                unseen: 1,
+                overdue: false,
+                hold: false,
+            },
+        );
+        assert!(
+            !s.pet.needs_frames(),
+            "room facts must never add a wake on their own"
+        );
+        let mut frames = Vec::new();
+        let mut aloft = 0;
+        for _ in 0..(2.0 / 0.016) as usize {
+            frames.push(s.frame(0.016));
+            aloft = aloft.max(s.pet.cheer_motes_aloft());
+        }
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Perk),
+            "unread mail perks the resident in place"
+        );
+        assert!(
+            aloft >= 1,
+            "unread mail spawns a musical note mote in the air"
+        );
+        assert!(
+            s.pet.console.resident && s.pet.console_attention() == PetAttention::Output,
+            "resident watch resumes once the mail beat finishes"
+        );
+
+        // Now trigger a talking sibling cue to the right of the cat.
+        s.pet.note_room_sibling(s.now, Some((60.0, s.pet.row)));
+        assert!(!s.pet.needs_frames());
+        let first = s.frame(0.016);
+        assert_eq!(first.action, PetAction::Perk);
+        assert!(
+            !first.facing_left,
+            "resident turns toward the talking sibling pane on the right"
+        );
+        let _ = s.watch(1.0);
+        assert!(
+            s.pet.console.resident && s.pet.console_attention() == PetAttention::Output,
+            "resident watch resumes once the sibling look finishes"
+        );
+    }
+
+    #[test]
+    fn word_cat_peek_bats_from_executing_resident_and_returns_to_watch() {
+        let mut s = Scene::new();
+        s.executing();
+        assert!(!s.pet.needs_frames());
+        s.pet.note_peek(s.now, s.pet.col + 6.0, s.pet.row);
+        assert!(
+            s.pet.needs_frames(),
+            "nearby word-cat peek wakes the parked resident"
+        );
+        let frames = s.watch(3.0);
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Frolic),
+            "resident hops to bat/greet the nearby word-cat peek"
+        );
+        assert!(
+            s.pet.console.resident && s.pet.console_attention() == PetAttention::Output,
+            "resident returns to its watch stand after batting the word-cat"
+        );
+    }
+
+    #[test]
+    fn v2_meteor_perk_and_star_catch_play_in_place_over_executing_resident() {
+        let mut s = Scene::new();
+        s.executing();
+        let stand = (s.pet.col.to_bits(), s.pet.row.to_bits());
+        let perk_at = s.now + Duration::from_millis(80);
+        let perk_offer = PetOffer {
+            perk_at: Some(perk_at),
+            ..PetOffer::default()
+        };
+        assert!(s.pet.note_v2_offer(&perk_offer).is_none());
+        assert!(
+            !s.pet.needs_frames(),
+            "v2 offer latches must never wake the frame train on their own"
+        );
+
+        let mut perked_at = None;
+        for _ in 0..20 {
+            let f = s.frame(0.016);
+            assert!(s.pet.note_v2_offer(&perk_offer).is_none());
+            if f.action == PetAction::Perk && perked_at.is_none() {
+                perked_at = Some((s.now, f));
+            }
+        }
+        let (at, perk_frame) = perked_at.expect("settled resident perks at the meteor arrival");
+        assert!(at >= perk_at, "perk must not fire before perk_at");
+        assert_eq!(
+            (perk_frame.col.to_bits(), perk_frame.row.to_bits()),
+            stand,
+            "v2 perk in place must never relocate the resident"
+        );
+        let _ = s.watch(0.6);
+        assert!(
+            s.pet.console.resident && s.pet.console_attention() == PetAttention::Output,
+            "resident resumes watching output after the v2 perk"
+        );
+
+        let star = StarCatch {
+            x: (s.pet.col + 4.0) * 10.0,
+            y: s.pet.row * 20.0,
+            born: s.now,
+            col: s.pet.col.round() as i32 + 4,
+        };
+        let catch_offer = PetOffer {
+            catch: Some(star),
+            ..PetOffer::default()
+        };
+        assert!(s.pet.note_v2_offer(&catch_offer).is_none());
+        let bat_frame = s.frame(0.016);
+        let caught = s.pet.note_v2_offer(&catch_offer);
+        assert_eq!(
+            caught,
+            Some(star),
+            "settled resident bats and returns the offered gold star"
+        );
+        assert_eq!(bat_frame.action, PetAction::Frolic);
+        assert_eq!(bat_frame.pose, PetGlyphId::PetBat);
+        assert_eq!(
+            (bat_frame.col.to_bits(), bat_frame.row.to_bits()),
+            stand,
+            "v2 star catch bats in place without relocating"
+        );
+        let _ = s.watch(BAT_HOLD + 0.1);
+        assert!(
+            s.pet.console.resident && s.pet.console_attention() == PetAttention::Output,
+            "resident resumes watching output after batting the star"
+        );
+    }
+
+    #[test]
+    fn pointer_gaze_tracks_moving_mouse_on_settled_resident_and_idles_when_gone() {
+        let mut s = Scene::new();
+        s.executing();
+        assert!(!s.pet.needs_frames());
+
+        // Wave the mouse pointer above and to the right of the settled resident.
+        let mut looked_up_right = false;
+        for step in 0..10 {
+            s.now += Duration::from_secs_f32(0.016);
+            let input = s.term.cell_frame(20, 80);
+            let facts = PetWorldFacts::read(&s.term, 17);
+            s.pet.observe_console(&input, &facts, PetPane::full(&input));
+            s.pet.set_console_presentable(true);
+            let c = s.term.cursor();
+            let px = s.pet.col + 10.0 + step as f32 * 1.2;
+            let py = (s.pet.row - 3.0).max(0.0);
+            let f = s.pet.tick(PetSense {
+                caret_drawn: true,
+                now: s.now,
+                caret: Some((c.row, c.col)),
+                wrapped: false,
+                rows: 20,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: Some((px, py)),
+            });
+            if f.pose == PetGlyphId::PetEdgeLookUp && !f.facing_left {
+                looked_up_right = true;
+            }
+        }
+        assert!(
+            looked_up_right && s.pet.needs_frames(),
+            "settled resident turns its gaze toward a moving pointer above and to the right"
+        );
+
+        // Removing the pointer immediately clears pointer heat and returns to idle-to-zero.
+        let settled = s.frame(0.016);
+        assert!(
+            !s.pet.needs_frames(),
+            "pointer leaving the pane immediately releases the resident's frame train"
+        );
+        assert_eq!(
+            settled.pose,
+            PetGlyphId::PetEdgeLean,
+            "output resident returns to its output gaze once the pointer leaves"
+        );
+    }
+
+    #[test]
+    fn interactive_caret_output_resident_flicks_ear_on_output_burst_edge_and_settles() {
+        let mut s = Scene::new();
+        s.executing();
+        // Place the caret above the executing block (or after a key) so the
+        // resident hops to its interactive-caret seat and settles in `PetSit`.
+        s.term.process(b"\x1b[4;17H");
+        for _ in 0..120 {
+            s.frame(0.016);
+            if s.pet.console.resident && !s.pet.console.moving && !s.pet.needs_frames() {
+                break;
+            }
+        }
+        let base = s.frame(0.016);
+        assert_eq!(s.pet.console_attention(), PetAttention::Output);
+        assert_eq!(base.pose, PetGlyphId::PetSit);
+        assert!(!s.pet.needs_frames());
+
+        // A rising edge of `output_burst` flicks an ear for `TWITCH_DUR`.
+        s.now += Duration::from_secs_f32(0.016);
+        let input = s.term.cell_frame(20, 80);
+        let facts = PetWorldFacts::read(&s.term, 17);
+        s.pet.observe_console(&input, &facts, PetPane::full(&input));
+        s.pet.set_console_presentable(true);
+        let c = s.term.cursor();
+        let twitch = s.pet.tick(PetSense {
+            caret_drawn: true,
+            now: s.now,
+            caret: Some((c.row, c.col)),
+            wrapped: false,
+            rows: 20,
+            cols: 80,
+            cell_w: 10,
+            cell_h: 20,
+            reduced_motion: false,
+            output_burst: true,
+            pointer: None,
+        });
+        assert!(
+            matches!(
+                twitch.pose,
+                PetGlyphId::PetSitEar | PetGlyphId::PetSitEarFar
+            ),
+            "interactive-caret resident flicks an ear on output burst edge, got {:?}",
+            twitch.pose
+        );
+        assert!(s.pet.needs_frames(), "ear flick keeps the frame train live");
+
+        // Once the twitch duration elapses, the resident returns to `PetSit` and idles to zero.
+        let settled = *s.watch(TWITCH_DUR + 0.1).last().unwrap();
+        assert_eq!(settled.pose, PetGlyphId::PetSit);
+        assert!(!s.pet.needs_frames());
+    }
+
+    #[test]
+    fn protected_surface_resident_retires_pending_bell_and_look_and_regrid_shifts_console_trip() {
+        let mut s = Scene::new();
+        s.term.process(b"\x1b[3;3Hread this");
+        s.term.text_selection_mut().start_selection(
+            0,
+            0,
+            SelectionSide::Left,
+            SelectionType::Block,
+        );
+        s.term
+            .text_selection_mut()
+            .update_selection(19, 79, SelectionSide::Right);
+        for _ in 0..240 {
+            s.frame(0.016);
+            if !s.pet.needs_frames() {
+                break;
+            }
+        }
+        assert_eq!(s.pet.console.reason, "protected-surface");
+        assert!(!s.pet.needs_frames());
+
+        // Noting a bell or a look while clipped on a protected surface must be
+        // retired on the next tick so `console_frames()` does not stay pinned.
+        s.pet.note_bell(s.now);
+        s.pet.note_peek(s.now, s.pet.col + 20.0, s.pet.row);
+        assert!(s.pet.pending_look.is_some());
+        assert!(s.pet.needs_frames());
+        s.frame(0.016);
+        assert!(
+            s.pet.pending_bell.is_none() && s.pet.pending_look.is_none() && !s.pet.needs_frames(),
+            "protected-surface yield must retire pending_bell and pending_look on its tick"
+        );
+
+        // `carry_with_regrid` shifts `console.target` and `console.trip` by `dy`.
+        s.pet.row = 5.0;
+        s.pet.console.target = Some(PetRect::new(4.0, 10.0, 1.7, 3.4));
+        s.pet.console.trip = Some(PerchTrip {
+            from: (10.0, 5.0),
+            to: (14.0, 6.0),
+            elapsed: 0.1,
+            duration: 0.4,
+            hop: false,
+        });
+        assert!(s.pet.carry_with_regrid(3.0, 20));
+        assert_eq!(s.pet.console.target.unwrap().row, 7.0);
+        let trip = s.pet.console.trip.unwrap();
+        assert_eq!((trip.from.1, trip.to.1), (8.0, 9.0));
     }
 }

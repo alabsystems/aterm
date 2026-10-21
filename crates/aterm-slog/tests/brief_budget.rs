@@ -740,6 +740,7 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
 /// busy agent session's brief, every 3B mark written on every turn, holds
 /// every line it holds without them, at every budget; mail is the `mail in ·
 /// out` line and `act` and `story` one count line, both the first lines shed.
+/// Phase 6's ring kinds (6F-2) are among them: none is a line.
 /// NEGATIVE CONTROL: the count lines are there when they fit, and a pre-3B
 /// mark (a person's input) still is a line.
 #[test]
@@ -777,6 +778,18 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
             Kind::Act => f.word(Key::Word, "approve"),
             Kind::Story => f.word(Key::Word, "approved"),
             Kind::Cwd => f.text(Key::Cwd, "/w/repo"),
+            // Phase 6's ring facts (6F-2): no line either.
+            Kind::State => f.word(Key::State, "alive"),
+            Kind::Policy => f.id(Key::Gen, "7"),
+            Kind::Topic => f.id(Key::Fp, "0a1b2c3d4e5f6071"),
+            Kind::Advisory => f
+                .word(Key::Origin, "fleet")
+                .and_then(|f| f.id(Key::Gen, "3")),
+            Kind::Program => f
+                .word(Key::State, "blocked")
+                .and_then(|f| f.word(Key::Ask, "permission")),
+            Kind::MailFetch => f.u(Key::Off, 91),
+            Kind::Shown => f.word(Key::Need, "approval:bash"),
             _ => Ok(f),
         }
         .expect("fields")
@@ -802,6 +815,13 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
         Kind::Hold,
         Kind::Act,
         Kind::Story,
+        Kind::State,
+        Kind::Policy,
+        Kind::Topic,
+        Kind::Advisory,
+        Kind::Program,
+        Kind::MailFetch,
+        Kind::Shown,
     ];
     for i in 0..12u64 {
         for k in kinds {

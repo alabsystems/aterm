@@ -657,8 +657,7 @@ fn directory_listings_agree() {
 ///
 /// The directory is deliberately larger than any plausible `readdir` buffer, and
 /// the two streams are advanced ONE ENTRY AT A TIME so they are genuinely
-/// interleaved rather than merely both alive. Measured against the `dup`
-/// implementation this replaced: 986 and 1016 of 2002.
+/// interleaved rather than merely both alive.
 #[test]
 fn two_interleaved_streams_over_one_descriptor_each_see_every_entry() {
     const N: usize = 2000;

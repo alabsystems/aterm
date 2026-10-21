@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The transcript's half of H6-HARNESS-1 on what Claude Code 2.1.294 wrote
-//! (`supervise/fixtures/claude-2.1.294-transcript-*.jsonl`, measured in
-//! the real-Claude lab on 2026-10-08).
+//! The transcript's half of the wall check, on what Claude Code 2.1.294 wrote
+//! (`supervise/fixtures/claude-2.1.294-transcript-*.jsonl`, measured in the real-Claude lab).
 
 use aterm_phase::{ApiCause, WallKind, classify_wall};
 
@@ -50,6 +49,9 @@ fn fixture(name: &str) -> &'static str {
             "fixtures/claude-2.1.294-transcript-session-limit-then-local-commands.jsonl"
         ),
         "local-commands" => include_str!("fixtures/claude-2.1.294-transcript-local-commands.jsonl"),
+        "bucket-cancelled-then-model" => {
+            include_str!("fixtures/claude-2.1.302-transcript-bucket-cancelled-then-model.jsonl")
+        }
         other => panic!("no fixture {other}"),
     }
 }
@@ -100,20 +102,10 @@ fn same_class(a: WallKind, b: WallKind) -> bool {
     class(a) == class(b)
 }
 
-/// EVERY WALL THE POLICY ACTS ON, AS CLAUDE CODE 2.1.294 WROTE IT: the
-/// transcript ends on its own notice row — the `error` word measured with it
-/// — and that row confirms the wall the screen drew (read from the screen's
-/// words through the one table, `classify_wall`): the 529, a 500, the API
-/// unreachable, the full context (the screen's `Context limit reached`, the
-/// row's `Prompt is too long`) after a prompt and after a tool's output, a
-/// `/compact` that failed (its local command's error row), no login and a
-/// refused key, the session limit (and its auto-continue row) and the weekly
-/// one, an API key's 429 — and the session limit met on a relaunched Claude
-/// Code's first turn, whose prompt row the file holds AFTER the notice (the
-/// conversation's first row, `parentUuid: null`: read as opening it, the
-/// one exception to the file's order). And A DIFFERENT KIND: each confirms
-/// no wall of another class — a 529's row is no lost login, a limit's no
-/// full context.
+/// Every wall the policy acts on, as Claude Code 2.1.294 wrote it, ends the transcript on its own
+/// notice row (its measured `error` word), which confirms the wall the screen drew and no wall of
+/// another class. The relaunched first turn's session limit, whose prompt row the file holds
+/// after the notice, is among them.
 #[test]
 fn every_wall_claude_code_writes_confirms_its_own_kind_and_no_other() {
     let cases: [(&str, &[&str], Option<&str>); 12] = [
@@ -217,16 +209,9 @@ fn every_wall_claude_code_writes_confirms_its_own_kind_and_no_other() {
     }
 }
 
-/// WHAT A TOOL'S OUTPUT LEAVES confirms no wall, of any kind: a Bash call
-/// whose output opens `Not logged in · Please run /login`, a shell-mode `!
-/// cat` of the same words, an MCP result of three blocks (a context wall's
-/// words, then a login wall's) and one whose first block of 60 rows scrolls
-/// its call off the screen, each with the reply after it empty, so the
-/// screen ends on the output — the screen's half reads the two MCP ones as
-/// walls — and the transcript on the model's (empty) reply, the turn
-/// closed. The same Bash and MCP shapes with the follow-up request too long
-/// — the real wall, the same screen as the MCP spoof but one block shorter —
-/// are confirmed (the controls).
+/// A tool's output in a wall's words (a Bash call, a shell-mode `!`, MCP results of several
+/// blocks or a long first block) confirms no wall: the transcript ends on the model's reply.
+/// Controls: the same Bash and MCP shapes followed by a real context wall are confirmed.
 #[test]
 fn a_tools_output_confirms_no_wall() {
     for name in [
@@ -247,14 +232,9 @@ fn a_tools_output_confirms_no_wall() {
     }
 }
 
-/// The transcript read before it caught up with the screen — cut before its
-/// notice and its `turn_duration` were written — is LAGGING (read again
-/// before the wall is refused): at the prompt, at the model's tool call
-/// (most likely the tail the lab's hosted loop refused a real wall after an
-/// MCP call on, before this rule), at the tool's result, and nothing at all.
-/// Not lagging: a notice (its `turn_duration` not written yet or written),
-/// and any end a `turn_duration` closed — a reply, an input. A torn first
-/// line (a tail cut mid-row) is passed over.
+/// A transcript cut before its notice and `turn_duration` is lagging (at the prompt, the model's
+/// call, the tool's result, or empty); a notice, or any end a `turn_duration` closed, is not. A
+/// torn first line is passed over.
 #[test]
 fn a_transcript_cut_before_its_notice_is_lagging() {
     let rows = |name: &str| -> Vec<&'static str> { fixture(name).lines().skip(1).collect() };
@@ -326,14 +306,9 @@ fn row_of(name: &str, needle: &str) -> &'static str {
         .unwrap_or_else(|| panic!("{name}: no row with {needle}"))
 }
 
-/// Rows that are no entry of the conversation's pass over the notice before
-/// them: a subagent's own notice (`isSidechain`) is not the session's wall;
-/// a local command that is not a failed compaction (`/model`'s output,
-/// Claude Code's meta caveat), Claude Code's meta nudge after an empty reply
-/// (`isMeta`) and a compaction's summary (`isCompactSummary`) leave the
-/// notice the newest entry — while a person's prompt, a tool's result and
-/// the model's words end it. The rows are measured ones from several
-/// fixtures.
+/// Rows that are no entry of the conversation's (a subagent's notice, a local command's rows,
+/// the meta nudge, a compaction's summary) leave the notice the newest entry; a prompt, a tool's
+/// result and the model's words end it.
 #[test]
 fn only_the_conversations_own_entries_end_a_notice() {
     let notice = row_of("529", "\"isApiErrorMessage\":true");
@@ -381,18 +356,10 @@ fn only_the_conversations_own_entries_end_a_notice() {
     }
 }
 
-/// THE FILE'S ORDER, NOT THE CLOCK'S: an entry written after the notice
-/// ends it whatever its own `timestamp` says — a clock stepped back an hour
-/// between them (the review of pass 3: read by time, the old notice stayed
-/// "newest" through the step, confirming a spoof of its class and refusing
-/// a real wall of another). THE ONE EXCEPTION, measured: a prompt row with
-/// no parent (`parentUuid: null`, the conversation's first) written after
-/// the rows that answered it opens the conversation and ends nothing — the
-/// relaunched first turn's session limit stands; the same row with a parent
-/// ends the notice, and so does the root row whose `parentUuid` is not
-/// written null but missing; read first, the root row is the turn's input.
-/// And only a prompt is so read: a notice or a reply with no parent is read
-/// where the file holds it.
+/// The file's order decides, not the rows' clocks: an entry written after the notice ends it
+/// whatever its `timestamp` says. The one exception: a prompt row with no parent
+/// (`parentUuid: null`) written after the rows that answered it ends nothing; with a parent, or
+/// with the key missing, it ends the notice.
 #[test]
 fn the_files_order_decides_but_for_the_conversations_first_row() {
     let notice = at(
@@ -410,7 +377,7 @@ fn the_files_order_decides_but_for_the_conversations_first_row() {
         (result, Entry::ToolResult),
         (reply, Entry::Reply),
     ] {
-        // An hour BEFORE the notice by its own clock.
+        // An hour before the notice by its own clock.
         let stepped = at(after, "2026-10-08T11:00:00.000Z");
         let end = transcript_ends_on(&format!("{notice}\n{stepped}"));
         assert_eq!(end.last, entry, "{entry:?}");
@@ -448,9 +415,8 @@ fn the_files_order_decides_but_for_the_conversations_first_row() {
     let end = transcript_ends_on(root);
     assert_eq!(end.last, Entry::Input, "the root row read first");
     assert!(end.lagging());
-    // Only a PROMPT opens the conversation out of the file's order: any other
-    // row with no parent is read where the file holds it — a notice after
-    // the prompt confirms its wall, the model's reply after a notice ends it.
+    // Only a prompt opens the conversation out of the file's order: a notice or a reply with no
+    // parent is read where the file holds it.
     let root_notice = parent(&notice, "null");
     assert!(root_notice.contains("\"parentUuid\":null"));
     let end = transcript_ends_on(&format!("{prompt}\n{root_notice}"));
@@ -464,27 +430,11 @@ fn the_files_order_decides_but_for_the_conversations_first_row() {
     assert!(!confirms(WallKind::Overloaded, &end));
 }
 
-/// LOCAL COMMANDS ARE NO TURNS (measured on 2.1.294: the review of pass 4
-/// found a real session limit refused as ending on "a user turn" after a
-/// person opened `/usage`, `/login` and `/model` at it). Every row the
-/// measured local commands wrote — `/model`, `/status`, `/usage`, `/mcp` and
-/// an unchanged `/config` as `system` rows; a dismissed `/login`, a `/config`
-/// that changed a setting and a `/compact` that compacted as `user` rows
-/// (`<command-name>…`, `<local-command-stdout>Login interrupted`, `Disabled
-/// auto-compact`, `Compacted`, the bare `/compact` and `/compact keep the
-/// notes`), with their caveats, a `compact_boundary` and a summary, and the
-/// `user` row a prompt command writes first (`/doctor`'s, opening
-/// `<command-message>doctor</command-message>`, measured by the review of
-/// pass 5) — is passed over, alone and all together, after a notice of every
-/// class: the notice stays the newest entry, and confirms its wall — and so
-/// the review's own case, measured whole (a real session limit, then
-/// `/usage`, `/login` dismissed, `/model`), confirms the limit. NEVER A
-/// NOTICE: a `user` row of a local command's output in a full context's words
-/// (`<local-command-stderr>Compaction failed · …`) leaves a 529's notice
-/// standing and confirms no context wall. CONTROLS: the person's prompt and a
-/// shell-mode `!` command's rows (`<bash-input>…`, `<bash-stdout>…`, as
-/// measured) end the notice; the `system` row of a failed `/compact` is the
-/// context wall's notice.
+/// Every row the measured local commands wrote (`system` and `user` rows, caveats, a
+/// `compact_boundary`, a summary, a prompt command's `<command-message>` row) is passed over,
+/// alone and all together, after a notice of every class. A `user` row of a local command's output
+/// in a full context's words is never a notice. Controls: a prompt and a shell-mode command's rows
+/// end the notice; a failed `/compact`'s `system` row is the context wall's notice.
 #[test]
 fn a_local_commands_rows_are_no_turn_and_no_notice() {
     let commands: Vec<&str> = fixture("local-commands").lines().skip(1).collect();
@@ -546,9 +496,7 @@ fn a_local_commands_rows_are_no_turn_and_no_notice() {
             );
         }
     }
-    // The review of pass 4's case, measured whole: a real session limit,
-    // then a person's `/usage`, `/login` dismissed and `/model` — the limit
-    // is confirmed.
+    // Measured whole: a real session limit, then `/usage`, `/login` dismissed and `/model`.
     let measured = transcript_ends_on(fixture("session-limit-then-local-commands"));
     assert!(confirms(WallKind::UsageSession, &measured), "{measured:?}");
     assert!(!measured.lagging());
@@ -1508,5 +1456,59 @@ fn a_limit_only_the_transcript_names_takes_its_rows_type() {
     assert_eq!(
         found_named(server, "API Error: terminated", Some("seven_day_opus")),
         (server, "API Error: terminated".to_string())
+    );
+}
+
+/// THE MODEL CHOSEN SINCE A LIMIT'S NOTICE ROW. On Claude Code 2.1.302 (the lab's `r21lebk5`) a
+/// Sonnet bucket's notice, Esc on the countdown and a person's `/model opus`, its rows `user`
+/// rows: the choice is the `/model`'s output after the notice row —
+/// `Set model to `Opus 5.5` and …`, read as the screen draws it. NEGATIVE CONTROLS, nothing
+/// chosen: the tail cut before the `/model`; a tail that does not hold the notice row (another
+/// conversation's); a `/model` left with Esc (`Kept model as …`, 2.1.294's `system`
+/// `local_command` rows); a `Set model to` that no `/model` printed.
+#[test]
+fn a_tail_names_the_model_chosen_since_a_notice() {
+    use super::chosen_since_notice;
+    let measured = fixture("bucket-cancelled-then-model");
+    let notice = "6f0c0c14-56cf-4622-a181-27337aa0ef2c";
+    assert!(
+        measured
+            .lines()
+            .any(|l| l.contains(notice) && l.contains("Sonnet limit"))
+    );
+    assert_eq!(
+        chosen_since_notice(measured, notice).as_deref(),
+        Some("Opus 5.5 and saved as your default for new sessions")
+    );
+    // NEGATIVE CONTROLS.
+    let cut: String = measured
+        .lines()
+        .take_while(|l| !(l.starts_with('{') && l.contains("<command-name>/model</command-name>")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(
+        chosen_since_notice(&cut, notice),
+        None,
+        "nothing chosen yet"
+    );
+    assert_eq!(
+        chosen_since_notice(measured, "another-conversations-row"),
+        None,
+        "not this notice's tail"
+    );
+    let kept = fixture("session-limit-then-local-commands");
+    assert_eq!(
+        chosen_since_notice(kept, "88c9221d-fa0c-4816-8165-2d440ff9e619"),
+        None,
+        "a `/model` left with Esc chose nothing"
+    );
+    let unprinted = measured.replace(
+        "<command-name>/model</command-name>",
+        "<command-name>/usage</command-name>",
+    );
+    assert_eq!(
+        chosen_since_notice(&unprinted, notice),
+        None,
+        "no `/model` printed it"
     );
 }

@@ -98,14 +98,15 @@ pub(crate) fn wait_listener_readable(
     listener: &TcpListener,
     timeout: Duration,
 ) -> io::Result<bool> {
-    use std::os::windows::io::AsRawSocket as _;
-    use windows_sys::Win32::Networking::WinSock::{
+    use aterm_win32::Win32::Networking::WinSock::{
         POLLIN, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
     };
+    use std::os::windows::io::AsRawSocket as _;
 
     let mut descriptor = WSAPOLLFD {
         // std's RawSocket is the pointer-width unsigned integer WinSock names
-        // SOCKET; windows-sys spells that same ABI type as `usize`.
+        // SOCKET; windows-sys (and so aterm-win32) spells that same ABI type
+        // as `usize`.
         fd: listener.as_raw_socket() as usize,
         events: POLLIN,
         revents: 0,

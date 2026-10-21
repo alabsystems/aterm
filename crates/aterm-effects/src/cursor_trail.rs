@@ -3,17 +3,12 @@
 
 //! Cursor motion trail: pure animation state.
 //!
-//! A cursor move with a correlated authored-input candidate spawns a comet of
-//! fading [`TrailCell`]s along the swept path, brightest at the head (nearest
-//! the new cursor) and dimming toward the tail. Bare cursor deltas and
-//! timestamp-only input hints stay dark: neither proves the landing came from
-//! that input. The comet fades within a few hundred milliseconds, and an idle
-//! screen returns to zero work (no live sparks, no animation timer).
-//!
-//! This module owns only the math: it takes the observed cursor cell and an
-//! injected [`Instant`] each frame and produces the current trail cells in
-//! terminal coordinates (the host offsets them into window space). The
-//! renderer only consumes the resulting [`TrailCell`]s.
+//! A cursor move with a correlated input candidate spawns a comet of fading [`TrailCell`]s
+//! along the swept path, brightest at the head (nearest the new cursor). Bare cursor deltas
+//! and timestamp-only hints stay dark: neither proves the landing came from that input. The
+//! comet fades within a few hundred milliseconds, and an idle screen does no work. Takes the
+//! cursor cell and an injected [`Instant`] each frame; cells are in terminal coordinates (the
+//! host offsets them into window space).
 
 use aterm_time::Instant;
 use std::time::Duration;
@@ -22,27 +17,21 @@ use aterm_render::TrailCell;
 
 use crate::cursor_glow::{TypedStamps, band_row, hint_fresh, take_hint_fresh};
 
-/// Coverage of the comet head (the cell nearest the cursor) at a gentle move:
-/// a lone keystroke barely tints the glyph it lands on. The continuous AA beam
-/// carries the visible streak, so the cell bed is a faint ember layer under
-/// [`READABLE_ALPHA_CAP`].
+/// Coverage of the comet head (the cell nearest the cursor) at a gentle move: a lone keystroke
+/// barely tints its glyph. The continuous AA beam carries the visible streak, so the cell bed
+/// is a faint ember layer.
 const HEAD_ALPHA_GENTLE: u32 = 42;
-/// Coverage of the comet head at full ignition (fast, sustained typing),
-/// brighter but under [`READABLE_ALPHA_CAP`]. Ignition shows through tail
-/// length, hot colour, the beam and the GPU bloom halo, not opacity over
-/// glyphs.
+/// Coverage of the comet head at full ignition. Ignition shows through tail length, hot
+/// colour, the beam and the GPU bloom, not opacity over glyphs.
 const HEAD_ALPHA_IGNITED: u32 = 70;
-/// Coverage of the comet TAIL (the cell farthest from the cursor) at a GENTLE move
-/// — faint, so a lone jump reads as a directional whisper rather than a solid bar.
+/// Coverage of the comet tail (the cell farthest from the cursor) at a gentle move: faint, so
+/// a lone jump reads as a directional whisper rather than a solid bar.
 const TAIL_ALPHA_GENTLE: u32 = 12;
-/// Coverage of the comet tail at full ignition: a brighter streak behind the
-/// cursor (older, already-read cells), without piling opacity on the freshest
-/// glyph.
+/// Coverage of the comet tail at full ignition: a brighter streak behind the cursor, without
+/// piling opacity on the freshest glyph.
 const TAIL_ALPHA_IGNITED: u32 = 44;
-/// Readability guard: the hard ceiling on any swept cell's coverage at any
-/// ignition level. The trail is a background tint drawn under the glyph, so
-/// capping it (~27%) keeps typed text legible even when a fast burst covers a
-/// run of fresh cells. Pinned by a unit test for every intensity.
+/// Readability guard: the hard ceiling (~27%) on any swept cell's coverage at any ignition
+/// level. The trail is a background tint under the glyph, so typed text stays legible.
 const READABLE_ALPHA_CAP: u8 = 70;
 
 /// The most coverage any bed cell is born with ([`READABLE_ALPHA_CAP`]): the
@@ -54,11 +43,9 @@ pub const BED_PEAK_ALPHA: u8 = READABLE_ALPHA_CAP;
 /// so a fast sustained burst leaves a LONGER visible comet (more overlapping live
 /// sparks) while a lone keystroke fades in the base time.
 const IGNITED_LIFE_MULT: f32 = 1.6;
-/// Typing continuity: at full sub-ignition warmth ([`TypingCadence::warmth`])
-/// a spark lives up to this many extra base durations, so keystrokes at human
-/// cadence (~150-350 ms apart) chain into a continuous ember bed (at 350 ms
-/// cadence the converged life is ~454 ms). Warmth is 0 for a lone keystroke,
-/// which keeps the plain fade.
+/// Typing continuity: at full sub-ignition warmth ([`TypingCadence::warmth`]) a spark lives up
+/// to this many extra base durations, so keystrokes ~150-350 ms apart chain into a continuous
+/// ember bed. Warmth is 0 for a lone keystroke.
 const CHAIN_LIFE_MULT: f32 = 1.5;
 
 /// ConPTY hide-bridge window, shared by the trail and glow engines: a cursor
@@ -72,17 +59,13 @@ pub const HIDE_BRIDGE_MS: u64 = 150;
 /// backspaces and wrap-adjacent steps bridge; a far teleport mid-hide (a
 /// full-screen repaint parking the cursor elsewhere) stays suppressed.
 pub const HIDE_BRIDGE_MAX_DIST: u16 = 2;
-/// The bridge's wider reach while a typed/backspace key hint is fresh: batched
-/// echoes (PTY coalescing under fast typing or key repeat) may still use their
-/// last visible cell as a source. This only classifies the source; the
-/// correlated movement candidate must still admit the landing. Unhinted moves
-/// keep [`HIDE_BRIDGE_MAX_DIST`].
+/// The bridge's wider reach while a typed/backspace key hint is fresh, so batched echoes (PTY
+/// coalescing under fast typing or key repeat) still find their last visible cell. This only
+/// classifies the source; the correlated movement candidate must still admit the landing.
 pub const HIDE_BRIDGE_TYPED_MAX_DIST: u16 = 8;
-/// Rows a nav-witnessed landing may cross. A navigation gesture moves along
-/// the logical line being edited, which spans one row unless the input box
-/// has wrapped, so rows are capped at a wrapped box: enough for Ctrl-A/Home on
-/// a multi-row composer, far short of a spinner repaint relocating the caret
-/// seven rows away with no key behind it.
+/// Rows a nav-witnessed landing may cross: a navigation gesture moves along the logical line,
+/// one row unless the input box has wrapped, so rows are capped at a wrapped box (enough for
+/// Ctrl-A/Home on a multi-row composer, short of a repaint relocating the caret far away).
 pub const HIDE_BRIDGE_NAV_MAX_ROWS: u16 = 4;
 
 /// Columns a nav-witnessed landing may cross when the host never named a pane
@@ -90,70 +73,54 @@ pub const HIDE_BRIDGE_NAV_MAX_ROWS: u16 = 4;
 /// width, never the whole grid.
 pub const HIDE_BRIDGE_NAV_UNPANED_COLS: u16 = 80;
 
-/// The window after a navigation press in which the caret may still be seen at
-/// rest without that proving the key moved nothing. An echo is a PTY round
-/// trip (12-40 ms in the pinned laws); once a presented frame sees the caret
-/// still visible this long after the press, the press did not move it (e.g.
-/// Ctrl-E at the end of the line), and a following hidden relocation belongs
-/// to the program. Only the bridge closes; the hint keeps licensing ordinary
-/// visible moves for its full window.
+/// The window after a navigation press in which the caret may still be seen at rest without
+/// proving the key moved nothing. An echo is a PTY round trip (12-40 ms in the pinned laws);
+/// a caret still visible this long after the press was not moved by it (Ctrl-E at the end of
+/// the line), so a following hidden relocation belongs to the program. Only the bridge closes;
+/// the hint keeps licensing visible moves for its full window.
 pub const NAV_NOOP_SETTLE_MS: u64 = 80;
 
-/// How long after a navigation press a hidden→visible landing may still be
-/// that press's echo. The nav hint lives [`CursorTrail::NAV_HINT_FRESH`]
-/// (250 ms, so a second press gets its own licence); the bridge claims "this
-/// landing is that key's echo", a PTY round trip plus a repaint. 150 ms is four
-/// times the slowest landing any pinned law needs.
+/// How long after a navigation press a hidden→visible landing may still be that press's echo
+/// (a PTY round trip plus a repaint): four times the slowest landing any pinned law needs. The
+/// nav hint itself lives [`CursorTrail::NAV_HINT_FRESH`].
 pub const NAV_BRIDGE_LANDING_MS: u64 = 150;
 
-/// May a nav-witnessed hidden→visible landing use `seen` as its source cell?
-///
-/// The question is whether the caret was still visible around the time the key
-/// was pressed: a sample within one hide window before the press is the cell it
-/// moved from; an older one belongs to an earlier state. Both sides are
-/// bounded: a sample much newer than the press proves the key moved nothing
-/// ([`NAV_NOOP_SETTLE_MS`]). With the nav hint capped at `NAV_HINT_FRESH`, the
-/// source is at most `NAV_HINT_FRESH + HIDE_BRIDGE_MS` old. Shared by both
-/// engines.
+/// May a nav-witnessed hidden→visible landing use `seen` as its source cell? A sample within
+/// one hide window before the press is the cell the key moved from, an older one belongs to an
+/// earlier state, and one more than [`NAV_NOOP_SETTLE_MS`] after the press proves the key moved
+/// nothing.
 #[must_use]
 pub fn nav_bridge_source_ok(key: Instant, seen: Instant) -> bool {
     key.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS
         && seen.saturating_duration_since(key).as_millis() as u64 <= NAV_NOOP_SETTLE_MS
 }
 
-/// The whole nav-bridge admission, called by both engines: the source must be
-/// a cell this key could have moved from ([`nav_bridge_source_ok`]) and the
-/// landing must arrive while the echo could still be outstanding
-/// ([`NAV_BRIDGE_LANDING_MS`]). Two separate claims (start cell vs arrival),
-/// kept as separate bounds.
+/// The nav-bridge admission, called by both engines: the source is a cell this key could have
+/// moved from ([`nav_bridge_source_ok`]), and the landing arrives while the echo could still be
+/// outstanding ([`NAV_BRIDGE_LANDING_MS`]).
 #[must_use]
 pub fn nav_bridge_admits(key: Instant, seen: Instant, now: Instant) -> bool {
     nav_bridge_source_ok(key, seen)
         && now.saturating_duration_since(key).as_millis() as u64 <= NAV_BRIDGE_LANDING_MS
 }
 
-/// How far one hidden→visible reappear may sit from its source, in cells, and
-/// on the nav lane what shape a row-crossing landing must have.
+/// How far one hidden→visible reappear may sit from its source, in cells, and on the nav lane
+/// what shape a row-crossing landing must have. The typed and classic lanes are a Chebyshev
+/// ball; the nav lane is wide across and short down.
 ///
-/// Rows and columns are judged separately: the typed and classic lanes keep a
-/// Chebyshev ball (`rows == cols`); the nav lane is wide across and short down.
-///
-/// A nav landing one row off is a wrap hop or arrow and may sit at any column
-/// of the pane. Two or more rows off, only Home/Ctrl-A lands where the engines
-/// can know (the box's own start, upward); End lands wherever the text ends,
-/// indistinguishable from a program re-laying its input box, so it is not
-/// bridged across two or more rows (it is still licensed whenever the caret
-/// was visible).
+/// A nav landing one row off is a wrap hop or arrow, at any column of the pane. Two or more
+/// rows off, only Home/Ctrl-A lands where the engines can know (the box's start, upward); End
+/// lands wherever the text ends, indistinguishable from a program re-laying its input box, so
+/// it is not bridged that far (it is still licensed while the caret is visible).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BridgeReach {
     /// Columns the landing may sit from the source.
     pub cols: u16,
     /// Rows the landing may sit from the source.
     pub rows: u16,
-    /// `Some(first column of the focused pane)` while the NAV lane is open: a
-    /// landing two or more rows from its source must be Home/Ctrl-A's —
-    /// upward, and within [`HIDE_BRIDGE_TYPED_MAX_DIST`] of that column.
-    /// `None` on the typed and classic balls, which carry no line gesture.
+    /// `Some(first column of the focused pane)` on the nav lane: a landing two or more rows
+    /// from its source must be Home/Ctrl-A's, upward and within [`HIDE_BRIDGE_TYPED_MAX_DIST`]
+    /// of that column. `None` on the typed and classic balls.
     pub line_start: Option<u16>,
 }
 
@@ -185,17 +152,13 @@ impl BridgeReach {
     }
 }
 
-/// The bridge reach for one reappear: the focused pane's width and a wrapped
-/// input box's height while a navigation hint is fresh, the Chebyshev typed
-/// ball while a typed/backspace hint is fresh, the classic ball otherwise.
-/// Shared by the trail and glow engines so they agree on every move.
+/// The bridge reach for one reappear, shared by the trail and glow engines: the focused pane's
+/// width and a wrapped box's height while a navigation hint is fresh, the typed ball while a
+/// typed/backspace hint is fresh, the classic ball otherwise.
 ///
-/// `pane` is the focused pane's `(first column, width)` (`note_pane_columns`):
-/// a word or line motion cannot leave the pane, so a wider landing was never
-/// that gesture, and a landing two or more rows off must be Home's, at the
-/// pane's first column ([`BridgeReach::line_start`]). In a single full-window
-/// pane the column ceiling is the window width; rows and the line-gesture
-/// shape do the work there.
+/// `pane` is the focused pane's `(first column, width)` (`note_pane_columns`): a word or line
+/// motion cannot leave the pane, and a landing two or more rows off must be Home's, at the
+/// pane's first column ([`BridgeReach::line_start`]).
 #[must_use]
 pub fn hide_bridge_reach(
     typed_hint_fresh: bool,
@@ -218,11 +181,9 @@ pub fn hide_bridge_reach(
     }
 }
 
-/// Hidden→visible relocations the trail's hide bridge has judged, each once:
-/// `bridged + declined` counts reappearances at a cell other than the last
-/// seen. A nav-paired move lays no comet, so this is the trail's only
-/// observable of the bridge decision, letting a test check the two engines
-/// decided the same.
+/// Hidden→visible relocations the trail's hide bridge has judged: `bridged + declined` counts
+/// reappearances at a cell other than the last seen. A nav-paired move lays no comet, so this
+/// is how a test checks both engines decided the same.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BridgeTally {
     /// Relocations the bridge admitted a source cell for.
@@ -238,11 +199,9 @@ fn lerp_u32(a: u32, b: u32, q: f32) -> u32 {
     (a as f32 + (b as f32 - a as f32) * q).round() as u32
 }
 
-/// Fingerprint the exact trail presentation handed to the renderer.
-///
-/// Colour is folded only while at least one cell is visible, preserving the
-/// trail's `0 == idle` contract. The sentinel keeps a black trail colour from
-/// becoming an empty multiply-add.
+/// Fingerprint the exact trail presentation handed to the renderer. Colour is folded only
+/// while a cell is visible (`0 == idle`); the sentinel bit keeps a black colour from folding to
+/// nothing.
 fn trail_presentation_fingerprint(cells: &[TrailCell], color: u32) -> u64 {
     let mut fp: u64 = 0;
     for cell in cells {
@@ -258,25 +217,34 @@ fn trail_presentation_fingerprint(cells: &[TrailCell], color: u32) -> u64 {
     fp
 }
 
-/// Apply a host presentation-opacity envelope to emitted trail cells and
-/// return the fingerprint of the attenuated output.
+/// Apply a host presentation-opacity envelope to emitted trail cells and return the
+/// fingerprint of the attenuated output.
 ///
-/// Downstream of [`CursorTrail::tick`]: ignition is baked into spark heat and
-/// lifetime at birth, so scaling [`TrailConfig::intensity`] would affect only
-/// new sparks. This attenuates every live cell uniformly without mutating
-/// engine state, so a recovery reveals the still-decaying bed continuously.
-/// Non-finite input fails closed; zero gives the empty/zero presentation.
+/// Ignition is baked into sparks at birth, so scaling [`TrailConfig::intensity`] would reach
+/// only new sparks; this attenuates every live cell uniformly without touching engine state,
+/// so a recovery reveals the still-decaying bed. Non-finite input fails closed.
 #[must_use]
 pub fn project_trail_presentation(cells: &mut Vec<TrailCell>, color: u32, opacity: f32) -> u64 {
+    if cells.is_empty() {
+        return 0;
+    }
     let opacity = if opacity.is_finite() {
         opacity.clamp(0.0, 1.0)
     } else {
         0.0
     };
-    cells.retain_mut(|cell| {
-        cell.alpha = (f32::from(cell.alpha) * opacity).round() as u8;
-        cell.alpha > 0
-    });
+    if opacity == 0.0 {
+        cells.clear();
+        return 0;
+    }
+    if opacity >= 1.0 {
+        cells.retain(|cell| cell.alpha > 0);
+    } else {
+        cells.retain_mut(|cell| {
+            cell.alpha = (f32::from(cell.alpha) * opacity).round() as u8;
+            cell.alpha > 0
+        });
+    }
     trail_presentation_fingerprint(cells, color)
 }
 
@@ -344,32 +312,21 @@ pub struct CursorTrail {
     /// Last observed cursor cell (terminal coords), to detect a move. `None` when
     /// the cursor was hidden, so a hide/show gap never spawns a spurious comet.
     last: Option<(u16, u16)>,
-    /// The last visible cursor cell and when it was seen, for the ConPTY hide
-    /// bridge ([`HIDE_BRIDGE_MS`]): conhost hides the cursor during every echo
-    /// repaint, which would otherwise drop the spark for nearly every key. When
-    /// the cursor reappears within the window at a plausible typing distance
-    /// (≤ [`HIDE_BRIDGE_MAX_DIST`]), an admitted move may use this cell as its
-    /// source; a long hide or far teleport stays suppressed.
+    /// The last visible cursor cell and when it was seen: the hide bridge's source
+    /// ([`HIDE_BRIDGE_MS`]).
     last_visible: Option<((u16, u16), Instant)>,
-    /// Fresh typed-echo key hints ([`Self::note_typed`]), the trail twin of
-    /// `CursorGlow`'s typed/backspace hints: armed on a plain
-    /// Character/Space/Backspace key (never Enter/Tab/nav/modified chords), it
-    /// classifies a paired one-row move beyond the typed advance as a TUI
-    /// repaint re-anchor (an Ink prompt rewrapping its input box), so `spawn`
-    /// lays no comet across those cells. Banked per press, one stamp per echo,
-    /// in lockstep with the glow engine's [`TypedStamps`]. Revoked in lockstep
-    /// too (`revoke_input_hints_at`): the glow's press credit goes with the
-    /// stamp only on a failed write; a queued key keeps its credit and has its
-    /// stamp re-banked at delivery.
+    /// Fresh typed-echo key hints ([`Self::note_typed`]), banked per press in lockstep with the
+    /// glow engine's [`TypedStamps`] (one stamp per echo, revoked together). A paired one-row
+    /// move beyond the typed advance is a TUI repaint re-anchor (an Ink prompt rewrapping its
+    /// input box), so `spawn` lays no comet across it.
     type_hint: TypedStamps,
     /// Fresh-navigation veto twin of `CursorGlow::nav_hint` (same host site): a
     /// Ctrl-A/E leap never re-anchors even with a typed hint and blink live, so
     /// the two engines agree on a nav jump.
     nav_hint: Option<Instant>,
-    /// One-shot LICENSE stamp for a cursor movement that is not a typed-glyph
-    /// echo: Return, Tab/paste, reflow, and the scripted-preview seams. A fresh
-    /// stamp licenses the following move exactly as `type_hint` does; consumed
-    /// on the first observed move, fresh or stale.
+    /// One-shot license stamp for a movement that is not a typed-glyph echo: Return, Tab/paste,
+    /// reflow and the scripted-preview seams. Consumed on the first observed move, fresh or
+    /// stale.
     move_hint: Option<Instant>,
     /// Fresh repaint-blink hint ([`Self::note_repaint_blink`]), twin of
     /// `CursorGlow`'s: the focused terminal's hide-inside-DEC-2026 repaint
@@ -380,11 +337,9 @@ pub struct CursorTrail {
     /// Per-frame alt-screen context ([`Self::note_context`]). `false` (main
     /// screen or an unwired host) leaves the re-anchor classifier unchanged.
     ctx_alt: bool,
-    /// Focused pane columns in this engine's composed/window coordinate space:
-    /// `(first_col, width)`. Native hosts stamp it beside [`Self::note_context`]
-    /// before every tick. `None` keeps direct/legacy embedders conservative:
-    /// without physical-margin authority, a large one-row move remains a dark
-    /// repaint re-anchor rather than guessing a fold.
+    /// Focused pane columns `(first_col, width)` in this engine's coordinate space, stamped by
+    /// native hosts before every tick. `None` stays conservative: without physical-margin
+    /// authority, a large one-row move is a dark re-anchor, never a guessed fold.
     pane_columns: Option<(u16, u16)>,
     /// Hidden→visible relocations the hide bridge admitted or declined, for
     /// the engine's life — see [`BridgeTally`]. Never reset.
@@ -397,16 +352,15 @@ pub struct CursorTrail {
     /// epoch reads as empty. Bumped once per lit tick. `u64` cannot wrap in a
     /// process lifetime, and starting at 1 means a zeroed table reads empty.
     dedup_epoch: u64,
-    /// Resident bounded Bresenham scratch used by [`Self::spawn`]. Walking
-    /// backward from the destination keeps both work and retained capacity at
-    /// O(`max_len`) even for a hostile full-u16 coordinate jump, and avoids a
-    /// heap allocation on every ordinary typed move after warm-up.
+    /// Resident bounded Bresenham scratch for [`Self::spawn`]. Walking back from the
+    /// destination keeps work and capacity at O(`max_len`) even for a full-u16 jump, and the
+    /// ordinary typed move allocates nothing after warm-up.
     spawn_path: Vec<(i32, i32)>,
 }
 
 impl CursorTrail {
-    /// Hard cap on live sparks (defends against a pathological flood of moves):
-    /// far more than a few hundred ms of typing or one capped jump can produce.
+    /// Hard cap on live sparks against a flood of moves: far more than a few hundred ms of
+    /// typing or one capped jump can produce.
     const MAX_SPARKS: usize = 512;
     /// Slot count of the dedup probe table: a power of two at 2 ×
     /// [`Self::MAX_SPARKS`], so even a saturated tick (512 distinct cells)
@@ -415,9 +369,9 @@ impl CursorTrail {
     /// A typed-echo key-hint stays armed this long for its paired move
     /// (seconds) — mirrors `CursorGlow::TYPE_HINT_FRESH`.
     const TYPE_HINT_FRESH: f32 = 0.25;
-    /// A repaint-blink hint stays fresh this long (seconds) — mirrors
-    /// `CursorGlow::BLINK_HINT_FRESH` (the blink is noted at the PREVIOUS
-    /// burst's present, so it must outlive one human inter-key gap).
+    /// A repaint-blink hint stays fresh this long (seconds), mirroring
+    /// `CursorGlow::BLINK_HINT_FRESH`: the blink is noted at the previous burst's present, so
+    /// it must outlive one inter-key gap.
     const BLINK_HINT_FRESH: f32 = 0.5;
     /// A navigation key-hint stays armed this long for its paired move
     /// (seconds) — mirrors `CursorGlow::NAV_HINT_FRESH`.
@@ -426,15 +380,15 @@ impl CursorTrail {
     /// a matching correlated candidate.
     const MOVE_HINT_FRESH: f32 = 0.25;
 
-    /// Last visible source owned by this engine. Hosts compare it with
-    /// CursorGlow's before arming a candidate; an unseeded or reset pair fails
-    /// closed.
+    /// Hidden→visible relocations the hide bridge admitted or declined ([`BridgeTally`]).
     #[must_use]
     #[cfg(test)]
     pub fn bridge_tally(&self) -> BridgeTally {
         self.bridge_tally
     }
 
+    /// Last visible source owned by this engine. Hosts compare it with CursorGlow's before
+    /// arming a candidate; an unseeded or reset pair fails closed.
     #[must_use]
     pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
         self.last
@@ -442,14 +396,11 @@ impl CursorTrail {
     }
 
     /// Host key hint: one plain typed-glyph or Backspace echo keypress (never
-    /// Enter/Tab/nav/modified chords). Arms only the [`Self::type_hint`]
-    /// re-anchor classifier; it cannot admit a comet.
+    /// Enter/Tab/nav/modified chords). Arms the [`Self::type_hint`] classifier and license.
     ///
-    /// A typed press closes nothing here: the nav and generic-move one-shots
-    /// survive it, since their echoes are still owed (a glyph typed before an
-    /// Enter's response lands is type-ahead). What the glow's
-    /// `supersede_typed_press` closes lives in this engine's single
-    /// [`Self::move_hint`] slot, so there is nothing to mirror here.
+    /// A typed press closes nothing here: the nav and generic-move one-shots survive it, since
+    /// their echoes are still owed (a glyph typed before an Enter's response lands is
+    /// type-ahead).
     pub fn note_typed(&mut self, now: Instant) {
         self.type_hint.stamp(now);
     }
@@ -508,27 +459,23 @@ impl CursorTrail {
         self.move_hint = None;
     }
 
-    /// Arm the navigation veto — see `CursorGlow::note_navigation`. It licenses
-    /// the following move (a key was pressed) and classifies it as scrubbing,
-    /// which the comet deliberately does not paint.
+    /// Arm the navigation veto (see `CursorGlow::note_navigation`): it licenses the following
+    /// move and classifies it as scrubbing, which the comet does not paint.
     pub fn note_navigation(&mut self, now: Instant) {
         self.clear_typed();
         self.nav_hint = Some(now);
     }
 
-    /// Arm one generic movement LICENSE, superseding any swallowed
-    /// typed/navigation classifier.
+    /// Arm one generic movement license, superseding any swallowed typed/navigation classifier.
     fn note_move(&mut self, now: Instant) {
         self.clear_typed();
         self.move_hint = Some(now);
     }
 
     /// Classify a Tab completion or non-empty paste, in lockstep with
-    /// `CursorGlow::note_user_gesture`: banked typed stamps are real keys whose
-    /// echoes are in flight, so the bank is kept. It closes the nav class
-    /// (`a_user_gesture_establishes_one_class_and_licenses_its_landing`), where
-    /// the glow keeps its nav one-shot; the two differ only for an arrow whose
-    /// hop is still in flight when Tab is pressed.
+    /// `CursorGlow::note_user_gesture`: banked typed stamps are real keys with echoes in
+    /// flight, so the bank is kept. It closes the nav class, where the glow keeps its nav
+    /// one-shot; the two differ only for an arrow whose hop is in flight when Tab is pressed.
     pub fn note_user_gesture(&mut self, now: Instant) {
         self.nav_hint = None;
         self.move_hint = Some(now);
@@ -559,10 +506,9 @@ impl CursorTrail {
         self.note_typed(now);
     }
 
-    /// Delivery re-stamp for every class using this engine's generic move slot
-    /// (a queued Enter's [`Self::note_return`], a queued Tab's or ⌃V's
-    /// [`Self::note_user_gesture`]): the licence revoked at enqueue is put back
-    /// at the writer's completed write (`CursorGlow::note_delivered`'s twin).
+    /// Delivery re-stamp for the generic move slot (a queued Enter's [`Self::note_return`], a
+    /// queued Tab's or ⌃V's [`Self::note_user_gesture`]): the licence revoked at enqueue is put
+    /// back at the writer's completed write (`CursorGlow::note_delivered`'s twin).
     pub fn note_move_delivered(&mut self, at: Instant) {
         self.move_hint = Some(at);
     }
@@ -584,10 +530,8 @@ impl CursorTrail {
         }
     }
 
-    /// PTY scroll translation (see `CursorGlow::note_scroll`): every live
-    /// terminal-coordinate member, classifier anchors and visible cells alike,
-    /// moves up `rows`. Anything pushed above row 0 is retired rather than
-    /// clamped there.
+    /// PTY scroll translation (see `CursorGlow::note_scroll`): every live terminal-coordinate
+    /// member moves up `rows`; anything pushed above row 0 retires rather than clamping.
     pub fn note_scroll(&mut self, rows: u16) {
         if rows == 0 {
             return;
@@ -606,8 +550,8 @@ impl CursorTrail {
         self.remap_rows(|row| band_row(row, top, bottom, delta));
     }
 
-    /// Move every live terminal-coordinate member — the classifier anchors
-    /// and the visible sparks — through `map`; `None` retires the member.
+    /// Move every live terminal-coordinate member (classifier anchors and sparks) through
+    /// `map`; `None` retires the member.
     fn remap_rows(&mut self, map: impl Fn(u16) -> Option<u16>) {
         self.last = self
             .last
@@ -624,8 +568,7 @@ impl CursorTrail {
         });
     }
 
-    /// Whether any spark is still alive (so the host should keep the animation
-    /// timer armed). Cheap; consulted every `about_to_wait`.
+    /// Whether any spark is still alive (the host keeps the animation timer armed).
     pub fn is_active(&self) -> bool {
         !self.sparks.is_empty()
     }
@@ -643,11 +586,10 @@ impl CursorTrail {
         self.pane_columns = None;
     }
 
-    /// Advance the trail one frame: observe the cursor at `cur` (`None` when
-    /// hidden), spawn a comet only when a one-shot movement candidate admits
-    /// the delta, decay expired sparks, write the current trail cells (terminal
-    /// coords) into `out`, and return their fingerprint (`0` when idle; it
-    /// changes on every visible change).
+    /// Advance the trail one frame: observe the cursor at `cur` (`None` when hidden), spawn a
+    /// comet only when a one-shot movement candidate admits the delta, decay expired sparks,
+    /// write the trail cells (terminal coords) into `out`, and return their fingerprint (`0`
+    /// when idle).
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -667,10 +609,9 @@ impl CursorTrail {
             return 0;
         }
 
-        // Source for a move between two visible positions, bridging ConPTY's
-        // per-echo hide: a cursor visible within HIDE_BRIDGE_MS that reappears
-        // at a plausible typing distance may start from the last visible cell.
-        // The bridge never substitutes for the license gate in `spawn`.
+        // Source cell, bridging ConPTY's per-echo hide: a cursor visible within HIDE_BRIDGE_MS
+        // that reappears within reach may start from the last visible cell. The bridge never
+        // substitutes for the license gate in `spawn`.
         let spawn_from = self.last.or_else(|| {
             let ((r, c), seen) = self.last_visible?;
             let fresh = now.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS;
@@ -678,11 +619,9 @@ impl CursorTrail {
             // source reach for batched echoes; unhinted moves keep the classic law.
             let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH);
             // A fresh navigation hint outranks the hide window (lockstep with
-            // `CursorGlow::tick`): the landing is the key's echo however long the
-            // caret was hidden. The reach is the focused pane's width and a wrapped
-            // box's height, never the grid. `spawn` still owns and consumes the
-            // license and refuses a stale one, and `nav_bridge_source_ok` bounds
-            // the source on both sides of the press.
+            // `CursorGlow::tick`): the landing is the key's echo however long the caret was
+            // hidden. `spawn` still owns the license, and `nav_bridge_admits` bounds source and
+            // landing in time.
             let nav_bridge = hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
                 && self
                     .nav_hint
@@ -739,91 +678,80 @@ impl CursorTrail {
             self.last_visible = Some((c, now));
         }
 
-        // Decay and emission in one ordered walk: drop sparks past their own
-        // baked lifetime, and resolve survivors' coverage into `out`, merging
-        // overlapping cells (keep the brightest) via one O(1) probe of the
-        // epoch-stamped table. Up to MAX_SPARKS = 512 live sparks can occupy
-        // hundreds of distinct cells, so a linear rescan would be quadratic.
-        // A first-seen cell claims its slot at first touch and later overlaps
-        // max() in place, so `out`'s contents and order (and the fingerprint)
-        // match a linear scan (`dedup_index_matches_the_linear_scan_byte_for_byte`).
+        // Decay and emission in one ordered walk: drop sparks past their baked lifetime and
+        // merge survivors into `out` (brightest wins) through one probe of the epoch-stamped
+        // table; up to 512 sparks on hundreds of cells would make a linear rescan quadratic.
+        // A cell claims its slot at first touch, so `out`'s order and the fingerprint match a
+        // linear scan (`dedup_index_matches_the_linear_scan_byte_for_byte`).
         if !self.sparks.is_empty() {
             if self.dedup.is_empty() {
-                // First lit tick of this window: size the table once. Idle and
-                // disabled windows never reach this (their sparks stay empty).
+                // First lit tick: size the table once (idle windows never get here).
                 self.dedup = vec![DedupSlot::default(); Self::DEDUP_SLOTS];
             }
-            // One counter bump invalidates every slot at once — the O(1)
-            // whole-table "clear" that replaces walking 1024 slots per frame.
             self.dedup_epoch += 1;
+            let epoch = self.dedup_epoch;
+            let dedup = &mut self.dedup;
+            const MASK: usize = CursorTrail::DEDUP_SLOTS - 1;
+            const SHIFT: u32 = 32 - CursorTrail::DEDUP_SLOTS.trailing_zeros();
+            self.sparks.retain(|s| {
+                let age_ms = now.saturating_duration_since(s.born).as_millis() as u64;
+                if age_ms >= s.life_ms {
+                    return false;
+                }
+                // time fade in 0..=255 (linear), then scale the birth coverage.
+                let tf = ((s.life_ms - age_ms) * 255 / s.life_ms) as u32;
+                let alpha = ((s.born_alpha as u32 * tf) / 255) as u8;
+                if alpha == 0 {
+                    return true;
+                }
+                let key = (u32::from(s.row) << 16) | u32::from(s.col);
+                // Fibonacci-hash the packed cell (top log2(DEDUP_SLOTS) bits of the
+                // golden-ratio product), then linear-probe. At most 512 keys are
+                // claimed per epoch against 1024 slots, so an empty slot is always
+                // reached before a wrap.
+                let mut i = (key.wrapping_mul(0x9E37_79B9) >> SHIFT) as usize;
+                loop {
+                    let slot = &mut dedup[i];
+                    if slot.epoch != epoch {
+                        // First touch this tick: claim the slot and push (first
+                        // spark wins the position).
+                        *slot = DedupSlot {
+                            epoch,
+                            key,
+                            out_idx: out.len() as u32,
+                        };
+                        out.push(TrailCell {
+                            row: s.row as usize,
+                            col: s.col as usize,
+                            alpha,
+                        });
+                        break;
+                    }
+                    if slot.key == key {
+                        // Already emitted this tick: the brightest overlapping spark wins.
+                        let cell = &mut out[slot.out_idx as usize];
+                        cell.alpha = cell.alpha.max(alpha);
+                        break;
+                    }
+                    i = (i + 1) & MASK;
+                }
+                true
+            });
         }
-        let epoch = self.dedup_epoch;
-        let dedup = &mut self.dedup;
-        self.sparks.retain(|s| {
-            let age_ms = now.saturating_duration_since(s.born).as_millis() as u64;
-            if age_ms >= s.life_ms {
-                return false;
-            }
-            // time fade in 0..=255 (linear), then scale the birth coverage.
-            let tf = ((s.life_ms - age_ms) * 255 / s.life_ms) as u32;
-            let alpha = ((s.born_alpha as u32 * tf) / 255) as u8;
-            if alpha == 0 {
-                return true;
-            }
-            let key = (u32::from(s.row) << 16) | u32::from(s.col);
-            // Fibonacci-hash the packed cell (top log2(DEDUP_SLOTS) bits of the
-            // golden-ratio product), then linear-probe. At most 512 keys are
-            // claimed per epoch against 1024 slots, so an empty slot is always
-            // reached before a wrap.
-            let mask = Self::DEDUP_SLOTS - 1;
-            let shift = 32 - Self::DEDUP_SLOTS.trailing_zeros();
-            let mut i = (key.wrapping_mul(0x9E37_79B9) >> shift) as usize;
-            loop {
-                let slot = &mut dedup[i];
-                if slot.epoch != epoch {
-                    // First touch this tick: claim the slot and push (first
-                    // spark wins the position).
-                    *slot = DedupSlot {
-                        epoch,
-                        key,
-                        out_idx: out.len() as u32,
-                    };
-                    out.push(TrailCell {
-                        row: s.row as usize,
-                        col: s.col as usize,
-                        alpha,
-                    });
-                    break;
-                }
-                if slot.key == key {
-                    // Already emitted this tick: merge exactly as before —
-                    // the brightest overlapping spark wins.
-                    let cell = &mut out[slot.out_idx as usize];
-                    cell.alpha = cell.alpha.max(alpha);
-                    break;
-                }
-                i = (i + 1) & mask;
-            }
-            true
-        });
 
-        // Include the resolved colour: `ignite` re-heats it from live cadence
-        // each frame, so colour can change while cells are identical. The shared
-        // helper is also the host's presentation-opacity seam.
+        // Include the resolved colour: `ignite` re-heats it each frame, so colour can change
+        // while cells are identical.
         trail_presentation_fingerprint(out, cfg.color)
     }
 
-    /// The license, twin of `CursorGlow::move_licensed`: did a human touch the
-    /// keyboard just now? See `docs/design/EFFECTS-LICENSE-REDESIGN.md`.
+    /// The license, twin of `CursorGlow::move_licensed`: did a human touch the keyboard just
+    /// now? See `docs/design/EFFECTS-LICENSE-REDESIGN.md`.
     ///
-    /// This engine keeps the glow's hint set under three stamps, so both
-    /// license exactly the same moves:
-    /// * `type_hint`: typed-glyph and Backspace echoes (glow `type_hint` +
-    ///   `quench_hint`);
+    /// This engine keeps the glow's hint set under three stamps, so both license the same moves:
+    /// * `type_hint`: typed-glyph and Backspace echoes (glow `type_hint` + `quench_hint`);
     /// * `nav_hint`: navigation/motion;
-    /// * `move_hint`: Return, Tab/paste, reflow and scripted preview notes
-    ///   (glow `return_hint` + `newline_hint` + `user_gesture_hint` +
-    ///   `synthetic_note_pending`).
+    /// * `move_hint`: Return, Tab/paste, reflow and scripted preview notes (glow
+    ///   `return_hint`, `newline_hint`, `user_gesture_hint` and `synthetic_note_pending`).
     ///
     /// Peeks, never consumes: `spawn` owns consumption (one hint, one echo).
     #[must_use]
@@ -846,25 +774,11 @@ impl CursorTrail {
         now: Instant,
         cfg: &TrailConfig,
     ) -> bool {
-        // The license seam (see [`Self::move_licensed`]), as in the glow: an
-        // unlicensed move mints nothing and clears nothing. Earned light leaves
-        // by decay, scroll translation or reset, never by someone else's output.
+        // The license seam ([`Self::move_licensed`]): an unlicensed move mints nothing and
+        // clears nothing. Earned light leaves by decay, scroll translation or reset only.
         if !self.move_licensed(now) {
             return false;
         }
-        // Typed re-anchor (twin of the `CursorGlow` wrap classifier): a fresh
-        // typed/backspace hint paired with a one-row move beyond the typed
-        // advance is a TUI repaint re-anchoring its caret (Ink rewraps its input
-        // box per keystroke), so lay no comet and return. `dr_abs <= 1` covers
-        // wrap-down, backspace wrap-back and box growth (a bottom-anchored box
-        // growing up keeps the caret's row, dr == 0 with a large column delta);
-        // `raw_dist > 2` keeps every hide-bridgeable move unchanged. The hint is
-        // consumed on any paired move.
-        let dr_abs = (cr as i32 - pr as i32).abs();
-        let raw_dist = dr_abs.max((cc as i32 - pc as i32).abs());
-        let physical_fold = self.pane_columns.is_some_and(|(col0, cols)| {
-            crate::trail_sweep::physical_margin_fold((pr, pc), (cr, cc), col0, cols)
-        });
         // A one-shot's own move is never the glyph's (lockstep with
         // `CursorGlow`'s `return_paired`): an Enter's late response can arrive
         // beside a type-ahead glyph's stamp. Any shape but a same-row forward
@@ -877,25 +791,37 @@ impl CursorTrail {
                 .type_hint
                 .take_fresh(now, Self::TYPE_HINT_FRESH)
                 .is_some();
-        // Alt-screen blink requirement (glow twin): on the alt screen only a
-        // repaint-blinking app re-anchors; vim's one-row motions keep their
-        // comet.
-        let blink_fresh = hint_fresh(self.blink_hint, now, Self::BLINK_HINT_FRESH);
         let nav_paired = take_hint_fresh(&mut self.nav_hint, now, Self::NAV_HINT_FRESH).is_some();
-        // The generic move license is consumed here too — one stamp, one echo.
+        // The generic move license is consumed here too: one stamp, one echo.
         let _ = self.move_hint.take();
-        // Navigation (Ctrl-A/E, Home/End, arrows, word/line motions): a move
-        // paired with a fresh nav hint is scrubbing, so lay no comet, matching
-        // `CursorGlow`. The live cursor draws itself, and the resident bed
-        // survives (a scrub mints and clears nothing).
+        // Navigation (Ctrl-A/E, Home/End, arrows, word/line motions) is scrubbing: no comet,
+        // as in `CursorGlow`, and the resident bed survives.
         if nav_paired {
             return false;
         }
-        if paired && !physical_fold && dr_abs <= 1 && raw_dist > 2 && (!self.ctx_alt || blink_fresh)
+        // Typed re-anchor (twin of the `CursorGlow` wrap classifier): a fresh typed/backspace
+        // hint paired with a one-row move beyond the typed advance is a TUI repaint re-anchoring
+        // its caret (Ink rewraps its input box per keystroke), so no comet. `dr_abs <= 1`
+        // covers wrap-down, backspace wrap-back and box growth (a bottom-anchored box growing up
+        // keeps the caret's row); `raw_dist > 2` leaves every hide-bridgeable move alone. The
+        // hint is consumed on any paired move.
+        // Alt-screen blink requirement (glow twin): on the alt screen only a
+        // repaint-blinking app re-anchors; vim's one-row motions keep their
+        // comet.
+        let dr_abs = (cr as i32 - pr as i32).abs();
+        let raw_dist = dr_abs.max((cc as i32 - pc as i32).abs());
+        let physical_fold = self.pane_columns.is_some_and(|(col0, cols)| {
+            crate::trail_sweep::physical_margin_fold((pr, pc), (cr, cc), col0, cols)
+        });
+        if paired
+            && !physical_fold
+            && dr_abs <= 1
+            && raw_dist > 2
+            && (!self.ctx_alt || hint_fresh(self.blink_hint, now, Self::BLINK_HINT_FRESH))
         {
             return false;
         }
-        // Keep at most `max_len` cells NEAREST the destination (the path's tail).
+        // Keep at most `max_len` cells nearest the destination (the path's tail).
         let max_len = cfg.max_len.max(1);
         self.spawn_path.clear();
         if physical_fold {
@@ -915,10 +841,8 @@ impl CursorTrail {
         if self.spawn_path.is_empty() {
             return false;
         }
-        // Ignition: the cadence intensity (baked at spawn) scales head and tail
-        // coverage between their gentle and ignited endpoints and stretches the
-        // lifetime. Warmth stretches lifetime only, so human-cadence typing
-        // chains the bed while a lone keystroke keeps the plain fade.
+        // Ignition (baked at spawn) scales head and tail coverage between their gentle and
+        // ignited endpoints and stretches the lifetime; warmth stretches the lifetime only.
         let q = cfg.intensity.clamp(0.0, 1.0);
         let head = lerp_u32(HEAD_ALPHA_GENTLE, HEAD_ALPHA_IGNITED, q);
         let tail = lerp_u32(TAIL_ALPHA_GENTLE, TAIL_ALPHA_IGNITED, q);
@@ -957,26 +881,23 @@ impl CursorTrail {
 // Typing-cadence ignition
 // ===========================================================================
 //
-// The comet ignites only when typing is fast and sustained. Each keystroke adds
-// a fixed quantum of heat, which decays with a fixed half-life between keys:
-// fast typing compounds toward a hot steady state, slow typing never climbs. A
-// knee mapping ([`ignition_intensity`]) turns heat into the `0.0..=1.0`
-// intensity, with a high lower knee so a few characters stay gentle. Clockless
-// (injected `now`), so it is unit-testable without sleeping.
+// Each keystroke adds a fixed quantum of heat, which decays with a fixed half-life between
+// keys: fast typing compounds toward a hot steady state, slow typing never climbs. A knee
+// mapping ([`ignition_intensity`]) turns heat into the `0.0..=1.0` intensity, with a high lower
+// knee so a few characters stay gentle.
 
-/// Tunables for the typing-cadence heat → ignition mapping. The [`Default`] is
-/// what the host uses: fast sustained typing ignites in ~8-10 keys, a few keys
-/// stay calm, a pause cools in ~½ s.
+/// Tunables for the typing-cadence heat → ignition mapping. The [`Default`] is what the host
+/// uses: fast sustained typing ignites in ~8-10 keys, a few keys stay calm, a pause cools in
+/// ~½ s.
 #[derive(Clone, Copy, Debug)]
 pub struct CadenceParams {
     /// Heat added by one keystroke (arbitrary units).
     pub gain: f32,
     /// Heat half-life: the time for accumulated heat to halve with no typing.
     pub half_life: Duration,
-    /// Heat where ignition BEGINS to ramp. Below it → intensity 0 (a few keys /
-    /// slow typing live here), so the effect stays gentle.
+    /// Heat where ignition begins to ramp; below it intensity is 0 (a few keys, slow typing).
     pub knee_lo: f32,
-    /// Heat where ignition is FULL (intensity 1). Fast, sustained typing reaches it.
+    /// Heat where ignition is full (intensity 1).
     pub knee_hi: f32,
 }
 
@@ -991,18 +912,18 @@ impl Default for CadenceParams {
     }
 }
 
-/// Decay `heat` forward by `dt` under a `half_life` (exponential). Pure + total;
-/// `dt == 0` returns `heat` unchanged, and a non-positive half-life is floored so
-/// the power is finite.
+/// Decay `heat` forward by `dt` under a `half_life` (exponential). A non-positive half-life is
+/// floored so the power is finite.
 fn decay_heat(heat: f32, dt: Duration, half_life: Duration) -> f32 {
+    if heat <= 0.0 || dt.is_zero() {
+        return heat.max(0.0);
+    }
     let hl = half_life.as_secs_f32().max(1e-3);
     heat * 0.5f32.powf(dt.as_secs_f32() / hl)
 }
 
-/// The PURE cadence→intensity mapping the whole feature turns on: a smoothstep of
-/// accumulated `heat` between the two knees, clamped to `0.0..=1.0`. Below `knee_lo`
-/// → `0.0` (gentle: a few keys never ignite); above `knee_hi` → `1.0` (ignited:
-/// fast sustained typing); a smooth S-curve between. Total for all finite inputs.
+/// The cadence→intensity mapping: a smoothstep of `heat` between the two knees, `0.0` below
+/// `knee_lo` (a few keys never ignite) and `1.0` above `knee_hi`.
 #[must_use]
 pub fn ignition_intensity(heat: f32, knee_lo: f32, knee_hi: f32) -> f32 {
     // A positive valid-interval test: NaN, inverted or equal knees fall to the
@@ -1017,14 +938,11 @@ pub fn ignition_intensity(heat: f32, knee_lo: f32, knee_hi: f32) -> f32 {
     }
 }
 
-/// Typing-cadence tracker → comet ignition intensity. Clockless: both
-/// [`Self::on_keystroke`] and [`Self::intensity`] take an injected `now`. The
-/// host keeps one per window and reads [`Self::intensity`] each frame.
+/// Typing-cadence tracker → comet ignition intensity, with an injected `now`. The host keeps
+/// one per window and reads it each frame.
 ///
-/// scope-waiver: heat is an aesthetic intensity, not a safety budget; a second
-/// tracker costs a second lazily decayed `f32` and a differently lit comet.
-/// (The ignition limiter that is a budget lives in `word_decorations`, under
-/// the `flash-limiter` scope claim.)
+/// Heat is an aesthetic intensity, not a safety budget: the ignition limiter lives in
+/// `word_decorations` (the `flash-limiter` scope claim).
 #[derive(Clone, Debug)]
 pub struct TypingCadence {
     params: CadenceParams,
@@ -1051,9 +969,8 @@ impl TypingCadence {
         }
     }
 
-    /// Register one keystroke at `now`: decay the standing heat to `now`, then add
-    /// one `gain` quantum (capped at `knee_hi` so a long hold saturates cleanly and
-    /// decay from the top reaches the gentle band predictably).
+    /// Register one keystroke at `now`: decay the standing heat to `now`, then add one `gain`
+    /// quantum, capped at `knee_hi` so a long hold saturates and decays predictably.
     pub fn on_keystroke(&mut self, now: Instant) {
         if let Some(last) = self.last {
             let dt = now.saturating_duration_since(last);
@@ -1063,10 +980,8 @@ impl TypingCadence {
         self.last = Some(now);
     }
 
-    /// The standing heat decayed forward to `now`, the one lazy read every
-    /// accessor derives from, so [`Self::sample`] pays the decay (`powf`) once
-    /// for both channels while [`Self::intensity`] / [`Self::warmth`] stay
-    /// bit-identical.
+    /// The standing heat decayed forward to `now`, the one lazy read every accessor derives
+    /// from.
     fn heat_at(&self, now: Instant) -> f32 {
         match self.last {
             Some(last) => {
@@ -1084,28 +999,24 @@ impl TypingCadence {
         ((heat - self.params.gain) / span).clamp(0.0, 1.0)
     }
 
-    /// The ignition intensity `0.0..=1.0` as of `now` — the heat decayed forward to
-    /// `now`, then run through [`ignition_intensity`]. Non-mutating (safe to call
-    /// every frame): a long idle simply reads as a fully-decayed, gentle `0.0`.
+    /// The ignition intensity `0.0..=1.0` as of `now`: the decayed heat through
+    /// [`ignition_intensity`]. Non-mutating, so safe to call every frame.
     #[must_use]
     pub fn intensity(&self, now: Instant) -> f32 {
         ignition_intensity(self.heat_at(now), self.params.knee_lo, self.params.knee_hi)
     }
 
-    /// Sub-ignition warmth `0.0..=1.0` as of `now`: `0` at or below one key's
-    /// worth of heat (so a lone keystroke contributes nothing), ramping to `1`
-    /// at the ignition knee. Continuity fuel, not brightness: the host feeds it
-    /// into trail lifetime only (see [`ignite`] / `TrailConfig::warmth`), so
-    /// human-cadence typing chains into a continuous bed while colour and alpha
-    /// stay gentle until real ignition. Non-mutating.
+    /// Sub-ignition warmth `0.0..=1.0` as of `now`: `0` at or below one key's worth of heat (a
+    /// lone keystroke contributes nothing), ramping to `1` at the ignition knee. The host feeds
+    /// it into trail lifetime only, so human-cadence typing chains into a continuous bed while
+    /// colour and alpha stay gentle. Non-mutating.
     #[must_use]
     pub fn warmth(&self, now: Instant) -> f32 {
         self.warmth_of(self.heat_at(now))
     }
 
-    /// Both per-frame channels from one lazy decay: `(intensity, warmth)`,
-    /// bit-for-bit what the two accessors return for the same `now`, with one
-    /// `powf` instead of two.
+    /// Both per-frame channels, `(intensity, warmth)`, bit-for-bit what the two accessors
+    /// return for the same `now`, with one `powf` instead of two.
     #[must_use]
     pub fn sample(&self, now: Instant) -> (f32, f32) {
         let heat = self.heat_at(now);
@@ -1133,6 +1044,9 @@ fn heat_color(base: u32, q: f32) -> u32 {
     /// and it keeps enough of the base hue that the wake still "matches the theme".
     const HEAT_COLOR_MAX: f32 = 0.5;
     let t = (q.clamp(0.0, 1.0) * HEAT_COLOR_MAX).clamp(0.0, 1.0);
+    if t == 0.0 {
+        return base & 0x00FF_FFFF;
+    }
     let lerp = |sh: u32| {
         let a = ((base >> sh) & 0xff) as f32;
         let b = ((HOT >> sh) & 0xff) as f32;
@@ -1155,8 +1069,7 @@ pub fn ignite(cfg: &mut TrailConfig, intensity: f32, warmth: f32) {
     cfg.color = heat_color(cfg.color, q);
 }
 
-/// Integer cell-line (Bresenham) from `(r0,c0)` to `(r1,c1)` INCLUSIVE of both
-/// endpoints — the cells a straight cursor move sweeps through. Pure + total.
+/// Integer cell-line (Bresenham) from `(r0,c0)` to `(r1,c1)`, both endpoints included.
 #[cfg(test)]
 fn line_cells(r0: i32, c0: i32, r1: i32, c1: i32) -> Vec<(i32, i32)> {
     let (dr, dc) = ((r1 - r0).abs(), (c1 - c0).abs());
@@ -1274,11 +1187,8 @@ mod tests {
         );
     }
 
-    /// Band twin of the scroll test below, in lockstep with
-    /// `CursorGlow::note_band_move`: a viewport `[8..20]` riding down one row
-    /// carries the anchors and the comet cell in it by one row, leaves a cell
-    /// outside the band alone, and drops the cell on the band's bottom row. A
-    /// degenerate band is a no-op.
+    /// In lockstep with `CursorGlow::note_band_move`: a band move carries what is inside, leaves
+    /// what is outside and drops what leaves; a degenerate band is a no-op.
     #[test]
     fn a_band_move_translates_the_trail_inside_the_band_and_drops_what_leaves() {
         let now = Instant::now();
@@ -1324,10 +1234,8 @@ mod tests {
         assert_eq!(trail.sparks.len(), 1);
     }
 
-    /// PTY scrolls carry the classic terminal-cell trail just like the glow
-    /// engine's pixel/cell pools. A survivor moves by the exact row delta,
-    /// while visible light and classifier anchors that cross the top retire;
-    /// none may clamp to row 0 and later seed an unrelated move.
+    /// A PTY scroll moves survivors by the exact row delta; light and anchors that cross the top
+    /// retire rather than clamp to row 0.
     #[test]
     fn scroll_translates_every_live_trail_cell_and_retires_off_top_state() {
         let now = Instant::now();
@@ -1386,8 +1294,7 @@ mod tests {
         );
         assert!(admitted, "real trail scroll transition rejected: {why}");
 
-        // Negative controls prove the bind observes both decisions rather than
-        // accepting any post-state with the right action name.
+        // Negative controls: a wrong post-state under the right action name is rejected.
         let mut stranded = projected.clone();
         stranded.insert("survivor_y", 10);
         let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
@@ -1422,9 +1329,8 @@ mod tests {
         );
     }
 
-    /// Paste/Tab supersedes swallowed typed/navigation classifiers, but its
-    /// text-blind timestamp is not movement evidence. A scripted candidate
-    /// proves the identical geometry is non-vacuously drawable.
+    /// Paste/Tab supersedes swallowed typed/navigation classifiers and licenses its landing; the
+    /// same landing with no gesture is dark.
     #[test]
     fn a_user_gesture_establishes_one_class_and_licenses_its_landing() {
         let now = Instant::now();
@@ -1448,7 +1354,7 @@ mod tests {
         );
         assert!(!out.is_empty());
 
-        // …and the SAME landing with no gesture behind it is dark.
+        // …and the same landing with no gesture behind it is dark.
         let mut cold = CursorTrail::default();
         cold.tick(Some((2, 20)), now, &c, &mut out);
         assert_eq!(
@@ -1605,9 +1511,8 @@ mod tests {
             !one_shot.spawn(0, 1, 0, 2, now + Duration::from_millis(1), &hot),
             "one candidate cannot fund a second program delta"
         );
-        // The denied delta is unlicensed (the gesture stamp went with the first
-        // move), so it mints and destroys nothing: the admitted comet keeps
-        // every cell (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
+        // The denied delta is unlicensed (the stamp went with the first move), so it mints and
+        // destroys nothing (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
         assert_eq!(
             one_shot
                 .sparks
@@ -1627,9 +1532,7 @@ mod tests {
             !stale.spawn(0, 0, 0, 1, now + Duration::from_millis(251), &hot),
             "an expired stamp licenses nothing"
         );
-        // The unlicensed return consumes nothing, and need not: every stamp
-        // read is freshness-checked, so an expired one is inert. Prove the
-        // inertness.
+        // An expired stamp is inert, not consumed: every stamp read is freshness-checked.
         assert!(
             !stale.spawn(0, 0, 0, 1, now + Duration::from_millis(400), &hot),
             "an expired stamp stays inert on every later delta"
@@ -1801,7 +1704,7 @@ mod tests {
             fp_green, fp_amber,
             "identical cells, different colour ⇒ different fp"
         );
-        // The cells themselves ARE identical — only the colour differs.
+        // The cells themselves are identical; only the colour differs.
         assert_eq!(cells_green.len(), cells_amber.len());
         // And an idle (empty) trail keeps fp 0 regardless of colour.
         let mut t = CursorTrail::default();
@@ -1848,7 +1751,7 @@ mod tests {
         }
         let w = cad.warmth(t);
         assert!(w > 0.4, "300ms-cadence warmth converges high (got {w})");
-        // …while real IGNITION stays essentially off at that cadence.
+        // …while ignition stays essentially off at that cadence.
         assert!(
             cad.intensity(t) < 0.1,
             "300ms cadence must not ignite (got {})",
@@ -1913,7 +1816,7 @@ mod tests {
         assert_ne!(fp, 0, "a candidate-backed generic jump keeps its comet");
         assert!(!out.is_empty());
 
-        // A hinted PLAIN advance (dist 1) still lays its typing spark.
+        // A hinted plain advance (dist 1) still lays its typing spark.
         let mut typing = CursorTrail::default();
         typing.tick(Some((0, 3)), t0, &c, &mut out);
         typing.note_synthetic_typed(t0 + Duration::from_millis(5));
@@ -1922,12 +1825,9 @@ mod tests {
         assert!(!out.is_empty());
     }
 
-    /// Enter then type-ahead, in lockstep with the glow: a glyph typed before
-    /// the Enter's response lands (SSH, a slow prompt) keeps the one-shots, and
-    /// a fresh generic licence paired with any move but a same-row forward hop
-    /// takes that move and leaves the stamp for the glyph's echo. So the
-    /// response is not drawn as the glyph's re-anchor, and the glyph's +1 is
-    /// licensed.
+    /// Enter then type-ahead, in lockstep with the glow: a glyph typed before the Enter's
+    /// response lands keeps its stamp; the Enter's licence takes the response (any move but a
+    /// same-row forward hop) and the glyph's own +1 stays licensed.
     #[test]
     fn a_glyph_typed_before_the_enters_response_lands_keeps_its_stamp_for_its_own_echo() {
         let c = cfg(true);
@@ -1981,8 +1881,7 @@ mod tests {
         // the Enter's licence went with its response.
         assert!(!trail.move_licensed(echo + ms(50)));
 
-        // CONTROL — the same response with NO glyph behind it draws exactly
-        // the same: the Enter's move is the Enter's, glyph or no glyph.
+        // Control: the same response with no glyph behind it draws exactly the same.
         let mut bare = CursorTrail::default();
         bare.tick(Some((2, 20)), t0, &c, &mut out);
         bare.note_return(enter);
@@ -2011,7 +1910,7 @@ mod tests {
         let t0 = Instant::now();
         let mut out = Vec::new();
 
-        // vim (alt ctx, hint armed, NO blink): the jump comet flies.
+        // vim (alt ctx, hint armed, no blink): the jump comet flies.
         let mut vim = CursorTrail::default();
         vim.note_context(true);
         vim.tick(Some((0, 30)), t0, &c, &mut out);
@@ -2024,7 +1923,7 @@ mod tests {
         );
         assert!(!out.is_empty());
 
-        // Claude Code (alt ctx, hint armed, FRESH blink): the wrap re-anchors.
+        // Claude Code (alt ctx, hint armed, fresh blink): the wrap re-anchors.
         let mut cc = CursorTrail::default();
         cc.note_context(true);
         cc.tick(Some((0, 30)), t0, &c, &mut out);
@@ -2198,8 +2097,8 @@ mod tests {
 
     #[test]
     fn readability_cap_bounds_every_cell_at_any_intensity() {
-        // The non-negotiable guard: no swept cell ever exceeds the readable ceiling,
-        // for ANY ignition level — so the glyph drawn on top always stays legible.
+        // No swept cell exceeds the readable ceiling at any ignition level, so the glyph on
+        // top stays legible.
         for &q in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
             let mut tr = CursorTrail::default();
             let now = Instant::now();
@@ -2252,12 +2151,10 @@ mod tests {
 
     #[test]
     fn ignite_stamps_intensity_and_heats_colour() {
-        // Zero intensity is a no-op on colour (byte-identical to the pre-ignition path).
+        // Zero intensity leaves the colour byte-identical.
         let mut c = cfg(true);
         let base = c.color;
         ignite(&mut c, 0.0, 0.0);
-        // (warmth/chain law tests live below: warmth_is_zero_for_a_lone_key…,
-        // warm_chain_outlives_the_gap)
         assert_eq!(c.intensity, 0.0);
         assert_eq!(c.warmth, 0.0);
         assert_eq!(c.color, base, "gentle keeps the base colour");
@@ -2280,12 +2177,9 @@ mod tests {
         }
     }
 
-    /// The probe-table merge in `tick` emits byte-identically (contents and
-    /// order) to a linear `out.iter_mut().find(..)` rescan, the reference fold
-    /// below, over the same live sparks. The trace covers a serpentine walk
-    /// (hundreds of distinct cells, saturating MAX_SPARKS), a same-row
-    /// ping-pong (hundreds of sparks stacked on ~48 cells), and the decay tail
-    /// to empty.
+    /// The probe-table merge in `tick` emits byte-identically (contents and order) to a linear
+    /// rescan, over a serpentine walk (saturating MAX_SPARKS), a same-row ping-pong (hundreds of
+    /// sparks on ~48 cells) and the decay tail.
     #[test]
     fn dedup_index_matches_the_linear_scan_byte_for_byte() {
         let c = TrailConfig {
@@ -2435,7 +2329,7 @@ mod tests {
                 line_start: Some(0),
             }
         );
-        // A one-column pane must not be TIGHTER than the typed lane.
+        // A one-column pane must not be tighter than the typed lane.
         assert_eq!(
             hide_bridge_reach(false, true, Some((0, 1))).cols,
             HIDE_BRIDGE_TYPED_MAX_DIST

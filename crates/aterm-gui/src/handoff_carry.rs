@@ -34,20 +34,15 @@
 //!   told. A ledger that could not be carried whole says which turn ids it
 //!   no longer vouches for, so a resumed `subscribe … since-turn=` is told.
 //! * `write_outgoing` writes it `0600`, `O_CREAT|O_EXCL|O_NOFOLLOW`, as
-//!   `seamless-<pid>-<nonce>.s<id>.ctl`, and names it in the session's
-//!   manifest record as `control = "<len> <sha256hex>"`; the manifest also
-//!   carries the turn-id counter. It is in NEITHER adoption-proof digest and
-//!   no schema moved: an older receiver skips both keys and adopts exactly as
-//!   before, and the sender unlinks the sidecar once the proof checks out — so
-//!   a receiver reads its sidecars BEFORE it publishes its proof. A HELD pane
-//!   (`--hold`, its command ended) is carried the same way, its sidecar
-//!   `seamless-<pid>-<nonce>.h<id>.ctl` named on its `HeldPaneCarry::control`
-//!   (round eight of the update audit, finding 730).
-//! * `take_incoming` reads and deletes it, checks its length and sha, and
-//!   [`decode`]s it; `spawn_session` installs it into the adopted engine and
-//!   ledger ([`ControlCarry::ledger`], [`ControlCarry::install`]). Anything
-//!   wrong with it — missing, truncated, oversized, a bad sha, bad JSON —
-//!   drops the carry and nothing else: the session adopts as it did before.
+//!   `seamless-<pid>-<nonce>.s<id>.ctl` (a held pane's as `.h<id>.ctl`, named on
+//!   `HeldPaneCarry::control`) and names it in the session's manifest record as
+//!   `control = "<len> <sha256hex>"`, beside the turn-id counter. It is in neither
+//!   adoption-proof digest: an older receiver skips both keys, and the sender unlinks the
+//!   sidecar once the proof checks out, so a receiver reads its sidecars before it publishes
+//!   its proof.
+//! * `take_incoming` reads and deletes it, checks its length and sha, and decodes it
+//!   ([`decode_why`]); `spawn_session` installs it ([`ControlCarry::ledger`],
+//!   [`ControlCarry::install`]). Anything wrong with it drops the carry and nothing else.
 //!
 //! # The session log
 //!
@@ -77,14 +72,12 @@
 //!
 //! # Privacy
 //!
-//! The archive was built to live in memory. Carrying it puts scrolled-off text
-//! and submitted turn text on disk for the length of one handoff: in the
-//! per-user `0700` control dir, `0600`, never through a symlink, deleted by the
-//! receiver as it reads it and by the sender once the proof checks out, and
-//! swept at the next start when a crash left it behind
-//! (`seamless::sweep_dead_handoff_leftovers`). A receiver with
-//! an archive switched off drops the carried rows. The ledger's text is carried
-//! as the ledger holds it, so a redacted operator turn stays redacted.
+//! Carrying the archive puts scrolled-off and submitted turn text on disk for one handoff: in
+//! the per-user `0700` control dir, `0600`, never through a symlink, deleted by the receiver as
+//! it reads it and by the sender once the proof checks out, and swept at the next start after
+//! a crash (`seamless::sweep_dead_handoff_leftovers`). A receiver with the archive switched off
+//! drops the carried rows. The ledger's text is carried as held, so a redacted operator turn
+//! stays redacted.
 
 use std::sync::Arc;
 #[cfg(any(unix, test))]
@@ -131,11 +124,9 @@ const WIRE_VERSION: u64 = 1;
 /// id — minted with a `+ 1` — neither overflows nor wraps below the ids
 /// before it.
 pub(crate) const MAX_TURN_ID: u64 = i64::MAX as u64;
-/// How long the worker waits, over the WHOLE export, for locks other threads
-/// hold before it carries less. The readers are parked, so the only holders
-/// are brief (a control read, a `turn` recording its record, the scrollback
-/// compressor) — and the terminal stays frozen until Commit, so the export
-/// never waits long on anyone.
+/// How long the worker waits, over the whole export, for locks other threads hold before it
+/// carries less. The readers are parked, so the only holders are brief (a control read, a
+/// `turn` recording, the scrollback compressor).
 #[cfg(any(unix, test))]
 const LOCK_PATIENCE: Duration = Duration::from_millis(50);
 /// How long the worker waits, over the whole log pass (after every ledger
@@ -182,10 +173,9 @@ pub(crate) struct CarrySource {
 
 #[cfg(any(unix, test))]
 impl CarrySource {
-    /// The session this capture belongs to — what the park's capture matches
-    /// against its carried screens, so a session whose screen it lowered below
-    /// the exact rungs after the fact goes without its differ's state too (the
-    /// 2026-09-22/23 update audit, plan P0-1e; [`Self::without_differ`]).
+    /// The session this capture belongs to, which the park's capture matches against its
+    /// carried screens: a session whose screen it lowered below the exact rungs goes without
+    /// its differ's state too ([`Self::without_differ`]).
     #[cfg(unix)]
     pub(crate) fn local_id(&self) -> u64 {
         self.local_id
@@ -208,10 +198,9 @@ impl CarrySource {
     }
 }
 
-/// THE FREEZE'S SHARE: the archive's fence and counters, and — with `differ`
-/// — the differ's screen-sized state, under the terminal lock the caller
-/// already holds for this session's checkpoint (so both describe the same
-/// screen). Two `Arc` clones and a screen of row text; it cannot fail.
+/// The freeze's share: the archive's fence and counters and, with `differ`, the differ's
+/// screen-sized state, under the terminal lock the caller already holds for this session's
+/// checkpoint (so both describe the same screen). It cannot fail.
 #[cfg(any(unix, test))]
 pub(crate) fn capture_head(
     local_id: u64,
@@ -250,21 +239,18 @@ pub(crate) fn successor_reads_session_log(target_build: u64, running_build: u64)
 #[cfg(any(unix, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StatusWords {
-    /// This build's: `settled`, `timeout` and `hangup`. Every build from
-    /// [`READS_HANGUP_FROM_BUILD`] on reads all three.
+    /// This build's `settled`, `timeout` and `hangup`, read by every build from
+    /// [`READS_HANGUP_FROM_BUILD`] on.
     Current,
-    /// A build from before `hangup` — a rollback, an older bundle put back, a
-    /// channel switch. 53bc0f2f7 added the word after v0.98.0 was cut: v0.98.0
-    /// and every build before it read `settled` and `timeout` alone, and leave
-    /// a `hangup` record out while still vouching for its id.
+    /// A build from before `hangup` (a rollback, an older bundle, a channel switch): v0.98.0
+    /// and earlier read `settled` and `timeout` alone, and leave a `hangup` record out while
+    /// still vouching for its id.
     PreHangup,
 }
 
-/// The first build whose turn ledger reads `hangup`: v0.100.0's claim in
-/// `RELEASES.ledger`. No v0.99.0 was cut, and v0.98.0 (1790607299) predates
-/// 53bc0f2f7, which added the word. A development build's number is its
-/// HEAD's commit time, so one built between 53bc0f2f7 and this claim is
-/// handed `timeout`, a word it also reads.
+/// The first build whose turn ledger reads `hangup`: v0.100.0's in `RELEASES.ledger` (no
+/// v0.99.0 was cut). A development build's number is its HEAD's commit time, so one built
+/// between the word's addition and this release is handed `timeout`, which it also reads.
 #[cfg(any(unix, test))]
 pub(crate) const READS_HANGUP_FROM_BUILD: u64 = 1_790_807_622;
 
@@ -298,10 +284,7 @@ impl StatusWords {
     }
 }
 
-/// What a session's carry left behind on its way out of [`export_noting`],
-/// for the log line that names it (round eight of the update audit, finding
-/// 731): every other export, write and adoption loss is logged by session and
-/// cause, and these two lock arms were not.
+/// What a session's carry left behind in [`export_noting`], for the log line that names it.
 #[cfg(any(unix, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CarryLoss {
@@ -325,8 +308,7 @@ pub(crate) enum CarryLoss {
 
 #[cfg(any(unix, test))]
 impl CarryLoss {
-    /// The WARN line naming this loss for session `local_id`, one sentence
-    /// read in aterm.log.
+    /// The WARN line naming this loss for session `local_id`.
     fn line(self, local_id: u64) -> String {
         match self {
             Self::LedgerBusy { unvouched } => format!(
@@ -367,13 +349,11 @@ pub(crate) fn export(sources: &[CarrySource], turn_id_ceiling: u64) -> Vec<(u64,
     export_for(sources, turn_id_ceiling, StatusWords::Current)
 }
 
-/// THE WORKER'S SHARE, just before the manifest is written: one sidecar per
-/// session, `(local_id, JSON)`, its records spelled in `words`, the receiving
-/// build's. Never fails the handoff — a session whose sidecar would not fit
-/// carries less, and in the end nothing.
-/// `turn_id_ceiling` is the turn-id count the manifest carries: the most
-/// this process mints before it exits, so the most a record that lands here
-/// after the export can be numbered.
+/// The worker's share, just before the manifest is written: one sidecar per session,
+/// `(local_id, JSON)`, its records spelled in `words` (the receiving build's). Never fails the
+/// handoff: a session whose sidecar would not fit carries less, and in the end nothing.
+/// `turn_id_ceiling` is the turn-id count the manifest carries, the most this process mints
+/// before it exits.
 ///
 /// THE AGGREGATE IS SPENT BY PRIORITY, not first come, first served (round
 /// seven, finding 37): every session's CORE — its ledger and the archive's
@@ -801,8 +781,8 @@ pub(crate) fn export_noting(
         out.push((local_id, bytes));
     }
     if shed_sessions > 0 {
-        // COUNTED, and said: each of these carries names the ids it shed
-        // (`history`'s `unheld_below=`, a resumed `since-turn=`'s GAP).
+        // Each of these carries names the ids it shed (`history`'s `unheld_below=`, a resumed
+        // `since-turn=`'s GAP).
         aterm_log::warn!(
             "update apply: {shed_sessions} sessions' turn ledgers do not fit the handoff's \
              {MAX_AGGREGATE_BYTES}-byte control budget whole; they hand off their newest \
@@ -886,9 +866,8 @@ fn core_shares(cores: &[u64], budget: u64) -> Vec<u64> {
     shares
 }
 
-/// The size of a session's CORE sidecar — its whole ledger and the archive's
-/// counters, without rows or the differ's state — as [`export`] sets it aside
-/// (never more than one sidecar may hold: a ledger past that is shed anyway).
+/// The size of a session's core sidecar (its whole ledger and the archive's counters, no rows
+/// or differ state) as [`export_noting`] sets it aside, capped at one sidecar's limit.
 #[cfg(any(unix, test))]
 fn core_len(turns: &[TurnRecord], floors: Floors, archive: &AltArchiveCarry) -> u64 {
     let mut core = counters_only(archive.clone());
@@ -905,12 +884,10 @@ pub(crate) fn manifest_turn_id(minted: u64) -> Option<u64> {
     (minted > 0 && minted <= MAX_TURN_ID).then_some(minted)
 }
 
-/// The turn ledger an ADOPTED session starts with: the one its carry brought
-/// ([`ControlCarry::ledger`]), or — when the handoff could not carry it (no
-/// sidecar, a bad one) — an empty one that no longer vouches for any turn id
-/// up to the count this process continued from, so a resumed `subscribe …
-/// since-turn=` below it is told (`GAP … events-resync=`) rather than left to
-/// believe no turn landed.
+/// The turn ledger an adopted session starts with: the one its carry brought
+/// ([`ControlCarry::ledger`]), or, when the handoff could not carry it, an empty one that no
+/// longer vouches for any turn id up to the count this process continued from, so a resumed
+/// `subscribe … since-turn=` below it is told (`GAP … events-resync=`).
 pub(crate) fn adopted_ledger(control: Option<&mut ControlCarry>) -> TurnLedger {
     match control {
         Some(control) => control.ledger(),
@@ -1592,12 +1569,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<ControlCarry> {
     decode_why(bytes).ok()
 }
 
-/// Decode a sidecar, or say why it is not one this build reads. A record
-/// with a status word this build does not print, or an id past
-/// [`MAX_TURN_ID`], is left out — and the carry no longer vouches for its id
-/// (`unheld_below` rises past it, as for a record the sender shed), so a
-/// resumed `since-turn=` below it is told and `history` says it (round eight,
-/// finding 714). A gap of a kind it does not know is left out.
+/// Decode a sidecar, or say why it is not one this build reads. A record with a status word
+/// this build does not print, or an id past [`MAX_TURN_ID`], is left out, and the carry no
+/// longer vouches for its id (`unheld_below` rises past it, as for a record the sender shed),
+/// so a resumed `since-turn=` below it is told and `history` says it. A gap of an unknown kind
+/// is left out.
 pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
     let wire: Wire =
         aterm_json::from_slice(bytes).map_err(|_| "its sidecar is not the carry's JSON")?;

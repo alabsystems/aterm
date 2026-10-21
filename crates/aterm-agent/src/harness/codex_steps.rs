@@ -5,10 +5,10 @@
 //! a Codex rollout, for the session log, with no text kept (session log 5G-2;
 //! rulings T9, T33, S6). It folds into the Claude step fold's own types
 //! ([`Step`], [`StepEvent`], [`StepBatch`]), so the log takes a Codex
-//! rollout's steps as it takes a transcript's. It is INERT: nothing taps a
-//! rollout into it yet (that is 5G-3's tap, which binds only a codex-alab
-//! session on a build [`CODEX_MEASURED_BUILDS`] names, and never a vendor
-//! Codex).
+//! rollout's steps as it takes a transcript's. One reader feeds it: 5G-3's
+//! rollout tap ([`super::codex_tap`]), which binds only a codex-alab
+//! session's own thread on a build [`CODEX_MEASURED_BUILDS`] names, and
+//! never a vendor Codex.
 //!
 //! WHAT IT READS is what the lab's Codex 0.163.0 rollouts show (the 5G lab
 //! run, 2026-10-19: a plain turn, a tool call, an approval, a question, Esc,
@@ -24,7 +24,8 @@
 //!   the lab ran wrote both, but a compaction turn's `turn_context` comes
 //!   after its compaction (measured), and the turn id and model are the
 //!   `turn_context`'s. The model and effort are said ([`StepEvent::Model`])
-//!   when they move, the build from the thread's own `session_meta`.
+//!   when they move, the build from the thread's own `session_meta` (the
+//!   writer's, where the reader knows it: [`CodexStepFold::set_writer`]).
 //! * A turn ENDS at the `task_complete` naming the open turn
 //!   ([`StepEvent::TurnEnd`], its `duration_ms`), on the usage wall when its
 //!   error's closed word is `usage_limit_exceeded` ([`StepEvent::EndWall`],
@@ -37,8 +38,8 @@
 //! * A CALL is a `function_call` or `custom_tool_call` item
 //!   ([`StepEvent::ToolUse`]: its `call_id`, its bare `name`), its result the
 //!   item's `_output` ([`StepEvent::ToolResult`], never failed: the output's
-//!   text is not read). Its class is [`tool_class`]'s, from the one call the
-//!   lab's rollout showed a class for.
+//!   text is not read). Its class is [`tool_class`]'s, from the calls the
+//!   lab's rollouts showed a class for.
 //! * A `compacted` row is a compaction ([`StepEvent::Compact`]).
 //!
 //! A COPY IS NO ONE'S TURN. A subagent's rollout opens with its own
@@ -62,7 +63,9 @@
 //! and fed its lines from its FIRST byte, since a copy is known only from
 //! the first row. Rows ending at or below the bind's seed, and rows older
 //! than the floor, are history: folded into the copy, the open turn, the
-//! running total and the turn's tokens, never queued.
+//! running total and the turn's tokens, never queued. History names no
+//! model: the first turn the log takes says its own, however many turns of
+//! history ran on it (a resumed thread's, read by the rollout tap).
 //!
 //! FAIL CLOSED. A `turn_context` with no turn id, or one that is no log id
 //! ([`StepId`]: at most 40 bytes of its alphabet), a `task_complete` or
@@ -81,9 +84,22 @@
 //! materialized (`tests/transcript_allocations.rs`).
 //!
 //! MEASURED BUILDS. [`CODEX_MEASURED_BUILDS`] names each codex-alab build
-//! whose rollout the lab measured through the tap: none yet (no codex-alab
-//! package was found for the 5G lab run, so its build is a vendor Codex,
-//! which is never bound). Every row is [`StepState::Partial`] until one is.
+//! whose rollouts the lab measured: 0.164.0-dev.12521 and 0.164.0-dev.12479
+//! (session log 6D-3a, `lab codex-alab-proof` on the package built from its
+//! source and on the owner's managed one), and 0.164.0-dev.12672 (B5c, the
+//! forever-port package under the twelve-leg proof), each leg's rollout
+//! committed reduced as `codex-alab-<release>-<leg>.jsonl`.
+//! A row is [`StepState::On`] only on a build named there, read off the
+//! thread's own `session_meta` (or handed to [`CodexStepFold::bind_build`]
+//! by the tap that read it), and, where its reader knows the build writing
+//! the rollout now ([`CodexStepFold::set_writer`]: a resumed or re-exec'd
+//! thread never restates its `session_meta`), only while that one is named
+//! there too; else [`StepState::Partial`] (ruling T8's rule): the 5G lab
+//! run's 0.163.0 was a vendor Codex, which is never bound. An
+//! ALab build's version carries its commit as build metadata
+//! (`0.164.0-dev.12521+g3d3eb12d8`), whose `+` no log id holds, so the
+//! build is said (`ver=`) as its release, the version before the `+`
+//! ([`log_build`]); it is matched whole.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -102,12 +118,36 @@ use super::steps::{
 };
 use super::transcript;
 
-/// The codex-alab builds whose rollouts the lab measured through the tap,
-/// each with its key-only reduction committed
-/// (`harness/testdata/steps/codex-<build>.jsonl`): exact one by one (ruling
-/// T8's rule). None: the 5G lab run's build was a vendor Codex (module
-/// docs).
-pub const CODEX_MEASURED_BUILDS: &[&str] = &[];
+/// The codex-alab builds whose rollouts the lab measured, each with its
+/// key-only reductions committed (`harness/testdata/steps/<stem>-<leg>.jsonl`,
+/// `aterm_phase::anchors::rollout_reduction_stem`'s stem): exact one by one
+/// (ruling T8's rule), the whole build string matched: 0.164.0-dev.12521,
+/// built from its source for the run, 0.164.0-dev.12479, the owner's
+/// managed codex-alab, read from its store, and 0.164.0-dev.12672, the
+/// forever-port build (codex-alab `089291d37`) the FOREVER CRUISE / LAND
+/// proof runs (B5c). `lab codex-alab-proof`'s legs
+/// on each (session log 6D-3a: a turn, a continued turn, an approved
+/// `exec_command`, a `request_user_input` answered, the usage wall waited
+/// out, a crash relaunched and a turn carried on), each step the fold makes
+/// exact against what the leg did and the rollout's own per-turn token
+/// record (`codex_steps_tests`).
+pub const CODEX_MEASURED_BUILDS: &[&str] = &[
+    "0.164.0-dev.12521+g3d3eb12d8",
+    "0.164.0-dev.12479+g07a25d86a",
+    "0.164.0-dev.12672+g089291d37",
+];
+
+/// The build `build` as the log says it (`ver=`): the build when it is a
+/// log id ([`StepId`]), else its release, the version before a `+` (an ALab
+/// build's commit is build metadata), when that is one.
+#[must_use]
+pub fn log_build(build: &str) -> Option<StepId> {
+    StepId::new(build).or_else(|| {
+        build
+            .split_once('+')
+            .and_then(|(release, _)| StepId::new(release))
+    })
+}
 
 const SESSION_META: &str = anchor_text("rollout.session_meta");
 const TURN_CONTEXT: &str = anchor_text("rollout.turn_context");
@@ -138,6 +178,7 @@ const KEY_ERROR_INFO: &str = anchor_text("rollout.codex_error_info");
 const USAGE_LIMIT: &str = anchor_text("rollout.usage_limit_exceeded");
 const COLLABORATION: &str = anchor_text("rollout.collaboration");
 const SPAWN_AGENT: &str = anchor_text("rollout.spawn_agent");
+const EXEC_COMMAND: &str = anchor_text("rollout.exec_command");
 
 /// The kinds of row past a copy the fold opens: any other is skipped by its
 /// raw bytes, unparsed (a quote inside a JSON string is escaped, so a
@@ -157,15 +198,19 @@ const OPENED: [&str; 9] = [
 /// The class of a Codex call, by its namespace and NAME (addendum A11), and
 /// whether it starts a subagent: one of the log's `CLS_WORDS`. Only what a
 /// lab rollout showed is classed: `spawn_agent` in the `collaboration`
-/// namespace starts a subagent (the lab's subagent leg). The rollout's other
-/// calls are `other`: `exec` (`functions`) runs a script that may call any
-/// tool, so its name says no class, and `request_user_input` asks the person.
+/// namespace starts a subagent (0.163.0, the lab's subagent leg), and
+/// `exec_command` in no namespace runs a shell command, `shell` as Claude
+/// Code's `Bash` is (codex-alab 0.164.0-dev.12521 and 12479, the lab's
+/// approval leg: the command its model ran, approved). Every other call is
+/// `other`: 0.163.0's `exec` (`functions`) runs a script that may call any
+/// tool, so its name says no class, and `request_user_input` (in no
+/// namespace on codex-alab, in `functions` on 0.163.0) asks the person.
 #[must_use]
 pub fn tool_class(namespace: Option<&str>, name: &str) -> (&'static str, bool) {
-    if namespace == Some(COLLABORATION) && name == SPAWN_AGENT {
-        ("agent", true)
-    } else {
-        ("other", false)
+    match (namespace, name) {
+        (Some(COLLABORATION), SPAWN_AGENT) => ("agent", true),
+        (None, EXEC_COMMAND) => ("shell", false),
+        _ => ("other", false),
     }
 }
 
@@ -196,8 +241,16 @@ pub struct CodexStepFold {
     /// While a fork's copy is read, its own thread's fingerprint: its own
     /// `thread_settings_applied` ends the copy.
     thread: Option<u64>,
-    /// The build its own `session_meta` names.
+    /// The build its own `session_meta` names, as the log says it
+    /// ([`log_build`]).
     version: Option<StepId>,
+    /// THE WRITER: the build of the process writing the rollout now, where
+    /// its reader knows it ([`Self::set_writer`]), its state and how the
+    /// log says it.
+    writer: Option<(StepState, Option<StepId>)>,
+    /// The state its rows are read at: [`StepState::On`] only on a build
+    /// [`CODEX_MEASURED_BUILDS`] names, matched whole.
+    state: StepState,
     /// The largest running total read, a copy's included.
     top: u64,
     /// The open turn's id's fingerprint.
@@ -227,6 +280,8 @@ impl CodexStepFold {
             prefix: Prefix::Start,
             thread: None,
             version: None,
+            writer: None,
+            state: StepState::Partial,
             top: 0,
             open: None,
             opened: VecDeque::new(),
@@ -245,12 +300,23 @@ impl CodexStepFold {
     /// history (module docs). Everything read of another binding is dropped
     /// but the queue, and the latch lifts.
     pub fn bind(&mut self, fp: u64, id: Option<(u64, u64)>, seed: u64) {
+        self.bind_build(fp, id, seed, None);
+    }
+
+    /// [`Self::bind`] a rollout whose `session_meta` the binder read already
+    /// names `build` (the tap's gate, `super::codex_tap`): the bind is said
+    /// at that build's state, so a measured thread's source is never said
+    /// partial before its first row. The thread's own `session_meta` decides
+    /// the rows' state.
+    pub fn bind_build(&mut self, fp: u64, id: Option<(u64, u64)>, seed: u64, build: Option<&str>) {
         *self = CodexStepFold {
             queue: std::mem::take(&mut self.queue),
             overflow: self.overflow,
             lost: self.lost,
             bound: Some((fp, id)),
             seed,
+            state: state_for(CODEX_MEASURED_BUILDS, build),
+            writer: self.writer,
             ..CodexStepFold::new(self.floor_ms)
         };
         let at_ms = self.floor_ms;
@@ -269,6 +335,43 @@ impl CodexStepFold {
     #[must_use]
     pub fn is_bound(&self) -> bool {
         self.bound.is_some()
+    }
+
+    /// Raise the floor to `floor_ms` (wall ms; it only rises): rows older
+    /// than it, read from now on, are history.
+    pub fn raise_floor(&mut self, floor_ms: u64) {
+        self.floor_ms = self.floor_ms.max(floor_ms);
+    }
+
+    /// THE WRITER (session log 5G-3): `build` is what the process writing
+    /// the rollout runs now (the rollout tap reads it off the claimant's
+    /// image, `super::codex_alab::alab_build`). A thread's `session_meta`
+    /// names the build that STARTED it, and a thread resumed or re-exec'd
+    /// onto another build appends without restating it, so its rows are
+    /// [`StepState::On`] only while the writer's build, too, is one
+    /// [`CODEX_MEASURED_BUILDS`] names, and the build said (`ver=`) is the
+    /// writer's. A writer that moves says the model again on its next turn.
+    pub fn set_writer(&mut self, build: &str) {
+        let writer = (
+            state_for(CODEX_MEASURED_BUILDS, Some(build)),
+            log_build(build),
+        );
+        if self.writer.is_some_and(|w| w != writer) {
+            self.model = None;
+        }
+        self.writer = Some(writer);
+    }
+
+    /// The reader stops reading the bound rollout at `end`, the end of the
+    /// last line it pushed (its writer runs a build nobody measured): the
+    /// source says `off` once ([`StepEvent::Off`]), and nothing more is
+    /// folded until the next bind.
+    pub fn stop(&mut self, end: u64) {
+        if let Some((fp, id)) = self.bound
+            && !self.broken
+        {
+            self.latch_as(fp, id, end, "unmeasured");
+        }
     }
 
     /// Whether the fold latched off.
@@ -329,12 +432,14 @@ impl CodexStepFold {
         if !self.past_copy(&v, stamp) {
             return;
         }
+        let at_ms = stamp.and_then(|s| u64::try_from(s).ok());
+        // A row the log takes: past the seed, and no older than the floor.
+        let live = fresh && at_ms.is_some_and(|t| t >= self.floor_ms);
         let mut out: Vec<StepEvent> = Vec::new();
-        let bad = self.row(&v, fresh, &mut out);
+        let bad = self.row(&v, fresh, live, &mut out);
         if !fresh {
             return;
         }
-        let at_ms = stamp.and_then(|s| u64::try_from(s).ok());
         if bad || (!out.is_empty() && at_ms.is_none()) {
             self.latch(fp, id, end);
             return;
@@ -362,7 +467,9 @@ impl CodexStepFold {
             Prefix::Own => return true,
             Prefix::Start => {
                 if kind == Some(SESSION_META) {
-                    self.version = word(payload, KEY_CLI_VERSION).and_then(StepId::new);
+                    let build = word(payload, KEY_CLI_VERSION);
+                    self.state = state_for(CODEX_MEASURED_BUILDS, build);
+                    self.version = build.and_then(log_build);
                     let fork = word(payload, KEY_FORKED_FROM).is_some_and(|p| !p.is_empty());
                     if !fork {
                         self.prefix = Prefix::Own;
@@ -408,8 +515,10 @@ impl CodexStepFold {
     }
 
     /// The steps of one of the thread's own rows, into `out`; `true` when a
-    /// key it reads has the wrong shape (module docs).
-    fn row(&mut self, v: &Value, fresh: bool, out: &mut Vec<StepEvent>) -> bool {
+    /// key it reads has the wrong shape (module docs). `fresh`: past the
+    /// seed; `live`: past the seed and no older than the floor, a row the
+    /// log takes.
+    fn row(&mut self, v: &Value, fresh: bool, live: bool, out: &mut Vec<StepEvent>) -> bool {
         let kind = v.get("type").and_then(Value::as_str);
         let payload = v.get("payload");
         let ptype = word(payload, "type");
@@ -430,10 +539,11 @@ impl CodexStepFold {
                     self.open = Some(f);
                     out.push(StepEvent::Prompt { vref });
                 }
-                // The model is said from the first row past the seed on:
-                // the history's is the run's to name.
+                // The model is said from the first row the log takes on:
+                // the history's (below the seed or the floor) is the run's
+                // to name, so a later turn on the same model still says it.
                 if let Some(model) = word(payload, KEY_MODEL)
-                    .filter(|m| fresh && super::upgrade::is_model_id(m))
+                    .filter(|m| live && super::upgrade::is_model_id(m))
                     .and_then(StepId::new)
                 {
                     let effort = word(payload, KEY_EFFORT).and_then(StepId::new);
@@ -442,7 +552,7 @@ impl CodexStepFold {
                         out.push(StepEvent::Model {
                             model,
                             effort,
-                            ver: self.version,
+                            ver: self.writer.map_or(self.version, |(_, ver)| ver),
                         });
                     }
                 }
@@ -528,6 +638,10 @@ impl CodexStepFold {
     }
 
     fn latch(&mut self, fp: u64, id: Option<(u64, u64)>, end: u64) {
+        self.latch_as(fp, id, end, "unknown");
+    }
+
+    fn latch_as(&mut self, fp: u64, id: Option<(u64, u64)>, end: u64, why: &'static str) {
         self.broken = true;
         let at_ms = self.floor_ms;
         self.enqueue(
@@ -537,16 +651,18 @@ impl CodexStepFold {
                 off: end,
                 at_ms,
             },
-            StepEvent::Off { why: "unknown" },
+            StepEvent::Off { why },
         );
     }
 
-    /// The state of the rows now (ruling T8's rule).
-    fn state(&self) -> StepState {
-        state_for(
-            CODEX_MEASURED_BUILDS,
-            self.version.as_ref().map(StepId::as_str),
-        )
+    /// The state of the rows now (ruling T8's rule): the thread's build's,
+    /// and never `On` while its writer runs a build nobody measured
+    /// ([`Self::set_writer`]).
+    const fn state(&self) -> StepState {
+        match self.writer {
+            Some((StepState::Partial, _)) => StepState::Partial,
+            _ => self.state,
+        }
     }
 
     fn enqueue(&mut self, pos: StepPos, ev: StepEvent) {

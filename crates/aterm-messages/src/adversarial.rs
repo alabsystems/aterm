@@ -277,8 +277,12 @@ fn the_width_law_holds_under_a_two_cell_measure() {
             if let (Some((c, w)), Some((slot, sw))) = (row.load, row.load_slot) {
                 assert_eq!(c + wide(w), slot + sw, "{name}@{cols}: right-aligned words");
             }
+            // Both clear cells, save the second where the degenerate step
+            // spent it on a whole word of the title.
             assert!(
-                first.col >= end + 2,
+                first.col >= end + 2
+                    || first.col == end + 1
+                        && crate::glass::tests::spent_clear_cell(spec, &row, &wide),
                 "{name}@{cols}: capsules overlap the flow"
             );
             let last = row.capsules.last().unwrap();

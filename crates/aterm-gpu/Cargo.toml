@@ -103,23 +103,18 @@ wgpu = { version = "29", optional = true, default-features = false, features = [
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 aterm-wasm-abi = { workspace = true }
 
-# Windows: DX12, the only backend wired for the HDR/scRGB present. `windows` must
-# be the version wgpu-hal resolved (0.62): `as_hal::<Dx12>` hands back its
-# `IDXGISwapChain3`, which this crate tags scRGB with `SetColorSpace1`.
+# Windows: DX12, the only backend wired for the HDR/scRGB present.
+# `as_hal::<Dx12>` hands back wgpu-hal's `IDXGISwapChain3`, which this crate
+# takes over as an aterm-win32 `Com` (one pointer, whatever `windows` version
+# wgpu-hal resolved) and tags scRGB with `SetColorSpace1` through aterm-win32's
+# DXGI vtables (WB.2 of docs/AUDIT-third-party-2026-10-15.md).
 [target.'cfg(windows)'.dependencies]
 wgpu = { version = "29", default-features = false, features = ["dx12", "wgsl"] }
-windows = { version = "0.62", features = [
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Foundation",
-    # `IDXGIOutput6::GetDesc1` returns a `DXGI_OUTPUT_DESC1` holding an
-    # `HMONITOR`, which lives here; without it the method is not generated.
-    "Win32_Graphics_Gdi",
-] }
+aterm-win32 = { workspace = true }
 
 [dev-dependencies]
-# `aterm_log::env`, the workspace's lock-scoped environment writer: parity tests
-# export a font / rasterizer selection to both renderers.
+# `aterm_log::env`, the lock-scoped environment writer: parity tests export a font or
+# rasterizer choice to both renderers.
 aterm-log = { workspace = true }
 # Inline-image (OSC 1337) parity tests: encode test PNGs + base64 payloads.
 aterm-png = { workspace = true }
@@ -145,9 +140,8 @@ workspace = true
 name = "gpu_suite"
 path = "tests/gpu_suite.rs"
 
-# The additive-parity files that force the deterministic fontdue rasterizer
-# (`common::backends_fontdue` sets ATERM_RASTERIZER=fontdue for the whole
-# process), apart from every renderer the suite above builds.
+# The files that force the fontdue rasterizer (`common::backends_fontdue` sets
+# ATERM_RASTERIZER=fontdue process-wide), kept apart from `gpu_suite`.
 [[test]]
 name = "gpu_fontdue"
 path = "tests/gpu_fontdue.rs"

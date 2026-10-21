@@ -4,10 +4,6 @@
 use super::*;
 use crate::machine;
 
-// ---------------------------------------------------------------------------
-// Fixtures: real /proc texts (a 4-core Linux 6.8 box), trimmed.
-// ---------------------------------------------------------------------------
-
 const MEMINFO: &str = "\
 MemTotal:       16318756 kB
 MemFree:          812344 kB
@@ -27,10 +23,6 @@ pswpin 1200
 pswpout 3400
 pgalloc_dma 0
 ";
-
-// ---------------------------------------------------------------------------
-// Linux parsers.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn meminfo_gives_the_total_and_the_available() {
@@ -95,9 +87,7 @@ fn the_auxiliary_vector_gives_the_page_size() {
 
 #[test]
 fn every_proc_read_is_bounded_to_4_kib() {
-    // A device that never ends costs exactly one buffer (the 2026-07-04
-    // incident read one to EOF and took the machine down). Unix's: Windows
-    // has no endless device a path opens.
+    // Reading an endless device stops at a single 4 KiB buffer.
     #[cfg(unix)]
     {
         let zero = read_bounded(Path::new("/dev/zero")).expect("/dev/zero opens");
@@ -124,10 +114,6 @@ fn every_proc_read_is_bounded_to_4_kib() {
     assert_eq!(linux::swap_pages(torn), None);
 }
 
-// ---------------------------------------------------------------------------
-// The shared pure pieces.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn kernel_pressure_levels_map_to_memory_levels() {
     assert_eq!(pressure_of(1), Some(MemoryLevel::Normal));
@@ -136,10 +122,7 @@ fn kernel_pressure_levels_map_to_memory_levels() {
     assert_eq!(pressure_of(3), None);
 }
 
-/// Memory in use is Activity Monitor's `Memory Used`: app memory (internal
-/// less purgeable) + wired + compressed. Measured on a 24 GB m1 at
-/// `kern.memorystatus_level` 89, where `1000 − 10·level` reads 2.6 GB in use
-/// beside Activity Monitor's ~8 GB.
+/// Memory in use matches Activity Monitor's `Memory Used`: `(internal - purgeable) + wired + compressed`.
 #[test]
 fn memory_in_use_is_counted_from_the_vm_pages() {
     let page = 16_384;
@@ -173,10 +156,6 @@ fn memory_available_is_free_inactive_and_purgeable_pages() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Live, on this host.
-// ---------------------------------------------------------------------------
-
 /// A process's working directory and executable are read from the OS: this
 /// test's own are what the process says they are. NEGATIVE CONTROL: a pid
 /// that cannot exist reads as nothing, never as some directory or program.
@@ -201,13 +180,9 @@ fn a_processs_working_directory_and_executable_are_its_own() {
     }
 }
 
-/// A process group's memory is its members' FOOTPRINT, summed, and only its
-/// own members': this test process's group grows by what it touches (512
-/// MiB allocated and written, most of it read back past a 384 MiB margin
-/// for the other members' churn); a child started in its own group
-/// (`process_group(0)`, as Claude Code starts its Bash tool's shells) is its
-/// own group, and a child left in ours is measured as one of ours.
-/// NEGATIVE CONTROLS: a pid that cannot exist and pid 0 read as nothing.
+/// `group_memory` sums member footprints within the target process group,
+/// excluding children placed in their own group (`process_group(0)`).
+/// NEGATIVE CONTROLS: non-existent pid and pid 0 return `None`.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_groups_memory_is_its_own_members_footprint() {
@@ -283,14 +258,9 @@ fn only_a_complete_group_census_admits_its_leader() {
     assert!(!complete_lone_group(41, 4, &[]));
 }
 
-/// The members that read a group leader's own input device are the ones
-/// started in its group on that very device (as Claude Code starts
-/// `$EDITOR`: inherited stdio, no group of its own), and only those: a
-/// second open of the device is the same vnode, so it counts.
-/// NEGATIVE CONTROLS: members of the group on `/dev/null` (another device)
-/// and on a pipe, a process in a group of its own on the same device, a pid
-/// that leads no group, a leader whose input is a pipe, pid 0 and a pid that
-/// cannot exist.
+/// `stdin_sharers` returns group members whose fd 0 shares the leader's
+/// input device vnode (including independent opens of the same device),
+/// excluding `/dev/null`, pipes, separate process groups, and non-leaders.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_leaders_input_is_shared_only_by_members_on_that_very_device() {
@@ -379,14 +349,10 @@ fn the_swap_counter_reads_on_this_host_and_never_runs_backwards() {
     );
 }
 
-/// THE SWAP RATE over the caller's readings: none from one reading; the
-/// recorded 2026-09-28 thrash (89 MB/s, `swap 89 MB/s` in the freeze's
-/// Messages row) read back from a counter that grew 445 MiB in 5 s; a
-/// second reader a millisecond later answers the same rate instead of a
-/// span of one page; a counter that stood still reads zero; a gap past
-/// [`SWAP_SPAN_MAX`] starts again (no rate), and an unknown counter forgets
-/// the base. NEGATIVE CONTROL: a meter taking its rate over the short span
-/// would read the millisecond reader's zero, which the assertion rejects.
+/// `SwapMeter` computes MB/s over readings separated by at least
+/// `SWAP_SPAN_MIN`, reuses the prior rate for sub-span reads, resets across
+/// gaps exceeding `SWAP_SPAN_MAX` or `None` readings, and returns `None` on
+/// the first sample.
 #[test]
 fn the_swap_meter_reads_a_rate_over_a_span_of_its_readings() {
     let t0 = Instant::now();
@@ -415,10 +381,6 @@ fn the_swap_meter_reads_a_rate_over_a_span_of_its_readings() {
     assert_eq!(m.observe(t0 + s(216), Some(1 + 5 * 8192)), Some(8192));
 }
 
-// ---------------------------------------------------------------------------
-// Volumes: the pure lookups and the mountinfo parser, then one live read.
-// ---------------------------------------------------------------------------
-
 #[cfg(unix)]
 fn mount(on: &str, fstype: &str, local: bool) -> volumes::Mount {
     volumes::Mount {
@@ -427,6 +389,7 @@ fn mount(on: &str, fstype: &str, local: bool) -> volumes::Mount {
         fstype: fstype.to_owned(),
         local,
         automounted: fstype == "autofs",
+        removable: false,
         read_only: false,
         container: None,
     }
@@ -509,8 +472,9 @@ fn mounts_under_sees_a_mount_inside_a_directory_in_either_spelling() {
 
 /// The mountinfo parser: `\040` decoded, the optional fields skipped up to
 /// `-`, `ro` read, an autofs mount automounted and a network one not local,
-/// and a torn last line dropped — which, like a read cut at the cap, makes
-/// the table incomplete. NEGATIVE CONTROL: the same text whole is complete.
+/// udisks' media folders removable, and a torn last line dropped — which,
+/// like a read cut at the cap, makes the table incomplete. NEGATIVE CONTROL:
+/// the same text whole is complete.
 // Unix-only: the table holds `/` mount points, no path Windows reads as absolute.
 #[cfg(unix)]
 #[test]
@@ -534,6 +498,18 @@ fn the_mountinfo_parser_reads_escapes_and_marks_a_cut_table() {
         Err(volumes::Unread::Automounted)
     );
     assert_eq!(volumes::read(&t.mounts[3]), Err(volumes::Unread::Remote));
+    assert!(
+        t.mounts.iter().all(|m| !m.removable),
+        "no mount above sits where udisks mounts removable media"
+    );
+    let media = volumes::parse_mountinfo(
+        "30 22 8:33 / /run/media/a/STICK rw - vfat /dev/sdc1 rw\n\
+         31 22 8:49 / /media/CARD rw - exfat /dev/sdd1 rw\n\
+         32 22 8:65 / /mediax rw - ext4 /dev/sde1 rw\n",
+        false,
+    );
+    let removable: Vec<bool> = media.mounts.iter().map(|m| m.removable).collect();
+    assert_eq!(removable, [true, true, false]);
     let torn = &text[..text.len() - 10];
     let t = volumes::parse_mountinfo(torn, false);
     assert!(!t.complete, "a torn last line");
@@ -597,11 +573,6 @@ fn a_volume_reads_its_size_free_space_and_inodes() {
     assert!(r.files_free.is_some(), "{r:?}");
     assert!(t.points().iter().any(|p| p == &r.mount));
 }
-
-// ---------------------------------------------------------------------------
-// The machine now: per-core ticks, the cluster layout, memory by page class,
-// the GPU and a volume. The pure pieces first, then one live read of each.
-// ---------------------------------------------------------------------------
 
 /// Busy is user + system + nice, total adds idle, and neither wraps.
 #[test]
@@ -792,13 +763,9 @@ fn a_cpu_list_reads_its_ranges() {
     }
 }
 
-/// `/proc/meminfo` in design §9.6's classes: app is the anonymous pages,
-/// shared the shared memory (never counted as cache), wired the kernel's
-/// slab, stacks and page tables, the cache `Cached − Shmem + Buffers`,
-/// compressed and stored zswap's pool and contents, and commit
-/// `Committed_AS` against `CommitLimit`, flagged a heuristic.
-/// NEGATIVE CONTROL: no `MemFree` is no reading; a missing optional class is
-/// `None` (never 0), a missing summed key adds nothing.
+/// `/proc/meminfo` page classes: anonymous app pages, `Shmem` shared memory,
+/// wired kernel slab/stacks/pagetables, `Cached - Shmem + Buffers` cache,
+/// zswap compressed/stored, and `Committed_AS`/`CommitLimit`.
 #[test]
 fn meminfo_gives_the_classes_of_section_9_6() {
     const FULL: &str = "\
@@ -904,9 +871,7 @@ fn node(id: u16, kind: u8, l2_mib: u64) -> machine::DtCpu {
     }
 }
 
-/// The owner's M5 as its sysctls and device tree read on 2026-10-19:
-/// perflevel0 "Super" (4 cores, 16 MiB L2), perflevel1 "Efficiency" (6
-/// cores, 6 MiB L2); cpu0–5 `E`, cpu6–9 `P`.
+/// M5 fixture: perflevel0 "Super" (4 cores, 16 MiB L2, `P`), perflevel1 "Efficiency" (6 cores, 6 MiB L2, `E`).
 fn m5() -> (Vec<machine::Level>, Vec<machine::DtCpu>) {
     let levels = vec![level("Super", 4, 16), level("Efficiency", 6, 6)];
     let cpus = (0..10)
@@ -1048,11 +1013,8 @@ fn a_device_tree_that_does_not_add_up_falls_back_to_the_convention() {
     assert_eq!(four.clusters.len(), 1, "a level with no cores is left out");
 }
 
-/// Memory by page class from one read: free is the free count less the
-/// speculative pages it holds, app is internal less purgeable (Activity
-/// Monitor's App Memory), stored is not clamped to physical memory, and the
-/// differences stop at zero. The figures are the M5's 14:00 sample of
-/// 2026-10-16 (design §9.1), in 16 KiB pages.
+/// `memory_detail_of` computes free (`free - speculative`), app (`internal - purgeable`),
+/// wired, compressed, and unclamped swap stored from 16 KiB page counts.
 #[test]
 fn memory_by_page_class_is_counted_from_one_read() {
     let page = 16_384;
@@ -1067,6 +1029,11 @@ fn memory_by_page_class_is_counted_from_one_read() {
         purgeable: 10_000,
         external: 783_000,
         internal: 930_000,
+        swapins: 7,
+        swapouts: 11,
+        decompressions: 1_234,
+        compressions: 2_345,
+        pageins: 99,
     };
     let m = machine::memory_detail_of(
         &p,
@@ -1092,6 +1059,17 @@ fn memory_by_page_class_is_counted_from_one_read() {
     assert_eq!(
         (m.swap_used, m.swap_total, m.pressure),
         (1 << 30, 2 << 30, Some(MemoryLevel::Normal))
+    );
+    assert_eq!(
+        m.counters,
+        Some(crate::VmCounters {
+            swapin_bytes: 7 * page,
+            swapout_bytes: 11 * page,
+            decompressions: 1_234,
+            compressions: 2_345,
+            pageins: 99,
+        }),
+        "the counters come from the same read, swap in bytes"
     );
     let odd = machine::VmPages {
         free: 1,
@@ -1320,16 +1298,9 @@ fn the_root_volume_reads_on_this_host() {
     assert_eq!(crate::volume(Path::new("/\0")), None);
 }
 
-/// A QUIET GUARD CANNOT LEAVE ITS THREAD ([`QuietErrors`]; the 8.3 branch's
-/// review, rev4-3: it was `Send`): the mode it sets and restores is its own
-/// thread's, so one moved to another thread and dropped there would leave
-/// its own thread quiet for good and hand the other a mode that was never
-/// its own. The proof is that this test compiles — the `assert_not_impl_any`
-/// technique (`aterm-grid`'s `security_regression_5573`): every type answers
-/// [`OnItsThread`] through `()`, a `Send` one through `IsSend` too and a
-/// `Sync` one through `IsSync`, so for a guard that is either the call below
-/// has more than one answer and is ambiguous (E0283). Checked on every
-/// platform: the guard's type is one everywhere.
+/// Compile-time check that [`QuietErrors`] implements neither `Send` nor
+/// `Sync` (since the thread error mode it sets and restores is thread-local).
+/// If `QuietErrors` implemented either, `check::<QuietErrors>()` would fail with E0283.
 #[test]
 fn a_quiet_guard_cannot_leave_its_thread() {
     /// Answered through `()` by every type, and through a marker by a type
@@ -1345,10 +1316,6 @@ fn a_quiet_guard_cannot_leave_its_thread() {
     fn on_its_thread<T: OnItsThread<A>, A>() {}
     on_its_thread::<QuietErrors, _>();
 }
-
-// ---------------------------------------------------------------------------
-// Network links, the process table's ceilings and the load average.
-// ---------------------------------------------------------------------------
 
 /// A link that is up and running, named `name`, with `physical` as given.
 fn link(name: &str, physical: Option<bool>) -> LinkReading {
@@ -1556,7 +1523,7 @@ fn the_link_reader_reads_a_fixture_root() {
         ],
         &[],
     );
-    let links = linux::links_under(r).expect("the fixture");
+    let links = linux::links_under_into(r, &mut Vec::new()).expect("the fixture");
     let names: Vec<&str> = links.iter().map(|l| l.name.as_str()).collect();
     assert_eq!(names, ["lo", "eth0", "wlan0", "docker0", "gone"]);
 
@@ -1591,7 +1558,126 @@ fn the_link_reader_reads_a_fixture_root() {
     assert_eq!(counted, ["eth0", "wlan0"]);
 
     let empty = aterm_tempfile::tempdir().expect("scratch root");
-    assert_eq!(linux::links_under(empty.path()), None);
+    assert_eq!(linux::links_under_into(empty.path(), &mut Vec::new()), None);
+}
+
+/// The link reader's scratch: made [`linux::NET_DEV_CAP`] long where it is
+/// shorter and read again in place by the next reading, whose answer is
+/// what it read now, not what an earlier, longer file left in it; a longer
+/// scratch is kept whole. Each answer matches a reading with a buffer of
+/// its own.
+#[test]
+fn the_link_readers_scratch_is_read_again_in_place() {
+    let fixture = |dev: &str| {
+        let root = aterm_tempfile::tempdir().expect("scratch root");
+        std::fs::create_dir_all(root.path().join("proc/net")).unwrap();
+        std::fs::write(root.path().join("proc/net/dev"), dev).unwrap();
+        root
+    };
+    let head = "Inter-|\n face |\n";
+    let two = fixture(&format!(
+        "{head}  eth0: 500 5 1 2 0 0 0 0 300 3 0 1 0 0 0 0\n\
+         \x20wlan0: 70 7 0 0 0 0 0 0 80 8 0 0 0 0 0 0\n"
+    ));
+    let one = fixture(&format!("{head}  eth1: 9 9 0 0 0 0 0 0 9 9 0 0 0 0 0 0\n"));
+    let names = |links: &[LinkReading]| links.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+
+    let mut scratch = Vec::new();
+    let first = linux::links_under_into(two.path(), &mut scratch).expect("two links");
+    assert_eq!(names(&first), ["eth0", "wlan0"]);
+    assert_eq!(
+        Some(&first),
+        linux::links_under_into(two.path(), &mut Vec::new()).as_ref()
+    );
+    assert_eq!(scratch.len(), linux::NET_DEV_CAP);
+
+    let at = scratch.as_ptr();
+    let second = linux::links_under_into(one.path(), &mut scratch).expect("one link");
+    assert_eq!(
+        names(&second),
+        ["eth1"],
+        "nothing of the longer file is read"
+    );
+    assert_eq!(
+        Some(&second),
+        linux::links_under_into(one.path(), &mut Vec::new()).as_ref()
+    );
+    assert_eq!(
+        (scratch.as_ptr(), scratch.len()),
+        (at, linux::NET_DEV_CAP),
+        "read again in place"
+    );
+
+    let mut long = vec![0u8; 2 * linux::NET_DEV_CAP];
+    let third = linux::links_under_into(two.path(), &mut long).expect("two links");
+    assert_eq!(third, first);
+    assert_eq!(
+        long.len(),
+        2 * linux::NET_DEV_CAP,
+        "a longer scratch is kept"
+    );
+
+    let empty = aterm_tempfile::tempdir().expect("scratch root");
+    assert_eq!(linux::links_under_into(empty.path(), &mut scratch), None);
+}
+
+/// `/proc/loadavg`'s total: the count after the `/` of its fourth field,
+/// from a whole first line. NEGATIVE CONTROLS: a torn line (whose total
+/// may have been cut short), a field that is not two counts, and a total
+/// of zero read nothing; so does a root with no file.
+#[test]
+fn the_load_average_file_gives_every_thread_on_the_machine() {
+    assert_eq!(
+        linux::loadavg_tasks("0.20 0.18 0.12 1/80 11206\n"),
+        Some(80)
+    );
+    assert_eq!(
+        linux::loadavg_tasks("30.12 31.40 29.98 12/3412 98765\n"),
+        Some(3412)
+    );
+    assert_eq!(linux::loadavg_tasks("0.20 0.18 0.12 1/8"), None, "torn");
+    assert_eq!(linux::loadavg_tasks("0.20 0.18 0.12 1/0 5\n"), None);
+    assert_eq!(linux::loadavg_tasks("0.20 0.18 0.12 80 5\n"), None);
+    assert_eq!(linux::loadavg_tasks("0.20 0.18 0.12 x/80 5\n"), None);
+    assert_eq!(linux::loadavg_tasks("0.20 0.18 0.12 1/-80 5\n"), None);
+    assert_eq!(linux::loadavg_tasks("0.20 0.18\n"), None);
+    assert_eq!(linux::loadavg_tasks(""), None);
+
+    let root = aterm_tempfile::tempdir().expect("scratch root");
+    std::fs::create_dir_all(root.path().join("proc")).unwrap();
+    std::fs::write(
+        root.path().join("proc/loadavg"),
+        "1.50 1.20 0.90 3/897 4242\n",
+    )
+    .unwrap();
+    assert_eq!(linux::Root::new(root.path()).tasks(), Some(897));
+    let empty = aterm_tempfile::tempdir().expect("scratch root");
+    assert_eq!(linux::Root::new(empty.path()).tasks(), None);
+}
+
+/// The macOS pid listing: offered the size ask's room and a quarter more,
+/// never past [`machine::MAX_PIDS`], and counted only when it listed some
+/// pids and did not fill its room; one uid's listing of none counts zero
+/// where `errno` stayed clear. NEGATIVE CONTROLS: a failed size ask offers
+/// nothing; a listing of every pid that listed none (libproc answers zero
+/// for a failure), a uid's that listed none and set `errno`, and one that
+/// filled its room (perhaps cut) are no count. Run on every host (the
+/// helpers are compiled for tests everywhere).
+#[test]
+fn a_pid_listing_counts_only_what_it_listed_within_its_room() {
+    assert_eq!(machine::pid_room(920), Some(1150));
+    assert_eq!(machine::pid_room(1_000_000), Some(machine::MAX_PIDS));
+    assert_eq!(machine::pid_room(0), None);
+    assert_eq!(machine::pid_room(-1), None);
+    assert_eq!(machine::listed_count(897, 1150), Some(897));
+    assert_eq!(machine::listed_count(1149, 1150), Some(1149));
+    assert_eq!(machine::listed_count(1150, 1150), None, "a full room");
+    assert_eq!(machine::listed_count(0, 1150), None, "zero is a failure");
+    assert_eq!(machine::listed_count(-1, 1150), None);
+    assert_eq!(machine::owned_count(0, 0, 1150), Some(0), "owns none");
+    assert_eq!(machine::owned_count(0, 22, 1150), None, "a failure");
+    assert_eq!(machine::owned_count(12, 0, 1150), Some(12));
+    assert_eq!(machine::owned_count(1150, 0, 1150), None, "a full room");
 }
 
 /// Two ceilings: the smaller of the known; an unlimited soft limit is no
@@ -1638,7 +1724,8 @@ fn the_load_average_reads_on_this_host() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_network_links_read_a_structurally_valid_snapshot_on_this_host() {
-    let first = crate::net_links().expect("the interface list");
+    let mut scratch = Vec::new();
+    let first = crate::net_links_into(&mut scratch).expect("the interface list");
     assert!(!first.is_empty());
     let mut indexes: Vec<u32> = first.iter().map(|l| l.index).collect();
     indexes.sort_unstable();

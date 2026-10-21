@@ -1,23 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A width change keeps the text the program wrote, on the screen and in every
-//! history tier, through the synchronous resize and the GUI's offloaded one.
+//! A width change keeps the text the program wrote, on the screen and in every history tier,
+//! through the synchronous resize and the GUI's offloaded one.
 //!
-//! Two losses this file pins (bug hunt 9, text fidelity):
-//!
-//! * The early-wrap hole. A width-2 glyph that cannot start in the last column
-//!   wraps early and leaves that cell unwritten. Every rewrap seam used to infer
-//!   the hole from the next row ("it opens with a wide cell") and dropped the
-//!   last cell of any such row, so a space or a glyph the program really wrote
-//!   there was deleted for good. The hole is now recorded when it is made (the
-//!   write path and the rewrap chunker mark the row, a history line simply
-//!   leaves it out) and only a recorded hole is dropped, as Ghostty drops only a
-//!   `spacer_head` and Alacritty only a `LEADING_WIDE_CHAR_SPACER`.
-//! * Reflow-copied blanks dropped out of `Row::len`, so a printed space at a
-//!   chunk end stopped being content: tiered history (staged at `len`) joined
-//!   words on the next width change, and a cursor after a printed space was
-//!   clamped onto it.
+//! * The early-wrap hole: a width-2 glyph that cannot start in the last column wraps early
+//!   and leaves that cell unwritten. Only a recorded hole (`Row::has_early_wrap_hole`) is
+//!   dropped on rejoin; a space or glyph the program wrote in that column is content.
+//! * A reflow-copied blank counts in `Row::len`, so a printed space at a chunk end stays
+//!   content: tiered history (staged at `len`) does not join the words around it, and a
+//!   cursor after a printed space keeps its column.
 
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
@@ -201,8 +193,7 @@ fn margined_vertical_moves_keep_printed_blanks_and_wrap_holes_distinct() {
     }
 }
 
-/// The written line, the history fixture: written at `cols` on a 3-row screen
-/// and scrolled into history by five line feeds.
+/// `text` written on a 3-row screen and scrolled into history by five line feeds.
 fn in_history(mut term: Terminal, text: &str) -> Terminal {
     term.process(text.as_bytes());
     term.process(b"\r\n\r\n\r\n\r\n\r\n");
@@ -704,13 +695,10 @@ fn a_cursor_after_a_printed_space_keeps_its_column() {
     }
 }
 
-/// A seamless handoff's checkpoint carries each screen row as history reads
-/// one, so an engine restored from it rewraps exactly as the live one: an
-/// early-wrap hole after cells a tab, CUF or CHA skipped stays a hole (read
-/// at its length it came back unmarked, and the next widening added a space),
-/// and a soft-wrapped row DCH left one short of the margin keeps its blank
-/// (read at its length it came back with a hole guessed, and the widening
-/// dropped the blank). Sync and offloaded, through both restore paths.
+/// A handoff checkpoint carries each screen row as history reads one, so an engine restored
+/// from it rewraps as the live one: an early-wrap hole after cells a tab, CUF or CHA skipped
+/// stays a hole, and a soft-wrapped row DCH left one short of the margin keeps its blank.
+/// Sync and offloaded, through both restore paths.
 #[test]
 fn a_restored_engine_rewraps_as_the_live_one() {
     for input in [
@@ -754,19 +742,14 @@ fn a_restored_engine_rewraps_as_the_live_one() {
     }
 }
 
-/// A history row rebuilt at a new width keeps an OSC 8 link or SGR 58
-/// underline colour only on the cells the rebuild put a glyph back in.
+/// A history row rebuilt at a new width keeps an OSC 8 link or SGR 58 underline colour only
+/// on the cells the rebuild put a glyph back in.
 ///
-/// One column cannot hold a wide glyph: the rewrap gives it a line of its own,
-/// which rebuilds as an empty ring row (`fill_row_into` places nothing), as
-/// the screen's own rewrap blanks it (`copy_cells_to_row`). Its link and
-/// underline colour came back anyway, keyed to the empty cell, and a rows grow
-/// re-seated them there: an extras entry no cell claimed (which a later
-/// extras-styled write adopts), or, where the reveal claims what it re-seats,
-/// a click target on an empty cell. Found 2026-10-11 (r16) checking every
-/// path that shrinks a wide glyph out of existence, after the alternate
-/// screen's width cut; the synchronous ring path and the window's offloaded
-/// tiered path both rebuild ring rows this way.
+/// One column cannot hold a wide glyph: the rewrap gives it a line of its own, which rebuilds
+/// as an empty ring row (`fill_row_into` places nothing), as the screen's own rewrap blanks
+/// it (`copy_cells_to_row`). Its link and underline colour must not come back keyed to the
+/// empty cell, where a rows grow would re-seat them. The synchronous ring path and the
+/// offloaded tiered path both rebuild ring rows this way.
 #[test]
 fn a_wide_glyph_one_column_cannot_hold_leaves_no_link_in_history() {
     let link_on = "\x1b]8;;https://example.com/\x1b\\";
@@ -866,15 +849,9 @@ fn view_style_strays(
     strays
 }
 
-/// Scrolled back, a history row rebuilt where a wide glyph cannot fit shows
-/// no link or underline colour on its empty cell.
-///
-/// The fills that rebuild ring rows already restore a line's spans only on
-/// the cells they filled (`filled_span_cols`). The scrolled-back view of a
-/// tiered line goes through its own walk (`materialize_from_line`), which
-/// restored them up to the row's width: on one-column history every empty
-/// row of a dropped glyph answered its link. Found 2026-10-11 by the r16
-/// alt-extras review (48 linked blanks over 16 tiered one-column cases).
+/// Scrolled back, a history row rebuilt where a wide glyph cannot fit shows no link or
+/// underline colour on its empty cell: the tiered view's walk (`materialize_from_line`)
+/// restores spans only on the cells it filled (`filled_span_cols`), as the ring fills do.
 #[test]
 fn a_one_column_history_row_scrolled_back_styles_no_blank() {
     let link_on = "\x1b]8;;https://example.com/\x1b\\";
@@ -909,19 +886,14 @@ fn a_one_column_history_row_scrolled_back_styles_no_blank() {
     }
 }
 
-/// A VS16 glyph the live grid kept narrow in mid row keeps the columns after
-/// it, in scrollback and through a history rewrap, so the link and underline
-/// colour of the glyph after it stay on that glyph.
+/// A VS16 glyph the live grid kept narrow in mid row keeps the columns after it, in
+/// scrollback and through a history rewrap, so the link and underline colour of the glyph
+/// after it stay on that glyph.
 ///
-/// The live writer cannot widen `❤️` at the last column (no room for the
-/// spacer), and the screen's own rewrap keeps that narrow cell narrow when a
-/// width change moves it into mid row. The line it scrolls into history
-/// records it narrow and keys the spans after it to those columns. Every
-/// reader re-widened it from its text: the scrolled-back row drew it two
-/// columns wide, a blank took the link of the 🚀 after it and the 🚀's
-/// right half lost it, and the history rewrap did the same to the line it
-/// built. Found 2026-10-11 by the r16 alt-extras review (3x4, widen to 3x8,
-/// scroll, 12x9).
+/// The live writer cannot widen `❤️` at the last column (no room for the spacer), and the
+/// screen's rewrap keeps it narrow when a width change moves it into mid row. Its history
+/// line records it narrow and keys the later spans to those columns; a reader that re-widened
+/// it from its text would shift the 🚀's link onto a blank.
 #[test]
 fn a_vs16_glyph_kept_narrow_in_mid_row_keeps_the_styles_after_it_in_place() {
     let text = "abc\u{2764}\u{FE0F} \x1b[4:3m\x1b[58;5;1m\x1b]8;;https://e.x/\x1b\\\u{1F680}\x1b]8;;\x1b\\\x1b[m";

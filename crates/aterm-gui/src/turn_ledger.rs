@@ -28,9 +28,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-/// How many turn records a session retains. Sized so a long agent conversation
-/// stays fully readable while the ring never grows unbounded; the screen-hash +
-/// bounded text keep each record small (~a few hundred bytes).
+/// How many turn records a session retains (a few hundred bytes each).
 pub(crate) const LEDGER_CAP: usize = 512;
 
 /// While more than this many of a full ledger's records are the window
@@ -53,12 +51,11 @@ const MAX_TEXT: usize = 512;
 /// One completed turn, in the order `cmd_turn` finished it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TurnRecord {
-    /// The turn id (the `id=` the `turn` reply prints, and the id the events
-    /// digest and `ERR busy turn=<id>` refusals name): unique in the process,
-    /// and still rising after a self-update handoff, which carries the counter.
+    /// The turn id (the `turn` reply's `id=`, also named by the events digest and `ERR busy
+    /// turn=<id>`): unique in the process, and still rising after a self-update handoff,
+    /// which carries the counter.
     pub id: u64,
-    /// Milliseconds since the process epoch when the turn began (monotonic; for
-    /// ordering + aligning against the temporal/cast spines, not wall-clock).
+    /// Milliseconds since the process epoch when the turn began ([`now_ms`]; monotonic).
     pub started_ms: u64,
     /// How long the whole type→submit→settle exchange took, in milliseconds.
     pub dur_ms: u64,
@@ -83,10 +80,9 @@ pub(crate) struct TurnRecord {
     pub screen_hash: u64,
     /// The engine `content_seq` at settle (matches the `turn` reply's `seq=`).
     pub seq: u64,
-    /// Where the session's alt-screen archive stood when the turn STARTED (before
-    /// a byte was typed): `offscreen since=<origin>:<last>` then reads exactly the
-    /// rows a fullscreen app scrolled off the top during and after this turn.
-    /// `history` prints it as `arch=<origin>:<last>`.
+    /// The alt-screen archive's mark when the turn started, before a byte was typed, so
+    /// `offscreen since=<origin>:<last>` reads the rows a fullscreen app scrolled off during
+    /// and after the turn. `history` prints it as `arch=`.
     pub arch: ArchMark,
     /// Who typed the turn ([`TurnBy`]): `history` prints it as `by=<word>`.
     pub by: TurnBy,
@@ -183,8 +179,8 @@ impl TurnBy {
 /// reads from the start of the new archive instead of from an unrelated index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ArchMark {
-    /// The archive's origin (unique per aterm process that started an archive,
-    /// and kept by a handoff that carries it; 0 when the host never set one).
+    /// The archive's origin (unique per aterm process that started an archive, kept by a
+    /// handoff that carries it; 0 when the host never set one).
     pub origin: u64,
     /// The newest archived index at the mark.
     pub last: u64,
@@ -249,14 +245,10 @@ pub(crate) struct TurnLedger {
     /// `since-turn=` below it is told, as for evicted records.
     /// 0: none.
     unheld_below: u64,
-    /// Turn ids minted for this session whose record has not landed yet
-    /// ([`TurnLedger::begin`] … [`TurnLedger::record`] or
-    /// [`TurnLedger::abandon`]): a handoff's export carries them as ids the
-    /// carried ledger does not vouch for ([`TurnLedger::carry_floor`]), since
-    /// their records land in the process that exits (the 2026-09-29 review,
-    /// round seven, finding 23). One lease holds a session's turn at a time,
-    /// so this holds one id, or a few when `lease release force` preempted a
-    /// wedged turn.
+    /// Turn ids begun on this session whose record has not landed ([`TurnLedger::begin`] …
+    /// [`TurnLedger::record`] / [`TurnLedger::abandon`]); [`TurnLedger::carry_floor`] keeps a
+    /// handoff's carried ledger from vouching for them. One lease holds a session's turn at a
+    /// time, so this is one id, or a few after `lease release force` preempted a wedged turn.
     open: Vec<u64>,
     /// The session's watchers ([`crate::SessionCtx::watchers`]), rung by
     /// [`TurnLedger::record`] so the `events` digest pushes a landed turn at
@@ -369,7 +361,9 @@ impl TurnLedger {
     /// carries only a rising run — a record landing under its old, lower id
     /// was one no subscriber was ever sent (round seven, finding 43).
     ///
-    /// It wakes the session's watchers: the record is the scannable state.
+    /// It wakes the session's watchers for a record
+    /// ([`crate::session_watch::Watchers::ring_record`]): the record is the
+    /// scannable state.
     pub(crate) fn record(&mut self, mut rec: TurnRecord, mint: impl FnOnce() -> u64) -> u64 {
         self.abandon(rec.id);
         if self.high_id().is_some_and(|high| high >= rec.id) {
@@ -377,7 +371,7 @@ impl TurnLedger {
         }
         let id = rec.id;
         self.push(rec);
-        self.watchers.ring_watchers();
+        self.watchers.ring_record();
         id
     }
 
@@ -468,19 +462,11 @@ impl TurnLedger {
         self.unheld_below
     }
 
-    /// The floor ([`TurnLedger::unheld_below`]) while it still tells a reader
-    /// something: until the records it lost would have AGED OUT of a ledger
-    /// carried whole. They are older than every record at or past the floor,
-    /// so that ledger has evicted them once it holds [`LEDGER_CAP`] such
-    /// records — this ledger is full, and its oldest record is at or past
-    /// the floor. From then on the floor is stale and `None`: a floor set by
-    /// one update must not ride every `history` reply and every later export
-    /// for the rest of the session (round seven, finding 58's review).
-    ///
-    /// Held records at or past the floor are not enough on their own: every
-    /// turn after a dropped ledger has an id at or past its floor, and a
-    /// halved carry holds only such records, so that rule went quiet one
-    /// turn after the update, or at once (round seven, finding 204).
+    /// The floor ([`TurnLedger::unheld_below`]) until the records it lost would have aged out
+    /// of a ledger carried whole: once this ledger is full and its oldest record is at or past
+    /// the floor, it is stale and `None`, so one update's floor does not ride every later
+    /// `history` reply and export. Records at or past the floor alone do not make it stale:
+    /// every turn after a dropped ledger, and every record of a halved carry, is at or past it.
     pub(crate) fn live_floor(&self) -> Option<u64> {
         let floor = self.unheld_below;
         let aged_out = self.records.len() >= LEDGER_CAP
@@ -488,24 +474,16 @@ impl TurnLedger {
         (floor > 0 && !aged_out).then_some(floor)
     }
 
-    /// What a handoff's export carries as the ledger's `unheld_below`: the
-    /// ledger's own, raised past every id a turn still OPEN on this session
-    /// can record under. Such a turn records into this process's ledger after
-    /// the export took it (a parked reader leaves its screen frozen, so an
-    /// idle settle latches), and the successor never sees that record — so
-    /// the carried ledger must not vouch for its id (round seven, finding 23).
+    /// The `unheld_below` a handoff's export carries: the live floor, raised past every id a
+    /// turn still open on this session can record under. Such a turn records into this
+    /// process's ledger after the export (a parked reader freezes its screen, so an idle settle
+    /// latches), and the successor never sees that record.
     ///
-    /// That id is the turn's own only while nothing records ahead of it: ONE
-    /// open turn, past every record. A turn at or below a record (a `lease
-    /// release force` preempted it, and the turn that took its slot
-    /// recorded), or one of several open at once, can land behind a newer
-    /// record, and [`TurnLedger::record`] re-numbers it with an id minted
-    /// after the export (round seven, finding 43) — any id up to `ceiling`,
-    /// the most this process mints before it exits (the turn-id count the
-    /// handoff's manifest carries, to which the Commit holds it). The carry
-    /// then vouches for no id up to `ceiling` (round eight, finding 40).
-    ///
-    /// A floor gone stale ([`TurnLedger::live_floor`]) is not carried on.
+    /// One open turn past every record records under its own id. A preempted turn (at or
+    /// below a record) or one of several open can land behind a newer record and be
+    /// re-numbered by [`TurnLedger::record`] with an id minted after the export, up to
+    /// `ceiling` (the turn-id count the handoff's manifest carries, which the Commit holds the
+    /// mint to); the carry then vouches for no id up to `ceiling`.
     #[cfg(any(unix, test))]
     pub(crate) fn carry_floor(&self, ceiling: u64) -> u64 {
         let live = self.live_floor().unwrap_or(0);
@@ -517,9 +495,8 @@ impl TurnLedger {
         live.max(past.saturating_add(1))
     }
 
-    /// The highest recorded turn id, or `None` when empty — the events digest
-    /// seeds its watermark to this so it streams only turns that land AFTER
-    /// subscription (a live stream, never the historical backlog).
+    /// The highest recorded turn id, or `None` when empty: the events digest seeds its
+    /// watermark here so it streams only turns that land after subscription.
     pub(crate) fn high_id(&self) -> Option<u64> {
         self.records.back().map(|r| r.id)
     }
@@ -555,24 +532,11 @@ impl TurnLedger {
         }
     }
 
-    /// Records with `id > after`, oldest-first (the events digest's scan, and the
-    /// `turns since=<id>` verb). Records only ever append with strictly increasing
-    /// ids, so this is a suffix. `None` = all retained records.
-    ///
-    /// SEEK, DON'T FILTER. The doc above has always said "this is a suffix" and
-    /// the body then walked all [`LEDGER_CAP`] retained records and threw away
-    /// the prefix — which the subscribe `events` digest paid on EVERY 250 ms
-    /// liveness tick per watched target, whether or not a turn had landed.
-    /// `id <= after` is a MONOTONE predicate over the ring precisely because the
-    /// ids are strictly increasing, so `partition_point` lands on the first
-    /// record past the watermark in O(log n) and `range` yields the suffix
-    /// itself. Same elements, same order, same borrow — the drain is now
-    /// O(log n + matched) instead of O(retained).
-    ///
-    /// A watermark BELOW the retained low-water still yields EVERY retained
-    /// record (`partition_point` returns 0), which is the behaviour the
-    /// events-resume `GAP … events-resync=` frame is built on: `low_id()`
-    /// reports the drop-oldest eviction, `since` does not silently swallow it.
+    /// Records with `id > after`, oldest first (the events digest's scan, and `history
+    /// since=<id>`); `None`: every retained record. Ids strictly rise, so this is a suffix
+    /// that `partition_point` finds in O(log n): the digest runs it every 250 ms per watched
+    /// target. A watermark below the retained low-water yields every record, and
+    /// [`TurnLedger::low_id`] reports the eviction.
     pub(crate) fn since(&self, after: Option<u64>) -> impl ExactSizeIterator<Item = &TurnRecord> {
         let start = match after {
             None => 0,
@@ -836,7 +800,7 @@ mod tests {
         let observed = |after: Option<u64>| -> Vec<u64> { l.since(after).map(|r| r.id).collect() };
 
         // The whole neighbourhood: below the low-water, exactly on retained ids,
-        // in the GAPS between them, at the high, and past it.
+        // in the gaps between them, at the high, and past it.
         let mut probes: Vec<Option<u64>> = vec![None, Some(0), Some(1), Some(low - 1)];
         for id in [
             low,
@@ -869,12 +833,9 @@ mod tests {
         );
     }
 
-    /// Round seven, finding 43: a turn a `lease release force` preempted
-    /// finishes after the turn that took its slot. Recorded under its own,
-    /// lower id it sat behind the newer record — the `events` digest, whose
-    /// watermark had passed it, never sent it, and a handoff's carry dropped
-    /// it. It is re-numbered instead, so the ids rise in the order records
-    /// land, and a watcher past the newer turn is sent it.
+    /// A turn a `lease release force` preempted finishes after the turn that took its slot:
+    /// it is re-numbered past the newer record, so ids rise in landing order and a watcher
+    /// past the newer turn is sent it.
     #[test]
     fn a_preempted_turn_that_records_late_is_renumbered_and_streamed() {
         let mut l = TurnLedger::default();
@@ -882,9 +843,8 @@ mod tests {
         l.begin(10);
         l.begin(11);
         assert_eq!(l.record(rec(11), || unreachable!("in order")), 11);
-        // Exported now, turn 10 can only record behind 11, under an id still
-        // to be minted: the carry vouches for none up to the ceiling (round
-        // eight, finding 40).
+        // Exported now, turn 10 can only record behind 11, under an id still to be minted:
+        // the carry vouches for none up to the ceiling.
         assert_eq!(l.carry_floor(CEILING), CEILING + 1);
         let watermark = l.high_id();
         let mut minted = 11;
@@ -899,19 +859,16 @@ mod tests {
         assert_eq!(streamed, vec![12], "the watcher past 11 is sent it");
         assert_eq!(l.carry_floor(CEILING), 0, "nothing is open any more");
 
-        // A sender that predates this (its ledger out of order) is put back
-        // in order by the receiver, not left a record short.
+        // An out-of-order sender's ledger is put back in order, not left a record short.
         let carried = TurnLedger::carried(vec![rec(5), rec(11), rec(10), rec(11)], 0);
         let ids: Vec<u64> = carried.since(None).map(|r| r.id).collect();
         assert_eq!(ids, vec![5, 10, 11]);
         assert_eq!(carried.since(Some(9)).count(), 2, "turn 10 is found");
     }
 
-    /// Round seven, finding 23: a turn still OPEN when the handoff exports
-    /// the ledger records into the exiting process. The export carries a
-    /// floor past it, and the adopted ledger's low-water is that floor even
-    /// though older records are held, so a subscriber resuming from before
-    /// it is told (`GAP … events-resync=`).
+    /// A turn still open when the handoff exports the ledger records into the exiting
+    /// process: the export carries a floor past it, and the adopted ledger's low-water is that
+    /// floor even with older records held.
     #[test]
     fn an_open_turn_is_carried_as_an_id_the_ledger_does_not_vouch_for() {
         let mut l = TurnLedger::default();
@@ -927,15 +884,9 @@ mod tests {
         assert_eq!(l.carry_floor(CEILING), 0);
     }
 
-    /// A floor stays live until the records it lost would have aged out of a
-    /// ledger carried whole — [`LEDGER_CAP`] records at or past it have
-    /// landed — and only then goes stale, neither reported nor carried on
-    /// (round seven, finding 58's review: it rode every `history` reply and
-    /// every later export for the life of the session). Records at or past
-    /// it are not enough on their own: every turn after a dropped ledger has
-    /// an id at or past its floor, and a halved carry holds only such
-    /// records, so the floor went quiet after ONE new turn, or at once
-    /// (round seven, findings 204 and 205).
+    /// A floor stays live until [`LEDGER_CAP`] records at or past it have landed, then is
+    /// neither reported nor carried on. Records at or past it alone are not enough: every turn
+    /// after a dropped ledger, and every record of a halved carry, is at or past it.
     #[test]
     fn a_floor_goes_stale_once_the_records_under_it_would_have_aged_out() {
         let cap = LEDGER_CAP as u64;

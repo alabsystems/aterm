@@ -24,15 +24,12 @@ use std::sync::Arc;
 
 use aterm_wayland::proxy::Proxy;
 
-pub(super) use crate::cursor::OnlyCursorImage as CustomCursor;
 use crate::dpi::{LogicalSize, PhysicalSize};
 pub use crate::platform_impl::platform::{OsError, WindowId};
 pub use clipboard::{WaylandClipboard, WaylandSelection};
 pub use event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-pub use output::{MonitorHandle, VideoModeHandle};
+pub use output::MonitorHandle;
 pub use window::Window;
-
-pub(crate) use state::Connection;
 
 mod clipboard;
 mod event_loop;

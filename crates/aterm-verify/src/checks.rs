@@ -84,7 +84,8 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::Selection,
         needs: &["targo-tippy"],
         also: "",
-        runs: "targo-tippy <selection> --all-targets -- -D warnings (+ aterm-gpu's wgpu-oracle arm)",
+        runs: "targo-tippy <selection> --all-targets -- -D warnings (+ aterm-gpu's wgpu-oracle arm; \
+               under release, the required-features targets and -p aterm --release)",
     },
     Spec {
         check: Check::Test,
@@ -150,8 +151,8 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::BrowserLane],
         reach: Reach::WholeTree,
         needs: &["chrome-headless-shell", "firefox", "rustup"],
-        also: "stable's wasm32",
-        runs: "both web modules (dev) in headless Chromium, WebGL2 on ANGLE Metal (macOS) and SwiftShader, and in headless Firefox; the GPU module on the page and in a worker (init_offscreen): a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
+        also: "stable's wasm32; on macOS Playwright's WebKit (`verify fetch-browser`), whose rows keep windows",
+        runs: "both web modules (dev) in headless Chromium, WebGL2 on ANGLE Metal (macOS) and SwiftShader, in headless Firefox, and in Playwright's WebKit (it keeps a window: a named skip under --no-windows); the GPU module on the page and in a worker (init_offscreen): a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::Libc,
@@ -416,7 +417,7 @@ pub fn sets_of(check: Check) -> String {
 }
 
 /// What `check` needs, as `list` prints it: each tool with its provider
-/// (`fish (verify provision)`), then what else it needs; `-` for nothing.
+/// (`fish (upstream)`), then what else it needs; `-` for nothing.
 ///
 /// # Panics
 ///
@@ -545,8 +546,8 @@ mod tests {
     fn list_renders_each_checks_needs_from_the_tools_table() {
         let test = needs_of(Check::Test);
         for want in [
-            "fish (verify provision)",
-            "pwsh (verify provision)",
+            "fish (upstream)",
+            "pwsh (upstream)",
             "cc (CLT)",
             "zstd (unprovided)",
             "python3 (unprovided)",
@@ -556,7 +557,7 @@ mod tests {
         }
         assert_eq!(
             needs_of(Check::Linux),
-            "Apple silicon with Rosetta, limactl (verify provision --linux), network for the first provision"
+            "Apple silicon with Rosetta, limactl (upstream), network for the first provision"
         );
         assert_eq!(needs_of(Check::Census), "-");
         let table = list_table();
@@ -568,7 +569,7 @@ mod tests {
             .find(|l| l.starts_with("fish "))
             .unwrap_or_else(|| panic!("no fish row in {table}"));
         assert!(
-            line.contains("verify provision") && line.ends_with(fish.why),
+            line.contains(" upstream ") && line.ends_with(fish.why),
             "{line}"
         );
         assert_eq!(table.lines().filter(|l| l.starts_with("fish ")).count(), 1);

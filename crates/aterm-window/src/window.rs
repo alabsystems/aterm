@@ -9,21 +9,23 @@
 //! The [`Window`] struct and associated types.
 
 // LOCAL PATCH (aterm), 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5): an
-// item here marked `#[cfg(not(macos_platform))]` is API no aterm crate calls. The macOS backend no
-// longer implements it; the Windows backend (owed its runtime smoke first) and the Linux module
-// (WC.8) still do, and their carves delete it.
+// item here marked `#[cfg(not(macos_platform))]` is API no aterm crate calls on macOS, and one
+// marked `#[cfg(windows_platform)]` API no aterm crate calls on Linux either. The macOS backend
+// no longer implements the first, nor (2026-10-21, WC.8) the Linux module the second; the
+// Windows backend (owed its runtime smoke first) still implements both, and its carve deletes
+// them.
 
 use std::fmt;
 
 use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError};
 use crate::monitor::MonitorHandle;
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 use crate::monitor::VideoModeHandle;
 use crate::platform_impl::{self, PlatformSpecificWindowAttributes};
 
 pub use crate::cursor::Cursor;
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 pub use crate::cursor::{BadImage, CustomCursor, CustomCursorSource, MAX_CURSOR_SIZE};
 #[cfg(not(macos_platform))]
 pub use crate::icon::{BadIcon, Icon};
@@ -62,8 +64,9 @@ impl fmt::Debug for Window {
 }
 
 // LOCAL PATCH (aterm), 2026-10-16 (winit-core step 5): not on macOS, which has no exclusive
-// fullscreen to leave; its backend's own `Drop` closes the window.
-#[cfg(not(macos_platform))]
+// fullscreen to leave; its backend's own `Drop` closes the window. 2026-10-21 (WC.8): nor on
+// Linux, which has none either; its X11 and Wayland windows close in their own `Drop`.
+#[cfg(windows_platform)]
 impl Drop for Window {
     /// This will close the [`Window`].
     ///
@@ -129,50 +132,53 @@ impl From<u64> for WindowId {
 /// `with_fullscreen`, `with_decorations`, `with_parent_window` and the rest) had no caller,
 /// so every field they set holds its [`Default`] for good; the backends that still read one
 /// are carved with their own steps.
+///
+/// LOCAL PATCH (aterm), 2026-10-21 (docs/AUDIT-third-party-2026-10-15.md, WC.8): the Linux
+/// module folded those defaults too, and `with_position` (which only the macOS toolbar driver
+/// calls) is not built there; the X11 and Wayland windows read the title, sizes, visibility,
+/// name and startup token, and X11 the icon.
 #[derive(Debug, Clone)]
 pub struct WindowAttributes {
     pub(crate) inner_size: Option<Size>,
     pub(crate) min_inner_size: Option<Size>,
+    #[cfg(any(macos_platform, windows_platform))]
     pub(crate) position: Option<Position>,
     pub(crate) title: String,
     pub(crate) visible: bool,
     // Platform-specific configuration.
     #[allow(dead_code)]
     pub(crate) platform_specific: PlatformSpecificWindowAttributes,
-    // Only the Windows and Linux backends read the rest, each gated to the backends that do, and
-    // only `window_icon` can be set (on Windows). macOS folded each to its default; the other
-    // carves delete them.
+    // The window icon is set on Windows and X11. Only the Windows backend reads the rest, each
+    // at its default; the Windows carve deletes them.
     #[cfg(any(x11_platform, windows_platform))]
     pub(crate) window_icon: Option<Icon>,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) max_inner_size: Option<Size>,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) resizable: bool,
     #[cfg(windows_platform)]
     pub(crate) enabled_buttons: WindowButtons,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) maximized: bool,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) transparent: bool,
-    #[cfg(wayland_platform)]
-    pub(crate) blur: bool,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) decorations: bool,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) preferred_theme: Option<Theme>,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) resize_increments: Option<Size>,
     #[cfg(windows_platform)]
     pub(crate) content_protected: bool,
-    #[cfg(any(x11_platform, windows_platform))]
+    #[cfg(windows_platform)]
     pub(crate) window_level: WindowLevel,
     #[cfg(windows_platform)]
     pub(crate) active: bool,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) cursor: Cursor,
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub(crate) fullscreen: Option<Fullscreen>,
-    #[cfg(all(feature = "rwh_06", any(x11_platform, windows_platform)))]
+    #[cfg(all(feature = "rwh_06", windows_platform))]
     pub(crate) parent_window: Option<SendSyncRawWindowHandle>,
 }
 
@@ -182,41 +188,40 @@ impl Default for WindowAttributes {
         WindowAttributes {
             inner_size: None,
             min_inner_size: None,
+            #[cfg(any(macos_platform, windows_platform))]
             position: None,
             title: "winit window".to_owned(),
             visible: true,
             platform_specific: Default::default(),
             #[cfg(any(x11_platform, windows_platform))]
             window_icon: None,
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             max_inner_size: None,
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             resizable: true,
             #[cfg(windows_platform)]
             enabled_buttons: WindowButtons::all(),
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             maximized: false,
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             transparent: false,
-            #[cfg(wayland_platform)]
-            blur: false,
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             decorations: true,
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             preferred_theme: None,
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             resize_increments: None,
             #[cfg(windows_platform)]
             content_protected: false,
-            #[cfg(any(x11_platform, windows_platform))]
+            #[cfg(windows_platform)]
             window_level: Default::default(),
             #[cfg(windows_platform)]
             active: true,
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             cursor: Cursor::default(),
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             fullscreen: None,
-            #[cfg(all(feature = "rwh_06", any(x11_platform, windows_platform)))]
+            #[cfg(all(feature = "rwh_06", windows_platform))]
             parent_window: None,
         }
     }
@@ -225,12 +230,12 @@ impl Default for WindowAttributes {
 /// Wrapper for [`rwh_06::RawWindowHandle`] for `WindowAttributes::parent_window`, which nothing
 /// sets now that `with_parent_window` is gone.
 #[derive(Debug, Clone)]
-#[cfg(all(feature = "rwh_06", any(x11_platform, windows_platform)))]
+#[cfg(all(feature = "rwh_06", windows_platform))]
 pub(crate) struct SendSyncRawWindowHandle(pub(crate) rwh_06::RawWindowHandle);
 
-#[cfg(all(feature = "rwh_06", any(x11_platform, windows_platform)))]
+#[cfg(all(feature = "rwh_06", windows_platform))]
 unsafe impl Send for SendSyncRawWindowHandle {}
-#[cfg(all(feature = "rwh_06", any(x11_platform, windows_platform)))]
+#[cfg(all(feature = "rwh_06", windows_platform))]
 unsafe impl Sync for SendSyncRawWindowHandle {}
 
 impl WindowAttributes {
@@ -273,8 +278,8 @@ impl WindowAttributes {
     /// - **Windows:** The top left corner position of the window title bar, the window's "outer"
     ///   position. There may be a small gap between this position and the window due to the
     ///   specifics of the Window Manager.
-    /// - **X11:** The top left corner of the window, the window's "outer" position.
-    /// - **Others:** Ignored.
+    /// - **X11, Wayland:** not built (WC.8: no aterm crate places a new Linux window).
+    #[cfg(any(macos_platform, windows_platform))]
     #[inline]
     pub fn with_position<P: Into<Position>>(mut self, position: P) -> Self {
         self.position = Some(position.into());
@@ -307,8 +312,8 @@ impl WindowAttributes {
     ///
     /// The default is `None`.
     ///
-    /// See [`Window::set_window_icon`] for details. Not on Wayland, which has no window icon,
-    /// nor on macOS.
+    /// On Windows, `Window::set_window_icon` changes it later. Not on Wayland, which has no
+    /// window icon, nor on macOS.
     #[cfg(any(x11_platform, windows_platform))]
     #[inline]
     pub fn with_window_icon(mut self, window_icon: Option<Icon>) -> Self {
@@ -468,7 +473,7 @@ impl Window {
     /// - **Wayland:** Schedules a frame callback to throttle [`WindowEvent::RedrawRequested`].
     ///
     /// [`WindowEvent::RedrawRequested`]: crate::event::WindowEvent::RedrawRequested
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn pre_present_notify(&self) {
         let _span = tracing::debug_span!("aterm_window::Window::pre_present_notify",).entered();
@@ -484,11 +489,11 @@ impl Window {
     ///
     /// ## Platform-specific
     /// - **Web, macOS:** Does nothing
-    #[cfg(not(macos_platform))]
     // ---------------------------
     // Developers' Note: If this cannot be implemented on every desktop platform
     // at least, then this function should be provided through a platform specific
     // extension trait
+    #[cfg(windows_platform)]
     pub fn reset_dead_keys(&self) {
         let _span = tracing::debug_span!("aterm_window::Window::reset_dead_keys",).entered();
 
@@ -707,7 +712,7 @@ impl Window {
     /// ## Platform-specific
     ///
     /// - **iOS / Android / Orbital:** Unsupported.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_max_inner_size<S: Into<Size>>(&self, max_size: Option<S>) {
         let max_size = max_size.map(|s| s.into());
@@ -724,7 +729,7 @@ impl Window {
     /// ## Platform-specific
     ///
     /// - **iOS / Android / Web / Orbital:** Always returns [`None`].
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn resize_increments(&self) -> Option<PhysicalSize<u32>> {
         let _span = tracing::debug_span!("aterm_window::Window::resize_increments",).entered();
@@ -779,7 +784,7 @@ impl Window {
     ///
     /// - **macOS:** This will reset the window's background color.
     /// - **X11:** Unsupported: upstream could only set it while building the window.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_transparent(&self, transparent: bool) {
         let _span =
@@ -796,7 +801,7 @@ impl Window {
     /// - **Android / iOS / X11 / Web / Windows:** Unsupported.
     /// - **Wayland:** Unsupported (aterm, LW.7: the kwin blur protocol left with the
     ///   `wayland-kwin-blur` feature).
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_blur(&self, blur: bool) {
         let _span = tracing::debug_span!("aterm_window::Window::set_blur", blur).entered();
@@ -824,8 +829,8 @@ impl Window {
     ///
     /// ## Platform-specific
     ///
-    /// - **X11:** Not implemented.
-    /// - **Wayland / iOS / Android / Web:** Unsupported.
+    /// - **X11, Wayland:** not built (WC.8: no aterm crate asks there).
+    #[cfg(any(macos_platform, windows_platform))]
     #[inline]
     pub fn is_visible(&self) -> Option<bool> {
         let _span = tracing::debug_span!("aterm_window::Window::is_visible",).entered();
@@ -847,7 +852,7 @@ impl Window {
     /// - **iOS / Android / Web:** Unsupported.
     ///
     /// [`WindowEvent::Resized`]: crate::event::WindowEvent::Resized
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_resizable(&self, resizable: bool) {
         let _span =
@@ -861,7 +866,7 @@ impl Window {
     ///
     /// - **X11:** Not implemented.
     /// - **iOS / Android / Web:** Unsupported.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn is_resizable(&self) -> bool {
         let _span = tracing::debug_span!("aterm_window::Window::is_resizable",).entered();
@@ -874,7 +879,7 @@ impl Window {
     ///
     /// - **Wayland / X11 / Orbital:** Not implemented.
     /// - **Web / iOS / Android:** Unsupported.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn set_enabled_buttons(&self, buttons: WindowButtons) {
         let _span = tracing::debug_span!(
             "aterm_window::Window::set_enabled_buttons",
@@ -890,7 +895,7 @@ impl Window {
     ///
     /// - **Wayland / X11 / Orbital:** Not implemented. Always returns [`WindowButtons::all`].
     /// - **Web / iOS / Android:** Unsupported. Always returns [`WindowButtons::all`].
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn enabled_buttons(&self) -> WindowButtons {
         let _span = tracing::debug_span!("aterm_window::Window::enabled_buttons",).entered();
         self.window.maybe_wait_on_main(|w| w.enabled_buttons())
@@ -999,7 +1004,7 @@ impl Window {
     /// ## Platform-specific
     ///
     /// - **iOS / Android / Web:** No effect.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_decorations(&self, decorations: bool) {
         let _span =
@@ -1026,7 +1031,7 @@ impl Window {
     /// This is just a hint to the OS, and the system could ignore it.
     ///
     /// See [`WindowLevel`] for details.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn set_window_level(&self, level: WindowLevel) {
         let _span = tracing::debug_span!(
             "aterm_window::Window::set_window_level",
@@ -1050,7 +1055,7 @@ impl Window {
     ///
     /// - **X11:** Has no universal guidelines for icon sizes, so you're at the whims of the WM.
     ///   That said, it's usually in the same ballpark as on Windows.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_window_icon(&self, window_icon: Option<Icon>) {
         let _span = tracing::debug_span!("aterm_window::Window::set_window_icon",).entered();
@@ -1242,7 +1247,7 @@ impl Window {
     /// - **iOS / Android / x11 / Wayland / Web / Orbital:** Unsupported.
     ///
     /// [`NSWindowSharingNone`]: https://developer.apple.com/documentation/appkit/nswindowsharingtype/nswindowsharingnone
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn set_content_protected(&self, protected: bool) {
         let _span = tracing::debug_span!("aterm_window::Window::set_content_protected", protected)
             .entered();
@@ -1253,7 +1258,8 @@ impl Window {
     ///
     /// ## Platform-specific
     ///
-    /// - **iOS / Android / x11 / Wayland / Web:** Unsupported. Always returns an empty string.
+    /// - **X11, Wayland:** not built (WC.8: no aterm crate asks there).
+    #[cfg(any(macos_platform, windows_platform))]
     #[inline]
     pub fn title(&self) -> String {
         let _span = tracing::debug_span!("aterm_window::Window::title",).entered();
@@ -1295,7 +1301,7 @@ impl Window {
     ///
     /// - **Wayland**: Cursor must be in [`CursorGrabMode::Locked`].
     /// - **iOS / Android / Web / Orbital:** Always returns an [`ExternalError::NotSupported`].
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_cursor_position<P: Into<Position>>(&self, position: P) -> Result<(), ExternalError> {
         let position = position.into();
@@ -1322,7 +1328,7 @@ impl Window {
     ///     .unwrap();
     /// # }
     /// ```
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_cursor_grab(&self, mode: CursorGrabMode) -> Result<(), ExternalError> {
         let _span = tracing::debug_span!(
@@ -1345,7 +1351,7 @@ impl Window {
     /// - **macOS:** The cursor is hidden as long as the window has input focus, even if the cursor
     ///   is outside of the window.
     /// - **iOS / Android:** Unsupported.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_cursor_visible(&self, visible: bool) {
         let _span =
@@ -1419,7 +1425,7 @@ impl Window {
     /// ## Platform-specific
     ///
     /// - **iOS / Android / Web / Orbital:** Always returns an [`ExternalError::NotSupported`].
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     #[inline]
     pub fn set_cursor_hittest(&self, hittest: bool) -> Result<(), ExternalError> {
         let _span =
@@ -1513,7 +1519,7 @@ impl rwh_06::HasDisplayHandle for Window {
 /// The behavior of cursor grabbing.
 ///
 /// Use this enum with [`Window::set_cursor_grab`] to grab the cursor.
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum CursorGrabMode {
     /// No grabbing of the cursor is performed.
@@ -1559,9 +1565,9 @@ pub enum ResizeDirection {
 /// Fullscreen modes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fullscreen {
-    /// Not on macOS: no aterm crate asks for a video mode, and the macOS backend no longer
-    /// implements one (winit-core step 5).
-    #[cfg(not(macos_platform))]
+    /// Windows only: no aterm crate asks for a video mode, and neither the macOS backend
+    /// (winit-core step 5) nor the Linux module (WC.8) implements one any more.
+    #[cfg(windows_platform)]
     Exclusive(VideoModeHandle),
 
     /// Providing `None` to `Borderless` will fullscreen on the current monitor.
@@ -1602,7 +1608,7 @@ pub enum UserAttentionType {
     Informational,
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 aterm_types::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct WindowButtons: u32 {
@@ -1620,7 +1626,7 @@ aterm_types::bitflags! {
 /// ## Platform-specific
 ///
 /// - **iOS / Android / Web / Wayland:** Unsupported.
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub enum WindowLevel {
     /// The window will always be below normal windows.

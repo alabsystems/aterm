@@ -10,7 +10,7 @@ The aterm-gpu-web and aterm-wasm crates, and individual files marked with
 
 This source distribution includes a modified copy of this upstream crate:
 
-- winit 0.30.13, Apache-2.0 (`crates/aterm-window/`)
+- winit 0.30.13, Apache-2.0 AND MIT (`crates/aterm-window/`)
 
 It retains its upstream license text. The winit copy is
 absorbed: it is `crates/aterm-window/` (the cargo package `aterm-window`), a
@@ -26,7 +26,11 @@ its own (its Wayland KDE blur support is removed), and it defines its own
 key-text `SmolStr`. Its `dpi` module is derived from dpi 0.1.2
 (Apache-2.0, from the winit project; only the crate's Apache-2.0 part), and its
 `CursorIcon` from cursor-icon 1.2.0 by Kirill Chibisov (MIT OR Apache-2.0 OR
-Zlib, used under Apache-2.0). Modified and added files carry prominent notices.
+Zlib, used under Apache-2.0). Its `src/frame_shadow.rs` (the shadow margin
+around a client-decorated Wayland window) is derived from sctk-adwaita 0.10.1
+by Bartłomiej Maryńczak, MIT, and stays MIT: see
+`crates/aterm-window/LICENSE-MIT-sctk-adwaita`. Modified and added files carry
+prominent notices.
 
 `crates/aterm-lz4/` is a modified, block-mode-only subset derived from
 lz4_flex 0.11.5 by Pascal Seitz and contributors. Its upstream-derived files
@@ -114,7 +118,12 @@ Corporation (the windows-rs project), licensed MIT OR Apache-2.0: `src/core.rs`,
 `src/Win32.rs` and `src/Win32/` hold the subset of upstream's declarations
 aterm's Windows graph reads, and its `link!` macro is derived from windows-link
 0.2.1 (the same project, under the same terms). Each generated file names the
-upstream file it came from. See `crates/aterm-win32/LICENSE-MIT` and
+upstream file it came from. Two hand-written modules derive from the same
+project under the same terms: `src/com.rs`'s `IUnknown_Vtbl` from windows-core
+0.62.2 (`src/unknown.rs`), and `src/dxgi.rs`, the DXGI declarations aterm
+calls, from windows 0.62.2 (`src/Windows/Win32/Graphics/Dxgi/mod.rs` and
+`src/Windows/Win32/Graphics/Dxgi/Common/mod.rs`); each names its upstream
+files. See `crates/aterm-win32/LICENSE-MIT` and
 `crates/aterm-win32/LICENSE-APACHE`.
 
 `crates/aterm-pty/src/windows/openconsole.rs` is a port of

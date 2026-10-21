@@ -83,10 +83,6 @@ use crate::{child_output, launch_isolation};
 /// socket itself is never polled: the instance says so ([`arm_ready`]).
 pub const POLL_GAP: Duration = Duration::from_millis(20);
 
-/// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD; a base that would
-/// overflow it (with margin) is refused instead of failing deep in `bind`.
-pub const MAX_SOCK_PATH: usize = 100;
-
 /// One booted headless instance plus its scratch world, torn down (kill, reap,
 /// remove) on every exit path — Drop runs on panic too, so a failing assert
 /// never leaks a live aterm or a scratch dir.
@@ -183,13 +179,14 @@ pub fn is_socket_or_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// A fresh exclusively created scratch root whose socket path fits `sun_path`:
-/// `$TMPDIR` (via `temp_dir`), else `/tmp`, prepared by
-/// [`launch_isolation::prepare`]. A failed attempt drops only the directory this
-/// call created; a standing path is never adopted or removed. The returned path
-/// transfers that ownership to its caller (an [`Instance`] removes it). When no
-/// base can be created, fits or can be prepared, the test is COULD NOT RUN: an
-/// environment refusal.
+/// A fresh exclusively created scratch root whose socket path fits `sun_path`
+/// as its clients dial it ([`launch_isolation::sock_fits`]: the instance's
+/// harness host dials the canonical spelling): `$TMPDIR` (via `temp_dir`), else
+/// `/tmp`, prepared by [`launch_isolation::prepare`]. A failed attempt drops
+/// only the directory this call created; a standing path is never adopted or
+/// removed. The returned path transfers that ownership to its caller (an
+/// [`Instance`] removes it). When no base can be created, fits or can be
+/// prepared, the test is COULD NOT RUN: an environment refusal.
 #[track_caller]
 pub fn scratch_root(prefix: &str) -> PathBuf {
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
@@ -199,8 +196,7 @@ pub fn scratch_root(prefix: &str) -> PathBuf {
         else {
             continue;
         };
-        let sock = root.path().join("run/aterm/aterm.sock");
-        if sock.as_os_str().len() >= MAX_SOCK_PATH {
+        if !launch_isolation::sock_fits(&root.path().join("run/aterm/aterm.sock")) {
             continue;
         }
         if launch_isolation::prepare(root.path()).is_err() {

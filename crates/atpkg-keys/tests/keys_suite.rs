@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The atpkg-keys integration files as modules of ONE test binary: each file
-//! keeps its path (so every citation of `crates/atpkg-keys/tests/<file>.rs`
-//! still resolves) and its own `#[test]`s.
+//! The atpkg-keys integration files as modules of one test binary; each keeps its path and
+//! its own `#[test]`s. `autotests = false` in `Cargo.toml`, so a `tests/*.rs` file listed
+//! neither here nor as its own `[[test]]` never compiles.
 //!
-//! `provision_cli` drives the binary on a real terminal, from `pty`, the one pty
-//! fixture. It hands the child its slave by descriptor, so no test calls
-//! `ptsname(3)` and no lock guards its static buffer. Nothing below sets the environment, installs a
-//! hook or an allocator, or keeps a process global; every child the tests
-//! start gets its environment on its own command.
-//!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
+//! Nothing here sets the environment or installs a hook or an allocator: every child the
+//! tests start gets its environment on its own command. The one process global is
+//! `provision_cli`'s `Once` that settles libSystem's libnotify state before the first fork.
 //!
 //! Run one file's tests with
 //! `targo --unverified test -p atpkg-keys --test keys_suite -- <file>::`.

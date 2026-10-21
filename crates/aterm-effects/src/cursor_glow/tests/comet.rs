@@ -5,8 +5,7 @@
 
 use super::*;
 
-/// `comet` and `beam` each graduated to their own variant; `lumen` stays
-/// the plain Lumen tracer (raw-string routing in the GUI resolver untouched).
+/// `comet`, `beam` and `lumen` each parse to their own variant.
 #[test]
 fn comet_parses_apart_from_beam_and_lumen() {
     assert_eq!(GlowStyle::parse("comet"), GlowStyle::Comet);

@@ -1,76 +1,50 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shell `shell.d` hooks (§16): generate `~/.aterm/shell.d/00-atpkg.{zsh,bash,fish,ps1}` from
-//! COMPILED-IN templates only — never artifact-supplied — with fish-safety (never emit a
-//! POSIX `.sh`; actively delete a stray one). The `.ps1` is what wires the managed bin/ onto
-//! PATH on Windows (and cross-platform pwsh), where no zsh/bash/fish runs the POSIX hooks.
+//! Shell hooks: `~/.aterm/shell.d/00-atpkg.{zsh,bash,fish,ps1}`, generated from compiled-in
+//! templates only, never artifact-supplied. Never a POSIX `.sh` (fish sources `*.sh`); a
+//! stray one is deleted. The `.ps1` serves PowerShell, where no POSIX hook runs.
 //!
-//! This is what puts the atpkg-managed `bin/` on an interactive shell's PATH outside aterm
-//! (inside it, the spawn seam appends the same entry from the first tab on,
-//! [`crate::session_bin_dir`]), and it **APPENDS** it (append-not-prepend, mirroring
-//! [`crate::store::append_bin_to_path`]) so a managed tool can never shadow system
-//! `sudo`/`ssh`/`git` even on the interactive PATH.
-//! The ONE exception (owner decision 2026-09-10): `<prefix>/agents/`
-//! ([`crate::store::Layout::agents_dir`]), which holds nothing but the agent programs'
-//! shims (`claude`, `codex` — [`crate::stub::AGENT_PROGRAMS`]), is MOVED TO THE FRONT as a
-//! separate element (`ATPKG_AGENTS`), so the managed copy of a coding agent runs ahead of a
-//! vendor's native install or a brew cask. `bin/` stays last; the deny-list keeps its
-//! meaning, because `agents/` can only ever carry those two names.
+//! The hook appends the managed `bin/` (as [`crate::store::append_bin_to_path`] does), so a
+//! managed tool never shadows system `sudo`/`ssh`/`git`. Outside aterm it is what puts `bin/`
+//! on an interactive shell's PATH; inside, the spawn seam appends the same entry from the
+//! first tab on ([`crate::session_bin_dir`]). `bin/` is unconditional, since the Trust
+//! toolchain is the default compiler in any terminal, and written first, so a parse error in
+//! the gated half cannot cost it: a shell abandons a sourced file at the error.
 //!
-//! AND THAT EXCEPTION IS SCOPED: the agents dir leads **INSIDE ATERM ONLY** (owner ask
-//! 2026-09-22; docs/DESIGN-which-copy-runs-2026-08-27.md: *"the managed copy is the one that
-//! runs **inside an aterm session**"*). Outside aterm a `claude` typed in iTerm runs the
-//! user's own install, which its vendor's updater can move forward.
+//! The gated half applies only inside aterm (any of [`AGENTS_MARKERS`] set):
 //!
-//! THE REROUTE DIRECTORY RIDES THAT GATE, IN FRONT (owner ruling 2026-09-27).
-//! `<prefix>/reroute` ([`crate::reroute`]) holds the stubs that announce `targo` and then run
-//! the upstream `cargo`/`rustc` asked for; they only answer when they come FIRST, and a
-//! login shell's `path_helper` and rc lines push the spawn seam's front-insert behind
-//! `/opt/homebrew/bin` (measured: position 12-14). A window tab's shell integration
-//! re-asserts it from `$ATERM_REROUTE_DIR`; the transparent-session lane carries no
-//! integration by design, and the rc-sourced hook is the one thing both lanes run after the
-//! user's startup files. So the gated arm writes `reroute:agents:…` — every earlier mention
-//! of either removed first, the seam's own order — except under `aterm --no-reroute`'s
-//! marker ([`crate::reroute::PASSTHROUGH_ENV`], read as the stubs read it), where only agents
-//! is prepended. Outside aterm the false arm takes the reroute dir OUT, exactly as it does
-//! agents, so an iTerm launched from an aterm tab heals. For the reroute dir alone, "inside
-//! aterm" also counts a non-empty [`crate::reroute::REROUTE_DIR_ENV`] — the seams' handle,
-//! read and never set — because a TTY launch whose front door handed no agents dir is still
-//! an aterm-hosted shell.
+//! * `<prefix>/agents/` ([`crate::store::Layout::agents_dir`]), which holds only the agent
+//!   programs' shims ([`crate::stub::AGENT_PROGRAMS`]) and so cannot shadow a system tool,
+//!   moves to the front (`ATPKG_AGENTS`), so the managed agent runs ahead of a vendor's
+//!   install. Outside aterm the user's own install runs
+//!   (docs/DESIGN-which-copy-runs-2026-08-27.md).
+//! * `<prefix>/reroute` ([`crate::reroute`]) goes in front of that: its stubs only answer
+//!   when they come first, and a login shell's `path_helper` and rc lines push the spawn
+//!   seam's front-insert down the PATH. A window tab's shell integration re-asserts it, but
+//!   the transparent-session lane has none, and the rc-sourced hook is the one thing both
+//!   run after the user's startup files. So the gated arm writes `reroute:agents:…`, except
+//!   under `aterm --no-reroute` ([`crate::reroute::PASSTHROUGH_ENV`]). For this dir alone a
+//!   non-empty [`crate::reroute::REROUTE_DIR_ENV`] also counts as inside aterm.
 //!
-//! What is NOT scoped, and must never be: `bin/`. The Trust toolchain and the verifiers are
-//! the default compiler on this machine in ANY terminal (owner standing instruction), so the
-//! bin half stays unconditional. It is written FIRST so a parse error in the gated half can
-//! never cost the toolchain: a shell abandons a sourced file at the error and runs nothing
-//! after it (the POSIX body's comment has the measurement).
+//! Outside aterm the false arm takes both dirs out, so a shell that inherited an aterm PATH
+//! heals. Each dir is moved to the front, never skipped when present: on a macOS login
+//! shell `path_helper` and rc prepends put other copies ahead, so the failure is an order,
+//! not a presence. aterm's shell integration re-asserts `ATPKG_AGENTS` after the user's rc
+//! files have run.
 //!
-//! MOVE-TO-FRONT, NEVER SKIP-IF-PRESENT. "Already on PATH?" is always yes on a macOS login
-//! shell, where `/etc/zprofile`'s `path_helper` and a `~/.zshrc` prepend put brew's and
-//! `~/.local/bin`'s agents ahead of it; the failure is an ORDER, not a presence. So every
-//! occurrence is removed, then prepended, and aterm's own shell integration re-asserts
-//! `ATPKG_AGENTS` after the user's rc files have run.
+//! `~/.aterm/shell.d` is sourced by aterm's shell integration inside a session, and from the
+//! user's own rc through the marker-bounded block [`ensure_rc_sources_hooks`] writes (which
+//! rc files, and why), so an ordinary interactive shell (Terminal.app, ssh, an agent's shell)
+//! gets the tools too (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Only rc files that
+//! exist are edited (`aterm pkg doctor` prints the PATH line for the rest), and an rc that
+//! resolves under a macOS-protected folder ([`crate::protected`]) is never opened: the wiring
+//! runs unattended and would raise a consent dialog with nobody at the screen.
 //!
-//! REACH: `~/.aterm/shell.d` is sourced from two places. aterm's own shell integration
-//! sources it for shells INSIDE an aterm session; and [`ensure_rc_sources_hooks`] adds a
-//! marker-bounded block to the user's `~/.zshrc` / `~/.bashrc` / `~/.bash_profile` / fish
-//! config so an ORDINARY interactive shell — Terminal.app, iTerm, VS Code, ssh, an agent's
-//! shell — gets the managed tools too (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md,
-//! B9). zsh reads `~/.zshrc` for every interactive shell; bash reads `~/.bashrc` ONLY for an
-//! interactive NON-login shell, and a LOGIN shell (Terminal.app, iTerm, ssh, `bash -l`)
-//! reads `~/.bash_profile` instead, so both are targets sourcing the same `00-atpkg.bash`
-//! (measured on macOS `/bin/bash` 3.2.57). `~/.profile` is deliberately NOT one: `sh`/dash
-//! logins read it, and the hook body (`${x//p/r}`) is not written for them. Nothing is
-//! invented: it edits only rc files that already exist, and `aterm pkg doctor` prints the
-//! PATH line for the rest. It never OPENS an rc that resolves under a macOS-protected folder
-//! ([`crate::protected`]): the wiring runs unattended, and a symlinked `~/.zshrc` into
-//! `~/Documents` or iCloud Drive would raise the folder consent dialog with nobody at the
-//! screen. Such an rc is left as it is; doctor's PATH line is the way in.
-//!
-//! `~/.aterm/shell.d` is OUTSIDE the managed prefix, so [`refresh`] hardens both `~/.aterm`
-//! and `~/.aterm/shell.d` with `ensure_private_dir` (symlink-refusing, `0700`, fail-closed)
-//! BEFORE writing, and each file is written `0600` via temp + rename. Entirely best-effort:
-//! a hook write NEVER fails an install.
+//! `~/.aterm/shell.d` is outside the managed prefix, so [`refresh`] hardens `~/.aterm` and
+//! `~/.aterm/shell.d` with `ensure_private_dir` (symlink-refusing, `0700`, fail-closed)
+//! before writing, and each file is written `0600` via temp + rename. Best-effort: a hook
+//! write never fails an install.
 
 use std::fs;
 use std::io;
@@ -79,24 +53,19 @@ use std::path::Path;
 use crate::platform::ensure_private_dir;
 use crate::store::Layout;
 
-/// The hook file base name (`00-` sorts first; distinct from any `aterm-pkg`-era name).
+/// The hook file base name (`00-` sorts first).
 pub const HOOK_BASENAME: &str = "00-atpkg";
 
-/// "THIS IS INSIDE ATERM": the environment variables whose UNION — any one of them
-/// non-empty — says a shell or a process runs inside an aterm session, so the managed
-/// agent programs lead there (owner ask 2026-09-22). A union because no single marker
+/// The environment variables whose union (any one non-empty) says a process runs inside an
+/// aterm session, where the managed agent programs lead. A union because no single marker
 /// covers every lane: the GUI exports `ATERM_CHILD` and `ATERM_SESSION_ID` but not
-/// `ATERM_AGENTS_DIR`, and `aterm --session` launched from another terminal carries
-/// `ATERM_AGENTS_DIR` and deliberately neither of the others. `TERM_PROGRAM` is NOT one:
-/// any shell rc can reset it, so it cannot decide which binary runs. No escape widens it
-/// past aterm (the owner's rule is "NOT ENV VARS"); `aterm claude` runs the managed copy
-/// from any terminal.
+/// `ATERM_AGENTS_DIR`, and `aterm --session` launched from another terminal carries only
+/// `ATERM_AGENTS_DIR`. `TERM_PROGRAM` is not one: any rc can reset it. `aterm claude` runs
+/// the managed copy from any terminal.
 ///
-/// THE ONE LIST. Every dialect's agents gate in [`hook_files`] is rendered from it, and so
-/// is the exec-time decision of the agents' reroute stubs
-/// ([`crate::reroute::agents_stub_body_sh`]) — the hook decides at SHELL START
-/// and the stub when the program RUNS, and the two can only agree if they read the same
-/// markers.
+/// The one list: every dialect's agents gate in [`hook_files`] and the agents' reroute stubs
+/// ([`crate::reroute::agents_stub_body_sh`]) are rendered from it, so the hook (at shell
+/// start) and the stub (when the program runs) agree.
 pub const AGENTS_MARKERS: &[&str] = &["ATERM_AGENTS_DIR", "ATERM_CHILD", "ATERM_SESSION_ID"];
 
 /// [`AGENTS_MARKERS`] as one POSIX word that is empty exactly when none is set:
@@ -110,13 +79,11 @@ pub fn agents_markers_sh() -> String {
         .collect()
 }
 
-/// The hook file `shell` — the basename of `$SHELL` — sources: `00-atpkg.zsh`,
-/// `00-atpkg.bash`, `00-atpkg.fish`, `00-atpkg.ps1` (`pwsh`/`powershell`); NOT `sh` — the
-/// bash hook's body uses `${var//pat/rep}`, which a POSIX `sh` (dash) rejects, so a
-/// `$SHELL=/bin/sh` user gets the `PATH` line instead;
-/// `None` for a shell atpkg writes no hook for (nushell, xonsh, cmd). One table for
-/// `rc_hook_wired`, [`hook_file`] and the remedy `doctor`/`which` print
-/// ([`crate::cli::shell_remedy_command`]) — the same four files [`write_hooks`] lays.
+/// The hook file `shell` (the basename of `$SHELL`) sources: `00-atpkg.zsh`, `.bash`,
+/// `.fish`, or `.ps1` for `pwsh`/`powershell`. Not `sh`: the bash body uses
+/// `${var//pat/rep}`, which dash rejects, so a `$SHELL=/bin/sh` user gets the `PATH` line.
+/// `None` for a shell with no hook (nushell, xonsh, cmd). One table for `rc_hook_wired`,
+/// [`hook_file`] and the remedy `doctor`/`which` print ([`crate::cli::shell_remedy_command`]).
 #[must_use]
 pub fn hook_for_shell(shell: &str) -> Option<&'static str> {
     match shell {
@@ -128,12 +95,10 @@ pub fn hook_for_shell(shell: &str) -> Option<&'static str> {
     }
 }
 
-/// `<home>/.aterm/shell.d/<hook>` when the hook for `shell` EXISTS there as a regular file (a
-/// symlink is not ours — the writer refuses one, [`crate::platform::ensure_private_dir`]), paired
-/// with the hook's file name; `None` for a shell without a hook or a hook never written (an install
-/// whose hook write failed, a `HOME` atpkg has not seen). The predicate behind the one remedy
-/// `doctor`/`which` name: the hook is sourced in place where it stands, and only where it does not
-/// stand is a `PATH` line printed instead.
+/// `<home>/.aterm/shell.d/<hook>` and the hook's file name, when the hook for `shell` exists
+/// there as a regular file (a symlink is not ours); `None` for a shell without a hook or a
+/// hook never written. `doctor`/`which` source the hook in place where it stands and print a
+/// `PATH` line only where it does not.
 #[must_use]
 pub fn hook_file(home: &Path, shell: &str) -> Option<(std::path::PathBuf, &'static str)> {
     let hook = hook_for_shell(shell)?;
@@ -144,9 +109,8 @@ pub fn hook_file(home: &Path, shell: &str) -> Option<(std::path::PathBuf, &'stat
         .map(|_| (path, hook))
 }
 
-/// Whether `home`'s `~/.aterm/shell.d` holds an atpkg hook for any shell ([`hook_file`]):
-/// [`write_hooks`] lays every dialect or none, so one is enough to say the hook that appends
-/// `bin/` is there for every interactive shell that sources it.
+/// Whether `~/.aterm/shell.d` under `home` holds an atpkg hook for any shell ([`hook_file`]).
+/// [`write_hooks`] lays every dialect or none, so one stands for all.
 #[must_use]
 pub fn written(home: &Path) -> bool {
     ["zsh", "bash", "fish", "pwsh"]
@@ -154,18 +118,15 @@ pub fn written(home: &Path) -> bool {
         .any(|shell| hook_file(home, shell).is_some())
 }
 
-/// Whether `shell` — the basename of `$SHELL`: `zsh`, `bash`, `fish` — has an rc under
-/// `home` that SOURCES the atpkg hook, paired with that hook's file name; `None` for a
-/// shell the table does not know. "Sources" is read off the rc itself: the marker block
-/// [`ensure_rc_sources_hooks`] writes, or a hand-written line naming the hook file (a
-/// `.zprofile` wired by the owner counts). Read-only, and an rc under a protected root is
-/// NOT opened — the consent fence the writer keeps — so it answers
-/// "not wired" there, which names the remedy that works either way.
+/// Whether `shell` (`zsh`, `bash`, `fish`) has an rc under `home` that sources the atpkg
+/// hook, paired with the hook's file name; `None` for a shell the table does not know. Read
+/// off the rc itself: the marker block [`ensure_rc_sources_hooks`] writes, or a hand-written
+/// line naming the hook file. An rc under a protected root is not opened (the writer's
+/// consent fence), so it answers "not wired" there.
 ///
-/// A FACT, NOT A REMEDY: `exec $SHELL` inside an aterm tab LOSES the tab's shell
-/// integration (the zsh wrapper consumes `ATERM_ORIGINAL_ZDOTDIR` before sourcing; bash
-/// rides `--rcfile`), so [`crate::cli::shell_remedy_command`] names the hook source
-/// everywhere and keys only on whether the hook FILE exists ([`hook_file`]).
+/// A fact, not a remedy: `exec $SHELL` inside an aterm tab loses the tab's shell
+/// integration, so [`crate::cli::shell_remedy_command`] keys only on whether the hook file
+/// exists ([`hook_file`]).
 #[must_use]
 #[cfg(all(test, unix))]
 pub(crate) fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static str)> {
@@ -189,12 +150,9 @@ pub(crate) fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static 
     Some((wired, hook))
 }
 
-/// The `(filename, content)` for each shell dialect, parametrized on `bin_dir` (APPENDED),
-/// `agents_dir` (MOVED TO THE FRONT — the agent programs' shims, module doc) and
-/// `reroute_dir` (moved in FRONT OF THAT, inside aterm only and not under `aterm
-/// --no-reroute` — [`crate::reroute`]'s stubs, module doc; "inside aterm" for this one
-/// dir also counts a non-empty `$ATERM_REROUTE_DIR`).
-/// NEVER a `.sh` (fish sources `*.sh`, which a POSIX body would break).
+/// The `(filename, content)` for each shell dialect: `bin_dir` appended, `agents_dir` moved
+/// to the front and `reroute_dir` in front of that, inside aterm only (module doc). Never a
+/// `.sh`: fish sources `*.sh`, which a POSIX body would break.
 #[must_use]
 pub fn hook_files(bin_dir: &Path, agents_dir: &Path, reroute_dir: &Path) -> Vec<(String, String)> {
     let bin = sh_quote(bin_dir);
@@ -205,14 +163,13 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path, reroute_dir: &Path) -> Vec<
     let fish_bin = fish_quote(bin_dir);
     let fish_agents = fish_quote(agents_dir);
     let fish_reroute = fish_quote(reroute_dir);
-    // The `aterm --no-reroute` marker, read by the reroute half of the gated arm in each
-    // dialect — the constant the stubs read ([`crate::reroute::PASSTHROUGH_ENV`]), with
-    // their reading ([`crate::reroute::engaged`]: non-empty and not "0").
+    // The `aterm --no-reroute` marker, read as the stubs read it
+    // ([`crate::reroute::engaged`]: non-empty and not "0").
     let passthrough = crate::reroute::PASSTHROUGH_ENV;
-    // The spawn seams' reroute handle ([`crate::reroute::REROUTE_DIR_ENV`]), READ — never
-    // set — by the reroute half as one more "inside aterm" marker, for that half only.
+    // The spawn seams' reroute handle ([`crate::reroute::REROUTE_DIR_ENV`]), read and never
+    // set: one more "inside aterm" marker, for the reroute half only.
     let reroute_marker = crate::reroute::REROUTE_DIR_ENV;
-    // The agents gate in each dialect, rendered from THE ONE LIST ([`AGENTS_MARKERS`]).
+    // The agents gate in each dialect, rendered from the one list ([`AGENTS_MARKERS`]).
     let markers_sh = agents_markers_sh();
     let markers_fish: String = AGENTS_MARKERS.iter().map(|m| format!("${m}")).collect();
     let markers_ps: String = AGENTS_MARKERS
@@ -220,39 +177,26 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path, reroute_dir: &Path) -> Vec<
         .map(|m| format!("$env:{m}"))
         .collect::<Vec<_>>()
         .join(" -or ");
-    // POSIX (zsh + bash, down to macOS's bash 3.2): the managed bin/ is an idempotent
-    // APPEND, and the agents dir is MOVED TO THE FRONT **ONLY INSIDE ATERM** — two
-    // elements, two variables, so neither can mask the other; quoted for a space in
-    // "Application Support".
+    // POSIX (zsh + bash, down to macOS's bash 3.2): bin/ is an idempotent append; agents and
+    // reroute move to the front only inside aterm. Paths are quoted for a space in
+    // "Application Support". The bin half comes first in every dialect (module doc); that
+    // matters most for fish and PowerShell, whose shells a stock macOS lacks to test with.
     //
-    // THE BIN HALF IS EMITTED FIRST, AND THAT ORDER IS LOAD-BEARING. A shell abandons a
-    // sourced file at a parse error and runs nothing after it, so whichever half is last is
-    // the one a future typo costs. Measured with the same injected typo in the agents gate:
-    // agents-first left `PATH=/usr/bin:/bin` with `ATPKG_BIN` unset — the Trust toolchain
-    // gone from EVERY terminal — while bin-first kept both. This matters most for the fish
-    // and PowerShell bodies, which cannot be executed on a stock macOS box at all.
+    // The false arm demotes rather than merely declining to promote: it writes PATH back
+    // without either dir and unsets ATPKG_AGENTS, so a shell that inherited an agents-first
+    // PATH (an iTerm launched from an aterm tab) heals.
     //
-    // THE AGENTS GATE is the union of [`AGENTS_MARKERS`] (its doc says why a union). The
-    // false arm DEMOTES rather than merely declining to promote: it writes PATH back without
-    // the agents element and unsets ATPKG_AGENTS, so a shell that INHERITED an agents-first
-    // PATH (an iTerm launched from an aterm tab) heals itself.
+    // The move frames PATH as `:$PATH:` so /opt/x never matches /opt/xy, removes every
+    // `:dir:` to a fixpoint by POSIX `[ = ]` (never `[[ == ]]`, which `nocasematch` bends),
+    // then strips one framing colon from each end so an empty entry (the user's "here")
+    // survives. Both arms decide on the framed remainder: only `:` means nothing is left,
+    // and the stripped string would drop a sole empty entry (`:dir`, `dir:`, `dir::dir`).
     //
-    // Both arms decide on the FRAMED remainder, never the stripped one. The move is the
-    // integration's reroute idiom: frame PATH as `:$PATH:` so /opt/x never matches /opt/xy,
-    // remove every `:dir:` to a fixpoint by POSIX `[ = ]` (never a `[[ == ]]` pattern,
-    // which `nocasematch` bends), then strip exactly one framing colon from each end so an
-    // EMPTY entry — "here", the user's — survives. Only a framed remainder of exactly `:`
-    // means nothing is left; deciding on the STRIPPED string would drop a sole empty entry
-    // (`:dir`, `dir:`, `dir::dir`).
-    //
-    // THE REROUTE DIR RIDES THE SAME GATE, IN FRONT OF AGENTS (module doc). Both dirs are
-    // removed in ONE loop, so the gated arm writes `reroute:agents:…`, the spawn seam's own
-    // order. `__atpkg_front` is built in two steps: agents iff a marker (ATPKG_AGENTS
-    // exported with it, unset otherwise), then the reroute dir ahead of it iff a marker or a
-    // non-empty `$ATERM_REROUTE_DIR`, and the passthrough marker not engaged. Only aterm's
-    // seams set that handle, and each blanks an inherited one under `--no-reroute` or with
-    // nothing laid, so it never widens the agents half. An empty front writes exactly the
-    // PATH the false arm writes.
+    // `__atpkg_front` is built in two steps: agents iff a marker (ATPKG_AGENTS exported with
+    // it, unset otherwise), then the reroute dir ahead of it iff a marker or a non-empty
+    // `$ATERM_REROUTE_DIR`, and the passthrough marker not engaged. Only aterm's seams set
+    // that handle, and each blanks an inherited one under `--no-reroute` or with nothing
+    // laid, so it never widens the agents half. An empty front writes the false arm's PATH.
     let posix = format!(
         "# Generated by atpkg -- DO NOT EDIT (rewritten on every install/update).\n\
          __atpkg_bin=\"{bin}\"\n\
@@ -272,19 +216,14 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path, reroute_dir: &Path) -> Vec<
          esac\n\
          unset __atpkg_agents __atpkg_reroute __atpkg_front __atpkg_p __atpkg_q\n"
     );
-    // fish: the agents dir moved to the front by an explicit equality loop (`string match`
-    // would read the directory as a wildcard pattern; the quoted `"$__atpkg_d"` keeps an
-    // empty entry), bin/ appended after $PATH; fish `set` syntax, no POSIX export. The list
-    // is grown with `set __atpkg_rest $__atpkg_rest …`, never `set -a`: fish 2.x has no
-    // `-a`, the append fails there, the list stays empty, and the final `set -gx PATH` would
-    // leave PATH as the agents dir alone. This file is sourced from a plain config.fish too,
-    // where an old fish may run. The reroute dir (the POSIX body's comment) is dropped by
-    // the same loop and leads `$__atpkg_front`, a list declared at the file's top level — a
-    // `set -l` inside the `if` would die with the block — unless the passthrough marker is
-    // engaged (non-empty and not "0"). It is built as the POSIX `__atpkg_front` is: empty,
-    // agents iff a marker, then the reroute dir ahead iff a marker or `$ATERM_REROUTE_DIR` (an unset
-    // fish variable expands to nothing inside the quotes), under a NESTED `if` so the
-    // passthrough test keeps the `if …; or …` shape fish 2.x already parses here.
+    // fish: both dirs are dropped by an explicit equality loop (`string match` would read a
+    // directory as a wildcard pattern; the quoted `"$__atpkg_d"` keeps an empty entry), bin/
+    // appended after $PATH. The list grows by `set __atpkg_rest $__atpkg_rest …`, never
+    // `set -a`, which fish 2.x lacks (the list would stay empty and PATH would be the front
+    // alone); a plain config.fish may run an old fish. `__atpkg_front` is declared at top
+    // level (a `set -l` inside the `if` dies with the block) and built as the POSIX one is,
+    // under a nested `if` so the passthrough test keeps the `if …; or …` shape fish 2.x
+    // parses. An unset fish variable expands to nothing inside the quotes.
     let fish = format!(
         "# Generated by atpkg -- DO NOT EDIT (rewritten on every install/update).\n\
          set -l __atpkg_bin \"{fish_bin}\"\n\
@@ -299,16 +238,12 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path, reroute_dir: &Path) -> Vec<
          for __atpkg_d in $PATH; if test \"$__atpkg_d\" != \"$__atpkg_agents\"; and test \"$__atpkg_d\" != \"$__atpkg_reroute\"; set __atpkg_rest $__atpkg_rest \"$__atpkg_d\"; end; end\n\
          set -gx PATH $__atpkg_front $__atpkg_rest\n"
     );
-    // PowerShell (Windows-native, and cross-platform pwsh): the aterm PowerShell integration
-    // dot-sources `~/.aterm/shell.d/*.ps1`, so this is the ONLY thing that puts the managed
-    // dirs on an interactive PowerShell's PATH — on Windows there is no zsh/bash/fish to run
-    // the POSIX hooks above. Same shape as the POSIX policy (agents moved to the front, bin/
-    // appended, each idempotent) using `[System.IO.Path]::PathSeparator` (';' on Windows, ':'
-    // on Unix), so it is correct wherever pwsh runs. The reroute dir leads the gated arm as
-    // in the POSIX body; Windows lays no stubs there (crate::reroute), so on Windows it is
-    // an entry that finds nothing. Its gate is the POSIX one too: the
-    // union, or `$env:ATERM_REROUTE_DIR`, parenthesised — PowerShell's `-or` and `-and`
-    // share ONE precedence, left to right, so the grouping is spelled, never implied.
+    // PowerShell (Windows, and pwsh anywhere): the aterm PowerShell integration dot-sources
+    // `~/.aterm/shell.d/*.ps1`, so this is the only thing that puts the managed dirs on its
+    // PATH. The POSIX policy, split on `[System.IO.Path]::PathSeparator` so it is correct
+    // wherever pwsh runs; Windows lays no reroute stubs, so that entry finds nothing there.
+    // `-or` and `-and` share one precedence, left to right, so the reroute gate's grouping
+    // is spelled out.
     let ps_bin = ps_quote(bin_dir);
     let ps_agents = ps_quote(agents_dir);
     let ps_reroute = ps_quote(reroute_dir);
@@ -337,7 +272,7 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path, reroute_dir: &Path) -> Vec<
 
 /// Whether the hook at `dest` is already `content`: a regular file (never a link), those
 /// exact bytes, and — on Unix — mode `0600`, the one [`stage_hook`] lays.
-fn hook_is_current(dest: &Path, content: &str) -> bool {
+pub(crate) fn hook_is_current(dest: &Path, content: &str) -> bool {
     let Ok(meta) = fs::symlink_metadata(dest) else {
         return false;
     };
@@ -362,9 +297,8 @@ enum Prev {
     Absent,
     /// The previous pass's hook — a regular file — moved aside to this path.
     Saved(std::path::PathBuf),
-    /// Something that is not a regular file (a directory, a link, a device), left exactly
-    /// where it is: the rename that follows fails on it as it always has, and an unwind has
-    /// nothing it could put back.
+    /// Something that is not a regular file (a directory, a link, a device), left where it
+    /// is: the rename that follows fails on it, and an unwind has nothing to put back.
     Foreign,
 }
 
@@ -406,22 +340,21 @@ fn restore_prev(dest: &Path, prev: Prev) {
 }
 
 /// Write the dialect hooks into `shell_d` (each `0600` via temp + rename) and delete a
-/// stray POSIX `00-atpkg.sh` (fish-safety). Returns every dialect's file name now in place.
+/// stray POSIX `00-atpkg.sh`. Returns every dialect's file name now in place.
 ///
-/// ONLY A HOOK WHOSE BYTES DIFFER IS WRITTEN: a rename gives the file a new inode, and
-/// every open zsh re-sources a hook whose inode moved at its next prompt. A hook already
-/// current (a regular file, these bytes, `0600`) is left exactly as it is.
+/// Only a hook whose bytes differ is written: a rename gives the file a new inode, and every
+/// open zsh re-sources a hook whose inode moved at its next prompt.
 pub fn write_hooks(
     shell_d: &Path,
     bin_dir: &Path,
     agents_dir: &Path,
     reroute_dir: &Path,
 ) -> io::Result<Vec<String>> {
-    // Stage every temp, then rename every destination; both phases are all-or-nothing.
-    // The dialects are only correct as a set — one shell reads each — so a partial publish
-    // leaves some carrying the new PATH policy and some the old. Each destination's previous
-    // file is moved aside and put back if a later rename fails, so a failed publish leaves
-    // `shell.d` as it found it and the next pass retries hooks and rc wiring together.
+    // Stage every temp, then rename every destination; both phases are all-or-nothing. The
+    // dialects are only correct as a set, so a partial publish would leave shells on
+    // different PATH policies. Each previous file is moved aside and put back if a later
+    // rename fails, so a failed publish leaves `shell.d` as it was and the next pass retries
+    // hooks and rc wiring together.
     let files = hook_files(bin_dir, agents_dir, reroute_dir);
     let current: Vec<String> = files
         .iter()
@@ -454,8 +387,7 @@ pub fn write_hooks(
             for (done, was) in std::mem::take(&mut published).into_iter().rev() {
                 restore_prev(&done, was);
             }
-            // Carry nothing over: the temps that have not been renamed are this pass's
-            // litter, and `shell.d` is swept by nobody.
+            // The temps not yet renamed are litter, and nobody sweeps `shell.d`.
             for (rest, _, _) in &staged[index..] {
                 let _ = fs::remove_file(rest);
             }
@@ -470,8 +402,7 @@ pub fn write_hooks(
             let _ = fs::remove_file(&saved);
         }
     }
-    // fish-safety: a POSIX `.sh` here is fatal (fish sources *.sh too). Never emitted above;
-    // actively remove a hand-dropped one.
+    // fish-safety: fish sources *.sh too, so remove a hand-dropped POSIX `.sh`.
     let stray = shell_d.join(format!("{HOOK_BASENAME}.sh"));
     if stray.exists() {
         let _ = fs::remove_file(&stray);
@@ -479,13 +410,138 @@ pub fn write_hooks(
     Ok(written)
 }
 
-/// What one hooks pass did, so a caller that prints its result states what happened rather
-/// than what it attempted. No variant is an error to a caller — a hooks pass never fails an
-/// install — but "rewritten" is claimed only where it is true.
+/// The hooks under `home`'s `~/.aterm/shell.d` that are not as [`write_hooks`] lays them
+/// for `layout` — missing, other bytes, another mode, a link in a hook's place ([`hook_is_current`])
+/// — and the stray POSIX `00-atpkg.sh` it removes: what `base.shell.hooks` reads. Changes
+/// nothing.
+pub(crate) fn hooks_not_current(layout: &Layout, home: &Path) -> Vec<String> {
+    let shell_d = home.join(".aterm").join("shell.d");
+    let mut stale: Vec<String> = hook_files(
+        &layout.bin_dir(),
+        &layout.agents_dir(),
+        &layout.reroute_dir(),
+    )
+    .into_iter()
+    .filter(|(name, content)| !hook_is_current(&shell_d.join(name), content))
+    .map(|(name, _)| name)
+    .collect();
+    let stray = format!("{HOOK_BASENAME}.sh");
+    if shell_d.join(&stray).exists() {
+        stale.push(stray);
+    }
+    stale
+}
+
+/// `home`'s `~/.aterm` and `~/.aterm/shell.d` that stand but not as [`lay_hooks`] leaves
+/// them (`ensure_private_dir`): a symlink or a file in a directory's place, or (Unix) a
+/// directory another uid owns or whose mode is not `0700`. Login shells source what is in
+/// them, so `base.shell.hooks` reads these with the hooks and its apply hardens them, or
+/// fails on what it may not harden. Changes nothing.
+pub(crate) fn shell_dirs_not_private(home: &Path) -> Vec<std::path::PathBuf> {
+    let aterm = home.join(".aterm");
+    let shell_d = aterm.join("shell.d");
+    [aterm, shell_d]
+        .into_iter()
+        .filter(|dir| fs::symlink_metadata(dir).is_ok_and(|meta| !laid_private(&meta)))
+        .collect()
+}
+
+/// Whether `meta` (an `lstat`) is a directory as `ensure_private_dir` leaves it.
+fn laid_private(meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        meta.file_type().is_dir()
+            && crate::platform::dir_meta_is_private(meta)
+            && meta.mode() & 0o7777 == 0o700
+    }
+    #[cfg(not(unix))]
+    {
+        meta.file_type().is_dir()
+    }
+}
+
+/// Harden `home`'s `~/.aterm` and `~/.aterm/shell.d` and write the hooks for `layout`
+/// ([`write_hooks`]): the apply of `base.shell.hooks`, the first half of a pass
+/// ([`refresh_at`]) without the rc wiring and the command links, which are items of their
+/// own. `Err` names what refused.
+pub(crate) fn lay_hooks(layout: &Layout, home: &Path) -> Result<(), String> {
+    let aterm = home.join(".aterm");
+    let shell_d = aterm.join("shell.d");
+    for dir in [&aterm, &shell_d] {
+        ensure_private_dir(dir).map_err(|e| {
+            format!(
+                "{} could not be made your own private (0700) directory ({e}); a symlink, a \
+                 foreign owner or a group/other-writable mode there is refused",
+                dir.display()
+            )
+        })?;
+    }
+    write_hooks(
+        &shell_d,
+        &layout.bin_dir(),
+        &layout.agents_dir(),
+        &layout.reroute_dir(),
+    )
+    .map(|_| ())
+    .map_err(|e| format!("a hook in {} could not be written ({e})", shell_d.display()))
+}
+
+/// The command links [`ensure_command_links_from`] would write for the executable at `exe`
+/// (canonical) under `home`, in the order it writes them: each with `None` where nothing
+/// stands at its name, or with the target of the link into another `aterm.app` bundle it
+/// re-points (a bundle moved from `~/Downloads` to `/Applications` leaves one dangling).
+/// What `base.shell.links` reads, by the pass's own rule ([`link_act`]). Empty where this
+/// executable lays none ([`command_link_source`]) or `~/.local/bin` is behind a consent
+/// fence ([`command_links_dir`]). Changes nothing.
+#[cfg(unix)]
+pub(crate) fn command_links_to_write(
+    home: &Path,
+    exe: &Path,
+) -> Vec<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    let (Some(macos), Some(bin)) = (command_link_source(exe), command_links_dir(home)) else {
+        return Vec::new();
+    };
+    let mut writes = Vec::new();
+    // `amacs` follows `aterm` as the pass leaves it: re-pointed here, or as it stands.
+    let mut aterm_settled = false;
+    for name in COMMAND_LINKS {
+        let target = macos.join(name);
+        if !target.exists() {
+            continue;
+        }
+        let link = bin.join(name);
+        let settled = aterm_settled
+            || fs::read_link(bin.join("aterm")).is_ok_and(|aterm| aterm == macos.join("aterm"));
+        if let Some(act) = link_act(&link, &target, name, settled) {
+            aterm_settled |= name == "aterm";
+            writes.push((link, act));
+        }
+    }
+    writes
+}
+
+/// The argv0 aliases [`heal_store_aliases`] would lay beside the store-installed aterm at
+/// `exe` (canonical): each with nothing at its name. Empty where `exe` runs from no store.
+#[cfg(unix)]
+pub(crate) fn store_aliases_absent(exe: &Path) -> Vec<std::path::PathBuf> {
+    store_dir_of(exe, canonical).map_or_else(Vec::new, |store| {
+        aterm_types::argv0::ALIASES
+            .into_iter()
+            .map(|name| store.join(name))
+            .filter(|alias| {
+                fs::symlink_metadata(alias).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            })
+            .collect()
+    })
+}
+
+/// What one hooks pass did, so a caller that prints it states what happened. No variant is
+/// an error to a caller (a hooks pass never fails an install).
 ///
-/// Only [`HookPass::Rewritten`] carries rc outcomes, because the rc step runs only once the
-/// hooks are on disk (the block never leads the hooks, [`refresh_at`]); the list is empty
-/// off unix, where no rc is wired, and on a home where no `RC_FILES` row exists.
+/// Only [`HookPass::Rewritten`] carries rc outcomes, since the rc step runs only once the
+/// hooks are on disk ([`refresh_at`]); the list is empty off unix and where no `RC_FILES`
+/// row exists.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HookPass {
     /// `~/.aterm` and `~/.aterm/shell.d` were hardened and the hook files are on disk as
@@ -493,18 +549,16 @@ pub enum HookPass {
     /// One [`RcOutcome`] per rc file that exists, in `RC_FILES` order.
     Rewritten(Vec<(&'static str, RcOutcome)>),
     /// The directories were hardened, a hook file could not be written, and the rc step was
-    /// therefore skipped — a block naming a hook that is not there sources nothing, and
-    /// being marker-bounded no later pass would rewrite it.
+    /// skipped: a block naming a missing hook sources nothing and no later pass rewrites it.
     HooksNotWritten,
     /// `$HOME` is unknown, or `~/.aterm` / `~/.aterm/shell.d` could not be made the
     /// user's own `0700` directory ([`ensure_private_dir`] refuses a symlink, a foreign
     /// owner or a group/other-writable mode): nothing was touched, no rc was read.
     NotHardened,
-    /// The UNATTENDED pass ran from an app bundle that is not the release `aterm.app` — a
-    /// dev bundle from `ship dev-app`, a renamed copy — and wrote nothing: the shell
-    /// hooks, the rc blocks and the command links are the release's to lay
-    /// ([`in_release_bundle`]) — a stale dev bundle would lay stale hooks. `atpkg repair`
-    /// from such a bundle — the asked-for pass — still writes.
+    /// The unattended pass ran from an app bundle that is not the release `aterm.app` (a dev
+    /// bundle from `ship dev-app`, a renamed copy) and wrote nothing: the shell hooks, rc
+    /// blocks and command links are the release's to lay ([`in_release_bundle`]), and a
+    /// stale dev bundle would lay stale hooks. `atpkg repair` from such a bundle still writes.
     NotReleaseBundle,
 }
 
@@ -520,11 +574,9 @@ impl HookPass {
     }
 }
 
-/// What one pass did to one rc file that exists. An absent rc has no outcome: atpkg never
-/// creates one. Carried in [`HookPass`] so `atpkg repair` prints one line per rc — what it
-/// wrote, what it left alone, and what it skipped and why — instead of one sentence that
-/// claimed "rc wiring" either way. Users and agents are sent to `repair` for unrelated
-/// reasons too, so re-laying an opt-out must be announced, never implied.
+/// What one pass did to one rc file that exists (atpkg never creates one), so `atpkg
+/// repair` prints a line per rc. People are sent to `repair` for unrelated reasons too, so
+/// re-laying an opt-out is announced, never implied.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RcOutcome {
     /// The rc already carried atpkg's block; nothing was written to it.
@@ -542,9 +594,8 @@ pub enum RcOutcome {
     /// The rc exists but is not something atpkg edits: a dangling link, not a regular
     /// file, or not UTF-8. Left untouched.
     Unreadable,
-    /// The rewrite was attempted and failed; the rc is unchanged. Either the rc or its
-    /// directory refused the write (a dotfile linked into a read-only store), or the
-    /// temp could not be created exclusively beside it.
+    /// The rewrite was attempted and failed; the rc is unchanged (the rc or its directory
+    /// refused the write, or the temp could not be created exclusively beside it).
     WriteFailed,
 }
 
@@ -559,30 +610,29 @@ pub enum RcOutcome {
 /// same pass first lays any argv0 alias missing beside a store-installed aterm
 /// ([`ensure_store_aliases`]).
 ///
-/// This is the UNATTENDED pass (install, seed, the six-hourly `update`), so its rc wiring
-/// HONOURS THE OPT-OUT the block itself documents: an rc that was wired once and no longer
-/// carries the block is left exactly as the user left it ([`RC_LEDGER`]).
-/// [`refresh_rewiring_rc`] is the deliberate pass that writes it back.
+/// Callers: the seed, right after it lays the pending stubs (so `bin/` is on a shell's PATH
+/// before anything installs), the end of every update pass, an install, and
+/// `uninstall --all`. The hooks name the three managed directories and nothing installed in
+/// them, so they are valid before anything installs.
 ///
-/// The returned [`HookPass`] says what the pass did. Every unattended caller discards it;
-/// `atpkg repair` is the one caller that reports it.
+/// The unattended pass (install, seed, the six-hourly `update`), so its rc wiring honours
+/// the opt-out the block documents: an rc wired once that no longer carries the block is
+/// left as the user left it ([`RC_LEDGER`]). [`refresh_rewiring_rc`] writes it back. Every
+/// caller discards the returned [`HookPass`]; `atpkg repair` reports the rewiring pass's.
 pub fn refresh(layout: &Layout) -> HookPass {
     refresh_with(layout, RcWiring::HonorOptOut)
 }
 
-/// [`refresh`], but the rc block is written back even where the user removed it — the
-/// ASKED-FOR pass, and only that: `atpkg repair`, whose own output promises it rewrote the
-/// shell integration. It is the way back in after an opt-out, so opting out costs nobody a
-/// hand-edited dotfile to undo.
-///
-/// The returned [`HookPass`] names each rc it re-laid ([`RcOutcome::RelaidOverOptOut`]),
-/// so `repair` can say so with the way back out instead of re-laying it silently.
+/// [`refresh`], but the rc block is written back even where the user removed it: the
+/// asked-for pass (`atpkg repair`) and only that, so opting out never costs a hand-edited
+/// dotfile to undo. The returned [`HookPass`] names each rc it re-laid
+/// ([`RcOutcome::RelaidOverOptOut`]), so `repair` says so.
 pub fn refresh_rewiring_rc(layout: &Layout) -> HookPass {
     refresh_with(layout, RcWiring::Rewire)
 }
 
-/// What a pass does with an rc whose block the user DELETED (the opt-out the block's own
-/// text documents): an unattended pass leaves it deleted; `repair` writes it back.
+/// What a pass does with an rc whose block the user deleted: an unattended pass leaves it
+/// deleted; `repair` writes it back.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RcWiring {
     /// An rc recorded in [`RC_LEDGER`] that no longer carries the block is skipped.
@@ -600,7 +650,7 @@ fn refresh_with(layout: &Layout, wiring: RcWiring) -> HookPass {
 /// Whether the hooks pass completes a store's argv0 aliases ([`heal_store_aliases`]): off
 /// macOS only. A macOS app's aliases arrive with each update, which swaps the whole bundle,
 /// and the macOS store lane is the source build, whose `install.sh` re-run lays them.
-const HEALS_STORE: bool = cfg!(unix) && !cfg!(target_os = "macos");
+pub(crate) const HEALS_STORE: bool = cfg!(unix) && !cfg!(target_os = "macos");
 
 /// [`refresh_with`] as the executable at `exe` (canonical) runs it, for the account whose
 /// home is `home`, healing a store when `heals_store` ([`HEALS_STORE`]). All three are
@@ -676,22 +726,21 @@ pub(crate) fn ensure_store_aliases(store: &Path) -> Vec<&'static str> {
 /// store ([`store_dir_of`]); anywhere else, nothing. The pass runs it where
 /// [`HEALS_STORE`] says.
 #[cfg(unix)]
-fn heal_store_aliases(exe: &Path) -> Vec<&'static str> {
+pub(crate) fn heal_store_aliases(exe: &Path) -> Vec<&'static str> {
     store_dir_of(exe, canonical).map_or_else(Vec::new, ensure_store_aliases)
 }
 
 /// The file `path` resolves to, links followed, or `None` where nothing is: the
 /// production `resolve` of [`store_dir_of`].
 #[cfg(unix)]
-fn canonical(path: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn canonical(path: &Path) -> Option<std::path::PathBuf> {
     fs::canonicalize(path).ok()
 }
 
-/// [`pass_at`] as the executable at `exe` runs it: the UNATTENDED pass
+/// [`pass_at`] as the executable at `exe` runs it: the unattended pass
 /// ([`RcWiring::HonorOptOut`]) from a bundle that is not the release `aterm.app` writes
 /// nothing ([`HookPass::NotReleaseBundle`]); the asked-for pass ([`RcWiring::Rewire`],
-/// `atpkg repair`) runs from anywhere. `exe` is injected so a test drives the rule on a
-/// synthetic home.
+/// `atpkg repair`) runs from anywhere.
 fn pass_as(layout: &Layout, home: &Path, wiring: RcWiring, exe: Option<&Path>) -> HookPass {
     if wiring == RcWiring::HonorOptOut && exe.is_some_and(is_non_release_bundle_exe) {
         return HookPass::NotReleaseBundle;
@@ -699,9 +748,8 @@ fn pass_as(layout: &Layout, home: &Path, wiring: RcWiring, exe: Option<&Path>) -
     pass_at(layout, home, wiring)
 }
 
-/// One whole pass against a known `home`, as [`refresh_with`] runs it — so a test in
-/// another module (`cli`'s repair report, `doctor`'s rc lines) can drive the real pass on
-/// a synthetic home instead of the account running the tests.
+/// One whole pass against a known `home`, as [`refresh_with`] runs it, so a test in another
+/// module (`cli`'s repair report, `doctor`'s rc lines) can drive it on a synthetic home.
 pub(crate) fn pass_at(layout: &Layout, home: &Path, wiring: RcWiring) -> HookPass {
     refresh_at(
         home,
@@ -712,14 +760,12 @@ pub(crate) fn pass_at(layout: &Layout, home: &Path, wiring: RcWiring) -> HookPas
     )
 }
 
-/// [`refresh_with`] over an explicit `home` and the three managed directories, so a test
-/// can drive a whole pass under a throwaway home.
+/// [`refresh_with`] over an explicit `home` and the three managed directories.
 ///
-/// The block never leads the hooks. The rc block is the only thing that makes a hook
-/// reachable from an ordinary shell, and it goes into a file atpkg does not own, so it may
-/// only be written once the hook it names is on disk: a marker-bounded block naming a file
-/// that was never written sources nothing, and no later pass rewrites it. The wiring runs
-/// only when the hooks are there, and the next pass retries the two together.
+/// The block never leads the hooks: it goes into a file atpkg does not own, and a
+/// marker-bounded block naming a hook that was never written sources nothing while no later
+/// pass rewrites it. So the wiring runs only once the hooks are on disk, and the next pass
+/// retries the two together.
 fn refresh_at(
     home: &Path,
     bin_dir: &Path,
@@ -763,40 +809,33 @@ pub(crate) const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
 pub(crate) const RC_END: &str = "# <<< atpkg shell integration <<<";
 
 /// The rc files atpkg wires: each row is a path relative to `$HOME` and the `shell.d` hook
-/// it sources — the one roster, so the pass that writes the block and the report that names
-/// its state ([`rc_wiring`]) can never disagree about which files are atpkg's. Each is the
-/// startup file of a shell whose hook dialect exists in [`hook_files`], and atpkg edits one
-/// only when it already exists.
+/// it sources. The one roster, so the pass that writes the block and the report of its
+/// state ([`rc_wiring`]) agree. atpkg edits one only when it already exists.
 ///
-/// A shell that reads none of these four is not wired by atpkg: fish with `$XDG_CONFIG_HOME`
-/// set reads a different `config.fish`, and a login bash with no `~/.bash_profile` falls
-/// through to `~/.bash_login` and then `~/.profile`, neither of which is a row.
-/// `aterm pkg doctor`'s PATH line is the way in for those.
+/// A shell that reads none of these is not wired: fish with `$XDG_CONFIG_HOME` set reads a
+/// different `config.fish`, and a login bash with no `~/.bash_profile` falls through to
+/// `~/.bash_login` and `~/.profile`. `aterm pkg doctor`'s PATH line is the way in for those.
 #[cfg(unix)]
 pub(crate) const RC_FILES: [(&str, &str); 4] = [
     (".zshrc", "00-atpkg.zsh"),
     (".bashrc", "00-atpkg.bash"),
-    // The login bash rc ([`ensure_rc_sources_hooks`]): the same hook, reached by the shell
-    // Terminal.app actually opens.
+    // The login bash rc: the same hook, reached by the shell Terminal.app opens.
     (".bash_profile", "00-atpkg.bash"),
     (".config/fish/config.fish", "00-atpkg.fish"),
 ];
 
-/// `~/.aterm/rc-wired` — the rc files this machine has wired, one canonical path per
-/// line. It is what makes the block's OWN SENTENCE true.
+/// `~/.aterm/rc-wired`: the rc files this machine has wired, one canonical path per line.
 ///
-/// The block says "delete this block to opt out", but [`refresh`] runs unconditionally
-/// from install, every launch's seed and the six-hourly background `update`: with the marker as
-/// the only idempotency check, the opt-out would last until the next pass.
+/// The block says "delete this block to opt out", but [`refresh`] runs from install, every
+/// launch's seed and the six-hourly `update`, so with the marker as the only check the
+/// opt-out would last until the next pass. A wired rc is recorded here, and a recorded rc that no
+/// longer carries the block is the user's opt-out and is skipped. A pass also records an rc
+/// it finds already wired, so the first deletion on a machine wired before the ledger is
+/// honoured too.
 ///
-/// So a wired rc is RECORDED here, and a recorded rc that no longer carries the block is
-/// read as the user's opt-out and skipped. A pass also records an rc it finds ALREADY
-/// wired, so a machine wired by an older build gets its entry on the first pass after the
-/// upgrade and the FIRST deletion there is honoured too.
-///
-/// State, not trust, and cheap to lose: a wiped `~/.aterm` costs one re-add, and two
-/// passes racing cost at most one lost entry (each writes the union of what it read and
-/// what it wired). [`refresh_rewiring_rc`] ignores it on purpose — that is the way back.
+/// State, not trust, and cheap to lose: a wiped `~/.aterm` costs one re-add, and two passes
+/// racing cost at most one lost entry (each writes the union of what it read and what it
+/// wired). [`refresh_rewiring_rc`] ignores it on purpose: that is the way back.
 #[cfg(unix)]
 const RC_LEDGER: &str = "rc-wired";
 
@@ -805,8 +844,8 @@ fn rc_ledger_path(home: &Path) -> std::path::PathBuf {
     home.join(".aterm").join(RC_LEDGER)
 }
 
-/// The recorded rc paths, or an empty set when the ledger is absent or unreadable — a
-/// missing ledger means "nothing has been wired yet", which is what a fresh home is.
+/// The recorded rc paths; empty when the ledger is absent or unreadable, which is what a
+/// fresh home is.
 #[cfg(unix)]
 fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
     fs::read_to_string(rc_ledger_path(home))
@@ -820,14 +859,9 @@ fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Record `real` as wired, best-effort (0600, temp + rename, the discipline every other
-/// file here is written with). Already recorded ⇒ no write at all, so the ordinary pass —
-/// every rc already in the ledger — touches nothing.
-///
-/// A path containing a NEWLINE cannot be one line of a line-per-path file, so it is left
-/// out rather than written as two entries that would each mean something else: such an rc
-/// keeps the old behaviour (wired again by the next pass) and the rest of the ledger stays
-/// exactly what it says it is.
+/// Record `real` as wired, best-effort (0600, temp + rename). Already recorded means no
+/// write, so the ordinary pass touches nothing. A path containing a newline cannot be one
+/// line of the ledger, so it is left out: such an rc is wired again by the next pass.
 #[cfg(unix)]
 fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTreeSet<String>) {
     let entry = real.to_string_lossy().into_owned();
@@ -846,84 +880,61 @@ fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTre
     let _ = atomic_write(&rc_ledger_path(home), &body);
 }
 
-/// Source the `shell.d` hooks from the user's own rc, so the managed toolchain is on
-/// PATH in EVERY shell — Terminal.app, iTerm, VS Code, ssh, an agent's shell — not only
-/// inside an aterm session.
+/// Source the `shell.d` hooks from the user's own rc, so the managed toolchain is on PATH in
+/// every shell (Terminal.app, iTerm, VS Code, ssh, an agent's shell), not only inside an
+/// aterm session.
 ///
-/// Until this existed, `shell.d` was written on every install and sourced only by
-/// aterm's own integration, so `trustc` was not found anywhere else and `doctor` could
-/// only print a PATH line for the user to paste by hand. For a product whose users run
-/// coding agents in other terminals that is most of the value of installing a toolchain
-/// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md, B9).
+/// Conservative about a file it does not own:
+/// * only rc files that already exist are edited;
+/// * the block is bounded by [`RC_BEGIN`]/[`RC_END`], so it is idempotent and a user can
+///   delete it in one motion, and a deletion stays deleted ([`RC_LEDGER`]);
+/// * it sources `shell.d` rather than inlining a PATH, so there is one generator and the
+///   path survives a prefix move;
+/// * the hook path is double-quoted, so a home with a space sources the hook;
+/// * every step is best-effort: wiring PATH never fails an install.
 ///
-/// Deliberately conservative about touching a file it does not own:
-/// * only rc files that ALREADY EXIST are edited — atpkg never creates a shell's rc;
-/// * the block is bounded by [`RC_BEGIN`]/[`RC_END`] so it is idempotent (present ⇒
-///   nothing happens) and a user can delete it in one motion — and a deletion STAYS
-///   deleted, because a wired rc is recorded in [`RC_LEDGER`] and a recorded rc that no
-///   longer carries the block is this pass's evidence that the user opted out;
-/// * it SOURCES `shell.d` rather than inlining a PATH, so the path stays correct after
-///   the prefix moves and there is exactly one generator;
-/// * the hook path is written DOUBLE-QUOTED, so a home with a space (`/Users//Jane Doe`)
-///   sources the hook instead of erroring at every shell start;
-/// * the sourced hook appends the managed `bin/`, never prepends it, so a managed tool
-///   cannot shadow system `sudo`/`ssh`/`git` (the agents dir it prepends can only ever
-///   carry `claude`/`codex` — module doc);
-/// * every step is best-effort — wiring PATH must never fail an install.
+/// bash gets two targets because it reads them for different shells (macOS `/bin/bash`
+/// 3.2.57): a login shell (a Terminal.app tab, ssh, `bash -l`) reads `.bash_profile` alone,
+/// `bash -i` reads `.bashrc` alone, and with no `.bash_profile` a login falls through to
+/// `.profile`. Both source the same `00-atpkg.bash`; a `.bash_profile` that sources
+/// `.bashrc` runs it twice, which the hook tolerates (bin/ presence-guarded, the front dirs
+/// moved, never duplicated). A home with a `.bashrc` and no `.bash_profile` gets nothing
+/// invented. `~/.bash_login` and `~/.profile` are not rows: `sh`/dash logins read
+/// `.profile`, and the hook body (`${x//p/r}`) is not written for them.
 ///
-/// bash gets TWO targets, `~/.bashrc` and `~/.bash_profile`, because bash reads them for DIFFERENT
-/// shells (measured on macOS `/bin/bash` 3.2.57, each rc echoing its name): `bash -l -i` — a
-/// Terminal.app or iTerm tab, an ssh login, `bash -l` — printed `.bash_profile` alone; `bash -i`
-/// printed `.bashrc` alone; with `.bash_profile` removed the login shell fell through to
-/// `.profile`. Both rows source the same `00-atpkg.bash`; a `.bash_profile` that itself sources
-/// `.bashrc` runs it twice, which the hook is built for (bin/ presence-guarded, agents/
-/// move-to-front — the real-shell test pins a second source as a no-op). The never-create rule
-/// stands: a home with a `.bashrc` and no `.bash_profile` gets nothing invented (many users source
-/// `.bashrc` from a `.bash_profile` of their own, and a file we invent is ours forever).
-/// `~/.bash_login` and `~/.profile` are NOT rows — this module has never reasoned about `.profile`,
-/// and it is read by `sh`/dash logins the bash/zsh hook body (`${x//p/r}`) is not written for;
-/// `aterm pkg doctor`'s PATH line is the way in for those.
-///
-/// Returns one [`RcOutcome`] per row that exists, in [`RC_FILES`] order, so `atpkg repair`
-/// can print what happened to each rc instead of one sentence about all of them. An absent
-/// row is not in the list at all: atpkg never creates an rc.
+/// Returns one [`RcOutcome`] per row that exists, in [`RC_FILES`] order.
 #[cfg(unix)]
-fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, RcOutcome)> {
+pub(crate) fn ensure_rc_sources_hooks(
+    home: &Path,
+    wiring: RcWiring,
+) -> Vec<(&'static str, RcOutcome)> {
     // Both sides of the protected-root comparison canonical: `$TMPDIR` and a home
     // reached through a link both spell `/private/…` once resolved.
     let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    // Read once for the whole pass: the four rows share it, and each write folds its own
-    // entry back in ([`record_rc_wired`]).
+    // Read once for the whole pass; each write folds its own entry back in.
     let mut ledger = read_rc_ledger(home);
     let mut outcomes: Vec<(&'static str, RcOutcome)> = Vec::new();
-    // Each row is independent — an absent one is skipped below, never created.
     for (rc, hook) in RC_FILES {
         let rc_path = home.join(rc);
-        // Never CREATE an rc: a shell the user does not use should not gain one, and a
-        // file we invent is a file we own forever. `lstat` and `realpath` are
-        // metadata-only (design §1.5) and gated nowhere, so finding out where the rc
+        // Never create an rc: a shell the user does not use should not gain one. `lstat`
+        // and `realpath` are metadata-only and gated nowhere, so finding where the rc
         // really lives costs no consent.
         if fs::symlink_metadata(&rc_path).is_err() {
             continue;
         }
-        // Write to the FILE the rc names, never over a link: a symlinked rc (stow,
-        // yadm/chezmoi, home-manager, a dotfiles repo) renamed over became a detached
-        // 0644 copy the dotfile never saw. Resolved for a
-        // Regular rc too: `~/.config` is itself a link in the same setups, and the file it
-        // leads to is the one every call below would open. A dangling link, or anything that
-        // is not a regular file, is left alone.
+        // Write to the file the rc names, never over a link: renaming over a symlinked rc
+        // (stow, yadm/chezmoi, home-manager) leaves a detached copy the dotfile never sees.
+        // Resolved for a regular rc too, since `~/.config` is itself a link in such setups.
+        // A dangling link, or anything that is not a regular file, is left alone.
         let Ok(real) = fs::canonicalize(&rc_path) else {
             outcomes.push((rc, RcOutcome::Unreadable));
             continue;
         };
-        // THE CONSENT FENCE. This runs on the six-hourly pass
-        // and at the first-launch seed, with nobody at the screen. A dotfile that
-        // resolves under `~/Documents`, iCloud Drive or a mounted volume is opened by
-        // the read below, and that open is exactly what raises the macOS folder dialog
-        // — in aterm's name, at a moment nobody chose, parking this pass on a modal
-        // that has no timeout. The rc stays unwired; the owner can wire it by hand from
-        // a shell (a deliberate touch, which may prompt), and `aterm pkg doctor` prints
-        // the PATH line either way.
+        // The consent fence: this runs on the six-hourly pass and the first-launch seed,
+        // with nobody at the screen. Opening a dotfile that resolves under `~/Documents`,
+        // iCloud Drive or a mounted volume raises the macOS folder dialog in aterm's name
+        // and parks the pass on a modal with no timeout. The rc stays unwired; the owner can
+        // wire it by hand, and `aterm pkg doctor` prints the PATH line either way.
         if crate::protected::under_protected_root(&canonical_home, &real) {
             outcomes.push((rc, RcOutcome::ConsentFenced));
             continue;
@@ -941,37 +952,30 @@ fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, 
             continue;
         };
         if existing.contains(RC_BEGIN) {
-            // Already wired; the hook body itself is what gets refreshed. Record it —
-            // including an rc wired by a build that predates the ledger — so that the
-            // NEXT deletion is read as the opt-out the block promises.
+            // Already wired; the hook body is what gets refreshed. Record it (including an
+            // rc wired before the ledger existed) so the next deletion reads as the opt-out.
             record_rc_wired(home, &real, &mut ledger);
             outcomes.push((rc, RcOutcome::AlreadyWired));
             continue;
         }
-        // THE OPT-OUT, HONOURED. This rc carried the block once and does not now, so the
-        // user deleted it exactly as the block told them to. An unattended pass — an
-        // install, a seed, the six-hourly `update` — must not undo a user's edit to their
-        // own dotfile; `atpkg repair` ([`refresh_rewiring_rc`]) is the pass that asks for
-        // it back — and it says which rc it re-laid, so the deletion is never undone
-        // silently ([`RcOutcome::RelaidOverOptOut`]).
+        // The opt-out, honoured: this rc carried the block once and does not now, so the
+        // user deleted it as the block told them to. An unattended pass leaves it; `atpkg
+        // repair` ([`refresh_rewiring_rc`]) puts it back and says so
+        // ([`RcOutcome::RelaidOverOptOut`]).
         let opted_out = ledger.contains(real.to_string_lossy().as_ref());
         if wiring == RcWiring::HonorOptOut && opted_out {
             outcomes.push((rc, RcOutcome::OptOutKept));
             continue;
         }
         let hook_path = home.join(".aterm").join("shell.d").join(hook);
-        // DOUBLE-QUOTED, both interpolations. `sh_quote`'s contract is a double-quoted
-        // context (its doc): bare, a HOME with a space (`/Users//Jane Doe`) word-splits, `[`
-        // gets too many arguments, and the hook is NEVER sourced. The block is
-        // marker-bounded, so a bad line is never rewritten by a later pass — it has to be
-        // born right (the real-shell test below replays it in bash and zsh).
+        // Double-quoted, both interpolations (`sh_quote`'s contract): bare, a HOME with a
+        // space word-splits and the hook is never sourced. The block is marker-bounded, so
+        // no later pass rewrites a bad line; it has to be born right.
         //
-        // Status-neutral in both dialects: this line is the last thing many rc files run,
-        // so the status it leaves is the `$?` the user's first prompt reads.
-        // `[ -f "<hook>" ] && . "<hook>"` is an `&&` list, so with the hook absent the test
-        // fails, nothing is sourced, and the list exits 1 — every prompt that renders the
-        // last status then opens showing a failure with nothing to blame. `if …; then …; fi`
-        // reports the sourced hook's own status, and 0 when there is nothing to source.
+        // Status-neutral in both dialects: this is the last line many rc files run, so its
+        // status is the `$?` the first prompt reads. `[ -f … ] && . …` exits 1 when the hook
+        // is absent; `if …; then …; fi` reports the hook's own status, and 0 when there is
+        // nothing to source.
         let line = if hook.ends_with(".fish") {
             format!(
                 "if test -f \"{p}\"; source \"{p}\"; end",
@@ -994,10 +998,9 @@ fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, 
              {line}\n\
              {RC_END}\n"
         ));
-        // Same temp+rename discipline the hook files use: a reader never sees a
-        // half-written rc, and a failure leaves the original untouched. The temp sits
-        // beside the real file (same filesystem, so the rename replaces it and not the
-        // link) and carries its mode, so a 0600 rc stays 0600. A directory we cannot
+        // Temp + rename: a reader never sees a half-written rc, and a failure leaves the
+        // original untouched. The temp sits beside the real file (same filesystem, so the
+        // rename replaces it and not the link) and carries its mode. A directory we cannot
         // write (a link into the read-only /nix/store) fails here and changes nothing.
         let Some(name) = real.file_name() else {
             outcomes.push((rc, RcOutcome::Unreadable));
@@ -1031,14 +1034,10 @@ fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, 
     outcomes
 }
 
-/// The login profiles `tools/install.sh`'s `path_block_rc_target` can elect for bash on
-/// macOS that atpkg has no row for, relative to `$HOME`. Login bash reads the first of
-/// `~/.bash_profile`, `~/.bash_login`, `~/.profile` that exists; the first is one of
-/// [`RC_FILES`], and these two are the fall-through atpkg never wires.
-///
-/// atpkg never edits them; [`rc_wiring`] reads them, so `doctor` can see install.sh's own
-/// block there — a Mac whose bash was wired into `~/.bash_login` would otherwise read as
-/// "nothing sources shell.d".
+/// The bash login profiles `tools/install.sh`'s `path_block_rc_target` can elect that atpkg
+/// has no row for, relative to `$HOME`: login bash reads the first of `~/.bash_profile`,
+/// `~/.bash_login`, `~/.profile` that exists, and these are the fall-through. atpkg never
+/// edits them; [`rc_wiring`] reads them so `doctor` sees install.sh's block there.
 #[cfg(unix)]
 pub(crate) const INSTALL_SH_PROFILES: [&str; 2] = [".bash_login", ".profile"];
 
@@ -1059,19 +1058,17 @@ pub(crate) enum RcState {
     /// Left alone by every pass except `atpkg repair`.
     OptedOut,
     /// The rc exists, no [`RC_LEDGER`] entry records atpkg wiring it, and nothing else
-    /// sources `shell.d` from it either — so no pass has run since it appeared.
+    /// sources `shell.d` from it: no pass has run since it appeared.
     Unwired,
-    /// The rc resolves under a folder macOS guards with a consent dialog, so no pass will
-    /// open it ([`ensure_rc_sources_hooks`]'s consent fence) — and neither does this report,
-    /// which is why the state is about the path, not the contents. The one state a user
-    /// cannot diagnose alone: the rc looks ordinary and every pass leaves it untouched.
+    /// The rc resolves under a folder macOS guards with a consent dialog, so no pass opens it
+    /// ([`ensure_rc_sources_hooks`]'s consent fence), and neither does this report. A user
+    /// cannot diagnose it alone: the rc looks ordinary and every pass leaves it untouched.
     ConsentFenced,
 }
 
-/// How [`rc_wiring`] resolves one rc: exactly the steps [`ensure_rc_sources_hooks`] takes
-/// before it would write, so the report can never describe a file the pass would treat
-/// differently. `None` means there is nothing to report — the rc is absent, or it is not a
-/// regular UTF-8 file, which is one no pass will ever edit.
+/// How [`rc_wiring`] resolves one rc: the steps [`ensure_rc_sources_hooks`] takes before it
+/// would write, so the report never describes a file the pass would treat differently.
+/// `None`: the rc is absent, or not a regular UTF-8 file, which no pass edits.
 #[cfg(unix)]
 enum RcRead {
     /// The resolved target and its contents.
@@ -1085,8 +1082,8 @@ fn read_rc_for_report(canonical_home: &Path, rc_path: &Path) -> Option<RcRead> {
     // Never create, and never invent a row for a file that is not there.
     fs::symlink_metadata(rc_path).ok()?;
     let real = fs::canonicalize(rc_path).ok()?;
-    // The consent fence, before the open — doctor must not raise the dialog the
-    // unattended pass refuses to raise.
+    // The consent fence, before the open: doctor must not raise the dialog the unattended
+    // pass refuses to raise.
     if crate::protected::under_protected_root(canonical_home, &real) {
         return Some(RcRead::Fenced);
     }
@@ -1100,16 +1097,12 @@ fn read_rc_for_report(canonical_home: &Path, rc_path: &Path) -> Option<RcRead> {
 /// The rc-wiring state of each [`RC_FILES`] row that exists under `home`, in roster order,
 /// then each [`INSTALL_SH_PROFILES`] entry that sources `shell.d`.
 ///
-/// An absent rc is not listed: atpkg never creates one, so there is nothing to say about it
-/// beyond "not there" — and an rc no pass would edit (not a regular file, not UTF-8) is not
-/// listed either. Content is read before the ledger: an rc that sources `shell.d` through a
-/// foreign line ([`RcState::SourcedElsewhere`]) reaches the toolchain whether or not
-/// atpkg's own block was deleted from it. The install.sh profiles are read-only probes —
-/// atpkg never wires them, so the only state they can report is `SourcedElsewhere`, and one
-/// that does not source `shell.d` is not listed at all.
+/// An absent rc, or one no pass would edit (not a regular file, not UTF-8), is not listed.
+/// Content is read before the ledger: an rc that sources `shell.d` through a foreign line
+/// reaches the toolchain whether or not atpkg's block was deleted from it. The install.sh
+/// profiles are read-only probes, listed only as `SourcedElsewhere`.
 ///
-/// These six names ([`rc_files_read`]) are every file the report is measured on, which is
-/// why doctor names them instead of making a claim about the machine: `$ZDOTDIR`, `/etc`
+/// These six names ([`rc_files_read`]) are every file the report reads: `$ZDOTDIR`, `/etc`
 /// and fish under `$XDG_CONFIG_HOME` are neither wired nor read.
 #[cfg(unix)]
 pub(crate) fn rc_wiring(home: &Path) -> Vec<(&'static str, RcState)> {
@@ -1147,10 +1140,9 @@ pub(crate) fn rc_wiring(home: &Path) -> Vec<(&'static str, RcState)> {
     wiring
 }
 
-/// Every file [`rc_wiring`] reads, relative to `$HOME`, in the order it reports them: the
-/// four atpkg wires, then install.sh's two bash login fall-throughs. doctor lists exactly
-/// these when none of them sources `shell.d`, so its "none of …" line is a measurement of
-/// named files rather than a verdict on every shell the machine can start.
+/// Every file [`rc_wiring`] reads, relative to `$HOME`, in report order: the four atpkg
+/// wires, then install.sh's two bash login fall-throughs. doctor names exactly these when
+/// none sources `shell.d`, so its line measures named files, not every shell.
 #[cfg(unix)]
 pub(crate) fn rc_files_read() -> impl Iterator<Item = &'static str> {
     RC_FILES
@@ -1159,11 +1151,9 @@ pub(crate) fn rc_files_read() -> impl Iterator<Item = &'static str> {
         .chain(INSTALL_SH_PROFILES)
 }
 
-/// Whether `rc`'s contents source `~/.aterm/shell.d` through some line other than atpkg's
-/// own block: any non-comment line naming a path under `/.aterm/shell.d/` (`~/`, `$HOME/`,
-/// or spelled out). `tools/install.sh`'s `wire_shell_path` writes exactly such a line under
-/// its own marker pair, and a user may write one by hand. A commented-out line does not
-/// count: it sources nothing.
+/// Whether `rc` sources `~/.aterm/shell.d` through a line other than atpkg's block: any
+/// non-comment line naming a path under `/.aterm/shell.d/`, as `tools/install.sh`'s
+/// `wire_shell_path` writes or a user may by hand.
 #[cfg(unix)]
 fn sources_shell_d(rc: &str) -> bool {
     rc.lines()
@@ -1182,24 +1172,15 @@ fn sources_shell_d(rc: &str) -> bool {
 /// `/Applications/aterm.app/Contents/MacOS`, so without these links none of the commands
 /// is on any PATH outside aterm.
 ///
-/// Deliberately narrow: symlinks only, into the same `~/.local/bin` that
-/// `tools/install.sh` uses, and never over anything that is not already ours — a real file
-/// there is left for `repair` to move aside ([`move_aside_copied_commands`]). No dotfile is
-/// touched here; `atpkg doctor` still prints
-/// the rc line for putting the managed `bin/` itself on PATH.
+/// Symlinks only, into the `~/.local/bin` `tools/install.sh` uses, and never over anything
+/// not already ours: a real file there is left for `repair` ([`move_aside_copied_commands`]).
 ///
-/// AND ONLY FROM THE RELEASE BUNDLE. "Ours" is a link whose target lies in an `aterm.app`
-/// bundle ([`in_release_bundle`]), and this pass never writes a link it would itself
-/// refuse to repoint: a dev bundle (`aterm (dev).app`) planting them would take them from
-/// the release, which could never take them back. Aiming `aterm` at a dev build is
-/// `targo --unverified ship dev-app`'s job — a stated choice, which prints what it displaced and
-/// which `--no-link` declines — and never a side effect of launching it; `atpkg` stays
-/// with the release (`ship dev-app` never links it). The same rule keeps the unattended
-/// shell-hook pass ([`refresh`]) and the window's agent primer off a dev bundle.
-///
-/// Unix-only: the whole body is bundle-shaped (`Contents/MacOS`, `~/.local/bin`,
-/// POSIX symlinks), so on Windows it could only ever return early — and
-/// `std::os::unix::fs::symlink` does not exist there to compile against.
+/// Only from the release bundle: "ours" is a link into an `aterm.app` bundle
+/// ([`in_release_bundle`]), and this pass never writes a link it would refuse to repoint, so
+/// a dev bundle (`aterm (dev).app`) cannot take the names from the release. Aiming `aterm`
+/// at a dev build is `targo --unverified ship dev-app`'s stated choice (`--no-link` declines
+/// it), never a side effect of launching one. Unix-only: the body is bundle-shaped
+/// (`Contents/MacOS`, POSIX symlinks).
 #[cfg(unix)]
 fn ensure_command_links(home: &Path) {
     let Ok(exe) = std::env::current_exe() else {
@@ -1211,31 +1192,28 @@ fn ensure_command_links(home: &Path) {
     ensure_command_links_from(home, &exe);
 }
 
-/// Whether `path` lies inside a release-named `aterm.app` bundle's `Contents/MacOS` —
-/// the ONE spelling of "ours" for the unattended writers of shared user state: the test an
-/// existing command link's target must pass to be repointed, and the test the running
-/// executable must pass to write the links ([`ensure_command_links`]) or, unattended, the
-/// shell hooks ([`refresh`]). A dev bundle (`aterm (dev).app`), a renamed copy and a
-/// source tree all fail it. The cost of the name test, accepted: a release copy the user
-/// renamed (`aterm 2.app`, `Aterm.app`) lays no links either — renaming it back is the fix.
+/// Whether `path` lies inside a release-named `aterm.app` bundle's `Contents/MacOS`: the one
+/// spelling of "ours" for the unattended writers of shared user state, both for an existing
+/// command link's target and for the executable that writes the links
+/// ([`ensure_command_links`]) or, unattended, the shell hooks ([`refresh`]). A dev bundle
+/// (`aterm (dev).app`), a renamed copy and a source tree fail it; so does a release copy
+/// the user renamed, which renaming back fixes.
 fn in_release_bundle(path: &Path) -> bool {
     path.to_string_lossy()
         .contains("/aterm.app/Contents/MacOS/")
 }
 
-/// Whether the executable at `exe` (canonical) runs from inside an app bundle that is NOT
-/// the release `aterm.app` — the one case [`refresh`] and [`ensure_command_links`] stand
-/// aside for. A source build (`target/release/aterm`) is not a bundle and is not caught.
-fn is_non_release_bundle_exe(exe: &Path) -> bool {
+/// Whether the executable at `exe` (canonical) runs from an app bundle that is not the
+/// release `aterm.app`, the case [`refresh`] and [`ensure_command_links`] stand aside for.
+/// A source build (`target/release/aterm`) is not a bundle.
+pub(crate) fn is_non_release_bundle_exe(exe: &Path) -> bool {
     exe.parent().is_some_and(|d| d.ends_with("Contents/MacOS")) && !in_release_bundle(exe)
 }
 
-/// Whether THIS process runs from an app bundle that is not the release `aterm.app` (see
-/// [`is_non_release_bundle_exe`]). Public so the window's agent primer applies the same
-/// rule: a stale dev bundle must not rewrite `~/.claude/CLAUDE.md` and the skills with its
-/// older text.
-/// An executable that cannot be resolved answers `false` — the rule is a guard against one
-/// named shape, never a reason to stop a release install from working.
+/// Whether this process runs from an app bundle that is not the release `aterm.app`
+/// ([`is_non_release_bundle_exe`]). Public so the window's agent primer applies the same
+/// rule: a stale dev bundle must not rewrite `~/.claude/CLAUDE.md` and the skills. An
+/// executable that cannot be resolved answers `false`.
 #[must_use]
 pub fn runs_from_non_release_bundle() -> bool {
     std::env::current_exe()
@@ -1243,10 +1221,9 @@ pub fn runs_from_non_release_bundle() -> bool {
         .is_ok_and(|exe| is_non_release_bundle_exe(&exe))
 }
 
-/// [`ensure_command_links`] for the executable at `exe` (already canonical) — split out so
-/// the ownership rules can be driven by a test with a bundle tree of its own.
+/// [`ensure_command_links`] for the executable at `exe` (already canonical).
 #[cfg(unix)]
-fn ensure_command_links_from(home: &Path, exe: &Path) {
+pub(crate) fn ensure_command_links_from(home: &Path, exe: &Path) {
     let Some(macos) = command_link_source(exe) else {
         return;
     };
@@ -1262,42 +1239,57 @@ fn ensure_command_links_from(home: &Path, exe: &Path) {
             continue;
         }
         let link = bin.join(name);
-        match fs::symlink_metadata(&link) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                // Ours to repoint only if it already points into an `aterm.app` bundle;
-                // anything else — a dev bundle `ship dev-app` aimed `aterm` at,
-                // someone's own build — belongs to whoever put it there. TWO exceptions
-                // into another bundle's `Contents/MacOS`. `atpkg`: no tool states that
-                // choice (`ship dev-app` links `aterm` and `amacs`), so such a link is the
-                // leftover of this pass before it was release-only — a dev bundle's launch
-                // took it — and it goes back to the release. `amacs` FOLLOWS `aterm`: the
-                // editor client and the window it hands a file to are one binary, so once
-                // `aterm` here runs this release again (`tools/install.sh` relinks only
-                // `aterm` when a dev build rejoins the release), the editor comes back
-                // with it; while `aterm` is aimed at a dev bundle, so is `amacs`.
-                let in_a_bundle =
-                    |old: &Path| old.parent().is_some_and(|d| d.ends_with("Contents/MacOS"));
-                let ours = fs::read_link(&link).ok().is_some_and(|old| {
-                    in_release_bundle(&old)
-                        || (name == "atpkg" && in_a_bundle(&old))
-                        || (name == "amacs"
-                            && in_a_bundle(&old)
-                            && fs::read_link(bin.join("aterm"))
-                                .is_ok_and(|aterm| aterm == macos.join("aterm")))
-                });
-                if !ours || fs::read_link(&link).is_ok_and(|old| old == target) {
-                    continue;
-                }
+        // Read as it stands now: `aterm` was settled a moment ago.
+        let aterm_settled =
+            fs::read_link(bin.join("aterm")).is_ok_and(|aterm| aterm == macos.join("aterm"));
+        match link_act(&link, &target, name, aterm_settled) {
+            None => continue,
+            Some(Some(_)) => {
                 let _ = fs::remove_file(&link);
             }
-            // Not a link: a binary an install from before the links copied here, or
-            // someone's own build. Never touched unattended — `doctor` names it, and
-            // `repair` run from the installed app moves it aside
-            // ([`move_aside_copied_commands`]).
-            Ok(_) => continue,
-            Err(_) => {}
+            Some(None) => {}
         }
         let _ = std::os::unix::fs::symlink(&target, &link);
+    }
+}
+
+/// What the command-link pass does at `link` for its `target` (`name` one of
+/// [`COMMAND_LINKS`]), `aterm_settled` whether `~/.local/bin/aterm` names this bundle's
+/// `aterm` once the pass has written it: `None` leaves it; `Some(None)` lays a link where
+/// nothing stands; `Some(Some(old))` re-points a link to `old`. One rule for the pass
+/// ([`ensure_command_links_from`]) and for the read of what it would do
+/// ([`command_links_to_write`]).
+///
+/// Ours to re-point only if it already points into an `aterm.app` bundle; anything else —
+/// a dev bundle `ship dev-app` aimed `aterm` at, someone's own build — belongs to whoever
+/// put it there. TWO exceptions into another bundle's `Contents/MacOS`. `atpkg`: no tool
+/// states that choice (`ship dev-app` links `aterm` and `amacs`), so such a link is the
+/// leftover of this pass before it was release-only — a dev bundle's launch took it — and
+/// it goes back to the release. `amacs` FOLLOWS `aterm`: the editor client and the window
+/// it hands a file to are one binary, so once `aterm` here runs this release again
+/// (`tools/install.sh` relinks only `aterm` when a dev build rejoins the release), the
+/// editor comes back with it; while `aterm` is aimed at a dev bundle, so is `amacs`. Not a
+/// link — an older install's copy, or someone's own build — is never touched by this pass;
+/// `doctor` names it and `repair` moves it aside.
+#[cfg(unix)]
+fn link_act(
+    link: &Path,
+    target: &Path,
+    name: &str,
+    aterm_settled: bool,
+) -> Option<Option<std::path::PathBuf>> {
+    match fs::symlink_metadata(link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let old = fs::read_link(link).ok()?;
+            let in_a_bundle =
+                |old: &Path| old.parent().is_some_and(|d| d.ends_with("Contents/MacOS"));
+            let ours = in_release_bundle(&old)
+                || (name == "atpkg" && in_a_bundle(&old))
+                || (name == "amacs" && in_a_bundle(&old) && aterm_settled);
+            (ours && old != target).then_some(Some(old))
+        }
+        Ok(_) => None,
+        Err(_) => Some(None),
     }
 }
 
@@ -1308,34 +1300,32 @@ fn ensure_command_links_from(home: &Path, exe: &Path) {
 /// another bundle ([`ensure_command_links_from`]), so it comes after `aterm`. A bundle from
 /// before amacs has no `Contents/MacOS/amacs`, so it lays no link to one.
 #[cfg(unix)]
-const COMMAND_LINKS: [&str; 3] = ["aterm", "atpkg", "amacs"];
+pub(crate) const COMMAND_LINKS: [&str; 3] = ["aterm", "atpkg", "amacs"];
 
 /// The `Contents/MacOS` an executable at `exe` (canonical) lays the command links from, or
 /// `None` where it may not lay them.
 #[cfg(unix)]
-fn command_link_source(exe: &Path) -> Option<&Path> {
+pub(crate) fn command_link_source(exe: &Path) -> Option<&Path> {
     command_link_check(exe).ok()
 }
 
-/// [`command_link_source`], with the reason when this executable may not lay the links —
-/// in words `repair` prints, so an owner running it from the wrong copy learns which.
+/// [`command_link_source`], with the reason, in words `repair` prints, when this executable
+/// may not lay the links.
 #[cfg(unix)]
-fn command_link_check(exe: &Path) -> Result<&Path, &'static str> {
+pub(crate) fn command_link_check(exe: &Path) -> Result<&Path, &'static str> {
     // Only from inside a bundle: a source build's target/release is the developer's
     // own tree, and linking out of it would outlive the checkout.
     let macos = exe
         .parent()
         .filter(|d| d.ends_with("Contents/MacOS"))
         .ok_or("this atpkg is not inside an app bundle")?;
-    // AND ONLY FROM THE RELEASE BUNDLE: never write a link this pass would itself refuse
-    // to repoint. From a dev bundle (or any bundle not named `aterm.app`) the PATH names
-    // are not ours to take — see [`ensure_command_links`].
+    // Only from the release bundle: never write a link this pass would refuse to repoint
+    // ([`ensure_command_links`]).
     if !in_release_bundle(exe) {
         return Err("this atpkg is not the release aterm.app's (a dev or renamed copy)");
     }
-    // AND NOT FROM A TRANSLOCATED ONE. Gatekeeper runs a quarantined download from a
-    // read-only, randomly-named mount that disappears when the app quits, so a link
-    // into it is dangling by the next login.
+    // Not from a translocated copy: Gatekeeper runs a quarantined download from a
+    // read-only, randomly-named mount that disappears when the app quits.
     if exe.components().any(|c| {
         c.as_os_str()
             .to_string_lossy()
@@ -1346,8 +1336,8 @@ fn command_link_check(exe: &Path) -> Result<&Path, &'static str> {
              /Applications and open it from there",
         );
     }
-    // AND NOT FROM A MOUNTED VOLUME. An app run in place from a disk image or a
-    // removable disk goes away with the eject, and a link into it dangles.
+    // Not from a mounted volume: an app run in place from a disk image or a removable disk
+    // goes away with the eject, and a link into it dangles.
     if exe.starts_with("/Volumes") {
         return Err(
             "this aterm.app resolves onto a disk image or a mounted volume (under /Volumes) \
@@ -1358,8 +1348,8 @@ fn command_link_check(exe: &Path) -> Result<&Path, &'static str> {
     Ok(macos)
 }
 
-/// Names a file in `~/.local/bin` may still carry from an install before the one-binary
-/// collapse, which no pass links any more: `aterm ctl` replaces `aterm-ctl`.
+/// Names an older install may have left in `~/.local/bin` that no pass links:
+/// `aterm ctl` replaces `aterm-ctl`.
 #[cfg(unix)]
 const RETIRED_COMMANDS: [&str; 1] = ["aterm-ctl"];
 
@@ -1371,12 +1361,12 @@ const INSTALLED_COMMANDS: &[&str] = &COMMAND_LINKS;
 #[cfg(all(unix, not(target_os = "macos")))]
 const INSTALLED_COMMANDS: &[&str] = &["aterm"];
 
-/// The command paths in `~/.local/bin` that hold a regular file instead of a link: a binary
-/// an install from before the links copied there, or someone's own build, under a name this
-/// platform's install links ([`INSTALLED_COMMANDS`]) or a retired one ([`RETIRED_COMMANDS`]).
-/// It never updates, and it runs instead of the installed aterm wherever `~/.local/bin` leads
-/// PATH. No unattended pass touches it; `doctor` names it, and on macOS `repair` run from the
-/// installed app moves it aside ([`move_aside_copied_commands`]).
+/// The command paths in `~/.local/bin` that hold a regular file instead of a link (an older
+/// install's copy, or someone's own build) under a name this platform's install links
+/// ([`INSTALLED_COMMANDS`]) or a retired one ([`RETIRED_COMMANDS`]). It never updates, and it
+/// runs instead of the installed aterm wherever `~/.local/bin` leads PATH. No unattended
+/// pass touches it; `doctor` names it, and on macOS `repair` moves it aside
+/// ([`move_aside_copied_commands`]).
 #[cfg(unix)]
 pub(crate) fn copied_command_links(home: &Path) -> Vec<std::path::PathBuf> {
     let Some(bin) = command_links_dir(home) else {
@@ -1390,11 +1380,10 @@ pub(crate) fn copied_command_links(home: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// How to run `repair` from the installed app, since a copied `~/.local/bin/aterm` is exactly
-/// what `aterm pkg repair` would run: this process's own `atpkg` when it is the release
-/// bundle's, else the `atpkg` of an `aterm.app` in `/Applications` or `~/Applications`, else a
-/// description. Only the macOS release bundle lays the links, so only there is there a
-/// command to name.
+/// How to run `repair` from the installed app (a copied `~/.local/bin/aterm` is what
+/// `aterm pkg repair` would run): this process's own `atpkg` when it is the release
+/// bundle's, else the `atpkg` of an `aterm.app` in `/Applications` or `~/Applications`, else
+/// a description.
 #[cfg(all(unix, target_os = "macos"))]
 pub(crate) fn repair_from_app_hint() -> String {
     let own = std::env::current_exe()
@@ -1415,9 +1404,9 @@ fn installed_app_dirs(home: Option<std::path::PathBuf>) -> [Option<std::path::Pa
 }
 
 /// The `atpkg` of the first `aterm.app` in `apps_dirs` that would do the job: its folder
-/// resolved (a link onto a mounted volume would refuse it, as atpkg refuses itself), and
-/// the `atpkg` name kept — in the bundle it is an alias link to `aterm`, and the one binary
-/// picks its tool by that name, so resolving it would name `aterm` instead.
+/// resolved (a link onto a mounted volume would refuse it), and the `atpkg` name kept,
+/// since in the bundle it is an alias link to `aterm` and the one binary picks its tool by
+/// that name.
 #[cfg(all(unix, target_os = "macos"))]
 fn installed_app_atpkg(apps_dirs: &[Option<std::path::PathBuf>]) -> Option<std::path::PathBuf> {
     apps_dirs
@@ -1494,7 +1483,7 @@ pub(crate) struct MovedAside {
 }
 
 /// What `repair`'s command-link step did: each file it moved and each it could not, with
-/// why. (When this process may not lay the links at all, the step answers the reason.)
+/// why.
 #[cfg(unix)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct AsideOutcome {
@@ -1504,22 +1493,13 @@ pub(crate) struct AsideOutcome {
 
 /// `atpkg repair`'s half of the command links: each [`copied_command_links`] path is moved to
 /// `<name>.moved-aside-<unix secs>` beside it, and a name the pass links ([`COMMAND_LINKS`])
-/// gets the release bundle linked in its place; a retired name ([`RETIRED_COMMANDS`]) is only
-/// moved. It is the asked-for pass, so it may displace someone's own build — which is why it
-/// moves rather than deletes, and says where the file went. `Err` says why this process
-/// does not lay the links ([`command_link_check`]).
+/// gets the release bundle linked in its place; a retired name is only moved. The asked-for
+/// pass may displace someone's own build, so it moves rather than deletes and says where the
+/// file went. `Err` says why the executable at `exe` does not lay the links
+/// ([`command_link_check`]); `home` and `exe` are the account's and the running pass's, `secs`
+/// the suffix's time.
 #[cfg(unix)]
-pub(crate) fn move_aside_copied_commands() -> Result<AsideOutcome, &'static str> {
-    let home = aterm_types::dirs::home_dir().ok_or("$HOME is not set")?;
-    let exe = std::env::current_exe()
-        .and_then(|e| e.canonicalize())
-        .map_err(|_| "this atpkg could not find its own path")?;
-    let secs = aterm_time::unix_secs().unwrap_or(0);
-    move_aside_copied_commands_at(&home, &exe, secs)
-}
-
-#[cfg(unix)]
-fn move_aside_copied_commands_at(
+pub(crate) fn move_aside_copied_commands_at(
     home: &Path,
     exe: &Path,
     secs: u64,
@@ -1556,9 +1536,8 @@ fn move_aside_copied_commands_at(
 /// Give the file at `from` the name `aside`, then put a link to `link_to` at `from` (or leave
 /// nothing there). The file keeps a name at every step: `hard_link` refuses an existing
 /// `aside`, so an earlier move is never overwritten; the link is made under a temporary name
-/// and renamed over `from` in one step; and on any failure `aside` is dropped, leaving `from`
-/// as it was. `from` must still be the file that was linked — checked by inode — before it
-/// is replaced. `Err` says why nothing changed.
+/// and renamed over `from`; `from` must still be the same inode before it is replaced; and on
+/// any failure `aside` is dropped, leaving `from` as it was. `Err` says why nothing changed.
 #[cfg(unix)]
 fn rename_file_aside(from: &Path, aside: &Path, link_to: Option<&Path>) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
@@ -1605,12 +1584,11 @@ fn rename_file_aside(from: &Path, aside: &Path, link_to: Option<&Path>) -> Resul
 /// or a link inside it, is a gated write, and [`ensure_command_links`] runs unattended
 /// (the same fence as [`ensure_rc_sources_hooks`]; `crate::protected`).
 ///
-/// The nearest EXISTING ancestor decides where a create would land, and `canonicalize`
-/// is metadata-only (design §1.5), so this touches nothing consent-gated itself. A home
-/// that cannot be resolved at all yields the plain path: there is nothing to refuse
-/// against, and `create_dir_all` answers for itself.
+/// The nearest existing ancestor decides where a create would land, and `canonicalize` is
+/// metadata-only, so this touches nothing consent-gated. A home that cannot be resolved at
+/// all yields the plain path.
 #[cfg(unix)]
-fn command_links_dir(home: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn command_links_dir(home: &Path) -> Option<std::path::PathBuf> {
     let bin = home.join(".local/bin");
     let mut probe = bin.as_path();
     let real = loop {
@@ -1647,7 +1625,7 @@ pub(crate) fn sh_quote(bin_dir: &Path) -> String {
     out
 }
 
-/// Render `p` for a double-quoted **fish** string — the fish hook body and the fish rc line.
+/// Render `p` for a double-quoted fish string: the fish hook body and the fish rc line.
 ///
 /// Not [`sh_quote`]: fish is not a POSIX shell. Between double quotes it recognises only
 /// `\\`, `\"` and `\$` (and a backslash-newline continuation), keeps a backslash before any
@@ -1667,9 +1645,8 @@ pub(crate) fn fish_quote(p: &Path) -> String {
     out
 }
 
-/// Render `bin_dir` for a SINGLE-quoted PowerShell string literal: only the single quote is
-/// special there (doubled to escape), so a Windows path's backslashes pass through literally
-/// (no `C:\Users` → `C:<tab>sers` surprise) — the reason the `.ps1` uses `'...'`, not `"..."`.
+/// Render `bin_dir` for a single-quoted PowerShell string literal: only the single quote is
+/// special there (doubled to escape), so a Windows path's backslashes pass through literally.
 fn ps_quote(bin_dir: &Path) -> String {
     bin_dir.to_string_lossy().replace('\'', "''")
 }
@@ -1685,13 +1662,9 @@ fn atomic_write(dest: &Path, content: &str) -> io::Result<()> {
 }
 
 /// Write `content` to `dest`'s temp sibling, born `0600` and hardened, and hand back the
-/// temp path for the caller to rename into place. The temp is removed on every error arm.
-///
-/// Not `fs::write`: it left the temp behind whenever `harden_file` or the rename failed, and
-/// `~/.aterm/shell.d` is swept by nobody, so each failed pass added another
-/// `.00-atpkg.zsh.tmp-<pid>` for aterm's own glob loops to skip. It also creates at the umask
-/// default, leaving the hook world-readable until the chmod; `create_new` + `mode(0o600)`
-/// gives it the mode at birth and refuses a name something else already holds.
+/// temp path for the caller to rename into place. The temp is removed on every error arm,
+/// since nobody sweeps `~/.aterm/shell.d`. Not `fs::write`: `create_new` + `0600` gives the
+/// mode at birth (never world-readable before a chmod) and refuses a name another file holds.
 fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {
     let name = dest
         .file_name()
@@ -1723,17 +1696,15 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    /// ONE TABLE FOR THE HOOK NAME (2026-09-16): the four files `write_hooks` lays are
-    /// exactly what `hook_for_shell` names per shell family, and `hook_file` answers only
-    /// for a hook that EXISTS as a regular file — a symlink under `shell.d` is not ours.
+    /// The four files `write_hooks` lays are exactly what `hook_for_shell` names per shell,
+    /// and `hook_file` answers only for a hook that exists as a regular file.
     #[cfg(unix)]
     #[test]
     fn hook_for_shell_and_hook_file_read_the_files_write_hooks_lays() {
         let home = tmp("hookfile");
         assert_eq!(hook_for_shell("zsh"), Some("00-atpkg.zsh"));
         assert_eq!(hook_for_shell("bash"), Some("00-atpkg.bash"));
-        // `sh` gets no hook: the bash hook is not POSIX sh (`${var//pat/rep}`), so the
-        // remedy for a `/bin/sh` user is the `PATH` line, never a file sh cannot source.
+        // `sh` gets no hook: the bash hook is not POSIX sh (`${var//pat/rep}`).
         assert_eq!(hook_for_shell("sh"), None);
         assert_eq!(hook_for_shell("fish"), Some("00-atpkg.fish"));
         assert_eq!(hook_for_shell("pwsh"), Some("00-atpkg.ps1"));
@@ -1772,9 +1743,8 @@ mod tests {
     }
 
     fn tmp(label: &str) -> crate::testdir::Dir {
-        // The command-link checks refuse anything on a mounted volume, so a
-        // TMPDIR under /Volumes (a RAM disk, an external build volume) would
-        // refuse these tests' own bundles: build them on the system volume.
+        // The command-link checks refuse anything on a mounted volume, so a TMPDIR under
+        // /Volumes would refuse these tests' own bundles: build them on the system volume.
         let base = std::env::temp_dir();
         let base = if base
             .canonicalize()
@@ -1788,11 +1758,6 @@ mod tests {
     }
 
     /// The rc block goes in exactly once, sources the hook, and is removable.
-    ///
-    /// Before this, `shell.d` was written on every install and sourced only by aterm's
-    /// own integration, so the managed toolchain was invisible in Terminal.app, iTerm,
-    /// VS Code and any agent shell — most of the value of installing a toolchain
-    /// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md, B9).
     #[cfg(unix)]
     #[test]
     fn rc_wiring_is_idempotent_and_only_touches_existing_rc_files() {
@@ -1800,8 +1765,7 @@ mod tests {
         let home = tmp("rcwire");
         let zshrc = home.join(".zshrc");
         std::fs::write(&zshrc, "# pre-existing user content\nexport FOO=1\n").unwrap();
-        // .bashrc deliberately absent: atpkg must not CREATE an rc for a shell the
-        // user does not use — a file we invent is a file we own forever.
+        // .bashrc deliberately absent: atpkg must not create an rc.
 
         ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
         let once = std::fs::read_to_string(&zshrc).unwrap();
@@ -1820,8 +1784,7 @@ mod tests {
         );
         assert!(!home.join(".bashrc").exists(), "no rc was invented");
 
-        // Idempotent: a second refresh must not stack a second block, and rewrites
-        // nothing — the rc keeps its inode (a temp+rename would give it a new one).
+        // Idempotent: a second pass stacks no second block and rewrites nothing (same inode).
         ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
         let twice = std::fs::read_to_string(&zshrc).unwrap();
         assert_eq!(twice, once, "a second pass must be a no-op");
@@ -1835,18 +1798,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// THE OPT-OUT THE BLOCK DOCUMENTS ACTUALLY LASTS — and `repair` is the way back.
-    ///
-    /// The block carries the sentence "delete this block to opt out", and until
-    /// 2026-09-16 the only idempotency check was [`RC_BEGIN`] itself: a user who
-    /// deleted the block as instructed got it back on the next pass — an install, a
-    /// seed, `repair`, or the six-hourly background `update`, so within hours — with
-    /// their own edit to their own dotfile silently reverted and a dotfiles repo
-    /// showing the same diff forever (audit finding). [`RC_LEDGER`] records the wiring,
-    /// so a recorded rc that no longer carries the block is read as the opt-out it is.
-    /// The other half is that opting out must not be a trap: the deliberate pass
-    /// ([`refresh_rewiring_rc`], which `atpkg repair` runs) writes it back, and after
-    /// that the block is deletable-for-good again.
+    /// The opt-out the block documents lasts: a recorded rc without the block is left alone
+    /// by every unattended pass, `repair` ([`refresh_rewiring_rc`]) writes it back, and after
+    /// that the block can be deleted for good again.
     #[cfg(unix)]
     #[test]
     fn a_deleted_rc_block_stays_deleted_and_repair_is_the_way_back() {
@@ -1906,12 +1860,8 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// A machine wired by a build from BEFORE the ledger opts out on its first deletion.
-    ///
-    /// Recording only at the moment of writing would have made every existing install
-    /// spend its first deletion re-learning what it already knew: the block would come
-    /// back once, and only the second deletion would stick. So a pass records an rc it
-    /// finds already wired — it rewrites nothing, it only remembers.
+    /// A machine wired before the ledger existed opts out on its first deletion: a pass
+    /// records an rc it finds already wired, rewriting nothing.
     #[cfg(unix)]
     #[test]
     fn an_rc_wired_before_the_ledger_existed_is_recorded_by_the_next_pass() {
@@ -1940,7 +1890,7 @@ mod tests {
             "the pass records what it found wired"
         );
 
-        // The FIRST deletion on such a machine is honoured.
+        // The first deletion on such a machine is honoured.
         fs::write(&bashrc, user).unwrap();
         ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
         assert_eq!(
@@ -2063,13 +2013,8 @@ mod tests {
         aterm_spec::host::could_not_run_without(&absent);
     }
 
-    /// The block must not leave `$?` = 1 in every new shell.
-    ///
-    /// The block is the last thing many rc files run, so the status its line leaves is the
-    /// `$?` the user's first prompt reads. `[ -f "<hook>" ] && . "<hook>"` is an `&&` list:
-    /// with the hook absent the test fails, nothing is sourced, and the list exits 1, so
-    /// every prompt that renders the last status opens showing a failure with nothing to
-    /// blame. Replayed in the real shells over a `shell.d` that holds no hook at all.
+    /// The block's line leaves `$?` = 0 when the hook is missing, replayed in the real shells
+    /// over a `shell.d` that holds no hook.
     #[cfg(unix)]
     #[test]
     fn the_rc_line_is_status_neutral_when_the_hook_is_missing() {
@@ -2131,12 +2076,8 @@ mod tests {
         aterm_spec::host::could_not_run_without(&absent);
     }
 
-    /// A pass whose hook write failed wires no rc.
-    ///
-    /// The block names one file. Writing it when that file is not there leaves an rc
-    /// sourcing nothing, and the marker-bounded block is never rewritten, so it stays wrong
-    /// for as long as it stands. The hook write is made to fail the way a real one does (the
-    /// temp path it must create is occupied), and the rc must come out as the user left it.
+    /// A pass whose hook write failed wires no rc: a block naming a missing hook sources
+    /// nothing and is never rewritten.
     #[cfg(unix)]
     #[test]
     fn a_failed_hook_write_wires_no_rc_block() {
@@ -2146,8 +2087,8 @@ mod tests {
         fs::write(&zshrc, user).unwrap();
         let shell_d = home.join(".aterm").join("shell.d");
         fs::create_dir_all(&shell_d).unwrap();
-        // A directory stands where the hook writer must create its temp file, so the very
-        // first dialect's write fails and `write_hooks` returns Err.
+        // A directory stands where the hook writer must create its temp file, so the first
+        // dialect's write fails.
         let blocked = shell_d.join(format!(".{HOOK_BASENAME}.zsh.tmp-{}", std::process::id()));
         fs::create_dir_all(&blocked).unwrap();
 
@@ -2172,11 +2113,8 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// A symlinked rc (GNU stow, yadm/chezmoi symlink mode, home-manager, any dotfiles
-    /// repo) gets the block written THROUGH the link, and stays a link. Until 2026-09-12
-    /// the temp file was renamed over the rc path, which replaces the link: `~/.zshrc`
-    /// became a detached regular 0644 copy, the dotfile never got the block, and later
-    /// edits to the dotfiles repo silently stopped reaching the shell (audit K12).
+    /// A symlinked rc (stow, yadm/chezmoi, home-manager) gets the block written through the
+    /// link and stays a link with its mode; a dangling link is left alone.
     #[cfg(unix)]
     #[test]
     fn rc_wiring_writes_through_a_symlinked_rc_and_keeps_it_a_link_and_its_mode() {
@@ -2257,13 +2195,9 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// THE BASH LOGIN SHELL. Measured 2026-09-15 (macOS `/bin/bash` 3.2.57): a login
-    /// shell — what Terminal.app, iTerm and ssh open — reads `~/.bash_profile` and NOT
-    /// `~/.bashrc`, which only an interactive non-login shell reads. Until this row
-    /// existed a bash-login user had the block in `.bashrc` and no toolchain on PATH in
-    /// any terminal they opened (audit finding). A home with `.bash_profile` gets the
-    /// block, sourcing the SAME `00-atpkg.bash` as `.bashrc`; a home with both gets it
-    /// in both; and `.bashrc` is never invented beside a lone `.bash_profile`.
+    /// A bash login shell reads `~/.bash_profile`, not `~/.bashrc`: a home with
+    /// `.bash_profile` gets the block, sourcing the same `00-atpkg.bash`; a home with both
+    /// gets it in both; and `.bashrc` is never invented beside a lone `.bash_profile`.
     #[cfg(unix)]
     #[test]
     fn rc_wiring_reaches_a_bash_login_shell_through_an_existing_bash_profile() {
@@ -2307,14 +2241,9 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// THE CONSENT FENCE. The wiring runs on the six-hourly pass and the first-launch
-    /// seed, and a dotfiles repo commonly lives under `~/Documents` (or iCloud Drive)
-    /// with `~/.zshrc` — or the whole of `~/.config` — symlinked into it. Opening that
-    /// file from an unattended pass raises the macOS folder dialog in aterm's name with
-    /// nobody at the screen (2026-09-12, TCC audit). So an rc that RESOLVES under a
-    /// protected root is left exactly as it was — through a symlinked rc, and through a
-    /// symlinked parent of a regular rc — while an rc beside it that resolves somewhere
-    /// ordinary is still wired.
+    /// The consent fence: an rc that resolves under a protected root (through a symlinked rc,
+    /// or a symlinked parent of a regular rc) is left exactly as it was, while an rc beside
+    /// it that resolves somewhere ordinary is still wired.
     #[cfg(unix)]
     #[test]
     fn rc_wiring_never_opens_an_rc_that_resolves_under_a_protected_folder() {
@@ -2325,12 +2254,12 @@ mod tests {
         let zshrc = docs.join("zshrc");
         fs::write(&zshrc, "export FOO=1\n").unwrap();
         std::os::unix::fs::symlink(&zshrc, home.join(".zshrc")).unwrap();
-        // ~/.config -> ~/Documents/dotfiles/config, with a REGULAR config.fish inside
+        // ~/.config -> ~/Documents/dotfiles/config, with a regular config.fish inside
         // it: the rc path itself is not a link, its parent is.
         let fish = docs.join("config").join("fish").join("config.fish");
         fs::write(&fish, "set -x FOO 1\n").unwrap();
         std::os::unix::fs::symlink(docs.join("config"), home.join(".config")).unwrap();
-        // ~/.bashrc -> ~/dotfiles/bashrc: a link into an ORDINARY directory, the control.
+        // ~/.bashrc -> ~/dotfiles/bashrc: a link into an ordinary directory, the control.
         let plain = home.join("dotfiles");
         fs::create_dir_all(&plain).unwrap();
         let bashrc = plain.join("bashrc");
@@ -2367,9 +2296,8 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// The same fence for the command links: `~/.local/bin` is created and written on
-    /// every pass, and a `~/.local` that is itself a link into a dotfiles repo under a
-    /// protected root would make that create the gated write.
+    /// The same fence for the command links: a `~/.local` linked under a protected root is
+    /// refused.
     #[cfg(unix)]
     #[test]
     fn command_links_stay_out_of_a_protected_local_bin() {
@@ -2395,14 +2323,10 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// THE PATH NAMES ARE THE RELEASE BUNDLE'S TO WRITE (2026-09-23). A dev bundle
-    /// (`aterm (dev).app`) launched from the Dock took `~/.local/bin/aterm` and `atpkg`
-    /// from the release within three seconds, and the release could never take them back
-    /// (a link into the dev bundle is not "ours"). Driven through the real pass on a
-    /// bundle tree of its own: from the dev bundle nothing is planted and a release link
-    /// is left alone; from the release bundle an absent link is planted, a link into an
-    /// OLDER release location is repointed (moves still track), and a link `ship dev-app`
-    /// aimed at the dev bundle — the stated choice — is left alone.
+    /// The PATH names are the release bundle's to write: from the dev bundle nothing is
+    /// planted and a release link is left alone; from the release bundle an absent link is
+    /// planted, a link into an older release location is repointed, and a link
+    /// `ship dev-app` aimed at the dev bundle is left alone.
     #[cfg(unix)]
     #[test]
     fn command_links_are_written_only_from_the_release_bundle() {
@@ -2440,7 +2364,7 @@ mod tests {
         assert_eq!(target("aterm"), Some(release.join("aterm")));
         assert_eq!(target("atpkg"), Some(release.join("atpkg")));
 
-        // 3. THE STEAL: the release owns them, then the dev bundle runs — untouched.
+        // 3. The release owns them, then the dev bundle runs: untouched.
         ensure_command_links_from(&home, &dev.join("aterm"));
         assert_eq!(
             target("aterm"),
@@ -2464,9 +2388,8 @@ mod tests {
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("aterm"), Some(dev.join("aterm")));
 
-        // 6. The leftover heals: an `atpkg` into the dev bundle can only be what the old
-        //    pass took (no tool states that choice), so the release takes it back — while
-        //    the `aterm` beside it, the stated choice, still stays.
+        // 6. The leftover heals: an `atpkg` into the dev bundle is no tool's choice, so the
+        //    release takes it back, while the `aterm` beside it stays.
         set("atpkg", &dev.join("atpkg"));
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("atpkg"), Some(release.join("atpkg")));
@@ -2818,12 +2741,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A move that cannot finish changes nothing: the file keeps its name and no second
-    /// name is left behind. Here the temporary link's name is taken by a directory, so the
-    /// link cannot be made after the file already has its aside name. (Also pinned: an
-    /// earlier aside name is never overwritten, and a retired name that cannot leave its
-    /// folder stays put. Not pinned: a failing rename over the old name and the inode
-    /// check, which need a writer racing this one.)
+    /// A move that cannot finish changes nothing: with the temporary link's name taken by a
+    /// directory, the file keeps its name and no second name is left behind.
     #[cfg(unix)]
     #[test]
     fn a_move_aside_that_cannot_finish_changes_nothing() {
@@ -2851,10 +2770,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A retired name is moved with nothing linked in its place; when its old name
-    /// cannot be removed, the second name is dropped again and the file stays exactly
-    /// where it was. Here the old name's folder is read-only while the aside name is in
-    /// a writable one, which separates the two steps.
+    /// A retired name is moved with nothing linked in its place; when its old name cannot be
+    /// removed (a read-only folder), the second name is dropped and the file stays put.
     #[cfg(unix)]
     #[test]
     fn a_retired_name_that_cannot_leave_its_folder_stays_put() {
@@ -2977,12 +2894,9 @@ mod tests {
         );
     }
 
-    /// THE SHELL HOOKS ARE THE RELEASE BUNDLE'S TO LAY UNATTENDED (2026-09-23). The same
-    /// Dock launch of a stale dev bundle rewrote `~/.aterm/shell.d` with a hook from before
-    /// the in-aterm-only agents gate, so `claude` led PATH in every terminal again. Driven
-    /// through the real pass on a synthetic home: the unattended pass from the dev bundle
-    /// writes nothing; from the release bundle it writes; `repair` (the asked-for pass)
-    /// writes from the dev bundle too.
+    /// The shell hooks are the release bundle's to lay unattended: from a dev bundle the
+    /// unattended pass writes nothing, from the release bundle it writes, and `repair` writes
+    /// from either.
     #[cfg(unix)]
     #[test]
     fn an_unattended_hooks_pass_from_a_dev_bundle_writes_nothing() {
@@ -3049,9 +2963,8 @@ mod tests {
                 && ps.contains("$env:PATH = ($__atpkg_front + $__atpkg_rest) -join $__atpkg_sep\n"),
             "agents/ is MOVED TO THE FRONT (the one exception): removed, then prepended"
         );
-        // reroute/ ahead of it: any agents marker OR the seams' handle (the degraded TTY
-        // launch carries only the handle, 2026-09-27 review), grouped explicitly — `-or` and
-        // `-and` share one precedence in PowerShell — and never under --no-reroute's marker.
+        // reroute/ ahead of it: any agents marker or the seams' handle, grouped explicitly,
+        // and never under --no-reroute's marker.
         assert!(
             ps.contains(&format!(
                 "if (($env:ATERM_AGENTS_DIR -or $env:ATERM_CHILD -or $env:ATERM_SESSION_ID -or $env:{r}) -and (-not $env:{p} -or $env:{p} -eq '0')) {{ $__atpkg_front = @($__atpkg_reroute) + $__atpkg_front }}",
@@ -3128,19 +3041,13 @@ mod tests {
         assert!(!fish.contains("export "), "no POSIX export in fish");
     }
 
-    /// The four hooks move as a set, or not at all.
-    ///
-    /// One shell reads each dialect and aterm's own integration sources whichever it finds,
-    /// so the four files are only ever correct together. Written one at a time, a failure on
-    /// the third left two dialects carrying the new PATH policy and two the old, with
-    /// nothing to put them back. Staging every temp before publishing any of them means the
-    /// ordinary failure happens while nothing has been replaced.
+    /// The four hooks move as a set, or not at all: a staging failure on the third publishes
+    /// none.
     #[cfg(unix)]
     #[test]
     fn a_failed_hook_write_replaces_none_of_the_dialects() {
         let d = tmp("writeset");
-        // A directory stands where the third dialect's temp must be created, so its staging
-        // fails after the first two have been staged.
+        // A directory stands where the third dialect's temp must be created.
         let blocked = d.join(format!(".{HOOK_BASENAME}.fish.tmp-{}", std::process::id()));
         fs::create_dir_all(&blocked).unwrap();
 
@@ -3169,13 +3076,8 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// No temp is left behind, on any error arm.
-    ///
-    /// `~/.aterm/shell.d` is swept by nobody, and the fish and zsh integration scripts
-    /// glob the directory — so every failed pass used to add one more
-    /// `.00-atpkg.<ext>.tmp-<pid>` for them to skip, forever. Here the LAST dialect's
-    /// destination is a directory, so its rename is what fails, with its temp already
-    /// written and hardened: exactly the arm that leaked.
+    /// No temp is left behind on any error arm, here a failed rename onto a directory after
+    /// the temp was written and hardened.
     #[cfg(unix)]
     #[test]
     fn a_hook_write_that_fails_leaves_no_temp_behind() {
@@ -3206,16 +3108,9 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// And the publish phase moves as a set too.
-    ///
-    /// Staging every temp first made only the TEMP phase all-or-nothing. A rename that
-    /// failed partway still left the earlier dialects carrying the NEW policy and the rest
-    /// the old one — and reported failure, on which `refresh_at`'s gate suppressed the rc
-    /// wiring for all four shells, including the ones whose own hook was on disk and
-    /// correct. That failure is persistent (a directory standing at a hook name), so every
-    /// later pass failed the same way and the rc block was never laid at all. Here the LAST
-    /// dialect's rename is the one that fails, with three already published over a previous
-    /// pass's hooks: every one of them must come back.
+    /// The publish phase moves as a set too: when the last dialect's rename fails, the three
+    /// already published over a previous pass's hooks are all put back, and neither a temp
+    /// nor a saved predecessor is left.
     #[cfg(unix)]
     #[test]
     fn a_failed_publish_puts_back_every_dialect_it_had_already_replaced() {
@@ -3302,7 +3197,7 @@ mod tests {
             !fish.contains("a\\`b"),
             "a backtick must never be backslash-escaped in a fish string: {fish:?}"
         );
-        // The POSIX body is unchanged: its quoter is still right for zsh and bash.
+        // The POSIX body still escapes the backtick.
         assert!(
             body(".zsh").contains("a\\`b"),
             "the POSIX body must still escape the backtick"
@@ -3492,10 +3387,8 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// A HOOK THAT IS ALREADY CURRENT IS NEVER REWRITTEN (Phase 3): a rename hands the
-    /// hook a new inode and every open zsh re-sources it at its next prompt, so an idle
-    /// pass must leave identical hooks exactly as they are — and still rewrite the one
-    /// whose bytes or mode drifted.
+    /// A hook that is already current is never rewritten (same inode), while one whose bytes
+    /// or mode drifted is.
     #[cfg(unix)]
     #[test]
     fn write_hooks_leaves_identical_hooks_untouched() {
@@ -3661,9 +3554,8 @@ mod tests {
                 assert_eq!(lines.len(), paths.len(), "{name}: one PATH line per case");
                 lines
             };
-            // fish SPELLS an empty PATH entry `.` (its path variables do, the moment the
-            // PATH is set — measured 2026-09-27, fish 4.9.3): the same directory, so the
-            // entry is still the user's and still in its place, in fish's spelling.
+            // fish spells an empty PATH entry `.` once PATH is set: the same directory, in
+            // its place, in fish's spelling.
             let spelled = |path: String| -> String {
                 if name != "fish" {
                     return path;

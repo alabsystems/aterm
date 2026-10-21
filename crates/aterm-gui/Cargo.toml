@@ -38,6 +38,15 @@ path = "benches/footer_pass_cost.rs"
 harness = false
 required-features = ["bench-support"]
 
+# A Settings page's frame of a preview's clock at short and shipped windows,
+# timed: a measurement, not a gate; by hand it is
+# `targo --unverified bench -p aterm-gui --features bench-support --bench settings_frame_cost`.
+[[bench]]
+name = "settings_frame_cost"
+path = "benches/settings_frame_cost.rs"
+harness = false
+required-features = ["bench-support"]
+
 # The byte arm's C cut (card engine §3.6), timed over `verify perf
 # throughput`'s corpus without and with the cut; by hand it is
 # `targo --unverified bench -p aterm-gui --features bench-support --bench c_cut_cost`.
@@ -232,6 +241,11 @@ aterm-messages = { workspace = true }
 # those readers lives in that crate, so the host adds none.
 aterm-sysprobe = { workspace = true }
 aterm-vitals = { workspace = true }
+# The boot identity bounds delegated process ownership carried over live updates.
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
+# The subtree walker: per-folder sizes and entry counts for `sys disk` and the
+# System panel, on the disk walker thread (`diskwalk_host`).
+aterm-diskwalk = { workspace = true }
 aterm-buffer = { path = "../aterm-buffer" }
 aterm-grapheme = { workspace = true }
 aterm-codec = { workspace = true }
@@ -336,6 +350,11 @@ aterm-png = { workspace = true }
 # First-party JPEG decode: the wallpaper lane reads PNG and JPEG on every
 # platform (`app_config::decode_wallpaper_portable`), not PNG alone off macOS.
 aterm-jpeg = { workspace = true }
+# The credentials vault's client (docs/DESIGN-secrets-2026-10-20.md §7): a first
+# launch on a Mac with no vault asks whether the ALab vault answers on the LAN and
+# offers the join (`secrets_join`). Not a new package in the shipped graph: the
+# `aterm` binary links it already for `aterm secrets`.
+aterm-secrets = { workspace = true }
 # The development Security-posture catalog owns its scratch bundle through the
 # existing exclusive directory guard; the shipped catalog is compiled out.
 aterm-tempfile = { workspace = true }
@@ -410,21 +429,16 @@ aterm-grid = { workspace = true }
 aterm-keeper = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# HDR-on-Windows (M3 phase B): query the display's panel MaxLuminance via DXGI
-# `IDXGIOutput6::GetDesc1` for the cursor-aurora EDR headroom. DXGI is genuinely
-# COM (vtable dispatch), so the `windows` crate is the right tool (the house-rule
-# carve-out); already in the tree via wgpu-hal 0.62.2, so this is a direct dep, not
-# a new crate. The DisplayConfig SDR-white/HDR-state query is FLAT C (not COM) and
-# is hand-rolled in hdr_win.rs (house style), so those features are not pulled here.
-# `Win32_Storage_FileSystem` is the one non-DXGI use: `pinned_dir.rs`'s Windows arm
-# disposes and renames through `SetFileInformationByHandle`, whose variable-length
-# `FILE_RENAME_INFO` layout the crate carries (docs/NATIVE_WINDOWS_DESIGN.md §3.1).
-windows = { version = "0.62", features = [
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Gdi",
-    "Win32_Storage_FileSystem",
-] }
+# aterm's Win32 declarations (WB.2 of docs/AUDIT-third-party-2026-10-15.md; no
+# `windows` crate here): the COM vocabulary behind the file picker, the imaging
+# decoder and the jump list (`win_ffi.rs`); DXGI's `IDXGIOutput6::GetDesc1` for
+# the panel's MaxLuminance, the cursor aurora's EDR headroom (`hdr_win.rs`;
+# aterm-win32's oracle holds its vtable slots to `windows` 0.62.2's); and
+# `SetFileInformationByHandle` with the variable-length `FILE_RENAME_INFO`
+# family behind `pinned_dir.rs`'s Windows arm (docs/NATIVE_WINDOWS_DESIGN.md
+# §3.1). The DisplayConfig SDR-white/HDR-state query is flat C, hand-rolled in
+# hdr_win.rs.
+aterm-win32 = { workspace = true }
 
 # THE ROW, softbuffer half: Windows only. The CPU present path is first-party
 # on macOS (`present/mac.rs`, CoreGraphics + CoreAnimation) and, since LW.6 of

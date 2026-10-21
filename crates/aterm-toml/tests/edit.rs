@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The document half, driven through the exact surface aterm uses it for.
-//!
-//! Two consumers define that surface: the Preferences window's non-destructive
-//! save (`prefs::apply_prefs_edits`), and the config editor's diagnostics
+//! The document half, through the surface aterm uses: the Preferences window's
+//! non-destructive save (`prefs::apply_prefs_edits`) and the config editor's diagnostics
 //! (`native_config_language`, which walks the tree and underlines spans).
 
 use aterm_toml::edit::{DocumentMut, Item, Key, Table, TableLike, Value};
@@ -22,8 +20,8 @@ listen = \"127.0.0.1:7777\"  # local only
 keys = \"ctrl+c\"
 ";
 
-/// The prefs contract: change only the named keys, keep every other byte —
-/// including the edited key's own trailing comment.
+/// The prefs contract: change only the named keys, keep every other byte, including the
+/// edited key's own trailing comment.
 #[test]
 fn a_non_destructive_edit_keeps_every_other_byte() {
     let ours = edit_ours(CONFIG);
@@ -119,11 +117,9 @@ fn set_nested_ours(doc: &mut DocumentMut, path: &[&str], mut item: Item) {
     table.insert(leaf, item);
 }
 
-/// A removed line takes its own text, same-line comment included, and nothing
-/// else: the comment and blank lines written above it stay where they were.
-/// `rain.on` lives in the `rain` table but prints among the root's lines;
-/// `port` is `[net]`'s last line, and its comment stays under `[net]` although
-/// the same edit adds a table that prints right after it.
+/// A removed line takes its own text, same-line comment included, and leaves the comment
+/// lines above it. `rain.on` prints among the root's lines; `port` is `[net]`'s last line,
+/// and its comment stays under `[net]` although the same edit adds a table right after it.
 #[test]
 fn a_removed_line_keeps_the_comment_lines_above_it() {
     let mut doc: DocumentMut = "\
@@ -370,10 +366,8 @@ fn a_byte_order_mark_stays_first() {
     );
 }
 
-/// The diagnostics surface: a dotted lookup, and a span that points at the
-/// authored token.
-///
-/// Spans survive on the mutable document.
+/// The diagnostics surface: a dotted lookup, and a span on the mutable document that
+/// points at the authored token.
 #[test]
 fn a_dotted_lookup_finds_the_value_and_keeps_its_span() {
     let doc: DocumentMut = CONFIG.parse().expect("parse");
@@ -530,9 +524,8 @@ k = 2
     );
 }
 
-/// Interleaved dotted keys are the case a tree-shaped model gets wrong: the
-/// three lines share one `net` node, and grouping them would rewrite a file the
-/// save was supposed to leave alone.
+/// Interleaved dotted keys share one `net` node; grouping them would rewrite a file the
+/// save should leave alone.
 #[test]
 fn interleaved_dotted_keys_keep_their_authored_order() {
     let source = "net.listen = \"a\"\nfont_px = 12\nnet.timeout_ms = 5\n";
@@ -551,8 +544,7 @@ fn interleaved_dotted_keys_keep_their_authored_order() {
     );
 }
 
-/// A brand-new document built from nothing has to print legal TOML, since that
-/// is what the serializer does on every `to_string`.
+/// A document built from nothing prints legal TOML, as the serializer relies on.
 #[test]
 fn a_document_built_by_hand_prints_legal_toml() {
     let mut doc = DocumentMut::new();
@@ -577,10 +569,8 @@ fn a_document_built_by_hand_prints_legal_toml() {
     );
 }
 
-/// `Value::from_str` — the surface `native_settings` counts a list with.
-///
-/// Its contract is STRICT: a value is the whole input or the input is not a
-/// value (` 1 `, `1\n`, `# c\n1` and `1 # c` are all refused).
+/// `Value::from_str` (which `native_settings` uses) takes the whole input as one value:
+/// ` 1 `, `1\n`, `# c\n1` and `1 # c` are refused.
 #[test]
 fn a_standalone_value_is_the_whole_input() {
     const ACCEPTED: &[&str] = &[
@@ -631,8 +621,8 @@ fn a_standalone_value_is_the_whole_input() {
     }
 }
 
-/// `Item::is_*` — the predicates `native_config_language` types a setting with.
-/// Every kind, in both polarities.
+/// `Item::is_*`, the predicates `native_config_language` types a setting with: every kind,
+/// in both polarities.
 #[test]
 fn item_kind_predicates() {
     const SOURCE: &str = "\
@@ -690,14 +680,9 @@ k = 1
     assert!(!vacant.is_value() && !vacant.is_str() && !vacant.is_table_like());
 }
 
-/// A file saved without a final newline (VS Code's default) ends on a line
-/// whose terminator is missing, so a line added after it must start a line of
-/// its own: glued on, `a = 1` + `b` printed `a = 1b = 2`, which does not parse,
-/// and `a = 1 # note` + `b` printed `a = 1 # noteb = 2`, which parses with `b`
-/// inside the comment.
-///
-/// Each case prints back unedited byte-for-byte, keeps every source byte
-/// through the edit, parses back, and has both the old key and the new one.
+/// A key added after a final line with no terminator (VS Code's default save) starts a line
+/// of its own. Each case prints back unedited byte-for-byte, keeps every source byte through
+/// the edit, parses back, and has both the old key and the new one.
 #[test]
 fn a_key_added_after_an_unterminated_final_line_starts_its_own_line() {
     // (source, path of the new key, path of a key the source already had)
@@ -744,10 +729,9 @@ fn a_key_added_after_an_unterminated_final_line_starts_its_own_line() {
     }
 }
 
-/// A new TABLE, or a new element of an array of tables, after an unterminated
-/// final line gets its header on a line of its own too — also when the
-/// header's decor asks for no blank line before it (prefix `""`), which left
-/// nothing between the old line and the `[`.
+/// A new table, or a new element of an array of tables, after an unterminated final line
+/// gets its header on a line of its own, also when its decor asks for no blank line before
+/// it (prefix `""`).
 #[test]
 fn a_table_added_after_an_unterminated_final_line_starts_its_own_line() {
     for source in ["a = 1", "a = 1 # note", "[s]\nx = 1", "[[k]]\nx = 1 # c"] {
@@ -788,13 +772,8 @@ fn a_table_added_after_an_unterminated_final_line_starts_its_own_line() {
     }
 }
 
-/// A nested write THROUGH an inline table lands in it.
-///
-/// The walk vivifies a missing intermediate as a `[header]` `Table`; inserted
-/// into `sparkle_words = { … }` as-is, the encoder (which prints only values
-/// inside braces) dropped it and the leaf beneath it, and the save wrote back
-/// the file it read. An inline table converts what it is given to its own
-/// spelling.
+/// A nested write through an inline table lands in it: the `[header]` `Table` the walk
+/// vivifies is converted to the inline spelling, not dropped by the encoder.
 #[test]
 fn a_nested_write_through_an_inline_table_lands_in_it() {
     let source = "# sparkles\nsparkle_words = { lexicon = \"my.txt\" } # keep\nfont_px = 12\n";

@@ -2,19 +2,19 @@ seq v=1 rig=screen program=claude build=2.1.0
 # T10: the window is 60 s, inclusive. A mail 61 s before the turn's open
 # links nothing; the next, exactly 60 s before the next turn, links it.
 mail task off=3
-expect mark - mail dir=in kind=task off=3 at=0
+expect mark - mail dir=in kind=task off=3 @0
 at 60700 ctl
 wait 300
 see busy
-expect open t1 turn ledger=1 by=harness at=61000
+expect open t1 turn ledger=1 by=harness @61000
 expect link=none
 see idle
 wait 1000
 expect close t1 turn out=done
 mail task off=4
-expect mark - mail dir=in kind=task off=4 at=62000
+expect mark - mail dir=in kind=task off=4 @62000
 at 121700 ctl
 wait 300
 see busy
-expect open t2 turn ledger=2 by=harness at=122000
+expect open t2 turn ledger=2 by=harness @122000
 expect link=@4

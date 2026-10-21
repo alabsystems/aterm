@@ -1535,15 +1535,6 @@ impl FieldIndex {
 // The bed's ink
 // ===========================================================================
 
-/// One sRGB channel, 0..1, through the EOTF to linear light.
-fn srgb_to_linear(c: f32) -> f32 {
-    if c <= 0.040_45 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
 /// The bed's one ceiling, in relative luminance: the brightest a source-over
 /// ribbon may composite and still leave `theme_fg` legible over it at
 /// [`BODY_CONTRAST_BAR`] plus [`BODY_CONTRAST_GUARD`]. A function of the
@@ -1584,10 +1575,11 @@ fn toward_white(rgb: u32, w: f32) -> u32 {
 /// target (never the midpoint, which can round over); `Y(family(lo)) <
 /// target` holds throughout.
 fn solve_for_luma(family: impl Fn(f32) -> u32, target: f32) -> u32 {
+    let table = crate::color_math::relative_luminance_table();
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     for _ in 0..24 {
         let mid = 0.5 * (lo + hi);
-        if relative_luminance(family(mid)) < target {
+        if crate::color_math::relative_luminance_with(table, family(mid)) < target {
             lo = mid;
         } else {
             hi = mid;
@@ -1651,15 +1643,16 @@ pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
     let full = scale_rgb(rgb, 255.0 / mx as f32);
     let bg = bg & 0x00FF_FFFF;
     let cap = (role.alpha_cap() / 255.0).clamp(0.0, 1.0);
-    let y_fg = relative_luminance(fg);
+    let table = crate::color_math::relative_luminance_table();
+    let y_fg = crate::color_math::relative_luminance_with(table, fg);
     let ratio = |y: f32| (y.max(y_fg) + 0.05) / (y.min(y_fg) + 0.05);
     let (weight, bar) = match role {
         InkRole::OverText => (
             PAPER_WEIGHT,
-            Some(
-                (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
-                    .min(PAPER_BAR_THEME_SHARE * ratio(relative_luminance(bg))),
-            ),
+            Some((BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD).min(
+                PAPER_BAR_THEME_SHARE
+                    * ratio(crate::color_math::relative_luminance_with(table, bg)),
+            )),
         ),
         InkRole::Leading => (PAPER_WEIGHT_LEADING, None),
     };
@@ -1680,7 +1673,10 @@ pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
         let on_glass = lerp_rgb(bg, full, share * cap);
         oklab_distance(on_glass, bg) <= weight
             && bar.is_none_or(|bar| {
-                ratio(relative_luminance(worst(lerp_rgb(bg, full, share)))) >= bar
+                ratio(crate::color_math::relative_luminance_with(
+                    table,
+                    worst(lerp_rgb(bg, full, share)),
+                )) >= bar
             })
     };
     let share = if holds(1.0) {
@@ -1745,9 +1741,10 @@ fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
             k[0].1 + (k[1].1 - k[0].1) * (h - k[0].0) / (k[1].0 - k[0].0)
         });
     let full = hsv2rgb(h, s, 1.0);
-    let y_bg = relative_luminance(bg & 0x00FF_FFFF);
+    let table = crate::color_math::relative_luminance_table();
+    let y_bg = crate::color_math::relative_luminance_with(table, bg & 0x00FF_FFFF);
     let holds = |k: f32| {
-        let y = relative_luminance(scale_rgb(full, k));
+        let y = crate::color_math::relative_luminance_with(table, scale_rgb(full, k));
         (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= bar
     };
     if holds(1.0) {
@@ -1774,8 +1771,8 @@ fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
 /// a whole-colour test cannot tell its stops apart: at one luminance violet is
 /// `#0019FD` and a warm stop `#585000`. The hue-carrying channel is what the
 /// eye picks out of the ground and what the census measures.
-fn channel_contrast(a: f32, b: f32) -> f32 {
-    let (a, b) = (srgb_to_linear(a / 255.0), srgb_to_linear(b / 255.0));
+fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
+    let (a, b) = (linear[usize::from(a)], linear[usize::from(b)]);
     let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
     (hi + 0.05) / (lo + 0.05)
 }
@@ -1786,13 +1783,17 @@ fn channel_contrast(a: f32, b: f32) -> f32 {
 /// passes a tinted ground. Both halves are ground-independent.
 #[must_use]
 pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
-    let ch = |c: u32, sh: u32| f32::from(((c >> sh) & 0xff) as u8);
+    let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as u8;
     let (r, g, b) = (ch(rgb, 16), ch(rgb, 8), ch(rgb, 0));
-    let stand = channel_contrast(r, ch(bg, 16))
-        .max(channel_contrast(g, ch(bg, 8)))
-        .max(channel_contrast(b, ch(bg, 0)));
-    let spread = r.max(g).max(b) - r.min(g).min(b);
-    stand >= SEEN_CONTRAST && spread >= SEEN_SPREAD
+    let spread = f32::from(r.max(g).max(b) - r.min(g).min(b));
+    if spread < SEEN_SPREAD {
+        return false;
+    }
+    let linear = &crate::color_math::relative_luminance_table().linear;
+    let stand = channel_contrast(linear, r, ch(bg, 16))
+        .max(channel_contrast(linear, g, ch(bg, 8)))
+        .max(channel_contrast(linear, b, ch(bg, 0)));
+    stand >= SEEN_CONTRAST
 }
 
 /// The coverage at which a stop goes out: the smallest alpha byte at which `ink` over `bg`
@@ -3213,13 +3214,9 @@ impl Ribbon {
             gate.awaiting_move = false;
         }
         // The pen and the hand's floor belong to the coordinate space that is
-        // ending ([`Ribbon::hand_floor`]).
-        self.pen = None;
-        self.arrived = None;
-        self.hand_floor = None;
-        // …and a soft-wrapped word waiting for its reflow: the curtain is
-        // the same coordinate-space cut ([`Ribbon::settle_carry`]).
-        self.carry = None;
+        // ending ([`Ribbon::hand_floor`]), as does a soft-wrapped word waiting
+        // for its reflow ([`Ribbon::settle_carry`]).
+        self.clear_space_transient_state();
         if self.cells.is_empty() || self.curtain.is_some() {
             return;
         }
@@ -3356,16 +3353,13 @@ impl Ribbon {
     fn hold(&mut self, open: u32, hand_row: u16, laid_into: Option<usize>, at: Instant) {
         let grace = self.rest_s();
         let floor = swoosh_life_s(grace);
-        for coh in &mut self.cohorts {
-            if !coh.abandoned && coh.row == hand_row && coh.flow.is_some() {
-                coh.phrase = open;
-            }
-        }
         let held_by = |i: usize, c: &Cohort| {
             !c.abandoned && c.phrase == open && (c.row == hand_row || laid_into == Some(i))
         };
+        let mut any_held = false;
         for (i, coh) in self.cohorts.iter_mut().enumerate() {
             if held_by(i, coh) {
+                any_held = true;
                 coh.alive_at = coh.alive_at.max(at);
                 coh.phase = Phase::Laying;
                 coh.retract_col = None;
@@ -3374,6 +3368,9 @@ impl Ribbon {
                     coh.flow_drift = 0.0;
                 }
             }
+        }
+        if !any_held {
+            return;
         }
         let cohorts = &self.cohorts;
         for cell in &mut self.cells {
@@ -3434,6 +3431,9 @@ impl Ribbon {
             (lo, hi)
         };
         let edge = if below { lo } else { hi };
+        // A shift can leave an older live writer over a newer leaving one.
+        // Resolve the kept edge first, then price every resident at it;
+        // pool order is not birth order (reach cells inherit their tail's birth).
         let disp = self
             .cells
             .iter()
@@ -4321,6 +4321,7 @@ impl Ribbon {
     fn relay_word(&mut self, row: u16, col0: u16, col1: u16, at: Instant, walk: Option<WalkPos>) {
         let mut first = true;
         let mut minted: Option<u32> = None;
+        let mut cached_like: Option<(u32, (f32, f32, f32, f32))> = None;
         for col in col0..col1 {
             if self.owned(row, col, at) {
                 continue;
@@ -4339,12 +4340,21 @@ impl Ribbon {
             let cohort = self.cohorts[idx];
             // Priced like its neighbour: the word is the hand's own glyphs
             // the app relocated, so it takes the light the row has.
-            let like = self
-                .cells
-                .iter()
-                .filter(|c| c.row == row && c.cohort == cohort.id && c.typing)
-                .max_by(|a, b| a.born.cmp(&b.born))
-                .copied();
+            let (life_s, cov0, birth_disp, edge_cells) = match cached_like {
+                Some((id, pricing)) if id == cohort.id => pricing,
+                _ => {
+                    let pricing = self
+                        .cells
+                        .iter()
+                        .filter(|c| c.row == row && c.cohort == cohort.id && c.typing)
+                        .max_by(|a, b| a.born.cmp(&b.born))
+                        .map_or((SWOOSH_LIFE_S, BODY_COLD_SHARE, 0.0, HOT_EDGE_CELLS), |c| {
+                            (c.life_s, c.cov0, c.birth_disp, c.edge_cells)
+                        });
+                    cached_like = Some((cohort.id, pricing));
+                    pricing
+                }
+            };
             let cell = Cell {
                 row,
                 col,
@@ -4352,13 +4362,13 @@ impl Ribbon {
                 t: cohort.t_at(col),
                 born: at,
                 attack_at: at,
-                life_s: like.map_or(SWOOSH_LIFE_S, |c| c.life_s),
-                cov0: like.map_or(BODY_COLD_SHARE, |c| c.cov0),
+                life_s,
+                cov0,
                 typing: true,
                 retract_at: None,
                 retire_at: None,
-                birth_disp: like.map_or(0.0, |c| c.birth_disp),
-                edge_cells: like.map_or(HOT_EDGE_CELLS, |c| c.edge_cells),
+                birth_disp,
+                edge_cells,
                 layer: Layer::Base,
                 rearm: None,
                 released_at: None,
@@ -4393,6 +4403,7 @@ impl Ribbon {
                 .rposition(|c| c.row == row && c.col == col && !c.leaving())
         };
         let reduced = ctx.cfg.reduced_motion;
+        let mut last_coh: Option<(u32, Instant)> = None;
         for col in lo..hi {
             let Some(i) = owner(&self.cells, col) else {
                 return false;
@@ -4401,16 +4412,23 @@ impl Ribbon {
             if self.env_of(ctx, &cell) <= 0.0 {
                 return false;
             }
-            let Some(coh) = self.cohorts.iter().find(|k| k.id == cell.cohort) else {
-                return false;
+            let alive_at = match last_coh {
+                Some((id, alive_at)) if id == cell.cohort => alive_at,
+                _ => {
+                    let Some(coh) = self.cohorts.iter().find(|k| k.id == cell.cohort) else {
+                        return false;
+                    };
+                    if coh.leaving_at(at) {
+                        return false;
+                    }
+                    last_coh = Some((coh.id, coh.alive_at));
+                    coh.alive_at
+                }
             };
-            if coh.leaving_at(at) {
-                return false;
-            }
             // The melt guard: `spent` on the clock `env_of` reads
             // (`live_since`), against the instant the cell's own melt opens.
             let spent = at
-                .saturating_duration_since(cell.born.max(coh.alive_at))
+                .saturating_duration_since(cell.born.max(alive_at))
                 .as_secs_f32();
             let melt_opens = if reduced {
                 (cell.life_s - REDUCED_MOTION_FADE_MS / 1000.0).max(0.0)
@@ -4423,15 +4441,20 @@ impl Ribbon {
         }
         // The hold: the owner of each corridor column, and only it. Holding
         // a cohort twice is the same hold.
+        let mut last_held: Option<u32> = None;
         for col in lo..hi {
             let Some(i) = owner(&self.cells, col) else {
                 continue;
             };
             let id = self.cells[i].cohort;
+            if last_held == Some(id) {
+                continue;
+            }
             if let Some(coh) = self.cohorts.iter_mut().find(|k| k.id == id) {
                 coh.alive_at = coh.alive_at.max(at);
                 coh.phase = Phase::Laying;
                 coh.retract_col = None;
+                last_held = Some(id);
             }
         }
         true
@@ -4856,28 +4879,41 @@ impl Ribbon {
         col: u16,
         at: Instant,
     ) -> (Option<usize>, f32, bool) {
-        let over = self
-            .cells
-            .iter()
-            .rposition(|c| c.row == row && c.col == col && c.layer == Layer::Over);
-        let (base_cov, base_leaving) = self
-            .cells
-            .iter()
-            .rposition(|c| c.row == row && c.col == col && c.layer == Layer::Base)
-            .map_or((0.0, false), |i| {
-                let c = self.cells[i];
-                let env = if c.leaving() {
-                    0.0
-                } else {
-                    self.env_of(ctx, &c)
-                };
-                let leaving = self
-                    .cohorts
-                    .iter()
-                    .find(|k| k.id == c.cohort)
-                    .is_none_or(|k| k.leaving_at(at));
-                (c.cov0 * env, leaving)
-            });
+        let mut over = None;
+        let mut base = None;
+        for (i, c) in self.cells.iter().enumerate().rev() {
+            if c.row != row || c.col != col {
+                continue;
+            }
+            match c.layer {
+                Layer::Over if over.is_none() => {
+                    over = Some(i);
+                    if base.is_some() {
+                        break;
+                    }
+                }
+                Layer::Base if base.is_none() => {
+                    base = Some(c);
+                    if over.is_some() {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (base_cov, base_leaving) = base.map_or((0.0, false), |c| {
+            let env = if c.leaving() {
+                0.0
+            } else {
+                self.env_of(ctx, c)
+            };
+            let leaving = self
+                .cohorts
+                .iter()
+                .find(|k| k.id == c.cohort)
+                .is_none_or(|k| k.leaving_at(at));
+            (c.cov0 * env, leaving)
+        });
         (over, base_cov, base_leaving)
     }
 
@@ -5202,30 +5238,25 @@ impl Ribbon {
                 .copied();
             // The newer writer of a column wins: the band's own cells under
             // the wake's go, so no column carries two owners of one cohort.
-            let wake_cols: Vec<u16> = self
-                .cells
-                .iter()
-                .filter(|c| c.cohort == wake.id)
-                .map(|c| c.col)
-                .collect();
             // A released band cell the wake shadows is replaced by a newer
             // writer, and the wake's own release custody goes with its cells
             // ([`Ribbon::custody_replaced`], [`Ribbon::carry_release`]).
-            for part in band.release_parts.iter().flatten() {
-                let shadowed = self
-                    .cells
-                    .iter()
-                    .filter(|c| {
-                        c.cohort == band.id
-                            && c.row == row
-                            && wake_cols.contains(&c.col)
-                            && c.released_at == Some(part.stamp)
-                    })
-                    .count();
-                self.custody_replaced(b, Some(part.stamp), shadowed);
+            let mut ci = 0usize;
+            while ci < self.cells.len() {
+                let c = self.cells[ci];
+                if c.cohort == band.id
+                    && c.row == row
+                    && self
+                        .cells
+                        .iter()
+                        .any(|w| w.cohort == wake.id && w.col == c.col)
+                {
+                    let gone = self.cells.remove(ci);
+                    self.custody_replaced(b, gone.released_at, 1);
+                } else {
+                    ci += 1;
+                }
             }
-            self.cells
-                .retain(|c| !(c.cohort == band.id && c.row == row && wake_cols.contains(&c.col)));
             self.carry_release(wake.id, band.id);
             for cell in &mut self.cells {
                 if cell.cohort == wake.id {
@@ -5643,14 +5674,12 @@ impl Ribbon {
             // (a merge keeps one clock, wrong for the other's cells).
             let hot =
                 |c: &Cohort| !c.wake && !c.abandoned && c.retract_col.is_none() && c.flow.is_none();
+            if !hot(&a) || !self.stands(&a) {
+                i += 1;
+                continue;
+            }
             let next = self.cohorts.iter().position(|b| {
-                b.id != a.id
-                    && b.row == a.row
-                    && b.col0 == a.col1
-                    && hot(b)
-                    && hot(&a)
-                    && self.stands(b)
-                    && self.stands(&a)
+                b.id != a.id && b.row == a.row && b.col0 == a.col1 && hot(b) && self.stands(b)
             });
             let Some(j) = next else {
                 i += 1;
@@ -6157,9 +6186,12 @@ impl Ribbon {
                 * smoothstep01(sp / WAVE_HEAD_PIN)
                 * (1.0 - settle)
         };
-        let wave = ((sp * std::f32::consts::TAU * WAVE_CYCLES) - ctx.phase * std::f32::consts::TAU)
-            .sin()
-            * amp;
+        let wave = if amp == 0.0 {
+            0.0
+        } else {
+            ((sp * std::f32::consts::TAU * WAVE_CYCLES) - ctx.phase * std::f32::consts::TAU).sin()
+                * amp
+        };
         // The wedge: fatter under the hand, settling into the leading behind
         // it. Shape, not light. Under the comet the wedge opens to
         // `prof.dn_ch` (`COMET_DN_HAND_CH`) at the hand, the lower lobe the
@@ -6170,8 +6202,9 @@ impl Ribbon {
         let bloom = clamp01(ctx.disp) * (1.0 - smoothstep01(behind / BLOOM_REACH_CELLS));
         // The lobe needs the leading below the row. The grid's last row has
         // none (its spine is clamped up by `dn`), so it keeps the flat wedge.
-        let room_below = self.pane_bot(ctx, chf)
-            - (f32::from(ctx.geom.origin_y) + (f32::from(cell.row) + 1.0) * chf);
+        let pane_bot = self.pane_bot(ctx, chf);
+        let row_bot = f32::from(ctx.geom.origin_y) + (f32::from(cell.row) + 1.0) * chf;
+        let room_below = pane_bot - row_bot;
         let last_row = room_below < prof.dn_ch * chf;
         let dn_ch = if last_row { DN_TOP_CH } else { prof.dn_ch };
         let dn_open = chf * (DN_FLOOR_CH + (dn_ch - DN_FLOOR_CH) * clamp01(bloom));
@@ -6196,8 +6229,8 @@ impl Ribbon {
         let up = (up_ch * chf + wave.min(0.0)).max(0.0)
             * (1.0 - FLOW_SETTLE_SHARE * settle)
             * (1.0 - breath);
-        let spine = (f32::from(ctx.geom.origin_y) + (f32::from(cell.row) + 1.0) * chf + wave)
-            .min(self.pane_bot(ctx, chf) - dn)
+        let spine = (row_bot + wave)
+            .min(pane_bot - dn)
             .max(ctx.geom.fx_top() as f32);
         (spine, up, dn, self.cov_of(ctx, cell, coh))
     }
@@ -6605,6 +6638,9 @@ impl Ribbon {
         // The boundary (index from `col0`) a hard edge doubled, if any (see
         // the block's right edge below); the head index accounts for it.
         let mut doubled: Option<usize> = None;
+        let caret_side_right = stream_dir < 0;
+        let ox = f32::from(ctx.geom.origin_x);
+        let slabs_f = slabs as f32;
         for boundary in u32::from(col0)..=u32::from(col1) + 1 {
             let left = boundary
                 .checked_sub(1)
@@ -6631,10 +6667,6 @@ impl Ribbon {
             left_sample = right.map(|_| sb);
             // The wipe runs from the cell's caret side: the right edge on a typed run, the left
             // on a leftward wake.
-            let caret_side_right = stream_dir < 0;
-            // The boundary is `a`'s right edge and `b`'s left edge.
-            let wa = self.wipe_of(ctx, a, if caret_side_right { 0.0 } else { 1.0 });
-            let wb = self.wipe_of(ctx, b, if caret_side_right { 1.0 } else { 0.0 });
             let mid = |u: f32, v: f32| (u + v) * 0.5;
             // The brighter side owns the boundary: shape and colour are the two cells'
             // midpoint, coverage the brighter cell's, and the dimmer reaches its own level
@@ -6642,8 +6674,13 @@ impl Ribbon {
             // spends. The right side enters at [`RUN_TAIL_EASE`], so an absent side leaves a
             // one-cell feather and a leaving neighbour hands it over as fast as its light goes.
             // At a seam the neighbour's vertex (left) or light (right) enters the same law.
-            let mut la = left.map_or(0.0, |_| sa.3 * wa);
-            let mut lb = right.map_or(0.0, |_| sb.3 * wb);
+            // The boundary is `a`'s right edge and `b`'s left edge.
+            let mut la = left.map_or(0.0, |_| {
+                sa.3 * self.wipe_of(ctx, a, if caret_side_right { 0.0 } else { 1.0 })
+            });
+            let mut lb = right.map_or(0.0, |_| {
+                sb.3 * self.wipe_of(ctx, b, if caret_side_right { 1.0 } else { 0.0 })
+            });
             let mut shape = (
                 mid(sa.0, sb.0),
                 mid(sa.1, sb.1),
@@ -6691,14 +6728,14 @@ impl Ribbon {
                     probe,
                 });
             }
-            let x = f32::from(ctx.geom.origin_x) + boundary as f32 * cw;
+            let x = ox + boundary as f32 * cw;
             if let Some((px, p)) = prev {
                 // The cell between `prev` and `here` is `a`: its interior never
                 // exceeds its own coverage, so a transition between two levels
                 // lives inside the dimmer cell, and inside a young cell that
                 // level is the wipe's at the slab.
                 for j in 1..slabs {
-                    let f = j as f32 / slabs as f32;
+                    let f = j as f32 / slabs_f;
                     let l = |u: f32, v: f32| u + (v - u) * f;
                     let own =
                         sa.3 * self.wipe_of(ctx, a, if caret_side_right { 1.0 - f } else { f });
@@ -6760,7 +6797,7 @@ impl Ribbon {
         {
             let x = px + cw;
             for j in 1..=slabs {
-                let f = j as f32 / slabs as f32;
+                let f = j as f32 / slabs_f;
                 let cov = af.level(self, ctx, f);
                 self.plan.push(Segment {
                     x: self.retract_x(ctx, coh, px + (x - px) * f).round(),
@@ -6827,7 +6864,8 @@ impl Ribbon {
             return;
         }
         let ink_from = frame.under.len();
-        let shoulder = Self::body_profile(ctx.cfg).shoulder;
+        let prof = Self::body_profile(ctx.cfg);
+        let shoulder = prof.shoulder;
         let rail = Self::rail_lit(ctx.cfg);
         let chf = ctx.geom.ch as f32;
         let ceiling = if ctx.cfg.dark_theme {
@@ -6837,8 +6875,8 @@ impl Ribbon {
         };
         let clip = ctx.geom.beam_clip();
         let budget = frame.under.len() + RIBBON_QUAD_BUDGET;
-        let core_up = Self::body_profile(ctx.cfg).core_up_ch * ctx.geom.ch as f32;
-        let lift_span = LEAD_CH * ctx.geom.ch as f32;
+        let core_up = prof.core_up_ch * chf;
+        let lift_span = LEAD_CH * chf;
         let mut verts = mem::take(&mut self.verts);
         let runs = mem::take(&mut self.runs);
         // One slab per vertex pair: the plan put a vertex on every slab
@@ -6854,6 +6892,8 @@ impl Ribbon {
             .map(|run| run.row)
             .filter(|&row| runs.iter().filter(|run| run.row == row).take(2).count() > 1);
         let pane_bot = self.pane_bot(ctx, chf);
+        let dn_floor = DN_FLOOR_CH * chf;
+        let rail_reach_max = RAIL_REACH_MAX_CH * chf;
         let plan = &self.plan;
         let ink = &self.ink;
         {
@@ -6866,14 +6906,12 @@ impl Ribbon {
                 verts.reserve(run.hi - run.lo);
                 // Laid head-first, so a capped run is repainted outward from its head and never
                 // drops the light beside the hand.
-                for seg in plan[run.lo..run.hi].iter().rev() {
-                    if rail_layer {
+                if rail_layer {
+                    for seg in plan[run.lo..run.hi].iter().rev() {
                         // The vivid rail lies below the row's bottom and uses
                         // the body's own lower reach, capped at the leading.
                         let top = row_bottom.max(seg.spine);
-                        let dn = (seg.spine + seg.dn - top)
-                            .max(DN_FLOOR_CH * chf)
-                            .min(RAIL_REACH_MAX_CH * chf);
+                        let dn = (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max);
                         verts.push(RibbonVertex {
                             x: seg.x,
                             spine: top,
@@ -6886,11 +6924,12 @@ impl Ribbon {
                             lift: 0.0,
                             lift_span: 0.0,
                         });
-                    } else {
+                    }
+                } else {
+                    for seg in plan[run.lo..run.hi].iter().rev() {
                         // The spine's strip is inside the body's one ceiling.
-                        let strip = (f32::from(seg.cov) * STRIP_LIFT_GAIN)
-                            .min(ceiling - f32::from(seg.cov))
-                            .max(0.0);
+                        let cov = f32::from(seg.cov);
+                        let strip = (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0);
                         verts.push(RibbonVertex {
                             x: seg.x,
                             spine: seg.spine,
@@ -6899,7 +6938,7 @@ impl Ribbon {
                             core_up,
                             core_dn: 0.0,
                             color: ink.at(seg.t),
-                            cov: f32::from(seg.cov),
+                            cov,
                             lift: strip,
                             lift_span,
                         });
@@ -7093,6 +7132,8 @@ impl Ribbon {
                 (lvl > 0.0).then_some((floor_x, lvl))
             });
         let reach = cells * cw;
+        let seam_lvl = seam.map_or(0.0, |(_, l)| l);
+        let intensity = clamp01(ctx.cfg.intensity);
         frame.beams.clear();
         for seg in self.plan[run.lo..run.hi]
             .iter()
@@ -7109,13 +7150,8 @@ impl Ribbon {
             // `max`, never add: the head's own falloff is byte-identical, and
             // the seam only ever lifts the tail to its level.
             let a = HOT_EDGE_ALPHA * (1.0 - d / cells).max(0.0).powi(2);
-            let a_rel = (a / HOT_EDGE_ALPHA).max(if in_seam {
-                seam.map_or(0.0, |(_, l)| l)
-            } else {
-                0.0
-            });
-            let cov = (HOT_EDGE_COV_MAX * a_rel * gain * clamp01(ctx.cfg.intensity))
-                .clamp(0.0, HOT_EDGE_COV_MAX);
+            let a_rel = (a / HOT_EDGE_ALPHA).max(if in_seam { seam_lvl } else { 0.0 });
+            let cov = (HOT_EDGE_COV_MAX * a_rel * gain * intensity).clamp(0.0, HOT_EDGE_COV_MAX);
             frame.beams.push(BeamVertex {
                 x: seg.x,
                 y: seg.spine - seg.up,
@@ -7164,16 +7200,21 @@ impl Ribbon {
         if let Some(t) = self.caret.and_then(|(row, col)| self.field_at(row, col)) {
             return t;
         }
-        let newest_typing = |row: Option<u16>| {
-            self.cells
-                .iter()
-                .filter(|c| c.typing && !c.leaving() && row.is_none_or(|r| c.row == r))
-                .max_by(|a, b| a.born.cmp(&b.born))
-                .map(|c| c.t)
-        };
-        newest_typing(self.caret.map(|(row, _)| row))
-            .or_else(|| newest_typing(None))
-            .unwrap_or(0.0)
+        let caret_row = self.caret.map(|(row, _)| row);
+        let mut best_on_row: Option<(Instant, f32)> = None;
+        let mut best_any: Option<(Instant, f32)> = None;
+        for c in &self.cells {
+            if !c.typing || c.leaving() {
+                continue;
+            }
+            if caret_row == Some(c.row) && best_on_row.is_none_or(|(b, _)| c.born >= b) {
+                best_on_row = Some((c.born, c.t));
+            }
+            if best_any.is_none_or(|(b, _)| c.born >= b) {
+                best_any = Some((c.born, c.t));
+            }
+        }
+        best_on_row.or(best_any).map_or(0.0, |(_, t)| t)
     }
 
     /// The source RGB a companion cursor inherits to meet the laid ribbon with no palette seam
@@ -7317,6 +7358,9 @@ impl Ribbon {
         let since = |at: Instant| now.saturating_duration_since(at).as_secs_f32();
         let dur = std::time::Duration::from_secs_f32;
         let reduced_fade_s = REDUCED_MOTION_FADE_MS / 1000.0;
+        let ember_left = self.ember_at.map(|at| FOCUS_EMBER_S - since(at));
+        let ember_u = self.ember_at.map(|at| clamp01(since(at) / FOCUS_EMBER_S));
+        let ember_spend = ember_u.map(spend);
         for cell in &self.cells {
             let coh = self.cohorts.iter().find(|c| c.id == cell.cohort);
             // The expiry clock is the cohort's (`live_since`), as `env_of`
@@ -7336,7 +7380,7 @@ impl Ribbon {
                     (!flowing).then_some(cell.life_s - age),
                     cell.retract_at.map(|at| RETRACT_FADE_S - since(at)),
                     cell.retire_at.map(|at| RETIRE_MELT_S - since(at)),
-                    self.ember_at.map(|at| FOCUS_EMBER_S - since(at)),
+                    ember_left,
                     coh.map(|c| c.swoosh_total() - c.idle_s(now)),
                 ];
                 for left in ends.into_iter().flatten() {
@@ -7350,7 +7394,6 @@ impl Ribbon {
             let retract_u = cell
                 .retract_at
                 .map(|at| clamp01(since(at) / RETRACT_FADE_S));
-            let ember_u = self.ember_at.map(|at| clamp01(since(at) / FOCUS_EMBER_S));
             let swoosh_u = coh.and_then(|c| {
                 let idle = c.idle_s(now);
                 if c.phase_at(idle) != Some(Phase::Fading) {
@@ -7369,7 +7412,7 @@ impl Ribbon {
             // `env_of` prices it.
             let carried = base * melt * f_r * f_s * f_m;
             let ember_floor = self.ember_floor_of(carried, cell.t);
-            let f_e = ember_u.map_or(1.0, |u| ember_level(ember_floor, spend(u)));
+            let f_e = ember_spend.map_or(1.0, |s| ember_level(ember_floor, s));
             if !flowing && let Some(step) = level_step_melt(base * f_r * f_e * f_s * f_m, u, life) {
                 cad.tail(step);
             }
@@ -7502,32 +7545,28 @@ impl Ribbon {
         // (`tests/midline_insert_colour_seam.rs`).
         let walk = self.cohorts[ci];
         let mut n = 0usize;
+        let (mut c0, mut c1) = (u16::MAX, 0u16);
         for c in &mut self.cells {
-            if c.row != row || c.cohort != cohort || c.leaving() || !(lo..=hi).contains(&c.col) {
+            if c.row != row || c.cohort != cohort {
                 continue;
             }
-            let Some(col) = c.col.checked_add_signed(dc) else {
-                continue;
-            };
-            moved.push((c.row, c.col, c.born));
-            c.col = col;
-            c.t = walk.t_at(col);
-            self.followed_now.push((row, col, c.born));
-            n += 1;
+            if !c.leaving()
+                && (lo..=hi).contains(&c.col)
+                && let Some(col) = c.col.checked_add_signed(dc)
+            {
+                moved.push((c.row, c.col, c.born));
+                c.col = col;
+                c.t = walk.t_at(col);
+                self.followed_now.push((row, col, c.born));
+                n += 1;
+            }
+            c0 = c0.min(c.col);
+            c1 = c1.max(c.col.saturating_add(1));
         }
         if n == 0 {
             return 0;
         }
         self.shifted_now.push((row, lo, hi, dc));
-        let (mut c0, mut c1) = (u16::MAX, 0u16);
-        for c in self
-            .cells
-            .iter()
-            .filter(|c| c.row == row && c.cohort == cohort)
-        {
-            c0 = c0.min(c.col);
-            c1 = c1.max(c.col.saturating_add(1));
-        }
         let coh = &mut self.cohorts[ci];
         coh.col0 = c0;
         coh.col1 = c1;
@@ -7583,16 +7622,28 @@ impl Ribbon {
         if dr == 0 || lo > hi {
             return 0;
         }
-        let inside = |c: &Cell| c.row == row && c.cohort == cohort && (lo..=hi).contains(&c.col);
-        let n = self.cells.iter().filter(|c| inside(c)).count();
-        if n == 0 {
-            return 0;
-        }
-        let all = self
+        let mut n = 0usize;
+        let mut all = 0usize;
+        let (mut c0, mut c1) = (u16::MAX, 0u16);
+        let (mut k0, mut k1) = (u16::MAX, 0u16);
+        for c in self
             .cells
             .iter()
             .filter(|c| c.row == row && c.cohort == cohort)
-            .count();
+        {
+            all += 1;
+            if (lo..=hi).contains(&c.col) {
+                n += 1;
+                c0 = c0.min(c.col);
+                c1 = c1.max(c.col + 1);
+            } else {
+                k0 = k0.min(c.col);
+                k1 = k1.max(c.col + 1);
+            }
+        }
+        if n == 0 {
+            return 0;
+        }
         let id = if all == n {
             self.cohorts[ci].row = new_row;
             cohort
@@ -7602,21 +7653,6 @@ impl Ribbon {
             self.next_cohort = self.next_cohort.wrapping_add(1);
             copy.row = new_row;
             copy.release_clock = None;
-            let (mut c0, mut c1) = (u16::MAX, 0u16);
-            let (mut k0, mut k1) = (u16::MAX, 0u16);
-            for c in self
-                .cells
-                .iter()
-                .filter(|c| c.row == row && c.cohort == cohort)
-            {
-                if inside(c) {
-                    c0 = c0.min(c.col);
-                    c1 = c1.max(c.col + 1);
-                } else {
-                    k0 = k0.min(c.col);
-                    k1 = k1.max(c.col + 1);
-                }
-            }
             copy.col0 = c0;
             copy.col1 = c1;
             // A split of a band already flowing keeps its frozen fold edge
@@ -7734,6 +7770,11 @@ impl Ribbon {
             .prev_space
             .filter(|&(row, _)| row >= rows)
             .map(|(row, col)| (row - rows, col));
+        self.attach = self
+            .attach
+            .filter(|&(row, _)| row >= rows)
+            .map(|(row, col)| (row - rows, col));
+        self.attach_floor = None;
         self.seam = self.seam.filter(|s| s.row >= rows).map(|s| Seam {
             row: s.row - rows,
             ..s
@@ -7745,6 +7786,14 @@ impl Ribbon {
         // A soft-wrapped word waiting for its reflow is dropped: a scroll between the wrap
         // and its reflow is not a shape the carry handles.
         self.carry = None;
+        if let Some(proof) = &mut self.short_reanchor {
+            proof.from.0 = proof.from.0.saturating_sub(rows);
+            proof.to.0 = proof.to.0.saturating_sub(rows);
+        }
+        if let Some(proof) = &mut self.rewrap_start {
+            proof.from.0 = proof.from.0.saturating_sub(rows);
+            proof.to.0 = proof.to.0.saturating_sub(rows);
+        }
         // The gate's row rides with its text; carried off the top it is dropped.
         if let Some(gate) = &mut self.fresh_line {
             gate.left_row = gate.left_row.and_then(|row| row.checked_sub(rows));
@@ -7809,6 +7858,10 @@ impl Ribbon {
         self.prev_space = self
             .prev_space
             .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
+        self.attach = self
+            .attach
+            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
+        self.attach_floor = None;
         self.seam = self
             .seam
             .and_then(|s| band_row(s.row, top, bottom, delta).map(|row| Seam { row, ..s }));
@@ -7818,6 +7871,14 @@ impl Ribbon {
         // …and a soft-wrapped word is dropped, as the whole-grid scroll drops
         // it ([`Ribbon::translate_scroll`]).
         self.carry = None;
+        if let Some(proof) = &mut self.short_reanchor {
+            proof.from.0 = band_pos(proof.from.0, top, bottom, delta);
+            proof.to.0 = band_pos(proof.to.0, top, bottom, delta);
+        }
+        if let Some(proof) = &mut self.rewrap_start {
+            proof.from.0 = band_pos(proof.from.0, top, bottom, delta);
+            proof.to.0 = band_pos(proof.to.0, top, bottom, delta);
+        }
         if let Some(gate) = &mut self.fresh_line {
             gate.left_row = gate
                 .left_row
@@ -7843,10 +7904,24 @@ impl Ribbon {
         self.hand_floor = self.hand_floor.map(|(r, c)| (map(r), c));
         self.last_space = self.last_space.map(|(r, c)| (map(r), c));
         self.prev_space = self.prev_space.map(|(r, c)| (map(r), c));
+        self.attach = self.attach.map(|(r, c)| (map(r), c));
+        self.attach_floor = None;
         self.relocate = self.relocate.map(|r| Relocate {
             row: map(r.row),
             ..r
         });
+        if let Some((sw, _)) = &mut self.carry {
+            sw.origin.0 = map(sw.origin.0);
+            sw.landing.0 = map(sw.landing.0);
+        }
+        if let Some(proof) = &mut self.short_reanchor {
+            proof.from.0 = map(proof.from.0);
+            proof.to.0 = map(proof.to.0);
+        }
+        if let Some(proof) = &mut self.rewrap_start {
+            proof.from.0 = map(proof.from.0);
+            proof.to.0 = map(proof.to.0);
+        }
         if let Some(gate) = &mut self.fresh_line {
             gate.left_row = gate.left_row.map(map);
         }
@@ -7883,6 +7958,21 @@ impl Ribbon {
         self.caret = None;
         self.ember_at = None;
         self.rearm = None;
+        self.clear_space_transient_state();
+        self.ink_quads = 0;
+        self.last_walk = None;
+        self.fresh_line = None;
+        self.seam = None;
+        // The phrase went with its cells; the hand's tempo and its last key
+        // are the hand's, not the coordinate space's, and stay.
+        self.phrase_open = None;
+        self.curtain = None;
+    }
+
+    /// Clear transient pen, carry, re-anchor, and follow state belonging to
+    /// the ending coordinate space (shared by [`Ribbon::curtain`] and
+    /// [`Ribbon::reset`]).
+    fn clear_space_transient_state(&mut self) {
         self.pending_erase = 0;
         self.pen = None;
         self.arrived = None;
@@ -7892,13 +7982,13 @@ impl Ribbon {
         self.relocate = None;
         self.carry = None;
         self.split_off = None;
-        self.last_walk = None;
-        self.fresh_line = None;
-        self.seam = None;
-        // The phrase went with its cells; the hand's tempo and its last key
-        // are the hand's, not the coordinate space's, and stay.
-        self.phrase_open = None;
-        self.curtain = None;
+        self.short_reanchor = None;
+        self.rewrap_start = None;
+        self.followed_now.clear();
+        self.shifted_now.clear();
+        self.scroll_followed = false;
+        self.attach = None;
+        self.attach_floor = None;
     }
 }
 
@@ -12257,9 +12347,10 @@ mod tests {
     #[test]
     fn a_fades_next_level_is_solved_not_polled() {
         let poll = |level_now: f32, curve: &dyn Fn(f32) -> f32, u: f32, span: f32| -> f32 {
-            let mut t = 0.0f32;
+            let mut step = 0u64;
             loop {
-                t += 0.000_01;
+                step += 1;
+                let t = (step as f64 * 1e-5) as f32;
                 if (curve(u + t / span)).round() < level_now {
                     return t;
                 }
@@ -12360,17 +12451,18 @@ mod tests {
             "a cell went dark under a hand still typing:\n{}",
             dark.join("\n")
         );
-        // The swoosh is still the ending: through the grace every cell stands, and
-        // SWOOSH_TOTAL_S after the last key the mark is gone.
+        // The swoosh is still the ending: through the PHRASE_REST_MIN_S grace every cell
+        // stands, and SWOOSH_TOTAL_S after the last key the mark is gone.
         let last = key_ms;
-        let cx = ctx_in(at(t0, last + 700), &c, (row, caret), 0.9, g);
+        let grace_ms = (PHRASE_REST_MIN_S * 1000.0) as u64;
+        let cx = ctx_in(at(t0, last + grace_ms), &c, (row, caret), 0.9, g);
         rib.plan(&cx);
         assert_eq!(
             (col0..caret)
                 .filter(|&col| rib.field_at(row, col).is_some())
                 .count(),
             usize::from(caret - col0),
-            "every cell stands through the 0.75 s grace"
+            "every cell stands through the {PHRASE_REST_MIN_S} s grace"
         );
         let gone = last + (SWOOSH_TOTAL_S * 1000.0) as u64 + 20;
         let cx = ctx_in(at(t0, gone), &c, (row, caret), 0.9, g);
@@ -14083,6 +14175,131 @@ mod tests {
             ms += 16;
         }
         assert!(drifted, "the band drifted toward its start");
+
+        // A public shift can put an old reach cell onto a newer leaving
+        // writer. Both residents price the kept edge, regardless of which
+        // side the hand is on or where each sits in the append-ordered pool.
+        for below in [false, true] {
+            for edge_disp in [0.0, 1.0] {
+                let mut rib = Ribbon::new();
+                // Establish the hand's floor, then let that old band leave.
+                type_run(&mut rib, t0, 0, 1, &c, 0.0);
+                rib.plan(&ctx(at(t0, 5000), &c, (2, 1), 0.0));
+                assert!(rib.at_rest());
+                let born = at(t0, 6000);
+                type_run(&mut rib, born, 10, 2, &c, 0.0);
+                let edge_at = at(born, 120);
+                let cx = ctx(edge_at, &c, (2, 13), edge_disp);
+                rib.on_event(&typed(), edge_at, &cx);
+                rib.plan(&cx);
+                let edge = *rib
+                    .cells()
+                    .iter()
+                    .find(|cell| cell.col == 12)
+                    .expect("edge");
+                let coh = *rib
+                    .cohorts()
+                    .iter()
+                    .find(|coh| coh.id == edge.cohort)
+                    .expect("band");
+                let reach_at = edge_at + Duration::from_secs_f32(coh.grace_s + 0.001);
+                assert_eq!(rib.retire_cells(&[(2, 12, edge.born)], reach_at), 1);
+                // The real reach pass appends column 9 on the cold tail's clock.
+                rib.plan(&ctx(reach_at, &c, (2, 13), 0.0));
+                let reach = *rib
+                    .cells()
+                    .iter()
+                    .find(|cell| cell.col == 9)
+                    .expect("reach");
+                assert!(!reach.leaving() && reach.born < edge.born);
+                let mut moved = Vec::new();
+                assert_eq!(
+                    rib.shift_run(
+                        super::super::witness::ShiftRun {
+                            row: 2,
+                            cohort: coh.id,
+                            lo: 9,
+                            hi: 9,
+                            dc: 3,
+                        },
+                        &mut moved
+                    ),
+                    1
+                );
+                // Widen the kept span so its cap distinguishes cold and hot pricing.
+                assert_eq!(
+                    rib.shift_run(
+                        super::super::witness::ShiftRun {
+                            row: 2,
+                            cohort: coh.id,
+                            lo: 10,
+                            hi: 11,
+                            dc: -8,
+                        },
+                        &mut moved
+                    ),
+                    2
+                );
+                let (edge_col, kept) = if below {
+                    assert_eq!(
+                        rib.shift_run(
+                            super::super::witness::ShiftRun {
+                                row: 2,
+                                cohort: coh.id,
+                                lo: 2,
+                                hi: 3,
+                                dc: 18,
+                            },
+                            &mut moved
+                        ),
+                        2
+                    );
+                    (12, 10.0)
+                } else {
+                    (12, 11.0)
+                };
+                let residents: Vec<_> = rib
+                    .cells()
+                    .iter()
+                    .filter(|cell| cell.col == edge_col)
+                    .collect();
+                assert_eq!(residents.len(), 2);
+                assert!(residents[0].leaving() && residents[0].born == edge.born);
+                assert!(!residents[1].leaving() && residents[1].born == reach.born);
+                assert_eq!(residents[0].birth_disp, edge_disp);
+                assert_eq!(residents[1].birth_disp, 0.0);
+                assert_eq!(
+                    rib.translate_run(
+                        super::super::witness::FollowRun {
+                            row: 2,
+                            cohort: coh.id,
+                            lo: 0,
+                            hi: u16::MAX,
+                            dr: 1,
+                        },
+                        reach_at,
+                        true,
+                        &mut moved
+                    ),
+                    4
+                );
+                let caret = (if below { 1 } else { 4 }, 13);
+                rib.plan(&ctx(at(reach_at, 1), &c, caret, 0.0));
+                let flowed = rib
+                    .cohorts()
+                    .iter()
+                    .find(|coh| coh.id == edge.cohort)
+                    .expect("flow");
+                assert_eq!(flowed.retract_col, Some(edge_col));
+                assert_eq!(flowed.drain_right_first, below);
+                let priced = if edge_disp == 0.0 {
+                    FLOW_DRIFT_MIN_CELLS
+                } else {
+                    FLOW_DRIFT_MAX_CELLS
+                };
+                assert_eq!(flowed.flow_drift, priced.min(FLOW_DRIFT_MAX_SHARE * kept));
+            }
+        }
     }
 
     /// A band move under the hand carries the seam and its floor together: the seam reaches
@@ -15381,5 +15598,56 @@ mod tests {
                 "{what}: the distant right tail should pay the budget, not the head"
             );
         }
+    }
+
+    #[test]
+    fn attach_cell_follows_scroll_band_and_hand_lift() {
+        let now = Instant::now();
+        let c = cfg(true, true);
+        let g = geom();
+        let mut rib = Ribbon::new();
+
+        // Lay a cell at (5, 4) with caret at (5, 5) and plan so `attach` is latched at (5, 5).
+        let cx5 = ctx_in(now, &c, (5, 5), 0.7, g);
+        rib.on_event(&typed(), now, &cx5);
+        rib.plan(&cx5);
+        assert_eq!(rib.attach, Some((5, 5)));
+
+        rib.translate_scroll(2);
+        assert_eq!(rib.attach, Some((3, 5)));
+        assert!(rib.attach_floor.is_none());
+
+        rib.translate_band(2, 6, 1);
+        assert_eq!(rib.attach, Some((4, 5)));
+
+        rib.lift_hand(4, 3);
+        assert_eq!(rib.attach, Some((3, 5)));
+        rib.carry = Some((
+            SoftWrap {
+                origin: (3, 79),
+                landing: (4, 2),
+                word_col0: 74,
+            },
+            now,
+        ));
+        rib.lift_hand(4, 5);
+        assert_eq!(
+            rib.carry.map(|(sw, _)| (sw.origin, sw.landing)),
+            Some(((3, 79), (5, 2)))
+        );
+
+        // Typing at the lifted caret (3, 6) lays at (3, 5) and inherits the spent attack from the translated attach.
+        let t_next = now + Duration::from_millis(20);
+        let cx3 = ctx_in(t_next, &c, (3, 6), 0.7, g);
+        rib.on_event(&typed(), t_next, &cx3);
+        let laid = rib
+            .cells()
+            .iter()
+            .find(|cell| cell.row == 3 && cell.col == 5)
+            .expect("cell laid at lifted caret");
+        assert!(
+            laid.attack_at < laid.born,
+            "typed cell at translated attach must inherit spent attack"
+        );
     }
 }

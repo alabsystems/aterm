@@ -290,6 +290,9 @@ struct Rig {
     asked: crate::harness::FakeInstanceLog,
     status_extra: Arc<Mutex<String>>,
     twin: PathBuf,
+    /// The harness's waits on the test's thread run on their own steps
+    /// ([`crate::harness::relaunch::virtual_waits`]): every stand-in here answers at once.
+    _waits: crate::harness::relaunch::VirtualWaits,
 }
 
 impl Rig {
@@ -359,6 +362,7 @@ impl Rig {
             marks: asked.clone(),
         };
         Rig {
+            _waits: crate::harness::relaunch::virtual_waits(),
             dir,
             opts,
             home,

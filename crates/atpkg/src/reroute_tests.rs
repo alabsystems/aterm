@@ -16,12 +16,11 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
 
-/// Replace whatever is at `at` with `bytes`, or with a symlink to `target`, by rename,
-/// so the directory entry is the old one or the new one, never neither. That is NOT
-/// safe under a concurrent run when the entry replaced is a SYMLINK: a call that reads
-/// it while it is renamed over — `readlink`, or a path walk following it — fails
-/// EINVAL ([`managed_target`] has the measurement), so a shared symlink is laid only
-/// when it is wrong.
+/// Replace whatever is at `at` with `bytes`, or with a symlink to `target`, by rename, so
+/// the entry is the old one or the new one, never neither. That is not safe under a
+/// concurrent run for a symlink: a `readlink` or path walk through it while it is renamed
+/// over fails EINVAL ([`managed_target`] has the measurement), so a shared symlink is laid
+/// only when it is wrong.
 #[cfg(unix)]
 fn lay_by_rename(at: &Path, bytes: Option<&str>, target: Option<&Path>) {
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -36,9 +35,9 @@ fn lay_by_rename(at: &Path, bytes: Option<&str>, target: Option<&Path>) {
     std::fs::rename(&tmp, at).unwrap();
 }
 
-/// The ONE fake program: it prints the label on the first line of the `.who` file
-/// beside the name it was run by, then its arguments, and exits with the code on that
-/// file's second line (0 when there is none).
+/// The one fake program: it prints the label on the first line of the `.who` file beside
+/// the name it was run by, then its arguments, and exits with the code on that file's
+/// second line (0 when there is none).
 #[cfg(unix)]
 const FAKE: &str = "#!/bin/sh\n{ IFS= read -r who; IFS= read -r code; } < \"$0.who\"\n\
                     echo \"$who: $*\"\nexit \"${code:-0}\"\n";
@@ -54,9 +53,9 @@ fn place_fake(at: &Path, who: &str) -> PathBuf {
     at.to_path_buf()
 }
 
-/// `stub` run the way the kernel runs its `#!/bin/sh` line — see [`assessed`]. Only a
-/// stub the kernel WOULD hand to `/bin/sh`: executable, first line `#!/bin/sh`. So the
-/// one thing this changes is which process pays the first-exec assessment.
+/// `stub` run the way the kernel runs its `#!/bin/sh` line (see [`assessed`]). Only a stub
+/// the kernel would hand to `/bin/sh`: executable, first line `#!/bin/sh`. So the one thing
+/// this changes is which process pays the first-exec assessment.
 #[cfg(unix)]
 fn sh(stub: &Path) -> std::process::Command {
     let mode = std::fs::metadata(stub).unwrap().permissions().mode();
@@ -394,8 +393,8 @@ fn lay_claims_absent_and_own_files_never_foreign_ones_and_remove_all_sweeps_only
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// The CPU time a pid has consumed, as `ps` spells it, or `None` when `ps`
-/// cannot answer. Read ONLY to describe a timeout — never to decide one.
+/// The CPU time a pid has consumed, as `ps` spells it, or `None` when `ps` cannot answer.
+/// Read only to describe a timeout, never to decide one.
 #[cfg(unix)]
 fn child_cpu_time(pid: u32) -> Option<String> {
     let out = std::process::Command::new("/bin/ps")
@@ -406,8 +405,7 @@ fn child_cpu_time(pid: u32) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
-/// Run `cmd`, killing it after `secs` — an exec loop must fail this test,
-/// not hang it.
+/// Run `cmd`, killing it after `secs`: an exec loop fails the test rather than hanging it.
 #[cfg(unix)]
 fn output_within(mut cmd: std::process::Command, secs: u64) -> std::process::Output {
     use std::io::Read as _;
@@ -440,20 +438,10 @@ fn output_within(mut cmd: std::process::Command, secs: u64) -> std::process::Out
             };
         }
         if std::time::Instant::now() > deadline {
-            // A BOUND ON OUR PATIENCE IS NOT A FACT ABOUT THE STUB.
-            //
-            // This used to panic with "an exec loop" — a diagnosis nothing
-            // here had measured. The bound is a minute at every call, and the two
-            // things that exhaust it are NOT alike: an exec loop replaces
-            // the image in the SAME pid over and over and burns CPU, while
-            // a stub the test has just written can sit at ~0% CPU for
-            // seconds while macOS `syspolicyd` assesses it under load (a
-            // recorded hazard on this machine). Calling the second one an
-            // exec loop sends the reader hunting a bug that is not there.
-            //
-            // So the pid is ASKED before it is killed. `ps -o time=` is the
-            // CPU the process has actually consumed; it is the one cheap
-            // measurement that separates spinning from blocked.
+            // A timeout is not yet a diagnosis: an exec loop burns CPU in the same pid,
+            // while a stub the test just wrote can sit near 0% CPU while macOS
+            // `syspolicyd` assesses it under load. `ps -o time=` before the kill tells
+            // spinning from blocked.
             let burned = child_cpu_time(child.id());
             let _ = child.kill();
             let _ = child.wait();
@@ -470,9 +458,8 @@ fn output_within(mut cmd: std::process::Command, secs: u64) -> std::process::Out
     }
 }
 
-/// The 2026-09-07 review's reproduction: with a SECOND reroute directory on
-/// PATH — another prefix's, a symlink to ours, ours with a trailing slash —
-/// the escape must still reach upstream, not exec the other stub forever.
+/// With a second reroute directory on PATH (another prefix's, a symlink to ours, ours with
+/// a trailing slash) the escape still reaches upstream, not the other stub forever.
 #[cfg(unix)]
 #[test]
 fn escape_walk_skips_every_reroute_directory_not_just_its_own() {
@@ -480,8 +467,8 @@ fn escape_walk_skips_every_reroute_directory_not_just_its_own() {
     let other = layout("second-spelling-other-prefix");
     lay(&l).unwrap();
     lay(&other).unwrap();
-    // The upstream copy lives OUTSIDE every manager prefix, as it does on a
-    // real machine (~/.cargo/bin); a walk skips anything under a prefix.
+    // The upstream copy lives outside every manager prefix, as on a real machine
+    // (~/.cargo/bin); a walk skips anything under a prefix.
     let upstream_dir = crate::testdir::dir("atpkg-reroute-upstream-");
     place_fake(&upstream_dir.join("cargo"), "upstream");
     let link = l.prefix.join("link-to-reroute");
@@ -501,10 +488,8 @@ fn escape_walk_skips_every_reroute_directory_not_just_its_own() {
         cmd.args(["build"])
             .env("PATH", &path_env)
             .env(PASSTHROUGH_ENV, "1");
-        // 60 s, not 5: the bound's only job is to tell "wedged" from
-        // "slow", and an exec loop never finishes, so a longer wait costs
-        // this test nothing when it is right and removes nearly all of the
-        // window in which a loaded machine can be accused of one.
+        // 60 s: the bound only tells "wedged" from "slow", and an exec loop never
+        // finishes, so a long wait costs nothing when the stub is right.
         let out = output_within(cmd, 60);
         assert_eq!(
             out.status.code(),
@@ -720,7 +705,7 @@ fn plan_pinned(
     plan_with(name, call, announce, false, upstream, branded, pin)
 }
 
-/// [`plan_on`] under `[reroute] strict = true` — the refusals of before 2026-09-29.
+/// [`plan_on`] under `[reroute] strict = true`, where the refusals stand.
 fn plan_strict(name: &str, call: &[&str], upstream: Option<&str>, branded: &[&str]) -> Plan {
     plan_with(name, call, true, true, upstream, branded, None)
 }
@@ -795,8 +780,8 @@ fn stock_at(name: &str, channel: &str, picked: Picked) -> Resolved {
     }
 }
 
-/// What the test machine's rustup resolves `name` to: Trust for `+trust…`, stock for
-/// any other `+<channel>`, and — for a bare name — stock 1.97.1 for a reason unsaid.
+/// What the test machine's rustup resolves `name` to: Trust for `+trust…`, stock for any
+/// other `+<channel>`, and stock 1.97.1 for a bare name.
 fn resolved(name: &str, toolchain: Option<&str>) -> Resolved {
     match toolchain {
         Some(tc) if rust_lane::is_trust_channel(tc) => trust_at(name, Picked::CommandLine),
@@ -831,8 +816,8 @@ fn plan_resolving(
 
 const UP: &str = "/usr/bin/up";
 
-/// NOTHING IS ANNOUNCED THAT WILL NOT RUN: with nothing to run, one answer says so —
-/// never a "running" line first — and the setting does not silence it.
+/// Nothing is announced that will not run: with nothing to run, one answer says so (never
+/// a "running" line first), and the setting does not silence it.
 #[test]
 fn a_plan_with_nothing_to_run_says_only_that() {
     for (name, call, upstream, branded) in [
@@ -861,10 +846,10 @@ fn a_plan_with_nothing_to_run_says_only_that() {
     }
 }
 
-/// THE 2026-09-29 RULING, AT THE DECISION POINT: a DIRECT row whose Trust tool is
-/// missing RUNS the upstream tool the caller named — the caller's own arguments, one
-/// line first naming the fix, the line silenced by `[reroute] announce = false` — and
-/// `[reroute] strict = true` restores the refusal byte for byte.
+/// A DIRECT row whose Trust tool is missing runs the upstream tool the caller named, with
+/// the caller's own arguments and one line first naming the fix (silenced by
+/// `[reroute] announce = false`); `[reroute] strict = true` restores the refusal byte for
+/// byte.
 #[test]
 fn a_missing_trust_tool_runs_upstream_with_a_line_and_strict_refuses() {
     for (name, branded) in [
@@ -908,10 +893,9 @@ fn a_missing_trust_tool_runs_upstream_with_a_line_and_strict_refuses() {
     }
 }
 
-/// z3 (2026-09-29): announce, naming `ay`, then run upstream — the caller's own
-/// arguments; the setting silences the line; strict refuses, naming the path, as
-/// before. A machine without `ay` is told the command that installs it, never
-/// pointed at a tool it lacks.
+/// z3: announce, naming `ay`, then run upstream with the caller's own arguments; the
+/// setting silences the line; strict refuses, naming the path. A machine without `ay` is
+/// told the command that installs it.
 #[test]
 fn z3_runs_upstream_naming_ay_and_strict_refuses() {
     for installed in [&["ay"][..], &[][..]] {
@@ -985,9 +969,9 @@ fn storeless_on(
     storeless_plan(row_for(name).unwrap(), &args(call), &machine)
 }
 
-/// No store resolves (`atpkg __reroute` under `env -i`): the upstream copy runs after
-/// one line; strict refuses as before; with no copy, 127's line. A row that names no
-/// compiler is never resolved.
+/// No store resolves (`atpkg __reroute` under `env -i`): the upstream copy runs after one
+/// line; strict refuses; with no copy, 127's line. A row that names no compiler is never
+/// resolved.
 #[test]
 fn no_store_runs_upstream_and_strict_refuses() {
     let call = args(&["x.rs"]);
@@ -1028,11 +1012,9 @@ fn no_store_runs_upstream_and_strict_refuses() {
     ));
 }
 
-/// NO STORE IS NO WAY ROUND THE CHECKOUT (2026-10-01 review, reproduced: `env -i PATH=…
-/// atpkg __reroute rustc main.rs` two levels inside a Trust checkout ran a stock rustc,
-/// under "running upstream 'rustc'"). A `cargo`/`rustc` with no store is resolved and
-/// judged as with one: refused there when not Trust, its line naming what runs
-/// elsewhere — and resolved only where a line names it or a checkout judges it.
+/// No store is no way round the checkout: a `cargo`/`rustc` with no store is resolved and
+/// judged as with one, refused inside a Trust checkout when not Trust and named by what
+/// runs elsewhere, and resolved only where a line names it or a checkout judges it.
 #[test]
 fn with_no_store_a_compiler_is_named_and_judged_in_a_trust_checkout() {
     let stock = |name: &str| stock_at(name, "1.97.1", Picked::Unsaid);
@@ -1099,12 +1081,9 @@ fn with_no_store_a_compiler_is_named_and_judged_in_a_trust_checkout() {
     );
 }
 
-/// A CHILD OF A COMMAND THE REROUTE RAN ([`ANNOUNCED_ENV`], 2026-10-01): never announced
-/// again, and upstream as typed — a DIRECT row's too, whatever is installed — but a
-/// `cargo`/`rustc` inside a Trust source checkout is judged as the same name typed
-/// alone. Reproduced by the review before: a Trust `cargo demo` the reroute allowed
-/// there handed its tree the ESCAPE, and the `rustc +1.97.1 -V` its subcommand spawned
-/// ran stock with no line, where typed alone it was refused.
+/// A child of a command the reroute ran ([`ANNOUNCED_ENV`]) is never announced again and
+/// runs upstream as typed (a DIRECT row's too, whatever is installed), but a
+/// `cargo`/`rustc` inside a Trust source checkout is judged as the same name typed alone.
 #[test]
 fn a_child_of_a_command_the_reroute_ran_is_quiet_and_judged() {
     let child = |name: &str,
@@ -1131,7 +1110,7 @@ fn a_child_of_a_command_the_reroute_ran_is_quiet_and_judged() {
         args: args(call),
     };
     let in_checkout = || Some(PathBuf::from("/t"));
-    // The reviewer's case: `rustc +1.97.1 -V` under a Trust cargo, inside the checkout.
+    // `rustc +1.97.1 -V` under a Trust cargo, inside the checkout.
     let stock = stock_at("rustc", "1.97.1", Picked::CommandLine);
     assert_eq!(
         child(
@@ -1215,7 +1194,7 @@ fn a_branded_tool_that_cannot_run_names_the_fix_that_works() {
         }
     );
     // A lost shim, an upstream copy on PATH: upstream runs, the line names `repair`;
-    // strict refuses with the same fix, as before.
+    // strict refuses with the same fix.
     let lost = |strict: bool, upstream: Option<PathBuf>| {
         move |row: &str, call: &[&str]| {
             let machine = Machine {
@@ -1483,13 +1462,10 @@ fn a_plan_runs_what_was_asked_with_the_callers_arguments() {
     assert_eq!((copy, argv), (store("targo"), args(&["trust", "build"])));
 }
 
-/// THE INCIDENT'S COMMAND (2026-09-23): `cargo +1.97.1 test -p x` in a session.
-/// Measured before on the installed aterm 0.91.0: ONE line naming only `targo trust
-/// <verb>` — no arguments, and not the unverified lane the agents needed — and 33
-/// agent logs carried it beside a stock run. Now the first line says what runs, the
-/// Trust spelling of the very command follows in both lanes, and one line says a
-/// stock channel moves only rustup's proxies. Upstream still runs as named (announce,
-/// never prevent), and the setting silences the lines, never the run.
+/// `cargo +1.97.1 test -p x` in a session: the first line says what runs, the Trust
+/// spelling of the very command follows in both lanes, and one line says a stock channel
+/// moves only rustup's proxies. Upstream still runs as named, and the setting silences the
+/// lines, never the run.
 #[test]
 fn a_stock_channel_signposts_the_trust_spelling_and_runs_upstream_as_named() {
     let call = ["+1.97.1", "test", "-p", "x"];
@@ -1533,12 +1509,9 @@ fn a_stock_channel_signposts_the_trust_spelling_and_runs_upstream_as_named() {
     );
 }
 
-/// HOST-05's second half, measured before this change: `rustfmt +1.97.1 --check x.rs`
-/// in a session ran trustfmt with `+1.97.1` as a FILE (`Error: file '+1.97.1' does not
-/// exist`, exit 1) — and it still did on main's `plan` until this change. A DIRECT
-/// Rust row never hands a rustup directive to its branded tool: a stock one is
-/// signposted and runs upstream as named, `+trust…` is dropped and the branded tool
-/// runs.
+/// A DIRECT Rust row never hands a rustup directive to its branded tool: a stock one
+/// (`rustfmt +1.97.1 --check x.rs`) is signposted and runs upstream as named, `+trust…` is
+/// dropped and the branded tool runs.
 #[test]
 fn a_direct_row_never_hands_a_rustup_directive_to_the_branded_tool() {
     let call = ["+1.97.1", "--check", "x.rs"];
@@ -1743,12 +1716,11 @@ fn a_resolution_is_asked_only_where_it_is_said_or_judged() {
     ));
 }
 
-/// INSIDE A TRUST SOURCE CHECKOUT only Trust runs by name (the owner's "NO STOCK RUST IN
-/// THE TOOLCHAIN FOR TRUST"): a `cargo`/`rustc` that
-/// resolves to STOCK — bare, pinned or `+<channel>` — or to anything not known to be
-/// Trust is refused (exit 2) with what it resolved to, the checkout, the Trust spelling
-/// and how to run it anyway; the setting that silences a signpost does not
-/// silence a refusal. Trust there runs as anywhere.
+/// Inside a Trust source checkout only Trust runs by name: a `cargo`/`rustc` that resolves
+/// to stock (bare, pinned or `+<channel>`) or to anything not known to be Trust is refused
+/// (exit 2) with what it resolved to, the checkout, the Trust spelling and how to run it
+/// anyway; the setting that silences a signpost does not silence a refusal. Trust there
+/// runs as anywhere.
 #[test]
 fn inside_a_trust_checkout_only_trust_runs_by_name() {
     let stock = |_: &Path, tc: Option<&str>| resolved("cargo", tc);
@@ -1881,7 +1853,7 @@ fn escape_hatch_dispatch_and_fail_closed_run_in_a_real_shell() {
             String::from_utf8_lossy(&out.stdout),
             "upstream: build --x [1/]\n"
         );
-        // Escape present but empty / zero: NOT engaged.
+        // Escape present but empty / zero: not engaged.
         for v in ["", "0"] {
             let out = run(&stub_body_sh("cargo", &fake, &d, strict), Some(v));
             assert_eq!(
@@ -1944,9 +1916,9 @@ fn escape_hatch_dispatch_and_fail_closed_run_in_a_real_shell() {
         String::from_utf8_lossy(&out.stdout).is_empty(),
         "stdout must stay clean"
     );
-    // NAMING NO ATPKG (the empty path, `crate::stub::named(None)`): `ATPKG=''`, which the
-    // `[ -x ]` refuses — the first absolute-entry atpkg on PATH answers, and with none the same
-    // answer as a dangling path, in each mode.
+    // Naming no atpkg (`crate::stub::named(None)`): `ATPKG=''`, which `[ -x ]` refuses; the
+    // first absolute-entry atpkg on PATH answers, and with none the same answer as a
+    // dangling path, in each mode.
     let none = stub_body_sh("cargo", crate::stub::named(None), &d, false);
     assert!(none.contains("\nATPKG=''\n"), "{none}");
     let out = run(&none, None);
@@ -1985,10 +1957,9 @@ fn escape_hatch_dispatch_and_fail_closed_run_in_a_real_shell() {
         "path atpkg: __reroute cargo build\n",
         "no atpkg named: the one on PATH answers"
     );
-    // ... but never one a RELATIVE or EMPTY entry names (2026-10-01 security review):
-    // `.` and a stray `:` both mean the current directory, which here is a tree holding
-    // its own `atpkg`. The shell's `command -v` ran it; the absolute-entry walk passes
-    // it by and runs upstream, as with no atpkg at all.
+    // ... but never one a relative or empty entry names: `.` and a stray `:` both mean the
+    // current directory, here a tree holding its own `atpkg`; the absolute-entry walk
+    // passes it by and runs upstream, as with no atpkg at all.
     let cwd_atpkg = l.prefix.join("cloned");
     place_fake(&cwd_atpkg.join("atpkg"), "cwd atpkg\n3");
     for relative in [".", ""] {
@@ -2011,13 +1982,12 @@ fn escape_hatch_dispatch_and_fail_closed_run_in_a_real_shell() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A CHILD OF A COMMAND THE REROUTE RAN, in a real `/bin/sh` (2026-10-01): a
-/// `cargo`/`rustc` stub under [`ANNOUNCED_ENV`] runs upstream with no atpkg and no line —
-/// unless the directory may be inside a Rust source checkout, PHYSICALLY (a `$PWD`
-/// through a symlink from outside hides nothing), where atpkg is asked. Every other stub
-/// passes it through like the escape. With atpkg unreachable, a `cargo`/`rustc` inside a
-/// Trust checkout does not run — in either marker state — while one in an upstream Rust
-/// checkout runs after the fallback's line, as anywhere.
+/// A child of a command the reroute ran, in a real `/bin/sh`: a `cargo`/`rustc` stub under
+/// [`ANNOUNCED_ENV`] runs upstream with no atpkg and no line, unless the directory may be
+/// inside a Rust source checkout, physically (a `$PWD` through a symlink hides nothing),
+/// where atpkg is asked. Every other stub passes it through like the escape. With atpkg
+/// unreachable, a `cargo`/`rustc` inside a Trust checkout does not run in either marker
+/// state, while one in an upstream Rust checkout runs after the fallback's line.
 #[cfg(unix)]
 #[test]
 fn an_announced_child_asks_atpkg_only_where_a_checkout_may_be() {
@@ -2114,7 +2084,7 @@ fn an_announced_child_asks_atpkg_only_where_a_checkout_may_be() {
     );
     // A name that is never judged passes the marker through, even in a Trust checkout.
     assert_eq!(run("rustfmt", &fake, &trust, &child), upstream);
-    // ATPKG UNREACHABLE: a Trust checkout refuses cargo/rustc, marked or not; an upstream
+    // Atpkg unreachable: a Trust checkout refuses cargo/rustc, marked or not; an upstream
     // checkout and a plain directory run upstream after the fallback's line.
     let gone = Path::new("/gone/atpkg");
     for env in [&[][..], &child[..]] {
@@ -2149,12 +2119,10 @@ fn an_announced_child_asks_atpkg_only_where_a_checkout_may_be() {
         ),
         "only a compiler is judged"
     );
-    // A STOCK CARGO'S OWN COMPILE ([`CARGO_CRATE_ENV`] without [`TARGO_CRATE_ENV`]) is a
-    // child as an announced one is, whichever way that cargo started: outside a checkout
-    // upstream, said nothing, the marker stamped on it; inside one a `rustc` goes to atpkg
-    // marked, so it is judged and not announced — a cached `rustc -vV` in the cargo's
-    // target dir is no way past the refusal. `rustdoc` is never judged. Trust's cargo's
-    // compile, marked twice, is the ordinary dispatch.
+    // A stock cargo's own compile ([`CARGO_CRATE_ENV`] without [`TARGO_CRATE_ENV`]) is a
+    // child as an announced one is: outside a checkout upstream, saying nothing, the marker
+    // stamped on it; inside one a `rustc` goes to atpkg marked, judged and not announced.
+    // `rustdoc` is never judged. Trust's cargo's compile is the ordinary dispatch.
     let compile = [(CARGO_CRATE_ENV, "dep1")];
     let trust_compile = [(CARGO_CRATE_ENV, "dep1"), (TARGO_CRATE_ENV, "dep1")];
     for name in ["rustc", "rustdoc"] {
@@ -2190,11 +2158,10 @@ fn an_announced_child_asks_atpkg_only_where_a_checkout_may_be() {
     assert_eq!(run("rustc", gone, &plain, &compile), upstream);
 }
 
-/// WHICH ATPKG A LAY NAMES, through the real [`lay_with`] (D1, 2026-09-25): a
-/// `target/` build with a live `atpkg` beside it never takes the stubs from the installed
-/// app, nor does a copy with none beside it; the installed app takes them from the
-/// `target/` build, and a moved app from its own gone path — the negative control that
-/// keeps this from passing for a lay that re-points nothing.
+/// Which atpkg a lay names, through the real [`lay_with`]: a `target/` build with a live
+/// `atpkg` beside it never takes the stubs from the installed app, nor does a copy with
+/// none beside it; the installed app takes them from the `target/` build, and a moved app
+/// from its own gone path (the negative control).
 #[cfg(unix)]
 #[test]
 fn a_target_build_never_takes_the_stubs_from_the_installed_app() {
@@ -2235,11 +2202,11 @@ fn a_target_build_never_takes_the_stubs_from_the_installed_app() {
     // A target/ build, its atpkg live: nothing re-pointed.
     lay_with(&l, &as_process(&target_build), false).unwrap();
     assert_eq!(named(&l), all(&installed), "a target/ build took the stubs");
-    // A copy with no atpkg beside it (D1): nothing re-pointed.
+    // A copy with no atpkg beside it: nothing re-pointed.
     lay_with(&l, &as_process(&root.join("scratch/bin/atpkg")), false).unwrap();
     assert_eq!(named(&l), all(&installed), "a missing atpkg was named");
-    // NEGATIVE CONTROLS. With the stubs on the target/ build, the installed app takes
-    // them back; and once the app has moved (the old path gone), the new path takes them.
+    // Negative controls: with the stubs on the target/ build, the installed app takes them
+    // back; once the app has moved (the old path gone), the new path takes them.
     let fresh = Layout {
         prefix: l.prefix.join("fresh"),
     };
@@ -2262,8 +2229,8 @@ fn a_target_build_never_takes_the_stubs_from_the_installed_app() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A fake program at `dir/name` that prints `<who>: <args>` — never a real vendor
-/// binary (a quarantined download raises a Gatekeeper dialog; owner, 2026-09-23).
+/// A fake program at `dir/name` that prints `<who>: <args>`, never a real vendor binary (a
+/// quarantined download raises a Gatekeeper dialog).
 #[cfg(unix)]
 fn fake(dir: &Path, name: &str, who: &str) -> PathBuf {
     place_fake(&dir.join(name), who)
@@ -2285,20 +2252,12 @@ fn fake_twin(l: &Layout, name: &str) -> PathBuf {
     at
 }
 
-/// The managed target a [`fake_twin`] execs: `managed-<name>` beside the programs, a
-/// symlink to [`FAKE`] labelled `managed <name>`. ONE path, shared by every test that
-/// makes a twin for `name` — so it is laid only when it is not already exactly that,
-/// under one lock: once in a fresh target dir, and never while a test runs through it.
-///
-/// Every `fake_twin` call used to re-lay it by rename, and on Darwin a call that READS a
-/// symlink while `rename(2)` replaces it fails with EINVAL — `readlink`, and `open`,
-/// `stat` and `execve` following it — while `lstat` of it, a follow of a symlink whose
-/// REGULAR-file target is renamed over, and a renamed-over regular file never fail
-/// (measured 2026-09-25, Darwin 25.6 / APFS: 1–2% of calls under a tight rename loop).
-/// So a parallel test laying its twin failed this one's `/bin/sh`, started by the
-/// kernel for the `#!/bin/sh` behind the link, as `/bin/sh: …/managed-claude: Invalid
-/// argument` (exit 126) — or the twin's own `exec`, as `bad interpreter: Invalid
-/// argument`. A rename is atomic for the directory entry, not for a walk through it.
+/// The managed target a [`fake_twin`] execs: `managed-<name>` beside the programs, a symlink
+/// to [`FAKE`] labelled `managed <name>`, shared by every test that makes a twin for `name`,
+/// so laid only when it is not already exactly that, under one lock. On APFS a call that
+/// reads a symlink while `rename(2)` replaces it (`readlink`, or `open`/`stat`/`execve`
+/// following it) fails EINVAL, 1–2% of calls under a tight rename loop; `lstat` and a
+/// renamed-over regular file never fail.
 #[cfg(unix)]
 fn managed_target(name: &str) -> PathBuf {
     static LAYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2316,8 +2275,8 @@ fn managed_target(name: &str) -> PathBuf {
     target
 }
 
-/// `name` run through `stub` on `path`, with every marker and the escape CLEARED from
-/// the inherited environment (this suite may itself run inside aterm) and `env` set.
+/// `name` run through `stub` on `path`, with every marker and the escape cleared from the
+/// inherited environment (this suite may itself run inside aterm) and `env` set.
 #[cfg(unix)]
 fn run_stub(stub: &Path, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = sh(stub);
@@ -2332,12 +2291,11 @@ fn run_stub(stub: &Path, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::p
     output_within(cmd, 60)
 }
 
-/// THE OWNER'S CASE, 2026-09-23, IN A REAL `/bin/sh`: a session shell from 2026-09-10
-/// whose PATH is `reroute, ~/.local/bin, /opt/homebrew/bin, pkg/bin` with NO
-/// `pkg/agents` runs the managed copy the moment the stub decides — inside aterm, on
-/// any one of the four markers. Outside aterm the same stub is a pure pass-through to
-/// the user's own copy, even with `agents/` leaked onto PATH ahead of it (owner law,
-/// 03513b5d7). `claude` and `codex` alike.
+/// A long-lived session shell whose PATH is `reroute, ~/.local/bin, /opt/homebrew/bin,
+/// pkg/bin` with no `pkg/agents` runs the managed copy the moment the stub decides, inside
+/// aterm, on any one of the four markers. Outside aterm the same stub is a pure
+/// pass-through to the user's own copy, even with `agents/` leaked onto PATH ahead of it.
+/// `claude` and `codex` alike.
 #[cfg(unix)]
 #[test]
 fn an_agents_stub_runs_the_twin_inside_aterm_and_the_users_own_copy_outside() {
@@ -2380,14 +2338,14 @@ fn an_agents_stub_runs_the_twin_inside_aterm_and_the_users_own_copy_outside() {
         };
         let managed = format!("managed {name}: --version x y\n");
         let own = format!("local {name}: --version x y\n");
-        // Inside aterm, on EACH marker alone: the twin, whatever PATH puts ahead.
+        // Inside aterm, on each marker alone: the twin, whatever PATH puts ahead.
         for marker in crate::hooks::AGENTS_MARKERS {
             for path in [&stale, &leaked] {
                 let out = run_stub(&stub, path, &[(marker, "1")]);
                 assert_eq!(stdout(&out), managed, "{name} under {marker}");
             }
         }
-        // A marker set but EMPTY is not set (`-n` on the joined word).
+        // A marker set but empty is not set (`-n` on the joined word).
         let out = run_stub(&stub, &stale, &[("ATERM_CHILD", "")]);
         assert_eq!(stdout(&out), own, "{name}: an empty marker");
         // Outside aterm: the user's own copy — never the managed one, even leaked.
@@ -2441,10 +2399,10 @@ fn an_agents_stub_runs_the_twin_inside_aterm_and_the_users_own_copy_outside() {
     });
 }
 
-/// NO RECURSION: a second reroute directory on PATH — another prefix's, holding its
-/// own `claude` stub, a symlink to ours, ours with a trailing slash — `agents/` under
-/// another spelling, and a symlink to the stub FILE in an ordinary directory are all
-/// walked past, inside aterm and out, in bounded time.
+/// No recursion: a second reroute directory on PATH (another prefix's, holding its own
+/// `claude` stub, a symlink to ours, ours with a trailing slash), `agents/` under another
+/// spelling, and a symlink to the stub file in an ordinary directory are all walked past,
+/// inside aterm and out, in bounded time.
 #[cfg(unix)]
 #[test]
 fn an_agents_stub_never_runs_another_stub_or_itself() {
@@ -2497,10 +2455,9 @@ fn an_agents_stub_never_runs_another_stub_or_itself() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // …and the OTHER prefix's stub (its twin gone, so it passes through), entered
-    // first, walks past every reroute spelling of ours too. (It skips its OWN
-    // `agents/` only — our `agents/` is left off this PATH, the nested-prefix corner
-    // the pass-through does not claim to cover.)
+    // …and the other prefix's stub (its twin gone, so it passes through), entered first,
+    // walks past every reroute spelling of ours too. (It skips its own `agents/` only; ours
+    // is left off this PATH, the nested-prefix corner the pass-through does not cover.)
     let path = std::env::join_paths([
         dir(&other).into_os_string(),
         link.clone().into_os_string(),
@@ -2627,8 +2584,8 @@ fn the_stubs_decision_restated_matches_the_stub() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// AN UPSTREAM CARGO GETS THE BUILD CACHE ONLY WHERE ITS RELEASE READS IT
-/// ([`crate::build_cache`]), and TRUST'S OWN `cargo` (which is `targo`) BY `targo`'S RULE:
+/// An upstream cargo gets the build cache only where its release reads it
+/// ([`crate::build_cache`]), and Trust's own `cargo` (which is `targo`) by `targo`'s rule:
 /// a stock 1.97.1 gets the line `decide` made for `cargo`; Trust gets the one made for
 /// `targo` (none for its verified lane); an older or unidentified cargo, or a line `decide`
 /// left alone, runs as typed.

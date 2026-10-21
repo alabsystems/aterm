@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The control-protocol VERB TABLE: the single, typed source of truth for every
-//! control-socket verb. One [`VerbSpec`] row per verb carries its op-class,
-//! reply framing, targeting class, and help text — a first-sentence `summary`
-//! plus the `detail` that completes it. Everything else projects from here: the
-//! server maps `op` to its auth `Op` and generates BOTH help catalogs from the
-//! two fields (the short one from the summaries, the full one from
-//! [`VerbSpec::help_line`]); the aterm-ctl client parses replies by `framing`.
-//! Client framing, server authorization metadata and help catalogs therefore
-//! share one declaration. The separate handlers must still implement the
-//! declared behavior. This lives in `aterm-types`, alongside `control_socket`,
-//! so both the client library and the GUI host use the same protocol metadata.
+//! The control-protocol verb table: the typed source of truth for every control-socket verb.
+//! One [`VerbSpec`] row per verb carries its op-class, reply framing, targeting class and help
+//! (a first-sentence `summary` plus the `detail` that completes it). The server maps `op` to
+//! its auth `Op` and generates both help catalogs from it; the `aterm-ctl` client parses
+//! replies by `framing`. The handlers are separate and must still do what a row declares.
+//! Here, beside `control_socket`, because the client library and the GUI host both use it.
 
 /// The longest control request line the server reads, its newline not counted
 /// (a frame's body is bounded on its own). A longer line is answered `ERR`
@@ -68,10 +63,8 @@ pub fn selector_body_names_something(body: &str) -> bool {
     !body.is_empty() && !body.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// The byte cap of one KEYED attention entry (`meta set attention owner=<k>
-/// <text>`), after trim — the server refuses a longer one (`ERR attention
-/// too long (max 200 bytes)`), and a supervisor cuts its text to it. One
-/// constant for both ends, so no escalation is cut longer than the server takes.
+/// The byte cap of one keyed attention entry (`meta set attention owner=<k> <text>`), after
+/// trim: the server refuses a longer one and a supervisor cuts its text to it.
 pub const META_ATTENTION_KEYED_MAX: usize = 200;
 
 /// A verb's authority class. Neutral here so this crate needn't depend on the
@@ -85,79 +78,57 @@ pub enum OpClass {
     Write,
     /// The out-of-band `signal` class.
     Signal,
-    /// Rewrites the DURABLE on-disk config (`settings set|unset` → `aterm.toml`).
-    /// A strictly greater authority than `Write` — split out so a keystroke-
-    /// injection edge cannot flip a default-OFF security knob. The server maps this
-    /// to `Op::ConfigWrite`, which is NOT provisioned to child edges.
+    /// Rewrites the durable on-disk config (`settings set|unset` → `aterm.toml`): greater than
+    /// `Write`, so a keystroke-injection edge cannot flip a default-off security knob. Maps to
+    /// `Op::ConfigWrite`, not provisioned to child edges.
     ConfigWrite,
-    /// Moves the selection out of the process onto the system clipboard (`copy`, the
-    /// exfil boundary). Split out of `Read` because writing the OS pasteboard leaves
-    /// the process. Maps to `Op::ClipboardWrite`, NOT provisioned to child edges.
+    /// Moves the selection onto the system clipboard (`copy`, the exfil boundary): split out
+    /// of `Read` because it leaves the process. Maps to `Op::ClipboardWrite`, not provisioned
+    /// to child edges.
     ClipboardWrite,
     /// Owner-only privilege verb or build/meta verb — no op-class; gated separately.
     Owner,
 }
 
-/// The connection-SCOPE gate a verb needs, ORTHOGONAL to its op-class. Most verbs
-/// are `Scoped` (authority is exactly the op-class, checked per target); a few are
-/// gated by connection scope BEFORE/around the op check. Making this a table field
-/// (rather than a hardcoded dispatch branch) keeps the table the single source of
-/// truth for these exceptions too.
+/// The connection-scope gate a verb needs, orthogonal to its op-class. Most verbs are
+/// `Scoped`; the exceptions live here so the table stays the single source of truth for them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Access {
     /// Normal: authority is exactly `op`, checked per resolved target.
     Scoped,
-    /// Non-sensitive build/meta provenance and instance posture — answered for ANY
-    /// authenticated scope BEFORE target resolution
-    /// (`version`/`update`/`help`/`verbs`/`privacy`). Self-scoped, no session; a
-    /// selector is meaningless.
+    /// Non-sensitive build/meta provenance and instance posture, answered for any
+    /// authenticated scope before target resolution (`version`/`update`/`help`/`verbs`/
+    /// `privacy`). Self-scoped; a selector is meaningless.
     AnyScopeMeta,
     /// Owner-only: only an OWNER-CLASS connection may run it, regardless of op-class
     /// (`sessions`/`who`/`grant`/`revoke`/`whoami`) — the instance god-token,
     /// and the bridge connection, which carries Owner's power. A selector is rejected.
     ///
-    /// TWO of its members then have their HANDLER tell the two owner-class scopes
-    /// apart, because no table row can. `hold`: the Owner token is the local human's
-    /// own credential, so it may set and lift a LOCAL halt (`origin=local`) on its own
-    /// sessions, while the FLEET halt (`origin=fleet` — set, replaced, or lifted)
-    /// stays reachable only from the bridge connection; each origin is its own slot
-    /// on the session, and an Owner `off` that finds only the fleet's standing is
-    /// refused, which turns on the STANDING holds, which the table cannot see. `fabric`: the bridge
-    /// connection is refused outright — `Scope::Owner` exactly, not owner-CLASS —
-    /// because arming the supervisor chooses which process holds the bridge scope, and
-    /// the bridge is that process rather than a party to arming it. For every other
-    /// member the class IS the whole gate. What the class buys in all cases is the
-    /// same: an edge token is kept out and a selector is rejected.
+    /// Two members' handlers then tell the two owner-class scopes apart, which no table row
+    /// can. `hold`: the Owner token (the local human's credential) may set and lift a local
+    /// halt (`origin=local`), while the fleet halt (`origin=fleet`) stays bridge-only; each
+    /// origin is its own slot on the session, and an Owner `off` that finds only the fleet's
+    /// hold standing is refused, so an injected agent holding Owner cannot lift a fleet halt.
+    /// `fabric`: the bridge connection is refused outright (`Scope::Owner` exactly), because
+    /// arming the supervisor chooses which process holds the bridge scope.
     OwnerOnly,
-    /// Bridge-only: ONLY the fabric bridge connection may run it — the pair of
-    /// `socketpair` ends the instance keeps when it launches its `aterm-link serve`
-    /// child, served with the bridge scope PRE-RESOLVED instead of an `AUTH` line.
-    /// The pinned set is FOUR verbs: `deliver`, `link`, `outbox` and `outbox sent`.
+    /// Bridge-only: only the fabric bridge connection may run it (the `socketpair` end the
+    /// instance keeps for its `aterm-link serve` child, served with the bridge scope
+    /// pre-resolved instead of an `AUTH` line): `deliver`, `link`, `hello`, `outbox`,
+    /// `outbox sent`.
     ///
-    /// Strictly narrower than [`Self::OwnerOnly`], and deliberately so: Owner scope is
-    /// what every in-session client already holds (`aterm-ctl @self` is Owner), so a
-    /// prompt-injected agent holding Owner must not be able to forge an attested human
-    /// order into a sibling's inbox (`deliver`, which stamps `from=`/`trust=`), read
-    /// every session's outbound traffic (`outbox`), or release a `post --wait` for a
-    /// message that never left the machine (`outbox sent`). There is no token file to
-    /// steal: the only way to be the bridge is to be the process the instance spawned.
-    /// A selector is rejected — every one of them names its session as an argument,
-    /// like `raise`.
+    /// Narrower than [`Self::OwnerOnly`] on purpose: every in-session client holds Owner
+    /// (`aterm-ctl @self`), so a prompt-injected agent must not forge an attested order into a
+    /// sibling's inbox (`deliver` stamps `from=`/`trust=`), read every session's outbound
+    /// traffic (`outbox`), or release a `post --wait` for a message that never left
+    /// (`outbox sent`). No token file to steal: the bridge is the process the instance
+    /// spawned. A selector is rejected; each names its session as an argument.
     ///
-    /// `hold` is [`Self::OwnerOnly`] (the Owner token is the local human's credential);
-    /// its handler keeps the FLEET hold bridge-issued, refusing `origin=fleet` from
-    /// Owner outright and an Owner `off` that finds only a fleet hold standing, so an
-    /// injected agent holding Owner still cannot lift a fleet halt.
-    ///
-    /// A FLEET hold has NO OPERATOR UNDO: no GUI, palette, key-binding or Owner path
-    /// clears one (`aterm-gui`'s `fabric::apply_hold` is called only by `hold` and
-    /// `bridge_lost`, the latter only under `[fabric] hold_on_bridge_lost = true`). A
-    /// `reason=fabric-lost` hold stands until a bridge reconnects and
-    /// issues `hold off`; failing that, only quitting (which ends the sessions)
-    /// clears it — a seamless update carries the holds (`SessionRecord::hold` and
-    /// `more_holds`), and so does a PTY keeper's crash recovery (`fabric::KeeperCarry`).
-    /// DESIGN §11.2's "or a human lifts it at the GUI" does not exist. A LOCAL hold
-    /// lifts with the owner's own `hold off`, and only with it: a fleet lift leaves it.
+    /// A fleet hold has no operator undo: no GUI, palette, key-binding or Owner path clears it.
+    /// A `reason=fabric-lost` hold (set under `[fabric] hold_on_bridge_lost = true`) stands
+    /// until a bridge reconnects and issues `hold off`, or the instance quits, ending the
+    /// sessions; a seamless update and a PTY keeper's crash recovery both carry it. A local
+    /// hold lifts only with the owner's own `hold off`; a fleet lift leaves it.
     BridgeOnly,
 }
 
@@ -177,7 +148,7 @@ pub enum Framing {
 /// What an `@<sid>` selector means for a verb (the targeting rule).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
-    /// Acts on the resolved SESSION (text/turn/image/send/…).
+    /// Acts on the resolved session (text/turn/image/send/…).
     Session,
     /// APP-level: acts on the resolved instance's FRONT window; the selector routes
     /// to the instance (window/chrome/controls/open/settings/invoke/…). `tab`,
@@ -803,16 +774,16 @@ const fn bytes_eq(a: &[u8], b: &[u8], len: usize) -> bool {
 }
 
 /// The budget for the short catalog's rows put together (every [`catalog_lines`] row,
-/// `\n`-terminated): what discovering a verb costs, whatever the table grows to.
+/// `\n`-terminated): what discovering a verb costs.
 ///
 /// The bound is on the SHAPE (one row per verb, first sentence only, capped at
 /// `summary_max_chars!()`, 96), so a new verb raises it by about its own row; never reword
 /// unrelated verbs' help to make room. Checked at compile time with the summary cap.
-pub const SHORT_CATALOG_MAX_BYTES: usize = 13171;
+pub const SHORT_CATALOG_MAX_BYTES: usize = 13753;
 
-/// THE ONE `subscribe` STREAM VOCABULARY: frame sources first, then the two
-/// modifiers. The catalog row, the `ERR usage` refusal, `Requested::parse`'s fold
-/// table and the installed drive skill derive from it or are tested against it.
+/// The `subscribe` stream vocabulary: frame sources, then the two modifiers. The catalog row,
+/// the `ERR usage` refusal, `Requested::parse`'s fold table and the installed drive skill
+/// derive from it or are tested against it.
 pub const SUBSCRIBE_STREAMS: &[&str] = &[
     "screen",
     "cursor",
@@ -850,13 +821,11 @@ impl VerbSpec {
         }
     }
 
-    /// The verb's full entry as `help <verb>` prints it: `<name padded> <text…>`, the
-    /// text greedily word-wrapped at [`ENTRY_WRAP_COLUMNS`] with every continuation
-    /// line indented to [`CATALOG_TEXT_COLUMN`], so a 900-char entry reads as one
-    /// aligned paragraph instead of one line. Deterministic and lossless: it breaks
-    /// only at single spaces (the table carries no run of spaces), so re-joining the
-    /// lines' text with spaces reproduces [`Self::help_line`] exactly; a word longer
-    /// than the text width stands alone on its own line, never split, never dropped.
+    /// The verb's full entry as `help <verb>` prints it: `<name padded> <text…>`, greedily
+    /// word-wrapped at [`ENTRY_WRAP_COLUMNS`] with continuation lines indented to
+    /// [`CATALOG_TEXT_COLUMN`]. Lossless: it breaks only at single spaces (the table has no
+    /// run of spaces), so re-joining with spaces gives [`Self::help_line`]; an over-long word
+    /// stands alone on its line.
     #[must_use]
     // Skip: iterator absent std bodies.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -1023,10 +992,8 @@ impl Form {
     }
 }
 
-/// A [`VerbSpec`] constructor with an explicit non-`Scoped` [`Access`] gate — the
-/// build/meta (`AnyScopeMeta`) and owner-only (`OwnerOnly`) exceptions declare their
-/// scope gate IN the table here, so the dispatch reads it instead of hardcoding a
-/// verb list.
+/// A [`VerbSpec`] constructor with an explicit non-`Scoped` [`Access`] gate, so the dispatch
+/// reads the exception from the table instead of hardcoding a verb list.
 const fn va(
     name: &'static str,
     op: OpClass,
@@ -1059,8 +1026,7 @@ const fn va(
 /// whole row — at most `summary_max_chars!()`, 96) and the `detail` that completes it
 /// (`""` when the summary says it all); `help_line` joins them with one space.
 pub const VERBS: &[VerbSpec] = &[
-    // build & meta — answered for ANY authenticated scope BEFORE target resolution
-    // (non-sensitive global provenance); the `AnyScopeMeta` access declares that.
+    // build & meta: answered for any authenticated scope before target resolution.
     va(
         "version",
         Owner,
@@ -1413,8 +1379,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        // The optional field rides in the detail: the full row reads exactly as
-        // one string would, and the short catalog (at its budget) stays as it was.
+        // The optional field rides in the detail, keeping the short catalog within budget.
         "OK <scrollback-line-count>",
         "[truncated=<lost>]",
     )
@@ -1464,8 +1429,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         Session,
-        // The summary is the short catalog's whole row, which is at its budget
-        // (`SHORT_CATALOG_MAX_BYTES`): the reply shape and no more.
+        // The short catalog is at its budget: the reply shape and no more.
         "leave a dead app's alt screen: OK left=<0|1>",
         "— a full-screen app killed from outside (Stop-Process, kill -9) never sends `?1049l`, so \
          the tab keeps its last screen: `lines` reads 0 and the shell paints onto it. A shell \
@@ -1681,17 +1645,11 @@ pub const VERBS: &[VerbSpec] = &[
          grid width and continues at column 0 of the next row; regex ^ and $ bind to the reader's \
          LOGICAL line, so a continuation row has no ^ of its own)",
     ),
-    // `find` DRIVES the find bar; `search` above ANSWERS the same question without
-    // one. Both are `Read`, and the reason is the op-class boundary rather than the
-    // absence of mutation: find mode exists to DIVERT keystrokes away from the PTY,
-    // so not one byte of a typed query reaches the driven program. What it moves is
-    // the viewport and the highlight — precisely what `scroll` and `select` move,
-    // and they are `Read` for the same reason. It reports the match position, which
-    // is what `search` (`Read`) already answers, so a read edge learns nothing here
-    // it could not already ask for. Classifying it `Write` would have been the real
-    // escalation: `Op::WriteInput` and `Op::ReadScreen` are independent (a `push`
-    // connection carries write WITHOUT read), so a keystroke-only edge could have
-    // typed a query and read match positions back off a screen it may not read.
+    // `find` drives the find bar and is `Read`, like `scroll` and `select`: find mode diverts
+    // keystrokes away from the PTY, so it moves only the viewport and highlight, and the match
+    // position it reports is what `search` already answers. `Write` would be the escalation:
+    // `Op::WriteInput` and `Op::ReadScreen` are independent (a `push` connection writes without
+    // reading), so a keystroke-only edge could read match positions off a screen it may not.
     v(
         "find",
         Read,
@@ -1863,9 +1821,8 @@ pub const VERBS: &[VerbSpec] = &[
         "OK <n> + one `activity` row per live/finished app-initiated job",
         "What aterm has been doing on its own initiative — a toolchain install, a self-update download — as the message band shows it, plus the finished jobs the ring still remembers, and the agent harness's notes (kind=harness, always phase=done: a harness note is a record, never a row). Rows are `activity kind=<toolchain|update|harness> phase=<live|done> progress=<pct>/100|- title=<t> detail=<d> stats=<s> outcome=<ok|warn|-> [since_ms=<ms>]` — progress= is `-` on every phase=done row (and on a live row with no fill yet), and stats= is empty on done rows; live rows first, then finished oldest-first. Free text is percent-encoded. Read-only: it starts and cancels nothing.",
     ),
-    // `appnotice` is the WRITE face of the same surface: a record made from OUTSIDE
-    // the process. Owner-only (a child edge must not be able to forge "Claude Code …
-    // is up to date" onto the record), Write op-class because it mutates app state.
+    // `appnotice` is the write face of the same surface, from outside the process. Owner-only:
+    // a child edge must not forge "… is up to date" onto the record.
     va(
         "appnotice",
         Write,
@@ -1910,9 +1867,8 @@ pub const VERBS: &[VerbSpec] = &[
          lines joined by a newline, actions= the button labels joined by a comma. Free text is \
          percent-encoded. Read-only; `appstatus` is its toolchain/update/harness projection.",
     ),
-    // `notice` is its WRITE face: a script's records, failures and work in flight
-    // under the attention rule. Owner-only (a child edge may not raise, end or
-    // press a row), Write op-class because it mutates the band.
+    // `notice` is its write face: a script's records, failures and work in flight. Owner-only:
+    // a child edge may not raise, end or press a row.
     va(
         "notice",
         Write,
@@ -2097,6 +2053,31 @@ pub const VERBS: &[VerbSpec] = &[
     // Outside the halt: reads, and in a development build injects, a memory-pressure
     // level; the shed takes history rings, never a byte on a PTY.
     .input(Input::NONE),
+    // macOS's program check, as the stuck check reads it (`aterm-gui`'s
+    // `program_check_watch`), and (development builds only) a full reading stood
+    // in for it, so the stuck path runs on a real window. `Write` for the stand-in:
+    // it can raise the restart alert and hold the harness.
+    v(
+        "program-check",
+        Write,
+        Status,
+        App,
+        "program-check [full|live]: the stuck check's reading of macOS's program check",
+        "Answers `OK reading=<live|full> syspolicyd=<-|ok|full|stuck> \
+         syspolicyd_workers=<n>/<limit|->|- syspolicyd_full_ms=<ms|->`: the board each tab's \
+         `status` carries (`aterm help permissions`, SLOW FIRST RUNS), read once a minute in \
+         a window on macOS; `-` before the first reading and in a headless instance, which \
+         runs no stuck check. `program-check full` makes each later reading of `syspolicyd` \
+         stand at the kernel's thread limit, its threads raised to the limit: five minutes of \
+         it read `stuck`, which raises the restart alert and holds the harness's \
+         continuations, as a real wedge does. `program-check live` reads the pool as it is \
+         again, and the next reading ends both. Each answers the same line; both need a \
+         development build (`dev-seams`) and a window that runs the stuck check, and are \
+         refused otherwise.",
+    )
+    // Outside the halt: reads, and in a development build stands in, the program check's
+    // reading; chrome and the harness, never a byte on a PTY.
+    .input(Input::NONE),
     // The harness card's constellation pin (`aterm-gui`'s `card_verb`): read,
     // and (debug builds only) pinned, so two builds' cards can be compared
     // pixel for pixel. `Write` for the pin: it re-arms every card on show.
@@ -2226,7 +2207,21 @@ pub const VERBS: &[VerbSpec] = &[
          staged), the strip `cols=` that `pointer move -1 <col>` takes and the `action=` a \
          click fires, or `reason=no-strip|not-laid-out|no-ui-face|strip-full` when it is not \
          shown (`not-laid-out`: no frame has laid the strip out yet — a headless instance \
-         lays it out when it composes one, e.g. for `image`). Before \
+         lays it out when it composes one, e.g. for `image`). Then one `autopilot \
+         sid=<sid> window=<id> program=<claude|agy|muse|gemini|codex> \
+         face=<cruise|cruise-until|land|landed|theirs|off|master-off|agent-off|unhosted|-> \
+         drawn=\"<cells>\"|drawn=- why=<not-drawn|no-room|no-host|no-footer> \
+         spoken=\"<label>\"|spoken=-` line per supervised pane, in every window, its tabs \
+         and panes in order (`window=` the window's id as `ls` prints it: a session shown \
+         in two windows has a line in each): `face=` the Autopilot chip's face now, the \
+         pane in front or not; `drawn=` the chip's cells exactly as the last frame drew \
+         them, printed only for a pane that frame drew (`not-drawn` for a tab behind, a \
+         pane a zoom hides or scrolled back, or a chip a band such as the link caption \
+         covers, never older cells, and on a `--headless` instance until a capture such \
+         as `image` composes a frame; `no-room` for a rule with no room for the chip; \
+         `no-host` where no harness host drew one); `spoken=` the drawn chip's \
+         accessibility label, `-` where none is drawn; a program with no composer footer \
+         (Gemini CLI, codex-alab) prints `face=- drawn=- why=no-footer spoken=-`. Before \
          the presence line comes `statusitem title=<❯|❯•|❯N> needs=<n> stuck=<n> \
          exceptions=<n> done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>>`: the menu-bar item's \
          mark (`❯N` counts the needs: this aterm's, a sibling aterm's from a scan under 45 s \
@@ -2241,11 +2236,18 @@ pub const VERBS: &[VerbSpec] = &[
          that item's menu as its own builder composes it now, from the same glance: what a \
          click on ❯ would show, read with no click and nothing of the menu changed (headless \
          too, where no item is drawn). One line per row, in its order: `statusmenu \
-         \"<label>\" enabled=<yes|no>`, a row that acts adding `checked=<yes|no>` and, where \
-         it has a hover, `tip=\"<text>\"`; `statusmenu ---` a separator; a submenu's row \
-         ends `submenu`, and its rows follow it indented two spaces a level (the Fleet \
-         row's as its own open composes them, from the fleet glance's last read). Labels \
-         and tips are quoted as the `menu` lines' titles are. \
+         \"<label>\" enabled=<yes|no>`, a row that acts adding `checked=<yes|no>`, where \
+         it has a hover `tip=\"<text>\"`, and where it is drawn levels in within its own \
+         menu `indent=<n>` (an agent's further NEEDS YOU line, one level in under its \
+         tab's Needs you row: never the two-space lead of a submenu's rows); \
+         `statusmenu ---` a separator; a submenu's row \
+         ends `submenu` (before a debug build's `at=`), and its rows follow it indented two \
+         spaces a level (the Fleet row's as its own open composes them, from the fleet \
+         glance's last read). Labels \
+         and tips are quoted as the `menu` lines' titles are. In a debug build each line \
+         ends with ` at=<i>[.<j>…]`, the row's path in the menu (its index among its \
+         menu's rows, separators and information lines counted, then its index in each \
+         submenu down to it), which `person menubar press` clicks by. \
          Read-only.",
     ),
     v(
@@ -2588,6 +2590,21 @@ pub const VERBS: &[VerbSpec] = &[
          table's default). An edge token reads only `OK effective=<on|off>`. Read-only. Any \
          other form is `ERR usage: harness policy`.",
     ),
+    v(
+        "resources", Read, Lines, Session,
+        "resources [capabilities|register]: delegated job ownership and current usage.",
+        "A read lists this session's explicitly registered jobs, their kernel PID/start \
+         identities, AI/job labels, current cores, physical bytes and sample age. \
+         capabilities is read-only: OK resources version=1 available= runner= ai= session=. \
+         register start=<kernel-start> [ai=<word>] job=<percent-encoded-label> is local and Owner-only: \
+         its root is the kernel peer PID, never a named parent or daemon. The optional AI \
+         label defaults to the target's observed program. Used by aterm resource-run before \
+         it starts a command; no command arguments are retained."
+    )
+    .forms(&[
+        form(Word("capabilities")).framing(Status),
+        form(Word("register")).framing(Status).op(Write).owner_only(),
+    ]),
     // `status` is the READ-ONLY Subject+Status record (RFC: Tab Subject &
     // Status §8) — what a session IS and what it is DOING, classified entirely
     // locally. Versioned so any consumer (a script, an agent, the harness) can
@@ -2612,6 +2629,7 @@ pub const VERBS: &[VerbSpec] = &[
          level=<quiet|note|story|driving|driven|attention|limited|hold> story=<n> \
          why=<-|prompt,question,escalation,mail> \
          needs=<frozen|stopped|stalled|login|memory|wall|ask|approval|question|-> \
+         needs_n=<n|-> [needs_told=<n|stale|->] \
          hold_by=<person|remote|local|bridge|-> typed_by=<pct|-> typed_ms=<ms|-> \
          path=<frozen|live> \
          program=<name|-> \
@@ -2625,7 +2643,9 @@ pub const VERBS: &[VerbSpec] = &[
          input=<-|clear|pending|typeahead|stalled|stopped> input_bytes=<n|-> \
          input_wait_ms=<ms|-> fg_rss_mb=<n|-> \
          disk=<unknown|ok|low|short|emergency|-> disk_free_mb=<n|-> disk_room_mb=<n|-> \
-         disk_age_ms=<n|-> supervisor=<pct|-> supervisor_proven=<0|1> \
+         disk_age_ms=<n|-> job=<verdict|none|-> job_quiet_ms=<ms|-> \
+         syspolicyd=<ok|full|stuck|-> syspolicyd_workers=<n>/<n|->|-> \
+         syspolicyd_full_ms=<ms|-> supervisor=<pct|-> supervisor_proven=<0|1> \
          autopilot=<off|cruise|land|-> \
          human_ms=<ms|-> human_seq=<n> \
          launch=<person|since|typed|boxed|other|pending|none> launch_seq=<n|-> \
@@ -2635,9 +2655,13 @@ pub const VERBS: &[VerbSpec] = &[
          born=<cold|spare-parked|spare-warming|spare-ready> [spare_age_ms=<ms>] \
          render=<ok|displaced|desync-risk|unverified|unjudged|-> resizes=<n> flaps=<n> \
          land_at=<unix-s|-> task=<open|landed|theirs|-> pause=<unix-s|-> \
+         land_held=<needs,repo,open,defense,cut|-> land_nudges=<n|-> land_since=<unix-s|-> \
+         [end=<unix-s|-> end_seen=<0|1|-> end_cheered=<0|1|->] \
          task_state=<working|done|exited|stalled|-> task_rev=<n> \
          log_seq=<n> log_ep=<e> run=<r<n>|-> turn=<t<n>|-> \
-         step=<p<n>|-> need=<word|-> need_since_ms=<ms|-> editing=<n> gen=<e.s|-> seq=<n|-> hash=<hex16|->. \
+         step=<p<n>|-> need=<word|-> need_since_ms=<ms|-> \
+         rollout=<bound|unmeasured|no-rollout|no-meta|other-thread|no-run|no-thread|stopped|-> \
+         rollout_asks=<n> editing=<n> gen=<e.s|-> seq=<n|-> hash=<hex16|->. \
          `editing=` counts the open `edit` tickets whose program waits in this session (an \
          `edit … wait=0` is not one); while it is not 0, `send`, `key`, `ctrl`, `feed`, \
          `feed-bin`, `mouse`, `paste`, `paste-bin`, `turn` and `focus` answer `ERR busy editing \
@@ -2648,12 +2672,34 @@ pub const VERBS: &[VerbSpec] = &[
          `disk_free_mb=` its free MiB, `disk_room_mb=` its room (what one round of this \
          machine's builds takes) and `disk_age_ms=` the reading's age; `-` while no reading \
          holds it (not measured yet, a remote or automounted mount). \
+         `job=` is the session's worst live job as the stuck engine last judged it (stuck, \
+         never-returns, quiet, slow, busy, waiting-you, parked, fine; `none` with no live job; \
+         `-` when nothing read it in the last 60 s) and `job_quiet_ms=` how long that job has \
+         been quiet (`sys jobs` has the rows). \
+         `syspolicyd=` is macOS's program check as the machine's watch last read it, once a \
+         minute: ok while its pool has room, full while its threads stand at the kernel's \
+         limit, stuck once full for five minutes (a deadlock with tccd: no new program starts \
+         on the Mac until it restarts, and the window server can die at its next privacy \
+         check); `syspolicyd_workers=` its pool threads over that limit and \
+         `syspolicyd_full_ms=` how long it has been full; `-` while unread (not macOS, a \
+         headless instance). \
          `log_seq=`/`log_ep=` are the session log's head and epoch as a reader is shown them \
          (`log since=<log_seq> ep=<log_ep>` and `await log … since= ep=` read what comes after), \
          `run=`/`turn=`/`step=` its open path, `need=` the most urgent need it OBSERVED \
          (`approval:<kind>`, `question`, `wall:<kind>`, `unresponsive`, `failure`, `escalated`, \
          `exited`; a need a `mark` claimed is `brief`'s `claim need`, never this) and \
          `need_since_ms=` its age; `-` when none. \
+         `rollout=` is what a codex-alab's rollout tap last answered for the session \
+         (`bound`: its rollout's turns reach `log`, `src=transcript`; else why it binds nothing: \
+         `unmeasured`, a build no lab run measured, the rollout's or the one running now; \
+         `no-rollout`, `no-meta` and `other-thread` for a rollout not there, not written whole \
+         or of another thread; `no-run` with no open Codex run to take its steps; `no-thread` \
+         for a claim naming no thread id; `stopped` once the codex-alab left the front or the \
+         sweep was switched off, until it is asked again), `-` while it was never asked, and \
+         `rollout_asks=` \
+         how many asks it answered, each counted after what it read reached the log, one at \
+         a time: a reader that saw `rollout_asks=<n>` and then sees `n+2` knows every turn the \
+         rollout held at its first look that the tap would log is in the log. \
          `render=` is the resize ledger's verdict (see `resizes`): \
          `displaced` while a resize has moved or cut alt-screen content and the engine still owes \
          it (until a full clear or screen switch repaints it, an undo hands the rows back, or \
@@ -2791,6 +2837,12 @@ pub const VERBS: &[VerbSpec] = &[
          `supervisor`) waits out under a live claim, an unanswered limit before its reset, an \
          overload, API error or full context the harness or another holder's live claim \
          retries with no hold standing, an unreachable API and a hold are never a need. \
+         `needs_n=` counts the needs a harness's own ask names (its worker's `NEEDS YOU:` \
+         lines: the first and its `(+N more)`), `-` where the need is none or not a \
+         harness's. A debug build prints `needs_told=` after it: how many needs the \
+         window reads whole beside the needs entry that stands, as the harness told them \
+         (the set told last, or the one it replaces until its request lands; `stale`: a set \
+         told for another entry, which nothing reads; `-`: none told). \
          `hold_by=` names whose hold \
          stands (`person` the window's Take Over, `remote` another Mac's node over the fleet, \
          `local` an Owner's, `bridge` the bus's; the person's first where several do), where \
@@ -2876,8 +2928,10 @@ pub const VERBS: &[VerbSpec] = &[
          `blocked` report's kind after a colon), shown only while the program in front names \
          `codex` or is a runtime that hosts one (npm's `node`, `bun`) and only since the \
          foreground group last moved, cleared by `state=clear`, a \
-         full reset, a foreground change and the program's exit: a claim for display, never \
-         `agent=`, `agent_since_ms=` or anything an `await` or a fenced press reads. \
+         full reset, a foreground change and the program's exit: a claim, never `agent=`, \
+         `agent_since_ms=`, a verdict or anything a fenced press reads; each move it shows is \
+         also a `program` mark in `log` (see `help log`), which `await log kind=program` and \
+         `subscribe … log` read. \
          `last_act=` is the last act an agent that supervises itself recorded (`meta set \
          harness_act`). \
          `integration=` is whether this \
@@ -2943,11 +2997,29 @@ pub const VERBS: &[VerbSpec] = &[
          Cruise always is, since nothing ends it), printed only while this window's harness holds the live claim; \
          `-` otherwise. `pause=`, under the same rule, is the instant (unix seconds) the \
          harness's pause after short turns ends — its back-off, which the chip's title says \
-         as `pausing until 18:41 after 3 short turns` — `-` while none stands. \
+         as `pausing until 18:41 after 3 short turns` — `-` while none stands. Under the \
+         same rule, while the session runs under Land with its task open, `land_held=` says \
+         why Land has not landed yet as its loop last told this window's harness: the legs \
+         of the last land act's reply that did not land, in the order a person can act on \
+         them (`needs` a need it named, `repo` work its repository holds that no remote main \
+         has, `open` open work Land's strict reading found, `defense` no `Nothing left:` \
+         defense, `cut` a reply too tall to read whole), `-` before such a reply is read or \
+         after someone else's turn; `land_nudges=` the nudges typed since the land act that \
+         began the hold and `land_since=` that act's instant (unix seconds; `-` where its \
+         ledger could not say) — all three `-` outside a landing (before Land's instruction, \
+         once landed, at a person's own exchange, under Cruise or Off). A debug \
+         build prints `end=`, `end_seen=` and `end_cheered=` after them, under `task=`'s \
+         rule: the instant (unix seconds) the task's landing stood on the glass as its end \
+         (the tab's `•`, the menu bar's Done for you row), whether someone has looked at it \
+         since (`1`: the looking rule saw its tab in front, or the menu bar went to it) and \
+         whether its cheer is spent (`1`: a pet cheered it on a frame that showed it, or a \
+         seamless update carried it, which never replays a cheer) — two facts, since a \
+         headless end can be cheered and never seen — all three `-` while no end stands. \
          `human_ms=` is how long ago a PERSON last gave this session input — a key (an arrow, \
          a digit, Enter and Esc included), text, a paste, a click, a drag, a wheel notch or a \
          scroll of the view, from the window (a hover does not count), never a control verb \
-         (`key`/`send`/`paste`/`turn`/`mouse`/`feed-bin`) — in ms, `-` when no person has since \
+         (`key`/`send`/`paste`/`turn`/`mouse`/`feed-bin`) save a development build's \
+         `key|send as=person` (see `send`) — in ms, `-` when no person has since \
          the session started. An automatic supervisor keeps its hands off while it is under \
          `[harness] human_grace_s`, and waits on it before it keys a dialog a person may be \
          navigating (`text --json` carries it too, as \"human_ms\"; every `sessions` row as \
@@ -3000,7 +3072,10 @@ pub const VERBS: &[VerbSpec] = &[
          an act a self-supervising agent recorded) and `program-state` (`state=<idle|working|\
          blocked|done|error|-> kind=<permission|question|auth|->`, one per move of the codex \
          in front's OSC 7501 report as the status sweep honoured it, `state=- kind=-` when \
-         it goes away; display only, read with the rows' `t=` as the program's turn ledger) \
+         it goes away; read with the rows' `t=` as the program's turn ledger; the same move is \
+         a `program` mark in `log` under the log's own rule (at most 64 a run; past 20 moves, \
+         then one a second, a flap is coalesced to its latest state with `coalesced=<n>`), \
+         while this ring keeps every move, up to half its rows: see `help log`) \
          — monotonic ids, rising on across an aterm \
          self-update (whose successor's first row is `handoff`), a drop-oldest \
          ring of 512 rows in which `program-state` rows hold at most half: past that a new \
@@ -3028,8 +3103,15 @@ pub const VERBS: &[VerbSpec] = &[
          control input: `verb= [act=] [re=] [dropped= [pool=shared]] [cause= cause_k=]`, see \
          `help send`) and `task` (a worker's task moved: `rev= state= attention= [why=] \
          [code=<exit>]`) on the \
-         session, `agent` (the screen's verdict) on the agent run, others on the deepest open \
-         node. `OK <n> v=2 as_of=<seq> ep=<e> oldest=<seq>[ lost=<k>][ more=<k>]` (`aterm ctl` \
+         session, `agent` (the screen's verdict) on the agent run, `program` (what the codex in \
+         front says about itself, OSC 7501, as `status program_state=` shows it: \
+         `state=<idle|working|blocked|done|error|none> [ask=<permission|question|auth>] \
+         [coalesced=<n>] src=engine conf=claim`, `none` once its report goes away) on the run \
+         in front, or `-` with none open — at most 64 a run, the oldest taken first and counted \
+         in `lost=`; past 20 moves at once, one a second, a flap coalesced to its latest state \
+         with `coalesced=` the moves it replaced, so the newest is never dropped; a claim no \
+         decision of aterm's reads, which `brief` does not print and no fleet mirror carries — \
+         others on the deepest open node. `OK <n> v=2 as_of=<seq> ep=<e> oldest=<seq>[ lost=<k>][ more=<k>]` (`aterm ctl` \
          prints this header on stderr, as `aterm-ctl: OK …`, and the records on stdout), then one \
          record per line, oldest first: `<seq> <open|close|mark|amend|gap> <node> <kind> \
          [par=<node>] <k=v ...> [by=<actor>] src=<where> conf=<exact|strong|heuristic|claim> \
@@ -3095,7 +3177,8 @@ pub const VERBS: &[VerbSpec] = &[
          (`- <program> <run> <age> · need=<word> <age> [src+]`, or the phase when nothing is \
          needed), the newest turns (`t17 open 4m10s by=human`, `t16 done 6m02s · 3 steps · \
          appr 1 [screen+]`) and their steps, ranges of older ones, the marks worth a line, \
-         `need`/`claim` lines, and `more=` naming what was left out (`-` when nothing was). \
+         `need`/`claim` lines, a `jobs …` line (the stuck engine's `sys jobs` summary) when the \
+         session has a live job, and `more=` naming what was left out (`-` when nothing was). \
          A turn that names no `cause=` and probably answered the one `kind=task` mail \
          delivered just before it says so as `mail=@<off>~` (an open turn, or the newest closed \
          one): a guess, never without its `~`. \
@@ -3246,7 +3329,8 @@ pub const VERBS: &[VerbSpec] = &[
          tx_chunk/tx_last (one hold of a session's timeline lock applying transcript steps: a \
          full 32-event chunk, and a batch's last hold; max_tx_hold_ms= the worst of either), plus \
          turns_by_root=<root>:<n>/<p50>/<p95>/<p99> and counters including input_edges_dropped= \
-         ime_cancelled= input_refused= (input a full queue refused) reply_dropped= (query \
+         input_predicted= (of n_input, the keys whose slice a proven prediction closed, before \
+         their echo: READ THE SLICES HONESTLY below) ime_cancelled= input_refused= (input a full queue refused) reply_dropped= (query \
          replies dropped). Plain line carries \
          max_frame_gap_ms= (worst successful-present-return gap since reset), \
          rust_main_to_first_present_ms= and rust_main_to_first_visible_ms= (Rust entry->the FIRST \
@@ -3300,9 +3384,51 @@ pub const VERBS: &[VerbSpec] = &[
          re-prime passes, a spawn's or the window launch's, still writing an identity's \
          primer files; 0 after a spawn's reply means none is). IT NAMES WHO OWES THE TIME: echo_* high with input_* low means the PROGRAM \
          is behind (a TUI sharing its scheduling band with a build has been measured echoing at \
-         p99 150ms while aterm wrote every key at p99 6.29ms), the reverse means aterm is; a \
-         lone max_present_latency_ms is not evidence of either. READ THE SLICES HONESTLY: present_* and input_* are OPEN INTERVALS closed by the next qualifying present, so any stretch in which nothing presented is INSIDE the number (only a 5 s discard bounds it) — a multi-second present_latency means \"nothing presented for that long\", not \"a frame took that long\"; input_* closes on the next CONTENT present (for a key a native page such as Settings takes, the present of the page's new pixels), which under concurrent streaming output may be a log-line frame rather than the key's echo, so it can read low. input_* counts EVERY key a content present answered (up to 32 waiting per window; the overflow is input_edges_dropped), so keys that never echo — a password prompt — each book their wait until the next content present (under the 5 s discard): measure typing latency in a program that echoes. Quote n_* with the percentiles, never a lone last_/max_, and note both stop at application-present return (no compositor selection, scanout or photons)",
+         p99 150ms while aterm wrote every key at p99 6.29ms), the reverse means aterm is — \
+         unless input_predicted is a large share of n_input: those keys' input_* ends at their \
+         prediction on glass, which says nothing of the program; a \
+         lone max_present_latency_ms is not evidence of either. READ THE SLICES HONESTLY: present_* and input_* are OPEN INTERVALS closed by the next qualifying present, so any stretch in which nothing presented is INSIDE the number (only a 5 s discard bounds it) — a multi-second present_latency means \"nothing presented for that long\", not \"a frame took that long\"; input_* closes on the next CONTENT present (for a key a native page such as Settings takes, the present of the page's new pixels; for a key whose prediction predictive_echo = \"adaptive\" shows under its proof, the first present that paints that prediction, before the echo, counted in input_predicted — `always` shows a guess with no proof and closes no slice early), which under concurrent streaming output may be a log-line frame rather than the key's echo, so it can read low. So over a slow link with prediction on, input_* is the press to the key on glass for the keys shown early and the press to the echo for the rest: compare it across prediction modes as that, with input_predicted beside it, and time the link with echo_*. input_* counts EVERY key a present answered (up to 32 waiting per window; the overflow is input_edges_dropped), so keys that never echo — a password prompt — each book their wait until the next content present (under the 5 s discard): measure typing latency in a program that echoes. Quote n_* with the percentiles, never a lone last_/max_, and note both stop at application-present return (no compositor selection, scanout or photons)",
     )
+    .json(Json::Emits),
+    v(
+        "sys",
+        Read,
+        Lines,
+        Session,
+        "sys [<view>] [--json] [since=<c>]: cores, GPU, memory, disk of the machine, aterm and this tab",
+        "- views overview (default) | tab | aterm | global | jobs | cores | gpu | mem | disk | \
+         procs; `scope=pane|tab|window|aterm|global` on jobs, cores, gpu, mem, disk and procs \
+         (refused on the scope views); `top=<n>` rows (8, max 64); `fresh=<ms>` the oldest \
+         snapshot accepted (cores 1000, disk 10000, else 2000; 0 reads now, at most four reads a \
+         second); `depth=` on disk; `instances=all` is folded by `aterm ctl`, each instance's \
+         reply in turn. No Deck needs to be on screen: a request whose snapshot is too old pulls \
+         a reading and waits up to 1 s (1.5 s cold), else answers the last one with `state=stale \
+         age_ms=`. The header (stderr) is `OK <n> sys v=1 view= as_of= age_ms= window_ms= \
+         next=<ep>.<seq>`; `since=<ep>.<seq>` answers only the lines whose words changed (the \
+         rest fold into `same <keys>`) plus the `e` event lines since (pressure, throttle, swap, \
+         disk, load, tab, orphan, lane, job); `gap why=reset|evicted`; a cursor ahead is `ERR bad since \
+         head=`. Sentence lines are words; record lines are `key=value` in base units (`cpu_mc=` \
+         millicores, `fp_bytes=`, `write_bps=`, `busy_pm=`); an unmeasured value reads \
+         `unavailable(<why>)`, never 0, and a bound carries ≥ or ≤. `--json`: `schema` 1, `kind` \
+         sys.<view>, every figure a bare integer, `{\"v\",\"bound\",\"cause\"}`, `{\"why\"}` or \
+         `{\"lo\",\"hi\"}`. Cores are SHARE, not placement. `jobs` is the stuck engine's \
+         rows (`job id= kind= consumer= … class= [wait=] [quiet_ms= phi=] verdict= [no_progress=1]`, the \
+         verdicts fine quiet busy slow stuck never-returns waiting-you parked exited) and its \
+         `finding` rows. `disk` lists each root with `state=complete|walking|<refusal>`, \
+         `alloc_bytes=` (≥ while a walk runs, with `walked_entries=`), `entries=`, `growth_bps=` \
+         and its biggest subtrees (`dir`, to `depth=`, 3 by default) where a disk walker measures \
+         it; folder sizes no walker measures \
+         and per-client GPU time read `unavailable(not_sampled)` or `lane_off:`. \
+         Never prints another process's argv, environment or title: a process is `pid=` and an \
+         `exe=` word (else `exe=-`), and paths print only for the caller's own tab (`caller=`, \
+         which `aterm ctl` adds from `$ATERM_PARENT_SESSION_ID`, is advisory, not a boundary). \
+         `aterm`, `name`, `instances=all`, and `procs|jobs|disk` beyond the target's tab are \
+         Owner-only, like `sessions`; machine-wide top rows print for an owner-class caller, a \
+         scoped one reads `withheld=<n>`. `aterm help sys` says what this OS measures; `await sys \
+         <predicate>` waits for a state (see `await`).",
+    )
+    // A pull waits up to 1.5 s for the probe's reading.
+    .lane(Wait)
     .json(Json::Emits),
     // drive input
     v(
@@ -3520,7 +3646,14 @@ pub const VERBS: &[VerbSpec] = &[
          (sessions, `-`, `aterm`, a vendor) share one bucket's tokens, not their counts: up to \
          32 of them keep their own; past those, the least recently counted one's count goes \
          to a shared pool, which one of them with no count of its own says as dropped=<n> \
-         pool=shared, never as its own",
+         pool=shared, never as its own. \
+         AS A PERSON (a development build only: debug, or `dev-seams`): a leading as=person \
+         (`send` and `key`, with no fence, id=, act= or cause=) puts the write in as a person's \
+         gesture through the window's own input seam, so it stamps `status human_ms=` and \
+         counts `human_seq=` as a keystroke at the window does, where a lab has no window to \
+         key. Pinned to the session as every scoped write is, it reaches the program, never a \
+         card or palette open over it. A shipped aterm refuses it, so there no client can \
+         pose as a person",
     )
     .input(
         DRIVEN
@@ -3562,7 +3695,8 @@ pub const VERBS: &[VerbSpec] = &[
          own commands are `invoke <action>` (names via `controls menu`), `tab new` and `find \
          open`. Accepts a leading id=<epoch>:<producer>:<seq> idempotency key (see `send`), \
          and a leading act=approve|deny|answer naming what the press means for the box it \
-         dismisses (see `send`'s ACT). \
+         dismisses (see `send`'s ACT). A development build (debug, or `dev-seams`) also takes \
+         a leading as=person (see `send`). \
          GUARDED PRESS: a leading if=<re> makes the press conditional — under ONE hold of \
          the terminal lock the regex is tested against the visible rows and, only if some \
          row matches, the key is written, so no output can land between the check and the \
@@ -3632,7 +3766,8 @@ pub const VERBS: &[VerbSpec] = &[
          miss still answers `OK skipped` exactly. THE PERSON FENCE: a leading if-human=<n> \
          presses only if no PERSON has given the session input since the read that returned \
          <n> (`status human_seq=`, `text --json`'s \"human_seq\": how many person gestures have \
-         reached the session through a window) — a key a person typed that the program has not \
+         reached the session through a window, or a development build's as=person) — a key a \
+         person typed that the program has not \
          read yet moves no screen, so no screen fence sees it; checked under the same lock \
          hold, ahead of the screen fences, it answers `OK skipped reason=person seq=<n>`, \
          nothing written. It is NOT atomic with the person's own write, which takes no \
@@ -3762,8 +3897,8 @@ pub const VERBS: &[VerbSpec] = &[
          with no glass (headless, no video take) commits the frame a capture of it shows first, \
          so the pointer lands on what `image` renders, and the reply is \
          `OK at=native view=<id> x=<x> y=<y> key=<ui-key|-> px=<x>,<y>` (`key=` the control a \
-         press there takes: `-` over none, as over a switch still saving the change a click \
-         made), or `ERR` where no \
+         press there takes: `-` over none, as over a label or a button that is off), or `ERR` \
+         where no \
          presented native frame is under the pointer; before replying that window commits the \
          frame again, and glass presents its next frame as its next redraw would, so the reply \
          reads the page its event left (`ERR the page under the pointer changed …` if that \
@@ -4078,6 +4213,40 @@ pub const VERBS: &[VerbSpec] = &[
     // answers once it is installed: no PTY, no session, as `open app editor` is.
     .input(Input::NONE),
     v(
+        "doc",
+        Read,
+        Lines,
+        App,
+        "live Editor documents: doc ls [uri=<file-uri>] | doc read <doc-id|file-uri> [lines=<A>-<B>]",
+        "(amacs design §7c). `doc ls` answers `OK <n>`, then a row per document an Editor view \
+         shows: `doc=<d> uri=<canonical-uri> seq=<s> dirty=0|1 \
+         disk=same|changed|missing|unknown views=<v,…> ticket=<t,…|-> \
+         cursor=<view>:<L>:<C>|- sel=<view>:<L>:<C>-<L>:<C>|-`. `disk=` compares the file now \
+         with the version the buffer was read or last saved as (`unknown`: it could not be \
+         read); `ticket=` names the `edit` tickets a program waits on through one of the \
+         views; `cursor=` and `sel=` are the person's caret and selection, in the view in front \
+         (else the first), as a 1-based line and character column. `uri=` keeps the document \
+         that file is, in any spelling. `doc read` answers `OK <nbytes> doc=<d>`, then \
+         `<n>:<h6>|<text>` per line and a `-- lines=<total> seq=<s> [next=<n>] [cut=<n>]` \
+         trailer, the rows `amacs --read` prints: `<n>:<h6>` is the anchor an edit script \
+         copies, `<h6>` the first 6 hex digits of FNV-1a/64 of the line without its \
+         end-of-line. At most 256 KiB of lines per read: `next=` is where `lines=<next>-` \
+         reads on, and `cut=` names a first line printed cut short. A reference is the `doc=` \
+         or the `uri=` of a row; `ERR unknown doc <ref>` when no Editor view shows it. `doc \
+         apply`, `doc save` and `doc log` answer `ERR unsupported` until they are served",
+    )
+    // `doc read` is one byte body; `doc apply` (its `hunk` lines) and `doc log` list
+    // rows, and `doc save` answers one line. The write forms need Write.
+    .forms(&[
+        form(Word("read")).framing(Bytes),
+        form(Word("apply")).op(Write),
+        form(Word("save")).op(Write).framing(Status),
+    ])
+    // Outside the PTY halt: the reads reach no PTY, and the write forms change a document
+    // buffer and its file, never a session's input; a fleet hold refuses them through their
+    // own gate (design §7c).
+    .input(Input::NONE),
+    v(
         "act",
         Write,
         Status,
@@ -4147,6 +4316,45 @@ pub const VERBS: &[VerbSpec] = &[
     // session it closes, so a question parked before the halt is not the one close a halted
     // driver can still finish. `confirm no` is refused with it: one verb, one answer.
     .input(Input::PTY),
+    // A development build's stand-in for the person at the window
+    // (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2), armed as `invoke
+    // TakeOver|HandBack`'s is: Owner-only like those acts' escalation, `Write` because it
+    // moves what the window has seen and clicks the menu bar's rows.
+    va(
+        "person",
+        Write,
+        Status,
+        App,
+        OwnerOnly,
+        "person look <window>|off | person menubar press <at>: the person, stood in for (debug builds)",
+        "— a debug build's stand-in for the person at the window, armed only by \
+         `ATERM_DEBUG_PERSON_INVOKE=1` in the instance's environment at launch, as `invoke \
+         TakeOver|HandBack`'s is; unarmed it answers `ERR denied: person is a development \
+         build's stand-in for the person at the window (ATERM_DEBUG_PERSON_INVOKE=1 at \
+         launch)`, and a release build `ERR person needs a debug build`. `person look \
+         <window>` (the number `ls` prints as `window=`) says that headless window is on \
+         screen for the one rule that marks what a front tab finished seen (the tab's `•`, \
+         the menu bar's Done for you, `status end_seen=`): while it is also the frontmost \
+         window that rule reads it as a window someone looks at, at once and at every tab \
+         switch after, and a window behind another is looked at by nobody, as on a desk. \
+         Nothing else reads it, so no band, card or pill timer arms for it. The look lasts \
+         until `person look off` or the process ends (a seamless update's successor starts \
+         with none). Answers `OK person look window=<n>` or `OK person look off`; `ERR no \
+         window <n>` for a window the instance has not, and `ERR a window looks for itself` \
+         for a window with an OS window. `person menubar press <at>` clicks the menu-bar \
+         item's row at `<at>`, the path a debug build's `chrome` ends each `statusmenu` \
+         line with (`at=<i>[.<j>…]`): the menu composed as `chrome` composes it, and the \
+         row's action posted as a click posts it, so it goes where a click goes, on the next \
+         turn of the window's loop. Answers `OK pressed \
+         \"<label>\"`, or `ERR no row at <at>`, `ERR not an action` (an information line, a \
+         separator, a submenu's row), `ERR disabled \"<label>\"`, and off macOS `ERR no \
+         menu-bar item off macOS`.",
+    )
+    // Outside the halt: the person's own gestures, which a halt never stops (the person at
+    // the glass keeps typing), stood in for, as the stand-in's `invoke TakeOver|HandBack` is
+    // under any hold (`control_media::person_invoke_act`, `control::app_verb_halt`); it
+    // writes no input. A press runs what a click on the menu bar runs.
+    .input(Input::NONE),
     // Runtime-only per-session visual toggle (nothing durable is written); the
     // observability face scripts/tests read (`status` = one Status line).
     v(
@@ -4253,10 +4461,9 @@ pub const VERBS: &[VerbSpec] = &[
          reopens_left=0 beside audio=failed is the one honestly \
          permanent reading. The typed window's TEXT is never reported)",
     ),
-    // The cursor cat's COLLECTION, and the direct way to put one on. `Write`
-    // rather than `Read` because the wear form changes what the user sees and
-    // stamps the durable collection; not `ConfigWrite`, which is reserved for
-    // `aterm.toml` and the security knobs a keystroke edge must never reach.
+    // The cursor cat's collection, and the direct way to put one on. `Write`, not `Read`: the
+    // wear form changes what the user sees and stamps the durable collection. Not
+    // `ConfigWrite`, which is reserved for `aterm.toml`.
     v(
         "kitty",
         Write,
@@ -4453,12 +4660,9 @@ pub const VERBS: &[VerbSpec] = &[
          the last resolved full-body art pose. These are observations, and reading \
          them never advances the pet",
     ),
-    // Read-only observability for SELECTION/VIEWPORT CUSTODY: which of the eleven
-    // custody-moving events last fired. Several of them leave identical state behind
-    // (an auto-repeat tick, a bare modifier and a key release each change nothing at
-    // all), so `scroll` and `selection` cannot answer "why did my selection
-    // disappear?" between them — only the engine's own record can. No write form: the
-    // record is written by the seams that make the decision.
+    // Read-only observability for selection/viewport custody: which custody-moving event last
+    // fired. Several leave identical state (an auto-repeat tick, a bare modifier, a key
+    // release), so only the engine's record answers "why did my selection disappear?".
     v(
         "custody",
         Read,
@@ -4765,8 +4969,30 @@ pub const VERBS: &[VerbSpec] = &[
          pattern latches at arm; a `rows <a> <b>` span must meet a row of the current grid — \
          `ERR bad rows` otherwise, since an empty span scans nothing and nothing-scanned is \
          never \"clear\"), `await block` (the running \
-         command completed), `await sys <free>=<size>|free>=room|disk=<word>[,…]> [and <term>] \
-         [vol=<path>]` — THE MACHINE: free space on the volume of the session's working \
+         command completed), `await sys <predicate> [for=<dur>] [scope=tab|aterm]` — THE \
+         MACHINE: `<predicate>` is \
+         `quiet [<term> …]` or `<term> [and <term> …]`, a term `<metric><op><value>` (op < <= > \
+         >= = !=) over cpu (% or c), cpu.l<n> or cpu.<cluster> (%), aterm and tab (cores, c), \
+         wait (cores' worth waiting for a core), gpu (%), mem (normal<warn<critical), swap \
+         (bytes/s: a size unit, /s optional), decompress (/s), thrash (yes|no), tab.mem and \
+         aterm.mem (a size), throttle (none<light<heavy<severe), jobs.stuck, jobs.quiet and \
+         jobs.running (counts of the target tab's jobs), or one job: `job=<id>` (or \
+         `task=<id>`, the agent's task id) then `<verdict>[,…]` (`done` = exited) or \
+         `class=<class>[,…]`, never both (a class word given bare is `ERR usage: <word> is a \
+         class`), answering `job=<id> verdict= class= [wait=] [quiet_ms=] [phi=] [exit=]`; a \
+         job that left the view after it exited answers from the event ring, and one that \
+         ended without meeting the wait, or that the view and ring still do not know two \
+         engine passes on, is `ERR gone job=<id>`; `scope=aterm` (Owner-only) reads every \
+         tab's jobs for jobs.* and job=; `quiet` is cpu<25% wait<0.25 \
+         gpu<10% throttle=none swap<1MB/s, an explicit term replacing the preset's and a preset \
+         term this host cannot measure dropping out (`skipped=<metric>:<why>`); level-triggered \
+         on each snapshot (one a second while armed, no Deck needed), and `for=<n>(ms|s|m|h)` \
+         holds over consecutive snapshots: `OK sys <metric>=<value> … held_ms= as_of= next=`, \
+         `ERR unavailable <metric> why=<word>` at arm for an explicit term this host cannot \
+         measure (growth, walk and eta read why=not_sampled in this build), \
+         `ERR exited`, `OK timeout` (exit 124). Free space is its own wait, never mixed with \
+         those terms: `await sys <free>=<size>|free>=room|disk=<word>[,…]> [and <term>] \
+         [vol=<path>]` — free space on the volume of the session's working \
          directory (a <size> needs its unit: B, KB, MB, GB, TB, KiB, MiB, GiB, TiB; `room` is \
          `status disk_room_mb=`), or its level (ok, low, short, emergency); latched, so a \
          condition already true answers at once; a `free` wait below its need registers a \
@@ -4946,6 +5172,8 @@ pub const VERBS: &[VerbSpec] = &[
          clicking or scrolling in it through a window after 30 s without (`status human_ms=`), \
          `EVENT <local> harness-policy gen=<n>` when the window's `[harness]` policy moves (re-read \
          `harness policy`), \
+         `EVENT <local> job <verdict> job=<id> class=<class> rev=<n> [task=<id>] [code=<n>]` \
+         each time the stuck engine's verdict on one of its jobs moves (`status job=`, `sys jobs`), \
          `EVENT <local> resize n=<k> id=<last> to=<CxR> run=<r>[ dropped=<n>]` at most once a \
          wake for the grid resizes booked since (see `resizes`; `dropped=` counts rows its ring \
          evicted before this watch was shown them — a count on this frame, never a `GAP`), \
@@ -4998,12 +5226,10 @@ pub const VERBS: &[VerbSpec] = &[
          usual 256, never fewer than 4); past them it is answered `ERR subscription capacity \
          busy; retry`, so follow many sessions with one comma list or `@*`",
     ),
-    // fabric messaging — the per-session INBOX RING, this session's outbound posts,
-    // the halt, and the BRIDGE-plane verbs. `inbox`/`inbox get`/`inbox seen`/`post`
-    // are ordinary scoped verbs an agent inside the session calls; `deliver`/
-    // `outbox`/`outbox sent` are `BridgeOnly`, so no token reaches them (see
-    // [`Access::BridgeOnly`]); `hold` is `OwnerOnly` — the local owner's halt from
-    // the Owner token, the fleet's from the bridge, told apart in the handler.
+    // fabric messaging: the per-session inbox ring, outbound posts, the halt and the
+    // bridge-plane verbs. `inbox`/`post` are ordinary scoped verbs; `deliver`/`outbox` are
+    // [`Access::BridgeOnly`]; `hold` is `OwnerOnly`, local and fleet halts told apart in the
+    // handler.
     va(
         "topic",
         Owner,
@@ -5399,8 +5625,11 @@ pub const VERBS: &[VerbSpec] = &[
          and the bridge then WITHDRAWS every session it advertised, one `state=exited` \
          presence row each, so a post to one is refused at its sender (`ERR unroutable`); on \
          `handoff` it withdraws none, because the successor re-attaches the same sids. \
-         Answered like a report: `OK`, or `OK stale=1` from a ghost lane. `ERR usage` for \
-         anything else.",
+         Answered like a report: `OK`, or `OK stale=1` from a ghost lane. `set-aside \
+         files=<n>` (lane 4) says the bridge moved `<n>` state files it found torn after an \
+         unclean shutdown into its state dir's quarantine, rather than refuse them at every \
+         attach: the instance files it for the owner's later look (`fabric.state.torn`), \
+         answered like a report. `ERR usage` for anything else.",
     )
     // Outside the halt: the bridge reporting its own broker link; it puts no bytes on a PTY,
     // and a halt that silenced it would hide the one fact that says why mail is not moving.
@@ -6265,29 +6494,24 @@ pub fn is_owner_only(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::OwnerOnly))
 }
 
-/// Whether `verb` is non-sensitive build/meta provenance or instance posture,
-/// answered for ANY authenticated scope BEFORE target resolution
-/// (`version`/`update`/`help`/`verbs`/`privacy`).
+/// Whether `verb` is answered for any authenticated scope before target resolution
+/// ([`Access::AnyScopeMeta`]).
 #[must_use]
 pub fn is_any_scope_meta(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::AnyScopeMeta))
 }
 
-/// THE BRIDGE LANE'S GRAMMAR GENERATION: what the bridge and the instance serving
-/// it each say in `hello` (`lane=`), so the two can tell which of them reads
-/// less of the lane — the bridge binary is whatever `[fabric] command` names,
-/// and nothing makes it the instance's own build.
+/// The bridge lane's grammar generation, which the bridge and the instance serving it each
+/// state in `hello` (`lane=`) so either can tell which side reads less of the lane: the bridge
+/// binary is whatever `[fabric] command` names, not necessarily the instance's own build.
 ///
-/// THE RULE THE NUMBER CARRIES. A change that one side would answer with `ERR
-/// usage` from the other — a new `deliver` field, a closed word added to a
-/// list the other side checks, a new line in a frame the other side parses
-/// closed — bumps it, and the side that made it writes the new thing only to a
-/// peer whose `hello` named this lane or a later one. Lane 0 is a peer from
-/// before the handshake (an instance answers `hello` with `ERR unknown verb`, a
-/// bridge never sends one): the lane as it stood at 1, `hello` aside. An
-/// additive change the other side already reads past (a `key=value` column
-/// after a roster's identity, a bodiless outbox line after every post) needs no
-/// bump.
+/// Bump it for any change one side would answer with `ERR usage` from the other (a new
+/// `deliver` field, a closed word added to a list the other side checks, a new line in a frame
+/// the other side parses closed); the side that made the change writes the new thing only to a
+/// peer whose `hello` named this lane or a later one. An additive change the other side already
+/// reads past (a `key=value` column after a roster's identity, a bodiless outbox line after
+/// every post) needs no bump. Lane 0 is a peer that never says `hello` (an instance answers it
+/// `ERR unknown verb`, a bridge never sends one); it speaks lane 1 without `hello`.
 ///
 /// THE LANES SO FAR: 1, the lane as `hello` found it. 2, `link log <identity>`
 /// (the bus log's identity, told on every attach before any `deliver`), which
@@ -6299,21 +6523,21 @@ pub fn is_any_scope_meta(verb: &str) -> bool {
 /// below which the two name the same records), which an instance at lane 2
 /// answers `ERR usage` — and a bridge reads that refusal as an attach that
 /// failed, so a lane-2 instance is told the bare identity and forgets every
-/// offset, as it did before lineage.
-pub const BRIDGE_LANE: u32 = 3;
+/// offset, as it did before lineage. 4, `link set-aside files=<n>` (the torn state files the
+/// bridge moved into its state dir's quarantine after an unclean shutdown, for the owner's later
+/// look),
+/// which an instance at lane 3 answers `ERR usage`; a bridge says it only to a lane-4 instance.
+pub const BRIDGE_LANE: u32 = 4;
 
-/// Whether `verb` is BRIDGE-ONLY per the table — only the fabric bridge connection
-/// may run it, and no token unlocks it, Owner included. The dispatch reads THIS (not
-/// a hardcoded verb list), so classifying a verb `BridgeOnly` in the table is what
-/// gates it. Unknown verbs are not bridge-only (`ERR unknown verb`).
+/// Whether `verb` is bridge-only per the table: no token unlocks it, Owner included. The
+/// dispatch reads this; unknown verbs are not bridge-only (`ERR unknown verb`).
 #[must_use]
 pub fn is_bridge_only(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::BridgeOnly))
 }
 
-/// Trailer emitted after a complete guarded response. Its unpredictable nonce
-/// is generated by the server only after receiving the request, so a client
-/// cannot pipeline a valid acknowledgement before consuming the response.
+/// Trailer emitted after a complete guarded response. The server generates its nonce only
+/// after the request arrives, so a client cannot pipeline an acknowledgement unread.
 pub const ARTIFACT_REPLY_CHALLENGE_PREFIX: &str = "ACK-CHALLENGE ";
 /// Client echo sent only after consuming the complete response and challenge.
 pub const ARTIFACT_REPLY_ACK_PREFIX: &str = "ACK ";
@@ -6324,13 +6548,10 @@ macro_rules! control_busy_reply {
         "ERR control server busy; retry"
     };
 }
-/// The control socket's BUSY reply. The listener answers it to a connection it
-/// cannot admit (every request lane at work, or the open-connection cap
-/// reached) and then drops the connection; a lane answers it to a WAIT none of
-/// its lanes may take (every wait lane taken and the request lanes' wait budget
-/// spent) and keeps the connection. Either way nothing was served, and the
-/// request may be sent again. Clients match its `ERR control server busy`
-/// prefix (`aterm-agent`'s `TURNED_AWAY`, `aterm ctl`'s report).
+/// The control socket's busy reply. The listener answers it to a connection it cannot admit
+/// (every request lane busy, or the connection cap reached) and drops it; a lane answers it to
+/// a wait none of its lanes may take and keeps the connection. Nothing was served, so the
+/// request may be retried. Clients match the `ERR control server busy` prefix.
 pub const CONTROL_BUSY_REPLY: &str = control_busy_reply!();
 /// [`CONTROL_BUSY_REPLY`] framed as the wire carries it.
 pub const CONTROL_BUSY_LINE: &str = concat!(control_busy_reply!(), "\n");
@@ -6338,29 +6559,23 @@ pub const CONTROL_BUSY_LINE: &str = concat!(control_busy_reply!(), "\n");
 /// What leads a [`host_gone_line`], up to its pid.
 const HOST_GONE_PREFIX: &str = "ERR gone pid=";
 
-/// THE FORWARD'S HOST WENT AWAY: the line an aterm that forwards a connection to the aterm hosting its
-/// session — a sibling the person opened, a child it spawned — writes in place
-/// of a bare end of stream when that host hung up first and no longer serves at
-/// `sock`, the socket it was reached at: an update's Commit `_exit`, a crash, a
-/// quit. `ERR gone pid=<host> sock=<path>`, the path last (it may hold spaces);
-/// the connection closes after it. The leading `gone` classifies it as every
-/// `ERR <token>` does: transient.
+/// The forward's host went away: the line an aterm forwarding a connection to the aterm hosting
+/// its session writes, instead of a bare end of stream, when that host hung up first and no
+/// longer serves at `sock` (an update's Commit `_exit`, a crash, a quit). `ERR gone pid=<host>
+/// sock=<path>`, path last (it may hold spaces), then the connection closes; `gone` classes it
+/// transient.
 ///
-/// It is the host's HANG-UP, typed: a bare EOF from a forwarder that still
-/// answers reads as a deliberate end (`subscribe` exits 0 "session over" while
-/// the session lives on in the host's successor; `turn` exits 1, the refusal code
-/// a caller retries). A client reads it as its own server going away — a hang-up
-/// of `pid`, whose successor republishes the session's graph entry beside
-/// `sock` — wherever it arrives: in place of a reply, or as a stream's last
-/// line, never relayed as a frame. It is never `ERR forward …`, which says the
-/// request did not reach the host at all.
+/// A bare EOF from a forwarder reads as a deliberate end (`subscribe` exits 0 while the session
+/// lives on in the host's successor). A client reads this line, as a reply or a stream's last
+/// line, as its own server going away (the successor republishes the session's graph entry
+/// beside `sock`). It is never `ERR forward …`, which says the request never reached the host.
 #[must_use]
 pub fn host_gone_line(pid: u32, sock: &str) -> String {
     format!("{HOST_GONE_PREFIX}{pid} sock={sock}\n")
 }
 
-/// The host a [`host_gone_line`] names — its pid and the socket it was reached
-/// at — or `None` for any other line. The line's own `\r\n` is ignored.
+/// The pid and socket a [`host_gone_line`] names, or `None` for any other line (its own
+/// `\r\n` ignored).
 #[must_use]
 pub fn host_gone(line: &str) -> Option<(u32, &str)> {
     let rest = line
@@ -6373,32 +6588,19 @@ pub fn host_gone(line: &str) -> Option<(u32, &str)> {
     Some((pid.parse().ok()?, sock))
 }
 
-/// Maximum UTF-8 bytes in one control-protocol reply line. The shipping client
-/// enforces this on every line; producers of intentionally large single-line
-/// payloads use the same ceiling so they never emit a reply their own client
-/// must reject.
+/// Maximum UTF-8 bytes in one control-protocol reply line: the client enforces it on every
+/// line, and producers of large single-line payloads stay under it.
 pub const MAX_CONTROL_REPLY_LINE_BYTES: usize = 8 << 20;
 
-/// THE SCREEN'S GENERATION: `(invalidation epoch, content seq)`, spelled
-/// `<epoch>.<seq>` on the wire — `status gen=`, `text --json`'s `"gen"`,
-/// `agent_gen=`, and the `if-gen=` fence a typed act (`key`, `send`) names.
+/// The screen's generation, `(invalidation epoch, content seq)`, spelled `<epoch>.<seq>` on the
+/// wire: `status gen=`, `text --json`'s `"gen"`, `agent_gen=`, and the `if-gen=` fence a typed
+/// act names. Server and client both parse with [`ScreenGen::parse`], so a client never sends a
+/// fence the server refuses.
 ///
-/// ONE READER for both ends: the server parses `if-gen=` with
-/// [`ScreenGen::parse`] and a client deciding whether a read's `gen` can be
-/// sent back as a fence asks the same function, so a client never sends a
-/// fence the server answers with `ERR usage`.
-///
-/// WHY NOT `seq=` ALONE. The content seq is the ACTIVE grid's counter, and
-/// every alternate-screen entry installs a fresh grid whose counter starts
-/// again at 1 — so a TUI that leaves and re-enters the alternate screen and
-/// draws a second dialog with the same number of writes shows the first
-/// dialog's `seq=` over a different screen (measured on a private headless
-/// aterm: box A `ls -la /tmp/work` and box B `rm -rf /tmp/work` both read
-/// `seq=15`, and a fence on that value pressed into B). The epoch is the
-/// terminal's invalidation epoch, monotonic for the terminal's life and
-/// advanced by every screen switch and by RIS, so within one epoch the grid is
-/// one grid and its seq only grows: the pair names a screen generation that
-/// never repeats.
+/// Not `seq=` alone: each alternate-screen entry installs a fresh grid whose seq restarts at 1,
+/// so two dialogs drawn with the same number of writes share a `seq=`. The epoch is monotonic
+/// for the terminal's life and advanced by every screen switch and RIS, so the pair never
+/// repeats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScreenGen {
     /// The terminal-wide invalidation epoch.
@@ -6408,9 +6610,8 @@ pub struct ScreenGen {
 }
 
 impl ScreenGen {
-    /// Parse the wire spelling `<epoch>.<seq>` (two unsigned decimals, each
-    /// fitting a `u64`); any other shape — one number, a sign, a third part,
-    /// an overflow — is `None`.
+    /// Parse the wire spelling `<epoch>.<seq>` (two unsigned decimals, each a `u64`); any other
+    /// shape is `None`.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         let (epoch, seq) = value.split_once('.')?;
@@ -6427,8 +6628,7 @@ impl ScreenGen {
 }
 
 impl core::fmt::Display for ScreenGen {
-    // Plain `write_str`s, not `write!`: see `crate::trust_fmt` for why this
-    // crate builds no runtime-argument `format_args!`.
+    // Plain `write_str`s, not `write!`: see `crate::trust_fmt`.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.epoch.to_string())?;
         f.write_str(".")?;
@@ -6436,18 +6636,14 @@ impl core::fmt::Display for ScreenGen {
     }
 }
 
-/// THE ROWS FENCE: `turn if-rows=<first>-<last>:<hex16>` (design record
-/// 2026-09-28 §3.2 C7b) — type only while the visible rows `first..=last`
-/// (0-based grid rows) still hash to `hash`, checked where `if-gen=` is.
-/// `if-gen=` refuses on ANY output since the read, so a screen that repaints
-/// itself (a spinner, a ticking timer) would refuse every press. This fence names only the rows the typing lands
-/// in and whose change matters (Claude Code's input box: a person's keystroke
-/// echoed there, a box drawn over it), and lets the rest move.
+/// The rows fence, `turn if-rows=<first>-<last>:<hex16>`: type only while the visible rows
+/// `first..=last` (0-based) still hash to `hash`, checked where `if-gen=` is. `if-gen=` refuses
+/// on any output since the read, so a repainting screen (a spinner, a timer) would refuse every
+/// press; this names only the rows whose change matters (an agent's input box) and lets the
+/// rest move.
 ///
-/// ONE DEFINITION for both ends, as [`ScreenGen`] is: the server hashes its
-/// rows and a client the rows a read served it through [`RowsFence::hash_rows`]
-/// — FNV-1a-64 over each row followed by `\n`, the definition the screen's own
-/// `hash=` stamp uses over every row — so the two cannot disagree on bytes.
+/// Server and client both hash through [`RowsFence::hash_rows`] (FNV-1a-64 over each row plus
+/// `\n`, as the screen's `hash=` stamp), so they cannot disagree on bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowsFence {
     /// The first grid row hashed.
@@ -6459,9 +6655,8 @@ pub struct RowsFence {
 }
 
 impl RowsFence {
-    /// Parse the wire spelling `<first>-<last>:<hex16>`: two unsigned
-    /// decimals with `first <= last`, and exactly sixteen hex digits; any
-    /// other shape is `None`.
+    /// Parse the wire spelling `<first>-<last>:<hex16>` (two unsigned decimals with
+    /// `first <= last`, exactly sixteen hex digits); any other shape is `None`.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         let (range, hex) = value.split_once(':')?;
@@ -6479,8 +6674,8 @@ impl RowsFence {
         Some(Self { first, last, hash })
     }
 
-    /// FNV-1a-64 over `rows`, each followed by `\n` — over every visible row,
-    /// the screen's `hash=` stamp.
+    /// FNV-1a-64 over `rows`, each followed by `\n` (over every visible row, the screen's
+    /// `hash=` stamp).
     #[must_use]
     pub fn hash_rows<'a>(rows: impl IntoIterator<Item = &'a str>) -> u64 {
         let mut h = aterm_hash::Fnv1a64::new();
@@ -6493,8 +6688,7 @@ impl RowsFence {
 }
 
 impl core::fmt::Display for RowsFence {
-    // Plain `write_str`s, not `write!`: see `crate::trust_fmt` for why this
-    // crate builds no runtime-argument `format_args!`.
+    // Plain `write_str`s, not `write!`: see `crate::trust_fmt`.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         f.write_str(&self.first.to_string())?;
@@ -6510,8 +6704,8 @@ impl core::fmt::Display for RowsFence {
     }
 }
 
-/// Validate the fixed-width lowercase/uppercase hexadecimal nonce grammar used
-/// by guarded artifact acknowledgement frames.
+/// Whether `nonce` is the 32-hex-digit (either case) nonce of a guarded artifact
+/// acknowledgement.
 #[must_use]
 pub fn valid_artifact_ack_nonce(nonce: &str) -> bool {
     nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -6544,16 +6738,15 @@ fn catalog_row(name: &str, text: &str) -> String {
     format!("{name:<w$} {text}", w = CATALOG_TEXT_COLUMN - 1)
 }
 
-/// The SHORT catalog: one `<name padded> <summary>` row per verb, in table order —
-/// what the server answers a bare `help` with, bounded by
-/// [`SHORT_CATALOG_MAX_BYTES`] in total. [`catalog_lines_full`] is the full form.
-/// Both project the one table, so neither can drift from it (they ARE the table).
+/// The short catalog: one `<name padded> <summary>` row per verb, in table order, answered to
+/// a bare `help` and bounded by [`SHORT_CATALOG_MAX_BYTES`]. [`catalog_lines_full`] is the full
+/// form.
 pub fn catalog_lines() -> impl Iterator<Item = String> {
     VERBS.iter().map(|s| catalog_row(s.name, s.summary))
 }
 
-/// The FULL catalog: one `<name padded> <summary detail>` row per verb, in table
-/// order — `help --full`, and the `aterm help introspection` manual.
+/// The full catalog: one `<name padded> <summary detail>` row per verb, in table order
+/// (`help --full`, and the `aterm help introspection` manual).
 pub fn catalog_lines_full() -> impl Iterator<Item = String> {
     VERBS.iter().map(|s| catalog_row(s.name, &s.help_line()))
 }
@@ -6581,9 +6774,8 @@ mod tests {
         }
     }
 
-    /// THE ROWS FENCE's wire spelling reads back what it wrote, refuses every
-    /// other shape, and its hash is FNV-1a-64 over the rows joined by `\n` —
-    /// the definition of the screen's `hash=` over all of them.
+    /// The rows fence's wire spelling round-trips, refuses other shapes, and hashes the rows
+    /// as the screen's `hash=` does.
     #[test]
     fn a_rows_fence_round_trips_refuses_bad_shapes_and_hashes_the_rows_joined() {
         use super::RowsFence;
@@ -6675,8 +6867,7 @@ mod tests {
                 );
             }
         }
-        // Negative control: WITHOUT the flag the verb keeps its table framing, so
-        // the test above is not passing for a trivial reason.
+        // Negative control: without the flag the table framing holds.
         assert_eq!(framing_of("metrics", "metrics"), Status);
         assert_eq!(framing_of("cursor", "cursor"), Status);
     }
@@ -6697,18 +6888,13 @@ mod tests {
         assert_eq!(framing_of("cast", "@s-a cast frames"), Lines);
         assert_eq!(framing_of("cast", "@s-a cast drift"), Lines);
         assert_eq!(framing_of("cast", "cast drift max_runs=4 rows=10"), Lines);
-        // `video frames` lists rows (Lines); base `video`/`video status` stay Status.
         assert_eq!(framing_of("video", "video frames"), Lines);
         assert_eq!(framing_of("video", "@s-a video frames count=5"), Lines);
         assert_eq!(framing_of("video", "video 3 full"), Status);
         assert_eq!(framing_of("video", "video status"), Status);
-        // `temporal status` is a Status line; base `temporal`/`temporal <tick>` stay Bytes.
         assert_eq!(framing_of("temporal", "temporal status"), Status);
-        // `identities` lists (`OK <n>` + rows) and describes one (`OK <1+agents>`
-        // + rows); its `forget` sub-form answers one status line.
         assert_eq!(framing_of("identities", "identities"), Lines);
         assert_eq!(framing_of("identities", "identities worker"), Lines);
-        // A roster of the whole instance: answered before any session resolves.
         assert_eq!(spec("identities").map(|s| s.target), Some(Target::Meta));
         assert_eq!(framing_of("identities", "identities forget worker"), Status);
         assert_eq!(
@@ -6744,6 +6930,24 @@ mod tests {
             Status
         );
         assert_eq!(framing_of("task", "@s-a task mark done"), Status);
+        // `doc`: `ls` lists `OK <n>` + rows (the bare verb too) and `read` is one byte
+        // body, aimed or not; `apply` lists its hunks and `log` its frames, and `save`
+        // answers one line.
+        for (request, framing) in [
+            ("doc", Lines),
+            ("doc ls", Lines),
+            ("doc ls uri=file:///tmp/x.txt", Lines),
+            ("@s-a doc ls", Lines),
+            ("doc read 3", Bytes),
+            ("doc read file:///tmp/x.txt lines=1-20", Bytes),
+            ("@s-a doc read doc=3 lines=40-", Bytes),
+            ("doc apply 3 base=7 len=12", Lines),
+            ("doc log 3 since=2", Lines),
+            ("doc save 3", Status),
+            ("@s-a doc save file:///tmp/x.txt", Status),
+        ] {
+            assert_eq!(framing_of("doc", request), framing, "{request}");
+        }
         // `result` answers `OK <n>` + the text's lines, `result full` too.
         assert_eq!(framing_of("result", "@s-a result"), Lines);
         assert_eq!(framing_of("result", "result full"), Lines);
@@ -6754,10 +6958,7 @@ mod tests {
         assert_eq!(framing_of("dims", "dims json"), Lines);
         assert_eq!(framing_of("cursor", "@s-a cursor --json"), Lines);
         assert_eq!(framing_of("edges", "edges --json"), Lines);
-        // Without the flag, cursor/dims keep their Status framing.
         assert_eq!(framing_of("dims", "dims"), Status);
-        // Session metadata: `meta` (and its set/unset sub-forms) are single
-        // status lines; `timeline` streams `OK <n>` + n event lines.
         assert_eq!(framing_of("meta", "meta"), Status);
         assert_eq!(framing_of("meta", "meta set title build agent"), Status);
         assert_eq!(framing_of("meta", "@s-a meta unset icon"), Status);
@@ -6765,12 +6966,9 @@ mod tests {
         assert_eq!(framing_of("timeline", "@s-a timeline 10 since=3"), Lines);
         assert_eq!(framing_of("resizes", "resizes"), Lines);
         assert_eq!(framing_of("resizes", "@s-a resizes 20 since=4"), Lines);
-        // The admission-diagnosis ring streams `OK <n>` + n rows, with no
-        // sub-form to change that (`trail 5` is a count, not a mode).
+        // `trail 5` is a count, not a mode.
         assert_eq!(framing_of("trail", "trail"), Lines);
         assert_eq!(framing_of("trail", "@s-a trail 5"), Lines);
-        // The Subject+Status record is ONE versioned status line, with no
-        // sub-form to change that.
         assert_eq!(framing_of("status", "status"), Status);
         assert_eq!(framing_of("status", "@s-a status"), Status);
     }
@@ -6803,10 +7001,8 @@ mod tests {
         assert!(!valid_artifact_ack_nonce("artifact"));
     }
 
-    /// `entry_lines` is the `help <verb>` body: first row `<name padded> <text>`, every
-    /// continuation row indented to the text column, no row wider than the wrap
-    /// width unless a single word is, and re-joining the text reproduces `help_line`
-    /// byte-for-byte — for EVERY verb, so the wrap is provably lossless and stable.
+    /// `entry_lines` wraps every verb within the width (bar a lone long word), indents
+    /// continuations to the text column, and re-joins to `help_line` exactly.
     #[test]
     fn entry_lines_wrap_every_verb_deterministically_and_losslessly() {
         let gutter = " ".repeat(CATALOG_TEXT_COLUMN);
@@ -6849,7 +7045,7 @@ mod tests {
                     "{}: ragged wrap chunk {t:?}",
                     s.name
                 );
-                // Greedy: a chunk only ends because the next word would not fit.
+                // No chunk is wider than the text width unless it is one word.
                 assert!(t.chars().count() <= text_width || !t.contains(' '));
             }
             assert_eq!(texts.join(" "), s.help_line(), "{}: wrap lost text", s.name);
@@ -6860,7 +7056,6 @@ mod tests {
                 s.name
             );
         }
-        // A short verb is exactly its one full-catalog row; a long one wraps.
         let one = spec("lines").unwrap();
         assert_eq!(
             one.entry_lines(),
@@ -6869,10 +7064,8 @@ mod tests {
         assert!(spec("image").unwrap().entry_lines().len() > 5);
     }
 
-    /// The fabric rows carry exactly the classes §11.2 of the fabric design gives
-    /// them, and `framing_of` flips BOTH `inbox` sub-forms. The classes are what the
-    /// server gates on and what the client parses with, so a silent change to one of
-    /// them is a protocol change with no other alarm.
+    /// The fabric rows carry the classes the fabric design's §11.2 gives them; a silent change
+    /// to one is a protocol change.
     #[test]
     fn fabric_verbs_carry_their_designed_classes() {
         for (name, op, framing, target, access) in [
@@ -6884,8 +7077,6 @@ mod tests {
             ("deliver", Write, Status, Meta, BridgeOnly),
             ("link", Write, Status, Meta, BridgeOnly),
             ("hello", Write, Status, Meta, BridgeOnly),
-            // Owner-class, not bridge-only: the local owner's halt rides the Owner
-            // token; the fleet hold is kept bridge-issued in the handler.
             ("hold", Write, Status, Meta, OwnerOnly),
             ("outbox", Read, Bytes, Meta, BridgeOnly),
             ("outbox sent", Write, Status, Meta, BridgeOnly),
@@ -6901,15 +7092,13 @@ mod tests {
             assert_eq!(s.target, target, "{name} target");
             assert_eq!(s.access, access, "{name} access");
         }
-        // The sub-form flip: the base listing is Lines, `get` is a byte body, `seen`
-        // is a status line. Selector-aware, like every other sub-form rule.
+        // The base listing is Lines, `get` a byte body, `seen` a status line; selector-aware.
         assert_eq!(framing_of("inbox", "inbox"), Lines);
         assert_eq!(framing_of("inbox", "inbox 20 since=4 --meta"), Lines);
         assert_eq!(framing_of("inbox", "inbox get 7"), Bytes);
         assert_eq!(framing_of("inbox", "@s-a inbox get 7"), Bytes);
         assert_eq!(framing_of("inbox", "inbox seen 7 handled"), Status);
         assert_eq!(framing_of("inbox", "@s-a inbox seen 7"), Status);
-        // `deliver`/`hold` are single status lines with no sub-form to change that.
         assert_eq!(
             framing_of("deliver", "deliver s-a off=9 from=h-x kind=task"),
             Status
@@ -6926,24 +7115,20 @@ mod tests {
         assert_eq!(framing_of("outbox", "outbox sent s-a 3 off=91"), Status);
     }
 
-    /// `copy` is the clipboard-exfil boundary and `settings` rewrites durable config
-    /// — each split OUT of the coarse Read/Write class into its own op-class, so a
-    /// read-only / keystroke-only edge can no longer reach them.
+    /// `copy` (clipboard exfil) and `settings` (durable config) each have their own op-class,
+    /// out of a read-only or keystroke-only edge's reach.
     #[test]
     fn copy_and_settings_have_their_own_op_class() {
         assert_eq!(spec("copy").unwrap().op, OpClass::ClipboardWrite);
         assert_eq!(spec("settings").unwrap().op, OpClass::ConfigWrite);
-        // scroll/select stay Read — viewport nav is part of reading, nothing leaves.
+        // scroll/select stay Read: nothing leaves the process.
         assert_eq!(spec("scroll").unwrap().op, OpClass::Read);
         assert_eq!(spec("select").unwrap().op, OpClass::Read);
     }
 
-    /// The `privacy` row's SHAPE is load-bearing, not cosmetic. `AnyScopeMeta` is
-    /// why a `--headless` instance answers it at all; `Meta` rejects a selector; `Read` because every
-    /// fact it aggregates is one `status` already exposes a session at a time, or
-    /// an instance-level fact about this Mac any program running as this user can
-    /// read for itself (the `debugger` row), so the verb introduces no new
-    /// authority; `Lines` because it replies `OK <n>` plus n rows.
+    /// The `privacy` row's shape is load-bearing: `AnyScopeMeta` so a `--headless` instance
+    /// answers it, `Meta` to reject a selector, `Read` because each fact is one `status` already
+    /// exposes or one the user's own processes can read, `Lines` for `OK <n>` + rows.
     #[test]
     fn privacy_is_a_headless_answerable_meta_read() {
         let s = spec("privacy").expect("privacy is in the table");
@@ -7050,6 +7235,13 @@ mod tests {
         // `edit` waits for its view to be installed, `await edit` for it to close.
         assert_eq!(r("edit", "file:///tmp/x.txt line=3").lane, Wait);
         assert_eq!(r("await", "edit ticket=1").lane, Wait);
+        // `doc`'s reads need Read and its write forms Write; all answer at once.
+        assert_eq!(r("doc", "ls").op, Read);
+        assert_eq!(r("doc", "read 3 lines=1-20").op, Read);
+        assert_eq!(r("doc", "log 3").op, Read);
+        assert_eq!(r("doc", "apply 3 len=12").op, Write);
+        assert_eq!(r("doc", "save 3").op, Write);
+        assert_eq!(r("doc", "read 3").lane, Rpc);
         // Owner-only forms, and the rows they leave open.
         assert!(r("update", "check").owner_only && r("update", "apply").owner_only);
         assert_eq!(r("update", "check").lane, Wait);

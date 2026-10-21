@@ -37,97 +37,55 @@
 
 use crate::tables::gcb::{GCB, GRAPHEME_BREAK, InCB, gcb_class, incb_class};
 
-// ---------------------------------------------------------------------------
-// Core break decision
-// ---------------------------------------------------------------------------
-
 /// Segmentation state carried between codepoints.
 ///
-/// The GB11 emoji-ZWJ chain is tracked in the iterator (via
-/// `ext_pict_then_extends`, "the text so far ends with ExtPict Extend\*")
-/// because it requires looking back past `Extend` codepoints to the
-/// pictograph. Only the "are we in a complete ExtPict Extend\* ZWJ prefix?"
-/// bit flows through `BreakState`.
+/// `ext_pict_then_extends` is tracked in `find_first_cluster_end`; only the
+/// completed `ExtPict Extend* ZWJ` prefix bit (`in_ext_pict_zwj`) flows here.
 #[derive(Debug, Clone, Copy, Default)]
 struct BreakState {
-    /// Number of consecutive Regional_Indicator codepoints since the last
-    /// non-RI character. Used by GB12/GB13 to pair odd-numbered RIs.
+    /// Consecutive `Regional_Indicator` count since the last non-RI (GB12/GB13).
     ri_count: u32,
-    /// Whether the prefix `Extended_Pictographic Extend* ZWJ` has just been
-    /// completed (i.e. `prev == ZWJ` and a matching prefix preceded it).
-    /// When set, a following `Extended_Pictographic` joins via GB11.
+    /// Just completed `Extended_Pictographic Extend* ZWJ` (GB11).
     in_ext_pict_zwj: bool,
-    /// GB9c tracking — set after we see an `InCB=Consonant` and have not
-    /// yet seen a character that resets the conjunct chain.
-    /// When set, a run of `InCB∈{Extend,Linker}` has been consumed and is
-    /// still eligible to complete a conjunct.
+    /// Seen `InCB=Consonant` without a chain-breaking character since (GB9c).
     incb_after_consonant: bool,
-    /// GB9c tracking — within the `InCB∈{Extend,Linker}` run following a
-    /// Consonant, at least one `InCB=Linker` has been seen. When both this
-    /// and `incb_after_consonant` are set, the next `InCB=Consonant` must
-    /// NOT introduce a break (GB9c).
+    /// Seen at least one `InCB=Linker` since the last `InCB=Consonant` (GB9c).
     incb_linker_seen: bool,
 }
 
 /// Decide whether there is a cluster break between `prev` and `next`.
-///
-/// `state` carries stateful context (RI parity, GB11 emoji-ZWJ chain) built
-/// up from all codepoints before `prev`; this function does not modify it
-/// (the iterator updates state after the decision).
 #[inline]
 fn is_break(prev: GCB, next: GCB, next_incb: InCB, state: &BreakState) -> bool {
-    // GB12/GB13: RI × RI only pairs when the preceding RI count is odd.
-    // `state.ri_count` is the number of RIs including `prev` if `prev == RI`.
+    // GB12/GB13: RI × RI pairs only when the preceding RI count is odd.
     if prev == GCB::Regional_Indicator && next == GCB::Regional_Indicator {
-        // odd => no break (complete a pair); even => break (start new pair).
         return state.ri_count.is_multiple_of(2);
     }
 
-    // GB11: ZWJ × Extended_Pictographic only when inside an ExtPict Extend* ZWJ
-    // prefix. The generated table already encodes "ZWJ × ExtPict = no break";
-    // we override to BREAK when state says we are not in such a prefix.
+    // GB11: table encodes ZWJ × ExtPict = no break; override when not in prefix.
     if prev == GCB::ZWJ && next == GCB::Extended_Pictographic && !state.in_ext_pict_zwj {
         return true;
     }
 
-    // GB9c: InCB=Consonant [InCB∈{Extend,Linker}]* InCB=Linker
-    //       [InCB∈{Extend,Linker}]* × InCB=Consonant.
-    // When the conjunct state is complete, override any pending break between
-    // the final InCB=Consonant and the preceding chain.
+    // GB9c: InCB=Consonant [InCB∈{Extend,Linker}]* InCB=Linker [InCB∈{Extend,Linker}]* × InCB=Consonant.
     if next_incb == InCB::Consonant && state.incb_after_consonant && state.incb_linker_seen {
         return false;
     }
 
-    // Default decision from the generated 15x15 matrix.
     GRAPHEME_BREAK[prev as usize][next as usize]
 }
 
-// ---------------------------------------------------------------------------
-// Graphemes iterator (yields &str)
-// ---------------------------------------------------------------------------
-
 /// Iterator over the grapheme clusters of a string slice.
 ///
-/// Yields `&str` slices, each representing one user-perceived character.
-/// This is a zero-allocation iterator suitable for hot paths.
-///
-/// Created by [`GraphemeClusters::graphemes`].
+/// Yields `&str` slices without allocation. Created by [`GraphemeClusters::graphemes`].
 #[derive(Debug, Clone)]
 pub struct Graphemes<'a> {
-    /// The remaining (unprocessed) portion of the input.
     rest: &'a str,
-    /// Precomputed `(GCB, InCB)` classes of the first character of `rest`.
-    ///
-    /// `find_first_cluster_end` classifies the codepoint at the break boundary
-    /// to decide the break; that boundary char becomes the base of the next
-    /// cluster. Carrying its classes forward lets the next `next()` reuse them
-    /// instead of re-classifying the same codepoint. `None` on the first call
-    /// (nothing precomputed yet) and whenever `rest` is empty.
+    /// Precomputed `(GCB, InCB)` of the first char of `rest` from the previous
+    /// boundary check, or `None` on the first call / when `rest` is empty.
     next_base: Option<(GCB, InCB)>,
 }
 
 impl<'a> Graphemes<'a> {
-    /// Create a new grapheme iterator over a string slice.
     #[inline]
     pub(crate) fn new(s: &'a str) -> Self {
         Self {
@@ -146,10 +104,6 @@ impl<'a> Iterator for Graphemes<'a> {
             return None;
         }
 
-        // Scan forward, consuming characters until a break is found (or the
-        // end of input is reached). The returned slice is the first cluster.
-        // The returned boundary classes are the classes of the first char of
-        // the new `rest`, reused on the next call to avoid re-classifying it.
         let (end, next_base) = find_first_cluster_end(self.rest, self.next_base);
         let grapheme = &self.rest[..end];
         self.rest = &self.rest[end..];
@@ -163,19 +117,13 @@ impl<'a> Iterator for Graphemes<'a> {
         if len == 0 {
             (0, Some(0))
         } else {
-            // At least 1 grapheme, at most one per byte.
             (1, Some(len))
         }
     }
 }
 
-// A `clean { … }` island is Clean surface that only a Trust rustc can parse. A
-// stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
-// compat slice) parses a cfg'd-out module's body all the same, so the island's
-// module goes through this macro, which drops its tokens there and emits them
-// unchanged under `cfg(clean_islands)`: set by this crate's build script
-// whenever the compiler is Trust (crates/aterm-log/clean_islands.rs), so the
-// island is kernel-checked at every Trust build, not only the verify lane.
+// Emits `clean { … }` tokens only under `cfg(clean_islands)` (set by build.rs
+// on Trust compilers) so stock rustc never parses Clean surface syntax.
 #[cfg(clean_islands)]
 macro_rules! verify_island {
     ($($tt:tt)*) => {
@@ -209,20 +157,10 @@ verify_island! {
     }
 }
 
-/// Locate the byte-end of the first grapheme cluster in `s`.
-///
-/// `first_classes`, when `Some`, supplies the already-computed `(GCB, InCB)` of
-/// the first character of `s` (it was classified as the break boundary of the
-/// previous cluster), so it is not re-classified; `None` means classify it here
-/// (the first call on a fresh iterator).
-///
-/// Returns `(end, boundary_classes)` where `end` is `s.len()` if the entire
-/// string is a single cluster. `boundary_classes` carries the `(GCB, InCB)` of
-/// the codepoint at the returned break boundary — i.e. the first char of
-/// `s[end..]` — so the next call can reuse it; it is `None` when `end == s.len()`
-/// (the remainder is one cluster, so `s[end..]` is empty).
-///
-/// Panics only on an empty string (which the caller guards against).
+/// Locate the byte-end of the first grapheme cluster in non-empty `s`, and
+/// return the `(GCB, InCB)` of the boundary char at `s[end..]` (`None` when
+/// `end == s.len()`). `first_classes` supplies precomputed classes for the
+/// first character of `s` when available.
 #[inline]
 #[allow(
     clippy::expect_used,
@@ -246,17 +184,11 @@ fn find_first_cluster_end(
     }
     let mut iter = s.char_indices();
 
-    // Consume the first character — the base of the cluster. Reuse the
-    // precomputed classes when available (the boundary char of the previous
-    // cluster); otherwise classify it now. Either way the state init below is
-    // derived solely from these classes, so behavior is identical.
     let (_, first) = iter.next().expect("s is non-empty");
     let (mut prev_gcb, first_incb) =
         first_classes.unwrap_or_else(|| (gcb_class(first), incb_class(first)));
 
-    // Whether the text so far ends with `ExtPict Extend*`: the only thing a
-    // ZWJ may follow for GB11 to join the next pictograph. A ZWJ ends it (a
-    // second ZWJ, or an Extend after the ZWJ, is no longer that prefix).
+    // True when the text so far ends with `ExtPict Extend*` (GB11).
     let mut ext_pict_then_extends = prev_gcb == GCB::Extended_Pictographic;
     let mut state = BreakState {
         ri_count: if prev_gcb == GCB::Regional_Indicator {
@@ -274,20 +206,15 @@ fn find_first_cluster_end(
         let next_incb = incb_class(c);
 
         if is_break(prev_gcb, next_gcb, next_incb, &state) {
-            // The boundary char `c` (at `idx`) becomes the base of the next
-            // cluster; hand its already-computed classes to the next call.
             return (idx, Some((next_gcb, next_incb)));
         }
 
-        // Advance the GB11 state: `in_ext_pict_zwj` holds exactly when the
-        // text so far ends with `ExtPict Extend* ZWJ`.
         match next_gcb {
             GCB::Extended_Pictographic => {
                 ext_pict_then_extends = true;
                 state.in_ext_pict_zwj = false;
             }
             GCB::Extend => {
-                // Extend continues `ExtPict Extend*` but ends `... ZWJ`.
                 state.in_ext_pict_zwj = false;
             }
             GCB::ZWJ => {
@@ -300,36 +227,21 @@ fn find_first_cluster_end(
             }
         }
 
-        // RI parity tracking.
         if next_gcb == GCB::Regional_Indicator {
             state.ri_count = state.ri_count.wrapping_add(1);
         } else {
             state.ri_count = 0;
         }
 
-        // GB9c state transitions for the Indic conjunct chain.
-        //
-        // - InCB=Consonant: starts (or restarts) a new chain. Any prior
-        //   chain with a linker would already have been completed via the
-        //   no-break decision above; here we reset and arm for the next.
-        // - InCB=Linker: remains in-chain and records that a linker has
-        //   been observed since the last Consonant.
-        // - InCB=Extend: remains in-chain but does not by itself satisfy
-        //   the "linker required" clause.
-        // - InCB=None: the chain is broken — the next Consonant must
-        //   start a fresh chain.
         match next_incb {
             InCB::Consonant => {
                 state.incb_after_consonant = true;
                 state.incb_linker_seen = false;
             }
             InCB::Linker => {
-                // Stay in chain and note the linker.
                 state.incb_linker_seen = true;
             }
-            InCB::Extend => {
-                // Stay in chain; linker state unchanged.
-            }
+            InCB::Extend => {}
             InCB::None => {
                 state.incb_after_consonant = false;
                 state.incb_linker_seen = false;
@@ -339,31 +251,19 @@ fn find_first_cluster_end(
         prev_gcb = next_gcb;
     }
 
-    // Whole remainder is a single cluster: `s[s.len()..]` is empty, so the
-    // following `next()` short-circuits and no boundary classes are needed.
     (s.len(), None)
 }
 
-// ---------------------------------------------------------------------------
-// GraphemeIndices iterator (yields (usize, &str))
-// ---------------------------------------------------------------------------
-
 /// Iterator over grapheme clusters with their byte offsets.
 ///
-/// Yields `(byte_offset, &str)` pairs. The byte offset is relative to the
-/// beginning of the original string.
-///
-/// Created by [`GraphemeClusters::grapheme_indices`].
+/// Yields `(byte_offset, &str)` pairs. Created by [`GraphemeClusters::grapheme_indices`].
 #[derive(Debug, Clone)]
 pub struct GraphemeIndices<'a> {
-    /// The original string, kept for byte-offset calculation.
     original: &'a str,
-    /// Inner graphemes iterator.
     inner: Graphemes<'a>,
 }
 
 impl<'a> GraphemeIndices<'a> {
-    /// Create a new grapheme-indices iterator over a string slice.
     #[inline]
     pub(crate) fn new(s: &'a str) -> Self {
         Self {
@@ -379,8 +279,6 @@ impl<'a> Iterator for GraphemeIndices<'a> {
     #[inline]
     fn next(&mut self) -> Option<(usize, &'a str)> {
         self.inner.next().map(|grapheme| {
-            // Both `grapheme` and `self.original` point into the same
-            // allocation, so pointer arithmetic gives the byte offset.
             let offset = grapheme.as_ptr() as usize - self.original.as_ptr() as usize;
             (offset, grapheme)
         })
@@ -392,12 +290,7 @@ impl<'a> Iterator for GraphemeIndices<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Extension trait
-// ---------------------------------------------------------------------------
-
-/// Extension trait providing grapheme cluster iteration on `&str`, with an
-/// API close to `unicode-segmentation`'s `UnicodeSegmentation`.
+/// Extension trait providing grapheme cluster iteration on `&str`.
 ///
 /// # Example
 ///
@@ -427,15 +320,6 @@ impl GraphemeClusters for str {
         GraphemeIndices::new(self)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests. The UAX #29 behaviour itself is pinned by
-// `tests/uax29_conformance.rs` (the official GraphemeBreakTest file plus the
-// recorded answers where unicode-segmentation disagreed); only what that suite
-// cannot reach stays here — code points the official file never uses (U+135D,
-// U+1F91D) and two regressions in this iterator's own state threading and
-// tables.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

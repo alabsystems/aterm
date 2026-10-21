@@ -55,8 +55,8 @@ pub fn write_in_process(file: &Executable) -> io::Result<()> {
 /// still reaches the drive before the rename names it, so a kernel panic cannot leave an
 /// empty file under the name; a power loss can lose the newest lay, and the next seed
 /// re-lays it (`stub::stub_is_current`, the reroute byte compare). A first seed lays ~35 of
-/// these; the barrier, ~4 ms each, would add ~140 ms and stall the whole volume during the
-/// first launch's other I/O.
+/// these; the barrier, ~4 ms each, would add ~140 ms and hold up most of the first launch's
+/// other flushes, growing writes, creates and renames on the volume while each runs.
 pub fn write_regenerable(file: &Executable) -> io::Result<()> {
     write_with(file, crate::platform::sync_file_contents)
 }

@@ -58,9 +58,9 @@ impl Builder for FakeBuilder {
     }
 }
 
-/// The shell suite's world: index 7 pins ay 10, clean 20, trust 30, trust-ir 40. ay's
-/// published manifest carries the darwin rows and the x86_64 Linux row; the others only
-/// the darwin rows. The builder is x86_64 Linux and can cross-build aarch64.
+/// The world: index 7 pins ay 10, clean 20, trust 30, trust-ir 40. ay's published manifest
+/// carries the darwin rows and the x86_64 Linux row; the others only the darwin rows. The
+/// builder is x86_64 Linux and can cross-build aarch64.
 struct World {
     fx: Fx,
     host: Triple,
@@ -170,7 +170,7 @@ fn a_latch_outranks_every_quieter_reading_of_a_row() {
 fn a_dry_run_sees_every_served_target_and_plans_the_missing_rows() {
     let w = World::new("linux-dry");
     let (o, tx) = ok(w.run(true));
-    // (a)/(b) ay ships x86_64 only: its aarch64 row is planned, not "done".
+    // ay ships x86_64 only: its aarch64 row is planned, not "done".
     assert_eq!(*decision(&o, "ay"), Decision::Build { held: vec![] });
     let ay = table_row(&tx, "ay");
     assert!(
@@ -182,7 +182,7 @@ fn a_dry_run_sees_every_served_target_and_plans_the_missing_rows() {
             || ay.contains("pack aarch64-unknown-linux-gnu"),
         "{ay}"
     );
-    // (c) clean has no Linux row: both targets.
+    // clean has no Linux row: both targets.
     let clean = table_row(&tx, "clean");
     assert!(
         clean.contains(
@@ -303,7 +303,7 @@ fn staging_extends_the_published_bytes_with_every_target_in_one_manifest() {
                 .is_file()
         );
     }
-    // (j) the merge EXTENDS the published bytes; ay gains exactly its aarch64 row.
+    // The merge extends the published bytes; ay gains exactly its aarch64 row.
     let published = String::from_utf8(
         w.fx.staging_asset("clean", 20, "pkg-clean-20.toml")
             .expect("pub"),
@@ -326,7 +326,7 @@ fn staging_extends_the_published_bytes_with_every_target_in_one_manifest() {
         !w.staged().join(format!("ay/ay-10-{X86}.tar.zst")).exists(),
         "a published row is never re-packed"
     );
-    // (k) READY.md: every tarball the manifest names, trust-ir HELD, keyless said.
+    // READY.md: every tarball the manifest names, trust-ir HELD, keyless said.
     let ready = w.ready();
     for t in [
         "clean/clean-20-x86_64-unknown-linux-gnu.tar.zst",
@@ -502,7 +502,8 @@ fn a_staged_merge_that_no_longer_extends_the_published_bytes_takes_the_ceremony_
     assert!(!m.with_extension("toml.sig").exists());
 }
 
-/// (i)'s staging, its rows packed by a compiler with no lineage receipt, then a keyed run.
+/// A keyless staging run whose rows carry no lineage receipt, then a keyed run with the
+/// receipt switch reading `switch`.
 fn unproven(label: &str, switch: Option<Switch>) -> (World, Result<Outcome>) {
     let w = World::new(label);
     w.keyless();
@@ -626,7 +627,7 @@ fn the_lane_serves_linux_targets_on_a_linux_host_only() {
     );
 }
 
-/// `text` signed by the fixture machine as `pkg-<p>-<b>.toml` on the PUBLIC owner only —
+/// `text` signed by the fixture machine as `pkg-<p>-<b>.toml` on the public owner only:
 /// another machine's extension that reached the channel.
 fn publish_public_only(w: &World, p: &str, b: u64, text: &str) {
     let slug = w.fx.ctx.public_slug(p);
@@ -650,9 +651,9 @@ fn uploads_of(w: &World, tag: &str) -> Vec<String> {
         .collect()
 }
 
-/// (i)'s staging of every program, keyless; then another machine's extension of clean
-/// reaches the public owner, and the staging release of clean stops verifying — it lost
-/// its manifest, or carries a signature the client refuses; then a keyed run.
+/// A keyless staging run; then another machine's extension of clean reaches the public
+/// owner and the staging release of clean stops verifying (no manifest, or a signature the
+/// client refuses); then a keyed run.
 fn unverifiable(label: &str, tamper: bool) -> (World, Result<Outcome>, Vec<u8>) {
     let w = World::new(label);
     w.keyless();

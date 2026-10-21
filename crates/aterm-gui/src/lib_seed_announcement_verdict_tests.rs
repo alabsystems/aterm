@@ -32,8 +32,8 @@ fn drive_code(script: &str) -> (SeedMarkers, Option<i32>, Vec<Wake>) {
     (seen, code, posted)
 }
 
-/// The pin. Announced, worked, exited 0, printed no terminal marker — and the user
-/// was told the install failed.
+/// Announced, exited 0, no terminal marker, a stocked store: the pass finished, and no
+/// failure card is raised.
 #[test]
 fn an_announced_pass_that_exits_zero_is_not_a_failure() {
     let (seen, ok, posted) = drive(
@@ -179,9 +179,8 @@ fn a_contended_pass_is_not_a_failed_install() {
         PassVerdict::Busy,
         "a contended pass is deferred, never a failed install"
     );
-    // …while a refusal with NO marker and not the contention code — an
-    // unwritable prefix, a bundle whose atpkg cannot exec — still reaches the
-    // card. That branch is not being weakened.
+    // …while a markerless refusal with any other code (an unwritable prefix, an atpkg
+    // that cannot exec) still reaches the card.
     let (bare, bare_code, bare_posted) =
         drive_code("echo 'atpkg: the prefix is not writable' >&2; exit 1");
     assert_eq!(bare_code, Some(1));
@@ -246,11 +245,9 @@ fn a_non_utf8_stdout_line_does_not_end_the_marker_reader() {
     );
 }
 
-/// The stderr twin: one raw byte on stderr must not discard the whole stream.
-/// `read_to_string` leaves its buffer empty on `InvalidData` (std's contract:
-/// the bytes are read to EOF, then validated as a whole), so a refusal atpkg
-/// printed in full came back as `said == ""` — "atpkg ended without saying
-/// what happened" on the card, "exited without saying why" in the log.
+/// The stderr twin: a raw byte on stderr must not discard the stream. `read_to_string`
+/// leaves its buffer empty on `InvalidData`, so a refusal printed in full would read as
+/// silence.
 #[test]
 fn a_non_utf8_stderr_byte_does_not_drop_the_refusal() {
     let mut child = aterm_uds::spawnfd::command("/bin/sh")

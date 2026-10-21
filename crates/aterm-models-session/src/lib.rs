@@ -66,7 +66,8 @@ pub use models_session::forward_handshake_model;
 pub use models_session_log::{
     session_log_claims_model, session_log_cursor_model, session_log_fold_model,
     session_log_journal_model, session_log_mail_link_model, session_log_mark_quota_model,
-    session_log_ring_model, transcript_join_model, turn_tracker_model,
+    session_log_program_share_model, session_log_ring_model, transcript_join_model,
+    turn_tracker_model,
 };
 pub use models_subscribe_announcement::subscribe_announcement_order_model;
 pub use models_write_all::write_all_model;

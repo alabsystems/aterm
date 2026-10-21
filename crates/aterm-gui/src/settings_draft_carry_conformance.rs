@@ -6,20 +6,14 @@
 //! rides a seamless self-update instead of holding it — and, beside it, the
 //! same rule for a document whose last save failed.
 //!
-//! Each schedule drives two real `App`s through the shipping code: the
-//! Settings view's own input, the update preflight
-//! (`revalidate_native_update_safety`, the one the Commit admission calls) and
-//! the close barrier it runs behind, the park's capture
-//! (`capture_handoff_layout`) written to the real layout wire and parsed back
-//! as the successor parses it (`RestoreManifest::from_toml`), the successor's
-//! restore (`restore_into_window`, which reopens the Settings view and hands it
-//! the carried drafts), the Commit's layout comparison
-//! (`commit_layout_topology`) and the lane gate (`lane_carry_refusal`). After
-//! every real step the machine is projected from real state — the outgoing
-//! view's draft, the parked layout's draft, the successor view's draft or its
-//! loss message — and must equal the model's state after the named actions;
-//! the real verdicts must BE the model's guards; and at each refusal the
-//! defect machine admits what the real code refused, so no pass is vacuous.
+//! Each schedule drives two real `App`s through the shipping code: the Settings view's
+//! input, the update preflight (`revalidate_native_update_safety`) behind its close
+//! barrier, the park's capture (`capture_handoff_layout`) round-tripped through the layout
+//! wire (`RestoreManifest::from_toml`), the successor's restore (`restore_into_window`),
+//! the Commit's layout comparison (`commit_layout_topology`) and the lane gate
+//! (`lane_carry_refusal`). After every step the projected state must equal the model's,
+//! the real verdicts must be the model's guards, and at each refusal the defect machine
+//! admits what the real code refused, so no pass is vacuous.
 
 use aterm_models_update::native_update_settings_draft_carry_model;
 use aterm_spec::derive::Model;
@@ -114,10 +108,8 @@ impl Rig {
             .map(|draft| draft.text)
     }
 
-    /// The successor said which draft it lost — on glass, or, before its Commit,
-    /// settled and held to be said AT the Commit that makes the loss its own (the
-    /// review of round eight's lead U61: before it the parent still holds the
-    /// draft, and a successor stood down must have written nothing).
+    /// The successor said which draft it lost: on glass, or, before its Commit, held to
+    /// be said at the Commit (until then the parent still holds the draft).
     fn successor_said_a_loss(&self) -> bool {
         self.successor.as_ref().is_some_and(|successor| {
             drafts_loss_row(successor).is_some() || successor.carried_settings_drafts_loss_owed()
@@ -158,8 +150,8 @@ impl Rig {
         state
     }
 
-    /// The real step `op` IS the model's `actions`, fired in order from the
-    /// state it started in, and the invariant holds after it.
+    /// The real step `op` must be the model's `actions`, fired in order from the state it
+    /// started in, and the invariant holds after it.
     fn step(&mut self, label: &str, actions: &[&str], op: impl FnOnce(&mut Self)) {
         let before = self.project();
         op(self);
@@ -177,8 +169,8 @@ impl Rig {
         });
     }
 
-    /// The real preflight must BE the model's Start guard, and the close
-    /// barrier it runs behind must let a carried draft through.
+    /// The real preflight must be the model's Start guard, and the close barrier it runs
+    /// behind must let a carried draft through.
     fn start(&mut self, label: &str) -> bool {
         let before = self.project();
         let barrier = self
@@ -218,9 +210,9 @@ impl Rig {
         });
     }
 
-    /// The seamless lane to a successor at least this build (`older == false`)
-    /// or older: the real lane gate must BE the model's guard, and an admitted
-    /// park captures the layout exactly as the update's park does.
+    /// The seamless lane to a successor at least this build (`older == false`) or older: the
+    /// real lane gate must be the model's guard, and an admitted park captures the layout as
+    /// the update's park does.
     fn park(&mut self, label: &str, older: bool) -> bool {
         let before = self.project();
         let action = if older { "ParkOlder" } else { "Park" };
@@ -257,8 +249,8 @@ impl Rig {
         true
     }
 
-    /// The cold lane: the real gate must BE the model's `ColdExec` guard. An
-    /// admitted exec replaces the app with one that reopens nothing.
+    /// The cold lane: the real gate must be the model's `ColdExec` guard. An admitted exec
+    /// replaces the app with one that reopens nothing.
     fn cold_exec(&mut self, label: &str) -> bool {
         let before = self.project();
         let refusal = lane_carry_refusal(
@@ -335,8 +327,8 @@ impl Rig {
         });
     }
 
-    /// The real Commit — the layout comparison and the native revalidation —
-    /// must BE the model's Commit guard.
+    /// The real Commit (layout comparison and native revalidation) must be the model's
+    /// Commit guard.
     fn commit(&mut self, label: &str) -> bool {
         let before = self.project();
         let pending = self.pending.as_ref().expect("a parked layout");
@@ -478,11 +470,9 @@ fn tab_only_layout(manifest: &RestoreManifest, restore_tag: &str) -> crate::rest
     }
 }
 
-/// THE ROUND TRIP: a Settings draft typed and never saved rides the update.
-/// The close barrier lets it through and the preflight is Ready (before plan
-/// P2-2 both refused: "Review Settings Drafts"); the successor's view holds the
-/// text, still unsaved — its tab dirty, its close held for review — and says
-/// nothing was lost.
+/// A Settings draft typed and never saved rides the update: the close barrier and the
+/// preflight let it through, and the successor's view holds the text still unsaved (tab
+/// dirty, close held for review) and reports no loss.
 #[test]
 fn a_settings_draft_rides_the_update_and_reopens_unsaved() {
     let mut rig = Rig::new();
@@ -573,9 +563,8 @@ fn the_cold_lane_and_an_older_successor_refuse_a_carried_draft() {
     assert!(cold.cold_exec("a clean desk execs cold"));
 }
 
-/// THE LENIENT CONSUMER: a carry the successor cannot read costs that draft —
-/// never the layout, never the Settings leaf, never the handoff — and the
-/// successor says so on glass.
+/// A carry the successor cannot read costs that draft, never the layout, the Settings leaf
+/// or the handoff, and the successor says so on glass.
 #[test]
 fn an_unreadable_carry_degrades_without_refusing() {
     let mut rig = Rig::new();
@@ -610,8 +599,8 @@ fn an_unreadable_carry_degrades_without_refusing() {
     );
 }
 
-/// A draft for a row the successor's build does not edit as text is said on
-/// glass WITH its text, so it can be typed again; drafts it can take land.
+/// A draft for a row the successor's build does not edit as text is said on glass with
+/// its text, so it can be typed again; drafts it can take land.
 #[test]
 fn a_draft_the_successor_cannot_reopen_is_said_with_its_text() {
     let mut rig = Rig::new();
@@ -672,9 +661,9 @@ fn a_successor_that_reopens_nothing_keeps_the_settings_hold() {
     );
 }
 
-/// A field mid-composition (an input method's marked text on screen, not yet
-/// the field's) is HELD, not carried as its committed value — by the close
-/// barrier under the carried scope and by the preflight.
+/// A field mid-composition (an input method's marked text on screen) is held, not
+/// carried as its committed value, by the close barrier under the carried scope and by
+/// the preflight.
 #[test]
 fn a_draft_still_being_composed_holds_the_update() {
     let mut rig = Rig::new();
@@ -746,12 +735,9 @@ fn every_settings_row_fits_one_views_carry() {
     );
 }
 
-/// A DOCUMENT WHOSE SAVE FAILED rides the update too (plan P2-2). Before, any
-/// failed checkpoint held the update ("Retry: … previously failed") even
-/// though its unsaved text was durable in the draft journal the successor
-/// replays. Now the seamless preflight is Ready and the successor reopens the
-/// editor holding the text, unsaved; the cold lane — which reopens nothing —
-/// and a successor that reopens nothing still hold it.
+/// A document whose save failed rides the seamless update too, since its unsaved text is
+/// durable in the draft journal the successor replays; the cold lane and a successor that
+/// reopens nothing still hold it.
 #[test]
 fn a_document_whose_save_failed_rides_the_seamless_update_only() {
     let dir = std::env::temp_dir().join(format!(
@@ -799,11 +785,15 @@ fn a_document_whose_save_failed_rides_the_seamless_update_only() {
                 crate::native_document_io::AtomicSaveResult::Failed {
                     stage: crate::native_document_io::AtomicSaveStage::WriteTemporary,
                     message: "No space left on device".to_string(),
+                    cause: Some(crate::native_document_io::SaveCause {
+                        kind: std::io::ErrorKind::StorageFull,
+                        touch: crate::native_document_io::SaveTouch::Folder,
+                    }),
                 },
                 None,
             )
             .unwrap_err();
-        assert!(error.contains("No space left on device"), "{error}");
+        assert!(error.contains("the disk is full"), "{error}");
         assert!(matches!(
             app.document_store.phase(document),
             Some(crate::document_store::DocumentPhase::Blocked { .. })

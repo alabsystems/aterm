@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The round-trip gate: every `.toml` file in this repository parses, and
-//! parse then print reproduces the source BYTE FOR BYTE.
-//!
-//! Comment and formatting preservation is the entire contract of the document
-//! half — `targo --unverified forge` asserts that rewriting `vendor/forge.toml` does not
-//! move a single byte, and the Preferences window promises a user that saving a
-//! font size will not reflow their config. Anything less than byte equality on
-//! an unmodified document breaks both.
+//! Every `.toml` file in the repository parses, and parse then print reproduces it byte for
+//! byte: a rewrite of one key (the Preferences window, `vendor/forge.toml` tooling) must
+//! leave the rest of the file untouched.
 
 use crate::common;
 
@@ -73,8 +68,8 @@ fn first_difference(a: &str, b: &str) -> String {
     )
 }
 
-/// Formatting the crate must preserve, spelled out so a regression names itself
-/// instead of pointing at a 3,000-line manifest.
+/// Formatting the crate must preserve, spelled out so a regression names itself instead
+/// of pointing into a large corpus file.
 #[test]
 fn formatting_details_survive() {
     for source in [

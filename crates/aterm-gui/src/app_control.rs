@@ -20,13 +20,16 @@ use crate::native_ui::{ActionId, CompiledUi, SemanticRole, SemanticValue, UiKey}
 use crate::tab_model::{LogicalRect, SplitAxis, SplitTree, Tab, View, ViewId};
 use crate::{App, WindowId};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InspectRequest {
     Tabs,
     View {
         view: ViewId,
         projection: InspectionProjection,
     },
+    /// A `doc` read (`control_doc`), which rides this hop and is answered on
+    /// its own channel ([`App::answer_doc`]); the hop's reply is empty.
+    Doc(crate::app_doc::DocCall),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,9 +163,9 @@ fn parse_view(view: WireViewId<'_>) -> Result<ViewId, String> {
 
 impl App {
     pub(crate) fn inspect_app(&self, request: InspectRequest) -> Result<Vec<String>, String> {
-        let topology = self.inspect_tabs_body();
         match request {
             InspectRequest::Tabs => {
+                let topology = self.inspect_tabs_body();
                 let revision = inspection_revision(self.inspection_fingerprint(&topology));
                 let mut lines = Vec::with_capacity(topology.len() + 1);
                 lines.push(
@@ -176,6 +179,7 @@ impl App {
                 Ok(lines)
             }
             InspectRequest::View { view, projection } => {
+                let topology = self.inspect_tabs_body();
                 let inspected = self.compile_view(view)?;
                 let revision = inspection_revision(
                     self.inspection_fingerprint(&topology)
@@ -206,6 +210,10 @@ impl App {
                     }
                 });
                 Ok(lines)
+            }
+            InspectRequest::Doc(call) => {
+                self.answer_doc(call);
+                Ok(Vec::new())
             }
         }
     }
@@ -288,8 +296,12 @@ impl App {
         ))
     }
 
-    /// Refuse control-surface opens inside file provider domains, the one consent
-    /// class a held grant does not cover.
+    /// Refuse control-surface opens inside file provider domains, the document class a held
+    /// Full Disk Access grant does not cover (`NEVER_COVERED`): an open there raises
+    /// `"aterm" wants to access files managed by "iCloud Drive"` in aterm's name. `open_app` is
+    /// reachable from inside a session, so the URI can come from a program's output, and a
+    /// dialog a program can raise is a consent surface an agent controls. The owner's own
+    /// gesture is not guarded.
     ///
     /// `open_app` is reachable from inside a session, so the URI can come from a
     /// program's output. Full Disk Access covers every other protected root, but file
@@ -1714,8 +1726,8 @@ mod tests {
         let mut app = App::headless_for_test();
         if let Some(window) = app.windows.get_mut(&WindowId(0)) {
             window.cols = 140;
-            // Fourteen Settings destinations need room for the labeled medium rail;
-            // stay above the compact-category breakpoint so this tests width.
+            // The Settings destinations need room for the labeled medium rail; stay above
+            // the compact-category breakpoint so this tests width.
             window.rows = 100;
         }
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
@@ -2206,8 +2218,8 @@ mod tests {
                 })
                 .expect("Typography specimen")
         };
-        // The native painter converts this logical size back to physical pixels.
-        // The historical physical input would become 72 px instead of 36 px.
+        // The native painter converts this logical size back to physical pixels, so a
+        // physical input would paint scaled twice (72 px instead of 36 at 2x).
         for scale in [1.0, 1.25, 2.0, 3.0] {
             let window = app.windows.get_mut(&second).unwrap();
             window.scale = scale;
@@ -2478,8 +2490,7 @@ mod tests {
             assert!(refuse(&uri(&path)).is_err(), "{}", path.display());
         }
 
-        // Protected but COVERED classes stay openable — this fence is one named
-        // class, not a general admission check.
+        // Protected but covered classes stay openable.
         for ordinary in [
             "Documents/notes.md",
             "Desktop/notes.md",

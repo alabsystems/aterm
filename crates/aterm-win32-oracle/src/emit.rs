@@ -823,6 +823,7 @@ mod tests {
         let model = Model {
             up,
             consumers: BTreeMap::new(),
+            direct: BTreeMap::new(),
             enabled,
             requested,
             seeds: BTreeMap::new(),

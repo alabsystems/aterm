@@ -194,6 +194,36 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
         "No AI CLI needs you \u{b7} looked at 13:46"
     );
 
+    // A later failed or pending refresh keeps the captured versions, but
+    // their old successful summary must not speak for the new observation.
+    let captured = state.projection(true);
+    let failed = AiState {
+        unavailable: Some("captured\ncollector\tfailure".to_string()),
+        ..state.clone()
+    };
+    let failed_view = failed.projection(true);
+    assert!(failed_view.health.contains("failed"));
+    assert!(failed_view.health.contains("captured collector failure"));
+    assert!(!failed_view.health.chars().any(char::is_control));
+    let refreshing = AiState {
+        looking: true,
+        ..failed
+    }
+    .projection(true);
+    assert!(refreshing.health.starts_with("Looking"));
+    assert!(!refreshing.health.contains("captured collector failure"));
+    for later in [&failed_view, &refreshing] {
+        assert!(later.health.contains("last observed at 13:46"));
+        assert_eq!(
+            later.clis, captured.clis,
+            "the last observed versions stay available"
+        );
+        assert_ne!(
+            later.health, captured.health,
+            "the current look has its own state"
+        );
+    }
+
     // The look switched off: no stale state, no button, and why.
     let off = AiState {
         enabled: false,

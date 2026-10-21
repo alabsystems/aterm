@@ -1,60 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The KITTY LOG (sparkle-words v2.2, design §F4): a durable, machine-owned
-//! collection-book ledger of every kitty sighting the cat renderer reports —
-//! aggregated by `(shown type, magic bucket, primary language)`, never by raw
-//! genome words, so the file is bounded by the vocabulary, not by usage.
+//! The Kitty Log: a durable, machine-owned collection-book ledger of every kitty
+//! sighting the cat renderer reports, aggregated by `(shown type, magic bucket,
+//! primary language)` rather than raw words, so its size is bounded by the
+//! vocabulary, not by usage.
 //!
-//! The shape is a clone of the updater's Health ledger
-//! (`crates/aterm-update/src/health.rs`, the repo's one durable-counter idiom):
-//! an all-`#[serde(default)]` TOML struct (absent/corrupt reads as EMPTY —
-//! fail-open: the log is observability, never a gate), saturating lifetime
-//! counters, RFC3339 first/last timestamps, a best-effort sibling `.lock`
-//! around every read→merge→write, an atomic pid+seq-unique temp + rename
-//! write, and a no-op skip when there is nothing to flush.
+//! Its shape follows the updater's Health ledger (`crates/aterm-update/src/health.rs`):
+//! an all-`#[serde(default)]` TOML struct (absent or corrupt reads as empty: the log
+//! is observability, never a gate), saturating counters, RFC3339 first/last stamps,
+//! a best-effort sibling `.lock` around every read→merge→write, an atomic
+//! pid+seq-unique temp + rename, and no write when there is nothing to flush.
 //!
-//! Legacy sightings and a rollback-readable collectible mirror live at
-//! `config_path().parent()/kitty-log.toml`; the authoritative collectible set
-//! and its published mirror baseline live in sibling `kitty-collectibles.toml`.
-//! A collectible-aware rollback can keep discovering into the mirror, while a
-//! pre-collectibles binary may erase only that mirror, never the sidecar.
-//! Neither file lives inside the user's hand-edited
-//! `aterm.toml`, whose 500 ms watcher would turn machine count-bumps into config
-//! reload + lexicon-recompile storms.
+//! Legacy sightings and a rollback-readable collectible mirror live in
+//! `kitty-log.toml` beside `aterm.toml`; the authoritative collectible set and its
+//! mirror baseline live in the sibling `kitty-collectibles.toml`, so a
+//! pre-collectibles binary can erase only the mirror. Neither lives inside
+//! `aterm.toml`, whose 500 ms watcher would turn count bumps into config-reload
+//! storms.
 //!
-//! Multi-process safety: every flush is a READ-MERGE-WRITE under the sibling
-//! lock (summed counts, min `first_seen`, max `last_seen`, unioned language
-//! chips) — a debounced dump of in-memory totals would last-writer-win a
-//! second aterm's sightings away. A contended lock is never waited on: the
-//! worker retains and coalesces that delta, then makes a finite best-effort
-//! retry at exit so another process cannot hang quit. The crash-loss window is
-//! the deltas since the last flush (≤ the 30 s debounce, plus a permanently
-//! contended exit or a hard kill) — documented, accepted for observability.
-//! The semantic unlock set is lossless across supported rollback chains. A
-//! mirror erased and recreated within the same timestamp second (or across a
-//! backward wall-clock jump) is information-theoretically indistinguishable
-//! from a stale replica, so its encounter count falls back to conservative
-//! max-merge; identity/unlock durability is unaffected.
+//! Every flush is a read-merge-write under the lock (summed counts, min
+//! `first_seen`, max `last_seen`, unioned language chips): a dump of in-memory
+//! totals would overwrite a second aterm's sightings. A contended lock is never
+//! waited on: the worker keeps and coalesces the delta and makes a finite retry at
+//! exit. A crash loses at most the deltas since the last flush (≤ the 30 s
+//! debounce). The unlock set is lossless across supported rollback chains; a mirror
+//! erased and recreated within one timestamp second (or across a backward clock
+//! jump) is indistinguishable from a stale replica, so its count falls back to
+//! max-merge.
 //!
-//! Containment mode denies reads/writes under `~/.config/aterm`
-//! (`config_watcher.rs`): every IO here is best-effort and never panics, so
-//! the log silently degrades to in-memory-only there — the settings page
-//! still shows this session's sightings, nothing persists.
-//! Ledger admission is also fail-open but finite: both TOML files must be
-//! same-handle regular, non-link UTF-8 files no larger than
-//! [`MAX_KITTY_LEDGER_BYTES`]. A FIFO, link/reparse point, device, oversized
-//! file, or malformed TOML is treated exactly like an absent ledger. Flushes
-//! likewise refuse to replace a non-regular or linked destination.
+//! Every IO is best-effort and never panics, so under Containment (reads and writes
+//! denied under `~/.config/aterm`) the log is in-memory only. Both TOML files must
+//! be same-handle regular, non-link UTF-8 files of at most
+//! [`MAX_KITTY_LEDGER_BYTES`]; anything else reads as absent, and a flush never
+//! replaces a non-regular or linked destination.
 //!
-//! [`KittyLogHost`] is the App-side state: the in-memory totals the settings
-//! page renders (settings-open does NO synchronous IO), the unflushed delta,
-//! the `(session, ident)` dedupe ring (multi-window shared sessions count a
-//! cat once; a vim round-trip's grace-expiry recount is absorbed for
-//! [`RING_TTL`]), and the drain-time debounce that hands the delta to a
-//! long-lived background writer (the `config_watcher` thread precedent — no
-//! filesystem work on the render thread). Startup admission is performed by
-//! that worker and imported through a nonblocking one-shot poll.
+//! [`KittyLogHost`] is the App-side state: the in-memory totals the settings page
+//! renders (no synchronous IO), the unflushed delta, the `(session, ident)` dedupe
+//! ring (a shared session counts a cat once; a vim round-trip's recount is absorbed
+//! for [`RING_TTL`]), and the debounce that hands the delta to a long-lived
+//! background writer. That worker also performs startup admission, imported by a
+//! nonblocking one-shot poll.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -70,25 +56,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::native_document_host::HeldAdvisoryLock;
 
-/// The ledger's filename, a sibling of `aterm.toml` (see the module doc for
-/// why it must never live INSIDE the user's config file).
+/// The ledger's filename, a sibling of `aterm.toml` (the module doc says why it
+/// never lives inside the user's config file).
 const KITTY_LOG_FILE: &str = "kitty-log.toml";
 
 /// Authoritative collectible identities and the embedded-replica baseline are
 /// isolated from the legacy ledger so a destructive rollback cannot drop them.
 const KITTY_COLLECTIBLES_FILE: &str = "kitty-collectibles.toml";
 
-/// Maximum accepted and emitted size of either Kitty Log TOML file.
-///
-/// The semantic schema has at most every shown type × every magic bucket ×
-/// every `LangSet` slot, plus two generated-roster copies in the sidecar
-/// (`collectibles` and `legacy_mirror`). Budgeting a generous 2 KiB for every
-/// possible row ties the ceiling to those source-of-truth registries without
-/// making ordinary roster growth an accidental compatibility break. It also
-/// makes startup parsing and the background read→merge→write path finite
-/// under hostile filesystem input. Files outside the admission envelope are
-/// observability failures and therefore read as the documented empty/default
-/// state.
+/// Maximum accepted and emitted size of either Kitty Log TOML file: a generous
+/// 2 KiB for every possible row (every shown type × magic bucket × `LangSet` slot,
+/// plus the sidecar's two roster copies). Tied to the registries, so roster growth
+/// is no compatibility break, and finite, so parsing and read→merge→write stay
+/// bounded under hostile input; a larger file reads as empty.
 const MAX_KITTY_LEDGER_ROWS: usize =
     KittyType::ALL.len() * KittyMagic::ALL.len() * LangSet::CAPACITY + (2 * GLYPH_IDS.len());
 const MAX_KITTY_LEDGER_BYTES: usize = MAX_KITTY_LEDGER_ROWS * 2 * 1024;
@@ -110,7 +90,7 @@ fn read_kitty_ledger_text(path: &Path) -> Option<String> {
 /// windows — a screenful of cats cannot evict itself.
 const RING_SLOTS: usize = 256;
 
-/// How long a ring entry keeps absorbing recounts of the SAME episode ident
+/// How long a ring entry keeps absorbing recounts of the same episode ident
 /// (alt-screen vim round-trips, config reloads, grace expiry + re-appearance).
 /// Refreshed on every hit, so a cat that stays on screen never double-counts.
 const RING_TTL: Duration = Duration::from_secs(600);
@@ -136,9 +116,9 @@ const EXIT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const EXIT_JOIN_BUDGET: Duration = Duration::from_millis(100);
 const EXIT_JOIN_POLL: Duration = Duration::from_millis(1);
 
-/// One aggregated collection-book row, keyed `(kitty_type, magic, lang)` —
-/// the registry `config_key()` spellings and the primary language CODE
-/// (`"en"`, never a raw `LangId`: ids are lexicon-build-scoped).
+/// One aggregated collection-book row, keyed `(kitty_type, magic, lang)`: the
+/// registry `config_key()` spellings and the primary language code (`"en"`, never a
+/// raw `LangId`, which is lexicon-build-scoped).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct KittyEntry {
     /// [`KittyType::config_key`] of the shown type.
@@ -147,8 +127,8 @@ pub(crate) struct KittyEntry {
     /// [`KittyMagic::config_key`] of the magic bucket.
     #[serde(default)]
     pub(crate) magic: String,
-    /// The PRIMARY language code of the matched surface (first-appearance
-    /// member of the match's language set; `"unknown"` for an empty set).
+    /// The primary language code of the matched surface (first-appearance member of
+    /// the match's language set; `"unknown"` for an empty set).
     #[serde(default)]
     pub(crate) lang: String,
     /// Lifetime sighting count for this cell (saturating).
@@ -160,16 +140,15 @@ pub(crate) struct KittyEntry {
     /// RFC3339 UTC of the most recent sighting of this cell.
     #[serde(default)]
     pub(crate) last_seen: String,
-    /// EVERY language code claiming a sighted surface (the settings page's
-    /// language chips) — the full `LangSet`, not just the primary.
+    /// Every language code claiming a sighted surface (the settings page's language
+    /// chips): the full `LangSet`, not just the primary.
     #[serde(default)]
     pub(crate) langs: Vec<String>,
 }
 
-/// One actually unlockable cat-art collectible. The key is a semantic authored
-/// glyph id (`s1_03`, `spec_maneki`, `acc_bow`), so the album denominator is
-/// exactly the generated roster rather than the retired v2 type×magic matrix.
-/// For an accessory unlock, `look` persists the composed cat that wore it.
+/// One unlockable cat-art collectible. The key is a semantic glyph id (`s1_03`,
+/// `spec_maneki`, `acc_bow`), so the album denominator is the generated roster. An
+/// accessory unlock's row keeps the composed cat that wore it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct KittyCollectible {
     #[serde(default)]
@@ -190,16 +169,13 @@ pub(crate) struct KittyCollectible {
     pub(crate) first_seen: String,
     #[serde(default)]
     pub(crate) last_seen: String,
-    /// RFC3339 UTC of the moment the user FAVOURITED this cat — empty for an
-    /// ordinary automatic discovery (owner: "if somebody really likes that
-    /// kitty it goes into the kitty registry"). The greatest stamp in the
-    /// roster elects the companion, so an explicit pick survives restart and
-    /// later discoveries; the stamp also transfers composition ownership (see
-    /// [`collectible_owns_look`]), because the look the user pinned is the one
-    /// they liked, not the one first stumbled upon. Election by MAX is
-    /// commutative, so it merges across processes exactly like `last_seen`.
-    /// A pre-favourite rollback rewriting the sidecar drops the pin (never the
-    /// unlock) and the companion falls back to the launch kitty.
+    /// RFC3339 UTC of the moment the user favourited this cat; empty for an
+    /// automatic discovery. The greatest stamp in the roster elects the companion,
+    /// so an explicit pick survives restart and later discoveries; the stamp also
+    /// transfers composition ownership ([`collectible_owns_look`]), since the pinned
+    /// look is the one the user liked. Election by max merges across processes like
+    /// `last_seen`. A pre-favourite rollback rewriting the sidecar drops the pin,
+    /// never the unlock.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) favourite: String,
     #[serde(default)]
@@ -282,8 +258,8 @@ impl KittyCollectibleStore {
     }
 }
 
-/// The durable ledger. All fields default so an absent/corrupt file reads as
-/// EMPTY (fail-open — the log is observability, never a gate).
+/// The durable ledger. All fields default, so an absent or corrupt file reads as
+/// empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct KittyLog {
     /// Lifetime sighting total (saturating; one per deduped episode).
@@ -295,9 +271,8 @@ pub(crate) struct KittyLog {
     /// RFC3339 UTC of the most recent recorded sighting.
     #[serde(default)]
     pub(crate) last_seen: String,
-    /// HOW sightings rendered — the fallback CAUSE tallied as its own
-    /// dimension (§F4.1: cat vs the three paw-fallback causes, never
-    /// conflated with the shown type).
+    /// How sightings rendered: the fallback cause, tallied apart from the shown type
+    /// (cat vs the three paw-fallback causes).
     #[serde(default)]
     pub(crate) shown_cat: u64,
     #[serde(default)]
@@ -306,8 +281,8 @@ pub(crate) struct KittyLog {
     pub(crate) shown_paw_fallback_overflow: u64,
     #[serde(default)]
     pub(crate) shown_paw_style: u64,
-    /// DISPLAYED-trait tallies (§F3.3: counted only when a head pose actually
-    /// drew/applied the trait that episode).
+    /// Displayed-trait tallies (counted only when a head pose drew the trait that
+    /// episode).
     #[serde(default)]
     pub(crate) trait_heterochromia: u64,
     #[serde(default)]
@@ -316,10 +291,8 @@ pub(crate) struct KittyLog {
     pub(crate) trait_blaze: u64,
     #[serde(default)]
     pub(crate) trait_shy: u64,
-    /// v3 §2.1 accessory tallies (worn only by plain — non-magic — cats;
-    /// counted when the accessory was actually drawn that episode). All
-    /// serde-default like every field, so a v2 ledger reads forward and a v3
-    /// ledger read by v2 keeps its unknown keys fail-open.
+    /// Accessory tallies (worn only by plain, non-magic cats; counted when the
+    /// accessory was drawn that episode).
     #[serde(default)]
     pub(crate) accessory_bow: u64,
     #[serde(default)]
@@ -331,10 +304,9 @@ pub(crate) struct KittyLog {
     /// The aggregated collection cells, in first-discovery order.
     #[serde(default)]
     pub(crate) entries: Vec<KittyEntry>,
-    /// Cat-art v4's bounded, achievable collection roster. This embedded copy
-    /// remains a deliberate rollback-compatible mirror: the first collectible
-    /// build can discover into it, while the sidecar remains authoritative
-    /// against destructive rewrites by older, pre-collectibles builds.
+    /// The bounded collection roster. This embedded copy is a rollback-compatible
+    /// mirror: a collectible-aware rollback can discover into it, while the sidecar
+    /// stays authoritative against destructive rewrites by pre-collectibles builds.
     #[serde(default)]
     pub(crate) collectibles: Vec<KittyCollectible>,
 }
@@ -380,7 +352,7 @@ fn collectible_order(a: &KittyCollectible, b: &KittyCollectible) -> std::cmp::Or
 /// normalization independent of flush order.
 fn collectible_owns_look(candidate: &KittyCollectible, current: &KittyCollectible) -> bool {
     // An explicit favourite outranks the automatic first-discovery record, and
-    // between two favourites the LATER one is the user's current pick. Only
+    // between two favourites the later one is the user's current pick. Only
     // unfavourited rows fall through to "earliest discovery owns the look".
     match (candidate.favourite.as_str(), current.favourite.as_str()) {
         (c, u) if c == u => {}
@@ -415,9 +387,8 @@ fn collectible_owns_look(candidate: &KittyCollectible, current: &KittyCollectibl
 }
 
 impl KittyLog {
-    /// Read the ledger; absent/corrupt ⇒ empty default (fail-open, exactly
-    /// like `Health::read` — under Containment the read is denied and this
-    /// yields the same empty default).
+    /// Read the ledger; absent or corrupt ⇒ empty default (fail-open, like
+    /// `Health::read`; a Containment-denied read yields the same).
     pub(crate) fn read(path: &Path) -> Self {
         let mut log: Self = read_kitty_ledger_text(path)
             .and_then(|t| aterm_toml::from_str(&t).ok())
@@ -595,9 +566,8 @@ impl KittyLog {
             };
             item.first_seen = min_ts(&item.first_seen, &candidate.first_seen);
             item.last_seen = max_ts(&item.last_seen, &candidate.last_seen);
-            // MAX, like `last_seen`: the pin is the user's LATEST pick, and a
-            // commutative fold is what makes two processes converge regardless
-            // of which one's flush lands first.
+            // Max, like `last_seen`: the pin is the latest pick, and a commutative
+            // fold makes two processes converge whichever flush lands first.
             item.favourite = max_ts(&item.favourite, &candidate.favourite);
             for code in std::mem::take(&mut candidate.langs) {
                 if !item.langs.iter().any(|present| present == &code) {
@@ -669,12 +639,11 @@ impl KittyLog {
         discovered
     }
 
-    /// Stamp an EXISTING roster row as the user's favourite and give it the
-    /// pinned composition. Row CREATION stays with [`Self::record_collectible`]
-    /// (which owns the roster cap): the caller records the sighting first, so a
-    /// brand-new head is already present here. A missing row (invalid key, or
-    /// the roster is full) fails closed — the ledger is observability, never a
-    /// place to force an entry in.
+    /// Stamp an existing roster row as the user's favourite, with the pinned
+    /// composition. Row creation stays with [`Self::record_collectible`] (which owns
+    /// the roster cap): the caller records first, so a new head is already here.
+    /// With no row (invalid key, full roster) nothing is stamped: the ledger never
+    /// forces an entry in.
     fn favourite_collectible(&mut self, look: KittyLook, now: &str) {
         let look = look.normalized();
         let key = glyph_key(look.variant);
@@ -691,22 +660,11 @@ impl KittyLog {
         item.favourite = max_ts(&item.favourite, now);
     }
 
-    /// **WEAR A CAT THE USER ALREADY HAS.** Stamp the roster row named by `key`
-    /// as the favourite and return the look it carries.
-    ///
-    /// This is the direct answer to "switch my cursor kitty", and it is why the
-    /// election in [`Self::favourite_look`] is by GREATEST stamp rather than by
-    /// a single pinned flag: a newer stamp simply wins, on this machine and
-    /// across every replica that merges this ledger (merges take `max_ts`), so
-    /// wearing a cat is monotone and needs no tombstone to be reliable. The
-    /// existing pin path ([`Self::favourite`]) can only ever pin the cat that
-    /// would ride ANYWAY — this window's tenured program cat, else the launch
-    /// kitty — so before this there was no way to put on a cat you had already
-    /// collected without first arranging for it to appear.
-    ///
-    /// `None` when no row carries that key: the ledger is observability, and a
-    /// wear that forced a row in would mint a cat the user never met. The
-    /// caller reports the miss and lists what IS there.
+    /// Wear a cat the user already has: stamp the row named by `key` as the
+    /// favourite and return it. The election ([`Self::favourite_look`]) is by
+    /// greatest stamp and merges take `max_ts`, so a newer wear wins on every replica
+    /// with no tombstone. `None` when no row has that key: a wear never mints a cat
+    /// the user never met.
     fn wear(&mut self, key: &str, now: &str) -> Option<KittyCollectible> {
         let item = self.collectibles.iter_mut().find(|item| item.key == key)?;
         item.favourite = max_ts(&item.favourite, now);
@@ -714,32 +672,21 @@ impl KittyLog {
         Some(item.clone())
     }
 
-    /// Carry a wear that happened in [`Self::wear`] on ANOTHER copy of this
-    /// ledger into this one, WITHOUT counting a sighting.
-    ///
-    /// **THE FLUSH SENDS THE DELTA, NOT THE WHOLE LEDGER**, so a stamp written
-    /// only into `mem` is a wear that works until you quit. The pin path does
-    /// not hit this because it calls `record` first, which mints the row in the
-    /// delta; a wear deliberately does not record (the cat is already
-    /// collected, there is nothing to observe), so the row it stamps is usually
-    /// one an EARLIER RUN collected and the delta has never heard of — which is
-    /// exactly the case this feature exists for.
-    ///
-    /// `count` is zeroed on the way in because [`Self::merge_collectible`] is
-    /// ADDITIVE on counts: the delta's copy is summed into the on-disk total,
-    /// and a wear must not invent a sighting. Everything else folds the way it
-    /// always does — `favourite` by `max_ts`, so two instances wearing
-    /// different cats converge on the later pick whichever flush lands first.
+    /// Carry a wear made by [`Self::wear`] on another copy of this ledger into this
+    /// one, without counting a sighting. The flush sends the delta, not the whole
+    /// ledger, and a wear does not record, so the row it stamps (usually collected
+    /// by an earlier run) is absent from the delta unless carried here. `count` is
+    /// zeroed because [`Self::merge_collectible`] sums counts; `favourite` folds by
+    /// `max_ts`, so two instances wearing different cats converge on the later pick.
     fn adopt_wear(&mut self, row: &KittyCollectible) {
         let mut carried = row.clone();
         carried.count = 0;
         self.merge_collectible(carried);
     }
 
-    /// The roster, in the order the collection book shows it — the menu of
-    /// [`Self::wear`]'s `key` argument. Which row is WORN is not decided here:
-    /// see [`KittyLogHost::wearable`] for why that must come from the cat on
-    /// glass rather than from a second election over these stamps.
+    /// The roster, in collection-book order: the menu of [`Self::wear`]'s `key`.
+    /// Which row is worn comes from the cat on glass ([`KittyLogHost::wearable`]),
+    /// not from these stamps.
     pub(crate) fn roster(&self) -> &[KittyCollectible] {
         &self.collectibles
     }
@@ -759,9 +706,9 @@ impl KittyLog {
             .and_then(KittyCollectible::look)
     }
 
-    /// Record ONE deduped sighting at RFC3339 stamp `now`. Language codes are
-    /// resolved HERE, with the same lexicon build that produced the match —
-    /// `LangId`s are build-scoped and must never be persisted (§F4).
+    /// Record one deduped sighting at RFC3339 stamp `now`. Language codes are
+    /// resolved here, with the lexicon build that produced the match: `LangId`s are
+    /// build-scoped and never persisted.
     pub(crate) fn record(&mut self, s: &KittySighting, lexicon: &Lexicon, now: &str) -> bool {
         self.sightings = self.sightings.saturating_add(1);
         self.first_seen = min_ts(&self.first_seen, now);
@@ -839,9 +786,9 @@ impl KittyLog {
         base_new || accessory_new
     }
 
-    /// Fold `other` into `self`: summed saturating counts, min `first_seen` /
-    /// max `last_seen`, per-cell merge by `(type, magic, lang)`, unioned
-    /// language chips. PURE — the multi-process read-merge-write core.
+    /// Fold `other` into `self`: summed saturating counts, min `first_seen` / max
+    /// `last_seen`, per-cell merge by `(type, magic, lang)`, unioned language chips.
+    /// Pure: the multi-process read-merge-write core.
     pub(crate) fn merge_from(&mut self, other: &KittyLog) {
         self.sightings = self.sightings.saturating_add(other.sightings);
         self.first_seen = min_ts(&self.first_seen, &other.first_seen);
@@ -893,15 +840,13 @@ impl KittyLog {
         self.collectibles.sort_by(collectible_order);
     }
 
-    /// Flush `delta` into the ledger at `path`: READ-MERGE-WRITE under the
-    /// sibling `.lock` (see the module doc — a dump of in-memory totals would
-    /// last-writer-win a second process's sightings). No-op for an empty
-    /// delta. Best-effort everywhere: a denied or contended lock returns
-    /// immediately and the background worker retains the coalesced delta for a
-    /// later delivery; a denied write remains an observability failure.
+    /// Flush `delta` into the ledger at `path`: read-merge-write under the sibling
+    /// `.lock` (see the module doc). No-op for an empty delta. A denied or contended
+    /// lock returns at once and the worker keeps the coalesced delta; a denied write
+    /// is an observability failure.
     ///
-    /// `true` means this delta reached the legacy ledger (or was empty).
-    /// `false` means the caller may retry without double-counting it.
+    /// `true` means the delta reached the legacy ledger (or was empty); `false` that
+    /// the caller may retry without double-counting it.
     pub(crate) fn flush_merge(path: &Path, delta: &KittyLog) -> bool {
         if delta.is_empty() {
             return true; // no-op skip: never rewrite (or create) the file for nothing
@@ -1017,7 +962,7 @@ fn atomic_write_toml(path: &Path, value: &impl Serialize) -> bool {
     {
         return false; // unreachable config dir (Containment) — stay in-memory
     }
-    // Unique per INVOCATION (pid + a process-wide counter): the exit flush and
+    // Unique per invocation (pid + a process-wide counter): the exit flush and
     // writer thread must never stage through the same temp path.
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = path.with_extension(format!(
@@ -1147,13 +1092,10 @@ fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Best-effort sibling lock (`kitty-log.toml.lock`) guarding a whole
 /// read→merge→write. Every failure, including another process owning the lock,
-/// returns immediately. Held for the guard's lifetime and released by `LOCK_UN`
-/// when it drops ([`HeldAdvisoryLock`]), not by the close: every take here is a
-/// SINGLE try, and a child any thread forks while the lock is held — a shell's
-/// pty fork, a sibling test's spawn — keeps a copy of the lock's description
-/// until it execs. Released by the close alone, the lock stayed taken in that
-/// copy, so the next flush, the startup read's repair, and the exit flush's
-/// few tries were refused for a lock nobody held.
+/// returns at once. Released by `LOCK_UN` when the guard drops
+/// ([`HeldAdvisoryLock`]), not by the close: each take is a single try, and a child
+/// any thread forks while the lock is held keeps a copy of its description until it
+/// execs, so a close-only release would leave the lock taken in that copy.
 fn try_lock(path: &Path) -> Option<HeldAdvisoryLock> {
     let lock_path = path.with_extension("toml.lock");
     let held = HeldAdvisoryLock::try_lock(open_lock(&lock_path).ok()?).ok()?;
@@ -1174,16 +1116,12 @@ fn lock_pair(
     Some((legacy, sidecar))
 }
 
-/// Best-effort RFC3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) — the ledger's
-/// stamp format, computed in-process (the `aterm-update::install` idiom; no
-/// `/bin/date` fork). Empty string on a pre-epoch clock.
+/// Best-effort RFC3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`), computed in-process;
+/// empty on a pre-epoch clock.
 fn now_rfc3339() -> String {
     aterm_time::unix_secs().map_or_else(String::new, format_rfc3339)
 }
 
-// The RFC3339 UTC stamp is `aterm_types::rfc3339::format_rfc3339` — the ONE
-// workspace home for the Howard-Hinnant civil-calendar math. This file used to
-// carry a byte-identical copy and said so in its own doc comment.
 use aterm_types::rfc3339::format_rfc3339;
 
 /// A ring slot: one recently-logged `(session, ident)` episode.
@@ -1194,17 +1132,14 @@ struct RingSlot {
     at: Instant,
 }
 
-/// Where a batch of sightings came from — the provenance that decides what a
-/// first-ever discovery is ALLOWED to do (owner ruling, 2026-08-07: words in
-/// OUTPUT text must never activate the cursor companion; owner ruling,
-/// 2026-08-17: NO discovery re-dresses it — the cat is the launch kitty, and
-/// only a pinned favourite outranks that).
+/// Where a batch of sightings came from, which decides what a first-ever discovery
+/// may do: words in output text never activate the cursor companion, and no
+/// discovery re-dresses it (only a pinned favourite outranks the launch kitty).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SightingSource {
-    /// The committed keystream (`record_typed_kitty`): a first-ever
-    /// discovery is RETURNED — the Kitty Log's own accounting of an unlock
-    /// (and what the tests pin); no caller presents it, and it never repoints
-    /// the companion.
+    /// The committed keystream (`record_typed_kitty`): a first-ever discovery is
+    /// returned as the Kitty Log's accounting of an unlock; no caller presents it,
+    /// and it never repoints the companion.
     Typed,
     /// The grid scanner's peeking word-cats: whatever a program happened to
     /// print. Counts and collects only — nothing is returned.
@@ -1226,20 +1161,15 @@ pub(crate) struct KittyLogHost {
     delta: KittyLog,
     /// Bumps once per recorded sighting; snapshot staleness + repaint stamp.
     revision: u64,
-    /// The PINNED FAVOURITE's visual identity, resolved once on load/update
-    /// (the ledger's pin stamp, or a memory-only pin under `log = false`).
-    /// Cursor frames read this `Copy` value in O(1), never scan the ledger.
-    /// This is the only ledger-side claim on the companion look: since the
-    /// launch-kitty ruling (2026-08-17) a discovery — typed or ambient —
-    /// collects but never repoints the cat.
+    /// The pinned favourite's look, resolved on load/update (the ledger's pin stamp,
+    /// or a memory-only pin under `log = false`), so cursor frames read a `Copy`
+    /// value instead of scanning the ledger. The ledger's only claim on the
+    /// companion: a discovery collects but never repoints the cat.
     favourite: Option<KittyLook>,
-    /// The user pinned a favourite IN THIS PROCESS (`favourite`). The one-shot
-    /// startup import ([`Self::absorb_initial`]) may land after such a press
-    /// (it is a spawned thread doing an flock plus two TOML parses); its
-    /// restart election must then leave the session's explicit pick alone —
-    /// a choice made now outranks one imported from disk, and under
-    /// `log = false` the memory-only pin has no roster row to win the
-    /// election on its own.
+    /// The user pinned a favourite in this process. The one-shot startup import
+    /// ([`Self::absorb_initial`]) can land after such a press, and its election must
+    /// leave the explicit pick alone: under `log = false` a memory-only pin has no
+    /// roster row to win the election on its own.
     pinned_this_session: bool,
     /// Recently-logged `(session, ident)` episodes (≤ [`RING_SLOTS`], TTL
     /// [`RING_TTL`], stamp refreshed on hit): shared-session multi-window
@@ -1249,26 +1179,20 @@ pub(crate) struct KittyLogHost {
     ring_next: usize,
     /// When the delta was last handed to the writer.
     last_flush: Option<Instant>,
-    /// The single long-lived flush writer. A persistent host pre-arms it during
-    /// [`Self::load`], before the event loop can enter a render/present; an
-    /// in-memory-only host starts no thread. Deltas are handed over a bounded
-    /// channel with a NON-blocking `try_send`, so the render thread never
-    /// creates/joins a thread or blocks on disk IO (TYPING-5); [`flush_exit`]
-    /// offers the final delta and waits only [`EXIT_JOIN_BUDGET`]. The worker's
-    /// filesystem can stall indefinitely, so an unfinished worker is detached
-    /// at that deadline and cannot wedge quit. `None` only for an in-memory
-    /// host or a failed pre-arm; observability then remains memory-only.
-    ///
-    /// [`flush_exit`]: Self::flush_exit
+    /// The single long-lived flush writer, pre-armed by a persistent host in
+    /// [`Self::load`] before the event loop can render; an in-memory host starts
+    /// none. Deltas go over a bounded channel by non-blocking `try_send`, so the
+    /// render thread never creates or joins a thread or blocks on disk IO;
+    /// [`Self::flush_exit`] offers the final delta, waits only [`EXIT_JOIN_BUDGET`],
+    /// then detaches a stalled worker. `None` for an in-memory host or a failed
+    /// pre-arm: observability is then memory-only.
     writer: Option<KittyWriter>,
 }
 
-/// The single background flush thread + its bounded delivery channel. One
-/// long-lived worker parked on `recv` (0 CPU while idle) does every
-/// read-merge-write, so the UI/render thread only ever `try_send`s a delta —
-/// it never spawns a thread nor joins a previous one on the hot path (the old
-/// per-flush spawn+inline-join could stall a render frame on a slow/networked
-/// config dir; TYPING-5).
+/// The single background flush thread and its bounded delivery channel. One
+/// long-lived worker parked on `recv` (no CPU while idle) does every
+/// read-merge-write, so the UI thread only `try_send`s a delta and never spawns or
+/// joins a thread on the hot path.
 struct KittyWriter {
     /// Bounded so a pathologically slow disk can't grow an unbounded backlog;
     /// the sender `try_send`s and coalesces on full (see `maybe_flush`).
@@ -1374,10 +1298,9 @@ fn run_kitty_writer(
 }
 
 impl KittyWriter {
-    /// Spawn the worker bound to `path`. `None` if the thread can't be spawned
-    /// (best-effort, matching the old `.ok()` on spawn). The host then remains
-    /// memory-only and retains later deltas rather than attempting filesystem
-    /// work from the render or exit path.
+    /// Spawn the worker bound to `path`, or `None` if the thread cannot be spawned:
+    /// the host then stays memory-only and retains later deltas rather than doing
+    /// filesystem work from the render or exit path.
     fn spawn(path: PathBuf) -> Option<Self> {
         // Depth 1: the worker can hold one in-flight batch while another queues;
         // a third arriving before the first drains coalesces back into `delta`.
@@ -1400,18 +1323,16 @@ impl KittyWriter {
 }
 
 impl KittyLogHost {
-    /// Host state persisting beside the given CONFIG path (the ledger is the
-    /// `kitty-log.toml` sibling). `None` — or a parentless path — degrades to
-    /// in-memory-only. The worker's one startup read is fail-open (absent /
-    /// corrupt / Containment-denied ⇒ empty) and never delays construction.
+    /// Host state persisting beside the given config path (the ledger is its
+    /// `kitty-log.toml` sibling). `None`, or a parentless path, is in-memory only.
+    /// The worker's one startup read is fail-open and never delays construction.
     pub(crate) fn load(config_path: Option<PathBuf>) -> Self {
         Self::load_with_writer_spawn(config_path, KittyWriter::spawn)
     }
 
-    /// Construction seam for the pre-armed writer. Keeping the spawner scoped
-    /// to `load` makes it impossible for [`Self::observe`] / [`Self::maybe_flush`]
-    /// to create a thread on the render path; tests inject a failed pre-arm and
-    /// pin that no hot-path retry can creep back in.
+    /// Construction seam for the pre-armed writer. Only `load` can spawn, so
+    /// [`Self::observe`] / [`Self::maybe_flush`] cannot create a thread on the
+    /// render path; tests inject a failed pre-arm.
     fn load_with_writer_spawn(
         config_path: Option<PathBuf>,
         spawn: impl FnOnce(PathBuf) -> Option<KittyWriter>,
@@ -1450,17 +1371,14 @@ impl KittyLogHost {
         &self.mem
     }
 
-    /// Drain the delta the way a real flush does, so a test can start from the
-    /// state every process is in for a cat collected in an EARLIER run.
+    /// Drain the delta the way a real flush does, so a test can start from the state
+    /// every process is in for a cat collected in an earlier run.
     #[cfg(test)]
     pub(crate) fn take_delta_for_test(&mut self) {
         self.delta = KittyLog::default();
     }
 
-    /// The UNFLUSHED delta — what a flush would actually put on disk. Exposed
-    /// to tests because "it works until you quit" is the exact shape of the
-    /// bug `a_wear_reaches_the_delta_or_it_does_not_survive_a_restart` exists
-    /// to catch, and `mem` cannot see it.
+    /// The unflushed delta: what a flush would put on disk, which `mem` cannot show.
     #[cfg(test)]
     pub(crate) fn pending(&self) -> &KittyLog {
         &self.delta
@@ -1468,27 +1386,18 @@ impl KittyLogHost {
 
     #[cfg(test)]
     fn await_initial_load(&mut self) {
-        // BLOCKS, deliberately, with no clock. This used to spin on `yield_now()`
-        // to a 1s deadline and then SILENTLY FALL THROUGH — which is the dangerous
-        // direction. The startup ledger is delivered by a freshly spawned thread
-        // whose first act is an flock plus two file opens and two TOML parses; on a
-        // loaded box that can miss 1s, and the waiter's own spin starved the very
-        // worker it waited for. Callers then saw an EMPTY log and asserted against
-        // it: the symlink/FIFO guards assert `(0, 0)` to prove startup did not
-        // follow a planted ledger, so a regression that DID follow it still reported
-        // `(0, 0)` and passed green.
-        //
-        // A blocking receive is finite by construction: `initial` is a
-        // `sync_channel(1)` written exactly once, and the sender is dropped when the
-        // worker moves on — so this resolves with either the ledger or
-        // `Err(Disconnected)`. There is no window left to cross.
+        // Blocks, with no clock, by design: a deadline that fell through would hand
+        // callers an empty log, and the symlink/FIFO tests assert `(0, 0)`, so a
+        // regression that followed a planted ledger would pass. The receive is
+        // finite: `initial` is a `sync_channel(1)` written once, and the worker drops
+        // the sender when it moves on, so this yields the ledger or
+        // `Err(Disconnected)`.
         let received = self
             .writer
             .as_mut()
             .and_then(|writer| writer.initial.take())
             .map(|receiver| receiver.recv());
-        // A worker that went away without sending — `None`, or `Err(Disconnected)`
-        // — leaves nothing to import, which is the same no-op as before.
+        // A worker that went away without sending leaves nothing to import.
         if let Some(Ok(loaded)) = received {
             self.absorb_initial(loaded);
         }
@@ -1527,12 +1436,9 @@ impl KittyLogHost {
             return;
         }
         self.mem = loaded;
-        // THE RESTART ELECTION: an explicit pin, or nothing. The startup
-        // import used to elect the chronologically-latest discovery when no
-        // pin existed; under the launch-kitty ruling (2026-08-17) an unpinned
-        // ledger claims nothing and the launch kitty rides. A pin the user
-        // took in THIS process before the import landed is never clobbered
-        // by an older one from disk (`pinned_this_session`).
+        // The restart election: an explicit pin, or nothing (the launch kitty
+        // rides). A pin taken in this process before the import landed is never
+        // replaced by one from disk (`pinned_this_session`).
         if !self.pinned_this_session {
             self.favourite = self.mem.favourite_look();
         }
@@ -1545,11 +1451,9 @@ impl KittyLogHost {
         self.revision
     }
 
-    /// The PINNED FAVOURITE, if any — the ledger's one claim on the cursor
-    /// companion (O(1), no I/O), read by the precedence seam
-    /// (`aterm_effects::companion_look::companion_precedence`: favourite > program with
-    /// tenure > launch kitty). `None` means the ledger claims nothing — the
-    /// tenured program cat or the launch kitty rides.
+    /// The pinned favourite, if any: the ledger's one claim on the cursor companion
+    /// (O(1), no I/O), read by `aterm_effects::companion_look::companion_precedence`
+    /// (favourite > tenured program > launch kitty). `None` claims nothing.
     pub(crate) fn favourite_look(&mut self) -> Option<KittyLook> {
         self.poll_initial_load();
         self.favourite
@@ -1594,14 +1498,11 @@ impl KittyLogHost {
         )
     }
 
-    /// AMBIENT drain-site entry point: the grid scanner's peeking word-cats —
-    /// `cat` in a man page, not a keystroke. The ledger still counts, and a
-    /// first-ever glyph still mints its collectible row (collections keep
-    /// growing from watching output), but the companion is out of reach and
-    /// nothing is returned BY TYPE: no ambient call site can arm an
-    /// `on_collect` hello (owner ruling, 2026-08-07 — words in OUTPUT text
-    /// must never activate or re-dress the cursor companion). The dedupe,
-    /// `enabled`, and flush contracts are [`Self::observe`]'s exactly.
+    /// Ambient drain-site entry point: the grid scanner's peeking word-cats (`cat` in
+    /// a man page, not a keystroke). The ledger counts and a first-ever glyph mints
+    /// its collectible row, but nothing is returned, so no ambient call site can arm
+    /// an `on_collect` hello: words in output text never activate or re-dress the
+    /// companion. Dedupe, `enabled` and flush are as in [`Self::observe`].
     pub(crate) fn observe_ambient<I>(
         &mut self,
         session: u64,
@@ -1622,9 +1523,9 @@ impl KittyLogHost {
         );
     }
 
-    /// The shared drain core. `source` is the ONE divergence between the two
-    /// public entry points: only [`SightingSource::Typed`] surfaces a
-    /// discovery for presentation (neither repoints the companion).
+    /// The shared drain core. `source` is the one difference between the entry
+    /// points: only [`SightingSource::Typed`] returns a discovery (neither repoints
+    /// the companion).
     fn observe_from<I>(
         &mut self,
         session: u64,
@@ -1648,11 +1549,9 @@ impl KittyLogHost {
             }
             let stamp = now_rfc3339();
             if self.mem.record(&s, lexicon, &stamp) && source == SightingSource::Typed {
-                // A genuine TYPED discovery reports itself (the ledger's own
-                // accounting of the unlock) but never re-dresses the
-                // companion: only a favourite pin changes the cat. An AMBIENT
-                // discovery gets nothing back — the row above is all output
-                // text may earn.
+                // A typed discovery reports itself but never re-dresses the
+                // companion (only a pin changes the cat); an ambient one gets
+                // nothing back.
                 discovery = Some(s.look.normalized());
             }
             let _ = self.delta.record(&s, lexicon, &stamp);
@@ -1662,21 +1561,15 @@ impl KittyLogHost {
         discovery
     }
 
-    /// Promote one look into the durable registry and PIN it as the companion
-    /// (owner: "if somebody really likes that kitty it goes into the kitty
-    /// registry").
+    /// Promote one look into the durable registry and pin it as the companion.
     ///
-    /// Deliberately NOT [`Self::observe`]:
-    /// * `KittyLog::record` reports "new" only for an unseen glyph KEY, so a
-    ///   favourite routed through it would silently no-op on any
-    ///   already-collected head — the common case on a used ledger.
-    /// * The `(session, ident)` dedupe ring exists to absorb re-observations of
-    ///   ONE on-screen episode and must never be able to swallow a button
-    ///   press, so it is bypassed by construction.
+    /// Deliberately not [`Self::observe`]:
+    /// * `KittyLog::record` reports "new" only for an unseen glyph key, so a
+    ///   favourite routed through it would no-op on an already-collected head.
+    /// * The `(session, ident)` dedupe ring must never swallow a button press.
     ///
-    /// `enabled = false` (`[sparkle_words.feline] log = false`) pins in memory
-    /// only — the same degradation Containment already documents: the session
-    /// keeps the cat it asked for, nothing is written.
+    /// `enabled = false` (`[sparkle_words.feline] log = false`) pins in memory only,
+    /// as under Containment: the session keeps its cat, nothing is written.
     pub(crate) fn favourite(
         &mut self,
         s: &KittySighting,
@@ -1686,21 +1579,15 @@ impl KittyLogHost {
     ) {
         self.poll_initial_load();
         let look = s.look.normalized();
-        // Unconditional: the press IS the reason to change the identity, and
+        // Unconditional: the press is the reason to change the identity, and
         // `record`'s "new key" answer cannot express that.
         self.favourite = Some(look);
         self.pinned_this_session = true;
         if !enabled {
             return;
         }
-        // NO ring check. The `(session, ident)` ring absorbs re-observations of one
-        // on-screen episode; a button press is not an observation, and a user who
-        // clicks the same cat twice means it twice. Note also that `observe` keys the
-        // ring by the REAL session (:1500) while this path would key it by 0, so an
-        // entry recorded here could only ever match ANOTHER favourite — i.e. its sole
-        // possible effect was swallowing the press it must never swallow, at the cost
-        // of a ring slot that can never usefully match. Pinned by
-        // `a_favourite_is_never_absorbed_by_the_recount_ring`.
+        // No ring check: the ring absorbs re-observations of one on-screen episode,
+        // and a user who clicks the same cat twice means it twice.
         let stamp = now_rfc3339();
         // Record first so a never-before-seen head exists as a roster row (that
         // call, and only that call, owns the roster cap); then stamp the pin.
@@ -1715,29 +1602,16 @@ impl KittyLogHost {
         self.maybe_flush(now);
     }
 
-    /// **WEAR A CAT FROM THE COLLECTION, BY NAME.** The direct switch: put on
-    /// the roster row called `key` and return the look now on the cursor, or
-    /// `None` when nothing in the collection answers to that name.
+    /// Wear the roster row called `key`: pin it and return the look now on the
+    /// cursor, or `None` when no row has that key. Unlike [`Self::favourite`], which
+    /// pins the cat that would ride anyway, this names any collected cat.
     ///
-    /// The difference from [`Self::favourite`] is the whole point of this
-    /// entry. That one pins the PROMOTABLE cat — the one that would ride
-    /// anyway — so it can only ever re-pin what is already there; to put on a
-    /// different cat you first had to arrange for it to appear, by relaunching
-    /// (a fresh launch kitty) or by running a program long enough to earn
-    /// tenure. This one names the cat instead, which is what "switch my cursor
-    /// kitty" actually means.
-    ///
-    /// It takes no [`KittySighting`] because a wear is not a sighting: the row
-    /// must ALREADY be in the collection, so there is nothing to record and no
-    /// roster cap to answer to — only the pin stamp moves. That also makes it
-    /// safe for the miss to be silent at this layer.
-    ///
-    /// The durable half is stamped only when the ledger is `enabled`, exactly
-    /// as [`Self::favourite`] does, and the in-memory pin is unconditional so
-    /// a user who turned the log off can still choose their cat for this run.
+    /// A wear is not a sighting: nothing is recorded and no roster cap applies; only
+    /// the pin stamp moves. The durable half is stamped only when `enabled`, as in
+    /// [`Self::favourite`]; the in-memory pin is unconditional.
     pub(crate) fn wear(&mut self, key: &str, now: Instant, enabled: bool) -> Option<KittyLook> {
         self.poll_initial_load();
-        // Ask the LEDGER, not the delta: `mem` is the whole collection, while
+        // Ask the ledger, not the delta: `mem` is the whole collection, while
         // `delta` holds only what this process has yet to flush.
         let stamp = now_rfc3339();
         let row = self.mem.wear(key, &stamp)?;
@@ -1747,10 +1621,9 @@ impl KittyLogHost {
         if !enabled {
             return Some(look);
         }
-        // CARRY THE ROW, don't just stamp: the flush sends the DELTA, and the
-        // row a wear stamps is usually one an earlier run collected, which the
-        // delta has never heard of. `adopt_wear` folds a count-0 copy in, so
-        // the stamp reaches disk and the cat is still on after a restart.
+        // Carry the row, not just the stamp: the flush sends the delta, which has
+        // never seen a row an earlier run collected. `adopt_wear` folds in a count-0
+        // copy, so the stamp reaches disk.
         self.delta.adopt_wear(&row);
         self.revision = self.revision.wrapping_add(1);
         // An explicit pick is not observability: skip the debounce so quitting
@@ -1760,18 +1633,14 @@ impl KittyLogHost {
         Some(look)
     }
 
-    /// The collection as the wear menu sees it: the key currently WORN (if
-    /// any), then every roster row, in the collection book's own order. The
-    /// `key` of each row is exactly what [`Self::wear`] takes.
+    /// The collection as the wear menu sees it: the key currently worn (if any), then
+    /// every roster row in collection-book order; each row's `key` is what
+    /// [`Self::wear`] takes.
     ///
-    /// **THE WORN KEY COMES FROM THE CAT ON GLASS, NOT FROM A SECOND ROSTER
-    /// ELECTION.** The roster elects by greatest pin stamp with the key as the
-    /// tie-break, and stamps are RFC3339 to the second — so two pins in one
-    /// second are a tie the KEY breaks, and the roster can name a different
-    /// row from the one [`Self::favourite_look`] is handing the companion. A
-    /// menu that marked the wrong row as worn would be a menu that lies about
-    /// the cat you are looking at, so this reads the same cached pin
-    /// [`Self::is_favourite`] reads and finds the row wearing it.
+    /// The worn key comes from the cached pin (the cat on glass), not a second roster
+    /// election: stamps are RFC3339 to the second, so two pins in one second tie and
+    /// the key breaks it, which could name a row other than the one
+    /// [`Self::favourite_look`] hands the companion.
     pub(crate) fn wearable(&mut self) -> (Option<String>, Vec<KittyCollectible>) {
         self.poll_initial_load();
         let rows: Vec<KittyCollectible> = self.mem.roster().to_vec();
@@ -1783,23 +1652,19 @@ impl KittyLogHost {
         (worn, rows)
     }
 
-    /// Whether `look` is the currently pinned favourite (the palette
-    /// checkmark). Reads the SAME value the companion verdict reads
-    /// ([`Self::favourite_look`]'s cache, not a fresh roster scan), so the
-    /// checkmark can never disagree with the cat on glass — including the
-    /// memory-only pin under `[sparkle_words.feline] log = false`, which the
-    /// roster never sees. `&self` on purpose: `App::palette_live` is `&self`
-    /// and cannot poll the startup import — staleness is a non-issue because
-    /// the render loop polls every tick.
+    /// Whether `look` is the pinned favourite (the palette checkmark). Reads the same
+    /// cached pin as [`Self::favourite_look`], so the checkmark matches the cat on
+    /// glass, including a memory-only pin under `log = false`. `&self` because
+    /// `App::palette_live` is `&self` and cannot poll the startup import; the render
+    /// loop polls every tick.
     pub(crate) fn is_favourite(&self, look: KittyLook) -> bool {
         self.favourite == Some(look.normalized())
     }
 
-    /// Note `(session, ident)` in the dedupe ring. Returns `true` when the
-    /// episode was logged within [`RING_TTL`] (⇒ suppress), refreshing its
-    /// stamp so a cat that STAYS on screen keeps absorbing its own recounts
-    /// (alt-screen round-trips, config reloads, grace expiry). An expired or
-    /// absent entry is (re-)stamped and NOT suppressed.
+    /// Note `(session, ident)` in the dedupe ring: `true` (suppress) when the episode
+    /// was logged within [`RING_TTL`], refreshing its stamp so a cat that stays on
+    /// screen keeps absorbing its recounts. An expired or absent entry is stamped and
+    /// not suppressed.
     fn ring_note(&mut self, session: u64, ident: u64, now: Instant) -> bool {
         for slot in &mut self.ring {
             if slot.session == session && slot.ident == ident {
@@ -1822,16 +1687,12 @@ impl KittyLogHost {
         false
     }
 
-    /// Drain-time debounce: hand the delta to the single long-lived writer at
-    /// most once per [`FLUSH_DEBOUNCE`], via a NON-blocking `try_send`. The
-    /// worker does the whole read-merge-write; the render thread only performs a
-    /// bounded `try_send`, so a slow/networked config dir can no longer stall a
-    /// render frame (TYPING-5). If the worker is still busy with a prior
-    /// batch (bounded channel full), the delta remains COALESCED in `self.delta`;
-    /// `flush_exit` offers that host-owned tail through the independent shutdown
-    /// lane. The worker's bounded backoff applies to batches it already owns. If
-    /// construction-time pre-arm failed, the delta remains resident; render and
-    /// quit never retry filesystem work synchronously.
+    /// Drain-time debounce: hand the delta to the long-lived writer at most once per
+    /// [`FLUSH_DEBOUNCE`] by a non-blocking `try_send`, so a slow or networked config
+    /// dir never stalls a render frame. With the channel full the delta stays
+    /// coalesced in `self.delta` for the next try or `flush_exit`'s shutdown lane;
+    /// with no writer (failed pre-arm) it stays resident. Render and quit never do
+    /// filesystem work synchronously.
     fn maybe_flush(&mut self, now: Instant) {
         if self.delta.is_empty() {
             return;
@@ -1863,9 +1724,8 @@ impl KittyLogHost {
                 self.last_flush = None;
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(delta)) => {
-                // Worker died. Preserve the batch and detach the already-dead
-                // handle without joining from render. Observability remains
-                // memory-only rather than moving filesystem work onto the UI.
+                // Worker died: keep the batch and drop the dead handle without
+                // joining from render. Observability stays memory-only.
                 self.delta = delta;
                 self.last_flush = None;
                 let _ = self.writer.take();
@@ -1873,12 +1733,10 @@ impl KittyLogHost {
         }
     }
 
-    /// Exit-path flush: offer the writer any remaining delta without waiting,
-    /// close its channel, and join only if the worker finishes within
-    /// [`EXIT_JOIN_BUDGET`]. Advisory lock acquisition is nonblocking, but an
-    /// ordinary file operation can still stall forever on a dead mount; that
-    /// worker is detached at the deadline so best-effort observability can
-    /// never wedge process quit.
+    /// Exit-path flush: offer the writer any remaining delta without waiting, close
+    /// its channel, and join only if the worker finishes within [`EXIT_JOIN_BUDGET`].
+    /// Lock acquisition is nonblocking, but a file operation can stall forever on a
+    /// dead mount, so such a worker is detached at the deadline and never wedges quit.
     pub(crate) fn flush_exit(&mut self) {
         self.poll_initial_load();
         if let Some(KittyWriter {
@@ -1892,9 +1750,7 @@ impl KittyLogHost {
             if !delta.is_empty()
                 && let Some(delta) = offer_exit_tail(&exit_tx, delta)
             {
-                // A disconnected worker cannot take ownership. Retain the
-                // batch in memory instead of reporting or modeling it as
-                // accepted; quit remains best-effort and nonblocking.
+                // A disconnected worker cannot take ownership: keep the batch.
                 self.delta = delta;
             }
             drop(tx);
@@ -1906,10 +1762,8 @@ impl KittyLogHost {
             if handle.is_finished()
                 && let Ok(unpersisted) = handle.join()
             {
-                // Retry exhaustion is not an ownership sink. The process is
-                // still quitting, but retaining the batch here keeps the
-                // lifecycle truthful and lets callers/tests observe that it
-                // was not durably accepted.
+                // Retry exhaustion is not an ownership sink: keep the batch, so it
+                // stays visibly not durably accepted.
                 self.delta.merge_from(&unpersisted);
             }
         }
@@ -1930,8 +1784,8 @@ mod tests {
     use aterm_spec::verify;
     use std::collections::BTreeMap;
 
-    /// Per-TEST scratch dir (tests share one process, so a pid-keyed dir would
-    /// race across the parallel test threads) — the health.rs test idiom.
+    /// A per-test scratch dir: tests share one process, so the name keeps parallel
+    /// tests apart.
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "aterm-kitty-log-test-{name}-{}",
@@ -1980,9 +1834,7 @@ mod tests {
 
     /// Startup plus exit on a thread of its own, waited for a minute: a hang
     /// detector, not a latency budget. Every hostile target these tests plant
-    /// (a writerless FIFO, a lock another holder keeps until after this
-    /// returns) blocks a regressed host FOREVER, so a minute catches it as
-    /// surely as 3 s did, and a loaded machine cannot fail the bounded path.
+    /// blocks a regressed host forever.
     fn host_startup_and_exit(config_path: PathBuf) -> (u64, usize) {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -2038,9 +1890,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// Absent and corrupt files both read as the empty default (fail-open —
-    /// the log is observability, never a gate), and a partial/unknown-key
-    /// file keeps whatever fields it does carry.
+    /// Absent and corrupt files read as the empty default, and a file with unknown
+    /// keys keeps the fields it does carry.
     #[test]
     fn corrupt_or_absent_file_reads_empty() {
         let p = tmp("corrupt");
@@ -2199,15 +2050,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
     }
 
-    /// THE LEDGER LOCKS ARE FREE THE MOMENT A FLUSH ENDS, even while a child
-    /// forked under them has yet to exec. A child any thread forks — a shell's
-    /// pty fork, a sibling test's spawn — holds a copy of both locks'
-    /// descriptions until its `execve`; released by the close alone they stayed
-    /// taken there, and the next single-try take (the next flush, the startup
-    /// read's sidecar repair, each of the exit flush's four tries) was refused
-    /// for a lock nobody held. The fork is made for real, inside the first
-    /// flush's hold of BOTH locks, and parked short of its exec while the next
-    /// flush runs.
+    /// Both ledger locks are free when a flush ends, even while a child forked under
+    /// them has yet to exec. The fork is real, made inside the first flush's hold of
+    /// both locks, and parked short of its exec while the next flush runs.
     #[cfg(unix)]
     #[test]
     fn a_flush_frees_both_locks_while_a_child_forked_under_them_has_yet_to_exec() {
@@ -2232,17 +2077,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
     }
 
-    /// A HALF-TAKEN PAIR FREES THE LEGACY LOCK TOO. When the sidecar lock is
-    /// refused, the legacy lock already taken is dropped on the way out of
-    /// `lock_pair` — by `LOCK_UN`, so a child forked while it was held does not
-    /// keep it, and the next pair take is not refused for it.
+    /// A refused sidecar lock drops the legacy lock by `LOCK_UN`, so a child forked
+    /// while it was held does not keep it and the next pair take succeeds.
     #[cfg(unix)]
     #[test]
     fn a_refused_sidecar_frees_the_legacy_lock_while_a_child_forked_under_it_has_yet_to_exec() {
         let legacy = tmp("fork-window-half");
         let sidecar = collectibles_path(&legacy);
-        // The peer lets go by `LOCK_UN` whatever `try_lock` returns, so only the
-        // legacy lock's release is on trial.
+        // The peer releases by `LOCK_UN` regardless, so only the legacy lock's
+        // release is on trial.
         let peer = HeldAdvisoryLock::try_lock(
             open_lock(&sidecar.with_extension("toml.lock")).expect("open"),
         )
@@ -2345,9 +2188,8 @@ mod tests {
         let joined = project(1, 0, 0, 0, 1, 0, 1, EXIT_LOCK_RETRIES as i64, 1);
         validate("Join", &before, &joined);
 
-        // Bind the genuine worker's terminal path, not only the retry helper:
-        // with the lock held through shutdown, the worker hands its exhausted
-        // batch back to its joiner exactly as the joined projection requires.
+        // The real worker, with the lock held through shutdown, hands its exhausted
+        // batch back to its joiner, as the joined projection requires.
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
         tx.send(delta)
@@ -2446,9 +2288,8 @@ mod tests {
         assert_eq!(migrated.collectibles[0].count, 1);
         assert!(collectibles_path(&p).exists(), "load creates the sidecar");
 
-        // A pre-v4 process reads known legacy fields and serializes that old
-        // schema back, removing the embedded table while leaving the sibling
-        // sidecar outside its reach.
+        // A pre-collectibles process serializes the old schema back, dropping the
+        // embedded table but not the sibling sidecar.
         let mut rollback_view = KittyLog::read(&p);
         rollback_view.sightings = rollback_view.sightings.saturating_add(1);
         write_precollectibles_rewrite(&p, &rollback_view);
@@ -2485,9 +2326,8 @@ mod tests {
             },
         ));
 
-        // The old collectible-aware build has the replicated A and discovers
-        // B. A sidecar written by the interim one-way implementation has no
-        // baseline, so reconciliation uses per-key max rather than sum.
+        // The old collectible-aware build has the replicated A and discovers B. A
+        // sidecar with no baseline reconciles by per-key max rather than sum.
         let mut rollback = sidecar_a;
         let look_b = KittyLook {
             variant: CatGlyphId::S101,
@@ -2551,12 +2391,11 @@ mod tests {
         );
     }
 
-    /// Tier-1 conformance for the real bidirectional two-file protocol. The
-    /// trace discovers A in the current build, discovers B and repeats A in a
-    /// collectible-aware rollback, reconciles both positive deltas exactly
-    /// once, then survives and repairs a pre-collectibles destructive rewrite.
-    /// The negative control omits authoritative sidecar rows and reproduces the
-    /// rollback loss admitted solely by `Buggy=1`.
+    /// Tier-1 conformance for the two-file protocol: discover A, then in a
+    /// collectible-aware rollback discover B and repeat A, reconcile both positive
+    /// deltas exactly once, and survive and repair a pre-collectibles destructive
+    /// rewrite. The negative control omits the sidecar rows and reproduces the
+    /// rollback loss only `Buggy=1` admits.
     #[test]
     fn sidecar_reconciles_rollback_discovery_and_repeat_without_double_counting() {
         let model = kitty_sidecar_durability_model();
@@ -2657,7 +2496,7 @@ mod tests {
             "discover A",
         );
 
-        // The first collectible-aware build knows only kitty-log.toml. It sees
+        // The first collectible-aware build knows only kitty-log.toml: it sees
         // mirrored A, discovers B there, and leaves the sidecar untouched.
         let mut rollback_view = KittyLog::read(&path);
         assert!(record(
@@ -2830,8 +2669,8 @@ mod tests {
             },
         ));
         let mut buggy_discovered = project(&buggy_path, 1, 1);
-        // Former base-only code considered its own row durable and had no
-        // concept of a pending cross-replica key.
+        // Base-only storage counts its own row durable and has no pending
+        // cross-replica key.
         buggy_discovered.insert("pending", 0);
         buggy_discovered.insert("durable", 1);
         buggy_discovered.insert("durable_events", 1);
@@ -2911,9 +2750,8 @@ mod tests {
         flush(&late);
         flush(&early);
 
-        // The same semantic key also arrives out of order. Its collectible
-        // appearance must come from the earliest discovery, not the process
-        // that happened to acquire the file lock first.
+        // The same key out of order: its look comes from the earliest discovery,
+        // not from whichever process took the lock first.
         let same_late = delta(CatGlyphId::SpecYarn, 14, "2026-07-03T00:00:00Z");
         let same_early = delta(CatGlyphId::SpecYarn, 1, "2026-06-30T00:00:00Z");
         flush(&same_late);
@@ -2948,8 +2786,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// A sighting carrying an EXPLICIT look — the shape the favourite path
-    /// mints (no matched surface, so no displayed-trait bits either).
+    /// A sighting carrying an explicit look, as the favourite path mints it (no
+    /// matched surface, so no displayed-trait bits).
     fn look_sighting(ident: u64, look: KittyLook) -> KittySighting {
         KittySighting {
             look,
@@ -2958,8 +2796,7 @@ mod tests {
         }
     }
 
-    /// A head glyph with a chosen coat — enough to tell two compositions of the
-    /// SAME collectible key apart.
+    /// A head glyph with a chosen coat, to tell two compositions of one key apart.
     fn coated(variant: CatGlyphId, coat: u8) -> KittyLook {
         KittyLook {
             variant,
@@ -2969,19 +2806,8 @@ mod tests {
         .normalized()
     }
 
-    /// **A WEAR THAT NEVER REACHES THE DELTA IS A WEAR THAT DIES AT QUIT.**
-    ///
-    /// The flush sends `delta`, not `mem`, so a stamp written only into `mem`
-    /// gives a cat that rides beautifully until the next launch and is then
-    /// gone. The pin path never meets this because it calls `record` first,
-    /// which mints the row in the delta. A WEAR DELIBERATELY DOES NOT RECORD —
-    /// the cat is already collected, there is nothing to observe — so the row
-    /// it stamps is typically one an EARLIER RUN collected, which this process
-    /// has never written and whose delta row does not exist. That is the whole
-    /// case the feature is for, so it is the case that must persist.
-    ///
-    /// Found by re-reading the flush path after the feature was written, not by
-    /// a failing test: every test in the suite passed with the wear lost.
+    /// A wear reaches the delta (with count 0), since the flush sends `delta`, not
+    /// `mem`, and the row a wear stamps is usually one an earlier run collected.
     #[test]
     fn a_wear_reaches_the_delta_or_it_does_not_survive_a_restart() {
         let lex = Lexicon::builtin();
@@ -2990,9 +2816,8 @@ mod tests {
         let old = coated(CatGlyphId::S100, 3);
         let new = coated(CatGlyphId::S101, 7);
 
-        // Two cats collected, and the delta drained — the state a process is in
-        // after any flush, and the state EVERY process is in for a cat it
-        // collected in an earlier run.
+        // Two cats collected and the delta drained: the state every process is in
+        // for a cat collected in an earlier run.
         host.observe(4, [look_sighting(11, old)], lex, now, true);
         host.observe(4, [look_sighting(12, new)], lex, now, true);
         let keys: Vec<String> = host
@@ -3008,13 +2833,12 @@ mod tests {
             "fixture: the delta is drained, as it is after any flush"
         );
 
-        // Wear the first one.
         let worn = host
             .wear(&keys[0], now, true)
             .expect("a collected cat can be worn");
         assert_eq!(host.favourite_look(), Some(worn), "it is on the cursor");
 
-        // AND THE DELTA CARRIES IT. Without this the cat is on until quit.
+        // The delta carries it, or the cat is on only until quit.
         let carried = host
             .pending()
             .roster()
@@ -3025,9 +2849,7 @@ mod tests {
             !carried.favourite.is_empty(),
             "the delta row carries the pin stamp, which is the whole point"
         );
-        // And it invents no sighting: the delta's count is SUMMED into the
-        // on-disk total, so a wear that carried a count would inflate it every
-        // time the user changed their cat.
+        // No invented sighting: the delta's count is summed into the on-disk total.
         assert_eq!(carried.count, 0, "a wear is not an observation");
     }
 
@@ -3063,9 +2885,8 @@ mod tests {
         dst.merge_from(src);
     }
 
-    /// The model's `Buggy = 1` merge, as its net effect on the real ledger: the
-    /// real merge, then every favourite stamp TAKEN from the incoming copy —
-    /// last-writer-by-arrival.
+    /// The model's `Buggy = 1` merge on the real ledger: the real merge, then every
+    /// favourite stamp taken from the incoming copy (last writer by arrival).
     fn take_flush(dst: &mut KittyLog, src: &KittyLog) {
         dst.merge_from(src);
         for row in &mut dst.collectibles {
@@ -3078,14 +2899,12 @@ mod tests {
         }
     }
 
-    /// Walk `model`'s whole reachable space on two REAL replicas of the ledger.
-    ///
-    /// A wear is the real [`KittyLog::wear`] at the next clock stamp; a flush is
-    /// `flush` of one replica into the other. `a1`/`a2`/`b1`/`b2` are read back
-    /// out of the replicas' rows every step. `clock`, `steps` and `ab` are the
-    /// harness's own bookkeeping, and `b*_hi` is the history the model states
-    /// its law over — the greatest stamp B held before the step — computed from
-    /// the PRE-step projection, exactly as the model's simultaneous update does.
+    /// Walk `model`'s reachable space on two real replicas. A wear is the real
+    /// [`KittyLog::wear`] at the next clock stamp; a flush is `flush` of one replica
+    /// into the other. `a1`/`a2`/`b1`/`b2` are read back from the rows each step;
+    /// `clock`, `steps` and `ab` are harness bookkeeping, and `b*_hi` (the greatest
+    /// stamp B held before the step) comes from the pre-step projection, as in the
+    /// model's simultaneous update.
     fn pin_merge_walk(model: &Model, flush: PinFlush) -> Result<(usize, usize), String> {
         let lex = Lexicon::builtin();
         let mut replica = KittyLog::default();
@@ -3202,10 +3021,9 @@ mod tests {
             .expect_err("the shipped join must not conform to the assignment merge");
     }
 
-    /// THE HEADLINE TRAP. `KittyLog::record` reports "new" only for an unseen
-    /// glyph KEY, so on any used ledger a favourite routed through `observe`
-    /// would silently no-op. The explicit pin must move the composition of an
-    /// ALREADY-collected head and become the companion.
+    /// The explicit pin moves the composition of an already-collected head and
+    /// becomes the companion (routed through `observe`, it would no-op: `record`
+    /// reports "new" only for an unseen glyph key).
     #[test]
     fn favourite_pins_an_already_collected_head() {
         let lex = Lexicon::builtin();
@@ -3239,8 +3057,7 @@ mod tests {
         assert!(!rows[0].favourite.is_empty(), "and is stamped durably");
     }
 
-    /// A later automatic discovery still earns its hello, but it must not steal
-    /// a pin the user made on purpose.
+    /// A later automatic discovery still reports itself but does not steal a pin.
     #[test]
     fn a_later_discovery_does_not_steal_a_pinned_favourite() {
         let lex = Lexicon::builtin();
@@ -3264,11 +3081,9 @@ mod tests {
         );
     }
 
-    /// OWNER RULING (2026-08-07): words in OUTPUT text never activate the
-    /// cursor companion. An ambient first-ever discovery still mints its
-    /// collectible row — collections grow from watching output — but the
-    /// companion stays exactly where it was, and `observe_ambient` returns
-    /// nothing a call site could hand to `on_collect`.
+    /// Words in output text never activate the companion: an ambient first-ever
+    /// discovery mints its collectible row, but the companion stays put and
+    /// `observe_ambient` returns nothing a call site could hand to `on_collect`.
     #[test]
     fn an_ambient_discovery_collects_without_touching_the_companion() {
         let lex = Lexicon::builtin();
@@ -3305,9 +3120,8 @@ mod tests {
         );
     }
 
-    /// The merge law, proven in BOTH orders (the multi-process read-merge-write
-    /// core is order-independent): a favourite owns the composition against an
-    /// earlier unfavourited discovery, without rewriting chronology.
+    /// In both merge orders a favourite owns the composition against an earlier
+    /// unfavourited discovery, without rewriting chronology.
     #[test]
     fn the_favourite_wins_the_merge_against_an_earlier_discovery() {
         let key = glyph_key(CatGlyphId::S100).to_string();
@@ -3354,22 +3168,19 @@ mod tests {
         }
     }
 
-    /// THE RESTART ELECTION. A pin survives restart (it is the ledger's one
-    /// claim on the companion); the chronologically-latest discovery the
-    /// startup import used to elect claims nothing any more.
+    /// A pin survives restart and outranks the latest discovery.
     #[test]
     fn a_favourite_survives_the_startup_import() {
         let lex = Lexicon::builtin();
         let p = tmp("favourite-restart");
         let pinned = coated(CatGlyphId::S100, 7);
         let later = coated(CatGlyphId::S101, 2);
-        // Keyed so the unfavourited newcomer ALSO sorts last on disk: without
-        // the favourite rule the startup election would hand it the companion.
+        // The unfavourited newcomer also sorts last on disk, so only the favourite
+        // rule keeps it from the companion.
         assert!(glyph_key(CatGlyphId::S100) < glyph_key(CatGlyphId::S101));
 
-        // The injected pre-arm failure keeps the delta resident, so the durable
-        // write below is synchronous — this test pins the ELECTION, not the
-        // background writer's timing (which has its own proofs).
+        // A failed pre-arm keeps the delta resident, so the write below is
+        // synchronous: this test pins the election, not the writer's timing.
         let mut host = KittyLogHost::load_with_writer_spawn(Some(p.clone()), |_| None);
         let now = Instant::now();
         host.favourite(&look_sighting(31, pinned), lex, now, true);
@@ -3390,10 +3201,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().expect("scratch parent"));
     }
 
-    /// The `(session, ident)` ring exists to absorb re-observations of ONE
-    /// on-screen episode. It must never be able to swallow a BUTTON PRESS, so
-    /// the favourite path bypasses it by construction — proven with a
-    /// deliberately REUSED ident, which `observe` would drop for `RING_TTL`.
+    /// The favourite path bypasses the recount ring, shown with a reused ident that
+    /// `observe` would drop for `RING_TTL`.
     #[test]
     fn a_favourite_is_never_absorbed_by_the_recount_ring() {
         let lex = Lexicon::builtin();
@@ -3417,9 +3226,8 @@ mod tests {
         );
     }
 
-    /// Gate 4 (`[sparkle_words.feline] log = false`) closes the DURABLE tier
-    /// only. The session still gets the cat it asked for — the same degradation
-    /// Containment documents — but nothing is written.
+    /// `[sparkle_words.feline] log = false` closes the durable tier only: the
+    /// session keeps the cat it asked for, nothing is written.
     #[test]
     fn favourite_with_recording_off_is_memory_only() {
         let lex = Lexicon::builtin();
@@ -3445,12 +3253,9 @@ mod tests {
         );
     }
 
-    /// A pin the user takes in THIS process before the one-shot startup import
-    /// lands must survive the import's restart election: a choice made now
-    /// outranks one imported from disk. Proven in the exposed case — a
-    /// memory-only pin (`log = false`) has no roster row to win the election
-    /// on its own — with a control showing the import still elects a disk pin
-    /// when the session has not chosen.
+    /// A pin taken in this process before the startup import lands survives the
+    /// import's election, shown with a memory-only pin (`log = false`, no roster
+    /// row); the control shows the import still elects a disk pin otherwise.
     #[test]
     fn a_session_pin_is_not_clobbered_by_a_late_startup_import() {
         let lex = Lexicon::builtin();
@@ -3467,12 +3272,12 @@ mod tests {
             "fixture: the disk carries a pin"
         );
 
-        // CONTROL: no session choice ⇒ the import elects the disk pin.
+        // Control: with no session choice the import elects the disk pin.
         let mut untouched = KittyLogHost::in_memory();
         untouched.absorb_initial(on_disk.clone());
         assert_eq!(untouched.favourite_look(), Some(disk_pin));
 
-        // THE CASE: the user pinned first (memory-only), then the import lands.
+        // The user pinned first (memory-only), then the import lands.
         let mut host = KittyLogHost::in_memory();
         host.favourite(&look_sighting(88, session_pick), lex, now, false);
         host.absorb_initial(on_disk);
@@ -3484,10 +3289,9 @@ mod tests {
         assert!(host.is_favourite(session_pick), "and the checkmark agrees");
     }
 
-    /// TYPING-5 negative control: even when the one construction-time writer
-    /// pre-arm fails, observing the first sighting must not retry a thread spawn
-    /// from the render path. The delta stays resident, while `flush_exit` avoids
-    /// a synchronous filesystem fallback that could wedge quit.
+    /// After a failed construction-time pre-arm, `observe` never retries a spawn from
+    /// the render path; the delta stays resident and `flush_exit` does no
+    /// synchronous filesystem fallback.
     #[test]
     fn observe_never_spawns_after_writer_prearm_failure() {
         let lex = Lexicon::builtin();
@@ -3580,14 +3384,12 @@ mod tests {
         host.observe(7, [sighting(11)], lex, Instant::now(), true);
 
         host.flush_exit();
-        // DETACHMENT is proven structurally, not by the clock: this worker blocks
-        // on `release_rx` until the send at the very end of this test, so a
-        // `flush_exit` that JOINED it could never return and execution could not
-        // reach this line at all.
+        // Detachment is structural: the worker blocks on `release_rx` until the end
+        // of this test, so a `flush_exit` that joined it would never return.
 
-        // Tier-1 projection of that genuine stalled worker: delivery and exit
-        // precede the unreturned IO, the UI-owned deadline advances without
-        // mutating the accepted batch, and only its final edge admits detach.
+        // Tier-1 projection of the stalled worker: delivery and exit precede the
+        // unreturned IO, the UI-owned deadline advances without touching the
+        // accepted batch, and only its final edge admits detach.
         let model = kitty_flush_worker_model();
         let project = |stalled, deadline, detached| {
             [
@@ -3659,21 +3461,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
     }
 
-    /// The ledger once a DETACHED exit writer has had its chance to land.
-    /// `flush_exit` waits only [`EXIT_JOIN_BUDGET`] and then detaches a worker
-    /// that is still writing — process teardown wins over ledger durability, by
-    /// design — so a test that reads the ledger the instant `flush_exit` returns
-    /// demands that the worker already finished. Worse, `read_with_sidecar` takes
-    /// the same lock pair the worker's `flush_merge` TRIES, so an early read can
-    /// also take the lock out from under the write: the injected single-try worker
-    /// below then gives up, and nothing is ever persisted. The v-fast gate of
-    /// 149bbe294, run beside another gate, read 0 of 3 and 1 of 2 sightings that
-    /// way; alone the worker always wins the 100 ms.
-    ///
-    /// So the wait polls with the LOCK-FREE [`KittyLog::read`], which cannot
-    /// contend, and takes the one locked read only once the ledger shows the
-    /// count — after the worker is through. A batch that never reaches disk
-    /// still fails the caller's assertions when the bounded window ends.
+    /// The ledger once a detached exit writer has had its chance to land.
+    /// `flush_exit` detaches a still-writing worker after [`EXIT_JOIN_BUDGET`], so a
+    /// read the instant it returns could race the write, and `read_with_sidecar`
+    /// takes the lock pair the worker's single-try `flush_merge` needs. So poll with
+    /// the lock-free [`KittyLog::read`] and take the one locked read only once the
+    /// count shows. A batch that never lands still fails the caller's assertions.
     fn read_once_persisted(ledger: &Path, sightings: u64) -> KittyLog {
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while KittyLog::read(ledger).sightings < sightings && Instant::now() < deadline {
@@ -3686,14 +3479,12 @@ mod tests {
     fn full_normal_queue_cannot_drop_the_dedicated_exit_tail() {
         let ledger = tmp("writer-full-normal-exit-tail");
         let lex = Lexicon::builtin();
-        // The injected worker takes batch one into its local accumulator, tells
-        // the test that ownership moved, then waits on the exit lane before it
-        // touches the ordinary receiver again. Batch two therefore fills the
-        // capacity-one normal queue and debounced batch three remains host-owned:
-        // all three real ownership containers are occupied simultaneously.
-        // Only the REAL KittyLogHost::flush_exit call can unblock the worker.
-        // Reverting that call site to `tx.try_send` would hit Full, close exit_rx
-        // without a tail, and fail without depending on thread scheduling.
+        // The injected worker takes batch one, signals that ownership moved, then
+        // waits on the exit lane before reading the ordinary receiver again. Batch
+        // two fills the capacity-one normal queue and debounced batch three stays
+        // host-owned, so all three ownership containers are occupied. Only the real
+        // `flush_exit` can unblock the worker; a `tx.try_send` there would hit Full
+        // and close `exit_rx` without a tail, independent of scheduling.
         let (pending_tx, pending_rx) = std::sync::mpsc::channel();
         let mut host = KittyLogHost::load_with_writer_spawn(Some(ledger.clone()), move |path| {
             let (tx, rx) = std::sync::mpsc::sync_channel::<KittyLog>(1);
@@ -3729,7 +3520,7 @@ mod tests {
         host.observe(7, [sighting(11)], lex, t0, true);
         assert!(host.delta.is_empty(), "the normal queue accepted batch one");
         pending_rx
-            // Failure bound: the worker that never takes batch one never sends at all.
+            // Hang detector: a worker that never takes batch one never sends.
             .recv_timeout(Duration::from_secs(60))
             .expect("the worker owns batch one before the queue is refilled");
         host.observe(8, [sighting(22)], lex, t0 + FLUSH_DEBOUNCE, true);
@@ -3746,11 +3537,10 @@ mod tests {
             "batch three remains host-owned while pending and normal are occupied"
         );
 
-        // Tier-1: expose each genuine ownership handoff. The ordinary queue is
-        // full, so the second accepted batch remains host-owned until exit,
-        // crosses the dedicated lane, and is absorbed only after the normal
-        // batch drains. The Buggy branch below is the retired one-lane send: it
-        // clears host ownership without establishing exit-lane ownership.
+        // Tier-1: each ownership handoff. With the ordinary queue full, the second
+        // accepted batch stays host-owned until exit, crosses the dedicated lane,
+        // and is absorbed after the normal batch drains. `Buggy` is a one-lane
+        // exit send, which clears host ownership without exit-lane ownership.
         let model = kitty_flush_worker_model();
         let project =
             |accepted, normal_lane, host_tail, exit_lane, pending, persisted, exiting, joined| {
@@ -3838,13 +3628,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
     }
 
-    /// The long-lived writer path end-to-end (TYPING-5): a real-path host
-    /// pre-arms ONE background worker before any sighting; `observe` hands its
-    /// delta over the bounded channel without replacing/spawning a worker. A
-    /// second sighting is debounced and accumulates; `flush_exit` offers the
-    /// tail over its shutdown-only lane and joins the healthy local worker
-    /// within its finite deadline, so every count is durable before quit
-    /// without trusting filesystem latency or ordinary-queue scheduling.
+    /// The long-lived writer end to end: a real-path host pre-arms one worker,
+    /// `observe` hands it the delta without spawning, a debounced second sighting
+    /// accumulates, and `flush_exit` sends the tail over its shutdown lane and joins
+    /// the healthy worker within its deadline, so every count is durable.
     #[test]
     fn background_writer_persists_and_drains_on_exit() {
         let lex = Lexicon::builtin();
@@ -3881,9 +3668,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
     }
 
-    /// The (session, ident) ring: a shared-session second window and a
-    /// vim-round-trip recount both collapse to ONE count; a DIFFERENT session
-    /// or an expired entry counts again; `enabled = false` drains-and-drops.
+    /// The (session, ident) ring: a shared-session second window and a vim
+    /// round-trip recount collapse to one count; a different session or an expired
+    /// entry counts again; `enabled = false` drains and drops.
     #[test]
     fn dedupe_ring_absorbs_recounts() {
         let lex = Lexicon::builtin();
@@ -3892,12 +3679,12 @@ mod tests {
         host.observe(7, [sighting(42)], lex, t0, true);
         assert_eq!(host.log().sightings, 1);
         let rev = host.revision();
-        // Second window draining the SAME session + the vim recount.
+        // A second window draining the same session, then the vim recount.
         host.observe(7, [sighting(42)], lex, t0, true);
         host.observe(7, [sighting(42)], lex, t0 + Duration::from_secs(60), true);
         assert_eq!(host.log().sightings, 1, "ring absorbs the recounts");
         assert_eq!(host.revision(), rev, "no revision bump when suppressed");
-        // A different SESSION with the same ident is a different cat.
+        // A different session with the same ident is a different cat.
         host.observe(8, [sighting(42)], lex, t0, true);
         assert_eq!(host.log().sightings, 2);
         // TTL expiry (stamp was refreshed by the 60 s recount) ⇒ counts anew.
@@ -3916,10 +3703,9 @@ mod tests {
         assert_eq!(host.revision(), rev);
     }
 
-    /// Tier-1 conformance for the real semantic-key set primitive. Every
-    /// generated key drives one `Unlock`, the first repeat drives `Repeat`, and
-    /// an invalid key is rejected without a state transition. The exact model
-    /// capacity is pinned to codegen so adding cat art cannot drift the proof.
+    /// Tier-1 conformance for the semantic-key set: every generated key drives one
+    /// `Unlock`, the first repeat `Repeat`, and an invalid key no transition. The
+    /// model's capacity is pinned to codegen, so new cat art cannot drift the proof.
     #[test]
     fn generated_collectible_set_conforms_and_rejects_duplicate_growth() {
         let model = kitty_collectibles_model();

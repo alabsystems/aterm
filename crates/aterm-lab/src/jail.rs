@@ -13,8 +13,10 @@
 //! resolution); signals to its own processes only; no keychain daemon and no
 //! `/usr/bin/security` (a bare-name call lands on the tripwire); nothing
 //! opened on the desktop (Launch Services' open doors and `/usr/bin/open`; a
-//! bare-name `open` lands on the recorder); none of the owner's data
-//! ([`crate::protected`]); no `TIOCSTI`; no write into another lab's `/tmp`
+//! bare-name `open` lands on the recorder); no preferences channels and no
+//! account-home or caller-home contents except the selected lab/build/tool
+//! paths; the extra data guards in [`crate::protected`]; no `TIOCSTI`; no
+//! write into another lab's `/tmp`
 //! directory, the xcrun shims' cache, the lab's state dir, its program and
 //! source, the aterm it runs or the checkout's builds; and writes nowhere in
 //! the owner's home nor in the run directory but its `scratch/`, whose own
@@ -43,11 +45,11 @@
 //!   that a program trusts is open), `/Volumes`, `/opt/homebrew`, …; the lab's
 //!   own socket directory among them (its socket, token and `proj/` cannot be
 //!   removed or moved);
-//! * reads of everything not on the protected list (documents, source trees,
-//!   shell history, another tool's credentials): add an entry to close one;
+//! * reads outside the two home fences and protected paths, and of the
+//!   explicitly selected lab/build/tool paths inside those homes;
 //! * loopback and this machine's own addresses, so every local service;
-//! * Mach and XPC services other than the keychain names and the four that
-//!   open on the desktop (the pasteboard, user defaults, Apple Events, the rest
+//! * Mach and XPC services other than the keychain, preferences and desktop
+//!   names (the pasteboard, Apple Events, the rest
 //!   of Launch Services, …);
 //! * `/bin/ps`, which runs OUTSIDE the sandbox (it is setuid, which a sandbox
 //!   refuses to exec, and the harness is blind without it) and prints every
@@ -91,6 +93,8 @@ pub struct Spec {
     pub sockdir: String,
     /// The owner's home (or a probe's replica of it).
     pub home: String,
+    /// The caller's physical HOME (or its replica), when different.
+    pub caller_home: String,
     /// The owner's Claude socket directory (or its replica).
     pub ccsocks: String,
     /// The lab's state dir (`runs/`, `logs/`, `captures/`).
@@ -122,6 +126,7 @@ impl Spec {
             muse: String::new(),
             sockdir: sockdir.into(),
             home: p.real_home.clone(),
+            caller_home: p.caller_home.clone(),
             ccsocks: crate::protected::CCSOCKS.into(),
             state: p.state.to_string_lossy().into_owned(),
             user_tmp: String::new(),
@@ -165,6 +170,41 @@ fn parent(p: &str) -> String {
         .map_or_else(|| "/".to_string(), |d| d.to_string_lossy().into_owned())
 }
 
+/// A selected non-store Codex package, never an arbitrary image's parent.
+/// Bind the standard layout's manifest to this exact physical entrypoint and
+/// refuse any root that would reopen a whole fenced home or its ancestors.
+fn codex_package_root(exe: &str, homes: &[&str]) -> Option<String> {
+    use aterm_agent::harness::codex_alab::{PACKAGE_JSON, package_entrypoint};
+    use std::io::Read as _;
+
+    let exe = Path::new(exe);
+    let bin = exe.parent()?;
+    if bin.file_name()? != "bin" || exe.file_name()? != "codex" {
+        return None;
+    }
+    let root = bin.parent()?;
+    // This admission precedes every read, including the manifest itself.
+    if !root.is_absolute() || homes.iter().any(|h| Path::new(h).starts_with(root)) {
+        return None;
+    }
+    let root_text = root.to_str()?;
+    if !profile_safe(root_text)
+        || std::fs::canonicalize(exe).ok()? != exe
+        || !std::fs::symlink_metadata(exe).ok()?.file_type().is_file()
+    {
+        return None;
+    }
+    let manifest = crate::sys::scratch_file(&root.join(PACKAGE_JSON)).ok()??;
+    const LIMIT: u64 = 1024 * 1024;
+    let mut text = String::new();
+    manifest.take(LIMIT + 1).read_to_string(&mut text).ok()?;
+    if text.len() as u64 > LIMIT {
+        return None;
+    }
+    let entry = package_entrypoint(&text)?;
+    (std::fs::canonicalize(root.join(entry)).ok()? == exe).then(|| root_text.to_owned())
+}
+
 /// Render the profile of `spec`.
 ///
 /// # Errors
@@ -193,6 +233,16 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         return Err(format!("render_jail: bad mark {mark}"));
     }
     let (home, cc, claude, codex) = (&spec.home, &spec.ccsocks, &spec.claude, &spec.codex);
+    if !Path::new(home).is_absolute() || home == "/" {
+        return Err("render_jail: the account home must be an absolute non-root path".into());
+    }
+    let mut homes = vec![home.as_str()];
+    if !spec.caller_home.is_empty() && spec.caller_home != *home {
+        if !Path::new(&spec.caller_home).is_absolute() || spec.caller_home == "/" {
+            return Err("render_jail: the caller home must be an absolute non-root path".into());
+        }
+        homes.push(&spec.caller_home);
+    }
     let (gemini, agy) = (&spec.gemini, &spec.agy);
     let muse = &spec.muse;
     let tg_written = spec.repo_target.clone();
@@ -207,6 +257,7 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         .into_owned();
     let mut quoted: Vec<&str> = vec![
         home,
+        &spec.caller_home,
         &run,
         claude,
         &sockdir,
@@ -230,7 +281,7 @@ pub fn render(spec: &Spec) -> Result<String, String> {
             quoted.join(", ")
         ));
     }
-    if inside_protected(&run, home, cc) {
+    if homes.iter().any(|h| inside_protected(&run, h, cc)) {
         return Err(format!(
             "the lab's run directory may not sit inside the owner's data ({run})"
         ));
@@ -242,14 +293,22 @@ pub fn render(spec: &Spec) -> Result<String, String> {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let data: Vec<String> = protected_paths(home, cc)
+    let mut paths = homes
+        .iter()
+        .flat_map(|h| protected_paths(h, cc))
+        .collect::<Vec<_>>();
+    paths.sort_by(|a, b| a.1.cmp(&b.1));
+    paths.dedup();
+    let data: Vec<String> = paths
         .iter()
         .map(|(kind, path)| format!("(deny file-read* file-write* ({} \"{path}\"))", kind.word()))
         .collect();
     // the probe's replica keeps its home and Claude sockets dir in /tmp too (their sockets need short paths): the rules
     // under test decide them, as they decide the owner's, not the /tmp rule above (which would hide every replica write check)
-    let tmp_replica: Vec<String> = [home.as_str(), cc.as_str()]
-        .into_iter()
+    let tmp_replica: Vec<String> = homes
+        .iter()
+        .copied()
+        .chain(std::iter::once(cc.as_str()))
         .filter(|p| p.starts_with("/private/tmp/at.") || p.starts_with("/private/tmp/labprobe."))
         .map(|p| {
             format!(
@@ -262,7 +321,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
     // build directory of each (Codex's holds its codex-package.json, resources and rg beside bin/), and the METADATA
     // only of the directories above it up to aterm's own, so that an agent can resolve its own path (Codex
     // canonicalizes it to find its package): a stat, no listing, no contents.
-    let top = format!("{home}/Library/Application Support/aterm");
     let mut store: Vec<String> = Vec::new();
     for agent in [
         claude.as_str(),
@@ -271,15 +329,34 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         agy.as_str(),
         muse.as_str(),
     ] {
+        let Some(h) = homes
+            .iter()
+            .filter(|h| Path::new(agent).starts_with(h))
+            .max_by_key(|h| h.len())
+        else {
+            continue;
+        };
+        let top = format!("{h}/Library/Application Support/aterm");
         if !agent.starts_with(&format!("{top}/")) {
+            if agent == codex.as_str()
+                && let Some(root) = codex_package_root(agent, &homes)
+            {
+                store.push(format!("(allow file-read* (subpath \"{root}\"))"));
+                store.push(format!("(allow file-read-data (subpath \"{root}\"))"));
+                continue;
+            }
+            // A selected native build outside the package store needs its own
+            // image, not the neighbouring source trees or the whole home.
+            store.push(format!("(allow file-read-data (literal \"{agent}\"))"));
             continue;
         }
         let mut path = parent(&parent(agent));
         store.push(";; ... but the agent under test, which lives in aterm's package store".into());
         store.push(format!("(allow file-read* (subpath \"{path}\"))"));
+        store.push(format!("(allow file-read-data (subpath \"{path}\"))"));
         loop {
             path = parent(&path);
-            if path.len() < home.len() || !(path == top || path.starts_with(&format!("{top}/"))) {
+            if path.len() < h.len() || !(path == top || path.starts_with(&format!("{top}/"))) {
                 break;
             }
             store.push(format!("(allow file-read-metadata (literal \"{path}\"))"));
@@ -343,6 +420,16 @@ pub fn render(spec: &Spec) -> Result<String, String> {
             "@PROTECTED@" => data.join("\n"),
             "@TMP_REPLICA@" => tmp_replica.join("\n"),
             "@AGENT_STORE@" => store.join("\n"),
+            "@HOME_READ_DENY@" => homes
+                .iter()
+                .map(|h| format!("(deny file-read-data (subpath \"{h}\"))"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "@HOME_WRITE_DENY@" => homes
+                .iter()
+                .map(|h| format!("(deny file-write* (subpath \"{h}\"))"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             _ => line
                 .replace("@TRUSTED_PARENTS@", &parents.join(" "))
                 .replace("@TRUSTED@", &trusted.join(" "))
@@ -437,6 +524,7 @@ mod tests {
             muse: String::new(),
             sockdir: d.sock.clone(),
             home: home.into(),
+            caller_home: String::new(),
             ccsocks: "/private/tmp/cc-socks".into(),
             state: d.state.clone(),
             user_tmp: d.ut.clone(),
@@ -464,7 +552,7 @@ mod tests {
             p.lines()
                 .filter(|l| l.starts_with("(deny mach-lookup"))
                 .count(),
-            MACH_DENY.len() + MACH_DENY_OPEN.len() + 1
+            MACH_DENY.len() + MACH_DENY_OPEN.len() + 2
         );
         assert!(p.contains("(deny mach-lookup (global-name \"lab.jail.t.0123456789abcdef\"))"));
         assert!(p.contains("(deny process-exec (literal \"/usr/bin/open\"))"));
@@ -581,7 +669,19 @@ mod tests {
     /// CONTROL: the store's re-allow for a Muse Code build, which the profile
     /// does carry, reaches neither.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one applied owner-data scenario with independent allow-default and selected-path controls"
+    )]
     fn the_owners_muse_code_and_antigravity_data_are_denied_reads_and_all() {
+        const CHILD: &str = "ATERM_LAB_HOME_FENCE_PROBE";
+        if let Some(operations) = std::env::var_os(CHILD) {
+            assert_eq!(
+                crate::probe::inside_main(&[operations.to_string_lossy().into_owned()]),
+                0
+            );
+            return;
+        }
         let d = dirs();
         let st = "/Users//o/Library/Application Support/aterm/pkg/store";
         let mut s = spec(&d, "/x", "", "/Users//o");
@@ -606,6 +706,206 @@ mod tests {
                 !a.contains("Application Support/Muse") && !a.contains(".local/share"),
                 "{a}"
             );
+        }
+
+        // Apply the actual profile to a child, with two distinct owned homes.
+        // Nothing in this fixture names the account's real home or asks a
+        // preferences service for anything: policy queries only.
+        use crate::probe::{Op, WriteHow};
+        let top = std::fs::canonicalize(&d.top).unwrap();
+        let account = top.join("account");
+        let caller = top.join("caller");
+        let source = account.join("Developer/selected-source");
+        let store = account.join("Library/Application Support/aterm/pkg/store/codex");
+        let selected = store.join("1/bin/codex");
+        let package = store.join("1/codex-package.json");
+        let sibling = store.join("2/bin/codex");
+        let artifacts = account.join("Developer/artifacts");
+        let dev_package = artifacts.join("selected");
+        let dev_codex = dev_package.join("bin/codex");
+        let manifest =
+            r#"{"layoutVersion":1,"entrypoint":"bin/codex","version":"0.164.0+gfixture"}"#;
+        let native = account.join("Developer/selected-native/muse");
+        let scratch = Path::new(&d.run).join("scratch/canary");
+        let project = Path::new(&d.sock).join("proj/canary");
+        let mut checks: Vec<(Op, &str)> = Vec::new();
+        for home in [&account, &caller] {
+            for name in [
+                "plain-canary",
+                "Library/Preferences/lab-canary.plist",
+                "Library/Containers/lab-canary/data",
+                "Library/Group Containers/lab-canary/data",
+                "Developer/unselected/canary",
+            ] {
+                let path = home.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "owned replica\n").unwrap();
+                checks.push((Op::Reach(path.display().to_string(), true), "EPERM"));
+            }
+            checks.push((
+                Op::Write(
+                    home.join("plain-canary").display().to_string(),
+                    WriteHow::Append,
+                ),
+                "EPERM",
+            ));
+        }
+        for (path, outcome) in [
+            (source.join("canary"), "yes"),
+            (selected.clone(), "yes"),
+            (package, "yes"),
+            (sibling, "EPERM"),
+            (native.clone(), "yes"),
+            (native.with_file_name("unselected-sibling"), "EPERM"),
+            (dev_codex.clone(), "yes"),
+            (dev_package.join("codex-package.json"), "yes"),
+            (dev_package.join("bin/codex-code-mode-host"), "yes"),
+            (dev_package.join("codex-path/rg"), "yes"),
+            (dev_package.join("codex-resources/canary"), "yes"),
+            (artifacts.join("sibling/codex-package.json"), "EPERM"),
+            (artifacts.join("ancestor-canary"), "EPERM"),
+            (scratch, "yes"),
+            (project, "yes"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "owned replica\n").unwrap();
+            checks.push((Op::Reach(path.display().to_string(), true), outcome));
+        }
+        std::fs::write(dev_package.join("codex-package.json"), manifest).unwrap();
+        let homes = [account.to_str().unwrap(), caller.to_str().unwrap()];
+        assert_eq!(
+            codex_package_root(dev_codex.to_str().unwrap(), &homes),
+            Some(dev_package.display().to_string())
+        );
+        // A stray manifest that names another image cannot enlarge the grant.
+        std::fs::write(dev_package.join("bin/other"), "a different owned image").unwrap();
+        std::fs::write(
+            dev_package.join("codex-package.json"),
+            manifest.replace("bin/codex", "bin/other"),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_package_root(dev_codex.to_str().unwrap(), &homes),
+            None
+        );
+        std::fs::write(dev_package.join("codex-package.json"), manifest).unwrap();
+        // Even a valid layout whose image exists cannot select HOME or above.
+        for root in [&account, &top] {
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            std::fs::write(root.join("bin/codex"), "owned image").unwrap();
+            std::fs::write(root.join("codex-package.json"), manifest).unwrap();
+            assert_eq!(
+                codex_package_root(root.join("bin/codex").to_str().unwrap(), &homes),
+                None
+            );
+        }
+        for (scope, name) in [
+            ("global", "com.apple.cfprefsd.daemon"),
+            ("global", "com.apple.cfprefsd.agent"),
+            ("local", "com.apple.cfprefsd.agent"),
+            ("read", ""),
+        ] {
+            checks.push((Op::PreferencePolicy(scope.into(), name.into()), "EPERM"));
+        }
+        checks.push((
+            Op::PreferencePolicy("global".into(), "com.apple.TrustEvaluationAgent".into()),
+            "yes",
+        ));
+        // Each spelling gets independent entropy: Darwin may alias slash and
+        // nonslash names. All objects are exclusively ours, mode 0600, and the
+        // parent proves a read-only mapping reads the byte it just planted.
+        let mut shared = Vec::new();
+        for (prefix, wanted) in [
+            ("apple.cfprefs.", "denied"),
+            ("/apple.cfprefs.", "denied"),
+            ("/alab.", "yes"),
+        ] {
+            let owned = crate::sys::NamedShm::create(prefix).unwrap();
+            crate::sys::read_named_shm(owned.name())
+                .expect("parent read-only mapping reads planted byte");
+            checks.push((Op::ShmRead(owned.name().into()), wanted));
+            shared.push(owned);
+        }
+        let mut s = spec(
+            &d,
+            "/bin/cat",
+            &dev_codex.display().to_string(),
+            account.to_str().unwrap(),
+        );
+        s.caller_home = caller.display().to_string();
+        s.muse = native.display().to_string();
+        // Retain the independent managed-store positive while Codex selects
+        // the non-store package. No fixture image is executed.
+        s.agy = selected.display().to_string();
+        s.lab_dirs = vec![source.display().to_string()];
+        let operations = top.join("operations.txt");
+        std::fs::write(
+            &operations,
+            checks
+                .iter()
+                .map(|(op, _)| format!("{}\n", op.encode()))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let me = std::env::current_exe().unwrap();
+        for (name, body, contained) in [
+            ("control", "(version 1)(allow default)".into(), false),
+            ("contained", render(&s).unwrap(), true),
+        ] {
+            let profile = top.join(format!("{name}.sb"));
+            std::fs::write(&profile, body).unwrap();
+            let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
+            cmd.arg("-f").arg(&profile).arg(&me)
+                .args(["--exact", "jail::tests::the_owners_muse_code_and_antigravity_data_are_denied_reads_and_all", "--nocapture"])
+                .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &caller)
+                .env(CHILD, &operations);
+            let output = aterm_uds::deadline::outputs_until(
+                &mut [&mut cmd],
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
+            .pop()
+            .unwrap();
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    let names = shared
+                        .iter()
+                        .map(|o| o.name().to_owned())
+                        .collect::<Vec<_>>();
+                    let kept = d.top.clone();
+                    // A deferred reaper is not EOF. Keep both descriptors and
+                    // names, and the owned fixture tree, for the pending child.
+                    std::mem::forget(shared);
+                    std::mem::forget(d);
+                    panic!("{name}: {error}; retained {kept:?} and named shm {names:?}");
+                }
+            };
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let outcomes = stdout
+                .lines()
+                .filter_map(|l| l.split_once("R\t").map(|(_, r)| r))
+                .collect::<Vec<_>>();
+            assert_eq!(outcomes.len(), checks.len(), "{name}: {stdout}");
+            for ((op, wanted), outcome) in checks.iter().zip(outcomes) {
+                if contained && *wanted == "denied" {
+                    assert!(
+                        matches!(outcome, "EPERM" | "EACCES"),
+                        "{name}: {op:?}: {outcome}"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    outcome,
+                    if contained { *wanted } else { "yes" },
+                    "{name}: {op:?}"
+                );
+            }
         }
     }
 

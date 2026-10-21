@@ -2,44 +2,32 @@
 // Copyright 2026 Andrew Yates
 
 //! The upgrade rim: the terminal's border animates while aterm replaces itself
-//! in place, from the moment the outgoing process parks its readers until the
-//! successor takes over. An inset rim ramps up, thickens and pulses while its
-//! colour moves from the theme accent (the live cursor colour) toward a
-//! white-cyan. It paints through the drop-target overlay pass the drag-and-drop
-//! highlight uses (CPU `apply_overlay_at`, GPU `DropOverlay`, and the
-//! `image`/`snapshot` introspection), so it shows on glass and to an agent.
-//! It is open-ended, capped at [`CHARGE_TTL`]; the successor restarts it already
-//! charged ([`LevelUp::charging_continued`]) so the rim is continuous across the
-//! swap, and ends it at Commit.
+//! in place, from the reader park until the successor takes over. An inset rim
+//! ramps up, thickens and pulses while its colour moves from the theme accent
+//! toward a white-cyan. It paints through the drop-target overlay pass (CPU
+//! `apply_overlay_at`, GPU `DropOverlay`, and `image`/`snapshot` introspection),
+//! so it shows on glass and to an agent. It is open-ended up to [`CHARGE_TTL`];
+//! the successor restarts it already charged ([`LevelUp::charging_continued`]) so
+//! the rim is continuous across the swap, and ends it at Commit.
 //!
-//! App-level, with the timed lifecycle shape (`is_expired` + `deadline` + a
-//! quantized `fingerprint`). It animates for its whole life, so `deadline` steps
-//! every [`FRAME`], except under reduced motion or serious mode, where the rim
-//! holds still and the deadline is its cap.
+//! It has the timed lifecycle shape (`is_expired` + `deadline` + a quantized
+//! `fingerprint`): `deadline` steps every [`FRAME`], except under reduced motion
+//! or serious mode, where the rim holds still and the deadline is its cap.
 //!
-//! Why a border and not a card: the automatic lane cannot add a status-bar row
-//! at apply time (its re-check reads the re-grid's SIGWINCH as activity), a row
-//! the explicit lane adds must exist before the handoff carry is built
-//! (`App::begin_update_installing`), and no floating card may cover the
-//! terminal. The rim covers no cell and takes no row, so it also paints over an
-//! in-app overlay. Nothing celebrates the swap: the rim explains a freeze the
-//! person can see (owner, 2026-09-24: the silent path).
-//!
-//! The rim never exceeds the drop overlay's alpha of 235, and the wash stays low
-//! enough to keep the terminal readable (`MotionEffect::UpgradeSurge`; amplitude
-//! 0 means no pulse, no hue travel, no thickening).
+//! A border, not a card or a row: the automatic lane cannot add a status-bar row
+//! at apply time (its re-check reads the re-grid's SIGWINCH as activity), a row the
+//! explicit lane adds must exist before the handoff carry is built
+//! (`App::begin_update_installing`), and no floating card may cover the terminal.
+//! The rim covers no cell and takes no row, so it also paints over an in-app
+//! overlay.
 
 use std::time::{Duration, Instant};
 
 /// The rim's cap, counted from the reader park where each lane starts it
-/// (`App::charge_upgrade_rim_at_park`; round eight of the update audit, leads
-/// U60 and U40 — until then it started at apply begin, before the launched
-/// lane's boot, dial and hold, and could run out before the freeze). What
-/// follows the park is bounded far inside it: the post-park proof's deadline (3 s
-/// automatic, 6 s after a failure, 30 s for an explicit apply; at most 120 s
-/// through its development seam), the capture and the grant. The rim normally
-/// ends earlier (the successor takes over, or the attempt rolls back and the
-/// caller clears it).
+/// (`App::charge_upgrade_rim_at_park`). What follows the park is bounded well
+/// inside it: the post-park proof deadline (at most 30 s, 120 s through its
+/// development seam), the capture and the grant. The rim normally ends earlier,
+/// at takeover or when a rolled-back attempt clears it.
 const CHARGE_TTL: Duration = Duration::from_secs(125);
 /// Animation cadence (~30 fps): the deadline granularity and fingerprint quantum.
 const FRAME: Duration = Duration::from_millis(33);

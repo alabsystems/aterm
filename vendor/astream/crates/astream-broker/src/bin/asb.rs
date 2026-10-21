@@ -160,10 +160,14 @@
 //! the same secret, and every request is authorized against the grants attached.
 //! Without a secret the broker checks nothing on attach, and a Unix socket's only
 //! boundary is the DIRECTORY it sits in. The secret is held to the same rules
-//! `mint` reads it under — the same bytes (a file exactly, an environment variable trimmed), at least [`SECRET_MIN`] bytes, and a
+//! `mint` reads it under — the same bytes (a file exactly, an environment variable trimmed), at least [`capfile::SECRET_MIN`] bytes, and a
 //! `--secret-file` readable by its owner alone (mode 0600 or tighter), which
 //! `serve` also demands of its `--key-file`: a daemon that runs for weeks on a
-//! group-readable key has been handing it out the whole time.
+//! group-readable key has been handing it out the whole time. Both are the one
+//! secret-file rule of `astream_cap::capfile` (`read_secret_file`, and
+//! `read_private_file` for the hex key), the file this binary already compiles in
+//! for `--cap-file`: each reads the mode off the descriptor its bytes come from,
+//! so the file whose mode passed is the file whose key is used.
 //!
 //! A TCP LISTENER BINDS LOOPBACK UNLESS TOLD OTHERWISE. `serve` refuses an
 //! endpoint that resolves to anything but loopback — `0.0.0.0`, `[::]`, a LAN
@@ -238,13 +242,15 @@ use astream_broker::{
 };
 
 // The ONE capability-file format and reader, `astream_cap::capfile`: what `mint`
-// prints and what `--cap-file` reads, by one set of rules.
+// prints and what `--cap-file` reads, by one set of rules; and the ONE secret-file
+// rule, which `--secret-file` and `--key-file` are read by.
 //
 // A default build has no `astream-cap` dependency — capabilities are the opt-in
 // `cap` feature — yet it still reads `--cap-file` (a malformed line is
-// exit 2 naming file:line in every build; only the attach needs the MAC). So it
-// compiles that module's std-only source file in by path, rather than keeping a
-// second reader that could drift from the first.
+// exit 2 naming file:line in every build; only the attach needs the MAC), and
+// still holds a `--key-file` to the owner-only rule. So it compiles that module's
+// std-only source file in by path, rather than keeping a second reader (or a
+// second secret-file rule, which this binary did) that could drift from the first.
 #[cfg(feature = "cap")]
 use astream_cap::capfile;
 #[cfg(not(feature = "cap"))]
@@ -255,6 +261,8 @@ mod capfile;
 const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
                   [--secret-env NAME | --secret-file PATH] [--revocation-file PATH] [--unix SOCKET] [--allow-remote]
                   [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N]
+                  [--retain-file PATH] [--retention-interval-ms N]
+                  [--max-retained-records N] [--max-retained-bytes N]
        asb pub    <endpoint> <subject> [--id N] [--seq M | --seq-file PATH] <transport> <cap>
        asb sub    <endpoint> <filter> [--from N | --group G] <transport> <cap>
        asb last   <endpoint> <filter> [--after SUBJECT] [--max N] <transport> <cap>
@@ -309,6 +317,15 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
                                     ack no full flush covers, after the batch in hand -- so that ack reaches stable
                                     media at most N ms + one batch + one full flush after it (default 1000; 0: a
                                     full flush after every batch)
+  --retain-file PATH:               serve: retain the log by the rules in PATH (REQUIREMENTS R4), one per line,
+                                    `#` comments: `prefix|hold|default [age=<n>ms|s|m|h|d] [bytes=<n>[KiB|MiB|GiB]]
+                                    [last] [read=<group template>] <filter>` (no filter on `default`). Exactly one
+                                    prefix rule sets the cut; hold rules carry what they keep below it in <log>.held.
+                                    Needs asb built with the retention feature (the default)
+  --retention-interval-ms N:        serve: run the retention tick at least every N ms (default 60000; a batch past
+                                    what the rules' bytes or a cap allow asks for one at once)
+  --max-retained-records N / --max-retained-bytes N:
+                                    serve: compact, carrying state, when the log holds more than N records / bytes
   --legacy-unbound:                 mint the read-write UNBOUND god cap -- `/f/F/>` or `rw:/f/F/>`, one authority in
                                     two spellings -- which `mint` otherwise refuses; a grant needs an explicit `ro:`
                                     mode, or `rw,p=<principal>:` to write as exactly that principal
@@ -650,11 +667,35 @@ fn load_bytes(flag: &str, src: &KeySource) -> Result<(String, Vec<u8>), u8> {
     }
 }
 
+/// How a `--key-file` is read. `serve` holds the key it SERVES under to the
+/// owner-only secret-file rule — a daemon that runs for weeks on a group-readable
+/// key has been handing it out the whole time — while a client verb reads its copy
+/// as it finds it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyFile {
+    /// Read the file as it is (a client's copy of the key).
+    AsFound,
+    /// Read it through [`capfile::read_private_file`]: refused unless 0600 or
+    /// tighter, the mode read off the descriptor the key bytes come from. A check
+    /// by path and then a read by path would resolve the path twice, and whoever
+    /// can write the key's directory could swap a 0600 file for a link to a 0644
+    /// one in between: `serve` would then seal its listener under a key that
+    /// account chose and knows, and nothing would say so.
+    OwnerOnly,
+}
+
 /// Read the sealed transport's pre-shared key, decode its 64 hex chars, and scrub
 /// the intermediate buffer. Whitespace around the hex (a trailing newline in a key
-/// file) is fine.
-fn load_key(src: &KeySource) -> Result<[u8; 32], u8> {
-    let (what, mut raw) = load_bytes("--key", src)?;
+/// file) is fine. `rule` says whether a `--key-file` must be owner-only.
+fn load_key(src: &KeySource, rule: KeyFile) -> Result<[u8; 32], u8> {
+    let (what, mut raw) = match (src, rule) {
+        (KeySource::File(path), KeyFile::OwnerOnly) => match capfile::read_private_file(path) {
+            Ok(v) => (format!("--key-file {path}"), v),
+            // capfile's refusal already starts with the path: prefix only the flag.
+            Err(e) => return Err(fail_exit(2, &format!("--key-file {e}"))),
+        },
+        _ => load_bytes("--key", src)?,
+    };
     let mut key = [0u8; 32];
     let res = decode_hex(raw.trim_ascii(), &mut key);
     raw.fill(0);
@@ -664,13 +705,6 @@ fn load_key(src: &KeySource) -> Result<[u8; 32], u8> {
     }
     Ok(key)
 }
-
-/// The shortest mint secret `mint` seals with and `serve` guards with. HMAC takes a
-/// key of any length, so an empty or truncated secret file mints capabilities that
-/// look perfectly well-formed and seal nothing: the failure is a fleet that appears
-/// configured and is not. 32 bytes is what a generated secret is (`head -c 32
-/// /dev/urandom`), and what the aterm fabric has always refused below.
-const SECRET_MIN: usize = 32;
 
 fn metadata_str(path: &str) -> io::Result<std::fs::Metadata> {
     std::fs::metadata(path)
@@ -688,32 +722,6 @@ fn rename_str(from: &str, to: &str) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// Refuse a SECRET file anyone but its owner can read — a mint secret, or the
-/// pre-shared key a broker serves under: `mode & 0o077` must be zero. The refusal
-/// names the `chmod` rather than fixing it silently, because a key that sat
-/// group-readable may already have been read and the operator should know that.
-#[cfg(unix)]
-fn check_private(flag: &str, path: &str) -> Result<(), u8> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = match metadata_str(path) {
-        Ok(m) => m.permissions().mode() & 0o777,
-        Err(e) => return Err(fail_exit(2, &format!("{flag} {path}: {e}"))),
-    };
-    if mode & 0o077 != 0 {
-        return Err(fail_exit(
-            2,
-            &format!(
-                "{flag} {path} is mode {mode:04o}: a secret file must be readable by its owner alone (0600) — `chmod 600 {path}`, and treat what it holds as already seen if other users share this machine"
-            ),
-        ));
-    }
-    Ok(())
-}
-#[cfg(not(unix))]
-fn check_private(_flag: &str, _path: &str) -> Result<(), u8> {
-    Ok(())
-}
-
 /// Read the MINT secret — arbitrary bytes, not hex, because that is what
 /// `Broker::open_guarded` takes. `mint` and `serve` read it through this one
 /// function, so the capability a mint seals is the one the guard verifies.
@@ -724,27 +732,33 @@ fn check_private(_flag: &str, _path: &str) -> Result<(), u8> {
 /// the same file (the aterm fabric's broker and mint, any embedder calling
 /// `Broker::open_guarded` with `fs::read`) seals with every byte. Trimming here made
 /// `asb mint` seal a DIFFERENT secret from the broker's for those files, silently.
-/// An environment variable is text and cannot hold arbitrary bytes, so `--secret-env`
-/// is trimmed; write a text secret to a file with `printf %s`, not `echo`, and the
-/// two sources agree.
+/// A `--secret-file` is read by [`capfile::read_secret_file`], which holds it to
+/// the whole rule (owner-only, exact bytes, at least [`capfile::SECRET_MIN`]); this
+/// binary no longer keeps a copy of that rule. An environment variable is text and
+/// cannot hold arbitrary bytes, so `--secret-env` is trimmed and then held to the
+/// same floor here; write a text secret to a file with `printf %s`, not `echo`,
+/// and the two sources agree.
 fn load_secret(src: &KeySource) -> Result<Vec<u8>, u8> {
-    if let KeySource::File(path) = src {
-        check_private("--secret-file", path)?;
-    }
-    let (what, raw) = load_bytes("--secret", src)?;
-    let s = match src {
-        KeySource::File(_) => raw,
-        KeySource::Env(_) => raw.trim_ascii().to_vec(),
+    let (what, s) = match src {
+        KeySource::File(path) => match capfile::read_secret_file(path) {
+            Ok(s) => (format!("--secret-file {path}"), s),
+            Err(e) => return Err(fail_exit(2, &format!("--secret-file {e}"))),
+        },
+        KeySource::Env(_) => {
+            let (what, raw) = load_bytes("--secret", src)?;
+            (what, raw.trim_ascii().to_vec())
+        }
     };
     if s.is_empty() {
         return Err(fail_exit(2, &format!("{what}: the mint secret is empty")));
     }
-    if s.len() < SECRET_MIN {
+    if s.len() < capfile::SECRET_MIN {
         return Err(fail_exit(
             2,
             &format!(
-                "{what}: the mint secret is {} bytes; it must be at least {SECRET_MIN} (a short key mints capabilities that seal nothing)",
-                s.len()
+                "{what}: the mint secret is {} bytes; it must be at least {} (a short key mints capabilities that seal nothing)",
+                s.len(),
+                capfile::SECRET_MIN
             ),
         ));
     }
@@ -958,6 +972,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--health-ms",
     "--max-retained-records",
     "--max-retained-bytes",
+    "--retain-file",
+    "--retention-interval-ms",
 ];
 
 /// Flags that take no value.
@@ -1264,16 +1280,24 @@ impl Cli {
     }
 
     /// How this invocation reaches the broker — resolved on first use and CACHED,
-    /// because `drain` opens two connections.
+    /// because `drain` opens two connections. A client's `--key-file` is read as
+    /// found; `serve` resolves its own through [`Cli::transport_reading`] first.
     fn transport(&self) -> Result<&Transport, u8> {
+        self.transport_reading(KeyFile::AsFound)
+    }
+
+    /// [`Cli::transport`], reading a `--key-file` under `rule`. The FIRST call
+    /// resolves and caches, so `serve` calls this with [`KeyFile::OwnerOnly`]
+    /// before anything asks for the transport.
+    fn transport_reading(&self, rule: KeyFile) -> Result<&Transport, u8> {
         if let Some(t) = self.transport.get() {
             return Ok(t);
         }
         let handshake = self.has("--handshake");
         let resolved = match self.key_source()? {
             // A key implies TCP (sealing a local Unix socket is pointless).
-            Some(src) if handshake => Transport::Handshake(Box::new(load_key(&src)?)),
-            Some(src) => Transport::Sealed(Box::new(load_key(&src)?)),
+            Some(src) if handshake => Transport::Handshake(Box::new(load_key(&src, rule)?)),
+            Some(src) => Transport::Sealed(Box::new(load_key(&src, rule)?)),
             // `--handshake` without a key has nothing to authenticate the agreement:
             // an unauthenticated ephemeral DH is exactly what a MITM wants.
             None if handshake => {
@@ -2229,6 +2253,8 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
             "--health-ms",
             "--max-retained-records",
             "--max-retained-bytes",
+            "--retain-file",
+            "--retention-interval-ms",
         ],
     )?;
     let health_every = match cli.num("--health-ms")? {
@@ -2242,13 +2268,31 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
     };
     let max_retained_records = cli.num("--max-retained-records")?;
     let max_retained_bytes = cli.num("--max-retained-bytes")?;
-    if (max_retained_records.is_some() || max_retained_bytes.is_some())
+    let retention_interval_ms = cli.num("--retention-interval-ms")?;
+    let retain_file = cli.kv.get("--retain-file").cloned();
+    if (max_retained_records.is_some()
+        || max_retained_bytes.is_some()
+        || retention_interval_ms.is_some()
+        || retain_file.is_some())
         && !cfg!(feature = "retention")
     {
         return Err(AsbErr::Exit(usage_error(
-            "serve --max-retained-records/--max-retained-bytes requires asb built with `--features retention`",
+            "serve --retain-file/--retention-interval-ms/--max-retained-records/--max-retained-bytes requires asb built with the `retention` feature",
         )));
     }
+    if retention_interval_ms == Some(0) {
+        return Err(AsbErr::Exit(usage_error(
+            "--retention-interval-ms expects at least 1",
+        )));
+    }
+    #[cfg(feature = "retention")]
+    let retention = match &retain_file {
+        Some(path) => match read_retain_file(path) {
+            Ok(r) => Some(r),
+            Err(e) => return Err(AsbErr::Exit(usage_error(&e))),
+        },
+        None => None,
+    };
     // Every refusal below is decided BEFORE a secret is read or the log is
     // opened, so a usage error consumes no `--*-env` variable and leaves no
     // file behind.
@@ -2289,15 +2333,15 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
             }
         }
     }
-    if let Some(path) = cli.kv.get("--key-file") {
-        check_private("--key-file", path)?;
-    }
+    // The key this broker serves under is read HERE, once, owner-only, where it was
+    // only checked before: the mode is read off the descriptor the key bytes come
+    // from (`KeyFile::OwnerOnly`), never off the path and then the path read again.
+    let transport = cli.transport_reading(KeyFile::OwnerOnly)?;
     let secret = match &guard {
         Some(src) => Some(load_secret(src)?),
         None => None,
     };
     let guarded = secret.is_some();
-    let transport = cli.transport()?;
     if matches!(transport, Transport::Unix) {
         refuse_live_socket(&ep)?;
     }
@@ -2313,6 +2357,19 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
         }
         if let Some(max_bytes) = max_retained_bytes {
             broker.set_max_retained_bytes(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+        }
+        if let Some(ms) = retention_interval_ms {
+            broker.set_retention_interval(std::time::Duration::from_millis(ms));
+        }
+        if let Some(rules) = retention {
+            if let Err(e) = broker.set_retention(rules) {
+                let path = retain_file.as_deref().unwrap_or_default();
+                discard_created_log(&log, created_here, broker);
+                return Err(AsbErr::Exit(fail_exit(
+                    2,
+                    &format!("--retain-file {path}: {e}"),
+                )));
+            }
         }
     }
     if let Some(rev_path) = cli.kv.get("--revocation-file") {
@@ -2727,6 +2784,33 @@ fn main() -> ExitCode {
     }
 }
 
+/// The most a `--retain-file` may hold: far more than [`astream_broker::retention::MAX_RULES`]
+/// rules take, and refused past it before it is read whole.
+#[cfg(feature = "retention")]
+const RETAIN_FILE_MAX: u64 = 64 << 10;
+
+/// `serve --retain-file PATH`: the rules file, read and checked
+/// ([`astream_broker::parse_rules`]) before the log is opened, so a bad file is a usage
+/// error that touches nothing.
+#[cfg(feature = "retention")]
+fn read_retain_file(path: &str) -> Result<astream_broker::Retention, String> {
+    use std::io::Read;
+    let mut text = String::new();
+    let read = std::fs::File::open(path).and_then(|f| {
+        f.take(RETAIN_FILE_MAX.saturating_add(1))
+            .read_to_string(&mut text)
+    });
+    match read {
+        Ok(n) if n as u64 > RETAIN_FILE_MAX => Err(format!(
+            "--retain-file {path}: longer than {RETAIN_FILE_MAX} bytes"
+        )),
+        Ok(_) => {
+            astream_broker::parse_rules(&text).map_err(|e| format!("--retain-file {path}: {e}"))
+        }
+        Err(e) => Err(format!("--retain-file {path}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{advance_seq_file, decode_hex, print_records};
@@ -2806,6 +2890,35 @@ mod tests {
         std::fs::write(path, "not-a-number\n").unwrap();
         let e = advance_seq_file(path).unwrap_err();
         assert!(e.to_string().contains("is not an unsigned integer"), "{e}");
+    }
+
+    /// `serve --retain-file`: a rules file reads as its rules; a bad line is refused naming
+    /// its line, and a file past `RETAIN_FILE_MAX` before it is read whole.
+    #[cfg(feature = "retention")]
+    #[test]
+    fn a_retain_file_reads_as_its_rules_and_a_bad_one_is_refused() {
+        let dir = std::env::temp_dir().join(format!("asbretain_{}", std::process::id()));
+        let _tmp = Cleanup(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules");
+        let path = path.to_str().unwrap();
+        std::fs::write(
+            path,
+            "# the fabric\nprefix age=7d bytes=256MiB /f/F/pub/*/*/ev\nhold last /f/F/pub/*/*/presence\n",
+        )
+        .unwrap();
+        let r = super::read_retain_file(path).unwrap();
+        assert_eq!(r.rules().len(), 2);
+        assert_eq!(r.rules()[0].bytes(), Some(256 << 20));
+        std::fs::write(path, "prefix /x/>\nhold size=1 /y\n").unwrap();
+        let e = super::read_retain_file(path).unwrap_err();
+        assert!(e.contains("line 2: "), "{e}");
+        let long = "# padding\n".repeat(usize::try_from(super::RETAIN_FILE_MAX).unwrap() / 10 + 1);
+        std::fs::write(path, long).unwrap();
+        let e = super::read_retain_file(path).unwrap_err();
+        assert!(e.contains("longer than"), "{e}");
+        let e = super::read_retain_file(dir.join("absent").to_str().unwrap()).unwrap_err();
+        assert!(e.starts_with("--retain-file "), "{e}");
     }
 
     /// An EMPTY or whitespace-only file is not a number either, and it is the shape

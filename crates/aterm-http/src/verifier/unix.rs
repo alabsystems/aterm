@@ -3,27 +3,30 @@
 
 //! Linux and the BSDs: the distribution's on-disk CA store, verified by webpki.
 //!
-//! There is no OS trust-evaluation call on these platforms — the "system trust
-//! store" IS a set of files. So this arm does exactly two things: find those
-//! files the way OpenSSL does, and hand what they contain to `rustls`'s own
-//! [`WebPkiServerVerifier`], which is already in the graph (`rustls-webpki`,
-//! via `rustls`) and needs no new package.
+//! There is no OS trust-evaluation call here: the system store is a set of
+//! files. This arm finds them the way OpenSSL does and hands them to `rustls`'s
+//! own [`WebPkiServerVerifier`].
 //!
-//! # This file is TESTED on macOS too
+//! Apple test builds compile it too, and its tests run against macOS's
+//! `/etc/ssl/cert.pem`, the same shape of OpenSSL bundle. A distro's exact paths
+//! and an `openssl rehash` symlink farm still need a Linux host.
 //!
-//! It is not the selected arm there — [`super::apple`] is — so a shipped Apple
-//! build does not carry it, but an Apple TEST build compiles it and [`tests`]
-//! drives it natively: macOS ships `/etc/ssl/cert.pem`, which is the
-//! same shape of multi-hundred-certificate OpenSSL bundle a Linux box has, so
-//! discovery, the tolerant PEM path and the chain math all execute for real.
-//! What that still does NOT cover is the exact set of paths a given distro puts
-//! its store at, and the behaviour of an `openssl rehash` symlink farm. Those
-//! need a Linux host.
+//! Roots are found as `rustls-native-certs` 0.8.4 finds them:
 //!
-//! # Where the roots come from
+//! * Neither `$SSL_CERT_FILE` nor `$SSL_CERT_DIR` set: the first existing path
+//!   of [`CERTIFICATE_FILES`], plus every existing path of [`CERTIFICATE_DIRS`].
+//! * Either set: only those. The environment replaces the built-in search, never
+//!   adds to it, so an operator pinning one CA gets exactly that CA and a stale
+//!   variable fails rather than restoring the system store. `$SSL_CERT_DIR` is a
+//!   `:`-separated list. A configured path that does not exist contributes
+//!   nothing; an empty store is an error at [`Verifier::new`].
+//! * Directories are read non-recursively, following symlinks; a dangling one
+//!   is skipped.
 //!
-//! Reproducing `rustls-native-certs` 0.8.4, which is what
-//! `rustls-platform-verifier` calls underneath.
+//! A real `/etc/ssl/certs` holds `TRUSTED CERTIFICATE` blocks and certificates
+//! webpki refuses, so parsing is [`crate::pem::decode_certificates_lossy`] and
+//! roots go in through `RootCertStore::add_parsable_certificates`. Tolerance
+//! stops there: an empty store is an error, never a verifier.
 //!
 //! THE ENVIRONMENT IS EXCLUSIVE, NOT ADDITIVE.
 //! `rustls_native_certs::load_native_certs` (lib.rs:118-125) reads:
@@ -88,13 +91,11 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use super::eku_rejected;
 
-/// Bundle files, in the order OpenSSL looks for them. The FIRST that exists
-/// wins; the search does not continue past it.
+/// Bundle files, in the order OpenSSL looks for them; the first that exists
+/// wins.
 ///
-/// PER-TARGET, NOT A UNION: one cross-OS union of every distro's paths would
-/// widen trust in the DEFAULT configuration. These lists are `openssl-probe`
-/// 0.2.1's own `#[cfg]` arms (src/lib.rs:137-210) reproduced verbatim, which is what
-/// `rustls-native-certs` -> `rustls-platform-verifier` actually consulted.
+/// Per target, not a union: a cross-OS union would widen trust in the default
+/// configuration. These are `openssl-probe` 0.2.1's own `#[cfg]` arms.
 #[cfg(target_os = "linux")]
 const CERTIFICATE_FILES: &[&str] = &[
     "/etc/ssl/certs/ca-certificates.crt", // Debian, Ubuntu, Gentoo
@@ -132,7 +133,7 @@ const CERTIFICATE_FILES: &[&str] = &["/boot/system/data/ssl/CARootCertificates.p
 )))]
 const CERTIFICATE_FILES: &[&str] = &["/etc/ssl/cert.pem"];
 
-/// Hash directories. EVERY one that exists is read, not just the first.
+/// Hash directories; every one that exists is read, not just the first.
 /// Per-target for the same reason as [`CERTIFICATE_FILES`].
 #[cfg(target_os = "linux")]
 const CERTIFICATE_DIRS: &[&str] = &[
@@ -158,15 +159,12 @@ const CERTIFICATE_DIRS: &[&str] = &["/var/ssl/certs"];
 )))]
 const CERTIFICATE_DIRS: &[&str] = &["/etc/ssl/certs"];
 
-/// The bundle file to read, if any.
-///
-/// `configured` is `$SSL_CERT_FILE`; it is a parameter rather than an
-/// `env::var_os` call inside so [`tests`] can drive both branches without
-/// mutating the process environment, which is unsound to do from a test thread.
+/// The bundle file to read, if any. `configured` is `$SSL_CERT_FILE`, passed in
+/// so the tests need not mutate the process environment.
 fn bundle_file(configured: Option<PathBuf>) -> Option<PathBuf> {
     if configured.is_some() {
-        // EXCLUSIVE: a set variable suppresses the built-in search entirely,
-        // even when it names a path that does not exist. See the module header.
+        // A set variable suppresses the built-in search even when its path is
+        // missing.
         return configured.filter(|path| path.exists());
     }
     CERTIFICATE_FILES
@@ -175,12 +173,9 @@ fn bundle_file(configured: Option<PathBuf>) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-/// Every hash directory to scan. `configured` is `$SSL_CERT_DIR`, and it
-/// REPLACES the built-in list rather than adding to it — see the module header.
-///
-/// It is a LIST, separated like `$PATH` (`:`), as OpenSSL's hash-directory
-/// lookup and the incumbent (`CertPaths::from_env`, `env::split_paths`) read
-/// it; an empty or missing entry contributes nothing.
+/// Every hash directory to scan. `configured` is `$SSL_CERT_DIR`, a
+/// `:`-separated list that replaces the built-in one; an empty or missing entry
+/// contributes nothing.
 fn bundle_dirs(configured: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(configured) = configured {
         return std::env::split_paths(&configured)
@@ -196,10 +191,8 @@ fn bundle_dirs(configured: Option<PathBuf>) -> Vec<PathBuf> {
 
 /// Decode every certificate in one PEM file, tolerating anything else in it.
 fn read_pem_file(path: &Path, out: &mut Vec<Vec<u8>>) {
-    // A file we cannot read, or that is not UTF-8, contributes nothing. The
-    // empty-store check in `Verifier::from_ders` is what turns "nothing
-    // anywhere" into a loud failure; one unreadable file among hundreds must
-    // not be one.
+    // An unreadable or non-UTF-8 file contributes nothing; only an empty store
+    // overall (`Verifier::from_ders`) is a failure.
     if let Ok(text) = std::fs::read_to_string(path) {
         out.extend(crate::pem::decode_certificates_lossy(&text));
     }
@@ -217,9 +210,8 @@ fn collect_ders(file: Option<&Path>, dirs: &[PathBuf]) -> Vec<Vec<u8>> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            // `fs::metadata` FOLLOWS symlinks, which is the point: an
-            // `openssl rehash` directory is almost entirely symlinks. A dangling
-            // one just fails here and is skipped.
+            // `fs::metadata` follows symlinks (an `openssl rehash` directory is
+            // mostly symlinks); a dangling one is skipped.
             let Ok(metadata) = std::fs::metadata(&path) else {
                 continue;
             };
@@ -236,16 +228,12 @@ fn collect_ders(file: Option<&Path>, dirs: &[PathBuf]) -> Vec<Vec<u8>> {
 /// Everything the system trust store offers on this machine.
 fn system_root_ders() -> Vec<Vec<u8>> {
     let env_file = std::env::var_os("SSL_CERT_FILE").map(PathBuf::from);
-    // A `$SSL_CERT_DIR` that lists nothing (`""`, `":"`) is not a configured
-    // directory: the incumbent tests the SPLIT list for emptiness.
+    // A `$SSL_CERT_DIR` that lists nothing (`""`, `":"`) is not configured.
     let env_dir = std::env::var_os("SSL_CERT_DIR")
         .map(PathBuf::from)
         .filter(|dirs| std::env::split_paths(dirs).any(|dir| !dir.as_os_str().is_empty()));
-    // EITHER variable suppresses BOTH built-in lists — that is what the
-    // incumbent's single `CertPaths::from_env()` / `platform::load_native_certs()`
-    // branch does. Passing them independently would let `$SSL_CERT_FILE` alone
-    // still pull in every built-in hash DIRECTORY. The configured values go
-    // through the SAME two helpers the tests drive, never a copy of them.
+    // Either variable suppresses both built-in lists; otherwise `$SSL_CERT_FILE`
+    // alone would still pull in every built-in directory.
     let (file, dirs) = if env_file.is_some() || env_dir.is_some() {
         (
             env_file.and_then(|file| bundle_file(Some(file))),
@@ -264,10 +252,8 @@ pub(super) struct Verifier {
 }
 
 impl Verifier {
-    /// `extra_roots` is EMPTY on every shipped path; see [`super::PlatformVerifier`].
-    ///
-    /// The store is read ONCE, here, rather than per handshake — matching the
-    /// incumbent, which built its `WebPkiServerVerifier` in its constructor too.
+    /// `extra_roots` is empty on every shipped path. The store is read once,
+    /// here, not per handshake.
     pub(super) fn new(
         extra_roots: Vec<CertificateDer<'static>>,
         provider: Arc<CryptoProvider>,
@@ -283,16 +269,14 @@ impl Verifier {
         provider: Arc<CryptoProvider>,
     ) -> Result<Self, rustls::Error> {
         let mut store = rustls::RootCertStore::empty();
-        // Extra anchors are parsed STRICTLY: one that will not parse is a
-        // configuration error and is reported, not skipped.
+        // Extra anchors are parsed strictly: a bad one is reported, not skipped.
         for root in extra_roots {
             store.add(root)?;
         }
         let (_added, _ignored) =
             store.add_parsable_certificates(system_roots.into_iter().map(CertificateDer::from));
-        // FAIL CLOSED. A verifier over an empty root store would reject every
-        // chain, which is safe but indistinguishable from a network fault; an
-        // empty store is a configuration failure and says so.
+        // Fail closed: an empty store would reject every chain like a network
+        // fault, so it is reported as a configuration failure.
         if store.is_empty() {
             return Err(rustls::Error::General(
                 "no CA certificates could be loaded from the system trust store".to_owned(),
@@ -325,10 +309,8 @@ impl Verifier {
                 now,
             )
             .map(|_verified| ())
-            // webpki reports a wrong/absent EKU as `InvalidPurpose`; the Apple
-            // and Windows arms report the same condition through their own
-            // platform codes. Normalising it here is what lets one test assert
-            // one outcome on all three.
+            // webpki reports a wrong or absent EKU as `InvalidPurpose`; map it to
+            // the outcome the Apple and Windows arms report.
             .map_err(|error| match &error {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::InvalidPurpose)
                 | rustls::Error::InvalidCertificate(
@@ -352,9 +334,6 @@ mod tests {
 
     #[test]
     fn an_empty_system_store_is_a_loud_failure_not_a_silent_verifier() {
-        // THE fail-closed branch. A verifier built over zero roots would reject
-        // every chain — safe, but indistinguishable from the network being down,
-        // and it hides a broken machine instead of reporting one.
         let error = Verifier::from_ders(Vec::new(), Vec::new(), provider())
             .expect_err("an empty store must not produce a verifier");
         assert!(
@@ -365,8 +344,7 @@ mod tests {
 
     #[test]
     fn unparseable_system_roots_are_skipped_but_do_not_take_the_store_with_them() {
-        // A real distro store legitimately contains certificates webpki refuses.
-        // One bad entry must not cost the good ones.
+        // A real distro store contains certificates webpki refuses.
         let good = include_bytes!("../testdata/tls/root.der").to_vec();
         let junk = vec![0u8; 8];
         Verifier::from_ders(Vec::new(), vec![junk, good], provider())
@@ -375,8 +353,7 @@ mod tests {
 
     #[test]
     fn an_unusable_extra_anchor_is_an_error_rather_than_a_skip() {
-        // The other direction: extra anchors are configuration, not discovery,
-        // so a broken one is reported instead of being silently dropped.
+        // Extra anchors are configuration, not discovery.
         let good = include_bytes!("../testdata/tls/root.der").to_vec();
         assert!(
             Verifier::from_ders(
@@ -406,13 +383,11 @@ mod tests {
             "found only {} certificates in {file:?} + {dirs:?}; a real CA store has hundreds",
             ders.len()
         );
-        // ...and they are usable as a root store, which is the part that proves
-        // the lossy parser produced certificates rather than plausible bytes.
+        // Usable as a root store: the lossy parser produced certificates.
         let verifier = Verifier::from_ders(Vec::new(), ders, provider())
             .expect("the host's own CA store must build a verifier");
-        // And the store really validates a real chain: the same captured
-        // github.com fixture the Apple arm is checked against, at the same
-        // pinned instant.
+        // The store validates the captured github.com chain the Apple arm is
+        // checked against, at the same pinned instant.
         let leaf = CertificateDer::from(include_bytes!("../testdata/tls/gh-leaf.der").as_slice());
         let int0 = CertificateDer::from(include_bytes!("../testdata/tls/gh-int0.der").as_slice());
         let int1 = CertificateDer::from(include_bytes!("../testdata/tls/gh-int1.der").as_slice());
@@ -434,7 +409,7 @@ mod tests {
                  github.com chain",
             );
         }
-        // The arming twin: the SAME store must refuse the SAME chain for a name
+        // The arming twin: the same store must refuse the same chain for a name
         // it does not carry, so the acceptance above is not "accepts everything".
         let wrong = ServerName::try_from("example.invalid").expect("a usable server name");
         assert!(
@@ -447,14 +422,12 @@ mod tests {
 
     #[test]
     fn the_shipped_constructor_reads_this_hosts_store() {
-        // `Verifier::new` is the entry point Linux actually uses, and this is
-        // what makes it — and `system_root_ders`, including its two environment
-        // lookups — run rather than merely compile.
+        // The shipped entry point, including `system_root_ders`'s environment
+        // lookups.
         match Verifier::new(Vec::new(), provider()) {
             Ok(_) => {}
             Err(error) => {
-                // Only acceptable outcome on a host with no CA store at all, and
-                // even then it must be the LOUD failure, not a silent verifier.
+                // Only on a host with no CA store, and then as the loud failure.
                 assert!(
                     error.to_string().contains("system trust store"),
                     "unexpected failure: {error}"
@@ -464,22 +437,15 @@ mod tests {
         }
     }
 
-    /// THE ENVIRONMENT REPLACES THE BUILT-IN SEARCH; IT DOES NOT ADD TO IT.
-    /// `rustls_native_certs::load_native_certs` (lib.rs:118-125) consults
-    /// `CertPaths::from_env()` FIRST and reaches the platform search only when
-    /// neither variable is set: an operator pinning one CA must get exactly
-    /// that CA.
+    /// The environment replaces the built-in search; it does not add to it.
     #[test]
     fn a_configured_path_replaces_the_built_in_search() {
-        // A configured path that does not exist yields NOTHING — it must not
-        // fall through to the system store. Failing closed is the point: a
-        // stale variable should break TLS loudly, not silently restore every
-        // root on the machine.
+        // A configured path that does not exist yields nothing, not the system
+        // store: a stale variable breaks TLS loudly.
         let missing = PathBuf::from("/nonexistent/aterm/definitely/not/here.pem");
         assert_eq!(bundle_file(Some(missing.clone())), None);
         assert!(bundle_dirs(Some(missing)).is_empty());
-        // And a path that DOES exist wins outright, even though it is not one
-        // of the built-in candidates.
+        // An existing path wins outright, even if it is not a built-in candidate.
         let real = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/testdata/tls/root.der"
@@ -491,11 +457,8 @@ mod tests {
         assert_eq!(bundle_file(Some(real.clone())), Some(real));
     }
 
-    /// `$SSL_CERT_DIR` IS A LIST, separated like `$PATH`. OpenSSL's hash-directory
-    /// lookup reads it so, and so does the incumbent this arm reproduces
-    /// (`rustls-native-certs` 0.8.4, `CertPaths::from_env`, via
-    /// `env::split_paths`). Read as ONE path, `/etc/ssl/certs:/usr/local/share/certs`
-    /// names nothing: the store comes up empty and every HTTPS connection fails.
+    /// `$SSL_CERT_DIR` is a `:`-separated list, as OpenSSL and
+    /// `rustls-native-certs` read it.
     #[test]
     fn a_configured_cert_dir_is_a_list_of_directories() {
         let a = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata");

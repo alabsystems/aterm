@@ -1,32 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The signed manifest schemas (§4) and the discovery allow-list (§5), parsed
-//! **only after signature verification**.
+//! The signed manifest schemas (§4) and the discovery allow-list (§5), parsed only after
+//! signature verification.
 //!
-//! Two TOML document types, each verified as exact raw bytes by [`crate::sig`] before
-//! a single byte reaches a parser here:
+//! * [`Index`]: the machine-signed `index.toml` — the freshness anchor, the attribution pair
+//!   (`machine_id`/`roster_seq`) binding it to the roster generation that authorized it, the
+//!   allow-list of installable programs, and the channels. A repo not named in `[programs]` is
+//!   unreachable (R4): private-config repos are never named.
+//! * [`PkgManifest`]: a `pkg-<program>-<build>.toml` signed by a machine on the same roster —
+//!   the per-triple artifact table, the `exposes` shim list and the `[cost]`.
 //!
-//! * [`Index`] — the MACHINE-signed `index.toml`: the freshness anchor, the attribution
-//!   pair (`machine_id` / `roster_seq`) that binds it to the roster generation which
-//!   authorized it, the **allow-list** of installable programs, and the channels. A repo
-//!   NOT named in `[programs]` is unreachable **by construction** (R4) — private-config
-//!   repos are excluded because they are never named.
-//! * [`PkgManifest`] — a `pkg-<program>-<build>.toml` signed by a machine on that same
-//!   roster: the per-triple artifact table, the `exposes` shim list, and the honest
-//!   `[cost]`.
-//!
-//! Every parse *entry point* here ([`parse_index`] / [`parse_pkg`]) takes
-//! `&`[`VerifiedBytes`] (which has no public constructor), so the crate's own parse path
-//! cannot run on unverified input — the same compile-time guarantee the line-scan stopgap
-//! had, scoped to these functions (the schema structs derive `Deserialize` so a *caller*
-//! can read the parsed result; that derive is an internal detail, not a sanctioned
-//! unverified-parse API). It runs over the **real `toml` parser**: duplicate keys are a
-//! hard error and
-//! table scoping is intrinsic, so the line-scanner/real-TOML differential the Phase-1
-//! `parse_delegation` had to hand-defend against simply cannot arise. Both carry the
-//! `SUPPORTED_SCHEMA` **reject-newer** gate (a manifest from a newer format this build
-//! cannot safely interpret is refused, fail-closed, rather than misread).
+//! The parse entry points ([`parse_index`], [`parse_pkg`]) take `&`[`VerifiedBytes`], which has
+//! no public constructor, so the crate's parse path cannot run on unverified input (the schema
+//! structs derive `Deserialize` only so callers can read results). The real `toml` parser makes
+//! a duplicate key an error and table scoping intrinsic. Both carry the [`SUPPORTED_SCHEMA`]
+//! reject-newer gate.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,91 +23,53 @@ use serde::Deserialize;
 
 use crate::sig::{Reject, VerifiedBytes};
 
-/// The highest manifest `schema` this build understands. A document declaring a higher
-/// schema is from a newer format we cannot safely interpret, so it is **rejected** (the
-/// client stays put) rather than misread — mirrors `aterm-update`'s `SUPPORTED_SCHEMA`.
-///
-/// # Why this went 1 → 2
-///
-/// Schema 1's `index.toml` carried a `[keys]` table naming the rotatable release key that
-/// signed each `pkg-*.toml`: the index WAS the delegation. Under the single root that
-/// authority moved to the master-signed machine roster, so `[keys]` is retired and two
-/// attribution fields (`machine_id`, `roster_seq`) take its place.
-///
-/// The bump is not decoration. It is what makes the transition legible in both
-/// directions:
-///
-/// * a schema-1 client meeting a schema-2 index refuses it here (`Reject::Schema`) and
-///   says "newer format" rather than parsing a document whose `[keys]` absence it would
-///   read as malformed — and it would have refused anyway, because a machine-signed index
-///   cannot verify under its retired root key;
-/// * a schema-2 client meeting a schema-1 index parses it (1 ≤ 2) but refuses it at the
-///   attribution bind, because a schema-1 index carries no `machine_id`
-///   ([`Reject::Unattributed`]) — and, again, would already have failed the signature.
-///
-/// Both directions fail CLOSED, twice over. There is no migration tier: a client from
-/// before the fold (installs older than v0.21.0) installs nothing new until reinstalled.
+/// The highest manifest `schema` this build understands; a higher one is rejected (the client
+/// stays put) rather than misread, as `aterm_update_core::SUPPORTED_SCHEMA` is. A schema-1
+/// index (the retired `[keys]` delegation, no attribution) parses but is refused at the
+/// attribution bind ([`Reject::Unattributed`]).
 pub const SUPPORTED_SCHEMA: u32 = 2;
 
-/// The default repository the signed index lives on, under the configurable account:
-/// `github.com/<account>/aterm` (§5). The index is a small signed release asset on the
-/// **aterm repo itself** — no dedicated repo to administer, 1-to-1 with the existing
-/// repos, and coherent with §16 (aterm is itself an index member). Not overridable: the
-/// `ATPKG_INDEX_REPO` override is gone (2026-09-23; [`crate::discovery::index_repo`]).
+/// The repository the signed index lives on, under the configurable account:
+/// `github.com/<account>/aterm` (§5), as a small release asset on the aterm repo itself. Not
+/// overridable ([`crate::discovery::index_repo`]).
 pub const INDEX_REPO: &str = "aterm";
 
-/// The root-signed `index.toml` (§4.1): allow-list + key delegation + freshness +
-/// channels. Unknown top-level keys/tables are ignored (forward-compatible within a
-/// schema); a *newer* schema is rejected by [`parse_index`].
+/// The machine-signed `index.toml` (§4.1): allow-list, attribution, freshness and channels.
+/// Unknown top-level keys and tables are ignored; a newer schema is rejected by
+/// [`parse_index`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct Index {
     /// Manifest format version; `> SUPPORTED_SCHEMA` is refused.
     pub schema: u32,
-    /// Monotonic index counter — the durable high-water rollback floor (§8). Required:
-    /// an index without one is malformed and fails closed.
+    /// Monotonic index counter: the durable high-water rollback floor (§8). Required.
     pub index_build: u64,
     /// RFC3339 generation time (informational).
     #[serde(default)]
     pub generated_at: String,
-    /// RFC3339 freshness deadline; the client refuses this index at/after it (§8). The
-    /// freshness comparison itself is done by the caller via [`crate::sig::check_freshness`].
+    /// RFC3339 freshness deadline; the client refuses this index at or after it (§8, checked
+    /// by the caller via [`crate::sig::check_freshness`]).
     pub valid_until: String,
-    /// WHICH MACHINE on the roster cut this index — the attribution half of the id bind
-    /// ([`aterm_update_core::roster::Attribution::bind`]).
-    ///
-    /// It sits INSIDE the signed bytes, which is what makes the bind free and two-way: a
-    /// genuine m3 signature cannot be relabelled m11 (the bytes, and so the signature,
-    /// would change), and a thief holding m11's key cannot claim `machine_id = "m3"`
-    /// (the roster maps m3 to m3's key, and the verification ran against m11's).
-    ///
-    /// `Option` because serde must be able to PARSE a document that lacks it — a schema-1
-    /// index, or a hand-written one. Absent is a REFUSAL under an armed anchor
-    /// ([`crate::sig::Reject::Unattributed`]), never a pass: an index nobody can be held
-    /// to is not an index this client installs from.
+    /// Which roster machine cut this index: the attribution half of the id bind
+    /// ([`aterm_update_core::roster::Attribution::bind`]). Inside the signed bytes, so an m3
+    /// signature cannot be relabelled m11 and a thief holding m11's key cannot claim m3.
+    /// `Option` only so a document lacking it parses; absent is a refusal under an armed anchor
+    /// ([`crate::sig::Reject::Unattributed`]), never a pass.
     #[serde(default)]
     pub machine_id: Option<String>,
-    /// The roster generation that authorized the machine which signed this index. Bound
-    /// to the roster actually used, so an old roster cannot be paired with a new index; a
-    /// NEWER roster with an older index is admitted (the roster travels on the channel
-    /// head). Absent ⇒ [`crate::sig::Reject::SeqMismatch`].
+    /// The roster generation that authorized the signing machine. Bound to the roster actually
+    /// used, so an old roster cannot be paired with a new index; a newer roster with an older
+    /// index is admitted (the roster travels on the channel head). Absent ⇒
+    /// [`crate::sig::Reject::SeqMismatch`].
     #[serde(default)]
     pub roster_seq: Option<u64>,
     /// `[programs.<name>]` — the open-ended allow-list. The map key is the program name
     /// (`exposes`/install identity); the value names its repo + policy + optional group.
     #[serde(default)]
     pub programs: BTreeMap<String, Program>,
-    /// `[[channels]]` — named, pinned program sets (`stable`/`nightly`). Parsed here;
-    /// the coherence-group apply semantics land in Phase 4.
+    /// `[[channels]]`: named, pinned program sets (`stable`/`nightly`).
     #[serde(default)]
     pub channels: Vec<Channel>,
 }
-
-// `[keys]` — the schema-1 release-key delegation — is GONE, along with the `Keys` struct
-// and `Index::delegation()` that fed `sig::verify_pkg`. The roster now supplies both the
-// grant and the deny for `pkg-*.toml`, which is the whole "one root, one revocation
-// story" decision; see `crate::sig`. Unknown top-level tables are ignored, so a producer
-// that still emits `[keys]` during the changeover is not refused for it — the table is
-// simply no longer read by anything, and carries no authority.
 
 /// One `[programs.<name>]` entry: where the program's release manifests live and how it
 /// may be installed.
@@ -126,42 +77,38 @@ pub struct Index {
 pub struct Program {
     /// The GitHub repo (under the same account) carrying this program's `pkg-*.toml`.
     pub repo: String,
-    /// `"prebuilt-only"` | `"prebuilt-or-build"` (§6). Empty ⇒ treated as prebuilt-only
-    /// by later phases (fail-closed: never build from source without an explicit policy).
+    /// `"prebuilt-only"` | `"prebuilt-or-build"` (§6). Empty is prebuilt-only: never build
+    /// from source without an explicit policy.
     #[serde(default)]
     pub policy: String,
-    /// Coherence group: members of the same group apply atomically as one tuple (§7).
-    /// `None` ⇒ loosely-coupled, applies independently (the open-ended R2 tools, and
-    /// `aterm` itself per §16).
+    /// Coherence group: members of one group apply atomically as one tuple (§7). `None` applies
+    /// independently (the open-ended R2 tools, and `aterm` itself per §16).
     #[serde(default)]
     pub coherence_group: Option<String>,
-    /// `system = "gh"` ⇒ a binary of this name already on the user's `PATH` — OUTSIDE the
-    /// managed `bin/` and the atpkg store — SATISFIES the program: no download, no shim,
-    /// status `satisfied by system: <path>`, reconciled on every pass
-    /// ([`crate::vendor::system_satisfied`]). If it disappears the program installs through
-    /// its artifact like any other member. Absent ⇒ the program is always managed here.
+    /// `system = "gh"`: a binary of this name on the user's `PATH`, outside the managed `bin/`
+    /// and the store, satisfies the program — no download, no shim, status
+    /// `satisfied by system: <path>`, reconciled every pass
+    /// ([`crate::vendor::system_satisfied`]). When it disappears the program installs through
+    /// its artifact. Absent ⇒ always managed here.
     #[serde(default)]
     pub system: Option<String>,
-    /// The one-line reason a target this program carries NO `[[artifact]]` row for cannot
-    /// have it (`"Emacs is a macOS-only member"`), surfaced verbatim in the canonical
-    /// `unavailable on <target>: <hint>` state ([`crate::state::unavailable`]). Absent ⇒
-    /// the generic hint. A missing row is a STATE, never an error, with or without one.
+    /// The one-line reason a target with no `[[artifact]]` row cannot have this program
+    /// (`"Emacs is a macOS-only member"`), shown verbatim in the
+    /// `unavailable on <target>: <hint>` state ([`crate::state::unavailable`]). Absent ⇒ the
+    /// generic hint. A missing row is a state, never an error.
     #[serde(default)]
     pub unavailable_hint: Option<String>,
-    /// `requires = […]` — RETIRED 2026-09-24 with the OS-installer protocols it ordered
-    /// (design 2026-09-22 §5.3(b)). Parsed only so a program that names it is REFUSED
-    /// ([`Program::names_requires`]) rather than installed ahead of what it names; this
-    /// client keeps no install order. `extra`, retired the same day (§5.3(c)), is not
-    /// parsed at all: an older index that still carries it verifies and reads the program
-    /// as default-set. Absent ⇒ none.
+    /// `requires = […]`: retired. Parsed only so a program that names it is refused
+    /// ([`Program::names_requires`]) rather than installed ahead of what it names; this client
+    /// keeps no install order. The retired `extra` key is not parsed at all: an index carrying
+    /// it reads the program as default-set.
     #[serde(default)]
     pub requires: Vec<String>,
 }
 
 impl Program {
-    /// Whether the signed row names the retired `requires` relation — the one question
-    /// the install door and the update pass ask before a member of such a program moves
-    /// (both refuse it, [`crate::FlowError::RequiresRetired`]).
+    /// Whether the signed row names the retired `requires` relation; the install door and the
+    /// update pass both refuse such a program ([`crate::FlowError::RequiresRetired`]).
     #[must_use]
     pub fn names_requires(&self) -> bool {
         !self.requires.is_empty()
@@ -177,75 +124,52 @@ pub struct Channel {
     /// Monotonic no-downgrade gate for the channel's coherence group.
     #[serde(default)]
     pub channel_build: u64,
-    /// CHANNEL-WIDE yank floor: a pinned build below this is force-upgraded / tombstoned at
-    /// apply (§7). It is compared against EVERY program's OWN build counter, so it is only
-    /// meaningful on a channel whose members share one numbering — the app channel (§16.1),
-    /// where the only member is `aterm`. The toolchain channel's members count
-    /// independently (the live index pins `nn = 108` beside `trust-mc = 20065`), so a scalar
-    /// floor raised to revoke ONE program's builds would tombstone every program numbered
-    /// below it; floor those through [`Self::min_build_by_program`], which is per program.
+    /// Channel-wide yank floor: a pinned build below it is force-upgraded or tombstoned at
+    /// apply (§7). It is compared against every program's own build counter, so it is only
+    /// meaningful where members share one numbering (the app channel, §16.1). Toolchain members
+    /// count independently (`nn = 108` beside `trust-mc = 20065`), so floor one of them through
+    /// [`Self::min_build_by_program`].
     #[serde(default)]
     pub min_build: u64,
-    /// PER-PROGRAM yank floors (`program -> floor`) — the floor to use on a channel whose
-    /// members have INDEPENDENT build counters. A program's effective floor is
-    /// [`Self::min_build_for`]: the MAX of its entry here and the channel-wide
-    /// [`Self::min_build`]. Max, not override, so this key can only ever RAISE a floor —
-    /// an entry can never lower a program below the channel-wide floor an older client
-    /// already enforces, and a client that predates the key is never stricter than one that
-    /// knows it. Absent ⇒ every program's floor is the channel-wide one (the old
-    /// behaviour, byte for byte).
+    /// Per-program yank floors (`program -> floor`), for a channel whose members have
+    /// independent build counters. A program's floor is [`Self::min_build_for`]: the max of its
+    /// entry and [`Self::min_build`], so an entry can only raise a floor and a client that
+    /// predates the key is never stricter than one that knows it.
     #[serde(default)]
     pub min_build_by_program: BTreeMap<String, u64>,
     /// Per-program revocations (`"trust@4790"`), enforced at apply (§7).
     #[serde(default)]
     pub yanked: Vec<String>,
-    /// The pinned SET — exact per-program builds that move together (`program -> build`).
+    /// The pinned set: exact per-program builds that move together (`program -> build`).
     #[serde(default)]
     pub pin: BTreeMap<String, u64>,
-    /// PER-TARGET pin overlays (`triple -> (program -> build)`), applied over [`Self::pin`]
-    /// by [`Self::for_target`]. A build number is platform-agnostic in `pin`, which forces
-    /// every target to move on one cadence: a Linux toolchain could only be published by
-    /// riding the Mac's build number — and the Mac's exact source for a given number is
-    /// not always recoverable (measured 2026-09-14: trust 8595's public tag names a
-    /// staging commit that no longer exists). An overlay lets one target pin its own
-    /// build without touching another's, and an old client that does not know this key
-    /// ignores it (the index parser tolerates unknown keys), so it is additive on the
-    /// wire. Absent ⇒ no overlay: `for_target` is the identity.
+    /// Per-target pin overlays (`triple -> (program -> build)`), laid over [`Self::pin`] by
+    /// [`Self::for_target`], so one target can pin its own build without moving another's. A
+    /// client that does not know the key ignores it. Absent ⇒ `for_target` is the identity.
     #[serde(default)]
     pub pin_by_target: BTreeMap<String, BTreeMap<String, u64>>,
-    // A `[channels.meta]` reproducibility tuple was designed (TOOLCHAIN-PACKAGE-MANAGER.md
-    // §4.1) and never published or read; the field that stored it went on 2026-09-27. An
-    // index that carries the table still parses: unknown keys are ignored.
 }
 
 impl Channel {
-    /// The effective yank floor for ONE program: the MAX of the channel-wide
-    /// [`Self::min_build`] and that program's [`Self::min_build_by_program`] entry.
+    /// The effective yank floor for one program: the max of [`Self::min_build`] and that
+    /// program's [`Self::min_build_by_program`] entry.
     ///
-    /// EVERY floor comparison in the client goes through here — [`crate::gate::decide`],
-    /// [`crate::gate::current_build_ok`] and the rollback target predicate
-    /// ([`crate::flow::rollback`]) — because a build number is only comparable to another build number OF THE SAME PROGRAM. The
-    /// counters in one channel are independent (`nn = 108` and `trust-mc = 20065` are both
-    /// current), so comparing one program's pin against a floor meant for another is a
-    /// category error: it would tombstone every working tool whose numbering happens to be
-    /// smaller. A channel that sets no per-program entry keeps the channel-wide floor for
-    /// every program, exactly as before the key existed.
+    /// Every floor comparison goes through here ([`crate::gate::decide`],
+    /// [`crate::gate::current_build_ok`], [`crate::flow::rollback`]'s target predicate): a
+    /// build number is comparable only to another build of the same program.
     #[must_use]
     pub fn min_build_for(&self, program: &str) -> u64 {
         self.min_build
             .max(self.min_build_by_program.get(program).copied().unwrap_or(0))
     }
 
-    /// This channel as seen from ONE target: [`Self::pin`] with `pin_by_target[triple]`
-    /// laid over it — an overlay entry REPLACES the platform-agnostic pin for that program
-    /// and an entry for a program `pin` never named ADDS it. Every other field is carried
-    /// unchanged, and `pin_by_target` itself is cleared in the view so a consumer cannot
-    /// overlay twice. Programs pinned for OTHER targets are not this target's business:
-    /// they neither appear nor mask anything.
+    /// This channel as seen from one target: [`Self::pin`] with `pin_by_target[triple]` laid
+    /// over it (an overlay entry replaces that program's pin or adds a program). Every other
+    /// field is carried unchanged, and `pin_by_target` is cleared in the view so it cannot be
+    /// overlaid twice; other targets' pins neither appear nor mask anything.
     ///
-    /// Every consumer that plans, decides or fetches for a host goes through this view,
-    /// so `plan_groups`, `decide` and `verified_pkg` stay pure over `pin` and never learn
-    /// that targets exist — the overlay is resolved once, where the channel is chosen.
+    /// Every consumer that plans, decides or fetches for a host uses this view, so
+    /// `plan_groups`, `decide` and `verified_pkg` stay pure over `pin`.
     #[must_use]
     pub fn for_target(&self, triple: &str) -> Channel {
         let mut view = self.clone();
@@ -260,10 +184,9 @@ impl Channel {
 }
 
 impl Index {
-    /// The named channel as seen from `triple` — [`Channel::for_target`] over the channel
-    /// of that name — or `None` when the index carries no such channel. THE one lookup
-    /// every host-facing path uses, so a per-target pin can never be missed by a caller
-    /// that read `channels` directly.
+    /// The named channel as seen from `triple` ([`Channel::for_target`]), or `None` when the
+    /// index has no such channel. The one lookup every host-facing path uses, so no caller
+    /// misses a per-target pin.
     #[must_use]
     pub fn channel_for(&self, name: &str, triple: &str) -> Option<Channel> {
         self.channels
@@ -272,24 +195,21 @@ impl Index {
             .map(|c| c.for_target(triple))
     }
 
-    /// The named program, **iff** the verified index names it. `None` ⇒ the repo is
-    /// unreachable (R4): private-config repos, half-finished repos, anything unlisted is
-    /// never named, so this is exclusion *by construction*, not by heuristic.
+    /// The named program, iff the verified index names it. `None` ⇒ the repo is unreachable
+    /// (R4): anything unlisted is never named, so exclusion is by construction.
     #[must_use]
     pub fn program(&self, name: &str) -> Option<&Program> {
         self.programs.get(name)
     }
 
-    /// Whether `name` is an installable program named by the index. The fail-closed
-    /// reachability rule (§5): an unlisted name is not installable, full stop.
+    /// Whether `name` is a program the index names (§5): an unlisted name is not installable.
     #[must_use]
     pub fn is_program(&self, name: &str) -> bool {
         self.programs.contains_key(name)
     }
 
-    /// The installable program set: every program the index names, less the
-    /// **narrowing-only** `[packages].exclude` (R4/§5). The signed index is the sole gate,
-    /// so no config can make a private-config / unlisted repo installable.
+    /// The installable set: every program the index names, less the narrowing-only
+    /// `[packages].exclude` (R4/§5). No config can make an unlisted repo installable.
     #[must_use]
     pub fn installable(&self, exclude: &[String]) -> BTreeSet<String> {
         let mut set: BTreeSet<String> = self.programs.keys().cloned().collect();
@@ -300,47 +220,40 @@ impl Index {
     }
 }
 
-/// A release-key-signed `pkg-<program>-<build>.toml` (§4.2): the per-triple artifact
-/// matrix for one program build.
+/// A machine-signed `pkg-<program>-<build>.toml` (§4.2): the per-triple artifact matrix for
+/// one program build.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PkgManifest {
     /// Manifest format version; `> SUPPORTED_SCHEMA` is refused.
     pub schema: u32,
-    /// The program name — must equal the index `[programs]` key that pointed here; bound
-    /// inside the signed bytes so a valid signature can't be paired with a re-pointed
-    /// program (the caller cross-checks it against the requested program).
+    /// The program name, which must equal the index `[programs]` key that pointed here. It is
+    /// inside the signed bytes, so the caller can refuse a re-pointed program
+    /// ([`Self::is_for`]).
     pub program: String,
     /// Human version string (informational / display).
     #[serde(default)]
     pub version: String,
-    /// Monotonic build number — the strictly-greater downgrade gate (reused from the
-    /// updater's `build_number` semantics).
+    /// Monotonic build number: the strictly-greater downgrade gate.
     pub build_number: u64,
-    /// The binaries to shim into `bin/` (§10) — generic over multi-binary / oddly-named
-    /// programs (R2).
+    /// The binaries to shim into `bin/` (§10); a program may expose several (R2).
     #[serde(default)]
     pub exposes: Vec<String>,
-    /// Runtime dependencies — other index-named programs this build needs at runtime.
-    /// Resolved at install ([`crate::flow::install`]): each MISSING dep is installed FIRST;
-    /// a yanked/below-floor, unreachable, not-pinned, or cyclic dep is SKIPPED with a
-    /// warning. A `requires` edge can pull a program IN — it can NEVER bypass the floor/yank
-    /// gate ([`crate::gate::decide`]) or the §5 index reachability rule. SIGNED metadata:
-    /// parsed only from a [`VerifiedBytes`], so a repo-write adversary cannot inject a
-    /// dependency edge.
+    /// Runtime dependencies: other index-named programs this build needs, each missing one
+    /// installed first ([`crate::flow::install`]); a yanked, below-floor, unreachable, unpinned or
+    /// cyclic dep is skipped with a warning. An edge never bypasses the floor/yank gate
+    /// ([`crate::gate::decide`]) or §5 reachability, and it is signed, so a repo-write adversary
+    /// cannot inject one.
     #[serde(default)]
     pub requires: Vec<String>,
-    /// `shim_env = ["NAME=VALUE", …]` — the environment EVERY shim of this program
-    /// (primary and `alab-` alias) exports before it execs the store binary (design S7,
-    /// `crates/atpkg/src/shim_env.rs`): a managed vendor tool runs with its own updater
-    /// off (`DISABLE_AUTOUPDATER=1` for Claude Code) and the index re-pin is its update
-    /// path. Only the MANAGED copy is affected — a system copy never runs through the
-    /// shim. SIGNED metadata, validated at parse ([`crate::shim_env::ShimEnv::admit`],
-    /// [`Reject::ShimEnv`]); absent on every manifest published before the key existed,
-    /// whose shims are byte-identical to before. Read through [`PkgManifest::shim_env`].
+    /// `shim_env = ["NAME=VALUE", …]`: the environment every shim of this program (primary and
+    /// `alab-` alias) exports before it execs the store binary ([`crate::shim_env`]), so a
+    /// managed vendor tool runs with its own updater off (`DISABLE_AUTOUPDATER=1` for Claude
+    /// Code) and the index re-pin is its update path. A system copy never runs through the shim.
+    /// Validated at parse ([`Reject::ShimEnv`]); read through [`PkgManifest::shim_env`].
     #[serde(default)]
     pub shim_env: Vec<String>,
-    /// `[[artifact]]` — one row per target triple. "No row for my triple" is a clean
-    /// fail-closed skip, never an error (§6).
+    /// `[[artifact]]`: one row per target triple. No row for a triple is a clean skip, never
+    /// an error (§6).
     #[serde(default, rename = "artifact")]
     pub artifacts: Vec<Artifact>,
 }
@@ -380,116 +293,95 @@ pub const TRUST_EXPOSES: &[&str] = &[
     "trust-wp-rustc",
 ];
 
-/// One `[[artifact]]` row: how ONE target triple obtains and applies this build. Two
-/// axes (§17): `kind` is the payload / apply shape, `protocol` is where the bytes come
-/// from; [`crate::dispatch::strategy_for`] maps the pair to an apply strategy and refuses
-/// every pair it does not know. A program carries one row per target it serves
-/// ([`TARGETS`]); a target with NO row is the canonical `unavailable on <target>` state,
-/// never an error.
+/// One `[[artifact]]` row: how one target triple obtains and applies this build. `kind` is the
+/// payload/apply shape and `protocol` where the bytes come from (§17);
+/// [`crate::dispatch::strategy_for`] maps the pair to an apply strategy and refuses every pair
+/// it does not know.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Artifact {
-    /// Target triple (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
-    /// `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
-    /// `aarch64-pc-windows-msvc`).
+    /// Target triple, one of [`TARGETS`].
     pub target: String,
-    /// The payload / apply shape: `binary` | `cargo-src` | `sysroot-bundle` | `app-bundle`
-    /// (§4.2/§17). The former `vendor-fetch` spelling — never published —
-    /// is RETIRED and refused at parse ([`crate::sig::Reject::RetiredKind`]): it was a
-    /// protocol wearing a kind's name; write `kind = "binary"` (or `"app-bundle"` +
-    /// `payload = "dmg"`) with `protocol = "https"` instead.
+    /// The payload/apply shape: `binary` | `cargo-src` | `sysroot-bundle` | `app-bundle`
+    /// (§4.2/§17). The retired `vendor-fetch` is refused at parse
+    /// ([`crate::sig::Reject::RetiredKind`]).
     #[serde(default)]
     pub kind: String,
-    /// How the bytes are obtained: `github-release` (default — a release asset under the
-    /// account slug) | `https` (a vendor's own download, pinned by this signed row).
-    /// Absent ⇒ `github-release`, so every manifest published before this key reads
-    /// exactly as it did. The OS-installer protocols (`pkg`, `system-pm`,
-    /// `softwareupdate`) were deleted 2026-09-24: a row naming one still parses and is
-    /// refused at admission ([`crate::vendor::check_row`]) and dispatch alike.
+    /// Where the bytes come from: `github-release` (the default: a release asset under the
+    /// account slug) or `https` (a vendor's own download, pinned by this signed row). A row
+    /// naming a deleted OS-installer protocol (`pkg`, `system-pm`, `softwareupdate`) parses and
+    /// is refused at admission ([`crate::vendor::check_row`]) and dispatch.
     #[serde(default = "default_protocol")]
     pub protocol: String,
-    /// `github-release`: the release asset file name to download. `https`: the LOCAL
-    /// staging file name the download lands under (one bare component, never a path).
-    /// Validated non-empty for both protocols at parse ([`parse_pkg`]).
+    /// `github-release`: the release asset file name to download. `https`: the local staging
+    /// file name the download lands under (one bare component). Required for both
+    /// ([`parse_pkg`]).
     #[serde(default)]
     pub asset: String,
-    /// SHA-256 of the DOWNLOADED bytes — the download-integrity gate. Required on every
-    /// index row (validated at parse).
+    /// SHA-256 of the downloaded bytes: the download-integrity gate. Required on every index
+    /// row.
     #[serde(default)]
     pub sha256: String,
-    /// SHA-512 of the DOWNLOADED bytes, for a vendor-direct row whose vendor signs only
-    /// that; empty is absent. A row's gate is the ONE of `sha256`/`sha512` it sets
-    /// ([`Artifact::digest`]), and an index row sets `sha256` alone.
+    /// SHA-512 of the downloaded bytes, for a vendor-direct row whose vendor publishes only
+    /// that; empty is absent. A row's gate is the one of `sha256`/`sha512` it sets
+    /// ([`Artifact::digest`]); an index row sets `sha256` alone.
     #[serde(default)]
     pub sha512: String,
-    /// SHA-256 over the sorted extracted-file list — the apply-time re-verify root (§8
-    /// TOCTOU). Empty until producers emit it.
+    /// SHA-256 over the sorted extracted-file list: the apply-time re-verify root (§8
+    /// TOCTOU).
     #[serde(default)]
     pub tree_root: String,
-    /// Asset size in bytes — drives the per-artifact download cap + disk preflight.
+    /// Asset size in bytes: drives the per-artifact download cap and disk preflight.
     #[serde(default)]
     pub size: u64,
-    /// Relocation policy for a `sysroot-bundle` (§10.1) — decides the install-time
-    /// apply branch. `self-contained` (default): the payload was relocated at PACK
-    /// time (machine-local deps vendored in), so install just extracts + activates,
-    /// needing NO rustup on the user side. `rustup-linked` (retired: the installer
-    /// no longer re-points such a bundle's dangling `toolchain` link, and no
-    /// published manifest selects it). Signed (inside the manifest
-    /// bytes), so the flag cannot be flipped by a repo-write adversary. Ignored for
-    /// non-bundle kinds.
+    /// Relocation policy for a `sysroot-bundle` (§10.1). `self-contained` (the default and the
+    /// only one applied): the payload was relocated at pack time, so install extracts and
+    /// activates with no rustup on the user side; any other value is refused at apply. Signed,
+    /// so a repo-write adversary cannot flip it. Ignored for other kinds.
     #[serde(default = "default_reloc")]
     pub reloc: String,
-    /// `[artifact.cost]` — honest accounting surfaced before any byte moves (R7).
+    /// `[artifact.cost]`: accounting shown before any byte moves (R7).
     #[serde(default)]
     pub cost: Cost,
-    /// `https`: the vendor's per-version HTTPS URL the client downloads from.
-    /// SIGNED (inside the manifest bytes) and further narrowed by the compiled host
-    /// allow-list ([`crate::vendor::VENDOR_HOSTS`]); the host is a transport, never an
-    /// authenticity input — `sha256`/`tree_root` gate the bytes exactly as for a release
-    /// asset. Ignored for every other protocol.
+    /// `https`: the vendor's per-version URL the client downloads from. Signed and narrowed by
+    /// the compiled host allow-list ([`crate::vendor::VENDOR_HOSTS`]); the host is a transport,
+    /// never an authenticity input — the digest and `tree_root` gate the bytes.
     #[serde(default)]
     pub url: String,
-    /// `https` only: how the download is staged — `raw-binary` | `tar-gz-binary` |
-    /// `tar-gz` | `tar-zst` | `zip` (each with `kind = "binary"`) | `dmg` (with
-    /// `kind = "app-bundle"`) ([`crate::vendor::PAYLOADS`]).
+    /// `https` only: how the download is staged: `raw-binary` | `tar-gz-binary` | `tar-gz` |
+    /// `tar-zst` | `zip` (each with `kind = "binary"`) | `dmg` (with `kind = "app-bundle"`)
+    /// ([`crate::vendor::PAYLOADS`]).
     #[serde(default)]
     pub payload: String,
-    /// `raw-binary` / `tar-gz-binary` only: the LOGICAL tool name the download (or the
-    /// tar's one file) becomes under `bin/` (mode `0755`) — laid down under the
-    /// platform's executable spelling ([`crate::store::ToolName::exe_file`]: `bin/claude`
-    /// on Unix, `bin/claude.exe` on Windows, which is what the shim forwards to). Must be
-    /// one of the manifest's `exposes`.
+    /// `raw-binary`/`tar-gz-binary` only: the tool name the download (or the tar's one file)
+    /// becomes under `bin/` (mode `0755`), in the platform's executable spelling
+    /// ([`crate::store::ToolName::exe_file`]). Must be one of `exposes`.
     #[serde(default)]
     pub entry: String,
     /// Archive payloads only (`tar-gz`/`tar-zst`/`zip`): leading path components to drop
     /// on extraction (`gh_<ver>_macOS_arm64/bin/gh` → `bin/gh`). Default `0`.
     #[serde(default)]
     pub strip_components: u32,
-    /// `dmg` (and, if declared, archive) payloads: RELATIVE symlinks created at
-    /// `bin/<name>` → `../<target>` after staging, so the shims resolve `bin/<tool>`
-    /// (`emacs = "Emacs.app/Contents/MacOS/Emacs"`). Every key must be in `exposes`;
-    /// targets are relative, `..`-free paths inside the staged tree.
+    /// `dmg` (and, if declared, archive) payloads: relative symlinks created at `bin/<name>` →
+    /// `../<target>` after staging, so the shims resolve `bin/<tool>`
+    /// (`emacs = "Emacs.app/Contents/MacOS/Emacs"`). Every key must be in `exposes`; targets
+    /// are relative, `..`-free paths inside the staged tree.
     #[serde(default)]
     pub links: BTreeMap<String, String>,
-    /// Display-only vendor name for the consent copy (`"Anthropic PBC"`). NEVER a trust
-    /// input.
+    /// Display-only vendor name for the consent copy (`"Anthropic PBC"`). Never a trust input.
     #[serde(default)]
     pub vendor: String,
-    /// `[artifact.provenance]` — which compiler built THIS row's payload, as the packer's
-    /// lineage scan recorded it ([`crate::lineage`]; `atpkg-publish`'s manifest writer
-    /// writes it from the scan's record and refuses to sign a `github-release` row without
-    /// one). Per ROW, not per manifest: a merge appends the rows of other triples,
-    /// packed on other builders with other seals, to one manifest. Signed metadata for
-    /// people and audits; no install decision reads it. Absent on every row published
-    /// before the table existed, and ignored by every client older than it (no struct
-    /// here denies unknown fields).
+    /// `[artifact.provenance]`: which compiler built this row's payload, as the packer's
+    /// lineage scan recorded it ([`crate::lineage`]). Per row, since a merge appends rows packed
+    /// on other builders to one manifest. For people and audits; no install decision reads it,
+    /// and no struct here denies unknown fields, so older clients ignore it.
     #[serde(default)]
     pub provenance: Option<Provenance>,
 }
 
 impl Artifact {
-    /// The signed digest that gates this row's download: whichever ONE of `sha256` and
-    /// `sha512` it sets ([`one_digest`]). `None` — no digest, which no file matches — when
-    /// it sets neither or both.
+    /// The signed digest that gates this row's download: whichever one of `sha256` and
+    /// `sha512` it sets ([`one_digest`]). `None` (which no file matches) when it sets neither
+    /// or both.
     #[must_use]
     pub fn digest(&self) -> Option<(DigestAlg, &str)> {
         one_digest(&self.sha256, &self.sha512)
@@ -532,9 +424,9 @@ impl std::fmt::Display for DigestAlg {
     }
 }
 
-/// The ONE digest a `sha256`/`sha512` pair of keys names — a signed row's, a log entry's,
-/// a record's: `(algorithm, value)` when exactly one is non-empty, `None` when neither or
-/// both are. The value is as written; its shape is the caller's check.
+/// The one digest a `sha256`/`sha512` pair names (a signed row's, a log entry's, a record's):
+/// `(algorithm, value)` when exactly one is non-empty, `None` otherwise. The value is as
+/// written; its shape is the caller's check.
 #[must_use]
 pub fn one_digest<'a>(sha256: &'a str, sha512: &'a str) -> Option<(DigestAlg, &'a str)> {
     match (sha256.is_empty(), sha512.is_empty()) {
@@ -570,8 +462,8 @@ pub struct Provenance {
     /// sha256 of its compiler driver.
     #[serde(default)]
     pub driver_sha256: String,
-    /// How its lineage was proven: `lineage`, `seed-mint`, or `unproven` (admitted while
-    /// the receipt requirement was dormant).
+    /// How its lineage was proven: `lineage`, `seed-mint`, or `unproven` (admitted while the
+    /// receipt requirement is dormant).
     #[serde(default)]
     pub lineage: String,
     /// sha256 of the SEED-MINT receipt, or `none`.
@@ -583,20 +475,18 @@ pub struct Provenance {
     /// Compiled objects the scan read.
     #[serde(default)]
     pub scan_objects: String,
-    /// Evidence of another compiler it found (always `0` in a signed row). `0` means
-    /// no evidence was found, not that none could exist (`lineage`'s module docs).
+    /// Evidence of another compiler it found (always `0` in a signed row): none found, not
+    /// none possible (see [`crate::lineage`]).
     #[serde(default)]
     pub scan_findings: String,
 }
 
-/// A `sysroot-bundle` with no explicit policy is treated as `self-contained` —
-/// the safe default (extract-and-run; no assumption the user has rustup).
+/// A `sysroot-bundle` with no explicit policy is `self-contained`.
 fn default_reloc() -> String {
     "self-contained".to_string()
 }
 
-/// A row with no `protocol` is a release asset under the account slug — every manifest
-/// published before the key existed.
+/// A row with no `protocol` is a release asset under the account slug.
 fn default_protocol() -> String {
     "github-release".to_string()
 }
@@ -608,7 +498,7 @@ const VENDOR_FETCH_RETIRED: &str = "kind = \"vendor-fetch\" is retired (it was n
     \"app-bundle\" with payload = \"dmg\") and where the bytes come from as \
     protocol = \"https\"";
 
-/// `[artifact.cost]` — the honest, structural accounting block (§4.2/R7).
+/// `[artifact.cost]`: the structural accounting block (§4.2/R7).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Cost {
     /// Bytes downloaded.
@@ -623,45 +513,35 @@ pub struct Cost {
 }
 
 impl PkgManifest {
-    /// The ADMITTED shim environment ([`crate::shim_env::ShimEnv`]). Total: [`parse_pkg`]
-    /// already refused a manifest whose list breaks the rule, so this cannot fail on a
-    /// parsed manifest; a hand-built one that would is read as no environment (fail-closed
-    /// — a shim laid with no env, never a half-parsed one).
+    /// The admitted shim environment ([`crate::shim_env::ShimEnv`]). [`parse_pkg`] already
+    /// refused a list that breaks the rule; a hand-built manifest's bad list reads as no
+    /// environment.
     #[must_use]
     pub fn shim_env(&self) -> crate::shim_env::ShimEnv {
         crate::shim_env::ShimEnv::admit(&self.shim_env).unwrap_or_default()
     }
 
-    /// The artifact for `target`, if this build ships one for that triple. `None` is the
-    /// clean fail-closed skip (§6) — not an error.
+    /// The artifact for `target`, if this build ships one. `None` is the clean skip (§6).
     #[must_use]
     pub fn artifact_for(&self, target: &str) -> Option<&Artifact> {
         self.artifacts.iter().find(|a| a.target == target)
     }
 
-    /// Whether this manifest's signed `program` field matches the program the client
-    /// asked for. The anti-replay bind (§4.2): because `program` is inside the signed
-    /// bytes, a valid signature can never be paired with a re-pointed program — but the
-    /// caller must still CHECK it, so a `pkg.toml` legitimately signed for program A is
-    /// refused when fetched as program B. Fail closed at the call site on `false`.
+    /// Whether the signed `program` field is `name`: the anti-replay bind (§4.2). A manifest
+    /// signed for program A must be refused when fetched as B, so fail closed on `false`.
     #[must_use]
     pub fn is_for(&self, name: &str) -> bool {
         self.program == name
     }
 }
 
-/// Parse a root-verified `index.toml` from its [`VerifiedBytes`]. Strict UTF-8 (no lossy
-/// substitution — the signature was checked over these exact bytes), real `toml` parse,
-/// then the [`SUPPORTED_SCHEMA`] reject-newer gate. Any failure is a fail-closed
-/// [`Reject`]; the caller treats every variant as "refuse, install nothing".
+/// Parse a verified `index.toml`: strict UTF-8 (the signature covers these exact bytes), a real
+/// `toml` parse, then the [`SUPPORTED_SCHEMA`] reject-newer gate. Every [`Reject`] means
+/// "refuse, install nothing".
 ///
-/// `pub(crate)`, deliberately, and narrowing it was a fix rather than tidiness: an
-/// `Index` carries self-declared attribution (`machine_id`/`roster_seq`) that is only
-/// trustworthy after `TrustedRoster::authorize_index` runs the id↔key bind over it. A
-/// public parse entry would let an out-of-crate caller pair `authorize_bytes` with this
-/// and read an UNBOUND `machine_id` — signed by one fleet machine, labelled as another.
-/// Keeping the parse crate-private makes `authorize_index` the only way to obtain a
-/// parsed `Index` from outside, so the bind cannot be skipped by construction.
+/// `pub(crate)` on purpose: `machine_id`/`roster_seq` are trustworthy only after
+/// `TrustedRoster::authorize_index` binds them to the signing key, and a public parse would let
+/// an out-of-crate caller pair `authorize_bytes` with it and read an unbound `machine_id`.
 pub(crate) fn parse_index(verified: &VerifiedBytes) -> Result<Index, Reject> {
     let idx: Index = parse_toml(verified)?;
     if idx.schema > SUPPORTED_SCHEMA {
@@ -670,8 +550,8 @@ pub(crate) fn parse_index(verified: &VerifiedBytes) -> Result<Index, Reject> {
     Ok(idx)
 }
 
-/// Parse a release-verified `pkg-*.toml` from its [`VerifiedBytes`] (same strict UTF-8 +
-/// reject-newer discipline as [`parse_index`]).
+/// Parse a verified `pkg-*.toml` (the same strict UTF-8 and reject-newer discipline as
+/// [`parse_index`]), then its row and `shim_env` rules.
 pub fn parse_pkg(verified: &VerifiedBytes) -> Result<PkgManifest, Reject> {
     let m: PkgManifest = parse_toml(verified)?;
     if m.schema > SUPPORTED_SCHEMA {
@@ -683,31 +563,25 @@ pub fn parse_pkg(verified: &VerifiedBytes) -> Result<PkgManifest, Reject> {
 }
 
 /// The `shim_env` list must be one a shim can honour ([`crate::shim_env::ShimEnv::admit`]),
-/// checked ONCE at parse so no writer ever meets an entry it cannot embed. A refusal is
-/// [`Reject::ShimEnv`] carrying the entry and the reason — post-verify, never a crypto
-/// oracle — and it refuses the WHOLE manifest: a program whose declared environment
-/// cannot be laid must not be installed with a different one.
+/// checked once at parse so no writer meets an entry it cannot embed. A refusal
+/// ([`Reject::ShimEnv`], naming the entry) refuses the whole manifest: a program whose declared
+/// environment cannot be laid is not installed with another.
 fn validate_shim_env(m: &PkgManifest) -> Result<(), Reject> {
     crate::shim_env::ShimEnv::admit(&m.shim_env)
         .map(|_| ())
         .map_err(Reject::ShimEnv)
 }
 
-/// The post-parse shape rules `serde` alone cannot express, since `asset`/`sha256` are
-/// `serde`-optional (a row of a protocol this client does not know may omit them, and is
-/// refused by name at admission instead):
+/// The row rules `serde` cannot express (`asset`/`sha256` are `serde`-optional, so a row of an
+/// unknown protocol can omit them and be refused by name at admission):
 ///
-/// * the retired `kind = "vendor-fetch"` is refused with the split's spelling
-///   ([`Reject::RetiredKind`]) — a whole-manifest refusal, since a publisher that emits
-///   it is running tooling this schema left behind;
-/// * a `github-release` or `https` row still REQUIRES `asset` and `sha256` (they were
-///   `serde`-required fields before the split, and a release-shaped row without them
-///   used to fail closed as [`Reject::Malformed`] — it still does), and carries no
-///   `sha512`: an index row's gate is its `sha256`, never a second digest beside it.
+/// * the retired `kind = "vendor-fetch"` refuses the whole manifest ([`Reject::RetiredKind`]);
+/// * a `github-release` or `https` row requires `asset` and `sha256` and carries no `sha512`
+///   ([`Reject::Malformed`]).
 ///
-/// Everything finer — hosts, payload lanes, an unknown protocol — is
-/// [`crate::vendor::check_row`]'s per-program refusal, so one mis-authored row for one
-/// target never takes the other targets' rows down with it.
+/// Everything finer (hosts, payload lanes, an unknown protocol) is
+/// [`crate::vendor::check_row`]'s per-program refusal, so one mis-authored row never takes the
+/// other targets' rows down.
 fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
     for a in &m.artifacts {
         if a.kind == "vendor-fetch" {
@@ -721,9 +595,8 @@ fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Shared strict-UTF-8 + `toml` deserialize over already-verified bytes. Invalid UTF-8
-/// or any TOML/shape error (missing required field, duplicate key, wrong type) is
-/// [`Reject::Malformed`] — fail closed, never a lossy reinterpretation.
+/// Strict UTF-8 and `toml` deserialize over verified bytes. Invalid UTF-8 or any TOML or shape
+/// error (missing field, duplicate key, wrong type) is [`Reject::Malformed`].
 fn parse_toml<T: serde::de::DeserializeOwned>(verified: &VerifiedBytes) -> Result<T, Reject> {
     let text = std::str::from_utf8(verified.as_slice()).map_err(|_| Reject::Malformed)?;
     aterm_toml::from_str(text).map_err(|_| Reject::Malformed)
@@ -734,15 +607,13 @@ mod tests {
     use super::*;
     use crate::sig::testkit;
 
-    /// `body`, machine-signed and taken through the REAL roster chain, so `parse_index` /
-    /// `parse_pkg` run on genuinely-verified input. (Parsing raw bytes does not
-    /// type-check, which is the compile-time half of the guarantee and needs no test.)
+    /// `body`, machine-signed and verified through the real roster chain.
     fn verified(body: &str) -> VerifiedBytes {
         testkit::machine_signed(body.as_bytes().to_vec())
     }
 
-    /// A complete, realistic index naming three programs (and deliberately NOT naming a
-    /// private-config repo like `dotfiles`), attributed to the test roster's machine.
+    /// A realistic index naming six programs (and not `dotfiles`, a private-config repo),
+    /// attributed to the test roster's machine.
     fn full_index() -> String {
         format!(
             r#"
@@ -797,10 +668,8 @@ trust_mc_rev = "0.67.0"
         )
     }
 
-    /// REGRESSION (audit 2026-09-15): the yank floor a multi-program channel needs is PER
-    /// PROGRAM. A channel-wide floor is compared against every program's own counter, and the
-    /// counters are independent (`nn = 108` beside `trust-mc = 20065` on the live index), so
-    /// the only channel-wide value that did not tombstone unrelated programs was 0.
+    /// A per-program floor raises only the program it names; every other program keeps the
+    /// channel-wide one.
     #[test]
     fn a_per_program_min_build_floors_one_program_only() {
         let body = format!(
@@ -839,8 +708,7 @@ pin = {{ trust = 7100, nn = 108 }}
             .expect("stable exists");
         assert_eq!(view.min_build_for("trust"), 7000);
         assert_eq!(view.min_build_for("nn"), 0);
-        // And an index WITHOUT the key is unchanged: every program keeps the channel-wide
-        // floor, so an old published index decides exactly as it did before the key existed.
+        // Without the key every program keeps the channel-wide floor.
         let old = parse_index(&verified(&full_index())).expect("valid index parses");
         let och = &old.channels[0];
         assert!(och.min_build_by_program.is_empty());
@@ -853,12 +721,10 @@ pin = {{ trust = 7100, nn = 108 }}
         let idx = parse_index(&verified(&full_index())).expect("valid index parses");
         assert_eq!(idx.index_build, 41);
         assert_eq!(idx.valid_until, "2026-07-05T12:00:00Z");
-        // The attribution pair that replaced `[keys]` — what the roster bind checks.
+        // The attribution pair the roster bind checks.
         assert_eq!(idx.machine_id.as_deref(), Some(testkit::MACHINE_ID));
         assert_eq!(idx.roster_seq, Some(testkit::SEQ));
-        // Programs, channels and pin parsed; the fixture's `[channels.meta]` table, which
-        // no field reads, is tolerated as an unknown key (wire-safe for any index that
-        // ever carried one).
+        // The fixture's `[channels.meta]` table, which no field reads, is ignored.
         assert_eq!(
             idx.program("trust").unwrap().coherence_group.as_deref(),
             Some("rustc")
@@ -872,9 +738,9 @@ pin = {{ trust = 7100, nn = 108 }}
         assert_eq!(ch.pin.get("trust"), Some(&4821));
     }
 
-    /// A per-target overlay changes ONLY the target it names: that target sees the
-    /// overlaid build for a program `pin` also names (replace), sees a program `pin`
-    /// never named (add), and every other target sees `pin` exactly as published.
+    /// A per-target overlay changes only the target it names: that target sees the overlaid
+    /// build for a program `pin` also names (replace) and a program `pin` never named (add);
+    /// every other target sees `pin` as published.
     #[test]
     fn a_per_target_pin_overlays_its_own_target_and_no_other() {
         let mut body = full_index();
@@ -938,15 +804,10 @@ pin = {{ trust = 7100, nn = 108 }}
         );
     }
 
-    /// The set a publisher must carry: over every triple an index names, the builds clients
-    /// resolve are `pin` union every `pin_by_target` overlay, never one of the two. This is the
-    /// law the public mirror's work list (`atpkg-publish mirror`) derives from; reading `pin` alone leaves a toolchain that publishes
-    /// entirely as an overlay pinned but never mirrored. Both halves below make it necessary:
-    ///
-    ///   * an overlay build is resolvable and appears in no `pin` row (so `pin` alone is
-    ///     not enough), and
-    ///   * the `pin` build an overlay masks is still resolvable from every other triple
-    ///     (so the overlays alone are not enough, and a masked build may never be dropped).
+    /// The builds clients resolve, over every triple an index names, are `pin` ∪ every
+    /// `pin_by_target` overlay: the set the public mirror's work list (`atpkg-publish mirror`)
+    /// must carry. Neither half suffices: an overlay build appears in no `pin` row, and the
+    /// `pin` build an overlay masks is still resolved by every other triple.
     #[test]
     fn the_builds_clients_resolve_are_pin_union_every_overlay() {
         use std::collections::BTreeSet;
@@ -993,7 +854,7 @@ pin = {{ trust = 7100, nn = 108 }}
              the public mirror's work list no longer describes what it has to carry"
         );
 
-        // …and neither key alone covers it, which is the whole reason for a union.
+        // Neither key alone covers it.
         let pin_only: BTreeSet<(String, u64)> =
             ch.pin.iter().map(|(p, b)| (p.clone(), *b)).collect();
         assert!(
@@ -1023,11 +884,11 @@ pin = {{ trust = 7100, nn = 108 }}
             !idx.installable(&[]).contains("dotfiles"),
             "a private-config repo can never be in the installable set"
         );
-        // Sanity: the named programs ARE reachable.
+        // The named programs are reachable.
         assert!(idx.is_program("trust") && idx.is_program("ay") && idx.is_program("aterm"));
     }
 
-    // §5: exclude is NARROWING-ONLY.
+    // §5: `exclude` only narrows.
     #[test]
     fn exclude_is_narrowing_only() {
         let idx = parse_index(&verified(&full_index())).unwrap();
@@ -1090,8 +951,8 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
             a.links.get("emacs").map(String::as_str),
             Some("Emacs.app/Contents/MacOS/Emacs")
         );
-        // Absent keys default: an ordinary binary row reads back empty/zero, and the
-        // protocol it never declared is the release lane every older manifest meant.
+        // Absent keys default to empty or zero, and the undeclared protocol is
+        // `github-release`.
         let plain = parse_pkg(&verified(
             "schema = 2\nprogram = \"ay\"\nbuild_number = 18\n[[artifact]]\n\
              target = \"aarch64-apple-darwin\"\nasset = \"ay-18.tar.zst\"\nsha256 = \"d\"\n",
@@ -1104,11 +965,9 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
         assert!(a.links.is_empty() && a.vendor.is_empty());
     }
 
-    /// `shim_env` (design S7) parses as SIGNED data and is validated at parse: the
-    /// accepted shape reads back through `PkgManifest::shim_env`, a manifest without the
-    /// key reads as no environment, and every entry the rule refuses refuses the WHOLE
-    /// manifest as `Reject::ShimEnv` naming the entry — never `Malformed`, never a shim
-    /// laid with half an environment.
+    /// `shim_env` is validated at parse: the accepted shape reads back through
+    /// `PkgManifest::shim_env`, an absent key is no environment, and any refused entry refuses
+    /// the whole manifest as `Reject::ShimEnv` naming it, never `Malformed`.
     #[test]
     fn shim_env_is_signed_validated_and_refused_by_name() {
         let head = "schema = 2\nprogram = \"claude\"\nversion = \"2.1.231\"\n\
@@ -1147,9 +1006,8 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
         assert_eq!(parse_pkg(&verified(&body)).unwrap_err(), Reject::Malformed);
     }
 
-    /// The retired index-level `requires` (§5.3(b)) still PARSES — whatever it names, a
-    /// cycle and an unlisted name included, since nothing orders on it any more — so the
-    /// program that names it can be refused by name rather than the whole index.
+    /// The retired index-level `requires` still parses, whatever it names (a cycle, an unlisted
+    /// name), so the program naming it is refused by name rather than the whole index.
     #[test]
     fn the_retired_requires_parses_so_its_program_can_be_refused() {
         let body = full_index()
@@ -1178,8 +1036,7 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
             Err(Reject::RetiredKind(why)) => assert!(why.contains("vendor-fetch"), "{why}"),
             other => panic!("expected RetiredKind, got {other:?}"),
         }
-        // Even a SECOND row spelled that way refuses the manifest: a publisher emitting it
-        // is on retired tooling.
+        // Even a second row spelled that way refuses the whole manifest.
         let mixed = "schema = 2\nprogram = \"claude\"\nbuild_number = 1\n[[artifact]]\n\
                      target = \"aarch64-apple-darwin\"\nasset = \"a\"\nsha256 = \"d\"\n\
                      [[artifact]]\ntarget = \"x86_64-apple-darwin\"\nkind = \"vendor-fetch\"\n\
@@ -1190,10 +1047,9 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
         ));
     }
 
-    /// A row of a DELETED protocol (`pkg`, `system-pm`, §5.3(b)) still parses, keys and
-    /// all, so admission refuses that one program by name rather than the manifest being
-    /// malformed — while a release-shaped row still fails closed without `asset`/`sha256`,
-    /// exactly as when serde required them.
+    /// A row of a deleted protocol (`pkg`, `system-pm`) still parses, so admission refuses that
+    /// one program by name instead of the whole manifest being malformed; a release-shaped row
+    /// still fails closed without `asset`/`sha256`.
     #[test]
     fn deleted_protocol_rows_parse_and_release_rows_still_need_their_digests() {
         let body = r#"
@@ -1249,8 +1105,8 @@ provides = ["emacs"]
         );
         // A target with no row is the clean skip, never an error.
         assert!(m.artifact_for("aarch64-pc-windows-msvc").is_none());
-        // Release-shaped rows keep their required digests (the pre-split serde contract),
-        // and an index row's digest is its sha256 alone.
+        // Release-shaped rows still require their digests, and an index row's digest is its
+        // sha256 alone.
         for missing in [
             "target = \"aarch64-apple-darwin\"\nsha256 = \"d\"\n",
             "target = \"aarch64-apple-darwin\"\nasset = \"a\"\n",
@@ -1269,9 +1125,9 @@ provides = ["emacs"]
         }
     }
 
-    /// A row's gate is the ONE digest it sets, named by its algorithm; neither or both is
-    /// no digest. The shape check takes each algorithm's length, lowercase only — the
-    /// sample is agy 1.3.6's darwin_arm64 tarball sha512 as Google's manifest names it.
+    /// A row's gate is the one digest it sets, named by its algorithm; neither or both is no
+    /// digest. The shape check takes each algorithm's length, lowercase only (the sample is a
+    /// real vendor's published sha512).
     #[test]
     fn a_row_is_gated_by_the_one_digest_it_sets() {
         const AGY_SHA512: &str = "473a34b685d0a09d48790e8b86bc3e545dfab889fe0d8fc81cb7e1fdfc336fe7\
@@ -1303,8 +1159,7 @@ provides = ["emacs"]
         }
     }
 
-    /// Every published triple is a forge cell, so some lane's compiler reads it:
-    /// a shipped triple in no cell is compiled by none.
+    /// Every published triple is a forge cell, so some lane compiles it.
     #[test]
     fn every_published_triple_is_a_forge_cell() {
         let cells = aterm_forge::resolve::default_cells();
@@ -1321,14 +1176,12 @@ provides = ["emacs"]
     fn rejects_newer_schema() {
         let body = full_index().replace("schema = 2", "schema = 99");
         assert_eq!(parse_index(&verified(&body)).unwrap_err(), Reject::Schema);
-        // And the CURRENT schema is accepted — so the gate is the number, not the fixture.
+        // The current schema is accepted: the gate is the number, not the fixture.
         assert!(parse_index(&verified(&full_index())).is_ok());
     }
 
-    /// A schema-1 index — the shape the retired delegation tier published — still PARSES
-    /// (1 ≤ SUPPORTED_SCHEMA) but carries no attribution, so the roster bind refuses it.
-    /// Both halves matter: the parse proves this is not an accidental format break, and
-    /// the missing attribution proves an old-shape index installs nothing.
+    /// A schema-1 index still parses (1 ≤ `SUPPORTED_SCHEMA`) but carries no attribution, so
+    /// the roster bind refuses it.
     #[test]
     fn a_schema_one_index_parses_but_carries_no_attribution() {
         let body = "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
@@ -1339,14 +1192,9 @@ provides = ["emacs"]
         // The bind is what refuses it; `sig`'s tests prove that direction end to end.
     }
 
-    /// Each of these fails closed as `Malformed`, never a silent default. One labelled row
-    /// per shape:
-    /// * a missing required field (`index_build`) is not a default-0 silent accept;
-    /// * a DUPLICATE key — the real TOML parser gives this for free (the Phase-1 line
-    ///   scanner had to hand-defend it) — matters for `machine_id`, where a last-wins
-    ///   parser would let a second copy re-attribute the index;
-    /// * a wrong-typed attribution: a string `roster_seq` cannot become "absent" and
-    ///   slide into the bind.
+    /// Each fails closed as `Malformed`, never a silent default: a missing `index_build`; a
+    /// duplicate `machine_id`, which a last-wins parser would let re-attribute the index; a
+    /// string `roster_seq`, which must not read as absent.
     #[test]
     fn malformed_indexes_fail_closed() {
         for (body, why) in [
@@ -1373,8 +1221,8 @@ provides = ["emacs"]
         }
     }
 
-    // Table scoping is intrinsic to the real parser: a `machine_id` in a SIBLING table
-    // cannot shadow the genuine top-level attribution (it lands in an ignored table).
+    // Table scoping is intrinsic to the real parser: a `machine_id` in a sibling table lands
+    // in an ignored table and cannot shadow the top-level attribution.
     #[test]
     fn sibling_table_cannot_hijack_the_attribution() {
         let body = "schema = 2\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
@@ -1385,7 +1233,7 @@ provides = ["emacs"]
         assert_eq!(idx.roster_seq, Some(3));
     }
 
-    // pkg-*.toml: per-triple artifact selection + reject-newer + clean missing-triple skip.
+    // `pkg-*.toml`: per-triple artifact selection, and a clean skip for a missing triple.
     #[test]
     fn parses_pkg_manifest_and_selects_artifact() {
         let body = r#"
@@ -1419,10 +1267,8 @@ build_seconds = 0
         assert!(m.artifact_for("x86_64-unknown-linux-gnu").is_none());
     }
 
-    // STRICT, never-lossy UTF-8: a signed index containing an invalid-UTF-8 byte is
-    // rejected (Malformed), NOT silently U+FFFD-substituted and reinterpreted. The byte
-    // is part of the genuinely-verified bytes, so this exercises the parse-layer's
-    // from_utf8 arm (not the signature).
+    // Strict UTF-8: an invalid byte inside genuinely verified bytes is `Malformed`, never
+    // U+FFFD-substituted (the parse layer's check, not the signature's).
     #[test]
     fn strict_utf8_rejects_invalid_bytes_in_signed_index() {
         let mut raw = b"schema = 2\nindex_build = 1\n".to_vec();
@@ -1434,13 +1280,11 @@ build_seconds = 0
         );
     }
 
-    // parse_pkg negative paths (symmetry with the index gate): a newer schema is refused,
-    // and a missing required field fails closed.
+    // `parse_pkg` refuses a newer schema and fails closed on a missing required field.
     #[test]
     fn parse_pkg_rejects_newer_schema_and_missing_field() {
         let newer = "schema = 99\nprogram = \"ay\"\nbuild_number = 1\n";
         assert_eq!(parse_pkg(&verified(newer)).unwrap_err(), Reject::Schema);
-        // Missing build_number (required) → Malformed, not a default-0 silent accept.
         let missing = "schema = 2\nprogram = \"ay\"\n";
         assert_eq!(
             parse_pkg(&verified(missing)).unwrap_err(),
@@ -1483,10 +1327,8 @@ build_seconds = 0
         );
     }
 
-    // The signed `program` field binds the manifest to a program (§4.2 anti-replay): a
-    // pkg legitimately signed for "ay" must be refused when fetched as some other program.
-    // This bind is UNCHANGED by the single-root move — it is the pkg tier's id bind, and
-    // it is what the roster's `machine_id` bind is for the index.
+    // The signed `program` field binds a manifest to its program (§4.2 anti-replay): a pkg
+    // signed for "ay" is refused when fetched as another program.
     #[test]
     fn pkg_program_field_binds_identity() {
         let m = parse_pkg(&verified(

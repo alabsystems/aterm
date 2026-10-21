@@ -26,7 +26,7 @@
 //! the terminal a plain writer, so a run is checked byte for byte.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use amacs::protocol::edit::{AwaitKey, EditOk, EditOutcome, EditRequest, EditResult};
@@ -52,8 +52,7 @@ In a tab of an aterm window, each FILE opens in a fresh Editor tab beside this
 one, and amacs waits, printing nothing, until that tab is closed; then the next
 FILE opens. That makes it an $EDITOR for `git commit`, `crontab -e` and an
 agent's editor key: close the tab when you are done, and the file on disk is
-the answer. A FILE that does not exist yet is not opened in a window yet (the
-window refuses to create one).
+the answer. A FILE that does not exist yet is created by its first save.
 
 OPTIONS:
     +LINE[:COL]   put the caret on LINE (and column COL) of the FILE after it
@@ -64,15 +63,19 @@ OPTIONS:
     -h, --help    print this help
     --            every argument after it is a FILE
 
-OUTSIDE A WINDOW (over ssh, in tmux or screen, with -nw), amacs edits in the
-terminal itself. That editor is not built yet: amacs says so and exits 1.
+OUTSIDE A WINDOW (over ssh, in tmux or screen, with -nw, or when the window
+will not take a FILE), amacs edits in the terminal itself, with the same
+Emacs keys: C-x C-s saves, C-x C-c closes the file (asking first when it has
+unsaved changes), C-c C-c saves and closes, C-c C-k closes without saving,
+C-g cancels, C-z suspends. A save refuses when the file changed on disk since
+it was read: C-x C-s again overwrites it, M-x revert-buffer reloads it.
 
 EXIT STATUS:
     0    every file's view was closed
-    1    the window refused a file or did not answer, or (for now) the edit
-         needed the terminal editor
+    1    the window refused a file or did not answer, a file could not be
+         opened, or an edit was abandoned (C-c C-k)
     2    a usage error, or no terminal (stdin or stdout is not a tty)
-         without --wait or --no-wait
+         without --wait or --no-wait, or no terminal to edit in
     75   the aterm serving the edit went away and no successor took the wait
     130  interrupted (C-c): the view stays open in the window
 ";
@@ -174,32 +177,22 @@ fn parse_position(spec: &str) -> Option<(u32, Option<u32>)> {
     }
 }
 
-/// `path`'s realpath as a `file://` URI, and whether the file is missing.
-/// A missing file is named by its directory's realpath plus its own name, so
-/// a symlinked directory resolves either way.
+/// `path`'s realpath as a `file://` URI, and whether the file is missing:
+/// the name amacs-files opens it by ([`amacs_files::host::open_path`]), so
+/// the window is handed the file the terminal face would edit. A missing
+/// file is named by its directory's realpath plus its own name, so a
+/// symlinked directory resolves either way.
 ///
 /// # Errors
 ///
 /// Why the path names no file the window could be handed (no such directory,
-/// a path that is not UTF-8), worded for a person.
+/// a dangling symbolic link, a path that is not UTF-8), worded for a person.
 pub fn target_uri(path: &Path) -> Result<(String, bool), String> {
-    let (real, missing) = match std::fs::canonicalize(path) {
-        Ok(real) => (real, false),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let name = path
-                .file_name()
-                .ok_or_else(|| format!("{}: {e}", path.display()))?;
-            let dir = match path.parent() {
-                Some(dir) if !dir.as_os_str().is_empty() => dir,
-                _ => Path::new("."),
-            };
-            let dir = std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            (dir.join(name), true)
-        }
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    let uri = amacs::protocol::uri::path_to_file_uri(&real)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let (real, uri) = amacs_files::host::open_path(path)
+        .map_err(|e| format!("{}: {}", path.display(), crate::tui::host_error(path, &e)))?;
+    // `open_path` names an existing file by its realpath, and a missing one
+    // by its directory's: only the second is absent.
+    let missing = std::fs::symlink_metadata(&real).is_err();
     Ok((uri, missing))
 }
 
@@ -309,8 +302,9 @@ impl Window for SessionWindow {
 pub enum Ending {
     /// Every file was handed over and, unless `--no-wait`, its view closed.
     Done,
-    /// The window would not take a file (why): the rest is the terminal's.
-    Terminal(String),
+    /// The window would not take the file at `from` in the targets (`why`):
+    /// it and the files after it are the terminal's.
+    Terminal { why: String, from: usize },
     /// Stop with this status; anything to say is already said.
     Exit(u8),
 }
@@ -334,7 +328,7 @@ pub fn edit_files(
     window: &mut dyn Window,
     tty: &mut dyn Write,
 ) -> Ending {
-    for target in &args.targets {
+    for (from, target) in args.targets.iter().enumerate() {
         let (uri, missing) = match target_uri(&target.path) {
             Ok(named) => named,
             Err(why) => {
@@ -359,7 +353,7 @@ pub fn edit_files(
                     target.path.display()
                 );
                 return match decide::after_handoff(handoff_of(&error)) {
-                    Face::Terminal => Ending::Terminal(why),
+                    Face::Terminal => Ending::Terminal { why, from },
                     Face::Exit(code, line) => {
                         say(tty, &why);
                         say(tty, line.trim_start_matches("amacs: "));
@@ -408,6 +402,8 @@ pub(crate) fn say(tty: &mut dyn Write, line: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
 
     /// What the caller's terminal received from a run: every byte the client

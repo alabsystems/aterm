@@ -60,11 +60,10 @@ fn drive_cursor_cat_momentum(app: &mut App, wid: WindowId, enabled: bool) {
     }
 }
 
-/// Tier-1 host binding for the derived cursor-cat owner gate: the shipping
-/// echo-correlated momentum seam does not forward the decisive pulse while
-/// `cursor_trail = false`, and the glass/capture predicate does not draw
-/// that ordinary branch. Enabling the master proves the fixture can arm. A
-/// collection hello stays presentable with the master off.
+/// Host binding for the derived cursor-cat owner gate: with `cursor_trail = false` the
+/// echo-correlated momentum seam withholds the decisive pulse and the glass/capture predicate
+/// does not draw the ordinary branch; enabling the master proves the fixture can arm. A
+/// collection hello still presents with the master off.
 #[test]
 fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     let model = cursor_cat_model();
@@ -102,8 +101,8 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     );
     assert_eq!(off_spec[&"ordinary_visible"], 0);
 
-    // Negative control: the historical style-only gate arms the exact
-    // state that Buggy=1 admits and the healthy invariant rejects.
+    // Negative control: the style-only gate (`Buggy=1`) arms the state the healthy invariant
+    // rejects.
     let mut buggy = cursor_cat_model();
     for cst in &mut buggy.consts {
         if cst.0 == "Buggy" {
@@ -269,11 +268,9 @@ fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
     );
 }
 
-/// An app whose session sink writes to a pipe this test owns. The private
-/// fd matters: the ordering FIFO is a process-global registry keyed by the
-/// PTY master, and every plain `headless_for_test` shares master `-1`, so
-/// pinning that key would steer concurrent tests' keystrokes onto the
-/// deferred writer. `pub(super)` so the tab-menu modules can reuse it.
+/// An app whose session sink writes to a test-owned pipe. The private fd matters: the ordering
+/// FIFO is a process-global registry keyed by PTY master, and every plain `headless_for_test`
+/// shares master `-1`, so pinning that key would divert concurrent tests' keystrokes.
 #[cfg(unix)]
 pub(super) fn app_with_private_pty() -> (
     App,
@@ -557,10 +554,9 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
         app.on_ime_commit(wid, "é".to_string());
     });
 
-    // This is the exact candidate-only preflight used at the top of
-    // `dispatch_menu_action`; even an inert Copy with no selection reaches
-    // it before rename/native/menu routing can return, and a Paste, which
-    // keeps the glow's hand on its row, still closes the licence.
+    // The candidate-only preflight at the top of `dispatch_menu_action`: even an inert Copy
+    // reaches it before any early return, and a Paste (which keeps the glow's hand on its row)
+    // still closes the licence.
     for action in [
         crate::menu::MenuAction::Copy,
         crate::menu::MenuAction::Paste,
@@ -585,27 +581,12 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
     });
 }
 
-/// THE WITNESS CLOCK STARTS AT THE WIRE, NOT AT THE EVENT LOOP.
-///
-/// The once-per-word rule (owner, 2026-08-09) lets a genuine RETYPE replay
-/// its cat by demanding a committed edit keystroke within the engine's
-/// short echo budget. That budget is spent waiting for the key's own echo,
-/// so it has to start when the key reaches the TERMINAL — and a key
-/// submitted while a paste drains does not go straight there. It is
-/// enqueued on the per-session ordering FIFO (the submission-order fix) and
-/// written later on the egress thread, so a witness stamped at event-loop
-/// arrival burns its whole budget in the queue and is already EXPIRED when
-/// the echo finally lands. The user retypes `kitty`, the engine sees the
-/// word reappear with no live witness, and refuses to replay it: a false
-/// negative inside the mechanism built to stop false positives.
-///
-/// The pre-existing wiring test only ever drove the INLINE path, so it
-/// could not see this. This one drives the ORDERED branch of
-/// `ordered_or_inline` through the real `App::input`, and pins BOTH
-/// directions: the queued key still authorizes its own echo well past the
-/// bare budget, while the scope tests it is supposed to enforce are
-/// untouched — a key that went to ANOTHER pane still authorizes nothing
-/// here, and the extended witness is still finite.
+/// The typing witness's clock starts when the key reaches the terminal, not at event-loop
+/// arrival. A key submitted while a paste drains waits on the per-session ordering FIFO; stamped
+/// at arrival, its witness would expire before the echo lands and a genuine retype would not
+/// replay its cat. Drives the ordered branch of `ordered_or_inline` through `App::input`: the
+/// queued key witnesses its echo past the bare budget, the grace is finite, and a key bound to
+/// another pane witnesses nothing.
 #[cfg(unix)]
 #[test]
 fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
@@ -721,11 +702,9 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
 /// alternate screen), a kill chord (^W, its retreat licensed by the nav
 /// stamp `note_kill` arms) and a Tab's gesture.
 ///
-/// The cases also run under `comet`, where the engine that lights is
-/// `cursor_trail`, reading its Return, nav and gesture re-stamps beside the
-/// glow (under `rainbow kitty` the trail's tick is disabled and clears its
-/// hints every frame, so only the glow is read there; Newline, Erase and
-/// Kill have no trail twin).
+/// Under `comet` the trail's Return, nav and gesture re-stamps are read too; under
+/// `rainbow kitty` the trail's tick is disabled and clears its hints every frame, so only the
+/// glow is read.
 #[cfg(unix)]
 #[test]
 fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
@@ -869,14 +848,10 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
     }
 }
 
-/// A Tab's dispatch arm claims no hop refused before the key. A bare Tab /
-/// ⌃V is armed as a delivered insert at dispatch (its write is inline), and
-/// the engine's late-receipt claim reaches back up to 0.25 s, which would
-/// light a refused prompt print or spinner tick as `insert` and spend the
-/// licence before the real completion. That backward window is for a
-/// spill-held receipt; at a synchronous dispatch nothing is on the wire
-/// yet. The dispatch arms without the retro claim (`note_insert_armed`); a
-/// delivery receipt (`note_insert_delivered`) still claims.
+/// A Tab's dispatch arm claims no hop refused before the key. A bare Tab / ⌃V is written inline
+/// and armed at dispatch (`note_insert_armed`) without the late-receipt claim, whose backward
+/// window (`INSERT_RETRO_FRESH`) is for a spill-held receipt and would light a refused prompt
+/// print as `insert`. A delivery receipt (`note_insert_delivered_from`) still claims.
 #[cfg(unix)]
 #[test]
 fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
@@ -959,13 +934,10 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
     }
 }
 
-/// A key release queued behind a draining paste carries no ticket. Under
-/// Kitty flags 2|8 (REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESC, as in
-/// crossterm / yazi / helix-class TUIs) a release (`CSI n;1:3 u`) is
-/// written like a press, but it banked nothing at dispatch, so there is
-/// nothing for the writer's completed write to re-stamp (otherwise a
-/// key-up would re-stamp as a typed press or arm a second insert licence).
-/// Only releases go out here; the wire bytes prove the encode is untouched.
+/// A key release queued behind a draining paste carries no ticket. Under Kitty flags 2|8
+/// (REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESC) a release (`CSI n;1:3 u`) is written like a
+/// press but banks nothing at dispatch; a ticket would re-stamp the key-up as a typed press or
+/// arm a second insert licence. The wire bytes prove the encode is untouched.
 #[cfg(unix)]
 #[test]
 fn a_queued_key_release_publishes_no_receipt() {
@@ -1086,15 +1058,12 @@ fn a_queued_ticket_carries_its_dispatch_instant() {
     }
 }
 
-/// The prelude hands the queued Tab's dispatch instant to the engine: the
-/// seam between [`a_queued_ticket_carries_its_dispatch_instant`] and
-/// `a_late_receipt_claims_no_hop_refused_before_its_dispatch`, i.e.
-/// `cursor_frame`'s prelude choosing `note_insert_delivered_from` over
-/// `note_insert_delivered`. The real clock orders the shapes: a keyless
-/// same-row +2 is refused and remembered as the pending hop, a sleep, then
-/// the Tab is pressed behind the ordering FIFO so its receipt reaches the
-/// prelude late. `deliver_insert` clears the pending hop unconditionally,
-/// so what is pinned is the claim (nothing spawned, nothing lit).
+/// The prelude hands a queued Tab's dispatch instant to the engine
+/// (`note_insert_delivered_from`): the seam between
+/// [`a_queued_ticket_carries_its_dispatch_instant`] and the engine's
+/// `a_late_receipt_claims_no_hop_refused_before_its_dispatch`. A keyless same-row +2 is refused,
+/// then a Tab queued behind the FIFO reaches the prelude late. `deliver_insert` drops the
+/// pending hop either way, so what is pinned is the claim: nothing spawned, nothing lit.
 #[cfg(unix)]
 #[test]
 fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
@@ -1291,16 +1260,14 @@ fn a_press_the_tty_will_not_echo_banks_no_credit() {
     }
 }
 
-/// A password prompt clicks one tone and rings no ting. Real pty pairs, as
-/// `a_press_the_tty_will_not_echo_banks_no_credit` drives them, and the
-/// audio host's capture tap: `a`, `A` (Shift), `1`, `.`, a space and a bare
-/// Shift are pressed into each (owner, 2026-09-27).
+/// A password prompt clicks one tone and rings no ting. Real pty pairs and the audio host's
+/// capture tap; `a`, `A` (Shift), `1`, `.`, a space and a bare Shift go into each:
 ///
-/// - Canonical no-echo (`read -s`, `sudo`, an `ssh` passphrase): every
-///   glyph key clicks with the same stamp: `Typed` (the space too),
-///   unshifted, class `SECRET`, rank 0; the bare Shift cues nothing.
-/// - Cooked (positive control): the same presses carry their own class,
-///   rank, shift and the space's comma, and the Shift lifts.
+/// - Canonical no-echo (`read -s`, `sudo`, an `ssh` passphrase): every glyph key clicks with one
+///   stamp (`Typed`, the space too; unshifted, class `SECRET`, rank 0); the bare Shift cues
+///   nothing.
+/// - Cooked (positive control): each press carries its own class, rank, shift and the space's
+///   comma, and the Shift lifts.
 #[cfg(unix)]
 #[test]
 fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
@@ -1524,13 +1491,10 @@ fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
     close_pty(app, sink, master, slave);
 }
 
-/// A Backspace erasing a zero-width glyph gives back a priced nothing. A
-/// committed run is remembered per grapheme, and a cluster can be zero
-/// wide: `\u{0301}日本` (a base-less combining mark before two CJK glyphs)
-/// prices 0, 2, 2 and banks one press of four cells. A priced zero retires
-/// nothing, distinct from "nothing remembered": `x` then the run (5) ⌫ → 3
-/// ⌫ → 1 ⌫ → 1, and only the fourth Backspace (memory empty, erase
-/// unpriced) takes `x`. Real cooked pty, so the writes land.
+/// A Backspace erasing a zero-width glyph gives back a priced nothing. `\u{0301}日本` (a
+/// base-less combining mark, then two CJK glyphs) prices 0, 2, 2 and banks one press of four
+/// cells. A priced zero retires nothing, unlike "nothing remembered": `x` then the run (5)
+/// ⌫ → 3 ⌫ → 1 ⌫ → 1, and only the fourth Backspace (memory empty, unpriced) takes `x`.
 #[cfg(unix)]
 #[test]
 fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
@@ -1747,11 +1711,9 @@ fn a_bare_tab_the_tty_will_not_echo_arms_no_insert() {
     }
 }
 
-/// Typing `kitty` never wakes an animal on the input path. The word echoes
-/// onto the grid and the screen scanner answers it with the ambient
-/// word-cat, centred on the word. This path only logs exactly one episode
-/// as the type it visually is (`head_peek`, ordinary magic); the consumed
-/// completion's tail adds nothing (owner, 2026-08-12).
+/// Typing `kitty` never wakes an animal on the input path: the screen scanner answers the echoed
+/// word with the ambient word-cat, centred on it. This path logs exactly one episode as what it
+/// visually is (`head_peek`, ordinary magic); the consumed completion's tail adds nothing.
 #[test]
 fn typing_kitty_logs_one_episode_and_wakes_no_companion() {
     let mut app = App::headless_for_test();
@@ -1972,8 +1934,7 @@ fn a_typed_summon_records_the_verdicts_look() {
         "…in the launch coat"
     );
 
-    // Pin a DIFFERENT cat: the verdict moves to the pin, and so does what
-    // the next summon logs.
+    // Pin a different cat: the verdict moves to the pin, and so does what the next summon logs.
     let pinned = KittyLook {
         variant: aterm_effects::cat_glyphs_gen::CatGlyphId::S101,
         coat: (launch.coat + 3) % 16,

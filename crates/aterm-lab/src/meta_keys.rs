@@ -444,7 +444,7 @@ enum Outcome {
 /// How long ago a person last touched a keyboard, mouse or trackpad: the
 /// kernel's `HIDIdleTime` (nanoseconds), read with `ioreg`, so nothing here
 /// reaches WindowServer. `None` when it cannot be read.
-fn hid_idle() -> Option<Duration> {
+pub(crate) fn hid_idle() -> Option<Duration> {
     let o = aterm_uds::spawnfd::command("/usr/sbin/ioreg")
         .args(["-c", "IOHIDSystem", "-r", "-d", "1", "-k", "HIDIdleTime"])
         .output()
@@ -461,7 +461,7 @@ fn hid_idle() -> Option<Duration> {
 /// # Errors
 /// `Ok(Err(why))`: the desk was never idle in [`IDLE_WAIT`], or the idle clock is
 /// unreadable.
-fn await_idle() -> Result<Result<(), String>, Stopped> {
+pub(crate) fn await_idle() -> Result<Result<(), String>, Stopped> {
     let asked = Instant::now();
     loop {
         match hid_idle() {

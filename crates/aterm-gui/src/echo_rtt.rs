@@ -1,17 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ECHO ROUND-TRIP — "how long does the PROGRAM take to answer my keystroke?"
-//! (responsiveness audit item 5, tier i).
-//!
-//! WHY THIS EXISTS. Every latency instrument aterm shipped measures aterm:
-//! `key_write` is key → bytes on the PTY (our input path), `input_present` is
-//! key → present returned (our whole pipeline). None of them can tell the owner
-//! whether a session that *feels* laggy is aterm being slow or the TUI on the
-//! far side of the PTY being slow — which is the actual question on a loaded
-//! machine, where a busy Claude/vim/tmux can take tens of milliseconds to echo
-//! a character that aterm then paints in one frame. This module measures the
-//! slice in between, and it belongs to the CHILD, not to us:
+//! Echo round trip: how long the program on the far side of the PTY takes to answer a
+//! keystroke. The other latency metrics measure aterm itself:
 //!
 //! ```text
 //!   key_write     (metrics)   key → bytes handed to the PTY      aterm input path
@@ -19,71 +10,34 @@
 //!   input_present (metrics)   key → present returned             aterm, end to end
 //! ```
 //!
-//! Read together, a sick number names its own culprit: `echo_rtt` high with
-//! `input_present` low means the program is behind; the reverse means we are.
+//! `echo_rtt` high with `input_present` low means the program is behind; the reverse means
+//! aterm is. Its bounds, stated per the observer rule in `docs/RELEASE-PROOF-DISCIPLINE.md`:
 //!
-//! HONESTY BOUNDS — stated up front because a latency instrument that hides its
-//! own contamination is worse than no instrument at all (the observer rule in
-//! `docs/RELEASE-PROOF-DISCIPLINE.md`):
+//! * A lower bound on the felt echo: the clock stops when the PTY reader has the bytes. The
+//!   parse → present tail is `present_latency`'s, and echo → present reads as `input_present`
+//!   minus `echo_rtt` (a content-matched echo tail would be biased by no-echo prompts and TUI
+//!   redraws).
+//! * Armed only by a real write: the probe brackets input dispatch and arms only when the
+//!   target sink's input epoch advanced. A UI shortcut, a bare modifier or a swallowed key
+//!   never arms; ungated, a `cat` flood would answer every keypress within microseconds.
+//! * Keep-oldest within a burst, like `INPUT_STAMP_NS`: a second key while one is outstanding
+//!   does not re-arm but counts in `echo_coalesced`, so the bias is published.
+//! * Not causal: the first output after the write may be a spinner or a build log, closing the
+//!   clock early. The arm, coalesced and expired counts show the evidence's shape.
+//! * A key queued behind a paste on the ordered-egress writer is written after the UI thread's
+//!   bracket closed: the enqueue marks the dispatch deferred ([`note_deferred_write`]) so the
+//!   bracket arms nothing, and the writer arms ([`arm_deferred`]) once the receipt shows the
+//!   bytes accepted, for visible presses only (a swallowed password key would only expire).
+//! * Never armed: a paste (its "echo" is its own redraw) and a cross-session (`@other`)
+//!   control verb, which writes from the control thread with no App seam. Both are missing
+//!   samples, never wrong ones. A flagless `key`/`send` at the front tab arms, via
+//!   `Wake::Input`.
+//! * Windowed: percentiles are exact order statistics over the last [`WINDOW`] samples
+//!   (`n_echo`), so a long healthy stretch cannot bury a bad one; `echo_total` is all-time.
 //!
-//!   * LOWER BOUND ON THE FELT ECHO. The clock stops when the PTY reader has
-//!     the bytes, not when the glyph is on glass. The remaining parse → compose
-//!     → present tail is `present_latency`'s slice, deliberately not folded in
-//!     here: mixing them back together is exactly what made "is it us or them?"
-//!     unanswerable. The echo → present remainder is read as `input_present`
-//!     minus `echo_rtt` — see the TIER (ii) note below for why it has no
-//!     instrument of its own.
-//!   * IT ARMS ONLY ON A REAL WRITE. The probe brackets input dispatch and arms
-//!     only when the target session's sink INPUT EPOCH advanced, i.e. bytes
-//!     actually entered that PTY. A UI shortcut, a bare modifier, a key an
-//!     overlay swallowed — none of them arm. Without that gate a `cat` flood
-//!     would satisfy every keypress within microseconds and the instrument
-//!     would publish its BEST numbers in precisely the window where the
-//!     terminal is at its WORST, which is the failure mode this audit exists to
-//!     stop repeating.
-//!   * KEEP-OLDEST WITHIN A BURST, like `INPUT_STAMP_NS`. While one write is
-//!     outstanding a second keystroke does not re-arm (it increments
-//!     `echo_coalesced` instead), so a fast typist's burst is measured from the
-//!     key that is actually still waiting rather than from the newest one. That
-//!     is conservative-HIGH per burst, and the count of suppressed arms is
-//!     published so the bias is visible rather than hidden.
-//!   * NO CAUSAL PROOF, BY CONSTRUCTION. "The first output after our bytes" is
-//!     not provably the ANSWER to our bytes: a program printing on its own
-//!     (a spinner, a build log) can close the clock early. This is a round-trip
-//!     LOWER bound, not a causal one; the sample count, the coalesced count and
-//!     the expired count are all published so a reader can see the shape of the
-//!     evidence. A causally-proven variant would need a content proof, which
-//!     is retired (TIER (ii) note below).
-//!   * A KEY THAT WAITED BEHIND A PASTE ARMS AT ITS OWN WRITE. A key queued on
-//!     the per-session ordered-egress writer is written on THAT thread, after the
-//!     UI thread's bracket has closed, so the bracket cannot see it — and must
-//!     not guess: the enqueue marks the dispatch deferred
-//!     ([`note_deferred_write`]) and the bracket arms nothing for it. The writer
-//!     arms instead ([`arm_deferred`]) once the key's receipt carries an accepted
-//!     order — the same "bytes really entered this PTY" gate, proven by the sink
-//!     rather than inferred from an epoch — for visible presses only, so a key
-//!     the tty swallows (a password prompt) never arms a clock that could only
-//!     expire. Before 2026-09-25 such a key was simply never measured, in exactly
-//!     the case the user feels as the worst (typing while a paste drains).
-//!   * WHAT IT DOES NOT SEE, SAID PLAINLY. Two writes do not arm it, by
-//!     construction rather than by oversight: a PASTE (its "echo" is the paste's
-//!     own redraw, not a round trip), and a CROSS-session (`@other`) control verb,
-//!     which writes straight from the control thread with no App seam to bracket.
-//!     Both are absences (no sample), never wrong samples — the instrument
-//!     under-counts rather than lying. A flagless `key`/`send` at the front tab
-//!     DOES arm: it posts `Wake::Input` through the App seam, which is what makes
-//!     this metric drivable by a proof harness instead of readable only by a
-//!     human at the glass.
-//!   * WINDOWED, AND SAID SO. The percentiles are exact order statistics over
-//!     the last [`WINDOW`] samples (published as `n_echo`), not the all-time
-//!     distribution: what the owner asks is "how does it feel NOW", and an
-//!     all-time histogram lets an hour of healthy typing bury the ten minutes
-//!     that hurt. `echo_total` carries the all-time sample count.
-//!
-//! COST. One relaxed load per output burst when nothing is armed (the flood
-//! case), one CAS per armed keystroke, and a `try_lock`ed 4 KiB ring push per
-//! recorded sample — at most one per keystroke. The PTY reader never blocks:
-//! a contended window is dropped and counted (`echo_dropped_locked`).
+//! Cost: one relaxed load per output burst when nothing is armed, one CAS per armed keystroke,
+//! and a `try_lock`ed ring push per sample. The PTY reader never blocks: a contended push is
+//! dropped and counted (`echo_dropped_locked`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,40 +50,19 @@ use crate::WindowId;
 /// stretch cannot be diluted by an old good one.
 pub const WINDOW: usize = 1024;
 
-/// How long an unanswered write keeps the single arm slot. Past this the write
-/// is retired as EXPIRED (never as a sample) so the NEXT keystroke can be
-/// measured — an unanswered write must not blind the instrument forever.
-/// Deliberately long: a slow answer is the very thing we are hunting, so the
-/// slot is only released once "the program is not answering at all" is the
-/// better explanation.
+/// How long an unanswered write holds the single arm slot; past it the write is retired as
+/// expired (never a sample) so the next keystroke can be measured. Long on purpose: a slow
+/// answer is what this measures.
 const ARM_TTL_US: u64 = 2_000_000;
 
-// TIER (ii) — key-arrival → typed-echo-present — is RETIRED, not owed.
-// Decided 2026-09-25 under the owner's standing direction: the existing
-// instruments already bracket that slice (`input_present` is key → next
-// content present, the aterm-owned end to end; this module is the child's
-// share), so the remainder reads as `input_present` minus `echo_rtt`. Its
-// planned data source, the cursor-glow content proof, is gone
-// (docs/design/EFFECTS-LICENSE-REDESIGN.md), and a content-matched echo tail
-// is tail-biased by no-echo prompts and TUI redraws, which is why the perf-gym
-// review (the since-deleted PERF_GYM_DESIGN.md) kept it unpublishable.
-
-// ---------------------------------------------------------------------------
-// The single arm slot.
-//
-// ONE `AtomicU64` holds both halves — `(session_tag << 48) | micros` — so the
-// pair can never be observed torn. Two atomics would let the PTY reader read a
-// session id from one keystroke and a stamp from another and publish the
-// difference as a latency, which is the class of quiet lie this whole audit is
-// about. 48 bits of microseconds is 8.9 years of uptime on the shared
-// `metrics::now_us` clock; the low 16 bits of the session id are enough to tell
-// live sessions apart (a collision needs 65 536 spawns and costs one
-// mislabelled sample, never a torn one).
+// The single arm slot: one `AtomicU64` holds `(session_tag << 48) | micros`, so the pair is
+// never observed torn. 48 bits of microseconds is 8.9 years on `metrics::now_us`; the low 16
+// bits of the session id tell live sessions apart (a collision costs one mislabelled sample).
 const US_MASK: u64 = (1 << 48) - 1;
 
 static ARMED: AtomicU64 = AtomicU64::new(0);
-/// Writes that took the slot (the denominator: `arms == samples + expired + at
-/// most one outstanding`).
+/// Writes that took the slot (the denominator: `arms == samples + expired`, plus at most one
+/// outstanding).
 static ARMS: AtomicU64 = AtomicU64::new(0);
 /// Writes that found the slot busy — the size of the keep-oldest bias.
 static COALESCED: AtomicU64 = AtomicU64::new(0);
@@ -139,8 +72,7 @@ static EXPIRED: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static LAST_US: AtomicU64 = AtomicU64::new(0);
 static MAX_US: AtomicU64 = AtomicU64::new(0);
-/// Samples whose ring push lost `try_lock` — the reader thread declines to
-/// block on the metrics reader, and says so rather than pretending.
+/// Samples whose ring push lost `try_lock`: the PTY reader never blocks on the metrics reader.
 static DROPPED_LOCKED: AtomicU64 = AtomicU64::new(0);
 
 /// The trailing sample window, in microseconds. Written at most once per
@@ -217,7 +149,6 @@ const fn pack(session: u64, now_us: u64) -> u64 {
     ((session & 0xFFFF) << 48) | (now_us & US_MASK)
 }
 
-// ---------------------------------------------------------------------------
 // The state machine. The `_at` forms take the clock so the tests can drive it.
 
 /// A keystroke's bytes just entered `session`'s PTY: start the clock, unless an
@@ -229,9 +160,8 @@ fn arm_at(session: u64, now_us: u64) {
             COALESCED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // Stale: that write was never answered. Retire it as EXPIRED — never as
-        // a sample — and take the slot. Losing this CAS means somebody else
-        // already moved the slot on; treat it as an ordinary busy slot.
+        // Stale: retire the unanswered write as expired, never as a sample, and take the
+        // slot. A lost CAS means someone else moved the slot on: an ordinary busy slot.
         if ARMED
             .compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
@@ -264,18 +194,15 @@ fn close_at(session: u64, now_us: u64) -> Option<u64> {
     if cur == 0 || cur >> 48 != (session & 0xFFFF) {
         return None;
     }
-    // Win the slot before reading the stamp out of it: the stamp lives in the
-    // same word, so a successful CAS is proof this thread owns that sample.
+    // Win the slot before using the stamp: the CAS proves this thread owns that sample.
     if ARMED
         .compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Relaxed)
         .is_err()
     {
         return None;
     }
-    // Recorded WHATEVER the duration is, including one past `ARM_TTL_US` that
-    // no later keystroke happened to displace. Truncating the tail is the exact
-    // dishonesty (contaminated distributions, healthy medians over sick tails)
-    // this audit round is repairing.
+    // Recorded whatever the duration, even past `ARM_TTL_US`: truncating would hide a sick
+    // tail under a healthy median.
     let d = now_us.saturating_sub(cur & US_MASK);
     TOTAL.fetch_add(1, Ordering::Relaxed);
     LAST_US.store(d, Ordering::Relaxed);
@@ -289,12 +216,9 @@ fn close_at(session: u64, now_us: u64) -> Option<u64> {
     Some(d)
 }
 
-/// One output burst arrived from `session` — call this on the LEADING edge of
-/// the burst, before any parse work, so the number stays the child's round trip
-/// and never absorbs aterm's own ingest backlog.
-///
-/// Hot path: a single relaxed load when no keystroke is outstanding, which is
-/// every burst of a flood.
+/// One output burst arrived from `session`. Call it on the burst's leading edge, before any
+/// parse, so the number never absorbs aterm's own ingest backlog. With nothing armed (every
+/// burst of a flood) it is one relaxed load.
 pub(crate) fn note_output_burst(session: u64) {
     if ARMED.load(Ordering::Relaxed) == 0 {
         return;
@@ -302,9 +226,8 @@ pub(crate) fn note_output_burst(session: u64) {
     let _ = close_at(session, crate::metrics::now_us());
 }
 
-/// A key queued behind a paste has just been ACCEPTED by `session`'s `sink`
-/// on the ordered-egress writer thread: start the clock there (see the module
-/// note). Keep-oldest like every arm.
+/// A key queued behind a paste was just accepted by `session`'s `sink` on the ordered-egress
+/// writer thread: start the clock there (keep-oldest, like every arm).
 pub(crate) fn arm_deferred(session: u64, sink: &aterm_session::sink::SinkWriter) {
     #[cfg(test)]
     if DEFERRED_ARM_SINK.load(Ordering::Acquire) != std::ptr::from_ref(sink).addr() {
@@ -336,18 +259,15 @@ pub(crate) fn deferred_arms_for_test(sink: &aterm_session::sink::SinkWriter) -> 
 }
 
 thread_local! {
-    /// This thread's current input dispatch handed a write to the ordered
-    /// egress writer. Set by the enqueue ([`note_deferred_write`]), cleared by
-    /// [`crate::App::echo_probe_open`], read by the close — all on the UI
-    /// thread, so no dispatch can see another's mark.
+    /// This thread's current input dispatch handed a write to the ordered egress writer. Set
+    /// by [`note_deferred_write`], cleared by [`crate::App::echo_probe_open`], read by the
+    /// close, all on the UI thread.
     static DEFERRED_IN_BRACKET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The dispatch in progress on this thread queued a write for the ordered
-/// egress writer: the bracket must not arm for it (the writer arms at the
-/// write, [`arm_deferred`]). An epoch that moved during such a bracket moved
-/// for THAT thread's writes — the queued key's, or an older job's — and
-/// arming on it would start the clock for bytes this dispatch did not write.
+/// The dispatch in progress on this thread queued a write for the ordered egress writer, so
+/// the bracket must not arm for it (the writer arms at the write, [`arm_deferred`]): an epoch
+/// that moved during such a bracket moved for the writer thread's writes, not this dispatch's.
 pub(crate) fn note_deferred_write() {
     DEFERRED_IN_BRACKET.with(|deferred| deferred.set(true));
 }
@@ -442,22 +362,19 @@ pub(crate) fn emit_metrics(s: &mut dyn crate::metrics::wire::FieldSink) {
     s.count("echo_dropped_locked", w.dropped_locked);
 }
 
-// ---------------------------------------------------------------------------
-// The write probe: the only thing that arms the clock.
+// The write probe: the UI thread's arm.
 
-/// An open bracket around one input dispatch: the session the input is routed
-/// to and its sink's input epoch BEFORE dispatch. Closing the bracket arms the
-/// echo clock iff that epoch moved, i.e. iff bytes really entered the PTY.
+/// An open bracket around one input dispatch: the target session and its sink's input epoch
+/// before dispatch. Closing it arms the echo clock iff that epoch moved.
 pub(crate) struct EchoWriteProbe {
     session: u64,
     epoch: aterm_session::sink::InputEpoch,
 }
 
 impl crate::App {
-    /// Open the echo bracket for input about to be routed to `session` (or, for
-    /// `None`, to `wid`'s focused pane — the hardware-keyboard case). `None` if
-    /// there is no terminal session to write to (native focus, dead pane), in
-    /// which case closing is a no-op.
+    /// Open the echo bracket for input about to be routed to `session` (`None`: `wid`'s focused
+    /// pane, the hardware-keyboard case). `None` when there is no terminal session to write to;
+    /// closing that is a no-op.
     pub(crate) fn echo_probe_open(
         &self,
         wid: WindowId,
@@ -469,11 +386,9 @@ impl crate::App {
         Some(EchoWriteProbe { session, epoch })
     }
 
-    /// Close the bracket. Arms the echo clock only if the sink's input epoch
-    /// advanced — see the module note on why an ungated arm would make this
-    /// instrument flatter itself exactly when the terminal is worst — and only
-    /// if the dispatch wrote INLINE: a dispatch that queued its write on the
-    /// ordered egress writer leaves the arm to that writer ([`arm_deferred`]).
+    /// Close the bracket: arm the clock only if the sink's input epoch advanced and the dispatch
+    /// wrote inline; a write queued on the ordered egress writer is armed there
+    /// ([`arm_deferred`]).
     pub(crate) fn echo_probe_close(&self, probe: Option<EchoWriteProbe>) {
         let deferred = DEFERRED_IN_BRACKET.with(|deferred| deferred.replace(false));
         let Some(probe) = probe else { return };
@@ -486,8 +401,8 @@ impl crate::App {
     }
 }
 
-/// The statics are process-global, so every test that reads them takes turns
-/// — this module's own and the ordered writer's (`app_input`).
+/// The statics are process-global: every test that reads them takes turns (this module's and
+/// the ordered writer's in `app_input`).
 #[cfg(test)]
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -520,9 +435,8 @@ mod tests {
         assert_eq!(s.expired, 0, "an answered write is not an expiry");
     }
 
-    /// A DIFFERENT session's output must not close our clock — that mislabel is
-    /// how a background flood would "answer" a keystroke typed into a quiet
-    /// pane and publish a microsecond echo.
+    /// Another session's output cannot close the clock, or a background flood would answer a
+    /// keystroke typed into a quiet pane.
     #[test]
     fn another_sessions_output_cannot_close_the_clock() {
         let _g = fresh();
@@ -536,8 +450,7 @@ mod tests {
         );
     }
 
-    /// Nothing armed ⇒ output records nothing at all. This is the property that
-    /// keeps a pure `cat`/`yes` flood out of the distribution.
+    /// With nothing armed, output records nothing: a pure `cat`/`yes` flood stays out.
     #[test]
     fn output_with_no_outstanding_write_records_nothing() {
         let _g = fresh();
@@ -548,9 +461,7 @@ mod tests {
         assert_eq!(snapshot().total, 0);
     }
 
-    /// Keep-oldest: while a write is outstanding a second keystroke does not
-    /// re-arm, so the burst is measured from the key still waiting — and the
-    /// suppressed arm is COUNTED, not hidden.
+    /// Keep-oldest: a second key while one is outstanding does not re-arm, and is counted.
     #[test]
     fn a_second_key_coalesces_and_the_bias_is_published() {
         let _g = fresh();
@@ -566,9 +477,8 @@ mod tests {
         assert_eq!((s.arms, s.coalesced), (1, 2));
     }
 
-    /// An unanswered write must not blind the instrument forever: past the TTL
-    /// the next keystroke takes the slot and the dead one is booked as EXPIRED,
-    /// never as a sample.
+    /// Past the TTL the next keystroke takes the slot and the unanswered write is booked as
+    /// expired, never as a sample.
     #[test]
     fn an_unanswered_write_expires_and_frees_the_slot() {
         let _g = fresh();
@@ -583,9 +493,7 @@ mod tests {
         );
     }
 
-    /// A slow echo is recorded at its true length. Truncating the tail would
-    /// reproduce the very defect (healthy median over a sick tail) this audit
-    /// round exists to repair.
+    /// A slow echo is recorded at its true length, not truncated.
     #[test]
     fn a_very_slow_echo_is_recorded_not_truncated() {
         let _g = fresh();

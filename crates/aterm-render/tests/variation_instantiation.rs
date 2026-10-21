@@ -2,27 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 conformance for variable-font instantiation (W9): the SHIPPING
+//! Tier-1 conformance for variable-font instantiation: the shipping
 //! `aterm_render::variation` policies are total, clamped, and consistently
-//! applied — and the system SF Mono actually rescues to Regular.
+//! applied — and the system SF Mono rescues to Regular.
 //!
-//! The sin: macOS ships SF Mono as `SFNSMono.ttf`, a variable font whose
-//! `fvar` DEFAULT instance is "SF NS Mono Light" (`wght` ≈ 294.67). Loaded at
-//! its default instance it reads faint, which is why the candidate order
-//! once demoted it below Menlo (with this fix proven, SF Mono now leads the
-//! candidates). W9 instantiates the face at load — `Regular`
-//! named instance, else `wght=400` clamped — and routes the ONE resolved
-//! coordinate list to the CoreText descriptor, the run shaper and the
-//! metrics derivation.
-//!
-//! ## Proof
-//!
-//! * **Concrete (this file)** — the axis-bounds and nudge-precondition
-//!   invariants checked on the real policy functions over exhaustive lattices,
-//!   with NaN/±∞ totality and float boundary behaviour, against the pre-fix
-//!   behaviours (no clamping / an ungated nudge), plus the SF Mono acceptance
-//!   binding and the coord single-source consistency binding on a live
-//!   `Renderer`.
+//! macOS ships SF Mono as `SFNSMono.ttf`, a variable font whose `fvar` default
+//! instance is "SF NS Mono Light" (`wght` ≈ 294.67). The renderer instantiates
+//! the face at load — `Regular` named instance, else `wght=400` clamped — and
+//! routes the one resolved coordinate list to the CoreText descriptor, the run
+//! shaper, and the metrics derivation.
 
 use aterm_render::variation::{self, VfAxis, WGHT_TAG, clamp_axis};
 
@@ -52,9 +40,9 @@ const REQUESTS: &[f32] = &[
     1e30,
 ];
 
-/// PROVE (1) — named-instance/axis resolution is TOTAL: for every axis on
+/// Named-instance/axis resolution is total: for every axis on
 /// the bounds lattice (min <= def <= max, aterm-font's normalization) and
-/// EVERY request including NaN/±∞, `clamp_axis` yields a finite value inside
+/// every request including NaN/±∞, `clamp_axis` yields a finite value inside
 /// `[min, max]`, exactly the request whenever the request is already
 /// in-bounds. Exhaustive over the lattice.
 #[test]
@@ -104,7 +92,7 @@ fn clamp_axis_total_and_exact() {
     assert!(clamped_low > 0 && clamped_high > 0, "vacuous lattice");
 }
 
-/// PROVE (1), degenerate-axis totality: a hand-built axis with non-finite
+/// Degenerate-axis totality: a hand-built axis with non-finite
 /// bounds (unreachable from aterm-font, reachable for a caller constructing
 /// `VfAxis` directly) still never panics and never returns NaN.
 #[test]
@@ -249,12 +237,10 @@ fn parse_variation_spec_grammar() {
     }
 }
 
-/// PROVE (3) — the dark-nudge SAFETY GATE: permitted iff BOTH advances are
-/// finite AND they agree within 0.25px. Exhaustive over an advance lattice
+/// The dark-nudge safety gate: permitted iff both advances are
+/// finite and agree within 0.25px. Exhaustive over an advance lattice
 /// spanning the tolerance boundary, plus the non-finite failed-measurement
-/// cases. The pre-fix behaviour (an unconditional nudge) is the negative
-/// control: it would "apply" on the >0.25px rows this test proves are
-/// rejected.
+/// cases.
 #[test]
 fn dark_nudge_gate_is_a_checked_precondition() {
     let advs = [
@@ -302,13 +288,13 @@ fn variable_face() -> Vec<u8> {
     include_bytes!("../assets/game/Cinzel-var.ttf").to_vec()
 }
 
-/// PROVE (2) — COORD CONSISTENCY, bound on a live `Renderer` over the real
+/// Coord consistency, bound on a live `Renderer` over the real
 /// SF Mono: the renderer's single `variation_coords()` list (the one source
 /// the CT descriptor and the shaper receive) is exactly the pure resolution
-/// of the probe, and the CELL WIDTH equals the aterm-font advance measured
-/// at those SAME coords — i.e. metrics derivation consumed the identical
+/// of the probe, and the cell width equals the aterm-font advance measured
+/// at those same coords — i.e. metrics derivation consumed the identical
 /// list, not the default instance (which would desync the grid). Also pins
-/// the real-bold instance (wght 700 clamped) for PROVE-adjacent (c).
+/// the real-bold instance (wght 700 clamped).
 #[cfg(target_os = "macos")]
 #[test]
 fn renderer_binds_one_coord_list_everywhere() {
@@ -405,11 +391,11 @@ fn dark_nudge_applies_gated_and_geometry_stable() {
     assert!((r.variation_coords().unwrap()[wi].1 - base_w).abs() < 1e-3);
 }
 
-/// The instantiation reaches the actual CoreText RASTER (macOS): at the same
-/// px, the W9-resolved Regular instance of SF Mono carries measurably MORE
+/// The instantiation reaches the actual CoreText raster (macOS): at the same
+/// px, the resolved Regular instance of SF Mono carries measurably more
 /// ink than the fvar-default Light instance (pinned by steering the config
 /// request back to the axis default, which collapses `variation_coords` to
-/// `None` — the pre-W9 raster), and the W9 real-bold instance carries more
+/// `None`), and the real-bold instance carries more
 /// ink than Regular (replacing synthetic dilation). This is the end-to-end
 /// proof that `CTFontDescriptorCreateCopyWithVariation` genuinely reshapes
 /// the outlines — not just the metrics book-keeping.
@@ -440,7 +426,7 @@ fn sf_mono_ct_raster_ink_tracks_the_instance() {
     let ink_bold = ink(&mut r, aterm_render::StyleBits::BOLD);
 
     // Steer the request to the axis default (Light): coords == defaults ⇒
-    // `None` ⇒ the pre-W9 default-instance raster.
+    // `None` ⇒ the default-instance raster.
     let probe = variation::probe(&bytes, 0).expect("variable");
     let light: Vec<(u32, f32)> = probe.axes.iter().map(|a| (a.tag, a.def)).collect();
     let mut r_light = aterm_render::Renderer::from_bytes(&bytes, px, theme).expect("renderer");
@@ -495,13 +481,12 @@ fn config_requests_apply_and_nonvariable_stays_default() {
     assert!(!r.set_font_variations(&[(WGHT_TAG, 510.0)], 0.0));
 }
 
-/// W9 perf regression: the resident shaping-variation cache (borrowed by
-/// the per-row-per-frame shaping path, NOT reallocated each row) stays in
+/// The resident shaping-variation cache (borrowed by
+/// the per-row-per-frame shaping path, not reallocated each row) stays in
 /// lock-step with `variation_coords()` across every coord transition —
-/// including the awkward variable→non-variable primary swap where
-/// `refresh_variations` early-outs (`None == None`) and must NOT leave the old
-/// instance's variations lingering. Guards the caching optimisation against a
-/// stale-cache correctness regression.
+/// including the variable→non-variable primary swap where
+/// `refresh_variations` early-outs (`None == None`) and must not leave the old
+/// instance's variations lingering.
 #[test]
 fn shaping_variation_cache_tracks_coords() {
     // Non-variable primary: coords None ⇒ cache empty.
@@ -573,24 +558,19 @@ fn dilate(cov: &[u8], w: usize, h: usize, e: usize) -> Vec<u8> {
     out
 }
 
-/// The portable twin of [`sf_mono_ct_raster_ink_tracks_the_instance`]: OFF macOS, a
-/// BOLD cell on a variable primary draws the REAL `wght`≈700 instance through
+/// The portable twin of [`sf_mono_ct_raster_ink_tracks_the_instance`]: off macOS, a
+/// bold cell on a variable primary draws the real `wght`≈700 instance through
 /// [`variation::varied_glyph_raster`], not a synthetic dilation of the regular one.
 ///
-/// This is the regression that shipped. The W9 resolver is platform-independent, so
-/// `vf_bold_coords` was computed correctly on Windows and then thrown away by two
-/// `#[cfg(not(target_os = "macos"))]` stubs — one in `vf_bold_mono_raster` (the
-/// by-CHAR arm), one in the by-GLYPH-ID arm that plain primary text actually takes.
-/// Every SGR-bold cell fell back to `embolden`, a horizontal max-dilation that keeps
-/// the ADVANCE, so at a 7px Windows cell a 1px stem became a 2px stem bleeding into
-/// the neighbouring column — "command" reading as "commmand".
+/// Both the by-char arm (`vf_bold_mono_raster`) and the by-glyph-id arm that plain
+/// primary text takes must use `vf_bold_coords`; falling back to `embolden` (a
+/// horizontal max-dilation that keeps the advance) widens a 1px stem into the
+/// neighbouring column at small cell widths.
 ///
-/// Both arms are checked, because patching only one leaves bold broken for whatever
-/// the other draws. Byte equality against a freshly-instantiated reference raster is
+/// Byte equality against a freshly-instantiated reference raster is
 /// the proof (the stem LUT is the identity at the default `stem_gamma = 1.0`, so the
 /// renderer's coverage is that raster verbatim); the `assert_ne!` against the
-/// dilation then states the negative outright, so a revert fails loudly instead of
-/// merely differing.
+/// dilation then states the negative outright.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn portable_bold_draws_the_real_instance_not_a_dilation() {
@@ -689,13 +669,13 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
     );
 }
 
-/// The `None` case, which the fix must PRESERVE: a face with no usable `wght` axis
+/// A face with no usable `wght` axis
 /// (Consolas, Courier New, the bundled DejaVu — most static fonts) has no bold
 /// instance to draw, so both arms must still fall through to the synthetic
-/// dilation. The contract is "use the real instance WHEN one exists", never "assume
+/// dilation. The contract is "use the real instance when one exists", never "assume
 /// one exists".
 ///
-/// Pinned on the committed DejaVu so it runs on every host, and on BOTH arms, since
+/// Pinned on the committed DejaVu so it runs on every host, and on both arms, since
 /// each has its own `vf_bold_*` early-out to get wrong.
 #[cfg(not(target_os = "macos"))]
 #[test]

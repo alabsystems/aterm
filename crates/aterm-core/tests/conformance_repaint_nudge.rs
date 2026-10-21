@@ -1,37 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind of the `RepaintNudge` model (aterm-spec, `models_resize_render`)
-//! to the REAL machine and a REAL alternate-screen `Terminal`, in process (no
-//! PTY, no window): a fake clock, a fake PTY dimension, and seven scripted
-//! stand-ins for the program - one that answers at once, one that never
-//! answers, one that answers 200 ms late, one that draws ordinary frames before
-//! a late answer, one that repaints with cursor addressing and no full clear,
-//! one whose handler is too busy to read a size for two seconds, and one that
-//! streams frames through its repaints - and the window's own resizes (a flap,
-//! a resize that lasts), a halt landing while the PTY is held, and a terminal
-//! lock busy long enough for the program to answer before the machine looks,
-//! or past the host's hard deadline, which the World plays as the host does.
+//! Tier-1 bind of the `RepaintNudge` model (aterm-spec `models_resize_render`) to the real
+//! machine and a real alternate-screen `Terminal`, in process: a fake clock and PTY size,
+//! scripted program stand-ins (`Standin`), window resizes during the hold, a halt, and a
+//! busy terminal lock, including past the host's hard deadline, which the World plays as
+//! the host does.
 //!
-//! Every act the machine asks for is asserted against the model's ACTUAL guard
-//! (`Model::action_enabled`) in the state projected from the real world just
-//! before it: `Hold` needs phase armed, no halt, a quiet moment; `Release` a
-//! held PTY that was answered, timed out or halted; `Forget` a held PTY someone
-//! else set; `ReleaseByDeadline` a hold past the host's deadline that no step
-//! ended (`RepaintNudge::let_go`); `Finish` both answers; `GiveUp` an
-//! unanswered restore with the engine where the hold found it (the code's
-//! `GaveUp`, or its silent
-//! `Dropped::NothingOwed` when the engine owes nothing); `Supersede` one with
-//! the engine moved. The machine must then be in the phase the model's move
-//! leads to, and the owner hears of the end (`Act::GaveUp`) exactly when the
-//! model's move reports it (`gaveup`, which only `debt` decides). After
-//! every schedule the ENGINE's rows, screen text and render debt are checked:
-//! the nudge never resizes it, and a nudge that got no answer leaves the screen
-//! and the debt byte-identical.
-//!
-//! NEGATIVE CONTROLS: the model's mutants written as deliberately wrong
-//! drivers (a driver that lets go of nothing; one that heals on the first
-//! answer) are REJECTED by the same projection, so a pass is never vacuous.
+//! Every act the machine asks for must be enabled in the model (`Model::action_enabled`)
+//! in the state projected just before it, and leave the machine in the phase the model's
+//! move leads to; the owner hears of the end (`Act::GaveUp`) exactly when the move reports
+//! `gaveup`. A silent `Dropped::NothingOwed` at a restore is the model's `GiveUp` with no
+//! debt. After every schedule the engine is unresized, and an unanswered nudge leaves screen
+//! and render debt byte-identical.
 
 use std::collections::BTreeMap;
 
@@ -98,7 +79,7 @@ struct World {
     rebase: bool,
     /// The act that put the machine at rest.
     ended: Option<Act>,
-    /// The engine's size as the WINDOW last set it.
+    /// The engine's size as the window last set it.
     engine: (u16, u16),
     machine: RepaintNudge,
     standin: Standin,
@@ -129,7 +110,7 @@ fn with_clear(mut b: Vec<u8>) -> Vec<u8> {
 }
 
 impl World {
-    /// The incident's residue: an alternate screen the program drew, a flap
+    /// The residue the nudge repairs: an alternate screen the program drew, and a flap
     /// with a draw between its halves.
     fn new(standin: Standin) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
@@ -404,8 +385,7 @@ impl World {
                 }
                 _ => {}
             }
-            // THE headline safety property: a PTY that is short is only ever so
-            // while the machine says it holds it.
+            // The headline safety property: the PTY is short only while the machine holds it.
             if self.pty != (self.term.rows(), self.term.cols()) {
                 assert_eq!(self.machine.phase(), Phase::Short, "a short PTY is held");
             }
@@ -414,11 +394,9 @@ impl World {
         assert_eq!(self.pty, (self.term.rows(), self.term.cols()));
     }
 
-    /// The host's hard deadline (`NudgeHost::tick`'s cap sweep), which runs
-    /// whether or not the machine could be stepped: past `PTY_HOLD_CAP_MS` it
-    /// lets the hold go (the guard's drop sets the PTY to the engine's size),
-    /// and the attempt goes on as after a release, as the model's
-    /// `ReleaseByDeadline` has it.
+    /// The host's hard deadline (`NudgeHost::tick`'s cap sweep), run whether or not the
+    /// machine could be stepped: past `PTY_HOLD_CAP_MS` it lets the hold go and the attempt
+    /// goes on as after a release (the model's `ReleaseByDeadline`).
     fn host_deadline(&mut self) {
         if self.machine.phase() != Phase::Short
             || self.now - self.machine.hold_started_ms() < PTY_HOLD_CAP_MS
@@ -476,9 +454,8 @@ fn a_program_that_never_answers_leaves_the_screen_and_the_debt_as_they_were() {
     assert_eq!(screen(&w.term), text, "no answer, no change");
     assert_eq!(w.term.render_debt(), debt);
     assert_eq!(w.machine.nudged(), 1, "one try");
-    // The same when no step could end the hold (the terminal lock busy past
-    // the host's deadline): the deadline lets it go, and the attempt is judged
-    // as after any release.
+    // The same when the terminal lock stays busy past the host's deadline: the deadline
+    // lets the hold go, and the attempt is judged as after any release.
     let mut w = World::new(Standin::NeverAnswers);
     w.lock_busy_after_hold = Some(PTY_HOLD_CAP_MS + 500);
     w.run(8_000);
@@ -514,10 +491,8 @@ fn a_program_that_repaints_without_a_full_clear_is_tried_once_and_abandoned() {
     assert_eq!(w.machine.phase(), Phase::Rest);
 }
 
-/// A program that streams through its repaints (its output never 40 ms quiet)
-/// answered both sizes all the same: healed. The restore's timeout once called
-/// it a no-answer - a give-up the model forbids, and a digest line the ledger
-/// withdrew 25 ms later.
+/// A program that streams through its repaints (its output never quiet for
+/// `QUIET_WAIT_MS`) still answered both sizes: healed, not a give-up.
 #[test]
 fn a_program_that_streams_through_both_answers_is_healed() {
     let mut w = World::new(Standin::Streams);
@@ -527,17 +502,10 @@ fn a_program_that_streams_through_both_answers_is_healed() {
     assert!(!w.term.render_debt().owed());
 }
 
-/// The window flaps while the PTY is held, and a busy program reads neither
-/// half: the hold is the layout's (forgotten, nothing written), and the
-/// attempt - its one try spent - ends in a give-up the owner hears, whether a
-/// step saw the flap's middle or only its end. It was once dropped at once as
-/// "superseded", silently. The same program given a size that LASTS was given
-/// a change of its own: superseded, never a give-up. A program that answered
-/// the short size AND the flap's restored one before the machine's next step
-/// (the terminal lock busy meanwhile) repaired the tab: the two answers read
-/// as one, the wait for a second is spent, and the attempt ends on what the
-/// engine owes - nothing - in silence. It was once a give-up, a digest line
-/// about a repaired tab that the ledger's heal withdrew.
+/// The window flaps during the hold and a busy program reads neither half: the hold is
+/// forgotten and the attempt, its one try spent, is a give-up the owner hears. A size that
+/// lasts supersedes it. A program that answered both sizes while the lock was busy repaired
+/// the tab, so the attempt ends silently with nothing owed.
 #[test]
 fn a_flap_the_program_never_saw_during_the_hold_is_a_give_up() {
     let busy = |resizes: &[(u64, u16)]| {
@@ -574,10 +542,9 @@ fn a_flap_the_program_never_saw_during_the_hold_is_a_give_up() {
     assert!(!w.term.render_debt().owed());
 }
 
-/// A halt that stands before the hold blocks it. One that lands DURING the
-/// hold lifts it at once, and the attempt (its one try spent) is judged as
-/// after any release: a busy program that read neither size is a give-up the
-/// owner hears.
+/// A halt that stands before the hold blocks it. One that lands during the hold lifts it
+/// at once, and the attempt is judged as after any release: a busy program that read
+/// neither size is a give-up the owner hears.
 #[test]
 fn a_halt_blocks_the_hold_and_one_during_it_is_judged() {
     let mut w = World::new(Standin::AnswersAtOnce);

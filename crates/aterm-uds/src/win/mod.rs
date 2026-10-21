@@ -409,19 +409,13 @@ impl CtlStream {
         Ok(())
     }
 
-    /// One read that never parks: the `recv` [`io::Read::read`] makes before
-    /// it waits, without the wait. `WouldBlock` when nothing is queued, and
-    /// end-of-file (`Ok(0)`) for a peer's close or write-half close and for a
-    /// local read shutdown, exactly as `read` reports them.
+    /// One non-blocking `recv`: returns `WouldBlock` when nothing is queued and
+    /// `Ok(0)` on peer close or local read shutdown.
     ///
-    /// For a liveness probe that must answer at once: the control socket's
-    /// push loop asks one before every pass it writes, and a probe that
-    /// borrowed `read` under a short read timeout made every pushed frame wait
-    /// that timeout out. A Unix caller peeks with `MSG_PEEK | MSG_DONTWAIT`
-    /// instead; this consumes what it reads, so it is for a stream whose next
-    /// byte ends it anyway (a push-only subscription's client sends none).
-    /// There is no per-call flag to borrow here and none is needed: arming
-    /// `WSAEventSelect` already made the socket non-blocking for every clone.
+    /// Used by the control socket's push loop to probe liveness without waiting
+    /// out a read timeout (`WSAEventSelect` already put the socket in
+    /// non-blocking mode). Consumes any byte it reads, so callers use it only on
+    /// streams where any client byte ends the subscription.
     ///
     /// # Errors
     /// `WouldBlock` for a quiet open peer; the mapped winsock error otherwise.

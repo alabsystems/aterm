@@ -52,3 +52,33 @@ pub(crate) fn count_art_build() {
 pub fn take_art_builds() -> usize {
     ART_BUILDS.with(|n| n.replace(0))
 }
+
+thread_local! {
+    /// Sprite column tables the fx rasterizer built (`fx_raster::SpriteCols`):
+    /// the work its key and its laziness spare.
+    static SPRITE_COLS_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn count_sprite_cols_build() {
+    SPRITE_COLS_BUILDS.with(|n| n.set(n.get() + 1));
+}
+
+/// This thread's sprite column-table builds since the last take, zeroed.
+pub fn take_sprite_cols_builds() -> usize {
+    SPRITE_COLS_BUILDS.with(|n| n.replace(0))
+}
+
+thread_local! {
+    /// Frame art budget rulings that walked their layers (`FxBudget::rule`):
+    /// the work its memo spares.
+    static BUDGET_RULINGS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn count_budget_ruling() {
+    BUDGET_RULINGS.with(|n| n.set(n.get() + 1));
+}
+
+/// This thread's walked budget rulings since the last take, zeroed.
+pub fn take_budget_rulings() -> usize {
+    BUDGET_RULINGS.with(|n| n.replace(0))
+}

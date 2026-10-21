@@ -1,29 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Generated fuzzing over the whole supported syntax.
+//! Generated fuzzing over the whole supported syntax: every quantifier and its lazy form,
+//! alternation with empty branches, all eight assertions, classes with ranges, perl
+//! shorthands and POSIX names, and the `i`/`s`/`m`/`U`/`x` group flags, crossed with
+//! haystacks mixing ASCII, a combining mark, CJK, an accented letter and newlines.
 //!
-//! A hand-written corpus tests the shapes someone thought of. This tests the
-//! ones nobody did: patterns drawn from a grammar covering the whole supported
-//! syntax — every quantifier and its lazy form, alternation with empty branches,
-//! all eight assertions, classes with ranges, perl shorthands and POSIX names,
-//! and the `i`/`s`/`m`/`U`/`x` group flags — crossed with haystacks drawn from an
-//! alphabet that mixes ASCII, a combining mark, CJK, an accented Latin letter
-//! and newlines.
-//!
-//! Every answer is folded into a digest, pinned when all ~40k cases matched
-//! the `regex` crate this engine replaced. It has earned its keep: three real
-//! defects came out of it and nowhere else — a star whose compiled shape made a
-//! nullable body prefer the wrong iteration, a prefilter skip that left stale
-//! visited marks behind and silently dropped a match, and four separate `(?x)`
-//! whitespace rules.
-//!
-//! Randomness comes from a deterministic LCG, so a failure is reproducible by
-//! re-running the test. `FUZZ_SEED` and `FUZZ_N` override the defaults for a
-//! longer soak (which then checks consistency only, not the pinned digest).
+//! Every answer is folded into a digest, pinned when all ~40k cases matched the `regex`
+//! crate. `FUZZ_SEED` and `FUZZ_N` override the defaults for a longer soak, which then
+//! checks consistency only, not the digest.
 
-/// Deterministic LCG (the Knuth/MMIX multiplier), so a failing case is
-/// reproducible from the seed alone.
+/// Deterministic LCG (the Knuth/MMIX multiplier): a failing case reproduces from the seed.
 struct Lcg(u64);
 
 impl Lcg {
@@ -67,9 +54,8 @@ fn gen_atom(r: &mut Lcg, out: &mut String, depth: u32) {
                     0 => out.push_str(r.pick(&[r"\d", r"\w", r"\s", r"\S"])),
                     1 => out.push_str(r.pick(&["a-c", "0-9", "x-z", "A-Z", "\u{e0}-\u{e9}"])),
                     2 => out.push_str(r.pick(&["[:alpha:]", "[:digit:]", "[:^space:]"])),
-                    // No bare `]` and no bare `-`: both would compose into the
-                    // nested-class and set-operation syntax this engine refuses
-                    // by design, which is tested exhaustively elsewhere.
+                    // No bare `]` or `-`: they compose into the nested-class and
+                    // set-operation syntax this engine refuses, tested elsewhere.
                     _ => out.push_str(r.pick(&["a", "b", r"\.", r"\-", r"\\", r"\]", "^", "0"])),
                 }
             }

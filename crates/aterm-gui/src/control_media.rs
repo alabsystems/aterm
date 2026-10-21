@@ -3,9 +3,9 @@
 
 //! Media-capture verbs: `image` (terminal-content framebuffer PNG), `image read`
 //! (structured inline-image payloads, headless/cross-session-safe), `window`
-//! (whole-window composited PNG), and `chrome` (native macOS UI readout). Moved
-//! verbatim from `control.rs` (behavior-preserving). The `ImageReq` type and the
-//! `AUDIT_SUBSYSTEM` name stay in `control.rs`, reached via `super::`.
+//! (whole-window composited PNG), and `chrome` (native macOS UI readout).
+//! The `ImageReq` type and the `AUDIT_SUBSYSTEM` name live in `control.rs`,
+//! reached via `super::`.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,10 +24,10 @@ use crate::{Wake, term_lock};
 
 /// Main-loop turns are normally sub-millisecond, but a debug build's first native
 /// document raster can legitimately spend well over two seconds initializing and
-/// painting its retained tray. Keep the historical 30-second wire allowance: it
-/// remains a hard bound (unlike the former raw `recv`) without misreporting cold
-/// work as a wedged event loop. Lane-exact socket admission keeps other peers from
-/// waiting invisibly behind every occupied worker.
+/// painting its retained tray. Keep the 30-second wire allowance: it remains a
+/// hard bound without misreporting cold work as a wedged event loop. Lane-exact
+/// socket admission keeps other peers from waiting invisibly behind every
+/// occupied worker.
 const MAIN_THREAD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Why a main-thread hop brought back no answer: a wire-ready reason, which a
@@ -304,11 +304,9 @@ impl<'a> MainPost<'a> {
     }
 }
 
-/// [`post_main`] and a bounded wait for the answer, which every UI-mutating /
-/// aux-window verb (controls, open, settings, invoke, spawn, close, chrome)
-/// needs: the channel + event-gone guard + recv once copy-pasted into ~8
-/// verbs, in one call, so the surface never grows a bespoke RPC ceremony per
-/// verb. `Err` is a wire-ready reason; callers format the `Ok(T)` into their
+/// [`post_main`] and a bounded wait for the answer, shared by UI-mutating and
+/// aux-window verbs (`controls`, `open`, `settings`, `invoke`, `spawn`, `close`,
+/// `chrome`). `Err` is a wire-ready reason; callers format `Ok(T)` into their
 /// own reply shape.
 pub(crate) fn call_main<T>(
     proxy: &EventLoopProxy<Wake>,
@@ -322,13 +320,8 @@ pub(crate) fn call_main<T>(
         Ok(v) => Ok(v),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             // State only what expiring this deadline actually proves: no reply
-            // arrived in time. The former text guessed "(event loop wedged?)",
-            // and that guess was WRONG for the first real report it produced --
-            // a request abandoned in the config queue by a loop that was turning
-            // tens of thousands of times a second and answering every other verb
-            // instantly -- while costing an hour of hunting for a stall that did
-            // not exist. A timeout cannot distinguish a wedged loop from a slow
-            // turn from a request nobody ever settles, so it must not name one.
+            // arrived in time. A timeout cannot distinguish a wedged loop from a
+            // slow turn from a request nobody ever settles, so it must not name one.
             Err(MainHopError::Reason(
                 "main-thread reply did not arrive within 30s",
             ))
@@ -339,15 +332,13 @@ pub(crate) fn call_main<T>(
     }
 }
 
-/// [`call_main`] with a CALLER-CHOSEN deadline instead of the 30 s cold-render
-/// allowance. The same one-shot channel and `recv_timeout`, but a verb that is
-/// itself under a tight external budget must not park its worker lane for 30 s
-/// when the main thread is momentarily busy. `sessions`/`ls` is the case that
-/// forced this: every discovery client probes a peer with a 2 s deadline (the
-/// menu-bar fleet scan, `aterm ctl ls`), so blocking the placement hop for 30 s
-/// turned a live-but-busy instance into "could not reach" — a false absence. A
-/// short deadline degrades to the verb's existing `Err` path (the roster prints
-/// `window=- active=- wfocus=-` and still lists the session) instead.
+/// [`call_main`] with a caller-chosen deadline instead of the 30 s cold-render
+/// allowance. A verb under a tight external budget must not park its worker
+/// lane for 30 s when the main thread is momentarily busy: discovery clients
+/// probe a peer with a 2 s deadline (the menu-bar fleet scan, `aterm ctl ls`),
+/// so a short deadline degrades to the verb's `Err` path (the roster prints
+/// `window=- active=- wfocus=-` and still lists the session) instead of timing
+/// out the probe.
 pub(crate) fn call_main_within<T>(
     proxy: &EventLoopProxy<Wake>,
     within: std::time::Duration,
@@ -358,23 +349,17 @@ pub(crate) fn call_main_within<T>(
 }
 
 /// Why a main-thread verb is refused before anything is posted, if it is. A
-/// STALLED main thread comes first. On 2026-09-28 the main thread was stuck in
-/// AppKit's scene setup before the whole process stopped running, and a verb
-/// that needed it could only post its hop and wait out the whole reply
-/// deadline, holding a worker lane, for a thread that could not answer. The
-/// heartbeat already showed the thread stuck
-/// ([`crate::watchdog::main_stall_now`], at the shipped stall bar in every
-/// build), so such a verb is now answered at once with
-/// `ERR main thread stalled <N>s; retry`, which the harness rides
-/// out as it does `ERR control server busy`. Then a standing dialog
-/// ([`dialog_refusal`]); a dialog is a designed freeze and never reads as a
-/// stall.
+/// stalled main thread comes first ([`crate::watchdog::main_stall_now`], at the
+/// shipped stall bar in every build), answered at once with
+/// `ERR main thread stalled <N>s; retry`, which the harness rides out as it
+/// does `ERR control server busy`. Then a standing dialog ([`dialog_refusal`]);
+/// a dialog is a designed freeze and never reads as a stall.
 pub(crate) fn main_thread_refusal() -> Option<MainHopError> {
     // A client that hung up is asked about before anything else: nothing is
     // posted for a request nobody will read the answer to, so it neither holds
     // a worker lane for the reply deadline nor runs late after its client has
     // asked again. `caller_hung_up` is the blocking verbs' check — the lane's
-    // own connection, a full close only, never a half-close (2026-09-28).
+    // own connection, a full close only, never a half-close.
     // A verb committed to finishing input it began is the one exception
     // ([`crate::control::CommittedInput`]: a `turn` whose text is typed still
     // gets its Enter, or the text sits unsubmitted in the composer).
@@ -394,13 +379,12 @@ pub(crate) fn main_thread_refusal() -> Option<MainHopError> {
     dialog_refusal().map(MainHopError::Reason)
 }
 
-/// WHILE A DIALOG STANDS the main thread is inside AppKit's nested modal
+/// While a dialog stands the main thread is inside AppKit's nested modal
 /// loop (`NSAlert runModal`, `NSOpenPanel runModal` — the quit confirmation
 /// among them), where no `Wake` is handled until the person answers: a
 /// main-thread verb posted now would park its worker for the whole of the
-/// reply deadline and then run LATE, after the answer, against whatever the
-/// answer left (design ruling 267; round 16 found `window` hung 90 s behind
-/// the ⌘Q dialog). It is refused at once instead, and never posted.
+/// reply deadline and then run late, after the answer, against whatever the
+/// answer left. It is refused at once instead, and never posted.
 fn dialog_refusal() -> Option<&'static str> {
     #[cfg(target_os = "macos")]
     {
@@ -437,16 +421,16 @@ fn recv_within<T>(
     }
 }
 
-/// Per-image payload cap for the line + JSON image channels (audit finding F4). An
-/// inline image is USER-supplied (the inner TUI emits OSC 1337), so a hostile or
+/// Per-image payload cap for the line + JSON image channels. An
+/// inline image is user-supplied (the inner TUI emits OSC 1337), so a hostile or
 /// careless inner could embed a multi-megabyte image and force a large base64
-/// allocation on every `image read` AND every styled `cells`/`screen` frame. Above
-/// this raw-byte cap the payload is OMITTED and the image marked `truncated` — the
+/// allocation on every `image read` and every styled `cells`/`screen` frame. Above
+/// this raw-byte cap the payload is omitted and the image marked `truncated` — the
 /// metadata + real `nbytes` still report it, so a consumer learns an image is there
 /// and how big it is, then fetches it deliberately, without the per-frame blowup.
 pub(crate) const MAX_IMAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024; // 4 MiB raw (~5.3 MiB base64)
 
-/// One image's wire payload under the F4 cap, through the process's payload
+/// One image's wire payload under the size cap, through the process's payload
 /// memo ([`crate::image_payload_memo`]): `png`/`rgba`/`unknown` and the
 /// base64 of its bytes, or `truncated` and an empty payload when they exceed
 /// [`MAX_IMAGE_PAYLOAD_BYTES`].
@@ -572,9 +556,8 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
         },
         None => t.images_frame(rows).into_iter().enumerate().collect(),
     };
-    // Identity dedup by SET: a `Vec::contains` scan made the dedup
-    // O(placed cells x distinct images) — quadratic on a tiled screen, where
-    // every covered cell carries a ref to one of a few images.
+    // Identity dedup by set so tiled screens with many cells sharing a few
+    // images stay linear in placed cells.
     let mut seen: std::collections::HashSet<*const ImageData> = std::collections::HashSet::new();
     // Anchor + payload handle per distinct image, in the same walk order the reply
     // uses. Holding the `Arc` keeps each payload alive (and keeps the `seen`
@@ -618,8 +601,7 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
 /// socket directory. A bare name (`image shot.png`) lands there; an empty
 /// request gets a server-unique path below `images/auto/<process-instance>/`.
 /// A path that would escape the subdir (`../`, an absolute path elsewhere, a symlink out) is refused with
-/// `ERR path\n` and audited — the socket can no longer be used to overwrite an
-/// arbitrary file via a caller-supplied path.
+/// `ERR path\n` and audited.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ImageOptions {
     want_bytes: bool,
@@ -813,7 +795,7 @@ pub(crate) fn cmd_image(
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
     let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
     // A capture is a main-thread photograph: refused while the main thread is
-    // stalled or a dialog stands, as every main-thread verb is (ruling 267),
+    // stalled or a dialog stands, as every main-thread verb is,
     // and counted as a hop until the main thread takes it.
     let posted = post_main(proxy, |reply| {
         Wake::Image(Box::new(ImageReq {
@@ -962,13 +944,8 @@ fn image_file_reply(
 /// The refusal of `window <word>` when `<word>` is neither a target nor a file name:
 /// `None` for the empty operand and for anything path-shaped — an extension
 /// (`shot.png`, `front.png`) or a separator, which the path confinement then judges —
-/// so both keep their meaning.
-///
-/// A bare word used to be taken as the capture's FILE NAME: `window bogus` answered
-/// `OK … bogus` and wrote a PNG named `bogus` into images/ (measured 2026-09-27 on
-/// 0.95.0), so a mistyped target (`window setings`) read as a successful capture of
-/// the front window. The refusal names the targets and the spelling that still
-/// writes a file of that name.
+/// so both keep their meaning. The refusal names the targets and the `.png`
+/// spelling that writes a file of that name.
 fn unknown_window_target(first: &str) -> Option<String> {
     if first.is_empty() || first.contains(['.', '/', '\\']) {
         return None;
@@ -997,8 +974,8 @@ fn default_stem(aux: crate::app_introspect::AuxTarget) -> String {
 /// honestly. `<target>` is an optional leading keyword selecting WHICH window:
 ///   * (omitted) / `front` — the frontmost TERMINAL window: native macOS chrome
 ///     (titlebar, traffic lights, unified toolbar, full-width tab strip) AND the
-///     terminal content. This is the original behavior and closes the gap `image`
-///     leaves (`image` rasterizes only the content framebuffer, no OS chrome).
+///     terminal content (`image` rasterizes only the content framebuffer, no OS
+///     chrome).
 ///   * `prefs` / `settings` — the Settings surface.
 ///   * `about` / `update` / `menu` / `tab-menu` / `session-picker` / `overview` — a
 ///     Settings route or an overlay of the front window.
@@ -1008,11 +985,10 @@ fn default_stem(aux: crate::app_introspect::AuxTarget) -> String {
 /// thread by `capture_aux_window`) rather than answered with a plain front frame under
 /// the target's name.
 ///
-/// A first token that is not a known keyword is treated as the path (so the original
-/// `window [path]` wire shape still works) when it LOOKS like one — it has an
-/// extension (`shot.png`); a bare word is refused instead ([`unknown_window_target`]).
-/// A literal filename `prefs`/`front` must therefore be given a target first (e.g.
-/// `window front prefs`).
+/// A first token that is not a known keyword is treated as the path (`window [path]`)
+/// when it looks like one — it has an extension (`shot.png`); a bare word is refused
+/// instead ([`unknown_window_target`]). A literal filename `prefs`/`front` must
+/// therefore be given a target first (e.g. `window front prefs`).
 ///
 /// PATH CONFINEMENT (mirrors [`cmd_image`]): the `path` is validated by
 /// `confine_image_path` to a single filename inside the socket dir's `images/` subdir,
@@ -1105,9 +1081,8 @@ pub(crate) fn cmd_window(
     let cancel = crate::control::CaptureCancellation::new();
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
     // Refused while the main thread is stalled or a dialog stands, as every
-    // main-thread verb is (ruling 267). Front uses the unchanged `CaptureWindow`
-    // (sacred path); aux windows use `CaptureAuxWindow` (resolved by their own
-    // window number on the main thread).
+    // main-thread verb is. Front uses `CaptureWindow`; aux windows use
+    // `CaptureAuxWindow` (resolved by their own window number on the main thread).
     let posted = post_main(proxy, |reply| match aux {
         AuxTarget::Front => Wake::CaptureWindow {
             path: confined,
@@ -1151,29 +1126,23 @@ pub(crate) fn cmd_window(
 /// caller), plus tests.
 #[cfg(any(target_os = "macos", windows, test))]
 impl crate::App {
-    /// `window <target>`'s refusal when the front window is not SHOWING `target`,
+    /// `window <target>`'s refusal when the front window is not showing `target`,
     /// or `None` when it is (always for `front`). Asked on the main thread in the
     /// same turn as the capture attempt (`App::run_capture`), so a photograph
     /// taken in that turn cannot outlive the answer. A photograph deferred for its
-    /// GPU drawable carries its target and re-enters the same door in the LATER
-    /// turn that replays it (`resume_deferred_gpu_captures`), so the question is
-    /// asked again there: an overlay dismissed while it waited is refused.
+    /// GPU drawable carries its target and re-enters the same door in the later
+    /// turn that replays it (`resume_deferred_gpu_captures`), so an overlay
+    /// dismissed while it waited is refused.
     ///
-    /// WHY: the keyword selects nothing to photograph — every target lives in the
-    /// front frame, and the capture is the front window's whatever it is called. A
-    /// closed overlay therefore answered `OK <w> <h> <path>` with a plain terminal
-    /// frame: measured on Windows, `window tab-menu`, `prefs`, `session-picker`,
-    /// `connections`, `about`, `menu` and `update` with nothing open
-    /// all hashed identical to `window front`, while `controls <target>` read
-    /// `open=false` and `controls about` refused. A PNG named after a surface it
-    /// does not show is worse than no PNG to an agent that looks at it.
+    /// Every target lives in the front frame, so capturing a closed overlay would
+    /// return a plain terminal frame under the overlay's name.
     ///
     /// "Showing" is the photograph's question, not `controls`': Settings counts
-    /// only as the front window's ACTIVE tab (`controls prefs` also reads one in a
+    /// only as the front window's active tab (`controls prefs` also reads one in a
     /// background tab or another window, which the capture cannot see), and
     /// `about` / `update` only on their own route. The action names the verb that
     /// opens the target. `open` refuses the picker, which opens from the wire
-    /// through the menu action a person uses (`invoke NewTabWithIdentity`).
+    /// through `invoke NewTabWithIdentity`.
     pub(crate) fn window_target_refusal(
         &self,
         target: crate::app_introspect::AuxTarget,
@@ -1225,10 +1194,9 @@ mod window_target_refusal_tests {
     use crate::session_picker::PickerIntent;
     use crate::{App, WindowId};
 
-    /// `window bogus` answered `OK` and wrote a PNG named `bogus` on 0.95.0
-    /// (measured 2026-09-27). A bare word that is no target is refused, listing
-    /// every target `window` takes and the spelling that writes a file of that
-    /// name; the empty operand and anything path-shaped keep their meaning.
+    /// A bare word that is no target is refused, listing every target `window`
+    /// takes and the spelling that writes a file of that name; the empty operand
+    /// and anything path-shaped keep their meaning.
     #[test]
     fn a_bare_word_that_is_no_target_is_refused_not_written() {
         let refusal = super::unknown_window_target("bogus").expect("a bare word is refused");
@@ -1251,15 +1219,10 @@ mod window_target_refusal_tests {
         }
     }
 
-    /// `help open` NAMES WHAT IT OPENS (the lab hunt's surfaces-F6): its entry
-    /// read `compatibility aux targets remain available` and named none, so
-    /// `open autopilot-menu` could be found only in the source. The entry now
-    /// carries the list of the targets `open` takes, from the one table the
+    /// `help open` names the targets `open` takes, from the one table the
     /// parser reads (`control_verbs::aux_targets!`): each is opened, and each
-    /// target it does not take (`front`, `session-picker`) is
-    /// refused with a line naming that list; `close` and an alias resolve.
-    /// NEGATIVE CONTROL: the entry without the list (the defect) fails the
-    /// first assertion.
+    /// target it does not take (`front`, `session-picker`) is refused with a
+    /// line naming that list; `close` and an alias resolve.
     #[test]
     fn help_open_names_every_target_open_takes() {
         use crate::app_introspect::AuxTarget;
@@ -1738,10 +1701,8 @@ mod confined_video_reader {
             .validate_path_identity()
             .map_err(|_| "recording namespace is not confined")?;
         // Until this launch's first `video` there is no `video/<instance>`, and on a fresh
-        // machine no `video/`: nothing recorded yet, which used to answer with the words of a
-        // refusal, "not confined", on every fresh instance (seen on Windows 2026-09-28).
-        // Absence counts only while the parent still validates: a swapped chain can surface
-        // as NotFound too, and stays a refusal.
+        // machine no `video/`. Absence counts only while the parent still validates: a
+        // swapped chain can surface as NotFound too, and stays a refusal.
         let video = match socket.child(std::ffi::OsStr::new(control_auth::VIDEO_DIR)) {
             Ok(video) => video,
             Err(error) => return absent_or_unconfined(&error, &socket),
@@ -2224,10 +2185,10 @@ pub(crate) fn cmd_video(
     let mut cancel_on_drop = CancelVideoRequestOnDrop(Some(cancel.clone()));
     // The main thread keeps `wire` and a seamless update's Commit waits on it:
     // this request's reply, whatever it turns out to be, is written before
-    // that `_exit` (round six of the update audit, finding 31).
+    // that `_exit`.
     let (wire, written) = crate::control::ReplyWire::new();
     // Refused while the main thread is stalled or a dialog stands, as every
-    // main-thread verb is (ruling 267). A refused or unsent request drops the
+    // main-thread verb is. A refused or unsent request drops the
     // unforgeable directory guard, which removes the unpublished directory.
     let posted = post_main(proxy, |reply| Wake::Video {
         dur_ms: (args.secs * 1000.0) as u64,
@@ -2346,13 +2307,11 @@ pub(crate) fn cmd_act(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 /// `open <target> [close]`'s target: the aux surface and whether to close it,
 /// or the refusal line. `open <target> close` is the symmetric half: native
 /// Settings targets close through the tab lifecycle and the transient palette
-/// uses its overlay exit. A target is one the one table marks as opened
+/// uses its overlay exit. A target is one the table marks as opened
 /// ([`AuxTarget::opens`](crate::app_introspect::AuxTarget::opens)), whose
-/// list the help entry and both refusals quote (`control_verbs::OPEN_TARGETS`):
-/// hand-typed copies had drifted (`tab-menu` was accepted and advertised by
-/// one and missing from the other, and `help open` named none). `front` is
-/// always open (and a bare/empty arg maps to it), so it is refused with the
-/// verb's contract.
+/// list the help entry and both refusals quote (`control_verbs::OPEN_TARGETS`).
+/// `front` is always open (and a bare/empty arg maps to it), so it is refused
+/// with the verb's contract.
 fn open_target(trimmed: &str) -> Result<(crate::app_introspect::AuxTarget, bool), String> {
     use crate::app_introspect::AuxTarget;
     use aterm_types::control_verbs::OPEN_TARGETS;
@@ -2432,9 +2391,7 @@ fn normalize_settings_section_name(input: &str) -> String {
         .join(" ")
 }
 
-/// Resolve the native label/path a person sees in Settings, plus the useful names from
-/// the retired category model. Deliberately no `performance` alias: that visual page and
-/// the bottom HUD it controlled were deleted, while specialist config remains in Manual.
+/// Resolve the native label/path a person sees in Settings, plus compatibility aliases.
 fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::SettingsRoute> {
     use crate::native_settings::SettingsRoute;
 
@@ -2461,10 +2418,9 @@ fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::S
         "manual config" | "config" => Some(SettingsRoute::Manual),
         "text" | "typography" | "text and fonts" => Some(SettingsRoute::TextFonts),
         "cursor" | "cursor and motion" => Some(SettingsRoute::CursorMotion),
-        // The cursor styles' page, which was the Cursor Kitty's. "kitty" alone
-        // routes here and NOT to the Kitty Log (a read-only book with no
-        // route): a bare "kitty" from `settings section …` means the thing
-        // walking your cursor.
+        // The cursor styles' page. "kitty" alone routes here and NOT to the
+        // Kitty Log (a read-only book with no route): a bare "kitty" from
+        // `settings section …` means the thing walking your cursor.
         "kitty" | "cat" | "cursor cat" | "cursor pet" | "kitty pet" | "cursor kitty"
         | "cursor style" | "styles" | "trail" | "trails" | "cursor trail" => {
             Some(SettingsRoute::CursorStyles)
@@ -2614,12 +2570,102 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
 /// Take Over refusing another Mac's writes). A shipped build never reads it,
 /// and an in-session client cannot set it on the instance it runs under.
 pub(crate) fn person_invoke_act(name: &str) -> bool {
+    person_seam_armed()
+        && crate::menu::MenuAction::from_invoke_name(name.trim()).is_some_and(|action| {
+            action.invoke_authority() == crate::menu::InvokeAuthority::PersonOnly
+        })
+}
+
+/// Whether this instance was launched with a development build's stand-in
+/// for the person at the window: `ATERM_DEBUG_PERSON_INVOKE=1` in its
+/// environment at launch (`aterm_types::dev_seam!`, read once). It arms
+/// `invoke TakeOver|HandBack` ([`person_invoke_act`]) and the `person` verb
+/// ([`cmd_person`]); a shipped build never reads it.
+fn person_seam_armed() -> bool {
     static SEAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let seam = *SEAM.get_or_init(|| {
+    *SEAM.get_or_init(|| {
         aterm_types::dev_seam!("ATERM_DEBUG_PERSON_INVOKE").is_some_and(|value| value == "1")
-    });
-    seam && crate::menu::MenuAction::from_invoke_name(name.trim())
-        .is_some_and(|action| action.invoke_authority() == crate::menu::InvokeAuthority::PersonOnly)
+    })
+}
+
+/// Whether this build carries the `person` verb's stand-in at all
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2): a debug or test
+/// build only. A release build answers [`PERSON_NEEDS_DEBUG`].
+const PERSON_BUILD: bool = cfg!(any(test, debug_assertions));
+
+/// What a build without the stand-in answers `person` with.
+pub(crate) const PERSON_NEEDS_DEBUG: &str = "person needs a debug build";
+
+/// What an unarmed instance answers `person` with: the verb is the person's
+/// own, stood in for only where the instance was launched to be.
+pub(crate) const PERSON_DENIED: &str = "denied: person is a development build's stand-in for \
+     the person at the window (ATERM_DEBUG_PERSON_INVOKE=1 at launch)";
+
+/// The usage line every malformed `person` form answers with.
+const PERSON_USAGE: &str = "usage: person look <window>|off | person menubar press <at>";
+
+/// One `person` request (§12.5.2), parsed on the control thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PersonAsked {
+    /// `person look <window>|off`: someone can look at that headless window
+    /// now (its number as `ls` prints `window=`), or at none.
+    Look(Option<u64>),
+    /// `person menubar press <at>`: the menu-bar item's row at that path,
+    /// clicked ([`crate::status_item::MenuAt`]).
+    Press(crate::status_item::MenuAt),
+}
+
+/// `person`'s words read, where this build carries the stand-in (`built`)
+/// and this instance was launched with it (`armed`), in that order: a
+/// release build's refusal, then the person's own (`ERR denied`), then the
+/// grammar. `armed` is asked only where `built` holds, so a release build
+/// (with `dev-seams` or not) never reads the stand-in's arming. Pure but for
+/// what `armed` reads.
+pub(crate) fn parse_person(
+    rest: &str,
+    built: bool,
+    armed: impl FnOnce() -> bool,
+) -> Result<PersonAsked, String> {
+    if !built {
+        return Err(PERSON_NEEDS_DEBUG.to_string());
+    }
+    if !armed() {
+        return Err(PERSON_DENIED.to_string());
+    }
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    match words.as_slice() {
+        ["look", "off"] => Ok(PersonAsked::Look(None)),
+        ["look", window] => window
+            .parse::<u64>()
+            .ok()
+            .filter(|_| window.bytes().all(|b| b.is_ascii_digit()))
+            .map(|w| PersonAsked::Look(Some(w)))
+            .ok_or_else(|| format!("{PERSON_USAGE} (`{window}` is no window number)")),
+        ["menubar", "press", at] => crate::status_item::MenuAt::parse(at)
+            .map(PersonAsked::Press)
+            .ok_or_else(|| format!("{PERSON_USAGE} (`{at}` is no row path: `chrome` prints them)")),
+        _ => Err(PERSON_USAGE.to_string()),
+    }
+}
+
+/// `person look <window>|off` | `person menubar press <at>`: A DEVELOPMENT
+/// BUILD'S STAND-IN FOR THE PERSON AT THE WINDOW
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2), armed like
+/// `invoke TakeOver|HandBack`'s ([`person_invoke_act`]), so a headless lab
+/// can stand where the person does: a look at a headless window, which the
+/// one looking rule reads (`App::person_look`), and a click on a menu-bar
+/// row by its path (`App::person_menubar_press`). A main-thread hop like
+/// `invoke`; answers `OK <words>` or `ERR <why>`.
+pub(crate) fn cmd_person(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let asked = match parse_person(rest, PERSON_BUILD, person_seam_armed) {
+        Ok(asked) => asked,
+        Err(refusal) => return format!("ERR {refusal}\n"),
+    };
+    match call_main(proxy, |reply| Wake::PersonStandIn { asked, reply }) {
+        Ok(Ok(words)) => format!("OK {words}\n"),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(e) => format!("ERR {e}\n"),
+    }
 }
 
 /// `invoke <action>` -> fire a menu action BY NAME — the `action=` tokens `controls
@@ -2675,18 +2721,18 @@ pub(crate) fn cmd_confirm(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// `rain [status|on|off|toggle]` -> the PHOSPHOR per-session matrix-rain
-/// override on the focused window's FRONT session (the same per-session state
-/// View ▸ Matrix Rain and the `toggle_matrix_rain` keybinding flip). `status`
-/// is the observability face scripts/tests read:
+/// `rain [status|on|off|toggle]` -> the per-session matrix-rain override on the
+/// focused window's front session (the same per-session state View ▸ Matrix
+/// Rain and the `toggle_matrix_rain` keybinding flip). `status` is the
+/// observability face scripts/tests read:
 /// `OK config_enabled=<bool> session_override=<none|on|off> effective=<bool>
 /// engine=<none|live> active=<bool> scope=<window|focused-pane>
 /// focused=<bool> animating=<bool>` — the engine tail reports the actual
-/// render state (split-pane audit): `scope` says whether emission covers the
-/// whole window (single-pane / zoomed) or the focused pane of a split,
-/// `active` is the wake-arming `is_active()`, and `focused`/`animating`
-/// surface the W11 motion facts (an unfocused or Reduced window emits
-/// nothing regardless of the enable bits).
+/// render state: `scope` says whether emission covers the whole window
+/// (single-pane / zoomed) or the focused pane of a split, `active` is the
+/// wake-arming `is_active()`, and `focused`/`animating` surface the motion
+/// facts (an unfocused or Reduced window emits nothing regardless of the
+/// enable bits).
 /// Main-thread hop like `open`/`controls` (one-shot reply channel); works
 /// headless. Runtime-only — nothing durable is written (the Settings switch /
 /// `settings set` own the `[matrix_rain]` config bit).
@@ -2998,85 +3044,55 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
     }
 }
 
-/// `trail [status|<n>]` -> the FOCUSED window's cursor-trail diagnostics, in
-/// the two shapes a "the trail went dark" report needs.
+/// `trail [status|<n>]` -> the focused window's cursor-trail diagnostics.
 ///
-/// * `trail [<n>]` — the last `n` SPAWN-SEAM VERDICTS (default: the whole
+/// * `trail [<n>]` — the last `n` spawn-seam verdicts (default: the whole
 ///   diagnostic ring, cap 32), one
 ///   `admission seq= phase= reason= age_ms= origin= target= alt= licence=`
 ///   row each, newest last ([`crate::App::trail_admissions`]). `phase` is
 ///   `licensed` or `declined`; `reason` on a decline is `no-fresh-hint` (no
 ///   key hint was fresh, so the move was program output nobody's fingers
-///   asked for), `no-credits` (a multi-cell coalesce outran the press CREDIT
+///   asked for), `no-credits` (a multi-cell coalesce outran the press credit
 ///   budget), `off-shape` (licensed and classified, but the style's shape
-///   gates laid nothing) or `program-row`; `licence=` (2026-09-10) names the
+///   gates laid nothing) or `program-row`; `licence=` names the
 ///   class a licensed row was admitted under — `key` (a press hint),
 ///   `inflight` (no hint was fresh and the unpaid presses still waiting on
-///   the row licensed the batch — a stalled prompt catching up; 2026-09-12),
-///   `insert` (a DELIVERED insert, Rainbow Kitty only: a file drop, ⌘V, and
+///   the row licensed the batch — a stalled prompt catching up),
+///   `insert` (a delivered insert, Rainbow Kitty only: a file drop, ⌘V, and
 ///   — into the tab on screen — the `paste` verb, `paste-bin`, `turn`'s
 ///   paste phase, an unguarded `key tab` or `key ctrl+v`; its bytes provably
 ///   on the wire, laid as one sweep) or `rewrite` (the program pulled the
 ///   caret back inside that insert's span and the ribbon retracted to it);
 ///   `none` on a decline. `send`, `feed`, a guarded `key if=` and any input
 ///   routed to a background session stamp nothing and stay dark by
-///   contract. What the last few keystrokes DECIDED.
-/// * `trail status` — ONE `trail style= … ribbon_active= …` line of standing
+///   contract.
+/// * `trail status` — one `trail style= … ribbon_active= …` line of standing
 ///   engine state ([`crate::App::trail_status`]): the resolved style, every
 ///   gate from the `cursor_trail` knob to the glass, the cumulative
 ///   `licensed=`/`declined=`/`last_decline_reason=` scoreboard, the light
-///   alive right now, WHO OWNS THE BLOCK CURSOR and what colour their body is
+///   alive right now, who owns the block cursor and what colour their body is
 ///   built from (`block_fill=`/`block_fill_base=`/`block_fill_base_from=`),
-///   and the DELIVERED INSERTS (`inserts_delivered=`/`inserts_lit=`/
+///   delivered inserts (`inserts_delivered=`/`inserts_lit=`/
 ///   `inserts_retracted=`/`last_insert_cells=`, which advance under Rainbow
-///   Kitty only): how many inserts the host reported delivered (a paste's
-///   completed write, a bare Tab's or ⌃V's dispatch), how many the seam lit,
-///   how many placeholder rewrites it retracted, and the last one's width in
-///   cells (priced from its text, else the 32-cell bound), and the PRESSES IN
-///   FLIGHT (`inflight_licensed=`/`inflight_forgotten=`/`credits=`/
-///   `swallowed_no_echo=`/`park_returns=`/`park_flushed=`): batches the waiting
-///   presses alone licensed after a stalled prompt caught up, edges that forgot
-///   a pool, the pool right now, presses a canonical no-echo tty (a password
-///   prompt) will never echo, held parks whose RETURN came within the window and
-///   was judged as one `origin -> target` echo, and held parks flushed through
-///   the ordinary body at their own clock. What is TRUE.
+///   Kitty only), and presses in flight (`inflight_licensed=`/
+///   `inflight_forgotten=`/`credits=`/`swallowed_no_echo=`/`park_returns=`/
+///   `park_flushed=`).
 ///
-/// THE BLOCK-FILL FIELDS ARE NOT DECORATION. A cursor-body effect replaces the
-/// caret's colour outright (`RenderInput::cursor_fill_override` is applied
-/// INSTEAD of the frame cursor colour), and the `glow_active`/`pet_active`/
-/// `cat_active` gates say nothing about it — so a style could hold the caret,
-/// and paint it a colour the terminal never asked for, while this row read
-/// quiet end to end. That is exactly how one hard-coded base survived two
-/// investigations (`d602f8cd`, the rainbow block) with its twin sitting in the
-/// phaser beside it. `block_fill=none` now means the terminal's own cursor
-/// colour is on the glass; anything else names the owner, and
-/// `block_fill_base_from=style_identity` marks the owners (fire, water) whose
-/// colour is theirs BY DESIGN rather than a leak.
+/// A cursor-body effect replaces the caret's colour outright
+/// (`RenderInput::cursor_fill_override` is applied instead of the frame cursor
+/// colour), independent of `glow_active`/`pet_active`/`cat_active`.
+/// `block_fill=none` means the terminal's own cursor colour is on the glass;
+/// anything else names the owner, and `block_fill_base_from=style_identity`
+/// marks owners (fire, water) whose colour is theirs by design.
 ///
-/// READ THEM IN THAT ORDER. A zero `licensed` beside a nonzero `declined`
-/// means every move the engine saw was unlicensed — read
-/// `last_decline_reason`. A nonzero `licensed` over a dark screen means the
-/// licence is fine and the failure is downstream (morphology, tuning, the
-/// compositor), which the rest of the status row walks in frame order.
-///
-/// The one-command face of the sensor: the rainbow-trail blackout was
-/// diagnosed with `ATERM_TRACE_SPAWN` stderr logs, and the standing owner
-/// report *"I don't see the rainbow cursor trails"* was investigated by
-/// recording video and scanning frames for hue diversity.
-/// Both now read the engine's own truth, so a user report is ONE COMMAND.
 /// Read-only, main-thread hop like `tone` (the state lives in per-window App
-/// state); works headless. The ring form answers `OK <n>` + n rows and the
-/// status form the single-line `OK <line>` `rain status` established.
+/// state); works headless.
 pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let count = match parse_trail_form(rest) {
         Ok(TrailForm::Admissions(count)) => count,
         Ok(TrailForm::Status) => {
-            // ONE FRAMING PER VERB: `trail` is declared `Lines` in the verb
-            // catalog, so the status form answers `OK 1` + its single row
-            // rather than the bare `OK <line>` of a natively Status-framed
-            // verb like `rain`. A sub-form that flipped framing would need a
-            // framing form on the verb's table row or the shipping client would
-            // read the row as a count — the `temporal status` footgun.
+            // `trail` is declared `Lines` in the verb catalog, so the status
+            // form answers `OK 1` + its single row rather than a bare `OK <line>`.
             return match call_main(proxy, |tx| Wake::TrailStatus { reply: tx }) {
                 Ok(Ok(msg)) => format!("OK 1\n{msg}\n"),
                 Ok(Err(e)) => format!("ERR {e}\n"),
@@ -3098,19 +3114,12 @@ pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     out
 }
 
-/// `kitty` -> the cursor cat's wearable COLLECTION; `kitty wear <key>` -> put
+/// `kitty` -> the cursor cat's wearable collection; `kitty wear <key>` -> put
 /// one on.
 ///
-/// **THE DIRECT SWITCH.** Before this the only way to change the cursor cat was
-/// View ▸ Favourite This Kitty, which pins the cat that would ride ANYWAY —
-/// this window's tenured program cat, else the launch kitty. To wear a
-/// different one you first had to make it appear: relaunch for a fresh launch
-/// kitty, or run a program long enough to earn tenure and hope you liked what
-/// turned up. Naming the cat is what switching means, and the ledger already
-/// elects by GREATEST pin stamp, so a wear is monotone — it needs no unpin, and
-/// it survives a merge from any other replica of the collection.
-///
-/// A main-thread hop like `trail`/`tone`: the collection lives in `App`.
+/// The ledger elects by greatest pin stamp, so a wear is monotone — it needs no
+/// unpin, and it survives a merge from any other replica of the collection.
+/// Main-thread hop like `trail`/`tone`: the collection lives in `App`.
 pub(crate) fn cmd_kitty(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let rest = rest.trim();
     if let Some(key) = rest.strip_prefix("wear") {
@@ -3166,44 +3175,24 @@ pub(crate) fn cmd_session_status(proxy: &EventLoopProxy<Wake>, session: u64, res
     }
 }
 
-/// Split `rest` into `key=value` tokens, honouring a DOUBLE-QUOTED value.
+/// Split `rest` into `key=value` tokens, honouring a double-quoted value.
 ///
-/// The control protocol is newline-delimited and otherwise whitespace-split,
-/// which was fine while the only value anyone passed was a POSIX path. It is not
-/// fine on Windows: `cwd=C:\Program Files\Git` arrives as two tokens and is
-/// rejected as a usage error, and that is the majority of the paths a Windows
-/// operator actually has. So a value may be wrapped in `"…"`, and only the
-/// wrapping quotes are consumed — there is deliberately NO escape vocabulary
-/// (`\"`, doubling, percent-encoding): a Windows path cannot contain `"` at all,
-/// and inventing an escape grammar for a protocol whose framing is "one line"
-/// buys a corner case at the cost of a second parser everyone has to agree on.
-/// The front door refuses to forward such a path instead
+/// The control protocol is newline-delimited and otherwise whitespace-split; a
+/// value may be wrapped in `"…"` for paths containing spaces (e.g.
+/// `cwd="C:\Program Files\Git"`), and only the wrapping quotes are consumed.
+/// There is deliberately no escape vocabulary (`\"`, doubling, percent-encoding):
+/// the front door refuses to forward a path containing `"`
 /// (`aterm_cli::WindowRequest::control_request`).
 ///
-/// Backward compatible in both directions: an UNQUOTED value parses exactly as
-/// it always did, so every existing `aterm-ctl spawn cwd=/tmp/x` caller is
-/// untouched, and an older server simply never sees a quoted one (the front door
-/// only quotes when it must).
-///
-/// WHERE A `"` OPENS A QUOTE is therefore narrow on purpose: only at the start of
-/// a token, or immediately after the `=` of a `key=` prefix — the one place the
-/// wire format ever puts one. Anywhere else it is an ORDINARY CHARACTER. This
-/// module is cross-platform while its justification ("a Windows path cannot
-/// contain `\"`") is not: `/tmp/a"b` is a perfectly legal POSIX directory, it
-/// used to arrive as one whitespace-delimited token and work, and a state
-/// machine that toggled on every `"` would leave the line unterminated and
-/// answer `ERR usage`. Treating a mid-value quote as data costs nothing — the
-/// front door refuses to FORWARD such a path anyway
-/// (`aterm_cli::WindowRequest::control_request`), so the only way one arrives is
-/// a direct `aterm-ctl spawn` that used to be served.
+/// A `"` opens a quote only at the start of a token or immediately after the `=`
+/// of a `key=` prefix; anywhere else (such as `/tmp/a"b`) it is an ordinary
+/// character, so unquoted tokens split identically to `split_whitespace`.
 ///
 /// Returns `None` for an unterminated quote — a malformed request, answered with
 /// the verb's usage line rather than a half-path.
-/// The spawn/act argument tokenizer. `pub(crate)` because the socket-policy fence
-/// in `control.rs` MUST classify with the very tokenizer that later parses the
-/// command: a fence that splits differently than the parser is a fence with a
-/// spelling that walks past it (`spawn "connected=controller" of=…` parsed as a
-/// connected spawn while `split_whitespace` saw a token starting with `"`).
+///
+/// `pub(crate)` because the socket-policy fence in `control.rs` must classify
+/// with the same tokenizer that later parses the command.
 pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -3290,12 +3279,12 @@ fn valid_model(model: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// `identity=<name>|-` as parsed on the control thread (session identities,
-/// 2026-09-17). Three states, because an AIMED spawn (`@<sid> spawn`, or the
-/// connected form's `of=`) INHERITS the aimed session's identity by default —
-/// a worker running `aterm ctl spawn` must not fall back to the human's login
-/// — and `-` is how it opts out. Resolved on the main thread, where the aimed
-/// handle is ([`resolve_spawn_identity`]).
+/// `identity=<name>|-` as parsed on the control thread. Three states, because
+/// an aimed spawn (`@<sid> spawn`, or the connected form's `of=`) inherits the
+/// aimed session's identity by default — a worker running `aterm ctl spawn`
+/// must not fall back to the human's login — and `-` is how it opts out.
+/// Resolved on the main thread, where the aimed handle is
+/// ([`resolve_spawn_identity`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IdentitySpec {
     /// `identity=<name>`: spawn under this identity (folded to lowercase at
@@ -3324,9 +3313,8 @@ pub(crate) fn resolve_spawn_identity(
 /// ([`cmd_tab_aimed`]) — one grammar, one sentence.
 const TAB_USAGE: &str = "ERR usage: tab <new|N|next|prev|close [N]|move <from> <to>>\n";
 
-/// One parsed `spawn` request: the plain tab/split spawn (optionally AIMED at a
-/// window, design S3), or the CONNECTED form (design §6) with every argument
-/// present and validated.
+/// One parsed `spawn` request: the plain tab/split spawn (optionally aimed at a
+/// window), or the connected form with every argument present and validated.
 #[derive(Debug, PartialEq, Eq)]
 enum SpawnForm {
     Plain {
@@ -3361,26 +3349,22 @@ enum SpawnForm {
     },
 }
 
-/// PURE parse of the `spawn` argument line (unit-tested off the event loop),
+/// Pure parse of the `spawn` argument line (unit-tested off the event loop),
 /// over [`split_quoted_tokens`] so a quoted `cwd=` keeps its spaces in both
-/// forms. `of=` is MANDATORY when `connected=` is present — the App dispatch
+/// forms. `of=` is mandatory when `connected=` is present — the App dispatch
 /// discards selectors, and an authority-minting argument gets no guessed
-/// default (design §6); `place=` is equally explicit (the grammar brackets
-/// neither). A `place=`/`of=` without `connected=` is a usage error, as is any
-/// unknown token or value.
+/// default; `place=` is equally explicit. A `place=`/`of=` without `connected=`
+/// is a usage error, as is any unknown token or value.
 ///
-/// `split=` and `connected=` are mutually exclusive: `place=` already says
-/// where a connected newborn lands, and a pane split is not one of its two
-/// answers — so the pair is refused rather than silently resolved. The same
-/// rule covers `window=` and `raise=` (design S3): the connected form places
-/// by `place=`/`of=`, so an aim or a raise verdict beside it is refused rather
-/// than one of the two silently winning.
+/// `split=`, `window=`, and `raise=` are mutually exclusive with `connected=`:
+/// the connected form places by `place=`/`of=`, so an aim, raise verdict, or
+/// split beside it is refused rather than one of the two silently winning.
 ///
 /// `window=<id>` is the id `inspect app/v1 tabs` prints (a plain integer);
-/// `raise=` is exactly `true` or `false` — anything else is the usage line, so
-/// a misspelt verdict can never be read as "use the default".
+/// `raise=` accepts `t`/`true` or `f`/`false` — anything else is the usage line,
+/// so a misspelt verdict can never be read as "use the default".
 ///
-/// `agent=claude|codex` makes the plain form a WORKER's (`task_launch`):
+/// `agent=claude|codex` makes the plain form a worker's (`task_launch`):
 /// `model=`, `autopilot=<land|cruise>` (the newborn's own word; never `off`,
 /// which would start a worker nothing sees through), `from=` and the frame's
 /// `len=` (read by the serve loop, `control::spawn_frame_len`) come only with
@@ -3416,10 +3400,7 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
         } else if let Some(v) = tok.strip_prefix("window=") {
             window = Some(v.parse::<u64>().map_err(|_| ())?);
         } else if let Some(v) = tok.strip_prefix("raise=") {
-            // The summary's `<t|f>` and the long spelling every existing caller
-            // uses — measured 2026-09-17 (review): the summary said `<t|f>`
-            // beside `split=<v|h>`, whose letters ARE accepted, and `raise=t`
-            // was `ERR usage`.
+            // Accept both `<t|f>` from the summary and the long spelling.
             raise = Some(match v {
                 "t" | "true" => true,
                 "f" | "false" => false,
@@ -3521,14 +3502,14 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
     }
 }
 
-/// `cwd=<path>` naming a folder no shell can start in is REFUSED by name
-/// (audit #7 finding 48): `ERR no such folder <path>` when nothing is there,
-/// `ERR no access to folder <path>` when this user may not enter it. The
-/// caller named the folder and can act on the refusal, where a shell started
-/// quietly in the home folder — what a restored pane or a New Tab gets
-/// ([`crate::spawn_folder`]) — would mislead it. `None` with no `cwd=`, a
-/// folder a shell can start in, or one the check could not judge in time.
-/// Off unix nothing is refused here ([`crate::spawn_folder::folder_fault`]).
+/// `cwd=<path>` naming a folder no shell can start in is refused by name:
+/// `ERR no such folder <path>` when nothing is there, `ERR no access to folder
+/// <path>` when this user may not enter it. The caller named the folder and can
+/// act on the refusal, where a shell started quietly in the home folder — what
+/// a restored pane or a New Tab gets ([`crate::spawn_folder`]) — would mislead
+/// it. `None` with no `cwd=`, a folder a shell can start in, or one the check
+/// could not judge in time. Off unix nothing is refused here
+/// ([`crate::spawn_folder::folder_fault`]).
 fn spawn_cwd_refusal(form: &SpawnForm) -> Option<String> {
     use crate::spawn_folder::Fault;
     let (SpawnForm::Plain { cwd, .. } | SpawnForm::Connected { cwd, .. }) = form;
@@ -3544,12 +3525,12 @@ fn spawn_cwd_refusal(form: &SpawnForm) -> Option<String> {
     }
 }
 
-/// Where an aimed `spawn` lands (design S3, finding F3): the FRONT window (the
-/// historical `aterm new-tab` contract), an EXPLICIT `window=<id>`, or the
-/// window HOSTING the `@<sid>` selector's session (the routing rule `@<sid>
-/// image` already uses). Carried by [`Wake::SpawnSession`] and resolved to
-/// a window on the main thread ([`crate::App::aimed_window`]) — the control
-/// thread knows neither the window table nor whether the instance is headless.
+/// Where an aimed `spawn` lands: the front window (`aterm new-tab`), an explicit
+/// `window=<id>`, or the window hosting the `@<sid>` selector's session (the
+/// routing rule `@<sid> image` uses). Carried by [`Wake::SpawnSession`] and
+/// resolved to a window on the main thread ([`crate::App::aimed_window`]) — the
+/// control thread knows neither the window table nor whether the instance is
+/// headless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpawnAim {
     Front,
@@ -3568,20 +3549,17 @@ impl SpawnAim {
         }
     }
 
-    /// True when the caller NAMED a window, in either spelling — the input to
+    /// True when the caller named a window, in either spelling — the input to
     /// [`raise_after_spawn`].
     pub(crate) const fn is_aimed(self) -> bool {
         !matches!(self, Self::Front)
     }
 }
 
-/// The raise policy, PURE. An explicit `raise=` always wins; otherwise a spawn
-/// that named NO window raises (today's `aterm new-tab` attach contract,
-/// unchanged) and one that DID name a window does not. An agent aiming at a
-/// background window is not asking to see it: in the drive recorded in the
-/// agent-experience report (§2.3) the unconditional raise flipped the human's
-/// keyboard focus to the agent's window twice while they were typing in the
-/// foreground one.
+/// The raise policy, pure. An explicit `raise=` always wins; otherwise a spawn
+/// that named no window raises (`aterm new-tab` attach contract) and one that
+/// did name a window does not, so an agent aiming at a background window does
+/// not steal keyboard focus from the foreground window.
 pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -> bool {
     match raise {
         Some(explicit) => explicit,
@@ -3613,19 +3591,18 @@ fn worker_order(
 /// calls and drives each newborn with `turn`/`send`/`subscribe`, no process
 /// management.
 ///
-/// AIMING (design S3). The newborn lands in the frontmost window unless the
+/// Aiming: the newborn lands in the frontmost window unless the
 /// caller names one: `window=<id>` (an id from `inspect app/v1 tabs`) or the
 /// `@<sid>` selector, which means "the window hosting `<sid>`" — `session` is
-/// that selector's resolved local id, `None` for a flagless request, exactly
-/// as `image` receives it; only an Owner reaches here WITH a selector — the
-/// aimed forms keep the App authority verdict every other App-target selector
-/// gets (`control::app_route`). `window=` wins over `@<sid>`. `split=` on an
-/// aimed spawn divides THAT window's focused pane. The main thread answers
+/// that selector's resolved local id, `None` for a flagless request, as `image`
+/// receives it; only an Owner reaches here with a selector — the aimed forms
+/// keep the App authority verdict every other App-target selector gets
+/// (`control::app_route`). `window=` wins over `@<sid>`. `split=` on an aimed
+/// spawn divides that window's focused pane. The main thread answers
 /// `ERR no such window <id>` for an id no window carries; a headless instance
 /// owns logical window 0 (the one `ls`/`dims` name), so `window=0` and `@<sid>`
 /// resolve there just as they do to a real window and only `window=<other>` is
-/// `ERR no such window`. The reply shape is otherwise unchanged. `raise=` is
-/// decided HERE, purely
+/// `ERR no such window`. `raise=` is decided here, purely
 /// ([`raise_after_spawn`]): explicit wins, else only an un-aimed spawn raises.
 ///
 /// `cwd=<path>` sets the newborn's working directory (default: inherit the
@@ -3639,25 +3616,19 @@ fn worker_order(
 /// another machine's, so it is not taken, and the newborn starts where it
 /// would with none ([`crate::spawn_folder::inherited`]).
 ///
-/// `split=v` / `split=h` divides the FOCUSED PANE instead of opening a tab —
+/// `split=v` / `split=h` divides the focused pane instead of opening a tab —
 /// side-by-side and stacked respectively, the same two directions Cmd-D and
-/// Cmd-Shift-D take. This is the wire half of the front door's `aterm
-/// split-pane [-d <dir>]` (S12): a split is the one "new terminal" shape that
-/// could not be requested from outside the process, so the verb that opens a
-/// terminal grew an option rather than the protocol growing a second verb (a new
-/// verb would need its own op-class entry, roster line, and completion, for a
-/// variation on the same act).
+/// Cmd-Shift-D take (the wire half of `aterm split-pane [-d <dir>]`).
 ///
 /// The newborn runs the default shell; give it a command with
 /// `@<sid> turn '<cmd>'`. Main-thread hop like `open`/`controls`.
 ///
 /// `spawn connected=controlled|controller place=window|tab of=<sid> [cwd=…]`
-/// (design §6) additionally mints the `both` SESSION CONNECTION binding the
-/// newborn to `of=` — Owner-only (the `argument_escalation` fence runs before this
+/// additionally mints the `both` session connection binding the newborn to
+/// `of=` — Owner-only (the `argument_escalation` fence runs before this
 /// dispatch). The handler resolves `of=` on the main thread and refuses
-/// `place=window` under headless with the NEW `ERR headless` reply (§1.4#7);
-/// `place=tab` works headless. cwd default for the connected form is the
-/// ORIGIN session's cwd.
+/// `place=window` under headless with `ERR headless`; `place=tab` works
+/// headless. cwd default for the connected form is the origin session's cwd.
 ///
 /// `spawn … agent=claude [model=<m>] [autopilot=<land|cruise>] [from=<sid>]
 /// len=<n>` starts a WORKER (`task_launch`; Owner-only, the
@@ -3929,24 +3900,21 @@ pub(crate) type SpawnTaken = Box<dyn FnOnce(&mut crate::App, Result<Spawned, Str
 /// Where a wire `tab` verb's `(active_index, tab_count)` or refusal goes.
 pub(crate) type TabCmdReply = std::sync::mpsc::Sender<Result<(usize, usize), String>>;
 
-/// The MAIN-THREAD half of the aimed `spawn`/`tab` verbs (design S3). It sits
-/// beside the verbs' control-thread half rather than in `app_tabs.rs` because
-/// it is verb POLICY — which window a wire request means, and whether a spawn
-/// may take the foreground — not tab mechanics; the mechanics it calls
+/// The main-thread half of the aimed `spawn`/`tab` verbs. It sits beside the
+/// verbs' control-thread half rather than in `app_tabs.rs` because it is verb
+/// policy — which window a wire request means, and whether a spawn may take the
+/// foreground — not tab mechanics; the mechanics it calls
 /// (`open_tab_off_loop`, `split_focused_pane_in_window`, `apply_tab_cmd_in`)
 /// stay window-parameterised beside every other caller of theirs.
 impl crate::App {
     /// Resolve a [`SpawnAim`] to the window it names. `Front` is `Ok(None)` —
-    /// "whatever is frontmost when the spawn runs", the historical contract;
-    /// a named window resolves through [`Self::named_window`] /
-    /// [`Self::hosting_window`], both of which refuse BEFORE anything is
-    /// created. A headless instance owns ONE logical window (id 0, the one
-    /// `ls`/`windows`/`dims` report) — so `window=0` and `@<sid>` resolve to it
-    /// there exactly as they do to a real window, and only `window=<other>` is
-    /// `ERR no such window`. The blanket `ERR headless` this used to answer for
-    /// every aim was inconsistent with the roster the same instance printed
-    /// (§1.4#7 review); raising the resolved window is simply a no-op headless
-    /// (it has no OS surface — [`Self::spawn_session_aimed`]).
+    /// "whatever is frontmost when the spawn runs"; a named window resolves
+    /// through [`Self::named_window`] / [`Self::hosting_window`], both of which
+    /// refuse before anything is created. A headless instance owns one logical
+    /// window (id 0, the one `ls`/`windows`/`dims` report) — so `window=0` and
+    /// `@<sid>` resolve to it there as they do to a real window, and only
+    /// `window=<other>` is `ERR no such window`; raising the resolved window is
+    /// a no-op headless (it has no OS surface — [`Self::spawn_session_aimed`]).
     pub(crate) fn aimed_window(&self, aim: SpawnAim) -> Result<Option<crate::WindowId>, String> {
         match aim {
             SpawnAim::Front => Ok(None),
@@ -4101,16 +4069,16 @@ impl crate::App {
     ) -> Result<SpawnPlan, String> {
         let host = self.aimed_window(aim)?;
         let worker = task.map(|order| self.worker_precheck(order)).transpose()?;
-        // IDENTITY (session identities, 2026-09-17): an aimed spawn inherits
-        // the aimed session's identity unless `identity=` says otherwise, so a
-        // worker's own `aterm ctl spawn` stays under its login instead of
-        // falling back to the human's. A named identity is created on the
-        // verb, and nowhere else: by the spawner, before the fork, once this
-        // turn has admitted the spawn (the aim above, the theme), so a refused
-        // spawn makes none; an inherited one is only checked there
-        // ([`crate::tab_spawn::IdentityPrep::Admit`]). Its failure is this
-        // spawn's reply (`ERR identity <name>: <why>`), never a shell without
-        // its env, and the folder's metadata is never read in this turn.
+        // Identity: an aimed spawn inherits the aimed session's identity unless
+        // `identity=` says otherwise, so a worker's own `aterm ctl spawn` stays
+        // under its login instead of falling back to the human's. A named
+        // identity is created on the verb, and nowhere else: by the spawner,
+        // before the fork, once this turn has admitted the spawn (the aim
+        // above, the theme), so a refused spawn makes none; an inherited one is
+        // only checked there ([`crate::tab_spawn::IdentityPrep::Admit`]). Its
+        // failure is this spawn's reply (`ERR identity <name>: <why>`), never a
+        // shell without its env, and the folder's metadata is never read in
+        // this turn.
         let aimed = match aim {
             SpawnAim::Session(local) => self.identity_of_local(local),
             SpawnAim::Front | SpawnAim::Window(_) => None,
@@ -4527,31 +4495,25 @@ impl crate::App {
         }
     }
 
-    /// THE ONE wire `tab` bracket, shared by the front and aimed forms so the
-    /// two spellings of `tab close` cannot carry different close policies.
+    /// The wire `tab` bracket, shared by the front and aimed forms so the two
+    /// spellings of `tab close` cannot carry different close policies.
     ///
     /// A control-socket `tab close` is a non-interactive instruction and must
-    /// NOT pop the blocking native confirm dialog (that wedged the UI thread
-    /// inside `runModal` and the client's blocking reply behind it). It ran
-    /// `Programmatic` — proceed busy or not — which made `tab close` the one
-    /// wire path that killed a running job: on a last tab with a foreground job
-    /// it answered `OK 0 1` and the instance was gone within a second, while
-    /// the sibling `close` refused and `invoke CloseTab` raised the dialog
-    /// (audit 2026-09-22, reproduced twice). It now runs the `close` verb's
+    /// not pop the blocking native confirm dialog (which would wedge the UI
+    /// thread inside `runModal` and the client's blocking reply behind it). It
+    /// runs the `close` verb's
     /// [`CloseConfirm::WireRefuseBusy`](crate::app_window::CloseConfirm): no
-    /// dialog ever, an idle close proceeds, a busy LAST-tab close is refused in
+    /// dialog ever, an idle close proceeds, a busy last-tab close is refused in
     /// the `close` verb's words (`ERR close refused (a running job armed the
     /// last-tab confirm)`) and a busy tab among several as `close` refuses its
     /// pane (`App::close_tab_via_verb`), carried to the reply by
     /// `pending_action_refusal`.
     /// A last-tab close that proceeds flags `pending_close`, escalated here so
-    /// the window really tears down (the close paths hold no `ActiveEventLoop`).
+    /// the window tears down (the close paths hold no `ActiveEventLoop`).
     ///
-    /// The bracket also names WHO closed: [`Self::tab_cmd_applied`] opens the
+    /// The bracket also names who closed: [`Self::tab_cmd_applied`] opens the
     /// `ctl-close` scope with the caller `by`, so a `tab close` journals `by=ctl`
-    /// (or the edge caller's sid) the way the `close` verb does. It wrote
-    /// `by=-` until 2026-09-22 — the wake carried no caller — beside a `help
-    /// exits` that promised `by=<caller>`.
+    /// (or the edge caller's sid) the way the `close` verb does.
     fn tab_cmd_bracketed(
         &mut self,
         el: &ActiveEventLoop,
@@ -4597,8 +4559,6 @@ impl crate::App {
     /// `ui-close by=human` for the gestures that reach it directly; the scope
     /// is outermost-wins, so the wire caller's attribution holds, and a
     /// last-tab close stashes it on its window for the deferred teardown.
-    /// Until 2026-09-27 the wake carried no caller, and a script's `invoke
-    /// CloseTab` was journalled as a person closing the tab.
     pub(crate) fn invoke_attributed(
         &mut self,
         by: crate::session_store::ExitActor,
@@ -4626,13 +4586,9 @@ impl crate::App {
 /// closed the session (`exits` → `reason=ctl-close by=<by>`), the one fact the
 /// target's ctx cannot supply: the dispatch resolved `session`/`sid` from the
 /// selector, and the caller is somebody else.
-/// `close` takes NO argument — validate the tail before anything is retired.
-///
-/// The silent-ignore hole this release closed for `text` (F4's sub-finding) sat
-/// on `close` too, where the cost is not a wasted read but a dead pane: a driver
-/// guessing `@<sid> close --dry-run` (or `close 2`, aiming at a tab index the
-/// verb has never taken) got the session retired and an `OK closed` that looked
-/// like the guess had been honoured. A guess must fail, and say so.
+/// `close` takes no argument — validate the tail before anything is retired,
+/// so a flag or tab index (`close --dry-run`, `close 2`) is refused rather than
+/// retiring the session.
 pub(crate) fn close_no_arg(rest: &str) -> Result<(), String> {
     if rest.trim().is_empty() {
         Ok(())
@@ -4690,11 +4646,11 @@ pub(crate) fn cmd_chrome(proxy: &EventLoopProxy<Wake>) -> String {
     out
 }
 
-/// `panes` -> the ACTIVE-tab split-pane layout (split-pane audit
-/// introspection): a `layout tab=<i> panes=<n> zoomed=<bool>` header + one
+/// `panes` -> the active-tab split-pane layout: a `layout tab=<i> panes=<n>
+/// zoomed=<bool>` header + one
 /// `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> focused=<bool>`
-/// row per visible pane, in CELL coords. `session` = a cross-session target:
-/// the layout of the window whose ACTIVE tab displays that session (the
+/// row per visible pane, in cell coords. `session` = a cross-session target:
+/// the layout of the window whose active tab displays that session (the
 /// `image` routing rule); `None` = the front window. A pure main-thread read
 /// (`Wake::ReadPanes`, the `chrome` round-trip shape); works headless.
 pub(crate) fn cmd_panes(proxy: &EventLoopProxy<Wake>, session: Option<u64>) -> String {
@@ -4716,9 +4672,7 @@ mod trail_parse_tests {
 
     /// The two forms of one verb must not swallow each other: `status` is a
     /// keyword, not a malformed count, and a count is a count, not an unknown
-    /// keyword. Before the status form existed, `trail status` answered
-    /// `ERR usage: trail [<n>] (got "status")` — which is exactly what a user
-    /// reaching for the obvious spelling would have typed first.
+    /// keyword.
     #[test]
     fn the_status_keyword_and_a_ring_count_are_separate_forms() {
         assert_eq!(parse_trail_form("status"), Ok(TrailForm::Status));
@@ -4817,12 +4771,9 @@ mod spawn_parse_tests {
     };
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
 
-    /// AUDIT #7 FINDING 48 — `spawn cwd=<dir>` naming no folder is refused by
-    /// name, in both forms, before anything is spawned: the agent that asked
-    /// can act on `ERR no such folder <dir>` (or `ERR no access to folder
-    /// <dir>` for one it may not enter), where a shell started quietly in the
-    /// home folder would mislead it. NEGATIVE CONTROLS: a folder that is
-    /// there, and no `cwd=` at all, pass through to the spawn.
+    /// `spawn cwd=<dir>` naming no folder is refused by name, in both forms,
+    /// before anything is spawned (`ERR no such folder <dir>` or `ERR no access
+    /// to folder <dir>`); an existing folder and no `cwd=` pass through.
     #[cfg(unix)]
     #[test]
     fn a_spawn_whose_cwd_names_no_folder_is_refused_by_name() {
@@ -4875,14 +4826,9 @@ mod spawn_parse_tests {
         );
     }
 
-    /// REVIEW (contract lens, 2026-09-17): the catalog's `spawn` summary says
-    /// `[raise=<t|f>]` beside `[split=<v|h>]`, whose letters ARE the accepted
-    /// values — and the parser refused `raise=t` (`ERR usage`). Every
-    /// spelling the summary, the usage line and the full entry name parses,
-    /// the long form every existing caller uses included; anything else is
-    /// still usage. A malformed aim or verdict is never "use the default":
-    /// `raise=maybe` must not quietly become an un-aimed raise, and a window
-    /// id is a plain integer from `inspect app/v1 tabs`, nothing looser.
+    /// Both the `<t|f>` letters from the `spawn` summary and the long
+    /// `true|false` form parse; malformed `raise=` or `window=` values are
+    /// rejected as usage errors rather than falling back to defaults.
     #[test]
     fn the_summarys_raise_letters_parse_like_splits_do() {
         let raise_of = |rest: &str| match parse_spawn_args(rest) {
@@ -4920,10 +4866,8 @@ mod spawn_parse_tests {
         }
     }
 
-    /// The BACKWARD-COMPATIBILITY leg: every `spawn` request that worked before
-    /// quoting existed must tokenize byte-identically, or a quiet regression
-    /// lands in every existing `aterm-ctl spawn` caller and every orchestrator
-    /// script.
+    /// Unquoted `spawn` requests tokenize identically to `split_whitespace`,
+    /// including mid-value quotes on POSIX paths.
     #[test]
     fn unquoted_requests_tokenize_exactly_as_whitespace_splitting_did() {
         for rest in [
@@ -4932,11 +4876,8 @@ mod spawn_parse_tests {
             "cwd=/tmp/x",
             "  cwd=/tmp/x  ",
             "cwd=/tmp/x split=v",
-            // A `"` INSIDE a value: legal on macOS/Linux, and the whole point of
-            // the "byte-identical for every unquoted shape" claim. Before the
-            // quote rule was narrowed these toggled the state machine, left the
-            // line unterminated, and turned a working `aterm-ctl spawn` into
-            // `ERR usage`.
+            // A `"` inside a value is treated as data when not at a token
+            // boundary or immediately after `=`.
             r#"cwd=/tmp/a"b"#,
             r#"cwd=/tmp/a"b"c"#,
             r#"cwd=/tmp/say"hi split=h"#,
@@ -5124,8 +5065,7 @@ mod spawn_parse_tests {
                 ..
             })
         ));
-        // `of=` is MANDATORY when connected= is present (an authority-minting
-        // argument gets no guessed default — design §6) — and so is place=.
+        // `of=` and `place=` are mandatory when `connected=` is present.
         assert_eq!(parse_spawn_args("connected=controlled place=tab"), Err(()));
         assert_eq!(parse_spawn_args("connected=controlled of=s-abc"), Err(()));
         assert_eq!(parse_spawn_args("connected=controlled"), Err(()));
@@ -5156,12 +5096,10 @@ mod spawn_parse_tests {
         }
     }
 
-    /// `identity=<name>|-` (session identities, 2026-09-17) parses in BOTH
-    /// forms: a name folds to lowercase at parse (`Worker` and `worker` are one
-    /// identity — one directory on a case-insensitive filesystem), `-` is the
-    /// absent mark that opts an aimed spawn out of inheriting, and anything
-    /// outside the grammar — a path, a shell word, `-x`, an empty value, a
-    /// 65-character name — is the usage line, never a spawn under a guess.
+    /// `identity=<name>|-` parses in both forms: a name folds to lowercase at
+    /// parse (`Worker` and `worker` are one identity — one directory on a
+    /// case-insensitive filesystem), `-` is the absent mark that opts an aimed
+    /// spawn out of inheriting, and anything outside the grammar is rejected.
     #[test]
     fn identity_parses_folded_in_both_forms_and_the_absent_mark_opts_out() {
         assert_eq!(
@@ -5258,9 +5196,9 @@ mod spawn_parse_tests {
         assert!(SpawnAim::Session(0).is_aimed());
     }
 
-    /// The raise policy, all four cells (design S3): an explicit verdict wins
-    /// either way; with none, an un-aimed spawn raises (the `aterm new-tab`
-    /// attach contract, unchanged) and an aimed one does not — the F3 fix.
+    /// The raise policy, all four cells: an explicit verdict wins either way;
+    /// with none, an un-aimed spawn raises (`aterm new-tab` attach contract)
+    /// and an aimed one does not.
     #[test]
     fn raise_after_spawn_all_four_cells() {
         use super::raise_after_spawn;
@@ -5313,14 +5251,13 @@ mod close_arg_tests {
     }
 }
 
-/// The wire `tab close` guard (audit 2026-09-22 defect b): a busy LAST-tab
-/// `tab close` is refused in the `close` verb's words, a busy tab among
-/// several is refused as `close` refuses its pane, and an idle one proceeds —
-/// the `close` verb's exact scope. Driven through `tab_cmd_applied`, the part
-/// of `tab_cmd_bracketed` that runs before the escalation, because the bracket
-/// itself needs the `ActiveEventLoop` a unit test cannot construct. Every
-/// guarded case is WINDOWED (`headless = false`): the headless short-circuit
-/// never confirms, so it would keep a dead guard green.
+/// The wire `tab close` guard: a busy last-tab `tab close` is refused in the
+/// `close` verb's words, a busy tab among several is refused as `close` refuses
+/// its pane, and an idle one proceeds. Driven through `tab_cmd_applied`, the
+/// part of `tab_cmd_bracketed` that runs before the escalation, because the
+/// bracket itself needs the `ActiveEventLoop` a unit test cannot construct.
+/// Every guarded case is windowed (`headless = false`): the headless
+/// short-circuit never confirms.
 #[cfg(test)]
 mod wire_tab_close_guard_tests {
     use crate::app_window::{CloseConfirm, WIRE_CLOSE_REFUSED, WIRE_TAB_CLOSE_REFUSED};
@@ -5373,12 +5310,10 @@ mod wire_tab_close_guard_tests {
         (row.reason, row.actor.as_wire().to_string())
     }
 
-    /// `tab close` NAMES ITS CALLER on the exit ledger, the way `close` does:
-    /// `by=ctl` for an owner-token client, the edge caller's sid for an edge.
-    /// Both closes the ledger sees — a non-last tab retired inside the verb's
-    /// turn, and a LAST tab whose window teardown runs on a later turn — wrote
-    /// `by=-` until 2026-09-22 (the wake carried no caller), which is what the
-    /// audit read beside a `help exits` promising `by=<caller>`.
+    /// `tab close` names its caller on the exit ledger, the way `close` does:
+    /// `by=ctl` for an owner-token client, the edge caller's sid for an edge,
+    /// for both a non-last tab retired inside the verb's turn and a last tab
+    /// whose window teardown runs on a later turn.
     #[test]
     fn a_wire_tab_close_journals_its_caller() {
         let mut app = App::headless_for_test();
@@ -5388,7 +5323,7 @@ mod wire_tab_close_guard_tests {
         wire_tab_close(&mut app, Some(1)).expect("a non-last tab closes");
         assert_eq!(last_exit(&app), (ExitReason::CtlClose, "ctl".to_string()));
 
-        // The last tab only FLAGS its window; the attribution must survive the
+        // The last tab only flags its window; the attribution must survive the
         // scope to the deferred teardown (`escalate_pending_close` ->
         // `close_window_logical`, driven directly here).
         wire_tab_close_by(&mut app, None, ExitActor::Sid("s-edge-caller".to_string()))
@@ -5401,14 +5336,8 @@ mod wire_tab_close_guard_tests {
         );
     }
 
-    /// `invoke CloseTab` NAMES ITS CALLER as well. Its arm lands in
-    /// `close_active_tab`, Cmd-W's own path, which journals `ui-close
-    /// by=human` for the gestures that reach it directly — so until
-    /// 2026-09-27 a script's `invoke CloseTab` was journalled as a person
-    /// closing the tab. The `Wake::InvokeMenuAction` arm needs an
-    /// `ActiveEventLoop`, so this drives the CloseTab arm's call inside
-    /// [`App::invoke_attributed`] the way the arm does, and pins the arm to
-    /// that scope by source.
+    /// `invoke CloseTab` names its caller as well: its arm lands in
+    /// `close_active_tab`, Cmd-W's own path, inside [`App::invoke_attributed`].
     #[test]
     fn an_invoked_close_tab_journals_its_caller_not_a_human() {
         let mut app = App::headless_for_test();
@@ -5427,7 +5356,7 @@ mod wire_tab_close_guard_tests {
         assert_eq!(invoked, Ok("invoked CloseTab".to_string()));
         assert_eq!(last_exit(&app), (ExitReason::CtlClose, "ctl".to_string()));
 
-        // The last tab only FLAGS its window; the stash carries the caller to
+        // The last tab only flags its window; the stash carries the caller to
         // the teardown that runs after the scope has closed.
         let _ = app.invoke_attributed(ExitActor::Sid("s-edge-caller".to_string()), |app| {
             assert_eq!(app.close_active_tab(), Some(wid), "the last tab closes");
@@ -5440,10 +5369,9 @@ mod wire_tab_close_guard_tests {
         );
     }
 
-    /// THE DEFECT: `tab close` of a last tab running an in-shell job answered
-    /// `OK 0 1` and ended the instance. It is now refused in the `close`
-    /// verb's words, the tab and the session survive, and the same close
-    /// proceeds the moment the job finishes.
+    /// `tab close` of a last tab running an in-shell job is refused in the
+    /// `close` verb's words; the tab and session survive, and the close
+    /// proceeds once the job finishes.
     #[test]
     fn a_busy_last_tab_tab_close_is_refused_and_proceeds_once_idle() {
         let mut app = App::headless_for_test();
@@ -5475,11 +5403,8 @@ mod wire_tab_close_guard_tests {
         );
     }
 
-    /// A busy tab AMONG SEVERAL is refused too, because `close` of its pane
-    /// is: the window-exit confirm never sees this close (the window stays
-    /// open), so until the review of this guard `tab close 0` answered `OK`
-    /// and hung up the very job `close` of the same session refused. Nothing
-    /// moves on the refusal, and the same close proceeds once the job ends.
+    /// A busy tab among several is refused too, as `close` refuses its pane;
+    /// nothing moves on the refusal, and the close proceeds once the job ends.
     #[test]
     fn a_busy_non_last_tab_close_is_refused_as_close_refuses_its_pane() {
         let mut app = App::headless_for_test();
@@ -5589,12 +5514,9 @@ mod spawn_aim_app_tests {
     }
 
     /// `window=<id>` names the table's ids (the ones `inspect app/v1 tabs`
-    /// prints), an unknown id is refused BY NAME, and `@<sid>` resolves to the
-    /// window whose pane trees hold the session — a background window
-    /// included, which is the whole point of aiming. A `--headless` instance
-    /// resolves against its OWN window table exactly as a windowed one does,
-    /// never the old blanket `ERR headless` that contradicted the roster
-    /// (§1.4#7 review).
+    /// prints), an unknown id is refused by name, and `@<sid>` resolves to the
+    /// window whose pane trees hold the session — a background window included,
+    /// in both windowed and `--headless` modes.
     #[test]
     fn a_named_or_hosting_window_resolves_and_an_unknown_one_is_named_back() {
         for headless in [true, false] {
@@ -5740,12 +5662,11 @@ mod worker_start_app_tests {
         app.pool.get(local).expect("live session").ctx.clone()
     }
 
-    /// A WORKER THAT CANNOT START LEAVES NOTHING BEHIND: one that did not
-    /// register is refused and its task file removed; one whose `working`
-    /// mark a committing update's fence refuses is closed again too. The
-    /// NEGATIVE CONTROL is the same start with no fence: a worker, `working`
-    /// from its starter, its tab and its task file standing — until its
-    /// session closes, which removes the file.
+    /// A worker that cannot start leaves nothing behind: one that did not
+    /// register is refused and its task file removed; one whose `working` mark
+    /// a committing update's fence refuses is closed again too. With no fence,
+    /// the worker starts as `working` with its tab and task file standing until
+    /// its session closes.
     #[test]
     fn a_worker_that_cannot_start_is_closed_again_and_leaves_no_task_file() {
         let state = aterm_tempfile::Builder::new()
@@ -5807,11 +5728,9 @@ mod worker_start_app_tests {
         });
     }
 
-    /// A SPAWN'S OWN AUTOPILOT WORD IS THE WORKER'S (FOREVER LAND §1.4):
-    /// `spawn agent=claude autopilot=cruise` parsed, ordered and started
-    /// writes the newborn's `autopilot=cruise` and seeds its task file with
-    /// the Cruise fact line. NEGATIVE CONTROL: the same spawn with no word is
-    /// a Land worker with the Land fact line.
+    /// `spawn agent=claude autopilot=cruise` parsed, ordered and started writes
+    /// the newborn's `autopilot=cruise` and seeds its task file with the Cruise
+    /// fact line; with no word it is a Land worker with the Land fact line.
     #[test]
     fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
         use aterm_agent::supervise::Autopilot;
@@ -5913,15 +5832,11 @@ mod worker_start_app_tests {
         }
     }
 
-    /// A WORKER'S LAUNCHER STARTS ONLY ONCE ITS REPLY IS TAKEN: a worker
-    /// whose `OK <sid>` nobody took (the lane's end dropped) is closed again,
-    /// its task file removed, and nothing is typed into it. The NEGATIVE
-    /// CONTROL, the same worker with its reply taken, has its launcher run to
-    /// its prompt and on to the line's main-thread admission, and keeps its tab
-    /// and its file, so the first case's silence is the dropped reply's doing.
-    /// A headless App has no event loop to admit the line on, so the launcher
-    /// says so and types nothing; the admission itself is
-    /// `control_tests::a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does`.
+    /// A worker's launcher starts only once its reply is taken: a worker whose
+    /// `OK <sid>` nobody took (the lane's end dropped) is closed again, its
+    /// task file removed, and nothing is typed into it. With its reply taken,
+    /// its launcher runs to its prompt and on to the line's main-thread
+    /// admission, keeping its tab and file.
     #[cfg(unix)]
     #[test]
     fn a_workers_launcher_starts_only_once_its_reply_is_taken() {
@@ -6919,9 +6834,8 @@ mod video_parse_tests {
 
     /// A launch that has not recorded yet has no `video/<instance>` at all, and on a fresh
     /// machine no `video/`. That is the ordinary empty state: it reads like the empty
-    /// namespace above and names the one action, never the confinement refusal a fresh
-    /// instance used to answer with. Negative control: a `video/` that is a file, not a
-    /// directory, is still refused.
+    /// namespace above and names the one action. Negative control: a `video/` that is a
+    /// file, not a directory, is still refused.
     #[test]
     fn video_frames_before_the_first_recording_says_there_is_none() {
         const INSTANCE: &str = "p305-fresh";
@@ -7431,10 +7345,8 @@ mod call_main_within_tests {
         assert!(timed_out.is_err() && dropped.is_err());
         assert_ne!(timed_out, dropped);
     }
-    /// ROUND 16, DAY TWO: behind the ⌘Q confirmation a `window` capture hung
-    /// 90 s. A main-thread verb is refused AT ONCE while the modal park is the
-    /// breadcrumb (ruling 267), and only then — every other root posts as
-    /// before.
+    /// A main-thread verb is refused at once while the modal park is the
+    /// breadcrumb, and only then.
     #[test]
     fn a_main_thread_verb_is_refused_while_a_dialog_stands() {
         use crate::watchdog::Breadcrumb;

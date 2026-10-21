@@ -4,7 +4,7 @@ seq v=1 rig=screen program=claude build=2.1.0
 see busy
 half
 see prompt bash:not-read-only
-expect open p1 approval par=t1 box=bash:not-read-only at=500
+expect open p1 approval par=t1 box=bash:not-read-only @500
 admit ctl act=approve
 accept
 see busy

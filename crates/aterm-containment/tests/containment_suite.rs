@@ -1,22 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE aterm-containment INTEGRATION SUITE: every integration file but two, as
-//! modules of ONE test binary.
+//! Combined `aterm-containment` integration test binary.
 //!
-//! Most of these files exist to test the crate's ONE-SHOT process state — the
-//! containment mode is a `OnceLock` — so each used to be its own binary to get
-//! a fresh process. They still get one: [`in_fresh_process`] re-executes THIS
-//! binary filtered to exactly the calling test, with [`FRESH_CHILD`] naming it,
-//! and the body runs only in that child. The parent never touches the mode, so
-//! `claimant_census`, which needs no fresh process, runs in it beside them.
-//!
-//! Two files stay their own `[[test]]` (see `Cargo.toml`): `audit_denial_logged`
-//! installs the process-global logger and counts its records exactly, and
-//! `image_anchor_live` copies its own binary and re-enters it by `--exact`.
-//!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
+//! Tests that initialize the process-wide containment mode `OnceLock` run in
+//! an isolated child via [`in_fresh_process`] (`--exact <module>::<fn>` with
+//! [`FRESH_CHILD`]). `audit_denial_logged` and `image_anchor_live` remain
+//! separate `[[test]]` targets in `Cargo.toml` (`autotests = false`).
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -25,16 +15,9 @@
 /// Names, in a re-executed child, the one test that child exists to run.
 const FRESH_CHILD: &str = "ATERM_CONTAINMENT_FRESH_CHILD";
 
-/// Run `body` in a FRESH PROCESS: the mode `OnceLock` unset and no sibling
-/// test in the process.
-///
-/// Called from a `#[test]` as `in_fresh_process(module_path!(), "<fn name>", ||
-/// …)`. In the parent it re-executes this binary as `--exact <module>::<fn>
-/// --test-threads=1` with [`FRESH_CHILD`] set to that name, and passes only if
-/// the child REPORTS exactly one passed test by that name — so a misspelt name
-/// (which libtest answers with a green "0 passed") fails here instead of
-/// passing without running anything. In the child the variable matches and the
-/// body runs.
+/// Re-execute this test binary with `--exact <module>::<test> --test-threads=1`
+/// and [`FRESH_CHILD`] set so `body` runs in a fresh process with an unset
+/// containment mode `OnceLock`, asserting that libtest ran `1 passed`.
 fn in_fresh_process(module: &str, test: &str, body: impl FnOnce()) {
     // libtest names a test by its module path WITHOUT the crate segment.
     let module = module.split_once("::").map_or("", |(_, rest)| rest);

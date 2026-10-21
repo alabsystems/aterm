@@ -8,9 +8,8 @@ use aterm_session::sink::SinkWriter;
 use super::{App, WindowId};
 use crate::input::Source;
 
-/// A headless App whose session sink is the WRITE end of a nonblocking pipe,
-/// plus the READ end: every byte the paste seam sends to the "shell" is
-/// observable, and an empty pipe is proof nothing was delivered.
+/// A headless App whose session sink is the write end of a pipe, plus the nonblocking
+/// read end: every byte the paste seam sends the shell is observable.
 fn app_with_pty_observer() -> (App, i32) {
     let mut pipe = [0; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "observer pipe");
@@ -26,7 +25,7 @@ fn app_with_pty_observer() -> (App, i32) {
 
 /// Everything queued on the observer pipe (empty = the paste never reached the PTY).
 /// Delivery happens on the per-session writer thread, so this polls until bytes arrive
-/// or the deadline passes; negative assertions use the same deadline.
+/// or the deadline passes.
 fn drain_within(fd: i32, ms: u64) -> Vec<u8> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     let mut out = Vec::new();
@@ -50,8 +49,8 @@ fn drain(fd: i32) -> Vec<u8> {
     drain_within(fd, 60_000)
 }
 
-/// The negative form: a parked/cancelled paste submits NO writer job, so a
-/// short grace window is enough to catch a leak without slowing the suite.
+/// The negative form: a parked or cancelled paste submits no writer job, so a short
+/// grace window catches a leak.
 fn assert_no_bytes(fd: i32, why: &str) {
     assert_eq!(drain_within(fd, 150), b"", "{why}");
 }
@@ -146,15 +145,12 @@ fn a_mode_flip_while_the_question_stands_cannot_reframe_the_answer() {
     );
 }
 
-/// Bytes larger than any pipe can hold: one such frame parks the FIFO
-/// writer thread inside its blocking write, which is what makes the window
-/// between a gesture and its drain a place a test can stand rather than a
-/// race it has to win.
+/// Larger than any pipe holds: one such frame parks the writer thread inside its
+/// blocking write, so a test can act between a gesture and its drain without a race.
 const WEDGE_BYTES: usize = 256 * 1024;
 
-/// Read until `want` bytes have arrived (or `ms` elapses), then take
-/// whatever else follows within a short idle grace — so an answer SHORTER
-/// than expected still returns promptly and a longer one is never truncated.
+/// Read until `want` bytes have arrived (or `ms` elapses), then whatever follows within
+/// a short idle grace, so a short answer returns promptly and a long one is not truncated.
 fn drain_at_least(fd: i32, want: usize, ms: u64) -> Vec<u8> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     let mut out = Vec::new();
@@ -201,8 +197,8 @@ fn a_mode_flip_before_the_drain_cannot_unframe_a_paste_nobody_was_asked_about() 
     );
 }
 
-/// `confirm_multiline_paste = false` (the explicit opt-out) delivers a risky
-/// paste straight through, exactly as before the banner existed.
+/// `confirm_multiline_paste = false` (the opt-out) delivers a risky paste straight
+/// through.
 #[test]
 fn the_opt_out_keeps_the_direct_delivery_path() {
     let (mut app, rx) = app_with_pty_observer();

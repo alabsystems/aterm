@@ -38,7 +38,11 @@
 //! agy subagent's turns held for a step's delay ([`held_reply`]);
 //! `rate-limit` and `limit:CLAIM:RESET` the 429 `RESOURCE_EXHAUSTED` whose
 //! `QuotaFailure` names a per-day quota, which both CLIs take as terminal
-//! ([`quota_error`]); and the walls of [`mode_error`]. A custom mode streams
+//! ([`quota_error`]: an API key's spent day) — but `limit:code_assist:RESET`
+//! the 429 a Google account's spent usage limit gets from Code Assist, its
+//! `QUOTA_EXHAUSTED` reason and the reset in its `RetryInfo`, on which Gemini
+//! CLI's usage-limit dialog names the reset ([`exhausted_error`],
+//! [`ACCOUNT_CLAIM`]); and the walls of [`mode_error`]. A custom mode streams
 //! its `text` (a 200 that does not say `"stream": false`), else answers as the
 //! other APIs' custom modes do.
 //!
@@ -478,6 +482,63 @@ pub fn quota_error_for(model: &str, quota_id: &str, limit: u32, retry_delay: &st
 /// retried the same per-day body with a 5 s delay (agy 1.4.0, measured).
 pub const DAY_QUOTA_RETRY: i64 = 3600;
 
+/// The claim of `limit:CLAIM:RESET` whose Gemini API answer is a Google
+/// ACCOUNT's spent usage limit ([`exhausted_error`]) rather than an API key's
+/// spent per-day quota ([`quota_error`], every other claim).
+pub const ACCOUNT_CLAIM: &str = "code_assist";
+
+/// The 429 `RESOURCE_EXHAUSTED` Google's Code Assist server
+/// (`cloudcode-pa.googleapis.com`, the API a Google sign-in's Gemini CLI
+/// speaks) answers once the ACCOUNT's usage limit on `model` is spent: the
+/// message `You have exhausted your capacity on this model. Your quota will
+/// reset after <span>.`, an `ErrorInfo` whose reason is `QUOTA_EXHAUSTED` in
+/// the Code Assist domain with the reset in its metadata (`quotaResetDelay`,
+/// `quotaResetTimeStamp`), and a `RetryInfo` of the same delay. Gemini CLI
+/// 0.46.0 reads the details, never the host that sent them
+/// (`classifyGoogleError`: a `QUOTA_EXHAUSTED` of a Code Assist domain is its
+/// terminal quota error carrying the `RetryInfo` delay), so its usage-limit
+/// dialog names the reset (`useQuotaAndFallback`: `Usage limit reached for
+/// <model>.` over `Access resets at <time>.`) under the lab's API key too,
+/// with no sign-in. An API key's per-day quota ([`quota_error`]) draws the same
+/// dialog with no reset: its `QuotaFailure` names `PerDay`, which the CLI
+/// takes as terminal before it reads any delay.
+#[must_use]
+pub fn exhausted_error(model: &str, retry_secs: i64, reset_s: i64) -> J {
+    let secs = retry_secs.max(0);
+    let span = format!("{}h{}m{}s", secs / 3600, secs % 3600 / 60, secs % 60);
+    let span = span.strip_prefix("0h").unwrap_or(&span).to_string();
+    google_error(
+        429,
+        "RESOURCE_EXHAUSTED",
+        &format!(
+            "You have exhausted your capacity on this model. Your quota will reset after {span}."
+        ),
+        vec![
+            J::obj([
+                ("@type", J::s("type.googleapis.com/google.rpc.ErrorInfo")),
+                ("reason", J::s("QUOTA_EXHAUSTED")),
+                ("domain", J::s("cloudcode-pa.googleapis.com")),
+                (
+                    "metadata",
+                    J::obj([
+                        ("uiMessage", J::s("true")),
+                        ("model", J::s(model)),
+                        ("quotaResetDelay", J::s(span.as_str())),
+                        (
+                            "quotaResetTimeStamp",
+                            J::s(format!("{}Z", crate::util::utc_civil(reset_s))),
+                        ),
+                    ]),
+                ),
+            ]),
+            J::obj([
+                ("@type", J::s("type.googleapis.com/google.rpc.RetryInfo")),
+                ("retryDelay", J::s(format!("{secs}s"))),
+            ]),
+        ],
+    )
+}
+
 /// The wall a fixed mode puts on a turn, in Google's shape: `rate-limit` the
 /// per-day [`quota_error`] (`RetryInfo` [`DAY_QUOTA_RETRY`]),
 /// `overloaded` 503 `UNAVAILABLE`, `500` 500 `INTERNAL`, `401` 401
@@ -894,7 +955,12 @@ impl Stub {
             };
             let now_s = crate::util::now_secs();
             if now_s < reset {
-                let st = out.json(429, &quota_error(model, reset - now_s), &[])?;
+                let body = if claim == ACCOUNT_CLAIM {
+                    exhausted_error(model, reset - now_s, reset)
+                } else {
+                    quota_error(model, reset - now_s)
+                };
+                let st = out.json(429, &body, &[])?;
                 let s = format!("{summary} limit:{claim} resets in {}s", reset - now_s);
                 self.record(method, path, st, blen, &mode, &s);
                 return Ok(());

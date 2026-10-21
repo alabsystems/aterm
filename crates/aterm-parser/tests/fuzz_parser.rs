@@ -1,11 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Robustness fuzz for the terminal escape-sequence parser. The parser processes
-// untrusted bytes emitted by EVERY program a terminal runs, so it must NEVER
-// panic on arbitrary input — a panic here is a denial-of-service (any program
-// could crash the terminal by emitting a crafted byte sequence). This is the
-// single highest-value daily-driver robustness surface.
+// Robustness fuzz for the escape-sequence parser: it reads untrusted bytes from
+// every program a terminal runs, so a panic on any input would let a program
+// crash the terminal.
 
 use aterm_parser::{NullSink, Parser};
 
@@ -35,10 +33,8 @@ fn fuzz_advance_never_panics() {
     }
 }
 
-/// Biased fuzz toward real escape-sequence shapes — `ESC`, `CSI` (`ESC [`),
-/// `OSC` (`ESC ]`), `DCS` (`ESC P`) introducers followed by random
-/// parameter/payload bytes — to drive deeper into each sub-state-machine where
-/// panics are most likely to hide.
+/// 200,000 chunks shaped like escape sequences: an introducer (ESC, CSI, OSC,
+/// DCS or APC), then random bytes, to reach deeper into each sub-machine.
 #[test]
 fn fuzz_escape_shapes_never_panic() {
     let mut state: u64 = 0xB7E1_5162_8AED_2A6B;

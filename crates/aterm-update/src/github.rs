@@ -1,53 +1,34 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The DMG/.app-specific orchestration of a background update check: learn which
-//! release is the channel head, and — if it is strictly newer than the running build —
-//! download + verify its container and stage it. The portable plumbing it drives (the
-//! redirect-refusing HEAD, the `curl` GETs of the download host) lives in
-//! `aterm-update-core`.
+//! The macOS (DMG/.app) update check: learn the channel head and, if it is strictly newer
+//! than the running build, download, verify and stage its container. The portable plumbing
+//! (the redirect-refusing HEAD, the `curl` GETs) is `aterm-update-core`.
 //!
-//! # One lane: the unmetered download host
+//! Every check reads `github.com/<owner>/<repo>/releases/…` with no credential and never
+//! touches `api.github.com`:
 //!
-//! Every check, on every source, reads `github.com/<owner>/<repo>/releases/…` with no
-//! credential and never touches `api.github.com` — not on a happy path, not on a failure
-//! path. There is no budget on this host, so there is nothing to hold, reserve or fall
-//! back to. A check is:
+//! 1. One unmetered `HEAD …/releases/latest/download/aterm-appcast.toml`, redirects refused
+//!    ([`aterm_update_core::pointer`]). Its `Location` names the newest published release's
+//!    tag and is accepted only as this repository's derived URL under a canonical
+//!    `vMAJOR.MINOR.PATCH` tag.
+//! 2. If that tag is the one the ledger last authorized (`latest_tag` in `status.toml`),
+//!    the check is done.
+//! 3. Otherwise every asset is fetched from the tag-specific
+//!    `…/releases/download/<tag>/<name>` (never `latest` again, so a moving pointer cannot
+//!    mix releases) and must pass the master-signed roster ([`authorize_by_roster`]),
+//!    manifest `version` == the tag, the manifest's container `url` == the derived URL
+//!    (cross-checked, never followed), the build-number, `min_build`, high-water and
+//!    roster-floor gates, the sha256, and codesign/Team ID on the staged bundle.
 //!
-//! 1. ONE unmetered `HEAD …/releases/latest/download/aterm-appcast.toml` with redirects
-//!    refused ([`aterm_update_core::pointer`]). Its `Location` names the newest
-//!    published release's tag — drafts and prereleases excluded by GitHub itself — and
-//!    is accepted only when it is exactly the derived tag-specific URL of this
-//!    repository under a canonical `vMAJOR.MINOR.PATCH` tag.
-//! 2. If that tag is the one the ledger last AUTHORIZED (`latest_tag` in
-//!    `status.toml`), the check is complete: "up to date", no other request.
-//! 3. Otherwise every asset is fetched from the TAG-SPECIFIC
-//!    `…/releases/download/<tag>/<name>` — never through `latest` again, so a pointer
-//!    that moves mid-check cannot mix two releases — and meets: the master-signed
-//!    machine roster ([`authorize_by_roster`], fail-closed), the manifest `version` ==
-//!    the tag minus its `v`, the manifest's container `url` == the DERIVED download URL
-//!    (the manifest field is cross-checked, never followed), then the build-number,
-//!    `min_build`, high-water and roster-floor gates, the sha256 and the
-//!    codesign/Team-ID verification on the staged bundle.
-//!
-//! A head that is not an app release — a release that carries no `aterm-appcast.toml`
-//! (a source-only release) or a tag this client does not install from — is recorded as
-//! exactly that ("channel head <tag> has no app manifest yet") and the check ends: the
-//! publisher owns `latest`, and the next check reads the head again. Nothing lists the
-//! catalog to look past it, and nothing may: `latest` is the ONLY unmetered signal
-//! that the publisher promoted a release. The download host serves a PRERELEASE's
-//! assets exactly as a release's (measured: the same 302), and the publisher relies on
-//! no client electing one — aterm's source release is a prerelease carrying its cut's
-//! `aterm-appcast.toml`, and a cut retired after binding keeps it for good. An older
-//! tag found past the head would also be judged under its OWN roster, never the head's
-//! newer one, so a revocation published source-first would not reach the machines
-//! behind it.
-//!
-//! A source-only head whose tag outranks the last one the ledger authorized for this
-//! source is an APP BUILD IN FLIGHT ([`app_build_in_flight`]): the publication train
-//! mints the release source-first and the app cut attaches its assets minutes later,
-//! so the next checks come every `cadence::IN_FLIGHT_RETRY` (a minute) instead of a
-//! whole interval, counted machine-wide on the check receipt ([`head_in_flight`]).
+//! A head that is not an app release (no `aterm-appcast.toml`, or a tag this client does
+//! not install from) is recorded as such and the check ends. Nothing looks past `latest`,
+//! the only unmetered sign that the publisher promoted a release: the host serves a
+//! prerelease's assets like a release's, aterm's source release is a prerelease carrying
+//! its cut's appcast, and an older tag would be judged under its own older roster, missing
+//! a revocation published source-first. A source-only head that outranks the last
+//! authorized tag is an app build in flight ([`app_build_in_flight`]): the next checks
+//! come on `cadence::IN_FLIGHT_RETRY`, counted machine-wide ([`head_in_flight`]).
 //!
 //! The lane is not a trust decision. Artifact trust is the master-signed roster, the
 //! pinned Team ID and the manifest sha256 — none of which the transport touches.
@@ -60,12 +41,12 @@ use aterm_update_core::{HeadAnswer, HttpError};
 use crate::manifest::{Manifest, Ready};
 use crate::{Source, bundle, install, paths::Staging};
 
-/// Whether the last check ended in a deferral — the download host asked us to slow
-/// down (a 429 or a 5xx). Read by the background loop to LENGTHEN the next wait without
+/// Whether the last check ended in a deferral (the download host asked us to slow down
+/// with a 429 or a 5xx). The background loop lengthens the next wait on it without
 /// recording a failure: weather, not a broken updater.
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 
-/// The channel head whose APP BUILD the check in progress found in flight
+/// The channel head whose app build the check in progress found in flight
 /// ([`app_build_in_flight`]) and, once the check receipt has counted it, how many
 /// consecutive completed checks machine-wide have found it so. Set by
 /// `check_and_stage_inner`, counted by [`check_and_stage`], read by the background
@@ -91,15 +72,12 @@ pub(crate) fn head_in_flight() -> Option<(String, u32)> {
         .clone()
 }
 
-/// Whether `head` — a channel head whose release carries no `aterm-appcast.toml` yet — is
-/// an APP BUILD IN FLIGHT: a release tag this client installs from whose rank is above
-/// `known`, the last tag the ledger authorized for this source, whichever build recorded it
-/// (`status::authorized_tag`: every build on the machine gets the same answer, as the
-/// machine-wide count needs), or any tag at all when none is. The publication train mints
-/// the release source-first and the app cut attaches its assets minutes later (~19 minutes
-/// on an ordinary promote). A head at or below `known` — GitHub's `latest` names the most
-/// recently PUBLISHED release, which a re-published older tag can be — is no release this
-/// client is waiting for, and neither is a tag it does not install from.
+/// Whether `head`, a channel head with no `aterm-appcast.toml` yet, is an app build in
+/// flight: a tag this client installs from that outranks `known` (the last tag the ledger
+/// authorized for this source, whichever build recorded it, so every build on the machine
+/// agrees), or any such tag when none is known. The train publishes source first and the
+/// app cut attaches its assets minutes later. A head at or below `known` (GitHub's `latest`
+/// is the most recently published, which can be an older tag) is not awaited.
 fn app_build_in_flight(head: &str, known: Option<&str>) -> bool {
     let Ok(TagKind::Candidate(rank)) = parse_numeric_tag(head) else {
         return false;
@@ -142,14 +120,12 @@ fn is_slug(source: &Source, owner: &str, repo: &str) -> bool {
     source.owner.eq_ignore_ascii_case(owner) && source.repo.eq_ignore_ascii_case(repo)
 }
 
-/// Record that the channel head was READ. This is what clears the "this machine cannot
-/// update" latch: reading the channel is the property that matters.
+/// Record that the channel head was read, which clears the "this machine cannot update"
+/// latch.
 fn note_readable(source: &Source) {
     RATE_LIMITED.store(false, Ordering::Relaxed);
     crate::unreadable::clear();
-    // Once per process, and at DEBUG: every aterm process (the window and each
-    // terminal session) runs this loop, so at INFO it was one line per launch saying
-    // what every launch before it had said.
+    // Once per process, at DEBUG: every aterm process runs this loop.
     if !ANNOUNCED_CHANNEL.swap(true, Ordering::Relaxed) {
         crate::debug(&format!(
             "updating from github.com/{}/{} over its unmetered download host with no \
@@ -172,15 +148,11 @@ fn cadence_note() -> String {
     )
 }
 
-/// The one message an operator gets when this machine cannot read its release
-/// channel — the evergreen pointer answered 404. It must survive being read months
-/// later out of `status.toml`, so it names the consequence, every possible cause, and
-/// the remedy.
-///
-/// GitHub renders "no published release", "private" and "does not exist" identically
-/// on the web host, so all three are named. The channel is read with no credential, so
-/// no credential is offered as a remedy. A REPOINTED source (a development build's
-/// `[update] owner`/`repo`) adds the one cause only it can have.
+/// The message an operator gets when this machine cannot read its release channel (the
+/// evergreen pointer answered 404). Read months later out of `status.toml`, so it names the
+/// consequence, every cause and the remedy. GitHub's web host renders "no published
+/// release", "private" and "does not exist" alike, so all are named; the channel is read
+/// with no credential, so none is offered. A repointed source adds its own cause.
 fn unreadable_explanation(source: &Source) -> String {
     let repointed = if is_default_channel(source) {
         String::new()
@@ -202,9 +174,8 @@ fn unreadable_explanation(source: &Source) -> String {
     )
 }
 
-/// A GitHub Release, SYNTHESIZED from the pointer's tag ([`web_release`]) with the
-/// derived tag-specific URLs, so the roster chain and the staging tail consume one
-/// shape.
+/// A GitHub Release synthesized from the pointer's tag ([`web_release`]) with the derived
+/// tag-specific URLs, so the roster chain and the staging tail consume one shape.
 #[derive(Clone, Debug)]
 struct Release {
     tag_name: String,
@@ -219,14 +190,11 @@ struct Asset {
     url: String,
 }
 
-/// Classify the channel head's tag.
-///
-/// The grammar is [`aterm_update_core::tag::parse_release_tag`] — the SAME
-/// function the publisher (`aterm-release/src/publish.rs`) classifies with, so
-/// client and publisher cannot disagree about which releases are candidates.
-/// Only the client's diagnostic wording is here: canonical three-component
-/// `vMAJOR.MINOR.PATCH` is a candidate, two-component tags are the retired
-/// scheme ([`TagKind::Legacy`]), anything else fails the check closed.
+/// Classify the channel head's tag with [`aterm_update_core::tag::parse_release_tag`], the
+/// grammar the publisher (`aterm-release/src/publish.rs`) uses too, so the two cannot
+/// disagree. Only the wording is here: `vMAJOR.MINOR.PATCH` is a candidate, a
+/// two-component tag is the retired scheme ([`TagKind::Legacy`]), anything else fails
+/// closed.
 fn parse_numeric_tag(tag: &str) -> Result<TagKind, String> {
     aterm_update_core::tag::parse_release_tag(tag).map_err(|error| match error {
         TagError::Malformed => format!("update candidate tag {tag:?} is not numeric dotted vN.N.N"),
@@ -236,15 +204,9 @@ fn parse_numeric_tag(tag: &str) -> Result<TagKind, String> {
     })
 }
 
-/// The tag contract: a release the client will install is spelled exactly
-/// `vMAJOR.MINOR.PATCH`, matching the workspace version with its DEV component
-/// reset to 0 (`VERSIONING.md`). `targo --unverified ship cut` derives it from
-/// `[workspace.package] version`, so the shipped app, the published source
-/// snapshot, and the tag are one number.
-///
-/// `numeric` has already been proved three-component by [`parse_numeric_tag`];
-/// [`aterm_update_core::tag::canonical_version`] re-derives the string, which
-/// pins the *spelling* too, so `v01.2.3` can never be admitted alongside
+/// The tag contract: an installable release is spelled exactly `vMAJOR.MINOR.PATCH`
+/// (`VERSIONING.md`). `numeric` is already three-component ([`parse_numeric_tag`]);
+/// re-deriving the string pins the spelling too, so `v01.2.3` is never admitted beside
 /// `v1.2.3`.
 fn canonical_authority_version(tag: &str, numeric: &[u64]) -> Result<String, String> {
     aterm_update_core::tag::canonical_version(tag, numeric).ok_or_else(|| {
@@ -326,13 +288,9 @@ struct StageArtifact {
 }
 
 /// Resolve the manifest's optional zip container to one canonical asset identity.
-///
-/// `Ok(None)` = the manifest declares no usable zip (no name, or a name with no
-/// digest to check the bytes against). `Err` = it declares one this release
-/// cannot resolve — a noncanonical name, or an asset that is missing/duplicated.
-/// Neither outcome is fatal to the check: the DMG identity is proved separately
-/// and staging falls back to it, which is what keeps releases published before
-/// zip staging installable.
+/// `Ok(None)`: no usable zip (no name, or no digest). `Err`: a declared zip this release
+/// cannot resolve (noncanonical, missing, duplicated). Neither ends the check: staging falls
+/// back to the DMG, which is proved separately.
 fn authoritative_zip_artifact(
     release: &Release,
     manifest: &Manifest,
@@ -367,14 +325,10 @@ fn authoritative_zip_artifact(
     }))
 }
 
-/// Choose the container to stage from: the zip when the manifest carries a
-/// resolvable one, else the DMG.
-///
-/// The DMG identity is proved FIRST and unconditionally, so a release that fails
-/// that check is refused exactly as before and the fallback is always available.
-/// Preferring the zip is an availability decision, not a trust one — both digests
-/// come from the same (optionally signed) manifest and both bundles go through
-/// the same codesign/sealed-identity gate after extraction.
+/// Choose the container to stage from: the zip when the manifest carries a resolvable one,
+/// else the DMG. The DMG identity is proved first and unconditionally, so the fallback
+/// always exists. Preferring the zip is availability, not trust: both digests come from
+/// the same manifest and both bundles pass the same codesign gate.
 fn select_stage_artifact(
     release: &Release,
     manifest: &Manifest,
@@ -406,37 +360,27 @@ struct AuthoritativeRelease {
     manifest_index: usize,
 }
 
-/// Everything the master-signed machine roster tier needs to run, bundled so the client
-/// path takes ONE parameter rather than three and so a caller cannot supply two of them
-/// and forget the third.
-///
-/// With `master_pubkeys` empty (a fork with no master of its own) the signature tier is
-/// ABSENT — the same shape as an empty `APPLE_TEAM_ID` removing the Developer-ID tier
-/// without loosening anything beside it. ARMED — as this tree is — the master-signed roster
-/// is the SOLE authority over who may have signed the appcast.
+/// Everything the master-signed machine-roster tier needs, as one parameter. With
+/// `master_pubkeys` empty (a fork with no master) the tier is absent; armed, as in this
+/// tree, the roster is the sole authority over who may have signed the appcast.
 pub(crate) struct RosterPolicy<'a> {
     /// The pinned paper master(s) — `pins::PAPER_MASTER_PUBKEYS` in production. Empty
     /// means the tier is absent.
     pub master_pubkeys: &'a [&'a str],
-    /// The highest `roster_seq` this client has ever durably recorded. THE replay defence
-    /// for a client that has already seen a newer roster; worth nothing to a fresh
-    /// install, which is what the roster's own `valid_until` is for.
+    /// The highest `roster_seq` this client has durably recorded: the replay defence for
+    /// a client that has seen a newer roster (a fresh install relies on `valid_until`).
     pub floor_seq: u64,
     /// Injected wall clock (unix seconds), so the freshness gate stays pure and every
     /// expiry case is testable without waiting for one.
     pub now_unix: i64,
-    /// Re-read the DURABLE floor immediately before admission, closing the TOCTOU that
-    /// `floor_seq` alone leaves open: that snapshot is taken before any network I/O, and
-    /// a concurrent instance of this process may ratchet the durable floor past it while
-    /// the roster assets download. Admission takes the max of the snapshot and this
-    /// re-read, so a roster generation a concurrent check has already superseded is
-    /// refused rather than admitted through a stale snapshot. `None` (tests that are not
-    /// about the race) means the snapshot alone decides, which is never LOOSER than the
-    /// snapshot — the hook can only raise the floor.
+    /// Re-reads the durable floor just before admission: `floor_seq` is taken before any
+    /// network I/O, and a concurrent instance may ratchet the floor past it meanwhile.
+    /// Admission takes the max of the two, so this can only raise the floor; `None`
+    /// (tests) leaves the snapshot to decide.
     pub floor_refresh: Option<&'a dyn Fn() -> u64>,
 }
 
-/// The marker a refusal carries when it is THIS BUILD's trust anchor that cannot verify the
+/// The marker a refusal carries when it is this build's trust anchor that cannot verify the
 /// channel, rather than the channel that is broken: the pinned paper master cannot verify
 /// the machine roster (a master rotation this build predates). That is permanent for the
 /// build — the head is the one candidate and nothing falls back — so the persistent wording
@@ -461,47 +405,35 @@ struct AuthoritativeFetch {
     /// (zip when the manifest carries a resolvable one, else the DMG).
     selected: Option<(Manifest, Release, StageArtifact)>,
     appcast_fetch_error: bool,
-    /// The `appcast_fetch_error` was the MANIFEST ITSELF answering 404 on the download
-    /// host: the release the pointer names exists but carries no `aterm-appcast.toml`
-    /// (a source-only release). Not a pipeline fault: the check records "channel head
-    /// <tag> has no app manifest yet" and ends, and the next check reads the head again.
+    /// The `appcast_fetch_error` was the manifest itself answering 404: a source-only
+    /// release. Not a fault: the check records the head as having no app manifest yet.
     appcast_missing: bool,
     /// The `appcast_fetch_error` was a `github.com` 429 on an asset fetch, not a broken
     /// download: weather, and never a `pipeline`-class failure.
     asset_fetch_rate_limited: bool,
     manifest_rejected: bool,
-    /// WHY the manifest was rejected, in the words the log got, so the ledger can
-    /// tell a forged release from a revoked signer from a STRANDED client whose
-    /// anchor predates a rotation and needs a reinstall ([`STALE_ANCHOR_KEY`]).
+    /// Why the manifest was rejected, in the log's words, so the ledger can tell a forged
+    /// release, a revoked signer and a stranded client ([`STALE_ANCHOR_KEY`]) apart.
     rejection_reason: Option<String>,
-    /// WHICH MACHINE SIGNED, when the roster tier is armed and the chain passed. `None`
+    /// Which machine signed, when the roster tier is armed and the chain passed. `None`
     /// with an unpinned master (the tier is absent) and `None` on any rejection, because
     /// a rejection never produces a `selected` release either.
     attribution: Option<aterm_update_core::roster::Attribution>,
-    /// The `roster_seq` of the master-verified roster that passed ADMISSION (the replay
-    /// floor and the freshness window), for the caller to ratchet into the durable floor.
-    ///
-    /// Set on OBSERVATION — the moment `admit` passes — NOT on successful artifact
-    /// authorization. The difference is the whole replay defence: a seq-10 roster that
-    /// REVOKES the appcast's signer refuses the release, and if the floor only ratcheted
-    /// on acceptance, a replayed still-fresh seq-9 roster would then re-authorize the very
-    /// machine the owner just revoked. Having SEEN generation 10, this client must refuse
-    /// 9 forever, whether or not it went on to install anything.
+    /// The `roster_seq` of the master-verified roster that passed admission, for the
+    /// caller to ratchet into the durable floor. Set on observation, not acceptance: a
+    /// seq-10 roster that revokes the appcast's signer refuses the release, and a floor
+    /// that ratcheted only on acceptance would let a replayed, still-fresh seq-9 roster
+    /// re-authorize that machine.
     observed_roster_seq: Option<u64>,
-    /// The machine IDS the admitted roster REVOKES, carried out on the same
-    /// observation as [`Self::observed_roster_seq`] and for the same reason.
-    ///
-    /// The seq says a newer generation was seen; this says what that generation
-    /// withdrew. The caller needs it to retract an already-staged build, which is a
-    /// question only this lane can answer: revocation is a LIST inside the roster
-    /// document, and the apply lane holds nothing but the floor NUMBER.
+    /// The machine ids the admitted roster revokes, set on the same observation as
+    /// [`Self::observed_roster_seq`]. The caller retracts an already-staged build by them:
+    /// revocation is a list inside the roster document, which only this lane reads.
     observed_revocations: Vec<String>,
 }
 
 impl AuthoritativeFetch {
-    /// Refuse the candidate: WARN the reason and carry it to the ledger. Every
-    /// rejection arm goes through here so the reason `health.toml` records is the
-    /// one the log printed.
+    /// Refuse the candidate: warn the reason and carry it to the ledger. Every rejection
+    /// arm goes through here, so `health.toml` records the reason the log printed.
     fn refuse(&mut self, reason: String) {
         crate::warn(&reason);
         self.manifest_rejected = true;
@@ -517,9 +449,9 @@ impl AuthoritativeFetch {
         floor: &crate::manifest::Floor,
         web_tag: &str,
     ) {
-        // THE URL CROSS-CHECK, after every signature has been verified and the version
-        // bound, and before anything is staged: the signed manifest must name the very
-        // container URL this client derived under the pointer's tag.
+        // After every signature has been verified and the version bound, and before
+        // anything is staged, the signed manifest must name the very container URL this
+        // client derived under the pointer's tag.
         if let Some((manifest, release, _)) = self.selected.as_ref()
             && let Err(error) = web_container_url_agrees(source, &release.tag_name, manifest)
         {
@@ -527,7 +459,7 @@ impl AuthoritativeFetch {
             self.selected = None;
             self.refuse(reason);
         }
-        // THE DURABLE REVOCATION SET: a machine a roster this client
+        // Durable revocation set: a machine a roster this client
         // admitted once revoked is not trusted again, whatever a later roster lists — the
         // rule the Linux lane keeps (`revoked_machines`). Without it the floor would
         // ignore the machine's word while the check staged its build, and every surface
@@ -569,46 +501,34 @@ impl AuthoritativeFetch {
 /// signature assets can have.
 const ED25519_SIGNATURE_LEN: usize = 64;
 
-/// Why the roster chain did not produce an attribution — split into the two classes the
-/// health ledger must never confuse.
-///
-/// Both are REFUSALS; neither is ever a fallthrough. The distinction is only about what
-/// the operator is told, and it matters because the wordings are not interchangeable:
-/// a `pipeline`-class transport failure is postponed-and-will-retry, while a `manifest`
-/// -class refusal escalates to "this Mac cannot install any release until that is fixed
-/// at the publisher". Once the roster is the SOLE authority, a flaky network fetching
-/// `aterm-machines.toml` would otherwise accuse the publisher of shipping a bad release.
+/// Why the roster chain produced no attribution, in the two classes the health ledger
+/// must not confuse. Both refuse; they differ in what the operator is told. A
+/// `pipeline`-class transport failure is retried, while a `manifest`-class refusal says
+/// this Mac cannot install until the publisher fixes it, which a flaky fetch of
+/// `aterm-machines.toml` must not claim.
 enum RosterFailure {
-    /// An asset could not be FETCHED, or what came back is not shaped like the asset at
-    /// all (a signature that is not [`ED25519_SIGNATURE_LEN`] bytes). Nothing has been
-    /// judged; retrying may work.
+    /// An asset could not be fetched, or what came back is not shaped like the asset (a
+    /// signature that is not [`ED25519_SIGNATURE_LEN`] bytes). Nothing was judged; a retry
+    /// may work.
     Transport(String),
-    /// The chain RAN and refused: no roster, a bad master signature, a stale or
+    /// The chain ran and refused: no roster, a bad master signature, a stale or
     /// rolled-back generation, a revoked machine, an unauthorized signer.
     Refused(String),
 }
 
-/// Run the master-signed machine-roster chain for one candidate release, returning WHICH
-/// machine signed its appcast.
+/// Run the master-signed machine-roster chain for one candidate release and return which
+/// machine signed its appcast. With the master armed this is the only authority. Cheapest
+/// first, fail-closed throughout:
 ///
-/// With the master ARMED this is the ONLY thing that authorizes a release.
-///
-/// Cheapest-first and fail-closed throughout — the ordering IS the design, so it is worth
-/// reading as a list:
-///
-/// 1. both roster assets must be present on the release. Free and structural: no roster
-///    means no authority, and an armed anchor never degrades to "unsigned is fine".
-/// 2. download them, under tight caps. A roster is a few hundred bytes per machine and a
-///    detached Ed25519 signature is exactly 64, so 64 KiB and 4 KiB are ceilings rather
-///    than fits.
-/// 3. verify the roster under the pinned paper master. THE FIRST CRYPTO.
-/// 4. parse it — only from `VerifiedRoster`, which has no public constructor, so parsing
-///    unverified roster bytes does not type-check.
-/// 5. `admit`: the durable `roster_seq` floor, then the freshness window. Both cheap,
-///    both before any artifact crypto.
-/// 6. `authorize_appcast`: revoked and expired machines are removed from the candidate
-///    set FIRST — so a revoked machine's perfectly valid signature is never even checked —
-///    and the survivors verify the appcast. THE SECOND CRYPTO.
+/// 1. The appcast signature and both roster assets are on the release (no roster, no
+///    authority).
+/// 2. Download them under tight caps (a roster is a few hundred bytes per machine; a
+///    signature is 64 bytes).
+/// 3. Verify the roster under the pinned paper master.
+/// 4. Parse it, only from `VerifiedRoster`, which has no public constructor.
+/// 5. `admit`: the durable `roster_seq` floor, then the freshness window.
+/// 6. `authorize_appcast`: revoked and expired machines leave the candidate set before any
+///    signature is checked; the survivors verify the appcast.
 ///
 /// Every error is a refusal. There is no path through here that returns "accept anyway".
 ///
@@ -656,7 +576,7 @@ fn authorize_by_roster(
             ))
         })?;
 
-    // (2) Bounded transport. A failure here has judged NOTHING — see [`RosterFailure`].
+    // (2) Bounded transport. A failure here has judged nothing ([`RosterFailure`]).
     let roster_bytes = download(&candidate.release.assets[roster_index].url, 65_536)
         .map_err(|e| Transport(format!("fetch {ROSTER_ASSET}: {e}")))?;
     let roster_sig = download(&candidate.release.assets[roster_sig_index].url, 4096)
@@ -699,11 +619,8 @@ fn authorize_by_roster(
             ))
         })?;
     if verified.master_index() != 0 {
-        // Never a rejection: a hit on a non-head master is a rotation in flight. Saying so
-        // makes a STALLED rotation visible instead of silent until updates stop. At INFO,
-        // not WARN: the roster VERIFIED under a pinned master, so this is rotation
-        // visibility, not verification degradation — an unverifiable roster is the
-        // `Refused` right above.
+        // Not a rejection: a non-head master is a rotation in flight, logged (at INFO, the
+        // roster verified) so a stalled rotation is visible.
         crate::log(&format!(
             "the machine roster was signed by master key #{}, not the current one — a \
              master rotation is in progress or incomplete",
@@ -713,24 +630,20 @@ fn authorize_by_roster(
     let roster = Roster::parse(&verified)
         .map_err(|e| Refused(format!("machine roster is unusable ({e:?})")))?;
 
-    // (5) Replay floor, then freshness. The floor is RE-READ here when the caller
-    // provides a reader, because `policy.floor_seq` is a snapshot taken before the
-    // downloads above and a concurrent instance may have ratcheted the durable floor
-    // past it in the meantime — admitting against the stale snapshot would accept a
-    // roster generation that instance has already superseded. The max keeps the hook
-    // strictly tightening: it can only raise the floor, never lower it.
+    // (5) Replay floor, then freshness. The floor is re-read
+    // ([`RosterPolicy::floor_refresh`]), since `floor_seq` predates the downloads above;
+    // the max only raises it.
     let floor_seq = policy
         .floor_refresh
         .map_or(policy.floor_seq, |read| read().max(policy.floor_seq));
     roster
         .admit(floor_seq, policy.now_unix)
         .map_err(|e| Refused(format!("machine roster refused ({e:?})")))?;
-    // THE OBSERVATION RATCHET. This roster is master-verified and admitted, so its
-    // generation has been SEEN — recorded here, before the appcast authorization,
+    // Observed: master-verified and admitted. Recorded before the appcast authorization,
     // so a refusal below (a revoked signer, above all) still advances the floor.
     *observed_roster_seq = Some(roster.roster_seq);
-    // Observed on the SAME event, so a roster that refuses this release below still
-    // tells the caller whom it withdrew.
+    // The same event: a roster that refuses this release below still reports whom it
+    // withdrew.
     observed_revocations.clone_from(&roster.revoked);
 
     // (6) Deny-list before crypto, then the artifact signature, once it is one.
@@ -776,21 +689,13 @@ fn fetch_authoritative_release(
             return fetched;
         }
     };
-    // WHO IS ALLOWED TO HAVE SIGNED THIS APPCAST — decided by the PAPER MASTER ANCHOR
-    // alone. Unpinned (a fork with no master of its own), the signature tier is absent.
-    // Armed — this tree — the master-signed roster decides, and it decides ALONE: there is
-    // no compiled-in key it could fall back to, so a revoked machine stays revoked on
-    // every build, and adding a machine is a LOCAL act (mint, roster, publish).
-    //
-    // The chain runs here, over the RAW bytes and before the parse below, which is the
-    // only correct place for it: the identity claims INSIDE the appcast are not bound to
-    // anything until something has verified the bytes that carry them. The cheap identity
-    // cross-check happens immediately after the parse (`bind`, below).
-    //
-    // The observed sequence lands in `fetched` on EVERY arm, including the refusals: it
-    // was set the moment a master-verified roster passed admission, and the caller's
-    // ratchet must advance on that observation even when the release itself is refused
-    // (see `AuthoritativeFetch::observed_roster_seq`).
+    // Who may have signed this appcast is decided by the paper master anchor alone:
+    // unpinned (a fork with no master), the signature tier is absent; armed (this tree),
+    // the master-signed roster decides, with no compiled-in key to fall back to. It runs
+    // over the raw bytes, before the parse: the identity claims inside bind to nothing
+    // until the bytes are verified (`bind` follows the parse). The observed sequence and
+    // revocations land in `fetched` on every arm, refusals included
+    // ([`AuthoritativeFetch::observed_roster_seq`]).
     let attribution = if roster.master_pubkeys.is_empty() {
         None
     } else {
@@ -808,8 +713,7 @@ fn fetch_authoritative_release(
         fetched.observed_revocations = observed_revocations;
         match authorized {
             Ok(who) => Some(who),
-            // FAIL CLOSED. An attacker who could suppress the roster assets must not
-            // downgrade an armed client to anything weaker.
+            // Fail closed: suppressing the roster assets must not downgrade an armed client.
             Err(RosterFailure::Transport(error)) => {
                 crate::warn(&format!(
                     "{error}; refusing authoritative {}",
@@ -842,10 +746,9 @@ fn fetch_authoritative_release(
     };
     match Manifest::parse(&text) {
         Ok(manifest) if manifest.version == candidate.version => {
-            // THE IDENTITY BIND, over bytes that are authenticated by the time it runs.
-            // A genuine signature by one machine cannot be relabelled as another (the id
-            // is inside the signed bytes), and a machine cannot claim someone else's id
-            // (the roster maps id to key). Both directions are string compares.
+            // The identity bind, over authenticated bytes: the machine id is inside the
+            // signed bytes and the roster maps id to key, so a signature can be neither
+            // relabelled nor claimed by another machine.
             if let Some(who) = &attribution
                 && let Err(reject) = who.bind(manifest.machine_id.as_deref(), manifest.roster_seq)
             {
@@ -857,10 +760,8 @@ fn fetch_authoritative_release(
                 return fetched;
             }
             if let Some(who) = &attribution {
-                // ATTRIBUTION, recorded where a human reads it: the owner asked to be able
-                // to track which computer does what. The durable record is the status
-                // file's (`check_and_stage` writes it beside the release); the log line is
-                // once per release per process, at DEBUG.
+                // The durable record is the status file's, written by the check; the log
+                // line is once per release per process.
                 if crate::first_in_process(&format!("signer {} {who}", candidate.release.tag_name))
                 {
                     crate::debug(&format!(
@@ -890,39 +791,24 @@ fn fetch_authoritative_release(
 }
 
 /// Whether an admitted roster's revocations withdraw the machine that authorized the
-/// staged build.
-///
-/// Split out so the decision is testable — the surrounding check lane fetches over the
-/// network — and so the `None` case is stated once: a marker that records NO machine
-/// predates the attribution fields, and an unnamed machine can never be matched against
-/// a revocation list. It is left alone rather than retired, because "I cannot tell who
-/// signed this" is not evidence of withdrawal, and guessing costs a re-download on every
-/// check forever.
+/// staged build. A marker that names no machine is left alone: an unknown signer is no
+/// evidence of withdrawal, and retiring it would cost a re-download on every check.
 fn revocation_withdraws_stage(revocations: &[String], staged_machine: Option<&str>) -> bool {
     staged_machine.is_some_and(|machine| revocations.iter().any(|id| id == machine))
 }
 
-/// Whether the roster generation that authorized this check's release has been
-/// SUPERSEDED by the durable floor while the check was in flight.
-///
-/// `observed` is the sequence the chain admitted for this release — `None`, which can never
-/// be superseded, whenever no master-verified roster reached `admit`: the UNARMED tier (a
-/// fork with no pinned master), or an armed tier whose roster was unfetchable or refused.
-/// This tree is armed, so `None` here is the second case, not the first. `floor_now` is a
-/// FRESH read of the durable floor. This run's own ratchet write makes `floor_now >=
-/// observed` in the quiescent case, so a strict `<` fires only when a CONCURRENT instance
-/// recorded a newer generation — at which point staging an artifact authorized under the
-/// older generation would act on authority this client already knows is withdrawn. The
-/// refusal is transient: the next check re-runs under the advanced floor.
+/// Whether the durable floor (`floor_now`, a fresh read) has superseded the roster
+/// generation that authorized this release (`observed`) while the check ran. `None` (no
+/// roster reached `admit`) is never superseded. This run's own ratchet makes
+/// `floor_now >= observed`, so a strict `<` means a concurrent instance recorded a newer
+/// generation. The refusal is transient: the next check runs under the new floor.
 fn roster_authority_superseded(observed: Option<u64>, floor_now: u64) -> bool {
     observed.is_some_and(|seq| seq < floor_now)
 }
 
-/// Whether a fully published local stage makes this release download redundant.
-/// Both the optimistic pre-lock check and the authoritative under-lock re-check
-/// call this exact predicate. For the same build, bind the marker back to the
-/// selected manifest's commit and DMG digest; a strictly newer publishable stage
-/// already supersedes the selected release.
+/// Whether a published local stage makes this release's download redundant: a strictly
+/// newer build, or the same build bound to the manifest's commit and DMG digest. The
+/// pre-lock check and the under-lock re-check share it.
 fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
     Ready::read_publishable(staging).is_some_and(|ready| {
         ready.build_number > manifest.build_number
@@ -938,24 +824,12 @@ fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
     })
 }
 
-/// Record the "a verified stage already covers this candidate" decision in
-/// `status.toml`.
-///
-/// WHAT WENT WRONG: both [`publishable_stage_covers`] short-circuits returned
-/// `Ok(None)` having written NOTHING. The attribution note ("authoritative release
-/// signed by machine m3") is written earlier in the SAME check, before the staging
-/// decision — and with the paper master armed that note lands on every cycle. So on a
-/// machine holding a pending, verified stage — which is its steady state until the
-/// apply lane runs — the last decision in `status.toml` was a note about who SIGNED a
-/// release, and the one fact an operator reading this file was after, that a build is
-/// already on disk waiting to apply, appeared nowhere. Every other terminal outcome of
-/// the check records its decision; these two were the hole.
+/// Record in `status.toml` that a verified stage already covers this candidate. The check's
+/// attribution note precedes this decision, so without it a machine holding a pending
+/// stage would show only who signed the release.
 fn record_covered_stage_status(staging: &Staging, current_build: u64, manifest: &Manifest) {
-    // Re-read the marker rather than plumbing a value out of the predicate: the marker
-    // IS the authority for what is on disk, and this read is local and cheap. It can
-    // legitimately have vanished since the predicate ran (a concurrent retire), and in
-    // that case we still record a decision — naming the candidate instead of inventing
-    // a stage — because leaving the previous line standing is the very failure above.
+    // Re-read the marker, the authority for what is on disk. If a concurrent retire removed
+    // it since the predicate ran, still record a decision, naming the candidate.
     let msg = match Ready::read_publishable(staging) {
         Some(ready) => covered_stage_line(
             staging,
@@ -972,10 +846,8 @@ fn record_covered_stage_status(staging: &Staging, current_build: u64, manifest: 
     crate::status::record(staging, current_build, &msg);
 }
 
-/// The one-line verdict for a stage the check found already in place — WITH the
-/// apply lane's standing answer about that very build, so a check never paints
-/// "ready" over the apply lane's "did not apply: …". The ledger knows both facts;
-/// the line says both.
+/// The verdict for a stage the check found already in place, with the apply lane's
+/// standing answer about that build, so a check never paints "ready" over "did not apply".
 fn covered_stage_line(
     staging: &Staging,
     current_build: u64,
@@ -1009,25 +881,15 @@ fn covered_stage_line(
     msg
 }
 
-/// The download path's counterpart to `install::sweep_stale_mounts` /
-/// `install::sweep_stale_extracts`: reclaim container scratch a previously-killed run
-/// leaked. Every removal on this path is keyed to the CURRENT artifact's name, and
-/// those names are version-keyed (`aterm-<version>-mac.zip{.part}`), so a partial —
-/// or a fully-downloaded container abandoned in the window between the finalize
-/// rename and the post-stage removal — for a version the channel has since moved past
-/// is unreachable by every other code path, forever. That is up to
-/// `RELEASE_ASSET_DOWNLOAD_BOUND` of the single largest file in the pipeline sitting
-/// in the user's Application Support, and `Staging::retire_published` deliberately
-/// never touches `download/`, so this is the only place it can be reclaimed.
+/// Reclaim container scratch a killed run leaked: the download path's counterpart to
+/// `install::sweep_stale_mounts` / `install::sweep_stale_extracts`. Container names are
+/// version-keyed, so a partial or abandoned container for a version the channel has moved
+/// past is reachable by no other path, and `Staging::retire_published` never touches
+/// `download/`. Every regular file goes (each download writes `{name}.part` and renames it,
+/// so nothing reuses bytes here); directories are left alone.
 ///
-/// Deleting every regular file (rather than sparing the current names) is what makes
-/// it a sweep and subsumes the pre-download `remove_file` it replaced: the pipeline
-/// always downloads into `{name}.part` and renames over the container, so no path
-/// ever reuses bytes already in this dir. Directories are left alone — nothing puts
-/// one here, and a recursive delete is not a risk worth taking for scratch.
-///
-/// Callers MUST hold `staging.stage_lock`: the staging critical section is this
-/// directory's only writer, and the apply/retire lane must keep its hands off it.
+/// Callers must hold `staging.stage_lock`: the staging critical section is this
+/// directory's only writer.
 fn sweep_download_scratch(staging: &Staging) {
     let Ok(entries) = std::fs::read_dir(&staging.download) else {
         return;
@@ -1039,18 +901,12 @@ fn sweep_download_scratch(staging: &Staging) {
     }
 }
 
-/// An OPEN stage-failure retry window, and what it is allowed to stop.
-///
-/// The window in `failed.toml` exists for exactly one purpose: stop us
-/// re-DOWNLOADING (up to 512 MB of) bytes that already refused to become a verified
-/// bundle. It says nothing about a bundle that is ALREADY downloaded, verified,
-/// extracted and published — applying that costs no bandwidth, is not the failure
-/// the memo recorded, and is counted and remedied separately
-/// (`Health::apply_failures`, cleared only by a real apply, escalating on its own
-/// streak). The two failures must not share a timer, and this type is where that
-/// separation is expressed: stage failures of a re-published artifact (same build,
-/// new digest, which [`publishable_stage_covers`] does not cover) must not keep the
-/// earlier, verified bundle on disk from applying.
+/// An open stage-failure retry window, and what it may stop. The window in `failed.toml`
+/// stops only re-downloading (up to 2 GiB of) bytes that refused to become a verified
+/// bundle. It never holds back an already-published bundle, which costs no bandwidth and
+/// has its own streak (`Health::apply_failures`): a re-published artifact (same build, new
+/// digest, not covered by [`publishable_stage_covers`]) that fails to stage must not keep
+/// the earlier verified one from applying.
 #[derive(Debug)]
 struct StageBackoff {
     /// Seconds until the candidate named by the manifest may be downloaded again.
@@ -1058,12 +914,11 @@ struct StageBackoff {
     retry_in_secs: u64,
     /// Consecutive stage failures recorded for that candidate (at least 1).
     attempts: u32,
-    /// The candidate is QUARANTINED: it was applied, crash-looped, and was reverted.
-    /// This is not a timed backoff and must not be reported as one — nothing on this
-    /// machine will retry it; the channel has to offer something else.
+    /// The candidate is quarantined (applied, crash-looped, reverted): not a timed backoff,
+    /// and nothing on this machine retries it.
     quarantined: bool,
-    /// The window is a MOMENT's: staging could not finish, which
-    /// says nothing about the bytes, and the line must not say it "failed".
+    /// The window is a moment's: staging could not finish, and the line must not say it
+    /// "failed".
     moment: bool,
     /// A published local stage that is strictly newer than the running build, if
     /// one exists. The backoff never gates this: the check reports it so the apply
@@ -1072,15 +927,11 @@ struct StageBackoff {
 }
 
 impl StageBackoff {
-    /// The operator-facing line for an open window. It names the lane actually
-    /// being skipped — the RE-STAGE — and then says, separately, whether an apply
-    /// is being skipped along with it. The old wording ("skipping build N for
-    /// another 1387m") named neither, so it read as "nothing is happening" while
-    /// sitting beside a `staged_build` that was ready the whole time.
+    /// The operator-facing line for an open window: the re-stage it skips, then whether an
+    /// apply is skipped too.
     fn status_line(&self, candidate_build: u64) -> String {
         let restage = if self.quarantined {
-            // A quarantine has no clock, and saying "retrying automatically" about one
-            // would be a lie an operator could only discover by waiting forever.
+            // A quarantine has no clock: never "retrying automatically".
             format!(
                 "build {candidate_build} is quarantined: it was applied, failed to start \
                  cleanly, and was reverted — this machine will not retry it (a newer build, \
@@ -1113,26 +964,16 @@ impl StageBackoff {
     }
 }
 
-/// Read the stage-failure memo and decide what it may stop for this candidate.
-/// `None` means no window is open for it (absent memo, another artifact, or the
-/// deadline has passed) — download and stage as usual.
+/// Read the stage-failure memo and decide what it may stop for this candidate; `None` when
+/// no window is open for it (no memo, another artifact, or past the deadline).
 ///
-/// A PERSON'S CHECK PASSES A MOMENT'S MEMO. A moment —
-/// a full disk, a helper past its deadline — says nothing about the bytes, and the
-/// memo throttles only the schedule's re-downloads while it keeps coming back. A
-/// person who freed the space, or changed the network, and asked for a check IS
-/// the news that it may have passed; holding them to the moment's schedule kept
-/// the release from them for up to four hours after the cause was gone, while the
-/// refusal told them to free some space and check. A verdict's memo and a
-/// quarantine still hold against them: those are findings about the build, and a
-/// person asking changes nothing about it.
+/// A person's check passes a moment's memo: a moment (a full disk, a helper past its
+/// deadline) says nothing about the bytes, and a person asking may be the news that it
+/// passed. A verdict's memo and a quarantine still hold.
 ///
-/// `applicable` is gated by [`Ready::read_publishable`], the same local read the
-/// status and apply surfaces share: the marker must carry a canonical identity AND
-/// name a real published bundle whose sealed `Info.plist` rebinds to it. Full
-/// codesign/Team-ID re-verification stays where it has always been — under the
-/// apply lock on the apply path itself, which is the authority — so a backed-off
-/// check never spawns a verification helper per cycle to answer this.
+/// `applicable` is gated by [`Ready::read_publishable`], the local read the status and
+/// apply surfaces share; full codesign/Team ID re-verification stays under the apply lock
+/// on the apply path, so a backed-off check spawns no verification helper.
 fn stage_backoff(
     staging: &Staging,
     manifest: &Manifest,
@@ -1181,44 +1022,26 @@ pub(crate) fn is_stopped_stage_holder_refusal(error: &str) -> bool {
     error.contains(STOPPED_STAGE_HOLDER)
 }
 
-/// This check's hold on `stage.lock`, with the beat that tells a waiting sibling
-/// the holder is alive. The beat is declared FIRST so it stops before the lock is
-/// let go, and never stamps this pid into a lock another process then holds.
+/// This check's hold on `stage.lock`, with the beat that tells a waiting sibling the
+/// holder is alive. The beat is declared first so it stops before the lock is let go,
+/// and never stamps this pid into a lock another process then holds.
 struct StageHold {
     _beat: crate::HolderBeat,
     _lock: aterm_update_core::FileLock,
 }
 
-/// Take the machine-wide stage lock (download → extract → publish), waiting at
-/// most `wait`.
+/// Take the machine-wide stage lock (download → extract → publish), waiting at most `wait`:
+/// a blocking wait would park the checker behind any holder.
 ///
-/// BOUNDED: a blocking wait would park the checker behind any holder.
-///
-/// AND THE HOLDER IS JUDGED. For an aterm STOPPED mid-download (a `SIGSTOP`, a
-/// debugger), or one whose check HUNG there (a download stalled on a dead read, which
-/// the window's watchdog retires but cannot unwind), "another aterm staging" never
-/// comes: it keeps the lock and every sibling's check times out here cycle after
-/// cycle.
-///
-/// The holder stamps the lock while its check is ALIVE — the rule
-/// `checker.lock`'s holder keeps ([`crate::stage_holder_alive`]: its checker
-/// generation current and its heartbeat fresh), not merely while the process
-/// runs, so a hung holder looks as stuck as a stopped one. A waiter that runs out
-/// of time reads the stamp: fresh is a sibling staging (the ordinary stand-down);
-/// stale is a holder that did nothing for half the wait.
-///
-/// ONE STALE READING IS NOT A VERDICT (the mixed-version pairing). A holder of a
-/// build older than this never stamps, so while it stages a large container on a
-/// slow link its lock reads stale — with the mtime and pid of whichever newer
-/// build stamped last, possibly this very process. So the first stale reading
-/// stands down unbooked, and only a SECOND consecutive one — the very next check
-/// that needs the lock — that finds the same stamp (nothing stamped in between —
-/// [`StaleStageStamps`]) is booked as the
-/// TYPED `pipeline` failure ([`STOPPED_STAGE_HOLDER`]) that `update status` and,
-/// past `PERSISTENT_AFTER`, the persistent notice say. A pid the lock names is
-/// never this process's own: an older holder leaves the last writer's there.
-/// The lock cannot be taken from a live process, stopped or not; saying so is
-/// what is left to do.
+/// The holder stamps the lock while its check is alive ([`crate::stage_holder_alive`]:
+/// checker generation current, heartbeat fresh), so a hung holder looks as stuck as a
+/// stopped one. A waiter that times out reads the stamp: fresh is a sibling staging (stand
+/// down), stale is a holder idle for half the wait. A build older than this one never
+/// stamps, so a first stale reading stands down unbooked; only a second consecutive one
+/// with the same stamp ([`StaleStageStamps`]) is booked, as the typed `pipeline` failure
+/// ([`STOPPED_STAGE_HOLDER`]) that `update status` and the persistent notice report. A pid
+/// the lock names is never reported as this process's own: an older holder leaves the last
+/// writer's there. The lock cannot be taken from a live process, stopped or not.
 fn take_stage_lock(staging: &Staging, wait: std::time::Duration) -> Result<StageHold, String> {
     StaleStageStamps::note_stage_lock_reached();
     match aterm_update_core::FileLock::acquire_within(&staging.stage_lock, wait) {
@@ -1253,8 +1076,8 @@ fn take_stage_lock(staging: &Staging, wait: std::time::Duration) -> Result<Stage
                     wait.as_secs()
                 ));
             }
-            // No count of checks: every later check that finds the same stamp books
-            // this again, so "across two checks" was true of the first only.
+            // No count of checks in the words: every later check that finds the same stamp
+            // books this again.
             let holder = crate::checker_lock_holder(&staging.stage_lock)
                 .filter(|pid| *pid != std::process::id())
                 .map_or_else(
@@ -1272,15 +1095,11 @@ fn take_stage_lock(staging: &Staging, wait: std::time::Duration) -> Result<Stage
     }
 }
 
-/// The stage-lock stamps this process last found stale, per lock path: the memory
-/// behind [`take_stage_lock`]'s two-reading rule. In process only — a relaunch
-/// starts over, which costs one more unbooked reading, never a false one.
-///
-/// TWO READINGS MEANS TWO CONSECUTIVE ONES. An older build's slow staging never stamps, so
-/// a first stale reading kept across checks that never needed the lock could pair, days
-/// later, with a reading of the same mtime and book a false stopped holder. A check that
-/// ends without reaching the stage lock ends the run ([`Self::check_ended`]), so the second
-/// reading must come from the very next check that needs the lock.
+/// The stage-lock stamps this process last found stale, per lock path: the memory behind
+/// [`take_stage_lock`]'s two-reading rule. In process only: a relaunch costs one more
+/// unbooked reading, never a false one. The readings must be consecutive: a check that
+/// ends without reaching the stage lock ends the run ([`Self::check_ended`]), so a stale
+/// reading cannot pair with one days later.
 struct StaleStageStamps;
 
 /// A stale reading: `(lock path, the stamp read there, the run it belongs to)`.
@@ -1300,10 +1119,10 @@ thread_local! {
 }
 
 impl StaleStageStamps {
-    /// Record the stale stamp `path` carries now, and say whether the previous
-    /// stale reading of `path` found this SAME stamp in the SAME run of checks —
-    /// nothing stamped in between, and no check in between that did without the
-    /// lock. An unreadable stamp is never a second reading.
+    /// Record the stale stamp `path` carries now, and say whether the previous stale
+    /// reading of `path` found this same stamp in the same run of checks (nothing stamped
+    /// in between, no check in between that did without the lock). An unreadable stamp is
+    /// never a second reading.
     fn seen_again(path: &std::path::Path) -> bool {
         let Ok(stamp) = std::fs::symlink_metadata(path).and_then(|meta| meta.modified()) else {
             Self::forget(path);
@@ -1369,17 +1188,10 @@ impl StaleStageStamps {
     }
 }
 
-/// Retire the published stage of `build`, which the floor withdraws — a revoked
-/// machine signed it, or the operator yanked it — the caller holds the apply lock
-/// and has re-read that the stage is still `build`'s.
-///
-/// AND FORGET ITS PENDING CLOCK. The build is
-/// withdrawn: its release can never be re-authorized by the revoked machine, so it
-/// will never be applied, and a clock left running announced "build P has been
-/// waiting on this machine … no apply attempt has been recorded" an hour later and
-/// at every relaunch until a newer release shipped. Nothing on disk records the
-/// revocation for the pending observation to read, but this code has the build in
-/// hand; a clock another observation has re-keyed to another build is left alone
+/// Retire the published stage of `build`, which the floor withdraws (a revoked signer, a
+/// yank), and forget its pending-update clock, which would otherwise announce a build that
+/// can never apply. The caller holds the apply lock and has re-read that the stage is still
+/// `build`'s; a clock re-keyed to another build is left alone
 /// ([`crate::health::Health::forget_pending_update`]).
 pub(crate) fn retire_revoked_stage(staging: &Staging, build: u64) {
     staging.retire_published();
@@ -1389,50 +1201,32 @@ pub(crate) fn retire_revoked_stage(staging: &Staging, build: u64) {
 /// How [`book_stage_failure`] booked a stage that did not publish.
 #[derive(Debug, PartialEq, Eq)]
 enum StageBooked {
-    /// HELD, not failed: the release was withdrawn (its signer revoked, a yank) or
-    /// quarantined while this check downloaded it. The floor or the quarantine is its
-    /// standing record, the next check refuses it before any download, and
-    /// `status.toml` says why (`held: …`, the words carried here). A healthy end.
+    /// Held, not failed: the release was withdrawn (a revoked signer, a yank) or
+    /// quarantined while this check downloaded it. `status.toml` says why (`held: …`, the
+    /// words carried here); the next check refuses it before any download. A healthy end.
     Held(String),
-    /// A MOMENT: staging could not finish. Booked on the moment schedule.
+    /// A moment: staging could not finish; booked on the moment schedule.
     Moment,
-    /// A VERDICT on the bytes. Booked on the verdict schedule.
+    /// A verdict on the bytes; booked on the verdict schedule.
     Verdict,
 }
 
-/// Book a stage that did not publish after its container arrived — a digest that
-/// could not be taken or did not match, an unpack, a verification, the publish —
-/// or a container this machine could not store as it arrived
-/// ([`book_download_failure`]), and say how it was booked. THE ONE BOOKING POINT
-/// for everything past the download, so one rule decides moment from verdict for
-/// all of it.
+/// Book a stage that did not publish after its container arrived (a digest, an unpack, a
+/// verification, the publish), or a container this machine could not store
+/// ([`book_download_failure`]), and say how it was booked: the one booking point past the
+/// download, so one rule tells a moment from a verdict.
 ///
-/// ONLY A VERDICT IS BOOKED AGAINST THE BUILD (the apply path's rule,
-/// `install::stage_failure_is_a_verdict`). A
-/// verification helper that ran past its deadline on a loaded machine, a helper
-/// the kernel would not start just then, a copy past its launchd budget, an
-/// `hdiutil attach` past its limit, the apply lock a sibling held through the
-/// publish: each is a MOMENT ([`crate::is_passing_refusal`]) and says nothing about
-/// the bytes, so it opens no verdict backoff against a healthy build.
+/// Only a verdict is booked against the build (`install::stage_failure_is_a_verdict`). A
+/// helper past its deadline or one the kernel would not start, a copy past its launchd
+/// budget, an `hdiutil attach` past its limit, the apply lock a sibling held through the
+/// publish: each is a moment ([`crate::is_passing_refusal`]). A moment is memoized on
+/// [`crate::manifest::MOMENT_BACKOFF_SECS`] (the first costs nothing; one that recurs widens
+/// to four hours, shared by every aterm on the Mac; a person's check passes it,
+/// [`stage_backoff`]) and advances the `stage` streak, so past `PERSISTENT_AFTER` the
+/// persistent notice says staging could not finish, never that the build will not verify.
 ///
-/// BUT A MOMENT THAT NEVER PASSES IS BOUNDED, AND ESCALATES (L4, L5). A Gatekeeper
-/// check a network filter always blocks would otherwise re-download the whole
-/// container at every check of every aterm on the machine. So a moment is
-/// memoized on the MOMENT schedule ([`crate::manifest::MOMENT_BACKOFF_SECS`]): the
-/// first costs nothing — the next check tries again — and one that keeps coming
-/// back widens to four hours at most, shared by every aterm on the Mac; a check a
-/// person asks for passes it ([`stage_backoff`]). It also advances the `stage`
-/// streak — the ledger's count of checks that could not make a stage — and past
-/// `PERSISTENT_AFTER` (and the notice's thirty minutes) the persistent notice says
-/// so, in words of its own: staging could not FINISH, never that the build will not
-/// verify (`persistent_failure_notice` reads the passing key in the ledger's
-/// error). The acquisition half of this check worked, which the ledger is told
-/// first.
-///
-/// A stage refused because the artifact is QUARANTINED (a crash-loop revert
-/// landed while this check was downloading), or WITHDRAWN (a sibling's
-/// check recorded its signer's revocation or a yank), is no stage failure either:
-/// it is [`StageBooked::Held`], and the check ends healthy.
+/// A stage refused because the artifact was quarantined or withdrawn meanwhile is
+/// [`StageBooked::Held`], a healthy end.
 fn book_stage_failure(
     staging: &Staging,
     current_build: u64,
@@ -1450,10 +1244,8 @@ fn book_stage_failure(
         crate::status::record(staging, current_build, &why);
         return StageBooked::Held(why);
     }
-    // WITHDRAWN WHILE IT DOWNLOADED: a sibling's check
-    // recorded a revocation of its signer, or a yank, and the publish refused it. No
-    // verdict on the bytes either — the floor is its standing record, and the next
-    // check refuses the release before any download.
+    // Withdrawn while it downloaded (a sibling's check recorded its signer's revocation, or
+    // a yank): held, with the floor as its standing record.
     if let Some(why) = crate::manifest::Floor::read(&staging.floor())
         .withdraws(manifest.build_number, manifest.machine_id.as_deref())
     {
@@ -1505,11 +1297,9 @@ fn book_stage_failure(
     StageBooked::Verdict
 }
 
-/// End the check for a stage that did not publish with `error`: booked by
-/// [`book_stage_failure`], a HELD release is a healthy end — `Ok(None)`, and a
-/// download that put a row on a host's screen takes it down as withheld, never as
-/// a failure that "tries again by itself" — and the rest is the
-/// check's error.
+/// End the check for a stage that did not publish: booked by [`book_stage_failure`], a held
+/// release is a healthy `Ok(None)` (a download's progress row comes down as withheld), and
+/// anything else is the check's error.
 fn end_failed_stage(
     staging: &Staging,
     current_build: u64,
@@ -1594,24 +1384,17 @@ fn container_sha256(path: &std::path::Path, limit: std::time::Duration) -> Resul
     })
 }
 
-/// Book a container download that failed with `error` (a rate limit is not one: it
-/// defers), and answer how the check ends — its error, unless the release was held
-/// while it downloaded ([`end_failed_stage`]).
+/// Book a container download that failed with `error` (a rate limit defers instead) and
+/// answer how the check ends: its error, unless the release was held meanwhile
+/// ([`end_failed_stage`]).
 ///
-/// A DOWNLOAD THIS MACHINE COULD NOT STORE IS NOT THE HOST'S (design law L4). curl's
-/// write error onto a full volume
-/// ([`aterm_update_core::download_error_is_local_write`]) is not a `pipeline` failure
-/// but a passing moment of the stage lane ([`book_stage_failure`]): no verdict
-/// against the release; the first costs nothing, a disk that stays full is
-/// re-downloaded on the moment's schedule — which a check a person asks for passes
-/// ([`stage_backoff`]), the action its words name
-/// ([`crate::install::FREE_SPACE_REMEDY`]) — and it escalates in words that name it.
-/// Every other failure is still the host's.
-///
-/// curl's write error is any local write or open failure (a permission, a read-only
-/// volume, an I/O error), so the words say "is full" only when `free` — the
-/// volume's free bytes, read before the partial download was removed — is under
-/// [`crate::install::STAGE_FREE_SPACE_HEADROOM`]; otherwise they keep curl's cause.
+/// A download this machine could not store is not the host's fault (design law L4): curl's
+/// local write error ([`aterm_update_core::download_error_is_local_write`]) is a passing
+/// moment of the stage lane ([`book_stage_failure`]), retried on the moment's schedule,
+/// which a person's check passes ([`stage_backoff`]). It is any local write or open
+/// failure, so the words say "is full" only when `free` (read before the partial was
+/// removed) is under [`crate::install::STAGE_FREE_SPACE_HEADROOM`]; otherwise they keep
+/// curl's cause. Every other failure is the host's (`pipeline`).
 fn book_download_failure(
     staging: &Staging,
     current_build: u64,
@@ -1676,12 +1459,11 @@ const APPCAST_ASSET: &str = crate::dev_channel::APPCAST_ASSET;
 const APPCAST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
 
 // ---------------------------------------------------------------------------------
-// THE CHECK
+// The check
 // ---------------------------------------------------------------------------------
 
-/// The injected pointer transport: `url → (status, Location)`. Production passes
-/// [`aterm_update_core::head_no_redirect`]; tests pass a counting fake, which is what
-/// makes "zero `api.github.com` requests" a measurement rather than a claim.
+/// The injected pointer transport, `url → (status, Location)`:
+/// [`aterm_update_core::head_no_redirect`] in production, a counting fake in tests.
 type HeadFetch<'a> = &'a mut dyn FnMut(&str) -> Result<HeadAnswer, HttpError>;
 
 /// What the evergreen pointer said the channel head is, relative to what this ledger
@@ -1692,9 +1474,9 @@ enum WebHead {
     /// A tag this ledger has not authorized (or nothing was recorded): the synthesized
     /// candidate whose every asset URL is the derived tag-specific one.
     New(AuthoritativeRelease),
-    /// A NON-failure end, already recorded — the channel has no published release
-    /// (announced, loud), the host asked us to wait (deferred), or the head is not an
-    /// app release. The check is over.
+    /// A non-failure end, already recorded: the channel has no published release
+    /// (announced, loud), the host asked us to wait (deferred), or the head is not an app
+    /// release.
     Ended,
 }
 
@@ -1713,10 +1495,9 @@ fn web_asset_names(version: &str) -> [String; 6] {
     ]
 }
 
-/// The candidate for the pointer's `tag`: every asset's URL the DERIVED
-/// `…/releases/download/<tag>/<name>` (a pure function of the trusted source and the
-/// pointer's tag — never a server string) and the canonical version the tag names,
-/// which the fetched manifest's `version` must then equal.
+/// The candidate for the pointer's `tag`: every asset's URL the derived
+/// `…/releases/download/<tag>/<name>` (a pure function of the trusted source and the tag,
+/// never a server string), and the canonical version the fetched manifest must equal.
 fn web_release(source: &Source, tag: &str) -> Result<AuthoritativeRelease, String> {
     let TagKind::Candidate(numeric) = parse_numeric_tag(tag)? else {
         return Err(format!(
@@ -1741,15 +1522,10 @@ fn web_release(source: &Source, tag: &str) -> Result<AuthoritativeRelease, Strin
     })
 }
 
-/// Record that the channel head is not an app release — a release that carries no
-/// `aterm-appcast.toml` (a source-only release), or a tag this client does not install
-/// from — and end the check. A HEALTHY outcome: the channel was read and nothing is
-/// broken on this machine. The tag is NOT recorded as authorized, so the next check
-/// reads the head again and picks up the app cut the moment the publisher's release
-/// carries it. No listing is consulted to look past the head: `latest` is the
-/// publisher's to point at an installable release, and an older tag's served appcast
-/// is no proof it was ever promoted (a prerelease's is served too — see the module
-/// docs).
+/// Record that the channel head is not an app release (no `aterm-appcast.toml`, or a tag
+/// this client does not install from) and end the check, healthy. The tag is not recorded
+/// as authorized, so the next check reads the head again; nothing looks past it (see the
+/// module docs).
 fn record_head_without_app(staging: &Staging, current_build: u64, tag: &str) {
     crate::health::Health::record_success(&staging.health());
     let mut line =
@@ -1767,23 +1543,19 @@ fn record_head_without_app(staging: &Staging, current_build: u64, tag: &str) {
     crate::status::record(staging, current_build, &line);
 }
 
-/// How long a stage waits under a roster this build's anchor cannot verify.
+/// The `why` of [`unconfirmable_stage_note`] when this build's anchor cannot verify the
+/// roster.
 const STALE_ANCHOR_STAGE_WAIT: &str = "this build can never confirm it";
 
-/// WHAT A CHECK THAT READ NO ROSTER SAYS ABOUT THE STAGE WAITING FOR ONE: `Some` when the
-/// build staged here — publishable and newer than the running build — waits for its roster
-/// confirmation at `now` (the swap's gate 4d, `Ready::roster_authorization_stale`), naming
-/// the wait and `why` this check could not end it.
+/// What a check that admitted no roster says about a stage waiting for one: `Some` when the
+/// publishable, newer stage waits for roster confirmation at `now` (gate 4d,
+/// `Ready::roster_authorization_stale`), naming the wait and `why` this check cannot end it.
 ///
-/// Gate 4d's own refusal says the stage "installs once the next update check
-/// confirms it", which is true only of a check that can admit the channel head's
-/// roster. Two channel states admit none, and the stage then waits as long as they
-/// last: a head that is not an app release (an index cut or a source-only release at
-/// the head: [`record_head_without_app`]), and a roster this build's trust anchor
-/// cannot verify (a master rotation it predates: [`STALE_ANCHOR_KEY`]), where it
-/// waits for good and only a reinstall moves the client (docs/RELEASE-KEYS.md,
-/// *Rotating the master*). The status line names the state rather than leave the
-/// update row promising a check that cannot come.
+/// Gate 4d's refusal promises that a check confirms the stage, which only a check that
+/// admits the head's roster can. Two channel states admit none: a head that is not an app
+/// release ([`record_head_without_app`]), and a roster this build's anchor cannot verify
+/// ([`STALE_ANCHOR_KEY`]), where only a reinstall helps (docs/RELEASE-KEYS.md, *Rotating
+/// the master*).
 fn unconfirmable_stage_note(
     staging: &Staging,
     current_build: u64,
@@ -1805,12 +1577,10 @@ fn unconfirmable_stage_note(
     ))
 }
 
-/// THE SOURCE-ONLY HEAD — the pointer named a canonical app tag whose appcast answers
-/// 404 — said as a head with no app manifest yet ([`record_head_without_app`]), and,
-/// when its tag outranks the last one the ledger authorized for this source, latched
-/// as an APP BUILD IN FLIGHT ([`app_build_in_flight`]): its assets are minutes away, so
-/// [`check_and_stage`] counts it on the receipt and the loop re-checks on the quick
-/// ladder instead of a whole interval.
+/// A source-only head (a canonical app tag whose appcast answers 404), recorded as a head
+/// with no app manifest yet, and latched as an app build in flight
+/// ([`app_build_in_flight`]) when it outranks the last tag authorized for this source, so
+/// the loop re-checks on the quick ladder.
 fn record_source_only_head(staging: &Staging, current_build: u64, source: &Source, tag: &str) {
     let known = crate::status::authorized_tag(staging, source);
     if app_build_in_flight(tag, known.as_deref()) {
@@ -1819,15 +1589,11 @@ fn record_source_only_head(staging: &Staging, current_build: u64, source: &Sourc
     record_head_without_app(staging, current_build, tag);
 }
 
-/// ONE unmetered HEAD, and the decision it yields: a redirect to a canonical tag is the
-/// head; the ledger's `latest_tag` decides whether anything else is fetched; a 404 is
-/// the loud standing state; a 429 or 5xx is a deferral; a redirect to a tag this client
-/// does not install from is a head with no app release; a transport failure is the
-/// historical `network`-class failure.
-///
-/// `known_tag` is what `status.toml` recorded as last authorized. The comparison is
-/// string equality on tags this function already proved canonical, so `v0.74.0`
-/// recorded and `v0.74.0` pointed at is "unchanged", and nothing else is.
+/// One unmetered HEAD and its decision: a redirect to a canonical tag is the head,
+/// unchanged when it equals `known_tag` (`status.toml`'s last authorized tag; both are
+/// canonical, so string equality suffices); a 404 is the loud standing state; a 429 or 5xx
+/// defers; a redirect to a tag this client does not install from is a head with no app
+/// release; anything else is a `network`-class failure.
 fn resolve_web_head(
     staging: &Staging,
     current_build: u64,
@@ -1865,10 +1631,8 @@ fn resolve_web_head(
             record_head_without_app(staging, current_build, &tag);
             return Ok(WebHead::Ended);
         }
-        // A refused redirect, an unexpected status, an unsafe source, a transport
-        // failure: the historical `network`-class failure. A refusal in particular is
-        // NOT interpreted — the pointer named something this client will not follow,
-        // and the check ends without a request to it.
+        // A refused redirect, an unexpected status, an unsafe source, a transport failure:
+        // `network`-class. What the pointer named is never requested.
         Err(error) => {
             let message = error.to_string();
             crate::health::Health::record_failure(&staging.health(), "network", &message);
@@ -1880,30 +1644,21 @@ fn resolve_web_head(
         return Ok(WebHead::Unchanged { tag: pointer.tag });
     }
     let candidate = web_release(source, &pointer.tag)?;
-    // The pointer's own `Location` and the candidate's derived appcast URL are the same
-    // string by construction (`parse_location` proved it); assert the construction
-    // rather than trust it, because every later GET is addressed by the derived one.
+    // The pointer's `Location` and the derived appcast URL are equal by construction
+    // (`parse_location`); asserted, because every later GET uses the derived one.
     debug_assert_eq!(candidate.release.assets[0].url, pointer.location);
     Ok(WebHead::New(candidate))
 }
 
-/// THE URL CROSS-CHECK: the signed manifest names its container's
-/// download URL, and that URL must name THE TAG the pointer chose and THE CONTAINER
-/// the manifest itself names. The manifest field is never followed — the derived URL
-/// is what is downloaded — so this binds the signed bytes to the tag (invariant (d):
-/// tag == `v<version>` == the tag in the manifest's URL), and a re-published appcast
-/// copied onto another tag cannot be elected under it.
+/// The URL cross-check: the signed manifest's container `url` must name the tag the pointer
+/// chose and the DMG the manifest names. The field is never followed (the derived URL is
+/// what is downloaded); this binds the signed bytes to the tag, so an appcast copied onto
+/// another tag is refused.
 ///
-/// What is bound is the TAG and the DMG name, not the repository: the publisher signs `url`
-/// under the compiled-in public channel's slug (`manifest_out.rs` `repo_slug` =
-/// `[workspace.metadata.aterm] update_channel`, the slug `DEFAULT_OWNER`/`DEFAULT_REPO`
-/// name), so an updater REPOINTED at a mirror that carries the
-/// upstream-signed appcast would otherwise refuse every release as a `manifest`-class
-/// failure blamed on a publisher who did nothing wrong. The repository half adds nothing to
-/// (d): `pointer::parse_location` already scopes every GET after the HEAD to the source
-/// repository. The URL's slug must be the source's or the compiled-in channel's
-/// (GitHub-style case-insensitively); anything else is a manifest signed for a channel this
-/// updater does not read.
+/// The repository may be the source's or the compiled-in channel's (case-insensitively):
+/// the publisher signs `url` under the public channel's slug, and a repointed mirror
+/// carries those appcasts. `pointer::parse_location` already scopes every GET to the
+/// source repository.
 fn web_container_url_agrees(source: &Source, tag: &str, manifest: &Manifest) -> Result<(), String> {
     let Some(url) = manifest.url.as_deref() else {
         return Err(format!(
@@ -1967,38 +1722,29 @@ enum Acquisition {
     Ended,
 }
 
-/// Background check + stage. Returns `Some(version)` when a strictly-newer
-/// verified build IS staged and applicable — usually because this call staged it,
-/// but also when one was already published and only the RE-stage is backed off
-/// (see [`StageBackoff`]) — or `None` when nothing newer is available / the updater
-/// is idle. The caller turns `Some` into the apply lane's cue, so the answer is
-/// deliberately about STATE ("a build is staged and can be applied") rather than
-/// about this call's activity. Errors are transient/operational (network, parse)
-/// and are logged by the caller.
+/// Background check and stage. `Some(version)` when a strictly newer verified build is
+/// staged and applicable, whether or not this call staged it (the re-stage may be backed
+/// off, [`StageBackoff`]): the caller arms the apply lane on it, so the answer is about
+/// state, not activity. `None` when nothing newer is available. Errors are transient
+/// (network, parse); the caller logs them.
 ///
-/// The running build's *version* is deliberately not a parameter: it plays no
-/// part in the decision. Selection is by numeric release tag
-/// ([`canonical_authority_version`]) and the downgrade gate is `current_build`
-/// against the manifest's `build_number`. Reintroducing a version comparison
-/// here would be wrong even under the single `MAJOR.MINOR.0` scheme: the patch
-/// slot is always 0 and a dev build carries the commit sha in SemVer build
-/// metadata (`0.5.0+g<sha>`), so a dev build and the release it should install
-/// compare EQUAL on the numeric triple — a version test could not tell them
-/// apart, and build metadata is explicitly not ordered (`VERSIONING.md`).
+/// The running build's version is not a parameter: selection is by release tag and the
+/// downgrade gate compares build numbers. A dev build (`0.5.0+g<sha>`) and the release it
+/// should install compare equal on the version triple, and build metadata is unordered
+/// (`VERSIONING.md`).
 pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<String>, String> {
     check_and_stage_for(current_build, source, Asked::Schedule)
 }
 
-/// Who asked for a check: the background schedule, or a PERSON (Check for Updates,
-/// `aterm update check`, `aterm ctl update check` — every one is
-/// [`crate::check_now`]).
+/// Who asked for a check: the background schedule, or a person (Check for Updates,
+/// `aterm update check`, `aterm ctl update check`, all through [`crate::check_now`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Asked {
     Schedule,
     Person,
 }
 
-/// [`check_and_stage`], asked for by `asked`. A person's check passes a MOMENT's
+/// [`check_and_stage`], asked for by `asked`. A person's check passes a moment's
 /// re-stage memo ([`stage_backoff`]); nothing else about the check differs.
 pub(crate) fn check_and_stage_for(
     current_build: u64,
@@ -2015,12 +1761,8 @@ pub(crate) fn check_and_stage_for(
     if let Some(staging) = Staging::resolve() {
         StaleStageStamps::check_ended(&staging.stage_lock);
     }
-    // EVERY exit writes status, including the failing ones. The eight `Err` paths
-    // below all returned without recording, so `status.toml` kept advertising the
-    // last HEALTHY outcome — "staged X — verified and ready to apply", or "up to
-    // date" — while the machine was in fact failing every check. An operator (and
-    // the GUI, which renders this text) then read a stale success as the current
-    // state, which is worse than no status at all: it is confidently wrong.
+    // Every exit writes status, failures included: else `status.toml` keeps the last
+    // healthy outcome while every check fails.
     if let Err(error) = &result
         && let Some(staging) = Staging::resolve()
     {
@@ -2030,12 +1772,8 @@ pub(crate) fn check_and_stage_for(
             &format!("update check failed: {error}"),
         );
     }
-    // THE LIVE CHANNEL IS ANSWERED THE SAME WAY. A check that reported a download
-    // (`progress::watch_download`) put something on the host's screen; every exit
-    // after that point must take it down with the truth — the `Staged` and
-    // `Deferred` arms report inline, and this is the one place all eight failure
-    // exits reach. A check that never downloaded reported nothing and owes nothing
-    // (the routine no-op check must not raise a bar to say it failed to find work).
+    // A check that began a download put a bar on the host's screen: a failure takes it
+    // down here (the other ends report inline). A check that never downloaded owes nothing.
     let began = crate::progress::take_download_began();
     if began && let Err(error) = &result {
         crate::progress::report(crate::progress::Progress::Failed {
@@ -2056,14 +1794,11 @@ pub(crate) fn check_and_stage_for(
     result
 }
 
-/// Stamp the check receipt for the check that just ended, when it owes one
-/// ([`check_leaves_a_receipt`]), and answer the head in flight it counted: `found` —
-/// the head whose app build the check found in flight — with the machine-wide count
-/// of consecutive checks that have found it so, this one included. Only a completed
-/// check that is not a deferral counts one: a host that asked us to slow down holds
-/// to the deferral's own window, never the quick ladder. A failed check leaves the
-/// receipt untouched, so it neither counts nor ends the run — the next completed
-/// check that finds the same head carries the count on.
+/// Stamp the check receipt when the check owes one ([`check_leaves_a_receipt`]), and answer
+/// `found`, the head whose app build it found in flight, with the machine-wide count of
+/// consecutive checks that found it so, this one included. A deferral counts none (it keeps
+/// its own window, not the quick ladder); a failed check leaves the receipt untouched,
+/// neither counting nor ending the run.
 fn stamp_receipt(
     staging: &Staging,
     current_build: u64,
@@ -2081,22 +1816,12 @@ fn stamp_receipt(
     found.filter(|_| checks > 0).map(|tag| (tag, checks))
 }
 
-/// Whether the check that just ended owes the shared check receipt a stamp.
-///
-/// ONLY A CHECK THAT REACHED THE CHANNEL LEAVES ONE. The receipt's
-/// contract is its module doc's first line — "completed network checks have their
-/// own receipt" — and every reader leans on it: `crate::checker_skip_for` skips
-/// this interval's network check on it machine-wide, and `crate::last_check_at` /
-/// `status.toml`'s `checked_at` advertise it as when this channel was last asked.
-/// Stamped from a failing exit, a process would re-read its OWN failure stamp as
-/// another process's completed check and advertise a last-check time for a check
-/// that never reached GitHub. A failure is bounded by
-/// each process's own backoff ladder (`cadence::Cadence::failed`), which is what
-/// that ladder is for.
-///
-/// A DEFERRAL IS NOT A FAILURE and still records: a 429 or a 5xx from the download
-/// host ends the check with `Ok` and books `record_deferral`, and the receipt then
-/// widens every sibling's window so the whole machine retreats, not one process.
+/// Whether the check that just ended owes the shared check receipt a stamp: only one that
+/// reached the channel. Readers take the receipt for a completed check (`checker_skip_for`
+/// skips the interval machine-wide on it; `last_check_at` and `checked_at` advertise it),
+/// so a failure stamps nothing and is bounded by its own process's backoff
+/// (`cadence::Cadence::failed`). A deferral (a 429 or 5xx) stamps, so every sibling's
+/// window widens and the whole machine retreats.
 fn check_leaves_a_receipt(
     result: &Result<Option<String>, String>,
     recorded_a_deferral: bool,
@@ -2113,19 +1838,15 @@ fn acquire(
     source: &Source,
     head: HeadFetch<'_>,
 ) -> Result<Acquisition, String> {
-    // The recorded tag is trusted only when the ledger still describes THIS build's
-    // verdict on THIS source (`status::latest_tag`).
+    // The recorded tag is trusted only when the ledger still describes this build's
+    // verdict on this source (`status::latest_tag`).
     let known_tag = crate::status::latest_tag(staging, current_build, source);
     match resolve_web_head(staging, current_build, source, known_tag.as_deref(), head)? {
         WebHead::Ended => Ok(Acquisition::Ended),
-        // THE STAGE'S ROSTER CONFIRMATION IS DUE: the head has not
-        // moved, but the build waiting here was last confirmed against a freshly
-        // fetched roster too long ago — the swap's gate 4d holds it past a day — so
-        // the head is judged again, roster and all, and the floor's observation
-        // confirms the stage or retires it (`observe_floor_and_withdraw_at`). A few
-        // small GETs about once an hour while a newer stage waits (so the stamp a
-        // quit leaves behind is never much older), and once after a launch that
-        // found one stale.
+        // The head has not moved, but the staged build's roster confirmation is due (gate
+        // 4d holds it past a day): judge the head again, roster and all, so the floor's
+        // observation confirms or retires the stage. A few small GETs about hourly while
+        // a newer stage waits.
         WebHead::Unchanged { tag }
             if stage_owes_roster_reconfirmation(
                 staging,
@@ -2179,27 +1900,18 @@ fn floor_hold(build: u64, effective_min_build: u64, high_water: u64) -> Option<S
     })
 }
 
-/// Record what this check OBSERVED in the durable floor, then withdraw a published
-/// stage the floor no longer admits, and answer the floor the rest of the check
-/// judges by (the one just written — a revocation may have LOWERED it).
+/// Record what this check observed in the durable floor, withdraw a published stage the
+/// floor no longer admits, and answer the floor the rest of the check judges by (the one
+/// just written: a revocation may have lowered it). `Err` (passing) when the floor could
+/// not be read back; a stage the revocations in hand withdraw is still retired first.
 ///
-/// Split out of the check so the rule is a test: the check itself needs the network.
+/// When this check admitted a roster (`observation.roster_seq` nonzero) and nothing on disk
+/// is withdrawn, the stage's [`Ready::roster_confirmed_at`] moves to `roster_read_at`
+/// (RFC3339, when this check began fetching that roster), which the swap's gate 4d waits
+/// for ([`crate::install::confirm_roster_authorization`]).
 ///
-/// `Err` (a passing refusal) when the floor is there but could not be read back: the
-/// check ends there, judging nothing by a floor it never saw. The
-/// stage a revocation in hand withdraws is still retired first.
-///
-/// AND A STAGE THE ROSTER STILL ADMITS IS CONFIRMED: when this
-/// check admitted a roster (`observation.roster_seq`, nonzero only then) and the floor
-/// it wrote withdraws nothing on disk, the stage's [`Ready::roster_confirmed_at`]
-/// moves to `roster_read_at` ([`crate::install::confirm_roster_authorization`]) — the
-/// one thing the swap's gate 4d waits for. `roster_read_at` (RFC3339) is when this
-/// check began fetching the roster it judged by, never a later instant: the window
-/// bounds how long ago a roster was read.
-///
-/// The `Check` of `NativeUpdateRosterFreshness`: a check that
-/// admitted a roster retires the stage it revokes and confirms the one it trusts.
-/// Tier-1: `tests::roster_freshness_conformance`.
+/// The `Check` action of `NativeUpdateRosterFreshness`; Tier-1:
+/// `tests::roster_freshness_conformance`.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2215,24 +1927,13 @@ fn observe_floor_and_withdraw_at(
     observation: &crate::manifest::FloorObservation<'_>,
     roster_read_at: &str,
 ) -> Result<crate::manifest::Floor, String> {
-    // Remember the authoritative release's operator floor immediately (even if we do
-    // not stage). The persisted floor remains monotonic across checks.
-    // The same call ratchets the roster sequence. Doing it here — on OBSERVATION, not on
-    // successful staging — is what makes the replay defence work: a client that merely
-    // SAW roster generation n must refuse n-1 forever after, whether or not it went on to
-    // install anything from that release. `observed_roster_seq` carries that observation
-    // out of the chain even when the chain then REFUSED the release (a roster that
-    // revokes the release's signer is admitted, observed here, and only then refuses),
-    // so the ratchet is genuinely observation-driven and not acceptance-driven.
-    //
-    // And it records what that roster REVOKES, which takes back every floor the revoked
-    // machines raised: a stolen key's release
-    // with a huge `min_build`, or a huge build this client staged, held every genuine
-    // release after the revocation "below the operator floor" forever.
+    // Record the release's operator floor and roster sequence now, whether or not this
+    // check stages: the ratchet follows observation, not acceptance (a roster that revokes
+    // the release's signer is observed, then refuses). It also records what the roster
+    // revokes, which takes back every floor the revoked machines raised (a stolen key's
+    // huge `min_build` or staged build).
     crate::manifest::Floor::observe_and_write(&staging.floor(), observation);
-    // THE FLOOR THIS CHECK JUDGES BY is the one just written: a revocation may have
-    // LOWERED it, and the snapshot taken before the fetch would go on holding the
-    // release a revoked machine's floor was holding back.
+    // Judge by the floor just written: a revocation may have lowered it.
     let floor = crate::manifest::Floor::read_for_gate(&staging.floor());
     if let Ok(floor) = &floor
         && (floor.min_build < floor_before.min_build || floor.high_water < floor_before.high_water)
@@ -2247,31 +1948,14 @@ fn observe_floor_and_withdraw_at(
             floor.high_water
         ));
     }
-    // A STAGE THE FLOOR NO LONGER ADMITS IS WITHDRAWN HERE. The ratchet above records
-    // what was SEEN; this acts on what it SAYS, for the stage already on disk: a
-    // machine the roster now revokes (roster generation `n+1`), or a build the
-    // operator has yanked (`min_build`).
-    //
-    // A stage is an authorization made earlier, and nothing revisited it: a build
-    // staged at 10:00 by a machine revoked at 10:30 was applied anyway (in-session,
-    // or at the next launch), and only a separate `min_build` yank could have
-    // stopped a withdrawn machine's artifact. A yanked stage, in turn, stayed
-    // announced as "verified and ready to apply" until an apply parked every reader
-    // for it and the successor's gate 4b refused it.
-    //
-    // IT IS DECIDED HERE, NOT IN THE APPLY LANE ALONE. Revocation is a LIST, and this
-    // is the only place the roster document is in hand; the apply lane holds the
-    // floor, whose durable revocation set is what this check just recorded. A
-    // roster-GENERATION comparison there is not merely weaker but WRONG — a manifest
-    // attributed under an older generation than the roster asset is the ordinary
-    // post-join steady state, which `authorize_by_roster` deliberately admits, so
-    // gating on it retires good stages forever (see `install`, gate 4c).
-    //
-    // Matching on `machine_id` is what makes this exact: the id sits inside the
-    // manifest's SIGNED bytes and the roster maps ids to keys, so a genuine
-    // signature by one machine cannot be relabelled as another's. The stage is
-    // read WITHOUT the floor ([`Ready::read_published_bundle`]): the stage the
-    // floor now hides from every other reader is exactly the one to find.
+    // A stage the floor no longer admits is withdrawn here: its signer is now revoked, or
+    // it was yanked (`min_build`). Decided here and not only in the apply lane, because
+    // revocation is a list in the roster document, which only this check holds; the apply
+    // lane holds the floor and its durable revocation set, recorded just above. A
+    // roster-generation comparison there would be wrong: a manifest attributed under an
+    // older generation is the ordinary post-join state (`install`, gate 4c). The match is
+    // on `machine_id`, inside the signed bytes. The stage is read without the floor
+    // ([`Ready::read_published_bundle`]): the one the floor hides is the one to find.
     let withdrawal = |staged: &Ready| {
         floor
             .as_ref()
@@ -2295,19 +1979,12 @@ fn observe_floor_and_withdraw_at(
     if let Some(staged) = Ready::read_published_bundle(staging)
         && let Some(why) = withdrawal(&staged)
     {
-        // UNDER THE APPLY LOCK, like every other retirement of the published stage.
-        // `apply_staged_if_ready` in a concurrently LAUNCHING instance verifies the
-        // staged `.app` and then renames it into place under `apply_lock`; a
-        // `remove_dir_all` racing that rename would gut the tree it was in the
-        // middle of installing (and, fd-relative, keep unlinking inside the same
-        // inode after the rename — the live install), which the boot sentinel would
-        // then read as a crash loop and revert with the build poisoned. Lock order
-        // is respected (nothing is held here; the stage lock is taken later), and a
-        // boot apply that wins the lock first reads the same floor at its own gates
-        // (4b, 4c) and retires the stage itself — the re-read below then finds
-        // nothing to retire.
-        // Bounded: this is the checker thread, and a wedged apply-lock holder would
-        // park it here for good. The `Err` arm already retries.
+        // Under the apply lock, like every retirement of the published stage: a launching
+        // instance's `apply_staged_if_ready` renames the staged `.app` into place under it,
+        // and a delete racing that rename would gut the live install. Nothing else is held
+        // here (the stage lock comes later); a boot apply that wins the lock retires the
+        // stage at its own gates (4b, 4c), and the re-read below finds nothing.
+        // Bounded: this is the checker thread. The next check retries.
         match aterm_update_core::FileLock::acquire_within(
             &staging.apply_lock,
             crate::install::BACKGROUND_LOCK_WAIT,
@@ -2319,9 +1996,8 @@ fn observe_floor_and_withdraw_at(
                     crate::warn(&format!("staged {why}; discarding it"));
                     retire_revoked_stage(staging, staged.build_number);
                     let note = format!("held: staged {why}");
-                    // Carried onto every later record of THIS check (status.toml is one
-                    // overwritten line): the sentence survives the check's own terminal
-                    // outcome, and `aterm ctl update status` really does say so.
+                    // Carried onto every later record of this check: `status.toml` is one
+                    // overwritten line.
                     crate::status::set_check_note(note.clone());
                     crate::status::record(staging, current_build, &note);
                 }
@@ -2332,12 +2008,9 @@ fn observe_floor_and_withdraw_at(
             )),
         }
     }
-    // THE CONFIRMATION. A roster admitted by THIS check — fetched
-    // just now, master-verified, no older than any generation this Mac has seen —
-    // whose revocations (and every one the floor remembers) leave the stage on disk
-    // standing has confirmed it: the swap may install it for another day. A floor
-    // that could not be read confirms nothing, and nor does a check that admitted no
-    // roster (the unchanged head's pointer read, a fetch that failed).
+    // A roster this check admitted whose revocations (and the floor's) leave the stage
+    // standing confirms it for another day. An unreadable floor, or a check that admitted
+    // no roster, confirms nothing.
     if observation.roster_seq > 0
         && floor.is_ok()
         && let Some(staged) = Ready::read_published_bundle(staging)
@@ -2354,13 +2027,11 @@ fn observe_floor_and_withdraw_at(
     floor
 }
 
-/// Project one observed stage onto the bounded `NativeUpdateRosterFreshness`
-/// machine: ticks of half the window (twelve hours of
-/// [`crate::manifest::ROSTER_FRESHNESS_SECS`]), the tick its confirmation was read
-/// at (`confirmed`), when the owner's revocation of its signer was
-/// published (`revoked_at`, `None`: not yet), whether its marker and bundle are
-/// on disk, and whether a lane installed it and how late (`swapped`: `None` not
-/// yet, `Some(late)` once).
+/// Project one observed stage onto the bounded `NativeUpdateRosterFreshness` machine: ticks
+/// of half the window ([`crate::manifest::ROSTER_FRESHNESS_SECS`]), the tick its
+/// confirmation was read at (`confirmed`), when its signer's revocation was published
+/// (`revoked_at`, `None`: not yet), whether its marker and bundle are on disk, and whether a
+/// lane installed it and how late (`swapped`: `None` not yet, `Some(late)` once).
 ///
 /// Compiled only for proof/test builds. Every input is an OBSERVATION of the real
 /// staging root and of the real gate's answer, never a second copy of either rule.
@@ -2394,18 +2065,10 @@ fn applicable_stage(staging: &Staging, current_build: u64) -> Option<String> {
         .map(|ready| ready.version)
 }
 
-/// The check's snapshot of the floor, or the refusal that ends the check: passing,
-/// since nothing is admitted past a floor that was not read and the next check
-/// reads it again ([`crate::manifest::Floor::read_for_gate`]) — and BOOKED,
-/// `pipeline` class.
-///
-/// Failing closed is right for a moment (`EMFILE` at a Dock launch's descriptor
-/// limit, one `EIO`), but a floor that STAYS unreadable — root-owned after a `sudo`
-/// run, a broken ACL, a failing disk — ends every check at this line, before any
-/// other booking, and `commit_observation` can never rewrite it: all updates stop
-/// for good. Unbooked, the only trace was `status.toml`'s "update check failed" and a
-/// de-duplicated log line. Booked, a streak of [`crate::PERSISTENT_AFTER`] checks
-/// raises the persistent notice, which names the file and the remedy.
+/// The check's snapshot of the floor, or the passing refusal that ends the check
+/// ([`crate::manifest::Floor::read_for_gate`]), booked `pipeline` class: a floor that stays
+/// unreadable (root-owned after a `sudo` run, a broken ACL, a failing disk) ends every check
+/// here, and a streak of [`crate::PERSISTENT_AFTER`] raises the persistent notice.
 fn floor_snapshot(staging: &Staging) -> Result<crate::manifest::Floor, String> {
     crate::manifest::Floor::read_for_gate(&staging.floor()).inspect_err(|error| {
         crate::health::Health::record_failure(&staging.health(), "pipeline", error);
@@ -2469,33 +2132,23 @@ fn check_and_stage_in(
         install::reap_abandoned_copy_attempts(parent);
     }
     crate::status::clear_check_note();
-    // A surviving apply streak recorded by a DIFFERENT build is proven stale
-    // — the machine moved by SOME means (channel, manual install, boot swap)
-    // — so every check heals it here rather than letting `update status`
-    // present `persistent=true` on an up-to-date install forever (see
-    // [`crate::health::Health::expire_stale_apply_streak`]).
-    // …unless this process is an UNCOMMITTED HANDOFF CANDIDATE. A candidate spawns
-    // its own background check before it has taken over, and expiring the streak
-    // from there would erase the failures its own attempt is about to add, keeping
-    // `failing_applies` at 1. Every other launch heals on its first check.
+    // An apply streak recorded by a different build is stale (the machine moved by some
+    // means), so every check expires it — except an uncommitted handoff candidate's, whose
+    // check runs before it takes over and would erase the failures its own attempt adds.
     if !crate::is_uncommitted_handoff_candidate() {
         crate::health::Health::expire_stale_apply_streak(&staging.health(), current_build);
     }
-    // Persisted monotonic recency floor (operator yank + rollback guard, F5/F6). A
-    // floor that could not be read ends the check, passing and booked: judged
-    // as "no floor", a yanked or rolled-back release would be authorized, staged and
-    // announced on that read.
+    // The persisted recency floor (yank and rollback guard, F5/F6). An unreadable floor
+    // ends the check ([`floor_snapshot`]): read as "no floor", a yanked or rolled-back
+    // release would be staged.
     let floor = floor_snapshot(&staging)?;
 
     let authoritative = match acquire(&staging, current_build, source, head)? {
         Acquisition::Proceed(candidate) => candidate,
         Acquisition::Ended => return Ok(None),
         Acquisition::UpToDate { tag } => {
-            // THE STEADY STATE, on one request. The pointer names the tag this ledger
-            // last authorized, so nothing is fetched and nothing is re-judged: the
-            // release was accepted or declined on a previous check under the same
-            // gates, and its required local stage still covers that decision. A terminal
-            // healthy outcome — the channel was read.
+            // The steady state, one request: the pointer names the tag last authorized,
+            // so nothing is fetched or re-judged. Healthy: the channel was read.
             crate::health::Health::record_success(&staging.health());
             // A strictly newer build already staged is the fact this line must
             // carry: "up to date" beside `staged_build = <newer>` would read as
@@ -2524,17 +2177,11 @@ fn check_and_stage_in(
     // Every asset rides the derived download-host URL, with no credential.
     let mut download =
         |url: &str, max_bytes: u64| aterm_update_core::download_bytes(url, max_bytes);
-    // The roster tier's inputs, resolved from the anchor and this client's durable state.
-    // `PAPER_MASTER_PUBKEYS` is ARMED, so the master-signed roster decides
-    // who may have signed the appcast this check accepts, and every field below is
-    // load-bearing.
-    //
-    // `floor_seq` is a snapshot read before the (network) head fetch above, so it can be
-    // stale by the time a roster is admitted; `floor_refresh` re-reads the durable floor
-    // at the admission point itself, closing the check-vs-ratchet TOCTOU between two
-    // concurrent app instances.
+    // The roster tier's inputs. `floor_seq` is a snapshot from before any network I/O;
+    // `floor_refresh` re-reads the durable floor at admission
+    // ([`RosterPolicy::floor_refresh`]).
     let floor_path = staging.floor();
-    // A re-read that failed keeps the snapshot: the max below only tightens.
+    // A re-read that failed keeps the snapshot: the max at admission only tightens.
     let floor_refresh = || crate::manifest::Floor::read(&floor_path).roster_seq;
     let roster_policy = RosterPolicy {
         master_pubkeys,
@@ -2542,19 +2189,15 @@ fn check_and_stage_in(
         now_unix: aterm_update_core::roster::now_unix(),
         floor_refresh: Some(&floor_refresh),
     };
-    // WHEN THIS CHECK READ THE ROSTER, taken before the
-    // fetch that reads it: the stage this check confirms, or publishes after its
-    // download, is stamped with this instant, never a later one. A download may run
-    // for hours, and a stamp taken at the publish added all of it to the window a
-    // revocation can hide in. An unreadable clock is empty, which stamps nothing
-    // (the swap reads that as unconfirmed).
+    // When this check read the roster, taken before the fetch: every stage it confirms or
+    // publishes is stamped with this instant, never a later one, since a download can run
+    // for hours of window a revocation could hide in. An unreadable clock is empty and
+    // stamps nothing (read as unconfirmed).
     let roster_read_at = crate::install::now_rfc3339();
     let mut fetched =
         fetch_authoritative_release(Some(authoritative), &mut download, &roster_policy);
-    // THE SOURCE-ONLY HEAD: the pointer named a release whose appcast answers 404. The
-    // head is not an app release yet; say so and end the check, healthy. The tag is not
-    // recorded as authorized, so the next check reads it again and the app cut that
-    // attaches its appcast is picked up then.
+    // A source-only head (its appcast answers 404) is not an app release yet: a healthy
+    // end, and the tag is not recorded as authorized, so the next check reads it again.
     if fetched.appcast_missing {
         record_source_only_head(&staging, current_build, source, &web_tag);
         return Ok(None);
@@ -2593,11 +2236,8 @@ fn check_and_stage_in(
 
     let Some((manifest, release, artifact)) = best else {
         if appcast_fetch_error && asset_fetch_rate_limited {
-            // The manifest/roster/signature GET met the host's throttle — the same
-            // verdict a throttled pointer HEAD gets one request earlier, and for the
-            // same reason no `record_failure`: a saturated check must not book a
-            // persistent `pipeline` streak and fire the "download pipeline is likely
-            // broken" notice at a perfectly healthy machine.
+            // An asset GET met the host's throttle: a deferral, like a throttled HEAD, and
+            // never a `pipeline` streak.
             record_deferral(
                 &staging,
                 current_build,
@@ -2644,20 +2284,16 @@ fn check_and_stage_in(
                 )
             }
         } else if manifest_rejected {
-            // Manifests were FETCHED but rejected (unsigned / bad signature /
-            // unparseable / a version or URL that does not bind to the tag): the
-            // pipeline works; the release side (or an attacker) is the problem. Its
-            // own class — it must not clear a streak. The ledger gets the reason the
-            // log printed, and a STRANDED client — one whose own anchor
-            // cannot verify the channel — is told to reinstall, not to wait for the
-            // publisher.
+            // Fetched but rejected (unsigned, bad signature, unparseable, a version or URL
+            // that does not bind to the tag): the release side or an attacker is the
+            // problem, booked `manifest`. A stranded client (its anchor cannot verify the
+            // channel) is told to reinstall, not to wait for the publisher.
             let reason = rejection_reason
                 .as_deref()
                 .unwrap_or("manifest(s) fetched but rejected (signature/parse)");
             let h = crate::health::Health::record_failure(&staging.health(), "manifest", reason);
-            // A stage waiting for its roster confirmation cannot get it from a build whose
-            // anchor cannot verify the roster: said, so the update row does not promise a
-            // check that cannot come.
+            // A build whose anchor cannot verify the roster can never confirm a waiting
+            // stage: say so, so the update row promises no check that cannot come.
             let stage_note = is_stale_anchor_refusal(reason)
                 .then(|| {
                     unconfirmable_stage_note(
@@ -2693,30 +2329,23 @@ fn check_and_stage_in(
             };
             line + &stage_note
         } else {
-            // The check itself ran fine (the head was read, nothing carries a
-            // manifest): clear any stale failure streak so health reflects THIS check.
+            // The check ran fine (the head was read, nothing carries a manifest): clear
+            // any stale streak.
             crate::health::Health::record_success(&staging.health());
             String::from("no release carries an update manifest")
         };
         crate::status::record(&staging, current_build, &msg);
         return Ok(None);
     };
-    // NOTE: no `record_success` yet — the container download/verify/stage below is
-    // still part of this check's pipeline. Success is recorded only at the terminal
-    // healthy outcomes ("up to date" / "staged"), so a download-only breakage ACCRUES
-    // a streak instead of being reset every cycle by its own check's manifest fetch.
+    // No `record_success` yet: only a terminal healthy outcome records it, so a
+    // download-only breakage accrues a streak instead of being reset by its own check.
 
-    // Downgrade gate: never stage an older-or-equal build. A terminal healthy
-    // outcome — the whole pipeline this check exercised worked — and the one that
-    // records `latest_tag`, so the next check stops at the HEAD.
+    // Downgrade gate: never stage an older-or-equal build. Healthy, and it records
+    // `latest_tag` so the next check stops at the HEAD.
     //
-    // DELIBERATELY NOT GATED ON THE BUNDLE AT THIS PATH. Suppressing the download
-    // when the installed bundle already carries this build would save one redundant
-    // fetch on a publisher's own machine — and would strand every machine whose
-    // newer bundle cannot be VERIFIED (mid-notarization, a broken seal, a yanked
-    // build), because the activation lane refuses it while the check lane would no
-    // longer acquire the release it could actually install. An unverified plist is
-    // not an input to an acquisition decision.
+    // Not gated on the bundle at this path: its build is unverified, and a machine whose
+    // newer bundle cannot be verified (mid-notarization, a broken seal, a yank) would stop
+    // acquiring the release it can install.
     if manifest.build_number <= current_build {
         crate::health::Health::record_success(&staging.health());
         crate::status::set_latest_tag(&web_tag, source, current_build, manifest.build_number);
@@ -2732,56 +2361,33 @@ fn check_and_stage_in(
         return Ok(None);
     }
 
-    // Recency floors (F5/F6): refuse a genuine build below the operator floor (yank),
-    // or below our high-water (an attacker re-pointing the newest release at an older
-    // genuine build cannot roll a client that has already advanced back down).
-    //
-    // BOTH holds are TERMINAL HEALTHY outcomes and must clear the acquisition streaks,
-    // for exactly the reason the downgrade gate immediately above does: everything this
-    // check exercised — the channel head, the appcast fetch, the signature/roster
-    // admission — WORKED, and the only reason it stops here is a deliberate policy
-    // decision about the build it found. Returning without `record_success` left the
-    // network/pipeline/manifest streaks standing, and a machine parked under a yank
-    // floor stays parked for days, so ordinary non-consecutive blips accumulated check
-    // after check until one crossed PERSISTENT_AFTER and fired "your update pipeline is
-    // likely broken" at a machine whose pipeline had just run end to end in front of it.
-    // (`latest_tag` is deliberately NOT recorded: a floor can move under the same tag,
-    // and re-judging costs unmetered requests only.)
+    // Recency floors (F5/F6): refuse a build below the operator floor (a yank) or below the
+    // high-water (a rollback to an older genuine build). Both holds are healthy ends:
+    // everything the check exercised worked, and a machine parked under a yank for days
+    // would otherwise accumulate blips into a false persistent notice. `latest_tag` is not
+    // recorded: a floor can move under the same tag.
     if let Some(held) = floor_hold(manifest.build_number, effective_min_build, floor.high_water) {
         crate::health::Health::record_success(&staging.health());
         crate::status::record(&staging, current_build, &held);
         return Ok(None);
     }
 
-    // If a newer build is already staged, don't re-download it. This is still a
-    // TERMINAL HEALTHY outcome — the head and the manifest were fetched and accepted;
-    // the only step skipped is a download whose bytes we already have — so clear the
-    // acquisition streaks. Omitting that let non-consecutive pipeline/manifest blips
-    // accumulate for the whole life of a pending stage and cross PERSISTENT_AFTER,
-    // firing "your update pipeline is likely broken" at a machine whose only state is
-    // a stage waiting to apply.
+    // A stage already covers this release: no download. Healthy (the head and manifest
+    // were fetched and accepted), so the streaks clear rather than accumulate blips for
+    // the life of a pending stage.
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
         crate::status::set_latest_tag(&web_tag, source, current_build, manifest.build_number);
         record_covered_stage_status(&staging, current_build, &manifest);
-        // ANSWER `Some`, exactly as the check loop's contract says: "the check
-        // also answers `Some` for a build that was already published and is
-        // only waiting to be applied". Every `aterm` session process runs this
-        // checker, so a SIBLING often wins the race to publish; `None` here would
-        // leave the GUI's apply lane unarmed until a relaunch (`arm` dedups).
+        // `Some`, so a stage a sibling published arms this process's apply lane too: every
+        // aterm process runs this checker.
         return Ok(Ready::read_publishable(&staging).map(|ready| ready.version));
     }
 
-    // If this exact build already failed to stage, don't re-download the (up to
-    // 2 GiB) container every interval; a re-publish under the same build with a
-    // different sha256 (or any newer build) clears the memo (F17). The memo is keyed
-    // on the manifest's `sha256` for both containers, so a build is one candidate
-    // however its bytes arrive.
-    //
-    // The window gates THIS — the re-stage — and nothing else. An already-published,
-    // strictly-newer stage is applied from disk, so it is not the thing the memo is
-    // throttling; skipping it here is how a ready 0.10.0 was held for 1387 minutes by
-    // a failed re-publish of the same build (see [`StageBackoff`]).
+    // A build that already failed to stage is not re-downloaded (up to 2 GiB) every
+    // interval; a re-publish under another sha256, or any newer build, clears the memo
+    // (F17). The memo is keyed on the manifest's `sha256` for both containers. It gates
+    // only the re-stage: a published newer stage is still reported ([`StageBackoff`]).
     if let Some(backoff) = stage_backoff(
         &staging,
         &manifest,
@@ -2789,70 +2395,41 @@ fn check_and_stage_in(
         crate::install::unix_now_secs(),
         asked,
     ) {
-        // A backed-off re-stage is still a terminal healthy end to the ACQUISITION half
-        // of this check: the head, the appcast and its authorization all worked, and we
-        // stop only because a memo says these exact bytes already refused to stage.
-        // Recording nothing left the network/pipeline/manifest streaks standing for the
-        // whole life of the memo — up to 24 h, and a quarantine's window never opens at
-        // all — so unrelated blips accumulated to PERSISTENT_AFTER and reported a broken
-        // pipeline on a machine whose pipeline demonstrably ran every cycle.
-        //
-        // DELIBERATELY NOT `record_success`: that also zeroes `stage_failures`. The
-        // backoff itself lives in `failed.toml`, so clearing the ledger streak would not
-        // re-open the window — it would do something worse. A machine that fails to
-        // stage interleaves failed checks with backed-off ones, so a `record_success`
-        // here would reset the stage streak between every pair of failures and it could
-        // never reach PERSISTENT_AFTER: the one class whose escalation says "the bytes
-        // arrive and will not become a bundle" would be silenced by the very backoff it
-        // caused. `record_acquisition_success` clears the acquisition classes and their
-        // clocks and preserves `stage_failures`/`stage_since`, exactly the way
-        // `record_success` already preserves the apply streak.
+        // Healthy for the acquisition half: only the memo stopped it. Not `record_success`,
+        // which zeroes `stage_failures`: failed checks interleave with backed-off ones, so
+        // the stage streak could never reach PERSISTENT_AFTER. `record_acquisition_success`
+        // clears the acquisition classes and keeps the stage streak.
         crate::health::Health::record_acquisition_success(&staging.health());
         crate::status::record(
             &staging,
             current_build,
             &backoff.status_line(manifest.build_number),
         );
-        // Reporting the staged version is what drives the apply lane (the caller's
-        // `on_staged` hook), so a download backoff cannot strand a build that only
-        // needs applying.
+        // `Some` drives the apply lane (the caller's `on_staged` hook), so a download
+        // backoff cannot strand a build that only needs applying.
         return Ok(backoff.applicable.map(|ready| ready.version));
     }
 
-    // Serialize the staging critical section (download → extract → publish) across
-    // processes so two app instances can't clobber the shared download/staged
-    // scratch. Separate from the apply lock so this (possibly long) download never
-    // blocks a starting instance's apply path.
-    //
-    // BOUNDED: a blocking wait would park the checker thread behind any holder, including
-    // one stopped mid-download. A holder past the bound is another process staging (the
-    // next check reads what it staged) or one stopped mid-stage, which `take_stage_lock`
-    // tells apart by the holder's beat and books as the typed failure it is.
+    // Serialize download → extract → publish across processes, which share the download
+    // and staged scratch. Separate from the apply lock, so a long download never blocks a
+    // starting instance's apply. Bounded; a stopped holder is booked ([`take_stage_lock`]).
     let _stage_lock = take_stage_lock(&staging, crate::install::BACKGROUND_LOCK_WAIT)?;
-    // Re-check under the lock: another instance may have just staged this build.
-    // Same terminal-healthy reasoning as the pre-lock check above — and the same
-    // `Some` answer, so the sibling's freshly-won stage arms THIS process's
-    // apply lane too.
+    // Re-check under the lock: a sibling may have just staged this build. Healthy, and
+    // `Some` so this process's apply lane arms too.
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
         crate::status::set_latest_tag(&web_tag, source, current_build, manifest.build_number);
         record_covered_stage_status(&staging, current_build, &manifest);
         return Ok(Ready::read_publishable(&staging).map(|ready| ready.version));
     }
-    // Under the same lock, re-read the roster floor: a concurrent instance may have
-    // observed a newer roster generation after this check's admission. Nothing signed
-    // under a superseded generation may be staged (see [`roster_authority_superseded`]).
+    // Re-read the roster floor under the lock: a concurrent instance may have observed a
+    // newer generation since this check's admission ([`roster_authority_superseded`]).
     if roster_authority_superseded(
         observed_roster_seq,
         crate::manifest::Floor::read_for_gate(&staging.floor())?.roster_seq,
     ) {
-        // Terminal healthy: acquisition ran end to end and a CONCURRENT instance simply
-        // ratcheted the roster generation under us. Losing that benign race is not a
-        // pipeline failure, and without a success record the streaks from earlier blips
-        // survived it — on a machine running two app instances this hold is common
-        // enough to keep a stale streak alive and eventually push it past
-        // PERSISTENT_AFTER. The refusal is transient; the next check re-runs under the
-        // advanced floor.
+        // Healthy: acquisition ran end to end and a concurrent instance ratcheted the
+        // roster generation under us; the next check runs under the advanced floor.
         crate::health::Health::record_success(&staging.health());
         crate::status::record(
             &staging,
@@ -2863,26 +2440,20 @@ fn check_and_stage_in(
         return Ok(None);
     }
 
-    // Download the exact unique same-release container identity already proven
-    // while accepting the authoritative manifest — the zip when the release
-    // carries one, else the DMG. No order-dependent asset lookup is permitted
-    // after this point. The URL is the DERIVED one for the pointer's tag (the
-    // manifest's own `url` was cross-checked above and is never followed).
+    // The container identity proved at acceptance (no asset lookup after this point), at
+    // the URL derived for the pointer's tag; the manifest's own `url` is never followed.
     let asset = &release.assets[artifact.asset_index];
     let container = artifact.container.label();
 
     let part = staging.download.join(format!("{}.part", artifact.name));
     let container_path = staging.download.join(&artifact.name);
     sweep_download_scratch(&staging);
-    // LIVE PROGRESS for a host that shows it (the aterm window's band row): a
-    // sibling poller stats the growing `.part`, and a HEAD of the same derived URL,
-    // run beside the download and never before it, gives the total its fill and ETA
-    // are drawn from (design ruling 226; the digest below still proves the bytes).
-    // The poller is joined on drop, so it cannot outlive the download it watches.
+    // Live progress for a host that shows it: a poller stats the growing `.part`, and a
+    // HEAD of the same URL, run beside the download and never before it, gives the total.
+    // Joined on drop, so it cannot outlive the download.
     let download_watch = crate::progress::watch_download(&part, &manifest.version, &asset.url);
-    // A failed download is a `pipeline`-class ledger entry: the asset provably
-    // exists (the release names it) but could not be fetched — unless it was this
-    // machine that could not store it (`book_download_failure`).
+    // A failed download is `pipeline`-class (the release names the asset), unless this
+    // machine could not store it (`book_download_failure`).
     let downloaded = aterm_update_core::download_to(
         &asset.url,
         &part,
@@ -2893,16 +2464,15 @@ fn check_and_stage_in(
         // Read before the partial download goes, so a full disk still reads as one.
         let free = crate::install::free_bytes_at(&staging.download);
         let _ = std::fs::remove_file(&part);
-        // The container's own 429 is the same weather as the manifest's, one
-        // request later in the check: deferred, not a pipeline failure.
+        // A 429 on the container defers, like one on the manifest.
         if aterm_update_core::download_error_is_rate_limit(&e) {
             let note = format!(
                 "update check deferred: GitHub rate limit hit while downloading the \
                  {container} — backing off, will retry on the next check"
             );
             record_deferral(&staging, current_build, &note);
-            // Answer the live channel too: the bar opened on the first byte and
-            // a deferral is its honest end (the wrapper reports only `Err`s).
+            // The bar opened on the first byte; a deferral closes it (the wrapper reports
+            // only `Err`s).
             if crate::progress::take_download_began() {
                 crate::progress::report(crate::progress::Progress::Deferred { detail: note });
             }
@@ -2911,28 +2481,26 @@ fn check_and_stage_in(
         return book_download_failure(&staging, current_build, &manifest, container, &e, free);
     }
 
-    // The container arrived; everything from here to the publish is one "verifying"
-    // phase on the live channel: digest, extract, codesign/Gatekeeper, the
-    // atomic stage.
+    // Digest, extract, codesign/Gatekeeper and publish are one "verifying" phase on the
+    // live channel.
     crate::progress::report(crate::progress::Progress::Verifying {
         version: manifest.version.clone(),
     });
-    // Atomically name it final. From here failures are `stage`-class in the health
-    // ledger: the bytes ARRIVED; the artifact (or local disk) is the problem, not the
-    // download pipeline. (Size is proved by the sha256 below.)
+    // From here failures are `stage`-class: the bytes arrived, so the artifact or the local
+    // disk is the problem. (The sha256 below proves the size.)
     if let Err(e) = std::fs::rename(&part, &container_path) {
         let msg = format!("finalize download: {e}");
         crate::health::Health::record_failure(&staging.health(), "stage", &msg);
         return Err(msg);
     }
 
-    // Integrity: SHA-256 must equal the manifest's digest FOR THIS CONTAINER. Every
+    // Integrity: SHA-256 must equal the manifest's digest for this container. Every
     // exit here is booked: a machine that can never hash a download must still reach
     // the persistent-failure notice.
     //
-    // BOUNDED, AND BOOKED BY THE ONE RULE: the hash has a deadline
-    // ([`container_sha256`]), and a hash past it or one whose thread the system would
-    // not start just then is a moment, booked as one at the one booking point.
+    // The hash has a deadline ([`container_sha256`]), and a hash past it or one whose
+    // thread the system would not start just then is a moment, booked as one at the one
+    // booking point.
     if let Some(end) = check_container_digest(
         &staging,
         current_build,
@@ -2945,11 +2513,9 @@ fn check_and_stage_in(
         return end;
     }
 
-    // Unpack, verify (codesign/team-id/spctl), publish the ready marker. On a
-    // post-download stage failure (verification etc.) memoize this build+sha so we
-    // don't re-download it next cycle, and reclaim the container (F17). The memo is
-    // keyed on the MANIFEST digest, not this container's, so the two paths share one
-    // retry budget for one candidate build.
+    // Unpack, verify (codesign/Team ID/spctl), publish the ready marker. A failure reclaims
+    // the container and is memoized under the manifest digest, so both containers
+    // share one retry budget per build.
     let staged = match artifact.container {
         Container::Zip => {
             install::stage_from_zip(&staging, &container_path, &manifest, team, &roster_read_at)
@@ -2962,19 +2528,15 @@ fn check_and_stage_in(
         let _ = std::fs::remove_file(&container_path);
         return end_failed_stage(&staging, current_build, &manifest, e);
     }
-    // The verified bundle is the artifact now; reclaim the container and clear the
-    // backoff memo — never a quarantine verdict, which a success of this build says
-    // nothing about.
+    // Reclaim the container and clear the backoff memo, never a quarantine verdict, which a
+    // success of this build says nothing about.
     let _ = std::fs::remove_file(&container_path);
     crate::manifest::FailedMark::clear_backoff(&staging.failed());
-    // Terminal healthy outcome: this check exercised the WHOLE pipeline (manifest,
-    // container, verify, stage) successfully — clear every failure streak.
+    // The whole pipeline ran: clear every failure streak.
     crate::health::Health::record_success(&staging.health());
-    // Raise the high-water to the build we just staged: a later attempt to roll us
-    // back below it is refused above (F6). ATTRIBUTED to the machine that signed it,
-    // so a revocation of that machine takes it back: a
-    // stolen key's staged build 9_000_000_000 otherwise held every genuine release
-    // after the revocation "below high-water" for good.
+    // Raise the high-water to this build (F6), attributed to its signer so a revocation of
+    // that machine takes it back (a stolen key's huge build would otherwise hold every
+    // genuine release below high-water).
     crate::manifest::Floor::observe_and_write(
         &staging.floor(),
         &crate::manifest::FloorObservation {
@@ -2986,11 +2548,8 @@ fn check_and_stage_in(
     // …and remember the tag, so the next check is one HEAD.
     crate::status::set_latest_tag(&web_tag, source, current_build, manifest.build_number);
 
-    // NOT "applies on next launch": the in-session apply lane owns that decision,
-    // and when it runs no relaunch happens at all. This is a record of what the
-    // stager did, not advice. A refused apply overwrites it through
-    // `record_apply_refusal` (a guarantee of those call sites, not this one), so
-    // read it as "the last thing the STAGER knew".
+    // A record of what the stager did, not advice: the in-session apply lane decides when
+    // it applies, and a refused apply overwrites it (`record_apply_refusal`).
     crate::status::record(
         &staging,
         current_build,
@@ -2999,8 +2558,7 @@ fn check_and_stage_in(
             manifest.version, manifest.build_number
         ),
     );
-    // The live channel's good end. Only a check that downloaded says so — an
-    // already-covered stage returns `Ok(Some)` far above without touching it.
+    // Only a check that downloaded reports its good end to the live channel.
     if crate::progress::take_download_began() {
         crate::progress::report(crate::progress::Progress::Staged {
             version: manifest.version.clone(),

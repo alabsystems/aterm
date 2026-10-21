@@ -1,42 +1,19 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Multilingual whole-word lexical matching for the "sparkle words" text
-//! decorations.
+//! Multilingual whole-word lexical matching for the "sparkle words" text decorations: a curated
+//! lexicon of surface forms per [`Class`] and a scanner that finds whole-word occurrences in a
+//! line of text.
 //!
-//! The terminal renderer decorates two families of words with distinct visual
-//! effects: a **profanity** family (the "fuck" expletive family across major
-//! languages) and a **feline** family (cat / kitty / kitten across major
-//! languages). This crate owns the language model: a curated lexicon of surface
-//! forms plus a scanner that finds *whole-word* occurrences in a line of text.
+//! Only complete tokens match folded keys, so `scatter` and `category` never match `cat`, and a
+//! token in a code, path or URL context (`cat.txt`, `/api/cat`) is suppressed; see
+//! [`Lexicon::scan`]. Concatenative languages use `stems × suffixes`, others curated `forms`
+//! (`data/lexicon.toml`); coverage is best-effort. Matches only place a render-time overlay: they
+//! never alter terminal state, copied text or recordings.
 //!
-//! # Why whole-word
-//!
-//! Naive substring matching produces the infamous "Scunthorpe problem":
-//! `scatter`, `concatenate`, `category` all contain `cat`. The scanner here
-//! matches only complete tokens (delimited by Unicode word boundaries) against
-//! folded lexicon keys, and additionally suppresses tokens that sit in a code /
-//! path / URL context (`cat.txt`, `/api/cat`). See [`Lexicon::scan`].
-//!
-//! # Coverage is honest, not total
-//!
-//! "Every major language, all forms" is not achievable with a finite list.
-//! Concatenative languages (English, Romance, Germanic) use `stems × suffixes`;
-//! fusional / agglutinative / non-concatenative languages use curated explicit
-//! `forms`. Everything is best-effort and extensible — see `data/lexicon.toml`.
-//!
-//! # Output is render-only
-//!
-//! Matches are positions used to paint a render-time overlay. They never alter
-//! terminal state, copied text, or recordings.
-//!
-//! # The kitty-command vocabulary is a SEPARATE table
-//!
-//! [`tricks`] holds the words a person types TO the cursor pet (`sit`, `nap`,
-//! `good kitty`). They are ordinary verbs that fill every build log, so they
-//! are deliberately NOT a [`Class`] here: the screen scanner never sees them.
-//! Only the typed-line listener asks, one token at a time
-//! ([`TrickLexicon::classify`]).
+//! The kitty-command vocabulary (`sit`, `nap`, `good kitty`) is the separate [`tricks`] table:
+//! those are ordinary verbs, so the screen scanner never sees them. Only the typed-line listener
+//! asks, one token at a time ([`TrickLexicon::classify`]).
 
 mod fold;
 mod raw;
@@ -60,20 +37,15 @@ pub enum Class {
     Feline,
     /// The dog / puppy family — the canine counterpart of [`Class::Feline`].
     Canine,
-    /// The ambient animal-word family (monkey / camel / penguin / …): animal
-    /// nouns, each entry tagged with a `species` id that names the authored
-    /// sprite the renderer peeks beside the word. The ENGLISH (and other
-    /// Latin-script) entries ride `ambiguous = true` by design: animal nouns
-    /// ARE ordinary prose, so they defer at the live caret (no fire inside
-    /// `been` while typing past `bee`) and stay out of the fold-collision
-    /// gate's unambiguous set. The zh/ja/ko/hi/th entries load plain instead
-    /// — the feline/canine CJK precedent — with lone-ideograph forms gated
-    /// behind [`ScanOptions::cjk_single_char`]; see the lexicon's
-    /// animal-multilingual group header for the full load laws.
+    /// Ambient animal nouns (monkey / camel / penguin / …), each entry tagged with a `species` id
+    /// naming the sprite the renderer peeks beside the word. Latin-script entries are
+    /// `ambiguous = true`: animal nouns are ordinary prose, so they defer at the live caret and
+    /// stay out of the fold-collision gate's unambiguous set. zh/ja/ko/hi/th entries load plain,
+    /// with lone-ideograph forms behind [`ScanOptions::cjk_single_char`]; the lexicon's
+    /// animal-multilingual group header has the load rules.
     Animal,
-    /// Hype / emphasis words — drawn as the animated-ink shimmer only (no
-    /// sprite overlay). The builtin lexicon ships NO emphasis forms: the class
-    /// is populated entirely by the user's `extra_words` / lexicon override.
+    /// Hype / emphasis words, drawn as the animated-ink shimmer only (no sprite overlay). The
+    /// builtin ships no emphasis forms: the user's `extra_words` / lexicon override fill the class.
     Emphasis,
 }
 
@@ -111,27 +83,18 @@ impl Class {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct LangId(pub u16);
 
-/// The reserved id for surfaces whose entry carried an empty / `"unknown"`
-/// `lang` code, and the deterministic overflow bucket once every real slot of
-/// the [`LangSet`] bitset is taken. [`Lexicon::lang_code`] renders it as
-/// `"unknown"` (the language table never grows into this slot).
+/// The reserved id for an empty or `"unknown"` `lang` code, and the overflow bucket once every
+/// real [`LangSet`] slot is taken; the language table never grows into it.
 const UNKNOWN_LANG: LangId = LangId((LangSet::CAPACITY - 1) as u16);
 
-/// Interned species identifier for [`Class::Animal`] surfaces: an index into
-/// the [`Lexicon`]'s species table ([`Lexicon::species_code`] resolves it back
-/// to the TOML `species` id, which is also the renderer's authored-sprite key).
-/// Ids are assigned in first-appearance TOML order across all well-formed
-/// animal entries.
+/// Interned species identifier for [`Class::Animal`] surfaces, in first-appearance TOML order:
+/// [`Lexicon::species_code`] resolves it to the TOML `species` id, the renderer's sprite key.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct SpeciesId(pub u16);
 
-/// A set of interned languages, as a `u64` bitset (bit `i` ⇔ `LangId(i)`).
-///
-/// The compiled maps carry one per surface so a match knows every language
-/// that claims its surface form (`kucing` is id **and** ms **and** jv). The
-/// last bit is reserved for the `"unknown"` bucket, so a lexicon can intern
-/// [`CAPACITY`](Self::CAPACITY)` - 1` real language codes; further codes
-/// collapse into `"unknown"` deterministically.
+/// A set of interned languages, as a `u64` bitset (bit `i` ⇔ `LangId(i)`), so a match knows every
+/// language that claims its surface (`kucing` is id, ms and jv). The last bit is the `"unknown"`
+/// bucket: [`CAPACITY`](Self::CAPACITY)` - 1` real codes intern, further ones collapse into it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub struct LangSet(u64);
 
@@ -233,9 +196,8 @@ impl LangSet {
     }
 }
 
-/// The set's primary language: the lowest set bit, i.e. the member whose entry
-/// appeared FIRST in the lexicon TOML. An empty set yields the reserved
-/// `"unknown"` id.
+/// The set's primary language: the lowest set bit, i.e. the member whose entry appeared first in
+/// the lexicon TOML. An empty set yields the reserved `"unknown"` id.
 #[must_use]
 pub const fn primary_lang(set: LangSet) -> LangId {
     if set.is_empty() {
@@ -245,11 +207,8 @@ pub const fn primary_lang(set: LangSet) -> LangId {
     LangId(set.0.trailing_zeros() as u16)
 }
 
-/// One whole-word occurrence found by [`Lexicon::scan`].
-///
-/// `start`/`end` are **character** indices into the scanned `&str` (i.e. indices
-/// into `text.chars()`), half-open `[start, end)`. The caller maps these back to
-/// terminal columns using its own per-character column table.
+/// One whole-word occurrence found by [`Lexicon::scan`]. `start`/`end` are half-open indices
+/// into `text.chars()`; the caller maps them to terminal columns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Match {
     /// First character index of the matched word (inclusive).
@@ -262,39 +221,25 @@ pub struct Match {
     /// (`kucing` → id ∪ ms ∪ jv). Resolve members via [`Lexicon::lang_code`];
     /// [`primary_lang`] picks the first-appearance member.
     pub langs: LangSet,
-    /// Collision-free identity of the exact compiled lexicon surface.
-    ///
-    /// IDs are unique within one [`Lexicon`] instance and survive every scan
-    /// performed with that instance. Hosts use this when a redraw moves an
-    /// occurrence: equality means the scanner matched the same exact folded
-    /// (or raw CJK) key, rather than merely a 64-bit hash collision.
+    /// Collision-free identity of the exact compiled surface, unique within one [`Lexicon`]. Hosts
+    /// compare it when a redraw moves an occurrence: equality means the same exact key, not a
+    /// 64-bit hash collision.
     pub form_id: FormId,
-    /// FNV-1a hash of the matched lexicon key — the *folded* whole-word surface
-    /// for spaced scripts, the *raw* compound slice for CJK. Position- and
-    /// case-independent by construction (`Cat` at column 3 and `cat` at column
-    /// 70 hash equal), so the host can use it as the form term of a
-    /// context-derived seed without re-folding the token.
+    /// FNV-1a hash of the matched key: the folded whole-word surface for spaced scripts, the raw
+    /// compound for CJK. Position- and case-independent (`Cat` and `cat` hash equal), so the host
+    /// can seed from it without re-folding the token.
     pub form_hash: u64,
-    /// Whether the winning surface is language-gated because it collides with
-    /// ordinary text in another language.
-    ///
-    /// Renderers use this bit to defer a match that still touches the live
-    /// input cursor. Once a delimiter moves the cursor away, the same exact
-    /// surface remains a normal match. A surface claimed by any non-ambiguous
-    /// entry of the winning class is non-ambiguous here.
+    /// Whether the winning surface is language-gated because it collides with ordinary text in
+    /// another language; renderers defer such a match while it touches the live input cursor. A
+    /// surface any non-ambiguous entry of the winning class claims is non-ambiguous.
     pub ambiguous: bool,
-    /// For [`Class::Animal`] matches: which authored species sprite this
-    /// surface names ([`Lexicon::species_code`] resolves the string id).
-    /// `None` for every other class, and for a (malformed) animal entry that
-    /// carried no `species` key.
+    /// For [`Class::Animal`] matches, the species sprite this surface names
+    /// ([`Lexicon::species_code`] resolves it); `None` for every other class.
     pub species: Option<SpeciesId>,
 }
 
-/// Collision-free identity of one exact recognized surface in a compiled
-/// [`Lexicon`].
-///
-/// The numeric value is intentionally opaque and local to the lexicon that
-/// produced it; compare values, but do not persist or interpret them.
+/// Collision-free identity of one exact recognized surface in a compiled [`Lexicon`]: opaque and
+/// local to that lexicon, so compare values but do not persist or interpret them.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct FormId(u64);
 
@@ -372,19 +317,14 @@ impl FormId {
 /// false-positive-safe choices.
 #[derive(Clone, Debug, Default)]
 pub struct ScanOptions<'a> {
-    /// Decorate the bare 3-letter token `cat` (and equally short feline tokens).
-    /// Off by default because `cat` is also the ubiquitous shell command and a
-    /// common English substring-of-intent; longer forms (`cats`, `kitty`,
-    /// `gato`, …) are always eligible.
+    /// Decorate the bare 3-letter token `cat` (and equally short feline tokens). Off by default
+    /// because `cat` is also the shell command; longer forms (`cats`, `kitty`, `gato`) are always
+    /// eligible.
     pub allow_bare_cat: bool,
-    /// Decorate a lone single-character CJK surface anywhere, even inside an
-    /// un-listed compound. Off by default (high false-positive rate).
-    ///
-    /// CLASS-AGNOSTIC: without it the scanner drops EVERY 1-char CJK hit —
-    /// `猫`, the dog ideographs (`犬`/`狗`) and the animal roster's lone
-    /// han/kana/hangul forms (`象`/`馬`/`새`/`곰`/…). Most lone CJK animal
-    /// characters are heavy homographs (ko `말` = horse AND speech, `새` =
-    /// bird AND new), which is why they are gated.
+    /// Decorate a lone single-character CJK surface anywhere in a run, even inside an unlisted
+    /// compound. Off by default: without it the scanner drops every 1-char CJK hit of every class
+    /// (`猫`, `犬`/`狗`, the animal roster's lone forms), most of which are heavy homographs
+    /// (ko `말` = horse and speech, `새` = bird and new).
     pub cjk_single_char: bool,
     /// Folded surfaces to never decorate (the user's `ignore_words` / global
     /// `deny`, already folded by the caller via [`fold`]). A plain `HashSet` so
@@ -392,13 +332,9 @@ pub struct ScanOptions<'a> {
     pub ignore: Option<&'a std::collections::HashSet<String>>,
 }
 
-/// Caller-owned auxiliary buffers for [`Lexicon::scan_into_with_scratch`].
-///
-/// Keep one beside the caller's `chars` and `out` vectors and reuse all three
-/// across lines. After their capacities have warmed, scanning performs no heap
-/// allocation, including possessive/clitic fallbacks and CJK maximal-run
-/// probes. The fields are intentionally private: they are workspace owned by
-/// the scanner and carry no result state.
+/// Caller-owned buffers for [`Lexicon::scan_into_with_scratch`]. Reuse one with the caller's
+/// `chars` and `out` vectors across lines: once their capacities warm, scanning allocates nothing,
+/// including possessive/clitic fallbacks and CJK probes.
 #[derive(Debug, Default)]
 pub struct ScanScratch {
     token: String,
@@ -429,11 +365,9 @@ impl std::fmt::Display for LexError {
 
 impl std::error::Error for LexError {}
 
-/// Renders a value's `Debug` output through `Display`, so `.to_string()` can
-/// produce the exact `{:?}` text without expanding a std format macro (which
-/// contains a hardened unsafe op the verifier cannot discharge) into the
-/// calling function's body. This crate composes its messages with `push_str`
-/// for the same reason.
+/// Renders a value's `Debug` output through `Display`, so `.to_string()` yields the `{:?}` text
+/// without expanding a std format macro (whose hardened unsafe op the verifier cannot discharge)
+/// into the caller. This crate composes messages with `push_str` for the same reason.
 struct DebugText<T: std::fmt::Debug>(T);
 
 impl<T: std::fmt::Debug> std::fmt::Display for DebugText<T> {
@@ -494,29 +428,19 @@ fn builtin_rows() -> (RawLexicon, RawExceptions) {
     (RawLexicon { entry }, RawExceptions { exception })
 }
 
-/// Hard cap on the number of surface forms materialized across *all* lexicon
-/// entries combined during [`Lexicon::build`]. The embedded builtin produces only
-/// a few hundred (max stems×suffixes product ~8), so this bound (2^20) never
-/// touches it; it exists solely to stop a config/override lexicon with huge
-/// `stems` / `suffixes` / `forms` arrays (or many entries) from driving
-/// O(stems·suffixes) peak memory and build time — an unbounded-allocation DoS.
-/// The cap is a GLOBAL running total, not per-entry, because a per-entry cap is
-/// bypassable by many individually-small entries.
+/// Cap on surface forms materialized across all entries in [`Lexicon::build`]. The builtin makes
+/// about 1,500; the cap stops an override with huge `stems`/`suffixes`/`forms` arrays from driving
+/// O(stems·suffixes) memory and build time. A global running total, since many small entries
+/// would bypass a per-entry cap.
 const MAX_TOTAL_SURFACES: usize = 1 << 20;
 
-/// Longest no-space (CJK / kana / Hangul / Thai / Lao / Khmer) surface, in
-/// characters, that [`Lexicon::build`] compiles: the bound on the maximal-run
-/// scan's probe window ([`Lexicon::max_cjk`]).
-///
-/// [`Lexicon::scan_cjk_run`] builds that window at every position whose
-/// character starts a surface and hashes each of its prefixes, so the window
-/// length `L` costs `O(L²)` per position. Unbounded, one long surface in an
-/// override lexicon made a line of its head character cost `Θ(n · min(L, n)²)`
-/// (a 1,600-character surface against a 2,000-character line: 0.42 s per
-/// scan). The builtin's longest no-space surface is 10 characters; a longer
-/// surface is dropped and reported on the conflicts channel. Same number as
-/// [`TrickLexicon::MAX_SURFACE_CHARS`]: a no-space run longer than that is a
-/// sentence, not a word.
+/// Longest no-space surface, in characters, that [`Lexicon::build`] compiles: the bound on the
+/// maximal-run probe window ([`Lexicon::max_cjk`]). The scan builds that window at each position
+/// a surface starts and hashes every prefix, so window length `L` costs `O(L²)` per position;
+/// unbounded, one long override surface makes a line of its head character cost
+/// `Θ(n · min(L, n)²)` (0.42 s per scan for 1,600 against 2,000 characters). The builtin's longest
+/// is 10; a longer surface is dropped and reported. Same as [`TrickLexicon::MAX_SURFACE_CHARS`]:
+/// a longer no-space run is a sentence, not a word.
 const MAX_CJK_SURFACE_CHARS: usize = 32;
 
 /// A compiled lexicon: folded surface forms mapped to their decoration class,
@@ -529,35 +453,20 @@ pub struct Lexicon {
     /// Raw CJK compound → (class, claiming languages), for no-space scripts
     /// (matched by maximal run).
     cjk_forms: FxHashMap<String, LexiconHit>,
-    /// Raw CJK compounds that CONTAIN a cat ideograph but are NOT a pet cat
-    /// (panda, lynx, wheelbarrow…), suppressed during the maximal-run match.
+    /// Raw CJK compounds that contain a surface but are not that word (山猫 lynx, 猫車
+    /// wheelbarrow, カメラ), suppressed during the maximal-run match.
     cjk_exceptions: FxHashSet<String>,
     /// Longest CJK key (chars), bounding the maximal-run search window.
     max_cjk: usize,
-    /// FIRST character of every [`Self::cjk_forms`] key and every
-    /// [`Self::cjk_exceptions`] member → the length in CHARS of the longest
-    /// surface starting with it. Built once, from the finished tables, by
-    /// [`note_cjk_head`].
+    /// First character of every [`Self::cjk_forms`] key and [`Self::cjk_exceptions`] member → the
+    /// length in chars of the longest surface starting with it, built by [`note_cjk_head`] from
+    /// the finished tables.
     ///
-    /// This is the prefilter [`Self::scan_cjk_run`] consults before it touches
-    /// its window. `fold::is_no_space_script` admits tens of thousands of
-    /// codepoints (all of Hiragana/Katakana, CJK Unified + Ext A/B, Hangul,
-    /// Thai, Lao, Khmer) while the shipped data holds only a few hundred
-    /// surfaces over a few hundred distinct first characters, so at almost
-    /// every position in real CJK prose NOTHING can match, and this map says
-    /// so without building a window.
-    ///
-    /// Two properties make consulting it exactly equivalent to not consulting
-    /// it, and both are structural rather than tuned:
-    ///
-    /// * a surface that matches at position `p` starts with `chars[p]`, so an
-    ///   absent key proves no length can match;
-    /// * the stored length is the MAXIMUM over surfaces sharing that first
-    ///   character, so clamping the window to it removes only lengths at which
-    ///   no surface of that shape exists.
-    ///
-    /// Every length is at most [`MAX_CJK_SURFACE_CHARS`]: the build drops a
-    /// longer surface, which bounds the probe window.
+    /// [`Self::scan_cjk_run`] consults it before building a window: `is_no_space_script` admits
+    /// tens of thousands of codepoints while the data's surfaces start with a few hundred, so at
+    /// most positions nothing can match. Consulting it is exactly equivalent to not: a surface
+    /// matching at `p` starts with `chars[p]`, and the stored length is the maximum over surfaces
+    /// sharing that first character. Every length is at most [`MAX_CJK_SURFACE_CHARS`].
     cjk_heads: FxHashMap<char, usize>,
     /// Interned language codes, in first-appearance TOML order ([`LangId`] `i`
     /// ⇔ `langs[i]`). The reserved [`UNKNOWN_LANG`] slot is never stored here;
@@ -566,13 +475,10 @@ pub struct Lexicon {
     /// Interned [`Class::Animal`] species ids, in first-appearance TOML order
     /// ([`SpeciesId`] `i` ⇔ `species[i]`).
     species: Vec<String>,
-    /// Data problems found during build (same surface in both classes, unknown
-    /// class). Empty for a well-formed lexicon; surfaced by the CI validator.
+    /// Data problems found during build; see [`Self::conflicts`].
     conflicts: Vec<String>,
-    /// Folded surfaces that came from USER config (override TOML /
-    /// `extra_words` / custom specs), not the builtin data. Consulted by the
-    /// scanner's unconditional ≤3-folded-chars emphasis guard: explicit config
-    /// is consent, so a short custom word ("gg") still matches (v3 §6).
+    /// Folded surfaces from user config (override TOML, `extra_words`, custom specs): the scanner's
+    /// short-word emphasis guard exempts them, so a short custom word ("gg") still matches.
     user_surfaces: FxHashSet<String>,
 }
 
@@ -586,20 +492,12 @@ struct LexiconHit {
     form_id: FormId,
     ambiguous: bool,
     species: Option<SpeciesId>,
-    /// THE MARKS-REQUIRED GATE: every
-    /// claiming surface lost diacritics in folding AND folded to a bare-ASCII
-    /// key, so plain ASCII text spells something ELSE that merely shares the
-    /// skeleton (Vietnamese `đm` → `dm`, which is also how one types `dmg`,
-    /// `dmesg`, a DM; Spanish `coño` → `cono` inside `conoid`; Slavic `pička`
-    /// → `picka` inside `pickax`). Such a key only matches a token that
-    /// itself carries folded-away marks ([`fold::has_foldable_marks`]) — the
-    /// data's own convention: an entry that WANTS the bare spelling to match
-    /// lists it explicitly (`scheiße` beside `scheisse`), and one that does
-    /// not says so (`đm`: "Tone marks essential").
-    ///
-    /// A key whose fold RETAINS any non-ASCII (e.g. `địt` → `dịt`) is never
-    /// gated: matching text already had to carry those characters, so the
-    /// bare-ASCII collision this bit exists for cannot arise.
+    /// The marks-required gate: every claiming surface lost diacritics in folding into a
+    /// bare-ASCII key, which plain ASCII text spells as something else (Vietnamese `đm` → `dm`, as
+    /// in `dmg`; Spanish `coño` → `cono` in `conoid`). Such a key matches only a token that itself
+    /// carries folded-away marks ([`fold::has_foldable_marks`]). An entry that wants the bare
+    /// spelling lists it (`scheiße` beside `scheisse`). A key whose fold keeps any non-ASCII
+    /// (`địt` → `dịt`) is never gated.
     marks_required: bool,
 }
 
@@ -607,8 +505,7 @@ struct LexiconHit {
 struct Langs {
     all: bool,
     set: FxHashSet<String>,
-    /// The codes as the CALLER listed them, in order, so an unknown one is
-    /// reported deterministically and spelled back the way it was written.
+    /// The codes as the caller listed them, so an unknown one is reported in order and as written.
     listed: Vec<String>,
 }
 
@@ -622,11 +519,9 @@ impl Langs {
     fn enabled(&self, lang: &str) -> bool {
         self.all || self.set.contains(lang)
     }
-    /// Record every configured code the loaded data names NOWHERE. A gate can
-    /// only un-gate a language the file actually holds, so `languages =
-    /// ["DA"]`, `["da-DK"]`, `["dk"]` or `["ALL"]` un-gates nothing, and the
-    /// person who set it must be told. `"all"` is the reserved
-    /// un-gate-everything spelling and is never a language.
+    /// Report every configured code the loaded data never names: it un-gates nothing (`"DA"`,
+    /// `"da-DK"`, `"dk"`, `"ALL"`), and the person who set it must be told. `"all"` is the reserved
+    /// un-gate-everything spelling.
     fn note_unknown(&self, known: &FxHashSet<String>, conflicts: &mut Vec<String>) {
         for lang in &self.listed {
             if lang == "all" || known.contains(lang) {
@@ -662,11 +557,10 @@ impl Lexicon {
         Self::build(raw, raw_exc, &Langs::new(langs))
     }
 
-    /// The embedded lexicon with an optional user `[[entry]]` TOML merged OVER it
-    /// (user entries are appended, so they extend coverage; the builder's
-    /// fold-normalization and cross-class conflict detection apply to them too).
-    /// `langs` selects which `ambiguous` entries load. Returns a parse error for a
-    /// malformed override so the caller can warn and fall back to [`with_languages`].
+    /// The embedded lexicon with an optional user `[[entry]]` TOML appended, so it extends
+    /// coverage under the same folding and conflict detection. `langs` selects which `ambiguous`
+    /// entries load. A malformed override is a parse error, so the caller can warn and fall back
+    /// to [`with_languages`](Self::with_languages).
     pub fn with_languages_and_override(
         langs: &[&str],
         extra_toml: Option<&str>,
@@ -674,8 +568,7 @@ impl Lexicon {
         let (mut raw, raw_exc) = builtin_rows();
         if let Some(t) = extra_toml {
             let user: RawLexicon = aterm_toml::from_str(t).map_err(LexError::Toml)?;
-            // v3 §6: user entries are marked so their surfaces land in the
-            // `user_surfaces` set (the short-emphasis-guard exemption).
+            // Marked so their surfaces land in `user_surfaces`.
             raw.entry.extend(user.entry.into_iter().map(|mut e| {
                 e.user = true;
                 e
@@ -708,14 +601,10 @@ impl Lexicon {
         let mut lang_table: Vec<String> = Vec::new();
         // Interned animal species ids, first-appearance order (see the field doc).
         let mut species_table: Vec<String> = Vec::new();
-        // Running count of surface forms materialized so far, shared across every
-        // entry, to bound the total against MAX_TOTAL_SURFACES (see its docs).
+        // Surfaces materialized so far, across entries (see MAX_TOTAL_SURFACES).
         let mut total: usize = 0;
-        // Every language the DATA names — gating, and whether the entry is
-        // otherwise well formed, aside. This is the set a configured code is
-        // judged against (`Langs::note_unknown`); built here rather than read
-        // off `lang_table`, which stops growing at the `LangSet` ceiling and
-        // would start calling real languages unknown.
+        // Every language the data names, well formed or gated or not: what a configured code is
+        // judged against. Not `lang_table`, which stops growing at the `LangSet` ceiling.
         let mut data_langs: FxHashSet<String> = FxHashSet::default();
 
         for e in raw.entry {
@@ -726,10 +615,8 @@ impl Lexicon {
                 "profanity" => Class::Profanity,
                 "feline" => Class::Feline,
                 "canine" => Class::Canine,
-                // The retired orca class (Sparkle Words v3 §4): an external
-                // lexicon that still names it is not malformed. Its entries
-                // are skipped and claim nothing, so the same word under a
-                // lower class (animal, emphasis) decorates as that class.
+                // The retired orca class: its entries are skipped, not malformed, so the same
+                // word under a lower class (animal, emphasis) decorates as that class.
                 "orca" => continue,
                 "animal" => Class::Animal,
                 "emphasis" => Class::Emphasis,
@@ -743,17 +630,11 @@ impl Lexicon {
                     continue;
                 }
             };
-            // Intern the entry's language BEFORE the ambiguous gating below, so
-            // the id table (and thus every LangId) depends only on the TOML
-            // input, never on the configured `languages`. The gating itself
-            // still keys on the RAW entry code — its semantics are unchanged.
+            // Interned before the `ambiguous` gating, so every LangId depends only on the TOML
+            // input, not on the configured `languages`.
             let lset = LangSet::EMPTY.with(intern_lang(&mut lang_table, &e.lang));
-            // Animal entries carry the species id that names their authored
-            // sprite; the id is interned BEFORE the ambiguous gating (exactly
-            // like the language intern above) so SpeciesId assignment depends
-            // only on the TOML input. A malformed pairing — animal without a
-            // species, species on another class — is recorded and the field
-            // (or entry) dropped rather than half-honored.
+            // The species id is interned before the gating too. An animal entry without one is
+            // skipped and a species on another class ignored; both are reported.
             let species = match (class, e.species.trim()) {
                 (Class::Animal, "") => {
                     let mut msg = String::from("animal entry without species (lang ");
@@ -778,15 +659,12 @@ impl Lexicon {
                 continue;
             }
 
-            // Collect surface forms: stems × suffixes (suffix mode) + explicit forms.
-            // Both come from attacker-controlled config/override TOML, so the
-            // expansion is bounded against the GLOBAL running `total`: an entry whose
-            // surfaces would push the total past MAX_TOTAL_SURFACES is skipped (and
-            // recorded as a conflict) rather than materialized.
+            // Surfaces: stems × suffixes (suffix mode) plus explicit forms. Both can come from
+            // override TOML, so expansion is bounded by the global running `total`: an entry that
+            // would pass MAX_TOTAL_SURFACES is skipped and reported.
             let mut surfaces: Vec<String> = Vec::new();
-            // `mode` has exactly two spellings. Any other value falls through
-            // to the explicit-`forms` path below and DISCARDS every stem, so
-            // say so.
+            // Any `mode` but these two falls through to the `forms` path and discards every
+            // stem, so it is reported.
             if e.mode != "suffix" && e.mode != "forms" {
                 let mut msg = String::from("unknown mode ");
                 msg.push_str(&DebugText(e.mode.as_str()).to_string());
@@ -796,10 +674,8 @@ impl Lexicon {
                 conflicts.push(msg);
             }
             if e.mode == "suffix" {
-                // `prod` is exactly the surface count the loop below would push
-                // (stems × suffixes, or stems alone when there are no suffixes);
-                // `saturating_mul`/`saturating_add` keep pathological input from
-                // overflowing usize.
+                // `prod` is the count the loop below pushes (stems alone without suffixes);
+                // saturating arithmetic keeps pathological input from overflowing.
                 let prod = e.stems.len().saturating_mul(e.suffixes.len().max(1));
                 if prod > MAX_TOTAL_SURFACES || total.saturating_add(prod) > MAX_TOTAL_SURFACES {
                     let mut msg = String::from("suffix expansion skipped (lang ");
@@ -830,8 +706,7 @@ impl Lexicon {
                     total = total.saturating_add(prod);
                 }
             }
-            // Explicit forms are attacker-controlled too (linear in file size); count
-            // them against the same global cap before materializing them.
+            // Explicit forms count against the same cap.
             let forms = e.forms.len();
             if total.saturating_add(forms) > MAX_TOTAL_SURFACES {
                 let mut msg = String::from("explicit forms skipped (lang ");
@@ -846,13 +721,9 @@ impl Lexicon {
                 total = total.saturating_add(forms);
             }
 
-            // AN ENTRY THAT COMPILES TO NOTHING. Individually unmatchable
-            // surfaces are a deliberate data choice (documentation of a word
-            // whose head noun is listed separately: "anak kucing" beside
-            // "kucing") and are skipped in silence below. An entry where
-            // EVERY surface goes that way leaves its class unreachable in
-            // that language, so it is reported (when this landed: one of 550
-            // shipped entries, id canine's lone "anak anjing").
+            // An unmatchable surface whose head noun is listed separately ("anak kucing" beside
+            // "kucing") is skipped silently below; an entry whose every surface goes that way
+            // leaves its class unreachable in that language, so it is reported.
             let offered = surfaces.len();
             let mut inserted = 0usize;
 
@@ -872,13 +743,9 @@ impl Lexicon {
                         max_cjk = len;
                     }
                     if e.user && len == 1 {
-                        // v3 §6: the scanner drops single-char CJK hits unless
-                        // `cjk_single_char = true` — a USER surface that can
-                        // only ever scan under that opt-in must say so instead
-                        // of silently never firing. Builtin single-char entries
-                        // (操/草/干, …) are a deliberate data choice and stay
-                        // quiet. The word "requires" is load-bearing for
-                        // callers that surface these to the user.
+                        // A user surface that scans only under `cjk_single_char = true` says so;
+                        // builtin single-char entries (操/草/干) are deliberate and stay quiet.
+                        // Callers match "requires cjk_single_char = true" in this message.
                         let mut msg = String::from("single-char CJK surface ");
                         msg.push_str(&DebugText(&key).to_string());
                         msg.push_str(" (lang ");
@@ -895,26 +762,20 @@ impl Lexicon {
                             langs: lset,
                             ambiguous: e.ambiguous,
                             species,
-                            // CJK keys are RAW (never folded), so no mark is
-                            // ever lost and the marks-required gate cannot
-                            // apply.
+                            // CJK keys are raw (never folded): no mark is lost.
                             marks_required: false,
                         },
                         &mut conflicts,
                     );
                 } else {
                     let key = fold(s);
-                    // A surface that is not a single scannable token (contains a
-                    // space, dot, slash, …) can never match whole-word; skip it.
-                    // Its head noun, if listed separately, still matches.
+                    // A surface that is not a single scannable token (a space, dot, slash, …)
+                    // can never match whole-word; its head noun, if listed, still matches.
                     if key.is_empty() || !is_matchable_token(&key) {
                         if e.user {
-                            // v3 §6: a USER surface dropped here (mixed-script
-                            // like "abc猫", multi-word, punctuation) would
-                            // otherwise be silently accepted by the config and
-                            // never scan — record it on the conflicts channel.
-                            // Builtin multi-word forms ("con mèo", "đ.m") are a
-                            // deliberate data choice and stay quiet.
+                            // A user surface that can never scan (mixed-script "abc猫",
+                            // multi-word, punctuation) is reported; builtin multi-word forms
+                            // ("con mèo", "đ.m") are deliberate and stay quiet.
                             let mut msg = String::from("surface ");
                             msg.push_str(&DebugText(s).to_string());
                             msg.push_str(" (lang ");
@@ -929,19 +790,12 @@ impl Lexicon {
                         continue;
                     }
                     if e.user {
-                        // v3 §6: explicit config is consent — record the
-                        // folded surface so the scanner's short-word guards
-                        // exempt it.
+                        // Explicit config is consent: the short-word guards exempt this surface.
                         user_surfaces.insert(key.clone());
                     }
-                    // The marks-required gate (see [`LexiconHit`]): this
-                    // surface folded marks away AND landed on a bare-ASCII
-                    // key, so unmarked ASCII text spells a DIFFERENT word
-                    // that would otherwise complete it (`đm` → `dm` fired
-                    // the curse bonk mid-`dmg`). Explicitly listing the bare
-                    // spelling (its own surface, `marks_required = false`)
-                    // remains the data's way to opt the skeleton in — the
-                    // same-class merge in [`insert_class`] ANDs the bit.
+                    // Marks-required (see `LexiconHit`): the surface lost marks into a bare-ASCII
+                    // key. Listing the bare spelling as its own surface opts the skeleton in, since
+                    // [`insert_class`] ANDs the bit.
                     let marks_required = key.is_ascii() && fold::has_foldable_marks(s);
                     inserted = inserted.saturating_add(1);
                     insert_class(
@@ -989,21 +843,14 @@ impl Lexicon {
             cjk_exceptions.insert(key);
         }
 
-        // Assign collision-free form identities only after precedence merging
-        // has selected one winning class per exact key. Sorting makes the IDs
-        // reproducible across processes without relying on hash-map iteration
-        // order; the two namespaces share one counter, so their IDs cannot
-        // alias either.
+        // Form IDs are assigned after precedence picked one class per key, in sorted key order
+        // so they are reproducible; the two tables share one counter, so their IDs never alias.
         let mut next_form_id = 0u64;
         let spaced = finalize_hits(spaced, &mut next_form_id);
         let cjk_forms = finalize_hits(cjk_forms, &mut next_form_id);
 
-        // First-character prefilter for the maximal-run scan. Derived from the
-        // FINISHED tables (after cross-class precedence has dropped whatever it
-        // drops), so it describes the surfaces that can actually match — never a
-        // superset that would let a probe through, never a subset that would
-        // suppress one. Every key here has length <= `max_cjk`, since both
-        // tables raised `max_cjk` as they were filled.
+        // The CJK prefilter, built from the finished tables so it describes exactly the surfaces
+        // that can match. Every key is at most `max_cjk` long.
         let mut cjk_heads: FxHashMap<char, usize> = FxHashMap::default();
         for key in cjk_forms.keys() {
             note_cjk_head(&mut cjk_heads, key);
@@ -1045,19 +892,16 @@ impl Lexicon {
             .map_or("unknown", String::as_str)
     }
 
-    /// Every interned species id, in [`SpeciesId`] order — the roster ⇄ lexicon
-    /// drift gate's enumeration surface (each tag here must name authored art,
-    /// and vice versa; see `animal_art_quality`).
+    /// Every interned species id, in [`SpeciesId`] order: what `animal_art_quality` checks against
+    /// the authored art, both ways.
     #[must_use]
     pub fn species_codes(&self) -> &[String] {
         &self.species
     }
 
-    /// Data problems found at build time (a surface claimed by both classes, an
-    /// unknown class string, a USER surface that can never scan as written —
-    /// single-char CJK without the `cjk_single_char` opt-in, mixed-script).
-    /// Empty for well-formed data; the CI validator asserts this is empty for
-    /// the embedded lexicon.
+    /// Data problems found at build time: a cross-class or cross-species claim, an unknown class
+    /// or mode, a surface cap hit, a user surface that can never scan as written. Empty for the
+    /// embedded lexicon (`embedded_lexicon_parses_and_has_no_conflicts`).
     #[must_use]
     pub fn conflicts(&self) -> &[String] {
         &self.conflicts
@@ -1079,13 +923,9 @@ impl Lexicon {
         self.cjk_forms.iter().map(|(k, v)| (k.as_str(), v.class))
     }
 
-    /// Whether the spaced surface behind `folded_key` matches only tokens that
-    /// themselves carry folded-away marks ([`has_foldable_marks`]) — i.e.
-    /// every claiming surface lost diacritics into a bare-ASCII key and none
-    /// listed the bare spelling explicitly (the `đm` → `dm` curse-bonk fix).
-    /// `false` for an unknown key. Validator surface: the round-trip tests
-    /// must probe such a key with a marked witness, and the fold-collision
-    /// gate may trust that its bare skeleton never fires.
+    /// Whether the spaced surface behind `folded_key` matches only tokens that themselves carry
+    /// folded-away marks ([`has_foldable_marks`]); `false` for an unknown key. For validators: a
+    /// round-trip test probes such a key with a marked witness.
     #[must_use]
     pub fn surface_requires_marks(&self, folded_key: &str) -> bool {
         self.spaced
@@ -1093,12 +933,10 @@ impl Lexicon {
             .is_some_and(|hit| hit.marks_required)
     }
 
-    /// Whether at least one compiled surface in `class` can pass the scanner's
-    /// static policy gates and is not claimed by an overriding runtime table.
-    /// This is a cold-path capability projection for hosts; it follows the same
-    /// folded keys, ignore policy, short-word rules, CJK exceptions, and
-    /// single-character opt-in as [`Self::scan`], without synthesizing text or
-    /// allocating one scan per surface.
+    /// Whether at least one compiled surface in `class` passes the scanner's static policy gates
+    /// and is not claimed by an overriding runtime table (`overridden` gets each surface's form
+    /// hash). Applies [`Self::scan`]'s ignore, short-word, CJK-exception and single-char rules
+    /// without scanning; cold path.
     pub fn has_scannable_class_surface(
         &self,
         class: Class,
@@ -1143,25 +981,17 @@ impl Lexicon {
             .map(|hit| hit.class)
     }
 
-    /// [`classify_token`](Self::classify_token) reusing `folded` as scratch for
-    /// the folded full-token lookup key, and also returning the surface's
-    /// claiming-language set. On return `folded` always holds the
-    /// **full-token** fold (the first lookup key), so the per-row scanner can
-    /// reuse it for the ignore-list and bare-`cat` guards without re-folding. The
-    /// rare possessive / clitic fallbacks fold into `candidate_folded`, so they
-    /// never clobber `folded` and allocate nothing after scratch warmup.
+    /// [`classify_token`](Self::classify_token) into caller scratch, returning the whole hit. On
+    /// return `folded` holds the full-token fold (the first lookup key), which the scanner reuses
+    /// for its guards; the possessive and clitic fallbacks fold into `candidate_folded`.
     fn classify_token_into(
         &self,
         token: &str,
         folded: &mut String,
         candidate_folded: &mut String,
     ) -> Option<LexiconHit> {
-        // The marks-required gate (see [`LexiconHit::marks_required`]): a key
-        // whose every claiming surface lost diacritics into bare ASCII only
-        // matches a token that itself carries folded-away marks. Evaluated
-        // lazily — only a token that actually hits a gated key pays the walk,
-        // and the possessive/clitic fallbacks judge the SAME full token (a
-        // mark anywhere in it is the typist writing marked text).
+        // The marks-required gate (see `LexiconHit::marks_required`), evaluated lazily. The
+        // possessive and clitic fallbacks judge the same full token.
         let admits = |c: &LexiconHit| !c.marks_required || fold::has_foldable_marks(token);
         fold::fold_into(token, folded);
         if let Some(c) = self.spaced.get(folded.as_str()).copied()
@@ -1272,13 +1102,9 @@ impl Lexicon {
                     // form is identical and lets the verifier discharge it.
                     k = k.saturating_add(1);
                 }
-                // THE CODE / PATH / URL GUARD, on the NO-SPACE arm too. A
-                // maximal no-space run is this arm's whole token: it is
-                // delimited by a script change exactly as a spaced token is
-                // delimited by a non-token character, so the boundary test
-                // `try_spaced_token` applies to a token's endpoints applies
-                // here to the run's, so `子猫.txt`, `/api/고양이/list`,
-                // `--แมว` and `子猫=1` are suppressed like `cat.txt`.
+                // The code/path/URL guard applies to the run's endpoints too, since a script
+                // change delimits the run as a non-token char delimits a spaced token: `子猫.txt`,
+                // `/api/고양이/list`, `--แมว` and `子猫=1` are suppressed like `cat.txt`.
                 if !(left_suppresses(chars, i) || right_suppresses(chars, k)) {
                     self.scan_cjk_run(chars, i, k, opts, window, bounds, out);
                 }
@@ -1315,15 +1141,12 @@ impl Lexicon {
             return;
         }
         token.clear();
-        // Clamp the token span to the buffer: identical when the caller's
-        // `i <= j <= chars.len()` invariant holds (the verifier cannot carry
-        // that invariant across the method boundary).
+        // Clamp to the buffer: identical under the caller's `i <= j <= chars.len()`, which the
+        // verifier cannot carry across the call.
         let hi = if j < chars.len() { j } else { chars.len() };
         let lo = if i < hi { i } else { hi };
         token.extend(chars[lo..hi].iter());
-        // `classify_token_into` leaves the full-token fold in `folded` (its first
-        // lookup key), so the ignore / bare-`cat` guards below reuse it instead of
-        // re-folding the same token.
+        // `classify_token_into` leaves the full-token fold in `folded` for the guards below.
         let Some(hit) = self.classify_token_into(token.as_str(), folded, candidate_folded) else {
             return;
         };
@@ -1332,17 +1155,10 @@ impl Lexicon {
         {
             return;
         }
-        // Bare-`cat` policy: short feline tokens are opt-in — but only the
-        // ones bare ASCII can actually SPELL, which is the whole of what the
-        // knob names ("`cat` is also the ubiquitous shell command"). A
-        // MARKS-REQUIRED key matches only a token that itself carries
-        // folded-away marks (vi `mèo` folds to `meo`; a typed bare `meo`
-        // never matches it), so it is exempt — `mèo` is vi's only
-        // single-token cat word. Deliberately NOT widened to every non-ASCII
-        // fold: the data's own notes record `قط`, `بس`, `بلا`, `кот` as
-        // homographs of very common words, and none carries `ambiguous =
-        // true`, so the <= 3 guard is incidentally load-bearing for them. Splitting those
-        // is a DATA change, not a scanner change.
+        // Short feline tokens are opt-in (`cat` is also the shell command), except a
+        // marks-required key, which bare ASCII cannot spell (vi `mèo` folds to `meo`). Not widened
+        // to every non-ASCII fold: the data notes `قط`, `بس`, `بلا`, `кот` as homographs of
+        // common words without `ambiguous = true`, so this guard covers them.
         if hit.class == Class::Feline
             && !opts.allow_bare_cat
             && folded.chars().count() <= 3
@@ -1350,11 +1166,8 @@ impl Lexicon {
         {
             return;
         }
-        // Emphasis policy: hype words must be >= 4 folded chars — EXCEPT
-        // user-supplied surfaces (v3 §6: explicit config is consent; a custom
-        // 2-char word must scan). Builtin/derived short surfaces stay
-        // suppressed: a 3-char emphasis surface ("wow") would fire on far too
-        // much ordinary prose.
+        // Emphasis words need >= 4 folded chars unless user-supplied (explicit config is
+        // consent): a 3-char surface ("wow") would fire on too much ordinary prose.
         if hit.class == Class::Emphasis
             && folded.chars().count() <= 3
             && !self.user_surfaces.contains(folded.as_str())
@@ -1388,33 +1201,21 @@ impl Lexicon {
         bounds: &mut Vec<usize>,
         out: &mut Vec<Match>,
     ) {
-        // Clamp the run's upper bound to the buffer: identical when the caller's
-        // `end <= chars.len()` invariant holds (the verifier cannot carry that
-        // invariant across the method boundary).
+        // Clamp to the buffer, as in `try_spaced_token`.
         let end = if end < chars.len() { end } else { chars.len() };
         let mut p = start;
         while p < end {
-            // FIRST-CHARACTER PREFILTER. Every surface that could match here
-            // starts with `chars[p]`, so a first character no surface starts
-            // with settles the whole position: advance by one with no window
-            // build and no probe. That is the dominant case — the no-space
-            // script ranges span tens of thousands of codepoints and the data
-            // holds a few hundred surfaces.
-            //
-            // `head_max` is the longest surface starting with this character,
-            // so probing beyond it can only miss; clamping to it also shrinks
-            // the HIT path, where the per-character maximum is 2-3 rather than
-            // the global `max_cjk`.
+            // First-character prefilter (see `cjk_heads`): a character no surface starts with
+            // settles the position with no window build. `head_max` also bounds the window on a
+            // hit.
             let Some(&head_max) = self.cjk_heads.get(&chars[p]) else {
                 // `p < end` makes the plain `+ 1` overflow-free; same value.
                 p = p.saturating_add(1);
                 continue;
             };
             let remaining = end - p;
-            // Clamped against `max_cjk` as well as `head_max`: `head_max` is
-            // <= `max_cjk` by construction (see `cjk_heads`), and spelling both
-            // keeps the window bound enforced HERE rather than inherited from
-            // the builder.
+            // `head_max <= max_cjk` by construction; clamping to both enforces the window bound
+            // here rather than trusting the builder.
             let head_max = if head_max < self.max_cjk {
                 head_max
             } else {
@@ -1425,17 +1226,14 @@ impl Lexicon {
             } else {
                 remaining
             };
-            // Build the longest candidate once into `window`, recording the
-            // cumulative byte length after each pushed char (`bounds[k]` = byte
-            // length of the first `k + 1` chars). A shorter candidate is then a
-            // cheap prefix slice rather than a fresh per-length allocation.
+            // Build the longest candidate once; `bounds[k]` is the byte length of its first
+            // `k + 1` chars, so each shorter candidate is a prefix slice.
             window.clear();
             bounds.clear();
             let mut off = 0;
             while off < max_l {
-                // `off < max_l <= end - p` keeps `p + off` in bounds; the plain
-                // while-loop (vs a `0..max_l` range) keeps that visible to the
-                // verifier.
+                // `off < max_l <= end - p` keeps `p + off` in bounds; the while-loop keeps that
+                // visible to the verifier.
                 window.push(chars[p + off]);
                 bounds.push(window.len());
                 off += 1;
@@ -1444,11 +1242,8 @@ impl Lexicon {
             let mut hit: Option<(usize, usize, CjkHit)> = None;
             let mut l = max_l;
             while l >= 1 {
-                // `&str` borrow into `FxHashSet<String>` / `FxHashMap<String, _>`
-                // (valid: `String: Borrow<str>`), preserving longest-match-first.
-                // `bounds` holds `max_l` char-boundary byte lengths, so both
-                // `get`s always succeed; they only make the index / boundary
-                // obligations checkable without changing behavior.
+                // `bounds` holds `max_l` char-boundary byte lengths, so both `get`s succeed; they
+                // make the index and boundary obligations checkable.
                 let Some(&cand_bytes) = bounds.get(l - 1) else {
                     break;
                 };
@@ -1465,9 +1260,7 @@ impl Lexicon {
                 }
                 l -= 1;
             }
-            // `l <= max_l <= end - p` keeps every `p + l` below `end`, so the
-            // saturating adds below are exactly `+`; they only discharge the
-            // verifier's overflow obligations.
+            // `l <= max_l <= end - p`, so the saturating adds are exactly `+` (for the verifier).
             match hit {
                 Some((l, _, CjkHit::Exception)) => p = p.saturating_add(l),
                 Some((l, cand_bytes, CjkHit::Form(hit))) => {
@@ -1525,10 +1318,8 @@ fn intern_lang(table: &mut Vec<String>, code: &str) -> LangId {
     LangId((table.len() - 1) as u16)
 }
 
-/// Intern an animal `species` id into `table` (first-appearance order). The
-/// species namespace is a plain index table — no bitset, so no reserved
-/// overflow slot; the id count is bounded by the u16 cast staying lossless
-/// (the roster is a few dozen species, the cap is structural, not reachable).
+/// Intern an animal `species` id into `table` (first-appearance order). A plain index table with
+/// no reserved slot; ids saturate at `u16::MAX`, far above the roster.
 fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
     if let Some(i) = table.iter().position(|s| s == code) {
         return SpeciesId(i as u16);
@@ -1540,14 +1331,9 @@ fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
     table.push(code.to_string());
     SpeciesId(i as u16)
 }
-/// Cross-class homograph precedence, TOTAL ORDER:
-/// `profanity > feline > canine > animal > emphasis`.
-///
-/// A surface that is an expletive in *any* enabled language
-/// (e.g. "poes": Dutch pussycat, Afrikaans vulgar; "anjing": Indonesian dog,
-/// in-language curse) is treated as profanity, so it sparkles rather than
-/// getting a friendly paw; likewise a user emphasis word colliding with a
-/// builtin feline form keeps the cat.
+/// Cross-class homograph precedence: `profanity > feline > canine > animal > emphasis`. A surface
+/// that is an expletive in any enabled language ("poes": Dutch pussycat, Afrikaans vulgar) is
+/// profanity, so it sparkles rather than getting a paw.
 fn class_rank(class: Class) -> u8 {
     match class {
         Class::Profanity => 5,
@@ -1591,16 +1377,9 @@ fn push_overlong_surface_conflict(conflicts: &mut Vec<String>, len: usize, lang:
     conflicts.push(msg);
 }
 
-/// Record `surface`'s first character in the CJK prefilter, keeping the LONGEST
-/// surface length (in chars) seen for that character.
-///
-/// The maximum — not the minimum, and not a mere presence bit — is what makes
-/// the clamp in [`Lexicon::scan_cjk_run`] lossless: probing is longest-first, so
-/// the window must still be long enough for the longest surface that starts
-/// here, while every length above that provably matches nothing.
-///
-/// An empty surface contributes nothing: it has no first character, and the
-/// builder already skips empty keys.
+/// Record `surface`'s first character in the CJK prefilter, keeping the longest surface length
+/// (chars) seen for it. The maximum keeps the clamp in [`Lexicon::scan_cjk_run`] lossless: probing
+/// is longest-first, and no surface starting with that character is longer.
 fn note_cjk_head(heads: &mut FxHashMap<char, usize>, surface: &str) {
     let mut it = surface.chars();
     let Some(first) = it.next() else {
@@ -1633,12 +1412,9 @@ fn insert_class(
 ) {
     match map.get_mut(&key) {
         Some(prev) if class_rank(new.class) > class_rank(prev.class) => {
-            // MARKS-REQUIRED IS A PROPERTY OF THE KEY, NOT OF THE CLASS: a
-            // claimant that listed the BARE spelling disproves "every
-            // claimant lost marks" whatever class it sits in, so its
-            // testimony outlives the precedence replacement. hu `cicák`
-            // (feline, marked) and id `cicak` (gecko, bare) fold to ONE key;
-            // without this, adding a language would silence a working word.
+            // Marks-required belongs to the key, not the class: a claimant that listed the bare
+            // spelling keeps it false through the replacement. hu `cicák` (feline) and id `cicak`
+            // (gecko) fold to one key; otherwise adding a language would silence a working word.
             let marks_required = prev.marks_required && new.marks_required;
             *prev = new;
             prev.marks_required = marks_required;
@@ -1648,15 +1424,13 @@ fn insert_class(
             // One unambiguous claimant is sufficient to make the winning
             // surface safe for immediate live-cursor decoration.
             prev.ambiguous &= new.ambiguous;
-            // Likewise one claimant listing the BARE spelling explicitly
-            // (`scheisse` beside `scheiße`) makes the merged key matchable
-            // by unmarked text — explicit data is consent.
+            // Likewise one claimant listing the bare spelling (`scheisse` beside `scheiße`)
+            // makes the key matchable by unmarked text.
             prev.marks_required &= new.marks_required;
             match (prev.species, new.species) {
                 (Some(a), Some(b)) if a != b => {
-                    // Two species claim one surface — a data bug (which sprite
-                    // would the word show?). First claimant wins (TOML order);
-                    // the loss is recorded, never silent.
+                    // Two species on one surface is a data bug: the first claimant (TOML order)
+                    // wins and the loss is reported.
                     let mut msg = String::from("surface ");
                     msg.push_str(&DebugText(&key).to_string());
                     msg.push_str(" claimed by two animal species: kept the first");
@@ -1667,10 +1441,8 @@ fn insert_class(
             }
         }
         Some(prev) => {
-            // The losing class is dropped whole, its languages with it — but
-            // the key-level fact above outlives it in this direction too, or
-            // the merge would depend on which claimant the file happened to
-            // list first. Nothing else of the loser survives.
+            // The loser is dropped whole except its marks testimony (as above), so the merge does
+            // not depend on claimant order.
             prev.marks_required &= new.marks_required;
         }
         None => {
@@ -1679,9 +1451,8 @@ fn insert_class(
     }
 }
 
-/// Freeze a precedence-resolved surface table and assign one collision-free,
-/// deterministic ID to every exact key. This is build-time work; scans retain
-/// the compact `Copy` value and perform no extra lookup or allocation.
+/// Freeze a precedence-resolved surface table, giving each exact key a deterministic,
+/// collision-free ID.
 fn finalize_hits(
     map: FxHashMap<String, PendingHit>,
     next_form_id: &mut u64,
@@ -1710,20 +1481,18 @@ fn finalize_hits(
     out
 }
 
-/// The [`Match::form_hash`] a scan would report for a surface string, exposed
-/// so the sparkle-words custom-spec resolver (v3 §6) can key its per-word
-/// override table with EXACTLY the scanner's hash. Callers must pass the same
-/// text a match carries: the [`fold`]ed full token for spaced surfaces (fold
-/// possessive variants whole: `fold(w) + "'s"` etc.), the RAW compound for
-/// no-space (CJK) surfaces.
+/// The [`Match::form_hash`] a scan reports for `surface`, so a host (the sparkle-words custom-spec
+/// resolver) keys per-word tables by the scanner's own hash. Pass the text a match carries: the
+/// [`fold`]ed full token for spaced surfaces (possessives folded whole: `fold(w) + "'s"`), the raw
+/// compound for no-space surfaces.
 #[must_use]
 pub fn form_hash(surface: &str) -> u64 {
     fnv1a64(surface)
 }
 
-/// True when `s` is a no-space-script surface (every char is CJK/kana/Hangul/
-/// Thai/Lao/Khmer): the custom-spec resolver must register it as a `cjk = true`
-/// entry with a RAW (unfolded) key, or the lexicon insert silently drops it.
+/// True when every char of `s` is in a no-space script (CJK, kana, Hangul, Thai, Lao, Khmer):
+/// such a surface must be a `cjk = true` entry with a raw (unfolded) key, or the build drops it
+/// as not a scannable token.
 #[must_use]
 pub fn is_no_space_surface(s: &str) -> bool {
     !s.is_empty() && s.chars().all(fold::is_no_space_script)
@@ -1764,12 +1533,9 @@ fn token_end(chars: &[char], i: usize) -> usize {
     j
 }
 
-/// True for a character the scanner treats as an *interior joiner* — an
-/// apostrophe or hyphen sitting between two token characters (`cat's`,
-/// `cat-like` are single tokens). Public for the same reason as
-/// [`is_token_char`]: the host's context tokenizer (the sparkle-words genome's
-/// ±K neighbor-token walk) must segment tokens exactly like the scanner, and a
-/// re-implemented look-alike joiner set would drift.
+/// An apostrophe or hyphen, which the scanner joins into a token when it sits between two token
+/// characters (`cat's`, `cat-like`). Public so the host's context tokenizer (the sparkle-words
+/// genome's ±K neighbor-token walk) segments tokens like the scanner.
 #[must_use]
 pub fn is_interior_joiner(c: char) -> bool {
     c == '\'' || c == '\u{2019}' || c == '-'
@@ -1811,9 +1577,8 @@ fn left_suppresses(chars: &[char], i: usize) -> bool {
     if i == 0 {
         return false;
     }
-    // `get` instead of `chars[i - 1]`: the caller always passes a token start
-    // `i <= chars.len()`, but the verifier cannot see that invariant across the
-    // call; the `None` arm is unreachable under it.
+    // `get`: the verifier cannot see the caller's `i <= chars.len()`; the `None` arm is
+    // unreachable.
     let Some(&c) = chars.get(i - 1) else {
         return false;
     };
@@ -1856,14 +1621,9 @@ mod tests {
         Lexicon::with_languages(&["all"])
     }
 
-    /// The invariant the CJK first-character prefilter's equivalence rests on:
-    /// EVERY surface the maximal-run scan can match is reachable through
-    /// `cjk_heads`, at a stored length no shorter than its own.
-    ///
-    /// A missing first character, or a stored maximum that is too small, would
-    /// make `scan_cjk_run` skip a probe that should hit — a silent matching
-    /// regression that no timing would catch. Checked over BOTH tables and over
-    /// every language configuration that changes which entries load.
+    /// Every surface the maximal-run scan can match is reachable through `cjk_heads` at a stored
+    /// length no shorter than its own, over both tables and each language set that changes which
+    /// entries load. A gap would silently skip a probe that should hit.
     #[test]
     fn cjk_prefilter_admits_every_surface_it_gates() {
         for langs in [&["en"][..], &["all"][..], &["ja", "th"][..]] {
@@ -1887,8 +1647,7 @@ mod tests {
                      — the scan would clamp its window below this surface and \
                      never probe it"
                 );
-                // ... and the clamp must itself stay inside the global window
-                // bound, or the window build could run past `max_cjk`.
+                // The clamp stays inside the global window bound.
                 assert!(
                     head_max <= lx.max_cjk,
                     "{langs:?}: first character {first:?} stores {head_max}, \
@@ -1896,9 +1655,7 @@ mod tests {
                     lx.max_cjk
                 );
             }
-            // The prefilter must be a genuine filter, not a table that admits
-            // everything: no-space script ranges span tens of thousands of
-            // codepoints and the data holds a few hundred first characters.
+            // The prefilter must stay selective: the data holds a few hundred first characters.
             assert!(
                 lx.cjk_heads.len() < 5_000,
                 "{langs:?}: {} distinct first characters — this is no longer a \
@@ -1913,7 +1670,7 @@ mod tests {
         }
     }
 
-    /// LANGUAGE-COLLISION REGRESSION: Romanian `fut` / `futu` must remain
+    /// Language-collision regression: Romanian `fut` / `futu` must remain
     /// recognizable in Romanian/all-language configurations, but every scan
     /// reports them as cursor-deferrable collisions. The renderer can therefore
     /// distinguish a provisional `future` prefix from a delimiter-settled word.
@@ -2011,18 +1768,14 @@ mod tests {
         );
     }
 
-    // Regression for the CJK maximal-run scratch reuse (scan_cjk_run builds the
-    // longest candidate once into `window`/`bounds` and probes prefix slices
-    // instead of allocating a fresh `String` per candidate length): longest
-    // match still wins, offsets are correct across multiple runs on one line,
-    // and the CJK ignore guard still keys on the raw compound substring.
+    // With the CJK window/bounds scratch reused, the longest match still wins, offsets stay right
+    // across runs on one line, and the ignore guard keys on the raw compound.
     #[test]
     fn cjk_run_scratch_reuse_preserves_matches_and_ignore() {
         use std::collections::HashSet;
         let lx = lex();
         let o = ScanOptions::default();
-        // Two CJK runs separated by an ASCII space share the same window/bounds
-        // scratch; each whole compound (length > 1) matches at the right chars.
+        // Two runs share the window/bounds scratch; each compound matches at its own chars.
         let got = lx.scan("子猫 ねこ", &o);
         assert_eq!(got.len(), 2, "got {got:?}");
         assert_eq!(
@@ -2033,8 +1786,7 @@ mod tests {
             (got[1].start, got[1].end, got[1].class),
             (3, 5, Class::Feline)
         );
-        // The CJK ignore guard reuses the `window` prefix slice (the raw compound
-        // substring), so ignoring the raw form suppresses the match.
+        // Ignoring the raw compound suppresses it.
         let ignore: HashSet<String> = ["子猫".to_string()].into_iter().collect();
         let oi = ScanOptions {
             ignore: Some(&ignore),
@@ -2077,15 +1829,11 @@ mod tests {
         );
     }
 
-    // Regression for the unbounded-alloc / quadratic-memory DoS: a config/override
-    // lexicon with a pathological suffix entry (stems × suffixes far above the cap)
-    // must be skipped instead of materializing the full cartesian product, while a
-    // normal small entry still expands fully and the tiny builtin is untouched.
+    // An override suffix entry whose product exceeds the cap is skipped and reported; a normal
+    // entry still expands.
     #[test]
     fn suffix_expansion_is_globally_bounded() {
-        // Build the override TOML programmatically: a normal 2×2 entry (must expand
-        // fully) plus a pathological 2000×2000 = 4_000_000-surface entry (product
-        // alone > MAX_TOTAL_SURFACES, so it must be dropped).
+        // A 2×2 entry plus a 2000×2000 one whose product alone exceeds MAX_TOTAL_SURFACES.
         let mut toml = String::new();
         toml.push_str(
             "[[entry]]\nclass = \"feline\"\nlang = \"xx\"\nmode = \"suffix\"\n\
@@ -2110,7 +1858,6 @@ mod tests {
         let lx = Lexicon::with_languages_and_override(&["all"], Some(&toml))
             .expect("override lexicon must parse");
 
-        // The build completed without exploding and the total stays bounded.
         assert!(
             lx.spaced_form_count() <= MAX_TOTAL_SURFACES,
             "surface count {} exceeded cap {MAX_TOTAL_SURFACES}",
@@ -2122,7 +1869,7 @@ mod tests {
             "expected a surface-cap conflict, got {:?}",
             lx.conflicts(),
         );
-        // The normal small entry still expanded fully (stems × suffixes present).
+        // The normal entry expanded fully.
         assert_eq!(lx.classify_token("qwxfeline"), Some(Class::Feline));
         assert_eq!(lx.classify_token("qwxfelinez"), Some(Class::Feline));
         assert_eq!(lx.classify_token("qwxkittenz"), Some(Class::Feline));
@@ -2130,9 +1877,8 @@ mod tests {
         assert_eq!(lx.classify_token("qwxstem0qwxsuf0"), None);
     }
 
-    // The cubic no-space scan (see `MAX_CJK_SURFACE_CHARS`): an overlong
-    // surface is dropped and reported at build, so the 4,096-character surface
-    // below cannot widen the window and the 20,000-character scan stays linear.
+    // An overlong no-space surface is dropped and reported at build (see
+    // `MAX_CJK_SURFACE_CHARS`), so it cannot widen the scan window.
     #[test]
     fn no_space_surface_length_is_bounded() {
         let long = "\u{9F98}".repeat(4096);
@@ -2158,8 +1904,8 @@ mod tests {
             "the dropped surface must be reported: {:?}",
             lx.conflicts()
         );
-        // A surface AT the bound still compiles and scans, here after a
-        // 20,000-character run of its head character.
+        // A surface at the bound still compiles and scans after a 20,000-character run of its
+        // head character.
         let line = format!("{}{fits}", "\u{9F98}".repeat(20_000));
         let hits = lx.scan(&line, &ScanOptions::default());
         let spans: Vec<(usize, usize)> = hits.iter().map(|m| (m.start, m.end)).collect();
@@ -2187,10 +1933,8 @@ mod tests {
         assert_eq!(lex().lang_code(primary_lang(LangSet::EMPTY)), "unknown");
     }
 
-    // The LangSet bitset holds 63 real codes + the reserved "unknown" slot;
-    // an (override-sized) lexicon with more distinct languages must
-    // deterministically collapse the overflow into "unknown" instead of
-    // wrapping or panicking.
+    // The bitset holds 63 real codes plus the reserved "unknown" slot; later codes collapse into
+    // "unknown" instead of wrapping or panicking.
     #[test]
     fn lang_interning_overflow_collapses_to_unknown() {
         let mut toml = String::new();

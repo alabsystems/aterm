@@ -60,6 +60,7 @@ mod parity_fuzz_adversarial;
 #[cfg(wgpu_arm)]
 mod present_real;
 mod rain_parity;
+mod row_overshoot_gpu;
 mod scissor_repaint;
 mod scroll_blit_gpu;
 mod selection_highlight;

@@ -27,13 +27,12 @@ pub(crate) struct StrokeDetector {
 }
 
 impl StrokeDetector {
-    /// `point` is an ABSOLUTE pointer position in grid cells, not a position
-    /// relative to the moving pet. Only its displacement earns travel; changing
-    /// the pet's body or its width under a still pointer earns nothing.
+    /// `point` is the absolute pointer position in grid cells, not one relative to the pet:
+    /// only its displacement earns travel, so a body moving or resizing under a still pointer
+    /// earns nothing.
     ///
-    /// `None` (leave, hidden, reduced motion, or work) forgets contact and
-    /// partial travel, while retaining the earned stroke's cooldown. Reentry
-    /// therefore cannot manufacture movement or bypass the rate limit.
+    /// `None` (leave, hidden, reduced motion, or work) forgets contact and partial travel but
+    /// keeps the earned stroke's cooldown, so reentry cannot bypass the rate limit.
     pub(crate) fn sample(
         &mut self,
         now: Instant,
@@ -56,9 +55,8 @@ impl StrokeDetector {
         };
         let elapsed = now.saturating_duration_since(previous.moved_at);
         if point == previous.point {
-            // Frame cadence can repeat this sample hundreds of times between
-            // real pointer events. Preserve the last MOVEMENT timestamp, or a
-            // slow sparse event will look like a one-frame dash when it lands.
+            // Frames repeat this sample between real pointer events: keep the
+            // last movement's timestamp, or a slow sparse event lands as a dash.
             if elapsed > MAX_GAP {
                 self.travel = 0.0;
             }
@@ -191,11 +189,9 @@ mod tests {
         assert!(!detector.sample(start + Duration::from_secs(2), Some((1.8, 0.0)), 4.0));
     }
 
-    /// Tier-1 binds the bounded model to the real detector. `event` is the
-    /// input class supplied by this trace, not a classification inferred from
-    /// the returned boolean; a premature response cannot label itself lawful.
-    /// The outstanding cooldown obligation comes from the observed earned
-    /// response's time, independently of the detector's retained deadline.
+    /// Tier-1 bind of `pet_stroke_detector_model` to the real detector. `event` is the input
+    /// class this trace supplies, not one inferred from the returned boolean, and the cooldown
+    /// obligation comes from the observed response's time, not the detector's own deadline.
     #[test]
     fn real_stroke_detector_transitions_conform_and_reject_negative_controls() {
         use std::collections::{BTreeMap, BTreeSet};

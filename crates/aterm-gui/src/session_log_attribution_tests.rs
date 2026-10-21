@@ -134,7 +134,7 @@ fn a_person_key_that_found_the_timeline_held_still_attributes() {
         } else {
             let mut g = h.ctx.timeline.lock().unwrap();
             let now = g.slog().now();
-            g.slog_mut().open_session(None, now);
+            g.slog_mut().open_session(None, None, now);
         }
         claude_busy(&h);
         // A burst already running (its stamp ahead of every clock): the key

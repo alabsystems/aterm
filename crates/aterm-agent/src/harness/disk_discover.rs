@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FINDING THE BUILD DIRECTORIES — every cargo build directory the disk watch
-//! can reach from where the agents work, and who OWNS each.
+//! Finding the build directories: every cargo build directory the disk watch can reach from
+//! where the agents work, and who owns each. Every path is injected ([`Roots`]); nothing here
+//! reads the environment.
 //!
-//! # Why this exists
+//! # Where it looks
 //!
 //! Measured on a 460 GB volume that kept falling to 3-6 GB free: the hogs
 //! were build directories a watch of only `target*` directly under each
@@ -107,19 +108,13 @@
 //!   cannot be read whole; the removal reads the running processes again
 //!   ([`still_gone`]).
 //!
-//! An owner owns only what lies INSIDE its folder: a `target*` link in a
-//! scratchpad that points out of the session's directory (a scratch
-//! worktree's `target -> ~/repo/target.noindex`) makes what it names
-//! [`Origin::Linked`], nobody's that can end — and a directory a checkout,
-//! an agent or the caller ALSO names is theirs.
+//! An owner owns only what lies inside its folder: a `target*` link out of it makes what it
+//! names [`Origin::Linked`], and a directory a checkout, an agent or the caller also names is
+//! theirs.
 //!
-//! What a gone owner's build directory may lose is the report's decision
-//! (`super::report`). The removal first asks that NO RUNNING PROCESS has its
-//! working directory, executable or an open file in it or the owner's
-//! folder ([`unused`] — cargo runs tests without its locks, so only this
-//! says nothing runs from it), then checks again under cargo's locks, right
-//! before it deletes ([`recheck`]): the directory still inside the owner's
-//! folder, the owner still gone.
+//! Whether a gone owner's build directory goes is the report's decision (`super::report`).
+//! The removal first asks that no running process uses it or the owner's folder ([`unused`]),
+//! then checks again under cargo's locks ([`recheck`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -196,10 +191,8 @@ pub struct Roots {
     /// `$HOME`: its direct children and their worktrees are walked, and its
     /// guarded folders are never looked into ([`HOME_SKIP`]).
     pub home: Option<PathBuf>,
-    /// The Claude Code directories whose registries and transcripts say
-    /// whether a session ended ([`claude_dirs`]): `~/.claude`, each running
-    /// Claude Code's own ([`Running::dirs`]) and the identities'. Not walked;
-    /// carried to the survey's [`Owners`].
+    /// The Claude Code directories whose registries and transcripts say whether a session
+    /// ended ([`claude_dirs`]). Not walked; carried to the survey's [`Owners`].
     pub claude_dirs: Vec<PathBuf>,
     /// The running Claude Codes ([`Running::claudes`]): one no registry read
     /// here pins to its session keeps every session of its project.
@@ -298,38 +291,42 @@ pub struct Running {
     /// Each one, as the kernel names it.
     pub claudes: Vec<RunningClaude>,
     /// The Claude Code directory each process of this uid was started with
-    /// (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, in its environment at
-    /// exec), each once — every process's, not only a Claude Code's: one
-    /// the kernel does not name one (a copy of it renamed) keeps its
-    /// registry there too. Read for REACH, never trusted for safety: there a
-    /// registry pins a Claude Code to its session and names the sessions
-    /// running, and transcripts date one, but a settings file moves the
-    /// directory after the exec (measured with Claude Code 2.1.287), and a
-    /// Claude Code no registry read here pins keeps its whole project
+    /// (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, at exec), each once; every process's,
+    /// since a renamed Claude Code keeps its registry there too. Read for reach, never
+    /// trusted for safety: a settings `env` block can move it after exec
     /// ([`RunningClaude::may_hold`]).
     pub dirs: Vec<PathBuf>,
 }
 
-/// One running Claude Code ([`Running::claudes`]): what the KERNEL says of
-/// it, which no settings file can move.
+/// One running Claude Code ([`Running::claudes`]): what the kernel says of it, which no
+/// settings file can move.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningClaude {
     /// Its pid.
     pub pid: u32,
-    /// When the kernel started it, as Claude Code writes `procStart` in its
-    /// registry record (`ps -o lstart=` in UTC and the C locale, its spaces
-    /// squashed): a record naming its pid pins it only at this start (a pid
-    /// reused since the record was written pins nothing). `None`: not read,
-    /// never pinned.
+    /// When the kernel started it, as Claude Code writes `procStart` in its registry
+    /// (`ps -o lstart=` in UTC and the C locale, spaces squashed): a record naming its pid
+    /// pins it only at this start, since a pid may be reused. `None`: not read, never pinned.
     pub started: Option<String>,
     /// Its working directory. `None`: not read — it may hold a session of
     /// any project.
     pub cwd: Option<PathBuf>,
+    /// The profile of the home it runs in — `.claude.json` beside or inside
+    /// its Claude Code directory, by the one resolver of a home
+    /// (`super::super::profile::path_of`, over its exec's `CLAUDE_CONFIG_DIR`
+    /// and `HOME`): the account it is on, for the account stats' count of
+    /// the sessions on a home. `None` for a process the kernel does not name
+    /// a Claude Code (kept only because its directory was not read) and for a
+    /// home that could not be resolved.
+    pub profile: Option<PathBuf>,
+    /// Its exec environment gives it no credential, provider, profile or
+    /// route of its own ([`Exec::stored_login`]): the account stats' word on
+    /// whether an API key, Bedrock or Vertex spends from its home.
+    pub stored_login: bool,
 }
 
-/// Claude Code's cap on a project folder's name: past it the name is its
-/// first [`PROJECT_NAME_CAP`] characters, a `-` and a hash of the path
-/// (measured, Claude Code 2.1.287).
+/// Claude Code's cap on a project folder's name: past it the name is its first
+/// [`PROJECT_NAME_CAP`] characters, a `-` and a hash of the path (Claude Code 2.1.287).
 const PROJECT_NAME_CAP: usize = 200;
 
 /// A directory's name as Claude Code writes it for its project folder: every
@@ -467,8 +464,8 @@ impl RunningClaude {
 pub struct Process {
     /// Its pid.
     pub pid: u32,
-    /// What the kernel says of its executable, read AFTER its exec record,
-    /// so one that exited meanwhile reads [`Exe::Exited`]. `None`: not read.
+    /// What the kernel says of its executable, read after its exec record, so one that
+    /// exited meanwhile reads [`Exe::Exited`]. `None`: not read.
     pub exe: Option<Exe>,
     /// Its exec record (`KERN_PROCARGS2` on macOS, `/proc` on Linux, its
     /// process parameters on Windows: [`atpkg::caller_shell::process_args`]),
@@ -496,12 +493,18 @@ pub struct Exec {
     /// The variable its `os.homedir()` reads, in its environment at exec:
     /// `HOME`, on Windows `USERPROFILE` ([`super::super::accounts::HOMEDIR_ENV`]).
     pub home: Option<String>,
+    /// Its environment at exec reads as its stored login: nothing in it gives
+    /// it a credential, provider, profile or route of its own — the
+    /// environment's half of the host's verdict
+    /// ([`super::super::accounts::ProcessLogin::of_exec_env`]). `false` for
+    /// an environment that reads empty, which was not read.
+    pub stored_login: bool,
 }
 
 impl Exec {
     /// What the census keeps of the exec record `args` ([`Exec`]): its path,
-    /// `argv[0]` and `argv[1]`, and its two variables — the rest dropped
-    /// here. `None` for a record naming neither a path nor an argument (the
+    /// `argv[0]` and `argv[1]`, its two variables and the verdict of its
+    /// environment on its login — the rest dropped here. `None` for a record naming neither a path nor an argument (the
     /// kernel's for a process that is no program's).
     fn of(args: atpkg::caller_shell::ProcArgs) -> Option<Self> {
         use super::super::accounts::{HOME_ENV, HOMEDIR_ENV};
@@ -511,6 +514,8 @@ impl Exec {
         Some(Self {
             config: args.env_var(HOME_ENV).map(str::to_owned),
             home: args.env_var(HOMEDIR_ENV).map(str::to_owned),
+            stored_login: super::super::accounts::ProcessLogin::of_exec_env(&args.env)
+                .is_some_and(|login| login.stored_login),
             path: args.exec_path,
             argv: args.argv.into_iter().take(2).collect(),
         })
@@ -615,10 +620,8 @@ fn claude_code(exe: Option<&Exe>, exec: &Exec, scratch: Option<&Scratch>) -> boo
             .any(claude)
 }
 
-/// Where the system's own executables live (macOS: its sealed volume):
-/// none is a Claude Code. Measured 2026-10-02: macOS read 410 of this uid's
-/// 483 processes with an empty environment, every one under these roots, and
-/// every process elsewhere whole.
+/// Where the system's own executables live (macOS: its sealed volume): none is a Claude
+/// Code. On macOS most of a uid's processes run from here and many cannot be read.
 const SYSTEM_EXECUTABLES: &[&str] = &[
     "/System",
     "/bin",
@@ -647,23 +650,16 @@ fn told(exec: Option<&Exec>, exe: &Exe) -> bool {
         }
 }
 
-/// How many more times the census reads a process it cannot tell
-/// ([`settled`]) before it refuses on it, pausing 1 ms before the first and
-/// twice as long before each next: 255 ms in all. A budget, not a verdict:
-/// most settle within a millisecond, but one has been measured taking 61 ms
-/// under load (2026-10-02), and only one that never settles pays it whole.
+/// How many more times the census reads a process it cannot tell ([`settled`]) before it
+/// refuses, pausing 1 ms before the first and twice as long before each next: 255 ms in all.
+/// Most settle within a millisecond; 61 ms has been measured under load.
 const EXEC_REREADS: u32 = 8;
 
-/// A process's exec record and then its executable, as `read` gives them,
-/// read again while the census cannot tell it ([`told`]), at most
-/// [`EXEC_REREADS`] times, `pause` taken between. A process caught in the
-/// middle of its spawn has no exec record yet, and the kernel still names
-/// its PARENT's executable for it (a build tool's, a test binary's, aterm's
-/// own); its record is there once its exec completes, and that record is
-/// what it is. Measured 2026-10-02 at load average 60: every one of 69
-/// caught settled within 1 ms, while one read refused 22 of 300 censuses —
-/// 130 of 300 with a spawn loop beside it. One the census still cannot tell
-/// after the last read is refused, as before: what it may hold is kept.
+/// A process's exec record and executable as `read` gives them, read again while the census
+/// cannot tell it ([`told`]), at most [`EXEC_REREADS`] times with `pause` between. A process
+/// caught mid-spawn has no exec record yet and the kernel still names its parent's
+/// executable; the record appears once its exec completes. One still untold after the last
+/// read is refused.
 fn settled(
     mut read: impl FnMut() -> (Option<Exec>, Exe),
     mut pause: impl FnMut(Duration),
@@ -701,7 +697,9 @@ fn settled(
 ///
 /// # Errors
 ///
-/// Why a process that may be a Claude Code could not be read.
+/// A process that may be a Claude Code could not be told ([`told`]): no exec record even
+/// after [`settled`], and not a system executable. Then no session is called ended
+/// ([`Roots::claude_unread`]).
 pub fn claude_census(
     processes: impl IntoIterator<Item = Process>,
     home: Option<&Path>,
@@ -824,8 +822,23 @@ fn census_of(
         // One whose own directory is not read here may be a Claude Code the
         // kernel does not name one (a copy renamed) keeping its registry
         // there: it keeps its project, as one no registry pins does.
-        if claude_code(exe.as_ref(), &exec, scratch) || dir == OwnDir::Unread {
-            out.claudes.push(RunningClaude { pid, started, cwd });
+        let claude = claude_code(exe.as_ref(), &exec, scratch);
+        if claude || dir == OwnDir::Unread {
+            let profile = home.filter(|_| claude).and_then(|user| {
+                super::super::profile::path_of(
+                    user,
+                    exec.config.as_deref(),
+                    exec.home.as_deref(),
+                    || cwd.clone(),
+                )
+            });
+            out.claudes.push(RunningClaude {
+                pid,
+                started,
+                cwd,
+                profile,
+                stored_login: exec.stored_login,
+            });
         }
         if let OwnDir::Read(dir) = dir
             && !out.dirs.contains(&dir)
@@ -851,10 +864,9 @@ enum OwnDir {
     Unread,
 }
 
-/// [`OwnDir`] of a process exec'd as `exec`, running in `cwd` (where read):
-/// a relative `CLAUDE_CONFIG_DIR` — set and EMPTY included — names the
-/// directory under it, as Claude Code resolves it
-/// ([`super::super::footer::claude_dir_of`], the one resolver).
+/// [`OwnDir`] of a process exec'd as `exec`, running in `cwd` (where read). A relative
+/// `CLAUDE_CONFIG_DIR`, empty included, names a directory under `cwd`, as Claude Code
+/// resolves it ([`super::super::footer::claude_dir_of`]).
 fn own_dir(exec: &Exec, cwd: Option<&Path>, home: Option<&Path>) -> OwnDir {
     let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
     match super::super::footer::claude_dir_of(exec.config.as_deref(), exec.home.as_deref(), || {
@@ -871,12 +883,10 @@ fn own_dir(exec: &Exec, cwd: Option<&Path>, home: Option<&Path>) -> OwnDir {
     }
 }
 
-/// Is `dir` inside aterm's own state directory under `home` (macOS:
-/// `~/Library/Application Support/aterm`) — an identity's Claude Code
-/// directory (`identities/<name>/.claude`, as `spawn identity=` starts one)
-/// or an account's login (`harness/claude-harness/accounts/logins/<label>`)?
-/// The window reads those as it reads any other: no privacy consent guards
-/// aterm's own folder. Lexical; a path that climbs out by `..` is not.
+/// Whether `dir` lies in aterm's own state directory under `home` (macOS:
+/// `~/Library/Application Support/aterm`), where identities and accounts keep their Claude
+/// Code directories. No privacy consent guards it, so the census reads them. Lexical; a path
+/// that climbs out by `..` is not.
 fn in_aterm_state(dir: &Path, home: Option<&Path>) -> bool {
     let platform = aterm_types::dirs::StatePlatform {
         home: home.map(Path::to_path_buf),
@@ -1081,8 +1091,8 @@ pub enum Origin {
         /// Does it carry `scripts/slim_build.py`, its own reclaimer?
         slim: bool,
     },
-    /// Under a Claude Code session's `scratchpad/` — its canonical path
-    /// INSIDE the session's directory ([`Walk::add`]).
+    /// Under a Claude Code session's `scratchpad/`, its canonical path inside the session's
+    /// directory ([`Walk::add`]).
     ClaudeScratch {
         /// The session id (the directory's name).
         session: String,
@@ -1121,10 +1131,9 @@ impl Origin {
         }
     }
 
-    /// One build directory reached twice: the origin it keeps. A directory
-    /// any checkout, agent or caller names is THEIRS (never an owner's that
-    /// can end), whichever walk met it first; two different owners make it
-    /// [`Origin::Linked`].
+    /// One build directory reached twice: the origin it keeps. A directory any checkout,
+    /// agent or caller names is theirs, whichever walk met it first; two different owners
+    /// make it [`Origin::Linked`].
     fn merge(self, other: Origin) -> Origin {
         if self == other || !self.ownable() {
             return self;
@@ -1140,7 +1149,7 @@ impl Origin {
 /// One build directory found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
-    /// Its path, CANONICAL.
+    /// Its path, canonical.
     pub path: PathBuf,
     /// How it was found: every walk that met it, merged ([`Origin::merge`]).
     pub origin: Origin,
@@ -1192,6 +1201,7 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
     for dir in &roots.agent_target_dirs {
         if dir.is_absolute()
             && let Ok(real) = std::fs::canonicalize(dir)
+            && !w.fenced(&real)
             && w.outside_sync_root(&real)
             && marked(&real)
         {
@@ -1205,6 +1215,9 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
         let Ok(cwd) = std::fs::canonicalize(cwd) else {
             continue;
         };
+        if w.fenced(&cwd) {
+            continue;
+        }
         w.checkout(&cwd);
         if let Some(root) = worktree_root(&cwd)
             && root != cwd
@@ -1229,7 +1242,7 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
                 continue;
             }
             w.checkout(&child);
-            for wt in worktrees(&child) {
+            for wt in worktrees(&child, &[&home, roots.home.as_deref().unwrap_or(&home)]) {
                 w.checkout(&wt);
             }
         }
@@ -1322,17 +1335,31 @@ fn worktree_root(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The worktrees of the repository at `repo`, read from
-/// `.git/worktrees/*/gitdir` (each names `<worktree>/.git`).
-fn worktrees(repo: &Path) -> Vec<PathBuf> {
+/// `.git/worktrees/*/gitdir` (each names `<worktree>/.git`). A gitdir can
+/// name any path, so one in a place never looked into
+/// ([`checkout::never_looked_at`] in any spelling of `$HOME` in `homes`), or
+/// one whose spelling walks up through `..`, is dropped before anything
+/// there is looked at, not even `stat`ed: on macOS a look into a
+/// privacy-guarded folder can put a consent dialog on the owner's screen.
+fn worktrees(repo: &Path, homes: &[&Path]) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(repo.join(".git").join("worktrees")) else {
         return Vec::new();
+    };
+    let placed = |p: &Path| {
+        p.is_absolute()
+            && !p
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            && homes
+                .iter()
+                .all(|home| checkout::never_looked_at(p, Some(home)).is_none())
     };
     let mut out: Vec<PathBuf> = rd
         .flatten()
         .take(MAX_WORKTREES)
         .filter_map(|e| small_text(&e.path().join("gitdir")))
         .map(|t| PathBuf::from(t.trim()))
-        .filter(|p| p.is_absolute())
+        .filter(|p| placed(p))
         .filter_map(|p| p.parent().map(Path::to_path_buf))
         .filter(|wt| std::fs::symlink_metadata(wt).is_ok_and(|m| m.is_dir()))
         .collect();
@@ -1580,6 +1607,9 @@ struct Walk {
     found: Vec<Found>,
     /// [`Roots::device`].
     device: Option<u64>,
+    /// Canonical [`Roots::home`], for the App Data and file-provider fence
+    /// ([`Self::fenced`]).
+    home: Option<PathBuf>,
     /// [`Roots::volume`] (read on Windows only).
     #[cfg(windows)]
     volume: Option<super::target::VolumeGuid>,
@@ -1618,6 +1648,10 @@ impl Walk {
             seen: BTreeMap::new(),
             found: Vec::new(),
             device: roots.device,
+            home: roots
+                .home
+                .as_deref()
+                .map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf())),
             #[cfg(windows)]
             volume: roots.volume,
             // Read once, on Windows only while a device fences: where each
@@ -1814,11 +1848,9 @@ impl Walk {
         out
     }
 
-    /// Record the build directory at `dir` (canonical), once by device and
-    /// inode, on the measured device only. An owner's origin holds only for
-    /// a directory INSIDE the owner's folder; one outside it (reached by a
-    /// link) is [`Origin::Linked`]. Met again, the origins merge
-    /// ([`Origin::merge`]).
+    /// Record the build directory at `dir` once by device and inode, on the measured device
+    /// only. An owner's origin holds only inside the owner's folder; outside it (reached by a
+    /// link) it is [`Origin::Linked`]. Met again, the origins merge ([`Origin::merge`]).
     fn add(&mut self, dir: &Path, origin: &Origin) {
         self.add_via(dir, origin, dir);
     }
@@ -1862,11 +1894,29 @@ impl Walk {
         }
     }
 
+    /// Whether `p` lies at or under a root macOS guards with
+    /// `kTCCServiceSystemPolicyAppData` (`~/Library/Containers`,
+    /// `~/Library/Group Containers`) or a file-provider domain
+    /// (`~/Library/CloudStorage`, `~/Library/Mobile Documents`), so no
+    /// checkout root, `CARGO_TARGET_DIR`, worktree, `target*` symlink or
+    /// `marked_walk` child ever opens or lists inside another app's container.
+    fn fenced(&self, p: &Path) -> bool {
+        self.home.as_deref().is_some_and(|home| {
+            atpkg::protected::under_app_data(home, p)
+                || atpkg::protected::under_file_provider_domain(home, p)
+        })
+    }
+
     /// A checkout root: x.py's bootstrap trees, then the marker walk —
-    /// never a root on another device, and never one inside an x.py tree's
-    /// `build/` (the bootstrap rule's alone).
+    /// never a root on another device, never one inside another app's data or
+    /// a file-provider domain, and never one inside an x.py tree's `build/`
+    /// (the bootstrap rule's alone).
     fn checkout(&mut self, root: &Path) {
-        if !self.on_device(root) || inside_xpy_build(root) {
+        let Ok(root) = std::fs::canonicalize(root) else {
+            return;
+        };
+        let root = root.as_path();
+        if self.fenced(root) || !self.on_device(root) || inside_xpy_build(root) {
             return;
         }
         // Never walked inside a sync root: nothing there is a candidate, and
@@ -1900,15 +1950,21 @@ impl Walk {
                 return;
             }
             let n = name.to_string_lossy();
-            if n.starts_with('.') || (xpy && n == "build") || home_skipped(&name) {
+            if n.starts_with('.')
+                || (xpy && n == "build")
+                || home_skipped(&name)
+                || self.fenced(&path)
+            {
                 continue;
             }
             if ty.is_symlink() {
                 // The ONE link followed: a checkout's `target -> target.noindex`
-                // — its marker never read where it leads into a sync root.
+                // — its marker never read where it leads into a sync root or
+                // another app's container.
                 if n.starts_with("target")
                     && !self.leads_into_mount(&path)
                     && let Ok(real) = std::fs::canonicalize(&path)
+                    && !self.fenced(&real)
                     && std::fs::metadata(&real).is_ok_and(|m| m.is_dir())
                     && self.outside_sync_root(&real)
                     && marked(&real)
@@ -2060,10 +2116,14 @@ impl Walk {
     /// anyway names `\<rel>`, no absolute path: its owner is never seen gone
     /// (`checkout::gone_placed` refuses it), so it is kept.
     fn build_cache(&mut self, cache: &Path) {
-        if !std::fs::symlink_metadata(cache).is_ok_and(|m| m.is_dir())
-            || !self.on_device(cache)
-            || !self.outside_sync_root(cache)
-        {
+        if !std::fs::symlink_metadata(cache).is_ok_and(|m| m.is_dir()) {
+            return;
+        }
+        let Ok(real_cache) = std::fs::canonicalize(cache) else {
+            return;
+        };
+        let cache = real_cache.as_path();
+        if self.fenced(cache) || !self.on_device(cache) || !self.outside_sync_root(cache) {
             return;
         }
         let mut stack = vec![(cache.to_path_buf(), 0usize)];
@@ -2105,12 +2165,10 @@ pub enum Owner {
         session: String,
         /// `<claude tmp>/<project>/<session>`.
         session_dir: PathBuf,
-        /// The Claude Code directories it was judged by ([`Roots::claude_dirs`]):
-        /// the ones holding its transcript are its registry and date it.
+        /// The Claude Code directories it was judged by ([`Roots::claude_dirs`]).
         claude_dirs: Vec<PathBuf>,
-        /// `$HOME`, whose guarded folders no Claude Code directory is read in
-        /// when the removal reads the running processes again
-        /// ([`still_gone`]).
+        /// `$HOME`, for [`still_gone`]'s census: no Claude Code directory in its guarded
+        /// folders is read.
         home: Option<PathBuf>,
     },
     /// The workspace a Rust build cache's build directory serves
@@ -2307,9 +2365,8 @@ impl Owners {
     }
 }
 
-/// A session not called ended because a process that may be a Claude Code
-/// could not be read ([`claude_census`]): what keeps every session, said as
-/// short as a line that names the session's path beside it allows.
+/// A session kept because a process that may be a Claude Code could not be read
+/// ([`claude_census`]).
 fn unread(why: &str) -> Owned {
     Owned::Live(format!("no session is called ended: {why}"))
 }
@@ -2319,8 +2376,8 @@ fn unread(why: &str) -> Owned {
 struct Record {
     /// The process.
     pid: u32,
-    /// The session it holds now (Claude Code rewrites the record when the
-    /// session changes: measured, `/clear`, Claude Code 2.1.287).
+    /// The session it holds now (Claude Code rewrites the record when the session changes,
+    /// as on `/clear`).
     session: String,
     /// Its `procStart`, spaces squashed ([`RunningClaude::started`]).
     started: String,
@@ -2330,10 +2387,9 @@ struct Record {
 /// not read whole.
 type Registry = Option<Vec<Record>>;
 
-/// The records of the registry of the Claude Code directory `claude_dir`
-/// that name a running process (`sessions/<pid>.json`, its pid alive), or
-/// `None` when it cannot be read whole — then no session it could name is
-/// gone, and no process it could name is pinned.
+/// The records in `claude_dir`'s registry (`sessions/<pid>.json`) whose pid is alive, or
+/// `None` when it cannot be read whole: then no session it could name is gone and no process
+/// it could name is pinned.
 fn live_records(claude_dir: &Path) -> Registry {
     let files = super::super::upgrade_drive::session_files_in(claude_dir)?;
     Some(
@@ -2375,16 +2431,13 @@ fn build_cache_owner(
     }
 }
 
-/// A Claude Code session's owner verdict, each Claude Code directory's
-/// registry read through `registry` (`None`: not readable whole). A running
-/// process any known registry names for it keeps it; so does a running
-/// Claude Code (`claudes`) that may hold a session of its project
-/// ([`RunningClaude::may_hold`]) unless a known registry pins it to its own
-/// — its pid at its kernel start. Only a directory that holds the session's
-/// transcript can then say it ended: its registry must be read whole, and
-/// the transcript, the transcript's directory (its subagents') and the
-/// session's temp directory must all be unwritten for the quiet window. No
-/// known directory holding one, it is never called ended.
+/// A Claude Code session's owner verdict, each directory's registry read through `registry`
+/// (`None`: not read whole). A running process any known registry names for it keeps it, as
+/// does a running Claude Code that may hold a session of its project
+/// ([`RunningClaude::may_hold`]) unless a registry pins it (its pid at its kernel start).
+/// Only a directory holding the session's transcript can say it ended: its registry read
+/// whole, and the transcript, its directory (subagents') and the session's temp directory all
+/// unwritten for the quiet window. With no such directory it is never called ended.
 fn session_owner(
     owner: &Owner,
     claudes: &[RunningClaude],
@@ -2407,8 +2460,7 @@ fn session_owner(
             short(session)
         ));
     };
-    // Each known directory's registry (its records of running processes,
-    // `None`: not read whole) and the session's transcript there, if any.
+    // Each known directory's registry and the session's transcript there, if any.
     let known: Vec<(&Path, Registry, Option<PathBuf>)> = claude_dirs
         .iter()
         .map(|dir| {
@@ -2421,16 +2473,13 @@ fn session_owner(
         })
         .collect();
     let records = || known.iter().filter_map(|(_, r, _)| r.as_ref()).flatten();
-    // A running process ANY known directory's registry names keeps it, even
-    // where that directory holds no transcript of it (one pruned, or a copy
-    // of it in another directory): what `~/.claude`'s registry kept before.
+    // A running process any known registry names for it keeps it, even where that
+    // directory holds no transcript of it.
     if records().any(|r| r.session == *session) {
         return Owned::Live(format!("Claude Code session {} is running", short(session)));
     }
-    // A running Claude Code no known registry pins to its session — its
-    // record moved where no registry is read (a settings `env` block moves
-    // its directory after its exec), or it keeps none (`claude -p`) — may
-    // hold any session of the project it works in: it keeps them all.
+    // A running Claude Code no registry pins to its session (its registry moved where none
+    // is read, or it keeps none: `claude -p`) may hold any session of its project.
     let pinned = |c: &RunningClaude| {
         c.started
             .as_deref()
@@ -2500,15 +2549,13 @@ fn session_owner(
     }
 }
 
-/// The running processes' census of Claude Codes as a removal reads it
-/// again ([`still_gone`]), given `$HOME`: the product's is
-/// [`running_claude_census`], a test's the processes it names.
+/// The Claude Code census a removal reads again ([`still_gone`]), given `$HOME`: the
+/// product's is [`running_claude_census`], a test's the processes it names.
 pub type Census<'a> = &'a dyn Fn(Option<&Path>) -> ClaudeCensus;
 
-/// Check, right before a removal, that `owner` is still gone at `now` (the
-/// survey's verdict, read again). A session's is judged by the Claude Codes
-/// running NOW (`census`) and by the survey's Claude Code directories with
-/// theirs: a Claude Code started since may have resumed it.
+/// Check, right before a removal, that `owner` is still gone at `now`. A session is judged
+/// again by the Claude Codes running now (`census`) and their directories added to the
+/// survey's, since one started since may have resumed it.
 ///
 /// # Errors
 ///
@@ -2564,9 +2611,8 @@ pub fn still_gone(owner: &Owner, now: i64, quiet_s: i64, census: Census<'_>) -> 
     }
 }
 
-/// Is the build directory at `path` (canonical: the removal reaches it with
-/// no link in any component) INSIDE `owner`'s folder? An owner's verdict
-/// never reaches a directory outside it.
+/// Whether the build directory at `path` (canonical) lies inside `owner`'s folder: an owner's
+/// verdict never reaches a directory outside it.
 ///
 /// # Errors
 ///
@@ -2676,24 +2722,19 @@ pub fn windows_service(exe: &Path, system: Option<&Path>, program_data: Option<&
             .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
 }
 
-/// The running processes [`unused`] judges: given the directories (each
-/// canonical) and the pids to leave out, which processes use a path under
-/// one of them and which could not be read. The product's is every process
-/// of this uid ([`aterm_uds::holders::scan_path_users`], what
-/// [`super::remover`] asks); a test names its own
-/// ([`aterm_uds::holders::scan_path_users_of`]) or writes the scan, so its
-/// verdict never turns on what else the machine runs.
+/// The process scan [`unused`] judges by: given canonical directories and pids to leave out,
+/// which processes use a path under one and which could not be read. The product's is
+/// [`aterm_uds::holders::scan_path_users`]; a test names its own processes
+/// ([`aterm_uds::holders::scan_path_users_of`]) so its verdict never turns on the machine.
 pub type Processes<'a> =
     &'a dyn Fn(&[PathBuf], &[u32]) -> std::io::Result<aterm_uds::holders::PathScan>;
 
-/// Is any running process USING the build directory at `path` or its
-/// owner's folder — its working directory, its executable or an open file
-/// there, as `processes` reads them ([`Processes`])? Cargo runs tests without
-/// its locks and a binary run from `deps/` holds none, so only this can say
-/// that nothing runs from a gone owner's build directory. This process is
-/// left out (its own reclaim holds the lock files). A process that cannot be
-/// read, unless it is a platform service ([`platform_service`]), and a
-/// listing that fails both keep the directory.
+/// Whether any running process uses the build directory at `path` or its owner's folder (its
+/// working directory, executable or an open file there). Cargo runs tests without its locks
+/// and a binary run from `deps/` holds none, so only this says nothing runs from a gone
+/// owner's build directory. This process is left out (its reclaim holds the lock files). An
+/// unreadable process that is not a [`platform_service`], or a failed listing, keeps the
+/// directory.
 ///
 /// # Errors
 ///
@@ -2856,17 +2897,15 @@ fn short(session: &str) -> &str {
     session.get(..8).unwrap_or(session)
 }
 
-/// The newest write under `dir`: the mtime of every regular file but
-/// cargo's lock files, and of each cargo profile's [`CLOCK_DIRS`] (the clock
-/// the reclaim reads) —
-/// never a directory's own (an unlink, the reclaim's included, writes it),
-/// never through a link, never onto another device, and never inside a
-/// profile's caches. `Ok(None)`: nothing to date.
+/// The newest write under `dir`: the mtime of every regular file but cargo's lock files, and
+/// of each profile's [`CLOCK_DIRS`] (the reclaim's clock); never a directory's own (an unlink
+/// writes it), never through a link or onto another device, never inside a profile's caches.
+/// `Ok(None)`: nothing to date.
 ///
 /// # Errors
 ///
-/// A directory could not be read, or the tree holds more than `max`
-/// entries: a tree that cannot be dated is never called quiet.
+/// A directory could not be read, or the tree holds more than `max` entries: a tree that
+/// cannot be dated is never called quiet.
 pub fn newest_write(dir: &Path, max: usize) -> Result<Option<i64>, String> {
     let dev = dev_nofollow(dir);
     let mut newest: Option<i64> = None;

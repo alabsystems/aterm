@@ -278,7 +278,8 @@ pub struct Ctx {
     pub target_dir: PathBuf,
     /// The checks this run runs, in [`checks::CHECKS`] order.
     pub checks: Vec<Check>,
-    /// The `release` set: the gated lint pass runs, and a skip is exit 3.
+    /// The `release` set: the lint's required-features and shipped-build passes
+    /// run, and a skip is exit 3.
     pub release: bool,
     /// `--fix`: `fmt` rewrites the files it finds unformatted.
     pub fix: bool,
@@ -308,15 +309,16 @@ pub struct Ctx {
     /// The wall-clock ceiling on one stage child; `None` for `--timeout off`.
     pub child_ceiling: Option<Duration>,
     /// `--no-windows`: every stage that opens a window ([`plan::WINDOWED`])
-    /// answers a named skip.
+    /// answers a named skip, and a stage that opens one in some rows
+    /// ([`plan::WINDOWED_ROWS`]) skips those rows by name.
     pub no_windows: bool,
     /// `--app <APP>`: the bundle `measure` judges.
     pub measure_artifact: Option<MeasureArtifact>,
     /// `--test-jobs`: the most test binaries the test stage runs at once.
     pub test_jobs: u32,
     /// `--test-threads`, else the caller's own `RUST_TEST_THREADS`: the threads
-    /// every test binary gets. `None` lets the run choose per binary
-    /// ([`testrun::threads_for`]).
+    /// every test binary gets. `None` gives each the machine's parallelism
+    /// ([`Ctx::test_threads`]).
     pub test_threads: Option<u32>,
     /// The program cargo runs in place of each test binary to record it
     /// ([`testrun::RECORD_FLAG`]): this very binary unless a test names one.
@@ -519,7 +521,7 @@ impl Ctx {
     }
 
     /// `--test-threads` (or the caller's `RUST_TEST_THREADS`), or the machine's
-    /// parallelism, as libtest would pick: what a binary with no history gets.
+    /// parallelism, as libtest would pick: what every test binary gets.
     #[must_use]
     pub fn test_threads(&self) -> u32 {
         self.test_threads.unwrap_or_else(|| self.cores())
@@ -619,13 +621,7 @@ impl Ctx {
                 }
             }
         }
-        if self.no_windows
-            && check
-                .spec()
-                .stages
-                .iter()
-                .any(|id| id.no_windows_skip().is_some())
-        {
+        if self.no_windows && check.spec().stages.iter().any(|id| id.opens_windows()) {
             cmd.push_str(" --no-windows");
         }
         if check == Check::Measure
@@ -1628,6 +1624,29 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert_eq!(unpinned.test_threads, None);
+    }
+
+    /// A rerun keeps `--no-windows` for a check it changes: a windowed stage's
+    /// (appkit) and one that skips its windowed rows (browser, whose WebKit
+    /// session opens windows). NEGATIVE CONTROL: a check it does not change
+    /// (fmt) drops it, and without the flag no rerun gains it.
+    #[test]
+    fn a_rerun_keeps_no_windows_where_the_flag_changes_the_check() {
+        let c = |no_windows| {
+            Ctx::new(
+                PathBuf::from("/repo"),
+                Scope::workspace(),
+                EnvSnapshot::default(),
+                PathBuf::from("/tmp"),
+            )
+            .with_no_windows(no_windows)
+        };
+        let (quiet, plain) = (c(true), c(false));
+        for check in [Check::Browser, Check::Appkit] {
+            assert!(quiet.rerun(check).ends_with(" --no-windows"), "{check:?}");
+            assert!(!plain.rerun(check).contains("--no-windows"), "{check:?}");
+        }
+        assert!(!quiet.rerun(Check::Fmt).contains("--no-windows"));
     }
 
     /// A usage error is 2; no checkout or no pin is 3 with its fix, before anything runs.

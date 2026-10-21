@@ -129,6 +129,70 @@
 //! `Last` read can be served first) beside an `inc` that never moved: the next
 //! attach takes the same incarnation. The model's `Buggy = 4` is that overlap.
 //!
+//! ## A torn file after a power cut
+//!
+//! "Atomic" is a promise against a `kill -9`, not against a power loss: POSIX
+//! keeps nothing of an unflushed file's DATA across one, so a rename that
+//! reached the media may name a file whose bytes did not — empty, or cut
+//! anywhere. A reader of a number in this dir reads a cut one as a prefix, a
+//! LOWER number, which every such file tolerates (the table), and an empty one
+//! as absent. But the readers of the in-flight journal, the reservations and
+//! the refill floors ([`TornKind`]) REFUSE damage, fail-closed, because within
+//! one boot damage is a bug: refused at every attach of every later boot, a torn
+//! one wedged the bridge until a person repaired the dir (the simulation's
+//! finding F1) — while every one of them serves only sessions, which a reboot
+//! ends, so the table calls losing it, after one, harmless (the rows marked
+//! TORN). And a cut can READ: an in-flight entry cut just before its `log=`
+//! line, or inside its hex body at an even length, is an entry with no witness
+//! (a reply's, an unwitnessed reference the attach refuses for good).
+//!
+//! So the first bridge after an UNCLEAN STOP IN AN EARLIER BOOT — the durable
+//! `run` record says the last bridge did not stop cleanly, in a boot the kernel
+//! no longer runs ([`StateDir::torn_files_possible`], astream's own rule for its
+//! weak tiers) — moves every file of those kinds that is not provably whole into
+//! `quarantine/`, with its exact bytes, durably, before it unlinks it, and goes
+//! on as if it were lost ([`StateDir::set_aside_torn`]). Provably whole: it ends
+//! at the newline its writer ends it with, its reader takes it, and, in flight,
+//! it names the log it was decided on (a cut anywhere short of the last byte
+//! fails one of the three). Never deleted: what was moved is the owner's to read
+//! or put back, and the bridge says where each went. Within one boot, on any
+//! volume, and after a clean stop (whose every such file was flushed,
+//! [`StateDir::end_run_clean`]), damage is refused as it always was.
+//!
+//! The other files cannot wedge torn: `node`, `inc`, `pins`, `halts`,
+//! `rewound-log`, `run` and `quarantine/` are durable (on the media before
+//! anything rests on them), and every other reader takes an empty file as
+//! absent and a cut number as a lower one — `inc-lease` as no lease (the attach
+//! leases afresh), `seq` as a lower one the durable `inc` fences, `acked`'s torn
+//! tail as no offset ([`AckedLog`]) — save `logpin`, which holds what no reboot
+//! ends (the node's alias key, ruling Q6, and its lifetime mirrored total,
+//! ruling Q13): a pin that does not read, a cut one included
+//! ([`crate::mirror::Pin::parse`]), stops the mirror and stays where it is,
+//! never set aside.
+//!
+//! ## An in-flight entry a power cut brought back
+//!
+//! A power cut does not only tear: it can roll back an unlink nothing flushed,
+//! and the entry of an own-lane record that LANDED comes back
+//! ([`StateDir::clear_in_flight`]). Republished by the next attach, it is
+//! deduped where the log still holds the record — but where the log, on
+//! another volume or after a lossy flush, lost the record on its own (the law
+//! lets it lose an unescalated one) and the sender's later posts landed after,
+//! it lands again BEHIND them: the sender's posts out of order (the
+//! simulation's finding F2). Nothing in the dir or on the log tells that entry
+//! from one whose record never landed (a read carries no producer sequence;
+//! the same cut rolls the later post's reservation back), and nothing needs
+//! either: the sessions they serve ended with the boot. So the same first
+//! bridge, after the torn sweep, RETIRES every whole in-flight entry into the
+//! quarantine as `retired.inflight.<seq>`, never publishing it again
+//! ([`StateDir::retire_in_flight_of_an_earlier_boot`]). Within one boot, and
+//! after a clean stop, the republish keeps the order, and stays — except
+//! where the state dir's volume alone lost power and came back within the
+//! boot, which nothing tells from a kill and which is not covered. No attach
+//! goes on while `run` still names an earlier boot's unclean stop (the disk
+//! refused this boot's [`StateDir::begin_run`]), so a boot's own entries are
+//! never retired.
+//!
 //! Offsets name records in one log. `seen/`, `topics/`, `unhandled/`, `acked`,
 //! `halt-acked`, `inbox-owed`, `deadlines`, `asked` and the `original-off` of `keys/`
 //! and `sent/` hold bus offsets, each meaningless on another log, as is an `inflight/` record's
@@ -153,20 +217,23 @@
 //! | `seq` | atomic | the last producer sequence of the newest reserved BLOCK, written before any number of the block is used ([`StateDir::reserve_sequence_block`]) | a `kill -9` skips the block's unused rest and reuses none; after a power loss, no dup either: the incarnation moved, and every sequence of `inc+1` is above `inc`'s reserved top |
 //! | `seen/<sid>` | atomic | where the session's addressed refill starts after: the endpoint's reported floor minus one ([`StateDir::seen_off`]) | the refill starts lower and the ring dedups on `off=` |
 //! | `acked` | append | the offsets with a `PublishAck` on this node's own lanes, each ended by its comma, one appended per own-lane publish, in one `write`, and compacted to the newest `keep` at twice that ([`AckedLog`]) | the self-lane check gets more conservative, never less |
-//! | `inflight/<seq>` | atomic | one record bound for this node's own lanes and the log it was decided on, from before its publish until `acked` holds its offset ([`StateDir::in_flight`]) | the attach cannot re-learn an offset a kill left out of `acked`, and the self-lane check accuses that one record of ours |
+//! | `inflight/<seq>` | atomic | one record bound for this node's own lanes and the log it was decided on, from before its publish until `acked` holds its offset ([`StateDir::in_flight`]) | the attach cannot re-learn an offset a kill left out of `acked`, and the self-lane check accuses that one record of ours; after a reboot, nothing: the record's session is gone, and the not-hosted gate runs before the self-lane check. TORN, set aside; whole after an unclean stop in an earlier boot, RETIRED unpublished ([`StateDir::retire_in_flight_of_an_earlier_boot`]) |
 //! | `pins` | durable | the TOFU `sid → node` map, newest [`PINS_KEEP`] | a re-pin on next sight, the TOFU rule anyway |
 //! | `halt-acked` | atomic | the highest fleet-halt offset this node has answered | a re-ack of an answered barrier: one extra retained row |
 //! | `inbox-owed` | atomic | the inbox-group commit a bridge owed when it exited with no broker connection to make it on, every record at or below it accounted for ([`StateDir::inbox_owed`]); removed once the next attach commits it | the group offers those records again, and an endpoint that no longer remembers their offsets (an update's successor) lists them as new |
 //! | `bus-log` | atomic | the identity of the log this node reads and the highest broker head seen there ([`LogWitness`]) | a replaced log is judged by its head alone until the next attach records the identity; the halts do not rest on it |
 //! | `rewound-log` | durable | one known identity whose head this node saw go backwards | regrowth cannot make its reused offsets trustworthy; only a different known log releases the refusal |
 //! | `halts` | durable | the fleet halts this node holds in force ([`StandingHalt`]) | the attach re-reads them from the bus; only one whose row the bus lost goes with it |
-//! | `sent/<sid>.<id>` | atomic | the sequence reserved for one queued post, its publication identity, and whether a `key=` entry chose it, one line an older bridge reads too | load-bearing: a fresh sequence is a second copy |
-//! | `keys/<sid>` | atomic | `post key=` → its reserved sequence, newest [`KEYS_KEEP`] per session | a re-post under a lost key is a second record |
-//! | `acks/<sid>.<rid>` | atomic | the sequence reserved for one owed receipt (R8), removed at retirement | a fresh sequence is a second `ack` after a crash between publish and retirement |
+//! | `sent/<sid>.<id>` | atomic | the sequence reserved for one queued post, its publication identity, and whether a `key=` entry chose it, one line an older bridge reads too | load-bearing: a fresh sequence is a second copy — within one boot; after a reboot aterm's outbox is gone with its sessions, and nothing reads it. TORN, set aside |
+//! | `keys/<sid>` | atomic | `post key=` → its reserved sequence, newest [`KEYS_KEEP`] per session | a re-post under a lost key is a second record — within one boot; after a reboot its session is gone. TORN, set aside |
+//! | `acks/<sid>.<rid>` | atomic | the sequence reserved for one owed receipt (R8), removed at retirement | a fresh sequence is a second `ack` after a crash between publish and retirement — within one boot; after a reboot the receipt is gone with aterm's memory. TORN, set aside |
 //! | `asked` | atomic | the recipient of each `ask`/`task` this node published, newest [`ASKED_KEEP`] | a reply to a forgotten ask is judged without its recipient (a deadline's `to` still counts) |
 //! | `deadlines` | atomic | each `ask`/`task` published with `dl=` and not yet answered, newest [`DEADLINES_KEEP`] | no `expired` for those asks; the bus is checked before any verdict, so never a false one |
 //! | `topics/<sid>` | atomic | `<topic> <next>` per broadcast opt-in ([`StateDir::topics`]) | the topic restarts from the session's `since=`, and `head` skips what was published meanwhile, so it is written every step |
-//! | `unhandled/<sid>` | atomic | `<topic> <off>`: per topic, the lowest offset of a broadcast the endpoint took as new and `inbox seen` has not passed, written before the cursor moves past it ([`StateDir::topic_floors`]) | a successor that keeps the sid (a seamless update, a PTY keeper's recovery) is not offered those broadcasts again, though they are gone from its inbox |
+//! | `unhandled/<sid>` | atomic | `<topic> <off>`: per topic, the lowest offset of a broadcast the endpoint took as new and `inbox seen` has not passed, written before the cursor moves past it ([`StateDir::topic_floors`]) | a successor that keeps the sid (a seamless update, a PTY keeper's recovery) is not offered those broadcasts again, though they are gone from its inbox; no successor keeps a sid across a reboot. TORN, set aside |
+//! | `logpin` | atomic | the bus mirror's one batch in flight, the node's total of mirrored bytes and its alias key ([`StateDir::logpin`]); only with `[fabric] log = "turns"` | an older whole version: one batch taken again at fresh sequences, a second copy each reader dedupes, and a lower total. Torn: the key and the total have no other copy, so the mirror stops and keeps it as it is (rulings Q6, Q13); never set aside |
+//! | `run` | durable | the boot the last bridge ran in and whether it stopped cleanly, every file of a [`TornKind`] it wrote flushed first ([`LastRun`]): written once per boot by the first bridge, after its sweep, and at a clean stop | a dir without one is judged by its lease's boot, as a build before it was; a torn file found after a stop it cannot call unclean is refused where it is read |
+//! | `quarantine/` | durable | the exact bytes of each file found torn after an unclean stop in an earlier boot, moved aside by the first bridge after it ([`StateDir::set_aside_torn`], [`QUARANTINE`]), and of each whole in-flight entry it retired then, as `retired.inflight.<seq>` ([`StateDir::retire_in_flight_of_an_earlier_boot`]) | nothing reads it: it is the owner's, to read or remove |
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -527,20 +594,38 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// The reserved top of an incarnation's sequence space: the will's sequence, so no
-/// ordinary publish of that incarnation can collide with it (§7).
-pub const WILL_SEQ_LOW: u64 = 0xFFFF_FFFF;
+/// THE INCARNATION LAYOUT IS ASTREAM'S: incarnation `inc` owns the producer
+/// sequences [`astream_broker::incarnation_base`]`(inc)` (`inc << 32`) through
+/// [`astream_broker::will_seq`]`(inc)` (`(inc << 32) | WILL_SEQ_LOW`), its ordinary
+/// publishes strictly between the two and its will at the top, so no ordinary
+/// publish of an incarnation collides with its will and every sequence of the next
+/// is above it (§7). astream exports the layout beside the will fence it serves, and
+/// states there the producer obligation the fence rests on (`Request::Will`): a new
+/// incarnation's sequences above every one ever presented, and the incarnation
+/// flushed before its will is registered. The layout meets the first clause by
+/// construction; the second, and the counter that hands incarnations out, stay this
+/// state dir's (the module doc's "The incarnation lease",
+/// [`StateDir::take_incarnation`], [`StateDir::reserve_sequence_block`]).
+///
+/// The values were this file's before they were astream's, and they are a
+/// PERSISTENCE CONTRACT: `seq` and `inc` hold numbers in this layout, so a changed
+/// value would let an upgraded bridge present a sequence its older build already
+/// presented. [`WILL_SEQ_LOW`] is the will's low word; [`INC_MAX`] the highest
+/// incarnation a node may run under, the last whose will sits below astream's
+/// reserved ack half ([`astream_broker::ACK_SEQ_BASE`]), where a will is refused
+/// (`SeqReserved`) and an ordinary publish is the caller's to keep out
+/// (`Client::publish`'s contract). Nothing above it is adopted, persisted or reserved
+/// under, and astream's `incarnation_base` and `will_seq` answer `None` there.
+pub use astream_broker::{INC_MAX, WILL_SEQ_LOW};
 
-/// The highest incarnation a node may run under: the last whose will,
-/// `(inc << 32) | WILL_SEQ_LOW`, sits below astream's reserved ack half
-/// ([`astream_broker::ACK_SEQ_BASE`]), where a will is refused (`SeqReserved`) and an
-/// ordinary publish is the caller's to keep out (`Client::publish`'s contract).
-/// Nothing above it is adopted, persisted or reserved under.
-pub const INC_MAX: u64 = (astream_broker::ACK_SEQ_BASE >> 32) - 1;
-// The will's sequence of INC_MAX is below the reserved half and the next
-// incarnation's is not. `+`, which is `|` here: `inc << 32` has no low bits.
-const _: () = assert!((INC_MAX << 32) + WILL_SEQ_LOW < astream_broker::ACK_SEQ_BASE);
-const _: () = assert!(((INC_MAX + 1) << 32) + WILL_SEQ_LOW >= astream_broker::ACK_SEQ_BASE);
+/// The incarnation `seq`, a number this state dir stored as its own, belongs to
+/// ([`astream_broker::incarnation_of`]). A number in astream's reserved ack half is
+/// no incarnation's: it is a corrupt `seq`, never incarnation 0, so it answers
+/// `u64::MAX` — past [`INC_MAX`], where every take and reservation refuses, by name,
+/// rather than hand out sequences the node already presented.
+fn incarnation_of_seq(seq: u64) -> u64 {
+    astream_broker::incarnation_of(seq).unwrap_or(u64::MAX)
+}
 
 /// How many incarnations one flushed write of `inc` covers (the module doc's "The
 /// incarnation lease"): the attaches of one boot pay one flush per lease instead of
@@ -712,36 +797,17 @@ pub(crate) fn plan_incarnation(
 
 /// Whether `dir` shares a device with the boot volume: the device that loses power
 /// only together with the kernel, so a page cache that has run throughout this boot
-/// still holds every write made to it. astream's weak tiers ask the same question of
-/// their log FILE's own device, never its directory's, so a log symlinked onto another
-/// volume is judged where it lives. That predicate is public
-/// (`astream_broker::on_boot_volume`, over an open `File`; a directory opened as one
-/// answers for the files written in it), and this copy is to give way to it. Off the
-/// boot volume, a removable or network disk can vanish while the kernel runs and take
-/// an unflushed write with it, so no lease written there is trusted.
-#[cfg(unix)]
+/// still holds every write made to it. ASTREAM'S PREDICATE
+/// ([`astream_broker::on_boot_volume`]), the one its weak tiers judge their log by,
+/// asked of the directory opened as a file (which answers for the files written in
+/// it), so a lease is trusted exactly where astream trusts a weak log's page cache:
+/// the device of what was opened, following links, and `false` wherever that cannot
+/// be read and off Unix, the safe direction (a wrong `false` costs a flush, a wrong
+/// `true` would trust a write the disk may have lost). Off the boot volume, a
+/// removable or network disk can vanish while the kernel runs and take an unflushed
+/// write with it, so no lease written there is trusted.
 fn on_boot_volume(dir: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(here) = std::fs::metadata(dir) else {
-        return false;
-    };
-    // APFS splits the boot volume into the read-only system volume (`/`) and the
-    // data volume (`/System/Volumes/Data`, where `~` lives); both sit on the one
-    // internal device.
-    let roots: &[&str] = if cfg!(target_vendor = "apple") {
-        &["/", "/System/Volumes/Data"]
-    } else {
-        &["/"]
-    };
-    roots
-        .iter()
-        .any(|r| std::fs::metadata(r).is_ok_and(|m| m.dev() == here.dev()))
-}
-
-/// No device to compare: never the boot volume, so never a trusted lease.
-#[cfg(not(unix))]
-fn on_boot_volume(_dir: &Path) -> bool {
-    false
+    std::fs::File::open(dir).is_ok_and(|opened| astream_broker::on_boot_volume(&opened))
 }
 
 /// The points of [`StateDir::take_incarnation`] a test can kill it at
@@ -764,8 +830,11 @@ pub(crate) enum IncStep {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IncSeam {
     /// This boot, as the walk stands it in: `Some(None)` is a boot the kernel cannot
-    /// name (or a dir off the boot volume); `None` asks the kernel.
+    /// name; `None` asks the kernel.
     pub boot: Option<Option<[u8; 16]>>,
+    /// The dir stands OFF THE BOOT VOLUME: the kernel names `boot`, but the page
+    /// cache cannot vouch for the dir ([`StateDir::trusted_boot`] is `None`).
+    pub off_volume: bool,
     /// The step the next take dies at.
     pub kill_at: Option<IncStep>,
     /// One defect, the walk's negative controls (the model's `Buggy`): 0 none; 1 a
@@ -784,12 +853,21 @@ pub struct StateDir {
     /// THE DOOR every write of this dir goes through ([`crate::fx::Disk`]): the
     /// filesystem as it always was, or a simulated device that can lose power.
     disk: crate::fx::Disk,
+    /// The files of a [`TornKind`] this process wrote without a flush — and,
+    /// when the last bridge of this boot did not stop cleanly, every one there
+    /// ([`StateDir::begin_run`]) — by path inside the dir: what a clean stop
+    /// flushes before it says it stopped cleanly ([`StateDir::end_run_clean`]).
+    unflushed: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// TEST-ONLY: what this dir's writers did to the filesystem ([`FileOps`]).
     #[cfg(test)]
     ops: std::sync::Mutex<FileOps>,
     /// TEST-ONLY: the incarnation take's boot, kill point and defect ([`IncSeam`]).
     #[cfg(test)]
     inc_seam: std::sync::Mutex<IncSeam>,
+    /// TEST-ONLY: the one file whose replaces fail as a full disk fails them
+    /// ([`StateDir::refuse_writes_of`]).
+    #[cfg(test)]
+    refused: std::sync::Mutex<Option<String>>,
 }
 
 /// The filesystem operations one [`StateDir`] made, by kind (counted only in a
@@ -945,6 +1023,57 @@ impl PublishPin {
     }
 }
 
+/// One non-blank line of a `keys/<sid>` file: the key, then its reservation.
+fn key_line(line: &str) -> io::Result<(&str, PublishPin)> {
+    let (key, reservation) = line
+        .split_once(char::is_whitespace)
+        .filter(|(key, _)| !key.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid publication key"))?;
+    Ok((key, PublishPin::parse(reservation)?))
+}
+
+/// One session's refill floors file ([`StateDir::topic_floors`]) read back from
+/// `body`, the file at `path`: empty, or any line that is not one unique topic and
+/// offset, is damage.
+fn parse_topic_floors(path: &Path, body: &str) -> io::Result<BTreeMap<String, u64>> {
+    if body.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty broadcast refill floor file",
+        ));
+    }
+    let mut out = BTreeMap::new();
+    for line in body.lines() {
+        let mut words = line.split_whitespace();
+        let topic = words.next().filter(|t| crate::subject::is_topic(t));
+        let off = words
+            .next()
+            .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|w| w.parse::<u64>().ok());
+        match (topic, off, words.next()) {
+            (Some(topic), Some(off), None) => {
+                if out.insert(topic.to_string(), off).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "duplicate broadcast refill topic",
+                    ));
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: `{}` is not a broadcast refill floor",
+                        path.display(),
+                        safe_line(line)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// A face a reservation may publish on: absolute, printable, no wildcard.
 fn is_face(subject: &str) -> bool {
     subject.starts_with('/')
@@ -1069,6 +1198,173 @@ impl AckedLog {
     }
 }
 
+/// A KIND OF FILE A POWER CUT MAY TEAR AND THE NEXT BOOT MAY SET ASIDE
+/// ([`StateDir::set_aside_torn`]): written atomically and never flushed (but
+/// at a clean stop, [`StateDir::end_run_clean`]), read back by a reader that
+/// REFUSES damage rather than read it as nothing, and serving only sessions,
+/// which a reboot ends: every sid is minted afresh at aterm's launch, and the
+/// outbox, the owed receipts and the rings live in aterm's memory. The module
+/// doc's table says what losing each costs; after a reboot, nothing a later
+/// boot reads. (`logpin` is not one: what it holds outlives a reboot.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TornKind {
+    /// `inflight/<seq>` ([`StateDir::in_flight`]).
+    InFlight,
+    /// `sent/<sid>.<id>` ([`StateDir::post_pin`]).
+    Sent,
+    /// `acks/<sid>.<rid>` ([`StateDir::receipt_pin`]).
+    Acks,
+    /// `keys/<sid>` ([`StateDir::key_pin`]).
+    Keys,
+    /// `unhandled/<sid>` ([`StateDir::topic_floors`]).
+    Unhandled,
+}
+
+impl TornKind {
+    /// Every kind, in the order a sweep visits them.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::InFlight,
+        Self::Sent,
+        Self::Acks,
+        Self::Keys,
+        Self::Unhandled,
+    ];
+
+    /// The directory its files are entries of.
+    const fn place(self) -> &'static str {
+        match self {
+            Self::InFlight => "inflight",
+            Self::Sent => "sent",
+            Self::Acks => "acks",
+            Self::Keys => "keys",
+            Self::Unhandled => "unhandled",
+        }
+    }
+
+    /// The kind whose file `rel` (a path inside the dir) is, if it is one.
+    fn of(rel: &str) -> Option<Self> {
+        let (place, name) = rel.split_once('/')?;
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.place() == place && kind.names(name))
+    }
+
+    /// Whether `text`, the file `rel` of this kind, is PROVABLY WHOLE: it ends
+    /// at the newline every writer of the kind ends it with
+    /// ([`StateDir::replace`]), its own reader takes it — the reader's parse,
+    /// so nothing it would refuse is ever whole — and, in flight, it names the
+    /// log it was decided on. A cut anywhere short of the last byte fails one
+    /// of the three: the newline is the last byte, a single-line file cut
+    /// short has none, and the cuts of an in-flight entry that end at a
+    /// newline (just before its `log=` line, or after its face) or that still
+    /// decode (inside the hex body at an even length) leave no witness. A
+    /// whole entry with no witness is written only under a broker that names
+    /// no log, and serves nothing after a reboot either. A multi-line
+    /// `keys/` or `unhandled/` file cut at a line's end reads whole, with
+    /// fewer lines: what a reboot ended anyway.
+    fn whole(self, rel: &Path, name: &str, text: &str) -> bool {
+        text.ends_with('\n')
+            && match self {
+                Self::InFlight => Self::entry(name, text).is_some_and(|entry| entry.log.is_some()),
+                _ => self.reads(rel, name, text),
+            }
+    }
+
+    /// Whether its own reader takes `text`, the file `rel` of this kind: the
+    /// reader's parse and nothing more — what a sweep that trusted the reader
+    /// alone called whole, a cut that still reads included (the simulation's
+    /// negative control, `Mutant::SweepByTheReaderAlone`).
+    fn reads(self, rel: &Path, name: &str, text: &str) -> bool {
+        match self {
+            Self::InFlight => Self::entry(name, text).is_some(),
+            Self::Sent | Self::Acks => PublishPin::parse(text).is_ok(),
+            Self::Keys => text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .all(|line| key_line(line).is_ok()),
+            Self::Unhandled => parse_topic_floors(rel, text).is_ok(),
+        }
+    }
+
+    /// The in-flight entry `name` holds, read as [`StateDir::in_flight`] reads it.
+    fn entry(name: &str, text: &str) -> Option<InFlight> {
+        name.parse().ok().and_then(|seq| InFlight::parse(seq, text))
+    }
+
+    /// Whether `name`, an entry of this kind's directory, is one of its files: a
+    /// writer's hidden temp (`.<name>.tmp.…`) never is, and an `inflight/` entry
+    /// is a sequence number ([`StateDir::in_flight`]'s own rule).
+    fn names(self, name: &str) -> bool {
+        !name.is_empty()
+            && !name.contains('/')
+            && !name.starts_with('.')
+            && (self != Self::InFlight || name.bytes().all(|b| b.is_ascii_digit()))
+    }
+}
+
+/// HOW THE LAST BRIDGE OF THIS DIR STOPPED, AND IN WHICH BOOT (`run`, durable):
+/// what tells the first bridge of a boot whether a power cut can have torn a
+/// file of a [`TornKind`] ([`StateDir::torn_files_possible`]) — astream's own
+/// unclean-stop rule for its weak tiers (`astream_broker::Durability::Relaxed`:
+/// a run that did not close cleanly, judged in another boot).
+///
+/// `open boot=<id>` from the first start in a boot (written after the sweep,
+/// before any file of those kinds), `clean boot=<id>` once a bridge has
+/// flushed every such file it or a predecessor of this boot wrote and stops
+/// ([`StateDir::end_run_clean`]); `-` for a boot the kernel does not name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LastRun {
+    /// The boot it ran in, as the kernel names it.
+    pub boot: Option<[u8; 16]>,
+    /// Whether it stopped cleanly, every file of a [`TornKind`] on the media.
+    pub clean: bool,
+}
+
+impl LastRun {
+    /// The one line it is stored as.
+    fn render(&self) -> String {
+        let boot = self
+            .boot
+            .map_or_else(|| "-".to_string(), |b| aterm_codec::hex::encode_lower(&b));
+        let state = if self.clean { "clean" } else { "open" };
+        format!("{state} boot={boot}")
+    }
+
+    /// Parse one back: `open` or `clean`, then `boot=` and a boot id or `-`.
+    /// Anything else — a hand-edited file — is `None`; the reader refuses
+    /// such a record rather than treating it as an older build's missing one.
+    fn parse(text: &str) -> Option<Self> {
+        let mut words = text.split_whitespace();
+        let clean = match words.next()? {
+            "open" => false,
+            "clean" => true,
+            _ => return None,
+        };
+        let boot = match words.next()?.strip_prefix("boot=")? {
+            "-" => None,
+            id => Some(astream_sys::parse_boot_id(id.as_bytes())?),
+        };
+        words.next().is_none().then_some(Self { boot, clean })
+    }
+}
+
+/// One damaged file [`StateDir::set_aside_torn`] moved aside: where it was and
+/// where its bytes are now, both relative to the state dir.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SetAside {
+    pub from: String,
+    pub to: String,
+}
+
+/// Where [`StateDir::set_aside_torn`] keeps what it moves aside, inside the dir.
+pub const QUARANTINE: &str = "quarantine";
+
+/// What a whole in-flight entry retired after an unclean stop in an earlier
+/// boot ([`StateDir::retire_in_flight_of_an_earlier_boot`], finding F2) is
+/// named with in [`QUARANTINE`], before its path: `retired.inflight.<seq>`.
+/// A torn file's name there starts with its kind's directory, never this.
+pub const RETIRED_PREFIX: &str = "retired.";
+
 /// [`StateDir::lock_bridge`]'s hold, released by `LOCK_UN` before the close
 /// (`clippy.toml`'s flock release rule): a child forked while it is held keeps the
 /// descriptor until it execs, so a release by the close alone would leave the lock
@@ -1112,10 +1408,13 @@ impl StateDir {
         Self {
             root,
             disk,
+            unflushed: std::sync::Mutex::default(),
             #[cfg(test)]
             ops: std::sync::Mutex::default(),
             #[cfg(test)]
             inc_seam: std::sync::Mutex::default(),
+            #[cfg(test)]
+            refused: std::sync::Mutex::default(),
         }
     }
 
@@ -1129,6 +1428,29 @@ impl StateDir {
     #[cfg(test)]
     pub(crate) fn set_inc_seam(&self, seam: IncSeam) {
         *self.inc_seam.lock().unwrap_or_else(|e| e.into_inner()) = seam;
+    }
+
+    /// TEST-ONLY: every replace of `name` (a path inside the dir) fails from
+    /// now on as a full disk fails it, before anything is written; `None`
+    /// lifts it. The simulated device refuses only a dead process's writes
+    /// ([`crate::fx::Disk::before`]); this is one the disk itself refuses.
+    #[cfg(test)]
+    pub(crate) fn refuse_writes_of(&self, name: Option<&str>) {
+        *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = name.map(str::to_string);
+    }
+
+    /// TEST-ONLY: the full disk's error for a replace of `name` a test
+    /// refuses ([`StateDir::refuse_writes_of`]); `Ok` for every other.
+    #[cfg(test)]
+    fn refused_by_a_test(&self, name: &str) -> io::Result<()> {
+        let refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
+        if refused.as_deref() == Some(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("{name}: no space left on device (a test's refusal)"),
+            ));
+        }
+        Ok(())
     }
 
     /// TEST-ONLY: the incarnation take's stand-ins as they are now.
@@ -1385,16 +1707,7 @@ impl StateDir {
                             lines.push(line.to_string());
                             continue;
                         }
-                        let (key, reservation) = line
-                            .split_once(char::is_whitespace)
-                            .filter(|(key, _)| !key.is_empty())
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "invalid publication key",
-                                )
-                            })?;
-                        let mut pin = PublishPin::parse(reservation)?;
+                        let (key, mut pin) = key_line(line)?;
                         if reset(&mut pin) {
                             changed = true;
                             lines.push(format!("{key} {}", pin.render()));
@@ -1462,6 +1775,8 @@ impl StateDir {
     /// write's own, so nothing can read it half written, and a second `write`
     /// for the newline was one more system call on every replace.
     fn replace_bytes(&self, name: &str, bytes: &[u8], durable: bool, mode: u32) -> io::Result<()> {
+        #[cfg(test)]
+        self.refused_by_a_test(name)?;
         let target = self.path(name);
         let parent = target.parent().unwrap_or(&self.root);
         let w = crate::fx::Write::Replace {
@@ -1502,6 +1817,16 @@ impl StateDir {
             }
         }
         self.disk.after(w);
+        // A file of a [`TornKind`] left unflushed is one a clean stop flushes
+        // ([`StateDir::end_run_clean`]); a durable replace has flushed it.
+        if TornKind::of(name).is_some() {
+            let mut unflushed = self.unflushed.lock().unwrap_or_else(|e| e.into_inner());
+            if durable {
+                unflushed.remove(name);
+            } else {
+                unflushed.insert(name.to_string());
+            }
+        }
         Ok(())
     }
 
@@ -1618,7 +1943,7 @@ impl StateDir {
     #[must_use]
     pub fn incarnation(&self) -> u64 {
         let used = self.lease().map_or(0, |lease| lease.used);
-        used.max(self.sequence() >> 32)
+        used.max(incarnation_of_seq(self.sequence()))
     }
 
     /// What `inc` holds: the top of the incarnation lease, at or above every
@@ -1663,10 +1988,25 @@ impl StateDir {
     /// never judge the page cache by different boots.
     pub(crate) fn trusted_boot(&self) -> Option<[u8; 16]> {
         #[cfg(test)]
+        {
+            let seam = self.inc_seam();
+            if let Some(boot) = seam.boot {
+                return boot.filter(|_| !seam.off_volume);
+            }
+        }
+        crate::durability::this_boot().filter(|_| on_boot_volume(&self.root))
+    }
+
+    /// This boot as the kernel names it, ON ANY VOLUME — the broker's own
+    /// ([`crate::durability::this_boot`]): what the `run` record names
+    /// ([`LastRun`]). Unlike [`StateDir::trusted_boot`] it vouches for no page
+    /// cache; it only tells this boot from another.
+    fn kernel_boot(&self) -> Option<[u8; 16]> {
+        #[cfg(test)]
         if let Some(boot) = self.inc_seam().boot {
             return boot;
         }
-        crate::durability::this_boot().filter(|_| on_boot_volume(&self.root))
+        crate::durability::this_boot()
     }
 
     /// TAKE THE INCARNATION AN ATTACH RUNS UNDER, before its will is registered: one
@@ -1695,7 +2035,7 @@ impl StateDir {
     pub fn take_incarnation(&self, bus: u64) -> io::Result<u64> {
         let (top, file) = (self.incarnation_top(), self.inc_file());
         let boot = self.trusted_boot();
-        let (lease, seq_inc, span) = (self.lease(), self.sequence() >> 32, INC_LEASE);
+        let (lease, seq_inc, span) = (self.lease(), incarnation_of_seq(self.sequence()), INC_LEASE);
         #[cfg(test)]
         let (lease, span) = {
             let seam = self.inc_seam();
@@ -1778,10 +2118,11 @@ impl StateDir {
     /// always was (the module doc): the next attach takes `inc + 1`, whose every
     /// number is above anything a rolled-back file could name.
     ///
-    /// Clamped below the incarnation's reserved top ([`WILL_SEQ_LOW`], the will's
-    /// own number), so a block near the top is shorter rather than refused; one
-    /// that would start at the top is refused, as is an incarnation past
-    /// [`INC_MAX`]. A read-add-write of one file, so only the holder of
+    /// Clamped below the incarnation's reserved top (astream's
+    /// [`astream_broker::will_seq`], the will's own number), so a block near the
+    /// top is shorter rather than refused; one that would start at the top is
+    /// refused, as is an incarnation past [`INC_MAX`], where astream's layout has
+    /// no space. A read-add-write of one file, so only the holder of
     /// [`StateDir::lock_bridge`] calls it.
     ///
     /// # Errors
@@ -1793,13 +2134,17 @@ impl StateDir {
         inc: u64,
         want: u64,
     ) -> io::Result<std::ops::RangeInclusive<u64>> {
-        if inc > INC_MAX {
+        // astream's layout, checked rather than shifted: `inc << 32` drops the
+        // high bits, so an unchecked incarnation 2^32 would be incarnation 0's
+        // space again.
+        let (Some(base), Some(top)) = (
+            astream_broker::incarnation_base(inc),
+            astream_broker::will_seq(inc),
+        ) else {
             return Err(io::Error::other(format!(
                 "incarnation {inc} is past this node's incarnation space ({INC_MAX})"
             )));
-        }
-        let base = inc << 32;
-        let top = base | WILL_SEQ_LOW;
+        };
         let first = self
             .sequence()
             .max(base)
@@ -2027,11 +2372,13 @@ impl StateDir {
 
     /// Forget the in-flight record at `seq`: it landed and `acked` holds its offset.
     ///
-    /// Atomic only, as the entry itself is: an unlink a power cut rolls back brings
-    /// the entry back, and the next attach publishes it again at its sequence, which
-    /// the broker dedups to the offset it already has (or, where the cut took the
-    /// record too, lands the record the bridge had decided to publish, once). A
-    /// record that did NOT land is dropped durably ([`StateDir::drop_in_flight`]).
+    /// Atomic only, as the entry itself is, so no flush is spent per message: an
+    /// unlink a power cut rolls back brings the entry back, and the first bridge
+    /// of the next boot retires it unpublished
+    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]) — published again, it
+    /// landed behind its sender's later posts wherever the log had lost the
+    /// record on its own (finding F2). A record that did NOT land is dropped
+    /// durably ([`StateDir::drop_in_flight`]).
     pub(crate) fn clear_in_flight(&self, seq: u64) {
         let _ = self.unlink(&format!("inflight/{seq}"));
     }
@@ -2041,9 +2388,12 @@ impl StateDir {
     /// — or it was decided on another log and is not published on this one. The
     /// unlink is flushed (the `inflight/` directory), because what the bridge does
     /// next says so to somebody: a post retired `off=-`, a receipt `unacked`, a
-    /// sender told its post did not go. Brought back by a power cut, the entry would
-    /// be published by the next attach after all — after the sender's later posts,
-    /// and on the lane of a session that may have left. One directory flush, spent
+    /// sender told its post did not go. Brought back by a power cut, the entry was
+    /// published by the next attach after all — after the sender's later posts,
+    /// and on the lane of a session that may have left. (The next boot's first
+    /// bridge now retires whatever a cut brings back,
+    /// [`StateDir::retire_in_flight_of_an_earlier_boot`]; the flush still keeps
+    /// the drop where nothing marks the stop unclean.) One directory flush, spent
     /// only on a refusal or a move of the log, never per message.
     ///
     /// # Errors
@@ -2065,6 +2415,528 @@ impl StateDir {
         self.count(|ops| ops.fsyncs += 1);
         sync_dir(dir)?;
         self.disk.after(w);
+        Ok(())
+    }
+
+    /// How the last bridge of this dir stopped, and in which boot (`run`,
+    /// [`LastRun`]); `None` only for a genuinely missing record (a build
+    /// before it). An unreadable, damaged or nonregular occupant is refused.
+    pub(crate) fn last_run(&self) -> io::Result<Option<LastRun>> {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = self.path("run");
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return match std::fs::symlink_metadata(&path) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(other) => Err(other),
+                    Ok(_) => Err(e),
+                };
+            }
+            Err(e) => return Err(e),
+        };
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "invalid bridge run record");
+        if !file.metadata()?.is_file() {
+            return Err(bad());
+        }
+        let mut text = String::new();
+        file.take(128).read_to_string(&mut text)?;
+        if text.len() >= 128 {
+            return Err(bad());
+        }
+        LastRun::parse(&text).map(Some).ok_or_else(bad)
+    }
+
+    /// WHETHER A POWER CUT CAN HAVE TORN A FILE OF A [`TornKind`] since the
+    /// last bridge wrote one: that bridge did NOT STOP CLEANLY, and it ran in a
+    /// boot the kernel no longer runs — astream's own unclean-stop rule for its
+    /// weak tiers (a run that did not close cleanly, judged in another boot).
+    /// Read off the durable `run` record ([`LastRun`]); a dir without one (a
+    /// build before it) by its incarnation lease's boot, which names one only
+    /// for a dir on the boot volume ([`StateDir::trusted_boot`]).
+    ///
+    /// `false` within one boot ON ANY VOLUME — a kill, a crash, a disk that
+    /// dropped out and came back: the sessions those files serve are alive,
+    /// and damage there is a bug, refused where it is read (a reservation set
+    /// aside would publish its post again, a second copy). `false` after a
+    /// CLEAN STOP, which flushed every such file before it said so
+    /// ([`StateDir::end_run_clean`]): nothing a reboot keeps is torn, and
+    /// damage is a bug's. And `false` where the kernel names no boot, now or
+    /// then: no evidence of a reboot is no sweep — fail-closed, the safe
+    /// direction here as a flush is astream's.
+    pub(crate) fn torn_files_possible(&self) -> io::Result<bool> {
+        let last = self.last_run()?;
+        let Some(now) = self.kernel_boot() else {
+            return Ok(false);
+        };
+        Ok(match last {
+            Some(run) => !run.clean && run.boot.is_some_and(|then| then != now),
+            None => self
+                .lease()
+                .and_then(|lease| lease.boot)
+                .is_some_and(|then| then != now),
+        })
+    }
+
+    /// WHETHER AN ATTACH RAN IN THIS BOOT, as far as the incarnation lease
+    /// says: every attach writes it, naming the boot it was taken in where the
+    /// page cache vouches for the dir ([`StateDir::take_incarnation`],
+    /// [`StateDir::trusted_boot`]). `false` off the boot volume, where it
+    /// names none, and before the first attach of a boot, whose lease an
+    /// earlier boot wrote.
+    fn attached_in_this_boot(&self) -> bool {
+        self.trusted_boot()
+            .is_some_and(|now| self.lease().and_then(|lease| lease.boot) == Some(now))
+    }
+
+    /// A swept-kind parent must be a real directory. In particular a planted
+    /// directory link must never lend external files to the sweep or clean close.
+    fn torn_kind_dir(&self, kind: TornKind) -> io::Result<Option<PathBuf>> {
+        let path = self.path(kind.place());
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+            Ok(meta) if meta.is_dir() => Ok(Some(path)),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a directory", path.display()),
+            )),
+        }
+    }
+
+    /// Every regular file of a [`TornKind`] in the dir, as `(kind, name, path
+    /// inside the dir)`, kind by kind in [`TornKind::ALL`]'s order and names
+    /// sorted. A link, a directory or anything else at an entry's name is
+    /// none (a power cut tears data; it makes no link and no directory).
+    fn torn_kind_files(&self) -> io::Result<Vec<(TornKind, String, String)>> {
+        let mut out = Vec::new();
+        for kind in TornKind::ALL {
+            for (name, rel) in self.kind_files(kind)? {
+                out.push((kind, name, rel));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every regular file of `kind` in the dir, as `(name, path inside the
+    /// dir)`, names sorted ([`StateDir::torn_kind_files`]'s rule for one kind).
+    fn kind_files(&self, kind: TornKind) -> io::Result<Vec<(String, String)>> {
+        let Some(dir) = self.torn_kind_dir(kind)? else {
+            return Ok(Vec::new());
+        };
+        let entries = std::fs::read_dir(dir)?;
+        let mut names = Vec::new();
+        for entry in entries {
+            if let Some(name) = entry?.file_name().to_str().filter(|n| kind.names(n)) {
+                names.push(name.to_string());
+            }
+        }
+        names.sort_unstable();
+        let mut out = Vec::new();
+        for name in names {
+            let rel = format!("{}/{name}", kind.place());
+            match std::fs::symlink_metadata(self.path(&rel)) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+                Ok(meta) if !meta.is_file() => {}
+                Ok(_) => out.push((name, rel)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// AFTER AN UNCLEAN STOP IN AN EARLIER BOOT ([`StateDir::torn_files_possible`]),
+    /// SET EVERY TORN FILE ASIDE — and the readers then find it gone, which is
+    /// what losing it costs, rather than refuse it at every attach of every later
+    /// boot until a person repairs the dir.
+    ///
+    /// POSIX keeps nothing of an unflushed file's DATA across a power loss, so a
+    /// rename that reached the media may name a file whose bytes did not: empty,
+    /// or cut anywhere. Every file of a [`TornKind`] is written atomically and
+    /// flushed only at a clean stop, so a power cut may tear it, and its reader
+    /// refuses damage (fail-closed: within one boot damage is a bug, never a
+    /// cut) — or, cut at the wrong byte, reads it as something it never was (an
+    /// in-flight reply with no witness, which the attach refuses for good).
+    /// Each kind serves only sessions, which a reboot ends, so a torn one is
+    /// harmless to lose — but kept, it wedged the bridge for good: the
+    /// in-flight journal stopped every attach, a torn reservation stopped every
+    /// attach that had to forget a moved log's offsets.
+    ///
+    /// SO A FILE THAT IS NOT PROVABLY WHOLE ([`TornKind`]'s rule: its last
+    /// newline, its reader's parse and, in flight, its witness) IS MOVED ASIDE,
+    /// NEVER DELETED: its exact bytes go into [`QUARANTINE`] inside the dir
+    /// (`quarantine/<path with / as .>`, a `.<n>` added past a name taken),
+    /// DURABLY, before its own name is unlinked and that directory flushed — so
+    /// a power cut at any step leaves it in one place or both, never in none,
+    /// and moving it back is a person's `mv`. A whole file stays where it is,
+    /// as does anything that is not a regular file.
+    ///
+    /// Within one boot, after a clean stop, and where no boot can be told from
+    /// another, NOTHING is moved: damage there is not a power cut's, and its
+    /// reader refuses it, as it always did. Run before anything reads the dir's
+    /// files of these kinds and before [`StateDir::begin_run`] renews the
+    /// record that says whether one can be torn, so a bridge killed part-way
+    /// leaves the next one in the same verdict, to sweep again (idempotent:
+    /// what was moved is gone, what is whole stays). Only the holder of
+    /// [`StateDir::lock_bridge`] calls it.
+    ///
+    /// # Errors
+    ///
+    /// The first I/O failure listing, reading or moving: what was moved before it
+    /// stays moved, and the reader of what was not refuses it as before.
+    pub(crate) fn set_aside_torn(&self) -> io::Result<Vec<SetAside>> {
+        self.sweep_torn(TornKind::whole)
+    }
+
+    /// TEST-ONLY: [`StateDir::set_aside_torn`] with each file judged by its
+    /// reader alone ([`TornKind::reads`]), as finding F1's first fix judged it:
+    /// a cut that still reads stays. The simulation's negative control
+    /// (`Mutant::SweepByTheReaderAlone`).
+    #[cfg(test)]
+    pub(crate) fn set_aside_torn_by_the_reader_alone(&self) -> io::Result<Vec<SetAside>> {
+        self.sweep_torn(TornKind::reads)
+    }
+
+    /// The sweep [`StateDir::set_aside_torn`] is, with `whole` the judge of a
+    /// file of a kind.
+    fn sweep_torn(
+        &self,
+        whole: fn(TornKind, &Path, &str, &str) -> bool,
+    ) -> io::Result<Vec<SetAside>> {
+        if !self.torn_files_possible()? {
+            return Ok(Vec::new());
+        }
+        let mut torn: Vec<(String, Vec<u8>)> = Vec::new();
+        for (kind, name, rel) in self.torn_kind_files()? {
+            let path = self.path(&rel);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let whole =
+                std::str::from_utf8(&bytes).is_ok_and(|text| whole(kind, &path, &name, text));
+            if !whole {
+                torn.push((rel, bytes));
+            }
+        }
+        self.move_into_quarantine(&torn, "")
+    }
+
+    /// FINDING F2, DECIDED: AFTER AN UNCLEAN STOP IN AN EARLIER BOOT
+    /// ([`StateDir::torn_files_possible`]), EVERY WHOLE IN-FLIGHT ENTRY IS
+    /// RETIRED — moved aside, never published again.
+    ///
+    /// An entry's unlink is atomic only ([`StateDir::clear_in_flight`]), so a
+    /// power cut can bring back the entry of a record that LANDED and was
+    /// answered. When the log on its own lost that record (a log on another
+    /// volume, a lossy flush: the law lets it lose an unescalated one) and the
+    /// sender's later posts landed after it, the next attach's republish
+    /// ([`crate::bridge::Bridge::settle_in_flight`]) appended it again BEHIND
+    /// them: the sender's posts out of order, the one thing the outbox promises
+    /// per sender. Nothing the bridge can read tells that entry from one whose
+    /// record never landed: a read of the log carries no producer sequence, the
+    /// sender's later post may be on any lane of any node, and the same cut
+    /// rolls back the later post's reservation (`sent/`) and entry with it.
+    ///
+    /// AND NOTHING NEEDS IT REPUBLISHED. An entry exists so the self-lane check
+    /// can re-learn the offset of a record of ours before the refill judges it,
+    /// and so a record the bridge decided to publish lands once. Both serve the
+    /// sessions on this node's own lanes — the record's sender and its
+    /// recipient — and a reboot ended them: aterm mints every sid afresh at
+    /// launch, the outbox lives in its memory, and the not-hosted gate runs
+    /// before the self-lane check, so no record of a session that is gone is
+    /// ever judged. The table calls a lost entry harmless after a reboot; this
+    /// makes the entry lost on purpose, rather than let a cut decide.
+    ///
+    /// WITHIN ONE BOOT the republish stays, and keeps the order: an entry
+    /// outlives its record's answer only where `acked` could not be written,
+    /// one post per sender is in flight (`Bridge::settle_sender`: a sender's
+    /// next post goes out only once its last is answered), the log keeps only
+    /// a prefix of what it held, and every attach to it republishes before any
+    /// post — so a republish that lands a record lands it on a log that lost
+    /// every later post of its sender too. So it does after a CLEAN STOP: its
+    /// flush kept every unlink ([`StateDir::end_run_clean`]), so an entry it
+    /// leaves was never cleared, and the same argument carries it across the
+    /// reboot. Both need the state dir's page cache to have outlived what the
+    /// log lost. A state dir on a volume of its own that loses power alone
+    /// and comes back within the boot (`ATERM_STATE_HOME` on an external
+    /// disk) can roll an unlink back as a power cut does, and nothing here
+    /// tells that from a kill — the case [`StateDir::torn_files_possible`]
+    /// counts as one boot too. It is NOT covered: an entry it brings back is
+    /// published again, behind its sender's later posts where the log, on
+    /// another volume, lost its record on its own; retiring on it would take
+    /// live sessions' entries.
+    ///
+    /// AND A BOOT'S OWN ENTRIES ARE NOT RETIRED, though `run` can still name
+    /// an earlier boot's unclean stop after this boot's first bridge: the
+    /// disk can refuse its [`StateDir::begin_run`] (full, an I/O error), and
+    /// that is said and survived. No attach of this build goes on while it
+    /// does (`Bridge::run_names_this_boot` writes `run` again first), so no
+    /// entry is written then. And where an incarnation lease names this boot
+    /// — an attach ran in it, an older build's, which did not wait — the
+    /// entries may be live sessions', and nothing is moved
+    /// ([`StateDir::attached_in_this_boot`]). Only on the boot volume does
+    /// the lease name a boot: off it, an older build's attach past a refused
+    /// `run`, followed in the same boot by this build's start, is the one
+    /// case where a live entry is still retired.
+    ///
+    /// Each entry's exact bytes go into [`QUARANTINE`] as
+    /// `retired.inflight.<seq>` ([`RETIRED_PREFIX`]), durably, before its
+    /// own name is unlinked and `inflight/` flushed, as [`StateDir::set_aside_torn`]
+    /// moves a torn file — so the bytes stay the owner's, and a person's `mv`
+    /// back publishes one. Only a PROVABLY WHOLE entry ([`TornKind`]'s rule) is
+    /// retired: one that is not is the torn sweep's, or, where that sweep did
+    /// not run, refused where it is read as before. Within one boot, after a
+    /// clean stop (which flushed every unlink, so an entry there is one still
+    /// in flight), once an attach of this boot is on record, and where no boot
+    /// can be told from another, NOTHING is moved. Run after
+    /// [`StateDir::set_aside_torn`] and before
+    /// [`StateDir::begin_run`], so a bridge killed part-way leaves the next one
+    /// the same verdict (idempotent: what was moved is gone).
+    ///
+    /// # Errors
+    ///
+    /// A `run` record that does not read ([`StateDir::torn_files_possible`]),
+    /// or the first I/O failure listing, reading or moving: what was moved
+    /// before it stays moved, and what was not is published again by the
+    /// attach, as before.
+    pub(crate) fn retire_in_flight_of_an_earlier_boot(&self) -> io::Result<Vec<SetAside>> {
+        if !self.torn_files_possible()? || self.attached_in_this_boot() {
+            return Ok(Vec::new());
+        }
+        let mut whole: Vec<(String, Vec<u8>)> = Vec::new();
+        for (name, rel) in self.kind_files(TornKind::InFlight)? {
+            let path = self.path(&rel);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if std::str::from_utf8(&bytes)
+                .is_ok_and(|text| TornKind::InFlight.whole(&path, &name, text))
+            {
+                whole.push((rel, bytes));
+            }
+        }
+        self.move_into_quarantine(&whole, RETIRED_PREFIX)
+    }
+
+    /// MOVE EACH `(path inside the dir, its bytes)` INTO [`QUARANTINE`], NEVER
+    /// DELETED: its exact bytes at `quarantine/<prefix><path with / as .>` (a
+    /// `.<n>` added past a name taken, never over another), DURABLY, mode 0600;
+    /// then its own name unlinked and each directory it left flushed — so a
+    /// power cut at any step leaves it in one place or both, never in none. The
+    /// quarantine's own entry is flushed when it is made, and one that is not a
+    /// real directory (a link or file planted at the name) refuses the move,
+    /// moving nothing. Answers `(from, to)` per file, in the order given.
+    fn move_into_quarantine(
+        &self,
+        files: &[(String, Vec<u8>)],
+        prefix: &str,
+    ) -> io::Result<Vec<SetAside>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The quarantine's own entry in the dir, on the media before anything
+        // is moved into it. Only a real directory is written into: a link or a
+        // file planted at the name is never written through.
+        let quarantine = self.path(QUARANTINE);
+        match std::fs::symlink_metadata(&quarantine) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not a directory", quarantine.display()),
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&quarantine)?;
+                self.flush_dir(&self.root)?;
+            }
+            Err(e) => return Err(e),
+        }
+        let mut moved = Vec::new();
+        for (from, bytes) in files {
+            let base = format!("{QUARANTINE}/{prefix}{}", from.replace('/', "."));
+            let mut to = base.clone();
+            let mut n = 0u32;
+            loop {
+                match self.publish_quarantine_file(&to, bytes) {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        n = n
+                            .checked_add(1)
+                            .ok_or_else(|| io::Error::other("quarantine suffix space exhausted"))?;
+                        to = format!("{base}.{n}");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            moved.push(SetAside {
+                from: from.clone(),
+                to,
+            });
+        }
+        let mut dirs = std::collections::BTreeSet::new();
+        for SetAside { from, .. } in &moved {
+            let path = self.path(from);
+            match self.remove_path(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            dirs.insert(path.parent().unwrap_or(&self.root).to_path_buf());
+        }
+        for dir in dirs {
+            self.flush_dir(&dir)?;
+        }
+        Ok(moved)
+    }
+
+    /// Publish exact evidence bytes without replacing any occupant: stage and
+    /// flush an owned temp, then link it exclusively at `name`. A collision is
+    /// the link's `AlreadyExists`, even if it appeared after staging. Every other
+    /// error is returned before the sweep can unlink any source.
+    fn publish_quarantine_file(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let target = self.path(name);
+        let parent = target.parent().unwrap_or(&self.root);
+        let w = crate::fx::Write::Replace {
+            path: &target,
+            bytes,
+            durable: true,
+            mode: 0o600,
+        };
+        self.disk.before(w)?;
+        let (tmp, mut file) = crate::enable::create_temp_beside(&target, 0o600)?;
+        let staged = (|| {
+            file.write_all(bytes)?;
+            if flushes_media() {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "quarantine evidence is flushed before its source may be unlinked"
+                )]
+                file.sync_all()?;
+            }
+            drop(file);
+            std::fs::hard_link(&tmp, &target)
+        })();
+        let cleaned = std::fs::remove_file(&tmp);
+        cleaned?;
+        staged?;
+        self.count(|ops| {
+            ops.replaces += 1;
+            ops.fsyncs += 1;
+        });
+        sync_dir(parent)?;
+        self.count(|ops| ops.fsyncs += 1);
+        self.disk.after(w);
+        Ok(())
+    }
+
+    /// A BRIDGE'S RUN BEGINS, after its sweep ([`StateDir::set_aside_torn`])
+    /// and before it writes any file of a [`TornKind`]: `run` names this boot,
+    /// OPEN, durably — so a power cut from here on is judged unclean by the
+    /// first bridge of the next boot ([`StateDir::torn_files_possible`]). One
+    /// durable write at the first start in a boot and at the first after a
+    /// clean stop; none at a start after a kill in the same boot, whose record
+    /// already says so.
+    ///
+    /// And what this run must flush before it may say it stopped cleanly
+    /// ([`StateDir::end_run_clean`]): what it writes itself, and — unless the
+    /// last run stopped cleanly or ran in another boot, so the media holds every
+    /// such file there now — every one already here, which a predecessor killed
+    /// in this boot may have left unflushed.
+    ///
+    /// # Errors
+    ///
+    /// Reading the existing record, listing those files, or writing the record.
+    /// Invalid or unreadable marker evidence is not replaced, and no marker is
+    /// removed to force a legacy fallback. A write may already have progressed
+    /// before an I/O error; uncertainty must remain fail-closed.
+    pub(crate) fn begin_run(&self) -> io::Result<()> {
+        let now = self.kernel_boot();
+        let last = self.last_run()?;
+        let on_the_media = last.is_some_and(|run| {
+            run.clean || (now.is_some() && run.boot.is_some() && run.boot != now)
+        });
+        let open = LastRun {
+            boot: now,
+            clean: false,
+        };
+        if !on_the_media {
+            let here = self.torn_kind_files()?;
+            self.unflushed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(here.into_iter().map(|(_, _, rel)| rel));
+        }
+        if last != Some(open) {
+            self.write_durable("run", &open.render())?;
+        }
+        Ok(())
+    }
+
+    /// A CLEAN STOP: every file of a [`TornKind`] this run must flush
+    /// ([`StateDir::begin_run`]) rewritten DURABLY with its own bytes and mode,
+    /// every such directory flushed (an unlink made since is kept), and only
+    /// then `run` says the run stopped cleanly, durably. A power cut from then
+    /// until the next bridge's [`StateDir::begin_run`] tears none of them, so
+    /// the first bridge of the next boot sets nothing aside: damage it finds
+    /// is a bug's, refused where it is read — the promise astream's clean
+    /// close makes of its log (`BrokerLog::close_clean`).
+    ///
+    /// The last act of a bridge that stops because aterm went away
+    /// (`Bridge::wind_down`), after its last write of those files: two flushes
+    /// a file this run wrote (an entry still in flight, a reservation, a
+    /// session's keys or floors — few at a stop) and one a directory. A bridge
+    /// that dies instead leaves `run` open, and the next boot's sweep runs.
+    ///
+    /// # Errors
+    ///
+    /// The first record read, directory admission, rewrite or flush that fails.
+    /// Invalid marker evidence is left untouched, and paths still needing a
+    /// flush remain pending for another attempt. No marker is removed to force
+    /// a legacy fallback.
+    pub(crate) fn end_run_clean(&self) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = self.last_run()?;
+        let dirs: Vec<PathBuf> = TornKind::ALL
+            .into_iter()
+            .filter_map(|kind| self.torn_kind_dir(kind).transpose())
+            .collect::<io::Result<_>>()?;
+        let paths = self
+            .unflushed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for rel in &paths {
+            let path = self.path(rel);
+            let mode = match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+                Ok(meta) if !meta.is_file() => continue,
+                Ok(meta) => meta.permissions().mode() & 0o777,
+            };
+            let bytes = std::fs::read(&path)?;
+            self.replace_bytes(rel, &bytes, true, mode)?;
+        }
+        for dir in dirs {
+            self.flush_dir(&dir)?;
+        }
+        let clean = LastRun {
+            boot: self.kernel_boot(),
+            clean: true,
+        };
+        self.write_durable("run", &clean.render())?;
+        self.unflushed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|rel| !paths.contains(rel));
         Ok(())
     }
 
@@ -2671,43 +3543,7 @@ impl StateDir {
             }
             Ok(_) => {}
         }
-        let body = std::fs::read_to_string(&path)?;
-        if body.trim().is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "empty broadcast refill floor file",
-            ));
-        }
-        let mut out = BTreeMap::new();
-        for line in body.lines() {
-            let mut words = line.split_whitespace();
-            let topic = words.next().filter(|t| crate::subject::is_topic(t));
-            let off = words
-                .next()
-                .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|w| w.parse::<u64>().ok());
-            match (topic, off, words.next()) {
-                (Some(topic), Some(off), None) => {
-                    if out.insert(topic.to_string(), off).is_some() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "duplicate broadcast refill topic",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{}: `{}` is not a broadcast refill floor",
-                            path.display(),
-                            safe_line(line)
-                        ),
-                    ));
-                }
-            }
-        }
-        Ok(out)
+        parse_topic_floors(&path, &std::fs::read_to_string(&path)?)
     }
 
     /// Replace one session's broadcast refill floors ([`Self::topic_floors`]);
@@ -2727,7 +3563,6 @@ impl StateDir {
         let body: Vec<String> = floors.iter().map(|(t, off)| format!("{t} {off}")).collect();
         self.write(&name, &body.join("\n"))
     }
-
     /// The producer sequence this bridge reserved for one outbound post, and whether
     /// a `post key=` entry an earlier post reserved chose it ([`StateDir::key_seq`]).
     ///
@@ -2925,6 +3760,70 @@ mod tests {
         p
     }
 
+    /// Incarnation `inc`'s first number, by astream's layout
+    /// ([`astream_broker::incarnation_base`]) — never spelled out here, because
+    /// the layout is astream's persistence contract and a second transcription
+    /// is nothing tied to it.
+    fn base(inc: u64) -> u64 {
+        astream_broker::incarnation_base(inc).expect("in the layout")
+    }
+
+    /// Incarnation `inc`'s will, by astream's layout
+    /// ([`astream_broker::will_seq`]).
+    fn will(inc: u64) -> u64 {
+        astream_broker::will_seq(inc).expect("in the layout")
+    }
+
+    /// **EVERY NUMBER THIS DIR HANDS OUT SITS IN ASTREAM'S INCARNATION LAYOUT**
+    /// ([`INC_MAX`]'s doc): a block of incarnation `inc` lies strictly between
+    /// astream's `incarnation_base(inc)` and `will_seq(inc)` — above everything of
+    /// every earlier incarnation, below this one's will — and astream's
+    /// `incarnation_of` maps it back to `inc`, which is the incarnation the dir then
+    /// answers for, up to the last incarnation the layout holds.
+    ///
+    /// Negative controls: past [`INC_MAX`], where astream's layout has no space,
+    /// nothing is reserved; and a `seq` in astream's reserved ack half, which no
+    /// incarnation owns, is a corrupt file that refuses the next take — read as
+    /// incarnation 0 (`incarnation_of`'s `None` taken for zero), it would hand out
+    /// incarnation 1 again.
+    #[test]
+    fn every_reserved_sequence_sits_in_astreams_incarnation_layout() {
+        let dir = scratch("layout");
+        let st = StateDir::open(&dir).expect("open");
+        for inc in [0, 1, 7, INC_MAX] {
+            let block = st.reserve_sequence_block(inc, 3).expect("a block");
+            let base = base(inc);
+            let will = will(inc);
+            assert!(
+                base < *block.start() && *block.end() < will,
+                "inc {inc}: {block:?} strictly inside ({base}, {will})"
+            );
+            assert_eq!(astream_broker::incarnation_of(*block.end()), Some(inc));
+            assert_eq!(
+                st.incarnation(),
+                inc,
+                "the dir answers for the block's incarnation"
+            );
+        }
+        assert!(
+            st.reserve_sequence_block(INC_MAX + 1, 1).is_err(),
+            "past INC_MAX the layout has no space"
+        );
+        let corrupt = scratch("layout-ack-half");
+        let st = StateDir::open(&corrupt).expect("open");
+        std::fs::write(
+            corrupt.join("seq"),
+            (astream_broker::ACK_SEQ_BASE | 5).to_string(),
+        )
+        .expect("seed a seq in the ack half");
+        assert!(
+            st.take_incarnation(0).is_err(),
+            "a seq no incarnation owns refuses the take; it is never incarnation 0"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&corrupt);
+    }
+
     /// A BLOCK IS ONE WRITE, AND ITS LAST NUMBER IS ON DISK BEFORE ITS FIRST IS
     /// ANSWERED. The file holds the block's end the moment the call returns, so
     /// a reopen — the next process, after a `kill -9` that used part of the
@@ -2937,7 +3836,7 @@ mod tests {
         let dir = scratch("seqblock");
         let st = StateDir::open(&dir).expect("open");
         let block = st.reserve_sequence_block(3, 64).expect("a block");
-        assert_eq!(block, (3 << 32) + 1..=(3 << 32) + 64);
+        assert_eq!(block, base(3) + 1..=base(3) + 64);
         assert_eq!(
             st.sequence(),
             *block.end(),
@@ -2952,21 +3851,14 @@ mod tests {
         // A later incarnation starts above its own base, not above the file.
         assert_eq!(
             reopened.reserve_sequence_block(4, 2).expect("inc 4"),
-            (4 << 32) + 1..=(4 << 32) + 2
+            base(4) + 1..=base(4) + 2
         );
         // Near the top: cut short below the will's number, then refused.
-        std::fs::write(
-            dir.join("seq"),
-            ((5u64 << 32) | (WILL_SEQ_LOW - 3)).to_string(),
-        )
-        .expect("seed near the top");
+        std::fs::write(dir.join("seq"), (will(5) - 3).to_string()).expect("seed near the top");
         let short = reopened
             .reserve_sequence_block(5, 64)
             .expect("a short block");
-        assert_eq!(
-            short,
-            ((5 << 32) | (WILL_SEQ_LOW - 2))..=((5 << 32) | (WILL_SEQ_LOW - 1))
-        );
+        assert_eq!(short, will(5) - 2..=will(5) - 1);
         assert!(
             reopened.reserve_sequence_block(5, 64).is_err(),
             "nothing below the will's number is left"
@@ -3738,8 +4630,8 @@ mod tests {
             id: [0x3c; 16],
             generation,
         };
-        let lineage =
-            crate::durability::lineage_of(&[(1, 41), (2, 138)]).expect("a lineage astream reads");
+        let lineage = astream_broker::Lineage::from_steps(&[(1, 41), (2, 138)])
+            .expect("a lineage astream reads");
         let entry = |seq: u64, re: u64, generation: u64| InFlight {
             pin: PublishPin {
                 seq,
@@ -4386,9 +5278,9 @@ mod tests {
     /// `INC_LEASE` and was flushed; `inc-lease`, which says which incarnation of the
     /// block the last attach took, was not, and the dir's FIRST lease has no older
     /// version for the media to fall back on. A doctor that answered `inc` there would
-    /// reserve `(64 << 32) + 1`, raise the producer's high water above incarnation 3's
-    /// will (`(3 << 32) | WILL_SEQ_LOW`) and fence it: the dead node's row would stay
-    /// `live`, and the next attach would never witness incarnation 3 dead.
+    /// reserve `incarnation_base(64) + 1`, raise the producer's high water above
+    /// incarnation 3's will (astream's `will_seq(3)`) and fence it: the dead node's row
+    /// would stay `live`, and the next attach would never witness incarnation 3 dead.
     ///
     /// What remains answers: `seq`'s incarnation, which a bridge reserves under after its
     /// take, so it is never above what was used. Without that either, nothing is known,
@@ -4415,7 +5307,6 @@ mod tests {
             (3, INC_LEASE),
             "the doctor answers the incarnation taken, not the lease's top"
         );
-        let will = |inc: u64| (inc << 32) | WILL_SEQ_LOW;
 
         // THE POWER LOSS: the flushed `inc` survives, the never-flushed first lease does
         // not, and `seq` was written back.
@@ -4429,7 +5320,7 @@ mod tests {
         std::fs::write(dir.join("inc-lease"), "used=3 top=").expect("tear the lease");
         assert_eq!(st.incarnation(), 3, "a torn lease");
         // `seq` rolled back to incarnation 1's block: at or below the one used.
-        std::fs::write(dir.join("seq"), ((1u64 << 32) + 16).to_string()).expect("seq");
+        std::fs::write(dir.join("seq"), (base(1) + 16).to_string()).expect("seq");
         assert_eq!(st.incarnation(), 1, "a rolled-back seq");
         // Both gone: nothing is known, and the doctor's sequence fences no will.
         std::fs::remove_file(dir.join("seq")).expect("lose seq");
@@ -4446,7 +5337,7 @@ mod tests {
         // reserved under it): the doctor answers that incarnation, as it always did.
         std::fs::remove_file(dir.join("inc-lease")).expect("no lease");
         std::fs::write(dir.join("inc"), "9").expect("inc");
-        std::fs::write(dir.join("seq"), ((9u64 << 32) + 5).to_string()).expect("seq");
+        std::fs::write(dir.join("seq"), (base(9) + 5).to_string()).expect("seq");
         assert_eq!(st.incarnation(), 9, "an older build's dir");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4576,7 +5467,7 @@ mod tests {
         );
         put(
             "seq",
-            (v("c_seq") > 0).then(|| ((v("c_seq") << 32) + 64).to_string()),
+            (v("c_seq") > 0).then(|| (base(v("c_seq")) + 64).to_string()),
         );
     }
 
@@ -4650,6 +5541,7 @@ mod tests {
                     kill_at: kill,
                     mutant,
                     span: Some(span),
+                    off_volume: false,
                 });
                 let got = st.take_incarnation(0);
                 let files = read_back(&st);
@@ -4765,7 +5657,8 @@ mod tests {
 
     /// The REAL reader's resume point from a `FabricReaderResume` state: the state's
     /// lineage — the model's two slots, `(g - 1, f2)` and `(g, f1)` where they exist — is
-    /// built through astream's own `Hello` parser ([`crate::durability::lineage_of`]), the
+    /// built by astream's own [`astream_broker::Lineage::from_steps`] (exactly the
+    /// lineages its `Hello` decoder accepts), the
     /// witness names generation `rg` of one log, [`LogWitness::continues`] answers where
     /// it continues on generation `g`, and [`StateDir::forget_log_offsets`] clamps (or
     /// forgets) a topic cursor at `c` against head `h`. Answers the cursor it leaves.
@@ -4786,7 +5679,7 @@ mod tests {
         if g >= 1 && s["f1"] != top {
             steps.push((g, at("f1")));
         }
-        let lineage = crate::durability::lineage_of(&steps).expect("a lineage astream reads");
+        let lineage = astream_broker::Lineage::from_steps(&steps).expect("a lineage astream reads");
         let log = |generation| astream_broker::LogIdentity {
             id: [0x5a; 16],
             generation,
@@ -4968,5 +5861,796 @@ mod tests {
             preserved.into_iter().all(|kept| kept),
             "CLAMP_DROPPED_UNCERTAIN_REFILL_EVIDENCE"
         );
+    }
+
+    /// A whole in-flight entry at `seq`, with a log witness, for the torn-file tests.
+    fn in_flight_entry(seq: u64) -> InFlight {
+        InFlight {
+            pin: PublishPin {
+                seq,
+                via_key: false,
+                identity: None,
+                original: None,
+                original_off: None,
+                owner: None,
+            },
+            subject: "/f/sim/in/n-1/s-a/n-1/note".to_string(),
+            body: b"v=1 t=5 text=hello".to_vec(),
+            log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
+        }
+    }
+
+    /// **A TORN FILE AFTER AN UNCLEAN STOP IN AN EARLIER BOOT IS SET ASIDE, AND
+    /// THE SAME DAMAGE WITHIN ONE BOOT IS REFUSED** — finding F1 on the real
+    /// filesystem ([`StateDir::set_aside_torn`]).
+    ///
+    /// The last bridge ran in boot 1 and did not stop cleanly (`run` says so, and
+    /// its lease names boot 1). Beside a whole in-flight entry and a whole
+    /// reservation, a power cut left `inflight/8` cut part-way through its face,
+    /// `sent/s-a.2` cut part-way through its identity and `keys/s-a` cut inside
+    /// its line, and tore one file of every other kind to nothing — `logpin`
+    /// too. Read in boot 2, every torn file of a [`TornKind`] is moved into
+    /// `quarantine/` with its exact bytes, the readers find the whole ones and
+    /// nothing of the torn ones, a second sweep moves nothing, and a name
+    /// already taken there gets a suffix rather than overwrite; `logpin`, which
+    /// holds what no reboot ends, stays where the mirror refuses it.
+    /// NEGATIVE CONTROL: the same dir read in boot 1 again — a `kill -9`, which
+    /// the page cache outlived — moves nothing, and the readers refuse the
+    /// damage as they always did.
+    #[test]
+    fn a_torn_file_after_an_unclean_stop_is_set_aside_and_within_a_boot_refused() {
+        for unclean in [true, false] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("torn")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("the last bridge's run, in boot 1");
+            st.take_incarnation(0).expect("its attach");
+            let whole = in_flight_entry(7);
+            st.set_in_flight(&whole).expect("a whole entry");
+            let pin = PublishPin {
+                identity: Some(PublishIdentity {
+                    subject: whole.subject.clone(),
+                    digest: "ab".repeat(32),
+                }),
+                ..whole.pin.clone()
+            };
+            st.set_post_pin("s-a", 1, &pin)
+                .expect("a whole reservation");
+            // THE CUT: a prefix of what each write held, as a power cut may leave it.
+            let entry = in_flight_entry(8).render();
+            let cut_entry = &entry.as_bytes()[..entry.find("/s-a/").expect("the face") + 3];
+            std::fs::write(root.join("inflight/8"), cut_entry).expect("cut entry");
+            let reservation = PublishPin {
+                seq: 9,
+                ..pin.clone()
+            }
+            .render();
+            let cut_pin = &reservation.as_bytes()[..reservation.len() - 20];
+            std::fs::write(root.join("sent/s-a.2"), cut_pin).expect("cut reservation");
+            for (place, name) in [
+                ("acks", "s-a.4"),
+                ("keys", "s-a"),
+                ("unhandled", "s-a"),
+                ("", "logpin"),
+            ] {
+                std::fs::create_dir_all(root.join(place)).expect("its dir");
+                std::fs::write(root.join(place).join(name), b"").expect("torn to nothing");
+            }
+            std::fs::write(root.join("keys/s-a"), b"k1 12 identity /f/x").expect("cut key");
+
+            if unclean {
+                st.set_inc_seam(in_boot(2));
+                assert!(
+                    st.torn_files_possible().expect("run record reads"),
+                    "boot 2, after boot 1's bridge stopped uncleanly"
+                );
+                let moved = st.set_aside_torn().expect("the sweep");
+                let from: Vec<&str> = moved.iter().map(|m| m.from.as_str()).collect();
+                assert_eq!(
+                    from,
+                    [
+                        "inflight/8",
+                        "sent/s-a.2",
+                        "acks/s-a.4",
+                        "keys/s-a",
+                        "unhandled/s-a",
+                    ],
+                    "every torn file, kind by kind"
+                );
+                for m in &moved {
+                    assert_eq!(m.to, format!("{QUARANTINE}/{}", m.from.replace('/', ".")));
+                    assert!(
+                        !root.join(&m.from).exists(),
+                        "{} is moved, not copied",
+                        m.from
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(root.join("quarantine/inflight.8")).expect("kept"),
+                    cut_entry,
+                    "its exact bytes, never deleted"
+                );
+                assert_eq!(
+                    std::fs::read(root.join("quarantine/sent.s-a.2")).expect("kept"),
+                    cut_pin
+                );
+                assert_eq!(
+                    st.in_flight().expect("the journal reads"),
+                    vec![(7, whole.clone())]
+                );
+                assert_eq!(st.post_pin("s-a", 2).expect("reads"), None);
+                assert_eq!(st.post_pin("s-a", 1).expect("reads"), Some(pin.clone()));
+                assert_eq!(st.receipt_pin("s-a", 4).expect("reads"), None);
+                assert!(st.topic_floors("s-a").expect("reads").is_empty());
+                assert_eq!(
+                    st.logpin().expect("reads").as_deref(),
+                    Some(""),
+                    "the mirror's pin stays, for the mirror to refuse"
+                );
+                st.publication_offset_resets(None)
+                    .expect("a log move's reset reads");
+                assert!(st.set_aside_torn().expect("again").is_empty(), "idempotent");
+                // A second cut at a name the quarantine holds keeps both.
+                std::fs::write(root.join("inflight/8"), b"").expect("torn again");
+                assert_eq!(
+                    st.publish_quarantine_file("quarantine/inflight.8", b"replacement")
+                        .expect_err("the actual publication cannot replace an occupant")
+                        .kind(),
+                    io::ErrorKind::AlreadyExists
+                );
+                assert_eq!(
+                    std::fs::read(root.join("inflight/8")).expect("source remains"),
+                    b""
+                );
+                assert_eq!(
+                    std::fs::read(root.join("quarantine/inflight.8")).expect("sentinel remains"),
+                    cut_entry
+                );
+                let again = st.set_aside_torn().expect("the next boot's sweep");
+                assert_eq!(again.len(), 1);
+                assert_eq!(again[0].to, format!("{QUARANTINE}/inflight.8.1"));
+                assert_eq!(
+                    std::fs::read(root.join("quarantine/inflight.8")).expect("kept"),
+                    cut_entry,
+                    "the first one is not overwritten"
+                );
+            } else {
+                assert!(
+                    !st.torn_files_possible().expect("run record reads"),
+                    "the same boot: nothing a kill does tears a file"
+                );
+                assert!(st.set_aside_torn().expect("no sweep").is_empty());
+                assert!(!root.join(QUARANTINE).exists(), "nothing moved");
+                assert_eq!(
+                    st.in_flight().expect_err("refused").kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    st.post_pin("s-a", 2).expect_err("refused").kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert!(st.publication_offset_resets(None).is_err());
+                assert!(st.topic_floors("s-a").is_err());
+                assert!(st
+                    .logpin()
+                    .expect("read")
+                    .is_some_and(|t| crate::mirror::Pin::parse(&t).is_err()));
+            }
+        }
+    }
+
+    /// A LINK PLANTED AT THE QUARANTINE'S NAME IS NEVER WRITTEN THROUGH: the sweep
+    /// refuses, nothing lands where the link points, and the torn file stays where
+    /// its reader refuses it.
+    #[test]
+    fn a_planted_quarantine_link_is_refused_and_nothing_moves() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("planted")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let elsewhere = aterm_tempfile::Builder::new()
+            .prefix("elsewhere")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let st = StateDir::open(root).expect("open");
+        st.set_inc_seam(in_boot(1));
+        st.begin_run()
+            .expect("a run in boot 1, never stopped cleanly");
+        st.set_inc_seam(in_boot(2));
+        std::fs::write(root.join("sent/s-a.1"), b"").expect("torn to nothing");
+        std::os::unix::fs::symlink(elsewhere.path(), root.join(QUARANTINE)).expect("plant");
+        let refused = st.set_aside_torn().expect_err("a link is no quarantine");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        assert!(root.join("sent/s-a.1").exists(), "nothing moved");
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).expect("list").count(),
+            0,
+            "nothing written through the link"
+        );
+    }
+
+    /// Neither a sweep nor a clean close follows a planted source parent.
+    /// The pending write and run marker survive refusal; an outside sentinel
+    /// is never removed or rewritten, for a link or a non-directory occupant.
+    #[test]
+    fn a_planted_source_parent_is_refused_before_sweep_or_clean_close() {
+        for kind in TornKind::ALL {
+            for linked in [true, false] {
+                let dir = aterm_tempfile::Builder::new()
+                    .prefix("source-parent")
+                    .tempdir_in("/tmp")
+                    .expect("scratch");
+                let elsewhere = aterm_tempfile::Builder::new()
+                    .prefix("source-target")
+                    .tempdir_in("/tmp")
+                    .expect("scratch");
+                let st = StateDir::open(dir.path()).expect("open");
+                st.set_inc_seam(in_boot(1));
+                st.begin_run().expect("open run");
+                let name = if kind == TornKind::InFlight {
+                    "8"
+                } else {
+                    "s-a.1"
+                };
+                let rel = format!("{}/{name}", kind.place());
+                st.write(&rel, "12").expect("a pending write");
+                std::fs::remove_file(st.path(&rel)).expect("remove owned fixture");
+                std::fs::remove_dir(st.path(kind.place())).expect("replace owned parent");
+                let sentinel = elsewhere.path().join(name);
+                std::fs::write(&sentinel, b"external evidence").expect("outside sentinel");
+                if linked {
+                    std::os::unix::fs::symlink(elsewhere.path(), st.path(kind.place()))
+                        .expect("plant parent link");
+                } else {
+                    std::fs::write(st.path(kind.place()), b"parent sentinel")
+                        .expect("plant non-directory");
+                }
+                let run = std::fs::read(st.path("run")).expect("original run");
+                st.set_inc_seam(in_boot(2));
+                assert_eq!(
+                    st.set_aside_torn()
+                        .expect_err("refuse source parent")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    st.end_run_clean().expect_err("refuse clean close").kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    std::fs::read(&sentinel).expect("outside remains"),
+                    b"external evidence"
+                );
+                assert_eq!(std::fs::read(st.path("run")).expect("run remains"), run);
+                assert!(st.unflushed.lock().expect("pending").contains(&rel));
+                assert!(
+                    !st.path(QUARANTINE).exists(),
+                    "no evidence publication before admission"
+                );
+                if linked {
+                    assert!(std::fs::symlink_metadata(st.path(kind.place()))
+                        .expect("link remains")
+                        .is_symlink());
+                } else {
+                    assert_eq!(
+                        std::fs::read(st.path(kind.place())).expect("parent remains"),
+                        b"parent sentinel"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An existing marker that cannot be read is never an older build's
+    /// absent marker. A genuine missing run has the legacy positive control;
+    /// invalid bytes, a directory, a dangling link, and (off root) an unreadable
+    /// clean marker preserve all evidence.
+    #[test]
+    fn an_existing_run_marker_never_authorizes_legacy_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for occupant in ["invalid", "directory", "dangling", "unreadable"] {
+            if occupant == "unreadable" && aterm_uds::peer::our_uid() == 0 {
+                continue; // Root can read a mode-000 file.
+            }
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("run-marker")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let st = StateDir::open(dir.path()).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.take_incarnation(0).expect("legacy lease");
+            st.set_inc_seam(in_boot(2));
+            assert!(st
+                .torn_files_possible()
+                .expect("genuine absence uses legacy lease"));
+            let run = st.path("run");
+            let clean = LastRun {
+                boot: Some(boot_id(1)),
+                clean: true,
+            }
+            .render();
+            match occupant {
+                "invalid" => std::fs::write(&run, b"not a run\n").expect("invalid marker"),
+                "directory" => std::fs::create_dir(&run).expect("nonregular marker"),
+                "dangling" => std::os::unix::fs::symlink(dir.path().join("missing"), &run)
+                    .expect("dangling marker"),
+                _ => {
+                    std::fs::write(&run, &clean).expect("valid clean marker");
+                    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o000))
+                        .expect("make unreadable");
+                }
+            }
+            std::fs::write(st.path("sent/s-a.1"), b"torn evidence").expect("candidate");
+            assert!(st.last_run().is_err(), "the occupant is not absence");
+            assert!(st.torn_files_possible().is_err(), "no legacy verdict");
+            assert!(st.set_aside_torn().is_err(), "no sweep");
+            assert!(st.begin_run().is_err(), "no replacement on start");
+            assert!(st.end_run_clean().is_err(), "no replacement on stop");
+            assert_eq!(
+                std::fs::read(st.path("sent/s-a.1")).expect("source remains"),
+                b"torn evidence"
+            );
+            assert!(!st.path(QUARANTINE).exists());
+            match occupant {
+                "invalid" => assert_eq!(
+                    std::fs::read(&run).expect("invalid evidence remains"),
+                    b"not a run\n"
+                ),
+                "directory" => assert!(std::fs::symlink_metadata(&run)
+                    .expect("directory remains")
+                    .is_dir()),
+                "dangling" => assert_eq!(
+                    std::fs::read_link(&run).expect("link remains"),
+                    dir.path().join("missing")
+                ),
+                _ => {
+                    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o600))
+                        .expect("restore owned marker");
+                    assert_eq!(
+                        std::fs::read_to_string(&run).expect("clean evidence remains"),
+                        clean
+                    );
+                }
+            }
+        }
+    }
+
+    /// **ONLY AN UNCLEAN STOP IN AN EARLIER BOOT CAN HAVE TORN A FILE**
+    /// ([`StateDir::torn_files_possible`], astream's unclean-stop rule), read off
+    /// the durable `run` record — and, for a dir without one, off its lease's
+    /// boot. NOT within one boot, on the boot volume or off it, nor in a boot
+    /// nobody can name (no evidence of a reboot is no sweep); NOT after a clean
+    /// stop; and an existing record that does not read is refused.
+    #[test]
+    fn only_an_unclean_stop_in_an_earlier_boot_can_have_torn_a_file() {
+        let unnamed = IncSeam {
+            boot: Some(None),
+            ..IncSeam::default()
+        };
+        for off_volume in [false, true] {
+            let seam = |b| IncSeam {
+                off_volume,
+                ..in_boot(b)
+            };
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("unclean")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let st = StateDir::open(dir.path()).expect("open");
+            st.set_inc_seam(seam(1));
+            assert!(
+                !st.torn_files_possible().expect("missing run"),
+                "a new dir: nothing ran"
+            );
+            st.begin_run().expect("a run in boot 1");
+            assert_eq!(
+                st.last_run().expect("run record reads"),
+                Some(LastRun {
+                    boot: Some(boot_id(1)),
+                    clean: false
+                })
+            );
+            st.take_incarnation(0).expect("its attach");
+            assert!(
+                !st.torn_files_possible().expect("run reads"),
+                "the same boot, killed"
+            );
+            st.set_inc_seam(seam(2));
+            assert!(
+                st.torn_files_possible().expect("run reads"),
+                "boot 2, the run never closed"
+            );
+            st.set_inc_seam(unnamed);
+            assert!(
+                !st.torn_files_possible().expect("run reads"),
+                "a boot nobody can name"
+            );
+            st.set_inc_seam(seam(1));
+            st.end_run_clean().expect("a clean stop in boot 1");
+            assert_eq!(
+                st.last_run().expect("run record reads"),
+                Some(LastRun {
+                    boot: Some(boot_id(1)),
+                    clean: true
+                })
+            );
+            st.set_inc_seam(seam(2));
+            assert!(
+                !st.torn_files_possible().expect("run reads"),
+                "boot 2, after a clean stop"
+            );
+            st.begin_run().expect("boot 2's run");
+            st.set_inc_seam(seam(3));
+            assert!(
+                st.torn_files_possible().expect("run reads"),
+                "boot 3, boot 2's run never closed"
+            );
+            // A DIR WITHOUT THE RECORD (a build before it) is judged by its
+            // lease's boot, which a dir off the boot volume never names.
+            std::fs::remove_file(dir.path().join("run")).expect("no record");
+            st.set_inc_seam(seam(1));
+            st.take_incarnation(0)
+                .expect("an older build's attach, boot 1");
+            st.set_inc_seam(seam(2));
+            assert_eq!(
+                st.torn_files_possible().expect("legacy missing run"),
+                !off_volume,
+                "the lease's boot, where it names one"
+            );
+        }
+    }
+
+    /// **AFTER A CLEAN STOP, DAMAGE IS A BUG'S, AND A REBOOT DOES NOT CHANGE
+    /// THAT** — the review of finding F1's fix, against astream's clean close.
+    /// A bridge in boot 1 writes a reservation and an in-flight entry and is
+    /// killed; its successor in the same boot inherits them unflushed, writes a
+    /// receipt pin, and stops cleanly: every one of the three is rewritten
+    /// durably (and nothing else), then `run` says `clean`. A bug then damages
+    /// the reservation. In boot 2 nothing is set aside and its reader refuses
+    /// it, fail-closed. NEGATIVE CONTROL: the same run killed instead of
+    /// stopped — boot 2 sets the damage aside, as after a power cut.
+    #[test]
+    fn after_a_clean_stop_damage_is_refused_across_a_reboot() {
+        for clean in [true, false] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("clean")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let killed = StateDir::open(root).expect("open");
+            killed.set_inc_seam(in_boot(1));
+            killed.begin_run().expect("the first run");
+            let entry = in_flight_entry(7);
+            killed.set_in_flight(&entry).expect("an entry");
+            killed
+                .set_post_pin("s-a", 1, &entry.pin)
+                .expect("a reservation");
+            drop(killed);
+            let st = StateDir::open(root).expect("its successor, in the same boot");
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("the second run");
+            st.set_receipt_pin("s-a", 4, &entry.pin)
+                .expect("a receipt pin");
+            if clean {
+                st.set_inc_seam(IncSeam {
+                    kill_at: Some(IncStep::Renamed),
+                    ..in_boot(1)
+                });
+                assert!(
+                    st.end_run_clean().is_err(),
+                    "a controlled failed flush attempt"
+                );
+                assert_eq!(
+                    st.last_run().expect("run reads").map(|run| run.clean),
+                    Some(false)
+                );
+                st.set_inc_seam(in_boot(1));
+                let before = st.ops();
+                st.end_run_clean().expect("a clean stop");
+                assert_eq!(
+                    (st.ops() - before).replaces,
+                    4,
+                    "the three files of the two runs, rewritten durably, then `run`"
+                );
+                assert_eq!(
+                    st.last_run().expect("run reads").map(|run| run.clean),
+                    Some(true)
+                );
+            }
+            std::fs::write(root.join("sent/s-a.1"), b"7 key identity\n").expect("a bug's damage");
+            st.set_inc_seam(in_boot(2));
+            let moved = st.set_aside_torn().expect("the sweep");
+            if clean {
+                assert!(moved.is_empty(), "nothing a clean stop left can be torn");
+                assert!(st.post_pin("s-a", 1).is_err(), "refused, fail-closed");
+            } else {
+                assert_eq!(
+                    moved.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
+                    ["sent/s-a.1"],
+                    "CONTROL: a run that never closed is judged unclean"
+                );
+            }
+        }
+    }
+
+    /// **FINDING F2, DECIDED: A WHOLE IN-FLIGHT ENTRY OF AN EARLIER BOOT IS
+    /// RETIRED, NEVER PUBLISHED AGAIN** — on the real filesystem
+    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]).
+    ///
+    /// The last bridge ran in boot 1 and did not stop cleanly, leaving two whole
+    /// in-flight entries beside one a power cut cut short. In boot 2 the
+    /// retirement moves the two whole ones into `quarantine/` under `retired.`
+    /// with their exact bytes, and leaves the cut one to the torn sweep (whose
+    /// reader refuses it until then): the retirement never takes what that
+    /// sweep judges. The journal then reads empty — nothing for the attach to
+    /// publish again — a second retirement moves nothing, and an entry at a
+    /// name the quarantine holds gets a suffix rather than overwrite it.
+    /// NEGATIVE CONTROLS: in boot 1 again (a `kill -9`, which the page cache
+    /// outlived) and after a clean stop (which flushed every unlink, so an
+    /// entry there is one still in flight), nothing is retired, and the
+    /// entries stay for the attach to publish again, as before.
+    #[test]
+    fn a_whole_in_flight_entry_of_an_earlier_boot_is_retired_and_within_a_boot_kept() {
+        for (case, boot, clean) in [
+            ("an unclean stop, then a reboot", 2, false),
+            ("a kill in the same boot", 1, false),
+            ("a clean stop, then a reboot", 2, true),
+        ] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("retire")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("boot 1's run");
+            let (seven, nine) = (in_flight_entry(7), in_flight_entry(9));
+            st.set_in_flight(&seven).expect("a whole entry");
+            st.set_in_flight(&nine).expect("another");
+            let on_disk = std::fs::read(root.join("inflight/7")).expect("its bytes");
+            if clean {
+                st.end_run_clean().expect("a clean stop");
+            }
+            let entry = in_flight_entry(8).render();
+            let cut = &entry.as_bytes()[..entry.find("/s-a/").expect("the face") + 3];
+            std::fs::write(root.join("inflight/8"), cut).expect("a cut entry");
+            st.set_inc_seam(in_boot(boot));
+            let retired = st
+                .retire_in_flight_of_an_earlier_boot()
+                .expect("the retirement");
+            if boot == 1 || clean {
+                assert!(retired.is_empty(), "{case}: nothing is retired");
+                assert!(!root.join(QUARANTINE).exists(), "{case}: nothing moved");
+                for seq in [7, 9] {
+                    assert!(
+                        root.join(format!("inflight/{seq}")).exists(),
+                        "{case}: inflight/{seq} stays, for the attach to publish again"
+                    );
+                }
+                continue;
+            }
+            assert_eq!(
+                retired,
+                [7, 9]
+                    .map(|seq| SetAside {
+                        from: format!("inflight/{seq}"),
+                        to: format!("{QUARANTINE}/{RETIRED_PREFIX}inflight.{seq}"),
+                    })
+                    .to_vec(),
+                "every whole entry, and only those"
+            );
+            assert_eq!(
+                std::fs::read(root.join("quarantine/retired.inflight.7")).expect("kept"),
+                on_disk,
+                "its exact bytes, never deleted"
+            );
+            assert_eq!(
+                st.in_flight()
+                    .expect_err("the cut one, the torn sweep's")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            let torn = st.set_aside_torn().expect("the torn sweep");
+            assert_eq!(
+                torn.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
+                ["inflight/8"]
+            );
+            assert!(
+                st.in_flight().expect("the journal reads").is_empty(),
+                "nothing left for the attach to publish again"
+            );
+            assert!(
+                st.retire_in_flight_of_an_earlier_boot()
+                    .expect("again")
+                    .is_empty(),
+                "idempotent"
+            );
+            st.set_in_flight(&seven)
+                .expect("an entry at a retired name");
+            let again = st.retire_in_flight_of_an_earlier_boot().expect("again");
+            assert_eq!(
+                again.iter().map(|m| m.to.as_str()).collect::<Vec<_>>(),
+                [format!("{QUARANTINE}/{RETIRED_PREFIX}inflight.7.1")]
+            );
+            assert_eq!(
+                std::fs::read(root.join("quarantine/retired.inflight.7")).expect("kept"),
+                on_disk,
+                "the first one is not overwritten"
+            );
+        }
+    }
+
+    /// **AN ATTACH OF THIS BOOT ON RECORD STOPS THE RETIREMENT** — the review
+    /// of finding F2's fix ([`StateDir::attached_in_this_boot`]). The last
+    /// bridge of boot 1 attached and did not stop cleanly, leaving a whole
+    /// entry. In boot 2 the disk refuses `begin_run`, so `run` still says
+    /// "open, boot 1" — and then an attach of boot 2 takes an incarnation
+    /// anyway (an older build's, which did not wait for `run`), its lease
+    /// naming boot 2: the entry may be a live session's, and nothing is moved.
+    /// NEGATIVE CONTROLS: with no attach in boot 2 (the lease boot 1 wrote),
+    /// and off the boot volume (a lease that names no boot), the entry is
+    /// retired, as the first bridge of a boot retires it.
+    #[test]
+    fn an_attach_of_this_boot_on_record_stops_the_retirement() {
+        for (case, off_volume, attached_in_boot_2) in [
+            ("a lease of boot 2", false, true),
+            ("a lease of boot 1", false, false),
+            ("off the boot volume", true, true),
+        ] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("retire-lease")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            let seam = |b| IncSeam {
+                off_volume,
+                ..in_boot(b)
+            };
+            st.set_inc_seam(seam(1));
+            st.begin_run().expect("boot 1's run");
+            st.take_incarnation(0).expect("boot 1's attach");
+            st.set_in_flight(&in_flight_entry(7))
+                .expect("a whole entry");
+            st.set_inc_seam(seam(2));
+            st.refuse_writes_of(Some("run"));
+            assert_eq!(
+                st.begin_run().expect_err("the disk refuses `run`").kind(),
+                io::ErrorKind::StorageFull,
+                "{case}"
+            );
+            assert_eq!(
+                st.last_run().expect("run reads"),
+                Some(LastRun {
+                    boot: Some(boot_id(1)),
+                    clean: false
+                }),
+                "{case}: `run` still names boot 1"
+            );
+            if attached_in_boot_2 {
+                st.take_incarnation(0).expect("boot 2's attach");
+            }
+            let retired = st
+                .retire_in_flight_of_an_earlier_boot()
+                .expect("the retirement");
+            if attached_in_boot_2 && !off_volume {
+                assert!(retired.is_empty(), "{case}: nothing is retired");
+                assert!(root.join("inflight/7").exists(), "{case}: the entry stays");
+            } else {
+                assert_eq!(
+                    retired.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
+                    ["inflight/7"],
+                    "{case}: NEGATIVE CONTROL"
+                );
+            }
+        }
+    }
+
+    /// **A CUT IN-FLIGHT ENTRY THAT STILL READS IS SET ASIDE TOO** — the review
+    /// of finding F1's fix. A real file is cut part-way, not only to nothing,
+    /// and three cuts of a witnessed reply's entry read whole: just before its
+    /// `log=` line (no witness), inside its hex body at an even length (a
+    /// shorter body, no witness), and inside the witness's generation (a lower
+    /// one). Kept, the first two are unwitnessed references that
+    /// `Bridge::settle_in_flight` refuses at every attach — finding F1's wedge
+    /// again. After an unclean stop in an earlier boot each is moved aside,
+    /// with its exact bytes, and the whole entry beside them stays.
+    #[test]
+    fn a_cut_in_flight_entry_that_still_reads_is_set_aside_after_an_unclean_reboot() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("cut")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let st = StateDir::open(root).expect("open");
+        st.set_inc_seam(in_boot(1));
+        st.take_incarnation(0).expect("the last attach, in boot 1");
+        let reply = |seq| InFlight {
+            body: b"v=1 t=5 re=42 text=a reply".to_vec(),
+            log: astream_broker::LogIdentity::parse(&format!("{}.12", "5a".repeat(16))),
+            ..in_flight_entry(seq)
+        };
+        let whole = reply(7);
+        st.set_in_flight(&whole).expect("a whole entry");
+        for seq in [8, 9, 10] {
+            st.set_in_flight(&reply(seq))
+                .expect("an entry the cut will take");
+        }
+        // Each cut, at a place in its own entry's text.
+        let at = |seq: u64, text: &str| match seq {
+            // just before `log=`
+            8 => text.find("log=").expect("its witness"),
+            // six bytes into the body: an even hex length
+            9 => text.match_indices('\n').nth(1).expect("its face line").0 + 1 + 12,
+            // inside the generation: `.12\n` to `.1`
+            _ => text.len() - 2,
+        };
+        for seq in [8, 9, 10] {
+            let path = root.join(format!("inflight/{seq}"));
+            let text = std::fs::read_to_string(&path).expect("as written");
+            let cut = &text[..at(seq, &text)];
+            std::fs::write(&path, cut).expect("the cut");
+            let read = InFlight::parse(seq, cut).expect("PRECONDITION: the cut still reads");
+            assert_eq!(read.log.is_some(), seq == 10, "{cut:?}");
+        }
+        st.set_inc_seam(in_boot(2));
+        let moved = st.set_aside_torn().expect("the sweep");
+        assert_eq!(
+            moved.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
+            ["inflight/10", "inflight/8", "inflight/9"],
+            "every cut entry, and not the whole one"
+        );
+        assert_eq!(st.in_flight().expect("reads"), vec![(7, whole)]);
+    }
+
+    /// **WITHIN ONE BOOT NOTHING IS SET ASIDE, ON ANY VOLUME** — the review of
+    /// finding F1's fix: a boot nobody can name (and a dir off the boot volume)
+    /// gives the page cache no voucher, but no reboot either. Damage there is
+    /// a bug, and a reservation a sweep set aside would publish its post again
+    /// at a fresh sequence — a second copy — so the reader refuses it, as it
+    /// always did.
+    #[test]
+    fn damage_in_a_boot_nobody_can_name_is_refused_not_set_aside() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("unnamed")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let st = StateDir::open(root).expect("open");
+        st.set_inc_seam(IncSeam {
+            boot: Some(None),
+            ..IncSeam::default()
+        });
+        st.take_incarnation(0).expect("an attach");
+        std::fs::create_dir_all(root.join("sent")).expect("sent/");
+        std::fs::write(root.join("sent/s-a.1"), b"12 key ident").expect("a damaged reservation");
+        assert!(st.set_aside_torn().expect("no sweep").is_empty());
+        assert!(st.post_pin("s-a", 1).is_err(), "refused, fail-closed");
+    }
+
+    /// **A TORN `logpin` IS NOT SET ASIDE** — the review of finding F1's fix:
+    /// the pin holds the node's lifetime total of mirrored bytes (ruling Q13's
+    /// cap) and its alias key (ruling Q6), which no reboot ends. Moved aside,
+    /// the next mirror would mint a fresh key and count from zero; left where
+    /// it is, the mirror refuses it and stops, keeping both on disk.
+    #[test]
+    fn a_torn_logpin_is_left_for_the_mirror_to_refuse() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("logpin")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let st = StateDir::open(root).expect("open");
+        st.set_inc_seam(in_boot(1));
+        st.take_incarnation(0).expect("the last attach, in boot 1");
+        std::fs::write(root.join("logpin"), b"").expect("torn to nothing");
+        st.set_inc_seam(in_boot(2));
+        assert!(st.set_aside_torn().expect("the sweep").is_empty());
+        assert_eq!(st.logpin().expect("read").as_deref(), Some(""));
     }
 }

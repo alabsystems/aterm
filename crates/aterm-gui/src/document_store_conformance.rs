@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the native document mutation/publication and close
-//! protocols. These tests drive the genuine Surface-backed [`DocumentStore`] (and,
-//! for publication, the shipping Editor controller over it),
-//! project independently observed store state into the drift-free models, and
-//! ask the executable model whether each real transition is admitted.
+//! Tier-1 conformance for the native document publication and close protocols: drives the
+//! real Surface-backed [`DocumentStore`] (and the shipping Editor controller over it), projects
+//! the observed state into the derived models and checks each transition is admitted.
 
 #![cfg(test)]
 
@@ -24,8 +22,7 @@ use crate::native_editor::{EditorBufferView, EditorError, EditorWorkspace, Selec
 #[derive(Clone, Copy)]
 struct PendingTxn {
     active: bool,
-    /// The Editor transaction's base: the Editor view's anchor sequence when it
-    /// began, read off the shipping view.
+    /// The Editor view's anchor sequence when the transaction began.
     base: Seq,
 }
 
@@ -33,15 +30,11 @@ fn relative(seq: Seq, baseline: Seq) -> i64 {
     i64::try_from(seq.0.saturating_sub(baseline.0)).expect("bounded test sequence")
 }
 
-/// Every text the document has published, with the sequence that published it,
-/// from the baseline on — built from the edits THIS TEST made, never read back
-/// from the store. The immutable snapshot's generation is read off its text
-/// against this record. `DocumentSnapshot::seq` is the Surface head by
-/// construction, so projecting `snapshot_seq` from it would make
-/// `SnapshotCurrent` true by construction, and so would recording the store's
-/// own text after each commit: a projection cache left on the old text would be
-/// recorded as the new one. Built independently, a stale cache resolves to the
-/// older sequence it still carries.
+/// Every text the document has published, with its sequence, built from this test's own
+/// edits and never read back from the store. The snapshot's generation is looked up by its
+/// text: `DocumentSnapshot::seq` is the Surface head by construction, so projecting from it
+/// (or recording the store's text after each commit) would make `SnapshotCurrent` vacuous.
+/// Built independently, a stale cache resolves to the older sequence it still carries.
 type TextHistory = Vec<(Seq, String)>;
 
 fn publication_projection(
@@ -72,14 +65,11 @@ fn publication_projection(
     state.insert("snapshot_seq", relative(snapshot_text_seq, baseline));
     state.insert("editor_seen", relative(editor_seen, baseline));
     state.insert("markdown_seen", relative(markdown_seen, baseline));
-    // The shipping Editor view's own anchor version, which the host moves
-    // through `observe_external` and the Editor's commit through `observe_own`.
+    // Moved by the host's `observe_external` and the Editor's own `observe_own`.
     state.insert("anchor_seq", relative(editor.anchor_seq(), baseline));
     state.insert("txn_active", i64::from(pending.active));
     state.insert("txn_base", relative(pending.base, baseline));
-    // These are defect witnesses, not duplicated sources of real state. A real
-    // conflict/atomic publication is checked below from before/after snapshots;
-    // the explicit corrupted projections flip these witnesses and must fail.
+    // Defect witnesses, not real state: only the corrupted projections below set them.
     state.insert("stale_write", 0);
     state.insert("partial_publish", 0);
     state
@@ -116,8 +106,7 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
     let document = store.open("mem://conformance/publication".into(), "alpha".into());
     let markdown = DocumentViewId(101);
     store.attach_view(document, markdown).unwrap();
-    // The Editor controller is the shipping one: its view, its anchor rebase
-    // and its own commits.
+    // The shipping Editor controller: its view, its anchor rebase and its own commits.
     let mut workspace = EditorWorkspace::new();
     let mut editor = workspace
         .attach(&mut store, document, DocumentViewId(102))
@@ -128,9 +117,8 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
     let mut text = String::from("alpha");
     let mut history: TextHistory = vec![(baseline, text.clone())];
 
-    // Editor begins at the current immutable snapshot. The transaction base is
-    // deliberately retained — as the view it was built from — while the other
-    // controller commits twice.
+    // The Editor's transaction base is retained, as the view it was built from, while the
+    // other controller commits twice.
     let retained = editor.clone();
     let mut pending = PendingTxn {
         active: true,
@@ -141,9 +129,8 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
         let before = publication_projection(
             &model, &store, document, &editor, markdown, pending, &history,
         );
-        // The other controller inserts ahead of the Editor's caret, and the host
-        // rebases the Editor through the commit's deltas, as it does for a disk
-        // refresh.
+        // The other controller inserts ahead of the Editor's caret; the host rebases the
+        // Editor through the commit's deltas, as for a disk refresh.
         let snapshot = store.snapshot(document).unwrap();
         let (seq, deltas) = committed(store.transact(
             document,
@@ -168,10 +155,9 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
         );
         assert_transition(&model, &before, &after, "OtherCommit");
 
-        // Negative control: the commit published only to its author. An Editor
-        // the host did not rebase keeps its old anchor version — projected from
-        // that real view — which no healthy step leaves behind; the mutant's
-        // step leaves the snapshot on the old text as well.
+        // Negative control: the commit published only to its author. An Editor the host did
+        // not rebase keeps its old anchor, which no healthy step leaves; the mutant also
+        // leaves the snapshot on the old text.
         let missed = publication_projection(
             &model, &store, document, &unrebased, markdown, pending, &history,
         );
@@ -187,9 +173,8 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
             assert!(!model.check_invariant(law, &author_only), "{law}");
         }
 
-        // Negative control: a router that publishes the commit only to Editor
-        // cannot masquerade as the real transition and violates the same derived
-        // invariant. This state is built independently from the router decision.
+        // Negative control: publishing the commit only to the Editor is no real transition
+        // and breaks the same invariant.
         let mut editor_only = after.clone();
         editor_only.insert("markdown_seen", before["markdown_seen"]);
         editor_only.insert("partial_publish", 1);
@@ -198,9 +183,8 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
         assert!(!model.check_invariant("PublishIsAtomic", &editor_only));
     }
 
-    // The original Editor request is now stale. The shipping Editor refuses its
-    // retained view before any transaction, the store's own lane answers
-    // Conflict to its base, and neither changes canonical text or an observer.
+    // The retained Editor request is now stale: the Editor refuses its view, the store
+    // answers Conflict to its base, and neither changes the text or an observer.
     let before_snapshot = store.snapshot(document).unwrap();
     let editor_before = store.observed_seq(document, editor.document_view);
     let markdown_before = store.observed_seq(document, markdown);
@@ -239,9 +223,8 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
     );
     assert_transition(&model, &before_reject, &after_reject, "RejectStale");
 
-    // Negative control: blind stale acceptance advances every data lane but
-    // explicitly records the forbidden stale write. It is not a valid Buggy=0
-    // transition and the invariant catches it.
+    // Negative control: blind stale acceptance advances every lane and records the stale
+    // write; the model rejects the step and the invariant catches it.
     let mut blind_stale = before_reject.clone();
     for key in [
         "edit_seq",
@@ -257,8 +240,8 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
     assert_eq!(admits(&model, &before_reject, &blind_stale), None);
     assert!(!model.check_invariant("StaleTxnIsNoOp", &blind_stale));
 
-    // A fresh transaction commits through the shipping Editor at its caret and
-    // is published to Markdown before this synchronous call returns.
+    // A fresh transaction commits at the Editor's caret and reaches Markdown before this
+    // synchronous call returns.
     pending = PendingTxn {
         active: true,
         base: editor.anchor_seq(),
@@ -352,8 +335,7 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
         other_leaf_ready: false,
     };
 
-    // A real edit makes the document dirty and conforms to the close model's
-    // only Open-phase mutation.
+    // A real edit makes the document dirty: the close model's only Open-phase mutation.
     let before_edit = close_projection(&model, &store, document, projection);
     let (dirty_seq, _) = committed(append_text(&mut store, document, "!"));
     let after_edit = close_projection(&model, &store, document, projection);
@@ -377,8 +359,8 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
     );
     assert_eq!(store.view_count(document), Some(1));
 
-    // Markdown is now the final view: the genuine store freezes the mandatory
-    // sequence and refuses detach until a durable checkpoint reaches it.
+    // Markdown is now the final view: the store freezes the requested sequence and refuses
+    // detach until a durable checkpoint reaches it.
     let before_final = close_projection(&model, &store, document, projection);
     let readiness = store.prepare_close(document, &[markdown]).unwrap();
     let DocumentCloseReadiness::Pending { requested } = readiness else {
@@ -388,9 +370,8 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
     let after_final = close_projection(&model, &store, document, projection);
     assert_transition(&model, &before_final, &after_final, "BeginFinalClose");
 
-    // Negative control: Closing freezes the head. The genuine mutation lane
-    // refuses an edit here; a lane that admitted it would move the head past
-    // the frozen request, which the healthy model does not admit.
+    // Negative control: Closing freezes the head. The real lane refuses the edit; one that
+    // admitted it would move the head past the frozen request.
     assert_eq!(
         append_text(&mut store, document, "late"),
         DocumentTxnOutcome::Rejected(DocumentError::Closing)
@@ -415,8 +396,7 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
         "refused close changes no projected state"
     );
 
-    // Negative control: a coordinator that detaches the leaf here is rejected by
-    // the executable Next relation and violates both atomicity and durability.
+    // Negative control: detaching the leaf here breaks both atomicity and durability.
     let mut early_detach = before_refused.clone();
     early_detach.insert("phase", 3);
     early_detach.insert("markdown_views", 0);
@@ -425,8 +405,8 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
     assert!(!model.check_invariant("AtomicTreeClose", &early_detach));
     assert!(!model.check_invariant("NoSilentLoss", &early_detach));
 
-    // Persistence failure blocks the plan and preserves the view. Retry returns
-    // to Closing but cannot fabricate a durable acknowledgement.
+    // A persistence failure blocks the plan and keeps the view; a retry returns to Closing
+    // without fabricating an ack.
     let before_fail = close_projection(&model, &store, document, projection);
     assert_eq!(store.checkpoint_fail(document).unwrap(), requested);
     let after_fail = close_projection(&model, &store, document, projection);
@@ -447,8 +427,7 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
         "Retry is not a fake Ack"
     );
 
-    // The other leaf's independently obtained Ready verdict joins the plan; it
-    // is intentionally separate from document durability.
+    // The other leaf's Ready verdict joins the plan, separate from document durability.
     let before_other_ready = close_projection(&model, &store, document, projection);
     projection.other_leaf_ready = true;
     let after_other_ready = close_projection(&model, &store, document, projection);
@@ -461,9 +440,8 @@ fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
 
     let before_ack = close_projection(&model, &store, document, projection);
 
-    // Negative control: the acknowledgement of an OLDER generation (the clean
-    // baseline) leaves the plan Pending in the genuine store. Read as covering
-    // the request, it would close the document below its frozen sequence.
+    // Negative control: an ack of the older clean baseline leaves the plan Pending; read as
+    // covering the request, it would close below the frozen sequence.
     assert_eq!(
         store.checkpoint_ack(document, baseline).unwrap(),
         DocumentCloseReadiness::Pending { requested }

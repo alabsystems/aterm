@@ -1601,6 +1601,8 @@ pub(crate) fn pet_owner_tick_for_test(
         caret: sense.caret,
         cursor_visible: sense.caret_drawn,
         frame_unfinished: false,
+        sync_end_seq: 0,
+        sync_end_caret: None,
         display_offset: 0,
         live_viewport: true,
         content_seq: 0,
@@ -1678,6 +1680,8 @@ pub(crate) fn pet_prepare_shed_for_test(
         caret,
         cursor_visible: caret.is_some(),
         frame_unfinished: false,
+        sync_end_seq: 0,
+        sync_end_caret: None,
         display_offset: 0,
         live_viewport: true,
         content_seq: 0,
@@ -4785,9 +4789,11 @@ pub(crate) struct ComposeDecoCtx<'a> {
     pub(crate) win_cols: u16,
     pub(crate) cell_w: u32,
     pub(crate) cell_h: u32,
-    /// The focused pane's caret in pane-local cells; `None` while scrolled into
-    /// history or hidden.
-    pub(crate) focus_cursor: Option<(u16, u16)>,
+    /// The caret the cursor companions escort, in the focused pane's cells
+    /// ([`aterm_effects::companion::PetTick::escort_caret`], the single-pane
+    /// path's rule): hidden or not, the last finished caret on a frame the
+    /// program has not finished, `None` while scrolled into history.
+    pub(crate) escort_caret: Option<(u16, u16)>,
     /// The window focus the cursor effects fold: `App::cursor_fx_focus` (raw
     /// focus, recording pin, typed wake) on the live present; raw focus on a
     /// capture splice.
@@ -6571,7 +6577,23 @@ pub(crate) struct TerminalCaptureFocus {
     pub(crate) live_viewport: bool,
     /// Rows scrolled back into history (`0` on the live viewport).
     pub(crate) display_offset: usize,
+    /// The caret on the live viewport, hidden or not (`None` while scrolled
+    /// into history), as a present hands it to the pet: the companions take
+    /// the caret they escort from it by the present's rule
+    /// ([`aterm_effects::companion::PetTick::escort_caret`]), so a capture
+    /// shows them where the glass does.
     pub(crate) cursor: Option<(u16, u16)>,
+    /// The emulator paints the caret (DECTCEM shown), same lock.
+    pub(crate) cursor_visible: bool,
+    /// The program's own account that the captured frame is unfinished
+    /// ([`aterm_core::terminal::Terminal::sync_frame_unfinished`]), same lock:
+    /// a hidden cursor on such a frame is its write position.
+    pub(crate) frame_unfinished: bool,
+    /// The terminal's count of synchronized-output closes
+    /// ([`aterm_core::terminal::Terminal::sync_end_seq`]), same lock.
+    pub(crate) sync_end_seq: u64,
+    /// The latest close's cell, from the same terminal hold.
+    pub(crate) sync_end_caret: Option<(u16, u16)>,
     /// Bounded console facts paired with these exact captured cells. The pet
     /// must never refresh ownership or scroll history by re-locking later.
     pub(crate) pet_world: aterm_effects::pet_world::PetWorldFacts,
@@ -6716,11 +6738,92 @@ fn with_borrowed_prediction_overlay<R>(
     consume(cells, chain_cursor)
 }
 
+/// What [`paint_prediction_overlay`] drew.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PredictionPainted {
+    /// Where the predicted cursor goes ([`paint_predictions`]), or `None` when
+    /// nothing is displayed and the engine's cursor stands.
+    cursor: Option<(u16, u16)>,
+    /// The overlay was painted WHOLE, through this op
+    /// (`Predictor::shown_through`): every visible guess of the glyph lane,
+    /// or every cell of a state chain (painted all or none), is in this
+    /// frame, so every key up to it whose op is pending is on glass. `None`
+    /// when nothing was displayed, or when the glyph lane's painter refused
+    /// ANY visible guess (half of a wide glyph, a column past the pane): what
+    /// the frame shows of that key is the engine's, and of the keys after it
+    /// a run placed on its effect.
+    shown_through: Option<u64>,
+    /// The overlay was displayed under its proof (`adaptive`: every op it
+    /// shows passed the display gate, `edit-class-proof` in aterm-predict's
+    /// SPECS.md), so what it shows of a key is the key's effect as the far
+    /// end will echo it. `always` displays with none: a guess at a remote
+    /// prompt that never echoes is drawn too.
+    proven: bool,
+}
+
+impl PredictionPainted {
+    /// The op through which this frame's present closes the input slices of
+    /// the keys whose prediction it shows (`metrics::note_prediction_shown`):
+    /// painted whole, under its proof. A guess shown with no proof (`always`)
+    /// is not yet the key's effect, so its key waits for its echo, as with
+    /// prediction off.
+    fn closes_input_through(self) -> Option<u64> {
+        self.shown_through.filter(|_| self.proven)
+    }
+}
+
+/// Paint this frame's predictions into `scratch` ([`paint_predictions`]):
+/// both render paths, the single pane's grid and the focused pane's own. In a
+/// test or debug build with `$ATERM_TRACE_PREDICT` set, a frame that painted
+/// is traced (`crate::predict_trace`).
+fn paint_prediction_overlay(
+    predictor: &mut crate::predict::Predictor,
+    scratch: &mut RenderInput,
+    now: Instant,
+    cols: usize,
+    blank: RenderCell,
+) -> PredictionPainted {
+    #[cfg(any(test, debug_assertions))]
+    let mut under = None;
+    let drawn = with_borrowed_prediction_overlay(predictor, now, |preds, chain| {
+        #[cfg(any(test, debug_assertions))]
+        {
+            under = Some(crate::predict_trace::Under::read(scratch, preds, chain));
+        }
+        paint_predictions(scratch, preds, chain, cols, blank)
+    });
+    #[cfg(any(test, debug_assertions))]
+    if let (Some(cursor), Some(under)) = (drawn.cursor, under.as_ref()) {
+        crate::predict_trace::frame(predictor, under, scratch, cursor, now);
+    }
+    PredictionPainted {
+        cursor: drawn.cursor,
+        shown_through: if drawn.cursor.is_some() && drawn.whole {
+            predictor.shown_through()
+        } else {
+            None
+        },
+        proven: predictor.mode() == crate::predict::PredictMode::Adaptive,
+    }
+}
+
+/// What [`paint_predictions`] drew of the overlay it was handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverlayPaint {
+    /// Where the predicted cursor goes, or `None` when nothing is displayed
+    /// and the engine's cursor stands.
+    cursor: Option<(u16, u16)>,
+    /// Every cell it was handed was painted (a state chain's, whenever its
+    /// cursor is drawn).
+    whole: bool,
+}
+
 /// Paint this frame's predictions and say where the predicted cursor goes, or
-/// `None` when nothing is displayed and the engine's cursor stands. The glyph
-/// lane paints each guess the painter accepts and puts the cursor one past the
-/// newest it painted ([`paint_prediction_ghosts`]); a state chain (predictive
-/// editing: `chain_cursor` is its cursor) is painted all or none
+/// `None` when nothing is displayed and the engine's cursor stands, and
+/// whether it painted them all. The glyph lane paints each guess the painter
+/// accepts and puts the cursor one past the newest it painted
+/// ([`paint_prediction_ghosts`]); a state chain (predictive editing:
+/// `chain_cursor` is its cursor) is painted all or none
 /// ([`paint_prediction_chain`]).
 fn paint_predictions(
     scratch: &mut RenderInput,
@@ -6728,13 +6831,25 @@ fn paint_predictions(
     chain_cursor: Option<(u16, u16)>,
     cols: usize,
     blank: RenderCell,
-) -> Option<(u16, u16)> {
+) -> OverlayPaint {
     match chain_cursor {
-        Some(cursor) => paint_prediction_chain(scratch, preds, cursor, cols, blank),
-        None => paint_prediction_ghosts(scratch, preds, cols, blank).map(|(row, col)| {
+        Some(cursor) => {
+            let cursor = paint_prediction_chain(scratch, preds, cursor, cols, blank);
+            OverlayPaint {
+                cursor,
+                whole: cursor.is_some(),
+            }
+        }
+        None => {
+            let ghosts = paint_prediction_ghosts(scratch, preds, cols, blank);
             let last = u16::try_from(cols.saturating_sub(1)).unwrap_or(u16::MAX);
-            (row, col.saturating_add(1).min(last))
-        }),
+            OverlayPaint {
+                cursor: ghosts
+                    .newest
+                    .map(|(row, col)| (row, col.saturating_add(1).min(last))),
+                whole: ghosts.refused == 0,
+            }
+        }
     }
 }
 
@@ -6804,6 +6919,16 @@ fn span_cell(p: &crate::predict::Prediction) -> SpanCell {
     }
 }
 
+/// What [`paint_prediction_ghosts`] painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GhostsPainted {
+    /// The newest guess it PAINTED, or `None` when it painted none.
+    newest: Option<(u16, u16)>,
+    /// The guesses the painter refused: while any is, the frame does not show
+    /// every visible guess.
+    refused: usize,
+}
+
 /// Overlay pending speculative-echo ghosts onto a terminal-coordinate snapshot
 /// (`input_scratch` single-pane; the focused pane's `pane_scratch` before the
 /// blit when composed), each through `RenderInput::paint_prediction_ghost`: the
@@ -6811,7 +6936,8 @@ fn span_cell(p: &crate::predict::Prediction) -> SpanCell {
 /// cell and nothing else (found through `visual_col`, as reconcile reads it; never
 /// half of a wide glyph; a short row padded with the terminal's implicit `blank`,
 /// not the last cell's SGR background; nothing at or past `cols`). Returns the
-/// newest guess it PAINTED, or `None` when it painted none.
+/// newest guess it PAINTED, or `None` when it painted none, and how many it
+/// refused.
 ///
 /// Both render paths draw the cursor one past that guess, never past a newer one
 /// the painter refused: a refused guess sits on half of a wide glyph, and one
@@ -6825,15 +6951,20 @@ fn paint_prediction_ghosts(
     preds: &[crate::predict::Prediction],
     cols: usize,
     blank: RenderCell,
-) -> Option<(u16, u16)> {
-    let mut newest_painted = None;
+) -> GhostsPainted {
+    let mut painted = GhostsPainted {
+        newest: None,
+        refused: 0,
+    };
     for p in preds {
         if scratch.paint_prediction_ghost(usize::from(p.row), usize::from(p.col), p.ch, cols, blank)
         {
-            newest_painted = Some((p.row, p.col));
+            painted.newest = Some((p.row, p.col));
+        } else {
+            painted.refused += 1;
         }
     }
-    newest_painted
+    painted
 }
 
 /// Compose a text field's display string with an in-flight IME composition
@@ -7066,7 +7197,8 @@ mod overlay_card_theme_tests {
 #[cfg(test)]
 mod prediction_ghost_tests {
     use super::{
-        paint_prediction_chain, paint_prediction_ghosts, paint_predictions, terminal_blank_cell,
+        paint_prediction_chain, paint_prediction_ghosts, paint_prediction_overlay,
+        paint_predictions, terminal_blank_cell,
     };
     use crate::predict::{GhostCell, Prediction};
     use aterm_core::terminal::{RenderCell, Terminal};
@@ -7104,7 +7236,7 @@ mod prediction_ghost_tests {
         let mut s = scratch(2);
         let preds = [Prediction::test_at(1, 3, 'x')];
         assert_eq!(
-            paint_prediction_ghosts(&mut s, &preds, 10, blank()),
+            paint_prediction_ghosts(&mut s, &preds, 10, blank()).newest,
             Some((1, 3))
         );
         assert_eq!(s.cells[1].len(), 4, "row extended to hold the ghost");
@@ -7136,6 +7268,7 @@ mod prediction_ghost_tests {
 
         assert!(
             paint_prediction_ghosts(&mut s, &[Prediction::test_at(0, 3, 'x')], 5, live_blank)
+                .newest
                 .is_some()
         );
         assert_eq!(s.cells[0][0], styled, "materialized SGR cell is preserved");
@@ -7156,14 +7289,14 @@ mod prediction_ghost_tests {
             Prediction::test_at(7, 0, 'c'), // past rows → ignored
         ];
         assert_eq!(
-            paint_prediction_ghosts(&mut s, &preds, 5, blank()),
+            paint_prediction_ghosts(&mut s, &preds, 5, blank()).newest,
             None,
             "nothing painted when everything clips"
         );
         assert!(s.cells[0].is_empty(), "clipped ghosts never extend the row");
         let ok = [Prediction::test_at(0, 4, 'd')]; // last in-rect column paints
         assert_eq!(
-            paint_prediction_ghosts(&mut s, &ok, 5, blank()),
+            paint_prediction_ghosts(&mut s, &ok, 5, blank()).newest,
             Some((0, 4))
         );
         assert_eq!(s.cells[0][4].ch, 'd');
@@ -7194,8 +7327,11 @@ mod prediction_ghost_tests {
         ];
         assert_eq!(
             paint_prediction_ghosts(&mut s, &preds, 5, blank()),
-            Some((0, 0)),
-            "the newest PAINTED guess, not the refused newest"
+            super::GhostsPainted {
+                newest: Some((0, 0)),
+                refused: 1,
+            },
+            "the newest PAINTED guess, not the refused newest, which is counted"
         );
         assert_eq!(s.cells[0][0].ch, 'b');
         assert_eq!(s.cells[0][1].ch, '日');
@@ -7204,11 +7340,61 @@ mod prediction_ghost_tests {
         let mut s = scratch(1);
         s.cells[0] = row();
         assert_eq!(
-            paint_prediction_ghosts(&mut s, &preds[1..], 5, blank()),
+            paint_prediction_ghosts(&mut s, &preds[1..], 5, blank()).newest,
             None,
             "every guess refused: nothing to draw the cursor past"
         );
         assert_eq!(s.cells[0], row(), "and nothing painted");
+    }
+
+    /// A frame SHOWS a key's prediction only when it painted every visible
+    /// guess: type-ahead `abcd` from column 0 runs over `日` (its lead at 1,
+    /// its continuation at 2), the painter refuses `b` and `c` (both halves),
+    /// and paints `a` and the newest, `d`. The cursor goes one past `d`, but
+    /// the frame does not show the keys of `b` and `c`, whose cells still hold
+    /// the engine's `日`: it shows the overlay through no op, so no key's input
+    /// slice closes at its present (the review of P7, 2026-10-20). The
+    /// control: on a blank row every guess paints and the frame shows them
+    /// through the newest; and `always`, which shows a guess with no proof,
+    /// closes no key's slice even then.
+    #[test]
+    fn a_frame_that_refused_an_older_guess_shows_no_key_through_the_newest() {
+        let mut predictor = crate::predict::Predictor::new(crate::predict::PredictMode::Always);
+        let now = std::time::Instant::now();
+        for (col, ch) in (0u16..).zip(['a', 'b', 'c', 'd']) {
+            assert!(predictor.predict_char(ch, (0, col), 0, 10, now));
+        }
+        let newest = predictor.shown_through();
+        assert!(newest.is_some(), "fixture: Always shows all four");
+        let wide = || {
+            let mut lead = blank();
+            lead.ch = '日';
+            let mut continuation = blank();
+            continuation.wide = true;
+            vec![blank(), lead, continuation, blank()]
+        };
+        let mut s = scratch(1);
+        s.cells[0] = wide();
+        let painted = paint_prediction_overlay(&mut predictor, &mut s, now, 10, blank());
+        assert_eq!(painted.cursor, Some((0, 4)), "one past the newest painted");
+        assert_eq!(
+            (s.cells[0][0].ch, s.cells[0][1].ch, s.cells[0][3].ch),
+            ('a', '日', 'd'),
+            "fixture: `b` and `c` refused, `a` and `d` painted"
+        );
+        assert_eq!(
+            painted.shown_through, None,
+            "the keys of `b` and `c` are not on glass"
+        );
+        let mut s = scratch(1);
+        s.cells[0] = vec![blank(); 4];
+        let painted = paint_prediction_overlay(&mut predictor, &mut s, now, 10, blank());
+        assert_eq!(painted.shown_through, newest, "every guess painted");
+        assert_eq!(
+            painted.closes_input_through(),
+            None,
+            "`always` shows them with no proof: their keys wait for their echoes"
+        );
     }
 
     /// A row `ab日` with the wide glyph's lead at 2 and its continuation at 3.
@@ -7251,16 +7437,22 @@ mod prediction_ghost_tests {
         let erase = [Prediction::test_at(0, 1, ' ')];
         assert_eq!(
             paint_predictions(&mut s, &erase, Some((0, 1)), 6, blank()),
-            Some((0, 1)),
-            "the chain's cursor, on its vacated cell"
+            super::OverlayPaint {
+                cursor: Some((0, 1)),
+                whole: true,
+            },
+            "the chain's cursor, on its vacated cell, the chain painted whole"
         );
         assert_eq!(s.cells[0][1].ch, ' ', "the vacated cell painted blank");
         let mut s = scratch(1);
         s.cells[0] = wide_row();
         assert_eq!(
             paint_predictions(&mut s, &erase, None, 6, blank()),
-            Some((0, 2)),
-            "the glyph lane: one past the newest painted guess"
+            super::OverlayPaint {
+                cursor: Some((0, 2)),
+                whole: true,
+            },
+            "the glyph lane: one past the newest painted guess, every guess painted"
         );
     }
 
@@ -7284,7 +7476,7 @@ mod prediction_ghost_tests {
             Prediction::test_ghost(0, 4, 'd', GhostCell::Moved { from: 3 }),
         ];
         assert_eq!(
-            paint_predictions(&mut s, &shift, Some((0, 2)), 6, blank()),
+            paint_predictions(&mut s, &shift, Some((0, 2)), 6, blank()).cursor,
             Some((0, 2)),
             "the chain's cursor"
         );
@@ -7306,7 +7498,10 @@ mod prediction_ghost_tests {
         )];
         assert_eq!(
             paint_predictions(&mut s, &refused, Some((0, 1)), 6, blank()),
-            None
+            super::OverlayPaint {
+                cursor: None,
+                whole: false,
+            }
         );
         assert_eq!(s.cells[0], wide_row(), "nothing painted");
     }
@@ -13551,6 +13746,10 @@ impl App {
             // The pet's half of it: only the program's own account of an
             // unfinished frame (`TerminalFacts::frame_unfinished`).
             let frame_unfinished = term.sync_frame_unfinished();
+            // And where the latest close ended: later unbracketed output in
+            // the same batch may already have moved the hidden cursor again.
+            let sync_end_seq = term.sync_end_seq();
+            let sync_end_caret = term.sync_end_caret();
             let cursor_style = term.cursor_style();
             // The echo anchor (stands in for a caret a TUI hides or parks) and the
             // glyph its run ended on, from the same hold. An unfinished frame's
@@ -14210,6 +14409,8 @@ impl App {
                     caret: cur,
                     cursor_visible: cur_drawn,
                     frame_unfinished,
+                    sync_end_seq,
+                    sync_end_caret,
                     display_offset: i32::try_from(display_offset).unwrap_or(i32::MAX),
                     live_viewport: display_offset == 0,
                     content_seq,
@@ -14987,7 +15188,7 @@ impl App {
                             Some((cpos.row, cpos.col)),
                             pred_coords,
                             pred_no_echo,
-                            std::time::Instant::now(),
+                            frame_started,
                             |r, c| crate::predict_seen::seen_at(input, r, c),
                         );
                     }
@@ -15097,6 +15298,12 @@ impl App {
         // the tab-strip splice. The composed path does this for its focused pane
         // inside `redraw_compose`.
         let mut painted_pred = false;
+        // This frame shows no key's prediction until it paints one whole, under
+        // its proof (`PredictionPainted::closes_input_through`,
+        // `metrics::note_prediction_shown`; the composed path marks its own).
+        if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
+            metrics::note_prediction_shown(&mut ws.present_metrics, None, |_| false);
+        }
         // Idle guard: with nothing pending and no ghost on glass, skip the
         // overlay, so an idle predictor costs nothing. `pred_shown` keeps the one
         // erase frame after a flush; every flush leaves `preds` empty, so no
@@ -15109,7 +15316,10 @@ impl App {
                 .is_some_and(|ws| !ws.predictor.idle() || ws.pred_shown)
             && let Some(ws) = self.windows.get_mut(&id)
         {
-            let now = std::time::Instant::now();
+            // The frame's one instant, as the composed path's reconcile and paint
+            // take theirs (`redraw_compose`'s `now`): the early-out above asked
+            // `is_displaying` at it, and `redraw_window_at` pins it.
+            let now = frame_started;
             // Predictions live in active-grid coords, so nothing is painted over
             // scrollback.
             if scrolled {
@@ -15117,11 +15327,20 @@ impl App {
                 // `next_deadline()` stays in the past and the repaint spins.
                 let _ = ws.predictor.overlay(now);
             } else {
-                let (predictor, input_scratch) = (&mut ws.predictor, &mut ws.input_scratch);
-                let drawn = with_borrowed_prediction_overlay(predictor, now, |preds, chain| {
-                    paint_predictions(input_scratch, preds, chain, cols, pred_blank)
-                });
-                if let Some((cursor_row, cursor_col)) = drawn {
+                let painted = paint_prediction_overlay(
+                    &mut ws.predictor,
+                    &mut ws.input_scratch,
+                    now,
+                    cols,
+                    pred_blank,
+                );
+                let predictor = &ws.predictor;
+                metrics::note_prediction_shown(
+                    &mut ws.present_metrics,
+                    painted.closes_input_through(),
+                    |op| predictor.op_is_pending(op),
+                );
+                if let Some((cursor_row, cursor_col)) = painted.cursor {
                     painted_pred = true;
                     // Invalidate the snapshot-keyed render cache, which would
                     // otherwise mask this post-fill cell mutation.
@@ -15146,6 +15365,10 @@ impl App {
         // RepaintKey unchanged). Single-pane only: `redraw_compose` set the flag
         // from its own paint, and this local `painted_pred` is always false there.
         if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
+            #[cfg(any(test, debug_assertions))]
+            if ws.pred_shown && !painted_pred {
+                crate::predict_trace::clear(std::time::Instant::now());
+            }
             ws.pred_shown = painted_pred;
         }
         // Splice the visible tab strip above the terminal grid (shifting content
@@ -16742,8 +16965,11 @@ impl App {
                     alternate_screen: term.is_alternate_screen(),
                     live_viewport,
                     display_offset,
-                    cursor: (term.cursor_visible() && live_viewport)
-                        .then_some((cursor.row, cursor.col)),
+                    cursor: live_viewport.then_some((cursor.row, cursor.col)),
+                    cursor_visible: term.cursor_visible(),
+                    frame_unfinished: term.sync_frame_unfinished(),
+                    sync_end_seq: term.sync_end_seq(),
+                    sync_end_caret: term.sync_end_caret(),
                     pet_world: aterm_effects::pet_world::PetWorldFacts::read(&term, *session),
                     damage_consumed: advance_cursor_fx,
                 };
@@ -16974,10 +17200,14 @@ impl App {
                     alternate_screen: term.is_alternate_screen(),
                     live_viewport,
                     display_offset,
-                    cursor: (term.cursor_visible() && live_viewport).then(|| {
+                    cursor: live_viewport.then(|| {
                         let cursor = term.cursor();
                         (cursor.row, cursor.col)
                     }),
+                    cursor_visible: term.cursor_visible(),
+                    frame_unfinished: term.sync_frame_unfinished(),
+                    sync_end_seq: term.sync_end_seq(),
+                    sync_end_caret: term.sync_end_caret(),
                     pet_world: aterm_effects::pet_world::PetWorldFacts::read(&term, session),
                     damage_consumed: advance_cursor_fx,
                 });
@@ -17385,10 +17615,9 @@ impl App {
             .retain_word_panes(|s| ctx.panes.iter().any(|(r, _)| r.session == s));
         // One companion per caret, in the focused pane's pixel space: the animal on
         // glass claims its cell, the flying head its real rect and the pet its
-        // live body. `focus_cursor` is the visible caret: the scanner's caret
-        // survives DECTCEM, custody does not.
+        // live body, at the caret they escort.
         let companion_at = companion_focus_place.and_then(|place| {
-            let duty = cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.focus_cursor);
+            let duty = cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.escort_caret);
             let geom = crate::word_decorations::EffectGeom {
                 cell_w: ctx.cell_w as u16,
                 cell_h: ctx.cell_h as u16,
@@ -17397,7 +17626,7 @@ impl App {
             };
             cursor_companion_on_glass(
                 duty,
-                ctx.focus_cursor,
+                ctx.escort_caret,
                 match duty {
                     CompanionDuty::FlyingHead { cell } => flying_head_footprint_px(
                         ws.fx.decos(),
@@ -17527,7 +17756,7 @@ impl App {
             Some(rs) if rs.cfg.canine => !ctx.animate_sparkles || rs.cfg.reduced_motion,
             _ => return 0,
         };
-        let (Some(place), Some(cell)) = (focus_place, ctx.focus_cursor) else {
+        let (Some(place), Some(cell)) = (focus_place, ctx.escort_caret) else {
             return 0;
         };
         let default_bg = self.theme.bg;
@@ -17665,7 +17894,7 @@ impl App {
         // translate/crop law. Its brain was already ticked for this present, so
         // this is pure emission. [`CompanionDuty`] is the one-companion custody
         // gate as a value, matched here and on the single-pane path.
-        let duty = cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.focus_cursor);
+        let duty = cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.escort_caret);
         // The companion seam ([`route_v2_companion`]), called for every duty (the
         // impulse is consumed even on an idle or pet frame) at the focused pane's
         // geometry and snapshot, before the pet or head is emitted.
@@ -18022,6 +18251,8 @@ impl App {
         // Whether the focused pane's program has not finished its frame (its
         // hidden cursor is then the write position), under the same hold.
         let mut focus_frame_unfinished = false;
+        let mut focus_sync_end_seq = 0u64;
+        let mut focus_sync_end_caret = None;
         let mut focus_style = CursorStyle::default();
         let mut focus_off = (0u16, 0u16);
         // The focused pane's size in cells — with `focus_off`, the pane box the
@@ -18247,6 +18478,8 @@ impl App {
                 focus_wrap_serial = term.wrap_serial();
                 focus_vis = term.cursor_visible();
                 focus_frame_unfinished = term.sync_frame_unfinished();
+                focus_sync_end_seq = term.sync_end_seq();
+                focus_sync_end_caret = term.sync_end_caret();
                 focus_style = term.cursor_style();
                 focus_off = (r.row_off, r.col_off);
                 focus_dims = (r.rows, r.cols);
@@ -18655,7 +18888,7 @@ impl App {
             i32::from(fx_ox) + i32::from(focus_off.1) * glow_cw as i32,
             i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
         );
-        let (cat_frame, kitty_alpha, riff, outro, pet) = {
+        let (cat_frame, kitty_alpha, riff, outro, pet, escort) = {
             let ws = self.windows.get_mut(&wid)?;
             // The companion precedence, as on the single-pane seam (favourite >
             // program with tenure > launch kitty; [`Self::companion_verdict`]).
@@ -18806,6 +19039,8 @@ impl App {
                     caret: (focus_pane_dims.is_some() && !focus_scrolled).then_some(focus_cur_pos),
                     cursor_visible: focus_vis,
                     frame_unfinished: focus_frame_unfinished,
+                    sync_end_seq: focus_sync_end_seq,
+                    sync_end_caret: focus_sync_end_caret,
                     display_offset: i32::try_from(focus_d_off).unwrap_or(i32::MAX),
                     live_viewport: !focus_scrolled,
                     content_seq: focus_content_seq,
@@ -18898,6 +19133,12 @@ impl App {
             if ws.fx.cursor_mut().glow.take_flow_entry() {
                 ws.fx.companion_mut().note_flow(now);
             }
+            // The caret every companion at the cursor escorts, as on the
+            // single-pane path: the pane's caret, hidden or not, or on a frame
+            // the program has not finished the last finished present's. The
+            // painted caret alone left the flying head no cell under a program
+            // that hides its cursor.
+            let escort = pet_tick.escort_caret();
             let pet = ws.fx.companion_mut().tick(pet_tick);
             // Rainbow Kitty v2's offer to the resident through
             // `EffectsPipeline::offer_pet_v2`, before `compose_cursor_companion`
@@ -18905,7 +19146,7 @@ impl App {
             // is the window, reconciled by the pane offset; the glow engine ticked
             // on `pane_geom`'s window grid in `cursor_frame` this frame.
             ws.fx.offer_pet_v2(&pet.pet, pane_geom, focus_off, now);
-            (cat_frame, alpha, riff, outro, pet)
+            (cat_frame, alpha, riff, outro, pet, escort)
         };
         if let Some((bar, gain, sig)) = riff {
             self.trail_audio.push(sing_riff_event(bar, gain, sig));
@@ -18925,7 +19166,7 @@ impl App {
                 win_cols: cols.min(u16::MAX as usize) as u16,
                 cell_w: glow_cw as u32,
                 cell_h: glow_ch as u32,
-                focus_cursor: (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
+                escort_caret: escort,
                 win_focused: focused,
                 word_focus,
                 animate_sparkles,
@@ -18955,7 +19196,7 @@ impl App {
                 win_cols: cols.min(u16::MAX as usize) as u16,
                 cell_w: glow_cw as u32,
                 cell_h: glow_ch as u32,
-                focus_cursor: (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
+                escort_caret: escort,
                 win_focused: focused,
                 word_focus,
                 animate_sparkles,
@@ -19252,6 +19493,10 @@ impl App {
         ws.input_scratch.history_renumber_epoch = 0;
         let mut focus_title: Arc<str> = Arc::default();
         let mut painted_pred = false;
+        // This frame shows no key's prediction until the focused pane paints
+        // one whole, under its proof (`PredictionPainted::closes_input_through`,
+        // `metrics::note_prediction_shown`).
+        metrics::note_prediction_shown(&mut ws.present_metrics, None, |_| false);
         let mut focus_pred_cursor: Option<(u16, u16)> = None;
         let mut focus_sub_cols = cols;
         // Whether this frame painted the IME composition into the focused leaf.
@@ -19360,13 +19605,22 @@ impl App {
                     let _ = ws.predictor.overlay(now);
                 }
                 Some(true) => {
-                    let (predictor, pane_scratch) = (&mut ws.predictor, &mut ws.pane_scratch);
-                    let drawn = with_borrowed_prediction_overlay(predictor, now, |preds, chain| {
-                        paint_predictions(pane_scratch, preds, chain, sub_cols, blank)
-                    });
-                    if drawn.is_some() {
+                    let painted = paint_prediction_overlay(
+                        &mut ws.predictor,
+                        &mut ws.pane_scratch,
+                        now,
+                        sub_cols,
+                        blank,
+                    );
+                    let predictor = &ws.predictor;
+                    metrics::note_prediction_shown(
+                        &mut ws.present_metrics,
+                        painted.closes_input_through(),
+                        |op| predictor.op_is_pending(op),
+                    );
+                    if painted.cursor.is_some() {
                         painted_pred = true;
-                        focus_pred_cursor = drawn;
+                        focus_pred_cursor = painted.cursor;
                         focus_sub_cols = sub_cols;
                     }
                 }
@@ -19525,6 +19779,10 @@ impl App {
         }
         // Record whether this present painted a guess, so the early-out repaints
         // the frame that erases a ghost (as single-pane does).
+        #[cfg(any(test, debug_assertions))]
+        if ws.pred_shown && !painted_pred {
+            crate::predict_trace::clear(Instant::now());
+        }
         ws.pred_shown = painted_pred;
         // Whether this frame painted a composition. `preedit_fp` already forces
         // the erase frame; single-pane reads this to decide whether an erase
@@ -23536,6 +23794,12 @@ mod torn_present_motion_caret_tests {
 #[cfg(test)]
 #[path = "app_render_single_hold_redraw_tests.rs"]
 mod single_hold_redraw_tests;
+
+/// A key's proven prediction on glass closes its input slice, through the
+/// press path, both render paths and the present.
+#[cfg(test)]
+#[path = "app_render_prediction_input_tests.rs"]
+mod prediction_input_tests;
 
 #[cfg(test)]
 #[path = "app_render_licence_fence_tests.rs"]

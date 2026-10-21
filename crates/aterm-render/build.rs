@@ -5,11 +5,11 @@
 //! the non-macOS terminal font STACK (`assets/bundled/`) and the faces only the
 //! tests embed (`assets/test/`).
 //!
-//! Every file in that directory is a candidate for `include_bytes!`, and
-//! `include_bytes!` puts the bytes in the shipped binary whether or not any
-//! menu names them — embedding IS redistribution. So a face may only sit there
-//! if a sibling `<stem>.LICENSE.txt` grants redistribution: OFL, Apache-2.0, or
-//! MIT. Anything else fails `cargo build` / `cargo check`, not merely tests.
+//! Every file there is a candidate for `include_bytes!`, and embedding is redistribution.
+//! So each asset needs an exact sibling `<stem>.LICENSE.txt` (`Cinzel-var.ttf` ->
+//! `Cinzel-var.LICENSE.txt`, never a prefix match, so no asset inherits a neighbour's
+//! notice) that names an OFL, Apache-2.0 or MIT grant; anything else fails the build, not
+//! merely the tests.
 //!
 //! It exists because the alternative failed in practice: four faces with no
 //! redistribution grant (Gill Sans UltraBold, FinkHeavy, Hylia Serif Beta,
@@ -46,13 +46,9 @@ const ASSET_DIRS: &[&str] = &["assets/game", "assets/bundled", "assets/test"];
 /// The suffix that marks a file as a licence notice rather than an asset.
 const LICENSE_SUFFIX: &str = ".LICENSE.txt";
 
-/// Grant markers that permit redistribution inside a binary. Matched
-/// case-insensitively against the whole notice, because these are the phrases
-/// the upstream licence texts and font `name` tables actually use.
-///
-/// Deliberately short: this gate answers "is there an open grant here at all",
-/// and the answer has to be legible in the notice itself. A face whose terms
-/// need a paragraph of interpretation is exactly the case that failed before.
+/// Grant markers that permit redistribution inside a binary, matched case-insensitively
+/// against the whole notice. Deliberately short: the grant must be legible in the notice
+/// itself, not a matter of interpretation.
 const GRANT_MARKERS: &[&str] = &[
     "sil open font license",
     "open font license",
@@ -97,15 +93,13 @@ fn gate_dir(dir: &Path, root: &Path, failures: &mut Vec<String>) {
             return;
         }
     };
-    // Sorted so the failure list is stable across filesystems (and so a CI log
-    // diff of two builds is readable).
+    // Sorted so the failure list is stable across filesystems.
     let mut paths: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .collect();
     paths.sort();
     for path in paths {
-        // Rerun when any individual asset or notice changes, not just when the
-        // directory listing does — an edited notice must re-run the gate.
+        // Per file, so an edited notice re-runs the gate.
         println!("cargo:rerun-if-changed={}", path.display());
         if path.is_dir() {
             gate_dir(&path, root, failures);

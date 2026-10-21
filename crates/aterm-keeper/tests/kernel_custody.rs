@@ -1,63 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE KEEPER ON A REAL KERNEL (`docs/DESIGN-pty-keeper-2026-09-26.md` §6.4):
-//! a keeper process, "window" processes that own real PTY masters and pass
-//! duplicates by `SCM_RIGHTS` over the keeper's real socket, and a session
-//! leader on each slave that the kernel hangs up when the master's last copy
-//! closes. No WindowServer: every process here is this test binary re-run in a
-//! role, or `/bin/sleep`.
+//! Real-kernel integration tests for `aterm-keeper` (`docs/DESIGN-pty-keeper-2026-09-26.md` §6.4).
 //!
-//! * A window registers its master and is SIGKILLed: the leader lives, the
-//!   master turns Orphaned (after the death grace), the keeper relaunches once
-//!   (a test command stands in for `open -a`), and the next window's HELLO is
-//!   offered exactly that master — while the keeper still holds its copy. That
-//!   window claims it, says BYE and exits 0: the keeper closes its copy and the
-//!   leader is hung up, as today.
-//! * NEGATIVE CONTROL: the same SIGKILL with the custody copy disabled (a
-//!   library-only test seam) hangs the leader up at once.
-//! * THE HOLDER SCAN: a window whose master is also held by a surviving
-//!   process is SIGKILLed; nothing is offered while that process lives, and
-//!   the master is offered once it is gone.
-//! * AN OFFER THAT BECOMES NO SESSION: the next window RELEASEs what it could
-//!   not place through its link, on the connection the offer was made to, and
-//!   quits: the keeper closes its copy and the shell is hung up.
-//! * THE CRASH MARKER (§5.4 row 3's cross-check): a window that holds a real
-//!   locked marker, names it at HELLO, and quits through its exit path —
-//!   `exit(0)`, the marker unlinked — WITHOUT a BYE has its shell hung up, as
-//!   a quit; NEGATIVE CONTROL: the same end naming no marker is kept as an
-//!   orphan (P3's lost-BYE resurrection). SIGKILLed, the marked window's
-//!   marker stays with its lock free: an orphan.
-//! * STALE ORPHANS: an orphan whose shell dies is closed on its leader's exit,
-//!   with no HELLO, and the status no longer lists it.
-//! * STREAM ORDER: the keeper is parked between two turns while the next
-//!   window claims two offered masters, says BYE and exits 0, so its exit and
-//!   the frames behind its first claim wait for the same turn; the keeper
-//!   still reads them before the death, and the quit hangs both shells up.
-//!   NEGATIVE CONTROL: the same end without the BYE keeps both as orphans.
-//! * A REPLY TO THE DEAD: the same end with an ADOPT after the first claim,
-//!   whose WELCOME the dead window cannot read; the failed write ends only
-//!   the keeper's writing, and the claim and BYE behind it are still read.
-//!   NEGATIVE CONTROL: without the BYE, both claims read, both shells kept.
-//! * A DEAD PEER HOLDS NOTHING: a window quits while another has died but is
-//!   not yet judged (unreaped, its connection still open); the holder scan
-//!   reads the dead one as holding nothing, and the quit hangs its shell up.
-//! * THE CRASH-RESTORE REGION (the crash-restore plan §7.3): a window that
-//!   journals registers its master and the read-only descriptor of a real
-//!   shared-memory region it writes through the real journal writer, then dies
-//!   by its own SIGKILL (`kill_self_now`); the next window that journals is
-//!   offered the master and the region, maps it read-only, recovers, and its
-//!   screen is exactly the oracle's. NEGATIVE CONTROLS: a window that
-//!   registered no region is offered none (the META rung); a restorer that
-//!   claims and dies before its COMPANION makes the next offer say
-//!   `attempts=1`, which restores the keyframe alone; a window whose HELLO does
-//!   not state CAP_JOURNAL gets no COMPANION_OFFER and its strict offer loop
-//!   succeeds; a writable custody descriptor is refused as no journal.
-//!
-//! Every wait is on a causal event — a status line, a kernel exit status, a
-//! line from a child — with a minute's hang detector, never a sleep. Every
-//! process started here is ended by SIGKILL or by its own exit (AGENTS.md
-//! rule 6).
+//! Spawns this test binary in keeper, window, and successor roles over real
+//! PTY pairs (`SCM_RIGHTS`) with `/bin/sleep` session leaders, exercising
+//! orphan recovery, holder scanning, unplaced-offer release, crash markers,
+//! stale-orphan pruning, stream ordering across process exit, dead-peer
+//! holder filtering, and POSIX shared-memory crash-restore journals.
 
 #![cfg(target_vendor = "apple")]
 #![allow(
@@ -108,8 +58,6 @@ fn sigkill(pid: u32) {
     // SAFETY: SIGKILL to a pid this test started.
     unsafe { kill(pid as i32, 9) };
 }
-
-// ---------------------------------------------------------------- the roles
 
 fn keeper_config() -> ServeConfig {
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
@@ -237,14 +185,8 @@ fn window_role(holder: bool) -> ! {
     drop(dup);
     let mut line = format!("leader={} rdev={rdev}", leader.id());
     if holder {
-        // A non-close-on-exec duplicate at a high number, inherited by a
-        // `sleep` that holds it for as long as it lives. The floor sits under
-        // 256, macOS's default soft `RLIMIT_NOFILE`: `F_DUPFD` at or above
-        // the soft limit fails `EINVAL`. The `sleep` is started by
-        // `spawnfd::transparent`, which hands its child every descriptor
-        // without close-on-exec on every std (a std `Command` child gets fds
-        // 0-2 alone under Trust's SP-1); its stdio is this role's, `/dev/null`
-        // (`Scratch::spawn`).
+        // Duplicate below macOS default soft `RLIMIT_NOFILE` (256) inherited
+        // via `spawnfd::transparent` by a child `sleep` holder.
         // SAFETY: F_DUPFD on a descriptor we own; the result is inherited.
         let raw = unsafe { fcntl(master.as_raw_fd(), F_DUPFD, 200) };
         assert!(
@@ -383,15 +325,9 @@ fn next_window_role(bye: bool, adopt: bool) -> ! {
     std::process::exit(0)
 }
 
-/// A window of a build from before the crash-restore journal: its HELLO states no
-/// `CAP_JOURNAL`, and it reads what the keeper wrote frame by frame, as such a build's strict loop
-/// would, not through `hello_app` (which skips what a window that did not ask for a journal must
-/// never be sent, so a keeper that sent it would pass unseen). It reports how many OFFERs carried
-/// the journal's trailing fields, and how many frames came between its offers and the keeper's
-/// answer to its next request (a META for a master it does not claim, which is refused): a stray
-/// COMPANION_OFFER, written right behind its OFFER, would be one. Then, told to, it claims every
-/// master and reports it (so the test can see its claim close the region, §3.2 N5), and told
-/// again, says BYE and exits 0.
+/// Legacy window role (`HELLO` without `CAP_JOURNAL`): reads raw frames to
+/// verify `OFFER`s omit journal fields and no `COMPANION_OFFER` is sent,
+/// then claims every master on cue so the keeper closes the journal region.
 fn old_window_role() -> ! {
     use aterm_keeper::wire::{CAP_SENDS_BYE, PROTO, PeerClass};
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
@@ -500,12 +436,9 @@ fn unplaced_window_role() -> ! {
     std::process::exit(0)
 }
 
-/// An update's OUTGOING window whose successor never takes part in the keeper
-/// (its `[keeper] enabled = false`, or a build before the keeper): open a PTY
-/// with a leader and REGISTER it; start the successor — this binary again, as
-/// `quiet-successor`, holding a duplicate of the master as an adopted session
-/// does — and name it in a PENDING; report; on "go", end as the Commit does:
-/// `exit(0)`, no BYE.
+/// Outgoing update window role whose `quiet-successor` holds a master
+/// duplicate without dialing the keeper: registers a PTY, names the
+/// successor in `PENDING`, and exits 0 without `BYE` on cue.
 fn outgoing_window_role() -> ! {
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
     let talk = std::env::var(TALK).expect("talk");
@@ -544,11 +477,7 @@ fn outgoing_window_role() -> ! {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // The hook clears the duplicate's close-on-exec flag in the child, so the
-    // successor holds it on every std. A `pre_exec` hook sends any std down
-    // its fork path, where Trust's SP-1 std MARKS every descriptor above
-    // stdio close-on-exec (it closes none) and then runs the hooks; the
-    // std before SP-1 marks nothing, and the clear changes nothing there.
+    // Clear `FD_CLOEXEC` on `raw` in the child after Trust's SP-1 `pre_exec` pass.
     // SAFETY: one async-signal-safe `fcntl` between fork and exec, on a
     // descriptor the child holds from the fork.
     unsafe {
@@ -644,8 +573,6 @@ fn dispatch_role() {
         _ => {}
     }
 }
-
-// ---------------------------------------------------------------- the tests
 
 fn born(pid: u32) -> Birth {
     aterm_keeper::server::born(pid).expect("a live process has a birth record")
@@ -992,12 +919,8 @@ fn a_master_another_process_holds_is_never_offered() {
 
 const T_UNPLACED: &str = "an_offer_the_window_could_not_place_is_released_through_its_link";
 
-/// AN OFFER THAT BECOMES NO SESSION IS RELEASED: a killed window's shell is
-/// offered to the next window, which cannot place it (its restore window
-/// failed to open, its spawn failed) and RELEASEs it through its link — the
-/// worker running on the connection the offer was made to — then quits. The
-/// keeper closes its copy and the shell is hung up: nothing is left for the
-/// next launch to bring back.
+/// When a recovering window `RELEASE`s an offered master it could not place
+/// and quits, the keeper closes its custody copy and hangs up the shell.
 #[test]
 fn an_offer_the_window_could_not_place_is_released_through_its_link() {
     dispatch_role();
@@ -1030,12 +953,8 @@ fn an_offer_the_window_could_not_place_is_released_through_its_link() {
 
 const T_QUIET: &str = "a_successor_that_never_registered_hangs_its_shells_up_when_it_quits";
 
-/// AN UPDATE TO A SUCCESSOR THAT TAKES NO PART (its keeper off, or a build
-/// before the keeper): the outgoing window names it in a PENDING and ends as
-/// the Commit does, so the keeper HOLDS the master for it; the successor never
-/// registers, and quits with `exit(0)`. §5.4 row 3 judges that end — a process
-/// that never spoke to the keeper, ended cleanly — as a quit: the keeper
-/// closes its copy and the shell is hung up, as with no keeper at all.
+/// When an outgoing window names a `PENDING` successor that never dials the
+/// keeper and later exits 0, the keeper treats the clean exit as a quit.
 #[test]
 fn a_successor_that_never_registered_hangs_its_shells_up_when_it_quits() {
     dispatch_role();
@@ -1177,15 +1096,9 @@ struct Overtaken {
     keeper_pid: u32,
 }
 
-/// STREAM ORDER on a real kernel: two windows, one master each, are
-/// SIGKILLed, and the next window is offered both. With the keeper parked
-/// between two turns, that window claims both, says BYE (when `bye`) and
-/// exits 0, so its exit and every frame it wrote wait for the same turn. The
-/// turn reads the first claim (one frame per connection), then the exit; the
-/// claim and the BYE still behind it must be read before the death is
-/// recorded — a claim read after it is refused, and its master goes back to
-/// Orphaned with the keeper's copy kept and its shell never hung up.
-/// `role` is the next window's: `next-window[-adopt][-no-bye]`.
+/// Park the keeper between turns while the next window claims two offered
+/// masters, optionally sends `ADOPT` and `BYE`, and exits 0, verifying
+/// queued frames behind the first claim are processed before process death.
 fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, role: &str) -> Overtaken {
     let keeper = s.spawn(test, "keeper-stepped", &[]);
     s.line(keeper, "ready");
@@ -1372,17 +1285,9 @@ fn without_a_bye_a_reply_lost_to_the_dead_keeps_both_shells() {
 
 const T_DEAD_PEER: &str = "a_quit_beside_a_dead_unjudged_peer_hangs_its_shell_up";
 
-/// A DEAD PEER HOLDS NOTHING. Two windows, one master each, with the keeper
-/// parked between two turns: the window with the higher pid writes one frame
-/// and is SIGKILLed, left unreaped (a zombie: still in the kernel's process
-/// list, its descriptors closed at its exit); the other says BYE and exits 0.
-/// The turn reads one frame of each, then the exits in pid order, so the quit
-/// is judged while the killed window's connection is still open — a peer —
-/// and the holder scan for the quitter's master meets the killed window's
-/// table. That table is gone, not unreadable: the quit closes its master and
-/// hangs its shell up. (Read as unknown, the dead peer made the quit a
-/// handoff: held, then orphaned — the shell kept.) The killed window itself
-/// is still a crash, its shell kept as an orphan.
+/// When one window is `SIGKILL`ed (unreaped zombie) and another sends `BYE`
+/// and exits 0 in the same parked turn, the holder scan treats the dead
+/// peer's descriptor table as empty so the quitting window's shell hangs up.
 #[test]
 fn a_quit_beside_a_dead_unjudged_peer_hangs_its_shell_up() {
     dispatch_role();
@@ -1459,8 +1364,6 @@ fn a_status_client_reads_the_keeper() {
         assert!(st.contains(want), "{want:?} in\n{st}");
     }
 }
-
-// ------------------------------------------------- the crash-restore region
 
 /// The journaled session's screen: small, so the oracle's text is readable in a failure.
 const JOURNAL_ROWS: u16 = 12;
@@ -1864,12 +1767,9 @@ fn a_restorer_that_dies_before_its_companion_costs_an_attempt() {
 
 const T_JOURNAL_OLD: &str = "a_window_that_does_not_journal_is_offered_the_master_alone";
 
-/// NEGATIVE CONTROL (§3.2 J2, N5): a window of a build from before the journal (its HELLO states
-/// no CAP_JOURNAL) reads, frame by frame, an OFFER of the master with no trailing fields and
-/// nothing between its offers and the keeper's next answer: no COMPANION_OFFER (`old-window`
-/// does not use `hello_app`, which would skip both unseen). The keeper meanwhile keeps the region
-/// for a window that journals; the old window's claim closes it, which the keeper process's own
-/// descriptor table shows while the master is still claimed, and its quit closes the master.
+/// NEGATIVE CONTROL (§3.2 J2, N5): a client without `CAP_JOURNAL` receives
+/// plain `OFFER`s with no `COMPANION_OFFER`, and its `CLAIM` closes the
+/// keeper's journal descriptor.
 #[test]
 fn a_window_that_does_not_journal_is_offered_the_master_alone() {
     dispatch_role();

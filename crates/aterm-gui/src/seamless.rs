@@ -8287,6 +8287,9 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
         }
         crate::control::raise_turn_ids(floor);
     }
+    if let Some(resources) = manifest.resources.clone() {
+        crate::resource_jobs::restore(resources);
+    }
     // THIS MACHINE'S NAMES GO ON: the names the outgoing process read the kernel
     // give the machine, kept beside this process's own, so a carried shell's OSC 7
     // under the name it started with is still this machine's

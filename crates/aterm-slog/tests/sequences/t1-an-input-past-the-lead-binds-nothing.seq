@@ -6,12 +6,12 @@ see busy
 admit harness act=approve
 accept
 at 600 see prompt edit
-expect open p1 approval par=t1 box=edit at=600
+expect open p1 approval par=t1 box=edit @600
 see busy
-expect close p1 approval out=passed by=- at=600
+expect close p1 approval out=passed by=- @600
 at 1000 admit harness act=approve
 at 1600 see prompt edit
-expect open p2 approval par=t1 box=edit at=1600
+expect open p2 approval par=t1 box=edit @1600
 accept
 see busy
 expect close p2 approval out=passed by=-

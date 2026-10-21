@@ -1,40 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The platform I/O a program's output asks aterm for — an OSC 52 query's
-//! pasteboard read, a Kitty `t=f`/`t=t`/`t=s` transmission's file or shared
-//! memory read — done by the session's PTY reader BEFORE it takes the terminal
-//! lock to feed those bytes, never inside `Terminal::process()`.
+//! The platform I/O a program's output asks aterm for (an OSC 52 query's pasteboard read; a
+//! Kitty `t=f`/`t=t`/`t=s` transmission's file or shared-memory read), done by the session's PTY
+//! reader before it takes the terminal lock, never inside `Terminal::process()`.
 //!
-//! WHY (2026-10-14): the engine answers both through host callbacks it runs
-//! inside `process()`, and the reader runs `process()` under the terminal lock.
-//! A pasteboard read blocks while a Universal Clipboard item is fetched from
-//! another device or a lazy provider is busy; a file read blocks while an
-//! evicted iCloud file downloads or a stalled SMB/NFS volume runs out its
-//! timeout. For all that time the session's lock was held, and the redraw,
-//! which takes the front terminal's lock, stopped every window. Both are opt-in
-//! (`allow_osc52_query`, `allow_kitty_file_transfer`) and stay so.
+//! The engine asks for both through host callbacks inside `process()`, under the terminal lock.
+//! A pasteboard read can block on a Universal Clipboard fetch or a busy lazy provider, a file
+//! read on an evicted iCloud file or a stalled SMB/NFS volume; holding the lock that long stops
+//! the redraw in every window. Both are opt-in (`allow_osc52_query`, `allow_kitty_file_transfer`).
 //!
-//! HOW: the reader hands each slice it is about to feed to [`Prefetch::reads`]
-//! first. It scans the slice (with the unfinished tail of the one before) for
-//! complete OSC 52 queries and Kitty transmissions that read a non-direct
-//! medium, does each read the session admits ([`Flags`], read under the
-//! reader's previous hold), and keeps the results on the reader's thread until
-//! the slice has been fed. The callbacks, which run on that thread inside
-//! `process()`, only take a result ([`take_clipboard_query`],
-//! [`take_kitty_medium`]), so the engine answers exactly as before, in byte
-//! order, with nothing deferred. A read the scan did not do — a terminator it
-//! does not read (an 8-bit ST in C1 mode), a file named across chunks, the
-//! slice right after a session first admits a query — is answered as a failed
-//! read is (no reply, a refused image), and is never done under the lock.
+//! [`Prefetch::reads`] scans each slice (with the unfinished tail of the one before) for complete
+//! OSC 52 queries and non-direct Kitty transmissions, does each read the session admits
+//! ([`Flags`], read under the previous hold), and keeps the results on the reader's thread until
+//! the slice is fed; the callbacks only take a result ([`take_clipboard_query`],
+//! [`take_kitty_medium`]). A read the scan did not do (a terminator it does not read, such as an
+//! 8-bit ST in C1 mode; a file named across chunks; the slice right after a session first admits
+//! a query) is answered as a failed read (no reply, a refused image), never done under the lock.
 //!
-//! What a slice's reads hold is bounded, as it was when the engine read one
-//! medium at a time: the pasteboard is read once per slice, whatever number of
-//! queries share it, and the media reads stop at the command that finds
-//! [`READ_BUDGET`] already held. The slice is cut there ([`Burst::covered`]),
-//! and the rest is the next slice's, read once this one is fed and its media
-//! dropped. Before (2026-10-14 review), one 64 KiB burst of 2048 short `t=f`
-//! commands held 2048 media at once, up to 8 GiB.
+//! What a slice's reads hold is bounded: the pasteboard is read once per slice however many
+//! queries share it, and media reads stop at the command that finds [`READ_BUDGET`] already
+//! held. The slice is cut there ([`Burst::covered`]); the rest is the next slice's, read once
+//! this one is fed and its media dropped.
 
 use std::cell::RefCell;
 
@@ -451,12 +438,10 @@ mod tests {
         apc
     }
 
-    /// A slice is read for exactly the requests the engine sends the host — an
-    /// OSC 52 query (BEL- or ST-terminated), the pasteboard once for all of a
-    /// slice's queries, and a Kitty transmit naming a file, in one piece or cut
-    /// across two slices — and for nothing else: an OSC 52 set, a canceled
-    /// query, a Kitty query or chunked load, or anything a session does not
-    /// admit.
+    /// A slice is read for exactly the requests the engine sends the host (an OSC 52 query, BEL-
+    /// or ST-terminated, with one pasteboard read for all of a slice's queries; a Kitty transmit
+    /// naming a file, whole or cut across two slices) and for nothing else: an OSC 52 set, a
+    /// canceled query, a Kitty query or chunked load, or anything the session does not admit.
     #[test]
     fn a_burst_is_read_for_the_requests_the_engine_will_make() {
         let mut burst = b"text\x1b]52;c;?\x07more\x1b]52;p;?\x1b\\".to_vec();
@@ -565,13 +550,10 @@ mod tests {
         (names, most)
     }
 
-    /// One burst of many short `t=f` commands, each naming a file as large as
-    /// a medium may be, is read slice by slice: no slice holds more than two
-    /// largest media, and every command is still read exactly once, in order,
-    /// however the PTY's reads cut the burst — including right before a
-    /// command's ESC that also begins the next. Before (2026-10-14 review), a
-    /// burst's reads were all held at once: a 64 KiB burst of 2048 such
-    /// commands held 8 GiB.
+    /// A burst of short `t=f` commands, each naming a largest-size file, is read slice by slice:
+    /// no slice holds more than two largest media, and each command is read once, in order,
+    /// however the PTY's reads cut the burst, including right before an ESC that ends one
+    /// command and begins the next.
     #[test]
     fn a_slice_holds_at_most_two_largest_media_and_reads_each_once() {
         let names: Vec<String> = (0..48).map(|n| format!("/m/{n}")).collect();

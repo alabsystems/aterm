@@ -36,23 +36,13 @@ const AWAIT_MAX_MS: u64 = 600_000;
 /// connection. It is `HANGUP_POLL`, so a served lane wakes no more often.
 const CONSENT_EXIT_POLL: Duration = crate::control::HANGUP_POLL;
 
-/// The refusal for a selector on an instance-wide verb.
+/// Refusal for a selector on an instance-wide verb.
 const NO_SELECTOR: &str = "ERR privacy is instance-wide and takes no selector\n";
 
-// The verb
-
-/// `privacy [--json]`: the macOS consent posture, instance-wide. `json` is the
-/// flag as the dispatch read it off the request (`control::json_ask`), and `rest`
-/// the arguments left, which must be none.
+/// `privacy [--json]`: the macOS consent posture, instance-wide.
 ///
-/// Runs on a control worker, which takes ONE main-thread hop for the facts
-/// only `App` holds ([`App::privacy_facts`]) and does everything else itself
-/// ([`privacy`]): it warms the signing identity (it may spawn `codesign`,
-/// which must never land on the event loop), reads the probe slots, asks the
-/// responsibility SPI, and renders. An unfinished observation gets a short,
-/// bounded wait HERE, never on the GUI thread, so occasional calls do not
-/// report only Pending by always arriving after the cache's freshness
-/// interval.
+/// Takes one main-thread hop for [`App::privacy_facts`] and warms signing
+/// identity, reads probe slots, and renders on the control worker.
 pub(crate) fn cmd_privacy(
     json: bool,
     rest: &str,

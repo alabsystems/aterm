@@ -77,7 +77,7 @@ fn config_patches(outcome: &crate::native_app::DispatchOutcome) -> Vec<(ConfigPa
         .effects
         .iter()
         .filter_map(|effect| match effect {
-            AppEffect::ConfigPatch { patch, reply } => Some((patch.clone(), reply.operation)),
+            AppEffect::ConfigPatch { patch, reply, .. } => Some((patch.clone(), reply.operation)),
             _ => None,
         })
         .collect()
@@ -1357,9 +1357,11 @@ fn finish_patch(
     operation: OperationId,
     applied: bool,
 ) {
+    // Landed at the revision after the page's snapshot, as a write the
+    // snapshot that holds it has not reached yet.
     let outcome = if applied {
         ConfigPatchOutcome::Applied {
-            revision: 0,
+            revision: state(runtime, view).snapshot_revision + 1,
             undo: None,
         }
     } else {
@@ -1660,34 +1662,743 @@ fn keep_from_the_keyboard_lands_on_the_kept_row() {
     }
 }
 
-/// While a Keep is landing the highlight holds, and so does the keyboard:
-/// it never lands on a row the highlight is not on. Negative control: once
-/// the Keep lands the arrow moves both.
+/// WHILE A KEEP SAVES THE CHOOSER TAKES THE ARROW: the theme the Keep
+/// writes is the one in use at once, so the arrow tries the next row over
+/// it, the keyboard with the highlight, and the Keep still lands. Before,
+/// the highlight held while the Keep saved ("Keeping the theme you tried…")
+/// and the arrow was dropped. Negative control: the kept row's own press
+/// changes nothing (it is the theme in use).
 #[test]
-fn an_arrow_during_keeping_leaves_the_keyboard_on_the_kept_row() {
-    let (_service, mut runtime, instance, view) = themes_view("");
+fn an_arrow_during_keeping_tries_the_next_row() {
+    let (mut service, mut runtime, instance, view) = themes_view("");
     let nord = card_action(&runtime, view, "Nord");
     let _ = act(&mut runtime, instance, view, &nord, None);
     let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
-    let (_, operation) = config_patches(&kept)[0].clone();
+    let (patch, operation) = config_patches(&kept)[0].clone();
     let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
     focus_on(&mut runtime, view, &nord);
+    // The kept row's own press: still the Keep on its way.
+    let _ = act(&mut runtime, instance, view, &nord, None);
+    assert!(matches!(
+        state(&runtime, view).showcase.trial,
+        ShowcaseTrial::Keeping { .. }
+    ));
     runtime
         .dispatch(instance, view, AppEvent::StepFocus(1))
         .unwrap();
-    let focus = |runtime: &NativeRuntime| {
-        state(runtime, view)
-            .common
-            .last_focus
-            .as_ref()
-            .map(|key| key.as_str().to_string())
+    let focus = state(&runtime, view)
+        .common
+        .last_focus
+        .as_ref()
+        .map(|key| key.as_str().to_string())
+        .expect("the keyboard is somewhere");
+    assert_ne!(focus, nord, "the arrow moved the keyboard");
+    let ShowcaseTrial::Trying { id: tried } = state(&runtime, view).showcase.trial.clone() else {
+        panic!("the arrow tries the row it lands on");
     };
-    assert_eq!(focus(&runtime).as_deref(), Some(nord.as_str()));
-    finish_patch(&mut runtime, instance, view, operation, true);
+    assert_eq!(
+        focus,
+        card_action(&runtime, view, &tried),
+        "keyboard and highlight together"
+    );
+    assert_eq!(
+        state(&runtime, view).theme_trial_intent(),
+        Some(crate::control_theme::ThemeTrialIntent::Show(tried.clone()))
+    );
+    let (published, undo) = apply_real_config_patch(&mut service, &patch);
     runtime
-        .dispatch(instance, view, AppEvent::StepFocus(1))
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ConfigPatchFinished {
+                operation,
+                outcome: ConfigPatchOutcome::Applied {
+                    revision: published.revision,
+                    undo,
+                },
+            },
+        )
         .unwrap();
-    assert_ne!(focus(&runtime).as_deref(), Some(nord.as_str()));
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(published))
+        .unwrap();
+    assert_eq!(service.snapshot().config.theme.as_deref(), Some("Nord"));
+    assert_eq!(
+        state(&runtime, view).showcase.trial,
+        ShowcaseTrial::Trying { id: tried },
+        "the landed Keep leaves the newer trial standing"
+    );
+}
+
+/// The compiled page's `key`: whether it takes a press, and whether it
+/// reads as busy.
+fn takes_press(
+    runtime: &NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    key: &str,
+) -> (bool, bool) {
+    let compiled = compile_settings_view(runtime, instance, view, &view_cx_at(1_284.0, 714.0));
+    let node = compiled
+        .semantic(&UiKey::new(key))
+        .unwrap_or_else(|| panic!("{key} is drawn"));
+    let state = node.state.unwrap_or_default();
+    (state.enabled, state.busy)
+}
+
+/// The follows `outcome`'s config writes carry, in order.
+fn write_follows(outcome: &crate::native_app::DispatchOutcome) -> Vec<Vec<OperationId>> {
+    outcome
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            AppEffect::ConfigPatch { follows, .. } => Some(follows.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Land `patch` (`operation`) as the config lane does: written to the real
+/// service, finished, and the snapshot that holds it published. A write
+/// that follows another of the page's is checked at the revision that one
+/// landed at (`follows_landed`), as the lane checks it
+/// (`App::native_config_followed_base`). The revision it landed at.
+fn land_patch(
+    service: &mut VersionedConfigService,
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    (patch, operation): (&ConfigPatch, OperationId),
+    follows_landed: Option<u64>,
+) -> u64 {
+    let mut patch = patch.clone();
+    if let Some(landed) = follows_landed {
+        patch.base_revision = patch.base_revision.max(landed);
+    }
+    let (published, undo) = apply_real_config_patch(service, &patch);
+    let revision = published.revision;
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ConfigPatchFinished {
+                operation,
+                outcome: ConfigPatchOutcome::Applied {
+                    revision: published.revision,
+                    undo,
+                },
+            },
+        )
+        .unwrap();
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(published))
+        .unwrap();
+    revision
+}
+
+/// KEEP AND REVERT TAKE EVERY PRESS WHILE A KEEP SAVES (the press shows at
+/// once; the writes follow one another in the config lane). With the Keep's
+/// write on its way, Keep and Revert are drawn enabled and never busy; a
+/// second Keep asks for what the first already writes and writes nothing;
+/// Revert writes the theme back over the Keep, following it, ends the trial
+/// at once ("Reverted to Dracula", the highlight on Dracula, no trial asked
+/// of the host), and once both land aterm.toml is as it began. Escape over
+/// a Keep on its way is the same Revert. Before, Keep read disabled and busy
+/// and Revert disabled while the Keep saved, so a second press was dropped
+/// (`aterm ctl pointer click` answered key=-) and Escape did nothing.
+#[test]
+fn keep_and_revert_take_presses_while_the_keep_saves() {
+    let source = "theme = \"Dracula\"\n";
+    for escape in [false, true] {
+        let (mut service, mut runtime, instance, view) = themes_view(source);
+        let nord = card_action(&runtime, view, "Nord");
+        let _ = act(&mut runtime, instance, view, &nord, None);
+        let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
+        let (keep, keep_op) = config_patches(&kept)[0].clone();
+        for key in ["settings/showcase/keep", "settings/showcase/revert"] {
+            assert_eq!(
+                takes_press(&runtime, instance, view, key),
+                (true, false),
+                "{key} takes a press while the Keep saves"
+            );
+        }
+        // The strip still says what the trial replaces, not the kept theme
+        // the key already shows.
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
+        let detail =
+            painted_text(&compiled, "settings/showcase/status/detail").expect("the strip's detail");
+        assert_eq!(detail, "was Dracula", "while the Keep saves");
+        assert!(
+            config_patches(&act(
+                &mut runtime,
+                instance,
+                view,
+                "settings/showcase/keep",
+                None
+            ))
+            .is_empty(),
+            "a second Keep writes nothing the first does not"
+        );
+        let reverted = if escape {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::TextInput(crate::native_app::TextInputEvent::Cancel),
+                )
+                .unwrap()
+        } else {
+            act(
+                &mut runtime,
+                instance,
+                view,
+                "settings/showcase/revert",
+                None,
+            )
+        };
+        let back = config_patches(&reverted);
+        assert_eq!(back.len(), 1, "escape {escape}: Revert is a write");
+        assert_eq!(
+            write_follows(&reverted),
+            vec![vec![keep_op]],
+            "it follows the Keep"
+        );
+        let (back, back_op) = back[0].clone();
+        assert_eq!(back.edits.len(), 1);
+        assert_eq!(back.edits[0].key, prefs::EDIT_THEME);
+        assert_eq!(back.edits[0].value.as_deref(), Some("Dracula"));
+        assert_eq!(
+            back.edits[0].expected,
+            ExpectedConfigValue::Exact(Some("Nord".to_string())),
+            "composed over the Keep"
+        );
+        let page = state(&runtime, view);
+        assert_eq!(page.showcase.trial, ShowcaseTrial::Idle, "shown at once");
+        assert_eq!(page.configured_theme_id(), "Dracula");
+        assert_eq!(page.theme_trial_intent(), None);
+        assert_eq!(
+            page.showcase.settled.as_ref().map(|s| s.words.as_str()),
+            Some("Reverted to Dracula")
+        );
+        let landed = land_patch(
+            &mut service,
+            &mut runtime,
+            instance,
+            view,
+            (&keep, keep_op),
+            None,
+        );
+        land_patch(
+            &mut service,
+            &mut runtime,
+            instance,
+            view,
+            (&back, back_op),
+            Some(landed),
+        );
+        assert_eq!(
+            service.snapshot().text.as_ref(),
+            source,
+            "the file ends as it began"
+        );
+        let page = state(&runtime, view);
+        assert_eq!(page.showcase.trial, ShowcaseTrial::Idle);
+        assert_eq!(page.configured_theme_id(), "Dracula");
+    }
+}
+
+/// KEEP COLOURS ONLY FOLLOWS A KEEP ON ITS WAY: while a typography theme's
+/// Keep saves, Keep ▾ is still offered (the Keep on its way is read as the
+/// trial it keeps), and Keep colours only writes the type pins over it,
+/// following it; a second press of it asks for what the first holds and
+/// writes nothing. Both land: the theme and the pins. Before, Keep ▾ was
+/// gone while the Keep saved.
+#[test]
+fn keep_colours_only_follows_a_keep_on_its_way() {
+    let (mut service, mut runtime, instance, view) = typography_view(
+        "theme = \"Dracula\"\n",
+        studio_catalog("font_family = Berkeley Mono\n"),
+    );
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
+    let (keep, keep_op) = config_patches(&kept)[0].clone();
+    assert_eq!(
+        takes_press(&runtime, instance, view, "settings/showcase/keep-more"),
+        (true, false)
+    );
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/keep-more",
+        None,
+    );
+    let pinned = act(
+        &mut runtime,
+        instance,
+        view,
+        SHOWCASE_KEEP_COLOURS_KEY,
+        None,
+    );
+    let pins = config_patches(&pinned);
+    assert_eq!(pins.len(), 1, "Keep colours only is a write");
+    assert_eq!(write_follows(&pinned), vec![vec![keep_op]]);
+    let (pins, pins_op) = pins[0].clone();
+    assert!(
+        pins.edits
+            .iter()
+            .any(|edit| edit.key == prefs::EDIT_FONT_FAMILY && edit.value.as_deref() == Some("")),
+        "{pins:?}"
+    );
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/keep-more",
+        None,
+    );
+    assert!(
+        config_patches(&act(
+            &mut runtime,
+            instance,
+            view,
+            SHOWCASE_KEEP_COLOURS_KEY,
+            None
+        ))
+        .is_empty(),
+        "a second press writes nothing the first does not"
+    );
+    let landed = land_patch(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        (&keep, keep_op),
+        None,
+    );
+    land_patch(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        (&pins, pins_op),
+        Some(landed),
+    );
+    let config = service.snapshot().config.clone();
+    assert_eq!(config.theme.as_deref(), Some("Studio"));
+    assert_eq!(config.font_family.as_deref(), Some(""));
+    assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
+}
+
+/// A REVERT TAKES BACK EVERY KEEP OF THE TRIAL ON ITS WAY: Keep, then Keep
+/// colours only over it, then Revert, all within one save. The strip still
+/// says what the trial replaces ("was Dracula", never the kept Studio), and
+/// Revert puts `theme` back to Dracula and takes the type pin off in one
+/// write that follows them, so aterm.toml ends as it began. Before, Revert
+/// and the strip read only the newest Keep (Keep colours only, whose
+/// `theme` edit went from Studio to Studio): the strip said "was Studio" and
+/// Revert left `theme = "Studio"`.
+#[test]
+fn a_revert_takes_back_a_keep_and_its_keep_colours_only() {
+    let source = "theme = \"Dracula\"\n";
+    let (mut service, mut runtime, instance, view) =
+        typography_view(source, studio_catalog(PINNABLE_TYPE));
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
+    let (keep, keep_op) = config_patches(&kept)[0].clone();
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/keep-more",
+        None,
+    );
+    let pinned = act(
+        &mut runtime,
+        instance,
+        view,
+        SHOWCASE_KEEP_COLOURS_KEY,
+        None,
+    );
+    let (pins, pins_op) = config_patches(&pinned)[0].clone();
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
+    assert_eq!(
+        painted_text(&compiled, "settings/showcase/status/detail").as_deref(),
+        Some("was Dracula"),
+        "the strip names what the trial replaces"
+    );
+    let reverted = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/revert",
+        None,
+    );
+    let back = config_patches(&reverted);
+    assert_eq!(back.len(), 1, "Revert is one write");
+    let (back, back_op) = back[0].clone();
+    let mut follows = write_follows(&reverted);
+    for follows in &mut follows {
+        follows.sort();
+    }
+    let mut both = vec![keep_op, pins_op];
+    both.sort();
+    assert_eq!(follows, vec![both], "it follows both Keeps");
+    let theme = back
+        .edits
+        .iter()
+        .find(|edit| edit.key == prefs::EDIT_THEME)
+        .expect("Revert writes the theme back");
+    assert_eq!(theme.value.as_deref(), Some("Dracula"));
+    assert_eq!(state(&runtime, view).configured_theme_id(), "Dracula");
+    let landed = land_patch(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        (&keep, keep_op),
+        None,
+    );
+    let landed = land_patch(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        (&pins, pins_op),
+        Some(landed),
+    );
+    land_patch(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        (&back, back_op),
+        Some(landed),
+    );
+    assert_eq!(
+        service.snapshot().text.as_ref(),
+        source,
+        "the file ends as it began"
+    );
+    assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
+}
+
+/// A REVERT THAT LANDS SAYS IT REVERTED, from the operation's own kind,
+/// whatever its take-back wrote: after a Keep alone (one key back) and after
+/// a Keep and Keep colours only over it (the theme and its type pins back),
+/// the status once every write lands is "Reverted to Dracula". Before, the
+/// landing named the Revert from the keys it wrote, like any other change:
+/// "Color theme set to Dracula" for the one key, "Changed 3 settings" for
+/// the three.
+#[test]
+fn a_landed_revert_says_it_reverted() {
+    let source = "theme = \"Dracula\"\n";
+    for colours_only in [false, true] {
+        let (mut service, mut runtime, instance, view) =
+            typography_view(source, studio_catalog(PINNABLE_TYPE));
+        let studio = card_action(&runtime, view, "Studio");
+        let _ = act(&mut runtime, instance, view, &studio, None);
+        let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
+        let mut writes = vec![config_patches(&kept)[0].clone()];
+        if colours_only {
+            let _ = act(
+                &mut runtime,
+                instance,
+                view,
+                "settings/showcase/keep-more",
+                None,
+            );
+            let pinned = act(
+                &mut runtime,
+                instance,
+                view,
+                SHOWCASE_KEEP_COLOURS_KEY,
+                None,
+            );
+            writes.push(config_patches(&pinned)[0].clone());
+        }
+        let reverted = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/revert",
+            None,
+        );
+        let back = config_patches(&reverted);
+        assert_eq!(back.len(), 1, "Revert is one write");
+        assert_eq!(
+            back[0].0.edits.len(),
+            if colours_only { 3 } else { 1 },
+            "the take-back writes each key the Keeps wrote"
+        );
+        assert_eq!(
+            state(&runtime, view).feedback.as_deref(),
+            Some("Reverting to Dracula\u{2026}"),
+            "while it saves"
+        );
+        writes.extend(back);
+        let mut landed = None;
+        for (patch, operation) in &writes {
+            landed = Some(land_patch(
+                &mut service,
+                &mut runtime,
+                instance,
+                view,
+                (patch, *operation),
+                landed,
+            ));
+        }
+        assert_eq!(service.snapshot().text.as_ref(), source);
+        assert_eq!(
+            state(&runtime, view).feedback.as_deref(),
+            Some("Reverted to Dracula"),
+            "once it lands (colours only: {colours_only})"
+        );
+    }
+}
+
+/// A REFUSED REVERT SAYS IT DID NOT REVERT, from the operation's own kind:
+/// pressed while a Keep saves (one key back) and while a Keep and a Keep
+/// colours only over it save (three keys back), the Keeps landing, a Revert
+/// the config lane refuses reads "Couldn't revert to Dracula: " and why.
+/// Before, it was named from the keys it wrote, like any other change:
+/// "Color theme was not saved: no" for the one key, "Couldn't apply: no"
+/// for the three.
+#[test]
+fn a_refused_revert_says_it_did_not_revert() {
+    for colours_only in [false, true] {
+        let (mut service, mut runtime, instance, view) =
+            typography_view("theme = \"Dracula\"\n", studio_catalog(PINNABLE_TYPE));
+        let studio = card_action(&runtime, view, "Studio");
+        let _ = act(&mut runtime, instance, view, &studio, None);
+        let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
+        let mut writes = vec![config_patches(&kept)[0].clone()];
+        if colours_only {
+            let _ = act(
+                &mut runtime,
+                instance,
+                view,
+                "settings/showcase/keep-more",
+                None,
+            );
+            let pinned = act(
+                &mut runtime,
+                instance,
+                view,
+                SHOWCASE_KEEP_COLOURS_KEY,
+                None,
+            );
+            writes.push(config_patches(&pinned)[0].clone());
+        }
+        // Revert pressed while the Keeps save: its take-back follows them.
+        let reverted = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/revert",
+            None,
+        );
+        let back = config_patches(&reverted);
+        assert_eq!(back.len(), 1, "Revert is one write");
+        let mut landed = None;
+        for (patch, operation) in &writes {
+            landed = Some(land_patch(
+                &mut service,
+                &mut runtime,
+                instance,
+                view,
+                (patch, *operation),
+                landed,
+            ));
+        }
+        finish_patch(&mut runtime, instance, view, back[0].1, false);
+        assert_eq!(
+            state(&runtime, view).feedback.as_deref(),
+            Some("Couldn\u{2019}t revert to Dracula: no"),
+            "colours only: {colours_only}"
+        );
+    }
+}
+
+/// KEEP COLOURS ONLY SAYS WHAT IT KEPT, from the operation's own kind:
+/// once it lands, "Kept Studio's colors and your type settings", the words
+/// it said while it saved with "Keeping" put by; refused, "Couldn't keep
+/// Studio's colors: " and why. Before, the landing was named from the
+/// three keys it wrote, "Changed 3 settings", and the refusal "Couldn't
+/// apply: no".
+#[test]
+fn keep_colours_only_says_what_it_kept() {
+    for applied in [true, false] {
+        let (mut service, mut runtime, instance, view) =
+            typography_view("theme = \"Dracula\"\n", studio_catalog(PINNABLE_TYPE));
+        let studio = card_action(&runtime, view, "Studio");
+        let _ = act(&mut runtime, instance, view, &studio, None);
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/keep-more",
+            None,
+        );
+        let pinned = act(
+            &mut runtime,
+            instance,
+            view,
+            SHOWCASE_KEEP_COLOURS_KEY,
+            None,
+        );
+        let (patch, operation) = config_patches(&pinned)[0].clone();
+        assert!(patch.edits.len() > 2, "the theme and its type pins");
+        assert_eq!(
+            state(&runtime, view).feedback.as_deref(),
+            Some("Keeping Studio's colors and your type settings\u{2026}"),
+            "while it saves"
+        );
+        if applied {
+            land_patch(
+                &mut service,
+                &mut runtime,
+                instance,
+                view,
+                (&patch, operation),
+                None,
+            );
+        } else {
+            finish_patch(&mut runtime, instance, view, operation, false);
+        }
+        assert_eq!(
+            state(&runtime, view).feedback.as_deref(),
+            Some(if applied {
+                "Kept Studio's colors and your type settings"
+            } else {
+                "Couldn\u{2019}t keep Studio's colors: no"
+            }),
+        );
+    }
+}
+
+/// KEEP AFTER KEEP COLOURS ONLY KEEPS THE THEME AS TRIED: with Keep colours
+/// only on its way, Keep writes the type pin off again (its theme's own
+/// type comes back), following it; a third press asks nothing more. Both
+/// land: `theme = "Studio"` and no pin. Before, Keep over a Keep on its way
+/// wrote nothing and the press was lost.
+#[test]
+fn keep_after_keep_colours_only_takes_the_pins_off() {
+    let (mut service, mut runtime, instance, view) =
+        typography_view("theme = \"Dracula\"\n", studio_catalog(PINNABLE_TYPE));
+    let studio = card_action(&runtime, view, "Studio");
+    let _ = act(&mut runtime, instance, view, &studio, None);
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/keep-more",
+        None,
+    );
+    let pinned = act(
+        &mut runtime,
+        instance,
+        view,
+        SHOWCASE_KEEP_COLOURS_KEY,
+        None,
+    );
+    let (pins, pins_op) = config_patches(&pinned)[0].clone();
+    let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
+    let keep = config_patches(&kept);
+    assert_eq!(keep.len(), 1, "Keep over Keep colours only is a write");
+    assert_eq!(write_follows(&kept), vec![vec![pins_op]]);
+    let (keep, keep_op) = keep[0].clone();
+    // Each type key Keep colours only pinned goes back to unset.
+    let mut pinned: Vec<(&str, Option<&str>)> = pins
+        .edits
+        .iter()
+        .filter(|edit| edit.key != prefs::EDIT_THEME)
+        .map(|edit| (edit.key.as_str(), None))
+        .collect();
+    pinned.sort_unstable();
+    assert!(pinned.len() > 1, "{pins:?}");
+    let mut unpinned: Vec<(&str, Option<&str>)> = keep
+        .edits
+        .iter()
+        .map(|edit| (edit.key.as_str(), edit.value.as_deref()))
+        .collect();
+    unpinned.sort_unstable();
+    assert_eq!(unpinned, pinned, "{keep:?}");
+    assert!(
+        config_patches(&act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/keep",
+            None
+        ))
+        .is_empty(),
+        "a third press asks nothing more"
+    );
+    let landed = land_patch(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        (&pins, pins_op),
+        None,
+    );
+    land_patch(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        (&keep, keep_op),
+        Some(landed),
+    );
+    assert_eq!(
+        service.snapshot().text.as_ref(),
+        "theme = \"Studio\"\n",
+        "the theme, and no pin"
+    );
+    assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
+}
+
+/// SAVE TAKES A SECOND SAVE WHILE THE FIRST IS ON ITS WAY: each is its own
+/// request to the themes folder, the newest the one selected once listed.
+/// Before, the second was refused ("Working on the themes folder…") while
+/// any themes request was out.
+#[test]
+fn save_as_takes_a_second_save_while_the_first_is_on_its_way() {
+    let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    let (first, _, first_op) = start_save_as(&mut runtime, instance, view);
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/save-as",
+        None,
+    );
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/save-name",
+        Some("Saved Again"),
+    );
+    let second = act(&mut runtime, instance, view, "settings/showcase/save", None);
+    let Some((ThemesRequest::Save { id, .. }, second_op)) = themes_request(&second) else {
+        panic!(
+            "the second Save is a request: {:?}",
+            state(&runtime, view).feedback
+        );
+    };
+    assert_eq!(
+        (first.as_str(), id.as_str()),
+        ("Saved Custom", "Saved Again")
+    );
+    assert_ne!(first_op, second_op);
+    assert_eq!(
+        state(&runtime, view).feedback.as_deref(),
+        Some("Saving Saved Again\u{2026}")
+    );
 }
 
 /// A name the theme file spells differently (a space before `#`) still
@@ -2056,6 +2767,10 @@ fn studio_catalog(extra: &str) -> std::sync::Arc<crate::app_config::ThemeCatalog
     crate::app_config::ThemeCatalog::from_parsed([("Studio".to_string(), parsed)])
 }
 
+/// Type settings Keep colours only can pin each of at aterm's own value:
+/// a font family, and a line height whose pin is aterm's default (1.0).
+const PINNABLE_TYPE: &str = "font_family = Berkeley Mono\nline_height = 1.15\n";
+
 const STUDIO_TYPE: &str = "font_family = Berkeley Mono\nline_height = 1.15\nfont_weight = 450\n";
 
 /// The Themes page over `source` with `themes` admitted.
@@ -2124,6 +2839,86 @@ fn font_rows_name_the_themes_values() {
             .placeholder,
         "Automatic"
     );
+}
+
+/// A ROW THAT OVERRIDES THE THEME'S TYPE COMPILES, ITS RESET NAMED BY ITS
+/// WORDS: Text & Fonts over `theme = "Studio"` with the line height and the
+/// font family set over Studio's (the state Keep colours only leaves) lays
+/// out, and each Reset that returns to the theme's value paints "Use
+/// theme's" inside an accessible name that says it and the value it returns
+/// to. Before, the name read "Reset Line height to theme Studio's (1.15)",
+/// which does not hold the painted words, so the page refused to compile in
+/// every development build (`VisibleLabelNotInName`) and a person speaking
+/// the button's words could not reach it.
+#[test]
+fn a_reset_to_the_themes_type_is_named_by_its_words() {
+    let (_service, mut runtime, instance, view) = typography_view(
+        "theme = \"Studio\"\nline_height = 1.4\nfont_family = \"\"\n",
+        studio_catalog(STUDIO_TYPE),
+    );
+    let Some(AppViewState::Settings(page)) = runtime.view_state_mut(view) else {
+        unreachable!()
+    };
+    page.navigate(SettingsRoute::TextFonts);
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
+    for (key, value) in [
+        (prefs::EDIT_LINE_HEIGHT, "1.15"),
+        (prefs::EDIT_FONT_FAMILY, "Berkeley Mono"),
+    ] {
+        let reset = compiled
+            .semantic(&UiKey::new(format!("settings/reset/{key}")))
+            .unwrap_or_else(|| panic!("{key}'s Reset is drawn"));
+        let name = reset.label.as_str();
+        assert!(
+            crate::native_ui::visible_label_in_name("Use theme's", name),
+            "{key}: {name:?}"
+        );
+        assert!(
+            name.contains(value) && name.contains("Studio"),
+            "{key}: {name:?}"
+        );
+    }
+}
+
+/// A RESET THAT HANDS A TYPE SETTING BACK TO THE THEME SAYS THE THEME'S
+/// VALUE: pressing "Use theme's" on Line height over `theme = "Studio"`
+/// (1.15) says "Line height reset to Studio's 1.15×", the value now drawn,
+/// and so does Keep after Keep colours only, which hands the pins back.
+/// Negative control: with no theme behind it the Reset says aterm's own
+/// default. Before, both said "reset to 1.0×", aterm's default, while the
+/// theme's 1.15 was drawn.
+#[test]
+fn a_reset_to_the_themes_type_says_the_themes_value() {
+    for (source, words) in [
+        (
+            "theme = \"Studio\"\nline_height = 1.4\n",
+            "Line height reset to Studio\u{2019}s 1.15\u{d7}",
+        ),
+        ("line_height = 1.4\n", "Line height reset to 1.0\u{d7}"),
+    ] {
+        let (mut service, mut runtime, instance, view) =
+            typography_view(source, studio_catalog(PINNABLE_TYPE));
+        let Some(AppViewState::Settings(page)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        page.navigate(SettingsRoute::TextFonts);
+        let reset = format!("settings/reset/{}", prefs::EDIT_LINE_HEIGHT);
+        let pressed = act(&mut runtime, instance, view, &reset, None);
+        let (patch, operation) = config_patches(&pressed)[0].clone();
+        land_patch(
+            &mut service,
+            &mut runtime,
+            instance,
+            view,
+            (&patch, operation),
+            None,
+        );
+        assert_eq!(
+            state(&runtime, view).feedback.as_deref(),
+            Some(words),
+            "{source:?}"
+        );
+    }
 }
 
 /// Save as theme with "Include type settings" writes the type the page shows
@@ -4781,10 +5576,15 @@ fn colour_rows_show_the_colour_they_draw() {
     );
 }
 
-/// Each Customize colour row is one line in every shape: its name, its
-/// field and its Reset share the row's band, and the fields keep one right
-/// edge whether or not a row has a Reset. A stacked row (the name over a
-/// page-wide field) fails it.
+/// Each Customize colour row is one line in every shape whose column holds
+/// it (a narrower one, the short page's chooser, puts the name over the
+/// field: [`opening_customize_never_squeezes_or_moves_the_demo`]): its name,
+/// its field and its Reset share the row's band, and the fields keep one
+/// right edge whether or not a row has a Reset. A stacked row (the name over
+/// a page-wide field) fails it. The keyboard on a field left to the theme
+/// paints the theme's hex, whole, not the field's own words cut ("Theme…",
+/// the round-7 audit at every size): NEGATIVE CONTROL, those words,
+/// "Theme default", are wider than the field.
 #[test]
 fn colour_rows_are_one_line_with_one_field_column() {
     let paint_rect = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -4847,6 +5647,40 @@ fn colour_rows_are_one_line_with_one_field_column() {
                 .semantic(&UiKey::new("settings/reset/background"))
                 .is_none(),
             "{width}x{height}: a colour left to the theme has no Reset"
+        );
+        // The keyboard on the background's field, left to the theme, as Tab
+        // or a click puts it there.
+        let control = "settings/control/background";
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.common.last_focus = Some(UiKey::new(control));
+            state.focus_field(Some(&UiKey::new(control)));
+            assert_eq!(state.editing_field.as_deref(), Some(prefs::EDIT_BACKGROUND));
+        }
+        let focused = compile_settings_view(&runtime, instance, view, &cx);
+        let line = focused
+            .text_fit_audit_line(&UiKey::new(control))
+            .expect("the field paints words");
+        assert!(
+            line.contains("overflow=false") && !line.contains('\u{2026}'),
+            "{width}x{height}: the focused field {line}"
+        );
+        let dracula = aterm_types::scheme::builtin("Dracula").expect("built-in");
+        let bg = dracula.background;
+        assert!(
+            line.contains(&format!(
+                "painted=\"#{:02x}{:02x}{:02x}\"",
+                bg.r, bg.g, bg.b
+            )),
+            "{width}x{height}: the focused field paints the theme's hex: {line}"
+        );
+        // NEGATIVE CONTROL: the field's own words would not fit it.
+        let field = rect_of(&focused, control);
+        assert!(
+            crate::native_ui::text_field_width_for("Theme default", true) > field.width + 0.5,
+            "{width}x{height}: the control: \"Theme default\" fits {field:?}"
         );
     }
 }
@@ -5759,6 +6593,17 @@ fn the_strip_draws_its_title_and_every_button_whole() {
                         None,
                     );
                 }
+                // The strip is the list's lead where the page lists it (a
+                // phone-width page at 2×): measured on the screen it is on,
+                // the list's first, not the one that keeps the tried row in
+                // view, whose wrapped name can take the strip past its top.
+                list_at_top(&mut runtime, view);
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!()
+                    };
+                    state.common.last_focus = None;
+                }
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
                 let context = format!("{width} at {scale}× {step}");
                 let title = compiled
@@ -6066,8 +6911,11 @@ fn whole_and_cut_rows(compiled: &crate::native_ui::CompiledUi) -> (Vec<String>, 
 /// it, the strip and the chooser end on one line, and Down on a row tries
 /// the next theme in that demo. A tall window keeps the demo over the
 /// chooser, and a wide one keeps them side by side with the footer pinned
-/// under the list, as they were. NEGATIVE CONTROL: a window too narrow for
-/// the demo beside the chooser (556x348) stacks them, and the same count
+/// under the list, as they were. (Every screen, the Customize sheet's and
+/// the one Community opens on included:
+/// [`no_stop_is_cut_on_any_screen`].) NEGATIVE CONTROL: a
+/// window too narrow for the demo beside even a chooser narrowed to keep
+/// it 40 columns (514x348, 70 columns) stacks them, and the same count
 /// finds fewer than four whole rows there.
 #[test]
 fn the_default_window_shows_four_whole_theme_rows_beside_the_demo() {
@@ -6130,11 +6978,838 @@ fn the_default_window_shows_four_whole_theme_rows_beside_the_demo() {
     );
     assert!(follow.y >= list.bottom(), "wide: {follow:?} under {list:?}");
     // NEGATIVE CONTROL: too narrow for the demo beside, stacked and short.
-    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(556.0, 348.0));
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(514.0, 348.0));
     let (whole, _) = whole_and_cut_rows(&compiled);
     assert!(
         rect_of(&compiled, STAGE).bottom() <= rect_of(&compiled, "settings/showcase/chooser").y,
         "the control is stacked"
     );
     assert!(whole.len() < 4, "the control: {whole:?}");
+}
+
+/// The shape the themes page took, read off what it draws: the demo beside
+/// the chooser with the footer pinned under its list (`Beside`) or listed
+/// among its stops (`Short`), else the demo over the chooser or among its
+/// stops (`Stacked`).
+fn page_shape(compiled: &crate::native_ui::CompiledUi) -> &'static str {
+    let chooser = rect_of(compiled, "settings/showcase/chooser");
+    let list = rect_of(compiled, showcase_page::SHOWCASE_LIST);
+    let beside = compiled
+        .semantic(&UiKey::new(STAGE))
+        .is_some_and(|stage| stage.rect.x >= chooser.right() - 0.01);
+    let pinned = compiled
+        .semantic(&UiKey::new("settings/showcase/footer/follow"))
+        .is_some_and(|follow| !follow.offscreen && follow.rect.y >= list.bottom() - 0.5);
+    match (beside, pinned) {
+        (true, true) => "Beside",
+        (true, false) => "Short",
+        (false, _) => "Stacked",
+    }
+}
+
+/// The chooser's row height at the default text size.
+const CHOOSER_ROW: f32 = 32.0;
+
+/// THE PAGE CHANGES SHAPE ONCE AS THE WINDOW GROWS TALLER (the audit of
+/// the short page, 2026-10-20: measured under a demo that gave up rows at
+/// another line than the one the page decided by, 80 and 92 columns went
+/// Short, Stacked, Short and Stacked again between 34 and 39 lines, and 37
+/// lines showed nine rows beside the demo where 39 showed two under it). At
+/// 584, 668 and 1144pt wide, from 240pt to 760pt tall, once the demo first
+/// stands beside the chooser every shape the page takes holds one unbroken
+/// run of heights, and where it then stacks the demo over the chooser the
+/// list keeps four rows' room. PREMISE: the sweep sees Short give way to
+/// Stacked at 584 and 668, and to Beside at 1144.
+#[test]
+fn the_themes_page_changes_shape_once_as_the_window_grows_taller() {
+    let (_service, runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    for (width, after) in [
+        (584.0_f32, "Stacked"),
+        (668.0, "Stacked"),
+        (1_144.0, "Beside"),
+    ] {
+        let mut runs: Vec<&str> = Vec::new();
+        for height in (240..=760).step_by(2).map(|h| h as f32) {
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+            let shape = page_shape(&compiled);
+            if runs.is_empty() && shape == "Stacked" {
+                continue;
+            }
+            if runs.last() != Some(&shape) {
+                assert!(
+                    !runs.contains(&shape),
+                    "{width}x{height}: {shape} again after {runs:?}"
+                );
+                runs.push(shape);
+            }
+            if shape == "Stacked" {
+                let list = rect_of(&compiled, showcase_page::SHOWCASE_LIST);
+                assert!(
+                    list.height + 0.5 >= 4.0 * CHOOSER_ROW,
+                    "{width}x{height}: the stacked list {list:?} keeps four rows' room"
+                );
+            }
+        }
+        assert_eq!(runs, ["Short", after], "{width}: the shapes, short to tall");
+    }
+}
+
+/// WIDENING THE WINDOW NEVER TAKES ROWS FROM THE CHOOSER (the audit of the
+/// short page, 2026-10-20: at 24 lines 93 columns showed four rows and a
+/// 7pt sliver where 92 showed six whole; 123 columns one theme row and a
+/// sliver where 122 showed four; and 106 and 107 columns, where the sidebar
+/// comes, stacked a one-line demo over a row and a cut, between a demo
+/// beside the chooser at 105 and 108). At 348pt and 434pt tall, from 70
+/// columns to 182, a column at a time: once the demo stands beside the
+/// chooser it does at every wider width, at least 40 cells wide; beside it
+/// the chooser's list is whole rows tall and paints no row cut; and its
+/// rows never fall below four, or below what a narrower width showed,
+/// while the page's heading stays as it was (a heading that comes with the
+/// sidebar takes its own room). NEGATIVE CONTROL: at 70 columns the page is
+/// too narrow for the demo beside a chooser that keeps its slabs, and
+/// stacks.
+#[test]
+fn widening_the_window_never_takes_rows_from_the_chooser() {
+    let (_service, runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    for height in [348.0_f32, 434.0] {
+        let mut beside_from = None;
+        let mut last: Option<(f32, f32)> = None;
+        for width in (514..=1_300).step_by(7).map(|w| w as f32) {
+            let at = format!("{width}x{height}");
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+            if page_shape(&compiled) == "Stacked" {
+                assert!(
+                    beside_from.is_none(),
+                    "{at}: stacked again after {beside_from:?}"
+                );
+                last = None;
+                continue;
+            }
+            beside_from.get_or_insert(width);
+            let stage = rect_of(&compiled, STAGE);
+            assert!(stage.width + 0.01 >= 40.0 * 12.0 * 0.6, "{at}: {stage:?}");
+            let list = rect_of(&compiled, showcase_page::SHOWCASE_LIST);
+            let rows = list.height / CHOOSER_ROW;
+            assert!(
+                (rows - rows.round()).abs() < 0.01,
+                "{at}: the list {list:?} is whole rows tall"
+            );
+            let (_, cut) = whole_and_cut_rows(&compiled);
+            assert!(cut.is_empty(), "{at}: rows cut: {cut:?}");
+            let top = rect_of(&compiled, "settings/showcase/chooser").y;
+            if let Some((was_top, was_rows)) =
+                last.filter(|(was_top, _)| (was_top - top).abs() < 0.01)
+            {
+                assert!(
+                    rows.round() >= was_rows.min(4.0),
+                    "{at}: {rows} rows where {was_rows} stood narrower ({was_top})"
+                );
+            }
+            last = Some((top, rows.round()));
+        }
+        assert_eq!(
+            beside_from,
+            Some(528.0),
+            "{height}: the demo beside from 72 columns"
+        );
+    }
+    // NEGATIVE CONTROL: too narrow for the demo beside, stacked.
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(514.0, 348.0));
+    assert_eq!(page_shape(&compiled), "Stacked");
+}
+
+/// Every node the list `key` paints that its edges cut: what lies within
+/// the list's columns and reaches past its top or bottom, the list's own
+/// frame and thumb aside.
+fn cut_by_the_list(compiled: &crate::native_ui::CompiledUi, key: &str) -> Vec<String> {
+    let list = rect_of(compiled, key);
+    compiled
+        .paint
+        .iter()
+        .filter(|node| {
+            !node.clip.is_empty()
+                && node.key.as_str() != key
+                && !node.key.as_str().starts_with(&format!("{key}/"))
+                && node.clip.x >= list.x - 0.5
+                && node.clip.right() <= list.right() + 0.5
+                && node.clip.y >= list.y - 0.5
+                && node.clip.bottom() <= list.bottom() + 0.5
+        })
+        .filter(|node| node.rect.y < list.y - 0.5 || node.rect.bottom() > list.bottom() + 0.5)
+        .map(|node| format!("{} {:?}", node.key.as_str(), node.rect))
+        .collect()
+}
+
+/// Every node the list `key` paints cut at the top of the rows a screen
+/// draws under the caption it keeps over them (a section's `/scrolled-rows`
+/// frame): a row scrolled half under its caption.
+fn cut_under_a_caption(compiled: &crate::native_ui::CompiledUi, key: &str) -> Vec<String> {
+    let list = rect_of(compiled, key);
+    let inside = |rect: &LogicalRect| {
+        rect.x >= list.x - 0.5
+            && rect.right() <= list.right() + 0.5
+            && rect.y >= list.y - 0.5
+            && rect.bottom() <= list.bottom() + 0.5
+    };
+    let Some(rows) = compiled
+        .paint
+        .iter()
+        .find(|node| node.key.as_str().ends_with("/scrolled-rows") && inside(&node.rect))
+        .map(|node| node.rect)
+    else {
+        return Vec::new();
+    };
+    compiled
+        .paint
+        .iter()
+        .filter(|node| !node.clip.is_empty() && inside(&node.clip))
+        .filter(|node| node.rect.y < rows.y - 0.5 && node.clip.y >= rows.y - 0.5)
+        .map(|node| format!("{} {:?} under {rows:?}", node.key.as_str(), node.rect))
+        .collect()
+}
+
+/// Each caption of the Customize sheet that a screen of its list `key`
+/// paints over none of the rows of its section that hold a colour: PALETTE
+/// with no chip under it, COLORS with no colour row.
+fn captions_over_no_colour(compiled: &crate::native_ui::CompiledUi, key: &str) -> Vec<String> {
+    let list = rect_of(compiled, key);
+    let painted: Vec<&str> = compiled
+        .paint
+        .iter()
+        .filter(|node| {
+            !node.clip.is_empty()
+                && node.clip.x >= list.x - 0.5
+                && node.clip.right() <= list.right() + 0.5
+                && node.clip.y >= list.y - 0.5
+                && node.clip.bottom() <= list.bottom() + 0.5
+        })
+        .map(|node| node.key.as_str())
+        .collect();
+    let colour_rows: Vec<String> = showcase_page::SHOWCASE_COLOR_KEYS
+        .iter()
+        .map(|key| format!("settings/control/{key}"))
+        .collect();
+    let sections: [(&str, Vec<String>); 2] = [
+        (
+            "settings/showcase/palette-section/heading",
+            vec!["settings/showcase/palette/".to_string()],
+        ),
+        ("settings/showcase/colours/heading", colour_rows),
+    ];
+    sections
+        .into_iter()
+        .filter(|(heading, _)| painted.contains(heading))
+        .filter(|(_, rows)| {
+            !painted.iter().any(|key| {
+                rows.iter().any(|row| {
+                    key.strip_prefix(row.as_str()).is_some_and(|rest| {
+                        row.ends_with('/') || rest.is_empty() || rest.starts_with('/')
+                    })
+                })
+            })
+        })
+        .map(|(heading, _)| format!("{heading} over none of its rows: {painted:?}"))
+        .collect()
+}
+
+/// NO STOP IS CUT ON ANY SCREEN, IN ANY SHAPE (the audit of the short page,
+/// 2026-10-20: the columns beside the demo were snapped to whole 32pt rows,
+/// but the Customize sheet's rows are 38pt apart under a caption — at a lab
+/// instance's 80x24, 584x348, `Selected text` showed 20 of its 32pt at the
+/// sheet's foot — and the 40pt Community disclosure and a NEEDS ATTENTION
+/// row's two lines left the rows after them cut at the chooser's foot; then
+/// the round-7 review of the stacked page, whose lists ended on a peek: every
+/// screen but the last ended on a cut row, at 514x348 (70x24) the last
+/// screen of a one-row list cut "Follow system light/dark" under the filter,
+/// at 584x516 and 584x530 (80x36, 80x37) it kept BUILT IN over a cut GitHub
+/// Light, and at 584x558 (80x39) the sheet's last screen kept PALETTE over
+/// its first chips, scrolled under it; then the round-8 audit of the sheet's
+/// last screen, measured 4pt longer than it draws: at 80x37 and 106x24 it
+/// was PALETTE and "Choose a color to change it" over Save as, no chip on
+/// it, where the bright chips fitted over them, and the screen before it
+/// left Save as undrawn with 40pt of the list blank under it). At 584x350,
+/// 675x448, 766x348 and 1144x448, where the demo stands beside the list,
+/// and at 514x348, 584x516, 584x530 and 584x558, where it stands over it,
+/// on every screen of the chooser — as it opens, with Community open, with
+/// a theme file that needs attention — and of the Customize sheet: no node
+/// the list draws reaches past its edges or starts under the caption a
+/// screen keeps over its rows; the screen draws exactly the stops it shows,
+/// seated at the first, and no stop after them that, laid out as the list
+/// lays out its runs, would end inside the list; and every caption the
+/// sheet's last screen paints stands over a row of its section's colours.
+/// NEGATIVE CONTROLS: at every one of those sizes the same stops ending on
+/// a peek (as the stacked lists did) draw one they do not show whole on
+/// some screen; what each screen draws, laid out so, ends inside the list,
+/// so a screen of two or more stops (none at 514x348, where every screen
+/// is one), one stop short, leaves out a stop that would end inside it;
+/// and at 766x348 and 584x530 the sheet's last screen paints PALETTE.
+#[test]
+fn no_stop_is_cut_on_any_screen() {
+    let dir = aterm_tempfile::tempdir().expect("a themes folder");
+    std::fs::write(dir.path().join("Broken.conf"), "foreground = \"#zz\"\n=\n").unwrap();
+    std::fs::write(
+        dir.path().join("Harbour.conf"),
+        "foreground = #dddddd\nbackground = #101218\n",
+    )
+    .unwrap();
+    // What the list cuts or leaves out on its screens, and the controls:
+    // whether some screen of it, its stops ending on a peek, draws a stop it
+    // does not show whole; whether some screen, one stop short, leaves out a
+    // stop that would end inside the list; and whether the last screen paints
+    // PALETTE.
+    let check = |width: f32, height: f32, form: &str, stacked: bool| -> (Vec<String>, [bool; 3]) {
+        let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+        let cx = view_cx_at(width, height);
+        let mut list = showcase_page::SHOWCASE_LIST;
+        let mut panel = "settings/showcase/chooser";
+        match form {
+            "community" => {
+                let _ = act(&mut runtime, instance, view, "settings/showcase/pack", None);
+            }
+            "attention" => {
+                let published = service.replace_theme_catalog(std::sync::Arc::new(
+                    crate::app_config::ThemeCatalog::discover_in(dir.path()),
+                ));
+                let _ = dispatch(
+                    &mut runtime,
+                    instance,
+                    view,
+                    AppEvent::ConfigChanged(published),
+                );
+                assert!(!state(&runtime, view).showcase.attention.is_empty());
+            }
+            "sheet" => {
+                let _ = act(
+                    &mut runtime,
+                    instance,
+                    view,
+                    "settings/showcase/customize",
+                    None,
+                );
+                list = "settings/showcase/sheet-list";
+                panel = "settings/showcase/sheet";
+            }
+            _ => {}
+        }
+        let at = format!("{width}x{height} {form}");
+        let mut faults = Vec::new();
+        // Each screen's first stop and how tall its list is; the captions the
+        // sheet's last screen paints over none of its colours, and whether it
+        // paints PALETTE.
+        let mut rooms = Vec::new();
+        let mut last_bare = Vec::new();
+        let mut last_palette = false;
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            // PREMISE: the shape the size is listed under.
+            let stage = rect_of(compiled, STAGE);
+            assert_eq!(
+                stage.bottom() <= rect_of(compiled, panel).y + 0.5,
+                stacked,
+                "{at}: the demo over the list"
+            );
+            faults.extend(
+                cut_by_the_list(compiled, list)
+                    .into_iter()
+                    .chain(cut_under_a_caption(compiled, list))
+                    .map(|node| format!("{at} screen {top}: {node}")),
+            );
+            rooms.push((top, rect_of(compiled, list).height));
+            if form == "sheet" {
+                last_bare = captions_over_no_colour(compiled, list)
+                    .into_iter()
+                    .map(|caption| format!("{at} last screen {top}: {caption}"))
+                    .collect();
+                last_palette = compiled.paint.iter().any(|node| {
+                    node.key.as_str() == "settings/showcase/palette-section/heading"
+                        && !node.clip.is_empty()
+                });
+            }
+        });
+        // THE LAST SCREEN IS NO CAPTION OVER ITS SECTION'S TOOLS: every
+        // caption the sheet's last screen paints stands over a row of its
+        // section's colours. (A screen the wheel seats at the palette's tools
+        // row, PALETTE kept over it, is one stop of the list; the last screen
+        // is the list's choice, the fullest that reaches its end.)
+        faults.extend(last_bare);
+        // The list's stops and room, the same on every screen.
+        let plan = state(&runtime, view)
+            .scroll_plan()
+            .expect("the list's plan");
+        let cuts = |plan: &scroll::ScrollPlan| {
+            (0..=plan.limit())
+                .map(|top| (top, plan.screen(top)))
+                .filter(|(_, screen)| screen.drawn != screen.view || screen.offset.abs() > 0.01)
+                .map(|(top, screen)| {
+                    format!("{at} screen {top} draws more than it shows: {screen:?}")
+                })
+                .collect::<Vec<_>>()
+        };
+        faults.extend(cuts(&plan));
+        // NO STOP LEFT OUT THAT FITS: the stops a screen draws and the next,
+        // laid out from the list's top as the list lays out its runs (each
+        // as tall as the card it draws, the list's gap between them), end
+        // inside the list only where the screen draws that next stop too.
+        let fits = |stops: std::ops::Range<usize>, room: f32| plan.span(stops) <= room + 0.5;
+        let mut short_flagged = false;
+        for (top, room) in rooms {
+            let drawn = plan.screen(top).drawn;
+            if drawn.end < plan.len() && fits(drawn.start..drawn.end + 1, room) {
+                faults.push(format!(
+                    "{at} screen {top} leaves stop {} undrawn, laid out ending {} down a \
+                     list {room} tall",
+                    drawn.end,
+                    plan.span(drawn.start..drawn.end + 1)
+                ));
+            }
+            // PREMISE: what the screen draws, laid out so, ends inside the
+            // list (a first stop taller than the list aside); so, NEGATIVE
+            // CONTROL, a screen of two or more stops, one stop short, leaves
+            // out a stop that ends inside the list.
+            assert!(
+                drawn.len() < 2 || fits(drawn.clone(), room),
+                "{at} screen {top}: {drawn:?} laid out ends past a list {room} tall"
+            );
+            short_flagged |= drawn.len() >= 2;
+        }
+        // NEGATIVE CONTROL: the same stops ending on a peek.
+        let mut peek = plan;
+        peek.set_foot(scroll::ListFoot::Peek);
+        (
+            faults,
+            [!cuts(&peek).is_empty(), short_flagged, last_palette],
+        )
+    };
+    let mut faults = Vec::new();
+    let mut controls = Vec::new();
+    let mut short_flagged = false;
+    for (width, height, stacked) in [
+        (584.0, 350.0, false),
+        (675.0, 448.0, false),
+        (766.0, 348.0, false),
+        (1_144.0, 448.0, false),
+        (514.0, 348.0, true),
+        (584.0, 516.0, true),
+        (584.0, 530.0, true),
+        (584.0, 558.0, true),
+    ] {
+        let mut peek_cuts = false;
+        for form in ["open", "community", "attention", "sheet"] {
+            let (cut, [peek, short, last_palette]) = check(width, height, form, stacked);
+            faults.extend(cut);
+            peek_cuts |= peek;
+            short_flagged |= short;
+            if form == "sheet"
+                && [(766.0, 348.0), (584.0, 530.0)].contains(&(width, height))
+                && !last_palette
+            {
+                controls.push(format!(
+                    "{width}x{height}'s last sheet screen paints PALETTE"
+                ));
+            }
+        }
+        if !peek_cuts {
+            controls.push(format!("{width}x{height} ending on a peek cuts a stop"));
+        }
+    }
+    if !short_flagged {
+        controls.push("some screen one stop short leaves out a stop that fits".to_string());
+    }
+    assert!(faults.is_empty(), "{faults:#?}");
+    assert!(controls.is_empty(), "the controls: {controls:#?}");
+}
+
+/// Land every config write `outcome` asked for, as the host does: the real
+/// service applies it, the view hears it finished and the new snapshot.
+fn land_writes(
+    service: &mut VersionedConfigService,
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    outcome: &crate::native_app::DispatchOutcome,
+) {
+    for (patch, operation) in config_patches(outcome) {
+        let (published, undo) = apply_real_config_patch(service, &patch);
+        let _ = dispatch(
+            runtime,
+            instance,
+            view,
+            AppEvent::ConfigPatchFinished {
+                operation,
+                outcome: ConfigPatchOutcome::Applied {
+                    revision: published.revision,
+                    undo,
+                },
+            },
+        );
+        let _ = dispatch(runtime, instance, view, AppEvent::ConfigChanged(published));
+    }
+}
+
+/// OPENING CUSTOMIZE, OR SETTING AND RESETTING A COLOUR IN IT, NEVER
+/// SQUEEZES OR MOVES THE DEMO (the audit of the short page's narrowed
+/// chooser, 2026-10-20: at 72x24 the chooser is 192pt so the demo beside it
+/// keeps its 40 cells, but the sheet in its place took 224.2pt to hold its
+/// colour rows on one line, and the demo, 255.8pt, moved right and wrapped
+/// its lines; then the round-7 audit: Reset's place came with the first
+/// colour set and went with the last reset, so at a Retina default window
+/// the first set moved the demo 18pt, and at the 1x default window every
+/// colour row went from one line to two and back). At 528, 556, 584, 766 and
+/// 885x348, 1152x420 and 1074x684, with no colour set and with one: the open
+/// sheet leaves the demo exactly where the chooser left it, at least 40 cells
+/// wide — rendered twice, so a page that seats its chrome again from the
+/// sheet's list is caught — and setting a colour there, then resetting it
+/// (or the other way round), moves the demo not at all and keeps every
+/// colour row's form, its name beside its field or over it; its rows paint
+/// every name whole and its title whole. PREMISE: at 885x348 and 1152x420
+/// the panel is wider than the 232pt chooser, as wide as the rows need on
+/// one line with Reset's place, so a sheet that took that width only while
+/// a colour was set would move the demo there. NEGATIVE CONTROL: the form
+/// check tells the forms apart — 584x348 puts every name over its field,
+/// 885x348 beside it.
+#[test]
+fn opening_customize_never_squeezes_or_moves_the_demo() {
+    let painted = |compiled: &crate::native_ui::CompiledUi, key: &str| {
+        compiled.paint.iter().find_map(|node| match &node.content {
+            UiContent::Text(text) if node.key.as_str() == key => {
+                Some((text.text.clone(), node.rect))
+            }
+            _ => None,
+        })
+    };
+    // Each colour row's form where the sheet draws it: its name beside its
+    // field (true) or over it.
+    let forms = |compiled: &crate::native_ui::CompiledUi, at: &str| {
+        let mut forms = Vec::new();
+        for key in showcase_page::SHOWCASE_COLOR_KEYS {
+            let control = format!("settings/control/{key}");
+            let field = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == control)
+                .map(|node| node.rect);
+            let (Some((name, label)), Some(field)) =
+                (painted(compiled, &format!("settings/label/{key}")), field)
+            else {
+                continue;
+            };
+            assert!(
+                !name.is_empty() && !name.contains('\u{2026}'),
+                "{at}: {key}'s name painted {name:?}"
+            );
+            let beside = (label.y - field.y).abs() < 0.5 && label.right() <= field.x + 0.5;
+            let over = label.bottom() <= field.y + 0.5 && label.x <= field.x + 0.5;
+            assert!(
+                beside || over,
+                "{at}: {key}'s name {label:?} beside or over its field {field:?}"
+            );
+            forms.push((key.to_string(), beside));
+        }
+        forms
+    };
+    let unmoved = |before: LogicalRect, after: LogicalRect| {
+        (after.x - before.x).abs() < 0.01
+            && (after.y - before.y).abs() < 0.01
+            && (after.width - before.width).abs() < 0.01
+            && (after.height - before.height).abs() < 0.01
+    };
+    let set = "theme = \"Dracula\"\ncursor_color = \"#ff8800\"\n";
+    let mut seen_forms = std::collections::BTreeMap::new();
+    for source in ["theme = \"Dracula\"\n", set] {
+        for (width, height) in [
+            (528.0_f32, 348.0_f32),
+            (556.0, 348.0),
+            (584.0, 348.0),
+            (766.0, 348.0),
+            (885.0, 348.0),
+            (1_152.0, 420.0),
+            (1_074.0, 684.0),
+        ] {
+            let at = format!(
+                "{width}x{height}{}",
+                if source == set { " set" } else { "" }
+            );
+            let (mut service, mut runtime, instance, view) = themes_view(source);
+            let cx = view_cx_at(width, height);
+            let chooser = compile_settings_view(&runtime, instance, view, &cx);
+            assert_ne!(page_shape(&chooser), "Stacked", "{at}: premise");
+            let before = rect_of(&chooser, STAGE);
+            let panel = rect_of(&chooser, "settings/showcase/chooser");
+            if (width, height) == (885.0, 348.0) || (width, height) == (1_152.0, 420.0) {
+                assert!(panel.width > 232.0 + 1.0, "{at}: premise: {panel:?}");
+            }
+            let _ = act(
+                &mut runtime,
+                instance,
+                view,
+                "settings/showcase/customize",
+                None,
+            );
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            let sheet = compile_settings_view(&runtime, instance, view, &cx);
+            let after = rect_of(&sheet, STAGE);
+            assert!(
+                unmoved(before, after),
+                "{at}: the demo {after:?} where the chooser left it {before:?}"
+            );
+            assert!(
+                after.width + 0.01 >= 40.0 * 12.0 * 0.6,
+                "{at}: the demo {after:?} keeps 40 cells"
+            );
+            let opened = forms(&sheet, &at);
+            assert!(!opened.is_empty(), "{at}: the sheet draws colour rows");
+            seen_forms.insert((width as u32, height as u32), opened.clone());
+            let (title, _) =
+                painted(&sheet, "settings/showcase/sheet-title").expect("the sheet's title");
+            assert!(!title.contains('\u{2026}'), "{at}: the title {title:?}");
+            // Set the cursor's colour, then reset it, or the other way round.
+            let steps = if source == set {
+                [
+                    ("settings/reset/cursor_color", None),
+                    ("settings/set/cursor_color", Some("#ff8800")),
+                ]
+            } else {
+                [
+                    ("settings/set/cursor_color", Some("#ff8800")),
+                    ("settings/reset/cursor_color", None),
+                ]
+            };
+            for (action, value) in steps {
+                let outcome = act(&mut runtime, instance, view, action, value);
+                assert!(
+                    !config_patches(&outcome).is_empty(),
+                    "{at}: {action} writes"
+                );
+                land_writes(&mut service, &mut runtime, instance, view, &outcome);
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let now = compile_settings_view(&runtime, instance, view, &cx);
+                let moved = rect_of(&now, STAGE);
+                assert!(
+                    unmoved(before, moved),
+                    "{at} after {action}: the demo {moved:?} where it stood {before:?}"
+                );
+                // The rows this screen and the opened one both draw (the
+                // keyboard on the row it set may scroll the list).
+                let now_forms = forms(&now, &at);
+                let both: Vec<_> = now_forms
+                    .iter()
+                    .filter(|row| opened.iter().any(|was| was.0 == row.0))
+                    .collect();
+                assert!(
+                    !both.is_empty(),
+                    "{at} after {action}: {now_forms:?} {opened:?}"
+                );
+                for (key, beside) in both {
+                    assert!(
+                        opened.contains(&(key.clone(), *beside)),
+                        "{at} after {action}: {key}'s form changed ({opened:?} then {now_forms:?})"
+                    );
+                }
+                assert_eq!(
+                    now.semantic(&UiKey::new("settings/reset/cursor_color"))
+                        .is_some(),
+                    action.starts_with("settings/set/"),
+                    "{at} after {action}: Reset shows while the colour is set"
+                );
+            }
+        }
+    }
+    // NEGATIVE CONTROL: the forms the check tells apart.
+    let all =
+        |size: (u32, u32), beside: bool| seen_forms[&size].iter().all(|(_, form)| *form == beside);
+    assert!(
+        all((584, 348), false),
+        "584x348: {:?}",
+        seen_forms[&(584, 348)]
+    );
+    assert!(
+        all((885, 348), true),
+        "885x348: {:?}",
+        seen_forms[&(885, 348)]
+    );
+}
+
+/// NO SCREEN OF THE SHEET IS MOSTLY BLANK (the audit of the sheet's whole
+/// stops, 2026-10-20: the palette was one 118pt stop — its caption, both
+/// rows of chips and the tools row — so at 106x24, 107x24 and 123x24 the
+/// last screen of a 128pt list was "Save as theme…" alone over 96pt of
+/// blank, and at 80x24 a screen showed two colour rows over a 96pt hole).
+/// With no slot open, every stop of the sheet is at most a caption over one
+/// of its rows, so on every screen, at 72, 80, 106 and 123 columns of 24
+/// lines, the room under the last stop drawn is less than a captioned
+/// colour row and the list's gap — the most the next stop can take.
+/// NEGATIVE CONTROL: an open slot's editor pages with its swatches as one
+/// tall stop, and at 80x24 a screen ends that much short of its foot.
+#[test]
+fn no_screen_of_the_sheet_is_mostly_blank() {
+    let list = "settings/showcase/sheet-list";
+    // The most blank a screen of the sheet at `width`x348 leaves, and the
+    // most its stops allow: a caption over a colour row as it draws, the
+    // card's gap under the row, and the list's gap.
+    let blanks = |width: f32, slot: bool| {
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+        let cx = view_cx_at(width, 348.0);
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/customize",
+            None,
+        );
+        if slot {
+            let _ = act(
+                &mut runtime,
+                instance,
+                view,
+                "settings/showcase/palette/4",
+                None,
+            );
+        }
+        let (mut caption, mut row) = (0.0_f32, 0.0_f32);
+        let mut most = (0.0_f32, 0);
+        let screens = each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let room = rect_of(compiled, list);
+            if let Some(foreground) = compiled.semantics.iter().find(|node| {
+                node.key.as_str().starts_with("settings/row/")
+                    && node.key.as_str().ends_with(prefs::EDIT_FOREGROUND)
+            }) {
+                row = row.max(foreground.rect.height);
+            }
+            if let Some(heading) = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == "settings/showcase/colours/heading")
+            {
+                caption = caption.max(heading.rect.height);
+            }
+            let drawn_to = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    !node.clip.is_empty()
+                        && node.key.as_str() != list
+                        && !node.key.as_str().starts_with(&format!("{list}/"))
+                        && node.clip.x >= room.x - 0.5
+                        && node.clip.right() <= room.right() + 0.5
+                        && node.clip.y >= room.y - 0.5
+                        && node.clip.bottom() <= room.bottom() + 0.5
+                })
+                .map(|node| node.clip.bottom())
+                .fold(room.y, f32::max);
+            let blank = room.bottom() - drawn_to;
+            if blank > most.0 {
+                most = (blank, top);
+            }
+        });
+        assert!(screens > 2, "{width}: the sheet scrolls");
+        assert!(caption > 0.0 && row > 0.0, "{width}: COLORS over its rows");
+        let bound = caption + 4.0 + row + 4.0 + 6.0;
+        (most, bound)
+    };
+    for width in [528.0_f32, 584.0, 766.0, 885.0] {
+        let ((blank, top), bound) = blanks(width, false);
+        assert!(
+            blank < bound,
+            "{width}x348: screen {top} ends {blank}pt short of its foot (bound {bound})"
+        );
+    }
+    // NEGATIVE CONTROL: the open slot's swatches and editor are one stop.
+    let ((blank, top), bound) = blanks(584.0, true);
+    assert!(
+        blank >= bound,
+        "the control: screen {top} ends {blank}pt short (bound {bound})"
+    );
+}
+
+/// EVERY PALETTE CHIP IS A TARGET A POINTER CAN HIT (the round-7 audit of
+/// the sheet at 72x24: the chooser's 192pt kept eight chips to a row, 15.2pt
+/// targets 21.2pt apart, a 7pt sliver of colour in each; at a Retina 70x24
+/// 17.9pt, 23.9pt apart). At 528x348 and 556x348, on every screen of the
+/// sheet, no two palette chips' targets stand closer than 24pt centre to
+/// centre (WCAG 2.5.8's spacing), and each of the sixteen is drawn whole on
+/// some screen. PREMISE: at 528x348 a row of the palette is too narrow for
+/// eight chips 24pt apart, so it stands four to a row. NEGATIVE CONTROL:
+/// where eight keep that pitch (1144x448) a row holds eight.
+#[test]
+fn palette_chips_stand_a_target_apart() {
+    let chips_in = |compiled: &crate::native_ui::CompiledUi| -> Vec<(usize, LogicalRect)> {
+        compiled
+            .hits
+            .iter()
+            .filter_map(|hit| {
+                let index = hit
+                    .key
+                    .as_str()
+                    .strip_prefix("settings/showcase/palette/")?
+                    .parse::<usize>()
+                    .ok()?;
+                Some((index, hit.rect))
+            })
+            .collect()
+    };
+    let open = |width: f32, height: f32| {
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/customize",
+            None,
+        );
+        (runtime, instance, view, view_cx_at(width, height))
+    };
+    for width in [528.0_f32, 556.0] {
+        let (mut runtime, instance, view, cx) = open(width, 348.0);
+        let mut whole = std::collections::BTreeSet::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let chips = chips_in(compiled);
+            for (index, rect) in &chips {
+                // Live over its whole height: no edge of the list cuts it.
+                if rect.height + 0.01 >= 24.0 {
+                    whole.insert(*index);
+                }
+                for (other, near) in &chips {
+                    if other <= index {
+                        continue;
+                    }
+                    let (dx, dy) = (
+                        (rect.x + rect.width / 2.0) - (near.x + near.width / 2.0),
+                        (rect.y + rect.height / 2.0) - (near.y + near.height / 2.0),
+                    );
+                    let pitch = dx.hypot(dy);
+                    assert!(
+                        pitch + 0.01 >= 24.0,
+                        "{width}x348 screen {top}: chips {index} and {other} {pitch}pt apart: \
+                         {rect:?} {near:?}"
+                    );
+                }
+            }
+            // PREMISE: at 528 a row is too narrow for eight 24pt apart.
+            if width == 528.0
+                && let Some(row) = compiled.semantic(&UiKey::new("settings/showcase/palette-row/0"))
+            {
+                assert!(
+                    (row.rect.width + 6.0) / 8.0 < 24.0,
+                    "premise: {:?}",
+                    row.rect
+                );
+            }
+        });
+        assert_eq!(whole.len(), 16, "{width}x348: chips drawn whole {whole:?}");
+    }
+    // NEGATIVE CONTROL: room for eight to a row.
+    let (mut runtime, instance, view, cx) = open(1_144.0, 448.0);
+    let mut most = 0;
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        let chips = chips_in(compiled);
+        for (_, rect) in &chips {
+            let in_row = chips
+                .iter()
+                .filter(|(_, other)| (other.y - rect.y).abs() < 0.5)
+                .count();
+            most = most.max(in_row);
+        }
+    });
+    assert_eq!(most, 8, "the control: eight chips to a row");
 }

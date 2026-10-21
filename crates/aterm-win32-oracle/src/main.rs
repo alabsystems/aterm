@@ -238,6 +238,15 @@ fn formatted(
     }
     Ok(())
 }
+/// lib.rs and [`model::HAND_WRITTEN`], the files under aterm-win32's `src/`
+/// that `gen` does not own.
+fn hand_written(root: &Path, path: &Path) -> bool {
+    let src = root.join("crates/aterm-win32/src");
+    ["lib.rs"]
+        .iter()
+        .chain(model::HAND_WRITTEN.iter())
+        .any(|f| path == src.join(f))
+}
 fn generate(
     root: &Path,
     model: &model::Model,
@@ -249,7 +258,7 @@ fn generate(
     if out == root {
         for path in model::rust_files(&root.join("crates/aterm-win32/src"))? {
             let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
-            if path.file_name().is_some_and(|n| n != "lib.rs") && !outputs.contains_key(rel) {
+            if !hand_written(root, &path) && !outputs.contains_key(rel) {
                 std::fs::remove_file(&path).map_err(|e| e.to_string())?;
             }
         }
@@ -269,7 +278,7 @@ fn check(root: &Path, model: &model::Model, tools: &Tools) -> Result<u8> {
     }
     for p in model::rust_files(&root.join("crates/aterm-win32/src"))? {
         let rel = p.strip_prefix(root).map_err(|e| e.to_string())?;
-        if p.file_name().is_some_and(|n| n != "lib.rs") && !outputs.contains_key(rel) {
+        if !hand_written(root, &p) && !outputs.contains_key(rel) {
             drift.push(format!("{} (no longer generated)", rel.display()))
         }
     }

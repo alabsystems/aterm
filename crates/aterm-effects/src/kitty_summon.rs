@@ -100,8 +100,6 @@ pub struct TypedKittySummon {
     chars: Vec<char>,
     matches: Vec<Match>,
     scratch: ScanScratch,
-    /// Reused `(byte offset, char)` walk for [`Self::trailing_scan_start`].
-    tail: Vec<(usize, char)>,
     /// Lifetime count of printed keystrokes fed to this detector: the [`DOG_SUMMON_KEYS`]
     /// odometer. Not persisted.
     keys_typed: u64,
@@ -119,9 +117,18 @@ impl TypedKittySummon {
     /// Drop leading chars until the window holds at most [`BUF_CAP`]. Trimming
     /// on a char boundary keeps the buffer valid UTF-8.
     fn trim(&mut self) {
-        while self.buf.chars().count() > BUF_CAP {
-            let first = self.buf.chars().next().map_or(0, char::len_utf8);
-            self.buf.drain(..first);
+        if self.buf.len() <= BUF_CAP {
+            return;
+        }
+        if self.buf.is_ascii() {
+            let split = self.buf.len() - BUF_CAP;
+            self.buf.drain(..split);
+            return;
+        }
+        if let Some((split, _)) = self.buf.char_indices().rev().nth(BUF_CAP - 1)
+            && split > 0
+        {
+            self.buf.drain(..split);
         }
     }
 
@@ -154,7 +161,7 @@ impl TypedKittySummon {
         // with the lexicon's own predicates (its `token_end`, walked
         // backwards). Exact for any surface length: earlier tokens could only
         // yield matches that do not end at the window end.
-        let start = Self::trailing_scan_start(&self.buf, ch, &mut self.tail);
+        let start = Self::trailing_scan_start(&self.buf, ch);
         let Self {
             buf,
             chars,
@@ -214,35 +221,40 @@ impl TypedKittySummon {
     /// Byte offset into `buf` where the incremental scan starts: the trailing
     /// token (when `last` is a token char) or trailing no-space run (when it is
     /// a no-space-script char), extended by two preceding chars of left
-    /// context. `tail` is reused scratch for the backward walk.
+    /// context. Walks `buf.char_indices().rev()` directly in O(token_len) with
+    /// zero scratch storage.
     ///
     /// Token segmentation mirrors the scanner's `token_end`, backwards: a
     /// maximal run of token chars where an interior joiner (`'`, `’`, `-`)
     /// counts only with token chars on both sides.
-    fn trailing_scan_start(buf: &str, last: char, tail: &mut Vec<(usize, char)>) -> usize {
-        tail.clear();
-        tail.extend(buf.char_indices());
-        let n = tail.len();
-        if n == 0 {
+    fn trailing_scan_start(buf: &str, last: char) -> usize {
+        let mut rev = buf.char_indices().rev().peekable();
+        if rev.next().is_none() {
             return 0;
         }
-        // Index (into `tail`) of the first char of the trailing token/run.
-        let mut i = n - 1;
         if aterm_lexicon::is_no_space_script(last) {
-            while i > 0 && aterm_lexicon::is_no_space_script(tail[i - 1].1) {
-                i -= 1;
+            while let Some(&(_, c)) = rev.peek()
+                && aterm_lexicon::is_no_space_script(c)
+            {
+                rev.next();
             }
         } else {
-            loop {
-                if i > 0 && aterm_lexicon::is_token_char(tail[i - 1].1) {
-                    i -= 1;
-                } else if i > 1
-                    && aterm_lexicon::is_interior_joiner(tail[i - 1].1)
-                    && aterm_lexicon::is_token_char(tail[i - 2].1)
-                {
-                    // `tail[i]` is a token char (we only arrive here from one),
-                    // so the joiner is interior: consume it and keep walking.
-                    i -= 2;
+            while let Some(&(_, c)) = rev.peek() {
+                if aterm_lexicon::is_token_char(c) {
+                    rev.next();
+                } else if aterm_lexicon::is_interior_joiner(c) {
+                    // Consume the joiner; if the char before it is a token
+                    // char, the joiner is interior (consume that token char
+                    // too and keep walking). Otherwise the joiner was already
+                    // the first of the two left-context chars.
+                    rev.next();
+                    if let Some(&(_, c2)) = rev.peek()
+                        && aterm_lexicon::is_token_char(c2)
+                    {
+                        rev.next();
+                    } else {
+                        return rev.next().map_or(0, |(idx, _)| idx);
+                    }
                 } else {
                     break;
                 }
@@ -250,7 +262,8 @@ impl TypedKittySummon {
         }
         // Two chars of left context for `left_suppresses` (`c == '.'` looks one
         // further back than the adjacent char).
-        tail[i.saturating_sub(2)].0
+        let _ = rev.next();
+        rev.next().map_or(0, |(idx, _)| idx)
     }
 
     /// A plain Backspace pops the most recent char (typo tolerance, bounded
@@ -265,6 +278,14 @@ impl TypedKittySummon {
     /// sequences) clears the window: the run must be typed as one word.
     pub fn note_break(&mut self) {
         self.buf.clear();
+    }
+
+    /// Serious Mode's drain: clear the live typing window without dropping the
+    /// warmed-up scan buffers, the Kitty Log cooldown (`last_summon`), or the
+    /// canine keystroke odometer (`keys_typed`). Idempotent.
+    pub fn drain_serious(&mut self) {
+        self.buf.clear();
+        self.session = None;
     }
 }
 

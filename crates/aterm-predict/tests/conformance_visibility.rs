@@ -52,7 +52,7 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
 
     // Negative control: the genuine predictor has a tracked, deadline-bearing `b`
     // after a real confirmation, while the shipping benefit gate keeps its overlay
-    // empty. The deleted confirmation-only gate would expose that exact tracked
+    // empty. A confirmation-only gate would expose that exact tracked
     // glyph. Derive both operands from the shipping predictor/model transition so
     // this control fails if tracking, confirmation, or the real overlay drifts.
     let tracked_fast_prediction = fast.next_deadline().is_some();
@@ -116,7 +116,7 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
     assert_eq!(slow_model["visible"], 0);
     assert!(slow.overlay(local_start).is_empty());
 
-    // Negative control: the old window-global EWMA survives the switch and is
+    // Negative control: a window-global EWMA survives the switch and is
     // explicitly rejected by the model's fresh-session invariant.
     let mut inherited = model.init_state();
     inherited.insert("slow", 1);
@@ -215,7 +215,7 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
         "a settled local link stops painting on both sides"
     );
 
-    // Tier-0 negative controls for the retraction rule: the deleted single-sample
+    // Tier-0 negative controls for the retraction rule: a single-sample
     // close, and a close taken with pixels still in flight, are both rejected.
     let mut single_sample = model.init_state();
     single_sample.insert("retracted", 1);
@@ -406,7 +406,7 @@ fn an_owed_echo_proves_nothing_until_its_window_passes() {
         "the space echoes after the second 'n', not at (1, 3)"
     );
 
-    // Negative control, from the code: the deleted rule credited every match. The
+    // Negative control, from the code: crediting every match. The
     // shipping predictor credits one exactly when the flushed key is older than
     // its window, so the same run with the second 'n' typed a window later is
     // that credit, measured — not a constant. Projected onto the model's state at
@@ -455,7 +455,7 @@ fn an_owed_echo_proves_nothing_until_its_window_passes() {
 /// expires; then `d` is typed at the live cursor, which still stands on `c`'s
 /// cell. Returns whether `d` is painted: the shipping proof, read through the
 /// pixels. With `rule_off` the predictor runs with `Rule::ExpiryOwes` switched
-/// off, the expiry as it shipped before the fix.
+/// off, leaving an expired guess unowed.
 fn expiry_run(rule_off: bool) -> bool {
     let mut p = Predictor::new(PredictMode::Adaptive);
     if rule_off {

@@ -442,6 +442,22 @@ fn a_walk_cut_short_makes_the_whole_directory_not_a_candidate() {
     assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
 }
 
+/// A size bounded by a deadline that has passed reads nothing more and says it was cut
+/// short; one whose deadline is far off is the whole size, as [`total_bytes`] gives it.
+#[test]
+fn a_size_past_its_deadline_is_cut_short() {
+    let tmp = Tmp::new("size-deadline");
+    let t = furnished(&tmp, "target");
+    let now = std::time::Instant::now();
+    assert_eq!(total_bytes_until(&t, now), (0, true));
+    let whole = total_bytes(&t);
+    assert!(whole.0 > 0 && !whole.1, "{whole:?}");
+    assert_eq!(
+        total_bytes_until(&t, now + Duration::from_secs(3600)),
+        whole
+    );
+}
+
 /// The idle clock is [`CLOCK_DIRS`], never a lock's or the profile directory's: a fresh lock
 /// or profile directory is not a use; a fresh `deps/` or `examples/` is.
 #[test]

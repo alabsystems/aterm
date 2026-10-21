@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parser tests — split into focused submodules.
+//! Parser tests.
 
 use super::*;
 
@@ -20,13 +20,13 @@ mod tmux;
 mod utf8_errors;
 mod utf8_parity;
 
-/// Test sink that records all actions for verification.
+/// Records every action.
 #[derive(Debug, Default, PartialEq)]
 struct RecordingSink {
     prints: Vec<char>,
     executes: Vec<u8>,
     csi_dispatches: Vec<(Vec<u16>, Vec<u8>, u8)>,
-    /// CSI dispatches with subparam mask: (params, intermediates, final_byte, subparam_mask)
+    /// (params, intermediates, final_byte, subparam_mask).
     csi_dispatches_with_subparams: Vec<(Vec<u16>, Vec<u8>, u8, u32)>,
     esc_dispatches: Vec<(Vec<u8>, u8)>,
     osc_dispatches: Vec<Vec<Vec<u8>>>,

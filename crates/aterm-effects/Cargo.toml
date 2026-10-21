@@ -19,26 +19,25 @@ autotests = false
 aterm-core = { path = "../aterm-core", default-features = false }
 # Explicit terminal progress facts; already part of the core dependency graph.
 aterm-types = { workspace = true }
-# The one char-width authority `note_committed_char` shares with the terminal's
-# own materialization law (handler_write Tier 5) and the native capture seam.
+# The one char-width authority, shared with the terminal's write path and the
+# native capture seam.
 aterm-grapheme = { workspace = true }
 # The render-boundary overlay types (GlowQuad/WordDecoration/InkCell/SpriteQuad/
 # SceneAtlas) + the comet-beam rasterizer the aurora shares with the renderer.
 aterm-render = { path = "../aterm-render", default-features = false }
 # Multilingual whole-word matching for the sparkle-words rescan.
 aterm-lexicon = { workspace = true }
-# v3 §6 spec framework: the FxHashMap override table (same hasher the lexicon
-# keys with) + serde/aterm-toml for the `[[sparkle_words.custom]]` fragment both the
-# native resolver and the web `set_sparkle_custom_specs` surface parse.
+# The FxHashMap override table (the lexicon's hasher) + serde/aterm-toml for the
+# `[[sparkle_words.custom]]` fragment that both the native resolver and the web
+# `set_sparkle_custom_specs` parse.
 aterm-hash = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 aterm-toml = { workspace = true }
 # Deterministic kinematics kit (mix_rgb/smoothstep) + the procedural Tile the
-# cat baker draws with. Pure/dependency-free (no `bridge` feature needed here).
+# cat baker draws with.
 aterm-scene = { workspace = true }
-# The injected-clock idiom: std::time::Instant on native, a JS clock on wasm32.
-# The state machines stay clockless (the host injects `now`), but wasm hosts
-# need a constructible Instant to synthesize one from an advance(dt) stream.
+# The injected-clock idiom: the state machines take `now` from the host; wasm
+# hosts need a constructible Instant to synthesize it from an advance(dt) stream.
 aterm-time = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
@@ -74,8 +73,8 @@ name = "effects_suite"
 path = "tests/effects_suite.rs"
 
 # ---- release perf gates: `targo --unverified bench -p aterm-effects` ----------
-# Wall-clock budgets measured in the bench profile; their deterministic halves
-# are the tests above.
+# Wall-clock budgets in the bench profile; the tests above hold their
+# deterministic halves.
 [[bench]]
 name = "cursor_bench"
 path = "benches/cursor_bench.rs"

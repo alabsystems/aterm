@@ -2731,8 +2731,12 @@ impl HarnessCard {
                 .map(|(i, c)| {
                     let x = f32::from(i) / span;
                     let at = tri(x + phi);
-                    let d = (x - pos) / LINE_SWEEP_SIGMA;
-                    let w = env * (-d * d).exp() * gain;
+                    let w = if env == 0.0 {
+                        0.0
+                    } else {
+                        let d = (x - pos) / LINE_SWEEP_SIGMA;
+                        env * (-d * d).exp() * gain
+                    };
                     let rgb = if dark {
                         let base = palette.at(at);
                         mix_rgb(lift_to_luminance(base, LINE_DARK_LUMA_FLOOR), WHITE, w)
@@ -2765,10 +2769,12 @@ impl HarnessCard {
 /// every point either tests is a multiple of `2^-14` at most 1, exact in an
 /// `f32` (`a_lift_finds_the_bisections_mix`).
 fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
-    if relative_luminance(rgb) >= floor {
+    let table = crate::color_math::relative_luminance_table();
+    if crate::color_math::relative_luminance_with(table, rgb) >= floor {
         return rgb;
     }
-    let reaches = |t: f32| relative_luminance(mix_rgb(rgb, WHITE, t)) >= floor;
+    let reaches =
+        |t: f32| crate::color_math::relative_luminance_with(table, mix_rgb(rgb, WHITE, t)) >= floor;
     // The last grid point known short of the floor, and the round's step.
     let (mut short, mut step) = (0.0f32, 0.25f32);
     for _ in 0..7 {
@@ -2856,6 +2862,10 @@ struct Emit<'a> {
     geo: Geo,
     clock: Clock,
     seed: u64,
+    phi: f32,
+    head_env: f32,
+    head_pos: f32,
+    shimmer_pos: f32,
     /// The kitty where it is this frame ([`ridden`]) and the frame of its
     /// art it wears.
     kitty: Option<(KittyAt, KittyPose)>,
@@ -2873,6 +2883,12 @@ impl<'a> Emit<'a> {
             geo,
             clock,
             seed,
+            phi: PHI_SETTLED + clock.drift(PHI_DRIFT),
+            head_env: clock.head_env(),
+            head_pos: (clock.u() * HEAD_LAPS).fract(),
+            shimmer_pos: clock
+                .t_ms
+                .map_or(0.0, |t| (t as f32 / SHIMMER_MS).fract() * 1.4 - 0.2),
             kitty: seat.map(|at| (ridden(&geo, scene, at, clock), kitty_frame(clock))),
             seat,
         }
@@ -2887,15 +2903,13 @@ impl<'a> Emit<'a> {
 
     /// The border's paint at arc fraction `s`.
     fn border_paint(&self, s: f32) -> Paint {
-        let phi = PHI_SETTLED + self.clock.drift(PHI_DRIFT);
         let base = self
             .scene
             .palette
-            .art_at(tri(2.0 * s + phi), self.scene.dark);
-        let env = self.clock.head_env();
+            .art_at(tri(2.0 * s + self.phi), self.scene.dark);
+        let env = self.head_env;
         let w = if env > 0.0 {
-            let head = (self.clock.u() * HEAD_LAPS).fract();
-            let d = (s - head).rem_euclid(1.0);
+            let d = (s - self.head_pos).rem_euclid(1.0);
             let d = d.min(1.0 - d) / HEAD_SIGMA;
             env * (-d * d).exp()
         } else {
@@ -3010,12 +3024,11 @@ impl<'a> Emit<'a> {
 
     /// The shimmer's weight at trail fraction `x`.
     fn shimmer(&self, x: f32) -> f32 {
-        let Some(t) = self.clock.t_ms else {
+        if self.clock.t_ms.is_none() {
             return 0.0;
-        };
-        let pos = (t as f32 / SHIMMER_MS).fract() * 1.4 - 0.2;
-        let d = (x - pos) / SHIMMER_SIGMA;
-        self.clock.head_env() * (-d * d).exp() * SHIMMER_GAIN
+        }
+        let d = (x - self.shimmer_pos) / SHIMMER_SIGMA;
+        self.head_env * (-d * d).exp() * SHIMMER_GAIN
     }
 
     /// One stripe's paint under shimmer weight `w`: lifted toward white by
@@ -3064,13 +3077,14 @@ impl<'a> Emit<'a> {
         let mut xa = tx0;
         // A segment's left end is the last one's right end: its shimmer and
         // its stripes' paints are that one's, not computed again.
-        let wa = self.shimmer(0.0);
+        let mut wa = self.shimmer(0.0);
         let mut ends: [Paint; TRAIL_STOPS.len()] =
             std::array::from_fn(|s| self.stripe_paint(s, wa));
         while xa < drawn {
             let xb = (xa + seg).min(drawn);
             let d = self.wave(&lay, k);
             let wb = self.shimmer((xb - tx0) as f32 / len as f32);
+            let same_w = wb == wa;
             for (s, end) in ends.iter_mut().enumerate() {
                 let si = s as i64;
                 let mut y0 = ya + h * si / stripes;
@@ -3088,10 +3102,15 @@ impl<'a> Emit<'a> {
                     y1,
                 };
                 // Inside the stroke: light stacked on the border would double.
-                let pb = self.stripe_paint(s, wb);
+                let pb = if same_w {
+                    *end
+                } else {
+                    self.stripe_paint(s, wb)
+                };
                 out.ramp(inner, r, *end, pb);
                 *end = pb;
             }
+            wa = wb;
             xa = xb;
             k += 1;
         }
@@ -3163,11 +3182,10 @@ impl<'a> Emit<'a> {
     /// with the border's.
     fn rim_paint(&self, (x, y): (f32, f32), (cx, cy): (f32, f32)) -> Paint {
         let s = ((x - cx).atan2(cy - y) / std::f32::consts::TAU).rem_euclid(1.0);
-        let phi = PHI_SETTLED + self.clock.drift(PHI_DRIFT);
         let base = self
             .scene
             .palette
-            .art_at(tri(2.0 * s + phi), self.scene.dark);
+            .art_at(tri(2.0 * s + self.phi), self.scene.dark);
         if self.scene.dark {
             light(base, f32::from(RIM_COV))
         } else {
@@ -3239,6 +3257,8 @@ impl<'a> Emit<'a> {
         let riding = self
             .seat
             .and_then(|seat| ride_span(&self.geo, self.scene, &seat));
+        let t_sec = self.clock.t_ms.map(|t| t as f32 / 1000.0);
+        let gold = twinkle_rgb(true);
         for (i, s) in glints.spots().iter().enumerate() {
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((from, dist))) => {
@@ -3250,9 +3270,9 @@ impl<'a> Emit<'a> {
             if up <= 0.0 {
                 continue;
             }
-            let (env, w) = match self.clock.t_ms {
-                Some(t) => {
-                    let e = twinkle_env(t as f32 / 1000.0, s.phase);
+            let (env, w) = match t_sec {
+                Some(t_sec) => {
+                    let e = twinkle_env(t_sec, s.phase);
                     let w =
                         self.shimmer((s.x - trail.tx0) as f32 / trail.len as f32) / SHIMMER_GAIN;
                     ((e + (STAR_STEADY_ENV - e) * settle) * up, w.clamp(0.0, 1.0))
@@ -3260,7 +3280,6 @@ impl<'a> Emit<'a> {
                 None => (STAR_STEADY_ENV, 0.0),
             };
             let arm = rest + ((flare - rest) as f32 * w).round() as i64;
-            let gold = twinkle_rgb(true);
             lay(StarCall {
                 clip: region,
                 centre: (s.x, s.y),
@@ -3287,8 +3306,15 @@ impl<'a> Emit<'a> {
         let riding = self
             .seat
             .and_then(|seat| Some((seat, ride_span(&self.geo, self.scene, &seat)?)));
+        let t_sec = self.clock.t_ms.map(|t| t as f32 / 1000.0);
+        let chf = self.geo.ch as f32;
+        let even_rgb = twinkle_rgb(true);
+        let odd_rgb = match self.scene.palette {
+            CardPalette::Cruise => twinkle_rgb(false),
+            CardPalette::Land => mix_rgb(SUNSET[3], WHITE, 0.5),
+        };
         for (i, s) in spots[..n].iter().enumerate() {
-            let arm = i64::from(star_arm_px(star_arm(self.geo.ch as f32, s.ratio)));
+            let arm = i64::from(star_arm_px(star_arm(chf, s.ratio)));
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((seat, (from, dist)))) if s.x < seat.rect.x0 => {
                     let passed = ride_at((s.x + arm + 1 - from) as f32 / dist as f32);
@@ -3299,24 +3325,15 @@ impl<'a> Emit<'a> {
             if up <= 0.0 {
                 continue;
             }
-            let (env, gold) = match self.clock.t_ms {
-                Some(t) => {
-                    let e = twinkle_env(t as f32 / 1000.0, s.phase);
+            let (env, gold) = match t_sec {
+                Some(t_sec) => {
+                    let e = twinkle_env(t_sec, s.phase);
                     let e = (e + (STAR_STEADY_ENV - e) * settle) * up;
                     (e, s.gold || (i % 2 == 0 && twinkle_peak(e)))
                 }
                 None => (STAR_STEADY_ENV, s.gold),
             };
-            let light_rgb = match self.scene.palette {
-                CardPalette::Cruise => twinkle_rgb(i % 2 == 0),
-                CardPalette::Land => {
-                    if i % 2 == 0 {
-                        twinkle_rgb(true)
-                    } else {
-                        mix_rgb(SUNSET[3], WHITE, 0.5)
-                    }
-                }
-            };
+            let light_rgb = if i % 2 == 0 { even_rgb } else { odd_rgb };
             lay(StarCall {
                 clip: region,
                 centre: (s.x, s.y),
@@ -3364,21 +3381,24 @@ impl<'a> Emit<'a> {
             })
         };
         let (y0, y1) = seat.body();
+        let span_y = (y1 - y0) as f32;
+        let chf = self.geo.ch as f32;
+        let tax = if dark { 1.0 } else { STAR_ARM_INK };
+        let tf = t as f32;
+        let dist_f = dist as f32;
         for k in 0..SHED_SPARKLES {
             let f = (k + 1) as f32 / (SHED_SPARKLES + 1) as f32;
-            let age = t as f32 - ride_at(f);
+            let age = tf - ride_at(f);
             if !(0.0..SHED_MS as f32).contains(&age) {
                 continue;
             }
             let tau = age / SHED_MS as f32;
-            let ratio = STAR_ARM_FINE * (1.0 - 0.4 * tau) * if dark { 1.0 } else { STAR_ARM_INK };
-            let arm = i64::from(star_arm_px(star_arm(self.geo.ch as f32, ratio)));
+            let ratio = STAR_ARM_FINE * (1.0 - 0.4 * tau) * tax;
+            let arm = i64::from(star_arm_px(star_arm(chf, ratio)));
             let m = arm + 1;
             // A star's reach behind the kitty's back as it was then.
-            let x = from + (dist as f32 * f).round() as i64 - m;
-            let y = y0
-                + ((y1 - y0) as f32 * (0.15 + 0.7 * unit(self.seed, 0x5348_4544 ^ k as u64)))
-                    as i64;
+            let x = from + (dist_f * f).round() as i64 - m;
+            let y = y0 + (span_y * (0.15 + 0.7 * unit(self.seed, 0x5348_4544 ^ k as u64))) as i64;
             let (lo, hi) = (
                 (region.x0 + m, region.y0 + m),
                 (region.x1 - m, region.y1 - m),

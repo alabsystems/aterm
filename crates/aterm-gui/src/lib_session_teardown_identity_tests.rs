@@ -4,9 +4,8 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-/// A `sleep` in its own session: a session and group leader, so it passes
-/// the old `getpgid(pid) == pid` guard exactly as a reissued shell pid
-/// landing on a job-control leader or a daemon would.
+/// A `sleep` in its own session: a session and group leader, like the job-control leader
+/// or daemon a reissued shell pid can land on, so `getpgid(pid) == pid` alone passes it.
 fn setsid_sleep() -> aterm_uds::spawnfd::Child {
     aterm_uds::spawnfd::command("/bin/sleep")
         .arg("30")
@@ -198,8 +197,8 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
             ),
             "an uncommitted drop deleted the files the predecessor handed its shell"
         );
-        // Its own held write went with the session: a release now leaves
-        // the predecessor's pointer as it is.
+        // Its own held write went with the session: a release leaves the predecessor's
+        // pointer as it is.
         commit.release();
         assert_eq!(
             std::fs::read_to_string(&body).ok().as_deref(),
@@ -258,13 +257,11 @@ fn a_session_built_through_the_spawn_s_latch_keeps_only_an_uncommitted_adopted_s
     assert!(!overlap.released(), "PRECONDITION: no Commit in this test");
 }
 
-/// A QUIT ENDS EVERY TAB'S SHELL AS CLOSING THE TAB DOES. The final exit forgets
-/// the App, so no session is dropped; `hang_up_at_exit` runs each one's hang-up
-/// and reap instead. This shell ignores SIGHUP, so only the reap's SIGKILL ends
-/// it: before, the quit left it to the master's close, which SIGHUPs the
-/// session leader alone, and it outlived aterm. CONTROL: a shell the
-/// predecessor still owns (an adoption before Commit) is left alive, as its
-/// close leaves it.
+/// A quit ends every tab's shell as closing the tab does. The final exit forgets the App,
+/// so no session drops; `hang_up_at_exit` runs each one's hang-up and reap instead. This
+/// shell ignores SIGHUP, so only the reap's SIGKILL ends it (the master's close SIGHUPs
+/// the session leader alone). Control: a shell the predecessor still owns (an adoption
+/// before Commit) is left alive, as its close leaves it.
 #[cfg(unix)]
 #[test]
 fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {

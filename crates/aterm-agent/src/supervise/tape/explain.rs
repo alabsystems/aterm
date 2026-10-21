@@ -1127,6 +1127,11 @@ fn facts_with_doors(
             value: facts.limit_reset_passed.to_string(),
             door: memory("this dialog's mount"),
         },
+        Fact {
+            name: "limit_retry",
+            value: facts.limit_retry.to_string(),
+            door: memory("the reset the dialog names, past its grace"),
+        },
     ];
     if let Some(trusted) = &facts.trusted_cwd {
         out.push(Fact {

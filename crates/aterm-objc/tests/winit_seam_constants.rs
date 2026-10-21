@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seam's constants, `_Static_assert`ed against the SDK on BOTH arches.
+//! The seam's constants (`crates/aterm-window/src/platform_impl/macos/aterm_objc_seam.rs`'s
+//! `consts`), `_Static_assert`ed against the SDK on both arches by the recipe in the seam's
+//! header. A hand transcription goes wrong silently: on Apple Silicon
+//! `#if TARGET_ABI_USES_IOS_VALUES` reduces to `!TARGET_CPU_X86_64`, not "iOS vs macOS".
 //!
 //! `crates/aterm-window/src/platform_impl/macos/aterm_objc_seam.rs`'s `consts` module
 //! carries AppKit and Foundation values, and its header gives the recipe:
@@ -39,12 +42,9 @@ use std::path::{Path, PathBuf};
 use crate::sdk_consts;
 use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_const_decl};
 
-/// `(Rust constant, the SDK spelling it claims to equal)`.
-///
-/// The SDK name is written out rather than derived from the Rust name by
-/// un-snake-casing it. A derivation would be a second guess — and it would be
-/// wrong for `NS_APPKIT_VERSION_NUMBER_10_12` and `NS_CRITICAL_REQUEST`, neither
-/// of which is the mechanical camel-case of its Rust spelling.
+/// `(Rust constant, the SDK spelling it claims to equal)`. The SDK name is written out, not
+/// derived: `NS_APPKIT_VERSION_NUMBER_10_12` and `NS_CRITICAL_REQUEST` are not the mechanical
+/// camel-case of their Rust spelling.
 //
 // `rustfmt::skip`: one row per line is what makes a lookup table checkable by
 // eye against the seam it mirrors.
@@ -86,10 +86,6 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY", "NSApplicationActivationPolicyAccessory"),
     ("NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED", "NSApplicationActivationPolicyProhibited"),
     // ---- app.rs's swizzled -sendEvent: ----
-    //
-    // The `NSEventType` enumerator the override matches on. It matched eleven
-    // until winit-core step 5 (2026-10-15) took its device-event dispatch, and
-    // the ten mouse types with it.
     ("NS_EVENT_TYPE_KEY_UP", "NSEventTypeKeyUp"),
 ];
 
@@ -174,13 +170,11 @@ fn every_seam_constant_equals_the_sdk_on_both_arches() {
     }
 }
 
-/// …and the same probe with ONE row inverted must fail on BOTH arches.
+/// The same probe with one row inverted fails on both arches.
 #[test]
 fn the_assertion_is_load_bearing_on_both_arches() {
-    // The row picked is deliberately one whose VALUE could never expose a
-    // mistake at runtime: `NSEventSubtypeWindowExposed` is 0, so the fork
-    // passes the same bits whether the constant is right or wrong. It is the
-    // profile of every constant this instrument exists for.
+    // The inverted row is one whose value no run-time test could expose (it is 0), the profile
+    // of every constant this check exists for.
     let body = probe(Some("NS_EVENT_SUBTYPE_WINDOW_EXPOSED"));
     for arch in ["arm64", "x86_64"] {
         inverted_verdict(

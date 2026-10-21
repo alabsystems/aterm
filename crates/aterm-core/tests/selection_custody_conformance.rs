@@ -12,13 +12,10 @@
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 
-/// A terminal with history, scrolled back, holding a completed selection on the
-/// oldest visible line — i.e. a selection anchored in scrollback.
-///
-/// The span reaches past the line number on purpose. `has_selection()` alone cannot
-/// tell "the highlight stayed put" from "the highlight slid onto a neighbouring
-/// line", and every row here starts with the same five characters — so the tests
-/// below compare [`selected_text`], which is what a ⌘-C would actually return.
+/// A terminal with history, scrolled to the top, holding a completed selection anchored in
+/// scrollback. The span reaches past the line number on purpose: every row starts with
+/// `line-`, so only [`selected_text`] (what a copy returns) tells a highlight that stayed put
+/// from one that slid onto a neighbouring line.
 fn with_scrollback_selection(rows: u16, cols: u16) -> Terminal {
     let mut term = Terminal::new(rows, cols);
     for i in 0..64 {
@@ -110,10 +107,8 @@ fn a_reverse_region_scroll_spares_a_scrollback_selection() {
     );
 }
 
-/// Ordinary output at the live bottom, with the user reading history: the selection
-/// rides the content and survives. This worked before (uniform scroll took the
-/// `adjust_for_scroll` path, not the sentinel) — it is the standing control that the
-/// lattice did not break the case that was already right.
+/// Ordinary output at the live bottom, with the user reading history: the selection rides
+/// the content and survives.
 #[test]
 fn ordinary_output_still_preserves_a_scrollback_selection() {
     let mut term = with_scrollback_selection(24, 40);
@@ -127,10 +122,8 @@ fn ordinary_output_still_preserves_a_scrollback_selection() {
         term.text_selection().has_selection(),
         "a uniform scroll must keep a scrollback selection"
     );
-    // The half `has_selection()` cannot see. Five uniform scrolls move every
-    // anchor five rows; `adjust_for_scroll` is what keeps the highlight over the
-    // same characters, and a control that never checks the text would pass with the
-    // compensation deleted — the selection would simply name a different line.
+    // Five uniform scrolls move every anchor five rows (`adjust_for_scroll`); only the text
+    // shows the highlight stayed over the same characters.
     assert_eq!(
         selected_text(&term),
         before,
@@ -229,11 +222,8 @@ fn changing_attributes_over_the_selection_spares_it() {
         "…and the copy is byte-identical, which is the reason it may be spared"
     );
 
-    // Discriminator. DECCARA is unmarked under every implementation of the lattice,
-    // so the assertions above hold vacuously on their own. A DECCRA whose
-    // destination is those same cells replaces the characters — same rows, same
-    // columns, different question — and must clear. What separates the two is
-    // whether the text changed, and this pins exactly that.
+    // Discriminator: a DECCRA onto the same cells replaces the characters and must clear;
+    // what separates the two is whether the text changed.
     term.process(b"\x1b[2;1;3;10;1;1;1$v");
     assert!(
         !term.text_selection().has_selection(),
@@ -288,12 +278,9 @@ fn a_rect_copy_clears_over_its_destination_but_spares_its_source() {
     );
 }
 
-/// A rows-grow that reveals history must move the selection with its content.
-///
-/// `Grid::resize_with_reflow_mode` shifts every pre-resize viewport row down by
-/// `revealed` and compensates the cursor and saved cursor for it; the selection
-/// must move by the same amount, or the highlight lands over different text and
-/// a copy returns something the user never selected.
+/// A rows grow that reveals history moves the selection with its content:
+/// `Grid::resize_with_reflow_mode` shifts every pre-resize viewport row down by `revealed`,
+/// and the selection moves by the same amount as the cursors.
 #[test]
 fn a_rows_grow_that_reveals_history_moves_the_selection_with_its_content() {
     let mut term = Terminal::new(4, 20);
@@ -332,10 +319,8 @@ fn a_rows_grow_that_reveals_history_moves_the_selection_with_its_content() {
     );
 }
 
-/// A terminal whose retained history is capped at `limit` and full, with the anchors
-/// left to the caller. `limit` lines of history plus a live screen is the only shape
-/// in which eviction is reachable without waiting for a default-sized scrollback to
-/// fill.
+/// A terminal whose history is capped at `limit` and full, so the next line evicts; the
+/// anchors are left to the caller.
 fn with_capped_history(rows: u16, cols: u16, limit: usize) -> Terminal {
     let mut term = Terminal::new(rows, cols);
     term.set_scrollback_line_limit(Some(limit));
@@ -399,8 +384,8 @@ fn evicting_one_endpoint_truncates_instead_of_destroying_the_selection() {
     );
 }
 
-/// The non-vacuity control: once both endpoints are evicted there is nothing to clamp
-/// onto and the honest answer is still a clear, with no sticky ` incomplete`.
+/// Control: with both endpoints evicted there is nothing to clamp onto, so the selection
+/// clears, with no sticky `incomplete`.
 #[test]
 fn evicting_both_endpoints_still_clears_the_selection() {
     let mut term = with_capped_history(24, 40, 50);
@@ -418,10 +403,9 @@ fn evicting_both_endpoints_still_clears_the_selection() {
     assert_eq!(term.selection_to_string_bounded(), (None, false));
 }
 
-/// eviction with no delta. Shrinking the retention limit drops the oldest lines
-/// without scrolling anything and without recording a damage band, so neither the
-/// geometric transform nor the damage test in `post_process` sees it. This is the
-/// entry point `adjust_for_scroll` cannot serve.
+/// Eviction with no delta: shrinking the retention limit drops the oldest lines without a
+/// scroll or a damage band, so neither `adjust_for_scroll` nor the damage test in
+/// `post_process` sees it.
 #[test]
 fn shrinking_the_retention_limit_truncates_a_selection_it_evicted() {
     let mut term = with_capped_history(24, 40, 50);
@@ -449,12 +433,9 @@ fn shrinking_the_retention_limit_truncates_a_selection_it_evicted() {
     assert!(term.text_selection().truncated());
 }
 
-/// The alt-screen guard, at the terminal level. The alt grid has no scrollback
-/// (`Grid::with_scrollback(rows, cols, 0)`), so there is no oldest retained row
-/// to clamp onto; clamping would pin the highlight to alt row 0, and a
-/// full-screen alt scroll records no band that could catch it afterwards. The
-/// guard is structural (`min_row == 0`), so it also holds for a primary grid
-/// with zero scrollback.
+/// The alt screen has no scrollback, so no oldest retained row to clamp onto: a scroll that
+/// evicts an endpoint clears the selection rather than pinning it to alt row 0
+/// (`min_row >= 0` in `clamp_head_to_min_row`).
 #[test]
 fn a_scroll_on_the_alt_screen_clears_rather_than_clamping_to_alt_row_zero() {
     let mut term = Terminal::new(24, 40);
@@ -485,10 +466,8 @@ fn a_scroll_on_the_alt_screen_clears_rather_than_clamping_to_alt_row_zero() {
     assert!(!term.text_selection().truncated());
 }
 
-// ---------------------------------------------------------------------------
-// ECH / ICH / DCH and ordinary character output: like EL, each replaces content
-// on the cursor's row, so each records selection damage.
-// ---------------------------------------------------------------------------
+// ECH / ICH / DCH and ordinary character output: like EL, each replaces content on the
+// cursor's row, so each records selection damage.
 
 /// A 24x40 terminal with `hello world` on live row 0 and a completed selection over
 /// `hello`. The cursor is left at the home position, so a test's first escape decides
@@ -525,11 +504,7 @@ fn char_edits_on_another_line_spare_the_highlight() {
     }
 }
 
-/// The positive half: ECH/ICH/DCH on the highlighted row (program output, so
-/// the GUI's typing-deselect never fires) must clear the stale highlight.
-/// Without this direction, recording no damage for these ops would pass the
-/// spare test above. Uses the cursor's own row (1;1H) so the edit overlaps the
-/// selection on row 0.
+/// ECH, ICH and DCH on the highlighted row clear it: the control for the spare test above.
 #[test]
 fn char_edits_on_the_selected_line_clear_the_stale_highlight() {
     for op in [&b"\x1b[40X"[..], &b"\x1b[3P"[..], &b"\x1b[3@"[..]] {
@@ -578,9 +553,8 @@ fn every_print_path_records_output_damage_on_the_row_it_lands() {
     }
 }
 
-/// …and an overwrite on a row the selection does not touch must spare it:
-/// ordinary-output damage is a band, not a blanket clear. A background job repainting further down the screen is
-/// the common case.
+/// An overwrite on a row the selection does not touch spares it: ordinary-output damage is
+/// a band, not a blanket clear.
 #[test]
 fn ordinary_output_on_another_row_spares_the_highlight() {
     let mut term = Terminal::new(24, 40);
@@ -603,12 +577,10 @@ fn ordinary_output_on_another_row_spares_the_highlight() {
     );
 }
 
-/// A print that appends past a row's existing content replaces nothing, so it must
-/// not clear a selection over that row. Not a nicety: a top-anchored history splice
-/// (Codex `insert_history`) fills the blank row it just created, and the piecewise
-/// remap deliberately carries a selection across that — marking the fill would
-/// silently destroy the survival `EligibleSelectionUsesPiecewiseRemap` proves, and
-/// would make ordinary appended output clear a selection on the same row.
+/// A print that appends past a row's content replaces nothing, so it spares a selection on
+/// that row. A top-anchored history splice (Codex `insert_history`) fills the blank row it
+/// just created, and the piecewise remap carries a selection across it
+/// (`EligibleSelectionUsesPiecewiseRemap`); marking the fill would destroy that.
 #[test]
 fn appending_to_the_selected_row_spares_the_highlight() {
     let mut term = Terminal::new(24, 40);
@@ -660,11 +632,9 @@ fn a_fifth_disjoint_repaint_still_spares_the_gap_between_them() {
     );
 }
 
-/// Past the bound the set gives up precision, and it must give it up in the safe
-/// direction: an over-clear, never a stale highlight over replaced text.
-///
-/// Nine separated repaints for a bound of eight. Whatever pair absorbs, the cover
-/// still includes every row that was erased — so a selection on one of them goes.
+/// Past the bound (nine separated repaints for eight bands) the set loses precision in the
+/// safe direction: the merged cover still includes every erased row, so a selection on one
+/// of them goes.
 #[test]
 fn past_the_bound_a_selection_on_a_repainted_row_still_clears() {
     let mut term = Terminal::new(24, 40);
@@ -688,13 +658,9 @@ fn past_the_bound_a_selection_on_a_repainted_row_still_clears() {
     );
 }
 
-/// The output-dedup guard dies with the batch that owns it.
-///
-/// `damage_selection_output` skips recording when a print lands on the row it
-/// just recorded, and `take_selection_damage` clears that guard on drain. If it
-/// leaked across batches, the next batch's first print on the same row would
-/// record nothing and a selection made in between would survive being
-/// overwritten.
+/// The output-dedup guard dies with its batch: `damage_selection_output` skips recording a
+/// print on the row it just recorded, and `take_selection_damage` clears that guard on drain,
+/// so the next batch's first print on that row records its own damage.
 #[test]
 fn the_output_dedup_guard_does_not_leak_into_the_next_batch() {
     let mut term = Terminal::new(24, 40);

@@ -113,6 +113,18 @@ impl LogicalRect {
         x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
     }
 
+    /// The least rect holding both.
+    pub(crate) fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        Self::new(
+            x,
+            y,
+            self.right().max(other.right()) - x,
+            self.bottom().max(other.bottom()) - y,
+        )
+    }
+
     pub(crate) fn intersect(self, other: Self) -> Option<Self> {
         const EDGE_EPSILON: f32 = 0.01;
         let x = self.x.max(other.x);
@@ -1082,6 +1094,21 @@ fn fit_placeholder_to(
     if fits(placeholder) {
         return placeholder.to_string();
     }
+    // A path keeps its file's name, its components whole either side of
+    // the ellipsis ([`path_forms`]), as a path field's value does.
+    if reads_as_path(placeholder) {
+        let start = path_name_start(placeholder);
+        let name = &placeholder[start..];
+        // The separator before the name, as the path spells it.
+        let led = &placeholder[start.saturating_sub(1)..];
+        return path_forms(placeholder)
+            .into_iter()
+            .map(|(form, _, _)| form)
+            // Then the file's name alone after its ellipsis, then bare.
+            .chain([format!("{TEXT_FIELD_ELLIPSIS}{led}"), name.to_string()])
+            .find(|form| fits(form))
+            .unwrap_or_else(|| elide_text_label(name, room, px, face));
+    }
     // Its honest shorter forms, longest first: without its "(default)";
     // without the aside in parentheses it ends in ("none (HH:MM)" reads
     // "none"); its leading whole words with an ellipsis after them, saying
@@ -1109,6 +1136,30 @@ fn fit_placeholder_to(
         .unwrap_or_else(|| elide_text_label(bare, room, px, face))
 }
 
+/// The room an empty text field `field_width` wide gives its placeholder:
+/// its text box less its insets and, with `swatch`, its colour swatch.
+pub(crate) fn field_placeholder_room(field_width: f32, swatch: bool) -> f32 {
+    let swatch_space = if swatch {
+        TEXT_FIELD_SWATCH_SIZE + TEXT_FIELD_SWATCH_GAP
+    } else {
+        0.0
+    };
+    (field_width - 2.0 * TEXT_FIELD_HORIZONTAL_PADDING - swatch_space).max(0.0)
+}
+
+/// A placeholder's plain words: without a trailing " (default)" (the quiet
+/// tint says it is unset) and the aside in parentheses it ends in.
+pub(crate) fn plain_placeholder(placeholder: &str) -> String {
+    let plain = placeholder
+        .strip_suffix(" (default)")
+        .unwrap_or(placeholder);
+    plain
+        .strip_suffix(')')
+        .and_then(|open| open.rsplit_once(" ("))
+        .map_or(plain, |(bare, _)| bare)
+        .to_string()
+}
+
 /// A field's placeholder fitted to the text box its geometry gives it: the
 /// painter's safety net ([`fit_placeholder_to`]). A page fits it when it is
 /// authored ([`fit_native_field_placeholder`]), so the audit, which compares
@@ -1123,12 +1174,14 @@ fn fitted_placeholder(
     } else {
         crate::widget::TextFace::Ui
     };
-    fit_placeholder_to(
-        control.spec.placeholder.as_deref().unwrap_or_default(),
-        (geometry.text_right - geometry.text_x).max(0.0),
-        px,
-        face,
-    )
+    let placeholder = control.spec.placeholder.as_deref().unwrap_or_default();
+    let room = (geometry.text_right - geometry.text_x).max(0.0);
+    // A placeholder its author set on lines is fitted line by line.
+    placeholder
+        .split('\n')
+        .map(|line| fit_placeholder_to(line, room, px, face))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `placeholder` fitted, when it is authored, to a text field `field_width`
@@ -1202,14 +1255,57 @@ pub(crate) enum TextFieldEllipsis {
     Lead,
     /// The value's start then "…".
     Trail,
+    /// A path's head up to this byte, "…", then the shown range: whole
+    /// components each side of the ellipsis ([`path_forms`]).
+    Middle(usize),
 }
 
 /// The mark a field draws for the part of its value it cannot show.
 pub(crate) const TEXT_FIELD_ELLIPSIS: &str = "…";
 
+/// A PATH'S SHORTER FORMS, longest first — one rule wherever a path must
+/// give way (a CLI's detail line, a path field, a path placeholder): its
+/// head and its tail around an ellipsis, whole components each side, the
+/// tail never under two components (the folder and the file) where it has
+/// them (`/Users/…/bin/claude`); then the tail alone (`…/bin/claude`). Each
+/// form is `(painted, head_end, tail_start)`: the painted words are
+/// `path[..head_end]`, the ellipsis, then `path[tail_start..]`. A Windows
+/// path's components end at either separator ([`path_separators`]).
+pub(crate) fn path_forms(path: &str) -> Vec<(String, usize, usize)> {
+    let slashes: Vec<usize> = path
+        .match_indices(path_separators(path))
+        .map(|(at, _)| at)
+        .collect();
+    let parts = slashes.len() + 1;
+    let mut forms = Vec::new();
+    let least = 2.min(parts.saturating_sub(1)).max(1);
+    for tail in (least..parts).rev() {
+        // The tail's `parts - tail` components before it end at this slash.
+        let tail_start = slashes[parts - tail - 1];
+        for head in (1..parts - tail).rev() {
+            let head_end = slashes[head - 1] + 1;
+            forms.push((
+                format!(
+                    "{}{TEXT_FIELD_ELLIPSIS}{}",
+                    &path[..head_end],
+                    &path[tail_start..]
+                ),
+                head_end,
+                tail_start,
+            ));
+        }
+        forms.push((
+            format!("{TEXT_FIELD_ELLIPSIS}{}", &path[tail_start..]),
+            0,
+            tail_start,
+        ));
+    }
+    forms
+}
+
 /// Whether a field's value reads as a filesystem path, whose end (the file's
 /// name) says more than its start: `/…`, `~/…`, `C:\…`, `\\server\…`.
-fn reads_as_path(text: &str) -> bool {
+pub(crate) fn reads_as_path(text: &str) -> bool {
     let bytes = text.as_bytes();
     text.starts_with('/')
         || text.starts_with("~/")
@@ -1218,6 +1314,23 @@ fn reads_as_path(text: &str) -> bool {
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
             && matches!(bytes[2], b'\\' | b'/'))
+}
+
+/// What ends a component of `path`: `/`, and on a Windows path (`C:\…`,
+/// `\\server\…`) `\` too. A Unix file's name may hold a `\`, so only a path
+/// that reads as a Windows one breaks there.
+pub(crate) fn path_separators(path: &str) -> &'static [char] {
+    if path.starts_with('/') || path.starts_with("~/") {
+        &['/']
+    } else {
+        &['/', '\\']
+    }
+}
+
+/// Where the last component of `path` (its file's name) starts, after its
+/// last separator ([`path_separators`]); `0` where it has none.
+pub(crate) fn path_name_start(path: &str) -> usize {
+    path.rfind(path_separators(path)).map_or(0, |at| at + 1)
 }
 
 /// How wide a field with no colour chip must be to show `words` whole.
@@ -1281,6 +1394,26 @@ pub(crate) fn text_field_geometry(
         let mark = crate::tray_raster::ui_text_width(TEXT_FIELD_ELLIPSIS, text_px);
         let room = (available - mark).max(0.0);
         if reads_as_path(text) {
+            // Its components whole either side of the ellipsis where a form
+            // of it fits ([`path_forms`]): `/Users/…/dotfiles/ai-fleet.toml`,
+            // never a folder cut inside its name.
+            if let Some((_, head_end, tail_start)) = path_forms(text)
+                .into_iter()
+                .find(|(form, _, _)| crate::tray_raster::ui_text_width(form, text_px) <= available)
+            {
+                let lead = head_end == 0;
+                return TextFieldGeometry {
+                    // A leading ellipsis stands before `text_x`.
+                    text_x: if lead { text_x + mark } else { text_x },
+                    text_right,
+                    visible: tail_start..text.len(),
+                    ellipsis: if lead {
+                        TextFieldEllipsis::Lead
+                    } else {
+                        TextFieldEllipsis::Middle(head_end)
+                    },
+                };
+            }
             let scan_start = grapheme_boundary_at_or_before(
                 text,
                 text.len().saturating_sub(TEXT_FIELD_GEOMETRY_BYTES),
@@ -1739,6 +1872,9 @@ pub(crate) struct EditorToolbar {
     pub(crate) problem_navigation: bool,
     /// Reload in Commands' place: the file changed on disk under local edits.
     pub(crate) reload: bool,
+    /// An `edit` ticket's header row heads the bar (`native_app::EditHeader`):
+    /// one more row, above the buttons.
+    pub(crate) edit_header: bool,
 }
 
 /// One button of the editor's toolbar: its key, its words (the long form,
@@ -1946,7 +2082,8 @@ pub(crate) fn editor_shell_metrics_at_scale(
     )
     .rows
     .len()
-    .max(1);
+    .max(1)
+        + usize::from(toolbar.edit_header);
     let command_bar_height =
         command_button_height * command_rows as f32 + command_gap * (command_rows - 1) as f32;
     let content_gap = 8.0 * chrome_scale;
@@ -2352,15 +2489,34 @@ pub(crate) struct UiNode {
     /// projection. This is reserved for responsive visual copies whose parent
     /// already carries the complete semantic label.
     pub(crate) paint_only: bool,
-    /// This subtree is cut on purpose by an edge that is not a list's
-    /// ([`Self::peek`]).
-    pub(crate) peek: bool,
     /// This node is a scrolling list and this its ROOM ([`Self::room`]).
     pub(crate) room: Option<ListRoom>,
     /// This subtree is a list's row off its screen ([`Self::offscreen`]).
     pub(crate) offscreen: bool,
     /// This group is a SEGMENTED CONTROL ([`Self::segmented`]).
     pub(crate) segmented: bool,
+    /// Where this boxed group runs on into the pieces of the same card over
+    /// and under it ([`Joins`]).
+    pub(crate) joins: Joins,
+}
+
+/// A BOXED GROUP LISTED A PIECE AT A TIME READS AS ONE CARD: where it runs
+/// on into the piece over it (`above`) its top edge is open, and where it
+/// goes on in a piece `below` points under it (the gap its list keeps
+/// between the two) its bottom edge is open and its face carried over that
+/// gap to meet the next piece. A box split between a list's rows used to
+/// draw each piece in a box of its own, closed at both ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Joins {
+    pub(crate) above: bool,
+    pub(crate) below: Option<f32>,
+}
+
+impl Joins {
+    /// Whether the box is closed at both ends.
+    pub(crate) fn closed(self) -> bool {
+        !self.above && self.below.is_none()
+    }
 }
 
 /// A scrolling list's ROOM ([`UiNode::room`]): the height from its top where
@@ -2395,10 +2551,10 @@ impl UiNode {
             content,
             children: Vec::new(),
             paint_only: false,
-            peek: false,
             room: None,
             offscreen: false,
             segmented: false,
+            joins: Joins::default(),
         }
     }
 
@@ -2446,15 +2602,6 @@ impl UiNode {
         self
     }
 
-    /// Mark this subtree as cut on purpose by an edge of its own (a pager's
-    /// window of options): the paint audit does not count its nodes as
-    /// clipped, every other clip still counts. A scrolling list's edges need
-    /// no mark ([`Self::room`]).
-    pub(crate) fn peek(mut self) -> Self {
-        self.peek = true;
-        self
-    }
-
     /// Make this clipped column a scrolling list whose ROOM is the first
     /// `height` of it (THE LIST'S EDGE RULE). Whatever part of a node shows
     /// inside the room is live — read out, in the Tab order, answering the
@@ -2466,7 +2613,22 @@ impl UiNode {
     /// person can press, and where the list goes on (`fades`) drawn fading
     /// out, so nothing there reads as a control to press. A list's edges cut
     /// on purpose: the paint audit counts no node they cut, or the strip
-    /// holds, as clipped.
+    /// holds, as clipped. A press on the picture of a control in the strip
+    /// scrolls that control in and works nothing
+    /// ([`CompiledUi::list_picture_at`]).
+    ///
+    /// A LIST'S EDGES NEVER SLICE A LINE OF WORDS OR A PICTOGRAM: whatever
+    /// sits over the room is kept whole there — the page's pinned heading or
+    /// preview, a caption the list keeps over its rows
+    /// ([`Self::under_caption`]), the sidebar's search field — so a line of
+    /// words the top edge cuts through paints nothing, nor does one the
+    /// bottom edge cuts where no strip fades under the list (a bar is up,
+    /// the page keeps none, the window's own edge), nor a pictogram whose
+    /// ink either edge cuts ([`PaintNode::cut_edges`]), as a caption a
+    /// list's edge would cut paints none of its words: a line sliced under
+    /// it read as a stray line of what is over it, a sliver of an icon as a
+    /// mark. Faces, strokes and pictures paint as they are, and a control an
+    /// edge cuts stays live where it shows.
     pub(crate) fn room(mut self, height: f32, fades: bool) -> Self {
         self.room = Some(ListRoom {
             height,
@@ -2474,6 +2636,19 @@ impl UiNode {
             lists_all: false,
         });
         self
+    }
+
+    /// [`Self::room`] for the rows a list scrolls UNDER A CAPTION it keeps
+    /// whole over them (the last screen's group caption, a picker's section
+    /// heading): a room of their own inside the list, the first `height` of
+    /// this clipped column, its top edge the caption's bottom. That edge is a
+    /// list's edge — a node it cuts is live where it shows and the paint
+    /// audit counts its cut as meant, while every row it leaves whole is
+    /// judged as any other — and, a list's top edge, it slices no line of
+    /// words: the card's backdrop shows there, so no sliced line sits under
+    /// the caption. The list's strip goes on fading under it.
+    pub(crate) fn under_caption(self, height: f32) -> Self {
+        self.room(height, false)
     }
 
     /// Mark this subtree a scrolling list's row OFF ITS SCREEN: laid out
@@ -2599,7 +2774,7 @@ impl UiTree {
             node.children.iter().find_map(find_default)
         }
         let default_action = find_default(&self.root);
-        compiler.node(self.root, viewport, viewport, None, false, None)?;
+        compiler.node(self.root, viewport, viewport, None, None)?;
         compiler.output.default_action = default_action;
         Ok(compiler.output)
     }
@@ -2611,12 +2786,20 @@ pub(crate) struct PaintNode {
     pub(crate) rect: LogicalRect,
     pub(crate) clip: LogicalRect,
     pub(crate) content: UiContent,
-    /// Cut on purpose: by a scrolling list's edge, drawn in the strip under
-    /// its room ([`UiNode::room`]), or marked so ([`UiNode::peek`]).
+    /// Cut on purpose: by a scrolling list's edge, or drawn in the strip
+    /// under its room ([`UiNode::room`]). Only what such an edge itself cuts
+    /// is: a row it leaves whole is judged as any other node.
     pub(crate) peek: bool,
     /// The band, top to bottom, over which this node fades: the strip under a
     /// scrolling list's room where the list goes on ([`ListRoom::fades`]).
     pub(crate) fade: Option<(f32, f32)>,
+    /// Where the edges of this node's list cut across it ([`UiNode::room`]):
+    /// what of its words an edge cuts through paints nothing
+    /// ([`drop_cut_marks`]).
+    pub(crate) cut_edges: CutEdges,
+    /// Where this boxed group runs on into the pieces of its card
+    /// ([`UiNode::joins`]).
+    pub(crate) joins: Joins,
 }
 
 impl PaintNode {
@@ -2625,6 +2808,308 @@ impl PaintNode {
     pub(crate) fn clipped(&self) -> bool {
         !self.peek && materially_clipped(self.rect, self.clip)
     }
+
+    /// The draw primitives this node paints, as [`CompiledUi::tray`] paints
+    /// it (inside its clip, a line of words a caption's edge cuts through
+    /// dropped): what the audit reads to say which of its words it paints.
+    fn painted_prims(&self) -> Vec<crate::widget::DrawPrim> {
+        let theme = aterm_render::Theme::default();
+        let roles = crate::settings::Roles::from_theme(theme);
+        let mut prims = Vec::new();
+        let icons = painted_icons(|| paint_compiled_node(&mut prims, self, roles, theme, 14.0));
+        drop_cut_marks(&mut prims, 0, &icons, self.cut_edges);
+        prims
+    }
+}
+
+/// How far over its baseline and under it a line of words a `px` run paints
+/// reaches: the UI faces' ascender, accents over capitals included, and
+/// their descender (San Francisco's and DejaVu's reach about 0.95 and 0.24
+/// of the em).
+fn word_line_band(baseline: f32, px: f32) -> (f32, f32) {
+    (baseline - 0.95 * px, baseline + 0.25 * px)
+}
+
+/// How far two marks must cross, both ways, to be painted over each other
+/// ([`CompiledUi::ink_overlaps`]): more than a glyph's side bearing, so two
+/// marks set side by side at their measured advances do not count.
+const INK_OVERLAP_LEAST: f32 = 1.0;
+
+/// How tall a line of words' body is over its baseline, of its size: the
+/// cap height the UI faces centre their rows on (`tray_raster::row_baseline`)
+/// — what two lines that run into each other both cover.
+const WORDS_BODY_EM: f32 = 0.7;
+
+/// One mark a node paints ([`CompiledUi::ink_overlaps`]): the node's index,
+/// its words (`None` for an icon), and where its ink is.
+struct InkMark {
+    node: usize,
+    words: Option<String>,
+    rect: LogicalRect,
+}
+
+/// The marks `prims`, painted by node `node` inside `clip`, draw: each line
+/// of words over its body (its advance, its cap band), each icon stroke,
+/// dot, ring or message icon over its ink, cut to the clips it is drawn in.
+fn ink_marks(
+    node: usize,
+    prims: &[crate::widget::DrawPrim],
+    clip: LogicalRect,
+    out: &mut Vec<InkMark>,
+) {
+    use crate::widget::DrawPrim;
+    let mut clips = vec![clip];
+    for prim in prims {
+        let current = *clips.last().unwrap_or(&clip);
+        let (words, rect) = match prim {
+            DrawPrim::ClipPush { x, y, w, h } => {
+                clips.push(
+                    current
+                        .intersect(LogicalRect::new(*x, *y, *w, *h))
+                        .unwrap_or_default(),
+                );
+                continue;
+            }
+            DrawPrim::ClipPop => {
+                if clips.len() > 1 {
+                    clips.pop();
+                }
+                continue;
+            }
+            DrawPrim::Text {
+                x,
+                baseline,
+                s,
+                px,
+                weight,
+                face,
+                ..
+            } => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let width = |text: &str| {
+                    if *face == crate::widget::TextFace::Mono {
+                        crate::tray_raster::measure_text(text, *px, *weight)
+                    } else {
+                        crate::tray_raster::ui_text_width_for(*face, text, *px)
+                    }
+                };
+                let lead = width(&s[..s.len() - s.trim_start().len()]);
+                let body = WORDS_BODY_EM * px;
+                (
+                    Some(trimmed.to_string()),
+                    LogicalRect::new(x + lead, baseline - body, width(trimmed), body),
+                )
+            }
+            DrawPrim::Line { .. } | DrawPrim::Dot { .. } | DrawPrim::Ring { .. } => {
+                match prim_ink(prim) {
+                    Some(rect) => (None, rect),
+                    None => continue,
+                }
+            }
+            DrawPrim::BandIcon { x, y, size, .. } => (None, LogicalRect::new(*x, *y, *size, *size)),
+            _ => continue,
+        };
+        if let Some(rect) = rect.intersect(current).filter(|rect| !rect.is_empty()) {
+            out.push(InkMark { node, words, rect });
+        }
+    }
+}
+
+/// Where a pictogram's prim puts ink ([`paint_button_icon`]): its outline
+/// with the stroke's width, its block, its segment, dot or ring.
+fn prim_ink(prim: &crate::widget::DrawPrim) -> Option<LogicalRect> {
+    use crate::widget::DrawPrim;
+    match prim {
+        DrawPrim::Stroke {
+            x, y, w, h, width, ..
+        } => {
+            let half = width * 0.5;
+            Some(LogicalRect::new(x - half, y - half, w + width, h + width))
+        }
+        DrawPrim::Panel { x, y, w, h, .. } => Some(LogicalRect::new(*x, *y, *w, *h)),
+        DrawPrim::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            width,
+            ..
+        } => {
+            let half = width * 0.5;
+            Some(LogicalRect::new(
+                x1.min(*x2) - half,
+                y1.min(*y2) - half,
+                (x1 - x2).abs() + *width,
+                (y1 - y2).abs() + *width,
+            ))
+        }
+        DrawPrim::Dot { cx, cy, r, .. } => Some(LogicalRect::new(cx - r, cy - r, 2.0 * r, 2.0 * r)),
+        DrawPrim::Ring {
+            cx, cy, r_outer, ..
+        } => Some(LogicalRect::new(
+            cx - r_outer,
+            cy - r_outer,
+            2.0 * r_outer,
+            2.0 * r_outer,
+        )),
+        _ => None,
+    }
+}
+
+/// Whether two marks one node draws are one mark painted twice: the parts
+/// of one icon, or a run of its words painted again over themselves on the
+/// same line at the same size (an editor line's syntax colours, drawn over
+/// the line in place).
+fn repaints(a: &InkMark, b: &InkMark) -> bool {
+    match (&a.words, &b.words) {
+        (None, None) => true,
+        (Some(one), Some(other)) => {
+            (a.rect.y - b.rect.y).abs() < 0.01
+                && (a.rect.height - b.rect.height).abs() < 0.01
+                && (one.contains(other.as_str()) || other.contains(one.as_str()))
+        }
+        _ => false,
+    }
+}
+
+/// One icon of the strokes, dots and rings a node draws that touch: the
+/// marks from `start` on are one node's, and its icons' parts are one mark.
+fn merge_icon_strokes(marks: &mut Vec<InkMark>, start: usize) {
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'pairs: for a in start..marks.len() {
+            if marks[a].words.is_some() {
+                continue;
+            }
+            for b in a + 1..marks.len() {
+                if marks[b].words.is_some() {
+                    continue;
+                }
+                let (one, other) = (marks[a].rect, marks[b].rect);
+                let grown = LogicalRect::new(
+                    one.x - INK_OVERLAP_LEAST,
+                    one.y - INK_OVERLAP_LEAST,
+                    one.width + 2.0 * INK_OVERLAP_LEAST,
+                    one.height + 2.0 * INK_OVERLAP_LEAST,
+                );
+                if grown.intersect(other).is_some() {
+                    marks[a].rect = one.union(other);
+                    marks.remove(b);
+                    merged = true;
+                    break 'pairs;
+                }
+            }
+        }
+    }
+}
+
+/// Where the edges of a node's scrolling list cut across it
+/// ([`UiNode::room`]): what of its words an edge cuts through paints nothing
+/// ([`drop_cut_marks`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct CutEdges {
+    /// The list's top edge — under the page's pinned heading, a caption the
+    /// list keeps, the sidebar's search field.
+    pub(crate) top: Option<f32>,
+    /// The list's bottom edge.
+    pub(crate) bottom: Option<f32>,
+}
+
+impl CutEdges {
+    /// A node no list edge cuts across.
+    #[cfg(test)]
+    pub(crate) const NONE: Self = Self {
+        top: None,
+        bottom: None,
+    };
+
+    /// Whether an edge cuts across the node.
+    pub(crate) const fn any(self) -> bool {
+        self.top.is_some() || self.bottom.is_some()
+    }
+}
+
+/// Which of `prims`, a node's own, the edges of its list cut away
+/// ([`drop_cut_marks`]): each line of words an edge cuts through, and each
+/// pictogram (`icons`, ranges of `prims`) whose ink it cuts through. Marked
+/// in `dropped`, index for index.
+fn cut_marks(
+    prims: &[crate::widget::DrawPrim],
+    icons: &[std::ops::Range<usize>],
+    edges: CutEdges,
+    dropped: &mut [bool],
+) {
+    let crosses = |top: f32, bottom: f32| {
+        [edges.top, edges.bottom]
+            .into_iter()
+            .flatten()
+            .any(|edge| top < edge - CLIP_EDGE_EPSILON && bottom > edge + CLIP_EDGE_EPSILON)
+    };
+    if !edges.any() {
+        return;
+    }
+    for (index, prim) in prims.iter().enumerate() {
+        if let crate::widget::DrawPrim::Text { baseline, px, .. } = prim {
+            let (top, bottom) = word_line_band(*baseline, *px);
+            if crosses(top, bottom) {
+                dropped[index] = true;
+            }
+        }
+    }
+    for span in icons {
+        let Some(ink) = prims
+            .get(span.clone())
+            .into_iter()
+            .flatten()
+            .filter_map(prim_ink)
+            .reduce(|one, other| one.union(other))
+        else {
+            continue;
+        };
+        if crosses(ink.y, ink.bottom()) {
+            for prim in span.clone() {
+                if let Some(dropped) = dropped.get_mut(prim) {
+                    *dropped = true;
+                }
+            }
+        }
+    }
+}
+
+/// WORDS AND PICTOGRAMS AT A LIST'S EDGES ARE WHOLE OR NOT DRAWN
+/// ([`UiNode::room`]): drop each line of words from `prims[from..]` that the
+/// list's top edge, or its bottom edge where no strip fades under it, cuts
+/// through, and each pictogram (`icons`, absolute ranges of `prims`) whose
+/// ink it cuts through, so what is behind shows there, as a caption the
+/// list's edge would cut paints none of its words. What the edges leave
+/// whole, and every face, stroke and picture, paints as it is: a control
+/// they cut stays live where it shows.
+fn drop_cut_marks(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    from: usize,
+    icons: &[std::ops::Range<usize>],
+    edges: CutEdges,
+) {
+    if !edges.any() || from >= prims.len() {
+        return;
+    }
+    let own: Vec<std::ops::Range<usize>> = icons
+        .iter()
+        .filter(|span| span.start >= from)
+        .map(|span| span.start - from..span.end - from)
+        .collect();
+    let mut dropped = vec![false; prims.len() - from];
+    cut_marks(&prims[from..], &own, edges, &mut dropped);
+    let mut index = 0;
+    prims.retain(|_| {
+        let keep = index < from || !dropped[index - from];
+        index += 1;
+        keep
+    });
 }
 
 /// What a node inside a scrolling list inherits from it ([`UiNode::room`]).
@@ -2636,6 +3121,12 @@ struct ListContext {
     fade: Option<(f32, f32)>,
     /// The list holds every row in the tree ([`ListRoom::lists_all`]).
     lists_all: bool,
+    /// The room's top edge, which slices no line of words ([`UiNode::room`]).
+    top_edge: f32,
+    /// The list's bottom edge where no strip fades under it — a bar is up,
+    /// the page keeps none, the list's last screen, the window's own edge —
+    /// which slices no line of words either.
+    bottom_edge: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2696,6 +3187,20 @@ pub(crate) struct CompiledUi {
     /// Every segmented control ([`UiNode::segmented`]): its group's key and
     /// its segments, in order.
     pub(crate) segment_groups: Vec<SegmentGroup>,
+    /// What of each enabled control a scrolling list draws in the strip
+    /// under its room ([`UiNode::room`]): a picture, never live, but a press
+    /// on it is the list's — it scrolls that control into the room and
+    /// works nothing ([`Self::list_picture_at`]).
+    pub(crate) list_pictures: Vec<ListPicture>,
+}
+
+/// The picture of a control a list draws in the strip under its room
+/// ([`CompiledUi::list_pictures`]): the control's key, and where it shows
+/// there.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ListPicture {
+    pub(crate) key: UiKey,
+    pub(crate) rect: LogicalRect,
 }
 
 /// One segmented control as compiled ([`UiNode::segmented`]).
@@ -2706,6 +3211,19 @@ pub(crate) struct SegmentGroup {
 }
 
 impl CompiledUi {
+    /// THE STRIP UNDER A LIST'S ROOM TAKES A PRESS AS A SCROLL: the control
+    /// whose picture a list draws there under `(x, y)`, which a press nudges
+    /// into the room without working it, as a platform list scrolls a row a
+    /// press finds half hidden into view — a click on what looks like a
+    /// control is never silently lost. `None` where no picture is.
+    pub(crate) fn list_picture_at(&self, x: f32, y: f32) -> Option<&UiKey> {
+        self.list_pictures
+            .iter()
+            .rev()
+            .find(|picture| picture.rect.contains(x, y))
+            .map(|picture| &picture.key)
+    }
+
     /// THE ARROW MODEL OF A SEGMENTED CONTROL: from segment `key`, `step`
     /// segments on (Left -1, Right 1), stopping at its ends. `None` where
     /// `key` is no segment; `Some(None)` at the end it would pass, where the
@@ -2990,8 +3508,9 @@ impl CompiledUi {
             .collect::<Vec<_>>();
         let overflow = audits.iter().filter(|audit| audit.overflow).count();
         let clipped = self.paint.iter().filter(|node| node.clipped()).count();
+        let overlaps = self.ink_overlaps();
         let mut lines = vec![format!(
-            "paint-audit text-nodes={} overflow={overflow} viewport={:.1},{:.1},{:.1},{:.1} nodes={} semantics={} hits={} focusable={} clipped={clipped} compiled-fingerprint={:016x}",
+            "paint-audit text-nodes={} overflow={overflow} viewport={:.1},{:.1},{:.1},{:.1} nodes={} semantics={} hits={} focusable={} clipped={clipped} overlaps={} compiled-fingerprint={:016x}",
             audits.len(),
             self.bounds.x,
             self.bounds.y,
@@ -3001,10 +3520,12 @@ impl CompiledUi {
             self.semantics.len(),
             self.hits.len(),
             self.focus_order.len(),
+            overlaps.len(),
             self.fingerprint(),
         )];
         lines.extend(self.paint.iter().map(|paint| self.paint_node_audit(paint)));
         lines.extend(audits.iter().map(text_fit_line));
+        lines.extend(overlaps);
         for paint in &self.paint {
             match &paint.content {
                 UiContent::SettingsPreview(spec) => {
@@ -3048,9 +3569,11 @@ impl CompiledUi {
     /// overflow, zero clipped" for sweeps that compile thousands of pages: the
     /// full audit renders a `paint-node` record per node, each with a linear
     /// semantic and focus-order lookup, and only a failure needs to read it.
+    /// Two painted marks over each other (a `paint-overlap` record,
+    /// [`Self::ink_overlaps`]) are a failure too.
     #[cfg(test)]
     pub(crate) fn fit_failures(&self) -> Vec<String> {
-        let mut failures = Vec::new();
+        let mut failures = self.ink_overlaps();
         for paint in &self.paint {
             if let Some(audit) = text_fit_audit(paint).filter(|audit| audit.overflow) {
                 failures.push(text_fit_line(&audit));
@@ -3066,6 +3589,179 @@ impl CompiledUi {
             }
         }
         failures
+    }
+
+    /// THE EDGE AUDIT: every line of words and every pictogram the page
+    /// paints that a clip cuts through — part of it painted, the rest cut
+    /// away above or below — outside the strip a list fades in under its
+    /// room, where what it draws is a picture fading out. Measured on what
+    /// is painted, as [`Self::tray`] paints it, each mark inside the clips
+    /// it is drawn in.
+    #[cfg(test)]
+    pub(crate) fn sliced_marks(&self) -> Vec<String> {
+        use crate::widget::DrawPrim;
+        let theme = aterm_render::Theme::default();
+        let roles = crate::settings::Roles::from_theme(theme);
+        let crosses = |top: f32, bottom: f32, edge: f32| {
+            top < edge - CLIP_EDGE_EPSILON && bottom > edge + CLIP_EDGE_EPSILON
+        };
+        let mut out = Vec::new();
+        for node in &self.paint {
+            let mut prims = Vec::new();
+            let icons = painted_icons(|| paint_compiled_node(&mut prims, node, roles, theme, 14.0));
+            let mut dropped = vec![false; prims.len()];
+            cut_marks(&prims, &icons, node.cut_edges, &mut dropped);
+            // Each prim's clip, as the painter nests them inside the node's.
+            let mut clips = vec![node.clip];
+            let mut clip_of = Vec::with_capacity(prims.len());
+            for prim in &prims {
+                let current = *clips.last().unwrap_or(&node.clip);
+                clip_of.push(current);
+                match prim {
+                    DrawPrim::ClipPush { x, y, w, h } => clips.push(
+                        current
+                            .intersect(LogicalRect::new(*x, *y, *w, *h))
+                            .unwrap_or_default(),
+                    ),
+                    DrawPrim::ClipPop => {
+                        clips.pop();
+                    }
+                    _ => {}
+                }
+            }
+            // A cut in the strip a list fades in is a picture fading out.
+            let faded = |edge: f32| {
+                node.fade
+                    .is_some_and(|(top, bottom)| edge >= top - 0.5 && edge <= bottom + 0.5)
+            };
+            // Cut by a clip over the node, not the node's own bounds (a line
+            // set in a box a little shorter than its accents' reach is the
+            // fit audit's to judge).
+            let sliced = |clip: LogicalRect, top: f32, bottom: f32| {
+                !clip.is_empty()
+                    && ((clip.y > node.rect.y + CLIP_EDGE_EPSILON && crosses(top, bottom, clip.y))
+                        || (clip.bottom() < node.rect.bottom() - CLIP_EDGE_EPSILON
+                            && crosses(top, bottom, clip.bottom())
+                            && !faded(clip.bottom())))
+            };
+            for (index, prim) in prims.iter().enumerate() {
+                if dropped[index] {
+                    continue;
+                }
+                if let DrawPrim::Text {
+                    baseline, px, s, ..
+                } = prim
+                {
+                    let (top, bottom) = word_line_band(*baseline, *px);
+                    if sliced(clip_of[index], top, bottom) {
+                        out.push(format!(
+                            "paint-slice key={:?} words={s:?} band={top:.1}..{bottom:.1} clip={:?}",
+                            node.key.as_str(),
+                            clip_of[index]
+                        ));
+                    }
+                }
+            }
+            for span in icons {
+                if span.clone().any(|index| dropped[index]) {
+                    continue;
+                }
+                let Some(ink) = prims[span.clone()]
+                    .iter()
+                    .filter_map(prim_ink)
+                    .reduce(|one, other| one.union(other))
+                else {
+                    continue;
+                };
+                let clip = clip_of.get(span.start).copied().unwrap_or(node.clip);
+                if sliced(clip, ink.y, ink.bottom()) {
+                    out.push(format!(
+                        "paint-slice key={:?} icon ink={ink:?} clip={clip:?}",
+                        node.key.as_str()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// THE AUDIT JUDGES WHAT PAINTS OVER WHAT: a `paint-overlap` record for
+    /// every two marks the page paints whose ink crosses — a line of words,
+    /// or an icon (a pictogram, whatever it is drawn with — its segments, its
+    /// outlines and blocks ([`ICON_SPANS`]) — a dot, a ring, a message icon)
+    /// — within one node (a preview header's state run under its Pause
+    /// glyph) or between two (sibling labels run into each other, a label
+    /// under a neighbour's pictogram). An icon's own parts are one mark;
+    /// what a node fills or strokes under its marks (a card, a control's
+    /// face, a switch's track, a terminal sample) is none.
+    /// Measured on what is painted ([`paint_compiled_node`], as
+    /// [`Self::tray`] paints it), each mark inside the clips it is drawn in.
+    pub(crate) fn ink_overlaps(&self) -> Vec<String> {
+        let theme = aterm_render::Theme::default();
+        let roles = crate::settings::Roles::from_theme(theme);
+        let mut marks = Vec::new();
+        let mut prims = Vec::new();
+        for (index, node) in self.paint.iter().enumerate() {
+            prims.clear();
+            let icons = painted_icons(|| paint_compiled_node(&mut prims, node, roles, theme, 14.0));
+            let mut dropped = vec![false; prims.len()];
+            cut_marks(&prims, &icons, node.cut_edges, &mut dropped);
+            let start = marks.len();
+            // A pictogram is one mark over all it draws, its outlines and
+            // blocks too: one a list's edge cuts through paints nothing.
+            for span in &icons {
+                if span.clone().any(|prim| dropped[prim]) {
+                    continue;
+                }
+                let ink = prims[span.clone()]
+                    .iter()
+                    .filter_map(prim_ink)
+                    .reduce(|one, other| one.union(other));
+                if let Some(rect) = ink
+                    .and_then(|ink| ink.intersect(node.clip))
+                    .filter(|rect| !rect.is_empty())
+                {
+                    marks.push(InkMark {
+                        node: index,
+                        words: None,
+                        rect,
+                    });
+                }
+            }
+            drop_cut_marks(&mut prims, 0, &icons, node.cut_edges);
+            ink_marks(index, &prims, node.clip, &mut marks);
+            merge_icon_strokes(&mut marks, start);
+        }
+        let mut overlaps = Vec::new();
+        for (at, a) in marks.iter().enumerate() {
+            for b in &marks[at + 1..] {
+                if a.node == b.node && repaints(a, b) {
+                    continue;
+                }
+                let Some(cross) = a.rect.intersect(b.rect) else {
+                    continue;
+                };
+                if cross.width < INK_OVERLAP_LEAST || cross.height < INK_OVERLAP_LEAST {
+                    continue;
+                }
+                let ink = |mark: &InkMark| match &mark.words {
+                    Some(words) => format!("words:{words:?}"),
+                    None => "icon".to_string(),
+                };
+                overlaps.push(format!(
+                    "paint-overlap a={:?} a-ink={} b={:?} b-ink={} at={:.1},{:.1},{:.1},{:.1}",
+                    self.paint[a.node].key.as_str(),
+                    ink(a),
+                    self.paint[b.node].key.as_str(),
+                    ink(b),
+                    cross.x,
+                    cross.y,
+                    cross.width,
+                    cross.height,
+                ));
+            }
+        }
+        overlaps
     }
 
     /// The `paint-text` record [`Self::paint_audit_lines`] prints for the FIRST
@@ -3232,7 +3928,14 @@ impl CompiledUi {
                 w: node.clip.width,
                 h: node.clip.height,
             });
-            paint_compiled_node(&mut prims, node, roles, theme, base_px);
+            let from = prims.len();
+            if node.cut_edges.any() {
+                let icons =
+                    painted_icons(|| paint_compiled_node(&mut prims, node, roles, theme, base_px));
+                drop_cut_marks(&mut prims, from, &icons, node.cut_edges);
+            } else {
+                paint_compiled_node(&mut prims, node, roles, theme, base_px);
+            }
             prims.push(crate::widget::DrawPrim::ClipPop);
             if node.fade.is_some() {
                 prims.push(crate::widget::DrawPrim::FadePop);
@@ -3737,18 +4440,23 @@ pub(crate) fn native_button_line_height() -> f32 {
 /// A BUTTON'S LABEL WRAPPED TO ITS ROOM, at its words: `label` on as many
 /// lines as a text button's label `room` wide needs, each as full as it holds
 /// — or `None` where a word of it is wider than the room on its own, which
-/// no line could hold whole. A button keeps its words in a narrow column at
-/// large text this way, its painted words still one phrase of its name.
+/// no line could hold whole. A word ends where the shared rule lets a line
+/// break short of a hyphen ([`aterm_grapheme::pieces`]): at a space, and
+/// between CJK characters, which go on with nothing between. A button keeps
+/// its words in a narrow column at large text this way, its painted words
+/// still one phrase of its name.
 pub(crate) fn native_button_label_lines(label: &str, room: f32) -> Option<Vec<String>> {
     let fits = |text: &str| native_button_label_width(text) <= room + TEXT_FIT_SLACK;
     let mut lines: Vec<String> = Vec::new();
-    for word in label.split_whitespace() {
+    for piece in aterm_grapheme::pieces(label, aterm_grapheme::BreakKind::is_word_boundary) {
+        let word = piece.text;
         if !fits(word) {
             return None;
         }
+        let joiner = if piece.spaced { " " } else { "" };
         match lines.last_mut() {
-            Some(line) if fits(&format!("{line} {word}")) => {
-                line.push(' ');
+            Some(line) if fits(&format!("{line}{joiner}{word}")) => {
+                line.push_str(joiner);
                 line.push_str(word);
             }
             _ => lines.push(word.to_string()),
@@ -3828,6 +4536,16 @@ fn paint_badge(
 }
 
 fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
+    // A node whose words the edge of a kept caption cuts through paints none
+    // of them ([`drop_cut_marks`]): it has no words to fit.
+    if node.cut_edges.any()
+        && !node
+            .painted_prims()
+            .iter()
+            .any(|prim| matches!(prim, crate::widget::DrawPrim::Text { .. }))
+    {
+        return None;
+    }
     match &node.content {
         UiContent::Text(spec) => {
             let authored = text_visual_projection(spec, node.rect.width);
@@ -3874,8 +4592,14 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                     .visual_label
                     .as_ref()
                     .unwrap_or(&control.spec.label);
-                let trailing_reserve =
-                    text_button_trailing_reserve(&control.spec) + button_end_reserve(&control.spec);
+                // A disclosure's label ends at its chevron's slot.
+                let trailing_reserve = if control.state.expanded.is_some()
+                    && control.style == StyleRef::Plain
+                {
+                    DISCLOSURE_LABEL_END
+                } else {
+                    text_button_trailing_reserve(&control.spec) + button_end_reserve(&control.spec)
+                };
                 // A label on more lines than one is audited line by line:
                 // painted is every line as the painter fits it, required the
                 // widest, the room the narrowest any line has.
@@ -3981,6 +4705,9 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                     TextFieldEllipsis::None => shown.to_string(),
                     TextFieldEllipsis::Lead => format!("{TEXT_FIELD_ELLIPSIS}{shown}"),
                     TextFieldEllipsis::Trail => format!("{shown}{TEXT_FIELD_ELLIPSIS}"),
+                    TextFieldEllipsis::Middle(head) => {
+                        format!("{}{TEXT_FIELD_ELLIPSIS}{shown}", &actual[..head])
+                    }
                 }
             };
             // A declared ellipsis is deliberate fitting, as a fitted button
@@ -3997,7 +4724,11 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
             };
             let authored_available = (geometry.text_right - field_x).max(0.0);
             let available = effective_horizontal_width(node, field_x, geometry.text_right);
-            let required = crate::tray_raster::ui_text_width(&source, size);
+            // A placeholder set on lines is as wide as its widest line.
+            let required = source
+                .split('\n')
+                .map(|line| crate::tray_raster::ui_text_width(line, size))
+                .fold(0.0_f32, f32::max);
             Some(finish_text_fit(
                 node,
                 "text-field",
@@ -4018,7 +4749,7 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                 .fold(0.0_f32, f32::max);
             let available = effective_horizontal_width(node, node.rect.x, node.rect.right());
             let required_height = spec.text.lines().count().max(1) as f32 * line_h;
-            // A peek is cut on purpose ([`UiNode::peek`]).
+            // A cut on purpose: a scrolling list's edge ([`UiNode::room`]).
             let visible_height = if node.peek {
                 node.rect.height
             } else {
@@ -4497,9 +5228,13 @@ fn paint_compiled_node(
                 // view asks for it with the style (Settings does, except under
                 // Serious Mode); it yields to the high-contrast preference,
                 // where every point of text contrast belongs to the reader.
-                // The wash is static — retained-raster cached.
+                // The wash is static — retained-raster cached. The ink audit
+                // ([`CompiledUi::ink_overlaps`], while [`ICON_SPANS`]
+                // collects) paints none: its tiles are opaque fills under
+                // every mark, never one, and a whole grid of them a screen.
                 if spec.style == StyleRef::Hero
                     && !crate::native_appearance::current_preferences().high_contrast
+                    && !ICON_SPANS.with(|spans| spans.borrow().is_some())
                 {
                     crate::settings::paint_settings_aurora(
                         prims,
@@ -4535,6 +5270,10 @@ fn paint_compiled_node(
                 // A one-pixel inner light along the top edge is the whole nod
                 // to dimensionality — a material sheen, not an elevation lie.
                 let hero = spec.style == StyleRef::Primary;
+                // A piece of a card that runs on is drawn as the card is,
+                // its open edges carried past a clip at its own bounds (and
+                // the gap to the next piece), so no edge closes it there.
+                let (rect, joined) = open_box(prims, rect, node.joins, 12.0);
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
                     y: rect.y,
@@ -4559,19 +5298,25 @@ fn paint_compiled_node(
                     width: 1.0,
                     color: rgba(if hero { roles.accent } else { roles.separator }, 150),
                 });
-                prims.push(DrawPrim::Panel {
-                    x: rect.x + 14.0,
-                    y: rect.y + 1.0,
-                    w: (rect.width - 28.0).max(0.0),
-                    h: 1.0,
-                    radius: 0.5,
-                    fill: rgba(roles.text_primary, 14),
-                });
+                if !node.joins.above {
+                    prims.push(DrawPrim::Panel {
+                        x: rect.x + 14.0,
+                        y: rect.y + 1.0,
+                        w: (rect.width - 28.0).max(0.0),
+                        h: 1.0,
+                        radius: 0.5,
+                        fill: rgba(roles.text_primary, 14),
+                    });
+                }
+                if joined {
+                    prims.push(DrawPrim::ClipPop);
+                }
             } else if spec.style == StyleRef::Code {
                 // A terminal/editor canvas should read as a working surface
                 // inside the surrounding card, not as another generic card.
                 // Keep it theme-derived and deliberately a step quieter than
                 // `surface`; the sample text supplies the visual hierarchy.
+                let (rect, joined) = open_box(prims, rect, node.joins, 10.0);
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
                     y: rect.y,
@@ -4589,6 +5334,9 @@ fn paint_compiled_node(
                     width: 1.0,
                     color: rgba(roles.separator, 180),
                 });
+                if joined {
+                    prims.push(DrawPrim::ClipPop);
+                }
             }
         }
         UiContent::Text(spec) => {
@@ -5199,7 +5947,7 @@ fn paint_compiled_node(
             };
             let geometry = slider_geometry(rect);
             // A slider that cannot move fills in the disabled ink, so it does
-            // not read as live; one busy saving its own value keeps the accent.
+            // not read as live; one busy with its own work keeps the accent.
             let fill = if control.state.muted && control.state.enabled {
                 // Idle: the slider still shows its value, in quiet ink.
                 roles.text_tertiary
@@ -5258,6 +6006,10 @@ fn paint_compiled_node(
                 TextFieldEllipsis::None => value.to_string(),
                 TextFieldEllipsis::Lead => format!("{TEXT_FIELD_ELLIPSIS}{value}"),
                 TextFieldEllipsis::Trail => format!("{value}{TEXT_FIELD_ELLIPSIS}"),
+                TextFieldEllipsis::Middle(head) => format!(
+                    "{}{TEXT_FIELD_ELLIPSIS}{value}",
+                    &actual[..head.min(actual.len())]
+                ),
             };
             let value_x = match geometry.ellipsis {
                 TextFieldEllipsis::Lead => {
@@ -5292,28 +6044,40 @@ fn paint_compiled_node(
                     });
                 }
             }
-            prims.push(text_prim(
-                value_x,
-                row_baseline(rect.y, rect.height, size.get()),
-                value,
-                size,
-                TextWeight::Regular,
-                if control.style == StyleRef::Code {
-                    TextFace::Mono
-                } else {
-                    TextFace::Ui
-                },
-                rgba(
-                    if !control.state.enabled {
-                        roles.text_tertiary
-                    } else if quiet {
-                        quiet_text(&roles)
+            // A placeholder its author set on lines paints them one under
+            // another, centred in the field ([`fit_row_field_placeholder`]).
+            let value_lines = value.split('\n').map(str::to_string).collect::<Vec<_>>();
+            let line_height = if value_lines.len() > 1 {
+                native_button_line_height()
+            } else {
+                rect.height
+            };
+            let top =
+                rect.y + ((rect.height - line_height * value_lines.len() as f32) / 2.0).max(0.0);
+            for (index, line) in value_lines.into_iter().enumerate() {
+                prims.push(text_prim(
+                    value_x,
+                    row_baseline(top + index as f32 * line_height, line_height, size.get()),
+                    line,
+                    size,
+                    TextWeight::Regular,
+                    if control.style == StyleRef::Code {
+                        TextFace::Mono
                     } else {
-                        control_text_color(control.state, &roles)
+                        TextFace::Ui
                     },
-                    255,
-                ),
-            ));
+                    rgba(
+                        if !control.state.enabled {
+                            roles.text_tertiary
+                        } else if quiet {
+                            quiet_text(&roles)
+                        } else {
+                            control_text_color(control.state, &roles)
+                        },
+                        255,
+                    ),
+                ));
+            }
             if control.state.focused
                 && let Some(input) = control.spec.input.as_ref()
             {
@@ -5621,8 +6385,15 @@ fn elide_ui_label(value: &str, max_width: f32, px: f32) -> String {
 /// in `visual_label`. This is intentionally the same typography and UTF-8-safe
 /// elision path used by the painter, which lets responsive authoring avoid a
 /// knowingly overflowing intermediate label while preserving full semantics.
+///
+/// A cut label ends after a whole word, as a cut status does
+/// ([`fit_native_status_label`]): a word cut mid-way reads as another word or
+/// none.
 pub(crate) fn fit_native_button_label(value: &str, max_width: f32) -> String {
-    elide_ui_label(value, max_width, native_type_px(TypeStep::Secondary).get())
+    whole_word_cut(
+        value,
+        elide_ui_label(value, max_width, native_type_px(TypeStep::Secondary).get()),
+    )
 }
 
 /// The width the painter needs to draw a native button label WHOLE, in the
@@ -5647,20 +6418,16 @@ pub(crate) fn native_button_label_width(value: &str) -> f32 {
 /// the same wherever they are placed, beside a name or under it.
 pub(crate) const FACT_SEPARATOR: &str = " \u{b7} ";
 
-/// The width a one-line native body label needs to paint WHOLE, in the face
-/// and rung [`fit_native_text_label`] elides against.
-pub(crate) fn native_text_label_width(value: &str) -> f32 {
-    visual_text_width(
-        value,
-        native_type_px(TypeStep::Body).get(),
-        crate::widget::TextFace::Ui,
-    )
-}
-
 /// Bounded visual projection for a one-line native body label. The caller's
 /// semantic wrapper remains responsible for the complete authored copy.
+///
+/// A cut label ends after a whole word ([`whole_word_cut`]): Messages' one
+/// line heads read "Claude Code is not inst…" at 36 columns.
 pub(crate) fn fit_native_text_label(value: &str, max_width: f32) -> String {
-    elide_ui_label(value, max_width, native_type_px(TypeStep::Body).get())
+    whole_word_cut(
+        value,
+        elide_ui_label(value, max_width, native_type_px(TypeStep::Body).get()),
+    )
 }
 
 /// The width the painter needs to draw one-line native status copy WHOLE,
@@ -5675,13 +6442,48 @@ pub(crate) fn native_status_label_width(value: &str) -> f32 {
 
 /// Bounded visual projection for one-line native status copy. The owning
 /// semantic Group remains responsible for the complete message.
+///
+/// A cut status ends after a whole word ("Cursor blink was not saved:
+/// ~/.config/aterm…", never "…~/.config/at…"): a word cut mid-way reads as
+/// another word or none. Only a status whose first word alone is too wide is
+/// cut inside it.
 pub(crate) fn fit_native_status_label(value: &str, max_width: f32) -> String {
-    elide_text_label(
+    let fitted = elide_text_label(
         value,
         max_width,
         native_type_px(TypeStep::Caption).get(),
         crate::widget::TextFace::Ui,
-    )
+    );
+    whole_word_cut(value, fitted)
+}
+
+/// `fitted`, a cut of `value` ending in `…`, backed off to the last whole
+/// word it keeps; `fitted` as it is where it is `value` whole, or where it
+/// keeps no whole word. Never wider than `fitted`.
+pub(crate) fn whole_word_cut(value: &str, fitted: String) -> String {
+    let Some(stem) = fitted.strip_suffix('…') else {
+        return fitted;
+    };
+    if value == fitted || !value.starts_with(stem) {
+        return fitted;
+    }
+    // The cut fell between words already.
+    if value[stem.len()..].starts_with(char::is_whitespace) {
+        return fitted;
+    }
+    match stem.rfind(char::is_whitespace) {
+        Some(space) if !stem[..space].trim_end().is_empty() => {
+            let kept = stem[..space].trim_end_matches(|c: char| {
+                c.is_whitespace() || matches!(c, ',' | ';' | ':' | '·' | '—' | '–')
+            });
+            if kept.is_empty() {
+                fitted
+            } else {
+                format!("{kept}…")
+            }
+        }
+        _ => fitted,
+    }
 }
 
 fn visual_text_width(value: &str, px: f32, face: crate::widget::TextFace) -> f32 {
@@ -5768,10 +6570,49 @@ pub(crate) fn elide_text_label(
     output
 }
 
+thread_local! {
+    /// While the paint audit reads what a node paints
+    /// ([`CompiledUi::ink_overlaps`]), or a list's edge cuts across it
+    /// ([`drop_cut_marks`]): the run of prims each pictogram
+    /// [`paint_button_icon`] draws, whatever prims it draws it with — the
+    /// outlines and blocks of a pictogram are its ink, where the same prims
+    /// elsewhere are a control's face.
+    static ICON_SPANS: std::cell::RefCell<Option<Vec<std::ops::Range<usize>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `paint`, noting the run of prims each pictogram it draws
+/// ([`ICON_SPANS`]): as absolute ranges of the prims it pushes to.
+fn painted_icons(paint: impl FnOnce()) -> Vec<std::ops::Range<usize>> {
+    let outer = ICON_SPANS.with(|spans| spans.borrow_mut().replace(Vec::new()));
+    paint();
+    let icons = ICON_SPANS
+        .with(|spans| spans.borrow_mut().take())
+        .unwrap_or_default();
+    ICON_SPANS.with(|spans| *spans.borrow_mut() = outer);
+    icons
+}
+
 /// Paint small navigation pictograms entirely from the shared draw IR. These
 /// shapes deliberately use no font glyphs, so the medium Settings rail remains
 /// stable under custom/fallback UI fonts on every backend.
 fn paint_button_icon(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    icon: ButtonIcon,
+    color: [u8; 3],
+) {
+    let from = prims.len();
+    paint_button_icon_prims(prims, rect, icon, color);
+    ICON_SPANS.with(|spans| {
+        if let Some(spans) = spans.borrow_mut().as_mut() {
+            spans.push(from..prims.len());
+        }
+    });
+}
+
+/// The prims of [`paint_button_icon`]'s pictogram.
+fn paint_button_icon_prims(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
     icon: ButtonIcon,
@@ -6363,28 +7204,30 @@ struct StyledBase {
 }
 
 /// For each wrapped prose row, its space-separated pieces with the byte range of
-/// `text` each came from — the words (or chunks of an over-long word) the wrap
-/// placed on the row, in order. A piece the walk cannot place (the tail
-/// ellipsis row's truncated word) carries `None` and paints unstyled.
+/// `text` each came from — the words (or the part of one a CJK break or a chunk
+/// of an over-long word left on the row) the wrap placed on the row, in order.
+/// The words are the text cut at its spaces as the wrap cuts them
+/// ([`aterm_grapheme::pieces`]: a no-break space is glue). A piece the walk
+/// cannot place (the tail ellipsis row's truncated word) carries `None` and
+/// paints unstyled.
 fn wrapped_piece_ranges(
     text: &str,
     rows: &[String],
 ) -> Vec<Vec<(String, Option<std::ops::Range<usize>>)>> {
-    let mut words: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut start: Option<usize> = None;
-    for (i, ch) in text.char_indices() {
-        match (ch.is_whitespace(), start) {
-            (true, Some(s)) => {
-                words.push(s..i);
-                start = None;
-            }
-            (false, None) => start = Some(i),
-            _ => {}
-        }
-    }
-    if let Some(s) = start {
-        words.push(s..text.len());
-    }
+    let words: Vec<std::ops::Range<usize>> = if text.is_ascii() {
+        text.split(char::is_whitespace)
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let at = word.as_ptr() as usize - text.as_ptr() as usize;
+                at..at + word.len()
+            })
+            .collect()
+    } else {
+        aterm_grapheme::pieces(text, |kind| kind == aterm_grapheme::BreakKind::Space)
+            .into_iter()
+            .map(|piece| piece.at..piece.at + piece.text.len())
+            .collect()
+    };
     let (mut wi, mut at) = (0usize, words.first().map_or(0, |w| w.start));
     rows.iter()
         .map(|row| {
@@ -6394,6 +7237,10 @@ fn wrapped_piece_ranges(
                     let Some(word) = words.get(wi) else {
                         return (piece.to_string(), None);
                     };
+                    // A word that holds a space the rule keeps (before a CJK
+                    // closer) goes on past it.
+                    let rest = &text[at..word.end];
+                    at += rest.len() - rest.trim_start().len();
                     let end = text[at..word.end]
                         .char_indices()
                         .nth(piece.chars().count())
@@ -6564,6 +7411,13 @@ fn wrap_markdown_text(
     max_lines: usize,
     preserve_lines: bool,
 ) -> Vec<String> {
+    // A char is a column of the face's average advance, a wide one (CJK, a
+    // fullwidth form, an emoji) two, as the block's row estimate counts them
+    // ([`crate::native_markdown::reader_columns`]); and a line breaks where
+    // the shared rule lets it ([`aterm_grapheme::pieces`]): at its spaces,
+    // and between CJK characters, kinsoku kept. ASCII text takes neither
+    // scan and wraps exactly as it always did.
+    use crate::native_markdown::reader_columns as columns;
     let max_columns = max_columns.max(1);
     // Upstream caps block text at 128 KiB. Even the adversarial one-byte-line
     // case is therefore bounded while still allowing a tail viewport far past
@@ -6580,6 +7434,11 @@ fn wrap_markdown_text(
     // and a fresh `Vec<char>` per line was thousands of malloc/free pairs per
     // frame for a buffer that is dead the moment the line is wrapped.
     let mut characters: Vec<char> = Vec::new();
+    // A preserved line's breaks between CJK characters, as the char each
+    // would start the next row at.
+    let mut cjk_starts: Vec<usize> = Vec::new();
+    // A flowed line's pieces: whether white space came before each, and it.
+    let mut words: Vec<(bool, &str)> = Vec::new();
     for source_line in text.lines().chain(text.is_empty().then_some("")) {
         if produced >= max_lines {
             break;
@@ -6587,6 +7446,19 @@ fn wrap_markdown_text(
         if preserve_lines {
             characters.clear();
             characters.extend(source_line.chars());
+            cjk_starts.clear();
+            if !source_line.is_ascii() {
+                let mut breaks = aterm_grapheme::line_breaks(source_line)
+                    .into_iter()
+                    .filter(|brk| brk.kind == aterm_grapheme::BreakKind::Ideographic)
+                    .map(|brk| brk.at)
+                    .peekable();
+                for (index, (byte, _)) in source_line.char_indices().enumerate() {
+                    if breaks.next_if_eq(&byte).is_some() {
+                        cjk_starts.push(index);
+                    }
+                }
+            }
             if characters.is_empty() {
                 if produced >= skip {
                     output.push(String::new());
@@ -6598,7 +7470,17 @@ fn wrap_markdown_text(
                     if produced >= max_lines {
                         break;
                     }
-                    let hard_end = (start + max_columns).min(characters.len());
+                    // As many chars as the row's columns hold, at least one.
+                    let mut hard_end = start;
+                    let mut used = 0usize;
+                    while let Some(&character) = characters.get(hard_end) {
+                        let width = columns(character);
+                        if hard_end > start && used + width > max_columns {
+                            break;
+                        }
+                        used += width;
+                        hard_end += 1;
+                    }
                     if hard_end == characters.len() {
                         if produced >= skip {
                             output.push(characters[start..hard_end].iter().collect());
@@ -6616,7 +7498,12 @@ fn wrap_markdown_text(
                         .rposition(|character| character.is_whitespace())
                         .map(|offset| start + offset)
                         .filter(|end| *end > start);
-                    let end = soft_end.unwrap_or(hard_end);
+                    // Or the last break between CJK characters that fits.
+                    let cjk_end = cjk_starts[..cjk_starts.partition_point(|at| *at <= hard_end)]
+                        .last()
+                        .copied()
+                        .filter(|end| *end > start);
+                    let end = soft_end.max(cjk_end).unwrap_or(hard_end);
                     if produced >= skip {
                         output.push(characters[start..end].iter().collect());
                     }
@@ -6630,17 +7517,32 @@ fn wrap_markdown_text(
             }
             continue;
         }
+        words.clear();
+        if source_line.is_ascii() {
+            words.extend(source_line.split_whitespace().map(|word| (true, word)));
+        } else {
+            words.extend(
+                aterm_grapheme::pieces(source_line, aterm_grapheme::BreakKind::is_word_boundary)
+                    .into_iter()
+                    .map(|piece| (piece.spaced, piece.text)),
+            );
+        }
         let mut line = String::new();
         let mut line_columns = 0usize;
-        for word in source_line.split_whitespace() {
-            let separator = usize::from(!line.is_empty());
-            let word_columns = word.chars().count();
+        // `line.chars().count()`, which the ellipsis rule totals.
+        let mut line_chars = 0usize;
+        for &(spaced, word) in &words {
+            // A space between it and the line, unless it goes on the line's
+            // last piece with nothing between (a CJK character's next).
+            let separator = usize::from(!line.is_empty() && spaced);
+            let word_columns: usize = word.chars().map(columns).sum();
             if line_columns + separator + word_columns <= max_columns {
-                if !line.is_empty() {
+                if separator == 1 {
                     line.push(' ');
                 }
                 line.push_str(word);
                 line_columns += separator + word_columns;
+                line_chars += separator + word.chars().count();
                 continue;
             }
             if !line.is_empty() {
@@ -6649,26 +7551,42 @@ fn wrap_markdown_text(
                     output.push(row);
                 }
                 produced += 1;
-                // `line_columns` is `line.chars().count()` by construction, so
-                // the ellipsis rule sees the same total it always did.
-                produced_chars += line_columns;
+                produced_chars += line_chars;
                 if produced >= max_lines {
                     break;
                 }
             }
             let mut chunk = String::new();
             let mut chunk_columns = 0usize;
+            let mut chunk_chars = 0usize;
             for character in word.chars() {
-                chunk.push(character);
-                chunk_columns += 1;
-                if chunk_columns == max_columns {
+                let width = columns(character);
+                // A wide char that would end past the row starts the next.
+                if chunk_columns + width > max_columns && !chunk.is_empty() {
                     let row = std::mem::take(&mut chunk);
                     if produced >= skip {
                         output.push(row);
                     }
                     produced += 1;
-                    produced_chars += chunk_columns;
+                    produced_chars += chunk_chars;
                     chunk_columns = 0;
+                    chunk_chars = 0;
+                    if produced >= max_lines {
+                        break;
+                    }
+                }
+                chunk.push(character);
+                chunk_columns += width;
+                chunk_chars += 1;
+                if chunk_columns >= max_columns {
+                    let row = std::mem::take(&mut chunk);
+                    if produced >= skip {
+                        output.push(row);
+                    }
+                    produced += 1;
+                    produced_chars += chunk_chars;
+                    chunk_columns = 0;
+                    chunk_chars = 0;
                     if produced >= max_lines {
                         break;
                     }
@@ -6676,6 +7594,7 @@ fn wrap_markdown_text(
             }
             line = chunk;
             line_columns = chunk_columns;
+            line_chars = chunk_chars;
         }
         if produced >= max_lines {
             break;
@@ -6685,15 +7604,23 @@ fn wrap_markdown_text(
                 output.push(line);
             }
             produced += 1;
-            produced_chars += line_columns;
+            produced_chars += line_chars;
         }
     }
     if produced == max_lines
         && text.chars().count() > produced_chars
         && let Some(last) = output.last_mut()
     {
+        // As many chars as the row's columns hold beside the `…`.
         let keep = max_columns.saturating_sub(1);
-        *last = last.chars().take(keep).collect::<String>();
+        let mut used = 0usize;
+        *last = last
+            .chars()
+            .take_while(|character| {
+                used += columns(*character);
+                used <= keep
+            })
+            .collect::<String>();
         last.push('…');
     }
     output
@@ -7261,6 +8188,51 @@ pub(crate) fn control_rest_fill_over(ground: [u8; 3], roles: &crate::settings::R
     }
 }
 
+/// A box drawn as a piece of a card that runs on ([`Joins`]): where it does,
+/// the clip its open edges stand past is pushed (its own bounds, and the gap
+/// to the next piece under it), and the rect to draw the box in returned —
+/// carried `radius` and its stroke past each open edge, so no rounded corner
+/// or stroke closes it there. Returns that rect and whether a clip was
+/// pushed (its caller pops it after the box).
+fn open_box(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    joins: Joins,
+    radius: f32,
+) -> (LogicalRect, bool) {
+    if joins.closed() {
+        return (rect, false);
+    }
+    let below = joins.below.unwrap_or(0.0).max(0.0);
+    prims.push(crate::widget::DrawPrim::ClipPush {
+        x: rect.x,
+        y: rect.y,
+        w: rect.width,
+        h: rect.height + below,
+    });
+    let past = radius + 2.0;
+    let top = rect.y - if joins.above { past } else { 0.0 };
+    let bottom = rect.bottom()
+        + if joins.below.is_some() {
+            below + past
+        } else {
+            0.0
+        };
+    (
+        LogicalRect::new(rect.x, top, rect.width, (bottom - top).max(0.0)),
+        true,
+    )
+}
+
+/// Where a DISCLOSURE button's label ends, from its trailing edge: the
+/// chevron's slot ([`paint_disclosure_button`]).
+pub(crate) const DISCLOSURE_LABEL_END: f32 = 34.0;
+
+/// The room a disclosure button `width` wide gives its label's lines.
+pub(crate) fn disclosure_label_room(width: f32) -> f32 {
+    (width - BUTTON_LABEL_INSET - DISCLOSURE_LABEL_END).max(0.0)
+}
+
 /// A DISCLOSURE button ([`ControlState::expanded`], design ruling 262): a row
 /// of a list, not a raised control — flush at rest, a quiet wash under the
 /// pointer, pressed or open, the focus ring when the keyboard is on it, and a
@@ -7314,20 +8286,31 @@ fn paint_disclosure_button(
         .unwrap_or(&control.spec.label);
     if !label.is_empty() {
         let size = native_type_px(TypeStep::Secondary);
-        prims.push(text_prim(
-            rect.x + BUTTON_LABEL_INSET,
-            row_baseline(rect.y, rect.height, size.get()),
-            elide_text_label(
-                label,
-                (rect.width - 44.0).max(0.0),
-                size.get(),
+        // Its lines one under another, centred, as a text button's
+        // ([`button_label_lines`]), each in the room the chevron leaves.
+        let lines = button_label_lines(label).collect::<Vec<_>>();
+        let line_height = if lines.len() > 1 {
+            native_button_line_height()
+        } else {
+            rect.height
+        };
+        let top = rect.y + ((rect.height - line_height * lines.len() as f32) / 2.0).max(0.0);
+        for (index, line) in lines.into_iter().enumerate() {
+            prims.push(text_prim(
+                rect.x + BUTTON_LABEL_INSET,
+                row_baseline(top + index as f32 * line_height, line_height, size.get()),
+                elide_text_label(
+                    line,
+                    (rect.width - BUTTON_LABEL_INSET - DISCLOSURE_LABEL_END).max(0.0),
+                    size.get(),
+                    TextFace::Ui,
+                ),
+                size,
+                TextWeight::Regular,
                 TextFace::Ui,
-            ),
-            size,
-            TextWeight::Regular,
-            TextFace::Ui,
-            rgba(control_text_color(state, roles), 255),
-        ));
+                rgba(control_text_color(state, roles), 255),
+            ));
+        }
     }
     let ink = rgba(readable_secondary(roles), 235);
     let (cx, cy) = (rect.right() - 16.0, rect.y + rect.height / 2.0);
@@ -7876,7 +8859,9 @@ pub(crate) enum CompileError {
     PaintOnlyAction(UiKey),
     ObserverMismatch(UiKey),
     /// A button whose painted words are not one phrase of its accessible
-    /// name ([`visible_label_in_name`]).
+    /// name ([`visible_label_in_name`]). An authoring rule a development build
+    /// holds, so the variant exists where its one refusal does.
+    #[cfg(debug_assertions)]
     VisibleLabelNotInName(UiKey),
 }
 
@@ -7998,7 +8983,6 @@ impl Compiler {
         rect: LogicalRect,
         inherited_clip: LogicalRect,
         parent: Option<&UiKey>,
-        inherited_peek: bool,
         list: Option<ListContext>,
     ) -> Result<(), CompileError> {
         let UiNode {
@@ -8007,10 +8991,10 @@ impl Compiler {
             content,
             children,
             paint_only,
-            peek,
             room,
             offscreen,
             segmented,
+            joins,
         } = node;
         if segmented {
             // One Tab stop for the control: the focused segment, else the
@@ -8032,7 +9016,6 @@ impl Compiler {
                 segments: segments.into_iter().map(|(key, _)| key).collect(),
             });
         }
-        let peek = inherited_peek || peek;
         if key.as_str().trim().is_empty() {
             return Err(CompileError::EmptyKey);
         }
@@ -8111,18 +9094,41 @@ impl Compiler {
         let fade = list
             .and_then(|list| list.fade)
             .filter(|(top, _)| visible.bottom() > top + CLIP_EDGE_EPSILON);
+        let across = |edge: &f32| {
+            rect.y < edge - CLIP_EDGE_EPSILON && rect.bottom() > edge + CLIP_EDGE_EPSILON
+        };
+        let cut_edges = CutEdges {
+            top: list.map(|list| list.top_edge).filter(across),
+            bottom: list.and_then(|list| list.bottom_edge).filter(across),
+        };
         self.output.paint.push(PaintNode {
             key: key.clone(),
             rect,
             clip: visible,
             content,
-            peek: peek || edge_cut,
+            peek: edge_cut,
             fade,
+            cut_edges,
+            joins,
         });
         let live = match live_visible {
             Some(shown) if !paint_only => Some(shown),
             _ => None,
         };
+        // What of an enabled control the strip under a list's room shows is
+        // its picture there: a press on it scrolls it into the room.
+        if let Some(list) = list
+            && !paint_only
+            && projection.action.is_some()
+            && projection.state.is_none_or(|state| state.enabled)
+            && visible.bottom() > list.room.bottom() + CLIP_EDGE_EPSILON
+        {
+            let top = visible.y.max(list.room.bottom());
+            self.output.list_pictures.push(ListPicture {
+                key: key.clone(),
+                rect: LogicalRect::new(visible.x, top, visible.width, visible.bottom() - top),
+            });
+        }
         // A list that holds every row in the tree has a node its room does
         // not show there off its screen, with its whole bounds.
         let listed = live.is_none() && !paint_only && list.is_some_and(|list| list.lists_all);
@@ -8181,7 +9187,10 @@ impl Compiler {
         if child_clip.is_empty() {
             return Ok(());
         }
-        // A list's children inherit its room and the strip under it.
+        // A list's children inherit its room, its top edge and the strip under
+        // it. A room inside a list (the rows under a kept caption) is that
+        // list's room cut down to its own, its top edge its own, over the strip
+        // its list keeps fading under it.
         let list = match room {
             Some(room) => {
                 let shown = LogicalRect::new(rect.x, rect.y, rect.width, room.height.max(0.0));
@@ -8189,11 +9198,18 @@ impl Compiler {
                     Some(outer) => shown.intersect(outer.room).unwrap_or_default(),
                     None => shown,
                 };
+                let fade = (room.fades && rect.height > room.height + CLIP_EDGE_EPSILON)
+                    .then(|| (rect.y + room.height, rect.bottom()))
+                    .or(list.and_then(|outer| outer.fade));
                 Some(ListContext {
                     room: shown,
-                    fade: (room.fades && rect.height > room.height + CLIP_EDGE_EPSILON)
-                        .then(|| (rect.y + room.height, rect.bottom())),
+                    fade,
                     lists_all: room.lists_all || list.is_some_and(|outer| outer.lists_all),
+                    top_edge: shown.y,
+                    // Where the list's children are cut off under it, its
+                    // own clip inside every clip over it; a list that fades
+                    // there draws a picture fading out instead.
+                    bottom_edge: fade.is_none().then(|| child_clip.bottom()),
                 })
             }
             None => list,
@@ -8214,7 +9230,7 @@ impl Compiler {
             } else {
                 child_clip
             };
-            self.node(child, child_rect, clip, semantic_parent, peek, list)?;
+            self.node(child, child_rect, clip, semantic_parent, list)?;
         }
         Ok(())
     }
@@ -8256,7 +9272,7 @@ impl Compiler {
         let child_rects = layout_children(layout, &children, rect.inset(layout.padding))?;
         for (mut child, child_rect) in children.into_iter().zip(child_rects) {
             child.offscreen = true;
-            self.node(child, child_rect, child_rect, parent, false, None)?;
+            self.node(child, child_rect, child_rect, parent, None)?;
         }
         Ok(())
     }
@@ -8381,6 +9397,88 @@ fn resolve_length(length: Length, available: f32) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A ONE-LINE STATUS IS CUT AFTER A WHOLE WORD (the message band's rule,
+    /// on Settings' status line): at every width the cut keeps whole words
+    /// and `…`, never a word's first letters, and a status that fits stays
+    /// whole. Negative control: the general label elision it narrows cuts
+    /// the same status mid-word.
+    #[test]
+    fn a_status_is_cut_after_a_whole_word() {
+        let status = "Cursor blink was not saved: ~/.config/aterm isn\u{2019}t writable \u{b7} check its permissions";
+        let whole = native_status_label_width(status);
+        let mut mid_word = 0;
+        let mut width = 40.0_f32;
+        while width < whole + 4.0 {
+            let shown = fit_native_status_label(status, width);
+            if shown != status {
+                let stem = shown.strip_suffix('…').expect("a cut ends in an ellipsis");
+                // Only the first word, alone too wide, is cut inside.
+                assert!(
+                    !stem.contains(char::is_whitespace)
+                        || status[stem.len()..].starts_with(|c: char| {
+                            c.is_whitespace() || matches!(c, ':' | ',' | '·')
+                        }),
+                    "{width}: {shown:?} cuts a word"
+                );
+                assert!(native_status_label_width(&shown) <= width + TEXT_FIT_SLACK);
+            }
+            let general = elide_text_label(
+                status,
+                width,
+                native_type_px(TypeStep::Caption).get(),
+                crate::widget::TextFace::Ui,
+            );
+            if let Some(stem) = general.strip_suffix('…')
+                && !status[stem.len()..].starts_with(char::is_whitespace)
+            {
+                mid_word += 1;
+            }
+            width += 3.0;
+        }
+        assert_eq!(fit_native_status_label(status, whole + 1.0), status);
+        assert!(
+            mid_word > 0,
+            "the control: the general elision cuts mid-word"
+        );
+    }
+
+    /// A CUT ONE-LINE LABEL ENDS AFTER A WHOLE WORD, as a cut status does: a
+    /// body label (Messages' one-line heads) and a button label at every
+    /// width keep whole words and `…`, never a word's first letters ("Claude
+    /// Code is not inst…" at 36 columns); one whose first word alone is too
+    /// wide is cut inside it, and one that fits stays whole.
+    #[test]
+    fn a_cut_one_line_label_ends_after_a_whole_word() {
+        let label = "Claude Code is not installed";
+        let words: Vec<&str> = label.split_whitespace().collect();
+        for (fit, measure) in [
+            (
+                fit_native_text_label as fn(&str, f32) -> String,
+                native_type_px(TypeStep::Body).get(),
+            ),
+            (
+                fit_native_button_label as fn(&str, f32) -> String,
+                native_type_px(TypeStep::Secondary).get(),
+            ),
+        ] {
+            let whole = crate::tray_raster::ui_text_width(label, measure);
+            let first = crate::tray_raster::ui_text_width("Claude…", measure);
+            let mut width = first + 1.0;
+            while width < whole {
+                let cut = fit(label, width);
+                let stem = cut.strip_suffix('…').unwrap_or(&cut).trim_end();
+                let kept = stem.split_whitespace().count();
+                assert_eq!(
+                    stem,
+                    words[..kept].join(" "),
+                    "{width}: {cut:?} ends after a whole word"
+                );
+                width += 3.0;
+            }
+            assert_eq!(fit(label, whole + 1.0), label);
+        }
+    }
 
     /// PAGE-CHROME TEXT ON THE AURORA READS. The heading, subtitle, pager and
     /// empty line sit straight on the Settings aurora, so every tile holds the
@@ -8612,6 +9710,7 @@ pub(crate) mod tests {
         let theme = forced_chrome_theme(Theme::default(), false);
         let roles = crate::settings::Roles::from_theme(theme);
         let node = |spec: ButtonSpec, rect: LogicalRect| PaintNode {
+            cut_edges: CutEdges::NONE,
             peek: false,
             fade: None,
             key: UiKey::new("settings/nav/packages"),
@@ -8621,6 +9720,7 @@ pub(crate) mod tests {
                 Control::new(spec, ActionId::new("settings/route/packages"))
                     .style(StyleRef::Navigation),
             ),
+            joins: Joins::default(),
         };
         let dots = |node: &PaintNode| -> Vec<(f32, f32, f32)> {
             let mut prims = Vec::new();
@@ -8705,6 +9805,7 @@ pub(crate) mod tests {
                 .visual_label("#E67A00 and a label long enough to be cut")
                 .trailing_icon(ButtonIcon::Forward);
             PaintNode {
+                cut_edges: CutEdges::NONE,
                 peek: false,
                 fade: None,
                 key: UiKey::new("settings/control/active_tab_color"),
@@ -8720,6 +9821,7 @@ pub(crate) mod tests {
                     )
                     .style(StyleRef::Setting),
                 ),
+                joins: Joins::default(),
             }
         };
         let paint = |chip: bool| {
@@ -8838,12 +9940,14 @@ pub(crate) mod tests {
                 Control::new(spec, ActionId::new("chrome/nav")).style(StyleRef::Navigation);
             control.state.selected = selected;
             PaintNode {
+                cut_edges: CutEdges::NONE,
                 peek: false,
                 fade: None,
                 key: UiKey::new("chrome/nav"),
                 rect,
                 clip: rect,
                 content: UiContent::Button(control),
+                joins: Joins::default(),
             }
         };
         // The three shapes that actually ship, exactly as their authors build
@@ -8914,12 +10018,14 @@ pub(crate) mod tests {
             .style(StyleRef::Navigation);
         control.state.selected = true;
         let chip_node = PaintNode {
+            cut_edges: CutEdges::NONE,
             peek: false,
             fade: None,
             key: UiKey::new("markdown/preview-mode"),
             rect: chip_rect,
             clip: chip_rect,
             content: UiContent::Button(control),
+            joins: Joins::default(),
         };
         let mut prims = Vec::new();
         paint_compiled_node(&mut prims, &chip_node, roles, theme, 14.0);
@@ -8957,12 +10063,14 @@ pub(crate) mod tests {
                 Control::new(spec, ActionId::new("chrome/nav")).style(StyleRef::Navigation);
             control.state.selected = selected;
             let node = PaintNode {
+                cut_edges: CutEdges::NONE,
                 peek: false,
                 fade: None,
                 key: UiKey::new("chrome/nav"),
                 rect,
                 clip: rect,
                 content: UiContent::Button(control),
+                joins: Joins::default(),
             };
             let mut prims = Vec::new();
             paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -9067,12 +10175,14 @@ pub(crate) mod tests {
                     .style(StyleRef::Navigation);
                 control.state.selected = selected;
                 let node = PaintNode {
+                    cut_edges: CutEdges::NONE,
                     peek: false,
                     fade: None,
                     key: UiKey::new("chrome/nav"),
                     rect,
                     clip: rect,
                     content: UiContent::Button(control),
+                    joins: Joins::default(),
                 };
                 let mut prims = Vec::new();
                 paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -9157,12 +10267,14 @@ pub(crate) mod tests {
             control.state.selected = selected;
             control.state.focus_visible = focus_visible;
             PaintNode {
+                cut_edges: CutEdges::NONE,
                 peek: false,
                 fade: None,
                 key: UiKey::new("settings/nav/top"),
                 rect,
                 clip: rect,
                 content: UiContent::Button(control),
+                joins: Joins::default(),
             }
         };
         for (label, theme) in [
@@ -9564,6 +10676,7 @@ pub(crate) mod tests {
                 line.contains("overflow=true")
                     || line.contains("clip-truncated=true")
                     || (line.starts_with("paint-node ") && line.contains(" clipped=true "))
+                    || line.starts_with("paint-overlap ")
             })
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
@@ -9581,13 +10694,149 @@ pub(crate) mod tests {
             selected.len(),
             "fit_failures reports each failure record once"
         );
-        let clean_summary = summary.contains(" overflow=0 ") && summary.contains(" clipped=0 ");
+        let clean_summary = summary.contains(" overflow=0 ")
+            && summary.contains(" clipped=0 ")
+            && summary.contains(" overlaps=0 ");
         assert_eq!(
             failures.is_empty(),
             clean_summary && selected.is_empty(),
             "fit_failures passes exactly when the full audit passes: {summary}"
         );
         failures
+    }
+
+    /// THE AUDIT REPORTS MARKS PAINTED OVER EACH OTHER (#50): two labels a
+    /// layout stacks run into each other, a label over a switch's thumb runs
+    /// into an icon, and a label over a button's pictogram drawn of outlines
+    /// alone (the Window glyph, which the audit did not read as ink) runs
+    /// into that — a `paint-overlap` record each, counted in the summary and
+    /// failing the cheap verdict; the same marks side by side, and a
+    /// switch's own track, thumb and words, are none.
+    #[test]
+    fn paint_audit_reports_marks_painted_over_each_other() {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let text = |key: &str, words: &str| {
+            UiNode::new(key, UiContent::Text(TextSpec::text(words)))
+                .layout(Layout::default().height(Length::Fixed(24.0)))
+        };
+        let switch = |key: &str| {
+            UiNode::new(
+                key,
+                UiContent::Switch(
+                    Control::new(
+                        SwitchSpec {
+                            label: key.to_string(),
+                            description: None,
+                        },
+                        ActionId::new(key),
+                    )
+                    .value(SemanticValue::Bool(false))
+                    .style(StyleRef::Quiet),
+                ),
+            )
+            .layout(Layout::default().height(Length::Fixed(24.0)))
+        };
+        let pictogram = |key: &str| {
+            UiNode::new(
+                key,
+                UiContent::Button(
+                    Control::new(
+                        ButtonSpec::new("Window").visual_icon(ButtonIcon::Window),
+                        ActionId::new(key),
+                    )
+                    .style(StyleRef::Quiet),
+                ),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fixed(32.0))
+                    .height(Length::Fixed(24.0)),
+            )
+        };
+        let row = |key: &str, layout: Layout, children: Vec<UiNode>| {
+            UiNode::new(
+                key,
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(layout.height(Length::Fixed(24.0)))
+            .children(children)
+        };
+        let compile = |children: Vec<UiNode>| {
+            UiTree::new(
+                UiNode::new(
+                    "app",
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+                )
+                .layout(Layout::column().padding(Insets::all(8.0)).gap(8.0))
+                .children(children),
+            )
+            .compile(LogicalRect::new(0.0, 0.0, 240.0, 120.0))
+            .expect("compiles")
+        };
+        let stacked = compile(vec![
+            row(
+                "labels",
+                Layout::default(),
+                vec![text("state", "Live trail"), text("badge", "Shape: Block")],
+            ),
+            row(
+                "thumb",
+                Layout::default().width(Length::Fixed(100.0)),
+                vec![text("over", "Typing glow"), switch("glow")],
+            ),
+            row(
+                "glyph",
+                Layout::default(),
+                vec![text("under", "Windows"), pictogram("window")],
+            ),
+        ]);
+        let overlaps = stacked.ink_overlaps();
+        assert!(
+            overlaps.iter().any(|line| line.contains("a=\"state\"")
+                && line.contains("b=\"badge\"")
+                && line.contains("a-ink=words:\"Live trail\"")),
+            "{overlaps:#?}"
+        );
+        assert!(
+            overlaps.iter().any(|line| line.contains("a=\"over\"")
+                && line.contains("b=\"glow\"")
+                && line.contains("b-ink=icon")),
+            "{overlaps:#?}"
+        );
+        assert!(
+            overlaps.iter().any(|line| line.contains("a=\"under\"")
+                && line.contains("b=\"window\"")
+                && line.contains("b-ink=icon")),
+            "{overlaps:#?}"
+        );
+        assert_eq!(overlaps.len(), 3, "{overlaps:#?}");
+        let audit = stacked.paint_audit_lines();
+        assert!(audit[0].contains(" overlaps=3 "), "{}", audit[0]);
+        assert_eq!(assert_fit_failures_match_full_audit(&stacked).len(), 3);
+        // CONTROL: side by side, nothing overlaps.
+        let apart = compile(vec![
+            row(
+                "labels",
+                Layout::row().gap(12.0),
+                vec![text("state", "Live trail"), text("badge", "Shape: Block")],
+            ),
+            row(
+                "thumb",
+                Layout::row().gap(12.0),
+                vec![text("over", "Typing glow"), switch("glow")],
+            ),
+            row(
+                "glyph",
+                Layout::row().gap(12.0),
+                vec![text("under", "Windows"), pictogram("window")],
+            ),
+        ]);
+        assert!(
+            apart.ink_overlaps().is_empty(),
+            "{:#?}",
+            apart.ink_overlaps()
+        );
+        assert!(assert_fit_failures_match_full_audit(&apart).is_empty());
     }
 
     #[test]
@@ -10385,6 +11634,79 @@ pub(crate) mod tests {
         );
     }
 
+    /// A BOX LISTED A PIECE AT A TIME READS AS ONE CARD ([`Joins`]): a piece
+    /// that runs on into the one over it draws no top edge, one that goes on
+    /// under it no bottom edge, its face carried over the gap to the next —
+    /// its box drawn past a clip at its own bounds and that gap. CONTROL: a
+    /// closed box is drawn at its bounds, with no clip of its own.
+    #[test]
+    fn a_joined_box_draws_no_edge_where_it_runs_on() {
+        use crate::widget::DrawPrim;
+        let theme = aterm_render::Theme::default();
+        let roles = crate::settings::Roles::from_theme(theme);
+        let rect = LogicalRect::new(10.0, 100.0, 200.0, 80.0);
+        let piece = |joins: Joins| PaintNode {
+            key: UiKey::new("card/part-1"),
+            rect,
+            clip: rect,
+            content: UiContent::Group(
+                GroupSpec::unlabeled(SemanticRole::Group).style(StyleRef::Secondary),
+            ),
+            peek: false,
+            fade: None,
+            cut_edges: CutEdges::NONE,
+            joins,
+        };
+        let drawn = |joins: Joins| {
+            let mut prims = Vec::new();
+            paint_compiled_node(&mut prims, &piece(joins), roles, theme, 14.0);
+            prims
+        };
+        let joined = drawn(Joins {
+            above: true,
+            below: Some(6.0),
+        });
+        assert!(
+            matches!(
+                joined.first(),
+                Some(DrawPrim::ClipPush { y, h, .. })
+                    if (*y - rect.y).abs() < 0.01 && (*h - (rect.height + 6.0)).abs() < 0.01
+            ),
+            "{joined:?}"
+        );
+        let face = joined
+            .iter()
+            .find_map(|prim| match prim {
+                DrawPrim::Panel { y, h, .. } if *h > 40.0 => Some((*y, *y + *h)),
+                _ => None,
+            })
+            .expect("the card's face");
+        assert!(face.0 < rect.y - 1.0, "open over it: {face:?}");
+        assert!(
+            face.1 > rect.bottom() + 6.0 + 1.0,
+            "open under it, over the gap: {face:?}"
+        );
+        assert!(
+            matches!(joined.last(), Some(DrawPrim::ClipPop)),
+            "{joined:?}"
+        );
+        // CONTROL: a closed box.
+        let closed = drawn(Joins::default());
+        assert!(
+            !closed
+                .iter()
+                .any(|prim| matches!(prim, DrawPrim::ClipPush { .. } | DrawPrim::ClipPop))
+        );
+        let face = closed
+            .iter()
+            .find_map(|prim| match prim {
+                DrawPrim::Panel { y, h, .. } if *h > 40.0 => Some((*y, *y + *h)),
+                _ => None,
+            })
+            .expect("the card's face");
+        assert_eq!(face, (rect.y, rect.bottom()));
+    }
+
     /// A PLACEHOLDER FITS ITS BOX: whole where it fits, its plain words
     /// without " (default)" where only they fit, else elided; a swatch takes
     /// its room from the box.
@@ -10436,6 +11758,44 @@ pub(crate) mod tests {
         assert_eq!(
             fit_native_field_placeholder(fleet, field_for("ai-fleet.toml beside a"), false),
             "ai-fleet.toml beside\u{2026}"
+        );
+    }
+
+    /// A WINDOWS PATH GIVES WAY AT ITS FOLDERS TOO ([`path_forms`]): its
+    /// components end at `\` as a Unix path's end at `/`, so a narrow field
+    /// keeps its file's name (`C:\…\aterm\ai-fleet.toml`, then
+    /// `…\ai-fleet.toml`). The forms split at `/` alone, and a Windows path had
+    /// none: its placeholder was elided from its start, the name lost, and a
+    /// value cut grapheme by grapheme. CONTROL: a Unix file's name may hold a
+    /// `\`, which ends no component there.
+    #[test]
+    fn a_windows_path_gives_way_at_its_folders() {
+        let path = r"C:\Users\someone\AppData\Roaming\aterm\ai-fleet.toml";
+        let forms: Vec<String> = path_forms(path).into_iter().map(|form| form.0).collect();
+        assert!(
+            forms.contains(&r"C:\…\aterm\ai-fleet.toml".to_string()),
+            "{forms:?}"
+        );
+        assert_eq!(
+            forms.last().map(String::as_str),
+            Some(r"…\aterm\ai-fleet.toml")
+        );
+        assert_eq!(&path[path_name_start(path)..], "ai-fleet.toml");
+        let px = native_type_px(TypeStep::Secondary).get();
+        let field_for = |text: &str| {
+            visual_text_width(text, px, crate::widget::TextFace::Ui)
+                + 2.0 * TEXT_FIELD_HORIZONTAL_PADDING
+        };
+        assert_eq!(
+            fit_native_field_placeholder(path, field_for(r"…\ai-fleet.toml") + 1.0, false),
+            r"…\ai-fleet.toml"
+        );
+        // CONTROL: a `\` in a Unix file's name.
+        let unix = r"/Users//someone/odd\name.toml";
+        assert_eq!(&unix[path_name_start(unix)..], r"odd\name.toml");
+        assert_eq!(
+            path_forms(unix).last().map(|form| form.0.as_str()),
+            Some(r"…/someone/odd\name.toml")
         );
     }
 
@@ -10822,6 +12182,150 @@ pub(crate) mod tests {
         );
     }
 
+    /// The reader's wraps of Latin text as `tests/fixtures/latin-markdown-wraps.txt`
+    /// records them: [`wrap_markdown_text`] flowed and preserved, at every
+    /// column count to 24 and a few wider, whole and cut to a few rows (the
+    /// tail ellipsis), and [`wrapped_piece_ranges`] of the flowed rows, as
+    /// they broke before CJK took the shared line breaks (taken from that
+    /// code, 2026-10-21).
+    fn latin_markdown_wraps() -> String {
+        let corpus = [
+            "alpha beta gamma delta epsilon zeta",
+            "supercalifragilisticexpialidocious and more",
+            "  let value = exact;  // two  spaces\tand a tab",
+            "one\ntwo\nthree\n\nfive six",
+            "aarch64-apple-darwin ~/.config/aterm/aterm.toml --columns",
+            "café naïve “quoted” — dash … end, (paren) [bracket] 50%",
+            "a\u{0301}b c\u{0327}d e",
+            "abcde fghij",
+            "",
+            " ",
+        ];
+        let mut out = String::new();
+        for text in corpus {
+            for columns in (1..=24).chain([32, 40, 80]) {
+                for preserve in [false, true] {
+                    for lines in [2usize, 131_072] {
+                        let rows = wrap_markdown_text(text, columns, 0, lines, preserve);
+                        out.push_str(&format!(
+                            "W {text:?} {columns} {preserve} {lines} => {rows:?}\n"
+                        ));
+                        if !preserve {
+                            out.push_str(&format!(
+                                "R {text:?} {columns} {lines} => {:?}\n",
+                                wrapped_piece_ranges(text, &rows)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// LATIN TEXT WRAPS IN THE READER WHERE IT ALWAYS DID: counting a wide
+    /// char as two columns and breaking between CJK characters (the shared
+    /// line breaks) moved no row, cut and piece of a Latin paragraph or
+    /// code line (the golden record, taken from the code that counted chars
+    /// and broke only at white space).
+    #[test]
+    fn latin_text_wraps_in_the_reader_where_it_always_did() {
+        let golden = include_str!("../tests/fixtures/latin-markdown-wraps.txt");
+        let now = latin_markdown_wraps();
+        let moved: Vec<(&str, &str)> = golden
+            .lines()
+            .zip(now.lines())
+            .filter(|(was, is)| was != is)
+            .take(8)
+            .collect();
+        assert!(moved.is_empty(), "moved wraps (was, is): {moved:#?}");
+        assert_eq!(golden.lines().count(), now.lines().count());
+    }
+
+    /// A CJK PARAGRAPH OR CODE LINE IN THE READER WRAPS INSIDE ITS COLUMN,
+    /// between its characters: at every column a Manual window gives a
+    /// block, 1× and 2× text, each painted row measures inside the block's
+    /// text column, no row starts with a closer or a small kana, and the
+    /// rows rejoined are the text. NEGATIVE CONTROL: counted a column a
+    /// char, a Japanese row was laid out at nearly twice the column's width
+    /// and painted past it (and broke grapheme by grapheme, a row starting
+    /// with "。").
+    #[test]
+    fn a_cjk_block_wraps_inside_the_readers_column() {
+        const NO_ROW_START: [char; 6] = ['。', '、', '」', 'ー', 'ァ', 'ょ'];
+        let text = "設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。\
+                    コーヒーブレイク中にアップデートをダウンロードしています、ちょっと待ってください。";
+        let roles = crate::settings::Roles::from_theme(aterm_render::Theme::default());
+        for scale in [1.0_f32, 2.0] {
+            std::thread::Builder::new()
+                .name(format!("CJK reader at {scale}\u{d7}"))
+                .stack_size(8 << 20)
+                .spawn(move || {
+                    crate::native_appearance::install_preferences(
+                        crate::native_appearance::AppearancePreferences {
+                            text_scale: scale,
+                            ..crate::native_appearance::current_preferences()
+                        },
+                    );
+                    for width in (160..=480).step_by(16).map(|width| width as f32) {
+                        for (kind, column) in [
+                            (MarkdownBlockKind::Paragraph, width),
+                            (MarkdownBlockKind::Code { language: None }, width - 24.0),
+                        ] {
+                            let context = format!("{scale}\u{d7} {width}pt {kind:?}");
+                            let spec = MarkdownBlockSpec {
+                                text: text.to_string(),
+                                kind: kind.clone(),
+                                dense: false,
+                                selectable: true,
+                                action: None,
+                                selected: false,
+                                source: 0..text.len(),
+                                estimated_height: 4_000.0,
+                                visual_row: 0,
+                                total_visual_rows: 64,
+                                inline: Vec::new(),
+                            };
+                            let mut prims = Vec::new();
+                            paint_markdown_block(
+                                &mut prims,
+                                LogicalRect::new(0.0, 0.0, width, 4_000.0),
+                                &spec,
+                                roles,
+                            );
+                            let rows: Vec<String> = prims
+                                .iter()
+                                .filter_map(|prim| match prim {
+                                    crate::widget::DrawPrim::Text { s, px, face, .. } => {
+                                        let painted = visual_text_width(s, *px, *face);
+                                        assert!(
+                                            painted <= column + 0.5,
+                                            "{context}: {s:?} paints {painted:.1}pt in a \
+                                             {column}pt column"
+                                        );
+                                        Some(s.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            assert!(rows.len() > 1, "{context}: {rows:?}");
+                            for row in rows.iter().skip(1) {
+                                let first = row.chars().next().unwrap_or(' ');
+                                assert!(
+                                    !NO_ROW_START.contains(&first),
+                                    "{context}: a row starts with {first:?}: {rows:?}"
+                                );
+                            }
+                            assert_eq!(rows.concat(), text, "{context}: rejoined");
+                        }
+                    }
+                })
+                .expect("a thread for the scale")
+                .join()
+                .unwrap_or_else(|_| panic!("at {scale}\u{d7}"));
+        }
+    }
+
     /// `skip` is a pure window over the SAME wrap: the returned rows, the row
     /// budget, and the tail-ellipsis rule must not depend on where the window
     /// starts. Checked against the un-skipped wrap for every start offset over
@@ -10892,6 +12396,7 @@ pub(crate) mod tests {
         let toolbar = EditorToolbar {
             problem_navigation: true,
             reload: false,
+            edit_header: false,
         };
         let items = editor_toolbar_items(toolbar);
         let gap = 4.0;
@@ -11497,12 +13002,14 @@ pub(crate) mod tests {
             control.state.enabled = true;
             control.state.focused = focused;
             PaintNode {
+                cut_edges: CutEdges::NONE,
                 key: UiKey::new("settings/control/wallpaper"),
                 rect,
                 clip: rect,
                 content: UiContent::TextField(control),
                 peek: false,
                 fade: None,
+                joins: Joins::default(),
             }
         };
         let painted = |node: &PaintNode| {
@@ -11554,6 +13061,7 @@ pub(crate) mod tests {
         let rect = LogicalRect::new(0.0, 0.0, 200.0, 200.0);
         let paint = |hsv: Option<[f32; 3]>| {
             let node = PaintNode {
+                cut_edges: CutEdges::NONE,
                 key: UiKey::new("wheel"),
                 rect,
                 clip: rect,
@@ -11566,6 +13074,7 @@ pub(crate) mod tests {
                 )),
                 peek: false,
                 fade: None,
+                joins: Joins::default(),
             };
             let mut prims = Vec::new();
             paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -11619,12 +13128,14 @@ pub(crate) mod tests {
             control.state.selected = selected;
             control.state.focus_visible = focus_visible;
             let node = PaintNode {
+                cut_edges: CutEdges::NONE,
                 key: UiKey::new("settings/control/bidi"),
                 rect,
                 clip: rect,
                 content: UiContent::Button(control),
                 peek: false,
                 fade: None,
+                joins: Joins::default(),
             };
             let mut prims = Vec::new();
             paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -11671,12 +13182,14 @@ pub(crate) mod tests {
                 control.state.muted = muted;
                 control.state.focus_visible = focus_visible;
                 let node = PaintNode {
+                    cut_edges: CutEdges::NONE,
                     key: UiKey::new("settings/control/harness.autopilot"),
                     rect,
                     clip: rect,
                     content: UiContent::Button(control),
                     peek: false,
                     fade: None,
+                    joins: Joins::default(),
                 };
                 let mut prims = Vec::new();
                 paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -11786,12 +13299,14 @@ pub(crate) mod tests {
                 )
                 .style(style);
                 let node = PaintNode {
+                    cut_edges: CutEdges::NONE,
                     key: UiKey::new("settings/control/cursor.styles"),
                     rect,
                     clip: rect,
                     content: UiContent::Button(control),
                     peek: false,
                     fade: None,
+                    joins: Joins::default(),
                 };
                 let mut prims = Vec::new();
                 paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -11847,12 +13362,14 @@ pub(crate) mod tests {
                     .state(state)
                     .style(style);
                 let node = PaintNode {
+                    cut_edges: CutEdges::NONE,
                     key: UiKey::new("settings/theme/browse"),
                     rect,
                     clip: rect,
                     content: UiContent::Button(control),
                     peek: false,
                     fade: None,
+                    joins: Joins::default(),
                 };
                 let mut prims = Vec::new();
                 paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
@@ -11905,5 +13422,131 @@ pub(crate) mod tests {
             );
             assert!(!rimmed(&icon), "{name}: a quiet icon button has no rim");
         }
+    }
+
+    /// WORDS AND PICTOGRAMS AT A LIST'S EDGES ARE WHOLE OR NOT DRAWN (#98,
+    /// #99): a list whose bottom no strip fades under (a bar up, the page's
+    /// edge) paints none of a line of words its bottom edge cuts through, and
+    /// neither edge paints any of a pictogram whose ink it cuts through,
+    /// where each painted a sliver under the search field or over the
+    /// window's bottom (Top Settings' "COLOR PREVIEW" at 220x12 at 2× text,
+    /// the sidebar's icons); what they leave whole paints as it is, and a
+    /// control they cut stays live where it shows. CONTROL: where the strip
+    /// fades under the room, the cut line paints, fading out with it.
+    #[test]
+    fn a_lists_edges_cut_no_line_of_words_or_pictogram_through() {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let list = |fades: bool| {
+            let icon = UiNode::new(
+                "list/top",
+                UiContent::Button(
+                    Control::new(
+                        ButtonSpec::new("Window").visual_icon(ButtonIcon::Window),
+                        ActionId::new("list/top"),
+                    )
+                    .style(StyleRef::Quiet),
+                ),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fixed(32.0))
+                    .height(Length::Fixed(24.0)),
+            );
+            let filler = UiNode::new(
+                "list/filler",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(Layout::default().height(Length::Fixed(52.0)));
+            let words = UiNode::new(
+                "list/bottom",
+                UiContent::Text(TextSpec::text("COLOR PREVIEW")),
+            )
+            .layout(Layout::default().height(Length::Fixed(24.0)));
+            // 72pt drawn, its room the first 60: a strip of 12 under it.
+            let room = if fades { 60.0 } else { 72.0 };
+            UiTree::new(
+                UiNode::new(
+                    "app",
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+                )
+                .layout(Layout::column().padding(Insets::all(8.0)))
+                .children(vec![
+                    UiNode::new(
+                        "list",
+                        UiContent::Group(GroupSpec::unlabeled(SemanticRole::List)),
+                    )
+                    .layout(
+                        Layout::column()
+                            .height(Length::Fixed(72.0))
+                            .scrolled(12.0)
+                            .clipped(),
+                    )
+                    .room(room, fades)
+                    .children(vec![icon, filler, words]),
+                ]),
+            )
+            .compile(LogicalRect::new(0.0, 0.0, 240.0, 120.0))
+            .expect("compiles")
+        };
+        let words_painted = |compiled: &CompiledUi| {
+            compiled.tray(aterm_render::Theme::default(), 14.0).prims.iter().any(|prim| {
+                matches!(prim, crate::widget::DrawPrim::Text { s, .. } if s.contains("PREVIEW"))
+            })
+        };
+        let hard = list(false);
+        // The words (72..96) cross the list's 80pt bottom (8 + 72), the icon
+        // (-4..20) its 8pt top.
+        let node = |key: &str| {
+            hard.paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .unwrap_or_else(|| panic!("{key} is painted"))
+                .cut_edges
+        };
+        assert!(
+            node("list/bottom").bottom.is_some(),
+            "{:?}",
+            node("list/bottom")
+        );
+        assert!(node("list/top").top.is_some(), "{:?}", node("list/top"));
+        assert!(!words_painted(&hard), "the bottom edge slices no words");
+        assert!(hard.sliced_marks().is_empty(), "{:#?}", hard.sliced_marks());
+        assert!(
+            hard.semantic(&UiKey::new("list/top")).is_some(),
+            "the cut button is live where it shows"
+        );
+        // The pictogram's prims are gone with its cut ink: the button paints
+        // fewer prims than it does whole.
+        let prims_of = |compiled: &CompiledUi, key: &str| {
+            let node = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .expect("painted");
+            node.painted_prims().len()
+        };
+        let whole = UiTree::new(
+            UiNode::new(
+                "list/top",
+                UiContent::Button(
+                    Control::new(
+                        ButtonSpec::new("Window").visual_icon(ButtonIcon::Window),
+                        ActionId::new("list/top"),
+                    )
+                    .style(StyleRef::Quiet),
+                ),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fixed(32.0))
+                    .height(Length::Fixed(24.0)),
+            ),
+        )
+        .compile(LogicalRect::new(0.0, 0.0, 32.0, 24.0))
+        .expect("compiles");
+        assert!(prims_of(&hard, "list/top") < prims_of(&whole, "list/top"));
+        // CONTROL: the fading strip draws the cut line, a picture fading out.
+        let fading = list(true);
+        assert!(words_painted(&fading), "the strip fades the line out");
     }
 }

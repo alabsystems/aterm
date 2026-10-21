@@ -138,16 +138,11 @@ pub(crate) fn shell_check(path: &str) -> crate::ShellCheck {
     }
 }
 
-/// The interactive shell the window spawns on this machine and where it came
-/// from, as reported by `aterm doctor` and `show-config` on Windows.
+/// Interactive shell resolution for `aterm doctor` and `show-config` on Windows.
 ///
-/// `aterm-pty`'s Windows spawn reads neither `$SHELL` (a POSIX path in MSYS
-/// shells) nor `%COMSPEC%` first, so the report is the spawn's own answer.
-/// Inside a tab it is the tab's shell, handed over by the window
-/// ([`aterm_types::domain::ENV_TAB_SHELL`]), since a window's `--shell` flag is
-/// invisible to a CLI process. Outside a tab it is what a new window would run:
-/// aterm.toml's `shell`, else the platform default (`pwsh`, `powershell`,
-/// `%COMSPEC%`, `cmd.exe`).
+/// Inside an aterm tab, reports [`aterm_types::domain::ENV_TAB_SHELL`]; outside,
+/// resolves `aterm.toml`'s top-level `shell` or the platform default (`pwsh`,
+/// `powershell`, `%COMSPEC%`, `cmd.exe`) via [`aterm_pty::select_shell_with_origin`].
 pub(crate) struct WindowShell {
     /// The program `CreateProcessW` is handed: an absolute path when the name
     /// resolved (or was given as one), the bare name verbatim when it did not —

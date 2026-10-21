@@ -11,6 +11,8 @@
 //!   grant (bounded UTF-8 read, symlink refusal), the atomic save (same-directory
 //!   temporary, file sync, rename, directory sync) and the advisory-lock door
 //!   every `flock` contender goes through.
+//! - [`save_words`] says why a save did not land, in a person's words: the
+//!   one set both faces (and aterm's own saves of aterm.toml) say.
 //!
 //! aterm-gui re-exports both under their old names (`native_document_io`,
 //! `native_document_host`). Its crash journal (`native_document_journal`) stays
@@ -72,6 +74,7 @@ macro_rules! verify_island {
 
 pub mod host;
 pub mod io;
+pub mod save_words;
 
 /// A document store whose write capability a test mints: a test process that
 /// handles no untrusted input is its own trusted launcher.

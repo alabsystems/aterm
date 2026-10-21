@@ -49,12 +49,11 @@ fn bulk_path_matches_continuation_path_for_sampled_codepoints() {
     ];
     let s: String = cps.iter().filter_map(|&c| char::from_u32(c)).collect();
     let expected: Vec<char> = s.chars().collect();
-    // Both paths must agree with each other AND with std's char iteration.
     assert_eq!(print_whole(s.as_bytes()), expected);
     assert_eq!(print_byte_by_byte(s.as_bytes()), expected);
 }
 
-/// Deterministic LCG (same constants as the engine fuzz) so failures reproduce.
+/// Deterministic LCG, so failures reproduce.
 fn next(state: &mut u64) -> u32 {
     *state = state
         .wrapping_mul(6_364_136_223_846_793_005)
@@ -66,14 +65,13 @@ fn next(state: &mut u64) -> u32 {
 fn fuzz_random_valid_utf8_has_exact_parity() {
     let mut state = 0xC0FFEE_1234_5678u64;
     for _ in 0..3_000 {
-        // Build a random string of valid scalar values (char::from_u32 excludes
-        // surrogates + out-of-range), avoiding ESC/CSI so we stay on the print path.
+        // Random scalar values (`from_u32` refuses surrogates).
         let n = (next(&mut state) % 40) as usize;
         let mut s = String::new();
         while s.chars().count() < n {
             let cp = next(&mut state) % 0x11_0000;
             if let Some(c) = char::from_u32(cp) {
-                // Skip C0/C1 controls + ESC so the bytes stay in the printable path.
+                // Printable only: no C0 or C1 controls, no DEL.
                 if c >= ' ' && c != '\x7f' && !('\u{80}'..='\u{9f}').contains(&c) {
                     s.push(c);
                 }
@@ -112,28 +110,23 @@ fn incomplete_trailing_lead_after_complete_char_matches_bytewise() {
             "whole vs byte-by-byte diverged on {bytes:02x?}"
         );
     }
-    // Pin the canonical case exactly: the complete prefix prints, the incomplete
-    // trailing lead prints NOTHING (it is buffered), so only 中 appears.
+    // Only 中 prints; the trailing lead is buffered.
     assert_eq!(print_whole(&[0xE4, 0xB8, 0xAD, 0xE4]), vec!['中']);
-    // A NON-continuation byte after a mid-run lead: exactly ONE U+FFFD (for the
-    // invalid lead) then the ASCII — never two replacements.
+    // A non-continuation after it: one U+FFFD, then the ASCII.
     assert_eq!(
         print_whole(&[0xE4, 0xB8, 0xAD, 0xE4, 0x41]),
         vec!['中', char::REPLACEMENT_CHARACTER, 'A']
     );
 }
 
-/// Ill-formed UTF-8 is replaced with one U+FFFD per MAXIMAL SUBPART (Unicode
-/// §3.9, "U+FFFD Substitution of Maximal Subparts", which the WHATWG Encoding
-/// Standard's UTF-8 decoder mandates and `String::from_utf8_lossy` implements):
-/// a byte that can begin no well-formed sequence (`C0`, `C1`, `F5..=FF`, a stray
-/// continuation) is one subpart on its own, and a second byte outside its lead's
-/// range (`E0` takes `A0..=BF`, `ED` `80..=9F`, `F0` `90..=BF`, `F4` `80..=8F`)
-/// ends the subpart before it. Taking any `80..=BF` as a continuation would
-/// draw `E0 80 80` as one cell where every other decoder draws three.
-///
-/// The oracle is `from_utf8_lossy` over every printable-or-high byte string,
-/// fed whole and one byte at a time (a trailing `Z` flushes a pending lead).
+/// Ill-formed UTF-8 is replaced with one U+FFFD per maximal subpart (Unicode
+/// §3.9; WHATWG's decoder; `String::from_utf8_lossy`): a byte that begins no
+/// well-formed sequence (`C0`, `C1`, `F5..=FF`, a stray continuation) is a
+/// subpart alone, and a second byte outside its lead's range (`E0` takes
+/// `A0..=BF`, `ED` `80..=9F`, `F0` `90..=BF`, `F4` `80..=8F`) ends the subpart
+/// before it, so `E0 80 80` is three cells, as in every other decoder. The
+/// oracle is `from_utf8_lossy`, fed whole and one byte at a time (a trailing
+/// `Z` flushes a pending lead).
 #[test]
 fn ill_formed_utf8_is_replaced_per_maximal_subpart() {
     let cases: [&[u8]; 10] = [

@@ -7,8 +7,7 @@ fn ro(cmd: &str) -> bool {
     classify_command(cmd).read_only
 }
 
-/// The corpus from the session that shaped the rules: each line was a real
-/// worker prompt, each verdict the one the manager gave.
+/// Real worker command lines, each with the verdict a person gave it.
 #[test]
 fn the_session_corpus_classifies_as_the_manager_did() {
     let corpus: &[(&str, bool)] = &[
@@ -99,8 +98,7 @@ fn quotes_hide_redirect_glyphs_but_not_substitutions() {
     assert!(ro("echo \"git push later\""));
 }
 
-/// (a): the alarm wrapper is stripped, with either quote; any other `perl -e`
-/// is inline code and refused.
+/// The alarm wrapper is stripped, with either quote; any other `perl -e` is inline code.
 #[test]
 fn the_alarm_idiom_is_a_wrapper_not_a_program() {
     assert!(ro("perl -e \"alarm 30; exec @ARGV\" ls -la"));
@@ -110,8 +108,7 @@ fn the_alarm_idiom_is_a_wrapper_not_a_program() {
     assert_eq!(classify_command("perl -e 'print 1'").reason, "perl -e");
 }
 
-/// (c): danger tokens anywhere, including behind a path and behind a shell
-/// keyword, and the inline-code interpreters.
+/// Danger tokens anywhere, behind a path or a shell keyword, and the inline-code interpreters.
 #[test]
 fn danger_tokens_anywhere_fail_the_line() {
     assert!(!ro("ls | xargs /bin/rm"));
@@ -139,9 +136,8 @@ fn danger_tokens_anywhere_fail_the_line() {
     assert!(!ro("sed --in-place 's/a/b/' f"));
 }
 
-/// (d): an unknown head is not read-only even with no danger token;
-/// keyword laundering (`do <cmd>`) is seen through; git needs a read
-/// subcommand; read subcommands' write forms are refused.
+/// An unknown head is not read-only even with no danger token; keyword laundering (`do
+/// <cmd>`) is seen through; git needs a read subcommand; read subcommands' write forms fail.
 #[test]
 fn segment_heads_must_be_known_reads() {
     assert!(!ro("./deploy.sh"));
@@ -187,8 +183,8 @@ fn segment_heads_must_be_known_reads() {
     assert_eq!(classify_command("   ").reason, "empty command");
 }
 
-/// Write forms an adversarial pass found classified read-only, each refused
-/// with its deciding rule, and the neighbours that must stay reads.
+/// A wrapper's command is the head: each write behind one is refused with its deciding rule,
+/// and the neighbours stay reads.
 #[test]
 fn a_wrapper_cannot_launder_the_program_it_runs() {
     assert_eq!(classify_command("ls | xargs touch").reason, "touch");
@@ -302,10 +298,9 @@ fn git_branch_creation_and_remote_set_branches_are_writes() {
     assert!(ro("git remote get-url origin"));
 }
 
-/// Shell arithmetic expands an array subscript held in a variable's value
-/// and runs its substitution from behind an opaque quote. Every form
-/// evaluating arithmetic on a non-literal is refused; literal forms stay
-/// reads (negative controls).
+/// Shell arithmetic expands an array subscript held in a variable's value and runs its
+/// substitution from behind an opaque quote: arithmetic on a non-literal is refused, literal
+/// forms stay reads.
 #[test]
 fn arithmetic_that_can_expand_a_subscript_is_not_a_read() {
     for line in [
@@ -550,8 +545,7 @@ fn program_words_resolve_quotes_and_split_where_the_segments_do() {
     );
 }
 
-/// Lines that must not classify read-only, each a write or a program of
-/// the line's choosing. `⏎` is a newline here.
+/// Lines that must not classify read-only, each a write or a program of the line's choosing.
 #[test]
 fn the_measured_bypasses_are_not_read_only() {
     let bypasses = [
@@ -718,8 +712,8 @@ fn the_added_reads_are_reads_and_their_neighbours_are_not() {
     assert!(!ro("for d in *; do n=$(rm $d); done"));
 }
 
-/// `aterm ctl` is read-only by verb AND form: `meta` reads and `meta set`
-/// writes the owner's badge; `inbox` reads and `inbox seen` writes.
+/// `aterm ctl` is read-only by verb and form: `meta` reads and `meta set` writes the owner's
+/// badge; `inbox` reads and `inbox seen` writes.
 #[test]
 fn aterm_forms_are_judged_by_their_full_subform() {
     for read in [
@@ -916,10 +910,8 @@ fn split_segments_sees_every_separator() {
     );
 }
 
-/// A command substitution is a word of the command around it and its body a
-/// command line of its own; a command whose name is unreadable cannot be
-/// cleared (`R=rm; $R -rf /usr`). [`MEASURED_SUBSTITUTION_BYPASSES`] holds
-/// lines a splitter cutting at each `$(` and backtick called read-only.
+/// A command substitution is a word of the command around it and its body a command line of
+/// its own; a command whose name is unreadable cannot be cleared (`R=rm; $R -rf /usr`).
 #[test]
 fn a_substitution_is_a_word_of_the_command_around_it() {
     for (cmd, reason) in MEASURED_SUBSTITUTION_BYPASSES {
@@ -1109,10 +1101,8 @@ fn a_redirect_or_a_dash_before_the_name_does_not_hide_it() {
     }
 }
 
-/// An awk program or sed script supplied by a parameter is refused like one
-/// supplied by a substitution ([`program_words`] marks every expansion).
-/// Negative controls: single-quoted `$1`/`$x` are awk's and sed's own
-/// language and stay reads.
+/// An awk program or sed script supplied by a parameter is refused like one supplied by a
+/// substitution ([`program_words`] marks every expansion).
 #[test]
 fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
     for (cmd, reason) in [
@@ -1146,9 +1136,8 @@ fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
         assert_eq!(v.reason, reason, "{cmd:?}");
     }
-    // Negative controls: single-quoted `$1`/`$x` are awk's or sed's own
-    // language, and a double-quoted awk program with no expansion stays a
-    // read.
+    // Negative controls: single-quoted `$1`/`$x` are awk's or sed's own language, and a
+    // double-quoted awk program with no expansion stays a read.
     for cmd in [
         "awk '{print $1}' f",
         "awk -F: '$3 > 100 {print $1}' /etc/passwd",
@@ -1737,10 +1726,9 @@ fn a_redirect_on_a_left_out_segment_is_judged() {
     }
 }
 
-/// zsh's `printf` decodes Unicode escapes in its format first, so `%d`
-/// is `%d` and runs a subscript; [`numeric_format`] (shared with the rm
-/// rule) must see it. Negative controls: octal and `x` escapes of `%`, and
-/// plain formats.
+/// zsh's `printf` decodes Unicode escapes in its format first, so `\u0025d` is `%d` and runs a
+/// subscript; [`numeric_format`] (shared with the rm rule) must see it. Negative controls:
+/// octal and `x` escapes of `%`, and plain formats.
 #[test]
 fn a_unicode_escape_in_a_printf_format_may_be_a_conversion() {
     for format in [
@@ -1865,10 +1853,9 @@ fn a_bash_indirection_is_not_literal() {
     }
 }
 
-/// zsh runs a command written after a closing `}` or `]]` in the same list
-/// (`{ ls } always { ./p/x }`, `if [[ -n a ]] ./p/x`), which the reader took
-/// as an argument. Negative controls: a closing word ending its segment,
-/// nested closings, a quoted `}`.
+/// zsh runs a command written after a closing `}` or `]]` in the same list (`{ ls } always {
+/// ./p/x }`, `if [[ -n a ]] ./p/x`), which a word reader would take as an argument. Negative
+/// controls: a closing word ending its segment, nested closings, a quoted `}`.
 #[test]
 fn a_word_after_a_closing_brace_is_a_command() {
     for cmd in [
@@ -1998,12 +1985,9 @@ fn a_brace_glued_to_a_word_closes_the_group() {
     }
 }
 
-/// THE PLAIN GRAMMAR: the reads a worker writes
-/// every hour are plain, and every form the zsh sweeps found — each one a
-/// command zsh ran while a check called the line a read — is not, by the
-/// character that opens it rather than by a rule of its own. So is any
-/// expansion at all, which is the point: a form nobody has measured
-/// needs one of these characters too.
+/// The reads a worker writes are plain; every form known to run a command under zsh is not, by
+/// the character that opens it rather than by a rule of its own, and neither is any expansion,
+/// so a form nobody has measured needs one of these characters too.
 #[test]
 fn a_plain_line_expands_nothing() {
     for line in [
@@ -2026,8 +2010,8 @@ fn a_plain_line_expands_nothing() {
         assert_eq!(plain_zsh_line(line), Ok(()), "{line:?}");
     }
     for line in [
-        // The sweeps' forms (audit §5): tied arrays, arithmetic,
-        // modifiers, process substitution, glob qualifiers, `=cmd`.
+        // Forms that run a command under zsh: tied arrays, arithmetic, modifiers, process
+        // substitution, glob qualifiers, `=cmd`.
         "path=/x ls",
         "path=/x; ls",
         "for path in /x; do ls; done",

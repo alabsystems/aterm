@@ -2,15 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Drop the part of an OSC title that names the machine the user is already on.
+//! Drop the parts of an OSC title that name only what the user already knows.
 //!
-//! ## The defect this exists to prevent
+//! The default prompt on Debian, Ubuntu, Fedora and macOS titles the terminal with a
+//! spelling of `user@host: cwd` (bash's `\u@\h: \w`), so every local tab opens with the
+//! same twenty-odd characters and [`crate::tab_bar`]'s distinctness pass has nothing to
+//! tell apart. `user@host:` is removed only when `host` names this machine; an ssh
+//! session into `prod-db-01` keeps saying so.
 //!
-//! The default prompt on Debian, Ubuntu, Fedora and macOS sets the terminal title
-//! to some spelling of `user@host: cwd` — bash's stock `PROMPT_COMMAND` writes
-//! `\u@\h: \w` and the others differ only in punctuation. Every tab of a local
-//! session therefore opens with the SAME twenty-odd characters, and they are the
-//! characters a tab has least room for.
+//! On Windows, ConPTY reports a fresh console's title as the full path of its program
+//! (`C:\Program Files\…\pwsh.exe`), and a shell that sets no title (stock `cmd.exe`,
+//! `pwsh` without a prompt hook) keeps it for life. That path is dropped too
+//! ([`without_console_program_path`]) and the cwd rung labels the tab; the running
+//! command `cmd.exe` appends (`C:\…\cmd.exe - ping x`) is kept.
 //!
 //! Measured on this machine at 0.61.0: two tabs in `~/aterm` both labelled
 //! `user@host: ~/aterm · Ready`. Byte-identical, so [`crate::tab_bar`]'s
@@ -105,10 +109,9 @@ fn resolve_hostname() -> Option<String> {
 
 /// The title with a `user@host:` prefix naming this machine removed.
 ///
-/// Returns the input unchanged when the title is not of that shape, or names a
-/// different host. An `""` result means the title said nothing BUT the local
-/// identity, which is the caller's signal to fall through to its next rung (the
-/// working directory) — see [`crate::app_tabs::resolved_terminal_title_rung`].
+/// Returns the input unchanged when the title is not of that shape or names a different
+/// host. `""` means the title said nothing but the local identity: the caller falls
+/// through to the working directory ([`crate::app_tabs::resolved_terminal_title_rung`]).
 #[must_use]
 pub(crate) fn without_local_identity(title: &str) -> &str {
     let names = local_host_names();
@@ -510,18 +513,14 @@ fn msys_title_path(title: &str) -> Option<&str> {
         .filter(|rest| rest.starts_with('/'))
 }
 
-/// The title with a bare Windows executable path removed — ConPTY's title for
-/// a console whose program set none (see the module docs for the measurement).
+/// The title with a bare Windows executable path removed: ConPTY's title for a
+/// console whose program set none.
 ///
-/// The shape is an ABSOLUTE Windows path (`X:\…` or a UNC `\\…`) whose first
-/// `.exe` (ASCII case-insensitive) either ends the title, which yields `""`
-/// (the caller's fall-through to the cwd rung), or is followed by `cmd.exe`'s
-/// ` - <command>` convention, which yields the command alone. Any other title
-/// is returned unchanged: a relative or POSIX path, an `.exe` mid-path
-/// (`C:\apps\foo.exe.bak\bar.txt`), or prose that merely contains one. The
-/// shape cannot occur on Unix, so that platform's labels are untouched.
-///
-/// No allocation: the per-frame refill calls this on every terminal tab.
+/// The shape is an absolute Windows path (`X:\…` or a UNC `\\…`) whose first `.exe`
+/// (ASCII case-insensitive) either ends the title, yielding `""` (the fall-through to
+/// the cwd rung), or is followed by `cmd.exe`'s ` - <command>`, yielding the command.
+/// Any other title is returned unchanged. No allocation: the per-frame refill calls
+/// this on every terminal tab.
 #[must_use]
 pub(crate) fn without_console_program_path(title: &str) -> &str {
     let trimmed = title.trim();
@@ -555,17 +554,13 @@ pub(crate) fn without_console_program_path(title: &str) -> &str {
     title
 }
 
-/// [`without_local_identity`] with this machine's names handed in.
-///
-/// The decision is the whole subject and it turns on which host the title names,
-/// so a test drives it against hosts it chooses rather than against whatever
-/// machine happens to be running the suite.
+/// [`without_local_identity`] with this machine's names handed in, so a test chooses
+/// the hosts rather than inheriting the machine running the suite.
 #[must_use]
 fn without_identity_of<'a>(title: &'a str, local_full: &str, local_short: &str) -> &'a str {
     let trimmed = title.trim();
-    // `user@host: rest`, or `user@host` alone at the end of the title. Splitting
-    // on the FIRST colon is what keeps `make: *** No rule` out of this: its head
-    // (`make`) carries no `@`, so the shape check below rejects it outright.
+    // `user@host: rest`, or `user@host` alone. Splitting on the first colon keeps
+    // `make: *** No rule` out: its head carries no `@`.
     let (head, rest) = match trimmed.split_once(':') {
         Some((head, rest)) => (head, rest.trim_start()),
         None => (trimmed, ""),
@@ -947,10 +942,8 @@ mod tests {
         }
     }
 
-    /// Windows names this machine from the OS, with no `hostname.exe` child (the
-    /// window has no console, so that child was a console window on screen): a
-    /// one-label name, as `hostname` prints it, that a prompt naming this host
-    /// in any case matches.
+    /// Windows names this machine from the OS, with no `hostname.exe` child, in a form
+    /// that a prompt naming this host in any case matches.
     #[cfg(windows)]
     #[test]
     fn windows_names_this_machine_without_a_child() {

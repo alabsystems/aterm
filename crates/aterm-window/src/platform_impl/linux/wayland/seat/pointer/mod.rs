@@ -15,6 +15,11 @@
 //! cursor theme through libwayland-cursor on a cursor surface, as sctk's `ThemedPointer` did.
 //! The `wl_pointer` itself is `Seats`'; every request on it is made through
 //! `Seats::with_seat`, so none races its release.
+//!
+//! LOCAL PATCH (aterm), 2026-10-20 (docs/AUDIT-third-party-2026-10-15.md, L-HEADER-LW7): a
+//! pointer on one of a window's shadow-margin parts (`window::frame`) shows the resize cursor of
+//! the edge or corner it is near and a left press there resizes the window, as sctk-adwaita's
+//! frame did; the application hears none of it (the part is no surface of the window's).
 
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -32,7 +37,7 @@ use tracing::warn;
 
 use crate::dpi::{LogicalPosition, PhysicalPosition};
 use crate::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
-use crate::window::CursorIcon;
+use crate::window::{CursorIcon, ResizeDirection};
 
 use crate::platform_impl::wayland::state::{Connection, WinitState};
 use crate::platform_impl::wayland::types::cursor::{shape, theme_names};
@@ -67,7 +72,10 @@ impl WinitState {
             // ours: its own cursor surface, or one already gone).
             let mut window = match self.windows.get_mut().get_mut(&window_id) {
                 Some(window) => window.lock().unwrap(),
-                None => continue,
+                None => {
+                    self.frame_pointer_event(seat, &themed_pointer, window_id, event);
+                    continue;
+                },
             };
 
             let scale_factor = window.scale_factor();
@@ -168,6 +176,65 @@ impl WinitState {
     }
 }
 
+impl WinitState {
+    /// `event` of `seat`'s pointer on `surface`, which is no window: if it is a part of a
+    /// window's shadow margin, the resize cursor of the edge or corner the pointer is near, and
+    /// a left press there resizes the window by it.
+    fn frame_pointer_event(
+        &mut self,
+        seat: u32,
+        pointer: &Arc<WinitPointer>,
+        surface: WindowId,
+        event: &PointerEvent<Proxy>,
+    ) {
+        let owner = self.windows.get_mut().values().find_map(|window| {
+            let part = window.lock().unwrap().frame_part(surface)?;
+            Some((Arc::clone(window), part))
+        });
+        let Some((window, part)) = owner else {
+            return;
+        };
+        let window = window.lock().unwrap();
+        let (x, y) = event.position;
+        match event.kind {
+            PointerKind::Enter { .. } | PointerKind::Motion { .. } => {
+                let direction = window.frame_direction(part, x, y);
+                if pointer.set_frame_edge(direction) {
+                    let icon = direction.map_or(CursorIcon::Default, resize_icon);
+                    if !pointer.set_cursor(&self.seats_book, icon) {
+                        warn!("Failed to set cursor to {icon:?}");
+                    }
+                }
+            },
+            PointerKind::Leave { .. } => {
+                pointer.set_frame_edge(None);
+            },
+            PointerKind::Press { button, serial, .. }
+                if wayland_button_to_winit(button) == MouseButton::Left =>
+            {
+                if let Some(direction) = window.frame_direction(part, x, y) {
+                    window.resize_from_seat(seat, serial, direction);
+                }
+            },
+            _ => (),
+        }
+    }
+}
+
+/// The cursor that shows a resize by `direction`.
+fn resize_icon(direction: ResizeDirection) -> CursorIcon {
+    match direction {
+        ResizeDirection::North => CursorIcon::NResize,
+        ResizeDirection::NorthEast => CursorIcon::NeResize,
+        ResizeDirection::East => CursorIcon::EResize,
+        ResizeDirection::SouthEast => CursorIcon::SeResize,
+        ResizeDirection::South => CursorIcon::SResize,
+        ResizeDirection::SouthWest => CursorIcon::SwResize,
+        ResizeDirection::West => CursorIcon::WResize,
+        ResizeDirection::NorthWest => CursorIcon::NwResize,
+    }
+}
+
 /// What the pointer's frames keep between them.
 #[derive(Debug)]
 struct PointerFocus {
@@ -176,6 +243,10 @@ struct PointerFocus {
 
     /// Current axis phase.
     phase: TouchPhase,
+
+    /// The edge or corner a shadow-margin part under the pointer resizes by, as its cursor
+    /// shows it (`None`: on no part, or one that resizes nothing).
+    frame_edge: Option<ResizeDirection>,
 }
 
 /// A seat's pointer as winit keeps it: the window it is on, its scroll phase, and its cursor (a
@@ -238,7 +309,11 @@ impl WinitPointer {
             seat,
             shm,
             cursor_scale: AtomicI32::new(1),
-            focus: Mutex::new(PointerFocus { surface: None, phase: TouchPhase::Ended }),
+            focus: Mutex::new(PointerFocus {
+                surface: None,
+                phase: TouchPhase::Ended,
+                frame_edge: None,
+            }),
             themes: Mutex::new(Vec::new()),
             shape_device,
             surface,
@@ -271,6 +346,12 @@ impl WinitPointer {
 
     fn set_phase(&self, phase: TouchPhase) {
         self.focus.lock().unwrap_or_else(PoisonError::into_inner).phase = phase;
+    }
+
+    /// Note the edge a shadow-margin part under the pointer resizes by; true when it moved.
+    fn set_frame_edge(&self, edge: Option<ResizeDirection>) -> bool {
+        let mut focus = self.focus.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::replace(&mut focus.frame_edge, edge) != edge
     }
 
     /// The cursor surface's integer scale changed.
@@ -355,16 +436,6 @@ impl WinitPointer {
                 true
             })
             .unwrap_or(false)
-    }
-
-    /// Hide the cursor by providing empty surface for it.
-    pub(crate) fn hide_cursor(&self, seats: &Seats) {
-        seats.with_seat(self.seat, |seat| {
-            if let (Some(pointer), Some(serial)) = (seat.pointer, seat.pointer_enter_serial) {
-                // SAFETY: the seat's pointer, lent live.
-                unsafe { wl_pointer::set_cursor(pointer, serial, None, 0, 0) };
-            }
-        });
     }
 }
 

@@ -3,10 +3,9 @@
 
 [package]
 name = "atpkg"
-# Integration tests are declared at the end of this file, not discovered: the
-# files are modules of the one `atpkg_suite` binary, and the four that time or
-# race real children on a lock, open a pty or re-execute themselves are their
-# own targets. With autotests off a `tests/*.rs` file listed nowhere never
+# Integration tests are listed at the end of this file: most are modules of the one
+# `atpkg_suite` binary; the four that time or race real children on a lock, open a pty or
+# re-execute themselves are their own targets. A `tests/*.rs` file listed nowhere never
 # compiles.
 autotests = false
 version.workspace = true
@@ -21,8 +20,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "atpkg"
 path = "src/main.rs"
-# A shim over `atpkg::cli::main_entry` with no test of its own (its libtest
-# harness ran 0 tests); the integration tests still get the built binary.
+# A shim over `atpkg::cli::main_entry` with no tests; the integration tests still get the
+# built binary.
 test = false
 
 # abrew (docs/DESIGN-abrew-2026-10-19.md): same dev-only shim shape as
@@ -34,30 +33,21 @@ test = false
 
 [features]
 # Development seams in an optimized build (`aterm_types::dev_seam!`: ATPKG_REGISTRY,
-# ATPKG_STAGE_DISK_REVERIFY; `config::DEV_SEAMS`: `[packages]`
-# prefix/account and the owner/repo form of `[packages.links]`). Debug builds compile
-# them anyway; the release cutter never enables this — aterm-release's buildplan pins it.
-# `aterm-types/dev-seams` too: atpkg asks aterm-types' own seam readers — the log folder
-# (`dirs::logs_dir`) and, at a pass's `[machine]` edge, whether it runs under a private
-# state root (`dirs::runs_under_private_state_root`, ruling 409) — which expand there.
+# ATPKG_STAGE_DISK_REVERIFY; `config::DEV_SEAMS`: `[packages]` prefix/account and the
+# owner/repo form of `[packages.links]`). Debug builds have them anyway; aterm-release's
+# buildplan keeps a release build from enabling this. It forwards to aterm-types' own seam
+# readers (`dirs::logs_dir`, `dirs::runs_under_private_state_root`).
 dev-seams = ["aterm-update-core/dev-seams", "aterm-types/dev-seams"]
 
 [dependencies]
-# THE load-bearing crypto root, for both signatures atpkg checks: Ed25519 over every
-# signed index and manifest (the anchor, docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13), and
-# RSA-4096 PKCS#1 v1.5 over SHA-512 for a vendor's OpenPGP-signed digest document
-# (`openpgp`, docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md §1.2). ring is
-# already in the compiled tree TRANSITIVELY (via rustls), but promoting it to a HARD
-# DIRECT dependency is a deliberate supply-chain decision: it pins the verify
-# primitive to an explicit floor so a future rustls bump that switches its backend to
-# aws-lc-rs (dropping ring) cannot silently break the only crypto we depend on. The
-# matching `deny.toml` [bans] floor blocks drift BELOW this version; presence is
-# guaranteed structurally by this direct edge. `alloc` is the one feature atpkg's edge
-# enables, because ring gates all of RSA behind it (the shipped binary already compiles
-# it through rustls); `std` and the RNG fallback stay off — verification needs neither.
-# Also the BULK SHA-256 (`tree::BulkSha256`: the signed archive digest and the extract
-# fold over every installed byte), for its hardware SHA-256 — ~6x aterm-digest's scalar
-# transcription on 1 GiB. `ring::digest` needs no feature.
+# The crypto root for both signatures atpkg checks: Ed25519 over every signed index and
+# manifest (docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13), and RSA-4096 PKCS#1 v1.5 over SHA-512
+# for a vendor's OpenPGP-signed digest document (`openpgp`,
+# docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md §1.2). A direct edge, not only
+# rustls's transitive one, so a rustls switch to aws-lc-rs cannot drop it; `deny.toml`
+# floors its version. `alloc` because ring gates RSA behind it; `std` and the RNG fallback
+# stay off. Also `tree::BulkSha256`, the bulk-content SHA-256 (the signed archive digest and
+# every extracted file), for the CPU's SHA-256 instructions; `ring::digest` needs no feature.
 ring = { workspace = true, features = ["alloc"] }
 # Decode the base64 root + release Ed25519 public keys (32 raw bytes each).
 # Standard padded Base64 — first-party; its one dependency is astream-wire
@@ -69,8 +59,6 @@ aterm-codec = { workspace = true }
 # digest (never a security primitive). First-party; its one dependency is
 # astream-wire (dependency-free, vendor/astream), whose byte loop it runs.
 aterm-hash = { workspace = true }
-# getuid() for the 0600, owned-by-uid durable high-water floor file (mirrors
-# aterm-update-core's privatedir hardening). Already a workspace dependency.
 libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
@@ -78,8 +66,7 @@ aterm-durable = { workspace = true }
 # for the floor file's directory, so atpkg and the updater cannot drift on what
 # "private" means.
 aterm-types = { workspace = true }
-# The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin). Already in
-# the graph via aterm-types.
+# The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin).
 aterm-time = { workspace = true }
 # First-party bounded regex engine for abrew's `search /regex/` form. It
 # refuses constructs it cannot evaluate (look-around, backreferences,
@@ -96,55 +83,38 @@ aterm-toolchain = { workspace = true }
 # core in as the design's shared substrate (§13). Also supplies pick_slug/is_valid_slug
 # for resolve_account() (the configurable index account, R3/§5).
 aterm-update-core = { workspace = true }
-# Parse index.toml / pkg-*.toml — but ONLY after signature verification. The parsers
-# take `&sig::VerifiedBytes` (no public constructor), so an unverified-bytes parse does
-# not type-check; serde derives the schema structs and the real `aterm-toml` parser replaces
-# Phase 1's [keys] line-scanner, getting table-scoping + duplicate-key rejection for
-# free (docs/TOOLCHAIN-PACKAGE-MANAGER.md §4/§5). reject-newer via SUPPORTED_SCHEMA.
+# Parse index.toml / pkg-*.toml only after signature verification: the parsers take
+# `&sig::VerifiedBytes` (no public constructor), so parsing unverified bytes does not
+# type-check. aterm-toml rejects duplicate keys; `SUPPORTED_SCHEMA` rejects a newer schema
+# (docs/TOOLCHAIN-PACKAGE-MANAGER.md §4/§5).
 serde = { workspace = true, features = ["derive"] }
 aterm-toml = { workspace = true }
-# Parse the GitHub Releases API JSON when wiring the production network Fetcher (the
-# release listing + per-asset url/name). Scoped to the net adapter; the verify/parse
-# core never touches JSON. Already a workspace dependency (aterm-update uses it too).
-# First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
-# untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
-# behind it.
+# First-party JSON: the progress file, `lane`'s stdin, the doctor's read of Claude Code
+# settings and the vendor-direct resolver's manifests. The signature verify/parse core
+# never touches JSON.
 aterm-json = { workspace = true }
-# In-process SHA-256 for the apply-time `tree_root` re-verify (§4.2/§8): the fold over
-# the sorted (relpath, mode, sha) list, symlink targets and the lineage receipts. Each
-# file's CONTENT sha is `tree::BulkSha256` (ring, above), held to this crate's digests
-# by a differential test. NOT the signature root — that stays `ring` (§8);
-# content-integrity only.
+# In-process SHA-256 for the apply-time `tree_root` re-verify: the fold over the sorted
+# (relpath, mode, sha) list, symlink targets and lineage receipts. File content goes through
+# `tree::BulkSha256` (ring), which a differential test holds to this crate's digest.
+# Content integrity only, never a signature primitive.
 aterm-digest = { workspace = true }
-# The bundle extractor reads a `.tar.zst` and lays it down through the tar-slip-safe
-# `vet_entry` gate (§9/§15). Both halves are first-party: the zstd decoder is
-# `aterm_zstd::Decoder` (no dependencies; it replaced the zstd / zstd-safe / zstd-sys
-# family and libzstd's C at ZC.5, docs/AUDIT-third-party-2026-10-15.md), and the TAR
-# side is `src/tarread.rs`, a read-only USTAR/PAX/GNU parser, which retired the `tar`
-# crate the design flagged for supply-chain audit (§13/§15), along with the `xattr` and
-# `filetime` packages it dragged in for metadata restoration this extractor never
-# wanted. aterm-zstd also writes the test fixtures' frames (`frame::write_raw`, ZC.3).
-# aterm NEVER WRITES a tar archive, so nothing here needed a writer. Per-entry
-# extraction is still driven manually so EVERY entry is vetted before a byte is
-# written, modes are sanitized, and a single escape aborts the whole stage.
+# The bundle extractor reads a `.tar.zst`: the first-party `aterm_zstd::Decoder` decodes it
+# and `src/tarread.rs` (read-only USTAR/PAX/GNU) parses it. Extraction runs per entry so
+# every entry passes the tar-slip-safe `vet_entry` gate before a byte is written, modes are
+# sanitized, and one escape aborts the whole stage. aterm-zstd also writes the test
+# fixtures' frames (`frame::write_raw`).
 aterm-zstd = { workspace = true }
 # The window's Claude Code defaults (`aterm_primer::CLAUDE_DEFAULTS`) and the rules that
-# hold them back, which the doctor's (10h) rows report by — the table itself, never a
-# copy, so a row says only what a window start does. The top-effort key among them is
-# spelled once, from parts, in that crate (the publication baseline bans the word,
-# joined, in every exported file). aterm-primer is a std-only leaf with no dependencies
-# of its own: the edge brings nothing else in.
+# hold them back: the doctor reads the table itself, so a row says only what a window start
+# does. Use `CLAUDE_TOP_EFFORT_KEY`, never the key spelled out: the publication baseline
+# bans the joined word in exported files.
 aterm-primer = { workspace = true }
-# `aterm_uds::spawnfd::command`: the `Command` every child here is built with, so
-# none inherits a descriptor of this process above stdio (clippy.toml: one child
-# constructor), and on Windows a caller with no console (a pass the window starts,
-# a detached `pkg update`) gives it a WINDOWLESS console, where a bare console child
-# opened a visible one (measured 2026-09-30). A dependency-free leaf the one
-# binary links already.
+# `aterm_uds::spawnfd::command` builds every child here: none inherits a descriptor above
+# stdio, and on Windows a caller with no console gives the child a windowless console
+# instead of a visible one.
 aterm-uds = { workspace = true }
-# The Developer Tools list's detector (`consent::devtool_grant` over the system TCC.db's
-# row and tccd's answers), for the `devtools:` row both doctors print (`crate::devtools`).
-# A small first-party leaf (aterm-log, aterm-uds, libc) already in the one binary's graph.
+# The Developer Tools list's detector (`consent::devtool_grant`), for the `devtools:` row
+# both doctors print (`crate::devtools`).
 aterm-containment = { workspace = true }
 
 # Private per-operation download and extraction staging, removed on drop.
@@ -181,8 +151,7 @@ ring = { workspace = true, features = ["default"] }
 # it kept a copy of its own master. First-party, and in the one shipped binary that
 # links atpkg already; no cycle (aterm-pty's graph names no atpkg). Tests only.
 aterm-pty = { workspace = true }
-# The forge cell matrix, so a published triple with no compile cell fails a test.
-# std-only and never in atpkg's shipped graph.
+# The forge cell matrix: a published triple that no forge cell compiles fails a test.
 aterm-forge = { workspace = true }
 
 [lints]

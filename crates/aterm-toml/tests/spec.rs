@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TOML 1.0.0 conformance, checked both ways: what the spec says must parse,
-//! and — the half that matters for a config parser — what the spec says must
-//! be REJECTED.
+//! TOML 1.0.0 conformance both ways: what the spec says must parse, and what it says must
+//! be refused. A duplicate key or a reopened `[table]` makes the file an operator reads
+//! and the file the program obeys different documents.
 //!
 //! A parser that accepts a duplicate key, or lets a second `[table]` header
 //! silently reopen the first, makes the file an operator reads and the file the
@@ -92,11 +92,10 @@ const VALID: &[&str] = &[
     "[a.b.c]\n[ d.e.f ]\n[ g .  h  . i ]\n[ j . \"ʞ\" . 'l' ]\n",
     "[x.y.z.w]\n[x]\n",
     "[fruit]\napple.color = \"red\"\napple.taste.sweet = true\n",
-    // The spec's own worked example, INCLUDING the line it annotates "you can
-    // add sub-tables". A dotted key closes its table to REDEFINITION, not to
-    // extension, and the eight shapes below are the whole matrix of that rule:
-    // plain and array-of-tables headers, one and two dotted segments, at the
-    // root and under a `[table]` and under a `[[array]]`.
+    // The spec's own worked example, including the line it annotates "you can add
+    // sub-tables": a dotted key closes its table to redefinition, not extension. The
+    // eight shapes below are that rule's matrix: plain and array-of-tables headers, one
+    // and two dotted segments, at the root, under a `[table]` and under a `[[array]]`.
     "[fruit]\napple.color = \"red\"\napple.taste.sweet = true\n\n[fruit.apple.texture]\nsmooth = true\n",
     "a.b = 1\n[a.c]\n",
     "a.b = 1\n[[a.c]]\n",
@@ -116,19 +115,18 @@ const VALID: &[&str] = &[
     "\n\n\n",
     "key = \"value\" # comment with \"quotes\" and 'apostrophes' and # hashes\n",
     "key = 1\r\nother = 2\r\n",
-    // A `\r\n` INSIDE a multi-line string is normalized to `\n` in the VALUE,
-    // while the raw bytes still round-trip.
-    // toml-test has no case for this; a config saved by a Windows editor does.
+    // A `\r\n` inside a multi-line string is `\n` in the value; the raw bytes still
+    // round-trip. toml-test has no case for this.
     "x = \"\"\"a\r\nb\"\"\"\n",
     "x = '''a\r\nb'''\n",
-    // A leading UTF-8 BOM (`valid/utf8-bom-01`, `utf8-bom-02` in toml-test).
-    // PowerShell 5 writes one by default and aterm ships a Windows cell.
+    // A leading UTF-8 BOM (`valid/utf8-bom-01`, `utf8-bom-02` in toml-test), which
+    // PowerShell 5 writes by default.
     "\u{feff}x = 1\n",
     "\u{feff}[a]\nb = 1\n",
     "\u{feff}# just a comment\n",
 ];
 
-/// Both implementations must REFUSE these. Each line names the rule.
+/// These must be refused. Each line names the rule.
 const INVALID: &[(&str, &str)] = &[
     (
         "name = \"Tom\"\nname = \"Pradyun\"\n",
@@ -299,9 +297,7 @@ fn parse_errors_carry_a_span_inside_the_source() {
             span.start <= source.len() && span.end <= source.len() && span.start <= span.end,
             "{rule}: span {span:?} is outside {source:?}"
         );
-        // And it must land on CHARACTER boundaries: `Error::span()` is public
-        // API, `crates/aterm-gui` slices the source with ranges derived from
-        // it, and a range that splits a character panics when sliced.
+        // On character boundaries too: `crates/aterm-gui` slices the source with it.
         assert!(
             source.is_char_boundary(span.start) && source.is_char_boundary(span.end),
             "{rule}: span {span:?} splits a character in {source:?}"
@@ -309,8 +305,8 @@ fn parse_errors_carry_a_span_inside_the_source() {
     }
 }
 
-/// A super-table may be declared AFTER the header that implied it — the one
-/// redefinition the spec explicitly allows.
+/// A super-table may be declared after the header that implied it, the one redefinition
+/// the spec allows.
 #[test]
 fn an_implicit_super_table_may_be_declared_later() {
     let source = "[a.b]\nx = 1\n\n[a]\ny = 2\n";
@@ -389,9 +385,7 @@ fn overflowing_float_literals_are_refused_in_both_signs() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// How an error PRINTS, and where it points
-// ---------------------------------------------------------------------------
+// ---- how an error prints, and where it points ----------------------------
 
 /// The rendered diagnostic carries the source line, and the span underlines
 /// the offending value.
@@ -425,13 +419,10 @@ fn a_schema_error_renders_the_offending_line() {
     }
 }
 
-/// END OF INPUT IS ON THE LAST AUTHORED LINE, and its span is EMPTY.
-///
-/// Both halves are load-bearing:
-/// `native_config_language::parser_diagnostic_range` turns an empty span at or
-/// past the end of input into a caret on the last authored byte, so a caret the
-/// operator can see. A span covering the whole unterminated construct is not
-/// empty, misses that path, and underlines the opening bracket instead.
+/// End of input is on the last authored line, with an empty span:
+/// `native_config_language::parser_diagnostic_range` turns that into a visible caret on the
+/// last authored byte, where a span over the whole construct would underline its opening
+/// bracket.
 #[test]
 fn end_of_input_errors_point_at_the_last_authored_line() {
     for (source, position) in [
@@ -459,8 +450,8 @@ fn end_of_input_errors_point_at_the_last_authored_line() {
     }
 }
 
-/// Our spans underline the offending TOKEN (`int = 010` is `6..9`, the
-/// literal). Every span is in range and lands on a character boundary.
+/// Spans underline the offending token (`int = 010` is `6..9`, the literal); every span is
+/// in range and on character boundaries.
 #[test]
 fn token_spans_underline_the_token() {
     for (source, why) in INVALID {

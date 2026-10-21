@@ -27,6 +27,7 @@ fn every_fact() -> BoxFacts {
         trusted_cwd: Some(PathBuf::from("/Users//owner/src/app")),
         bypass: true,
         limit_reset_passed: true,
+        limit_retry: true,
         worker: Some(Ok(WorkerEnv::from_env(vec![
             "ANTHROPIC_API_KEY=sk-planted-secret".to_string(),
             "PATH=/usr/bin".to_string(),

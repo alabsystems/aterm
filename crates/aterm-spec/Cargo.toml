@@ -8,9 +8,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "TLA+ specification coverage tracking for aterm verification"
-# The integration tests compile as ONE suite (tests/spec_suite.rs), not one
-# binary per file. With auto-discovery off, a tests/*.rs that is neither a
-# [[test]] below nor a `mod` of the suite compiles into nothing.
+# The integration tests compile as one suite (tests/spec_suite.rs): a tests/*.rs that is
+# neither a [[test]] below nor a `mod` of the suite compiles into nothing.
 autotests = false
 
 [dependencies]
@@ -27,9 +26,8 @@ aterm-spec-anchor = { workspace = true }
 # the `ty capabilities --json` probe) is one JSON object per line; first-party,
 # serde its only dependency (docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md §9.10).
 aterm-json.workspace = true
-# The pooled `ty --cases` co-process outlives the call that starts it, so it is
-# built by aterm-uds's `spawnfd::command` (stdio and nothing else inherited),
-# never a plain `std::process::Command` (clippy.toml: one child constructor).
+# The pooled `ty --cases` co-process outlives its caller, so `spawnfd::command` spawns it with
+# stdio and nothing else inherited.
 aterm-uds.workspace = true
 
 # The account's home for tool discovery (`verify::account_home`): one

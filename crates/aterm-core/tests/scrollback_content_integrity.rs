@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! End-to-end scrollback content integrity under load: emit many lines,
-//! scroll them into history (hot ring, then the lz4 cold tier), read them back
-//! by index and assert the exact text survived.
+//! Scrollback content integrity: emit many lines, scroll them into history, read them back
+//! by index and across resizes, and assert the exact text survived.
 
 use aterm_core::terminal::Terminal;
 
-/// Reconstruct the logical (pre-wrap) scrollback lines by joining soft-wrapped
-/// continuation rows. A history row is a continuation of the previous logical
-/// line when its `wrapped` flag is set, mirroring how a terminal stores reflow.
+/// The logical (pre-wrap) history lines: a row whose `wrapped` flag is set continues the
+/// previous one.
 fn logical_history_lines(term: &Terminal) -> Vec<String> {
     let grid = term.grid();
     let h = grid.scrollback_lines();
@@ -80,9 +78,7 @@ fn resize_preserves_scrollback_logical_lines_both_directions() {
 
 #[test]
 fn resize_preserves_scrollback_with_tiered_storage() {
-    // Same invariant with an explicit tiered scrollback (the builder path used
-    // by hosts that want unlimited history), exercising the lazy-buffer restore
-    // path rather than the ring-only path.
+    // Same invariant with a tiered store attached, as hosts build one.
     use aterm_core::scrollback::Scrollback;
     let sb = Scrollback::new(1000, 10_000, 100_000_000);
     let mut term = Terminal::with_scrollback(30, 120, 1000, sb);
@@ -122,9 +118,8 @@ fn resize_preserves_scrollback_with_tiered_storage() {
 
 #[test]
 fn scrollback_preserves_line_content_in_order() {
-    // Distinctly-numbered lines so each is self-identifying. The default
-    // scrollback limit is 100k, so all 5000 are retained (no eviction) and
-    // history index 0 == oldest == the first emitted line, contiguous upward.
+    // Self-identifying lines. `Terminal::new`'s 10,000-line ring retains all 5000, so
+    // history index 0 is the first line emitted.
     let mut term = Terminal::new(24, 80);
     const N: usize = 5000;
     let mut input = Vec::with_capacity(N * 8);
@@ -137,8 +132,7 @@ fn scrollback_preserves_line_content_in_order() {
     // Nearly all of them scrolled off the 24-row screen into history.
     assert!(h >= N - 40, "expected ~{} history lines, got {h}", N - 24);
 
-    // Read a spread of indices — including the oldest (0, likely cold-tiered)
-    // and the newest history line (h-1) — and assert the exact content.
+    // A spread of indices, the oldest (0) and the newest (h-1) included.
     for k in [0usize, 1, 100, 2500, h - 1] {
         let line = term
             .grid()

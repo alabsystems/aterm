@@ -1,62 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SUPERVISED CONTROL LISTENER — the accept loop that notices when it has
-//! stopped accepting, and repairs itself.
+//! Supervised control-socket listener with watchdog rebind.
 //!
-//! **The incident (2026-09-25, the owner's live v0.93.0 window).** The control
-//! listener thread sat in `accept(2)` while its listening socket held thirteen
-//! completed, never-accepted connections (`lsof -Tfqs`: `QLEN=13`). Every new
-//! client connected into that dead queue and waited out `aterm ctl`'s 900 s
-//! exchange deadline; the window itself kept working, so nothing looked wrong
-//! but the one surface agents drive it through. The accept loop was a single
-//! blocking `for stream in listener.incoming()` with `Err(_) => continue`:
-//! nothing could notice that it had stopped, and nothing could repair it.
-//!
-//! **What replaces it.** Two threads, so that the one that judges can never be
-//! caught in the state it judges.
-//!
-//! * The ACCEPT THREAD never parks inside a blocking `accept`. The listener is
-//!   non-blocking; the thread `poll`s it for readability with a [`TICK`]-long
-//!   timeout, then drains `accept` until `EWOULDBLOCK`, so a lost wakeup costs
-//!   at most one tick. Each turn it reads the socket's OWN completed-connection
-//!   queue length ([`queue_pending`]: `soi_qlen` from
-//!   `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` on macOS — the very number `lsof`
-//!   printed — and the listening socket's read readiness elsewhere) and
-//!   publishes a BEAT: progress, accepts, the queue reading.
-//! * The WATCHDOG (the thread that started the listener) reads only that beat,
-//!   once a tick, and makes no call on the socket at all. `O_NONBLOCK` does not
-//!   guarantee `accept` returns — XNU skips the wait only when the completed
-//!   queue is EMPTY — so the incident's state (a thread inside `accept`, a
-//!   non-empty queue) is one a non-blocking accept loop can still enter. The
-//!   watchdog judges it WEDGED when the beat stops moving for [`WEDGE_AFTER`]
-//!   (the thread is stuck inside a call), or when the queue stays non-empty
-//!   that long while nothing is accepted from it. It logs one warning with the
-//!   numbers and REBINDS — a fresh socket bound at a temporary name in the
-//!   same directory, locked to `0600`, renamed over the published path (so the
-//!   path never stops naming a live listener), served by a NEW accept thread.
-//!   The old thread and its socket are retired: if its call ever returns, it
-//!   serves what the old socket still yields and exits. The token file is
-//!   untouched, so every client simply reconnects with the same credential; a
-//!   client left in the old queue is told nothing by a stuck socket, and
-//!   `aterm ctl`'s connect deadline names that failure within seconds.
-//!
-//! The health of all of this is published on `metrics` ([`emit_metrics`]).
-//!
-//! **Retired before a cold `exec`** ([`Endpoint`], measured 2026-09-29). An
-//! `exec` from a multi-threaded process completes on macOS only once every
-//! other thread has been scheduled and terminated, and close-on-exec
-//! descriptors close only at its end. UTILITY and BACKGROUND threads — mostly
-//! libdispatch workqueue threads — must each get CPU to die, and a saturated
-//! machine starves them for seconds (up to 2.36 s measured at load 78–176,
-//! 11.6 s under a build; unbounded). Throughout, the listening socket and
-//! every connection it accepted stayed open with no thread left to serve them:
-//! a client connected into a queue nothing would accept and waited out `aterm
-//! ctl`'s 10 s connect probe, and a client holding a connection waited for an
-//! answer that could not come. The cold update lane now retires the endpoint
-//! right before the `exec` — a fresh connect is refused and a held connection
-//! reads EOF at once — and reopens it at the same path, with the same token,
-//! if the `exec` returns.
+//! - **Accept thread**: polls the non-blocking listener with [`TICK`] timeout,
+//!   drains `accept` until `EWOULDBLOCK`, reads the kernel completed-connection
+//!   queue length ([`queue_pending`]), and publishes a [`Beat`].
+//! - **Watchdog**: monitors the [`Beat`] without touching the socket. If progress
+//!   freezes or the queue stays non-empty with zero accepts for [`WEDGE_AFTER`],
+//!   it binds a replacement socket at a temp path (`0600`), renames it over the
+//!   published path, and starts a new accept thread.
+//! - **Endpoint retirement** ([`Endpoint`]): before a cold `exec`, closes the
+//!   listening socket and shuts down accepted connections so clients immediately
+//!   observe connection refusal or EOF while worker threads terminate; reopens
+//!   at the same path and token if `exec` returns.
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, RawFd};
@@ -137,12 +94,7 @@ pub(crate) fn note_busy_reply() {
     HEALTH.busy_replies.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The listener fields of the `metrics` summary. `control_last_accept_age_ms`
-/// is `-` (JSON `null`) until the supervisor has started. (Read over the
-/// socket, the age is the reading connection's own accept; the fields that
-/// tell a wedge are `rebinds`, `rebind_failures` and `queue_pending`, which a
-/// caller that reached the instance some other way — the file log, a later
-/// healthy read — can trust.)
+/// Emit listener health metrics (`control_last_accept_age_ms` is `-`/`null` before start).
 pub(crate) fn emit_metrics(
     ctx: &crate::metrics::wire::ReadCtx,
     s: &mut dyn crate::metrics::wire::FieldSink,
@@ -248,9 +200,7 @@ enum Wedge {
 #[cfg(unix)]
 const STUCK_TICKS: u32 = 3;
 
-/// THE WATCHDOG'S JUDGEMENT, pure: fed one [`Reading`] per tick, it says when
-/// the listening socket is wedged. Kept apart from every socket call so it can
-/// never be caught in the state it judges.
+/// Pure watchdog state machine: fed one [`Reading`] per tick, detects wedged listeners.
 #[cfg(unix)]
 struct Watch {
     last: Reading,
@@ -347,10 +297,8 @@ type Serve = Arc<dyn Fn(CtlStream) + Send + Sync>;
 #[cfg(unix)]
 type Rebind = Box<dyn FnMut() -> Option<CtlListener> + Send>;
 
-/// THE CONTROL ENDPOINT'S RETIRE HANDLE: what the cold update lane closes right
-/// before its `exec`, and opens again if the `exec` returns (module doc). The
-/// App keeps one beside `sock_bound`; the supervisor serving the socket holds
-/// the other end. One that no supervisor ever served retires nothing.
+/// Handle used by the cold update lane to retire the control listener before `exec`
+/// and reopen it if `exec` returns.
 #[derive(Clone, Default)]
 pub(crate) struct Endpoint {
     #[cfg(unix)]
@@ -568,22 +516,10 @@ fn bound_name(listener: &CtlListener) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Close the listening socket `fd` names without freeing the descriptor
-/// number: /dev/null is duplicated over it. Its accept thread owns `fd` and
-/// closes it when that thread ends, so the number must stay allocated until
-/// then — after a plain `close` the process could reuse it under a thread that
-/// still polls it, and that thread's own close would then close the reuser's.
-/// The socket closes with its last descriptor: every connection still queued
-/// on it is reset, and a new connect is refused. The accept thread finds
-/// /dev/null under the number (`accept` fails ENOTSOCK) and ends. `dup2` does
-/// not wait for that thread. On macOS a `poll` holds no reference to the
-/// socket, so it closes at the `dup2`. Linux's `poll` holds a reference until
-/// it returns (up to a [`TICK`]), so the socket is shut down first. On Linux
-/// that refuses every new connect at once and wakes the `poll`. On macOS it
-/// fails with ENOTCONN and changes nothing (measured 2026-09-30), and the
-/// `dup2` does the work — unless a child another thread forked has not exec'd
-/// yet: it holds a copy of the descriptor, and the socket listens until that
-/// exec (26.6 drops `FD_CLOFORK`, so there is no opting out; measured).
+/// Close the listening socket at `fd` by `shutdown` + `dup2`ing `/dev/null` onto
+/// it with `FD_CLOEXEC`. Keeps the descriptor number allocated until the accept
+/// thread exits (avoiding fd reuse races) while immediately resetting queued
+/// peers and waking `poll` on Linux.
 #[cfg(unix)]
 fn close_listening(fd: RawFd) -> bool {
     let Ok(null) = std::fs::File::open("/dev/null") else {
@@ -617,21 +553,9 @@ fn close_listening(fd: RawFd) -> bool {
     true
 }
 
-/// Shut down, both ways, every connected socket in this process whose local
-/// address is one of `names`: the connections a listening socket bound at one
-/// of them accepted, wherever each is held — a request or wait lane, the
-/// parker, a subscription, a relay — so no path that holds one keeps any
-/// bookkeeping for this. A retired generation's listening socket carries one
-/// of the names too; Darwin refuses its shutdown (ENOTCONN) and it is not
-/// counted, while Linux shuts it (harmless: retiring closes every listener)
-/// and counts it.
-///
-/// Each half is shut on its own ([`aterm_uds::hangup::hang_up`]). A client
-/// that half-closed after its request (`printf … | nc -U`, parked in a verb)
-/// has shut its connection's read half here, and Darwin refuses a both-ways
-/// `shutdown` of it — ENOTCONN, as for a listening socket — and shuts NOTHING:
-/// such a client read its EOF only when the process was replaced, and was not
-/// counted.
+/// Shut down both halves ([`aterm_uds::hangup::hang_up`]) of every connected
+/// socket in this process whose local address matches `names`. Separate
+/// half-shutdowns ensure half-closed clients (`nc -U`) still receive EOF on Darwin.
 #[cfg(unix)]
 fn shutdown_accepted(names: &[PathBuf]) -> usize {
     if names.is_empty() {
@@ -649,14 +573,9 @@ fn shutdown_accepted(names: &[PathBuf]) -> usize {
         .count()
 }
 
-/// [`shutdown_accepted`] for one descriptor number, which another thread owns
-/// and may close — and the process reuse — at any moment. So the socket is
-/// read and shut down through a duplicate, which names the socket that was
-/// inspected whatever happens to the number. And only a SOCKET is ever
-/// duplicated: closing any descriptor of a file drops every POSIX record lock
-/// this process holds on it, so a duplicate that turns out to name something
-/// else (the number was reused between the two calls) is leaked rather than
-/// closed — close-on-exec, it goes with the `exec`.
+/// Inspect and shut down `fd` via a `F_DUPFD_CLOEXEC` duplicate so concurrent
+/// closes on other threads cannot race. Non-socket duplicates are leaked (with
+/// `CLOEXEC`) rather than closed so POSIX `fcntl` record locks are never dropped.
 #[cfg(unix)]
 fn shutdown_if_accepted_at(fd: RawFd, names: &[PathBuf]) -> bool {
     use std::os::fd::FromRawFd as _;
@@ -715,29 +634,18 @@ impl Pace {
     };
 }
 
-/// THE TEST SEAMS, shared with every generation's accept thread. Each holds a
-/// generation number (or `u64::MAX` for none) that the seam applies to.
+/// Test seams shared with accept threads, keyed by generation (`u64::MAX` = none).
 #[cfg(all(unix, test))]
 #[derive(Clone)]
 struct Seams {
     /// While it names a thread's generation, that thread's accept path consumes
     /// nothing but keeps turning — the queue stands still.
     withhold: Arc<AtomicU64>,
-    /// The generation that has SEEN `withhold` name it (`u64::MAX` for none).
-    /// Like `park`, `withhold` takes effect at a thread's next check, not when it
-    /// is stored: a thread already past the check, still draining the queue, can
-    /// serve a client that connects before this names it (measured 2026-09-29
-    /// under load: "the wedged socket served a peer it was withholding").
+    /// Generation that has observed `withhold` (`u64::MAX` for none).
     withholding: Arc<AtomicU64>,
-    /// While it names a thread's generation, that thread blocks INSIDE its
-    /// accept step and does not return — the incident's thread, parked in
-    /// `accept(2)` with connections queued.
+    /// Generation whose accept thread should park inside its accept step.
     park: Arc<AtomicU64>,
-    /// The generation now INSIDE its park (`u64::MAX` for none). `park` takes
-    /// effect at a thread's next park check, not when it is stored: a thread
-    /// already past that check drains the queue as usual, so a test that
-    /// connects before this names the thread can be served by it (measured
-    /// 2026-09-28 under load: "replaced after 90µs", the socket never rebound).
+    /// Generation currently parked inside its accept step (`u64::MAX` for none).
     parked: Arc<AtomicU64>,
     /// The watchdog's pace for this test ([`Pace::PRODUCTION`] unless the test
     /// shortens it).
@@ -766,15 +674,8 @@ impl Seams {
     }
 }
 
-/// The accept loop, supervised. The listening socket is served by an ACCEPT
-/// THREAD per generation, and judged by a WATCHDOG — the thread that calls
-/// [`Supervisor::run`] — which reads only the accept thread's published
-/// [`Beat`], never the socket. So the watchdog cannot be caught in the state it
-/// judges: an accept thread stuck inside `accept(2)` (or inside the queue
-/// reading, which takes the same socket lock) stops beating, and the watchdog
-/// rebinds a fresh socket over the path and starts a new accept thread on it.
-/// The stuck thread and its socket are abandoned (retired: if the call ever
-/// returns, the thread serves what its socket still yields and exits).
+/// Supervised accept loop pairing a per-generation accept thread with a socket-free
+/// watchdog that rebinds on wedge.
 #[cfg(unix)]
 pub(crate) struct Supervisor<R: FnMut() -> Option<CtlListener> + Send + 'static> {
     listener: CtlListener,
@@ -792,8 +693,6 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
     /// handle the cold update lane retires it by.
     pub(crate) fn new(listener: CtlListener, rebind: R, endpoint: Endpoint) -> Self {
         if let Err(error) = listener.set_nonblocking(true) {
-            // Still served: a blocking listener only loses the tick while idle,
-            // which is the loop this replaced.
             aterm_log::warn!("control listener could not be made non-blocking: {error}");
         }
         stamp_accept();
@@ -841,8 +740,7 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
                 seams.clone(),
             ) {
                 Ok(beat) => beat,
-                // No thread to supervise: serve here, unsupervised — exactly
-                // the loop this replaced, never nothing.
+                // Fallback to inline accept loop if thread spawn fails.
                 Err(accept) => return accept.run(),
             },
         };
@@ -1169,21 +1067,8 @@ fn drain(
     Some(accepted)
 }
 
-/// The listening socket's completed-connection queue length — the kernel's own
-/// count of connections waiting for `accept`.
-///
-/// macOS: `soi_qlen`, via `proc_pidfdinfo(getpid(), fd, PROC_PIDFDSOCKETINFO)`
-/// (the number `lsof -Tq` prints as `QLEN`). `libc` does not bind
-/// `struct socket_fdinfo`, so the reply is read from a buffer of the header's
-/// exact size at the header's offsets (`<sys/proc_info.h>`, measured with
-/// `offsetof` on Darwin 25.6: size 792, `psi.soi_family` 184, `psi.soi_options`
-/// 188, `psi.soi_qlen` 194), and refused unless it describes an `AF_UNIX`
-/// socket with `SO_ACCEPTCONN` set — so a layout that ever moved reads as "no
-/// reading", never as a wrong number. `queue_pending_reads_the_kernel_queue`
-/// pins it against a real queue.
-///
-/// Elsewhere: whether the listening socket is readable, which for a listener
-/// means exactly "the accept queue is not empty" (1 or 0).
+/// Read the listening socket's completed-connection queue length (`soi_qlen` via
+/// `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` on macOS; `poll` read-readiness 0/1 elsewhere).
 #[cfg(target_os = "macos")]
 pub(crate) fn queue_pending(listener: &CtlListener) -> Option<u32> {
     use std::os::fd::AsRawFd;
@@ -1384,15 +1269,7 @@ mod tests {
         (stop, seams, thread)
     }
 
-    /// Bound `stream`'s reads by `patience`. A supervisor that accepted,
-    /// answered and closed the connection before this runs — a client thread
-    /// descheduled after its `connect` on a loaded host — leaves a socket
-    /// Darwin refuses every option on (`EINVAL`, measured on macOS 26.6 once
-    /// the peer's last descriptor closed), though its answer is still queued
-    /// and no read on it can block any more. That is how the healthy `ask`
-    /// failed once at load ~100 ("healthy ask: EINVAL"). So, as `aterm ctl`
-    /// does (`open_accepted`), the read goes ahead unarmed. Only an OS error
-    /// counts: std refuses a zero timeout with no errno.
+    /// Set read timeout on `stream`, ignoring `EINVAL` when Darwin's peer already closed.
     fn arm(stream: &CtlStream, patience: Duration) -> std::io::Result<()> {
         match stream.set_read_timeout(Some(patience)) {
             Err(error)
@@ -1455,13 +1332,7 @@ mod tests {
         assert_eq!(mode, 0o600, "the rebound socket is owner-only");
     }
 
-    /// THE QUEUE STANDS STILL. The accept path stops consuming (the seam
-    /// withholds every accept on generation 0) while clients keep connecting
-    /// into the kernel queue. The watchdog must see the queue stand still,
-    /// rebind, and serve a NEW client on the fresh socket at the SAME path.
-    /// The healthy pre-wedge answer is the negative control: the same client
-    /// code is served before the wedge. At a test's pace (a 50 ms tick, a
-    /// 300 ms wedge).
+    /// Verify the watchdog rebinds and serves new clients when the accept queue stalls.
     #[test]
     fn a_stalled_listener_is_detected_and_rebound() {
         let dir = scratch();
@@ -1508,15 +1379,8 @@ mod tests {
         thread.join().expect("supervisor thread");
     }
 
-    /// THE INCIDENT'S THREAD: stuck INSIDE its accept step, never returning,
-    /// while connections queue. Nothing on the accept thread can notice this —
-    /// which is why the judge is a different thread that reads only the beat.
-    /// The watchdog must rebind and a NEW client must be served at the same
-    /// path while the old thread is still stuck. Released afterwards, the
-    /// retired thread serves what its old socket queued (and the client it
-    /// holds is not lost) and exits. At a test's pace (a 100 ms tick, a 1 s
-    /// wedge — long enough that a starved healthy thread is not judged stuck
-    /// before the park).
+    /// Verify the watchdog rebinds when the accept thread blocks inside its accept step,
+    /// and that the retired thread drains its old queue once unblocked.
     #[test]
     fn a_listener_stuck_inside_accept_is_detected_and_rebound() {
         let dir = scratch();
@@ -1635,17 +1499,7 @@ mod tests {
         ));
     }
 
-    /// A RETIRE REACHES A CLIENT THAT HALF-CLOSED after its request (`printf …
-    /// | nc -U`, parked in a verb) and counts it, beside one that did not. The
-    /// accepted ends stay held, as a lane holds them, so only the shutdown can
-    /// end either connection; the listener is gone first, as `retire` closes
-    /// it before this runs.
-    ///
-    /// NEGATIVE CONTROL (run by restoring the both-ways `shutdown`): Darwin
-    /// refused it for the half-closed connection, whose read half the client's
-    /// half-close had shut (ENOTCONN, as for a listening socket), and shut
-    /// nothing — that client read `WouldBlock`, not its end-of-file, and the
-    /// count was 1.
+    /// Verify `shutdown_accepted` delivers EOF to both full-duplex and half-closed clients.
     #[test]
     fn shutting_accepted_connections_down_reaches_a_client_that_half_closed() {
         let dir = scratch();

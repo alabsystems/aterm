@@ -63,7 +63,21 @@
 //! composer turns the footer into `  Press Ctrl-C again to quit`. `/usage`
 //! and `/status` draw a card (`┌ … ┘` in column 0) into the transcript under
 //! the turn's end; Esc does not close it, and the composer stays open under
-//! it.
+//! it. A `/status` card names the run's state at its head's right (`IDLE`
+//! before any turn, `RUNNING` while a turn runs, `COMPLETED` after a turn,
+//! `FAILED` after a wall, `CANCELLED` after a person's Esc; measured
+//! 2026-10-21); a `/usage` card names none, only the turns the session
+//! counts (`0` before any, and after a first turn a person stopped).
+//! Entered while a turn runs, the card goes ABOVE the turn's status row,
+//! which stays over the composer, and the turn's reply is drawn whole under
+//! the card once it ends. So a screen of cards alone above the open
+//! composer, the turn's end scrolled away under them, is a session at rest
+//! on the run the newest card names (`Turn::Carded`): idle as evidence, its
+//! last words out of sight — and, where that card says `IDLE`, a session
+//! with no turn yet, its banner scrolled away under them (`Turn::Fresh`).
+//! A local command's rows (`/rules` prints three, two in) are a block of
+//! their own under a blank row: no part of the notice above them
+//! ([`notice`]).
 //!
 //! **TYPING.** An Enter in the same burst as the text is taken as a NEWLINE
 //! (the draft grows a row); an Enter after a pause submits (measured on
@@ -629,6 +643,137 @@ fn is_card_row(row: &str) -> bool {
     row.starts_with('┌') || row.starts_with('│') || row.starts_with("└─")
 }
 
+/// The state of the session's run the NEWEST `/status` card among `rows`
+/// names at its head's right: `│  MUSE CODE 1.4.10 / sea-pasiphae  RUNNING │`
+/// (the session's name after the build once it has one). Measured on
+/// 1.4.10 (the lab, 2026-10-16 and 2026-10-21): `IDLE` before any turn
+/// ([`fixtures::FRESH_STATUS_CARDS`]), `COMPLETED` after a turn's end
+/// ([`fixtures::STATUS_CARD`], [`fixtures::COMPLETED_STATUS_CARDS`]),
+/// `RUNNING` for a card entered while a turn ran
+/// ([`fixtures::STATUS_MID_TURN`]), `FAILED` after the usage wall and after
+/// a 429 its retries did not get past ([`fixtures::USAGE_WALL_STATUS_CARDS`],
+/// [`fixtures::LIMIT_UNNAMED_STATUS_CARDS`]), and `CANCELLED` after a
+/// person's Esc ([`fixtures::INTERRUPTED_STATUS_CARDS`]). The words are put
+/// together at run time (the binary holds none in capitals). `None` with no
+/// readable state on the newest head, or no `/status` head among `rows`
+/// (a `/usage` card names no state).
+fn card_state(rows: &[String]) -> Option<&str> {
+    status_head(rows).and_then(|(_, state)| state)
+}
+
+/// A card's row, `│  <text>  │`, as its text trimmed: `None` for any other row.
+fn card_text(row: &str) -> Option<&str> {
+    let inner = crate::text::trim_end(row)
+        .strip_prefix('│')?
+        .strip_suffix('│')?;
+    Some(crate::text::trim(inner))
+}
+
+/// The NEWEST `/status` card's head among `rows`, as `(its row, its readable
+/// state)` ([`card_state`]). A recognizable head whose right border or state
+/// is unreadable still takes precedence over every older card.
+fn status_head(rows: &[String]) -> Option<(usize, Option<&str>)> {
+    let (i, row) = rows.iter().enumerate().rev().find(|(_, row)| {
+        row.strip_prefix('│')
+            .map(crate::text::trim_start)
+            .is_some_and(|text| text.starts_with(const { anchor_text("muse.card.status") }))
+    })?;
+    let state = card_text(row)
+        .and_then(|text| text.strip_prefix(const { anchor_text("muse.card.status") }))
+        .and_then(|text| text.rsplit_once(' ').map(|(_, state)| state))
+        .filter(|state| !state.is_empty() && state.bytes().all(|b| b.is_ascii_uppercase()));
+    Some((i, state))
+}
+
+/// Whether the NEWEST `/status` card among `rows` counts no token spent: its
+/// `USAGE` row `0 tokens · 0 turns · 0 subagents`. Measured on 1.4.10: so
+/// before any turn ([`fixtures::FRESH_STATUS_CARDS`]), and after a first
+/// turn a person stopped ([`fixtures::INTERRUPTED_STATUS_CARDS`]); the count
+/// is the session's, cumulative, and every turn the model answered adds to
+/// it ([`fixtures::COMPLETED_STATUS_CARDS`]: `67,077 tokens`).
+fn status_spent_none(rows: &[String]) -> bool {
+    status_head(rows).is_some_and(|(head, _)| {
+        rows[head + 1..]
+            .iter()
+            .take_while(|r| r.starts_with('│'))
+            .filter_map(|r| card_text(r))
+            .find_map(|t| t.strip_prefix(const { anchor_text("muse.card.usage") }))
+            .and_then(|spent| crate::text::trim(spent).split_once(' '))
+            .is_some_and(|(count, unit)| {
+                count == "0" && unit.starts_with(const { anchor_text("muse.card.tokens") })
+            })
+    })
+}
+
+/// The turns the NEWEST `/usage` card among `rows` counts, `│    Turns    1 │`.
+/// Measured on 1.4.10: `0` before any turn ([`fixtures::FRESH_STATUS_CARDS`])
+/// — and after a first turn a person stopped, as the `/status` card's own
+/// count says there ([`fixtures::INTERRUPTED_STATUS_CARDS`]) — and `1` after
+/// one ([`fixtures::USAGE_CARD`]). `None` with no such row among `rows`.
+fn usage_turns(rows: &[String]) -> Option<u64> {
+    rows.iter().rev().find_map(|r| {
+        let count = card_text(r)?.strip_prefix(const { anchor_text("muse.card.turns") })?;
+        let count = count.strip_prefix(' ').map(crate::text::trim)?;
+        (!count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| count.parse().ok())
+            .flatten()
+    })
+}
+
+/// What CARDS ALONE over the open composer say of the run the session rests
+/// on ([`Turn::Carded`]): the newest `/status` card's state ([`card_state`]),
+/// or, with none in sight, a `/usage` card's count of a turn taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rest {
+    /// `COMPLETED`: the last turn ended as a turn does.
+    Completed,
+    /// `FAILED`: the last turn ended on a wall (the usage wall, a 429 its
+    /// retries did not get past), its notice out of sight.
+    Failed,
+    /// `CANCELLED`: a person stopped the last turn with Esc
+    /// ([`interrupted`]).
+    Cancelled,
+    /// No `/status` card in sight, and the newest `/usage` card counts a
+    /// turn or more: a turn was taken, and how it ended is out of sight.
+    Unnamed,
+}
+
+/// The turn cards alone over the composer read as (`rows` the session's rows
+/// above it, no message, banner, reply or status row among them): a session
+/// at rest on the run the newest `/status` card names ([`Rest`]); one with
+/// no turn yet where it says `IDLE` and counts no token spent
+/// ([`status_spent_none`]: both measured so, its banner scrolled away under
+/// them, [`fixtures::FRESH_STATUS_CARDS`]; an `IDLE` over a count of tokens
+/// spent, which nothing measured draws, is no evidence); and, with no `/status`
+/// card in sight, at rest where a `/usage` card counts a turn taken. NO
+/// EVIDENCE (`Unknown`) where the newest `/status` card's state is unreadable,
+/// says `RUNNING` with no status row under it (nothing measured draws it), or
+/// names a state nothing measured; or none is in sight and no `/usage` card counts a
+/// turn: `0` is a session with no turn yet and one whose first turn a
+/// person stopped alike. Read as at rest, a fresh session's cards owed a
+/// continuation nobody's task asked for.
+fn carded(rows: &[String]) -> Turn {
+    match card_state(rows) {
+        Some(s) if s == const { anchor_text("muse.card.idle") } && status_spent_none(rows) => {
+            Turn::Fresh
+        }
+        Some(s) if s == const { anchor_text("muse.card.completed") } => {
+            Turn::Carded(Rest::Completed)
+        }
+        Some(s) if s == const { anchor_text("muse.card.failed") } => Turn::Carded(Rest::Failed),
+        Some(s) if s == const { anchor_text("muse.card.cancelled") } => {
+            Turn::Carded(Rest::Cancelled)
+        }
+        // `RUNNING` with no status row under the cards (nothing measured
+        // draws it), or a state nothing measured.
+        Some(_) => Turn::Unknown,
+        None if status_head(rows).is_none() && usage_turns(rows).is_some_and(|n| n > 0) => {
+            Turn::Carded(Rest::Unnamed)
+        }
+        None => Turn::Unknown,
+    }
+}
+
 /// Muse Code's pointer to the background-work panel on row `i`: `  (↓ to
 /// view terminals)` (or `monitors`), two columns in, a block of its own
 /// under a blank row. Measured on 1.4.10: drawn once into the transcript
@@ -682,7 +827,22 @@ enum Turn {
     /// away, its rows from `.0` down to `.1`, all indented, the last thing
     /// drawn.
     Tail(usize, usize),
-    /// No turn yet: the banner and no message.
+    /// THE TURN'S END SCROLLED AWAY UNDER CARDS (`/usage`, `/status`): no
+    /// message, banner, reply or status row in sight above the open
+    /// composer, only cards (measured on 1.4.10, the lab of 2026-10-21:
+    /// `/status` entered three times under the usage wall pushed the notice
+    /// out of sight, [`fixtures::USAGE_WALL_STATUS_CARDS`]). The session is
+    /// at rest: a card entered while a turn runs is drawn ABOVE the turn's
+    /// status row, which stays over the composer, and the turn's text goes
+    /// on under the card ([`fixtures::STATUS_MID_TURN`],
+    /// [`fixtures::STATUS_MID_TURN_ENDED`]); a message sent since would be
+    /// in sight under the cards. The run it rests on is the newest card's
+    /// ([`carded`]): not where that card says `RUNNING` with no status row
+    /// under it, which nothing measured draws, nor `IDLE` (no turn yet).
+    Carded(Rest),
+    /// No turn yet: the banner and no message — or cards alone whose newest
+    /// `/status` card says `IDLE`, the banner scrolled away under them
+    /// ([`carded`]).
     Fresh,
     /// Nothing measured says: rows this grammar does not know under the
     /// last message, or its head scrolled away with no reply in sight.
@@ -707,11 +867,11 @@ fn turn(rows: &[String], top: usize) -> Turn {
             && !in_abnormal_end(rows, i)
     };
     let Some(last) = (from..top).rev().find(|&i| drawn(i)) else {
-        let carded = rows[from..top].iter().any(|r| is_card_row(r));
-        return if user.is_some() && !carded {
-            Turn::Sent
-        } else {
-            Turn::Unknown
+        let cards = rows[from..top].iter().any(|r| is_card_row(r));
+        return match (user, cards) {
+            (Some(_), false) => Turn::Sent,
+            (None, true) => carded(&rows[from..top]),
+            _ => Turn::Unknown,
         };
     };
     // The reply is the last block: its head the last row in column 0, every
@@ -783,16 +943,50 @@ fn is_elapsed(t: &str) -> bool {
 /// while a box is up or a turn runs, before any turn, and where [`phase`]
 /// cannot say the turn ended.
 fn ended(rows: &[String]) -> Option<(usize, Vec<&str>)> {
+    let (head, last) = ended_rows(rows)?;
+    Some((head, block_lines(rows, head, last)))
+}
+
+/// The rows of the block [`ended`] reads, `(its head, its last row)`.
+fn ended_rows(rows: &[String]) -> Option<(usize, usize)> {
     let f = open_frame(rows)?;
     let (Turn::Ended(head, last) | Turn::Tail(head, last)) = turn(rows, f.top) else {
         return None;
     };
+    Some((head, last))
+}
+
+/// Rows `head..=last` of a block: the head less its `◆`, then each row under
+/// it, trimmed, blank rows left out.
+fn block_lines(rows: &[String], head: usize, last: usize) -> Vec<&str> {
     let first = rows[head].strip_prefix('◆').unwrap_or(&rows[head]);
-    let lines = std::iter::once(crate::text::trim(first))
+    std::iter::once(crate::text::trim(first))
         .chain(rows[head + 1..=last].iter().map(|r| crate::text::trim(r)))
         .filter(|t| !t.is_empty())
-        .collect();
-    Some((head, lines))
+        .collect()
+}
+
+/// THE NOTICE the last turn ended on, as one line: the first paragraph of
+/// the block [`ended`] reads — its head less its `◆` and the rows under it
+/// up to the first blank row, trimmed and joined with one space. Muse
+/// Code's own notices (a wall, a fault, the interrupt) are one line each,
+/// wrapped onto the rows under their head, two in, with no blank between
+/// (measured on 1.4.10: the usage wall's time on `  AM` under it,
+/// [`fixtures::USAGE_WALL`]). What a local command prints under one is a
+/// block of its own under a blank row, no part of it: `/rules` entered at
+/// the empty composer under the usage wall printed its three rows so
+/// (measured in the W2 lab, 2026-10-21, [`fixtures::USAGE_WALL_RULES_UNDER`]).
+/// Read as the whole block, they were folded into the wall's message, and
+/// its reset named no time.
+fn notice(rows: &[String]) -> Option<(usize, String)> {
+    let (head, last) = ended_rows(rows)?;
+    // A reply too tall for the screen ([`Turn::Tail`]) may open on blank
+    // rows: its paragraph in sight starts at the first row that is not.
+    let start = (head..=last).find(|&i| !blank(&rows[i]))?;
+    let end = (start + 1..=last)
+        .find(|&i| blank(&rows[i]))
+        .map_or(last, |b| b - 1);
+    Some((head, block_lines(rows, start, end).join(" ")))
 }
 
 /// The footer says the run is still stopping: `interrupting run` at its
@@ -881,8 +1075,12 @@ pub fn background_wait(rows: &[String]) -> Option<&'static str> {
 /// prompt; the status row is busy; a reply as the last thing drawn above the
 /// composer (a card under it or not; its rows in sight, of one taller than
 /// the screen) is idle — a question when its last words end in `?`, limited
-/// on a rate limit or a usage wall — and so is a session with no turn yet;
-/// the sign-in wall is idle on its wall. A message with nothing under it,
+/// on a rate limit or a usage wall — and so is a session with no turn yet
+/// (its banner, or cards alone whose newest `/status` card says `IDLE`),
+/// and cards alone over the composer, the turn's end scrolled away under
+/// them, where the newest card says how the run ended ([`Turn::Carded`]: no
+/// words read); the sign-in wall is idle on its wall. A message with
+/// nothing under it,
 /// and a turn's end whose footer still says `interrupting run`, are busy NOT
 /// authoritatively; a turn stopped on a fault only a person can fix
 /// ([`faulted`]), and any other screen, are `idle` NOT authoritatively. No
@@ -926,7 +1124,12 @@ fn turn_phase(rows: &[String]) -> (Phase, bool) {
         Turn::Sent => (Phase::Busy, false),
         Turn::Fresh => (Phase::Idle, true),
         Turn::Unknown => (Phase::Idle, false),
-        Turn::Ended(..) | Turn::Tail(..) if interrupting(rows, f) => (Phase::Busy, false),
+        Turn::Ended(..) | Turn::Tail(..) | Turn::Carded(_) if interrupting(rows, f) => {
+            (Phase::Busy, false)
+        }
+        // At rest under its cards, its last words out of sight: idle as
+        // evidence, with none read (no wall, no question, no fault).
+        Turn::Carded(_) => (Phase::Idle, true),
         Turn::Ended(..) | Turn::Tail(..) if faulted(rows) => (Phase::Idle, false),
         Turn::Ended(..) | Turn::Tail(..) => {
             if let Some(w) = wall(rows).filter(|w| w.kind.reads_limited()) {
@@ -944,10 +1147,47 @@ fn turn_phase(rows: &[String]) -> (Phase, bool) {
     }
 }
 
-/// No turn yet: the banner above the composer and no message.
+/// No turn yet: the banner above the composer and no message, or cards alone
+/// whose newest `/status` card says `IDLE` ([`carded`]).
 #[must_use]
 pub fn fresh(rows: &[String]) -> bool {
     open_frame(rows).is_some_and(|f| turn(rows, f.top) == Turn::Fresh)
+}
+
+/// A MESSAGE STANDS ON `rows` ([`crate::ScreenReader::message_drawn`]): this
+/// session's last person's message (`❯` in column 0 under its banner,
+/// [`scope`]) above the composer's top rule (anywhere where no composer is
+/// drawn), answered or not.
+#[must_use]
+pub fn message_drawn(rows: &[String]) -> bool {
+    let top = frame(rows).map_or(rows.len(), |f| f.top);
+    scope(rows, top).1.is_some()
+}
+
+/// The run cards alone over the open composer say the session rests on
+/// ([`Turn::Carded`]); `None` on any other screen.
+fn rests_on(rows: &[String]) -> Option<Rest> {
+    match open_frame(rows).map(|f| turn(rows, f.top)) {
+        Some(Turn::Carded(rest)) => Some(rest),
+        _ => None,
+    }
+}
+
+/// THE SESSION RESTS ON A TURN'S END ITS CARDS HIDE: cards alone over the
+/// open composer, idle as evidence ([`phase`]: no `interrupting run`, no
+/// work of its own running in the panel), whose newest `/status` card says
+/// the run `FAILED`, or, with none in sight, whose `/usage` card counts a
+/// turn taken ([`Rest::Failed`], [`Rest::Unnamed`]). Nothing in sight says
+/// a turn went on past that end, or that a person stopped it: the wall the
+/// supervisor last read there may be the end still (measured: three
+/// `/status` under the usage wall, and under a 429 its retries did not get
+/// past, say `FAILED`, [`fixtures::USAGE_WALL_STATUS_CARDS`],
+/// [`fixtures::LIMIT_UNNAMED_STATUS_CARDS`]). Not where it says `COMPLETED`
+/// (a turn ended as a turn does since) or `CANCELLED` (a person's Esc).
+#[must_use]
+pub fn end_hidden(rows: &[String]) -> bool {
+    phase(rows) == (Phase::Idle, true)
+        && matches!(rests_on(rows), Some(Rest::Failed | Rest::Unnamed))
 }
 
 /// The heads of Muse Code's own tool rows, which are no words of the agent
@@ -991,13 +1231,14 @@ fn names_a_path(rest: &str) -> bool {
 /// The agent's last words: the reply the last turn ended on, its `◆` and
 /// indent stripped, one line per row. `None` while a box is up or a turn
 /// runs, before any turn, where [`phase`] cannot say the turn ended, and
-/// where it ended on Muse Code's own row: a tool row, the interrupt, a wall,
-/// a fault.
+/// where it ended on Muse Code's own row: a tool row, the interrupt, or a
+/// wall or a fault read off its notice ([`notice`]), a local command's rows
+/// under it aside.
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
     let (_, lines) = ended(rows)?;
     let head = *lines.first()?;
-    let message = lines.join(" ");
+    let (_, message) = notice(rows)?;
     if head == const { anchor_text("muse.turn.interrupted") }
         || tool_row(head)
         || wall_of(&message).is_some()
@@ -1143,12 +1384,15 @@ fn faulted(rows: &[String]) -> bool {
 /// Whether a PERSON stopped the last turn with Esc: it ended on `◆
 /// Interrupted · Report issues with /feedback` (1.4.10, a model's turn). The
 /// next message is theirs. 1.4.9's retracted echo turn draws no marker, and
-/// reads as a draft (module header).
+/// reads as a draft (module header). So too where cards alone hide that
+/// marker and the newest `/status` card says the run was `CANCELLED`
+/// (measured: Esc on a turn, then `/status` three times,
+/// [`fixtures::INTERRUPTED_STATUS_CARDS`]).
 #[must_use]
 pub fn interrupted(rows: &[String]) -> bool {
     ended(rows).is_some_and(|(_, lines)| {
         lines.first().copied() == Some(const { anchor_text("muse.turn.interrupted") })
-    })
+    }) || rests_on(rows) == Some(Rest::Cancelled)
 }
 
 /// The sign-in wall's first option row (`Log in with browser · Enter to
@@ -1284,17 +1528,18 @@ pub fn remedy(message: &str) -> Option<String> {
 }
 
 /// The wall on the screen: Muse Code signed out (`WallKind::Auth`, its login
-/// menu never read), or the turn's last `◆` block in a wall's own shape
-/// ([`wall_of`]), its rows joined with one space — the vendor's error row as
-/// the last thing said ([`Placement::ErrorRow`]). `None` while a turn runs:
-/// a retry row ([`retrying`]) is no wall.
+/// menu never read), or the notice the turn's last `◆` block opens on
+/// ([`notice`]: its head and the rows it wraps onto, joined with one space,
+/// a local command's rows under it left out) in a wall's own shape
+/// ([`wall_of`]) — the vendor's error row as the last thing said
+/// ([`Placement::ErrorRow`]). `None` while a turn runs: a retry row
+/// ([`retrying`]) is no wall.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
     if let Some(row) = signed_out(rows) {
         return Some(Wall::sign_in(rows, row));
     }
-    let (head, lines) = ended(rows)?;
-    let message = lines.join(" ");
+    let (head, message) = notice(rows)?;
     let (kind, reset) = wall_of(&message)?;
     Some(Wall {
         kind,
@@ -2634,6 +2879,43 @@ pub mod fixtures {
     pub const USAGE_CARD: &str = include_str!("fixtures/muse-1.4.10-R6427.1-usage.txt");
     /// `/status` after that: its card under the `/usage` card.
     pub const STATUS_CARD: &str = include_str!("fixtures/muse-1.4.10-R6427.1-status.txt");
+    /// The usage wall, its time wrapped onto `  AM`, and one `/rules` under
+    /// it: three indented rows, a block of their own under a blank row (the
+    /// W2 lab of 2026-10-21, the harness's own 40-row read).
+    pub const USAGE_WALL_RULES_UNDER: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-limit-rules-under.txt");
+    /// `/status` entered three times under the usage wall: cards alone above
+    /// the open composer, the notice out of sight, each card's state
+    /// `FAILED`.
+    pub const USAGE_WALL_STATUS_CARDS: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-limit-status-cards.txt");
+    /// `/status` entered 5 s into a slow turn: the turn's text so far, the
+    /// card (`RUNNING`), and the status row under it, over the composer.
+    pub const STATUS_MID_TURN: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-status-mid-turn.txt");
+    /// That turn once it ended: its reply drawn whole under the card.
+    pub const STATUS_MID_TURN_ENDED: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-status-mid-turn-ended.txt");
+    /// A session with no turn yet: `/status`, `/usage` and `/status` twice
+    /// more at the empty composer, the banner out of sight, each `/status`
+    /// card's state `IDLE`, the `/usage` card counting `Turns 0`.
+    pub const FRESH_STATUS_CARDS: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-fresh-status-cards.txt");
+    /// A first turn stopped by Esc, then `/status` three times: cards alone,
+    /// each `CANCELLED` (and counting `0 turns`).
+    pub const INTERRUPTED_STATUS_CARDS: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-interrupted-status-cards.txt");
+    /// A `usage_limit_reached` 429 that names no reset (no `resets_at`):
+    /// retried as a rate limit, then `model failed: API error 429: …` as the
+    /// turn's end.
+    pub const LIMIT_UNNAMED: &str = include_str!("fixtures/muse-1.4.10-R6427.1-limit-unnamed.txt");
+    /// That wall, then `/status` three times: cards alone, each `FAILED`.
+    pub const LIMIT_UNNAMED_STATUS_CARDS: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-limit-unnamed-status-cards.txt");
+    /// A turn's reply after that, then `/status` three times: cards alone,
+    /// each `COMPLETED`.
+    pub const COMPLETED_STATUS_CARDS: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-completed-status-cards.txt");
 
     // 1.4.10-R6427.1 again, the next lab (the harness's step: its boxes,
     // typing and turn ends).

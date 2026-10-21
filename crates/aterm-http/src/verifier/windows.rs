@@ -12,60 +12,24 @@
 //! its CN, now refused in [`Verifier::verify`]. Revocation and network fetching
 //! below are still unmeasured.
 //!
-//! # The two traps this code is written around
+//! `CERT_CHAIN_PARA` is used as `windows-sys` declares it (all nine fields;
+//! `rustls-platform-verifier` redefines it only to drop two on Windows 7, which
+//! aterm does not support), so `cbSize` is its full size.
 //!
-//! 1. **`BOOL` is not the verdict.** `CertGetCertificateChain` and
-//!    `CertVerifyCertificateChainPolicy` both return `BOOL` meaning "the API
-//!    call itself worked". The trust decision is
-//!    `CERT_CHAIN_POLICY_STATUS.dwError`, and a chain that Windows rejects still
-//!    comes back with `BOOL == TRUE`. A verifier that checks only the return
-//!    value accepts every forged chain — and it compiles. Below, acceptance
-//!    requires `status.dwError == 0` reached through an explicit `TRUE` check on
-//!    both calls; every other path returns `Err`.
-//! 2. **`szOID_PKIX_KP_SERVER_AUTH` must be NUL-terminated** when it goes into
-//!    `CERT_USAGE_MATCH` (rustls-platform-verifier issue #126). In
-//!    `windows-sys` 0.61.2 the constant is
-//!    `windows_sys::core::s!("1.3.6.1.5.5.7.3.1")`, and that macro is
-//!    `concat!($s, '\0').as_ptr()` — already terminated. Verified by reading
-//!    `windows-sys-0.61.2/src/core/literals.rs:3`. If this crate's `windows-sys`
-//!    requirement ever moves, re-check that line before anything else.
-//!
-//! # `CERT_CHAIN_PARA` is used as `windows-sys` declares it
-//!
-//! `rustls-platform-verifier` redefines this struct locally and pointer-casts
-//! it in. That is not a workaround for a truncated binding: `windows-sys`
-//! 0.61.2 already declares all nine fields through `dwStrongSignFlags`
-//! (`Win32/Security/Cryptography/mod.rs:2106`). The redefinition exists so the
-//! crate can drop the last two fields on `target_vendor = "win7"`. aterm does
-//! not support Windows 7, so the upstream binding is used directly and `cbSize`
-//! is `size_of::<CERT_CHAIN_PARA>()` — the value the OS reads to decide which
-//! fields are present.
-//!
-//! # Revocation and network fetching: the incumbent's behaviour, preserved
-//!
-//! The chain flags below are exactly `rustls-platform-verifier`'s:
-//! end-entity-only revocation, an accumulated retrieval timeout, and an
-//! end-cert cache, with `dwUrlRetrievalTimeout` at 10 s. This arm therefore MAY
-//! make a bounded network request during verification, which the Apple arm
-//! explicitly forbids with `SecTrustSetNetworkFetchAllowed(false)`.
-//!
-//! That asymmetry is deliberate and is a decision, not an oversight. On Windows
-//! the revocation checking IS the URL retrieval — `CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL`
-//! would remove the fetch and the revocation checking together. Trading away
-//! revocation on a platform nobody here can test, in the same change that
-//! reimplements the verifier, is the wrong risk to take; behaviour-preserving is
-//! the right default until a Windows-capable reviewer measures the alternative.
-//! Recorded so the next reader sees a choice rather than an inconsistency.
+//! The chain flags are `rustls-platform-verifier`'s: end-entity revocation, an
+//! accumulated retrieval timeout and an end-cert cache, with a 10 s
+//! `dwUrlRetrievalTimeout`. So unlike the Apple arm this one may make a bounded
+//! network request: on Windows revocation checking is the URL retrieval, and
+//! `CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL` would drop both. Keep that until the
+//! alternative is measured on Windows.
 
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
 use std::sync::Arc;
 
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use windows_sys::Win32::Foundation::{FILETIME, TRUE};
-use windows_sys::Win32::Security::Cryptography::{
+use aterm_win32::Win32::Foundation::{FILETIME, TRUE};
+use aterm_win32::Win32::Security::Cryptography::{
     AUTHTYPE_SERVER, CERT_CHAIN_CACHE_END_CERT, CERT_CHAIN_CONTEXT, CERT_CHAIN_ENGINE_CONFIG,
     CERT_CHAIN_PARA, CERT_CHAIN_POLICY_IGNORE_ALL_REV_UNKNOWN_FLAGS, CERT_CHAIN_POLICY_PARA,
     CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_STATUS, CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT,
@@ -79,7 +43,9 @@ use windows_sys::Win32::Security::Cryptography::{
     CertVerifyCertificateChainPolicy, HCERTCHAINENGINE, HCERTSTORE, HTTPSPolicyCallbackData,
     USAGE_MATCH_TYPE_AND, X509_ASN_ENCODING, szOID_PKIX_KP_SERVER_AUTH,
 };
-use windows_sys::core::{PCSTR, PSTR};
+use aterm_win32::core::{PCSTR, PSTR};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use super::{
     bad_encoding, eku_rejected, invalid_certificate, name_mismatch, revoked, unknown_issuer,
@@ -90,8 +56,8 @@ const UNIX_TO_WINDOWS_SECS: u64 = 11_644_473_600;
 /// `FILETIME` counts 100-nanosecond intervals.
 const INTERVALS_PER_SEC: u64 = 10_000_000;
 
-// The five `dwError` values this module translates into a specific
-// `rustls::CertificateError` — the same five `rustls-platform-verifier` maps.
+// The `dwError` values translated to a specific `rustls::CertificateError`, as
+// `rustls-platform-verifier` maps them.
 const CERT_E_EXPIRED: i32 = -2146762495; // 0x800B0101
 const CERT_E_UNTRUSTEDROOT: i32 = -2146762487; // 0x800B0109
 const CERT_E_CN_NO_MATCH: i32 = -2146762481; // 0x800B010F
@@ -100,7 +66,7 @@ const CERT_E_INVALID_NAME: i32 = -2146762476; // 0x800B0114
 const CRYPT_E_REVOKED: i32 = -2146885616; // 0x80092010
 
 /// The last OS error, as a rustls error. Used only where a `crypt32` call
-/// reported failure, so the resulting `Err` is a REJECTION either way.
+/// reported failure, so the resulting `Err` is a rejection either way.
 fn last_os_error(what: &str) -> rustls::Error {
     invalid_certificate(format!("{what}: {}", std::io::Error::last_os_error()))
 }
@@ -203,9 +169,8 @@ fn build_chain(
     now: UnixTime,
     engine: Option<&ChainEngine>,
 ) -> Result<ChainContext, rustls::Error> {
-    // Saturating rather than wrapping: a clock far enough in the future to
-    // overflow here would silently wrap into the past, which is the direction
-    // that turns an expired certificate valid.
+    // Saturating: wrapping would move the clock into the past, which turns an
+    // expired certificate valid.
     let intervals = now
         .as_secs()
         .saturating_add(UNIX_TO_WINDOWS_SECS)
@@ -215,9 +180,8 @@ fn build_chain(
         dwHighDateTime: (intervals >> 32) as u32,
     };
 
-    // `PCSTR` and `PSTR` differ only in constness; `CTL_USAGE` wants the mutable
-    // spelling but crypt32 only reads it. The OID is already NUL-terminated —
-    // see this module's header.
+    // `CTL_USAGE` wants `PSTR` but crypt32 only reads it. The OID is already
+    // NUL-terminated (see the module docs).
     let mut ekus: [PCSTR; 1] = [szOID_PKIX_KP_SERVER_AUTH];
     // SAFETY: `CERT_CHAIN_PARA` is a plain integer/pointer aggregate; MSDN
     // requires every unused field to be zero, which is exactly what this gives.
@@ -270,16 +234,14 @@ pub(super) struct Verifier {
 }
 
 impl Verifier {
-    /// `extra_roots` is EMPTY on every shipped path; see [`super::PlatformVerifier`].
-    ///
-    /// `_provider` is unused here — crypt32 brings its own crypto — but every
-    /// arm takes the same two arguments so `super::PlatformVerifier` has ONE
-    /// constructor call rather than a `#[cfg]` fork per platform.
+    /// `extra_roots` is empty on every shipped path. `_provider` is unused
+    /// (crypt32 brings its own crypto); every arm takes the same arguments so
+    /// `PlatformVerifier::build` needs no `#[cfg]` fork.
     pub(super) fn new(
         extra_roots: Vec<CertificateDer<'static>>,
         _provider: Arc<CryptoProvider>,
     ) -> Result<Self, rustls::Error> {
-        // Reject an unusable anchor at construction, like the incumbent does.
+        // Reject an unusable anchor at construction, not at first handshake.
         let store = Store::new()?;
         for root in &extra_roots {
             store.add(root.as_ref())?;
@@ -289,7 +251,7 @@ impl Verifier {
         })
     }
 
-    /// An engine whose ONLY roots are `self.extra_roots`, plus a store holding
+    /// An engine whose only roots are `self.extra_roots`, plus a store holding
     /// them. The store must outlive the engine, so both are returned.
     fn exclusive_engine(&self) -> Result<(Store, ChainEngine), rustls::Error> {
         let roots = Store::new()?;
@@ -311,9 +273,8 @@ impl Verifier {
         Ok((roots, ChainEngine(engine)))
     }
 
-    /// The presented chain, judged by crypt32.
-    ///
-    /// Returns `Ok(())` ONLY when the SSL chain policy reported `dwError == 0`.
+    /// The presented chain, judged by crypt32: `Ok(())` only when the SSL chain
+    /// policy reported `dwError == 0`.
     pub(super) fn verify(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -325,9 +286,8 @@ impl Verifier {
     ) -> Result<(), rustls::Error> {
         let store = Store::new()?;
         let leaf = store.add(end_entity.as_ref())?;
-        // The intermediates go into the store so chain building can find them;
-        // their contexts are dropped at the end of this scope, which is safe
-        // because the store defers its close until the last free.
+        // The intermediates go into the store for chain building; dropping their
+        // contexts is safe because the store defers its close until the last free.
         let _intermediates = intermediates
             .iter()
             .map(|der| store.add(der.as_ref()))
@@ -358,18 +318,11 @@ impl Verifier {
 
         let mut chain = build_chain(&store, &leaf, now, None)?;
 
-        // Test-only extra anchors. EMPTY on every shipped path, so this whole
-        // branch is dead in a real build. `TrustStatus` here has NOT been
-        // through policy verification; it is read only to decide whether the
-        // system roots failed to complete the chain.
-        // A CHAIN CONTEXT MUST NOT OUTLIVE THE ENGINE THAT BUILT IT, so the
-        // engine is bound HERE rather than inside the `if partial` block below.
-        // Bound there, it and its store dropped — calling
-        // CertFreeCertificateChainEngine — at that block's closing brace, while
-        // `chain` stayed in use through the policy check further down: a
-        // use-after-free that two independent reviews caught by reading. It has
-        // never fired because the branch is test-only (`extra_roots` is empty on
-        // every shipped path), which is exactly why it survived.
+        // Test-only extra anchors; empty on every shipped path. `TrustStatus`
+        // here has not been through policy verification: it only says whether
+        // the system roots completed the chain. A chain context must not outlive
+        // the engine that built it, so the engine is bound at this scope, not
+        // inside `if partial`.
         let mut _engine_keepalive = None;
         if !self.extra_roots.is_empty() {
             // SAFETY: `chain.0` is a live, non-null chain context.
@@ -382,9 +335,7 @@ impl Verifier {
             }
         }
 
-        // UTF-16, NUL-terminated. `encode_utf16` (rather than widening bytes one
-        // by one) is correct for any `&str`; a `ServerName` is ASCII in practice,
-        // but this does not depend on that.
+        // UTF-16, NUL-terminated; `encode_utf16` is correct for any `&str`.
         let mut server: Vec<u16> = server_text.encode_utf16().chain(Some(0)).collect();
 
         // SAFETY: plain aggregate containing a union of two `u32`s; zeroing is
@@ -402,16 +353,14 @@ impl Verifier {
         let mut params: CERT_CHAIN_POLICY_PARA = unsafe { mem::zeroed() };
         params.cbSize = u32::try_from(mem::size_of::<CERT_CHAIN_POLICY_PARA>())
             .map_err(|_| invalid_certificate("CERT_CHAIN_POLICY_PARA is impossibly large"))?;
-        // Do not fail a chain merely because revocation status was UNKNOWN.
-        // OpenSSL and Apple's Secure Transport behave the same way, and this is
-        // the incumbent's setting. A definitively REVOKED certificate is still
-        // rejected — that arrives as `CRYPT_E_REVOKED` below.
+        // Unknown revocation status does not fail a chain (as in OpenSSL and
+        // `rustls-platform-verifier`); a revoked one still arrives as
+        // `CRYPT_E_REVOKED` below.
         params.dwFlags = CERT_CHAIN_POLICY_IGNORE_ALL_REV_UNKNOWN_FLAGS;
         params.pvExtraPolicyPara = (&raw mut https).cast::<c_void>();
 
-        // SAFETY: plain aggregate; zeroed so a `dwError` that the call somehow
-        // failed to write reads as 0 — which is why the `BOOL` is checked FIRST
-        // and a non-`TRUE` return is an error before `dwError` is ever consulted.
+        // SAFETY: plain aggregate; zeroed, so an unwritten `dwError` reads as 0 —
+        // which is why the `BOOL` is checked first.
         let mut status: CERT_CHAIN_POLICY_STATUS = unsafe { mem::zeroed() };
         status.cbSize = u32::try_from(mem::size_of::<CERT_CHAIN_POLICY_STATUS>())
             .map_err(|_| invalid_certificate("CERT_CHAIN_POLICY_STATUS is impossibly large"))?;
@@ -422,7 +371,7 @@ impl Verifier {
         let ok = unsafe {
             CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain.0, &params, &mut status)
         };
-        // THE BOOL IS NOT THE VERDICT. It only says the policy engine ran.
+        // The `BOOL` only says the policy engine ran.
         if ok != TRUE {
             return Err(invalid_certificate(
                 "CertVerifyCertificateChainPolicy could not evaluate the chain",

@@ -60,7 +60,7 @@ use crate::proto::{
     decode_request, decode_response, encode_protocol_refusal, encode_replicate, encode_response,
     read_frame, write_frame, Request, Response, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER,
     ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND,
-    ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION,
+    ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RETAINED_FROM_PREFIX,
 };
 use crate::store::{
     is_hidden_subject, replicated_reserved_msg, reserved_msg, Begun, BrokerLog, Durability,
@@ -478,9 +478,7 @@ struct RevocationFileState {
 const REVOCATION_FILE_MAX: u64 = 1024 * 1024;
 
 #[allow(clippy::type_complexity)]
-fn parse_revocation_file(
-    path: &Path,
-) -> io::Result<(HashSet<[u8; 32]>, HashSet<String>, usize)> {
+fn parse_revocation_file(path: &Path) -> io::Result<(HashSet<[u8; 32]>, HashSet<String>, usize)> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .and_then(|f| f.take(REVOCATION_FILE_MAX + 1).read_to_end(&mut bytes))?;
@@ -1253,14 +1251,24 @@ struct HelloCopy {
 }
 
 impl HelloCopy {
-    /// The log's own answer now: its identity, the tier this open serves, and its
-    /// lineage. Taken under the log lock (the caller holds the log).
+    /// The log's own answer now: its identity, the tier this open serves, its lineage,
+    /// and the retention rules this open retains it by (never rules only read back from
+    /// its held store, which compact nothing: `BrokerLog::retention_active`). Taken under
+    /// the log lock (the caller holds the log); taken again when the rules are set.
     fn of(log: &BrokerLog) -> HelloCopy {
+        #[cfg(feature = "retention")]
+        let retention = match log.retention_active() {
+            Some(r) => Some(r.encode()),
+            None => None,
+        };
+        #[cfg(not(feature = "retention"))]
+        let retention = None;
         HelloCopy {
             identity: log.identity(),
             ext: crate::proto::NonceExt {
                 durability: Some(log.served()),
                 lineage: Some(log.lineage().clone()),
+                retention,
                 requests: Some(crate::proto::REQUEST_RETIRE),
                 // Never copied: the answer reads it fresh from the vitals
                 // (`hello_health`), since it moves with every batch's flush.
@@ -1508,9 +1516,42 @@ struct Shared {
     /// One compaction at a time: held by a retention call across its begin, its unlocked
     /// copy and its finish (lock order: compaction → batch → log). The copy writes the one
     /// `<log>.kept`, and the log is replaced by the finish of the compaction that copied
-    /// it, so two may never overlap. Nothing else takes it.
+    /// it, so two may never overlap. [`Broker::set_retention`] takes it too, so no rules
+    /// change lands inside a compaction: the job begun under the old rules writes its held
+    /// frames where the store ended at its begin, which is where a rules frame would go,
+    /// and its cut is where the new rules start to hold from.
     #[cfg(feature = "retention")]
     compaction: Mutex<()>,
+    /// How many times a caller of [`lock_compaction`] found another's compaction under
+    /// way and waited for it: what a test reads to know a call is waiting there.
+    #[cfg(feature = "retention")]
+    compaction_waits: AtomicU64,
+    /// THE RETENTION TICK's wake and stop (`ticker_loop`): asked for by the writer when a
+    /// batch takes some class of the rules past its bytes or the log past a cap, by
+    /// [`Broker::set_retention`], and by nothing at all once a
+    /// [retention interval](Broker::set_retention_interval) passes; stopped at shutdown,
+    /// before the writer. `tick_cv` wakes the ticker, `tick_done` whoever waits on a tick.
+    #[cfg(feature = "retention")]
+    tick: Mutex<TickState>,
+    #[cfg(feature = "retention")]
+    tick_cv: Condvar,
+    #[cfg(feature = "retention")]
+    tick_done: Condvar,
+    /// The retention tick's thread: started by the first rules or cap set, joined at
+    /// shutdown before the writer. `None` on a broker nothing retains, which never ticks.
+    #[cfg(feature = "retention")]
+    ticker: Mutex<Option<JoinHandle<()>>>,
+    /// [`RETENTION_INTERVAL`], in milliseconds ([`Broker::set_retention_interval`]).
+    #[cfg(feature = "retention")]
+    retention_interval_ms: AtomicU64,
+    /// The log's bytes on disk (`BrokerLog::durable_len`), published with its head so the
+    /// writer can tell, with no lock, that a batch took the log past what retention allows.
+    #[cfg(feature = "retention")]
+    log_bytes: AtomicU64,
+    /// [`BrokerLog::retention_due`]: set, a batch asks for a tick at once. Published under
+    /// the log lock with every batch's state and after every planning.
+    #[cfg(feature = "retention")]
+    retain_due: AtomicBool,
     /// [`Broker::pause_next_batch`] and [`Broker::pause_next_acks`]: the test seam
     /// taken at one point of one batch. Empty unless a test arms it;
     /// `batch_pause_armed` keeps an unarmed broker's writer from taking even this lock
@@ -1540,6 +1581,10 @@ struct Shared {
     /// whenever retention advances it so [`Broker::base`] and `tail_loop`'s caught-up
     /// fast path can read it without locking `shared.log`.
     base: AtomicU64,
+    /// The lowest offset a subscriber can still be delivered from
+    /// ([`BrokerLog::read_floor`]: the oldest record the retention rules hold below the
+    /// base, or the base), published beside `base` for `tail_loop`'s fast path.
+    read_floor: AtomicU64,
     /// The log's committed head (`BrokerLog::head`), updated under the log lock
     /// whenever a batch commits so [`Broker::head`] and `serve_replicate`'s hidden-subject
     /// pre-check can read it without locking `shared.log`.
@@ -1553,6 +1598,29 @@ struct Shared {
     /// Automatic state-carrying compaction byte cap (`0` = unlimited, default `0`).
     #[cfg_attr(not(feature = "retention"), allow(dead_code))]
     max_retained_bytes: AtomicUsize,
+}
+
+/// How often the retention tick runs when nothing asks for it sooner: once a minute
+/// ([`Broker::set_retention_interval`]). The writer asks for one at once when a batch takes
+/// the log past what the rules' bytes or the caps allow, so the interval is what an age
+/// rule waits for, not what bounds the log.
+#[cfg(feature = "retention")]
+pub const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The retention tick's wake (`Shared::tick`).
+#[cfg(feature = "retention")]
+#[derive(Default)]
+struct TickState {
+    /// A tick is asked for now.
+    due: bool,
+    /// The broker is shutting down: the ticker returns.
+    stop: bool,
+    /// Ticks run, by the ticker or [`Broker::retention_tick_at`]
+    /// ([`BrokerStats::retention_ticks`]).
+    ticks: u64,
+    /// The ticker's ticks skipped, a compaction being under way
+    /// ([`BrokerStats::retention_skips`]).
+    skips: u64,
 }
 
 /// Where in a batch a [`BatchPauseSlot`] parks the writer.
@@ -2476,6 +2544,14 @@ pub struct BrokerStats {
     /// (`Shared::compaction`), which this does not count, so what it counts is retention
     /// that waited for a batch.
     pub retention_waits: u64,
+    /// Retention ticks run (`Broker::set_retention`): by the tick's thread, asked for by
+    /// a batch or the interval, and by `Broker::retention_tick_at`. `0` on a broker
+    /// nothing retains, which never ticks.
+    pub retention_ticks: u64,
+    /// The retention tick's thread's ticks SKIPPED because a compaction (a retention call's,
+    /// or an explicit `Broker::retention_tick_at`) was under way: the next batch over a
+    /// bound, or the next interval, asks again.
+    pub retention_skips: u64,
 }
 
 const fn follower_backoff_ms(timeout_failures: u32) -> u64 {
@@ -2705,10 +2781,7 @@ impl Broker {
     /// signed under `secret` before its requests are served; an unbound read-write
     /// capability is required for `Request::Replicate`. Strict durability by default.
     #[cfg(feature = "cap")]
-    pub fn open_replica_guarded(
-        log_path: impl AsRef<Path>,
-        secret: Vec<u8>,
-    ) -> io::Result<Broker> {
+    pub fn open_replica_guarded(log_path: impl AsRef<Path>, secret: Vec<u8>) -> io::Result<Broker> {
         Self::open_replica_guarded_with(log_path, secret, Durability::Strict)
     }
 
@@ -2804,11 +2877,7 @@ impl Broker {
     /// begin between batches, copy with no lock held, finish between batches.
     #[cfg(feature = "retention")]
     fn compact(&self, min_offset: u64, carry_state: bool) -> io::Result<u64> {
-        let _one = self
-            .shared
-            .compaction
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _one = lock_compaction(&self.shared);
         let mut waited = false;
         let begun = {
             let _batch = self.batch_settled(&mut waited);
@@ -2818,14 +2887,21 @@ impl Broker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.refuse_above_visible(min_offset.min(log.head().0))?;
-            log.compact_begin(Offset(min_offset), carry_state)?
+            let begun = log.compact_begin(Offset(min_offset), carry_state);
+            // A log its rules retain planned at that floor: the writer asks by it.
+            publish_retention(&self.shared, &log);
+            begun?
         };
         let Some(mut c) = begun else {
             return Ok(0);
         };
         // The bulk of the copy: no lock held, so no publish's ack waits for it.
         if let Err(e) = c.copy() {
-            c.abandon();
+            self.shared
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .compact_abandon(c);
             return Err(e);
         }
         let _batch = self.batch_settled(&mut waited);
@@ -2834,9 +2910,9 @@ impl Broker {
             .log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dropped = log.compact_finish(c)?;
-        self.shared.base.store(log.base().0, Ordering::Release);
-        Ok(dropped)
+        let dropped = log.compact_finish(c);
+        publish_retention(&self.shared, &log);
+        dropped
     }
 
     /// Take the writer's batch lock (`Shared::batch`) for a retention call: at once
@@ -2854,22 +2930,7 @@ impl Broker {
     /// Bound here, the guard is dropped as the panic unwinds.
     #[cfg(feature = "retention")]
     fn batch_settled(&self, waited: &mut bool) -> std::sync::MutexGuard<'_, ()> {
-        match self.shared.batch.try_lock() {
-            Ok(held) => held,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if !*waited {
-                    *waited = true;
-                    self.shared.retention_waits.fetch_add(1, Ordering::Relaxed);
-                }
-                self.shared
-                    .batch
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            }
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("retention: the writer panicked inside a batch ({poisoned})")
-            }
-        }
+        batch_settled(&self.shared, waited)
     }
 
     /// The guard both retention calls take, with the log lock held (the visible head is
@@ -2904,21 +2965,30 @@ impl Broker {
         self.compact(min_offset, true)
     }
 
-    /// Configure automatic writer-side state-carrying compaction whenever the log's
-    /// retained record count exceeds `max` (`0` = unlimited, the default).
+    /// Configure automatic state-carrying compaction whenever the log's retained record
+    /// count exceeds `max` (`0` = unlimited, the default).
     ///
-    /// When triggered after a batch commits, the writer compacts the oldest half of the
-    /// safe visible prefix via [`Self::retain_before_carrying_state`], preserving all
-    /// producer bindings, pending wills, producer sequence fences, consumer-group
-    /// commits, and the latest record of every quiet subject (`Last`) in `<log>.state`.
-    /// It runs the whole compaction, its copy included, on the writer thread under the
-    /// batch and log locks, so the batches behind it wait for it; it skips a batch while
-    /// a retention call is compacting (one compaction at a time).
+    /// When a batch takes the log over the cap, the writer asks the RETENTION TICK for a
+    /// tick ([`set_retention`](Self::set_retention)), which compacts at least the oldest
+    /// half of the safe visible prefix, and enough to keep half the cap, as
+    /// [`Self::retain_before_carrying_state`] does — off the ack path, its copy under no
+    /// lock — preserving all producer bindings, pending wills, producer sequence fences,
+    /// consumer-group commits, and the latest record of every quiet subject (`Last`) in
+    /// `<log>.state`. The base moves when that tick finishes, not before the next batch.
+    /// The tick skips while a retention call compacts (one compaction at a time), and the
+    /// next batch over the cap asks again. With rules set, the cut is the higher of theirs
+    /// and the cap's, and what the rules hold below it is carried.
     #[cfg(feature = "retention")]
     pub fn set_max_retained_records(&self, max: usize) {
         self.shared
             .max_retained_records
             .store(max, Ordering::Relaxed);
+        if max > 0 {
+            // Asked before the thread starts, so a thread started here takes this ask as
+            // its first tick and none after it (`ensure_ticker`).
+            ask_tick(&self.shared);
+            ensure_ticker(&self.shared);
+        }
     }
 
     /// The configured automatic compaction record threshold (`0` = unlimited).
@@ -2928,11 +2998,132 @@ impl Broker {
         self.shared.max_retained_records.load(Ordering::Relaxed)
     }
 
-    /// Configure automatic writer-side state-carrying compaction whenever the log's
-    /// retained byte size exceeds `max` (`0` = unlimited, the default).
+    /// Configure automatic state-carrying compaction whenever the log's retained byte
+    /// size exceeds `max` (`0` = unlimited, the default), through the retention tick as
+    /// [`set_max_retained_records`](Self::set_max_retained_records) does.
     #[cfg(feature = "retention")]
     pub fn set_max_retained_bytes(&self, max: usize) {
         self.shared.max_retained_bytes.store(max, Ordering::Relaxed);
+        if max > 0 {
+            // Asked before the thread starts, so a thread started here takes this ask as
+            // its first tick and none after it (`ensure_ticker`).
+            ask_tick(&self.shared);
+            ensure_ticker(&self.shared);
+        }
+    }
+
+    /// RETAIN BY RULES (`REQUIREMENTS` R4; [`Retention`](crate::Retention)): from here the
+    /// broker's RETENTION TICK takes the cut the prefix rule says, carries below it what
+    /// the hold rules still want into the held store `<log>.held`, and gives up what they
+    /// no longer want — off the ack path, as [`retain_before`](Self::retain_before) runs.
+    /// It ticks when a batch takes some class past its bytes (counted by the class of each
+    /// record, so a class at its bytes asks for nothing while other classes' records
+    /// arrive), and at least every [`RETENTION_INTERVAL`]
+    /// ([`set_retention_interval`](Self::set_retention_interval)), by the wall clock; the
+    /// first tick is asked for at once. A class past its bytes gives up at least a quarter
+    /// of them ([`SLACK_DIV`](crate::retention::SLACK_DIV)), so its own records ask for a
+    /// cut, which copies the log it keeps, at most once a quarter of its bytes. Reads answer by the rules
+    /// at once, and every `Hello` answered from here advertises them (its extension
+    /// block's retention entry). The rules are durable in the held store before this
+    /// returns; a broker never given rules never compacts by itself, and behaves exactly
+    /// as before.
+    ///
+    /// PER OPEN: a broker retains by the rules set on it since its open, and advertises
+    /// only those. Reopened, a log answers reads by the rules its held store was last held
+    /// under ([`BrokerLog::retention`]), and compacts by none, nor advertises any, until
+    /// they are set again — as `asb serve --retain-file` does at every start.
+    ///
+    /// Refused on a simulated log (no held store), and on a poisoned one. Waits for a
+    /// compaction under way, a tick's or a retention call's, to finish first: the rules
+    /// change between compactions, never inside one.
+    #[cfg(feature = "retention")]
+    pub fn set_retention(&self, rules: crate::Retention) -> io::Result<()> {
+        {
+            // Lock order: compaction → log. A job begun under the old rules appends its
+            // held frames where the store ended at its begin; the rules frame set here
+            // goes after them, and its cut is the base the new rules hold from.
+            let _one = lock_compaction(&self.shared);
+            let mut log = self
+                .shared
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            log.set_retention(rules)?;
+            publish_retention(&self.shared, &log);
+            // Hello advertises them from here (lock order: log → copy).
+            *self
+                .shared
+                .hello
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = HelloCopy::of(&log);
+        }
+        // Asked before the thread starts, so a thread started here takes this ask as its
+        // first tick and none after it (`ensure_ticker`).
+        ask_tick(&self.shared);
+        ensure_ticker(&self.shared);
+        Ok(())
+    }
+
+    /// The rules this broker retains its log by: the ones [`set_retention`](Self::set_retention)
+    /// set since its open, which every `Hello` advertises; `None` before. A reopened log's
+    /// held store may keep the rules it was last held under, which its reads answer by
+    /// ([`BrokerLog::retention`]) but which compact nothing, so are not these, until they
+    /// are set again.
+    #[cfg(feature = "retention")]
+    #[must_use]
+    pub fn retention(&self) -> Option<crate::Retention> {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retention_active()
+            .cloned()
+    }
+
+    /// Override how often the retention tick runs when no batch asks for it sooner
+    /// (default [`RETENTION_INTERVAL`], a minute; at least a millisecond). Asks for a tick
+    /// now, after which the new interval runs.
+    #[cfg(feature = "retention")]
+    pub fn set_retention_interval(&self, every: Duration) {
+        self.shared.retention_interval_ms.store(
+            every.as_millis().clamp(1, u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        ask_tick(&self.shared);
+    }
+
+    /// The retention tick's interval ([`set_retention_interval`](Self::set_retention_interval)).
+    #[cfg(feature = "retention")]
+    #[must_use]
+    pub fn retention_interval(&self) -> Duration {
+        Duration::from_millis(self.shared.retention_interval_ms.load(Ordering::Relaxed))
+    }
+
+    /// ONE RETENTION TICK NOW, on this thread, at `now_ms` (unix ms: the caller's clock, a
+    /// test's hand clock): exactly what the tick's thread runs, off the ack path — begin
+    /// between batches, the held store's frames and the copy with no lock held, finish
+    /// between batches — and one compaction at a time with it and every retention call.
+    /// Says what it did. Nothing without rules or a cap over.
+    #[cfg(feature = "retention")]
+    pub fn retention_tick_at(&self, now_ms: u64) -> io::Result<crate::RetentionTick> {
+        match retention_tick(&self.shared, now_ms, true)? {
+            Some(tick) => Ok(tick),
+            None => Err(io::Error::other(
+                "retention: a waiting tick was skipped, which cannot happen",
+            )),
+        }
+    }
+
+    /// THE OLDEST offset a read of `filter` can reach ([`BrokerLog::oldest`]): the base,
+    /// or, for what a hold rule keeps records of, the oldest it still holds of them.
+    #[must_use]
+    pub fn oldest(&self, filter: &Filter) -> u64 {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .oldest(filter)
+            .0
     }
 
     /// The configured automatic compaction byte threshold (`0` = unlimited).
@@ -3109,6 +3300,9 @@ impl Broker {
         log.start_last_visible(head);
         let durable = log.durable_head().0;
         let base = log.base().0;
+        let read_floor = log.read_floor().0;
+        #[cfg(feature = "retention")]
+        let (log_bytes, retain_due) = (log.durable_len(), log.retention_due());
         let log_head = log.head().0;
         let is_replica = log.is_replica();
         let durable_marks = log.served().served == crate::proto::Tier::Ordered;
@@ -3176,6 +3370,22 @@ impl Broker {
             retention_waits: AtomicU64::new(0),
             #[cfg(feature = "retention")]
             compaction: Mutex::new(()),
+            #[cfg(feature = "retention")]
+            compaction_waits: AtomicU64::new(0),
+            #[cfg(feature = "retention")]
+            tick: Mutex::new(TickState::default()),
+            #[cfg(feature = "retention")]
+            tick_cv: Condvar::new(),
+            #[cfg(feature = "retention")]
+            tick_done: Condvar::new(),
+            #[cfg(feature = "retention")]
+            ticker: Mutex::new(None),
+            #[cfg(feature = "retention")]
+            retention_interval_ms: AtomicU64::new(RETENTION_INTERVAL.as_millis() as u64),
+            #[cfg(feature = "retention")]
+            log_bytes: AtomicU64::new(log_bytes),
+            #[cfg(feature = "retention")]
+            retain_due: AtomicBool::new(retain_due),
             batch_pause: Mutex::new(BatchPauseSeam::default()),
             batch_pause_armed: AtomicBool::new(false),
             unclean_stop: AtomicBool::new(false),
@@ -3184,6 +3394,7 @@ impl Broker {
             health: Mutex::new(None),
             health_thread: Mutex::new(None),
             base: AtomicU64::new(base),
+            read_floor: AtomicU64::new(read_floor),
             log_head: AtomicU64::new(log_head),
             is_replica: AtomicBool::new(is_replica),
             max_retained_records: AtomicUsize::new(0),
@@ -4363,6 +4574,18 @@ fn stats_of(shared: &Shared) -> BrokerStats {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .len();
     let active_listeners = shared.active_listeners.load(Ordering::Acquire);
+    // Read once, the guard dropped here: a second lock of it inside the literal below
+    // would wait on the first's temporary.
+    #[cfg(feature = "retention")]
+    let (retention_ticks, retention_skips) = {
+        let t = shared
+            .tick
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (t.ticks, t.skips)
+    };
+    #[cfg(not(feature = "retention"))]
+    let (retention_ticks, retention_skips) = (0, 0);
     BrokerStats {
         log,
         visible_head,
@@ -4383,6 +4606,8 @@ fn stats_of(shared: &Shared) -> BrokerStats {
         peer_probes: shared.peer_probes.load(Ordering::Relaxed),
         parked_tails: shared.parked_tails.load(Ordering::Relaxed),
         retention_waits: shared.retention_waits.load(Ordering::Relaxed),
+        retention_ticks,
+        retention_skips,
     }
 }
 
@@ -4608,6 +4833,9 @@ impl Drop for Broker {
 /// else: the writer sleeps on its queue, and the stop wakes it at once. A no-op once
 /// the writer was taken.
 fn stop_writer(shared: &Shared) {
+    // The retention tick first: it finishes the tick it is in, so none meets the log
+    // closed below. Idempotent, as the rest is.
+    stop_ticker(shared);
     let Some(w) = shared
         .writer
         .lock()
@@ -5665,11 +5893,8 @@ fn dispatch_request<S: Stream>(
                 log.group_start(&group)
             };
             #[cfg(feature = "cap")]
-            let cap_check = StreamCapCheck::new(
-                shared,
-                keyring,
-                Request::SubscribeGroup { group, filter },
-            );
+            let cap_check =
+                StreamCapCheck::new(shared, keyring, Request::SubscribeGroup { group, filter });
             #[cfg(not(feature = "cap"))]
             let cap_check = StreamCapCheck::new(shared);
             tail_loop(
@@ -6177,23 +6402,43 @@ fn serve_fetch<S: Stream>(
             );
         }
     };
-    let (page, next, head, durable) = {
+    // BELOW THE OLDEST (`REQUIREMENTS` R4): told, never a page that silently starts
+    // later. A head query (`max = 0`) is never refused; its `Mark` says the oldest.
+    let (read, head, durable, oldest) = {
         let log = shared
             .log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let head = shared.head.load(Ordering::Relaxed);
-        let (page, next) = log.fetch(from_offset, &filt, max as usize, FETCH_SCAN_MAX, head);
-        (page, next, head, durable_for(shared, head))
+        let read = log.fetch_checked(from_offset, &filt, max as usize, FETCH_SCAN_MAX, head);
+        (read, head, durable_for(shared, head), log.oldest(&filt).0)
+    };
+    let (page, next) = match read {
+        Ok(read) => read,
+        Err(floor) => {
+            return emit(
+                stream,
+                pipe,
+                Err(refusal(
+                    ERR_RECORD_REFUSED,
+                    format!(
+                        "{RETAINED_FROM_PREFIX}{}: retention gave up the records of {filter} \
+                         below offset {}; read from there",
+                        floor.0, floor.0
+                    ),
+                )),
+            );
+        }
     };
     let mut out = Vec::new();
     for rec in page {
         queue_delivery_cached(shared, stream, &mut out, &rec)?;
     }
-    append_frame(
-        &mut out,
-        &encode_response(&mark(next, head, durable, String::new())),
-    )?;
+    let mut closing = mark(next, head, durable, String::new());
+    if let Response::Mark { oldest: o, .. } = &mut closing {
+        *o = Some(oldest);
+    }
+    append_frame(&mut out, &encode_response(&closing))?;
     flush_egress(stream, &mut out)?;
     Ok(true)
 }
@@ -6889,9 +7134,21 @@ fn write_ack<S: Stream>(stream: &mut S, ack: AckResult) -> io::Result<()> {
 /// batch and nothing else. (It also leaves if the channel closes, which cannot happen
 /// while [`Shared`] holds the sender.)
 ///
-/// THE ORDERED HORIZON lives here, on the one thread that appends: a full flush from
-/// any other thread would make the writer's next `write()` wait behind it on the same
-/// file. `dirty_since` is when the first batch no full flush covers was acked (set as
+/// THE ORDERED HORIZON lives here, on the one thread that appends. A full flush issued
+/// from any other thread would usually make the writer's next `write()` wait behind it,
+/// and its barrier too. Measured on one Mac (APFS, macOS 27.0.1,
+/// 2026-10-21; aterm `docs/measured/flush-wait-2026-10-21.md`): while an `F_FULLFSYNC`
+/// from another thread of the process was in flight, every `F_BARRIERFSYNC` the probe
+/// caught waited for it to end (992 of 992, on the flushed file and two others), and so
+/// did 72-99% of the `fsync(2)`s, growing appends, creates and renames caught in the
+/// same directory tree; a 64-byte `pread` and an in-place page-cache `pwrite` never did.
+/// A separate flusher thread would therefore still hold up the writer for the whole
+/// flush: with this broker's log full-flushed from a probe thread, each of the 89
+/// publishes that began with more than 2 ms of a flush left was acked no earlier than
+/// 1 ms before that flush ended. Under continuous traffic, that is up to one ack a
+/// horizon that takes a full flush's time.
+///
+/// `dirty_since` is when the first batch no full flush covers was acked (set as
 /// that batch finishes, cleared by every full flush that catches the durable head up);
 /// once the horizon has passed since then the writer issues a full flush — after the
 /// current batch's acks, or on the idle timeout, which is the time left — outside the
@@ -7033,6 +7290,47 @@ fn settle_full_flush(
     (outcome, dirty, wake)
 }
 
+/// [`Broker::batch_settled`], for whoever holds the shared state: a retention call, or the
+/// retention tick.
+#[cfg(feature = "retention")]
+fn batch_settled<'a>(shared: &'a Shared, waited: &mut bool) -> std::sync::MutexGuard<'a, ()> {
+    match shared.batch.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            if !*waited {
+                *waited = true;
+                shared.retention_waits.fetch_add(1, Ordering::Relaxed);
+            }
+            shared
+                .batch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            panic!("retention: the writer panicked inside a batch ({poisoned})")
+        }
+    }
+}
+
+/// Publish the log's base and read floor where the lock-free readers find them, under the
+/// log lock, which a parked tail's predicate reads them under.
+fn publish_floor(shared: &Shared, log: &BrokerLog) {
+    shared.base.store(log.base().0, Ordering::Release);
+    shared
+        .read_floor
+        .store(log.read_floor().0, Ordering::Release);
+}
+
+/// [`publish_floor`], and whether the log is due a retention tick: after the rules are set
+/// and after every planning, whatever it began (a tick that changes nothing too).
+#[cfg(feature = "retention")]
+fn publish_retention(shared: &Shared, log: &BrokerLog) {
+    publish_floor(shared, log);
+    shared
+        .retain_due
+        .store(log.retention_due(), Ordering::Relaxed);
+}
+
 /// Publish the log's heads and tier where the lock-free readers find them. Called with
 /// the log lock held, which is what a parked tail's predicate reads them under, so no
 /// wakeup is lost between "nothing to do" and "wait".
@@ -7052,7 +7350,14 @@ fn publish_log_state(
 ) -> (bool, Option<crate::LastViewGarbage>) {
     shared.is_replica.store(log.is_replica(), Ordering::Release);
     shared.log_head.store(log.head().0, Ordering::Release);
-    shared.base.store(log.base().0, Ordering::Release);
+    #[cfg(feature = "retention")]
+    {
+        shared.log_bytes.store(log.durable_len(), Ordering::Relaxed);
+        shared
+            .retain_due
+            .store(log.retention_due(), Ordering::Relaxed);
+    }
+    publish_floor(shared, log);
     // Durable first, then visible: a thread that sees the visible head move past an
     // escalated record then also sees the durable head that covers it.
     let durable_before = shared.durable.swap(log.durable_head().0, Ordering::Release);
@@ -7570,67 +7875,277 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) -> bool {
         served_before,
     );
     #[cfg(feature = "retention")]
-    maybe_auto_retain(shared);
+    ask_retention_after_batch(shared);
     dirty
 }
 
-/// Automatic writer-side state-carrying compaction (`set_max_retained_records` /
-/// `set_max_retained_bytes`): runs AFTER the batch's acks and follower replication have
-/// completed so publishers and subscribers never wait for compaction on the ack path.
-/// When both caps are `0` (the default), exits after two `Relaxed` atomic loads without
-/// taking any lock.
+/// AFTER A BATCH, the retention it may owe: when the batch took some class of the rules
+/// past its bytes ([`BrokerLog::retention_due`]) or the log past a cap
+/// ([`Broker::set_max_retained_records`], [`Broker::set_max_retained_bytes`]), ask the
+/// retention tick for a tick now. Never a compaction here, after the batch's acks and
+/// replication: the tick runs it off the ack path (`retention_tick`). With no rules and no
+/// cap (the default) three `Relaxed` loads, and no lock.
 #[cfg(feature = "retention")]
-fn maybe_auto_retain(shared: &Shared) {
+fn ask_retention_after_batch(shared: &Shared) {
+    let due = shared.retain_due.load(Ordering::Relaxed);
+    let max_records = shared.max_retained_records.load(Ordering::Relaxed) as u64;
+    let max_bytes = shared.max_retained_bytes.load(Ordering::Relaxed) as u64;
+    if !due && max_records == 0 && max_bytes == 0 {
+        return;
+    }
+    let bytes = shared.log_bytes.load(Ordering::Relaxed);
+    let records = shared
+        .log_head
+        .load(Ordering::Relaxed)
+        .saturating_sub(shared.base.load(Ordering::Relaxed));
+    if due || (max_records > 0 && records > max_records) || (max_bytes > 0 && bytes > max_bytes) {
+        ask_tick(shared);
+    }
+}
+
+/// Take the one-compaction-at-a-time lock (`Shared::compaction`), waiting for a compaction
+/// under way to finish, and counting the wait (`Shared::compaction_waits`). A poisoned lock
+/// is taken all the same, as every retention call takes it: the guard protects no data.
+#[cfg(feature = "retention")]
+fn lock_compaction(shared: &Shared) -> std::sync::MutexGuard<'_, ()> {
+    match shared.compaction.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            shared.compaction_waits.fetch_add(1, Ordering::Relaxed);
+            shared
+                .compaction
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+    }
+}
+
+/// Ask the retention tick for a tick now (`TickState::due`).
+#[cfg(feature = "retention")]
+fn ask_tick(shared: &Shared) {
+    let mut t = shared
+        .tick
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    t.due = true;
+    shared.tick_cv.notify_one();
+}
+
+/// THE CAPS' FLOOR for a tick (`set_max_retained_records` / `_bytes`): over a cap, the
+/// oldest half of the safe visible prefix, and at least what keeps half the record cap —
+/// the cut the writer's caps took before they ran through the tick. `0` (none) under
+/// both caps, with no cap set, or with nothing below `ceiling` to drop.
+#[cfg(feature = "retention")]
+fn caps_floor(shared: &Shared, log: &BrokerLog, ceiling: u64) -> u64 {
     let max_records = shared.max_retained_records.load(Ordering::Relaxed);
     let max_bytes = shared.max_retained_bytes.load(Ordering::Relaxed);
     if max_records == 0 && max_bytes == 0 {
-        return;
+        return 0;
     }
-    // ONE COMPACTION AT A TIME (`Shared::compaction`, lock order compaction → batch →
-    // log): a retention call copies with no batch or log lock held, and a compaction run
-    // here meanwhile would replace the log under it, failing that call at its finish
-    // ("the log was compacted while this compaction copied it"). Skipped, never waited
-    // for, so the writer never parks behind a copy: the next batch tries again.
-    let _one = match shared.compaction.try_lock() {
-        Ok(held) => held,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return,
-    };
-    let _batch = shared
-        .batch
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut guard = shared
-        .log
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let stats = guard.stats();
-    let over_records = max_records > 0 && stats.retained_records > max_records;
-    let over_bytes = max_bytes > 0 && stats.retained_bytes > max_bytes;
-    if !over_records && !over_bytes {
-        return;
+    let (base, head) = (log.base().0, log.head().0);
+    let records = usize::try_from(head.saturating_sub(base)).unwrap_or(usize::MAX);
+    let bytes = usize::try_from(log.durable_len()).unwrap_or(usize::MAX);
+    let over_records = max_records > 0 && records > max_records;
+    let over_bytes = max_bytes > 0 && bytes > max_bytes;
+    if (!over_records && !over_bytes) || ceiling <= base {
+        return 0;
     }
-    let mut ceiling = shared.head.load(Ordering::Relaxed);
-    if let Some(rep) = &shared.replicator {
-        ceiling = ceiling.min(rep.min_upto(stats.base.0, stats.head.0));
-    }
-    if ceiling <= stats.base.0 {
-        return;
-    }
-    let span = ceiling.saturating_sub(stats.base.0);
-    let half_span = (span / 2).max(1);
-    let mut cut = stats.base.0.saturating_add(half_span);
+    let span = ceiling.saturating_sub(base);
+    let mut cut = base.saturating_add((span / 2).max(1));
     if max_records > 0 {
         let target_keep = (max_records / 2).max(1) as u64;
-        let by_count = stats.head.0.saturating_sub(target_keep);
+        let by_count = head.saturating_sub(target_keep);
         if by_count > cut {
             cut = by_count;
         }
     }
-    cut = cut.min(ceiling);
-    if cut > stats.base.0 && guard.retain_before_carrying_state(Offset(cut)).is_ok() {
-        shared.base.store(guard.base().0, Ordering::Release);
+    cut.min(ceiling)
+}
+
+/// ONE RETENTION TICK at `now_ms` (unix ms; a test's hand clock), off the ack path: begin
+/// between batches — the cut the rules take, at least the caps' floor, never above the
+/// visible head (nor, replicated, what every follower holds) — then the held store's
+/// frames and the compaction's copy with no lock held, then the finish between batches.
+///
+/// One compaction at a time (`Shared::compaction`, lock order compaction → batch → log).
+/// A tick that would `wait` for a retention call's (or another tick's) compaction does;
+/// the tick's thread does not: it SKIPS (`None`), as the writer's caps skipped a batch,
+/// since the compaction under way is already moving the base and the next batch over a
+/// bound, or the next interval, asks again. Either way the tick is counted
+/// (`TickState::ticks`, `skips`) and whoever waits on one is woken.
+#[cfg(feature = "retention")]
+fn retention_tick(
+    shared: &Shared,
+    now_ms: u64,
+    wait: bool,
+) -> io::Result<Option<crate::RetentionTick>> {
+    let one = if wait {
+        Some(lock_compaction(shared))
+    } else {
+        match shared.compaction.try_lock() {
+            Ok(held) => Some(held),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    };
+    let tick = match one {
+        Some(held) => {
+            let tick = retention_tick_run(shared, now_ms);
+            drop(held);
+            tick.map(Some)
+        }
+        None => Ok(None),
+    };
+    let mut t = shared
+        .tick
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &tick {
+        Ok(None) => t.skips = t.skips.saturating_add(1),
+        _ => t.ticks = t.ticks.saturating_add(1),
     }
+    shared.tick_done.notify_all();
+    tick
+}
+
+/// [`retention_tick`]'s work, the compaction lock held.
+#[cfg(feature = "retention")]
+fn retention_tick_run(shared: &Shared, now_ms: u64) -> io::Result<crate::RetentionTick> {
+    // What every follower holds, asked before the batch and log locks: the replicator's
+    // links are held across a ship, which a tick must not wait on with the log locked.
+    // Read a moment early it is only lower, and the base moves only under `_one`.
+    let followers = match &shared.replicator {
+        Some(rep) => rep.min_upto(
+            shared.base.load(Ordering::Acquire),
+            shared.log_head.load(Ordering::Acquire),
+        ),
+        None => u64::MAX,
+    };
+    let mut waited = false;
+    let begun = {
+        let _batch = batch_settled(shared, &mut waited);
+        let mut log = shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ceiling = shared
+            .head
+            .load(Ordering::Relaxed)
+            .min(log.head().0)
+            .min(followers);
+        let at_least = caps_floor(shared, &log, ceiling);
+        let begun = log.retention_begin(now_ms, ceiling, at_least);
+        // The planning reset each class's room whatever it began, a tick that changes
+        // nothing too: the writer asks by it from here.
+        publish_retention(shared, &log);
+        begun?
+    };
+    let Some(mut job) = begun else {
+        let base = shared.base.load(Ordering::Acquire);
+        return Ok(crate::RetentionTick {
+            base_before: base,
+            base,
+            ..crate::RetentionTick::default()
+        });
+    };
+    // The held store's frames and the bulk of the copy: no lock held, so no publish's
+    // ack waits for them.
+    if let Err(e) = job.run() {
+        let mut log = shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.retention_abandon(job);
+        publish_retention(shared, &log);
+        return Err(e);
+    }
+    let _batch = batch_settled(shared, &mut waited);
+    let mut log = shared
+        .log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tick = log.retention_finish(job);
+    publish_retention(shared, &log);
+    tick
+}
+
+/// THE RETENTION TICK's thread: a tick whenever one is asked for (`ask_tick`) or the
+/// [interval](Broker::set_retention_interval) passes, by the wall clock, until the broker
+/// stops. A failed tick is logged, one line, and the next waits for the interval whatever
+/// asks sooner, so a log that cannot compact is not retried once per batch.
+#[cfg(feature = "retention")]
+fn ticker_loop(shared: &Shared) {
+    let mut backoff = false;
+    loop {
+        {
+            let t = shared
+                .tick
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let every = Duration::from_millis(shared.retention_interval_ms.load(Ordering::Relaxed));
+            let (mut t, _) = shared
+                .tick_cv
+                .wait_timeout_while(t, every, |t| !t.stop && (backoff || !t.due))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if t.stop {
+                return;
+            }
+            t.due = false;
+        }
+        match retention_tick(shared, now_unix_ms(), false) {
+            Ok(_) => backoff = false,
+            Err(e) => {
+                eprintln!(
+                    "astream-broker: the retention tick failed, and waits out its interval \
+                     before the next: {e}"
+                );
+                backoff = true;
+            }
+        }
+    }
+}
+
+/// Start the retention tick's thread, once: the first rules or cap a broker is given. Its
+/// caller asks for the tick it wants FIRST (`ask_tick`): a thread started after the ask
+/// takes it as its first tick, where one started before it could take an earlier ask
+/// (`set_retention_interval`'s) and then this one, a second tick at its start.
+#[cfg(feature = "retention")]
+fn ensure_ticker(shared: &Arc<Shared>) {
+    let mut slot = shared
+        .ticker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_some() || !shared.running.load(Ordering::Relaxed) {
+        return;
+    }
+    let t_shared = Arc::clone(shared);
+    *slot = Some(thread::spawn(move || ticker_loop(&t_shared)));
+}
+
+/// Stop the retention tick's thread and join it, its tick in progress finished: at
+/// shutdown, before the writer's join and the log's clean close, so no tick meets a
+/// closed log.
+fn stop_ticker(shared: &Shared) {
+    #[cfg(feature = "retention")]
+    {
+        shared
+            .tick
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop = true;
+        shared.tick_cv.notify_all();
+        let ticker = shared
+            .ticker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(t) = ticker {
+            let _ = t.join();
+        }
+    }
+    #[cfg(not(feature = "retention"))]
+    let _ = shared;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8013,9 +8528,8 @@ fn last_page(
 /// tail parks on `head <= cursor`, and a cursor left below a base with nothing visible
 /// above it would never park — it would spin on the lock.
 fn next_chunk(log: &BrokerLog, cursor: &mut u64, head: u64) -> Vec<Arc<BrokerRecord>> {
-    *cursor = (*cursor).max(log.base().0);
-    let behind = usize::try_from(head.saturating_sub(*cursor)).unwrap_or(usize::MAX);
-    log.read_range(Offset(*cursor), behind.min(TAIL_CHUNK))
+    *cursor = (*cursor).max(log.read_floor().0);
+    log.read_chunk(cursor, head, TAIL_CHUNK)
 }
 
 /// Stream every visible record matching `filter` from `cursor`, then tail live, until
@@ -8061,11 +8575,12 @@ fn tail_loop<S: Stream>(
     // of the records it was shown survive a power loss (a notifier pages only those).
     let mut marked_durable: u64 = 0;
     loop {
-        // Fast path when caught up: clamp `cursor` up to `base` atomically and, if
+        // Fast path when caught up: clamp `cursor` up to the read floor (the base, or the
+        // oldest record the retention rules hold below it) atomically and, if
         // `visible <= cursor`, skip locking `shared.log` for an empty `next_chunk`
         // call and go straight to the Condvar park below (cutting caught-up lock
         // acquisitions in half).
-        cursor = cursor.max(shared.base.load(Ordering::Acquire));
+        cursor = cursor.max(shared.read_floor.load(Ordering::Acquire));
         let mut batch = if shared.head.load(Ordering::Acquire) <= cursor {
             Vec::new()
         } else {
@@ -8121,7 +8636,7 @@ fn tail_loop<S: Stream>(
                         if parked {
                             resumes = resumes.saturating_add(1);
                         }
-                        cursor = cursor.max(log.base().0);
+                        cursor = cursor.max(log.read_floor().0);
                         let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
                             && astream_sys::sighup_generation()
                                 != shared.sighup_seen.load(Ordering::Relaxed);
@@ -8281,6 +8796,7 @@ fn mark(next: u64, head: u64, durable: u64, resume: String) -> Response {
         head,
         resume,
         durable: Some(durable),
+        oldest: None,
     }
 }
 
@@ -9626,56 +10142,6 @@ mod tests {
         assert_eq!(kept, want);
     }
 
-    /// THE WRITER'S AUTOMATIC COMPACTION (`set_max_retained_records`) never runs inside a
-    /// retention call: while one holds the compaction lock — as it does across its
-    /// unlocked copy (`compactions_on_one_broker_run_one_at_a_time`) — a batch over the
-    /// cap is acked and leaves the base where it was, and the first batch after the lock
-    /// is free compacts. Deterministic: the writer runs a batch's automatic compaction
-    /// before it takes the next batch, so a later publish's ack orders the check after
-    /// it. NEGATIVE CONTROL: an automatic compaction that does not take the lock moves
-    /// the base while the call holds it (and so fails a real call's finish).
-    #[cfg(feature = "retention")]
-    #[test]
-    fn an_automatic_compaction_waits_out_a_retention_call() {
-        let root = crate::test_scratch::Scratch::new("compact-auto-one-at-a-time");
-        let path = root.path().join("log");
-        let b = Arc::new(Broker::open(&path).unwrap());
-        let publish = |seq: u64| {
-            let shared = Arc::clone(&b.shared);
-            let acked = within_a_minute("a publish", move || {
-                let kind = WriteKind::Publish {
-                    producer_id: 1,
-                    producer_seq: seq,
-                    subject: "/t/x".to_string(),
-                    body: format!("m{seq}").into_bytes(),
-                };
-                submit_blocking(&shared, kind)
-            });
-            assert_eq!(acked, Ok((seq, false)));
-        };
-        for seq in 0..10u64 {
-            publish(seq);
-        }
-        let one = b.shared.compaction.lock().unwrap();
-        b.set_max_retained_records(2);
-        publish(10);
-        publish(11);
-        assert_eq!(
-            b.shared.log.lock().unwrap().base(),
-            Offset::ZERO,
-            "an automatic compaction ran while a retention call held the compaction lock"
-        );
-        drop(one);
-        publish(12);
-        publish(13);
-        let base = b.shared.log.lock().unwrap().base();
-        assert!(
-            base > Offset::ZERO,
-            "the first batch after the lock is free compacts (base {base:?})"
-        );
-        assert_eq!(b.base(), base.0);
-    }
-
     /// A LOG THAT LATCHES TO STRICT KEEPS MARKING WHAT IT MADE DURABLE. A tail that
     /// attached while the log served Ordered — like a connection whose `Hello` said so —
     /// may hold back what it is delivered until a durable mark covers it (aterm's
@@ -10266,46 +10732,8 @@ mod tests {
         h2.shutdown();
         h3.shutdown();
     }
-
-    #[cfg(all(unix, feature = "retention"))]
-    #[test]
-    fn automatic_state_carrying_compaction_caps_retained_records_and_preserves_state() {
-        let root = crate::test_scratch::Scratch::new("auto-retain");
-        let log_path = root.path().join("auto.log");
-        let sock_path = root.path().join("auto.sock");
-
-        let b = Broker::open_with(&log_path, Durability::Relaxed).unwrap();
-        b.set_max_retained_records(20);
-        assert_eq!(b.max_retained_records(), 20);
-        let mut h = b.serve(&sock_path).unwrap();
-
-        let mut c = crate::Client::connect(&sock_path).unwrap();
-        // Publish a quiet subject at offset 0 that will fall below the compaction cut.
-        c.publish(1, 1, "/t/quiet", b"sticky-state").unwrap();
-        // Publish 40 noisy records so automatic compaction triggers repeatedly.
-        for seq in 2..=41 {
-            c.publish(1, seq, "/t/noisy", b"payload").unwrap();
-        }
-        c.commit("/g/consumers", 35).unwrap();
-
-        let stats = b.stats();
-        assert!(
-            b.base() > 0 && stats.log.base.0 == b.base(),
-            "automatic compaction must advance base (got base={})",
-            b.base()
-        );
-        assert!(
-            stats.log.retained_records <= 20,
-            "retained_records={} exceeded cap 20",
-            stats.log.retained_records
-        );
-
-        // Verify quiet subject's Last record survived compaction via `<log>.state`.
-        let (rows, _) = c.last("/t/quiet", "", 10).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, "/t/quiet");
-        assert_eq!(rows[0].2, b"sticky-state");
-
-        h.shutdown();
-    }
 }
+
+#[cfg(all(test, feature = "retention"))]
+#[path = "retention_tick_tests.rs"]
+mod retention_tick_tests;

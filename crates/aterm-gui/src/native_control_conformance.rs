@@ -3,13 +3,10 @@
 
 //! Tier-1 conformance for native-front control routing.
 //!
-//! This test drives the pure classifier used by the shipping control dispatcher.
-//! The projection calls that classifier independently for every principal/target
-//! pair, so the model is bound to the actual zero-terminal routing decisions
-//! rather than to a second handwritten truth table. The App bind reads the two
-//! session routes through `session_route_decision`, the dispatcher's own
-//! assembly of the classifier's inputs over the App's real active handle and
-//! session store, so a slip at that call site (its two liveness bools swapped)
+//! The projection calls the shipping classifier for every principal/target pair, so the model
+//! binds to the real routing decisions rather than a second truth table. The App bind reads
+//! the two session routes through `session_route_decision` over the App's real active handle
+//! and session store, so a slip at the dispatcher's call site (its two liveness bools swapped)
 //! fails there.
 
 #![cfg(test)]
@@ -86,10 +83,8 @@ impl RealRouting {
         state
     }
 
-    /// The same projection with the dispatcher's classic slip replayed through
-    /// the REAL classifier: its two adjacent liveness bools passed swapped. The
-    /// slip itself would sit in `session_route`, which
-    /// `real_window_focus_projects_exact_optional_terminal_capability` drives.
+    /// The projection with the classifier's two liveness bools swapped: the negative control
+    /// for that slip in `session_route`, which the App bind below drives.
     fn project_with_swapped_inputs(self, model: &Model) -> State {
         let swapped = Self {
             front_has_terminal: self.explicit_session_live,
@@ -192,9 +187,8 @@ fn shipping_classifier_conforms_across_focus_and_session_lifecycle() {
         real.front_has_terminal = true;
     });
 
-    // Negative control: retaining a hidden terminal while a native view is
-    // focused is neither emitted by the classifier projection nor admitted by
-    // the correct model.
+    // Negative control: a hidden terminal kept behind a focused native view breaks the
+    // terminal-mirror and fallback invariants.
     let before_native = real.project(&model);
     let mut hidden_fallback = before_native.clone();
     hidden_fallback.insert("front_kind", 2);
@@ -214,9 +208,8 @@ fn shipping_classifier_conforms_across_focus_and_session_lifecycle() {
     assert!(!model.check_invariant("EdgeAppDenied", &edge_bypass));
 }
 
-/// Bind the model's focus transition to the real window resolver, not only the
-/// pure control classifier. The terminal session deliberately remains live in
-/// the pool while Settings is focused; authority must still become absent.
+/// Binds the focus transition to the real window resolver. The terminal session stays live in
+/// the pool while Settings is focused; bare-session authority must still go.
 #[test]
 fn real_window_focus_projects_exact_optional_terminal_capability() {
     let model = native_control_routing_model();

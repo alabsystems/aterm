@@ -165,14 +165,8 @@ fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Round eight of the update audit, leads U60 and U40 (r8d #759, #739): THE
-/// RIM STARTS WHERE THE TERMINAL FREEZES. It is the one explanation of a frozen
-/// terminal, and it started at apply begin: on the launched lane that is before
-/// the successor's boot, its dial and the park gate's hold (up to two minutes),
-/// so the rim pulsed around a terminal that still echoed, and its 125 s cap could
-/// run out before the park, leaving the freeze with no notice. Now apply begin
-/// shows none, and the launched lane's park starts it, with its cap counted from
-/// the freeze it explains.
+/// The upgrade rim starts at the launched lane's park rather than at apply
+/// begin, with its 125 s cap counted from the freeze it explains.
 #[test]
 fn the_upgrade_rim_starts_at_the_launched_lanes_park() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -214,13 +208,8 @@ fn the_upgrade_rim_starts_at_the_launched_lanes_park() {
     aterm_pty::close_fd(master);
 }
 
-/// The review of round eight's leads U60 and U40 (r8d #759, #739): A RE-PARK
-/// COUNTS THE RIM'S CAP AGAIN. A park that missed its budget left its rim
-/// running, and the re-park kept it as it was: one first missed early and
-/// admitted late (the gate's hold runs to two minutes) froze the terminal on a
-/// cap counted from the first park, which the proof after it could outrun. The
-/// rim a missed park left — here 120 s old, its 125 s cap nearly spent — runs
-/// on at the re-park, continuous, its cap counted from this freeze.
+/// A re-park after a missed park restarts the upgrade rim's cap from the new
+/// freeze while keeping the visual animation continuous.
 #[test]
 fn a_re_park_counts_the_rims_cap_from_its_own_freeze() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -260,13 +249,9 @@ fn a_re_park_counts_the_rims_cap_from_its_own_freeze() {
     aterm_pty::close_fd(master);
 }
 
-/// The review of round eight's leads U60 and U40 (r8d #759, #739): NO RIM
-/// WHILE THE GATE WAITS. A missed park resumes the readers and sends the
-/// launched lane back through its gate, which can wait — output pending, a
-/// person typing — until the hold's cap, two minutes, with the terminal
-/// echoing; the rim the missed park left pulsed around it all that time (the
-/// U60 symptom). The gate's wait takes it away, and the next park it admits
-/// starts it again. CONTROL: the first try, before any park, has none to take.
+/// When a missed park resumes the readers and the park gate waits again (e.g.
+/// for pending output or typing), the upgrade rim is cleared until the next
+/// park is admitted.
 #[test]
 fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -316,16 +301,11 @@ fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
     aterm_pty::close_fd(slave);
 }
 
-/// A COMMIT THE WORKER TOOK FIRST NEVER ANSWERS A LIVE TAKE (the review
-/// of round eight's finding 18). The Commit's messages flush runs before
-/// the claim, under the dispatch fence; the video answer stays past
-/// `try_begin_commit` (round six, finding 22), because everything before
-/// it can still roll the attempt back with this process running. Here the
-/// admission holds — the flush ran — and the worker has already moved the
-/// attempt to Rejecting: the take must still be running, its client untold.
-///
-/// RED before the fix: the Commit's waits, the video answer among them,
-/// ran before the claim, and the rollback after them lost the take.
+/// The Commit's messages flush runs before `try_begin_commit`, under the
+/// dispatch fence, while the video answer stays after `try_begin_commit`
+/// because earlier steps can still roll the attempt back. When the worker has
+/// already moved the attempt to `Rejecting`, the live take stays running and
+/// its client is told nothing.
 #[test]
 fn a_commit_the_worker_took_first_never_answers_a_live_take() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -393,33 +373,14 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A COMMIT WHOSE ANSWERS TOOK TIME HOLDS ITS CLAIM THROUGH THE FENCE (round
-/// eight of the update audit, #18). A live `video` request is answered only
-/// under the claim (round six, #22), and its answer can block the main
-/// thread — here a reply its client writes one fence grain
-/// (`HANDOFF_INPUT_DRAIN_YIELD`) after it reads it; a key the OS queued
-/// to this process meanwhile died with the `_exit` when the successor had not
-/// taken the keyboard. The claim's pass now answers the take and keeps the
-/// claim (the worker cannot reject a claimed attempt): no Commit is written,
-/// and the attempt goes back through the drain gate, whose re-post lets the
-/// run loop dispatch that input into the masters. Its next pass, once the
-/// fence has had its loop time, reads the admission again and writes the
-/// Commit (the test's pipe has no reader, so the write fails as an EPIPE
-/// does and rolls back — never an activity refusal). A pass whose admission
-/// now refuses — a quit pressed during the fence — gives the claim to the
-/// rejection, as activity, with the take still answered. A row the park's
-/// carry left is closed only at the write (ruling 441 (d)): the refused pass
-/// keeps running with it open, its reporter's id still live.
-///
-/// CONTROL: answers that cost under one grain hold nothing — the claim's own
-/// pass writes the Commit and closes the row there. The cost is chosen
-/// (`App::handoff_commit_answers_took`), in place of what the slow reply took.
-///
-/// The derived machine says the same (`NativeUpdateOverlapHandoff`): input
-/// queued under the claim disables `CommitModern` until it drains.
-///
-/// RED before the fix: the claim's pass wrote the Commit at once after the
-/// answer, re-posting nothing.
+/// When answering a live `video` request under the Commit claim takes at least
+/// one fence grain (`HANDOFF_INPUT_DRAIN_YIELD`), the pass keeps the claim and
+/// re-posts through the drain gate so the run loop can dispatch any OS input
+/// queued during the wait before writing the Commit. If admission refuses on
+/// the re-posted pass (e.g. quit requested during the fence), the claim goes
+/// to rejection and uncarried messages stay open; otherwise the re-posted pass
+/// writes the Commit and closes uncarried messages. Answers costing under one
+/// grain (`App::handoff_commit_answers_took`) write the Commit immediately.
 #[test]
 fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
     let model = aterm_models_misc::native_update_overlap_handoff_model();
@@ -621,30 +582,11 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
     }
 }
 
-/// A HELD CLAIM IS NOT REFUSED BY THE SUPERVISOR'S OWN STOP (the review of
-/// round eight's #18). A supervised tab waits at a question box the
-/// in-window supervisor escalated: its badge (`meta set attention
-/// owner=supervisor …`) stands, and the park draws it into the manifest.
-/// The Commit's answers took one fence grain (chosen,
-/// `App::handoff_commit_answers_took`), so its claim is held through one
-/// more input-dispatch fence, and the pass after it reads the admission
-/// again — the escalations among it (`carried_claims_held`). A stopped
-/// worker's last act clears the badges it raised (`release_attention`, on
-/// a fresh connection the cut allows). The host used to stop at the claim,
-/// so the held pass read that clearing as an escalation moved since the
-/// park and refused the Commit as activity, its successor killed — at every
-/// retry of the automatic lane while the box stood. The host now stops at
-/// the write, after the admission's last reading: the held pass writes the
-/// Commit (the test's pipe has no reader, so the write fails as an EPIPE
-/// does), and the host is stopped there, then resumed by the failure.
-///
-/// The worker is the test's own: it parks until stopped, and its last act
-/// clears the badge, as `release_attention` does; when a stop reaches it
-/// before the held pass, the test waits for that clearing to land (the
-/// real one lands in milliseconds, inside the fence's 30 ms at least).
-///
-/// RED before the fix: the claim's pass stopped the host, and the held
-/// pass refused the Commit ("structural activity arrived before Commit").
+/// The harness host stops at the Commit write, after the held pass's last
+/// admission check (`carried_claims_held`), rather than at the initial claim.
+/// Otherwise a stopped worker's `release_attention` badge clear during the
+/// held claim's input-dispatch fence would look like an escalation change and
+/// refuse the Commit as activity.
 #[test]
 fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     use std::sync::Arc;
@@ -826,33 +768,9 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// THE SUCCESSOR TAKES THE FRONT AT THE WRITE, NEVER AT A HELD CLAIM (the
-/// second review of round eight's #18). The Commit's answers took one fence
-/// grain (chosen, `App::handoff_commit_answers_took`), so its claim is held
-/// through one more input-dispatch fence. The successor used to be
-/// activated at the claim, before that fence: the keys the person typed
-/// through it went to the successor's pre-Commit queue and died with it
-/// when the held pass refused the Commit, and the fence's own run-loop
-/// turns dispatched this window's focus loss, a DEC 1004 focus-out written
-/// to the masters after the successor's focus-in. Now nothing is activated
-/// before the held pass has read the admission. Refused (a quit pressed
-/// during the fence), the successor its rejection kills was never
-/// activated; admitted, it is activated once, in the write (the test's
-/// pipe has no reader, so the write fails as an EPIPE does).
-///
-/// AND ONLY WHEN AN ATERM WINDOW HAS FOCUS AT THE WRITE (the lifecycle audit
-/// of 2026-10-14, handoff finding 3): focus is read there, not at the park.
-/// The person who switched to another app during the freeze keeps it; the
-/// one who came back to aterm gets the successor in front.
-///
-/// The activation is recorded in place of AppKit's
-/// (`App::handoff_activations`); the successor is a process of the
-/// test's own, killed at the end, and the ids the write marks for it go
-/// to a scratch rendezvous.
-///
-/// RED before the fix: the claim's pass activated the successor. RED with
-/// focus sampled at the park: the successor took the front from the app the
-/// person had moved to, and not for the one who had come back.
+/// The successor is activated (`App::handoff_activations`) only at the Commit
+/// write, after any held claim's re-posted pass has passed admission, and only
+/// when an aterm window has focus at the write (rather than at the park).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_held_claim_activates_the_successor_only_at_its_write() {
@@ -1003,16 +921,10 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
     }
 }
 
-/// A SLOW COMMIT FLUSH SENDS THE ATTEMPT THROUGH THE FENCE AGAIN (round
-/// eight of the update audit, finding 18): the flush blocks the main thread
-/// for up to `MESSAGES_FLUSH_COMMIT_WAIT`, and a key the OS queued then
-/// would die with the `_exit`. A writer that waits out its bound restarts
-/// the dispatch fence's clock and asks for the drain gate again, once per
-/// attempt, touching no `video` request. CONTROLS: a hold under one fence
-/// grain leaves the fence it has and one grain restarts it, decided by a
-/// chosen hold (`App::settle_commit_flush`), never by how fast this machine
-/// ran; and with no writer behind, the flush waits on nothing — answered, no
-/// new fence.
+/// A Commit messages flush that takes at least one fence grain
+/// (`HANDOFF_INPUT_DRAIN_YIELD`) restarts the dispatch fence's clock once per
+/// attempt so any OS input queued during `MESSAGES_FLUSH_COMMIT_WAIT` drains
+/// before the claim, without answering a live `video` request early.
 #[test]
 fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     let mut app = crate::App::headless_for_test();
@@ -1176,26 +1088,10 @@ fn a_park_that_misses_keeps_a_live_take() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// EVERY `video` REPLY COMMIT CAUSES IS ON ITS CONNECTION BEFORE THE
-/// `_exit` (round six of the update audit, finding 31). Commit aborts a
-/// live take and cancels an export; the export's encode worker sees that
-/// only between frames, and either answer reaches its client only when
-/// the connection thread writes it, after the channel hand-off. Each
-/// stand-in below is a connection thread that writes its reply 150 ms
-/// after the answer arrives (and releases the request's [`ReplyWire`] as
-/// the real connection does once the last byte is out, `Outbox::deliver_to`),
-/// and the export worker answers 200 ms after the cancel: Commit's step
-/// (`App::video_answer_before_commit`, which the Commit arm alone calls)
-/// returns only once both replies are WRITTEN, inside its bound.
-///
-/// The bound handed to the step is TEN MINUTES, not the shipped
-/// [`super::VIDEO_EXPORT_COMMIT_WAIT`]: "returned on the writes, not at the
-/// bound" is then told apart by a minute's hang detector, where a one-second
-/// bound let one stall of this thread fail a correct tree.
-///
-/// RED before the fix: Commit went from the park's cancel straight to the
-/// `_exit`; with only the export's permit waited for, the export's reply
-/// was still unwritten when it returned.
+/// `App::video_answer_before_commit` aborts a live take, cancels an in-flight
+/// export, and waits until the connection threads have written both replies and
+/// released their [`ReplyWire`] guards (within the caller's bound) before
+/// returning for `_exit`.
 ///
 /// [`ReplyWire`]: crate::control::ReplyWire
 #[test]

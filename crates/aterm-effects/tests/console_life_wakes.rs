@@ -72,8 +72,7 @@ impl Scene {
         for _ in 0..30 {
             s.tick(100);
         }
-        // Exercise an actual local hop. A screen-wide relocation now carries
-        // the base home immediately instead of leaving the pet across the pane.
+        // A local hop: a screen-wide relocation would carry the base home at once, with no flight.
         s.term.process(b"\x1b[9;43H");
         for _ in 0..80 {
             let frame = s.tick(16);
@@ -102,8 +101,7 @@ impl Scene {
         } else {
             b"\r\n\x1b]133;D;0\x07"
         });
-        // A fast command intentionally creates no legacy cheer latch. The
-        // console completion itself must supply the consumption wake.
+        // A fast command creates no legacy cheer latch; the console completion supplies the wake.
         self.brain.note_command_done(self.now, failed, Some(100));
     }
 
@@ -141,13 +139,10 @@ fn settled_console_resident_offers_a_consumption_tick_for_pending_notes() {
     pet.brain.note_petted(pet.now);
     pet.assert_prompt_wake();
     pet.tick(16);
-    // The offer is the contract. A console resident does not park the pet
-    // at the escort's station, so handing it back for affection can leave a
-    // gap between the perch and the caret (here a row hop back to the
-    // prompt). Stimulus consumption sits below every caret-travel intent
-    // (`consume_stimuli` in `kitty_pet.rs`), so the touch is spent when the
-    // pet lands, well inside PET_LATCH_TTL. The latch must never expire
-    // unconsumed.
+    // The offer is the contract. A console resident is not parked at the escort's station, so
+    // the touch may wait for a hop back to the prompt: stimulus consumption sits below every
+    // caret-travel intent (`consume_stimuli`), and the touch is spent on landing, well inside
+    // `PET_LATCH_TTL`. The latch never expires unconsumed.
     let mut spent_after = None;
     for i in 0..60 {
         if pet.brain.pending_pets() == 0 {
@@ -169,8 +164,7 @@ fn a_fresh_but_delayed_completion_gets_its_full_visible_hold() {
     for failed in [false, true] {
         let mut s = Scene::watching();
         s.complete(failed);
-        // Freshness is two seconds. Arriving after 1.3s must still buy the 1.2s
-        // visible response; it must not be born already past its own hold.
+        // Freshness is two seconds: arriving after 1.3s still gets the full 1.2s visible hold.
         let frame = s.tick(1300);
         assert_eq!(s.brain.console_attention(), PetAttention::Result);
         assert_eq!(
@@ -198,9 +192,8 @@ fn a_completion_past_its_admission_ttl_never_starts_a_response() {
     assert_ne!(s.brain.console_attention(), PetAttention::Result);
     s.tick(10_000);
     assert_ne!(s.brain.console_attention(), PetAttention::Result);
-    // Idle-to-zero is about where it ends: the content perch is a visit,
-    // spent after `PERCH_DWELL`, so the walk home and settle ladder are owed
-    // frames. Both are finite and the pet must arrive at silence on its own.
+    // The content perch is a visit spent after `PERCH_DWELL`, so the walk home and settle owe
+    // frames; both are finite and end in silence.
     for _ in 0..(45 * 63) {
         s.tick(16);
     }
@@ -238,9 +231,9 @@ fn a_selection_arriving_midflight_preserves_the_arc_and_landing_cadence() {
             break;
         }
         frame = s.tick(16);
-        // Ownership ends when the flight/recovery work ends. The follower may
-        // still emit Walk for the small home gap this frame; Sit is the
-        // resident's next tick, which consumes the handoff.
+        // Ownership ends with the flight/recovery work. The follower may still emit Walk for the
+        // small home gap this frame; Sit comes on the resident's next tick, which consumes the
+        // handoff.
         if landed_body.is_none() && !s.brain.console_legacy_motion_pending() {
             assert!(frame.alpha > 0, "the completed landing stays visible");
             assert_eq!(frame.lift, 0.0, "the completed landing has grounded paws");
@@ -250,9 +243,8 @@ fn a_selection_arriving_midflight_preserves_the_arc_and_landing_cadence() {
             let mut world = PetWorld::default();
             assert!(world.observe(&input, &facts, PetPane::full(&input)));
             let (x0, x1, y0, y1) = body;
-            // The caret's own blank ring is not ink: `STATION_LEAD` seats the
-            // escort one cell past the caret, inside that 3x3 ring. Glyphs,
-            // selections, images and uncertified geometry still fail here.
+            // The caret's blank ring is not ink (`STATION_LEAD` seats the escort inside it);
+            // glyphs, selections, images and uncertified geometry still fail.
             assert!(
                 world.clear_past_caret(
                     PetRect::new(
@@ -341,9 +333,8 @@ fn a_landing_handoff_with_no_clear_reading_space_releases_its_frame_lane() {
 fn petting_suppressed_by_full_viewport_selection_is_consumed_without_polling() {
     let mut s = Scene::watching();
     let content = s.brain.content();
-    // A valid visible-body touch is queued; selection then claims its cells
-    // before the next frame. Losing custody must consume the note, not leave
-    // an immortal pending latch behind the no-clear-target early return.
+    // A touch is queued, then selection claims its cells before the next frame. Losing custody
+    // consumes the note rather than leaving a pending latch behind.
     s.brain.note_petted(s.now);
     assert_eq!(s.brain.pending_pets(), 1);
     s.select_whole_viewport();

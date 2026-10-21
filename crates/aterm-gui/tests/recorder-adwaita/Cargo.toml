@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE CLIENT FRAME'S ORACLE RECORDER (L-HEADER-LW7, docs/AUDIT-third-party-
+# 2026-10-15.md, lw5-button-layout-shadow), in ITS OWN WORKSPACE on purpose
+# (the empty `[workspace]` below): sctk-adwaita 0.10.1, the frame the winit
+# fork drew before LW.5, answers how GNOME's `button-layout` places the
+# header's buttons and what its shadow paints outside the window, and
+# aterm-gui is held to the committed recording with no sctk-adwaita anywhere
+# in the workspace graph.
+#
+# The functions that answer are private to sctk-adwaita (`Buttons` and
+# `Shadow` are `pub(crate)` types behind a frame that needs a compositor), so
+# the build script copies the crate's own `buttons.rs`, `config.rs`,
+# `theme.rs` and `shadow.rs` out of the registry, each checked against its
+# SHA-256, and this crate compiles them as modules (see build.rs for the two
+# mechanical edits). `config.rs` reads the setting by spawning `dbus-send`;
+# the recorder runs it as it is, with this crate's own `dbus-send` (src/bin)
+# first on PATH printing what the real one prints for a value
+# (`dbus-send --print-reply=literal` through xdg-desktop-portal-gtk on the
+# lane's Ubuntu 24.04 guest, 2026-10-20: `   variant       variant
+# <value>`, no newline).
+#
+# sctk-adwaita is a dependency only for Linux, so the lock pins it and
+# `targo fetch` puts its source in the registry; the recorder never calls it
+# (on Linux cargo compiles it all the same).
+#
+# Nothing in the aterm workspace builds this. From this directory:
+#   targo fetch
+#   targo --unverified build --release --locked
+#   targo --unverified run --release --locked --bin record > ../recorded/sctk-adwaita-0.10.1-frame.tsv.new
+#   targo --unverified run --release --locked --bin record planes > ../../../aterm-window/tests/recorded/sctk-adwaita-0.10.1-shadow.tsv.new
+# It prints rows only; the committed TSV adds the `#` header that says what
+# the rows are. Diff the rows against the committed ones: a difference is the
+# recorder changing, never a reason to edit the corpus by hand.
+[package]
+name = "aterm-gui-adwaita-recorder"
+version = "0.0.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[workspace]
+
+[[bin]]
+name = "record"
+path = "src/main.rs"
+
+[[bin]]
+name = "dbus-send"
+path = "src/bin/dbus-send.rs"
+
+[dependencies]
+log = "0.4"
+tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sctk-adwaita = { version = "=0.10.1", default-features = false }

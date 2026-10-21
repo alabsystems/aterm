@@ -301,16 +301,19 @@ impl ForgeBand {
     pub(super) fn solve(ground: u32, dark: bool) -> Self {
         // The crate's WCAG luminance (`color_math`), the one any page floor
         // on the caret measures with, so such a floor leaves these fills be.
-        let lum_of = crate::color_math::relative_luminance;
+        let table = crate::color_math::relative_luminance_table();
+        let lum_of = |c: u32| crate::color_math::relative_luminance_with(table, c);
         let lum = lum_of(ground);
         let ratio = |p: f32| {
             let l = lum_of(fire_ramp(p));
             (l.max(lum) + 0.05) / (l.min(lum) + 0.05)
         };
-        let reads = |p: f32| ratio(p) >= Self::PAGE_CONTRAST;
         // Bright side: lighter than the page and reading, false below and
         // true above, so the band starts at the first point that reads.
-        let lit = |p: f32| lum_of(fire_ramp(p)) > lum && reads(p);
+        let lit = |p: f32| {
+            let l = lum_of(fire_ramp(p));
+            l > lum && (l + 0.05) / (lum + 0.05) >= Self::PAGE_CONTRAST
+        };
         let bright = lit(Self::TOP).then(|| {
             let lo = if lit(Self::COLD) {
                 Self::COLD
@@ -321,7 +324,10 @@ impl ForgeBand {
         });
         // Deep side: darker than the page and reading, true below and false
         // above, so the band ends at the last point that reads.
-        let deep_ok = |p: f32| lum_of(fire_ramp(p)) < lum && reads(p);
+        let deep_ok = |p: f32| {
+            let l = lum_of(fire_ramp(p));
+            l < lum && (lum + 0.05) / (l + 0.05) >= Self::PAGE_CONTRAST
+        };
         let deep = deep_ok(0.0).then(|| {
             let hi = if deep_ok(Self::HOT) {
                 Self::HOT

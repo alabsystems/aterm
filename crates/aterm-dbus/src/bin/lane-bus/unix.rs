@@ -45,6 +45,7 @@ const RD_SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
 const SC: &str = "org.gnome.Mutter.ScreenCast";
 const SC_PATH: &str = "/org/gnome/Mutter/ScreenCast";
 const SC_SESSION: &str = "org.gnome.Mutter.ScreenCast.Session";
+const SC_STREAM: &str = "org.gnome.Mutter.ScreenCast.Stream";
 
 /// The AT-SPI 2 roles, by number (at-spi2-core's `AtspiRole`).
 const ROLES: [&str; 130] = [
@@ -271,6 +272,10 @@ pub(crate) fn main() -> ExitCode {
                 "seat <mutter-pid> <app> <app-pid> <step>...".into(),
             )),
         },
+        Some("cast") => match (args.get(1).map(|p| p.parse::<u32>()), args.get(2)) {
+            (Some(Ok(mutter)), Some(out)) if args.len() == 3 => cast(mutter, Path::new(out)),
+            _ => Err(Fail::Usage("cast <mutter-pid> <out.png>".into())),
+        },
         Some("xseat") => match (args.get(1), args.get(2).map(|p| p.parse::<u32>())) {
             (Some(app), Some(Ok(pid))) => parse_steps(args.get(3..).unwrap_or_default())
                 .map_err(Fail::Usage)
@@ -289,8 +294,25 @@ pub(crate) fn main() -> ExitCode {
             }
             _ => Err(Fail::Usage("xgrab <window> <out>".into())),
         },
+        Some("xhide") => match (args.get(1), args.get(2), args.get(3)) {
+            (Some(display), Some(server), Some(hide)) if args.len() == 4 => {
+                xhide(display, server, hide)
+            }
+            _ => Err(Fail::Usage(
+                "xhide <display> <server-display> <extension>[,<extension>...]|-".into(),
+            )),
+        },
+        Some("wlhide") => match (args.get(1), args.get(2)) {
+            (Some(listen), Some(server)) if args.len() > 3 => {
+                wlhide(listen, server, args.get(3..).unwrap_or_default())
+            }
+            _ => Err(Fail::Usage(
+                "wlhide <listen-socket> <server-socket> hide:<interface>|cap:<interface>=<n>|-..."
+                    .into(),
+            )),
+        },
         _ => Err(Fail::Usage(
-            "lane-bus atspi-walk <app> <pid> | atspi-listen <app> <out> <stop> | seat <mutter-pid> <app> <app-pid> <step>... | xseat <app> <app-pid> <step>... | xdnd <window> <uri> <marks-dir> | xgrab <window> <out>"
+            "lane-bus atspi-walk <app> <pid> | atspi-listen <app> <out> <stop> | seat <mutter-pid> <app> <app-pid> <step>... | cast <mutter-pid> <out.png> | xseat <app> <app-pid> <step>... | xdnd <window> <uri> <marks-dir> | xgrab <window> <out> | xhide <display> <server-display> <extensions>|- | wlhide <listen> <server> <rule>..."
                 .into(),
         )),
     };
@@ -309,6 +331,16 @@ pub(crate) fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The filtering proxies (`xhide`, `wlhide`), which run until killed: a
+/// fault when one cannot listen or reach its server.
+fn xhide(display: &str, server: &str, hide: &str) -> Result<(), Fail> {
+    crate::xhide::run(display, server, hide).map_err(Fail::Fault)
+}
+
+fn wlhide(listen: &str, server: &str, rules: &[String]) -> Result<(), Fail> {
+    crate::wlhide::run(listen, server, rules).map_err(Fail::Fault)
 }
 
 /// An X client's failure: no server (or no extension) to speak to is "not
@@ -1294,6 +1326,168 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     }
     println!("ok seat {} steps", steps.len());
     Ok(())
+}
+
+/// `cast <mutter-pid> <out.png>`: one frame of the primary monitor of the
+/// Mutter that is process `mutter`, as its compositor composited it, written
+/// to `out` as a PNG: a ScreenCast session of its own (no RemoteDesktop, the
+/// cursor left out), whose PipeWire stream `gst-launch-1.0` reads one buffer
+/// of (`pipewiresrc`, `videoconvert`, `pngenc`). Mutter sends the monitor's
+/// whole frame first, so the one buffer is the screen as it is now. The
+/// PipeWire node is the user's daemon's (`XDG_RUNTIME_DIR`), which the stream
+/// needs before the session starts: without it the session's `Start` fails
+/// and the verb says so (NOT AVAILABLE).
+fn cast(mutter: u32, out: &Path) -> Result<(), Fail> {
+    let mut conn = Connection::session().map_err(|e| Fail::NotHere(format!("session bus: {e}")))?;
+    let sc = names_of(&mut conn, mutter)
+        .into_iter()
+        .find(|name| {
+            call(
+                &mut conn,
+                name,
+                SC_PATH,
+                PROPERTIES,
+                "GetAll",
+                vec![SC.into()],
+            )
+            .is_ok()
+        })
+        .ok_or_else(|| {
+            Fail::NotHere(format!(
+                "process {mutter} serves no {SC} on the session bus (not a Mutter)"
+            ))
+        })?;
+    let none = Value::dict(Type::Str, Type::Variant, Vec::new()).map_err(Fail::fault)?;
+    let body = call(&mut conn, &sc, SC_PATH, SC, "CreateSession", vec![none])
+        .map_err(|e| Fail::NotHere(format!("no screencast here: CreateSession: {e}")))?;
+    let session = match body.first() {
+        Some(Value::Path(p)) => p.as_str().to_owned(),
+        other => {
+            return Err(Fail::Fault(format!(
+                "ScreenCast.CreateSession answered {}",
+                other.map_or_else(|| "nothing".into(), render)
+            )));
+        }
+    };
+    // The primary monitor (an empty connector), the cursor hidden (Mutter's
+    // `cursor-mode` 0).
+    let hidden = Value::dict(
+        Type::Str,
+        Type::Variant,
+        vec![("cursor-mode".into(), Value::variant(Value::U32(0)))],
+    )
+    .map_err(Fail::fault)?;
+    let body = call(
+        &mut conn,
+        &sc,
+        &session,
+        SC_SESSION,
+        "RecordMonitor",
+        vec!["".into(), hidden],
+    )
+    .map_err(Fail::Fault)?;
+    let stream = match body.first() {
+        Some(Value::Path(p)) => p.as_str().to_owned(),
+        other => {
+            return Err(Fail::Fault(format!(
+                "RecordMonitor answered {}",
+                other.map_or_else(|| "nothing".into(), render)
+            )));
+        }
+    };
+    let rule = format!(
+        "type='signal',sender='{sc}',path='{stream}',interface='{SC_STREAM}',\
+         member='PipeWireStreamAdded'"
+    );
+    conn.add_match(&rule, CALL).map_err(Fail::fault)?;
+    call(&mut conn, &sc, &session, SC_SESSION, "Start", Vec::new())
+        .map_err(|e| Fail::NotHere(format!("the screencast did not start (pipewire): {e}")))?;
+    let shot = stream_node(&mut conn, &stream).and_then(|node| one_frame(node, out));
+    let _ = call(&mut conn, &sc, &session, SC_SESSION, "Stop", Vec::new());
+    shot?;
+    println!("ok cast {}", out.display());
+    Ok(())
+}
+
+/// The PipeWire node of the screencast stream `stream`, from its
+/// `PipeWireStreamAdded` (a hang detector).
+fn stream_node(conn: &mut Connection, stream: &str) -> Result<u32, Fail> {
+    let started = Instant::now();
+    while started.elapsed() < HANG {
+        let msg = match conn.recv(Some(POLL)) {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(e @ (aterm_dbus::Error::Malformed { .. } | aterm_dbus::Error::Unsupported(_))) => {
+                eprintln!("lane-bus: cast: {e}");
+                continue;
+            }
+            Err(e) => return Err(Fail::fault(e)),
+        };
+        let added = msg.member.as_deref() == Some("PipeWireStreamAdded")
+            && msg.path.as_ref().map(|p| p.as_str()) == Some(stream);
+        if added {
+            return msg.body.first().and_then(Value::as_u32).ok_or_else(|| {
+                Fail::Fault(format!(
+                    "PipeWireStreamAdded carried {}",
+                    msg.body.first().map_or_else(|| "nothing".into(), render)
+                ))
+            });
+        }
+    }
+    Err(Fail::Fault(format!(
+        "the stream never named its PipeWire node ({} s)",
+        HANG.as_secs()
+    )))
+}
+
+/// One buffer of PipeWire node `node`, as a PNG at `out`: `gst-launch-1.0`,
+/// waited for within the hang detector and killed past it.
+fn one_frame(node: u32, out: &Path) -> Result<(), Fail> {
+    let location = format!("location={}", out.display());
+    let path = format!("path={node}");
+    let mut child = aterm_uds::spawnfd::command("gst-launch-1.0")
+        .args([
+            "-q",
+            "pipewiresrc",
+            path.as_str(),
+            "num-buffers=1",
+            "!",
+            "videoconvert",
+            "!",
+            "pngenc",
+            "!",
+            "filesink",
+            location.as_str(),
+        ])
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .map_err(|e| Fail::NotHere(format!("gst-launch-1.0: {e}")))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) => {
+                return Err(Fail::Fault(format!("gst-launch-1.0 ended {status}")));
+            }
+            Ok(None) if started.elapsed() > HANG => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Fail::Fault(format!(
+                    "gst-launch-1.0 read no buffer of node {node} ({} s)",
+                    HANG.as_secs()
+                )));
+            }
+            Ok(None) => std::thread::sleep(POLL),
+            Err(e) => return Err(Fail::Fault(format!("gst-launch-1.0: {e}"))),
+        }
+    }
+    match std::fs::metadata(out) {
+        Ok(m) if m.len() > 0 => Ok(()),
+        _ => Err(Fail::Fault(format!(
+            "gst-launch-1.0 wrote no {}",
+            out.display()
+        ))),
+    }
 }
 
 /// The `DX DY` the file `path` holds now (a `move:@PATH` step's).

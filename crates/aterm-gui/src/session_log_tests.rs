@@ -86,7 +86,7 @@ pub(super) fn opened() -> (Mutex<SessionTimeline>, Hand) {
     {
         let mut g = tl.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
     }
     (tl, hand)
@@ -96,9 +96,14 @@ pub(super) fn opened() -> (Mutex<SessionTimeline>, Hand) {
 /// its agent run open (the sweep the name wakes opened it): the record count
 /// before the agent's first verdict.
 pub(super) fn with_claude(tl: &Mutex<SessionTimeline>) {
+    with_agent(tl, "claude");
+}
+
+/// [`with_claude`] for the agent named `name` (`codex`: a Codex run).
+pub(super) fn with_agent(tl: &Mutex<SessionTimeline>, name: &str) {
     let mut g = tl.lock().unwrap();
     assert!(g.note_foreground_group(300));
-    assert!(g.set_program(300, Some("claude".into())));
+    assert!(g.set_program(300, Some(name.into())));
     swept(&mut g);
 }
 
@@ -120,7 +125,8 @@ fn swept(g: &mut SessionTimeline) {
 // ---- (1) register and deregister_local_as -----------------------------
 
 /// THE SESSION NODE: the registry's first registration opens it (`spawn`,
-/// `parent=` the spawning session, `epoch=1`), a replace writes nothing, and
+/// `parent=` the spawning session, `epoch=1`, `state=` the registration's,
+/// 6F-7), a replace writes nothing, and
 /// the deregister closes it with the exit ledger's reason, actor and code.
 #[test]
 fn register_opens_the_session_and_deregister_closes_it_with_the_ledgers_tale() {
@@ -134,7 +140,8 @@ fn register_opens_the_session_and_deregister_closes_it_with_the_ledgers_tale() {
     assert_eq!(
         lines_of(&timeline),
         vec![format!(
-            "1 open - spawn parent=s-0123456789abcdef0123 epoch=1 src=aterm conf=exact t={WALL0}"
+            "1 open - spawn parent=s-0123456789abcdef0123 epoch=1 state=alive src=aterm conf=exact \
+             t={WALL0}"
         )]
     );
     // NEGATIVE CONTROL: a replace (a relabel) is not a birth.
@@ -228,7 +235,7 @@ fn a_restored_adopted_or_kept_session_opens_as_what_it_is() {
         vec![
             format!("1 gap - gap why=crash by=aterm src=aterm conf=exact t={WALL0}"),
             format!(
-                "2 open - adopt epoch={} src=aterm conf=exact t={WALL0}",
+                "2 open - adopt epoch={} state=alive src=aterm conf=exact t={WALL0}",
                 WALL0 / 1000
             ),
         ]
@@ -310,11 +317,12 @@ fn a_seamless_update_carries_the_epoch_and_never_reissues_a_node_id() {
         after[..2],
         [
             format!(
-                "{} gap - gap why=handoff epoch=2 by=aterm src=aterm conf=exact t={WALL0}",
+                "{} gap - gap why=handoff epoch=2 build=7 by=aterm src=aterm conf=exact \
+                 t={WALL0}",
                 s0 + 1
             ),
             format!(
-                "{} open - adopt epoch=2 src=aterm conf=exact t={WALL0}",
+                "{} open - adopt epoch=2 state=alive src=aterm conf=exact t={WALL0}",
                 s0 + 2
             ),
         ]
@@ -360,7 +368,7 @@ fn a_seamless_update_carries_the_epoch_and_never_reissues_a_node_id() {
     {
         let mut g = bare.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
         g.note_foreground_group(301);
         g.set_program(301, Some("vim".into()));
@@ -511,6 +519,7 @@ fn a_seq_count_past_any_log_never_stands_the_commit_down() {
                 mirror: None,
             },
             false,
+            None,
             at,
         );
         for _ in 0..4 {
@@ -843,8 +852,8 @@ fn a_block_closed_without_a_d_ends_unknown_and_an_older_one_is_not_ours() {
     {
         let mut g = adopted.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().adopt(LogAdopt::default(), false, now);
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().adopt(LogAdopt::default(), false, None, now);
+        g.slog_mut().open_session(None, None, now);
     }
     blocks(
         &adopted,
@@ -1195,7 +1204,7 @@ fn a_persons_input_marks_its_burst_and_attributes_the_turn() {
     {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
     }
     with_claude(&h.ctx.timeline);
@@ -1244,7 +1253,7 @@ fn a_ctl_turn_labels_the_turn_it_opens_with_its_ledger_id() {
     {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
     }
     with_claude(&h.ctx.timeline);
@@ -1527,7 +1536,13 @@ fn every_producer_runs_under_the_timeline_lock_alone() {
                 effort: None,
             };
             g.slog_mut().observe_card(&card, now);
-            g.slog_mut().observe_render("healed", now);
+            g.slog_mut().observe_render(
+                &crate::resize_ledger::Transition::Healed {
+                    run: 1,
+                    after_ms: 2,
+                },
+                now,
+            );
             g.record_cwd_change(Some("/a"));
             g.slog_mut().observe_title("t", now);
             let _ = g.slog_take_wake();
@@ -2147,7 +2162,7 @@ fn claude_handle() -> (crate::session_store::SessionHandle, Hand) {
     {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
     }
     with_claude(&h.ctx.timeline);
@@ -2344,7 +2359,7 @@ fn first_turn_after(
     {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
     }
     blocks(&h.ctx.timeline, &hand, 10, &running(1, 5, "claude"));
@@ -2457,7 +2472,7 @@ fn input_while_the_name_waits_attributes_the_first_turn() {
         {
             let mut g = h.ctx.timeline.lock().unwrap();
             let now = g.slog().now();
-            g.slog_mut().open_session(None, now);
+            g.slog_mut().open_session(None, None, now);
             g.note_root_group(100);
         }
         if by_ms < 10 {
@@ -2521,7 +2536,7 @@ fn input_while_the_name_waits_attributes_the_first_turn() {
     {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
     }
     hand.set(3);
@@ -2564,8 +2579,8 @@ fn a_command_from_before_this_process_measures_its_duration_on_the_wall() {
     {
         let mut g = tl.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().adopt(LogAdopt::default(), false, now);
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().adopt(LogAdopt::default(), false, None, now);
+        g.slog_mut().open_session(None, None, now);
     }
     let began = WALL0 - 3_600_000;
     let read = |end: BlockEnd| BlockRead {
@@ -3455,8 +3470,8 @@ fn an_adoption_told_no_epoch_resets_a_predecessors_cursor() {
         {
             let mut g = tl.lock().unwrap();
             let now = g.slog().now();
-            g.slog_mut().adopt(LogAdopt::default(), keeper, now);
-            g.slog_mut().open_session(None, now);
+            g.slog_mut().adopt(LogAdopt::default(), keeper, None, now);
+            g.slog_mut().open_session(None, None, now);
             g.note_root_group(100);
             for pgid in 200..210 {
                 g.note_foreground_group(pgid);
@@ -4233,8 +4248,8 @@ fn oracle_adopted(ms: u64) -> (Mutex<SessionTimeline>, Hand) {
     {
         let mut g = tl.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().adopt(LogAdopt::default(), false, now);
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().adopt(LogAdopt::default(), false, None, now);
+        g.slog_mut().open_session(None, None, now);
         g.note_root_group(100);
     }
     (tl, hand)
@@ -5750,6 +5765,7 @@ fn recovered(ms: u64, tag_ep: Option<u32>) -> SessionLog {
             ..LogAdopt::default()
         },
         true,
+        None,
         at,
     );
     log
@@ -5798,6 +5814,7 @@ fn two_crash_adoptions_in_one_second_take_growing_epochs() {
                 mirror: None,
             },
             false,
+            None,
             Stamp::new(WALL0, 5),
         );
     }
@@ -5847,7 +5864,7 @@ fn app_with_logs(n: u64, marks: usize) -> crate::App {
     for s in app.pool.iter() {
         let mut g = s.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
         for _ in 0..marks {
             g.slog_mut().human_input(true, now);
         }
@@ -6178,8 +6195,13 @@ fn closed_log(marks: usize) -> Log {
         g.slog_mut().human_input(true, now);
     }
     let now = g.slog().now();
-    g.slog_mut()
-        .close_session(aterm_slog::SessionOut::UiClose, Actor::Human, None, now);
+    g.slog_mut().close_session(
+        aterm_slog::SessionOut::UiClose,
+        Actor::Human,
+        "-",
+        None,
+        now,
+    );
     g.slog().log().clone()
 }
 
@@ -6370,7 +6392,7 @@ fn a_window_close_builds_only_what_the_closed_index_keeps() {
         let ctx = std::sync::Arc::clone(&app.pool.get(last).expect("pooled").ctx);
         let mut g = ctx.timeline.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
     }
     let held = |h: &crate::session_store::SessionHandle| {
         !h.ctx.timeline.lock().unwrap().slog().log().is_empty()
@@ -6704,7 +6726,6 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
         ("obs_ctx", "10".to_string()),
         ("obs_goal", "1".to_string()),
         ("obs_prog", "indeterminate.10".to_string()),
-        ("obs_render", "desync-risk".to_string()),
         ("cwd_fp", fp.clone()),
         ("title_fp", fp.clone()),
         ("obs_esc", "1".to_string()),
@@ -6854,7 +6875,7 @@ fn process(leaf_ep: Option<u32>) -> Arc<Epochs> {
 fn spawned_in(epochs: &Arc<Epochs>, ms: u64, marks: u64) -> SessionLog {
     let mut log = SessionLog::starting(Arc::clone(epochs), at(ms));
     log.set_clock(Clock::reading(move || at(ms)));
-    log.open_session(None, at(ms));
+    log.open_session(None, None, at(ms));
     for _ in 0..marks {
         log.human_input(true, at(ms));
     }
@@ -6867,8 +6888,8 @@ fn spawned_in(epochs: &Arc<Epochs>, ms: u64, marks: u64) -> SessionLog {
 fn adopted_in(epochs: &Arc<Epochs>, ms: u64) -> SessionLog {
     let mut log = SessionLog::starting(Arc::clone(epochs), at(ms));
     log.set_clock(Clock::reading(move || at(ms)));
-    log.adopt(LogAdopt::default(), false, at(ms));
-    log.open_session(None, at(ms));
+    log.adopt(LogAdopt::default(), false, None, at(ms));
+    log.open_session(None, None, at(ms));
     log
 }
 
@@ -7000,6 +7021,7 @@ fn an_adoption_after_a_chain_ahead_of_the_clock_repeats_no_epoch() {
                 ..LogAdopt::default()
             },
             false,
+            None,
             at(100 * i),
         );
         assert_eq!(next.log().ep(), pred + 1, "a carried successor's");
@@ -7096,6 +7118,7 @@ fn a_told_epoch_at_the_top_saturates_nothing() {
             ..LogAdopt::default()
         },
         true,
+        None,
         at(0),
     );
     eps.push(crashed.log().ep());

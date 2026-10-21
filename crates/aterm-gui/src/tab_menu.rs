@@ -2,15 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 //! The in-grid tab context menu: the popup a right-click on an in-grid tab chip opens,
-//! painted as terminal cells over the frame like the rest of aterm's chrome (strip,
-//! find bar, config banner).
+//! painted as terminal cells over the frame like the rest of aterm's chrome. It renders
+//! [`crate::session_chrome::compose_tab_menu`]'s model off macOS; macOS renders the same
+//! model as an `NSMenu` off the strip's `TabView`.
 //!
-//! It renders [`crate::session_chrome::compose_tab_menu`]'s model (identity headers,
-//! the timeline tail, then `Rename Session…` / `Copy Session ID` / `Copy CWD` /
-//! `Close Tab`) off macOS; macOS renders the same model as an `NSMenu` off the strip's
-//! `TabView`.
+//! Cells, not `TrackPopupMenu`:
 //!
-//! # Why cells and not `TrackPopupMenu`
+//! * `TrackPopupMenu` runs its own modal message loop from inside winit's event callback,
+//!   and the vendored runner panics when `RedrawRequested` re-enters its handler
+//!   (`vendor/winit/src/platform_impl/windows/event_loop/runner.rs`), so the `WM_PAINT`
+//!   after a popup would kill the app. (`drag_window()` is safe because winit posts
+//!   `WM_NCLBUTTONDOWN` and returns first; a popup has no such cheap deferral point.)
+//! * There is no `HMENU` FFI, and the identity card at the top reads as a broken menu
+//!   when rendered as disabled system rows.
+//! * Everything around it is themed cells; a system-tinted popup would be the one seam.
 //!
 //! * `TrackPopupMenu` runs its own modal message loop, and every call site is inside
 //!   winit's event callback. The vendored runner takes the handler out of a `Cell`
@@ -46,7 +51,7 @@ use crate::tab_model::TabId;
 
 /// Cells of horizontal breathing room inside each vertical border.
 const H_PAD: usize = 1;
-/// Narrowest the card may be, in CONTENT cells — a menu whose rows read
+/// Narrowest the card may be, in content cells: a menu whose rows read
 /// `Copy…`/`Close…` is worse than one that runs a little wide.
 const MIN_CONTENT: usize = 16;
 /// Widest the card may be, in content cells. Headers (whose description can reach
@@ -68,8 +73,7 @@ pub(crate) struct TabMenu {
     /// The composed model, snapshotted at pop time so the card never reflows under
     /// the pointer; actions resolve their payloads fresh at dispatch.
     pub entries: Vec<TabMenuEntry>,
-    /// The strip COLUMN the press landed on — the card's left edge wants to sit
-    /// here, before clamping.
+    /// The strip column the press landed on: the card's left edge, before clamping.
     pub anchor_col: u16,
     /// The highlighted row (index into `entries`), or `None` when the pointer is off
     /// every action row. A keyboard open seeds the first enabled action; a mouse open
@@ -145,7 +149,7 @@ pub(crate) fn display_cells(s: &str) -> usize {
     s.chars().map(|c| char_cells(safe_char(c))).sum()
 }
 
-/// `s` cut to at most `max` DISPLAY cells, ellipsized when it did not fit. Cuts
+/// `s` cut to at most `max` display cells, ellipsized when it did not fit. Cuts
 /// on a whole char (never half a wide glyph) and leaves a cell for the `…`.
 #[must_use]
 pub(crate) fn ellipsize(s: &str, max: usize) -> String {
@@ -251,8 +255,9 @@ pub(crate) fn place(
     })
 }
 
-/// Entry rows the card at `rect` shows (height minus two border rows). A truncated
-/// card shows a prefix of the model; see [`entry_at_row`] on why there is no scroller.
+/// Entry rows the card at `rect` shows (height minus two border rows). There is no
+/// scroller: the model is bounded, so only a tiny window truncates, and a truncated card
+/// shows a prefix of the model.
 #[must_use]
 pub(crate) fn visible_entries(rect: MenuRect) -> usize {
     rect.h.saturating_sub(2)
@@ -260,10 +265,6 @@ pub(crate) fn visible_entries(rect: MenuRect) -> usize {
 
 /// Which model entry frame `row` shows, or `None` for border rows and rows past the
 /// truncation. Inverse of the painter's row walk.
-///
-/// No scrolling: the model is bounded (identity ≤ 4 lines, timeline ≤
-/// [`crate::session_chrome::TIMELINE_TAIL`], four actions), so truncation only happens
-/// in a tiny window, where fewer rows beat a scrollbar.
 #[must_use]
 pub(crate) fn entry_at_row(rect: MenuRect, row: usize) -> Option<usize> {
     if row <= rect.row || row + 1 >= rect.row + rect.h {
@@ -403,10 +404,10 @@ pub(crate) fn menu_colors(palette: impl Into<chrome_band::ChromePalette>) -> Men
         ((theme.fg >> 8) & 0xff) as u8,
         (theme.fg & 0xff) as u8,
     ];
-    // One more step toward the ink than the band: the find bar sits ON the grid
-    // edge and may share its tone; a popup over live text may not.
+    // One more step toward the ink than the band: the find bar sits on the grid edge and
+    // may share its tone; a popup over live text may not.
     let card_bg = chrome_band::mix3(band.bar_bg, fg, 0.08);
-    // AA against the CARD, not against the band — the ground moved.
+    // AA against the card ground, not the band's.
     let value = chrome_band::ensure_contrast(fg, card_bg, 4.5);
     let label = chrome_band::ensure_contrast(band.label, card_bg, 4.5);
     let rule = chrome_band::mix3(card_bg, value, 0.34);
@@ -514,8 +515,8 @@ pub(crate) fn paint(
             TabMenuEntry::Separator => unreachable!("handled above"),
         };
         let mut row = vec![chrome_band::cell(' ', fg, bg, false, false); w];
-        // The vertical rules keep the CARD ground even on a highlighted row —
-        // a selection wash that reaches the border makes the card look torn.
+        // The vertical rules keep the card ground even on a highlighted row: a selection
+        // wash that reaches the border makes the card look torn.
         row[0] = chrome_band::cell('\u{2502}', c.rule, c.card_bg, false, false);
         if w >= 2 {
             row[w - 1] = chrome_band::cell('\u{2502}', c.rule, c.card_bg, false, false);
@@ -534,14 +535,11 @@ pub(crate) fn paint(
     rows
 }
 
-/// A cell that renders as bare terminal ground, as the renderer draws columns a row
-/// does not materialize.
+/// A cell that renders as bare terminal ground. The engine trims trailing blanks, so a
+/// row from `cell_frame_into` can stop short of the card's right edge; the splice pads
+/// it with this, reproducing the pixels already there.
 ///
-/// The engine trims trailing blanks, so a blank row arrives from `cell_frame_into` as
-/// an empty `Vec`. The splice pads rows up to the card's right edge with this before
-/// writing, reproducing the pixels already there.
-///
-/// `default_bg` is the frame's OSC-11 background, or `COLOR_UNSET` to use the theme's.
+/// `default_bg` is the frame's OSC-11 background, or `COLOR_UNSET` for the theme's.
 /// On a split, a pane's own `default_bg_spans` value can differ; the pad is then off
 /// only on cells the card overwrites, except at the very edge.
 #[must_use]
@@ -581,8 +579,8 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
             TabMenuEntry::Action { label, enabled, .. } => {
                 (2u8, label.as_str(), *enabled).hash(&mut h);
             }
-            // A connection row's identity is its PEER as well as its label —
-            // two peers' `Disconnect` rows read alike and must not collapse.
+            // A connection row's identity is its peer as well as its label: two peers'
+            // `Disconnect` rows read alike and must not collapse.
             TabMenuEntry::ConnectionAction {
                 label,
                 peer_sid,
@@ -740,8 +738,8 @@ mod tests {
             None,
             "nor the left rule"
         );
-        // …but every one of those points is still ON the card, so the caller
-        // swallows the press instead of leaking it to the grid below.
+        // ...but every one of those points is still on the card, so the caller swallows
+        // the press instead of leaking it to the grid below.
         for (r, cc) in [
             (rect.row, rect.col + 3),
             (rect.row + 1, rect.col),

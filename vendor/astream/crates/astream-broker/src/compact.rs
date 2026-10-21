@@ -22,6 +22,11 @@
 //!
 //! Its durable steps, in order, each a crash point of the [`Seam`]:
 //!
+//! 0. [`Step::Held`]: a log the retention rules retain (`retention.rs`) has its held
+//!    store's frames for this compaction appended to `<log>.held` and flushed, each naming
+//!    the new base, before anything else is written (`held.rs`). An open that finds them
+//!    while the log's base is still the old one cuts them away: the records they carry are
+//!    still in the log.
 //! 1. [`Step::Copy`]: `<log>.kept` holds every byte of the log from the cut, flushed.
 //! 2. [`Step::State`]: `<log>.state.next` is durable (a carrying compaction only).
 //! 3. [`Step::Intent`]: `<log>.compact` is durable.
@@ -93,6 +98,7 @@ const INTENT_AAD: &[u8] = b"astream-compact-intent-v1";
 /// it (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
+    Held,
     Copy,
     State,
     Intent,
@@ -371,14 +377,17 @@ pub(crate) fn clear_leftovers(log: &Path) {
         staged_state_path(log),
         intent_tmp,
         staged_tmp,
+        crate::held::held_tmp_path(log),
     ] {
         let _ = remove_file_path(&p);
     }
 }
 
-/// A log this open CREATED carries none of a deleted predecessor's compaction.
+/// A log this open CREATED carries none of a deleted predecessor's compaction, nor its
+/// held store.
 pub(crate) fn clear_created(log: &Path) {
     let _ = remove_file_path(&intent_path(log));
+    let _ = remove_file_path(&crate::held::held_path(log));
     clear_leftovers(log);
 }
 
@@ -928,6 +937,11 @@ impl KeptCopy {
     /// `<log>.kept`.
     pub(crate) fn kept(&self) -> &Path {
         &self.kept
+    }
+
+    /// The compaction's seam, which the held store's append before the copy crashes at too.
+    pub(crate) const fn seam(&self) -> &Seam {
+        &self.seam
     }
 
     /// Give the compaction up before its switch: close and remove the copy.

@@ -85,7 +85,7 @@ const CASES: &[Case] = &[
     // Before an intermediate the list closes the same way.
     (b"\x1b[1; qX", &[(&[1, 0], b" ", b'q', 0)]),
     (b"\x1b[?1;$pX", &[(&[1, 0], b"?$", b'p', 0)]),
-    // Leading and middle empties already arrived as 0; they still do.
+    // Leading and middle empties are 0 too.
     (b"\x1b[;1mX", &[(&[0, 1], b"", b'm', 0)]),
     (b"\x1b[1;;4mX", &[(&[1, 0, 4], b"", b'm', 0)]),
     // After a subparameter group, a `;` opens an (empty) parameter too.

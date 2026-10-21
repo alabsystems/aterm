@@ -87,7 +87,7 @@ pub use mirror::{
 };
 #[path = "log_quota.rs"]
 mod quota;
-pub use quota::mark_quota;
+pub use quota::{PROGRAM_SHARE_MAX, mark_quota, program_share};
 pub use summary::CLOSED_SUMMARY_BYTES;
 
 /// A session ring's record bound (§5.1).
@@ -813,6 +813,17 @@ struct Entry {
     /// mirror turned on later finds every record numbered; its only cost
     /// with the mirror off is these 8 bytes a record ([`ENTRY_BYTES`]).
     ms: u64,
+    /// THE RECORD'S PROCESS-CLOCK READING (Phase 6 step 6F-1, ruling U1):
+    /// the `mono_ms` of the [`Stamp`] its append was given, so a view that
+    /// orders or ages records on this process's monotonic clock (the
+    /// timeline's `t_ms`) reads it off the record, never off the wall `t=`.
+    /// RAM ONLY: it is no field, so no tier encodes it, and neither the
+    /// journal nor the carry writes it. A record this process did not append
+    /// has none of its own: a carried one reads its wall time on this clock
+    /// ([`crate::turn::rebase`], clamped as a carried open node's is), and
+    /// one read back from a journal or a closed summary reads 0. Another 8
+    /// bytes a record ([`ENTRY_BYTES`]), which [`Log::footprint`] counts.
+    mono: u64,
 }
 
 /// One node of the log's index: a node that is open, or whose subtree holds
@@ -1050,6 +1061,21 @@ impl Log {
         next_seq: u64,
         at: Stamp,
     ) -> Log {
+        Log::after_handoff_built(ep, limits, ids, next_seq, None, at)
+    }
+
+    /// [`Log::after_handoff`], the gap naming the predecessor's build
+    /// (`gap why=handoff epoch=<ep> build=<n>`, Phase 6 step 6F-7) when the
+    /// update said it.
+    #[must_use]
+    pub fn after_handoff_built(
+        ep: u32,
+        limits: Limits,
+        ids: IdCounters,
+        next_seq: u64,
+        build: Option<u64>,
+        at: Stamp,
+    ) -> Log {
         let mut log = Log::with_limits(ep, limits);
         log.issued = ids.slots();
         // A count past the limit is no count ([`SEQ_LIMIT`]): a new seq space.
@@ -1060,7 +1086,7 @@ impl Log {
         };
         log.last_seq = next_seq - 1;
         log.first_seq = next_seq;
-        log.gap(GapWhy::Handoff, 0, at);
+        log.gap_built(GapWhy::Handoff, 0, build, at);
         log
     }
 
@@ -1375,6 +1401,25 @@ impl Log {
         self.ring.iter().map(|e| &*e.rec)
     }
 
+    /// The live records, oldest first, each with its process-clock reading
+    /// (6F-1: the `mono_ms` of the stamp its append was given; a carried
+    /// record's wall time on this clock, a journaled or summarized one's 0).
+    pub fn window_mono(&self) -> impl DoubleEndedIterator<Item = (&Rec, u64)> + ExactSizeIterator {
+        self.ring.iter().map(|e| (&*e.rec, e.mono))
+    }
+
+    /// The process-clock reading of the live record at `seq` (as
+    /// [`Log::window_mono`] gives it), or `None` when no live record has
+    /// that seq.
+    #[must_use]
+    pub fn mono_of(&self, seq: u64) -> Option<u64> {
+        let i = self.ring.partition_point(|e| e.rec.seq < seq);
+        self.ring
+            .get(i)
+            .filter(|e| e.rec.seq == seq)
+            .map(|e| e.mono)
+    }
+
     /// The fold of every record ever appended, evicted or not.
     #[must_use]
     pub const fn fold(&self) -> &Fold {
@@ -1597,7 +1642,7 @@ impl Log {
         self.session_kind = kind;
         self.session_t = at.wall_ms;
         self.session_mono = at.mono_ms;
-        Ok(self.push(rec))
+        Ok(self.push(rec, at.mono_ms))
     }
 
     /// Open a run, turn or step (§2.3). Returns the new node.
@@ -1664,7 +1709,7 @@ impl Log {
             log.issued[slot] = n;
             let cls = rec.f.get_word(Key::Cls);
             let continues = rec.f.get(Key::Cont).is_some();
-            log.push(rec);
+            log.push(rec, at.mono_ms);
             if lvl == Lvl::Step && !continues {
                 log.count_step(parent, o.kind, cls);
             }
@@ -1781,7 +1826,7 @@ impl Log {
             f: m.f,
         };
         fits(&rec)?;
-        let seq = self.push(rec);
+        let seq = self.push(rec, at.mono_ms);
         if is_mail {
             self.for_open_lineage(node, |r| r.mail = r.mail.saturating_add(1));
         }
@@ -1829,11 +1874,18 @@ impl Log {
             f: a.f,
         };
         fits(&rec)?;
-        Ok(self.push(rec))
+        Ok(self.push(rec, at.mono_ms))
     }
 
     /// Record a loss (`gap - gap why=<why> lost=<n>`). Returns its seq.
     pub fn gap(&mut self, why: GapWhy, lost: u64, at: Stamp) -> u64 {
+        self.gap_built(why, lost, None, at)
+    }
+
+    /// [`Log::gap`], naming the build of the process the loss came across
+    /// from (`build=<n>`, Phase 6 step 6F-7: a handoff's or a crash
+    /// adoption's predecessor) when `build` says it.
+    pub fn gap_built(&mut self, why: GapWhy, lost: u64, build: Option<u64>, at: Stamp) -> u64 {
         let mut f = Fields::new();
         // Every value below is of its key's shape and the record is far
         // under the byte bound, so none of these can be refused.
@@ -1844,18 +1896,24 @@ impl Log {
         if why == GapWhy::Handoff {
             let _ = f.set(Key::Epoch, Val::U(u64::from(self.ep)));
         }
-        self.push(Rec {
-            seq: 0,
-            t: at.wall_ms,
-            op: Op::Gap,
-            node: Node::SESSION,
-            par: None,
-            k: Kind::Gap,
-            src: Src::Aterm,
-            conf: Conf::Exact,
-            by: Actor::Aterm,
-            f,
-        })
+        if let Some(build) = build {
+            let _ = f.set(Key::Build, Val::U(build));
+        }
+        self.push(
+            Rec {
+                seq: 0,
+                t: at.wall_ms,
+                op: Op::Gap,
+                node: Node::SESSION,
+                par: None,
+                k: Kind::Gap,
+                src: Src::Aterm,
+                conf: Conf::Exact,
+                by: Actor::Aterm,
+                f,
+            },
+            at.mono_ms,
+        )
     }
 
     // ---- internals ---------------------------------------------------
@@ -2116,7 +2174,7 @@ impl Log {
                 self.for_open_lineage(p, |r| r.errs = r.errs.saturating_add(1));
             }
         }
-        self.push(rec)
+        self.push(rec, at.mono_ms)
     }
 
     /// A TURN'S CLOSE RESTATES ITS `ledger=` (plan 5F-4a, ruling T12): the
@@ -2166,13 +2224,15 @@ impl Log {
         }
     }
 
-    /// Append a record that fits: assign its seq, apply it to the fold,
-    /// index it, then evict a batch when the ring is past its limits.
-    fn push(&mut self, mut rec: Rec) -> u64 {
+    /// Append a record that fits, appended at the process clock's `mono`:
+    /// assign its seq, apply it to the fold, index it, then evict a batch
+    /// when the ring is past its limits.
+    fn push(&mut self, mut rec: Rec, mono: u64) -> u64 {
         self.last_seq = self.last_seq.saturating_add(1);
         rec.seq = self.last_seq;
         let bytes = encoded_size(&rec, Tier::Content).unwrap_or(MAX_RECORD_BYTES);
         let claim = rec.src == Src::Mark;
+        let program = (rec.op == Op::Mark && rec.k == Kind::Program).then_some(rec.node);
         let ms = if rec.is_bus_class() {
             self.ms_head = self.ms_head.saturating_add(1);
             self.ms_head
@@ -2186,6 +2246,7 @@ impl Log {
             rec: Arc::new(rec),
             bytes,
             ms,
+            mono,
         });
         self.bytes = self.bytes.saturating_add(bytes);
         // A claim's append keeps the marks within their quarter of the ring
@@ -2193,6 +2254,11 @@ impl Log {
         // quota left.
         if claim {
             self.enforce_mark_quota();
+        }
+        // A program mark keeps its node's program marks within their share
+        // (`log_quota`, T6): a flapping program spends its own.
+        if let Some(node) = program {
+            self.enforce_program_share(Some(node));
         }
         if !self.hold_batch {
             self.settle_batch();

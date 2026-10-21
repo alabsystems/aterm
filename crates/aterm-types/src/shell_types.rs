@@ -37,10 +37,6 @@ pub(crate) fn elapsed_ms(start: Option<u64>, end: Option<u64>) -> Option<u64> {
     }
 }
 
-// ============================================================================
-// Shell Integration (OSC 133)
-// ============================================================================
-
 /// A mark representing a shell command and its output.
 ///
 /// Command marks are created by OSC 133 shell integration sequences.
@@ -140,10 +136,6 @@ impl CommandMark {
         elapsed_ms(self.command_exec_start_time_ms, self.command_end_time_ms)
     }
 }
-
-// ============================================================================
-// Terminal OSC 1337 Protocol (Marks, Annotations)
-// ============================================================================
 
 /// A user-created mark for navigation (OSC 1337 SetMark).
 ///

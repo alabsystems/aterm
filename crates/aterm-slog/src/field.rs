@@ -6,8 +6,9 @@
 //! and its cap (the value's shape and bound). Nothing else decides either.
 
 use crate::vocab::{
-    ACT_WORDS, BOX_WORDS, CAUSE_WORDS, CLS_WORDS, DIR_WORDS, DUR_WORDS, END_WORDS, MAIL_KIND_WORDS,
-    NEED_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, STATE_WORDS, ShortId, VERB_WORDS, WALL_WORDS,
+    ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
+    DUR_WORDS, END_WORDS, HEALED_BY_WORDS, MAIL_KIND_WORDS, NEED_WORDS, NET_WORDS, ORIGIN_WORDS,
+    OUT_WORDS, PHASE_WORDS, POOL_WORDS, SOURCE_WORDS, STATE_WORDS, ShortId, VERB_WORDS, WALL_WORDS,
     WHY_WORDS, WORD_WORDS, lookup,
 };
 
@@ -185,8 +186,12 @@ keys! {
     Value "value" Host Cap::Text(160),
     Vid "vid" Host Cap::Text(64),
     Tool "tool" Host Cap::Text(64),
-    From "from" Host Cap::Text(64),
-    To "to" Host Cap::Text(64),
+    // A mail's sender and a post's address (`mail from= to=`): a principal
+    // at a node, `s-<32>@n-<32>` (69 bytes), and a post's `@` before it, 70
+    // (`aterm_types::fabric_grammar::PRINCIPAL_MAX`; phase 6, the review of
+    // 6F-6: every value the grammar admits is held whole).
+    From "from" Host Cap::Text(72),
+    To "to" Host Cap::Text(72),
     Off "off" Host Cap::U,
     Title "title" Content Cap::Text(240),
     // Phase 3B, appended so no discriminant moves. The usage tap's reading
@@ -233,6 +238,107 @@ keys! {
     // mark limiter's owed-only table spilled into, `crate::limit`). A closed
     // word; HOST only, as the input marks that carry it are.
     Pool "pool" Host Cap::Word(POOL_WORDS),
+    // Phase 6 (6F-2, plan item U2; rulings U11-U13), appended so no
+    // discriminant moves: the fields of the timeline ring's rows their marks
+    // carry once the log holds every fact the ring holds (6F-4..6F-9).
+    // WIRE. A handoff's predecessor build (`handoff build=`, the ring's
+    // `from_build=`).
+    Build "build" Wire Cap::U,
+    // The resize ledger's render verdict (`render run= displaced= at=`): its
+    // run, the rows it displaced (signed) and when, in ms.
+    Run "run" Wire Cap::U,
+    Displaced "displaced" Wire Cap::I,
+    At "at" Wire Cap::U,
+    // The bytes a handback or a reset wrote (`modes bytes=`).
+    Bytes "bytes" Wire Cap::U,
+    // A keyed write's producer (`in-doubt producer=`, `pty_idem`'s number).
+    Producer "producer" Wire Cap::U,
+    // The modes a handback or a reset put back (`modes reverted=alt,kitty`),
+    // the engine's own mode names: every one of them at once is under 300
+    // bytes, and the row's 256-byte payload shows less (the review of 6F-7).
+    Reverted "reverted" Wire Cap::Tok(Charset::Rollup, 300),
+    // A hold's origin (`advisory origin=`).
+    Origin "origin" Wire Cap::Word(ORIGIN_WORDS),
+    // What a program's `blocked` report waits on (`program ask=`, ruling
+    // U17): OSC 7501's `kind=`, which on a record is the mail kind's key.
+    Ask "ask" Wire Cap::Word(ASK_WORDS),
+    // How many earlier values a throttled mark class wrote over unwritten
+    // (`program coalesced=`, `shown coalesced=`; ruling U44): the newest is
+    // always written, and this counts the ones it stands for.
+    Coalesced "coalesced" Wire Cap::U,
+    // HOST. The holder of a self-claim's act (`act holder=`): an id the
+    // server sets, never a caller's text.
+    Holder "holder" Host Cap::Id,
+    // A post's relay hops (`mail via=`) and the caller's own key for it
+    // (`mail idem=`, the post's `key=` token; `key=` is the config key's).
+    // `via=` holds more than the row's 256-byte payload can show of it, and
+    // its writer cuts it to what the record leaves room for (the grammar
+    // admits 560 bytes beside a 70-byte `to=` and a 64-byte `idem=`).
+    Via "via" Host Cap::Text(256),
+    Idem "idem" Host Cap::Text(64),
+    // CONTENT, RAM only (rulings U11-U13): never journaled, carried or
+    // published, as the title is. A hold's or an advisory's reason, the
+    // supervisor's attention text beside its `fp=`, a topic's name beside
+    // its `fp=`, and the raw actor that closed a session (`closer=`, beside
+    // the close's `by=`, which says `-` for a sid no one minted). A reason
+    // is a pct token of at most 128 bytes whose every `%` starts an escape
+    // (`aterm_gui_fabric`'s `reason_token`): 42 escapes, five encoded bytes
+    // each, and two more bytes, 212 (the review of 6F-6).
+    Reason "reason" Content Cap::Text(212),
+    AttnText "attn_text" Content Cap::Text(256),
+    TopicName "topic_name" Content Cap::Text(64),
+    Closer "closer" Content Cap::Text(64),
+    // Phase 6 (6F-5, plan item U3; ruling U11), appended so no discriminant
+    // moves: a topic opt-in's move (`topic change=add|drop`, beside its
+    // name's `fp=`; not `op=`, the record's own token in `log --json`), and
+    // the `since=` token an add resumes from, CONTENT as the name is: a
+    // topic is a fingerprint wherever its record leaves RAM.
+    Change "change" Wire Cap::Word(CHANGE_WORDS),
+    Since "since" Content Cap::Text(64),
+    // Phase 6 (6F-6, plan item U3), appended so no discriminant moves: the
+    // fabric rows' fields their marks carry. A post's deadline (`mail dl=`,
+    // ms) and the origins a hold leaves standing (`hold hold_origin=fleet,
+    // local`, the origin words comma-joined); an `inbox seen`'s refill floor
+    // (`mail-seen floor=`, a bus offset, so HOST as `off=` is) and its
+    // watermark (`seen=`, an inbox id); and whether the act moved anything
+    // (`mail-seen moved=0|1`: the fold folds only moves).
+    Dl "dl" Wire Cap::U,
+    HoldOrigin "hold_origin" Wire Cap::Tok(Charset::Rollup, 64),
+    Floor "floor" Host Cap::U,
+    Seen "seen" Wire Cap::U,
+    Moved "moved" Wire Cap::U,
+    // Phase 6 (6F-7, plan item U4b), appended so no discriminant moves: the
+    // session rows' fields their marks carry. The resize ledger's verdict:
+    // a run's `net=` and `after_ms=` (beside 6F-2's `run= displaced= at=`),
+    // and an epoch's `resize_epoch= pushed= cut= drew= class= healed_by=`
+    // (not `epoch=`, the log's own epoch, nor `by=`, the record's actor).
+    Net "net" Wire Cap::Word(NET_WORDS),
+    AfterMs "after_ms" Wire Cap::U,
+    ResizeEpoch "resize_epoch" Wire Cap::U,
+    Pushed "pushed" Wire Cap::I,
+    Cut "cut" Wire Cap::U,
+    Drew "drew" Wire Cap::U,
+    Class "class" Wire Cap::Word(CLASS_WORDS),
+    HealedBy "healed_by" Wire Cap::Word(HEALED_BY_WORDS),
+    // A manual reset's source (`modes source=ctl|menu`), and HOST, a
+    // handback's foreground groups (`modes from_pg= to_pg=`): a process
+    // group is this machine's.
+    Source "source" Wire Cap::Word(SOURCE_WORDS),
+    FromPg "from_pg" Host Cap::I,
+    ToPg "to_pg" Host Cap::I,
+    // A keyed write in doubt: its key's sequence (`in-doubt key_seq=`; not
+    // `seq=`, the record's own), and CONTENT, RAM only as the ring's row
+    // is, the first two words of its reply (`reply=ERR-write`), which its
+    // writer bounds once, for the row and the mark both.
+    KeySeq "key_seq" Wire Cap::U,
+    Reply "reply" Content Cap::Text(64),
+    // Appended after the review of 6F-7, so no discriminant moves: a
+    // self-claim's act as its holder told it (`act harness_act=<act>`, an
+    // owner token of up to 64 bytes of `[A-Za-z0-9._:@/-]`), HOST as its
+    // `holder=` is: `rule=` is a wire id, which holds no `@` and no `/`, so
+    // the act itself, and an act with no word (`word=unknown`), is read from
+    // here, the `harness-act` row's whole.
+    HarnessAct "harness_act" Host Cap::Text(64),
 }
 
 impl Key {

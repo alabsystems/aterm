@@ -296,11 +296,13 @@ fn the_launch_card_amends_the_agent_run_once() {
     );
 }
 
-/// `mark - render state=…` (plan §3.2): each move of the verdict once; the
-/// ledger's transitions name their state. NEGATIVE CONTROL: the same state
-/// twice writes one mark.
+/// `mark - render state=… run=…` (plan §3.2; phase 6, 6F-7): every
+/// transition the ledger records is one mark with its row's fields, the
+/// same state twice too, as the ring keeps a row for each; the ledger's
+/// transitions name their state. NEGATIVE CONTROL (by scratch revert): the
+/// state dedupe this replaced writes two marks for three transitions.
 #[test]
-fn a_render_verdict_is_marked_once_per_move() {
+fn every_render_transition_is_one_mark_with_its_row() {
     use crate::resize_ledger::Transition;
     assert_eq!(
         Transition::Healed {
@@ -323,11 +325,37 @@ fn a_render_verdict_is_marked_once_per_move() {
     let (tl, _hand) = opened();
     let mut g = tl.lock().unwrap();
     let now = g.slog().now();
-    for w in ["desync-risk", "desync-risk", "healed"] {
-        g.slog_mut().observe_render(w, now);
+    for t in [
+        Transition::Risk {
+            run: 1,
+            displaced: 2,
+            net_zero: true,
+            at_ms: 3,
+        },
+        Transition::Risk {
+            run: 2,
+            displaced: -1,
+            net_zero: false,
+            at_ms: 4,
+        },
+        Transition::Healed {
+            run: 2,
+            after_ms: 5,
+        },
+    ] {
+        g.slog_mut().observe_render(&t, now);
     }
     let got = lines(g.slog().log());
-    assert_eq!(having(&got, " mark - render state=").len(), 2, "{got:?}");
+    let marks = having(&got, " mark - render state=");
+    assert_eq!(marks.len(), 3, "{got:?}");
+    assert!(
+        marks[1].contains(" state=desync-risk run=2 displaced=-1 net=changed at=4 "),
+        "{marks:?}"
+    );
+    assert!(
+        marks[2].contains(" state=healed run=2 after_ms=5 "),
+        "{marks:?}"
+    );
 }
 
 /// THE CARRY (ruling S5): what the marks last wrote crosses an update as
@@ -389,7 +417,7 @@ fn the_observed_values_cross_an_update_as_words() {
 // ---- C9: cwd, title, modes, in-doubt ----------------------------------------
 
 /// Every record of `timeline`'s log at the content tier (the title's).
-fn content_lines(
+pub(super) fn content_lines(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
 ) -> Vec<String> {
     let g = timeline.lock().unwrap();
@@ -618,7 +646,7 @@ fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
 
 /// A registered session and its store: what a control worker's fabric verb
 /// runs against.
-fn fabric_rig(
+pub(super) fn fabric_rig(
     local: u64,
 ) -> (
     crate::session_store::SessionHandle,
@@ -633,7 +661,7 @@ fn fabric_rig(
 /// An in-process `await log kind=<kind>` parked past `h`'s log as it stands:
 /// its reply arrives once a `<kind>` record is written and its watchers are
 /// woken.
-fn parked_log_await(
+pub(super) fn parked_log_await(
     h: &crate::session_store::SessionHandle,
     store: &crate::session_store::Store,
     kind: &str,
@@ -652,7 +680,7 @@ fn parked_log_await(
     rx
 }
 
-fn returned(rx: &std::sync::mpsc::Receiver<String>, site: &str) -> String {
+pub(super) fn returned(rx: &std::sync::mpsc::Receiver<String>, site: &str) -> String {
     rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .unwrap_or_else(|_| panic!("{site}: the parked await never returned"))
 }
@@ -749,9 +777,10 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
 /// ([`crate::control::wake_sid_watchers`]), each site's parked `await log`
 /// its one-minute hang detector: a delivered row is `mail dir=in by=bridge`,
 /// a post is `mail dir=out`, its landing `mail-landed`, an `inbox seen`
-/// `mail-seen word=`, and the hold `hold state=on|off`. The fold counts the
-/// mail. No body is in any record. NEGATIVE CONTROLS: a redelivered offset
-/// and a repeated `inbox seen` write no second mark.
+/// `mail-seen moved=1 word=`, and the hold `hold state=on|off`. The fold
+/// counts the mail. No body is in any record. NEGATIVE CONTROLS: a
+/// redelivered offset writes no second mark, and a repeated `inbox seen`
+/// one that says it moved nothing (`moved=0`, 6F-6).
 #[test]
 fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     let (h, store) = fabric_rig(21);
@@ -778,10 +807,7 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     let rx = parked_log_await(&h, &store, "mail");
     let post = crate::fabric::cmd_post(&h.ctx, "to=@s-peer kind=ask --wait=0 SENTINEL-POST", None);
     // Queued whether or not a bridge is up (`ERR fabric absent id=1` here).
-    assert!(
-        post.starts_with("OK 1") || post.contains(" id=1 "),
-        "{post}"
-    );
+    assert!(super::overlap_tests::queued(&post, 1), "{post}");
     let reply = returned(&rx, "post");
     assert!(reply.contains(" mark - mail dir=out kind=ask "), "{reply}");
     let rx = parked_log_await(&h, &store, "mail-landed");
@@ -801,10 +827,13 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     assert!(seen.starts_with("OK seen=1"), "{seen}");
     let reply = returned(&rx, "inbox seen");
     assert!(
-        reply.contains(" mark - mail-seen inbox=1 word=handled "),
+        reply.contains(" mark - mail-seen inbox=1 off=7 floor=8 seen=1 moved=1 word=handled "),
         "{reply}"
     );
+    let rx = parked_log_await(&h, &store, "mail-seen");
     let _ = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
+    let reply = returned(&rx, "inbox seen again");
+    assert!(reply.contains(" seen=1 moved=0 src=fabric "), "{reply}");
     // The hold, on and off.
     for (state, word) in [("on reason=demo", "on"), ("off", "off")] {
         let rx = parked_log_await(&h, &store, "hold");
@@ -823,7 +852,8 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     }
     let got = content_lines(&h.ctx.timeline);
     assert_eq!(having(&got, " mark - mail dir=in ").len(), 1, "{got:?}");
-    assert_eq!(having(&got, " mark - mail-seen ").len(), 1, "{got:?}");
+    assert_eq!(having(&got, " mark - mail-seen ").len(), 2, "{got:?}");
+    assert_eq!(having(&got, " moved=0 ").len(), 1, "{got:?}");
     assert!(got.iter().all(|l| !l.contains("SENTINEL")), "{got:?}");
     let totals = h
         .ctx
@@ -888,6 +918,7 @@ fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
             (sid == self.0.self_id()).then(|| Arc::clone(&self.0))
         }
         fn bridge_lost_advised(&self, _: usize) {}
+        fn torn_state_set_aside(&self, _: u64) {}
     }
     // 5B-7's presence check: the inbox row at `off` has its mark.
     let check = |ctx: &crate::SessionCtx, off: u64| -> Result<(), String> {

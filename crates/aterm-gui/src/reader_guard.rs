@@ -1,35 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SCREEN READER'S PANIC FENCE on the window's own threads.
+//! The screen reader's panic fence on the window's own threads.
 //!
-//! The window reads every agent session's screen with `aterm_phase` (and the
-//! `aterm_agent` harness readers built on it) on threads whose panic is the
-//! whole terminal's: every session in every window goes with it. Every such
-//! call site reads through this fence:
+//! The window reads agent sessions' screens with `aterm_phase` (and the
+//! `aterm_agent` harness readers built on it) on threads whose panic takes every
+//! session in every window with it. Every such call site reads through [`guarded`]:
 //!
 //! * the published agent verdict ([`crate::presence::agent_verdict_guarded`],
 //!   from `session_status`'s sweep — the main thread);
 //! * the Claude Code footer (`crate::claude_footer`: the composer's frame
-//!   (`aterm_phase::phase::FrameReach`) + `footer::mode_row_under`, and
-//!   `footer::launch_card` while a process's model or effort is unnamed —
-//!   on each rebuild of a pane's text whose changed rows it reads, on the
-//!   main thread);
-//! * the Claude Code lights (`crate::claude_lights`: `lights::reading_under`
-//!   with the footer's reading, and `lights::read_screen` at a toggle — the
-//!   main thread), which the footer reads too, with
-//!   `upgrade::composer_is_empty`, every frame while a live upgrade's note
-//!   stands for the pane.
+//!   (`aterm_phase::phase::FrameReach`), `footer::mode_row_under`, and
+//!   `footer::launch_card` while a process's model or effort is unnamed), read on the
+//!   main thread at each rebuild of a pane's text that changes a row it read;
+//! * the Claude Code lights (`crate::claude_lights`: `lights::reading_under` with the
+//!   footer's reading, and `lights::read_screen` at a toggle, on the main thread),
+//!   which the footer also reads, with `upgrade::composer_is_empty`, every frame
+//!   while a live upgrade's note stands for the pane.
 //!
-//! The
-//! reader is pure functions over the screen's rows, and a screen is whatever
-//! the pane shows; the live harness validation of 2026-09-24 found a window
-//! of rows (a question box cut below its top by the 40-row tail) that
-//! panicked it (`rows[1..0]`). `aterm-phase`'s panic sweep
-//! (`tests/panic_sweep.rs`) now reads every fixture through every window
-//! and width, but a sweep is evidence about the screens it holds, not a
-//! proof about the next one — so the callers read through [`guarded`], and
-//! a panic becomes the caller's own no-verdict answer:
+//! The readers are pure functions over whatever rows the pane shows, and
+//! `aterm-phase`'s panic sweep (`tests/panic_sweep.rs`) is evidence about the
+//! screens it holds, not a proof about the next one. A panic becomes the caller's
+//! own no-verdict answer:
 //!
 //! * the agent verdict degrades to `unknown` (never `prompt`: nothing is
 //!   pressed or announced off a screen the reader could not read);
@@ -78,10 +70,9 @@ std::thread_local! {
     static CAUGHT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// The panic hook's question: a panic on a thread inside [`guarded`] is the
-/// fence's — its location is recorded for [`guarded`] and `true` tells the
-/// hook to file nothing (no crash report, no stderr). Anything else is
-/// `false` and the hook proceeds as ever.
+/// The panic hook's question: a panic on a thread inside [`guarded`] is the fence's,
+/// so its location is recorded for [`guarded`] and `true` tells the hook to file
+/// nothing (no crash report, no stderr). Anything else is `false`.
 pub(crate) fn absorb(info: &PanicHookInfo<'_>) -> bool {
     if DEPTH.with(Cell::get) == 0 {
         return false;

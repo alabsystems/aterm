@@ -22,9 +22,11 @@ pub struct Paths {
     pub aterm: Option<PathBuf>,
     /// Why `$LAB_ATERM` was not taken, when it was not.
     pub aterm_note: Option<String>,
-    /// The owner's home, through every link (`cd ~ && pwd -P`); empty when
-    /// `HOME` is unset or names no directory, which [`Paths::need_home`] refuses.
+    /// The UID account's physical home, independently of `HOME`; empty when
+    /// it cannot be resolved safely, which [`Paths::need_home`] refuses.
     pub real_home: String,
+    /// The calling shell's physical `HOME`, when it names a directory.
+    pub caller_home: String,
     /// The owner's login name.
     pub user: String,
     /// This program.
@@ -99,12 +101,8 @@ impl Paths {
         let state = physical(Path::new(state.to_string_lossy().trim_end_matches('/')));
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aterm-lab"));
         let (aterm, aterm_note) = find_aterm(&exe, &repo);
-        let real_home = std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .and_then(|h| std::fs::canonicalize(h).ok())
-            .filter(|h| h.is_dir())
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let real_home = home_path(aterm_uds::account::home().as_deref());
+        let caller_home = home_path(std::env::var_os("HOME").as_deref().map(Path::new));
         let user = crate::sys::login_name()
             .or_else(|| std::env::var("USER").ok().filter(|u| !u.is_empty()))
             .unwrap_or_else(|| crate::sys::getuid().to_string());
@@ -114,6 +112,7 @@ impl Paths {
             aterm,
             aterm_note,
             real_home,
+            caller_home,
             user,
             exe,
             repo,
@@ -178,11 +177,11 @@ impl Paths {
     /// The owner's home (the jail protects what is under it), or the refusal.
     ///
     /// # Errors
-    /// `HOME` is unset or names no directory.
+    /// The UID account's home is unavailable, root, relative or not UTF-8.
     pub fn need_home(&self) -> Result<&str, String> {
         if self.real_home.is_empty() {
             return Err(
-                "HOME is not set or is not a directory: the jail protects the owner's home, so it must name it".into(),
+                "the UID account's home cannot be resolved safely: the jail must protect it independently of HOME".into(),
             );
         }
         Ok(&self.real_home)
@@ -197,7 +196,7 @@ impl Paths {
 
 /// The aterm a new lab tests, and why `$LAB_ATERM` was not taken: `$LAB_ATERM`,
 /// else the `aterm` beside this program, else this checkout's debug build,
-/// else its release build. The lab runs it UNJAILED (its door), and the jail
+/// else its release build. The lab's door runs it under the recorded jail, which
 /// pins the file and its parents by their physical paths only: a link on the
 /// path as written could be re-pointed from inside the jail, and a relative one
 /// names another file from each cwd. So a `$LAB_ATERM` must already be the
@@ -302,6 +301,16 @@ pub fn valid_tag(t: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// A home fence must name an existing physical directory exactly, never a
+/// lossy replacement of its name or the whole filesystem.
+fn home_path(path: Option<&Path>) -> String {
+    path.filter(|p| p.is_absolute() && *p != Path::new("/") && p.to_str().is_some())
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .filter(|p| p.is_dir() && p != Path::new("/"))
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
 /// A path that may go into a sandbox profile: no quote, backslash or control character.
 #[must_use]
 pub fn profile_safe(s: &str) -> bool {
@@ -370,6 +379,20 @@ mod tests {
         assert_eq!(
             physical(&tmp.join("no-such-dir-lab/x")),
             real.join("no-such-dir-lab/x")
+        );
+        assert_eq!(home_path(Some(&tmp)), real.to_str().unwrap());
+        for path in [None, Some(Path::new("/")), Some(Path::new("relative"))] {
+            assert!(home_path(path).is_empty());
+        }
+        assert!(home_path(Some(&tmp.join("no-such-dir-lab/x"))).is_empty());
+        use std::os::unix::ffi::OsStrExt as _;
+        let owned = aterm_tempfile::tempdir().unwrap();
+        let bytes = owned.path().join(std::ffi::OsStr::from_bytes(b"home-\xff"));
+        // Reject the input without requiring this filesystem to support a
+        // non-UTF8 directory name in the first place.
+        assert!(
+            home_path(Some(&bytes)).is_empty(),
+            "a fence cannot use a lossy name"
         );
     }
 }

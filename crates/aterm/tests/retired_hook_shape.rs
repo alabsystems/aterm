@@ -1,22 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every ONE-BINARY route to the retired `hook` verb answers as `aterm-link`'s
+//! Every one-binary route to the retired `hook` verb answers as `aterm-link`'s
 //! `retired_hook` does: exit 0, nothing on stdout, exactly its one stderr line
-//! (`aterm_link::cli::RETIRED_HOOK_LINE`). A hook entry can survive the vendor
-//! hooks' removal — a project's `.claude/settings.local.json`, a host the pass
-//! has not reached, a Claude Code already running — and exit 2 is Claude Code's
-//! BLOCKING error, which would block every prompt. A
-//! `UserPromptSubmit` or `SessionStart` hook's stdout is added to the model's
-//! context, which is why stdout must stay empty. The shipped product is this
-//! binary (the dev `aterm-link` bin is not shipped), reached three ways a
-//! settings file may still hold:
+//! (`aterm_link::cli::RETIRED_HOOK_LINE`). A hook entry can outlive the vendor hooks'
+//! removal (a project's `.claude/settings.local.json`, a host not yet updated, a running
+//! Claude Code); exit 2 is Claude Code's blocking error, which would block every prompt, and
+//! a `UserPromptSubmit` or `SessionStart` hook's stdout is added to the model's context. The
+//! shipped product is this binary, reached three ways a settings file may still hold:
 //!
-//! * `<aterm> hook run <event> …` — what an older `aterm link hook install`
-//!   wrote. Without the route in `src/main.rs` it falls to the window parser's
-//!   `unknown option`, exit 2.
-//! * `<aterm> link hook run <event> …` — the 0.91.0 shape, through the verb.
-//! * `…/aterm-link hook run <event> …` — the argv0 alias symlink.
+//! * `<aterm> hook run <event> …`, which an older `aterm link hook install` wrote (routed in
+//!   `src/main.rs`; otherwise the window parser's `unknown option`, exit 2).
+//! * `<aterm> link hook run <event> …`, through the verb.
+//! * `…/aterm-link hook run <event> …`, the argv0 alias symlink.
 
 #![cfg(unix)]
 #![allow(
@@ -121,14 +117,12 @@ fn every_one_binary_route_to_the_retired_hook_is_a_silent_success() {
     }
 }
 
-/// EVERY SHAPE THE REMOVED INSTALLER WROTE, and a few it did not, through the
-/// `aterm-link` argv0 alias — a symlink NAMED `aterm-link` onto this binary IS
-/// that tool — (where every `hook …` reaches `retired_hook`, not only
-/// `hook run`): each with the vendor's JSON on stdin, with a prompt larger than any
-/// pipe buffer (and than the 1 MiB cap a first cut had — the write must never meet a
-/// closed pipe), and with no stdin at all. The no-op writes no state; and every OTHER
-/// unknown word is still refused by name, exit 2 — a neighbour carrying the retired
-/// verb's own arguments included.
+/// Every shape the removed installer wrote, and a few it did not, through the `aterm-link`
+/// argv0 alias (where every `hook …` reaches `retired_hook`, not only `hook run`): each with
+/// the vendor's JSON on stdin, with a prompt larger than any pipe buffer (the write must
+/// never meet a closed pipe), and with no stdin. The no-op writes no state, and every other
+/// unknown word is still refused by name, exit 2, a neighbour carrying the retired verb's
+/// arguments included.
 #[test]
 fn every_retired_hook_shape_through_the_alias_is_a_silent_success() {
     let dir =

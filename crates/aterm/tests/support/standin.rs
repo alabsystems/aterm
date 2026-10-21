@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! STAND-IN PROGRAMS IN RUST: a live lane runs a terminal program of its own
-//! (a TUI, a job that arms modes and dies) by re-executing THIS test binary.
+//! Stand-in programs in Rust: a live lane runs a terminal program of its own (a TUI, a job
+//! that arms modes and dies) by re-executing this test binary.
 //!
 //! Each lane uses one of its real tests as the child entry. Before that test's
 //! ordinary body, it checks [`ENV`] and plays the named program when set,

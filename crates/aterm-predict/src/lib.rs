@@ -254,8 +254,6 @@ pub enum PredictMode {
 /// exist.
 ///
 /// Each variant's doc says what the predictor does with the rule switched off.
-/// For the rules found by the theorem's stronger clauses that is the code as it
-/// was before the fix, so a measurement can run the predictor as it shipped.
 ///
 /// [`Rule::ALL`] is derived from this declaration (the `rules!` macro), so a rule
 /// added here is in it without a second list to keep in step: the theorem's
@@ -494,8 +492,7 @@ rules! {
         /// moved onto a cell where a suggestion's `c` already stood: overwrite
         /// mode's echo matched the insert's state, the next insert was shown
         /// shifted while overwrite mode replaced, and a line one cell longer
-        /// than the buffer took a `→` the editor beeped at (the two-hundred-seed
-        /// sweep, seed index 21). Judged op by op against the fold's own
+        /// than the buffer took a `→` the editor beeped at. Judged op by op against the fold's own
         /// states, which no frame showed, a rubout then a glyph typed in
         /// overwrite mode (`a c`, then `aoc`) proved both shift kinds, since
         /// each op alone differs from its edit in place while the two together
@@ -521,7 +518,7 @@ rules! {
         /// a glyph is placed as any narrow glyph, and after `א` proved its line
         /// (a lone right-to-left letter keeps the logical order) the space and
         /// two letters typed next were shown `א אא` while the row settled to
-        /// `אא א` (the two-hundred-seed sweep, seed index 125, case 509).
+        /// `אא א`.
         RightToLeftRows,
         /// A state chain holding a shift of an unproven kind retires at the
         /// smallest state the screen matches only when no in-place world
@@ -534,7 +531,7 @@ rules! {
         /// it, which is the chain's state after all four. Off: all four were
         /// credited, `→` and Backspace before either was read (a sample of
         /// nothing in the smoothed RTT), and the line rebased on a state the
-        /// far end leaves once they land (found by review).
+        /// far end leaves once they land.
         InPlaceReadsFewer,
         /// Our own trailing glyph and a Backspace after it cancel
         /// (`predict_backspace`, `predict_edit`) only while no op in flight is a
@@ -545,8 +542,7 @@ rules! {
         /// (an erase, dark while its kind is unproven), or, where it cannot be
         /// placed, an erase we did not model. Off: it popped the glyph, and the
         /// chain's next `←` showed the line with `b` still on it while overwrite
-        /// mode settled to `a` (the review's shrink of seed index 152, case 65,
-        /// with `VacateRefusal` off).
+        /// mode settled to `a`.
         CancelsOnlyKnownShifts,
         /// A glyph-lane run started inside the known line's text (`run_inside`:
         /// a motion of a chain left the line's cursor there, and the edit lane
@@ -556,8 +552,7 @@ rules! {
         /// the line reads as typed over nothing: readline writes the glyph
         /// before the tail it shifts, the frame between showed the row right of
         /// it as the press saw it, and the glyph typed next was painted over
-        /// the tail about to move (the eight-hundred-seed sweep, seed index
-        /// 361).
+        /// the tail about to move.
         InsideRunsNeverProve,
         /// A standing proof stands only while its echo's own cell still holds
         /// the glyph it echoed (THE STANDING GLYPH, `holds_its_glyph`): read at
@@ -570,8 +565,7 @@ rules! {
         /// password prompt printed on the same row, and a screen clear that
         /// redrew `$ ` landed in one burst, the cursor brought back onto the
         /// space's cell; the redraw's trailing space then credited it, the proof
-        /// carried on, and `8`, typed at the password read, was painted (the
-        /// two-thousand-seed sweep, seed index 1121, case 571).
+        /// carried on, and `8`, typed at the password read, was painted.
         StandingGlyph,
         /// A Backspace that cancels our own trailing glyph owes the erase's echo
         /// too, typed as a SPACE (`predict_backspace`): part-way, as `\b \b`,
@@ -579,7 +573,7 @@ rules! {
         /// space's echo exactly. Off: `n` typed and cancelled, a space typed on
         /// the cancelled cell, and the frame caught after the erase's blank
         /// and before its step back credited the space before the far end read
-        /// it (the two-thousand-seed sweep, seed index 1200, case 44).
+        /// it.
         CancelOwesItsBlank,
         /// A state chain retires at a state the screen matches only where the
         /// echo of no op before it, caught PART-WAY, shows that screen too
@@ -590,14 +584,12 @@ rules! {
         /// typed after it, and zle's erase caught after its blank, the cursor
         /// past it: the chain's state after both keys, so the space was
         /// credited before the far end read it, and the space typed next was
-        /// credited with that one's echo (the two-thousand-seed sweep, seed
-        /// index 1200, case 44, once the cancelled pair's blank was owed). A
+        /// credited with that one's echo. A
         /// line edge's echo moves the cursor over the text a cell at a time
         /// (End reprints the line from the cursor), so caught part-way its
         /// cursor is anywhere between where it started and where it lands: a
         /// later `←`'s state matched there was credited unread, and the End
-        /// typed after it with the first one's output (the three-hundred-seed
-        /// sweep of increment 4, seed index 266, case 427).
+        /// typed after it with the first one's output.
         PartWayEchoes,
         /// A line-edge key (Home, End, Ctrl-A, Ctrl-E) or Delete is placed only
         /// on a WITNESSED line (`witnessed`): one the predictor started at the
@@ -620,7 +612,7 @@ rules! {
         /// sends none). Off: any run started at the `B`'s cell, and after
         /// two spaces typed, Home at the start not modelled (the line gone)
         /// and `c` typed there, End was shown after `c` while the far end
-        /// went past the spaces (the review of increment 4).
+        /// went past the spaces.
         WitnessFirstKey,
         /// A line-edge key or Delete is LEARNED before it is shown
         /// (`EditorBindings`): an unlearned one is armed as a dark PROBE of its
@@ -647,9 +639,7 @@ rules! {
         /// of a wide glyph. Off: the guess waited there as over a blank, and a
         /// line editor whose forced wrap carried the mark its buffer held after
         /// the cursor onto the next row's first cell, under the next guess, had
-        /// that guess painted plain while it settled marked (the
-        /// three-hundred-seed sweep of increment 4, seed index 139, a break on
-        /// main before it).
+        /// that guess painted plain while it settled marked.
         OpaqueHead,
         /// DARK BEHIND A WAIT: a glyph-lane guess waiting on a cell that shows
         /// its glyph with the real cursor ON it, a glyph the run's press did not
@@ -661,8 +651,7 @@ rules! {
         /// for, after which the far end may echo nothing more. Off: `sad`
         /// typed, ` Password: ` printed after it on the same row and a reverse
         /// index back onto `d` left `d` waiting there, and the secret typed next
-        /// was shown after it (the review of increment 4's sweep, seed index
-        /// 1909, case 109, a break on main before it). The flush that would also
+        /// was shown after it. The flush that would also
         /// close it costs every run typed ahead along an autosuggestion its
         /// display; holding only what follows costs those keys one echo.
         DarkBehindAWait,
@@ -673,9 +662,7 @@ rules! {
         /// leaves there can be brought back to the very cell the proof names.
         /// Off: ` sie` echoed, `\r\nPassword: ` printed on the next row and a
         /// reverse index back up onto the cell after `e`, where the proof
-        /// stood, and the secret typed there was shown (the review of
-        /// increment 4's sweep, seed index 1206, case 434, a break on main
-        /// before it).
+        /// stood, and the secret typed there was shown.
         FloorBelow,
         /// THE CREDIT TAKEN BACK: a turn that finds the real cursor back on the
         /// newest glyph-lane credit's cell, or before it on its row, with nothing
@@ -683,9 +670,7 @@ rules! {
         /// and voids the proof: an echo never steps back over itself. Off: an
         /// autosuggestion drawn part-way, its first glyph the typed one with the
         /// cursor past it, stood for the key's echo, and the guess typed next on
-        /// the cursor stepped back was credited with that key's real echo (the
-        /// review of increment 4's sweep, seed indices 784 and 2115, breaks on
-        /// main before it).
+        /// the cursor stepped back was credited with that key's real echo.
         CreditTakenBack,
         /// A press places its glyph by the engine's own deferred-wrap flag
         /// (`KeySample::wrap_pending`, `parked`) where the host hands it: the
@@ -695,8 +680,7 @@ rules! {
         /// unparked, and the next glyph replaces that cell. Off: the last
         /// reconcile's reading, a filled last column under the cursor, which put
         /// `i` on the next row while overwrite mode wrote it over the `d` the
-        /// cursor stood on, and every guess after it a cell right of its echo
-        /// (the review of increment 4's sweep, seed index 1841, case 453).
+        /// cursor stood on, and every guess after it a cell right of its echo.
         EngineWrapFlag,
         /// A run anchored on the cell of a guess a Backspace cancelled
         /// (`cancelled_at`) carries a STALE ANCHOR when that guess did
@@ -709,8 +693,7 @@ rules! {
         /// `o` a cell left of its guess, which stayed pending; a Backspace
         /// cancelled it, `aac` was typed on its cell, and the second `a`'s
         /// echo credited the first guess, so `ac` stood a cell right of where
-        /// they echoed (the review of increment 5's sweep, seed index 3942,
-        /// case 141, a break on main before it).
+        /// they echoed.
         StaleCancel,
         /// The echo of an erase or a Delete (zle's and readline's redraw: the
         /// tail rewritten, a blank where the text ended, then the step back)
@@ -722,9 +705,7 @@ rules! {
         /// `d`, ` `, `\b\b` left the cursor on End's state, and Delete and End
         /// were credited (End unread); the rest of the step back put the
         /// cursor on `lo`, Home's state, and Home, pressed meanwhile, was
-        /// credited with Delete's output (ATTRIBUTION, the review of
-        /// increment 5's sweep, seed index 2748, case 172, a break on main
-        /// before it).
+        /// credited with Delete's output.
         PartWayStepBack,
         /// A state chain no state of which the screen matches waits in
         /// transit (`in_transit`) only where every BLANK cell some state
@@ -736,9 +717,7 @@ rules! {
         /// `reset-prompt` redrawing the prompt narrower (`\r$ od\e[K`, the
         /// line's text moved left of `lo`, its old cells blank and the cursor
         /// left inside them) kept a `←` in flight waiting and painted `od` a
-        /// second time over the blanks (FRAME FIDELITY, the review of
-        /// increment 5's sweep, seed index 2482, case 215, a break on main
-        /// before it).
+        /// second time over the blanks.
         TransitBlanks,
         /// A coordinate move (`observe_coordinates`: rows moved under the
         /// screen) keeps THE FIRST KEY's gate as it stood, where a host reset
@@ -753,20 +732,64 @@ rules! {
         /// THE SCREEN AS IT WAS: a head guess whose cell shows another glyph,
         /// the very one its run's press read there, with the real cursor still
         /// on it, is not echoed yet and waits (a glyph typed onto an
-        /// autosuggestion it diverges from, the review of phase 0). Off: any
-        /// other glyph on the head's cell flushes, as before that review, so
+        /// autosuggestion it diverges from). Off: any
+        /// other glyph on the head's cell flushes, so
         /// a glyph typed over text (`sudo ` after Home or Ctrl-A, a typo
         /// retyped inside the line) goes at the first frame after its press.
-        /// It keeps no safety clause: off, less is shown. It was the one
-        /// change of what the glyph lane shows since the plan that no rule
-        /// switched off: with it, every rule off shows on the measurement's
-        /// corpus what the predictor before the plan showed. A cross-check
-        /// driving the predictor at 3d4c211fbb through the same world printed
-        /// every metric of every `Baseline` run of `tests/editing_win.rs`
-        /// exactly, the churn (which it did not count) and the cost (the press
-        /// still reads the row) aside (`docs/DESIGN-predictive-editing-2026-10-20.md`
-        /// §2).
+        /// It keeps no safety clause: off, less is shown.
         ScreenAsItWas,
+        /// THE HIDDEN TAIL: an echo retired as an append over a CLEAN TAIL,
+        /// not at the end of the line, credited or not, that may have been
+        /// drawn over a glyph it shifted (its press saw text on its cell, or
+        /// nothing, or its run started on the cell a hidden tail's redraw
+        /// writes) may still have that redraw on its way, so for a window a
+        /// blank row from the cursor is no evidence of the line's end
+        /// (`retired_as_append`, `hidden_tail_at`, `moved_tail_at`). Off: only
+        /// an echo the tail guard refused marked it. Over `i`, Home
+        /// (owed: no integration) and `i` typed on the `i` there, readline
+        /// wrote the glyph (`i`) and its tail (`i\b`) in two reads: the first
+        /// left the row clean, so the echo retired as an append, uncredited
+        /// while Home's echo was owed, and nothing watched the row. `a`, typed
+        /// on the cursor it left, read a blank row, took itself to be at the
+        /// end of the line and proved beside the `i` the redraw put right of
+        /// it, and `d` was shown over that `i` (`iad` on glass, `iadi`
+        /// settled: FRAME FIDELITY, seed index 97 of the sweep whose index `i`
+        /// is the committed seed xor `i` times `0xA24B_AED4_963E_E407`, case
+        /// 27, a break on main since the review of phase 0, 0376b47967).
+        CleanTailInFlight,
+        /// DARK OVER TEXT: a glyph-lane guess waiting on THE SCREEN AS IT WAS
+        /// ([`Rule::ScreenAsItWas`]) in a run not known to be typed at the end
+        /// of the line (`tail_line_end`) shows nothing while it waits there,
+        /// nor does anything typed after it, in every mode (`text_wait`,
+        /// `visible_count`). The glyph its press read on its cell may be the
+        /// line's own text, which the far end's insert shifts right of the
+        /// typed glyph; or text an owed echo is still to erase (Ctrl-K pressed
+        /// a round trip before), which only the wait keeps the run alive
+        /// through. A press cannot tell those apart, and nothing can until the
+        /// cell changes, so the guess keeps its wait and leaves the glass. The
+        /// press takes the same decision on the screen it read, for a host that
+        /// paints before it reconciles. Past the line's end the glyph is
+        /// decoration (a suggestion the typed glyph diverges from), which a
+        /// ghost may cover. Off: `Always` painted a glyph typed over the line's
+        /// text there, unshifted, until its echo: over ssh, after Home (not
+        /// modelled there), `s` typed on the `d` of `du -sh` showed `su -sh`
+        /// while the far end inserted it (`sdu -sh`), and
+        /// `tests/editing_win.rs`'s corpus showed 123 mispredicted cells over
+        /// ssh at 30 ms, where the predictor before the plan, which flushed
+        /// such a guess, showed 45. It keeps no safety clause: on, less is
+        /// shown.
+        ///
+        /// The run's first guess typed over text is the one decided on
+        /// (`first_over_text`), the head or not: behind a head that hides
+        /// nothing (typed on its own glyph, waiting for its cursor advance, or
+        /// on a blank inside the line) it is held, with every guess after it,
+        /// while its cell shows a glyph its ghost would hide; and a hold
+        /// outlives its guess's expiry, passing to the guess typed next until a
+        /// turn decides afresh. Head only, `sudo ` typed on the `s` of
+        /// `systemctl` showed `sudo mctl`, ` -C x` typed on the space of
+        /// `git commit` showed `git -C xit`, and `xyz` typed on the `d` of
+        /// `du -sh` showed `dyz-sh` once `x` expired.
+        DarkOverText,
     }
 }
 
@@ -926,7 +949,9 @@ impl Learned {
         }
     }
 
-    /// The edit key this is.
+    /// The edit key this is. Its one reader is the test seam
+    /// [`Prediction::edit_key_for_test`], so it is built where that is.
+    #[cfg(any(test, debug_assertions))]
     fn key(self) -> EditKey {
         match self {
             Self::Home => EditKey::Home,
@@ -1559,7 +1584,7 @@ fn row_reorders(cells: &[Seen]) -> bool {
     cells.iter().any(|s| s.legacy().is_some_and(reorders))
 }
 
-/// Counts of the predictor's phase-0 decisions, for the safety theorem's
+/// Counts of the predictor's decisions, for the safety theorem's
 /// non-vacuity floors: each must be reached on its committed seed. Debug builds
 /// only ([`Predictor::events_for_test`]).
 #[cfg(any(test, debug_assertions))]
@@ -1634,6 +1659,11 @@ pub struct PredictEvents {
     /// Turns a guess waited on with the cursor on a glyph its press did not see,
     /// and what was typed after it held dark ([`Rule::DarkBehindAWait`]).
     pub held_waits: u64,
+    /// Turns a guess typed over text in a run not known to be at the end of the
+    /// line, the head waiting on THE SCREEN AS IT WAS or the first such guess
+    /// behind a head that hides nothing, was held dark with what was typed
+    /// after it ([`Rule::DarkOverText`]).
+    pub text_waits: u64,
     /// Credits taken back for the cursor found on or before them
     /// ([`Rule::CreditTakenBack`]).
     pub credits_taken_back: u64,
@@ -1692,6 +1722,7 @@ enum Event {
     BindingUnlearned,
     KittyRefusal,
     HeldWait,
+    TextWait,
     FloorVoid,
     CreditTakenBack,
     Flush,
@@ -2084,13 +2115,12 @@ pub struct Predictor {
     /// a far end that writes a mid-line glyph before the tail it shifts proved
     /// on the frame between, a glyph typed then, an arrow declined with its
     /// pixels kept (or an Enter) carried it, and once the redraw landed it stood
-    /// on glass over the tail that had moved (FRAME FIDELITY, the
-    /// eight-hundred-seed sweep's seed index 361). A new run cannot start while
+    /// on glass over the tail that had moved. A new run cannot start while
     /// carried guesses are pending, so the run's snapshot (`tail`) is still the
     /// carried run's.
     carried_proof: Option<(Prediction, bool, bool)>,
     /// The edit lane is switched off (`set_editing(false)`): every edit key is
-    /// routed as before it existed. The kill switch, and a measurement's baseline.
+    /// routed without it. The kill switch, and a measurement's baseline.
     editing_off: bool,
     /// The host's last reconcile could say which cells are opaque
     /// ([`Predictor::reconcile_seen`]). A chain compares whole states, and a host
@@ -2133,7 +2163,7 @@ pub struct Predictor {
     /// typed on a SPACE of the line: a typed space reads blank, the cell under
     /// the cursor looked like nothing typed over, and the echo of a far end
     /// that writes the glyph before the tail it shifts proved the line as an
-    /// append (FRAME FIDELITY, the eight-hundred-seed sweep's seed index 361).
+    /// append.
     run_inside: bool,
     /// The glyph-lane run in flight was started by THE FIRST KEY of a prompt
     /// (`prompt_gate`), pressed at the very cell the shell's authenticated OSC
@@ -2148,6 +2178,16 @@ pub struct Predictor {
     /// shows nothing typed after it (`visible_count`) until a turn finds it
     /// gone or no longer so. Set and cleared by each turn of the glyph lane.
     held_wait: Option<u64>,
+    /// DARK OVER TEXT ([`Rule::DarkOverText`]): the guess (its `seq`) the last
+    /// reconcile turn, or a press since, held over text in a run not known to
+    /// be at the end of the line (`first_over_text`): the head waiting on THE
+    /// SCREEN AS IT WAS (another glyph on its cell, the one its press read
+    /// there, with the real cursor on it), or the run's first guess typed over
+    /// text behind a head that hides nothing, its cell still showing a glyph.
+    /// No mode shows it, or anything typed after it (`visible_count`), until a
+    /// turn finds it gone or no longer so. Set and cleared by each turn of the
+    /// glyph lane; passed to the guess typed next when its guess expires.
+    text_wait: Option<u64>,
     /// THE CREDIT TAKEN BACK ([`Rule::CreditTakenBack`]): the cell and press time
     /// of the newest glyph-lane guess credited with an echo, while nothing of
     /// ours has moved the cursor back since (a chain started, a flush or an
@@ -2167,7 +2207,7 @@ pub struct Predictor {
     /// start: one typed after an unmodelled key (a Tab that inserted a literal
     /// tab, drawn as blanks, then a word motion back to the start), one typed
     /// at a `B` zsh's `reset-prompt` left stale when it redrew the prompt
-    /// narrower, or one typed ahead of the prompt (the review of increment 4).
+    /// narrower, or one typed ahead of the prompt.
     prompt_gate: PromptGate,
     /// THE LEARNED BINDINGS of the editor context the line-edge keys last
     /// reached ([`EditorBindings`]): the session's, carried in its
@@ -2214,8 +2254,7 @@ pub struct Predictor {
     /// Comparing that tail anyway voided the proof each time the far end drew
     /// text right of the cursor that is not the line: an autosuggestion the echo
     /// brought up, changed or cleared, two dark keys per change on fish,
-    /// zsh-autosuggestions, PSReadLine and ble.sh, where the shipped predictor
-    /// painted them where they echo. And a guess typed onto such a suggestion's
+    /// zsh-autosuggestions, PSReadLine and ble.sh. And a guess typed onto such a suggestion's
     /// first glyph (diverging from it) was typed over "other text", which a run
     /// not known to be at the end of the line must treat as mid-line. The line
     /// end is what tells them apart: no tail can move behind it.
@@ -2242,13 +2281,33 @@ pub struct Predictor {
     line_end_at: Option<(u16, u16)>,
     /// When the newest guess whose echo moved the text right of it was typed (a
     /// retirement the tail guard refused, credited or not, or a standing proof
-    /// it voided), or the newest key whose echo moves the far end's cursor
-    /// where the live cursor does not show it was pressed (an arrow declined, a
-    /// key not modelled). Its echo's trailing output, the tail redraw or the
-    /// motion, may still be on its way for one glitch window, and until then a
-    /// blank row from the cursor is no evidence that the line ends there
-    /// (`tail_line_end`).
+    /// it voided), or may have (a HIDDEN TAIL, `hidden_tail_at`), or the newest
+    /// key whose echo moves the far end's cursor where the live cursor does not
+    /// show it was pressed (an arrow declined, a key not modelled). Its echo's
+    /// trailing output, the tail redraw or the motion, may still be on its way
+    /// for one glitch window, and until then a blank row from the cursor is no
+    /// evidence that the line ends there (`tail_line_end`).
     moved_tail_at: Option<Instant>,
+    /// THE HIDDEN TAIL ([`Rule::CleanTailInFlight`], `retired_as_append`): the
+    /// cell after the newest guess that retired as an append over a clean tail,
+    /// not at the end of the line, whose own cell may have hidden a glyph its
+    /// echo shifted right: its press saw text there (its own glyph: a
+    /// suggestion it matched, or the line's last glyph it was inserted before),
+    /// or nothing said what was there, or its run was started on this very
+    /// cell while the window of the hidden tail before it ran (`run_hidden`).
+    /// A far end that writes the glyph before the tail it shifts shows a clean
+    /// tail between the two, the shifted glyph drawn over by the echo, and the
+    /// row right of the cursor reads blank until the redraw lands. The guess
+    /// marks `moved_tail_at` with its press, so no run read for a window takes
+    /// a blank row for the line's end; a run started here carries the mark on,
+    /// since its echo, drawn over the shifted glyph the redraw put on this
+    /// cell, hides it again with its own tail still to come. A run started
+    /// anywhere else does not: what hides a tail is an echo on the cell it is
+    /// drawn on.
+    hidden_tail_at: Option<(u16, u16)>,
+    /// The run in flight was started on `hidden_tail_at` within the window of
+    /// `moved_tail_at` (`take_tail`).
+    run_hidden: bool,
     /// The phase-0 decision counts the safety theorem's floors read
     /// ([`PredictEvents`]). Debug builds only.
     #[cfg(any(test, debug_assertions))]
@@ -2284,7 +2343,7 @@ impl Predictor {
         self.disabled |= rule.bit();
     }
 
-    /// How often each phase-0 decision was taken (see [`PredictEvents`]). A
+    /// How often each decision was taken (see [`PredictEvents`]). A
     /// read-only test seam for the safety theorem's non-vacuity floors.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
@@ -2331,6 +2390,7 @@ impl Predictor {
                 Event::BindingUnlearned => &mut self.events.bindings_unlearned,
                 Event::KittyRefusal => &mut self.events.kitty_refusals,
                 Event::HeldWait => &mut self.events.held_waits,
+                Event::TextWait => &mut self.events.text_waits,
                 Event::FloorVoid => &mut self.events.floor_voids,
                 Event::CreditTakenBack => &mut self.events.credits_taken_back,
                 Event::Flush => &mut self.events.flushes,
@@ -2680,9 +2740,8 @@ impl Predictor {
             // stayed pending there; the Backspace cancelling it erases that
             // glyph, and the cursor returns a cell left of the cancelled cell.
             // Anchored there as fresh, `aac` typed next was placed a cell right
-            // of its echo, and the second `a`'s echo credited the first guess
-            // (FIDELITY, the review of increment 5's sweep, seed index 3942,
-            // case 141). Stale, that credit is refused while a later key for the
+            // of its echo, and the second `a`'s echo credited the first guess.
+            // Stale, that credit is refused while a later key for the
             // same glyph is pending (`attributable`), and the run proves nothing
             // on another key's echo.
             let stale_cancel =
@@ -2703,7 +2762,59 @@ impl Predictor {
         if let Some(p) = self.preds.back_mut() {
             p.stale = self.run_stale;
         }
+        // DARK OVER TEXT ([`Rule::DarkOverText`]) from the press, as the next
+        // reconcile decides on the screen the press read: the run's first guess
+        // typed over text (`first_over_text`), where its cell, as this press
+        // reads it (the run's snapshot where it read no such row), shows a glyph
+        // its ghost would hide. It is the run's first guess, or one typed behind
+        // guesses that hide nothing (their own glyphs, or blanks inside the
+        // line). A host that composes a frame before it reconciles (the web
+        // reconciles after output only) paints none of it, nor anything typed
+        // after it, meanwhile.
+        if !self.text_held()
+            && self.first_over_text() == self.preds.len().checked_sub(1)
+            && let Some(p) = self.preds.back()
+        {
+            let read = cells
+                .filter(|_| row == cursor.0)
+                .and_then(|r| r.get(usize::from(col)).copied())
+                .or_else(|| self.tail_at(row, col));
+            if read.and_then(Seen::legacy).is_some_and(|g| g != ch) {
+                self.text_wait = Some(p.seq);
+            }
+        }
         true
+    }
+
+    /// DARK OVER TEXT ([`Rule::DarkOverText`]): the glyph other than `ch` that
+    /// the run's press read on `(row, col)` (`tail_at`), in a run not known to
+    /// be at the end of the line (`tail_line_end`). It may be the line's own
+    /// text, which the far end's insert of `ch` moves right of it, or text an
+    /// owed echo is still to erase. A guess on its own glyph or on a blank is
+    /// over none.
+    fn text_under(&self, row: u16, col: u16, ch: char) -> Option<char> {
+        if self.tail_line_end || !self.rule(Rule::DarkOverText) {
+            return None;
+        }
+        self.tail_at(row, col)
+            .and_then(Seen::legacy)
+            .filter(|&c| c != ch)
+    }
+
+    /// The index of the run's first pending guess typed over text
+    /// (`text_under`): the one DARK OVER TEXT decides on, and with it every
+    /// guess typed after it ([`Rule::DarkOverText`]).
+    fn first_over_text(&self) -> Option<usize> {
+        self.preds
+            .iter()
+            .position(|p| self.text_under(p.row, p.col, p.ch).is_some())
+    }
+
+    /// Whether a pending guess holds itself and what was typed after it off
+    /// the glass over the line's text (`text_wait`, [`Rule::DarkOverText`]).
+    fn text_held(&self) -> bool {
+        self.text_wait
+            .is_some_and(|s| self.preds.iter().any(|p| p.seq == s))
     }
 
     /// Arm one op at `(row, col)`: the newest pending key, owing nothing of its
@@ -2770,7 +2881,7 @@ impl Predictor {
         // the cursor advancing past it) and its credit proved the epoch a cell
         // behind, or, parked, it matched the proof's cell and was wrapped to the
         // next row while it echoes in the last column (the theorem's FIDELITY
-        // clause, on seeds 13 and 39 of the sweep).
+        // clause).
         //
         // The cancelled glyph's echo is still on its way, to that very cell, so
         // it is OWED, typed as its glyph (`glyph_owes`): a guess typed next for
@@ -2786,8 +2897,7 @@ impl Predictor {
         // the cursor past it, which lasts until the erase's echo takes it off,
         // and that echo is due a window after the Backspace. Dated by the glyph,
         // it lapsed while the erase was still on time, and a glyph typed again on
-        // the cancelled cell was credited with the old echo still standing there
-        // (ATTRIBUTION, sweep seed index 455).
+        // the cancelled cell was credited with the old echo still standing there.
         //
         // Only a typed glyph pops: an edit op of a state chain (a motion, an
         // erase) is not erased by a Backspace, which erases text at the cursor
@@ -2834,7 +2944,7 @@ impl Predictor {
     }
 
     /// Switch the edit lane on or off ([`predict_edit`](Self::predict_edit)):
-    /// off, every edit key is routed as it was before the lane existed (a
+    /// off, every edit key is routed without it (a
     /// Backspace through [`predict_backspace`](Self::predict_backspace), an arrow
     /// as [`note_unmodelled_input`](Self::note_unmodelled_input)). On by default.
     /// The kill switch, and a measurement's baseline. A real change flushes.
@@ -2862,7 +2972,7 @@ impl Predictor {
     ///
     /// Every key it cannot place still costs only display:
     /// * a Backspace that finds our own trailing glyph pending cancels it, as
-    ///   [`predict_backspace`](Self::predict_backspace) always has, where the
+    ///   [`predict_backspace`](Self::predict_backspace) does, where the
     ///   pair cancels (`pair_cancels`: no shift of an unproven kind in flight);
     ///   beside one it is an erase of the chain, armed as any Backspace is;
     /// * an arrow that cannot be placed (no line, the anchor lost, a carried line,
@@ -3005,7 +3115,7 @@ impl Predictor {
 
     /// A LEARNED KEY (Home, End, Ctrl-A, Ctrl-E, Delete) pressed
     /// (`predict_edit`): an op of a state chain where it can be placed, else
-    /// input this crate does not model, as it was before the lane knew it.
+    /// input this crate does not model.
     ///
     /// Placed only on a WITNESSED line (R-WITNESS, `witnessed`): the known
     /// line was started at the very cell the shell's authenticated `B` names
@@ -3037,7 +3147,7 @@ impl Predictor {
     ///   there, which no state names, and whatever the far end makes of it,
     ///   it reads it after every key in flight and writes only after them.
     /// * Home or Ctrl-A at `lo`, and Delete at the end of the text, change
-    ///   nothing canonically and teach nothing: not modelled, as before.
+    ///   nothing canonically and teach nothing: not modelled.
     /// * Delete is an erase (R-VACATE): the cells from the text's end to one
     ///   past every state must read blank.
     fn predict_line_edge(
@@ -3316,7 +3426,7 @@ impl Predictor {
     /// cell on the line (R-OPAQUE), the text's end short of the last column once
     /// it moves (R-ROW), after the standing proof was held to that row
     /// (`standing_at_press`). `None` when it cannot be placed: the caller tracks
-    /// the glyph as before, the proof voided and its run proving nothing.
+    /// the glyph in the glyph lane, the proof voided and its run proving nothing.
     fn arm_inside(
         &mut self,
         ch: char,
@@ -3356,7 +3466,7 @@ impl Predictor {
     /// An arrow that cannot be placed (`predict_edit`): DECLINED WITH ITS PIXELS
     /// KEPT. The far end reads it after every key in flight, and in the family no
     /// motion erases text, so every guess in flight still echoes where it is
-    /// painted; flushing them, as every unmodelled key did, blinked out a
+    /// painted; flushing them would blink out a
     /// typed-ahead tail at each arrow. What the arrow does is not ours to place
     /// (readline beeps at an edge, zsh does nothing, an autosuggestion is
     /// accepted), so it is OWED ([`Rule::EditOpsOwe`]), the epoch ends, and
@@ -3368,8 +3478,7 @@ impl Predictor {
     /// the arrow landed read a blank row, took itself to be at the end of the
     /// line, and proved without comparing its tail, while the far end inserted
     /// it before the line's last glyph; the glyph typed next was painted over
-    /// that glyph, which its echo moved one cell on (FRAME FIDELITY, found by
-    /// review).
+    /// that glyph, which its echo moved one cell on.
     fn decline_motion(&mut self, now: Instant) -> EditOutcome {
         if self.rule(Rule::EditOpsOwe) {
             self.owe(now);
@@ -4064,7 +4173,7 @@ impl Predictor {
     /// one as each was credited, the arrows ahead of a re-typed glyph were
     /// credited (a sample of nothing, the motion class proven) on a cooked tty's
     /// echo of the cancelled glyph, before the tty had read either arrow, which
-    /// it would echo as `^[[D` (ATTRIBUTION, sweep seed index 65). Each is asked
+    /// it would echo as `^[[D`. Each is asked
     /// under the window as it stood before this turn: a turn's evidence is judged
     /// by what was known before it, not by the samples it is about to record.
     ///
@@ -4586,7 +4695,7 @@ impl Predictor {
     /// up a row (a reverse index), leaves the chain's row untouched and the
     /// cursor on it, ten cells right of every state: waited on, the chain kept
     /// displaying, and a glyph typed at that prompt joined the chain and was
-    /// painted (SECRECY, the eight-hundred-seed sweep's seed index 230). No echo of
+    /// painted. No echo of
     /// the chain's own keys passes the cursor right of every state's text, or
     /// left of the text it verified; a frame catching a redisplay that does
     /// (through the prompt, out to a right prompt) flushes, which costs display
@@ -4963,7 +5072,8 @@ impl Predictor {
     /// wrapped off the cursor's row (the deferred-wrap slot), leaves no snapshot,
     /// and that run proves only over a blank tail. Whether the run is at the end
     /// of the line (`tail_line_end`) is what it `inherits` from the proof or the
-    /// append it starts on, if anything, else what the snapshot shows at `now`.
+    /// append it starts on, if anything, else what the snapshot shows at `now`;
+    /// whether it carries a hidden tail on (`run_hidden`) is asked of every run.
     fn take_tail(
         &mut self,
         cursor: (u16, u16),
@@ -4976,6 +5086,13 @@ impl Predictor {
         self.tail = None;
         self.tail_cells.clear();
         self.tail_line_end = inherits.unwrap_or(false);
+        let window = self.glitch_window();
+        let tail_in_flight = self
+            .moved_tail_at
+            .is_some_and(|t| now.saturating_duration_since(t) <= window);
+        // Started on the cell a hidden tail's redraw writes, while it may still
+        // be on its way: this run's echo can hide it again (`hidden_tail_at`).
+        self.run_hidden = tail_in_flight && self.hidden_tail_at == Some(at);
         let Some(cells) = cells.filter(|_| at == cursor) else {
             return;
         };
@@ -4989,10 +5106,6 @@ impl Predictor {
         // observe answers as blank, opaque or not (the blanks of a row the frame
         // reorders are opaque).
         if inherits.is_none() {
-            let window = self.glitch_window();
-            let tail_in_flight = self
-                .moved_tail_at
-                .is_some_and(|t| now.saturating_duration_since(t) <= window);
             self.tail_line_end =
                 !tail_in_flight && self.tail_cells.iter().all(|s| s.legacy().is_none());
         }
@@ -5185,7 +5298,7 @@ impl Predictor {
     /// still reads as the press saw it, and a run typed there from a row that
     /// reads blank to the margin is at the end of the line by every cell, so
     /// the tail guard proved it: `e` was then shown plain where it settled to
-    /// `é` (FRAME FIDELITY, sweep seed index 573). The echo's own cell is the one
+    /// `é`. The echo's own cell is the one
     /// place the hidden tail shows, and it shows there as the opaque cell no
     /// typed narrow glyph makes by itself. A row that becomes right-to-left
     /// under the run reads opaque too, and proves only from the next run's
@@ -5343,7 +5456,7 @@ impl Predictor {
 
     /// [`reconcile`](Self::reconcile), with `observe` answering what the host read
     /// at a cell as a [`Seen`]. The glyph lane reads each answer through
-    /// [`Seen::legacy`], so an opaque cell is the plain glyph it always was; the
+    /// [`Seen::legacy`], so an opaque cell is read as its plain glyph; the
     /// tail guard (`tail_clean`) compares whole answers, so a cell that changed
     /// under the same glyph (a wide glyph's half, combining marks) is a change.
     ///
@@ -5426,6 +5539,7 @@ impl Predictor {
         }
         // Each turn says afresh which guess, if any, holds what follows it dark.
         self.held_wait = None;
+        self.text_wait = None;
         // Retire confirmed leading predictions; a different glyph at the head ⇒ the
         // program diverged from our guess ⇒ flush. A still-blank head ⇒ not echoed
         // yet ⇒ stop and wait for the next burst.
@@ -5468,7 +5582,7 @@ impl Predictor {
                         // cursor brought back over it by output nobody typed for
                         // (a password prompt printed after it and a reverse
                         // index), after which the far end echoes nothing. The
-                        // guess waits as before; what is typed after it shows
+                        // guess waits; what is typed after it shows
                         // only once it retires.
                         if self.rule(Rule::DarkBehindAWait)
                             && real_cursor == Some((p.row, p.col))
@@ -5494,12 +5608,24 @@ impl Predictor {
                 // the `o` of `echo hello`). Flushed, the guess went at the first
                 // frame after its press, and the proof with it, so every suggestion
                 // the typist left cost the keys after it their display
-                // ([`Rule::ScreenAsItWas`]).
+                // ([`Rule::ScreenAsItWas`]). The same wait keeps a run typed while
+                // an owed echo is still to erase the text the press read (Ctrl-A,
+                // Ctrl-K and the next command typed a round trip ahead), whose
+                // echoes land as appends once that erase has.
                 Some(c)
                     if self.rule(Rule::ScreenAsItWas)
                         && real_cursor == Some((p.row, p.col))
                         && self.tail_at(p.row, p.col).and_then(Seen::legacy) == Some(c) =>
                 {
+                    // DARK OVER TEXT ([`Rule::DarkOverText`]): not known to be past
+                    // the line's end, `c` may be the line's own text, which this
+                    // key's echo shifts right of its glyph. The guess waits off the
+                    // glass, and what was typed after it with it: painted, it hid
+                    // that text unshifted until the echo (`sudo` over `du -sh`).
+                    if self.text_under(p.row, p.col, p.ch).is_some() {
+                        self.text_wait = Some(p.seq);
+                        self.count(Event::TextWait);
+                    }
                     break;
                 }
                 Some(_) => {
@@ -5530,6 +5656,23 @@ impl Predictor {
                     }
                 }
             }
+        }
+        // DARK OVER TEXT behind the head ([`Rule::DarkOverText`]): the run's
+        // first guess typed over text (`first_over_text`), behind a head that
+        // hides nothing (its own glyph, waiting for its cursor advance, or a
+        // blank), is held with every guess typed after it while its cell shows
+        // a glyph its ghost would hide: one cell read a turn. The head itself
+        // the loop above decided. Painted, `sudo ` typed on the `s` of
+        // `systemctl` (Home not modelled over ssh) showed `sudo mctl` until the
+        // first echo flushed it.
+        if !chain
+            && self.text_wait.is_none()
+            && let Some(i) = self.first_over_text().filter(|&i| i > 0)
+            && let Some(p) = self.preds.get(i).copied()
+            && observe(p.row, p.col).legacy().is_some_and(|g| g != p.ch)
+        {
+            self.text_wait = Some(p.seq);
+            self.count(Event::TextWait);
         }
         if let Some(sample) = oldest_confirmed {
             self.record_echo_regime(sample);
@@ -5804,6 +5947,16 @@ impl Predictor {
                 break;
             }
             self.preds.pop_front();
+            // DARK OVER TEXT ([`Rule::DarkOverText`]): a hold outlives its
+            // guess. What was typed after it still lies over the text it lay
+            // over, and no turn has read the screen since, so the hold passes
+            // to the guess typed next until a turn decides afresh. Dropped, the
+            // guesses behind it were painted over the line's text, unshifted,
+            // a window after their presses (`$ dyz-sh` for `xyz` typed on the
+            // `d` of `du -sh`).
+            if self.text_wait == Some(oldest.seq) {
+                self.text_wait = self.preds.front().map(|p| p.seq);
+            }
             timed_out = true;
             self.count(Event::Expiry);
             // Its echo, late or never, moves the cursor where no guess says: the
@@ -5877,9 +6030,11 @@ impl Predictor {
     /// In every mode a PROBE (`Prediction::probe`: a learned key whose binding
     /// is not learned yet) ends the run: `Always` shows every guess, but a
     /// probe is a question to the far end, not a guess, and the state after it
-    /// is built on a binding nobody has seen.
+    /// is built on a binding nobody has seen. So does a guess waiting over text
+    /// not known to be past the line's end (`text_wait`, [`Rule::DarkOverText`]):
+    /// the far end's insert shifts that text right of it, which no ghost shows.
     fn visible_count(&self) -> usize {
-        match self.mode {
+        let shown = match self.mode {
             PredictMode::Off => 0,
             PredictMode::Always => self.preds.iter().take_while(|p| !p.probe).count(),
             PredictMode::Adaptive if !self.adaptive_slow => 0,
@@ -5890,7 +6045,12 @@ impl Predictor {
                     .and_then(|s| self.preds.iter().position(|p| p.seq == s))
                     .map_or(shown, |i| shown.min(i + 1))
             }
-        }
+        };
+        // Neither a guess waiting over text nor anything after it (DARK OVER
+        // TEXT), in any mode.
+        self.text_wait
+            .and_then(|s| self.preds.iter().position(|p| p.seq == s))
+            .map_or(shown, |i| shown.min(i))
     }
 
     /// Whether Adaptive may show op `p`: of the current epoch once its glyph
@@ -5954,6 +6114,51 @@ impl Predictor {
             .reduce(|(r0, c0, r1, c1), (s0, d0, s1, d1)| {
                 (r0.min(s0), c0.min(d0), r1.max(s1), c1.max(d1))
             })
+    }
+
+    /// The press order of the newest pending op: right after a press that
+    /// armed one, that press's op. Ops are numbered in press order, so a press
+    /// armed an op exactly when this is newer than it was before the press (a
+    /// cancel or a flush leaves none newer). A host tags the key with it, to
+    /// know later whether a frame shows the key ([`shown_through`]).
+    ///
+    /// [`shown_through`]: Self::shown_through
+    #[must_use]
+    pub fn newest_op(&self) -> Option<u64> {
+        self.preds.back().map(|p| p.seq)
+    }
+
+    /// The op a press armed, given [`newest_op`](Self::newest_op) read just
+    /// before it: the newest op when it is newer than `before`, else `None`
+    /// (the press cancelled a guess, flushed, or was input the predictor does
+    /// not model).
+    #[must_use]
+    pub fn armed_since(&self, before: Option<u64>) -> Option<u64> {
+        self.newest_op()
+            .filter(|op| before.is_none_or(|before| *op > before))
+    }
+
+    /// Whether `op` still belongs to a pending key. A host that kept a key's
+    /// op for input timing checks this at the frame that paints its overlay:
+    /// a Backspace may have cancelled an older op below `shown_through`, so
+    /// numeric press order alone does not say that key is still shown.
+    #[must_use]
+    pub fn op_is_pending(&self, op: u64) -> bool {
+        self.preds.iter().any(|pending| pending.seq == op)
+    }
+
+    /// The press order of the newest op the displayed overlay shows: the last
+    /// of the leading run of visible ops, which [`overlay`](Self::overlay)
+    /// paints (a state chain as the state that run leaves). A frame that
+    /// painted that overlay whole shows the effect of every key up to it whose
+    /// op is still pending, before its echo. `None` when nothing would be
+    /// displayed. `&self`, read after the frame's `overlay`.
+    #[must_use]
+    pub fn shown_through(&self) -> Option<u64> {
+        self.visible_count()
+            .checked_sub(1)
+            .and_then(|newest| self.preds.get(newest))
+            .map(|p| p.seq)
     }
 
     /// Every pending guess, oldest first, without expiring any: the leading run
@@ -6161,7 +6366,7 @@ impl Predictor {
     /// autosuggestion the far end drew beside the echo, the frame caught before
     /// its cursor stepped back. The guess under the suggestion's first glyph was
     /// retired on it, and the run typed next was anchored on that cursor, a cell
-    /// right of where it echoes (FIDELITY, sweep seed index 490). Held instead,
+    /// right of where it echoes. Held instead,
     /// the head is flushed by the cursor check, owed, and the run typed next is
     /// a STALE ANCHOR (`Prediction::stale`), credited by no echo while that owe
     /// is in flight.
@@ -6170,8 +6375,8 @@ impl Predictor {
     /// ([`Rule::ParkedAtTheEnd`], `tail_line_end`). A run typed mid-line pushes
     /// the line's own text right, and once the line's last glyph reaches the
     /// last column the cursor stands on it exactly as a park would leave it,
-    /// before the key typed there was read (ATTRIBUTION, sweep seed index 605:
-    /// three ICH echoes pushed a `d` there under a `d` guess). Only at the end of
+    /// before the key typed there was read (three ICH echoes pushing a `d` there
+    /// under a `d` guess). Only at the end of
     /// the line is there no tail to push.
     fn echoed_past(&self, cursor: Option<(u16, u16)>, p: &Prediction) -> bool {
         let last_col =
@@ -6246,8 +6451,7 @@ impl Predictor {
     /// flight (a declined key typed after it is owed, not tracked) and while a
     /// later key for the same glyph is pending or owed typed. Credited, `c`
     /// typed twice after such a Backspace proved the line on the second `c`'s
-    /// echo, a cell behind, and the third `c` was painted where the second echoed
-    /// (FIDELITY, seed 76 of the eighty-seed sweep of the edit lane's world).
+    /// echo, a cell behind, and the third `c` was painted where the second echoed.
     ///
     /// A later key is as much a later key once a Backspace has cancelled its
     /// guess: the cancelled glyph's echo still lands (it is a typed owe, with the
@@ -6255,7 +6459,7 @@ impl Predictor {
     /// pending one's would. Asking only the pending guesses, `n`, `n` typed
     /// before an erase landed, the second cancelled and `i` typed, credited the
     /// first `n` with the cancelled one's echo, and `i` was painted a cell right
-    /// of where it echoes (FIDELITY, sweep seed index 151).
+    /// of where it echoes.
     ///
     /// An EDIT OP (a motion, an erase) asks about the keys after it too, in
     /// every run ([`Rule::EditOwedAfter`]): its state differs from the one
@@ -6265,8 +6469,8 @@ impl Predictor {
     /// an owe newer than any it was armed under is in flight. A Backspace that
     /// erased the space a line began with, carried across an Enter to a far end
     /// that had stopped echoing, was credited when the carriage return alone put
-    /// the cursor on its cell (ATTRIBUTION, the eight-hundred-seed sweep's seed index
-    /// 508); a glyph's state names its glyph, which no other key's echo writes.
+    /// the cursor on its cell; a glyph's state names its glyph, which no other
+    /// key's echo writes.
     fn attributable(&self, p: &Prediction, now: Instant) -> bool {
         let window = self.glitch_window();
         let live = |t: Instant| now.saturating_duration_since(t) <= window;
@@ -6379,17 +6583,16 @@ impl Predictor {
                 // space among them. Typed while `Password: ` was still being
                 // drawn, on the cell of its last space, a space was credited with
                 // that space, proved the line where the prompt ends, and the
-                // password typed there was painted (SECRECY, the eight-hundred-seed
-                // sweep's seed index 796). It measures the link, and on a line a
-                // glyph has proven it carries the proof on.
+                // password typed there was painted. It measures the link, and on
+                // a line a glyph has proven it carries the proof on.
                 if p.ch == ' ' && !self.confirmed_epoch && self.rule(Rule::SpaceNeverProves) {
-                    self.ended_line_at(&p);
+                    self.retired_as_append(&p);
                     return;
                 }
                 if self.tail_decorated(&p) {
                     self.count(Event::DecoratedProof);
                 }
-                self.ended_line_at(&p);
+                self.retired_as_append(&p);
                 self.confirm(p);
                 self.proof_opaque = matches!(own, Seen::Opaque(_));
                 self.extend_line(&p);
@@ -6405,13 +6608,13 @@ impl Predictor {
         // at or before `p`'s, where the cursor stands once nothing else moves it;
         // that no longer holds, and an erase in flight (a Backspace that popped our
         // guess) puts the cursor back on that very cell, where the next glyph was
-        // painted and `p`'s echo then landed (FIDELITY, seed 43 of the sweep).
+        // painted and `p`'s echo then landed.
         if p.epoch == self.epoch && self.rule(Rule::UncreditedVoids) {
             self.void_proof();
         }
         let appended = self.appended((&p, own), observe, clean_row, cursor);
         if appended {
-            self.ended_line_at(&p);
+            self.retired_as_append(&p);
         } else {
             self.moved_tail(p.born);
         }
@@ -6427,11 +6630,44 @@ impl Predictor {
         }
     }
 
-    /// `p`, of the run in flight, retired as an append: in a run of the current
-    /// epoch at the end of the line, the line now ends after it (`line_end_at`).
-    fn ended_line_at(&mut self, p: &Prediction) {
-        if self.tail_line_end && p.epoch == self.epoch {
-            self.line_end_at = Some(self.cell_after(p));
+    /// `p`, of the run in flight, retired as an append, credited or not: in a
+    /// run of the current epoch at the end of the line, the line now ends after
+    /// it (`line_end_at`).
+    ///
+    /// A run NOT at the end of the line retired it over a CLEAN TAIL
+    /// (`tail_clean`), which says only what the row shows so far: a far end
+    /// that writes the glyph before the tail it shifts (readline's mid-line
+    /// insert: the glyph, the tail, the step back) shows a clean tail between
+    /// the two. Where the echo was drawn over the glyph it shifted (a HIDDEN
+    /// TAIL, `hidden_tail_at`), the row right of the cursor reads blank until
+    /// the redraw lands, which may be a window away (`moved_tail_at`,
+    /// [`Rule::CleanTailInFlight`]): a proof the echo earns stands on its tail
+    /// meanwhile (THE STANDING TAIL), but a run started on the cursor it left
+    /// with no proof to continue (the echo was not credited, or its proof went
+    /// first) reads its row for the line's end. Where the press saw a blank
+    /// under the echo, any text the far end held right of it is still drawn
+    /// right of it, and the next run's row shows it.
+    fn retired_as_append(&mut self, p: &Prediction) {
+        if self.tail_line_end {
+            if p.epoch == self.epoch {
+                self.line_end_at = Some(self.cell_after(p));
+            }
+            return;
+        }
+        // A HIDDEN TAIL (`hidden_tail_at`): its cell may have held a glyph the
+        // echo drew over, or its run was started on the cell a hidden tail's
+        // redraw writes.
+        let over_text = self
+            .tail_at(p.row, p.col)
+            .is_none_or(|held| held.legacy().is_some());
+        if self.rule(Rule::CleanTailInFlight) && (over_text || self.run_hidden) {
+            self.moved_tail(p.born);
+            self.hidden_tail_at = Some(self.cell_after(p));
+            // …and no earlier append's line end stands on that cell: a run
+            // started there inherits none (`arm_glyph`).
+            if self.line_end_at == self.hidden_tail_at {
+                self.line_end_at = None;
+            }
         }
     }
 
@@ -6609,8 +6845,8 @@ mod tests {
         assert_eq!(predictor.pending_bounds(), None);
     }
 
-    /// THE SWEEP CONSUMES ITS DEADLINE (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md`
-    /// item 7). One `expire_due` at a wake past the deadline, with no `overlay`
+    /// THE SWEEP CONSUMES ITS DEADLINE. One `expire_due` at a wake past the
+    /// deadline, with no `overlay`
     /// (a suppressed redraw), leaves `next_deadline()` `None` — never the past
     /// instant a peek-only sweep left for the event loop to re-fold every turn.
     /// Control: before the deadline it drops nothing and the deadline stands.
@@ -6839,7 +7075,7 @@ mod tests {
 
     #[test]
     fn burst_is_classified_by_the_oldest_retired_guess() {
-        // REGRESSION (P3): `preds` is in type order, so the LAST guess retired in a
+        // `preds` is in type order, so the LAST guess retired in a
         // turn is the newest and always the smallest sample. Classifying by the minimum
         // meant a five-glyph burst echoed in one 45 ms turn reported 5 ms — the faster
         // the user typed, the more certain the shutoff. The user waited 45 ms for the
@@ -6924,7 +7160,7 @@ mod tests {
 
     #[test]
     fn expired_prediction_clears_next_deadline() {
-        // REGRESSION (scrolled-back busy loop): a prediction in flight when the
+        // A prediction in flight when the
         // user scrolls into history must still self-heal. `overlay`'s expiry flush
         // is the only thing that disarms `next_deadline()`; if it never runs, the
         // deadline stays pinned at a past instant and the host's WaitUntil-driven
@@ -7147,7 +7383,7 @@ mod tests {
 
     #[test]
     fn a_stale_guess_confirming_after_submit_cannot_arm_the_new_line() {
-        // The password guarantee, pinned against the P5 change: keeping in-flight
+        // The password guarantee: keeping in-flight
         // guesses across the boundary means one can CONFIRM after it. That confirmation
         // measures the link (legitimately) but must not arm the new line's display
         // gate, or the secret typed at the prompt below would show.
@@ -7238,11 +7474,11 @@ mod tests {
         assert_eq!(p.overlay(at).len(), 1, "a 400 ms link finally predicts");
     }
 
-    /// REGRESSION (P1 review): an endlessly non-echoing context — a password prompt,
-    /// a raw-mode key — must never accumulate "slow" evidence. The real cursor does
-    /// not move there, so `reconcile`'s consistency check matches and every guess
-    /// reaches the expiry path; an earlier fix counted each of those as a slow echo
-    /// sample and latched speculation ON after two keystrokes, on a LOCAL link.
+    /// An endlessly non-echoing context — a password prompt, a raw-mode key —
+    /// must never accumulate "slow" evidence. The real cursor does not move
+    /// there, so `reconcile`'s consistency check matches and every guess
+    /// reaches the expiry path; counting each expiry as a slow echo sample
+    /// would latch speculation ON after two keystrokes on a LOCAL link.
     #[test]
     fn silence_never_opens_the_gate_or_diverges_the_estimate() {
         let mut p = Predictor::new(PredictMode::Adaptive);
@@ -7319,9 +7555,9 @@ mod tests {
         assert!(!p.confirmed_epoch);
     }
 
-    /// The `ExpiryOwes` negative control is the code as it shipped before the
-    /// fix: the expiry pops the guess, owes nothing and keeps the proof, so the
-    /// next glyph paints on the expired guess's cell.
+    /// The `ExpiryOwes` negative control: the expiry pops the guess, owes
+    /// nothing and keeps the proof, so the next glyph paints on the expired
+    /// guess's cell.
     #[test]
     fn without_expiry_owes_an_expiry_keeps_the_proof_as_it_did() {
         let (mut p, at) = proven_slow_line(PredictMode::Adaptive);
@@ -7630,7 +7866,7 @@ mod tests {
     /// `ls⏎cd` typed ahead on a slow link in `Always`. Reconciliation holds the real
     /// cursor on the oldest unechoed guess, so a live-cursor anchor put 'c' on the
     /// very cell 'l' was painted on: the new line painted over the old line's tail
-    /// (two guesses on one cell; `reconciled_view_safety.rs` found it in three ops).
+    /// (two guesses on one cell).
     #[test]
     fn nothing_is_armed_behind_a_terminator_while_its_line_is_in_flight() {
         let mut p = Predictor::new(PredictMode::Always);
@@ -7705,8 +7941,7 @@ mod tests {
     /// typed at the new live cursor: the FIRST keystroke's echo lands in the second
     /// guess's cell and the cursor steps past it, exactly as the second's own echo
     /// would. Crediting it proved the epoch one keystroke behind, and the space
-    /// typed next was painted where the second 'n' then echoed
-    /// (`reconciled_view_safety.rs`'s fidelity clause, shrunk to fifteen ops).
+    /// typed next was painted where the second 'n' then echoed.
     #[test]
     fn an_echo_owed_to_a_flushed_guess_cannot_prove_a_later_one() {
         let slow = Duration::from_millis(60);
@@ -7880,8 +8115,7 @@ mod tests {
     /// without credit — and then that guess's OWN echo is owed: it lands one cell
     /// on, in the next guess's cell. Not owing it, the second match came just
     /// after the flushed key's window closed and was credited, proving the epoch
-    /// one cell behind with every echo inside 250 ms of its own key
-    /// (`reconciled_view_safety.rs`'s fidelity clause, in review).
+    /// one cell behind with every echo inside 250 ms of its own key.
     #[test]
     fn a_guess_retired_without_credit_owes_its_own_echo() {
         let (mut p, at) = proven_slow_line(PredictMode::Adaptive);
@@ -7964,7 +8198,7 @@ mod tests {
             "the first 'n's echo is no sample of the link"
         );
 
-        // Control: past every window, a carried tail measures as it always did.
+        // Control: past every window, a carried tail still measures the link.
         at += Duration::from_millis(GLITCH_CEILING_MS);
         assert!(p.predict_char('x', (1, 1), G, 80, at));
         p.note_line_submit(at);
@@ -8350,15 +8584,12 @@ mod tests {
         );
     }
 
-    /// REGRESSION (adversarial review): `restore_link_estimate` must RESET before it
-    /// installs, and that line must be pinned by a test that fails without it.
-    ///
-    /// The sibling test drives the swap through `take_link_estimate` first — which
-    /// already resets — so deleting `self.reset()` from `restore_link_estimate` left
-    /// every test passing while the guarantee it protects was gone. This drives
-    /// `restore` DIRECTLY on a pane with a displayed guess, which is what a host does
-    /// when it installs a parked estimate into a predictor it did not just take from.
-    /// Without the reset, pane A's ghost survives onto pane B's screen.
+    /// `restore_link_estimate` must RESET before it installs: the sibling test
+    /// drives the swap through `take_link_estimate` first — which already
+    /// resets — so this drives `restore` DIRECTLY on a pane with a displayed
+    /// guess, which is what a host does when it installs a parked estimate into
+    /// a predictor it did not just take from. Without the reset, pane A's ghost
+    /// survives onto pane B's screen.
     #[test]
     fn restoring_an_estimate_clears_the_outgoing_panes_pixels() {
         let mut a = Predictor::new(PredictMode::Always);
@@ -8611,8 +8842,7 @@ mod tests {
             "'i' is not painted over the shifted space"
         );
 
-        // The `TailGuard` negative control is the code as it shipped: the same
-        // echo proves, and 'i' paints.
+        // `TailGuard` negative control: the same echo proves, and 'i' paints.
         let mut p = Predictor::new(PredictMode::Adaptive);
         p.disable_rule_for_test(Rule::TailGuard);
         let at = slow_link_then(&mut p, "ab cd");
@@ -8817,7 +9047,7 @@ mod tests {
     /// `h`'s echo brings up the autosuggestion `o hello`, `x` is typed onto its
     /// first glyph (diverging, so the shell clears it) and `y`'s echo brings up
     /// `zz`, which `z` then follows. Every key after the link is known slow is on
-    /// glass where it echoes, as the shipped predictor painted them; the tail
+    /// glass where it echoes; the tail
     /// comparison alone refused `h`'s echo (text appeared beside it) and `x`'s
     /// (typed over other text), darkening two keys per change on fish,
     /// zsh-autosuggestions, PSReadLine and ble.sh. `x` waits on the suggestion's
@@ -8871,10 +9101,9 @@ mod tests {
     /// `du` (after Ctrl-A, `sudo ` in front): its press read `d` on its cell,
     /// and the frame before its echo still shows `d` there with the cursor on
     /// it. That is the screen as the press saw it, not a divergence: the guess
-    /// waits, and its echo (`sdu`, the cursor past `s`) retires it. Control:
-    /// with the rule off the `d` flushes it at that first frame, as the
-    /// predictor did before the review of phase 0, and its echo finds nothing
-    /// pending.
+    /// waits (off the glass: DARK OVER TEXT), and its echo (`sdu`, the cursor
+    /// past `s`) retires it. Control: with the rule off the `d` flushes it at
+    /// that first frame, and its echo finds nothing pending.
     #[test]
     fn a_glyph_typed_over_the_text_its_press_saw_waits_for_its_echo() {
         for rule_on in [true, false] {
@@ -8895,7 +9124,7 @@ mod tests {
             let unread = at + MS(5);
             p.reconcile_seen(Some((0, 2)), G, false, unread, seen_cells("$ du"));
             assert_eq!(
-                p.overlay(unread).len(),
+                p.pending().len(),
                 usize::from(rule_on),
                 "rule on {rule_on}: the screen as the press saw it"
             );
@@ -8910,6 +9139,233 @@ mod tests {
                 usize::from(rule_on),
                 "rule on {rule_on}: credited with its own echo, or gone before it"
             );
+        }
+    }
+
+    /// DARK OVER TEXT ([`Rule::DarkOverText`]), in `Always`, which shows every
+    /// guess it may. Over ssh, Home is not modelled: `s` is typed on the `d` of
+    /// `du -sh` once Home's echo has put the cursor there, a run not known to be
+    /// at the end of the line. It waits on the screen as its press saw it, off
+    /// the glass from its press on, before any reconcile (a host that paints
+    /// first, the web, sees none of it), and its echo (`sdu -sh`) retires it.
+    /// `l`, typed on that `d` a round trip after Ctrl-K, waits off the glass
+    /// while Ctrl-K's echo is in flight, and is painted once that echo has
+    /// erased the row under it. `x`, typed on a suggestion's first glyph in a
+    /// run at the end of the line, waits on the glass: past the line's end the
+    /// glyph is decoration.
+    /// Control: with the rule off, `s` and `l` are painted over the line's
+    /// text (`su -sh` on glass while the far end inserts `s` before `du`).
+    #[test]
+    fn a_glyph_waiting_over_the_line_s_text_is_not_painted() {
+        for rule_on in [true, false] {
+            let fresh = || {
+                let mut p = Predictor::new(PredictMode::Always);
+                if !rule_on {
+                    p.disable_rule_for_test(Rule::DarkOverText);
+                }
+                p
+            };
+            let row = seen_row("$ du -sh");
+            let key = KeySample {
+                cursor: (0, 2),
+                coords: G,
+                grid: (12, 6),
+                row: Some(&row),
+                ..KeySample::default()
+            };
+            // `s` over the line's text.
+            let mut p = fresh();
+            let at = t0();
+            assert!(p.predict_glyph('s', &key, at));
+            assert_eq!(
+                p.overlay(at).len(),
+                usize::from(!rule_on),
+                "rule on {rule_on}: s at its press, before any reconcile"
+            );
+            let unread = at + MS(5);
+            p.reconcile_seen(Some((0, 2)), G, false, unread, seen_cells("$ du -sh"));
+            assert_eq!(p.pending().len(), 1, "rule on {rule_on}: s waits");
+            assert_eq!(
+                p.overlay(unread).len(),
+                usize::from(!rule_on),
+                "rule on {rule_on}: s over the d of du"
+            );
+            assert_eq!(p.shown_through(), (!rule_on).then_some(0));
+            assert_eq!(p.events_for_test().text_waits, u64::from(rule_on));
+            let echoed = unread + MS(60);
+            p.reconcile_seen(Some((0, 3)), G, false, echoed, seen_cells("$ sdu -sh"));
+            assert!(p.idle(), "rule on {rule_on}: s retired by its echo");
+
+            // `l` over text Ctrl-K's echo, still in flight, erases.
+            let mut p = fresh();
+            p.note_unmodelled_input(at);
+            let typed = at + MS(30);
+            assert!(p.predict_glyph('l', &key, typed));
+            assert_eq!(
+                p.overlay(typed).len(),
+                usize::from(!rule_on),
+                "rule on {rule_on}: l at its press, before any reconcile"
+            );
+            let unread = typed + MS(5);
+            p.reconcile_seen(Some((0, 2)), G, false, unread, seen_cells("$ du -sh"));
+            assert_eq!(
+                p.overlay(unread).len(),
+                usize::from(!rule_on),
+                "rule on {rule_on}: l over the d Ctrl-K is still to erase"
+            );
+            let erased = at + MS(60);
+            p.reconcile_seen(Some((0, 2)), G, false, erased, seen_cells("$"));
+            let shown: Vec<(u16, char)> = p.overlay(erased).iter().map(|g| (g.col, g.ch)).collect();
+            assert_eq!(
+                shown,
+                [(2, 'l')],
+                "rule on {rule_on}: l over the erased row"
+            );
+            let echoed = typed + MS(60);
+            p.reconcile_seen(Some((0, 3)), G, false, echoed, seen_cells("$ l"));
+            assert!(p.idle(), "rule on {rule_on}: l retired by its echo");
+
+            // `x` over a suggestion past the end of the line.
+            let mut p = fresh();
+            let keys: [Keystroke<'_>; 4] = [
+                ('e', 2, "$", "$ e", 3),
+                ('c', 3, "$ e", "$ ec", 4),
+                ('h', 4, "$ ec", "$ echo hello", 5),
+                ('x', 5, "$ echo hello", "$ echx", 6),
+            ];
+            let mut at = t0();
+            let mut shown = Vec::new();
+            for key in keys {
+                let (on_glass, next) = typed_at_the_prompt(&mut p, key, true, at);
+                shown.push(on_glass);
+                at = next;
+            }
+            assert_eq!(shown, [true; 4], "rule on {rule_on}: x over the suggestion");
+            assert_eq!(p.events_for_test().text_waits, 0);
+        }
+    }
+
+    /// DARK OVER TEXT ([`Rule::DarkOverText`]) behind a head that hides
+    /// nothing, in `Always`. Over ssh, after Home or Alt-F (neither modelled
+    /// there), a run's first glyph can land on its own glyph or on a blank
+    /// inside the line, and the glyphs typed after it on the line's text:
+    /// `sudo ` typed on the `s` of `ssh host` (`u` on the second `s`), and
+    /// ` -C x` typed on the space of `git commit` (`-` on its `c`). The head
+    /// waits for its cursor advance or on its blank, which hold nothing; the
+    /// first guess typed over another glyph its run's press read there, which
+    /// its cell still shows, is held off the glass with every guess typed after
+    /// it, from its press on and at the reconcile.
+    /// Control: with the rule off, `$ suh host` and `$ git -C xit` are painted,
+    /// while the far end inserts both (`$ sussh host`, `$ git -C x commit`).
+    #[test]
+    fn a_guess_after_the_head_over_the_line_s_text_is_not_painted() {
+        for rule_on in [true, false] {
+            for (screen, cursor, typed) in
+                [("$ ssh host", 2u16, "su"), ("$ git commit", 5, " -C x")]
+            {
+                let mut p = Predictor::new(PredictMode::Always);
+                if !rule_on {
+                    p.disable_rule_for_test(Rule::DarkOverText);
+                }
+                let row = seen_row(screen);
+                let key = KeySample {
+                    cursor: (0, cursor),
+                    coords: G,
+                    grid: (12, 6),
+                    row: Some(&row),
+                    ..KeySample::default()
+                };
+                let mut at = t0();
+                for ch in typed.chars() {
+                    assert!(p.predict_glyph(ch, &key, at), "{ch:?} is guessed");
+                    at += MS(5);
+                }
+                let painted = if rule_on { 1 } else { typed.len() };
+                let expect: Vec<(u16, char)> =
+                    (cursor..).zip(typed.chars()).take(painted).collect();
+                let shown = |p: &mut Predictor| -> Vec<(u16, char)> {
+                    p.overlay(at).iter().map(|g| (g.col, g.ch)).collect()
+                };
+                assert_eq!(
+                    shown(&mut p),
+                    expect,
+                    "rule on {rule_on}, {screen:?}: at the presses"
+                );
+                p.reconcile_seen(Some((0, cursor)), G, false, at, seen_cells(screen));
+                assert_eq!(
+                    p.pending().len(),
+                    typed.len(),
+                    "{screen:?}: every guess waits"
+                );
+                assert_eq!(
+                    shown(&mut p),
+                    expect,
+                    "rule on {rule_on}, {screen:?}: at the reconcile"
+                );
+                assert_eq!(p.events_for_test().text_waits, u64::from(rule_on));
+            }
+        }
+    }
+
+    /// DARK OVER TEXT across an expiry, in `Always`: `xyz` typed on the `d` of
+    /// `du -sh`, 50 ms apart, with no echo. `x` waits on the screen as its
+    /// press saw it, off the glass with what follows it. Once `x` expires, `y`
+    /// and `z` still lie over the line's text and no turn has read the screen
+    /// since, so the hold passes to `y`, and from it to `z`.
+    /// Control: with the rule off `y` and `z` are painted once `x` expires,
+    /// `$ dyz-sh`, a state the line never has.
+    #[test]
+    fn a_hold_over_the_line_s_text_outlives_its_guess() {
+        for rule_on in [true, false] {
+            let mut p = Predictor::new(PredictMode::Always);
+            if !rule_on {
+                p.disable_rule_for_test(Rule::DarkOverText);
+            }
+            let row = seen_row("$ du -sh");
+            let key = KeySample {
+                cursor: (0, 2),
+                coords: G,
+                grid: (12, 6),
+                row: Some(&row),
+                ..KeySample::default()
+            };
+            let at = t0();
+            for (ch, after) in [('x', 0), ('y', 50), ('z', 100)] {
+                assert!(
+                    p.predict_glyph(ch, &key, at + MS(after)),
+                    "{ch:?} is guessed"
+                );
+            }
+            let shown = |p: &mut Predictor, now| -> Vec<(u16, char)> {
+                p.overlay(now).iter().map(|g| (g.col, g.ch)).collect()
+            };
+            let read = at + MS(110);
+            p.reconcile_seen(Some((0, 2)), G, false, read, seen_cells("$ du -sh"));
+            let all = [(2, 'x'), (3, 'y'), (4, 'z')];
+            let expect = |from: usize| {
+                if rule_on {
+                    Vec::new()
+                } else {
+                    all[from..].to_vec()
+                }
+            };
+            assert_eq!(shown(&mut p, read), expect(0), "rule on {rule_on}: x waits");
+            assert_eq!(p.events_for_test().text_waits, u64::from(rule_on));
+            let x_gone = at + MS(251);
+            assert_eq!(
+                shown(&mut p, x_gone),
+                expect(1),
+                "rule on {rule_on}: x expired"
+            );
+            assert_eq!(p.pending().len(), 2, "x expired, y and z wait");
+            // The timeout doubled the window (`expiry_backoff`): 500 ms for `y`.
+            let y_gone = at + MS(551);
+            assert_eq!(
+                shown(&mut p, y_gone),
+                expect(2),
+                "rule on {rule_on}: y expired"
+            );
+            assert_eq!(p.pending().len(), 1, "y expired, z waits");
         }
     }
 
@@ -9266,7 +9722,7 @@ mod tests {
     /// TYPED OWES. `x` retired without credit owes its own echo as `x`: it lands
     /// in the next guess's cell, so it refuses credit to a later `x` there and to
     /// nothing else. `y`'s echo, past the Enter's window, is credited and proves
-    /// the line; owed as any echo (the shipped cascade, `TypedOwes` off) it was
+    /// the line; owed as any echo (`TypedOwes` off) it was
     /// refused, and every guess after it in turn while keys came faster than the
     /// window. A typed owe that refuses nothing (`TypedOwesSameGlyph` off)
     /// credits the second `x` with what may be the first's echo.
@@ -9476,12 +9932,12 @@ mod tests {
     /// before either echoes; `c`'s echo lands first, the screen a cell ahead, and
     /// `x`, `x` are typed then. The erase lands, the two echo at (0, 2) and
     /// (0, 3). With the rule they anchor on the cancelled cell, where they echo,
-    /// and their own echoes prove the line. Without it (`CancelTransit` off: the
-    /// shipped code) they anchor on the live cursor a cell right, the second
+    /// and their own echoes prove the line. Without it (`CancelTransit` off)
+    /// they anchor on the live cursor a cell right, the second
     /// `x`'s echo stands in the first's cell with the cursor past it, that credit
     /// proves the line a cell behind, and the second `x` is painted at (0, 4),
-    /// where it does not echo. (Typed as two spaces, the shipped case, the
-    /// credit now proves nothing: a space proves no line by itself,
+    /// where it does not echo. (Typed as two spaces, the
+    /// credit proves nothing: a space proves no line by itself,
     /// `Rule::SpaceNeverProves`.)
     #[test]
     fn a_cancelled_glyph_anchors_the_next_on_its_cell() {
@@ -9576,7 +10032,7 @@ mod tests {
     /// `reconcile` is `reconcile_seen` with each glyph a plain `Glyph`; and an
     /// OPAQUE cell is read by the glyph lane as the glyph it carries, so a host
     /// that marks wide or marked cells opaque retires, flushes and wraps exactly
-    /// as the plain observe did, but for an opaque BLANK under the head guess,
+    /// as the plain observe does, but for an opaque BLANK under the head guess,
     /// which flushes it ([`Rule::OpaqueHead`]: a mark or a wide glyph's half is
     /// there, which a plain ghost cannot show). With that rule off the two
     /// hosts act alike on every screen; with it on, on the screen where the
@@ -9962,7 +10418,7 @@ mod tests {
         }
     }
 
-    /// With the edit lane off every edit key is routed as before it existed: an
+    /// With the edit lane off every edit key is routed without it: an
     /// arrow is input this crate does not model, a Backspace is
     /// `predict_backspace`'s.
     #[test]
@@ -10221,11 +10677,10 @@ mod tests {
     /// lands. Control: a motion's credit that re-proves the epoch.
     ///
     /// No public path voids the proof under a chain in flight without flushing
-    /// it or ending the epoch any more: the right prompt cleared beside the line
-    /// while `←` is in flight, which once voided it through the standing tail,
-    /// moves nothing past the chain's states (`far_tail_moved`), so the test
-    /// voids it itself. The rule is the defence of the line against any that
-    /// does.
+    /// it or ending the epoch: a right prompt cleared beside the line while `←`
+    /// is in flight moves nothing past the chain's states (`far_tail_moved`),
+    /// so the test voids it itself. The rule is the defence of the line against
+    /// any path that does.
     #[test]
     fn a_motion_echo_never_proves_its_epoch() {
         for rule_on in [true, false] {
@@ -10566,6 +11021,52 @@ mod tests {
         assert_eq!(cursor, Some((0, 4)), "the chain's cursor on `c`");
     }
 
+    /// A press that arms an op makes it the newest; the overlay shows through
+    /// the last VISIBLE op, so a dark op typed after it is pending and not
+    /// shown, and a cancel arms nothing newer.
+    #[test]
+    fn newest_op_and_shown_through_name_the_pressed_and_the_displayed_ops() {
+        let (mut p, screen, at) = edited_line(PredictMode::Adaptive, "ab");
+        let row = seen_row(&screen);
+        assert_eq!((p.newest_op(), p.shown_through()), (None, None));
+        assert!(p.predict_glyph('c', &sample(&row, 4), at));
+        let c = p.newest_op().expect("`c` armed an op");
+        assert_eq!(p.armed_since(None), Some(c));
+        let _ = p.overlay(at);
+        assert_eq!(p.shown_through(), Some(c), "the proven line shows `c`");
+        assert_eq!(
+            press(&mut p, EditKey::Left, &screen, 5, at),
+            EditOutcome::Armed
+        );
+        let left = p.newest_op().expect("`←` armed an op");
+        assert!(left > c, "ops are numbered in press order");
+        assert_eq!(p.armed_since(Some(c)), Some(left));
+        let _ = p.overlay(at);
+        assert_eq!(
+            p.shown_through(),
+            Some(c),
+            "the line's first `←` is dark until a motion of it echoes (THE CLASS LADDER)"
+        );
+        let (mut q, screen, at) = edited_line(PredictMode::Always, "ab");
+        let row = seen_row(&screen);
+        assert!(q.predict_glyph('c', &sample(&row, 4), at));
+        assert!(q.predict_glyph('d', &sample(&row, 5), at));
+        let before = q.newest_op();
+        assert_eq!(
+            press(&mut q, EditKey::Backspace, &screen, 6, at),
+            EditOutcome::Cancelled
+        );
+        assert!(
+            q.newest_op() < before,
+            "a cancel pops `d` and arms nothing newer"
+        );
+        assert_eq!(
+            q.armed_since(before),
+            None,
+            "the cancel armed nothing (naming the newest op would hand `c`'s op to it)"
+        );
+    }
+
     /// Nothing flushed is displayed, its cursor included: a `reset` (a web host's
     /// switch to `off`, a resize) or any other flush clears the chain's cursor at
     /// once, so a host that asks before its next `overlay` draws the engine's.
@@ -10885,10 +11386,6 @@ mod tests {
         }
     }
 
-    // REVIEW OF INCREMENT 3: the in-place worlds, the pair that cancels, the
-    // standing tail under a run in flight, a line end behind a declined arrow,
-    // and the guards no test held.
-
     /// THE IN-PLACE WORLDS of a burst. `abc` proven, `←` echoed onto `c`, then
     /// a Backspace and `o` typed inside the text before either echoes.
     /// Overwrite mode blanks `b` (`a c`, which no state matches: the chain
@@ -11078,7 +11575,7 @@ mod tests {
     /// `d` first, and inserts the run before the line's `b`: `dbnsb`. Taken to
     /// be at the end of the line, the run proved without comparing its tail,
     /// and the glyph typed next proved again over the `b` its echo pushes on,
-    /// and was painted where that `b` then settles (found by review). The row right of the run holds a `b` its press did not
+    /// and was painted where that `b` then settles. The row right of the run holds a `b` its press did not
     /// see: it proves nothing.
     #[test]
     fn a_blank_row_behind_a_declined_arrow_is_no_line_end() {
@@ -11104,6 +11601,71 @@ mod tests {
         assert!(p.events_for_test().tail_refusals > 0);
     }
 
+    /// THE HIDDEN TAIL. `xi` proven on a slow link; Ctrl-B, a control chord
+    /// nothing models (owed, the epoch ends), steps the far end's cursor one
+    /// cell back, onto `i`, and `i` is typed on it. (The named case's line is
+    /// `i` alone, where Home lands on it; on `xi` Home would land on `x`.)
+    /// Readline inserts it before that `i` and writes the glyph before the
+    /// tail it shifts: the frame between shows `xi` with the cursor past the
+    /// echo and the row right of it blank, as the press saw it, so the echo
+    /// retires as an append, uncredited while Ctrl-B's echo is owed, with no
+    /// proof to watch the row. A window after Ctrl-B, `a` is typed on the
+    /// cursor it left, over a blank row; the redraw (`i\b`) and `a`'s echo
+    /// (`ai\b`) land in one read, `xiai`, the shifted `i` right of `a`. The `i`
+    /// was drawn over the glyph it shifted, so for its window the blank row is
+    /// no line end and `a` proves nothing beside the `i`. Control: with the
+    /// rule off, `a` was taken to be at the end of the line, proved, and `d`
+    /// typed next was shown over the `i` (`xiad` on glass, `xiadi` settled; the
+    /// safety theorem's seed index 97 of the `0xA24B_AED4_963E_E407` sweep).
+    #[test]
+    fn an_echo_drawn_over_the_glyph_it_shifts_hides_its_tail() {
+        for rule_on in [true, false] {
+            let mut p = Predictor::new(PredictMode::Adaptive);
+            if !rule_on {
+                p.disable_rule_for_test(Rule::CleanTailInFlight);
+            }
+            let (screen, at) = type_after(&mut p, "", "xi", t0());
+            assert!(
+                p.adaptive_slow && p.confirmed_epoch,
+                "fixture: a slow, proven line"
+            );
+            let step_back = at;
+            p.note_unmodelled_input(step_back);
+            let at = step_back + RTT;
+            let _ = frame(&mut p, &screen, 1, at);
+            assert!(p.predict_glyph('i', &sample(&seen_row(&screen), 1), at));
+            let at = at + RTT;
+            let _ = frame(&mut p, &screen, 2, at);
+            assert!(p.idle(), "the glyph's echo retires it");
+            assert!(!p.confirmed_epoch, "uncredited: Ctrl-B's echo is owed");
+            assert_eq!(
+                p.hidden_tail_at.is_some(),
+                rule_on,
+                "rule on {rule_on}: typed over its own glyph"
+            );
+            let at = step_back + p.glitch_window_for_test() + MS(1);
+            assert!(p.predict_glyph('a', &sample(&seen_row(&screen), 2), at));
+            assert_eq!(
+                p.tail_line_end, !rule_on,
+                "rule on {rule_on}: the blank row is the line's end"
+            );
+            let at = at + RTT;
+            let _ = frame(&mut p, "xiai", 3, at);
+            assert!(p.idle(), "`a`'s echo retires it");
+            assert_eq!(
+                p.confirmed_epoch, !rule_on,
+                "rule on {rule_on}: `a` proves beside the shifted `i`"
+            );
+            assert!(p.predict_glyph('d', &sample(&seen_row("xiai"), 3), at));
+            let (shown, _) = frame(&mut p, "xiai", 3, at);
+            assert_eq!(
+                shown.is_empty(),
+                rule_on,
+                "rule on {rule_on}: `d` over the `i`: {shown:?}"
+            );
+        }
+    }
+
     /// A glyph-lane run started inside the known text proves nothing.
     /// `abcdefg i` proven, `←` twice onto the space: `o` typed there is inside
     /// the text, but its shift would bring the line to the last column
@@ -11111,13 +11673,17 @@ mod tests {
     /// looks typed over nothing; readline writes `o` before the tail it
     /// shifts, and the frame between shows `abcdefgoi` with the row right of
     /// `o` as the press saw it. Control: proved there, the space typed next
-    /// was painted over `i`, which settles a cell on.
+    /// was painted over `i`, which settles a cell on. DARK OVER TEXT
+    /// ([`Rule::DarkOverText`]) is a second guard against that picture, the
+    /// space typed over `i` where the line's end is not known, so the control
+    /// switches both off.
     #[test]
     fn a_run_started_inside_the_text_proves_nothing() {
         for rule_on in [true, false] {
             let (mut p, screen, at) = edited_line(PredictMode::Adaptive, "abcdefg i");
             if !rule_on {
                 p.disable_rule_for_test(Rule::InsideRunsNeverProve);
+                p.disable_rule_for_test(Rule::DarkOverText);
             }
             let mut at = at;
             for cursor in [11, 10] {
@@ -11323,8 +11889,6 @@ mod tests {
         }
     }
 
-    // THE REVIEW OF INCREMENT 4: the glyph lane's breaks its sweep found on main.
-
     /// A frame of two rows: `top` on row 0, `under` on row 1.
     fn two_rows<'t>(top: &'t str, under: &'t str) -> impl FnMut(u16, u16) -> Seen + 't {
         move |r, c| {
@@ -11424,8 +11988,8 @@ mod tests {
     /// DARK BEHIND A WAIT. `ab` proving, `c` and `d` typed ahead; a frame shows
     /// `c` on its own cell with the cursor ON it, a glyph its press saw no trace
     /// of (a suggestion drawn after the press, a tail a mid-line echo shifted,
-    /// or its own echo with the cursor brought back over it). `c` waits as
-    /// before, and `d` does not show until `c` retires. Control: with the rule
+    /// or its own echo with the cursor brought back over it). `c` waits,
+    /// and `d` does not show until `c` retires. Control: with the rule
     /// off `d` shows.
     #[test]
     fn nothing_shows_behind_a_guess_held_on_its_own_glyph() {
@@ -11907,7 +12471,7 @@ mod tests {
     /// `$ ab`, and `h` typed at the old `B`'s cell, mid-buffer: its line is no
     /// witnessed one, and Home is not placed. Control: with the rule off the
     /// line is taken for the buffer's start, and Home is shown on the stale
-    /// `B` while zle goes to column 2 (the review of increment 4's case).
+    /// `B` while zle goes to column 2.
     #[test]
     fn a_b_left_behind_by_a_narrower_redraw_witnesses_nothing() {
         for rule_on in [true, false] {
@@ -12291,8 +12855,6 @@ mod tests {
             EditOutcome::Declined
         );
     }
-
-    // THE REVIEW OF INCREMENT 5: the breaks its sweep found on main.
 
     /// THE STALE CANCEL. A key not modelled (over ssh, Delete) is owed, and `o`
     /// is guessed on the live cursor after `xd`: a stale anchor. The owed echo

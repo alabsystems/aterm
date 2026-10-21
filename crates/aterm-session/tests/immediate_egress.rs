@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Immediate actuator-egress regression tests.
-//!
-//! A non-blocking pipe gives deterministic kernel backpressure without a shell
-//! or live aterm session.  Like a raw PTY master, it can return initial EAGAIN or
-//! a short write; unlike the ordinary sink path, the immediate API must never
-//! spill the refused/tail bytes for a detached thread to inject later.
+//! Immediate actuator egress over a non-blocking pipe, which gives deterministic
+//! backpressure and, like a raw PTY master, can refuse with EAGAIN or short-write. The
+//! immediate API must never spill refused or tail bytes for a detached thread to inject
+//! later.
 
 #![cfg(unix)]
 
@@ -63,8 +61,8 @@ fn initial_eagain_is_busy_zero_and_never_appears_later() {
     reader.read_exact(&mut old).expect("drain original fill");
     assert!(old.iter().all(|byte| *byte == b'.'));
 
-    // There is room now.  A distinct accepted frame must be the very next
-    // sequence; this catches any rejected frame that was secretly spilled.
+    // There is room now. A distinct accepted frame must be the very next sequence;
+    // this catches any rejected frame that was secretly spilled.
     assert_eq!(
         sink.try_write_frame_immediate(b"accepted"),
         ImmediateWrite::Full
@@ -82,9 +80,8 @@ fn short_write_is_partial_in_doubt_and_tail_is_never_injected() {
     sink.note_master_nonblocking(true);
     let mut reader = std::fs::File::from(read);
 
-    // Make SOME room, but strictly less than the admitted frame.  For an
-    // O_NONBLOCK pipe write larger than PIPE_BUF this deterministically exercises
-    // the same short-write outcome a PTY is permitted to return.
+    // Make some room, but less than the frame: an O_NONBLOCK pipe write larger than
+    // PIPE_BUF then short-writes deterministically, as a PTY may.
     let room = filled.min(8 * 1024);
     let mut prefix = vec![0_u8; room];
     reader.read_exact(&mut prefix).expect("make partial room");
@@ -98,9 +95,9 @@ fn short_write_is_partial_in_doubt_and_tail_is_never_injected() {
     assert!(accepted > 0);
     assert!(accepted < frame.len());
 
-    // Drain the untouched original suffix, followed by exactly the accepted P
-    // prefix.  Then switch the reader non-blocking: EAGAIN proves the unaccepted
-    // tail was not queued for a later drainer write.
+    // Drain the untouched original suffix, then exactly the accepted P prefix; then
+    // switch the reader non-blocking: EAGAIN proves the unaccepted tail was not
+    // queued for a later drainer write.
     let old_remaining = filled - room;
     let mut landed = vec![0_u8; old_remaining + accepted];
     reader

@@ -4,53 +4,46 @@
 //! The sparkle-words spec framework: new sparkle words are data, not code. A
 //! [`WordEffectSpec`] composes three orthogonal axes:
 //!
-//! * **graphic**: a peek-up sprite show ([`Collection::Cats`]),
-//! * **ink**: a glyph colorway ([`Colorway`]: two-tone gradient, the
-//!   ultrathink-style rainbow, or the feline self-glow),
+//! * **graphic**: a peek-up sprite show ([`Collection`]),
+//! * **ink**: a glyph colorway ([`Colorway`]: two-tone gradient, rainbow, or
+//!   the feline self-glow),
 //! * **burst**: a light show ([`BurstKind`]: sparkle, nova, supernova,
 //!   starburst, glow).
 //!
-//! Per-class behaviour is expressed as class-default specs (resolved from the
-//! live [`DecoConfig`](crate::word_decorations::DecoConfig) knobs), and user
+//! Class defaults resolve from the live
+//! [`DecoConfig`](crate::word_decorations::DecoConfig) knobs; user
 //! `[[sparkle_words.custom]]` entries become per-word overrides keyed by the
-//! scanner's `form_hash`. Overrides win over class defaults whatever the match's
-//! class, and an overridden word bypasses the per-class enable gate (a custom
-//! spec on a builtin profanity form fires with `[profanity] enabled = false`).
+//! scanner's `form_hash`. An override wins over the class default whatever the
+//! match's class and bypasses the per-class enable gate (a custom spec on a
+//! builtin profanity form fires with `[profanity] enabled = false`).
 //!
 //! ## form_hash keys
 //!
-//! The scanner reports `form_hash = FNV-1a(folded full token)` for spaced
-//! surfaces and `FNV-1a(raw compound)` for no-space (CJK) scripts, so the
-//! override table uses exactly those hashes:
+//! The scanner reports `FNV-1a(folded full token)` for spaced surfaces and
+//! `FNV-1a(raw compound)` for no-space (CJK) scripts. So spaced surfaces key by
+//! `aterm_lexicon::fold(word)` plus the four possessive variants (`w's`, `w’s`,
+//! `w'`, `w’`), and no-space surfaces ([`aterm_lexicon::is_no_space_surface`])
+//! key by their raw text and become `cjk = true` lexicon entries (a spaced entry
+//! holding a CJK surface is dropped at lexicon insert).
 //!
-//! * spaced surfaces hash `aterm_lexicon::fold(word)`;
-//! * the four possessive variants (`w's`, `w’s`, `w'`, `w’`) are inserted too,
-//!   since possessive hits carry the full-token hash;
-//! * no-space-script surfaces ([`aterm_lexicon::is_no_space_surface`]) become
-//!   `cjk = true` lexicon entries with raw keys and hashes (a spaced entry
-//!   holding a CJK surface would be dropped at lexicon insert).
+//! Dropped or conflicting custom words surface on the lexicon `conflicts`
+//! channel: a single-char CJK word needs `cjk_single_char = true`, and a
+//! mixed-script word is dropped.
 //!
-//! Dropped or conflicting surfaces surface through the lexicon `conflicts`
-//! channel (custom words are appended to the emphasis class). A single-char CJK
-//! word warns that it needs `cjk_single_char = true`, and a mixed-script word
-//! warns it was dropped; both are recorded at lexicon build for the resolver's
-//! warning log.
-//!
-//! ## Toy Packs (strict contribution lane)
+//! ## Toy Packs
 //!
 //! [`compile_toy_pack_toml`] compiles a versioned, bounded Toy Pack into the
-//! same [`SpecTable`] + lexicon fragment as the inline surface. Parsing and
-//! validation happen only when a host loads or reloads a pack; the render path
-//! sees only copied [`WordEffectSpec`] values and enum dispatch. Unlike
-//! `[[sparkle_words.custom]]`, Toy Packs fail closed on unknown fields or effect
-//! names, malformed colours, unsafe timings, duplicate ids/surfaces, or an
-//! unscannable word.
+//! same [`SpecTable`] + lexicon fragment, only when a host loads or reloads a
+//! pack; the render path sees only copied [`WordEffectSpec`] values. Unlike
+//! inline customs, Toy Packs fail closed on unknown fields or effect names,
+//! malformed colours, unsafe timings, duplicate ids/surfaces, or an unscannable
+//! word.
 
 use aterm_hash::FxHashMap;
 use aterm_lexicon::{fold, form_hash, is_no_space_surface};
 
-/// One word's composed effect over the three §6 axes. All-`None` renders
-/// nothing (such customs are not registered as overrides).
+/// One word's composed effect over the three axes. All-`None` renders nothing
+/// (such customs are not registered as overrides).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WordEffectSpec {
     /// Peek-up sprite show.
@@ -90,10 +83,10 @@ pub struct InkSpec {
     pub sweep_once: bool,
 }
 
-/// Glyph colorways (§3.1/§6).
+/// Glyph colorways.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Colorway {
-    /// The v2 two-tone gradient + one specular sweep.
+    /// The two-tone gradient + one specular sweep.
     TwoTone { c0: u32, c1: u32 },
     /// The rainbow: per-lead-cell hue over `span_deg` (clamped to
     /// `min(span_deg, 100°·(lead_cells − 1))`), one exact full-cycle temporal
@@ -107,7 +100,7 @@ pub enum Colorway {
         span_deg: f32,
         drift_ms: u32,
     },
-    /// The feline v2.9 self-terminating glow in the word's own fg.
+    /// The feline self-terminating glow in the word's own fg.
     SelfGlow { lift: f32, amp: f32, window_ms: u32 },
 }
 
@@ -122,9 +115,9 @@ pub struct BurstSpec {
 /// Burst light shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BurstKind {
-    /// The v1 randomized self-terminating sparkle.
+    /// The randomized self-terminating sparkle.
     Sparkle,
-    /// The v2 §6 classic nova (dip → flash → ring + rays → debris → ember).
+    /// The classic nova (dip → flash → ring + rays → debris → ember).
     Nova,
     /// The supernova (charge → theme-branched detonation → double shockwave →
     /// rainbow debris → afterglow).
@@ -135,8 +128,8 @@ pub enum BurstKind {
     Glow,
 }
 
-/// §3.1 rainbow defaults (the `ProfanityStyle::Rainbow` class default and the
-/// bare `colorway = "rainbow"` custom shorthand).
+/// Rainbow defaults (the `ProfanityStyle::Rainbow` class default and the bare
+/// `colorway = "rainbow"` custom shorthand).
 pub const RAINBOW_SAT: f32 = 0.85;
 pub const RAINBOW_VAL: f32 = 1.0;
 pub const RAINBOW_SPAN_DEG: f32 = 300.0;
@@ -191,15 +184,11 @@ pub struct SpecTable {
     overrides: FxHashMap<u64, SpecId>,
 }
 
-/// Which shared runtime tunings have at least one admitted word-effect consumer.
-/// Derived from the compiled [`SpecTable`], not from the presence of a custom or
-/// Toy Pack entry: graphic-only, Glow, SuperNova and zero-chance recipes do not
-/// make unrelated controls effective.
-///
-/// Custom TwoTone recipes own their repeat choice ([`InkSpec::sweep_once`]), so
-/// there is no global ink-loop capability; `ink.loop` affects class defaults
-/// only. `twotone_ink` marks consumers of the shared sweep duration and
-/// strength.
+/// Which shared runtime tunings have at least one admitted word-effect consumer,
+/// derived from the compiled [`SpecTable`]: graphic-only, Glow, SuperNova and
+/// zero-chance recipes do not make unrelated controls effective. Custom TwoTone
+/// recipes own their repeat choice ([`InkSpec::sweep_once`]), so `ink.loop`
+/// affects class defaults only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpecConsumerCapabilities {
     /// A positive-chance classic Nova burst consumes the shared magic toggle.
@@ -220,17 +209,15 @@ pub struct SpecConsumerCapabilities {
 }
 
 impl SpecTable {
-    /// Whether any custom spec is registered — the §6 emphasis-class resolve
-    /// gate term (`enabled && (ink_enabled || has_custom_specs)`).
+    /// Whether any custom spec is registered: a term of the emphasis-class
+    /// resolve gate (`enabled && (ink_enabled || has_custom_specs)`).
     #[must_use]
     pub fn has_custom(&self) -> bool {
         !self.specs.is_empty()
     }
 
-    /// Exact shared-setting consumers in this compiled table. `specs` holds only
-    /// recipes attached to at least one non-empty word by
-    /// [`Self::insert_custom`]. After Toy Pack overlay this matches the inline +
-    /// pack generation the renderer uses.
+    /// Exact shared-setting consumers in this compiled table, after any Toy Pack
+    /// overlay.
     #[must_use]
     pub fn consumer_capabilities(&self) -> SpecConsumerCapabilities {
         let mut capabilities = SpecConsumerCapabilities::default();
@@ -263,8 +250,8 @@ impl SpecTable {
         capabilities
     }
 
-    /// The per-word override for a scan match, if any. Wins over the class
-    /// default regardless of the match's class (design §6, normative).
+    /// The per-word override for a scan match, if any; it wins over the class
+    /// default whatever the match's class.
     #[must_use]
     pub fn override_for(&self, form_hash: u64) -> Option<&WordEffectSpec> {
         self.overrides
@@ -299,14 +286,16 @@ impl SpecTable {
             // possessive hit carries the full-token hash, so the four possessive
             // variants register too (`fold(w + suf) == fold(w) + suf` for these
             // ASCII/U+2019 tails).
-            let base = fold(word);
+            let mut base = fold(word);
             if base.is_empty() {
                 return;
             }
-            for suf in ["", "'s", "\u{2019}s", "'", "\u{2019}"] {
-                let mut k = base.clone();
-                k.push_str(suf);
-                self.overrides.insert(form_hash(&k), id);
+            self.overrides.insert(form_hash(&base), id);
+            let base_len = base.len();
+            for suf in ["'s", "\u{2019}s", "'", "\u{2019}"] {
+                base.truncate(base_len);
+                base.push_str(suf);
+                self.overrides.insert(form_hash(&base), id);
             }
         }
     }
@@ -450,19 +439,30 @@ impl RawCustomEntry {
                 sweep_once,
             }
         });
-        let burst = self.burst.as_ref().map(|raw| BurstSpec {
-            kind: match raw.kind.trim().to_ascii_lowercase().as_str() {
-                "sparkle" => BurstKind::Sparkle,
-                "nova" => BurstKind::Nova,
-                "supernova" | "super_nova" | "super-nova" => BurstKind::SuperNova,
-                "glow" => BurstKind::Glow,
-                // "starburst" and anything unknown: the gentlest burst.
-                _ => BurstKind::Starburst,
-            },
-            chance_pct: raw.chance.unwrap_or(100).min(100) as u8,
+        let burst = self.burst.as_ref().map(|raw| {
+            let kind = raw.kind.trim();
+            BurstSpec {
+                kind: if kind.eq_ignore_ascii_case("sparkle") {
+                    BurstKind::Sparkle
+                } else if kind.eq_ignore_ascii_case("nova") {
+                    BurstKind::Nova
+                } else if kind.eq_ignore_ascii_case("supernova")
+                    || kind.eq_ignore_ascii_case("super_nova")
+                    || kind.eq_ignore_ascii_case("super-nova")
+                {
+                    BurstKind::SuperNova
+                } else if kind.eq_ignore_ascii_case("glow") {
+                    BurstKind::Glow
+                } else {
+                    // "starburst" and anything unknown: the gentlest burst.
+                    BurstKind::Starburst
+                },
+                chance_pct: raw.chance.unwrap_or(100).min(100) as u8,
+            }
         });
         let graphic = self.graphic.as_ref().map(|_| GraphicSpec {
-            // Only Cats exists in v3; unknown collections fail open to it.
+            // Inline customs always peek Cats; any collection value fails open to
+            // it (Animals is builtin-only).
             collection: Collection::Cats,
             dwell_ms: (2200, 3598),
         });
@@ -534,7 +534,7 @@ fn push_toml_basic_string_body(out: &mut String, value: &str) {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => {} // legacy inline customs drop controls
+            c if (c as u32) < 0x20 => {} // inline customs drop controls
             c => out.push(c),
         }
     }
@@ -579,7 +579,7 @@ const MAX_ANIMATION_MS: u32 = 6000;
 const MAX_CAT_DWELL_MS: u32 = 3750;
 
 /// Contributor-facing metadata retained with a compiled Toy Pack. `id` is a
-/// stable, namespaced key (for example `community.example.tiny-triumphs`), not
+/// stable, namespaced key (for example `community.aterm.tiny-triumphs`), not
 /// display text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToyPackMetadata {
@@ -872,10 +872,9 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
         push_lexicon_entry(&mut lexicon_toml, &toy.lang, &cjk, true);
     }
 
-    // Round-trip through the real scanner builder, then scan every accepted
-    // surface in isolation. This catches mixed-script/punctuation/multi-word
-    // surfaces, CJK exception precedence, and any future scanner rule the pack
-    // compiler would otherwise duplicate and drift from.
+    // Round-trip through the real scanner builder and scan each accepted surface
+    // alone, so the pack compiler never duplicates (and drifts from) a scanner
+    // rule: mixed-script, punctuation, multi-word, CJK exception precedence.
     if diagnostics.is_empty() {
         match aterm_lexicon::Lexicon::with_languages_and_override(&["all"], Some(&lexicon_toml)) {
             Ok(lexicon) => {
@@ -946,15 +945,16 @@ fn toy_dispatch_hashes(word: &str) -> Vec<u64> {
     if is_no_space_surface(word) {
         return vec![form_hash(word)];
     }
-    let base = fold(word);
-    ["", "'s", "\u{2019}s", "'", "\u{2019}"]
-        .into_iter()
-        .map(|suffix| {
-            let mut key = base.clone();
-            key.push_str(suffix);
-            form_hash(&key)
-        })
-        .collect()
+    let mut base = fold(word);
+    let base_len = base.len();
+    let mut hashes = Vec::with_capacity(5);
+    hashes.push(form_hash(&base));
+    for suffix in ["'s", "\u{2019}s", "'", "\u{2019}"] {
+        base.truncate(base_len);
+        base.push_str(suffix);
+        hashes.push(form_hash(&base));
+    }
+    hashes
 }
 
 fn validate_pack_metadata(raw: &RawToyPackMetadata, diagnostics: &mut Vec<String>) {
@@ -1238,8 +1238,7 @@ fn compile_toy_ink(raw: &RawToyPackInk, context: &str, diagnostics: &mut Vec<Str
             rainbow_ink().colorway
         }
     };
-    // Pack recipes are structurally one-shot. A future schema may add looping
-    // ink with an explicit wake/performance contract; v1 always settles.
+    // Schema v1 pack ink is one-shot: it always settles.
     InkSpec {
         colorway,
         sweep_once: true,
@@ -1640,7 +1639,7 @@ graphic = { collection = "cats" }
         let (table, lex_frag) = build_custom(&entries);
         assert!(table.has_custom());
 
-        // Spaced word: keyed by the FOLDED hash + 4 possessive variants.
+        // Spaced word: keyed by the folded hash + 4 possessive variants.
         let base = table
             .override_for(form_hash("ultrathink"))
             .expect("folded base hash registered");
@@ -1659,7 +1658,7 @@ graphic = { collection = "cats" }
                 "possessive variant {k:?} registered"
             );
         }
-        // Raw (cased) TOML text is NOT the key — hashing it would no-op.
+        // The raw (cased) text is not the key.
         assert!(table.override_for(form_hash("Ultrathink")).is_none());
 
         // CJK word: RAW hash; chance clamps to 100.
@@ -1745,10 +1744,8 @@ graphic = { collection = "cats" }
         assert_eq!(kind("later-only"), Some(BurstKind::Starburst));
     }
 
-    /// Unscannable custom words are not silently accepted: a single-char CJK
-    /// surface (dropped unless `cjk_single_char = true`) and a mixed-script
-    /// surface (dropped at lexicon insert) both appear on the lexicon
-    /// `conflicts` channel when the fragment is built.
+    /// A single-char CJK word (needs `cjk_single_char = true`) and a mixed-script
+    /// word both surface on the lexicon `conflicts` channel.
     #[test]
     fn unscannable_custom_words_warn_on_the_conflicts_channel() {
         let frag = r#"
@@ -1827,9 +1824,8 @@ ink = { colorway = "rainbow" }
             ..WordEffectSpec::default()
         };
 
-        // Negative controls: these are genuine admitted custom recipes, but
-        // none consumes Nova magic, legacy sparkle tuning, or global ink
-        // strength/sweep timing.
+        // Negative controls: admitted recipes that consume none of Nova magic,
+        // sparkle tuning, or global ink strength/sweep timing.
         table.insert_custom(
             "graphic-only",
             WordEffectSpec {
@@ -1881,8 +1877,7 @@ ink = { colorway = "rainbow" }
                         c0: 0x0011_2233,
                         c1: 0x0044_5566,
                     },
-                    // A custom recipe owns this choice. It does not become a
-                    // consumer of the global `ink.loop` setting.
+                    // The recipe's own choice, not a global `ink.loop` consumer.
                     sweep_once: false,
                 }),
                 burst: Some(BurstSpec {
@@ -1904,9 +1899,8 @@ ink = { colorway = "rainbow" }
             }
         );
 
-        // An inline override can make an imported pack recipe unreachable.
-        // The arena keeps both specs for compact ids, but capability projection
-        // follows the live dispatch map and therefore drops the shadowed burst.
+        // An inline override shadows the imported recipe; capabilities follow
+        // the live dispatch map, not the arena, so the shadowed burst drops out.
         let mut imported = SpecTable::default();
         imported.insert_custom("shared", burst(BurstKind::Sparkle, 100));
         let mut inline = SpecTable::default();

@@ -133,6 +133,11 @@ impl Mark {
 
 /// Fixed header: version(1) + seq(8) + producer_id(8) + producer_seq(8).
 const HEADER: usize = 25;
+/// The bytes every unmarked record payload takes beside its subject, its body and its
+/// commit's group and offset: the header, the two length prefixes and the commit tag
+/// (`retention::record_bytes`).
+#[cfg(feature = "retention")]
+pub(crate) const RECORD_FIXED_LEN: usize = HEADER + 9;
 /// The largest record payload the log accepts: the frame cap minus a margin, so a
 /// stored record ALWAYS also fits the frame wherever it is re-framed — inside a
 /// `Replicate` request (whose envelope, with the leader's log-identity trailer, is 25

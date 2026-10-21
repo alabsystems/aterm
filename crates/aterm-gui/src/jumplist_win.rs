@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Windows taskbar **jump list** — the menu behind a right-click (or upward
-//! swipe) on aterm's taskbar button.
+//! Windows taskbar jump list: the menu behind a right-click on aterm's taskbar button.
 //!
 //! Without this, that menu shows only the shell defaults (the recent-items
 //! stub, "Pin to taskbar", "Close window") — a gap every established Windows
@@ -34,25 +33,14 @@
 //! window (a development build under its own `ATERM_STATE_HOME`) commits no
 //! list and keeps no file ([`owns_the_jump_list`]).
 //!
-//! **Identity**: the list is registered against the process AUMID
-//! ([`crate::win32::AUMID`], set via `SetCurrentProcessExplicitAppUserModelID`
-//! at startup) with `ICustomDestinationList::SetAppID` *before* `BeginList`.
-//! The Start-Menu shortcut stamps the SAME AUMID (`apps/aterm-win/
-//! install.ps1`, landed with the pin-identity work), so the running button,
-//! the pinned tile, and this jump list all resolve to one identity — without
-//! `SetAppID` the list would attach to the exe-path identity and a *pinned*
-//! aterm would never show it.
+//! The tasks carry verbs. "New Window" runs `new-window`, the one verb the routing policy never
+//! redirects (a bare launch under `attach` opens a tab). "New Tab" runs `new-tab` and is
+//! offered only under `attach`: under `new_window` that verb opens a window
+//! (`aterm_cli::route_launch`).
 //!
-//! **The tasks carry VERBS, not a bare launch** (S12). "New Window" runs
-//! `aterm-gui.exe new-window`, the one verb the routing policy never redirects,
-//! so the row does what it says even when the operator set
-//! `windowing_behavior = "attach"` — a bare launch under that policy would open
-//! a TAB, and a taskbar row labelled "New Window" that opens a tab is a lie the
-//! shell would keep telling from the user's persisted profile. "New Tab" runs
-//! `aterm-gui.exe new-tab`, and is only OFFERED under `attach`: under the default
-//! `new_window` policy that verb opens a window (deliberately — see
-//! `aterm_cli::route_launch`), so the row would be a second "New Window" with a
-//! misleading name. One list per policy, each honest about itself.
+//! The target is resolved at every registration ([`front_door_exe`]), so a moved install or a
+//! dev build rewrites the list to point at itself; re-committing an identical list costs a few
+//! KB once per process.
 //!
 //! **Self-healing exe path**: the task's target is resolved from
 //! `current_exe()` at every registration, not an install-time constant — move
@@ -82,10 +70,11 @@
 //!
 //! **FFI style**: hand-rolled by-hand-vtable COM against system DLLs (ole32),
 //! the same tiny-FFI house style as the `ITaskbarList3` progress block in
-//! `app_window.rs` — see the vocabulary note there. The `windows` crate is in
-//! this binary for DXGI only; pulling `Win32_UI_Shell` (+ `Win32_System_Com` +
-//! the PROPVARIANT stack) for four leaf interfaces used on one worker thread was
-//! rejected as a heavyweight feature add for no safety gain: the vtables below
+//! `app_window.rs` — see the vocabulary note there; the owned pointer and
+//! object creation are aterm-win32's. Pulling `windows`' `Win32_UI_Shell` (+
+//! `Win32_System_Com` + the PROPVARIANT stack) for four leaf interfaces used on
+//! one worker thread was rejected as a heavyweight feature add for no safety
+//! gain: the vtables below
 //! are transcribed from `shobjidl_core.h`/`propsys.h` and every slot before a
 //! called one is declared so offsets are load-bearing and checked by shape.
 #![cfg(windows)]
@@ -95,12 +84,10 @@ use std::os::windows::ffi::OsStrExt;
 
 use crate::win_ffi::{
     COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize, Com, Guid, HKEY_CURRENT_USER,
-    IUnknownRepr, StepError, check, co_create, wide,
+    StepError, check, co_create, wide,
 };
 
-// ---------------------------------------------------------------------------
-// GUIDs (from shobjidl_core.h / propsys.h / propkey.h)
-// ---------------------------------------------------------------------------
+// GUIDs (shobjidl_core.h / propsys.h / propkey.h)
 
 /// `CLSID_DestinationList` {77F10CF0-3DB5-4966-B520-B7C54FD35ED6}.
 const CLSID_DESTINATION_LIST: Guid = Guid {
@@ -130,8 +117,8 @@ const IID_IOBJECT_COLLECTION: Guid = Guid {
     data3: 0x400A,
     data4: [0x92, 0x8A, 0xD4, 0xCD, 0x63, 0x23, 0x02, 0x95],
 };
-/// `IID_IObjectArray` {92CA9DCD-5622-4BBA-A805-5E9F541BD8C9} — only used as the
-/// riid for `BeginList`'s removed-destinations out-param.
+/// `IID_IObjectArray` {92CA9DCD-5622-4BBA-A805-5E9F541BD8C9}: the riid for `BeginList`'s
+/// removed-destinations out-param.
 const IID_IOBJECT_ARRAY: Guid = Guid {
     data1: 0x92CA_9DCD,
     data2: 0x5622,
@@ -160,9 +147,7 @@ const IID_IPROPERTY_STORE: Guid = Guid {
     data4: [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99],
 };
 
-// ---------------------------------------------------------------------------
 // Property-store plumbing for the task title
-// ---------------------------------------------------------------------------
 
 /// `PROPERTYKEY` (propsys.h): a fmtid GUID plus a property id.
 #[repr(C)]
@@ -171,11 +156,9 @@ struct PropertyKey {
     pid: u32,
 }
 
-/// `PKEY_Title` ({F29F85E0-4FF9-1068-AB91-08002B27B3D9}, 2) — the string the
-/// jump-list row actually *displays*. `IShellLinkW::SetDescription` is only the
-/// hover tooltip; without a `System.Title` the row shows the link's target
-/// filename ("aterm-gui.exe"), which is why the property store is mandatory
-/// here and not gold-plating.
+/// `PKEY_Title` ({F29F85E0-4FF9-1068-AB91-08002B27B3D9}, 2): the text the jump-list row
+/// displays. `IShellLinkW::SetDescription` is only the tooltip; without a `System.Title` the
+/// row shows the target's filename.
 const PKEY_TITLE: PropertyKey = PropertyKey {
     fmtid: Guid {
         data1: 0xF29F_85E0,
@@ -188,16 +171,12 @@ const PKEY_TITLE: PropertyKey = PropertyKey {
 
 const VT_LPWSTR: u16 = 31;
 
-/// A shape-only `PROPVARIANT`, wide enough for every ABI aterm builds
-/// (24 bytes on x64: 8-byte discriminant header + 16-byte data union; the
-/// callee never reads past its own `sizeof`, so over-size on x86 is harmless).
-/// Only the `VT_LPWSTR` arm is modeled: `ptr` occupies the union's first
-/// pointer slot (`pwszVal`), `pad` zero-fills the rest.
+/// A shape-only `PROPVARIANT`: 24 bytes on x64 (8-byte header, 16-byte union); the callee
+/// never reads past its own `sizeof`, so the over-size on x86 is harmless. Only the
+/// `VT_LPWSTR` arm is modeled: `ptr` is the union's `pwszVal`, `pad` zero-fills the rest.
 ///
-/// Ownership subtlety, and why no `CoTaskMemAlloc`: `InitPropVariantFromString`
-/// copies into CoTaskMem *so that a later `PropVariantClear` can free it*. We
-/// never call `PropVariantClear` — `SetValue` copies the value into the store
-/// and our variant then simply goes out of scope — so pointing `pwszVal` at a
+/// No `CoTaskMemAlloc`: that is only for a later `PropVariantClear` to free, which never
+/// runs here, and `SetValue` copies the value into the store, so pointing `pwszVal` at a
 /// caller-owned NUL-terminated buffer is sound and leak-free.
 #[repr(C)]
 struct PropVariant {
@@ -209,10 +188,8 @@ struct PropVariant {
     pad: [u64; 1],
 }
 
-// ---------------------------------------------------------------------------
-// Vtables, in COM inheritance order. Slots before a called one are declared
-// with their real shapes and never invoked — their OFFSETS are load-bearing.
-// ---------------------------------------------------------------------------
+// Vtables, in COM inheritance order. Slots before a called one are declared with
+// their real shapes and never invoked: their offsets are load-bearing.
 
 /// `ICustomDestinationList` (shobjidl_core.h).
 #[repr(C)]
@@ -334,11 +311,9 @@ struct IPropertyStore {
     vtbl: *const IPropertyStoreVtbl,
 }
 
-// ---------------------------------------------------------------------------
-// Tiny RAII so error paths cannot leak COM references ([`Com`]) or the apartment.
-// [`build`] has too many fallible steps for the linear manual-release style of
-// the `taskbar` module.
-// ---------------------------------------------------------------------------
+// RAII so error paths cannot leak COM references ([`Com`]) or the apartment:
+// [`build`] has too many fallible steps for the manual-release style of
+// `app_window.rs`'s `taskbar` module.
 
 /// Balances a successful `CoInitializeEx` when [`build`] returns by any path.
 struct CoUninitGuard;
@@ -351,9 +326,7 @@ impl Drop for CoUninitGuard {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Registration
-// ---------------------------------------------------------------------------
 
 /// Register (or refresh) the jump list for this process's AUMID, then keep its
 /// Recent rows current for the life of the process.
@@ -405,12 +378,8 @@ pub(crate) fn install() {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    // Read the routing policy HERE rather than taking it as a parameter: this
-    // already runs on its own thread after the first present, a bounded config
-    // read costs nothing next to the shell's registry + profile round trip, and
-    // it keeps the first-present hook in `app_render.rs` a single argument-less
-    // call. The list is re-committed every launch anyway (see the module docs),
-    // so flipping the config and restarting rewrites the menu.
+    // Read here so the first-present hook stays an argument-less call; the list
+    // is re-committed every launch, so a config change shows after a restart.
     let attach = attach_policy_is_on();
     let Some(notes) = crate::jumplist_recent::take_notes() else {
         return; // a second install in one process: the first one's worker serves
@@ -669,28 +638,14 @@ fn recents_tracked() -> bool {
 /// image that routes `new-tab` / `new-window` / `split-pane`, and that the
 /// shell starts without a console.
 ///
-/// Not simply `current_exe()`, and the difference was a shipped-feature bug
-/// twice over. Once when the install was identical copies of one binary:
-/// `aterm-gui.exe` was then an argv0 alias meaning "the window", and
-/// `aterm-gui.exe new-window` reached the window's own flag parser and exited 2
-/// — a taskbar row gone silently dead — so the row named `aterm.exe`. And
-/// again when Windows split the front door into two images (2026-09-22):
-/// `aterm.exe` became the CONSOLE image, so a row naming it made the shell
-/// allocate a console — a conhost window, or with Windows Terminal as the
-/// default terminal a WT window — that flashed up on every click before the
-/// handoff exited, which is exactly what the split exists to prevent (review
-/// 2026-09-27). The windowed `aterm-gui.exe` now IS the front door under its
-/// alias (`aterm-gui.exe new-window` routes the verb), so the row names it.
+/// Not `current_exe()`: the console `aterm.exe` routes the verbs but makes the shell allocate
+/// a console that flashes up on every click, and a build tree's thin `aterm-gui.exe` knows no
+/// verb. The rule is [`crate::windowed_front_door`]'s: `aterm-gui.exe` in an install,
+/// `aterm-windowed.exe` in a build tree. Without one on disk the row falls back to a sibling
+/// console `aterm.exe` (it routes the verb, with a console flash), and without that to this
+/// process.
 ///
-/// The rule is [`crate::windowed_front_door`]'s, shared with the console
-/// image's window handoff and the Explorer verb: `aterm-gui.exe` in an install,
-/// `aterm-windowed.exe` in a build tree — never a build tree's `aterm-gui.exe`,
-/// the thin dev bin that knows no verb. Without a windowed front door on disk
-/// the row falls back to a sibling console `aterm.exe` (it routes the verb and
-/// only flashes a console), and without that to this process.
-///
-/// `is_file` and `cargo_profile_dir` are injected so the rule is unit-testable
-/// without laying out a fake install tree on disk.
+/// `is_file` and `cargo_profile_dir` are injected so the rule is testable without a fake tree.
 fn front_door_exe(
     current: &std::path::Path,
     is_file: impl Fn(&std::path::Path) -> bool,
@@ -706,15 +661,11 @@ fn front_door_exe(
         .unwrap_or_else(|| current.to_path_buf())
 }
 
-/// Whether `windowing_behavior` is `attach` — i.e. whether a "New Tab" row would
-/// actually produce a tab.
+/// Whether `windowing_behavior` is `attach`, i.e. whether a "New Tab" row would produce a tab.
 ///
-/// The spelling test is intentionally duplicated in miniature rather than
-/// reached for through `aterm-cli` (this crate does not depend on it, and adding
-/// the dependency to decide one menu row would be backwards). Kept in sync by
-/// being the SAME two accepted spellings the front door's parser accepts for
-/// this value; anything else — including a typo — leaves the list at the safe
-/// one-task shape, which is exactly what the front door's own fallback does.
+/// The spellings mirror `aterm_cli::WindowingBehavior::parse` (this crate does not depend on
+/// `aterm-cli`); anything else, a typo included, leaves the one-task list, as the front door's
+/// own fallback does.
 fn attach_policy_is_on() -> bool {
     crate::windowing_behavior_setting().is_some_and(|value| {
         matches!(
@@ -777,18 +728,16 @@ unsafe fn build_once(
     // The worker's own thread, so APARTMENTTHREADED cannot RPC_E_CHANGED_MODE;
     // a real failure here means COM itself is unavailable and the list is off
     // the table for this launch.
-    let hr = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+    let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
     check(hr, "CoInitializeEx")?;
     let _co = CoUninitGuard;
 
-    let list = unsafe {
-        co_create(
-            &CLSID_DESTINATION_LIST,
-            &IID_ICUSTOM_DESTINATION_LIST,
-            "create DestinationList",
-        )?
-    };
-    let list_ptr = list.0.cast::<ICustomDestinationList>();
+    let list = co_create(
+        &CLSID_DESTINATION_LIST,
+        &IID_ICUSTOM_DESTINATION_LIST,
+        "create DestinationList",
+    )?;
+    let list_ptr = list.as_raw().cast::<ICustomDestinationList>();
     let list_vt = unsafe { &*(*list_ptr).vtbl };
 
     // Identity FIRST: bind the list to the process AUMID before BeginList, or
@@ -817,8 +766,8 @@ unsafe fn build_once(
         },
         "BeginList",
     )?;
-    if !removed_raw.is_null() {
-        let array = Com(removed_raw);
+    // SAFETY: a successful BeginList hands over one reference to the array.
+    if let Some(array) = unsafe { Com::from_raw(removed_raw) } {
         removed.extend(unsafe { removed_dirs(&array) });
     }
 
@@ -833,18 +782,16 @@ unsafe fn build_once(
         .cloned()
         .collect();
     if !rows.is_empty() {
-        let category = unsafe {
-            co_create(
-                &CLSID_ENUMERABLE_OBJECT_COLLECTION,
-                &IID_IOBJECT_COLLECTION,
-                "create ObjectCollection",
-            )?
-        };
-        let category_ptr = category.0.cast::<IObjectCollection>();
+        let category = co_create(
+            &CLSID_ENUMERABLE_OBJECT_COLLECTION,
+            &IID_IOBJECT_COLLECTION,
+            "create ObjectCollection",
+        )?;
+        let category_ptr = category.as_raw().cast::<IObjectCollection>();
         for (dir, title) in rows.iter().zip(crate::jumplist_recent::titles(&rows)) {
             let row = unsafe { recent_row(exe, dir, &title)? };
             check(
-                unsafe { ((*(*category_ptr).vtbl).add_object)(category_ptr, row.0) },
+                unsafe { ((*(*category_ptr).vtbl).add_object)(category_ptr, row.as_raw()) },
                 "AddObject",
             )?;
         }
@@ -852,19 +799,17 @@ unsafe fn build_once(
         // file-type registration (an IShellItem would need one).
         let name = wide("Recent");
         check(
-            unsafe { (list_vt.append_category)(list_ptr, name.as_ptr(), category.0) },
+            unsafe { (list_vt.append_category)(list_ptr, name.as_ptr(), category.as_raw()) },
             "AppendCategory",
         )?;
     }
 
-    let tasks = unsafe {
-        co_create(
-            &CLSID_ENUMERABLE_OBJECT_COLLECTION,
-            &IID_IOBJECT_COLLECTION,
-            "create ObjectCollection",
-        )?
-    };
-    let tasks_ptr = tasks.0.cast::<IObjectCollection>();
+    let tasks = co_create(
+        &CLSID_ENUMERABLE_OBJECT_COLLECTION,
+        &IID_IOBJECT_COLLECTION,
+        "create ObjectCollection",
+    )?;
+    let tasks_ptr = tasks.as_raw().cast::<IObjectCollection>();
 
     // The tasks, in menu order. A future "Settings" (pending a real CLI verb)
     // is one more `task(...)` + `add_object` pair here.
@@ -882,25 +827,24 @@ unsafe fn build_once(
             )?
         };
         check(
-            unsafe { ((*(*tasks_ptr).vtbl).add_object)(tasks_ptr, new_tab.0) },
+            unsafe { ((*(*tasks_ptr).vtbl).add_object)(tasks_ptr, new_tab.as_raw()) },
             "AddObject",
         )?;
     }
     let new_window = unsafe { task(exe, "new-window", "New Window", "Open a new aterm window")? };
     check(
-        unsafe { ((*(*tasks_ptr).vtbl).add_object)(tasks_ptr, new_window.0) },
+        unsafe { ((*(*tasks_ptr).vtbl).add_object)(tasks_ptr, new_window.as_raw()) },
         "AddObject",
     )?;
 
     // IObjectCollection inherits IObjectArray, so the collection pointer IS the
     // IObjectArray AddUserTasks wants — no QueryInterface detour needed.
     check(
-        unsafe { (list_vt.add_user_tasks)(list_ptr, tasks.0) },
+        unsafe { (list_vt.add_user_tasks)(list_ptr, tasks.as_raw()) },
         "AddUserTasks",
     )?;
-    // Commit publishes atomically; an error-path return before this point
-    // abandons the transaction on release and the previously committed list
-    // (if any) stays in force — the shell's documented AbortList-on-release.
+    // Commit publishes atomically; an earlier error return abandons the
+    // transaction on release and the previously committed list stays.
     check(unsafe { (list_vt.commit_list)(list_ptr) }, "CommitList")?;
     Ok(rows)
 }
@@ -910,17 +854,15 @@ unsafe fn build_once(
 /// its own list.
 #[cfg(debug_assertions)]
 unsafe fn delete_list(aumid: &str) -> Result<(), StepError> {
-    let hr = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+    let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
     check(hr, "CoInitializeEx")?;
     let _co = CoUninitGuard;
-    let list = unsafe {
-        co_create(
-            &CLSID_DESTINATION_LIST,
-            &IID_ICUSTOM_DESTINATION_LIST,
-            "create DestinationList",
-        )?
-    };
-    let list_ptr = list.0.cast::<ICustomDestinationList>();
+    let list = co_create(
+        &CLSID_DESTINATION_LIST,
+        &IID_ICUSTOM_DESTINATION_LIST,
+        "create DestinationList",
+    )?;
+    let list_ptr = list.as_raw().cast::<ICustomDestinationList>();
     let aumid = wide(aumid);
     check(
         unsafe { ((*(*list_ptr).vtbl).delete_list)(list_ptr, aumid.as_ptr()) },
@@ -935,7 +877,7 @@ unsafe fn delete_list(aumid: &str) -> Result<(), StepError> {
 unsafe fn removed_dirs(removed: &Com) -> Vec<String> {
     // IObjectArray's five slots lead IObjectCollection's, so the collection
     // vtable reads the array.
-    let array = removed.0.cast::<IObjectCollection>();
+    let array = removed.as_raw().cast::<IObjectCollection>();
     let array_vt = unsafe { &*(*array).vtbl };
     let mut count = 0u32;
     if unsafe { (array_vt.get_count)(array, &mut count) } < 0 {
@@ -945,11 +887,14 @@ unsafe fn removed_dirs(removed: &Com) -> Vec<String> {
     for at in 0..count {
         let mut raw: *mut c_void = std::ptr::null_mut();
         let hr = unsafe { (array_vt.get_at)(array, at, &IID_ISHELL_LINK_W, &mut raw) };
-        if hr < 0 || raw.is_null() {
+        if hr < 0 {
             continue;
         }
-        let link = Com(raw);
-        let link_ptr = link.0.cast::<IShellLinkW>();
+        // SAFETY: a successful GetAt hands over one reference to the item.
+        let Some(link) = (unsafe { Com::from_raw(raw) }) else {
+            continue;
+        };
+        let link_ptr = link.as_raw().cast::<IShellLinkW>();
         // A kept directory is at most 1024 chars, so at most 2048 UTF-16 units.
         let mut buf = vec![0u16; 2050];
         let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
@@ -1006,19 +951,9 @@ unsafe fn recent_row(exe: &[u16], dir: &str, title: &str) -> Result<Com, StepErr
     }
 }
 
-/// Build one task entry: an in-memory `IShellLinkW` whose target is `exe` run
-/// with `args` (a front-door VERB — see the module docs on why a bare launch is
-/// no longer good enough), whose icon is the exe's own (index 0 — the aterm icon
-/// compiled in by `build.rs`), and whose visible row text is set via the link's
-/// property store (`PKEY_Title` — see that const for why `SetDescription` alone
-/// would render "aterm-gui.exe").
-///
-/// `exe` is [`front_door_exe`]'s answer, not raw `current_exe()`: the row must
-/// name an image that ROUTES the verb and opens no console. That matters for
-/// the thin dev `aterm-gui` bin too, which is genuinely not the router and
-/// knows none of these verbs — in its `target/<profile>` the row points at the
-/// `aterm-windowed.exe` a `-p aterm` build lays beside it (which, unlike the
-/// thin bin, carries the icon `crates/aterm/build.rs` compiles in).
+/// One task entry: an in-memory `IShellLinkW` running `exe` ([`front_door_exe`]) with `args`
+/// (a front-door verb), with the exe's own icon (index 0) and its row text set through the
+/// link's property store ([`PKEY_TITLE`]).
 unsafe fn task(exe: &[u16], args: &str, title: &str, tooltip: &str) -> Result<Com, StepError> {
     unsafe { link(exe, args, title, tooltip, (exe, 0), None) }
 }
@@ -1034,8 +969,8 @@ unsafe fn link(
     icon: (&[u16], i32),
     working_dir: Option<&str>,
 ) -> Result<Com, StepError> {
-    let link = unsafe { co_create(&CLSID_SHELL_LINK, &IID_ISHELL_LINK_W, "create ShellLink")? };
-    let link_ptr = link.0.cast::<IShellLinkW>();
+    let link = co_create(&CLSID_SHELL_LINK, &IID_ISHELL_LINK_W, "create ShellLink")?;
+    let link_ptr = link.as_raw().cast::<IShellLinkW>();
     let link_vt = unsafe { &*(*link_ptr).vtbl };
 
     check(
@@ -1064,15 +999,10 @@ unsafe fn link(
         "SetDescription",
     )?;
 
-    let mut store_raw: *mut c_void = std::ptr::null_mut();
-    let unk = link.0.cast::<IUnknownRepr>();
-    let hr =
-        unsafe { ((*(*unk).vtbl).query_interface)(link.0, &IID_IPROPERTY_STORE, &mut store_raw) };
-    if hr < 0 || store_raw.is_null() {
-        return Err(("QueryInterface IPropertyStore", hr));
-    }
-    let store = Com(store_raw);
-    let store_ptr = store.0.cast::<IPropertyStore>();
+    let store = link
+        .query(&IID_IPROPERTY_STORE)
+        .map_err(|hr| ("QueryInterface IPropertyStore", hr))?;
+    let store_ptr = store.as_raw().cast::<IPropertyStore>();
     let store_vt = unsafe { &*(*store_ptr).vtbl };
 
     let title_w = wide(title);
@@ -1108,12 +1038,8 @@ mod tests {
         format!("{name}{}", std::env::consts::EXE_SUFFIX)
     }
 
-    /// THE SHIPPED WINDOWS LAYOUT: two images, the console `aterm.exe` (every
-    /// CLI name a hardlink of it) and the windowed `aterm-gui.exe` the
-    /// Start-Menu shortcut targets. Whichever image commits the list, every row
-    /// names `aterm-gui.exe`: it routes the verb under its alias name, and a
-    /// row naming the console image flashed a console window on every click
-    /// (review 2026-09-27).
+    /// The shipped layout: whichever image commits the list, every row names the windowed
+    /// `aterm-gui.exe` (a row naming the console image flashes a console on every click).
     #[test]
     fn a_row_names_the_windowed_image_whoever_commits_the_list() {
         let dir = install_dir();
@@ -1136,11 +1062,9 @@ mod tests {
         }
     }
 
-    /// A build tree: the row names the `aterm-windowed.exe` a `-p aterm` build
-    /// lays, never the thin dev `aterm-gui.exe` beside it (the window library
-    /// with no router, which would answer `new-window` with `unknown command`).
-    /// Without the windowed image the console `aterm.exe` still routes the
-    /// verb — a flash, not a dead row.
+    /// A build tree: the row names `aterm-windowed.exe`, never the thin dev `aterm-gui.exe`
+    /// (no router: `new-window` is `unknown command` there); without it the console
+    /// `aterm.exe` still routes the verb.
     #[test]
     fn a_build_tree_row_skips_the_thin_dev_bin() {
         let dir = PathBuf::from(r"C:\src\aterm\target\debug");
@@ -1153,10 +1077,7 @@ mod tests {
         assert_eq!(front_door_exe(&thin, no_windowed, true), console);
     }
 
-    /// No front door of either kind on disk (a copy of the exe on its own
-    /// somewhere): fall back to this process rather than committing a row that
-    /// names a file that is not there. The front door's argv0-alias dispatch
-    /// routes the verb under the alias name too, so the row still works.
+    /// No front door on disk: fall back to this process, never a row naming a missing file.
     #[test]
     fn a_lone_copy_falls_back_to_itself() {
         let current = Path::new(r"C:\tmp\scratch").join(exe("aterm-ctl"));

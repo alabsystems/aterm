@@ -1,23 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `App` glue for the in-window command PALETTE ([`crate::palette`]): open/close (the
-//! `Action::OpenPalette` keybinding, the macOS View ▸ Command Palette… menu item, or the
-//! `menu` control verb), type-to-filter, move the cursor, and ACTIVATE the selected command.
+//! `App` glue for the in-window command palette ([`crate::palette`]): open/close (the
+//! `Action::OpenPalette` keybinding, the macOS View ▸ Command Palette… item, or the `menu`
+//! control verb), type-to-filter, cursor moves, and activation.
 //!
-//! Menu activation posts [`Wake::MenuAction`](crate::Wake) — the exact relay the native
-//! `MenuTarget::menuAction:` uses ([`crate::menu`]). Active native-tab commands share the
-//! surface but carry an exact window/view/generation target and enter their reducer as
-//! `AppEvent::Action` only while that identity remains current.
-//! Theme rows ([`PaletteTarget::Theme`](crate::palette::PaletteTarget)) preview
-//! through the transient preview lane ([`crate::control_theme`]): the highlight is
-//! read once per event-loop turn ([`App::sync_palette_theme_preview`]), so a held
-//! arrow key or a pointer sweep costs one install per turn, not one per event.
-//! Enter keeps the chosen theme standing while its `theme` write is in flight
-//! ([`App::palette_choose_theme`]); Esc, or any other close, reverts.
-//! Every mutator just `request_redraw`s (the state change rides
-//! in `RepaintKey::settings_fp` via [`crate::WindowState::overlay_fp`]), and the frosted card
-//! is built by the shared `splice_settings_panel`.
+//! A menu row posts [`Wake::MenuAction`](crate::Wake), the relay the native
+//! `MenuTarget::menuAction:` uses ([`crate::menu`]). A native-tab command carries an exact
+//! window/view/generation target and enters its reducer as `AppEvent::Action` only while that
+//! identity is current. A Theme row previews through the transient preview lane
+//! ([`crate::control_theme`]); the highlight is read once per event-loop turn
+//! ([`App::sync_palette_theme_preview`]), so a held arrow key or a pointer sweep costs one
+//! install per turn. Enter keeps the chosen theme on screen while its `theme` write is in
+//! flight ([`App::palette_choose_theme`]); any other close reverts. Mutators only
+//! `request_redraw` (the state rides in `RepaintKey::settings_fp` via
+//! [`crate::WindowState::overlay_fp`]); the card is built by `splice_settings_panel`.
 
 use crate::App;
 use crate::control_theme::PreviewHold;
@@ -25,14 +22,11 @@ use crate::palette::{
     NativeCommandScope, NativeCommandTarget, PaletteLive, PaletteState, PaletteTarget, PaletteTheme,
 };
 
-/// The `[keybindings]` face of a menu action, when one exists — the map that
-/// lets [`App::palette_live`] resolve each menu row's accelerator HINT from the
-/// EFFECTIVE binding table (platform seeds + the user's rebinds/unbinds) off
-/// macOS, where the ⌘ key-equivalents are honestly blanked and the rows used to
-/// show no chord at all. `None` = the command has no rebindable chord (its row
-/// simply shows no hint). The pairing mirrors `dispatch_menu_action` ↔
-/// `dispatch_action`: both faces of an entry here run the same verb, so the
-/// hint can never advertise a chord that does something different.
+/// The `[keybindings]` action behind a menu action, if any: off macOS,
+/// [`App::palette_live`] shows each menu row's chord from the effective binding table (seeds
+/// plus the user's rebinds). `None`: no rebindable chord, no hint. Both faces of a pair run the
+/// same verb (`dispatch_menu_action` / `dispatch_action`), so a hint never advertises a chord
+/// that does something else.
 #[cfg(not(target_os = "macos"))]
 fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Action> {
     use crate::keybinding::Action as K;
@@ -112,11 +106,10 @@ impl App {
             })
     }
 
-    /// The palette's Theme section, from the admitted catalog only: every
-    /// built-in (Default first, the registry's order), then each theme file that
-    /// loaded, labelled by its own `name =` verbatim (its id joins the label when
-    /// they differ, so two files sharing a name stay apart), its appearance the
-    /// row's hint. A file that did not load has no row: there is nothing to draw.
+    /// The palette's Theme section, from the admitted catalog: every built-in (Default first,
+    /// then registry order), then each loaded theme file whose id is not a built-in's, labelled
+    /// by its own `name =` (its id appended when they differ, so two files sharing a name stay
+    /// apart), its appearance the row's hint.
     pub(crate) fn palette_themes(&self) -> Vec<PaletteTheme> {
         let current = self.configured_theme_id();
         let mut themes: Vec<PaletteTheme> = aterm_types::scheme::builtin_theme_list()
@@ -142,10 +135,9 @@ impl App {
         themes
     }
 
-    /// Open the command palette scoped to its Theme section (View ▸ Choose
-    /// Theme…, the `choose_theme` binding), the cursor on the configured theme.
-    /// An open command palette is closed first (reverting any preview it held),
-    /// so the scoped one starts from what the config draws.
+    /// Open the command palette scoped to its Theme section (View ▸ Choose Theme…, the
+    /// `choose_theme` binding), the cursor on the configured theme. An open unscoped palette is
+    /// closed first, reverting its preview; an open scoped one stays.
     pub(crate) fn open_theme_palette(&mut self) {
         if self
             .front()
@@ -374,12 +366,9 @@ impl App {
         }
     }
 
-    /// The live predicates that resolve per-row enabled/checked, read off the front window —
-    /// the same conditions the native `validateMenuItem:` path uses (selection present,
-    /// Settings open, full-screen, tab count) — plus the update-flow state the
-    /// Version section's dynamic row mirrors (staged nudge / post-update realized arrow).
-    /// `pub(crate)`: the `controls menu` closed-palette fallback (`app_introspect`)
-    /// resolves a fresh snapshot against the same predicates.
+    /// The live predicates that resolve each row's enabled/checked state off the front window
+    /// (the same conditions `validateMenuItem:` uses), plus the update-flow state the Version
+    /// rows mirror. The closed-palette `controls menu` fallback resolves against it too.
     pub(crate) fn palette_live(&self) -> PaletteLive {
         let has_selection = self.frontmost_window.is_some_and(|wid| {
             if self.active_native_view(wid).is_some() {
@@ -405,14 +394,12 @@ impl App {
         let native_tab_active = self
             .frontmost_window
             .is_some_and(|wid| self.active_native_view(wid).is_some());
-        // The staged nudge state (set only for a strictly-newer build — the
-        // `Wake::UpdateStaged` contract) drives the one-click row; the realized arrow
-        // (post-update boot, TTL-bounded by the about_to_wait sweep) drives the fading
-        // celebration row. Both may be live at once — `resolve` gives staged precedence.
+        // The staged build (only ever strictly newer) drives the one-click row; the realized
+        // arrow (after an update, until `REALIZED_ARROW_TTL`) the fading celebration row.
+        // `resolve` prefers staged when both are live.
         let staged = self.relaunch.as_ref().map(|r| (r.build, r.version.clone()));
-        // The palette row is the cross-platform twin of the macOS Version-menu item,
-        // so it carries the same apply-lane verdict: a row that offers an apply must
-        // say when applying has already been tried and did not work.
+        // The row is the twin of the macOS Version-menu item and carries its apply-lane
+        // verdict: a row that offers an apply says when applying was tried and failed.
         let staged_trouble = staged
             .as_ref()
             .and_then(|(build, _)| self.apply_trouble_for(*build));
@@ -426,24 +413,22 @@ impl App {
                 .filter(|t| t.elapsed() < crate::relaunch_notice::REALIZED_ARROW_TTL)
                 .map(|t| (crate::build_info::version_display().to_string(), t))
         };
-        // The FRONT session's effective rain state (override else config bit);
-        // false with no frontmost terminal — the row disables there anyway.
+        // The front session's effective rain state (override, else config); false with no
+        // front terminal, where the row is disabled anyway.
         let rain_on = self
             .frontmost_window
             .and_then(|wid| self.front_terminal(wid))
             .is_some_and(|terminal| self.session_rain_enabled(terminal.session));
-        // The checkmark answers "is this window's promotable kitty (the
-        // tenured program cat on glass, else the launch kitty) the pinned
-        // favourite?" — the same look `App::favourite_kitty_checked` promotes. With
-        // no window at all the launch kitty is the answer. `is_favourite` is
-        // `&self`: this resolver cannot poll the startup import, and the
-        // render loop polls every tick anyway.
+        // Checked when this window's promotable kitty (the tenured program cat, else the
+        // launch kitty) is the pinned favourite: the look `App::favourite_kitty_checked`
+        // promotes. `is_favourite` takes `&self`, so this cannot poll the startup import; the
+        // render loop does every tick.
         let promotable = self
             .frontmost_window
             .map_or(self.launch_kitty, |wid| self.promotable_kitty(wid));
         let kitty_favourited = self.kitty_log.is_favourite(promotable);
-        // Per-session rows need a real front terminal — false over a native
-        // whole tab AND with no window at all (the windowless-app state).
+        // Per-session rows need a real front terminal: false over a native whole tab and
+        // with no window at all.
         let terminal_front = self
             .frontmost_window
             .is_some_and(|wid| self.front_terminal(wid).is_some());
@@ -501,24 +486,17 @@ impl App {
             terminal_front,
             can_reopen_closed_tab: self.can_reopen_closed_tab(),
             can_reopen_closed_view: self.can_reopen_closed_view(),
-            // A live capability question, not a platform one. It was
-            // `cfg!(target_os = "macos")` while macOS owned the only picker;
-            // Windows has a real `IFileOpenDialog` now, and both document
-            // runtimes already worked here — so the rows come alive from the
-            // same predicate Settings ▸ Wallpaper's button asks, and stay grey
-            // wherever the dialog genuinely cannot open. HEADLESS is one such
-            // place, folded here rather than in the platform predicate: a
-            // headless instance has no glass to hang the panel on and no
-            // application object to present it from (on macOS its display-free
-            // loop builds no `NSApplication`) — `invoke OpenMarkdown` must
-            // answer "disabled", never park the main thread in a modal nothing
-            // can dismiss.
+            // A live capability, not a platform one: the predicate Settings ▸ Wallpaper's
+            // button asks. Headless has no glass to hang the panel on (and on macOS no
+            // `NSApplication`), so `invoke OpenMarkdown` answers "disabled" instead of parking
+            // the main thread in a modal nothing can dismiss.
             local_file_picker_available: !self.headless
                 && crate::menu::local_file_picker_available(),
             front_person_hold,
             front_remote_hold,
             needs_in_windows: self.presence_rim_on(),
             stats_bars: Some(self.stats_bars_form()),
+            deck_size: Some(self.deck_size_pref()),
             agents: self.agents_live(),
             staged,
             staged_trouble,
@@ -540,18 +518,14 @@ impl App {
             .is_some_and(|tab| tab.root.len() > 1)
     }
 
-    /// Publish the native bar's live bits ([`crate::menu::MenuLive`]) — the facts
-    /// [`Self::palette_live`] reads for the same rows — for `validateMenuItem:`,
-    /// which AppKit calls synchronously when a menu opens and which cannot reach
-    /// `App`. Called on the way to every wait (macOS, windowed), so it allocates
-    /// nothing and never waits on a terminal: the selection is read with a
-    /// try-lock, and a busy terminal keeps the last bit (a stale Copy bit costs no
-    /// keystroke — a disabled row's ⌘C falls through to `on_key`, which copies).
-    /// Over a native tab Copy stays enabled: reading its selection would copy
-    /// the selected text on every wait. While a rename field is open Copy
-    /// stays enabled too, so ⌘C reaches `divert_menu_action_around_rename`: a
-    /// native field's editor gets `copy:` (it has no ⌘C of its own); the
-    /// in-grid field claims it inert.
+    /// Publish the native bar's live bits ([`crate::menu::MenuLive`]), the facts
+    /// [`Self::palette_live`] reads for the same rows, for `validateMenuItem:`, which AppKit
+    /// calls synchronously and which cannot reach `App`. Runs before every wait, so it
+    /// allocates nothing and never waits on a terminal: a busy terminal keeps the last
+    /// selection bit (a stale Copy bit costs nothing: a disabled row's ⌘C falls through to
+    /// `on_key`, which copies). Copy stays enabled over a native tab (reading its selection
+    /// would copy on every wait) and while a rename field is open, so ⌘C reaches
+    /// `divert_menu_action_around_rename`.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn publish_menu_live(&self) {
         let last = crate::menu::menu_live();
@@ -579,14 +553,15 @@ impl App {
             kitty_favourited: self.kitty_log.is_favourite(promotable),
             front_tab_split: self.front_tab_split(),
         });
-        // View ▸ Stats Bars' radio: the applied form, whatever applied it.
+        // View ▸ Stats Bars' radios: the applied form and Deck size, whatever
+        // applied them.
         crate::menu::set_stats_bars_form(self.stats_bars_form());
+        crate::menu::set_deck_size_pref(self.deck_size_pref());
     }
 
-    /// Re-resolve every OPEN palette against the live predicates and repaint — called on
-    /// update-flow transitions (`Wake::UpdateStaged` lands, the realized arrow spawns or
-    /// its TTL expires) so an open palette's Version rows update IN PLACE; without this
-    /// it would keep pre-transition rows until closed and reopened.
+    /// Re-resolve every open palette and repaint. Called on update-flow transitions
+    /// (`Wake::UpdateStaged`, the realized arrow's spawn or expiry) so open Version rows update
+    /// in place.
     pub(crate) fn palette_refresh_live(&mut self) {
         let live = self.palette_live();
         let mut touched = Vec::new();
@@ -639,9 +614,8 @@ impl App {
         self.overlay_a11y_update();
     }
 
-    /// Open the command palette on the front window. Settings, About, and the palette are
-    /// MUTUALLY EXCLUSIVE modal overlays (they share the one card slot), so this closes the
-    /// others first. No-op if the palette is already open.
+    /// Open the command palette on the front window. It takes the window's one `overlay` slot,
+    /// replacing whatever card was there. No-op if the palette is already open.
     pub(crate) fn palette_enter(&mut self) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -656,8 +630,6 @@ impl App {
         if let Some(ws) = self.front_mut()
             && ws.palette().is_none()
         {
-            // Mutual exclusion is STRUCTURAL now: assigning the one `overlay` slot drops
-            // whatever Settings/About was there — no manual "clear the other two".
             ws.overlay = Some(crate::overlay::Overlay::Palette(state));
             // Wheel fractions belong to one surface only. Drop any terminal/native
             // remainder before the palette begins consuming the shared device stream.
@@ -837,10 +809,9 @@ impl App {
         }
     }
 
-    /// Generation-safe native-command sink, separated for focused positive and stale-target
-    /// negative tests. Re-reading commands here is the final enabled-state authority; an
-    /// open palette can outlive an async reducer update, so its painted snapshot is not
-    /// trusted for dispatch.
+    /// Dispatch a native target only while its window, view and generation are current and the
+    /// command is enabled now: an open palette can outlive an async reducer update, so its
+    /// painted snapshot is not trusted for dispatch.
     fn activate_native_palette_target(
         &mut self,
         target: &NativeCommandTarget,
@@ -881,8 +852,7 @@ impl App {
         {
             w.request_redraw();
         }
-        // Typing/moving re-narrows or re-selects: refresh the accessibility tree too, so the
-        // screen-reader view of the filtered rows + focus tracks the on-screen list.
+        // Keep the screen reader's view of the filtered rows and focus in step.
         self.overlay_a11y_update();
     }
 
@@ -935,14 +905,10 @@ impl App {
         if self.windows.get(&wid).and_then(|ws| ws.palette()).is_none() {
             return;
         }
-        // THE KEYPAD IS ITS MAIN-BLOCK TWIN ON AN OVERLAY, as it is on a native
-        // page and in the seam's press classifier. This card reads the key for
-        // what it MEANS, and `keymap::build_key_input` hands it the keypad
-        // identity (`Numpad5`, `NumpadEnd`) so the PTY encoders can tell KP_5
-        // from 5 — which the arms below have no case for: a keypad digit
-        // typed NOTHING into the filter, where the main row's types its glyph.
-        // `InputEvent::keypad_folded` is the one fold, shared with the native
-        // pages, and a controller's `key kp5` takes the same road.
+        // A keypad key acts as its main-block twin here, as on a native page:
+        // `keymap::build_key_input` keeps the keypad identity (`Numpad5`) for the PTY
+        // encoders, which the arms below have no case for. `InputEvent::keypad_folded` is
+        // the one fold.
         let folded = ev.keypad_folded();
         let ev = folded.as_ref().unwrap_or(ev);
         if let Some(key) = palette_input_key(ev) {
@@ -1084,11 +1050,9 @@ mod tests {
         }
     }
 
-    /// THE MENU BAR PUBLISHES WHAT THE PALETTE RESOLVES. `publish_menu_live` —
-    /// what the native bar's `validateMenuItem:` reads — derives each bit from
-    /// the same fact `palette_live` does: one tab greys the tab cycle, no
-    /// selection greys Copy, serious mode checks its row, and a split front tab
-    /// titles ⌘W's row Close Pane (on the bar and in the palette).
+    /// `publish_menu_live` (what `validateMenuItem:` reads) derives each bit from the same fact
+    /// as `palette_live`: one tab greys the tab cycle, no selection greys Copy, serious mode
+    /// checks its row, and a split front tab titles ⌘W's row Close Pane.
     #[test]
     fn the_menu_bar_publishes_what_the_palette_resolves() {
         use crate::menu::{MenuAction, menu_live, native_live_title, set_menu_live};
@@ -1130,10 +1094,7 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// An open rename keeps the Copy row enabled so ⌘C reaches the divert
-    /// (`divert_menu_action_around_rename`) instead of the field editor (which,
-    /// for a native field, has no ⌘C of its own). Headless, the in-grid field
-    /// presents the edit, and the divert claims its Copy inert.
+    /// An open rename keeps the menu bar's Copy row enabled so ⌘C reaches the rename divert.
     #[test]
     fn a_live_rename_keeps_the_menu_bar_copy_row_enabled() {
         use crate::menu::{menu_live, set_menu_live};
@@ -1157,10 +1118,9 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// A ⌘ chord is a command, never text. A menu row the bar greys hands its
-    /// key equivalent to `on_key` — ⌘C with no selection, ⇧⌘] with one tab,
-    /// ⇧⌘T with nothing to reopen — and with the palette open those typed `c`,
-    /// `}` and `T` into its search.
+    /// A ⌘ chord is a command, never text: the key equivalents of rows the bar greys (⌘C with
+    /// no selection, ⇧⌘] with one tab, ⇧⌘T with nothing to reopen) reach `on_key` and type
+    /// nothing into an open palette's search.
     #[test]
     fn a_command_chord_never_types_into_the_palette_search() {
         use aterm_window::event::{ElementState, KeyEvent};
@@ -1413,8 +1373,8 @@ mod tests {
 
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         let closed = app.read_aux_controls(crate::app_introspect::AuxTarget::Menu);
-        // The advertised chord is PLATFORM-TRUE (audit I9): ⌘F on macOS, the
-        // seeded Ctrl+Shift+F off it — never a ⌘ glyph on a keyboard without one.
+        // The advertised chord is the platform's: ⌘F on macOS, the seeded Ctrl+Shift+F
+        // elsewhere.
         let accel = if cfg!(target_os = "macos") {
             "accel=\"Cmd-F\""
         } else {
@@ -1469,12 +1429,7 @@ mod tests {
         }
     }
 
-    /// A headless instance has no glass to hang a file picker on — and no
-    /// application object to present the `NSOpenPanel` from — so the two
-    /// local-file rows read disabled there, and
-    /// `invoke OpenMarkdown` answers "disabled" instead of parking the main
-    /// thread in a modal nothing can dismiss. Windowed, the platform predicate
-    /// decides as before.
+    /// Headless, the local-file rows read disabled; windowed, the platform predicate decides.
     #[test]
     fn local_file_open_rows_are_disabled_headless() {
         let mut app = App::headless_for_test();
@@ -2199,9 +2154,8 @@ mod tests {
         assert_eq!(durable(&app), durable_before);
     }
 
-    /// View ▸ Choose Theme… (and the `choose_theme` key) opens the palette
-    /// scoped to its Theme section, the cursor on the configured theme, which
-    /// is not re-installed; its rows are exactly the theme rows.
+    /// View ▸ Choose Theme… (and the `choose_theme` key) opens the palette scoped to its Theme
+    /// section, the cursor on the configured theme, which is not re-installed.
     #[test]
     fn choose_theme_opens_the_scoped_palette_on_the_configured_theme() {
         let mut app = themed_app("theme = \"Nord\"\n");

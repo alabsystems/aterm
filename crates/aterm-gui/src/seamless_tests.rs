@@ -919,6 +919,7 @@ fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
 #[cfg(unix)]
 fn bare_manifest(sessions: Vec<SessionRecord>) -> SessionHandoff {
     SessionHandoff {
+        resources: None,
         schema: SessionHandoff::SCHEMA,
         window: None,
         connections: Vec::new(),

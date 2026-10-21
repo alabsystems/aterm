@@ -159,27 +159,20 @@ pub fn closed(stream: &mut dyn Rw) -> bool {
 /// The fleet's RFC 5705 exporter label (`aterm_net::fleet`'s module doc).
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-fleet-v1";
 
-/// HMAC-SHA256 of `parts` under `key`.
-fn mac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut m = aterm_digest::HmacSha256::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts a key of any length");
-    for part in parts {
-        m.update(part);
-    }
-    m.finalize()
-}
-
 /// The dialer's proof line for `op` on the channel whose exporter is
 /// `exporter`, under the raw fleet `secret`, as the module doc of
 /// `aterm_net::fleet` documents it: `PRK = HMAC-SHA256(∅, secret)` (HKDF
 /// Extract with an empty salt), `Kc = HMAC-SHA256(PRK, "aterm-fleet/v1
 /// client" ‖ 0x01)` (HKDF-Expand's first block), and the line `<op> SP
-/// hex(HMAC-SHA256(Kc, E ‖ op)) LF`.
+/// hex(HMAC-SHA256(Kc, E ‖ op)) LF`. The HKDF and the HMAC are the shared
+/// ones (astream-digest's, through aterm-digest), the one construction every
+/// fleet member derives with; what this composes apart from aterm-net is the
+/// protocol: the info string, the line and the order, read off the doc.
 #[must_use]
 pub fn dialer_proof(secret: &[u8], exporter: &[u8], op: &str) -> String {
-    let prk = mac(&[], &[secret]);
-    let kc = mac(&prk, &[b"aterm-fleet/v1 client", &[1]]);
-    let tag = mac(&kc, &[exporter, op.as_bytes()]);
+    let prk = aterm_digest::hkdf_extract(&[], secret);
+    let kc = aterm_digest::hkdf_expand_32(&prk, b"aterm-fleet/v1 client");
+    let tag = aterm_digest::hmac_sha256_parts(&kc, &[exporter, op.as_bytes()]);
     format!("{op} {}\n", aterm_codec::hex::encode_lower(&tag))
 }
 
@@ -242,9 +235,17 @@ mod tests {
     use super::*;
 
     /// The proof is the documented line: a word, a space, 64 lowercase hex
-    /// digits; another secret, exporter or op makes another tag.
+    /// digits; another secret, exporter or op makes another tag. And it is the
+    /// tag aterm-net's own derivation was recorded making for the same secret,
+    /// exporter and op (`aterm_net::fleet`'s
+    /// `the_role_keys_and_a_tag_are_the_answers_recorded_before_the_hkdf_moved`),
+    /// composed here from the module doc alone.
     #[test]
     fn the_raw_proof_is_one_documented_line_bound_to_secret_exporter_and_op() {
+        assert_eq!(
+            dialer_proof(&[0x0b; 22], &[0xa5; 32], "survey"),
+            "survey f92e33cf27fc4091ec8577e69a3afae1985bfca7b81d9d98738e89272125c732\n"
+        );
         let a = dialer_proof(&[0x11; 20], &[0xa5; 32], "survey");
         let (word, tag) = a.trim_end().split_once(' ').expect("a word and a tag");
         assert_eq!(word, "survey");

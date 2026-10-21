@@ -1051,7 +1051,7 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
                 },
             };
             g.slog_mut()
-                .adopt_carried(&lines, ids, head + 65536, at(100))
+                .adopt_carried(&lines, ids, head + 65536, None, at(100))
                 .expect("adopts");
             assert_eq!(g.slog().journal_start(), Some(head));
         }
@@ -1182,6 +1182,7 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
                 &lines,
                 crate::session_log::LogCarry { ep: 1, ids },
                 head + 65536,
+                None,
                 at(100),
             )
             .expect("adopts");
@@ -1683,7 +1684,7 @@ fn version_skew_both_ways() {
         ids: aterm_slog::IdCounters::default(),
     };
     tl.slog_mut()
-        .adopt_carried(&out.lines, ids, log.last_seq() + 65536, at(5))
+        .adopt_carried(&out.lines, ids, log.last_seq() + 65536, None, at(5))
         .expect("adopts");
     assert_eq!(
         tl.slog().journal_start(),
@@ -2766,6 +2767,7 @@ fn queuing_a_retirement_wakes_even_when_its_close_is_already_recorded() {
         tl.slog_mut().close_session(
             crate::session_log::exit_out(crate::session_store::ExitReason::CtlClose),
             crate::session_log::exit_actor(&crate::session_store::ExitActor::Human),
+            "-",
             None,
             at,
         );

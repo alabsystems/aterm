@@ -15,7 +15,6 @@
 use aterm_wayland::output::{Output, OutputInfo};
 
 use crate::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
-use crate::platform_impl::platform::VideoModeHandle as PlatformVideoModeHandle;
 
 use super::event_loop::ActiveEventLoop;
 
@@ -53,11 +52,6 @@ impl MonitorHandle {
     }
 
     #[inline]
-    pub fn name(&self) -> Option<String> {
-        self.info().name
-    }
-
-    #[inline]
     pub fn native_identifier(&self) -> u32 {
         self.output.global()
     }
@@ -86,22 +80,6 @@ impl MonitorHandle {
     pub fn scale_factor(&self) -> i32 {
         self.info().scale
     }
-
-    #[inline]
-    pub fn video_modes(&self) -> impl Iterator<Item = PlatformVideoModeHandle> {
-        let modes = self.info().modes;
-
-        let monitor = self.clone();
-
-        modes.into_iter().map(move |mode| {
-            PlatformVideoModeHandle::Wayland(VideoModeHandle {
-                size: (mode.width as u32, mode.height as u32).into(),
-                refresh_rate_millihertz: mode.refresh as u32,
-                bit_depth: 32,
-                monitor: monitor.clone(),
-            })
-        })
-    }
 }
 
 impl PartialEq for MonitorHandle {
@@ -127,34 +105,5 @@ impl Ord for MonitorHandle {
 impl std::hash::Hash for MonitorHandle {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.native_identifier().hash(state);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct VideoModeHandle {
-    pub(crate) size: PhysicalSize<u32>,
-    pub(crate) bit_depth: u16,
-    pub(crate) refresh_rate_millihertz: u32,
-    pub(crate) monitor: MonitorHandle,
-}
-
-impl VideoModeHandle {
-    #[inline]
-    pub fn size(&self) -> PhysicalSize<u32> {
-        self.size
-    }
-
-    #[inline]
-    pub fn bit_depth(&self) -> u16 {
-        self.bit_depth
-    }
-
-    #[inline]
-    pub fn refresh_rate_millihertz(&self) -> u32 {
-        self.refresh_rate_millihertz
-    }
-
-    pub fn monitor(&self) -> MonitorHandle {
-        self.monitor.clone()
     }
 }

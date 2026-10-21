@@ -1,35 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The approval ledger: one JSON object per line for every box the
-//! supervisor's approval policy decided ([`super::policy::approval::decide`]),
-//! kept for every `watch`, `supervise` and hosted run, at
-//! `<aterm state>/drive/<sid>.jsonl` ([`default_path`];
-//! [`aterm_types::dirs::state_dir`] is the state root).
+//! The approval ledger: one JSON line per box the approval policy decided
+//! ([`super::policy::approval::decide`]) and per act of the turn-end policy, for every `watch`,
+//! `supervise` and hosted run, at `<aterm state>/drive/<sid>.jsonl` ([`default_path`]).
 //!
 //! ```text
 //! {"ts":<unix ms>,"sid":"<sid>"|null,"rule_id":"<rule>|-",
-//!  "decision":"approved|declined|typed|skipped|escalated|deferred",
+//!  "decision":"approved|declined|typed|skipped|escalated|deferred|waiting",
 //!  "cmd_sha256":"<hex of the whole command>","command":"<the command, cut at 4 KiB>",
 //!  "reason":"<the rule's reason or the classifier's>","box_seq":<n>}
 //! ```
 //!
-//! `approved` is a press the server wrote; `declined` a box refused with a
-//! reason typed for the worker ([`super::policy::approval::Decision::Decline`]);
-//! `typed` an act of the turn-end policy the server took; `skipped` a press it
-//! did not (the guard matched no row, or the screen moved); `escalated` a box
-//! no rule approved; `deferred` a press the server turned away for now (`ERR
-//! halted`, `ERR busy …`, `ERR rate`), retried later and never a refusal. The
-//! hash identifies a command cut at 4 KiB. The file is written through
-//! [`super::journal::Journal`] (append-only, `0600`; a write failure warns
-//! once and the loop goes on).
+//! `approved` is a press the server wrote; `declined` a box refused with a reason typed for
+//! the worker; `typed` an act of the turn-end policy; `skipped` a press not made (the guard
+//! matched no row, or the screen moved); `escalated` a box no rule approved; `deferred` a
+//! press the server turned away for now (`ERR halted`, `ERR busy …`, `ERR rate`), retried
+//! later; `waiting` a record, no act. Written through [`super::journal::Journal`]
+//! (append-only, `0600`; a write failure warns once and the loop goes on).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::journal::{Journal, json_str};
 use super::policy::sleeps::{Boot, SleepStamp};
-use super::policy::turn_end::LimitTry;
+use super::policy::turn_end::{Conversation, LimitTry};
 
 /// How much of a command a row keeps.
 pub const COMMAND_BYTES: usize = 4096;
@@ -46,8 +41,8 @@ pub enum Outcome {
     Escalated,
     /// The server turned the press away for now; it is tried again.
     Deferred,
-    /// A wall the loop waits on, remembered for the loop that follows it, or
-    /// its end: no act, no press — a record.
+    /// A record, no act or press: a wall waited on or its end, a probe panel seen closed, a
+    /// reset step ended, an account move answered.
     Waiting,
 }
 
@@ -115,6 +110,74 @@ impl Row<'_> {
         self.to_json_counted_with_boot_text(ts, sid, count, None)
     }
 
+    /// A wall's optional top-level identity. The legacy reason grammar and
+    /// ordinary rows stay unchanged; null is a host-scoped unknown, while
+    /// an absent field retains the explicit hostless/legacy lane.
+    #[cfg(test)]
+    pub(crate) fn to_json_wall_wait(
+        &self,
+        ts: i64,
+        sid: Option<&str>,
+        conversation: &Conversation,
+    ) -> String {
+        self.to_json_scoped(ts, sid, None, None, conversation)
+    }
+
+    /// [`Self::to_json_wall_wait`] with the program the wall was met under
+    /// ([`PROGRAM`]).
+    #[cfg(test)]
+    pub(crate) fn to_json_wall_wait_by(
+        &self,
+        ts: i64,
+        sid: Option<&str>,
+        conversation: &Conversation,
+        program: Option<aterm_phase::Program>,
+    ) -> String {
+        self.to_json_scoped_by(ts, sid, None, None, conversation, program)
+    }
+
+    /// [`Self::to_json_scoped_by`] naming no program: a row as a loop wrote
+    /// it before rows named the program their wall was met under.
+    #[cfg(test)]
+    pub(crate) fn to_json_scoped(
+        &self,
+        ts: i64,
+        sid: Option<&str>,
+        count: Option<&SleepStamp>,
+        captured_boot: Option<&str>,
+        conversation: &Conversation,
+    ) -> String {
+        self.to_json_scoped_by(ts, sid, count, captured_boot, conversation, None)
+    }
+
+    /// [`Self::to_json_scoped`], and where `program` is given, the program
+    /// the wall was met under ([`PROGRAM`]), whatever the conversation: a
+    /// hostless wall names it too.
+    pub(crate) fn to_json_scoped_by(
+        &self,
+        ts: i64,
+        sid: Option<&str>,
+        count: Option<&SleepStamp>,
+        captured_boot: Option<&str>,
+        conversation: &Conversation,
+        program: Option<aterm_phase::Program>,
+    ) -> String {
+        let mut line = self.to_json_counted_with_boot_text(ts, sid, count, captured_boot);
+        if *conversation != Conversation::Hostless {
+            line.pop(); // the closing brace of this writer's JSON object
+            let id = match conversation {
+                Conversation::Named(id) => json_str(id),
+                Conversation::Unknown | Conversation::Hostless => "null".to_owned(),
+            };
+            line.push_str(&format!(",\"conversation\":{id}}}"));
+        }
+        if let Some(program) = program {
+            line.pop(); // the closing brace, as above
+            line.push_str(&format!(",\"{PROGRAM}\":{}}}", json_str(program.name())));
+        }
+        line
+    }
+
     /// A replay's validated captured spelling, including noncanonical forms
     /// the boot reader admits. The typed id must still name this count's boot.
     fn to_json_counted_with_boot_text(
@@ -152,6 +215,11 @@ impl Row<'_> {
 /// An act's row's field: the machine's count of its sleep since boot at the
 /// row's stamp, in milliseconds ([`Row::to_json_counted`]).
 pub const SLEPT_MS: &str = "slept_ms";
+
+/// A [`RULE_WALL_WAIT`] row's field: the program the wall was met under, by
+/// its name ([`aterm_phase::Program::name`]; [`row_program`] reads it back).
+/// A row an older build wrote has none.
+pub const PROGRAM: &str = "program";
 
 /// An act's row's field: the boot that count is on
 /// (`astream_sys::boot_session`), in the kernel's own spelling ([`Boot::text`]:
@@ -236,10 +304,9 @@ pub fn ledger_under(state: &Path, sid: Option<&str>) -> PathBuf {
     state.join("drive").join(format!("{name}.jsonl"))
 }
 
-/// The loop's journal beside a session's ledger: `<state>/drive/<sid>.jsonl`
-/// → `<state>/drive/<sid>.journal.jsonl`. The in-GUI host keeps one for every
-/// supervised session, so its journal-only lines (`SKIPPED`, `WAITING`,
-/// `ESCALATED … attention=<reply>`, `CLEARED`) can be read.
+/// The loop's journal beside a session's ledger: `<sid>.jsonl` → `<sid>.journal.jsonl`. The
+/// in-GUI host keeps one per supervised session for its journal-only lines (`SKIPPED`,
+/// `WAITING`, `ESCALATED … attention=<reply>`, `CLEARED`).
 #[must_use]
 pub fn journal_beside(ledger: &Path) -> PathBuf {
     let stem = ledger
@@ -900,6 +967,38 @@ impl Ledger {
         self.write_counted_with_boot_text(t_ms, row, count, None, warn)
     }
 
+    /// A wall, its typed try or its point, with optional ownership outside
+    /// the backwards-compatible reason and unchanged count/boot fields.
+    /// As for every ledger row, failure warns
+    /// and the returned exact bytes are what the harness tape records.
+    /// `program`: a wall's row names the program it was met under
+    /// ([`PROGRAM`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_scoped_counted(
+        &mut self,
+        t_ms: i64,
+        row: &Row<'_>,
+        count: Option<&SleepStamp>,
+        captured_boot: Option<&str>,
+        conversation: &Conversation,
+        program: Option<aterm_phase::Program>,
+        warn: &mut dyn Write,
+    ) -> Option<String> {
+        if !self.journal.is_on() {
+            return None;
+        }
+        let line = row.to_json_scoped_by(
+            t_ms,
+            self.sid.as_deref(),
+            count,
+            captured_boot,
+            conversation,
+            program,
+        );
+        self.journal.append_raw(&line, warn);
+        Some(line)
+    }
+
     /// The counted writer with a replay's validated captured boot text.
     /// Ordinary live and recorded rows keep [`Boot::kernel`]'s host spelling.
     pub(crate) fn write_counted_with_boot_text(
@@ -934,18 +1033,11 @@ pub struct Typed {
     pub rule: String,
 }
 
-/// THE TEXTS THE LOOP TYPED into `sid`'s session, each with WHEN: the
-/// command of every `typed` row of its in the ledger at `path`, as the loop
-/// wrote them — the turn-end policy's continuations (`continue_text` and the
-/// standing rules riding in it), its answers (`answer_text`), the agent's
-/// own suggestions it accepted, the wall's retries and its commands. The
-/// harness's own turns, which make no conversation's task
-/// (`crate::harness::upgrade::TaskScan`: a
-/// `keep going` or an `answer_text` is the supervisor's, however the vendor
-/// records it). The ledger is the SESSION's (the tab's), kept across every
-/// conversation it holds: the time is what places a text in one. A missing
-/// or unreadable file, and a row that does not parse or carries no time,
-/// know none.
+/// The texts the loop typed into `sid`'s session, each with when: the command of every
+/// `typed` row in the ledger at `path` (continuations, answers, accepted suggestions, a
+/// wall's retries and commands). These are the harness's own turns, which make no
+/// conversation's task (`crate::harness::upgrade::TaskScan`). The ledger is the tab's, across
+/// every conversation it holds; the time places a text in one.
 #[must_use]
 pub fn typed_texts(path: &Path, sid: Option<&str>) -> Vec<Typed> {
     let Ok(body) = std::fs::read_to_string(path) else {
@@ -1295,18 +1387,10 @@ fn probe_rule_field() -> String {
     )
 }
 
-/// WHETHER A `/usage` PANEL THE HARNESS OPENED MAY STILL STAND on `sid`'s
-/// session: the last row of the accounts probe's in the ledger `body` (the
-/// file as the loop read it, once, at its start) is
-/// its `typed` one ([`PROBE_TYPED_REASON`]) — an earlier loop wrote `/usage`
-/// and no loop has written since that it saw the panel gone
-/// ([`PROBE_CLOSED_REASON`]). A loop that starts on such a ledger takes the
-/// panel up and closes it; one that starts on any other closes nothing it
-/// finds (the spec's P18: a loop closes only a panel the harness opened).
-///
-/// `false` for an empty ledger, for one with no row of
-/// the probe's — every ledger of a machine with no roster, where the probe
-/// never runs — and for another session's rows.
+/// Whether a `/usage` panel the harness opened may still stand on `sid`'s session: the last
+/// accounts-probe row in `body` is its `typed` one ([`PROBE_TYPED_REASON`]), not a later
+/// [`PROBE_CLOSED_REASON`] one. Only then does a starting loop close a panel it finds (the
+/// spec's P18: a loop closes only a panel the harness opened). `false` with no probe row.
 #[must_use]
 pub fn probe_owed(body: &str, sid: Option<&str>) -> bool {
     let sid = sid.map_or_else(
@@ -1340,22 +1424,12 @@ pub struct ResetOpen {
     pub taken_ms: i64,
 }
 
-/// WHETHER A LIMIT RESET'S STEP THE HARNESS OPENED IS STILL OWED on `sid`'s
-/// session (`docs/SPEC-claude-accounts-resets-2026-10-02.md` §3.1): among
-/// the rows of [`super::policy::approval::RULE_LIMIT_RESET`] in the ledger
-/// `body` (the file as read), an `approved` one — the grant row taken — has no `waiting` row
-/// after it (`ended: <outcome>`, written when the loop told its host how the
-/// step ended). `Some` then: when the row was taken, and whether the
-/// confirmation's Enter was written since ([`ResetOpen`]). A loop that starts
-/// on such a ledger takes the step up — and never enters: it closes what it
-/// finds — unless the row is older than a step can be, which only ends it.
-///
-/// `None` for an empty ledger, for one with no row of the
-/// rule — every ledger of a session that never took a grant row, and so
-/// every one written with `[harness] limit_reset` off — for one whose last
-/// such row is the `waiting` one, and for another session's rows. A row of
-/// the rule that took nothing (`skipped`, `deferred`: a press that did not
-/// land) opens no step.
+/// Whether a limit reset's step the harness opened is still owed on `sid`'s session
+/// (`docs/SPEC-claude-accounts-resets-2026-10-02.md` §3.1): among the
+/// [`super::policy::approval::RULE_LIMIT_RESET`] rows of `body`, an `approved` one (the grant
+/// row taken) with no `waiting` row (`ended: <outcome>`) after it. A loop that starts on such
+/// a ledger takes the step up and never enters: it closes what it finds. A row that took
+/// nothing (`skipped`, `deferred`) opens no step.
 #[must_use]
 pub fn reset_owed(body: &str, sid: Option<&str>) -> Option<ResetOpen> {
     let sid = sid.map_or_else(
@@ -1404,8 +1478,15 @@ pub fn reset_owed(body: &str, sid: Option<&str>) -> Option<ResetOpen> {
 
 /// [`usage_attempt`]'s try, and whether (and when) its limit was MET AGAIN
 /// after it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageAttempt {
+    /// The context of the actual try, retained after its typed row closes
+    /// OpenWall; subsequent scoped records cannot downgrade it to hostless.
+    pub conversation: Conversation,
+    /// The program the limit the try was typed at was met under: the one
+    /// the last [`RULE_WALL_WAIT`] row before the try names ([`PROGRAM`]).
+    /// `None` where that row names none (an older build's) or there is none.
+    pub program: Option<aterm_phase::Program>,
     /// When the try was typed (unix ms).
     pub at_ms: i64,
     /// The limit's try its row names — ON THE LADDER THE WALL THAT MET IT
@@ -1645,6 +1726,9 @@ pub fn usage_attempt_taken_in(
     // whose work ended the limit's track for the loop that typed it — a new
     // appearance ([`LIMIT_ENDED`]'s, which that build did not write).
     let mut took_turn = false;
+    // The program the last wall's row names it met under: a try's
+    // ([`UsageAttempt::program`]).
+    let mut wall_program = None;
     for v in body
         .lines()
         .filter(|l| {
@@ -1668,9 +1752,25 @@ pub fn usage_attempt_taken_in(
         };
         let first = read && last.is_some() && !std::mem::replace(&mut seen, true);
         if text("decision") == Some("waiting") {
+            // Existing point/answer/wall records can retain an upgraded
+            // unknown even after the try closed OpenWall. No new row kind.
+            if matches!(
+                text("rule_id"),
+                Some(RULE_POINT | RULE_TRY_ANSWERED | RULE_WALL_WAIT)
+            ) && v.get("conversation").is_some()
+                && let Some(a) = last.as_mut()
+                && row_conversation(&v) != a.conversation
+            {
+                // A later wall/point cannot relabel the actual try as
+                // another conversation, nor prove a legacy try's owner.
+                a.conversation = Conversation::Unknown;
+            }
+            if text("rule_id") == Some(RULE_WALL_WAIT) {
+                wall_program = row_program(&v);
+            }
             let took = text("rule_id") == Some(RULE_WALL_WAIT_END)
                 && std::mem::take(&mut untaken)
-                && last.is_some_and(|a| {
+                && last.as_ref().is_some_and(|a| {
                     v.get("ts")
                         .and_then(aterm_json::Value::as_i64)
                         .is_some_and(|end| taken(a.at_ms, end))
@@ -1779,8 +1879,10 @@ pub fn usage_attempt_taken_in(
         let Some(ts) = v.get("ts").and_then(aterm_json::Value::as_i64) else {
             continue;
         };
-        if last.is_none_or(|a| ts >= a.at_ms) {
+        if last.as_ref().is_none_or(|a| ts >= a.at_ms) {
             last = Some(UsageAttempt {
+                conversation: row_conversation(&v),
+                program: wall_program,
                 at_ms: ts,
                 limit,
                 met_ms: None,
@@ -2045,6 +2147,16 @@ pub struct LandSeed {
     /// [`land_episode_in`] alone: the walk's own states leave it out, so a
     /// ledger's cut keeps no row for each act ([`standing_path`]).
     pub act: Option<LandAct>,
+    /// WHERE THE EPISODE'S HOLD BEGAN ([`super::policy::turn_end::HoldStart`]):
+    /// the `ts` (unix ms) of its [`super::policy::turn_end::RULE_LAND`] row,
+    /// or of the first land act's row after a landing ([`RULE_TASK_DONE`]
+    /// ends the hold), the hold's `since`
+    /// (`crate::harness::acts::LandHeld::since_ms`), and the nudges before
+    /// it, so both survive a restart and a seamless update. Part of the
+    /// walk's state: only those rows and the landing's move it, so the
+    /// ledger's cut keeps them. `since_ms` `None` where the row names no
+    /// time.
+    pub hold: super::policy::turn_end::HoldStart,
 }
 
 /// THE LAST ACT OF A LAND EPISODE IN HAND ([`LandSeed::act`]): what a loop
@@ -2138,8 +2250,8 @@ impl LandWalk {
 
     fn read(&mut self, v: &aterm_json::Value) {
         use super::policy::turn_end::{
-            RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, RULE_USAGE_PROBE, is_continue_rule,
-            is_land_rule, is_wall_retry,
+            HoldStart, RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, RULE_USAGE_PROBE,
+            is_continue_rule, is_land_rule, is_wall_retry,
         };
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
         let rule = text("rule_id").unwrap_or("");
@@ -2148,24 +2260,39 @@ impl LandWalk {
                 if rule != RULE_USAGE_PROBE {
                     self.judged = 0;
                 }
-                let land = |nudges: u32, landing: bool| LandSeed {
+                let land = |nudges: u32, landing: bool, hold: HoldStart| LandSeed {
                     nudges,
                     landing,
                     cut: false,
                     answered: false,
                     act: None,
+                    hold,
+                };
+                // The hold begins at this row (`TurnEndState::acted`): its
+                // `since` the row's `ts`, its nudges those after it.
+                let begun = |base: u32| HoldStart {
+                    since_ms: v.get("ts").and_then(aterm_json::Value::as_i64),
+                    base,
+                    relanded: false,
                 };
                 self.ep = match (rule, self.ep) {
                     (RULE_USAGE_PROBE, ep) => ep,
-                    (RULE_LAND, _) => Some(land(0, true)),
+                    (RULE_LAND, _) => Some(land(0, true, begun(0))),
                     (r, Some(e)) if is_land_rule(r) => {
-                        Some(land(e.nudges + u32::from(r == RULE_LAND_NUDGE), true))
+                        let nudges = e.nudges + u32::from(r == RULE_LAND_NUDGE);
+                        let hold = if e.hold.relanded {
+                            begun(nudges)
+                        } else {
+                            e.hold
+                        };
+                        Some(land(nudges, true, hold))
                     }
                     (r, _) if is_continue_rule(r) => None,
                     (r, Some(e)) => Some(land(
                         e.nudges,
                         (e.cut && is_wall_retry(r))
                             || (r == RULE_COMPACT && delivers_land(text("command"))),
+                        e.hold,
                     )),
                     (_, None) => None,
                 };
@@ -2179,7 +2306,11 @@ impl LandWalk {
         };
         match rule {
             RULE_LAND_OVER | RULE_OFF_STOOD => self.ep = None,
-            RULE_TASK_DONE => e.answered = true,
+            // The landing: it ends the hold too, until Land's next act.
+            RULE_TASK_DONE => {
+                e.answered = true;
+                e.hold = HoldStart::LANDED;
+            }
             // The act's answer judged; a second point is a later turn's.
             RULE_POINT if e.landing && !e.cut => {
                 self.judged += 1;
@@ -3054,6 +3185,14 @@ pub fn account_unmade_reason(
     )
 }
 
+/// The host's word [`account_unmade_reason`]'s `reason` carries (`step=`),
+/// `None` where it carries none (`-`: no host answered).
+fn unmade_step(reason: &str) -> Option<&str> {
+    let at = reason.find(" step=")? + " step=".len();
+    let step = reason[at..].split([')', ' ']).next()?;
+    (!step.is_empty() && step != "-").then_some(step)
+}
+
 /// The reason the row carries that says WHAT ANSWERED an account move
 /// (`account-rotate@v1`, `waiting`: a record, no act): the label and the
 /// answer the loop told its host — `served`, or `wall` / `signed-out` — so a
@@ -3109,8 +3248,15 @@ pub struct AccountMoves {
     pub open: Option<OpenAccountMove>,
     /// A move could not be made, and neither an act of the policy's nor the
     /// end of the wall it waited on ([`RULE_WALL_WAIT_END`]) follows that
-    /// row: the wall it was asked at still stood when the loop ended.
-    pub unmade: bool,
+    /// row: the wall it was asked at still stood when the loop ended. It
+    /// keeps what the host's word the row carries (`step=`) says of asking
+    /// again ([`super::policy::turn_end::Unmade::of`]).
+    pub unmade: Option<super::policy::turn_end::Unmade>,
+    /// When that row was written (unix ms; `None` with no latch, or a row
+    /// that carries no `ts`): a refusal of THIS LAUNCH is the launch's that
+    /// ran then, and a process started since is not it
+    /// ([`super::policy::turn_end::TurnEndState::seed_account_unmade`]).
+    pub unmade_ms: Option<i64>,
 }
 
 /// [`AccountMoves`] of `sid`'s ledger text `body`, read from
@@ -3121,7 +3267,7 @@ pub struct AccountMoves {
 /// [`ACCOUNT_MOVE_COMMAND`]) is no move.
 #[must_use]
 pub fn account_moves_in(body: &str, sid: Option<&str>) -> AccountMoves {
-    use super::policy::turn_end::{AccountAt, RULE_ACCOUNT};
+    use super::policy::turn_end::{AccountAt, RULE_ACCOUNT, Unmade};
     let mut out = AccountMoves::default();
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     for line in body.lines() {
@@ -3143,7 +3289,8 @@ pub fn account_moves_in(body: &str, sid: Option<&str>) -> AccountMoves {
         let reason = text("reason").unwrap_or("");
         if waits {
             if rule == Some(RULE_WALL_WAIT_END) {
-                out.unmade = false;
+                out.unmade = None;
+                out.unmade_ms = None;
             }
             // What answered the move: served closes it, anything else is
             // told and stands.
@@ -3164,13 +3311,15 @@ pub fn account_moves_in(body: &str, sid: Option<&str>) -> AccountMoves {
                 && reason.contains("account move unmade:")
                 && reason.contains(" at=wall")
             {
-                out.unmade = true;
+                out.unmade = Some(Unmade::of(unmade_step(reason)));
+                out.unmade_ms = v.get("ts").and_then(aterm_json::Value::as_i64);
             }
             continue;
         }
         // A `typed` row: an act on the point, whatever its rule — and a
         // turn asked under the login an open move chose.
-        out.unmade = false;
+        out.unmade = None;
+        out.unmade_ms = None;
         if rule != Some(RULE_ACCOUNT) || !reason.contains("account move:") {
             if let Some(open) = &mut out.open {
                 open.asked = true;
@@ -3435,6 +3584,11 @@ pub fn wall_kind(
 /// ([`open_wall`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenWall {
+    /// Missing in a legacy row; explicit null keeps a host-scoped unknown.
+    pub conversation: Conversation,
+    /// The program the wall was met under ([`PROGRAM`], [`row_program`]):
+    /// `None` in a row an older build wrote.
+    pub program: Option<aterm_phase::Program>,
     /// When the row was written (unix ms).
     pub at_ms: i64,
     /// The notice, as the reader gave it.
@@ -3457,6 +3611,37 @@ pub struct OpenWall {
     /// whose answer the row read: the appearance moves to the point that
     /// judges it.
     pub retry_ms: Option<i64>,
+}
+
+/// Optional ownership outside the legacy reason; malformed explicit data
+/// stays host-scoped unknown, while an old row remains admitted.
+fn row_conversation(v: &aterm_json::Value) -> Conversation {
+    match v.get("conversation") {
+        None => Conversation::Hostless,
+        Some(id) => id
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map_or(Conversation::Unknown, |id| {
+                Conversation::Named(id.to_owned())
+            }),
+    }
+}
+
+/// The program a wall's row names it met under ([`PROGRAM`]): `None` where
+/// the row names none (an older build's), and a name this build does not
+/// know read as a screen no reader names ([`aterm_phase::Program::Generic`]),
+/// which names no agent a limit could be released by.
+fn row_program(v: &aterm_json::Value) -> Option<aterm_phase::Program> {
+    let name = v.get(PROGRAM)?;
+    Some(
+        name.as_str()
+            .and_then(|n| {
+                aterm_phase::Program::ALL
+                    .into_iter()
+                    .find(|p| p.name() == n)
+            })
+            .unwrap_or(aterm_phase::Program::Generic),
+    )
 }
 
 /// The wall `sid`'s ledger text `body` holds open: the last [`RULE_WALL_WAIT`]
@@ -3499,7 +3684,10 @@ pub fn open_wall_in(body: &str, sid: Option<&str>) -> Option<OpenWall> {
                 let Some(row) = text("reason").and_then(wall_wait_of) else {
                     continue;
                 };
+                let conversation = row_conversation(&v);
                 open = Some(OpenWall {
+                    conversation,
+                    program: row_program(&v),
                     at_ms: ts,
                     message: row.message.to_string(),
                     reset: row.reset,
@@ -4683,7 +4871,11 @@ mod tests {
                 let sid = Some("@s-9");
                 assert_eq!(usage_attempt(&path, sid), None, "{act_rule} {tag}");
                 assert!(open_wall(&path, sid).is_some(), "{act_rule} {tag}");
-                assert_eq!(account_moves(&path, sid).unmade, !ended, "{act_rule} {tag}");
+                assert_eq!(
+                    account_moves(&path, sid).unmade.is_some(),
+                    !ended,
+                    "{act_rule} {tag}"
+                );
                 if check {
                     let owed = done_check_owed(&path, sid);
                     assert_eq!(owed.is_some_and(|o| o.cut), !ended, "{tag}: {owed:?}");
@@ -5474,6 +5666,159 @@ mod tests {
         crate::harness::cli::bound_ledger(&path, MAX_BYTES, KEEP_ROWS).expect("cut");
         let plain = read(&path);
         assert!(plain.0.is_none() && plain.1.is_none(), "CONTROL: {plain:?}");
+    }
+
+    /// THE EPISODE'S `since` IS ITS INSTRUCTION'S ROW (the Autopilot design's
+    /// §12.3.3, [`LandSeed::hold`]): the `ts` of the newest
+    /// [`super::super::policy::turn_end::RULE_LAND`] row of the episode in
+    /// hand, kept through its nudges and its points, and through the
+    /// ledger's cut past a run of acts — also where an instruction typed
+    /// again with no end between leaves the walk where it stood but for its
+    /// time. An episode another mode's act ended seeds nothing, and a Land
+    /// after it is the new instruction's. NEGATIVE CONTROL: the plain cut,
+    /// which keeps only the newest rows, loses the episode and its `since`.
+    #[test]
+    fn a_land_episodes_since_is_its_instruction_rows_stamp_through_a_cut() {
+        use super::super::policy::turn_end::{
+            RULE_API_RETRY, RULE_CONTINUE, RULE_LAND, RULE_LAND_NUDGE,
+        };
+        let dir = crate::supervise::ScratchDir::new("apr-seed", "land-since");
+        let sid = Some("@s-9");
+        let point = |ts: i64| {
+            (
+                ts,
+                RULE_POINT,
+                Outcome::Waiting,
+                "",
+                point_reason(Carried::streak(0), false),
+            )
+        };
+        let typed =
+            |ts: i64, rule: &'static str| (ts, rule, Outcome::Typed, "(land)", act_reason(None));
+        let t = 1_771_000_000_000_i64;
+        // Older rows the cut drops: approvals before the episode.
+        let filler = "cd /Users//someone/Developer/project && cargo test -p project-core --lib -- parser::tests 2>&1 | tail -40";
+        let mut rows: Vec<(i64, &str, Outcome, &str, String)> = (0..3000)
+            .map(|i| {
+                let why = "the safe rules proved the command reads and runs tests".to_string();
+                (
+                    t - 200_000 + i,
+                    "allow-once@v1",
+                    Outcome::Approved,
+                    filler,
+                    why,
+                )
+            })
+            .collect();
+        rows.extend([
+            typed(t - 90_000, RULE_LAND),
+            point(t - 80_000),
+            typed(t - 70_000, RULE_CONTINUE),
+            typed(t, RULE_LAND),
+            typed(t + 1_000, RULE_LAND),
+            point(t + 1_500),
+            typed(t + 2_000, RULE_LAND_NUDGE),
+            point(t + 2_500),
+        ]);
+        let path = seed_ledger(&dir, "since", &rows);
+        let ep = land_episode(&path, sid).expect("in hand");
+        assert_eq!(
+            (ep.hold.since_ms, ep.nudges),
+            (Some(t + 1_000), 1),
+            "{ep:?}"
+        );
+        let retry =
+            "Claude Code reported an API error (overloaded). Carry on from where you stopped.";
+        for n in 1..=1100_i64 {
+            let at = t + 10_000 + 300_000 * n;
+            rows.push((at, RULE_API_RETRY, Outcome::Typed, retry, act_reason(None)));
+            rows.push(point(at + 3_000));
+        }
+        let path = seed_ledger(&dir, "since-cut", &rows);
+        assert!(std::fs::metadata(&path).unwrap().len() > MAX_BYTES);
+        let before = land_episode(&path, sid).expect("in hand");
+        assert_eq!(before.hold.since_ms, Some(t + 1_000), "{before:?}");
+        bound(&path);
+        let after = land_episode(&path, sid).expect("kept");
+        assert_eq!(after, before);
+        // Another mode's act ends it; a Land after it is the new instruction's.
+        let mut over = rows.clone();
+        let end = t + 10_000 + 300_000 * 1101;
+        over.push(typed(end, RULE_CONTINUE));
+        let path = seed_ledger(&dir, "since-over", &over);
+        assert_eq!(land_episode(&path, sid), None);
+        over.push(typed(end + 1_000, RULE_LAND));
+        let path = seed_ledger(&dir, "since-anew", &over);
+        let anew = land_episode(&path, sid).expect("anew");
+        assert_eq!((anew.hold.since_ms, anew.nudges), (Some(end + 1_000), 0));
+        // NEGATIVE CONTROL: the plain cut.
+        let path = seed_ledger(&dir, "since-plain", &rows);
+        crate::harness::cli::bound_ledger(&path, MAX_BYTES, KEEP_ROWS).expect("cut");
+        assert_eq!(land_episode(&path, sid), None, "CONTROL");
+    }
+
+    /// A LANDING ENDS THE HOLD IN THE BOOKS TOO (the Autopilot design's
+    /// §12.3.9, [`super::super::policy::turn_end::HoldStart`]), as the loop
+    /// that landed it holds it: after the landing's [`RULE_TASK_DONE`] the
+    /// episode is still in hand, its nudges the engine's, and no hold
+    /// stands; the first land act after it begins the hold again, its
+    /// `since` that row's `ts` and the nudges before it its base; a nudge
+    /// after that moves neither. NEGATIVE CONTROL: the instruction's row is
+    /// the hold's `since` until a landing, through the episode's nudges.
+    #[test]
+    fn a_landing_ends_the_hold_a_loop_that_follows_seeds() {
+        use super::super::policy::turn_end::{HoldStart, RULE_LAND, RULE_LAND_NUDGE};
+        let dir = crate::supervise::ScratchDir::new("apr-seed", "land-relanded");
+        let sid = Some("@s-9");
+        let point = |ts: i64| {
+            (
+                ts,
+                RULE_POINT,
+                Outcome::Waiting,
+                "",
+                point_reason(Carried::streak(0), false),
+            )
+        };
+        let typed =
+            |ts: i64, rule: &'static str| (ts, rule, Outcome::Typed, "(land)", act_reason(None));
+        let t = 1_771_000_000_000_i64;
+        let mut rows = vec![
+            typed(t, RULE_LAND),
+            point(t + 500),
+            typed(t + 1_000, RULE_LAND_NUDGE),
+            point(t + 1_500),
+        ];
+        let path = seed_ledger(&dir, "held", &rows);
+        let ep = land_episode(&path, sid).expect("in hand");
+        let instructed = HoldStart {
+            since_ms: Some(t),
+            base: 0,
+            relanded: false,
+        };
+        assert_eq!((ep.hold, ep.nudges), (instructed, 1), "CONTROL: {ep:?}");
+        rows.push((
+            t + 1_600,
+            RULE_TASK_DONE,
+            Outcome::Waiting,
+            "",
+            TASK_DONE.to_string(),
+        ));
+        let path = seed_ledger(&dir, "landed", &rows);
+        let ep = land_episode(&path, sid).expect("in hand");
+        assert_eq!((ep.hold, ep.nudges), (HoldStart::LANDED, 1), "{ep:?}");
+        rows.extend([typed(t + 9_000, RULE_LAND_NUDGE), point(t + 9_500)]);
+        let path = seed_ledger(&dir, "anew", &rows);
+        let ep = land_episode(&path, sid).expect("in hand");
+        let anew = HoldStart {
+            since_ms: Some(t + 9_000),
+            base: 2,
+            relanded: false,
+        };
+        assert_eq!((ep.hold, ep.nudges), (anew, 2), "{ep:?}");
+        rows.extend([typed(t + 12_000, RULE_LAND_NUDGE), point(t + 12_500)]);
+        let path = seed_ledger(&dir, "after", &rows);
+        let ep = land_episode(&path, sid).expect("in hand");
+        assert_eq!((ep.hold, ep.nudges), (anew, 3), "{ep:?}");
     }
 
     /// A TAB A COLD RESTORE REOPENED (ATERM-KI-1016-1, follow-7): its loops

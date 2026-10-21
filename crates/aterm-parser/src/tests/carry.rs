@@ -126,10 +126,9 @@ fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
         ),
         // A sixel ended by the 8-bit ST.
         (b"\x1bPq#0;2;0;0;0", b"#0!10~-\x9cafter"),
-        // An unknown string ended by the 8-bit ST after a character that
-        // holds 0x9C itself (U+672C is E6 9C AC): with C1 off that byte is
-        // the character's and the string ends at the ST after it; with C1 on
-        // it ends the string early, in both.
+        // An 8-bit ST after a character holding 0x9C (本 is E6 9C AC): with C1
+        // off that 0x9C is the character's; with C1 on it ends the string
+        // early, in both parsers.
         (b"\x1bP@x", b"y\xe6\x9c\xac\x9cafter"),
     ];
     for c1 in [false, true] {
@@ -331,10 +330,9 @@ fn the_hooked_string_carry_reads_every_byte_as_the_hooked_string() {
     }
 }
 
-/// An ignored DCS, and an SOS/PM/APC string, are carried as strings to
-/// IGNORE: the rest of the payload is swallowed up to its terminator (never
-/// printed, never handed to a consumer the successor did not start), and the
-/// text after it prints.
+/// An ignored DCS and an SOS/PM/APC string are carried as strings to ignore:
+/// the rest of the payload is swallowed to its terminator, delivered to no
+/// consumer, and the text after it prints.
 #[test]
 fn string_payloads_are_swallowed_to_their_terminator() {
     for (head, tail) in [
@@ -413,8 +411,8 @@ fn can_sub_and_esc_still_reset_a_restored_state() {
     }
 }
 
-/// THE REFUSAL TABLE: every carry `restore_carry` must refuse, each named by
-/// the check that refuses it — and the parser is untouched by a refusal.
+/// Every carry `restore_carry` must refuse, each with the refusal naming its
+/// check; a refusal leaves the parser untouched.
 #[test]
 fn restore_carry_refuses_every_invalid_carry() {
     let csi = |params: Vec<u16>| ParserCarry {
@@ -759,7 +757,7 @@ fn restore_carry_refuses_every_invalid_carry() {
     }
 }
 
-/// The NEGATIVE CONTROLS beside the table: the edge of every bound restores.
+/// The refusal table's negative controls: the edge of every bound restores.
 #[test]
 fn restore_carry_accepts_the_edge_of_every_bound() {
     let accepted = [
@@ -855,13 +853,12 @@ fn restore_carry_accepts_the_edge_of_every_bound() {
     }
 }
 
-/// UTF-8 tails to put in a carry. The pending prefixes: every Table 3-7 row's
-/// lead alone, then (three- and four-byte rows) with the lowest second byte
-/// the row allows, then (four-byte rows) with a third byte. Beside them,
-/// tails no stream ends in: a second byte just outside each range-checked
-/// row's range (`E0`, `ED`, `F0`, `F4`), an ASCII byte, continuation bytes
-/// and the leads that begin no sequence as heads, and a complete character of
-/// each length.
+/// UTF-8 tails for a carry. Pending prefixes: each Table 3-7 row's lead alone,
+/// then (three- and four-byte rows) with the row's lowest second byte, then
+/// (four-byte rows) with a third byte. Beside them, tails no stream ends in: a
+/// second byte just outside each range-checked row (`E0`, `ED`, `F0`, `F4`),
+/// ASCII, continuation bytes and non-leads as heads, and a complete character
+/// of each length.
 fn utf8_tails() -> Vec<Vec<u8>> {
     let mut tails = vec![vec![]];
     for lead in [
@@ -895,29 +892,23 @@ fn utf8_tails() -> Vec<Vec<u8>> {
     tails
 }
 
-/// THE HOSTILE CARRIES: `restore_carry` either installs a carry that reads
-/// back exactly and leaves a safe parser ([`assert_restored_state_is_safe`],
-/// in both C1 modes), or refuses it and installs nothing — over carries no
-/// parser wrote, at, inside and just past every bound. Two products, each
-/// over all 14 states:
+/// `restore_carry` either installs a carry that reads back exactly and leaves
+/// a safe parser ([`assert_restored_state_is_safe`], both C1 modes) or refuses
+/// it and installs nothing, over carries no parser wrote, at, inside and past
+/// every bound. Two products over all 14 states:
 ///
-/// * the sequence fields, with both UTF-8 tails empty: 0, 1, 2, `MAX_PARAMS`
-///   and `MAX_PARAMS + 1` parameters (`u16::MAX` and 0 alternating) × a
-///   subparameter mask of 0, 1, 2, the bit at the parameter count, or every
-///   bit × `current_param` 0, 1 or `u32::MAX` × both `param_started` and both
-///   `last_was_colon` × intermediates of every length to
-///   `MAX_INTERMEDIATES + 1` in `0x20`, `0x2F`, `0x30`, `0x3C`, `0x3F` and
-///   `0x40`, and two mixed × no OSC payload or one byte × both
-///   `osc_overflowed`;
-/// * the UTF-8 fields, with the sequence fields empty: every
-///   [`utf8_tails`] tail × `utf8_expected` 0..=5 × every [`utf8_tails`] tail
-///   as `string_utf8_tail`.
+/// * the sequence fields, UTF-8 tails empty: 0, 1, 2, `MAX_PARAMS` and
+///   `MAX_PARAMS + 1` parameters × subparameter masks 0, 1, 2, the bit at the
+///   count and all bits × `current_param` 0, 1, `u32::MAX` × both flags ×
+///   intermediates of every length to `MAX_INTERMEDIATES + 1`, each of six
+///   bytes, and two mixed × an empty or one-byte OSC × both `osc_overflowed`;
+/// * the UTF-8 fields, sequence fields empty: every [`utf8_tails`] tail ×
+///   `utf8_expected` 0..=5 × every tail as `string_utf8_tail`.
 ///
-/// No acceptance check reads a field of both groups, and a state that takes
-/// either group's fields refuses the other's, so a carry that mixes them is
-/// refused by a check one of the two products already reaches. Every state
-/// a carry may name is accepted at least once and every refusal is met, so
-/// neither product is vacuous.
+/// No check reads fields of both groups, and a state that takes one group's
+/// fields refuses the other's, so a mixed carry is refused by a check a
+/// product already reaches. Every nameable state is accepted and every refusal
+/// met, so neither product is vacuous.
 #[test]
 fn restore_carry_installs_only_safe_carries_whoever_wrote_them() {
     let mut start = Parser::new();
@@ -1089,13 +1080,11 @@ fn state_names_round_trip() {
     assert_eq!(State::from_name("Nowhere"), None);
 }
 
-/// THE CARRIES THAT ONLY SWALLOW:
-/// an OSC over the carry's cap and an APC string with its consumer started
-/// are carried as sequences to ignore to their terminator, where this parser
-/// would have delivered them — `carry_swallows_sequence` names exactly those.
-/// What this parser swallows itself (an SOS or PM string, `DcsIgnore`, an OSC
-/// past its own cap) and every sequence the carry continues (a DCS header
-/// among them, since 2026-10-10) are not named.
+/// `carry_swallows_sequence` names exactly the carries that lose a sequence
+/// this parser would deliver: an OSC over the carry's cap and an APC string
+/// with its consumer started. What this parser swallows itself (SOS, PM,
+/// `DcsIgnore`, an OSC it discards) and every sequence the carry continues (a
+/// DCS header among them) are not named.
 #[test]
 fn carry_swallows_sequence_names_the_lossy_carries_only() {
     let at = |bytes: &[u8]| {
@@ -1134,14 +1123,12 @@ fn carry_swallows_sequence_names_the_lossy_carries_only() {
     }
 }
 
-/// A STRING'S CARRY CONTINUES A UTF-8 CHARACTER SPLIT AT THE HANDOFF. Whether
-/// a `0x9C` in a DCS or APC payload is ST or the next byte of a character
-/// depends on the bytes before it
-/// (`tests::c1::a_0x9c_inside_a_utf8_character_does_not_end_the_string`), so
-/// a carry taken between the two holds the character's head: split the string
-/// at every byte of a payload whose characters hold `0x9C` as their second,
-/// third and fourth byte, carry the head, and the successor swallows the rest
-/// of the string as the live parser does and prints only what follows it.
+/// A carry taken inside a DCS or APC payload holds the head of a split UTF-8
+/// character, since whether the next `0x9C` is ST depends on it
+/// (`tests::c1::a_0x9c_inside_a_utf8_character_does_not_end_the_string`).
+/// Split at every byte of a payload holding `0x9C` as second, third and fourth
+/// byte, the successor swallows the rest of the string and prints only what
+/// follows.
 #[test]
 fn a_string_carry_continues_a_split_utf8_character() {
     let payload = "\u{71c}\u{672c}\u{d71c}\u{1f71c}\u{1c71c}x";
@@ -1292,11 +1279,9 @@ fn every_split_of_a_dcs_stream_continues_exactly() {
     }
 }
 
-/// A BUILD BEFORE DCS HEADER CARRIES READS A HEADER AS IT ALWAYS DID: the
-/// coarse form a header carry crosses beside ([`ParserCarry::for_older_builds`])
-/// is the `DcsIgnore` holding nothing that such a build wrote for every
-/// header, which that build's `restore_carry` accepted, and it swallows the
-/// string to its terminator. Every other carry such a build reads as it is.
+/// A header carry's [`ParserCarry::for_older_builds`] form is `DcsIgnore`
+/// holding nothing, which a build without header carries accepts and which
+/// swallows the string to its terminator. Every other carry has no such form.
 #[test]
 fn a_header_carry_has_the_older_builds_form_beside_it() {
     for head in [&b"\x1bP"[..], b"\x1bP1;2", b"\x1bP>1;2 $"] {

@@ -11,7 +11,8 @@
 //! name, WHY aterm runs it, where it is found and who provides it
 //! (docs/DESIGN-init-system-2026-10-20.md §8). A gate that cannot find one ends COULD NOT
 //! RUN naming that provider ([`Tool::refusal`]), so the remedy is the provider's one
-//! command and never a hand install.
+//! command, or, where the provider's slice has not landed, the route that works today;
+//! never a command that does not exist, and never a system-wide install.
 //!
 //! The one shell read of what a child holds ([`sh_held_any`]) is here too, for the same
 //! reason: every crate's test that asks a child shell for its descriptors asks it this way.
@@ -73,12 +74,22 @@ pub enum Provider {
         /// The default-set program that carries this tool.
         program: &'static str,
     },
-    /// The checkout's own pin, which `targo --unverified verify provision` fetches or
-    /// builds into the tooling cache ([`tooling_dir`]); `aterm init --develop` runs it
-    /// (the `develop.workspace-tools` item).
+    /// A tool the checkout pins, which the design's S7 slice fetches or builds into the
+    /// tooling cache ([`tooling_dir`]) with a `verify provision` verb that `aterm init
+    /// --develop` runs (§6.2–§6.4). Neither command exists yet, so the words name only
+    /// `meanwhile`, the route that provides the tool today: as for [`Provider::Unprovided`],
+    /// naming a command that does not do the job would send a person nowhere. The slice
+    /// that adds the verb names it here.
     Workspace {
-        /// Which `verify provision` run provides it.
+        /// Which provisioning run will provide it (S7).
         when: When,
+        /// Where the tool comes from today, and how a copy is put in reach without a
+        /// system-wide install: the whole remedy until S7 lands.
+        meanwhile: &'static str,
+        /// The command of this tree that provides it today, where one does (`verify
+        /// fetch-browser` for the browsers): `verify list` names it as the provider, and
+        /// `upstream` where the route is the official build.
+        by: Option<&'static str>,
     },
     /// A release host's own (`ship provision` acquires and audits it).
     ReleaseHost,
@@ -96,27 +107,15 @@ pub enum Provider {
     Hardware(&'static str),
 }
 
-/// Which `verify provision` run provides a [`Provider::Workspace`] row.
+/// Which provisioning run will provide a [`Provider::Workspace`] row (S7's, §8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum When {
-    /// Every run (and so `aterm init --develop`).
+    /// Every run: what testing a checkout needs.
     Always,
-    /// `--linux`: the Linux lane's own.
+    /// The Linux lane's own.
     Linux,
-    /// `--record`: only to re-record a golden.
+    /// Only to re-record a golden.
     Record,
-}
-
-impl When {
-    /// The flag `verify provision` takes for this row: empty for [`When::Always`].
-    #[must_use]
-    pub fn flag(self) -> &'static str {
-        match self {
-            Self::Always => "",
-            Self::Linux => " --linux",
-            Self::Record => " --record",
-        }
-    }
 }
 
 /// The version of a [`Provider::Workspace`] tool the tree pins, and where its install lays
@@ -291,22 +290,7 @@ impl Tool {
             Provider::Toolset { program } => format!(
                 "ALab's default set provides it (`aterm pkg install --default-set` installs {program})"
             ),
-            Provider::Workspace { when } => {
-                let act = match self.pin {
-                    Some(pin) if pin.built => format!("builds the pinned {}", pin.version),
-                    Some(pin) => format!("fetches the pinned {}", pin.version),
-                    None => "provides it".into(),
-                };
-                let init = if when == When::Always {
-                    " (`aterm init --develop` runs it)"
-                } else {
-                    ""
-                };
-                format!(
-                    "`targo --unverified verify provision{}` {act}{init}",
-                    when.flag()
-                )
-            }
+            Provider::Workspace { meanwhile, .. } => meanwhile.into(),
             Provider::ReleaseHost => {
                 "a release host carries it (`targo --unverified ship provision` audits one)".into()
             }
@@ -322,11 +306,18 @@ impl Tool {
     /// What a gate that found no such tool says: what is missing, then [`Tool::remedy`],
     /// then the variable that names another copy. Only for a gate that resolves the tool
     /// through [`Tool::find_in`], which reads that variable; any other gate says
-    /// [`Tool::remedy`] alone.
+    /// [`Tool::remedy`] alone. A [`Provider::Workspace`] copy got today lands nowhere the
+    /// resolver looks, so its words lead with the variable, the route that finds it.
     #[must_use]
     pub fn refusal(&self) -> String {
         match self.provider {
             Provider::Hardware(what) => format!("this host lacks {what}, and no command adds it"),
+            Provider::Workspace { .. } => format!(
+                "no {} here: {}=<path> names one; {}",
+                self.missing.unwrap_or(self.name),
+                self.var(),
+                self.remedy()
+            ),
             _ => format!(
                 "no {} here: {} (or {}=<path> names one)",
                 self.missing.unwrap_or(self.name),
@@ -336,7 +327,9 @@ impl Tool {
         }
     }
 
-    /// Its provider in a word or two, as `verify list` prints it: `verify provision`,
+    /// Its provider in a word or two, as `verify list` prints it: for a
+    /// [`Provider::Workspace`] row the command that provides it today (`verify
+    /// fetch-browser`), else `upstream` (its official build, until S7 provides the pin);
     /// `default set`, `OS`, `unprovided` for a [`Provider::Unprovided`] row, or `hardware`
     /// for a [`Provider::Hardware`] row.
     #[must_use]
@@ -345,7 +338,7 @@ impl Tool {
             Provider::Os => "OS".to_string(),
             Provider::Clt => "CLT".to_string(),
             Provider::Toolset { .. } => "default set".to_string(),
-            Provider::Workspace { when } => format!("verify provision{}", when.flag()),
+            Provider::Workspace { by, .. } => by.unwrap_or("upstream").to_string(),
             Provider::ReleaseHost => "release host".to_string(),
             Provider::Guest => "Linux guest".to_string(),
             Provider::Unprovided { .. } => "unprovided".to_string(),
@@ -354,7 +347,7 @@ impl Tool {
     }
 
     /// This row as `verify list`'s NEEDS column names it: the tool and its provider in a
-    /// word (`fish (verify provision)`), or a [`Provider::Hardware`] row's own words.
+    /// word (`fish (upstream)`), or a [`Provider::Hardware`] row's own words.
     #[must_use]
     pub fn needs_label(&self) -> String {
         match self.provider {

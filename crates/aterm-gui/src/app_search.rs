@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cmd-F / Emacs-navigation find overlay: the in-progress find state
-//! (`SearchState`), the absolute → selection coordinate map (`map_matches`), and
-//! the `App`-side enter/recompute/apply/step/exit methods.
-//!
-//! The search itself (a full-history trigram index built off the term lock and
-//! cached across keystrokes) lives in [`crate::control::search_full_history`],
-//! shared with the socket `search` verb so a live ⌘F and a scripted `search` over
-//! the same content reuse one index. This module calls it, maps the engine's
-//! absolute match rows into the overlay's selection coordinates, and drives the
-//! current-match cursor and highlight.
+//! The find overlay (⌘F, Emacs-style navigation): the find state (`SearchState`),
+//! the absolute → selection row map (`map_matches`), and the `App` methods that
+//! open, recompute, step and close it. The search itself is
+//! [`crate::control::search_full_history`], shared with the socket `search` verb so
+//! both reuse one cached trigram index built off the term lock.
 
 use crate::app_mouse::note_selection_custody;
 use crate::{App, term_lock};
@@ -18,10 +13,8 @@ use aterm_core::search::{SearchDirection as EngineSearchDirection, SearchMatch};
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 
-/// Direction of an incremental terminal search. Forward is the plain Cmd-F
-/// default; backward is selected by Cmd-R/Ctrl-R and makes every query recompute
-/// land at/before the Emacs search point immediately (never a wrong-direction
-/// flash).
+/// Direction of an incremental find. Forward is ⌘F's default; backward (⌘R/^R)
+/// makes every recompute land at or before the search point at once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SearchDirection {
     #[default]
@@ -39,17 +32,14 @@ impl SearchDirection {
     }
 }
 
-/// One text-field edit of the find query. The bar is a real single-line text
-/// field, so it speaks the standard macOS/readline motions (^A/^E/^B/^F, ⌥←/⌥→
-/// by word, Home/End) and kills (^K/^U/^W, ⌥⌫, ⌘⌫).
-///
-/// Kept separate from the key handler so the editing model is pure, unit-testable
-/// state ([`SearchState::edit`]) and repeatable on a held key
+/// One text-field edit of the find query: the macOS/readline motions (^A/^E/^B/^F,
+/// ⌥←/⌥→, Home/End) and kills (^K/^U/^W, ⌥⌫, ⌘⌫). Kept apart from the key handler so
+/// the editing model is pure ([`SearchState::edit`]) and repeatable on a held key
 /// ([`crate::SearchRepeatAction`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SearchEdit {
-    /// Insert typed/pasted text at the caret. Control characters are stripped: a
-    /// find query is one line, and ⎋/⏎/⇥ are COMMANDS here, never content.
+    /// Insert typed/pasted text at the caret, control characters stripped: ⎋/⏎/⇥ are
+    /// commands here, never content.
     Insert(String),
     DeleteBack,
     DeleteForward,
@@ -71,12 +61,10 @@ pub(crate) enum SearchEdit {
 /// Byte offset of the previous word boundary before `at`: the start of the word the
 /// caret is in, or else of the word before it.
 ///
-/// A word is the readline convention's run of alphanumerics plus `_`, with the marks
-/// and the format controls that spell it ([`aterm_grapheme::words`], the rule a
-/// double-click follows too). Everything else (space, punctuation, path separators,
-/// an invisible control) is a boundary, so ⌥← walks a path or a shell command one
-/// component at a time and never stops inside `नमस्ते` or `می‌خواهم`. A step costs
-/// the distance it moves, not the length of the field.
+/// A word is the readline run of alphanumerics plus `_`, with the marks and format
+/// controls that spell it ([`aterm_grapheme::words`], as a double-click uses).
+/// Everything else is a boundary, so ⌥← walks a path one component at a time and
+/// never stops inside `नमस्ते` or `می‌خواهم`. A step costs the distance it moves.
 fn prev_word_boundary(s: &str, at: usize) -> usize {
     aterm_grapheme::word_start_before(s, at, aterm_grapheme::is_word_char).unwrap_or(0)
 }
@@ -95,16 +83,10 @@ fn next_word_boundary(s: &str, at: usize) -> usize {
     .unwrap_or(s.len())
 }
 
-/// Apply one [`SearchEdit`] to a bare `(text, cursor)` single-line field, returning
-/// `true` when the text changed and `false` for a pure caret move.
-///
-/// The editing model of every in-grid single-line field: the find bar (a
-/// [`SearchState`]) and the tab strip's inline rename (a `String` plus a byte
-/// offset) share the same caret motions, kills and paste behaviour.
-///
-/// Pure and total: every offset is clamped into `text` and floored onto a char
-/// boundary, so no edit (even one applied a frame after the text it was
-/// classified against) can panic or split a multi-byte character.
+/// Apply one [`SearchEdit`] to a single-line `(text, cursor)` field: `true` when the
+/// text changed, `false` for a caret move. The find bar and the tab strip's inline
+/// rename share it. Total: offsets are clamped and floored onto a char boundary, so
+/// an edit classified against an older text cannot panic or split a character.
 pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: SearchEdit) -> bool {
     // The largest char boundary at or before `at`, already clamped into `text`.
     let floor = |text: &str, at: usize| -> usize {
@@ -127,10 +109,9 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
     let at = *cursor;
     match edit {
         SearchEdit::Insert(insert) => {
-            // ⎋/⏎/⇥ and friends are commands in a one-line field, and a multi-line
-            // clipboard is not one line: keep printable characters only. The
-            // Unicode line/paragraph separators are not `is_control`, so they are
-            // named explicitly.
+            // A one-line field keeps printable characters only (⎋/⏎/⇥ are commands,
+            // a multi-line clipboard is not one line). U+2028/U+2029 are not
+            // `is_control`, so they are named.
             let insert: String = insert
                 .chars()
                 .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
@@ -222,16 +203,13 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
     }
 }
 
-/// Drop the find highlight only when the output that invalidated the match
-/// vector could have moved the text under it.
-///
-/// The find bar's four stamps (`results_dirty`, `match_absolute_row_revision`,
-/// `match_history_renumber_epoch`, `match_content_seq`) say whether the match
-/// vector may still be used to compute a row and column. They say nothing about
-/// the highlight, which `post_process` maintains itself: a uniform scroll remaps
-/// the anchors, a piecewise splice remaps or destroys them, and an overlapping
-/// damage band clears them. By the time the GUI runs, the selection is already
-/// correct or gone.
+/// Drop the find highlight only when the output that invalidated the matches could
+/// have moved the text under it. `post_process` already maintains the selection (a
+/// uniform scroll remaps it, a splice remaps or destroys it, overlapping damage
+/// clears it); what remains is the live screen, rows from `Grid::base_y()` down,
+/// which streaming output overwrites under unchanged row numbers. Archived rows
+/// change only by eviction and renumbering, which the engine accounts for. It is
+/// `base_y`, not `top_visible_absolute_row`, so where the user looks does not matter.
 ///
 /// So only the mutable band matters: rows at or below `live_top_abs` are the live
 /// screen, which streaming output can overwrite cell by cell under an unchanged
@@ -279,12 +257,11 @@ fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) -> boo
 /// the predicate if that is ever worth refusing too.
 #[derive(Clone, Copy)]
 pub(crate) struct FindOrigin {
-    /// The absolute row that was at the TOP of the viewport when find opened.
+    /// The absolute row at the top of the viewport when find opened.
     pub(crate) top_visible_absolute_row: u64,
-    /// Find opened at the live tail (`display_offset == 0`). At the tail the
-    /// anchored row is exactly the row a protected-footer splice archives, so
-    /// anchoring would drop a tail follower one row off the bottom on every
-    /// footer repaint; a tail follower gets the tail back instead.
+    /// Find opened at the live tail (`display_offset == 0`). There the anchored row
+    /// is exactly the row a protected-footer splice archives, so a tail follower gets
+    /// the tail back rather than drifting one row per footer repaint.
     pub(crate) was_live: bool,
     /// Which buffer the anchor's absolute numbering belongs to.
     pub(crate) on_alt_screen: bool,
@@ -297,12 +274,10 @@ pub(crate) struct FindOrigin {
 /// shortens it to fit, `find_bar::status_seg`).
 pub(crate) const HISTORY_AWAY_NONE: &str = "none yet, history rewrapping";
 
-/// What a find count rests on. The find bar, the window title and the spoken
-/// status word their qualifiers from this one value, so the three name the same
-/// cause: the depth cap (`newest 100,000 lines`), the match limit (`match
-/// limit`), a regex that could not finish a long line (`long line partly
-/// searched`), a rewrap holding the history away (`rewrapping`), or output
-/// since the count (`stale`).
+/// What a find count rests on. The bar, the window title and the spoken status
+/// word their qualifiers from this one value: the depth cap (`newest 100,000
+/// lines`), the match limit, a regex that could not finish a long line, a rewrap
+/// holding the history away (`rewrapping`), or output since the count (`stale`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CountFacts {
     /// The count is a floor: some of the history was not searched, or the list
@@ -446,65 +421,51 @@ fn comma_list(words: &[String]) -> String {
     words.iter().map(|word| format!(", {word}")).collect()
 }
 
-/// In-progress find over the live screen and scrollback history. Matches are
-/// `(row, start_col, end_col)` in selection coordinates (0..rows = live screen,
-/// negative = scrollback); the current one is highlighted through the text
-/// selection and scrolled into view.
-///
-/// `end_col` is inclusive and measured from `row`'s column 0, not clamped to
-/// the grid width: a hit that crosses a soft wrap is one match whose `end_col`
-/// runs past the width by the part continuing on the rows below. Both consumers
-/// (the current match's selection and the highlight-all tint) divide by the
-/// width to get there.
+/// In-progress find over the live screen and scrollback. Matches are
+/// `(row, start_col, end_col)` in selection coordinates (0..rows live, negative
+/// scrollback); the current one is highlighted through the text selection and
+/// scrolled into view. `end_col` is inclusive, measured from `row`'s column 0 and
+/// not clamped to the width: a hit crossing a soft wrap runs past it, and both
+/// consumers (the selection and the highlight-all tint) divide by the width.
 #[derive(Default)]
 pub(crate) struct SearchState {
     pub(crate) query: String,
-    /// Caret position in [`Self::query`], as a byte offset on a char boundary.
-    /// Every mutation goes through [`Self::edit`]/[`Self::set_query`], which keep
-    /// that invariant; the find bar paints the caret here.
+    /// Caret byte offset in [`Self::query`], always on a char boundary
+    /// ([`Self::edit`] and [`Self::set_query`] keep it there).
     pub(crate) cursor: usize,
     pub(crate) matches: Vec<(i32, u16, u32)>,
-    /// Exact point-relative hit when it lies outside the capped batch. Keeping
-    /// it separate avoids inserting/removing/shifting 100k elements on every
-    /// truncated Cmd-S/Cmd-R repeat.
+    /// The exact point-relative hit when it lies outside the capped batch, kept apart
+    /// so a truncated ⌘S/⌘R repeat never shifts 100k elements.
     point_match: Option<(i32, u16, u32)>,
-    /// The most rows any match in [`Self::matches`] spans past its own (0 while
-    /// nothing straddles a soft wrap). The compositor binary-slices the sorted
-    /// matches to the visible band by start row, so without this allowance a hit
-    /// beginning just above the viewport would lose the tint on its visible part.
+    /// The most rows any match in [`Self::matches`] spans past its own (0 while none
+    /// straddles a soft wrap). The compositor slices the sorted matches to the
+    /// visible band by start row; this allowance keeps the tint on a hit that begins
+    /// just above the viewport.
     pub(crate) max_match_rows: i32,
-    /// The grid `base_y()` the selection rows in [`Self::matches`] were computed
-    /// against (see [`App::search_recompute_in`]). Selection rows are
-    /// frame-relative but consumed a frame or more later, so if PTY output scrolls
-    /// the grid meanwhile, the apply/highlight paths re-anchor by
+    /// The grid `base_y()` [`Self::matches`] was computed against
+    /// ([`App::search_recompute_in`]). Selection rows are frame-relative but consumed
+    /// a frame or more later, so the apply and highlight paths re-anchor by
     /// `current_base_y − match_base_y`.
     pub(crate) match_base_y: i64,
     /// Terminal revision for top-anchored protected-footer insertions when
-    /// [`Self::matches`] was computed. Such a piecewise row splice cannot be
-    /// corrected by a single `base_y` delta, so output handling recomputes the
-    /// active search whenever this revision changes.
+    /// [`Self::matches`] was computed. That piecewise splice has no single `base_y`
+    /// delta, so output handling recomputes the find when it changes.
     pub(crate) match_absolute_row_revision: u64,
-    /// `Grid::history_renumber_epoch()` when [`Self::matches`] was computed.
-    ///
-    /// The footer revision cannot stand in for this: a width reflow (an edge
-    /// drag, a font zoom, a divider move) rewraps history and renumbers every
-    /// retained row wholesale without moving `absolute_row_revision`, so a stored
-    /// row would point at different text. Every consumer of a stored match row
-    /// fails closed on this stamp too, as `Terminal::finalize_resize` does for the
-    /// text selection.
+    /// `Grid::history_renumber_epoch()` when [`Self::matches`] was computed. A width
+    /// reflow renumbers every retained row without moving the footer revision, so
+    /// every consumer of a stored row fails closed on this stamp too, as
+    /// `Terminal::finalize_resize` does for the text selection.
     pub(crate) match_history_renumber_epoch: u64,
-    /// Terminal content generation captured with [`Self::matches`]. Ordinary
-    /// streaming output changes this even when absolute-row coordinates remain
-    /// uniform; the output wake marks the batch dirty so stale matches are never
-    /// applied or accepted, then the next navigation/edit refreshes off-lock.
+    /// Terminal content generation captured with [`Self::matches`]. Streaming output
+    /// moves it even when row numbering stays uniform; the output wake then marks the
+    /// batch dirty so stale matches are never applied, and the next navigation or
+    /// edit refreshes off-lock.
     pub(crate) match_content_seq: u64,
     /// The terminal changed since the current result batch was built.
     pub(crate) results_dirty: bool,
     pub(crate) current: usize,
-    /// Direction used both by the next repeat and by incremental recomputes. In
-    /// particular, typing after Cmd-R selects the anchored previous match
-    /// atomically rather than selecting a forward match and correcting it in a
-    /// second render pass.
+    /// Direction of the next repeat and of incremental recomputes, so typing after
+    /// ⌘R lands on the anchored previous match in one render.
     pub(crate) direction: SearchDirection,
     /// Match case (default off = case-insensitive). Toggled with `⌥⌘C` in find mode.
     pub(crate) case_sensitive: bool,
@@ -515,8 +476,8 @@ pub(crate) struct SearchState {
     /// `^` and `$` anchor the logical line the reader sees, not the grid row a
     /// soft wrap split it onto, because find matches whole wrapped runs.
     pub(crate) is_regex: bool,
-    /// The last recompute's query was an INVALID regex (only reachable in regex mode).
-    /// Distinguishes "your pattern is broken" from "zero hits" in the find bar.
+    /// The last recompute's query was an invalid regex (regex mode only): the bar says
+    /// "bad regex", not zero hits.
     pub(crate) regex_error: bool,
     /// The count is a floor: the depth cap left older history unsearched
     /// ([`Self::searched_lines`]), the list stopped at the match limit
@@ -595,7 +556,7 @@ impl SearchState {
         } else if self.query.is_empty() {
             None
         } else if self.matches.is_empty() && self.history_away {
-            // Ruling 237: the painter's long form, at every width.
+            // The painter's long form, at every width.
             Some(HISTORY_AWAY_NONE.to_string())
         } else if self.matches.is_empty() {
             Some(format!(
@@ -621,7 +582,7 @@ impl SearchState {
             // The panel's own word: an invalid pattern is not a miss.
             format!("aterm — find: {} (bad regex)", self.query)
         } else if self.matches.is_empty() && self.history_away {
-            // Ruling 237: the history is away, not empty of the text.
+            // The history is away, not empty of the text.
             format!("aterm — find: {} ({HISTORY_AWAY_NONE})", self.query)
         } else if self.matches.is_empty() {
             format!(
@@ -642,10 +603,9 @@ impl SearchState {
         }
     }
 
-    /// Pure next/previous-match cursor step with wraparound (no window/render
-    /// side effects). `forward` advances toward later matches; both directions
-    /// wrap. A no-op when there are no matches. This is the testable core of
-    /// [`App::search_step`], which calls it and then re-applies the highlight.
+    /// Next/previous-match step with wraparound and no window or render side
+    /// effects; with no matches it only sets the direction. The core of
+    /// [`App::search_step`].
     pub(crate) fn step(&mut self, forward: bool) {
         // Direction changes even with zero matches: typing the first query after
         // a reverse command must start from the bottom.
@@ -738,17 +698,14 @@ impl SearchState {
         }
     }
 
-    /// Repaint fingerprint of the find bar's displayed state: exactly the fields
-    /// [`splice_find_bar`](crate::App::splice_find_bar) reads (query, caret,
-    /// current index and count, case/regex toggles, regex-error/truncated
-    /// readouts). Folded into [`RepaintKey`](crate::RepaintKey) so a find edit
-    /// that does not move the highlighted match still presents. FNV-1a over
-    /// those fields; the key builders substitute `0` when no find is active.
+    /// Repaint fingerprint of the find bar: FNV-1a over the fields
+    /// [`splice_find_bar`](crate::App::splice_find_bar) paints, folded into
+    /// [`RepaintKey`](crate::RepaintKey) so an edit that does not move the highlight
+    /// still presents (the key builders use `0` with no find open).
     pub(crate) fn fingerprint(&self) -> u64 {
         let mut h = aterm_hash::Fnv1a64::new();
         h.write(self.query.as_bytes());
-        // The CARET is painted state: a bare ^A/^E/⌥←, which changes no match, still
-        // has to reach glass, so the edit position is part of the fingerprint.
+        // The caret is painted state: ^A/^E/⌥← move no match but must still present.
         for word in [
             self.cursor as u64,
             self.current as u64,
@@ -790,29 +747,21 @@ fn match_position(matches: &[(i32, u16, u32)], point: (i32, u16, u32)) -> Result
     matches.binary_search_by(|&(row, col, _)| (row, col).cmp(&(point.0, point.1)))
 }
 
-/// Map engine [`SearchMatch`]es (absolute rows, exclusive end columns) to the
-/// find overlay's selection coordinates: `sel_row = abs_row − base_y` (0..rows =
-/// live screen, negative = scrollback) with inclusive end columns, sorted
-/// top-to-bottom then left-to-right so next/prev reads in visual order. `base_y`
-/// is the absolute row of the live top line (`grid().base_y()`), independent of
-/// the display offset. Rows or columns outside the overlay's `i32`/`u16` range
-/// are dropped rather than wrapped.
-///
-/// The engine's columns are display/cell columns (its `ColumnMap` counts a wide
-/// CJK glyph as two), so they pass straight through.
-///
-/// `end` is the one column that can exceed the grid width: a hit straddling a
-/// soft wrap continues on the row below, and carrying the overflow lets the
-/// consumers paint the second half. It is `u32` because a match on a deeply
-/// wrapped line can run past `u16`.
+/// Map engine [`SearchMatch`]es (absolute rows, exclusive end, cell columns) to the
+/// overlay's selection coordinates: `sel_row = abs_row − base_y`, where `base_y` is
+/// `grid().base_y()` (independent of the display offset), with an inclusive end,
+/// sorted in visual order. Rows or columns outside `i32`/`u16` are dropped, not
+/// wrapped. Only `end` may exceed the grid width (a hit straddling a soft wrap
+/// carries the overflow onto the rows below); it is `u32` because a deeply wrapped
+/// line can run past `u16`.
 pub(crate) fn map_matches(matches: &[SearchMatch], base_y: i64) -> Vec<(i32, u16, u32)> {
     let mut out: Vec<(i32, u16, u32)> = matches
         .iter()
         .filter_map(|m| {
             let row = i32::try_from(i64::try_from(m.line).ok()? - base_y).ok()?;
             let start = u16::try_from(m.start_col).ok()?;
-            // end_col is EXCLUSIVE; the selection wants an INCLUSIVE end. A non-empty
-            // match always has end_col > start_col.
+            // The engine's end is exclusive, the selection's inclusive; a non-empty
+            // match has end_col > start_col.
             let end = u32::try_from(m.end_col.saturating_sub(1)).ok()?;
             Some((row, start, end))
         })
@@ -830,14 +779,11 @@ pub(crate) fn map_matches(matches: &[SearchMatch], base_y: i64) -> Vec<(i32, u16
 }
 
 impl App {
-    /// `(row geometry died, content moved)` for the open find, or `None` when
-    /// nothing is being searched.
-    ///
-    /// The first term folds both ways a stored row number dies: the piecewise
-    /// protected-footer splice (`absolute_row_revision`) and the wholesale history
-    /// renumbering of a width reflow (`history_renumber_epoch`). Every caller
-    /// treats them alike: refuse to re-anchor, and re-aim the Emacs point at the
-    /// buffer edge.
+    /// `(row geometry died, content moved)` for the open find, `None` without one.
+    /// The first folds both ways a stored row dies: a protected-footer splice
+    /// (`absolute_row_revision`) and a width reflow's renumbering
+    /// (`history_renumber_epoch`). Callers refuse to re-anchor and re-aim the point
+    /// at the buffer edge.
     fn search_stamp_mismatch(&self, wid: crate::WindowId) -> Option<(bool, bool)> {
         let ws = self.windows.get(&wid)?;
         let search = ws.search.as_ref()?;
@@ -878,9 +824,8 @@ impl App {
             }
         }
         if let Some(term) = term {
-            // Press custody: as on the navigation refusal, this clears the
-            // highlight only when the live screen could have moved under it, and
-            // records a `UserClear` exactly when it does.
+            // Press custody: clear the highlight only when the live screen could
+            // have moved under it, and record a `UserClear` exactly then.
             let mut t = term_lock(&term);
             if clear_selection_if_content_is_mutable(&mut t) {
                 crate::app_mouse::note_selection_custody(&mut t, false);
@@ -913,9 +858,8 @@ impl App {
                     }),
                 );
             }
-            // A native front never falls through to the parked terminal search
-            // host. Markdown/Recovery have no find action, so Find is a no-op
-            // there.
+            // A native front never falls through to the parked terminal search;
+            // Markdown/Recovery have no find action.
             return;
         }
         if self.front_terminal(wid).is_some() {
@@ -931,10 +875,9 @@ impl App {
         self.search_enter_impl_in(wid, true, true);
     }
 
-    /// Enter (or refresh) terminal find in an explicit direction, seeding a fresh
-    /// find from the app-sticky match-case / regex toggles. The origin viewport is
-    /// captured before any recompute moves it, so a cancel (⎋/^G) returns the user
-    /// to the content they were reading (see [`Self::search_cancel`]).
+    /// Enter (or refresh) terminal find in an explicit direction; a fresh find takes
+    /// the app-sticky case/regex toggles. The origin viewport is captured before any
+    /// recompute moves it, so ⎋/^G can return to it ([`Self::search_cancel_in`]).
     pub(crate) fn search_enter_direction(&mut self, forward: bool) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -986,8 +929,7 @@ impl App {
             };
             (
                 FindOrigin {
-                    // The same quantity as `top` above, read from the accessor that
-                    // owns the definition rather than re-derived from two reads.
+                    // `top` above, from the accessor that owns the definition.
                     top_visible_absolute_row: terminal.grid().top_visible_absolute_row(),
                     was_live: display_offset == 0,
                     on_alt_screen: terminal.is_alternate_screen(),
@@ -1000,18 +942,10 @@ impl App {
         let (find_origin, anchor_absolute_row, anchor_col) = origin;
         let already_open = self.windows.get(&wid).is_some_and(|ws| ws.search.is_some());
         if !already_open {
-            // A ⌘S/⌘R that only flips the direction of an open find must not move
-            // the origin to wherever find navigation put the viewport, hence the
-            // gate.
-            //
-            // `or_insert`, not `insert`: a tab switch tears the bar down through
-            // the neutral close, which parks this entry rather than restoring (it
-            // runs on the winit thread without the engine mutex, so it cannot
-            // scroll). Reopening find on that terminal and pressing ⎋ still lands
-            // on what the user was reading before the interrupted find. Both user
-            // exits (⎋ and ⏎) remove the entry, so every open after a modelled
-            // exit captures afresh, as `EmacsSearchNavigation`'s unconditional
-            // `origin = viewport` says; a tab switch is outside that model.
+            // Only a fresh open captures the origin: a ⌘S/⌘R that flips an open find's
+            // direction must not move it. `or_insert`, because a tab switch's neutral
+            // close parks this entry (it cannot scroll without the engine mutex), so a
+            // reopen and ⎋ still return to what the user was reading. ⎋ and ⏎ remove it.
             self.find_origins
                 .entry((session, wid))
                 .or_insert(find_origin);
@@ -1106,18 +1040,11 @@ impl App {
         self.search_recompute_in(wid);
     }
 
-    /// Re-run window `wid`'s find over the live screen and scrollback history,
-    /// then show the first directional match at the Emacs search point.
-    ///
-    /// Delegates to [`crate::control::search_full_history`] (the off-lock,
-    /// chunked, cached trigram index shared with the socket `search` verb): a
-    /// keystroke over unchanged content reuses the index, ordinary output
-    /// refreshes the prior visible rows plus appended rows, and coordinate
-    /// revisions rebuild only the retained suffix. [`map_matches`] converts the
-    /// engine's absolute rows to selection coordinates against `base_y`, stashed
-    /// as [`SearchState::match_base_y`] so apply and highlight can re-anchor if
-    /// output scrolls the grid first. `incomplete` becomes
-    /// [`SearchState::truncated`]; an invalid regex sets `regex_error`.
+    /// Re-run window `wid`'s find over the screen and scrollback, then show the first
+    /// match in its direction from the search point. The search shares
+    /// [`crate::control::search_full_history`]'s cached index; matches are mapped
+    /// against `base_y`, kept as [`SearchState::match_base_y`] so apply and highlight
+    /// can re-anchor if output scrolls the grid first.
     pub(crate) fn search_recompute_in(&mut self, wid: crate::WindowId) {
         self.search_recompute_from_anchor_in(wid, false);
     }
@@ -1136,13 +1063,11 @@ impl App {
         else {
             return;
         };
-        // THE SEARCH'S HONESTY (design rulings 234, 237): while a width
-        // change's rewrap holds this session's history detached, the search
-        // reaches only the screen — so its count is a floor (`truncated`, the
-        // `+`), and nothing found is `none yet, history rewrapping`
-        // (`history_away`), never `no matches` at any width.
-        // The person searching is waiting on the rewrap, so its row is
-        // wanted; when it re-attaches, the search runs again by itself.
+        // While a width change's rewrap holds this session's history detached, the
+        // search reaches only the screen: the count is a floor (`truncated`) and
+        // nothing found is `none yet, history rewrapping`, never `no matches`. The
+        // searcher is waiting on the rewrap, so the history is wanted; the
+        // re-attach reruns the search.
         let rewrapping = self.rewrap_in_flight(session);
         if rewrapping
             && self
@@ -1180,8 +1105,8 @@ impl App {
                 ),
                 None => return,
             };
-        // (matches, regex_error, the floor's facts, base_y): an empty query is the neutral "bar
-        // open, nothing typed" state (no error, no truncation readout).
+        // An empty query is the neutral "bar open, nothing typed" state: no error, no
+        // truncation readout.
         let (
             matches,
             point_match,
@@ -1197,12 +1122,10 @@ impl App {
             cols,
             consistent,
         ) = if query.is_empty() {
-            // The guard lives in its own fn DELIBERATELY (OB-7): the lock
-            // census is lexical and branch-blind, so a `term_lock` here read
-            // as "held" across the else-arm's `search_full_history_direction`
-            // — which takes the same lock class. The arms are exclusive, but a
-            // tripwire that cannot see exclusivity is satisfied by a guard
-            // whose scope is a function — which is also simply clearer.
+            // The guard lives in its own fn on purpose: the lock census is lexical
+            // and branch-blind, so a `term_lock` in this arm would read as held
+            // across the else-arm's `search_full_history_direction`, which takes the
+            // same lock class.
             let (base_y, row_rev, epoch, seq, cols) = empty_query_term_snapshot(&term);
             (
                 Vec::new(),
@@ -1261,10 +1184,9 @@ impl App {
                     search.cols,
                     search.consistent,
                 ),
-                // The only error is a pattern the engine will not compile (literal
-                // search never errors, and a regex line its scan cannot finish is
-                // `cut_short_lines` in an `Ok`) → no hits, and the bar flags "bad
-                // regex" instead of a misleading "no matches".
+                // The only error is a pattern the engine will not compile (a literal
+                // never errors; an unfinished regex line is `cut_short_lines` in an
+                // `Ok`): the bar says "bad regex", not "no matches".
                 Err(_) => {
                     let terminal = term_lock(&term);
                     (
@@ -1290,13 +1212,10 @@ impl App {
         if !consistent {
             if let Some(search) = ws.search.as_mut() {
                 search.results_dirty = true;
-                // The kept result is stale, but whether the history is away is a
-                // fact about NOW (ruling 240): the re-attach's own rerun can come
-                // back torn under streaming output, and nothing runs it again by
-                // itself, so a `history_away` left from the rewrap would keep
-                // saying `rewrapping` with nothing running. The floor stays a
-                // floor (`truncated` is only ever raised here), and the stale
-                // mark returns with the plain ladder.
+                // The kept result is stale, but `history_away` is a fact about now:
+                // the re-attach's own rerun can come back torn under streaming
+                // output and nothing reruns it, so a leftover flag would keep saying
+                // `rewrapping`. `truncated` is only ever raised here.
                 let away = rewrapping && !query.is_empty();
                 search.history_away = away;
                 search.truncated |= away;
@@ -1329,14 +1248,10 @@ impl App {
         self.search_apply_current_in(wid);
     }
 
-    /// Invalidate an open search when the focused terminal emits output.
-    ///
-    /// A protected-footer splice changes absolute coordinates piecewise and a
-    /// width reflow renumbers retained history wholesale; all mutations mark the
-    /// result batch dirty and clear its selection. The next search edit/repeat
-    /// rebuilds once from the latest generation, avoiding one
-    /// expensive scan per output chunk while guaranteeing stale coordinates are
-    /// never navigated.
+    /// Invalidate an open find when the focused terminal emits output: any change
+    /// marks the batch dirty and clears a highlight the output could have moved. The
+    /// next edit or repeat rebuilds once from the latest generation, so a flood costs
+    /// no scan per chunk and stale coordinates are never navigated.
     pub(crate) fn search_refresh_for_output(&mut self, session: u64) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -1361,15 +1276,10 @@ impl App {
         if terminal.session != session {
             return;
         }
-        // TRY-lock, never block. This runs from the `Wake::Output` handler, i.e. once
-        // per PTY reader BATCH — at flood rate, on the UI thread. A blocking acquire
-        // here parks the main thread behind the reader's whole-batch `process()` hold
-        // for every burst, on the very mutex the keystroke echo's present also needs;
-        // with a find bar open during a flood that is unbounded main-thread starvation.
-        // Skipping one refresh is invisible (a stale search invalidation is corrected
-        // by the next burst, and `match_content_seq` still catches the drift); a
-        // blocked event loop is not. Mirrors the try_lock discipline the title
-        // observer already uses on this same path.
+        // Try-lock, never block: this runs per PTY reader batch on the UI thread, and
+        // a blocking acquire would park it behind the reader's whole-batch `process()`
+        // hold for every burst of a flood. A skipped refresh is corrected by the next
+        // batch, and `match_content_seq` still catches the drift.
         let Ok(term) = terminal.term.try_lock() else {
             return;
         };
@@ -1382,9 +1292,8 @@ impl App {
         }
     }
 
-    /// Highlight the current match via the text selection (the existing overlay —
-    /// no renderer change), scroll it into view, and show the find state in the
-    /// window title.
+    /// Highlight the current match through the text selection, scroll it into view,
+    /// and show the find state in the window title.
     fn search_apply_current_in(&mut self, wid: crate::WindowId) {
         let Some(ws) = self.windows.get(&wid) else {
             return;
@@ -1413,36 +1322,26 @@ impl App {
                 || term.grid().history_renumber_epoch() != match_epoch
                 || term.content_seq() != match_seq
             {
-                // A protected-footer insertion is piecewise and a width reflow
-                // renumbers retained history wholesale: applying this stale
-                // match with a uniform base_y delta could select unrelated text;
-                // ordinary edits can invalidate the columns. Fail closed until
-                // the output wake/next navigation refreshes the batch. The REFUSAL is
-                // unconditional — nothing below may be recomputed from `mat` — but the
-                // highlight already on glass is only destroyed when the output could
-                // have reached it.
-                // PRESS CUSTODY: the refusal path can DESTROY a live highlight, so
-                // it records a `UserClear` when it does. `clear_selection_if_content_is_mutable`
-                // reports whether it cleared, because "nothing was selected" and "the
-                // find bar took your selection" are different answers to the verb.
+                // A footer splice is piecewise and a reflow renumbers wholesale, so a
+                // uniform base_y delta could select unrelated text, and ordinary edits
+                // can move the columns: refuse until the output wake or the next
+                // navigation refreshes the batch. The highlight on glass is destroyed
+                // only when output could have reached it, and then (press custody) a
+                // `UserClear` is recorded.
                 if clear_selection_if_content_is_mutable(&mut term) {
                     note_selection_custody(&mut term, false);
                 }
                 return;
             }
-            // Re-anchor the stored (frame-relative) selection row to THIS frame: if output
-            // scrolled the grid since the search, base_y advanced by `delta`, so the match's
-            // current row is `stored_row − delta`. Read base_y under this same lock so the
-            // selection + scroll always land on the right line, even mid-stream.
+            // Re-anchor the frame-relative row to this frame: output that scrolled
+            // the grid since the search advanced base_y by `delta`. base_y is read
+            // under this lock so the selection and scroll land on the right line.
             let base_y = i64::try_from(term.grid().base_y()).unwrap_or(0);
             let delta = base_y - match_base_y;
             let row = mat.and_then(|(r, _, _)| i32::try_from(i64::from(r) - delta).ok());
-            // A hit that straddles a soft wrap ends on a LATER row, and its stored
-            // end column counts straight through the boundary. Divide by the grid
-            // width to land the selection's far anchor on the row and column the
-            // text actually finishes on: a Simple selection already spans rows, so
-            // the tail gets highlighted by the same overlay, on the right cells —
-            // ending it at `(row, end)` would paint a whole row of unrelated text.
+            // A hit straddling a soft wrap ends on a later row and its stored end
+            // column counts through the boundary: divide by the width to put the far
+            // anchor where the text ends (a Simple selection spans the rows).
             let cols = usize::from(term.grid().cols()).max(1);
             let end = mat.and_then(|(_, _, c1)| {
                 let row = row?;
@@ -1463,35 +1362,20 @@ impl App {
                 } else {
                     false
                 };
-                // PRESS CUSTODY: a search jump reaches the `TextSelection` primitive
-                // directly, with no mouse gesture around it, so the projected
-                // `selection` moved 0 -> 1 (a hit) or 1 -> 0 (an empty query over a
-                // previous hit) with nothing recorded. Same guard as the mutation.
+                // Press custody: a search jump arms or clears the selection with no
+                // gesture around it, so record the transition.
                 if armed {
                     note_selection_custody(&mut term, true);
                 } else if had {
                     note_selection_custody(&mut term, false);
                 }
             }
-            // MOVE THE CONTENT, NOT THE CHROME. The panel rides the TOP rows
-            // (`splice_find_bar`), so any match landing under it would be hidden; the
-            // splice's fallback is to float the whole panel to the bottom, which makes
-            // the search UI jump across the window as you step through hits. Scrolling
-            // the VIEWPORT so the match clears the band keeps the panel still — the
-            // behaviour every native find bar has — and leaves the float for the one
-            // case scrolling cannot fix: no history left above the match, where
-            // the scroll clamps and the splice floats instead. Applies to
-            // scrollback matches (row < 0) and live ones alike; a terminal shorter than
-            // the panel keeps whatever clearance it has.
-            //
-            // Stated ABSOLUTELY rather than as "snap to the bottom, then scroll back
-            // `clearance − row`". The two are offset-identical when there IS a row —
-            // `live_top + row − clearance` is exactly the line the relative form lands
-            // on, and a match already clear of the panel saturates to the live bottom
-            // just as the snap did. They differ where the old form was gratuitous: with
-            // no row at all (an empty query, zero hits, a malformed regex) the viewport
-            // no longer moves, so opening ⌘F on a scrolled-back view stops yanking the
-            // user to the tail before they have typed anything.
+            // Move the content, not the chrome: the panel rides the top rows
+            // (`splice_find_bar`), so scroll the viewport until the match clears the
+            // band and the panel stays still. Only with no history above the match
+            // does the scroll clamp and the splice float the panel to the bottom. An
+            // absolute target, so with no match (empty query, zero hits, bad regex)
+            // the viewport does not move.
             if let Some(row) = row {
                 let clearance = i32::try_from(crate::find_bar::FIND_BAR_ROWS)
                     .unwrap_or(1)
@@ -1625,16 +1509,12 @@ impl App {
         self.search_apply_current_in(wid);
     }
 
-    /// Standard Edit ▸ Find Next/Previous (Cmd-G / Shift-Cmd-G). While the bar
-    /// is open this is an ordinary step. After Enter accepted and closed it,
-    /// reopen the last accepted query and resume strictly after/before its
-    /// absolute match anchor, wrapping when content changed or an edge is hit.
+    /// Edit ▸ Find Next/Previous (⌘G/⇧⌘G). With the bar open, an ordinary step; after
+    /// ⏎ closed it, reopen the last accepted query and resume strictly after/before
+    /// its match anchor, wrapping when the content changed or at an edge.
     ///
-    /// Returns the REASON it declined when there is nothing to step — no open
-    /// bar and no remembered query — rather than succeeding silently: the menu
-    /// seam reports that refusal instead of answering OK for a search that never
-    /// ran. Key-path callers, for which a refusal has nowhere to go, discard it
-    /// explicitly.
+    /// Returns why it declined when there is nothing to step (no bar, no remembered
+    /// query) so the menu seam reports it; key-path callers discard it.
     pub(crate) fn search_find_again(&mut self, forward: bool) -> Result<(), &'static str> {
         if self.front().is_some_and(|ws| ws.search.is_some()) {
             self.search_step(forward);
@@ -1645,10 +1525,9 @@ impl App {
         }
 
         let query = self.search_last_query.clone();
-        // BOTH row-identity stamps, not just the footer revision: a width reflow
-        // renumbers retained history wholesale and leaves `absolute_row_revision`
-        // exactly where it was, so an anchor gated on that alone resumes Cmd-G
-        // from a line that no longer carries that number.
+        // Both row-identity stamps: a width reflow renumbers history without moving
+        // `absolute_row_revision`, so the revision alone would resume ⌘G from a
+        // renumbered line.
         let session_identity = self
             .frontmost_window
             .and_then(|wid| self.front_terminal(wid))
@@ -1678,12 +1557,10 @@ impl App {
         Ok(())
     }
 
-    /// `^S`/`^R` in find mode (emacs isearch-repeat): step to the next (`forward`) /
-    /// previous match — except on an EMPTY query, where the chord RECALLS the last
-    /// ACCEPTED query ([`crate::App`]'s `search_last_query`) instead: the emacs
-    /// `C-s C-s` "search for the same thing again" idiom. A forward recall lands on
-    /// the FIRST match, a backward one on the LAST (searching up from the bottom).
-    /// Empty query + nothing to recall is a no-op (as is stepping with no matches).
+    /// `^S`/`^R` in find mode (isearch-repeat): step to the next/previous match, or
+    /// on an empty query recall the last accepted one (`search_last_query`, emacs
+    /// `C-s C-s`); forward lands on the first match, backward on the last. A no-op
+    /// with nothing to recall or no matches.
     #[cfg(test)]
     pub(crate) fn search_repeat(&mut self, forward: bool) {
         let Some(wid) = self.frontmost_window else {
@@ -1707,9 +1584,8 @@ impl App {
             let recalled = self.search_last_query.clone();
             if let Some(s) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
                 s.set_query(recalled);
-                // Empty-query recall has explicit whole-buffer semantics: the
-                // first forward hit or last backward hit, independent of the
-                // entry point captured for a still-empty find bar.
+                // Recall searches the whole buffer: the first forward hit or the
+                // last backward one, whatever point the empty bar captured.
                 if forward {
                     s.anchor_absolute_row = i64::MIN;
                     s.anchor_col = 0;
@@ -1718,17 +1594,15 @@ impl App {
                     s.anchor_col = u16::MAX;
                 }
             }
-            // Direction-aware recompute selects FIRST for forward, LAST for backward.
             self.search_recompute_in(wid);
             return;
         }
         self.search_step_in(wid, forward);
     }
 
-    /// Apply one text-field [`SearchEdit`] to window `wid`'s find query. A TEXT change
-    /// re-runs the search (incremental find); a pure caret move only repaints — the
-    /// caret is painted state (it is folded into [`SearchState::fingerprint`]), so a
-    /// bare ^A/^E must still reach glass without paying for a full recompute.
+    /// Apply one [`SearchEdit`] to window `wid`'s find query: a text change re-runs
+    /// the search; a caret move only repaints (the caret is part of
+    /// [`SearchState::fingerprint`]).
     pub(crate) fn search_edit_in(&mut self, wid: crate::WindowId, edit: SearchEdit) {
         let Some(changed) = self
             .windows
@@ -1745,18 +1619,17 @@ impl App {
         }
     }
 
-    /// ⌘V in the find field: insert the system clipboard at the caret (control bytes
-    /// and line breaks are stripped by [`SearchState::edit`] — a find query is one
-    /// line). This is the field's paste, NOT the terminal's: nothing reaches the PTY.
+    /// ⌘V in the find field: insert the clipboard at the caret ([`SearchState::edit`]
+    /// strips control bytes and line breaks). The field's paste, not the terminal's:
+    /// nothing reaches the PTY.
     pub(crate) fn search_paste_in(&mut self, wid: crate::WindowId) {
         if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
             return;
         }
-        // macOS/Windows read the clipboard in-process and instantly, so deliver on the
-        // UI thread. Linux/X11 mirrors `paste_clipboard`'s discipline: the OWN-selection
-        // read is instant, but a FOREIGN owner needs a `ConvertSelection` round-trip that
-        // can park the event loop for ~1 s — that goes to the worker, which posts
-        // `Wake::FindPasteReady` back here.
+        // macOS/Windows read the clipboard in-process, so paste on the UI thread. On
+        // Linux/X11 an own-selection read is instant, but a foreign owner needs a
+        // `ConvertSelection` round-trip that can park the event loop ~1 s, so a
+        // worker reads it and posts `Wake::FindPasteReady`.
         #[cfg(not(target_os = "linux"))]
         {
             if let Some(text) = crate::control::pbpaste() {
@@ -1782,11 +1655,9 @@ impl App {
         }
     }
 
-    /// A click at cell `col` inside the find field's WELL: put the caret on the
-    /// character under the pointer (the last one when the click lands past the text),
-    /// exactly like a native single-line field. `scroll` is the well's horizontal
-    /// offset and `offset` the click's cell distance into it, both recorded by the
-    /// paint ([`crate::FindBarHit`]), so this never re-derives the layout.
+    /// A click inside the find field's well: put the caret before character `slot`
+    /// (the well's scroll plus the click's cell distance into it, both recorded by
+    /// the paint in [`crate::FindBarHit`]), or at the end past the text.
     pub(crate) fn search_click_caret_in(&mut self, wid: crate::WindowId, slot: usize) {
         let Some(byte) = self
             .windows
@@ -1805,13 +1676,10 @@ impl App {
         self.search_edit_in(wid, SearchEdit::MoveTo(byte));
     }
 
-    /// Leave find mode via ⏎ ACCEPT (emacs `RET`): the viewport STAYS wherever the find
-    /// navigation left it and the current match KEEPS its selection highlight (ready for
-    /// ⌘C), so find doubles as fast navigation through a big scrollback. The accepted
-    /// query is remembered app-sticky for `^S`/`^R` empty-query recall next find.
-    /// Frontmost-window convenience wrapper. Every PRODUCTION caller is the
-    /// window-targeted `search_accept_in` form (a keystroke stays bound to the window it was
-    /// routed to), so this survives for the headless tests that drive one window.
+    /// Leave find via ⏎ (emacs `RET`): the viewport stays where navigation left it and
+    /// the current match keeps its highlight (ready for ⌘C); the query is remembered
+    /// for `^S`/`^R` recall. Frontmost-window form for the headless tests; production
+    /// calls [`Self::search_accept_in`].
     #[cfg(test)]
     pub(crate) fn search_accept(&mut self) {
         let Some(wid) = self.frontmost_window else {
@@ -1820,10 +1688,9 @@ impl App {
         self.search_accept_in(wid);
     }
 
-    /// Window-targeted ⏎ ACCEPT. A keystroke stays bound to the window it was routed to
-    /// for the whole press episode (see `terminal_emacs_search_pressed`), so the exits
-    /// must act on THAT window — re-resolving the frontmost one here would let ⏎ in a
-    /// background window close the front window's find.
+    /// Window-targeted ⏎. A press episode stays bound to the window it was routed to
+    /// (`terminal_emacs_search_pressed`), so the exit acts on that window; resolving
+    /// the frontmost here would let ⏎ in a background window close the front's find.
     pub(crate) fn search_accept_in(&mut self, wid: crate::WindowId) {
         if let Some((revision_stale, content_stale)) = self.search_stamp_mismatch(wid)
             && (revision_stale || content_stale)
@@ -1878,22 +1745,17 @@ impl App {
                 .zip(*anchor)
                 .map(|(session, (row, start, end))| (session, *revision, *epoch, row, start, end));
         }
-        // ⏎ is a user EXIT: the origin has served its purpose and must not outlive it,
-        // or the next ⌘F would silently inherit this find's origin instead of the
-        // viewport the user opens it from.
+        // ⏎ is a user exit: drop the origin so the next ⌘F captures its own.
         if let Some(session) = session {
             self.find_origins.remove(&(session, wid));
         }
         self.search_close_in(wid, false);
     }
 
-    /// Leave find mode via ⎋/^G CANCEL (emacs `C-g`): clear the highlight and RESTORE
-    /// the viewport captured at [`Self::search_enter`] — by the ABSOLUTE anchor parked
-    /// in [`FindOrigin`], so however much output streamed past mid-find the user lands
-    /// back on the same LINE rather than the same distance from a moved bottom.
-    /// Frontmost-window convenience wrapper. Every PRODUCTION caller is the
-    /// window-targeted `search_cancel_in` form (a keystroke stays bound to the window it was
-    /// routed to), so this survives for the headless tests that drive one window.
+    /// Leave find via ⎋/^G (emacs `C-g`): clear the highlight and restore the viewport
+    /// captured at open by its absolute anchor ([`FindOrigin`]), so the user lands on
+    /// the same line however much output streamed past. Frontmost-window form for the
+    /// headless tests; production calls [`Self::search_cancel_in`].
     #[cfg(test)]
     pub(crate) fn search_cancel(&mut self) {
         let Some(wid) = self.frontmost_window else {
@@ -1902,8 +1764,8 @@ impl App {
         self.search_cancel_in(wid);
     }
 
-    /// Window-targeted ⎋/^G CANCEL — the twin of [`Self::search_accept_in`], for the
-    /// same press-episode-stays-on-its-window reason.
+    /// Window-targeted ⎋/^G, bound to its press episode's window like
+    /// [`Self::search_accept_in`].
     pub(crate) fn search_cancel_in(&mut self, wid: crate::WindowId) {
         if let Some((term, session)) = self
             .front_terminal(wid)
@@ -1913,10 +1775,9 @@ impl App {
             // stale entry would be inherited by the next ⌘F on this terminal.
             if let Some(origin) = self.find_origins.remove(&(session, wid)) {
                 let mut terminal = term_lock(&term);
-                // The absolute space the anchor was written in has to still exist.
-                // Neither of these can be repaired by any amount of arithmetic — the
-                // rows the anchor names are either renumbered wholesale or belong to a
-                // different buffer — so refuse and leave the viewport alone.
+                // The anchor's absolute space must still exist: rows renumbered
+                // wholesale or another buffer cannot be repaired, so the viewport is
+                // left alone.
                 let coherent = origin.on_alt_screen == terminal.is_alternate_screen()
                     && origin.history_renumber_epoch == terminal.grid().history_renumber_epoch();
                 if coherent {
@@ -1931,10 +1792,9 @@ impl App {
         self.search_close_in(wid, true);
     }
 
-    /// Leave find mode NEUTRALLY on the frontmost window: clear the highlight +
-    /// restore the title, leaving the viewport wherever it is. The user-facing exits
-    /// are [`Self::search_accept`] (⏎) and [`Self::search_cancel`] (⎋/^G); this is
-    /// the tests' neutral exit.
+    /// Leave find neutrally on the frontmost window: clear the highlight and restore
+    /// the title, leaving the viewport. The user exits are [`Self::search_accept_in`]
+    /// (⏎) and [`Self::search_cancel_in`] (⎋/^G).
     #[cfg(test)]
     pub(crate) fn search_exit(&mut self) {
         self.search_close(true);
@@ -1955,26 +1815,20 @@ impl App {
     /// armed close warning stays untouched; otherwise the canonical window-title
     /// cache is restored.
     ///
-    /// `pub(crate)` for `sync_window`: a tab/pane switch tears the find bar down and
-    /// must go through THIS seam rather than nulling `ws.search` itself, or the title
-    /// stays stuck under Search authority showing a find that is no longer on screen.
-    /// It deliberately does NOT drop the parked [`FindOrigin`] — the switch is not a
-    /// user exit (see `search_enter_impl_in`'s `or_insert`).
+    /// `pub(crate)` for `sync_window`: a tab/pane switch closes through here, not by
+    /// nulling `ws.search`, or the title stays under Search authority. It keeps the
+    /// parked [`FindOrigin`], since a switch is not a user exit.
     pub(crate) fn search_close_in(&mut self, wid: crate::WindowId, clear_selection: bool) {
-        // Why: a native front has no terminal, but parked host search state must still be
-        // dropped — bailing on the missing terminal left a stale find bar armed.
+        // A native front has no terminal, but its parked find state is still dropped.
         let term = self
             .front_terminal(wid)
             .map(|terminal| terminal.term.clone());
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        // Nothing find-owned was on screen, so nothing find-owned needs taking back.
-        // `sync_window` runs this on every focus publish — a pane-focus click, an
-        // accessibility focus change, a window attach, a settings sync — and an
-        // unguarded title restore there would push a `set_title` + `request_redraw`
-        // through ~40 seams that never opened find, where it is invisible to the
-        // headless tests and merely wasteful in production.
+        // Only take back what find put on screen: `sync_window` runs this on every
+        // focus publish, and an unguarded title restore would set the title and
+        // redraw for each one that never opened find.
         let was_open = ws.search.is_some() || ws.find_bar_hit.is_some();
         ws.search = None;
         ws.find_bar_hit = None; // drop the clickable-indicator geometry with the overlay
@@ -1991,20 +1845,12 @@ impl App {
     }
 
     /// Run one [`FindAction`] against the front window's find bar and report the
-    /// state it left behind. `None` when there is no front window at all.
-    ///
-    /// EVERY arm is a call to the function the KEYSTROKE calls, and that is the
-    /// whole design: `Open` is `find_requested` (Edit ▸ Find… / ⌘F itself), `Type`
-    /// and `Edit` are `search_edit_in` (what `on_key_search_mode`'s field
-    /// classifier and the IME commit both reach), `Step` is `search_step_in`
-    /// (⌘S/⌘R), the toggles are `search_toggle_*_in` (⌥⌘C/⌥⌘R), `Accept`/`Cancel`
-    /// are `search_accept_in`/`search_cancel_in` (⏎/⎋). There is no second
-    /// implementation of find here to drift from the one on the glass.
-    ///
-    /// It also cannot become a way to type at the SHELL. Every editing arm bottoms
-    /// out in a `ws.search.as_mut()` that is `None` when no find bar is up, so a
-    /// `find type` against a closed bar changes nothing and says `open=0` — the
-    /// PTY is not on any path out of this function.
+    /// state it left; `None` with no front window. Every arm calls the function its
+    /// keystroke calls (`find_requested`, `search_edit_in`, `search_step_in`,
+    /// `search_toggle_*_in`, `search_accept_in`/`search_cancel_in`), so there is no
+    /// second find to drift. No path reaches the PTY: every editing arm ends in a
+    /// `ws.search.as_mut()` that is `None` with no bar up, so `find type` on a closed
+    /// bar changes nothing and says `open=0`.
     pub(crate) fn find_cmd(&mut self, action: FindAction) -> Option<FindStatus> {
         let wid = self.frontmost_window?;
         match action {
@@ -2021,10 +1867,8 @@ impl App {
         Some(self.find_status_in(wid))
     }
 
-    /// Window `wid`'s find bar as the `find` verb reports it. Read from the ONE
-    /// [`SearchState`] the bar paints itself from, so the wire and the glass cannot
-    /// disagree about the match count or which match is current — `current`/`matches`
-    /// are the pair [`SearchState::window_title`] puts in the title bar.
+    /// Window `wid`'s find bar as the `find` verb reports it, read from the
+    /// [`SearchState`] the bar paints, so the wire and the glass agree.
     fn find_status_in(&self, wid: crate::WindowId) -> FindStatus {
         let Some(search) = self.windows.get(&wid).and_then(|ws| ws.search.as_ref()) else {
             return FindStatus::CLOSED;
@@ -2046,10 +1890,9 @@ impl App {
     }
 }
 
-/// One step the `find` verb drives the find bar through. Each variant names the
-/// keystroke it IS, and [`App::find_cmd`] resolves it to that keystroke's own
-/// function — the enum exists so the grammar (parsed on the control thread) and
-/// the effect (applied on the main thread) can travel through a `Wake`.
+/// One step the `find` verb drives the find bar through; [`App::find_cmd`] runs the
+/// function its keystroke runs. An enum so the grammar, parsed on the control
+/// thread, reaches the main thread through a `Wake`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FindAction {
     /// Edit ▸ Find… (⌘F).
@@ -2060,9 +1903,9 @@ pub(crate) enum FindAction {
     Edit(SearchEdit),
     /// ⌘S / ⌘R: step to the next/previous match, wrapping.
     Step { forward: bool },
-    /// ⌥⌘C: match-case. A TOGGLE, because the keystroke is one.
+    /// ⌥⌘C: toggle match-case, as the keystroke does.
     ToggleCase,
-    /// ⌥⌘R: regex. A TOGGLE, because the keystroke is one.
+    /// ⌥⌘R: toggle regex, as the keystroke does.
     ToggleRegex,
     /// ⏎: leave find mode, staying on the current match.
     Accept,
@@ -2072,11 +1915,8 @@ pub(crate) enum FindAction {
     Status,
 }
 
-/// What the `find` verb answers with: the find bar's state after the action ran.
-///
-/// Every field that can be absent is an `Option`, so the wire formatter has no way
-/// to spell a match position that does not exist — the reply's `-` for those comes
-/// from `None` and from nowhere else.
+/// What the `find` verb answers with: the find bar's state after the action. Absent
+/// values are `None`, the only source of the reply's `-`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FindStatus {
     pub(crate) open: bool,
@@ -2085,35 +1925,20 @@ pub(crate) struct FindStatus {
     pub(crate) is_regex: bool,
     pub(crate) regex_error: bool,
     pub(crate) matches: usize,
-    /// 0-based index of the current match within `matches`; `None` when the batch
-    /// is empty and no match is current.
-    ///
-    /// This is the counter the find bar PAINTS (`SearchState::window_title`'s
-    /// `i/n`), which is why the wire and the glass always agree. When `truncated`
-    /// is set the batch is capped, so the pair counts within the cap and
-    /// `current_match` may be an exact point-relative hit from outside it — read
-    /// `truncated` before treating `current`/`matches` as a whole-history census.
+    /// 0-based index of the current match within `matches`; `None` with an empty
+    /// batch. The counter the bar paints (`i/n` in the title). With `truncated` the
+    /// pair counts within the capped batch, and `current_match` may be a point hit
+    /// from outside it.
     pub(crate) current: Option<usize>,
     pub(crate) truncated: bool,
-    /// The terminal changed since `matches` was counted, so the pair above is a
-    /// PAST census, not the present one ([`SearchState::results_dirty`]).
-    ///
-    /// Output does not re-run the search — that would be one full scan per PTY
-    /// batch on the UI thread — so between the output and the next edit or step
-    /// the count is simply older than the screen. It can be wrong in either
-    /// direction (new output adds hits; a repaint or a `clear` removes them), so
-    /// it is NOT the `truncated` "at least this many" floor and gets its own
-    /// field. The find bar paints the same qualifier, which is what keeps the
-    /// wire and the glass agreeing.
+    /// The terminal changed since `matches` was counted ([`SearchState::results_dirty`]).
+    /// Output does not re-run the search (a full scan per PTY batch on the UI thread),
+    /// so the count is older than the screen and can be off in either direction: not
+    /// the `truncated` floor, hence its own field. The bar paints the same qualifier.
     pub(crate) stale: bool,
-    /// `(row, col, len)` in SELECTION coordinates — 0..rows is the live
-    /// screen, a negative row is scrollback above it. NOT `search`'s rows:
-    /// `search` emits absolute usize rows from the oldest retained line
-    /// (`SearchMatch.line`), and `map_matches` below subtracts `base_y` to get
-    /// these. The find catalog entry said "`search` coordinates" for a full
-    /// audit cycle, teaching scripts to feed a find row to `line`, which
-    /// parses u64 and refuses the negative rows outright — and silently reads
-    /// the wrong line for the non-negative ones.
+    /// `(row, start_col, end_col)`, `end_col` inclusive, in selection coordinates
+    /// (0..rows the live screen, negative scrollback): not `search`'s absolute rows,
+    /// so not a `line` argument. The wire reports it as `row col len`.
     pub(crate) current_match: Option<(i32, u16, u32)>,
 }
 
@@ -2134,10 +1959,9 @@ impl FindStatus {
     };
 }
 
-/// The empty-query snapshot of `search_recompute_from_anchor_in`: base row,
-/// row revision, history renumber epoch, content sequence, grid width — taken
-/// and released under one short guard. A FREE fn so the OB-7 lock census sees
-/// the guard end here (see the call site's comment).
+/// The empty-query snapshot for `search_recompute_from_anchor_in` (base row, row
+/// revision, renumber epoch, content seq, width) under one short guard, in a free
+/// fn so the lock census sees the guard end (see the call site).
 fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u64, u64, usize) {
     let terminal = term_lock(term);
     (
@@ -2157,9 +1981,8 @@ mod tests {
     };
     use crate::{App, WindowId, term_lock};
 
-    /// An App whose session capability writes to an observer pipe, so a test can
-    /// assert that a control verb put NOTHING on the PTY (the shape
-    /// `app_input`'s `app_observing_pty` uses, for the same reason).
+    /// An App whose session writes to an observer pipe, so a test can assert that a
+    /// control verb put nothing on the PTY.
     #[cfg(unix)]
     fn app_observing_pty() -> (App, [i32; 2]) {
         use std::sync::Arc;
@@ -2190,14 +2013,9 @@ mod tests {
         bytes[..read as usize].to_vec()
     }
 
-    /// THE fence the `find` verb stands on, and the reason it can be `Read`: a find
-    /// query is typed into aterm's own overlay, and not one byte of it reaches the
-    /// driven program — whether the bar is open or not.
-    ///
-    /// Both halves matter. With the bar CLOSED every editing arm is a no-op (it
-    /// bottoms out in a `ws.search.as_mut()` that is `None`), so `find type` cannot
-    /// become a back door onto the shell for an edge holding only read authority.
-    /// With the bar OPEN the text lands in the QUERY and still not on the PTY.
+    /// The `find` verb never puts a byte on the PTY: with the bar closed every editing
+    /// arm is a no-op, so `find type` is no back door to the shell for a read-only
+    /// edge; with it open the text lands in the query.
     #[cfg(unix)]
     #[test]
     fn typing_into_the_find_bar_never_reaches_the_pty() {
@@ -2238,9 +2056,8 @@ mod tests {
         );
     }
 
-    /// The verb drives the SAME field editor the keystrokes do, so a caret motion
-    /// and a kill behave in the query exactly as ⌃A/⌃K do on the glass — and the
-    /// reported query is the one the bar holds.
+    /// The verb runs the field editor the keystrokes run, and reports the query the
+    /// bar holds.
     #[test]
     fn find_key_edits_run_the_field_editor_the_keystrokes_run() {
         let mut app = App::headless_for_test();
@@ -2269,9 +2086,8 @@ mod tests {
         );
     }
 
-    /// `case`/`regex` are TOGGLES because the keystrokes they stand for are, and
-    /// the reply is how a driver learns which way the flag went. `accept` and
-    /// `cancel` both close the bar, so the reply falls back to `open=0`.
+    /// `case`/`regex` toggle, as their keystrokes do, and the reply says which way the
+    /// flag went; `accept`/`cancel` close the bar, so the reply is `open=0`.
     #[test]
     fn the_find_toggles_report_the_flag_they_left_behind() {
         let mut app = App::headless_for_test();
@@ -2291,9 +2107,8 @@ mod tests {
         );
     }
 
-    /// A `SearchState` pre-seeded with three matches (scrollback row -1, live rows
-    /// 0/1) so the find-state machine (`step`, `current_match`) can be driven
-    /// headlessly — no window, no renderer.
+    /// A `SearchState` seeded with three matches (scrollback row -1, live rows 0/1),
+    /// for driving `step`/`current_match` headlessly.
     fn seeded() -> SearchState {
         SearchState {
             query: "foo".to_string(),
@@ -2406,10 +2221,8 @@ mod tests {
             .set_query(query.into());
     }
 
-    /// Occurrences of `needle` in the rows the reader can actually SEE — the
-    /// ground truth every find count is measured against below. Read straight off
-    /// the visible grid, so it is independent of every index, cache and snapshot
-    /// the search path builds.
+    /// Occurrences of `needle` in the visible rows, read off the grid: the ground
+    /// truth, independent of every index and cache the search path builds.
     #[cfg(test)]
     fn visible_occurrences(
         term: &std::sync::Arc<std::sync::Mutex<super::Terminal>>,
@@ -2435,14 +2248,8 @@ mod tests {
             .len()
     }
 
-    /// A count the terminal has already moved past is never stated as a census.
-    ///
-    /// Output does not re-run the search (one full scan per PTY batch on the UI
-    /// thread is what the deferral exists to avoid), so between an output burst
-    /// and the next edit/step the batch is simply older than the screen. It used
-    /// to go on painting `1/3` at a window holding five hits, with no marker of
-    /// any kind on the glass or the wire. Now both carry it, and the next
-    /// recompute — which does have the real number — drops it again.
+    /// A count the terminal has moved past is never stated as a census: after output
+    /// the bar and the wire mark it stale, and the next recompute drops the mark.
     #[test]
     fn output_since_the_count_is_marked_on_the_glass_and_on_the_wire() {
         let mut app = App::headless_for_test();
@@ -2467,8 +2274,7 @@ mod tests {
             "and is painted bare"
         );
 
-        // Two more hits arrive. The batch is not re-run — that is the design —
-        // so the number on screen is now three of five.
+        // Two more hits arrive; the batch is not re-run, so it still counts three.
         term_lock(&term).process(b"needle four\r\nneedle five\r\n");
         app.search_refresh_for_output(0);
         assert_eq!(
@@ -2514,20 +2320,9 @@ mod tests {
         );
     }
 
-    /// THE DEFECT: after a `clear`, growing the window taller silently erased
-    /// on-screen lines from the search corpus.
-    ///
-    /// `clear` is `ED 2` + `ED 3`: the screen is blanked and the scrollback is
-    /// DROPPED. With no history left, a rows-grow cannot reveal anything, so it
-    /// appends blank rows at the BOTTOM — which grew the retained-line total while
-    /// `absolute_row_counter` stayed put (until 2026-10-01; the counter now moves
-    /// with the appended rows), and `oldest_absolute_row()` is `counter − visible −
-    /// scrollback`. Every retained row's absolute key shifted DOWN by the number of
-    /// appended rows. The GUI's index-reuse path carried the pre-shift keys
-    /// forward, re-fed only the rows at/after the OLD visible base, and left the
-    /// top band of the screen — where everything printed since the clear lives —
-    /// absent from the corpus entirely. Kept as the end-to-end witness that find
-    /// sees the whole glass across such a grow, whatever the grid's bookkeeping.
+    /// After a `clear` (`ED 2` + `ED 3`: no history left) a rows-grow appends blank rows
+    /// at the bottom, and find still sees every hit on the glass: the end-to-end check
+    /// that index reuse keys the retained rows correctly across such a grow.
     #[test]
     fn growing_the_window_after_a_clear_keeps_the_visible_screen_searchable() {
         let mut app = App::headless_for_test();
@@ -2567,17 +2362,10 @@ mod tests {
         );
     }
 
-    /// The shrink the other way: one that trims the trailing blanks a
-    /// screen-clear left behind. Until 2026-10-01 that slid the absolute space
-    /// UPWARD (the counter stayed while the retained total fell), which looks
-    /// exactly like the ordinary retention advance the reuse guard allows, and
-    /// only the grid's renumber report kept a reused index from filing history
-    /// at pre-slide keys. The trim now moves the counter with the rows it drops
-    /// (`Grid::keep_keys_across_bottom_rows`, as a shell's command marks need),
-    /// so nothing slides: the deep needle keeps its absolute row, a reused or
-    /// rebuilt index answers it there, and that row holds it. Here the clear
-    /// KEEPS its history (`ED 2` alone, no `ED 3`), so there are rows below the
-    /// refreshed band for a wrongly keyed index to misfile.
+    /// A shrink that trims a screen-clear's trailing blanks moves the counter with the
+    /// rows it drops (`Grid::keep_keys_across_bottom_rows`), so no key slides: the deep
+    /// needle keeps its absolute row and that row holds it. The clear keeps its
+    /// history (`ED 2` alone), leaving rows for a wrongly keyed index to misfile.
     #[test]
     fn shrinking_the_window_after_a_screen_clear_keeps_history_correctly_keyed() {
         let mut app = App::headless_for_test();
@@ -2588,9 +2376,8 @@ mod tests {
             for line in 0..40 {
                 t.process(format!("needle {line:02}\r\n").as_bytes());
             }
-            // `ED 2` + home: the screen is blank — every row below the cursor is
-            // a trailing blank, which is what makes the shrink TRIM — and the
-            // history stays where it is.
+            // `ED 2` + home: every row below the cursor is a trailing blank, so the
+            // shrink trims, and the history stays.
             t.process(b"\x1b[H\x1b[2J");
         }
         let deep = "needle 03";
@@ -2655,8 +2442,7 @@ mod tests {
         state
     }
 
-    /// Insertion happens AT THE CARET (not always at the end), and the caret follows
-    /// the inserted text — the difference between a text field and an append-only box.
+    /// Insertion happens at the caret, and the caret follows the inserted text.
     #[test]
     fn insert_lands_at_the_caret() {
         let mut s = field("bc");
@@ -2671,9 +2457,8 @@ mod tests {
         assert_eq!((s.query.as_str(), s.cursor), ("abcd", 4));
     }
 
-    /// ⎋ / ⏎ / ⇥ are COMMANDS in find mode: their text (`\u{1b}`, `\r`, `\t` — what
-    /// winit reports for them) must never reach the query, and a multi-line paste is
-    /// flattened rather than typed in. This is the escape-typed-into-the-box bug.
+    /// ⎋/⏎/⇥ are commands in find mode: their text (`\u{1b}`, `\r`, `\t`, as winit
+    /// reports it) never reaches the query, and a multi-line paste is flattened.
     #[test]
     fn control_characters_never_enter_the_query() {
         let mut s = field("");
@@ -2720,9 +2505,8 @@ mod tests {
         assert!(!s.edit(SearchEdit::DeleteForward));
     }
 
-    /// Every motion and edit is CHARACTER-wise on a multi-byte query, and a caret that
-    /// somehow lands mid-codepoint (or past the end) is floored/clamped rather than
-    /// panicking or splitting a character.
+    /// Every motion and edit is character-wise on a multi-byte query, and a caret
+    /// mid-codepoint or past the end is floored/clamped, never a panic or a split.
     #[test]
     fn editing_is_utf8_safe() {
         let mut s = field("héllo");
@@ -2780,14 +2564,11 @@ mod tests {
         words
     }
 
-    /// ⌥←/⌥→, ^W and ⌥⌫ step over a word whole, in every script, and stop exactly
-    /// where a double-click ends the same word. A mark, a virama and a format
-    /// control that spells the word (a ZWNJ, a ZWJ, the Mongolian vowel separator)
-    /// belong to it: the find field used to stop at the virama of `नमस्ते` and at
-    /// the half space of `می‌خواهم`, so ⌥⌫ deleted half a word and left a dangling
-    /// virama. An invisible character between two words (a joiner between two
-    /// Latin letters, a bidi override, the word joiner, a mark) still separates
-    /// them, as it does for a double-click.
+    /// ⌥←/⌥→, ^W and ⌥⌫ step over a word whole in every script and stop where a
+    /// double-click ends it: a mark, a virama or a format control that spells the word
+    /// (ZWNJ, ZWJ, the Mongolian vowel separator) belongs to it, while an invisible
+    /// character between two words (a joiner between Latin letters, a bidi override,
+    /// the word joiner) still separates them.
     #[test]
     fn word_motions_step_over_whole_words_like_a_double_click() {
         for word in [
@@ -2830,8 +2611,7 @@ mod tests {
         }
     }
 
-    /// The caret is PAINTED state, so it has to be part of the repaint fingerprint —
-    /// otherwise a bare ^A/^E would move the caret with nothing reaching glass.
+    /// The caret is painted state, so it is part of the repaint fingerprint.
     #[test]
     fn fingerprint_tracks_the_caret() {
         let mut s = field("abc");
@@ -2842,9 +2622,9 @@ mod tests {
         assert_eq!(s.fingerprint(), at_end, "and settle back when it returns");
     }
 
-    /// `map_matches` converts engine ABSOLUTE rows to SELECTION rows (`abs − base_y`,
-    /// negative = scrollback), turns EXCLUSIVE end columns INCLUSIVE, and sorts into
-    /// visual (row, start) order regardless of the engine's grouping order.
+    /// `map_matches` turns absolute rows into selection rows (`abs − base_y`, negative
+    /// = scrollback), exclusive ends inclusive, and sorts into visual order whatever
+    /// the engine's order.
     #[test]
     fn map_matches_abs_to_selection_inclusive_sorted() {
         let base_y = 100; // absolute row of the top visible line
@@ -2877,8 +2657,7 @@ mod tests {
         assert_eq!(map_matches(&ms, 5), vec![(0, 0, 0)]);
     }
 
-    /// open -> next/next/next (wrap) and prev (wrap) walks the current match through
-    /// the set with correct wraparound, and the current offset tracks it at every step.
+    /// Next and previous walk the matches with wraparound at both ends.
     #[test]
     fn find_state_next_prev_wraparound() {
         let mut s = seeded();
@@ -2887,7 +2666,6 @@ mod tests {
 
         // Starts on the first (top-most) match.
         assert_eq!(s.current_match(), Some((-1, 0, 2)));
-        // next -> second, next -> third.
         s.step(true);
         assert_eq!(s.current_match(), Some((0, 2, 4)));
         s.step(true);
@@ -2896,19 +2674,18 @@ mod tests {
         s.step(true);
         assert_eq!(s.current, 0);
         assert_eq!(s.current_match(), Some((-1, 0, 2)));
-        // prev off the front wraps to the last (Shift-Enter from the top).
+        // prev off the front wraps to the last.
         s.step(false);
         assert_eq!(s.current, n - 1);
         assert_eq!(s.current_match(), Some((0, 12, 14)));
-        // prev -> middle, prev -> first.
         s.step(false);
         assert_eq!(s.current_match(), Some((0, 2, 4)));
         s.step(false);
         assert_eq!(s.current_match(), Some((-1, 0, 2)));
     }
 
-    /// With no matches the cursor step is a no-op (Enter/Shift-Enter do nothing),
-    /// and there is no current match to highlight.
+    /// With no matches a step is a no-op with no current match, but it still sets the
+    /// direction.
     #[test]
     fn find_state_step_no_matches_is_noop() {
         let mut s = SearchState {
@@ -3053,9 +2830,8 @@ mod tests {
         );
     }
 
-    /// Claude/Codex-style streaming output invalidates a result batch without
-    /// rescanning on every chunk. The next repeat refreshes exactly once and
-    /// navigates relative to the old point, so a newly appended hit is visible.
+    /// Streaming output invalidates a batch without a rescan per chunk; the next repeat
+    /// refreshes once and navigates from the old point, reaching the appended hit.
     #[test]
     fn streaming_output_marks_search_dirty_then_repeat_refreshes_latest_content() {
         let mut app = App::headless_for_test();
@@ -3076,11 +2852,9 @@ mod tests {
         assert_ne!(term_lock(&term).content_seq(), before_seq);
         app.search_refresh_for_output(0);
         assert!(app.windows[&wid].search.as_ref().unwrap().results_dirty);
-        // The highlight is dropped because this hit is on the LIVE SCREEN — the band the
-        // streaming write can rewrite cell-by-cell under an unchanged row number. The
-        // scrollback twin below is the control that says the clear is narrow, not
-        // reflexive; without asserting the fixture's position here that pair would drift
-        // apart silently.
+        // The highlight drops because this hit is on the live screen, which streaming
+        // output rewrites under unchanged row numbers; the scrollback twin below shows
+        // the clear is narrow.
         assert!(
             before_abs >= i64::try_from(term_lock(&term).grid().base_y()).unwrap(),
             "fixture hit must be on the live screen"
@@ -3097,12 +2871,10 @@ mod tests {
         assert!(term_lock(&term).text_selection().has_selection());
     }
 
-    /// Deep-scrollback twin of the test above, and the direct pin on the narrowed
-    /// clear. Output that invalidates the MATCH VECTOR must not destroy a highlight
-    /// sitting on ARCHIVED rows: those rows are immutable except for eviction and
-    /// wholesale renumbering, both of which `post_process` has already accounted for
-    /// by the time the GUI runs. Restore either clear to unconditional and this fails
-    /// while its live-screen twin keeps passing.
+    /// Scrollback twin of the test above, pinning the narrowed clear: output that
+    /// invalidates the matches keeps a highlight on archived rows (`post_process` has
+    /// already accounted for eviction and renumbering). An unconditional clear fails
+    /// this while the live-screen twin passes.
     #[test]
     fn streaming_output_keeps_a_scrollback_highlight_alive() {
         let mut app = App::headless_for_test();
@@ -3145,12 +2917,8 @@ mod tests {
         );
     }
 
-    /// ⌘F on a scrolled-back viewport with nothing to go to LEAVES THE VIEW ALONE.
-    ///
-    /// The apply path used to snap to the bottom before deciding where to put the
-    /// viewport, so opening find — or typing a query that matches nothing, or a
-    /// malformed regex — yanked the reader to the live tail before they had asked for
-    /// anything. Positioning by absolute row makes "no row" mean "no movement".
+    /// ⌘F on a scrolled-back viewport with nothing to go to (empty query, no match)
+    /// leaves the view alone: positioning by absolute row makes no row mean no move.
     #[test]
     fn opening_find_with_nothing_to_show_does_not_move_the_viewport() {
         let mut app = App::headless_for_test();
@@ -3185,15 +2953,10 @@ mod tests {
         );
     }
 
-    /// ⎋ restores a SCROLLED-BACK origin across a protected-footer splice — the
-    /// codex/Claude Code shape, asserted on the row TEXT rather than on
-    /// `display_offset`, because the splice moves rows relative to the tail.
-    ///
-    /// This is the repo's own daily-driver bug. `absolute_row_revision` has exactly one
-    /// producer, a top-anchored archival scroll with a protected footer, so the old
-    /// revision gate skipped the restore for precisely the TUIs that repaint a pinned
-    /// footer: ⎋ silently did nothing. There is no gate now, and the anchor is immune
-    /// because a splice only renumbers rows BELOW the insertion point.
+    /// ⎋ restores a scrolled-back origin across a protected-footer splice (the
+    /// codex/Claude Code shape), asserted on row text since the splice moves rows
+    /// relative to the tail. No revision gate: a splice renumbers only rows below its
+    /// insertion point.
     #[test]
     fn cancel_restores_a_scrolled_back_origin_across_a_footer_splice() {
         let mut app = App::headless_for_test();
@@ -3219,8 +2982,7 @@ mod tests {
         );
 
         // The codex footer shape: a top-anchored DECSTBM region whose scroll archives
-        // the displaced row, which is the ONLY producer of an `absolute_row_revision`
-        // bump — i.e. the exact input the deleted gate refused to restore across.
+        // the displaced row, the only producer of an `absolute_row_revision` bump.
         let region_bottom = rows - 2;
         term_lock(&term).process(
             format!("\x1b[1;1HA\x1b[1;{region_bottom}r\x1b[{region_bottom};1H\r\nX\x1b[r")
@@ -3236,11 +2998,9 @@ mod tests {
         );
     }
 
-    /// A tab/pane switch is not a find EXIT. It tears the bar down through the neutral
-    /// close, which hands the title back and PARKS the origin, so reopening find on
-    /// that terminal and pressing ⎋ still lands on what the user was reading before the
-    /// find the switch interrupted — rather than on wherever the interrupted find left
-    /// the viewport.
+    /// A tab/pane switch is not a find exit: the neutral close hands the title back and
+    /// parks the origin, so a reopen and ⎋ land on what the user was reading before
+    /// the interrupted find.
     #[test]
     fn a_neutral_close_parks_the_find_origin_for_the_next_open() {
         let mut app = App::headless_for_test();
@@ -3364,7 +3124,7 @@ mod tests {
                 sink.write_frame(b"\x12")
                     .expect("the observer pipe accepts a byte");
             }
-            // The step off the last hit lands one PAST it instead of wrapping.
+            // The step off the last hit lands one past it instead of wrapping.
             ("past the end", "RepeatForward") => {
                 let search = app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap();
                 if search.current == 0 {
@@ -3463,11 +3223,10 @@ mod tests {
         }
     }
 
-    /// Drive the navigation trace on a real headless App whose PTY is an
-    /// observer pipe, with `patch` injected after every real step. Every chord
-    /// goes through the host seam a physical ⌘S/⌘R takes
-    /// (`terminal_emacs_search_pressed`, then the physical release), with
-    /// Kitty event-type reporting ON so a release that leaked would be encoded.
+    /// Drive the navigation trace on a real headless App whose PTY is an observer
+    /// pipe, with `patch` injected after every real step. Every chord goes through the
+    /// seam a physical ⌘S/⌘R takes (`terminal_emacs_search_pressed`, then the
+    /// release), with Kitty event-type reporting on so a leaked release would encode.
     #[cfg(unix)]
     fn emacs_navigation_trace(
         model: &aterm_spec::derive::Model,
@@ -3536,9 +3295,9 @@ mod tests {
         })?;
         run.step(&["RefreshRepeatForward"], chord(true))?;
 
-        // ⎋ restores the viewport the open captured: read the PARKED anchor
-        // before cancelling (⎋ removes it), then project the real restore onto
-        // the model's `viewport == origin`.
+        // ⎋ restores the viewport the open captured: read the parked anchor before
+        // cancelling (⎋ removes it), then project the restore onto the model's
+        // `viewport == origin`.
         let origin_offset = {
             let origin = run
                 .app
@@ -3571,16 +3330,14 @@ mod tests {
         Ok(())
     }
 
-    /// Tier-1 conformance for the derived `EmacsSearchNavigation` model. The
-    /// trace drives the real chord seam, the real snapshot search, the real
-    /// streaming-output refresh, and the real ⎋/⏎ exits on a headless App,
-    /// and after EVERY step requires the real search (active, hits, ordinal,
-    /// direction, staleness), the real selection, and the real PTY observer
-    /// to be the model's state — the viewport restore at ⎋ included.
+    /// Tier-1 conformance for the derived `EmacsSearchNavigation` model: the trace
+    /// drives the real chord seam, search, output refresh and ⎋/⏎ exits on a headless
+    /// App, and after every step requires the real find state, selection and PTY
+    /// observer (and the viewport restore at ⎋) to be the model's.
     ///
-    /// NEGATIVE CONTROL: each of the model's `Buggy = 1` members, injected into
-    /// the same real trace at its own step, is refused by the healthy model AT
-    /// that action; and the shipped host is refused by the buggy model.
+    /// Negative control: each `Buggy = 1` member, injected at its own step, is refused
+    /// by the healthy model at that action, and the shipped host is refused by the
+    /// buggy model.
     #[cfg(unix)]
     #[test]
     fn emacs_navigation_conforms_to_derived_transition_model() {
@@ -3650,7 +3407,7 @@ mod tests {
         assert_eq!(before.current, 1);
         assert_eq!(before.match_absolute_row_revision, 0);
 
-        // Row 0 must be WRITTEN for the displaced row to archive and splice.
+        // Row 0 must be written for the displaced row to archive and splice.
         let region_bottom = rows - 2;
         term_lock(&term).process(
             format!("\x1b[1;1HA\x1b[1;{region_bottom}r\x1b[{region_bottom};1H\r\nX\x1b[r")
@@ -3673,10 +3430,9 @@ mod tests {
         assert_eq!(after.match_base_y + i64::from(row), i64::from(rows));
     }
 
-    /// A protected-footer revision invalidates the old piecewise coordinate
-    /// frame. Forward repeat must restart inclusively at the true beginning;
-    /// clamping the internal before-first sentinel to `(0, 0)` and then using a
-    /// strict comparison would incorrectly skip this first retained hit.
+    /// After a protected-footer revision a forward repeat restarts inclusively at the
+    /// true beginning: the before-first sentinel must not clamp to `(0, 0)` under a
+    /// strict comparison and skip the first retained hit.
     #[test]
     fn codex_protected_footer_forward_refresh_keeps_row_zero_match() {
         let mut app = App::headless_for_test();
@@ -3758,13 +3514,8 @@ mod tests {
         assert_eq!(restored.current, 0);
     }
 
-    /// PRESS CUSTODY — the search-jump seam RECORDS, and this drives it.
-    ///
-    /// `search_apply_current_in` reaches `TextSelection` directly with no mouse
-    /// gesture around it, so it is a `UserSelect` producer that no gesture seam can
-    /// account for. The conformance module could not drive it (it needs a populated
-    /// match vector) and said so — but "stated, not implied" is not the same as
-    /// tested, and four recorder call sites in this file were exercised by nothing.
+    /// Press custody: a search jump selects with no gesture around it, so it records
+    /// the `UserSelect` itself.
     #[test]
     fn a_search_jump_records_who_took_the_selection() {
         let mut app = App::headless_for_test();
@@ -3779,9 +3530,8 @@ mod tests {
             }
         }
 
-        // A find-bar state with a real hit, as the recompute would have produced.
-        // The freshness stamps matter: without them `search_stamp_mismatch` sends this
-        // down the REFUSAL path and the jump never happens.
+        // A find state with a real hit, as a recompute would produce. The freshness
+        // stamps matter: stale ones send the apply down the refusal path.
         let (base_y, revision, seq) = {
             let t = crate::term_lock(&terminal);
             (

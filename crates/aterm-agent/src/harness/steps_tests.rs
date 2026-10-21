@@ -1352,6 +1352,39 @@ fn a_fresh_row_names_the_model_the_history_had() {
     assert_eq!(evs, vec![vec![], vec![model], vec![]]);
 }
 
+/// A11 AT THE FLOOR: a row past the seed but older than the floor (the
+/// run's open, which the host arms the fold with, on a file read from its
+/// first byte) is history the log never takes, so it names no model either:
+/// the first row no older than the floor says it, though it is the same
+/// model. NEGATIVE CONTROL (scratch, the unit's notes): a model said on any
+/// row past the seed is said by the row below the floor, which is never
+/// queued, and the row the log takes says nothing.
+#[test]
+fn a_row_below_the_floor_names_no_model() {
+    let mut fold = StepFold::new(T0 + 15, None);
+    fold.read_at(FP, ID, 0, false);
+    let mut off = 0;
+    let mut evs = Vec::new();
+    for row in [reply("m0", 0, 1), reply("m1", 20, 1)] {
+        off += row.len() as u64 + 1;
+        fold.push(row.as_bytes(), off);
+        evs.push(
+            fold.take()
+                .steps
+                .into_iter()
+                .map(|s| s.ev)
+                .filter(|e| !matches!(e, StepEvent::Bind { .. }))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let model = StepEvent::Model {
+        model: id("claude-opus-5-5"),
+        effort: Some(id("high")),
+        ver: None,
+    };
+    assert_eq!(evs, vec![vec![], vec![model]]);
+}
+
 /// The queue keeps its bind and the newest steps after it, [`STEP_QUEUE`]
 /// in all, and counts the rest (a burst past the bound right after a bind
 /// still tells the log which file the kept steps came from); rows past the

@@ -2,31 +2,9 @@
 # Copyright 2026 Andrew Yates
 #
 # cargo-deny configuration for the aterm workspace.
-# ---------------------------------------------------------------------------
-# aterm is built and shipped OFFLINE from a pinned, locally-cached/vendored
-# dependency set (see Cargo.lock + the "present in local cargo cache for offline
-# builds" note in the workspace Cargo.toml). This file is the offline
-# supply-chain audit policy for that set: it lets a maintainer run
-#
-#     cargo deny check
-#
-# to gate on security advisories, dependency bans, license policy, and source
-# provenance. With a vendored advisory DB it runs without network access:
-#
-#     cargo deny --offline check
-#
-# cargo-deny is OPTIONAL tooling, not required to build or test aterm. The
-# policy itself is enforced by `targo --unverified forge check`: `[licenses]
-# allow` by [OB-9], and `[bans] deny` plus `[sources]` by [OB-18], over every
-# cell's resolved graph.
-#
-# Schema: cargo-deny v2 (the current `[graph]`/`[advisories]`/`[licenses]`/
-# `[bans]`/`[sources]` layout; no `version` keys, no removed fields such as
-# `[licenses].deny`/`copyleft` or `[advisories].vulnerability`/`notice`). Keep
-# it conservative: warn — don't hard-fail — on things inherent to a large
-# GPU/GUI dependency tree (e.g. duplicate transitive versions) so a routine
-# audit stays signal, not noise.
-# ---------------------------------------------------------------------------
+# Offline supply-chain audit policy (`cargo deny --offline check`, schema v2).
+# Enforced in verification by `targo --unverified forge check` (`[licenses] allow`
+# under [OB-9], `[bans] deny` and `[sources]` under [OB-18]).
 
 # Evaluate the dependency graph for all targets aterm actually supports, so the
 # audit covers the macOS (objc2/metal), Linux (wayland/x11/drm), and Windows
@@ -44,10 +22,7 @@ targets = [
 all-features = false
 no-default-features = false
 
-# ---------------------------------------------------------------------------
-# Security advisories (RustSec). Run with a locally-cloned advisory DB for a
-# fully offline audit: `cargo deny --offline check advisories`.
-# ---------------------------------------------------------------------------
+# Security advisories (RustSec).
 [advisories]
 # RustSec advisory DB source. Cloned/refreshed out-of-band; `--offline` reuses
 # the local checkout without fetching. (Crates with a known vulnerability are
@@ -67,26 +42,10 @@ unsound = "all"
 # to remove it — never blanket-ignore.
 ignore = []
 
-# ---------------------------------------------------------------------------
-# License policy. The allowlist below was derived from the ACTUAL resolved tree
-# (412 packages in Cargo.lock as audited 2026-06): every crate's SPDX expression
-# is satisfied by this set, with zero crates left unsatisfied. It is an
-# Apache-2.0-compatible permissive allowlist — the workspace itself is
-# Apache-2.0 (see Cargo.toml [workspace.package]).
-#
-# Notable deliberate EXCLUSIONS (kept off the allowlist on purpose, and still
-# safe because each such crate dual-licenses under a permissive alternative that
-# IS allowed, so its `OR` expression is satisfied without them):
-#   * LGPL-2.1-or-later  — r-efi is "MIT OR Apache-2.0 OR LGPL-2.1-or-later";
-#                          the MIT/Apache arm satisfies it. We do not want to
-#                          broadly bless copyleft.
-#   * Unlicense          — aho-corasick/memchr/walkdir/same-file/termcolor/
-#                          winapi-util are all "Unlicense OR MIT"; the MIT arm
-#                          satisfies them. Public-domain dedications are left
-#                          off the explicit allowlist.
-# If a future dependency forces one of these as its ONLY license, that is a
-# conscious policy decision to make here — not something to allow silently.
-# ---------------------------------------------------------------------------
+# License policy: Apache-2.0-compatible permissive allowlist.
+# Dual-licensed crates with `LGPL-2.1-or-later` (`r-efi`) or `Unlicense`
+# (`aho-corasick`, `memchr`, `walkdir`, `same-file`, `termcolor`, `winapi-util`)
+# are satisfied via their `MIT` / `Apache-2.0` arms.
 [licenses]
 # Permissive licenses present in (and required by) the resolved tree. Each line
 # notes a representative crate that pulls the license in without a permissive
@@ -101,28 +60,12 @@ allow = [
     "Unicode-3.0",  # unicode-ident: "(MIT OR Apache-2.0) AND Unicode-3.0"
     "Zlib",         # foldhash, slotmap
 ]
-# Per-crate license exceptions (allow a license only for the named crate). None
-# are needed today: the rustix / wasi / wit-* / linux-raw-sys family is
-# "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT", whose plain-Apache-2.0
-# (and MIT) arms are already allowed, so the WITH-exception arm never has to be
-# reached. Add narrowly-scoped entries here, e.g.
-#   { allow = ["OpenSSL"], name = "ring" }
-# rather than widening the global allow list above.
+# Per-crate license exceptions.
 exceptions = []
 # Confidence required for the license-text matcher to accept a crate's declared
 # license. 0.8 is cargo-deny's default; keep it strict.
 confidence-threshold = 0.8
-# Every crate in the current tree declares a parseable SPDX expression, so no
-# `[[licenses.clarify]]` entries are needed. If a future dependency ships a
-# license file without a parseable SPDX header, add a narrowly-scoped,
-# hash-pinned clarify entry here rather than lowering the confidence above.
-
-# ---------------------------------------------------------------------------
-# Bans: dependency hygiene. The tree is large (a GPU/GUI terminal pulls in the
-# wgpu/winit/wayland/objc2 stacks), so duplicate transitive versions are a fact
-# of life — we WARN on them (so they stay visible and can be deduplicated as the
-# ecosystem converges) rather than hard-failing an otherwise-clean audit.
-# ---------------------------------------------------------------------------
+# Dependency bans and version hygiene.
 [bans]
 multiple-versions = "warn"
 # A wildcard ("*") version requirement is a supply-chain hazard (it floats to
@@ -132,36 +75,12 @@ wildcards = "deny"
 # (the internal aterm-* members reference each other by path, not by a pinned
 # registry version), which are not a registry-floating risk.
 allow-wildcard-paths = true
-# `atpkg` promotes `ring` to a DELIBERATE, load-bearing DIRECT dependency: it is the
-# Ed25519 verify root of the toolchain package manager's two-tier signature anchor
-# (docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13 — the offline root key signs index.toml, a
-# delegated release key signs each pkg.toml, both verified over the EXACT raw manifest
-# bytes). It is also the RSA verify root for a vendor's OpenPGP-signed digest document
-# (crates/atpkg/src/openpgp.rs), which is why atpkg's edge enables ring's `alloc` feature.
-# ring was previously only a TRANSITIVE dep (via rustls); making it a direct
-# edge is a conscious supply-chain decision, recorded here rather than left implicit.
+# `atpkg` depends directly on `ring` (>= 0.17.14) for Ed25519 manifest
+# verification (`index.toml` / `pkg.toml`) and OpenPGP RSA digest verification.
 #
-# cargo-deny has NO "require-crate-present" knob, so this file CANNOT assert that ring
-# exists on the verify path. Presence is instead guaranteed structurally: ring is a
-# hard direct dependency of crates/atpkg (the workspace will not compile without it).
-# What the entry below DOES enforce is the other half — that ring never drifts BELOW
-# the audited floor (0.17.14). A future rustls bump that switched its backend to
-# aws-lc-rs would drop ring from rustls's subtree, but atpkg's own direct edge keeps it
-# present and at/above the floor regardless.
-#
-# To outright ban a crate, add e.g.
-#   { name = "openssl", reason = "atpkg's crypto root is ring (pure-Rust); do not add a second C TLS/crypto stack" }
-# with a reason string.
-#
-# THIRD-PARTY RANDOMNESS. Entropy in the shipped tree comes from `aterm_uds::rand`
-# (the OS CSPRNG, and on wasm32 a counter the module docs justify), so no
-# first-party crate depends on an RNG crate. Resolution sees a crate whatever a
-# manifest calls it, so a rename or a dotted key cannot hide one. `getrandom`
-# 0.2 IS aterm_uds::rand: crates/aterm-getrandom, through its [patch.crates-io]
-# row, and ring is the one crate admitted to take it. That ring's getrandom is
-# that path package is [OB-12]'s half of the rule: a registry copy beside it,
-# or a row that replaces nothing, fails `forge check`. `fastrand` arrives inside
-# third-party crates, admitted under the parents named.
+# First-party crates use `aterm_uds::rand` for CSPRNG entropy. `getrandom` 0.2
+# is patched to `crates/aterm-getrandom` (`aterm_uds::rand`) for `ring`;
+# `fastrand` is restricted to the listed third-party parents.
 deny = [
     { name = "ring", version = "<0.17.14", reason = "atpkg's load-bearing Ed25519 and OpenPGP RSA verify root (TOOLCHAIN-PACKAGE-MANAGER.md S8/S13): never allow it to drift below the audited, vendored floor on the verify path" },
     { name = "getrandom", wrappers = ["ring"], reason = "entropy comes from aterm_uds::rand; getrandom is its first-party facade (crates/aterm-getrandom), admitted only as ring's seed source" },
@@ -177,12 +96,7 @@ skip = []
 # Subtrees whose internal duplicates are ignored wholesale (none needed yet).
 skip-tree = []
 
-# ---------------------------------------------------------------------------
-# Sources: provenance. aterm pins all crates from crates.io and uses no git
-# dependencies; the offline cache/vendor dir is populated from exactly these.
-# Any crate from an unknown registry or a git source is a hard failure — that is
-# the supply-chain boundary this section enforces.
-# ---------------------------------------------------------------------------
+# Sources: only crates.io is permitted; unknown registries and git sources are denied.
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

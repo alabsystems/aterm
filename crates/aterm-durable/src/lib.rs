@@ -11,9 +11,12 @@
 //! * [`durable`]: the data is on stable media when the call returns. Apple:
 //!   `fcntl(F_FULLFSYNC)` (std's [`File::sync_all`]), which drains the device's whole
 //!   queue. Measured on one Mac (Apple SSD, APFS, under other agents' builds): p50
-//!   4.3 ms in steps of about 4.2 ms, and while it runs every other writer on the
-//!   volume waits behind it (a neighbour's 64-byte page-cache write went to p95
-//!   4-5 ms). Elsewhere the platform full flush. Stable-on-return is the supported
+//!   4.3 ms in steps of about 4.2 ms, and while it runs a neighbour's 64-byte write
+//!   with no flush went to p95 4-5 ms. A later probe there
+//!   (`docs/measured/flush-wait-2026-10-21.md`) saw every barrier it caught, and
+//!   most `fsync(2)`s, growing appends, creates and renames, wait out a full flush
+//!   in flight from another thread; a read and an in-place page-cache write did not.
+//!   Elsewhere the platform full flush. Stable-on-return is the supported
 //!   filesystem/device contract, not an independent check of the hardware. A site
 //!   needs it when something outside this device's write order depends on the data
 //!   having reached the media: a reply or ack that promises it is saved, a network
@@ -61,7 +64,10 @@
 //! measured on the crash journal's conformance test, the heaviest user, 3.8-7.5 s
 //! against 2.2-4.2 s with a plain `fsync(2)` in its place (load 27-47). What a crate's
 //! own unit tests may swap is the DURABLE flush (`seam::durable_fsync`, Unix only),
-//! whose `F_FULLFSYNC` costs a step of about 4.2 ms and stalls the whole volume.
+//! whose `F_FULLFSYNC` costs a step of about 4.2 ms and, while it runs, holds up
+//! most flushes, growing writes, creates and renames made beside it: a probe saw
+//! every barrier it caught and 72-99% of the rest wait, from threads of one process
+//! on files in one directory tree (`docs/measured/flush-wait-2026-10-21.md`).
 
 use std::fs::File;
 use std::io;

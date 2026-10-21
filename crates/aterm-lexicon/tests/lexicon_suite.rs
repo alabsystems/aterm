@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The aterm-lexicon integration files as modules of ONE test binary: each file
-//! stays at its own path and keeps its own `#[test]`s, and none installs a
-//! global or touches the environment. The two exact-allocation pins
-//! (`scan_scratch_alloc`, `tricks_alloc`) are the separate `lexicon_alloc`
-//! binary, which owns the counting `#[global_allocator]`.
-//!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
+//! The aterm-lexicon integration files as modules of one test binary (see `Cargo.toml`). None
+//! installs a global or touches the environment; the exact-allocation pins are the separate
+//! `lexicon_alloc` binary, which owns the counting `#[global_allocator]`.
 
 /// Webster's Second International (`web2`), the English word list the dictionary gates
 /// walk. Their allowlists (`INTENTIONAL`, `INTENTIONAL_PREFIXES`, `DICTIONARY_EXCUSED`)

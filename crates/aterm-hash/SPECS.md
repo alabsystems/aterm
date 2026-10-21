@@ -3,26 +3,15 @@
 
 # aterm-hash: spec recovery from its 6 unit tests
 
-> Status 2026-10-16: this is the crate's migration worklist. The 6 specs below are each to be
-> proved through Trust/Clean about the compiled Rust functions, and then the tests each one subsumes
-> are deleted. The one test in §4 samples no spec and can be deleted now. The crate's floor today is
-> 50 of 86 obligation rows proved (`crates/aterm-release/trust/floors.tsv`).
+> Status: migration worklist (`crates/aterm-release/trust/floors.tsv` tracks the obligation floor).
+> Each of the 6 specs below is proved through Trust/Clean about the compiled Rust functions, and then
+> the tests it subsumes are deleted. `fnv1a_64_extend` delegates to `astream_wire::hash::fnv1a_64_update`
+> and `FNV64_OFFSET` is `astream_wire::hash::FNV1A_64_INIT`; `FNV64_PRIME` and `fnv_mix_u64` stay here.
+> `HASH-FNV-1` and `HASH-FNV-2` cite a refinement `ensures` on `fnv1a_64_update`
+> (`fnv1a_64_update(h, bs) = fnvRef(h, bs)`) that lands in `astream-wire` first (`astream`'s
+> `docs/ROADMAP.md`, "Functional contracts aterm cites"), then connects here via gap 12.
 
-> Status 2026-10-20: `fnv1a_64_extend` no longer holds a loop. Its body is one call to
-> astream-wire's `hash::fnv1a_64_update` (a `while let` over a slice pattern), and `FNV64_OFFSET` is
-> astream-wire's `FNV1A_64_INIT`; `FNV64_PRIME` and `fnv_mix_u64` stay here, because astream keeps
-> its prime private and exports no word fold. `fnv1a_64_extend` went from 3 proved of 4 obligations
-> to 1 unknown (the call), measured by `ship trust run -p aterm-hash`. HASH-FNV-1 and HASH-FNV-2 now cite a refinement `ensures` on
-> `fnv1a_64_update` (`fnv1a_64_update(h, bs) = fnvRef(h, bs)`) that astream-wire DOES NOT HAVE: the
-> function is a plain `pub const fn`, of which Trust proves only the Level-0 obligations (astream's
-> `evidence/verify/trust-wire.md`). That contract, with the loop invariant this file used to state,
-> lands in astream first (astream's `docs/ROADMAP.md`, "Functional contracts aterm cites", astream e45b103); here the
-> two rows wait on it and on gap 12 to cite it. The new test
-> `the_word_fold_agrees_with_astreams_byte_loop` samples HASH-FNV-1 (§2). The counts in the header
-> and §3 were taken before.
-
-Source: `crates/aterm-hash` (read only). I read every `#[test]` (`src/fnv.rs` 2, `src/lib.rs` 4 = 6)
-and the code each one reaches. Nothing was compiled or run. The claims below come from reading the code.
+Source: `crates/aterm-hash` (`src/fnv.rs` and `src/lib.rs`).
 
 Result: **6 specs**, covering **5 tests**. **1 test was not a spec sample** (§4); it is deleted.
 
@@ -125,10 +114,8 @@ src/lib.rs	test_fxhasher_bytes_match_rustc_hash	HASH-FX-3	HASH-FX-2, HASH-FX-1 (
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: `lib::test_fxhasher_default_via_buildhasherdefault` is deleted.
-
-> Status 2026-10-17: none left. Its row here and in §2 is gone; its one real fact (both build
-> hashers start in state 0) is a clause of HASH-FX-1.
+None (`lib::test_fxhasher_default_via_buildhasherdefault` is deleted; its fact that both build
+hashers start in state 0 is a clause of `HASH-FX-1`).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

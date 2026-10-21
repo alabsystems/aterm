@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Settings control model and the chrome primitives the in-grid overlays share.
-//! Native Settings views reuse [`SettingsState`] preference metadata/projections, while
-//! production pixels, input, accessibility, and machine inspection compile from
-//! [`crate::native_ui`]. The retired card is gone; what remains here is the control
-//! catalogue, the overlay geometry and colour roles ([`SettingsGeom`], [`Roles`]), the
-//! row writers ([`blank_row`], [`write_str`]), and the aurora / rainbow-banner painters
-//! native Settings draws.
+//! The Settings control model and the chrome primitives the in-grid overlays share: the
+//! control catalogue ([`SettingsState`]), the overlay geometry and colour roles
+//! ([`SettingsGeom`], [`Roles`]), the row writers ([`blank_row`], [`write_str`]), and the
+//! aurora and rainbow-banner painters. Native Settings pixels, input and accessibility
+//! compile from [`crate::native_ui`].
 
 use aterm_core::terminal::RenderCell;
 
@@ -19,9 +17,8 @@ use crate::widget::{DrawPrim, TextWeight, rgba};
 /// Shared semantic state embedded in each native Settings tab: the editable control
 /// catalogue plus the search fields the native view reads through `legacy`.
 pub(crate) struct SettingsState {
-    /// Snapshot of the editable controls for the live config, in row order. Native
-    /// Settings rebuilds it from its config snapshot after every persisted change, so
-    /// the displayed value tracks the file. OWNED — [`EditField`] is moved in.
+    /// The editable controls for the live config, in row order. Native Settings rebuilds
+    /// it from its config snapshot after every persisted change.
     pub(crate) fields: Vec<EditField>,
 }
 
@@ -34,12 +31,10 @@ impl SettingsState {
         }
     }
 
-    /// The CURRENT displayed value for a row: the configured seed, else the effective
-    /// placeholder (so an unset key shows what is actually in effect, never blank).
-    /// Authored Enum aliases are projected onto their canonical option so the native
-    /// picker does not mislabel a runtime-valid alias as a custom value. Unknown and
-    /// dynamic values remain verbatim, and unset placeholders retain their explanatory
-    /// `"(default)"` / `"(follow OS)"` annotation.
+    /// The displayed value for a row: the configured seed, else the effective placeholder
+    /// (an unset key shows what is in effect, with its `"(default)"` / `"(follow OS)"`
+    /// note). Enum aliases project onto their canonical option so the picker does not
+    /// show a valid alias as a custom value; unknown and dynamic values stay verbatim.
     pub(crate) fn display_value(f: &EditField) -> &str {
         let raw = f.seed.as_deref().unwrap_or(f.placeholder.as_str());
         if let Some(seed) = f.seed.as_deref()
@@ -58,22 +53,18 @@ impl SettingsState {
     }
 }
 
-/// Resolve a documented config ALIAS to its canonical option spelling. The config loaders
-/// (`app_config`) accept aliases that are NOT in the picker's canonical option set (e.g.
-/// cursor_style `beam` == `bar`); without this native Settings would misclassify the
-/// authored value as a custom option. Returns `None` when `token` is not a known alias.
+/// Resolve a documented config alias to its canonical option. The loaders (`app_config`)
+/// accept aliases outside the picker's option set (cursor_style `beam` == `bar`), which
+/// native Settings would otherwise show as a custom value. `None` for a non-alias.
 fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
-    // Trail-style aliases (nyan rainbow → rainbow kitty, ember → fire, …) resolve through the
-    // shared table in `prefs` — the same source `--validate-config` and the
-    // load-time unknown-style warning consult, so the native row, preview lane,
-    // and the live effect can never disagree about an aliased spelling.
+    // Trail-style aliases resolve through the shared `prefs` table that
+    // `--validate-config` and the load-time warning also read, so they never disagree.
     let token = token.trim();
     if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
         return prefs::cursor_trail_style_canonical(token);
     }
-    // Typing-sound aliases (water → droplet, mech → mechanical, bell → glass
-    // bell, …) resolve through the synth's own parser, so an authored alias
-    // projects onto its picker row instead of showing as a custom entry.
+    // Typing-sound aliases (water → droplet, mech → mechanical, …) resolve through the
+    // synth's own parser.
     if key == prefs::EDIT_TRAIL_SOUND_STYLE {
         return prefs::trail_sound_style_canonical(token);
     }
@@ -94,31 +85,17 @@ fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
     })
 }
 
-/// The voice/style a row's configured value RESOLVES to at RUNTIME even when the
-/// picker does not offer it — the third state the Enum layer was missing.
-///
-/// `enum_recognized` answers one question: is this value one of the options?
-/// For every row but one that is the same as "does the engine accept it", and
-/// the two were treated as interchangeable. The typing-sound row pulled them
-/// apart: `SoundVoice::RainbowKittyV2` ("music box") is live and selectable by
-/// config while `SoundVoice::ALL` — the picker AND v1's voice-agnostic sweep
-/// list — deliberately withholds it until v2's migration completes. Read
-/// through the options alone, that config reported as `auto`: Settings
-/// contradicting the synth actually playing.
-///
-/// So resolve it the way the runtime does (`Config::trail_sound_voice` =
-/// `SoundVoice::parse(..).unwrap_or_default()`) and let a recognized voice
-/// answer with its own canonical name, whichever spelling was authored. `None`
-/// for a genuinely unknown value, whose truthful answer is the row's default —
-/// which for this row IS `auto`, `SoundVoice::default()`.
+/// The canonical name of a typing-sound value the synth accepts, resolved as the runtime
+/// does (`SoundVoice::parse`), whether or not the picker offers it, so the row shows the
+/// voice that plays. `None` for an unknown value, which plays the default (`auto`).
 fn enum_offered_or_runtime(key: &str, token: &str) -> Option<&'static str> {
     (key == prefs::EDIT_TRAIL_SOUND_STYLE)
         .then(|| prefs::trail_sound_style_canonical(token))
         .flatten()
 }
 
-/// The canonical option an Enum row's authored `token` RESOLVES to (directly or via the
-/// alias map), or `None` for a genuinely unrecognized spelling.
+/// The canonical option an Enum row's `token` resolves to (directly or via the alias map),
+/// or `None` for an unrecognized spelling.
 fn enum_recognized(f: &EditField, token: &str) -> Option<&'static str> {
     let EditKind::Enum { options } = f.kind else {
         return None;
@@ -154,15 +131,11 @@ pub(crate) fn text_w(s: &str, px: f32) -> f32 {
     crate::tray_raster::measure_text(s, px, TextWeight::Regular)
 }
 
-/// `f32::clamp(lo, hi)` panics when `lo > hi`. Overlay geometry can invert bounds in
-/// extreme windows — a tiny font drops the max widget below its floor; an ultra-narrow
-/// grid drops the available width below the desired minimum. Pin to the achievable
-/// (upper) bound in that case instead of panicking.
+/// `f32::clamp`, except that inverted bounds (where `clamp` panics), which overlay geometry
+/// produces in extreme windows (a tiny font, an ultra-narrow grid), give `hi` floored at
+/// zero: never negative, since a later `as u32` would wrap it.
 #[inline]
 pub(crate) fn fit(value: f32, lo: f32, hi: f32) -> f32 {
-    // Inverted bounds (degenerate layout): pin to the achievable upper bound,
-    // floored at zero so a too-narrow window yields a zero-width widget rather
-    // than a NEGATIVE length (which would wrap on a later `as u32` downstream).
     if hi <= lo {
         hi.max(0.0)
     } else {
@@ -171,8 +144,7 @@ pub(crate) fn fit(value: f32, lo: f32, hi: f32) -> f32 {
 }
 
 /// Device-pixel geometry of the in-grid overlay card slot, handed to every
-/// [`crate::overlay::OverlayModel::tray`]. Native Settings does not use this
-/// terminal-grid geometry.
+/// [`crate::overlay::OverlayModel::tray`]. Native Settings does not use it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SettingsGeom {
     pub cw: f32,
@@ -182,7 +154,7 @@ pub(crate) struct SettingsGeom {
     pub panel_rows: usize,
 }
 
-// ---- Landing page (design §L) -------------------------------------------------------
+// Rainbow palette for the banner's arch and glints.
 
 const BLOB_CORAL: [u8; 3] = [0xFF, 0x51, 0x48];
 const BLOB_MARIGOLD: [u8; 3] = [0xFF, 0xC2, 0x2E];
@@ -190,9 +162,6 @@ const BLOB_LEAF: [u8; 3] = [0x2F, 0xAE, 0x5B];
 const BLOB_COBALT: [u8; 3] = [0x2E, 0x5B, 0xFF];
 const BLOB_VIOLET: [u8; 3] = [0xB0, 0x5C, 0xFF];
 
-// ---- §L.5 The rainbow welcome ---------------------------------------------------
-// The landing's welcome flourish: a pastel rainbow arch sweeping in behind the
-// hero and a small twinkling constellation. Purely decorative.
 /// The rainbow arch's sixth stripe (the blob palette covers the other five).
 const RAINBOW_TEAL: [u8; 3] = [0x21, 0xC2, 0xB7];
 
@@ -325,27 +294,13 @@ pub(crate) fn paint_settings_aurora(
     });
 }
 
-/// The §L.5 composition as a NATIVE Settings hero banner: a pastel rainbow arch
-/// cresting through a small constellation of star glints. Deliberately STATIC:
-/// the native scheduler keeps idle routes at 0% and this banner never asks for a
-/// frame. Painted through the audited custom-node lowering
-/// (`native_ui::RAINBOW_BANNER_AUDIT`); everything clips to `rect`.
+/// The native Settings hero banner: a pastel rainbow arch cresting through a few star
+/// glints. Static (it never asks for a frame); painted through the audited custom-node
+/// lowering (`native_ui::RAINBOW_BANNER_AUDIT`) and clipped to its rect.
 ///
-/// `sky` and `rim` arrive RESOLVED from the caller's role palette, exactly as
-/// [`paint_settings_aurora`] takes `surface` — this banner is a Settings CARD,
-/// and a card that does not follow the resolved chrome palette is a hole in the
-/// page. It used to fill with the landing page's authored `#EDF6EC` mint and a
-/// `#C9DDC8` hairline, byte-identical in all four appearance states, which put a
-/// near-white slab in the middle of the forced-DARK Settings page (the 2026-08
-/// cold visual audit's headline defect, and the last place config `window_theme`
-/// was still a no-op).
-///
-/// The ARCH and the GLINTS keep their authored spectrum — they are the identity,
-/// and a rainbow that re-tints per theme stops being a rainbow — but their alpha
-/// is conditioned on the sky they land on: saturated trim at ~27 % over a pale
-/// sky reads as a pastel wash, while the same alpha over a dark sky all but
-/// vanishes, so the dark side gets the deeper pour that lands it in the same
-/// place perceptually.
+/// `sky` and `rim` come resolved from the caller's role palette, so the card follows the
+/// chrome appearance. The arch and glints keep their spectrum in every theme; only their
+/// alpha follows the sky, deeper over a dark one so the wash reads the same.
 pub(crate) fn paint_rainbow_banner(
     prims: &mut Vec<DrawPrim>,
     x: f32,
@@ -436,13 +391,11 @@ pub(crate) fn paint_rainbow_banner(
     prims.push(DrawPrim::ClipPop);
 }
 
-/// A full-width blank row of `cols` cells in `fg`/`bg` (the `seam` overline marks the
-/// panel's top edge on row 0) — the renderer's (`aterm_render::band`, ruling 331).
+/// A full-width blank row of `cols` cells in `fg`/`bg`; `seam` overlines row 0.
 pub(crate) use aterm_render::band::blank_row;
 
-/// Write `s` into `row` starting at column `col`, clamped to the row width. Each glyph
-/// becomes a `chrome_band::cell` in `fg`/`bg`. Multi-cell-wide glyphs are not expected here
-/// (labels/values are ASCII + a few BMP arrows), so one char == one cell.
+/// Write `s` into `row` from column `col`, clamped to `cols`, one char per cell (labels
+/// and values are ASCII plus a few BMP arrows, never wide glyphs).
 pub(crate) fn write_str(
     row: &mut [RenderCell],
     cols: usize,
@@ -558,11 +511,7 @@ mod tests {
             assert_eq!(SettingsState::display_value(&f), canonical, "{alias}");
         }
 
-        // The typing-sound row: every synth alias (water → droplet, mech →
-        // mechanical, bell / glass bell → music box, …) reads back the voice the
-        // synth actually plays — including an alias of a voice the roster
-        // (`SoundVoice::ALL`) deliberately withholds, which must never collapse to
-        // the roster's first entry (`auto`).
+        // Every synth alias reads back the voice the synth plays.
         for &(alias, voice) in aterm_effects::trail_sound::SoundVoice::ALIASES {
             let canonical = voice.name();
             let f = field(crate::prefs::EDIT_TRAIL_SOUND_STYLE, alias);

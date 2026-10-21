@@ -1,19 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A one-name verb handed several names refuses them all, and does nothing.
-//!
-//! Measured on m3 (2026-09-23): `aterm pkg uninstall ty ay clean` removed `ty`, printed
-//! `atpkg: uninstalled ty`, exited 0 — and `ay` and `clean` were still installed. The
-//! arm read `args.get(1)` and dropped the rest without a word, like every other verb
-//! whose grammar is one operand. `install` already refused a second program in its own
-//! parser; the dispatch edge now refuses for the rest, before the store lock.
-//!
-//! Driven through the real dev binary over a temp HOME whose default prefix holds two
-//! managed programs. The control, `uninstall ta` alone, really removes `ta` — so the
-//! refusal is not a fixture that could not have uninstalled anything. NEVER THE REAL
-//! STORE: `HOME` is a temp directory, `XDG_CONFIG_HOME` an absent one and the registry a
-//! local directory that does not exist, so nothing here can reach the network.
+//! Verify single-operand `atpkg` verbs (`uninstall`, `install`, `verify`,
+//! `which`, `repair`, etc.) reject extra operands before taking the store lock
+//! and leave installed state untouched, using an isolated temp `HOME`.
 
 #![cfg(unix)]
 #![allow(
@@ -200,8 +190,8 @@ fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
 }
 
-/// A verb that takes no argument refuses a stray one at the usage exit, before the store
-/// lock: `repair --dry-run` (there is no such flag) must not re-lay a single shim or rc
+/// A verb that takes no operand refuses a stray argument at the usage exit, before the
+/// store lock: `repair --dry-run` (there is no such flag) must not re-lay a single shim or rc
 /// line. No bare-`repair` control: repair re-asserts the rustup seam, and `RUSTUP_HOME`
 /// is the real one under a rustup-run test.
 #[test]
@@ -218,17 +208,15 @@ fn a_no_argument_verb_refuses_a_stray_one_and_touches_nothing() {
     let all = text(&out);
     assert_eq!(out.status.code(), Some(2), "the usage exit:\n{all}");
     assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("unknown argument \"--dry-run\" \u{2014} this verb takes none"),
+        String::from_utf8_lossy(&out.stderr).contains("unknown or repeated argument \"--dry-run\""),
         "the refusal names the stray argument:\n{all}"
     );
     let mut after = std::fs::read_dir(&f.home)
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect::<std::collections::BTreeSet<_>>();
-    // Rosetta writes its translation cache to `$HOME/.cache/rosetta` in every process it
-    // runs, whatever `XDG_CACHE_HOME` says (measured 2026-10-19): under a translator that
-    // folder is its own, and whether atpkg laid `.cache` is not decided here.
+    // Rosetta writes `$HOME/.cache/rosetta` regardless of `XDG_CACHE_HOME`;
+    // ignore `.cache` when running under a binary translator.
     if let Some(translator) = aterm_uds::process::translator() {
         let cache = std::ffi::OsString::from(".cache");
         let held = std::fs::read_dir(f.home.join(&cache))

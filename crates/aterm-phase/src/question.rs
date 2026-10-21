@@ -1,42 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE QUESTION DIALOG (AskUserQuestion) as Claude Code 2.1.282 draws it,
-//! read whole: its tab bar, its question, each option (its label, its
-//! description, its focus, its checkbox, and `(Recommended)` read from the
-//! LABEL only), the free-text row and the chat row read by their POSITION,
-//! the multi-select button, the Submit (review) tab, and the side-by-side
+//! The question dialog (AskUserQuestion) as Claude Code draws it, read whole: its tab
+//! bar, its question, each option (label, description, focus, checkbox, and
+//! `(Recommended)` read from the label only), the free-text and chat rows read by
+//! position, the multi-select button, the Submit (review) tab, and the side-by-side
 //! preview form. [`crate::prompt::PromptV2::question_dialog`] carries it.
 //!
-//! **THE GEOMETRY** (measured 2026-09-25 on 2.1.282 under a headless aterm
-//! 0.93.0, 53 captures; the fixtures `claude-2.1.282-question-*.txt`). Top
-//! to bottom: a full-width rule at column 0 (its width is the pane's, `W`);
-//! the tab bar (` ☐ Colors` for one single-select question; `←  ☐ Button  ☒
-//! Grey cursor  ✔ Submit  →` for several, and for ONE multi-select question,
-//! whose answers are reviewed too — the active chip is marked by colour
-//! only, so the text never says which tab is up); a blank row; the question
-//! at column 0 (every row led by the `│ ` gutter when its text has a newline
-//! or is wider than 80 cells, else bare); a blank row; the options — `❯ 1.
-//! label` / `  2. label` (the number at column 2, the label at column 5, its
-//! description rows under it at column 5, dim, which the text cannot tell
-//! from a wrapped label) or, multi-select, `  1. [ ] label` (the label and
-//! its description at column 9); the free-text row `N+1. Type something.`
-//! (`[ ] Type something` in multi-select, whose button row `Next` — `Submit`
-//! on the last question — follows at column 5); a full-width divider; the
-//! chat row `  N+2. Chat about this`; a blank row; the key-hint footer (in a
-//! pane narrower than it, word-wrapped onto the rows under it, which the
-//! reader joins first: `prompt.rs`, "A WRAPPED FOOTER").
-//! The preview form draws its options in a 30-cell column with the preview
-//! pane (`┌─┐│└┘`) to their right on the same rows, a blank row, `Notes:
-//! press n to add notes` at the pane's column, no descriptions, no
-//! free-text row, and an UNNUMBERED chat row. The review tab (the `✔ Submit`
-//! chip) draws `Review your answers`, an optional `⚠ You have not answered
-//! all questions`, the answers ` ● <question>` / `   → <answer>`, `Ready to
-//! submit your answers?` and `❯ 1. Submit answers` / `  2. Cancel`, and no
-//! footer. Under a dialog its host may draw the AFK countdown row
-//! (`auto-continue in 16s · any key to stay`, right-aligned), one
-//! right-aligned plugin notice, and the REPL's `Background task update
-//! waiting while this panel is open`.
+//! The geometry (2.1.282 and 2.1.283, the `claude-2.1.28[23]-question-*.txt` fixtures),
+//! top to bottom: a full-width rule at column 0; the tab bar (` ☐ Colors` for one
+//! single-select question; `←  ☐ Button  ☒ Grey cursor  ✔ Submit  →` for several, or for
+//! one multi-select question; the active chip is marked by colour only); a blank row; the
+//! question at column 0 (every row led by a `│ ` gutter when it has a newline or is wider
+//! than 80 cells); a blank row; the options (`❯ 1. label` / `  2. label`: the number at
+//! column 2, the label and its dim description rows at column 5, which the text cannot
+//! tell from a wrapped label; multi-select `  1. [ ] label`, at column 9); the free-text
+//! row `N+1. Type something.` (multi-select: `[ ] Type something`, then the button row
+//! `Next`, or `Submit` on the last question, at column 5); a full-width divider; the chat
+//! row `  N+2. Chat about this`; a blank row; the key-hint footer, which a narrow pane
+//! word-wraps ([`crate::prompt`] joins it first).
 //!
 //! **2.1.283** draws the same geometry (measured 2026-09-25 and read by
 //! this module unchanged; the fixtures `claude-2.1.283-question-*.txt`).
@@ -52,17 +34,12 @@
 //! ([`checkbox`], [`label_col`]), a row continuing at the column its own
 //! text starts at, never another.
 //!
-//! **NEVER READ WHOLE UNLESS SOUND.** A form is read only when every row of
-//! it is one of the rows above, the options are numbered `1..=N` from the
-//! first without a gap, the free-text row is option `N+1` (by position,
-//! never by its words: a person's text replaces them), the chat row is
-//! `N+2`, and exactly one row carries the `❯` focus (2.1.282 always draws
-//! one: none is a rendering this reader did not understand). Anything
-//! else — a scrolled option list (`↑`/`↓` in the pointer column), a
-//! numbering gap, an opened notes field, a head cut by the pane, a dialog
-//! withheld behind a draft in the composer — is
-//! [`QuestionForm::Unknown`]: still a question, never idle, and never
-//! answered.
+//! A form is read whole only when sound: every row is one of the rows above, the options
+//! are numbered `1..=N` without a gap, the free-text row is `N+1` (by position, never by
+//! its words), the chat row `N+2`, and exactly one row carries the `❯`. Anything else (a
+//! scrolled list, `↑`/`↓` in the pointer column; a numbering gap; open notes; a head cut
+//! by the pane; a dialog withheld behind a draft) is [`QuestionForm::Unknown`]: still a
+//! question, never idle, never answered.
 
 use std::ops::Range;
 
@@ -108,9 +85,8 @@ pub struct QuestionText {
     pub gutter: bool,
 }
 
-/// Whether an option's LABEL is marked `(Recommended)` — the tool's own
-/// convention ("add (Recommended) at the end of the label"), read from the
-/// label only, never from a description row.
+/// Whether an option's label is marked `(Recommended)`, the tool's own convention, read
+/// from the label only, never from a description row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recommended {
     /// The option's own row ends ` (Recommended)`.
@@ -147,9 +123,9 @@ pub struct QuestionOption {
     pub selected: bool,
 }
 
-/// The free-text row, `N+1.` — read by its POSITION (the last numbered row
-/// above the divider, or above the multi-select button), never by its
-/// words: a person's text replaces the placeholder.
+/// The free-text row, `N+1.`, read by its position (the last numbered row above the
+/// divider, or above the multi-select button), never by its words: a person's text
+/// replaces the placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreeText {
     pub n: u8,
@@ -216,8 +192,8 @@ pub enum QuestionForm {
         chat: ChatRow,
         pane_col: usize,
     },
-    /// The Submit tab: `1. Submit answers` / `2. Cancel` (its cancel rejects
-    /// the tool call, measured).
+    /// The Submit tab: `1. Submit answers` / `2. Cancel` (its cancel rejects the tool
+    /// call).
     Review {
         /// `⚠ You have not answered all questions` is drawn.
         unanswered: bool,
@@ -407,10 +383,8 @@ impl QShape {
         }
     }
 
-    /// A live question footer whose rows are none of the shapes read (a
-    /// focused or unnumbered chat row the old walk stopped at, a shape a
-    /// later release draws): rows `first..=footer`, the head off the screen
-    /// (`prompt::question_fallback`).
+    /// A live question footer whose rows are none of the shapes read (one a later release
+    /// draws): rows `first..=footer`, the head off the screen (`prompt::question_fallback`).
     pub(crate) fn fallback(first: usize, footer: usize) -> Self {
         Self {
             footer: Some(footer),
@@ -441,8 +415,7 @@ enum Pointer {
     /// `❯`: the focus.
     Focus,
     Blank,
-    /// `↑` / `↓`: the list is scrolled (He() draws them in place of the
-    /// pointer, 2.1.282).
+    /// `↑` / `↓` in place of the pointer: the list is scrolled.
     Scrolled,
 }
 
@@ -667,17 +640,15 @@ fn cell_of(row: &str, c: char) -> Option<usize> {
 
 // ---- under the dialog -----------------------------------------------------
 
-/// The AFK countdown row (Lme(), right-aligned): `auto-continue in 16s ·
-/// any key to stay`.
+/// The right-aligned AFK countdown row: `auto-continue in 16s · any key to stay`.
 fn afk_row(row: &str) -> bool {
     let t = crate::text::trim(row);
     t.starts_with(const { anchor_text("question.auto_continue") })
         && t.ends_with(const { anchor_text("question.stay") })
 }
 
-/// The REPL's row while a panel holds the queue (Y_(), 2.1.282): `Background
-/// task update waiting while this panel is open`, or `<N> background task
-/// updates …`.
+/// The REPL's row while a panel holds the queue: `Background task update waiting while
+/// this panel is open`, or `<N> background task updates …`.
 fn panel_waiting_row(row: &str) -> bool {
     let t = crate::text::trim(row);
     let Some(head) = t.strip_suffix(const { anchor_text("dialog.panel_waiting") }) else {
@@ -690,9 +661,8 @@ fn panel_waiting_row(row: &str) -> bool {
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// One right-aligned plugin notice (Fme(): one row, flex-end, dim) in a
-/// dialog `width` cells wide: at least half the width of leading spaces, and
-/// none of a dialog's, a rule's or the composer's glyphs.
+/// One right-aligned, dim plugin notice in a dialog `width` cells wide: at least half the
+/// width of leading spaces, and none of a dialog's, a rule's or the composer's glyphs.
 fn plugin_notice_row(row: &str, width: usize) -> bool {
     let t = crate::text::trim(row);
     !t.is_empty()
@@ -701,10 +671,9 @@ fn plugin_notice_row(row: &str, width: usize) -> bool {
         && numbered(t).is_none()
 }
 
-/// What sits under a dialog from row `from` down: blank rows, and at most
-/// one each of the AFK countdown row, a plugin notice and the panel's
-/// waiting row. `Some(afk row)` when that
-/// is all; `None` when anything else is there.
+/// What sits under a dialog from row `from` down: blank rows, and at most one each of
+/// the AFK countdown row, a plugin notice and the panel's waiting row. `Some(afk row)`
+/// when that is all; `None` when anything else is there.
 pub(crate) fn trailers(rows: &[String], from: usize, width: usize) -> Option<Option<usize>> {
     let (mut afk, mut plugin, mut panel) = (None, false, false);
     for (i, r) in rows.iter().enumerate().skip(from) {
@@ -883,12 +852,10 @@ enum Walk {
     Rows(Zone),
 }
 
-/// The single- or multi-select options zone above the divider: the
-/// contiguous rows up to a blank row, each a numbered row (the pointer
-/// column, the number at column 2), a row at its label column (5, or 9 in
-/// multi-select, 8 under a `[✔]` drawn with no space: [`label_col`]; a
-/// description or a wrap) under one, or — multi-select, the
-/// zone's last row — the button. `None` for any other row.
+/// The single- or multi-select options zone above the divider: the contiguous rows up to
+/// a blank row, each a numbered row, a row at its label column under one (a description
+/// or a wrap: [`label_col`]), or, multi-select, the zone's last row, the button. `None`
+/// for any other row.
 fn options_zone(rows: &[String], divider: usize) -> Option<Walk> {
     let mut top = divider.checked_sub(1)?;
     if blank(&rows[top]) {
@@ -968,12 +935,10 @@ fn options_zone(rows: &[String], divider: usize) -> Option<Walk> {
     }))
 }
 
-/// The preview form's zone above the divider, walked up: blank rows; the
-/// notes row(s) at the pane's column; blank rows; the option block — its
-/// numbered rows with the pane (`┌─┐│└┘`) to their right, rows continuing a
-/// label left of the pane (R8: a label wraps inside the 30-cell column),
-/// and rows of the pane alone. The pane's column is the `┌`'s on the first
-/// option row.
+/// The preview form's zone above the divider, walked up: blank rows; the notes row(s) at
+/// the pane's column; blank rows; the option block (numbered rows with the pane `┌─┐│└┘`
+/// to their right, rows continuing a label inside its 30-cell column, rows of the pane
+/// alone). The pane's column is the `┌`'s on the first option row.
 fn preview_zone(rows: &[String], divider: usize) -> Option<Walk> {
     let mut i = divider.checked_sub(1)?;
     while blank(&rows[i]) {
@@ -1047,20 +1012,17 @@ fn preview_zone(rows: &[String], divider: usize) -> Option<Walk> {
     }))
 }
 
-/// The review (Submit) tab, which draws no footer, read bottom up: under
-/// it only blank rows and R6's rows; `2. <one word>` (its cancel, read by
-/// position); `1. Submit answers`; a blank row; `Ready to submit your
-/// answers?` at column 0; blank rows; the answers (rows indented one or
-/// more); blank rows; optionally `⚠ You have not answered all questions`
-/// and blank rows; `Review your answers` at column 0; blank rows; a tab bar
-/// with a `✔ Submit` chip; the top rule. No composer frame anywhere (the
-/// dialog replaces it), and no transcript row among its rows. When the two
-/// options and `Ready to submit …` match but the rest does not (a cut, a
-/// row out of place), the tab is read with its head off the screen, form
-/// unknown: escalated, never idle.
+/// The review (Submit) tab, which draws no footer, read bottom up: only blank rows and
+/// [`trailers`] under it; `2. <one word>` (its cancel, by position); `1. Submit answers`;
+/// a blank row; `Ready to submit your answers?` at column 0; blank rows; the answers
+/// (indented); blank rows; optionally `⚠ You have not answered all questions` and blank
+/// rows; `Review your answers` at column 0; blank rows; a tab bar with a `✔ Submit` chip;
+/// the top rule. No composer frame and no transcript row. When the two options and
+/// `Ready to submit …` match but the rest does not, the tab is read with its head off the
+/// screen, form unknown: escalated, never idle.
 pub(crate) fn review(rows: &[String]) -> Option<QShape> {
-    // The reader runs on the window's main thread every frame: a screen
-    // with no `Ready to submit …` row is no review, at the cost of a scan.
+    // The reader runs on the window's main thread every frame: no `Ready to submit …`
+    // row, no review, for the cost of one scan.
     let ready_text = const { anchor_text("question.review_ready") };
     if !rows.iter().any(|r| crate::text::trim_end(r) == ready_text)
         || crate::phase::composer_frame(rows).is_some()
@@ -1068,7 +1030,7 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
         return None;
     }
     let width = screen_width(rows);
-    // The last row that is none of R6's (each at most once).
+    // The last row that is not one of the trailers (each at most once).
     let mut last = rows.len().checked_sub(1)?;
     loop {
         if !blank(&rows[last]) && trailers(rows, last, width).is_none() {
@@ -1189,14 +1151,11 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
     Some(shape(QForm::Review, bar, Some(rule), Some(bar), warning))
 }
 
-/// A dialog Claude Code WITHHOLDS while the composer holds a draft (Ufe()'s
-/// reason `draft`, 2.1.282): no dialog, and in its place the dim notice
-/// `Claude has a question for you — it shows once you send or clear what
-/// you're typing.` (or `… a suggestion …`), one row or wrapped onto a few
-/// at one column. Read where the live UI draws it — outside the composer's
-/// frame, at column 0 or 1, no transcript row or user row between it and
-/// the frame when it is above it — as a question not read whole, never
-/// idle (a silent stall while the draft stands).
+/// A dialog Claude Code withholds while the composer holds a draft: in its place the dim
+/// notice `Claude has a question for you — it shows once you send or clear what you're
+/// typing.` (or `… a suggestion …`), one row or wrapped at one column. Read outside the
+/// composer's frame, at column 0 or 1, with no transcript or user row between it and a
+/// frame below it, as a question not read whole: never idle while the draft stands.
 pub(crate) fn deferred(rows: &[String]) -> Option<QShape> {
     let frame = crate::phase::composer_frame(rows)?;
     let texts = [
@@ -1411,8 +1370,8 @@ fn select_form(rows: &[String], shape: &QShape) -> Result<QuestionForm, &'static
     one_focus(form)
 }
 
-/// `form` when exactly one of its rows carries the `❯` (R11: none is a
-/// rendering this reader did not understand; 2.1.282 always draws one).
+/// `form` when exactly one of its rows carries the `❯`: 2.1.282 always draws one, so
+/// none is a rendering this reader does not understand.
 fn one_focus(form: QuestionForm) -> Result<QuestionForm, &'static str> {
     let probe = QuestionDialog {
         tabs: Vec::new(),
@@ -1428,13 +1387,11 @@ fn one_focus(form: QuestionForm) -> Result<QuestionForm, &'static str> {
     }
 }
 
-/// An option's label and description (module header): the option's row and
-/// the rows under it to `until`. The LABEL CHAIN is the option's row and the
-/// run of rows under it each [`possibly_wrap`] of the row above; the label
-/// is [`Recommended::Wrapped`] at chain row `k` when the option's own row
-/// does not end ` (Recommended)` and row `k` does. The label is the
-/// option's row alone — or, wrapped, the chain to `k` — and the rest is the
-/// description.
+/// An option's label and description: the option's row and the rows under it to `until`.
+/// The label chain is the option's row and the run of rows under it each [`possibly_wrap`]
+/// of the row above. The label is the option's row alone, or, when the row does not end
+/// ` (Recommended)` but chain row `k` does, the chain to `k` ([`Recommended::Wrapped`]);
+/// the rest is the description.
 fn split_label(
     rows: &[String],
     row: usize,

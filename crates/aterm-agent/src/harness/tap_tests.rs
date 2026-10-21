@@ -2,15 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(unix)]
 const EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 const SID: &str = "s-60776b6e2ed1b73bd013";
 
-/// The status-line payload Claude Code 2.1.300 handed the lab's tap (E1,
-/// `tap-inline.jsonl`), its paths replaced with example ones: what the verb
-/// reads, and the fields it must leave alone.
+/// A Claude Code 2.1.300 status-line payload (lab capture `tap-inline.jsonl`, paths replaced).
 fn payload(api_ms: u64, five: Option<(u32, i64)>, seven: Option<(u32, i64)>) -> String {
     let window = |w: Option<(u32, i64)>| {
         w.map_or_else(
@@ -45,15 +43,11 @@ fn vars() -> TapVars {
     }
 }
 
-fn scratch(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-tap-{label}-{}-{}",
-        std::process::id(),
-        aterm_time::unix_millis().unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(label: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("aterm-tap-{label}-"))
+        .tempdir()
+        .expect("scratch")
 }
 
 /// A file's permission bits: the reading's privacy is a unix mode.
@@ -193,7 +187,8 @@ fn the_tap_names_the_console_image_beside_a_windowed_one() {
 /// time. NEGATIVE CONTROL: the figures the line shows are the payload's.
 #[test]
 fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
-    let dir = scratch("verb");
+    let root = scratch("verb");
+    let dir = root.path().to_path_buf();
     let rl = dir.join("rl");
     let five = Some((42, 1_792_062_396));
     let seven = Some((61, 1_792_397_196));
@@ -212,11 +207,13 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
         read.five_hour,
         Some(Window {
             pct: 42,
-            resets_at: 1_792_062_396
+            resets_at: 1_792_062_396,
+            pct_x10: Some(420),
         })
     );
     assert_eq!(read.seven_day.map(|w| w.pct), Some(61));
     assert_eq!(read.version.as_deref(), Some("2.1.300"));
+    assert_eq!(read.model.as_deref(), Some("claude-sonnet-5-5"));
     assert_eq!(
         read.session.as_deref(),
         Some("6cf4169e-20c7-4bcb-a97f-e8a1387ed6ea")
@@ -231,6 +228,45 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
         .map(|e| e.file_name())
         .collect();
     assert_eq!(names.len(), 1, "{names:?}");
+
+    // An occupied candidate is borrowed, so a failed write leaves it and
+    // the last published reading alone. The verb still prints its line.
+    let candidate = rl.join(format!(".{SID}-68537.json.tmp{}", std::process::id()));
+    std::fs::write(&candidate, "borrowed sentinel").expect("candidate");
+    let (_, collision_line) = tap(payload(19, five, seven).as_bytes(), &vars(), Some(&rl));
+    assert_eq!(collision_line, "5h 42% \u{b7} 7d 61%\n");
+    assert_eq!(
+        std::fs::read_to_string(&candidate).expect("preserved"),
+        "borrowed sentinel"
+    );
+    assert_eq!(std::fs::read_to_string(&file).expect("last reading"), text);
+    std::fs::remove_file(&candidate).expect("remove owned sentinel");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+        let name = std::ffi::CString::new(candidate.as_os_str().as_bytes()).expect("path");
+        // SAFETY: name is a live terminated path in the owned directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (_, collision_line) = tap(payload(19, five, seven).as_bytes(), &vars(), Some(&rl));
+        assert_eq!(collision_line, "5h 42% \u{b7} 7d 61%\n");
+        assert!(
+            std::fs::symlink_metadata(&candidate)
+                .expect("preserved FIFO")
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("last reading"), text);
+        std::fs::remove_file(&candidate).expect("remove owned FIFO");
+    }
+    let _ = tap(payload(19, five, seven).as_bytes(), &vars(), Some(&rl));
+    assert_eq!(
+        Reading::read(&rl, SID, 68537, 0)
+            .expect("write recovered")
+            .0
+            .api_ms,
+        19
+    );
 
     let over = vec![b' '; STDIN_MAX + 10];
     for stdin in [
@@ -286,7 +322,6 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
     let (code, line) = tap(payload(1, five, seven).as_bytes(), &vars(), None);
     assert_eq!(code, std::process::ExitCode::SUCCESS);
     assert_eq!(line, "5h 42% \u{b7} 7d 61%\n");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// NOTHING OF STDIN IS WRITTEN AS IT CAME, and no variable but the four is
@@ -305,7 +340,8 @@ fn the_verb_never_writes_a_secret_it_was_handed() {
         let _ = super::super::cli::main_entry(vec!["tap".into()]);
         return;
     }
-    let dir = scratch("secret");
+    let root = scratch("secret");
+    let dir = root.path().to_path_buf();
     let state = aterm_types::dirs::resolve_state_dir(
         None,
         aterm_types::dirs::StatePlatform {
@@ -357,16 +393,128 @@ fn the_verb_never_writes_a_secret_it_was_handed() {
     assert!(!text.contains("SECRET"), "{text}");
     assert!(!stdout.contains("SECRET"), "{stdout}");
     assert!(!text.contains("transcript_path") && !text.contains("/Users//example"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A FILE IS READ ONLY AS ITS OWN PROCESS'S: its tab and pid in the name and
-/// in the text, written since the process started, a regular file. NEGATIVE
-/// CONTROLS: another tab's, another pid's, one older than the process, a
-/// symlink to a good file and a file of another format are each refused.
+/// A RE-REPORT KEEPS THE FIRST REPORT'S STAMP (the account-stats design
+/// §3.4, §3.5): Claude Code runs the tap every ten seconds while idle,
+/// re-reporting the figure it holds, and the file's `at` stays the run's
+/// that first reported it — so a figure read late is as old as it is, and
+/// one from before a limit reset used inside its window is cut by that
+/// reset however late the host reads it. Session B's 100%, first reported
+/// before session A's refill at `E`, re-reported after it and read then:
+/// the account keeps A's 3%, and B's next served reply (2%, dropped from
+/// that 100%) opens no second epoch. NEGATIVE CONTROLS: a request served
+/// since (`api_ms` rose) or a figure that moved is a new report, stamped by
+/// its own run; and the same late reading stamped by its late write — what
+/// the tap wrote before — is taken as served after the reset, so 100%
+/// stands again and B's next reply writes a second `reset` row.
+#[test]
+fn a_re_report_keeps_the_first_reports_stamp() {
+    use crate::harness::accounts::{self, Kind, State, TapRead, WindowRead};
+    let root = scratch("first-report");
+    let dir = root.path().to_path_buf();
+    let reset = 1_792_062_396;
+    let report = |api_ms: u64, pct: u32, now: i64| {
+        let mut out = Vec::new();
+        let stdin = payload(api_ms, Some((pct, reset)), None);
+        let _ = run(
+            &mut stdin.as_bytes(),
+            false,
+            &vars(),
+            Some(&dir),
+            now,
+            &mut out,
+        );
+        Reading::read(&dir, SID, 68537, 0).expect("its own file").0
+    };
+    let mut legacy = report(18, 100, 1000);
+    assert_eq!(legacy.at, 1000);
+    legacy.five_hour.as_mut().expect("five hour").pct_x10 = None;
+    let name = file_name(SID, 68537).expect("name");
+    write_reading(&dir, &name, &legacy.to_json()).expect("older v1 reading");
+    assert_eq!(report(18, 100, 1010).at, 1000, "a re-report");
+    let late = report(18, 100, 1366);
+    assert_eq!(late.at, 1000, "a re-report, read late");
+    // The account: A's 100% (served at 990), A's refill to 3% at E = 1100,
+    // then B's late reading, then B's next reply.
+    let five = |pct_x10: u32, refilled: Option<u32>, at: i64| TapRead {
+        five_hour: Some(WindowRead {
+            pct_x10,
+            reset,
+            refilled,
+        }),
+        seven_day: None,
+        at,
+        seen_before: true,
+        born: None,
+        key: None,
+    };
+    let account = |b_late: TapRead| {
+        let mut state = State::default();
+        let mut resets = 0;
+        let mut note = |state: &mut State, read: &TapRead, now: i64| {
+            resets += accounts::note_reading(state, "main", read, now)
+                .iter()
+                .filter(|e| e.kind == Kind::Reset)
+                .count();
+        };
+        note(&mut state, &five(1000, None, 990), 990);
+        note(&mut state, &five(30, Some(1000), 1100), 1100);
+        note(&mut state, &b_late, 1366);
+        let held = state.accounts["main"].windows[accounts::SESSION_LIMIT].pct_x10;
+        note(&mut state, &five(20, Some(1000), 1400), 1400);
+        (held, resets)
+    };
+    let beside = Beside {
+        seen: true,
+        refilled: [None, None],
+    };
+    assert_eq!(account(late.tap_read(beside, None)), (30, 1));
+    // NEGATIVE CONTROL: stamped by its late write, it stands again.
+    let rewritten = TapRead {
+        at: 1366,
+        ..late.tap_read(beside, None)
+    };
+    assert_eq!(account(rewritten), (1000, 2));
+    // NEGATIVE CONTROLS: served since; a figure that moved.
+    assert_eq!(report(31, 100, 1376).at, 1376, "served since");
+    assert_eq!(report(31, 99, 1386).at, 1386, "a figure moved");
+    // Both windows compare their served values, including a tenth that
+    // moves without changing the whole-percent row.
+    let mut legacy = report(31, 42, 1396);
+    legacy.five_hour.as_mut().expect("five hour").pct_x10 = None;
+    legacy.seven_day = Some(Window {
+        pct: 61,
+        resets_at: reset + 3600,
+        pct_x10: None,
+    });
+    write_reading(&dir, &name, &legacy.to_json()).expect("both older windows");
+    let mut precise = legacy.clone();
+    precise.at = 1406;
+    precise.five_hour.as_mut().expect("five hour").pct_x10 = Some(420);
+    precise.seven_day.as_mut().expect("week").pct_x10 = Some(610);
+    let path = dir.join(&name);
+    assert_eq!(first_reported(&path, &precise), 1396);
+    for five in [true, false] {
+        let mut moved = precise.clone();
+        let window = if five {
+            moved.five_hour.as_mut()
+        } else {
+            moved.seven_day.as_mut()
+        }
+        .expect("window");
+        window.pct_x10 = Some(window.x10() + 1);
+        assert_eq!(first_reported(&path, &moved), 1406, "a tenth moved");
+    }
+}
+
+/// A reading is read only from its own process's regular file: tab and pid in name and text,
+/// written since the process started. Negative controls: another tab's, another pid's, an older
+/// one, a symlink and another format version are each refused.
 #[test]
 fn a_reading_is_read_only_from_its_own_processes_file() {
-    let dir = scratch("read");
+    let root = scratch("read");
+    let dir = root.path().to_path_buf();
     let vars = vars();
     let mut out = Vec::new();
     let _ = run(
@@ -403,11 +551,16 @@ fn a_reading_is_read_only_from_its_own_processes_file() {
     let text = std::fs::read_to_string(dir.join(&name)).expect("read");
     std::fs::write(dir.join(&name), text.replace("\"v\":1", "\"v\":2")).expect("write");
     assert!(Reading::read(&dir, SID, 68537, 0).is_none());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Reading {
-    let w = |pct: Option<u32>, at: i64| pct.map(|pct| Window { pct, resets_at: at });
+    let w = |pct: Option<u32>, at: i64| {
+        pct.map(|pct| Window {
+            pct,
+            resets_at: at,
+            pct_x10: None,
+        })
+    };
     Reading {
         at: 0,
         sid: SID.to_string(),
@@ -421,8 +574,117 @@ fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Read
         warm: None,
         cache_expires_at: None,
         version: None,
+        model: None,
         dur_us: 0,
     }
+}
+
+/// THE TENTHS AND THE MODEL (the account-stats design §4.2, F1): Claude Code
+/// hands `used_percentage` with one decimal (`42.6` in the lab, 2.1.301):
+/// the row prints the whole percent it rounds to, the file keeps the tenths
+/// and the process's `model.id` beside it, and both read back. A file an
+/// older tap wrote — no `pct_x10`, no `model` — still reads, with neither
+/// (`FORMAT_V` stays 1). A `model.id` that is no model id is not kept.
+/// NEGATIVE CONTROL: a whole-percent payload has whole tenths, and the
+/// figure in tenths of an old file is its whole percent times ten.
+#[test]
+fn a_reading_keeps_the_vendors_tenths_and_its_model() {
+    let text = r#"{"model":{"id":"claude-opus-5-5"},"cost":{"total_api_duration_ms":9},
+"rate_limits":{"five_hour":{"used_percentage":42.6,"resets_at":1792062396},
+"seven_day":{"used_percentage":61,"resets_at":1792397196}}}"#;
+    let r = Reading::of_stdin(text, &vars(), 1_792_050_000).expect("a reading");
+    let five = r.five_hour.expect("the five-hour window");
+    assert_eq!((five.pct, five.pct_x10, five.x10()), (43, Some(426), 426));
+    assert_eq!(r.line(), "5h 43% \u{b7} 7d 61%");
+    assert_eq!(
+        r.seven_day.and_then(|w| w.pct_x10),
+        Some(610),
+        "a whole percent"
+    );
+    assert_eq!(r.model.as_deref(), Some("claude-opus-5-5"));
+    let back = Reading::of_json(&r.to_json()).expect("reads back");
+    assert_eq!(back, r);
+    // An older tap's file: no tenths, no model.
+    let old = r#"{"v":1,"at":5,"sid":"s-1","pid":7,"session":null,"login":null,"home":null,
+"api_ms":3,"five_hour":{"pct":42,"resets_at":9},"seven_day":null,"cache":{},"version":null}"#;
+    let old = Reading::of_json(old).expect("an older file reads");
+    let w = old.five_hour.expect("its window");
+    assert_eq!((w.pct_x10, w.x10()), (None, 420));
+    assert_eq!(old.model, None);
+    let odd = text.replace("claude-opus-5-5", "not a model; rm -rf");
+    let r = Reading::of_stdin(&odd, &vars(), 1_792_050_000).expect("a reading");
+    assert_eq!(r.model, None);
+}
+
+/// WHAT A READING SAYS BESIDE THE LAST ADMITTED ([`Fresh::beside`]): the
+/// same process read before is `seen`; a window is REFILLED, from the
+/// figure that process read before, where it was served since (`api_ms`
+/// rose) and reads lower by a whole point or more under the same reset —
+/// the drop a limit reset used inside the window makes. NEGATIVE CONTROLS: the same drop with no API time since
+/// (an idle repeat), another process, another reset, and a tenth's wobble
+/// are no refill; and another process is not `seen`.
+#[test]
+fn a_refill_is_a_drop_in_one_process_served_since_under_one_reset() {
+    let at = |pct_x10: u32, reset: i64| {
+        Some(Window {
+            pct: (pct_x10 + 5) / 10,
+            resets_at: reset,
+            pct_x10: Some(pct_x10),
+        })
+    };
+    let read = |pid: u32, api_ms: u64, five: Option<Window>| Reading {
+        five_hour: five,
+        ..reading(pid, api_ms, None, Some(30))
+    };
+    let mut fresh = Fresh::default();
+    assert!(fresh.admit(&read(7, 100, at(1000, 50))));
+    let beside = |r: &Reading| fresh.beside(r);
+    assert_eq!(
+        beside(&read(7, 200, at(50, 50))),
+        Beside {
+            seen: true,
+            refilled: [Some(1000), None],
+        }
+    );
+    assert_eq!(
+        beside(&read(7, 100, at(50, 50))).refilled,
+        [None, None],
+        "no API time since"
+    );
+    assert_eq!(
+        beside(&read(7, 200, at(50, 80))).refilled,
+        [None, None],
+        "another reset"
+    );
+    assert_eq!(
+        beside(&read(7, 200, at(995, 50))).refilled,
+        [None, None],
+        "a tenth's wobble"
+    );
+    assert_eq!(
+        beside(&read(8, 200, at(50, 50))),
+        Beside::default(),
+        "another process"
+    );
+    // `tap_read` carries what was said, in tenths, at the file's time.
+    let r = Reading {
+        at: 77,
+        ..read(7, 200, at(50, 50))
+    };
+    let t = r.tap_read(beside(&r), None);
+    assert_eq!(
+        t.five_hour,
+        Some(accounts::WindowRead {
+            pct_x10: 50,
+            reset: 50,
+            refilled: Some(1000),
+        })
+    );
+    assert_eq!((t.at, t.seen_before), (77, true));
+    assert_eq!(
+        t.seven_day.map(|w| (w.pct_x10, w.refilled)),
+        Some((300, None))
+    );
 }
 
 /// FRESHNESS (design §3.2) ON THE LAB'S OWN SEQUENCES (Claude Code 2.1.300,
@@ -433,7 +695,7 @@ fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Read
 /// whatever it repeats; a reading with no figures never is.
 #[test]
 fn freshness_admits_news_and_never_an_idle_repeat() {
-    // tap-refresh2: (api_ms, 5h, 7d) as the tap saw them, 01:09:42 on.
+    // tap-refresh2: (api_ms, 5h, 7d) as the tap saw them.
     let refresh2 = [(0, None, None), (0, Some(75), Some(43))]
         .into_iter()
         .chain(std::iter::repeat_n((0, Some(75), Some(43)), 10));
@@ -467,11 +729,9 @@ fn freshness_admits_news_and_never_an_idle_repeat() {
     assert!(!Fresh::default().admit(&reading(13, 50, None, None)));
 }
 
-/// THE SILENT TAP: marked only for a process up at least 30 s that served a
-/// turn, whose file is missing or older than 30 s at two points 30 s apart;
-/// once; unmarked when heard again; started over for a new process.
-/// NEGATIVE CONTROLS: a process that served no turn, one up for less, one
-/// whose file is fresh, and two strikes too close together are never marked.
+/// A tap is marked silent, once, only for a process up at least 30 s that served a turn, whose
+/// file is missing or older than 30 s at two points 30 s apart; heard again, it is unmarked.
+/// Negative controls: no turn served, up for less, a fresh file, strikes too close together.
 #[test]
 fn a_tap_is_silent_only_after_two_strikes_on_a_served_process() {
     let mut s = Silence::default();
@@ -510,12 +770,9 @@ fn a_tap_is_silent_only_after_two_strikes_on_a_served_process() {
     assert_eq!(s.step(80, 8, 100, true, None), Heard::Silent);
 }
 
-/// A SILENT MARK ENDS WITH ITS PROCESS, said once ([`Heard::Again`]): at
-/// the first point of the process relaunched in place — its file there or
-/// not — and when the tab's agent is one that carries no tap. The new
-/// process is judged on its own: two strikes of its own mark it again.
-/// NEGATIVE CONTROLS: the marked process at a later stale point stays
-/// marked and says nothing; an unmarked process replaced says nothing.
+/// A silent mark ends, once ([`Heard::Again`]), at the first point of a relaunched process or when
+/// the tab's agent carries no tap; the new process needs two strikes of its own. Negative
+/// controls: the marked process stays marked and quiet; an unmarked process replaced says nothing.
 #[test]
 fn a_silent_mark_ends_with_its_process() {
     let marked = || {
@@ -551,7 +808,8 @@ fn a_silent_mark_ends_with_its_process() {
 /// and leaves a live process's file and anything not named as ours.
 #[test]
 fn a_sweep_takes_the_dead_and_the_old_and_nothing_else() {
-    let dir = scratch("sweep");
+    let root = scratch("sweep");
+    let dir = root.path().to_path_buf();
     for name in [
         format!("{SID}-1.json"),
         format!("{SID}-2.json"),
@@ -582,7 +840,6 @@ fn a_sweep_takes_the_dead_and_the_old_and_nothing_else() {
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
     assert!(!left.contains(&format!("{SID}-2.json")), "an old one");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The facts of a line the gate admits: the switch on, the machine's own
@@ -772,9 +1029,8 @@ fn each_guard_alone_refuses_the_tap() {
     }
 }
 
-/// The real Claude Code 2.1.300's idle screen with the tap's row, at
-/// 110x32 and at 80x24 beside the vendor's credits notice (the real-claude
-/// lab, 2026-10-15), as rows.
+/// Claude Code 2.1.300's idle screen with the tap's row, at 110x32 and at 80x24 beside the
+/// vendor's credits notice.
 fn tap_screens() -> [Vec<String>; 2] {
     use aterm_phase::prompt::fixtures::screen;
     [
@@ -813,26 +1069,31 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
             Some(Window {
                 pct: 42,
                 resets_at: 1,
+                pct_x10: None,
             }),
             Some(Window {
                 pct: 61,
                 resets_at: 2,
+                pct_x10: None,
             }),
         ),
         line_of(
             Some(Window {
                 pct: 100,
                 resets_at: 1,
+                pct_x10: None,
             }),
             Some(Window {
                 pct: 100,
                 resets_at: 2,
+                pct_x10: None,
             }),
         ),
         line_of(
             Some(Window {
                 pct: 0,
                 resets_at: 1,
+                pct_x10: None,
             }),
             None,
         ),

@@ -2,25 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Platform (winit) → engine keyboard mapping (K-2).
+//! Bridge from winit's `Key`/`NamedKey`/`PhysicalKey` to the engine's
+//! [`Key`]/[`NamedKey`], plus US-QWERTY `base_layout_key` derivation for
+//! Kitty `REPORT_ALTERNATE_KEYS`.
 //!
-//! The reusable bridge from winit's `Key`/`NamedKey`/`PhysicalKey` to the
-//! engine's bridge-agnostic [`Key`]/[`NamedKey`], plus the US-QWERTY
-//! `base_layout_key` derivation the Kitty `REPORT_ALTERNATE_KEYS` enhancement
-//! needs. The GUI and the future native shell share ONE table instead of each
-//! hand-rolling an inline match that drifts (the old GUI match stopped at F12,
-//! dropped Super/Cmd, and had no numpad/media keys).
-//!
-//! WHY ITS OWN CRATE. This was `aterm-types/src/keyboard/winit_map.rs` behind an
-//! optional `winit-keymap` feature whose stated job was "so non-GUI consumers of
-//! `aterm-types` never link winit". Cargo unifies features across a workspace
-//! resolve, so a plain `cargo build --workspace` turned that feature on for
-//! everyone and `aterm-ctl` — aterm-types + aterm-uds, no third-party
-//! dependency — shipped linking AppKit, Carbon, ApplicationServices,
-//! CoreGraphics, CoreVideo, CoreFoundation, Foundation and libobjc. A separate
-//! crate is the enforceable form of the same intent: `aterm-types` no longer
-//! mentions winit at all, so nothing can unify an edge that does not exist.
-//! See `crates/aterm-winit-keymap/Cargo.toml`.
+//! Kept in its own crate so non-GUI crates that depend on `aterm-types`
+//! (`aterm-ctl`, `aterm-uds`) never pull in `winit` or platform windowing
+//! frameworks via Cargo feature unification.
 
 use aterm_window::keyboard::{
     Key as WinitKey, KeyCode, KeyLocation, NamedKey as WinitNamed, PhysicalKey,
@@ -57,15 +45,10 @@ pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
 
 /// Map a winit [`WinitNamed`] into the engine's [`NamedKey`].
 ///
-/// Covers the FULL set the engine can encode: navigation, editing, locks,
-/// system keys, F1-F35, the media/audio cluster, and the modifier keys
-/// (including Super/Cmd, which the old inline match dropped). The keypad keys
-/// are NOT here, because winit has none to map: a keypad press arrives as the
-/// main block's logical key (`Character("5")`, `Named(Enter)`, `Named(End)`)
-/// with the keypad recorded in `KeyLocation` alone. [`map_numpad_key`], which
-/// `build_key_input` asks FIRST, is the one road to the engine's `Numpad*`.
-/// Returns `None` for variants with no terminal encoding (TV, IME composition,
-/// launch/browser/phone keys, etc.).
+/// Covers navigation, editing, locks, system keys, F1–F35, media/audio keys,
+/// and modifiers. Keypad keys are mapped first via [`map_numpad_key`]
+/// (since winit reports keypad presses using main-block logical keys with
+/// `KeyLocation::Numpad`). Returns `None` for keys without a terminal encoding.
 #[must_use]
 pub(crate) fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
     Some(match named {
@@ -204,31 +187,16 @@ pub fn physical_modifier_twin(physical: PhysicalKey) -> Option<PhysicalKey> {
     }))
 }
 
-/// The keypad key a winit press IS — the one road from a physical numpad to
-/// the engine's `Numpad*` keys (DECKPAM's SS3 forms, kitty's
-/// `CSI 57399..57427 u`) — or `None` when the press is not a keypad key the
-/// engine names. winit has no keypad key of its own: KP_5 arrives as
-/// `Character("5")` and KP_Enter as `Named(Enter)`, the very keys the main
-/// block produces, with the keypad recorded in `location` alone. So this is
-/// asked BEFORE [`map_logical_key`], which cannot see the keypad at all.
+/// Map a keypad press (`KeyLocation::Numpad`) to the engine's `Numpad*`
+/// [`Key`], or `None` when not a recognized keypad key.
 ///
-/// `location` says whether the key is on the keypad; `logical` — the event's
-/// `logical_key`, which carries NumLock — says what it means there. The
-/// identity is the GLYPH the layout typed, not the scancode: a de-DE
-/// `keypad(comma)` decimal key types `,` and is KP_Separator (SS3 `l`), which
-/// is how xterm and kitty read it, where a scancode table would type `.`.
-/// Enter on the keypad is KP_Enter; a NumLock-off navigation key is its keypad
-/// twin. `physical` settles only the nameless NumLock-off centre key — the one
-/// keypad key winit names on no platform (`Unidentified` from xkb's KP_Begin,
-/// `Clear` on Windows) — as NumpadBegin. A keypad key with no keypad identity
-/// (KP_Tab, KP_Space, a key remapped to a letter) yields `None` and takes the
-/// logical route as before.
-///
-/// The caller passes `logical_key`, never `key_without_modifiers()`: the Linux
-/// backends derive the latter from xkb's LEVEL-0 keysym, and the KEYPAD type
-/// keeps the NumLock-OFF symbol at level 0 (`types/numpad`: `map[None] =
-/// Level1`; `symbols/keypad(x11)`: `<KP1> { [ KP_End, KP_1 ] }`), so a
-/// NumLock-on keypad 1 reads back from it as End.
+/// Must be queried before [`map_logical_key`] because winit reports keypad
+/// presses using main-block logical keys (`Character("5")`, `Named(Enter)`).
+/// Uses the event's `logical_key` (not `key_without_modifiers()`, whose xkb
+/// level-0 symbol ignores NumLock) so layout-specific decimal keys (``.` vs
+/// `,`) and NumLock navigation states resolve accurately, falling back to
+/// `physical` (`KeyCode::Numpad5`) only for the nameless NumLock-off center
+/// key (`NumpadBegin`).
 #[must_use]
 pub fn map_numpad_key(
     physical: PhysicalKey,
@@ -291,15 +259,9 @@ pub fn map_numpad_key(
     Some(Key::Named(named))
 }
 
-/// The character a physical key produces on a US-QWERTY layout, for the Kitty
-/// `REPORT_ALTERNATE_KEYS` `base_layout_key` (#7678).
-///
-/// The engine emits this as the third colon-delimited code so a remote app can
-/// reason about the PHYSICAL key independent of the user's active layout (e.g. a
-/// Dvorak or AZERTY user pressing the QWERTY-`a` position). Returns the
-/// UNSHIFTED US-QWERTY character for the alphanumeric and symbol rows; `None`
-/// for keys with no printable US-QWERTY character (function/navigation/modifier
-/// keys), where `base_layout_key` is simply omitted.
+/// Unshifted US-QWERTY character for `physical`, used as the Kitty
+/// `REPORT_ALTERNATE_KEYS` `base_layout_key`, or `None` for non-printable
+/// keys.
 #[must_use]
 pub fn base_layout_key_for(physical: PhysicalKey) -> Option<char> {
     let PhysicalKey::Code(code) = physical else {
@@ -570,7 +532,7 @@ mod tests {
     use super::*;
     use aterm_window::keyboard::SmolStr;
 
-    /// The old inline GUI match stopped at F12 and dropped the media keys.
+    /// Verify F13–F35 and media/audio keys map to their engine `NamedKey` variants.
     #[test]
     fn maps_function_keys_past_f12_and_media_keys() {
         for (winit, want) in [

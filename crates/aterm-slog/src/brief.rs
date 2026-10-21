@@ -226,7 +226,10 @@ struct Scan<'a> {
 /// the status classifier's, the screen's context and goal, the fabric's
 /// (mail is the `mail in · out` line), the usage tap's; `act` and `story`
 /// are one count line ([`Scan::acts`]), the first line shed. A worker's
-/// `task` mark (phase 5, 5C-1) is bookkeeping too: `task` is its reader.
+/// `task` mark (phase 5, 5C-1) is bookkeeping too: `task` is its reader. So
+/// are Phase 6's ring facts (6F-2): a session's state, a policy's
+/// generation, a topic, an advisory, the program's own report (ruling U17),
+/// a mail fetch and what the person was shown.
 fn mark_worth_a_line(k: Kind) -> bool {
     !matches!(
         k,
@@ -258,6 +261,13 @@ fn mark_worth_a_line(k: Kind) -> bool {
             | Kind::Act
             | Kind::Story
             | Kind::Task
+            | Kind::State
+            | Kind::Policy
+            | Kind::Topic
+            | Kind::Advisory
+            | Kind::Program
+            | Kind::MailFetch
+            | Kind::Shown
     )
 }
 

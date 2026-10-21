@@ -19,7 +19,7 @@ at 46 tx end vdur=54 in=22682 out=12 dated=46 off=2831 slice=claude-2.1.299-tran
 expect amend t1 turn vdur_ms=54 tok_in=22682 tok_out=12 by=vendor conf=strong
 at 100 see idle
 wait 1000
-expect close t1 turn out=done src=screen at=100
+expect close t1 turn out=done src=screen @100
 at 8345 see busy
 expect open t2 turn par=r1 src=screen conf=strong
 tx prompt v2 dated=8345 off=3421 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:5-9
@@ -31,16 +31,16 @@ at 8400 see wall:usage-session
 expect open p1 wall par=t2 wall=usage-session src=screen conf=strong
 expect need=wall:usage-session
 at 20887 see busy
-expect close p1 wall out=gone src=screen at=8400
-expect close t2 turn out=wall:usage-session steps=1 walls=1 src=screen at=8400
+expect close p1 wall out=gone src=screen @8400
+expect close t2 turn out=wall:usage-session steps=1 walls=1 src=screen @8400
 expect open p2 wall par=r1 wall=usage-session cont=p1 orphan=1 src=screen
-expect close p2 wall out=passed src=screen at=20887
-expect open t3 turn par=r1 src=screen conf=strong at=20887
+expect close p2 wall out=passed src=screen @20887
+expect open t3 turn par=r1 src=screen conf=strong @20887
 tx prompt v3 dated=20887 off=6949 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:10-12
 expect amend t3 turn vref=v3 by=vendor src=transcript conf=strong
 at 20915 tx end vdur=30 in=22414 out=12 dated=20915 off=8562 slice=claude-2.1.299-transcript-session-limit-cancelled-then-person-turn:10-12
 expect amend t3 turn vdur_ms=30 tok_in=22414 tok_out=12 by=vendor conf=strong
 at 21000 see idle
 wait 1000
-expect close t3 turn out=done src=screen at=21000
+expect close t3 turn out=done src=screen @21000
 expect turn=none

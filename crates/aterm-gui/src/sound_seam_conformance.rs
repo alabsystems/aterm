@@ -17,10 +17,9 @@
 //!   then `resolve_cursor_glow`). The verb's call site is covered by
 //!   `app_input`'s `tone_status_tests`.
 //!
-//! `seam`, `key` and `tone` are observed (the engine's seam, the key chain's
-//! answer, the verb's verdict). `master`, `amplitude` and `dark_cause` are the
-//! input class the model action names, read off the config the engine was
-//! handed, never off the engine under test.
+//! `seam`, `key` and `tone` are observed (the engine's seam, the key chain's answer, the
+//! verb's verdict); `master`, `amplitude` and `dark_cause` are the input class the model
+//! action names, read off the config the engine was handed, never off the engine.
 //!
 //! Each observed step is projected onto the model and must be a successor of
 //! the action its host input class names, with every invariant holding. The
@@ -28,18 +27,15 @@
 //! Every style is driven (`Classic` included), on a real grid and on the
 //! three degenerate ones (no columns, no rows, no cell).
 //!
-//! Negative controls replay the defects this binding catches: a host fold that
-//! reads `audible` off the folded (dark) intensity, a verb that reads
-//! `trail_on` as `GlowConfig::enabled` alone, a classic tick that keeps the
-//! previous seam, and a degenerate grid that closes the seam. Each must be
-//! rejected at the named step while the shipping code passes the same case.
+//! Negative controls replay the defects this binding catches (a host fold reading
+//! `audible` off the folded intensity, a verb reading `trail_on` as `GlowConfig::enabled`
+//! alone, a classic tick keeping the previous seam, a degenerate grid closing the seam);
+//! each must be rejected at the named step.
 //!
-//! Before a window's first frame the engine has resolved no seam: a key is
-//! refused (the model's `Key` before any tick) and the verb, with every gate
-//! open, says `closed:engine-silent`. `EngineSilentIsUnreachable` is a claim
-//! about a window that has run a frame;
-//! `the_verb_before_the_first_frame_is_read_not_invented` pins the pre-frame
-//! reading.
+//! Before a window's first frame the engine has resolved no seam: a key is refused and the
+//! verb, every gate open, says `closed:engine-silent`. `EngineSilentIsUnreachable` holds
+//! for a window that has run a frame; `the_verb_before_the_first_frame_is_read_not_invented`
+//! pins the pre-frame reading.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -226,10 +222,9 @@ fn geom(grid: Grid) -> Geom {
     }
 }
 
-/// The resolved config for one input and style, through the shipping
-/// resolver `App::glow_config_for` calls (`resolve_cursor_glow`, after
-/// `resolve_trail_presentation`). `enabled` is formed as the host forms it:
-/// the master knob and serious mode's `CursorGlow` permission.
+/// The resolved config for one input and style, through the resolver `App::glow_config_for`
+/// calls (`resolve_trail_presentation`, then `resolve_cursor_glow`). `enabled` is formed as
+/// the host forms it: the master knob and serious mode's `CursorGlow` permission.
 fn resolved(i: HostInputs, style: GlowStyle) -> GlowConfig {
     let raw = spelling(style);
     let presentation = resolve_trail_presentation(raw);
@@ -632,8 +627,7 @@ fn the_shipping_seam_conforms_to_the_trail_sound_seam_model() {
     );
     assert_eq!(visited, space);
 
-    // A dark frame from Reduce Motion and one from the load-shed envelope both
-    // occur in the domain and both are heard.
+    // Both dark-but-heard causes (Reduce Motion, load shed) occur in the domain.
     let reduce = domain.iter().any(|i| {
         i.action() == "TickDarkMotion"
             && MotionPolicy::resolve(i.mode, i.system_reduce, i.focused) == MotionPolicy::Reduced
@@ -659,9 +653,8 @@ fn lit() -> HostInputs {
     }
 }
 
-/// Negative control 1: the dark-is-silent fold is rejected at a
-/// `TickDarkMotion` step for both causes, while the shipping fold passes the
-/// identical script.
+/// Negative control 1: the dark-is-silent fold is rejected at a `TickDarkMotion` step for
+/// both causes, while the shipping fold passes the same script.
 #[test]
 fn the_pre_fix_fold_is_rejected_by_the_conformance() {
     let model = trail_sound_seam_model();
@@ -696,8 +689,7 @@ fn the_pre_fix_fold_is_rejected_by_the_conformance() {
             "rejected at the dark tick: {err}"
         );
     }
-    // …and over the whole domain it is rejected exactly on the motion class;
-    // everywhere else the two folds agree.
+    // Over the whole domain it is rejected exactly on the motion class.
     for i in domain() {
         let got = drive(
             &[(i, GlowStyle::RainbowKitty, Grid::Real)],
@@ -714,11 +706,9 @@ fn the_pre_fix_fold_is_rejected_by_the_conformance() {
     }
 }
 
-/// Negative control 2: the enabled-only `trail_on`, substituted into the
-/// shipping constructor's output, reads a user-dimmed aurora as
-/// `closed:engine-silent`; the conformance rejects it at the `Tone` step only.
-/// (`app_input`'s `a_dimmed_aurora_reads_trail_off_never_engine_silent` covers
-/// `tone_status` calling the constructor.)
+/// Negative control 2: the enabled-only `trail_on` reads a user-dimmed aurora as
+/// `closed:engine-silent` and is rejected at the `Tone` step only (`app_input`'s
+/// `a_dimmed_aurora_reads_trail_off_never_engine_silent` covers the call site).
 #[test]
 fn the_pre_fix_verb_is_rejected_by_the_conformance() {
     let model = trail_sound_seam_model();
@@ -742,10 +732,9 @@ fn the_pre_fix_verb_is_rejected_by_the_conformance() {
     }
 }
 
-/// Negative control 3: the classic wake keeping the previous tick's seam, and a
-/// degenerate grid closing it like the master switch. Each is rejected at the
-/// tick it happens on, on exactly the classes it gets wrong, while the shipping
-/// engine passes the identical scripts.
+/// Negative control 3: a classic wake keeping the previous tick's seam, and a degenerate
+/// grid closing it like the master switch, are each rejected at the tick and on exactly
+/// the classes they get wrong.
 #[test]
 fn the_pre_fix_classic_and_empty_grid_seams_are_rejected() {
     let model = trail_sound_seam_model();
@@ -784,10 +773,8 @@ fn the_pre_fix_classic_and_empty_grid_seams_are_rejected() {
     assert!(err.contains("`TickDarkUnfocused`"), "{err}");
 }
 
-/// Before the first frame the verb's answer is read, never substituted: the
-/// engine has resolved no seam, so a key is refused (as the model's `Key`
-/// before any tick) and the verb, with every gate open, says
-/// `closed:engine-silent`. Pins the pre-frame reading so the model's
+/// Before the first frame the verb's answer is read, never substituted: with no seam
+/// resolved, the verb with every gate open says `closed:engine-silent`, so the model's
 /// `EngineSilentIsUnreachable` is not overread.
 #[test]
 fn the_verb_before_the_first_frame_is_read_not_invented() {

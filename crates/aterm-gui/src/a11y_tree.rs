@@ -53,21 +53,23 @@ const MENU_ROWS: u64 = 64;
 /// below [`CHIP_BASE`] (`MENU_BASE + 1 + (2^22 − 1) · 64 + 63 < 2^30`).
 const MENU_EPOCH_BITS: u32 = 22;
 /// The chips in a Claude Code composer rule (design §9.2.1, owner surfaces §5) are
-/// `CHIP_BASE + session · 2 + chip` ([`chip_for`]): Autopilot `0`, Team `1`.
+/// `CHIP_BASE + session · 4 + chip` ([`chip_for`]): Autopilot `0`, Team `1`, and on the
+/// top rule the harness switch `2` and its `on` button `3`.
 /// Between the menu's range and [`TAB_BASE`], so [`tab_index_for`] and
 /// [`ChromeMessage::from_node`] refuse a chip and a click on one never decodes as a tab
 /// switch or a band's capsule.
 const CHIP_BASE: u64 = 1 << 30;
-/// The stats bars (`crate::stats_deck`, `crate::stats_sill`; design §12.2
-/// Accessibility) are `STATS_BASE + …` ([`stats_node_id`]): a `Role::Group` a bar
-/// at `STATS_BASE + bar · 16` with its `Role::Meter` children after it, the core
-/// row's `Role::Grid` at `STATS_BASE + 64` and one meter a core from
-/// `STATS_BASE + 128`. Below [`MENU_BASE`] and far above every chrome message's
-/// slot, so no decoder takes a stats node for a message, a menu item, a chip or
-/// a tab; a stats node offers no action, so the routing never needs one.
+/// The stats deck (`crate::stats_deck`, `crate::stats_sill`; Stats Deck v2
+/// §12) is `STATS_BASE + …`: its `Role::Group` at `STATS_BASE` with one
+/// `Role::Meter` a resource after it ([`stats_meter_id`]), the open lens from
+/// [`STATS_LENS`], the cores' group at `STATS_BASE + 64` and one meter a core
+/// from `STATS_BASE + 128`. Below [`MENU_BASE`] and far above every chrome
+/// message's slot, so no decoder takes a stats node for a message, a menu
+/// item, a chip or a tab; a stats node offers no action but the keyboard
+/// lens's focus, so the routing never needs one.
 const STATS_BASE: u64 = 1 << 28;
-/// The cores a published core row may name (`STATS_BASE + 128 + core` stays
-/// below [`MENU_BASE`]).
+/// The cores a published cores group may name (`STATS_BASE + 128 + core`
+/// stays below [`MENU_BASE`]).
 const STATS_CORES: usize = 1 << 20;
 /// Tab items are `TAB_BASE + tab_index`. A high, disjoint range so a tab id can never be
 /// mistaken for any other node by [`crate::App::on_accessibility_action`]'s routing.
@@ -483,23 +485,30 @@ pub(crate) struct GridMessage {
 /// button stands in the rule (owner, 2026-10-20), so none is published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HarnessChip {
-    /// The Autopilot chip: a click steps the session's word (or opens Settings ▸ Harness
-    /// where no harness runs).
+    /// The Autopilot chip: a click steps the session's word (or, where a switch of
+    /// aterm.toml holds the harness off, turns that switch on).
     Autopilot,
     /// The Team chip (`✋ you`, `⇠ <manager>`, `⇉N`): a click hands the tab back, goes to
     /// the manager, or opens the Overview at a manager.
     Team,
+    /// The harness switch on the composer's top rule (`claude harness ● on`, `claude
+    /// harness ○ off`): a `Role::Switch` with its on/off state; a click flips it.
+    Switch,
+    /// An off switch's `on` button: a click turns the harness on.
+    SwitchOn,
 }
 
 impl HarnessChip {
     /// The chips a session's ids have room for.
-    const SLOTS: u64 = 2;
+    const SLOTS: u64 = 4;
 
     /// Its place in its session's ids.
     const fn index(self) -> u64 {
         match self {
             Self::Autopilot => 0,
             Self::Team => 1,
+            Self::Switch => 2,
+            Self::SwitchOn => 3,
         }
     }
 }
@@ -519,6 +528,9 @@ pub(crate) struct GridChip {
     pub(crate) label: String,
     /// The newest act, in words, where the harness has taken one.
     pub(crate) description: Option<String>,
+    /// A switch's state (the harness switch, [`HarnessChip::Switch`]): published as a
+    /// `Role::Switch` toggled so, `Mixed` while it turns on. `None` for a button.
+    pub(crate) toggled: Option<aterm_a11y::model::Toggled>,
     /// Its grid row (the snapshot's: below the tab strip and the bars).
     pub(crate) row: usize,
     /// Its first cell.
@@ -583,7 +595,9 @@ pub(crate) fn chip_for(node: NodeId) -> Option<(u64, HarnessChip)> {
         .filter(|_| node.0 < TAB_BASE)?;
     let chip = match at % HarnessChip::SLOTS {
         0 => HarnessChip::Autopilot,
-        _ => HarnessChip::Team,
+        1 => HarnessChip::Team,
+        2 => HarnessChip::Switch,
+        _ => HarnessChip::SwitchOn,
     };
     Some((at / HarnessChip::SLOTS, chip))
 }
@@ -640,8 +654,15 @@ fn push_chips(
         let Some(id) = chip_node_id(chip.session, chip.chip) else {
             continue;
         };
-        let mut node = Node::new(Role::Button);
+        let mut node = Node::new(if chip.toggled.is_some() {
+            Role::Switch
+        } else {
+            Role::Button
+        });
         node.set_label(chip.label.clone());
+        if let Some(toggled) = chip.toggled {
+            node.set_toggled(toggled);
+        }
         if let Some(description) = &chip.description {
             node.set_description(description.clone());
         }
@@ -711,168 +732,157 @@ fn push_menu(
     (menu_id, focus)
 }
 
-/// One stats meter: a gauge with its value within a known range, named stably
-/// ("CPU", "Super core 1") and described in words ("3.1 of 10 cores, rising").
+/// One stats meter: a resource's % of its maximum or a core's % busy, named
+/// stably ("CPU", "Super core 1") and described in words (the row's sentence,
+/// `aterm_vitals::words::row_sentence`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatsMeter {
-    /// The stable name; only the value changes.
+    /// The stable name; only the value and the words change.
     pub(crate) name: String,
-    pub(crate) value: f64,
-    pub(crate) min: f64,
-    pub(crate) max: f64,
-    /// The value in words, with its motion and variance where they apply.
+    /// The %, `0..=100`; `None` when it is not known, so a reader hears no
+    /// value rather than a zero.
+    pub(crate) value: Option<f32>,
+    /// The value in words.
     pub(crate) words: String,
 }
 
-/// One stats bar as a reader meets it: a group named for its scope, described
-/// by the scope's sentence (the one words function the lens and `sys` share),
-/// its meters, the core row (Global only) and its attention counts.
+/// The stats deck as a reader meets it (Stats Deck v2 §12): a group named
+/// for the deck holding one meter a resource in row order, then a group of
+/// one meter a core.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatsGroup {
-    /// "Global", "aterm" or "Tab".
+    /// "Stats deck, last 10 minutes".
     pub(crate) name: &'static str,
-    /// The scope's sentence.
-    pub(crate) sentence: String,
-    /// CPU, GPU, memory, disk: whichever this scope reads.
+    /// One meter a resource, in row order.
     pub(crate) meters: Vec<StatsMeter>,
-    /// One meter a core, in cluster order (Global only; empty elsewhere).
+    /// The cores' group's name: "18 CPU cores".
+    pub(crate) cores_name: String,
+    /// One meter a core, in cluster order; empty before the cores are read,
+    /// and then there is no cores group.
     pub(crate) cores: Vec<StatsMeter>,
-    /// Stuck, quiet and waiting counts, as status text (aterm only).
-    pub(crate) marks: Option<String>,
 }
 
-/// The stats bars on this window (the Deck or the sill), `None` when off.
+/// The stats deck on this window (the Deck or the sill), `None` when off.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GridStats {
-    /// Global, aterm, Tab.
-    pub(crate) groups: Vec<StatsGroup>,
-    /// Where the bars' card sits, physical px.
+    /// The deck's group: its meters and its cores.
+    pub(crate) group: StatsGroup,
+    /// Where the deck's card sits, physical px.
     pub(crate) bounds: Option<Rect>,
     /// The open lens, while one is open.
     pub(crate) lens: Option<StatsLens>,
 }
 
-/// The open stats lens as a reader meets it (design §12.2): a group holding
-/// the selected bar's well and the focus well, each named and described in
-/// the words the lens draws. The keyboard lens (⌘I) holds the keys, so it is
-/// the window's focus; a hover lens is only there to be read.
+/// The open stats lens as a reader meets it (Stats Deck v2 §12): a group named
+/// "<Name> close-up", described by its explainer and its keys, holding a well
+/// for the answer and for each section the lens shows, each named by its
+/// heading and described by its lines. A lens that takes the keys (opened by
+/// ⌘I, or pinned by a click or Return) holds them, so its first well is the
+/// window's focus; a hover lens is only there to be read.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatsLens {
-    /// Whether the keyboard opened it (it takes ←/→/↑/↓, Return, ⌘C, Esc).
-    pub(crate) keyboard: bool,
-    /// The selected bar ("Global", "aterm", "Tab") and its sentence.
-    pub(crate) bar: &'static str,
-    pub(crate) bar_words: String,
-    /// The focus well's instrument ("Cores") and its readout.
-    pub(crate) focus: &'static str,
-    pub(crate) focus_words: String,
+    /// Whether it takes ←/→/↑/↓, ⌘C and Esc: the keyboard or pinned lens.
+    pub(crate) keys: bool,
+    /// "Disk close-up".
+    pub(crate) name: String,
+    /// What its heat measures.
+    pub(crate) explainer: String,
+    /// The wells in reading order: each one's heading and its lines.
+    pub(crate) wells: Vec<(String, String)>,
     /// Where the lens card sits, physical px.
     pub(crate) bounds: Option<Rect>,
 }
 
-/// The lens group's id (its two wells follow it): after the three bars'
-/// groups (`STATS_BASE + bar · 16 + k`, bars 0–2) and before the core row's
-/// grid at `STATS_BASE + 64`.
+/// The lens group's id (its wells follow it, at most 15): after the deck's
+/// meters and before the cores' group at `STATS_BASE + 64`.
 const STATS_LENS: u64 = STATS_BASE + 48;
 
-/// A stats node's id: `bar` 0–2 and its meter `k` (0 is the group itself);
-/// `STATS_BASE + 48` on belongs to the lens ([`STATS_LENS`]).
-fn stats_node_id(bar: usize, k: usize) -> Option<NodeId> {
-    (bar < 3 && k < 16).then(|| NodeId(STATS_BASE + bar as u64 * 16 + k as u64))
+/// The deck's `k`th meter's id (the group itself is `STATS_BASE`); `None`
+/// past the 15 the range holds before the lens's.
+fn stats_meter_id(k: usize) -> Option<NodeId> {
+    (k < 15).then(|| NodeId(STATS_BASE + 1 + k as u64))
 }
 
-/// Emit the stats groups; return their ids in painted order (top down).
-fn push_stats(nodes: &mut Vec<(NodeId, Node)>, stats: &GridStats) -> Vec<NodeId> {
+/// Emit the stats deck's group, its meters and its cores; return the
+/// group's id.
+fn push_stats(nodes: &mut Vec<(NodeId, Node)>, stats: &GridStats) -> NodeId {
     let meter_node = |m: &StatsMeter| {
         let mut node = Node::new(Role::Meter);
         node.set_label(m.name.clone());
-        node.set_numeric_value(m.value);
-        node.set_min_numeric_value(m.min);
-        node.set_max_numeric_value(m.max);
+        if let Some(v) = m.value {
+            node.set_numeric_value(f64::from(v));
+        }
+        node.set_min_numeric_value(0.0);
+        node.set_max_numeric_value(100.0);
         node.set_description(m.words.clone());
         node
     };
-    let mut ids = Vec::with_capacity(stats.groups.len());
-    for (bar, group) in stats.groups.iter().enumerate() {
-        let Some(group_id) = stats_node_id(bar, 0) else {
-            continue;
+    let group = &stats.group;
+    let group_id = NodeId(STATS_BASE);
+    let mut children = Vec::with_capacity(group.meters.len() + 1);
+    for (k, m) in group.meters.iter().enumerate() {
+        let Some(id) = stats_meter_id(k) else {
+            break;
         };
-        let mut children = Vec::new();
-        for (k, m) in group.meters.iter().enumerate() {
-            let Some(id) = stats_node_id(bar, k + 1) else {
-                break;
-            };
+        nodes.push((id, meter_node(m)));
+        children.push(id);
+    }
+    if !group.cores.is_empty() {
+        let cores_id = NodeId(STATS_BASE + 64);
+        let mut cells = Vec::with_capacity(group.cores.len().min(STATS_CORES));
+        for (i, m) in group.cores.iter().take(STATS_CORES).enumerate() {
+            let id = NodeId(STATS_BASE + 128 + i as u64);
             nodes.push((id, meter_node(m)));
-            children.push(id);
-        }
-        if !group.cores.is_empty() {
-            let grid_id = NodeId(STATS_BASE + 64);
-            let mut cells = Vec::with_capacity(group.cores.len());
-            for (i, m) in group.cores.iter().take(STATS_CORES).enumerate() {
-                let id = NodeId(STATS_BASE + 128 + i as u64);
-                nodes.push((id, meter_node(m)));
-                cells.push(id);
-            }
-            let mut grid = Node::new(Role::Grid);
-            grid.set_label("Cores");
-            grid.set_children(cells);
-            nodes.push((grid_id, grid));
-            children.push(grid_id);
-        }
-        if let Some(marks) = &group.marks
-            && let Some(id) = stats_node_id(bar, 15)
-        {
-            let mut node = Node::new(Role::Status);
-            node.set_label(marks.clone());
-            nodes.push((id, node));
-            children.push(id);
+            cells.push(id);
         }
         let mut node = Node::new(Role::Group);
-        node.set_label(group.name);
-        node.set_description(group.sentence.clone());
-        if let Some(b) = stats.bounds {
-            node.set_bounds(b);
-        }
-        node.set_children(children);
-        nodes.push((group_id, node));
-        ids.push(group_id);
+        node.set_label(group.cores_name.clone());
+        node.set_children(cells);
+        nodes.push((cores_id, node));
+        children.push(cores_id);
     }
-    ids
+    let mut node = Node::new(Role::Group);
+    node.set_label(group.name);
+    if let Some(b) = stats.bounds {
+        node.set_bounds(b);
+    }
+    node.set_children(children);
+    nodes.push((group_id, node));
+    group_id
 }
 
 /// Emit the open lens; return its group's id and the node that takes focus
-/// when the keyboard holds it (the focus well).
+/// when it takes the keys (its first well, else the group).
 fn push_stats_lens(nodes: &mut Vec<(NodeId, Node)>, lens: &StatsLens) -> (NodeId, NodeId) {
-    let (group_id, bar_id, focus_id) = (
-        NodeId(STATS_LENS),
-        NodeId(STATS_LENS + 1),
-        NodeId(STATS_LENS + 2),
-    );
-    let mut bar = Node::new(Role::Group);
-    bar.set_label(lens.bar);
-    bar.set_description(lens.bar_words.clone());
-    nodes.push((bar_id, bar));
-    let mut focus = Node::new(Role::Group);
-    focus.set_label(lens.focus);
-    focus.set_description(lens.focus_words.clone());
-    if lens.keyboard {
-        focus.add_action(Action::Focus);
+    let group_id = NodeId(STATS_LENS);
+    let mut children = Vec::with_capacity(lens.wells.len());
+    for (k, (name, words)) in lens.wells.iter().take(15).enumerate() {
+        let id = NodeId(STATS_LENS + 1 + k as u64);
+        let mut well = Node::new(Role::Group);
+        well.set_label(name.clone());
+        well.set_description(words.clone());
+        if lens.keys && k == 0 {
+            well.add_action(Action::Focus);
+        }
+        nodes.push((id, well));
+        children.push(id);
     }
-    nodes.push((focus_id, focus));
-    let mut group = Node::new(Role::Group);
-    group.set_label("System lens");
-    group.set_description(if lens.keyboard {
-        "Left and Right arrows choose the instrument, Up and Down the bar, Return keeps \
-         it open, Command-C copies the bar's sentence, Escape closes"
+    let keys = if lens.keys {
+        "Left and Right arrows choose the instrument, Up and Down the scope, Command-C \
+         copies its sentence, Escape closes"
     } else {
         "Click to pin it; Escape or a click outside closes it"
-    });
+    };
+    let mut group = Node::new(Role::Group);
+    group.set_label(lens.name.clone());
+    group.set_description(format!("{} {keys}", lens.explainer));
     if let Some(b) = lens.bounds {
         group.set_bounds(b);
     }
-    group.set_children(vec![bar_id, focus_id]);
+    let focus = children.first().copied().unwrap_or(group_id);
+    group.set_children(children);
     nodes.push((group_id, group));
-    (group_id, focus_id)
+    (group_id, focus)
 }
 
 /// Everything a frame publishes besides its plain visible grid: the tab strip, split
@@ -1291,17 +1301,17 @@ pub(crate) fn grid_tree(
         root_children.push(TAB_LIST);
     }
 
-    // The stats bars, under the titlebar or in the bottom pad: named groups of meters
+    // The stats deck, under the titlebar or in the bottom pad: a named group of meters
     // whose values change in place (no live region: a reader asks, nothing announces).
     let mut lens_focus = None;
     if let Some(stats) = frame.stats {
-        root_children.extend(push_stats(&mut nodes, stats));
-        // The open lens over the grid: the keyboard lens holds the keys, so a
-        // reader lands in its focus well.
+        root_children.push(push_stats(&mut nodes, stats));
+        // The open lens over the grid: a lens that takes the keys holds them,
+        // so a reader lands in its focus well.
         if let Some(lens) = &stats.lens {
             let (id, focus) = push_stats_lens(&mut nodes, lens);
             root_children.push(id);
-            lens_focus = lens.keyboard.then_some(focus);
+            lens_focus = lens.keys.then_some(focus);
         }
     }
 
@@ -1370,7 +1380,7 @@ pub(crate) fn grid_tree(
         // The open menu holds the keys: its highlighted row, else the menu.
         (Some((id, row)), _, _) => row.unwrap_or(id),
         (None, true, _) => FIND,
-        // The keyboard lens holds the arrows: its focus well.
+        // The lens that takes the keys holds the arrows: its focus well.
         (None, false, _) if lens_focus.is_some() => lens_focus.unwrap_or(GRID),
         (None, false, Some(pane)) => pane,
         (None, false, None) => root_children.last().copied().unwrap_or(GRID),
@@ -2033,6 +2043,93 @@ mod tests {
         assert!(!closed.nodes.iter().any(|(id, _)| *id == FIND));
     }
 
+    /// The stats deck is one group of meters in row order, then the cores'
+    /// group (Stats Deck v2 §12): a meter's value is its % on a 0–100 range,
+    /// an unknown one has no value rather than a zero, and the keyboard
+    /// lens's first well takes the focus.
+    #[test]
+    fn the_stats_deck_is_a_group_of_meters_and_a_group_of_cores() {
+        let snap = live_grid(2, 20, b"", None);
+        let meter = |name: &str, value: Option<f32>| StatsMeter {
+            name: name.into(),
+            value,
+            words: format!("{name} said"),
+        };
+        let stats = GridStats {
+            group: StatsGroup {
+                name: "Stats deck, last 10 minutes",
+                meters: vec![meter("CPU", Some(98.0)), meter("Tokens", None)],
+                cores_name: "2 CPU cores".into(),
+                cores: vec![
+                    meter("Super core 1", Some(54.0)),
+                    meter("Super core 2", None),
+                ],
+            },
+            bounds: None,
+            lens: Some(StatsLens {
+                keys: true,
+                name: "CPU close-up".into(),
+                explainer: "Heat is the share of the cores in use.".into(),
+                wells: vec![("Now".into(), "CPU 98 percent of capacity.".into())],
+                bounds: None,
+            }),
+        };
+        let frame = GridFrame {
+            stats: Some(&stats),
+            ..GridFrame::default()
+        };
+        let update = grid_tree(&snap, Some(GEOM), &frame);
+        let group = node(&update, NodeId(STATS_BASE));
+        assert_eq!(group.role(), Role::Group);
+        assert_eq!(group.label(), Some("Stats deck, last 10 minutes"));
+        let kids = group.children();
+        assert_eq!(kids.len(), 3, "two meters and the cores");
+        let cpu = node(&update, kids[0]);
+        assert_eq!(
+            (cpu.role(), cpu.label(), cpu.numeric_value()),
+            (Role::Meter, Some("CPU"), Some(98.0))
+        );
+        assert_eq!(
+            (cpu.min_numeric_value(), cpu.max_numeric_value()),
+            (Some(0.0), Some(100.0))
+        );
+        assert_eq!(cpu.description(), Some("CPU said"));
+        let tokens = node(&update, kids[1]);
+        assert_eq!(
+            (tokens.label(), tokens.numeric_value()),
+            (Some("Tokens"), None)
+        );
+        assert_eq!(tokens.description(), Some("Tokens said"));
+        let cores = node(&update, kids[2]);
+        assert_eq!(
+            (cores.role(), cores.label()),
+            (Role::Group, Some("2 CPU cores"))
+        );
+        let cells: Vec<_> = cores
+            .children()
+            .iter()
+            .map(|&id| {
+                let n = node(&update, id);
+                (n.role(), n.label(), n.numeric_value())
+            })
+            .collect();
+        assert_eq!(
+            cells,
+            [
+                (Role::Meter, Some("Super core 1"), Some(54.0)),
+                (Role::Meter, Some("Super core 2"), None)
+            ]
+        );
+        let lens = node(&update, NodeId(STATS_LENS));
+        assert_eq!(lens.label(), Some("CPU close-up"));
+        assert_eq!(update.focus, lens.children()[0], "the lens's first well");
+        assert_eq!(
+            node(&update, update.focus).label(),
+            Some("Now"),
+            "the well is named by its heading"
+        );
+    }
+
     fn message(message: ChromeMessage, text: &str) -> GridMessage {
         GridMessage {
             message,
@@ -2345,6 +2442,7 @@ mod tests {
                 chip: HarnessChip::Autopilot,
                 label: "Autopilot: cruise. Lands at 18:00.".to_string(),
                 description: Some("Last: approved at 14:05.".to_string()),
+                toggled: None,
                 row: 2,
                 col: 4,
                 width: 1,
@@ -2354,6 +2452,7 @@ mod tests {
                 chip: HarnessChip::Team,
                 label: "Worker of fmt".to_string(),
                 description: Some("Goes to its manager.".to_string()),
+                toggled: None,
                 row: 2,
                 col: 8,
                 width: 1,

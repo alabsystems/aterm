@@ -1367,8 +1367,9 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     assert!(
         record.contains(
             " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
-             resizes=0 flaps=0 land_at=- task=- pause=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- editing=0 gen="
+             resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
+             end=- end_seen=- end_cheered=- task_state=- task_rev=0 \
+             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 gen="
         ),
         "{record}"
     );
@@ -1410,8 +1411,9 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     assert!(
         record.contains(
             " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
-             resizes=0 flaps=0 land_at=- task=- pause=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- editing=0 gen="
+             resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
+             end=- end_seen=- end_cheered=- task_state=- task_rev=0 \
+             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 gen="
         ),
         "{record}"
     );

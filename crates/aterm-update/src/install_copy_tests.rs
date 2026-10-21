@@ -50,8 +50,8 @@ fn isolated_copy_proves_and_catches() {
     aterm_spec::verify::prove_and_catch_scalar(&publication_model(), "isolated update copy");
 }
 
-// The negative control replays the old shipping policy: ditto receives the
-// caller's reusable path directly, and returning success needs no promotion.
+// `isolated == false` is the negative control: ditto writes the caller's reusable path
+// directly, and success needs no promotion.
 fn copy_with_policy(
     isolated: bool,
     args: &[std::ffi::OsString],
@@ -102,9 +102,8 @@ fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
                 std::fs::create_dir_all(&bundle).unwrap();
                 std::fs::write(bundle.join("id"), "OLD-COPY").unwrap();
                 old_payload = Some(payload);
-                // Open the old job's absolute destination only AFTER the
-                // retry has materialized, then keep that actual file open
-                // across the retry's publication/atomic exchange.
+                // Open the old job's destination only after the retry has materialized,
+                // and hold it open across the retry's publication or exchange.
                 writer = Some(std::thread::spawn(move || {
                     open_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
                     let mut file = std::fs::OpenOptions::new()
@@ -136,8 +135,8 @@ fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
                 .1 = i64::from(!isolated);
             let mut state = model.init_state();
             copy_model_step(&model, &mut state, "Timeout");
-            // The real callers reclaim their requested destination after
-            // failure. The isolated attempt must remain outside that cleanup.
+            // Real callers reclaim their requested destination after a failure; the
+            // isolated attempt lies outside that cleanup.
             remove_path_no_follow(&destination).unwrap();
             if shape == "zip" {
                 std::fs::create_dir(&destination).unwrap();

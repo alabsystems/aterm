@@ -33,14 +33,18 @@
 //!   `hasExtraUsageEnabled`, `planDisplayName`, `profileFetchedAt`. Never its
 //!   `displayName`, `fullName`, `organizationName` or `organizationUuid`,
 //!   and its `emailAddress` only in the in-memory login check [`answers_to`]
-//!   and the explicitly requested, volatile footer display [`subscription_for`].
-//!   The general [`Profile`] and account-stat records retain no email.
+//!   and the explicitly requested, volatile footer display [`subscription_for`]
+//!   (whose roster gate [`plan_usage_for`] shares). An address the display does
+//!   not return — refused, gating only the plan, or another login's — is zeroed
+//!   before it is freed. The general [`Profile`] and account-stat records
+//!   retain no email.
 //! * `cachedExtraUsageDisabledReason`: [`Credits`].
 //! * `cachedUsageUtilization`: `fetchedAtMs`, `accountUuid` (hashed, and the
 //!   body is dropped unless it names the profile's own account, as Claude
-//!   Code drops it) and the usage body's windows, its per-model weekly rows,
-//!   its usage-credits spend and its two one-time credit blocks
-//!   ([`UsageCache`]).
+//!   Code drops it; one that names another keeps only its `fetchedAtMs`,
+//!   [`Profile::usage_of_another_at`]) and the usage body's windows, its
+//!   per-model weekly rows, its usage-credits spend and its two one-time
+//!   credit blocks ([`UsageCache`]).
 //! * `cachedGrowthBookFeatures`: the two Fable billing flags by name,
 //!   `tengu_saffron_credits_only_tiers` and `tengu_saffron_lattice`
 //!   ([`FablePlan`]), and `tengu_calm_seal`, the model families billed to
@@ -163,6 +167,25 @@ impl AccountKey {
         let mut out = String::with_capacity(6);
         aterm_codec::hex::push_lower(&mut out, self.digest.get(..3).unwrap_or(&[]));
         out
+    }
+
+    /// A key back from its text ([`fmt::Display`]: `c-` or `x-` and twelve
+    /// lowercase hex digits), as the accounts state keeps it; `None` for any
+    /// other text.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<AccountKey> {
+        let (agent, hex) = match text.split_once('-')? {
+            ("c", hex) => (b'c', hex),
+            ("x", hex) => (b'x', hex),
+            _ => return None,
+        };
+        // Lowercase only, as the key is written: one key, one spelling.
+        if !aterm_codec::hex::is_lower(hex, 2 * KEY_BYTES) {
+            return None;
+        }
+        let mut digest = [0; KEY_BYTES];
+        aterm_codec::hex::decode_into(hex.as_bytes(), &mut digest)
+            .then_some(AccountKey { agent, digest })
     }
 }
 
@@ -340,7 +363,7 @@ impl Credits {
 
 /// WHICH WINDOW A CACHED READING IS OF: aterm's closed bucket ids (design
 /// §7.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bucket {
     /// `five_hour`.
     FiveHour,
@@ -516,6 +539,12 @@ pub struct Profile {
     pub credits: Credits,
     /// [`UsageCache`].
     pub usage: Option<UsageCache>,
+    /// When a cached `/usage` body that names ANOTHER ACCOUNT than this
+    /// profile's was fetched (`fetchedAtMs`, Unix seconds): that account was
+    /// signed in to the home then. The body itself is not kept
+    /// ([`Self::usage`]); `None` where none names another, or the profile
+    /// names no account.
+    pub usage_of_another_at: Option<i64>,
     /// [`FablePlan`].
     pub fable: FablePlan,
     /// The model families a stored consent bills to usage credits with no
@@ -621,6 +650,22 @@ pub fn effective(plain: &Path, records: Option<&Path>, custom_oauth: bool) -> Pa
         return legacy;
     }
     plain
+}
+
+/// THE KEY OF THE ACCOUNT SIGNED IN TO THE DEFAULT HOME of a user whose
+/// home is `user_home` — `CLAUDE_CONFIG_DIR` unset, the one home the usage
+/// tap serves (`super::tap::own_login`) — read from the file Claude Code
+/// reads for it ([`effective`]: `~/.claude.json`, or a `.config.json` in
+/// `~/.claude` standing in for it) through [`read`], the allowlist. `None`
+/// where no profile reads or it names no account. A process launched with a
+/// custom OAuth URL keeps its login in another file ([`custom_oauth`]),
+/// which this does not follow: the tap's own reading carries no such
+/// variable to tell.
+#[must_use]
+pub fn default_home_key(user_home: &Path) -> Option<AccountKey> {
+    let plain = path_of(user_home, None, None, || None)?;
+    let records = user_home.join(".claude");
+    read(&effective(&plain, Some(&records), false)).ok()?.key
 }
 
 /// The profile filename selected by a process's own exec environment.
@@ -937,6 +982,11 @@ pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool>
     .flatten()
 }
 
+/// How long a cached `/usage` reading stays current ([`current_windows`]). Claude Code
+/// writes the cache only when a person opens `/usage`, so an older reading cannot say
+/// what is used now.
+const USAGE_CURRENT_S: i64 = 15 * 60;
+
 /// Facts for the requested on-screen account/subscription display. These are volatile
 /// presentation values, never account-stat records, settings or authentication material.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -947,6 +997,37 @@ pub struct SubscriptionDisplay {
     pub plan: Option<String>,
     /// Its weekly quota, only while the selected account's cached sample is current.
     pub weekly: Option<String>,
+}
+
+/// THE PLAN AS A DATED FACT (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §8.4): the
+/// window that binds a tab's model, from the cached `/usage` reading of the profile
+/// [`plan_usage_for`] selects. Volatile, like [`SubscriptionDisplay`]: never an
+/// account-stat record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PlanUsage {
+    /// The account the reading is of.
+    pub account: AccountKey,
+    /// The binding window: the most used of the current windows that gate the model.
+    pub window: Bucket,
+    /// Its share used, in tenths of a percent (0..=1000).
+    pub used_x10: u16,
+    /// When it resets, Unix seconds.
+    pub resets_at: i64,
+    /// When Claude Code fetched the reading (`fetchedAtMs`), Unix seconds.
+    pub read_at: i64,
+}
+
+impl PlanUsage {
+    /// Whether this reading still says what is used at `now` (Unix seconds), by the
+    /// currency rule [`plan_usage_for`] read it under ([`current_windows`]): fetched at
+    /// most [`USAGE_CURRENT_S`] ago and not after `now`, and its window resetting after
+    /// `now`. A caller that keeps a reading past the read that made it asks this.
+    #[must_use]
+    pub fn current_at(&self, now: i64) -> bool {
+        self.read_at <= now
+            && now.saturating_sub(self.read_at) <= USAGE_CURRENT_S
+            && self.resets_at > now
+    }
 }
 
 /// Read the on-screen subscription facts from this process's selected profile. The
@@ -960,6 +1041,9 @@ pub struct SubscriptionDisplay {
 /// its home lists several logins. A roster email gates the read, never supplies text.
 /// `Some(empty)` means no logins are configured; `None` means the roster is unknown,
 /// so the default shared home cannot establish which login the profile describes.
+///
+/// The window's resolver reads both halves at once ([`subscription_and_plan_for`]); this
+/// and [`plan_usage_for`] are each half alone, over the same selection.
 #[must_use]
 pub fn subscription_for(
     env: &[String],
@@ -968,6 +1052,80 @@ pub fn subscription_for(
     roster: Option<&super::accounts::Roster>,
     now: i64,
 ) -> Option<SubscriptionDisplay> {
+    selected_profile(env, user_home, records, roster).map(|selected| selected.subscription(now))
+}
+
+/// The plan usage of this process's selected profile at `now`, for the tab's `model`: an
+/// id (`claude-opus-5-5`), an alias (`opus`) or a display name (`Opus 5.5`), `None` when
+/// it is not known. The profile is the one [`subscription_for`] reads, by the same
+/// selection and the same roster gate, so it never answers with another login's plan;
+/// the caller's duties and the roster's meaning are the same as there. The binding window
+/// is the most used of the current windows ([`current_windows`]) that gate the model: the
+/// five-hour, the seven-day, and the model's own weekly bucket (Opus, Sonnet or Fable;
+/// of Fable's per-version rows, the one named for the model where one is). `None` where
+/// nothing is selected, no reading is current, no window that gates the model is current,
+/// or one that is has a share that did not read (which window binds is then not known).
+///
+/// The window's resolver reads this with the display ([`subscription_and_plan_for`]);
+/// this is that half alone, as the Stats Deck design names it. The address that gated
+/// the read is zeroed with it, never returned.
+#[must_use]
+pub fn plan_usage_for(
+    env: &[String],
+    user_home: &Path,
+    records: &Path,
+    roster: Option<&super::accounts::Roster>,
+    now: i64,
+    model: Option<&str>,
+) -> Option<PlanUsage> {
+    selected_profile(env, user_home, records, roster)?.plan_usage(now, model)
+}
+
+/// [`subscription_for`] and [`plan_usage_for`] from one read of the selected profile, for
+/// the caller that keeps both (the Claude footer's resolver): the two never describe two
+/// versions of a profile a login rewrote between reads.
+#[must_use]
+pub fn subscription_and_plan_for(
+    env: &[String],
+    user_home: &Path,
+    records: &Path,
+    roster: Option<&super::accounts::Roster>,
+    now: i64,
+    model: Option<&str>,
+) -> Option<(SubscriptionDisplay, Option<PlanUsage>)> {
+    let selected = selected_profile(env, user_home, records, roster)?;
+    let plan = selected.plan_usage(now, model);
+    Some((selected.subscription(now), plan))
+}
+
+/// One read of a process's selected profile ([`selected_profile`]).
+struct Selected {
+    /// What the profile says of its account.
+    profile: Profile,
+    /// The address `oauthAccount.emailAddress` names, where it reads as one.
+    email: Option<String>,
+}
+
+impl Drop for Selected {
+    /// An address no display took — a refused selection's, or one that only gated the
+    /// plan — is zeroed before it is freed, as [`answers_to`]'s is.
+    fn drop(&mut self) {
+        if let Some(email) = self.email.take() {
+            wipe(&mut email.into_bytes());
+        }
+    }
+}
+
+/// THE ONE SELECTION behind [`subscription_for`] and [`plan_usage_for`]: the profile the
+/// process's own exec environment selects, for a stored login only, read once, and kept
+/// only where the roster binds that login to the address the profile names (see
+/// [`subscription_for`] for the cases).
+fn selected_profile(
+    env: &[String],
+    user_home: &Path,
+    records: &Path,
+    roster: Option<&super::accounts::Roster>,
+) -> Option<Selected> {
     let who = super::accounts::ProcessLogin::of_exec_env(env)?;
     if !who.stored_login {
         return None;
@@ -978,7 +1136,7 @@ pub fn subscription_for(
         Some(&context.records),
         context.selection == Selection::CustomOauth,
     );
-    let display = read_with(&file, |bytes| parse_subscription(bytes, now)).ok()?;
+    let read = read_with(&file, parse_selected).ok()?;
     // CLAUDE_SECURESTORAGE_CONFIG_DIR changes the keychain item, not this file.
     // A different login can overwrite the shared profile while this tab stays open.
     let selected = (who.default_home || who.login.is_some())
@@ -991,7 +1149,7 @@ pub fn subscription_for(
         })
         .flatten();
     if let Some(expected) = selected.and_then(|row| row.email.as_deref()) {
-        if !display
+        if !read
             .email
             .as_deref()
             .is_some_and(|email| super::accounts::email_matches(expected, email))
@@ -1004,10 +1162,11 @@ pub fn subscription_for(
     {
         return None;
     }
-    Some(display)
+    Some(read)
 }
 
-fn parse_subscription(bytes: &[u8], now: i64) -> Result<SubscriptionDisplay, NoProfile> {
+/// The profile ([`parse`]) and its address, from one file's bytes.
+fn parse_selected(bytes: &[u8]) -> Result<Selected, NoProfile> {
     let profile = parse(bytes)?;
     // This second typed allowlist reads only the address. The general Profile stays
     // unchanged, and unrelated values (including credential strings) remain skipped.
@@ -1016,39 +1175,116 @@ fn parse_subscription(bytes: &[u8], now: i64) -> Result<SubscriptionDisplay, NoP
     let email = raw
         .and_then(|who| who.oauth.0)
         .and_then(|oauth| oauth.address.0)
-        .filter(|email| super::accounts::email_refusal(email).is_none());
-    // The underlying parser discards cached usage with a different accountUuid.
-    // Expired windows and a cache older than fifteen minutes cannot say what remains.
-    let weekly = profile.usage.as_ref().and_then(|usage| {
-        let observed = usage.fetched_at_ms.checked_div(1000)?;
-        if observed > now || now.saturating_sub(observed) > 15 * 60 {
-            return None;
+        .and_then(|email| {
+            if super::accounts::email_refusal(&email).is_none() {
+                return Some(email);
+            }
+            wipe(&mut email.into_bytes());
+            None
+        });
+    Ok(Selected { profile, email })
+}
+
+impl Selected {
+    /// The footer's display of this read at `now`.
+    fn subscription(mut self, now: i64) -> SubscriptionDisplay {
+        // The underlying parser discards cached usage with a different accountUuid.
+        let weekly = self.profile.usage.as_ref().and_then(|usage| {
+            let window = current_windows(usage, now).find(|row| row.bucket == Bucket::SevenDay)?;
+            let left = 1000_u16.saturating_sub(window.used_pct_x10?);
+            Some(if left.is_multiple_of(10) {
+                format!("weekly {}% left", left / 10)
+            } else {
+                format!("weekly {}.{}% left", left / 10, left % 10)
+            })
+        });
+        let plan = self
+            .profile
+            .plan
+            .display
+            .as_ref()
+            .map(|name| name.as_str().to_owned())
+            .or_else(|| self.profile.plan.title());
+        SubscriptionDisplay {
+            email: self.email.take(),
+            plan,
+            weekly,
         }
-        let window = usage
-            .windows
-            .iter()
-            .find(|row| row.bucket == Bucket::SevenDay)?;
-        if window.resets_at.is_none_or(|reset| reset <= now) {
-            return None;
-        }
-        let left = 1000_u16.saturating_sub(window.used_pct_x10?);
-        Some(if left.is_multiple_of(10) {
-            format!("weekly {}% left", left / 10)
-        } else {
-            format!("weekly {}.{}% left", left / 10, left % 10)
+    }
+
+    /// The window that binds `model` at `now` ([`plan_usage_for`]).
+    fn plan_usage(&self, now: i64, model: Option<&str>) -> Option<PlanUsage> {
+        let usage = self.profile.usage.as_ref()?;
+        let own = model.and_then(model_bucket);
+        let gating: Vec<&CachedWindow> = current_windows(usage, now)
+            .filter(|row| {
+                matches!(row.bucket, Bucket::FiveHour | Bucket::SevenDay) || Some(row.bucket) == own
+            })
+            .collect();
+        // Fable's weekly rows are per version (`Fable 5`, `Fable 5.1`): the row named for
+        // the model is its own. Where none is, which one gates it is not known, so all do.
+        let shown = model.map(super::footer::model_display);
+        let named = |row: &CachedWindow| {
+            row.bucket == Bucket::Fable
+                && row
+                    .name
+                    .as_ref()
+                    .zip(shown.as_deref())
+                    .is_some_and(|(name, shown)| name.as_str().eq_ignore_ascii_case(shown))
+        };
+        let by_name = gating.iter().any(|row| named(row));
+        let (used_x10, window) = gating
+            .into_iter()
+            .filter(|row| !by_name || row.bucket != Bucket::Fable || named(row))
+            // A gating window whose share did not read may be the one that binds.
+            .map(|row| Some((row.used_pct_x10?, row)))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            // Of two windows used alike, the one that resets later binds longer.
+            .max_by_key(|(used, row)| (*used, row.resets_at))?;
+        Some(PlanUsage {
+            account: self.profile.key?,
+            window: window.bucket,
+            used_x10,
+            resets_at: window.resets_at?,
+            read_at: usage.fetched_at_ms.checked_div(1000)?,
         })
-    });
-    let plan = profile
-        .plan
-        .display
-        .as_ref()
-        .map(|name| name.as_str().to_owned())
-        .or_else(|| profile.plan.title());
-    Ok(SubscriptionDisplay {
-        email,
-        plan,
-        weekly,
-    })
+    }
+}
+
+/// THE CURRENCY RULE of a cached `/usage` reading: the windows of `usage` that still say
+/// what is used at `now`. None when Claude Code fetched it over [`USAGE_CURRENT_S`] ago or
+/// after `now`, and of the rest only those that reset after `now`: an expired window, or one
+/// that names no reset, cannot say what remains.
+fn current_windows(usage: &UsageCache, now: i64) -> impl Iterator<Item = &CachedWindow> {
+    let current = usage
+        .fetched_at_ms
+        .checked_div(1000)
+        .is_some_and(|observed| observed <= now && now.saturating_sub(observed) <= USAGE_CURRENT_S);
+    let rows = if current {
+        usage.windows.as_slice()
+    } else {
+        &[]
+    };
+    rows.iter()
+        .filter(move |row| row.resets_at.is_some_and(|reset| reset > now))
+}
+
+/// The weekly bucket of `model`'s own family, for a model named by id
+/// (`claude-opus-5-5`), alias (`opus`) or display name (`Opus 5.5`); `None` for a family
+/// the usage body keeps no bucket of.
+fn model_bucket(model: &str) -> Option<Bucket> {
+    let short = super::usage::model_short(model);
+    let family: String = short
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    match family.to_ascii_lowercase().as_str() {
+        "opus" => Some(Bucket::SevenDayOpus),
+        "sonnet" => Some(Bucket::SevenDaySonnet),
+        "fable" => Some(Bucket::Fable),
+        _ => None,
+    }
 }
 
 /// READ THE PROFILE AT `path` ([`parse`]). Opened without blocking (a FIFO
@@ -1168,11 +1404,12 @@ fn profile_of(raw: RawFile) -> Profile {
         Leaf::Text(reason) => Credits::Off(reason),
         _ => Credits::Unknown,
     };
-    let usage = raw
-        .usage
-        .0
-        .filter(|cache| key.is_some() && cache.key.0 == key)
-        .and_then(usage_of);
+    let (usage, another) = match raw.usage.0 {
+        Some(cache) if key.is_some() && cache.key.0 == key => (usage_of(cache), None),
+        Some(cache) if key.is_some() && cache.key.0.is_some() => (None, Some(cache)),
+        _ => (None, None),
+    };
+    let usage_of_another_at = another.and_then(|cache| cache.fetched_ms.num().and_then(ms_to_s));
     let features = raw.features.0.unwrap_or_default();
     let credits_only = features
         .calm_seal
@@ -1189,6 +1426,7 @@ fn profile_of(raw: RawFile) -> Profile {
         plan,
         credits,
         usage,
+        usage_of_another_at,
         fable,
         consented,
         credits_only,

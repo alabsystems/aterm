@@ -1,40 +1,19 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The contracts the third-party consumers rely on (the liveness table in
-//! `src/lib.rs` says who relies on which).
+//! Behavioral tests for `once_cell` consumer contracts:
 //!
-//! The one that matters most: `wgpu-core`'s `ResourcePool` decides it won an
-//! initialisation race by whether its closure ran, so
-//! [`sync::OnceCell::get_or_try_init`] must call it EXACTLY ONCE.
-//! [`get_or_try_init_runs_the_closure_exactly_once_under_contention`] asserts
-//! that with wgpu-core's two-thread barrier shape. Its negative control is the
-//! gate-removal plant below; the `sync-init-exactly-once-concurrent` proof in
-//! `SPECS.md` is to carry that control as a mutation.
-//!
-//! Each of these plants in `src/lib.rs` was compiled, run and caught:
-//!
-//! * `sync::OnceCell::get_or_try_init` without its gate -> the exactly-once
-//!   test (`left: 2, right: 1`), plus
-//!   [`lazy_forced_concurrently_runs_its_initialiser_once`] and
-//!   [`once_box_runs_its_initialiser_once_under_contention`], which share the gate.
-//! * `get_or_try_init` without the fallible path ->
-//!   [`a_failed_initialiser_leaves_the_cell_empty_and_retryable`].
-//! * `sync::Lazy::get` forcing instead of peeking ->
-//!   [`lazy_does_not_run_its_initialiser_until_forced`].
-//! * `race::OnceBox::get_or_init` as check-compute-set ->
-//!   [`once_box_runs_its_initialiser_once_under_contention`].
-//! * `unsync::OnceCell::get_or_try_init` ignoring a failed `set` (origin/main
-//!   before 2026-10-10) -> [`unsync_get_or_try_init_refuses_a_reentrant_initialisation`].
+//! * `sync::OnceCell::get_or_try_init`, `sync::Lazy`, and `race::OnceBox` run
+//!   their initializer closure at most once under contention.
+//! * Failed `get_or_try_init` closures leave the cell empty and retryable.
+//! * `Lazy::get` peeks without forcing initialization.
+//! * `unsync::OnceCell::get_or_try_init` panics on reentrant initialization.
+//! * Panicking initializers do not poison the cell.
 
 use once_cell::{race, sync, unsync};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-
-// ---------------------------------------------------------------------------
-// sync::OnceCell — the exactly-once contract
-// ---------------------------------------------------------------------------
 
 /// How long the initialiser sleeps to widen the race window; the barrier does
 /// the synchronising. wgpu-core's own test uses 250 ms.
@@ -93,9 +72,7 @@ fn a_failed_initialiser_leaves_the_cell_empty_and_retryable() {
     let second: Result<&u32, &str> = cell.get_or_try_init(|| Ok(3));
     assert_eq!(second, Ok(&3), "a later call must be able to try again");
     assert_eq!(cell.get(), Some(&3));
-    // …and now it is closed: a library loader (x11-dl's and xkbcommon-dl's,
-    // until LW.7) relied on the cached handle never being replaced once a load
-    // succeeds.
+    // Once initialized, subsequent calls return the cached value.
     assert_eq!(cell.get_or_try_init(|| Ok::<u32, &str>(9)), Ok(&3));
 }
 
@@ -149,10 +126,6 @@ fn debug_and_eq_match_the_upstream_shapes() {
         "a full OnceBox prints its address, not null: {boxed:?}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Lazy — laziness, forcing, and the `F` bound that wasm-bindgen needs
-// ---------------------------------------------------------------------------
 
 #[test]
 fn lazy_does_not_run_its_initialiser_until_forced() {
@@ -256,9 +229,7 @@ fn lazy_is_sync_when_upstream_says_it_is() {
 
 #[test]
 fn lazy_forced_concurrently_runs_its_initialiser_once() {
-    // A `Lazy` static's initialiser may have effects (`wayland-sys`'s eight each
-    // `dlopen`ed a library until LW.7 left it lock-only); running one twice would
-    // repeat them.
+    // Concurrent `Lazy::force` calls run the initializer closure only once.
     let runs = Arc::new(AtomicUsize::new(0));
     let runs2 = Arc::clone(&runs);
     let lazy: Arc<sync::Lazy<u32, Box<dyn Fn() -> u32 + Send>>> =
@@ -282,10 +253,6 @@ fn lazy_forced_concurrently_runs_its_initialiser_once() {
     }
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 }
-
-// ---------------------------------------------------------------------------
-// race::OnceBox
-// ---------------------------------------------------------------------------
 
 #[test]
 fn once_box_is_a_single_assignment_cell_over_a_box() {
@@ -333,10 +300,6 @@ fn once_box_runs_its_initialiser_once_under_contention() {
     }
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 }
-
-// ---------------------------------------------------------------------------
-// unsync::OnceCell
-// ---------------------------------------------------------------------------
 
 #[test]
 fn unsync_once_cell_matches_its_sync_sibling() {
@@ -395,10 +358,6 @@ fn unsync_get_or_try_init_refuses_a_reentrant_initialisation() {
     });
     assert!(control.contains("reentrant init"), "got {control:?}");
 }
-
-// ---------------------------------------------------------------------------
-// Poisoning: the private mutexes must not turn one panic into a permanent one
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_panicking_initialiser_leaves_the_cell_usable() {

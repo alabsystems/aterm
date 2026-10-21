@@ -2,38 +2,24 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 for `NativeUpdateSpeculativeSidecar` (aterm-spec's
-//! `native_update_speculative_sidecar_model`): warm successor P5's artifact
-//! diet, a layout sidecar written before the park and sealed at it.
+//! `native_update_speculative_sidecar_model`): a layout sidecar written before the park and
+//! sealed at it.
 //!
-//! EVERY BEHAVIOUR of the committed model (`Buggy = 0`) is replayed against
-//! the SHIPPING code in a private directory that stands in for the control
-//! directory, under the attempt's real sidecar name. The steps it drives are:
+//! Every behaviour of the committed model (`Buggy = 0`) is replayed against the shipping code
+//! in a private directory, under the attempt's real sidecar name: the writer
+//! [`speculate_layout`] (a refused write is a directory the writer may not create in), the seal
+//! [`seal_layout`], the successor's reader (`seamless::take_regular_capped` and
+//! `seamless::layout_wire_digest` against `seamless::layout_digest` of the park's layout), and
+//! the sweep `seamless::discard_outgoing_in`. The desk moving is a second park layout, a
+//! disturbed file an in-place overwrite. After every step the real files are projected onto
+//! the model's variables ([`project`]); the file's identity (device and inode, the speculative
+//! file held open so its inode is not reused) tells a kept sidecar from a rewritten one with
+//! the same bytes. Each shipping call runs in its own `StepEvidence` window, and the audit
+//! requires each anchored fn to be entered by the step that drives its action.
 //!
-//! * the writer before the park, [`speculate_layout`], with a refused write
-//!   realized as a directory the writer may not create in;
-//! * the seal at the park, [`seal_layout`];
-//! * the successor's reader, `seamless::take_regular_capped` plus
-//!   `seamless::layout_wire_digest`, compared with `seamless::layout_digest`
-//!   of the park's layout (the pair the adoption proof compares);
-//! * the attempt's sweep, `seamless::discard_outgoing_in`.
-//!
-//! The environment's actions are realized on the files: the desk moving is a
-//! second park layout, and a disturbed file is an in-place overwrite. After
-//! every step the real files are PROJECTED onto the model's variables
-//! ([`project`]) and must equal the model's successor state. The file's
-//! identity (device and inode, with the speculative file held open so its
-//! inode cannot be reused) tells a kept sidecar from a rewritten one with the
-//! same bytes. Each shipping call runs inside its own `StepEvidence` window,
-//! and the audit requires every anchored function to have been entered by the
-//! step that drives its action.
-//!
-//! NEGATIVE CONTROL, the case P5 exists for: the layout changes between the
-//! launch and the park. Each `Buggy = 1` mutant is replayed on the same real
-//! files with a stand-in for the shortcut it takes (a seal that keeps without
-//! reading back, a grant before the seal, a retire without the sweep). The
-//! real projection then breaks the invariant the model says the mutant
-//! breaks, and the shipping step at the same point keeps it. So each
-//! invariant is observable on the real files, and a pass is never vacuous.
+//! Negative control: each `Buggy = 1` mutant is replayed on the same real files with a
+//! stand-in for its shortcut; the real projection breaks the invariant the model says it
+//! breaks, and the shipping step at the same point keeps it, so no pass is vacuous.
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -373,7 +359,7 @@ fn mutant_stand_in(rig: &mut Rig, action: &str) -> bool {
             rig.speculative = None;
             true
         }
-        // Compare what was MEANT to be written, not what the file holds.
+        // Compare what was meant to be written, not what the file holds.
         "VerifyTheMemoryCopy" => {
             let speculative = rig.speculative.take().expect("a speculation");
             assert_eq!(speculative.wire, wire(rig.park_layout()));
@@ -388,18 +374,17 @@ fn mutant_stand_in(rig: &mut Rig, action: &str) -> bool {
     }
 }
 
-/// THE NEGATIVE CONTROL. Each mutant's shortest counterexample from the Tier-0
-/// replayed on the real files: the real projection breaks the invariant the
-/// mutant was written for, and the shipping step at the same point keeps it.
+/// Negative control: each mutant's shortest Tier-0 counterexample, replayed on the real
+/// files, breaks the invariant it was written for, and the shipping step at the same point
+/// keeps it.
 #[test]
 fn negative_control_each_mutant_breaks_its_invariant_on_the_real_files() {
     let buggy = interp::with_buggy(&native_update_speculative_sidecar_model(), 1);
     let committed = interp::with_buggy(&native_update_speculative_sidecar_model(), 0);
     let mut ev = StepEvidence::new("native_update_speculative_sidecar");
     let cases: [(&[&'static str], &str, &[&'static str]); 5] = [
-        // THE DESK MOVED between the launch and the park, and the grant did
-        // not wait for the seal: the successor reads the launch's layout, and
-        // the real digest it takes is not the park's.
+        // The desk moved and the grant did not wait for the seal: the successor reads the
+        // launch's layout, and its digest is not the park's.
         (
             &[
                 "Speculate",

@@ -303,7 +303,8 @@ pub fn utc_iso(secs: i64) -> String {
 }
 
 /// `YYYY-MM-DDTHH:MM:SS` of a unix second in UTC.
-fn utc_civil(secs: i64) -> String {
+#[must_use]
+pub fn utc_civil(secs: i64) -> String {
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // civil-from-days (Howard Hinnant's algorithm), the proleptic Gregorian calendar
     let z = days + 719_468;

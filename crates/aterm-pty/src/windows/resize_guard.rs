@@ -1,171 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The resize guard: one input record written ahead of the input that
-//! follows a ConPTY resize, so a console reader that loses the record after a
-//! resize loses that one instead of the user's.
+//! ConPTY resize input guard: writes a sacrificial input record after a size
+//! change so MSYS2/Cygwin console readers drop the guard record instead of
+//! user input.
 //!
-//! WHAT IS LOST, measured 2026-09-27 on this box (conhost 10.0.26200, Git for
-//! Windows bash 5.3.9 on the MSYS2 runtime 3.6.7): after `aterm ctl resize`,
-//! the FIRST input record that reached bash vanished. A bracketed paste lost
-//! its opening ESC, so readline inserted `[200~xyzzy~` (and a turn ran
-//! `[200~cd` — "command not found") in 6 of 16 tries; a typed `xyzzy` came out
-//! `yzzy` in 2 of 12. pwsh and cmd lost nothing. `turn` hit it (4 of 8) on its
-//! FIRST use in a window: the tab strip grows a row for the turn (`dims`
-//! tab_rows 1 -> 2, `stty size` 24 -> 23), so its paste followed a resize.
-//!
-//! WHERE, read from the MSYS2 runtime source (winsup/cygwin/fhandler/console.cc
-//! at msys2-3.6.7; the same code is on cygwin `main` as of 2026-09-27):
+//! In the MSYS2/Cygwin runtime (`winsup/cygwin/fhandler/console.cc`),
 //! `process_input_message` peeks the console input queue and, on a
 //! `WINDOW_BUFFER_SIZE_EVENT` that changed the size, `send_winch_maybe`
-//! RELEASES the input mutex around `kill_pgrp (SIGWINCH)`. The runtime's
-//! `cons_master_thread` can take the mutex in that gap, read the queue, drop
-//! the size event as processed and write the rest back. `process_input_message`
-//! then discards `i + 1` records from the head of the queue — its count from
-//! the peek, one more than is left of it — so the record AFTER the size event
-//! goes, whenever it arrives (a paste a full second after the resize lost its
-//! ESC too). A terminal cannot keep the runtime from dropping that record, so
-//! the seam makes sure the record dropped is one nobody needs.
+//! releases the input mutex around `kill_pgrp(SIGWINCH)`. `cons_master_thread`
+//! can take the mutex in that gap, consume the size event, and write the
+//! remaining records back; `process_input_message` then discards `i + 1`
+//! records from the head of the queue (its pre-gap peek count), dropping the
+//! first record after the size event.
 //!
-//! THE RECORD is a Shift key-UP in conhost's win32-input-mode
-//! (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`, microsoft/terminal spec #4999). Measured with a
-//! `ReadConsoleInputW` dump under this conhost: it arrives as exactly one
-//! KEY_EVENT (key up, VK_SHIFT, scan 0x2A, no char, no modifiers) both with
-//! and without ENABLE_VIRTUAL_TERMINAL_INPUT. No reader acts on it as a key:
-//! the MSYS2 runtime skips key-ups, and bash, pwsh (PSReadLine) and cmd showed
-//! nothing and lost nothing with three of them queued. With the guard in this
-//! seam the same bash lost nothing in 48 resize-then-input tries (24 pastes,
-//! 24 typed lines), and ten first turns went through whole.
+//! ## Guard Record & Parser Switch
 //!
-//! THE SWITCH it throws. The record is not inert to conhost itself. The first
-//! win32-input-mode record conhost's input parser reads sets a flag it never
-//! clears (`_encounteredWin32InputModeSequence`, microsoft/terminal
-//! `InputStateMachineEngine.cpp`), and from then on the parser stops settling
-//! a read that ENDS in a lone ESC, or in an ESC plus one byte it cannot finish,
-//! as the Escape key or Alt+key (`StateMachine::ProcessString`: a terminal
-//! speaking win32-input-mode never sends those, so a trailing ESC must be a
-//! sequence cut across reads). It holds the ESC and joins it to the next key.
-//! Measured 2026-09-27 (pwsh `[Console]::ReadKey`, raw bytes by `ctl send
-//! --stdin`): before any resize, `ESC`, 1.5 s, `z` read as Escape then Z; after
-//! a resize and one `a`, the same bytes read as Alt+Z. The guard only brings
-//! the switch forward (aterm's Shift+Enter record already threw it), and two
-//! halves keep the keys whole across it:
-//! * the key ENCODER sends every key whose legacy bytes the switched parser
-//!   holds as that key's record (`win32_escape_record` in aterm-types
-//!   `keyboard/encode.rs`: Escape, Ctrl+[, Alt+[, Alt+Backspace, …). This guard
-//!   must not ship without it: alone it would hold Alt+Backspace, Alt+[ and
-//!   the other two-byte forms in every tab after the first resize (measured
-//!   after the switch: raw `ESC DEL` then `z` read as Alt+Z, while `ctl key
-//!   alt+backspace` read as Alt+Backspace).
-//!   `the_seam_escape_is_the_key_encoders_escape` fails without it.
-//! * the SEAM keeps the Escape key of a RAW writer (`ctl send`, `feed`,
-//!   `feed-bin` with a bare `\x1b`): once a record has gone to this conhost, a
-//!   write that is exactly one ESC, at a sequence boundary, goes out as the
-//!   Escape key's record pair, the key conhost read that ESC as before the
-//!   switch. A raw two-byte held form (`ESC [`, `ESC O`, `ESC ESC`, `ESC DEL`:
-//!   Alt+[, Alt+Shift+O, Alt+Escape, Alt+Backspace) is still held after the
-//!   switch, because the seam cannot know which physical key those bytes mean;
-//!   `ctl key` sends those keys through the encoder.
+//! For inbox `conhost`, the guard is a win32-input-mode Shift key-up
+//! ([`GUARD_RECORD`]: `CSI 16;42;0;0;0;1 _`), which decodes to a single
+//! `KEY_EVENT` (`VK_SHIFT` up) that shells and the MSYS2 runtime ignore.
+//! Because the first win32-input-mode sequence permanently sets
+//! `_encounteredWin32InputModeSequence` in conhost's `InputStateMachineEngine`
+//! (causing it to buffer a trailing lone `ESC` across reads), the key encoder
+//! emits held Escape-prefixed keys as win32-input-mode records, and this seam
+//! rewrites a bare single-byte `\x1b` write at a sequence boundary into
+//! [`ESCAPE_KEY_RECORDS`] once switched.
 //!
-//! WHEN the guard record is written — three gates:
-//! * conhost ASKED for win32-input-mode (`CSI ? 9001 h`, the first 8 bytes a
-//!   fresh ConPTY writes on 10.0.26200). A conhost that never asked may not
-//!   parse the record, and one that does not would hand a VT-input reader the
-//!   raw bytes, so without the request nothing is ever written.
-//! * the resize CHANGED the size. The runtime drops a record only for a size
-//!   it had not seen (`send_winch_maybe` compares), so an unchanged size needs
-//!   no guard.
-//! * the input stream is at a BOUNDARY: not inside an escape sequence and not
-//!   inside a UTF-8 character. A paste of 64 KiB or more is written in 4 KiB
-//!   slices cut at raw byte offsets. A record spliced into a half-written
-//!   `CSI 201 ~` would break the very marker it protects, and one spliced
-//!   between a character's bytes makes conhost's UTF-8 decoder replace the
-//!   character (measured 2026-09-27: a U+4E2D at bytes 4095..4097 of a
-//!   74,104-byte paste after a resize reached `cat` as three U+FFFD). The
-//!   guard then waits for the next write that starts clean.
+//! ## Emission Gates
 //!
-//! It rides the first [`GUARDED_WRITES`] writes after the resize, not just
-//! one: conhost reads the resize (signal pipe) and the input (input pipe) on
-//! two threads, so a write issued right after `ResizePseudoConsole` can be
-//! queued AHEAD of the size event, and then the record the runtime drops is
-//! the one in the NEXT write — which carries the guard too.
+//! [`GUARD_RECORD`] is prepended to the first [`GUARDED_WRITES`] (2) input
+//! writes after a resize (covering races between conhost's signal and input
+//! pipe threads) when:
+//! 1. Conhost requested win32-input-mode (`CSI ? 9001 h` within
+//!    [`HANDSHAKE_WINDOW`]).
+//! 2. The resize changed `(rows, cols)`.
+//! 3. [`InputTail`] is at `Ground` (never mid-escape sequence or mid-UTF-8
+//!    codepoint across 4 KiB paste slices).
 //!
-//! ONLY CONHOST DELIVERS IT. The runtime reads in VT-input mode, and for such
-//! a reader OpenConsole passes text alone: the guard (and every key-up) arrives
-//! as nothing, so the drop takes the user's key again. An OpenConsole session
-//! gets the OTHER half instead: before the first input write after a size
-//! change (not a reply: REPLIES), or by itself when no input follows (THE
-//! STALL), when a runtime program is in the tab, a second console client
-//! writes a `MENU_EVENT` record no reader acts on ([`super::console_guard`],
-//! with the numbers), and the write waits for it. The inline record still
-//! rides along there; it is inert.
+//! ## OpenConsole, Astral Characters, Replies, and Stall Nudge
 //!
-//! ASTRAL CHARACTERS. The inbox conhost hands a VT-input reader a character
-//! beyond U+FFFF typed as UTF-8 text without its high surrogate (measured
-//! 2026-10-17: Git Bash read `printf %s 'A😀B'` as `41 ed b8 80 42`, a lone
-//! U+DE00, for every emoji typed or pasted), while the same character sent as
-//! win32-input-mode records, both surrogates' key-downs then both key-ups with
-//! no virtual key, reached Git Bash, Windows PowerShell 5.1 and cmd whole
-//! (`VK_PACKET` records did not: PSReadLine dropped them). So once conhost has
-//! asked for records, and while a program of that runtime is in the tab (the
-//! same probe of the tab's job and process tree as the OpenConsole half's,
-//! `console_guard::runtime_in_tab`), every four-byte
-//! UTF-8 character that starts at a boundary goes as those four records, and a
-//! write that ends partway into one stops before it, for the caller's next
-//! write (which starts with it) to carry it whole. Only then: as text the
-//! character already reaches pwsh 7, Windows PowerShell 5.1 and cmd whole,
-//! and as records cmd's own line editor echoed a narrow one (𝐀, U+1D400) as
-//! U+FFFD although the command still got it (measured 2026-10-17). OpenConsole
-//! delivers such text intact and is sent it as typed.
-//!
-//! REPLIES pass the guard ([`Writer::Reply`]): the terminal's answer to a query
-//! neither runs the OpenConsole client nor carries the inline record, and the
-//! guard stays owed to the next input. OpenConsole asks for the cursor itself
-//! after a resize: the first `GetConsoleScreenBufferInfo` once the size changed
-//! writes `ESC[6n` and holds the host's one API thread up to 500 ms for the
-//! answer (microsoft/terminal `WaitForConptyCursorPositionToBeSynchronized`),
-//! and the MSYS2 runtime makes that call on every size event. A guarded answer
-//! waited for the client, and the client could not connect to a host whose API
-//! thread was waiting for that answer, so each resize stalled the runtime 500
-//! ms and its answer landed after the host had stopped waiting. The host
-//! captures an answer only while it has asked (one flag, not a count), so with
-//! resizes 50 to 300 ms apart, a window drag, late answers and new requests
-//! crossed and an answer the host no longer expected reached Git Bash as typed
-//! text: `$ ;1Rtyped` or `$ Rtyped`, after a bell, in 4 of 4 tries (measured
-//! 2026-10-18, OpenConsole 1.25.2609.30003).
-//! An answer that goes straight is captured within milliseconds and never
-//! becomes input, so the record the runtime drops is still the next input's,
-//! and that is where the guard waits. Nor may a write that waits for the
-//! client hold an answer up: an input write runs the client
-//! ([`ResizeGuard::settle`]) before it takes the input stream's lock, and
-//! aterm-session's sink has it run before the sink's frame lock
-//! (`aterm_pty::settle_input`), which the reply writer takes too. Run under
-//! those locks, a key typed while the host waited for its answer held the
-//! answer back the same way.
-//!
-//! REPORTS are input. A full-screen program that turns on DEC 2048 (vim does,
-//! and OpenConsole forwards it) is sent an in-band size report after every
-//! resize, and it went out in the same write as the answer to the host's
-//! cursor query, as a reply: past the guard, the record after the size event.
-//! The runtime dropped its ESC, and vim read `[48;20;70;460;630t` as keys,
-//! showed `900t` or `630t` pending and kept the old width: 9 of 36 resizes in
-//! pwsh and Git Bash tabs (OpenConsole 1.25.2609.30003, measured 2026-10-18).
-//! The terminal keeps the reports it sends unasked apart from its answers
-//! (aterm-core's `Terminal::take_reports`), and aterm-gui sends them through
-//! the session's ordered input writer, as it sends mouse and focus reports,
-//! behind the burst's answers: that writer waits for the client, the reply
-//! writer never does. 0 of 36 after.
-//!
-//! THE STALL. The dropped record is not only lost: until a record comes for
-//! the runtime's discard to take, its read sits there, and the program with
-//! it. The inbox conhost does not forward 2048, so vim there redraws on the
-//! size event alone, and it kept the old size after 10 of 36 resizes until a
-//! key came, whose record the guard then gave up (measured 2026-10-18). So
-//! when no input has followed a size change within 50 ms (the backend's
-//! `NUDGE_AFTER`), the guard sends its record by itself
-//! ([`ResizeGuard::nudge`]): in a tab with a runtime program, the inline
-//! record to an inbox conhost, and the client in OpenConsole. 0 of 36 after. A
-//! newer size change takes the nudge over, so a window drag whose steps come
-//! faster than that sends one record when it stops, not one per step.
+//! * **OpenConsole**: OpenConsole strips key-up records for VT-input readers,
+//!   so [`ResizeGuard::settle`] instead invokes [`super::console_guard`] to
+//!   inject an inert `MENU_EVENT` before the next input write.
+//! * **Astral characters**: Inbox `conhost` drops the high surrogate of
+//!   4-byte UTF-8 text for VT-input readers; when `runtime_in_tab` holds,
+//!   [`astral_as_records`] encodes 4-byte UTF-8 characters at `Ground` as
+//!   surrogate-pair win32-input-mode records.
+//! * **Replies vs. reports**: Terminal replies ([`Writer::Reply`], e.g.
+//!   `ESC[6n` cursor position answers that OpenConsole's API thread blocks on)
+//!   bypass both the inline guard and the OpenConsole client so they cannot
+//!   deadlock or consume the guard. Unsolicited reports (e.g. DEC 2048
+//!   in-band resize reports) travel as [`Writer::Input`].
+//! * **Stall nudge**: Until a post-resize record arrives for MSYS2's discard,
+//!   its input read blocks (`vim` on inbox conhost). If no input follows
+//!   within `NUDGE_AFTER` (50 ms), [`ResizeGuard::nudge`] sends the guard
+//!   record or runs the OpenConsole client for the latest resize arming.
 
 use std::borrow::Cow;
 use std::io;
@@ -174,6 +62,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use aterm_types::MutexExt;
 
+use super::INPUT_WRITE_MAX;
 use crate::ConsoleHostKind;
 
 /// conhost's request for win32-input-mode records (DECSET 9001).
@@ -346,14 +235,15 @@ fn push_astral_records(wire: &mut Vec<u8>, c: char) {
     }
 }
 
-/// `bytes` as an inbox conhost must be sent them after `tail` (module docs,
-/// ASTRAL CHARACTERS): each four-byte UTF-8 character that starts at a boundary
-/// as its records. Returns the wire and how many of `bytes` it carries, or
-/// `None` when `bytes` go as they are. A four-byte character that the write cuts
-/// off at its end is left out of the count when anything comes before it, for
-/// the caller's next write to start with; alone, it goes as bytes (there is no
-/// count short of zero to report).
-fn astral_as_records(mut tail: InputTail, bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+/// Rewrite 4-byte UTF-8 characters starting at `Ground` as surrogate-pair
+/// win32-input-mode records for inbox conhost, into at most `room` bytes of
+/// wire. Returns the rewritten buffer and consumed caller byte count, or `None`
+/// if the caller bytes that fit `room` need no rewrite. A trailing incomplete
+/// 4-byte character after earlier bytes is excluded from the count so the next
+/// write carries it whole, and so is everything from the first character whose
+/// records would not fit (records are 18 bytes a surrogate, so a 4 KiB slice of
+/// emoji is a 72 KiB wire): the wire ends between characters.
+fn astral_as_records(mut tail: InputTail, bytes: &[u8], room: usize) -> Option<(Vec<u8>, usize)> {
     let mut wire: Option<Vec<u8>> = None;
     // `bytes[..copied]` are in `wire` already.
     let mut copied = 0;
@@ -366,7 +256,13 @@ fn astral_as_records(mut tail: InputTail, bytes: &[u8]) -> Option<(Vec<u8>, usiz
                     if let Some(c) = s.chars().next() {
                         let w = wire.get_or_insert_with(|| Vec::with_capacity(bytes.len() + 64));
                         w.extend_from_slice(&bytes[copied..i]);
+                        copied = i;
+                        let at = w.len();
                         push_astral_records(w, c);
+                        if w.len() > room && i > 0 {
+                            w.truncate(at);
+                            break;
+                        }
                         i = end;
                         copied = end;
                         continue;
@@ -381,12 +277,16 @@ fn astral_as_records(mut tail: InputTail, bytes: &[u8]) -> Option<(Vec<u8>, usiz
                 Err(_) => {}
             }
         }
+        // The wire `bytes[..i]` makes fills `room`: it ends before this byte.
+        if wire.as_ref().map_or(0, Vec::len) + (i - copied) >= room {
+            break;
+        }
         tail = tail.step(bytes[i]);
         i += 1;
     }
     wire.map(|mut w| {
-        w.extend_from_slice(&bytes[copied..]);
-        (w, bytes.len())
+        w.extend_from_slice(&bytes[copied..i]);
+        (w, i)
     })
 }
 
@@ -458,16 +358,10 @@ impl ResizeGuard {
         Some(self.armings.fetch_add(1, Ordering::AcqRel).wrapping_add(1))
     }
 
-    /// THE STALL (module docs): the guard's record by itself, for arming
-    /// `arming` ([`Self::note_resize`]) when no input has carried it since, so
-    /// a program of the MSYS2/Cygwin runtime that is waiting for one more
-    /// record after the size change gets one and goes on. Only the latest
-    /// arming nudges: a newer size change armed the guard again and nudges for
-    /// itself. In OpenConsole it settles the client ([`Self::settle`], which
-    /// asks the tab for the runtime itself); to an inbox conhost that asked for
-    /// records, in a tab where `runtime_in_tab`, it writes [`GUARD_RECORD`] at a
-    /// boundary as the first of the [`GUARDED_WRITES`], so the next input still
-    /// carries the second. Whether it sent or ran anything.
+    /// Send a standalone guard record for `arming` ([`Self::note_resize`]) when
+    /// no input has followed the resize and `arming` is still the latest.
+    /// Settles `client` on OpenConsole, or writes [`GUARD_RECORD`] at a boundary
+    /// on inbox conhost when `runtime_in_tab` holds. Returns whether it acted.
     pub(super) fn nudge(
         &self,
         arming: u64,
@@ -548,13 +442,8 @@ impl ResizeGuard {
         }
     }
 
-    /// Write `bytes` with `write` (one `WriteFile` on the input pipe), leading
-    /// with [`GUARD_RECORD`] when the guard is armed and may be written, and
-    /// sending a lone ESC as [`ESCAPE_KEY_RECORDS`] once conhost has switched.
-    /// Returns the count of the CALLER's bytes that landed: the guard's own
-    /// bytes are left out, and a lone ESC counts once its whole pair is in.
-    /// Astral characters go as records here, as in a tab running the MSYS2
-    /// runtime.
+    /// Test helper: [`Self::write_with_client`] as [`Writer::Input`] with astral
+    /// record encoding enabled.
     #[cfg(test)]
     pub(super) fn write_with(
         &self,
@@ -564,14 +453,10 @@ impl ResizeGuard {
         self.write_with_client(bytes, Writer::Input, write, |_, _| {}, || true)
     }
 
-    /// Run `client` with the size last sent when an OpenConsole session's guard
-    /// is owed (module docs, ONLY CONHOST DELIVERS IT), and return once it has
-    /// run: in the input writes' turn and outside the input stream's lock, so
-    /// an input write that comes while it runs waits here for its record, and
-    /// a reply, which settles nothing, goes past it. An input writer calls this
-    /// before it takes any lock a reply needs (`aterm_pty::settle_input`): the
-    /// client may be waiting on the host, and the host on the terminal's
-    /// answer to its own cursor query (module docs, REPLIES).
+    /// Run `client` with the last size when an OpenConsole session's guard is
+    /// owed, serialized by `client_turn` and outside `input`'s lock so
+    /// [`Writer::Reply`] writes can proceed concurrently without deadlocking
+    /// OpenConsole's cursor-position query.
     pub(super) fn settle(&self, writer: Writer, client: impl FnOnce(i16, i16)) {
         if writer != Writer::Input {
             return;
@@ -583,15 +468,13 @@ impl ResizeGuard {
         }
     }
 
-    /// [`Self::write_with`] for `writer`, first settling `client` when an
-    /// OpenConsole session's guard is owed ([`Self::settle`]), and sending an
-    /// inbox conhost each astral character
-    /// as its records when `runtime_in_tab` says a program of the MSYS2/Cygwin
-    /// runtime is in the tab (ASTRAL CHARACTERS; asked only of a write that
-    /// holds one). A write whose wire was rewritten that way is finished here:
-    /// a record cut short would leave conhost inside it, and the caller's retry
-    /// starts its character over. A [`Writer::Reply`] runs no client and
-    /// carries no record, and leaves both owed (module docs, REPLIES).
+    /// Write `bytes` for `writer`, settling `client` on OpenConsole and rewriting
+    /// astral characters or lone `ESC` when required. Hands `write` at most
+    /// [`INPUT_WRITE_MAX`] bytes, the guard's record included, ending between
+    /// characters when it rewrote them, so a write the pipe released took none
+    /// of them; loops until a rewritten wire buffer is written in full; returns
+    /// the number of caller bytes consumed, which may be fewer than `bytes`.
+    /// [`Writer::Reply`] bypasses both `client` and the guard.
     pub(super) fn write_with_client(
         &self,
         bytes: &[u8],
@@ -608,16 +491,6 @@ impl ResizeGuard {
         let records = self.records.load(Ordering::Acquire);
         let at_boundary = input.tail == InputTail::Ground;
         let escape_key = records && input.switched && at_boundary && bytes == [ESC];
-        let rewritten = (records && !escape_key && self.host == ConsoleHostKind::Inbox)
-            .then(|| astral_as_records(input.tail, bytes))
-            .flatten()
-            .filter(|_| runtime_in_tab());
-        let (payload, taken): (Cow<'_, [u8]>, usize) = match rewritten {
-            Some((wire, taken)) => (Cow::Owned(wire), taken),
-            None if escape_key => (Cow::Borrowed(ESCAPE_KEY_RECORDS), 1),
-            None => (Cow::Borrowed(bytes), bytes.len()),
-        };
-        let finish = matches!(payload, Cow::Owned(_));
         let guarded = input_write
             && at_boundary
             && records
@@ -625,12 +498,27 @@ impl ResizeGuard {
                 .pending
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                 .is_ok();
+        let prefix: &[u8] = if guarded { GUARD_RECORD } else { &[] };
+        let room = INPUT_WRITE_MAX - prefix.len();
+        let rewritten = (records && !escape_key && self.host == ConsoleHostKind::Inbox)
+            .then(|| astral_as_records(input.tail, bytes, room))
+            .flatten()
+            .filter(|_| runtime_in_tab());
+        let (payload, taken): (Cow<'_, [u8]>, usize) = match rewritten {
+            Some((wire, taken)) => (Cow::Owned(wire), taken),
+            None if escape_key => (Cow::Borrowed(ESCAPE_KEY_RECORDS), 1),
+            None => {
+                let fits = bytes.len().min(room);
+                (Cow::Borrowed(&bytes[..fits]), fits)
+            }
+        };
+        let finish = matches!(payload, Cow::Owned(_));
         let framed;
-        let (prefix, wire): (&[u8], &[u8]) = if guarded {
+        let wire: &[u8] = if guarded {
             framed = [GUARD_RECORD, &payload].concat();
-            (GUARD_RECORD, &framed)
+            &framed
         } else {
-            (&[], &payload)
+            &payload
         };
         match write(wire) {
             // A write a sever or a stop released before anything landed: the
@@ -817,9 +705,8 @@ mod tests {
         assert_eq!(write(&g, b"x").1, guarded(b"x"));
     }
 
-    /// Nor a UTF-8 character: a slice that ends after U+4E2D's lead byte
-    /// (`E4 | B8 AD`, the review's 4 KiB boundary) and one that ends after its
-    /// second byte are each finished before the record goes out.
+    /// A slice ending mid-UTF-8 character (`U+4E2D` split after byte 1 or 2)
+    /// finishes the character before emitting the guard record.
     #[test]
     fn the_record_never_splits_a_utf8_character() {
         let g = ResizeGuard::new(Some((24, 80)), ConsoleHostKind::Inbox);
@@ -1001,10 +888,9 @@ mod tests {
         g
     }
 
-    /// ASTRAL CHARACTERS: once conhost asked for records, an emoji goes to it as
-    /// its surrogate pair's records, the text around it as typed, and the
-    /// caller hears its own byte count; the records throw THE SWITCH like any
-    /// other, so a lone ESC after them is the Escape key.
+    /// Once conhost requested win32-input-mode, astral characters are encoded as
+    /// surrogate-pair records, surrounding BMP text is unchanged, and the
+    /// records set `switched` so a subsequent lone `ESC` uses `ESCAPE_KEY_RECORDS`.
     #[test]
     fn an_astral_character_goes_to_conhost_as_its_surrogate_records() {
         let g = asked(ConsoleHostKind::Inbox);
@@ -1141,9 +1027,61 @@ mod tests {
         assert_eq!(write(&g, b"x").1, b"x", "the stream is at a boundary again");
     }
 
-    /// ONLY CONHOST DELIVERS IT: an OpenConsole session's first write after a
-    /// size change runs the client with the size sent, once; an unchanged size
-    /// and a conhost session never run it.
+    /// A paste of astral characters whose records outgrow the pipe (72 bytes
+    /// of records for 4 of text) goes in writes of at most [`INPUT_WRITE_MAX`],
+    /// the record included, each ending between characters: the pipe takes
+    /// such a write whole or, released, not at all, so the caller hears the
+    /// characters each one took, and a released one answers `Ok(0)`, never an
+    /// error after part of the paste went.
+    #[test]
+    fn records_that_outgrow_the_pipe_go_in_writes_it_takes_whole() {
+        let g = armed_guard();
+        let paste = "😀".repeat(1024);
+        let wires = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+        // The pipe takes the first write, at most its quota, and a stop
+        // releases every later one.
+        let pipe = |b: &[u8]| -> io::Result<usize> {
+            let mut wires = wires.borrow_mut();
+            wires.push(b.to_vec());
+            Ok(if wires.len() == 1 {
+                b.len().min(INPUT_WRITE_MAX)
+            } else {
+                0
+            })
+        };
+        let fit = (INPUT_WRITE_MAX - GUARD_RECORD.len()) / GRIN_RECORDS.len();
+        let first = g
+            .write_with(paste.as_bytes(), &pipe)
+            .expect("a write the pipe took");
+        assert_eq!(first, fit * 4, "as many whole characters as fit");
+        let released = g
+            .write_with(&paste.as_bytes()[first..], &pipe)
+            .expect("a released write");
+        assert_eq!(released, 0);
+        assert_eq!(
+            *wires.borrow(),
+            [
+                guarded(&GRIN_RECORDS.repeat(fit)),
+                guarded(&GRIN_RECORDS.repeat(1024 - fit)),
+            ]
+        );
+        assert_eq!(write(&g, b"x").1, guarded(b"x"), "the record still owed");
+        // Plain text past the quota ends at it, and an astral character just
+        // past it goes in the next write, as records.
+        let g = asked(ConsoleHostKind::Inbox);
+        let long = [vec![b'a'; INPUT_WRITE_MAX], "😀".into()].concat();
+        assert_eq!(
+            write(&g, &long),
+            (INPUT_WRITE_MAX, vec![b'a'; INPUT_WRITE_MAX])
+        );
+        assert_eq!(
+            write(&g, &long[INPUT_WRITE_MAX..]),
+            (4, GRIN_RECORDS.to_vec())
+        );
+    }
+
+    /// An OpenConsole session's first write after a size change runs `client`
+    /// once with the new size; unchanged sizes and conhost sessions never run it.
     #[test]
     fn an_openconsole_resize_runs_the_client_once_before_the_next_write() {
         let runs = std::cell::RefCell::new(Vec::new());
@@ -1192,11 +1130,8 @@ mod tests {
         (n, wire)
     }
 
-    /// REPLIES: after a size change an OpenConsole session's answer to the
-    /// host's `ESC[6n` goes out at once, as it is, with no client run before
-    /// it (the host's API thread waits for this very answer, and the client
-    /// cannot connect until it has it); the client stays owed to the next
-    /// input, which runs it once, for the last size.
+    /// After a size change, [`Writer::Reply`] writes immediately without running
+    /// the OpenConsole client, leaving the client owed to the next [`Writer::Input`].
     #[test]
     fn a_reply_after_a_resize_leaves_the_openconsole_client_to_the_next_input() {
         let runs = std::cell::Cell::new(0);
@@ -1237,12 +1172,9 @@ mod tests {
     /// A wait for something that must happen: a hang detector, never a budget.
     const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
 
-    /// REPLIES: an input write that owes the OpenConsole client runs it outside
-    /// the input stream's lock, so a reply written while the client runs goes
-    /// through. The client may be waiting on the console host and the host on
-    /// that reply (its own cursor query after a resize); with the client run
-    /// under the lock, the reply waited for the client and the client for the
-    /// reply, until the host gave up. The input's bytes follow the client.
+    /// An input write that owes the OpenConsole client runs it outside `input`'s
+    /// lock so a concurrent [`Writer::Reply`] (e.g. `ESC[6n` cursor answer)
+    /// completes while the client waits on the host.
     #[test]
     fn a_reply_goes_past_an_input_waiting_for_the_openconsole_client() {
         use std::sync::{Arc, mpsc};
@@ -1324,10 +1256,8 @@ mod tests {
         (sent, wire, runs)
     }
 
-    /// THE STALL: with no input after a size change, an inbox conhost in a tab
-    /// of the MSYS2 runtime gets the record by itself, once, as the first of
-    /// the two the resize owes, so the next input still carries the second and
-    /// the one after it none.
+    /// With no input after a size change, `nudge` on inbox conhost with the
+    /// MSYS2 runtime writes the first of the two [`GUARDED_WRITES`] records.
     #[test]
     fn a_nudge_sends_an_inbox_conhost_the_record_no_input_carried() {
         let (g, arming) = armed_for_nudge(ConsoleHostKind::Inbox);

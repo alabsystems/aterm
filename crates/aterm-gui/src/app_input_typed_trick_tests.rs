@@ -321,8 +321,8 @@ fn program_output_a_paste_and_raw_controller_bytes_never_command_the_cat() {
         "`send 'echo '` then a typed `sleep␣` must not nap the cat"
     );
 
-    // `sit` typed, then `send 'xyz\n'`: the newline in the raw payload
-    // resets WITHOUT evaluating the open token.
+    // `sit` typed, then `send 'xyz\n'`: the newline in the raw payload resets without
+    // evaluating the open token.
     app.input(wid, named(NamedKey::Enter), Source::Human);
     type_word(&mut app, wid, "sit");
     app.input(wid, InputEvent::KeySequence(b"xyz\n".to_vec()), ctl);
@@ -433,8 +433,7 @@ fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
     for (label, setup) in setups {
         let (mut app, wid, session) = pet_app();
         setup(&mut app);
-        // Runtime activation is memory-only: model the worker-prepared
-        // generation handoff, as the summon tests do.
+        // Model the worker-prepared generation handoff, as the summon tests do.
         app.prepared_sparkle = app.config.prepare_sparkle_runtime();
         app.sparkle_dirty = true;
         app.recompute_sparkle();
@@ -1267,12 +1266,10 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
     );
 }
 
-/// The introspection renderer declares the snapshot's row origin. `sit⏎`
-/// on the bottom row at a prompt width that puts the shell's `command not
-/// found: sit` in the typed word's columns one row nearer the caret, driven
-/// through a headless capture: with `set_scan_base_y` called before the
-/// rescan the flash lands on the typed line, two rows up (the engine's own
-/// negative control shows an undeclared host would paint the error line).
+/// The introspection renderer declares the snapshot's row origin. `sit⏎` on the bottom row, at a
+/// prompt width that puts the shell's `command not found: sit` in the typed word's columns one
+/// row nearer the caret: with `set_scan_base_y` called before the rescan, a headless capture's
+/// flash lands on the typed line two rows up, not the error line.
 #[test]
 fn a_headless_capture_declares_base_y_so_the_scrolled_flash_finds_the_typed_line() {
     let (mut app, wid, session) = pet_app();
@@ -1299,7 +1296,7 @@ fn a_headless_capture_declares_base_y_so_the_scrolled_flash_finds_the_typed_line
     app.capture_words(wid, t0);
     // The word was typed: the listener's line must know it.
     type_word(&mut app, wid, "sit");
-    // Enter is the boundary key: noted on the input path FIRST…
+    // Enter is the boundary key: noted on the input path first…
     app.input(wid, named(NamedKey::Enter), Source::Human);
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
     assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);

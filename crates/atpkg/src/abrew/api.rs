@@ -12,6 +12,7 @@ use aterm_json::Value;
 
 use super::fetch;
 use super::formula::{Cask, Formula};
+use super::machine::Machine;
 use super::prefix::{Prefix, write_metadata};
 
 const API_BASE: &str = "https://formulae.brew.sh/api";
@@ -55,11 +56,6 @@ impl Api {
             .is_some_and(|age| age < max_age)
     }
 
-    /// Fetch (or reuse) one API document as parsed JSON.
-    fn doc(&self, rel_url: &str, cache_file: &str, max_age_s: u64) -> Result<Value, String> {
-        self.doc_with_freshness(rel_url, cache_file, max_age_s, true)
-    }
-
     fn doc_with_freshness(
         &self,
         rel_url: &str,
@@ -67,8 +63,22 @@ impl Api {
         max_age_s: u64,
         allow_stale: bool,
     ) -> Result<Value, String> {
+        self.doc_checked(rel_url, cache_file, max_age_s, allow_stale)
+            .map_err(fetch::GetError::into_message)
+    }
+
+    /// Keep response status typed until per-package absence is classified.
+    fn doc_checked(
+        &self,
+        rel_url: &str,
+        cache_file: &str,
+        max_age_s: u64,
+        allow_stale: bool,
+    ) -> Result<Value, fetch::GetError> {
         if self.writable {
-            self.prefix.ensure_api_cache()?;
+            self.prefix
+                .ensure_api_cache()
+                .map_err(fetch::GetError::other)?;
         }
         let path = self.cache_path(cache_file);
         if Self::fresh(&path, Duration::from_secs(max_age_s))
@@ -77,15 +87,9 @@ impl Api {
         {
             return Ok(v);
         }
-        let url = format!("{API_BASE}/{rel_url}");
-        match fetch::curl_get(&url, &[]) {
+        match get_document(rel_url) {
             Ok(bytes) => {
-                if bytes.len() > API_BYTES {
-                    return Err(format!(
-                        "abrew: API document exceeds the {API_BYTES}-byte limit"
-                    ));
-                }
-                let value = parse_json(&bytes)?;
+                let value = parse_json(&bytes).map_err(fetch::GetError::other)?;
                 if self.writable {
                     let _ = write_metadata(&path, &bytes);
                 }
@@ -97,7 +101,7 @@ impl Api {
                     && let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, API_BYTES)
                 {
                     eprintln!("abrew: offline; using stale API cache for {cache_file}");
-                    parse_json(&bytes)
+                    parse_json(&bytes).map_err(fetch::GetError::other)
                 } else {
                     Err(e)
                 }
@@ -140,59 +144,41 @@ impl Api {
 
     fn formula_doc(&self, name: &str) -> Result<Value, String> {
         let short = Formula::short_name(name);
-        self.doc(
+        self.doc_checked(
             &format!("formula/{short}.json"),
             &format!("formula-{short}.json"),
             3600,
+            true,
         )
-        .map_err(|e| not_found_error(&e, "formula", short))
+        .map_err(|e| not_found_error(e, "formula", short))
     }
 
     fn cask_doc(&self, token: &str) -> Result<Value, String> {
         let short = Formula::short_name(token);
-        self.doc(
+        self.doc_checked(
             &format!("cask/{short}.json"),
             &format!("cask-{short}.json"),
             3600,
+            true,
         )
-        .map_err(|e| not_found_error(&e, "cask", short))
+        .map_err(|e| not_found_error(e, "cask", short))
     }
 
     pub fn formula(&self, name: &str) -> Result<Formula, String> {
-        let short = Formula::short_name(name);
-        let mut f = Formula::from_api(&self.formula_doc(name)?)?;
-        f.resolve_variations();
-        // Bind metadata to the request: the record must name the
-        // requested formula (or carry it as a known alias/oldname), so a
-        // mismatched cache/redirect body cannot rename the install.
-        if f.name != short
-            && !f.aliases.iter().any(|a| a == short)
-            && !f.oldnames.iter().any(|a| a == short)
-        {
-            return Err(format!(
-                "abrew: formula metadata for {short} names {}",
-                f.name
-            ));
-        }
-        Ok(f)
+        formula_record(&self.formula_doc(name)?, name, Machine::this())
     }
 
     /// Deletion may not interpret a missing or malformed dependency field as empty.
     pub(super) fn dependency_formula(&self, name: &str) -> Result<Formula, String> {
-        dependency_formula(&self.formula_doc(name)?, Formula::short_name(name))
+        dependency_formula(
+            &self.formula_doc(name)?,
+            Formula::short_name(name),
+            Machine::this(),
+        )
     }
 
     pub fn cask(&self, token: &str) -> Result<Cask, String> {
-        let short = Formula::short_name(token);
-        let v = self.cask_doc(token)?;
-        let c = Cask::from_api(&v)?;
-        if c.token != short {
-            return Err(format!(
-                "abrew: cask metadata for {short} names {}",
-                c.token
-            ));
-        }
-        Ok(c)
+        cask_record(&self.cask_doc(token)?, token)
     }
 
     /// The raw API record for `info --json`: brew's JSON info is
@@ -310,6 +296,83 @@ impl Api {
     }
 }
 
+/// Where admission reads package records from: the live API with its cache
+/// for the running machine ([`Api`]), or a downloaded index for a modelled
+/// one (the admission census, [`super::census`]). Records come back resolved
+/// for [`Catalog::machine`].
+pub trait Catalog {
+    /// The machine records are resolved, and admission judged, for.
+    fn machine(&self) -> &Machine;
+    /// The formula `name` names (a `homebrew/core/` or tap prefix dropped).
+    fn formula(&self, name: &str) -> Result<Formula, String>;
+    /// The cask `token` names.
+    fn cask(&self, token: &str) -> Result<Cask, String>;
+}
+
+impl Catalog for Api {
+    fn machine(&self) -> &Machine {
+        Machine::this()
+    }
+    fn formula(&self, name: &str) -> Result<Formula, String> {
+        Api::formula(self, name)
+    }
+    fn cask(&self, token: &str) -> Result<Cask, String> {
+        Api::cask(self, token)
+    }
+}
+
+/// One formula record, resolved for `machine` and bound to the request: the
+/// record must name the requested formula (or carry it as a known
+/// alias/oldname), so a mismatched cache/redirect body cannot rename the
+/// install.
+pub(super) fn formula_record(v: &Value, name: &str, machine: &Machine) -> Result<Formula, String> {
+    let short = Formula::short_name(name);
+    let mut f = Formula::from_api(v)?;
+    f.resolve_variations(machine);
+    if f.name != short
+        && !f.aliases.iter().any(|a| a == short)
+        && !f.oldnames.iter().any(|a| a == short)
+    {
+        return Err(format!(
+            "abrew: formula metadata for {short} names {}",
+            f.name
+        ));
+    }
+    Ok(f)
+}
+
+/// One cask record, bound to the requested token.
+pub(super) fn cask_record(v: &Value, token: &str) -> Result<Cask, String> {
+    let short = Formula::short_name(token);
+    let c = Cask::from_api(v)?;
+    if c.token != short {
+        return Err(format!(
+            "abrew: cask metadata for {short} names {}",
+            c.token
+        ));
+    }
+    Ok(c)
+}
+
+/// GET one API document, bounded like every cached one.
+fn get_document(rel_url: &str) -> Result<Vec<u8>, fetch::GetError> {
+    let bytes = fetch::curl_get_with_status(&format!("{API_BASE}/{rel_url}"), &[])?;
+    if bytes.len() > API_BYTES {
+        return Err(fetch::GetError::other(format!(
+            "abrew: API document exceeds the {API_BYTES}-byte limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// The full formula (`formula.json`) or cask (`cask.json`) index as
+/// formulae.brew.sh serves it now, in memory: no prefix and no cache
+/// are read or written (the admission census).
+pub fn fetch_index(casks: bool) -> Result<Vec<u8>, String> {
+    get_document(if casks { "cask.json" } else { "formula.json" })
+        .map_err(fetch::GetError::into_message)
+}
+
 /// One formula's declared install options, for `brew options`.
 pub struct OptionsRow {
     pub full_name: String,
@@ -349,12 +412,16 @@ pub(super) fn parse_options_record(v: &Value) -> (Vec<(String, String)>, bool) {
     (options, head)
 }
 
-pub(super) fn dependency_formula(v: &Value, name: &str) -> Result<Formula, String> {
+pub(super) fn dependency_formula(
+    v: &Value,
+    name: &str,
+    machine: &Machine,
+) -> Result<Formula, String> {
     if !super::valid_component(name) {
         return Err("abrew: invalid formula name".to_string());
     }
     let mut formula = Formula::from_api(v)?;
-    if !formula.resolve_variations() {
+    if !formula.resolve_variations(machine) {
         return Err(format!(
             "abrew: {name} has unknown system dependency metadata"
         ));
@@ -397,11 +464,11 @@ pub(super) fn dependency_formula(v: &Value, name: &str) -> Result<Formula, Strin
 
 /// A 404 from the per-package API is a plain "no such package",
 /// not a transport failure worth showing curl's stderr for.
-fn not_found_error(error: &str, kind: &str, name: &str) -> String {
-    if error.contains("404") {
+fn not_found_error(error: fetch::GetError, kind: &str, name: &str) -> String {
+    if error.is_not_found() {
         format!("abrew: no such {kind}: {name}")
     } else {
-        error.to_string()
+        error.into_message()
     }
 }
 

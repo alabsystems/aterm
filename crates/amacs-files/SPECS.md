@@ -34,6 +34,13 @@
 >
 > No test was deleted. No existing test sampled one of the five predicates alone. TR3 added three
 > tests and F2 fifteen, for the code around them, which the proofs do not cover (§4).
+>
+> T3 (amacs's terminal face) added `DocumentPersistenceStore::accept_overwrite`, the second
+> `C-x C-s` after a save found the file changed on disk: it accepts the disk's version as the
+> one the save may replace, keeping the buffer's own BOM and line-ending mapping (a reload takes
+> the disk's, `accept_reloaded_observation`). No contract: it moves structs (Gap 1). On T3's tree
+> the lane measured **172/756** and wrote that `floors.tsv` row; its three new rows are an
+> `unreachable` proved, a drop-glue assertion runtime-checked and the allocator assumption.
 
 The contract macros are aterm-log's two `trust_contract_fn!` arms and two `verify_island!` arms,
 defined once in `src/lib.rs` ahead of the modules. Both key on `cfg(trust_verify)`: the theorems
@@ -94,11 +101,9 @@ only `bool`, `uN` and `iN` carriers, and it refuses a body that holds a cast or 
 ## 2. Safety obligations TR3 made provable (TSV)
 
 The baseline is the lane's `--obligations` record at main `3eda2d3d76`. The after column is the
-same record on this tree. Behaviour is unchanged for every input the code accepted before,
-except at two extremes. A read no longer reserves more than 32 MiB + 1 up front, whatever the
-caller's limit and the file's claimed length (row 1). A lock budget the clock cannot add to now
-is no ceiling, where it used to panic (row 5). F2 kept every form here; its `decode_utf8` returns
-`Decoded` through the same slice pattern.
+same record on this tree. A read reserves at most 32 MiB + 1 up front, whatever the caller's
+limit and the file's claimed length (row 1), and a lock budget the clock cannot add to has no
+ceiling (row 5). `decode_utf8` returns `Decoded` through the same slice pattern.
 
 ```tsv
 site	before (lane text)	change	after
@@ -164,6 +169,9 @@ Whole-crate rows the lane leaves open	every fn	On the merged tree: 230 unsupport
   `the_observed_text_fingerprint_is_the_admitted_texts`, had no mutant run.
 - `targo --unverified test -p amacs-files` on the merged tree: 59 unit tests pass (41 before
   either slice, 3 from TR3, 15 from F2).
+- **Added by T3:** `host::tests::an_overwrite_keeps_the_buffers_mapping`: a CRLF buffer
+  overwriting an LF file is written `ours\r\n`, and a mixed buffer over a CRLF file byte for
+  byte. With it, 60 unit tests pass.
 
 ## 5. Re-measuring
 

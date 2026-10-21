@@ -463,7 +463,7 @@ pub(crate) struct FxGpu {
     pub(crate) atlas_bytes: u64,
     /// The bloom layers' source quads, and their scratch.
     bloom_src: Vec<GlowQuad>,
-    bloom_cols: Vec<u32>,
+    bloom_cols: aterm_render::SpriteCols,
     bloom_slicer: FxSlicer,
 }
 

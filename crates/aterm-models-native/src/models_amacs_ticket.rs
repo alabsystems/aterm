@@ -6,14 +6,22 @@
 //!
 //! Invariants: OneOutcome; SavedOnlyWhenAcked (`saved=1` implies the
 //! checkpoint reached the requested seq); OrphanKeepsView;
-//! WaiterAnsweredOnlyAfterViewGone. Buggy mutants: AnswerBeforeAck (`Buggy = 1`,
+//! WaiterAnsweredOnlyAfterViewGone; AbortNeverAdvancesCheckpoint (an abort
+//! writes nothing to the file and answers `saved=0`); FinishedOnlyOnItsSave
+//! (`finished` only once a save covers the text the person had when they
+//! pressed done); AbortKeepsOthersText (an abort never throws away unsaved
+//! text the edit did not type). Buggy mutants: AnswerBeforeAck (`Buggy = 1`,
 //! the `AnswerAtRequest` action), SecondOutcome (2, `ResolveAgain`),
-//! OrphanCloses (3, in `Orphan`) and AnswerWhileViewOpen (4, in
-//! `PersonCloses`). Tier-1: aterm-gui's `edit_ticket_conformance.rs`, whose
-//! control answers before `checkpoint_ack` and must fail.
+//! OrphanCloses (3, in `Orphan`), AnswerWhileViewOpen (4, in `PersonCloses`),
+//! AbortSaves (5, in `Abort`), FinishBeforeItsSave (6, in `Retire`) and
+//! AbortDiscardsOthersText (7, in `Abort`). Tier-1: aterm-gui's
+//! `edit_ticket_conformance.rs`, whose controls answer before
+//! `checkpoint_ack`, save on abort and discard the person's text on abort,
+//! and must fail.
 //!
-//! Slice N1 writes the close half (closing the view is done); N3 adds finish
-//! and abort, with AbortNeverAdvancesCheckpoint and its AbortSaves mutant.
+//! Slice N1 wrote the close half (closing the view is done); N3 added finish
+//! (C-c C-c: the Finishing state, then the close once its save is durable)
+//! and abort (C-c C-k: discard, then close).
 
 use aterm_spec::derive::Model;
 
@@ -29,8 +37,30 @@ use aterm_spec::derive::Model;
 /// checkpoint to cover the sequence it froze. `waiter` is a parked
 /// `await edit`; `outcomes` counts recorded outcomes; `answered` says a waiter
 /// received the outcome, whose `seq=` is `answer_seq` (the durable checkpoint
-/// when the view retired) and whose `saved` bit claims the file holds the text
-/// the view last showed (`close_seq`).
+/// when the view retired), whose `saved` bit claims the file holds the text
+/// the view last showed (`close_seq`), and whose `result` is 1 closed, 2
+/// finished or 3 aborted (0 before it resolves).
+///
+/// `finishing` is the Finishing state: done was pressed (`Finish`, C-c C-c)
+/// with the document at `finish_seq`, a save of it was started, and the view
+/// closes once the checkpoint covers it. A view that retires before then
+/// (another view keeps the document, so its close forces no save) answers
+/// `closed`, never `finished`; a save that did not land stops it finishing
+/// (`FinishHalts`), and the view stays open. `aborting` says abort was pressed (`Abort`,
+/// C-c C-k): its discard put the file's text back as a new sequence the
+/// checkpoint covers at once, writing nothing, and its close comes next
+/// (`AbortHalts` when that close did not happen). `writes` counts saves that
+/// reached the file while the ticket's view was open, `abort_writes` its
+/// value when abort was pressed.
+///
+/// `foreign` says the shared document holds unsaved text the edit did not
+/// type: it was dirty when the ticket's view opened, or the person typed in
+/// their own view since (`PersonEdits`; `Edit` is typing in the ticket's
+/// view). A save covers it again. Abort discards only when nothing is
+/// foreign; with foreign text it closes the ticket's view and keeps the text
+/// in the person's view (a view that is not the document's last closes with
+/// no save), and with no other view to keep it in, abort is refused. `lost`
+/// says an abort threw such text away, which no abort may.
 ///
 /// The view retires (`Retire`) once its close is covered, or at once when
 /// another view keeps the document (a non-final close forces no checkpoint),
@@ -39,8 +69,12 @@ use aterm_spec::derive::Model;
 /// `Buggy = 0`: a waiter answered when the close is requested, before its
 /// checkpoint (`AnswerAtRequest`, Buggy 1); a second outcome for a resolved
 /// ticket (`ResolveAgain`, Buggy 2); an orphan that closes its view
-/// (`Orphan`, Buggy 3); and the person's own view closing answering the
-/// ticket while its view is still open (`PersonCloses`, Buggy 4).
+/// (`Orphan`, Buggy 3); the person's own view closing answering the ticket
+/// while its view is still open (`PersonCloses`, Buggy 4); an abort that saves
+/// the buffer instead of discarding it (`Abort`, Buggy 5); a finish that
+/// answers `finished` whatever its save did (`Retire`, Buggy 6); and an
+/// abort that discards the person's unsaved text with its own (`Abort`,
+/// Buggy 7).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn amacs_edit_ticket_model() -> Model {
@@ -61,6 +95,14 @@ pub fn amacs_edit_ticket_model() -> Model {
             var answered = 0;
             var saved = 0;
             var answer_seq = 0;
+            var result = 0;
+            var finishing = 0;
+            var finish_seq = 0;
+            var aborting = 0;
+            var writes = 0;
+            var abort_writes = 0;
+            var foreign = 0;
+            var lost = 0;
             action Request when (state == 0) {
                 state = 1;
             }
@@ -71,6 +113,7 @@ pub fn amacs_edit_ticket_model() -> Model {
                 state = 2;
                 view = 1;
                 start = durable;
+                foreign = if durable <= head - 1 { 1 } else { 0 };
             }
             action PersonOpens when (other == 0) {
                 other = 1;
@@ -84,13 +127,21 @@ pub fn amacs_edit_ticket_model() -> Model {
                     outcomes
                 };
             }
-            action Edit when (
-                (view == 1 || other == 1) && closing == 0 && head <= MaxSeq - 1
-            ) {
+            action Edit when (view == 1 && closing == 0 && aborting == 0 && head <= MaxSeq - 1) {
                 head = head + 1;
             }
-            action SaveAck when ((view == 1 || other == 1) && durable <= head - 1) {
+            action PersonEdits when (
+                other == 1 && closing == 0 && aborting == 0 && head <= MaxSeq - 1
+            ) {
+                head = head + 1;
+                foreign = if view == 1 { 1 } else { foreign };
+            }
+            action SaveAck when (
+                (view == 1 || other == 1) && aborting == 0 && durable <= head - 1
+            ) {
                 durable = head;
+                writes = if view == 1 { writes + 1 } else { writes };
+                foreign = 0;
             }
             action Await when ((state == 2 || state == 3) && waiter == 0) {
                 state = 2;
@@ -106,6 +157,41 @@ pub fn amacs_edit_ticket_model() -> Model {
                 state = 3;
                 view = if Buggy == 3 { 0 } else { view };
             }
+            action Finish when ((state == 2 || state == 3) && view == 1 && aborting == 0) {
+                finishing = 1;
+                finish_seq = head;
+            }
+            action FinishHalts when (finishing == 1) {
+                finishing = 0;
+            }
+            action Abort when (
+                (state == 2 || state == 3) && view == 1 && aborting == 0
+                    && (foreign == 0 || other == 1 || Buggy == 7)
+            ) {
+                aborting = 1;
+                finishing = 0;
+                abort_writes = writes;
+                head = if Buggy == 5 {
+                    head
+                } else {
+                    if durable <= head - 1 && (foreign == 0 || Buggy == 7) { head + 1 } else { head }
+                };
+                durable = if Buggy == 5 {
+                    head
+                } else {
+                    if durable <= head - 1 && (foreign == 0 || Buggy == 7) {
+                        head + 1
+                    } else {
+                        durable
+                    }
+                };
+                writes = if Buggy == 5 && durable <= head - 1 { writes + 1 } else { writes };
+                lost = if Buggy == 7 && foreign == 1 { 1 } else { lost };
+                foreign = if Buggy == 5 || Buggy == 7 { 0 } else { foreign };
+            }
+            action AbortHalts when (aborting == 1 && closing == 0) {
+                aborting = 0;
+            }
             action RequestClose when (view == 1 && closing == 0) {
                 closing = 1;
                 close_seq = head;
@@ -117,10 +203,22 @@ pub fn amacs_edit_ticket_model() -> Model {
                 closing = 0;
                 state = 4;
                 outcomes = outcomes + 1;
-                saved = if close_seq <= durable && start <= durable - 1 { 1 } else { 0 };
+                result = if aborting == 1 {
+                    3
+                } else {
+                    if finishing == 1 && (finish_seq <= durable || Buggy == 6) { 2 } else { 1 }
+                };
+                saved = if aborting == 0 && close_seq <= durable && start <= durable - 1 {
+                    1
+                } else {
+                    0
+                };
                 answer_seq = durable;
                 answered = if waiter == 1 { 1 } else { answered };
                 waiter = 0;
+                finishing = 0;
+                aborting = 0;
+                foreign = 0;
             }
             action AnswerAtRequest when (
                 Buggy == 1 && view == 1 && closing == 1 && waiter == 1 && answered == 0
@@ -140,7 +238,16 @@ pub fn amacs_edit_ticket_model() -> Model {
                 if state == 3 { view == 1 } else { view <= 1 };
             invariant WaiterAnsweredOnlyAfterViewGone:
                 if answered == 1 { view == 0 } else { answered == 0 };
-            bound SequenceBounded: head <= MaxSeq;
+            invariant AbortNeverAdvancesCheckpoint:
+                if aborting == 1 || result == 3 {
+                    writes == abort_writes && saved == 0
+                } else {
+                    abort_writes <= writes
+                };
+            invariant FinishedOnlyOnItsSave:
+                if result == 2 { finish_seq <= answer_seq } else { result <= 3 };
+            invariant AbortKeepsOthersText: lost == 0;
+            bound SequenceBounded: head <= MaxSeq + 1;
         }
     }
 }

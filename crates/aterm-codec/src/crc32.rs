@@ -3,19 +3,11 @@
 
 //! CRC-32/ISO-HDLC, the checksum in a gzip (RFC 1952) trailer.
 //!
-//! The fold is astream-wire's `hash::crc32_ieee_update`: the CRC astream
-//! frames every record with, built as compile-time slicing-by-8 tables from
-//! the reflected polynomial `0xEDB8_8320`, with every table index proved in
-//! bounds by its `u8` type and the result pinned to the `0xCBF4_3926` check
-//! value and a bitwise reference there. aterm used to carry two more copies (a
-//! byte-at-a-time one here, a `OnceLock` slicing one in `aterm-png`); there is
-//! now one CRC-32 across aterm and its bus.
-//!
-//! [`Crc32`] stays as a type because the gzip reader
-//! (`inflate::stream::GzipReader`) holds one across `read` calls. astream's
-//! running value is the FINISHED CRC of the bytes so far (it starts at `0`,
-//! the CRC of nothing, and inverts in and out on each call), so the wrapper
-//! holds that and [`Crc32::finish`] has nothing left to undo.
+//! The fold is `astream_wire::hash::crc32_ieee_update` (slicing-by-8 tables
+//! from reflected polynomial `0xEDB8_8320`). Its running value is the finished
+//! CRC of the bytes so far (starting at `0` and inverting in and out on each
+//! call), so [`Crc32`] stores that directly and [`Crc32::finish`] returns it
+//! unchanged.
 
 use astream_wire::hash::crc32_ieee_update;
 
@@ -59,15 +51,9 @@ impl Crc32 {
 mod tests {
     use super::Crc32;
 
-    /// The conformance check on the borrowed fold: the standard CRC-32/ISO-HDLC
-    /// check value, the empty CRC, and gzip's own CRC for a known member
-    /// (`printf hello | gzip -n` ends in the trailer `86 a6 10 36 05 00 00 00`:
-    /// the CRC, little-endian, then ISIZE). Every value is also taken through
-    /// the running value the gzip reader holds (`new`, `update`, `finish`), not
-    /// only through [`Crc32::of`], which calls astream's fold directly: a
-    /// wrapper that kept the old register convention (seed `0xFFFF_FFFF`,
-    /// `finish` XORing it back out) passed this test when it checked `of` alone,
-    /// and fails it now.
+    /// Standard CRC-32/ISO-HDLC check value, empty input, and gzip trailer CRC
+    /// (`printf hello | gzip -n` ends in `86 a6 10 36 05 00 00 00`: little-endian
+    /// CRC then ISIZE), checked via both [`Crc32::of`] and streaming [`Crc32`].
     #[test]
     fn check_vector() {
         let streamed = |data: &[u8]| {
@@ -86,14 +72,9 @@ mod tests {
         assert_eq!(Crc32::default().finish(), 0);
     }
 
-    /// The wrapper's state is the finished CRC, not the inverted register a
-    /// table loop keeps: a state read mid-stream is the CRC of the bytes so
-    /// far, and folding on from it finishes the whole. A wrapper that kept the
-    /// old convention fails here, in `check_vector` and in
-    /// `folding_is_associative_over_every_split`. Negative control on the
-    /// assertions themselves: the same wrapper holding the register seed
-    /// (`0xFFFF_FFFF`, what this type used to start from) finishes to another
-    /// value, so the state's starting value is something they can see.
+    /// [`Crc32`] holds the finished CRC rather than an uninverted `0xFFFF_FFFF`-seeded
+    /// register: reading mid-stream yields the CRC of the prefix, and continuing folds
+    /// into the full-stream CRC.
     #[test]
     fn the_state_is_the_finished_crc_and_the_register_seed_is_wrong() {
         let mut crc = Crc32::new();

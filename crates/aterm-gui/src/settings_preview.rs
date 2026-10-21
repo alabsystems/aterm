@@ -47,13 +47,10 @@ const PAUSE_GLYPH_W: f32 = 14.0;
 /// accessibility read one value.
 pub(crate) const PREVIEW_PAUSE_ACTION: &str = "settings/preview-pause";
 
-/// The narrowest host cadence that can change a preview's pixels.
-///
-/// Keeping this decision on the normalized semantic preview spec means paint,
-/// retained-raster identity, and the event-loop timer cannot independently
-/// guess whether a demonstration is moving. `BlinkEdge` is deliberately a
-/// one-shot deadline rather than a frame cadence: a blinking cursor has only
-/// two visual states and must not wake/rasterize at 30 fps between them.
+/// The narrowest host cadence that can change a preview's pixels, decided on the
+/// normalized spec so paint, raster identity and the event-loop timer agree.
+/// `BlinkEdge` is a one-shot deadline, not a frame cadence: a blink has two visual
+/// states and must not rasterize at 30 fps between them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PreviewAnimation {
     #[default]
@@ -197,16 +194,14 @@ pub(crate) enum PreviewTrailStyle {
     Water,
     Beam,
     Comet,
-    /// THE CLASSIC WAKE — the salvaged v0.28 trail.
+    /// The classic wake.
     Classic,
 }
 
-/// The cursor companion selected by a rainbow-family style spelling.
-///
-/// Companion identity deliberately rides beside [`PreviewTrailStyle`]: the
-/// effects engine resolves every one of these choices to
-/// [`GlowStyle::RainbowKitty`], while the runtime uses the original style
-/// token to choose the resident cat, resident dog, or flying kitty.
+/// The cursor companion a rainbow-family spelling selects. It rides beside
+/// [`PreviewTrailStyle`] because the engine resolves all of them to
+/// [`GlowStyle::RainbowKitty`] and the runtime picks the resident cat, resident dog or
+/// flying kitty from the original token.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PreviewTrailCompanion {
     #[default]
@@ -265,9 +260,8 @@ pub(crate) struct CursorPreviewSpec {
     /// its own switch.
     pub(crate) trail_enabled: bool,
     pub(crate) trail_style: PreviewTrailStyle,
-    /// The selected preference token, retained because rainbow-family
-    /// geometry and companion identity intentionally live in its spelling.
-    /// `trail_style` is only the shared engine's broad dispatch class.
+    /// The selected preference token: rainbow-family geometry and companion live in its
+    /// spelling, while `trail_style` is only the engine's broad dispatch class.
     pub(crate) trail_style_raw: Arc<str>,
     /// The trail colour setting: each style's automatic colour, the cursor's
     /// colour chosen, or a packed `0x00RRGGBB`.
@@ -361,10 +355,8 @@ impl CursorPreviewSpec {
         }
     }
 
-    /// [`Self::effective_trail_style_raw`] as the RUNTIME resolves it — the
-    /// spelling the host's raw-token predicates would be asked about, so an
-    /// unrecognized value previews the default's companion and ribbon instead
-    /// of the geometry of a look nothing renders.
+    /// [`Self::effective_trail_style_raw`] as the runtime resolves it, so an
+    /// unrecognized value previews the default's companion and ribbon.
     #[cfg(test)]
     fn effective_trail_style_token(&self) -> &str {
         crate::app_config::effective_trail_style_token(self.effective_trail_style_raw())
@@ -379,17 +371,9 @@ impl CursorPreviewSpec {
         crate::app_config::resolve_trail_presentation_from_style(raw, self.resolved_trail_style())
     }
 
-    /// Match the runtime's broad-style gate plus its raw-token companion
-    /// predicates. A non-pet rainbow spelling owns the flying kitty — the
-    /// historical `nyan` / `rainbow` aliases and the explicit `… flying`
-    /// spellings.
-    ///
-    /// The GEOMETRY-ONLY underline variant used to land here too, and this
-    /// comment used to say so. It was not a rule: `style_names_kitty_pet` is a
-    /// whole-string equality and `"rainbow kitty underline"` simply matched no
-    /// entry, so one appended geometry word swapped the animal. It draws the
-    /// resident now, exactly like the `rainbow kitty` it is a geometry of; this
-    /// preview follows because it asks the engine's own predicate.
+    /// The rainbow companion the runtime draws, read from the same resolved presentation:
+    /// a pet species draws the resident pet, any other rainbow spelling (`nyan`, `rainbow`,
+    /// the `… flying` forms) the flying kitty.
     pub(crate) fn trail_companion(&self) -> PreviewTrailCompanion {
         let presentation = self.resolved_trail_presentation();
         if presentation.style.style != Some(GlowStyle::RainbowKitty) {
@@ -431,12 +415,9 @@ impl CursorPreviewSpec {
     }
 }
 
-/// A bounded terminal-canvas palette used to preview an uncommitted theme.
-///
-/// Values are packed `0x00RRGGBB`. The override is intentionally narrower
-/// than [`Theme`]: it cannot alter Settings chrome, layout, typography, or
-/// interaction state, and therefore remains portable across every semantic
-/// renderer host.
+/// A bounded terminal-canvas palette for previewing an uncommitted theme, packed
+/// `0x00RRGGBB`. Narrower than [`Theme`] on purpose: it cannot alter Settings chrome,
+/// layout, typography or interaction state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PreviewTerminalTheme {
     pub(crate) fg: u32,
@@ -912,8 +893,8 @@ pub(crate) struct SettingsPreviewSpec {
     pub(crate) ligatures: bool,
     pub(crate) merged_ligatures: bool,
     pub(crate) synthetic_styles: bool,
-    /// Uncommitted primary and real style-family choices. Every terminal-text
-    /// primitive carries this identity through delayed rasterization.
+    /// Uncommitted primary and style-family choices; every terminal-text primitive
+    /// carries this identity through delayed rasterization.
     pub(crate) font_candidate: SemanticFontCandidate,
     pub(crate) appearance: AppearancePreviewSpec,
     pub(crate) typography: TypographyPreviewSpec,
@@ -946,12 +927,11 @@ pub(crate) struct SettingsPreviewSpec {
     /// The candidate palette's label and appearance, for the accessible value.
     pub(crate) terminal_theme_identity: Option<PreviewThemeIdentity>,
     pub(crate) cursor: CursorPreviewSpec,
-    /// Injected deterministic animation phase. Hosts may advance this at their
-    /// own cadence; equal specs always produce equal pixels.
+    /// Injected deterministic animation phase; hosts advance it at their own cadence, and
+    /// equal specs paint equal pixels.
     pub(crate) phase_ms: u64,
-    /// The already-resolved W11 motion policy. True removes all decorative
-    /// motion and freezes a visible cursor instead of retaining a misleading
-    /// in-flight trail.
+    /// The resolved motion policy. True removes decorative motion and freezes a visible
+    /// cursor rather than leave a trail in flight.
     pub(crate) reduced_motion: bool,
     /// The viewer paused this looping demonstration (the card is its own
     /// Pause/Play control; WCAG 2.2.2). View state, never config: the view
@@ -1316,9 +1296,8 @@ impl SettingsPreviewSpec {
         }
     }
 
-    /// Return the exact cadence required by the pixels this spec can paint.
-    /// Static, hidden, reduced-motion, and zero-intensity combinations return
-    /// `None`, preserving aterm's pure-Wait idle contract.
+    /// The cadence the pixels this spec can paint require. Static, hidden, reduced-motion
+    /// and zero-intensity combinations return `None` (the pure-Wait idle contract).
     ///
     /// Answered from the spec as it stands, normalized or not, without
     /// materializing `normalized()`: the event loop probes the cadence for every
@@ -1801,10 +1780,9 @@ impl SettingsPreviewSpec {
         Some(format!("{} {value}", subject.to_lowercase()))
     }
 
-    /// Detailed renderer audit projection for introspection and regression
-    /// oracles. This deliberately does not back the accessibility value: terms
-    /// such as internal primitive names, fingerprints, and tone-map details are
-    /// useful to developers but punishing when spoken by assistive technology.
+    /// Detailed renderer audit projection for introspection and regression oracles. It does
+    /// not back the accessibility value: primitive names, fingerprints and tone-map details
+    /// are punishing when spoken by assistive technology.
     pub(crate) fn audit_value(&self) -> String {
         let spec = self.normalized();
         let motion = match spec.animation() {
@@ -1965,11 +1943,8 @@ impl SettingsPreviewSpec {
     /// preventing a frozen preview from needlessly re-rasterizing.
     pub(crate) fn paint_fingerprint(&self) -> u64 {
         let fingerprint = self.paint_identity_hash();
-        // Drift guard for the invariant documented on `paint_identity_hash`:
-        // hashing a spec and hashing its normalization must agree. Any raw
-        // field that leaks into the key (a missing clamp, trim, mask, or the
-        // `phase_ms` modulo) breaks this equality for un-normalized input, so
-        // every debug-built test that touches a fingerprint pins it.
+        // Drift guard for the invariant on `paint_identity_hash`: a raw field leaking into
+        // the key breaks this equality for un-normalized input.
         debug_assert_eq!(
             fingerprint,
             self.normalized().paint_identity_hash(),
@@ -1978,7 +1953,9 @@ impl SettingsPreviewSpec {
         fingerprint
     }
 
-    /// The hashing half of [`Self::paint_fingerprint`].
+    /// The hashing half of [`Self::paint_fingerprint`]. It runs on the present path, so it
+    /// hashes each field's normalized projection in place rather than cloning `normalized()`
+    /// (FxHash: a cache key over first-party data, never persisted or sent).
     ///
     /// This runs on the present path (once per native frame, once per visible
     /// native leaf on the split route), so it hashes each field's NORMALIZED
@@ -2709,12 +2686,9 @@ impl SettingsPreviewSpec {
         }
     }
 
-    /// The side the WINDOW SAMPLE paints (`true` = Light) when this spec is
-    /// painted against `host` — the theme [`Self::paint`] falls back to for a
-    /// spec carrying no candidate palette. THE resolver ([`window_sample_light`])
-    /// answering for the pixels, exposed so a fixture that needs a candidate on
-    /// the OPPOSITE side can ask instead of restating the platform rule and
-    /// silently rotting when the rule moves.
+    /// The side the window sample paints (`true` = Light) against `host`, the theme
+    /// [`Self::paint`] falls back to without a candidate palette. Asks [`window_sample_light`]
+    /// so a fixture needing the opposite side does not restate the platform rule.
     #[cfg(test)]
     pub(crate) fn window_sample_is_light(&self, host: Theme) -> bool {
         let spec = self.normalized();
@@ -2847,20 +2821,16 @@ impl SettingsPreviewSpec {
             state_width = measure(&state);
         }
         if state_width > available {
-            // Character caps are only a first-pass readability heuristic:
-            // proportional glyphs and Dynamic Type make their pixel width
-            // unknowable. The final preview-header projection therefore fits
-            // the actual UI-bold measure and remains UTF-8 safe.
+            // Character caps are only a first pass (proportional glyphs and Dynamic Type
+            // make pixel width unknowable): fit the real UI-bold measure, UTF-8 safe.
             state = bounded_badge_width(&state, available, caption_size.get());
             state_width =
                 crate::tray_raster::ui_text_width_for(TextFace::UiBold, &state, caption_size.get());
         }
         let show_scene = scene_width + 8.0 + state_width <= available;
         if show_scene {
-            // The scene badge is the preview's kicker — it wears the theme
-            // accent so every card header carries one confident spot of the
-            // theme's own color (the state badge on the right keeps its
-            // quieter semantic coloring).
+            // The scene badge wears the theme accent; the state badge keeps its quieter
+            // semantic colour.
             prims.push(text_prim(
                 rect.x + inset,
                 caption_y,
@@ -3402,9 +3372,9 @@ fn paint_platform_window_controls(
     }
 }
 
-/// Text/control ink conditioned against the preview titlebar itself. Native UI
-/// roles are conditioned against the terminal-derived Settings surface, which
-/// may have the opposite luminance from a forced Light/Dark window chrome.
+/// Text/control ink conditioned against the preview titlebar. Native UI roles are
+/// conditioned against the Settings surface, which may have the opposite luminance from a
+/// forced Light/Dark window chrome.
 const fn window_chrome_text_color(light: bool) -> [u8; 3] {
     if light {
         [0x64, 0x68, 0x72]
@@ -3895,16 +3865,11 @@ fn build_terminal_specimen_input_grid(
     specimen_cursor_col(spec).hash(&mut hash);
     let fingerprint = hash.finish() | 1;
 
-    // Building the snapshot means constructing a whole `aterm_core::Terminal`
-    // (grid page store included) and re-parsing the const specimen through the
-    // real VT parser, which is pure but far from free at 30 fps. The result is
-    // an immutable `Arc` snapshot (`TerminalSpecimenSpec::input`; raster only
-    // ever reads it), so returning the previous frame's `Arc` for an identical
-    // key is indistinguishable from rebuilding it.
-    //
-    // The slot is thread-local, so a raster worker can never observe another
-    // thread's entry, and it stores the full (key, value) pair: a bare value
-    // keyed elsewhere is exactly how such caches go stale.
+    // Building the snapshot constructs a whole `Terminal` and re-parses the specimen
+    // through the VT parser: pure but costly at 30 fps. The result is an immutable `Arc`
+    // that raster only reads, so reusing the previous one for an identical key is
+    // indistinguishable from rebuilding. The slot is thread-local and stores the full
+    // (key, value) pair.
     thread_local! {
         static LAST_SPECIMEN: std::cell::RefCell<Option<(u64, Arc<aterm_render::RenderInput>)>> =
             const { std::cell::RefCell::new(None) };
@@ -5615,10 +5580,8 @@ mod tests {
         compiled_with_font(spec, |_| {})
     }
 
-    /// [`compiled`], with a last chance to perturb the host-prepared semantic
-    /// font snapshot the fixture injects. Only [`pixels_recomputed`] uses the
-    /// hook, and only to move `snapshot.ready_epoch` — the one field of that
-    /// snapshot that reaches no primitive at all (see the helper).
+    /// [`compiled`], with a hook to perturb the injected semantic font snapshot. Only
+    /// [`pixels_recomputed`] uses it, to move `snapshot.ready_epoch`.
     fn compiled_with_font(
         mut spec: SettingsPreviewSpec,
         perturb: impl FnOnce(&mut crate::tray_raster::PreparedSemanticFont),
@@ -5627,10 +5590,8 @@ mod tests {
             crate::native_appearance::AppearancePreferences::default(),
         );
         thread_local! {
-            // A libtest worker can execute another font-mutating test between
-            // two tests in this module. Track the actual cascade generation,
-            // not a one-way boolean, so worker reuse cannot leave this pixel
-            // fixture rendering somebody else's font.
+            // Another font-mutating test can run on this libtest worker in between, so
+            // track the cascade generation, not a one-way boolean.
             static INSTALLED_EPOCH: Cell<Option<u64>> = const { Cell::new(None) };
         }
         INSTALLED_EPOCH.with(|installed| {
@@ -5644,11 +5605,9 @@ mod tests {
                 .expect("embedded semantic renderer");
                 renderer.set_runtime_font_discovery(false);
                 renderer.prepare_semantic_typography("Bold Italic != => 你好 ∑✓♥ 😀 🚀 👩‍💻");
-                // SETTLED install, not `set_chrome_fonts`: the production seam
-                // parks an async prewarm worker whose landing between two
-                // `pixels()` calls of one test would swap the semantic cascade
-                // mid-assertion (the pass-isolated/fail-parallel flake). The
-                // fixture runs that warmup inline and parks no worker.
+                // A settled install, not `set_chrome_fonts`: that parks an async prewarm
+                // worker whose landing between two `pixels()` calls would swap the
+                // cascade mid-assertion.
                 let epoch = crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
                 installed.set(Some(epoch));
             }
@@ -5796,35 +5755,19 @@ mod tests {
         .0
     }
 
-    /// [`pixels`], with BOTH specimen memos on the paint path forced to miss,
-    /// so the terminal specimen — by far the most expensive prim in the tray —
-    /// is genuinely re-derived instead of replayed.
+    /// [`pixels`] with both specimen memos on the paint path forced to miss, so the
+    /// terminal specimen is re-derived, not replayed. A second paint of one spec otherwise
+    /// hits both memos and returns identical bytes by construction, making a
+    /// `differences(..) == 0` across two paints trivially true. Use this for the second
+    /// half of such a comparison:
     ///
-    /// Two caches sit between a spec and its pixels: the single-slot engine
-    /// snapshot memo inside [`build_terminal_specimen_input`], and
-    /// `tray_raster`'s retained specimen frame (an `Rc<Frame>` keyed by the
-    /// whole specimen spec beside the fork-source pointer). Both keys are total
-    /// functions of one paint's inputs, so a SECOND paint of one spec hits both
-    /// and hands back byte-identical bytes by construction — which would make
-    /// any `differences(..) == 0` assertion across two paints trivially true for
-    /// everything inside the specimen. Use this for the second half of such a
-    /// comparison; both memos then miss, and the assertion is once again a
-    /// statement about the renderer rather than about the cache:
-    ///
-    /// * the snapshot memo holds exactly one `(key, value)` pair, so parking
-    ///   another key in it evicts whatever the previous paint left there. The
-    ///   parking spec below is a different `PreviewScene`, which selects both a
-    ///   different row count and a different source string — three of the hashed
-    ///   inputs — and the returned fingerprint is asserted against the one this
-    ///   paint actually resolves to, so a memo hit cannot pass unnoticed.
-    /// * the retained frame is keyed on `prepared_font.snapshot.ready_epoch`
-    ///   among the rest. That epoch is an identity token: it reaches no
-    ///   primitive and no renderer setting — only `paint_fingerprint` and the
-    ///   two raster memo keys — so moving it cannot change a pixel, but it does
-    ///   force `cached_specimen_frame` to miss and the fork + `render_input` to
-    ///   run again against the same immutable renderer `Rc`. The nonce makes the
-    ///   key one this libtest worker has never retained, so a reused worker
-    ///   cannot serve one recomputed paint from another's entry.
+    /// * the snapshot memo in [`build_terminal_specimen_input`] holds one `(key, value)`
+    ///   pair, so parking a spec of another `PreviewScene` (different rows and source)
+    ///   evicts it; the returned fingerprint is asserted, so a hit cannot pass unnoticed.
+    /// * `tray_raster`'s retained specimen frame is keyed on
+    ///   `prepared_font.snapshot.ready_epoch`, which reaches no primitive, so moving it
+    ///   changes no pixel but makes `cached_specimen_frame` miss. The nonce makes the key
+    ///   one this libtest worker has never retained.
     fn pixels_recomputed(spec: SettingsPreviewSpec) -> Vec<u8> {
         let parking_spec = if spec.scene == PreviewScene::Appearance {
             SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
@@ -8715,8 +8658,8 @@ mod tests {
             rgba: Arc::clone(&rgba),
             fp: 0xCA7C_A7C0_1234_5678,
         };
-        // Rainbow kitty is the DEFAULT trail style now, so pin the spec to phaser — the
-        // dormant-rainbow kitty path this test exercises requires a non-rainbow-kitty style.
+        // The default trail is a rainbow-kitty style; the dormant-kitty path this test
+        // exercises needs another, so pin phaser.
         let custom = SettingsPreviewSpec::cursor(CursorPreviewSpec {
             trail_style: PreviewTrailStyle::Phaser,
             ..CursorPreviewSpec::default()
@@ -8891,8 +8834,8 @@ mod tests {
 
     #[test]
     fn typography_reserves_whole_candidate_rows_above_its_status_band() {
-        // Load the real deterministic specimen renderer through the paint
-        // fixture, then keep its immutable snapshot for every geometry probe.
+        // Load the deterministic specimen renderer through the paint fixture, then reuse
+        // its immutable snapshot for every geometry probe.
         let _ = compiled(SettingsPreviewSpec::typography(12.0));
         let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
             &SemanticFontCandidate::default(),
@@ -8981,8 +8924,7 @@ mod tests {
                 }
             }
         }
-        // Historical negative control: the old compact card held five rows
-        // at24px under a bottom pill, which physically cannot fit.
+        // Negative control: five rows at 24px under a bottom pill cannot fit a 108pt card.
         let old_terminal_h = 108.0 - 27.0 - 15.0;
         let row_h = prepared.specimen_cell_height(48.0, 1.0, &[]).unwrap() as f32 / 2.0;
         assert!(row_h * TYPOGRAPHY_SPECIMEN_ROWS as f32 > old_terminal_h - 24.0);

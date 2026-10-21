@@ -70,6 +70,7 @@ mod procedural_orthogonal_regression;
 mod procedural_seams;
 mod rain_render;
 mod raster_accuracy_survey;
+mod row_overshoot;
 mod row_revision_oracle;
 mod rtl_runs;
 mod script_support_matrix;

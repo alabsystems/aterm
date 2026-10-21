@@ -1,27 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for the HOST's reading of an agent session: the
-//! program an atpkg shim launches and the wall its turn ended on, driven
-//! through the one `aterm` binary against a real headless instance.
+//! Live-headless conformance for the host's reading of a session run through atpkg's shim.
+//! `claude` in an aterm shell runs the twin `…/agents/claude`, a `/bin/sh` script that
+//! `exec`s the store binary, so until the exec the foreground leader's argv[0] is `/bin/sh`.
+//! A twin that draws aterm-phase's 529 end of turn and never execs reads `program=claude`
+//! and `agent=wall:overloaded` (`level=limited`; `await agent wall` latches). NEGATIVE
+//! CONTROLS: the same script under another name, or named `claude` outside the managed
+//! prefix (a user's own wrapper), reads `program=sh agent=-`.
 //!
-//! * THE SHIM WINDOW. `claude` typed in an aterm shell runs atpkg's twin, a
-//!   `#!/bin/sh` script `…/agents/claude` that `exec`s the store binary; until
-//!   the exec the foreground leader's argv[0] is `/bin/sh` (measured). A twin
-//!   that draws a Claude end-of-turn screen and never execs must read
-//!   `program=claude` — and so be read by the Claude reader — not `sh`.
-//!   NEGATIVE CONTROLS: the same script under another name reads `program=sh
-//!   agent=-`, and so does one named `claude` outside the managed prefix (a
-//!   user's own wrapper).
-//! * THE WALL. The screen it draws is aterm-phase's 529 end of turn
-//!   (`hand-built-529-end-of-turn.txt`): `agent=wall:overloaded`, `level=
-//!   limited`, and `await agent wall:overloaded` / `await agent wall` latch.
-//!   It read `agent=idle` before, and a supervisor that trusted idle waited
-//!   for a worker that would never move.
-//!
-//! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
-//! every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance opens no window.
+//! Isolation (`support/launch_isolation.rs`): scratch HOME/XDG roots, a private control
+//! socket, every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`.
 
 #![cfg(unix)]
 
@@ -44,11 +33,9 @@ fn boot(tag: &str) -> Instance {
     )
 }
 
-/// How long a wait for something that MUST happen may take before it is read
-/// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
-/// Every one is BELOW the shim's life ([`write_shim`]'s `sleep`): a shim that
-/// ended first would leave `program=sh` behind, which the negative controls
-/// would read as their pass.
+/// How long a wait for something that must happen may take before it is read as a hang.
+/// Every one is below the shim's life ([`write_shim`]'s `sleep`): a shim that ended first
+/// would leave `program=sh` behind, which the negative controls would read as their pass.
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 
@@ -148,10 +135,8 @@ fn a_shim_before_its_exec_is_the_agent_and_its_529_is_a_wall() {
     );
     assert_eq!(field(&rec, "agent_detail"), Some("-"), "{rec}");
     assert_eq!(field(&rec, "level"), Some("limited"), "{rec}");
-    // Latched: the verdict is already true, so both answer at once. A wait
-    // that did not latch parks for a change this still screen never makes and
-    // answers `OK timeout`, exit 124, which fails `ctl_ok` — so the timeout is
-    // a hang detector, not the "at once" (it was 3 s).
+    // Latched: the verdict is already true, so each answers at once; one that did not latch
+    // would time out (exit 124) and fail `ctl_ok`.
     for word in ["wall:overloaded", "wall", "busy,wall:overloaded"] {
         let reply = ctl_ok(
             &inst,
@@ -193,9 +178,9 @@ fn the_same_script_under_another_name_is_a_shell() {
     assert_eq!(field(&rec, "agent"), Some("-"), "{rec}");
 }
 
-/// NEGATIVE CONTROL: a script NAMED `claude` that is not atpkg's shim — a
-/// user's own `~/bin/claude` wrapper — is a shell running a script too, so the
-/// in-GUI supervisor never attaches a pressing loop to whatever it runs.
+/// NEGATIVE CONTROL: a script named `claude` that is not atpkg's shim (a user's own
+/// `~/bin/claude` wrapper) is a shell running a script too, so the in-GUI supervisor never
+/// attaches to it.
 #[test]
 fn a_wrapper_named_claude_outside_the_prefix_is_a_shell() {
     let (inst, sid) = run_shim("claude", false, "u");

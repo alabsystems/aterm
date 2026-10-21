@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for `TrustFactsReuse` — the whole-tree Trust lane's facts and
-//! the one judge that reads them (FACTS, NOT VERDICTS, 2026-09-29; NO FLOOR EXCUSES,
-//! 2026-09-30), bound to the code that ships.
+//! Tier-1 conformance for `TrustFactsReuse` (`aterm_spec::derive::trust_facts_reuse_model`,
+//! which states the laws): the whole-tree Trust lane's facts and their judge, bound to the
+//! shipping code.
 //!
 //! The model (`aterm_models_release::trust_facts_reuse_model`) states the laws: a
 //! VERIFIED answer is judged from facts measured on this tree (floors aside) with this
@@ -21,14 +21,8 @@
 //! on from the file the reader opened — and requires the model to admit each
 //! transition, named, on both tiers.
 //!
-//! The model's store holds the latest record, so the harness files one record at a
-//! time (the unit tests in `trust_facts` hold the reader to its key among many).
-//!
-//! NEGATIVE CONTROLS, so a pass is never vacuous: the pre-P0 receipt reader, P0's
-//! unchecked reuse reader, the retired lane's two floor excuses (another prover's floor
-//! not held; a shortfall the lapses cover passed), P0's re-base admitted with no reason,
-//! and a re-measure folded across keys are each replayed on the state that exposes it;
-//! the model refuses what each answers.
+//! Negative controls replay each reader or fold that the contract rules out, on the state that
+//! exposes it; the model must refuse each, so a pass is never vacuous.
 
 use crate::trust_facts::{
     self, Crate, Decision, Facts, Measured, Prover, RATCHET, TrustCmd, Update, facts_for, testing,
@@ -119,8 +113,8 @@ impl Harness {
             src_of: BTreeMap::new(),
             steps: 0,
         };
-        // The initial state IS the fixture: source 0, floor 0 under the measuring
-        // prover with no reason, nothing filed.
+        // The initial state is the fixture: source 0, floor 0 under the measuring prover
+        // with no reason, nothing filed.
         let head = h.commit(&[
             ("crates/alpha/src/lib.rs", "v0"),
             (RATCHET, &floors(0, 0, 0)),
@@ -137,8 +131,7 @@ impl Harness {
         self.work.join(".git/aterm-verify/receipts")
     }
 
-    /// Writes `files`, stages them with one `git add` (one per file was a git
-    /// process each), and commits.
+    /// Writes `files`, stages them with one `git add`, and commits.
     fn commit(&self, files: &[(&str, &str)]) -> String {
         for (path, body) in files {
             let full = self.work.join(path);
@@ -363,8 +356,8 @@ impl Harness {
         self.run_as("RunUnderLoad", true);
     }
 
-    /// `--remeasure` on HEAD: alpha measured again on HEAD's key, folded by the REAL
-    /// fold into the stored record of that key, and filed.
+    /// `--remeasure` on HEAD: alpha measured again on HEAD's key, folded by the real fold into
+    /// the stored record of that key, and filed.
     fn remeasure(&mut self) {
         let head = self.head();
         let (base, _) = facts_for(&self.cli(), &self.store(), self.prover(), &head)
@@ -473,8 +466,8 @@ impl Harness {
         self.step("Assemble", next);
     }
 
-    /// A retired reader's answer on this state: found, VERIFIED, from the record's
-    /// own facts. The model must refuse it.
+    /// A ruled-out reader's answer on this state (found, VERIFIED, from the record's own facts),
+    /// which the model must refuse.
     fn refuses_a_pass(&mut self, which: &str) {
         let head = self.head();
         let (facts, _) = facts_for(&self.cli(), &self.store(), self.prover(), &head)
@@ -508,8 +501,8 @@ struct Projected {
     m_prv: i64,
 }
 
-/// The ratchet: alpha's floor, of 9, recorded by the measuring provers' driver line
-/// (`other` 0) or another prover's (1), with the harness's reason (`why` 1) or none.
+/// The ratchet: alpha's floor, of 9, under the measuring prover's driver line (`other` 0) or
+/// another prover's (1), with the harness's reason (`why` 1) or none.
 fn floors(n: i64, other: i64, why: i64) -> String {
     let prover = if other == 1 { OTHER } else { DRV };
     if why == 1 {
@@ -522,8 +515,8 @@ fn floors(n: i64, other: i64, why: i64) -> String {
 #[test]
 fn the_real_filing_and_reader_conform_to_the_facts_contract() {
     let mut h = Harness::new("walk");
-    // A run's facts pass floor 0 (0 of 9 proved); the floors rise and the SAME facts
-    // fail them, judged again with no run.
+    // A run's facts pass floor 0 (0 of 9 proved); the floors rise and the same facts fail
+    // them, judged again with no run.
     h.run();
     h.assemble();
     assert_eq!(h.answer(), (1, 1));
@@ -560,9 +553,8 @@ fn the_real_filing_and_reader_conform_to_the_facts_contract() {
         (1, 2),
         "re-labelled away from the measuring prover"
     );
-    // A run on a commit whose floor another prover recorded: HELD. 1 proved meets
-    // its 1; raised to 2, it does not — and a re-base onto the measuring prover goes
-    // down from the same facts only with a reason.
+    // Another prover's floor is held: 1 proved meets its 1, not its 2; a re-base onto the
+    // measuring prover goes down from the same facts only with a reason.
     h.run();
     h.assemble();
     assert_eq!(h.answer(), (1, 1), "another prover's 1, met");
@@ -591,9 +583,8 @@ fn the_real_filing_and_reader_conform_to_the_facts_contract() {
     assert_eq!(h.state["found"], 0);
 }
 
-/// THE CLOCK, walked on the real code: a run whose lapsed budgets cost alpha the
-/// proof its floor needs is refused, not excused; measured again on the same key —
-/// on a floors-only commit after it too — the one record passes.
+/// A run whose lapsed budgets cost alpha the proof its floor needs is refused, not excused;
+/// measured again on the same key (after floors-only commits too), the one record passes.
 #[test]
 fn the_real_remeasure_completes_the_record_of_its_key() {
     let mut h = Harness::new("clock");
@@ -611,18 +602,16 @@ fn the_real_remeasure_completes_the_record_of_its_key() {
     assert_eq!(h.state["m_src"], h.state["f_src"]);
 }
 
-/// NEGATIVE CONTROL: the pre-P0 reader. Its record — `trust-tree-<tree>` — was keyed on
-/// the whole tree, floors included, and carried the verdict the run's own floors gave
-/// it. Replayed on a floors-only commit it finds nothing (a four-hour run for a row's
-/// total, 0.100.0), and the model refuses that answer; the committed reader, on the
-/// same state, is admitted.
+/// Negative control: a receipt keyed on the whole tree, floors included, carrying the verdict
+/// of the run's own floors. On a floors-only commit it finds nothing; the model refuses that
+/// answer and admits the real reader's on the same state.
 #[test]
 fn the_pre_facts_receipt_reader_is_refused() {
     let mut h = Harness::new("receipt");
     h.run();
     let measured_tree = git(&h.work, &["rev-parse", "HEAD^{tree}"]);
     h.raise();
-    // The receipt reader: a record about THIS tree (floors and all), or nothing.
+    // The receipt reader: a record about this tree (floors and all), or nothing.
     let now_tree = git(&h.work, &["rev-parse", "HEAD^{tree}"]);
     assert_ne!(
         measured_tree, now_tree,
@@ -642,16 +631,14 @@ fn the_pre_facts_receipt_reader_is_refused() {
         "NEGATIVE CONTROL passed the model — the whole-tree receipt reader's answer was \
          admitted ({why}); the conformance would not catch the defect it replays"
     );
-    // (control) the committed reader on the same state.
+    // (control) the real reader on the same state.
     h.assemble();
     assert_eq!(h.state["found"], 1);
 }
 
-/// NEGATIVE CONTROL: P0's reader before its review. It judged a floors-only commit's
-/// reused facts against whatever floors that commit held, so a floor lowered by hand
-/// below the run's passed in seconds. The real judge of those facts against those
-/// floors alone says PASS — the up-only rule is what refuses it — and the model
-/// refuses that PASS; the committed reader, on the same state, refuses too.
+/// Negative control: reused facts judged against the commit's floors alone, so a floor
+/// lowered by hand below the run's passes. `judge` alone says PASS (the up-only rule is what
+/// refuses it); the model refuses that PASS, and the real reader refuses too.
 #[test]
 fn the_unchecked_reuse_reader_is_refused() {
     let mut h = Harness::new("unchecked");
@@ -680,12 +667,9 @@ fn the_unchecked_reuse_reader_is_refused() {
     assert_eq!(h.answer(), (1, 2));
 }
 
-/// NEGATIVE CONTROLS: the retired lane's two floor excuses and P0's unreasoned
-/// re-base. Another prover's floor of 2 over 1 proved (BELOW-FLOOR-NEW-PROVER passed
-/// it); 0 proved and 1 lapsed against a floor of 1 (BELOW-FLOOR-TIMED-OUT passed
-/// it); another prover's floor re-based lower with no reason (P0's reuse rule
-/// admitted it). The model refuses each PASS; the committed reader refuses each
-/// state.
+/// Negative controls: another prover's floor not held (2 over 1 proved), a shortfall the
+/// lapses cover passed (0 proved, 1 lapsed, floor 1), and another prover's floor re-based
+/// lower with no reason. The model refuses each PASS; the real reader refuses each state.
 #[test]
 fn the_retired_floor_excuses_are_refused() {
     let mut h = Harness::new("new-prover");
@@ -731,9 +715,8 @@ fn the_retired_floor_excuses_are_refused() {
     assert_eq!(h.answer(), (1, 2));
 }
 
-/// NEGATIVE CONTROL: a re-measure folded across keys. The real fold refuses facts
-/// measured on another tree; a fold that took them anyway would leave a record whose
-/// measurement is not of its key, and the model refuses that write.
+/// Negative control: a re-measure folded across keys. The real fold refuses it, and the model
+/// refuses the record such a fold would write.
 #[test]
 fn a_remeasure_across_keys_is_refused() {
     let mut h = Harness::new("across");
@@ -751,8 +734,7 @@ fn a_remeasure_across_keys_is_refused() {
         err.contains("facts of two keys are never one record"),
         "{err}"
     );
-    // The naive fold — the stored record, its alpha replaced by the new tree's — as
-    // the store would hold it.
+    // The naive fold: the stored record with the new tree's alpha.
     let naive = h.cleared(&[
         ("f_proved", h.src_of[&moved]),
         ("f_lapsed", 0),

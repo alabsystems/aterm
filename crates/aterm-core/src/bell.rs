@@ -1,17 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bell presentation state — the pure decision logic a host needs to turn
-//! BEL callbacks into user-visible output (visual flash, audible beep).
-//!
-//! Hosts own the I/O (painting an inverted frame, playing a sound, marking
-//! the window urgent); this module owns the *when*. Every method takes the
-//! current [`Instant`] as a parameter instead of reading the clock, so the
-//! full transition space is unit-testable without sleeping.
+//! Bell presentation state: when a host turns BEL into a visual flash or an audible beep.
+//! Hosts own the I/O; every method takes the current [`Instant`] instead of reading the clock.
 
-// aterm_time::Instant is std's on native and a JS-clock instant on wasm32
-// (where Instant::now() panics); every Instant in the engine's clock seam must
-// be this type.
+// The engine's clock seam uses aterm_time::Instant: std's on native, a JS-clock instant on
+// wasm32 (where std's Instant::now() panics).
 use aterm_time::Instant;
 use std::time::Duration;
 

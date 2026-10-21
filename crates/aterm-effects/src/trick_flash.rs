@@ -5,84 +5,51 @@
 //! of `good kitty`) turns rainbow for about a second, then its glyphs return to
 //! exactly the colour they had.
 //!
-//! Pet commands are ordinary verbs (`sit`, `play`, `roll`) that fill build logs
-//! and READMEs, so they are not a scanned lexicon class (which would cost an
-//! occurrence slot, persist episode and ink capture per ambient match) nor the
-//! rainbow colorway (which settles to a permanent tint). The typed-line listener
-//! ([`crate::typed_tricks`]) decides a word was a command, the host tells the
-//! word engine which word and how far behind the caret it sits, and this module
-//! finds that word on the glass, paints it, and lets go, with one slot.
+//! Pet commands are ordinary verbs that fill build logs and READMEs, so they are
+//! neither a scanned lexicon class nor the rainbow colorway (which settles to a
+//! permanent tint). The typed-line listener ([`crate::typed_tricks`]) decides a
+//! word was a command, the host says which word and how far behind the caret it
+//! sits, and this module finds it on the glass, paints it and lets go. One slot.
 //!
-//! # Rules
-//!
-//! * Typed, never seen: nothing here reads the screen for vocabulary. A slot
-//!   exists only because the input path noted one, so `echo sit`, a pasted `sit`
-//!   or a file full of `sit` never ink; with no slot both hooks are one
-//!   `Option` test.
+//! * Typed, never seen: a slot exists only because the input path noted one, so
+//!   `echo sit`, a pasted `sit` or a file full of `sit` never ink.
 //! * Never paint a place not found: the note carries a caret and a word, not a
-//!   cell. The word becomes paintable only when a rescan of the same pane finds
-//!   those exact characters, as a whole word, on the caret's row (moved by
-//!   exactly the scroll the snapshot reports), within reach of that caret. A
-//!   slot not found within `GIVE_UP_MS` is dropped.
+//!   cell. It becomes paintable only when a rescan of the same pane finds those
+//!   characters as a whole word within reach of that caret, on the caret's row
+//!   moved by exactly the scroll the snapshot reports. Unfound after
+//!   `GIVE_UP_MS`, it is dropped.
 //! * No residue: the colour is `mix(base, rainbow, env(t) · strength)` with
-//!   `env` zero at both ends, so the last frames converge on the base and after
-//!   the window the flash emits zero cells. Where the word already carries
-//!   occurrence ink (a custom spec, a feline self-glow) that ink is the base.
+//!   `env` zero at both ends, and after the window the flash emits zero cells.
+//!   Occurrence ink already on the word (a custom spec, a feline self-glow) is
+//!   the base.
 //!
-//! # Finding the word
+//! A cell holds only its base scalar (Thai `นั่ง` is the two cells `น ง`), the
+//! GUI lays an RTL run out in visual order, and an East-Asian-ambiguous letter is
+//! two cells under `ambiguous_width_double`. So the typed word is stored without
+//! zero-width scalars, an RTL word is also tried mirrored, and every column comes
+//! from the matched cells.
 //!
-//! A cell holds only its base scalar (zero-width marks ride the previous cell,
-//! so Thai `นั่ง` is the two cells `น ง`), the shipping GUI lays an RTL run out
-//! in visual order (Hebrew `שב` arrives reversed in place), and an
-//! East-Asian-ambiguous letter is two cells under `ambiguous_width_double`. So
-//! the typed word is stored without zero-width scalars, an RTL word is also
-//! tried mirrored, and every column comes from the matched cells.
-//!
-//! The row is the hard part. `sit⏎` on the bottom row scrolls before its echo is
+//! The row is the hard part: `sit⏎` on the bottom row scrolls before its echo is
 //! scanned, and the shell's `command not found: sit` then sits one row above the
-//! typed line; flashing that would paint program output. The snapshot carries
-//! `base_y` (the absolute row of the top visible line), so a host that declares
-//! it (`TrickFlash::declare_base_y`) gets
-//! `row = caret.row − (base_y_now − base_y_then)` and only that row is tested.
-//! A bounded, nearest-first upward search remains only for scrolls the snapshot
-//! cannot see (a scroll region: tmux, the alt screen), where the delta is zero
-//! and the caret's row came up empty. It takes exactly anchored candidates only,
-//! only on the reading that the word had already echoed in full when the key was
-//! committed (a caret one past its end), and only once the live cursor has left
-//! the place the key was committed at. A row empty because the echo is late
-//! must not start a search.
+//! typed line. A host that declares `base_y` (`TrickFlash::declare_base_y`) gets
+//! `row = caret.row − (base_y_now − base_y_then)`, and only that row is tested;
+//! a bounded upward search covers only scrolls the snapshot cannot see (a scroll
+//! region), under the conditions on `locate`.
 //!
-//! On the row the caret picks the copy ([`Anchor`]): one it anchors exactly,
-//! then one it stands inside (recorded mid-echo), then one it merely reaches,
+//! On that row the caret picks the copy ([`Anchor`]): one it anchors exactly,
+//! then one it stands inside (recorded mid-echo), then one it only reaches,
 //! taken only with the live cursor just past it. So `sit sit␣` typed in one
-//! burst flashes the copy that fired, and under a scroll nobody reported the
-//! shell's `bash: sit: command not found` on the caret's row does not flash.
-//! Output whose `sit` the prompt's width lines up exactly with the caret, under
-//! such a scroll, still can.
+//! burst flashes the copy that fired, and under an unreported scroll the shell's
+//! `bash: sit: command not found` on the caret's row does not flash unless the
+//! prompt's width lines its `sit` up with the caret.
 //!
-//! # Scope
-//!
-//! Window-scoped, not parked with the panes: a keyboard has one owner, so the
-//! slot names its pane in the value, and every hook compares that pane to the
-//! scan scope, keeping pane B from painting pane A's flash. The cardinality
-//! statement is on the owning field in `word_decorations.rs`.
-//!
-//! # Flash safety
-//!
-//! Structural: one hue revolution per flash, never faster than the crate's
-//! animation floor, with the declared luminance-reversal rate const-asserted
-//! under the WCAG 2.3.1 bound (measured by
-//! `the_flash_stays_under_the_photosensitivity_bound`). The start debounce is
-//! cosmetic.
-//!
-//! # Cost
-//!
-//! No slot: one `Option` test per rescan and tick, plus a probe of the short
-//! base-y memo on a cursor-bearing rescan of a declaring host. A slot: one row
-//! copy per rescan (at most `SEARCH_UP_ROWS` more on the scroll-region
-//! fallback) and at most 32 cells per frame for about a second. Fixed inline
-//! buffers; the note, the revoke and a flashing frame never allocate (pinned by
-//! `tests/trick_flash_alloc.rs`).
+//! The slot is window-scoped (a keyboard has one owner) and names its pane, which
+//! every hook compares to the scan scope. Flash safety is structural: one hue
+//! revolution per flash, with the luminance-reversal rate const-asserted under
+//! the WCAG 2.3.1 bound; the start debounce is cosmetic. With no slot the cost is
+//! one `Option` test per rescan and tick; a slot costs one row copy per rescan
+//! and at most 32 cells per frame. The note, the revoke and a flashing frame
+//! never allocate (`tests/trick_flash_alloc.rs`).
 
 use std::time::Duration;
 
@@ -93,7 +60,9 @@ use aterm_render::InkCell;
 use aterm_scene::{mix_rgb, smoothstep};
 use aterm_time::Instant;
 
-use crate::color_math::{hsv2rgb, relative_luminance};
+use crate::color_math::hsv2rgb;
+#[cfg(test)]
+use crate::color_math::relative_luminance;
 use crate::effect_util::TWINKLE_FLASH_BOUND_HZ;
 use crate::spec::{MIN_ANIMATION_MS, RAINBOW_SAT, RAINBOW_SPAN_DEG, RAINBOW_VAL};
 use crate::word_decorations::{
@@ -107,7 +76,7 @@ use crate::word_decorations::{
 pub(crate) const FLASH_MS: u32 = 1100;
 /// Smooth ramp-in, ms (the ink sweep's own ramp).
 const RAMP_MS: u32 = 130;
-/// Smoothstep fade over the LAST this-many ms, back to the base colour.
+/// Smoothstep fade over the last this-many ms, back to the base colour.
 const FADE_MS: u32 = 250;
 /// A revoked flash (the line turned out to be prose) leaves over this many ms
 /// instead of finishing its second.
@@ -121,7 +90,7 @@ const SEARCH_UP_ROWS: usize = 12;
 /// Peak tint toward the rainbow before the legibility guard. The flash owns this
 /// (it never reads the shared ink strength knob).
 const FLASH_STRENGTH: f32 = 0.9;
-/// The typed word's inline buffer IS the listener's token window: a word the
+/// The typed word's inline buffer is the listener's token window: a word the
 /// vocabulary could hold always fits, and a longer one is not a trick.
 const MAX_CHARS: usize = TrickLexicon::MAX_SURFACE_CHARS;
 /// Panes whose last cursor-bearing `base_y` is remembered. A window shows a
@@ -129,11 +98,10 @@ const MAX_CHARS: usize = TrickLexicon::MAX_SURFACE_CHARS;
 /// flash's scroll-following and nothing else.
 const BASE_Y_MEMO_CAP: usize = 16;
 
-/// Large luminance reversals one flash can show on one cell: at most four big
-/// moves (off the base on the ramp, across the revolution's two cliffs up to
-/// yellow and down to blue, back to the base on the fade), so at most three
-/// changes of direction. Measured off the real colour law, and tight, by the
-/// test named in the module docs.
+/// Large luminance reversals one flash can show on one cell: off the base on the
+/// ramp, across the revolution's two cliffs (up to yellow, down to blue), back to
+/// the base on the fade, so at most three changes of direction. Pinned by
+/// `the_flash_stays_under_the_photosensitivity_bound`.
 const FLASH_REVERSALS: f32 = 3.0;
 /// That count as a rate over the flash, Hz.
 const FLASH_REVERSAL_HZ: f32 = FLASH_REVERSALS * 1000.0 / FLASH_MS as f32;
@@ -178,12 +146,12 @@ struct Slot {
     at: Instant,
     /// The pane the key went to; `None` from a host that names none.
     pane: Option<u64>,
-    /// The PRE-ECHO caret of that pane, `(row, col)`.
+    /// The pre-echo caret of that pane, `(row, col)`.
     caret: (u16, u16),
     /// That pane's `base_y` at the scan which recorded the caret, when the
     /// host declares one.
     base_y: Option<i64>,
-    /// The typed word, zero-width scalars removed, in LOGICAL order.
+    /// The typed word, zero-width scalars removed, in logical order.
     chars: [char; MAX_CHARS],
     len: u8,
     /// Typed characters between the word and the caret (0 for a plain fire).
@@ -201,8 +169,8 @@ struct Slot {
 /// frame reads no grid at all.
 #[derive(Clone, Copy, Debug)]
 struct Located {
-    /// The envelope's zero: `max(rescan clock, key time)`. NOT the key time —
-    /// a late echo would otherwise skip the ramp and pop in at full rainbow.
+    /// The envelope's zero: `max(rescan clock, key time)`, so a late echo still
+    /// ramps in instead of popping in at full rainbow.
     since: Instant,
     row: u16,
     base_y: Option<i64>,
@@ -210,9 +178,10 @@ struct Located {
     grid_cols: u16,
     /// The match was the mirrored (visual-order) spelling.
     mirrored: bool,
-    /// LEAD cells only, ascending: a wide glyph's lead governs both halves.
+    /// Lead cells only, ascending: a wide glyph's lead governs both halves.
     cols: [u16; MAX_CHARS],
     fg: [[u8; 3]; MAX_CHARS],
+    bg: [u8; 3],
     /// Resolved for the word's background (light backgrounds take deep tones).
     sat: f32,
     val: f32,
@@ -235,10 +204,15 @@ pub(crate) struct TrickFlash {
     declared: Option<(Option<u64>, i64)>,
     /// Per-pane `base_y` as of that pane's last cursor-bearing rescan, the same
     /// moment its caret is recorded, so a note reads one observation.
-    base_y: Vec<(Option<u64>, i64)>,
+    base_y: [(Option<u64>, i64); BASE_Y_MEMO_CAP],
+    base_y_len: u8,
 }
 
 impl TrickFlash {
+    fn base_y_slice(&self) -> &[(Option<u64>, i64)] {
+        &self.base_y[..usize::from(self.base_y_len)]
+    }
+
     /// The host's declaration for the one rescan it is about to run in `scope`,
     /// which spends it. `None` withdraws it: every scroll delta then reads zero.
     pub(crate) fn declare_base_y(&mut self, scope: Option<u64>, base_y: Option<i64>) {
@@ -264,7 +238,21 @@ impl TrickFlash {
         )
     )]
     pub(crate) fn retain_panes(&mut self, keep: impl Fn(u64) -> bool) {
-        self.base_y.retain(|(pane, _)| pane.is_none_or(&keep));
+        let mut w = 0usize;
+        for r in 0..usize::from(self.base_y_len) {
+            let entry = self.base_y[r];
+            if entry.0.is_none_or(&keep) {
+                self.base_y[w] = entry;
+                w += 1;
+            }
+        }
+        self.base_y_len = w as u8;
+        if self
+            .declared
+            .is_some_and(|(pane, _)| pane.is_some_and(|pane| !keep(pane)))
+        {
+            self.declared = None;
+        }
         if self
             .slot
             .is_some_and(|slot| slot.pane.is_some_and(|pane| !keep(pane)))
@@ -273,11 +261,11 @@ impl TrickFlash {
         }
     }
 
-    /// The slot names the pane its key went to and was found there: that
-    /// pane's, not the window-wide grid's, so a bind from unbound carries it
-    /// across its reset. An unfound word's caret may be the window-wide grid's
-    /// (the unsplit host names its session too), whose geometry the bind just
-    /// changed, so it goes; a found one ends by itself if its columns moved.
+    /// Whether the slot names the pane its key went to and was found there. Such
+    /// a flash is that pane's, not the window-wide grid's, so a bind from unbound
+    /// keeps it across the reset. An unfound word's caret may be the window-wide
+    /// grid's (the unsplit host names its session too), whose geometry the bind
+    /// just changed, so it goes; a found one ends by itself if its columns move.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -347,8 +335,8 @@ impl TrickFlash {
         let mut len = 0usize;
         let mut rtl = false;
         for c in word.chars() {
-            // The grid keeps a zero-width scalar on the PREVIOUS cell, so it
-            // can never be found as a cell of its own.
+            // The grid keeps a zero-width scalar on the previous cell, so it can
+            // never be found as a cell of its own.
             if aterm_grapheme::char_width(c) == 0 {
                 continue;
             }
@@ -363,7 +351,7 @@ impl TrickFlash {
             return;
         }
         let base_y = self
-            .base_y
+            .base_y_slice()
             .iter()
             .find(|(key, _)| *key == pane.or(scope))
             .map(|(_, y)| *y);
@@ -461,7 +449,7 @@ impl TrickFlash {
         if cursor.is_some() {
             self.remember_base_y(scope, base_y_now);
         }
-        // THE ONE TEST an engine with no flash pays.
+        // The one test an engine with no flash pays.
         let Some(mut slot) = self.slot else {
             return;
         };
@@ -528,7 +516,7 @@ impl TrickFlash {
         ink: &mut Vec<InkCell>,
         fp: &mut u64,
     ) -> Option<Instant> {
-        // THE ONE TEST a frame with no flash pays.
+        // The one test a frame with no flash pays.
         let slot = self.slot?;
         if !pane_matches(slot.pane, scope) {
             return None;
@@ -550,16 +538,26 @@ impl TrickFlash {
         let tint = envelope(t, revoked_t) * loc.strength;
         let n = usize::from(slot.len);
         let hue0 = rainbow_base_hue(slot.hue_seed);
+        let steps = n.saturating_sub(1) as f32;
+        let span = RAINBOW_SPAN_DEG.min(100.0 * steps);
+        let denom = steps.max(1.0);
+        let time_deg = 360.0 * (t as f32 / FLASH_MS as f32);
+        let mut search_from = 0usize;
         for i in 0..n {
-            let target = hsv2rgb(flash_hue(hue0, i, n, t), loc.sat, loc.val);
+            let hue = (hue0 + (i as f32 / denom) * span + time_deg).rem_euclid(360.0);
+            let target = hsv2rgb(hue, loc.sat, loc.val);
             let col = loc.cols[i];
-            let at = ink.binary_search_by_key(&(loc.row, col), |c| (c.row, c.col));
+            let at = ink[search_from..].binary_search_by_key(&(loc.row, col), |c| (c.row, c.col));
             let cell = match at {
-                Ok(j) => {
+                Ok(rel) => {
+                    let j = search_from + rel;
+                    search_from = j + 1;
                     ink[j].color = u32_to_rgb3(mix_rgb(rgb3_to_u32(ink[j].color), target, tint));
                     ink[j]
                 }
-                Err(j) => {
+                Err(rel) => {
+                    let j = search_from + rel;
+                    search_from = j + 1;
                     let cell = InkCell {
                         row: loc.row,
                         col,
@@ -578,19 +576,24 @@ impl TrickFlash {
     }
 
     fn remember_base_y(&mut self, scope: Option<u64>, base_y: Option<i64>) {
-        let at = self.base_y.iter().position(|(key, _)| *key == scope);
+        let len = usize::from(self.base_y_len);
+        let at = self.base_y[..len].iter().position(|(key, _)| *key == scope);
         match (at, base_y) {
             (Some(i), Some(y)) => self.base_y[i].1 = y,
             // The host stopped declaring: a stale row origin would be worse
             // than none.
             (Some(i), None) => {
-                self.base_y.remove(i);
+                self.base_y.copy_within(i + 1..len, i);
+                self.base_y_len -= 1;
             }
             (None, Some(y)) => {
-                if self.base_y.len() >= BASE_Y_MEMO_CAP {
-                    self.base_y.remove(0);
+                if len >= BASE_Y_MEMO_CAP {
+                    self.base_y.copy_within(1..BASE_Y_MEMO_CAP, 0);
+                    self.base_y[BASE_Y_MEMO_CAP - 1] = (scope, y);
+                } else {
+                    self.base_y[len] = (scope, y);
+                    self.base_y_len += 1;
                 }
-                self.base_y.push((scope, y));
             }
             (None, None) => {}
         }
@@ -648,6 +651,7 @@ fn envelope(t: u64, revoked_t: Option<u64>) -> f32 {
 /// Lead cell `i` of `n`'s hue at `t` ms, in degrees: the opening hue, the word's
 /// spatial spread (the colorway's span clamp: a two-step on a 2-cell word, a
 /// pure temporal sweep on one cell), plus one revolution over the flash.
+#[cfg(test)]
 fn flash_hue(hue0: f32, i: usize, n: usize, t: u64) -> f32 {
     let steps = n.saturating_sub(1) as f32;
     let span = RAINBOW_SPAN_DEG.min(100.0 * steps);
@@ -658,7 +662,8 @@ fn flash_hue(hue0: f32, i: usize, n: usize, t: u64) -> f32 {
 /// The rainbow colorway's theme rule: a light background takes deep candy
 /// tones that can clear the contrast bound on white.
 fn resolve_sat_val(bg: u32) -> (f32, f32) {
-    if relative_luminance(bg) > 0.5 {
+    let table = crate::color_math::relative_luminance_table();
+    if crate::color_math::relative_luminance_with(table, bg) > 0.5 {
         (1.0, 0.62)
     } else {
         (RAINBOW_SAT, RAINBOW_VAL)
@@ -685,16 +690,29 @@ fn resolve_sat_val(bg: u32) -> (f32, f32) {
 /// rather than arming frames that show nothing (so concealed text is never
 /// revealed).
 fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
-    let lum_bg = relative_luminance(bg);
+    let table = crate::color_math::relative_luminance_table();
+    let lum_bg = crate::color_math::relative_luminance_with(table, bg);
     let contrast = |lum: f32| (lum.max(lum_bg) + 0.05) / (lum.min(lum_bg) + 0.05);
     let floor = MIN_INK_CONTRAST;
-    let text_is_lighter = relative_luminance(fg) >= lum_bg;
-    let corners = [0.0f32, 60.0, 120.0, 180.0, 240.0, 300.0].map(|hue| hsv2rgb(hue, sat, val));
+    let text_is_lighter = crate::color_math::relative_luminance_with(table, fg) >= lum_bg;
+    let c = val * sat;
+    let m = val - c;
+    let hi = ((c + m).clamp(0.0, 1.0) * 255.0).round() as u32;
+    let lo = (m.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let corners = [
+        (hi << 16) | (lo << 8) | lo,
+        (hi << 16) | (hi << 8) | lo,
+        (lo << 16) | (hi << 8) | lo,
+        (lo << 16) | (hi << 8) | hi,
+        (lo << 16) | (lo << 8) | hi,
+        (hi << 16) | (lo << 8) | hi,
+    ];
     let step = FLASH_STRENGTH / 8.0;
     let mut strength = FLASH_STRENGTH;
     'guard: while strength > 0.0 {
         for corner in corners {
-            let lum = relative_luminance(mix_rgb(fg, corner, strength));
+            let lum =
+                crate::color_math::relative_luminance_with(table, mix_rgb(fg, corner, strength));
             if contrast(lum) < floor || (lum >= lum_bg) != text_is_lighter {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
@@ -740,7 +758,7 @@ enum Anchor {
 /// One whole-word match on a row.
 #[derive(Clone, Copy)]
 struct Hit {
-    /// LEAD columns of the matched scalars, ascending.
+    /// Lead columns of the matched scalars, ascending.
     cols: [u16; MAX_CHARS],
     anchor: Anchor,
 }
@@ -750,10 +768,10 @@ struct Hit {
 /// last thing on its line). Continuation halves of wide glyphs carry no scalar
 /// and are skipped; columns come from the cells.
 ///
-/// Reach is the typed-edit witness's span reach (the caret may be at the word's
-/// start, inside it, or past it) widened by `2·back_chars + 2` columns, since a
-/// held address word sits a few typed characters away, each at most two cells.
-/// Symmetric: a word inside one IME commit lies right of the recorded caret.
+/// Reach is the typed-edit witness's span reach widened by `2·back_chars + 2`
+/// columns, since a held address word sits a few typed characters away, each at
+/// most two cells. Symmetric: a word inside one IME commit lies right of the
+/// recorded caret.
 ///
 /// Exact means the distance is what `back_chars` narrow or wide characters make
 /// it: `caret == end + 1 + w·back` (typed, word on the left) or
@@ -761,21 +779,17 @@ struct Hit {
 /// Inside means the caret stands in the span the typed characters cover (the
 /// word widened by `2·back` columns each side): `sit sit␣` in one burst with
 /// the caret noted at `$ s` is the first copy, not the rightmost. Slack is the
-/// rest of the reach, a burst that outran its echo; its echo leaves the live
+/// rest of the reach, a burst that outran its echo; that echo leaves the live
 /// cursor on this row past the word by at most the typed tail (`back` and the
 /// boundary key, two cells each), so Slack needs `cursor_col` there. Output
-/// meets the reach and nothing else.
+/// usually meets the reach alone.
 ///
 /// `exact_only` (the upward search) takes the left reading alone: it follows a
-/// line that moved, so it may only look for a word already seen in full (a caret
-/// one past its end proves that). The right reading means none of the word had
-/// echoed, so an empty row means "not yet", and searching would find only
-/// history (last time's `$ sit` starts at the same prompt column). A line only
-/// scrolls because Enter was typed and a commit never carries an Enter, so no
-/// IME input is lost; a burst inside a scroll region is. Each extra reading is
-/// also another column where the shell's `command not found: good` could line
-/// up by coincidence (`$ good kitty⏎` at a two-column prompt puts it at exactly
-/// `caret + 2·6`).
+/// line that moved, so it may only find a word already echoed in full (a caret
+/// one past its end proves that). Under the right reading none of the word has
+/// echoed, so an empty row means "not yet" and a search would find only history
+/// (last time's `$ sit` starts at the same prompt column). IME commits never
+/// carry an Enter, so they never need the search.
 fn find_in_row(
     cells: &[RenderCell],
     seq: &[char],
@@ -787,12 +801,14 @@ fn find_in_row(
     let (first, caret, back) = (*seq.first()?, i64::from(caret_col), i64::from(back_chars));
     let reach = i64::from(TYPED_EDIT_REACH_COLS) + 2 * back + 2;
     let cursor = cursor_col.map(i64::from);
+    let max_start =
+        usize::try_from(caret + reach).map_or(0, |m| m.saturating_add(1).min(cells.len()));
     let mut best: Option<Hit> = None;
-    for start in 0..cells.len() {
+    for start in 0..max_start {
         if cells[start].wide || cells[start].ch != first {
             continue;
         }
-        // Left bound: the previous LEAD cell (step over a continuation half).
+        // Left bound: the previous lead cell (step over a continuation half).
         let before = cells[..start].iter().rev().find(|cell| !cell.wide);
         if before.is_some_and(|cell| is_word_char(cell.ch)) {
             continue;
@@ -900,18 +916,17 @@ fn scrolled(row: u16, then: Option<i64>, now: Option<i64>) -> (i64, i64) {
 }
 
 /// Find a pending slot's word. Only the expected row is tested; the bounded
-/// nearest-first upward search runs only when the snapshot reported no scroll,
-/// the expected row came up empty, and the live `cursor` says the line was left
-/// behind (a scroll region moved it), and it takes exact anchors only.
+/// nearest-first upward search (exact anchors only) runs only when the snapshot
+/// reported no scroll, the expected row came up empty, and the live `cursor`
+/// says the line was left behind (a scroll region moved it).
 ///
-/// An empty expected row also happens while the echo is late (`$ si` of `sit`),
-/// and a search then can only find something else (last time's command line, a
-/// printed `sit`). An echo only carries the cursor rightward along the caret's
-/// row, so a cursor still there at or past the recorded caret means the line is
-/// still being typed; off that row, or left of the caret (a fresh prompt), it
-/// was left behind. A new prompt that grew past the old caret reads as still
-/// typing and costs that one flash. The same cursor, on the expected row, is
-/// the evidence an [`Anchor::Slack`] copy needs.
+/// An empty expected row also happens while the echo is late, when a search
+/// could only find something else. An echo only carries the cursor rightward
+/// along the caret's row, so a cursor still there at or past the recorded caret
+/// means the line is still being typed; off that row, or left of the caret (a
+/// fresh prompt), it was left behind. A new prompt that grew past the old caret
+/// reads as still typing and costs that one flash. The same cursor on the
+/// expected row is the evidence an [`Anchor::Slack`] copy needs.
 #[allow(
     clippy::too_many_arguments,
     reason = "on_rescan's list minus the gate it already applied; the slot, the clock, both carets, the geometry and the row source are each read once"
@@ -953,6 +968,7 @@ fn locate(
         mirrored,
         cols: hit.cols,
         fg: [[0; 3]; MAX_CHARS],
+        bg: [0; 3],
         sat: 0.0,
         val: 0.0,
         strength: 0.0,
@@ -993,8 +1009,8 @@ fn follow(
     }
     loc.row = u16::try_from(row).ok()?;
     loc.base_y = base_y_now;
-    // The shell may have recoloured the word since (a syntax highlighter
-    // painting an unknown command red): the fade must land on TODAY's colour.
+    // The shell may have recoloured the word (a syntax highlighter painting an
+    // unknown command red): recapture so the fade lands on the current colour.
     capture(&mut loc, n, row_buf).then_some(loc)
 }
 
@@ -1003,14 +1019,19 @@ fn follow(
 /// against. `false` when no tint would be legible (see [`legible_strength`]),
 /// so there is no flash.
 fn capture(loc: &mut Located, n: usize, cells: &[RenderCell]) -> bool {
+    let Some(first) = cells.get(usize::from(loc.cols[0])) else {
+        return false;
+    };
+    let same_lead = loc.strength > 0.0 && first.fg == loc.fg[0] && first.bg == loc.bg;
     for i in 0..n {
         if let Some(cell) = cells.get(usize::from(loc.cols[i])) {
             loc.fg[i] = cell.fg;
         }
     }
-    let Some(first) = cells.get(usize::from(loc.cols[0])) else {
-        return false;
-    };
+    if same_lead {
+        return true;
+    }
+    loc.bg = first.bg;
     let bg = rgb3_to_u32(first.bg);
     (loc.sat, loc.val) = resolve_sat_val(bg);
     loc.strength = legible_strength(rgb3_to_u32(first.fg), bg, loc.sat, loc.val);
@@ -1253,7 +1274,7 @@ mod tests {
         }
     }
 
-    /// The two rescan twins are ONE routine outside row sourcing: the same
+    /// The two rescan twins are one routine outside row sourcing: the same
     /// scenario paints the same bytes and folds the same fingerprints.
     #[test]
     fn the_cold_path_and_the_snapshot_path_paint_the_same_bytes() {
@@ -1455,11 +1476,9 @@ mod tests {
                 .collect();
             assert_eq!(flashed, [(2, 2), (2, 3), (2, 4), (2, 5)], "{path:?}");
 
-            // Left behind is a fact about the live cursor, and a cursor on
-            // another row counts as much as one left of the caret: typed one row
-            // above the region's floor, the failing command leaves a grown prompt
-            // (`[127] $ `) on the floor itself, right of the old caret's column
-            // but off its row.
+            // A cursor on another row is left behind as much as one left of the
+            // caret: the failing command leaves a grown prompt (`[127] $ `) on
+            // the region's floor, right of the old caret's column but off its row.
             let mut g = Glass::new(path, 6, 40);
             g.echo("\x1b[2;5r\x1b[4;1H$ sit", t0);
             assert_eq!(g.caret(), (3, 5));
@@ -1556,11 +1575,9 @@ mod tests {
                     "{path:?}, wired = {wired}: the word itself, once it lands"
                 );
 
-                // One letter further on, the left reading lines up by coincidence:
-                // with `s` echoed the recorded caret is column 3, and the `sit`
-                // that `echo sit` printed ends at column 2. The live cursor has only
-                // moved right of the commit point, so the line is still being
-                // echoed.
+                // One letter further on, the left reading lines up by coincidence
+                // (caret column 3, `echo sit`'s output ends at column 2), but the
+                // live cursor has only moved right: the line is still echoing.
                 let mut g = Glass::new(path, 8, 40);
                 g.wired = wired;
                 g.echo("$ echo sit\r\nsit\r\n$ s", t0);
@@ -1685,10 +1702,10 @@ mod tests {
         }
     }
 
-    /// Under a scroll nobody reported, bash's `bash: sit: command not found`
-    /// lands on the caret's row with its `sit` within reach of a two-column
-    /// prompt's caret, and the cursor at the end of that line. It never flashes;
-    /// the typed line is found upward once the next prompt leaves it behind.
+    /// Under an unreported scroll, bash's `bash: sit: command not found` lands
+    /// on the caret's row with its `sit` within reach of a two-column prompt's
+    /// caret, and the cursor at the end of that line. It never flashes; the
+    /// typed line is found upward once the next prompt leaves it behind.
     #[test]
     fn output_the_caret_only_reaches_never_flashes_under_an_unreported_scroll() {
         for path in BOTH {
@@ -1766,7 +1783,7 @@ mod tests {
         wd.bind_pane(2, (400, 0));
         wd.rescan(&b, 4, 40, &lex, &cfg, 1, t0);
         // The key goes to pane 1 while pane 2 is the one left bound: the caret
-        // must come from pane 1's PARKED slot.
+        // must come from pane 1's parked slot.
         wd.note_trick_typed(t0, Some(1), "sit", 0);
         a.process(b" ");
         b.process(b" ");
@@ -1793,7 +1810,7 @@ mod tests {
         );
         wd.bind_pane(1, (0, 0));
         assert_eq!(tick(&mut wd, t0 + ms(316)).0.len(), 3);
-        // The wake rides pane A's OWN parked deadline and dies with it.
+        // The wake rides pane A's own parked deadline and dies with it.
         wd.bind_pane(2, (400, 0));
         assert!(wd.is_active(t0 + ms(316)));
         assert!(!wd.is_active(t0 + ms(u64::from(FLASH_MS))));
@@ -1819,7 +1836,7 @@ mod tests {
             assert_eq!(wd.trick_flash_phase(t0), TrickFlashPhase::Live);
             wd.retain_panes(|pane| pane != closed);
             assert_eq!(wd.trick_flash_phase(t0), left, "pane {closed} closed");
-            // Closing the BOUND pane 2 left the engine unbound, so the split
+            // Closing the bound pane 2 left the engine unbound, so the split
             // host's next bind is a pane-space reset; pane 1's flash survives it.
             wd.bind_pane(1, (0, 0));
             assert_eq!(wd.trick_flash_phase(t0), left, "pane {closed}: re-bound");
@@ -1838,7 +1855,7 @@ mod tests {
 
     /// A flash that names no pane is the window-wide grid's own, and the bind
     /// that makes the window a split retires it with that grid. So does a word
-    /// the unsplit host noted for its session and nobody found yet: its caret
+    /// the unsplit host noted for its session and nobody has found yet: its caret
     /// was recorded in the geometry the split just changed.
     #[test]
     fn a_flash_that_names_no_pane_dies_with_the_window_wide_grid() {
@@ -1949,8 +1966,8 @@ mod tests {
         }
     }
 
-    /// The envelope runs from the RESCAN that found the word, not from the
-    /// key: a late echo still ramps in from the base instead of popping.
+    /// The envelope runs from the rescan that found the word, not from the key:
+    /// a late echo still ramps in from the base instead of popping.
     #[test]
     fn a_late_echo_still_ramps_in_from_the_base() {
         let t0 = Instant::now();
@@ -1965,7 +1982,7 @@ mod tests {
         let end = echoed + ms(u64::from(FLASH_MS));
         assert!(!g.frame(end - ms(1)).0.is_empty());
         assert!(g.frame(end).0.is_empty());
-        // A REWOUND rescan clock (the capture path) never predates the key.
+        // A rewound rescan clock (the capture path) never predates the key.
         let mut g = Glass::new(Path::Cold, 4, 40);
         g.echo("$ sit", t0);
         g.wd.note_trick_typed(t0 + ms(50), None, "sit", 0);
@@ -2018,7 +2035,7 @@ mod tests {
         );
         assert_eq!(g.wd.trick_flash_phase(gone), TrickFlashPhase::Idle);
 
-        // Revoked BEFORE the echo: never painted at all.
+        // Revoked before the echo: never painted at all.
         let mut g = Glass::new(Path::Cold, 4, 40);
         g.echo("$ sit", t0);
         g.wd.note_trick_typed(t0, None, "sit", 0);
@@ -2049,7 +2066,7 @@ mod tests {
                 assert!(ink.is_empty() && fp == 0, "{path:?}");
                 assert!(!g.wd.is_active(t0), "{path:?}: never armed");
 
-                // The gate closing MID-FLASH (a reload, a window losing focus).
+                // The gate closing mid-flash (a reload, a window losing focus).
                 let mut g = Glass::new(path, 4, 40);
                 g.echo("$ sit", t0);
                 g.fire("sit", 0, " ", t0);
@@ -2063,7 +2080,7 @@ mod tests {
         }
     }
 
-    /// The grid holds BASE scalars only: Thai `นั่ง` and Hindi `बैठ` are typed
+    /// The grid holds base scalars only: Thai `นั่ง` and Hindi `बैठ` are typed
     /// with combining marks the cells never show as cells of their own.
     #[test]
     fn thai_and_hindi_words_are_found_under_their_combining_marks() {
@@ -2227,7 +2244,7 @@ mod tests {
         }
     }
 
-    /// Flash cells are INSERTED in `(row, col)` order between other rows' ink.
+    /// Flash cells are inserted in `(row, col)` order between other rows' ink.
     #[test]
     fn the_flash_inserts_between_other_rows_ink_in_order() {
         let t0 = Instant::now();
@@ -2390,16 +2407,25 @@ mod tests {
         for pane in 0..40u64 {
             scan(&mut flash, pane, Some(pane as i64), Some((0, 0)));
         }
-        assert_eq!(flash.base_y.len(), BASE_Y_MEMO_CAP);
-        assert_eq!(flash.base_y[0], (Some(24), 24), "oldest-first eviction");
+        assert_eq!(flash.base_y_slice().len(), BASE_Y_MEMO_CAP);
+        assert_eq!(
+            flash.base_y_slice()[0],
+            (Some(24), 24),
+            "oldest-first eviction"
+        );
         // A cursor-less rescan is not an observation of the caret's row origin.
         scan(&mut flash, 39, Some(1000), None);
-        assert!(flash.base_y.contains(&(Some(39), 39)));
+        assert!(flash.base_y_slice().contains(&(Some(39), 39)));
         // Re-declaring updates in place; withdrawing removes.
         scan(&mut flash, 39, Some(41), Some((0, 0)));
-        assert!(flash.base_y.contains(&(Some(39), 41)));
+        assert!(flash.base_y_slice().contains(&(Some(39), 41)));
         scan(&mut flash, 39, None, Some((0, 0)));
-        assert!(flash.base_y.iter().all(|(pane, _)| *pane != Some(39)));
+        assert!(
+            flash
+                .base_y_slice()
+                .iter()
+                .all(|(pane, _)| *pane != Some(39))
+        );
         // One pane's declaration never stands in for another pane's rescan.
         flash.declare_base_y(Some(30), Some(7));
         flash.on_rescan(
@@ -2414,18 +2440,23 @@ mod tests {
                 row.clear();
             },
         );
-        assert!(flash.base_y.iter().all(|(pane, _)| *pane != Some(31)));
+        assert!(
+            flash
+                .base_y_slice()
+                .iter()
+                .all(|(pane, _)| *pane != Some(31))
+        );
 
         flash.note(t0, Some(38), Some(38), Some((0, 0)), "sit", 0);
         assert_eq!(flash.slot.map(|slot| slot.base_y), Some(Some(38)));
         flash.retain_panes(|pane| pane < 30);
         assert!(
             flash
-                .base_y
+                .base_y_slice()
                 .iter()
                 .all(|(pane, _)| pane.is_some_and(|p| p < 30))
         );
-        assert!(!flash.base_y.is_empty());
+        assert!(!flash.base_y_slice().is_empty());
         assert!(
             flash.slot.is_none(),
             "pane 38 is gone, and its flash with it"
@@ -2446,7 +2477,7 @@ mod tests {
             (0x00FF_FFFF, 0x001E_1E2E), // white on a dark blue
             (0x001E_1E1E, 0x00FA_FAFA), // dark on near-white
             (0x0000_0000, 0x00FF_FFFF), // black on white
-            (0x0060_6060, 0x0000_0000), // dim comment grey: BELOW the bound
+            (0x0060_6060, 0x0000_0000), // dim comment grey: below the bound
             (0x00FF_5555, 0x0028_2A36), // an "unknown command" red
             (0x0080_8080, 0x0080_8080), // concealed: fg == bg
         ];
@@ -2483,8 +2514,8 @@ mod tests {
                 "{fg:06x} on {bg:06x}: below the bound already, so never tinted"
             );
         }
-        // …and on the glass that is NO FLASH, not an armed second of nothing —
-        // so a flash can never reveal concealed text either.
+        // …and on the glass that is no flash, so concealed text is never
+        // revealed.
         for sgr in ["\x1b[38;2;96;96;96m\x1b[48;2;0;0;0m", "\x1b[8m"] {
             for path in BOTH {
                 let t0 = Instant::now();
@@ -2537,8 +2568,8 @@ mod tests {
         let mut worst = 0u32;
         for (fg, bg) in themes {
             let (sat, val) = resolve_sat_val(bg);
-            // The guarded strength the emitter would use, AND the unguarded
-            // peak — the bound must not depend on the guard having bound.
+            // The guarded strength the emitter would use and the unguarded peak:
+            // the bound must not depend on the guard having bound.
             for strength in [legible_strength(fg, bg, sat, val), FLASH_STRENGTH, 1.0] {
                 for hue0 in (0..360).step_by(5) {
                     for (i, n) in [(0usize, 1usize), (0, 4), (3, 4), (7, 8)] {

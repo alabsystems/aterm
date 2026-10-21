@@ -177,8 +177,9 @@ fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
 /// `amacs --help` (the argv0 alias, a link onto the binary as every install lays it) print the
 /// editor's help and exit 0. The alias runs `Verb::Edit`, not the front door: inside a session
 /// with no terminal on stdin it says so and exits 2 (an agent's tool call never hangs), and
-/// outside any aterm window it says the terminal editor is not built yet and exits 1. None of
-/// these dials a socket: the face is decided before any handoff.
+/// outside any aterm window it edits in the terminal (`/dev/tty`), so with no controlling
+/// terminal at all (a new session, `setsid`) it says there is none to edit in and exits 2.
+/// None of these dials a socket: the face is decided before any handoff.
 #[test]
 fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
     let root = private_root();
@@ -198,6 +199,18 @@ fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
             .env_remove("STY");
         if let Some(sid) = session {
             cmd.env("ATERM_PARENT_SESSION_ID", sid);
+        }
+        // A session of its own, with no controlling terminal: the terminal face's
+        // `/dev/tty` is never the one this test runner was started from.
+        // SAFETY: the hook runs in the forked child before `exec` and calls only
+        // `setsid`, which is async-signal-safe.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
         let out = cmd
             .stdin(Stdio::null())
@@ -229,9 +242,9 @@ fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
             "{program:?} {args:?}: {text}"
         );
         let (code, text) = run(program, args, None);
-        assert_eq!(code, Some(1), "{program:?} {args:?}: {text}");
+        assert_eq!(code, Some(2), "{program:?} {args:?}: {text}");
         assert!(
-            text.contains("amacs: the terminal editor is not built yet"),
+            text.starts_with("amacs: no terminal to edit in (/dev/tty: "),
             "{program:?} {args:?}: {text}"
         );
     }

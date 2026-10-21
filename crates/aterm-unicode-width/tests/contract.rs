@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Upstream's per-character contract, and answers recorded from
-//! unicode-width 0.2.2 before the switch where its tables and aterm's agree.
+//! Per-character width contract and reference answers from `unicode-width` 0.2.2.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -24,7 +23,7 @@ fn every_other_scalar_value_is_zero_one_or_two_columns() {
     }
 }
 
-/// `(char, width)` as unicode-width 0.2.2 answered them, recorded 2026-10-15.
+/// `(char, width)` reference pairs from `unicode-width` 0.2.2.
 const RECORDED: &[(char, usize)] = &[
     ('\u{A0}', 1),
     ('\u{B1}', 1),

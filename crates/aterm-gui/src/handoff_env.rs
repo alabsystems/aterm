@@ -1,59 +1,39 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE HANDOFF ENVIRONMENT SNAPSHOT (docs/DESIGN-warm-successor-2026-09-29.md
-//! §1, phase P1).
+//! The handoff environment snapshot (docs/DESIGN-warm-successor-2026-09-29.md §1).
 //!
-//! An update handoff hands its successor authority through the process
-//! environment: the manifest, nonce, layout and descriptor list
-//! (`ATERM_SEAMLESS_*`), the readiness and Commit pipes, the parent's identity
-//! and exit capabilities, the rendezvous and its claim, the proof term, the
-//! grant capabilities and the control-socket witness (`ATERM_HANDOFF_*`). Until
-//! this module every one of them was read — and the launched lane's claimed
-//! descriptors were even WRITTEN, by `ClaimedHandoff::publish` — through
-//! `std::env` at the point of use, so the whole intake had to sit on the
-//! single-threaded prologue of `main_entry`: `set_var`/`remove_var` are unsound
-//! beside any other thread.
+//! An update handoff hands its successor authority through the process environment: the
+//! manifest, nonce, layout and descriptor list (`ATERM_SEAMLESS_*`), the readiness and Commit
+//! pipes, the parent's identity and exit capabilities, the rendezvous and its claim, the proof
+//! term, the grant capabilities and the control-socket witness (`ATERM_HANDOFF_*`).
+//! `set_var`/`remove_var` are unsound beside any other thread, so [`HandoffEnv::capture`]
+//! reads and clears every one of those names once, as the first thing `main_entry` does,
+//! before any thread exists. Everything after works on the in-memory snapshot:
 //!
-//! [`HandoffEnv::capture`] reads AND CLEARS every one of those names ONCE, as
-//! the first thing `main_entry` does, before any thread exists. Everything
-//! after works on the in-memory snapshot:
+//! * `seamless::prearm_incoming_fds_from` attests the parent, re-arms the descriptors from it,
+//!   and removes from it what it consumes;
+//! * the boot apply's re-exec carries the remaining pairs onto the new image
+//!   ([`HandoffEnv::exec_env`]);
+//! * the launched lane's claim takes the rendezvous, claim and capabilities from it, and the
+//!   granted descriptors land in it (`handoff_rendezvous::ClaimedIntake::install`);
+//! * the `_from` intakes (`take_incoming_from`, `take_ready_fd_from`, `take_commit_fd_from`,
+//!   `take_target_identity_from`, `control_socket_identity::consume_incoming_from`) run the
+//!   same authentication over the same strings.
 //!
-//! * `seamless::prearm_incoming_fds_from` attests the parent and re-arms the
-//!   descriptors from it, and removes from IT what it used to remove from the
-//!   process;
-//! * the boot apply's re-exec carries the snapshot's remaining pairs onto the
-//!   new image ([`HandoffEnv::exec_env`]), exactly the pairs the ambient
-//!   environment used to carry across that `execve`;
-//! * the launched lane's claim takes the rendezvous, claim and capabilities
-//!   from it, and the granted descriptors land in it
-//!   (`handoff_rendezvous::ClaimedIntake::install`) instead of in `environ`;
-//! * the `_from` intakes (`take_incoming_from`, `take_ready_fd_from`,
-//!   `take_commit_fd_from`, `take_target_identity_from`,
-//!   `control_socket_identity::consume_incoming_from`) run the SAME
-//!   authentication over the same strings.
-//!
-//! Same authentication, a different transport: no timing or behaviour change is
-//! intended, and after it where the claim sits no longer matters to env
-//! soundness (the precondition of P2, which moves work ahead of the dial).
-//!
-//! [`HandoffName`] fences it: a handoff name has no `AsRef<OsStr>` in shipped
-//! code, so nothing outside this file can read or mutate one through the
-//! process environment. (A parent naming one on a CHILD's environment is not
-//! the process environment: [`HandoffName::pair`].) The model is
-//! `NativeUpdateSuccessorWarmBeforeClaim` (aterm-spec); its Tier-1 bind is
-//! `conformance` below.
+//! So where the claim sits in `main_entry` does not matter to env soundness. [`HandoffName`]
+//! fences the snapshot: shipped code cannot read or mutate a handoff name through the process
+//! environment. The model is `NativeUpdateSuccessorWarmBeforeClaim` (aterm-spec); its Tier-1
+//! bind is `seamless::handoff_env_conformance`.
 
 use std::ffi::{OsStr, OsString};
 
 /// The name of one piece of handoff authority in the process environment.
 ///
-/// It has no `AsRef<OsStr>` outside test builds, so shipped code cannot hand
-/// one to `std::env` or `aterm_log::env`: [`HandoffEnv::capture`] is the one
-/// read of the process environment for a handoff name, and every later reader
-/// works on that snapshot (a `set_var` beside another thread is a data race).
-/// A parent names one on a CHILD's environment, which is not this process's,
-/// with [`Self::pair`], which hands out the name only bound to its value.
+/// It has no `AsRef<OsStr>` outside test builds, so shipped code cannot hand one to `std::env`
+/// or `aterm_log::env`: [`HandoffEnv::capture`] is the one read of the process environment for
+/// a handoff name. A parent names one on a child's environment with [`Self::pair`], which hands
+/// out the name only bound to its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct HandoffName(&'static str);
 
@@ -109,13 +89,12 @@ impl From<HandoffName> for OsString {
     }
 }
 
-/// Every process-environment name a successor reads as handoff authority on
-/// THIS platform, and so every name [`HandoffEnv::capture`] takes out of the
-/// process: the readers' own constants. Per platform exactly as the readers
-/// are: the rendezvous, the parent identity and the parent's exit capabilities
-/// are unix-only, the proof term and the grant capabilities ride only beside a
-/// rendezvous (macOS). A reader asking for a name not listed here trips the
-/// accessors' debug assertion.
+/// Every process-environment name a successor reads as handoff authority on this platform,
+/// and so every name [`HandoffEnv::capture`] takes out of the process: the readers' own
+/// constants, per platform as the readers are (the rendezvous, parent identity and exit
+/// capabilities are unix-only; the proof term and grant capabilities ride only beside a
+/// rendezvous, on macOS). A reader asking for a name not listed trips the accessors' debug
+/// assertion.
 pub(crate) const HANDOFF_ENV_KEYS: &[HandoffName] = &[
     crate::seamless::ENV_MANIFEST,
     crate::seamless::ENV_FDS,
@@ -141,8 +120,8 @@ pub(crate) const HANDOFF_ENV_KEYS: &[HandoffName] = &[
     crate::handoff_rendezvous::ENV_GRANT_CAPS,
     #[cfg(target_os = "macos")]
     crate::handoff_rendezvous::ENV_PROOF_TERM,
-    // The advisory warm hint (P2): captured like the rest so no helper or
-    // shell ever sees it, and read only as a guess (`handoff_warm_hint`).
+    // The advisory warm hint: captured like the rest so no helper or shell sees it, and read
+    // only as a guess (`handoff_warm_hint`).
     #[cfg(target_os = "macos")]
     crate::handoff_warm_hint::ENV_WARM_HINT,
     #[cfg(unix)]
@@ -155,11 +134,10 @@ pub(crate) const HANDOFF_ENV_KEYS: &[HandoffName] = &[
 
 /// The handoff authority this process was launched with, held in memory.
 ///
-/// Every accessor has the semantics of the `std::env` call it replaces:
-/// [`Self::os`] is `var_os`, [`Self::string`] is `var(..).ok()` (UTF-8 only),
-/// [`Self::take`] is `aterm_log::env::take`, [`Self::remove`] is
-/// `aterm_log::env::unset`. A reader moved onto the snapshot therefore decides
-/// exactly what it decided over the process environment.
+/// Every accessor mirrors a `std::env` call: [`Self::os`] is `var_os`, [`Self::string`] is
+/// `var(..).ok()` (UTF-8 only), [`Self::take`] is `aterm_log::env::take`, [`Self::remove`] is
+/// `aterm_log::env::unset`, so a reader decides over the snapshot exactly what it would over
+/// the process environment.
 #[derive(Default)]
 pub(crate) struct HandoffEnv {
     /// `(name, value)` in [`HANDOFF_ENV_KEYS`] order; a name appears at most
@@ -168,13 +146,11 @@ pub(crate) struct HandoffEnv {
 }
 
 impl HandoffEnv {
-    /// Read and CLEAR every [`HANDOFF_ENV_KEYS`] name, once.
+    /// Read and clear every [`HANDOFF_ENV_KEYS`] name, once.
     ///
-    /// Position (the caller's obligation, the only one left): before the first
-    /// thread of the process. `main_entry` calls it as its first act on the
-    /// handoff, so this is the one process-environment mutation the handoff
-    /// makes in the successor, and it happens while the process is provably
-    /// single-threaded. Every later handoff read is of `self`.
+    /// The caller's one obligation: call it before the first thread of the process.
+    /// `main_entry` calls it first, so this is the one process-environment mutation the
+    /// handoff makes in the successor, made while the process is single-threaded.
     #[must_use]
     #[cfg_attr(
         any(test, debug_assertions),
@@ -187,9 +163,8 @@ impl HandoffEnv {
     pub(crate) fn capture() -> Self {
         let mut slots = Vec::new();
         for key in HANDOFF_ENV_KEYS {
-            // `take` removes the name whether or not it was set: after this
-            // loop no handoff name is left in the process environment, for a
-            // helper, a shell or a later reader to observe.
+            // `take` removes the name whether or not it was set, so no handoff name is left
+            // for a helper, a shell or a later reader to observe.
             if let Some(value) = aterm_log::env::take(key.0) {
                 slots.push((*key, value));
             }
@@ -219,8 +194,8 @@ impl HandoffEnv {
         self.slot(key).map(OsString::as_os_str)
     }
 
-    /// The value as UTF-8 (`std::env::var(key).ok()`), not consumed: a
-    /// non-UTF-8 value answers `None`, as that call's `Err` did.
+    /// The value as UTF-8 (`std::env::var(key).ok()`), not consumed: a non-UTF-8 value is
+    /// `None`.
     #[must_use]
     pub(crate) fn string(&self, key: HandoffName) -> Option<String> {
         self.slot(key)
@@ -228,8 +203,7 @@ impl HandoffEnv {
             .map(str::to_owned)
     }
 
-    /// Read and remove (`aterm_log::env::take(key)`): a one-shot authority is
-    /// consumable once from the snapshot, as it was from the environment.
+    /// Read and remove (`aterm_log::env::take(key)`): a one-shot authority is consumable once.
     pub(crate) fn take(&mut self, key: HandoffName) -> Option<OsString> {
         debug_assert!(
             HANDOFF_ENV_KEYS.contains(&key),
@@ -263,10 +237,8 @@ impl HandoffEnv {
         self.slots.insert(at, (key, value));
     }
 
-    /// The pairs still held, to restore onto an `execve` of this process's own
-    /// successor image (the boot apply's re-exec). Before the snapshot those
-    /// names were simply still in `environ` at the exec, and the new image read
-    /// them there; its `capture` reads them here.
+    /// The pairs still held, to restore onto an `execve` of this process's own successor image
+    /// (the boot apply's re-exec), whose `capture` reads them.
     #[must_use]
     pub(crate) fn exec_env(&self) -> Vec<(OsString, OsString)> {
         self.slots

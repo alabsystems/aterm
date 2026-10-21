@@ -477,8 +477,10 @@ impl Log {
     /// Lift the readers' fence (the update stood down; this process goes on).
     pub fn lift_read_fence(&mut self) {
         self.fence = None;
-        // The marks the fence kept past their quota go now (`log_quota`).
+        // The marks the fence kept past their quota, and the program marks
+        // past their share, go now (`log_quota`).
         self.enforce_mark_quota();
+        self.enforce_program_share(None);
         self.rang();
     }
 
@@ -517,6 +519,21 @@ impl Log {
     pub fn from_carry(
         lines: &[String],
         a: CarryAdopt,
+    ) -> Result<(Log, Vec<String>, CarryStats), CarryError> {
+        Log::from_carry_built(lines, a, None)
+    }
+
+    /// [`Log::from_carry`], its handoff mark naming the predecessor's build
+    /// (`mark - handoff … build=<n>`, Phase 6 step 6F-7) when the update
+    /// said it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Log::from_carry`].
+    pub fn from_carry_built(
+        lines: &[String],
+        a: CarryAdopt,
+        build: Option<u64>,
     ) -> Result<(Log, Vec<String>, CarryStats), CarryError> {
         if lines.len() > CARRY_MAX_LINES {
             return Err(CarryError::Bound("more carry lines than a carry holds"));
@@ -929,10 +946,15 @@ impl Log {
             };
             log.index_carried(&rec, bytes);
             log.heap = log.heap.saturating_add(super::entry_heap(&rec));
+            // The carry writes no process-clock reading (6F-1): a carried
+            // record reads its wall time on this process's clock, clamped as
+            // a carried open node's does.
+            let mono = rebase(rec.t, a.at).mono_ms;
             log.ring.push_back(super::Entry {
                 rec: rec.into(),
                 bytes,
                 ms,
+                mono,
             });
             log.bytes = log.bytes.saturating_add(bytes);
         }
@@ -966,6 +988,9 @@ impl Log {
         let _ = f.set(crate::field::Key::Carried, Val::U(carried));
         let _ = f.set(crate::field::Key::Shed, Val::U(shed));
         let _ = f.set(crate::field::Key::Epoch, Val::U(u64::from(a.ep)));
+        if let Some(build) = build {
+            let _ = f.set(crate::field::Key::Build, Val::U(build));
+        }
         let _ = log.mark(
             super::Mark::new(Kind::Handoff, Src::Aterm, Conf::Exact)
                 .at(Node::SESSION)

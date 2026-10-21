@@ -8,7 +8,7 @@
 // Orbital and Web backends: no aterm cell compiles them.)
 
 use crate::monitor::MonitorHandle as RootMonitorHandle;
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 use crate::monitor::VideoModeHandle as RootVideoModeHandle;
 use crate::window::Fullscreen as RootFullscreen;
 
@@ -32,8 +32,8 @@ pub use self::platform::*;
 /// [`VideoModeHandle`]/[`MonitorHandle`]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Fullscreen {
-    // Not on macOS (winit-core step 5): see `crate::window::Fullscreen`.
-    #[cfg(not(macos_platform))]
+    // Windows only (winit-core step 5, WC.8): see `crate::window::Fullscreen`.
+    #[cfg(windows_platform)]
     Exclusive(VideoModeHandle),
     Borderless(Option<MonitorHandle>),
 }
@@ -41,7 +41,7 @@ pub(crate) enum Fullscreen {
 impl From<RootFullscreen> for Fullscreen {
     fn from(f: RootFullscreen) -> Self {
         match f {
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             RootFullscreen::Exclusive(mode) => Self::Exclusive(mode.video_mode),
             RootFullscreen::Borderless(Some(handle)) => Self::Borderless(Some(handle.inner)),
             RootFullscreen::Borderless(None) => Self::Borderless(None),
@@ -52,7 +52,7 @@ impl From<RootFullscreen> for Fullscreen {
 impl From<Fullscreen> for RootFullscreen {
     fn from(f: Fullscreen) -> Self {
         match f {
-            #[cfg(not(macos_platform))]
+            #[cfg(windows_platform)]
             Fullscreen::Exclusive(video_mode) => {
                 Self::Exclusive(RootVideoModeHandle { video_mode })
             },

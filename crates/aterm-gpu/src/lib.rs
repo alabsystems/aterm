@@ -110,9 +110,9 @@ pub mod gpu_time;
 /// Present-to-glass timing: `presentDrawable:` registration to the drawable's
 /// `presentedTime`.
 pub mod present_glass;
-/// Cold-build sub-phase timing for the GPU backend (see `startup_probe`).
+/// Cold-build sub-phase timing for the GPU backend.
 pub mod startup_probe;
-/// VIDEO introspection: submitted-destination-frame capture (see `video_tap`).
+/// Video introspection: submitted-destination-frame capture.
 pub mod video_tap;
 /// The browser entry: a canvas becomes a context and a pending surface.
 #[cfg(target_arch = "wasm32")]
@@ -121,8 +121,7 @@ pub mod web;
 #[cfg(wgpu_arm)]
 mod wgpu_timer;
 // The GPU-free slice-precondition decision `VertexBuffer::upload_via` (and the
-// Metal arm's `upload_stream`) uses,
-// re-exported for the Tier-1 conformance test.
+// Metal arm's `upload_stream`) uses, re-exported for the Tier-1 conformance test.
 pub use renderer::should_slice;
 /// The armed tray card ring's GPU-free bookkeeping: which slot a change
 /// writes and which in-flight presents it outlasts (public for the Tier-1
@@ -146,13 +145,12 @@ pub mod tray_card_ring;
 // `WGPU_DX12_PRESENTATION_SYSTEM` env knob, which would leak to child shells.
 // The HWND path remains the default (`background_material = "none"`).
 //
-// Fail-soft: on a visual instance the composition stack is built lazily by the
-// first `Surface::configure`, and a failure there reaches wgpu's default error
-// handler, which panics. So `GpuRenderer::create_window_surface` runs that
-// configure inside error scopes and returns `Err`; the frontend consults
-// [`surface_attach_fallback`], withdraws this latch, rebuilds on the HWND
-// swapchain (`GpuRenderer::rebuild_on_fresh_context`) and retries once. The
-// material then styles only the caption, with one diagnostic.
+// Fail-soft: the composition stack is built by the first `Surface::configure`,
+// whose failure would reach wgpu's panicking default error handler, so
+// `GpuRenderer::create_window_surface` runs it inside error scopes and returns
+// `Err`. The frontend then consults [`surface_attach_fallback`], withdraws the
+// latch, rebuilds on the HWND swapchain (`GpuRenderer::rebuild_on_fresh_context`)
+// and retries once; the material then styles only the caption.
 #[cfg(windows)]
 static VISUAL_SWAPCHAIN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -241,7 +239,7 @@ pub fn visual_swapchain_requested() -> bool {
 }
 
 /// Whether the live [`GpuContext`] was actually built on the DirectComposition
-/// visual path (ground truth for `aterm-ctl chrome`'s `client=` field).
+/// visual path (ground truth for `aterm ctl chrome`'s `client=` field).
 #[cfg(windows)]
 pub fn visual_swapchain_active() -> bool {
     VISUAL_SWAPCHAIN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
@@ -324,8 +322,7 @@ pub(crate) fn frame_from_padded_rgba(bytes: &[u8], w: usize, h: usize, padded: u
     for row in 0..h {
         let base = row * padded;
         let src = &bytes[base..base + w * 4];
-        // `src` is exactly `w * 4` bytes, so the `as_chunks` remainder is always
-        // empty — the discarded tail is the one `chunks_exact` also dropped.
+        // `src` is exactly `w * 4` bytes, so the `as_chunks` remainder is empty.
         pixels.extend(src.as_chunks::<4>().0.iter().map(|c| {
             ((255 - u32::from(c[3])) << 24)
                 | (u32::from(c[0]) << 16)
@@ -423,11 +420,10 @@ fn default_backends() -> wgpu::Backends {
     backends
 }
 
-/// The first-party Metal renderer is the macOS backend, unconditionally, with
-/// no wgpu escape hatch: wgpu is not in the macOS production dependency graph.
-/// A Mac where Metal fails to initialize falls to the softbuffer CPU present
-/// path, the same floor as device loss. A `const fn` so every armed-path site
-/// reads as this decision.
+/// The first-party Metal renderer is the macOS backend, unconditionally: wgpu is
+/// not in the macOS production graph. A Mac where Metal fails to initialize falls
+/// to the softbuffer CPU present, as on device loss. A `const fn` so every
+/// armed-path site reads as this decision.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub const fn metal_backend_selected() -> bool {
@@ -790,8 +786,8 @@ impl GpuContext {
             device_loss_msg,
             #[cfg(target_os = "macos")]
             metal_loss: std::sync::OnceLock::new(),
-            // Seeded false; ONLY the native `new()` (which owns the descriptor
-            // decision) upgrades it — the wasm/web path never has a DComp visual.
+            // Only the native `new()`, which owns the descriptor, sets this; the
+            // web path never has a DComp visual.
             visual_swapchain: false,
         };
         startup_probe::record(
@@ -863,7 +859,7 @@ impl GpuContext {
 
     /// Clamp a texture dimension to `1..=max_texture_dimension_2d`, the
     /// `GpuContext` equivalent of [`GpuRenderer::clamp_fb_dim`]. A 0 or oversized
-    /// extent would abort in wgpu's default error handler.
+    /// extent would panic in wgpu's default error handler.
     #[inline]
     #[cfg(wgpu_arm)]
     fn clamp_tex_dim(&self, d: u32) -> u32 {
@@ -1033,11 +1029,8 @@ impl GpuContext {
             Err(_) => return Err("readback buffer map never completed".to_string()),
         }
         let data = slice.get_mapped_range();
-        // Deref the `BufferView` once and walk row slices as `[u8; 4]` texels,
-        // avoiding a mapped-range deref and bounds check per channel.
+        // Deref the mapped range once, not per channel.
         let bytes: &[u8] = &data;
-        // The unpack is the shared `frame_from_padded_rgba`, one spelling of
-        // the Frame byte contract for both backends.
         let frame = frame_from_padded_rgba(bytes, w, h, padded);
         drop(data);
         buffer.unmap();

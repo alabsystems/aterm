@@ -1,33 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Windows EDR headroom + SDR-white query for the cursor aurora (M3 phase B on
-//! Windows). Two sources, both keyed off the window's monitor:
+//! Windows EDR headroom and SDR-white query for the cursor aurora, keyed off the window's
+//! monitor:
 //!
-//! * **DXGI** (`IDXGIOutput6::GetDesc1` → `MaxLuminance`) for the panel's peak nits.
-//!   DXGI is COM (vtable dispatch), so this uses the `windows` crate.
-//! * **DisplayConfig** (`DisplayConfigGetDeviceInfo` advanced-color + SDR-white) for
-//!   the "Use HDR" state and the desktop's SDR-white level. This is a FLAT C API, so
-//!   it is hand-rolled here (house style, mirroring `aterm-pty`'s `ffi.rs`), with the
-//!   exact `#[repr(C)]` layouts validated against a live display.
+//! * DXGI (`IDXGIOutput6::GetDesc1` → `MaxLuminance`) for the panel's peak nits; COM, through
+//!   aterm-win32's `dxgi` vtables, which its oracle holds to `windows` 0.62.2's slots.
+//! * DisplayConfig (`DisplayConfigGetDeviceInfo` advanced-color and SDR-white) for the "Use
+//!   HDR" state and the desktop's SDR-white level; a flat C API, hand-rolled here like
+//!   `aterm-pty`'s `windows/ffi.rs`, with `#[repr(C)]` layouts validated against a live
+//!   display.
 //!
-//! Everything fails SAFE to `(edr_max 1.0, sdr_white_scale 1.0)` — no headroom, no
-//! scaling — so a query failure or an HDR-off display leaves the aurora inert and the
-//! present byte-identical to SDR. `edr_max = MaxLuminance / SDR-white` (relative, like
-//! macOS's `NSScreen` value); `sdr_white_scale = SDR-white / 80` (scRGB reference).
+//! Every failure yields `(1.0, 1.0)`, so a failed query or an HDR-off display leaves the aurora
+//! inert and the present identical to SDR. `edr_max = MaxLuminance / SDR-white` (relative, like
+//! macOS's `NSScreen` value); `sdr_white_scale = SDR-white / 80` (the scRGB reference).
 //!
-//! **Measured composition law (2026-08, AMD 780M, Windows 11 HDR on, SDR-white
-//! 240 nits → scale 3.0):** DWM composes every SDR-drawn pixel (GDI, the
-//! `DWMWA_CAPTION_COLOR` tint) onto the FP16 scRGB desktop as
-//! `srgb_piecewise_to_linear(byte) × scale` — exactly 3.0 × the piecewise decode,
-//! not a 2.2 power — and aterm's scRGB present (`fs_blit`: decode × this scale)
-//! lands byte-for-byte on the same linear values, caption == grid == gutter.
-//! Verify it with an FP16 capture (`Windows.Graphics.Capture` at
-//! `R16G16B16A16Float`): a GDI screen grab (`BitBlt` / `CopyFromScreen`) reads an
-//! f16 swapchain back at 80 nits == white (no `/scale`), so it reports the EDR
-//! present `scale×` lifted in linear light (`#111318` → `#23262E` at 3.0) while
-//! reading SDR windows byte-exact — a capture artefact, not a presented colour.
+//! DWM composes SDR-drawn pixels (GDI, the caption tint) onto the scRGB desktop at the same
+//! `sdr_white_scale` the present applies, so caption, grid and gutter match
+//! (`aterm_render::hdr::scrgb_present_channel` has the curve and how to capture it).
 #![cfg(windows)]
 
+use aterm_win32::com::Com;
 use aterm_window::platform::windows::MonitorHandleExtWindows;
 use aterm_window::window::Window;
 use core::ffi::c_void;
@@ -45,8 +37,8 @@ pub(crate) fn query(window: &Window) -> (f32, f32) {
     if !hdr_on || sdr_nits < 1.0 {
         return (1.0, 1.0);
     }
-    // Fail-safe: if the DXGI peak query fails, fall back to SDR-white (headroom 0 =
-    // the aurora glow adds nothing) while STILL scaling the grid to SDR-white.
+    // Without a DXGI peak, headroom is 0 (the aurora adds nothing) but the grid still scales to
+    // SDR-white.
     let max_nits = dxgi_max_luminance(hmon).unwrap_or(sdr_nits);
     let edr_max = (max_nits / sdr_nits).max(1.0);
     let scale = (sdr_nits / 80.0).max(1.0);
@@ -63,29 +55,59 @@ pub(crate) fn sdr_white_scale(window: &Window) -> f32 {
     query(window).1
 }
 
-// ---- DXGI: panel MaxLuminance for a monitor (COM, via the `windows` crate) --------
+// ---- DXGI: panel MaxLuminance for a monitor (COM, aterm-win32's vtables) ---------
+
+/// The interface pointer one successful DXGI call wrote to `out`, owned; `None`
+/// for a failure, which ends an enumeration (`DXGI_ERROR_NOT_FOUND`) as any
+/// other does.
+///
+/// # Safety
+///
+/// `out` is what the call whose result is `hr` wrote: on success, a live
+/// interface pointer whose one reference nothing else releases.
+unsafe fn owned(hr: i32, out: *mut c_void) -> Option<Com> {
+    // SAFETY: the caller's contract.
+    (hr >= 0).then(|| unsafe { Com::from_raw(out) }).flatten()
+}
 
 fn dxgi_max_luminance(hmon: isize) -> Option<f32> {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6};
-    use windows::core::Interface;
-    // SAFETY: standard DXGI enumeration; every handle is COM-reference-counted by the
-    // `windows` crate and dropped at scope end. No raw pointers escape.
-    unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let mut ai = 0u32;
-        while let Ok(adapter) = factory.EnumAdapters1(ai) {
-            ai += 1;
-            let mut oi = 0u32;
-            while let Ok(output) = adapter.EnumOutputs(oi) {
-                oi += 1;
-                let Ok(o6) = output.cast::<IDXGIOutput6>() else {
-                    continue;
-                };
-                if let Ok(desc) = o6.GetDesc1()
-                    && desc.Monitor.0 as isize == hmon
-                {
-                    return Some(desc.MaxLuminance);
-                }
+    use aterm_win32::dxgi::{
+        CreateDXGIFactory1, DXGI_OUTPUT_DESC1, IDXGIAdapter1_Vtbl, IDXGIFactory1_Vtbl,
+        IDXGIOutput6_Vtbl, IID_IDXGIFactory1, IID_IDXGIOutput6,
+    };
+    let mut out = core::ptr::null_mut();
+    // SAFETY: the factory's IID and an out pointer DXGI writes only on success,
+    // when it hands over one reference.
+    let factory = unsafe { owned(CreateDXGIFactory1(&IID_IDXGIFactory1, &mut out), out) }?;
+    // SAFETY: `factory` is an IDXGIFactory1, whose vtable this is; every object
+    // below is owned by a `Com` and released at scope end, and no pointer escapes.
+    let factory_vt = unsafe { factory.vtable::<IDXGIFactory1_Vtbl>() };
+    for ai in 0u32.. {
+        let mut out = core::ptr::null_mut();
+        // SAFETY: as above; EnumAdapters1 hands back an owned IDXGIAdapter1.
+        let hr = unsafe { (factory_vt.EnumAdapters1)(factory.as_raw(), ai, &mut out) };
+        // SAFETY: `out` is that call's.
+        let Some(adapter) = (unsafe { owned(hr, out) }) else {
+            break;
+        };
+        // SAFETY: `adapter` is an IDXGIAdapter1.
+        let adapter_vt = unsafe { adapter.vtable::<IDXGIAdapter1_Vtbl>() };
+        for oi in 0u32.. {
+            let mut out = core::ptr::null_mut();
+            // SAFETY: EnumOutputs hands back an owned IDXGIOutput.
+            let hr = unsafe { (adapter_vt.EnumOutputs)(adapter.as_raw(), oi, &mut out) };
+            // SAFETY: `out` is that call's.
+            let Some(output) = (unsafe { owned(hr, out) }) else {
+                break;
+            };
+            let Ok(o6) = output.query(&IID_IDXGIOutput6) else {
+                continue;
+            };
+            let mut desc = DXGI_OUTPUT_DESC1::default();
+            // SAFETY: `o6` is an IDXGIOutput6; GetDesc1 fills `desc`.
+            let hr = unsafe { (o6.vtable::<IDXGIOutput6_Vtbl>().GetDesc1)(o6.as_raw(), &mut desc) };
+            if hr >= 0 && desc.Monitor as isize == hmon {
+                return Some(desc.MaxLuminance);
             }
         }
     }
@@ -181,9 +203,9 @@ unsafe extern "system" {
     fn DisplayConfigGetDeviceInfo(packet: *mut Header) -> i32;
 }
 
-/// The first active display path's `(SDR-white nits, HDR-enabled)`. Single-display
-/// exact; on multi-monitor it reports the first active path (a documented first-cut
-/// limitation — DXGI above already matches the window's exact HMONITOR for the peak).
+/// The first active display path's `(SDR-white nits, HDR-enabled)`. On multi-monitor this is
+/// the first active path, not the window's (DXGI above matches the window's HMONITOR for the
+/// peak).
 fn displayconfig_primary() -> Option<(f32, bool)> {
     // SAFETY: hand-rolled DisplayConfig FFI with `#[repr(C)]` layouts validated
     // against a live display; sizes are passed by the API contract and every call is

@@ -45,9 +45,9 @@ fn pin(expected: &str) {
     assert_eq!(format!("{got:016x}"), expected, "the pinned corpus changed");
 }
 
-/// The eleven patterns `aterm-selection`'s `builtin_patterns` ships. These are
-/// the specification: whatever else this engine can or cannot do, it has to do
-/// these, because they are compiled on every terminal that opens.
+/// The eleven `aterm-selection` built-in patterns: the specification this engine must
+/// meet. `file_path` is an earlier form of the shipped rule; `step_budget_tests` in
+/// `src/lib.rs` carries the current one.
 const BUILTIN: &[(&str, &str)] = &[
     (
         "url",
@@ -106,9 +106,7 @@ const HAYSTACKS: &[&str] = &[
     "",
     " ",
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    // NEWLINE-BEARING. No haystack above holds a `\n`, so none tells `(?m)^`
-    // from `^`. These tell `StartText` and `StartLine` apart — and are what a
-    // scrollback export, a pasted diff or a bracketed-paste payload looks like.
+    // Newline-bearing: these tell `StartText` from `StartLine`.
     "a\nb\nc",
     "ERROR one\nERROR two\nok three",
     "\nleading",
@@ -298,13 +296,8 @@ fn syntax_corpus_is_pinned() {
         r"(?m)a$",
         r"(?m)^",
         r"(?m)$",
-        // START-ANCHOR ADVERSARIES. `Program::start_anchored` claims a pattern
-        // can only match at offset 0, and the search then declines to walk the
-        // rest of the haystack. Every one of these CONTAINS a `^` and is
-        // nonetheless NOT anchored — an alternation with a bare branch, a loop
-        // that can exit without entering, an optional group — so a walk that
-        // merely spotted the `^` and stopped would report a missed match here
-        // rather than a slow one.
+        // Start-anchor adversaries: each contains a `^` but is not anchored, so a
+        // `Program::start_anchored` walk that stopped at the `^` would miss a match.
         r"a|^b",
         r"^a|b",
         r"(^a)*",
@@ -441,11 +434,9 @@ fn syntax_corpus_is_pinned() {
     pin(SYNTAX_DIGEST);
 }
 
-/// `\d`, `\w` and `\s` over every code point. `\w` is `char::is_alphabetic`
-/// (the toolchain's Unicode version, which also moves `\b` and so the
-/// `git_hash` rule) plus baked tables; only the baked part is pinned, so a
-/// toolchain bump cannot move the digest. Recorded when `\d`, `\s` and the
-/// non-alphabetic `\w` matched the `regex` crate exactly.
+/// `\d`, `\w` and `\s` over every code point. Only the baked part of `\w` is pinned, not
+/// `char::is_alphabetic`, so a toolchain bump cannot move the digest. Recorded when `\d`,
+/// `\s` and the non-alphabetic `\w` matched `regex` exactly.
 #[test]
 fn perl_classes_are_pinned() {
     let d = aterm_regex::Regex::new(r"^\d$").expect("compiles");
@@ -473,15 +464,11 @@ fn perl_classes_are_pinned() {
     pin(PERL_DIGEST);
 }
 
-/// Case folding, over the whole cased range, one code point at a time.
-///
-/// Candidates are *bucketed by case mapping* — every code point whose
-/// `to_lowercase`/`to_uppercase` starts with the same code point as this one's,
-/// in both directions — which is what finds a distant orbit partner: `\u{390}`
-/// folds to `\u{1fd3}`, 0x1c43 away, and both uppercase to a string starting
-/// `\u{399}`. Recorded when every answer matched the `regex` crate except
-/// pairs `std`'s own single-code-point case mappings link (Unicode-version
-/// skew, in the direction of folding MORE).
+/// Case folding over the whole cased range, one code point at a time. Candidates are
+/// bucketed by case mapping in both directions, which finds distant orbit partners
+/// (`\u{390}` and `\u{1fd3}`, 0x1c43 apart, both uppercase to a string starting
+/// `\u{399}`). Recorded when every answer matched `regex` except pairs `std`'s own case
+/// mappings link (Unicode-version skew, folding more).
 #[test]
 fn case_folding_is_pinned() {
     let mut lower_bucket: BTreeMap<char, Vec<char>> = BTreeMap::new();
@@ -554,9 +541,7 @@ fn exotic_fold_orbits_are_pinned() {
     pin(EXOTIC_DIGEST);
 }
 
-/// Zero-width matching, where `find_iter`'s advance rule lives. `aterm-search`
-/// filters these out, but only after this engine has produced exactly the same
-/// ones it should.
+/// Zero-width matching, where `find_iter`'s advance rule lives.
 #[test]
 fn zero_width_matches_are_pinned() {
     for p in [
@@ -660,12 +645,9 @@ fn nullable_and_lazy_repetitions_are_pinned() {
     pin(NULLABLE_DIGEST);
 }
 
-/// `(?x)` — extended mode, where whitespace is insignificant and `#` runs to
-/// end of line. It is the flag with the most parser-level quirks, and they are
-/// not symmetric: whitespace may separate `(` from the `?` that qualifies it,
-/// and `[` from the `^` that negates it, and it may sit between a *counted*
-/// repetition and its `?` laziness marker — but not between `*`, `+` or `?` and
-/// theirs, where `a? ?` is `(a?)?` and not `a??`.
+/// `(?x)` extended mode, the flag with the most parser quirks: whitespace may separate
+/// `(` from its `?`, `[` from its `^`, and a counted repetition from its lazy `?`, but not
+/// `*`, `+` or `?` from theirs (`a? ?` is `(a?)?`).
 #[test]
 fn extended_mode_is_pinned() {
     const PATTERNS: &[&str] = &[
@@ -738,10 +720,9 @@ fn extended_mode_is_pinned() {
     pin(EXTENDED_DIGEST);
 }
 
-/// The prefilter — the byte-at-a-time scan that skips text no match can begin
-/// in — is the one place a walk could stop inside a multi-byte code point, and
-/// the one optimisation that could cost a match outright. Drive it at every
-/// alignment over text where the skipped runs are multi-byte.
+/// The prefilter is the one place a walk could stop inside a multi-byte code point and
+/// the one optimisation that could cost a match: drive it at every alignment over
+/// multi-byte filler.
 #[test]
 fn the_prefilter_never_changes_the_answer() {
     const PATTERNS: &[&str] = &[
@@ -874,19 +855,11 @@ fn malformed_patterns_are_rejected() {
     }
 }
 
-/// A negated POSIX item is case-folded BEFORE it is negated, exactly as a
-/// bracketed class is: `(?i)[[:^lower:]]` is "not a letter of either case", not
-/// "fold the complement of `[a-z]`".
-///
-/// The two orders are far apart. The complement of `[a-z]` holds `A-Z`, `ſ`
-/// (U+017F) and the KELVIN SIGN (U+212A), whose fold orbits are `a-z`, `s` and
-/// `k` — so folding after negating gives back every code point there is, and
-/// `[^[:^lower:]]` then matches nothing at all. `aterm-search` prefixes `(?i)`
-/// to every pattern in its default case-insensitive mode, so these are the
-/// answers a person typing `[[:^alpha:]]` into the find bar gets.
-///
-/// Every expected span here is what the `regex` crate (1.12.4) reports on the
-/// same haystack.
+/// A negated POSIX item is folded before it is negated, as a bracketed class is:
+/// `(?i)[[:^lower:]]` is "not a letter of either case". Folding the complement of `[a-z]`
+/// (which holds `A-Z`, `ſ` and KELVIN SIGN) would yield every code point instead. The
+/// expected spans are what `regex` 1.12.4 reports; `aterm-search`'s default `(?i)` makes
+/// them the find bar's answers.
 #[test]
 fn negated_posix_items_fold_before_they_negate() {
     // a Z ␠ k K ␠ s S ſ K ␠ 1 é _ -
@@ -925,8 +898,7 @@ fn negated_posix_items_fold_before_they_negate() {
             vec![(2, 3), (5, 6), (13, 14), (15, 17), (18, 19)],
         ),
         (r"(?i)[[:^print:]]", vec![(15, 17)]),
-        // Controls: the same items without `(?i)`, and the class-level
-        // negation, which was always folded first.
+        // Controls: the same items without `(?i)`, and class-level negation.
         (
             r"[[:^lower:]]",
             vec![
@@ -951,13 +923,8 @@ fn negated_posix_items_fold_before_they_negate() {
     }
 }
 
-/// A quantifier straight after a flag directive has nothing to repeat, and is
-/// refused — not quietly applied to whatever came before the directive.
-///
-/// `a(?i)*` read as `a*` (then case-insensitive) is a different pattern from
-/// anything its author wrote, and the `regex` crate rejects all of these with
-/// "repetition operator missing expression". A refusal is the contract
-/// (`refusals_are_refusals`); a reinterpretation is the failure it guards.
+/// A quantifier right after a flag directive has nothing to repeat and is refused, as in
+/// `regex`, not applied to the item before the directive.
 #[test]
 fn a_quantifier_after_a_flag_directive_is_refused() {
     for pattern in [
@@ -979,17 +946,15 @@ fn a_quantifier_after_a_flag_directive_is_refused() {
             "{pattern:?}: {err}"
         );
     }
-    // The directive still leaves the item AFTER it repeatable, and a group
-    // after it is an item like any other.
+    // The item after the directive is still repeatable, and a group after it is an
+    // item like any other.
     assert_eq!(spans_mine(r"a(?i)b*", "aBB"), Some(vec![(0, 3)]));
     assert_eq!(spans_mine(r"a(?i)(?:b)*", "aBB"), Some(vec![(0, 3)]));
     assert_eq!(spans_mine(r"a(?i)(?:)*", "aa"), Some(vec![(0, 1), (1, 2)]));
 }
 
-/// The leftmost start where a repetition whose body can consume a multi-byte
-/// code point is followed by a multi-byte literal — a case some `regex-automata`
-/// versions miss (`(.*b)*é` on `"aaébé"` reported `2..7`), confirmed by an
-/// anchored lazy-prefix arbiter.
+/// The leftmost start when a repetition over multi-byte code points precedes a multi-byte
+/// literal; some `regex-automata` versions report `2..7` for `(.*b)*é` on `"aaébé"`.
 #[test]
 fn this_engine_finds_the_leftmost_start() {
     for (pattern, haystack, correct) in [

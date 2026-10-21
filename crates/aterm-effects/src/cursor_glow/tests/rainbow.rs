@@ -33,8 +33,7 @@ fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
 }
 
 /// Bounded lifecycle for a rainbow cell reclaimed while retracting. Visibility
-/// is quantized for exhaustive exploration; Tier 1 projects the real
-/// multiplier at the reversal instant. `Buggy=1` snaps back to full.
+/// is quantized for exhaustive exploration; `Buggy=1` snaps back to full.
 fn rainbow_retract_rearm_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -94,6 +93,11 @@ fn rainbow_kitty_parse_and_beam() {
 /// 236 cap is reachable.
 #[test]
 fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
+    assert_eq!(
+        crate::rainbow_kitty::ribbon::UNDER_COV_CAP as i64,
+        236,
+        "RainbowOccupiedCoverage::Cap must equal ribbon::UNDER_COV_CAP"
+    );
     let model = rainbow_occupied_coverage_model();
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 }

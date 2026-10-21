@@ -1378,6 +1378,7 @@ impl Terminal {
         // cannot remain attached to pre-restore cells. A freshly constructed
         // `from_checkpoint` terminal needs no edge: consumers baseline it.
         self.content_scroll_state.invalidate();
+        self.transient.sync_end_caret = None;
         // Hydration replaced both grids and `modes.alternate_screen`, so the
         // parked selection (restored on the next alt exit) would name content
         // from another lineage; clear it. The live selection is left alone, so

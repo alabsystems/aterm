@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Thread SCHEDULING ROLE, declared once per worker.
+//! Thread scheduling role, declared once per worker.
 //!
 //! macOS schedules by Quality of Service, and on Apple Silicon QoS also steers
-//! P-core versus E-core placement. A thread that never declares one inherits
-//! `QOS_CLASS_DEFAULT`, which sits just below `USER_INITIATED` and therefore
-//! competes with the UI thread's work whenever the machine is saturated.
+//! P-core versus E-core placement. A thread that declares none inherits
+//! `QOS_CLASS_DEFAULT`, just below `USER_INITIATED`, and so competes with the UI
+//! thread's work whenever the machine is saturated. Nearly every aterm worker (font
+//! warmers, encoders, update checkers, package probes, log flushers) does work no
+//! human is waiting on; left at the default it keeps its share under load while
+//! keystroke handling waits, which is felt as typing lag.
 //!
-//! That default is wrong for most of this app. aterm spawns dozens of workers —
-//! font warmers, image/video encoders, update checkers, package probes, log
-//! flushers — and essentially all of them do work no human
-//! is waiting on. Left at the default they are indistinguishable, to the
-//! scheduler, from the thread drawing the next frame. Under load that is
-//! precisely backwards: the cosmetic work keeps its share while keystroke
-//! handling waits, which is felt as typing lag rather than as a slow font warm.
+//! The scale is deliberately coarse, four roles chosen by asking "who is waiting for
+//! this?", so the priority order stays explicit and reviewable. Call sites stay
+//! platform-neutral: on macOS a role is a QoS class, on Linux (x86_64/aarch64)
+//! `Interactive` and `Responsive` are an EEVDF slice request (see the Linux section
+//! below), and elsewhere a role is a no-op.
 //!
 //! Declaring the role makes the priority ORDER explicit and reviewable, instead
 //! of an accident of which threads happened to get a `pthread_set_qos_class`
@@ -54,22 +55,21 @@
 /// What a thread's work is worth relative to the human at the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
-    /// The human is watching this land RIGHT NOW: input egress, and anything
-    /// else on the keystroke→glass path. Ranks at or above the UI thread.
+    /// The human is watching this land right now: input egress, and anything else on
+    /// the keystroke→glass path. Ranks at or above the UI thread.
     Interactive,
-    /// The human asked for it and is waiting, but not frame-by-frame: PTY drain
-    /// and parse, reflow. Below the UI thread, above everything cosmetic.
+    /// The human asked for it and is waiting, but not frame-by-frame: PTY drain and
+    /// parse, reflow. Below the UI thread, above everything cosmetic.
     ///
-    /// Also the FLOOR for any worker that holds or initialises a lock the UI
-    /// thread contends. Matching the PTY drain here does not make such work
-    /// urgent; it shortens the window in which a lock holder can sit
-    /// descheduled with the UI thread queued behind it.
+    /// Also the floor for any worker that holds or initialises a lock the UI thread
+    /// contends: it shortens the window in which a lock holder can sit descheduled
+    /// with the UI thread queued behind it.
     Responsive,
     /// Useful work nobody is blocked on: font warming, encoding, log flushing,
     /// package/update probes. Must never delay a keystroke.
     Background,
-    /// Work with NO deadline at all, which may therefore run arbitrarily late:
-    /// opportunistic disk sweeps and prefetch. Yields to literally everything.
+    /// Work with no deadline at all, which may run arbitrarily late: opportunistic
+    /// disk sweeps and prefetch. Yields to everything.
     ///
     /// "Arbitrarily late" is the whole contract, and it is stricter than it
     /// sounds. A `QOS_CLASS_BACKGROUND` thread on a saturated machine can be
@@ -94,15 +94,12 @@ const fn qos_class(role: Role) -> libc::qos_class_t {
     }
 }
 
-/// Declare the CALLING thread's role. Call it as the first statement of a
-/// worker's closure, so the whole body runs at the declared class.
+/// Declare the calling thread's role. Call it as the first statement of a worker's
+/// closure, so the whole body runs at the declared class. The result of setting
+/// one's own QoS (`_self_np`) is discarded: it cannot fail in a way worth branching on.
 ///
-/// Setting a thread's own QoS is the supported spelling (`_self_np`); it cannot
-/// fail in a way worth branching on, so the result is discarded.
-///
-/// Every fork the thread makes afterwards runs at the default class or above
-/// (`fork_at_default`, macOS), installed here BEFORE the class is set, so no
-/// thread is ever demoted while a fork from it could run at the demoted class.
+/// On macOS it first installs `fork_at_default`, so no thread is ever demoted while
+/// a fork from it could run at the demoted class.
 #[inline]
 pub(crate) fn set_self(role: Role) {
     #[cfg(target_os = "macos")]
@@ -188,20 +185,22 @@ where
 // kernel as `THREAD_QOS_UNSPECIFIED` in its `pre_exec`. The address-space copy,
 // on the forking thread, is what a demoted class starves.
 //
-// THE GUARD IS `pthread_atfork`, so no spawn site can forget it: libSystem runs
-// the prepare handler on the forking thread before `fork(2)` and the parent
-// handler after it returns, for every fork in the process — std's `Command`
-// fork path, aterm-pty's raw `fork`, any library's — and for no `posix_spawn`
-// (aterm-pty measured 1 call per fork, 0 per spawn), which copies nothing of
-// aterm's and so needs no lift. A thread below the default is lifted to the
-// default; the parent handler puts its class and relative priority back as soon
-// as `fork(2)` returns, and it waits for the child's exec at its own class. A
-// thread at or above the default, or one opted out of QoS, is left exactly as
-// it is: the guard never lowers anything.
+// A fork-path spawn (any `Command` with a `pre_exec`, a raw `fork()`, a `forkpty`)
+// makes a child that holds a copy of every descriptor aterm has open (pty masters,
+// the control listener, locks, pipe ends) until its exec closes them, and `fork(2)`
+// copies the address space on the forking thread, so that window is paid at the
+// forking thread's class. Measured at load ~130 on 18 cores, a 2 GB parent, fork to
+// the child's last `pre_exec` step: p99 20 ms from DEFAULT, 309 ms from UTILITY,
+// 26 ms from UTILITY lifted by this guard. The child's own thread is not the slow
+// party: it starts with no class (`THREAD_QOS_UNSPECIFIED`) whichever class forked it.
 //
-// Installed by `set_self` BEFORE it sets a class — the one way this crate
-// demotes a thread.
-// ---------------------------------------------------------------------------
+// The guard is `pthread_atfork`, so no spawn site can forget it: libSystem runs the
+// prepare handler on the forking thread before `fork(2)` and the parent handler after
+// it returns, for every fork in the process (std's `Command`, aterm-pty's raw `fork`,
+// any library's) and for no `posix_spawn`, which copies nothing of aterm's. A thread
+// below the default is lifted to it and put back as soon as `fork(2)` returns; a
+// thread at or above the default, or opted out of QoS, is left as it is. `set_self`
+// installs it before it sets a class, the one way this crate demotes a thread.
 #[cfg(target_os = "macos")]
 mod fork_at_default {
     use libc::qos_class_t::{QOS_CLASS_BACKGROUND, QOS_CLASS_DEFAULT, QOS_CLASS_UTILITY};
@@ -257,39 +256,25 @@ mod fork_at_default {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LINUX: THE SAME ROLES, SPOKEN TO EEVDF.
+// Linux: the same roles, spoken to EEVDF.
 //
-// Until this, every function above was a no-op off macOS, so on Linux the
-// keystroke path (the UI thread, the reply writer, the PTY drain) woke with
-// exactly the latency of the compilers the user runs beside it. Linux has no
-// QoS class an unprivileged process may raise itself into, but since 6.12
-// EEVDF honours a per-task SLICE request (`sched_setattr` on a fair policy
-// with `sched_runtime` set, allowed unprivileged, range 0.1-100 ms). A shorter
-// slice is a LATENCY hint, not a bigger share: the task keeps its weight
-// (its nice, which the request carries over untouched) and so its fair share
-// of CPU, but gets an earlier virtual deadline and is picked sooner when it
-// wakes onto a busy CPU.
+// Linux has no QoS class an unprivileged process may raise itself into, but since
+// 6.12 EEVDF honours a per-task slice request (`sched_setattr` on a fair policy with
+// `sched_runtime` set, allowed unprivileged, range 0.1-100 ms). A shorter slice is a
+// latency hint, not a bigger share: the task keeps its weight (its nice, which the
+// request carries over) but gets an earlier virtual deadline, so it is picked sooner
+// when it wakes onto a busy CPU. Measured at load 65-75 on 20 cores (kernel 6.17), a
+// 1 ms sleeper's wake overshoot p99 was 3.1-3.7 ms at the 2.8 ms default slice,
+// 1.4-2.5 ms at 1 ms and 1.4-1.6 ms at 0.1 ms; the UI thread is woken several times
+// per keystroke (key event, PTY output, present), so the tail is paid more than once.
 //
-// MEASURED 2026-09-24 on the Linux daily driver (aarch64, 20 cores, kernel
-// 6.17, load average 65-75 from parallel agent builds): a thread sleeping
-// 1 ms and doing a little work per wake, 3000 wakes per run, overshoot at the
-// kernel's 2.8 ms default slice p99 3.1-3.7 ms / max 5.2-5.5 ms; at a 1 ms
-// slice p99 1.4-2.5 ms / max 3.0-3.7 ms; at 0.1 ms p99 1.4-1.6 ms / max
-// 2.2-2.7 ms. The UI thread is woken several times per keystroke (key event,
-// PTY output, present), so that tail is paid more than once per echo.
-//
-// `SCHED_FLAG_RESET_ON_FORK` is set so the hint stops at this thread: a
-// thread or a CHILD PROCESS it creates (a shell spawned from the UI thread,
-// and therefore every compiler the user runs in it) starts back at the
-// default slice — measured on the same kernel, both read `runtime=2800000`
-// back after the parent set 500 µs. Only the roles that rank at or above the
-// UI thread take a slice; `Background`/`Housekeeping` are left alone because
-// a Linux nice value, unlike a macOS QoS class, IS inherited by child
-// processes, and a demoted thread that launches an aterm would starve it.
-// Older kernels accept the call and ignore `sched_runtime` for a fair
-// policy, so the hint degrades to a no-op rather than an error.
-// ---------------------------------------------------------------------------
+// `SCHED_FLAG_RESET_ON_FORK` stops the hint at this thread: a thread or child process
+// it creates (a shell spawned from the UI thread, so every compiler run in it) starts
+// back at the default slice. Only `Interactive` and `Responsive` take a slice;
+// `Background`/`Housekeeping` are left alone because a Linux nice value, unlike a
+// macOS QoS class, is inherited by child processes, and a demoted thread that
+// launches an aterm would starve it. Older kernels accept the call and ignore
+// `sched_runtime` for a fair policy, so the hint degrades to a no-op.
 
 /// The EEVDF slice request for `role`, in ns, or `None` for the kernel default.
 #[cfg(any(
@@ -308,8 +293,7 @@ const fn linux_slice_ns(role: Role) -> Option<u64> {
 }
 
 /// `struct sched_attr` (`include/uapi/linux/sched/types.h`, VER1 — 56 bytes).
-/// Not in `libc`, which is generated from a pinned reference; declared here the
-/// way this module declares the Darwin constants.
+/// Not in `libc`, which is generated from a pinned reference.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -363,22 +347,18 @@ const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 ))]
 const FAIR_POLICIES: [u32; 3] = [0, 3, 5];
 
-/// The `sched_attr` that asks for `slice_ns` while changing NOTHING ELSE about
-/// `current` — its policy, nice and priority are carried over. Writing a fresh
-/// `SCHED_OTHER`/nice-0 struct instead would silently reset a user-chosen
-/// `SCHED_BATCH`, reset a privileged negative nice, and — for an aterm started
-/// under `nice` — FAIL outright (lowering nice unprivileged is `EPERM`), so the
-/// slice would never land. `None` for a non-fair policy.
+/// The `sched_attr` that asks for `slice_ns` while changing nothing else about
+/// `current`: its policy, nice and priority are carried over. A fresh
+/// `SCHED_OTHER`/nice-0 struct would reset a user-chosen `SCHED_BATCH`, reset a
+/// privileged negative nice, and for an aterm started under `nice` fail outright
+/// (lowering nice unprivileged is `EPERM`). `None` for a non-fair policy.
 ///
-/// `None`, too, for a NEGATIVE nice. The reset-on-fork this request must carry
-/// (so the slice stops at this thread) also resets a negative nice to 0 in
-/// every thread and process the thread creates afterwards (`sched_fork`), and
-/// the thread asking is the UI thread, which spawns the shells. An aterm the
-/// user started at nice -5 (privileged, `RLIMIT_NICE`, a unit's `Nice=`) would
-/// otherwise hand every shell, and every compiler in it, nice 0 instead of the
-/// -5 it inherited before: exactly the "worse for a niced aterm" this request
-/// must never be. Such a thread already out-ranks its peers; it keeps the
-/// kernel default slice and its inheritance.
+/// `None`, too, for a negative nice. The reset-on-fork this request carries also
+/// resets a negative nice to 0 in every thread and process the thread creates
+/// afterwards (`sched_fork`), and the thread asking is the UI thread, which spawns
+/// the shells: an aterm started at nice -5 would hand every shell nice 0. Such a
+/// thread already out-ranks its peers, so it keeps the default slice and its
+/// inheritance.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -400,11 +380,9 @@ fn slice_request(current: &SchedAttr, slice_ns: u64) -> Option<SchedAttr> {
     })
 }
 
-/// Request `slice_ns` for the CALLING thread (tid 0): read its attributes,
-/// change only the slice ([`slice_request`]), write them back. The error is
-/// returned for the tests; `set_self` discards it for the same reason it
-/// discards macOS's — a scheduling hint must never be the reason a worker
-/// fails.
+/// Request `slice_ns` for the calling thread (tid 0): read its attributes, change
+/// only the slice ([`slice_request`]), write them back. The error is for the tests;
+/// `set_self` discards it, since a scheduling hint must never make a worker fail.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -431,7 +409,7 @@ fn set_self_slice(slice_ns: u64) -> std::io::Result<()> {
     }
 }
 
-/// The CALLING thread's `sched_attr`, read back from the kernel.
+/// The calling thread's `sched_attr`, read back from the kernel.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -456,7 +434,7 @@ fn sched_attr_of_self() -> std::io::Result<SchedAttr> {
     }
 }
 
-/// The slice (ns) and flags the CALLING thread runs with — the Linux twin of
+/// The slice (ns) and flags the calling thread runs with: the Linux twin of
 /// `class_of_self`.
 #[cfg(all(
     target_os = "linux",
@@ -492,7 +470,7 @@ const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 ///
 /// Mirrors [`qos_class`]: a `Background` worker's child runs at UTILITY, the class
 /// the worker's own thread runs at, and a `Housekeeping` worker's at BACKGROUND.
-/// `Interactive` and `Responsive` rank ABOVE the inherited default, and a clamp can
+/// `Interactive` and `Responsive` rank above the inherited default, and a clamp can
 /// only lower a child, so their children are spawned bare.
 const fn child_clamp(role: Role) -> Option<&'static str> {
     match role {
@@ -503,35 +481,28 @@ const fn child_clamp(role: Role) -> Option<&'static str> {
 }
 
 /// A `Command` for `program`, run on behalf of `role`'s work: behind
-/// `taskpolicy -c <clamp>` whenever that work ranks below the inherited default,
-/// so the child — and everything it launches — yields to the program being typed
-/// into. Measured: under `taskpolicy -c utility` a child and its own child both
-/// read pri 20, against 31 spawned bare.
+/// `taskpolicy -c <clamp>` whenever that work ranks below the inherited default, so
+/// the child and everything it launches yield to the program being typed into
+/// (under `taskpolicy -c utility` a child and its own child both read pri 20,
+/// against 31 bare).
 ///
-/// A WRAPPER, NOT A HOOK OF OURS. `taskpolicy` replaces itself with the program
-/// (`POSIX_SPAWN_SETEXEC`), so `Child::id` is the program's own pid and its parent
-/// is aterm: pid-keyed tailers, group kills and `SPAWNER_PID_ENV` checks see exactly
-/// what they saw before. (The `Command` comes from `aterm_uds::spawnfd::command`, so
-/// neither `taskpolicy` nor the program inherits a descriptor of aterm's above stdio,
-/// and on Darwin the spawn is one `posix_spawn`: no fork of the window.)
+/// `taskpolicy` replaces itself with the program (`POSIX_SPAWN_SETEXEC`), so
+/// `Child::id` is the program's own pid and its parent is aterm: pid-keyed tailers,
+/// group kills and `SPAWNER_PID_ENV` checks see what they would bare. Both arms build
+/// through [`aterm_uds::spawnfd::command`], so neither inherits a descriptor of
+/// aterm's above stdio, on Darwin the spawn is one `posix_spawn` (no fork), and on
+/// Windows a console child (an `atpkg.exe` pass) gets a windowless console rather
+/// than a visible window.
 ///
-/// Wrapped only when both ends are real: `taskpolicy` exists and `program` is an
-/// absolute path to an executable file. A missing program under `taskpolicy` is an
-/// exit 66 rather than a spawn error, so such a program is spawned bare and still
-/// fails the way its caller expects.
+/// Wrapped only when `taskpolicy` exists and `program` is an absolute path to an
+/// executable file: a missing program under `taskpolicy` exits 66 rather than
+/// failing the spawn, so such a program is spawned bare and fails as its caller
+/// expects.
 ///
-/// NOT FOR a child whose pid is attested the moment `spawn` returns: until
-/// `taskpolicy` execs the program, that pid is still running taskpolicy's image.
-/// NOT FOR a child that launches an aterm either: the clamp is inherited, and
-/// docs/RELEASING.md measured an aterm under UTILITY starving its paint probe.
-///
-/// NO CONSOLE WINDOW ON WINDOWS. Both arms build through
-/// [`aterm_uds::spawnfd::command`]: the window has no console, and every console
-/// child it started bare — each `atpkg.exe` pass, a Settings ▸ Packages verb, the
-/// daily `machine apply` — got a VISIBLE console window for its whole life
-/// (measured 2026-09-30: 9–18 s per pass, at every launch and update). It gets a
-/// windowless console now, which atpkg's own children (curl, `cmd /C mklink`)
-/// share.
+/// Not for a child whose pid is attested the moment `spawn` returns: until
+/// `taskpolicy` execs the program, that pid runs taskpolicy's image. Nor for a
+/// child that launches an aterm: the clamp is inherited, and docs/RELEASING.md
+/// measured an aterm under UTILITY starving its paint probe.
 pub(crate) fn command(
     role: Role,
     program: impl AsRef<std::path::Path>,
@@ -607,17 +578,14 @@ fn is_executable_file(path: &std::path::Path) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LENDING A WAITER'S URGENCY TO THE WORKER IT WAITS ON.
+// Lending a waiter's urgency to the worker it waits on.
 //
-// A channel donates no priority: a UI-thread caller that waits (bounded) for
-// a `Background` worker to finish what is queued waits on a UTILITY thread
-// the scheduler may run late on a busy Mac. A QoS OVERRIDE (`<pthread/qos.h>`)
-// raises the worker for exactly as long as the dependency stands, leaves the
-// class it requested alone, and may be ended from any thread — so the worker
-// ends it itself once the awaited job is done. libSystem exports, declared
-// here for the reason the next section gives.
-// ---------------------------------------------------------------------------
+// A channel donates no priority: a UI-thread caller that waits (bounded) for a
+// `Background` worker to finish what is queued waits on a UTILITY thread the
+// scheduler may run late on a busy Mac. A QoS override (`<pthread/qos.h>`) raises the
+// worker for as long as the dependency stands, leaves the class it requested alone,
+// and may be ended from any thread, so the worker ends it once the awaited job is
+// done. libSystem exports, declared here for the reason the next section gives.
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn pthread_override_qos_class_start_np(
@@ -628,9 +596,9 @@ unsafe extern "C" {
     fn pthread_override_qos_class_end_np(over: *mut std::ffi::c_void) -> libc::c_int;
 }
 
-/// A worker raised to [`Role::Responsive`] until this drops — carried with
-/// the job it is waited on for, and dropped by the worker once that job is
-/// done. Inert where the platform has no override, or declined one.
+/// A worker raised to [`Role::Responsive`] until this drops: it travels with the job
+/// the caller waits on, and the worker drops it once that job is done. Inert where
+/// the platform has no override or declined one.
 pub(crate) struct Boost {
     #[cfg(target_os = "macos")]
     over: Option<std::ptr::NonNull<std::ffi::c_void>>,
@@ -682,24 +650,14 @@ impl Drop for Boost {
     }
 }
 
-// ---------------------------------------------------------------------------
-// READING A CLASS BACK.
+// Reading a class back off a running thread, the only thing the scheduler reads:
+// the fork guard reads the class it lifts from, and the tests read where a role landed.
 //
-// Until this, nothing in the tree ever observed the class a thread ACTUALLY
-// runs at. `set_self` returns nothing worth branching on, and every QoS test
-// below asserts either this enum's ORDER or the SOURCE TEXT of a spawn site —
-// both of them claims about code. The class is a property of a RUNNING THREAD,
-// and it is the only thing the scheduler reads.
-//
-// None of these symbols is in `libc`: that crate is GENERATED from a pinned
-// reference and asserted item-for-item by its oracle ("Regenerate rather than
-// edit"), so declaring them there would be a hand edit of generated code. All
-// are ordinary libSystem exports (`<sys/qos.h>`, `<pthread/qos.h>`,
-// `<pthread.h>`), declared here.
-//
-// Declared returning `c_uint`, NOT `libc::qos_class_t`: a `repr(u32)` enum
-// return carrying a value outside its six discriminants would be undefined
-// behaviour, so a class read back is compared as a number.
+// None of these symbols is in `libc` (aterm-libc, generated from a pinned reference:
+// regenerate rather than edit); all are ordinary libSystem exports (`<sys/qos.h>`,
+// `<pthread/qos.h>`, `<pthread.h>`), declared here. Declared returning `c_uint`, not
+// `libc::qos_class_t`: a `repr(u32)` enum return carrying a value outside its six
+// discriminants would be undefined behaviour.
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     /// Spelled as `main_thread_probe` declares it: one symbol, one signature.
@@ -716,9 +674,9 @@ unsafe extern "C" {
     fn qos_class_self() -> libc::c_uint;
 }
 
-/// The class and relative priority the CALLING thread has REQUESTED — its own
-/// word, which no override another thread pushes onto it changes — or `None` if
-/// the platform declined to answer.
+/// The class and relative priority the calling thread has requested (its own word,
+/// which no override another thread pushes onto it changes), or `None` if the
+/// platform declined to answer.
 #[cfg(target_os = "macos")]
 fn requested_class_of_self() -> Option<(libc::c_uint, libc::c_int)> {
     let mut class: libc::c_uint = 0;
@@ -729,7 +687,7 @@ fn requested_class_of_self() -> Option<(libc::c_uint, libc::c_int)> {
     (rc == 0).then_some((class, relative))
 }
 
-/// The class the CALLING thread is actually running at.
+/// The class the calling thread is actually running at.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn class_of_self() -> u32 {
     // SAFETY: reads the calling thread's own class. Takes no pointers and
@@ -737,7 +695,7 @@ pub(crate) fn class_of_self() -> u32 {
     unsafe { qos_class_self() }
 }
 
-/// The class ANOTHER thread is actually running at, named by its pthread handle
+/// The class another thread is actually running at, named by its pthread handle
 /// (`std::os::unix::thread::JoinHandleExt::as_pthread_t`), or `None` if the
 /// platform declined to report one.
 #[cfg(all(test, target_os = "macos"))]
@@ -916,11 +874,8 @@ mod tests {
         worker.join().expect("the worker");
     }
 
-    /// THE CLASS, READ OFF A RUNNING THREAD. Every other QoS assertion in this
-    /// crate is about text — this enum's order, or a `set_self` appearing in a
-    /// spawn site's source. None of them can tell whether a worker HAS the class
-    /// its role names. This one declares each role on a real thread and asks the
-    /// kernel what that thread is running at.
+    /// Each role, declared on a real thread, is the class the kernel reports that
+    /// thread running at.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_declared_role_really_lands_on_the_running_thread() {
@@ -957,7 +912,7 @@ mod tests {
         use std::os::unix::process::CommandExt as _;
 
         let (mut probe, probe_end) = std::io::pipe().unwrap();
-        // std's Command on purpose: the probe IS a `pre_exec` in a forked child.
+        // std's Command on purpose: the probe is a `pre_exec` in a forked child.
         let mut command = std::process::Command::new("/usr/bin/true");
         // SAFETY: the probe loads this thread's QoS word (a thread-specific
         // slot) and makes one 4-byte `write`; it allocates nothing and takes
@@ -984,16 +939,12 @@ mod tests {
         u32::from_ne_bytes(class)
     }
 
-    /// A FORK FROM A DEMOTED THREAD RUNS AT THE DEFAULT CLASS, and the thread
-    /// has its own class back once `spawn` returns. Until its exec the forked
-    /// child holds every descriptor aterm has open, and that window is paid at
-    /// the forking thread's class: from a UTILITY thread p50 26 ms / max 431 ms
-    /// at load ~130, against 7 ms / 32 ms from a DEFAULT one
-    /// ([`fork_at_default`]). Read off the fork itself, not timed. A thread at
-    /// or above the default forks at its own class — the guard never lowers —
-    /// which is also what shows the probe reads the forking thread's class
-    /// rather than a constant. Negative control: without the guard a
-    /// `Background` thread forks at UTILITY (0x11).
+    /// A fork from a demoted thread runs at the default class, and the thread has its
+    /// own class back once `spawn` returns ([`fork_at_default`]). Read off the fork,
+    /// not timed. A thread at or above the default forks at its own class (the guard
+    /// never lowers), which also shows the probe reads the forking thread's class.
+    /// Negative control: without the guard a `Background` thread forks at UTILITY
+    /// (0x11).
     #[cfg(target_os = "macos")]
     #[test]
     fn a_fork_runs_at_the_default_class_or_above_and_the_role_comes_back() {
@@ -1025,10 +976,9 @@ mod tests {
         }
     }
 
-    /// The ORDER is the contract: cosmetic work must never outrank the work a
-    /// human is waiting on. Pinned as a test because the roles are assigned at
-    /// ~20 scattered spawn sites, and a wrong one is invisible at the call site
-    /// — it shows up only as latency on a loaded machine.
+    /// The order is the contract: cosmetic work never outranks work a human is
+    /// waiting on. A wrong role is invisible at its spawn site and shows up only as
+    /// latency on a loaded machine.
     #[cfg(target_os = "macos")]
     #[test]
     fn roles_rank_interactive_above_cosmetic_work() {
@@ -1049,7 +999,7 @@ mod tests {
 
     /// The Linux slice map keeps the enum's order: the keystroke path asks for
     /// the shortest slice, the PTY drain a longer one, and nothing below the
-    /// UI thread asks at all (a Linux nice would be inherited by children).
+    /// PTY drain asks at all (a Linux nice would be inherited by children).
     #[test]
     fn only_the_keystroke_path_roles_request_a_linux_slice() {
         let interactive = linux_slice_ns(Role::Interactive).expect("interactive slice");
@@ -1063,11 +1013,10 @@ mod tests {
         assert_eq!(linux_slice_ns(Role::Housekeeping), None);
     }
 
-    /// The slice request changes the slice and NOTHING ELSE: a `nice`d aterm
-    /// keeps its nice (writing 0 back would be an unprivileged nice decrease —
-    /// EPERM, and the slice would never land), a `SCHED_BATCH` thread stays
-    /// batch, and a real-time thread is not touched at all. Negative control:
-    /// the struct the first cut wrote (policy 0, nice 0) differs from it.
+    /// The slice request changes the slice and nothing else: a `nice`d aterm keeps its
+    /// nice (writing 0 back would be an unprivileged nice decrease, `EPERM`), a
+    /// `SCHED_BATCH` thread stays batch, and a real-time thread is not touched.
+    /// Negative control: a fresh policy-0, nice-0 request differs from it.
     #[test]
     fn a_slice_request_carries_policy_and_nice_over() {
         let niced = SchedAttr {
@@ -1117,11 +1066,8 @@ mod tests {
         );
     }
 
-    /// The same, against the real kernel: a thread that was `nice`d to +5 (an
-    /// unprivileged INCREASE, so this needs no rights) still gets its slice
-    /// request accepted, and keeps nice +5. The first cut wrote nice 0 back,
-    /// which the kernel refuses unprivileged, so on a niced aterm the whole
-    /// call failed and the slice never landed.
+    /// The same, against the real kernel: a thread `nice`d to +5 (an unprivileged
+    /// increase) still has its slice request accepted, and keeps nice +5.
     #[cfg(target_os = "linux")]
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
@@ -1142,11 +1088,9 @@ mod tests {
         assert_eq!(attr.sched_nice, 5, "the thread's nice was preserved");
     }
 
-    /// THE SLICE, READ OFF A RUNNING THREAD, and the reset-on-fork that keeps it
-    /// from leaking into a thread (or shell) the declaring thread creates. On a
-    /// kernel older than 6.12 the request is accepted and ignored for a fair
-    /// policy; that is reported, not failed, because the hint degrading to a
-    /// no-op is the designed behaviour there.
+    /// The slice, read off a running thread, and the reset-on-fork that keeps it from
+    /// leaking into a thread (or shell) the declaring thread creates. A pre-6.12
+    /// kernel accepts and ignores the request; that is reported, not failed.
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -1245,8 +1189,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The live contract (2026-09-15): a `Background` child really starts below the
-    /// inherited band (pri 31). Before [`command`], every such child did not.
+    /// A `Background` child really starts below the inherited band (pri 31).
     #[cfg(target_os = "macos")]
     #[test]
     fn a_background_child_starts_below_the_inherited_band() {

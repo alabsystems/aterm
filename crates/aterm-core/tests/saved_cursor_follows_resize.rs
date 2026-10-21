@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The DECSC / 1049 saved cursor follows its text through a resize.
-//!
-//! A full-screen app enters the alternate screen (1049 saves the main-screen
-//! cursor), the window is resized, the app exits (1049 restores it) and the
-//! shell prints its prompt. The resize rewraps or re-seats the saved primary
-//! screen, so a slot left at its pre-resize row and column named other text:
-//! the prompt was drawn over earlier output and the next keystrokes overwrote
-//! it. Every reference terminal moves the slot with its text: xterm
-//! (`AdjustSavedCursor`, cursor.c), Alacritty (`grow_lines`), kitty
-//! (`screen_resize` tracks the saved cursors through `rewrap`), Ghostty
-//! (`Screen.resize` reflows the saved cursor's pin) and WezTerm. aterm now does
-//! too, on the synchronous and the offloaded path, for both slots; a bare DECRC
-//! and the 1049 exit still clamp what they read to the grid.
+//! The DECSC / 1049 saved cursor follows its text through a resize, on the synchronous and
+//! the offloaded path, for both slots. A full-screen app enters the alternate screen (1049
+//! saves the main cursor), the window resizes, the app exits (1049 restores it) and the shell
+//! prints its prompt; the resize rewraps or re-seats the saved primary screen, so a slot left
+//! at its old row and column would put the prompt over earlier output. xterm
+//! (`AdjustSavedCursor`), Alacritty, kitty, Ghostty and WezTerm move the slot with its text
+//! too; a bare DECRC and the 1049 exit still clamp what they read to the grid.
 
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
@@ -207,12 +201,11 @@ fn the_alternate_screens_saved_cursor_follows_a_demoting_shrink() {
     assert_eq!(screen(&term)[3], "r5X", "{:?}", screen(&term));
 }
 
-/// A column a program saved past its output (`abc`, then a move to column 31)
-/// names no cell of the line, only a distance from its start. A width change
-/// keeps that distance where the new width has room (a widening always does)
-/// and clamps it to the last column otherwise, as xterm, which never moves the
-/// slot, restores it. Pulled back to the content's end (the live cursor's
-/// rule), the next glyph landed right after `abc`.
+/// A column a program saved past its output (`abc`, then a move to column 31) names no cell
+/// of the line, only a distance from its start. A width change keeps that distance where the
+/// new width has room and clamps it to the last column otherwise, as xterm, which never
+/// moves the slot, restores it; pulling it back to the content's end (the live cursor's rule)
+/// would put the next glyph right after `abc`.
 #[test]
 fn a_saved_column_past_the_lines_content_keeps_its_distance() {
     for (cols, expected) in [(100u16, 30usize), (60, 30), (20, 19)] {

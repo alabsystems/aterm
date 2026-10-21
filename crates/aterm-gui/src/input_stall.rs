@@ -1,41 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The UNREAD-INPUT GATE (G3): a socket-driven input write into a session
-//! whose program has left earlier input unread is WARNED — written, with
-//! `warn=input-unread input_bytes=<n> input_wait_ms=<ms>` on its `OK` — and
-//! REFUSED `ERR busy input-unread …`, with nothing written, only where
-//! writing is known to be harmful: the program is published STALLED, its job
-//! is STOPPED with input queued, or a published stall is HELD through a drop
-//! aterm made ([`Restart`]).
+//! The unread-input gate: a socket-driven input write into a session whose program has left
+//! earlier input unread is warned (written, with `warn=input-unread input_bytes=<n>
+//! input_wait_ms=<ms>` on its `OK`), and refused `ERR busy input-unread …`, with nothing
+//! written, only where writing is known to be harmful: the program is published stalled, its
+//! job is stopped with input queued, or a published stall is held through a drop aterm made
+//! ([`Restart`]).
 //!
-//! WHY THIS EXISTS (2026-09-24): a Claude Code session froze — 38.8 GiB
-//! resident, still spinning on the CPU, never reading its tty again — with the
-//! owner's Enter sitting unread in the slave's input queue. The in-window
-//! supervisor read an approval box off the screen, and its screen-fenced
-//! `key down` passed every check it had: the screen had not changed, because
-//! the program had stopped drawing, so a fence on the screen can never see
-//! this. The key was queued BEHIND the Enter, and both were read together,
-//! later, against a screen nobody had looked at. The facts that separate a
-//! frozen program from a busy one are in the kernel, not on the screen:
-//! [`aterm_session::sink::SinkWriter::input_backlog`] reads how many bytes the
+//! A frozen program stops drawing, so a screen fence never sees it: a key sent then queues
+//! behind the unread input and is read later against a screen nobody looked at. The facts are
+//! in the kernel: [`aterm_session::sink::SinkWriter::input_backlog`] reads how many bytes the
 //! program has not read and how long the oldest has waited, and
-//! [`aterm_session::input_backlog::gate`] is the rule. The rule is proved
-//! over a bounded model (`aterm_spec::input_unread_gate_model`, machine
-//! `InputUnreadGate`) and bound to a real pty in aterm-session's
+//! [`aterm_session::input_backlog::gate`] is the rule, proved over a bounded model
+//! (`aterm_spec::input_unread_gate_model`) and bound to a real pty in aterm-session's
 //! `conformance_input_unread`.
 //!
-//! WARN, DON'T BLOCK (owner direction, 2026-09-29: "make sure that these …
-//! caps and ceilings are warnings and dynamic and that we're not blocking
-//! when we don't have to"). The first cut refused every write behind raw
-//! input a second old. This machine runs many agents at load averages of 100
-//! to 170, where a healthy Claude Code routinely takes longer than a second to
-//! read, and the refusal blocked every driver of it — other agents, the
-//! harness's own presses — when nothing was wrong. One reading sees the
-//! queue, not the program; the WATCH below looks at the program (is it
-//! spinning, drawing, asleep — against thresholds the machine's load
-//! stretches) and publishes a stall only on that evidence. So a slow read is
-//! a warning the driver can act on, and a refusal waits for the watch.
+//! Warn, don't block: on a loaded machine a healthy program can take more than a second to
+//! read, and one reading sees only the queue. The watch below looks at the program (spinning,
+//! drawing, asleep, against thresholds the machine's load stretches) and publishes a stall only
+//! on that evidence; until then a slow read is a warning the driver can act on.
 //!
 //! WHERE IT IS ASKED: on the SOCKET seams only — last of the input admission
 //! (`control::admit`) every text verb and `feed-bin`/`paste-bin` frame passes,
@@ -122,26 +106,21 @@ impl Admission {
 ///
 /// [`Admission::Warn`] when raw input has waited
 /// [`input_backlog::WARN_AFTER`] and nothing says the program is not
-/// reading: the verb writes, and its `OK` names the backlog — a slow read on
-/// a loaded machine is the driver's to know about, not to be stopped by.
+/// reading: the verb writes, and its `OK` names the backlog.
 ///
 /// [`Admission::Refuse`] only where writing is known to be harmful
 /// ([`input_backlog::gate`]): the foreground job is stopped with input
-/// queued, or the watch has PUBLISHED the program as stalled and its oldest
-/// unread byte is still [`input_backlog::STALL_AFTER`] old — or the
-/// published stall is HELD through a drop aterm made ([`Restart`]), which
-/// needs no unread byte at all: aterm dropped the queue before `signal term`,
-/// and the program the stall was published for still leads the foreground.
-/// Its queue is empty because nothing READ it, and a key sent now queues
-/// into a program that is not reading — where the `claude --continue` typed
-/// after the signal went (whole-branch review, third round, 2026-09-25).
-/// Only a session that has had a discard pays for the timeline read that
-/// asks.
+/// queued, or the watch has published the program as stalled and its oldest
+/// unread byte is still [`input_backlog::STALL_AFTER`] old; or the published
+/// stall is held through a drop aterm made ([`Restart`]), which needs no
+/// unread byte: the queue is empty because aterm dropped it, not because the
+/// program read it, and a key sent now queues into a program that is not
+/// reading. Only a session that has had a discard pays for the timeline read
+/// that asks.
 ///
-/// The foreground job's stop state is read only when bytes are queued, so an
-/// idle session pays for one `tcgetattr` and two ioctls and no process
-/// lookup. A warning or a refusal also wakes the session's input watch, in
-/// case nothing else has.
+/// The job's stop state is read only when bytes are queued, so an idle
+/// session pays one `tcgetattr` and two ioctls. A warning or a refusal also
+/// wakes the session's input watch.
 pub(crate) fn admission(ctx: &SessionCtx, verb: &str, rest: &str, unread_ok: bool) -> Admission {
     gate(ctx, input_of(verb), verb, rest.as_bytes(), unread_ok)
 }
@@ -162,8 +141,7 @@ pub(crate) fn gate(
     let Some(backlog) = ctx.sink.input_backlog() else {
         return Admission::Open;
     };
-    // A `^C` into a cbreak program is SIGINT, not a byte behind the unread
-    // ones (S4 review, 2026-09-24: the gate refused the remedy).
+    // A `^C` into a cbreak program is SIGINT, not a byte behind the unread ones.
     let signals = || {
         written_bytes(verb, args, ctx.modes.keyboard_mode())
             .is_some_and(|bytes| backlog.signals_on_write(&bytes))
@@ -204,19 +182,17 @@ pub(crate) fn gate(
     if decided == Gate::Open || signals() {
         return Admission::Open;
     }
-    // A warning or a refusal WAKES the watch (S6 review, 2026-09-24): input a
-    // second stale that no write through this sink announced — an unseen
-    // writer's, an adopted master's — may have no watch looking at it, and a
-    // refused write never lands to start one. At most once per probe (the
-    // hook's own arming, rearmed by each probe), so a driver retrying never
-    // drives the probe past `PROBE_MIN_GAP`.
+    // A warning or a refusal wakes the watch: input no write through this sink
+    // announced (an unseen writer's, an adopted master's) may have no watch,
+    // and a refused write never lands to start one. At most once per probe
+    // (the hook re-arms at each probe), so a retrying driver never drives the
+    // probe past `PROBE_MIN_GAP`.
     let _ = ctx.sink.wake_input_hook();
     if decided == Gate::Warn {
         return Admission::Warn(warning_text(&backlog));
     }
     // A refused `^C` (a raw program reads it as a byte) names the signal that
-    // interrupts instead (S4 review, 2026-09-24) — the legacy encoding, so a
-    // kitty-mode `ctrl+c` counts too.
+    // interrupts instead; the legacy encoding, so a kitty-mode `ctrl+c` counts.
     let interrupt =
         written_bytes(verb, args, KeyboardMode::default()).as_deref() == Some(b"\x03".as_slice());
     let liveness = if published.is_some() {
@@ -248,11 +224,10 @@ pub(crate) fn refusal(ctx: &SessionCtx, verb: &str, rest: &str, unread_ok: bool)
 }
 
 /// The fields a warned write adds to its `OK`: ` warn=input-unread
-/// input_bytes=<n> input_wait_ms=<ms>` — the `status` field names, so a
-/// driver reads them as it reads `status`, and none a verb's own reply uses
-/// (`seq=`, `dup=`, `skipped`). PURE. `input_bytes=` is every unread input
-/// byte before this write (the kernel's queue plus aterm's spill);
-/// `input_wait_ms=` a lower bound on how long the oldest has waited.
+/// input_bytes=<n> input_wait_ms=<ms>`, the `status` field names, and none a
+/// verb's own reply uses (`seq=`, `dup=`, `skipped`). `input_bytes=` is every
+/// unread input byte before this write (the kernel's queue plus aterm's
+/// spill); `input_wait_ms=` a lower bound on how long the oldest has waited.
 pub(crate) fn warning_text(b: &InputBacklog) -> String {
     format!(
         " warn=input-unread input_bytes={} input_wait_ms={}",
@@ -262,11 +237,11 @@ pub(crate) fn warning_text(b: &InputBacklog) -> String {
 }
 
 /// `resp` with a warned write's fields ([`warning_text`]) at the end of its
-/// FIRST line — additive, like `seq=` before it, so every existing parser
-/// (`OK` prefix, `seq=`, a framed reply's `OK <n>` count, `turn`'s verdict
-/// fields) reads the reply it always read. Only a reply that WROTE: an `ERR`,
-/// an `OK skipped` (a guard that matched nothing) or an `OK dup=1` (an `id=`
-/// already written) wrote nothing now, and is returned unchanged.
+/// first line, additive like `seq=`, so every existing parser (`OK` prefix,
+/// `seq=`, a framed reply's `OK <n>` count, `turn`'s verdict fields) reads the
+/// reply it always read. Only a reply that wrote takes them: an `ERR`, an
+/// `OK skipped` (a guard that matched nothing) or an `OK dup=1` (an `id=`
+/// already written) wrote nothing now and is returned unchanged.
 pub(crate) fn with_warning(resp: String, warning: Option<&str>) -> String {
     let Some(warning) = warning else {
         return resp;
@@ -327,16 +302,15 @@ fn written_bytes(verb: &str, args: &[u8], mode: KeyboardMode) -> Option<Vec<u8>>
 }
 
 /// The refusal line for one reading and its word: `ERR busy input-unread
-/// bytes=<n> wait_ms=<ms> input=<word> (<what is true> ; <the one thing to do>)`.
-/// PURE, so its wording is pinned without a pty. `bytes=` is every unread input
-/// byte (the kernel's queue plus aterm's spill); `wait_ms=` is a lower bound on
-/// how long the oldest has waited. ONE remedy: a stopped job is resumed; a
-/// refused `^C` (`interrupt`) names `signal int`; a published stall is
-/// restarted (the attention line's remedy — a program that lives through it
-/// earns [`held_refusal_text`]'s `signal kill`); input not yet a stall (a
+/// bytes=<n> wait_ms=<ms> input=<word> (<what is true>; <the one thing to do>)`.
+/// Pure. `bytes=` is every unread input byte (the kernel's queue plus aterm's
+/// spill); `wait_ms=` a lower bound on how long the oldest has waited. One
+/// remedy: a stopped job is resumed; a refused `^C` (`interrupt`) names
+/// `signal int`; a published stall is restarted (a program that lives through
+/// it earns [`held_refusal_text`]'s `signal kill`); input not yet a stall (a
 /// word [`admission`] no longer refuses on, kept so the text stays total) is
-/// retried. `unread=ok` stays in `help key`. `restart` is the explicit restart
-/// the window's host would carry for the stalled agent
+/// retried. `unread=ok` is left to `help key`. `restart` is the explicit
+/// restart the window's host would carry for the stalled agent
 /// ([`crate::restart_act::offered`]: `restart pid=<n> if-stalled`), named in
 /// place of `signal term`, whose exit the host reads as the agent's own.
 pub(crate) fn refusal_text(
@@ -365,20 +339,16 @@ pub(crate) fn refusal_text(
     )
 }
 
-/// The refusal line while a stall is HELD through a drop aterm made
+/// The refusal line while a stall is held through a drop aterm made
 /// ([`Restart`]): the same `ERR busy input-unread … input=stalled` shape, so
 /// every driver's back-off and the supervisor's hold read it as they read
-/// the other, with what is true and the one remedy it has come to. PURE.
+/// the other. Pure.
 ///
-/// `held` says which drop ([`Held`]). Only a restart's drop may say a restart
-/// signal was sent: the queue `reset flush` emptied had no signal behind it,
-/// and its refusal once said "the program has not ended since its restart
-/// signal" all the same (robustness review of the manual reset, 2026-09-26),
-/// pointing the reader at `signal kill` for a program never sent SIGTERM. A
-/// restart names `signal kill` once the program has `survived`
-/// [`RESTART_GRACE`] ([`Restart::survived`]), as [`attention_text`] then
-/// does; before that it asks for a retry, while a handler may still be ending
-/// the program, and the attention line keeps its `signal term` words.
+/// `held` says which drop ([`Held`]); only a restart's drop says a restart
+/// signal was sent (a `reset flush` had none behind it). A restart names
+/// `signal kill` once the program has `survived` [`RESTART_GRACE`]
+/// ([`Restart::survived`]), as [`attention_text`] then does; before that it
+/// asks for a retry, while a handler may still be ending the program.
 /// `restart`, as [`refusal_text`]'s: where the host carries the explicit
 /// restart, that is the remedy named (the act ends a survivor itself).
 pub(crate) fn held_refusal_text(
@@ -410,56 +380,46 @@ pub(crate) fn held_refusal_text(
     )
 }
 
-/// Whether a `turn` RE-PRESS would only queue another Enter behind input the
-/// program has not read yet. The re-press exists for an Enter the program READ
-/// and swallowed without drawing; an Enter still sitting in its queue has not
-/// been swallowed, it has not been read, and a second one stacks behind it, to
-/// be read with it, much later, as the incident's queued keys were. Counts the
-/// spill too: bytes aterm has not yet handed the kernel are just as far behind.
-/// `false` with no reading, so a platform that cannot tell keeps its re-press.
+/// Whether a `turn` re-press would only queue another Enter behind input the
+/// program has not read yet. The re-press exists for an Enter the program read
+/// and swallowed without drawing; an Enter still in its queue has not been
+/// read, and a second one stacks behind it. Counts the spill too: bytes aterm
+/// has not yet handed the kernel are just as far behind. `false` with no
+/// reading, so a platform that cannot tell keeps its re-press.
 pub(crate) fn repress_would_queue(sink: &SinkWriter) -> bool {
     sink.input_backlog().is_some_and(|b| b.unread() > 0)
 }
 
-/// Before `signal term|kill|hup|quit` reaches the PTY's foreground job, DROP
-/// the input it left unread, when that input can only have been meant for
-/// it: the tty is in raw or cbreak mode (the program, not the line
-/// discipline, owns every key typed there), or the job is stopped. Returns
-/// what was dropped, `None` when nothing was (another signal, canonical
-/// type-ahead, nothing unread, no reading — off macOS or off a tty).
+/// Before `signal term|kill|hup|quit` reaches the PTY's foreground job, drop
+/// the input it left unread when that input can only have been meant for it:
+/// the tty is in raw or cbreak mode (the program, not the line discipline,
+/// owns every key typed there), or the job is stopped. Returns what was
+/// dropped; `None` when nothing was (another signal, canonical type-ahead,
+/// nothing unread, or no reading, as off macOS or off a tty).
 ///
-/// WHY (whole-branch review, 2026-09-25): `signal term` is the remedy the
-/// server's attention line, the band, the menu row and the refusal all name
-/// for a frozen program, and the window keyboard is never gated — a person
-/// who kept typing into a frozen Claude Code builds up complete lines in its
-/// queue. The queue outlives the program: reproduced on a pty, `zsh -f -i`
-/// running a raw-mode program that stopped reading, a line typed into it,
-/// SIGTERM to the job — zsh took the tty back and RAN the line as a command.
-/// Reading the screen first cannot help; the shell reads the queue the
-/// moment it gets the terminal. So the remedy drops those keys itself.
+/// The queue outlives the program: after SIGTERM to a raw-mode program that
+/// stopped reading, the shell takes the tty back and runs a line typed into it
+/// as a command. The window keyboard is never gated, so a person typing into
+/// a frozen program builds up such lines, and reading the screen first cannot
+/// help.
 ///
-/// WHAT IT KEEPS: canonical input — complete lines typed during a shell
-/// command are the SHELL's type-ahead (`sleep 30`, then `ls` typed ahead),
-/// and the flush would also take the partial line FIONREAD cannot count.
-/// `int` keeps everything: it is the program's own interrupt, and a program
-/// that survives it (a REPL, Claude Code's first ^C) reads what follows.
-/// `cont` resumes a job that reads its queue itself; `tstp` hands the tty to
-/// the shell with the job alive to come back to.
+/// Canonical input is kept: complete lines typed during a shell command are
+/// the shell's type-ahead, and the flush would also take the partial line
+/// FIONREAD cannot count. `int` keeps everything (a program that survives its
+/// own interrupt reads what follows); `cont` resumes a job that reads its
+/// queue itself; `tstp` hands the tty to the shell with the job alive.
 ///
-/// Dropped BEFORE the signal, while the program still owns the tty: after
-/// it, the shell may already be reading. Everything the program left unread
-/// goes, not only the kernel's queue: the spill aterm holds behind a full
-/// queue, and the rest of any frame a writer is still handing the kernel
-/// ([`SinkWriter::discard_unread_input`]). The first cut of this remedy
-/// flushed the kernel queue alone. Its reply said `discarded=1022 left=96`,
-/// and the sink's drainer then slept on the flushed queue for good, so every
-/// later key queued behind the 96 and the session was deaf (whole-branch
-/// review, second round, 2026-09-25). The count is every byte dropped.
+/// Dropped before the signal, while the program still owns the tty: after it
+/// the shell may already be reading. Everything unread goes, not only the
+/// kernel's queue: the spill aterm holds behind a full queue and the rest of
+/// any frame a writer is still handing the kernel
+/// ([`SinkWriter::discard_unread_input`]); flushing the kernel queue alone
+/// leaves the sink's drainer asleep on it and the session deaf. The count is
+/// every byte dropped.
 ///
-/// A DROP IS NOT A READ (third round, 2026-09-25): the queue this empties is
-/// what a recovered program leaves too, so a published stall remembers the
-/// sink's discard count and is held, not withdrawn, while its program lives
-/// through the signal ([`Restart`]).
+/// A drop is not a read: a published stall remembers the sink's discard count
+/// and is held, not withdrawn, while its program lives through the signal
+/// ([`Restart`]).
 #[cfg(unix)]
 pub(crate) fn discard_before_signal(
     master: i32,
@@ -475,13 +435,12 @@ pub(crate) fn discard_before_signal(
     if echo.canonical && !fg_stopped(master) {
         return None;
     }
-    // The drop runs on an EMPTY queue too: it is also the mark that this
+    // The drop runs on an empty queue too: it is also the mark that this
     // signal was sent ([`Discard::Restart`] moves the restart count the
-    // watch's hold and [`RESTART_GRACE`] read). Skipping it when nothing was
-    // queued — after a `reset flush`, or a stall entered on a queue since read
-    // — left a program that ignores SIGTERM on "restart it: … signal term"
-    // for good (review of the manual reset, 2026-09-27). The reply still
-    // names a count only when bytes were dropped.
+    // watch's hold and [`RESTART_GRACE`] read). Without it a program that
+    // ignores SIGTERM after a `reset flush`, or after a stall entered on a
+    // queue since read, stays on "restart it: … signal term" for good. The
+    // reply names a count only when bytes were dropped.
     let dropped = sink.discard_unread_input(aterm_session::sink::Discard::Restart);
     if unread.queued == 0 && unread.spilled == Some(0) {
         return dropped.filter(|n| *n > 0);
@@ -490,7 +449,7 @@ pub(crate) fn discard_before_signal(
 }
 
 /// After `signal term|kill|hup|quit` has been sent: wake the session's input
-/// watch, so it looks NOW rather than at its next [`RECHECK`]: a stall whose
+/// watch, so it looks now rather than at its next [`RECHECK`]: a stall whose
 /// program is living through the signal is held from that probe, and
 /// [`RESTART_GRACE`] counts from it ([`Restart`]). The wake is the one the
 /// sink's writes share ([`SinkWriter::wake_input_hook`]), so it never
@@ -503,9 +462,9 @@ pub(crate) fn after_signal(sink: &SinkWriter, sig: libc::c_int) {
     }
 }
 
-/// Whether `sig` is a RESTART signal: `term`, `kill`, `hup` or `quit`, the
-/// signals that end the program a stall's remedy restarts — the ones the
-/// `signal` verb (and the explicit `restart`) drops unread input before
+/// Whether `sig` is a restart signal: `term`, `kill`, `hup` or `quit`, the
+/// signals that end the program a stall's remedy restarts, which the `signal`
+/// verb (and the explicit `restart`) drops unread input before
 /// ([`discard_before_signal`]) and wakes the watch after ([`after_signal`]).
 #[cfg(unix)]
 pub(crate) fn is_restart_signal(sig: libc::c_int) -> bool {
@@ -592,13 +551,10 @@ pub(crate) fn pid_stopped(pid: libc::pid_t) -> Option<bool> {
 }
 
 /// `struct proc_taskinfo` (`<sys/proc_info.h>`), which aterm-libc does not
-/// declare: six `u64` then twelve `i32`, 96 bytes — measured on Darwin 25.6
-/// (`proc_pidinfo(pid, PROC_PIDTASKINFO)` returns 96) and the layout the libc
-/// crate's `apple` module carries. The resident size and the total CPU times
-/// are read; the times are in MACH ABSOLUTE TIME units, not nanoseconds
-/// (measured 2026-09-25 on this Mac: a process spinning one core for 2.005 s
-/// of wall time gained 45.9 M user ticks, which the 125/3 timebase makes
-/// 1.91 s) — [`pid_cpu_ns`] converts them.
+/// declare: six `u64` then twelve `i32`, 96 bytes (what `proc_pidinfo(pid,
+/// PROC_PIDTASKINFO)` returns on Darwin 25.6, and the libc crate's `apple`
+/// layout). The CPU times are in mach absolute time units, not nanoseconds;
+/// [`pid_cpu_ns`] converts them.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct ProcTaskInfo {
@@ -610,50 +566,30 @@ struct ProcTaskInfo {
     _counters: [i32; 12],
 }
 
-/// `struct mach_timebase_info` (`<mach/mach_time.h>`): mach absolute time
-/// units times `numer / denom` is nanoseconds.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MachTimebaseInfo {
-    numer: u32,
-    denom: u32,
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    /// Declared here: aterm-libc does not export it.
-    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
-}
-
 #[cfg(target_os = "macos")]
 const _: () = assert!(std::mem::size_of::<ProcTaskInfo>() == 96);
 
 /// `pid`'s resident set in MiB from `proc_pidinfo(PROC_PIDTASKINFO)`, read
 /// only when the kernel wrote exactly one whole record. A same-uid, non-parent
-/// reader is allowed (measured on the incident's process).
+/// reader is allowed.
 #[cfg(target_os = "macos")]
 pub(crate) fn pid_rss_mb(pid: libc::pid_t) -> Option<u64> {
     pid_task_info(pid).map(|info| info.resident_size / (1024 * 1024))
 }
 
-/// `pid`'s total CPU time, user plus system, in nanoseconds — the liveness
-/// half of a stall ([`Liveness::Watched`]'s `spinning`): the incident's
-/// frozen program burned ~380% CPU while it read nothing, where `less` on a
-/// slow pipe or zsh inside a completion sleeps. `None` when the record or
-/// the timebase cannot be read.
+/// `pid`'s total CPU time, user plus system, in nanoseconds: the liveness
+/// half of a stall ([`Liveness::Watched`]'s `spinning`), since a frozen
+/// program can spin while it reads nothing, where `less` on a slow pipe or zsh
+/// inside a completion sleeps. The ticks are scaled by the kernel's timebase
+/// ([`aterm_sysprobe::procs::kernel_timebase`]), not this process's own, which
+/// is 1/1 under Rosetta. `None` when the record or the timebase cannot be
+/// read.
 #[cfg(target_os = "macos")]
 pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
-    static TIMEBASE: std::sync::OnceLock<Option<(u128, u128)>> = std::sync::OnceLock::new();
-    let (numer, denom) = (*TIMEBASE.get_or_init(|| {
-        let mut base = MachTimebaseInfo { numer: 0, denom: 0 };
-        // SAFETY: `base` is a live, writable `mach_timebase_info` record; the
-        // call only fills it.
-        let rc = unsafe { mach_timebase_info(&raw mut base) };
-        (rc == 0 && base.denom != 0).then_some((u128::from(base.numer), u128::from(base.denom)))
-    }))?;
+    let (numer, denom) = aterm_sysprobe::procs::kernel_timebase()?;
     let info = pid_task_info(pid)?;
     let ticks = u128::from(info.total_user) + u128::from(info.total_system);
-    u64::try_from(ticks * numer / denom).ok()
+    u64::try_from(ticks * u128::from(numer) / u128::from(denom)).ok()
 }
 
 /// `proc_pidinfo(pid, PROC_PIDTASKINFO)`, read only when the kernel wrote
@@ -742,10 +678,10 @@ pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
 // THE WATCH (G1, and the server half of G2): publishing a stall.
 // ---------------------------------------------------------------------------
 
-/// The attention owner the SERVER writes a stall under (`meta attention_owner=
+/// The attention owner the server writes a stall under (`meta attention_owner=
 /// aterm`). A keyed entry, so it outranks an older supervisor badge while the
 /// stall stands (the most recent write wins) and uncovers it again when the
-/// stall clears — the supervisor's entry is never touched.
+/// stall clears; the supervisor's entry is never touched.
 pub(crate) const SERVER_ATTENTION_OWNER: &str = "aterm";
 
 /// The cadence of a probe that has nothing sooner to wait for: a stall or a
@@ -755,10 +691,10 @@ pub(crate) const SERVER_ATTENTION_OWNER: &str = "aterm";
 /// unread output, keeps from entering the stall.
 pub(crate) const RECHECK: Duration = Duration::from_secs(5);
 
-/// The least time between two probes of one session asked for by a WAKE (the
-/// input hook, the session's own output) rather than by its deadline: an
-/// output flood from an armed session costs one probe a quarter second, never
-/// one per burst.
+/// The least time between two probes of one session asked for by a wake (the
+/// input hook, the session's own output) rather than by its deadline: an output
+/// flood from an armed session costs one probe a quarter second, never one per
+/// burst.
 pub(crate) const PROBE_MIN_GAP: Duration = Duration::from_millis(250);
 
 /// The least wall time a CPU reading of the foreground leader is compared
@@ -766,11 +702,11 @@ pub(crate) const PROBE_MIN_GAP: Duration = Duration::from_millis(250);
 /// window's verdict rather than judging a quarter second of scheduling.
 pub(crate) const SPIN_WINDOW: Duration = Duration::from_secs(1);
 
-/// What one probe saw of the PROGRAM, beside its input queue — the evidence
-/// [`InputWatches::step`] folds into [`Liveness::Watched`] (whole-branch
-/// review, 2026-09-25: an old unread byte alone published `less` on a slow
-/// pipe, zsh inside a slow completion and a cbreak progress line as frozen)
-/// — and whether aterm itself has dropped its input since ([`Restart`]).
+/// What one probe saw of the program beside its input queue (the evidence
+/// [`InputWatches::step`] folds into [`Liveness::Watched`], since an old unread
+/// byte alone also describes `less` on a slow pipe, zsh inside a slow
+/// completion and a cbreak progress line), and whether aterm itself has dropped
+/// its input since ([`Restart`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Activity {
     /// The foreground group leader and its total CPU time in nanoseconds
@@ -785,7 +721,7 @@ pub(crate) struct Activity {
     /// ([`SinkWriter::restart_discards`]); a `reset flush` moves `discards`
     /// alone ([`Restart::restarted`]).
     pub(crate) restarts: u64,
-    /// The program has READ input accepted after aterm's last discard
+    /// The program has read input accepted after aterm's last discard
     /// ([`SinkWriter::read_since_discard`]). Asked only while a stall is
     /// published, the one case that needs it ([`Restart`]).
     pub(crate) read_since_discard: bool,
@@ -838,47 +774,27 @@ pub(crate) fn machine_contention() -> Contention {
 /// never runs does not end at all.
 pub(crate) const RESTART_GRACE: Duration = Duration::from_secs(5);
 
-/// What a published stall keeps so that a RESTART is not taken for a
-/// recovery (whole-branch review, third round, 2026-09-25).
+/// What a published stall keeps so that a restart is not taken for a recovery.
 ///
-/// `signal term` drops the input a frozen program left unread before it
-/// signals ([`discard_before_signal`]), so the next probe finds the queue
-/// empty — exactly what a program that read its input looks like — and the
-/// watch took it for that. It withdrew the whole publication
-/// (`agent=wall:unresponsive`, the server's attention, the band and the menu
-/// row, the supervisor's hold) from a program that never ended: a spinning
-/// Node program with a SIGTERM listener. The listener replaces the default
-/// action, and only the JS thread runs it — the thread that is spinning.
-/// Measured on a headless instance: `status` read `input=clear` 15 s after
-/// `OK signalled … discarded=1` while `ps` showed the program still at 90%
-/// CPU, and the `claude --continue` typed next queued into it. Claude Code
-/// registers such listeners, and the incident's process was busy on its main
-/// thread (`ps -M`). Nothing named `signal kill`.
-///
-/// So a stall is HELD while aterm, not the program, emptied its queue
+/// `signal term` drops the input a frozen program left unread before it signals
+/// ([`discard_before_signal`]), so the next probe finds the queue empty,
+/// exactly as for a program that read its input; yet a program whose SIGTERM
+/// handler runs only on its spinning thread (a Node listener, say) never ends.
+/// So a stall is held while aterm, not the program, emptied its queue
 /// ([`Self::dropped`]) and the leader it was published for still leads the
 /// foreground group: `status input=stalled` (`input_bytes=0`: the keys were
-/// dropped, never read), the publication standing, and every input-writing
-/// verb refused ([`refusal`]). A leader still there [`RESTART_GRACE`] after
-/// the drop has SURVIVED, and the attention line, the menu row and the band
-/// name `signal kill`.
+/// dropped, never read), the publication standing, and every input-writing verb
+/// refused ([`refusal`]). A leader still there [`RESTART_GRACE`] after the drop
+/// has survived, and the attention line, the menu row and the band name
+/// `signal kill`.
 ///
-/// A `reset flush` IS A DROP, NOT A RESTART (robustness review of the manual
-/// reset, 2026-09-26). The flush empties the same queue with the same sink
-/// call, and this record used to read every moved discard count as the
-/// restart signal's drop. Reproduced on a headless instance: a spinning
-/// python3 program published `input=stalled input_bytes=433`, `reset flush`
-/// answered `discarded=433` with no `signal` verb sent, and five seconds
-/// later its line read "Python is still running after its restart signal …
-/// end it: … signal kill", with `send x` refused "(the program has not ended
-/// since its restart signal …)". A supervisor acting on that line SIGKILLs a
-/// program that never got SIGTERM. So the sink counts the two drops apart
-/// ([`aterm_session::sink::Discard`]): any drop HOLDS the stall
-/// ([`Self::dropped`]) — the flushed queue is no more a read than the
-/// restart's — but only a restart's starts [`RESTART_GRACE`]
-/// ([`Self::restarted`]), and only it may end in `survived`. A stall held
-/// through a flush alone keeps its frozen line and its `signal term` remedy,
-/// and its refusal says `reset flush` dropped the input ([`Held::Flush`]).
+/// A `reset flush` is a drop, not a restart: the sink counts the two apart
+/// ([`aterm_session::sink::Discard`]). Any drop holds the stall
+/// ([`Self::dropped`]), but only a restart's starts [`RESTART_GRACE`]
+/// ([`Self::restarted`]) and may end in `survived`, so a program never sent
+/// SIGTERM is never told `signal kill`. A stall held through a flush alone
+/// keeps its frozen line and its `signal term` remedy, and its refusal says
+/// `reset flush` dropped the input ([`Held::Flush`]).
 ///
 /// The hold ends, and the episode with it, on the first sign that the program
 /// is alive ([`InputWatches::step`]):
@@ -886,28 +802,16 @@ pub(crate) const RESTART_GRACE: Duration = Duration::from_secs(5);
 /// - its leader stops leading: the program ended and the shell took the
 ///   terminal back;
 /// - it draws after the drop;
-/// - it READS a byte sent after the drop ([`SinkWriter::read_since_discard`],
-///   told only on a raw tty, where the driver eats no byte itself — a cbreak
+/// - it reads a byte sent after the drop ([`SinkWriter::read_since_discard`],
+///   told only on a raw tty, where the driver eats no byte itself; a cbreak
 ///   program's `^C` leaves the queue unread);
-/// - or it was spinning when the hold began, a later window judges it NOT
-///   spinning, and nothing sent since has waited
-///   [`input_backlog::WARN_AFTER`] unread ([`input_backlog::lagging`]).
+/// - or it was spinning when the hold began, a later window judges it not
+///   spinning, and nothing sent since has waited [`input_backlog::WARN_AFTER`]
+///   unread ([`input_backlog::lagging`]).
 ///
-/// WHY THE LAST TWO (whole-branch review, fourth round, 2026-09-25). The hold
-/// used to end only on the first two. A program that lived through `signal
-/// term` and then recovered stayed published as frozen for good if it was
-/// asleep in `read`, read every key sent to it and drew nothing. Its status
-/// read `input=stalled`, its line read `… still running after its restart
-/// signal, not reading input … end it: signal kill`, and every input verb was
-/// refused, all while it was reading. The reviewer measured this on a
-/// headless instance with a Python fixture that ignored SIGTERM, spun for
-/// 25 s, then read without drawing. Two facts the hold did not check said the
-/// program was alive. The spin was the evidence the stall was entered on, and
-/// it had stopped. A byte sent with `unread=ok` was read at once. The
-/// incident's program keeps spinning and reads nothing, so it stays held. A
-/// program that stopped spinning but leaves new input unread is not reading,
-/// so it stays held too. One that was asleep when the hold began has no spin
-/// to stop, so only a read, a draw or its end lets it go.
+/// A program still spinning and reading nothing stays held, and so does one
+/// that stopped spinning but leaves new input unread. One asleep when the hold
+/// began has no spin to stop, so only a read, a draw or its end lets it go.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Restart {
     /// The foreground group leader the stall was published for, from the
@@ -918,7 +822,7 @@ pub(crate) struct Restart {
     /// The sink's discard count at entry ([`SinkWriter::discards`]): one that
     /// has moved since means aterm dropped the queue.
     pub(crate) discards: u64,
-    /// The sink's RESTART discard count at entry
+    /// The sink's restart discard count at entry
     /// ([`SinkWriter::restart_discards`]): one that has moved since means the
     /// drop was a restart signal's, and starts [`RESTART_GRACE`].
     pub(crate) restarts: u64,
@@ -929,7 +833,7 @@ pub(crate) struct Restart {
 }
 
 impl Restart {
-    /// Whether aterm has DROPPED the queue of a stall published with this
+    /// Whether aterm has dropped the queue of a stall published with this
     /// record: it knows the stall's leader, and the sink's discard count
     /// (`discards`) has moved since entry. The hold then stands while that
     /// leader leads and shows no sign of life ([`InputWatches::step`]).
@@ -937,17 +841,17 @@ impl Restart {
         self.leader.is_some() && discards != self.discards
     }
 
-    /// Whether one of those drops was a RESTART's — the one before `signal
-    /// term|kill|hup|quit` ([`discard_before_signal`]) — and not only
-    /// `reset flush`'s: the sink's restart count (`restarts`) has moved
-    /// since entry. Only then does [`RESTART_GRACE`] run, and only then may
-    /// the stall be called survived.
+    /// Whether one of those drops was a restart's (the one before
+    /// `signal term|kill|hup|quit`, [`discard_before_signal`]) and not only
+    /// `reset flush`'s: the sink's restart count (`restarts`) has moved since
+    /// entry. Only then does [`RESTART_GRACE`] run, and only then may the stall
+    /// be called survived.
     pub(crate) fn restarted(&self, restarts: u64) -> bool {
         self.leader.is_some() && restarts != self.restarts
     }
 }
 
-/// Which drop a published stall is HELD through NOW ([`held_now`]), for the
+/// Which drop a published stall is held through now ([`held_now`]), for the
 /// refusal's words ([`held_refusal_text`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Held {
@@ -957,18 +861,19 @@ pub(crate) enum Held {
     Flush,
 }
 
-/// Whether `fact`'s hold stands NOW against `sink`, as far as one reading
-/// can tell, and through which drop ([`Held`]). `status` and the refusal need this without waiting for
-/// the watch's next probe: a driver's `send` right behind its `signal term`
-/// is exactly the key that must not queue into the program. The discard count
-/// is checked first, so an ordinary reading pays for no process lookup.
+/// Whether `fact`'s hold stands now against `sink`, as far as one reading can
+/// tell, and through which drop ([`Held`]). `status` and the refusal need this
+/// without waiting for the watch's next probe: a driver's `send` right behind
+/// its `signal term` is exactly the key that must not queue into the program.
+/// The discard count is checked first, so an ordinary reading pays for no
+/// process lookup.
 ///
-/// One reading sees a READ since the drop ([`SinkWriter::read_since_discard`])
+/// One reading sees a read since the drop ([`SinkWriter::read_since_discard`])
 /// and the leader, but not the spin window or a draw, which only the watch
-/// sees. A read lets the hold go here at once, and WAKES the watch so the
+/// sees. A read lets the hold go here at once and wakes the watch, so the
 /// publication follows within a turn instead of at its next [`RECHECK`]. The
-/// wake shares the hook's arming, so a driver polling `status` adds at most
-/// one probe per probe.
+/// wake shares the hook's arming, so a driver polling `status` adds at most one
+/// probe per probe.
 fn held_now(fact: &InputStallFact, sink: &SinkWriter) -> Option<Held> {
     // The restart count first: a restart bumps both counts at once, so one
     // seen moved here is seen moved in `discards` below.
@@ -987,21 +892,20 @@ fn held_now(fact: &InputStallFact, sink: &SinkWriter) -> Option<Held> {
     })
 }
 
-/// Fold one CPU reading into a watch's window: `mark` is the reading the
-/// window started at (leader, instant, CPU ns), `spinning` the last verdict.
-/// A window of at least [`SPIN_WINDOW`] is judged — spinning when the leader
-/// burned at least half of what one runnable thread can get across it
-/// ([`Contention::fair_share_ns`]: half a core on an idle machine, half a
-/// tenth of one at a load of 190 on 18 CPUs) — and restarts at this reading;
-/// a shorter one keeps its mark and its verdict. A new leader (the foreground
-/// job changed) or no reading restarts the window with no verdict.
+/// Fold one CPU reading into a watch's window: `mark` is the reading the window
+/// started at (leader, instant, CPU ns), `spinning` the last verdict. A window
+/// of at least [`SPIN_WINDOW`] is judged, spinning when the leader burned at
+/// least half of what one runnable thread can get across it
+/// ([`Contention::fair_share_ns`]: half a core on an idle machine, half a tenth
+/// of one at a load of 190 on 18 CPUs), and restarts at this reading; a shorter
+/// one keeps its mark and its verdict. A new leader (the foreground job
+/// changed) or no reading restarts the window with no verdict.
 ///
-/// WHY RELATIVE (live run, 2026-09-29, load 186-197 on 18 CPUs): a raw-mode
-/// program spinning one core and never reading was never published in ten
-/// minutes. It got about a tenth of a core, failed a flat half-core test,
-/// and was judged a sleeper — whose threshold the load had stretched to 50
-/// minutes. A sleeper (`less` on a slow pipe, zsh in a completion) burns a
-/// few milliseconds a minute, far under any share this allows.
+/// Relative, not a flat half core: under heavy load a program spinning one core
+/// gets about a tenth of one, and would be judged a sleeper whose threshold the
+/// load has stretched to most of an hour. A real sleeper (`less` on a slow
+/// pipe, zsh in a completion) burns a few milliseconds a minute, far under any
+/// share this allows.
 fn spin_window(
     mark: Option<(i32, Instant, u64)>,
     spinning: bool,
@@ -1029,31 +933,27 @@ fn spin_window(
     }
 }
 
-/// One session's PUBLISHED input stall: its program has left raw-mode input
+/// One session's published input stall: its program has left raw-mode input
 /// unread past [`input_backlog::STALL_AFTER`], stretched by the machine's
-/// [`Contention`], while seen spinning and silent (or asleep past the
-/// stretched [`input_backlog::QUIET_STALL_AFTER`]) ([`InputWord::Stalled`]),
-/// or its job is stopped with input queued ([`InputWord::Stopped`]). Only a
-/// published stall (or stop) refuses socket input ([`admission`]).
+/// [`Contention`], while seen spinning and silent (or asleep past the stretched
+/// [`input_backlog::QUIET_STALL_AFTER`]) ([`InputWord::Stalled`]), or its job
+/// is stopped with input queued ([`InputWord::Stopped`]). Only a published
+/// stall (or stop) refuses socket input ([`admission`]).
 ///
-/// WHY THE SERVER PUBLISHES IT (2026-09-24): the incident's frozen Claude Code
-/// held the owner's Enter for 2h41m while the in-window supervisor re-read an
-/// unmoving approval box and re-raised "answer this box" — the one badge that
-/// was wrong, because the box could not be answered by anyone. A frozen
-/// program's screen does not move, so every screen reader keeps its last
-/// verdict for ever; the unread byte in the kernel's queue is the fact that
-/// moved. A supervisor-written "frozen" badge would go stale the moment the
-/// program recovered (nothing would clear it) — so aterm writes and clears it
-/// ITSELF, in lockstep with the probe: `status agent=wall:unresponsive` for an
-/// identified agent, a keyed attention entry owned by [`SERVER_ATTENTION_OWNER`]
-/// for every program, and the presence refresh that carries both to the band,
-/// the rim and the menu.
+/// The server publishes it because a frozen program's screen does not move, so
+/// every screen reader keeps its last verdict for ever; the unread byte in the
+/// kernel's queue is the fact that moves. A supervisor-written "frozen" badge
+/// would go stale the moment the program recovered, so aterm writes and clears
+/// it itself, in lockstep with the probe: `status agent=wall:unresponsive` for
+/// an identified agent, a keyed attention entry owned by
+/// [`SERVER_ATTENTION_OWNER`] for every program, and the presence refresh that
+/// carries both to the band, the rim and the menu.
 ///
-/// Fixed at ENTRY: `since` dates the oldest unread byte, and `bytes` and
-/// `rss_mb` are what they were when the stall was published (the RSS is read
-/// once per episode — the incident's program was 38.8 GiB resident), and so
-/// are the leader and the discard count its [`Restart`] is judged against.
-/// The live numbers are `status input_bytes= input_wait_ms= fg_rss_mb=`.
+/// Fixed at entry: `since` dates the oldest unread byte, `bytes` and `rss_mb`
+/// are what they were when the stall was published (the RSS is read once per
+/// episode), and so are the leader and the discard count its [`Restart`] is
+/// judged against. The live numbers are
+/// `status input_bytes= input_wait_ms= fg_rss_mb=`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InputStallFact {
     /// [`InputWord::Stalled`] or [`InputWord::Stopped`].
@@ -1097,10 +997,10 @@ pub(crate) struct InputStallFact {
 pub(crate) struct StallAct {
     /// As a person runs it: `aterm ctl @<sid> restart pid=<n> if-stalled`.
     pub(crate) cmd: String,
-    /// Its exit is relaunched on the agent's own conversation, PROMISED
+    /// Its exit is relaunched on the agent's own conversation, promised
     /// ([`crate::restart_act::Offer::promised`]): the words go on "; aterm
-    /// relaunches it on its conversation" ([`AfterRestart::Relaunch`]).
-    /// `false` for a Codex: the act alone ([`AfterRestart::Act`]).
+    /// relaunches it on its conversation" ([`AfterRestart::Relaunch`]). `false`
+    /// for a Codex: the act alone ([`AfterRestart::Act`]).
     pub(crate) promised: bool,
 }
 
@@ -1143,18 +1043,18 @@ struct InputWatch {
     /// was spinning then and is judged not spinning later has stopped
     /// spinning since.
     dropped: Option<(Instant, bool)>,
-    /// The probe that first found one of those drops to be a RESTART's
+    /// The probe that first found one of those drops to be a restart's
     /// ([`Restart::restarted`]). [`RESTART_GRACE`] counts from here, not from
     /// `dropped`: a `reset flush` that came first holds the stall without
     /// starting the grace, and the `signal term` after it starts it.
     restarted: Option<Instant>,
 }
 
-/// Every session's input watch. A session is watched from the first probe
-/// that finds input unread until one finds nothing unread with nothing
-/// published — so an IDLE machine arms nothing: no entry, no deadline, and the
-/// only thing that starts a watch is the sink's input hook firing on a write
-/// that landed (`Wake::InputWatch`).
+/// Every session's input watch. A session is watched from the first probe that
+/// finds input unread until one finds nothing unread with nothing published, so
+/// an idle machine arms nothing: no entry, no deadline, and the only thing that
+/// starts a watch is the sink's input hook firing on a write that landed
+/// (`Wake::InputWatch`).
 ///
 /// Each probe decides the next ([`Self::step`]):
 ///
@@ -1170,11 +1070,11 @@ pub(crate) struct InputWatches {
 }
 
 impl InputWatches {
-    /// Fold one probe of session `id` — `backlog` its reading (`None` = no
-    /// reading), `stopped` its foreground job's stop state, `activity` what
-    /// the program itself did — into the watch, and say what the publication
-    /// must do and when the next probe is owed. PURE (no clock, no syscall):
-    /// `rss` is asked only on ENTRY to a stall.
+    /// Fold one probe of session `id` (`backlog` its reading, `None` = no
+    /// reading; `stopped` its foreground job's stop state; `activity` what the
+    /// program itself did) into the watch, and say what the publication must do
+    /// and when the next probe is owed. Pure (no clock, no syscall): `rss` is
+    /// asked only on entry to a stall.
     ///
     /// The watch keeps the leader's CPU window across probes ([`spin_window`])
     /// and hands [`input_backlog::classify`] what it saw: `drew` when output
@@ -1184,13 +1084,13 @@ impl InputWatches {
     /// so a stall is entered on a later one — the one at the stretched
     /// [`input_backlog::STALL_AFTER`], which the first schedules.
     ///
-    /// A published stall whose queue aterm DROPPED — the discard before a
-    /// restart signal — while its leader still leads stays `stalled` whatever
-    /// the queue holds ([`Restart`]); past [`RESTART_GRACE`] it is
-    /// republished as survived. The first sign of life ends the EPISODE: the
-    /// leader goes, draws, reads what was sent after the drop, or stops
-    /// spinning with nothing left unread. The stall is withdrawn, and what is
-    /// unread then is judged as a new episode's, with no carry-over.
+    /// A published stall whose queue aterm dropped (the discard before a
+    /// restart signal) while its leader still leads stays `stalled` whatever
+    /// the queue holds ([`Restart`]); past [`RESTART_GRACE`] it is republished
+    /// as survived. The first sign of life ends the episode: the leader goes,
+    /// draws, reads what was sent after the drop, or stops spinning with
+    /// nothing left unread. The stall is withdrawn, and what is unread then is
+    /// judged as a new episode's, with no carry-over.
     pub(crate) fn step(
         &mut self,
         id: u64,
@@ -1213,10 +1113,10 @@ impl InputWatches {
         let mut was = prior.and_then(|w| w.published);
         let wait = backlog.map_or(Duration::ZERO, |b| b.wait);
         let since = now.checked_sub(wait).unwrap_or(now);
-        // THE RESTART HOLD ([`Restart`]): a queue aterm dropped is not a queue
+        // The restart hold ([`Restart`]): a queue aterm dropped is not a queue
         // the program read. Taken at the first probe that sees the drop (its
-        // instant, and whether the leader was spinning then), and let go on
-        // the first sign the program is alive. `Some(None)` is that sign.
+        // instant, and whether the leader was spinning then), and let go on the
+        // first sign the program is alive. `Some(None)` is that sign.
         let leader = activity.cpu.map(|(pid, _)| pid);
         let hold = was
             .as_ref()
@@ -1237,14 +1137,13 @@ impl InputWatches {
                     || stopped_spinning;
                 (!alive).then_some((at, spun))
             });
-        // RECOVERED: the episode is over. What is unread now is judged as a
-        // new episode's, on what the watch saw, not kept by the old one.
+        // Recovered: the episode is over. What is unread now is judged as a new
+        // episode's, on what the watch saw, not kept by the old one.
         let recovered = matches!(hold, Some(None));
         let dropped = hold.flatten();
-        // THE GRACE runs from a RESTART's drop only (robustness review of the
-        // manual reset, 2026-09-26). A queue `reset flush` emptied is held
-        // like a restart's — it was dropped, not read — but no signal was
-        // sent, so it is never "still running after its restart signal".
+        // The grace runs from a restart's drop only: a queue `reset flush`
+        // emptied is held like a restart's (dropped, not read), but no signal
+        // was sent, so it is never "still running after its restart signal".
         let restarted = dropped
             .filter(|_| {
                 was.as_ref()
@@ -1391,7 +1290,7 @@ impl InputWatches {
         self.watches.contains_key(&id)
     }
 
-    /// Whether a WAKE-driven probe of `id` must wait: it was probed less than
+    /// Whether a wake-driven probe of `id` must wait: it was probed less than
     /// [`PROBE_MIN_GAP`] ago. An unwatched session is never throttled, so the
     /// hook's first wake always probes.
     pub(crate) fn throttled(&self, id: u64, now: Instant) -> bool {
@@ -1400,13 +1299,11 @@ impl InputWatches {
             .is_some_and(|w| now < w.last_probe + PROBE_MIN_GAP)
     }
 
-    /// A throttled wake is DEFERRED, never dropped: pull `id`'s deadline in to
-    /// the end of its [`PROBE_MIN_GAP`]. A wake says something moved — the
-    /// program drew, or a write landed — and the burst's LAST wake is often the
-    /// one inside the gap: measured on a headless instance (2026-09-24), a
-    /// frozen program killed with `signal term` drew nothing after its shell's
-    /// prompt, and its stall stood until the next [`RECHECK`] instead of a
-    /// quarter second.
+    /// A throttled wake is deferred, never dropped: pull `id`'s deadline in to
+    /// the end of its [`PROBE_MIN_GAP`]. A wake says something moved (the
+    /// program drew, or a write landed), and a burst's last wake is often the
+    /// one inside the gap; dropped, a stall whose program ended could stand
+    /// until the next [`RECHECK`].
     pub(crate) fn defer(&mut self, id: u64) {
         if let Some(w) = self.watches.get_mut(&id) {
             w.next_probe = w.next_probe.min(w.last_probe + PROBE_MIN_GAP);
@@ -1439,13 +1336,14 @@ impl InputWatches {
 /// `published` says the watch has a stall published; `last_output` is when
 /// aterm last read the program's output.
 ///
-/// The leader's CPU, and the machine's load ([`machine_contention`]), are
-/// asked only while the job runs and either input is unread or a stall is
-/// published, so an idle or stopped session pays for no process lookup. A published stall pays for it with an empty queue too: that
-/// is the probe after a restart's discard, and the leader is what tells the
-/// program that lived through the signal from the one that ended ([`Restart`]).
-/// Only a published stall on a sink that has had a discard asks whether the
-/// program has read since ([`SinkWriter::read_since_discard`]).
+/// The leader's CPU, and the machine's load ([`machine_contention`]), are asked
+/// only while the job runs and either input is unread or a stall is published,
+/// so an idle or stopped session pays for no process lookup. A published stall
+/// pays for it with an empty queue too: that is the probe after a restart's
+/// discard, and the leader is what tells the program that lived through the
+/// signal from the one that ended ([`Restart`]). Only a published stall on a
+/// sink that has had a discard asks whether the program has read since
+/// ([`SinkWriter::read_since_discard`]).
 pub(crate) fn probe(
     sink: &SinkWriter,
     published: bool,
@@ -1455,7 +1353,7 @@ pub(crate) fn probe(
     let master = sink.master();
     let unread = backlog.is_some_and(|b| b.unread() > 0);
     let stopped = unread && fg_stopped(master);
-    // The restart count before the epoch ([`SinkWriter::restart_discards`]).
+    // The restart count before the discard count ([`SinkWriter::restart_discards`]).
     let restarts = sink.restart_discards();
     let discards = sink.discards();
     let looks = (unread || published) && !stopped;
@@ -1475,31 +1373,24 @@ pub(crate) fn probe(
 }
 
 /// Give `sink` its input watch: install `wake` (the event loop's
-/// `Wake::InputWatch` post) as its input hook, and fire it NOW when the
-/// program already has input unread. Called on every reader attach
+/// `Wake::InputWatch` post) as its input hook, and fire it now when the program
+/// already has input unread. Called on every reader attach
 /// (`spawn::attach_reader_inner`); returns whether it fired.
 ///
-/// The hook alone wakes the watch only for a write THROUGH this sink, and
-/// that left a hole (S6 review, 2026-09-24): a master adopted across a
-/// seamless update — attached at once, or by a deferred reader after the
-/// handoff — arrives holding whatever the old process wrote and the program
-/// never read. The new sink dates those bytes from its own birth, but no
-/// write of this process lands behind them to start a watch: the gate, as it
-/// stood then, refused every socket write a second later, so only a human
-/// keystroke could. The stall was never published — `agent=` kept the frozen screen's
-/// verdict and `meta attention` stayed empty — while `status input=` read
-/// `stalled` live beside them. That is the incident's own delivery path: the
-/// frozen tab runs a build without the watch, and the watch arrives by a live
-/// apply.
+/// The hook alone wakes the watch only for a write through this sink. A master
+/// adopted across a seamless update (attached at once, or by a deferred reader
+/// after the handoff) arrives holding whatever the old process wrote and the
+/// program never read, and no write of this process may land behind it to start
+/// a watch; the explicit wake starts it.
 ///
-/// Only where the probe can answer — macOS, a tty master — so no other
-/// platform pays a wake per keystroke for a reading it cannot take; the
-/// caller builds `wake` on every target and it is simply dropped there. The
-/// hook is installed BEFORE the queue is read, so a write landing between the
-/// two fires it itself, and the explicit wake shares the writes' arming
+/// Only where the probe can answer (macOS, a tty master), so no other platform
+/// pays a wake per keystroke for a reading it cannot take; the caller builds
+/// `wake` on every target and it is simply dropped there. The hook is installed
+/// before the queue is read, so a write landing between the two fires it
+/// itself, and the explicit wake shares the writes' arming
 /// ([`SinkWriter::wake_input_hook`]), so it never doubles one already in
-/// flight. First install wins: a re-attach keeps the first attach's hook
-/// (same session id, same event loop) and only re-asks the queue.
+/// flight. First install wins: a re-attach keeps the first attach's hook (same
+/// session id, same event loop) and only re-asks the queue.
 pub(crate) fn watch_input(sink: &SinkWriter, wake: impl Fn() + Send + Sync + 'static) -> bool {
     if aterm_pty::input_queue_len(sink.master()).is_none() {
         return false;
@@ -1527,28 +1418,27 @@ pub(crate) fn status_fields(
     )
 }
 
-/// `status`'s four fields for `sink`, probed LIVE on the call: the reading,
-/// its word, and the foreground RSS only while stalled or stopped. The word
-/// is `stalled` exactly while the watch has one PUBLISHED (`published`):
-/// one reading sees the queue, never whether the program is spinning or
-/// drawing ([`Liveness`]), so an old byte the watch has not called a stall
-/// reads `pending` here — the same word the supervisor, the band and the
-/// menu act on, never a second verdict beside them.
+/// `status`'s four fields for `sink`, probed live on the call: the reading, its
+/// word, and the foreground RSS only while stalled or stopped. The word is
+/// `stalled` exactly while the watch has one published (`published`): one
+/// reading sees the queue, never whether the program is spinning or drawing
+/// ([`Liveness`]), so an old byte the watch has not called a stall reads
+/// `pending` here, the same word the supervisor, the band and the menu act on.
 ///
 /// A reading that finds input unread while no watch is looking (`watched`
-/// false) WAKES the watch ([`SinkWriter::wake_input_hook`]; S6 review,
-/// 2026-09-24): bytes no write through the sink announced — an unseen
-/// writer's, or any a future attach path forgets ([`watch_input`]) — would
-/// otherwise read `stalled` here, poll after poll, beside an `agent=` and a
-/// `meta attention` that never heard of them. A watched session is never
-/// woken from here, so a driver polling `status` adds no probes to one.
+/// false) wakes the watch ([`SinkWriter::wake_input_hook`]): bytes no write
+/// through the sink announced (an unseen writer's, or any a future attach path
+/// forgets, [`watch_input`]) would otherwise read here, poll after poll, beside
+/// an `agent=` and a `meta attention` that never heard of them. A watched
+/// session is never woken from here, so a driver polling `status` adds no
+/// probes to one.
 ///
-/// `published` is the watch's stall. One whose queue aterm dropped — for a
-/// restart its leader is living through, or by `reset flush` — reads
-/// `stalled` with nothing unread ([`Restart`]), from the drop on — not from the watch's next probe, which
-/// is what the supervisor's hold waits on — and its live word again from the
-/// moment the program reads a key sent since, a reading that wakes the watch
-/// to withdraw the stall ([`held_now`]).
+/// A published stall whose queue aterm dropped (for a restart its leader is
+/// living through, or by `reset flush`) reads `stalled` with nothing unread
+/// ([`Restart`]) from the drop on, not from the watch's next probe, which is
+/// what the supervisor's hold waits on; and its live word again from the moment
+/// the program reads a key sent since, a reading that wakes the watch to
+/// withdraw the stall ([`held_now`]).
 pub(crate) fn status_input(
     sink: &SinkWriter,
     published: Option<&InputStallFact>,
@@ -1559,8 +1449,8 @@ pub(crate) fn status_input(
         let _ = sink.wake_input_hook();
     }
     let stopped = backlog.is_some_and(|b| b.unread() > 0) && fg_stopped(sink.master());
-    // One reading sees the queue, not the program: `stalled` is what the
-    // watch has PUBLISHED, never a verdict of this call.
+    // One reading sees the queue, not the program: `stalled` is what the watch
+    // has published, never a verdict of this call.
     let liveness = if published.is_some() {
         Liveness::Published
     } else {
@@ -1614,19 +1504,17 @@ pub(crate) fn since_unix_of(since: Instant) -> Option<i64> {
 /// ```
 ///
 /// `program` is `status program=` (`the program` when unresolved), `clock` the
-/// [`since_hhmm`] of the stall (`for <dur>` of `waited` without one). The
-/// third line is a stall whose program SURVIVED `signal term` by
-/// [`RESTART_GRACE`] ([`Restart::survived`]): its queue was dropped, so it
-/// counts no bytes, and the remedy moves on to the signal no handler can
-/// replace.
+/// [`since_hhmm`] of the stall (`for <dur>` of `waited` without one). The last
+/// line is a stall whose program survived `signal term` by [`RESTART_GRACE`]
+/// ([`Restart::survived`]): its queue was dropped, so it counts no bytes, and
+/// the remedy moves on to the signal no handler can replace.
 ///
-/// Where the act would be carried ([`InputStallFact::act`], the one
-/// predicate: [`crate::restart_act::offered`]) the restart named is the
-/// EXPLICIT one, `restart pid=<leader> if-stalled` (design of 2026-10-08),
-/// the survivor's line too: the act stamps the agent before it signals, so
-/// its exit is the restart's whoever reads it, and it ends a program that
-/// lives through its `SIGTERM` itself — where a bare `signal term`'s exit
-/// reads as the agent's own, and is left.
+/// Where the act would be carried ([`InputStallFact::act`], the one predicate:
+/// [`crate::restart_act::offered`]) the restart named is the explicit
+/// `restart pid=<leader> if-stalled`, the survivor's line too: the act stamps
+/// the agent before it signals, so its exit is the restart's whoever reads it,
+/// and it ends a program that lives through its `SIGTERM` itself, where a bare
+/// `signal term`'s exit reads as the agent's own.
 ///
 /// `<after>` is what follows the restart ([`AfterRestart`], [`after_restart`]):
 /// `, then claude --resume <id>` — the line that resumes THIS tab's own
@@ -1650,10 +1538,10 @@ pub(crate) fn since_unix_of(since: Instant) -> Option<i64> {
 ///
 /// The command is never cut: the stored attention keeps
 /// [`crate::session_timeline::META_ATTENTION_KEYED_MAX`] bytes, and a cut id
-/// names no conversation (or another). Where the whole line does not fit,
-/// the carried flags go first — all but the permission mode's, then those
-/// too (`claude --resume <id>`, [`aterm_agent::harness::resume::shorter`]) —
-/// then the resident size, then the command itself.
+/// names no conversation (or another). Where the whole line does not fit, the
+/// carried flags go first (all but the permission mode's, then those too:
+/// `claude --resume <id>`, [`aterm_agent::harness::resume::shorter`]), then the
+/// resident size, then the command itself.
 pub(crate) fn attention_text(
     fact: &InputStallFact,
     program: Option<&str>,
@@ -1682,9 +1570,8 @@ pub(crate) fn attention_text(
         let tenths = (mb * 10 + 512) / 1024;
         format!("rss {}.{} GB", tenths / 10, tenths % 10)
     });
-    // Where the act would be carried, the restart named is the explicit one
-    // (it ends a survivor itself, and its exit is the restart's whoever
-    // reads it); elsewhere `signal term`, then `signal kill` for a survivor.
+    // The explicit restart where the act would be carried; elsewhere
+    // `signal term`, then `signal kill` for a survivor.
     let explicit = fact.act.as_ref().map(|act| act.cmd.as_str());
     let head = |rss: Option<&str>| {
         if fact.restart.survived {
@@ -1729,15 +1616,14 @@ pub(crate) fn attention_text(
 }
 
 /// What follows the restart of the stalled program in session `tl`
-/// ([`attention_text`]'s `<after>`). Where the explicit restart is named —
-/// `act`, the publication's [`InputStallFact::act`] (the one predicate,
-/// [`crate::restart_act::offered`]) — the host's own relaunch on the
-/// conversation where that is promised (U1, whatever `[harness] relaunch`
-/// says: ruling 1, 2026-10-08), else nothing after the act: never a resume
-/// line a person would run over the host's relaunch. Elsewhere the resume
-/// line the footer resolver read for the foreground Claude Code
-/// (`FooterFacts::resume`, published only for the process in front); else
-/// nothing. One timeline read: the caller holds its leaf lock.
+/// ([`attention_text`]'s `<after>`). Where the explicit restart is named
+/// (`act`, the publication's [`InputStallFact::act`]), the host's own relaunch
+/// on the conversation where that is promised (whatever `[harness] relaunch`
+/// says), else nothing after the act: never a resume line a person would run
+/// over the host's relaunch. Elsewhere the resume line the footer resolver read
+/// for the foreground Claude Code (`FooterFacts::resume`, published only for
+/// the process in front); else nothing. One timeline read: the caller holds its
+/// leaf lock.
 pub(crate) fn after_restart(
     tl: &crate::session_timeline::SessionTimeline,
     act: Option<&StallAct>,
@@ -1773,9 +1659,9 @@ fn act_of(ctx: &SessionCtx, fact: &InputStallFact) -> Option<StallAct> {
     })
 }
 
-/// WHY THE HOST'S HAND IS NOT THE ONE ON SESSION `ctx` at `now_us` (`None`:
-/// it is): the live supervisor claim is not this host's (`not-supervised`),
-/// the session is halted (`halted`), another driver's live lease holds it
+/// Why the host's hand is not the one on session `ctx` at `now_us` (`None`: it
+/// is): the live supervisor claim is not this host's (`not-supervised`), the
+/// session is halted (`halted`), another driver's live lease holds it
 /// (`driver-lease`), or a turn a named driver typed does (`driver-turn`; an
 /// owner-class turn, no driver, is the host's own loop's and holds nothing
 /// against it). What the explicit restart's fences
@@ -1841,10 +1727,10 @@ pub(crate) fn attention_now(
     )
 }
 
-/// The identity of one stall EPISODE, for the menu herald's notification key:
-/// a hash of the instant its oldest unread byte was accepted. [`InputWatches`]
+/// The identity of one stall episode, for the menu herald's notification key: a
+/// hash of the instant its oldest unread byte was accepted. [`InputWatches`]
 /// fixes `since` at entry and keeps it through a stalled ⇄ stopped change, so
-/// one episode is one key — its row's text can move (a `for <dur>` clause
+/// one episode is one key: its row's text can move (a `for <dur>` clause
 /// without a zone, a program name resolving late) without a second
 /// notification, and a new episode after a thaw is a new key.
 pub(crate) fn episode_key(fact: &InputStallFact) -> u64 {
@@ -1875,28 +1761,25 @@ pub(crate) fn menu_row(
 
 impl crate::App {
     /// Probe the input watches that are owed a probe and publish what moved.
-    /// `only = None` is the event loop's turn: every session whose deadline
-    /// has come. `only = Some(id)` is a WAKE for one session — its input hook
-    /// fired, or it produced output while watched — and is skipped inside
-    /// [`PROBE_MIN_GAP`] of its last probe — deferred to the end of that gap,
-    /// never dropped ([`InputWatches::defer`]).
-    /// Returns the sessions whose publication moved.
+    /// `only = None` is the event loop's turn: every session whose deadline has
+    /// come. `only = Some(id)` is a wake for one session (its input hook fired,
+    /// or it produced output while watched), skipped inside [`PROBE_MIN_GAP`]
+    /// of its last probe and deferred to the end of that gap, never dropped
+    /// ([`InputWatches::defer`]). Returns the sessions whose publication moved.
     ///
-    /// Each probe REARMS the sink's input hook first, so a write racing the
+    /// Each probe rearms the sink's input hook first, so a write racing the
     /// probe wakes the watch again rather than falling between the two. The
     /// probe is the sink's lock-free reading (a `tcgetattr` and two ioctls,
     /// never the fd lock a parked writer holds), plus one `proc_pidinfo` for
-    /// the stop state while bytes are unread and one more for the RSS on
-    /// entry — all on the event loop, all non-blocking.
+    /// the stop state while bytes are unread and one more for the RSS on entry:
+    /// all on the event loop, all non-blocking.
     ///
-    /// A STANDING stall (published, unmoved by the probe) has its explicit
-    /// restart asked again ([`act_of`]: the one predicate, leaf locks, no
-    /// I/O) and is republished where that moved — a claim taken or lost, a
-    /// halt, a lease, a snapshot first published after the stall (a worker
-    /// attaching to a tab already frozen, as a live upgrade's Commit leaves
-    /// it): the entry, the row and the band follow the refusal and the mail,
-    /// which ask live, within a [`RECHECK`] (review of `fix/restart-advice`,
-    /// 2026-10-08: a standing stall is never otherwise republished).
+    /// A standing stall (published, unmoved by the probe) has its explicit
+    /// restart asked again ([`act_of`]: the one predicate, leaf locks, no I/O)
+    /// and is republished where that moved (a claim taken or lost, a halt, a
+    /// lease, a snapshot first published after the stall), so the entry, the
+    /// row and the band follow the refusal and the mail, which ask live, within
+    /// a [`RECHECK`].
     pub(crate) fn observe_input_stalls(&mut self, now: Instant, only: Option<u64>) -> Vec<u64> {
         let ids = match only {
             Some(id) if self.session_status.inputs.throttled(id, now) => {
@@ -1957,21 +1840,15 @@ impl crate::App {
         }
     }
 
-    /// A `Wake::InputWatch` the pre-Commit gate SWALLOWED
+    /// A `Wake::InputWatch` the pre-Commit gate swallowed
     /// (`App::drops_wake_before_commit`) releases its sink's input hook, as the
-    /// dropped Output wake releases its coalescing latch: the hook fires at most
-    /// once until a probe rearms it, and the probe it asked for will never run.
-    ///
-    /// WHY (whole-branch review, 2026-09-25): an overlap live upgrade adopts
-    /// each session's master, and the reader's prepare runs
-    /// [`watch_input`] BEFORE the proof — so a session that arrives with
-    /// input unread fires its hook while `incoming_handoff_pending` holds, and
-    /// the wake is dropped. Nothing rearmed the hook after that: every later
-    /// write, the refusal's wake and `status`'s wake all found it already
-    /// fired, and the stall — the frozen Claude Code's Enter, delivered by the
-    /// very live apply that brings this watch — was never published
-    /// (`agent=`, the server's attention, the band and the menu row), while
-    /// `status input=` read it live beside them. Any other wake is left alone.
+    /// dropped Output wake releases its coalescing latch: the hook fires at
+    /// most once until a probe rearms it, and the probe it asked for will never
+    /// run. An overlap upgrade's reader runs [`watch_input`] before the proof,
+    /// so a session arriving with input unread fires its hook while
+    /// `incoming_handoff_pending` holds; left spent, every later wake would
+    /// find it fired and the stall would never be published. Any other wake is
+    /// left alone.
     pub(crate) fn release_input_wake_dropped_before_commit(&self, ev: &crate::Wake) {
         if let crate::Wake::InputWatch { session } = ev
             && let Some(s) = self.pool.get(*session)
@@ -2078,13 +1955,10 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     const TICK: Duration = Duration::from_millis(1100);
 
-    /// Publish a `stalled` fact for `ctx`'s session, as the watch does on its
-    /// evidence (spinning and silent past the stretched
-    /// [`input_backlog::STALL_AFTER`]), and age its unread input past that
-    /// threshold without sleeping to it
-    /// ([`SinkWriter::backdate_input_for_testing`]). No leader, so no
-    /// restart hold. Every test that publishes one drives a real pty, so is
-    /// macOS's.
+    /// Publish a `stalled` fact for `ctx`'s session, as the watch does on its evidence, and age
+    /// its unread input past the stall threshold without sleeping to it
+    /// ([`SinkWriter::backdate_input_for_testing`]). No leader, so no restart hold. Every
+    /// caller drives a real pty, so this is macOS's.
     #[cfg(target_os = "macos")]
     pub(crate) fn publish_stall(ctx: &SessionCtx) {
         ctx.sink
@@ -2175,12 +2049,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// A real pty pair with a RAW slave nobody reads — the incident's shape.
-    /// Both ends close-on-exec from birth, so a child another test spawns in
-    /// this multi-threaded harness cannot inherit the slave and hold it open
-    /// (the aterm-pty test module measured an inheritable openpty slave SIGHUP
-    /// an unrelated test's child). The master is O_NONBLOCK, as production's
-    /// is. Returns `(master, slave)`; the caller closes both.
+    /// A real pty pair with a raw slave nobody reads. Both ends close-on-exec from birth, so a
+    /// child another test spawns in this multi-threaded harness cannot inherit the slave and
+    /// hold it open; the master is O_NONBLOCK, as production's is. Returns `(master, slave)`;
+    /// the caller closes both.
     #[cfg(target_os = "macos")]
     pub(crate) fn raw_pty_pair() -> (i32, i32) {
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -2203,8 +2075,8 @@ pub(crate) mod tests {
         (master, slave)
     }
 
-    /// Everything the slave has queued, read in ONE `read()` — the way the
-    /// incident's program read its Enter and the supervisor's key together.
+    /// Everything the slave has queued, read in one `read()`, as a program reads keys queued
+    /// together.
     #[cfg(target_os = "macos")]
     pub(crate) fn slave_read_all(slave: i32) -> Vec<u8> {
         let mut buf = [0u8; 256];
@@ -2357,7 +2229,7 @@ pub(crate) mod tests {
         assert_eq!(wakes.load(Ordering::SeqCst), 1, "a pass wakes nothing");
         ctx.sink.backdate_input_for_testing(TICK);
 
-        // A SLOW READ: written, with the warning.
+        // A slow read: written, with the warning.
         let Admission::Warn(warning) = admission(&ctx, "key", "down", false) else {
             panic!("a slow read is warned, not refused");
         };
@@ -2372,7 +2244,7 @@ pub(crate) mod tests {
         );
         assert_eq!(admission(&ctx, "key", "down", true), Admission::Open);
 
-        // THE INCIDENT: the watch publishes the stall.
+        // The watch publishes the stall.
         publish_stall(&ctx);
         let refused = refusal(&ctx, "key", "down", false).expect("refused");
         assert!(
@@ -2450,16 +2322,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// THE REMEDY IS NOT REFUSED (S4 review, 2026-09-24). A cbreak program —
-    /// ICANON off, ISIG on: readline between keys, `watch`, `htop` — has left
-    /// a `q` unread, and the watch has published it as stalled, so a driver's
-    /// `key down` is refused as ever. But `key ctrl+c`, `ctrl c`, `ctrl z`
-    /// and `feed 03` are signals the line discipline raises as they are
-    /// written: they never queue behind the `q`, and writing one flushes it —
-    /// the gate lets them through, and the queue reads 0 after. In RAW mode
-    /// (ISIG off) the same `^C` is a byte that would be read after the `q`, so
-    /// it is refused, and the refusal names `signal int`. Fails before the
-    /// exemption: the cbreak `key ctrl+c` answered `ERR busy input-unread`.
+    /// The remedy is not refused: in a cbreak program (ICANON off, ISIG on) with a `q` unread
+    /// and a published stall, `key down` is refused, but `key ctrl+c`, `ctrl c`, `ctrl z` and
+    /// `feed 03` are signals the line discipline raises as they are written, so they pass and
+    /// the queue reads 0 after. In raw mode (ISIG off) the same `^C` is a byte read after the
+    /// `q`, so it is refused, and the refusal names `signal int`.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_signal_character_into_a_cbreak_program_is_not_refused() {
@@ -2520,20 +2387,12 @@ pub(crate) mod tests {
         aterm_pty::close_fd(slave);
     }
 
-    /// A YIELDING TURN ASKS THE GATE AGAIN BEFORE ITS FIRST BYTE (S4 review,
-    /// 2026-09-24). The dispatch asks once, when the turn arrives; a turn that
-    /// arrives within a second of the human's Enter is let in, and its yield
-    /// — parked until the human's ribbon exhales, τ = 2 s — can outlast the
-    /// moment the watch publishes the program as stalled. Typing then would be
-    /// the incident's shape exactly. Here the ribbon reads 0.40 against a 0.20
-    /// floor (a crossing at 2·ln 2 ≈ 1.39 s).
-    ///
-    /// Unpublished — a program that is only SLOW (owner direction,
-    /// 2026-09-29) — the second ask warns and the turn types and presses
-    /// behind the 1.39 s-old Enter. Published during the yield, the second
-    /// ask refuses `ERR busy input-unread`, and the turn types and presses
-    /// NOTHING — the slave reads exactly the human's `\r`. Without the second
-    /// ask it pastes `hi` and presses Enter behind it.
+    /// A yielding turn asks the gate again before its first byte: the dispatch asks once, when
+    /// the turn arrives, and its yield (parked until the human's ribbon exhales, τ = 2 s; here
+    /// 0.40 against a 0.20 floor, a crossing at 2·ln 2 ≈ 1.39 s) can outlast the moment the
+    /// watch publishes a stall. Unpublished, the second ask warns and the turn types and
+    /// presses behind the Enter. Published during the yield, it refuses `ERR busy input-unread`
+    /// and the turn types nothing: the slave reads exactly the human's `\r`.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_yielding_turn_asks_the_gate_again_before_its_first_byte() {
@@ -2610,7 +2469,7 @@ pub(crate) mod tests {
         aterm_pty::close_fd(slave);
     }
 
-    // -- THE WATCH ------------------------------------------------------------
+    // The watch.
 
     /// A reading: `queued` raw bytes, the oldest `wait_s` seconds old, and
     /// `output` bytes of the program's own output aterm has not read.
@@ -2621,9 +2480,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// What the probe sees of the incident's program: leader 4242, having
-    /// burned `burned` of CPU since its window started — a whole core, when
-    /// `burned` is the wall time since then. Nothing drawn.
+    /// What the probe sees of a frozen program: leader 4242, having burned `burned` of CPU
+    /// since its window started (a whole core when `burned` is the wall time since then),
+    /// nothing drawn.
     fn spin(burned: Duration) -> Activity {
         Activity {
             cpu: Some((4242, u64::try_from(burned.as_nanos()).expect("small"))),
@@ -2686,9 +2545,9 @@ pub(crate) mod tests {
         assert_eq!((t, next), (Transition::None, stretched), "slow, not frozen");
     }
 
-    /// A STOPPED job with input queued is published at any age, and a stall
-    /// that becomes a stop (or a stop that resumes into a stall) is an UPDATE
-    /// of the same episode: its date and RSS carry over.
+    /// A stopped job with input queued is published at any age, and a stall that becomes a stop
+    /// (or a stop that resumes into a stall) is an update of the same episode: its date and RSS
+    /// carry over.
     #[test]
     fn step_stopped_enters_at_once_and_updates_the_episode() {
         let mut w = InputWatches::default();
@@ -2724,9 +2583,8 @@ pub(crate) mod tests {
         assert_eq!((stall.since, stall.rss_mb), (stop.since, Some(7)));
     }
 
-    /// The program reads: the stall LEAVES and, with nothing unread, the watch
-    /// ends. Unread input that is younger again (it read the old byte, a new
-    /// one came) also leaves — that is a new episode, still watched. So does a
+    /// The program reads: the stall leaves and, with nothing unread, the watch ends. Unread
+    /// input that is younger again (a new episode, still watched) leaves it too, and so does a
     /// reading that went dark: a published stall is never left standing.
     #[test]
     fn step_leaves_on_clear_on_young_input_and_on_no_reading() {
@@ -2814,7 +2672,7 @@ pub(crate) mod tests {
         };
         let t1 = t0 + Duration::from_secs(1);
 
-        // The negative control: emptied by a READ, the stall leaves.
+        // The negative control: emptied by a read, the stall leaves.
         let mut w = InputWatches::default();
         entered(&mut w);
         let (t, _) = w.step(
@@ -3047,7 +2905,7 @@ pub(crate) mod tests {
         let core = |now: Instant| now.duration_since(base);
         let t1 = t0 + Duration::from_secs(1);
         let t2 = t1 + Duration::from_secs(2);
-        // Entered spinning at t0, and HELD from t1, spinning.
+        // Entered spinning at t0, and held from t1, spinning.
         let held = |w: &mut InputWatches| {
             primed(w, 1, t0);
             let (t, _) = w.step(
@@ -3178,20 +3036,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// NOT EVERY OLD BYTE IS A FROZEN PROGRAM (whole-branch review,
-    /// 2026-09-25). The three shapes measured on Darwin ptys — each with a
-    /// cbreak byte unread at twelve seconds and aterm's output queue empty,
-    /// each published "frozen … restart it" before this gate — as the watch
-    /// sees them across two probes, and the incident beside them:
+    /// Not every old byte is a frozen program. Each shape has a cbreak byte unread at twelve
+    /// seconds and aterm's output queue empty, as the watch sees it across two probes:
     ///
-    /// * `less` in front of a slow `git log -S`, `q` typed: the leader
-    ///   asleep, nothing drawn → `pending`, until [`input_backlog::
-    ///   QUIET_STALL_AFTER`] (a deadlock looks the same from outside);
-    /// * zsh inside a slow completion widget, a key typed: the LEADER (zsh)
-    ///   asleep while its child works → `pending`;
-    /// * a cbreak progress line redrawn every 100 ms, `q` typed: drawing →
-    ///   `pending` at any age and any CPU;
-    /// * the incident: spinning, nothing drawn → `stalled` at ten seconds.
+    /// * `less` in front of a slow `git log -S`, `q` typed: the leader asleep, nothing drawn →
+    ///   `pending` until [`input_backlog::QUIET_STALL_AFTER`] (a deadlock looks the same from
+    ///   outside);
+    /// * zsh inside a slow completion widget, a key typed: the leader (zsh) asleep while its
+    ///   child works → `pending`;
+    /// * a cbreak progress line redrawn every 100 ms, `q` typed: drawing → `pending` at any age
+    ///   and any CPU;
+    /// * a frozen program: spinning, nothing drawn → `stalled` at ten seconds.
     #[test]
     fn step_enters_only_a_program_seen_spinning_and_silent() {
         let t0 = Instant::now();
@@ -3232,7 +3087,7 @@ pub(crate) mod tests {
             let (t, _, _) = probe(spin(Duration::ZERO), drawing(cpu), 3600);
             assert_eq!(t, Transition::None, "a program that draws is alive");
         }
-        // Output from BEFORE the oldest byte is not drawing since it.
+        // Output from before the oldest byte is not drawing since it.
         let stale = Activity {
             last_output: Some(t1 - Duration::from_secs(13)),
             ..spin(Duration::from_secs(12))
@@ -3240,7 +3095,7 @@ pub(crate) mod tests {
         let (t, _, _) = probe(spin(Duration::ZERO), stale, 12);
         assert!(matches!(t, Transition::Entered(_)), "{t:?}");
 
-        // The incident: a core burned across the window, nothing drawn.
+        // Frozen: a core burned across the window, nothing drawn.
         let (t, _, _) = probe(spin(Duration::ZERO), spin(Duration::from_secs(12)), 12);
         assert!(matches!(t, Transition::Entered(_)), "{t:?}");
     }
@@ -3279,30 +3134,22 @@ pub(crate) mod tests {
             spin_window(mark, true, None, idle, at(ms(5000))),
             (None, false)
         );
-        // UNDER LOAD (live run, 2026-09-29): at a load of 190 on 18 CPUs a
-        // spinning thread gets about a tenth of a core — 200 ms over two
-        // seconds — and that is spinning; a sleeper's few milliseconds are
-        // not. NEGATIVE CONTROL: the same 200 ms on an idle machine is not.
+        // Under load: at a load of 190 on 18 CPUs a spinning thread gets about a tenth of a
+        // core (200 ms over two seconds), and that is spinning; a sleeper's few milliseconds
+        // are not. Negative control: the same 200 ms on an idle machine is not.
         let loaded = Contention::of_load(190.0, 18);
         assert!(spin_window(mark, false, Some((7, ns(ms(200)))), loaded, at(ms(2000))).1);
         assert!(!spin_window(mark, true, Some((7, ns(ms(3)))), loaded, at(ms(2000))).1);
         assert!(!spin_window(mark, true, Some((7, ns(ms(200)))), idle, at(ms(2000))).1);
     }
 
-    /// The CPU reader counts a child's CPU in nanoseconds — the mach-tick
-    /// conversion ([`pid_cpu_ns`]; the raw record counts 125/3-ns ticks on
-    /// this Mac) — checked against the kernel's own account of the SAME child:
-    /// the `rusage` its reap returns, in microseconds, which no tick
-    /// conversion touches.
-    ///
-    /// The oracle is that rusage, never the wall clock. A spinning thread gets
-    /// a core per second of wall time only on an idle machine; beside other
-    /// builds it gets its share, cores over runnable threads (14 cores at a
-    /// load of 60 is 0.23 of one), so a `burned * 4 >= wall` floor can fail a
-    /// correct reader by load alone. The child is STOPPED before the reading,
-    /// and the stop is waited for (`WUNTRACED`), so the reading and the reap
-    /// count the same CPU at any load, while a reader off by the tick factor
-    /// (41.7x either way) lands far outside the 2x band.
+    /// The CPU reader counts a child's CPU in nanoseconds (the mach-tick conversion,
+    /// [`pid_cpu_ns`]), checked against the kernel's own account of the same child: the
+    /// `rusage` its reap returns, in microseconds, which no tick conversion touches. Never the
+    /// wall clock: a spinning thread gets a core per second only on an idle machine. The child
+    /// is stopped before the reading, and the stop waited for (`WUNTRACED`), so the reading and
+    /// the reap count the same CPU at any load, while a reader off by the tick factor (41.7x
+    /// either way) lands far outside the 2x band.
     #[test]
     #[cfg(target_os = "macos")]
     fn pid_cpu_ns_reads_a_spinning_child_in_nanoseconds() {
@@ -3589,19 +3436,14 @@ pub(crate) mod tests {
         snap
     }
 
-    /// ONE PREDICATE, EVERY WORD (2026-10-08). A frozen Claude Code whose
-    /// host keeps a snapshot its relaunch would carry: every word of the
-    /// stall names the explicit restart exactly where the act would be
-    /// carried ([`crate::restart_act::offered`]) — the publication's (the
-    /// attention entry, the menu row, the band's spoken remedy) and the
-    /// loop's (`harness_host::offered_now`, its frozen mail and warning) —
-    /// and the survivor's line and band name it in place of `signal kill`.
-    /// The menu row is read with `relaunching` empty, as under `[harness]
-    /// relaunch = false`, which does not refuse a person's explicit restart
-    /// (ruling 1): the row and the attention entry once named two remedies
-    /// there. A hosted Codex whose thread is named is offered the act, but
-    /// promised no conversation: its words name the act alone, and the
-    /// loop's predicate says so (`Some(false)`).
+    /// One predicate, every word: for a frozen Claude Code whose host keeps a relaunch
+    /// snapshot, every word of the stall (the attention entry, the menu row, the band, and the
+    /// loop's `harness_host::offered_now` mail and warning) names the explicit restart exactly
+    /// where the act would be carried ([`crate::restart_act::offered`]), the survivor's line
+    /// and band in place of `signal kill`. The menu row is read with `relaunching` empty, as
+    /// under `[harness] relaunch = false`, which does not refuse a person's explicit restart. A
+    /// hosted Codex whose thread is named is offered the act but promised no conversation
+    /// (`Some(false)`).
     ///
     /// NEGATIVE CONTROLS — each a session the act refuses, whose words name
     /// `signal term` and this tab's own resume line (`signal kill` for a
@@ -4070,13 +3912,10 @@ pub(crate) mod tests {
         (out, before.min(after), before.max(after))
     }
 
-    /// THE WATCH ON A REAL PTY. An idle session arms nothing; the human's
-    /// byte into a raw program that has not read it arms ONE deadline — the
-    /// instant it turns a stall, stretched by this machine's load
-    /// ([`machine_contention`]) — and publishes nothing yet; a wake inside
-    /// [`PROBE_MIN_GAP`] waits; the program reading ends the watch. Every
-    /// probe rearms the sink's input hook FIRST, so the next write that lands
-    /// wakes the watch again.
+    /// The watch on a real pty: an idle session arms nothing; a byte into a raw program that
+    /// has not read it arms one deadline (the instant it turns a stall, stretched by this
+    /// machine's load) and publishes nothing yet; a wake inside [`PROBE_MIN_GAP`] waits; the
+    /// program reading ends the watch. Every probe rearms the sink's input hook first.
     #[test]
     #[cfg(target_os = "macos")]
     fn the_watch_arms_on_unread_input_and_ends_when_it_is_read() {
@@ -4127,7 +3966,7 @@ pub(crate) mod tests {
         // The probe rearmed the hook: the next write that lands wakes again.
         sink.write_frame_nonparking(b"b").expect("a third key");
         assert_eq!(hooks.load(Ordering::SeqCst), 2);
-        // A wake inside the gap waits — DEFERRED to the gap's end, not
+        // A wake inside the gap waits, deferred to the gap's end, not
         // dropped: the deadline is pulled in to it.
         assert!(
             app.observe_input_stalls(t0 + Duration::from_millis(100), Some(77))
@@ -4242,18 +4081,12 @@ pub(crate) mod tests {
         aterm_pty::close_fd(slave);
     }
 
-    /// THE ATTACH WAKE AN OVERLAP UPGRADE DROPS (whole-branch review,
-    /// 2026-09-25). The adopted master's attach runs before this process's
-    /// proof, so the wake [`watch_input`] posts for its unread Enter reaches
-    /// `user_event` while `incoming_handoff_pending` holds and is SWALLOWED —
-    /// routed here through that very gate (`App::drops_wake_before_commit`),
-    /// not handed to [`crate::App::observe_input_stalls`] as the test above
-    /// does. The drop releases the hook it fired (else every later wake — a
-    /// refusal's, `status`'s, a replayed write's — found it fired for good),
-    /// and Commit probes every adopted session once
-    /// ([`crate::App::rewatch_adopted_input`]): the one with input unread is
-    /// watched from there, an idle one arms nothing, and a wake that is not an
-    /// input watch releases no hook.
+    /// The attach wake an overlap upgrade drops: the adopted master's attach runs before the
+    /// proof, so the wake [`watch_input`] posts for its unread Enter is swallowed by the
+    /// pending gate (`App::drops_wake_before_commit`). The drop releases the hook it fired, and
+    /// Commit probes every adopted session once ([`crate::App::rewatch_adopted_input`]): the
+    /// one with input unread is watched from there, an idle one arms nothing, and a wake that
+    /// is not an input watch releases no hook.
     #[test]
     #[cfg(target_os = "macos")]
     fn an_adopted_backlog_whose_attach_wake_is_dropped_before_commit_is_watched_at_commit() {
@@ -4477,7 +4310,7 @@ pub(crate) mod tests {
 
             // The Enter it never reads, then the stall: entered on readings
             // aged by hand (ten real seconds is no unit test), on the job's
-            // REAL leader and the sink's real discard count.
+            // real leader and the sink's real discard count.
             sink.write_frame_nonparking(b"\r").expect("the Enter");
             let t0 = Instant::now();
             let on_leader = |ns: u64| Activity {

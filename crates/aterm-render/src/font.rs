@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The first-party font face — the type that RETIRED `fontdue`.
+//! The first-party font face.
 //!
-//! # What this is
+//! A [`Font`] holds a face's cmap, horizontal advances, line metrics and legacy `kern`
+//! pairs, read once with `aterm-font`. Rasterization is
+//! [`crate::variation::varied_glyph_raster_with_face`]: aterm-font outlines into the
+//! [`crate::raster`] signed-area coverage fill, flattened at the size drawn.
 //!
-//! A [`Font`] is a parsed face: the cmap, the horizontal advances, the `hhea`
-//! line metrics and the legacy `kern` pairs, read once out of the file with
-//! `aterm-font`, the first-party reader carved from `ttf-parser` (TF.5 of
-//! docs/AUDIT-third-party-2026-10-15.md), which also serves `sbix` colour-emoji
-//! extraction and the FONT-2 variation path. Rasterization is
-//! [`crate::variation::varied_glyph_raster_with_face`] — the SAME
-//! aterm-font-outline → [`crate::raster`] signed-area coverage fill the
-//! variation and `sbix` paths already used, which is why retiring fontdue added
-//! no rasterizer: the rasterizer was already here and already proven, glyph for
-//! glyph, against `ab_glyph_rasterizer` at f32 bit equality.
+//! Behaviour the grid and face routing depend on:
 //!
 //! The API is deliberately the SEVEN methods the workspace actually called on
 //! `fontdue::Font` — [`Font::from_bytes`], [`Font::rasterize`],
@@ -171,26 +165,20 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 
 /// Settings for [`Font::from_bytes`].
-///
-/// One field, because one field was used. fontdue's `scale` (the parse-time
-/// flattening budget) has no counterpart here — outlines are flattened at the
-/// size they are drawn at — and `load_substitutions` (its GSUB pre-load) has no
-/// counterpart either, because substitution is the run shaper's job in this crate.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct FontSettings {
-    /// Which face to take out of a TrueType/OpenType COLLECTION (`.ttc`).
+    /// Which face to take out of a TrueType/OpenType collection (`.ttc`).
     /// `0` for a plain single-face file.
     pub collection_index: u32,
 }
 
-/// Layout information for one glyph at one size — fontdue's convention, kept
-/// because the whole renderer is written in it.
+/// Layout information for one glyph at one size.
 #[derive(Copy, Clone, PartialEq, Debug, Default)]
 pub struct Metrics {
-    /// Whole-pixel offset of the bitmap's LEFT edge from the pen, negative when
+    /// Whole-pixel offset of the bitmap's left edge from the pen, negative when
     /// the glyph reaches left of the origin.
     pub xmin: i32,
-    /// Whole-pixel offset of the bitmap's BOTTOM edge from the baseline,
+    /// Whole-pixel offset of the bitmap's bottom edge from the baseline,
     /// negative below it.
     pub ymin: i32,
     /// Bitmap width, in whole pixels.
@@ -206,13 +194,12 @@ pub struct Metrics {
 pub struct LineMetrics {
     /// Above the baseline, positive.
     pub ascent: f32,
-    /// Below the baseline, NEGATIVE.
+    /// Below the baseline, negative.
     pub descent: f32,
     /// Designer's recommended gap between one line's descent and the next
     /// line's ascent.
     pub line_gap: f32,
-    /// `ascent - descent + line_gap`, precomputed in DESIGN units and then
-    /// scaled — the same order fontdue used, so the f32 rounding is identical.
+    /// `ascent - descent + line_gap`, summed in design units before scaling.
     pub new_line_size: f32,
 }
 
@@ -240,30 +227,16 @@ impl LineMetrics {
     }
 }
 
-/// The font FILE, however the caller already holds it.
+/// The font file, however the caller holds it. The face reads outlines on demand, so it
+/// keeps the file, and adopting the caller's handle avoids copying it.
 ///
-/// This exists so that adopting a caller's handle is possible in BOTH of the
-/// workspace's two shapes. `fontdue` retained no bytes at all — it kept only the
-/// geometry it had already converted — so a face and its file were never the
-/// same allocation and the question never came up. This face reads outlines on
-/// demand and therefore MUST hold the file, which makes "whose copy" a real
-/// question: a 53 MB `.ttc` copied because the constructor only took a slice is
-/// 53 MB of pure waste, permanently, in a process that already had it.
-///
-/// The three arms are the three handle types the crate's byte stores actually
-/// use — the styled and shared-face stores hold `Arc<[u8]>`, the host-injection
-/// intern holds `Arc<Vec<u8>>`, and the discovery path (`DISCOVERED_FONT_BYTES`
-/// / `PARSED_FONT_INTERN`, the seal's broad / symbol / colour-emoji admissions)
-/// holds a read-only private MAPPING of the file
-/// ([`crate::font_file::MappedFontFile`]) when the file lives on the sealed
-/// system font volume, so a 192 MB emoji collection is file-backed and faulted
-/// in per glyph rather than copied into anonymous heap at every launch. An
-/// `Arc<dyn AsRef<[u8]>>` would unify them on paper and cannot: `Arc<[u8]>` is
-/// already unsized and will not coerce again.
-///
-/// This is the crate's ONE discovered-bytes handle: `FallbackFace`, the
-/// colour-emoji slot, the discovery intern and the parsed-face intern all
-/// carry it, so a face's file is held exactly once however it was admitted.
+/// The arms are the crate's handle types: `Arc<[u8]>` (styled and shared-face stores),
+/// `Arc<Vec<u8>>` (host injection), and a read-only private mapping
+/// ([`crate::font_file::MappedFontFile`]) for discovered files on the sealed system font
+/// volume, so a 192 MB emoji collection is faulted in per glyph instead of copied. One
+/// `Arc<dyn AsRef<[u8]>>` cannot unify them: `Arc<[u8]>` is already unsized. Every holder
+/// of discovered bytes (`FallbackFace`, the colour-emoji slot, `DISCOVERED_FONT_BYTES`,
+/// `PARSED_FONT_INTERN`) carries this, so a file is held once however it was admitted.
 #[derive(Clone)]
 pub enum FaceBytes {
     /// The styled / shared-face store's handle.
@@ -272,17 +245,13 @@ pub enum FaceBytes {
     Vec(Arc<Vec<u8>>),
     /// The mapping arm of discovery (`font_file::admit_font_file`).
     Mapped(Arc<crate::font_file::MappedFontFile>),
-    /// A face compiled INTO the binary (`include_bytes!` — the bundled font
-    /// stack, `crate::bundled`). Borrowed, never copied: the pages are the
-    /// executable's own read-only data, faulted in per glyph like a mapping,
-    /// so a bundled chain face costs no anonymous heap at the seal.
+    /// A face compiled into the binary (`include_bytes!`, `crate::bundled`): the
+    /// executable's read-only pages, faulted in per glyph, no anonymous heap.
     Static(&'static [u8]),
 }
 
-/// A discovery index's non-owning key. Vec payloads and mappings are released
-/// with their final live face; dead entries are pruned on the next lookup.
-/// A weak slice retains its inline Arc allocation until that pruning, unlike
-/// the Vec/mapping arms used by file admission.
+/// A discovery index's non-owning key; dead entries are pruned on the next lookup. A weak
+/// slice keeps its `Arc` allocation until then, unlike the Vec and mapping arms.
 pub(crate) enum WeakFaceBytes {
     Slice(std::sync::Weak<[u8]>),
     Vec(std::sync::Weak<Vec<u8>>),
@@ -320,9 +289,8 @@ impl FaceBytes {
         }
     }
 
-    /// Whether both handles are the SAME allocation or mapping — the O(1)
-    /// identity every pointer-keyed cache in the crate relies on, and the
-    /// fast path in front of any byte comparison.
+    /// Whether both handles are the same allocation or mapping: the O(1) identity the
+    /// pointer-keyed caches rely on.
     #[must_use]
     pub fn ptr_eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -336,11 +304,8 @@ impl FaceBytes {
         }
     }
 
-    /// Whether both handles hold the same BYTES, deciding it without touching a
-    /// page wherever identity already answers: the same handle, or two
-    /// mappings of one inode. Only two distinct heap blobs (or a blob against a
-    /// mapping) of equal length pay the compare — which is what the byte-keyed
-    /// interns did for every candidate before.
+    /// Whether both handles hold the same bytes, answered by identity where it can (the
+    /// same handle, or two mappings of one inode) and by comparison only otherwise.
     #[must_use]
     pub fn same_bytes(&self, other: &Self) -> bool {
         if self.ptr_eq(other) {
@@ -354,19 +319,15 @@ impl FaceBytes {
         self.len() == other.len() && self[..] == other[..]
     }
 
-    /// Whether the bytes are a file mapping (file-backed, evictable, shared)
-    /// rather than anonymous heap. Diagnostics: the seal's residency proof.
+    /// Whether the bytes are a file mapping (file-backed, evictable, shared). Diagnostics.
     #[must_use]
     pub fn is_mapped(&self) -> bool {
         matches!(self, FaceBytes::Mapped(_))
     }
 
-    /// Whether the bytes are ANONYMOUS HEAP — a copy this process owns — as
-    /// opposed to file-backed pages: a mapping of a font file, or a face
-    /// compiled into the executable ([`FaceBytes::Static`], the bundled stack),
-    /// whose read-only pages are the binary's own and are evictable like a
-    /// mapping. Diagnostics: the seal's residency split
-    /// (`AdmittedFontSources::discovered_residency`).
+    /// Whether the bytes are anonymous heap this process owns, as opposed to file-backed
+    /// pages (a mapping, or a face compiled into the executable). Diagnostics: the seal's
+    /// residency split (`AdmittedFontSources::discovered_residency`).
     #[must_use]
     pub fn is_heap(&self) -> bool {
         matches!(self, FaceBytes::Slice(_) | FaceBytes::Vec(_))
@@ -413,10 +374,7 @@ impl core::fmt::Debug for FaceBytes {
     }
 }
 
-/// A parsed font face.
-///
-/// Cheap to clone in the sense that matters: the font FILE is an [`Arc`], so a
-/// clone copies the derived tables but never the megabytes.
+/// A parsed font face. A clone copies the derived tables, never the file (an [`Arc`]).
 #[derive(Clone)]
 pub struct Font {
     /// The font file, shared. Kept because outlines are read on demand.
@@ -427,8 +385,8 @@ pub struct Font {
     upem: f32,
     /// `maxp` glyph count — the bound `rasterize_indexed` refuses to exceed.
     glyph_count: u16,
-    /// fontdue's `char_to_glyph`: EVERY cmap subtable enumerated, non-zero
-    /// mappings only, later subtables overwriting earlier ones.
+    /// Every cmap subtable enumerated, non-zero mappings only, later subtables overwriting
+    /// earlier ones.
     char_to_glyph: FxHashMap<char, NonZeroU16>,
     /// Where [`Font::unicode_glyph_index`] answers differently from
     /// [`Self::char_to_glyph`]: each code point a legacy subtable (Macintosh
@@ -448,17 +406,14 @@ pub struct Font {
     /// the end of the table repeats the last entry, which is what
     /// `glyph_hor_advance` already does, so this is a straight copy.
     advances: Box<[u16]>,
-    /// Per-glyph ink box in design units `(x_min, y_min, x_max, y_max)`, for
-    /// `glyf` faces only — there the box is a four-`i16` read out of the glyph
-    /// header, so precomputing it makes [`Font::metrics`] allocation-free and
-    /// parse-free. A CFF face has no such header (the box is a by-product of
-    /// running the charstring), so it stays `None` and `metrics` re-parses.
+    /// Per-glyph ink box in design units `(x_min, y_min, x_max, y_max)`, for `glyf` faces,
+    /// where it is a header read; this keeps [`Font::metrics`] allocation- and parse-free.
+    /// CFF faces have no such header (`None`), so `metrics` re-parses.
     bboxes: Option<Box<[[i16; 4]]>>,
     /// Unscaled `hhea`/`OS/2` line metrics, `None` only if the face declares
     /// none.
     line_metrics: Option<LineMetrics>,
-    /// The raw legacy `kern` table, copied out of the file (kilobytes) so a
-    /// pair lookup costs a header parse instead of a whole-face parse.
+    /// The legacy `kern` table, copied out (kilobytes) so a pair lookup parses only it.
     kern: Option<Box<[u8]>>,
 }
 
@@ -474,24 +429,16 @@ impl core::fmt::Debug for Font {
 }
 
 impl Font {
-    /// The live face owns its source; a weak parsed-face index recovers the
-    /// byte key through this handle without retaining a separate strong copy.
+    /// The face's source bytes, through which a weak parsed-face index recovers its key.
     pub(crate) fn source_bytes(&self) -> &FaceBytes {
         &self.data
     }
 
-    /// Parse a face out of `data`.
+    /// Parse a face out of `data`; the error names which table refused.
     ///
-    /// The error is a `&'static str` (fontdue's shape, so the call sites'
-    /// `.map_err(|e| e.to_string())` is unchanged) naming which table refused.
-    ///
-    /// This COPIES `data`, because a slice is all it is given. A caller that
-    /// already holds the file behind an `Arc` should hand the handle over
-    /// instead — [`Font::from_shared_slice`] or [`Font::from_shared_vec`] — and
-    /// every store in this crate does. MEASURED on this machine: parsing
-    /// `STHeiti Light.ttc` costs 55,562 kB of live heap through here and
-    /// 1,086 kB through the sharing constructors, because 53 MB of it is the
-    /// copy.
+    /// This copies `data`. A caller holding the file behind an `Arc` hands it to
+    /// [`Font::from_shared_slice`] or [`Font::from_shared_vec`] instead, as every store in
+    /// this crate does (53 MB saved on `STHeiti Light.ttc`).
     pub fn from_bytes<D: core::ops::Deref<Target = [u8]>>(
         data: D,
         settings: FontSettings,
@@ -499,9 +446,8 @@ impl Font {
         Self::parse(FaceBytes::Slice(Arc::from(&*data)), settings)
     }
 
-    /// [`Font::from_bytes`] adopting a caller's `Arc<[u8]>` — the styled tier's
-    /// and the shared-face store's handle type. The face costs its derived
-    /// tables and NOT a second copy of the file.
+    /// [`Font::from_bytes`] adopting a caller's `Arc<[u8]>` (the styled and shared-face
+    /// stores' handle): the face costs its derived tables, not a second copy of the file.
     pub fn from_shared_slice(
         data: Arc<[u8]>,
         settings: FontSettings,
@@ -509,9 +455,8 @@ impl Font {
         Self::parse(FaceBytes::Slice(data), settings)
     }
 
-    /// [`Font::from_bytes`] adopting a caller's `Arc<Vec<u8>>` — the interned
-    /// and discovered stores' handle type. Same bargain as
-    /// [`Font::from_shared_slice`].
+    /// [`Font::from_bytes`] adopting a caller's `Arc<Vec<u8>>` (the interned and discovered
+    /// stores' handle).
     pub fn from_shared_vec(
         data: Arc<Vec<u8>>,
         settings: FontSettings,
@@ -519,9 +464,7 @@ impl Font {
         Self::parse(FaceBytes::Vec(data), settings)
     }
 
-    /// [`Font::from_bytes`] adopting a caller's [`FaceBytes`] whatever its arm
-    /// — the discovery path's handle, which may be a file mapping. Same
-    /// bargain as [`Font::from_shared_slice`].
+    /// [`Font::from_bytes`] adopting any [`FaceBytes`], including a file mapping.
     pub fn from_shared(data: FaceBytes, settings: FontSettings) -> Result<Font, &'static str> {
         Self::parse(data, settings)
     }
@@ -531,8 +474,7 @@ impl Font {
         let index = settings.collection_index;
         let face = aterm_font::Face::parse(&data, index).map_err(describe)?;
         let upem = f32::from(face.units_per_em());
-        // `units_per_em()` widens a `u16`, so this value is always finite and a
-        // plain `<=` is the whole test — there is no NaN case to lose.
+        // `units_per_em()` widens a `u16`, so there is no NaN case.
         if upem <= 0.0 {
             return Err("The head table declares a zero or malformed units_per_em.");
         }
@@ -576,9 +518,8 @@ impl Font {
         }
         let unicode_overrides = unicode_overrides(&face, &char_to_glyph, contested, glyph_count);
 
-        // `hmtx` is a flat array; reading it once here is what keeps
-        // `metrics(..).advance_width` — the UI text measurer's per-character
-        // call — off the parse path entirely.
+        // Read `hmtx` once so `metrics(..).advance_width`, the UI text measurer's
+        // per-character call, never parses.
         let advances: Box<[u16]> = (0..glyph_count)
             .map(|gid| {
                 face.glyph_hor_advance(aterm_font::GlyphId(gid))
@@ -586,7 +527,7 @@ impl Font {
             })
             .collect();
 
-        // Ink boxes, but only where they are a header read (see the field docs).
+        // Ink boxes, only where they are a header read (see the field docs).
         let bboxes: Option<Box<[[i16; 4]]>> = face.tables().glyf.map(|_| {
             (0..glyph_count)
                 .map(|gid| {
@@ -596,9 +537,8 @@ impl Font {
                 .collect()
         });
 
-        // `Face::ascender`/`descender`/`line_gap` already apply the
-        // `USE_TYPO_METRICS` rule, which is the law `geometry_metrics` states
-        // elsewhere in this crate — so this is the same triple fontdue read.
+        // `Face::ascender`/`descender`/`line_gap` apply the `USE_TYPO_METRICS` rule, as
+        // `geometry_metrics` does.
         let line_metrics = Some(LineMetrics::new(
             face.ascender(),
             face.descender(),
@@ -624,9 +564,8 @@ impl Font {
         })
     }
 
-    /// The glyph id `ch` maps to, or `0` (`.notdef`) when the face has no
-    /// mapping. See the module docs for why this is the enumerated-cmap answer
-    /// and not `aterm_font::Face::glyph_index`'s Unicode-only one.
+    /// The glyph id `ch` maps to, or `0` (`.notdef`). This is the enumerated-cmap answer
+    /// (module docs), not `aterm_font::Face::glyph_index`'s Unicode-only one.
     #[inline]
     #[must_use]
     pub fn lookup_glyph_index(&self, ch: char) -> u16 {
@@ -667,12 +606,9 @@ impl Font {
         Some(self.line_metrics?.scale(self.scale_factor(px)))
     }
 
-    /// Legacy `kern`-table pair adjustment for `left`→`right` at `px`, or
-    /// `None` when the face has no `kern` table or no value for the pair.
-    ///
-    /// GPOS kerning is NOT read here — it was not read before either — nor by
-    /// the run shaper ([`crate::ligature_shaping`]), which places each glyph
-    /// on its cell and positions by advance alone (TF.6).
+    /// Legacy `kern`-table adjustment for `left`→`right` at `px`, or `None` without a
+    /// `kern` table or pair. Nothing reads GPOS kerning: the run shaper
+    /// ([`crate::ligature_shaping`]) positions by advance alone.
     #[must_use]
     pub fn horizontal_kern(&self, left: char, right: char, px: f32) -> Option<f32> {
         self.horizontal_kern_indexed(
@@ -687,9 +623,7 @@ impl Font {
     pub fn horizontal_kern_indexed(&self, left: u16, right: u16, px: f32) -> Option<f32> {
         let table = aterm_font::kern::Table::parse(self.kern.as_deref()?)?;
         let (l, r) = (aterm_font::GlyphId(left), aterm_font::GlyphId(right));
-        // First horizontal, non-variable subtable with an entry for THIS pair
-        // wins (fontdue's "first usable horizontal subtable" rule, widened so
-        // a subtable without the pair does not end the search).
+        // The first horizontal, non-variable subtable with an entry for this pair wins.
         let value = table
             .subtables
             .into_iter()
@@ -728,31 +662,35 @@ impl Font {
     }
 
     /// Rasterize `ch` at `px`: its [`Metrics`] and a `width * height` coverage
-    /// mask, 0 = uncovered, 255 = fully covered, TOP row first.
+    /// mask, 0 = uncovered, 255 = fully covered, top row first.
     #[inline]
     #[must_use]
     pub fn rasterize(&self, ch: char, px: f32) -> (Metrics, Vec<u8>) {
         self.rasterize_indexed(self.lookup_glyph_index(ch), px)
     }
 
-    /// [`Font::rasterize`] by glyph id.
-    ///
-    /// An id past the end of the face, a non-finite or non-positive `px`, and a
-    /// glyph with no outline all return an EMPTY mask — the first two with
-    /// default metrics, the last with the glyph's real advance, because a space
-    /// still moves the pen.
+    /// [`Font::rasterize`] by glyph id. An out-of-range id or a NaN or non-positive `px`
+    /// returns an empty mask with default metrics; a glyph with no outline returns an empty
+    /// mask with its real advance.
     #[must_use]
     pub fn rasterize_indexed(&self, gid: u16, px: f32) -> (Metrics, Vec<u8>) {
-        // `px` is caller-supplied, so NaN is a real input and is spelled out
-        // rather than hidden inside a negated comparison: an unordered size is
-        // refused exactly as a non-positive one is.
+        self.rasterize_indexed_at(gid, px, 0.0)
+    }
+
+    /// [`Font::rasterize_indexed`] for a glyph whose pen sits `dx` px (a
+    /// fraction, `0.0..1.0`) right of a whole pixel: the outline is filled
+    /// there, and `xmin` is that moved ink box's left edge, so the mask
+    /// drawn at the pen's whole pixel plus `xmin` keeps the run's true
+    /// spacing. At `dx = 0` it is exactly [`Font::rasterize_indexed`].
+    #[must_use]
+    pub fn rasterize_indexed_at(&self, gid: u16, px: f32, dx: f32) -> (Metrics, Vec<u8>) {
         if px.is_nan() || px <= 0.0 || gid >= self.glyph_count {
             return (Metrics::default(), Vec::new());
         }
         let Ok(face) = aterm_font::Face::parse(&self.data, self.index) else {
             return (Metrics::default(), Vec::new());
         };
-        match crate::variation::varied_glyph_raster_with_face(&face, gid, px) {
+        match crate::variation::varied_glyph_raster_with_face_at(&face, gid, px, dx) {
             Some((width, height, xmin, ymin, advance_width, cov)) => (
                 Metrics {
                     xmin,
@@ -763,10 +701,8 @@ impl Font {
                 },
                 cov,
             ),
-            // `varied_glyph_raster_with_face` declines an ink box that is empty
-            // or absurd (over 4096 px a side). The advance still has to be
-            // right — a cell whose glyph refuses to draw must not also lose its
-            // width.
+            // The raster declines an empty or absurd (> 4096 px a side) ink box; the cell
+            // keeps its advance.
             None => (
                 Metrics {
                     advance_width: self.advance_px(gid, px),
@@ -777,9 +713,7 @@ impl Font {
         }
     }
 
-    /// Scaled `hmtx` advance for `gid` — the ONE number the terminal grid is
-    /// built from, so it is read straight out of the precomputed table with the
-    /// same `scale * units` fontdue used.
+    /// Scaled `hmtx` advance for `gid` (`scale * units`), the number the grid is built from.
     #[inline]
     fn advance_px(&self, gid: u16, px: f32) -> f32 {
         let units = self.advances.get(usize::from(gid)).copied().unwrap_or(0);
@@ -803,14 +737,9 @@ impl Font {
     }
 }
 
-/// The bitmap box, in whole pixels, for a design-space ink box at `scale`:
-/// `(xmin, ymin, width, height)`.
-///
-/// This is fontdue's `metrics_raw` arithmetic in its shorter algebraic form —
-/// see the module docs for why the two agree integer for integer — and it is
-/// the SAME expression [`crate::variation::varied_glyph_raster_with_face`]
-/// sizes its coverage grid with, which is what keeps [`Font::metrics`] and
-/// [`Font::rasterize`] from ever disagreeing about a glyph's box.
+/// The whole-pixel bitmap box `(xmin, ymin, width, height)` for a design-space ink box at
+/// `scale`: the same expression [`crate::variation::varied_glyph_raster_with_face`] sizes
+/// its coverage grid with, so [`Font::metrics`] and [`Font::rasterize`] agree on the box.
 #[inline]
 fn ink_box_px(bbox: [i16; 4], scale: f32) -> (i32, i32, usize, usize) {
     let x_min = (f32::from(bbox[0]) * scale).floor();

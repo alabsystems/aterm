@@ -1,53 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm's clock: `std::time` everywhere it exists, and a browser clock where
-//! it does not.
+//! Platform clock facade: re-exports `std::time` on native targets and
+//! bridges to browser clocks (`performance.now()` / `Date.now()`) on
+//! `wasm32-unknown-unknown`, where `std::time::Instant::now()` panics.
 //!
-//! `std::time::Instant::now()` panics on `wasm32-unknown-unknown` ("time not
-//! implemented on this platform"): the target has no clock syscall and the
-//! browser's clocks are JS functions. The engine samples a monotonic clock
-//! everywhere (VT processing, the effects tick, predictive echo, present
-//! pacing), so a wasm build would trap on its first frame.
-//!
-//! On every target with `std::time`, this crate is a plain re-export:
-//! [`Instant`] is `std::time::Instant`. On `wasm32-unknown-unknown` it swaps
-//! in an [`Instant`] over `performance.now()` (monotonic, sub-millisecond) and
-//! a [`SystemTime`] over `Date.now()` (wall clock, ms since the Unix epoch).
-//! [`Duration`] is `core::time::Duration` on both arms.
-//!
-//! [`since_epoch`], [`unix_secs`] and [`unix_millis`] are the workspace's one
-//! spelling of "the wall clock as a Unix timestamp", correct on both arms.
-//!
-//! # Precision on the wasm arm
-//!
-//! Both browser clocks return `f64` milliseconds, which may be negative,
-//! non-finite or clamped. The conversion is total (non-finite and negative
-//! floor to zero) and splits whole milliseconds from the fraction before
-//! scaling, so an old time origin keeps sub-microsecond resolution.
-//!
-//! # Where the browser clocks come from
-//!
-//! This crate binds no JS and has no dependency. On `wasm32-unknown-unknown`
-//! it reads two link-time symbols, `aterm_wasm_performance_now` and
-//! `aterm_wasm_date_now`, and the wasm module defines them from its own JS
-//! bindings with [`wasm_clock_host!`]. The module (a cdylib) chooses how JS is
-//! reached, so the clock is the same whichever binding layer the module uses.
-//!
-//! A module that never invokes the macro does not link: `rust-lld` stops at
-//! `undefined symbol: aterm_wasm_date_now` (measured on rustup stable 1.96.0,
-//! wasm-platform WP.4). There is no install order to get wrong and no runtime
-//! fallback.
-//!
-//! # Testing the wasm arm
-//!
-//! The Trust toolchain has no `wasm32` std, so the `wasm-cpu` and `wasm-gpu`
-//! cells of `verify cells` type-check the wasm arm on rustup's `stable`.
-//! A box without the `wasm32` std reports them skipped, never passed.
-//! `verify wasm-smoke` runs both clocks in the two web modules under
-//! node. The shim's arithmetic is also compiled into the native test build
-//! (see `shim`).
-
+//! * [`Instant`], [`SystemTime`], and [`Duration`] provide a unified clock API.
+//! * [`since_epoch`], [`unix_secs`], and [`unix_millis`] read wall-clock Unix
+//!   timestamps on both targets.
+//! * On `wasm32-unknown-unknown`, `f64` millisecond readings clamp negative or
+//!   non-finite values to zero and split whole milliseconds from the
+//!   fractional part before scaling to preserve sub-microsecond resolution.
+//! * Wasm cdylib crates define the link-time symbols
+//!   `aterm_wasm_performance_now` and `aterm_wasm_date_now` via
+//!   [`wasm_clock_host!`].
 // A clock needs no unsafe; on the wasm arm the one `unsafe` is the extern
 // block naming the two clock symbols.
 #![cfg_attr(

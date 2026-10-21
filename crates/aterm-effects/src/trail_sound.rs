@@ -4246,18 +4246,33 @@ impl TrailSynth {
         self.tick_bed(dt_block);
 
         let dt = self.inv_sr;
-        // Per-sample duck recovery factor (τ = BONK_DUCK_TAU).
-        let duck_step = (-dt / BONK_DUCK_TAU).exp();
+        // Per-sample duck recovery factor (τ = BONK_DUCK_TAU); `self.duck` is
+        // written only by `design_bonk` inside `push`, so a block that starts
+        // with `duck == 0.0` never needs the exponential.
+        let duck_step = if self.duck > 0.0 {
+            (-dt / BONK_DUCK_TAU).exp()
+        } else {
+            0.0
+        };
         // The bed's floor test is block-invariant: `bed.level` is written only
         // by `tick_bed`, the quiet early-out and `push`, never inside the
         // sample loop.
         let bed_on = self.bed.level >= 1e-4;
-        // §9.7's limiter coefficients: per-sample steps of its two time
-        // constants, resolved once per block. Read only while `v2_latched`.
-        let lim_att = 1.0 - (-dt / LIMIT_ATTACK_S).exp();
-        let lim_rel = (-dt / LIMIT_RELEASE_S).exp();
         // In circuit while latched; the latch does not change inside a block.
         let lim_on = self.v2_latched;
+        // §9.7's limiter coefficients: per-sample steps of its two time
+        // constants, resolved once per block when `v2_latched`.
+        let (lim_att, lim_rel) = if lim_on {
+            (
+                1.0 - (-dt / LIMIT_ATTACK_S).exp(),
+                (-dt / LIMIT_RELEASE_S).exp(),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        // Nothing inside the sample loop ever turns a voice on, so trailing
+        // inactive slots can be skipped for the entire block.
+        let active_voices_end = self.voices.iter().rposition(|v| v.on).map_or(0, |i| i + 1);
         for f in 0..frames {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             // Duck-exempt sum — the bonk itself, riding above the dip.
@@ -4267,9 +4282,10 @@ impl TrailSynth {
             //
             // A counted `while`, not `for vi in 0..MAX_VOICES`: an unoptimized
             // build calls the range iterator four functions deep per slot, and
-            // this loop runs `MAX_VOICES` times per frame. Same slots, same order.
+            // this loop runs up to `MAX_VOICES` times per frame. Same slots,
+            // same order.
             let mut next_vi = 0;
-            while next_vi < MAX_VOICES {
+            while next_vi < active_voices_end {
                 let vi = next_vi;
                 next_vi += 1;
                 // Indexed, not `iter_mut`, so the body can reach other `self`

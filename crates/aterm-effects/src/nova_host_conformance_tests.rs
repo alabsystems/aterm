@@ -6,29 +6,18 @@
 //! profanity word in the classic nova style, ticked at 1 ms through three arms
 //! and everything between them.
 //!
-//! The model's defect lives in `Rearm`, and only the host re-arms: the ignition
-//! grant (`nova_start`, from the flash limiter), the spent mark (`nova_done`),
-//! `hard_reset`, the suspend time-shift in `thaw`, and the grace/rebirth rules
-//! that decide when a word may not ignite again. All of them run here, and both
-//! model variables come from the host:
+//! The model's defect lives in `Rearm`, and only the host re-arms, so every rule that decides
+//! re-ignition runs here: the grant (`nova_start`), the spent mark (`nova_done`), `hard_reset`,
+//! the suspend time-shift in `thaw`, and the grace/rebirth rules. The projection:
 //!
-//! * `phase`: `Armed` until the host grants an ignition, then the
-//!   `(now − nova_start, D)` window the emitter draws from (`D` from the word's
-//!   genome), and `Settled` for an episode marked spent without a grant (born
-//!   done). Each frame also checks `nova_done` is set exactly when the window
-//!   has run out.
-//! * `flashes`: frames on which the host's nova stream goes from dark to lit,
-//!   per phase window. The model counts a flash only on entering `Flash`.
+//! * `phase`: `Armed` until the grant, then the phase of `(now − nova_start, D)` (`D` from the
+//!   genome), or `Settled` for an episode born spent. Each frame checks `nova_done` is set
+//!   exactly when the window has run out.
+//! * `flashes`: frames on which the nova stream goes from dark to lit, per phase window.
 //!
-//! Each window boundary is validated as a `Step`, each `hard_reset` + rescan as
-//! a `Rearm` (new episode `Armed`, no crown yet), and every other host
-//! transition (a grace re-hit, an identity death and rebirth) must leave the
-//! projection unchanged. Three arms spend the model's `MaxSteps` budget; the
-//! second is frozen mid-crown for two seconds and must resume where it stopped.
-//!
-//! Negative control: from the real settled state, a re-arm that re-enters
-//! `Flash` and counts a second crown is rejected by the committed model and
-//! admitted by `Buggy = 1`.
+//! Window boundaries validate as `Step`, `hard_reset` + rescan as `Rearm`, and every other host
+//! transition (a grace re-hit, an identity rebirth) must leave the projection unchanged. The
+//! second arm is frozen mid-crown for two seconds and must resume where it stopped.
 
 use std::collections::BTreeMap;
 
@@ -132,8 +121,7 @@ impl Host {
         Some((occ, self.wd.persist.get(&occ.ident)?))
     }
 
-    /// The phase the host is in at `now` (see the module docs), after checking
-    /// the host's own spent mark against it.
+    /// The host's phase at `now`, after checking its spent mark against it.
     fn phase(&self, now: Instant) -> i64 {
         let (occ, ep) = self.episode().expect("the word has an episode");
         let Some(start) = ep.nova_start else {
@@ -296,7 +284,7 @@ fn the_real_host_conforms_to_nova_phase_model() {
     let mut now = t0 + Duration::from_secs(4);
 
     // Occluded for one rescan and back within the grace window: the same
-    // episode, still spent — no re-ignition.
+    // episode, still spent.
     host.rescan(false, now);
     host.rescan(true, now + Duration::from_secs(1));
     now += Duration::from_secs(1);
@@ -333,8 +321,8 @@ fn the_real_host_conforms_to_nova_phase_model() {
     );
 }
 
-/// The modelled defect on the real settled host state: a re-arm that lands in
-/// `Flash` and counts a second crown.
+/// Negative control: from the real settled state, a re-arm into `Flash` that counts a second
+/// crown is rejected by the committed model and admitted by `Buggy = 1`.
 #[test]
 fn a_rearm_into_flash_is_the_buggy_step_the_host_bind_rejects() {
     let model = nova_phase_model();

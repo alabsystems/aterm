@@ -2,15 +2,14 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! C1 control code tests: 8-bit CSI/OSC introducers, default-off security
-//! posture, and runtime enable/disable toggle.
+//! C1 controls: 8-bit introducers and ST, off by default, and 0x9C in string
+//! payloads.
 
 use super::super::*;
 use super::RecordingSink;
 
 #[test]
 fn parse_c1_csi() {
-    // C1 controls require explicit opt-in (disabled by default for UTF-8 security)
     let mut parser = Parser::with_c1_controls();
     let mut sink = RecordingSink::default();
 
@@ -23,7 +22,6 @@ fn parse_c1_csi() {
 
 #[test]
 fn parse_c1_osc() {
-    // C1 controls require explicit opt-in (disabled by default for UTF-8 security)
     let mut parser = Parser::with_c1_controls();
     let mut sink = RecordingSink::default();
 
@@ -80,8 +78,7 @@ fn osc_string_c1_st_byte_is_data_not_terminator() {
 
 #[test]
 fn c1_disabled_by_default() {
-    // Default parser should treat C1 bytes (0x80-0x9F) as invalid UTF-8
-    // This is the secure default for UTF-8 terminals
+    // C1 controls are off by default: 0x9B is U+FFFD, then "31m" prints.
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
@@ -89,10 +86,7 @@ fn c1_disabled_by_default() {
     // Instead: 0x9B -> replacement char, "31m" -> printed as regular chars
     parser.advance_fast(b"\x9b31m", &mut sink);
 
-    // Should NOT produce a CSI dispatch
     assert_eq!(sink.csi_dispatches.len(), 0);
-    // 0x9B becomes replacement char, then "31m" are printed as chars
-    // Total: 4 prints (replacement + '3' + '1' + 'm')
     assert_eq!(sink.prints.len(), 4);
     assert_eq!(sink.prints[0], char::REPLACEMENT_CHARACTER);
     assert_eq!(sink.prints[1], '3');
@@ -105,8 +99,7 @@ fn dcs_passthrough_preserves_non_st_high_bytes() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Build a DCS passthrough sequence containing all high bytes except 0x9C (ST).
-    // ESC P @ = DCS with final byte '@' (enters DcsPassthrough)
+    // Every high byte but 0x9C (ST).
     let payload: Vec<u8> = (0x80..=0x9Bu8).chain(0x9D..=0xFFu8).collect();
     let mut input = vec![0x1B, b'P', b'@']; // DCS hook
     input.extend_from_slice(&payload);
@@ -128,7 +121,7 @@ fn dcs_passthrough_st_c1_byte_terminates_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 0x9C in DCS passthrough should act as ST (terminate the sequence)
+    // 0x9C ends a DCS as ST.
     let mut input = vec![0x1B, b'P', b'@']; // DCS hook
     input.extend_from_slice(b"data");
     input.push(0x9C); // ST via C1
@@ -166,8 +159,7 @@ fn apc_payload_preserves_non_st_c1_bytes() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Build an APC sequence containing all high bytes except 0x9C (ST).
-    // ESC _ = APC start
+    // Every high byte but 0x9C (ST).
     let payload: Vec<u8> = (0x80..=0x9Bu8).chain(0x9D..=0xFFu8).collect();
     let mut input = vec![0x1B, b'_']; // APC start
     input.extend_from_slice(&payload);
@@ -189,7 +181,7 @@ fn apc_st_c1_byte_terminates_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 0x9C in APC should act as ST (terminate the sequence)
+    // 0x9C ends an APC as ST.
     let mut input = vec![0x1B, b'_']; // APC start
     input.extend_from_slice(b"data");
     input.push(0x9C); // ST via C1
@@ -205,8 +197,7 @@ fn apc_st_c1_byte_terminates_sequence() {
 
 #[test]
 fn parse_c1_osc_with_c1_st() {
-    // When C1 controls are enabled, 0x9C in OscString state should act as ST
-    // (terminating the OSC), not be accumulated as data.
+    // With C1 controls on, 0x9C ends an OSC as ST.
     let mut parser = Parser::with_c1_controls();
     let mut sink = RecordingSink::default();
 
@@ -243,8 +234,6 @@ fn c1_disabled_blocks_injection_in_csi_param_state() {
     // params adjusted by the state machine).
     parser.advance_fast(b"\x1b[1\x9b31m", &mut sink);
 
-    // The 0x9B should NOT have started a new CSI sequence.
-    // We should get exactly 1 CSI dispatch (the original \x1b[..m).
     assert_eq!(
         sink.csi_dispatches.len(),
         1,
@@ -252,7 +241,7 @@ fn c1_disabled_blocks_injection_in_csi_param_state() {
     );
 }
 
-/// Verify 0x9B in EscapeIntermediate state is dropped when C1 disabled (#7556).
+/// With C1 controls off, 0x9B in `Escape` is dropped.
 #[test]
 fn c1_disabled_blocks_injection_in_escape_state() {
     let mut parser = Parser::new();
@@ -263,7 +252,6 @@ fn c1_disabled_blocks_injection_in_escape_state() {
     // With fix: 0x9B is dropped in Escape state.
     parser.advance_fast(b"\x1b\x9b31m", &mut sink);
 
-    // The 0x9B should NOT have produced a CSI dispatch via C1
     assert_eq!(
         sink.csi_dispatches.len(),
         0,
@@ -271,7 +259,7 @@ fn c1_disabled_blocks_injection_in_escape_state() {
     );
 }
 
-/// Verify C1 bytes 0x90 (DCS) and 0x9D (OSC) are also blocked mid-sequence (#7556).
+/// With C1 controls off, 0x90 (DCS) and 0x9D (OSC) are dropped mid-CSI too.
 #[test]
 fn c1_disabled_blocks_dcs_osc_injection_mid_sequence() {
     let mut parser = Parser::new();
@@ -375,7 +363,7 @@ fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
         }
     }
 
-    // The case that motivated it, end to end: a UTF-8 payload and an 8-bit ST.
+    // End to end: a UTF-8 payload, then an 8-bit ST.
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
     parser.advance_fast(

@@ -935,6 +935,71 @@ fn a_gemini_wall_is_googles_error_body() {
     assert!(q.py().contains("\"retryDelay\": \"42s\""));
 }
 
+/// A Google ACCOUNT's spent usage limit (`exhausted_error`, the claim
+/// `code_assist`) is Code Assist's 429 in the shape Gemini CLI 0.46.0's
+/// `classifyGoogleError` takes as its terminal quota error WITH a delay —
+/// an `ErrorInfo` whose reason is `QUOTA_EXHAUSTED` in a Code Assist domain,
+/// and a `RetryInfo` — so its usage-limit dialog names the reset; the reset
+/// is in the message and the metadata too. NEGATIVE CONTROL: an API key's
+/// per-day quota (`quota_error`) carries a `QuotaFailure` naming `PerDay`
+/// (terminal before any delay is read: the dialog names no reset) and no
+/// `QUOTA_EXHAUSTED`.
+#[test]
+fn a_google_accounts_spent_limit_is_code_assists_quota_exhausted() {
+    let reset = 1_792_584_000;
+    let e = gemini::exhausted_error("gemini-3.5-flash", 3725, reset);
+    let err = e.get("error").unwrap();
+    assert_eq!(
+        (err.get("code"), err.get("status").and_then(J::as_str)),
+        (Some(&J::Int(429)), Some("RESOURCE_EXHAUSTED"))
+    );
+    assert_eq!(
+        err.get("message").and_then(J::as_str),
+        Some("You have exhausted your capacity on this model. Your quota will reset after 1h2m5s.")
+    );
+    let details = err.get("details").and_then(J::as_arr).unwrap();
+    let info = details
+        .iter()
+        .find(|d| {
+            d.get("@type").and_then(J::as_str) == Some("type.googleapis.com/google.rpc.ErrorInfo")
+        })
+        .unwrap();
+    assert_eq!(
+        info.get("reason").and_then(J::as_str),
+        Some("QUOTA_EXHAUSTED")
+    );
+    assert_eq!(
+        info.get("domain").and_then(J::as_str),
+        Some("cloudcode-pa.googleapis.com")
+    );
+    let meta = info.get("metadata").unwrap();
+    assert_eq!(
+        meta.get("quotaResetTimeStamp").and_then(J::as_str),
+        Some(format!("{}Z", crate::util::utc_civil(reset)).as_str())
+    );
+    assert_eq!(
+        meta.get("model").and_then(J::as_str),
+        Some("gemini-3.5-flash")
+    );
+    let retry = details
+        .iter()
+        .find(|d| {
+            d.get("@type").and_then(J::as_str) == Some("type.googleapis.com/google.rpc.RetryInfo")
+        })
+        .unwrap();
+    assert_eq!(retry.get("retryDelay").and_then(J::as_str), Some("3725s"));
+    // under an hour the span names no hours, as Code Assist writes it
+    let short = gemini::exhausted_error("m", 240, reset).py();
+    assert!(short.contains("reset after 4m0s."), "{short}");
+    // the control: the key's spent day
+    let day = gemini::quota_error("gemini-3.5-flash", 3725).py();
+    assert!(
+        day.contains("PerDay") && !day.contains("QUOTA_EXHAUSTED"),
+        "{day}"
+    );
+    assert_eq!(gemini::ACCOUNT_CLAIM, "code_assist");
+}
+
 /// The Gemini API's other refusals the lab measured (`measured_refusals`):
 /// each a custom mode's spec (`status` and `json`) whose body is Google's
 /// error with that code, under a name the stub serves as a custom mode and
@@ -1070,6 +1135,22 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     let walled = post(stream, turn);
     assert_eq!(walled.status(), 429);
     assert!(String::from_utf8_lossy(walled.body()).contains("PerDay"));
+    // a usage limit: a Google account's (`code_assist`) is Code Assist's
+    // QUOTA_EXHAUSTED with its reset; any other claim the key's spent day
+    let future = crate::util::now_secs() + 600;
+    control(&port, &format!("/__mode?m=limit:code_assist:{future}")).unwrap();
+    let account = post(stream, turn);
+    assert_eq!(account.status(), 429);
+    let body = String::from_utf8_lossy(account.body()).into_owned();
+    assert!(body.contains("\"QUOTA_EXHAUSTED\""), "{body}");
+    assert!(body.contains("cloudcode-pa.googleapis.com"), "{body}");
+    assert!(!body.contains("PerDay"), "{body}");
+    control(&port, &format!("/__mode?m=limit:five_hour:{future}")).unwrap();
+    let key = String::from_utf8_lossy(post(stream, turn).body()).into_owned();
+    assert!(
+        key.contains("PerDay") && !key.contains("QUOTA_EXHAUSTED"),
+        "the control: {key}"
+    );
 
     // the tool mode: a call with its signature, then done once its result is in
     std::fs::write(

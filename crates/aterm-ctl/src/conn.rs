@@ -1,33 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm conn`: the human CLI for session connections
-//! (docs/design/SESSION_CONNECTIONS.md §6.1). Shows and manages which sessions
-//! pull from or push to each other, from inside any aterm session or against
-//! the latest instance from outside one.
+//! `aterm conn`: the human CLI for session connections (docs/design/SESSION_CONNECTIONS.md
+//! §6.1): which sessions pull from or push to each other.
 //!
-//! A presentation layer over the §6 wire verbs (`connect`, `disconnect`,
-//! `flows`, `raise`, `spawn connected=`, `open connections`): each subverb
-//! frames one request per wire act through the crate's shared plumbing (socket
-//! resolution, token handshake, bounded reads, reply framing), so `aterm conn
-//! add` and `aterm ctl connect dst=… src=…` are the same act byte for byte.
-//!
-//! Peers are selectors (`@self`, `@<sid>`, `@<local-id>`), never titles.
-//! Outside an aterm session the `@self` forms refuse with an error naming
-//! `$ATERM_PARENT_SESSION_ID`; everything else targets the latest instance, as
-//! `aterm ctl` does.
+//! A presentation layer over the §6 wire verbs (`connect`, `disconnect`, `flows`, `raise`,
+//! `spawn connected=`, `open connections`) through the crate's shared plumbing, so `aterm
+//! conn add` and `aterm ctl connect dst=… src=…` are the same act byte for byte. Peers are
+//! selectors (`@self`, `@<sid>`, `@<local-id>`), never titles; outside an aterm session the
+//! `@self` forms refuse and everything else targets the latest instance.
 
 use std::env;
 use std::io::{self, BufReader, Write};
 use std::process::ExitCode;
 
-/// The conn subverbs completion offers after `aterm conn`, shared with
-/// [`crate::fish_completion`].
+#[path = "resource_run.rs"]
+mod resource_run;
+pub use resource_run::main_entry as resource_run_main_entry;
+
+/// The conn subverbs completion offers after `aterm conn`, shared with the front door's fish
+/// script ([`crate::front_door_fish`]).
 pub(crate) const CONN_SUBVERBS: &str = "ls add set rm spawn show map help";
 
-/// The `conn help` page. `conn` manages the standing wiring and hands the
-/// reader the `aterm ctl @<sid> turn …` drive line; the pull/push verbs stay on
-/// `aterm ctl` (§6.1).
+/// The `conn help` page. Driving a connected peer stays on `aterm ctl` (§6.1).
 const CONN_USAGE: &str = "\
 aterm conn — session connections: standing pull/push wiring between sessions.
 
@@ -80,14 +75,12 @@ DRIVING A CONNECTED PEER (the connection is standing wiring; driving is ctl):
 connected=/open connections`.
 ";
 
-/// Per-op socket deadline for the conn verbs. Every §6 verb answers
-/// synchronously (none blocks like `await`), so a short bound keeps a wedged
-/// instance from stalling the CLI, with margin for a loaded machine's window
-/// spawn.
+/// Per-op socket deadline for the conn verbs. Every §6 verb answers synchronously, so a
+/// bound keeps a wedged instance from stalling the CLI; 60s leaves margin for a loaded
+/// machine's window spawn.
 const CONN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The `aterm conn` verb: `argv` (past the `conn` token) in, exit code out.
-/// The `aterm` binary dispatches here beside `ctl`/`pkg`/`fleet`/`drive`.
 pub fn conn_main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     match conn_real_main(argv) {
         Ok(code) => code,
@@ -100,9 +93,7 @@ pub fn conn_main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     }
 }
 
-/// Write `"aterm conn: <msg>\n"` to stderr — the conn-prefixed twin of the
-/// crate's [`super::stderr_line`], so a failure names the verb the user typed,
-/// rendered for a terminal as it is ([`super::stderr_prefixed`]).
+/// Write `"aterm conn: <msg>\n"` to stderr: the conn-prefixed twin of [`super::stderr_line`].
 fn conn_stderr_line(msg: &str) -> io::Result<()> {
     super::stderr_prefixed("aterm conn: ", msg)
 }
@@ -132,14 +123,12 @@ fn conn_real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         } else if let Some(v) = arg.strip_prefix("--pid=") {
             pid = Some(super::parse_pid(v)?);
         } else {
-            // First positional is the subverb; the remainder is its argument list.
             rest.push(arg);
             rest.extend(args.by_ref());
             break;
         }
     }
-    // `help` needs no socket — answer before resolution so it works with no
-    // instance running at all (the discoverability path).
+    // `help` answers before socket resolution, so it works with no instance running.
     if rest.first().map(String::as_str) == Some("help") {
         return print_usage();
     }
@@ -174,8 +163,8 @@ fn print_usage() -> io::Result<ExitCode> {
 /// One resolved control-socket target the subverbs frame their requests on.
 struct ConnWire {
     path: String,
-    /// How `path` was chosen — `--sock`/`--pid` pin it — which decides what a
-    /// connect failure on it may offer instead (`super::connect_error`).
+    /// How `path` was chosen; decides what a connect failure may offer instead
+    /// (`super::connect_error`).
     origin: super::TargetOrigin,
 }
 
@@ -208,13 +197,9 @@ fn require_ok(reply: Reply) -> io::Result<Reply> {
 }
 
 impl ConnWire {
-    /// One framed request and reply: authenticate, send the joined parts as
-    /// one line, read the status and, when the framing table says the verb
-    /// streams `OK <n>` + n lines, the body rows. Uses [`super::exchange`]'s
-    /// bounded-read plumbing but returns the reply for rendering. A
-    /// [`CONN_DEADLINE`] that fires after connecting reports as
-    /// [`super::converse`] does (`no reply from <sock> within 60s …` or `reply
-    /// from <sock> stopped part-way: …`).
+    /// One framed request and reply: authenticate, send the joined parts as one line, read
+    /// the status and, for a Lines-framed verb's `OK <n>`, the n body rows. A
+    /// [`CONN_DEADLINE`] that fires after connecting reports as [`super::converse`] does.
     fn request(&self, parts: &[String]) -> io::Result<Reply> {
         super::validate_request_parts(parts)?;
         let mut request = parts.join(" ");
@@ -532,9 +517,9 @@ struct FlowPair {
     ops: Vec<String>,
 }
 
-/// The next `"<key>":"<value>"` member's value in `s`, plus the remainder.
-/// The values extracted (sids and `Op` tokens) are ASCII that `json_escape`
-/// never rewrites, so a plain quote scan is exact.
+/// The next `"<key>":"<value>"` member's value in `s`, plus the remainder. The values read
+/// (sids and op tokens) are ASCII the server's JSON escape never rewrites, so a plain quote
+/// scan is exact.
 fn str_member<'a>(s: &'a str, key: &str) -> Option<(String, &'a str)> {
     let i = s.find(key)?;
     let r = &s[i + key.len()..];
@@ -542,9 +527,8 @@ fn str_member<'a>(s: &'a str, key: &str) -> Option<(String, &'a str)> {
     Some((r[..e].to_string(), &r[e + 1..]))
 }
 
-/// Parse a `flows --json` body by an anchored key scan over `cmd_flows`' fixed
-/// emit order (`{"src":..,"dst":..,"ops":[..]}` per pair), keeping the crate
-/// free of a JSON dependency.
+/// Parse a `flows --json` body by an anchored key scan over the server's fixed emit order
+/// (`{"src":..,"dst":..,"ops":[..]}` per pair), keeping the crate free of a JSON dependency.
 fn parse_flows_json(body: &str) -> Vec<FlowPair> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -717,8 +701,7 @@ fn cmd_status(wire: &ConnWire, self_sid: Option<&str>) -> io::Result<ExitCode> {
     for row in &rows {
         super::print_stdout_line(row)?;
     }
-    // The ready-to-paste drive hint (§6.1: introspection referenced, not
-    // duplicated) — for the first peer this session can push into.
+    // A ready-to-paste drive line for the first peer this session can push into.
     if let Some((peer, _)) = outbound
         .iter()
         .find(|(_, ops)| matches!(kind_of_ops(ops), "push" | "both"))
@@ -847,9 +830,8 @@ fn cmd_add_set(
     let mut sessions = LazySessions::new(wire);
     let (dst, src) = resolve_pair(&spec, self_sid, &mut sessions)?;
     let kind = spec.kind.unwrap_or_else(|| "both".to_string());
-    // The wire replies with the minted capability hexes; the human CLI keeps
-    // bearer tokens off the terminal (the record store holds them, and a
-    // driver needing raw tokens uses `aterm ctl connect`).
+    // The reply carries the minted capability hexes; the human CLI keeps bearer
+    // tokens off the terminal (`aterm ctl connect` prints them).
     require_ok_for(
         wire.request(&[
             "connect".to_string(),
@@ -957,8 +939,7 @@ mod tests {
         v.iter().map(|t| t.to_string()).collect()
     }
 
-    /// The §6.1 direction rules: default is "I take control" (src=@self,
-    /// dst=peer), `--to-me` inverts, `--from` wires a third-party pair.
+    /// The §6.1 direction rules ([`direction_pair`]).
     #[test]
     fn direction_mapping_produces_the_right_dst_src_pairs() {
         assert_eq!(
@@ -1021,8 +1002,7 @@ mod tests {
         assert!(classify_selector("@sideways").is_err());
     }
 
-    /// Outside an aterm session (`$ATERM_PARENT_SESSION_ID` unset), `@self`
-    /// forms refuse with the documented error naming the variable.
+    /// Outside an aterm session, `@self` refuses with an error naming the variable.
     #[test]
     fn self_selector_outside_aterm_refuses_with_the_env_var_named() {
         let mut no_lookup = |_n: u64| -> io::Result<Option<String>> {
@@ -1033,8 +1013,7 @@ mod tests {
             e.to_string().contains("ATERM_PARENT_SESSION_ID"),
             "must name the env var: {e}"
         );
-        // Inside: expands to the sid; @<sid> passes through; @<local> resolves
-        // via the index and a miss is a clear error.
+        // Inside: @self expands; @<sid> passes through; @<local> resolves via the index.
         let ok = resolve_selector_with("@self", Some("s-me"), &mut no_lookup).unwrap();
         assert_eq!(ok, "s-me");
         let ok = resolve_selector_with("@s-peer", None, &mut no_lookup).unwrap();
@@ -1175,8 +1154,7 @@ mod tests {
             ),
             ("s-peer".to_string(), s(&["read-screen"])),
         ];
-        // Inbound: the peer holds pull over us (symmetric with our pull ⇒ ⇆),
-        // and a foreign supervisor pushes into us (unknown to `sessions`).
+        // Inbound: the peer's pull mirrors ours (collapses to ⇆); an unknown sid pushes in.
         let inbound = vec![
             ("s-peer".to_string(), s(&["read-screen"])),
             ("s-ghost".to_string(), s(&["write-input", "signal"])),

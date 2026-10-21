@@ -1,44 +1,30 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable presentation values for macOS bundle posture. This module performs
-//! no path or bundle probes and grants no replacement authority; native probing
-//! remains in `bundle`, while all-host message builders can render these facts.
+//! Portable presentation values for macOS bundle posture: no path or bundle probes and no
+//! replacement authority. Probing stays in `bundle`; any host's messages can render these.
 
-/// WHERE a running copy is installed from, and therefore what it can and cannot
-/// do for the person using it. `resolve_from` answers the updater's question —
-/// "may I replace this?" — as a bare `Option`, which is the right shape for the
-/// updater and the wrong shape for a human: "no" is the same value whether the
-/// copy is a dev build or a download the user never moved out of their Downloads
-/// folder, and only one of those is something they can fix.
-///
-/// This is that same judgement, kept as a REASON. It is what a first-open doctor
-/// reports, and it is deliberately pure — the classification is a function of the
-/// path alone, so every case below is a unit test rather than a situation someone
-/// has to reproduce by hand on a fresh Mac.
+/// Where a running copy is installed from, kept as a reason. `bundle::resolve_from`
+/// answers only "may I replace this?", and its "no" is the same for a dev build and for a
+/// download left in `~/Downloads`, though only the latter is the user's to fix.
+/// `bundle::posture_from` classifies from the path alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallPosture {
-    /// A normal install. The bundle can be replaced in place, so self-update
-    /// works and the shell shims can be written beside it.
+    /// Replaceable in place: self-update works and the shell shims go beside it.
     Installed,
-    /// Running from a mounted volume (`/Volumes/…`) — usually the user
-    /// double-clicked `aterm.app` inside the DMG window instead of dragging it
-    /// to Applications, but an install on a second drive lands here too: the
-    /// path alone cannot tell them apart, and the updater replaces neither.
+    /// Running from a mounted volume (`/Volumes/…`): usually opened inside the DMG
+    /// window, but an install on a second drive looks the same; neither is replaced.
     MountedImage,
-    /// Gatekeeper is running this copy from a randomized, read-only path (App
-    /// Translocation), which is what happens to a quarantined app launched
-    /// WITHOUT being moved first — typically unzipped and opened from
-    /// `~/Downloads`. The copy the user can see is not the copy that is running.
+    /// Gatekeeper runs this copy from a randomized read-only path (App Translocation):
+    /// a quarantined app opened without being moved, typically from `~/Downloads`.
     Translocated,
-    /// Not a `…/<name>.app/Contents/MacOS/<exe>` layout at all: a `cargo run` or
-    /// a `target/release` binary. Nothing is wrong; there is simply no bundle.
+    /// Not a `…/<name>.app/Contents/MacOS/<exe>` layout: a plain dev binary such as
+    /// `target/release/…`. Nothing is wrong; there is no bundle.
     NotABundle,
 }
 
 impl InstallPosture {
-    /// One line naming what is true, in the user's terms rather than the
-    /// updater's. No trailing period: callers put this in a sentence.
+    /// One line, in the user's terms. No trailing period: callers put it in a sentence.
     #[must_use]
     pub fn summary(self) -> &'static str {
         match self {
@@ -52,10 +38,8 @@ impl InstallPosture {
         }
     }
 
-    /// What the person should DO, or `None` when there is nothing to fix. The
-    /// two consequences are named because they are both invisible otherwise:
-    /// the copy silently cannot update itself, and it silently does not put
-    /// `aterm` on the PATH of a new shell.
+    /// What the person should do, or `None` when there is nothing to fix. It names both
+    /// consequences, which are otherwise invisible: no self-update and no `aterm` on PATH.
     #[must_use]
     pub fn remedy(self) -> Option<&'static str> {
         match self {

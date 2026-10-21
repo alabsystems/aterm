@@ -1,39 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Roster editing — the three operations the owner actually performs, expressed as PURE
-//! functions over a [`Roster`] value so each one is testable without a filesystem, a
-//! terminal, or the paper master.
-//!
-//! The master is needed to SIGN the result, never to compute it. Keeping that split means
-//! the interesting logic (which id is added, which is denied, how the sequence advances)
-//! is exercised by ordinary tests, and the only code that ever touches a secret is the
-//! thin CLI layer that calls these and then signs.
+//! Roster edits as pure functions over a [`Roster`] value, testable without a filesystem, a
+//! terminal or the paper master. The master signs the result and never computes it, so only
+//! the thin layer that calls these and then signs touches a secret.
 
 use aterm_update_core::roster::{MAX_MACHINES, Machine, Roster, SUPPORTED_SCHEMA};
 
-/// The `valid_until` every mint and revocation stamps: KEYS LAST FOREVER.
+/// The `valid_until` every mint and revocation stamps: keys last forever.
 ///
-/// # The dial existed, and the owner turned it off — decided, not defaulted
-///
-/// `valid_until` was a 180-day window: the only protection a brand-new install (no
-/// `roster_seq` floor yet) had against being served a replayed pre-revocation roster.
-/// The owner weighed that and removed it, on the argument that months of a valid stolen
-/// key already force a full re-key, so the window's residual protection did not pay for
-/// its cost — a mandatory return to the paper twice a year, and a fleet-wide fail-closed
-/// outage if the date ever lapsed unattended.
-///
-/// What remains is the honest shape of that decision: REVOCATION IS THE ONLY DEFENSE
-/// against a stolen machine key, and it requires the owner to notice the theft. The
-/// roster format keeps its date (fielded verifiers check one), so "forever" is a
-/// far-future date the strict parser accepts, not a format change.
+/// There is deliberately no expiry window. Its only protection, a floor-less fresh install
+/// refusing a replayed pre-revocation roster, does not pay for a twice-yearly return to the
+/// paper and a fleet-wide fail-closed outage if the date lapses; months of a stolen key force a
+/// full re-key anyway. Revocation is the only defense against a stolen machine key, and it
+/// needs the owner to notice the theft. The format keeps its date (fielded verifiers check
+/// one), so "forever" is a far-future date the strict parser accepts.
 pub const VALID_UNTIL_FOREVER: &str = "9999-12-31T00:00:00Z";
 
-/// The roster a brand-new channel starts from: schema 1, sequence 0, nobody listed.
-///
-/// Sequence 0 and an EMPTY machine list is a deliberate starting point rather than a
-/// special case — it authorizes nothing, so a roster that was created and never populated
-/// fails closed like everything else here.
+/// The roster a new channel starts from: schema 1, sequence 0, nobody listed, so it
+/// authorizes nothing.
 #[must_use]
 pub fn empty(_now_unix: u64) -> Roster {
     Roster {
@@ -47,19 +32,11 @@ pub fn empty(_now_unix: u64) -> Roster {
 
 /// Add a machine, advancing the sequence and restamping `valid_until` (see [`bump`]).
 ///
-/// # Why an id collision is a hard refusal and not an overwrite
-///
-/// The roster maps id → key, so re-minting under an existing id silently REPLACES that
-/// id's public key. Clients still holding the old roster would honour the old key while
-/// clients on the new one honour the new key — two live authorities under one name — and
-/// the deny-list, which names ids, could not name one without naming the other. That is
-/// invisible when it goes wrong, so the tool refuses rather than leaving the rule to the
-/// documentation. Reformatting a machine means a NEW id (`m3-2026b`) plus a revocation of
-/// the old one, which is [`revoke`] followed by this.
-///
-/// A REVOKED id is refused for the same reason with more force: an id never returns from
-/// the dead, because a client that still holds the revoking roster would keep denying it
-/// while a client on the new roster allowed it.
+/// An existing id is refused, not overwritten: clients on the old roster would honour the
+/// old key and clients on the new one the new key, two live authorities under one name that
+/// the id-based deny-list cannot separate. Reformatting a machine means a new id plus a
+/// [`revoke`] of the old one. A revoked id is refused too: a client still holding the
+/// revoking roster would keep denying it while one on the new roster allowed it.
 pub fn add(mut r: Roster, id: &str, pubkey_b64: &str, now_unix: u64) -> Result<Roster, String> {
     if id.is_empty() {
         return Err(
@@ -85,12 +62,9 @@ pub fn add(mut r: Roster, id: &str, pubkey_b64: &str, now_unix: u64) -> Result<R
         s.push_str("' has been revoked; an id never returns. Mint under a new one.");
         return Err(s);
     }
-    // THE OTHER DIRECTION OF THE SAME RULE, and the one that breaks revocation outright.
-    // Authority is decided by KEY and denial is expressed by ID, so one key under two ids
-    // means `machine-revoke <either>` withdraws nothing: the twin entry survives and the
-    // same key keeps signing under the surviving name. The owner would see the revocation
-    // succeed and still be publishable by the machine they cut off. `Roster::validate`
-    // refuses such a document on the client too; this is where an operator gets told why.
+    // The same rule from the other side: authority is decided by key and denial by id, so
+    // one key under two ids survives `machine-revoke` of either. `Roster::validate` refuses
+    // such a roster on the client too; this is where the operator is told why.
     if let Some(twin) = r.machines.iter().find(|m| m.pubkey == pubkey_b64) {
         let mut s = String::from("that public key is already on the roster as '");
         s.push_str(&twin.id);
@@ -120,12 +94,8 @@ pub fn add(mut r: Roster, id: &str, pubkey_b64: &str, now_unix: u64) -> Result<R
     Ok(bump(r))
 }
 
-/// Withdraw a machine: remove it from `[[machine]]` AND name it in `revoked`.
-///
-/// Both halves are required, and the second is the one that does the work. Merely
-/// deleting the entry would leave a client that fetched the OLD roster with no reason to
-/// stop trusting the machine; naming it explicitly means any client that reads this roster
-/// learns the denial in the same document that grants everyone else's authority.
+/// Withdraw a machine: remove it from `[[machine]]` and name it in `revoked`, so a client
+/// reading this roster learns an explicit denial, not merely an absence.
 pub fn revoke(mut r: Roster, id: &str, _now_unix: u64) -> Result<Roster, String> {
     if !r.machines.iter().any(|m| m.id == id) && !r.is_revoked(id) {
         let mut s = String::from("machine id '");
@@ -140,13 +110,9 @@ pub fn revoke(mut r: Roster, id: &str, _now_unix: u64) -> Result<Roster, String>
     Ok(bump(r))
 }
 
-/// Advance the replay counter — the thing EVERY edit must do — and restamp `valid_until`
-/// to [`VALID_UNTIL_FOREVER`].
-///
-/// One private helper rather than a line at each call site because forgetting the bump is
-/// silent and serious: a roster published without a sequence bump can be swapped for its
-/// predecessor by anyone who kept a copy. The restamp upgrades a roster minted under the
-/// old 180-day window at its next edit.
+/// Advance the replay counter, which every edit must do, and restamp `valid_until` to
+/// [`VALID_UNTIL_FOREVER`]. One helper because a forgotten bump is silent and serious: a
+/// roster published without one can be swapped for its predecessor by anyone with a copy.
 fn bump(mut r: Roster) -> Roster {
     r.roster_seq += 1;
     r.valid_until = VALID_UNTIL_FOREVER.to_string();
@@ -157,12 +123,11 @@ fn bump(mut r: Roster) -> Roster {
 mod tests {
     use super::*;
 
-    // 2026-08-04T00:00:00Z. Obviously a fixture; no real key or date depends on it.
+    // 2026-08-04T00:00:00Z, a fixture.
     const NOW: u64 = 1_785_801_600;
     const M3_KEY: &str = "PGwCmwCNJnpwjPqXKzcgKDBtGRoIvxWkuIXpsyC5cJc=";
     const M11_KEY: &str = "Fo0aiPXNC/1JVAOAuMFTB6XtBg5o4bXsPI5rUcC1YZo=";
 
-    /// A machine joins: it is listed, the sequence advances, and the stamp is forever.
     #[test]
     fn adding_a_machine_lists_it_and_advances_the_sequence() {
         let r = empty(NOW);
@@ -174,15 +139,13 @@ mod tests {
         assert_eq!(r.machines[0].pubkey, M3_KEY);
         assert_eq!(r.machines[0].added_at, "2026-08-04T00:00:00Z");
         assert_eq!(r.valid_until, VALID_UNTIL_FOREVER);
-        // A second machine joins alongside the first — this is the owner's whole point.
+        // A second machine joins alongside the first.
         let r = add(r, "m11", M11_KEY, NOW).unwrap();
         assert_eq!(r.roster_seq, 2);
         assert_eq!(r.machines.len(), 2);
         assert!(r.validate().is_ok(), "every edit must leave a valid roster");
     }
 
-    /// REUSING AN ID IS REFUSED. The failure it prevents is invisible when it happens, so
-    /// the tool refuses rather than documenting the rule.
     #[test]
     fn reusing_a_machine_id_is_refused_rather_than_overwriting_the_key() {
         let r = add(empty(NOW), "m3", M3_KEY, NOW).unwrap();
@@ -196,17 +159,8 @@ mod tests {
         assert!(add(r, "", M11_KEY, NOW).is_err());
     }
 
-    /// REUSING A KEY UNDER A SECOND ID IS REFUSED, and this is the stronger of the two
-    /// rules — reusing an id makes revocation ambiguous, reusing a key makes it a no-op.
-    ///
-    /// `revoke` names an id; `Roster::authorize_appcast` decides by key. So a key listed
-    /// twice cannot be withdrawn at all: revoke either name and the twin keeps signing
-    /// with the same key. The tool refuses because the failure is silent — the operator
-    /// sees the revocation succeed.
-    ///
-    /// Kills the mutation "check the id collision only": the first assertion below turns
-    /// into an `unwrap` of a roster that `Roster::validate` would then refuse anyway, so
-    /// the two halves of the rule are pinned on both sides.
+    /// The stronger of the two rules: a reused id makes revocation ambiguous, a reused key
+    /// makes it a no-op. With only the id check, the first assertion fails.
     #[test]
     fn reusing_a_key_under_a_second_id_is_refused_because_revocation_names_ids() {
         let r = add(empty(NOW), "m3", M3_KEY, NOW).unwrap();
@@ -216,13 +170,10 @@ mod tests {
         // No partial edit: the roster is exactly as it was.
         assert_eq!(r.machines.len(), 1);
         assert!(r.validate().is_ok());
-        // The negative control — a DIFFERENT key under a different id is the ordinary
-        // case and must stay easy, since making it easy is the point of the tier.
+        // Negative control: a different key under a different id is the ordinary case.
         assert!(add(r, "m11", M11_KEY, NOW).is_ok());
     }
 
-    /// REVOCATION removes AND denies. The deny is the half that reaches a client which
-    /// already saw the machine listed.
     #[test]
     fn revoking_removes_the_machine_and_names_it_in_the_deny_list() {
         let r = add(empty(NOW), "m3", M3_KEY, NOW).unwrap();
@@ -238,7 +189,7 @@ mod tests {
             "a revocation that did not bump the sequence could be swapped for its \
              predecessor by anyone holding a copy"
         );
-        // m3 is untouched: revocation is targeted, not a channel-wide brick.
+        // m3 is untouched: revocation is targeted.
         assert!(r.machines.iter().any(|m| m.id == "m3"));
         assert!(r.validate().is_ok());
 
@@ -248,22 +199,20 @@ mod tests {
         assert_eq!(r.revoked, ["m11"]);
     }
 
-    /// A revoked id NEVER returns, so a re-mint under it cannot resurrect the machine.
     #[test]
     fn a_revoked_id_can_never_be_re_added() {
         let r = add(empty(NOW), "m11", M11_KEY, NOW).unwrap();
         let r = revoke(r, "m11", NOW).unwrap();
         let err = add(r.clone(), "m11", M3_KEY, NOW).unwrap_err();
         assert!(err.contains("never returns"), "{err}");
-        // ...and the reformat recipe DOES work: a new id beside the revoked one.
+        // The reformat recipe works: a new id beside the revoked one.
         let r = add(r, "m11-2026b", M3_KEY, NOW).unwrap();
         assert!(r.is_revoked("m11"));
         assert!(r.machines.iter().any(|m| m.id == "m11-2026b"));
     }
 
-    /// Revoking something that was never there is an error, not a silent no-op: a typo'd
-    /// id would otherwise produce a freshly signed roster that revokes nobody, and the
-    /// owner would believe the stolen machine had been cut off.
+    /// A typo'd id would otherwise sign a roster that revokes nobody while the owner believes
+    /// the machine cut off.
     #[test]
     fn revoking_an_unknown_id_is_an_error_not_a_silent_no_op() {
         let r = add(empty(NOW), "m3", M3_KEY, NOW).unwrap();
@@ -271,13 +220,10 @@ mod tests {
         assert!(err.contains("not on the roster"), "{err}");
     }
 
-    /// The ceiling holds. The roster is the set of machines that can publish to every
-    /// user, so it is bounded on purpose.
     #[test]
     fn the_roster_has_a_hard_ceiling() {
-        // A DISTINCT key per machine, so this test measures the ceiling and nothing else.
-        // Filling it with one repeated key would now trip the key-collision rule at the
-        // second `add` and the assertion below would pass for the wrong reason.
+        // A distinct key per machine: one repeated key would trip the key-collision rule
+        // first and pass for the wrong reason.
         let key = |i: usize| format!("{}{i:02}=", &M3_KEY[..M3_KEY.len() - 3]);
         let mut r = empty(NOW);
         for i in 0..MAX_MACHINES {
@@ -288,8 +234,7 @@ mod tests {
         assert!(err.contains("full"), "{err}");
     }
 
-    /// Every edit stamps FOREVER — even a roster that somehow carries an earlier date
-    /// leaves an edit with the decided stamp, so no stale window can survive a mint.
+    /// Even a roster carrying an earlier date leaves an edit stamped forever.
     #[test]
     fn every_edit_stamps_the_forever_window() {
         let stale = Roster {
@@ -298,17 +243,15 @@ mod tests {
         };
         let fresh = add(stale, "m3", M3_KEY, NOW).unwrap();
         assert_eq!(fresh.valid_until, VALID_UNTIL_FOREVER);
-        // The stamp must PARSE under the same strict parser the client gates with —
-        // an unparseable forever would read as LAPSED and brick the tier at mint time.
+        // It parses under the client's strict gate: an unparseable forever would read as
+        // lapsed.
         assert_eq!(
             fresh.admit(0, NOW as i64),
             Ok(()),
             "9999-12-31 parses under the client's own gate and sits in the future"
         );
-        // The owner's decided residual, pinned so it stays a decision: a client with NO
-        // floor (a fresh install) admits this generation decades from now, so against a
-        // floor-less client a replayed pre-revocation roster never lapses and the only
-        // remedy for a stolen key is a full re-key.
+        // The decided residual: a client with no floor (a fresh install) admits this
+        // generation decades on, so a replayed pre-revocation roster never lapses against it.
         let years_later = NOW as i64 + 20 * 365 * 86_400;
         assert_eq!(
             fresh.admit(0, years_later),

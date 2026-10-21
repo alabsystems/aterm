@@ -5,17 +5,14 @@
 //! (crates/aterm-models-atpkg/src/models_atpkg_index_publish.rs). The reader half — the
 //! client's tag walk — stays in atpkg (`src/net/index_publish_conformance.rs`).
 //!
-//! Every decision a publisher holding a baseline faces in the model (its baseline number,
-//! the number it aims at, the channel's tags) is laid out on a fake channel, and the REAL
-//! indexer (`channel::index::publish_with`) publishes over it. Its outcome must be the
-//! model's one enabled decision — `Create`, `Converge` or `Refuse` — and leave the tags as
-//! the model does.
+//! Every decision a publisher holding a baseline faces in the model is laid out on a fake
+//! channel, and the real indexer (`channel::index::publish_with`) must take the model's one
+//! enabled decision (`Create`, `Converge` or `Refuse`) and leave the tags as the model does.
 //!
-//! NEGATIVE CONTROLS: the `Buggy = 1` decisions (a baseline counted off a draft, a number
-//! past the baseline's successor, a converge onto another publisher's bytes) are driven
-//! too, and the real indexer refuses each one the mutant takes. The writer cannot be TOLD
-//! a number past the baseline's successor (it derives N+1); the only way to name one is a
-//! channel's first publish, which a live channel refuses.
+//! Negative controls: the `Buggy = 1` decisions (a baseline counted off a draft, a number past
+//! the baseline's successor, a converge onto another publisher's bytes) are driven too, and
+//! the indexer refuses each. The writer derives N+1, so the only way to name a number past the
+//! successor is a channel's first publish, which a live channel refuses.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;

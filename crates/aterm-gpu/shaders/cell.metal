@@ -1,14 +1,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// text_blend != 0.0 => fs_glyph applies the W2 linear-corrected coverage remap.
+// text_blend != 0.0 => fs_glyph applies the linear-corrected coverage remap.
 //
-// BINDING LAW: uniform blocks in vertex functions here say [[buffer(0)]], and
-// that is safe ONLY because the instance stream is laid out at vertex-buffer
-// index 30 (ffi.rs::INSTANCE_STREAM_SLOT, wgpu-hal's own deconfliction).
-// [[stage_in]] attributes and constant buffers share ONE vertex argument
-// table; a stream at 0 lands on top of this block and the draw completes
-// having painted nothing. pipelines.rs's slot-scan test holds this file to it.
+// Vertex functions here take uniforms at [[buffer(0)]], safe only because the
+// instance stream sits at vertex-buffer index 30 (ffi.rs::INSTANCE_STREAM_SLOT,
+// wgpu-hal's own deconfliction): [[stage_in]] attributes and constant buffers share
+// one vertex argument table, and a stream at 0 overwrites this block so the draw
+// paints nothing. pipelines.rs's slot-scan test enforces it.
 struct Uniforms { float2 screen; float text_blend; float pad; };
 
 // Unit quad corner for vertex index 0..6 (two CCW triangles).
@@ -25,20 +24,18 @@ static inline float2 to_ndc(float2 px, constant Uniforms& u) {
     return float2(2.0 * px.x / u.screen.x - 1.0, 1.0 - 2.0 * px.y / u.screen.y);
 }
 
-// sRGB-encoded channel -> linear-light (the proper piecewise curve). The base
-// (OVER/REPLACE) passes render into an sRGB-typed target that re-encodes on
-// store, so emitting linear here makes fixed-function blending composite in
-// linear light, matching the CPU `blend`. Alpha/coverage are NOT sRGB and pass
-// through. (The ADDITIVE glow/deco-add passes render to the Unorm view and must
-// NOT decode.)
+// sRGB-encoded channel -> linear light. The base (OVER/REPLACE) passes render into
+// an sRGB view that re-encodes on store, so emitting linear makes fixed-function
+// blending composite in linear light like the CPU `blend`. Alpha and coverage pass
+// through; the additive passes render to the Unorm view and must not decode.
 static inline float3 s2l(float3 c) {
     float3 lo = c / 12.92;
     float3 hi = pow((c + float3(0.055)) / 1.055, float3(2.4));
     return select(lo, hi, c > float3(0.04045));
 }
 
-// Scalar sRGB decode/encode for the W2 corrected-alpha remap — the SAME
-// piecewise curves (and thresholds) as the CPU srgb_to_linear/linear_to_srgb.
+// Scalar sRGB decode/encode for the text_blend coverage remap: the same curves and
+// thresholds as the CPU srgb_to_linear/linear_to_srgb.
 static inline float s2l_s(float c) {
     if (c <= 0.04045) { return c / 12.92; }
     return pow((c + 0.055) / 1.055, 2.4);
@@ -48,7 +45,7 @@ static inline float l2s_s(float l) {
     return 1.055 * pow(l, 1.0 / 2.4) - 0.055;
 }
 
-// ---------------------------------------------------------------- BG / GLOW
+// ---------------------------------------------------------------- BG
 // BG_ATTRS: 0 => Uint16x4 (rect), 1 => Unorm8x4 (colour, hardware-normalized).
 struct BgVsIn {
     ushort4 rect_u [[attribute(0)]];
@@ -78,22 +75,19 @@ fragment float4 fs_bg(BgVsOut in [[stage_in]]) {
 }
 
 // ---------------------------------------------------------------- GLOW
-// GLOW_ATTRS: 0 => Uint16x4 (rect), 1 => Uint8x4 (LEFT colour), 2 => Uint8x4
-// (RIGHT colour) — both colours RAW integer bytes, not normalized.
+// GLOW_ATTRS: 0 => Uint16x4 (rect), 1 => Uint8x4 (left colour), 2 => Uint8x4
+// (right colour); both colours are raw bytes, not normalized.
 //
-// A GlowInstance is the bg rect plus a colour PAIR, the quad's left and right
-// edges (aterm_render::GlowQuad::color2, 2026-09-21). The vertex stage hands
-// the fragment the pair and the rect's width [[flat]], and the fragment ramps
-// between the two ends PER COLUMN with the SAME integer law the CPU rasterizer
-// uses (aterm_render::glow_lerp), for alpha alike:
+// A GlowInstance is the bg rect plus a colour pair for the quad's left and right
+// edges (aterm_render::GlowQuad::color2). The fragment ramps between them per
+// column with the CPU's integer law (aterm_render::glow_lerp), alpha included:
 //
 //     c(i) = (c0·(2w − m) + c1·m + w) / (2w),   m = 2i + 1
 //
-// A flat pair is the identity for every i (the historical bytes); a gradient
-// is continuous inside the quad. The rasterizer's float colour interpolant is
-// deliberately NOT used — its rounding is not the CPU's, and byte parity is
-// the contract. The fragment emits c / 255.0 RAW (no sRGB decode) into the
-// glow blend src + dst·(1 − src_a), which rounds once on store.
+// A flat pair is the identity for every i. The rasterizer's float interpolant is
+// not used: its rounding is not the CPU's, and byte parity is the contract. The
+// fragment emits c / 255.0 raw (no sRGB decode) into the glow blend
+// src + dst·(1 − src_a), which rounds once on store.
 struct GlowVsIn {
     ushort4 rect_u [[attribute(0)]];
     uchar4  c0     [[attribute(1)]];
@@ -104,14 +98,10 @@ struct GlowVsOut {
     float4 pos [[position]];
     // The quad's left edge and width in device px, as whole numbers.
     float2 span [[flat]];
-    // The fragment's x INSIDE THE QUAD, in the quad's own px: 0 at its left
-    // edge, its width at its right, interpolated linearly. Measured in the
-    // quad's space rather than as `pos.x - span.x` because the same pipeline
-    // draws the bloom EXTRACT into the HALF-RES bloom target under the
-    // full-res frame's uniforms: there `pos.x` is a half-res pixel and
-    // `span.x` a full-res one, and the difference clamped every fragment in
-    // the quad's left half toward the LEFT colour (the 2026-09-22 review: the
-    // halo over a red->blue ramp stayed red to its blue end).
+    // The fragment's x inside the quad, in the quad's own px (0 at its left edge,
+    // its width at its right). Not `pos.x - span.x`: the same pipeline draws the
+    // bloom extract into the half-res target under the full-res uniforms, where
+    // `pos.x` is a half-res pixel and `span.x` a full-res one.
     float lx [[center_no_perspective]];
     // The colour pair as exact bytes (r, g, b, a): premultiplied, a the mode.
     uint4 c0 [[flat]];
@@ -134,7 +124,7 @@ vertex GlowVsOut vs_glow(uint vi [[vertex_id]],
 }
 
 // The fragment's 0-based column inside its quad, from its x in the quad's own
-// px. At full res the pixel CENTRE interpolates to i + 0.5, so the floor is i
+// px. At full res the pixel centre interpolates to i + 0.5, so the floor is i
 // with half a pixel of margin either side; at half res each fragment reads the
 // quad's own column under its centre. The clamp only guards the edges.
 static inline uint glow_column(float lx, float w) {
@@ -165,10 +155,9 @@ struct RainVsIn {
 struct RainVsOut {
     float4 pos [[position]];
     float4 color;
-    // cx, cy, rx, ry (window px). Integers in stage_in MUST be flat in MSL,
-    // which is exactly the WGSL @interpolate(flat). The value is per-INSTANCE
-    // (identical across all 6 quad vertices), so the provoking-vertex rule
-    // never enters into it.
+    // cx, cy, rx, ry (window px). Integers in stage_in must be flat in MSL (the
+    // WGSL @interpolate(flat)); the value is per instance, so the provoking
+    // vertex never matters.
     uint4  fall [[flat]];
 };
 
@@ -188,7 +177,7 @@ vertex RainVsOut vs_rain_glow(uint vi [[vertex_id]],
 // The elliptical integer falloff weight, shared by the Add and Over halos.
 // Pure i32 math so it is byte-for-byte identical to the CPU draw_rain_add.
 static inline int rain_weight(float2 fragpos, uint4 fall) {
-    // Frag pos is the pixel CENTRE (px + 0.5); floor -> the integer pixel index
+    // Frag pos is the pixel centre (px + 0.5); floor -> the integer pixel index
     // the CPU walks.
     int px = int(floor(fragpos.x));
     int py = int(floor(fragpos.y));
@@ -218,32 +207,23 @@ fragment float4 fs_rain_glow(RainVsOut in [[stage_in]]) {
     return float4(r, g, b, 1.0);
 }
 
-// HaloMode::Over radial VEIL: the SAME integer falloff weight, emitted as the
-// STRAIGHT colour with the weight as the per-pixel ALPHA into the deco
-// source-over blend state.
+// HaloMode::Over veil: the same falloff weight, as the alpha of the straight
+// colour, into the deco source-over blend.
 fragment float4 fs_rain_glow_over(RainVsOut in [[stage_in]]) {
     int wt = rain_weight(in.pos.xy, in.fall);
-    // Per-pixel alpha CEILING (== CPU wt.min(halo_over_cap)): the veil's cap
-    // rides the instance colour's ALPHA byte; 0 == uncapped (255), so every
-    // historical veil (packed a == 0) is byte-identical.
+    // Per-pixel alpha ceiling (== CPU wt.min(halo_over_cap)), carried in the
+    // instance colour's alpha byte; 0 means uncapped (255).
     int cap = int(round(in.color.a * 255.0));
     if (cap == 0) { cap = 255; }
     if (wt > cap) { wt = cap; }
     return float4(in.color.rgb, float(wt) / 255.0);
 }
 
-// ========================== EMBERFORGE FIRE ==========================
-// The MSL twin of aterm_render::fire_field — OP-FOR-OP: every add, mul, shift,
-// division and clamp below mirrors the Rust module exactly (pure int/uint math,
-// wrapping uint semantics), so the CPU rasterizer's pixel and this fragment's
-// byte agree everywhere (the fire-parity contract).
-//
-// SHIFT DISCIPLINE: several of these shift a possibly-NEGATIVE int right
-// (notably `(body0 - 128) * edge >> 8`). WGSL defines i32 >> as ARITHMETIC
-// (sign-replicating), and so does MSL — Metal's integers are two's-complement
-// and >> on a signed type is an arithmetic shift. That equality is what keeps
-// the negative-body case identical; it is NOT the C++ implementation-defined
-// case, because MSL pins it.
+// ---------------------------------------------------------------- FIRE
+// The MSL twin of aterm_render::fire_field, op for op (pure int/uint math,
+// wrapping uint), so the CPU pixel and this fragment's byte agree everywhere.
+// Several lines shift a possibly negative int right (`(body0 - 128) * edge >> 8`);
+// WGSL and MSL both define signed >> as arithmetic, so that case matches too.
 
 static inline uint fire_hash(uint x, uint y, uint seed) {
     uint h = x * 0x9E3779B1u + y * 0x85EBCA77u + seed * 0xC2B2AE3Du;
@@ -293,7 +273,7 @@ static inline FireCoreOut fire_core(int px, int py, int base_y, int peak_h, uint
     int ch = max(cell_h, 2);
     uint chu = uint(ch);
     int peak = clamp(peak_h, 1, 2048);
-    // ROOT SKIRT: below the root the envelope mirrors, compressed 5x.
+    // Root skirt: below the root the envelope mirrors, compressed 5x.
     int v = base_y - py;
     if (v < 0) { v = -v * 5; }
     int vn = min((v * 256) / peak, 512);
@@ -396,11 +376,9 @@ vertex FireVsOut vs_fire(uint vi [[vertex_id]],
     return o;
 }
 
-// FireMode::Add — premultiplied field light on the One/One Unorm view:
-// (palette*cov + 127)/255 per channel is the SINGLE rounding point.
 // Shared shading tail == CPU fire_shade_add: coverage law, top fade, rim cool,
-// palette, and the single (ch*cov + 127)/255 rounding. Returns packed 0xRRGGBB
-// so the parity differential can compare the exact CPU u32.
+// palette, and the single (ch*cov + 127)/255 rounding. Returns packed 0xRRGGBB so
+// the parity differential compares the exact CPU u32.
 static inline uint fire_shade_add_px(FireCoreOut c, int py, int temp, int strength,
                                      int cov_cap, int cell_h, int top_fade_y) {
     (void)strength;
@@ -408,9 +386,8 @@ static inline uint fire_shade_add_px(FireCoreOut c, int py, int temp, int streng
     int dens = 150 + ((temp * 106) >> 8);
     int bodyc = 110 + ((c.body * 146) >> 8);
     int cov0 = min((((((c.edge * dens) >> 8) * bodyc) >> 8) * c.root) >> 8, cov_cap);
-    // TOP-EDGE FADE == CPU fire_top_fade. The CPU short-circuits tf == 255 to
-    // cov0; (cov0 * 255) / 255 == cov0 exactly, so this unconditional form is
-    // byte-identical (fire_fade(255) == 255).
+    // Top-edge fade == CPU fire_top_fade, whose tf == 255 short-circuit this
+    // unconditional form matches (fire_fade(255) == 255).
     int fade_px = max(cell_h * 2, 2);
     int ttop = clamp(((py - top_fade_y) * 255) / fade_px, 0, 255);
     int cov = (cov0 * fire_fade(ttop)) / 255;
@@ -440,10 +417,8 @@ fragment float4 fs_fire_add(FireVsOut in [[stage_in]]) {
                   float(packed & 0xFFu) / 255.0, 1.0);
 }
 
-// FireMode::Over — straight ink + field alpha through the deco source-over
-// blend state on the same Unorm view.
 // Shared shading tail == CPU fire_shade_over. Returns (packed 0xRRGGBB ink,
-// alpha 0..255) in a uint2 so the parity differential compares both exactly.
+// alpha 0..255) so the parity differential compares both exactly.
 static inline uint2 fire_shade_over_px(FireCoreOut c, int py, int temp, int cov_cap,
                                        int cell_h, int top_fade_y) {
     (void)temp;
@@ -533,8 +508,8 @@ fragment float4 fs_glyph(GlyphVsOut in [[stage_in]],
     return float4(fg_lin, cov);
 }
 
-// Colour-emoji glyphs: the atlas already holds the CPU renderer's final,
-// cell-sized RGBA pixels, so we blit them straight through.
+// Colour-emoji glyphs: the atlas holds the CPU renderer's final cell-sized RGBA,
+// passed straight through.
 fragment float4 fs_glyph_color(GlyphVsOut in [[stage_in]],
                                texture2d<float> atlas_tex [[texture(0)]],
                                sampler atlas_samp [[sampler(0)]]) {
@@ -547,14 +522,14 @@ fragment float4 fs_deco_over(GlyphVsOut in [[stage_in]],
                              texture2d<float> atlas_tex [[texture(0)]],
                              sampler atlas_samp [[sampler(0)]]) {
     float cov = atlas_tex.sample(atlas_samp, in.uv).r;
-    // Quantized to the CPU's intermediate byte lattice — the wgsl twin's law
-    // (fs_deco_over): round(cov*a*255)/255 == the CPU (cov*alpha+127)/255.
+    // Quantized to the CPU's byte lattice: round(cov*a*255)/255 == the CPU
+    // (cov*alpha+127)/255, as in the WGSL fs_deco_over.
     float a = rint(cov * in.color.a * 255.0) / 255.0;
     return float4(s2l(in.color.rgb), a);
 }
 
-// ADD (the profanity sparkle): output PREMULTIPLIED (rgb*a, a) into the One/One
-// additive pipeline => dst + rgb*a == the CPU add_sat(dst, premul_rgb(color, a)).
+// ADD (the profanity sparkle): emit premultiplied (rgb*a, a) into the One/One
+// pipeline, so dst + rgb*a == the CPU add_sat(dst, premul_rgb(color, a)).
 fragment float4 fs_deco_add(GlyphVsOut in [[stage_in]],
                             texture2d<float> atlas_tex [[texture(0)]],
                             sampler atlas_samp [[sampler(0)]]) {
@@ -564,9 +539,8 @@ fragment float4 fs_deco_add(GlyphVsOut in [[stage_in]],
     return float4(in.color.rgb * a, a);
 }
 
-// RGBA8 sprites use a per-instance multiply tint and opacity. The tint multiply
-// and the opacity multiply are QUANTIZED to 8 bits with round-half BEFORE the
-// sRGB decode, exactly reproducing the CPU stamp's intermediate byte.
+// RGBA8 sprites: the per-instance tint and opacity multiplies are each quantized
+// to 8 bits (round-half) before the sRGB decode, reproducing the CPU stamp's byte.
 fragment float4 fs_sprite_over(GlyphVsOut in [[stage_in]],
                                texture2d<float> atlas_tex [[texture(0)]],
                                sampler atlas_samp [[sampler(0)]]) {

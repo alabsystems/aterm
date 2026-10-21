@@ -3,10 +3,9 @@
 
 //! The width-reflow bump of `history_renumber_epoch`.
 //!
-//! A width rewrap changes how many rows the same history occupies, so absolute
-//! row numbers shift wholesale. `history_renumber_epoch` is the signal
-//! absolute-row-keyed caches (the search index, the viewport row cache) use to
-//! learn their keys went stale.
+//! A width rewrap changes how many rows the same history occupies, so absolute row numbers
+//! shift wholesale; the epoch is how absolute-row-keyed caches (the search index, the
+//! viewport row cache) learn their keys went stale.
 //!
 //! The epoch is the oracle here because no consumer witnesses the bump through
 //! a width change: the search slot's key (`SearchKey`) also compares `cols`,
@@ -47,8 +46,8 @@ fn a_width_reflow_advances_the_history_renumber_epoch_and_a_rows_only_resize_doe
     let history_rows_before = grid.scrollback_lines();
     let epoch_before = grid.history_renumber_epoch();
 
-    // Narrow: every retained logical line re-wraps into MORE rows, so the absolute
-    // number of every row above the splice shifts.
+    // Narrowing re-wraps every retained logical line into more rows, shifting the absolute
+    // number of every row above the splice.
     grid.resize(4, 17);
     assert!(
         grid.scrollback_lines() > history_rows_before,
@@ -62,7 +61,7 @@ fn a_width_reflow_advances_the_history_renumber_epoch_and_a_rows_only_resize_doe
          absolute-row-keyed cache gets"
     );
 
-    // CONTROL: rows-only. Nothing is re-wrapped, so nothing is renumbered.
+    // Control: a rows-only resize re-wraps and renumbers nothing.
     let epoch_after_width = grid.history_renumber_epoch();
     grid.resize(9, 17);
     assert_eq!(
@@ -73,13 +72,12 @@ fn a_width_reflow_advances_the_history_renumber_epoch_and_a_rows_only_resize_doe
     );
 }
 
-/// A width reflow with empty scrollback still advances the epoch: the same
-/// logical lines move from four rows to eight, so absolute row N names
-/// different text even though nothing was spliced into history.
+/// A width reflow with empty scrollback still advances the epoch: the same logical lines
+/// move from three rows to six, so absolute row N names different text even though nothing
+/// was spliced into history.
 #[test]
 fn a_width_reflow_with_no_scrollback_still_advances_the_renumber_epoch() {
-    // Three full-width lines in a 12-row viewport: 3 rows at width 20, 6 at
-    // width 10, so nothing is pushed off the top.
+    // Twelve rows hold both layouts, so nothing is pushed off the top.
     let mut grid = Grid::with_scrollback(12, 20, 200);
     for row in 0..3u16 {
         for (col, ch) in format!("row {row} text that wraps")
@@ -111,8 +109,7 @@ fn a_width_reflow_with_no_scrollback_still_advances_the_renumber_epoch() {
          consumers holding a cached absolute row get no other signal"
     );
 
-    // CONTROL, restated for this fixture: rows-only still renumbers nothing
-    // that a reveal/demote relabel does not already account for.
+    // Control: a resize to the same dimensions rewraps nothing.
     let epoch_after_width = grid.history_renumber_epoch();
     grid.resize(12, 10);
     assert_eq!(

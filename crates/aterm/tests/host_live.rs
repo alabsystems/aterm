@@ -794,9 +794,11 @@ fn write_world(tmp: &Path) {
          # with nothing drawn, and after a *.type screen ONE bounded read takes\n\
          # what was written, logged text:. A *.hold's seconds start once\n\
          # $log.go exists (the test says when: the host has attached).\n\
-         # It first writes a cell and erases it in place, as a real Claude\n\
+         # It first clears what the shell printed between its fork and this\n\
+         # exec, then writes a cell and erases it in place, as a real Claude\n\
          # Code moves the screen as it starts (start_fake says why).\n\
          log=$1; shift\n\
+         printf '\\033[2J\\033[H'\n\
          printf 'x\\b \\b'\n\
          old=$(stty -g)\n\
          stty -icanon -echo min 1\n\
@@ -1062,8 +1064,14 @@ fn let_go_once_looked(inst: &Instance, keys: &str, mark: usize, blank: bool) -> 
 /// [`run_fake`] without the clock: the fake's `*.hold` scenes wait for
 /// `<keys>.go`, its `*.look` and `*.late` ones for `<keys>.next`.
 ///
-/// WHAT THE FAKE WRITES AT START (`x`, backspace, space, backspace: a cell
-/// written and erased in place, so the rows end as they were), for the reason
+/// WHAT THE FAKE WRITES AT START. First a clear: the line runs `clear`
+/// before the fake, but the shell's child can still print between its fork
+/// and the fake's exec. Under load on Darwin, bash's job control has printed
+/// `-sh: child setpgid (N to N): Operation not permitted` there (verify,
+/// 2026-10-21). That line spoiled a `*.late` blank: the host's look read the
+/// complaint, never a blank, and the run hung at its hang detector. Then
+/// `x`, backspace, space, backspace: a cell written and erased in place, so
+/// the rows end as they were, for the reason
 /// `agent_verdict_live_headless.rs`'s silent launch fakes write it (fc6f5c64a).
 /// The status sweep names a foreground group when it CHANGES and once more
 /// 500 ms later (`PROGRAM_NAME_CONFIRM`), then only when the screen moves. A

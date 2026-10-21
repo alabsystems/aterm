@@ -15,6 +15,7 @@ fn transcript(name: &str) -> &'static str {
         "context" => include_str!("fixtures/claude-2.1.294-transcript-context.jsonl"),
         "not-logged-in" => include_str!("fixtures/claude-2.1.294-transcript-not-logged-in.jsonl"),
         "weekly-limit" => include_str!("fixtures/claude-2.1.294-transcript-weekly-limit.jsonl"),
+        "session-limit" => include_str!("fixtures/claude-2.1.294-transcript-session-limit.jsonl"),
         "bash-output-then-context" => {
             include_str!("fixtures/claude-2.1.294-transcript-bash-output-then-context.jsonl")
         }
@@ -50,6 +51,9 @@ fn transcript(name: &str) -> &'static str {
         ),
         "stop-hook-feedback-then-context" => {
             include_str!("fixtures/claude-2.1.304-transcript-stop-hook-feedback-then-context.jsonl")
+        }
+        "bucket-cancelled-then-model" => {
+            include_str!("fixtures/claude-2.1.302-transcript-bucket-cancelled-then-model.jsonl")
         }
         other => panic!("no transcript {other}"),
     }
@@ -1356,7 +1360,7 @@ fn a_closed_notice_the_screen_cannot_name_is_the_decisions_wall() {
     let host = TranscriptHost::of(&[Some(&notice_turn(MODEL, "model_not_found", true))]);
     let opts = hosted_by(&host);
     let mut m = Mock::new(vec![busy_screen()]);
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     let mut reading = read(&shown);
     s.confirm_wall(&mut reading, &at(&shown, 1), &opts, Check::Decide);
     let w = reading.wall.clone().expect("the transcript's wall");
@@ -1637,7 +1641,7 @@ fn a_notice_the_screen_shows_is_read_until_its_turn_closes() {
         cause: aterm_phase::ApiCause::Request,
     });
     let mut m = Mock::new(vec![busy_screen()]);
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     for (seq, (name, tails, asks)) in [
         (
             "open, then closed",
@@ -1734,7 +1738,7 @@ fn a_notice_drawn_like_prose_the_transcript_has_not_written_is_read_again_once()
         .collect::<Vec<_>>()
         .join("\n");
     let mut m = Mock::new(vec![busy_screen()]);
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     let host = TranscriptHost::of(&[Some(&prompt), Some(&closed)]);
     let opts = hosted_by(&host);
     let mut reading = read(&shown);
@@ -1812,7 +1816,7 @@ fn a_prose_notice_after_a_prompt_command_behind_an_older_notice_is_read_again_on
         cause: aterm_phase::ApiCause::Request,
     });
     let mut m = Mock::new(vec![busy_screen()]);
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     let host = TranscriptHost::of(&[Some(&older), Some(&written)]);
     let opts = hosted_by(&host);
     let mut reading = read(&shown);
@@ -2426,7 +2430,7 @@ fn a_lag_re_read_that_reads_nothing_refuses_the_wall() {
     let lagging = rows[..notice].join("\n");
     let shown = fx::screen(fx::MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED);
     let mut m = Mock::new(vec![busy_screen()]);
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     for (seq, (then, stands)) in [(None, false), (Some(full), true)].into_iter().enumerate() {
         let host = TranscriptHost::of(&[Some(lagging.as_str()), then]);
         host.own_again.store(true, Ordering::SeqCst);
@@ -2468,7 +2472,7 @@ fn a_point_decided_again_on_an_unmoved_screen_asks_the_transcript_again() {
     m.turn_releases = Some(0);
     let mut noted = Noted::default();
     let seq = {
-        let mut s = session(&mut m, None);
+        let mut s = virtual_session(&mut m, None);
         let screen = s.screen().expect("the wall");
         let point = s.turn_of(screen);
         let action = s
@@ -2737,10 +2741,11 @@ fn backs_off(s: &Session<'_, Mock>, a: &TurnEndAction, before: Instant, after: I
 /// A person's turn the transcript holds ends a left limit's wait: after a confirmed five-hour
 /// limit's countdown is cancelled, a short turn no read saw busy, on a screen that no longer shows
 /// the notice, is ordered by the transcript (its newest entry the model's reply after the notice),
-/// so the point is the continue policy's. Negative controls, each the wait for the reset: the
-/// transcript still ending on the notice, and no transcript.
+/// so the point is the continue policy's. The unchanged notice waits for its reset; no
+/// transcript instead preserves that reset and owner while scheduling a bounded reread.
 #[test]
 fn a_persons_turn_the_transcript_holds_ends_a_left_limits_wait() {
+    use crate::supervise::policy::turn_end::LIMIT_CONVERSATION_LOOK;
     let measured = transcript("session-limit-cancelled-then-person-turn");
     let rows: Vec<&str> = measured.lines().skip(1).collect();
     let cancel = rows
@@ -2805,26 +2810,53 @@ fn a_persons_turn_the_transcript_holds_ends_a_left_limits_wait() {
             .turn_end_at_point(&left, None, &opts)
             .unwrap_or_else(|e| panic!("{e:?}"));
         assert!(waits_on_the_reset(&s, &a), "the left limit's wait: {a:?}");
+        let remembered = s.turn_end.waited_limit().expect("the remembered reset");
+        let owner = s
+            .turn_end
+            .limit_conversation()
+            .cloned()
+            .expect("the limit's owner");
+        assert!(matches!(
+            &owner,
+            crate::supervise::policy::turn_end::Conversation::Named(_)
+        ));
         host.reads(after);
         let point = point_at(&mut s, turned.clone(), 103);
         let before = Instant::now();
         let a = s
             .turn_end_at_point(&point, None, &opts)
             .unwrap_or_else(|e| panic!("{e:?}"));
-        let after = Instant::now();
-        let (on_reset, backed) = (waits_on_the_reset(&s, &a), backs_off(&s, &a, before, after));
+        let decided_at = Instant::now();
+        if after.is_none() {
+            let look = LIMIT_CONVERSATION_LOOK;
+            assert!(
+                matches!(&a, TurnEndAction::WaitUntil { until, wait: WaitKind::Other, .. }
+                    if *until >= remembered.at.min(before + look)
+                        && *until <= remembered.at.min(decided_at + look)),
+                "an unread identity is rechecked within its bounded look: {a:?}"
+            );
+            assert_eq!(a.rule_id(), None, "no act on an unread conversation");
+            assert_eq!(s.turn_end.waited_limit(), Some(remembered));
+            assert_eq!(s.turn_end.limit_conversation(), Some(&owner));
+        }
+        let (on_reset, backed) = (
+            waits_on_the_reset(&s, &a),
+            backs_off(&s, &a, before, decided_at),
+        );
         (a, on_reset, backed)
     };
     let (a, _, backed) = decided(Some(measured));
     assert!(backed, "the continue policy's back-off: {a:?}");
-    // Negative controls.
-    for (name, after) in [
-        ("nothing since the cancel", Some(at_cancel.as_str())),
-        ("no transcript", None),
-    ] {
-        let (a, on_reset, _) = decided(after);
-        assert!(on_reset, "{name}: {a:?}");
-    }
+    // The readable, unchanged notice still waits out its reset exactly.
+    let (a, on_reset, _) = decided(Some(at_cancel.as_str()));
+    assert!(on_reset, "nothing since the cancel: {a:?}");
+    // Without a transcript the bounded reread above preserves both owner and reset;
+    // it is never the continue policy's back-off or permission to type an act.
+    let (a, on_reset, backed) = decided(None);
+    assert!(
+        !on_reset && !backed,
+        "no continuation back-off for an unread identity: {a:?}"
+    );
 }
 
 /// A limit a cancel left answers the act only by a notice written since it: the transcript's
@@ -3570,6 +3602,8 @@ fn a_seeded_loop_reads_the_limits_end_in_the_transcript_by_its_reset() {
         s.set_clock(now, PDT);
         s.set_zone_lookup(test_zones);
         s.seed_wall_memory(Some(crate::supervise::approvals::OpenWall {
+            conversation: super::super::wall_confirm::conversation_of(measured),
+            program: None,
             at_ms: MEASURED_NOTICE_AT * 1000,
             message: wall.message.clone(),
             reset: wall.reset.clone(),
@@ -3780,6 +3814,8 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
             s.set_clock(MEASURED_NOTICE_AT + 30 * 60, PDT);
             s.set_zone_lookup(test_zones);
             s.seed_wall_memory(Some(crate::supervise::approvals::OpenWall {
+                conversation: super::super::wall_confirm::conversation_of(measured),
+                program: None,
                 at_ms: MEASURED_NOTICE_AT * 1000,
                 message: wall.message.clone(),
                 reset: wall.reset.clone(),
@@ -3848,7 +3884,8 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
         if s.turn_end.waits_on_named_reset() || !backs_off(&s, &a, before, after) {
             wrong.push(format!("fired row {fired_row}, saw the notice: {a:?}"));
         }
-        // THE ACT, with no transcript to read.
+        // THE ACT in the same known conversation. A failed host read is
+        // unknown instead, and cannot spend the remembered wall's authority.
         for (reply, want, finished) in [
             (
                 done,
@@ -3885,10 +3922,16 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
                 false,
             ),
         ] {
-            let (a, _, task_done, _) = seeded(reply, None);
+            let (unread, waits, _, _) = seeded(reply, None);
+            if !matches!(unread, TurnEndAction::WaitUntil { .. }) || !waits {
+                wrong.push(format!(
+                    "fired row {fired_row}, unread {reply:?}: {unread:?}"
+                ));
+            }
+            let (a, _, task_done, _) = seeded(reply, Some(&at_limit));
             if a != want || task_done != finished {
                 wrong.push(format!(
-                    "fired row {fired_row}, no transcript, {reply:?}: {a:?} (finished {task_done})"
+                    "fired row {fired_row}, same conversation, {reply:?}: {a:?} (finished {task_done})"
                 ));
             }
         }
@@ -4072,4 +4115,771 @@ fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follow
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// VIRTUAL clocks standing at `now` (Unix seconds) in a zone `offset` from UTC, moved by sleeps
+/// through the session's door alone (`fx::VirtualClock`): a test passes a reset by sleeping on
+/// them (`s.fx.sleep`), at once, never in real time.
+fn virtual_clock<C: Ctl>(s: &mut Session<'_, C>, now: i64, offset: i64) {
+    use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
+    s.set_clock(now, offset);
+    s.set_fx(Fx::over(ClockSource::Virtual(Arc::new(VirtualClock::new(
+        Instant::now(),
+        now.saturating_mul(1000),
+    )))));
+}
+/// A BUCKET'S CANCEL ON A SHORT PANE IS THE BUCKET'S WHERE THE TRANSCRIPT IS READ (ATERM-KI-1015-1,
+/// LP-1 (d); the second review of round 21's amendment, minor 5). The policy's `keep going` met a
+/// Sonnet bucket under 24 h from its reset (Claude Code 2.1.302: no dialog, its own continue armed
+/// at once), and a person's Esc on the countdown came before the loop's first read. On a pane 12
+/// rows tall the bucket's own `⎿  You've hit your Sonnet limit · …` has scrolled off and the
+/// GENERIC `⏺ Usage limit reached · continuing automatically at 7:09pm · …` row is the newest notice
+/// drawn: the screen alone reads the act's answer as a usage window ([`aterm_phase::left_wall`]),
+/// which offers no bucket's fallback and which no `/model` moves. The session's transcript holds
+/// the bucket's notice row, written since the act (its words, its `rateLimitType`), and the left
+/// answer is confirmed as the limit that row names, as a screen's wall is (`wall_confirm.rs`
+/// `named_by`, KI-1015-1 W3): the bucket is the limit the policy works. The transcript
+/// is the measured 2.1.302 bucket's (`bucket-cancelled-then-model`) up to its cancel, under 24 h:
+/// the person's turn the policy's `keep going`, the notice's reset the screen's (`7:09pm`, and its
+/// `resetsAt`), the `/rate-limit-options` dialog's rows dropped (none is asked under 24 h), its
+/// stamps moved to the screen's `done 6:54 PM`. NEGATIVE CONTROL: no transcript — the screen alone,
+/// a usage window (LP-1's blind residual).
+#[test]
+fn a_buckets_cancel_on_a_short_pane_is_the_bucket_the_transcript_names() {
+    use aterm_phase::WallKind;
+    let short: Vec<String> = {
+        let rows = fx::screen(fx::WALL_SONNET_BUCKET_CANCELLED_UNDER_24H_2_1_302);
+        rows[rows.len() - 12..].to_vec()
+    };
+    assert!(
+        !short.iter().any(|r| r.contains("Sonnet limit")),
+        "the bucket's notice off the pane: {short:#?}"
+    );
+    assert_eq!(
+        aterm_phase::left_wall(&short).map(|w| w.kind),
+        Some(WallKind::UsageSession),
+        "the screen alone: a usage window"
+    );
+    let rows: Vec<&str> = transcript("bucket-cancelled-then-model")
+        .lines()
+        .skip(1)
+        .collect();
+    let notice = rows
+        .iter()
+        .position(|r| r.contains("\"isApiErrorMessage\":true"))
+        .expect("the bucket's notice row");
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    let under_a_day: Vec<String> = rows[..=notice + 1]
+        .iter()
+        .chain(std::iter::once(&rows[cancel]))
+        .map(|r| {
+            r.replace("carry on with the task", "keep going")
+                .replace("Oct 19 at 2:42am", "7:09pm")
+                // 2026-10-16 7:09pm PDT.
+                .replace("\"resetsAt\":1792402927", "\"resetsAt\":1792202940")
+        })
+        .collect();
+    // The notice written at 6:54:48 PM PDT, the screen's `done 6:54 PM`.
+    let notice_at: i64 = 1_792_202_088;
+    let tail = shifted(&under_a_day.join("\n"), -14 * 60);
+    assert_eq!(
+        super::super::wall_confirm::transcript_ends_on(&tail).at,
+        Some(notice_at),
+        "the notice row's own stamp"
+    );
+    let decided = |tail: Option<&str>| {
+        let host = tail.map(|t| TranscriptHost::of(&[Some(t)]));
+        let opts = SuperviseOpts {
+            idle_host: host.map(|h| h as Arc<dyn IdleHost>),
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            ..auto(30)
+        };
+        let mut m = Mock::new(vec![short.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(notice_at + 1, PDT);
+        // The act the loop typed at a turn's end.
+        let busy = busy_screen();
+        let at_act = TurnEndReading::of(
+            &aterm_phase::read(Some("claude"), &busy, Some(2)),
+            &busy,
+            false,
+            None,
+            None,
+            None,
+        );
+        s.turn_end.acted(
+            &TurnEndAction::Type {
+                text: "keep going".to_string(),
+                rule_id: crate::supervise::policy::turn_end::RULE_CONTINUE,
+            },
+            &at_act,
+            Instant::now(),
+        );
+        let mut point = point_at(&mut s, short.clone(), 102);
+        s.turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        s.point_as_decided(&mut point);
+        let bucket = s
+            .turn_end
+            .wall_since(WallKind::ModelBucket { consent: false })
+            .is_some();
+        let window = s.turn_end.wall_since(WallKind::UsageSession).is_some();
+        (point.phase, bucket, window)
+    };
+    // The point stays the limit point it was read as (its words the screen's, as the decision's
+    // books keep them); the limit worked is the bucket.
+    let (phase, bucket, window) = decided(Some(tail.as_str()));
+    assert!(
+        matches!(phase, Phase::Limited { .. }) && bucket && !window,
+        "the bucket the transcript's row names: {phase:?}, bucket {bucket}, window {window}"
+    );
+    // NEGATIVE CONTROL: no transcript.
+    let (phase, bucket, window) = decided(None);
+    assert!(
+        matches!(phase, Phase::Limited { .. }) && window && !bucket,
+        "hostless, the screen alone: {phase:?}, bucket {bucket}, window {window}"
+    );
+}
+
+/// A BUCKET'S CANCEL UNDER CLAUDE CODE'S LIMIT DIALOG ANSWERS THE ACT, AND NOTHING IS TYPED INTO
+/// THE BUCKET (ATERM-KI-1015-1, LP-1's residual (d); review 3 of round 21's limit-edges lane: a
+/// known wrong action). The policy's `keep going` met a Sonnet bucket whose reset is over 24 h away
+/// (Claude Code 2.1.302 opens its usage-limit dialog, answered `Wait here, …`, and arms its
+/// countdown), and a person's Esc on the countdown came before the loop's first read after the
+/// answer: that read is the measured `r21lebk2` screen, the cancel under the dialog's own rows
+/// (`❯ /rate-limit-options` and its answer) under the bucket's notice. The bucket is the limit the
+/// policy then works: the point is the limit's, the bucket tracked, and at the act's next points
+/// nothing of the continue policy's is typed — the wait runs to the bucket's reset
+/// (`model_fallback` off). Measured before: no wall read, the act judged a short turn, and
+/// `continue@v1 keep going` typed into the standing bucket at the back-off, two days before its
+/// reset. The transcript is the measured 2.1.302 bucket's (`bucket-cancelled-then-model`, its own
+/// `/rate-limit-options` rows kept) up to its cancel, the person's turn the policy's `keep going`,
+/// its reset the screen's (`Oct 19 at 2:25am`, and its `resetsAt`), its stamps moved to the
+/// screen's `done 6:52 PM`.
+#[test]
+fn a_buckets_cancel_under_the_limit_dialog_answers_the_act_and_nothing_is_typed_into_it() {
+    use aterm_phase::WallKind;
+    let screen: Vec<String> = fx::screen(fx::WALL_SONNET_BUCKET_CANCELLED_OVER_24H_2_1_302)
+        .into_iter()
+        .map(|r| r.replace("❯ carry on with the task", "❯ keep going"))
+        .collect();
+    let rows: Vec<&str> = transcript("bucket-cancelled-then-model")
+        .lines()
+        .skip(1)
+        .collect();
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    let tail: Vec<String> = rows[..=cancel]
+        .iter()
+        .map(|r| {
+            r.replace("carry on with the task", "keep going")
+                .replace("Oct 19 at 2:42am", "Oct 19 at 2:25am")
+                // 2026-10-19 2:25am PDT, as the lab's stub was told.
+                .replace("\"resetsAt\":1792402927", "\"resetsAt\":1792401934")
+        })
+        .collect();
+    // The notice written at 6:52:48 PM PDT, the screen's `done 6:52 PM`.
+    let tail = shifted(&tail.join("\n"), -16 * 60);
+    let notice_at = super::super::wall_confirm::transcript_ends_on(&tail)
+        .notice_at()
+        .expect("the bucket's notice row");
+    let host = TranscriptHost::of(&[Some(tail.as_str())]);
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        policy: SupervisorConfig {
+            answer_questions: false,
+            model_fallback: None,
+            ..SupervisorConfig::default()
+        },
+        ..auto(30)
+    };
+    let mut m = Mock::new(vec![screen.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_zone_lookup(test_zones);
+    virtual_clock(&mut s, notice_at + 1, PDT);
+    // The act the loop typed at a turn's end.
+    let busy = busy_screen();
+    let at_act = TurnEndReading::of(
+        &aterm_phase::read(Some("claude"), &busy, Some(2)),
+        &busy,
+        false,
+        None,
+        None,
+        None,
+    );
+    let typed_at = s.fx.mono();
+    s.turn_end.acted(
+        &TurnEndAction::Type {
+            text: "keep going".to_string(),
+            rule_id: crate::supervise::policy::turn_end::RULE_CONTINUE,
+        },
+        &at_act,
+        typed_at,
+    );
+    let mut acts = Vec::new();
+    let mut phase = None;
+    for seq in 102..106 {
+        let mut point = point_at(&mut s, screen.clone(), seq);
+        let a = s
+            .turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        s.point_as_decided(&mut point);
+        phase.get_or_insert(point.phase);
+        // Past the act's take window and the short turn's back-off: the act's next point.
+        s.fx.sleep(Duration::from_secs(10 * 60));
+        acts.push(a);
+    }
+    let typed: Vec<_> = acts.iter().filter(|a| a.rule_id().is_some()).collect();
+    assert!(typed.is_empty(), "nothing typed into the bucket: {acts:#?}");
+    assert!(
+        matches!(phase, Some(Phase::Limited { .. }))
+            && s.turn_end
+                .wall_since(WallKind::ModelBucket { consent: false })
+                .is_some()
+            && s.turn_end.waits_on_named_reset(),
+        "the bucket is the act's answer: {phase:?}"
+    );
+}
+
+/// 2026-09-17T09:18:59-07:00: a second before conversation B's five-hour limit resets (`resets
+/// 9:19am`, [`fx::WALL_SESSION_ARMED_CONVERSATION_B_2_1_300`]).
+const BEFORE_B_RESETS: i64 = TEST_NOW + 23 * 60 + 59;
+
+/// How the confirmed wall is carried to the next point.
+#[derive(Clone, Copy, Debug)]
+enum AfterB {
+    Live,
+    Seeded,
+    LegacySeed,
+    WithoutHost,
+}
+
+/// The decision at `second`, a point after conversation B's five-hour limit (the lab's 2.1.300
+/// screen, its countdown armed) was confirmed by B's own transcript, the host's tail then `tail`
+/// (`None`: none to read): the clock at `clock` (virtual: it moves only by the loop's sleeps and
+/// the test's), the reset's grace and jitter none, and, `past`, the reset passed before `second`
+/// is read. The continue policy off, so only the limit's own resume types anything.
+fn decided_after_b(
+    second: &[String],
+    tail: Option<&str>,
+    clock: i64,
+    past: bool,
+    after: AfterB,
+) -> TurnEndAction {
+    let armed = fx::screen(fx::WALL_SESSION_ARMED_CONVERSATION_B_2_1_300);
+    let host = TranscriptHost::of(&[Some(transcript("session-limit"))]);
+    let mut opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        policy: SupervisorConfig {
+            answer_questions: false,
+            continue_policy: false,
+            ..SupervisorConfig::default()
+        },
+        ..auto(30)
+    };
+    let mut m = Mock::new(vec![armed.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_zone_lookup(test_zones);
+    // Virtual clocks: the monotonic and the wall clock move together, so a reset read again off a
+    // redrawn notice is placed where the first read placed it.
+    virtual_clock(&mut s, clock, PDT);
+    s.set_turn_end_timing(TurnEndTiming {
+        reset_grace: Duration::ZERO,
+        reset_jitter: Duration::ZERO,
+        ..TurnEndTiming::default()
+    });
+    let wall = point_at(&mut s, armed, 101);
+    let a = s
+        .turn_end_at_point(&wall, Some(Duration::from_secs(60)), &opts)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("goes on by itself")),
+        "B's armed countdown: {a:?}"
+    );
+    use crate::supervise::approvals::{self, Outcome, Row};
+    use crate::supervise::policy::turn_end::Conversation;
+    let memory = s.wall_memory.as_ref().expect("the confirmed wall");
+    assert!(
+        matches!(&memory.conversation, Conversation::Named(_)),
+        "the confirming tail named B"
+    );
+    if matches!(after, AfterB::Seeded | AfterB::LegacySeed) {
+        let reason = approvals::wall_wait_reason(
+            s.wall_reset.as_ref().and_then(|(_, at)| *at),
+            memory.wall.reset.as_deref(),
+            memory.wall.kind,
+            &memory.wall.message,
+        );
+        let row = Row {
+            rule_id: approvals::RULE_WALL_WAIT,
+            outcome: Outcome::Waiting,
+            command: "",
+            reason: &reason,
+            box_seq: 101,
+        };
+        let body = if matches!(after, AfterB::Seeded) {
+            row.to_json_wall_wait(clock * 1000, Some("@s-1"), &memory.conversation)
+        } else {
+            row.to_json(clock * 1000, Some("@s-1"))
+        };
+        let open = approvals::open_wall_in(&body, Some("@s-1")).expect("the same wall read back");
+        assert_eq!(
+            open.kind,
+            Some(memory.wall.kind),
+            "identity is outside the legacy kind span"
+        );
+        drop(s);
+        s = session(&mut m, Some("@s-1".to_string()));
+        s.set_zone_lookup(test_zones);
+        virtual_clock(&mut s, clock, PDT);
+        s.set_turn_end_timing(TurnEndTiming {
+            reset_grace: Duration::ZERO,
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+        s.seed_wall_memory(Some(open));
+    }
+    if matches!(after, AfterB::WithoutHost) {
+        opts.idle_host = None;
+    }
+    if past {
+        // The reset is a second off: past it once this virtual sleep has run.
+        s.fx.sleep(Duration::from_millis(1500));
+    }
+    host.reads(tail);
+    let p = point_at(&mut s, second.to_vec(), 102);
+    s.turn_end_at_point(&p, None, &opts)
+        .unwrap_or_else(|e| panic!("{e:?}"))
+}
+
+/// A LIMIT'S CONTINUATION IS ITS OWN CONVERSATION'S, THOUGH NO NOTICE IS DRAWN (ATERM-KI-1015-1,
+/// LP-1: the review of round 20's W1 fix, live as `lp20w1a` on Claude Code 2.1.300:
+/// `usage-resume@v1` typed into A). Conversation B's five-hour limit stands, its countdown armed;
+/// a person `/resume`s conversation A (the lab's 2.1.300 screen: no limit in A's history, B's
+/// countdown dropped, no notice drawn), and the host's transcript is now A's (another session id,
+/// no row of B's notice). At B's reset A's words get the continue policy's act — off here, so
+/// nothing is typed into A, which owed no continuation. Measured before: the screen drew no notice
+/// to tell A from B by, and `usage-resume@v1` was typed into A at B's reset. NEGATIVE CONTROL: the
+/// transcript still B's (the conversation the limit stopped is the one on the screen) — the
+/// continuation typed at the reset.
+#[test]
+fn a_limits_continuation_is_typed_into_no_other_conversation() {
+    use crate::supervise::approvals::{self, Outcome, Row};
+    use crate::supervise::policy::turn_end::Conversation;
+    let resumed = fx::screen(fx::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300);
+    let ours = transcript("session-limit");
+    let theirs = another_conversation(ours);
+    let unnamed = ours.replace("\"sessionId\":", "\"oldSessionId\":");
+    for after in [AfterB::Live, AfterB::Seeded] {
+        let a = decided_after_b(&resumed, Some(&theirs), BEFORE_B_RESETS, true, after);
+        assert_eq!(
+            a.rule_id(),
+            None,
+            "nothing typed into A at B's reset ({after:?}): {a:?}"
+        );
+        // A real host read None or a tail without identity is unknown, even
+        // though the screen and reset clock still look like B's.
+        for tail in [None, Some(""), Some(unnamed.as_str())] {
+            let a = decided_after_b(&resumed, tail, BEFORE_B_RESETS, true, after);
+            assert!(
+                matches!(a, TurnEndAction::WaitUntil { .. }),
+                "unread ({after:?}): {a:?}"
+            );
+        }
+        // Negative control: B's own readable tail authorizes its continuation.
+        let a = decided_after_b(&resumed, Some(ours), BEFORE_B_RESETS, true, after);
+        assert_eq!(
+            a.rule_id(),
+            Some(crate::supervise::policy::turn_end::RULE_LIMIT_RESUME),
+            "B's own ({after:?}): {a:?}"
+        );
+    }
+    let a = decided_after_b(&resumed, None, BEFORE_B_RESETS, true, AfterB::WithoutHost);
+    assert!(
+        matches!(a, TurnEndAction::WaitUntil { .. }),
+        "a departed host cannot unbind B: {a:?}"
+    );
+    let a = decided_after_b(
+        &resumed,
+        Some(ours),
+        BEFORE_B_RESETS,
+        true,
+        AfterB::LegacySeed,
+    );
+    assert!(
+        matches!(a, TurnEndAction::WaitUntil { .. }),
+        "a legacy host-scoped seed has no owner: {a:?}"
+    );
+
+    // The optional field roundtrips separately from the unchanged kind/reason.
+    // Legacy rows still parse; explicit unknown remains scoped across restore.
+    let reason = approvals::wall_wait_reason(
+        Some(BEFORE_B_RESETS + 1),
+        Some("9:19am"),
+        aterm_phase::WallKind::UsageSession,
+        "session limit",
+    );
+    let row = Row {
+        rule_id: approvals::RULE_WALL_WAIT,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: &reason,
+        box_seq: 101,
+    };
+    for conversation in [
+        Conversation::Hostless,
+        Conversation::Unknown,
+        Conversation::Named("B;\"unicode-λ".to_owned()),
+    ] {
+        let body = row.to_json_wall_wait(BEFORE_B_RESETS * 1000, Some("@s-1"), &conversation);
+        let value: aterm_json::Value = aterm_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            value.get("reason").and_then(aterm_json::Value::as_str),
+            Some(reason.as_str())
+        );
+        let open = approvals::open_wall_in(&body, Some("@s-1")).expect("legacy-compatible row");
+        assert_eq!(open.conversation, conversation);
+        assert_eq!(open.kind, Some(aterm_phase::WallKind::UsageSession));
+    }
+    // A typed retry closes OpenWall, but the actual usage-try seed retains
+    // its identity. A later point can persist unknown without inventing a
+    // new row kind; an absent field cannot downgrade scoped evidence.
+    let tried = Row {
+        rule_id: crate::supervise::policy::turn_end::RULE_LIMIT_RESUME,
+        outcome: Outcome::Typed,
+        command: "keep going",
+        reason: &approvals::act_reason(Some(crate::supervise::policy::turn_end::LimitTry {
+            bucket: false,
+            in_place: false,
+            attempts: 1,
+            entitlement: false,
+        })),
+        box_seq: 102,
+    };
+    let owner = Conversation::Named("B".to_owned());
+    let body = tried.to_json_scoped(BEFORE_B_RESETS * 1000, Some("@s-1"), None, None, &owner);
+    assert!(approvals::open_wall_in(&body, Some("@s-1")).is_none());
+    assert_eq!(
+        approvals::usage_attempt_in(&body, Some("@s-1"))
+            .expect("the try")
+            .conversation,
+        owner
+    );
+    let mut state = crate::supervise::policy::turn_end::TurnEndState::default();
+    seed_usage_act_in(
+        &mut state,
+        &body,
+        Some("@s-1"),
+        &OlderReads::default(),
+        (BEFORE_B_RESETS + 60) * 1000,
+        Instant::now(),
+    );
+    assert_eq!(state.limit_conversation(), Some(&owner));
+    let point = Row {
+        rule_id: approvals::RULE_POINT,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: "point",
+        box_seq: 103,
+    };
+    let conflicting = point.to_json_scoped(
+        (BEFORE_B_RESETS + 60) * 1000,
+        Some("@s-1"),
+        None,
+        None,
+        &Conversation::Named("A".to_owned()),
+    );
+    assert_eq!(
+        approvals::usage_attempt_in(&format!("{body}\n{conflicting}\n"), Some("@s-1"))
+            .expect("the original try")
+            .conversation,
+        Conversation::Unknown
+    );
+    let unknown = point.to_json_scoped(
+        (BEFORE_B_RESETS + 60) * 1000,
+        Some("@s-1"),
+        None,
+        None,
+        &Conversation::Unknown,
+    );
+    let legacy = point.to_json((BEFORE_B_RESETS + 61) * 1000, Some("@s-1"));
+    let body = format!("{body}\n{unknown}\n{legacy}\n");
+    assert_eq!(
+        approvals::usage_attempt_in(&body, Some("@s-1"))
+            .expect("the scoped try")
+            .conversation,
+        Conversation::Unknown
+    );
+}
+
+/// `rows` with a shell of the agent's that outlived the turn, as the measured background-work
+/// screens draw it (`· 1 shell still running` on the done row, `· 1 shell` in the footer): no
+/// live turn, the screen read busy on that work alone.
+fn with_a_shell(mut rows: Vec<String>) -> Vec<String> {
+    let done = rows
+        .iter()
+        .rposition(|r| r.starts_with('✻'))
+        .expect("done row");
+    rows[done].push_str(" · 1 shell still running");
+    let footer = rows
+        .iter()
+        .rposition(|r| r.contains("auto mode on"))
+        .expect("mode row");
+    rows[footer].push_str(" · 1 shell");
+    assert!(aterm_phase::background_only(&rows), "{rows:#?}");
+    rows
+}
+
+/// A REMEMBERED LIMIT IS ITS OWN CONVERSATION'S TOO (ATERM-KI-1015-1, LP-1). Conversation B's
+/// five-hour limit armed, confirmed by B's transcript; a person `/resume`s conversation A while the
+/// agent's background shell runs, so A's screen reads busy on that work alone and the loop's
+/// memory supplies B's wall in its place. The host's transcript is A's. At B's reset nothing is
+/// typed into A (the continue policy off): the remembered wall is B's, and A's screen is no point
+/// of it. Measured before: the wall was read as this screen's, and `usage-resume@v1` was typed into
+/// A at B's reset. NEGATIVE CONTROL: the transcript B's own — the remembered wall is this
+/// screen's, and its continuation goes at the reset.
+#[test]
+fn a_remembered_limits_continuation_is_typed_into_no_other_conversation() {
+    let resumed = with_a_shell(fx::screen(fx::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300));
+    let ours = transcript("session-limit");
+    let theirs = another_conversation(ours);
+    let a = decided_after_b(&resumed, Some(&theirs), BEFORE_B_RESETS, true, AfterB::Live);
+    assert_eq!(
+        a.rule_id(),
+        None,
+        "nothing typed into conversation A at B's reset: {a:?}"
+    );
+    // NEGATIVE CONTROL: the transcript B's own.
+    let a = decided_after_b(&resumed, Some(ours), BEFORE_B_RESETS, true, AfterB::Live);
+    assert_eq!(
+        a.rule_id(),
+        Some(crate::supervise::policy::turn_end::RULE_LIMIT_RESUME),
+        "B's remembered wall at its reset: {a:?}"
+    );
+}
+
+/// The decision at the 14-row pane of a Sonnet bucket ([`fx::WALL_SONNET_BUCKET_ARMED_NOTICE_SCROLLED_OFF_2_1_302`],
+/// its reset moved to `Sep 19`, two days off the test's clock), the host's tail the transcript up to the
+/// dialog's answer; then at `second` with the tail `tail`. The continue policy on.
+fn decided_at_scrolled_bucket(second: &[String], tail: &str) -> (TurnEndAction, TurnEndAction) {
+    let sep = |s: &str| s.replace("Oct 19 at 2:42am", "Sep 19 at 2:42am");
+    let armed: Vec<String> = fx::screen(fx::WALL_SONNET_BUCKET_ARMED_NOTICE_SCROLLED_OFF_2_1_302)
+        .iter()
+        .map(|r| sep(r))
+        .collect();
+    let whole = sep(transcript("bucket-cancelled-then-model"));
+    let at_wall: String = whole
+        .lines()
+        .take_while(|l| !(l.starts_with('{') && l.contains("Automatic continue cancelled")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let host = TranscriptHost::of(&[Some(&at_wall)]);
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        policy: SupervisorConfig {
+            answer_questions: false,
+            ..SupervisorConfig::default()
+        },
+        ..auto(30)
+    };
+    let mut m = Mock::new(vec![armed.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_zone_lookup(test_zones);
+    s.set_clock(TEST_NOW, PDT);
+    let wall = point_at(&mut s, armed, 101);
+    let first = s
+        .turn_end_at_point(&wall, Some(Duration::from_secs(60)), &opts)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    host.reads(Some(&sep(tail)));
+    let p = point_at(&mut s, second.to_vec(), 102);
+    let second = s
+        .turn_end_at_point(&p, None, &opts)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    (first, second)
+}
+
+/// A `/model` OFF A BUCKET WHOSE NOTICE THE SCREEN NO LONGER DRAWS MOVES THE SESSION OFF IT
+/// (ATERM-KI-1015-1, LP-1 (e); live as `r21lebk5` on Claude Code 2.1.302, 2026-10-16). On a pane
+/// 14 rows tall a Sonnet bucket's own notice scrolls off before the first read: the footer's
+/// generic banner is all the screen draws of it, and the session's transcript holds the turn's
+/// notice (`You've hit your Sonnet limit · resets Sep 19 at 2:42am (…)`). Then Esc on the
+/// countdown and a person's `/model opus`: `Set model to Opus 5.5 …` drawn, no notice of the
+/// bucket. Measured before: the bucket was waited on as a `usage-session` limit (the banner's own
+/// words) and the choice moved nothing — `WAITING … usage-session resets`, two days. The bucket is
+/// read as the transcript's notice names it, and the `/model` written after that notice leaves the
+/// model it limits: its reset binds nothing, and the limit's resume goes at once, as with the
+/// notice on the screen. NEGATIVE CONTROLS, the bucket's wait standing: the transcript ending at the
+/// cancel (no choice written since the notice); the choice of the same family (`sonnet`).
+#[test]
+fn a_model_chosen_off_a_bucket_whose_notice_scrolled_off_moves_the_session_off_it() {
+    let chosen = fx::screen(fx::SONNET_BUCKET_CANCELLED_THEN_MODEL_NOTICE_SCROLLED_OFF_2_1_302);
+    let whole = transcript("bucket-cancelled-then-model");
+    let (first, second) = decided_at_scrolled_bucket(&chosen, whole);
+    assert!(
+        matches!(&first, TurnEndAction::WaitUntil { why, .. } if why.contains("model-bucket")),
+        "the bucket the transcript names: {first:?}"
+    );
+    assert_eq!(
+        second.rule_id(),
+        Some(crate::supervise::policy::turn_end::RULE_LIMIT_RESUME),
+        "off the bucket's model, its resume at once: {second:?}"
+    );
+    // NEGATIVE CONTROLS.
+    let unchosen: String = whole
+        .lines()
+        .take_while(|l| !(l.starts_with('{') && l.contains("<command-name>/model</command-name>")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let same = whole.replace("Set model to `Opus 5.5`", "Set model to `Sonnet 5.5`");
+    let same_rows: Vec<String> = chosen
+        .iter()
+        .map(|r| r.replace("Opus 5.5", "Sonnet 5.5"))
+        .collect();
+    for (name, rows, tail) in [
+        ("no choice since the notice", &chosen, unchosen.as_str()),
+        ("the same family", &same_rows, same.as_str()),
+    ] {
+        let (_, second) = decided_at_scrolled_bucket(rows, tail);
+        assert!(
+            matches!(&second, TurnEndAction::WaitUntil { why, .. } if why.contains("model-bucket resets")),
+            "{name}: the bucket's wait stands: {second:?}"
+        );
+    }
+}
+
+/// The measured Sonnet bucket's transcript with its dates moved as the screens' are
+/// ([`decided_at_scrolled_bucket`]): the notice's `Oct 19 at 2:42am` and its row's own
+/// `quotaLimits.resetsAt` thirty days back, to `Sep 19`, two days off the test's clock.
+fn bucket_tail_on_the_tests_clock(tail: &str) -> String {
+    tail.replace("Oct 19 at 2:42am", "Sep 19 at 2:42am")
+        .replace(
+            "\"resetsAt\":1792402927",
+            &format!("\"resetsAt\":{}", 1_792_402_927 - 30 * 24 * 3600),
+        )
+}
+
+/// [`decided_at_scrolled_bucket`]'s bucket for a loop that TOOK ITS WAIT OVER: a first loop
+/// judges the 14-row pane's wall, the host's tail the transcript up to the dialog's answer, and
+/// writes its `wall-wait@v1` row to a real ledger; then a second loop — what every seamless update
+/// and fault restart starts — takes the wait up from that row ([`Session::seed_wall_memory`]: no
+/// notice row of its own) and decides at `second`, the host's tail `tail`
+/// ([`bucket_tail_on_the_tests_clock`] applied to both). The continue policy on.
+fn seeded_at_scrolled_bucket(second: &[String], tail: &str) -> TurnEndAction {
+    use crate::supervise::approvals::{Ledger, open_wall};
+    let dir = crate::supervise::ScratchDir::new("seeded-bucket", "e");
+    let ledger = dir.join("s-1.jsonl");
+    let armed: Vec<String> = fx::screen(fx::WALL_SONNET_BUCKET_ARMED_NOTICE_SCROLLED_OFF_2_1_302)
+        .iter()
+        .map(|r| r.replace("Oct 19 at 2:42am", "Sep 19 at 2:42am"))
+        .collect();
+    let whole = bucket_tail_on_the_tests_clock(transcript("bucket-cancelled-then-model"));
+    let at_wall: String = whole
+        .lines()
+        .take_while(|l| !(l.starts_with('{') && l.contains("Automatic continue cancelled")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let opts_of = |host: &Arc<TranscriptHost>| SuperviseOpts {
+        idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
+        policy: SupervisorConfig {
+            answer_questions: false,
+            ..SupervisorConfig::default()
+        },
+        ..auto(30)
+    };
+    {
+        let host = TranscriptHost::of(&[Some(&at_wall)]);
+        let opts = opts_of(&host);
+        let mut m = Mock::new(vec![armed.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
+        s.set_zone_lookup(test_zones);
+        s.set_clock(TEST_NOW, PDT);
+        let wall = point_at(&mut s, armed.clone(), 101);
+        let first = s
+            .turn_end_at_point(&wall, Some(Duration::from_secs(60)), &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(
+            matches!(&first, TurnEndAction::WaitUntil { why, .. } if why.contains("model-bucket")),
+            "the bucket the transcript names: {first:?}"
+        );
+    }
+    let open = open_wall(&ledger, Some("@s-1"));
+    assert!(open.is_some(), "the first loop's wait: {open:?}");
+    let host = TranscriptHost::of(&[Some(&bucket_tail_on_the_tests_clock(tail))]);
+    let opts = opts_of(&host);
+    let mut m = Mock::new(vec![second.to_vec()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_zone_lookup(test_zones);
+    s.set_clock(TEST_NOW + 120, PDT);
+    s.seed_wall_memory(open);
+    assert!(s.turn_end.waits_on_named_reset(), "the wait taken over");
+    assert!(s.limit_notice_row.is_none(), "no notice row remembered");
+    let p = point_at(&mut s, second.to_vec(), 102);
+    s.turn_end_at_point(&p, None, &opts)
+        .unwrap_or_else(|e| panic!("{e:?}"))
+}
+
+/// A `/model` OFF A BUCKET MOVES A LOOP THAT TOOK THE BUCKET'S WAIT OVER (ATERM-KI-1015-1, LP-1
+/// (e); the review of round 21's amendment, major 1). Every seamless update and fault restart
+/// starts a loop that takes the wait up from its predecessor's ledger row, and keeps no notice row
+/// id of its own. On a 14-row pane the Sonnet bucket's notice is off the screen, and Esc on the
+/// countdown then `/model opus` draws `Set model to Opus 5.5 …` with no notice of the bucket; the
+/// session's transcript holds the bucket's notice row and the choice written after it. Before, the
+/// transcript's choice was read only after a notice row the loop kept itself: the taken-over wait
+/// stood to the bucket's reset, two days off, over the person's choice. The transcript's notice
+/// row that names the reset waited on (its class, its clock, and its `resetsAt` beside the reset)
+/// stands for it, as for a served turn: off the bucket's model, its resume at once. NEGATIVE
+/// CONTROLS, the bucket's wait standing: the transcript ending at the cancel (no choice written);
+/// the choice of the same family (`sonnet`); the notice's row a day off the reset waited on (an
+/// older notice naming the same clock, which the waited limit is not).
+#[test]
+fn a_model_chosen_off_a_bucket_moves_a_loop_that_took_its_wait_over() {
+    let chosen = fx::screen(fx::SONNET_BUCKET_CANCELLED_THEN_MODEL_NOTICE_SCROLLED_OFF_2_1_302);
+    let whole = transcript("bucket-cancelled-then-model");
+    let a = seeded_at_scrolled_bucket(&chosen, whole);
+    assert_eq!(
+        a.rule_id(),
+        Some(crate::supervise::policy::turn_end::RULE_LIMIT_RESUME),
+        "off the bucket's model, its resume at once: {a:?}"
+    );
+    // NEGATIVE CONTROLS.
+    let unchosen: String = whole
+        .lines()
+        .take_while(|l| !(l.starts_with('{') && l.contains("<command-name>/model</command-name>")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let same = whole.replace("Set model to `Opus 5.5`", "Set model to `Sonnet 5.5`");
+    let same_rows: Vec<String> = chosen
+        .iter()
+        .map(|r| r.replace("Opus 5.5", "Sonnet 5.5"))
+        .collect();
+    // The row's `resetsAt` a day before the reset moved to the test's clock (which the move
+    // then leaves alone).
+    let a_day_off = whole.replace(
+        "\"resetsAt\":1792402927",
+        &format!("\"resetsAt\":{}", 1_792_402_927 - 31 * 24 * 3600),
+    );
+    for (name, rows, tail) in [
+        ("no choice since the notice", &chosen, unchosen.as_str()),
+        ("the same family", &same_rows, same.as_str()),
+        (
+            "the notice a day off the reset",
+            &chosen,
+            a_day_off.as_str(),
+        ),
+    ] {
+        let a = seeded_at_scrolled_bucket(rows, tail);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("model-bucket resets")),
+            "{name}: the bucket's wait stands: {a:?}"
+        );
+    }
 }

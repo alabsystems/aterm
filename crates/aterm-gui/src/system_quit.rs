@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A QUIT THE SYSTEM ASKED FOR (2026-09-27, the owner: relaunch the agents
-//! aterm hosted after an exit they did not choose — a crash, a kill, or a
-//! restart or logout). A crash leaves the crash journal, which carries the
-//! agents ([`crate::crash_journal`]). A restart, a logout or a shutdown quits
-//! aterm the ordinary way instead, and the ordinary quit writes a manifest
-//! that carries no agent — right for a person's own ⌘Q, wrong for these.
-//! macOS says which it is: its quit Apple Event carries a `kAEQuitReason`
-//! naming the logout, restart or shutdown, read where AppKit asks
-//! `applicationShouldTerminate:` (`menu::terminate_is_the_systems`) and
-//! noted here; the graceful exit then fills the agents in
-//! ([`crate::restore::RestoreManifest::fill_agents`]).
+//! The quit the system asked for: a logout, a restart or a shutdown, after which the agents
+//! aterm hosted relaunch at the next start. A crash leaves the crash journal, which carries
+//! the agents ([`crate::crash_journal`]); a system quit takes the ordinary path, whose
+//! manifest carries no agent — right for a person's own ⌘Q, wrong here. macOS names the
+//! reason in its quit Apple Event's `kAEQuitReason`, read where AppKit asks
+//! `applicationShouldTerminate:` (`menu::terminate_is_the_systems`) and noted here; the
+//! graceful exit then fills the agents in ([`crate::restore::RestoreManifest::fill_agents`]).
 //!
 //! THE MARK BELONGS TO ONE QUIT (2026-09-28). It was a bare flag that nothing
 //! cleared, so a system quit that did NOT happen — the person answered Cancel,
@@ -152,9 +148,8 @@ pub(crate) fn clear_for_test() {
 mod tests {
     use super::*;
 
-    /// A logout, a restart and a shutdown, asked or confirmed, are the
-    /// system's; no other code is — an AppleScript `quit` or a Dock Quit
-    /// carries none, and `0` is what a missing reason reads as.
+    /// Only logout, restart and shutdown codes are the system's: an AppleScript
+    /// `quit` or a Dock Quit carries no reason, which reads as `0`.
     #[test]
     fn only_a_logout_a_restart_or_a_shutdown_is_the_systems() {
         for r in [b"logo", b"rlgo", b"rrst", b"rest", b"rsdn", b"shut"] {
@@ -170,13 +165,8 @@ mod tests {
         assert_eq!(KEY_QUIT_REASON, 0x7768_793f);
     }
 
-    /// A SYSTEM QUIT THAT DID NOT HAPPEN MARKS NO LATER QUIT (2026-09-28). A
-    /// logout aterm answered Cancel to (the person's Cancel, a held document, or
-    /// an update successor that had not taken over yet) left the bare flag set,
-    /// so the person's own quit after it kept every agent for the next start.
-    /// The mark now goes with its generation's cancel — through either cancel
-    /// path — and a duplicate the system sends while a quit is pending marks
-    /// that pending quit.
+    /// A cancelled system quit marks no later quit, through either cancel path; a
+    /// duplicate the system sends while a quit is pending marks that pending quit.
     #[test]
     fn a_cancelled_system_quit_does_not_mark_a_later_person_quit() {
         use crate::menu::{NativeTerminateDecision, admit_native_terminate};

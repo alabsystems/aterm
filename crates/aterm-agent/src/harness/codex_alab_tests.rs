@@ -42,6 +42,53 @@ fn the_measured_manifest_parses_and_a_changed_layout_refuses() {
     }
 }
 
+/// Optional package metadata never blocks on a nonfile or accepts an
+/// oversized, otherwise valid manifest. Every path belongs to this fixture.
+#[test]
+fn package_metadata_refuses_nonfiles_and_oversized_text() {
+    let d = aterm_tempfile::tempdir().expect("private package fixture");
+    let root = d.path();
+    std::fs::create_dir(root.join("bin")).expect("bin");
+    let exe = root.join("bin/codex");
+    std::fs::write(&exe, "").expect("exe is never run");
+    std::fs::write(root.join(ALAB_BUILD_JSON), "{}").expect("marker");
+    let manifest = root.join(PACKAGE_JSON);
+    let accepted = || {
+        assert_eq!(package_version(&exe), Some(v("0.157.1")));
+        assert_eq!(alab_build(&exe).as_deref(), Some("0.157.1"));
+        assert!(alab_bytes(&exe));
+    };
+    let refused = || {
+        assert_eq!(package_version(&exe), None);
+        assert_eq!(alab_build(&exe), None);
+        assert!(!alab_bytes(&exe));
+    };
+    let mut text = PACKAGE_0_157_1.to_string();
+    text.extend(std::iter::repeat_n(
+        ' ',
+        MAX_PACKAGE_BYTES as usize - text.len(),
+    ));
+    std::fs::write(&manifest, &text).expect("valid manifest at the bound");
+    accepted();
+    text.push(' ');
+    std::fs::write(&manifest, &text).expect("valid oversized JSON");
+    refused();
+    std::fs::write(&manifest, [0xff]).expect("invalid UTF-8");
+    refused();
+    std::fs::remove_file(&manifest).expect("remove owned file");
+    std::fs::create_dir(&manifest).expect("manifest is a directory");
+    refused();
+    std::fs::remove_dir(&manifest).expect("remove owned directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(manifest.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: the NUL-terminated path is inside this fixture's exclusive directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        refused();
+    }
+}
+
 /// AN ALAB BUILD IS KNOWN BY ITS PACKAGE, NOT ITS VERSION: codex-alab's
 /// package carries the publication scheme's pre-release version
 /// (`X.Y.0-dev.<n>+g<sha>`), which [`Version::parse`] refuses on purpose. The
@@ -65,10 +112,16 @@ fn an_alab_package_with_a_pre_release_version_is_alab_bytes() {
     assert_eq!(parse_package(&manifest), None, "no order is guessed");
     // Negative control: without ALab's marker it is no ALab build.
     assert!(!alab_bytes(&exe));
+    assert_eq!(alab_build(&exe), None, "no marker, no ALab build");
     std::fs::write(root.join(ALAB_BUILD_JSON), "{}").expect("marker");
     assert!(
         alab_bytes(&exe),
         "the package and its marker say ALab built it"
+    );
+    // The build it runs, whole, as the rollout tap holds a thread to it.
+    assert_eq!(
+        alab_build(&exe).as_deref(),
+        Some("0.164.0-dev.12365+g124c29509")
     );
     assert_eq!(package_version(&exe), None);
     // A changed layout or an entrypoint outside the root still refuses.

@@ -1,32 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A SHELL'S PROMPT MARK READS BACK AS ITS PROMPT, whatever height changes the
+//! A shell's `133;B` prompt mark reads back as its prompt row, whatever height changes the
 //! grid went through.
 //!
-//! The incident: an upgrade ended Claude Code (fullscreen, on the alternate
-//! screen) and the harness's relaunch read the returned prompt — the screen's
-//! cursor row, and the row the shell's `133;B` mark named (`blocks 1 --json`,
-//! then `line <cmd>`). The mark named row 69 and `line 69` was the line ABOVE
-//! the prompt (`claude --resume …`), so the relaunch took the prompt for a
-//! person's typing and waited five minutes for nothing; the agent stayed down.
-//!
-//! The cause was the engine's two maps of an absolute row. A mark is RECORDED
-//! through `visible_to_absolute` (`counter − visible + r`) and READ BACK
-//! through `oldest_absolute_row()` (`counter − visible − scrollback`, saturating
-//! at 0) plus the history count. They agree while the counter covers every
-//! retained row. A rows-only grow that APPENDED blank rows at the bottom (no
-//! history to reveal) left the counter where it was while the retained total
-//! grew; on a grid that had evicted nothing — a fresh tab, or a seamless
-//! update's adopted grid, whose counter starts at its floor — the oldest key
-//! could not go below 0, and from then on every mark read back one row per
-//! appended row ABOVE the row it was recorded on. The tab's grid was such a
-//! one: adopted at a seamless update, its counter was 70 with 19 rows of
-//! history on a 52-row screen.
-//!
-//! Each test drives the real parser with real bytes: the incident's own exit
-//! bytes (Claude Code 2.1.286 in `"tui": "fullscreen"`, SIGTERMed, from the
-//! tab's recording) and zsh's prompt with aterm's integration marks.
+//! A mark is recorded through `visible_to_absolute` (`counter − visible + r`) and read back
+//! through `oldest_absolute_row()` (`counter − visible − scrollback`, saturating at 0) plus
+//! the history count. The two agree only while the counter covers every retained row: a
+//! rows-only grow that appends blank rows must advance it, or on a grid whose counter sits
+//! at its floor (a fresh tab, an adopted grid) each appended row shifts every mark one row
+//! above where it was recorded. The tests drive real bytes: a fullscreen Claude Code's
+//! SIGTERM exit and zsh's prompt with aterm's integration marks.
 
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
@@ -39,9 +23,8 @@ fn live(rows: u16) -> Terminal {
     Terminal::with_scrollback(rows, COLS, 1000, Scrollback::with_defaults())
 }
 
-/// zsh's prompt, as the tab's recording has it: `PROMPT_SP` across the full
-/// width, the integration's `133;D`/`133;A`, the prompt, then `133;B` (from
-/// `zle-line-init`, after the prompt is drawn).
+/// zsh's prompt as recorded: `PROMPT_SP` across the full width, the integration's
+/// `133;D`/`133;A`, the prompt, then `133;B` (from `zle-line-init`, after the prompt).
 fn prompt(t: &mut Terminal) {
     let mut v = Vec::new();
     v.extend_from_slice(b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m");
@@ -67,9 +50,8 @@ fn fullscreen(t: &mut Terminal) {
     }
 }
 
-/// Claude Code 2.1.286's bytes after a SIGTERM, verbatim from the tab's
-/// recording (`cast`): the mouse modes off, `?1049l`, the scroll region reset
-/// inside DECSC/DECRC, and the two-line resume hint.
+/// Claude Code 2.1.286's bytes after a SIGTERM, verbatim from a recording: the mouse modes
+/// off, `?1049l`, the scroll region reset inside DECSC/DECRC, and the two-line resume hint.
 fn sigterm_exit(t: &mut Terminal) {
     t.process(b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
     t.process(b"\x1b[?2026h\x1b[?25h\x1b[?2026l");
@@ -107,8 +89,7 @@ fn assert_mark_is_the_prompt(t: &Terminal, label: &str) {
     assert_eq!(block.command_start_col, Some(cursor.col), "{label}");
 }
 
-/// The smallest shape: a tab that grows before it has any history, then
-/// works. Before the fix the mark read back as the last line of output.
+/// The smallest shape: a tab that grows before it has any history.
 #[test]
 fn a_tab_that_grew_before_it_had_history_reads_its_marks_back() {
     let mut t = live(30);
@@ -120,14 +101,9 @@ fn a_tab_that_grew_before_it_had_history_reads_its_marks_back() {
     assert_mark_is_the_prompt(&t, "after a grow of a fresh tab");
 }
 
-/// The incident's sequence: a grid adopted at a seamless update while the
-/// agent was fullscreen, its numbering at its floor (a parent from before the
-/// carry held history or the counters, 2026-09-25, restored fresh numbering
-/// over the visible rows alone — the tab's grid had kept it: counter 70, 19
-/// rows of history), the window growing it by a row while it was parked, the
-/// agent's exit, a relaunch typed, the new agent fullscreen through more
-/// resizes, then the upgrade's SIGTERM — and the prompt's mark then and across
-/// the three resizes the window made while the relaunch waited (53→54→53→52).
+/// A grid adopted while an agent is fullscreen, its numbering at its floor, grown while
+/// parked; then the agent's exit, a relaunch, another fullscreen session, a resize and a
+/// SIGTERM exit, and three resizes while the prompt waits.
 #[test]
 fn the_prompt_after_a_fullscreen_agents_exit_reads_back_as_the_prompt() {
     for (adopt_rows, parked) in [(52u16, [53u16, 53]), (52, [53, 52]), (51, [53, 54])] {
@@ -141,9 +117,8 @@ fn the_prompt_after_a_fullscreen_agents_exit_reads_back_as_the_prompt() {
             "claude --dangerously-skip-permissions --resume 253a40df",
         );
         fullscreen(&mut old);
-        // The seamless update: the successor adopts the carried grids — here
-        // as a parent from before 2026-09-25 carried them, visible rows only
-        // and no counters, so the primary grid's numbering starts at its floor.
+        // Adopt a carry without row counters (visible rows only), so the primary grid's
+        // numbering starts at its floor.
         let mut carry = old.checkpoint_visible().expect("parser at ground");
         carry.absolute_row_counter = 0;
         carry.alt_absolute_row_counter = 0;
@@ -172,12 +147,10 @@ fn the_prompt_after_a_fullscreen_agents_exit_reads_back_as_the_prompt() {
     }
 }
 
-/// THE INVARIANT behind both: every retained row of the primary grid has a
-/// key at or above 0 — the counter covers the rows and the history — through
-/// output, scrollback erases, the alternate screen, height and width changes
-/// (synchronous and offloaded) and seamless adopts, in any order. While it
-/// holds, the two maps of an absolute row agree. A fixed walk of 300 scripts
-/// of 40 steps each.
+/// The invariant behind both (the grid's `KeysCoverRetained`): the primary grid's counter
+/// covers every retained row through output, `3J`, the alternate screen, synchronous and
+/// offloaded resizes, and adopts, in any order. While it holds, the two maps of an absolute
+/// row agree. A fixed walk of 300 scripts of 40 steps.
 #[test]
 fn the_counter_covers_every_retained_row() {
     let mut state: u64 = 0x2026_1001;

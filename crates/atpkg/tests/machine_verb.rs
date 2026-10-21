@@ -1,19 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `machine` verb, run as a PROCESS.
+//! Process-level integration tests for `atpkg machine` on macOS.
 //!
-//! The window consumes the bytes `atpkg machine` writes to stdout; the other tests of this
-//! feature are unit tests over pure functions and a fake `defaults` port, so this pins the
-//! seam: a reword here would leave the card reading "not read yet" forever.
-//!
-//! THE MACHINE IS NOT TOUCHED. Every child here runs with a temp `HOME`, and the
-//! synthetic-home guard refuses on exactly that basis — `defaults` writes the ACCOUNT's
-//! per-host domain and ignores `$HOME` (measured 2026-09-14), so a test that let the
-//! apply through would disable Universal Control on whatever Mac ran it. The refusal is
-//! what these tests assert, and `store_lock_wait.rs` asserts the same edge for a pass.
-//! Each test asserts what the verb does on a Mac (off macOS it reads and applies
-//! nothing), so the file is macOS's.
+//! Runs `atpkg machine` with a temporary `HOME` to verify stdout record
+//! parsing (`MachineState::parse`), synthetic-home refusal on `--apply`
+//! (since `defaults` writes to the account's per-host domain regardless of
+//! `$HOME`), and non-zero exit on malformed config files.
 #![cfg(target_os = "macos")]
 #![allow(
     clippy::disallowed_types,
@@ -60,8 +53,7 @@ impl Fixture {
     }
 }
 
-/// THE RECORD THE WINDOW READS, produced by the real verb and parsed by the real
-/// parser — the two halves of the contract, met in one test.
+/// Verify `atpkg machine` output parses via `MachineState::parse`.
 #[test]
 fn the_read_prints_exactly_one_parseable_record_and_exits_zero() {
     let fx = Fixture::new("read");
@@ -112,8 +104,7 @@ fn the_apply_refuses_a_synthetic_home_and_writes_nothing() {
     );
 }
 
-/// A CONFIG THAT DOES NOT PARSE STOPS THE VERB, on both spellings. Both `[machine]`
-/// defaults act, so a file nobody could read must not be treated as "no opt-outs set".
+/// An unparseable config causes `atpkg machine` (with or without `--apply`) to exit non-zero.
 #[test]
 fn an_unparseable_config_refuses_on_both_spellings() {
     let fx = Fixture::new("badconfig");

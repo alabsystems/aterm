@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `MainThreadBound<T>` — the half of the contract libtest can hold.
+//! `MainThreadBound<T>`: the half of the contract libtest can hold.
 //!
 //! # WHAT THIS FILE MUST NOT DO, AND WHY IT IS THE FIRST THING WRITTEN HERE
 //!
@@ -25,14 +25,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_objc::{MainThread, MainThreadBound};
 
-/// A witness for a value with NO main-thread affinity.
+/// A witness for values with no main-thread affinity.
 ///
 /// # Safety
-/// Every `T` this file puts in a container is a plain Rust value that touches
-/// no AppKit state and whose destructor (where it has one) is a counter
-/// increment, so `MainThread::new_unchecked`'s SECOND form is what discharges
-/// this: the class being handled has no main-thread affinity and its payload
-/// may be dropped on whatever thread performs the last release.
+/// Every `T` here is a plain Rust value that touches no AppKit state and whose destructor (if
+/// any) increments a counter, so it may be dropped on whatever thread performs the last release
+/// (`MainThread::new_unchecked`'s second form).
 fn witness() -> MainThread {
     // SAFETY: as documented above.
     unsafe { MainThread::new_unchecked() }
@@ -57,8 +55,7 @@ fn into_inner_hands_the_value_back_and_does_not_run_the_containers_drop() {
         "extracting must not run the destructor — and must not reschedule one either, which on \
          this thread would hang"
     );
-    // Dropped HERE, as a bare `Counted`, on this worker: out of the container,
-    // the value has no affinity and no reschedule.
+    // Out of the container the value has no affinity: dropped here, on this worker.
     drop(value);
     assert_eq!(1, DROPS.load(Ordering::Relaxed), "exactly once");
 }

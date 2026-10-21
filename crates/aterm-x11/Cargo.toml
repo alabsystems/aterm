@@ -25,9 +25,13 @@ aterm-dl = { workspace = true }
 # free(3) for the packets libxcb hands back.
 libc = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-# tests/xlib_layout.rs: the C probe's scratch directory and its compiler.
+[dev-dependencies]
+# tests/icccm_xrm.rs: the include tree's scratch directory; tests/xlib_layout.rs:
+# the C probe's.
 aterm-tempfile = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# tests/xlib_layout.rs: the C probe's compiler.
 aterm-uds = { workspace = true }
 
 [lints]

@@ -37,7 +37,12 @@
 //! 7. on X11, compose (a dead key through XTEST) and a file dropped by XDND
 //!    (`lane-bus xdnd`, a second X client as the drag source: dragged over
 //!    the window and away, then dropped), with the drop highlight read from
-//!    frames; after the session, XIM through ibus;
+//!    frames; after the session, XIM through ibus: the dead key again, and
+//!    a pinyin composition (ibus-libpinyin), its preedit and the spot aterm
+//!    gave it read from `chrome`'s `ime` line, then committed; then the X11
+//!    wire (X11-TRACE): a second aterm-gui through an `xtrace` proxy display,
+//!    started, typed at, resized and quit, its requests summed up as the
+//!    `x11.wire.*` lines ([`crate::linux_xwire`]);
 //! 8. the AT-SPI tree again, then the event stream the listener recorded,
 //!    its kinds and whether its text changes rebuild the end walk's text;
 //! 9. the present and input percentiles (`metrics percentiles`, reset after
@@ -81,6 +86,7 @@ use std::time::{Duration, Instant};
 use crate::linux::{self, Out, Up};
 use crate::linux_guest::{self as guest, Arch, Display, Screen, Seat, Selection};
 use crate::linux_proof::{self as proof, Gui};
+use crate::linux_xwire as xwire;
 use crate::{Fail, LAB, Res};
 
 mod deck;
@@ -114,6 +120,17 @@ pub const IME_COMPOSED: &str = "X-\u{e9}-Y";
 /// ibus's engine for the XIM check: its simple engine, which composes dead
 /// keys (an engine must be set, or ibus passes every key through untouched).
 pub const XIM_ENGINE: &str = "xkb:us::eng";
+
+/// ibus's CJK engine for the XIM item's second half (L-HEADER-LW7,
+/// linux-xim-cjk-preedit): libpinyin, which holds the pinyin typed as a
+/// composition and commits its first candidate on space.
+pub const XIM_CJK_ENGINE: &str = "libpinyin";
+
+/// The pinyin typed to it, one key at a time.
+pub const XIM_CJK_KEYS: [&str; 5] = ["n", "i", "h", "a", "o"];
+
+/// The pinyin's first candidate, committed between `echo X-` and `-Y`.
+pub const XIM_CJK_TEXT: &str = "\u{4f60}\u{597d}";
 
 /// How long a key is held for the repeat measurement.
 pub const HOLD_MS: u64 = 1500;
@@ -389,6 +406,28 @@ impl Caption {
             .map(|&(_, s, e)| s + (e - s) / 2)
     }
 
+    /// The first strip column of the right end's buttons on a `cols`-wide
+    /// strip, or `cols` where none is there: the buttons in one run from
+    /// column 0 are the left end's (GNOME's `button-layout` can put buttons
+    /// at either end, aterm-gui's `client_frame::ButtonLayout`).
+    #[must_use]
+    pub fn right_end(&self, cols: u16) -> u16 {
+        let mut slots: Vec<(u16, u16)> = self.buttons.iter().map(|&(_, s, e)| (s, e)).collect();
+        slots.sort_unstable();
+        let mut lead = 0;
+        slots
+            .into_iter()
+            .find(|&(s, e)| {
+                if s == lead {
+                    lead = e;
+                    false
+                } else {
+                    true
+                }
+            })
+            .map_or(cols, |(s, _)| s)
+    }
+
     /// The buttons' names, in strip order, `none` without any.
     #[must_use]
     pub fn names(&self) -> String {
@@ -541,6 +580,22 @@ fn slot_class(f: &Frame, x0: usize, x1: usize, y0: usize, y1: usize) -> (&'stati
         "bare"
     };
     (class, differ)
+}
+
+/// The `chrome` verb's `ime` line: `ime preedit="<text>" caret=<n|-> spot=<x>,<y>,<w>x<h>|-`.
+#[must_use]
+pub fn ime_line(chrome: &str) -> Option<&str> {
+    chrome
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("ime preedit="))
+}
+
+/// An `ime` line's composition, its text and caret, without the spot.
+#[must_use]
+pub fn ime_composition(line: &str) -> &str {
+    line.rsplit_once(" spot=")
+        .map_or(line, |(composition, _spot)| composition)
 }
 
 /// What is typed after the screen's last prompt (`lane$ `).
@@ -1445,17 +1500,7 @@ impl Session<'_> {
 
     /// A control verb's reply (trailing whitespace dropped), or why not.
     fn ctl(&self, verb: &[&str]) -> Result<String, String> {
-        let out = self.gui.ctl(verb);
-        let reply = proof::reply(&out.text).to_string();
-        if out.ok() {
-            Ok(reply)
-        } else {
-            Err(format!(
-                "`{}` answered {}",
-                verb.join(" "),
-                crate::util::one_line(&reply, 160)
-            ))
-        }
+        self.gui.expect(verb, &|_| true)
     }
 
     /// Run `argv` in the guest.
@@ -2460,6 +2505,103 @@ impl Session<'_> {
         ]);
     }
 
+    /// X11-TRACE: what aterm-gui says on the X11 wire
+    /// ([`crate::linux_xwire`]). A second aterm-gui reaches the screen through
+    /// an `xtrace` proxy display ([`xwire::PROXY`]) and is driven through its
+    /// start, a typed echo, a resize to 30x100 and the person's quit; its log
+    /// is kept beside the report and summed up into the `x11.wire.*` lines.
+    fn x11_wire(&mut self) {
+        let Some(display) = self.x_display() else {
+            return;
+        };
+        let r = self.x11_wire_run(&display);
+        self.gui.stop();
+        self.stop_unit(&xwire::unit_name());
+        match r {
+            Ok(lines) => {
+                for (key, value) in lines {
+                    self.rec.behaviour(key, value);
+                }
+            }
+            Err(e) => self.rec.behaviour("x11.wire", format!("failed: {e}")),
+        }
+    }
+
+    /// [`Self::x11_wire`]'s run: its lines, or why it could not run.
+    fn x11_wire_run(&self, display: &str) -> Result<Vec<(&'static str, String)>, String> {
+        let log = format!("{}/xtrace.txt", self.gui.dir);
+        let stderr = format!("{}/xtrace-gui.stderr", self.gui.dir);
+        self.gui.prepare()?;
+        let proxy = guest::Unit {
+            name: xwire::unit_name(),
+            env: Vec::new(),
+            argv: xwire::proxy_argv(display, &log),
+            socket: guest::x_socket(xwire::PROXY),
+        };
+        // A socket an earlier proxy left would keep the new one from listening.
+        let _ = self.sh(&["rm".into(), "-f".into(), proxy.socket.clone()]);
+        let started = self.sh(&guest::run_unit(&proxy, None));
+        if !started.ok() {
+            return Err(format!("could not start xtrace: {}", started.tail(3)));
+        }
+        if !self.sh(&guest::wait_socket(&proxy.socket, 60)).ok() {
+            return Err(format!(
+                "xtrace never listened (60 s): {}",
+                self.unit_journal(&proxy.name)
+            ));
+        }
+        let invocation = self
+            .gui
+            .start_logged_on(&[("DISPLAY".into(), xwire::PROXY.into())], &stderr)?;
+        if !self.sh(&guest::wait_socket(&self.gui.sock(), 60)).ok() {
+            return Err(format!(
+                "aterm-gui never listened through xtrace (60 s): {}",
+                crate::util::one_line(&self.gui.journal(&invocation), 300)
+            ));
+        }
+        let step = |verb: &[&str], ok: &dyn Fn(&str) -> bool| -> Result<(), String> {
+            let r = self.ctl(verb)?;
+            if ok(&r) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "`{}` answered {:?}",
+                    verb.join(" "),
+                    crate::util::one_line(&r, 200)
+                ))
+            }
+        };
+        step(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
+        step(&["send", xwire::TYPED], &|r| r.starts_with("OK"))?;
+        step(&["key", "enter"], &|r| r.starts_with("OK"))?;
+        let awaited = format!("timeout={}", 60_000);
+        step(&["await", "match", xwire::ECHO, &awaited], &|r| {
+            r.starts_with("OK match")
+        })?;
+        step(&["resize", "30", "100"], &|r| r.starts_with("OK"))?;
+        step(&["status"], &|r| proof::field(r, "render") == Some("ok"))?;
+        step(&["invoke", "Quit"], &|r| r.starts_with("OK"))?;
+        if !self.sh(&guest::wait_unit_gone(&Gui::unit_name(), 60)).ok() {
+            return Err("aterm-gui still ran 60 s after its Quit".into());
+        }
+        self.stop_unit(&proxy.name);
+        // The log is kept beside the report whatever it says: it is what
+        // says which request a line came from.
+        let wire = self.sh(&["cat".into(), log]);
+        let _ = std::fs::write(
+            self.results.join(format!(
+                "{}-{}-xtrace.txt",
+                self.arch.name(),
+                self.screen.name()
+            )),
+            &wire.text,
+        );
+        if !wire.ok() || wire.text.trim().is_empty() {
+            return Err(format!("xtrace logged nothing: {}", wire.tail(2)));
+        }
+        Ok(xwire::summary(&wire.text))
+    }
+
     fn key_repeat(&mut self) {
         let held = match (self.x_display(), self.screen.display.seat()) {
             (Some(display), _) => {
@@ -3094,14 +3236,21 @@ impl Session<'_> {
         let Some(display) = self.x_display() else {
             return;
         };
-        let keyfile = format!("{}/glib-2.0/settings/keyfile", guest::IBUS_CONFIG);
-        let config = format!("XDG_CONFIG_HOME={}", guest::IBUS_CONFIG);
+        let ibus_config = match self.up().config() {
+            Ok(config) => config.ibus(),
+            Err(e) => {
+                self.rec.behaviour("xim", format!("failed: {e}"));
+                return;
+            }
+        };
+        let keyfile = format!("{ibus_config}/glib-2.0/settings/keyfile");
+        let config = format!("XDG_CONFIG_HOME={ibus_config}");
         let ibus = guest::Unit {
             name: format!("{}ibus", guest::UNIT_PREFIX),
             env: vec![
                 ("DISPLAY".into(), display.clone()),
                 ("GSETTINGS_BACKEND".into(), "keyfile".into()),
-                ("XDG_CONFIG_HOME".into(), guest::IBUS_CONFIG.into()),
+                ("XDG_CONFIG_HOME".into(), ibus_config.clone()),
             ],
             argv: [
                 "ibus-daemon",
@@ -3115,19 +3264,19 @@ impl Session<'_> {
             .collect(),
             socket: String::new(),
         };
-        let r = (|| -> Result<String, String> {
+        type Cjk = (Option<String>, String);
+        let r = (|| -> Result<(String, Cjk), String> {
             let fresh = self.sh(&[
                 "sh".into(),
                 "-c".into(),
-                "rm -rf \"$1\" && install -d \"${2%/*}\" && printf '%s' \"$3\" > \"$2\"".into(),
+                "rm -rf -- \"$1\"".into(),
                 "ibus-config".into(),
-                guest::IBUS_CONFIG.into(),
-                keyfile.clone(),
-                guest::IBUS_KEYFILE.into(),
+                ibus_config,
             ]);
             if !fresh.ok() {
                 return Err(format!("{keyfile}: {}", fresh.tail(2)));
             }
+            self.up().write_config(&keyfile, guest::IBUS_KEYFILE)?;
             if !self.sh(&guest::run_unit(&ibus, None)).ok() {
                 return Err("ibus-daemon did not start".into());
             }
@@ -3184,20 +3333,149 @@ impl Session<'_> {
                 .x_window(&display)
                 .ok_or("xdotool found no window for the XIM aterm-gui")?;
             self.focus_x(&display, &win)?;
-            Ok(self.composed(Typist::X {
+            let composed = self.composed(Typist::X {
                 display: &display,
                 server: true,
-            }))
+            });
+            Ok((composed, self.cjk(&display, &config)))
         })();
         self.gui.stop();
         self.stop_unit(&ibus.name);
-        self.rec.behaviour(
-            "xim",
-            match r {
-                Ok(what) => format!("ibus XIM, engine {XIM_ENGINE}: {what}"),
-                Err(e) => format!("failed: {e}"),
-            },
-        );
+        match r {
+            Ok((composed, (preedit, committed))) => {
+                self.rec
+                    .behaviour("xim", format!("ibus XIM, engine {XIM_ENGINE}: {composed}"));
+                self.rec.behaviour(
+                    "xim.cjk",
+                    format!("ibus XIM, engine {XIM_CJK_ENGINE}: {committed}"),
+                );
+                if let Some(preedit) = preedit {
+                    self.rec.behaviour("xim.cjk.preedit", preedit);
+                }
+            }
+            Err(e) => {
+                self.rec.behaviour("xim", format!("failed: {e}"));
+                self.rec.behaviour("xim.cjk", format!("failed: {e}"));
+            }
+        }
+    }
+
+    /// The XIM item's CJK half (L-HEADER-LW7, linux-xim-cjk-preedit), on the
+    /// XIM aterm-gui [`Self::xim`] started: ibus switched to
+    /// [`XIM_CJK_ENGINE`], `echo X-` sent, the pinyin [`XIM_CJK_KEYS`] typed
+    /// through the X `display` one key at a time, each awaited (a hang
+    /// detector) as a change of the composition the `chrome` verb's `ime` line
+    /// shows, since a composition is painted and never typed; then space, held until the committed text is
+    /// on the typed line ([`Self::held_letter`] says why), and `-Y`. Returns
+    /// the `ime` line after the last key (the composition, its caret and the
+    /// spot aterm gave ibus for it) with what the typed line read meanwhile,
+    /// `None` where no key composed; and what the shell printed.
+    fn cjk(&self, display: &str, config: &str) -> (Option<String>, String) {
+        let mut preedit = None;
+        let before = self.ime_events();
+        let r = (|| -> Result<String, String> {
+            let engine = self.x(
+                display,
+                &[
+                    "GSETTINGS_BACKEND=keyfile",
+                    config,
+                    "timeout",
+                    "60",
+                    "sh",
+                    "-c",
+                    "until ibus engine \"$1\" 2>/dev/null; do sleep 0.2; done",
+                    "ibus-engine",
+                    XIM_CJK_ENGINE,
+                ],
+            );
+            if !engine.ok() {
+                return Err(format!(
+                    "ibus never took the engine {XIM_CJK_ENGINE} (60 s)"
+                ));
+            }
+            self.clear_line();
+            self.ctl(&["send", COMPOSE_BEFORE])?;
+            self.typed(COMPOSE_BEFORE)?;
+            let mut last = self.ime()?;
+            for key in XIM_CJK_KEYS {
+                let typed = self.x(display, &["xdotool", "key", key]);
+                if !typed.ok() {
+                    return Err(format!("the key {key}: {}", typed.tail(2)));
+                }
+                let t0 = Instant::now();
+                loop {
+                    let now = self.ime()?;
+                    // The composition, not the spot: a key that composes
+                    // nothing is typed, and the caret's spot moves all the same.
+                    if ime_composition(&now) != ime_composition(&last) {
+                        last = now;
+                        break;
+                    }
+                    if t0.elapsed() > HANG {
+                        let screen = self.ctl(&["text"]).unwrap_or_default();
+                        return Err(format!(
+                            "`{key}` never moved the composition (60 s): {last}; typed line {:?}",
+                            typed_line(&screen)
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            let screen = self.ctl(&["text"])?;
+            preedit = Some(format!("{last}; typed line {:?}", typed_line(&screen)));
+            let committed = format!("{COMPOSE_BEFORE}{XIM_CJK_TEXT}");
+            let off = self.x(display, &["xset", "r", "off"]);
+            if !off.ok() {
+                return Err(format!("autorepeat stayed on: {}", off.tail(2)));
+            }
+            let down = self.x(display, &["xdotool", "keydown", "space"]);
+            if down.ok() {
+                let _ = self.typed(&committed);
+            }
+            let up = self.x(display, &["xdotool", "keyup", "space"]);
+            let _ = self.x(display, &["xset", "r", "on"]);
+            if !down.ok() || !up.ok() {
+                return Err(format!("space: {} {}", down.tail(2), up.tail(2)));
+            }
+            self.ctl(&["send", COMPOSE_AFTER])?;
+            self.ctl(&["key", "enter"])?;
+            let want = format!("X-{XIM_CJK_TEXT}{COMPOSE_AFTER}");
+            if self.appeared(&want).is_ok() {
+                Ok(format!("{want} printed"))
+            } else {
+                let screen = self.ctl(&["text"]).unwrap_or_default();
+                let shown = screen
+                    .lines()
+                    .rev()
+                    .find(|l| l.starts_with("X-"))
+                    .unwrap_or("nothing")
+                    .to_string();
+                Ok(format!("{want} never printed; the shell printed {shown:?}"))
+            }
+        })();
+        self.clear_line();
+        let ime = match (before, self.ime_events()) {
+            (Some(b), Some(a)) if a > b => "IME events",
+            (Some(_), Some(_)) => "no IME event",
+            _ => "IME events unread",
+        };
+        let committed = match r {
+            Ok(what) => format!("{what}; {ime}"),
+            Err(e) => format!("failed: {e}"),
+        };
+        (preedit, committed)
+    }
+
+    /// The front window's `ime` line (the composition and its spot), or why
+    /// not.
+    fn ime(&self) -> Result<String, String> {
+        let chrome = self.ctl(&["chrome"])?;
+        ime_line(&chrome).map(str::to_string).ok_or_else(|| {
+            format!(
+                "`chrome` has no ime line: {}",
+                crate::util::one_line(&chrome, 200)
+            )
+        })
     }
 
     /// text-input-v3 (Mutter): a second aterm-gui, its Wayland wire logged
@@ -3450,7 +3728,15 @@ impl Session<'_> {
         if self.screen.display != Display::Mutter {
             return;
         }
-        let Some(mut shell) = self.screen.gnome_shell(&self.up().runtime) else {
+        let config = match self.up().config() {
+            Ok(config) => config,
+            Err(e) => {
+                self.rec
+                    .behaviour("text-input-v3.ime", format!("failed: {e}"));
+                return;
+            }
+        };
+        let Some(mut shell) = self.screen.gnome_shell(&self.up().runtime, config) else {
             return;
         };
         // Outside the session's directory, which `logged_gui` empties.
@@ -4035,7 +4321,8 @@ impl Session<'_> {
         // tab and its `+`.
         let caption = self.caption()?;
         let (cw, pad) = (num("cell_w").unwrap_or(0), num("pad").unwrap_or(0));
-        let first = caption.buttons.first().map_or(0, |&(_, s, _)| i32::from(s));
+        let cols = u16::try_from(num("window_cols").unwrap_or(0)).unwrap_or(0);
+        let first = i32::from(caption.right_end(cols));
         let band_x = pad + (first - 4).max(0) * cw;
         // The seat moves in logical pixels and the window reads back device
         // pixels: one seat pixel is `scale` window pixels.
@@ -4677,6 +4964,7 @@ fn record_session(
     s.server_stack();
     s.gui.stop();
     s.xim();
+    s.x11_wire();
     s.text_input_v3();
     s.header_gestures();
     s.cpu_seat();
@@ -5498,6 +5786,20 @@ mod tests {
         assert_eq!(c.names(), "minimize,maximize,close");
         assert_eq!(c.middle("maximize"), Some(74));
         assert_eq!(c.middle("restore"), None);
+        assert_eq!(c.right_end(80), 68);
+        let left = parse_caption(
+            "strip-caption frame=client buttons=close:0..4,minimize:4..8,maximize:76..80 maximized=false",
+        )
+        .expect("a caption line");
+        assert_eq!(
+            left.right_end(80),
+            76,
+            "the left end's run is not the right end"
+        );
+        let only_left =
+            parse_caption("strip-caption frame=client buttons=close:0..4 maximized=false")
+                .expect("a caption line");
+        assert_eq!(only_left.right_end(80), 80);
         let system = parse_caption("strip-caption frame=system").expect("a caption line");
         assert!(!system.client);
         assert_eq!(system.names(), "none");
@@ -5512,6 +5814,26 @@ mod tests {
         )
         .expect("a caption line");
         assert!(none.buttons.is_empty() && none.maximized);
+    }
+
+    /// The `ime` line as aterm-gui's `chrome` prints it (L-HEADER-LW7).
+    #[test]
+    fn the_ime_line_is_found_among_the_chrome_lines() {
+        let chrome = "toolbar (none)\nstrip-caption frame=system\nime preedit=\"ni hao\" caret=6 spot=66,36,9x20\nmenu \"File\": New Tab";
+        assert_eq!(
+            ime_line(chrome),
+            Some("ime preedit=\"ni hao\" caret=6 spot=66,36,9x20")
+        );
+        assert_eq!(ime_line("toolbar (none)\nmenu \"ime\": x"), None, "no line");
+        assert_eq!(
+            ime_composition("ime preedit=\"\" caret=- spot=174,76,9x20"),
+            ime_composition("ime preedit=\"\" caret=- spot=165,76,9x20"),
+            "a spot that moved is no composition"
+        );
+        assert_ne!(
+            ime_composition("ime preedit=\"n\" caret=1 spot=174,76,9x20"),
+            ime_composition("ime preedit=\"\" caret=- spot=174,76,9x20"),
+        );
     }
 
     /// A wire log's `xdg_toplevel` requests as libwayland prints them.

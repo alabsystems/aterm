@@ -706,6 +706,8 @@ const STARTER_CONFIG: &str = concat!(
 # the close-up.
 # [sys]
 # stats_bars = \"deck\"              # \"deck\" (default: under the titlebar) | \"sill\" (bottom padding, no row) | \"off\"
+# stats_deck_size = \"auto\"         # \"auto\" (default: Full on a tall window, Folded on a short one) | \"full\" | \"folded\"
+# disk_roots = []                  # folders in ~/Library or protected ones the disk walker may size (macOS may ask once for a protected one)
 
 # --- input policy: map a chord to RAW BYTES sent to the program, overriding the
 # default key encoding + non-menu hardcoded chords (NOT macOS menu keys like Cmd-C,

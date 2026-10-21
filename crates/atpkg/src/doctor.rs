@@ -1181,9 +1181,16 @@ fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicy
 /// home is the one rustup resolves (`$RUSTUP_HOME`, else `<home>/.rustup`,
 /// [`crate::seam::rustup_home_with`]), so a relocated home is probed, not skipped.
 fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealProbe> {
-    let link = crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)?
-        .join("toolchains")
-        .join("trust");
+    probe_local_seal_at(
+        layout,
+        &crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)?,
+    )
+}
+
+/// [`probe_local_seal`] under a known rustup home: what `aterm pkg repair`'s
+/// `base.pkg.rustup.local` item reads, over the home its apply re-points in.
+pub(crate) fn probe_local_seal_at(layout: &Layout, rustup_home: &Path) -> Option<LocalSealProbe> {
+    let link = rustup_home.join("toolchains").join("trust");
     let target = std::fs::read_link(&link).ok()?;
     let target = if target.is_absolute() {
         target
@@ -1232,6 +1239,33 @@ pub enum Detail {
 /// ([`crate::converge::passes`]: no structural problem; `main` maps `false` to exit 1).
 #[must_use]
 pub fn run(layout: &Layout, prefix: &str, detail: Detail, json: bool) -> bool {
+    emit(
+        rows(layout),
+        prefix,
+        detail,
+        json,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// The doctor's rows over the real environment (home, PATH, the clock, the `[packages]`
+/// config), read once and never applied: what [`run`] prints.
+#[must_use]
+pub fn rows(layout: &Layout) -> Vec<ItemReport> {
+    rows_reading(layout, crate::devtools::facts())
+}
+
+/// [`rows`] without the Developer Tools read (one `sqlite3` and one `log show`, up to
+/// 8 s): the packages view `aterm doctor` composes beside its own items, whose own
+/// Developer Tools row has read it already.
+#[must_use]
+pub fn packages_rows(layout: &Layout) -> Vec<ItemReport> {
+    rows_reading(layout, None)
+}
+
+/// [`rows`] with the Developer Tools facts `devtools` (`None`: no such row).
+fn rows_reading(layout: &Layout, devtools: Option<crate::devtools::Facts>) -> Vec<ItemReport> {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
     let cfg_account = crate::config::cached().account().map(str::to_string);
@@ -1250,24 +1284,16 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail, json: bool) -> bool {
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
-        devtools: crate::devtools::facts(),
+        devtools,
         trust_chain: probe_trust_chain(layout),
     };
-    let rows = report_with(
+    report_with(
         layout,
         home.as_deref(),
         path.as_deref(),
         crate::flow::now_unix(),
         cfg_account.as_deref(),
         &probes,
-    );
-    emit(
-        rows,
-        prefix,
-        detail,
-        json,
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
     )
 }
 
@@ -1591,6 +1617,31 @@ pub fn render(rows: &[ItemReport], p: &str, detail: Detail) -> Presented {
         faults,
         rest,
     }
+}
+
+/// The packages view `aterm doctor` prints under its `packages:` row (design §5: `pkg
+/// doctor` is its packages view): whether the rows read `healthy`, then the default
+/// report's lines ([`render`], [`Detail::Problems`]) without their `doctor:` lead — the
+/// verdict first, then the structural faults and the rest, each in one short line.
+#[must_use]
+pub fn packages_view(rows: &[ItemReport]) -> (bool, Vec<String>) {
+    const P: &str = "doctor";
+    let shown = render(rows, P, Detail::Problems);
+    let lead = format!("{P}: ");
+    let lines = [&shown.verdict, &shown.faults, &shown.rest]
+        .into_iter()
+        .flat_map(|part| part.lines())
+        .map(|line| {
+            line.strip_prefix(&lead)
+                .unwrap_or(line)
+                .trim_start()
+                .to_owned()
+        })
+        .collect();
+    (
+        verdict(rows, P).starts_with(&format!("{P}: healthy")),
+        lines,
+    )
 }
 
 /// A typed row's words as the doctor prints them: `<level> — <text>`.
@@ -4474,7 +4525,7 @@ fn repoint_fix(layout: &Layout, link: &Path) -> String {
 /// cannot be re-pointed over (`ln -sfn` onto a directory lays the link inside it), so that
 /// shape gets [`crate::seam::DETACH_FIX`]. A link into the store (`current`, or a numbered
 /// build) is a note, not a warn: `repair` re-points it to the view by itself.
-fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<(Row, Remedy)> {
+pub(crate) fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<(Row, Remedy)> {
     use crate::seam::Entry;
     let target = crate::seam::seam_target(layout, "trust");
     let row = |level, text| Row { level, text };

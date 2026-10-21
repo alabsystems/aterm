@@ -35,7 +35,10 @@
 //!   simulated, an in-memory broker speaking astream's own wire
 //!   (`astream_broker::proto`) through astream's own client, and a pump the
 //!   scheduler drives. The closer that ends a connection from outside its
-//!   reader is the door's too ([`BusCloser`]).
+//!   reader is the door's too ([`BusCloser`]), and so is a read of an owed
+//!   ack that must not wait ([`Fx::unwaited`]): live astream's own
+//!   non-blocking read, simulated a read that finds a held answer not yet
+//!   there.
 //! * THE VERB LANE ([`Fx::lane`]): every request to aterm already goes through
 //!   one funnel (`Bridge::ctl_request`); the door wraps it, so a simulated
 //!   kill can land on either side of a request the endpoint handled.
@@ -206,6 +209,22 @@ impl Fx {
             }
             #[cfg(test)]
             World::Sim(p) => p.dial(),
+        }
+    }
+
+    /// A READ THAT MUST NOT WAIT, `op` being the read
+    /// ([`crate::pipeline::Link::try_recv`], aterm-0). Live it is `op`: astream's
+    /// client puts its own socket in non-blocking mode for the read and back
+    /// after it. Simulated, the bus is a stream astream cannot reach under
+    /// (`Client::from_stream`), so the process says it is TRYING for the length
+    /// of `op`, and the simulated broker answers "not yet" for an answer it is
+    /// still holding — a batch still in its flush (`crate::sim::bus`'s held
+    /// acks) — where a read that may wait releases it: the wait is the flush.
+    pub(crate) fn unwaited<T>(&self, op: impl FnOnce() -> T) -> T {
+        match &self.world {
+            World::Os => op(),
+            #[cfg(test)]
+            World::Sim(p) => p.trying(op),
         }
     }
 

@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! The host-facing predictive-echo API on [`WebTerminal`](crate::WebTerminal) — mosh-style
-//! speculative typing, driven by the shared [`aterm_predict`] state machine
-//! (the SAME predictor the native app runs — no forked heuristics).
+//! Predictive echo on [`WebTerminal`](crate::WebTerminal): mosh-style speculative typing
+//! driven by the [`aterm_predict`] state machine the native app runs.
 //!
-//! The host seams (the crate's own contract):
+//! Host seams:
 //! 1. [`predict_char`](crate::WebTerminal::predict_char) /
 //!    [`predict_edit_key`](crate::WebTerminal::predict_edit_key) (a bare `←`, `→`, or
 //!    Backspace, also [`predict_backspace`](crate::WebTerminal::predict_backspace))
@@ -24,26 +23,43 @@
 //! 4. [`predict_reset`](crate::WebTerminal::predict_reset) when only the coordinate
 //!    space changes (`resize` calls it automatically), and
 //!    [`predict_session_reset`](crate::WebTerminal::predict_session_reset) when the
-//!    host reuses this wrapper for a different pane/session.
+//!    wrapper is reused for another pane.
 //!
-//! OFF by default: until `set_predictive_echo("adaptive" | "always")` every
-//! entry point is inert and rendering is untouched — the same fail-safe
-//! `PredictMode::parse` domain as the native `predictive_echo` config knob.
+//! Off by default: until `set_predictive_echo("adaptive" | "always")` every entry
+//! point is inert. Unlike the deterministic effects clock, this module samples the
+//! real monotonic clock (`aterm_time::Instant`, through [`clock`]): an unechoed guess
+//! must vanish within the predictor's RTT-relative glitch window. A test pins that
+//! clock ([`pin_clock`]), so no stall of its thread ages a guess past the window;
+//! deterministic timing coverage lives in `aterm-predict`.
 //!
-//! Unlike the effects clock (a deterministic host-advanced `advance_effects`
-//! stream), this module samples the REAL monotonic clock (`aterm_time::Instant`:
-//! std on native, `performance.now()` on wasm32). The predictor's glitch-expiry
-//! self-heal is a wall-clock window (an unechoed guess must vanish ~250 ms
-//! after the real keypress) — the same live-clock seam the native event loop
-//! wires. The state machine itself stays pure/clock-injected; deterministic
-//! timing coverage lives in the `aterm-predict` crate tests.
-//!
-//! Shared with `aterm-gpu-web`, which mounts this file by `#[path]`;
-//! [`WebTerminal`](crate::WebTerminal) is each crate's own terminal type.
+//! `aterm-gpu-web` mounts this file by `#[path]`; `WebTerminal` is each crate's own
+//! terminal type.
 
 use aterm_core::terminal::{RenderCell, Terminal};
 use aterm_predict::{EditKey, EditOutcome, KeySample, PredictMode, Seen};
 use aterm_time::Instant;
+
+/// The predictor's one clock read, for every export below: the real monotonic
+/// clock, or the instant a test pinned ([`pin_clock`]).
+fn clock() -> Instant {
+    #[cfg(test)]
+    if let Some(at) = PINNED_CLOCK.with(std::cell::Cell::get) {
+        return at;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The pinned clock ([`clock`]); `None` reads the real one.
+    static PINNED_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin (or, with `None`, release) this thread's predictor clock ([`clock`]).
+#[cfg(test)]
+fn pin_clock(at: Option<Instant>) {
+    PINNED_CLOCK.with(|clock| clock.set(at));
+}
 
 /// The predictor's resident row buffers on a web terminal: one extracted row
 /// (cells, emoji clusters, combining marks) that the reconcile's observe reads
@@ -101,17 +117,13 @@ macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
         impl $terminal {
-            /// Set the predictive-echo display mode: `"off"` (the default) |
-            /// `"adaptive"` (show after the current line confirms echo and its measured
-            /// RTT is high enough to benefit) | `"always"` (power users / demos). Case-
-            /// insensitive; unknown strings fail safe to `off` — the native
-            /// `predictive_echo` domain.
+            /// Set the predictive-echo mode: `"off"` (default), `"adaptive"` (show once the
+            /// line confirms echo and measured RTT is high enough to benefit) or `"always"`.
+            /// Case-insensitive; unknown strings fail safe to `off`.
             pub fn set_predictive_echo(&mut self, mode: &str) {
                 let mode = PredictMode::parse(mode);
-                // A real mode change flushes in-flight guesses (set_mode). Flipping to
-                // Off additionally forgets the confirmation epoch so the toggle is
-                // FULLY inert: no armed deadline may outlive a disable (the native
-                // stranded-deadline 100%-CPU lesson).
+                // A mode change flushes in-flight guesses; Off also forgets the epoch so no
+                // armed deadline outlives a disable.
                 self.predict.set_mode(mode);
                 if mode == PredictMode::Off {
                     self.predict.reset();
@@ -130,7 +142,7 @@ macro_rules! bind {
                     // Not guessed, but sent: the app may leave the alternate screen
                     // before it reads the key and the shell echo it, so its echo is
                     // owed (the native no-echo gate does the same).
-                    self.predict.note_unmodelled_input(Instant::now());
+                    self.predict.note_unmodelled_input(clock());
                     return false;
                 }
                 let cur = self.term.cursor();
@@ -170,7 +182,7 @@ macro_rules! bind {
                     wrap_pending: Some(self.term.grid().pending_wrap()),
                     ..KeySample::default()
                 };
-                self.predict.predict_glyph(ch, &sample, Instant::now())
+                self.predict.predict_glyph(ch, &sample, clock())
             }
 
             /// Register a Backspace: it cancels our OWN trailing guess, or, on a line
@@ -207,7 +219,7 @@ macro_rules! bind {
                 };
                 if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
                     // Sent all the same, and owed (see `predict_char`).
-                    self.predict.note_unmodelled_input(Instant::now());
+                    self.predict.note_unmodelled_input(clock());
                     return 0;
                 }
                 let cur = self.term.cursor();
@@ -239,60 +251,46 @@ macro_rules! bind {
                     wrap_pending: Some(self.term.grid().pending_wrap()),
                     ..KeySample::default()
                 };
-                match self.predict.predict_edit(key, &sample, Instant::now()) {
+                match self.predict.predict_edit(key, &sample, clock()) {
                     EditOutcome::Declined => 0,
                     EditOutcome::Armed => 1,
                     EditOutcome::Cancelled => 2,
                 }
             }
 
-            /// Register a line terminator going to the PTY: Enter (CR, or Shift+Enter's
-            /// LF), Ctrl+J, Ctrl+M — not Alt+Enter, whose ESC prefix makes it any other
-            /// key. Ends the confirmation epoch: nothing typed after it displays
-            /// (`adaptive`) until an echo is confirmed again. LOAD-BEARING for password
-            /// safety: a password typed ahead of the prompt that follows still sits on
-            /// the proven row. The line's own unechoed tail keeps painting until its echo
-            /// (the native `note_line_submit` seam). Cheap.
+            /// Register a line terminator going to the PTY: Enter (CR, or Shift+Enter's LF),
+            /// Ctrl+J, Ctrl+M; not Alt+Enter, whose ESC prefix makes it any other key. Ends the
+            /// confirmation epoch, so nothing typed after it displays (`adaptive`) until an
+            /// echo is confirmed again: a password typed ahead of the next prompt never
+            /// paints. The line's own unechoed tail keeps painting until its echo.
             pub fn predict_line_submit(&mut self) {
-                self.predict.note_line_submit(Instant::now());
+                self.predict.note_line_submit(clock());
             }
 
-            /// Register any OTHER key the host did not hand to
-            /// [`predict_char`](Self::predict_char) /
-            /// [`predict_backspace`](Self::predict_backspace) — Tab, an arrow, a control
-            /// or Alt chord, an IME commit — and a paste: call when its bytes go to the
-            /// PTY. Ends the confirmation epoch like
-            /// [`predict_line_submit`](Self::predict_line_submit), and also retires the
-            /// guesses in flight: the key may erase them (Ctrl+W, Ctrl+H), and a guess
-            /// left over the erased cell is a ghost of the erased text. Which keys submit
-            /// a line is the program's call, so this is the seam for every key that is
-            /// not a terminator (the native `note_unmodelled_input`). Cheap.
+            /// Register any other key whose bytes go to the PTY (Tab, an arrow, a control or
+            /// Alt chord, an IME commit) and a paste. Ends the confirmation epoch like
+            /// [`predict_line_submit`](Self::predict_line_submit) and also retires the guesses
+            /// in flight, since the key may erase them (Ctrl+W, Ctrl+H).
             pub fn predict_unmodelled_input(&mut self) {
                 // ICF barrier (see `predict_reset`): keep this export's body distinct.
                 std::hint::black_box(2u8);
-                self.predict.note_unmodelled_input(Instant::now());
+                self.predict.note_unmodelled_input(clock());
             }
 
-            /// Reconcile pending guesses against the grid — call after `process()`
-            /// applies a PTY chunk. Confirmed leading guesses retire (arming the
-            /// epoch's display gate), any divergence flushes the set, and a no-echo
-            /// context refuses prediction outright — the alternate screen (vim/less/
-            /// htop) OR an app-owned Kitty composer (REPORT_EVENT_TYPES /
-            /// REPORT_ALL_KEYS_AS_ESC). While scrolled into history only the expiry
-            /// self-heal runs: guesses live in ACTIVE-grid coords, so the scrollback
-            /// view is never reconciled against them (the native discipline).
+            /// Reconcile pending guesses against the grid after `process()`. Confirmed leading
+            /// guesses retire (arming the display gate), a divergence flushes the set, and a
+            /// no-echo context (alternate screen, or a Kitty composer with REPORT_EVENT_TYPES
+            /// or REPORT_ALL_KEYS_AS_ESC) refuses prediction. While scrolled into history only
+            /// the expiry self-heal runs: guesses are in active-grid coordinates.
             pub fn predict_reconcile(&mut self) {
-                let now = Instant::now();
+                let now = clock();
                 if self.term.grid().display_offset() != 0 {
-                    // Expiry flush only — a guess in flight when the user scrolled up
-                    // must still self-heal, or `predict_next_deadline_ms` stays pinned
-                    // at a past instant forever.
+                    // Expiry flush only, so a guess in flight when the user scrolled up
+                    // still self-heals and `predict_next_deadline_ms` does not stay pinned.
                     let _ = self.predict.overlay(now);
                     return;
                 }
                 let cur = self.term.cursor();
-                // The native no-echo gate: alt screen OR app-owned Kitty composer.
-                // Read-only display projection — never a byte producer.
                 let no_echo =
                     self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo();
                 // `reconcile` probes once per retired guess plus the head, and the
@@ -305,8 +303,7 @@ macro_rules! bind {
                 // is the fix aterm-gui already carries.
                 let mut scratch = std::mem::take(&mut self.pred_row_scratch);
                 let mut cached: Option<u16> = None;
-                // Rows that moved under the guesses (output scrolled the screen) retire
-                // them and their epoch inside the predictor.
+                // Output that scrolled the screen retires the guesses inside the predictor.
                 let coords = self.term.content_scroll_state().coordinate_generation();
                 let (term, predict) = (&self.term, &mut self.predict);
                 predict.reconcile_seen(Some((cur.row, cur.col)), coords, no_echo, now, |r, c| {
@@ -343,7 +340,7 @@ macro_rules! bind {
                     self.predict.reset();
                     return Vec::new();
                 }
-                let shown = self.predict.overlay(Instant::now());
+                let shown = self.predict.overlay(clock());
                 if self.term.grid().display_offset() != 0 {
                     return Vec::new();
                 }
@@ -380,32 +377,24 @@ macro_rules! bind {
             pub fn predict_next_deadline_ms(&self) -> Option<f64> {
                 self.predict
                     .next_deadline()
-                    .map(|d| d.saturating_duration_since(Instant::now()).as_secs_f64() * 1000.0)
+                    .map(|d| d.saturating_duration_since(clock()).as_secs_f64() * 1000.0)
             }
 
-            /// Drop all in-flight guesses because this SAME terminal's coordinate space
-            /// changed (`resize` calls this automatically). The confirmation epoch is
-            /// forgotten, while this session's learned link RTT remains useful.
+            /// Drop in-flight guesses because this terminal's coordinate space changed
+            /// (`resize` calls it). Forgets the confirmation epoch, keeps the learned RTT.
             pub fn predict_reset(&mut self) {
-                // ICF barrier: `reset`, `note_line_submit` and `note_unmodelled_input` could
-                // compile to identical bodies, and LLVM MergeFunctions folds the exported
-                // shims — after which wasm-bindgen bound BOTH JS methods to the one surviving
-                // export (observed: generated glue called predict_line_submit from
-                // predict_reset). Harmless while semantics coincide; a silent misroute the
-                // day they diverge. black_box keeps this shim's body distinct so the exports
-                // stay separate.
+                // ICF barrier: these export shims can compile to identical bodies, and LLVM
+                // MergeFunctions then folds them, binding several JS methods to one export.
+                // black_box keeps each body distinct.
                 std::hint::black_box(0u8);
                 self.predict.reset();
             }
 
-            /// Reset for a DIFFERENT pane/session. In addition to coordinate-bound
-            /// guesses, forget the learned echo RTT so a slow remote pane cannot make a
-            /// newly selected local pane display speculation. Hosts that keep one
-            /// `WebTerminal` per session never need this; pane-reusing hosts call it at
-            /// the identity switch.
+            /// Reset for a different pane/session: also forget the learned echo RTT, so a
+            /// slow remote pane cannot make a local one display speculation. Call at the
+            /// identity switch when one `WebTerminal` serves several panes.
             pub fn predict_session_reset(&mut self) {
-                // Keep this export distinct from the coordinate-only reset and line-submit
-                // shims under wasm LLVM function merging.
+                // ICF barrier (see `predict_reset`).
                 std::hint::black_box(1u8);
                 self.predict.reset_session();
             }
@@ -419,8 +408,12 @@ mod tests {
     use crate::WebTerminal;
 
     /// A terminal on the system font, or COULD NOT RUN where the host has
-    /// none (the same posture as the other binding tests).
+    /// none (the same posture as the other binding tests). The predictor's
+    /// clock is pinned for the test: every export reads the same instant,
+    /// however long the thread stalls between calls, so no guess expires
+    /// behind the test's back.
     fn terminal() -> WebTerminal {
+        super::pin_clock(Some(aterm_time::Instant::now()));
         crate::system_font_terminal(4, 20, 16.0)
     }
 
@@ -440,8 +433,7 @@ mod tests {
         assert!(t.predict_char('a'));
         assert_eq!(t.predict_overlay(), vec![0, 0, u32::from('a')]);
         assert!(t.predict_next_deadline_ms().is_some(), "glitch timer armed");
-        // The real echo lands: the guess retires, the overlay clears, and the
-        // self-heal deadline disarms.
+        // The real echo retires the guess and disarms the deadline.
         t.process(b"a");
         t.predict_reconcile();
         assert!(t.predict_overlay().is_empty());
@@ -573,8 +565,7 @@ mod tests {
         assert!(t.predict_overlay().is_empty());
         assert!(t.predict_next_deadline_ms().is_none());
 
-        // Arm gate: while Codex owns the composer there is no speculative state and
-        // therefore no 250 ms erase deadline.
+        // Arm gate: while Codex owns the composer nothing is tracked or armed.
         assert!(!t.predict_char('c'));
         assert!(!t.predict_backspace());
         assert!(t.predict_next_deadline_ms().is_none());
@@ -659,8 +650,7 @@ mod tests {
         t.predict_char('b');
         assert!(t.predict_backspace());
         assert_eq!(t.predict_overlay(), vec![0, 0, u32::from('a')]);
-        // Disabled with a guess still in flight: overlay empties AND no
-        // deadline stays armed (the stranded-timer regression).
+        // Disabling with a guess in flight leaves no deadline armed.
         t.set_predictive_echo("off");
         assert!(t.predict_overlay().is_empty());
         assert!(t.predict_next_deadline_ms().is_none());

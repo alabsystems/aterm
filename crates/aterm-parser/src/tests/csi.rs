@@ -8,8 +8,6 @@
 use super::super::*;
 use super::RecordingSink;
 
-// ============== CSI Tests ==============
-
 #[test]
 fn parse_csi_many_params() {
     use crate::MAX_PARAMS;
@@ -37,8 +35,8 @@ fn parse_csi_many_params() {
 
 #[test]
 fn parse_csi_kakoune_sgr() {
-    // Kakoune emits a 17-parameter SGR (truecolor fg + bg + attrs); a cap of
-    // 16 truncated the 17th and dropped the styling.
+    // Kakoune's 17-parameter SGR (reset, underline, truecolor fg and bg,
+    // attributes): a cap of 16 would drop the last.
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
@@ -61,8 +59,6 @@ fn parse_csi_kakoune_sgr() {
         "17th param (SGR 58 underline color) preserved"
     );
 }
-
-// ============== CSI Fast Path Tests ==============
 
 #[test]
 fn csi_single_sequences_dispatch_once() {
@@ -101,7 +97,6 @@ fn csi_fast_path_multiple_sequences() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Multiple sequences in a row (escape-heavy workload)
     parser.advance_fast(b"\x1b[38;5;196m\x1b[48;5;21m\x1b[1;4;5m\x1b[0m", &mut sink);
 
     assert_eq!(sink.csi_dispatches.len(), 4);
@@ -116,7 +111,6 @@ fn csi_fast_path_interleaved_with_text() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Text interleaved with CSI sequences
     parser.advance_fast(b"Hello\x1b[31mWorld\x1b[0m!", &mut sink);
 
     assert_eq!(sink.prints.len(), 11); // "Hello" + "World" + "!"
@@ -188,8 +182,7 @@ fn assert_whole_read_matches_per_byte(input: &[u8]) {
 
 #[test]
 fn csi_fast_path_falls_back_when_sequence_exceeds_64_bytes() {
-    // Trigger `try_parse_csi_fast` length guard (`final_pos > 64`) and verify
-    // fast-path fallback preserves behavior.
+    // Longer than the fast path's 65-byte scan window, so it falls back.
     let mut input = Vec::from(&b"\x1b["[..]);
     for _ in 0..33 {
         input.extend_from_slice(b"1;");
@@ -232,8 +225,8 @@ fn csi_fast_path_trailing_empty_colon_subparam_matches_per_byte() {
         assert_whole_read_matches_per_byte(input);
     }
 
-    // Control cases: a separator follows the empty colon value, so the empty
-    // subparameter IS materialized on both paths and they must still agree.
+    // Controls: an empty colon value with a separator after it is a
+    // subparameter on both paths.
     let mid_cases = [
         b"\x1b[1;2:;3m".as_slice(),
         b"\x1b[1;4:3m",

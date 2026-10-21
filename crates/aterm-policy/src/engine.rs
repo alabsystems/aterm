@@ -43,10 +43,6 @@ use crate::{
     selector::{BucketKey, DispatchedSequence, FunctionKind, SequenceSelector},
 };
 
-// ---------------------------------------------------------------------------
-// Decision
-// ---------------------------------------------------------------------------
-
 /// Result of [`PolicyEngine::evaluate`].
 ///
 /// The winning [`Response`] plus the matched rule's rate-limit id, a key into
@@ -77,10 +73,6 @@ impl Decision {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// PolicyEngine
-// ---------------------------------------------------------------------------
 
 /// Precompiled policy with a bucketed decision table.
 ///
@@ -182,7 +174,6 @@ impl PolicyEngine {
     /// `OSC 52 set` rules override a `*` fallback regardless of line number.
     #[must_use]
     pub fn evaluate(&self, sequence: &DispatchedSequence, origin: OriginTag) -> Decision {
-        // 1. Specific bucket.
         let bucket_key = BucketKey {
             function: sequence.function,
             major: sequence.major,
@@ -206,12 +197,10 @@ impl PolicyEngine {
             return decision;
         }
 
-        // 3. Universal wildcard bucket (`*` / `response any`).
         if let Some(decision) = self.walk_bucket(&self.wildcard_bucket, sequence, origin) {
             return decision;
         }
 
-        // 4. Default fallthrough.
         Decision::fell_through(self.policy.defaults.unmatched)
     }
 
@@ -247,10 +236,6 @@ impl PolicyEngine {
         }
         None
     }
-
-    // -----------------------------------------------------------------
-    // Rate-limit API
-    // -----------------------------------------------------------------
 
     /// Attempt to debit `amount` tokens from the named rate-limit bucket.
     ///
@@ -314,10 +299,6 @@ impl PolicyEngine {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests (co-located to exercise bucket internals).
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,10 +311,6 @@ mod tests {
     fn csi(major: Option<u32>, final_byte: char, params: &[&str]) -> DispatchedSequence {
         DispatchedSequence::csi(major, final_byte, params.iter().map(|&s| s.to_owned()))
     }
-
-    // -----------------------------------------------------------------
-    // Built-in profile decisions
-    // -----------------------------------------------------------------
 
     /// One sequence from one origin under one built-in profile:
     /// `(what, profile, sequence, origin, response, rate-limit id)`. The
@@ -416,10 +393,6 @@ mod tests {
             }
         }
     }
-
-    // -----------------------------------------------------------------
-    // Engine mechanics
-    // -----------------------------------------------------------------
 
     #[test]
     fn malformed_rule_selector_is_skipped() {

@@ -34,9 +34,9 @@ pub(crate) const fn is_utf8_lead(byte: u8) -> bool {
 /// no sequence extends nothing.
 ///
 /// This is the whole of the decoder's well-formedness: the first byte it
-/// refuses ends a MAXIMAL SUBPART, which is replaced by exactly one U+FFFD
-/// (Unicode §3.9, "U+FFFD Substitution of Maximal Subparts"; the WHATWG
-/// Encoding Standard's UTF-8 decoder), and that byte is read afresh.
+/// refuses ends a maximal subpart, replaced by one U+FFFD (Unicode §3.9,
+/// "U+FFFD Substitution of Maximal Subparts"; WHATWG's UTF-8 decoder), and
+/// that byte is read afresh.
 #[inline]
 pub(crate) const fn utf8_continues(lead: u8, held: u8, byte: u8) -> bool {
     if !is_utf8_lead(lead) {
@@ -171,13 +171,9 @@ impl Utf8Prefix {
 }
 
 impl Parser {
-    /// Decode a UTF-8 codepoint from pre-validated bytes.
-    ///
-    /// The lead byte and all continuation bytes have already been range-checked,
-    /// so we extract the codepoint directly via bit manipulation. This avoids
-    /// the overhead of `std::str::from_utf8` which re-scans for validity.
-    ///
-    /// Returns REPLACEMENT_CHARACTER for overlong encodings or surrogates.
+    /// Decode a codepoint from bytes [`utf8_continues`] already checked, by
+    /// bit arithmetic. U+FFFD for an overlong, a surrogate or an unexpected
+    /// `len`.
     #[inline]
     pub(crate) fn decode_utf8_validated(buf: [u8; 4], len: u8) -> char {
         let cp = match len {
@@ -235,22 +231,17 @@ impl Parser {
     /// Process a byte as part of a UTF-8 sequence.
     #[inline]
     pub(crate) fn process_utf8_byte<S: ActionSink>(&mut self, byte: u8, sink: &mut S) {
-        // Check if this byte extends the well-formed prefix held so far.
         if utf8_continues(self.utf8_buffer[0], self.utf8_len, byte) {
-            // Invariant: `utf8_len < 4` while collecting (utf8_expected <= 4),
-            // so `get_mut` is always `Some` at runtime; the `get_mut` +
-            // saturating increment spelling keeps the buffer write provably
-            // in-bounds without changing behavior.
+            // `utf8_len < 4` while collecting, so `get_mut` is always `Some`;
+            // the spelling keeps the write provably in bounds.
             if let Some(slot) = self.utf8_buffer.get_mut(usize::from(self.utf8_len)) {
                 *slot = byte;
             }
             self.utf8_len = self.utf8_len.saturating_add(1);
 
             if self.utf8_len == self.utf8_expected {
-                // Decode directly from validated bytes — skips std::str::from_utf8 scan.
-                // Each byte has already been range-checked against its position
-                // (`utf8_continues`), so the sequence is well-formed and the
-                // codepoint comes out of plain bit math.
+                // Every byte was range-checked for its position, so the
+                // sequence is well-formed: plain bit math, no `from_utf8` scan.
                 let c = Self::decode_utf8_validated(self.utf8_buffer, self.utf8_len);
                 sink.print(c);
                 self.utf8_len = 0;
@@ -263,7 +254,6 @@ impl Parser {
             self.utf8_len = 0;
             self.utf8_expected = 0;
 
-            // Re-process this byte (it might be a new sequence or control)
             if is_utf8_lead(byte) {
                 self.start_utf8(byte);
             } else if byte >= 0x80 {

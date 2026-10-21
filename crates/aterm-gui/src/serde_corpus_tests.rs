@@ -1090,53 +1090,70 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// THE BYTES OLD BUILDS WROTE: every handoff manifest, layout and checkpoint
-/// meta each shipped release's producer committed under `tests/fixtures/
-/// handoff/`, read by this build's models and written back out.
-#[test]
-fn state_written_by_shipped_producers_answers_as_recorded() {
+/// Every file of the fixture root `root` as `(its path under the root, where it is read from)`,
+/// in the order the shipped-state sweep records them: by that path, component by component, the
+/// order a walk of sorted entries visits them in. With `release` (`(tag, dir)`), release `tag`'s
+/// files are read from `dir` in place of `root/<tag>`, as they read once `dir` is checked in
+/// there.
+fn shipped_files(root: &Path, release: Option<(&str, &Path)>) -> Vec<(PathBuf, PathBuf)> {
+    let under = |base: &Path, prefix: &Path| {
+        let mut files = Vec::new();
+        walk(base, &mut files);
+        files
+            .into_iter()
+            .map(|path| {
+                let rel = path.strip_prefix(base).expect("a file under its directory");
+                (prefix.join(rel), path)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut files = under(root, Path::new(""));
+    if let Some((tag, dir)) = release {
+        files.retain(|(rel, _)| !rel.starts_with(tag));
+        files.extend(under(dir, Path::new(tag)));
+    }
+    files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    files
+}
+
+/// The shipped-state sweep's cases over [`shipped_files`]: every handoff manifest, layout and
+/// checkpoint meta read by this build's models and written back out, then the negative control.
+/// Beside the corpus, how many of each it read, and the ids of `release`'s own cases that this
+/// build refused.
+fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], Vec<String>) {
     let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "shipped-state");
-    let root = fixtures();
-    let mut files = Vec::new();
-    walk(&root, &mut files);
     let (mut manifests, mut layouts, mut metas) = (0, 0, 0);
+    let mut refused = Vec::new();
     // Every `Ok` here is pinned by digest: the bytes are the fixture's, read
     // and written back, and a drift is found by re-running one desk.
-    for path in files {
-        let name = path
+    for (rel, path) in shipped_files(&fixtures(), release) {
+        let name = rel
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
         // The id names the desk with `/` whatever the host's separator, so a
         // Windows run reads the same answers file.
-        let desk = path
+        let desk = rel
             .parent()
-            .and_then(|dir| dir.strip_prefix(&root).ok())
             .expect("a desk under the root")
             .components()
             .map(|part| part.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
         let read_text = || checkout_text(&path);
-        if name.ends_with(".meta.json") {
+        let (id, answer) = if name.ends_with(".meta.json") {
             metas += 1;
             let meta = aterm_json::from_str::<CheckpointMeta>(&read_text())
                 .map_err(|e| e.to_string())
                 .and_then(|meta| aterm_json::to_string(&meta).map_err(|e| e.to_string()));
-            corpus.record(
-                format!("{desk}/{name}"),
-                meta.map(|bytes| answers::digest(&bytes)),
-            );
+            (format!("{desk}/{name}"), meta)
         } else if name.starts_with("seamless-") && name.ends_with(".layout.toml") {
             layouts += 1;
             let layout = aterm_toml::from_str::<RestoreManifest>(&read_text())
                 .map_err(|e| e.to_string())
                 .and_then(|layout| layout.to_toml());
-            corpus.record(
-                format!("{desk}/layout"),
-                layout.map(|bytes| answers::digest(&bytes)),
-            );
+            (format!("{desk}/layout"), layout)
         } else if name.starts_with("seamless-") && name.ends_with(".toml") {
             manifests += 1;
             // The first line binds the file to its attempt's nonce; the TOML
@@ -1146,23 +1163,61 @@ fn state_written_by_shipped_producers_answers_as_recorded() {
             let manifest = aterm_toml::from_str::<SessionHandoff>(toml)
                 .map_err(|e| e.to_string())
                 .and_then(|manifest| manifest.to_toml());
-            corpus.record(
-                format!("{desk}/manifest"),
-                manifest.map(|bytes| answers::digest(&bytes)),
-            );
+            (format!("{desk}/manifest"), manifest)
+        } else {
+            continue;
+        };
+        if answer.is_err() && release.is_some_and(|(tag, _)| rel.starts_with(tag)) {
+            refused.push(id.clone());
         }
+        corpus.record(id, answer.map(|bytes| answers::digest(&bytes)));
     }
-    // A fixture tree that moved would leave nothing of a kind to read (the
-    // answers file names every fixture it read, so a lost one is a red too).
-    assert!(
-        manifests > 0 && layouts > 0 && metas > 0,
-        "the shipped-producer sweep read {manifests} manifests, {layouts} layouts, {metas} metas"
-    );
     // The negative control the harness asks for: a manifest whose schema line
     // is torn, as a truncated write would leave it.
     corpus.record(
         "negative-control/torn-manifest",
         aterm_toml::from_str::<SessionHandoff>("schema = ").map(|_| String::new()),
     );
+    (corpus, [manifests, layouts, metas], refused)
+}
+
+/// THE BYTES OLD BUILDS WROTE: every handoff manifest, layout and checkpoint
+/// meta each shipped release's producer committed under `tests/fixtures/
+/// handoff/`, read by this build's models and written back out.
+#[test]
+fn state_written_by_shipped_producers_answers_as_recorded() {
+    let (corpus, [manifests, layouts, metas], _) = shipped_state_corpus(None);
+    // A fixture tree that moved would leave nothing of a kind to read (the
+    // answers file names every fixture it read, so a lost one is a red too).
+    assert!(
+        manifests > 0 && layouts > 0 && metas > 0,
+        "the shipped-producer sweep read {manifests} manifests, {layouts} layouts, {metas} metas"
+    );
     corpus.finish();
+}
+
+/// THE ANSWERS A RELEASE'S DESKS ADD: the answers file
+/// [`state_written_by_shipped_producers_answers_as_recorded`] records once `dir` (the desks the
+/// generator just wrote, `fixture_generator::generate_handoff_fixtures`) is checked in as release
+/// `tag`'s, `tests/fixtures/handoff/<tag>/`. A release's cut stages it beside its desks, and its
+/// landing (`aterm-release`'s `fixtures.rs`) records the release's own cases in the committed
+/// file with them, so the commit that adds the desks leaves this sweep green. Refuses unless this
+/// build reads back every manifest, layout and meta the release's desks hold. Unix, as the
+/// generator that calls it is.
+#[cfg(unix)]
+pub(crate) fn shipped_state_with(tag: &str, dir: &Path) -> String {
+    let (corpus, _, refused) = shipped_state_corpus(Some((tag, dir)));
+    assert!(
+        refused.is_empty(),
+        "this build cannot read back what its own producer wrote: {}",
+        refused.join(", ")
+    );
+    let text = corpus.render();
+    let prefix = format!("{tag}/");
+    assert!(
+        text.lines().any(|line| line.starts_with(&prefix)),
+        "the shipped-state sweep reads no case of {tag}'s desks in {}",
+        dir.display()
+    );
+    text
 }

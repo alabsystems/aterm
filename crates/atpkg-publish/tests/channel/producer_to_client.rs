@@ -1,14 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE PRODUCER AND THE CLIENT VERIFIER, IN ONE PROCESS.
-//!
-//! The producer's self-check is the client's own chain (`quad::verify_dir`), so a
-//! producer that emits what clients refuse cannot finish. This file proves it from both
-//! ends: the real indexer's quad is accepted by the verifier, run independently; and every
-//! mutation a well-meaning edit could make — the retired schema-1 shape, a dropped
-//! `machine_id`, a signature by a key nobody rostered — is refused by that same verifier.
-//! The pre-checks refuse the common mistakes before anything is signed, naming the fix.
+//! The producer and the client verifier in one process. The producer self-checks with the
+//! client's own chain (`quad::verify_dir`), so a producer that emits what clients refuse
+//! cannot finish: the real indexer's quad verifies, every plausible mutation is refused, and
+//! the pre-checks refuse the common mistakes before anything is signed, naming the fix.
 
 use atpkg_publish::api::{Baseline, Delta, IndexRequest};
 use atpkg_publish::channel::index::{parse_delta, publish_with, render};
@@ -79,9 +75,8 @@ fn every_retired_or_broken_shape_is_refused_by_the_self_check() {
     let seq_line = format!("roster_seq = {}\n", rig.keys.roster.roster_seq);
     assert!(good.contains(id_line) && good.contains(&seq_line));
 
-    // (a) the retired producer, restored: schema 1, a [keys] table, no attribution. The
-    // schema number alone stops nothing (SUPPORTED_SCHEMA rejects only newer); the
-    // attribution bind does.
+    // (a) the retired schema-1 shape: a [keys] table, no attribution. The schema number alone
+    // stops nothing (SUPPORTED_SCHEMA rejects only newer); the attribution bind does.
     let retired = good
         .replace("schema = 2\n", "schema = 1\n")
         .replace(id_line, "")
@@ -100,8 +95,7 @@ fn every_retired_or_broken_shape_is_refused_by_the_self_check() {
             "{label} must be refused"
         );
     }
-    // (d) signed by a key nobody rostered: the body is flawless, the signature is not
-    // the roster's — only the real verifier catches it.
+    // (c) signed by a key nobody rostered: a flawless body, a foreign signature.
     let (outsider, _) = atpkg_keys::generate().expect("keypair");
     let dir = rig.path("mutant-outsider");
     rig.keys.write_quad(&dir, &good);
@@ -149,8 +143,8 @@ fn an_unarmed_anchor_stops_the_publish_rather_than_signing_into_the_void() {
     assert!(!req.out.join("index.toml").exists());
 }
 
-/// The index's own horizon is the client's gate 2, which `atpkg verify-index` never
-/// reached: a lapsed or unreadable stamp is refused before a signature, because the upload
+/// The index's own horizon is the client's freshness gate, which `atpkg verify-index` does not
+/// check: a lapsed or unreadable stamp is refused before a signature, because the upload
 /// consumes a tag.
 #[test]
 fn a_lapsed_or_malformed_horizon_never_reaches_a_signature() {
@@ -178,7 +172,7 @@ fn the_roster_shipped_is_the_newest_and_never_below_the_heads() {
     let newer = atpkg_keys::roster_ops::add(rig.keys.roster.clone(), "m4", &m4, now).expect("add");
     let newer_bytes = newer.to_toml().expect("emit").into_bytes();
     let newer_sig = rig.keys.master_sign(&newer_bytes);
-    // The head ships the NEWER generation; this machine still has the older pair installed.
+    // The head ships the newer generation; this machine still has the older pair installed.
     let head = rig.path("head");
     rig.keys
         .write_quad(&head, &Doc::new(6, &[("ay", 5)]).render(&rig.keys));

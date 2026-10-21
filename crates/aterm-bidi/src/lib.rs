@@ -1633,7 +1633,7 @@ mod generated {
         (0..rng.index(48)).map(|_| *rng.pick(alphabet)).collect()
     }
 
-    /// Lines over [`ALPHABET`], plus the case that once broke paragraph handling.
+    /// Lines over [`ALPHABET`], plus a two-paragraph RTL/LTR line.
     fn lines() -> impl Iterator<Item = Vec<char>> {
         let mut rng = XorShift::new(0x0B1D_1A57_C0FF_EE11);
         std::iter::once(vec!['\u{05D0}', '\n', 'a'])
@@ -1693,7 +1693,7 @@ mod generated {
 
     /// The class-taking entry points, and the `_into` companion with one
     /// Scratch reused across bases, are byte-identical to the char-taking
-    /// originals (the dedup the bridge depends on). Resolution is deterministic.
+    /// entry points (the dedup the bridge depends on). Resolution is deterministic.
     #[test]
     fn class_taking_and_into_variants_match_char_taking() {
         let mut scratch = Scratch::default();

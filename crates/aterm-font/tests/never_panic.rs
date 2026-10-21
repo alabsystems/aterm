@@ -1215,14 +1215,15 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
 }
 
 /// The autohinter over the face: one target at one size (from a desktop
-/// size to an absurd one), at the face's own hostile instance spelled in
-/// user space, every glyph up to `glyph_cap / 8` and the glyphs past the
-/// end.
+/// size to an absurd one the scale bound still admits for a 1000-unit em,
+/// so the hinter runs at it: `hint_extremes` holds the sizes past the
+/// bound), at the face's own hostile instance spelled in user space, every
+/// glyph up to `glyph_cap / 8` and the glyphs past the end.
 #[cfg(any(feature = "hint", debug_assertions))]
 fn hint(bytes: &[u8], index: u32, face: &Face<'_>, rng: &mut Lcg, glyph_cap: u16) -> u64 {
     use aterm_font::autohint::{HintingInstance, Target};
     let target = [Target::Normal, Target::Light, Target::Lcd][rng.below(3)];
-    let px = [0.5f32, 9.0, 13.0, 16.5, 300.0, 1.0e6][rng.below(6)];
+    let px = [0.5f32, 9.0, 13.0, 16.5, 300.0, 1.0e5][rng.below(6)];
     let settings: Vec<(u32, f32)> = face
         .variation_axes()
         .into_iter()

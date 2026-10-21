@@ -19,19 +19,11 @@
 //! denies that; a directory reached through [`PinnedDir::child`] shares it, as
 //! a Unix descriptor does, so any number of pins of one directory coexist.
 //!
-//! POSIX has no portable unlink-by-file-descriptor operation. Recursive cleanup
-//! therefore traverses only retained, no-follow directory handles and checks the
-//! retained child's link count after the final `unlinkat`. A same-uid process can
-//! still swap an empty direct child during that syscall window; the replacement
-//! may be removed inside this server-owned directory, but the post-check returns
-//! an error and never falsely certifies that the retained inode was removed.
-//! The same POSIX limitation applies to `PinnedFile::remove_exact`: “exact”
-//! describes the success verdict, not an impossible side-effect guarantee. A
-//! same-uid process can swap a direct file entry after the identity check and
-//! before `unlinkat`; that replacement entry may be unlinked inside the pinned,
-//! server-owned `0700` directory, but no operation follows/traverses it, nothing
-//! outside that directory is mutated, and the retained-inode post-check prevents
-//! a false `Ok`.
+//! POSIX has no unlink-by-descriptor, so removal (recursive cleanup,
+//! `PinnedFile::remove_exact`) checks identity, `unlinkat`s by name, then checks the retained
+//! inode's link count. A same-uid swap inside that window can remove the replacement entry, but
+//! only inside the pinned, server-owned `0700` directory; nothing is followed, and the
+//! post-check returns an error rather than a false `Ok`.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -55,16 +47,12 @@ pub(crate) fn is_one_component(name: &OsStr) -> bool {
     validate_component(name).is_ok()
 }
 
-/// Refuse any name that is not one ordinary path component.
+/// Refuse any name that is not one ordinary path component: the empty name, `.`, `..`, any
+/// separator (`/`, and `\` on Windows) and NUL.
 ///
-/// Ruling 2026-10-10 (FS-1): decided on the RAW name, never on
-/// `Path::components()`, which normalizes a trailing `/`, `/.` and `//` away.
-/// `"link/"` read as the one component `link`, the raw name went to the `*at`
-/// call, and the kernel resolved the symlink `link` (`O_NOFOLLOW`, `unlinkat`
-/// and `renameat` govern only the final component): `child` opened an outside
-/// directory, `remove_child_tree` emptied and removed one, `rename` moved one
-/// in and `create_child` made one through a dangling link. Refused: the empty
-/// name, `.`, `..`, any separator (`/`, and `\` on Windows) and NUL.
+/// Decided on the raw name, never on `Path::components()`, which normalizes a trailing `/`, `/.`
+/// and `//` away: `"link/"` would pass as `link`, and the `*at` call would resolve the symlink
+/// (`O_NOFOLLOW`, `unlinkat` and `renameat` govern only the final component).
 fn validate_component(name: &OsStr) -> io::Result<()> {
     let bytes = name.as_encoded_bytes();
     let separator = |byte: u8| byte == b'/' || (cfg!(windows) && byte == b'\\');
@@ -656,15 +644,12 @@ mod imp {
             })
         }
 
-        /// Reopen the exact retained directory inode for a cross-process
-        /// advisory lock. Unlike a replaceable child lockfile, every process
-        /// writing through this pinned directory necessarily locks the same
-        /// authority even if a same-uid actor renames child entries.
+        /// Reopen the exact retained directory inode for a cross-process advisory lock: unlike
+        /// a replaceable child lockfile, every process writing through this pin locks the same
+        /// inode even if a same-uid actor renames entries.
         ///
-        /// This must be a new open-file description, not `dup`: `flock` locks
-        /// are attached to the open-file description on Unix, so a duplicated
-        /// descriptor would keep the lease locked until the longer-lived
-        /// [`PinnedDir`] descriptor also closed.
+        /// A new open-file description, not a `dup`: `flock` locks belong to the description,
+        /// so a dup would stay locked until the [`PinnedDir`] descriptor also closed.
         pub(crate) fn open_directory_lock(&self) -> io::Result<std::fs::File> {
             Ok(std::fs::File::from(open_directory_at(self.leaf(), ".")?))
         }
@@ -1127,12 +1112,9 @@ mod imp {
                     .is_some_and(|fd| is_regular_file(&fd))
         }
 
-        /// Hard-bounded enumeration: overrunning `limit` is an ERROR, not a
-        /// truncation. Every retention caller moved to `names_up_to` (see its
-        /// note: a directory that outgrew the bound must not become a permanent
-        /// failure), so this stricter variant is compiled for the TEST build
-        /// only — it is where the fail-closed bound is still stated and
-        /// exercised, and shipping it would be unreachable code.
+        /// Hard-bounded enumeration: overrunning `limit` is an error, not a truncation.
+        /// Test-only: shipping callers use [`Self::names_up_to`], so a directory that outgrew
+        /// the bound is not a permanent failure.
         #[cfg(test)]
         pub(crate) fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
             let mut directory = Dir::read_from(self.leaf()).map_err(io::Error::from)?;
@@ -1260,13 +1242,9 @@ mod imp {
             super::ClearContentsOutcome { result, removed }
         }
 
-        /// Remove a child tree named only BY NAME, resolving it through the
-        /// retained parent. Every production cleanup already holds the child's
-        /// own handle and therefore goes through `remove_child_tree_exact`, so
-        /// this variant is compiled for the TEST build only: it is what lets a
-        /// test hand the parent nothing but a name AFTER the parent's pathname
-        /// was swapped, proving the removal still lands on the retained inode
-        /// and never on the replacement. Shipping it would be unreachable code.
+        /// Test-only: remove a child tree by name through the retained parent, so a test can
+        /// swap the parent's pathname and see the removal land on the retained inode. Production
+        /// cleanup holds the child's handle and uses [`Self::remove_child_tree_exact`].
         #[cfg(test)]
         pub(crate) fn remove_child_tree(&self, name: &OsStr) -> io::Result<()> {
             validate_component(name)?;
@@ -1510,15 +1488,6 @@ mod imp {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
-    fn windows_io_error(error: windows::core::Error) -> io::Error {
-        let raw = error.code().0 as u32;
-        if raw & 0xFFFF_0000 == 0x8007_0000 {
-            io::Error::from_raw_os_error((raw & 0xFFFF) as i32)
-        } else {
-            io::Error::other(error.to_string())
-        }
-    }
 
     #[repr(C)]
     struct ByHandleFileInformation {
@@ -2274,16 +2243,8 @@ mod imp {
                 // being swapped between validation and truncation/publication.
                 .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-            // REQUIRED even though `access_mode` above is what actually reaches
-            // `CreateFileW`. std validates the PORTABLE flags first, and a creation
-            // disposition without `write`/`append` is rejected there —
-            // "creating or truncating a file requires write or append access" —
-            // before the Windows-specific access mask is ever consulted. Without
-            // this line every private artifact write failed on Windows, which is
-            // how `aterm-ctl window` came to answer with a write error on a
-            // directory it could plainly write to. `get_access_mode` still returns
-            // the explicit mask (an explicit `access_mode` outranks these), so this
-            // changes the validation outcome and nothing about the actual open.
+            // std refuses `create_new` without `write`/`append` before it consults
+            // `access_mode`, which still decides the actual open.
             options.write(true);
             options.create_new(true);
             let file = options.open(path)?;
@@ -2841,31 +2802,37 @@ mod imp {
             .open(path)
     }
 
+    /// `SetFileInformationByHandle`'s answer: `Ok` for TRUE, else this thread's
+    /// last OS error, which the call set.
+    fn set_information(succeeded: aterm_win32::core::BOOL) -> io::Result<()> {
+        if succeeded == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     fn dispose_file_handle(file: &std::fs::File) -> io::Result<()> {
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::Storage::FileSystem::{
+        use aterm_win32::Win32::Storage::FileSystem::{
             FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
         };
 
         let information = FILE_DISPOSITION_INFO { DeleteFile: true };
         // SAFETY: `file` owns a live handle opened with DELETE access; the
         // information pointer and exact structure size match FileDispositionInfo.
-        unsafe {
+        set_information(unsafe {
             SetFileInformationByHandle(
-                HANDLE(file.as_raw_handle()),
+                file.as_raw_handle(),
                 FileDispositionInfo,
                 (&raw const information).cast(),
                 u32::try_from(std::mem::size_of_val(&information))
                     .expect("FILE_DISPOSITION_INFO size fits u32"),
             )
-            .map_err(windows_io_error)
-        }
+        })
     }
 
-    /// The exact `FILE_RENAME_INFO` request bytes for one destination, split out
-    /// so the payload's shape is directly assertable. `bytes` is the size handed
-    /// to `SetFileInformationByHandle`; `buffer` is `usize`-aligned backing store
-    /// at least that large.
+    /// The `FILE_RENAME_INFO` request bytes for one destination. `bytes` is the size handed to
+    /// `SetFileInformationByHandle`; `buffer` is `usize`-aligned backing store at least that large.
     pub(super) struct RenamePayload {
         buffer: Vec<usize>,
         bytes: usize,
@@ -2888,7 +2855,7 @@ mod imp {
         #[cfg(test)]
         #[must_use]
         pub(super) fn file_name_length(&self) -> u32 {
-            use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+            use aterm_win32::Win32::Storage::FileSystem::FILE_RENAME_INFO;
             let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
             let mut raw = [0_u8; 4];
             raw.copy_from_slice(&self.request_bytes()[header - 4..header]);
@@ -2899,7 +2866,7 @@ mod imp {
         #[cfg(test)]
         #[must_use]
         pub(super) fn file_name_units(&self) -> Vec<u16> {
-            use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+            use aterm_win32::Win32::Storage::FileSystem::FILE_RENAME_INFO;
             let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
             self.request_bytes()[header..]
                 .chunks_exact(2)
@@ -2908,31 +2875,16 @@ mod imp {
         }
     }
 
-    /// Build the rename request for `destination`. Split out of
-    /// [`rename_file_handle`] so `windows_tests` can assert the payload's shape
-    /// without a live handle; see that function's doc comment for why the
-    /// terminator is load-bearing.
+    /// Build the rename request for `destination`; split out of [`rename_file_handle`] so
+    /// `windows_tests` can assert its shape without a live handle.
     pub(super) fn rename_payload(destination: &Path, replace: bool) -> io::Result<RenamePayload> {
+        use aterm_win32::Win32::Storage::FileSystem::FILE_RENAME_INFO;
         use std::os::windows::ffi::OsStrExt as _;
-        use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
 
-        // NUL-TERMINATE the destination, and let the buffer size cover the
-        // terminator. `FileNameLength` alone does NOT bound what
-        // `SetFileInformationByHandle` reads: the Win32 wrapper also walks the
-        // name as a wide C string. Without the terminator it ran off the end of
-        // this allocation, and the only thing that ever stopped it was the
-        // padding `vec![0_usize; words]` happens to leave — `bytes` is
-        // `offset_of(FileName) + 2 * len`, which is a multiple of
-        // `size_of::<usize>()` exactly when the destination's UTF-16 length is
-        // 2 mod 4, and in that case there is NO slack and no zero byte.
-        // Measured on Windows 11 (2026-08-27): every failing publication had
-        // zero slack, and the same path succeeded or answered os error 123
-        // (ERROR_INVALID_NAME) / os error 2 (ERROR_FILE_NOT_FOUND) from one run
-        // to the next purely on what followed the allocation. That made EVERY
-        // confined artifact write — snapshot, `image`/`window` capture, video
-        // frame — fail nondeterministically on a path-length parity nobody
-        // chose. `FileNameLength` stays the length of the NAME, excluding the
-        // terminator, which is what the structure documents.
+        // NUL-terminate the destination inside the buffer: `SetFileInformationByHandle` also
+        // walks `FileName` as a wide C string, and the `usize`-granular buffer has no zero slack
+        // when the UTF-16 length is 2 mod 4. `FileNameLength` stays the name's length without
+        // the terminator, as the structure documents.
         let name_bytes = destination
             .as_os_str()
             .encode_wide()
@@ -2958,15 +2910,13 @@ mod imp {
             / std::mem::size_of::<usize>();
         let mut buffer = vec![0_usize; words];
         let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        // SAFETY: `Vec<usize>` provides at least pointer alignment and enough
-        // bytes for the header plus the UTF-16 payload INCLUDING its NUL
-        // terminator, so both a length-driven and a terminator-driven reader
-        // stay inside this allocation.
+        // SAFETY: `Vec<usize>` provides at least pointer alignment and enough bytes for the
+        // header plus the UTF-16 payload including its NUL terminator, so both a length-driven
+        // and a terminator-driven reader stay inside this allocation.
         unsafe {
             std::ptr::write(information, FILE_RENAME_INFO::default());
             (*information).Anonymous.ReplaceIfExists = replace;
-            // RootDirectory stays NULL (from `default()`) — see the doc comment:
-            // `SetFileInformationByHandle` rejects any other value.
+            // `RootDirectory` stays NULL from `default()` (see `rename_file_handle`).
             (*information).FileNameLength = u32::try_from(name_bytes)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename name too long"))?;
             std::ptr::copy_nonoverlapping(
@@ -2978,7 +2928,7 @@ mod imp {
         Ok(RenamePayload { buffer, bytes })
     }
 
-    /// Rename the file behind `file`'s HANDLE to `name` inside `parent_path`.
+    /// Rename the file behind `file`'s handle to `name` inside `parent_path`.
     ///
     /// `FILE_RENAME_INFO::RootDirectory` — the natural way to anchor the destination
     /// to a directory HANDLE this process already retains — is NOT honored by
@@ -3004,8 +2954,7 @@ mod imp {
         name: &OsStr,
         replace: bool,
     ) -> io::Result<()> {
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::Storage::FileSystem::{FileRenameInfo, SetFileInformationByHandle};
+        use aterm_win32::Win32::Storage::FileSystem::{FileRenameInfo, SetFileInformationByHandle};
 
         validate_component(name)?;
         let mut payload = rename_payload(&parent_path.join(name), replace)?;
@@ -3013,24 +2962,21 @@ mod imp {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename too large"))?;
         // SAFETY: `payload` owns `bytes` initialized, `usize`-aligned bytes
         // holding one FILE_RENAME_INFO plus its NUL-terminated destination.
-        unsafe {
+        set_information(unsafe {
             SetFileInformationByHandle(
-                HANDLE(file.as_raw_handle()),
+                file.as_raw_handle(),
                 FileRenameInfo,
                 payload.as_mut_ptr().cast(),
                 bytes,
             )
-            .map_err(windows_io_error)
-        }
+        })
     }
 }
 
 pub(crate) use imp::{PinnedDir, PinnedDirIdentity, PinnedFile, PinnedFileIdentity};
 
 impl PinnedDir {
-    /// Admit one already-resolved path before constructing its retained
-    /// ancestor chain. The ordinary [`Self::open`] remains the common,
-    /// refinement-anchored implementation after admission succeeds.
+    /// Admit one already-resolved path, then [`Self::open`] it; a refusal opens nothing.
     pub(crate) fn open_with_admission(
         path: &Path,
         admit: impl FnOnce(&Path) -> bool,
@@ -3043,7 +2989,7 @@ impl PinnedDir {
     }
 }
 
-/// Contracts BOTH backends owe, asserted with one body so they cannot drift.
+/// Contracts both backends owe, asserted with one body so they cannot drift.
 #[cfg(test)]
 mod shared_backend_contract_tests {
     use super::PinnedDir;
@@ -3059,18 +3005,8 @@ mod shared_backend_contract_tests {
             ))
     }
 
-    /// REGRESSION: `remove_file_if_exists` removes a FILE. A directory sitting on
-    /// an artifact name must survive it, on every backend.
-    ///
-    /// Unix removes with `unlinkat` and no `AT_REMOVEDIR`, so a directory there
-    /// answers EISDIR. Windows opens with `FILE_FLAG_BACKUP_SEMANTICS` (needed to
-    /// unlink a reparse point without following it), which also opens a real
-    /// directory, and `FileDispositionInfo` then deleted an empty one outright.
-    /// The callers are best-effort rollback paths — `write_snapshot_artifacts`
-    /// cleaning up after a failed payload write, video/image publication abort —
-    /// running on names this process does not control, so the Windows backend was
-    /// silently destroying a directory a same-uid actor had parked there while
-    /// the Unix backend left it alone.
+    /// `remove_file_if_exists` removes a file; a directory on an artifact name survives it on
+    /// every backend.
     #[test]
     fn remove_file_if_exists_never_removes_a_directory() {
         let root = unique_dir("remove-file-is-file-only");
@@ -3119,8 +3055,8 @@ mod shared_backend_contract_tests {
         );
         identity.validate_at_retained(&pinned, name).unwrap();
 
-        // Keep the original object allocated so this test cannot accidentally
-        // pass an immediately reused inode/file-index as the replacement.
+        // Keep the original allocated so a reused inode/file index cannot pose as the
+        // replacement.
         std::fs::rename(root.join(name), root.join("original.png")).unwrap();
         let replacement = pinned.write_new_private(name, b"replacement").unwrap();
         assert!(
@@ -3249,19 +3185,9 @@ mod windows_tests {
         windows_component_is_safe,
     };
 
-    /// REGRESSION: the `FILE_RENAME_INFO` payload must carry a NUL terminator
-    /// INSIDE the request bytes, at every destination length.
-    ///
-    /// `FileNameLength` does not bound what `SetFileInformationByHandle` reads —
-    /// it also walks `FileName` as a wide C string. The payload buffer is
-    /// `usize`-granular, so `offset_of(FileName) + 2 * len` leaves zero slack
-    /// exactly when the destination's UTF-16 length is 2 mod 4. Without an
-    /// explicit terminator those lengths shipped an unterminated name and the
-    /// kernel read past the allocation, so a confined artifact publication
-    /// answered os error 123 / os error 2 / success depending only on the heap
-    /// byte that happened to follow. Sweeping four consecutive lengths always
-    /// covers the zero-slack case, so this fails without the terminator no
-    /// matter where the sweep starts.
+    /// The `FILE_RENAME_INFO` payload carries a NUL terminator inside the request bytes at every
+    /// destination length. Four consecutive lengths always include the zero-slack case (UTF-16
+    /// length 2 mod 4), where allocation padding supplies no zero byte.
     #[test]
     fn rename_payload_nul_terminates_its_destination_at_every_length() {
         let mut zero_slack_seen = 0usize;
@@ -3297,7 +3223,7 @@ mod windows_tests {
             );
 
             if (std::mem::offset_of!(
-                windows::Win32::Storage::FileSystem::FILE_RENAME_INFO,
+                aterm_win32::Win32::Storage::FileSystem::FILE_RENAME_INFO,
                 FileName
             ) + expected.len() * 2)
                 % std::mem::size_of::<usize>()
@@ -3334,20 +3260,15 @@ mod windows_tests {
         pinned.sync().unwrap();
         pinned.validate_path_identity().unwrap();
         index.validate_path_identity().unwrap();
-        // Reading an artifact whose WRITE guard this process still retains must
-        // work. The write guard holds DELETE_ACCESS for its whole life (rename
-        // publication and `remove_exact` both need it), so a read mask without
-        // FILE_SHARE_DELETE answered ERROR_SHARING_VIOLATION here — which is
-        // what the video prune probe originally hit against a live publisher.
+        // Reading an artifact whose write guard this process still holds works: the read
+        // mask shares DELETE, which the write guard holds for its whole life.
         let (bytes, read) = pinned
             .read_private(std::ffi::OsStr::new("index.json"), 32)
             .unwrap();
         assert_eq!(bytes, b"whole");
         read.validate_path_identity().unwrap();
-        // The price, stated in code rather than left implicit: a retained READ
-        // guard no longer denies deletion on Windows. Its contract is now the
-        // Unix one — it does not EXCLUDE a same-uid mutation, it DETECTS one and
-        // fails closed. Both halves are asserted so neither can rot silently.
+        // A retained read guard does not deny deletion on Windows, as on Unix: it detects a
+        // same-uid mutation and fails closed.
         drop(index);
         std::fs::remove_file(root.join("index.json"))
             .expect("a retained read guard permits deletion, as an open Unix fd does");
@@ -3368,15 +3289,9 @@ mod windows_tests {
         pinned
             .remove_child_tree_exact(std::ffi::OsStr::new("recording"), &child)
             .unwrap();
-        // The `unwrap` above is the removal verdict; this `exists` check is only
-        // about WHEN the name stops being enumerable. `dispose_file_handle` is
-        // Windows' handle-anchored removal and it marks delete-on-close, so the
-        // committed entry survives until the last handle to that exact inode
-        // closes — `child` is still holding one right here. (`std`'s `metadata`
-        // falls back to a directory-entry query when the open is refused, so a
-        // delete-pending name still reports as existing.) Unix `unlinkat` drops
-        // the name at once, so the two backends differ in observation point, not
-        // in guarantee. Assert once the handle this call was anchored to is gone.
+        // The `unwrap` above is the removal verdict. `dispose_file_handle` marks
+        // delete-on-close, so the name stays enumerable until `child`'s handle closes (Unix
+        // drops it at once): assert after the drop.
         drop(child);
         assert!(!root.join("recording").exists());
         drop(pinned);
@@ -3848,18 +3763,16 @@ mod tests {
         if outside.join("absent").exists() {
             escapes.push("create_child(\"dangle/\") made a directory outside".into());
         }
-        // The control: a bare name was always refused, the link never followed.
+        // Control: the bare name is refused too; the link is never followed.
         assert!(pinned.child(OsStr::new("link")).is_err());
         drop(pinned);
         let _ = std::fs::remove_dir_all(&root);
         assert!(escapes.is_empty(), "{escapes:#?}");
     }
 
-    /// REGRESSION: admission charges the caller's canonical path before an
-    /// artifact job starts, but a same-uid actor can retarget a short symlink
-    /// before confinement resolves it again. Reconcile against that exact
-    /// target before constructing its retained ancestor chain. The hard depth
-    /// ceiling is the second backstop and must also fire before chain opening.
+    /// A same-uid actor can retarget a symlink between admission and confinement, so admission
+    /// runs against the exact resolved target, and the hard depth ceiling fires too, both before
+    /// any ancestor handle opens.
     #[test]
     fn deep_resolved_path_is_rejected_before_ancestor_chain_open() {
         let root = unique_dir("deep-resolved-budget");
@@ -3970,20 +3883,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A DIRECTORY LOCK IS AN OPEN FILE DESCRIPTION OF ITS OWN, let go at
-    /// once. `open_directory_lock` opens the retained directory anew rather
-    /// than `dup`ing the pin's descriptor: two locks through ONE pin exclude
-    /// each other (a `dup` shares the pin's description, and `flock` lets a
-    /// second take through the same description succeed), and a lease's
-    /// release owes nothing to the pin, which stays open throughout. Its
-    /// holder lets it go by `LOCK_UN` (`ArtifactPathLease`'s drop; here
-    /// [`HeldAdvisoryLock`]), so the release lands even while a child forked
-    /// under the lock has yet to exec — the child is made for real
-    /// ([`crate::parked_fork::ParkedChild`]) and parked through the check, so
-    /// nothing is waited out. NEGATIVE CONTROL: the close alone leaves the
-    /// lock taken in that child's copy until it execs — what this test, which
-    /// released by dropping the `File`, used to wait out on a 10 s stopwatch
-    /// whenever a sibling test's fork landed in its window.
+    /// A directory lock is an open file description of its own: two locks through one pin
+    /// exclude each other, and a lease released by `LOCK_UN` ([`HeldAdvisoryLock`]) is free at
+    /// once, even while a child forked under it has yet to exec. Negative control: a lock let go
+    /// by the close alone stays taken in that child's copy.
     ///
     /// [`HeldAdvisoryLock`]: crate::native_document_host::HeldAdvisoryLock
     #[test]
@@ -4019,8 +3922,8 @@ mod tests {
         child.release();
         contender.unlock().unwrap();
 
-        // NEGATIVE CONTROL: released by the close alone, the lock lives on in
-        // the parked child's copy of the description, until that child execs.
+        // Negative control: released by the close alone, the lock lives on in the parked
+        // child's copy of the description until that child execs.
         let lease = pin.open_directory_lock().unwrap();
         #[expect(
             clippy::disallowed_methods,
@@ -4214,14 +4117,8 @@ mod tests {
         // SAFETY: `path` is NUL-terminated and points to an absent path.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         let pinned = PinnedDir::open(&root).unwrap();
-        // A LIVENESS CHECK, NOT A STOPWATCH (the load-sensitive test audit of
-        // 2026-09-27). Losing O_NONBLOCK does not make this open slow — it makes
-        // it block until a writer appears, which here is never. So the call runs
-        // on a helper and the answer is awaited for a minute: any finite bound
-        // catches that regression (and reports it, where the old inline call
-        // would have hung the suite before its 1 s assertion was reached), while
-        // a test thread kept off the CPU for a second no longer fails a correct
-        // tree. The same shape as `app_documents`' `REFUSES_WITHOUT_BLOCKING`.
+        // A liveness check, not a stopwatch: without O_NONBLOCK this open blocks until a
+        // writer appears (never), so the call runs on a helper and is awaited for a minute.
         let (answered, answer) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = answered.send(

@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TBC 3 (`CSI 3 g`, "clear all tab stops") is two facts, and both must cross
-//! every seam: the tab array, and `GridCursorState::tab_defaults_suppressed`,
-//! the instruction that a later widen must not re-seed every-8 defaults into
-//! the added columns (the grid sizes its tab array lazily where xterm uses a
-//! fixed 1024-column bitmap).
-//!
-//! The seams are the alt-screen switch (tab stops are shared by both screens,
-//! per xterm) and the seamless-update checkpoint; dropping the flag lets the
-//! next resize resurrect stops the application erased.
-//!
-//! Each test carries a control: the same gesture on a terminal that never
-//! crossed the seam, so a terminal that stopped seeding defaults altogether
-//! cannot pass.
+//! TBC 3 (`CSI 3 g`) is two facts, and both cross every seam: the tab array, and
+//! `GridCursorState::tab_defaults_suppressed`, which stops a later widen re-seeding every-8
+//! defaults into the added columns (the grid sizes its tab array lazily; xterm uses a fixed
+//! 1024-column bitmap). The seams are the alt-screen switch (both screens share tab stops,
+//! per xterm) and the seamless-update checkpoint. Each test's control makes the same gesture
+//! on a terminal that never crossed the seam.
 
 use aterm_core::terminal::Terminal;
 
@@ -28,8 +21,7 @@ fn stops(t: &Terminal) -> Vec<usize> {
         .collect()
 }
 
-/// Where a HT from column 0 lands. With every stop cleared it must run to the
-/// last column, not to column 8.
+/// Where a HT from column 0 lands: with every stop cleared, the last column.
 fn tab_from_home(t: &mut Terminal) -> u16 {
     t.process(b"\x1b[H\t");
     t.grid().cursor_col()
@@ -43,8 +35,7 @@ fn tbc3_survives_the_alt_screen_switch_and_a_widen_under_it() {
     control.resize(24, 120);
     assert_eq!(stops(&control), Vec::<usize>::new(), "control: still clear");
 
-    // The alt screen shares tab state with the main screen, so a widen taken
-    // while a full-screen program is up must obey the same clear.
+    // The alt screen shares tab state, so a widen under it obeys the same clear.
     let mut t = Terminal::new(24, 80);
     t.process(b"\x1b[3g");
     t.process(b"\x1b[?1049h");
@@ -55,8 +46,7 @@ fn tbc3_survives_the_alt_screen_switch_and_a_widen_under_it() {
         "a widen under the alt screen resurrected the every-8 defaults"
     );
 
-    // …and leaving the alt screen must not copy a resurrected array back onto
-    // the main screen, where it would outlive the program that caused it.
+    // Leaving the alt screen must not copy a resurrected array back onto the main screen.
     t.process(b"\x1b[?1049l");
     assert_eq!(
         stops(&t),
@@ -91,8 +81,7 @@ fn tbc3_survives_the_seamless_update_checkpoint_and_a_widen_after_it() {
         .expect("the terminal produces a carry checkpoint");
     let mut restored = Terminal::from_checkpoint(&carry);
 
-    // Both widen. The restored terminal must behave like the one that never
-    // went through the handoff — that is the seamless-update contract.
+    // Both widen; the restored terminal must behave like the one never handed off.
     source.resize(24, 120);
     restored.resize(24, 120);
     assert_eq!(
@@ -113,9 +102,7 @@ fn tbc3_survives_the_seamless_update_checkpoint_and_a_widen_after_it() {
     );
 }
 
-/// Two-sided: a terminal that never issued TBC 3 must still grow its defaults
-/// into the columns a widen adds, or the fix above would be a regression that
-/// silently deletes everyone else's tab stops.
+/// The other side: without TBC 3 a widen still seeds every-8 defaults into the added columns.
 #[test]
 fn an_ordinary_terminal_still_seeds_defaults_into_the_columns_a_widen_adds() {
     let mut t = Terminal::new(24, 80);
@@ -125,8 +112,7 @@ fn an_ordinary_terminal_still_seeds_defaults_into_the_columns_a_widen_adds() {
         got.contains(&88) && got.contains(&112),
         "a widen must seed the every-8 defaults past the old width: {got:?}"
     );
-    // …and the same through both seams, so neither carries suppression it was
-    // never given.
+    // Neither seam invents a suppression.
     let mut alt = Terminal::new(24, 80);
     alt.process(b"\x1b[?1049h");
     alt.resize(24, 120);
@@ -146,15 +132,9 @@ fn an_ordinary_terminal_still_seeds_defaults_into_the_columns_a_widen_adds() {
 
 // ---------------------------------------------- retention across the adopt ----
 
-/// Retention is the host's config, not the checkpoint's.
-///
-/// The adopt path applies the host's `set_scrollback_line_limit`, then
-/// `restore_checkpoint` replaces both grids with unlimited ones (so the ≤256
-/// carried history lines are not dropped on the way in); the configured limit
-/// must be put back, since `apply_config` early-outs when it is unchanged.
-///
-/// The control is the session that never updated: after the same 400 lines it
-/// must retain the same number.
+/// Retention is the host's config, not the checkpoint's: `restore_checkpoint` replaces
+/// both grids with unlimited ones (so the carried history is not dropped on the way in),
+/// then puts the configured limit back, since `apply_config` only re-applies on change.
 #[test]
 fn an_adopted_session_keeps_the_configured_scrollback_limit() {
     let feed = |t: &mut Terminal, n: usize| {
@@ -170,8 +150,7 @@ fn an_adopted_session_keeps_the_configured_scrollback_limit() {
     feed(&mut control, 400);
     assert_eq!(control.scrollback_line_limit(), Some(50));
 
-    // The adopt: an outgoing session hands its carry to an incoming one that
-    // the host configured exactly like the control.
+    // The adopt: the incoming session is configured exactly like the control.
     let mut outgoing = Terminal::new(24, 80);
     outgoing.set_scrollback_line_limit(Some(50));
     feed(&mut outgoing, 100);
@@ -203,11 +182,9 @@ fn an_adopted_session_keeps_the_configured_scrollback_limit() {
     );
 }
 
-/// The same law with the alternate screen up at the adopt — the polarity that
-/// makes the re-imposition's placement load-bearing. `set_scrollback_line_limit`
-/// targets the primary-content grid, which is `alt_grid` while the alt screen
-/// is up, so the limit must be re-imposed after the restored modes are in
-/// place, or it lands on the wrong grid.
+/// The same with the alt screen up at the adopt. `set_scrollback_line_limit` targets the
+/// primary-content grid, which is `alt_grid` while the alt screen is up, so the limit is
+/// re-imposed after the restored modes are in place or it lands on the wrong grid.
 #[test]
 fn an_adopted_session_on_the_alt_screen_keeps_its_limit_through_1049l() {
     let mut outgoing = Terminal::new(24, 80);

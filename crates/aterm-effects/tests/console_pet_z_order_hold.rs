@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PET'S Z-ORDER IS HELD, NOT RECOMPUTED PER FRAME.
+//! The pet's z-order is held, not recomputed per frame.
 //!
-//! `PetFrame::under_ink` decides whether the renderer draws the resident
-//! beneath the glyphs (with the ribbon light, the caret halo and the
-//! sparkles over it) or above all of them. Recomputed as `!clear(body)`
-//! every frame it strobes: `clear` counts the caret's 3x3 keep-off ring as
-//! occupied, so the typing escort, seated at caret+1, flipped between the
-//! two layers at the keystroke rate with no glyph under it at all: 50 flips
-//! over one 80 ms/key pangram. Measured here against a real `Terminal` —
-//! typed text, and Claude Code's own recorded bytes — with an independent
-//! `PetWorld` as the oracle, the derived `ConsolePetZOrder` model as the
-//! relation every frame must step through, and the old rule replayed over
-//! the same frames as the negative control.
+//! `PetFrame::under_ink` decides whether the renderer draws the resident beneath the glyphs
+//! (ribbon light, caret halo and sparkles over it) or above them. A per-frame `!clear(body)` rule
+//! strobes: `clear` counts the caret's 3x3 keep-off ring as occupied, so the typing escort seated
+//! at caret+1 flips layers at the keystroke rate with no glyph under it. Measured on a real
+//! `Terminal` (typed text and Claude Code's recorded bytes) against an independent `PetWorld` and
+//! the derived `ConsolePetZOrder` model, with that per-frame rule replayed over the same frames
+//! as the negative control.
 
 use std::time::{Duration, Instant};
 
@@ -35,8 +31,7 @@ const DWELL: Duration = Duration::from_millis(250);
 
 struct Fixture {
     brain: PetBrain,
-    /// A SECOND, independent world over the same snapshot, so the oracle
-    /// reads occupancy without asking the brain what it decided.
+    /// A second, independent world over the same snapshot, so the oracle never asks the brain.
     world: PetWorld,
     term: Terminal,
     now: Instant,
@@ -101,7 +96,7 @@ impl Fixture {
         })
     }
 
-    /// The DRAWN body in fractional cells, or `None` when nothing is on glass.
+    /// The drawn body in fractional cells, or `None` when nothing is on glass.
     fn drawn(&self, frame: &PetFrame) -> Option<PetRect> {
         let (cw, ch) = self.cell;
         frame
@@ -116,9 +111,8 @@ impl Fixture {
             })
     }
 
-    /// Real glyph occupancy under the drawn body — `ink_at`, independent of
-    /// caret and selection PROTECTION. An unobserved cell counts as ink, so
-    /// the oracle never excuses a body it cannot see under.
+    /// Real glyph occupancy under the drawn body (`ink_at`, ignoring caret and selection
+    /// protection). An unobserved cell counts as ink, so the oracle never excuses a body.
     fn ink_under(&self, rect: PetRect) -> bool {
         let r1 = (rect.row + rect.rows).ceil() as usize;
         let c1 = (rect.col + rect.cols).ceil() as usize;
@@ -132,14 +126,13 @@ impl Fixture {
 #[derive(Debug, Default, Clone, Copy)]
 struct Burst {
     drawn: usize,
-    /// Drawn frames with a real glyph under the body and the body OVER it.
+    /// Drawn frames with a real glyph under the body and the body over it.
     over_ink: usize,
     /// `under_ink` changes between consecutive drawn frames.
     flips: usize,
-    /// Changes of the oracle's raw ink reading: what a per-frame ink rule,
-    /// with no hold, would have flipped.
+    /// Changes of the oracle's raw ink reading: what a per-frame ink rule with no hold would flip.
     ink_flips: usize,
-    /// The pre-fix rule (`!clear(body)`) replayed over the same frames.
+    /// The per-frame `!clear(body)` rule replayed over the same frames.
     old_flips: usize,
     prev: Option<(bool, bool, bool)>,
 }
@@ -185,9 +178,8 @@ fn type_pangram(ms_per_key: u64) -> Burst {
     burst
 }
 
-/// THE OWNER'S GESTURE at three human rates. No frame may paint the pet in
-/// front of a glyph under its drawn body, and the whole burst may change
-/// layers at most twice: once under, once back over.
+/// The pangram at three human rates: no frame paints the pet in front of a glyph under its drawn
+/// body, and the burst changes layers at most twice (once under, once back over).
 #[test]
 fn typing_never_paints_over_ink_and_holds_the_z_order() {
     let bursts = [80, 125, 200].map(|ms| (ms, type_pangram(ms)));
@@ -199,11 +191,7 @@ fn typing_never_paints_over_ink_and_holds_the_z_order() {
         assert_eq!(burst.over_ink, 0, "{ms} ms/key: painted over ink");
         assert!(burst.flips <= 2, "{ms} ms/key: z flips {burst:?}");
     }
-    // THE NEGATIVE CONTROL: the pre-fix rule over the very same frames
-    // strobes at a human rate. Measured 50 flips at 80 ms/key while the
-    // escort trailed the caret through its keep-off ring; since the escort
-    // keeps station ahead at that rate (`console_pet_escort_lead.rs`), the
-    // strobe is 78 flips at 125 ms/key, and the control reads the worst rate.
+    // Negative control: the old rule over the same frames strobes at a human rate.
     let worst = bursts.iter().map(|(_, b)| b.old_flips).max().unwrap_or(0);
     assert!(
         worst >= 10,
@@ -211,9 +199,9 @@ fn typing_never_paints_over_ink_and_holds_the_z_order() {
     );
 }
 
-/// INK BLINKING UNDER A STILL PET — a spinner, a toggled glyph — faster than
-/// the dwell. The raw ink reading flips on every toggle; the held z-order goes
-/// under once and comes back once, after the ink has stopped for a dwell.
+/// Ink blinking under a still pet (a spinner, a toggled glyph) faster than the dwell. The raw ink
+/// reading flips on every toggle; the held z-order goes under once and comes back once, a dwell
+/// after the ink stops.
 #[test]
 fn ink_toggling_under_the_body_faster_than_the_dwell_flips_once_each_way() {
     let mut f = Fixture::console();
@@ -296,9 +284,9 @@ fn action(post: &State) -> &'static str {
     }
 }
 
-/// A real frame sequence, walked through the model's action relation: every
-/// transition must be a successor, and every invariant must hold after it.
-/// `old_rule` replaces the emitted z with the pre-fix `!clear(body)`.
+/// A real frame sequence walked through the model's action relation: every transition is a
+/// successor and every invariant holds after it. `old_rule` replaces the emitted z with
+/// `!clear(body)`.
 struct Walk {
     model: Model,
     state: State,
@@ -355,9 +343,8 @@ impl Walk {
     }
 }
 
-/// TIER 1: the real resident, under real ink arriving, blinking, leaving and
-/// a selection that takes it off glass, conforms to the derived model — and
-/// the model rejects the pre-fix rule replayed over the same frames.
+/// The real resident, under ink arriving, blinking and leaving and a selection that takes it off
+/// glass, conforms to the derived model, and the model rejects the old rule over the same frames.
 #[test]
 fn the_real_z_order_conforms_to_the_derived_model_and_rejects_the_old_rule() {
     let mut f = Fixture::console();
@@ -466,10 +453,9 @@ fn replay(f: &mut Fixture, src: &str, mut each: impl FnMut(&Fixture, &PetFrame))
     }
 }
 
-/// CLAUDE CODE, the owner's program: its recorded composer (alt screen,
-/// DEC 2026 synchronized output, a line typed at 12 cps, then ⌥← hops into
-/// it and `INTO ` inserted). Every frame of the real resident is a model
-/// step and none paints over ink; the old rule over the same frames is not.
+/// Claude Code's recorded composer (alt screen, DEC 2026 synchronized output, a line typed at
+/// 12 cps, then ⌥← hops into it and `INTO ` inserted): every frame of the real resident is a
+/// model step and none paints over ink; the old rule over the same frames is rejected.
 #[test]
 fn claude_code_s_recorded_composer_conforms_and_never_paints_over_ink() {
     let mut f = Fixture::new(40, 120, (7, 14));

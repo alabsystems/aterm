@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Session-graph + capability-authority verbs: `sessions`, `family`, `ready`,
-//! `cast`, `edges`/`grants`, `grant`, `revoke`, `whoami`. Moved verbatim from
-//! `control.rs` (behavior-preserving). The `Scope` authority enum + the
-//! proxy-forward / cross-session auth cluster stay in `control.rs`; this module
-//! reaches `Scope` and the shared JSON helpers via `super::`.
+//! Session-graph, drive and capability-authority verbs: the roster (`sessions`, `who`,
+//! `family`, `raise`), the waits (`ready`, `await`), `lease` and `turn`, the ledgers and
+//! recordings (`history`, `meta`, `timeline`, `cast`, `temporal`, `exits`), and the authority
+//! graph (`edges`, `grant`, `revoke`, `connect`, `disconnect`, `flows`, `whoami`). `Scope` and
+//! the cross-session auth stay in `control.rs`.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,91 +35,39 @@ use crate::{SessionCtx, term_lock};
 /// upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|done|spent|theirs|->
 /// pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
 ///
-/// `task_state= task_rev=` (2026-10-15), last: the session's task record
-/// ([`crate::task_record`]), so one roster read tells a manager which of its
-/// workers has news; `-`/`0` for a session with no task. Named apart from
-/// `task=`, the task's face under Land.
+/// The store snapshot is cloned out before formatting, so this never holds the
+/// registry lock across a `Terminal` lock.
 ///
-/// `pause=` (2026-10-17, §10.5.1), after `task=`: the unix second the loop's
-/// pause after short turns ends, under the same rule as `task=`
-/// ([`crate::autopilot::pause_field`]).
-///
-/// `land_at= task=` (2026-10-16, `docs/DESIGN-harness-autopilot-2026-10-15.md`
-/// §9.3.5, §9.4.1), after the owner's columns: for an agent session, the instant its
-/// timed Cruise lands (unix seconds) and its task's face under Land as its
-/// loop last told this window's host — `task=` only while that host holds
-/// the session's live claim — and `-` otherwise
-/// ([`crate::autopilot::land_at_field`], [`crate::autopilot::task_field`]).
-///
-/// `autopilot=` (2026-10-15), right after `supervisor=`: the session's
-/// EFFECTIVE Autopilot when it runs an agent the harness supervises — its own
-/// word, else `[harness] autopilot`, and `off` under the master switch or
-/// with no host ([`crate::autopilot::wire_field`]) — and `-` for any other
-/// session. Read under the snapshot's registry guard (the window's posture,
-/// [`crate::session_store::SessionStore::harness_posture`]) and the one meta
-/// and timeline read of each row.
-///
-/// On a single-session window this is exactly one line == the lone session (the
-/// zero-regression base case). The store snapshot is cloned out before formatting,
-/// so this never holds the registry lock across a `Terminal` lock.
-///
-/// `meta=<1|0>` (session-metadata stage 1) is a TRAILING additive token: `1` iff
-/// any USER metadata (`meta set title|description|icon|role|attention|questions|autopilot`) is set, so a fleet
-/// driver knows which sessions to `@<sid> meta` without N round-trips. Safe to
-/// append: the title token before it is pct-encoded (never contains a space) and
-/// the one shipping parser (aterm-ctl `ls`) prints the line verbatim, keying only
-/// on the sid field — verified tolerant of trailing tokens.
-///
-/// `window=`/`active=`/`wfocus=` (F2: windows on the session verbs) come from ONE
-/// main-thread hop for the whole roster ([`Wake::ReadSessionWindows`]): the window
-/// the session is reported under (the `dims` rule — the front window when it shows
-/// the session, else the lowest id), whether it is on that window's active tab,
-/// and whether that window is front. `none` is the honest "no window hosts it";
-/// `-` is "the main thread could not be asked" (no event loop, or the hop timed
-/// out) — the line is still printed, because a roster with a column missing beats
-/// no roster. `detail=` (F5: who lives here) is the sanitized running command,
-/// the same [`crate::session_status::executing_detail`] the `status` record
-/// carries, read under a per-session `try_lock` (`-` when contended or idle).
-///
-/// `identity=<name|->` (session identities, 2026-09-17): the agent identity the
-/// session was spawned under (`SessionHandle::identity`, spawn-time and
-/// immutable — `spawn identity=<name>`), `-` for the human's own agent config,
-/// and for a shell adopted from a build without the field, which keeps its env
-/// and drops the label. Additive like every column before it: aterm-ctl's
-/// `roster_tail` reads the tail by key back to `meta=`, so `ls` and `windows`
-/// need no change, and the `identities` verb explains the names.
-///
-/// `program= agent= agent_detail= agent_rev= agent_since_ms=` (2026-09-23) come
-/// LAST, after `path=`: the argv[0] basename of the PTY's foreground group
-/// leader and the server's agent verdict on the screen, exactly as `status`
-/// prints them (see the `status` catalog row) — read from the session
-/// timeline the status sweep publishes to, so `-` until the sweep has seen the
-/// session and `agent=-` for anything that is not an identified agent.
-///
-/// `path=<frozen|live>` (2026-09-22) was the last column until then: whether the session's
-/// shell fronts aterm's managed `agents/` on PATH. `frozen` began as the registry's
-/// adoption mark ([`crate::session_store::SessionStore::has_frozen_path`]): a
-/// shell spawned by a build before the self-healing sessions (2026-09-16) and
-/// carried across every update since, so `claude`/`codex` typed in it run the
-/// foreign copies. It was an UPPER BOUND that only closing the tab lowered —
-/// until 2026-09-24, when a tab the live upgrade had healed a day earlier still
-/// read `frozen` (gap audit). Now it is MEASURED where it can be: the
-/// environment of a program the shell itself started names the PATH the shell
-/// exports; a live reading wins over the mark and lowers it, a frozen one is
-/// believed once a second job agrees and never raises the mark (one job's
-/// `PATH=` override reads frozen)
-/// ([`crate::session_timeline::SessionTimeline::owner_columns`]);
-/// `path_evidence=` says which (`measured:<ms>` ago, `unconfirmed:<ms>`,
-/// `carried`, `-`). `copy=`
-/// names which build an agent in front runs (`managed` from the store,
-/// `foreign` — the native install, a brew cask), and `upgrade=` the live
-/// upgrade of the conversation in the tab. Until the `path=` column, the
-/// managed row's count named no tab —
-/// an agent reading the roster could not tell WHICH session still ran the
-/// native `claude` without running `pkg doctor` inside each one (measured
-/// 2026-09-22: a tab from 2026-09-10, adopted through six updates, had run the
-/// foreign copy for twelve days with every roster surface green). Read under
-/// the same registry guard the snapshot is taken under, so the two agree.
+/// - `meta=1` iff any user metadata (`meta set title|description|icon|role|attention|questions|autopilot`)
+///   is set, so a fleet driver knows which sessions to `@<sid> meta`.
+/// - `window=`/`active=`/`wfocus=` come from one main-thread hop for the whole roster
+///   ([`session_window_rows`]): the window the session is reported under (the `dims` rule),
+///   whether it is that window's active tab, whether that window is front. `none` means no
+///   window hosts it; `-` means the hop failed, and the line is still printed.
+/// - `detail=` is the sanitized running command
+///   ([`crate::session_status::executing_detail`]), `-` when idle or the lock is contended.
+/// - `identity=` is the agent identity the session was spawned under (`spawn identity=`), `-`
+///   for the human's own config or an adopted shell without the field.
+/// - `path=<frozen|live>` says whether the shell fronts aterm's managed `agents/` on PATH:
+///   measured from a program the shell started where it can be, else the registry's adoption
+///   mark ([`crate::session_store::SessionStore::has_frozen_path`]); `path_evidence=` says which
+///   ([`crate::session_timeline::SessionTimeline::owner_columns`]). `copy=` names the build an
+///   agent in front runs (`managed` or `foreign`), `upgrade=` the live upgrade of its
+///   conversation.
+/// - `program=` … `agent_fp=` are the status sweep's publication on the session timeline, as
+///   `status` prints them (`-` until the sweep has seen the session, `agent=-` when not an
+///   identified agent).
+/// - `autopilot=`, right after `supervisor=`, is the session's effective Autopilot when it runs
+///   an agent the harness supervises (its own word, else `[harness] autopilot`, and `off` under
+///   the master switch or with no host; [`crate::autopilot::wire_field`]), and `-` otherwise.
+/// - `land_at= task=`, after the owner's columns, report the instant a timed Cruise lands (unix
+///   seconds) and the task's face under Land while this window's host holds the live claim (or a
+///   proven self-claim), `-` otherwise ([`crate::autopilot::land_at_field`],
+///   [`crate::autopilot::task_field`]).
+/// - `pause=`, after `task=`, is the unix second the loop's pause after short turns ends
+///   ([`crate::autopilot::pause_field`]).
+/// - `task_state= task_rev=`, last, report the session's task record ([`crate::task_record`]),
+///   `-`/`0` when none, named apart from `task=` (the task's face under Land).
 ///
 /// Instance state, answered with no terminal. `proxy` is `None` only where there
 /// is no event loop to ask (a worker-thread test): the window columns then read
@@ -137,8 +85,7 @@ pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wa
             .collect();
         (snapshot, frozen, g.harness_posture())
     };
-    // An empty roster needs no window rows; skipping the hop keeps `OK 0` as
-    // cheap as it was, and answerable before the event loop is up.
+    // An empty roster skips the hop, so `OK 0` is answerable before the event loop is up.
     let rows = if snapshot.is_empty() {
         Ok(Vec::new())
     } else {
@@ -149,10 +96,9 @@ pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wa
     sessions_lines(&snapshot, rows, posture, |id| frozen.contains(&id))
 }
 
-/// `sessions bridge`: the same local-id, stable-sid and launch-nonce triples
-/// as the public `sessions` roster, without its placement hop or per-session
-/// terminal, metadata and timeline reads. The Fabric bridge asks every two
-/// seconds and uses only these three fields to fence admission and status.
+/// `sessions bridge`: the roster's local-id, sid and launch-nonce triples, without the
+/// placement hop or any per-session lock. The Fabric bridge asks every two seconds and fences
+/// admission and status with them.
 pub(crate) fn cmd_sessions_bridge(store: &Store) -> String {
     use std::fmt::Write as _;
 
@@ -176,15 +122,11 @@ pub(crate) fn cmd_sessions_bridge(store: &Store) -> String {
 /// The batch must fail well inside the bridge's two-second roster cadence.
 const BRIDGE_STATUS_HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// `sessions status`: a Lines-framed roster of the status fields the Fabric
-/// bridge consumes, including the server's agent verdict. One wake replaces one
-/// wake per hosted session on each bridge roster round. The bridge validates
-/// every row's sid and launch nonce against its own preceding `sessions bridge`
-/// read. A busy timeline writer makes only that row's agent field
-/// `agent_deferred=1`; the bridge keeps its last verdict, and the GUI's event
-/// loop does not wait for that writer. If the event loop itself cannot answer
-/// promptly, the bridge retains its prior samples and retries at its next
-/// roster tick.
+/// `sessions status`: a Lines-framed roster of the status fields the Fabric bridge consumes,
+/// agent verdict included, in one main-thread wake. The bridge checks each row's sid and nonce
+/// against its preceding `sessions bridge` read. A busy timeline writer marks only its row
+/// `agent_deferred=1` (the event loop never waits on it); a late hop is an `ERR`, and the bridge
+/// keeps its prior samples.
 pub(crate) fn cmd_sessions_status(proxy: &EventLoopProxy<Wake>) -> String {
     match super::control_media::call_main_within(proxy, BRIDGE_STATUS_HOP_TIMEOUT, |reply| {
         Wake::ReadSessionStatuses { reply }
@@ -194,20 +136,14 @@ pub(crate) fn cmd_sessions_status(proxy: &EventLoopProxy<Wake>) -> String {
     }
 }
 
-/// The placement hop's deadline: SHORT on purpose. `sessions`/`ls` is read by
-/// every discovery client under a 2 s per-peer budget (the menu-bar fleet scan;
-/// `aterm ctl ls`), so the hop must degrade to `window=-` well inside that
-/// rather than hold the 30 s `call_main` allowance and turn a live-but-busy
-/// instance into a false "could not reach". Half a second is far longer than a
-/// healthy event-loop turn (sub-millisecond) yet a quarter of the tightest
-/// client budget.
+/// The placement hop's deadline. Discovery (`aterm ctl ls`, the menu-bar fleet scan) dials each
+/// instance with a 2 s deadline, so a busy main thread must cost `window=-` well inside it
+/// rather than a false "could not reach": far above a healthy event-loop turn (sub-millisecond),
+/// a quarter of that deadline.
 const PLACEMENT_HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The main-thread hop behind the roster's window columns: every hosted
-/// session's [`SessionWindowRow`], or why they could not be read. Bounded by
-/// [`PLACEMENT_HOP_TIMEOUT`] (not the 30 s default) so a busy main thread costs
-/// the roster its window columns, never the whole listing — the `Err` prints
-/// `window=- active=- wfocus=-` and every session still appears.
+/// The main-thread hop behind the roster's window columns, bounded by
+/// [`PLACEMENT_HOP_TIMEOUT`] so a busy main thread costs the window columns, never the listing.
 pub(crate) fn session_window_rows(
     proxy: Option<&EventLoopProxy<Wake>>,
 ) -> Result<Vec<SessionWindowRow>, super::control_media::MainHopError> {
@@ -232,48 +168,21 @@ fn session_detail(h: &SessionHandle) -> Option<String> {
     }
 }
 
-/// The `<title>` column of `sessions` / `ls` (and `family`) for `h`: the tab
-/// strip's title RUNGS less its identity shed (below), read LIVE off the
-/// engine — not the store's copy.
-///
-/// The store's `title` is fed by one path only, `App::publish_active_terminal_title`,
-/// which runs for the ACTIVE tab of a window. Measured (audit 2026-09-22):
-/// a tab opened and switched away from before its prompt drew had an EMPTY
-/// `ls` title for its whole life, and a fresh split pane printed ConPTY's
-/// program path, `C:\Program%20Files\…\pwsh.exe`, while `title` on the same
-/// session answered `~\aterm`. So the column is, first rung that answers:
+/// The `<title>` column of `sessions` and `family`, read live off the engine rather than the
+/// store's copy, which only the active tab's title publisher feeds. First rung that answers:
 ///
 /// 1. the operator's `meta set title`;
-/// 2. the OSC title minus the console's program path
+/// 2. the OSC title minus a console program path
 ///    ([`crate::tab_label::without_console_program_path`]);
-/// 3. the native cwd, `~`-abbreviated exactly as the strip's cwd rung paints it;
-/// 4. the store's title, program path dropped — only when the engine lock is
-///    contended (the roster runs on the control thread and never parks behind
-///    a PTY reader — the `detail=` discipline) or the session has neither a
-///    title nor a cwd;
-/// 5. "aterm", the strip's own last rung, for nothing at all — an empty token
-///    would shift every column after it for a whitespace-splitting reader.
+/// 3. the native cwd, `~`-abbreviated as the tab strip paints it;
+/// 4. the store's title, program path dropped, when the engine lock is contended (the roster
+///    never parks behind a PTY reader) or there is neither title nor cwd;
+/// 5. "aterm": an empty token would shift every later column for a whitespace-splitting reader.
 ///
-/// WHAT THIS CHANGES against the store's copy, on every platform: a session
-/// with a `meta set title` now prints that title (the store held the OSC
-/// title), and a session with no OSC title prints its cwd, or "aterm", where
-/// it printed whatever the active-tab publisher last wrote ("aterm" for a
-/// focused one) or an empty token for one never focused. A session whose OSC
-/// title is set, and is not a program path, prints that title — what the
-/// store held for it whenever the store was current.
-///
-/// NOT the strip's identity shed: a stock prompt's `user@host:` stays, as it
-/// does in `title`, where the strip paints `~/x` for `user@host: ~/x` on this
-/// machine ([`crate::tab_label::informative`]). The roster is read by
-/// programs, and the prefix is part of what the program set; only the program
-/// path — which names no session — is dropped.
-///
-/// `family` is readable by an EDGE-scoped caller for its own relatives, so
-/// those rows now carry a relative's operator title or cwd where they carried
-/// its OSC title — the rung that relative's own tab chip paints for anyone at
-/// the window.
+/// Unlike the strip ([`crate::tab_label::informative`]), a prompt's `user@host:` prefix stays:
+/// the roster is read by programs, and the prefix is part of what the program set.
 fn roster_title(h: &SessionHandle) -> String {
-    // TOP RUNG: `meta set title` — a leaf lock, dropped before the term lock.
+    // Rung 1, a leaf lock dropped before the term lock.
     let user_title = h
         .ctx
         .meta
@@ -378,27 +287,18 @@ pub(crate) fn sessions_lines(
         let detail = session_detail(h)
             .as_deref()
             .map_or_else(|| "-".to_string(), pct_encode);
-        // The identity is a handle field (never a lock): the name the session
-        // was spawned under, already in the grammar `[a-z0-9][a-z0-9._-]*`, so
-        // the codec leaves it as it is — it is applied for uniformity, not need.
+        // Already in the grammar `[a-z0-9][a-z0-9._-]*`, which the codec leaves as it is.
         let identity = h
             .identity
             .as_deref()
             .map_or_else(|| "-".to_string(), pct_encode);
-        // THE PROGRAM AND THE AGENT VERDICT, after `path=`: the status sweep's
+        // Program and agent verdict after `path=`: the status sweep's
         // publication on the session timeline (a leaf lock, no hop), the same
-        // five fields `status` prints — so a fleet read names every agent tab
-        // and what it waits on, adopted tabs included. From the same read,
-        // `path=` itself — MEASURED where a child of the shell was read, else
-        // the carried mark — and the owner's columns after `autopilot=`
-        // (`path_evidence= copy= upgrade=`, gap audit 2026-09-24), which
-        // `land_at= task=` follow.
-        //
-        // From the same read, `task_state=<state|-> task_rev=<n>` (2026-10-15),
-        // last, after `pause=`: the session's task record
-        // ([`crate::task_record`]), so one roster read tells a manager which of
-        // its workers has news — apart from `task=`, the task's face under
-        // Land.
+        // fields `status` prints. From the same read: `path=` itself (measured
+        // where a child of the shell was read, else the carried mark), the
+        // owner's columns after `autopilot=` (`path_evidence= copy= upgrade=`),
+        // which `land_at= task=` follow, and `task_state= task_rev=` last
+        // after `pause=` ([`crate::task_record`]).
         let (agent, (path, owner), task_record, (supervised_agent, group), face, pause) = {
             let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -423,12 +323,12 @@ pub(crate) fn sessions_lines(
         let land_at =
             crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
         // The face shows under this host's own claim and beside a proven
-        // self-claim, whose acts tell it (FOREVER LAND §10.4).
+        // self-claim, whose acts tell it.
         let task = crate::autopilot::task_field(face, claimed_here || proven, supervised_agent);
         // `pause=` (§10.5.1) after `task=`: the loop's pause after short
         // turns, from the same read.
         let pause = crate::autopilot::pause_field(pause, claimed_here, supervised_agent);
-        // `human_ms=<ms|->`: how long since a PERSON last had a hand on the
+        // `human_ms=<ms|->`: how long since a person last had a hand on the
         // session through a window — the same atomic `status` reads.
         let human = h.ctx.human_input.wire(crate::metrics::now_us());
         // Then the typed `role=`, `attention=` and `user_title=` (the escalated
@@ -455,16 +355,16 @@ pub(crate) fn sessions_lines(
     out
 }
 
-/// `who` -> the PRESENCE readout for the whole instance: one line per session
-/// naming who is DRIVING it and how many peers are WATCHING it, so a human or an
+/// `who` -> the presence readout for the whole instance: one line per session
+/// naming who is driving it and how many peers are watching it, so a human or an
 /// orchestrator can always see the hand and the eye on a fleet. Framed `OK <n>`
 /// then one `<local> <sid> driving=<turn-id|-> watchers=<n> turns=<n> <state>
 /// nonce=<hex32> fgpgid=<pid|->` line per session (sorted by local id, like
 /// `sessions`). The
-/// public launch nonce comes from the SAME registry snapshot as the sid, so a
+/// public launch nonce comes from the same registry snapshot as the sid, so a
 /// client that keys on a launch can read it here without asking the
 /// `sessions` roster for a window-placement hop. `driving` is the
-/// session's live TURN LEASE (`Some(id)` while a `turn` is mid-flight, `-` when
+/// session's live turn lease (`Some(id)` while a `turn` is mid-flight, `-` when
 /// idle — the one-driver-per-session mutex); `watchers` is the live `subscribe`
 /// count on that session; `turns` is its ledger depth. Owner-only + self-scoped
 /// like `sessions` (a fleet-wide readout, not a per-target query). Read-side
@@ -518,9 +418,7 @@ pub(crate) fn cmd_who(store: &Store) -> String {
     out
 }
 
-/// Process-wide auto-holder tag mint for a `lease acquire` with no explicit
-/// `holder=`: a unique `drv-<n>` so an unnamed driver still gets a distinct token
-/// to renew/release with.
+/// The auto-holder tag mint for a `lease acquire` with no `holder=`: a unique `drv-<n>`.
 static NEXT_LEASE_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Default / max cooperative-lease TTL (ms). Short by default so a crashed driver
@@ -661,7 +559,7 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         // The connection's end sweeps it, as it sweeps a bound claim.
         super::note_connection_claim();
     }
-    // The presence rim follows the lease (round 19): one wake per change of hand.
+    // The presence rim follows the lease: one wake per change of hand.
     crate::presence::post_lease_changed(&ctx.self_id);
     format!(
         "OK lease acquired holder={holder} ttl_ms={ttl_ms} expires_in_ms={ttl_ms}{}\n",
@@ -704,13 +602,9 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         None => Act::None,
         Some(crate::Lease::Turn { id, driver, .. }) => {
             if force {
-                // Force-PREEMPT a wedged Turn lease: the crash-recovery escape hatch
-                // for a turn whose driver crashed/disconnected. The synchronous serve
-                // loop cannot detect the dead client until cmd_turn returns (up to its
-                // timeout), so without this a crashed driver wedges every other writer.
-                // Safe: cmd_turn's LeaseGuard now clears ONLY its own turn id, so a
-                // fresh turn acquiring the freed slot is not stomped when the wedged
-                // one finally returns. A deliberate operator override, like `signal`.
+                // Force-preempt a wedged turn whose driver crashed: a deliberate operator
+                // override, like `signal`. Safe because the turn's `LeaseGuard` clears only its
+                // own id, so a fresh turn in the freed slot is not stomped when it returns.
                 Act::Release(driver.clone())
             } else {
                 Act::Refuse(format!(
@@ -773,7 +667,7 @@ fn lease_freed(ctx: &SessionCtx) {
 /// connection is the one its interrupter hangs up), or one whose give-back
 /// was lost with a connection that dropped, is free at once, not after its
 /// TTL — while it stood, every other connection's writes were `ERR busy
-/// lease=…`, under a hand the window shows no row for (ruling 313). A lease
+/// lease=…`, under a hand the window shows no row for. A lease
 /// taken without `here`, or over another connection, stays: the upgrade's
 /// and relaunch's hand rides a reconnect, its renewal moving it.
 pub(crate) fn release_connection_lease(ctx: &SessionCtx, conn: u64) {
@@ -817,9 +711,8 @@ pub(crate) fn cmd_edges(ctx: &SessionCtx) -> String {
     out
 }
 
-/// `edges --json` / `grants --json` -> `{"edges":[{"src":"..","dst":"..",
-/// "op":".."}],"dst":"<self>"}`. The SAME edges `cmd_edges` lists (sorted, no
-/// token), as a structured object an agent can consume without line-splitting.
+/// `edges --json` / `grants --json` -> `{"edges":[{"src":"..","dst":"..","op":".."}],
+/// "dst":"<self>"}`: the edges [`cmd_edges`] lists, as one object.
 pub(crate) fn cmd_edges_json(ctx: &SessionCtx) -> String {
     let (self_id, mut edges) = {
         let tbl = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
@@ -844,31 +737,20 @@ pub(crate) fn cmd_edges_json(ctx: &SessionCtx) -> String {
     ))
 }
 
-/// `family [<sid>]` -> the session HIERARCHY for a target: its parent and its
-/// direct children, from the registry's `parent` links (only a flat `sessions`
-/// list was queryable before). Framed `OK <n>\n` + n lines (self/parent/child).
-///
-/// With NO argument the target is the RESOLVED session (`@<sel>` or self); with an
-/// explicit `<sid>` argument the target is that session id (so an Owner can walk
-/// the tree from any node without re-addressing). Header `OK\n`, then:
+/// `family [<sid>]` -> the target's place in the session hierarchy, from the registry's
+/// `parent` links. Header `OK\n`, then:
 ///   `self <sid> <state> <title>`
 ///   `parent <sid|-> ...`            (one line; `-` sid when the node is a root)
 ///   `child <sid> <state> <title>`  (zero or more, sorted by local id)
-/// Titles are percent-encoded (single space-free tokens), matching `sessions`.
-/// An unknown target id yields `ERR no such session\n` (fail-closed). An EXPLICIT
-/// `<sid>` argument is Owner-only — fenced at the dispatch by the verb table's
-/// `family` form (`control::need_of`), so a scoped Edge gets
-/// `ERR denied` before this runs; the no-arg form is scoped to the already-gated
-/// resolved session.
 ///
-/// For OWNER scope only, session-connection DISCOVERY rows follow the child
-/// rows (design §6): `pushes` / `pushed-by` / `pulls` / `pulled-by`, one per
-/// connected peer, in the same `<kind> <sid> <state> <title>` shape. Direction
-/// per peer is classified from the edge ops (`write-input` present ⇒ pushes,
-/// else pulls); outbound rows scan OTHER sessions' tables, which is exactly why
-/// a scoped edge gets NONE of these rows (the `sessions`-is-Owner-only
-/// disclosure rationale — a scoped caller reads its own inbound table via
-/// `edges`). `parent`/`child` stay lineage, untouched.
+/// Titles are pct-encoded as in `sessions`. With no argument the target is the resolved
+/// session; an explicit `<sid>` is Owner-only (`control::need_of`). An unknown target is
+/// `ERR no such session`.
+///
+/// For Owner scope, connection rows follow (`pushes`, `pushed-by`, `pulls`, `pulled-by`, one per
+/// peer, same shape): `write-input` makes a push, anything else a pull. Outbound rows scan other
+/// sessions' tables, which is why a scoped caller gets none; it reads its own inbound table
+/// with `edges`.
 pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &str) -> String {
     // Target sid: an explicit argument, else the resolved session's own id. Both
     // are gated by the dispatch: the explicit form (arbitrary-node enumeration) is
@@ -895,9 +777,8 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
             pct_encode(&roster_title(h)),
         )
     };
-    // Build the body first so the header can carry a COUNT, matching every other
-    // multi-line verb (`OK <n>` + n lines) — a bare `OK` made the aterm-ctl client
-    // treat family as a single-line status reply and DROP the whole hierarchy.
+    // The body comes first so the header can carry its line count: the client frames a bare
+    // `OK` as a one-line status and would drop the rows.
     let mut body = String::new();
     body.push_str(&line("self", node));
     // Parent row: the parent sid + its live state/title if still registered, else
@@ -917,9 +798,8 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
     {
         body.push_str(&line("child", h));
     }
-    // Session-connection rows, OWNER ONLY (see the doc above). Each peer's
-    // table is locked briefly against the already-released snapshot (the
-    // connections-module discipline: no store lock across a table lock).
+    // Connection rows, Owner only. Each table is locked after the store guard is released:
+    // never a store lock across a table lock.
     if scope.is_owner_class() {
         // OUTBOUND (this node → peer): rows live in each PEER's table with
         // src == target. Snapshot order keeps peers local-id sorted.
@@ -946,10 +826,8 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
                 pulls.push(h);
             }
         }
-        // INBOUND (peer → this node): rows in the TARGET's own table, grouped
-        // by src. A src may be foreign (wire-granted, never registered): its
-        // row still prints, `unknown -` for state/title (the absent-parent
-        // idiom), sorted by sid for a stable listing.
+        // Inbound (peer → this node): rows in the target's own table, grouped by src. A foreign
+        // src (wire-granted, never registered) still prints, `unknown -` for state and title.
         let mut inbound: Vec<(SessionId, bool)> = Vec::new();
         {
             let rows = {
@@ -991,16 +869,14 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
 }
 
 /// How often a wait re-reads the park while its session's reader is parked
-/// for an update (round seven of the update audit, findings 62 and 63): the
-/// kernel's idle deadline says nothing then, so the wait polls the park
-/// instead, to take up its own clock the moment output flows again.
+/// for an update: the kernel's idle deadline says nothing then, so the wait
+/// polls the park instead, to take up its own clock the moment output flows
+/// again.
 const PARKED_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Fire the idle watchers that are due — unless this session's output is not
-/// being consumed (`SessionCtx::update_parked`), when their clocks are held
-/// instead: the silence of a parked reader is the host's, not the program's,
-/// and `ready`/`await idle`/a `turn`'s idle settle answered "idle" over a
-/// program still printing into the kernel queue (finding 62).
+/// Fire the idle watchers that are due, unless the session's reader is parked for an update
+/// (`SessionCtx::update_parked`): then their clocks are held, since that silence is the host's,
+/// not the program's, which may still be printing into the kernel queue.
 fn fire_idle_unless_parked(t: &mut Terminal, now: std::time::Instant, parked: bool) {
     if parked {
         t.watch_restart_idle(now);
@@ -1010,9 +886,9 @@ fn fire_idle_unless_parked(t: &mut Terminal, now: std::time::Instant, parked: bo
 }
 
 /// The exit check every parked verb shares: whether `session` was in the
-/// registry is read HERE, at arm, and the returned probe answers "has it
-/// ended?" against the store it is handed. A session that WAS registered but is
-/// later GONE (deregistered during teardown) is dead — the `Wake::Exit` notify
+/// registry is read here, at arm, and the returned probe answers "has it
+/// ended?" against the store it is handed. A session that was registered but is
+/// later gone (deregistered during teardown) is dead — the `Wake::Exit` notify
 /// can race the deregistration, so the woken thread may see `None`. Treating
 /// "was registered, now None" as exited closes that race; a headless unit term
 /// (never registered) stays Alive on `None`.
@@ -1032,10 +908,10 @@ pub(crate) fn exit_probe(store: &Store, session: u64) -> impl Fn(&Store) -> bool
     }
 }
 
-/// `ready [timeout_ms]` -> block until the target session is ALIVE and IDLE, then
+/// `ready [timeout_ms]` -> block until the target session is alive and idle, then
 /// `OK ready <reason>\n`; `OK timeout\n` if it does not become ready in time
 /// (default 30 000 ms, capped at 600 000); `ERR exited\n` if the session has
-/// exited (it will never become ready). Lets an agent CHAIN sessions — spawn one,
+/// exited (it will never become ready). Lets an agent chain sessions — spawn one,
 /// `ready` on it, then drive it — without busy-polling a screen read.
 ///
 /// Exactly two ready reasons are emitted:
@@ -1049,7 +925,7 @@ pub(crate) fn exit_probe(store: &Store, session: u64) -> impl Fn(&Store) -> bool
 ///     fallback for a session with no in-flight completed block — covering plain
 ///     shells (no shell integration) and the between-commands case alike.
 ///
-/// Fully event-driven (NO poll): arms an `IdleFor` watcher and parks on the
+/// Fully event-driven (no poll): arms an `IdleFor` watcher and parks on the
 /// session's watchers ([`Park`]), woken by output, by the exit's timeline
 /// record and by the idle deadline, so an exit is reported promptly.
 pub(crate) fn cmd_ready(
@@ -1075,14 +951,12 @@ pub(crate) fn cmd_ready(
     };
     let now0 = Instant::now();
     let deadline = now0 + Duration::from_millis(timeout_ms);
-    // The no-shell-integration settle window. This now drives the model-checked
-    // kernel `IdleFor` (deterministic, no-silent-loss) INSTEAD of the old racy
-    // "3 stable 20ms samples" — the engine resets the deadline on every content
-    // advance (`observe_at`), so it latches only after SETTLE of TRUE quiet.
+    // The settle window without shell integration: the kernel's `IdleFor` resets on every
+    // content advance (`observe_at`), so it latches only after `SETTLE` of true quiet.
     const SETTLE: Duration = Duration::from_millis(60);
 
-    // The lifecycle state of THIS resolved session, by its local id. `None` (not in
-    // the registry — e.g. a headless unit term) is treated as Alive — UNLESS the
+    // The lifecycle state of this resolved session, by its local id. `None` (not in
+    // the registry — e.g. a headless unit term) is treated as Alive — unless the
     // session was registered at arm and is now gone (deregistered on teardown),
     // which is a dead session the exit's ring woke us for ([`exit_probe`]).
     let gone = exit_probe(store, session);
@@ -1102,17 +976,17 @@ pub(crate) fn cmd_ready(
     let look = |now: Instant, parked: bool, closing: bool| {
         let mut t = term_lock(term);
         // Shell-integration fast path: newest block prompt/complete => ready
-        // prompt (read directly so an ALREADY-ready session returns at once).
+        // prompt (read directly so an already-ready session returns at once).
         let prompt = matches!(
             t.all_blocks().last().map(|b| b.state),
             Some(BlockState::PromptOnly | BlockState::Complete)
         );
         fire_idle_unless_parked(&mut t, now, parked); // host-injected idle fire
         let settled = idle_id.and_then(|id| t.watch_poll(id)).is_some();
-        // Parked, the parser is behind the program (round eight's lead U12):
-        // what it wrote since waits unread in the kernel, so neither the last
-        // prompt nor the silence is its answer until the resumed reader has
-        // parsed that ([`crate::spawn::UpdatePark`], which ends only then).
+        // Parked, the parser is behind the program: what it wrote since waits
+        // unread in the kernel, so neither the last prompt nor the silence is
+        // its answer until the resumed reader has parsed that
+        // ([`crate::spawn::UpdatePark`], which ends only then).
         let ready = if parked {
             None
         } else if prompt {
@@ -1151,20 +1025,10 @@ pub(crate) fn cmd_ready(
 /// (`await consent [kind=debugger] [timeout=<ms>]` is dispatched to `control_privacy` before this
 /// handler is reached; the usage line names it so the alternation stays complete.)
 ///
-/// `gone` is the inverse of `match` — it latches when NO visible row (in range)
-/// matches — and exists because the end of an agent's turn is often a row LEAVING
-/// (Claude Code's `esc to interrupt` busy footer) rather than one arriving: the
-/// composer glyph is on screen the whole time it thinks and the screen can sit
-/// static for seconds mid-turn, so neither `match '❯'` nor `idle` says "the turn
-/// is over". Level-triggered like `match`/`seq`: a surface with no matching row
-/// at arm latches at arm.
-///
-/// `rows <a> <b>` scopes either row predicate to an inclusive visible-row span,
-/// which must meet at least one row of the CURRENT grid (`a <= b`, `a` inside
-/// the grid) — `ERR bad rows` otherwise. A span that meets no row scans nothing:
-/// `match` could never latch on it, and `gone` must not (the kernel refuses to
-/// read an empty scan as "clear"), so without the check a typo'd range would
-/// burn the whole timeout in silence; with it the typo is named at once.
+/// `gone` latches when no visible row in range matches: an agent's turn often ends with a row
+/// leaving (Claude Code's `esc to interrupt` footer) while its composer glyph stays on screen
+/// and the screen can sit still mid-turn, so neither `match` nor `idle` says the turn is over.
+/// Like `match` and `seq` it is level-triggered.
 ///
 /// This is the L1 exposure of the core primitive. The CORRECTNESS — no-silent-
 /// loss for content/match/block, and a deterministic idle deadline — lives in the
@@ -1210,10 +1074,8 @@ pub(crate) fn cmd_await(
     let mut timeout_ms = aterm_control::wire::WAIT_DEFAULT_MS;
     let mut args: Vec<&str> = Vec::new();
     while let Some(tok) = toks.next() {
-        // Accept BOTH `timeout <ms>` (the original await grammar) and `timeout=<ms>`
-        // (the k=v form turn/turns/subscribe use) so the wait family reads uniformly.
-        // A bare trailing `timeout` is an argument like any other word. An `<ms>`
-        // that is not one is the usage line, never the default.
+        // `timeout <ms>` or `timeout=<ms>`; a bare trailing `timeout` is an argument, and an
+        // `<ms>` that is not a number is the usage line, never the default.
         let value = if let Some(v) = tok.strip_prefix("timeout=") {
             v
         } else if tok == "timeout"
@@ -1233,11 +1095,8 @@ pub(crate) fn cmd_await(
         return USAGE.to_string();
     };
 
-    // `await inbox` is the FABRIC predicate and the one form that arms nothing in
-    // the engine: it parks on the session's inbox condvar, which `deliver`, `hold`
-    // and a landing post all signal, so it is event-driven with no watcher budget
-    // spent and no terminal lock taken. Answered before the `match kind` below
-    // because that arm arms its watcher UNDER the terminal lock.
+    // `await inbox` parks on the session's inbox condvar and arms nothing in the engine, so it
+    // is answered before the arms below, which take the terminal lock.
     if kind == "inbox" {
         return crate::fabric::cmd_await_inbox(ctx, &args[1..], timeout_ms);
     }
@@ -1288,7 +1147,7 @@ pub(crate) fn cmd_await(
     }
 
     // `await log need|open=<lvl>|close=<lvl>|kind=<k> [since=<seq> ep=<e>]` parks on
-    // the SESSION LOG (phase 3A), woken by every producer's ring (no watcher
+    // the session log, woken by every producer's ring (no watcher
     // armed, no terminal lock taken).
     if kind == "log" {
         return match crate::session_log::LogAwait::parse(&args[1..]) {
@@ -1298,13 +1157,9 @@ pub(crate) fn cmd_await(
     }
 
     let now0 = Instant::now();
-    // Arm the predicate. The `match`/`gone` verbs compile an UNTRUSTED regex:
-    // that work is now bounded (row_matcher caps pattern length + NFA/DFA size)
-    // but is still non-trivial parse/compile, so do it BEFORE taking the terminal
-    // lock. Holding the Mutex across it would let a crafted (bounded) pattern
-    // stall rendering / PTY processing / other control verbs that contend for
-    // the same lock; here we lock only long enough to install the compiled
-    // matcher. `gone` parses identically and arms the inverse predicate.
+    // `match`/`gone` compile an untrusted (bounded) regex in `aterm-observe` before the terminal
+    // lock is taken, so a crafted pattern cannot stall rendering, the PTY reader or other verbs;
+    // only the install runs under the lock.
     let armed = if kind == "match" || kind == "gone" {
         let Some(pat) = args.get(1) else {
             return USAGE.to_string();
@@ -1316,16 +1171,12 @@ pub(crate) fn cmd_await(
             },
             _ => RowRange::All,
         };
-        // Compile the regex in `aterm-observe` (regex out of the engine core),
-        // OUTSIDE the lock; only `watch_rows`/`watch_rows_gone` runs under it.
         let matcher = match aterm_observe::row_matcher(pat) {
             Ok(m) => m,
             Err(_) => return "ERR badregex\n".to_string(),
         };
         let mut t = term_lock(term);
-        // The span must meet the CURRENT grid. An empty span scans nothing, so
-        // `match` could never latch on it and `gone` must not (the kernel refuses
-        // a vacuous "clear"): name the typo now rather than burn the timeout.
+        // A span off the current grid is named now rather than burning the timeout.
         let grid_rows = t.rows() as usize;
         if !range.covers_any(grid_rows) {
             return super::control_query::rows_off_grid(grid_rows);
@@ -1356,16 +1207,9 @@ pub(crate) fn cmd_await(
                     .get(1)
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(current);
-                // AN ANCHOR FROM THE FUTURE IS AN ANCHOR FROM ELSEWHERE (round
-                // seven of the update audit, finding 29): the counter only
-                // rises within one grid, so a `<n>` above it was read off
-                // another grid (the screen switched since — a change) or
-                // another process (an update's successor starts its count
-                // over — output since the handoff is a change too). Parked,
-                // it waited for the new count to pass the old one and
-                // answered `OK timeout` — "nothing changed", even to the
-                // `timeout=0` dirty check — over a moving screen. Latched at
-                // once instead, with the seq to anchor on next.
+                // An `<n>` above the current count was read off another grid or another
+                // process (an update's successor restarts the count): either way the screen
+                // changed, so latch now with the seq to anchor on next.
                 if after > current {
                     return format!("OK seq {current}\n");
                 }
@@ -1413,20 +1257,11 @@ const AGENT_WORDS: [&str; 7] = [
     "busy", "prompt", "question", "idle", "survey", "unknown", "-",
 ];
 
-/// One `await agent` word: a verdict of [`AGENT_WORDS`], or a WALL —
-/// `wall` for any `wall:<kind>` verdict, `wall:<kind>` for that one (the
-/// kinds are `aterm_phase::WallKind::name`'s: `usage-session`,
-/// `usage-weekly`, `model-bucket`, `spend`, `context`, `auth`, `api-error`,
-/// `overloaded`, `memory` — Claude Code's critical-memory banner — and the
-/// server's own `unresponsive`, a program that has stopped reading its
-/// input). A `<kind>` of the right shape that no wall carries parks to
-/// its timeout rather than being refused: a newer reader may name one this
-/// build does not. `limited`, the verdict word before the walls were named,
-/// is `ERR usage` like any unknown word: its deprecated alias meant the limit
-/// walls MINUS an API 429, which is neither what `level=limited` (any wall
-/// nobody answers)
-/// nor the band's `limited` (the limit walls with a 429) means — `wall` or
-/// `wall:<kind>` says which.
+/// One `await agent` word: a verdict of [`AGENT_WORDS`], `wall` for any `wall:<kind>` verdict,
+/// or `wall:<kind>` for that one (`aterm_phase::WallKind::name`'s kinds, and the server's own
+/// `unresponsive`). A well-formed `<kind>` no wall carries parks to its timeout rather than
+/// being refused, since a newer reader may name one this build does not. `limited` is
+/// `ERR usage` like any unknown word: `wall` or `wall:<kind>` says which walls are meant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AgentWord {
     /// One of [`AGENT_WORDS`].
@@ -1688,10 +1523,10 @@ fn latch_task_news<F: Fn(&Store) -> bool>(
 /// holds the session's `ctx`, so it reads the closed session's own log after the
 /// store forgot it. Each check takes the timeline's leaf lock alone.
 ///
-/// A SHELL THAT EXITED ON ITS OWN is `Exited` at once (`exit_session_logical`)
+/// A shell that exited on its own is `Exited` at once (`exit_session_logical`)
 /// but its log's close (`close - spawn out=shell-exit code=`) is written by the
 /// retire's deregister, which comes after and wakes this waiter. So once the
-/// session ended, the waiter takes ONE LOOK under the timeline's lock
+/// session ended, the waiter takes one look under the timeline's lock
 /// (`SessionLog::await_look`): the log past the cursor and whether the close is
 /// still due. The exit path sets that before `Exited`; the close clears it, and
 /// so does the end of the exit handling, which wakes the waiters (for an exit
@@ -1759,7 +1594,7 @@ pub(crate) fn await_log_seamed(
             LogAwaitStep::Wait(next) => cursor = next,
         }
         if exited(store) {
-            // ONE LOOK (`SessionLog::await_look`): the close and the flag it
+            // One look (`SessionLog::await_look`): the close and the flag it
             // clears are written in one hold of the timeline's lock, and the
             // look reads both in one, so a look that finds the close not due
             // has the close in what it read, if it was ever written.
@@ -1824,13 +1659,9 @@ pub(crate) fn turn_ids_minted() -> u64 {
     NEXT_TURN_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Continue the turn-id count from `minted` (an earlier process's
-/// [`turn_ids_minted`]): the next id is above it. Never lowers the count, and
-/// never raises it past what a handoff can carry
-/// (`handoff_carry::MAX_TURN_ID`): a count taken from a sidecar or manifest
-/// is input, and one at `u64::MAX` would make the next `turn`'s `+ 1`
-/// overflow (a debug panic, a release wrap to 0 that breaks the rising ids
-/// `history since=` and `ERR busy turn=` rely on).
+/// Continue the turn-id count from `minted` (an earlier process's [`turn_ids_minted`]). Never
+/// lowers it, nor raises it past `handoff_carry::MAX_TURN_ID`: a carried count is input, and
+/// one at `u64::MAX` would overflow the next `+ 1` and break the rising ids.
 pub(crate) fn raise_turn_ids(minted: u64) {
     NEXT_TURN_ID.fetch_max(
         minted.min(crate::handoff_carry::MAX_TURN_ID),
@@ -1840,22 +1671,16 @@ pub(crate) fn raise_turn_ids(minted: u64) {
     crate::crash_restore::note_turn_ids();
 }
 
-/// How many turn ids a self-update leaves this process between the park's
-/// manifest and its `_exit` ([`turn_ids_for_handoff`]). The parent serves the
-/// control socket until Commit, and a `turn` in that overlap mints an id; the
-/// successor counts on from above the reserve, so no id is ever handed to two
-/// turns (round seven, finding 22) — a `report`, `history since=` or
-/// `since-turn=` naming an overlap id never reads another exchange. A turn in
-/// the overlap is not activity that vetoes an update: only a process that
-/// mints more than this many in one overlap stands its Commit down
+/// How many turn ids a self-update leaves this process between the park's manifest and its
+/// `_exit` ([`turn_ids_for_handoff`]). The parent serves the control socket until Commit, so a
+/// `turn` in that overlap mints an id; the successor counts on from above the reserve, so no id
+/// names two turns. Only minting more than this in one overlap stands the Commit down
 /// ([`turn_ids_past_handoff_ceiling`]), a lossless retry.
 pub(crate) const TURN_ID_RESERVE: u64 = 1 << 12;
 
-/// The turn-id count a handoff manifest carries: the ids minted so far plus
-/// [`TURN_ID_RESERVE`] (never past what a manifest can hold). The caller
-/// keeps it on its ATTEMPT (`HandoffAttemptArbiter::set_turn_id_ceiling`), so
-/// the Commit checks the ceiling of the manifest its successor consumed
-/// ([`turn_ids_past_handoff_ceiling`]).
+/// The turn-id count a handoff manifest carries: ids minted so far plus [`TURN_ID_RESERVE`],
+/// within what a manifest holds. The caller keeps it on its attempt
+/// (`HandoffAttemptArbiter::set_turn_id_ceiling`) for [`turn_ids_past_handoff_ceiling`].
 #[cfg(any(unix, test))]
 pub(crate) fn turn_ids_for_handoff() -> u64 {
     turn_ids_minted()
@@ -1869,12 +1694,11 @@ pub(crate) fn turn_ids_for_handoff() -> u64 {
 /// `ceiling` of 0 — an attempt whose manifest was never written — is none.
 ///
 /// Nor is a ceiling at the top of what a manifest carries
-/// (`handoff_carry::MAX_TURN_ID`, round eight of the update audit, finding
-/// 715): the successor continues from there whatever this process minted
-/// ([`raise_turn_ids`] holds the count to it), so standing down protects no
-/// id — and since the next attempt's ceiling is the top again, it would
-/// refuse every later Commit, an update that never lands. A count gets there
-/// only from a carried count no aterm minted; the successor says so
+/// (`handoff_carry::MAX_TURN_ID`): the successor continues from there whatever
+/// this process minted ([`raise_turn_ids`] holds the count to it), so standing
+/// down protects no id — and since the next attempt's ceiling is the top again,
+/// it would refuse every later Commit, an update that never lands. A count gets
+/// there only from a carried count no aterm minted; the successor says so
 /// (`seamless::take_incoming`).
 #[cfg(unix)]
 pub(crate) fn turn_ids_past_handoff_ceiling(ceiling: u64) -> bool {
@@ -1888,13 +1712,10 @@ const fn past_ceiling(minted: u64, ceiling: u64) -> bool {
     ceiling > 0 && ceiling < crate::handoff_carry::MAX_TURN_ID && minted > ceiling
 }
 
-/// Input delivery for [`cmd_turn`], resolved by the dispatch site so the ONE
-/// orchestration below serves both targets: the SELF/active-tab path delivers
-/// through the event loop (`Wake::Input`, so gesture/window side-effects run for
-/// the tab the user is looking at), the CROSS path through the source-blind seam
-/// (`seam_egress` on the resolved target's `(term, sink)`). `cmd_turn` itself
-/// never touches an input API — it only orchestrates watchers around these two
-/// calls, so the Tier-1 byte-indistinguishability of both paths is untouched.
+/// Input delivery for [`cmd_turn`], resolved by the dispatch: the active tab's path delivers
+/// through the event loop (`Wake::Input`, so window side effects run), a cross-session target
+/// through the source-blind seam (`seam_egress`). `cmd_turn` never touches an input API itself,
+/// so both paths stay byte-indistinguishable.
 pub(crate) struct TurnIo<'a> {
     /// Deliver the message text into the target's input path with PASTE
     /// semantics (control bytes stripped by `format_paste`; bracketed-paste
@@ -1905,19 +1726,13 @@ pub(crate) struct TurnIo<'a> {
     /// Press a named key (the `key` verb vocabulary, e.g. "enter"). `false`
     /// means the name did not parse — reported as a usage error.
     pub press: &'a dyn Fn(&str) -> bool,
-    /// Press ONE pre-built key event — `turn typed=1`'s per-grapheme press,
-    /// through the SAME route `press` takes (the event-loop seam for the tab
-    /// on screen, the source-blind seam for a background target). The verb
-    /// builds the event ([`typed_key_events`]) and the route delivers it; the
-    /// seam never learns who pressed. `false` means the route refused it.
-    /// The paste-only base ([`TurnIo::paste_only`]) refuses every press, so a
-    /// caller that has no key route answers `typed=1` honestly.
+    /// Press one pre-built key event (`turn typed=1`'s per-grapheme press, built by
+    /// [`typed_key_events`]) through the same route `press` takes. `false` means the route
+    /// refused it, as [`TurnIo::paste_only`] refuses every one.
     pub key: &'a dyn Fn(InputEvent) -> bool,
-    /// ONE reading of the target's typing-momentum metric (the raw
-    /// `trail status momentum=` number) with the instant it was read — what
-    /// `turn yield=<floor>` solves the release law from. `Err` names why no
-    /// reading exists (no event loop, a dropped reply); the turn then refuses
-    /// the yield rather than typing over a ribbon it could not see.
+    /// One reading of the target's typing momentum (`trail status momentum=`) and when it was
+    /// read, for `turn yield=<floor>`. `Err` names why there is none, and the turn refuses the
+    /// yield rather than type over a ribbon it could not see.
     pub momentum: &'a dyn Fn() -> Result<(f32, std::time::Instant), String>,
     /// WHO is driving: the session the connection's edge token was granted to
     /// (`EdgeTable::src_of` on the resolved target's table — the one that
@@ -1936,13 +1751,13 @@ pub(crate) struct TurnIo<'a> {
     /// [`Self::driver`]. The turn ledger's `by=`; the session log's is
     /// [`Self::actor`].
     pub by: TurnBy,
-    /// THE SESSION LOG'S `by=` for the turn this exchange opens: the
+    /// The session log's `by=` for the turn this exchange opens: the
     /// connection's ([`log_actor`]: `harness`, `ctl`, `bridge`, an edge's
     /// minted sid, else `-`), never a parameter. Resolved by the dispatch,
     /// which has the scope; `ctl` for the routes with no connection (the
     /// keyed replay path).
     pub actor: aterm_slog::Actor,
-    /// A leading `cause=` the dispatch took and checked (phase 3A): the
+    /// A leading `cause=` the dispatch took and checked: the
     /// turn this exchange opens names it. `cmd_turn` takes one among its own
     /// options too, and refuses a second.
     pub cause: Option<aterm_slog::ShortId>,
@@ -2007,27 +1822,20 @@ impl TurnIo<'static> {
     }
 }
 
-/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are
-/// pressed one key at a time; the remainder is ONE paste (the remainder's
-/// voice is the paste's own — one up-strum of the music box's live chord,
-/// keyed off the event kind at the seam, never off a source). 240 graphemes at
-/// the default cadence is ~17 s of typing, inside the default 240 s deadline
-/// with room for the reply; past that a turn is a document, not a sentence.
+/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are pressed one key at a
+/// time, the remainder going as one paste. 240 at the default cadence is ~17 s of typing,
+/// inside the default 240 s deadline with room for the reply.
 pub(crate) const TYPED_CAP: usize = 240;
 
-/// The most graphemes `turn typed=1 cap=<n>` may ask to have pressed one key at a
-/// time. The default cap is a bound on TIME (240 keys at the default cadence);
-/// a caller that types faster and needs its whole text pressed, not pasted,
-/// asks for the room with `cap=`. Why anyone would: an agent that reads a long
-/// paste as PASTED (Claude Code wraps one in `<pasted_content>` and treats its
-/// instructions as not its person's) reads the same text pressed as its person's
-/// own. 4096 keys at the 2 ms a harness notice uses is ~8 s, inside `timeout=`.
+/// The most graphemes `turn typed=1 cap=<n>` may ask to have pressed one key at a time. The
+/// default cap bounds time; a faster caller asks for room with `cap=`, since an agent that reads
+/// a long paste as pasted (Claude Code's `<pasted_content>`, not its person's words) reads the
+/// same text pressed as its person's. 4096 keys at a harness notice's 2 ms is ~8 s.
 pub(crate) const TYPED_CAP_MAX: usize = 4096;
 
-/// The default inter-key interval of `turn typed=1`, in milliseconds. A
-/// jitter-free 70 ms IOI (~14 cps, held exactly) is the typed turn's ONE
-/// honest signature: no hand holds a cadence to the millisecond, and the seam
-/// is told nothing else — every key it sees is the tuple a keyboard builds.
+/// The default inter-key interval of `turn typed=1`, in ms (~14 cps). Held exactly, it is the
+/// typed turn's one honest signature: no hand keeps a cadence to the millisecond, and the seam
+/// is told nothing else.
 pub(crate) const TYPED_CADENCE_MS: u64 = 70;
 
 /// The US-layout BASE key SHIFT composes `c` from — the inverse of
@@ -2075,14 +1883,11 @@ fn has_us_base_layout(base: char) -> bool {
         )
 }
 
-/// ONE grapheme of a typed turn as the key event a keyboard builds for it:
-/// a capital or shifted symbol is its base key under SHIFT (the encoder
-/// composes the glyph, as it does for a human), the spacebar is
-/// `NamedKey::Space`, a line break is `Enter`, a tab is `Tab`, and a
-/// multi-scalar cluster (an emoji sequence, a composed accent) is a committed
-/// `Text` run — the IME path, which is also a keyboard's. Control characters
-/// other than those three are dropped (`None`): the paste path strips them
-/// and a keyboard has no key for them.
+/// One grapheme of a typed turn as the key event a keyboard builds for it: a capital or shifted
+/// symbol is its base key under SHIFT (the encoder composes the glyph), space, line break and
+/// tab are their named keys, and a multi-scalar cluster is a committed `Text` run (the IME
+/// path). Other control characters are dropped: the paste path strips them and no key types
+/// them.
 fn typed_key_event(g: &str) -> Option<InputEvent> {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
     let mut chars = g.chars();
@@ -2133,95 +1938,48 @@ pub(crate) fn split_typed_cap(text: &str, cap: usize) -> (&str, &str) {
     }
 }
 
-/// WHAT A FENCED TYPED TURN IS HELD TO BETWEEN ITS KEYS (review of
-/// 2026-09-30, finding 12): `if-gen=`/`if-rows=` are checked once, before the
-/// first key, and a `typed=1` text then takes a key per grapheme — about two
-/// seconds for the live upgrade's notice. The fence's own values cannot be
-/// asked again between the keys: the turn's own echo moves the generation
-/// and the rows it lands in at every key. What they are there for can be:
+/// What a fenced typed turn is held to between its keys. `if-gen=`/`if-rows=` are checked once,
+/// before the first key, and cannot be asked again (the turn's own echo moves the generation
+/// and its rows at every key), so the hold checks what they stand for:
 ///
-/// * `person`: the session's person count
-///   ([`crate::human_input::HumanInputStamp::seq`]), read under the fence's
-///   own lock hold. A person's key counts and a controller's never does —
-///   this turn's own keys included — so a moved count is a person at the
-///   keyboard, whose keys would be mixed into the text and submitted with it.
-/// * `epoch`: the screen's invalidation epoch ([`crate::control::ScreenGen`]),
-///   moved by every screen switch and RIS and never by an echo. A moved one
-///   is another screen than the one the caller judged.
-/// * `frame`: THE CARET ANCHOR (the review of 2026-09-30, item D), armed by
-///   an `if-rows=` fence whose rows ARE an input frame ([`Frame::of`]) —
-///   any other rows leave the hold to the person and the epoch, as for any
-///   app, so `turn typed=1 if-rows=` stays the app-agnostic verb its help
-///   describes (the review of the build). A box that mounts between two keys
-///   on the same screen — a
-///   workflow subagent's permission box at the break the notice is typed
-///   at, a resumed turn's first tool call — moves neither count above, and
-///   took the notice's digits as its answers (`2` = No, `1` = Yes on an
-///   `rm -rf`). The rows a typed turn is fenced on are the input FRAME it
-///   types into, and the typing is held to that frame ([`Frame::holds`]):
-///   a miss stops it as `changed`. A frame the program has not finished
-///   drawing (DEC 2026, [`Terminal::sync_frame_unfinished`]) is TORN — its
-///   cursor is the program's write position, not its caret — and is not
-///   judged: the key waits for it ([`TypingHold::held`]). A DIGIT, the
-///   selector of every numbered box, also waits until the program has READ
-///   every key before it (the kernel's own count, [`keys_unread`]) and the
-///   caret has moved since the key before it went out, on a finished frame.
+/// - `person`: the session's person count ([`crate::human_input::HumanInputStamp::seq`]),
+///   which a controller's keys never move, so a moved count is a person whose keys would be
+///   mixed into the text.
+/// - `epoch`: the screen's invalidation epoch ([`crate::control::ScreenGen`]), moved by every
+///   screen switch and RIS, never by an echo.
+/// - `frame`: armed by an `if-rows=` fence whose rows are an input frame ([`Frame::of`]); other
+///   rows leave the hold to person and epoch, so the verb stays app-agnostic. A box that mounts
+///   between two keys on the same screen (a permission box) moves neither count and would take
+///   the text's digits as answers, so the typing is held to the frame ([`Frame::holds`]) and a
+///   miss stops it as `changed`. A frame the program has not finished drawing (DEC 2026,
+///   [`Terminal::sync_frame_unfinished`]) is not judged: the key waits. A digit, the selector
+///   of every numbered box, also waits until the program has read every key before it
+///   ([`keys_unread`]) and the caret has moved since the previous key.
 ///
-/// What it does not see, said. Keys already on their way when a box mounts,
-/// before the box's first finished frame reaches the grid: about one render
-/// of them (Claude Code echoes 13-17 ms after a key, 7-8 keys at the
-/// notice's `cadence=2`), which the box takes. A digit is pressed only once
-/// the program has read every key before it, so what stays open for a digit
-/// is the program's own gap between reading a key and drawing the box it
-/// raises (the caret check alone, until 2026-10-01, was satisfied by an
-/// OLDER key's echo while later keys sat unread; a tty that cannot count
-/// its unread input keeps that check alone). A card drawn ABOVE an intact
-/// composer (the session survey) leaves the frame whole and is not a change
-/// — and need not be one, below. And a turn fenced by `if-gen=` alone — the
-/// driver's fallback when it found no frame, or the host takes no
-/// `if-rows=` — is held to the person and the epoch only: the host is
-/// app-agnostic, and without a frame it cannot tell a box's drawing from the
-/// turn's own echo.
+/// Not seen: keys already sent when a box mounts, before its first finished frame (about one
+/// render's worth, 7-8 keys at `cadence=2`), and a digit's gap between the program reading a
+/// key and drawing the box it raises. A card drawn above an intact composer leaves the frame
+/// whole. A turn fenced by `if-gen=` alone is held to person and epoch only: without a frame
+/// the host cannot tell a box's drawing from the turn's own echo.
 ///
-/// A ONE-KEY CARD OVER THE COMPOSER TAKES NO KEY OF A TYPED TEXT (measured
-/// 2026-10-01 from Claude Code 2.1.286's bundle, the same code in 2.1.285,
-/// and live). The session survey (`1: Bad … 0: Dismiss`) and every one-key
-/// card — the other rating cards, the transcript ask, the drafts card, the
-/// hotkeys above the prompt — reads no key of its own: one hook (`Dm` in
-/// 2.1.286) reads the COMPOSER'S VALUE, and answers only while that value is
-/// exactly one of the card's keys (a digit; `y`/`n`/`d` on the transcript
-/// ask), changed since the card mounted and left alone 400 ms (or Enter
-/// pressed on it), past the card's first 600 ms. A rating card also leaves
-/// the screen at any other value, and one a person was shown is closed for
-/// good, as `abandoned`: nothing answered. A typed text's first key is its
-/// whole value only until the next key, so a text answers a card only if it
-/// OPENS with the card's key and its second key is held back 400 ms. The
-/// notice and the release open with `[aterm harness]`, and nothing is typed
-/// into a draft. Live, the card forced by `CLAUDE_FORCE_DISPLAY_SURVEY=1` on
-/// a private instance: `draft` then `2` left `❯ draft2` and no card; `[`
-/// alone took the card off, the notice's shape after it at `cadence=2` stood
-/// whole, digits and all, and the card stayed closed once the composer was
-/// cleared; `0x` 100 ms apart left `❯ 0x`; and a lone `0`, the control, was
-/// taken — the composer emptied, the card gone. What a notice's first key
-/// WOULD do is close an open card unanswered, as a person's first key does —
-/// so the card is the person's, and the driver never types a notice or a
-/// release while one is open (`wait:survey`, the upgrade's look).
+/// A one-key card over the composer (Claude Code's session survey, rating cards, the transcript
+/// ask) reads the composer's value, answering only when it is exactly one of the card's keys,
+/// changed since the card mounted and left alone 400 ms. A typed text's first key is its whole
+/// value only until the next key, so it answers a card only if it opens with the card's key and
+/// its second key is held back 400 ms. Its first key would still close an open card unanswered,
+/// as a person's does, so the driver never types while one is open (`wait:survey`).
 struct TypingHold {
     epoch: u64,
     person: u64,
     frame: Option<Frame>,
 }
 
-/// The input frame an `if-rows=` fence names, as the fence found it: the
-/// text of its first row (the top rule), of its last (the bottom rule), and
-/// the first grapheme of the row after the first (the caret, Claude Code's
-/// `❯` — the frame `aterm_phase::phase::composer_rules` reads and the
-/// driver's fence is built on, the cursor on the caret row). False stops it
-/// can make, each a cut whose words stand and whose owner is told (the
-/// safety ruling of 2026-09-30): the program retitling its top rule
-/// mid-text (an effort or mode tag), a text grown past the pane's height
-/// that pushes the top rule off the visible rows, a frame left torn until
-/// the deadline.
+/// The input frame an `if-rows=` fence names, as the fence found it: its first row (the top
+/// rule), its last (the bottom rule), and the first grapheme of the row after the first (the
+/// caret, Claude Code's `❯`; see `aterm_phase::phase::composer_rules`). It can stop falsely, a
+/// cut whose words stand and whose owner is told, when the program retitles its top rule
+/// mid-text, the text grows past the pane and pushes the top rule off, or the frame stays torn
+/// to the deadline.
 struct Frame {
     top: String,
     bottom: String,
@@ -2229,15 +1987,10 @@ struct Frame {
 }
 
 impl Frame {
-    /// The frame the fence's rows are, read under the fence's own lock hold —
-    /// ARMED whether or not the cursor sits between them now: a fence checked
-    /// during a repaint found the program's write position there, not its
-    /// caret, and a hold armed only on a bracketing cursor would drop out
-    /// silently for the whole text. Judged by the rows alone, which are the
-    /// rows the caller judged (they hashed to its fence): a rule
-    /// ([`aterm_phase::phase::is_rule`]) over a row opening with a caret, down
-    /// to a rule. `None` for any other rows — a shell prompt's row, a single
-    /// line — whose turn a frame would stop at its first key.
+    /// The frame the fence's rows are, read under the fence's lock hold and judged by the rows
+    /// alone: a rule ([`aterm_phase::phase::is_rule`]) over a row opening with a caret, down to
+    /// a rule. Armed wherever the cursor sits now, since a fence checked mid-repaint finds the
+    /// program's write position. `None` for any other rows (a shell prompt, a single line).
     fn of(terminal: &Terminal, fence: aterm_types::control_verbs::RowsFence) -> Option<Self> {
         use aterm_grapheme::GraphemeClusters;
         let row = |r: usize| crate::control::visible_row(terminal, r);
@@ -2254,17 +2007,11 @@ impl Frame {
         .then_some(Self { top, bottom, caret })
     }
 
-    /// Whether the cursor on `row` is still in the frame: the row under it is
-    /// the bottom rule (typing only appends, so the caret sits on the text's
-    /// last row), and the nearest row at or above it that is the top rule
-    /// sits over a row opening with the caret. The frame is free to move and
-    /// to grow — rows above it come and go, the text wraps, a full screen
-    /// scrolls it up — and so is every row outside it (a ticking timer, the
-    /// footer rewriting itself at the first key). Every measured box misses:
-    /// its title sits under its top border (` Bash command`, ` ☐ Colors`), so
-    /// a border that is the composer's own all-`─` rule, the cursor inside
-    /// and the bottom border right under it, is caught by the caret. A frame
-    /// with no caret never holds.
+    /// Whether the cursor on `row` is still in the frame: the row under it is the bottom rule
+    /// (typing only appends) and the nearest top rule at or above it sits over a row opening
+    /// with the caret. The frame may move and grow, and rows outside it may change. A box's
+    /// title sits under its top border (` Bash command`), so a border that matches the
+    /// composer's rule is caught by the caret. A frame with no caret never holds.
     fn holds(&self, terminal: &Terminal, row: usize) -> bool {
         let text = |r: usize| crate::control::visible_row(terminal, r);
         let under = row.saturating_add(1);
@@ -2374,26 +2121,19 @@ impl TypingHold {
     }
 }
 
-/// THE READ WITNESS (2026-10-01): whether the program has yet to READ keys
-/// already written to it — bytes in the slave's input queue or still in the
-/// sink's spill ([`aterm_session::sink::SinkWriter::input_backlog`], the
-/// kernel's own count; a spill whose lock was busy counts as unread). Before
-/// a DIGIT the typing waits for none: a key the program has read went where
-/// the screen it judged was, and only the program's own gap between reading
-/// a key and drawing the box it raises stays open. The caret-moved check
-/// alone was satisfied by an OLDER key's echo while later keys sat unread —
-/// keys a box mounting then would take, a digit answering it. A tty that
-/// cannot say (`None`) keeps the caret check alone: never weaker than it was.
+/// Whether the program has yet to read keys already written to it: bytes in the slave's input
+/// queue or still in the sink's spill ([`aterm_session::sink::SinkWriter::input_backlog`]; a
+/// spill whose lock was busy counts as unread). A digit waits for none, since the caret check
+/// alone is satisfied by an older key's echo while later keys sit unread. A tty that cannot
+/// say (`None`) keeps the caret check alone.
 fn keys_unread(ctx: &SessionCtx) -> bool {
     ctx.sink
         .input_backlog()
         .is_some_and(|b| b.queued != 0 || b.spilled != Some(0))
 }
 
-/// Whether a typed turn's key is an ASCII DIGIT — the selector key of every
-/// numbered box (`1. Yes`, `2. No`), which [`TypingHold::held`] presses only
-/// after the key before it has moved the caret. Unshifted: `!` rides the `1`
-/// key under SHIFT ([`typed_key_event`]) and is not one.
+/// Whether a typed turn's key is an unshifted ASCII digit, the selector of every numbered box
+/// (`1. Yes`, `2. No`), which [`TypingHold::held`] holds back (`!` is SHIFT+`1`, not one).
 fn is_digit_key(ev: &InputEvent) -> bool {
     matches!(
         ev,
@@ -2405,10 +2145,9 @@ fn is_digit_key(ev: &InputEvent) -> bool {
     )
 }
 
-/// A typed turn stopped part-way ([`TypingHold::held`], or its deadline):
-/// NOTHING pressed after it, the Enter included, and the keys already typed
-/// said — `typed=<k> pasted=<p>` — so the driver knows part of its text sits
-/// where it was typed. The verb's Lines framing, zero rows, like every skip.
+/// The reply for a typed turn stopped part-way ([`TypingHold::held`], or its deadline): nothing
+/// is pressed after it, the Enter included, and `typed=<k> pasted=<p>` tells the driver part of
+/// its text sits where it was typed. Lines framing with zero rows, like every skip.
 fn typed_cut(
     term: &Arc<Mutex<Terminal>>,
     why: &str,
@@ -2451,9 +2190,8 @@ enum OnHangup {
 }
 
 /// What a [`Park`]'s window does while the session's reader is parked for an
-/// update (`SessionCtx::update_parked`; round seven of the update audit,
-/// findings 62 and 63), when nothing consumes the program's output and its
-/// silence is the host's.
+/// update (`SessionCtx::update_parked`), when nothing consumes the program's
+/// output and its silence is the host's.
 #[derive(Clone, Copy)]
 enum Stretch<'a> {
     /// The park does not read the flag: what it waits on is not the
@@ -2483,7 +2221,7 @@ impl Stretch<'_> {
     }
 }
 
-/// THE PARK every blocking session verb shares: `ready`, `await`, `await
+/// The park every blocking session verb shares: `ready`, `await`, `await
 /// agent`, `await momentum` and each of a `turn`'s phases. [`Park::run`] parks
 /// on the session's watchers until the look answers, the window closes, the
 /// session exits or (for [`OnHangup::Abort`]) the caller hangs up. A park
@@ -2517,7 +2255,7 @@ impl<'a> Park<'a> {
 
     /// Run the park until `until`, as stretched. Each look is `look(now,
     /// parked, closing)`: it takes its own lock (the terminal's or the
-    /// timeline's), reads, DISARMS UNDER THAT GUARD when it answers or
+    /// timeline's), reads, disarms under that guard when it answers or
     /// `closing` is set, and returns its answer and the next instant the
     /// kernel names. `disarm` runs on the paths that end without a look (an
     /// exit, a hang-up).
@@ -2699,15 +2437,12 @@ fn momentum_read_outcome(
     }
 }
 
-/// THE YIELD: park until the target's typing momentum has decayed to
-/// `floor`, ANALYTICALLY — one reading, one crossing solved from the spine's
-/// release law (`TypingMomentum::reading_low_crossing`, τ = 2 s), ONE kernel timer
-/// ([`WatcherSpec::MomentumBelow`]), no polling. When the timer fires the
-/// metric is read again: at or under the floor the wait is over; above it
-/// the human re-lit the ribbon while we parked, and the next crossing is
-/// solved from that reading. So every wake is a crossing of a real reading,
-/// and the human's typing is never touched — the agent yields, the human never
-/// waits. Bounded by `until` and by session exit like every other park.
+/// The yield: park until the target's typing momentum has decayed to `floor`, analytically:
+/// one reading, one crossing solved from the release law (`TypingMomentum::reading_low_crossing`),
+/// one kernel timer ([`WatcherSpec::MomentumBelow`]), no polling. When the timer fires the
+/// metric is read again: at or under the floor the wait is over; above it the person re-lit the
+/// ribbon, and the next crossing is solved from that reading. The person's typing is never
+/// touched. Bounded by `until` and session exit like every park.
 pub(crate) fn park_until_momentum_below(
     term: &Arc<Mutex<Terminal>>,
     exited: &dyn Fn() -> bool,
@@ -2755,13 +2490,11 @@ pub(crate) fn park_until_momentum_below(
     }
 }
 
-/// `await momentum <floor> [timeout <ms>|timeout=<ms>]` — block until the
-/// typing momentum of the window hosting this session (the raw
-/// `trail status momentum=` number) has decayed to `floor` (0..=1), then
-/// `OK momentum <v>`; `OK timeout` past the deadline (default 30 s), `ERR
-/// exited` if the session dies. The wait is [`park_until_momentum_below`]:
-/// analytic, one timer per reading, no polling — an agent uses it to wait for
-/// the human's ribbon to exhale before typing into a shared session.
+/// `await momentum <floor> [timeout <ms>|timeout=<ms>]` — block until the typing momentum of
+/// the window hosting this session (`trail status momentum=`) has decayed to `floor` (0..=1),
+/// then `OK momentum <v>`; `OK timeout` past the deadline (default 30 s), `ERR exited` if the
+/// session dies. An agent waits on it for the person's ribbon to exhale before typing into a
+/// shared session ([`park_until_momentum_below`]).
 pub(crate) fn cmd_await_momentum(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -2841,15 +2574,11 @@ enum GuardedSubmit {
 /// press has not happened yet, so a retry cannot double it; the guard is asked
 /// again each time.
 ///
-/// ORDERING, stated rather than enforced: the text went through the App input
-/// seam (`PasteFraming::AtDrain`) and this Enter goes straight to the target's
-/// sink on the control thread. It follows the text because the caller presses
-/// only after the echo settled (the text was on screen, so its bytes were
-/// written), and because the immediate write refuses — `BusyZero`, retried
-/// here — while any spilled frame is still queued ahead of it. The one gap is
-/// the echo CAP: a target that never goes echo-quiet within it is pressed
-/// anyway, and if the seam had not yet written the text by then, this Enter
-/// would precede it. The guard still decides on the live screen either way.
+/// Ordering is argued, not enforced: the text went through the App input seam
+/// (`PasteFraming::AtDrain`) and this Enter goes straight to the sink. It follows the text
+/// because the caller presses only after the echo settled, and the immediate write refuses
+/// (`BusyZero`, retried) while a spilled frame is queued. The gap is the echo cap: a target
+/// never echo-quiet within it is pressed anyway, and could get this Enter before the text.
 fn guarded_submit(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -2938,27 +2667,16 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     let mut idle_ms = 1_500u64;
     let mut timeout_ms = 240_000u64;
     let mut submit = "enter".to_string();
-    // `submit=guarded:<re>`: the submit is Enter, pressed only while the
-    // cursor's row still matches `<re>` — checked and written under one
-    // terminal lock hold (`control_input::input_if_fenced`). None => an
+    // `submit=guarded:<re>`: Enter, pressed only while the cursor's row matches; `None` is an
     // ordinary press.
     let mut submit_guard: Option<String> = None;
-    // Submit-verification knobs: `submit_window` is how long one press has to move
-    // `content_seq` before a re-press; `presses` is the max total presses.
-    // `presses=1` disables re-press for slow/high-latency links where a duplicate
-    // Enter would be harmful (e.g. auto-confirming a following prompt).
+    // `submit_window`: how long one press has to verify before a re-press; `presses`: the most
+    // presses in all.
     let mut submit_window_ms = 2_000u64;
     let mut presses = 3u32;
-    // `submit_verify` chooses the submit-verification signal. `block` verifies the
-    // submit against the OSC-133 command-start transition (ambient-repaint-immune);
-    // `seq` uses a bare `content_seq` advance. DEFAULT (None) is AUTO: `block` when
-    // the target is at a shell prompt (a submit will start a command — the sound
-    // choice), else `seq` (a TUI or no shell integration has no press-attributable
-    // signal, so seq is the best available). So a shell drive is sound by default.
+    // `submit_verify`: `Some(true)` is `block`, `Some(false)` `seq`, `None` auto.
     let mut submit_verify: Option<bool> = None;
-    // `settle=match:<re>` keys phase-3 settle on a screen PATTERN instead of global
-    // idle, `settle=gone:<re>` on that pattern LEAVING the screen (the `gone` flag);
-    // None => the default idle settle. Compiled below, before any input.
+    // `settle=match:<re>` or `settle=gone:<re>` (the `gone` flag); `None` is the idle settle.
     let mut settle_match: Option<(bool, String)> = None;
     // `settle=submitted`: no phase-3 settle — the turn answers at its verified
     // submit (`status=submitted`).
@@ -2966,20 +2684,16 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     // `trim=1` drops the settled screen's trailing blank rows from the reply (the
     // `text trim` rule); off by default so a script that counts rows sees the grid.
     let mut trim = false;
-    // THE EVEN HAND: `typed=1` presses one key per grapheme at `cadence=` ms
-    // (absolute schedule); `yield=<floor>` parks before typing until the
-    // target's typing momentum has exhaled to the floor.
+    // The even hand: `typed=1` with its `cadence=` and `cap=`, and `yield=<floor>`.
     let mut typed = false;
     let mut cadence_ms = TYPED_CADENCE_MS;
     let mut typed_cap = TYPED_CAP;
     let mut yield_floor: Option<f32> = None;
-    // `if-gen=<epoch>.<seq>`: type only while the screen is still the
-    // generation the caller judged — checked after the yield, immediately
-    // before the paste. None => no precondition.
+    // `if-gen=<epoch>.<seq>`: type only while the screen is still the generation the caller
+    // judged, checked after the yield, just before the paste.
     let mut if_gen: Option<crate::control::ScreenGen> = None;
-    // `if-rows=<first>-<last>:<hex16>`: the NARROW fence — type only while
-    // those rows still hash to the value (a spinner or a timer elsewhere may
-    // move). Checked with `if-gen=`, under the same lock hold.
+    // `if-rows=<first>-<last>:<hex16>`: the narrow fence, type only while those rows still
+    // hash to the value; checked with `if-gen=` under the same lock hold.
     let mut if_rows: Option<aterm_types::control_verbs::RowsFence> = None;
     // `cause=@<off>|<seq>` (phase 3A, ruling R6): in any position among the
     // options, once (with a leading one too, the dispatch refuses the pair),
@@ -3086,10 +2800,8 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
         text = tail;
     }
     let timeout_ms = timeout_ms.min(600_000);
-    // A turn with NO TEXT submits nothing a person typed: a bare `ctl turn` used to
-    // skip the typing and still press Enter into the live session (audit D-3). A
-    // lone Enter is `key enter`; an empty turn is a usage error unless it submits
-    // nothing either (`submit=none` — a settle read, the one empty form with a use).
+    // An empty turn would press Enter with nothing typed (that is `key enter`), so it is a
+    // usage error unless it submits nothing either (`submit=none`, a settle read).
     if text.trim().is_empty() && submit != "none" {
         return Err(USAGE.to_string());
     }
@@ -3146,7 +2858,7 @@ fn turn_matchers(o: &TurnOptions<'_>) -> Result<TurnMatchers, String> {
     Ok((settle_matcher, submit_matcher))
 }
 
-/// EVERY REFUSAL A `turn` CAN MAKE OF ITS OWN WORDS, made BEFORE the
+/// Every refusal a `turn` can make of its own words, made before the
 /// exactly-once claim (`pty_idem::guarded`): the options' grammar, a bad
 /// pattern, and the `cause=` among them. Only an attempt that reached the PTY
 /// seam may consume an `id=` sequence: a refused turn whose key was claimed
@@ -3165,34 +2877,34 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 
 /// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>]
 /// [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [trim=<0|1>]
-/// [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] <text>` — one complete HUMAN
-/// TURN against the target session: type `<text>`, submit it with a real keypress,
+/// [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] <text>` — one complete human
+/// turn against the target session: type `<text>`, submit it with a real keypress,
 /// block until the app's response settles, and return the settled screen —
 /// `OK <rows> turn submitted=<0|1> status=<settled|timeout|hangup|submitted> seq=<n> id=<n>
 /// dur_ms=<n> hash=<hex16>[ trimmed=<k>]` then `<rows>` text rows (the same rows
-/// `text` prints). `hash` is the FNV-1a of the settled screen (the SAME value
+/// `text` prints). `hash` is the FNV-1a of the settled screen (the same value
 /// `history` reports for this `id`), so a driver can diff two turns' outputs inline
 /// without a second call. `trim=1` drops the settled screen's trailing all-blank
 /// rows exactly as `text trim` does — `<rows>` is then the count sent and
-/// `trimmed=<k>` closes the verdict — while `hash` stays over the UNTRIMMED screen:
+/// `trimmed=<k>` closes the verdict — while `hash` stays over the untrimmed screen:
 /// it names the screen, not the payload, so a trimmed and an untrimmed read of the
 /// same settled screen hash alike and `history` agrees with both.
 ///
-/// WHY A COMPOSITE VERB: driving one turn out of `paste` + `key enter` +
-/// `await idle` from a client is RACY at the submit seam — a TUI line editor
+/// Why a composite verb: driving one turn out of `paste` + `key enter` +
+/// `await idle` from a client is racy at the submit seam — a TUI line editor
 /// that is still ingesting a large paste burst (agent CLIs bracket-paste big
 /// input into a "[Pasted text]" chip) swallows an Enter that arrives during
 /// ingestion, and the client cannot see when ingestion ended. Server-side, the
-/// Observation Kernel can: this verb parks on the SAME model-checked watcher
-/// primitives `await` uses and only presses submit AFTER the echo settled, then
-/// VERIFIES the press landed within `submit_window` (default 2000ms) and re-presses
+/// Observation Kernel can: this verb parks on the same model-checked watcher
+/// primitives `await` uses and only presses submit after the echo settled, then
+/// verifies the press landed within `submit_window` (default 2000ms) and re-presses
 /// up to `presses` times (default 3) before giving up. `presses=1` disables re-press
 /// for a slow/high-latency link where a second Enter could auto-confirm a following
-/// prompt. HOW the press is verified is `submit_verify=`: `block` keys on the OSC-133
-/// command-start (a command block enters Executing) — ambient-repaint-IMMUNE, so a
+/// prompt. How the press is verified is `submit_verify=`: `block` keys on the OSC-133
+/// command-start (a command block enters Executing) — ambient-repaint-immune, so a
 /// periodically-repainting TUI cannot false-verify a swallowed Enter; `seq` keys on a
-/// bare `content_seq` advance. The DEFAULT is AUTO: `block` when the target is at a
-/// shell prompt (a submit will start a command — the sound choice); THE COMPOSER for
+/// bare `content_seq` advance. The default is auto: `block` when the target is at a
+/// shell prompt (a submit will start a command — the sound choice); the composer for
 /// a session read as Claude Code whose framed composer shows the typed text — its
 /// echo waited for as the screen moves, within the echo's cap
 /// ([`composer_key_once_shown`]) — the text leaving the composer (its dim
@@ -3200,13 +2912,13 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 /// ([`composer_after_press`]), which no repaint elsewhere gives (its animated
 /// logo, a ticking row); else `seq` (a full-screen TUI or a session with no shell
 /// integration has no press-attributable signal). So a shell drive and a Claude Code
-/// drive are sound by default. AUTO additionally DEGRADES
+/// drive are sound by default. Auto additionally degrades
 /// honestly: when the window expires with content having moved after the press but
-/// no command block started, the prompt-shaped block AUTO keyed on has proven
-/// STALE (a desynced 133 stream — e.g. a distro integration whose C mark never
-/// lands), so AUTO takes the seq verdict (`submitted=1`) instead of re-pressing —
+/// no command block started, the prompt-shaped block auto keyed on has proven
+/// stale (a desynced 133 stream — e.g. a distro integration whose C mark never
+/// lands), so auto takes the seq verdict (`submitted=1`) instead of re-pressing —
 /// a press whose echo moved the screen was consumed, and another Enter would land
-/// in the running command. Re-press is reserved for a press after which NOTHING
+/// in the running command. Re-press is reserved for a press after which nothing
 /// moved (the true swallowed case) — or, verified by the composer, after which the
 /// text still sits there. Explicit `submit_verify=block` never degrades, and
 /// neither does the composer: a repaint is exactly what it must not take for a
@@ -3218,55 +2930,54 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 /// program is driven. Claude Code, codex, a shell, emacs (`submit=none` types
 /// without submitting; any `key`-verb name may be the submit key) — anything in
 /// a PTY holds a conversation through the exact surface a human uses. For an
-/// ordinary interactive `turn`, a human typing INTO the target mid-turn simply
+/// ordinary interactive `turn`, a human typing into the target mid-turn simply
 /// extends the same content stream: the settle watcher keeps resetting, and the
 /// returned screen contains whatever both parties produced.
 ///
-/// SETTLE (phase 3) defaults to GLOBAL idle — no content change for `idle_ms` —
-/// which assumes the app STOPS painting when done. A periodically-repainting TUI
+/// Settle (phase 3) defaults to global idle — no content change for `idle_ms` —
+/// which assumes the app stops painting when done. A periodically-repainting TUI
 /// (a status-bar clock, a spinner, `watch -n1`) never goes idle, so an idle-settle
 /// turn against it burns the full timeout; pass `settle=match:<re>` to key settle
-/// on a screen PATTERN instead (the same regex/`RowRange` machinery as
-/// `await match`), `settle=gone:<re>` to key it on that pattern LEAVING the
+/// on a screen pattern instead (the same regex/`RowRange` machinery as
+/// `await match`), `settle=gone:<re>` to key it on that pattern leaving the
 /// screen (`await gone` — a busy footer such as Claude Code's `esc to interrupt`
 /// disappearing), or lower `idle=` below the repaint cadence.
 ///
-/// `settle=gone:` is TWO waits, not one, because `await gone` is level-triggered:
+/// `settle=gone:` is two waits, not one, because `await gone` is level-triggered:
 /// arming it on a screen the busy footer has not painted yet would latch at arm
-/// and report `status=settled` over the PRE-response screen — and the verified
+/// and report `status=settled` over the pre-response screen — and the verified
 /// submit can be satisfied by the input line clearing one frame before the footer
 /// lands. So phase 3 first waits (bounded by `submit_window`, the same window the
-/// submit had to move the screen) for `<re>` to APPEAR after the verified submit,
-/// and only then for it to LEAVE. A pattern that never appears inside that window
+/// submit had to move the screen) for `<re>` to appear after the verified submit,
+/// and only then for it to leave. A pattern that never appears inside that window
 /// degrades to the default idle settle: a wrong pattern, or a turn too quick to
 /// show its footer, behaves like a plain `turn` instead of settling instantly on
 /// a screen nothing was read from. A caller who needs certainty follows the turn
 /// with `await gone <re>` while the footer is up.
 ///
 /// `settle=submitted` waits for no settle at all: the turn answers the moment its
-/// submit is VERIFIED, `status=submitted` over the screen as it stands then. For a
+/// submit is verified, `status=submitted` over the screen as it stands then. For a
 /// program whose screen never goes quiet and has no pattern to key on — Claude Code
 /// 2.1.301 animates its header logo's colours every few hundred milliseconds at an
-/// idle prompt, so an idle settle burns the whole timeout (MEASURED on a real login,
-/// 2026-10-15: `submitted=1 status=timeout` after 240 s) — and for a caller with its
+/// idle prompt, so an idle settle burns the whole timeout — and for a caller with its
 /// own wait to follow, as a manager's follow-up into a worker has (`await task`).
 /// Everything the submit does happens as ever (a done worker's task opens again
 /// here). An unverified submit answers `status=timeout` as any turn does; with
 /// `submit=none` there is no submit to answer on, and the pair is the usage line.
 /// The ledger records the turn as `status=pressed`: its Enter landed and no settle
-/// was awaited after it. Into Claude Code AUTO verifies by the composer (above),
+/// was awaited after it. Into Claude Code auto verifies by the composer (above),
 /// which its animation cannot satisfy; at another program's prompt by `seq`, which
 /// a repaint of its own can: `submitted=1` there says the screen moved, not that
 /// the Enter landed.
 ///
-/// A TURN INTO AN AGENT — a session whose published verdict is an agent's word,
+/// A turn into an agent — a session whose published verdict is an agent's word,
 /// not `-` — closes its verdict with `agent_rev=<n>`, the verdict's rev as the
 /// Enter found it: `await agent <words> since=<n>` answers only on a verdict
 /// published after it, so a wait armed the moment a `settle=submitted` turn
 /// answers cannot latch the `idle` from before the submit, which the status
 /// sweep (at most every `AGENT_MIN_INTERVAL`) has not yet republished as busy.
 ///
-/// A WORKER'S TURN — into a session with a task record — closes its verdict with
+/// A worker's turn — into a session with a task record — closes its verdict with
 /// `task_rev=<n>`, the record's rev as the Enter found it: `await task
 /// @<sid>:<n>` waits past it, so the `working` this turn moves a done record to is
 /// no news there and the follow-up's own `done` is, even one marked before the
@@ -3278,42 +2989,41 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 /// chip already sitting in the target's editor); `submit=none` skips the press
 /// (type-only). `ERR exited` if the target dies at any phase.
 ///
-/// THE GUARDED SUBMIT. `submit=guarded:<re>` submits with Enter, and presses it
-/// only while the row holding the CURSOR still matches `<re>` — checked and
-/// written under ONE terminal lock hold, the `key if=` delivery — so a driver
+/// `submit=guarded:<re>` submits with Enter, and presses it
+/// only while the row holding the cursor still matches `<re>` — checked and
+/// written under one terminal lock hold, the `key if=` delivery — so a driver
 /// that typed into a composer does not submit into whatever replaced it (an
 /// approval box that arrived during the paste settle). The cursor row because
 /// that is where a submit lands: a transcript row above the box can match the
-/// composer's pattern too (see [`guarded_submit`]). A miss on the FIRST press
+/// composer's pattern too (see [`guarded_submit`]). A miss on the first press
 /// types the text and submits nothing: `OK 0 turn skipped reason=guard
 /// submitted=0 seq=<n> id=<n>`, zero rows, the verb's Lines framing. A miss on
-/// a RE-press ends the presses and the turn reports the first press by its
+/// a re-press ends the presses and the turn reports the first press by its
 /// verification, as ever. A guarded turn's verdict also carries `pressed=<n>`,
-/// the Enters actually written: `submitted=0 pressed=1` is an Enter that WAS
+/// the Enters actually written: `submitted=0 pressed=1` is an Enter that was
 /// written and not verified — not "no Enter", and not a turn to retry blindly.
 ///
-/// THE EVEN HAND (RAINBOW-KITTY-V2.md §28). A plain turn is a PASTE: one
+/// The even hand (`RAINBOW-KITTY-V2.md` §28): a plain turn is a paste (one
 /// event, no keystroke behind any cell, so it lays no ribbon, earns no
-/// stardust and steps no melody — every light has a keystroke behind it, and
-/// a paste is not one. `typed=1` presses `<text>` one `InputEvent::Key` per
-/// grapheme through the SAME route a keyboard's presses take, at `cadence=<ms>`
+/// stardust and steps no melody). `typed=1` presses `<text>` one `InputEvent::Key` per
+/// grapheme through the same route a keyboard's presses take, at `cadence=<ms>`
 /// (default [`TYPED_CADENCE_MS`]), from an absolute schedule so the interval
 /// never drifts: an agent's typed turn lays real ribbon and earns real
-/// stardust, and its only signature is TIME — a jitter-free cadence no hand
+/// stardust, and its only signature is time — a jitter-free cadence no hand
 /// produces. The seam is told nothing else ([`typed_key_events`] builds the
 /// tuple a keyboard builds; `input.rs`'s indistinguishability invariant is
 /// untouched). The typed prefix is capped at [`TYPED_CAP`] graphemes (`cap=<n>`,
-/// up to [`TYPED_CAP_MAX`], raises it) and the remainder is ONE paste, voiced as
-/// one up-strum by the paste seam. A typed text is never submitted in part
-/// (review of 2026-09-30, findings 12 and 15): a head whose schedule would
-/// end past the deadline is not begun, one the deadline overtakes stops
-/// there, and a FENCED one (`if-gen=`/`if-rows=`) stops at a person's key or
-/// a screen switch counted between its keys, and an `if-rows=` one at the
-/// cursor leaving the frame those rows are ([`TypingHold`]) — each pressing
-/// nothing more, Enter included, and answering `OK 0 turn skipped
-/// reason=<deadline|person|changed> typed=<k> pasted=<p> submitted=0
-/// seq=<n> id=<n>`, the keys already typed left where they landed.
-/// `yield=<floor>` parks BEFORE typing until the target's typing momentum has
+/// up to [`TYPED_CAP_MAX`], raises it) and the remainder is one paste, voiced as
+/// one up-strum by the paste seam. A typed text is never submitted in part:
+/// a head whose schedule would end past the deadline is not begun, one the
+/// deadline overtakes stops there, and a fenced one (`if-gen=`/`if-rows=`)
+/// stops at a person's key or a screen switch counted between its keys, and an
+/// `if-rows=` one at the cursor leaving the frame those rows are
+/// ([`TypingHold`]) — each pressing nothing more, Enter included, and
+/// answering `OK 0 turn skipped reason=<deadline|person|changed> typed=<k>
+/// pasted=<p> submitted=0 seq=<n> id=<n>`, the keys already typed left where
+/// they landed.
+/// `yield=<floor>` parks before typing until the target's typing momentum has
 /// exhaled to `floor` ([`park_until_momentum_below`]: analytic, one timer per
 /// reading, no polling); the human's own typing is never blocked — the agent
 /// yields, the human never waits. A yield that outlives the deadline answers
@@ -3321,12 +3031,12 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 /// `typed=<keys> pasted=<graphemes>` for a typed turn and `yielded_ms=<n>`
 /// for a yielded one; a plain turn's reply is byte-identical to before.
 ///
-/// THE HOLDS, AT EVERY WRITE. A hold set while the turn runs (`hold`, the
-/// person's Take Over) is asked again before each key, paste and Enter: one
-/// that stands before any byte landed answers the dispatch's own `ERR
-/// halted`, and one after stops the turn there, pressing nothing more,
-/// Enter included — `OK 0 turn skipped reason=halted submitted=0 seq=<n>
-/// id=<n>`, a typed turn's with `typed=<k> pasted=<p>`.
+/// A hold set while the turn runs (`hold`, the person's Take Over) is asked
+/// again before each key, paste and Enter: one that stands before any byte
+/// landed answers the dispatch's own `ERR halted`, and one after stops the
+/// turn there, pressing nothing more, Enter included — `OK 0 turn skipped
+/// reason=halted submitted=0 seq=<n> id=<n>`, a typed turn's with `typed=<k>
+/// pasted=<p>`.
 pub(crate) fn cmd_turn(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -3387,20 +3097,14 @@ pub(crate) fn cmd_turn(
         ..
     } = o;
 
-    // ── turn LEASE: one driver per session at a time. Acquire-or-busy under the
-    // lock (the dispatch-level check is the fast fail; THIS is authoritative), and
-    // release on EVERY exit via the drop guard — including timeouts, exits, usage
-    // errors and watcher-budget failures below.
+    // ── turn lease: one driver per session. Acquire-or-busy here is authoritative (the
+    // dispatch's check is the fast fail); the drop guard releases it on every exit.
     let (turn_id, handed_back) = {
         let mut lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
         let now = crate::metrics::now_us();
-        // A LIVE lease of either kind blocks a new turn: a `turn` lease is the usual
-        // busy case; a `Drive` lease (unexpired) refuses too, so a driver's hold is
-        // not stomped mid-drive — unless it is THIS connection's own: the holder
-        // types its turn under it, and gets it back when the turn is over (the
-        // live upgrade's relaunch line, under the restart's hold). An EXPIRED
-        // `Drive` lease is free — the turn takes over (and its guard clears the
-        // slot on exit).
+        // A live lease of either kind refuses a new turn, unless it is this connection's own
+        // drive lease: the holder types its turn under it and gets it back after (the live
+        // upgrade's relaunch line, under the restart's hold). An expired drive lease is free.
         let own = lease
             .as_ref()
             .filter(|h| h.held_over(now, super::serving_connection()))
@@ -3413,15 +3117,11 @@ pub(crate) fn cmd_turn(
                 crate::Lease::Drive { holder, .. } => format!("ERR busy lease={holder}\n"),
             };
         }
-        // The ledger owes this id a record from here (or its abandonment, by
-        // the guard below): a handoff that exports the ledger meanwhile does
-        // not vouch for it (`TurnLedger::carry_floor`). MINTED under the
-        // ledger's own lock, the one `handoff_carry::export` takes (it never
-        // takes the lease lock): an export either sees the id open, or ran
-        // before it was minted. The latter is a turn begun after the export,
-        // a stated residual: it records only in this process, and the
-        // successor's ledger does not know it was lost (round seven, finding
-        // 23; the parked readers make a turn in that window rare).
+        // The ledger owes this id a record from here (or its abandonment, by the guard): a
+        // handoff exporting the ledger meanwhile does not vouch for it
+        // (`TurnLedger::carry_floor`). Minted under the ledger's lock, the one
+        // `handoff_carry::export` takes, so an export either sees the id open or ran before it;
+        // a turn begun after the export records only in this process.
         let id = {
             let mut turns = ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
             let id = mint_turn_id();
@@ -3445,17 +3145,14 @@ pub(crate) fn cmd_turn(
     // the drive lease this connection types under is the harness's hand.
     let by = typed_by(&io.by, handed_back.as_ref());
     struct LeaseGuard<'a> {
-        /// `ctx.turn_lease` — a NAMED field (not a tuple `.0`) so the
-        /// lock-order census (OB-7) resolves this Drop-path acquisition to the
-        /// same `turn_lease` identity as the acquire above.
+        /// `ctx.turn_lease`, a named field so the lock-order census resolves this Drop-path
+        /// acquisition to the same `turn_lease` identity as the acquire above.
         turn_lease: &'a std::sync::Mutex<Option<crate::Lease>>,
         /// `ctx.turns`, NAMED for the census like `turn_lease`: the ledger
         /// this turn's id was opened in.
         turns: &'a std::sync::Mutex<crate::turn_ledger::TurnLedger>,
-        /// This turn's own id. The guard clears the slot ONLY if it still holds THIS
-        /// turn's lease — so a `lease release force` preemption of a WEDGED turn
-        /// (whose driver crashed) followed by a fresh turn acquiring the slot is not
-        /// stomped when this turn finally returns and its guard drops.
+        /// This turn's id: the guard clears the slot only while it still holds this turn's
+        /// lease, so a fresh turn after a `lease release force` preemption is not stomped.
         id: u64,
         /// The session's fabric id, for the presence wake the release posts.
         sid: &'a aterm_session::SessionId,
@@ -3468,10 +3165,8 @@ pub(crate) fn cmd_turn(
     }
     impl Drop for LeaseGuard<'_> {
         fn drop(&mut self) {
-            // A turn that ends without its record owes none any more (a
-            // no-op once `TurnLedger::record` took it). Before the lease, so
-            // the order is the acquire's: never the ledger under the lease
-            // here — a leaf lock, released at once.
+            // A turn that ends without its record owes none any more (a no-op once
+            // `TurnLedger::record` took it). Taken and released before the lease, never under it.
             self.turns
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -3505,7 +3200,7 @@ pub(crate) fn cmd_turn(
         crate::presence::post_lease_changed(driver);
     }
 
-    // ATTRIBUTION BEFORE DELIVERY: the turn this exchange opens carries `by=` (the
+    // Attribution before delivery: the turn this exchange opens carries `by=` (the
     // connection's, `TurnIo::actor`) and `ledger=<id>`; a turn at rest closes. Noted when
     // the exchange's input is handed to the seam — its first key or paste,
     // after the yield and the `if-gen=`/`if-rows=` check, and again at each
@@ -3529,14 +3224,12 @@ pub(crate) fn cmd_turn(
     let now0 = Instant::now();
     let started_ms = crate::turn_ledger::now_ms();
     let deadline = now0 + Duration::from_millis(timeout_ms);
-    // The alt-screen archive's mark as the turn STARTS — before the yield, before
-    // a byte is typed — so `offscreen since=<arch>` reads everything a fullscreen
-    // app scrolled off its top from here on, the echo of this turn's own text
-    // included. Recorded in the ledger below and printed by `history`.
+    // The alt-screen archive's mark as the turn starts, before the yield and the first byte, so
+    // `offscreen since=<arch>` reads everything a fullscreen app scrolls off its top from here,
+    // this turn's own echo included. Recorded in the ledger and printed by `history`.
     let arch = crate::turn_ledger::ArchMark::of(&term_lock(term));
 
-    // Exit detection, identical to `await` (including the deregistration race:
-    // "was registered, now gone" is exited).
+    // Exit detection as in `await` ([`exit_probe`]).
     let exited = exit_probe(store, session);
 
     // One subscriber for the whole turn: output/exit notifies wake every phase.
@@ -3549,7 +3242,7 @@ pub(crate) fn cmd_turn(
     // which a hangup must not cut short (see [`OnHangup::Finish`]).
     let exited_now = || exited(store);
     // Both hold their clocks while the session's reader is parked for an
-    // update, stretched never past the turn's own deadline (findings 62/63).
+    // update, stretched never past the turn's own deadline.
     let stretch = Stretch::Window {
         parked: ctx.update_parked.as_ref(),
         bound: deadline,
@@ -3568,10 +3261,8 @@ pub(crate) fn cmd_turn(
         term_lock(term).watch(spec, Instant::now())
     };
 
-    // ── phase 0: yield. Park until the human's ribbon has exhaled to the
-    // floor — analytic, one timer per reading, no polling — BEFORE any input.
-    // Nothing is typed on a timeout: an agent that could not get its turn
-    // says so rather than typing over a hand mid-sentence.
+    // ── phase 0: yield until the person's ribbon has exhaled to the floor, before any input.
+    // Nothing is typed on a timeout.
     let mut yielded_ms: Option<u64> = None;
     if let Some(floor) = yield_floor {
         let yield0 = Instant::now();
@@ -3583,35 +3274,21 @@ pub(crate) fn cmd_turn(
             MomentumWait::HungUp => return crate::control::HUNG_UP_REPLY.to_string(),
             MomentumWait::Unreadable(e) => return format!("ERR yield: {e}\n"),
         }
-        // The dispatch asked the unread-input gate when this turn ARRIVED; the
-        // yield (τ = 2 s) can outlast the moment the watch publishes the
-        // program as stalled, so a turn let in then is refused now. Asked
-        // again before the first byte (2026-09-24, S4 review); a slow read is
-        // only a warning, and the dispatch's warning is the one the verdict
-        // carries.
+        // The dispatch asked the unread-input gate when this turn arrived; the yield can
+        // outlast the moment the program is published as stalled, so ask again before the
+        // first byte (a slow read is only a warning, and the dispatch's is the one reported).
         if let Some(refusal) = crate::input_stall::refusal(ctx, "turn", "", false) {
             return refusal;
         }
     }
 
-    // ── the precondition: `if-gen=`. The caller read the screen, judged it
-    // (an empty composer, no box) and asked to type into THAT screen; any
-    // output since — a person's keystroke echoed, a box drawn, a repaint —
-    // moved the generation, and nothing is typed: the caller reads again.
-    // Checked AFTER the yield (a person typing during the park moves it too)
-    // and under the terminal lock, immediately before the paste is handed to
-    // the input seam. The seam's own write is not under that hold (it cannot
-    // be: the seam routes through the event loop or the source-blind sink),
-    // so what is left is the seam's hand-off — not the caller's whole
-    // read-judge-type round trip, which is what the fence closes. ──
-    //
-    // `if-rows=` is the same check over the rows it names only (the owner's
-    // ruling of 2026-09-29, design record C7b): a screen that repaints
-    // itself — a spinner, a ticking timer — moved `if-gen=` at every look
-    // and a notice was never typed; the rows the text lands in are what
-    // matter. Both, when given, are read under ONE lock hold — and so is
-    // what a typed turn is then held to between its keys ([`TypingHold`]),
-    // the frame `if-rows=` names included.
+    // ── the precondition: `if-gen=`. The caller judged a screen and asked to type into it;
+    // any output since (an echoed keystroke, a box, a repaint) moved the generation, and
+    // nothing is typed. Checked after the yield (a person typing during it moves it too), under
+    // the terminal lock, just before the paste goes to the seam: only the seam's hand-off stays
+    // open. `if-rows=` is the same check over the named rows only, so a spinner or timer
+    // elsewhere does not block every notice. Both, and the [`TypingHold`] a typed turn is held
+    // to, are read under one lock hold. ──
     let mut hold: Option<TypingHold> = None;
     if if_gen.is_some() || if_rows.is_some() {
         // The rows are the session's published text, looked at before the lock.
@@ -3631,7 +3308,7 @@ pub(crate) fn cmd_turn(
         hold = typed.then(|| TypingHold::of(&terminal, ctx, if_rows));
     }
 
-    // THE HOLDS, ASKED AGAIN AT EVERY WRITE. The dispatch asked them once,
+    // The holds, asked again at every write. The dispatch asked them once,
     // as the turn arrived ([`crate::fabric::halt_refusal`]); a turn then
     // types for as long as its budget lets it, so a hold set since — the
     // person's Take Over above all, which takes the tab from a remote node
@@ -3654,18 +3331,15 @@ pub(crate) fn cmd_turn(
     };
 
     // ── phase 1: type. Paste semantics by default; the seam strips control
-    // bytes. `typed=1`: one key per grapheme on an ABSOLUTE schedule (`t0 +
+    // bytes. `typed=1`: one key per grapheme on an absolute schedule (`t0 +
     // i·cadence`, so the interval never drifts) up to the cap, then the
     // remainder as one paste. ──
     let mut typed_keys = 0usize;
     let mut pasted_graphemes = 0usize;
     let cadence = Duration::from_millis(cadence_ms);
-    // From the first byte that lands to the verified submit the turn is
-    // committed: a caller that hangs up then does not stop the rest of its
-    // keys or its Enter at the main-thread gate (round eight of the update
-    // audit, U51), as it does not end the parks between them
-    // ([`OnHangup::Finish`]). Before the first byte nothing is half-applied,
-    // and a gone caller's first hop is refused as any other is.
+    // From the first byte that lands to the verified submit the turn is committed: a caller
+    // that hangs up then stops neither its remaining keys nor its Enter at the main-thread
+    // gate, as it ends none of the parks between them ([`OnHangup::Finish`]).
     let mut committed: Option<crate::control::CommittedInput> = None;
     // Where the echo's cap ends: the composer verify waits no later for a
     // Claude Code composer to show the text (phase 2).
@@ -3676,10 +3350,8 @@ pub(crate) fn cmd_turn(
             let (head, remainder) = split_typed_cap(text, typed_cap);
             let keys = typed_key_events(head);
             let mut type0 = Instant::now();
-            // ALL OR NOTHING AGAINST THE DEADLINE (review of 2026-09-30,
-            // finding 15): a head whose schedule ends past the deadline is
-            // not begun — a yield that spent the budget types nothing, as a
-            // yield timeout does.
+            // All or nothing against the deadline: a head whose schedule ends past it is not
+            // begun.
             let last_due =
                 type0 + cadence * u32::try_from(keys.len().saturating_sub(1)).unwrap_or(u32::MAX);
             if !keys.is_empty() && last_due >= deadline {
@@ -3694,10 +3366,8 @@ pub(crate) fn cmd_turn(
                 if due > now {
                     std::thread::sleep(due - now);
                 }
-                // The deadline bounds the typing too: a turn does not keep
-                // pressing keys into a session after its own budget is spent
-                // — and a text cut short there is never submitted: its Enter
-                // would send the part typed as the whole.
+                // The deadline bounds the typing too, and a text cut short there is never
+                // submitted: its Enter would send the part as the whole.
                 if Instant::now() >= deadline {
                     return typed_cut(term, "deadline", typed_keys, 0, turn_id);
                 }
@@ -3731,7 +3401,7 @@ pub(crate) fn cmd_turn(
                 if !(io.key)(ev) {
                     return "ERR key delivery failed\n".to_string();
                 }
-                // A key that waited ANCHORS THE SCHEDULE ON ITSELF, as it went
+                // A key that waited anchors the schedule on itself, as it went
                 // out: the next is one cadence after it, never a burst catching
                 // up on the time spent (a torn frame has been held ~280 ms, 140
                 // keys at `cadence=2`), nor on a stall between the hold's
@@ -3771,8 +3441,8 @@ pub(crate) fn cmd_turn(
             }
             committed = Some(crate::control::CommittedInput::enter());
         }
-        // Echo settle: the editor ingested + painted the burst. Cap the phase so
-        // an app that is ALREADY animating (mid-turn spinner) cannot stall us.
+        // Echo settle: the editor ingested and painted the burst, capped so an app already
+        // animating cannot stall the turn.
         let Some(id) = arm(WatcherSpec::IdleFor { dur: ECHO_SETTLE }) else {
             return format!("ERR {WAITS_FULL}\n");
         };
@@ -3795,10 +3465,8 @@ pub(crate) fn cmd_turn(
         }
     }
 
-    // ── phase 2: verified submit. Press; content_seq MUST advance within the
-    // submit window, else the press was swallowed mid-ingestion — press again.
-    // `submitted` reports "a press VERIFIABLY landed": with `submit=none` there
-    // is no press, so it stays 0 (honest) while the settle phase still runs.
+    // ── phase 2: verified submit. `submitted` means a press verifiably landed; with
+    // `submit=none` there is no press, so it stays 0 while the settle still runs.
     let mut submitted = false;
     // Enters the guarded submit actually wrote (`pressed=` on its verdict).
     let mut guarded_presses = 0u32;
@@ -3819,14 +3487,10 @@ pub(crate) fn cmd_turn(
         (agent.word != "-").then_some(agent.rev)
     };
     if submit != "none" {
-        // EFFECTIVE verification mode. Explicit `submit_verify=` wins; otherwise AUTO:
-        // `block` when the target is at a shell prompt (a submit will start a command,
-        // so the OSC-133 signal exists and is ambient-repaint-immune), else `seq`.
-        // AUTO retains the right to DEGRADE below: a prompt-shaped block may be a
-        // STALE one from a desynced 133 stream (a distro-side integration whose C
-        // mark never lands — stock Ubuntu bash sources vte.sh twice and its PS0
-        // 133;C is clobbered), where block verification can never succeed even
-        // though every press lands. Explicit `block` stays strict.
+        // Explicit `submit_verify=` wins; auto picks `block` at a shell prompt, else `seq`, and
+        // may degrade below: a prompt-shaped block can be stale under a desynced 133 stream (an
+        // integration whose 133;C never lands, such as stock Ubuntu bash sourcing vte.sh
+        // twice), where block verification never succeeds though every press lands.
         let auto_mode = submit_verify.is_none();
         let submit_verify_block = submit_verify.unwrap_or_else(|| {
             matches!(
@@ -3843,9 +3507,9 @@ pub(crate) fn cmd_turn(
         // repaint never touches it. (The C, not a new block id: a new id
         // appears only at the NEXT prompt — too late to verify the submit.)
         //
-        // THE COMPOSER VERIFY: where AUTO keys on `seq` for an identified
+        // The composer verify: where auto keys on `seq` for an identified
         // Claude Code session whose framed composer shows the typed text, the
-        // submit is verified by that text LEAVING the composer instead — a
+        // submit is verified by that text leaving the composer instead — a
         // signal no repaint gives: Claude Code 2.1.301 animates its logo at an
         // idle prompt, so a content advance is no proof the Enter landed
         // ([`composer_after_press`]). An echo still to come is waited for as
@@ -3879,18 +3543,16 @@ pub(crate) fn cmd_turn(
             None
         };
         for press_no in 0..presses {
-            // A re-press is for an Enter the program READ and swallowed; one
-            // still unread in its queue would only stack another behind it
-            // (2026-09-24, `input_stall::repress_would_queue`).
+            // A re-press is for an Enter the program read and swallowed; one still unread would
+            // only queue another behind it (`input_stall::repress_would_queue`).
             if press_no > 0 && crate::input_stall::repress_would_queue(&ctx.sink) {
                 break;
             }
-            // NEVER A RE-PRESS INTO A PARKED SESSION (round seven of the update
-            // audit, finding 63): its echo cannot be seen until the reader
-            // runs again, so a window without one says nothing about the press
-            // — and a second Enter can confirm whatever the program shows next
-            // (a permission box's default). The window only closes parked at
-            // the turn's own deadline; the press is judged as unverified.
+            // Never a re-press into a parked session: its echo cannot be seen until the reader
+            // runs again, so a window without one says nothing about the press — and a second
+            // Enter can confirm whatever the program shows next (a permission box's default).
+            // The window only closes parked at the turn's own deadline; the press is judged as
+            // unverified.
             if press_no > 0 && ctx.update_parked.is_parked() {
                 break;
             }
@@ -3924,7 +3586,7 @@ pub(crate) fn cmd_turn(
             // attributed from here (the session log, above).
             note_ctl_input();
             if let Some(guard) = submit_matcher.as_deref() {
-                // THE GUARDED SUBMIT: Enter only while `<re>` still matches,
+                // The guarded submit: Enter only while `<re>` still matches,
                 // decided and written under one terminal lock hold, on the
                 // control thread against this target's own `(term, sink)` —
                 // the `key if=` arm's delivery, whichever route typed the text.
@@ -3942,9 +3604,8 @@ pub(crate) fn cmd_turn(
                                  id={turn_id}\n"
                             );
                         }
-                        // A RE-press whose guard no longer matches: the screen
-                        // moved on, so the first press is judged by the
-                        // verification below, never by a second Enter.
+                        // A re-press whose guard no longer matches: the screen moved on, so
+                        // the first press is judged by the verification below.
                         break;
                     }
                     GuardedSubmit::Failed(reply) => {
@@ -3956,12 +3617,9 @@ pub(crate) fn cmd_turn(
                 term_lock(term).watch_disarm(id);
                 return USAGE.to_string();
             }
-            // `seq`: the first content advance verifies. `block`: only a NEW command
-            // block does — re-arm past ambient repaints until the window expires, so a
-            // periodically-repainting TUI cannot false-verify a swallowed Enter.
-            // `advanced` records whether THIS press's window saw ANY content advance:
-            // it separates a swallowed press (nothing moved — press again) from a
-            // press the app consumed without starting a command block.
+            // `seq`: the first content advance verifies. `block`: only a new command start does,
+            // re-armed past ambient repaints until the window closes. `advanced` separates a
+            // swallowed press (nothing moved) from one consumed without starting a command.
             let mut advanced = false;
             // The composer verify's last read: the composer gone from the
             // screen (a box or a menu took its place) rather than still
@@ -4103,7 +3761,7 @@ pub(crate) fn cmd_turn(
     // hold: its holder types on after it. A turn whose submit did not land
     // skips its settle below and releases the lease at once: ending its input
     // first would post a wake that could raise the row only for the release's
-    // wake to fold it a moment later (review of 2026-09-28) — the N → N-1 → N
+    // wake to fold it a moment later — the N → N-1 → N
     // re-grid a program on the alternate screen can miss. It keeps the hold
     // to its release, and the row, if anything else wants it, comes then.
     if lease_guard.handed_back.is_none() && (submitted || submit == "none") {
@@ -4124,22 +3782,12 @@ pub(crate) fn cmd_turn(
         status = "submitted";
     } else if submitted || submit == "none" {
         'settle: {
-            // Default settle = GLOBAL idle: no content change for `idle_ms`, which
-            // assumes the app stops painting when done. `settle=match:<re>` keys on a
-            // screen PATTERN instead — for a periodically-repainting TUI (clock,
-            // spinner, `watch`) that never goes idle and would otherwise burn the
-            // whole timeout — and `settle=gone:<re>` on that pattern LEAVING (a busy
-            // footer that is the only honest "turn over" signal).
             let armed = match &settle_matcher {
                 Some((true, m)) => {
-                    // `gone` is level-triggered, so it must not be armed before the
-                    // busy pattern is ON the screen: the verified submit can be the
-                    // input line clearing, with the footer landing a frame later, and
-                    // a `gone` armed in that gap latches at arm over the pre-response
-                    // screen. Phase 3a: wait (bounded by `submit_window`) for the
-                    // pattern to APPEAR; phase 3b: for it to LEAVE. Never seen inside
-                    // the window => the default idle settle, the honest degrade for a
-                    // wrong pattern or a turn too quick to paint its footer.
+                    // `gone` is level-triggered: armed before the footer paints (the verified
+                    // submit can be the input line clearing a frame early) it would latch over
+                    // the pre-response screen. So 3a waits for the pattern to appear and 3b for
+                    // it to leave; never seen within `submit_window`, the idle settle.
                     let Some(seen) = term_lock(term).watch_rows(
                         m.clone(),
                         aterm_core::terminal::RowRange::All,
@@ -4191,7 +3839,7 @@ pub(crate) fn cmd_turn(
     let mut look = ctx.frame.look_frame();
     let (seq, screen) = {
         let t = term_lock(term);
-        // ONE CONSTRUCTION, shared with `status`'s stamp: the session's published
+        // One construction, shared with `status`'s stamp: the session's published
         // text ([`crate::frame_memo::ScreenText`]), built here only when no reader
         // built this screen's already.
         (t.content_seq(), look.text(&t))
@@ -4199,12 +3847,12 @@ pub(crate) fn cmd_turn(
     // Published now, for the reads of this settled screen that follow.
     drop(look);
     let rows = screen.row_count();
-    // Record this exchange in the session TURN LEDGER — read back by `turns`,
+    // Record this exchange in the session turn ledger — read back by `turns`,
     // streamed by the `subscribe … events` digest. Drop-oldest + bounded; the
     // ledger lock is disjoint from the terminal lock (released just above).
-    // Computed ONCE and shared by the ledger record AND the verdict line below, so
+    // Computed once and shared by the ledger record and the verdict line below, so
     // the inline `dur_ms=`/`hash=` an AI diffs by (the catalog + INTROSPECTION.md
-    // promise them) are the SAME values `history` later reports for this id.
+    // promise them) are the same values `history` later reports for this id.
     let dur_ms = now0.elapsed().as_millis() as u64;
     let screen_hash = screen.fnv();
     // `record` keeps the ids rising in landing order: a turn a `lease release
@@ -4237,8 +3885,8 @@ pub(crate) fn cmd_turn(
     };
     // `trim=1` drops the settled screen's trailing blank rows and closes the verdict
     // with `trimmed=<k>` — the same rule and framing as `text trim`, through the one
-    // shared framer. `screen_hash` above was taken over the UNTRIMMED screen on
-    // purpose: it is the settled screen's IDENTITY — the value `history` reports for
+    // shared framer. `screen_hash` above was taken over the untrimmed screen on
+    // purpose: it is the settled screen's identity — the value `history` reports for
     // this id and the one a driver diffs across turns — not a checksum of the bytes
     // sent, so the same settled screen hashes the same whether or not the caller
     // asked for its blank tail.
@@ -4246,8 +3894,7 @@ pub(crate) fn cmd_turn(
         "turn submitted={} status={status} seq={seq} id={turn_id} dur_ms={dur_ms} hash={screen_hash:016x}",
         u8::from(submitted)
     );
-    // The even hand's fields ride only the turns that asked for them, so a
-    // plain turn's verdict is byte-identical to before.
+    // The even hand's fields ride only the turns that asked for them.
     if typed {
         use std::fmt::Write as _;
         let _ = write!(verdict, " typed={typed_keys} pasted={pasted_graphemes}");
@@ -4283,7 +3930,7 @@ pub(crate) fn cmd_turn(
 /// (a draft that wraps is cut at the composer's width, and each of its rows
 /// is read trimmed): the caret row between the composer's two rules down to
 /// its bottom rule ([`aterm_phase::phase::composer_rules`],
-/// [`aterm_phase::phase::composer_draft`]). Its DIM PLACEHOLDER is no words —
+/// [`aterm_phase::phase::composer_draft`]). Its dim placeholder is no words —
 /// a suggestion (`Try "…"`), `Press up to edit queued messages` — which keeps
 /// the cursor at column 2 of the caret row, where typing pushes it right
 /// ([`aterm_phase::phase::is_placeholder`]): a key of a few letters is no
@@ -4351,7 +3998,7 @@ enum ComposerKey {
     No,
 }
 
-/// THE COMPOSER VERIFY'S KEY in `t`, the screen of a session read as Claude
+/// The composer verify's key in `t`, the screen of a session read as Claude
 /// Code ([`read_as_claude`]), for the typed `text` ([`ComposerKey`]).
 fn composer_verify_key(t: &Terminal, text: &str) -> ComposerKey {
     let key: String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -4369,7 +4016,7 @@ fn composer_verify_key(t: &Terminal, text: &str) -> ComposerKey {
     }
 }
 
-/// THE COMPOSER VERIFY'S KEY, ITS ECHO WAITED FOR: `look()` reads the
+/// The composer verify's key, its echo waited for: `look()` reads the
 /// screen of a session read as Claude Code once — what
 /// [`composer_verify_key`] makes of it, and the content seq it stood at,
 /// under one lock — and `wait(after)` parks until the screen moves past
@@ -4428,7 +4075,7 @@ fn composer_after_press(t: &Terminal, key: &str) -> ComposerAfterPress {
     }
 }
 
-/// `history [<n>] [since=<id>]` -> the session's TURN LEDGER, newest-last, framed
+/// `history [<n>] [since=<id>]` -> the session's turn ledger, newest-last, framed
 /// `OK <count>\n` + one line per record (streaming like `text`). `<n>` keeps the
 /// last n (default: all retained); `since=<id>` keeps records with id strictly
 /// greater than `<id>` (poll the ledger forward). Each record: `turn <id>
@@ -4459,8 +4106,8 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
         Ok(page) => page,
         Err(usage) => return usage,
     };
-    // A LEDGER A HANDOFF COULD NOT CARRY WHOLE says so (round seven, finding
-    // 58): records under ids below its floor may be gone, not absent, so an
+    // A ledger a handoff could not carry whole says so:
+    // records under ids below its floor may be gone, not absent, so an
     // empty or short reply is not "no turn landed". Only when the floor is
     // above the anchor — a `since=` past it lost nothing — and after the
     // count, where every reader of the header already allows fields. Only
@@ -4569,10 +4216,10 @@ impl RingPage {
     }
 }
 
-/// `meta` — the SESSION-METADATA verb (stage 1). Three forms:
+/// `meta` — the session-metadata verb. Three forms:
 ///
-/// * bare `meta` (Read): one status line joining the ENGINE identity (live OSC
-///   title, reported cwd, lifecycle state) with the USER identity (`meta set`
+/// * bare `meta` (Read): one status line joining the engine identity (live OSC
+///   title, reported cwd, lifecycle state) with the user identity (`meta set`
 ///   fields) — `OK title=<pct> user_title=<pct|-> description=<pct|-> icon=<pct|->
 ///   role=<pct|-> attention=<pct|-> cwd=<pct|-> state=<s>`, then the additive
 ///   tail `attention_owner= attention_owners= attention_kinds= supervisor=
@@ -4580,8 +4227,8 @@ impl RingPage {
 ///   autopilot_since=` (`land_at=`: the instant a timed Cruise lands, unix
 ///   seconds, `-` while none; `autopilot_by=`/`autopilot_since=`: who set the
 ///   pair and when, [`autopilot_by_fields`]). Every free-text value is pct-encoded so the reply is always
-///   ONE line; `-` marks an unset optional. Readers find a field BY KEY.
-///   `autopilot=` is printed on EVERY bare `meta`, set or `-`: the supervisor's
+///   one line; `-` marks an unset optional. Readers find a field by key.
+///   `autopilot=` is printed on every bare `meta`, set or `-`: the supervisor's
 ///   loop reads the session's word only off a reply that names the field
 ///   (`aterm_agent::supervise`'s `AutopilotWord`), so a host that kept the word
 ///   and printed it only when set would read as an older build's.
@@ -4592,12 +4239,12 @@ impl RingPage {
 ///   silent truncation (the caller must know its label was refused). C0/C1,
 ///   line separators, bidi controls, and spoof-relevant invisible format
 ///   characters are rejected rather than silently stored. The user title
-///   OUTRANKS the OSC title in tab labels; a role is a label the menus and
+///   outranks the OSC title in tab labels; a role is a label the menus and
 ///   the pill name the session by first, and no value elects anything; an
 ///   `attention` entry that asks is the typed needs-human escalation the
 ///   menu-bar status item badges and lists, and a `kind=wait` entry a
 ///   record it does not badge (`crate::needs::of` reads which). `questions` is a
-///   CLOSED set, not text: `ask|recommended|long-term|short-term` (case
+///   closed set, not text: `ask|recommended|long-term|short-term` (case
 ///   folded, stored lowercase) — how the in-window supervisor treats this
 ///   session's Claude Code question dialog, over `[harness] answer_questions`
 ///   and `question_priority` (`ask` hands it to a person, `recommended`
@@ -4606,7 +4253,7 @@ impl RingPage {
 ///   usage: meta set questions …`
 ///   ([`questions_usage`]). Writing it is Owner-only
 ///   ([`meta_questions_denied`], answered before this handler). `autopilot` is
-///   the other CLOSED set: `cruise|land|off` (the owner's words `forever`,
+///   the other closed set: `cruise|land|off` (the owner's words `forever`,
 ///   `infinity`, `wrap-up`, `wrapup` and `wrap` admitted, case folded, stored
 ///   as the mode's word) — how far the window's harness carries this session's
 ///   work, over `[harness] autopilot` (`cruise` keeps it moving, `land` wraps
@@ -4620,11 +4267,11 @@ impl RingPage {
 ///   `meta unset autopilot` to `[harness] autopilot`).
 ///
 /// Returns `(reply, changed)`: `changed` is `true` only when a stored value
-/// ACTUALLY moved — for `attention`, any entry moving, one under a newer
+/// actually moved — for `attention`, any entry moving, one under a newer
 /// entry included — and the dispatch arm keys its side-effects (tab-strip
 /// repaint wake, the need's republish) on it, so a no-op re-set stays
-/// silent. The `meta-change` timeline record happens HERE, and only when the
-/// EFFECTIVE value moves ([`crate::session_timeline::apply_meta_value`]):
+/// silent. The `meta-change` timeline record happens here, and only when the
+/// effective value moves ([`crate::session_timeline::apply_meta_value`]):
 /// `timeline` and the `events` digest see exactly one event per change a
 /// reader of the field can see, and none for an entry moving under a newer
 /// one. The record wakes the session's watchers.
@@ -4642,7 +4289,7 @@ pub(crate) fn cmd_meta(
 }
 
 /// [`cmd_meta`], each write's session log mark by `by` (the wire's
-/// [`log_actor`]; session log phase 3B).
+/// [`log_actor`]).
 pub(crate) fn cmd_meta_by(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -4661,20 +4308,18 @@ pub(crate) fn cmd_meta_by(
             let Some(typed) = MetaField::parse(field) else {
                 return (meta_unknown_field(), false);
             };
-            // The VALUE is the raw remainder after the field token (single-space
-            // grammar like `turn`) — token iteration would collapse interior
-            // whitespace the caller meant to keep. This is WIRE GRAMMAR and stops
-            // here: everything below is the shared policy ladder, which a GUI
-            // caller (already holding a discrete value) enters directly.
+            // The value is the raw remainder after the field token (single-space grammar like
+            // `turn`): token iteration would collapse interior whitespace. The wire grammar
+            // stops here; below is the shared policy ladder a GUI caller enters directly.
             let value = rest
                 .split_once("set")
                 .and_then(|(_, r)| r.trim_start().split_once(char::is_whitespace))
                 .map_or("", |(_, v)| v);
-            // KEYED ATTENTION: `meta set attention owner=<k> [kind=<ask|wait>]
+            // Keyed attention: `meta set attention owner=<k> [kind=<ask|wait>]
             // <text>` writes only owner `<k>`'s entry, of that kind. The owner
-            // LEADS, like every option on this wire, so a bare text that merely
+            // leads, like every option on this wire, so a bare text that merely
             // contains `owner=` stays text; `kind=` comes only after it.
-            // A TIMED CRUISE (§9.3.5): `cruise until=<when>` writes the word
+            // A timed Cruise (§9.3.5): `cruise until=<when>` writes the word
             // and its instant as one; any other autopilot value is a hand
             // write of the word, which drops a timer, the same word included.
             if typed == MetaField::Autopilot
@@ -4707,9 +4352,8 @@ pub(crate) fn cmd_meta_by(
             }
             match write_session_meta(ctx, typed, MetaEdit::Set(value), by) {
                 Ok(changed) => ("OK\n".to_string(), changed),
-                // On the wire `meta set title ""` is a USAGE ERROR, never a
-                // clear: clearing has its own explicit `meta unset` form. A
-                // bare `meta set questions` names its own closed set.
+                // On the wire `meta set title ""` is a usage error, never a clear (that is
+                // `meta unset`). A bare `meta set questions` names its own closed set.
                 Err(MetaWriteError::NotAQuestionsPolicy) => {
                     (format!("ERR {}\n", questions_usage()), false)
                 }
@@ -4945,10 +4589,10 @@ fn attention_owned_reply(
     }
 }
 
-/// `meta set supervisor <holder> [ttl=<ms>]` / `meta unset supervisor
-/// [holder=<holder>]` — the OWNER-writable key that makes a running supervisor visible (`status`,
-/// `sessions`, `meta` print `supervisor=<holder|->`). `None` when `rest` is not
-/// a supervisor write, so the caller falls through to [`cmd_meta`].
+/// `meta set supervisor <holder> [ttl=<ms>]` / `meta unset supervisor [holder=<holder>]`: the
+/// owner-writable key that makes a running supervisor visible (`status`, `sessions` and `meta`
+/// print `supervisor=<holder|->`). `None` when `rest` is not a supervisor write, so the caller
+/// falls through to [`cmd_meta`].
 ///
 /// Owner-class only: a supervisor answers the session's prompts, and an edge
 /// token (even a write edge) must not be able to claim to be one or hide the
@@ -4960,7 +4604,7 @@ fn attention_owned_reply(
 /// `<h>` holds it (`OK` either way). Returns `(reply, changed)` like
 /// [`cmd_meta`].
 ///
-/// THE PROVEN SELF-CLAIM ([`crate::self_claim`]): `prove` reads the proof of
+/// The proven self-claim ([`crate::self_claim`]): `prove` reads the proof of
 /// a set's holder from the connection and the session (the kernel's peer pid,
 /// the live foreground group, the process's image) — only for a set with no
 /// `ttl=`, as a self-claim is connection-bound; a proven `codex-alab@<pid>` claim replaces the
@@ -5064,7 +4708,7 @@ pub(crate) fn cmd_meta_supervisor(
 /// driving a session is seen per session). `None` for every other form, so
 /// the caller falls through.
 ///
-/// Only the holder of the session's live PROVEN self-claim may: the request
+/// Only the holder of the session's live proven self-claim may: the request
 /// arrives on the connection the claim is bound to, or the kernel proves it
 /// again (`prove`: the peer pid of this direct connection is the claim's pid
 /// and leads the foreground group). Anyone else is `ERR denied`, an unproven
@@ -5075,10 +4719,17 @@ pub(crate) fn cmd_meta_supervisor(
 /// a proven claim's record copy is read again with it
 /// ([`crate::self_claim::meta_changed`]). In the same timeline hold, the
 /// session log's `act` mark by `by`, the connection's actor ([`log_actor`]),
-/// for an act the log has a word for (plan 5C-2): its wake is taken in that
-/// hold, where it and the row ring the session's watchers.
+/// for every act (`word=unknown` for one the log has no word for, since the
+/// review of 6F-7): its wake is taken in that
+/// hold, where it and the row ring the session's watchers. A landing's
+/// `landing_mark` (or a point left to a person's,
+/// `harness_task::holds_until_another_turn`), sampled before admission,
+/// commits in that same hold:
+/// another request cannot record a later landing and then have an earlier
+/// request overwrite its mark after the commit.
 pub(crate) fn cmd_meta_harness_act(
     ctx: &SessionCtx,
+    landing_mark: Option<crate::session_timeline::LandingMark>,
     conn: Option<u64>,
     by: aterm_slog::Actor,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
@@ -5133,6 +4784,14 @@ pub(crate) fn cmd_meta_harness_act(
     {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         timeline.note_harness_act(act, &holder, by);
+        if harness_act_face(rest).is_some_and(crate::harness_task::holds_until_another_turn)
+            && let Some(mark) = landing_mark
+        {
+            timeline.mark_landing(mark);
+        }
+        if let Some(face) = crate::harness_task::self_claim_act_face(act) {
+            timeline.queue_self_task(face);
+        }
         // The `harness-act` row rang the session's watchers; the log's owed
         // wake is taken in the same hold.
         let _ = timeline.slog_take_wake();
@@ -5140,20 +4799,23 @@ pub(crate) fn cmd_meta_harness_act(
     Some(("OK\n".to_string(), true))
 }
 
-/// THE FACE A RECORDED `meta set harness_act <act>` TELLS (FOREVER LAND
-/// §10.4, [`crate::harness_task::self_claim_act_face`]), for the meta arm's
-/// change wake: `landed` for codex-alab's `landed@v1`, `open` for any other
-/// act; `None` for every other `meta` line. Read only where the line was
-/// recorded (the arm's `on_change`): [`cmd_meta_harness_act`] answered `OK`.
+/// The face a recorded `meta set harness_act <act>` tells
+/// ([`crate::harness_task::self_claim_act_face`]), for the meta arm's
+/// change wake: `landed` for codex-alab's `landed@v1`, `theirs` for its
+/// `left-to-person@v1` (a person's own exchange left to them), `open` for
+/// any other act save its re-exec (`upgrade@v1`, no face); `None` for that
+/// one and for every other `meta` line. Read only where the line was recorded (the arm's
+/// `on_change`): [`cmd_meta_harness_act`] answered `OK`.
 pub(crate) fn harness_act_face(rest: &str) -> Option<aterm_agent::harness::acts::TaskFace> {
     let mut toks = rest.split_whitespace();
     if toks.next() != Some("set") || toks.next() != Some("harness_act") {
         return None;
     }
     let act = toks.next()?;
-    toks.next()
-        .is_none()
-        .then(|| crate::harness_task::self_claim_act_face(act))
+    if toks.next().is_some() {
+        return None;
+    }
+    crate::harness_task::self_claim_act_face(act)
 }
 
 /// `meta set questions|autopilot …` / `meta unset questions|autopilot` from a
@@ -5179,9 +4841,9 @@ pub(crate) fn meta_questions_denied(scope: Scope, rest: &str) -> Option<(String,
     (!scope.is_owner_class()).then(|| ("ERR denied\n".to_string(), false))
 }
 
-/// The bare-`meta` status line. Locks are strictly SEQUENTIAL leaves: meta,
-/// then term, then the store read — never nested, so this cannot deadlock
-/// against the render path (meta before term there too) or the registry.
+/// The bare-`meta` status line. Locks are sequential leaves (meta, then term, then the store
+/// read), never nested, so this cannot deadlock against the render path (meta before term
+/// there too) or the registry.
 fn meta_status(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -5194,9 +4856,8 @@ fn meta_status(
         let t = term_lock(term);
         (
             t.title().to_string(),
-            // Same native conversion the `cwd` verb uses — `meta` reported the
-            // engine's `/C:/Users//m6-an` URI path before, so the two verbs must
-            // keep sharing one boundary or they will disagree.
+            // The `cwd` verb's native conversion: the two verbs share one boundary so they
+            // agree.
             t.native_working_directory()
                 .filter(|c| !c.is_empty())
                 .map(|c| c.into_owned()),
@@ -5207,10 +4868,9 @@ fn meta_status(
         g.by_local(session)
             .map_or_else(|| "-".to_string(), |h| h.state.as_str().to_string())
     };
-    // The foreground program's OWN working directory, read from the OS (a
-    // leaf lock of its own, after the store: never nested). An agent's
-    // folder-trust dialog asks for exactly this folder, and a shell with no
-    // OSC 7 reports no `cwd=` at all (the harness audit, 2026-09-25).
+    // The foreground program's own working directory, read from the OS (its timeline lock is a
+    // leaf after the store's): an agent's folder-trust dialog asks for exactly this folder,
+    // and a shell with no OSC 7 reports no `cwd=`.
     let agent_cwd = {
         let pgid = ctx
             .timeline
@@ -5224,9 +4884,8 @@ fn meta_status(
             .and_then(aterm_sysprobe::process_cwd)
             .map(|p| p.to_string_lossy().into_owned())
     };
-    // A STORED value of exactly "-" must not read back as the unset sentinel:
-    // pct_encode leaves '-' verbatim, so it is escaped here ("%2D") — any
-    // percent-decoder recovers it, and `-` stays unambiguous as "unset".
+    // A stored value of exactly "-" must not read back as the unset sentinel: pct_encode leaves
+    // '-' verbatim, so it is escaped here ("%2D"), which any percent-decoder recovers.
     let opt = |v: Option<&str>| match v {
         None => "-".to_string(),
         Some("-") => "%2D".to_string(),
@@ -5235,19 +4894,15 @@ fn meta_status(
     let (autopilot_by, autopilot_since) = autopilot_by_fields(&meta);
     // After `state=`, additive: which owner's entry `attention=` shows (the bare
     // owner prints `%2D` by the rule above), how many owners hold one, each
-    // entry's kind (2026-10-16, `kind=`), the live supervisor, the session's question policy word (2026-09-24), the
-    // foreground program's own working directory (2026-09-27), the one
-    // folder a worker's starter trusted for it (2026-10-15, `spawn agent=`),
-    // the session's Autopilot word (2026-10-15; ALWAYS named, `-` while
-    // unset: the supervisor's loop reads the word only off a reply that names
-    // it), and after it the instant a timed Cruise lands (`land_at=`, unix
-    // seconds, 2026-10-16; `-` while unset), and after that who set the pair
-    // and when (`autopilot_by=`, `autopilot_since=`, 2026-10-19; design
-    // §11.7.2: [`autopilot_by_fields`]) — each appended LAST: every
-    // in-tree reader keys, none counts. Beside `supervisor=`,
-    // `supervisor_proven=<0|1>` (2026-10-16): whether the live claim is a
-    // PROVEN self-claim ([`crate::self_claim`]), the pair the self-claim
-    // contract names (§1).
+    // entry's kind (`kind=`), the live supervisor, the session's question policy
+    // word, the foreground program's own working directory, the one folder a
+    // worker's starter trusted for it (`spawn agent=`), the session's Autopilot
+    // word (always named, `-` while unset: the supervisor's loop reads the word
+    // only off a reply that names it), the instant a timed Cruise lands
+    // (`land_at=`, unix seconds, `-` while unset), and who set the pair and when
+    // (`autopilot_by=`, `autopilot_since=`; [`autopilot_by_fields`]). Beside
+    // `supervisor=`, `supervisor_proven=<0|1>`: whether the live claim is a
+    // proven self-claim ([`crate::self_claim`]).
     format!(
         "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
          attention_owner={} attention_owners={} attention_kinds={} supervisor={} supervisor_proven={} \
@@ -5328,11 +4983,10 @@ fn attention_owners(meta: &crate::session_timeline::SessionMeta) -> usize {
     }
 }
 
-/// `timeline [<n>] [since=<id>]` -> the session's EVENT TIMELINE, oldest-first,
-/// framed `OK <count>\n` + one `event <id> t=<ms> kind=<k> <payload>` line per
-/// record — the lifecycle twin of `history` (same `<n>`/`since=` grammar, same
-/// drop-oldest ring semantics). Payload values were pct-encoded at record time,
-/// so every event is exactly one line.
+/// `timeline [<n>] [since=<id>]` -> the session's event timeline, oldest first, framed
+/// `OK <count>\n` + one `event <id> t=<ms> kind=<k> <payload>` line per record, with
+/// `history`'s window grammar over a drop-oldest ring. Payload values were pct-encoded at
+/// record time, so every event is one line.
 pub(crate) fn cmd_timeline(ctx: &SessionCtx, rest: &str) -> String {
     let page = match RingPage::parse(rest, "timeline") {
         Ok(page) => page,
@@ -5365,7 +5019,7 @@ fn timeline_reply(events: &[crate::session_timeline::TimelineEvent]) -> String {
 }
 
 /// `log [<node>] [lvl=] [since=<seq> ep=<epoch>] [n=] [kinds=] [class=turn]
-/// [tier=content] [--json]`: the target session's SESSION LOG
+/// [tier=content] [--json]`: the target session's session log
 /// ([`crate::session_log`]), a pure reader of the ctx's timeline lock like
 /// `timeline`, cross-session correct. `OK <n> v=2 as_of=<seq> ep=<e>
 /// oldest=<seq>[ lost=<n>][ more=<k>]`, then a `gap why= lost= resync_to=`
@@ -5464,7 +5118,18 @@ pub(crate) fn cmd_brief_closed_query(
 /// turn within one budget (Owner-only, escalated by `control::argument_escalation`,
 /// like `sessions`). The store guard is dropped before any timeline is locked,
 /// and each timeline's lock is held only to copy what its brief reads.
-pub(crate) fn cmd_brief(ctx: &SessionCtx, store: &Store, rest: &str) -> String {
+///
+/// `jobs` is the stuck engine's line for this session (`jobs 2 jobs · 1
+/// stuck · …`, [`crate::sys_host::brief_jobs_line`]), the last line before
+/// the trailer's `more=`: the log's brief is fitted to the budget less that
+/// line's tokens, so the whole stays within it, and a budget only the
+/// one-line form fits goes without it.
+pub(crate) fn cmd_brief_with_jobs(
+    ctx: &SessionCtx,
+    store: &Store,
+    rest: &str,
+    jobs: Option<String>,
+) -> String {
     let query = match crate::session_log::BriefQuery::parse(rest) {
         Ok(q) => q,
         Err(usage) => return usage.to_string(),
@@ -5479,15 +5144,22 @@ pub(crate) fn cmd_brief(ctx: &SessionCtx, store: &Store, rest: &str) -> String {
             tl.slog().now().wall_ms,
         )
     };
-    let mut text = copy
-        .brief(
-            ctx.self_id.as_str(),
-            query.budget.unwrap_or(aterm_slog::DEFAULT_BUDGET),
-            now,
-        )
-        .text;
+    let budget = query.budget.unwrap_or(aterm_slog::DEFAULT_BUDGET);
+    let sid = ctx.self_id.as_str();
+    let fitted = jobs.and_then(|line| {
+        let reserve = aterm_slog::tokens(line.len() + 1);
+        let b = copy.brief(sid, budget.saturating_sub(reserve), now);
+        (b.level < 4).then(|| crate::sys_host::splice_brief_line(&b.text, &line, budget))
+    });
+    let mut text = fitted.unwrap_or_else(|| copy.brief(sid, budget, now).text);
     text.push('\n');
     text
+}
+
+/// [`cmd_brief_with_jobs`] with no jobs line, for the session log's tests.
+#[cfg(test)]
+pub(crate) fn cmd_brief(ctx: &SessionCtx, store: &Store, rest: &str) -> String {
+    cmd_brief_with_jobs(ctx, store, rest, None)
 }
 
 /// `brief all [budget=]`: every live session's brief in turn within one
@@ -5680,7 +5352,7 @@ impl Drop for DriftSlot {
 }
 
 /// `cast drift [max_runs=<k>] [rows=<n>] [seed=auto|alt|primary]` -> the
-/// COUNTERFACTUAL REPLAY AUDIT of this session's asciicast against its live
+/// counterfactual replay audit of this session's asciicast against its live
 /// screen (`aterm_control::cast_drift`, which owns the method and the wire):
 /// `OK <n> verdict=<clean|desync|unfaithful|unknown|empty> fidelity=… culprit=…
 /// … cut=<quiescent|racy> folds=<f> fold_events=<e> ms=<ms>` then `n`
@@ -5688,7 +5360,7 @@ impl Drop for DriftSlot {
 /// never repainted after — the alt-screen net-zero flap that shifts every row
 /// up one — and the rows that are wrong, with what the app believes they say.
 ///
-/// THE CUT. Under the term lock read the rows, cursor and alt flag, and the
+/// The cut. Under the term lock read the rows, cursor and alt flag, and the
 /// [`crate::cast::CastCut`] of that screen (the PTY reader's holds so far and the
 /// engine's resize ordinal), release; then, under the recorder's lock, wait up to
 /// [`CAST_DRIFT_CATCH_UP`] for the recording to hold every burst and resize that
@@ -5696,9 +5368,9 @@ impl Drop for DriftSlot {
 /// (`cut=quiescent`), with no wait when it already does; one that holds something
 /// later, or did not catch up, is cut again, and after
 /// [`CAST_DRIFT_CUT_ATTEMPTS`] the verb answers `cut=racy` with the replays held
-/// against EACH OTHER (`against=replay fidelity=-`: an app that never stops
+/// against each other (`against=replay fidelity=-`: an app that never stops
 /// drawing cannot make every answer `unknown`). The two locks are taken one
-/// after the other, NEVER nested (the `cast frames` order), and the folds run
+/// after the other, never nested (the `cast frames` order), and the folds run
 /// with both released: a replay never holds the engine or the recorder. At
 /// most [`CAST_DRIFT_CONCURRENCY`] analyses fold at once in the instance; a
 /// request that waits [`CAST_DRIFT_SLOT_WAIT`] for a slot is answered `ERR
@@ -5825,14 +5497,13 @@ fn cast_drift_with(
 pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str) -> String {
     const USAGE: &str = "ERR usage: temporal [status | <tick>] [trim]  (tick = µs since \
                          session start; `temporal status` reports the reachable range)\n";
-    // `trim` is the LAST token of either form. `temporal status trim` has no rows
-    // to trim, so it is a usage error rather than a token that quietly vanishes.
+    // `trim` is the last token of either form; `temporal status trim` has no rows to trim, so
+    // it is a usage error rather than a token that quietly vanishes.
     let (rest, trim) = super::control_query::split_trim_tail(rest);
-    // The resizes the TARGET's engine applied that no reader has handed its spine
-    // yet: the watermark is read under the target's term lock (the reader
-    // publishes it under that lock), taken only after the recorder lock was
-    // released, so the two are never nested. Read BEFORE any replay, so a resize
-    // handed over meanwhile is counted rather than missed.
+    // The resizes the target's engine applied that no reader has handed its spine yet. The
+    // watermark is read under the target's term lock (the reader publishes it there), after the
+    // recorder lock is released, so the two never nest; and before any replay, so a resize
+    // handed over meanwhile is counted, not missed.
     let pending = || {
         let spine = ctx
             .temporal
@@ -5841,10 +5512,8 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
             .spine_watermark();
         spine.pending(&term_lock(term))
     };
-    // `temporal status` -> the reachable window + whether recording is on, so a
-    // caller can DISCOVER a valid tick (µs since session start) and tell an OFF
-    // recorder from an aged-out one without guessing. Additive subform; the bare
-    // `temporal` / `temporal <tick>` wire shapes are unchanged.
+    // `temporal status`: the reachable window and whether recording is on, so a caller can pick
+    // a valid tick and tell an off recorder from an aged-out one.
     if rest == "status" {
         if trim {
             return USAGE.to_string();
@@ -5877,10 +5546,9 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
             Err(_) => return USAGE.to_string(),
         },
     };
-    // An enabled recorder ALWAYS seeds a t0 keyframe at spawn, so `total_events()
-    // == 0` means recording was never turned on (the default) — a config fix, not
-    // the inherent retention bound that `ERR temporal unreachable` names. Reporting
-    // one error for both stranded first-contact callers.
+    // An enabled recorder always seeds a t0 keyframe at spawn, so `total_events() == 0` means
+    // recording was never turned on (the default): a config fix, distinct from the retention
+    // bound `ERR temporal unreachable` names.
     let pending = pending();
     // The replay is lifted out under the recorder lock (refcounts) and folded
     // after it is released, so the writer thread never waits on it.
@@ -5915,9 +5583,9 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
     // A private replay engine: the one construction, with no slot to share.
     let mut body = super::screen_text(&term);
     if trim {
-        // Byte-framed, so the header's count is the TRIMMED body's length and the
-        // client's `byte_count` (first token only) reads it unchanged; `trimmed=<k>`
-        // closes the line as on the row-framed verbs.
+        // Byte-framed: the header's count is the trimmed body's length, which the client's
+        // `byte_count` (first token only) reads unchanged; `trimmed=<k>` follows as on the
+        // row-framed verbs.
         let sent = super::control_query::trimmed_len(body.lines());
         let keep: usize = body.split_inclusive('\n').take(sent).map(str::len).sum();
         body.truncate(keep);
@@ -5961,14 +5629,14 @@ pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
         let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
         edges.grant(src.clone(), ctx.self_id.clone(), op, ctx.nonce)
     };
-    // Audit the act (§1.4#5) OFF the table lock: the logger sink has its own
-    // mutex and must never nest inside `ctx.edges`.
+    // Audit off the table lock: the logger sink has its own mutex and must never nest inside
+    // `ctx.edges`.
     session_edge_audit::emit(EdgeAction::Grant, "wire", &src, &ctx.self_id, op.as_str());
     format!("OK {}\n", tok.to_hex())
 }
 
 /// The refusal of an edge source that is one of the session log's actor
-/// words (`human ctl harness bridge aterm vendor -`; phase 3A ruling R1):
+/// words (`human ctl harness bridge aterm vendor -`):
 /// `grant` and `connect` take a source as given, and no session is named
 /// after an actor, so a grant under one could only be a try at being read
 /// as that actor. The log never would (it attributes an edge only to a
@@ -5996,7 +5664,7 @@ pub(crate) fn cmd_revoke(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     revoke_in(&ctx.edges, &ctx.self_id, rest)
 }
 
-/// THE `revoke` VERB: [`cmd_revoke`] on the connection's own session, and a
+/// The `revoke` verb: [`cmd_revoke`] on the connection's own session, and a
 /// `revoke <edge-hex>` it finds no row for goes on to the read grants the
 /// closed-session index keeps (`session_log::ClosedLog`): a grant a session
 /// closed with is revoked by its token as a live one is, from any owner
@@ -6079,11 +5747,9 @@ fn revoke_in(edges: &Mutex<EdgeTable>, dst: &SessionId, rest: &str) -> String {
     "OK\n".to_string()
 }
 
-/// Parse the `dst=<sid> src=<sid> [kind=pull|push|both]` grammar shared by
-/// `connect` and `disconnect`. `kind` is `None` when absent — each verb applies
-/// its own default (`connect` ⇒ `both`, the §1.2 default connection;
-/// `disconnect` ⇒ the whole connection). Any unknown token, empty value, or
-/// missing endpoint is `Err` (the caller's usage string) — an authority-minting
+/// Parse the `dst=<sid> src=<sid> [kind=pull|push|both]` grammar `connect` and `disconnect`
+/// share. `kind` is `None` when absent: `connect` defaults to `both`, `disconnect` to the whole
+/// connection. An unknown token, empty value or missing endpoint is `Err`: an authority-minting
 /// argument gets no guessed default.
 fn parse_connection_args(rest: &str) -> Result<(SessionId, SessionId, Option<ConnectionKind>), ()> {
     let (mut dst, mut src, mut kind) = (None, None, None);
@@ -6121,20 +5787,15 @@ pub(crate) fn cmd_connect(store: &Store, scope: Scope, rest: &str) -> String {
     cmd_connect_in(&crate::connections::connections(), store, scope, rest)
 }
 
-/// The §6 `connect` verb: declaratively SET the session connection `src → dst`
-/// to exactly `kind` (default `both`) through the [`crate::connections`] seam —
-/// one atomic mint+revoke transition, audited on `session_edge` with origin
-/// `wire`. Owner-only (also enforced by the dispatch's `OwnerOnly` table gate).
+/// The `connect` verb: set the connection `src → dst` to exactly `kind` (default `both`)
+/// through [`crate::connections`], one atomic mint+revoke audited on `session_edge` with origin
+/// `wire`. Owner-only.
 ///
-/// `dst` must be a LIVE registered session (its table + nonce are the mint
-/// target); `src` may be ANY sid — the shipping `grant` contract, since the
-/// source presents the token later and an unknown src simply never connects —
-/// but a self-loop is refused (§1.5). Reply, caller-is-the-deliverer (the
-/// `grant` principle, not its one-hex grammar): one Status line naming only the
-/// LIVE ops — `OK read-screen=<hex> write-input=<hex> signal=<hex>`. A
-/// declarative no-op (the connection already IS `kind`) replies the current
-/// set the same way: the record's original tokens stay live, so re-deriving
-/// the reply from the record covers both paths with no token churn.
+/// `dst` must be a live registered session (its table and nonce are the mint target); `src`
+/// may be any sid, as with `grant` (an unknown src never presents the token), but a self-loop
+/// is refused. The reply names only the live ops, `OK read-screen=<hex> write-input=<hex>
+/// signal=<hex>`; a no-op (the connection already is `kind`) replies the current set the same
+/// way, from the record whose tokens stay live.
 pub(crate) fn cmd_connect_in(
     conn: &crate::connections::ConnectionStore,
     store: &Store,
@@ -6154,9 +5815,8 @@ pub(crate) fn cmd_connect_in(
     if src == dst {
         return "ERR self-loop\n".to_string();
     }
-    // Resolve the DESTINATION from the registry (clone-then-release: the ctx
-    // Arc is lifted out before any table lock). A dead session's table would
-    // mint rows its nonce already fails closed — refuse honestly instead.
+    // Resolve the destination, lifting its ctx out before any table lock. A dead session's
+    // table would mint rows its nonce already fails closed: refuse instead.
     let dst_ctx = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         match g.by_sid(&dst) {
@@ -6199,15 +5859,11 @@ pub(crate) fn cmd_disconnect(store: &Store, scope: Scope, rest: &str) -> String 
     cmd_disconnect_in(&crate::connections::connections(), store, scope, rest)
 }
 
-/// The §6 `disconnect` verb: dissolve the session connection `src → dst`,
-/// KIND-FILTERED when `kind=` is given (`disconnect … kind=pull` revokes only
-/// the pull half). Owner-only. Recorded connections dissolve pair-precisely by
-/// held token; wire-granted rows with no record fall back to the op-filtered
-/// source sweep — see [`crate::connections::disconnect_kind_in`]. Reply
-/// `OK <revoked>`; an unknown pair (no record AND nothing swept) fails closed
-/// with `ERR no such connection`. Unlike `connect`, an Exited-but-registered
-/// dst is a legal target: dissolution is first-class (§1.4#4) and needs no
-/// liveness.
+/// The `disconnect` verb: dissolve the connection `src → dst`, only the `kind=` half when given.
+/// Owner-only. Recorded connections dissolve by held token; wire-granted rows with no record
+/// fall back to the op-filtered source sweep ([`crate::connections::disconnect_kind_in`]).
+/// Reply `OK <revoked>`; an unknown pair fails closed with `ERR no such connection`. Unlike
+/// `connect`, an exited but registered dst is a legal target: dissolution needs no liveness.
 pub(crate) fn cmd_disconnect_in(
     conn: &crate::connections::ConnectionStore,
     store: &Store,
@@ -6246,15 +5902,12 @@ pub(crate) fn cmd_disconnect_in(
     }
 }
 
-/// `flows [--json]` -> the instance's AGGREGATED session-connection graph
-/// (design §5.3/§6): every live edge row across EVERY registered session's
-/// table, `OK <n>\n` + one `<src> <dst> <op>` line per row, sorted by
-/// `(src, dst, op)`. Owner-only — the aggregated view discloses the whole
-/// fabric, the same rationale as `sessions`. `--json` groups per directed pair
-/// in the `cmd_edges_json` style: `{"flows":[{"src":..,"dst":..,"ops":[..]}]}`.
-/// Collection reuses the [`crate::connections`] snapshot discipline (registry
-/// snapshot first, each table locked briefly, no store lock held across a
-/// table lock).
+/// `flows [--json]` -> the instance's aggregated session-connection graph: every live edge row
+/// across every registered session's table, `OK <n>\n` + one `<src> <dst> <op>` line per row,
+/// sorted by `(src, dst, op)`. Owner-only: like `sessions`, it discloses the whole fabric.
+/// `--json` groups per directed pair: `{"flows":[{"src":..,"dst":..,"ops":[..]}]}`.
+/// Collection follows the [`crate::connections`] snapshot discipline (no store lock held
+/// across a table lock).
 pub(crate) fn cmd_flows(store: &Store, scope: Scope, rest: &str) -> String {
     if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
@@ -6268,9 +5921,9 @@ pub(crate) fn cmd_flows(store: &Store, scope: Scope, rest: &str) -> String {
     }
     let edges = crate::connections::all_edges(store);
     if json {
-        // Grouped per (src, dst): the sort above makes pairs consecutive. The
-        // op tokens are the closed `Op::as_str` vocabulary (no escaping
-        // needed); sids go through `json_str_field` like `edges --json`.
+        // Grouped per (src, dst): `all_edges` sorts, so pairs are consecutive. The op tokens
+        // are the closed `Op::as_str` vocabulary (no escaping); sids go through
+        // `json_str_field` like `edges --json`.
         let mut items: Vec<String> = Vec::new();
         let mut i = 0;
         while i < edges.len() {
@@ -6301,10 +5954,9 @@ pub(crate) fn cmd_flows(store: &Store, scope: Scope, rest: &str) -> String {
     out
 }
 
-/// Resolve the `raise <sid>` argument against the registry — the pure,
-/// headless-testable half of [`cmd_raise`] (the proxy hop cannot run off the
-/// event loop; `pub(super)` for exactly that test). Exactly one sid token; an
-/// unknown sid fails closed.
+/// Resolve the `raise <sid>` argument against the registry: the headless-testable half of
+/// [`cmd_raise`] (`pub(super)` for that test). Exactly one sid token; an unknown sid fails
+/// closed.
 pub(super) fn raise_target(store: &Store, rest: &str) -> Result<u64, String> {
     let mut toks = rest.split_whitespace();
     let (Some(sid), None) = (toks.next(), toks.next()) else {
@@ -6344,18 +5996,18 @@ pub(crate) fn cmd_raise(
     }
 }
 
-/// `exits [<n>] [since=<id>]` -> the instance's EXIT LEDGER, oldest-first, framed
+/// `exits [<n>] [since=<id>]` -> the instance's exit ledger, oldest-first, framed
 /// `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…>
-/// exit_code=<n|-> by=<sid|human|ctl|bridge|->` line per session that LEFT the registry —
+/// exit_code=<n|-> by=<sid|human|ctl|bridge|->` line per session that left the registry —
 /// the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps
 /// rows with id strictly greater) over the roster journal, whose seq is the
 /// row id. Owner-only, like `sessions`: it names every sid the instance ever
 /// hosted. This is the tale the dead could not tell: a driver whose peer
-/// answered `ERR no such session` asks here WHEN it went (`t=`, the timeline's
-/// clock), WHY (`reason=`), with what status (`exit_code=`, `-` when the child
+/// answered `ERR no such session` asks here when it went (`t=`, the timeline's
+/// clock), why (`reason=`), with what status (`exit_code=`, `-` when the child
 /// was hung up by a close, died by signal, was not ours to reap, or had not yet
 /// exited at either of the ledger's two non-blocking looks — see
-/// `App::shell_exit_code`) and BY WHOM (`by=`, the closing connection's sid,
+/// `App::shell_exit_code`) and by whom (`by=`, the closing connection's sid,
 /// `human`, `ctl` for an owner-token client, `bridge` for the fabric bridge,
 /// or `-` — see [`caller_actor`]).
 /// Bounded like the journal it reads (drop-oldest): a row older than the
@@ -6405,42 +6057,27 @@ fn exits_reply(rows: &[crate::session_store::RosterRecord]) -> String {
     out
 }
 
-/// The exit ledger's `by=` for a control-socket `close`: the CALLER's own sid,
-/// when the connection carries one. An edge-scoped connection does — its token
-/// was granted TO a session ([`aterm_session::EdgeTable::src_of`], read from the
-/// resolved target's table, the one that authorized this request), and that
-/// session is the caller. An owner-token connection carries no session: the
-/// per-instance token names the instance's owner, so it writes the KIND of
-/// client instead — [`ExitActor::Ctl`] (`by=ctl`) — and the fabric bridge, a
-/// connection the server pre-resolves rather than a token, writes
-/// [`ExitActor::Bridge`] (`by=bridge`). NEVER the front tab (the sid a bare
-/// `whoami` answers): `spawn` makes the new session the front tab, so an
-/// `@<new> close` would name the closed session as its own closer, and an
-/// agent's pane is rarely the tab on screen anyway. Until 2026-09-22 both
-/// owner-class scopes wrote `Unknown` (`by=-`) beside `reason=ctl-close`, the
-/// token the ledger uses for a path that never attributed at all, while
-/// `help exits` promised `by=<caller>` — the audit read a ctl close as
-/// `by=-` and could not tell the two apart.
+/// The exit ledger's `by=` for a control-socket `close`: the caller's own sid when the
+/// connection carries one. An edge's token was granted to a session
+/// ([`aterm_session::EdgeTable::src_of`], read from the resolved target's table), and that
+/// session is the caller. An owner-token connection carries no session, so it writes the kind
+/// of client, [`ExitActor::Ctl`] (`by=ctl`); the fabric bridge writes [`ExitActor::Bridge`].
+/// Never the front tab: `spawn` makes the new session the front tab, so an `@<new> close`
+/// would name the closed session as its own closer.
 pub(crate) fn caller_actor(scope: Scope, target: &SessionCtx) -> ExitActor {
     caller_actor_of(scope, Some(target))
 }
 
-/// [`caller_actor`] for a request that may have no resolved session — the
-/// App lane's `tab` and `invoke`, which drive the front window whether or not
-/// a terminal is active. The owner and the bridge are named by kind either
-/// way, and they are the only scopes that lane admits (an edge is denied
-/// every App-target verb there). An edge caller is found only in a resolved
-/// session's table; with none there is no table to find it in, so it names
-/// nobody (`-`).
+/// [`caller_actor`] for a request that may have no resolved session (the App lane's `tab` and
+/// `invoke`). The owner and the bridge, the only scopes that lane admits, are named by kind
+/// either way; an edge caller is found only in a resolved session's table, so with none it
+/// names nobody (`-`).
 pub(crate) fn caller_actor_of(scope: Scope, target: Option<&SessionCtx>) -> ExitActor {
     match scope {
         Scope::Owner => ExitActor::Ctl,
-        // The bridge is a CONNECTION, not a session, so like the owner token it
-        // has no sid to write; it is named apart from `ctl` because a fleet
-        // order and a local client are different callers to a reader of the
-        // ledger, and this is the one site where the two owner-class scopes
-        // are attributed differently. Unix-only like the scope itself (the
-        // bridge is an inherited `socketpair`).
+        // The bridge is a connection, not a session: no sid to write, but named apart from
+        // `ctl` because a fleet order and a local client are different callers to a ledger
+        // reader. Unix-only like the scope (an inherited `socketpair`).
         #[cfg(any(unix, test))]
         Scope::Bridge => ExitActor::Bridge,
         Scope::Edge(presented) => target
@@ -6490,9 +6127,9 @@ pub(crate) fn turn_by(scope: Scope, driver: Option<&SessionId>) -> TurnBy {
 /// harness's upgrade and relaunch lanes take a tab by for every line they
 /// type — the live upgrade's notice and release, a relaunched agent's
 /// continuation) is the harness's. This is
-/// the rule by which the presence band reads aterm's own hand (ruling 313:
-/// an Owner-token turn whose lease hands back to that hand), so the band and
-/// the ledger agree on which turns are aterm's. Only an owner-token caller is
+/// the rule by which the presence band reads aterm's own hand (an Owner-token
+/// turn whose lease hands back to that hand), so the band and the ledger agree
+/// on which turns are aterm's. Only an owner-token caller is
 /// refined: an edge-scoped connection is its own sid whatever its lease is
 /// named, and the bridge is the bridge — a holder name is never authority.
 pub(crate) fn typed_by(caller: &TurnBy, under: Option<&crate::Lease>) -> TurnBy {
@@ -6504,8 +6141,8 @@ pub(crate) fn typed_by(caller: &TurnBy, under: Option<&crate::Lease>) -> TurnBy 
     }
 }
 
-/// A TEXT THE WINDOW HARNESS TYPES WITH `send` AND SUBMITS WITH `key enter`,
-/// INTO THE LEDGER ([`crate::turn_ledger::STATUS_PRESSED`]): wherever the
+/// Record a text the window harness types with `send` and submits with `key enter`
+/// into the ledger ([`crate::turn_ledger::STATUS_PRESSED`]): wherever the
 /// host fences `send`, the turn-end loop's continuation, done check and
 /// answers go out so (`aterm-agent`'s `Session::type_fenced`), never as a
 /// `turn`, and they are the harness's turns all the same. Called with every
@@ -6604,8 +6241,8 @@ pub(crate) fn ledger_typed_input(
     }
 }
 
-/// THE SESSION LOG'S `by=` for a request on `scope` against `target` (design
-/// §2.5, phase 3A ruling R1): who the CONNECTION is, never a parameter.
+/// The session log's `by=` for a request on `scope` against `target` (design
+/// §2.5): who the connection is, never a parameter.
 ///
 /// - An Owner connection is `harness` when it presented the harness's
 ///   in-memory token ([`crate::control::Principal::Harness`]), else `ctl`
@@ -6640,18 +6277,16 @@ pub(crate) fn log_actor(scope: Scope, target: &SessionCtx) -> aterm_slog::Actor 
     }
 }
 
-/// `whoami` -> report this session's fabric id + nonce + the connection's EFFECTIVE
-/// scope against the session active RIGHT NOW. For an edge, the op is re-derived from
-/// the presented token via `authorize` (the same per-request authority the gate uses)
-/// rather than a cached connect-time op — so whoami can never over-report power the
-/// token no longer holds after the ActiveHandle swung `@.` to a different session
-/// (`edge unauthorized` when the token grants nothing against the now-active table).
+/// `whoami` -> this session's fabric id and nonce and the connection's effective scope against
+/// the session active now. An edge's op is re-derived from the presented token via `authorize`
+/// (the gate's per-request authority), so it never over-reports power the token lost when `@.`
+/// swung to another session (`edge unauthorized`).
 pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
     let s = match scope {
         Scope::Owner => "owner".to_string(),
-        // The bridge learns it IS the bridge — the one thing a hand-started
-        // `aterm-link serve --sock` (an Owner-token client, observer mode) cannot
-        // see any other way, and the check it makes before claiming delivery.
+        // The bridge learns it is the bridge, which a hand-started `aterm-link serve --sock`
+        // (an Owner-token client) cannot see any other way; it checks this before claiming
+        // delivery.
         #[cfg(any(unix, test))]
         Scope::Bridge => "bridge".to_string(),
         Scope::Edge(presented) => {
@@ -6676,10 +6311,9 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// Round seven, finding 22: the count a handoff manifest carries leaves
-    /// room for the turns the parent still serves before its `_exit`, so the
-    /// successor never mints an id the parent already replied with; only a
-    /// parent that outruns the reserve stands its Commit down.
+    /// The count a handoff manifest carries leaves room for the turns the parent still serves
+    /// before its `_exit`, so the successor never mints an id the parent already replied with;
+    /// only a parent that outruns the reserve stands its Commit down.
     #[test]
     fn the_handoff_turn_count_leaves_room_for_turns_in_the_overlap() {
         let carried = super::turn_ids_for_handoff();
@@ -6694,12 +6328,10 @@ mod tests {
         assert!(!super::past_ceiling(u64::MAX, 0), "no manifest, no ceiling");
     }
 
-    /// Round eight, finding 715: a count held at the top of what a manifest
-    /// carries (`raise_turn_ids` from a carried count at `MAX_TURN_ID`) mints
-    /// its next id past it, and every later attempt's ceiling is the top again
-    /// (`turn_ids_for_handoff`'s clamp). Read as "minted past the ceiling",
-    /// that stood every Commit down for good. Pure arithmetic: the
-    /// process-wide count is never moved.
+    /// A count held at the top of what a manifest carries (`raise_turn_ids` at `MAX_TURN_ID`)
+    /// mints its next id past it, and every later ceiling is the top again
+    /// (`turn_ids_for_handoff`'s clamp): that must not stand every Commit down. Pure
+    /// arithmetic: the process-wide count is never moved.
     #[test]
     fn a_count_at_the_manifest_limit_never_wedges_the_commit() {
         let max = crate::handoff_carry::MAX_TURN_ID;
@@ -6754,7 +6386,7 @@ mod tests {
 
         type HistoryQuery = fn(&SessionCtx, &str) -> String;
         // The timeline reads an anchor above every id it handed out as another
-        // count's (a keeper's recovery restarts it, U13): every retained row.
+        // count's (a keeper's recovery restarts it): every retained row.
         let verbs: [(HistoryQuery, usize, bool); 2] = [
             (cmd_history, LEDGER_CAP, false),
             (cmd_timeline, TIMELINE_CAP, true),
@@ -6823,12 +6455,12 @@ mod tests {
         }
     }
 
-    /// THE RING VERBS FORMAT OFF THEIR LOCKS: `history`, `timeline` and
+    /// The ring verbs format off their locks: `history`, `timeline` and
     /// `exits` copy their page under the ring's lock (the turn ledger's, the
     /// timeline's, the store's read guard) and format after releasing it, so
     /// a probe at the start of each formatter
     /// ([`crate::session_log::ENCODE_PROBE`]) finds all three free.
-    /// NEGATIVE CONTROL: each formatter run inside its ring's held guard
+    /// Negative control: each formatter run inside its ring's held guard
     /// finds exactly that lock held, so the probe sees every lock it checks,
     /// and the reply is the same.
     #[test]
@@ -6895,7 +6527,7 @@ mod tests {
             "a ring was formatted under its lock"
         );
 
-        // NEGATIVE CONTROL: formatting under each guard is seen.
+        // Negative control: formatting under each guard is seen.
         let all = RingPage { n: 0, since: None };
         let under = [
             {
@@ -7081,9 +6713,8 @@ mod tests {
         ));
     }
 
-    /// A registered handle over a bare engine (sentinel `master = -1`): the same
-    /// shape `control_host`'s roster tests build, so these lines are the real
-    /// store projection and not a fixture string.
+    /// A registered handle over a bare engine (sentinel `master = -1`), so these lines are the
+    /// real store projection, not a fixture string.
     fn handle(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHandle {
         let sid = SessionId::generate();
         let nonce = LaunchNonce::generate();
@@ -7145,13 +6776,11 @@ mod tests {
         }
     }
 
-    /// The published program / agent columns, `human_ms=` (2026-09-24), the
-    /// typed `role=`/`attention=`/`user_title=` (2026-09-25), `supervisor=`
-    /// (2026-09-23), `autopilot=` (2026-10-15), the owner's columns and the
-    /// harness's `land_at=`/`task=`/`pause=` after them (2026-10-16), and the
-    /// task record's `task_state=`/`task_rev=` (2026-10-15) last, elided by
-    /// [`tail`] and pinned on their own by
-    /// [`the_roster_carries_the_published_program_and_agent_verdict`].
+    /// The published program / agent columns, `human_ms=`, the typed
+    /// `role=`/`attention=`/`user_title=`, `supervisor=`, `autopilot=`, the
+    /// owner's columns, the harness's `land_at=`/`task=`/`pause=`, and the
+    /// task record's `task_state=`/`task_rev=`, elided by [`tail`] and pinned
+    /// on their own by [`the_roster_carries_the_published_program_and_agent_verdict`].
     const AGENT_COLUMNS: [&str; 21] = [
         "program=",
         "agent=",
@@ -7176,11 +6805,9 @@ mod tests {
         "task_rev=",
     ];
 
-    /// The tail every line carries, after the sid and with the per-launch
-    /// `nonce=` elided — both are minted per run, so neither can be pinned by
-    /// value. The nonce's PRESENCE is pinned separately, by
-    /// [`the_roster_carries_each_sessions_public_launch_nonce`]. The agent
-    /// columns after `path=` are elided too ([`AGENT_COLUMNS`]).
+    /// The tail every line carries, without the sid and `nonce=` (minted per run; the nonce is
+    /// pinned by [`the_roster_carries_each_sessions_public_launch_nonce`]) and without the
+    /// columns in [`AGENT_COLUMNS`].
     fn tail(line: &str) -> String {
         let mut f = line.splitn(3, ' ');
         let local = f.next().unwrap();
@@ -7216,10 +6843,9 @@ mod tests {
         assert!(words[1].matches(overloaded));
         assert!(words[2].matches(session));
         assert!(!words[2].matches(overloaded));
-        // NEGATIVE CONTROL: `wall` is not a prefix match on everything.
+        // Negative control: `wall` is not a prefix match on everything.
         assert!(!words[1].matches("prompt") && !words[1].matches("wallpaper"));
-        // `limited`, the word before the walls were named, is refused like
-        // any unknown word: `wall` or `wall:<kind>` names what it meant.
+        // `limited` is refused like any unknown word: `wall` or `wall:<kind>` names it.
         for bad in [
             "",
             "promt",
@@ -7234,12 +6860,9 @@ mod tests {
         }
     }
 
-    /// THE ESCALATED SET IN THE ROSTER (2026-09-25): the typed `role=`,
-    /// `attention=` and `user_title=` a fleet glance classifies by ride every
-    /// row, so the menu-bar fleet scan reads a sibling in ONE hop. Before, the
-    /// roster carried none of them and the scan paid up to 256 `@sid meta`
-    /// follow-ups per peer inside its 2 s budget, falling back to the ⚠-title
-    /// heuristic past the cap.
+    /// The typed `role=`, `attention=` and `user_title=` a fleet glance
+    /// classifies by ride every row, so the menu-bar fleet scan reads a sibling
+    /// in one hop.
     #[test]
     fn the_roster_carries_the_typed_role_attention_and_title() {
         let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -7266,10 +6889,10 @@ mod tests {
         assert!(line.contains(" meta=1 "), "{line}");
     }
 
-    /// THE TASK RECORD IN THE ROSTER (2026-10-15): one `sessions` read tells a
-    /// manager which of its workers has news — `task_state=<state>
-    /// task_rev=<n>` closing every row, `-`/`0` for a session with no task,
-    /// after `task=`, the task's face under Land (`-` with no live claim).
+    /// One `sessions` read tells a manager which of its workers has news:
+    /// `task_state=<state> task_rev=<n>` closes every row, `-`/`0` for a
+    /// session with no task, after `task=`, the task's face under Land (`-`
+    /// with no live claim).
     #[test]
     fn the_roster_carries_each_sessions_task_record() {
         use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -7374,7 +6997,7 @@ mod tests {
             any.contains(" rev=2 state=done agent=- attention=- result_bytes=64\n"),
             "{any}"
         );
-        // NEGATIVE CONTROLS: `all` still waits on two; re-armed with the rev
+        // Negative controls: `all` still waits on two; re-armed with the rev
         // each was read at, and armed with none, the same news is no news.
         for (since, combine) in [
             ([Some(1); 3], Combine::All),
@@ -7496,7 +7119,7 @@ mod tests {
         assert_eq!(await_("timeout 20 task since=1"), AWAIT_TASK_USAGE);
     }
 
-    /// LATCHED WITHIN A WAIT: a target that showed news keeps it, and the
+    /// Latched within a wait: a target that showed news keeps it, and the
     /// row it showed, after its record moves on to no news — so news that
     /// came and went between two wakes still counts toward `all` — while a
     /// target without news is read again on every wake. A wait armed again
@@ -7541,19 +7164,16 @@ mod tests {
             "{latched:?}"
         );
         assert!(latched[2].is_none());
-        // NEGATIVE CONTROL: a wait armed again reads the record as it stands.
+        // Negative control: a wait armed again reads the record as it stands.
         let mut again: Vec<Option<String>> = vec![None; 3];
         latch_task_news(&store, &targets, &edges, &exits, &mut again);
         assert!(again[0].is_none() && again[1].is_some(), "{again:?}");
     }
 
-    /// `path=` IS MEASURED WHERE IT CAN BE (gap audit 2026-09-24: a tab the live
-    /// upgrade had healed a day earlier still read `path=frozen`, and its
-    /// foreign native `claude` showed nowhere). A carried adoption mark reads
-    /// `path=frozen path_evidence=carried` until a child of the shell is read;
-    /// a live reading then wins over the mark and says so, `copy=` names the
-    /// agent's build, and `upgrade=` the tab's live upgrade. NEGATIVE CONTROL:
-    /// a reading for a group no longer in front changes nothing.
+    /// `path=` is measured where it can be: a carried adoption mark reads `path=frozen
+    /// path_evidence=carried` until a child of the shell is read; a live reading then wins and
+    /// says so, `copy=` names the agent's build, and `upgrade=` the tab's live upgrade. Negative
+    /// control: a reading for a group no longer in front changes nothing.
     #[test]
     fn the_roster_path_is_measured_where_a_child_of_the_shell_was_read() {
         use crate::session_status::program::PathVerdict;
@@ -7757,9 +7377,8 @@ mod tests {
         );
     }
 
-    /// With rows present, each line names its window, active-tab and front
-    /// bits; a session the rows do not mention is DETACHED (`window=none`),
-    /// not unknown. The store columns before `meta=` are unchanged.
+    /// With rows present, each line names its window, active-tab and front bits; a session the
+    /// rows do not mention is detached (`window=none`), not unknown.
     #[test]
     fn sessions_lines_carry_the_placement_columns_from_the_rows() {
         let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -7789,13 +7408,11 @@ mod tests {
         );
     }
 
-    /// THE TITLE IS THE STRIP'S, READ LIVE ([`roster_title`]): the measured
-    /// divergence was `ls` printing `C:\Program%20Files\…\pwsh.exe` (a fresh
-    /// pane) and `` (a tab opened in the background) while `title` and the
-    /// strip said `~\aterm`. Rung by rung, and the contended-lock fallback.
+    /// The title is the strip's, read live ([`roster_title`]): rung by rung, and the
+    /// contended-lock fallback.
     #[test]
     fn sessions_lines_print_the_title_the_strip_settles_on() {
-        // No title, no cwd: the store's title, as before.
+        // No title, no cwd: the store's title.
         let bare = Arc::new(Mutex::new(Terminal::new(24, 80)));
         // ConPTY's program path with the cwd known: the cwd rung, never the
         // path. A POSIX cwd so the native form is the same on every host.
@@ -7850,9 +7467,8 @@ mod tests {
             ]
         );
 
-        // A CONTENDED engine lock falls back to the store's title — with a
-        // program path dropped there too, and "aterm" standing in for an
-        // empty one, so the token never vanishes from the line.
+        // A contended engine lock falls back to the store's title, with a program path dropped
+        // there too and "aterm" standing in for an empty one, so the token never vanishes.
         let mut stale = handle(5, &fresh);
         stale.title = "C:\\Windows\\system32\\cmd.exe".to_string();
         let mut empty = handle(6, &fresh);
@@ -7945,15 +7561,11 @@ mod tests {
         );
     }
 
-    /// THE EPOCH THE FABRIC BRIDGE READS. §7 of the fabric design says a
-    /// session's presence row carries `epoch=` — its public launch nonce,
-    /// verbatim — and names `whoami` as where the bridge reads it. `whoami`
-    /// reports only the CONNECTION's own session and refuses a selector, so a
-    /// bridge (whose connection is not a session's) cannot read any session's
-    /// nonce that way; the roster is where it can. Additive, and additive of
-    /// nothing secret: the nonce is public anti-spoof state by construction
-    /// (`aterm_session::LaunchNonce`), republished in every presence row on the
-    /// bus, and this listing is Owner-only anyway.
+    /// The roster carries each session's launch nonce, the presence row's `epoch=` for the
+    /// fabric bridge: `whoami` reports only the connection's own session, so a bridge cannot
+    /// read any session's nonce there. The nonce is public anti-spoof state
+    /// (`aterm_session::LaunchNonce`), republished in every presence row, and this listing is
+    /// Owner-only.
     #[test]
     fn the_roster_carries_each_sessions_public_launch_nonce() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -7970,8 +7582,8 @@ mod tests {
             row.contains(&format!(" nonce={expect} ")),
             "the roster must carry the launch nonce: {row}"
         );
-        // Thirty-two hex digits, and it sits AFTER `meta=` so `aterm-ctl`'s
-        // `roster_tail` (which reads back to that anchor) keeps working.
+        // Thirty-two hex digits, right after `meta=` so `aterm-ctl`'s `roster_tail` (which
+        // reads back to that anchor) keeps working.
         assert_eq!(expect.len(), 32, "{expect}");
         let fields: Vec<&str> = row.split_whitespace().collect();
         let meta_at = fields.iter().position(|f| f.starts_with("meta=")).unwrap();
@@ -8016,12 +7628,9 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let _ = tx.send(cmd_sessions_bridge(&store));
         });
-        // The three locks stay held until this test returns, so the roster cannot
-        // have answered by taking them, and an answer rules out a roster that
-        // waits on them without end. It does not rule out a bounded patience
-        // shorter than the minute; the roster has none (`bridge_roster` reads the
-        // store alone). The minute is a hang detector for a roster that parks
-        // behind them.
+        // The three locks stay held until this test returns, so an answer shows the roster
+        // neither takes nor waits on them (`bridge_roster` reads the store alone); the minute is
+        // a hang detector.
         let bridge = rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("identity-only roster must not wait on terminal, meta or timeline");
@@ -8084,12 +7693,9 @@ mod tests {
         );
     }
 
-    /// IDENTITY (session identities, phase 1): the roster's LAST column names the
-    /// agent identity each session was spawned under, `-` for the human's own —
-    /// the golden PAIR, a handle carrying `worker` beside one carrying none. It
-    /// sits immediately AFTER `detail=`, and last, so aterm-ctl's `roster_tail`
-    /// (which reads the tail by key back to `meta=`) is unmoved and an older
-    /// client keying on the sid field ignores it.
+    /// `identity=` names the agent identity each session was spawned under, `-` for the human's
+    /// own. It sits right after `detail=`, so aterm-ctl's `roster_tail` (which reads the tail by
+    /// key back to `meta=`) is unmoved; `path=` and the agent columns follow it.
     #[test]
     fn sessions_lines_carry_the_identity_after_detail_as_a_name_or_a_dash() {
         let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -8154,11 +7760,9 @@ mod tests {
         );
     }
 
-    /// `path=` (2026-09-22): the registry's frozen-path mark, per session, as the
-    /// LAST column — `frozen` for the shell the store marked at adoption, `live`
-    /// for every other — on both arms, since it is a registry fact and not a
-    /// main-thread answer. Through the verb over a real store, so the mark the
-    /// managed-current row COUNTS is the mark the roster NAMES.
+    /// `path=` is the registry's frozen-path mark: `frozen` for the shell the store marked at
+    /// adoption, `live` for every other, on both arms (a registry fact, not a main-thread
+    /// answer). Also through the verb over a real store, so the roster names the store's mark.
     #[test]
     fn sessions_lines_name_the_frozen_path_tab_as_the_last_column() {
         let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -8254,14 +7858,9 @@ mod tests {
         }
     }
 
-    /// `temporal <tick> trim` (byte-framed `OK <nbytes> trimmed=<k>`) and the
-    /// `temporal status trim` usage rule had no test. Build a recorder with a
-    /// blank keyframe plus a couple of `RawIn` lines: the bare form serializes
-    /// the whole reconstructed grid; the `trim` form drops the trailing blank
-    /// rows and its header byte count is the TRIMMED body's own byte length
-    /// (the client reads the body by that count, so the two must agree). And
-    /// `temporal status trim` — status has no rows to trim — is a usage error,
-    /// never a silently-swallowed token.
+    /// `temporal trim` drops the trailing blank rows, and its header's byte count is the trimmed
+    /// body's own length (the client reads the body by that count); `temporal status trim` is a
+    /// usage error.
     #[test]
     fn temporal_trim_byte_frames_the_trimmed_body_and_status_trim_is_usage() {
         let ctx = temporal_ctx();
@@ -8301,17 +7900,13 @@ mod tests {
             .parse()
             .expect("nbytes is a number");
         assert_eq!(tok.next(), Some("trimmed=6"), "six blank rows dropped");
-        // The header's byte count IS the trimmed body's byte length.
         assert_eq!(nbytes, body.len(), "header nbytes == body bytes");
-        // The trailing all-blank rows are gone: exactly the two written rows
-        // remain and the body ends on the last non-blank one.
         assert_eq!(body.lines().count(), 2, "only the two written rows survive");
         assert!(
             body.trim_end_matches('\n').ends_with("second line"),
             "body ends on the last non-blank row: {body:?}"
         );
 
-        // `temporal status trim` has no rows to trim → usage, not a swallow.
         let status_trim = cmd_temporal(&ctx, &live, "status trim");
         assert!(
             status_trim.starts_with("ERR usage: temporal"),
@@ -8651,9 +8246,8 @@ mod tests {
         );
     }
 
-    /// The same flap with NOTHING between its halves: the engine's resize undo
-    /// hands the demoted row back, the live screen is what the app drew, and
-    /// the verb answers clean with no culprit.
+    /// The same flap with nothing between its halves: the engine's resize undo hands the
+    /// demoted row back, and the verb answers clean with no culprit.
     #[test]
     fn cmd_cast_drift_answers_clean_for_a_quiet_flap() {
         let (term, cast) = quiet_flapped_session();
@@ -8863,10 +8457,8 @@ mod exits_tests {
         assert_eq!(cmd_exits(&store, ""), "OK 0\n", "a birth is not an exit");
     }
 
-    /// Every reason token the ledger can hold renders on its own line in the
-    /// documented shape, with the actor and exit-code spellings for each of the
-    /// three actor kinds and both `exit_code` cases. Walks `ExitReason::ALL`, so
-    /// a reason added without a row here fails to compile past the array.
+    /// Every reason in `ExitReason::ALL` renders on its own line in the documented shape, with
+    /// each actor kind and both `exit_code` cases.
     #[test]
     fn formats_every_reason_actor_and_exit_code() {
         let store = new_store();
@@ -8927,11 +8519,10 @@ mod exits_tests {
     /// `exits <n>` formats only the rows it replies with: the page is cut
     /// from the journal's newest end under the read guard, so an older exit
     /// is neither cloned nor formatted. Over interleaved births and exits,
-    /// for every `<n>` and `since=`, the reply equals the full-format-then-
-    /// drain oracle the verb used to be, and the formatter's row count
-    /// ([`crate::work_counts`]) equals the rows shown. NEGATIVE CONTROL: with
-    /// no `<n>` every exit is formatted, so the count can see rows the page
-    /// leaves out.
+    /// for every `<n>` and `since=`, the reply equals the full-format-then-drain
+    /// oracle, and the formatter's row count ([`crate::work_counts`]) equals
+    /// the rows shown. Negative control: with no `<n>` every exit is formatted,
+    /// so the count can see rows the page leaves out.
     #[test]
     fn exits_n_formats_only_n_rows() {
         use crate::work_counts::take_ring_rows_formatted;
@@ -9045,14 +8636,9 @@ mod exits_tests {
         }
     }
 
-    /// `by=` names the CALLER, never the closed session. An edge-scoped
-    /// connection's caller is the session its token was granted to (read from
-    /// the TARGET's table); an owner-token connection carries no session and
-    /// writes `ctl`, the bridge writes `bridge` (both wrote `-` until
-    /// 2026-09-22, indistinguishable from a path that never attributed); a
-    /// token the target's table does not know is `-`. In no case is it the
-    /// closed session's own sid — the E2E twin drives a private instance
-    /// through `spawn` → `@<new> close` and checks the `exits` row agrees.
+    /// `by=` names the caller, never the closed session: an edge's caller is the session its
+    /// token was granted to (read from the target's table), an owner-token connection is
+    /// `ctl`, the bridge is `bridge`, and a token the target's table does not know is `-`.
     #[test]
     fn caller_actor_is_the_edge_source_never_the_target_and_the_client_kind_for_owner() {
         let store = new_store();
@@ -9098,10 +8684,9 @@ mod exits_tests {
             ExitActor::Unknown,
             "a token the target's table never issued names nobody"
         );
-        // With NO resolved session (the flagless `tab` on the App lane) the
-        // owner and the bridge are still named by kind, and an edge — whose
-        // table is the only thing that knows its source — names nobody; with
-        // one, the answer is `caller_actor`'s.
+        // With no resolved session (the flagless `tab` on the App lane) the owner and the
+        // bridge are still named by kind and an edge names nobody; with one, the answer is
+        // `caller_actor`'s.
         assert_eq!(caller_actor_of(Scope::Owner, None), ExitActor::Ctl);
         assert_eq!(caller_actor_of(Scope::Bridge, None), ExitActor::Bridge);
         assert_eq!(caller_actor_of(Scope::Edge(tok), None), ExitActor::Unknown);
@@ -9109,8 +8694,7 @@ mod exits_tests {
             caller_actor_of(Scope::Edge(tok), Some(&target.ctx)),
             ExitActor::Sid(caller_sid.clone())
         );
-        // The row an edge-attributed close writes carries the caller's sid, and
-        // it differs from the sid of the row itself.
+        // The row an edge-attributed close writes carries the caller's sid, not its own.
         {
             let mut g = store.write().unwrap_or_else(|p| p.into_inner());
             g.register(caller);
@@ -9129,8 +8713,8 @@ mod exits_tests {
     /// The turn ledger's caller is the exits ledger's ([`turn_by`], from the
     /// driver the dispatch resolved, `turn_driver`), and the one thing that
     /// refines it is the lease the turn types under ([`typed_by`]): an
-    /// owner-token turn under THIS process's harness hand is the harness's.
-    /// NEGATIVE CONTROLS: another instance's harness (a different pid in the
+    /// owner-token turn under this process's harness hand is the harness's.
+    /// Negative controls: another instance's harness (a different pid in the
     /// holder), a manager's lease, a `turn`'s lease, no lease, and every
     /// non-owner caller are left as they are — an edge under the harness's
     /// holder name is still its own sid, because a lease's name is never
@@ -9206,7 +8790,7 @@ mod exits_tests {
     }
 }
 
-/// THE SESSION LOG'S `by=` (design §2.5, phase 3A ruling R1): who the
+/// The session log's `by=` (design §2.5): who the
 /// connection is, never a name anyone chose.
 #[cfg(test)]
 mod log_actor_tests {
@@ -9300,11 +8884,9 @@ mod log_actor_tests {
     }
 }
 
-/// ROUND SEVEN OF THE UPDATE AUDIT, FINDINGS 29, 49 AND 50: the per-instance
-/// counters a driver pages or waits by keep their meaning across a seamless
-/// update — the exit ledger's and the timeline's ids go on above the old
-/// process's (carried on the manifest), and a content sequence from before it
-/// is recognised as one rather than parked on.
+/// The counters a driver pages or waits by keep their meaning across a seamless update: the
+/// exit ledger's and the timeline's ids continue above the old process's (carried on the
+/// manifest), and a content seq from before it is recognised rather than parked on.
 #[cfg(test)]
 mod update_anchor_tests {
     use super::{cmd_await, cmd_exits, cmd_timeline};
@@ -9312,10 +8894,7 @@ mod update_anchor_tests {
         ExitActor, ExitReason, SessionHandoff, SessionStore, new_store, test_handle,
     };
 
-    /// FINDING 49: `exits since=<id>` from before an update still means "after
-    /// that row" on the successor. FAILS WITHOUT THE FIX: the successor's
-    /// journal counts 1..3 again and the page answers `OK 0` (measured with
-    /// `continue_roster_seq` a no-op).
+    /// `exits since=<id>` from before an update still means "after that row" on the successor.
     #[test]
     fn exits_ids_keep_rising_across_a_handoff() {
         let mut producer = SessionStore::default();
@@ -9356,10 +8935,8 @@ mod update_anchor_tests {
         assert_eq!(old.roster_seq, None);
     }
 
-    /// FINDING 50: an adopted session's timeline goes on above the id the
-    /// record carried, so a pre-update `timeline since=<id>` sees the
-    /// `handoff` row and what follows. FAILS WITHOUT THE FIX: the handoff row
-    /// is id 1 and the page answers `OK 0`.
+    /// An adopted session's timeline continues above the id the record carried, so a pre-update
+    /// `timeline since=<id>` sees the `handoff` row and what follows.
     #[test]
     fn an_adopted_timeline_is_visible_to_a_pre_update_since_anchor() {
         let producer = test_handle(1);
@@ -9381,10 +8958,8 @@ mod update_anchor_tests {
         let reserve = crate::session_timeline::HANDOFF_ID_RESERVE;
         assert_eq!(read.sessions[0].timeline_id, 58 + reserve);
 
-        // THE OVERLAP (round seven's review, item 2): the old process goes on
-        // recording after the draw, and a driver pages past those events —
-        // `since=60` here. FAILS WITHOUT THE FIX: the successor's `handoff`
-        // row was id 59, below the anchor, and the page hid it.
+        // The old process goes on recording after the draw and a driver pages past those events
+        // (`since=60`): the successor's `handoff` row must still lie above that anchor.
         for i in 0..2 {
             producer_timeline
                 .lock()
@@ -9434,11 +9009,9 @@ mod update_anchor_tests {
         }
     }
 
-    /// FINDING 29: a `seq` anchor above the current count (one read off the
-    /// instance an update replaced) answers at once with the current seq —
-    /// never `OK timeout`, "unchanged", over a moving screen. NEGATIVE
-    /// CONTROL: an anchor at the current count still waits for a change.
-    /// FAILS WITHOUT THE FIX: `OK timeout`.
+    /// A `seq` anchor above the current count (read off the instance an update replaced)
+    /// answers at once with the current seq, never `OK timeout`; an anchor at the current
+    /// count still waits for a change.
     #[test]
     fn a_seq_anchor_from_another_process_answers_at_once() {
         let handle = test_handle(0);
@@ -9462,20 +9035,15 @@ mod update_anchor_tests {
     }
 }
 
-/// ROUND EIGHT OF THE UPDATE AUDIT, U23: the raw `grant` verb mints a fresh row
-/// for every call, an identical `(src, dst, op)` included, and names any
-/// string as its source. The handoff carries each triple once — never a
-/// repeat, which every successor folds into one set of ops anyway. A triple the
-/// successor cannot re-mint (a source that is not one of its sessions, a
-/// self-loop) still rides, once (U23's review): its drop in the successor
-/// (`App::remint_carried_connections`) is the `session_edge` audit that puts
-/// its dissolution on record, after the Commit that dissolves it.
+/// The raw `grant` verb mints a row for every call, an identical `(src, dst, op)` included, and
+/// takes any string as its source; the handoff carries each triple once. A triple the successor
+/// cannot re-mint (a source that is not one of its sessions, a self-loop) still rides once: its
+/// drop in `App::remint_carried_connections` is the `session_edge` audit of its dissolution.
 #[cfg(test)]
 mod connection_carry_tests {
     use super::{Scope, cmd_grant};
     use crate::session_store::{SessionHandoff, SessionStore, test_handle};
 
-    /// RED before the fix: 1,000 + 1,000 + 2 + 1 rows, every one written.
     #[test]
     fn the_carry_holds_each_triple_once() {
         let controller = test_handle(1);
@@ -9524,11 +9092,9 @@ mod connection_carry_tests {
     }
 }
 
-/// ROUND SEVEN OF THE UPDATE AUDIT, FINDINGS 62 AND 63: while a session's PTY
-/// reader is parked for an update (`SessionCtx::update_parked`), nothing on
-/// this side consumes its output, so the silence is not the program's: an idle
-/// wait does not latch on it, and a `turn`'s submit window neither closes nor
-/// presses Enter again.
+/// While a session's PTY reader is parked for an update (`SessionCtx::update_parked`), nothing
+/// consumes its output, so the silence is not the program's: an idle wait does not latch on
+/// it, and a `turn`'s submit window neither closes nor presses Enter again.
 #[cfg(test)]
 mod update_park_wait_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9537,8 +9103,8 @@ mod update_park_wait_tests {
     use super::{OnHangup, Park, Parked, Stretch, TurnIo, cmd_await, cmd_ready, cmd_turn};
     use crate::session_store::{new_store, test_handle};
 
-    /// FINDING 62. FAILS WITHOUT THE FIX: both latch within their windows
-    /// (`OK idle …`, `OK ready idle`) with the reader parked.
+    /// Both waits time out with the reader parked; unparked mid-wait, the window runs from the
+    /// resume.
     #[test]
     fn idle_waits_do_not_latch_on_a_parked_readers_silence() {
         let handle = test_handle(0);
@@ -9553,21 +9119,12 @@ mod update_park_wait_tests {
             cmd_ready(&handle.term, &store, 0, &handle.ctx, "400"),
             "OK timeout\n"
         );
-        // Unparked mid-wait: the idle window is measured from the resume, in
-        // full — never from before the park. "Mid-wait" is a FACT, not 300 ms
-        // of sleep: nothing is printed, so only a parked look restarts the
-        // await's idle deadline, and once that deadline has moved a whole
-        // window past the first one seen, the await held its window open
-        // across a park longer than the window. Then the reader resumes; the
-        // deadline its last parked look set is the earliest it may latch.
-        //
-        // The resume and the deadline it is judged by are taken under ONE
-        // hold of the terminal lock — the lock every look of the await takes
-        // to restart or expire its idle clock — and only while that deadline
-        // is still AHEAD: so `held` is what the last parked look set, and it
-        // lies after the resume. A resumer descheduled between reading a
-        // deadline and resuming can no longer hand back one already past,
-        // which let an await that latches AT the resume pass.
+        // Unparked mid-wait, the idle window runs in full from the resume. Mid-wait is observed,
+        // not slept: nothing is printed, so only a parked look moves the await's idle deadline,
+        // and a deadline a whole window past the first shows the await held its window open
+        // across the park. The resume and the deadline it is judged by are read under one hold
+        // of the terminal lock, only while that deadline is still ahead, so `held` is what the
+        // last parked look set and lies after the resume.
         const IDLE: Duration = Duration::from_millis(200);
         let resumer = {
             let ctx = handle.ctx.clone();
@@ -9613,8 +9170,8 @@ mod update_park_wait_tests {
             "a whole window after the last parked look: latched {:?} before it",
             held.saturating_duration_since(latched)
         );
-        // NEGATIVE CONTROL: unparked, the same wait latches on true quiet —
-        // at its 60 ms window; the timeout is only the hang detector.
+        // Negative control: unparked, the same wait latches at its 60 ms window; the timeout
+        // is the hang detector.
         assert!(
             cmd_await(
                 &handle.term,
@@ -9627,17 +9184,15 @@ mod update_park_wait_tests {
         );
     }
 
-    /// ROUND EIGHT'S LEAD U12: `ready`'s shell-integration answer is the
-    /// parser's, and a parked reader leaves the parser behind the program — a
-    /// shell at its prompt that was handed `make` while parked has signed the
-    /// command's start into the kernel queue, unread. So no look answers
-    /// `prompt` while the park stands, and the park stands until the resumed
-    /// reader has parsed what queued (`spawn::UpdatePark`; the real reader is
-    /// driven through it in `spawn::update_park_catch_up_tests`). Then the
-    /// parser is the program's again: here the `make` runs, so the answer is
-    /// the idle settle after it, never the prompt it left.
-    ///
-    /// FAILS WITHOUT THE FIX: `OK ready prompt` at once, parked.
+    /// `ready`'s shell-integration answer is the parser's, and a parked reader
+    /// leaves the parser behind the program: a shell at its prompt that was
+    /// handed `make` while parked has signed the command's start into the
+    /// kernel queue, unread. So no look answers `prompt` while the park stands,
+    /// and the park stands until the resumed reader has parsed what queued
+    /// (`spawn::UpdatePark`; the real reader is driven through it in
+    /// `spawn::update_park_catch_up_tests`). Then the parser is the program's
+    /// again: here `make` runs, so the answer is the idle settle after it,
+    /// never the prompt it left.
     #[test]
     fn ready_answers_no_prompt_from_a_parked_readers_parser() {
         let handle = test_handle(0);
@@ -9674,7 +9229,7 @@ mod update_park_wait_tests {
             reply, "OK ready idle\n",
             "the caught-up parser shows `make` running, not the prompt it left"
         );
-        // NEGATIVE CONTROL: never parked, a prompt answers at once.
+        // Negative control: never parked, a prompt answers at once.
         handle
             .term
             .lock()
@@ -9686,11 +9241,9 @@ mod update_park_wait_tests {
         );
     }
 
-    /// FINDING 63: a `turn` whose Enter lands while the reader is parked
-    /// presses it ONCE — the absent echo says nothing then — however many
-    /// presses it was allowed. FAILS WITHOUT THE FIX: three presses, one per
-    /// submit window. NEGATIVE CONTROL: unparked, a swallowed press is pressed
-    /// again, as before.
+    /// A `turn` whose Enter lands while the reader is parked presses it once —
+    /// the absent echo says nothing then — however many presses it was allowed.
+    /// Negative control: unparked, a swallowed press is pressed again.
     ///
     /// The deadline is the subject only parked, where the first press's
     /// window stays open to it. Unparked, the turn ends at its third
@@ -9733,16 +9286,11 @@ mod update_park_wait_tests {
         );
     }
 
-    /// THE ONSET OF A PARK IS AN EVENT (finding 63's stretch accounting needs
-    /// it). `park_reader` rings the session's watchers, and between the
-    /// slices of a served lane the park reads the flag itself, so even a flip
-    /// nothing rang is seen within one slice: the look after it runs at most
-    /// one slice after the flip, counted, never timed. Here nothing rings, the
-    /// slice is 10 ms and the window a minute (the hang detector), so a park
-    /// that read only the hang-up between slices would first see the flip at
-    /// the window's close, thousands of slices on. NEGATIVE CONTROL: with no
-    /// flip, the same park over 100 ms looks twice, at entry and at its close,
-    /// however many slices it took: the look that saw the flip was the flip's.
+    /// The onset of a park is an event: `park_reader` rings the session's
+    /// watchers, and between the slices of a served lane the park reads the
+    /// flag itself, so even a flip nothing rang is seen within one slice.
+    /// Negative control: with no flip, the same park over 100 ms looks twice,
+    /// at entry and at its close, however many slices it took.
     #[test]
     fn a_park_that_begins_mid_slice_is_noticed_within_one_slice() {
         use std::sync::atomic::AtomicBool;
@@ -9867,7 +9415,7 @@ mod park_tests {
 
     /// A park over 100 ms of 2 ms slices, with nothing ringing and the caller
     /// there, looks exactly twice: at entry and at its close. The count does
-    /// not depend on how many slices the window took. NEGATIVE CONTROL: the
+    /// not depend on how many slices the window took. Negative control: the
     /// loop before it looked once per slice, plus once at entry.
     #[test]
     fn a_hangup_slice_does_not_rerun_the_predicate() {
@@ -9975,16 +9523,13 @@ mod turn_halt_tests {
         }
     }
 
-    /// A HOLD SET WHILE A TURN RUNS STOPS IT THERE (the step-in's rule: every
-    /// remote write is refused while the person's hold stands). The person's
-    /// Take Over landing between a typed turn's keys writes no key after it
-    /// and no Enter, and says what landed; one landing after a plain turn's
-    /// paste presses no Enter; one standing before the first byte answers the
-    /// dispatch's own `ERR halted`, typing nothing. FAILS WITHOUT THE FIX:
-    /// the holds were asked once, as the turn arrived, and every key and the
-    /// Enter went on into the tab the person took. NEGATIVE CONTROLS: with
-    /// no Take Over the same turns write every key and press their Enter,
-    /// and a remote node's own hold never stops its own drive's turn.
+    /// A hold set while a turn runs stops it there: the person's Take Over
+    /// landing between a typed turn's keys writes no key after it and no Enter,
+    /// and says what landed; one landing after a plain turn's paste presses no
+    /// Enter; one standing before the first byte answers the dispatch's own
+    /// `ERR halted`, typing nothing. Negative controls: with no Take Over the
+    /// same turns write every key and press their Enter, and a remote node's
+    /// own hold never stops its own drive's turn.
     #[test]
     fn a_hold_set_while_a_turn_runs_presses_nothing_more() {
         const TYPED: &str = "typed=1 cadence=1 cap=5 idle=1 presses=1 submit_window=50 \
@@ -10054,12 +9599,12 @@ mod composer_verify_tests {
         t
     }
 
-    /// THE KEY IS THE TYPED TEXT THE COMPOSER SHOWS, whitespace aside. Not
+    /// The key is the typed text the composer shows, whitespace aside. Not
     /// shown yet is `NotYet` — read again as the screen moves — save where a
     /// `[Pasted text …]` chip stands for it, or no framed composer is on the
-    /// screen, or the text is empty: `No`, and AUTO's `seq` stands. Claude
-    /// Code's DIM PLACEHOLDER (the cursor at column 2 of the caret row) is no
-    /// text: a key it spells is not shown. NEGATIVE CONTROL: the same words
+    /// screen, or the text is empty: `No`, and auto's `seq` stands. Claude
+    /// Code's dim placeholder (the cursor at column 2 of the caret row) is no
+    /// text: a key it spells is not shown. Negative control: the same words
     /// with the cursor after them are the typed text.
     #[test]
     fn the_key_is_the_typed_text_the_composer_shows() {
@@ -10085,7 +9630,7 @@ mod composer_verify_tests {
             composer_verify_key(&placeholder, "edit"),
             ComposerKey::NotYet
         );
-        // NEGATIVE CONTROL: the cursor after the words.
+        // Negative control: the cursor after the words.
         let drafted = screen("\u{276f} Press up to edit queued messages", 35);
         assert_eq!(
             composer_verify_key(&drafted, "edit"),
@@ -10093,10 +9638,10 @@ mod composer_verify_tests {
         );
     }
 
-    /// AFTER THE ENTER the composer has LEFT the key once it no longer holds
+    /// After the Enter the composer has left the key once it no longer holds
     /// it — emptied, or Claude Code's placeholder back, though its words
     /// spell the key (`Press up to edit queued messages` after `edit`) —
-    /// HOLDS it while the typed text stands, is GONE where a box or a menu
+    /// holds it while the typed text stands, is gone where a box or a menu
     /// took its place, and is not judged in a frame still being drawn.
     #[test]
     fn after_the_enter_the_composer_has_left_holds_or_is_gone() {
@@ -10129,11 +9674,11 @@ mod composer_verify_tests {
         );
     }
 
-    /// A LATE ECHO IS WAITED FOR: the composer read `NotYet` is read again
+    /// A late echo is waited for: the composer read `NotYet` is read again
     /// each time the screen moves past the seq it was read at, and its key
     /// taken once shown. The echo's cap ending first, or no composer to
-    /// verify by, gives none (AUTO's `seq`); a reply that ends the turn (the
-    /// session exited) is handed back. NEGATIVE CONTROL: a composer showing
+    /// verify by, gives none (auto's `seq`); a reply that ends the turn (the
+    /// session exited) is handed back. Negative control: a composer showing
     /// the text at once waits for nothing.
     #[test]
     fn a_late_echo_is_waited_for_within_the_cap() {
@@ -10180,7 +9725,7 @@ mod composer_verify_tests {
             ),
             (Err("ERR exited\n".to_string()), vec![10])
         );
-        // NEGATIVE CONTROL: shown at once.
+        // Negative control: shown at once.
         assert_eq!(
             script(vec![shows()], vec![]),
             (Ok(Some("edit".to_string())), vec![])

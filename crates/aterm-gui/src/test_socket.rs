@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: hang a socket client up the way its PROCESS hangs up, and join
+//! Test-only: hang a socket client up the way its process exit does, and join
 //! what served it with a hang detector.
 //!
 //! `drop` closes a descriptor, and a socket closes only with its LAST one. In
@@ -20,32 +20,27 @@
 //! 2026-09-30. A relay's client-to-child pump, waiting for that EOF, parks the
 //! same way.
 //!
-//! [`hang_up`] acts on the socket instead of the descriptor. A real `aterm ctl`
-//! client is a process of its own, whose exit closes the last descriptor; this
-//! is how a test stands in for that exit. It does NOT stand in for a probe that
-//! needs the last close itself — the lanes' `POLLHUP` hangup check
-//! (`aterm_uds::hangup`) — which a test waits for as a fact instead
-//! (`control_hangup_tests`).
+//! [`hang_up`] acts on the socket instead, standing in for a real `aterm ctl`
+//! client's exit. It does not stand in for a probe that needs the last close
+//! itself (the lanes' `POLLHUP` check, `aterm_uds::hangup`); a test waits for
+//! that as a fact (`control_hangup_tests`).
 
 use std::thread::JoinHandle;
 
 use aterm_uds::CtlStream;
 
-/// HANG UP a test's client for the whole socket, not for one descriptor of
-/// it: the server end reads EOF at once whatever copies of the client end
-/// survive, and its writes are discarded without blocking. The production
-/// rule ([`aterm_uds::hangup::hang_up`]: each half on its own, because Darwin
-/// refuses a both-ways `shutdown` once the peer half-closed, and then shuts
-/// nothing), and then this descriptor's close.
+/// Hang up a test's client for the whole socket by the production rule
+/// ([`aterm_uds::hangup::hang_up`]), then close this descriptor: the server end
+/// reads EOF at once whatever copies of the client end survive, and its writes
+/// are discarded without blocking.
 pub(crate) fn hang_up(client: CtlStream) {
     aterm_uds::hangup::hang_up(&client);
 }
 
-/// Join a thread that must END once its client hung up — a push loop, a
-/// relay, a parked verb — with a HANG DETECTOR: one that never ends fails the
-/// test at [`aterm_spec::wait::MUST_HAPPEN`] instead of parking the suite in
-/// an unbounded `join`. Its value comes back; a panic inside it is re-raised
-/// as itself.
+/// Join a thread that must end once its client hung up (a push loop, a relay,
+/// a parked verb) with a hang detector of [`aterm_spec::wait::MUST_HAPPEN`],
+/// not an unbounded `join`. Its value comes back; a panic inside it is
+/// re-raised as itself.
 #[track_caller]
 pub(crate) fn join_after_hang_up<T>(join: JoinHandle<T>, what: &str) -> T {
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {

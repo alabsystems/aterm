@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exact allocation regression for the kitty-command listener.
+//! A warmed `TrickListener` allocates nothing.
 //!
-//! `TrickListener` sits on the typing path: every printed key, Backspace and
-//! Enter in every window goes through it, feature on or off. Its law is one
-//! inline push per letter and one fold + one hash probe per closed token, and,
-//! once the fold scratch has grown to the widest token the window can hold, no
-//! allocation at all (not for a fire, a borrowed event word or the command
-//! surfaces beside it, the boundary snapshot, a held address word, a parked
-//! fire, an IME commit, a session switch, or the glued reading of a no-space
-//! run, which probes borrowed halves of the inline token, hit or miss).
+//! It sits on the typing path: every printed key, Backspace and Enter in every window goes
+//! through it, feature on or off. Its cost is one inline push per letter and one fold plus one
+//! hash probe per closed token; once the fold scratch has grown to the widest token the window
+//! holds, nothing allocates (not a fire, a borrowed event word or the command surfaces beside it,
+//! the boundary snapshot, a held address word, a parked fire, an IME commit, a session switch, or
+//! the glued reading of a no-space run, which probes borrowed halves of the inline token, hit or
+//! miss).
 //!
 //! Counted by the suite's per-thread allocator (`alloc_count`), so the pin
 //! shares `effects_suite` with every other test and no parallel test bleeds
@@ -52,16 +51,15 @@ words = ["앉아"]
 cjk   = true
 "#;
 
-/// What one pass of the script heard. Plain counters: comparing them
-/// allocates nothing, and they prove the counted pass really exercised every
-/// lane (a script that silently stopped firing would make a zero vacuous).
+/// What one pass of the script heard: proof the counted pass exercised every lane, so a zero is
+/// not vacuous. Plain counters, so comparing them allocates nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct Heard {
     fires: usize,
     confirms: usize,
     revokes: usize,
     pet_only_submits: usize,
-    /// Bytes of fired words, read THROUGH the borrowed `&str`.
+    /// Bytes of fired words, read through the borrowed `&str`.
     word_bytes: usize,
     /// Bytes of their command surfaces, walked as a host's ignore list walks
     /// them: fewer than `word_bytes` once a glued run has fired.
@@ -234,8 +232,6 @@ fn a_warmed_listener_is_allocation_free_on_every_lane() {
     let allocations = allocations_during(|| {
         counted = one_pass(&mut listener, english, &lanes, &mut now);
     });
-    // `assert_eq!` formats on failure only; the comparison allocates nothing,
-    // and it runs after the counter is off in any case.
     assert_eq!(counted, expected, "the counted pass heard something else");
     assert_eq!(allocations, 0, "a warmed listener must not allocate");
 }

@@ -75,39 +75,31 @@ pub(crate) fn offscreen_view_formats(srgb_offscreen: bool) -> &'static [TextureF
 /// * `glow_boost_pass ⇒ swapchain_is_f16 ∧ glow_nonempty ∧ hdr_glow`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HdrPlan {
-    /// The blit decodes the offscreen's sRGB bytes to linear (clamped ≤ 1.0 —
-    /// the grid clamp law) for the extended-linear-sRGB f16 swapchain.
+    /// The blit decodes the offscreen's sRGB bytes to linear (clamped to 1.0) for
+    /// the extended-linear-sRGB f16 swapchain.
     pub blit_linear_encode: bool,
     /// Run the HDR aurora pass after the blit: re-emit the glow quads additively
     /// above 1.0, clamped to the panel headroom (`aterm_render::hdr`).
     pub glow_boost_pass: bool,
 }
 
-/// ATTACH: pick `Rgba16Float` for the swapchain? See [`HdrPlan`].
+/// Attach: pick `Rgba16Float` for the swapchain? See [`HdrPlan`].
 #[must_use]
 pub fn hdr_swapchain_wants_f16(hdr_glow: bool, supports_f16: bool) -> bool {
     hdr_glow && supports_f16
 }
 
-/// The attach gate narrowed by screen (macOS Metal arm):
-/// [`hdr_swapchain_wants_f16`] and the window's screen reports EDR potential
-/// (`NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`, via
-/// `screen_edr_potential`) above 1.0.
+/// The attach gate narrowed by screen (macOS Metal arm): [`hdr_swapchain_wants_f16`]
+/// and the window's screen reports EDR potential
+/// (`NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`) above 1.0.
+/// On a potential-1.0 screen an f16 swapchain draws no crown (zero headroom, and
+/// [`sdr_boost_pass`] is off on f16) yet costs more GPU time and memory.
 ///
-/// On a screen with potential 1.0 an f16 swapchain draws no crown at all (the
-/// HDR aurora has zero headroom and [`sdr_boost_pass`] is off on f16) and costs
-/// more GPU time and drawable memory, so such a screen gets the 8-bit pick and
-/// the SDR crown.
-///
-/// The potential, not the brightness-tracking current value (which the present
-/// reads as `edr_max`): it is brightness-independent and fixed per `NSScreen`
-/// object. A display-settings change can create a new `NSScreen`, so the
-/// frontend re-reads the potential for 8-bit windows via
-/// [`hdr_screen_upgrade_wants_f16`].
-///
-/// `None` (unresolved screen) keeps the unconditional pick, so this narrows
-/// only on a positive "cannot show EDR" answer and implies
-/// [`hdr_swapchain_wants_f16`]. A non-finite potential counts as SDR.
+/// The potential, unlike the current value the present reads as `edr_max`, is
+/// brightness-independent and fixed per `NSScreen`; a display-settings change can
+/// create a new `NSScreen`, so the frontend re-checks 8-bit windows via
+/// [`hdr_screen_upgrade_wants_f16`]. `None` (unresolved screen) keeps the
+/// unconditional pick; a non-finite potential counts as SDR.
 #[must_use]
 pub fn hdr_swapchain_wants_f16_on_screen(
     hdr_glow: bool,
@@ -376,7 +368,7 @@ mod tests {
         let potentials = [
             None,
             Some(1.0),  // an external SDR monitor
-            Some(2.0),  // this 2017 MacBook Pro's built-in panel (measured)
+            Some(2.0),  // a MacBook Pro built-in panel (measured)
             Some(16.0), // Pro Display XDR
             Some(1.0 + f32::EPSILON),
             Some(0.0),
@@ -404,8 +396,7 @@ mod tests {
                 }
             }
         }
-        // NON-VACUITY: the SDR-screen answers (1.0, 0.0, -1.0, NaN, +inf) each
-        // narrow the one (on, supported) corner — five real narrowings, no more.
+        // Non-vacuity: the five SDR answers each narrow the one (on, supported) corner.
         assert_eq!(narrowed, 5, "the screen gate must bite on every SDR answer");
         // The pinned corners, spelled out.
         assert!(hdr_swapchain_wants_f16_on_screen(true, true, None));
@@ -467,8 +458,8 @@ mod tests {
                 }
             }
         }
-        // NON-VACUITY: the three EDR answers (2.0, 16.0, 1+ε) each upgrade the
-        // one (on, supported, 8-bit) corner — three real upgrades, no more.
+        // Non-vacuity: the three EDR answers each upgrade the one (on, supported,
+        // 8-bit) corner.
         assert_eq!(upgraded, 3, "the upgrade must bite on every EDR answer");
         // The pinned corners, spelled out.
         assert!(hdr_screen_upgrade_wants_f16(true, true, false, Some(2.0)));

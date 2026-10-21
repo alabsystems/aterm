@@ -10,4 +10,4 @@ expect close t1 turn out=done
 pass 6000
 see busy
 expect open t1 turn
-expect open t2 turn at=7000
+expect open t2 turn @7000

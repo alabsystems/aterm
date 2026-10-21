@@ -11,7 +11,6 @@
 use std::ops::Deref;
 use std::os::raw::c_char;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::keyboard::SmolStr;
 #[cfg(x11_platform)]
@@ -30,12 +29,7 @@ mod state;
 use compose::{ComposeStatus, XkbComposeState, XkbComposeTable};
 use keymap::XkbKeymap;
 
-#[cfg(x11_platform)]
-pub use keymap::raw_keycode_to_physicalkey;
 pub use state::XkbState;
-
-// TODO: Wire this up without using a static `AtomicBool`.
-static RESET_DEAD_KEYS: AtomicBool = AtomicBool::new(false);
 
 /// libxkbcommon's table. aterm-xkb loads it once per process; a missing library panics, as
 /// upstream's `xkbcommon_handle` did, and `Context::new` checks first.
@@ -52,11 +46,6 @@ fn xkbch() -> &'static XkbCommonCompose {
 #[cfg(feature = "x11")]
 fn xkbxh() -> &'static xkb::XkbX11 {
     xkb::x11().expect("Library libxkbcommon-x11.so could not be loaded.")
-}
-
-#[inline(always)]
-pub fn reset_dead_keys() {
-    RESET_DEAD_KEYS.store(true, Ordering::SeqCst);
 }
 
 #[derive(Debug)]
@@ -262,10 +251,6 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
         let keysym = context.state.get_one_sym_raw(keycode);
 
         let compose = if let Some(state) = context.compose_state1.as_mut().filter(|_| compose) {
-            if RESET_DEAD_KEYS.swap(false, Ordering::SeqCst) {
-                state.reset();
-                context.compose_state2.as_mut().unwrap().reset();
-            }
             state.feed(keysym)
         } else {
             ComposeStatus::None

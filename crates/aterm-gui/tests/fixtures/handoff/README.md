@@ -26,8 +26,10 @@ lenient.
 
 `seamless::fixture_tests::every_shipped_producers_desk_adopts_exactly_and_proves`
 (`crates/aterm-gui/src/seamless_fixture_tests.rs`) runs every desk of every
-release through this build's `take_incoming`. It asks only about what the
-desk's `parent.toml` records, and asserts that:
+release through this build's `take_incoming`. It asks about what the desk's
+`parent.toml` records and, where `parent.toml` records nothing (a record's
+render debt columns, the blocks a full clear blanked, the Settings drafts),
+about the producer's own bytes, and asserts that:
 
 - every session is adopted exactly: repainted only when its producer flagged
   it, each screen byte for byte at its carried geometry, each control carry
@@ -48,10 +50,18 @@ desk's `parent.toml` records, and asserts that:
   sidecar imports nothing;
 - after the import, in an engine whose owner allows palette changes, every
   colour the application set is live, the completed-command count is the
-  parent's, and every carried shell mark still names its line: its prompt row
-  reads as a prompt (every shell on these desks prompts as `dev@devhost`) and
-  its output end is readable. A repainted session's marks are not read: its
-  screen is blank until its program redraws;
+  parent's, every carried mark keeps its exact rows, columns and exit, and
+  every carried block keeps the full-clear flags the parent recorded
+  (`text_cleared`, `command_text_cleared`), no more and no fewer, and every
+  carried shell mark still names its line: its prompt row reads as a prompt
+  (every shell on these desks prompts as `dev@devhost`) and its output end is
+  readable. A repainted session's marks are not read: its screen is blank until
+  its program redraws; nor is the prompt row of a mark whose block a full clear
+  blanked, which the live terminal reads as Evicted, unless a block no clear
+  blanked prompts on that row. Which marks a clear blanked is read off the
+  parent's checkpoint, never the engine under test, and that checkpoint's
+  flags are first held to the producer's own meta (`s<id>.meta.json`, read
+  with `aterm_json`'s value tree, never this build's decode of it);
 - every unsaved Settings draft the layout carries is placed on the leaf that
   carried it, with its key and text, and none is dropped as unreadable. Whether
   this build's Settings view still has an input for the key is past what a
@@ -67,7 +77,13 @@ The guard reads history sidecars straight off the checked-in bytes with the
 line codec, never through the consumer's reader, because the import is what it
 checks. It counts the `[[….settings_drafts]]` tables in the layout's raw text
 and reads each draft with `aterm_toml`, which also sits under the consumer's
-parse: the count is independent of the consumer, the text is not.
+parse: the count is independent of the consumer, the text is not. A record's
+render debt is the rows `parent.toml` records (`render_debt`) and the columns of
+the record's own `render_debt_cut` key, read off the manifest's TOML tree, never
+the consumer's record. New generators also copy the column count to the optional
+parent summary, which must agree with the wire; older immutable summaries omit it. v0.107.0's producer is
+the first to write the key, on a session that owes columns; v0.108.0's
+`engine-state` htop is the first desk record that carries one.
 
 Beside it:
 
@@ -80,6 +96,20 @@ Beside it:
   drafts check's, stages the newest `link-dense-history` desk and changes only
   the placed layout: the draft dropped uncounted, dropped and counted
   unreadable, and the Settings tab moved to the other tab's position.
+- `a_consumer_that_drops_column_debt_fails_the_exact_debt_check`, the render
+  debt check's, stages the newest desk whose record carries a cut and drops the
+  cut from the adopted session's debt, which no digest or proof covers.
+- `a_consumer_that_moves_a_full_clears_flags_or_rows_fails_the_mark_check`,
+  the mark check's, lands the newest `engine-state` desk's cleared shell and an
+  uncleared one as carried, then judges, against the parent's checkpoint, an
+  engine restored with the clear's flags dropped, one with every block of the
+  uncleared shell flagged, and one with the cleared shell's marks and blocks
+  moved down a row.
+- `a_consumer_that_decodes_a_meta_without_its_clear_flags_fails_the_flag_check`,
+  the decode's, hands the same cleared shell to the guard as a consumer whose
+  meta reader dropped the flags would decode it: the guard must fail where it
+  holds the decoded flags to the producer's meta, not later on the blank
+  prompt row the clear left.
 - `every_release_since_the_floor_pins_the_required_desks` checks that every
   release pins each desk in `REQUIRED_DESKS` from that desk's floor on.
 
@@ -323,7 +353,9 @@ v0.100.0).
   the charsets in G1 to G3, its title pushed with the icon name cleared, mouse
   modes saved, the alternate screen's own saved cursor and kitty keyboard
   stack, an open OSC 8 link, VT52 mode with an address in progress, a 1049
-  screen that owes rows after a resize, a shell resized back by the handback,
+  screen that owes columns after a narrowing (htop drew 99 of its 100 columns
+  and was narrowed to 80 with no redraw since, so its record carries
+  `render_debt_cut = 19`), a shell resized back by the handback,
   shells whose integration state was revoked, held, stale or cleared, and
   Claude Code's two drawers with their cut holders.
 - `held-failed` and `held-withheld` (v0.108.0): a shell beside a `make` that
@@ -571,7 +603,17 @@ among them) and `fields.toml`, and `generate_rendezvous_fixture` (macOS) writes
 `rendezvous.toml` with the guard's own capture (`capture_transport`). Each
 self-checks: the release's own consumer must adopt every desk exactly, held
 panes and history imports included, and the desks must cover every field the
-newest recorded release's did (`fields.toml`, above).
+newest recorded release's did (`fields.toml`, above). `generate_handoff_fixtures`
+then asks of every desk it wrote what the desk guard asks once the desks are
+checked in (`assert_written_desks_adopt`, the guard's own per-desk check), so a
+desk the guard cannot read as written fails the run of the tree that writes it,
+not main after the release lands it (as v0.108.0's htop record did, 8f45f2dc7d).
+Last it reads every manifest, layout and meta under the fixture root with its
+desks in place of `v<version>/`, as the serde corpus's
+`state_written_by_shipped_producers_answers_as_recorded` reads them once they
+are checked in (`serde_corpus_tests::shipped_state_with`): every one of its own
+must read back, and with `ATERM_SHIPPED_STATE_OUT` set it writes that answers
+file there.
 
 Nothing in it is edited per release. Every release input is derived at run
 time:
@@ -604,14 +646,24 @@ The cut (`crates/aterm-release/src/fixtures.rs`):
    `target-fixture-guard` (removed after), with C's and n's pins and the
    prover's `TRUST_STAGE2_BIN`, into the release cache
    (`<clone>-release.noindex/handoff-fixtures/vX.Y.0-<n>-<C12>/`, outside the
-   clone). A failing test, a desk `REQUIRED_DESKS` asks of the release left
-   out, a missing `rendezvous.toml` (macOS), or a desk not written as C and n
-   refuses the release with nothing claimed or published. A re-run that finds
+   clone), the shipped-state answers beside `vX.Y.0/` (`shipped-state.txt`).
+   A failing test, a desk `REQUIRED_DESKS` asks of the release left out, a
+   missing `rendezvous.toml` (macOS), a desk not written as C and n, or no
+   shipped-state answers for the release's desks refuses the release with
+   nothing claimed or published. A re-run that finds
    the identity staged (the journal's `fixtures-staged`) runs nothing; a
    reservation the ledger passed, reserved anew, is written afresh.
 2. Step 11 (`after-cut`), once the cut has published the release: one commit
-   on origin/main's tip adds `vX.Y.0/` and its `("vX.Y.0", "<desk>")` rows in
-   `PINNED_DESKS`, pushed as a fast-forward of main (a compare-and-swap). A
+   on origin/main's tip adds `vX.Y.0/`, its `("vX.Y.0", "<desk>")` rows in
+   `PINNED_DESKS` and its cases in `../serde-corpus/shipped-state.txt`, so the
+   commit that adds the desks leaves the corpus's sweep of them green (four
+   releases running, v0.105.0 to v0.108.0, landed without them and turned main
+   red until a hand re-record). The cases go after the case they follow in the
+   staged answers, found by its id in main's file, so an answer main
+   re-recorded since the cut stays as main holds it; a file that cannot take
+   them (it lost that case, or records the release already) gets the desks
+   alone, and the step says the answers were not recorded. The commit is
+   pushed as a fast-forward of main (a compare-and-swap). A
    lost race rebuilds the commit on the new tip, up to five tries, as the
    ledger claim does; any other push failure refuses the step, and running the
    release again lands what is staged. A tip whose fixtures for the release
@@ -657,6 +709,8 @@ ATERM_HANDOFF_FIXTURE_OUT=$OUT ATERM_RENDEZVOUS_FIXTURE_OUT=$OUT \
 
 The tag is annotated, so take the commit it points at, not the tag object's own
 sha. Then, in the landing worktree, add the release's `("vX.Y.0", "<desk>")`
-rows to `PINNED_DESKS` in `seamless_fixture_tests.rs`, run `targo --unverified
-test -p aterm-gui --lib -- fixture_tests`, commit, land, and remove both
-worktrees.
+rows to `PINNED_DESKS` in `seamless_fixture_tests.rs`, record the release's
+shipped-state answers (`ATERM_BLESS_SERDE_CORPUS=1 targo --unverified test -p
+aterm-gui --lib -- state_written_by_shipped_producers`; check it added only
+`vX.Y.0/` cases), run `targo --unverified test -p aterm-gui --lib --
+fixture_tests serde_corpus_tests`, commit, land, and remove both worktrees.

@@ -36,12 +36,12 @@
 //!
 //! **FFI style**: hand-rolled by-hand-vtable COM against system DLLs (ole32), the
 //! same tiny-FFI house style as [`super::jumplist_win`] and the `ITaskbarList3`
-//! block in `app_window.rs` — see the vocabulary note there. The `windows` crate
-//! is in this binary for DXGI only, and pulling `Win32_UI_Shell` +
-//! `Win32_System_Com` for three leaf interfaces was rejected there for the same
-//! reason it is rejected here: the vtables below are transcribed from
-//! `shobjidl_core.h`, and every slot before a called one is declared so offsets
-//! are load-bearing and checked by shape.
+//! block in `app_window.rs` — see the vocabulary note there. The shared COM
+//! vocabulary (`Com`, `co_create`, the apartment) is aterm-win32's; pulling
+//! `windows`' `Win32_UI_Shell` + `Win32_System_Com` for three leaf interfaces
+//! was rejected there for the same reason it is rejected here: the vtables
+//! below are transcribed from `shobjidl_core.h`, and every slot before a called
+//! one is declared so offsets are load-bearing and checked by shape.
 #![cfg(windows)]
 
 use std::ffi::c_void;
@@ -300,9 +300,9 @@ pub(crate) fn available() -> bool {
         let Ok(_apartment) = Apartment::enter() else {
             return false;
         };
-        // SAFETY: standard COM object creation; the returned reference is
-        // released by `Com`'s Drop at the end of this expression.
-        unsafe { co_create(&CLSID_FILE_OPEN_DIALOG, &IID_IFILE_OPEN_DIALOG, "probe") }.is_ok()
+        // The returned reference is released by `Com`'s Drop at the end of
+        // this expression.
+        co_create(&CLSID_FILE_OPEN_DIALOG, &IID_IFILE_OPEN_DIALOG, "probe").is_ok()
     })
 }
 
@@ -372,14 +372,12 @@ unsafe fn show_dialog<N: AsRef<str>, S: AsRef<str>>(
 ) -> Result<Option<PathBuf>, StepError> {
     let _apartment = Apartment::enter()?;
 
-    let dialog = unsafe {
-        co_create(
-            &CLSID_FILE_OPEN_DIALOG,
-            &IID_IFILE_OPEN_DIALOG,
-            "create FileOpenDialog",
-        )?
-    };
-    let ptr = dialog.0.cast::<IFileOpenDialog>();
+    let dialog = co_create(
+        &CLSID_FILE_OPEN_DIALOG,
+        &IID_IFILE_OPEN_DIALOG,
+        "create FileOpenDialog",
+    )?;
+    let ptr = dialog.as_raw().cast::<IFileOpenDialog>();
     let vt = unsafe { &*(*ptr).vtbl };
 
     // Options FIRST, folded over the shell's defaults (see `dialog_options`).
@@ -418,11 +416,11 @@ unsafe fn show_dialog<N: AsRef<str>, S: AsRef<str>>(
 
     let mut item: *mut c_void = std::ptr::null_mut();
     check(unsafe { (vt.get_result)(ptr, &mut item) }, "GetResult")?;
-    if item.is_null() {
+    // SAFETY: a successful GetResult hands over one reference to the item.
+    let Some(item) = (unsafe { Com::from_raw(item) }) else {
         return Err(("GetResult", 0));
-    }
-    let item = Com(item);
-    let item_ptr = item.0.cast::<IShellItem>();
+    };
+    let item_ptr = item.as_raw().cast::<IShellItem>();
 
     let mut name: *mut u16 = std::ptr::null_mut();
     check(

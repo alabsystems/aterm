@@ -23,8 +23,7 @@ use aterm_grid::test_counters::take_ring_fast_materialize;
 const ROWS: u16 = 6;
 const COLS: u16 = 40;
 
-/// The corpus. Every line is one physical row's worth of content and exercises
-/// a different edge of the serializer/parser pair.
+/// One physical row per line, each on a different edge of the serializer/parser pair.
 fn corpus() -> Vec<String> {
     vec![
         // Plain ASCII — the common cell, and the closed-form fast path.
@@ -37,9 +36,8 @@ fn corpus() -> Vec<String> {
         "cjk 日本語テキスト end".to_owned(),
         // Non-BMP emoji (complex cells), plus a ZWJ family and a skin tone.
         "emoji 🎉 👨‍👩‍👧 👍🏽".to_owned(),
-        // Printable ASCII after a cell ending in a ZWJ opens a cell of its own
-        // (the ASCII bulk path never folds), and the round trip must not join
-        // it (ruling 2026-10-11, r15 search-columns review).
+        // Printable ASCII after a cell ending in a ZWJ opens a cell of its own (the ASCII
+        // bulk path never folds), and the round trip must not join it.
         "zwj then ascii \u{2764}\u{FE0F}\u{200D}Qa".to_owned(),
         // Presentation selectors: VS16 widens, VS15 narrows.
         "vs ❤\u{FE0F} ⌚\u{FE0E} done".to_owned(),
@@ -145,8 +143,7 @@ fn assert_row_parity(term: &Terminal, rev_idx: usize) {
     }
 }
 
-/// Every RING-tier history row materializes identically both ways, and the fast
-/// path really is the one producing the direct reads.
+/// Every ring-tier history row materializes identically both ways, through the fast path.
 #[test]
 fn ring_rows_materialize_identically_to_the_line_round_trip() {
     let mut term = Terminal::new(ROWS, COLS);

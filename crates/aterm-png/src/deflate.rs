@@ -1,22 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The zlib COMPRESSOR the PNG encoder needs (RFC 1950 + RFC 1951).
+//! Streaming zlib compressor for the PNG encoder (RFC 1950 + RFC 1951; paired
+//! with `aterm_codec::inflate`).
 //!
-//! The other half is `aterm_codec::inflate`.
-//!
-//! Fixed-Huffman blocks (RFC 1951 §3.2.6) over a greedy LZ77 match finder with a
-//! 32 KiB window and hash-chained candidates. No dynamic Huffman tables, no
-//! block-splitting heuristics, no lazy matching. Every stream it emits is a
-//! VALID zlib stream.
-//!
-//! The compressor streams: it takes its input a scanline at a time and holds
-//! [`STATE_BYTES`] beside its pending output, whatever the image's size.
-//!
-//! Dynamic Huffman would win on entropy, but measured on 60 corpus images
-//! (31,157,948 raw bytes) this encoder wrote 3,304,492 bytes against `png`'s
-//! 3,876,652 (0.85x): `png` defaulted to `Fast`, and the per-row adaptive
-//! filter in `encode::RowFilter` matters more than the entropy stage.
+//! Emits a single fixed-Huffman block (RFC 1951 §3.2.6) over a greedy LZ77
+//! match finder with a 32 KiB window and hash-chained candidates, holding
+//! [`STATE_BYTES`] beside its pending output regardless of image size.
 
 use crate::checksum::Adler32;
 
@@ -512,8 +502,7 @@ mod tests {
         );
     }
 
-    /// The whole-buffer compressor this streaming one replaced, kept verbatim
-    /// as the oracle for byte identity: one `prev` link per input position.
+    /// Reference whole-buffer compressor with one `prev` link per input position.
     fn whole_buffer_zlib(data: &[u8]) -> Vec<u8> {
         let mut w = BitWriter::with_capacity(0);
         w.bits(1, 1);
@@ -644,10 +633,6 @@ mod tests {
         ]
     }
 
-    /// THE STREAMING COMPRESSOR IS THE WHOLE-BUFFER ONE, BYTE FOR BYTE, however
-    /// its input is split: in one write, in scanline-sized writes, in seeded
-    /// random splits, and a byte at a time. The long cases run past three
-    /// windows, so the chain ring wraps and the window compacts.
     #[test]
     fn streaming_output_is_byte_identical_to_the_whole_buffer_compressor() {
         let mut state = 0x9E37_79B9u32;

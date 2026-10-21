@@ -41,7 +41,7 @@ pub enum VisibleTrim {
 /// space ([`visible_char`]), then the appended text's tail trimmed per `trim`,
 /// so a row ending in a control char ends no differently from one ending in a
 /// blank. What `out` held is never changed. Text with no control char (nearly
-/// every row) costs one `push_str` and a scan. THE collapse-and-trim rule:
+/// every row) costs one `push_str` and a scan. The collapse-and-trim rule:
 /// [`visible_row`], `line`, `offscreen` and `blocktext` all append through it.
 pub fn push_visible(out: &mut String, s: &str, trim: VisibleTrim) {
     let start = out.len();
@@ -77,15 +77,14 @@ pub fn is_blank_row(row: &str) -> bool {
 
 /// How many leading rows a reply keeps once its trailing blank rows
 /// ([`is_blank_row`]) are dropped: the index of the last row that is not blank
-/// plus one, and 0 when every row is blank. Interior blank rows are KEPT, only
+/// plus one, and 0 when every row is blank. Interior blank rows are kept, only
 /// the tail goes, so row `i` of a trimmed reply is still row `i` of the read,
 /// and the `line`/`cell`/`search` coordinates an agent reads off it stay valid.
-/// THE one blank-tail rule: `text trim`, `text --json trim`, `turn … trim=1`,
+/// The blank-tail rule: `text trim`, `text --json trim`, `turn … trim=1`,
 /// `blocktext … trim`, `temporal … trim` and the `subscribe … screen,trim` delta
 /// all count with it, so the polled and pushed faces cannot disagree about what
-/// a trailing blank is. (F4: a 55-row grid with 48 blank rows cost ~7.6 KB per
-/// read and a `grep -v` on every reply; the count on a trimmed header is the
-/// count of rows actually sent.)
+/// a trailing blank is. The count on a trimmed header is the count of rows
+/// actually sent.
 pub fn trimmed_len<'a>(rows: impl Iterator<Item = &'a str>) -> usize {
     rows.enumerate()
         .filter(|(_, r)| !is_blank_row(r))
@@ -187,8 +186,7 @@ pub fn wait_ms(token: &str) -> Option<u64> {
 /// the bidi controls, U+2028/U+2029: a cwd from OSC 7 or a command line from
 /// OSC 633 is text a program chose). Still valid JSON that decodes to the same
 /// string; every other character, non-ASCII included, is verbatim UTF-8. The
-/// implementation is `aterm_codec::json`, shared with the supervisor's JSON
-/// (ruling 2026-10-10, round fifteen, OUT-2).
+/// implementation is `aterm_codec::json`, shared with the supervisor's JSON.
 pub use aterm_codec::json::{escape as json_escape, escape_into as json_escape_into};
 
 /// The typed record sinks: a producer writes each field once to a
@@ -246,7 +244,7 @@ mod tests {
     }
 
     /// `push_visible` collapses first and trims second, under each rule, and
-    /// never touches what the buffer held. NEGATIVE CONTROL: trimming before the
+    /// never touches what the buffer held. Negative control: trimming before the
     /// collapse (the order `text order=display` reads its rows in) leaves a space
     /// where a row ends in a control char.
     #[test]
@@ -288,8 +286,8 @@ mod tests {
 
     /// The blank rule counts a raw line and its shown form alike, which is what
     /// lets `blocktext` count its tail before it frames a row; interior blank rows
-    /// stay. NEGATIVE CONTROL: the spaces-only blank test this replaced counts an
-    /// NBSP or a control char as content.
+    /// stay. Negative control: a spaces-only blank test counts an NBSP or a
+    /// control char as content.
     #[test]
     fn trimmed_len_is_last_nonblank_plus_one() {
         assert_eq!(trimmed_len(["", "", ""].into_iter()), 0, "all blank");
@@ -321,7 +319,7 @@ mod tests {
         assert_eq!(spaces_only, 4, "control: the old rule keeps every row");
     }
 
-    /// `visible_row` is the old two-pass reading (the engine's line, collapsed,
+    /// `visible_row` matches a two-pass reading (the engine's line, collapsed,
     /// then trimmed) byte for byte on every row, scrolled back or not, and
     /// `visible_row_into` appends exactly it after what the buffer held.
     #[test]

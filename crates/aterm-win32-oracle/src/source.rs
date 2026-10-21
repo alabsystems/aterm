@@ -442,13 +442,24 @@ impl Upstream {
             .filter(|it| it.features.is_subset(enabled))
             .collect()
     }
+    /// The features upstream gates `key` on: its modules' and, over its
+    /// variants, its own.
+    pub fn gates(&self, key: &Key) -> BTreeSet<String> {
+        let mut out: BTreeSet<String> = (1..=key.0.len())
+            .filter_map(|n| self.modules.get(&key.0[..n])?.feature.clone())
+            .collect();
+        for it in self.items.get(key).into_iter().flatten() {
+            out.extend(it.features.iter().cloned());
+        }
+        out
+    }
     pub fn resolve(&self, base: &[String], segments: &[String]) -> Option<Key> {
         if segments.is_empty() {
             return None;
         }
         let mut segs = segments.to_vec();
         let mut cur = base.to_vec();
-        if ["windows_sys", "$crate", "crate"].contains(&segs[0].as_str()) {
+        if ["windows_sys", "aterm_win32", "$crate", "crate"].contains(&segs[0].as_str()) {
             cur.clear();
             segs.remove(0);
         } else if segs[0] == "super" {

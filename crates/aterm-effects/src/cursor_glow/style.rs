@@ -127,7 +127,15 @@ impl GlowStyle {
     /// only to pick the skin.
     #[must_use]
     pub fn style_names_any_pet(s: &str) -> bool {
-        Self::style_names_kitty_pet(s) || Self::style_names_dog_pet(s)
+        matches!(
+            spellings::canonical(s),
+            Some(
+                "rainbow kitty pet"
+                    | "rainbow kitty underline"
+                    | "rainbow kitty flat"
+                    | "rainbow dog pet"
+            )
+        )
     }
 
     /// Whether this style string selects the highlighter-plus-under-baseline
@@ -218,10 +226,9 @@ impl GlowStyle {
 }
 
 /// Resolved tunables (`Copy`, so the host reads it out before borrowing window
-/// state). `PartialEq` (never `Eq`; f32 fields) backs the `last_cfg`
-/// compare-on-write in [`CursorGlow::tick`]: equal configs produce the same
-/// frame. The converse does not hold: [`Self::audible`] is audio-only, so
-/// configs differing in it alone draw identical frames.
+/// state). `PartialEq` backs the `last_cfg` compare-on-write in
+/// [`CursorGlow::tick`]: equal configs produce the same frame (configs
+/// differing only in the audio-only [`Self::audible`] also do).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlowConfig {
     pub enabled: bool,
@@ -239,17 +246,11 @@ pub struct GlowConfig {
     /// the host's load-shed envelope. See [`Self::audible`] for the audio half.
     pub intensity: f32,
     /// The audio half: whether a key pressed on this tick's window should be
-    /// heard, independent of how bright the trail is.
-    ///
-    /// A key-time click costs no GPU, so a frame shed for performance is still a
-    /// heard key, and Reduce Motion dims the light without closing the key seam.
-    ///
-    /// Not decided here: the master switch and serious mode arrive as
-    /// [`Self::enabled`], and the sound knobs (`trail_sounds`,
-    /// `trail_sound_volume`, the resize-quiet window, a dead audio worker) gate
-    /// host-side in `keystroke_click_audible` before a cue is minted. The host
-    /// puts here the one term the engine cannot see: whether the key landed in
-    /// this window.
+    /// heard. A key-time click costs no GPU, so a shed frame is still a heard
+    /// key, and Reduce Motion dims the light without closing the key seam. The
+    /// master switch arrives as [`Self::enabled`] and the sound knobs gate
+    /// host-side (`keystroke_click_audible`); the host puts here the one term
+    /// the engine cannot see, whether the key landed in this window.
     pub audible: bool,
     /// Bloom-crown radius in cells (0 ⇒ no crown, comet only).
     pub radius: f32,
@@ -260,17 +261,10 @@ pub struct GlowConfig {
     /// [`HaloMode::Over`] source-over veils. Default true.
     pub dark_theme: bool,
     /// The theme's resolved default foreground and background, `0x00RRGGBB`, with
-    /// OSC 10/11 and DECSCNM folded in by the host (canonically
-    /// `rgb_to_u32(terminal_blank_cell(term).fg / .bg)`).
-    ///
-    /// Only the fresh-typed glyph tint reads them: it anchors on `theme_fg` so
-    /// the tint hands the foreground back exactly, and bounds itself against
-    /// `theme_bg` by real WCAG contrast.
-    ///
-    /// A host that cannot resolve one may pass [`aterm_core::render::COLOR_UNSET`];
-    /// the tint then suppresses itself rather than reading the sentinel as black.
-    /// `fg == bg` (a conceal-shaped theme) also suppresses it, as
-    /// `floor_min_contrast_fg` refuses to reveal concealed text.
+    /// OSC 10/11 and DECSCNM folded in by the host. Only the fresh-typed glyph
+    /// tint reads them: it anchors on `theme_fg` and bounds itself against
+    /// `theme_bg` by WCAG contrast. [`aterm_core::render::COLOR_UNSET`] or
+    /// `fg == bg` (a conceal-shaped theme) suppresses the tint.
     pub theme_fg: u32,
     pub theme_bg: u32,
     /// Whether this style draws its own additive comet beam (the anti-aliased
@@ -307,25 +301,18 @@ pub struct GlowConfig {
     /// shoulder. Cohort admission, segment survival, retract, momentum,
     /// starfield and the light-theme rail are shared.
     pub ribbon_tall: bool,
-    /// The flat body: the explicit `… flat` spelling
-    /// ([`GlowStyle::style_names_flat_ribbon`]), `false` by default.
-    ///
-    /// `false` draws the comet body with its vivid rail
-    /// (`docs/design/RAINBOW-KITTY-V2.md` §30): fattest and brightest at the
-    /// hand, the full-value spectrum below the row bottom where no letter can
-    /// be, and a new cell's light entering from the caret side. `true` draws the
-    /// flat body (same shape at every cell, the bed alone below the baseline,
-    /// uniform edge-in) as an A/B control. A presentation like
-    /// [`Self::ribbon_tall`], composing with either geometry; read by
-    /// `rainbow_kitty::ribbon` alone.
+    /// The flat body, selected only by the explicit `… flat` spelling
+    /// ([`GlowStyle::style_names_flat_ribbon`]). `false` draws the comet body
+    /// with its vivid rail (`docs/design/RAINBOW-KITTY-V2.md` §30): fattest and
+    /// brightest at the hand, the full-value spectrum below the row bottom, and
+    /// a new cell's light entering from the caret side. `true` draws the same
+    /// shape at every cell as an A/B control. Read by `rainbow_kitty::ribbon`
+    /// alone.
     pub ribbon_flat: bool,
-    /// The classic wake's colour face, chosen by the resolved spelling as
-    /// [`Self::ribbon_tall`] chooses geometry.
-    ///
-    /// `false` (plain `classic`) is a rolling spectrum sweep independent of the
-    /// theme. `true` (`classic mono`) is the two-tone tracer fading
-    /// `accent → color`, which follows the theme's cursor colour,
-    /// `cursor_trail_color` and live OSC 12.
+    /// The classic wake's colour face: `false` (plain `classic`) is a rolling
+    /// spectrum sweep independent of the theme; `true` (`classic mono`) is the
+    /// two-tone tracer fading `accent → color`, which follows the theme's cursor
+    /// colour, `cursor_trail_color` and live OSC 12.
     pub classic_mono: bool,
 }
 

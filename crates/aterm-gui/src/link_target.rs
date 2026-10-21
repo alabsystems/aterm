@@ -1,92 +1,51 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LINK TARGET CAPTION: the one-row chrome band that says where the
-//! hyperlink under the pointer actually goes.
+//! The link target caption: a one-row chrome band that says where the hyperlink under the
+//! pointer goes. OSC 8 lets the visible text and the destination be unrelated, so the underline
+//! on a linked cell says only "this is a link". The band reuses the `paste_banner` mechanics (a
+//! pure `RenderCell` row builder plus a splice that overwrites one frame row in place).
 //!
-//! OSC 8 lets the visible text and the destination be unrelated — `google.com`
-//! addressed to `evil.example` is one escape sequence — so the underline the
-//! renderer stamps on a linked cell says "this is a link" and nothing at all
-//! about WHERE. A mark that invites a click without disclosing its destination
-//! is half an affordance; the other half is this band, which reuses the
-//! `paste_banner` mechanics (a pure `RenderCell` row builder
-//! plus a splice that overwrites one frame row in place) rather than inventing a
-//! floating widget of its own.
+//! A plain-text URL's visible text is its destination, so it gets the band only when some cell
+//! of it is painted under 3:1 contrast and nobody can tell where it ends
+//! (`crate::plain_url_at`), and only while the link modifier is held, since a plain URL is found
+//! only then.
 //!
-//! A plain-text URL needs no band: its visible text IS its destination. Except
-//! where part of it is painted so faintly that nobody can say where it ends — a
-//! tail a shade off its background reads as blank and still opens — so a plain
-//! URL with any cell under 3:1 earns the same band (`crate::plain_url_at`).
-//! Unlike an OSC 8 link's, it shows only while the link modifier is held: a
-//! plain URL is found only then, which is when the hand offers its click.
+//! Disclosure only: nothing here gates or changes what Cmd/ctrl-click opens; that boundary is
+//! `is_safe_url` at the point of action.
 //!
-//! It is DISCLOSURE ONLY. Nothing here gates, prompts, or changes what
-//! Cmd/ctrl-click opens — the security boundary for that stays `is_safe_url` at
-//! the point of action. What this closes is the gap where the only honest
-//! account of a link's destination lived in `ctl cell`.
+//! # The caption is derived, never remembered
 //!
-//! # The caption is DERIVED, never remembered
-//!
-//! What a hover resolution may be kept as is [`LinkHover`] — where the pointer
-//! is — and nothing else. The destination, and whether there is a caption at
-//! all, are re-read by `App::splice_link_target` from the VIEWPORT it paints,
-//! every frame. A URL captured at hover time is a claim about a grid that keeps
-//! changing with no pointer event to announce it: the program rewrites the
-//! cell, a tab moves to the front, a panel opens over the row. Every one of
-//! those is a way for a remembered string to become a lie, and re-deriving is
-//! the one seam that closes all of them at once instead of one retirement rule
-//! per path.
+//! A hover keeps only [`LinkHover`], where the pointer is. The destination, and whether there
+//! is a caption at all, are re-read by `App::splice_link_target` from the viewport it paints,
+//! every frame: a remembered URL goes stale with no pointer event to announce it (the program
+//! rewrites the cell, a tab moves to the front, a panel opens over the row).
 //!
 //! # Why the caption cannot itself deceive
 //!
-//! The string being displayed came from a hostile program, so the display form
-//! is chosen so that no input can make it read as a destination other than the
-//! one it is:
+//! The string came from a hostile program, so no input may make it read as another
+//! destination:
 //!
-//! * **Every byte outside printable ASCII is percent-encoded** ([`safe_form`]).
-//!   That is the canonical RFC 3986 spelling of those bytes anyway, and it means
-//!   a bidi override, an ASCII or C1 control, a zero-width space, a soft hyphen
-//!   and a Cyrillic homoglyph all arrive on screen as visible `%XX` runs instead
-//!   of reordering the line, vanishing into it, or impersonating a Latin domain.
-//!   The engine already REJECTS OSC 8 URIs carrying controls or bidi overrides
-//!   (`handler_osc::handle_osc_8`, CVE-2021-42574); this is the belt at the
-//!   presentation end, because the caption must be safe for whatever a future
-//!   admission rule lets through.
-//! * **Elision never drops the host.** A URL too wide for the band is cut, and
-//!   the naive cut — keep the head, append an ellipsis — is exactly the forgery:
-//!   `https://google.com.<400 chars>.evil.example/` reads as `google.com`. So
-//!   the cut is anchored on the END of the host ([`host_span`]), keeping the
-//!   labels that decide which site this is and saying with a leading ellipsis
-//!   that something was dropped in front of them.
-//! * **The SITE'S OWN LABELS are the emphasized run** — the tail of the host,
-//!   not the whole authority ([`emphasis_span`]). The forgery this band exists
-//!   to defeat puts its padding INSIDE the authority
-//!   (`https://google.com.<400 a's>.evil.example/`), so emphasizing the whole
-//!   host emphasizes the padding too and the hierarchy says nothing at all.
-//!   Marking only the last labels puts the weight on the answer.
-//! * **Userinfo cannot masquerade as the host**: `https://google.com@evil.example/`
-//!   emphasizes `evil.example`, because the host is what follows the LAST `@`
-//!   of the authority — found the way the browser that opens it finds it, over
-//!   the WHOLE URI ([`SCAN_BYTES`]). Userinfo has no length limit, so
-//!   `https://google.com.<1000 chars>@evil.example/` carries its host past any
-//!   shorter read. Where no host can be found at all, the band shows the scheme
-//!   and an ellipsis — never the head standing in for the host.
+//! * Every byte outside printable ASCII is percent-encoded ([`safe_form`]), so a bidi override,
+//!   a control, a zero-width space, a soft hyphen or a Cyrillic homoglyph shows as visible
+//!   `%XX`. The engine already rejects OSC 8 URIs with controls or bidi overrides
+//!   (`handler_osc::handle_osc_8`, CVE-2021-42574); this holds for whatever a future admission
+//!   rule lets through.
+//! * Elision never drops the host. Keeping the head and appending an ellipsis is the forgery
+//!   (`https://google.com.<400 chars>.evil.example/` reads as `google.com`), so the cut anchors
+//!   on the end of the host ([`host_span`]) behind a leading ellipsis.
+//! * The emphasized run is the site's own labels, the tail of the host ([`emphasis_span`]),
+//!   not the whole authority, which is where the forgery puts its padding.
+//! * Userinfo cannot pose as the host: the host follows the last `@` of the authority, found
+//!   the way the browser finds it, over the whole URI ([`SCAN_BYTES`]). Where no host can be
+//!   found the band shows the scheme and an ellipsis, never the head.
 //!
-//! # The seam has an ink of its own, so the caption may have two
+//! # The seam has its own ink
 //!
-//! The band's content-facing edge is an OVERLINE, and a rule that changes ink
-//! under the words it passes beneath stops reading as a boundary: a top edge
-//! that brightens for the twelve cells above the domain is a highlighter dash
-//! floating over them. The seam therefore paints from its OWN channel
-//! (`RenderCell::overline_color`, resolved for both backends by
-//! `aterm_render::deco_inks`) instead of from each cell's `fg`, so every cell of
-//! the row stamps the same edge tone whatever ink it carries.
-//!
-//! That is what lets the caption answer in BRIGHTNESS as well as weight. The
-//! destination host is the one thing a reader came to this row for, so it takes
-//! the band's full-contrast tone while the gesture hint, the scheme and the path
-//! recede to the secondary one — the ordinary hierarchy of every other chrome
-//! band here, which a single-toned row could only imitate with bold.
+//! The band's content-facing edge is an overline painted from its own channel
+//! (`RenderCell::overline_color`, resolved by `aterm_render::deco_inks`) rather than each
+//! cell's `fg`, so it is one tone across the row. That lets the caption carry two inks: the
+//! host takes the band's full-contrast tone, the gesture hint, scheme and path the secondary.
 
 use std::ops::Range;
 
@@ -104,32 +63,22 @@ const GAP: usize = 2;
 /// Below this many cells for the URL itself the lead-in is dropped: the
 /// destination is the disclosure, the gesture hint is the courtesy.
 const LEAD_IN_URL_CELLS: usize = 12;
-/// Below this many cells for the URL the band paints NOTHING.
-///
-/// An elided run is `…<text>…`, so under eight cells two of them are spent on
-/// the marks and what is left is four or five characters out of the middle of a
-/// hostname — a fragment that names no site. The row it would cost belongs to
-/// the person's output, and it must buy them more than the underline already
-/// gave them.
+/// Below this many cells for the URL the band paints nothing: an elided `…<text>…` that narrow
+/// is a fragment of a hostname that names no site, not worth a row of output.
 const MIN_URL_CELLS: usize = 8;
 
-/// How many bytes of a URL are ever read: the engine's `OSC 8` admission cap
-/// (`MAX_HYPERLINK_URL_BYTES`), so every URI a program can attach is read
-/// whole. No shorter bound is safe — DNS caps a hostname, but the userinfo in
-/// front of it has no limit, and a host pushed past the read leaves the cut
-/// nothing to anchor on. The read is only a search for the ASCII delimiters
-/// [`host_span`] needs; [`safe_form`] spells out just the characters the band
-/// paints, so the paint path never expands 8 KiB.
+/// How many bytes of a URL are read: the engine's OSC 8 admission cap
+/// (`MAX_HYPERLINK_URL_BYTES`), so every URI is read whole. No shorter bound is safe: the
+/// userinfo before the host has no length limit. The read only searches for the ASCII
+/// delimiters [`host_span`] needs; [`safe_form`] spells out only the characters painted.
 const SCAN_BYTES: usize = 8 * 1024;
 
 const HEX: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
 ];
 
-/// The gesture that opens a link, named the way `--help` names it. Cmd on macOS
-/// (its native convention), Ctrl everywhere else — the same split
-/// `app_mouse::link_modifier_held` makes, so the caption cannot promise a
-/// gesture the modifier check does not accept.
+/// The gesture that opens a link: Cmd on macOS, Ctrl elsewhere, the split
+/// `app_mouse::link_modifier_held` makes.
 #[cfg(target_os = "macos")]
 const OPENS: &str = "Cmd-click opens";
 #[cfg(not(target_os = "macos"))]
@@ -143,75 +92,54 @@ const OPENS_TRACKED: &str = "Cmd-Option-click opens";
 #[cfg(not(target_os = "macos"))]
 const OPENS_TRACKED: &str = "ctrl+alt+click opens";
 
-/// The lead-in for a link whose scheme `crate::is_safe_url` refuses. Saying
-/// "opens" there would be the caption's own small lie: the click is a no-op.
+/// The lead-in for a link whose scheme `crate::is_safe_url` refuses: the click is a no-op, so
+/// it must not say "opens".
 const BLOCKED: &str = "blocked scheme";
 
-/// WHERE THE POINTER IS RESTING, when the cell under it carried a destination
-/// to disclose the last time the hover was resolved: an OSC 8 hyperlink, or a
-/// plain-text URL part of which is painted too faintly to be sure where it
-/// ends (`crate::PlainUrl`).
-///
-/// Deliberately NOT the URL and not a rendered caption: those are re-derived
-/// from the live grid at paint (see the module header). What is kept is the
-/// only part of a hover that a program, a tab switch or a panel cannot falsify
-/// — where the pointer is — plus the identity of the grid it was resolved
-/// against.
+/// Where the pointer rests, when the cell under it carried a destination to disclose at the
+/// last hover resolution: an OSC 8 hyperlink, or a plain URL partly painted too faintly
+/// (`crate::PlainUrl`). Not the URL: that is re-derived from the live grid at paint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinkHover {
-    /// The PANE-LOCAL `(row, col)` the pointer is on, in the VIEWPORT rows the
-    /// frame is drawn in: the PAINTED cell. The probe reads the logical cell
+    /// The pane-local `(row, col)` the pointer is on, in the viewport rows the
+    /// frame is drawn in: the painted cell. The probe reads the logical cell
     /// under it (`app_mouse::pointer_cell`: a doubled line's halving, then the
     /// BiDi permutation), the one `Terminal::hyperlink_at_visible` addresses.
     /// Re-read, not remembered as a URL.
     pub(crate) cell: (u16, u16),
-    /// WINDOW terminal row of that cell. The placement may not cover it (a
-    /// caption over the text it describes discloses nothing), and it is the row
-    /// the pointer is standing on when the splice asks whether chrome has taken
-    /// the pointer's own row out from under it.
+    /// Window terminal row of that cell: the placement may not cover it, and the splice
+    /// checks whether chrome has taken the pointer's row.
     pub(crate) window_row: u16,
-    /// The session the cell belongs to. A hover is a statement about ONE
-    /// terminal's grid, and the front terminal changes under a stationary
-    /// pointer for reasons the pointer never hears about — a tab switch, a
-    /// pane-focus move, a session migration. The splice re-reads the
-    /// destination out of the FRONT terminal and only when it is still this
-    /// one, so a hover can never speak for a grid it never looked at.
+    /// The session the cell belongs to. The front terminal changes under a stationary pointer
+    /// (tab switch, pane focus, migration), so the splice re-reads only while the front
+    /// terminal is still this one.
     pub(crate) session: u64,
 }
 
-/// One URL laid out for a band `max_cells` wide: the text to paint and the run
-/// within it that is the HOST.
-///
-/// `host` is measured in CHARACTERS, which for this text is also cells and also
-/// columns — every character in it is either printable ASCII or the one-cell
-/// ellipsis. It is deliberately not bytes: the ellipsis is three of those, and
-/// a byte range would put the emphasis three cells off the run it emphasizes.
+/// One URL laid out for a band `max_cells` wide: the text to paint and the host's run in it.
+/// `host` counts characters, which here are also cells (printable ASCII or the one-cell
+/// ellipsis), not bytes: the ellipsis is three bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Caption {
     pub(crate) text: String,
-    /// The whole host, in characters. What the ELISION anchors on: the labels
-    /// that decide which site this is are the last thing the cut may take.
+    /// The whole host, in characters: what the elision anchors on.
     pub(crate) host: Range<usize>,
 }
 
 impl Caption {
-    /// The run the band EMPHASIZES: the site's own labels within
-    /// [`Self::host`]. See [`emphasis_span`].
+    /// The emphasized run: the site's own labels within [`Self::host`] ([`emphasis_span`]).
     pub(crate) fn emphasis(&self) -> Range<usize> {
         let chars: Vec<char> = self.text.chars().collect();
         emphasis_span(&chars, &self.host)
     }
 
-    /// The text of a run, by the same character measure the runs are expressed
-    /// in — the ellipsis is one character and three bytes, so a byte slice
-    /// would land three cells off the run it names.
+    /// The text of a run, in characters (see [`Caption`]).
     pub(crate) fn slice(&self, run: &Range<usize>) -> String {
         self.text.chars().skip(run.start).take(run.len()).collect()
     }
 
-    /// The WHOLE host. What the elision proofs measure, since "the host
-    /// survived the cut" is the property they are about; the paint path takes
-    /// [`Self::emphasis`] instead.
+    /// The whole host's text, which the elision tests measure; the paint path uses
+    /// [`Self::emphasis`].
     #[cfg(test)]
     pub(crate) fn host_text(&self) -> String {
         self.slice(&self.host)
@@ -224,22 +152,14 @@ impl Caption {
     }
 }
 
-/// The run of the host a hurried reader must land on: the site's own labels,
-/// never the padding stacked in front of them.
+/// The run of the host a hurried reader should land on: the site's own labels, never the
+/// padding in front of them. The last two labels, or three when the second-to-last has three
+/// characters or fewer (`co.uk`, `com.au`). Erring long is safe: one label too many still ends
+/// at the addressed site.
 ///
-/// The last two labels, and a THIRD when the second-to-last is three characters
-/// or fewer — the `co.uk` / `com.au` shape, where two labels name a registry
-/// rather than a site. Erring long is the safe direction: a run that reaches one
-/// label too far still ends at the site that is actually addressed, while one
-/// that stops short points at a suffix nobody owns.
-///
-/// A READING AID, never a boundary. Public-suffix truth needs the PSL, which
-/// this deliberately does not carry; what the security argument rests on is that
-/// the WHOLE host is always shown and is the last thing elision drops
-/// ([`caption`]), not on where the weight falls inside it.
-///
-/// An address literal (`1.2.3.4`, `[::1]:8443`) has no labels to choose between
-/// — every part of it is the identity — so the whole host is the run.
+/// A reading aid, not a boundary: there is no public-suffix list here, and the security
+/// argument rests on the whole host being shown and elided last ([`caption`]). An address
+/// literal (`1.2.3.4`, `[::1]:8443`) is the run whole.
 fn emphasis_span(chars: &[char], host: &Range<usize>) -> Range<usize> {
     let Some(slice) = chars.get(host.start..host.end) else {
         return host.clone();
@@ -256,12 +176,9 @@ fn emphasis_span(chars: &[char], host: &Range<usize>) -> Range<usize> {
         .filter(|(_, ch)| **ch == '.')
         .map(|(i, _)| i)
         .collect();
-    // A FULLY QUALIFIED host ends in the root's empty label — `evil.example.` is
-    // a legal, resolvable spelling of `evil.example`. That final dot separates
-    // nothing, and counting it shifts every label one place: the run would begin
-    // at `example.` and leave `evil.` back at padding weight, which is precisely
-    // the forgery this run exists to surface. It is dropped from the count and
-    // stays inside the run, because the span still reaches `host.end`.
+    // A fully qualified host ends in the root's empty label (`evil.example.`). Counting that
+    // dot would shift the run one label and leave `evil.` at padding weight, so it is dropped
+    // from the count; it stays inside the run, which still reaches `host.end`.
     if dots.last() == Some(&slice.len().saturating_sub(1)) {
         dots.pop();
     }
@@ -282,8 +199,7 @@ fn emphasis_span(chars: &[char], host: &Range<usize>) -> Range<usize> {
 /// impersonate the rest of the line: printable ASCII survives verbatim, every
 /// other character becomes the percent-encoding of its UTF-8 bytes.
 ///
-/// Space is encoded too. A URL with a raw space is already refused by
-/// `is_safe_url`, and `%20` is what it would have to be spelled as to be one.
+/// Space is encoded too: `is_safe_url` refuses a raw space, and `%20` is its URL spelling.
 fn safe_form(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -311,23 +227,17 @@ fn safe_width(ch: char) -> usize {
     }
 }
 
-/// The byte range of the HOST inside a URL — the run that decides which site
-/// the link addresses, and therefore the run the band refuses to elide away.
-/// Every delimiter it looks for is ASCII, and an ASCII byte never occurs inside
-/// a multi-byte UTF-8 sequence, so it reads the raw URL without spelling it
-/// out; [`caption`] measures the result in the safe form's characters.
+/// The byte range of the host inside a URL: the run the band refuses to elide. Every delimiter
+/// is ASCII, which never occurs inside a multi-byte UTF-8 sequence, so it reads the raw URL;
+/// [`caption`] converts the result to safe-form characters.
 ///
-/// For a `scheme://` form that is the authority with any `userinfo@` prefix
-/// removed (the `@` trick is the oldest way to make a URL read as a site it
-/// never touches). For a schemeless-authority form such as `mailto:` it is the
-/// recipient, up to the first `?`.
+/// For `scheme://` it is the authority minus any `userinfo@`; for a schemeless-authority form
+/// such as `mailto:` it is the recipient, up to the first `?` or `#`.
 ///
-/// A WHATWG SPECIAL scheme is read the way the browser that opens it reads it,
-/// because that parser — not RFC 3986 — decides where a click lands: any run of
-/// `/` and `\` after the colon is skipped (`https:///`, `https:\\` and a bare
-/// `https:` all start the authority there), and `\` ends the authority like
-/// `/`. `file` is special too, but it has a host grammar of its own and no
-/// click opens it, so it keeps the generic reading.
+/// A WHATWG special scheme is read the way the browser that opens it reads it: any run of `/`
+/// and `\` after the colon is skipped (`https:///`, `https:\\` and a bare `https:` all start
+/// the authority there), and `\` ends the authority like `/`. `file` is special too, but it has
+/// its own host grammar and no click opens it, so it keeps the generic reading.
 fn host_span(url: &str) -> Range<usize> {
     let Some(colon) = url.find(':') else {
         return 0..url.len(); // no scheme: the whole thing is the identity
@@ -360,15 +270,10 @@ fn host_span(url: &str) -> Range<usize> {
 /// The one-cell mark that says text was dropped.
 const ELLIPSIS: char = '\u{2026}';
 
-/// Lay `url` out for a band `max_cells` wide.
-///
-/// The cut is the security-relevant part. Keeping the head and appending an
-/// ellipsis is the intuitive rule and it is precisely the forgery this band
-/// exists to prevent, so when the head does not reach the end of the host the
-/// window is anchored on the host's END instead and BOTH ends carry an
-/// ellipsis. Whatever the width, the labels that name the site are the last
-/// thing to go — and a URL with no host to anchor on shows its scheme alone,
-/// because the head is not a host either.
+/// Lay `url` out for a band `max_cells` wide. When the head does not reach the end of the
+/// host, the window anchors on the host's end behind a leading ellipsis (and a trailing one
+/// when something follows the host), so the site's labels are the last thing to go. A URL
+/// with no host to anchor on shows its scheme alone.
 pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
     let raw = url.trim();
     let mut read = raw.len().min(SCAN_BYTES);
@@ -376,10 +281,10 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
         read -= 1;
     }
     let span = host_span(&raw[..read]);
-    // A host is known when it has a character and its authority ENDED inside
-    // the read; one still running where the read stopped names nothing yet.
+    // A host is known when it has a character and its authority ended inside the read; one
+    // still running where the read stopped names nothing yet.
     let known = !span.is_empty() && (span.end < read || read == raw.len());
-    // From here on, offsets are the SAFE form's: its characters, its cells.
+    // From here on, offsets are in the safe form's characters (and cells).
     let width = |text: &str| text.chars().map(safe_width).sum::<usize>();
     let host_start = width(&raw[..span.start]);
     let host = host_start..host_start + width(&raw[span.clone()]);
@@ -402,10 +307,9 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
             host: 0..0,
         },
         max if !known => {
-            // No host to anchor on, so nothing is emphasized and nothing past
-            // the scheme is shown: whatever follows it would stand where the
-            // host belongs. A scheme with a dot is legal and reads as a domain,
-            // so only a plain one is named.
+            // No host to anchor on: nothing is emphasized and nothing past the scheme shows,
+            // since it would stand where the host belongs. A scheme with a dot reads as a
+            // domain, so only a plain one is named.
             let mut text = raw[..read]
                 .split_once(':')
                 .map(|(scheme, _)| scheme)
@@ -428,11 +332,8 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
             Caption { text, host }
         }
         max => {
-            // Anchor on the host's END: `…<tail of the host>…`. The TRAILING
-            // mark is spent only when something really follows the host — a URL
-            // that ends at its host has had nothing dropped after it, and an
-            // ellipsis claiming a path that does not exist is the caption
-            // telling its own small lie about the destination.
+            // Anchor on the host's end: `…<tail of the host>…`, the trailing mark only when
+            // something really follows the host.
             let after_host = span.end < raw.len();
             let keep = if after_host { max - 2 } else { max - 1 };
             // The last `keep` safe characters come from at most that many raw
@@ -459,24 +360,16 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
     }
 }
 
-/// PURE row builder: exactly `cols` cells, so the splice overwrites one frame
-/// row in place. The lead-in names the gesture, the site's own labels are the
-/// one emphasized run — full contrast and bold — and everything else recedes to
-/// the secondary tone: hierarchy the flat string could not express, exactly as
-/// the retired notice card's caption grammar argued for its own. The seam is
-/// painted from its own channel rather than from the cells' inks, which is what
-/// lets the row carry two of them (see the module header).
+/// Pure row builder: exactly `cols` cells, so the splice overwrites one frame row in place.
+/// The lead-in names the gesture, the site's own labels are the one bold, full-contrast run,
+/// and everything else takes the secondary tone.
 ///
-/// `seam` draws the band's content-facing top edge (a bottom-anchored caption
-/// wants it; a caption flipped to the top row is already under the strip's own
-/// rule and does not). `tracking` says the program under the pointer tracks
-/// the mouse, so the lead-in names the gesture that still opens the link.
+/// `seam` draws the content-facing top edge (a bottom-anchored caption wants it; one flipped
+/// to the top row is already under the strip's rule). `tracking`: the program under the
+/// pointer tracks the mouse, so the lead-in names the gesture that still opens the link.
 ///
-/// `None` when the band is narrower than [`MIN_URL_CELLS`] leaves for the URL,
-/// or when the URL contributes no character at all. A row of the person's
-/// output is too expensive to spend on a band that names no site. The decision
-/// lives here, with the layout it depends on, so there is one width rule rather
-/// than a splice-side guess at this one's terms.
+/// `None` when the band leaves the URL fewer than [`MIN_URL_CELLS`] or the URL contributes no
+/// character: a row of output is too expensive for a band that names no site.
 pub(crate) fn caption_row(
     url: &str,
     cols: usize,
@@ -509,12 +402,8 @@ pub(crate) fn caption_row(
         return None;
     }
     write_str(&mut row, cols, url_col, &cap.text, c.label, c.bar_bg, false);
-    // Re-stamp the emphasized run over the text just written: one `write_str`
-    // per role keeps the layout in ONE place, so the emphasis can never land on
-    // a different span than the text it is emphasizing. The band's FULL-CONTRAST
-    // tone and heavier weight — the destination is the answer this row exists to
-    // give, and a reader who takes one thing from a status band takes the
-    // brightest thing on it.
+    // Re-stamp the emphasized run over the text just written: one layout, so the emphasis
+    // cannot land on a different span than its text.
     let emphasis = cap.emphasis();
     if !emphasis.is_empty() {
         write_str(
@@ -527,13 +416,7 @@ pub(crate) fn caption_row(
             true,
         );
     }
-    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE — closed across the finished row,
-    // after every write, in the seam's own ink rather than each cell's. This band
-    // stated that rule first and kept it inline; it now lives in `chrome_band` so
-    // the paste banner and the find bar close their edges from the same three
-    // lines (as the retired config-notice band did), and the message band closes
-    // its bottom edge with the twin in `aterm_render::band` (`seal_stack`). See
-    // the module header for why the ink is the band's and not the text's.
+    // The seam closes across the finished row in the band's ink (see the module doc).
     if seam {
         chrome_band::seal_band_top(&mut row, c.seam);
     }
@@ -641,10 +524,7 @@ mod tests {
         row.iter().map(|cell| cell.ch).collect()
     }
 
-    /// The Trojan Source shape, at the display end. A right-to-left override
-    /// inside a URL reorders whatever follows it, so `evil.example` can be made
-    /// to read as a trusted domain in any status bar that paints the raw string.
-    /// It must reach the band as visible `%XX`, never as a reordering control.
+    /// Trojan Source at the display end: a right-to-left override reaches the band as `%XX`.
     #[test]
     fn a_bidi_override_is_spelled_out_instead_of_reordering_the_caption() {
         let cap = caption("https://safe.example\u{202e}moc.live/x", 200);
@@ -657,10 +537,8 @@ mod tests {
         assert!(cap.text.contains("%E2%80%AE"), "{:?}", cap.text);
     }
 
-    /// Everything that hides, joins or impersonates: C0/C1 controls, a
-    /// zero-width space, a soft hyphen, a BOM, and a Cyrillic homoglyph domain
-    /// that is pixel-identical to `google.com`. Each one leaves as `%XX`, so
-    /// the caption reads as the strange string it is.
+    /// Controls, a zero-width space, a soft hyphen, a BOM, a Cyrillic homoglyph and a space each
+    /// leave as `%XX`.
     #[test]
     fn invisible_and_look_alike_characters_survive_only_as_percent_escapes() {
         for hostile in [
@@ -681,11 +559,7 @@ mod tests {
         }
     }
 
-    /// THE LONG-URL FORGERY. `https://google.com.<padding>.evil.example/` is
-    /// wider than any band, and the intuitive cut — keep the head, append an
-    /// ellipsis — leaves `https://google.com…` on screen. The cut must keep the
-    /// END of the host instead, so the site that is actually addressed is the
-    /// last thing to go.
+    /// The long-URL forgery: the cut keeps the end of the host, never `https://google.com…`.
     #[test]
     fn eliding_a_long_url_keeps_the_host_and_never_the_forged_head() {
         let url = format!("https://google.com.{}.evil.example/steal", "a".repeat(400));
@@ -706,9 +580,7 @@ mod tests {
         );
     }
 
-    /// The `@` trick: everything before the last `@` is userinfo, not a host.
-    /// The emphasized run — the one a hurried reader takes as the destination —
-    /// must be `evil.example`.
+    /// Everything before the last `@` is userinfo: the host is `evil.example`.
     #[test]
     fn userinfo_before_an_at_sign_is_never_emphasized_as_the_host() {
         let cap = caption("https://google.com@evil.example/steal", 200);
@@ -716,13 +588,8 @@ mod tests {
         assert_eq!(cap.host_text(), "evil.example");
     }
 
-    /// THE BROWSER'S AUTHORITY, not RFC 3986's. For `http`/`https` the WHATWG
-    /// parser every browser runs skips any run of `/` and `\` after the scheme
-    /// and ends the authority at `\` as well as `/ ? #`, so a caption that read
-    /// `//` to `/` would bold `google.com` while a click lands on `evil.example`
-    /// — or, for `https:///`, find an empty host and fall back to the very
-    /// keep-the-head cut the module calls a forgery. Each expectation is what
-    /// node's `new URL(u).host` answers.
+    /// A special scheme's host is the WHATWG parser's (runs of `/` and `\` skipped, `\` ends the
+    /// authority), not RFC 3986's. Expected hosts are node's `new URL(u).host`.
     #[test]
     fn a_special_schemes_host_is_the_one_the_browser_parses() {
         for (url, want) in [
@@ -774,14 +641,9 @@ mod tests {
         assert_eq!(cap.host_text(), "evil.example");
     }
 
-    /// THE WHOLE URI IS READ. Userinfo comes before the host and has no length
-    /// limit, so a read that stopped at a fixed count found no host in
-    /// `https://google.com.a.a…@evil.example/` and fell back to the keep-the-head
-    /// cut the module calls a forgery; a run of slashes the browser skips did
-    /// the same with nothing at all. And a URI whose authority outruns even the
-    /// whole read names no host, so the band shows its scheme and nothing that
-    /// could stand where the host belongs. Each expected host is what node's
-    /// `new URL(u).host` answers.
+    /// The whole URI is read: a host pushed far in by userinfo or a run of slashes is still found,
+    /// and one whose authority outruns the whole read names no host, so only the scheme shows.
+    /// Expected hosts are node's `new URL(u).host`.
     #[test]
     fn the_host_is_found_however_far_into_the_uri_it_is_pushed() {
         for url in [
@@ -831,10 +693,7 @@ mod tests {
         }
     }
 
-    /// A URL that ENDS at its host has nothing after it to drop, so the
-    /// host-anchored cut must not append a trailing ellipsis: that mark means
-    /// "there was more", and inventing one is the caption misdescribing the
-    /// very destination it exists to describe.
+    /// A URL that ends at its host gets no trailing ellipsis; the same URL with a path does.
     #[test]
     fn a_url_that_ends_at_its_host_is_not_marked_as_having_more() {
         let url = format!("https://google.com.{}.evil.example", "a".repeat(400));
@@ -848,7 +707,7 @@ mod tests {
         );
         assert!(cap.text.ends_with("evil.example"), "{:?}", cap.text);
         assert!(cap.host_text().ends_with("evil.example"), "{:?}", cap.host);
-        // The same URL WITH a path keeps the mark: there really is more.
+        // The same URL with a path keeps the mark.
         let cap = caption(&format!("{url}/steal"), 40);
         assert!(cap.text.ends_with(ELLIPSIS), "{:?}", cap.text);
     }
@@ -883,16 +742,12 @@ mod tests {
         assert!(text.contains("evil.example"), "{text:?}");
     }
 
-    /// A band too narrow to name a site paints NOTHING. The row it would take
-    /// belongs to the person's output, and a few characters cut out of the
-    /// middle of a hostname buy them no more knowledge of where the link goes
-    /// than the underline already gave them.
+    /// A band too narrow to name a site takes no row.
     #[test]
     fn a_band_too_narrow_to_name_anything_does_not_take_a_row() {
         let theme = Theme::default();
-        // LITERAL widths, not `MARGIN * 2 + MIN_URL_CELLS`: the threshold is the
-        // claim under test, so a test that derived its own bounds from the
-        // constant would follow it wherever it moved and assert nothing.
+        // Literal widths: bounds derived from `MIN_URL_CELLS` would follow the constant and
+        // assert nothing.
         for cols in 0..=11usize {
             assert!(
                 caption_row("https://evil.example/steal", cols, theme, true, false).is_none(),
@@ -912,15 +767,14 @@ mod tests {
             text.chars().any(|ch| ch.is_ascii_alphanumeric()),
             "{text:?}"
         );
-        // An EMPTY URL contributes no character at any width: the band would be
-        // margins and nothing, so it declines the row however wide it is.
+        // An empty URL contributes no character, so it declines the row at any width.
         assert!(caption_row("", 200, theme, true, false).is_none());
     }
 
-    /// THE DESTINATION IS THE BRIGHTEST THING ON THE ROW, on every theme the
+    /// The destination is the brightest thing on the row, on every theme the
     /// product ships. Weight is a hierarchy a glance can miss — a bold run in a
     /// dim tone still reads as part of the dim sentence around it — and the one
-    /// question this band answers is WHICH SITE. So the site's own labels take
+    /// question this band answers is which site. So the site's own labels take
     /// the band's full-contrast ink and everything else stays secondary, while
     /// the seam underneath is unaffected either way.
     #[test]
@@ -962,11 +816,7 @@ mod tests {
         }
     }
 
-    /// THE ATTACK THE MODULE EXISTS FOR, at the presentation end. When the
-    /// padding is INSIDE the authority the whole band is host, so emphasizing
-    /// "the host" emphasizes the padding too and the hierarchy conveys
-    /// nothing — a full row of bold `aaaa…` with the answer hidden in it. The
-    /// weight must fall on the site's own labels and on nothing else.
+    /// With the forgery's padding inside the authority, only the site's own labels carry weight.
     #[test]
     fn the_forged_authoritys_padding_is_never_part_of_the_emphasized_run() {
         let url = format!("https://google.com.{}.evil.example/steal", "a".repeat(400));
@@ -991,9 +841,8 @@ mod tests {
         );
     }
 
-    /// Which labels name the SITE. Two of them, or three where two would name a
-    /// registry (`co.uk`) instead of a site; an address literal has no labels to
-    /// choose between; and userinfo is outside the host to begin with.
+    /// The site's labels: two, or three where two name a registry (`co.uk`); an address
+    /// literal whole; never userinfo.
     #[test]
     fn the_emphasized_run_is_the_sites_own_labels_and_never_a_bare_suffix() {
         for (url, want) in [
@@ -1006,9 +855,7 @@ mod tests {
             ("https://10.0.0.7:8443/steal", "10.0.0.7:8443"),
             ("https://[2001:db8::1]/steal", "[2001:db8::1]"),
             ("https://localhost:9000/steal", "localhost:9000"),
-            // FULLY QUALIFIED spellings. The root's empty label separates
-            // nothing, so it must not shift the run one place and hand the
-            // padding the site's own name back.
+            // Fully qualified: the root's empty label must not shift the run.
             ("https://evil.example./steal", "evil.example."),
             (
                 "https://google.com.pad.evil.example./steal",

@@ -17,9 +17,45 @@
 //! counted lost, into the rollups, exactly as a batch's victim is. It keeps
 //! no counter of its own: one pass over the ring, so it holds whichever way
 //! the ring was built (a carry, a closed copy, a journal read).
+//!
+//! THE PROGRAM SHARE (phase 6, 6F-3; T6, ruling U17): the program marks
+//! (`mark <node> program`, OSC 7501's reports) hanging from one node hold at
+//! most [`program_share`] of the ring: 64 per run at a session's bound, or
+//! per session while no run is open. [`Log::enforce_program_share`] keeps it
+//! on the same terms as the quota: an append of a program mark and the fence
+//! lifting run it, it takes only that node's program marks, the oldest
+//! first, never the record just appended and never a fenced one, and each it
+//! takes is counted lost. So a flapping program spends its own share and
+//! never the facts beside it (a mail mark written before 300 flaps is still
+//! in the log).
 
-use super::{Limits, Log};
-use crate::vocab::Src;
+use std::collections::BTreeMap;
+
+use super::{Entry, Limits, Log};
+use crate::vocab::{Kind, Node, Op, Src};
+
+/// The program share at a session ring's bound ([`super::MAX_RECORDS`]).
+pub const PROGRAM_SHARE_MAX: usize = 64;
+
+/// What one node's program marks may hold of a ring bounded by `l`: a 32nd
+/// of its records, at least one (the mark just appended always stays) and at
+/// most [`PROGRAM_SHARE_MAX`] (a session's ring: 64).
+#[must_use]
+pub const fn program_share(l: Limits) -> usize {
+    let n = l.records / 32;
+    if n < 1 {
+        1
+    } else if n > PROGRAM_SHARE_MAX {
+        PROGRAM_SHARE_MAX
+    } else {
+        n
+    }
+}
+
+/// Whether `e` is a program mark.
+fn is_program(e: &Entry) -> bool {
+    e.rec.op == Op::Mark && e.rec.k == Kind::Program
+}
 
 /// What marks may hold of a ring bounded by `l`: a quarter of its records
 /// (at least one: the mark just appended always stays) and a quarter of its
@@ -86,6 +122,59 @@ impl Log {
         if taken == 0 {
             return 0;
         }
+        self.take_victims(victim);
+        taken
+    }
+
+    /// The live program marks hanging from `node`.
+    #[must_use]
+    pub fn programs_held(&self, node: Node) -> usize {
+        self.ring
+            .iter()
+            .filter(|e| is_program(e) && e.rec.node == node)
+            .count()
+    }
+
+    /// THE PROGRAM SHARE: take the oldest program marks of each node (of
+    /// `only`, when it names one) whose live program marks pass
+    /// [`program_share`] of the ring's record bound, until it is within it,
+    /// never the newest record and never one at or below the readers' fence.
+    /// Each is counted lost as an eviction's is. Returns how many it took.
+    pub fn enforce_program_share(&mut self, only: Option<Node>) -> u64 {
+        let share = program_share(self.limits);
+        let mut held: BTreeMap<Node, usize> = BTreeMap::new();
+        for e in &self.ring {
+            if is_program(e) && only.is_none_or(|n| n == e.rec.node) {
+                *held.entry(e.rec.node).or_insert(0) += 1;
+            }
+        }
+        if held.values().all(|&c| c <= share) {
+            return 0;
+        }
+        let n = self.ring.len();
+        let frozen = self.read_fence().unwrap_or(0);
+        let mut victim = vec![false; n];
+        let mut taken = 0u64;
+        for (i, e) in self.ring.iter().enumerate() {
+            if !is_program(e) || i + 1 == n || e.rec.seq <= frozen {
+                continue;
+            }
+            if let Some(c) = held.get_mut(&e.rec.node)
+                && *c > share
+            {
+                victim[i] = true;
+                *c -= 1;
+                taken += 1;
+            }
+        }
+        if taken > 0 {
+            self.take_victims(victim);
+        }
+        taken
+    }
+
+    /// Take the ring's records `victim` names, each counted lost.
+    fn take_victims(&mut self, victim: Vec<bool>) {
         let mut gone = Vec::new();
         let old = std::mem::take(&mut self.ring);
         for (e, v) in old.into_iter().zip(victim) {
@@ -98,6 +187,5 @@ impl Log {
         for e in &gone {
             self.evicted(e);
         }
-        taken
     }
 }

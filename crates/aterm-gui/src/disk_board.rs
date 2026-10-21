@@ -6,7 +6,10 @@
 //! watch (`harness_host::disk_look`) and read by `status` (`disk=`,
 //! [`status_fields`]) and `await sys` (`control_disk`). It holds the
 //! episode the watch keeps of sessions a full disk stopped ([`DiskEpisode`]),
-//! so there is one store of the watch's last look, not two.
+//! so there is one store of the watch's last look, not two. It also keeps
+//! today's tally of what aterm's cleaner freed ([`FreedTally`]), and the
+//! Stats Deck reads its disk facts off it ([`Shelf::deck_facts`]; design
+//! `docs/DESIGN-stats-deck-v2-2026-10-20.md` §7.1, §7.3, §7.6).
 //!
 //! Its lock is a LEAF: nothing is locked, read from the file system or
 //! logged under it. A reader takes it, copies what it needs and lets go;
@@ -17,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::disk::{Level, Thresholds};
+use aterm_agent::harness::disk::{Class, Hog, Level, Thresholds};
 use aterm_sysprobe::volumes::{Reading, Table, VolumeKey};
 
 /// The most volumes the board holds: the home volume and the volumes the
@@ -91,6 +94,12 @@ pub(crate) struct PassSummary {
     /// How many build directories it could not reclaim, and the largest.
     pub(crate) hogs: usize,
     pub(crate) largest: u64,
+    /// Those build directories, as the pass named them: the deck's "where"
+    /// when no survey is newer.
+    pub(crate) left: Vec<Hog>,
+    /// When it ended, unix seconds: the time the deck gives its hog list
+    /// (`None` where the wall clock could not be read).
+    pub(crate) ended_at_unix: Option<i64>,
 }
 
 /// THE SPENT RULE: a pass that adopted `demand` (need bytes) was spent for
@@ -145,6 +154,171 @@ pub(crate) struct DiskEpisode {
     pub(crate) alerted: bool,
 }
 
+/// The clocks, read once and outside the board's lock (the local offset may
+/// read the zone's file): the monotonic instant the watch's beat is on, the
+/// wall clock, and the local offset from UTC that places a local day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Clock {
+    /// The monotonic clock.
+    pub(crate) at: Instant,
+    /// The wall clock, unix seconds (`None` where it reads before the
+    /// epoch).
+    pub(crate) unix: Option<i64>,
+    /// The local offset from UTC at `unix`, seconds (`None` where the
+    /// platform cannot say, or the wall clock is unread).
+    pub(crate) offset: Option<i64>,
+}
+
+impl Clock {
+    /// The clocks now.
+    pub(crate) fn read() -> Self {
+        let unix = unix_now();
+        Self {
+            at: Instant::now(),
+            unix,
+            offset: unix.and_then(crate::presence::local_offset_at),
+        }
+    }
+
+    /// The local calendar day: whole days since 1970-01-01 on the local
+    /// clock, so a new one starts at local midnight. `None` where the wall
+    /// clock or the local offset is unread: no day is guessed.
+    pub(crate) fn day(&self) -> Option<u32> {
+        let local = self.unix?.saturating_add(self.offset?);
+        u32::try_from(local.div_euclid(86_400)).ok()
+    }
+}
+
+/// The wall clock, unix seconds (`None` before the epoch).
+pub(crate) fn unix_now() -> Option<i64> {
+    aterm_time::unix_secs().map(|s| i64::try_from(s).unwrap_or(i64::MAX))
+}
+
+/// What aterm's cleaner freed today (design §7.3): the bytes each removal it
+/// recorded released, counted once each, and the last of them. In memory
+/// only, and only aterm's own frees: space that came back by itself is not
+/// inferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FreedTally {
+    /// The local calendar day it counts ([`Clock::day`]); a removal on a
+    /// later day starts it again from nothing.
+    pub(crate) day: u32,
+    /// The bytes freed that day.
+    pub(crate) aterm_bytes: u64,
+    /// When the last removal was counted, unix seconds.
+    pub(crate) last_at: i64,
+    /// What the last removal was, in words ([`freed_what`]). Both of
+    /// aterm's cleaners remove build caches only (the supervised pass's plan,
+    /// `aterm_agent::harness::disk::pass_plan`, and the no-session sweep), so
+    /// this names what the last pass removed.
+    pub(crate) last_what: String,
+}
+
+impl FreedTally {
+    /// Nothing freed yet.
+    const fn new() -> Self {
+        Self {
+            day: 0,
+            aterm_bytes: 0,
+            last_at: 0,
+            last_what: String::new(),
+        }
+    }
+
+    /// Count `bytes` a removal released, `what` it was, at `now`. A tally of
+    /// an earlier day is reset first, so the count is today's. A removal
+    /// that released nothing counts nothing, and neither does one whose day
+    /// cannot be placed ([`Clock::day`]): the tally is a local day's, and no
+    /// time is made up for it.
+    pub(crate) fn add(&mut self, bytes: u64, what: &str, now: &Clock) {
+        let (Some(day), Some(unix)) = (now.day(), now.unix) else {
+            return;
+        };
+        if self.day != day {
+            *self = Self { day, ..Self::new() };
+        }
+        if bytes == 0 {
+            return;
+        }
+        self.aterm_bytes = self.aterm_bytes.saturating_add(bytes);
+        what.clone_into(&mut self.last_what);
+        self.last_at = unix;
+    }
+
+    /// The tally if it is `now`'s day's and counts something; `None` once
+    /// local midnight has passed since the last removal, before any, or
+    /// while the day cannot be placed.
+    pub(crate) fn today(&self, now: &Clock) -> Option<&Self> {
+        (now.day() == Some(self.day) && self.aterm_bytes > 0).then_some(self)
+    }
+}
+
+/// What a supervised pass's removal was, in the words the deck and the lens
+/// print after "freed" ([`FreedTally::last_what`]). The pass removes build
+/// caches only (`aterm_agent::harness::disk::pass_plan`); the other classes
+/// are named for when it removes more. The no-session sweep takes only build
+/// caches ([`BUILD_CACHES`]).
+pub(crate) fn freed_what(class: Class) -> &'static str {
+    match class {
+        Class::CargoTargets => BUILD_CACHES,
+        Class::ClaudeStaleVersions => "old Claude Code versions",
+        Class::AtpkgGc => "old package builds",
+        Class::ClaudePurge => "Claude Code project data",
+    }
+}
+
+/// The words for what the build-cache removals free.
+pub(crate) const BUILD_CACHES: &str = "build caches";
+
+/// The disk facts the Stats Deck reads off the board for the home volume
+/// ([`Board::deck_facts`]), before the vitals host maps them onto
+/// `aterm_vitals`' own types. With the harness off it is empty and `watch`
+/// is false ([`Shelf::deck_facts`]): no level, no lines, no stuck count and
+/// no freed tally, since aterm's cleaner is the harness.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DiskFactsRaw {
+    /// The home volume's level at the last look; `None` before a look
+    /// measured it.
+    pub(crate) level: Option<Level>,
+    /// The lines in force on it, bytes free: below `warn` it is low, below
+    /// `floor` aterm cleans (`None` with the automatic pass off, or where no
+    /// pass removes on it: [`VolumeRow::reclaimed_here`]), below `emergency`
+    /// writes are about to fail.
+    pub(crate) warn: Option<u64>,
+    pub(crate) floor: Option<u64>,
+    pub(crate) emergency: Option<u64>,
+    /// The emergency comes from the inode line, not the free bytes: the deck
+    /// says "out of file slots" and prints no free figure.
+    pub(crate) files_emergency: bool,
+    /// Sessions stuck on a full disk.
+    pub(crate) stuck: u16,
+    /// Every other volume the board measured: its name, its level and its
+    /// free bytes.
+    pub(crate) others: Vec<(String, Level, u64)>,
+    /// When the watch last made progress, unix seconds, once that is two of
+    /// its look periods old ([`crate::control::control_disk::STALL`]); a
+    /// stall the unread wall clock cannot date is not given.
+    pub(crate) stalled_since: Option<i64>,
+    /// What aterm freed today, when it freed anything.
+    pub(crate) freed_today: Option<FreedTally>,
+    /// The build directories the last pass on the home volume could not
+    /// reclaim, and when it ended (`None` when it named none, or when the
+    /// wall clock could not be read at its end).
+    pub(crate) hogs: Vec<Hog>,
+    pub(crate) hogs_at: Option<i64>,
+    /// A disk watch runs: the harness is on.
+    pub(crate) watch: bool,
+}
+
+/// A volume's name for a person: its mount point's last component
+/// ("Backup"), or the whole mount point where it has none ("/").
+fn volume_name(mount: &Path) -> String {
+    mount.file_name().map_or_else(
+        || mount.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
 /// The board ([`Shelf::board_lock`]).
 #[derive(Debug)]
 pub(crate) struct Board {
@@ -180,6 +354,8 @@ pub(crate) struct Board {
     pub(crate) demands: Vec<Demand>,
     /// The episode.
     pub(crate) episode: DiskEpisode,
+    /// What aterm's cleaner freed today ([`Shelf::tally_freed`]).
+    pub(crate) freed: FreedTally,
     /// The next demand's id.
     next_demand: u64,
 }
@@ -208,7 +384,66 @@ impl Board {
                 said: BTreeSet::new(),
                 alerted: false,
             },
+            freed: FreedTally::new(),
             next_demand: 1,
+        }
+    }
+
+    /// The Stats Deck's disk facts for the home volume `home` at `now`
+    /// (design §7.1): its level and lines, whether an emergency is the inode
+    /// line's, the stuck sessions, every other volume measured, the watch's
+    /// stall, today's freed tally and the last pass's hog list. The floor
+    /// is given only where a pass removes: under a private state root the
+    /// watch measures and cleans nothing. Empty, with `watch` false, when no
+    /// watch runs in this process ([`Self::watched`]). Pure: nothing is
+    /// looked at.
+    pub(crate) fn deck_facts(&self, home: &VolumeKey, now: &Clock) -> DiskFactsRaw {
+        if !self.watched {
+            return DiskFactsRaw::default();
+        }
+        let row = self.row_keyed(home).filter(|r| r.level != Level::Unknown);
+        let lines = row.map(|r| r.thresholds);
+        // A stall is the hang detector's (`control_disk`): a running watch
+        // whose beat is two look periods old. It began at that beat.
+        let stalled_since = match self.watch {
+            Watch::Running { beat } => {
+                let quiet = now.at.saturating_duration_since(beat);
+                let quiet_s = i64::try_from(quiet.as_secs()).unwrap_or(i64::MAX);
+                now.unix
+                    .filter(|_| quiet >= crate::control::control_disk::STALL)
+                    .map(|unix| unix.saturating_sub(quiet_s))
+            }
+            Watch::NotStarted | Watch::Suspended => None,
+        };
+        let (hogs, hogs_at) = match &self.last_pass {
+            Some(p) if &p.key == home && !p.left.is_empty() => (p.left.clone(), p.ended_at_unix),
+            _ => (Vec::new(), None),
+        };
+        DiskFactsRaw {
+            level: row.map(|r| r.level),
+            warn: lines.map(|t| t.warn),
+            floor: row
+                .filter(|r| r.reclaimed_here)
+                .map(|r| r.thresholds.floor)
+                .filter(|f| *f > 0),
+            emergency: lines.map(|t| t.emergency),
+            // At an emergency with the free bytes above its line, the inode
+            // line is what crossed.
+            files_emergency: row.is_some_and(|r| {
+                r.level == Level::Emergency && r.reading.free >= r.thresholds.emergency
+            }),
+            stuck: u16::try_from(self.episode.stuck.len()).unwrap_or(u16::MAX),
+            others: self
+                .volumes
+                .iter()
+                .filter(|r| &r.reading.key != home && r.level != Level::Unknown)
+                .map(|r| (volume_name(&r.reading.mount), r.level, r.reading.free))
+                .collect(),
+            stalled_since,
+            freed_today: self.freed.today(now).cloned(),
+            hogs,
+            hogs_at,
+            watch: true,
         }
     }
 
@@ -369,6 +604,38 @@ impl Shelf {
         self.changed.notify_all();
     }
 
+    /// Count into today's tally ([`Board::freed`]) each removal one pass of
+    /// aterm's cleaner recorded, the bytes it released and what it was: once
+    /// per `removed` row of a supervised pass and per `build-cache-sweep`
+    /// removal row of the no-session sweep (`harness_host`'s
+    /// `disk_pass_removals` and `disk_sweep_removals`). The clocks are read
+    /// before the lock is taken. Wakes no wait: a wait parks on free space,
+    /// not on the tally.
+    pub(crate) fn tally_freed(&self, removals: &[(u64, &str)]) {
+        if removals.is_empty() {
+            return;
+        }
+        let now = Clock::read();
+        let mut b = self.board_lock();
+        for &(bytes, what) in removals {
+            b.freed.add(bytes, what, &now);
+        }
+    }
+
+    /// The Stats Deck's disk facts for the home volume `home` at `now`
+    /// ([`Board::deck_facts`]): empty, `watch` false, while no disk watch
+    /// runs here, and the deck says "disk watch off" (design §7.6).
+    pub(crate) fn deck_facts(&self, home: &VolumeKey, now: &Clock) -> DiskFactsRaw {
+        self.board_lock().deck_facts(home, now)
+    }
+
+    /// Whether a disk watch runs in this process ([`Board::watched`]: the
+    /// harness host is on). `harness_host::harness_state` is no such sign: it
+    /// answers a state directory whether or not the harness runs.
+    pub(crate) fn watched(&self) -> bool {
+        self.board_lock().watched
+    }
+
     /// Park on the board until it changes or `wait` passes, `guard` released
     /// meanwhile and held again on return.
     pub(crate) fn park<'a>(
@@ -497,6 +764,7 @@ mod tests {
                 fstype: "apfs".to_owned(),
                 local: true,
                 automounted: false,
+                removable: false,
                 read_only: false,
                 container: Some("disk3".to_owned()),
             }],
@@ -535,6 +803,7 @@ mod tests {
             fstype: String::new(),
             local: true,
             automounted: false,
+            removable: false,
             read_only: false,
             container: Some(format!("Volume{{{guid}}}")),
         };
@@ -549,6 +818,7 @@ mod tests {
                     fstype: String::new(),
                     local: false,
                     automounted: false,
+                    removable: false,
                     read_only: false,
                     container: None,
                 },
@@ -597,6 +867,288 @@ mod tests {
         b.refresh(row("/m", key.clone(), 2, Level::Short));
         assert_eq!(b.volumes.len(), 1);
         assert_eq!(b.row_keyed(&key).map(|r| r.reading.free), Some(2));
+    }
+
+    const GIB: u64 = 1 << 30;
+    /// A UTC midnight (2026-09-22T00:00:00Z).
+    const UTC_MIDNIGHT: i64 = 20_718 * 86_400;
+    /// Two hours east of UTC: local midnight comes two hours before UTC's.
+    const EAST_2H: i64 = 7_200;
+
+    fn clock(unix: i64) -> Clock {
+        Clock {
+            at: Instant::now(),
+            unix: Some(unix),
+            offset: Some(EAST_2H),
+        }
+    }
+
+    /// The tally adds every removal of the local day, names what the last
+    /// one was, ignores a removal that released nothing, and starts again
+    /// at LOCAL midnight: read after it, it is gone before any removal; the
+    /// next removal counts alone. UTC's midnight, two hours later, resets
+    /// nothing. NEGATIVE CONTROL: with the local offset or the wall clock
+    /// unread no day is placed, so a removal counts nothing, resets nothing
+    /// and the tally reads as no day's.
+    #[test]
+    fn freed_tally_counts_the_local_day_and_starts_again_at_its_midnight() {
+        let local_midnight = UTC_MIDNIGHT - EAST_2H;
+        let mut t = FreedTally::new();
+        assert_eq!(t.today(&clock(local_midnight - 600)), None);
+
+        let at_2350 = clock(local_midnight - 600);
+        t.add(5 * GIB, BUILD_CACHES, &at_2350);
+        t.add(GIB, "old Claude Code versions", &at_2350);
+        let today = t.today(&at_2350).expect("freed today");
+        assert_eq!(today.aterm_bytes, 6 * GIB);
+        assert_eq!(today.last_at, local_midnight - 600);
+        assert_eq!(today.last_what, "old Claude Code versions");
+
+        let at_2359 = clock(local_midnight - 60);
+        t.add(3 * GIB, BUILD_CACHES, &at_2359);
+        t.add(0, "old package builds", &clock(local_midnight - 30));
+        let today = t.today(&at_2359).expect("freed today");
+        assert_eq!(today.aterm_bytes, 9 * GIB);
+        assert_eq!(today.last_at, local_midnight - 60);
+        assert_eq!(today.last_what, "build caches");
+
+        let no_zone = Clock {
+            offset: None,
+            ..clock(local_midnight + 60)
+        };
+        let no_wall = Clock {
+            unix: None,
+            offset: None,
+            ..no_zone
+        };
+        t.add(4 * GIB, BUILD_CACHES, &no_zone);
+        t.add(4 * GIB, BUILD_CACHES, &no_wall);
+        assert_eq!((no_zone.day(), no_wall.day()), (None, None));
+        assert_eq!(t.today(&no_zone), None);
+        assert_eq!(t.today(&at_2359).map(|t| t.aterm_bytes), Some(9 * GIB));
+
+        assert_eq!(t.today(&clock(local_midnight + 60)), None, "a new day");
+        t.add(GIB, BUILD_CACHES, &clock(local_midnight + 60));
+        t.add(2 * GIB, BUILD_CACHES, &clock(UTC_MIDNIGHT));
+        let today = t.today(&clock(UTC_MIDNIGHT + 1)).expect("freed today");
+        assert_eq!(today.aterm_bytes, 3 * GIB);
+        assert_eq!(Some(today.day), clock(local_midnight).day());
+        assert_eq!(today.last_at, UTC_MIDNIGHT);
+    }
+
+    fn lines() -> Thresholds {
+        Thresholds {
+            warn: 69 * GIB,
+            floor: 34 * GIB,
+            target: 50 * GIB,
+            emergency: 8 * GIB,
+            files_emergency: 10_000,
+        }
+    }
+
+    fn measured(mount: &str, key: VolumeKey, free: u64, files_free: u64) -> VolumeRow {
+        let thresholds = lines();
+        VolumeRow {
+            reading: Reading {
+                mount: PathBuf::from(mount),
+                key,
+                total: 2000 * GIB,
+                free,
+                files_free: Some(files_free),
+                dev: 1,
+                read_only: false,
+            },
+            thresholds,
+            level: thresholds.level(Some(free), Some(files_free)),
+            room: Some(16 * GIB),
+            as_of: Instant::now(),
+            as_of_unix: 0,
+            reclaimed_here: true,
+        }
+    }
+
+    fn pass(key: VolumeKey, left: Vec<Hog>, ended_at_unix: Option<i64>) -> PassSummary {
+        PassSummary {
+            key,
+            ended_at: Instant::now(),
+            free_after: None,
+            tiers: vec![1],
+            freed: 0,
+            demand: None,
+            ran_out: false,
+            spent: false,
+            held_back: false,
+            hogs: left.len(),
+            largest: left.iter().map(|h| h.bytes).max().unwrap_or(0),
+            left,
+            ended_at_unix,
+        }
+    }
+
+    /// With the watch on, the deck reads the home volume's level and lines
+    /// (no floor where no pass removes, a private state root's volume, nor
+    /// with the automatic pass off), the inode emergency as its own flag,
+    /// the stuck sessions, every other measured volume by name, a stall
+    /// only once the beat is two look periods old (dated at the beat),
+    /// today's tally and the last home pass's hogs with its time. NEGATIVE
+    /// CONTROLS: an unread wall clock dates neither a stall nor the hogs, a
+    /// pass on another volume names no hogs, a home volume the board has
+    /// not measured reads no level, and a process with no watch reads
+    /// nothing.
+    #[test]
+    fn deck_facts_with_the_watch_on() {
+        let home = VolumeKey::Container("disk3".to_owned());
+        let backup = VolumeKey::Fsid(9);
+        let mut b = Board::new();
+        b.watched = true;
+        b.volumes.push(measured(
+            "/System/Volumes/Data",
+            home.clone(),
+            41 * GIB,
+            1 << 30,
+        ));
+        b.volumes.push(measured(
+            "/Volumes/Backup",
+            backup.clone(),
+            12 * GIB,
+            1 << 30,
+        ));
+        b.episode.stuck.insert("s1".to_owned(), "ENOSPC".to_owned());
+        b.episode.stuck.insert("s2".to_owned(), "ENOSPC".to_owned());
+        let beat = Instant::now();
+        b.watch = Watch::Running { beat };
+        let now = Clock {
+            at: beat + crate::control::control_disk::STALL + Duration::from_secs(90),
+            ..clock(UTC_MIDNIGHT + 37_800)
+        };
+        b.freed
+            .add(41 * GIB, BUILD_CACHES, &clock(UTC_MIDNIGHT + 30_000));
+        let hog = Hog {
+            path: PathBuf::from("/Users//x/aterm/target"),
+            bytes: 212 * GIB,
+            bytes_partial: false,
+            why: "a live checkout's build directory".to_owned(),
+        };
+        b.last_pass = Some(pass(
+            home.clone(),
+            vec![hog.clone()],
+            Some(UTC_MIDNIGHT + 30_000),
+        ));
+
+        let f = b.deck_facts(&home, &now);
+        assert!(f.watch);
+        assert_eq!(f.level, Some(Level::Low));
+        assert_eq!(
+            (f.warn, f.floor, f.emergency),
+            (Some(69 * GIB), Some(34 * GIB), Some(8 * GIB))
+        );
+        assert!(!f.files_emergency);
+        assert_eq!(f.stuck, 2);
+        assert_eq!(f.others, [("Backup".to_owned(), Level::Short, 12 * GIB)]);
+        let quiet = crate::control::control_disk::STALL.as_secs() + 90;
+        assert_eq!(
+            f.stalled_since,
+            Some(UTC_MIDNIGHT + 37_800 - i64::try_from(quiet).expect("seconds"))
+        );
+        let freed = f.freed_today.expect("freed today");
+        assert_eq!(
+            (freed.aterm_bytes, freed.last_at),
+            (41 * GIB, UTC_MIDNIGHT + 30_000)
+        );
+        assert_eq!(f.hogs, std::slice::from_ref(&hog));
+        assert_eq!(f.hogs_at, Some(UTC_MIDNIGHT + 30_000));
+
+        // An unread wall clock dates no stall, and a pass that ended under
+        // one gives its hogs no time.
+        let unread = Clock {
+            unix: None,
+            offset: None,
+            ..now
+        };
+        assert_eq!(b.deck_facts(&home, &unread).stalled_since, None);
+        b.last_pass = Some(pass(home.clone(), vec![hog.clone()], None));
+        let f = b.deck_facts(&home, &now);
+        assert_eq!((f.hogs.len(), f.hogs_at), (1, None));
+
+        // A beat younger than two look periods is no stall; a suspended
+        // watch never stalls.
+        let fresh = Clock {
+            at: beat + crate::control::control_disk::STALL - Duration::from_secs(1),
+            ..now
+        };
+        assert_eq!(b.deck_facts(&home, &fresh).stalled_since, None);
+        b.watch = Watch::Suspended;
+        assert_eq!(b.deck_facts(&home, &now).stalled_since, None);
+
+        // Out of file slots with bytes to spare: the inode line's emergency.
+        b.volumes[0] = measured("/System/Volumes/Data", home.clone(), 41 * GIB, 10);
+        let f = b.deck_facts(&home, &now);
+        assert_eq!(f.level, Some(Level::Emergency));
+        assert!(f.files_emergency);
+        // Below the emergency line in bytes: the free figure's emergency.
+        b.volumes[0] = measured("/System/Volumes/Data", home.clone(), 6 * GIB, 10);
+        assert!(!b.deck_facts(&home, &now).files_emergency);
+        // A private state root: the watch measures and cleans nothing, so
+        // no floor line, while the warning and the emergency stand.
+        b.volumes[0].reclaimed_here = false;
+        let f = b.deck_facts(&home, &now);
+        assert_eq!((f.warn, f.floor), (Some(69 * GIB), None));
+        assert_eq!(f.emergency, Some(8 * GIB));
+        b.volumes[0].reclaimed_here = true;
+        assert_eq!(b.deck_facts(&home, &now).floor, Some(34 * GIB));
+        // The automatic pass off: no floor line.
+        b.volumes[0].thresholds.floor = 0;
+        assert_eq!(b.deck_facts(&home, &now).floor, None);
+
+        b.last_pass = Some(pass(backup.clone(), vec![hog], Some(UTC_MIDNIGHT)));
+        let f = b.deck_facts(&home, &now);
+        assert!(f.hogs.is_empty());
+        assert_eq!(f.hogs_at, None);
+
+        let elsewhere = b.deck_facts(&VolumeKey::Fsid(77), &now);
+        assert!(elsewhere.watch);
+        assert_eq!((elsewhere.level, elsewhere.warn), (None, None));
+        assert_eq!(elsewhere.others.len(), 2);
+
+        b.watched = false;
+        assert_eq!(b.deck_facts(&home, &now), DiskFactsRaw::default());
+    }
+
+    /// With the harness off (the host's tick says no watch runs) the deck
+    /// reads no board facts, even from a board that holds a level, a stuck
+    /// session and a tally: it is empty with `watch` false, and the shelf
+    /// says it is not watched. NEGATIVE CONTROL: the same board watched reads
+    /// them.
+    #[test]
+    fn with_the_harness_off_the_deck_reads_no_board_facts() {
+        let home = VolumeKey::Container("disk3".to_owned());
+        let shelf = Shelf::new();
+        shelf.publish(|b| {
+            b.watched = true;
+            b.volumes.push(measured(
+                "/System/Volumes/Data",
+                home.clone(),
+                41 * GIB,
+                1 << 30,
+            ));
+            b.episode.stuck.insert("s1".to_owned(), "ENOSPC".to_owned());
+            b.freed.add(GIB, BUILD_CACHES, &clock(UTC_MIDNIGHT));
+        });
+        let now = clock(UTC_MIDNIGHT + 60);
+        assert!(shelf.watched());
+        let on = shelf.deck_facts(&home, &now);
+        assert!(on.watch);
+        assert_eq!(on.level, Some(Level::Low));
+        assert_eq!(on.stuck, 1);
+        assert!(on.freed_today.is_some());
+        shelf.publish(|b| b.watched = false);
+        assert!(!shelf.watched());
+        let off = shelf.deck_facts(&home, &now);
+        assert_eq!(off, DiskFactsRaw::default());
+        assert!(!off.watch);
+        assert_eq!(off.level, None);
+        assert_eq!((off.warn, off.floor, off.emergency), (None, None, None));
+        assert_eq!((off.stuck, off.freed_today), (0, None));
     }
 
     /// THE WATCH'S JUDGEMENT STAYS (live5 F1): a wait's own reading of a
@@ -674,6 +1226,7 @@ mod tests {
                 fstype: String::new(),
                 local: true,
                 automounted: false,
+                removable: false,
                 read_only: false,
                 container: Some("Volume{6140fc3b-044f-43d7-b060-cb98170c7a63}".to_owned()),
             },
@@ -688,6 +1241,7 @@ mod tests {
                 fstype: "apfs".to_owned(),
                 local: true,
                 automounted: false,
+                removable: false,
                 read_only: false,
                 container: Some("disk3".to_owned()),
             },

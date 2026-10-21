@@ -18,7 +18,11 @@
 //!   the media or not: the file holds the version before it, or it, or any
 //!   later one, WHOLE — the model the state dir is written against (its module
 //!   doc: "a reader sees the old value or the new one, never a truncation");
-//! * an unlink may or may not have reached the media;
+//! * an unlink may or may not have reached the media (finding F2: a landed
+//!   post's in-flight entry came back, and its republish landed it behind its
+//!   sender's later posts where the log had lost it on its own; the next
+//!   boot's first bridge now retires what a cut brings back,
+//!   `StateDir::retire_in_flight_of_an_earlier_boot`);
 //! * an append (`acked`) may have reached it whole or not at all;
 //! * a directory flush puts every ENTRY change in that directory on the
 //!   media — an unlink is kept, a rename's older versions can no longer come
@@ -40,15 +44,30 @@
 //! POSIX promises nothing of an unflushed file's DATA across a power loss, so
 //! a rename that reached the media may name a file whose bytes did not — an
 //! empty or cut file. [`Device::tears`] lets a power cut leave that too (an
-//! atomic-only replace torn to nothing, an append cut at any byte). The
-//! committed model does not, because the bridge does not survive it: a torn
-//! `inflight/<seq>` (`StateDir::in_flight`) or `sent/` reservation
-//! (`StateDir::forget_log_offsets`) is refused as damaged, fail-closed, at
-//! every attach of every later boot, and the bridge never attaches again until
-//! a person repairs the dir — while the state dir's own table calls losing
+//! atomic-only replace cut at any byte short of its last, nothing included;
+//! an append cut at any byte), and the committed worlds' devices do
+//! (`world::Opts::seed`).
+//!
+//! FINDING F1 was what that did to the bridge: a torn `inflight/<seq>`
+//! (`StateDir::in_flight`) or `sent/` reservation
+//! (`StateDir::forget_log_offsets`) was refused as damaged, fail-closed, at
+//! every attach of every later boot, and the bridge never attached again until
+//! a person repaired the dir — while the state dir's own table calls losing
 //! those files harmless after a reboot, which orphans every session they
-//! served. The torn model's seed that shows it is kept as a test
-//! (`tests::a_torn_state_file_after_a_power_cut_wedges_the_attach`).
+//! served. Decided for the table: after an unclean stop in an earlier boot,
+//! the bridge moves each file of those kinds that is not provably whole into
+//! the state dir's quarantine and goes on (`StateDir::set_aside_torn`);
+//! within one boot, and after a clean stop, damage is still refused. Its
+//! negative controls are the old refusal and the first fix's sweep, which
+//! kept an in-flight reply cut where it still reads
+//! (`tests::a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on`).
+//!
+//! A cut number reads as a prefix, a LOWER number (a cursor that re-reads, a
+//! watermark that re-answers, a `seq` the durable `inc` fences), and every
+//! reader that refuses damage is one of `StateDir::set_aside_torn`'s kinds —
+//! but `logpin`, the mirror's pin, which holds what no reboot ends (the alias
+//! key and the lifetime total, rulings Q6 and Q13): a torn one is kept, and
+//! the mirror stops for good (`world::World::mirror_stopped_by_its_torn_pin`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -154,7 +173,7 @@ pub(crate) struct Device {
     /// anything), so a failure only a lossy cut can cause vanishes under it.
     pub(crate) lossless: bool,
     /// POSIX's worst case: a power cut may also TEAR an unflushed file (the
-    /// module doc's finding F1). Off in the committed model.
+    /// module doc's finding F1). On in the committed worlds.
     pub(crate) tears: bool,
 }
 
@@ -251,9 +270,11 @@ impl Device {
             };
             let (version, torn_from, replace) = versions[pick].clone();
             let image = match (torn, version) {
+                // A replace torn: its data reached the media up to any byte
+                // short of its last, nothing included.
                 (true, Version::Bytes(bytes, mode)) if replace => {
-                    let _ = bytes;
-                    Version::Bytes(Vec::new(), mode)
+                    let cut = usize::try_from(rng.below(bytes.len().max(1) as u64)).unwrap_or(0);
+                    Version::Bytes(bytes[..cut.min(bytes.len())].to_vec(), mode)
                 }
                 (true, Version::Bytes(bytes, mode)) => {
                     let from = torn_from.unwrap_or(0);

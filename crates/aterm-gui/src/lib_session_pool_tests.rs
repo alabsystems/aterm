@@ -107,8 +107,8 @@ fn detach_drops_session_exactly_when_last_view_leaves() {
     pool.insert(test_session(1));
     // A second window now views the one session (views = 2).
     pool.attach(1);
-    // First detach: a view remains, so the session is not dropped — the
-    // precondition for same-session-in-two-windows / detach with zero PTY churn.
+    // First detach: a view remains, so the session lives on (one session in two
+    // windows, detach with no PTY churn).
     assert!(
         !pool.detach(1),
         "detach with a remaining view must not drop"

@@ -2,11 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-crossing operations on [`Scrollback`].
-//!
-//! Methods that read or write across the hot/warm/cold tier system.
-//! Separated from `lib.rs` (which holds the struct definition, constructors,
-//! and read-only accessors) to keep file sizes under the 500-line limit.
+//! Tier-crossing operations on [`Scrollback`]: methods that read or write
+//! across the hot/warm/cold tiers (`lib.rs` holds the struct, constructors and
+//! read-only accessors).
 
 use std::borrow::Cow;
 
@@ -19,7 +17,7 @@ impl Scrollback {
     /// Get a line by index (0 = oldest).
     ///
     /// Returns `Cow::Borrowed` for hot-tier lines (zero-copy) and
-    /// `Cow::Owned` for warm/cold-tier lines (decompressed on access). (#5950)
+    /// `Cow::Owned` for warm/cold-tier lines (decompressed on access).
     ///
     /// REQUIRES: idx < self.line_count() for Some result
     /// ENSURES: idx >= self.line_count() implies result == Ok(None)
@@ -77,7 +75,6 @@ impl Scrollback {
     /// ENSURES: self.memory_budget() >= 1 (clamped from input)
     pub fn set_memory_budget(&mut self, budget: usize) -> Result<(), ScrollbackError> {
         self.memory_budget = budget.max(1);
-        // Recompute watermark thresholds for the new budget.
         self.yellow_threshold = threshold_bytes(DEFAULT_YELLOW_PERCENT, self.memory_budget);
         self.yellow_exit_threshold = threshold_bytes(YELLOW_EXIT_PERCENT, self.memory_budget);
         self.red_threshold = threshold_bytes(DEFAULT_RED_PERCENT, self.memory_budget);
@@ -110,7 +107,6 @@ impl Scrollback {
     /// ENSURES: self.line_limit() == limit
     pub fn set_line_limit(&mut self, limit: Option<usize>) {
         self.line_limit = limit;
-        // Enforce the limit immediately
         if let Some(max) = limit
             && self.line_count > max
             && let Err(e) = self.truncate(max)
@@ -129,17 +125,13 @@ impl Scrollback {
     ///
     /// ENSURES: self.line_count() >= 1
     pub fn push_line(&mut self, line: Line) {
-        // If hot tier is full, promote oldest lines to warm
         if self.hot.len() >= self.hot_limit {
             self.promote_hot_to_warm();
         }
 
-        // Add line to hot tier
         self.hot.push(line);
-        // line_count counts lines held across the tiers; every counted line
-        // occupies at least one byte of memory, so the count is bounded well
-        // below usize::MAX and saturating_add never saturates —
-        // behavior-identical to `+= 1`.
+        // saturating_add never saturates (every counted line holds memory);
+        // identical to `+= 1`.
         self.line_count = self.line_count.saturating_add(1);
         self.sync_accounting();
 
@@ -159,7 +151,6 @@ impl Scrollback {
             self.promote_hot_to_warm();
         }
 
-        // Handle memory pressure
         self.handle_memory_pressure();
     }
 
@@ -186,19 +177,16 @@ impl Scrollback {
     /// Per the Kitty unscroll spec: "The lines that have been scrolled into
     /// the scrollback buffer are removed from the scrollback buffer."
     ///
-    /// Selects the newest lines across hot, warm and cold tiers, committing
-    /// the oldest affected tier first. Decompresses at most one boundary
-    /// block/page at a time, bounding peak memory to ~one block regardless of
-    /// total scrollback size.
-    ///
-    /// Returns an error if decompression fails during line extraction.
-    /// On error, scrollback state is unchanged (no lines lost). (#4638)
+    /// Takes the newest lines from hot, then warm, then cold, committing the
+    /// oldest affected tier first and decompressing at most one boundary
+    /// block/page, so peak memory is ~one block. On a decompression error the
+    /// scrollback is unchanged.
     ///
     /// ENSURES: Ok(()) implies self.line_count() == old_line_count.saturating_sub(n)
     /// ENSURES: Err(_) implies state unchanged
     // Skip: the cross-tier back-removal driver — the blanket-unmodeled
     // drain/iterator class of the tier truncations it calls (their arithmetic
-    // is saturating and proven). ARENA-SCROLL tested.
+    // is saturating and proven).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn remove_newest(&mut self, n: usize) -> Result<(), ScrollbackError> {
         if n == 0 || self.line_count == 0 {
@@ -209,16 +197,15 @@ impl Scrollback {
             return Ok(());
         }
 
-        // Calculate per-tier removal amounts.
         let hot_remove = n.min(self.hot.len());
         let after_hot = n.saturating_sub(hot_remove);
         let warm_remove = after_hot.min(self.warm.line_count());
         let cold_remove = after_hot.saturating_sub(warm_remove);
 
-        // Commit the oldest affected tier first: it is the only tier that
-        // can have a partial boundary, hence the only fallible rebuild. Every
-        // newer tier is removed whole. Each truncation prepares its boundary
-        // before mutation, so no separate validation pass is needed.
+        // Commit the oldest affected tier first: only it can have a partial
+        // boundary, hence the only fallible rebuild; every newer tier goes whole.
+        // Each truncation prepares its boundary before mutating, so a failure
+        // leaves the scrollback unchanged.
         if cold_remove > 0 {
             self.cold.truncate_back_lines(cold_remove)?;
         }
@@ -236,14 +223,9 @@ impl Scrollback {
 
     /// Truncate to keep only the last `n` lines.
     ///
-    /// Tier-aware: removes oldest lines from cold → warm → hot without
-    /// decompressing the entire scrollback. Both cold and warm tiers use
-    /// `front_offset` for O(1) line removal with no decompression.
-    /// The hot tier uses simple front truncation.
-    ///
-    /// Returns `Result` for API compatibility, but all steps are now infallible
-    /// after the warm tier `front_offset` optimization (no boundary block
-    /// decompression during truncation).
+    /// Removes the oldest lines cold → warm → hot without decompressing: cold
+    /// and warm advance a `front_offset`, hot truncates its front. Every step is
+    /// infallible; the `Result` is kept for API compatibility.
     ///
     /// ENSURES: Ok(()) implies self.line_count() <= n
     /// ENSURES: n == 0 implies self.line_count() == 0
@@ -256,12 +238,10 @@ impl Scrollback {
             return Ok(());
         }
 
-        // saturating chain: `n < line_count` (guarded above) and each tier's
-        // remove is `min`-capped, so none ever actually saturates — this only
-        // discharges the obligations the verifier cannot chain. Identical.
+        // Saturating: `n < line_count` and each remove is `min`-capped, so
+        // nothing saturates; it discharges obligations the verifier cannot chain.
         let to_remove = self.line_count.saturating_sub(n);
 
-        // Calculate per-tier removal amounts up front.
         let cold_lines = self.cold.line_count();
         let cold_remove = to_remove.min(cold_lines);
         let after_cold = to_remove.saturating_sub(cold_remove);
@@ -270,7 +250,7 @@ impl Scrollback {
         let warm_remove = after_cold.min(warm_lines);
         let hot_remove = after_cold.saturating_sub(warm_remove);
 
-        // All three tiers are now infallible during truncation (front_offset pattern).
+        // All three are infallible here (front_offset).
         if warm_remove > 0 {
             self.warm.truncate_front_lines(warm_remove)?;
         }
@@ -294,40 +274,36 @@ impl Scrollback {
             return;
         }
 
-        // Take block_size lines from front of hot tier
         let lines = self.hot.take_front(self.block_size);
         if lines.is_empty() {
             return;
         }
 
-        // THE IMAGE RETENTION HORIZON. Compression is where a line's inline
-        // picture stops existing (the wire format has no image section — see
-        // `Line::serialize`), so this is the one place in the crate that can
-        // report the loss, and it reports it BEFORE the lines are consumed.
+        // The image retention horizon: compression is where a line's inline
+        // picture ends (no image section on the wire; see `Line::serialize`), so
+        // the loss is counted here, before the lines are consumed.
         self.image_rows_dropped_by_compression = self
             .image_rows_dropped_by_compression
             .saturating_add(crate::count_image_rows(&lines));
 
-        // Compress and add to warm tier
         self.warm.push_block(&lines);
 
-        // While the warm tier is over its limit, evict to cold: a batch can
-        // arrive as several blocks (see `WarmTier::push_block`), and the block
-        // evicted can be shorter than the batch.
-        // Failure is OK here — handle_memory_pressure will retry or fall through
-        // to cold eviction.
+        // Evict to cold while warm is over its limit: a batch can arrive as
+        // several blocks (see `WarmTier::push_block`), and an evicted block can
+        // be shorter than the batch. A failure is fine: handle_memory_pressure
+        // retries or falls through to cold eviction.
         while self.warm.line_count() > self.warm_limit && self.evict_warm_to_cold() {}
 
         self.sync_accounting();
         self.assert_bytes_used_invariant();
     }
 
-    /// Evict oldest warm block to cold tier.
+    /// Evict the oldest warm block to cold.
     ///
-    /// Returns `true` if the block was accepted by cold tier or quarantined
-    /// (freed memory), `false` if eviction failed and the block was restored
-    /// to warm for retry. Blocks that fail decompression repeatedly are
-    /// quarantined (dropped) after [`QUARANTINE_THRESHOLD`] consecutive failures. (#5947)
+    /// Returns `true` if cold accepted it or it was quarantined (memory freed),
+    /// `false` if eviction failed and the block went back to warm for retry. A
+    /// block is quarantined after `tier::QUARANTINE_THRESHOLD` consecutive
+    /// decompression failures.
     fn evict_warm_to_cold(&mut self) -> bool {
         let Some(block) = self.warm.pop_front() else {
             return false;
@@ -384,15 +360,15 @@ impl Scrollback {
     fn handle_memory_pressure(&mut self) {
         let mut changed = false;
         // First, evict warm blocks to cold (compresses further).
-        // Break if eviction fails — retrying the same block loops forever (#5921).
+        // Stop when eviction fails: retrying the same block would loop forever.
         while self.over_budget() && self.warm.block_count() > 0 {
             if !self.evict_warm_to_cold() {
                 break;
             }
             changed = true;
         }
-        // If still over budget, batch-evict oldest cold pages (#5444, #5858).
-        // Uses evict_bytes for O(P) total cost instead of O(K*P) from repeated pop_front.
+        // Still over budget: batch-evict the oldest cold pages (`evict_bytes` is
+        // O(P) total, not the O(K*P) of repeated pop_front).
         if self.over_budget() && self.cold.line_count() > 0 {
             let excess = self.budgeted_bytes.saturating_sub(self.memory_budget);
             let evicted = self.cold.evict_bytes(excess);
@@ -414,12 +390,10 @@ impl Scrollback {
 
 #[cfg(any(test, debug_assertions))]
 impl Scrollback {
-    /// Inject a corrupted warm block at the front of the warm tier.
-    ///
-    /// The block reports `line_count` lines but its compressed data is invalid,
-    /// causing decompression and warm→cold eviction to fail. Used by quarantine
-    /// behavioral tests (#5947) and, in a debug build, by the grid's
-    /// dense-history conformance tests. Never compiled into a release build.
+    /// Inject a corrupted warm block at the front of the warm tier: it reports
+    /// `line_count` lines but its compressed data is invalid, so decompression
+    /// and warm→cold eviction fail. For quarantine tests and, in a debug build,
+    /// the grid's dense-history conformance tests; never in a release build.
     #[doc(hidden)]
     pub fn inject_corrupted_warm_block(&mut self, line_count: usize) {
         self.warm.push_front_corrupt(line_count);

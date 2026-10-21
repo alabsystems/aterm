@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 #
-# The workspace clippy.toml's `libc::` rows (`flock`, `forkpty`, `execvp`,
-# `abort`, `raise`) name paths that resolve oddly inside this crate (it cannot
-# call itself `libc`), so every tippy run warned. These are declarations that
-# call nothing; this crate lints with clippy's defaults.
+# Empty, so this crate lints with clippy's defaults: the workspace clippy.toml's
+# `libc::` paths do not resolve inside this crate (it cannot name itself `libc`)
+# and would warn on every tippy run, and these declarations call nothing.

@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OWNED-MASTER CENSUS: `aterm_session::sink::owned_masters_open`
-//! counts the masters this process's sinks own and have not closed, the number
-//! the GUI's `metrics` prints as `pty_masters=` beside its live sessions.
-//!
-//! One test in its own binary, so no other test's sinks move the count while it
-//! reads it. It pins the census to the fd itself: the count falls exactly when
-//! the master closes (the LAST clone's drop), never at an earlier clone's drop,
-//! and a borrowed sink is not counted at all.
+//! `aterm_session::sink::owned_masters_open` counts the masters this process's sinks
+//! own and have not closed (`metrics`' `pty_masters=`). Alone in its binary so no
+//! other test's sinks move the count: it falls exactly when the master closes (the
+//! last clone's drop), and a borrowed sink is never counted.
 
 #![cfg(unix)]
 
@@ -31,7 +27,7 @@ fn the_census_counts_an_owned_master_until_its_last_clone_closes_it() {
     let owned = OwnedFd::from(ours);
     let fd = owned.as_raw_fd();
 
-    // A BORROWED sink over the same number owns nothing and counts nothing.
+    // A borrowed sink over the same number owns and counts nothing.
     let borrowed = SinkWriter::new(fd);
     assert_eq!(owned_masters_open(), base, "a borrowed sink is not counted");
     drop(borrowed);

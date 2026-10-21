@@ -10,14 +10,13 @@ use astream_wire::hash::crc32_ieee_update;
 /// CRC-32/ISO-HDLC (the polynomial PNG specifies, reflected form `0xEDB8_8320`)
 /// as a running value over astream-wire's `hash::crc32_ieee_update`.
 ///
-/// This crate used to build its own slicing-by-8 tables behind a `OnceLock`.
-/// astream-wire's are the same eight tables built at COMPILE TIME from the
+/// astream-wire builds the eight slicing-by-8 tables at compile time from the
 /// polynomial (no first-use init, no probe per chunk), with every table index
 /// proved in bounds by its `u8` type and the result pinned to the `0xCBF4_3926`
 /// check value and a bitwise reference there. It is the CRC astream frames
-/// every record with and `aterm_codec::crc32` wraps for gzip, so aterm has one.
+/// every record with and `aterm_codec::crc32` wraps for gzip.
 ///
-/// astream's running value is the FINISHED CRC of the bytes so far: it starts
+/// astream's running value is the finished CRC of the bytes so far: it starts
 /// at `0` (the CRC of nothing) and inverts in and out on every call, so there
 /// is no seed to apply here and none to strip in [`Crc32::finish`].
 pub(crate) struct Crc32(u32);

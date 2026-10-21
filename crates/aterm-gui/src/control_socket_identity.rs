@@ -24,9 +24,8 @@ const MAX_TOKEN_BYTES: usize = 256;
 pub(crate) struct SocketIdentity {
     schema: u32,
     path: String,
-    /// Relative Unix socket names are resolved against the listener's original
-    /// working directory. LaunchServices does not inherit that directory.
-    /// Absolute endpoints retain the original wire shape for older receivers.
+    /// The listener's working directory, for a relative socket path (LaunchServices does not
+    /// inherit it). `None` for an absolute path, the wire shape older receivers read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     directory: Option<std::path::PathBuf>,
     device: u64,
@@ -92,28 +91,25 @@ impl SocketIdentity {
         self.schema == 1 && explicit_plan(plan) && self.path == plan.sock_path
     }
 
-    /// Requires the same socket vnode AND the same token file and contents.
-    /// Missing paths, symlinks, unsupported platforms and unreadable files refuse.
+    /// Requires the same socket vnode and the same token file and contents. Missing paths,
+    /// symlinks, unsupported platforms and unreadable files refuse.
     pub(crate) fn matches_current(&self, plan: &SocketPlan) -> bool {
         self.matches_plan_path(plan) && self.matches_files(plan)
     }
 
-    /// Restore a relative endpoint's binding directory only after validating
-    /// the existing socket AND credential there. The final ordinary validation
-    /// and binder still recheck the files against the now-current directory.
-    /// No environment string or directory alone grants endpoint ownership.
+    /// Restore a relative endpoint's binding directory, only after the socket and credential
+    /// there validate; the files are rechecked against the new cwd before this returns true.
     ///
     /// # Safety
-    /// Called only in single-threaded startup of an admitted Ready/Commit
-    /// candidate. Changing cwd must not redirect concurrent filesystem work.
+    /// Called only in single-threaded startup of an admitted Ready/Commit candidate: changing
+    /// cwd must not redirect concurrent filesystem work.
     #[cfg(unix)]
     pub(crate) unsafe fn prepare_incoming_directory(&self, plan: &SocketPlan) -> bool {
         if !self.matches_plan_path(plan) {
             return false;
         }
         let Some(directory) = &self.directory else {
-            // Legacy witnesses have no directory. Fork inheritance still works;
-            // a launched candidate must fail closed if its files do not match.
+            // An absolute endpoint, or an older witness: validate in place, failing closed.
             return self.matches_current(plan);
         };
         if !directory.is_absolute() || !std::path::Path::new(&plan.sock_path).is_relative() {
@@ -242,14 +238,13 @@ fn read_token(plan: &SocketPlan) -> Option<TokenIdentity> {
     })
 }
 
-/// The witness this process publishes: set once at bind, and MOVED only by
-/// [`republish_rebound`] when the supervised listener replaces its own wedged
-/// socket (`control_listener`). A leaf lock: held for a clone or a store, never
-/// across another acquisition or any I/O but the rebind's own two `lstat`s.
+/// The witness this process publishes: set once at bind, moved only by [`republish_rebound`]
+/// when the supervised listener replaces its own wedged socket. A leaf lock, never held across
+/// another acquisition; the only I/O under it is the rebind's file revalidation.
 static PUBLISHED: Mutex<Option<SocketIdentity>> = Mutex::new(None);
 
-/// Called only after the real listener has bound and its witness was captured.
-/// The first publication wins, exactly as the one-shot cell this replaced.
+/// Called only after the real listener has bound and its witness was captured. The first
+/// publication wins.
 pub(crate) fn publish(identity: SocketIdentity) -> bool {
     let mut slot = PUBLISHED
         .lock()
@@ -328,14 +323,10 @@ pub(crate) fn consume_incoming() -> Result<Option<SocketIdentity>, String> {
     crate::handoff_env::through_process_env(&[ENV_IDENTITY], consume_incoming_from)
 }
 
-/// Consume the launch value once. An error is a refused handoff, never an absent
-/// witness that permits the ordinary binder. Parsed data gains authority only
-/// beside the existing admitted Ready/Commit gate and matching explicit plan.
-///
-/// Taken out of the handoff snapshot `main_entry` captured
-/// (`HandoffEnv::capture`, the one read-and-clear of the process environment,
-/// before any thread): a one-shot authority consumed twice is not one-shot, and
-/// a `take` from the snapshot is one-shot by construction.
+/// Consume the launch value once. An error is a refused handoff, never an absent witness that
+/// permits the ordinary binder; parsed data gains authority only beside the admitted
+/// Ready/Commit gate and a matching explicit plan. It is taken from the snapshot `main_entry`
+/// captured (`HandoffEnv::capture`), so it is one-shot by construction.
 pub(crate) fn consume_incoming_from(
     env: &mut crate::handoff_env::HandoffEnv,
 ) -> Result<Option<SocketIdentity>, String> {
@@ -372,18 +363,12 @@ mod tests {
         (dir, plan, listener, token)
     }
 
-    /// `consume_incoming` takes the launch witness ONCE, through the workspace's
-    /// lock-scoped env helper: absent and empty are `Ok(None)`, a malformed
-    /// witness is the refusal, a real one decodes to the identity the parent
-    /// captured — and after every case the variable is gone, so nothing later in
-    /// the process, and no child it spawns, can observe it. The env helpers are
-    /// serialized under one lock, so this runs beside the parallel suite. The
-    /// identity is compared with `==`, never formatted: the type carries no
-    /// `Debug` on purpose (nothing about a listener's files is for a log line).
+    /// The witness is taken once: absent and empty are `Ok(None)`, malformed is the refusal,
+    /// and the variable is gone after every case. `SocketIdentity` has no `Debug` on purpose
+    /// (nothing about a listener's files belongs in a log), so it is compared with `==`.
     #[test]
     fn consume_incoming_takes_the_witness_once_through_the_blessed_helper() {
-        // The handoff env lock: `HandoffEnv::capture` in the snapshot's
-        // conformance takes this name out of the process too.
+        // `HandoffEnv::capture`'s conformance takes this name out of the process too.
         let _env = crate::seamless::tests::ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -424,8 +409,7 @@ mod tests {
 
     #[test]
     fn relative_listener_witness_restores_directory_across_transport() {
-        // Cwd is process-wide; the normal parallel test runner never changes
-        // it. This single-test child owns every file and listener below.
+        // Cwd is process-wide: this runs only as a single-test child.
         if !crate::test_alone::alone() {
             return;
         }
@@ -456,8 +440,8 @@ mod tests {
         let received = SocketIdentity::decode(wire).unwrap();
         assert!(!wire.contains(&token));
 
-        // LaunchServices can start from another cwd. The original raw relative
-        // spelling must remain usable without lengthening the Unix bind path.
+        // LaunchServices can start from another cwd; the relative spelling must stay usable
+        // without lengthening the Unix bind path.
         std::env::set_current_dir(foreign.path()).unwrap();
         let foreign_dir = std::env::current_dir().unwrap();
         assert!(
@@ -474,7 +458,7 @@ mod tests {
         assert_eq!(std::env::current_dir().unwrap(), foreign_dir);
         assert_eq!(std::fs::read(&plan.token_path).unwrap(), token.as_bytes());
 
-        // The valid endpoint and credential are checked BEFORE cwd changes.
+        // The endpoint and credential validate in the original directory before cwd moves.
         // SAFETY: same isolated child and the fixture's admitted witness.
         assert!(unsafe { received.prepare_incoming_directory(&plan) });
         assert_eq!(std::env::current_dir().unwrap(), original_dir);
@@ -483,7 +467,7 @@ mod tests {
         let (accepted, _) = listener.accept().unwrap();
         assert!(crate::control_auth::peer_check(&accepted).is_ok());
         assert_eq!(std::fs::read(&plan.token_path).unwrap(), token.as_bytes());
-        // Legacy receivers still see the byte-compatible absolute witness.
+        // An absolute endpoint's witness keeps the wire shape older receivers read.
         let (_absolute_dir, absolute, absolute_listener, absolute_token) = fixture();
         let absolute_identity =
             SocketIdentity::capture(&absolute, &absolute_listener, &absolute_token).unwrap();
@@ -569,16 +553,8 @@ mod tests {
         assert!(!identity.matches_current(&plan));
     }
 
-    /// A WITNESS THE PARENT'S OWN REBIND MOVED IS FILED A MOMENT (round eight
-    /// of the update audit, finding 69). The successor carries the witness
-    /// sampled when the attempt began; the parent's self-healing listener
-    /// rebind moves the socket's inode under it while it is held, so its
-    /// fixed-socket check refuses the intake. That is the parent's endpoint,
-    /// not the new build's bytes: a parent that declared it reads 75 files
-    /// the exit Transient, and an older one is sent the `74` it always read.
-    ///
-    /// RED before the fix: the successor exited 74, which the parent files
-    /// Structural, and two such races converged a healthy build.
+    /// The parent's own rebind invalidates a carried witness; the successor's refusal exit is
+    /// filed Transient by a parent that reads it (`seamless::endpoint_refusal_exit`).
     #[test]
     fn a_witness_the_parents_rebind_moved_is_filed_a_moment() {
         use crate::app_native::PhysicalFailureShape as Shape;

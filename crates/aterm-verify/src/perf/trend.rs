@@ -456,8 +456,11 @@ fn civil_date(days: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// One parsed ledger row. The parser accepts all three widths: 5, 6
-/// (+ toolchain), 7 (+ the box's hardware shape).
+/// The eighth column of a row a re-record wrote ([`trend_rows`]).
+const RERECORDED: &str = "rerecorded";
+
+/// One parsed ledger row. The parser accepts all four widths: 5, 6
+/// (+ toolchain), 7 (+ the box's hardware shape), 8 (+ [`RERECORDED`]).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrendRow<'a> {
     pub token: &'a str,
@@ -465,6 +468,10 @@ pub(crate) struct TrendRow<'a> {
     pub value: f64,
     /// `""` on every row written before the shape column existed.
     pub shape: &'a str,
+    /// A run that re-recorded this row's lane wrote it: the lane's new level
+    /// is declared, so this box's reference window for the metric starts
+    /// here ([`judge_trend`]).
+    pub rerecorded: bool,
 }
 
 /// Parse the ledger into rows AND COUNT what it had to throw away. Pure
@@ -508,6 +515,7 @@ pub(crate) fn trend_ledger_rows_counted(ledger: &str) -> (Vec<TrendRow<'_>>, Vec
             metric: cols[3],
             value,
             shape: cols.get(6).copied().unwrap_or("").trim(),
+            rerecorded: cols.get(7).is_some_and(|c| c.trim() == RERECORDED),
         });
     }
     (rows, dropped)
@@ -627,12 +635,16 @@ pub(crate) fn judge_trend(
     let mut skipped = Vec::new();
     for s in samples {
         let metric_key = format!("{}/{}", s.lane, s.metric);
-        let mut history: Vec<f64> = mine
+        let rows: Vec<&TrendRow<'_>> = mine
             .iter()
-            .filter(|r| r.metric == metric_key)
-            .map(|r| r.value)
-            .filter(|v| *v > 0.0)
+            .copied()
+            .filter(|r| r.metric == metric_key && r.value > 0.0)
             .collect();
+        // A re-record declared a new level: the window starts at its row, so
+        // the level it replaced (a scene that now draws more, say) is not
+        // the best this run is held to.
+        let start = rows.iter().rposition(|r| r.rerecorded).unwrap_or(0);
+        let mut history: Vec<f64> = rows[start..].iter().map(|r| r.value).collect();
         let recent = history.split_off(history.len().saturating_sub(TREND_WINDOW));
         if recent.is_empty() {
             // First run on this box for this metric: nothing to hold it to —
@@ -677,18 +689,30 @@ fn toolchain_lane(lane: &str) -> &'static str {
 }
 
 /// Render `samples` as ledger rows (one metric per line, TSV). Older rows lack
-/// the toolchain and SHAPE columns; the parser still accepts them.
-pub(crate) fn trend_rows(date: &str, sha: &str, me: &MachineId, samples: &[TrendSample]) -> String {
+/// the toolchain and SHAPE columns; the parser still accepts them. A sample
+/// of a lane in `recorded` (re-recorded by this run) carries [`RERECORDED`].
+pub(crate) fn trend_rows(
+    date: &str,
+    sha: &str,
+    me: &MachineId,
+    samples: &[TrendSample],
+    recorded: &[&str],
+) -> String {
     let mut s = String::new();
     for sample in samples {
         s.push_str(&format!(
-            "{date}\t{sha}\t{}\t{}/{}\t{:.3}\t{}\t{}\n",
+            "{date}\t{sha}\t{}\t{}/{}\t{:.3}\t{}\t{}{}\n",
             me.key,
             sample.lane,
             sample.metric,
             sample.value,
             toolchain_lane(sample.lane),
-            me.shape
+            me.shape,
+            if recorded.contains(&sample.lane) {
+                format!("\t{RERECORDED}")
+            } else {
+                String::new()
+            }
         ));
     }
     s
@@ -700,7 +724,7 @@ TREND_WINDOW entries\n# (crates/aterm-verify/src/perf/trend.rs; *_worst_ms metri
 by best-MIN / TREND_RATIO).\n# The BOX column is a name from crates/aterm-verify/perf/golden/perf-boxes.tsv, \
 which is also where a\n# pre-W-1 hostname is claimed as the box it was measured on. NEVER edit a \
 box name here\n# to merge two machines — add the claim to perf-boxes.tsv, where the chip column \
-keeps it\n# honest.\n# date\tsha\tbox\tlane/metric\tvalue\ttoolchain\tshape\n";
+keeps it\n# honest. A row a re-record (`--record LANE`) wrote carries `rerecorded` in an eighth column:\n# that lane's new level is declared, and each of its metrics' windows starts there.\n# date\tsha\tbox\tlane/metric\tvalue\ttoolchain\tshape\trerecorded\n";
 
 /// Whether this run's samples join the ledger, which holds only good states:
 /// every floor lane held, no alias claim merges two machines, and any trend
@@ -842,7 +866,13 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool, recorded: &[&s
         } else {
             ledger
         };
-        text.push_str(&trend_rows(&utc_date(), &head_sha(), &me, samples));
+        text.push_str(&trend_rows(
+            &utc_date(),
+            &head_sha(),
+            &me,
+            samples,
+            recorded,
+        ));
         if let Err(e) = std::fs::write(&path, &text) {
             eprintln!("  trend: could not append ledger {}: {e}", path.display());
         } else {
@@ -883,7 +913,7 @@ mod tests {
 
     /// [`trend_rows`] for a synthetic box.
     fn rows_for(date: &str, sha: &str, key: &str, samples: &[TrendSample]) -> String {
-        trend_rows(date, sha, &box_id(key), samples)
+        trend_rows(date, sha, &box_id(key), samples, &[])
     }
 
     fn sample(lane: &'static str, metric: &str, value: f64) -> TrendSample {
@@ -930,6 +960,60 @@ mod tests {
         // A claim merging two machines blocks the append until it is fixed.
         let merged = judgment(Vec::new(), vec![("m15".into(), "Apple M4".into())]);
         assert!(!may_append(true, &merged, &["throughput"]));
+    }
+
+    /// A re-record declares its lane's new level: the rows it wrote start each
+    /// of that lane's metrics' windows, so the next run is held to the new
+    /// level, not to the best of the level it replaced. Another lane's window
+    /// is untouched. CONTROL: the same rows without the mark (an ordinary
+    /// run's) keep the old best, and the run breaches.
+    #[test]
+    fn a_re_record_starts_its_lanes_window() {
+        let old: String = (0..4)
+            .map(|_| {
+                rows_for(
+                    "2026-10-19",
+                    "a",
+                    "boxA",
+                    &[
+                        sample("effects", "m", 1000.0),
+                        sample("search", "q", 1000.0),
+                    ],
+                )
+            })
+            .collect();
+        let new = [sample("effects", "m", 500.0), sample("search", "q", 500.0)];
+        let me = box_id("boxA");
+        let marked = trend_rows("2026-10-20", "b", &me, &new, &["effects"]);
+        assert!(
+            marked
+                .lines()
+                .next()
+                .is_some_and(|l| l.ends_with("\trerecorded")),
+            "{marked}"
+        );
+        let parsed = trend_ledger_rows(&marked);
+        assert_eq!(
+            parsed.iter().map(|r| r.rerecorded).collect::<Vec<_>>(),
+            [true, false],
+            "only the re-recorded lane's rows carry the mark"
+        );
+        let next = [sample("effects", "m", 450.0), sample("search", "q", 450.0)];
+        let after = judged(&format!("{TREND_HEADER}{old}{marked}"), "boxA", &next);
+        assert_eq!(
+            after
+                .breaches
+                .iter()
+                .map(|b| b.metric.as_str())
+                .collect::<Vec<_>>(),
+            ["search/q"],
+            "450 >= 0.70 x 500 for the re-recorded lane; the other still holds 1000"
+        );
+        let unmarked = trend_rows("2026-10-20", "b", &me, &new, &[]);
+        let control = judged(&format!("{old}{unmarked}"), "boxA", &next);
+        assert_eq!(control.breaches.len(), 2, "CONTROL: 450 < 0.70 x 1000");
+        // And the 7-column rows still parse, unmarked.
+        assert!(!trend_ledger_rows(&old)[0].rerecorded);
     }
 
     #[test]
@@ -1324,6 +1408,7 @@ mod tests {
             "abc123",
             &me,
             &[sample("throughput", "median_mbps", 500.0)],
+            &[],
         );
         let parsed = trend_ledger_rows(&rows);
         assert_eq!(parsed.len(), 1);

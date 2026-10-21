@@ -169,8 +169,13 @@ fn cross_process_same_baseline_has_one_winner_and_no_temp_collision() {
                 AtomicCommitResult::Conflict { .. } => break "conflict",
                 AtomicCommitResult::Failed {
                     stage: AtomicSaveStage::Preflight,
-                    message,
-                } if message.contains("busy") => {
+                    cause:
+                        Some(crate::native_document_io::SaveCause {
+                            kind: std::io::ErrorKind::WouldBlock,
+                            ..
+                        }),
+                    ..
+                } => {
                     assert!(
                         std::time::Instant::now() < retry_deadline,
                         "save lock remained busy past the bounded retry window"

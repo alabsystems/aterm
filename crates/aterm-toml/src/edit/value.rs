@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Values: the six scalar kinds, arrays, and inline tables — each keeping the
-//! text it was written as.
+//! Values: scalars, arrays and inline tables, each keeping the text it was written as.
 
 use core::ops::Range;
 
@@ -361,12 +360,9 @@ impl TableLike for InlineTable {
     fn contains_key(&self, key: &str) -> bool {
         self.items.contains_key(key)
     }
-    /// A `[header]` table or array of tables is converted to its inline
-    /// spelling on the way in. An inline table can hold only values, and the
-    /// encoder prints only values inside `{ … }`, so an `Item::Table` stored
-    /// as-is was dropped from the output along with everything under it: a
-    /// walk that vivifies `sparkle_words.profanity` as `Item::Table` beneath
-    /// `sparkle_words = { … }` saved a file identical to the one it read.
+    /// A `[header]` table or array of tables is converted to its inline spelling on the way
+    /// in: an inline table holds only values, and the encoder prints only values inside
+    /// `{ … }`, so a stored `Item::Table` would vanish from the output.
     fn insert(&mut self, key: &str, item: Item) -> Option<Item> {
         self.items.insert(Key::new(key), inline_item(item))
     }
@@ -407,11 +403,9 @@ fn inline_item(item: Item) -> Item {
     }
 }
 
-/// The inline spelling of a `[header]` table. Its entries keep their keys; its
-/// header decor, span and `implicit` flag describe a header line, which an
-/// inline table does not have, so they are dropped. `dotted` means the same
-/// thing in both spellings (the entries print on the parent's lines as dotted
-/// keys) and is kept.
+/// The inline spelling of a `[header]` table. Its header decor, span and `implicit` flag
+/// describe a header line, so they are dropped; `dotted` means the same in both spellings
+/// and is kept.
 fn table_to_inline(table: super::Table) -> InlineTable {
     let mut out = InlineTable::new();
     out.dotted = table.dotted;
@@ -424,11 +418,8 @@ fn table_to_inline(table: super::Table) -> InlineTable {
 impl core::str::FromStr for Value {
     type Err = crate::Error;
 
-    /// Parse ONE value, and nothing else.
-    ///
-    /// The input must be exactly the value: no surrounding whitespace, no
-    /// comment, no trailing newline. That is the oracle's contract, measured
-    /// rather than assumed — see `parse::parse_value`.
+    /// Parse exactly one value: no surrounding whitespace, comment or trailing newline
+    /// (see `parse::parse_value`).
     fn from_str(s: &str) -> crate::Result<Self> {
         super::parse::parse_value(s)
     }

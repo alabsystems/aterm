@@ -450,6 +450,13 @@ pub(crate) const MUTANT_HOSTS: [Host; 20] = [
 ///   nothing more is shown. The measurement's `Baseline` switches it off with
 ///   every other rule, which is what makes that variant the predictor before
 ///   the plan; its unit test holds the wait and the flush.
+/// * `DarkOverText` off paints a guess typed over the line's text where the
+///   line's end is not known, unshifted, as the predictor did before the
+///   measurement found what that cost `Always`: the head waiting on the
+///   screen as it was, and what is typed behind a head that hides nothing.
+///   On, less is shown, so it keeps no clause: the measurement runs it off
+///   beside `Full`'s `Always` runs (`PaintedOverText`) and counts the cells it
+///   costs, and its unit tests hold the glass with it on and off.
 pub(crate) fn rule_clause(rule: Rule) -> Option<&'static str> {
     match rule {
         Rule::ExpiryOwes
@@ -486,7 +493,8 @@ pub(crate) fn rule_clause(rule: Rule) -> Option<&'static str> {
         | Rule::LearnedBindings
         | Rule::EndRefusal
         | Rule::OpaqueHead
-        | Rule::TransitBlanks => Some("frame-fidelity"),
+        | Rule::TransitBlanks
+        | Rule::CleanTailInFlight => Some("frame-fidelity"),
         Rule::WholeStateMatch => Some("provenance"),
         Rule::TransitReach
         | Rule::SpaceNeverProves
@@ -506,7 +514,8 @@ pub(crate) fn rule_clause(rule: Rule) -> Option<&'static str> {
         | Rule::CancelOwesItsBlank
         | Rule::CancelsOnlyKnownShifts
         | Rule::ScrollKeepsFirstKey
-        | Rule::ScreenAsItWas => None,
+        | Rule::ScreenAsItWas
+        | Rule::DarkOverText => None,
     }
 }
 
@@ -2318,6 +2327,10 @@ pub(crate) struct Stats {
     pub(crate) typed_owes: u64,
     pub(crate) standing_voids: u64,
     pub(crate) advance_waits: u64,
+    /// Turns a guess typed over text in a run not known to be at the end of
+    /// the line was held off the glass, the head waiting on THE SCREEN AS IT
+    /// WAS or the run's first such guess behind it (`Rule::DarkOverText`).
+    pub(crate) text_waits: u64,
     /// Edit keys the predictor armed as ops of a state chain (host side).
     pub(crate) edit_keys_armed: u64,
     /// Arrows armed while the far end was a cooked tty: tracked, and (the class
@@ -2399,6 +2412,7 @@ impl Stats {
         self.typed_owes += o.typed_owes;
         self.standing_voids += o.standing_voids;
         self.advance_waits += o.advance_waits;
+        self.text_waits += o.text_waits;
         self.edit_keys_armed += o.edit_keys_armed;
         self.cooked_motions_armed += o.cooked_motions_armed;
         self.edit_frames_displaying += o.edit_frames_displaying;
@@ -2469,30 +2483,29 @@ pub(crate) fn seen_at(input: &RenderInput, row: usize, col: usize) -> Seen {
 /// trimmed row is the implicit blank).
 pub(crate) fn frame_text(f: &RenderInput, rows: usize, cols: usize) -> Vec<Vec<CellText>> {
     (0..rows)
-        .map(|r| {
-            (0..cols)
-                .map(|c| {
-                    let cell = f.cells.get(r).and_then(|row| row.get(c));
-                    let cluster = f
-                        .clusters
-                        .get(r)
-                        .and_then(|row| row.iter().find(|(at, _)| *at == c))
-                        .map(|(_, s)| s.clone());
-                    let marks = cluster.or_else(|| {
-                        f.combining
-                            .get(r)
-                            .and_then(|row| row.iter().find(|(at, _)| *at == c))
-                            .map(|(_, m)| m.iter().collect::<String>().into_boxed_str())
-                    });
-                    (
-                        cell.map_or(' ', |cell| cell.ch),
-                        cell.is_some_and(|cell| cell.wide),
-                        marks,
-                    )
-                })
-                .collect()
-        })
+        .map(|r| (0..cols).map(|c| cell_text(f, r, c)).collect())
         .collect()
+}
+
+/// One cell of [`frame_text`].
+fn cell_text(f: &RenderInput, r: usize, c: usize) -> CellText {
+    let cell = f.cells.get(r).and_then(|row| row.get(c));
+    let cluster = f
+        .clusters
+        .get(r)
+        .and_then(|row| row.iter().find(|(at, _)| *at == c))
+        .map(|(_, s)| s.clone());
+    let marks = cluster.or_else(|| {
+        f.combining
+            .get(r)
+            .and_then(|row| row.iter().find(|(at, _)| *at == c))
+            .map(|(_, m)| m.iter().collect::<String>().into_boxed_str())
+    });
+    (
+        cell.map_or(' ', |cell| cell.ch),
+        cell.is_some_and(|cell| cell.wide),
+        marks,
+    )
 }
 
 /// The cursor aterm-gui draws on a frame whose newest painted ghost is at
@@ -2710,6 +2723,10 @@ pub(crate) struct Sim {
     /// The instant of the last keypress: the only clock `Host::StaleClock` reads.
     last_press: Instant,
     keys: Vec<KeyLog>,
+    /// The keys whose output last reached the screen past its deadline: the
+    /// only keys [`Sim::late_predecessor`] can find, kept where output lands so
+    /// it reads them rather than every key typed before.
+    late_outputs: std::collections::BTreeSet<KeyId>,
     /// The keystroke behind each pending guess, oldest first (see `sync`).
     mirror: VecDeque<KeyId>,
     screen_epoch: u64,
@@ -2853,6 +2870,7 @@ impl Sim {
             now: start,
             last_press: start,
             keys: Vec::new(),
+            late_outputs: std::collections::BTreeSet::new(),
             mirror: VecDeque::new(),
             screen_epoch: 0,
             was_alt: false,
@@ -2909,6 +2927,7 @@ impl Sim {
             typed_owes: events.typed_owes,
             standing_voids: events.standing_voids,
             advance_waits: events.advance_waits,
+            text_waits: events.text_waits,
             motions_proven: events.motions_proven,
             net_null_retired: events.net_null_retired,
             transit_waits: events.transit_waits,
@@ -3525,9 +3544,16 @@ impl Sim {
                 self.program.head_off = 0;
                 let now = self.now;
                 let window = self.predictor.glitch_window_for_test();
-                if let Some(log) = seg.cause.and_then(|k| self.keys.get_mut(k)) {
+                if let Some(k) = seg.cause
+                    && let Some(log) = self.keys.get_mut(k)
+                {
                     log.last_output_at = Some(now);
                     log.last_output_window = window;
+                    if now.saturating_duration_since(log.typed_at) > ECHO_DEADLINE.max(window) {
+                        self.late_outputs.insert(k);
+                    } else {
+                        self.late_outputs.remove(&k);
+                    }
                 }
                 match seg.kind {
                     SegKind::Echo(id) => {
@@ -3587,12 +3613,21 @@ impl Sim {
         let Some(typed) = self.keys.get(id).map(|log| log.typed_at) else {
             return false;
         };
+        // Only a key whose output arrived past its deadline can be one
+        // (`late_outputs`); every other key fails `late` below.
+        let mut late_before = self.late_outputs.range(..id).peekable();
+        if late_before.peek().is_none() {
+            return false;
+        }
         let boundary = before
             .iter()
             .rev()
             .find(|log| log.ends_epoch)
             .map(|log| log.typed_at);
-        before.iter().enumerate().any(|(j, log)| {
+        late_before.any(|&j| {
+            let Some(log) = before.get(j) else {
+                return false;
+            };
             log.last_output_at.is_some_and(|t| {
                 let late = t.saturating_duration_since(log.typed_at)
                     > ECHO_DEADLINE.max(log.last_output_window);
@@ -3805,17 +3840,18 @@ impl Sim {
     /// glyph typed again on that cell is retired by them.
     fn overdue_predecessor(&self, k: KeyId, window: Duration) -> bool {
         let window = ECHO_DEADLINE.max(window);
-        let unarrived = |j: KeyId| {
-            self.program.inbox.contains(&j)
-                || self.program.pipe.iter().any(|seg| seg.cause == Some(j))
-        };
-        self.keys
-            .get(..k)
-            .unwrap_or_default()
+        let before = self.keys.get(..k).unwrap_or_default();
+        // The keys whose output has not all arrived: the program's inbox and
+        // the pipe's causes, read rather than every key typed before `k`.
+        self.program
+            .inbox
             .iter()
-            .enumerate()
-            .any(|(j, log)| {
-                unarrived(j) && self.now.saturating_duration_since(log.typed_at) > window
+            .copied()
+            .chain(self.program.pipe.iter().filter_map(|seg| seg.cause))
+            .any(|j| {
+                before
+                    .get(j)
+                    .is_some_and(|log| self.now.saturating_duration_since(log.typed_at) > window)
             })
     }
 
@@ -4595,15 +4631,17 @@ impl Sim {
             self.stats.rprompt_frames += 1;
         }
         let text = frame_text(d, rows, cols);
-        let under = frame_text(&self.scratch, rows, cols);
         let cell =
             |t: &[Vec<CellText>], (r, c): (usize, usize)| t.get(r).and_then(|l| l.get(c)).cloned();
+        // What was under a ghost, read at the ghosts alone.
+        let under =
+            |(r, c): (usize, usize)| (r < rows && c < cols).then(|| cell_text(&self.scratch, r, c));
         let vacated = ghosts
             .iter()
             .copied()
             .filter(|&at| {
                 cell(&text, at).is_some_and(|t| t.0 == ' ' && t.2.is_none())
-                    && cell(&under, at).is_some_and(|u| u.0 != ' ')
+                    && under(at).is_some_and(|u| u.0 != ' ')
             })
             .collect();
         let frame = FrameShown {
@@ -5515,6 +5553,32 @@ pub(crate) const LINKS: [Link; 4] = [Link::Local, Link::Slow, Link::Erratic, Lin
 pub(crate) const CASES: usize = 600;
 pub(crate) const OPS_PER_CASE: usize = 320;
 pub(crate) const SEED: u64 = 0x5AFE_EC40_7EED_2026;
+
+/// The seed of SEED INDEX `i` of the many-seed sweeps: the committed seed xor
+/// `i` times an odd constant that is not the golden ratio `case_world` steps
+/// cases by (the reviews of increments 3 to 5 swept that family, indices 0 to
+/// 4200). Index 0 is the committed seed.
+pub(crate) fn seed_index(i: u64) -> u64 {
+    SEED ^ i.wrapping_mul(0xA24B_AED4_963E_E407)
+}
+
+/// The theorem's sweep of every faithful configuration over each of the seed
+/// indices `indices` (`seed_index`), on every core: each failure's report
+/// (`sweep`), prefixed with its seed index, in order.
+pub(crate) fn sweep_seed_indices(indices: impl IntoIterator<Item = u64>) -> Vec<String> {
+    let items: Vec<(u64, Config)> = indices
+        .into_iter()
+        .flat_map(|i| faithful_configs().into_iter().map(move |cfg| (i, cfg)))
+        .collect();
+    aterm_spec::check::each(&items, |&(i, cfg)| {
+        sweep(cfg, seed_index(i))
+            .err()
+            .map(|report| format!("seed index {i}: {report}"))
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
 
 /// Case `case` of a sweep: its configuration (the line editor's wrap policy
 /// alternates), seed, link and ops.

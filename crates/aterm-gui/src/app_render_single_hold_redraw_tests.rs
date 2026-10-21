@@ -254,8 +254,10 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
             now,
         ));
     }
+    // Every frame below presents at the guess's own instant: a stalled test
+    // thread must not age it past its glitch window.
     let before = term_lock_acquisitions_on_this_thread();
-    app.redraw_window(wid);
+    app.redraw_window_at(wid, now);
     let taken = term_lock_acquisitions_on_this_thread() - before;
     assert_eq!(
         taken, 1,
@@ -290,7 +292,7 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
         });
     }
     let before = term_lock_acquisitions_on_this_thread();
-    app.redraw_window(wid);
+    app.redraw_window_at(wid, now);
     redraw_hold_hook::clear();
     let taken = term_lock_acquisitions_on_this_thread() - before;
     assert_eq!(
@@ -309,7 +311,7 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
     // 3. The next frame extracts the echoed `'k'` from the terminal grid and
     //    retires the prediction cleanly.
     let before = term_lock_acquisitions_on_this_thread();
-    app.redraw_window(wid);
+    app.redraw_window_at(wid, now);
     let taken = term_lock_acquisitions_on_this_thread() - before;
     assert_eq!(taken, 1, "the confirmation frame takes ONE terminal hold");
     assert!(
@@ -330,11 +332,16 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
     );
 }
 
-/// Type `ch` as a guess at the front terminal's cursor. Returns what a predictor
-/// holding only that guess hands over ([`crate::predict::Predictor::take_link_estimate`]):
-/// a link nothing has measured, owing that one keystroke's echo.
-fn arm_prediction(app: &mut crate::App, ch: char) -> crate::predict::LinkEstimate {
-    arm_prediction_with(app, ch, None)
+/// Type `ch` as a guess at the front terminal's cursor, at `born`. Returns what a
+/// predictor holding only that guess hands over
+/// ([`crate::predict::Predictor::take_link_estimate`]): a link nothing has
+/// measured, owing that one keystroke's echo.
+fn arm_prediction(
+    app: &mut crate::App,
+    ch: char,
+    born: std::time::Instant,
+) -> crate::predict::LinkEstimate {
+    arm_prediction_with(app, ch, born, None)
 }
 
 /// [`arm_prediction`] with `rule_off` switched off in both predictors it arms,
@@ -342,6 +349,7 @@ fn arm_prediction(app: &mut crate::App, ch: char) -> crate::predict::LinkEstimat
 fn arm_prediction_with(
     app: &mut crate::App,
     ch: char,
+    born: std::time::Instant,
     rule_off: Option<crate::predict::Rule>,
 ) -> crate::predict::LinkEstimate {
     let wid = WindowId(0);
@@ -359,7 +367,6 @@ fn arm_prediction_with(
             (term.cols(), term.rows()),
         )
     };
-    let born = std::time::Instant::now();
     let predictor = &mut app.windows.get_mut(&wid).unwrap().predictor;
     predictor.set_mode(crate::predict::PredictMode::Always);
     let mut unmeasured = crate::predict::Predictor::new(crate::predict::PredictMode::Always);
@@ -392,9 +399,15 @@ fn prediction_reconcile_confirms_rtl_echo_in_logical_columns() {
         "a right-to-left glyph is declined"
     );
     assert!(declining.idle());
-    arm_prediction_with(&mut app, 'ג', Some(crate::predict::Rule::RightToLeftRows));
+    let born = std::time::Instant::now();
+    arm_prediction_with(
+        &mut app,
+        'ג',
+        born,
+        Some(crate::predict::Rule::RightToLeftRows),
+    );
     feed(&app, "ג".as_bytes());
-    app.redraw_window(wid);
+    app.redraw_window_at(wid, born);
     let ws = app.windows.get_mut(&wid).unwrap();
     assert_eq!(
         ws.input_scratch.cells[0][0].ch, 'ג',
@@ -420,9 +433,10 @@ fn prediction_reconcile_never_confirms_uncommitted_ime_text() {
     app.predict_mode_cache = None;
     feed(&app, b"$ ");
     app.redraw_window(wid);
-    let unmeasured = arm_prediction(&mut app, 'k');
+    let born = std::time::Instant::now();
+    let unmeasured = arm_prediction(&mut app, 'k', born);
     app.on_ime_preedit(wid, "k".into(), Some((1, 1)));
-    app.redraw_window(wid);
+    app.redraw_window_at(wid, born);
     let ws = app.windows.get_mut(&wid).unwrap();
     assert!(!ws.predictor.idle(), "IME preedit has not reached the PTY");
     // The armed guess still owes its echo (custody, 90bb2dc9b7): taking the
@@ -467,10 +481,14 @@ fn a_single_pane_frame_paints_a_state_chain_with_its_cursor() {
         app.windows.get_mut(&wid).expect("window").focused = true;
         feed(&app, b"$ ");
         app.redraw_window(wid);
+        // Every press and frame below is at one instant: a stalled test thread
+        // must not age the chain past its glitch window.
+        let now = std::time::Instant::now();
+        crate::app_input::pin_input_clock(Some(now));
         for c in ['a', 'b'] {
             let _ = app.input(wid, press(Key::Character(c)), Source::Human);
             feed(&app, c.to_string().as_bytes());
-            app.redraw_window(wid);
+            app.redraw_window_at(wid, now);
         }
         assert!(
             app.windows[&wid].predictor.idle(),
@@ -481,7 +499,7 @@ fn a_single_pane_frame_paints_a_state_chain_with_its_cursor() {
             !app.windows[&wid].predictor.idle(),
             "{key:?}: armed as an edit op"
         );
-        app.redraw_window(wid);
+        app.redraw_window_at(wid, now);
         let ws = &app.windows[&wid];
         assert!(ws.pred_shown, "{key:?}: the chain is on glass");
         assert_eq!(

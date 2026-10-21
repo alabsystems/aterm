@@ -10,7 +10,7 @@
 
 use super::*;
 
-use aterm_core::terminal::{HolderAdoption, HolderView, Terminal};
+use aterm_core::terminal::HolderView;
 use aterm_grid::{FenceKnob, with_knob};
 
 use crate::holder_image::{CardGate, GateBuild, HolderImage};
@@ -1260,7 +1260,7 @@ fn the_dev_rows_count_the_frames_a_drawers_card_was_bare() {
 #[cfg(unix)]
 #[test]
 fn a_restore_re_derives_the_holder_from_the_kernel() {
-    use aterm_core::terminal::{CutKind, HolderCut};
+    use aterm_core::terminal::{CutKind, HolderAdoption, HolderCut, Terminal};
     fn in_front(_: i32) -> i32 {
         PGID
     }
@@ -1385,7 +1385,7 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
     {
         let mut timeline = timeline.lock().unwrap();
         let at = timeline.slog().now();
-        timeline.slog_mut().open_session(None, at);
+        timeline.slog_mut().open_session(None, None, at);
         assert!(
             timeline.slog().opened_wall().is_some(),
             "registered session"

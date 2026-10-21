@@ -966,6 +966,7 @@ fn real_renewal_is_clean() -> bool {
         config: Some(root.join("aterm.toml")),
         claude_tmp: None,
         claude_running: None,
+        tz_s: 0,
     };
     let host = Recording::default();
     let (mut out, mut err) = (Vec::new(), Vec::new());

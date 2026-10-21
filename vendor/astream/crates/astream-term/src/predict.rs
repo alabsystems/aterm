@@ -70,8 +70,11 @@ contract_fn! {
 /// advances `cur_wm` to `max(cur_wm, cand_wm)` when the authoritative `Out`'s
 /// `caused_by` offset `in_off` matches `pred_in_off`, or retains `cur_wm` otherwise.
 ///
-/// Composes two Clean-Origin (`I5`) functions (`echo_causal_watermark_select`
-/// and `echo_watermark_monotone`), matching `Astream.Term.TlaSpeculativeEcho.echo_admit_causal_watermark_isl`.
+/// Hand-written plain Rust, not compiled from Clean: it restates
+/// `Astream.Term.TlaSpeculativeEcho.echo_admit_causal_watermark_isl`, the island's
+/// composition of the Clean-Origin (`I5`) functions [`echo_causal_watermark_select`] and
+/// [`echo_watermark_monotone`], and the `predict` suite holds it to that composition over a
+/// grid of boundary operands.
 #[must_use]
 pub const fn echo_admit_causal_watermark(
     in_off: u64,

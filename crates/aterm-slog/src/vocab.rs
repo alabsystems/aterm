@@ -234,6 +234,23 @@ kinds! {
     // never bus class, journaled with the rest of its session's log (D3, on
     // by default), no brief line. A reader without it maps it to `unknown`.
     Task => "task",
+    // Phase 6 (6F-2, plan item U2; rulings U11-U13, U15-U17, U26), appended
+    // so no kind moves: the facts the timeline ring held and the log did not,
+    // each a mark its ring row's writer writes in the same hold (6F-4, 6F-5,
+    // 6F-9). A session's state (`state state=`), a harness policy's
+    // generation (`policy gen=`), a topic added or dropped (`topic`, its name
+    // a fingerprint below the content tier, U11), a lost bridge's advisory
+    // (`advisory origin= gen=`), the program's own OSC 7501 report (`program
+    // state= ask=`, U17), a mail fetch (`mail-fetch off=`, U15), and a move of
+    // what the person is shown (`shown`, U26). Local: none is bus class, and
+    // none is a `brief` line. A reader without them maps each to `unknown`.
+    State => "state",
+    Policy => "policy",
+    Topic => "topic",
+    Advisory => "advisory",
+    Program => "program",
+    MailFetch => "mail-fetch",
+    Shown => "shown",
 }
 
 impl Kind {
@@ -310,6 +327,13 @@ impl Kind {
                 | Kind::Source
                 | Kind::MailLanded
                 | Kind::Task
+                | Kind::State
+                | Kind::Policy
+                | Kind::Topic
+                | Kind::Advisory
+                | Kind::Program
+                | Kind::MailFetch
+                | Kind::Shown
         )
     }
 
@@ -897,6 +921,16 @@ pub const WHY_WORDS: &[&str] = &[
     "held",
     "turn",
     "moved",
+    // phase 6 (6F-2, ruling U13): why a person's `human` mark was written
+    // when it is not the ring's burst row: the first input after delivered
+    // mail (`mail`, the 5D-4 latch's mark), or the burst's own (`burst`).
+    "mail",
+    "burst",
+    // phase 6 (6F-6): why a post landed nowhere (`mail-landed why=`, the
+    // ring's `post-landed off=- reason=`): not carried across an update, or
+    // its offset on a bus log since replaced.
+    "not-carried",
+    "log-replaced",
 ];
 
 /// The input verbs an `input` mark names.
@@ -962,7 +996,48 @@ pub const STATE_WORDS: &[&str] = &[
     "connected",
     "disconnected",
     "absent",
+    // phase 6 (6F-2): a session's lifecycle state (`state state=`, the
+    // timeline's `state-change` row: `SessionState::as_str` and `closed`), and
+    // the program's own report (`program state=`, OSC 7501's words; `working`,
+    // `done` and `error` are above)
+    "spawning",
+    "alive",
+    "closed",
+    "idle",
+    "blocked",
 ];
+
+/// A hold's origin (`advisory origin=`, `hold origin=`; Phase 6 step 6F-2):
+/// the slots `aterm_gui_fabric::Holds` keeps, `person`, `remote`, `fleet`
+/// and `local`.
+pub const ORIGIN_WORDS: &[&str] = &["person", "remote", "fleet", "local"];
+
+/// What a program's `blocked` report waits on (`program ask=`, OSC 7501's
+/// `kind=`, Phase 6 step 6F-2): `kind=` is the mail kind's key.
+pub const ASK_WORDS: &[&str] = &["permission", "question", "auth"];
+
+/// How a session's topic opt-ins moved (`topic change=`, Phase 6 step 6F-5):
+/// the two moves `topic add` and `topic drop` make. Not `op=`: that is the
+/// record's own token in `log --json`.
+pub const CHANGE_WORDS: &[&str] = &["add", "drop"];
+
+/// Whether a resize run's geometry came back (`render net=`, Phase 6 step
+/// 6F-7): the resize ledger's `net=` words.
+pub const NET_WORDS: &[&str] = &["zero", "changed"];
+
+/// The class of program a render epoch judged (`render class=`, Phase 6
+/// step 6F-7): `aterm-gui`'s `resize_epoch::ProgramClass` words.
+pub const CLASS_WORDS: &[&str] = &["agent", "learned", "unknown"];
+
+/// What healed a render epoch (`render healed_by=`, Phase 6 step 6F-7):
+/// `aterm-gui`'s `resize_epoch::EpochBy` words, an open epoch's `-` aside.
+/// Not `by=`: that is the record's actor.
+pub const HEALED_BY_WORDS: &[&str] = &["app", "undo", "nudge"];
+
+/// Where a manual reset came from (`modes source=`, Phase 6 step 6F-7):
+/// `aterm-gui`'s `manual_reset::ResetSource` words, the `reset` verb's and
+/// the menu's.
+pub const SOURCE_WORDS: &[&str] = &["ctl", "menu"];
 
 /// How the previous run of this instance ended (`start prev_end=` on the
 /// node log, 5J): `aterm_update::recovery_ledger::EndClass`'s row tokens, a

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ONE CLEAN-TREE JUDGE of a release: the paths of a checkout whose working tree
-//! differs from its `HEAD`, as a compiler reads them. `ship release` judges its clone
-//! with it, the cut its tree and its operator's checkout, so no step calls a tree clean
-//! that another calls dirty.
+//! The one clean-tree judge of a release: the paths of a checkout whose working tree
+//! differs from its `HEAD`, as a compiler reads them. `ship release` judges its clone with
+//! it, the cut its tree and its operator's checkout, so no step calls a tree clean that
+//! another calls dirty.
 //!
-//! What counts, and why each:
+//! What counts:
 //! - tracked changes, staged or not (`git diff HEAD`, renames off so a moved file is
 //!   listed at both ends, submodules never ignored whatever the config says);
-//! - untracked files the TREE's own `.gitignore` files do not ignore — never
+//! - untracked files the tree's own `.gitignore` files do not ignore — never
 //!   `.git/info/exclude` or `core.excludesFile`, which are one checkout's config — and an
 //!   untracked `.gitignore` those rules ignore, since it hides what it names;
 //! - edits an assume-unchanged or skip-worktree flag hides from every git listing;
@@ -105,7 +105,7 @@ pub fn dirty_against_head(root: &Path) -> Option<BTreeMap<String, Dirt>> {
     Some(dirty)
 }
 
-/// THE STRICT JUDGE, for a run that files proofs under `HEAD`'s tree: nothing
+/// The strict judge, for a run that files proofs under `HEAD`'s tree: nothing
 /// [`dirty_against_head`] lists, and nothing [`raw_differences`] lists. `None` when git
 /// cannot answer.
 #[must_use]
@@ -391,10 +391,10 @@ mod tests {
         assert_eq!(keys(&root), ["a.rs", "flagged.rs", "local.rs"]);
     }
 
-    /// THE STRICT JUDGE reads the bytes: a CRLF copy of an LF file under
+    /// The strict judge reads the bytes: a CRLF copy of an LF file under
     /// `core.autocrlf=input`, and a same-size edit that kept its mtime under
-    /// `core.checkStat=minimal`, read clean to `git diff` and differ raw; a flag, a
-    /// lost exec bit and a retargeted link differ too.
+    /// `core.checkStat=minimal`, read clean to `git diff` and differ raw; a flag, a lost
+    /// exec bit and a retargeted link differ too.
     #[test]
     fn the_strict_judge_reads_the_bytes_git_diff_trusts() {
         use std::time::{Duration, SystemTime};

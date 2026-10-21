@@ -479,10 +479,111 @@ fn a_strangers_orphan(log: &str) -> Option<String> {
         .then(|| (*escape).to_owned())
 }
 
+/// The line the gate's last verdict in `log` rests on when the escape scan
+/// left it none for the listing's sake: a visible run's `Inconclusive` fold on
+/// `scan Unknown`, or a warm spare's `Backoff("scan-unknown")` at its hold,
+/// with no scan of it that could not read the run's own shell
+/// ([`SHELL_UNKNOWN`]). The scan lists every process of this account (this
+/// suite's other instances and `aterm ctl` clients, every other program's),
+/// and reads `Unknown` when it cannot settle that listing: a process still
+/// exiting past its settling listings, a record it cannot read again. The gate
+/// counts such a run as no sample, as it must, so the streak a test expected
+/// never comes, and that decides nothing about the code: a test ends COULD NOT
+/// RUN on it ([`an_unsettled_scan_decided_it`]). A scan that could not read the
+/// run's shell (none named, unread, gone, unlisted) is the run's or the gate's
+/// (a wrong pid handed to the scan), and still fails.
+fn an_unsettled_scan(log: &str) -> Option<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    let verdict = lines
+        .iter()
+        .rposition(|l| VERDICTS.iter().any(|v| l.contains(v)))?;
+    let mut scanned = lines[..verdict]
+        .iter()
+        .rev()
+        .take_while(|l| !VERDICTS.iter().any(|v| l.contains(v)));
+    if scanned.clone().any(|l| l.contains(SHELL_UNKNOWN)) {
+        return None;
+    }
+    if lines[verdict].contains("verified at its hold: Backoff(\"scan-unknown\")") {
+        return Some(lines[verdict].to_owned());
+    }
+    if !lines[verdict].contains("saw a visible run: Inconclusive") {
+        return None;
+    }
+    scanned
+        .find(|l| l.contains("spare gate: inconclusive run: scan Unknown"))
+        .map(|l| (*l).to_owned())
+}
+
+/// The escape scan's line for an `Unknown` on the run's own shell
+/// (`aterm-gui`'s `spare::shell_unknown`), logged before the verdict it leaves.
+const SHELL_UNKNOWN: &str = "spare gate: scan unknown: the run's shell";
+
+/// End the test COULD NOT RUN on `line`, a verdict the escape scan could not
+/// give ([`an_unsettled_scan`]), with the gate's `log`.
+fn an_unsettled_scan_decided_it(line: &str, log: &str) -> ! {
+    aterm_spec::host::could_not_run(format!(
+        "the escape scan could not settle this account's process listing, so the gate \
+         took no sample of the run ({line}); the listing is every process of this user, \
+         which no test holds still:\n{log}"
+    ))
+}
+
+/// [`an_unsettled_scan`] reads the scan's own two words for no verdict, and
+/// nothing else: an `Inconclusive` fold for another reason (input moved before
+/// the start record), another backoff, and a scan that could not read the
+/// run's own shell still fail their test.
+#[test]
+fn only_a_scan_with_no_verdict_is_the_hosts() {
+    let fold = |why: &str, verdict: &str| {
+        format!(
+            "spare gate: generation 00000000000000aa saw a visible run: Clean {{ rc_ms: 9 }}\n\
+             spare gate: {why}\n\
+             spare gate: generation 00000000000000aa saw a visible run: {verdict}"
+        )
+    };
+    assert_eq!(
+        an_unsettled_scan(&fold("inconclusive run: scan Unknown", "Inconclusive")).as_deref(),
+        Some("spare gate: inconclusive run: scan Unknown")
+    );
+    assert_eq!(
+        an_unsettled_scan("spare 3: verified at its hold: Backoff(\"scan-unknown\")").as_deref(),
+        Some("spare 3: verified at its hold: Backoff(\"scan-unknown\")")
+    );
+    // NEGATIVE CONTROLS: what a test must still fail on.
+    for log in [
+        fold(
+            "inconclusive run: input moved before its start record",
+            "Inconclusive",
+        ),
+        fold("inconclusive run: scan RateLimited", "Inconclusive"),
+        fold("unclean run: failed=flags", "Unclean"),
+        "spare 3: verified at its hold: Backoff(\"stale\")".to_owned(),
+        // An earlier run's unsettled scan is not the last verdict's.
+        format!(
+            "{}\nspare gate: generation 00000000000000aa saw a visible run: Clean {{ rc_ms: 9 }}",
+            fold("inconclusive run: scan Unknown", "Inconclusive")
+        ),
+        // The run's own shell unread (a wrong pid handed to the scan), in a
+        // fold and at a hold: the run's or the gate's, never the host's.
+        fold(
+            "scan unknown: the run's shell -1 unread\n\
+             spare gate: inconclusive run: scan Unknown",
+            "Inconclusive",
+        ),
+        "spare gate: scan unknown: the run's shell 4242 gone\n\
+         spare 3: verified at its hold: Backoff(\"scan-unknown\")"
+            .to_owned(),
+    ] {
+        assert_eq!(an_unsettled_scan(&log), None, "{log}");
+    }
+}
+
 /// Hold a visible run's fold to `expected` clean runs in a row; a fold a
-/// stranger's orphan spoiled ([`a_strangers_orphan`]) decides nothing about
-/// the code, and ends the test as COULD NOT RUN; one that failed only a time
-/// budget ([`a_budget_fold`]) is decided by the host's load
+/// stranger's orphan spoiled ([`a_strangers_orphan`]), or the escape scan left
+/// with no verdict ([`an_unsettled_scan`]), decides nothing about the code,
+/// and ends the test as COULD NOT RUN; one that failed only a time budget
+/// ([`a_budget_fold`]) is decided by the host's load
 /// ([`a_budget_decided_it`]).
 fn expect_streak(inst: &Instance, streak: u32, expected: u32) {
     if streak != expected {
@@ -490,6 +591,9 @@ fn expect_streak(inst: &Instance, streak: u32, expected: u32) {
         let log = log_through(inst, "saw a visible run:", expected as usize);
         if let Some(escape) = a_strangers_orphan(&log) {
             a_stranger_decided_it(&escape);
+        }
+        if let Some(line) = an_unsettled_scan(&log) {
+            an_unsettled_scan_decided_it(&line, &log);
         }
         if let Some(fold) = a_budget_fold(&log) {
             a_budget_decided_it(
@@ -558,6 +662,14 @@ fn await_learned_spare_ready(inst: &Instance) {
                     a_strangers_orphan(&log_through(inst, "verified at its hold: Backoff", 1))
             {
                 a_stranger_decided_it(&escape);
+            }
+            // Discarded `scan-unknown` once its verification's line was logged,
+            // the generation's first such line.
+            if field(&m, "spare_discard").is_some_and(|d| d.contains("scan-unknown:")) {
+                let log = log_through(inst, "verified at its hold: Backoff", 1);
+                if let Some(line) = an_unsettled_scan(&log) {
+                    an_unsettled_scan_decided_it(&line, &log);
+                }
             }
             panic!(
                 "the learned generation backed off before its warm spare was ready: {m}\n{}",
@@ -915,12 +1027,17 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
     let sid = spawn(&inst, &[]);
     assert_eq!(born(&inst, &sid), tier, "{name}");
     let after = await_sample_after(&inst, &before);
+    // The boot session's fold was the first.
+    let log = log_through(&inst, "saw a visible run:", 2);
+    if after.streak != 0
+        && let Some(line) = an_unsettled_scan(&log)
+    {
+        an_unsettled_scan_decided_it(&format!("{name}: {line}"), &log);
+    }
     assert_eq!(
         after.streak, 0,
         "{name}: the actual negative fold reset the streak"
     );
-    // The boot session's fold was the first.
-    let log = log_through(&inst, "saw a visible run:", 2);
     let (failed, line) = fold_failed(&log)
         .unwrap_or_else(|| panic!("{name}: an unclean fold names what it failed:\n{log}"));
     if !failed.iter().any(|rule| rules.contains(&rule.as_str())) {

@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The animal-roster contract: every builtin `class = "animal"` surface scans
-//! as [`Class::Animal`], carries a species id that resolves to its sprite key,
-//! and rides `ambiguous = true` (the live-caret deferral + fold-collision-gate
-//! exemption the group's design depends on). Existing classes keep their
-//! homograph wins: `cat`/`kitty` stay feline. `orca` is no class's word.
+//! Builtin English animal surfaces scan as [`Class::Animal`] with a species id naming their
+//! sprite, and are `ambiguous = true` (live-caret deferral). Existing classes keep their homograph
+//! wins (`kitty` stays feline); `orca` is no class's word.
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions};
 
@@ -32,7 +30,6 @@ fn animal_surfaces_scan_with_their_species() {
         ("fox", "fox"), // 3 folded chars: the short-word guards are feline/emphasis-only
         ("owl", "owl"),
         ("bee", "bee"),
-        // Regression: these once matched nothing.
         ("turkey", "turkey"),
         ("turkeys", "turkey"),
         ("Turkey", "turkey"), // the country folds into the bird — deliberate, see the entry's notes
@@ -72,9 +69,7 @@ fn non_animal_matches_carry_no_species() {
     assert_eq!(scan_one(lex, "doggo").species, None);
 }
 
-/// Whole-word law, restated for the new group: animal nouns inside longer
-/// tokens never match — `bee` in `been`, `cow` in `coward`, `ant` (not even a
-/// roster word) in `anthem`.
+/// Animal nouns inside longer tokens never match (`bee` in `been`, `cow` in `coward`).
 #[test]
 fn animal_words_are_whole_word_only() {
     let lex = Lexicon::builtin();

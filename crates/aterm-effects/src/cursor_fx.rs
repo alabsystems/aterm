@@ -87,7 +87,7 @@ pub struct CursorFxInput {
     pub cur: Option<(u16, u16)>,
     /// The frame presents the active grid, not retained scrollback.
     pub live_viewport: bool,
-    /// The live cursor shape (a body needs a BLOCK; the rod takes a BAR).
+    /// The live cursor shape (a body needs a block; the rod takes a bar).
     pub cursor_style: CursorStyle,
     /// This window's blink phase (unused by the rainbow body; kept on its tick
     /// signature).
@@ -97,7 +97,7 @@ pub struct CursorFxInput {
     pub live_cursor: u32,
     /// Whether that colour was pinned (by config or a program's OSC 12) rather
     /// than the theme's seed. A pinned colour is the rainbow/phaser block's
-    /// base; an unpinned caret builds from white (owner, 2026-08-29).
+    /// base; an unpinned caret builds from white.
     pub cursor_color_pinned: bool,
     /// The live default background (DECSCNM-folded), `0x00RRGGBB`: the
     /// ground every body solves its light against.
@@ -156,11 +156,11 @@ pub struct CursorFxFrame {
     /// the load-shed projection. It becomes status truth only at the host's
     /// final projection seam (a focus outline, a composed clip).
     pub block_fill: Option<BlockFill>,
-    /// ⚡ The laser BOLT owns the block: the caret's shape is `Bolt`.
+    /// The laser bolt owns the block: the caret's shape is `Bolt`.
     pub bolt_cursor: bool,
-    /// 🌟 The rainbow owns a BLINKING block: the shape is pinned steady.
+    /// The rainbow owns a blinking block: the shape is pinned steady.
     pub twinkle_cursor: bool,
-    /// ✨ The momentum glow is HOT: this Blinking* style pinned to its Steady*
+    /// The momentum glow is hot: this Blinking* style pinned to its Steady*
     /// twin (`None` when cold, or when the style does not blink).
     pub momentum_steady: Option<CursorStyle>,
 }
@@ -205,24 +205,22 @@ pub struct BlockFillSplice {
     pub comet: Option<u32>,
     pub droplet: Option<u32>,
     pub beamrod: Option<u32>,
-    /// The typing-momentum tint — LAST, so a style body always wins the caret.
+    /// The typing-momentum tint, last, so a style body always wins the caret.
     pub momentum: Option<u32>,
 }
 
-/// The blink law, by who owns the caret. Precedence, first wins
-/// (owner, 2026-09-08):
+/// The blink law, by who owns the caret. Precedence, first wins:
 ///
 /// 1. the bolt (the `laser` body's own shape);
-/// 2. the rainbow owns the caret (`twinkle_cursor`: the `rainbow kitty` block
-///    resolved a fill on a blinking block): pinned `SteadyBlock`
-///    unconditionally, since its halo, rim and spin already encode momentum;
+/// 2. the rainbow owns the caret (`twinkle_cursor`): pinned `SteadyBlock`,
+///    since its halo, rim and spin already encode momentum;
 /// 3. the momentum glow is hot on any other style: a Blinking* style is pinned
 ///    to its Steady* twin while warm (`momentum_steady`), and `None` once cool,
 ///    so the configured blink returns.
 ///
-/// Composed only by ordering. One function for every site that spells the
-/// caret's shape (every native render path, the introspection mirror, the web
-/// pipeline), so a capture cannot contradict the glass.
+/// Every site that spells the caret's shape (native render paths, the
+/// introspection mirror, the web pipeline) calls this, so a capture cannot
+/// contradict the glass.
 #[must_use]
 pub fn compose_caret_style_override(
     bolt: bool,
@@ -234,8 +232,7 @@ pub fn compose_caret_style_override(
     } else if rainbow_owns_caret {
         Some(CursorStyle::SteadyBlock)
     } else {
-        // A hot cursor does not blink; a cool one is exactly the configured
-        // cursor (owner, 2026-09-08).
+        // A hot cursor does not blink; a cool one is the configured cursor.
         momentum_steady
     }
 }
@@ -351,9 +348,14 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
     }
     let rgb = |c: u32| c & 0x00FF_FFFF;
     let (color, ground, ink) = (rgb(color), rgb(ground), rgb(ink));
-    let contrast = crate::color_math::contrast_ratio;
-    let target = BED_INK_FLOOR.min(contrast(ink, ground));
-    let holds = |alpha: u8| contrast(ink, aterm_render::blend_rgb(ground, color, alpha)) >= target;
+    let table = crate::color_math::relative_luminance_table();
+    let lum_ink = crate::color_math::relative_luminance_with(table, ink);
+    let contrast_ink = |bg: u32| {
+        let lb = crate::color_math::relative_luminance_with(table, bg);
+        (lum_ink.max(lb) + 0.05) / (lum_ink.min(lb) + 0.05)
+    };
+    let target = BED_INK_FLOOR.min(contrast_ink(ground));
+    let holds = |alpha: u8| contrast_ink(aterm_render::blend_rgb(ground, color, alpha)) >= target;
     let peak = crate::cursor_trail::BED_PEAK_ALPHA;
     if holds(peak) {
         return 1.0;
@@ -499,7 +501,7 @@ pub struct GlowSpelling {
     pub style: Option<GlowStyle>,
     /// The additive beam ([`crate::cursor_glow::style_has_beam_of`]).
     pub beam: bool,
-    /// The v0.43 full-height ribbon body (every spelling but `… underline`).
+    /// The full-height ribbon body (every spelling but `… underline`).
     pub ribbon_tall: bool,
     /// The explicit `… flat` ribbon body.
     pub ribbon_flat: bool,
@@ -932,7 +934,7 @@ impl OverInkShares {
     }
 }
 
-/// A BLOCK cursor shape — the one every block body needs.
+/// A block cursor shape, the one every block body needs.
 #[inline]
 fn is_block(style: CursorStyle) -> bool {
     matches!(style, CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock)
@@ -940,15 +942,10 @@ fn is_block(style: CursorStyle) -> bool {
 
 impl CursorFx {
     /// The per-frame preamble, before the host feeds the glow engine its row
-    /// probe, print anchor and delivered inserts:
-    ///
-    /// * **the history fence**: cursor effects live in active-grid coordinates
-    ///   and a history viewport shows other rows, so both engines retire before
-    ///   projecting anything, except Rainbow Kitty, which is hidden (its clocks
-    ///   run and nothing is written, so the band is where it should be when the
-    ///   live viewport returns);
-    /// * **the fresh-ink reduced-motion arm**: the motion policy folded into the
-    ///   engine's step-fade seam.
+    /// probe, print anchor and delivered inserts. A history viewport shows
+    /// other rows than the active grid the effects live in, so both engines
+    /// retire there, except Rainbow Kitty, which is hidden (its clocks run,
+    /// nothing is written). It also arms the fresh-ink pop's reduced motion.
     pub fn begin(&mut self, live_viewport: bool, animate: bool) {
         if !live_viewport {
             if !self.glow.hide_v2() {
@@ -1023,7 +1020,7 @@ impl CursorFx {
         self.trail.reset();
     }
 
-    /// Any BODY (not the aurora, not the comet) still animating — the part of
+    /// Any body (not the aurora, not the comet) still animating — the part of
     /// the scheduler's frame-cadence set this step owns.
     #[must_use]
     pub fn bodies_active(&self) -> bool {
@@ -1121,36 +1118,40 @@ impl CursorFx {
             && f.focused
             && is_block(f.cursor_style);
         let pinned_base = f.cursor_color_pinned.then_some(f.live_cursor);
-        // Typing-reactive rainbow cursor (the `rainbow kitty` block): the fill
-        // moves from its base toward a spinning rainbow and a halo blooms,
-        // scaled by typing momentum, cooling to a dim ember. It wears a pinned
-        // cursor colour at rest and builds from white otherwise; only the
-        // host's pinned verdict tells OSC 12 from the theme's seed
-        // (owner, 2026-08-29).
+        // Rainbow block (`rainbow kitty`): the fill moves from its base toward a
+        // spinning rainbow and a halo blooms with typing momentum. The base is
+        // a pinned cursor colour, else white; only the host's pinned verdict
+        // tells OSC 12 from the theme's seed.
+        let rainbow_enabled = matches!(glow_cfg.style, GlowStyle::RainbowKitty) && rainbow_block;
         let rainbow_cfg = RainbowConfig {
-            enabled: matches!(glow_cfg.style, GlowStyle::RainbowKitty) && rainbow_block,
+            enabled: rainbow_enabled,
             intensity: body_amp,
             blinking: matches!(f.cursor_style, CursorStyle::BlinkingBlock),
             base: pinned_base,
             // The ribbon emitter is the colour authority at the nozzle, so the
             // hot block cannot run a plausible-but-different rainbow beside
             // the trail it leads.
-            head_rgb: self.glow.rainbow_head_rgb(glow_cfg),
+            head_rgb: if rainbow_enabled {
+                self.glow.rainbow_head_rgb(glow_cfg)
+            } else {
+                None
+            },
             // The caret cools with its trail: the ribbon's eased display spine
             // (floored by v2's landing re-light), not the 220 ms cadence alone.
-            paint: Some(self.glow.caret_paint(now)),
-            // The page the caret's light lands on — the same ground the ribbon
-            // solves against.
+            paint: rainbow_enabled.then(|| self.glow.caret_paint(now)),
+            // The ground the ribbon solves against.
             ground: Some(f.default_bg & 0x00FF_FFFF),
-            // The caret seam (§7.1): when a v2 meteor's frame-0 flare fired,
-            // while its spring-snap relax is live; `None` is the identity.
-            flare_at: self.glow.caret_flare_at(),
+            // When a v2 meteor's frame-0 flare fired, while its spring-snap relax
+            // is live; `None` is the identity.
+            flare_at: if rainbow_enabled {
+                self.glow.caret_flare_at()
+            } else {
+                None
+            },
         };
-        // One cadence decay per frame, and none when nothing listens: only the
-        // rainbow/phaser bodies read the energy (each early-outs when disabled
-        // or at zero intensity), and a disabled comet reads no ignited fields.
-        // Cadence reads are pure, so a re-enable samples what an
-        // always-sampling build would.
+        // Sample the cadence only when something listens: the rainbow/phaser
+        // bodies or an enabled comet. Reads are pure, so skipping one changes
+        // nothing a later sample sees.
         let cadence_heard = trail_cfg.enabled
             || (rainbow_block
                 && rainbow_cfg.intensity > 0.0
@@ -1257,6 +1258,11 @@ impl CursorFx {
         // budget on a dark page, the style's own hue as ink beneath the
         // letters of the caret's row on a light one; a hot cursor does not
         // blink (owner, 2026-09-08).
+        let momentum_enabled = momentum_glow_allowed(
+            f.momentum_glow,
+            body_allowed && f.focused,
+            rainbow_owns_caret,
+        );
         let momentum_from = self.glow_scratch.len();
         let momentum_frame = self.momentum.tick(
             cur,
@@ -1265,11 +1271,7 @@ impl CursorFx {
             &MomentumGlowConfig {
                 // Gated by its own switch, not the style: it is its own
                 // effect on every style, `off` included.
-                enabled: momentum_glow_allowed(
-                    f.momentum_glow,
-                    body_allowed && f.focused,
-                    rainbow_owns_caret,
-                ),
+                enabled: momentum_enabled,
                 intensity: body_amp,
                 tau_s: MOMENTUM_GLOW_TAU_S,
                 radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
@@ -1288,7 +1290,11 @@ impl CursorFx {
                 theme_bg: glow_cfg.theme_bg,
                 block: is_block(f.cursor_style),
                 // On a light page its ink stays off the caret row's letters.
-                glyph_span: cur.and_then(|cell| self.glow.caret_row_glyphs(cell)),
+                glyph_span: if momentum_enabled && !dark {
+                    cur.and_then(|cell| self.glow.caret_row_glyphs(cell))
+                } else {
+                    None
+                },
             },
             &mut self.glow_scratch,
             self.glow.under_sink(),
@@ -1419,9 +1425,8 @@ impl CursorFx {
             && matches!(glow_cfg.style, GlowStyle::Laser);
         let bolt_fill = bolt_cursor.then(|| bolt_body(glow_cfg.color, self.glow.blaze(), dark));
         let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
-        // The cadence-comet trail off the same caret cell, ignited from the
-        // frame's one cadence sample; idle decays to 0, so a steady screen
-        // produces no cells.
+        // The cadence comet off the same caret cell, ignited from the frame's
+        // one cadence sample; a steady screen produces no cells.
         crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);
         let _ = self
             .trail
@@ -1505,19 +1510,17 @@ mod tests {
     fn the_caret_style_law_is_one_truth_table() {
         use CursorStyle::{Bolt, SteadyBar, SteadyBlock, SteadyUnderline};
         let rows = [
-            // LAW 1, the rainbow half: under the rainbow, Blink is never the
-            // caret's — regardless of momentum temperature.
+            // The rainbow owns the caret: a steady block, whatever the momentum.
             (false, true, None, Some(SteadyBlock)),
             (false, true, Some(SteadyBlock), Some(SteadyBlock)),
             (false, true, Some(SteadyBar), Some(SteadyBlock)),
             (false, true, Some(SteadyUnderline), Some(SteadyBlock)),
-            // LAW 1, the other half: under a classic style the peer's law
-            // stands — cool: no override; warm: the Steady* twin.
+            // No rainbow: cool means no override, warm the Steady* twin.
             (false, false, None, None),
             (false, false, Some(SteadyBlock), Some(SteadyBlock)),
             (false, false, Some(SteadyBar), Some(SteadyBar)),
             (false, false, Some(SteadyUnderline), Some(SteadyUnderline)),
-            // The bolt outranks both — the `laser` body's own shape.
+            // The bolt outranks both.
             (true, true, Some(SteadyBlock), Some(Bolt)),
             (true, false, None, Some(Bolt)),
         ];
@@ -1530,8 +1533,8 @@ mod tests {
         }
     }
 
-    /// The momentum ENGINE yields the caret cell to the rainbow; without the
-    /// rainbow it is exactly the user's switch ANDed with the host's gates.
+    /// The momentum engine yields the caret cell to the rainbow; otherwise it is
+    /// the user's switch and the host's gates.
     #[test]
     fn the_momentum_engine_yields_the_caret_cell_to_the_rainbow() {
         assert!(!momentum_glow_allowed(true, true, true));

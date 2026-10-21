@@ -184,7 +184,7 @@ fn a_merge_onto_a_foreign_or_conflicting_base_is_refused() {
     same_asset.asset = pkgdoc::asset_name("ay", 9, AARCH64_APPLE_DARWIN);
     refused(base.clone(), &header(), &same_asset, "already names asset");
     refused(b"schema = = 1".to_vec(), &header(), &x86, "does not parse");
-    // The exposed set is a set: the order a list was written in is no difference.
+    // The exposed set is a set: the order a list was written in makes no difference.
     let reordered = with(&|h| h.exposes.reverse());
     pkgdoc::merge(base, &reordered, &x86).expect("the same set, another order");
 }

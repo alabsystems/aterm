@@ -218,6 +218,12 @@ pub(crate) struct EpState {
     /// The node mirrors its sessions' logs (`hello … log=turns` is answered
     /// `log=turns`, and `log-take`/`log-landed` are served).
     pub(crate) mirror: bool,
+    /// How many torn state files the bridges said they set aside
+    /// (`link set-aside files=<n>`).
+    pub(crate) set_aside_told: u64,
+    /// What the newest bridge said of its mirror (`link mirror <words>`):
+    /// `on`, `stopped reason=<why>`, `capped`; empty before any said.
+    pub(crate) mirror_said: String,
     /// The world's clock as the sessions last stamped a record: a take's
     /// snapshot is stamped with it.
     stamp: aterm_slog::Stamp,
@@ -467,6 +473,25 @@ impl Endpoint {
             "hold" => s.hold(words),
             "link" => match words.next() {
                 Some("log") => s.link_log(words),
+                // The torn state files the bridge set aside after a power
+                // cut, counted for the oracle (lane 4: a lower lane refuses
+                // it, as its real endpoint does).
+                Some("set-aside") if s.rules.lane >= 4 => {
+                    match words.next().and_then(|w| w.strip_prefix("files=")) {
+                        Some(n) => {
+                            s.set_aside_told += n.parse::<u64>().unwrap_or(0);
+                            "OK\n".to_string()
+                        }
+                        None => "ERR usage\n".to_string(),
+                    }
+                }
+                Some("set-aside") => "ERR usage\n".to_string(),
+                // The mirror's own word for the oracle: `on`, or why it
+                // stopped (`stopped reason=pin`: a pin that does not read).
+                Some("mirror") => {
+                    s.mirror_said = words.collect::<Vec<_>>().join(" ");
+                    "OK\n".to_string()
+                }
                 _ => "OK\n".to_string(),
             },
             // A session's own reads, as the bridge's presence takes them: its

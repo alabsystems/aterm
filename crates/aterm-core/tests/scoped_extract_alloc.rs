@@ -2,18 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The damage-scoped refill allocates nothing once warm.
-//!
-//! `Terminal::cell_frame_damage_scoped_into` is the per-frame extraction every
-//! native echo frame rides; its row mask lives in resident terminal scratch.
-//! This pins that extracting 10,000 one-row echoes allocates nothing after the
-//! warm-up frame, and that the frames took the scoped arm (a silent fallback to
-//! full refills would prove nothing about the mask).
-//!
-//! The scrolled arm shares the mask but is not measured: its debug-build
-//! oracle in `render_cells.rs` clones the scratch on every scrolled step.
-//!
-//! The counter is thread-local, so only this test thread's allocations count.
+//! The damage-scoped refill (`Terminal::cell_frame_damage_scoped_into`, the extraction every
+//! native echo frame rides) allocates nothing once warm, and every frame takes the scoped arm
+//! (a fallback to full refills would prove nothing about its row mask). The scrolled arm is
+//! not measured: its debug-build oracle in `render_cells.rs` clones the scratch. The counter
+//! is thread-local, so only this test thread's allocations count.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -55,8 +48,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// Run `f` and return how many allocations (and reallocations) it made on
-/// this thread.
+/// Run `f`; count its allocations and reallocations on this thread.
 fn allocs_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
     ALLOC_CALLS.with(|n| n.set(0));
     ACTIVE.with(|a| a.set(true));

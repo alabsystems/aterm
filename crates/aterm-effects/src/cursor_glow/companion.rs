@@ -126,6 +126,15 @@ impl CursorGlow {
         self.v2.engaged() && self.v2.catch_star(star, at)
     }
 
+    /// The kitty's Delight edge (§5.8, §7.2): mints [`CompanionImpulse::Delight`]
+    /// and buffers the earned m1 hero at `(row, col)` for the next engaged tick.
+    pub fn earn_hero(&mut self, now: Instant, row: u16, col: u16) {
+        if self.v2.engaged() {
+            self.unsettle();
+            self.v2.earn_hero(now, row, col);
+        }
+    }
+
     /// The verdict's hot resume: the host reports that a shell command came
     /// back green after a long run, on the OSC 133/633 `D` it already
     /// dedupes. Not an [`rk::Event`]; inert unless v2 is engaged, and mints
@@ -216,5 +225,9 @@ impl CursorGlow {
     pub fn hush_fanfare(&mut self, now: Instant) {
         self.unsettle();
         self.momentum.set_value(now, 0.0);
+        self.flow_open = false;
+        if self.v2.engaged() {
+            self.v2.hush_fanfare(now);
+        }
     }
 }

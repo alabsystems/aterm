@@ -11,7 +11,7 @@
 //! | --- | --- |
 //! | the method picker | the method this session's login already is, by its exact label ([`RULE_LOGIN_METHOD`]); never a guess, never Console or a platform: unknown, the owner is told |
 //! | Console's menu | nothing: its second option mints an API key; the owner is told |
-//! | the browser hand-off | nothing (no `c`, no Esc, nothing pasted); the owner is told now: finish the sign-in in the browser |
+//! | the browser hand-off | nothing (no `c`, no Esc, nothing pasted); the owner is told now: finish the browser sign-in |
 //! | `Login successful. Press Enter to continue…` | Enter, once ([`RULE_LOGIN_DONE`]): the login is saved already |
 //! | a success that stayed up after that Enter | nothing: the login is back, and nothing is told |
 //! | an error, a retry, an account on hold | nothing; the owner is told |
@@ -82,7 +82,7 @@ pub fn pick_method(
         Ok(target) => target,
         Err(why) => {
             return Decision::escalate(format!(
-                "pick the sign-in method in the tab, then finish signing in in the browser \
+                "pick the sign-in method in the tab, then finish the browser sign-in \
                  (Claude Code's login method picker: {why})"
             ));
         }
@@ -93,7 +93,7 @@ pub fn pick_method(
             .starts_with(LoginMethod::Subscription.label())
     }) else {
         return Decision::escalate(
-            "pick the sign-in method in the tab, then finish signing in in the browser \
+            "pick the sign-in method in the tab, then finish the browser sign-in \
              (Claude Code's login method picker: its rows read otherwise than its options)",
         );
     };

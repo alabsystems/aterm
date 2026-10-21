@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TEST ONLY: what a test that needs the platform verifier to ANSWER uses to
-//! find out whether it will.
+//! Test only: whether the platform verifier will answer, for tests that need it
+//! to.
 //!
 //! Declared by `super::tests` as `verifier::test_platform`; its parent module
 //! has `PlatformVerifier` and `is_service_unanswered` in scope, which is all it
@@ -39,9 +39,9 @@ pub(crate) fn require_trust_service() {
     }
 }
 
-/// Whether the shipped verifier's evaluation of one chain went unanswered —
-/// asked once per process. Any chain that reaches the evaluation will do; the
-/// verdict is not the question, only whether there is one.
+/// Whether the shipped verifier's evaluation of one chain went unanswered,
+/// asked once per process. The verdict is not the question, only whether there
+/// is one.
 fn shipped_evaluation_unanswered() -> bool {
     static SILENT: OnceLock<bool> = OnceLock::new();
     *SILENT.get_or_init(|| {

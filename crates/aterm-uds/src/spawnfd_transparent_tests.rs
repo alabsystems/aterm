@@ -10,7 +10,7 @@
 //! a `std` child inherits above stdio, which no comparison here reads.
 
 use super::tests::{
-    STAGE_ENV, STD_SPAWN_MUTE, park, run_staged, translator, unflagged_at_or_above,
+    STAGE_ENV, STD_SPAWN_MUTE, park, run_staged_hup_ignored, translator, unflagged_at_or_above,
 };
 use super::*;
 use std::path::PathBuf;
@@ -156,6 +156,7 @@ const SIGUSR2: i32 = if cfg!(target_vendor = "apple") {
     12
 };
 const SIG_BLOCK: i32 = if cfg!(target_vendor = "apple") { 1 } else { 0 };
+const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
 
 unsafe extern "C" {
@@ -237,10 +238,15 @@ fn sh_run(transparent_run: bool, script: &str, out: &std::path::Path) -> (ExitSt
 /// The staged half of [`a_transparent_run_is_the_std_run_it_replaces`].
 fn staged_signals() {
     // SIGUSR2 ignored process-wide (the runtime already ignores SIGPIPE), and
-    // SIGUSR1 and SIGTERM blocked in this thread.
-    // SAFETY: `signal` with `SIG_IGN`, and a mask change for this thread; both
-    // take plain integers or a live local.
+    // SIGUSR1 and SIGTERM blocked in this thread. SIGHUP at its default, set
+    // rather than inherited: the death-by-signal case needs it, and a run under
+    // `nohup` hands it on ignored, which no spawn resets, so both shells then
+    // outlive `kill -HUP $$` and the case proves nothing
+    // ([`run_staged_hup_ignored`] starts this stage that way).
+    // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL`, and a mask change for this
+    // thread; each takes plain integers or a live local.
     unsafe {
+        signal(SIGHUP, SIG_DFL);
         signal(SIGUSR2, SIG_IGN);
         let block = set_of(&[SIGUSR1, SIGTERM]);
         assert_eq!(pthread_sigmask(SIG_BLOCK, &block, std::ptr::null_mut()), 0);
@@ -325,6 +331,9 @@ fn staged_signals() {
 /// the same raw status (an exit code; a death by SIGHUP), holds the same three
 /// open files as stdio, has SIGPIPE at its default (`yes` dies of it, 128 +
 /// 13) and SIGUSR2 still ignored, and starts with the spawning thread's mask.
+/// The process is started with SIGHUP ignored, as under `nohup`, and sets the
+/// default its death-by-signal case needs, so the case holds however the
+/// suite was launched.
 #[test]
 fn a_transparent_run_is_the_std_run_it_replaces() {
     const NAME: &str = "spawnfd::transparent_tests::a_transparent_run_is_the_std_run_it_replaces";
@@ -332,7 +341,7 @@ fn a_transparent_run_is_the_std_run_it_replaces() {
         staged_signals();
         return;
     }
-    let out = run_staged(NAME, SIGNALS_STAGE);
+    let out = run_staged_hup_ignored(NAME, SIGNALS_STAGE);
     assert!(out.contains("STAGED transparent signals ok"), "{out}");
     print!("{out}");
 }

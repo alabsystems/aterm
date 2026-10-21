@@ -74,6 +74,17 @@ impl Registry for crate::session_store::SessionStore {
         #[cfg(not(any(unix, test)))]
         let _ = sessions;
     }
+
+    fn torn_state_set_aside(&self, files: u64) {
+        // A fact for the owner's later look: an exceptions entry, raised at
+        // the next park ([`crate::message_inbox::queue_exception`]).
+        #[cfg(any(unix, test))]
+        crate::message_inbox::queue_exception(
+            crate::message_reporters::torn_state_set_aside_entry(files),
+        );
+        #[cfg(not(any(unix, test)))]
+        let _ = files;
+    }
 }
 
 impl Timeline for crate::session_timeline::SessionTimeline {

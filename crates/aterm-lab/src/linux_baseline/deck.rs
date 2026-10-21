@@ -29,7 +29,6 @@
 //!    to the server's pixels, the Deck's rows left out, and its remainder
 //!    bands each continue the frame's nearest pixel, the Deck's rule
 //!    included (the same proof found 5 of 26790 band pixels short of it).
-//!    Mutter's pixels are not read back, and the row says so.
 
 use std::ops::Range;
 use std::path::Path;
@@ -302,15 +301,8 @@ fn session_checks(s: &Session<'_>, presenter: &'static str, on: &str) -> Vec<Che
     ));
     out.push(Check::new(named("click"), click(s)));
     if presenter == "cpu" {
-        // Mutter's pixels are not read back: its check holds the window
-        // maximized and banded, never a band pixel, and its name says so.
-        let check = if s.screen.display == Display::Mutter {
-            "bands (not read back)"
-        } else {
-            "bands"
-        };
         out.push(Check::new(
-            named(check),
+            named("bands"),
             match &caption {
                 Ok(c) => bands(s, c),
                 Err(e) => Err(e.clone()),

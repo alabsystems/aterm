@@ -463,6 +463,9 @@ struct Rig {
     twin: PathBuf,
     blocks2: Arc<Mutex<String>>,
     after: Arc<Mutex<After>>,
+    /// The harness's waits on the test's thread run on their own steps
+    /// ([`crate::harness::relaunch::virtual_waits`]): every stand-in here answers at once.
+    _waits: crate::harness::relaunch::VirtualWaits,
 }
 
 impl Rig {
@@ -537,6 +540,7 @@ impl Rig {
             timings: crate::harness::Timings::FAST,
         };
         Rig {
+            _waits: crate::harness::relaunch::virtual_waits(),
             kernel: Script {
                 exited,
                 stopped: Arc::new(AtomicBool::new(false)),

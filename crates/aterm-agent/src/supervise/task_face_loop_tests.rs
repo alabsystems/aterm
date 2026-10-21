@@ -1181,6 +1181,122 @@ fn a_restated_landings_note_carries_its_first_time_forward() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// THE PAGE COUNTS EACH LANDING ONCE, FROM THE FILES THE LOOPS WROTE (design
+/// §12.4.3, item 2; slice 4b): a real landing kept through the task's own
+/// wake (its note restated, `WAKE_KEPT`), then two loops restarted over it
+/// (a seamless update, a relaunch), each restating it with its first time
+/// (`ended`) — the page's one reading of the ledger and the journal
+/// (`stats_windows`) counts ONE landing beside the one land prompt, today, in
+/// the week and in the session's share, after every loop: across the
+/// restarts the count is the journal's. Someone else's turn then reopens the
+/// task and Land's next act lands it again: two. NEGATIVE CONTROLS: the
+/// journal holds four `DONE … rule=land@v1` notes of the first landing (a
+/// count of the notes reads 4), and a window opened after the first landing
+/// counts only the second.
+#[test]
+fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
+    use crate::harness::stats::stats_windows;
+    use crate::supervise::policy::turn_end::WAKE_KEPT;
+    const WAKE: &str = "The monitor fired: the deploy finished.";
+    let dir = crate::supervise::test_scratch_path("task-face", "landed-count");
+    let _ = std::fs::remove_dir_all(&dir);
+    let state = dir.join("state");
+    let drive = state.join("drive");
+    std::fs::create_dir_all(&drive).expect("drive");
+    let ledger = drive.join("s-land.jsonl");
+    std::fs::write(&ledger, "").expect("ledger");
+    std::fs::write(crate::supervise::approvals::journal_beside(&ledger), "").expect("journal");
+    let opened = crate::supervise::journal::unix_ms() - 3_600_000;
+    // (today's landings, the week's, the session's share, today's land prompts)
+    let read = |since: i64| {
+        let (today, week) = stats_windows(&state, &dir.join("harness"), since, since - 86_400_000);
+        let share: u64 = today
+            .by_session
+            .as_ref()
+            .map_or(0, |s| s.values().map(|t| t.landed).sum());
+        (today.landed, week.landed, share, today.land_prompts)
+    };
+    let notes = || {
+        journal_lines(&ledger)
+            .iter()
+            .filter(|l| landed_note(l))
+            .count()
+    };
+    let wakeful = || {
+        Arc::new(Faces {
+            finished: Some(true),
+            ..Faces::default()
+        })
+    };
+    // The first loop: the land instruction, its clean defense, the wake.
+    let host = wakeful();
+    let screens = vec![
+        busy_screen(),
+        ended(PROGRESS),
+        busy_screen(),
+        ended(LANDING_REPLY),
+        busy_screen(),
+        ended(WAKE),
+    ];
+    let (lines, turns) = run(screens, "land", vec![1], &host, Some(&ledger), None);
+    assert_eq!(turns, 1, "the instruction alone: {lines:#?}");
+    assert_eq!(
+        host.told(),
+        [TaskFace::Open, TaskFace::Landed],
+        "{lines:#?}"
+    );
+    let first = journal_lines(&ledger);
+    assert!(
+        first
+            .iter()
+            .any(|l| landed_note(l) && l.contains(WAKE_KEPT)),
+        "the wake restated the landing: {first:#?}"
+    );
+    assert_eq!(read(opened), (1, 1, 1, 1), "{first:#?}");
+    // Two loops restarted over it, each restating it.
+    for again in 0..2 {
+        std::thread::sleep(Duration::from_millis(5));
+        let host = wakeful();
+        let (lines, turns) = run(
+            vec![ended(WAKE)],
+            "land",
+            Vec::new(),
+            &host,
+            Some(&ledger),
+            None,
+        );
+        assert_eq!(turns, 0, "{again}: {lines:#?}");
+        assert_eq!(host.told(), [TaskFace::Landed], "{again}: {lines:#?}");
+        assert_eq!(read(opened), (1, 1, 1, 1), "{again}: the journal's count");
+    }
+    // NEGATIVE CONTROL: four notes of the one landing.
+    assert_eq!(notes(), 4, "{:#?}", journal_lines(&ledger));
+    // Someone else's turn reopens the task, and Land's act lands it again.
+    std::thread::sleep(Duration::from_millis(5));
+    let reopened = crate::supervise::journal::unix_ms();
+    let host = Arc::new(Faces::default());
+    let screens = vec![
+        busy_screen(),
+        ended(PROGRESS),
+        busy_screen(),
+        ended(LANDING_REPLY),
+    ];
+    let (lines, turns) = run(screens, "land", vec![1], &host, Some(&ledger), None);
+    assert_eq!(turns, 1, "Land's act: {lines:#?}");
+    assert_eq!(host.told().last(), Some(&TaskFace::Landed), "{lines:#?}");
+    let (today, week, share, prompts) = read(opened);
+    assert_eq!(
+        (today, week, share),
+        (2, 2, 2),
+        "{:#?}",
+        journal_lines(&ledger)
+    );
+    assert_eq!(prompts, 2, "two land prompts, one per landing");
+    // NEGATIVE CONTROL: a window opened after the first landing.
+    assert_eq!(read(reopened).0, 1, "{:#?}", journal_lines(&ledger));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A RESTART OF A LANDED SESSION TYPES NOTHING (§9.4.5): the loop finds the
 /// land's `DONE` as the journal's last end and no typed row after it, and the
 /// screen's reply still a clean defense — it is told `landed` AT ITS START and

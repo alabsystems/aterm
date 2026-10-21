@@ -52,7 +52,6 @@ pub enum State {
     SosPmApcString,
 }
 
-// NOTE(#2368): State is returned by Parser::state() (prelude API); helpers stay pub.
 impl State {
     /// Total number of states (for table sizing).
     pub const COUNT: usize = 14;
@@ -75,10 +74,9 @@ impl State {
         State::SosPmApcString,
     ];
 
-    /// The state whose [`State::name`] is `name`, or `None` for any other
-    /// string — how a state crosses a text wire (the seamless-update parser
-    /// carry, [`crate::ParserCarry`]) without a numeric discriminant a later
-    /// build might renumber.
+    /// The state whose [`State::name`] is `name`, or `None`: how a state
+    /// crosses a text wire (the [`crate::ParserCarry`]) without a numeric
+    /// discriminant a later build might renumber.
     #[must_use]
     pub fn from_name(name: &str) -> Option<State> {
         State::ALL.into_iter().find(|state| state.name() == name)
@@ -90,11 +88,8 @@ impl State {
         matches!(self, State::Ground)
     }
 
-    /// The state's name, as a static string (identical to its `Debug` form).
-    ///
-    /// Lets a caller outside this crate (`State` is `#[non_exhaustive]`) report
-    /// a state without allocating, e.g. the seamless-update capture naming the
-    /// partial sequence it abandoned.
+    /// The state's name (its `Debug` form) as a static string, so a caller
+    /// outside this crate can report a state without allocating.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {

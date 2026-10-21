@@ -701,6 +701,102 @@ fn the_usage_limit_dialog_is_a_box_with_nothing_to_press() {
     assert!(roles(&p).iter().all(|&r| r == Role::Other));
 }
 
+/// A Google account's spent quota draws the same dialog with its reset named
+/// under the title (`Access resets at 5:06 AM PDT.`): the same
+/// [`PromptKind::UsageLimit`] box, read as a prompt with no wall, its title
+/// the title row alone, and nothing on it to press. NEGATIVE CONTROL: the
+/// reset row moved over the title, the box is named by nothing.
+#[test]
+fn the_accounts_usage_limit_dialog_names_its_reset_and_is_the_same_box() {
+    let r = gemini(LIMIT_DIALOG_ACCOUNT);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+    assert_eq!((r.wall, r.composer), (None, None));
+    let p = r.prompt.expect("the dialog");
+    assert_eq!(p.kind, PromptKind::UsageLimit);
+    assert!(p.title.starts_with(anchor_text("gemini.usage.title")));
+    assert_eq!(labels(&p), vec![anchor_text("gemini.usage.retry"), "Stop"]);
+    assert_eq!(roles(&p), vec![Role::Other, Role::Other]);
+    assert_eq!(p.cancel, None);
+    let rows = screen(LIMIT_DIALOG_ACCOUNT);
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("│ Access resets at 5:06 AM PDT.")),
+        "{rows:#?}"
+    );
+    assert!(
+        !screen(LIMIT_DIALOG)
+            .iter()
+            .any(|r| r.contains("Access resets at"))
+    );
+
+    let title = rows
+        .iter()
+        .position(|r| r.starts_with("│ Usage limit reached"))
+        .expect("the title");
+    let mut swapped = rows.clone();
+    swapped.swap(title, title + 1);
+    let p = prompt(&swapped).expect("still a box");
+    assert_eq!(p.kind, PromptKind::Other);
+    assert!(roles(&p).iter().all(|&r| r == Role::Other));
+}
+
+/// The reset the account's dialog names is its clock less its zone (`5:06
+/// AM` of `Access resets at 5:06 AM PDT.`), the zone's short name dropped
+/// whatever it is and the CLI's no-break space read as a space; the
+/// supervisor waits for it before `Keep trying`. NEGATIVE CONTROLS: the
+/// per-day quota's dialog names none; the same row moved under the options
+/// (no part of the dialog's message), or on a screen with no dialog, names
+/// none; a row whose words are no reset's is not read as one.
+#[test]
+fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
+    let rows = screen(LIMIT_DIALOG_ACCOUNT);
+    assert_eq!(limit_reset(&rows).as_deref(), Some("5:06 AM"));
+    let row = rows
+        .iter()
+        .find(|r| r.starts_with("│ Access resets at"))
+        .expect("the reset row")
+        .clone();
+    // The row keeps its width, its right border where the box draws it.
+    let respelled = |from: &str, to: &str| -> Vec<String> {
+        assert!(row.contains(from), "{row:?}");
+        let with = row.replacen(from, to, 1);
+        let body = with.trim_end_matches('│').trim_end();
+        let width = row.chars().count() - 1;
+        edited(&rows, "│ Access resets at", &format!("{body:<width$}│"))
+    };
+    assert_eq!(
+        limit_reset(&respelled("5:06 AM PDT", "5:06\u{202f}AM PDT")).as_deref(),
+        Some("5:06 AM")
+    );
+    assert_eq!(
+        limit_reset(&respelled("5:06 AM PDT", "5:06 AM GMT+2")).as_deref(),
+        Some("5:06 AM")
+    );
+    assert_eq!(
+        limit_reset(&respelled("5:06 AM PDT.", "11:30 PM.")).as_deref(),
+        Some("11:30 PM")
+    );
+    // NEGATIVE CONTROLS.
+    assert_eq!(limit_reset(&screen(LIMIT_DIALOG)), None);
+    assert_eq!(limit_reset(&screen(IDLE)), None);
+    let at = rows.iter().position(|r| *r == row).expect("the row");
+    let option = rows
+        .iter()
+        .position(|r| r.contains("2. Stop"))
+        .expect("the last option");
+    let mut under = rows.clone();
+    let moved = under.remove(at);
+    under.insert(option, moved);
+    assert_eq!(
+        prompt(&under).map(|p| p.kind),
+        Some(PromptKind::UsageLimit),
+        "still the dialog"
+    );
+    assert_eq!(limit_reset(&under), None, "{under:#?}");
+    let renamed = respelled("Access resets at", "Access ended at");
+    assert_eq!(limit_reset(&renamed), None);
+}
+
 /// The folder-trust dialog of a first run is a box no typing answers: a
 /// Trust prompt, `Trust folder (<dir>)` the trust, `Trust parent folder
 /// (<parent>)` a wider standing grant, `Don't trust` the refusal, chosen by
@@ -1940,4 +2036,36 @@ fn the_message_that_opened_the_turn_is_read_off_its_band() {
     assert!(said_tail(&cut).is_some());
     assert_eq!(turn_opened_by(&cut), None);
     assert_eq!(ClaudeReader.turn_opened_by(&rows), None);
+}
+
+/// THE FRAME A LAUNCH DRAWS BEFORE ITS BANNER (measured in the forever lab,
+/// P3 of `docs/measured/forever-lab-2026-10-20.md`): the composer, its
+/// footer and `? for shortcuts` with nothing above them — idle as evidence,
+/// no message, no reply, no opener, an empty composer, and NOT `fresh`: no
+/// banner row stands above the composer yet, so the screen alone cannot tell
+/// it from a conversation scrolled or cleared away (the supervisor reads the
+/// host's launch for that). NEGATIVE CONTROLS: the composer under its banner
+/// a moment later is fresh; a turn's end over the same composer opens on its
+/// message and ends on its reply.
+#[test]
+fn the_frame_before_the_banner_is_idle_with_no_turn_and_not_fresh() {
+    let r = gemini(PRE_BANNER);
+    let rows = screen(PRE_BANNER);
+    assert_eq!(r.program, Program::Gemini);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert!(!r.fresh, "no banner row above the composer");
+    assert_eq!((r.prompt, r.wall, r.said_tail), (None, None, None));
+    assert!(!r.interrupted);
+    assert_eq!(r.composer, Some((caret_at(&rows), vec![String::new()])));
+    assert_eq!(turn_opened_by(&rows), None);
+    assert!(!rows.iter().any(|row| is_banner_row(row)));
+    // NEGATIVE CONTROLS.
+    assert!(gemini(IDLE).fresh, "the banner drawn");
+    let ended = gemini(END_OF_TURN);
+    assert!(!ended.fresh);
+    assert!(ended.said_tail.is_some());
+    assert!(turn_opened_by(&screen(END_OF_TURN)).is_some());
 }

@@ -282,9 +282,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn owns_turn_end(&self) -> bool;
     /// The host WITHHOLDS the session's continuations for now — nothing
     /// else: a full disk ([`crate::harness::disk`]) on which every write of
-    /// the agent fails, where a continuation only burns a turn. The turn-end
-    /// policy types nothing at such a point and decides it again once the
-    /// host withholds nothing ([`Session::host_held`]). Unlike
+    /// the agent fails, where a continuation only burns a turn, or a stuck
+    /// macOS program check, where no program the agent starts would start.
+    /// The turn-end policy decides nothing at such a point, an escalation
+    /// included (the host's own alert is the owner's ask then), and decides
+    /// it again once the host withholds nothing ([`Session::host_held`]). Unlike
     /// [`Self::owns_turn_end`] it is no upgrade: no account move is held
     /// back for it, no relaunch is promised by it, and a wall keeps its own
     /// rule once the hold lifts. The default: never.
@@ -505,6 +507,28 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn lifted_off(&self) -> bool {
         false
     }
+    /// THE AGENT'S LAUNCH, AS ATERM SAW IT (P3 of
+    /// `docs/measured/forever-lab-2026-10-20.md`): when the command that
+    /// runs the agent now started, unix ms — the shell's signed command
+    /// start, which the server witnesses under the terminal lock whoever
+    /// typed the line (a person, a lab, a spawn's worker line, a relaunch)
+    /// — where the agent's process began at or after it and no person's
+    /// gesture has reached the session since. So nobody has keyed anything
+    /// to the agent since it started, and a task its launch carried (its
+    /// argv; a `spawn agent=` worker's task file, which is argv too) is the
+    /// conversation's first message on its screen. What lets a loop that is
+    /// the session's first read a point before anything of a conversation
+    /// stands as no turn's end ([`TurnEndReading::taskless`]): a frame the
+    /// agent draws before its banner, or a blank first screen, counted no
+    /// short turn, and the back-off began a step late. Asked only at such a
+    /// point. `None` — the default — is an agent aterm did not see start (one
+    /// a seamless update carried, one under a shell with no signed
+    /// integration, an `exec`), one a person keyed into since, or one whose
+    /// process the host has not read: its first point counts, as a
+    /// supervisor attaching to an idle worker counts it.
+    fn launch(&self) -> Option<i64> {
+        None
+    }
     /// A read since the last point saw the session busy: a turn ran (the
     /// agent's, a person's, an orchestrator's, or one the host typed). What the
     /// host counted of the points before starts over. The default ignores it.
@@ -548,7 +572,9 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// `None` — and `None` where the host MOVED the conversation off that row
     /// (a bucket's fallback model, the way back, another account, with no row
     /// of the model since: `crate::harness::relaunch::moved_off`), so a
-    /// move's carry-on is never held behind the limit it left. Asked where
+    /// move's carry-on is never held behind the limit it left; and `None`
+    /// where Claude Code's own continuation was written after the row (it
+    /// went on past the limit at its reset). Asked where
     /// the screen draws no wall and the loop tracks no limit: at the first
     /// decisions after the loop starts or the agent's process or
     /// conversation changes ([`Session::read_standing_limit`]), at the
@@ -636,11 +662,12 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = act;
     }
 
-    /// THE TASK'S FACE, TOLD AS IT MOVES (§9.4.2): open, landed, done, spent
-    /// or theirs ([`TaskFace`](crate::harness::acts::TaskFace)), told once at
-    /// the loop's start and then on each change, so the window's chip and
-    /// `status task=` say how a landing ended. Reporting only: nothing the
-    /// loop decides reads it back. The default ignores it.
+    /// THE TASK'S FACE, TOLD AS IT MOVES (§9.4.2): open, landed or theirs
+    /// ([`TaskFace`](crate::harness::acts::TaskFace); FOREVER CRUISE / FOREVER
+    /// LAND retired done and spent), told once at the loop's start and then
+    /// on each change, so the window's chip and `status task=` say whether a
+    /// landing landed. Reporting only: nothing the loop decides reads it
+    /// back. The default ignores it.
     fn task_face(&self, face: crate::harness::acts::TaskFace) {
         let _ = face;
     }
@@ -655,6 +682,63 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn task_face_noted(&self, face: crate::harness::acts::TaskFace, noted_ms: i64) {
         let _ = noted_ms;
         self.task_face(face);
+    }
+
+    /// THE WORKER'S NEEDS YOU, WHOLE, TOLD BEFORE ITS ENTRY GOES UP
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3): `needs`, the
+    /// whole set the turn-end policy holds standing
+    /// ([`TurnEndState::standing_needs`]: each the worker's own line,
+    /// sanitized and held to the policy's 160 characters, never cut to the
+    /// entry's 64 cells), and `entry`, the exact text of the `needs` owner's
+    /// attention entry the loop is about to set for that set (`escalate.rs`'s
+    /// `needs_attention_text`; told again with the cut text where the
+    /// server's refusal names a tighter cap) — or `(&[], "")` as the loop is
+    /// about to take that entry down. Told where the set or the entry's text
+    /// moves, and only there, BEFORE the `meta set` or `unset` is sent, so a
+    /// host that stores the words where the entry lands has them for the
+    /// first publication that shows it. Told again, with no request sent,
+    /// where a request the connection lost left the host told otherwise than
+    /// the entry the loop holds up (a take-down whose `unset` never landed,
+    /// another set whose `meta set` never did): the set standing, with the
+    /// text it was put up with. Never told a set where the entry is not this
+    /// loop's (beside a proven self-claim, behind another supervisor's
+    /// claim: `Session::needs_not_ours`); where the loop lets its own set go
+    /// there (an Off park, the loop's end), told `(&[], "")` with no request
+    /// sent, so the host keeps no words of an entry this loop no longer
+    /// holds. Reporting only: nothing the loop decides reads it back. The
+    /// default ignores it.
+    fn needs_standing(&self, needs: &[String], entry: &str) {
+        let _ = (needs, entry);
+    }
+
+    /// WHY LAND STILL HOLDS, TOLD AS IT MOVES
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3): `held`, the
+    /// hold the turn-end policy keeps ([`TurnEndState::land_held`]) — its
+    /// `since` and nudges once the episode's instruction is typed, and the
+    /// legs that held the last land act's yield while no other turn ran
+    /// since — or `None` where none stands (before the instruction, at a
+    /// landing and until Land's next act, at a person's own exchange, at
+    /// Off, at the loop's end) and where the hold is not this loop's to tell
+    /// (beside a proven self-claim, behind another supervisor's claim:
+    /// `Session::hold_is_ours`). Told where it moved, and only there: at
+    /// each loop's start (whatever stands, the seed included), at each point
+    /// folded in and each live read of someone else's turn (beside the
+    /// task's face), at each act's ledger row (a land act's `since` and its
+    /// nudge count current as it is typed), at an Off park, and `None` at
+    /// the loop's end where a hold was told.
+    ///
+    /// OUTSIDE LAND IT IS TOLD `None` AT THE LOOP'S NEXT READ OF THE WORD,
+    /// NOT AT THE SWITCH: the loop reads the session's word where it decides
+    /// and at a busy read's act, so a switch from Land to Cruise at a held
+    /// point waiting out its back-off is told `None` only when the loop next
+    /// reads the word (that act's row, someone else's live turn, the next
+    /// point). A host, which owns the word and sees it change at once, shows
+    /// a told hold only while the session's word is Land. Reporting only:
+    /// nothing the loop decides reads it back. The default ignores it.
+    ///
+    /// [`TurnEndState::land_held`]: crate::supervise::policy::turn_end::TurnEndState::land_held
+    fn land_held(&self, held: Option<crate::harness::acts::LandHeld>) {
+        let _ = held;
     }
 
     /// The line a person runs to resume the agent's own conversation after a
@@ -963,6 +1047,16 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// lost login came back; a plain turn end is none (`Login interrupted`
     /// reads as one). The default ignores it.
     fn login_back(&self) {}
+
+    /// THIS SESSION'S USAGE OR MODEL LIMIT ENDED WITH NO SIGN-IN THAT TOOK
+    /// ([`super::super::policy::turn_end::TurnEndState::limit_ended`] with
+    /// no [`Self::login_back`]): the worker worked past it at its reset, a
+    /// `/clear` left it, another wall took its place. A host whose notices
+    /// told the limit ends their story there, unfixed: no switch ended it,
+    /// and a login back told later — a lost login's, an account move days on
+    /// — is no word of it (the review of the login carry, r9h-3). The
+    /// default ignores it.
+    fn limit_over(&self) {}
 
     /// CLAUDE CODE SAID THE STORED LOGIN ENDS IN `days` DAYS
     /// ([`super::super::policy::turn_end::TurnEndReading::login_notice`]): told

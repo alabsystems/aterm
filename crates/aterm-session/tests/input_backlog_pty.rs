@@ -1,23 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `SinkWriter::input_backlog` against a REAL pty — the reading built for the
-//! incident where a frozen Claude Code left the owner's Enter
-//! unread in its slave's input queue for hours and a supervisor's
-//! screen-fenced key queued behind it.
+//! `SinkWriter::input_backlog` against a real pty: the one place the kernel's own
+//! count meets the ledger's dates. A raw slave that does not read, bytes written
+//! through the sink, and the probe's `queued`/`wait` checked against what the test did
+//! and when. The pure halves (the ledger, word and gate tables) are
+//! `aterm_session::input_backlog`'s unit tests; socketpair fixtures are not ttys and
+//! read `None`.
 //!
-//! The pure halves (the ledger truth table, the word and refusal tables) are
-//! `aterm_session::input_backlog`'s unit tests; the socketpair fixtures every
-//! other sink test drives are not ttys and read `None`. This file is the one
-//! place the kernel's own count meets the ledger's dates: a raw slave that
-//! does not read, bytes written through the sink, and the probe's
-//! `queued`/`wait` checked against what the test did and when.
-//!
-//! macOS-only: the queue probes answer `None` everywhere else (on Linux a
-//! master's `FIONREAD` counts output — aterm-pty's `input_queue_len` says
-//! why). The pairs come from aterm-pty's `open_pty_pair`, both ends
-//! close-on-exec from birth, as every test's pair does: `openpty(3)`'s are
-//! inheritable, and a child spawned meanwhile keeps them.
+//! macOS-only: the queue probes answer `None` elsewhere (on Linux a master's
+//! `FIONREAD` counts output; aterm-pty's `input_queue_len` says why). Pairs come from
+//! aterm-pty's `open_pty_pair`, close-on-exec from birth: `openpty(3)`'s are
+//! inheritable, and a child spawned meanwhile would keep them.
 #![cfg(target_os = "macos")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,11 +26,9 @@ use aterm_spec::wait::MUST_HAPPEN;
 /// A pty pair with the slave raw (`VMIN = 1`, `VTIME = 0`, a key-at-a-time
 /// reader like every agent TUI) or canonical without echo.
 fn pty_pair(raw: bool) -> (i32, i32) {
-    // No lock: the harness's parallel threads open their pairs at once. The
-    // failures `openpty` (which this opener replaced) once had here were the
-    // kernel's: concurrent `/dev/ptmx` clone opens can be handed the same pty
-    // minor, and every loser gets XNU's `EREDRIVEOPEN` (errno -6) once the
-    // kernel's own ten redrives run out. `open_pty_pair` redrives it.
+    // No lock: parallel tests open pairs at once. Concurrent `/dev/ptmx` clone opens
+    // can be handed the same minor, and a loser gets XNU's `EREDRIVEOPEN` (errno -6)
+    // once the kernel's ten redrives run out; `open_pty_pair` redrives it.
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     // SAFETY: `libc::termios` is plain integer fields and a byte array; all
     // zeros is a valid value, overwritten by `tcgetattr` below.
@@ -107,13 +99,11 @@ fn settle(sink: &SinkWriter, done: impl Fn(&InputBacklog) -> bool) -> InputBackl
     hit.unwrap_or_else(|| panic!("never settled: {:?}", last.expect("probed")))
 }
 
-/// Wait until a parked paste's first bytes are in the queue AND DATED. The
-/// ledger stamps a write after `write(2)` returns (`ledger_end`), and until it
-/// has, the probe reads the queued bytes as in flight (`wait` zero). A nonzero
-/// `wait` therefore means the stamp is older than this call's return, so an
-/// age bound slept from here counts from an event this thread SAW — never
-/// from the paster's `spawn`, which a loaded scheduler can start later than a
-/// `sleep` beside it overshoots.
+/// Wait until a parked paste's first bytes are queued and dated. The ledger stamps a
+/// write after `write(2)` returns, and until then the probe reads the bytes as in
+/// flight (`wait` zero); a nonzero `wait` means the stamp predates this return, so an
+/// age slept from here counts from an event this thread saw, never from the paster's
+/// `spawn`, which a loaded scheduler can start late.
 fn first_write_dated(sink: &SinkWriter) -> InputBacklog {
     settle(sink, |b| b.queued > 0 && !b.wait.is_zero())
 }
@@ -133,10 +123,8 @@ fn raw_unread_input_is_counted_and_dated() {
     assert_eq!(empty.spilled, Some(0));
     assert_eq!(empty.output_backlog, Some(0));
 
-    // Fresh bytes are dated no earlier than their write: their wait cannot
-    // exceed the time since just before it. (It was `< 300 ms`, which a
-    // descheduled probe could overrun and a date that is merely too old
-    // could pass.)
+    // Fresh bytes are dated no earlier than their write: their wait cannot exceed the
+    // time since just before it.
     let before_write = Instant::now();
     assert_eq!(sink.write_frame(b"abc").expect("write"), 3);
     let fresh = sink.input_backlog().expect("measured");
@@ -158,9 +146,9 @@ fn raw_unread_input_is_counted_and_dated() {
     close_pair(master, slave);
 }
 
-/// CANONICAL MODE COUNTS COMPLETE LINES ONLY: a partial `ab` at a cooked
-/// prompt is invisible to FIONREAD, so it reads 0 — and `canonical` says so,
-/// which is what keeps a shell's type-ahead from ever reading as a stall.
+/// Canonical mode counts complete lines only: a partial `ab` is invisible to FIONREAD
+/// and reads 0, and `canonical` says so, which keeps a shell's type-ahead from reading
+/// as a stall.
 #[test]
 fn canonical_partial_line_reads_zero() {
     let (master, slave) = pty_pair(false);
@@ -229,16 +217,13 @@ fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
     close_pair(master, slave);
 }
 
-/// A DRAINER PARKED PARTWAY THROUGH A CHUNK COUNTS EACH UNREAD BYTE ONCE. A
-/// 4000-byte keystroke frame into a raw reader that has stopped reading
-/// fills the queue with its head; its tail spills, and the drainer takes
-/// the whole tail as ONE chunk and parks on the full queue. The program then
-/// reads 500 bytes, the drainer hands the kernel about 500 more from the
-/// middle of that chunk, and parks again. Those bytes are now in the queue
-/// FIONREAD counts, so the spill must stop counting them: `unread()` is
-/// exactly 4000 - 500, not 4000 with the 500 counted twice (the status field
-/// `input_bytes` is this sum). A second episode on the same sink reads
-/// the first one's figure again, so the mark is cleared with its chunk.
+/// A drainer parked partway through a chunk counts each unread byte once. A
+/// 4000-byte frame into a raw reader that stopped reading fills the queue with its
+/// head; the tail spills, and the drainer takes it as one chunk and parks. The program
+/// reads 500 bytes, the drainer hands the kernel about 500 more from that chunk and
+/// parks again; those are now in FIONREAD's count, so the spill must stop counting
+/// them: `unread()` (the status field `input_bytes`) is exactly 4000 - 500. A second
+/// episode reads like the first, so the mark is cleared with its chunk.
 #[test]
 fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
     const FRAME: usize = 4000;
@@ -359,16 +344,13 @@ fn read_within(fd: i32, max: usize) -> Vec<u8> {
     out
 }
 
-/// A DISCARD DROPS THE SPILL WITH THE QUEUE, AND THE SINK STILL REACHES THE
-/// PROGRAM. The shape of a
-/// paste into a frozen raw program: 1118 bytes, of which the queue takes
-/// 1022 and the sink spills 96, with the drainer parked in `poll(POLLOUT)`
-/// holding the fd lock. The first cut of the restart remedy flushed only
-/// the kernel queue. A flush does not wake a parked poll on Darwin, and
-/// the emptied queue gives nobody a reason to read, so the drainer slept
-/// for good and a key written after it queued behind the 96 forever.
-/// `discard_unread_input` drops both (1118), and the next key is the next
-/// thing the program reads, alone.
+/// A discard drops the spill with the queue, and the sink still reaches the program.
+/// A paste into a frozen raw program: the queue takes 1022 bytes, the rest spill, and
+/// the drainer parks in `poll(POLLOUT)` holding the fd lock. On Darwin a flush does
+/// not wake a parked poll and the emptied queue gives nobody a reason to read, so
+/// flushing only the kernel queue would strand the drainer and every later key behind
+/// the spill. `discard_unread_input` drops both, and the next key is the next thing
+/// the program reads.
 #[test]
 fn a_discard_drops_a_parked_spill_and_the_next_key_still_arrives() {
     let (master, slave) = pty_pair(true);
@@ -398,12 +380,10 @@ fn a_discard_drops_a_parked_spill_and_the_next_key_still_arrives() {
     close_pair(master, slave);
 }
 
-/// A DISCARD ENDS A WRITER PARKED MID-FRAME. A blocking `write_frame` (a
-/// paste on its own thread) fills the queue and parks HOLDING the fd lock.
-/// After the discard it must neither sleep for good on the flushed queue
-/// nor hand the kernel the rest of its frame, which was meant for the
-/// program the discard was for. It returns short, and the next key reaches
-/// the program alone.
+/// A discard ends a writer parked mid-frame: a blocking `write_frame` that filled the
+/// queue and parked holding the fd lock neither sleeps for good on the flushed queue
+/// nor hands the kernel the rest of its frame (meant for the program the discard was
+/// for). It returns short, and the next key reaches the program alone.
 #[test]
 fn a_discard_ends_a_writer_parked_mid_frame() {
     const PASTE: usize = 64 * 1024;
@@ -459,7 +439,7 @@ fn a_flush_moves_the_discard_epoch_and_not_the_restart_count() {
     );
     assert_eq!(sink.discard_unread_input(Discard::Restart), Some(0));
     assert_eq!((sink.discards(), sink.restart_discards()), (2, 1));
-    // The read evidence counts from the LATEST drop, whichever it was.
+    // The read evidence counts from the latest drop, whichever it was.
     assert_eq!(sink.discard_unread_input(Discard::Flush), Some(0));
     assert_eq!(sink.write_frame_nonparking(b"x").expect("write"), 1);
     let _ = settle(&sink, |b| b.queued == 1);
@@ -478,14 +458,12 @@ fn a_flush_moves_the_discard_epoch_and_not_the_restart_count() {
     drop((a, b));
 }
 
-/// A READ AFTER A DISCARD IS TOLD FROM THE DISCARD. The discard's empty queue is what a reader
-/// leaves too, so aterm-gui holds a stall through it; this is the evidence
-/// that lets the hold go when the program reads again. Nothing written since
-/// the discard is no read. A byte written and still queued is no read. The
-/// program reading it is one, and a byte queued behind that read does not
-/// undo it. The next discard starts over. In canonical mode FIONREAD cannot
-/// see a partial line, so a byte typed there never reads as read: that is
-/// the negative control for the count the answer rests on.
+/// A read after a discard is told from the discard. The discard's empty queue is what
+/// a reader leaves too, so aterm-gui holds a stall through it; this is the evidence
+/// that lets the hold go. Nothing written since the discard is no read, nor is a byte
+/// still queued; the program reading it is one, and a byte queued behind that read
+/// does not undo it. The next discard starts over. Negative control: in canonical
+/// mode FIONREAD cannot see a partial line, so a byte typed there never reads as read.
 #[test]
 fn a_read_after_a_discard_is_told_from_the_discard() {
     let (master, slave) = pty_pair(true);
@@ -531,16 +509,14 @@ fn a_read_after_a_discard_is_told_from_the_discard() {
     drop((a, b));
 }
 
-/// A CBREAK PROGRAM'S CONTROL KEY IS NOT A READ. With ICANON off but ISIG, IEXTEN and IXON on
-/// — Python's `tty.setcbreak`, ncurses `cbreak()` — the line discipline
-/// consumes `^C`, `^O` and `^S` as they are written: the ledger counts the
-/// byte and the queue never holds it. The held gate admits a lone `^C` on
-/// purpose (it is a signal, the remedy), so the queue's shrink was read as
-/// the program reading and released a program still frozen. Nothing reads the
-/// slave here, the queue is seen EMPTY after each key — the evidence the old
-/// answer rested on — and the answer stays `false`. The raw twin in
-/// [`a_read_after_a_discard_is_told_from_the_discard`] is the positive
-/// control: there a real read answers `true`.
+/// A cbreak program's control key is not a read. With ICANON off but ISIG, IEXTEN and
+/// IXON on (Python's `tty.setcbreak`, ncurses `cbreak()`) the line discipline consumes
+/// `^C`, `^O` and `^S` as they are written: the ledger counts the byte and the queue
+/// never holds it. The held gate admits a lone `^C` on purpose (a signal is the
+/// remedy), so a shrinking queue must not read as the program reading. Nothing reads
+/// the slave here, the queue is seen empty after each key, and the answer stays
+/// `false`; the raw twin in [`a_read_after_a_discard_is_told_from_the_discard`] is the
+/// positive control.
 #[test]
 fn a_control_key_a_cbreak_driver_eats_is_not_a_read() {
     let (master, slave) = pty_pair(true);

@@ -169,7 +169,10 @@ pub fn install_bundle(
     publish_directory(&inner, &dest, occupied).map_err(|error| {
         format!("abrew: cannot publish bundle; existing destination retained: {error}")
     })?;
-    println!("🍺  Homebrew {tag} bundled at {}", dest.display());
+    match super::install_badge() {
+        Some(badge) => println!("{badge}  Homebrew {tag} bundled at {}", dest.display()),
+        None => println!("Homebrew {tag} bundled at {}", dest.display()),
+    }
     Ok(())
 }
 

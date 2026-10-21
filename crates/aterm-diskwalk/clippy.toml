@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# aterm-diskwalk's lint config. Clippy reads only the nearest clippy.toml, so the
+# workspace file's rows that can resolve in a crate with a libc dependency are
+# repeated here (the root file says why each exists), followed by the walker's
+# own two laws (docs/DESIGN-system-awareness-2026-10-16.md §3.4 row 3, §10.5):
+#
+# FD-RELATIVE ONLY, FOLLOW NOTHING. Every path call below resolves a path from the
+# top, follows symlinks on the way, or both: a walk through one could reach a
+# folder whose stat raises a macOS privacy prompt (which holds the calling
+# syscall until a person answers), or leave the tree through a link. The walker
+# opens each component with O_NOFOLLOW relative to its parent's descriptor and
+# lists with getattrlistbulk / getdents64 / readdir; a test that builds or checks
+# a scratch tree with std carries the `#[expect]`.
+#
+# NO FILE CONTENTS. The walker reads names and attributes, never a regular file's
+# bytes, so `File::open` and the whole-file reads are banned here.
+#
+# THE INJECTED CLOCK. A slice ends by the clock its caller hands in, so a test can
+# charge per call and the conformance replays exactly; the walker reads no clock.
+disallowed-methods = [
+  { path = "std::fs::File::lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "libc::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "libc::forkpty", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "libc::execvp", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::raise", reason = "a raised core signal writes a crash report: die by SIGKILL (clippy.toml: no core-dump death)" },
+  { path = "std::os::windows::process::CommandExt::creation_flags", reason = "set a child's console with aterm_uds::spawn (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "std::fs::read_dir", reason = "list fd-relative (openat O_NOFOLLOW, then getattrlistbulk/getdents64/readdir): a path listing follows links (clippy.toml: fd-relative only)" },
+  { path = "std::fs::metadata", reason = "stat fd-relative with AT_SYMLINK_NOFOLLOW after refuse(): a path stat follows links and can prompt (clippy.toml: fd-relative only)" },
+  { path = "std::fs::symlink_metadata", reason = "stat fd-relative after refuse(): a path stat resolves every earlier component (clippy.toml: fd-relative only)" },
+  { path = "std::path::Path::metadata", reason = "stat fd-relative with AT_SYMLINK_NOFOLLOW after refuse() (clippy.toml: fd-relative only)" },
+  { path = "std::path::Path::symlink_metadata", reason = "stat fd-relative after refuse() (clippy.toml: fd-relative only)" },
+  { path = "std::path::Path::read_dir", reason = "list fd-relative (clippy.toml: fd-relative only)" },
+  { path = "std::path::Path::canonicalize", reason = "canonicalise lexically (refuse::canonical): realpath follows links into places refuse() never tested (clippy.toml: fd-relative only)" },
+  { path = "std::fs::canonicalize", reason = "canonicalise lexically (refuse::canonical): realpath follows links into places refuse() never tested (clippy.toml: fd-relative only)" },
+  { path = "std::path::Path::exists", reason = "a path stat follows links and can prompt: test the path with refuse() and stat fd-relative (clippy.toml: fd-relative only)" },
+  { path = "std::path::Path::is_dir", reason = "a path stat follows links and can prompt: test the path with refuse() and stat fd-relative (clippy.toml: fd-relative only)" },
+  { path = "std::fs::File::open", reason = "the walker never opens a regular file (clippy.toml: no file contents)" },
+  { path = "std::fs::read", reason = "the walker never reads a file's contents (clippy.toml: no file contents)" },
+  { path = "std::fs::read_to_string", reason = "the walker never reads a file's contents (clippy.toml: no file contents)" },
+  { path = "std::time::Instant::now", reason = "a slice ends by the clock its caller hands in (clippy.toml: the injected clock)" },
+  { path = "std::time::Instant::elapsed", reason = "a slice ends by the clock its caller hands in (clippy.toml: the injected clock)" },
+  { path = "std::time::SystemTime::now", reason = "a slice ends by the clock its caller hands in (clippy.toml: the injected clock)" },
+]
+disallowed-types = [
+  { path = "std::process::Command", reason = "build children with aterm_uds::spawnfd::command, which hands them stdio and nothing else (clippy.toml: one child constructor)" },
+]

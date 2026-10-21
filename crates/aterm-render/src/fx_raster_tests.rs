@@ -895,6 +895,190 @@ fn fx_dirty_band_restamps_only_its_band() {
     assert!(doubled, "CONTROL: an ungated slice build must double-add");
 }
 
+/// A COLUMN TABLE PER SIZE, BUILT ONLY TO DRAW: a frame's sprites build their
+/// column table ([`SpriteCols`]) once per run of one `(art width, dw)` (the
+/// rectangles of a rim's cover share one), never for a sprite whose every band
+/// is kept, and the frame equals the spec at every size.
+///
+/// CONTROLS (mutations run by hand, then restored): a table keyed on the art
+/// width alone draws the second size from the first size's table and fails
+/// the bytes; a table built when the slicer hands the item over, before any
+/// band is asked, fails the counts.
+#[test]
+fn a_column_table_is_built_per_size_and_only_when_drawn() {
+    let f = FxFrame {
+        w: 160,
+        h: 100,
+        pad: 0,
+        grid_top: 0,
+        cell_h: 10,
+        rows: 10,
+    };
+    let art = |w: u16, seed: u8| {
+        let data: Vec<u8> = (0..w * 5)
+            .map(|i| (i as u8).wrapping_mul(seed).wrapping_add(seed) % 4)
+            .collect();
+        Arc::new(FxArt::new(w, 5, FxTexels::Index8, data).expect("sized"))
+    };
+    let (a, b, c) = (art(7, 3), art(7, 5), art(9, 7));
+    let sprite = |art: &Arc<FxArt>, x: i32, dw: u16, clip: PxRect| {
+        FxItem::Sprite(FxSprite {
+            x,
+            y: 2,
+            dw,
+            dh: 15,
+            flip_x: false,
+            ink: 0,
+            clip,
+            art: Arc::clone(art),
+        })
+    };
+    // One art at one size laid as two rectangles of its cover, another art of
+    // that width at that size, the first art at a second size, and an art of
+    // another width at the first size: three tables a frame.
+    let items = vec![
+        sprite(&a, 2, 21, PxRect::new(2, 2, 12, 17)),
+        sprite(&a, 2, 21, PxRect::new(12, 2, 23, 17)),
+        sprite(&b, 30, 21, PxRect::EVERYWHERE),
+        sprite(&a, 60, 17, PxRect::EVERYWHERE),
+        sprite(&c, 90, 21, PxRect::EVERYWHERE),
+    ];
+    let pal = vec![
+        FxInk::over(0x00C0_4020, 255),
+        FxInk::over(0x0020_C040, 160),
+        FxInk::add(0x0030_3090),
+    ];
+    let layers = vec![FxLayer::new(
+        1,
+        Arc::new(FxContent::new(items, pal)),
+        FxSlot::Over,
+        FxSpace::Window,
+        FxBlend::Exact,
+    )];
+    let base: Vec<u32> = (0..f.w * f.h).map(|i| 0x0008_1018 + i as u32 % 7).collect();
+    let mut scratch = FxScratch::default();
+    let mut band = |only: Option<usize>| {
+        let dirty: Option<Vec<bool>> = only.map(|r| (0..f.rows).map(|b| b == r).collect());
+        let mut px = base.clone();
+        crate::test_counters::take_sprite_cols_builds();
+        draw_layers(
+            &mut px,
+            &f,
+            &layers,
+            &[],
+            FxSlot::Over,
+            FxBlend::Exact,
+            dirty.as_deref(),
+            &mut scratch,
+        );
+        let builds = crate::test_counters::take_sprite_cols_builds();
+        let want = placed_by_spec(
+            &f,
+            &layers,
+            &[],
+            FxSlot::Over,
+            FxBlend::Exact,
+            dirty.as_deref(),
+            &base,
+            true,
+        );
+        if let Some(i) = (0..px.len()).find(|&i| px[i] != want[i]) {
+            panic!(
+                "band {only:?}: pixel ({}, {}) is {:08x}, the spec says {:08x}",
+                i % f.w,
+                i / f.w,
+                px[i],
+                want[i]
+            );
+        }
+        (builds, px != base)
+    };
+    assert_eq!(band(None), (3, true), "a whole frame: one table a size");
+    assert_eq!(band(None), (3, true), "and again on the next frame");
+    assert_eq!(band(Some(1)), (3, true), "every sprite reaches band 1");
+    assert_eq!(band(Some(6)), (0, false), "no sprite reaches band 6");
+}
+
+/// A LAYER AWAY FROM EVERY OPEN BAND IS NOT READ: the slicer hands its sink
+/// no item of a layer whose extent meets no open band (a card on rows the
+/// frame keeps), and every item of one whose extent does, in Window and Grid
+/// space and under an offset. The bytes such a skip could cost are
+/// `fx_placement_is_the_spec`'s (random dirty sets over random offsets).
+///
+/// CONTROL (a mutation run by hand, then restored): without the skip, the
+/// kept layer's items are handed over and the counts fail.
+#[test]
+fn a_layer_away_from_every_open_band_is_not_read() {
+    struct Count(Vec<u64>);
+    impl<'a> FxSliceSink<'a> for Count {
+        fn item(&mut self, layer: &'a FxLayer, _: &'a FxItem, _: (i64, i64)) -> bool {
+            self.0.push(layer.id);
+            true
+        }
+        fn slice(&mut self, _: FxSlice, _: usize) {}
+    }
+    let f = FxFrame {
+        w: 120,
+        h: 6 + 8 * 10,
+        pad: 4,
+        grid_top: 6,
+        cell_h: 10,
+        rows: 8,
+    };
+    let rect = |y: i32| {
+        FxItem::Rect(FxRect {
+            x: 3,
+            y,
+            w: 20,
+            h: 12,
+            ink: 0,
+        })
+    };
+    let layer = |id: u64, space: FxSpace, offset: (i32, i32), ys: &[i32]| {
+        let pal = vec![FxInk::add(0x0010_2030), FxInk::add(0x0030_2010)];
+        let mut l = FxLayer::new(
+            id,
+            Arc::new(FxContent::new(ys.iter().map(|&y| rect(y)).collect(), pal)),
+            FxSlot::Over,
+            space,
+            FxBlend::Exact,
+        );
+        l.offset = offset;
+        l
+    };
+    // Layer 1: Window pixels 10..42, bands 0..=3. Layer 2: Grid rows 50..62
+    // moved up 20, window 36..48, bands 3..=4. Layer 3: Window 70..82, bands
+    // 6..=7.
+    let layers = vec![
+        layer(1, FxSpace::Window, (0, 0), &[10, 30]),
+        layer(2, FxSpace::Grid, (0, -20), &[50]),
+        layer(3, FxSpace::Window, (5, 0), &[70]),
+    ];
+    let handed = |open: &[usize]| {
+        let mut sink = Count(Vec::new());
+        slice_layers(
+            &f,
+            &layers,
+            &[],
+            |_| true,
+            |b| open.contains(&b),
+            &mut FxSlicer::default(),
+            &mut sink,
+        );
+        sink.0
+    };
+    assert_eq!(handed(&[5]), Vec::<u64>::new(), "no layer reaches band 5");
+    assert_eq!(handed(&[0]), vec![1, 1], "only layer 1 reaches band 0");
+    assert_eq!(handed(&[4]), vec![2], "layer 2, moved, reaches band 4");
+    assert_eq!(handed(&[3]), vec![1, 1, 2], "both reach band 3");
+    assert_eq!(handed(&[7]), vec![3], "layer 3 reaches the last band");
+    assert_eq!(
+        handed(&[0, 1, 2, 3, 4, 5, 6, 7]),
+        vec![1, 1, 2, 3],
+        "every band open hands over every item"
+    );
+}
+
 /// OCCLUDERS COMPOSE: three overlapping chrome rects (a banner band, a menu
 /// card, a tab menu) all keep their pixels free of the layer.
 ///
@@ -1515,7 +1699,8 @@ fn fx_mixed_content_draws_nothing() {
 fn fx_bloom_quads_are_law_f() {
     let mut rng = Rng(0xb100_3c0d_5eed_0001);
     let mut scratch = FxScratch::default();
-    let (mut slicer, mut cols, mut quads) = (FxSlicer::default(), Vec::new(), Vec::new());
+    let (mut slicer, mut cols, mut quads) =
+        (FxSlicer::default(), SpriteCols::default(), Vec::new());
     let (mut columns, mut spans) = (0usize, 0usize);
     for case in 0..1500 {
         let f = frame(&mut rng);
@@ -1706,4 +1891,91 @@ fn fx_art_budget_refuses_past_the_frame_total() {
     );
     assert!(painted(&px, 16), "CONTROL: the refused art draws alone");
     assert_eq!(scratch.slicer.budget().refused_items(), 0);
+}
+
+/// ONE RULING PER SET OF CONTENTS: the frame art budget walks its layers
+/// only when their contents (by identity), slots or blends differ from the
+/// last ruling's, so a frame's passes and a card at rest rule once; and a
+/// changed set is ruled afresh, so a ruling is never another frame's.
+///
+/// CONTROLS (mutations run by hand, then restored): a memo that compares the
+/// layer count alone keeps the over-budget ruling for the fitting set and
+/// fails "ruled afresh"; one that ignores the blend keeps the Exact ruling
+/// for the Linear layer and fails "a blend's change".
+#[test]
+fn the_budget_rules_once_per_set_of_contents() {
+    use aterm_core::render::{FX_ART_MAX_SIDE, FX_FRAME_ART_TEXELS};
+    let (aw, ah) = (FX_ART_MAX_SIDE, FX_ART_MAX_SIDE / 2);
+    assert_eq!(
+        3 * u64::from(aw) * u64::from(ah),
+        FX_FRAME_ART_TEXELS + FX_FRAME_ART_TEXELS / 2,
+        "two arts fill the budget, and a third passes it"
+    );
+    let index = |k: u8| {
+        let n = usize::from(aw) * usize::from(ah);
+        Arc::new(FxArt::new(aw, ah, FxTexels::Index8, vec![k; n]).expect("sized"))
+    };
+    let (a, b, c) = (index(1), index(2), index(3));
+    let content = |arts: &[&Arc<FxArt>]| {
+        let items = arts
+            .iter()
+            .enumerate()
+            .map(|(i, art)| {
+                FxItem::Sprite(FxSprite {
+                    x: 8 * i as i32,
+                    y: 0,
+                    dw: 6,
+                    dh: 6,
+                    flip_x: false,
+                    art: Arc::clone(art),
+                    ink: 0,
+                    clip: PxRect::EVERYWHERE,
+                })
+            })
+            .collect();
+        let ink = FxInk::over(0x11_22_33, 255);
+        Arc::new(FxContent::new(items, vec![ink; 3]))
+    };
+    let layer = |content: &Arc<FxContent>, slot: FxSlot| {
+        FxLayer::new(
+            1,
+            Arc::clone(content),
+            slot,
+            FxSpace::Window,
+            FxBlend::Exact,
+        )
+    };
+    let (over, fits) = (content(&[&a, &b, &c]), content(&[&a, &b]));
+    let mut budget = FxBudget::default();
+    let mut rule = |layers: &[FxLayer]| {
+        crate::test_counters::take_budget_rulings();
+        budget.rule(layers);
+        (
+            crate::test_counters::take_budget_rulings(),
+            budget.refused_items(),
+        )
+    };
+    let under = |c: &Arc<FxContent>| vec![layer(c, FxSlot::Under)];
+    assert_eq!(rule(&under(&over)), (1, 1), "the third art is refused");
+    assert_eq!(rule(&under(&over)), (0, 1), "the same content keeps it");
+    assert_eq!(rule(&under(&fits)), (1, 0), "ruled afresh: nothing refused");
+    assert_eq!(rule(&under(&over)), (1, 1), "and back");
+    assert_eq!(
+        rule(&[layer(&over, FxSlot::Over)]),
+        (1, 1),
+        "a slot's change is ruled afresh"
+    );
+    // A Linear layer draws none of its Exact content (fail closed): its
+    // sprites are not the budget's.
+    let mut linear = layer(&over, FxSlot::Over);
+    linear.blend = FxBlend::Linear;
+    assert_eq!(rule(&[linear]), (1, 0), "a blend's change is ruled afresh");
+    // A copy of the content is another identity, ruled again.
+    let copy = Arc::new(FxContent::new(
+        over.items().to_vec(),
+        over.palette().to_vec(),
+    ));
+    assert_eq!(rule(&under(&copy)), (1, 1), "an equal copy is ruled afresh");
+    assert_eq!(rule(&[]), (1, 0), "no layers: nothing refused");
+    assert_eq!(rule(&[]), (0, 0), "and kept");
 }

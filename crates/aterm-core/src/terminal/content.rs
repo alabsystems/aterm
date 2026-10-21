@@ -201,10 +201,6 @@ fn push_visible_row_text(
 }
 
 impl Terminal {
-    // =========================================================================
-    // Trigger evaluation helpers
-    // =========================================================================
-
     /// Get visible content as string (for debugging/testing).
     #[must_use]
     pub fn visible_content(&self) -> String {
@@ -371,10 +367,6 @@ impl Terminal {
         i32::try_from(terminal_row).ok()
     }
 
-    // ========================================================================
-    // Smart Selection API
-    // ========================================================================
-
     /// How wide the grid writes an East Asian Ambiguous character (`→`, `─`,
     /// `°`): the `ambiguous_width` policy. Every text measurer that maps text
     /// back to grid columns (a scrollback copy) measures under it, so its
@@ -394,23 +386,12 @@ impl Terminal {
         }
     }
 
-    /// Smart word boundaries at a position on a display-relative row.
-    ///
-    /// Context-aware rules find semantic units (URLs, file paths, email
-    /// addresses, git hashes, quoted strings), falling back to plain word
-    /// boundaries. Reads scrollback when the viewport is scrolled back. `row`
-    /// is display-relative (0 is the viewport's top). Returns `(start_col,
-    /// end_col)`, or `None` on whitespace or out of bounds.
-    ///
-    /// The row is read with the cells it is drawn in, as far as they draw it
-    /// ([`written_line_cells`](Self::written_line_cells): a live row's cells,
-    /// a ring-tier history row's own cells, a row past the ring as its stored
-    /// line lays it out) and the word mapped through them
-    /// ([`smart_word_in_cells`](super::smart_word_in_cells)), as the desktop
-    /// double-click maps it: a walk of the row's text pairs two flag halves
-    /// the grid drew apart into one, and put the word or link under a cell
-    /// two cells left of where it is drawn (ruling 2026-10-11, r16
-    /// selection-stride; the ring tier's rows by its review).
+    /// Smart word boundaries `(start_col, end_col)` at `(row, col)` on a
+    /// display-relative row (`0` = viewport top), matching URLs, file paths,
+    /// emails, git hashes, and quoted strings before falling back to word
+    /// boundaries. Maps through [`written_line_cells`](Self::written_line_cells)
+    /// and [`smart_word_in_cells`](super::smart_word_in_cells) so wide/emoji
+    /// cells align with drawn columns.
     #[must_use]
     pub fn smart_word_at(
         &self,
@@ -422,13 +403,8 @@ impl Terminal {
             .map(|(_, start, end)| (start, end))
     }
 
-    /// [`smart_word_at`](Self::smart_word_at) with the word's text:
-    /// `(word, start_col, end_col)`, the text read from the same cells the
-    /// columns name. A host that shows or opens the word (a web host's link
-    /// under the pointer) takes it from here rather than slicing the row's
-    /// text by columns, which counted one column a character and so read the
-    /// wrong characters after any wide one (ruling 2026-10-11, r16
-    /// selection-stride).
+    /// [`smart_word_at`](Self::smart_word_at) returning `(word, start_col, end_col)`
+    /// extracted from the drawn cells.
     #[must_use]
     pub fn smart_word_text_at(
         &self,
@@ -445,12 +421,6 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use crate::terminal::Terminal;
-
-    // ---- Stale CellExtras cleanup on overwrite ------------------------------
-    //
-    // Through the VT byte stream: extras-bearing cells (hyperlink, combining
-    // marks) overwritten by plain text leave no entry in the extras map and no
-    // stale data for a later styled write on the same coordinate.
 
     #[test]
     fn plain_overwrite_removes_stale_hyperlink_extras_entries() {
@@ -515,8 +485,6 @@ mod tests {
         );
     }
 
-    // ---- display_row_text across the history/live boundary ------------------
-
     /// display_row_text returns exactly what each display row shows when the
     /// viewport straddles the history/live boundary (live rows are not
     /// shifted again by display_offset).
@@ -579,8 +547,6 @@ mod tests {
             "the live accent row keeps its combining mark while straddling"
         );
     }
-
-    // ---- display_cell_grapheme (display-relative single-cell reads) ---------
 
     /// The display-relative cell reader tracks the scroll position like
     /// display_row_text (row 0 is the top displayed row), and equals

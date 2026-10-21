@@ -14,7 +14,7 @@ use super::{
     fixed::F2Dot14,
     font::{HintFont, OutlineGlyph},
     hint::hint_outline,
-    metrics::{Scale, ScaleFlags, UnscaledStyleMetricsSet, pix_round},
+    metrics::{Scale, ScaleFlags, UnscaledStyleMetricsSet, pix_round, scale_fits},
     outline::Outline,
     shape::Shaper,
     style::GlyphStyleMap,
@@ -50,6 +50,13 @@ impl Instance {
         glyph: &OutlineGlyph,
         pen: &mut impl OutlineSink,
     ) -> Result<(), DrawError> {
+        let units_per_em = font.units_per_em();
+        // The face here is the one the caller hands this draw, which may not
+        // be the one the instance was built from: the scale bound is held
+        // where the scale is made.
+        if !scale_fits(ppem, units_per_em) {
+            return Err(DrawError::ScaleOutOfRange);
+        }
         let glyph_id = match glyph {
             OutlineGlyph::Glyf(outline) => GlyphId::from(outline.glyph_id),
             OutlineGlyph::Cff(glyph_id) => *glyph_id,
@@ -62,7 +69,6 @@ impl Instance {
             .metrics
             .get(font, coords, &self.styles, glyph_id)
             .ok_or(DrawError::GlyphNotFound)?;
-        let units_per_em = font.units_per_em();
         let scale = Scale::new(
             ppem,
             units_per_em,

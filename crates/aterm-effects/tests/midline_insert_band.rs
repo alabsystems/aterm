@@ -3,10 +3,13 @@
 
 //! Typing inside a lit line keeps the tail it pushes lit.
 //!
-//! The take: a line typed at 12 cps, the caret walked back into it with ←
-//! (the host stamps a navigation key: `clear_typed`, then `note_motion`), a
-//! rest, then six keys typed inside the line. Every key is an insert: the
-//! program rewrites the rest of the line one column on.
+//! The take: a line typed at 12 cps, the caret walked back into it with ← (stamped as the host
+//! stamps a navigation key: `clear_typed_keeping_hand`, then `note_motion`), a rest, then six keys
+//! typed inside the line, each an insert the program answers by rewriting the rest of the line
+//! one column on. The shift pass (`Witness::shift_runs`, `Ribbon::shift_run`, run by
+//! `Engine::follow_rows` before the tick) finds the tail's glyphs where the insert pushed them and
+//! moves their light with them, clocks intact; a key a hidden-caret composer reports at the
+//! print's end is laid at the insert it made (`Ribbon::insert_landing`).
 //!
 //! The shift pass (`Witness::shift_runs`, `Ribbon::shift_run`, run by
 //! `Engine::follow_rows` before the tick) finds the tail's glyphs where the
@@ -33,7 +36,7 @@ const CW: usize = 8;
 const CH: usize = 16;
 const ROWS: usize = 60;
 const COLS: usize = 140;
-/// 12 cps, the owner's pace.
+/// 12 cps.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
 /// The Ink-shaped composer's pause between a redraw's two reads.
@@ -59,8 +62,7 @@ enum Shape {
     /// The same frame torn after `?2026h ?25l`: the hold capped, the rest
     /// a read later.
     ClaudeTorn,
-    /// A shell completing at a visible caret: the glyphs printed where the
-    /// caret stands, no hide.
+    /// readline at a visible caret: the edit column on reprinted, then `CUB` back to the caret.
     Visible,
 }
 
@@ -139,9 +141,9 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// Exactly the render path: the frame hold's caret row and every ribbon
-    /// row whether or not the caret is visible, the print anchor fed just
-    /// before the tick (`app_render.rs`), the tick, then the census.
+    /// The render path: the frame hold's caret row and every ribbon row whether or not the caret
+    /// is visible, the print anchor fed just before the tick (`app_render.rs`), the tick, then
+    /// the census.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
@@ -430,9 +432,8 @@ fn dark_text_cols(h: &Host, i: usize) -> Vec<usize> {
 /// (prefix, keys, and the pushed tail) with no hole.
 #[test]
 fn typing_inside_a_lit_line_keeps_the_tail_it_pushes_lit() {
-    // Each take replays on its own host and clock, so the 36 run on the
-    // binary's threads (`par_map`);
-    // the first failing take in this order raises its own panic.
+    // The 36 takes replay on their own hosts and clocks on the binary's threads (`par_map`); the
+    // first failing take in this order raises its panic.
     let takes: Vec<(Shape, usize, u64)> = SHAPES
         .into_iter()
         .flat_map(|shape| {

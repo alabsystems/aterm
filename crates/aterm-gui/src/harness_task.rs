@@ -70,17 +70,40 @@ use crate::harness_glass::EndFace;
 pub(crate) const SELF_CLAIM_LANDED: &str = aterm_agent::harness::acts::RULE_LANDED;
 
 /// THE FACE A PROVEN SELF-CLAIM'S ACT `act` TELLS (FOREVER LAND §10.4):
-/// [`TaskFace::Landed`] for its landing ([`SELF_CLAIM_LANDED`]), and
+/// [`TaskFace::Landed`] for its landing ([`SELF_CLAIM_LANDED`]),
+/// [`TaskFace::Theirs`] for a point it left to a person's own exchange
+/// (`left-to-person@v1`, aterm's own loop's `LEFT` rule: recorded, never
+/// typed, as aterm's loop tells `theirs` there), none for its re-exec onto a
+/// new build (`upgrade@v1`: the same conversation resumed, a landing carried
+/// across, the one act it records at rest after a landing), and
 /// [`TaskFace::Open`] for any other act it records — a continuation, a land
-/// act, an answer, an approval: whoever acted after a landing reopened the
-/// work. `finished@v1` (an older codex-alab's token act) is no landing.
+/// act, an answer, an approval, a resume after a wall: each types into a
+/// turn, and whoever acted after a landing reopened the work. `finished@v1`
+/// (an older codex-alab's token act) is no landing.
 #[must_use]
-pub(crate) fn self_claim_act_face(act: &str) -> TaskFace {
+pub(crate) fn self_claim_act_face(act: &str) -> Option<TaskFace> {
     if act == SELF_CLAIM_LANDED {
-        TaskFace::Landed
+        Some(TaskFace::Landed)
+    } else if act == aterm_agent::supervise::policy::turn_end::RULE_LEFT {
+        Some(TaskFace::Theirs)
+    } else if act == aterm_agent::harness::acts::RULE_UPGRADE {
+        None
     } else {
-        TaskFace::Open
+        Some(TaskFace::Open)
     }
+}
+
+/// A FACE THAT STANDS UNTIL SOMEONE ELSE'S TURN, as a proven self-claim tells
+/// it: its landing ([`TaskFace::Landed`]), and a point it left to a person's
+/// own exchange ([`TaskFace::Theirs`]). Its holder types nothing at either
+/// until a turn it did not type, so the act is marked with the session's
+/// counts of turns begun (`session_timeline::LandingMark`) and a turn begun
+/// past them opens the task again ([`App::reopen_self_claim_landing`]), as
+/// aterm's own loop reads `open` once a turn it did not start is read after
+/// either (`TaskFace::of`, rule 1).
+#[must_use]
+pub(crate) fn holds_until_another_turn(face: TaskFace) -> bool {
+    matches!(face, TaskFace::Landed | TaskFace::Theirs)
 }
 
 /// THE WORK FLOOR OF AN END (§11.2.3, items 1 and 3): a landing marks the
@@ -172,13 +195,20 @@ impl App {
             }
             (was, timeline.task_face().map_or(stamp_ms, |(_, at)| at))
         };
+        // What the tab's hover and the menu bar say of the face, read off
+        // the glass before it moves (§12.4.3, item 1): both are composed
+        // away from the frame, so a move must stamp them again.
+        let hover_was = self.driven_by_aterm(session);
+        let landed_was = self.chip_face_landed(session);
         // An unseen end a move to open or theirs clears takes its `•` with
         // it (§11.2.3, item 4).
         let stood = self.end_unseen(session);
-        if crate::harness_glass::on_task(self, session, face, at_ms) {
+        let moved = crate::harness_glass::on_task(self, session, face, at_ms);
+        if moved {
             crate::claude_footer::post_changed(session);
         }
-        if stood && !self.end_unseen(session) {
+        let cleared = stood && !self.end_unseen(session);
+        if cleared {
             self.restamp_for_end();
         }
         // The A/B book's cause may have moved with the face (landed, at the
@@ -186,8 +216,25 @@ impl App {
         self.note_harness_arm(session);
         // Past the glass: the one end decided, the page republished, and a
         // landing under Land recorded (§9.4.4).
+        let unseen_before_end = self.end_unseen(session);
         let was = was.or(floor);
         self.harness_task_moved(session, was, face);
+        // THE HOVER FOLLOWS THE FACE (§12.3.3 item 3, §12.4.3 item 1): where
+        // the words `driven by aterm (…)` moved (`(land)` to `(land,
+        // landed)`, with no end told under the floor too), the windows that
+        // show the session are stamped again; where only whether it landed
+        // moved (a hover that names no driver), the menu bar's This Mac is
+        // dirtied. Not where every strip was just stamped for an end: one
+        // cleared above, or one told unseen now (`note_harness_end` stamps
+        // every strip for it).
+        let end_restamped = cleared || (self.end_unseen(session) && !unseen_before_end);
+        if moved && !end_restamped {
+            if self.driven_by_aterm(session) != hover_was {
+                self.restamp_for_hover(session);
+            } else if self.chip_face_landed(session) != landed_was {
+                self.mark_status_dirty();
+            }
+        }
         // THE TASK OPENED (§11.2.3, item 2): a move from a face the window
         // knew to open or landed zeroes the work, after the end has read it
         // — never one from "unknown", a loop's restatement (the landed
@@ -199,31 +246,69 @@ impl App {
         }
     }
 
-    /// SOMEONE BEGAN A TURN on session `session` (the status sweep read its
-    /// agent busy, or its program's own report began a turn): a proven
-    /// self-claim's landing is reopened (FOREVER LAND §10.4). Its holder types
-    /// nothing after its landing until someone else's turn, so the turn is
-    /// someone else's — a person's prompt, a driver's — and the work is open
-    /// again, as aterm's own loop opens its face at the first live read of
-    /// another's turn. Nothing for any other face or claim.
+    /// A TURN BEGUN SINCE A PROVEN SELF-CLAIM'S LANDING on session `session`
+    /// reopens it (FOREVER LAND §10.4). Its holder types nothing after its
+    /// landing until someone else's turn, so the turn is someone else's — a
+    /// person's prompt, a driver's — and the work is open again, as aterm's
+    /// own loop opens its face at the first live read of another's turn.
+    ///
+    /// BEGUN SINCE, never "running now": the landing's mark
+    /// ([`crate::session_timeline::LandingMark`], taken as the `landed@v1`
+    /// act arrived) holds the session's counts of turns begun, and one of
+    /// them past it is a turn begun after the landing — the program's own
+    /// (OSC 7501, counted by the engine as each report is parsed, read here as
+    /// the last sweep read it: `StatusObserver::program_turns`) or the
+    /// screen's (`AgentPublication::busy_entries`). So a turn that began and
+    /// ended between two sweeps reopens it at the next, whatever the report
+    /// standing then says, and neither the landing turn's own reports, a
+    /// report written again after a handoff, nor a stretch of work that ran
+    /// on through the landing (codex-alab reports `working` while background
+    /// work runs) does. A landing with no mark (none recorded in this window)
+    /// reads every turn the session has counted as after it. Nothing for any
+    /// other face or claim. Called by the status sweep for a session whose
+    /// counts may have moved, and as the landing's face is applied (a turn
+    /// the sweep counted between the act and its face).
+    ///
+    /// A POINT LEFT TO A PERSON reopens the same way
+    /// ([`holds_until_another_turn`]): its `left-to-person@v1` is marked as a
+    /// landing is, and their next turn — "now implement it", a job of twenty
+    /// minutes — is a turn begun past the mark, so the face reads `open` from
+    /// its first counted report, as aterm's own loop reads `open` once it
+    /// reads a turn it did not start, never `theirs` for the whole job until
+    /// the holder's next act.
+    ///
+    /// WHAT THE PROGRAM'S COUNT CANNOT TELL: its report claims work, not
+    /// turns. codex-alab reports `working` while it starts its MCP servers —
+    /// at its launch, a `resume`, an in-TUI `/resume` or thread switch — with
+    /// no turn running, in the very bytes a person's turn writes (`working`,
+    /// then `idle`), so such a start after a landing reopens it while its
+    /// holder still holds the landing (as a sweep that saw the start running
+    /// did before the count). And a turn begun while its report already reads
+    /// `working` (background work, or an active goal, running on through the
+    /// landing) writes no report, so nothing reopens until the holder's next
+    /// act. Only the holder can tell either apart — an act it recorded at a
+    /// person's turn would reopen the landing at once, as any act but
+    /// `landed@v1` does — and no screen helps: aterm reads no Codex screen.
     pub(crate) fn reopen_self_claim_landing(&mut self, session: u64) {
         let Some(entry) = self.pool.get(session) else {
             return;
         };
-        let (landed, busy) = {
+        let (holds, busy_entries, mark) = {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
-                timeline.task_face().map(|(f, _)| f) == Some(TaskFace::Landed),
-                timeline.agent().word == "busy",
+                timeline
+                    .task_face()
+                    .is_some_and(|(f, _)| holds_until_another_turn(f)),
+                timeline.agent().busy_entries,
+                timeline.landing_mark().unwrap_or_default(),
             )
         };
-        let working = self
-            .session_status
-            .program_state(session)
-            .is_some_and(|(s, _)| {
-                s.state == aterm_core::terminal::program_state::ProgramStateWord::Working
-            });
-        if landed && (busy || working) && self.beside_proven_self_claim(session) {
+        if !holds {
+            return;
+        }
+        let begun = self.session_status.program_turns(session) > mark.program_turns
+            || busy_entries > mark.busy_entries;
+        if begun && self.beside_proven_self_claim(session) {
             self.apply_task_face(session, Some(TaskFace::Open), None, None);
         }
     }
@@ -279,7 +364,9 @@ impl App {
     /// end is decided first ([`Self::note_harness_end`]). A landing under
     /// Land is counted in the A/B book and recorded ([`is_an_end`]: once an
     /// end, by the face it moved from; the count first, so the republish
-    /// reads it), and the page is republished where a view shows it.
+    /// reads it), and the page is republished where a view shows it — a
+    /// loop's landing marking its counts `Newer` and owing the re-read
+    /// ([`Self::note_harness_act_for_page`]), as an act does.
     pub(crate) fn harness_task_moved(
         &mut self,
         session: u64,
@@ -294,7 +381,17 @@ impl App {
             let now = crate::turn_ledger::now_ms();
             self.harness_screen.ab.landed(session, now);
         }
-        self.harness_screen_moved();
+        // WHAT THE HARNESS DID, STATUS's today line and the rows' day lines
+        // count landings from the reading (§12.4.3, item 3), and a landing
+        // reaches the window as this face, never as an act: a loop's landing
+        // told while the page is on screen marks the counts `Newer` and owes
+        // the re-read, as an act does. A codex-alab's own landing is in no
+        // ledger the reading reads, so it moves the A/B book alone.
+        if end.is_some() && !self.beside_proven_self_claim(session) {
+            self.note_harness_act_for_page(std::time::Instant::now(), true);
+        } else {
+            self.harness_screen_moved();
+        }
         let Some(face) = end else {
             return;
         };
@@ -408,3 +505,11 @@ mod tests;
 #[cfg(test)]
 #[path = "harness_end_tests.rs"]
 mod end_tests;
+
+#[cfg(test)]
+#[path = "landed_words_tests.rs"]
+mod landed_words_tests;
+
+#[cfg(test)]
+#[path = "harness_task_reopen_tests.rs"]
+mod reopen_tests;

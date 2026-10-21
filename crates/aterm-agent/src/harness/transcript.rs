@@ -49,8 +49,8 @@ const USAGE: Shape = Shape::Object(&[
     ),
 ]);
 
-/// A message's token classes, read by the session usage ([`USAGE`]) and
-/// step ([`STEPS`]) folds.
+/// A message's `usage` as the spend fold reads it ([`USAGE`]) and the step
+/// fold counts a vendor turn's tokens from it ([`STEPS`]).
 const MESSAGE_USAGE: Shape = Shape::Object(&[
     ("input_tokens", Shape::Scalar),
     ("output_tokens", Shape::Scalar),
@@ -64,6 +64,23 @@ const MESSAGE_USAGE: Shape = Shape::Object(&[
             ("ephemeral_5m_input_tokens", Shape::Scalar),
             ("ephemeral_1h_input_tokens", Shape::Scalar),
         ]),
+    ),
+    // What the price table does not price, so the spend
+    // fold counts the message as approximate
+    // (`spend::approx`): fast mode, US-only inference,
+    // web search, a tier other than the standard one, any
+    // iteration but a plain message — an advisor's, a
+    // server-side fallback's (each entry's `type` only).
+    ("speed", Shape::Scalar),
+    ("inference_geo", Shape::Scalar),
+    ("service_tier", Shape::Scalar),
+    (
+        "server_tool_use",
+        Shape::Object(&[("web_search_requests", Shape::Scalar)]),
+    ),
+    (
+        "iterations",
+        Shape::Seq(&Shape::Object(&[("type", Shape::Scalar)])),
     ),
 ]);
 
@@ -143,14 +160,13 @@ const QUOTA_LIMITS: Shape = Shape::Object(&[
 ]);
 const CONVERSATION: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
-    // `null` on a conversation's first row: the supervisor's wall check
-    // reads a first prompt written after the rows that answer it
-    // (`supervise/wall_confirm.rs`).
+    // `null` on a conversation's first row; read by `supervise/wall_confirm.rs`.
     ("parentUuid", Shape::Scalar),
-    // The row's own id: a usage limit's notice confirmed is remembered by
-    // it, so only a reply written after THAT row ends the wait on it
-    // (`supervise/wall_confirm.rs`'s `served_since_notice`).
+    // A confirmed limit notice is remembered by its row id; only a reply after that row ends the
+    // wait (`supervise/wall_confirm.rs`'s `served_since_notice`).
     ("uuid", Shape::Scalar),
+    // The same tail names the conversation that owns a limit notice.
+    ("sessionId", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
     ("isMeta", Shape::Scalar),
     ("isCompactSummary", Shape::Scalar),

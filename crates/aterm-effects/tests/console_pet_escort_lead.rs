@@ -1,21 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ESCORT STAYS OFF WHAT YOU JUST TYPED — measured on a real `Terminal`.
+//! The escort stays off what was just typed, measured on a real `Terminal`.
 //!
-//! Typing bursts with pauses — three runs of "hello world this is a test "
-//! at a steady key cadence, one frame per 16 ms, the host's ink seam fed
-//! every frame, the first burst waking a cat asleep at the prompt. The oracle
-//! reads the DRAWN body (`PetFrame::body_px`) against an independent
-//! `PetWorld`, so it never asks the brain what it decided: frames whose body
-//! covers a glyph typed on the caret's row, how far the body trails the
-//! caret on the ground, its largest step between two grounded frames, how
-//! often it turns round, and any contact brace.
-//!
-//! Before the rework, at 62 / 100 / 150 ms a key: 30.9 / 19.8 / 9.8 % of
-//! the frames covered typed glyphs, the body trailed by up to 4.7 cells,
-//! turned round 1.00 / 0.72 / 0.56 times a second, and the first key braced
-//! it for nine frames a run.
+//! Three typing bursts with pauses at a steady key cadence, one frame per 16 ms, the host's ink
+//! seam fed every frame, the first burst waking a cat asleep at the prompt. The oracle reads the
+//! drawn body (`PetFrame::body_px`) against an independent `PetWorld`, never the brain's
+//! decisions: frames covering a glyph typed on the caret's row, how far the body trails the
+//! caret on the ground, its largest grounded step, how often it turns round, and any brace.
 
 use std::time::{Duration, Instant};
 
@@ -138,8 +130,8 @@ struct Feel {
     /// Frames whose caret leaves the escort room on its right.
     free: usize,
     covering: usize,
-    /// …and frames covering at the WALL, where the stand crosses to the
-    /// caret's left over the line by design — reported, not judged.
+    /// Covering frames at the wall, where the stand crosses to the caret's left by design:
+    /// reported, not judged.
     wall_covering: usize,
     max_cover: usize,
     max_trail: f32,
@@ -158,9 +150,9 @@ impl Feel {
         self.flips as f32 / self.secs
     }
 
-    /// The oracle over a run of frames. Coverage and trail are judged only
-    /// where the escort's station fits on the caret's RIGHT (at the wall it
-    /// crosses to the left over the line by design), trail never in the air.
+    /// The oracle over a run of frames. Coverage and trail are judged only where the escort's
+    /// station fits on the caret's right (at the wall it crosses to the left by design); trail
+    /// never in the air.
     fn judge(seen: &[Seen]) -> Self {
         let width = art_cols(CELL_W, CELL_H);
         let mut m = Self {
@@ -221,8 +213,7 @@ fn run(ms_per_key: u64, pause_ms: u64) -> Vec<Seen> {
         seen.push(s);
     };
     for _ in 0..3 {
-        // Keys on their own clock, frames on theirs: key `k` of the burst is
-        // due at `k · ms_per_key`, and lands before the first frame past it.
+        // Key `k` of the burst is due at `k · ms_per_key` and lands before the first frame past it.
         let mut clock = 0;
         for (k, &ch) in WORDS.concat().iter().enumerate() {
             f.key(ch);
@@ -238,10 +229,8 @@ fn run(ms_per_key: u64, pause_ms: u64) -> Vec<Seen> {
     seen
 }
 
-/// `(ms per key, pause ms, covering % ceiling, flips/s ceiling)`. The flip
-/// ceilings are this fixture's measurement before the escort was reworked
-/// (1.00 / 0.72 / 0.56 per second, the settle-turn and the walk home
-/// included): the rework may not turn the cat round more often than that.
+/// `(ms per key, pause ms, covering % ceiling, flips/s ceiling)`. The flip ceilings are this
+/// fixture's measured baseline, settle-turn and walk home included.
 const CADENCES: [(u64, u64, f32, f32); 3] = [
     (62, 1000, 10.0, 1.00),
     (100, 1000, 5.0, 0.72),

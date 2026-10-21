@@ -73,6 +73,17 @@ pub fn getppid() -> i32 {
     unsafe { libc::getppid() }
 }
 
+/// The kernel session containing a live process, when it can be read.
+#[must_use]
+pub fn session_id(pid: i32) -> Option<i32> {
+    if pid <= 1 {
+        return None;
+    }
+    // SAFETY: getsid only reads the kernel record for a positive process id.
+    let sid = unsafe { libc::getsid(pid) };
+    (sid >= 0).then_some(sid)
+}
+
 /// This process's user id.
 #[must_use]
 pub fn getuid() -> u32 {
@@ -1748,6 +1759,182 @@ pub fn evict_pages(path: &std::path::Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Read the byte of a named shared-memory canary created by the probe's parent.
+/// The parent keeps it sized and unchanged until the child has exited. This
+/// opens it read-only by name, then maps it read-only: an inherited descriptor
+/// cannot bypass the policy being tested.
+///
+/// # Errors
+/// Open/map/read refusal, an empty object, or a byte other than the canary.
+#[cfg(test)]
+pub fn read_named_shm(name: &str) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mode: libc::c_uint = 0o600;
+    // SAFETY: a valid name and the correctly promoted variadic mode argument.
+    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = std::fs::File::from(own_fd(fd));
+    if file.metadata()?.len() == 0 {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+    }
+    // SAFETY: a fresh read-only mapping of one byte of the retained, sized
+    // object. No writable mapping or resize is active in the parent.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            1,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful one-byte mapping is still live; volatile loads
+    // read this externally backed memory without creating a Rust reference.
+    let byte = unsafe { addr.cast::<u8>().read_volatile() };
+    // SAFETY: exactly the one mapping made above, unmapped once.
+    if unsafe { libc::munmap(addr, 1) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if byte != 0x5a {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    Ok(())
+}
+
+/// An exclusively created named canary. Only the test parent creates/writes
+/// these; children use [`read_named_shm`]. A name stays until confirmed child
+/// EOF; the parent retains this whole owner if the kernel has not confirmed it.
+#[cfg(test)]
+pub struct NamedShm {
+    name: CString,
+    fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(test)]
+impl NamedShm {
+    /// Create one random, mode-0600 canary under `prefix` without replacing a
+    /// collision. The writable mapping is gone before this function returns.
+    ///
+    /// # Errors
+    /// No entropy, a name collision, or an OS create/size/map refusal.
+    pub fn create(prefix: &str) -> io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let mut entropy = [0u8; 8];
+        aterm_uds::rand::fill(&mut entropy)?;
+        let name = CString::new(format!(
+            "{prefix}{:012x}",
+            u64::from_ne_bytes(entropy) >> 16
+        ))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: the valid name and unsigned-int mode match shm_open's
+        // variadic ABI. O_EXCL establishes custody before any cleanup exists.
+        let mode: libc::c_uint = 0o600;
+        let fd = unsafe {
+            libc::shm_open(
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                mode,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owner = Self {
+            name,
+            fd: own_fd(fd),
+        };
+        // SAFETY: our exclusively owned descriptor; no writable alias is
+        // handed to the child, by either exec inheritance or spawnfd custody.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let meta = std::fs::File::from(owner.fd.try_clone()?).metadata()?;
+        if meta.mode() & 0o777 != 0o600 || meta.uid() != getuid() {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        // SAFETY: size this exclusively owned writable object once.
+        if unsafe { libc::ftruncate(fd, 1) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh one-byte writable mapping of the sized object.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                1,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                owner.fd.as_raw_fd(),
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: our fresh writable mapping, touched only before any reader.
+        unsafe { addr.cast::<u8>().write_volatile(0x5a) };
+        // SAFETY: exactly the one mapping above, never used again.
+        if unsafe { libc::munmap(addr, 1) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(owner)
+    }
+
+    /// The exact spelling used to create it, including an optional slash.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.name
+            .to_str()
+            .expect("a prefix and hexadecimal entropy")
+    }
+}
+
+#[cfg(test)]
+impl Drop for NamedShm {
+    fn drop(&mut self) {
+        // SAFETY: only a successfully O_EXCL-created name reaches here.
+        unsafe { libc::shm_unlink(self.name.as_ptr()) };
+    }
+}
+
+/// Ask the kernel about this process's preferences policy, without contacting
+/// a service or loading a preference. `scope` is global/local Mach or the
+/// domain-independent user-preference-read operation.
+///
+/// # Errors
+/// An invalid query or no policy answer.
+pub fn preference_policy(scope: &str, name: &str) -> io::Result<bool> {
+    let (op, kind) = match scope {
+        "global" => (c"mach-lookup", 2),
+        "local" => (c"mach-lookup", 3),
+        "read" => (c"user-preference-read", 0),
+        _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+    };
+    let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: the constant and C strings are valid. This is only a policy
+    // query for our own process, with no service lookup or preference access.
+    let rc = unsafe {
+        sandbox_check(
+            std::process::id().cast_signed(),
+            op.as_ptr(),
+            kind | SANDBOX_CHECK_NO_REPORT,
+            name.as_ptr(),
+        )
+    };
+    match rc {
+        0 => Ok(true),
+        n if n > 0 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 
 /// The pids of every live process of this user in the jail that carries

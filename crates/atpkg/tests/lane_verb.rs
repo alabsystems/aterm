@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm pkg lane`, run as a PROCESS the way a guard the owner wires calls it
-//! (review of 2026-09-27): a hook payload on stdin, `lane --json
+//! `aterm pkg lane`, run as a process the way a wired guard calls it:
+//! a hook payload on stdin, `lane --json
 //! tool_input.command`, the answer in the exit code — 0 let through, 2 refused, 1
 //! unreadable — and on stderr.
 //!
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 /// The directories of the guard's own cases, as files on disk: a trust checkout's
-/// `stage0/bin` (the Trust names of the one measured 2026-09-28, and no `rustdoc`),
+/// `stage0/bin` (Trust binary names, with no `rustdoc`),
 /// a Trust toolchain under `~/`, and rustup's stock 1.97.1 under `~/`.
 struct Fixture {
     root: aterm_tempfile::TempDir,

@@ -166,6 +166,14 @@ impl ToneTracker {
         self.buf.clear();
     }
 
+    /// Serious Mode's drain: clear the partial typing window and any owed
+    /// re-inference while keeping the cached tone, throttle timestamp, and
+    /// warmed-up scratch buffers intact. Idempotent.
+    pub fn drain_serious(&mut self) {
+        self.buf.clear();
+        self.infer_pending = false;
+    }
+
     /// Run the classifier over the window and cache the verdict. A missing or
     /// corrupt weight asset degrades to Technical.
     fn infer(&mut self, now: Instant) {
@@ -343,5 +351,22 @@ mod tests {
             Tone::Technical,
             "the re-enabled window carries only post-break text"
         );
+    }
+
+    #[test]
+    fn drain_serious_clears_the_window_and_pending_inference_while_keeping_cached_tone() {
+        let mut t = ToneTracker::default();
+        let now = Instant::now();
+        feed(&mut t, now, 1, "why is this broken again ugh");
+        assert_eq!(t.current(), Tone::Frustrated);
+        let inferences_before = t.inferences;
+        t.note_char(now + Duration::from_secs(1), 1, '!', true);
+        assert!(t.infer_pending && t.window_chars() > 0);
+        t.drain_serious();
+        assert_eq!(t.window_chars(), 0);
+        assert!(!t.infer_pending);
+        t.drain_pending_inference(now + Duration::from_secs(1));
+        assert_eq!(t.inferences, inferences_before);
+        assert_eq!(t.current(), Tone::Frustrated);
     }
 }

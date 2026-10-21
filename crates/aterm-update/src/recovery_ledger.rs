@@ -1,37 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RECOVERY LEDGER — how each run of the installed app ended. The product half of
-//! the PTY keeper's P0 census (`docs/DESIGN-pty-keeper-2026-09-26.md` §7).
+//! Recovery ledger — records how each run of the installed app ended.
 //!
-//! WHY IT EXISTS. The keeper design rests on a frequency: how often the daily driver
-//! dies without an exit path, and whether it was wedged or starved of memory when it
-//! did. Clean ends are recorded too, so the count has a denominator.
+//! One row is written per windowed launch of the installed app and per update
+//! successor at its commit. Each row records the launch (pid, birth, build,
+//! version) and classifies the run before it: how it ended ([`EndClass`]), its
+//! build and version, how long it ran ([`Uptime`]), whether the main-thread
+//! watchdog's last word for it was an unended stall ([`Tri`]), the last
+//! memory-pressure level the OS reported ([`Pressure`]), and how many launches
+//! the updater's boot trial had counted against its build. `aterm doctor`
+//! summarizes the ledger via [`doctor_lines`].
 //!
-//! WHAT A ROW IS. One per windowed launch of the installed app, and one per update
-//! successor at its Commit. A row records the launch itself (pid, birth, build,
-//! version) and classifies the run before it: how it ended ([`EndClass`]), its build
-//! and version, how long it ran ([`Uptime`]), whether the main-thread watchdog's last
-//! word for it was a stall that never ended ([`Tri`]), the last memory-pressure level
-//! the OS reported to it ([`Pressure`]), and how many launches the updater's boot trial
-//! had counted against its build when the row was written.
-//!
-//! READ-ONLY IN EVERY SENSE BUT THE ONE FILE. Nothing about how aterm runs changes.
-//! The evidence is what already exists when the next launch starts — the crash marker
-//! and the panic report (`aterm-gui`'s `crash_signal` and `logging`), the watchdog's
-//! and the pressure source's lines in `aterm.log`, the boot sentinel — and the only
-//! thing written is this ledger. Nothing reads it to decide anything: `aterm doctor`
-//! summarizes it ([`doctor_lines`]).
-//!
-//! THE FILE: [`LEDGER_FILE_NAME`] in the log directory
-//! ([`aterm_types::dirs::logs_dir`], beside the crash markers it reads), `0600`, one
-//! space-separated `key=value` line per row, newest last, trimmed to the newest
-//! [`KEEP_ROWS`] once it passes [`TRIM_AT_BYTES`]. A line this build cannot parse is
-//! skipped, never fatal: the ledger is observability, not state.
+//! Stored at [`LEDGER_FILE_NAME`] in [`aterm_types::dirs::logs_dir`] (`0600`),
+//! one space-separated `key=value` line per row, newest last, trimmed to the
+//! newest [`KEEP_ROWS`] once it passes [`TRIM_AT_BYTES`]. Unparseable lines are
+//! skipped.
 
 use std::path::{Path, PathBuf};
 
-/// The ledger's file name in the log directory. Deliberately NOT `crash-*.log`: the
+/// The ledger's file name in the log directory. Deliberately not `crash-*.log`: the
 /// crash scan reads every non-empty file of that shape as a crash report.
 pub const LEDGER_FILE_NAME: &str = "recovery-ledger.log";
 
@@ -42,18 +30,16 @@ pub const KEEP_ROWS: usize = 256;
 /// crossed it. A row is about 250 bytes, so this is roughly twice [`KEEP_ROWS`].
 pub const TRIM_AT_BYTES: u64 = 128 * 1024;
 
-/// The most bytes [`read_rows`] reads — the TAIL of an oversized file. A file in the
-/// log directory is not necessarily one aterm wrote (the urandom incident
-/// `aterm-gui`'s `logging::CRASH_HEAD_BYTES` records), so no read is unbounded.
+/// The most bytes [`read_rows`] reads — the tail of an oversized file, so no
+/// read in the log directory is unbounded.
 pub const MAX_READ_BYTES: u64 = 512 * 1024;
 
 /// The format version every row this build writes carries (`v=1`).
 ///
-/// A field added since rides as an OPTIONAL key under the same version
-/// (`started_us=`, `restored=`, …): every reader skips a row whose version is not its
-/// own, so a new version would hide every newer row from an older build — the one a
-/// crash-looping update reverts to, which is the reader that most needs the row of
-/// the run that just died. An older row lacks the key and still parses.
+/// New fields ride as optional keys under the same version (`started_us=`,
+/// `restored=`, …): every reader skips a row whose version is not its own, so a
+/// new version would hide newer rows from an older build that a crash-looping
+/// update reverts to. An older row lacks the key and still parses.
 pub const ROW_VERSION: u32 = 1;
 
 /// The ledger's path in `logs_dir`.
@@ -305,15 +291,10 @@ impl LaunchKind {
     }
 }
 
-/// How a launch's keeper recovery brought its screens back (the crash restore,
-/// `aterm-gui`'s `crash_restore`), with the same fields `status` reports for each recovered
-/// session, summed: written only by a launch a keeper offered at least one session, so the
-/// ledger answers whether real kills restore exactly and, when they do not, what was lost.
-/// The crash-restore plan starts its follow-up work only when the ledger shows the loss it
-/// would close (a gather-stage tail when `in_flight_lost` is common, a disk tier when
-/// history is), so a row that said only the rungs could never trigger any of it. Three
-/// tokens, each optional on its own (an older row has none and still parses; one this build
-/// cannot read refuses the row rather than misread it):
+/// How a launch's keeper recovery brought its screens back (`aterm-gui`'s
+/// `crash_restore`), summing the per-session `status` fields across every
+/// session offered by a keeper. Each token is optional on its own (an older row
+/// lacking a key still parses; a malformed value rejects the row):
 ///
 /// * `restored=<exact>:<screen>:<meta>`: how many sessions came back exactly, as a screen
 ///   with a loss counted, or blank (the META rung);
@@ -321,22 +302,12 @@ impl LaunchKind {
 ///   the PTY bytes read and never processed, the sessions whose tail overflowed, the
 ///   verified marks left in a tail, and the resizes nothing journaled, over every session;
 /// * `restore_why=<word>:<n>,…`: how many sessions each `status restore_why=` word named
-///   (every rung but exact; `-` when every session was exact), in word order.
-///
-/// And a fourth since the history ring (the crash-restore plan's increment 5), optional the
-/// same way, which a build before it ignores as it ignores every key it does not read:
-///
+///   (every rung but exact; `-` when every session was exact), in word order;
 /// * `restore_history=<lines>:<sessions>`: the scrollback lines the restores could not bring
-///   back (each session's first `status history_lost=`), and how many sessions lost any —
-///   the loss a disk tier for the history would close.
-///
-/// And a fifth since the soak gate (`crate::restore_soak`), optional the same way and written
-/// only when it is not 0:
-///
-/// * `restore_refused=<n>`: the sessions a keeper offered that this launch refused and released
-///   (a tag it cannot read, no session id, a reused pid, a descriptor that is not a tty), so
-///   the keeper closed them: lost, and on no rung. A recovery that refused every offer writes
-///   `restored=0:0:0` beside it.
+///   back (each session's first `status history_lost=`), and how many sessions lost any;
+/// * `restore_refused=<n>` (written when non-zero): the sessions a keeper offered that this
+///   launch refused and released (unreadable tag, missing session id, reused pid, or non-tty
+///   fd). A recovery that refused every offer writes `restored=0:0:0` beside it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Restores {
     /// Sessions whose screen came back exactly.
@@ -715,35 +686,58 @@ pub fn parse_rows(text: &str) -> Vec<Row> {
 }
 
 /// The ledger's rows, oldest first; empty when there is no ledger or it cannot be
-/// read. Reads at most [`MAX_READ_BYTES`] — the TAIL of a larger file, from its first
+/// read. Reads at most [`MAX_READ_BYTES`] — the tail of a larger file, from its first
 /// whole line — and only a regular file (never a FIFO, a device or a symlink's target).
 #[must_use]
 pub fn read_rows(path: &Path) -> Vec<Row> {
+    read_text(path)
+        .map(|text| parse_rows(&text))
+        .unwrap_or_default()
+}
+
+/// The doctor's ledger read: a missing ledger is empty history, while an unreadable
+/// file or an unrecognized complete row is missing evidence, not a clean history.
+/// Unlike [`read_rows`], this never silently discards a failed read or malformed row.
+///
+/// # Errors
+/// The read error, or a row this build cannot interpret.
+pub fn read_rows_checked(path: &Path) -> std::io::Result<Vec<Row>> {
+    read_text(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            Row::parse(line)
+                .ok_or_else(|| std::io::Error::other("unrecognized recovery ledger row"))
+        })
+        .collect()
+}
+
+fn read_text(path: &Path) -> std::io::Result<String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return Vec::new();
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(error),
     };
     if !meta.file_type().is_file() {
-        return Vec::new();
+        return Err(std::io::Error::other(
+            "recovery ledger is not a regular file",
+        ));
     }
-    let Ok(mut file) = open_for_read(path) else {
-        return Vec::new();
-    };
+    let mut file = open_for_read(path)?;
     let skip = meta.len().saturating_sub(MAX_READ_BYTES);
-    if skip > 0 && file.seek(SeekFrom::Start(skip)).is_err() {
-        return Vec::new();
+    if skip > 0 {
+        file.seek(SeekFrom::Start(skip))?;
     }
     let mut bytes = Vec::new();
-    if file.take(MAX_READ_BYTES).read_to_end(&mut bytes).is_err() {
-        return Vec::new();
-    }
+    file.take(MAX_READ_BYTES).read_to_end(&mut bytes)?;
     let text = String::from_utf8_lossy(&bytes);
     let text = if skip > 0 {
         text.split_once('\n').map_or("", |(_, rest)| rest)
     } else {
         &text
     };
-    parse_rows(text)
+    Ok(text.to_owned())
 }
 
 /// Open `path` for reading without following a final symlink or blocking on a FIFO.
@@ -829,15 +823,11 @@ fn lock_briefly(file: &std::fs::File) -> Option<LedgerLock<'_>> {
     None
 }
 
-/// A held [`lock_briefly`], released by `LOCK_UN` when it drops rather than by the
-/// close alone (the product fd-hygiene sweep of 2026-09-27). An `flock` lives on the
-/// open file description, and the census appends while the GUI forks shells: a
-/// forked child holds every descriptor until it execs, and `O_CLOEXEC` closes its
-/// copy at the exec, never at the fork (up to ~523 ms under load). Released by the
-/// close alone, the lock lived on in that copy, a rival append ran out of tries, and
-/// its row went unchecked into an inode a trim had just retired. `LOCK_UN` strips the
-/// lock from the description itself, every inherited copy included (pinned by
-/// `a_released_ledger_lock_is_free_while_a_copy_of_its_descriptor_lives`).
+/// A held [`lock_briefly`], released via `LOCK_UN` on drop rather than by
+/// `close` alone: `flock` lives on the open file description, and a child
+/// forked concurrently holds its inherited copy of the descriptor until `exec`
+/// (`O_CLOEXEC` closes at exec, not fork). `LOCK_UN` releases the lock across
+/// every copy of the open file description.
 #[cfg(unix)]
 struct LedgerLock<'a>(&'a std::fs::File);
 
@@ -946,7 +936,7 @@ pub fn summarize(rows: &[Row]) -> Summary {
 
 /// The ledger as the fact of `aterm doctor`'s `recovery:` row — its lines, without
 /// the label, which the row prints once — and whether any recorded run ended
-/// unexpectedly (a NOTE there, never a failure: a past crash is not a reason to
+/// unexpectedly (a note there, never a failure: a past crash is not a reason to
 /// refuse to launch). `rows` is [`read_rows`]'s answer for `path`.
 #[must_use]
 pub fn doctor_lines(rows: &[Row], path: &Path) -> (Vec<String>, bool) {
@@ -1119,13 +1109,12 @@ mod tests {
         assert_eq!(Row::parse(&exact.to_line()), Some(exact));
     }
 
-    /// THE BIRTH TO THE MICROSECOND. A row carries the kernel's birth microseconds
-    /// (`started_us=`) beside its second, round trip, under the same row version; an
-    /// older row without the key still parses (`None`), and one out of range refuses
-    /// the row. With both sides known, a process is the row's only to the microsecond:
-    /// a pid reused within the same second is another process (the negative control
-    /// is the second alone, which cannot tell them apart), while a side that does not
-    /// know its microseconds still matches by the second, as every row did before.
+    /// A row carries the kernel's birth microseconds (`started_us=`) beside its
+    /// second under the same row version; an older row without the key still
+    /// parses (`None`), and an out-of-range value rejects the row. When both
+    /// sides carry microseconds, `is_process` matches to the microsecond so a
+    /// pid reused within the same second does not match; when either side lacks
+    /// microseconds, it matches to the second.
     #[test]
     fn a_row_names_its_process_to_the_microsecond() {
         let mut r = row(1_790_500_000, 4242, prev(EndClass::Clean));
@@ -1375,6 +1364,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn checked_history_distinguishes_absence_and_empty_from_unreadable_or_malformed() {
+        let dir = scratch("checked");
+        let path = ledger_path(&dir);
+        assert!(
+            read_rows_checked(&path).unwrap().is_empty(),
+            "absent is normal"
+        );
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            read_rows_checked(&path).is_err(),
+            "a directory is not history"
+        );
+        assert!(
+            read_rows(&path).is_empty(),
+            "legacy reader remains tolerant"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert!(read_rows_checked(&path).unwrap().is_empty());
+        let expected = row(1, 1, PrevRun::none());
+        std::fs::write(&path, format!("{}\n", expected.to_line())).unwrap();
+        assert_eq!(read_rows_checked(&path).unwrap(), vec![expected.clone()]);
+        std::fs::write(&path, format!("{}\nunreadable row\n", expected.to_line())).unwrap();
+        assert!(read_rows_checked(&path).is_err());
+        assert_eq!(
+            read_rows(&path),
+            vec![expected],
+            "legacy parsing is unchanged"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn append_creates_a_private_file_and_keeps_rows_in_order() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = scratch("append");
@@ -1424,10 +1447,8 @@ mod tests {
     }
 
     /// A ledger lock is free for a second open file description the instant its
-    /// guard drops, even while a copy of the first description lives — the copy a
-    /// child another thread is forking holds until it execs (the product fd-hygiene
-    /// sweep of 2026-09-27). `try_clone` is `dup`: the same description, as a fork's
-    /// copy is.
+    /// guard drops, even while a `dup`'d copy of the first description lives (as
+    /// in a concurrently forked child before `exec`).
     #[cfg(unix)]
     #[test]
     fn a_released_ledger_lock_is_free_while_a_copy_of_its_descriptor_lives() {

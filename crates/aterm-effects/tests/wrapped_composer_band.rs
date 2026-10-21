@@ -3,34 +3,23 @@
 
 //! The band in a wrapped composer is one run, on every frame.
 //!
-//! [`Ribbon::retract_suffix`] states the law: contiguous at every frame,
-//! nothing removed from the middle. Every path that takes light off a row by
-//! geometry (Backspace's retract, the kill, the insert's rewrite, the exit
-//! swoosh) obeys it by construction; the content witness takes light off by
-//! name, one cell at a time, and must be shown to as well.
+//! `Ribbon::retract_suffix` states the law: contiguous at every frame, nothing removed from the
+//! middle. Every path that takes light off a row by geometry (Backspace's retract, the kill, the
+//! insert's rewrite, the exit swoosh) obeys it by construction; the content witness takes light
+//! off by name, one cell at a time, and is pinned here.
 //!
-//! Driven at the host seam like `scrub_gaps.rs`: a real
-//! `aterm_core::terminal::Terminal` driven byte for byte, its rows sampled as
-//! `app_render.rs`'s frame hold samples them, its content-scroll clock read as
-//! `app_render::sync_cursor_effect_scroll` reads it, fed to `CursorGlow` on a
-//! frame train. The program is `scratch/composer.py`'s bottom-pinned wrapping
-//! box (the shape of Claude Code's and Codex's composer):
+//! Driven at the host seam like `scrub_gaps.rs`: a real `Terminal` fed byte for byte, its rows
+//! sampled as `app_render.rs`'s frame hold samples them, its content-scroll clock read as
+//! `sync_cursor_effect_scroll` reads it. The program is a bottom-pinned wrapping box (the shape
+//! of Claude Code's and Codex's composer): one logical input wrapping at the box's inner width;
+//! the box grows upward from the last row, so a new wrap row scrolls the screen under the band;
+//! every repaint homes to the box's top row, clears to the end of the screen, rewrites every row
+//! and parks the cursor in separate writes, so a present can land between any two.
 //!
-//! * one logical input that wraps at the box's inner width;
-//! * the box is pinned to the last row and grows upward, so a new wrap row
-//!   scrolls the screen and the paragraph's first row moves up under the band;
-//! * every repaint homes to the box's top row, clears to the end of the
-//!   screen, rewrites every row and parks the cursor on the caret, in five
-//!   separate writes (`composer.py`'s `w()` flushes each), so a present can
-//!   land between any two.
-//!
-//! The census is of the plan (the coverage the emitter puts in each cell),
-//! which is what a pixel census reads: a retracting cell is light until spent.
-//!
-//! A mid-line Backspace shifts every column from the edit to the line's end;
-//! where the shifted text repeats a letter, a per-column comparison would keep
-//! that one cell while naming its neighbours, leaving a comb of lit specks.
-//! `Witness::walk`'s span closure prevents that.
+//! The census is of the plan (the coverage the emitter puts in each cell), which is what a pixel
+//! census reads: a retracting cell is light until spent. Where a mid-line Backspace's shifted
+//! text repeats a letter, a per-column comparison would keep that cell while naming its
+//! neighbours, leaving a comb of lit specks; `Witness::walk`'s span closure prevents that.
 
 use crate::common::{
     LIT_COV, caret_sample, coverage, holes_of, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -45,19 +34,18 @@ const ROWS: usize = 14;
 const COLS: usize = 80;
 const CW: usize = 15;
 const CH: usize = 28;
-/// `composer.py`'s inner width: the terminal's columns less its box chrome.
+/// The box's inner width: the terminal's columns less its chrome.
 const W: usize = COLS - 4;
 const PROMPT: &str = "> ";
 const CONT: &str = "  ";
-/// 12 cps, the rate the owner's takes were driven at.
+/// 12 cps.
 const KEY_MS: u64 = 83;
 /// The frame train.
 const FRAME_MS: u64 = 8;
-/// Milliseconds between a repaint's five writes. `composer.py` flushes five
-/// times per paint; on glass the host presents between them.
+/// Milliseconds between a repaint's writes; on glass the host presents between them.
 const WRITE_GAP_MS: u64 = 3;
 
-/// The owner's own paragraph, from `drive2.py`.
+/// The typed paragraph.
 const PARA: &str = "there is a bug that when backspacing in this build the rainbow cursor trail breaks apart and I also see some awkward transitions when going to a new line still with the rainbow please audit that logic";
 /// How much of it the takes type: enough to wrap onto a second row.
 const TYPED: usize = 110;
@@ -130,8 +118,8 @@ impl Composer {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// EXACTLY the host's own order: `sync_cursor_effect_scroll`, then LOCK
-    /// A's samples, then the tick.
+    /// The host's order, less the neighbour probe and print anchor: content-scroll
+    /// sync (`sync_cursor_effect_scroll`), the frame hold's samples, then the tick.
     fn frame(&mut self) {
         sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
         let (c, cur) = caret_sample(&self.term);
@@ -180,9 +168,8 @@ impl Composer {
             .collect()
     }
 
-    /// `composer.py`'s `paint()`, byte for byte and write for write: the grow
-    /// scroll, the home-and-clear, the body, the caret park, each its own
-    /// flush with the frame train running between.
+    /// The box's repaint, write for write: the grow scroll, the home-and-clear,
+    /// the body, the caret park, with the frame train running between.
     fn paint(&mut self) {
         let rows = self.wrap();
         let n = rows.len();
@@ -248,7 +235,7 @@ impl Composer {
         self.frame();
     }
 
-    /// This frame's per-row census of the PLAN's coverage — what the glass
+    /// This frame's per-row census of the plan's coverage: what the glass
     /// shows, not what the pool holds.
     fn record(&mut self) {
         let ms = self.ms();

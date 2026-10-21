@@ -312,8 +312,7 @@ impl SmartSelection {
     /// into neighbouring cells out of order are two cells the walk pairs into
     /// one, and a VS16 base the grid kept one cell wide in the last column is
     /// one cell the walk widens. Grid code maps a row through the cells its
-    /// text was read from instead (`aterm_core::terminal::smart_word_in_cells`;
-    /// ruling 2026-10-11, r16 selection-stride).
+    /// text was read from instead (`aterm_core::terminal::smart_word_in_cells`).
     ///
     /// A column at or past the end of the text names an empty cell: `None`.
     #[must_use]

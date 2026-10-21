@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Regression net for the alternate screen's resize undo AND for 24-bit colour
-//! across a resize (R14): a flap with nothing written between its halves puts
-//! every row back as it was drawn, cell for cell.
-//!
-//! The samples cover what a full-screen program paints: plain text, wide CJK,
-//! ZWJ emoji, combining marks, SGR colour and weight, curly underline with an
-//! underline colour, an OSC 8 link, a truecolor background, and blank rows. The
-//! comparison is the renderer's own row (`render_row`: text, foreground, background
-//! and attributes per cell), plus the links and the cursor, so a colour the
-//! resize drops or a row it shifts cannot pass. Deterministic seed; the screens
-//! are random, the test is not.
+//! The alternate screen's resize undo and 24-bit colour across a resize: a flap with nothing
+//! written between its halves puts every row back as drawn, cell for cell. The samples cover
+//! what a full-screen program paints (wide CJK, ZWJ emoji, combining marks, SGR, a coloured
+//! curly underline, an OSC 8 link, truecolor, blank rows); the comparison is the renderer's
+//! own row (`render_row`) plus links and cursor. The screens are random from a fixed seed.
 
 use aterm_core::terminal::Terminal;
 
@@ -123,10 +117,9 @@ fn a_quiet_flap_is_a_styled_identity() {
     }
 }
 
-/// The point of the harvest, in the renderer's own words: a truecolor colour on
-/// screen is the same after a same-size resize, a flap the engine undoes, a
-/// shrink nothing undoes (the coloured rows are found where they moved) and an
-/// alternate-screen width change.
+/// A truecolor colour, as `render_row` reports it, survives a same-size resize, a flap the
+/// engine undoes, a shrink nothing undoes (the coloured rows are found where they moved) and
+/// an alternate-screen width change.
 #[test]
 fn resize_keeps_truecolor_in_render_row() {
     for (name, sizes) in [

@@ -615,28 +615,51 @@ pub(crate) enum Streamed<'a> {
 pub(crate) fn stream_lines_ends(
     path: &Path,
     cap: u64,
-    mut each: impl FnMut(u64, u64, Streamed<'_>) -> std::ops::ControlFlow<()>,
+    each: impl FnMut(u64, u64, Streamed<'_>) -> std::ops::ControlFlow<()>,
 ) -> Option<RolloutRead> {
-    use std::io::BufRead as _;
-    let max_line = crate::harness::usage::MAX_LINE_BYTES;
     let file = crate::harness::footer::open_regular(path)?;
+    Some(stream_open_ends(file, 0, None, cap, each))
+}
+
+/// [`stream_lines_ends`] over the open `file` from offset `from`, the start
+/// of a line (where a reader that reads on stopped: the Codex rollout tap,
+/// `super::codex_tap`), or, with `skip` (where that line began), a point
+/// inside a line the reader skips, handed on as [`Streamed::Long`] at its
+/// newline and counted in [`RolloutRead::long`] there: the offsets handed on
+/// are the file's own, `read` counts the bytes read from `from`, and at most
+/// `cap` of them are. A file that cannot be sought there reads nothing.
+pub(crate) fn stream_open_ends(
+    file: std::fs::File,
+    from: u64,
+    skip: Option<u64>,
+    cap: u64,
+    mut each: impl FnMut(u64, u64, Streamed<'_>) -> std::ops::ControlFlow<()>,
+) -> RolloutRead {
+    use std::io::{BufRead as _, Seek as _};
+    let max_line = crate::harness::usage::MAX_LINE_BYTES;
     let mut file = std::io::BufReader::with_capacity(64 * 1024, file);
     let mut out = RolloutRead::default();
+    if file.seek(std::io::SeekFrom::Start(from)).is_err() {
+        return out;
+    }
     let mut line: Vec<u8> = Vec::new();
-    let mut skipping = false;
-    let mut start = 0_u64;
+    let mut skipping = skip.is_some();
+    // Whether the line being skipped is counted long yet: one carried in
+    // from an earlier read is counted at its newline.
+    let mut counted = false;
+    let mut start = skip.unwrap_or(from);
     loop {
         let buf = match file.fill_buf() {
             Ok(buf) => buf,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Some(out),
+            Err(_) => return out,
         };
         if buf.is_empty() {
             break;
         }
         // Bytes are left past the cap: the read stops short.
         if out.read >= cap {
-            return Some(out);
+            return out;
         }
         let room = usize::try_from(cap - out.read).unwrap_or(usize::MAX);
         let chunk = &buf[..buf.len().min(room)];
@@ -646,6 +669,7 @@ pub(crate) fn stream_lines_ends(
             line.extend_from_slice(&chunk[..newline.unwrap_or(used)]);
             if line.len() > max_line {
                 out.long += 1;
+                counted = true;
                 line = Vec::new();
                 skipping = true;
             }
@@ -653,25 +677,26 @@ pub(crate) fn stream_lines_ends(
         file.consume(used);
         out.read += used as u64;
         if newline.is_some() {
+            let end = from.saturating_add(out.read);
             let flow = if skipping {
-                each(start, out.read, Streamed::Long)
+                if !counted {
+                    out.long += 1;
+                }
+                each(start, end, Streamed::Long)
             } else {
-                each(
-                    start,
-                    out.read,
-                    Streamed::Line(std::str::from_utf8(&line).ok()),
-                )
+                each(start, end, Streamed::Line(std::str::from_utf8(&line).ok()))
             };
             line.clear();
             skipping = false;
-            start = out.read;
+            counted = false;
+            start = end;
             if flow.is_break() {
-                return Some(out);
+                return out;
             }
         }
     }
     out.complete = true;
-    Some(out)
+    out
 }
 
 /// How much of a rollout's first line is read for its `session_meta`
@@ -717,8 +742,14 @@ fn session_ids(first_line: &str) -> Option<(Option<String>, Option<String>)> {
 /// The first line of `path`, at most [`META_BYTES`] of it; `None` when it
 /// cannot be read or runs past the bound.
 pub(crate) fn first_line(path: &Path) -> Option<String> {
-    use std::io::BufRead as _;
-    let file = crate::harness::footer::open_regular(path)?;
+    first_line_of(&crate::harness::footer::open_regular(path)?)
+}
+
+/// [`first_line`] of the open `file`, read from its start.
+pub(crate) fn first_line_of(file: &std::fs::File) -> Option<String> {
+    use std::io::{BufRead as _, Seek as _};
+    let mut file = file;
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
     let mut line = Vec::new();
     std::io::BufReader::new(std::io::Read::take(file, META_BYTES))
         .read_until(b'\n', &mut line)

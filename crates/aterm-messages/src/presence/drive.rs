@@ -26,8 +26,11 @@ use super::{
 use crate::Instant;
 
 /// The longest need text a pill carries, in cells: the words clip at the
-/// painter's width before this.
-const PILL_WHAT_CELLS: usize = 96;
+/// painter's width before this. Public so a host that composes a need's
+/// words with a tail of its own (`aterm-gui`'s `presence::need_fact`, a
+/// harness's `(1 more need)`) clips them before this cut, which then never
+/// falls inside the tail.
+pub const PILL_WHAT_CELLS: usize = 96;
 
 /// The longest tab label a pill carries, in cells.
 const PILL_LABEL_CELLS: usize = 32;

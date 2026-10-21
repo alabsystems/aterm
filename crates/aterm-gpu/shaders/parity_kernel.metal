@@ -1,13 +1,8 @@
-// ===================== VERIFICATION-ONLY COMPUTE KERNELS =====================
-// NOT part of the shipped renderer — aterm asks the GPU for ZERO compute (see
-// crates/aterm-gpu/src/lib.rs required_features == empty). These kernels exist
-// so the parity test can evaluate the SAME fire_core / fire_shade_*_px /
-// rain_weight functions the fragment shaders run, at arbitrary coordinates, and
-// diff them against aterm_render::fire_field and aterm_render::halo_weight.
-//
-// This file is CONCATENATED onto cell.metal by the test, so the math under test
-// is literally the shipped math — it cannot drift from what fs_fire_add and
-// fs_rain_glow use.
+// Verification-only compute kernels; the shipped renderer runs no compute. The
+// parity test concatenates this file onto cell.metal, so the fire_core,
+// fire_shade_*_px and rain_weight evaluated here at arbitrary coordinates are the
+// shipped fragment math, diffed against aterm_render::fire_field and
+// aterm_render::halo_weight.
 
 struct FireParityParams {
     int base_y;
@@ -50,8 +45,8 @@ kernel void k_rain_parity(constant RainParityParams& p [[buffer(0)]],
     int px = p.x0 + int(gid.x);
     int py = p.y0 + int(gid.y);
     uint i = gid.y * uint(p.w) + gid.x;
-    // rain_weight() takes the fragment CENTRE, so feed px+0.5 exactly as the
-    // rasterizer hands it to fs_rain_glow.
+    // rain_weight() takes the fragment centre, as the rasterizer hands it to
+    // fs_rain_glow.
     int wt = rain_weight(float2(float(px) + 0.5, float(py) + 0.5),
                          uint4(uint(p.cx), uint(p.cy), uint(p.rx), uint(p.ry)));
     out_wt[i] = uint(wt);

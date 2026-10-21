@@ -111,12 +111,18 @@ pub fn run(root: &Path) -> Result<Outcome, String> {
 /// crate the lock names, [`crate::direct_vendor::machine_refusal`]) — why: the
 /// run is then COULD NOT RUN, never FAIL (OF-30).
 pub struct Attestation {
-    /// Every obligation held.
+    /// No obligation was found violated.
     pub ok: bool,
     /// The transcript, complete on its own.
     pub log: String,
     /// Why an obligation could not be judged here, if one could not.
     pub could_not_run: Option<String>,
+    /// The Apache-only forks `[OB-7]` could not diff here, for want of a pristine copy: their
+    /// §4(b) notices are UNVERIFIED, never passed. `ok` can hold beside them (nothing was found
+    /// wrong), so a verdict built on `ok` names these too. Until 2026-10-20 the transcript said
+    /// "✓ [OB-7] every file … carries a modification notice" with no diff run, and an added
+    /// aterm-window file without its notice passed a day of runs that way.
+    pub unverified: Vec<String>,
 }
 
 // --- facts -----------------------------------------------------------------
@@ -766,6 +772,7 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
                 ok: false,
                 log,
                 could_not_run,
+                unverified: Vec::new(),
             };
         }
     };
@@ -822,27 +829,41 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
     fails += ob4_provenance_files(&forks, &mut log);
     fails += ob5_license_files(&redistributed, &mut log);
     fails += ob6_notice_agreement(root, &redistributed, &mut log);
-    fails += ob7_apache_modification_notices(root, &redistributed, &mut log);
+    let (ob7_fails, unverified) = ob7_apache_modification_notices(root, &redistributed, &mut log);
+    fails += ob7_fails;
     fails += ob8_marker_census(&forks, &mut log);
     fails += ob9_spdx_allowlist(root, &redistributed, &mut log);
     fails += ob10_gitignore(root, &forks, &mut log);
 
     if fails == 0 {
-        let _ = writeln!(
-            log,
-            "cargo forge attest: PASS — 10 obligations held over {} vendored fork(s) \
-             (+ [OB-1]/[OB-2]/[OB-5]/[OB-6]/[OB-7]/[OB-9] over {} absorbed patch target(s), \
-             [OB-1]/[OB-5]/[OB-6]/[OB-7]/[OB-9] over {} renamed absorbed member(s), \
-             [OB-1]/[OB-2] over {} first-party patch target(s)).",
+        let over = format!(
+            "over {} vendored fork(s) (+ [OB-1]/[OB-2]/[OB-5]/[OB-6]/[OB-7]/[OB-9] over {} \
+             absorbed patch target(s), [OB-1]/[OB-5]/[OB-6]/[OB-7]/[OB-9] over {} renamed \
+             absorbed member(s), [OB-1]/[OB-2] over {} first-party patch target(s))",
             forks.len(),
             absorbed.len(),
             members.len(),
             first_party_forks.len()
         );
+        if unverified.is_empty() {
+            let _ = writeln!(
+                log,
+                "cargo forge attest: PASS — 10 obligations held {over}."
+            );
+        } else {
+            let _ = writeln!(
+                log,
+                "cargo forge attest: PASS, [OB-7] UNVERIFIED — nothing violated {over}, but \
+                 [OB-7] diffed no file of {}: no pristine copy here (its NOTE above names the \
+                 fix).",
+                unverified.join(", ")
+            );
+        }
         return Attestation {
             ok: could_not_run.is_none(),
             log,
             could_not_run,
+            unverified,
         };
     }
     let _ = writeln!(
@@ -855,6 +876,7 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
         ok: false,
         log,
         could_not_run,
+        unverified,
     }
 }
 
@@ -1606,10 +1628,16 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
 }
 
 /// `[OB-7]` Apache-2.0 §4(b): every modified file must carry a prominent
-/// notice stating that it changed.
-fn ob7_apache_modification_notices(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
+/// notice stating that it changed. Returns the violations and the in-scope forks no diff could
+/// judge ([`Attestation::unverified`]).
+fn ob7_apache_modification_notices(
+    root: &Path,
+    forks: &[VendoredFork],
+    log: &mut String,
+) -> (usize, Vec<String>) {
     let mut fails = 0;
     let mut scoped = Vec::new();
+    let mut unverified = Vec::new();
     for fork in forks {
         if !apache_is_mandatory(&fork.license) {
             continue;
@@ -1629,15 +1657,18 @@ fn ob7_apache_modification_notices(root: &Path, forks: &[VendoredFork], log: &mu
                  has a source-less lock entry, so cargo never downloads it).",
                 fork.name, fork.name, fork.version, fork.name, fork.name, fork.version, fork.name
             );
+            unverified.push(fork.name.clone());
             continue;
         };
         let Some(Divergence { modified, added }) = diff_against_pristine(&pristine, &fork.dir)
         else {
             let _ = writeln!(
                 log,
-                "  • NOTE [OB-7] fork `{}` could not be walked for a pristine diff.",
+                "  • NOTE [OB-7] fork `{}` could not be walked for a pristine diff; UNVERIFIED \
+                 for it, not satisfied.",
                 fork.name
             );
+            unverified.push(fork.name.clone());
             continue;
         };
         let _ = writeln!(
@@ -1686,14 +1717,22 @@ fn ob7_apache_modification_notices(root: &Path, forks: &[VendoredFork], log: &mu
             scoped.join(", ")
         }
     );
-    if fails == 0 {
+    // The tick is a claim about files a diff read: a fork none was read for gets its own line.
+    if !unverified.is_empty() {
+        let _ = writeln!(
+            log,
+            "  • UNVERIFIED [OB-7] no file of {} was diffed, so this run says nothing of its \
+             §4(b) notices.",
+            unverified.join(", ")
+        );
+    } else if fails == 0 {
         let _ = writeln!(
             log,
             "  ✓ [OB-7] every file diverging from pristine upstream in an Apache-only fork \
              carries a modification notice."
         );
     }
-    fails
+    (fails, unverified)
 }
 
 /// What a fork changed relative to the copy the registry published.
@@ -2317,6 +2356,51 @@ mod tests {
         std::fs::remove_dir_all(fixture.0.path().join("crates/aterm-absorbed")).unwrap();
         let Attestation { ok, log, .. } = report(fixture.0.path());
         assert!(!ok && log.contains("FAIL [OB-1]"), "{log}");
+    }
+
+    /// `[OB-7]` with no pristine copy diffed nothing, so it claims nothing: no tick, and the
+    /// verdict names the member UNVERIFIED. This is how crates/aterm-window's added
+    /// `seat/retire_tests.rs` went without its notice from 2026-10-19 to 2026-10-20: no machine
+    /// had winit 0.30.13's pristine copy, and every run printed the tick. The control is the
+    /// same member with its pristine copy, which earns the tick.
+    #[test]
+    fn a_member_without_a_pristine_copy_is_unverified_never_ticked() {
+        let fixture = absorbed_fixture("member-pristine", true);
+        let Attestation {
+            ok,
+            log,
+            unverified,
+            ..
+        } = report(fixture.0.path());
+        assert!(ok && unverified.is_empty(), "{log}");
+        assert!(
+            log.contains("✓ [OB-7]"),
+            "a diffed member earns the tick:\n{log}"
+        );
+
+        let fixture = absorbed_fixture("member-no-pristine", true);
+        std::fs::remove_dir_all(fixture.0.path().join("vendor/.forge/absorbed")).unwrap();
+        // An edit with no notice, which only a diff could find.
+        std::fs::write(
+            fixture.0.path().join("crates/aterm-absorbed/src/lib.rs"),
+            "pub fn upstream() { /* edited */ }\n",
+        )
+        .unwrap();
+        let Attestation {
+            ok,
+            log,
+            unverified,
+            ..
+        } = report(fixture.0.path());
+        assert_eq!(unverified, ["absorbed"], "{log}");
+        assert!(
+            !log.contains("✓ [OB-7]") && log.contains("UNVERIFIED [OB-7] no file of absorbed"),
+            "an undiffed member must not be ticked:\n{log}"
+        );
+        assert!(
+            ok && log.contains("cargo forge attest: PASS, [OB-7] UNVERIFIED"),
+            "the verdict names what was not judged, and finds nothing wrong:\n{log}"
+        );
     }
 
     /// A vendor directory nothing claims is red, and NAMING one `astream` is no

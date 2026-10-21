@@ -16,7 +16,6 @@
 //! loop's reference is the last and the window's objects are destroyed on the loop's thread,
 //! between dispatches, never while it dispatches their events.
 
-use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +26,7 @@ use aterm_wayland::protocols::fractional_scale_v1::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
 use aterm_wayland::protocols::viewporter::{wp_viewport, wp_viewporter};
-use aterm_wayland::protocols::wayland::{wl_callback, wl_compositor, wl_region, wl_surface};
+use aterm_wayland::protocols::wayland::{wl_compositor, wl_surface};
 use aterm_wayland::protocols::xdg_activation_v1::{xdg_activation_token_v1, xdg_activation_v1};
 use aterm_wayland::protocols::xdg_decoration_unstable_v1::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
@@ -40,12 +39,9 @@ use crate::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{Ime, WindowEvent};
 use crate::platform_impl::common::poll::Waker;
-use crate::platform_impl::{
-    Fullscreen, MonitorHandle as PlatformMonitorHandle, OsError, PlatformIcon,
-};
+use crate::platform_impl::{Fullscreen, MonitorHandle as PlatformMonitorHandle, OsError};
 use crate::window::{
-    Cursor, CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType,
-    WindowAttributes, WindowButtons, WindowLevel,
+    Cursor, ImePurpose, ResizeDirection, Theme, UserAttentionType, WindowAttributes,
 };
 
 use super::event_loop::sink::EventSink;
@@ -54,6 +50,7 @@ use super::state::Connection;
 use super::wire::{self, Inbox, Owned, ToplevelEvent, Wire};
 use super::{ActiveEventLoop, WaylandError, WindowId};
 
+pub(crate) mod frame;
 pub(crate) mod state;
 
 pub use state::WindowState;
@@ -151,8 +148,8 @@ impl Window {
             })
         };
 
-        // We prefer server side decorations, however to not have decorations we ask for client
-        // side decorations instead.
+        // Server-side decorations are asked for (WC.8: no window turns decorations off, which
+        // asked for client mode).
         let decoration = state.xdg_shell.decoration_manager().and_then(|manager| {
             // SAFETY: the shell's live decoration manager and the toplevel made above.
             let decoration =
@@ -174,13 +171,13 @@ impl Window {
                     },
                 )
             };
-            let mode = if attributes.decorations {
-                zxdg_toplevel_decoration_v1::mode::SERVER_SIDE
-            } else {
-                zxdg_toplevel_decoration_v1::mode::CLIENT_SIDE
-            };
             // SAFETY: the live decoration object.
-            unsafe { zxdg_toplevel_decoration_v1::set_mode(decoration.proxy(), mode) };
+            unsafe {
+                zxdg_toplevel_decoration_v1::set_mode(
+                    decoration.proxy(),
+                    zxdg_toplevel_decoration_v1::mode::SERVER_SIDE,
+                )
+            };
             Some(decoration)
         });
 
@@ -214,15 +211,20 @@ impl Window {
         });
 
         let objects = WindowObjects {
-            frame_callback: None,
             attention_token: None,
             viewport,
             fractional_scale,
-            decoration,
+            _decoration: decoration,
             toplevel: toplevel_owned,
             xdg_surface: xdg_owned,
             surface: surface_owned,
         };
+        // The shadow margin's globals, where the compositor offers subsurfaces.
+        let frame_globals = state.subcompositor.as_ref().map(|subcompositor| frame::FrameGlobals {
+            compositor: Arc::clone(&state.compositor),
+            subcompositor: Arc::clone(subcompositor),
+            shm: state.shm(),
+        });
         let mut window_state = WindowState::new(
             Arc::clone(&state.compositor),
             Arc::clone(&state.xdg_shell),
@@ -230,16 +232,11 @@ impl Window {
             Arc::clone(&connection),
             size,
             objects,
-            attributes.preferred_theme,
+            frame_globals,
         );
 
-        // Set transparency hint.
-        window_state.set_transparent(attributes.transparent);
-
-        window_state.set_blur(attributes.blur);
-
-        // Set the decorations hint.
-        window_state.set_decorate(attributes.decorations);
+        // The surface is opaque (WC.8: no window is transparent, and none asks for blur).
+        window_state.reload_transparency_hint();
 
         // Set the app_id.
         if let Some(name) = attributes.platform_specific.name.map(|name| name.general) {
@@ -249,42 +246,11 @@ impl Window {
         // Set the window title.
         window_state.set_title(attributes.title);
 
-        // Set the min and max sizes. We must set the hints upon creating a window, so
-        // we use the default `1.` scaling...
+        // Set the min size. We must set the hint upon creating a window, so we use the default
+        // `1.` scaling... (WC.8: no window has a max size, is created maximized or fullscreen,
+        // or starts with resize increments or a cursor other than the default.)
         let min_size = attributes.min_inner_size.map(|size| size.to_logical(1.));
-        let max_size = attributes.max_inner_size.map(|size| size.to_logical(1.));
         window_state.set_min_inner_size(min_size);
-        window_state.set_max_inner_size(max_size);
-
-        // Non-resizable implies that the min and max sizes are set to the same value.
-        window_state.set_resizable(attributes.resizable);
-
-        // Set startup mode.
-        match attributes.fullscreen.map(Into::into) {
-            Some(Fullscreen::Exclusive(_)) => {
-                warn!("`Fullscreen::Exclusive` is ignored on Wayland");
-            },
-            Some(Fullscreen::Borderless(monitor)) => {
-                with_live_output(&monitors, monitor, |output| {
-                    // SAFETY: the live toplevel and an output still bound.
-                    unsafe { xdg_toplevel::set_fullscreen(toplevel, output) }
-                })
-            },
-            // SAFETY: the live toplevel.
-            _ if attributes.maximized => unsafe { xdg_toplevel::set_maximized(toplevel) },
-            _ => (),
-        };
-
-        match attributes.cursor {
-            Cursor::Icon(icon) => window_state.set_cursor(icon),
-            Cursor::Custom(cursor) => window_state.set_custom_cursor(cursor),
-        }
-
-        // Apply resize increments.
-        if let Some(increments) = attributes.resize_increments {
-            let increments = increments.to_logical(window_state.scale_factor());
-            window_state.set_resize_increments(Some(increments));
-        }
 
         // Activate the window with the launcher's token, before the initial commit, so
         // the compositor raises and focuses it and ends the launch's startup sequence.
@@ -349,10 +315,6 @@ impl Window {
             event_loop_awakener,
             window_events_sink,
         })
-    }
-
-    pub(crate) fn xdg_toplevel(&self) -> Option<NonNull<c_void>> {
-        NonNull::new(self.toplevel.as_ptr())
     }
 }
 
@@ -425,11 +387,6 @@ impl Window {
     }
 
     #[inline]
-    pub fn is_visible(&self) -> Option<bool> {
-        None
-    }
-
-    #[inline]
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         Err(NotSupportedError::new())
     }
@@ -468,24 +425,6 @@ impl Window {
     }
 
     #[inline]
-    pub fn pre_present_notify(&self) {
-        let inbox = self.inbox.clone();
-        let window_id = self.window_id;
-        self.window_state.lock().unwrap().request_frame_callback(|surface| {
-            // SAFETY: the window's live surface; the callback is the window's, and ends with
-            // its one event.
-            let callback = unsafe { wl_surface::frame(surface) }?;
-            // SAFETY: as above; the proxy is destroyed client-side once done (the protocol
-            // ends the object with its event).
-            Some(unsafe {
-                Owned::listened(callback, Proxy::destroy, &inbox, move |_, opcode, _| {
-                    (opcode == wl_callback::evt::DONE).then_some(Wire::Frame { window: window_id })
-                })
-            })
-        });
-    }
-
-    #[inline]
     pub fn outer_size(&self) -> PhysicalSize<u32> {
         let window_state = self.window_state.lock().unwrap();
         let scale_factor = window_state.scale_factor();
@@ -510,36 +449,12 @@ impl Window {
         self.request_redraw();
     }
 
-    /// Set the maximum inner size for the window.
-    #[inline]
-    pub fn set_max_inner_size(&self, max_size: Option<Size>) {
-        let scale_factor = self.scale_factor();
-        let max_size = max_size.map(|size| size.to_logical(scale_factor));
-        self.window_state.lock().unwrap().set_max_inner_size(max_size);
-        // NOTE: Requires commit to be applied.
-        self.request_redraw();
-    }
-
-    #[inline]
-    pub fn resize_increments(&self) -> Option<PhysicalSize<u32>> {
-        let window_state = self.window_state.lock().unwrap();
-        let scale_factor = window_state.scale_factor();
-        window_state
-            .resize_increments()
-            .map(|size| super::logical_to_physical_rounded(size, scale_factor))
-    }
-
     #[inline]
     pub fn set_resize_increments(&self, increments: Option<Size>) {
         let mut window_state = self.window_state.lock().unwrap();
         let scale_factor = window_state.scale_factor();
         let increments = increments.map(|size| size.to_logical(scale_factor));
         window_state.set_resize_increments(increments);
-    }
-
-    #[inline]
-    pub fn set_transparent(&self, transparent: bool) {
-        self.window_state.lock().unwrap().set_transparent(transparent);
     }
 
     #[inline]
@@ -566,42 +481,8 @@ impl Window {
     }
 
     #[inline]
-    pub fn set_resizable(&self, resizable: bool) {
-        if self.window_state.lock().unwrap().set_resizable(resizable) {
-            // NOTE: Requires commit to be applied.
-            self.request_redraw();
-        }
-    }
-
-    #[inline]
-    pub fn is_resizable(&self) -> bool {
-        self.window_state.lock().unwrap().resizable()
-    }
-
-    #[inline]
-    pub fn set_enabled_buttons(&self, _buttons: WindowButtons) {
-        // TODO(kchibisov) v5 of the xdg_shell allows that.
-    }
-
-    #[inline]
-    pub fn enabled_buttons(&self) -> WindowButtons {
-        // TODO(kchibisov) v5 of the xdg_shell allows that.
-        WindowButtons::all()
-    }
-
-    #[inline]
     pub fn scale_factor(&self) -> f64 {
         self.window_state.lock().unwrap().scale_factor()
-    }
-
-    #[inline]
-    pub fn set_blur(&self, blur: bool) {
-        self.window_state.lock().unwrap().set_blur(blur);
-    }
-
-    #[inline]
-    pub fn set_decorations(&self, decorate: bool) {
-        self.window_state.lock().unwrap().set_decorate(decorate)
     }
 
     #[inline]
@@ -615,12 +496,6 @@ impl Window {
     pub fn client_decorations(&self) -> Option<crate::platform::wayland::ClientDecorations> {
         self.window_state.lock().unwrap().client_decorations()
     }
-
-    #[inline]
-    pub fn set_window_level(&self, _level: WindowLevel) {}
-
-    #[inline]
-    pub(crate) fn set_window_icon(&self, _window_icon: Option<PlatformIcon>) {}
 
     #[inline]
     pub fn set_minimized(&self, minimized: bool) {
@@ -679,9 +554,6 @@ impl Window {
     #[inline]
     pub(crate) fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
         match fullscreen {
-            Some(Fullscreen::Exclusive(_)) => {
-                warn!("`Fullscreen::Exclusive` is ignored on Wayland");
-            },
             Some(Fullscreen::Borderless(monitor)) => {
                 with_live_output(&self.monitors, monitor, |output| {
                     // SAFETY: the window's live toplevel and an output still bound.
@@ -695,17 +567,8 @@ impl Window {
 
     #[inline]
     pub fn set_cursor(&self, cursor: Cursor) {
-        let window_state = &mut self.window_state.lock().unwrap();
-
-        match cursor {
-            Cursor::Icon(icon) => window_state.set_cursor(icon),
-            Cursor::Custom(cursor) => window_state.set_custom_cursor(cursor),
-        }
-    }
-
-    #[inline]
-    pub fn set_cursor_visible(&self, visible: bool) {
-        self.window_state.lock().unwrap().set_cursor_visible(visible);
+        let Cursor::Icon(icon) = cursor;
+        self.window_state.lock().unwrap().set_cursor(icon);
     }
 
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
@@ -758,47 +621,8 @@ impl Window {
     }
 
     #[inline]
-    pub fn set_cursor_grab(&self, mode: CursorGrabMode) -> Result<(), ExternalError> {
-        self.window_state.lock().unwrap().set_cursor_grab(mode)
-    }
-
-    #[inline]
-    pub fn set_cursor_position(&self, position: Position) -> Result<(), ExternalError> {
-        let scale_factor = self.scale_factor();
-        let position = position.to_logical(scale_factor);
-        self.window_state
-            .lock()
-            .unwrap()
-            .set_cursor_position(position)
-            // Request redraw on success, since the state is double buffered.
-            .map(|_| self.request_redraw())
-    }
-
-    #[inline]
     pub fn drag_window(&self) -> Result<(), ExternalError> {
         self.window_state.lock().unwrap().drag_window()
-    }
-
-    #[inline]
-    pub fn set_cursor_hittest(&self, hittest: bool) -> Result<(), ExternalError> {
-        let compositor = self.window_state.lock().unwrap().compositor();
-        if hittest {
-            // SAFETY: the window's live surface.
-            unsafe { wl_surface::set_input_region(self.surface, None) };
-            Ok(())
-        } else {
-            // SAFETY: the live compositor.
-            let region = unsafe { wl_compositor::create_region(compositor) }.ok_or_else(|| {
-                ExternalError::Os(os_error!(OsError::Misc("failed to set input region.")))
-            })?;
-            // SAFETY: the region made above, destroyed once here (the surface copies it).
-            unsafe {
-                wl_region::add(region, 0, 0, 0, 0);
-                wl_surface::set_input_region(self.surface, Some(region));
-                wl_region::destroy(region);
-            }
-            Ok(())
-        }
     }
 
     #[inline]
@@ -861,19 +685,15 @@ impl Window {
 
     #[inline]
     pub fn set_theme(&self, theme: Option<Theme>) {
-        self.window_state.lock().unwrap().set_theme(theme)
+        if self.window_state.lock().unwrap().set_theme(theme) {
+            // The frame's border colour moved: its parts apply with the window's next commit.
+            self.request_redraw();
+        }
     }
 
     #[inline]
     pub fn theme(&self) -> Option<Theme> {
         self.window_state.lock().unwrap().theme()
-    }
-
-    pub fn set_content_protected(&self, _protected: bool) {}
-
-    #[inline]
-    pub fn title(&self) -> String {
-        self.window_state.lock().unwrap().title().to_owned()
     }
 }
 

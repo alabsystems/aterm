@@ -44,6 +44,9 @@ aterm-regex = { workspace = true }
 # decoded to read the drop highlight, and the frames `trail-contrast` reads
 # (every colour type and depth, never a hand-written decoder).
 aterm-png = { workspace = true }
+# The far end's own screen, replayed from a link take (`predict-live`): the
+# engine aterm draws with, so the oracle is the instance's own fold.
+aterm-core = { workspace = true }
 # The terminal grid's own width table: how many cells a glyph of a frame's
 # screen text takes (`trail-contrast`). Already in the graph through aterm-agent.
 aterm-grapheme = { workspace = true }
@@ -73,6 +76,10 @@ aterm-link = { path = "../aterm-link" }
 
 # Private, exclusively created directories for lab runs and counterfeit API fixtures.
 aterm-tempfile = { workspace = true }
+# `abrew-admission` runs abrew's own admission code over Homebrew's indexes
+# (`atpkg::abrew::census`). Not a new edge in the build graph: aterm-agent
+# above already depends on it.
+atpkg = { workspace = true }
 
 [lints]
 workspace = true

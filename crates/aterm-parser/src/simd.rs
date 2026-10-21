@@ -1,58 +1,33 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fast path scanning for the parser with explicit SIMD intrinsics.
+//! SIMD scans for the parser's bulk paths: the next byte outside printable
+//! ASCII (0x20-0x7E) in Ground, the next C0 control in an OSC string, the next
+//! terminator in a DCS or APC string.
 //!
-//! ## Performance
-//!
-//! The ground state fast path finds the next byte that requires state
-//! machine processing. With explicit SIMD intrinsics:
-//! - AVX2 (x86_64, runtime-detected): Processes 32 bytes per iteration
-//! - SSE2 (x86_64 baseline): Processes 16 bytes per iteration; SSE2 is
-//!   architecturally guaranteed on x86_64, so it needs no runtime detection
-//!   and serves both pre-AVX2 CPUs and inputs shorter than an AVX2 chunk
-//! - NEON (aarch64): Processes 16 bytes per iteration
-//! - Scalar fallback: other architectures
-//!
-//! Explicit SIMD provides better throughput than the scalar loops (early-exit
-//! `position` searches do not auto-vectorize) for the predicate
-//! `byte < 0x20 || byte > 0x7E` because we can use optimized SIMD comparisons.
-//!
-//! ## Special Bytes
-//!
-//! Non-printable bytes that exit the printable-ASCII fast path
-//! (`find_non_printable`):
-//! - C0 controls: 0x00-0x1F (including ESC at 0x1B)
-//! - DEL: 0x7F
-//! - High bytes: >= 0x80 (includes C1 controls and bytes >= 0xA0)
+//! Tiers: AVX2 on x86_64 (runtime-detected, 32 bytes per iteration); SSE2 on
+//! x86_64 (baseline, 16 bytes, for pre-AVX2 CPUs and inputs shorter than an
+//! AVX2 chunk); vectorized safe code on aarch64 (NEON); scalar elsewhere.
+//! Early-exit `position` searches do not auto-vectorize, hence the tiers.
 
-// =============================================================================
-// x86_64 SIMD (AVX2 + SSE2)
-// =============================================================================
-
-/// AVX2 + SSE2 implementations for x86_64.
-/// AVX2 (runtime-detected) processes 32 bytes per iteration; SSE2 (baseline,
-/// no detection needed) processes 16 bytes per iteration and also serves as
-/// the tail handler for the AVX2 loops.
+/// x86_64 scans: AVX2 (runtime-detected, 32 bytes per iteration) and SSE2
+/// (baseline, 16 bytes per iteration, also the AVX2 loops' tail). Loads are
+/// unaligned (`loadu`), so the pointer casts' alignment increase is harmless.
 #[cfg(target_arch = "x86_64")]
 mod x86_simd {
     use std::arch::x86_64::*;
 
-    /// Check if AVX2 is available, detected once and cached.
-    ///
-    /// `is_x86_feature_detected!` caches CPUID results but still pays an
-    /// atomic load plus two bit tests per call; the `OnceLock` keeps the
-    /// per-call cost to a single load + branch on the hot scan paths.
+    /// Whether AVX2 is available, detected once. `is_x86_feature_detected!`
+    /// still costs an atomic load and two bit tests per call; the `OnceLock`
+    /// is one load and a branch on the hot scan paths.
     #[inline]
     pub(crate) fn has_avx2() -> bool {
         static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *HAS_AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
     }
 
-    /// Find first C0 control byte (< 0x20) using SSE2 (16 bytes/iteration).
-    ///
-    /// SSE2 is baseline on x86_64, so this is safe to call without runtime
-    /// detection and can inline into the dispatcher.
+    /// Find the first C0 control byte (< 0x20) with SSE2. Baseline on x86_64:
+    /// no runtime detection, and it inlines into the dispatcher.
     #[inline]
     pub(crate) fn find_c0_control_sse2(input: &[u8]) -> Option<usize> {
         let len = input.len();
@@ -61,8 +36,6 @@ mod x86_simd {
         while offset + 16 <= len {
             // SAFETY: offset + 16 <= len; SSE2 is baseline on x86_64.
             let found = unsafe {
-                // `_mm_loadu_si128` is an explicitly UNALIGNED load, so the
-                // 1 -> 16 byte alignment increase in the pointer cast is fine.
                 #[allow(clippy::cast_ptr_alignment)]
                 let chunk = _mm_loadu_si128(ptr.add(offset).cast::<__m128i>());
                 let threshold = _mm_set1_epi8(0x20i8);
@@ -85,12 +58,8 @@ mod x86_simd {
         None
     }
 
-    /// Find the first byte equal to any of `needles` using SSE2
-    /// (16 bytes/iteration).
-    ///
-    /// Mirrors [`find_any_of_avx2`] at 128-bit width: one OR-reduced
-    /// `_mm_cmpeq_epi8` per needle, sign-agnostic so high needles like 0x9C
-    /// (ST) match correctly. SSE2 is baseline on x86_64.
+    /// Find the first byte equal to any of `needles` with SSE2:
+    /// [`find_any_of_avx2`] at 128-bit width.
     #[inline]
     pub(crate) fn find_any_of_sse2<const N: usize>(
         input: &[u8],
@@ -102,8 +71,6 @@ mod x86_simd {
         while offset + 16 <= len {
             // SAFETY: offset + 16 <= len; SSE2 is baseline on x86_64.
             let found = unsafe {
-                // `_mm_loadu_si128` is an explicitly UNALIGNED load, so the
-                // 1 -> 16 byte alignment increase in the pointer cast is fine.
                 #[allow(clippy::cast_ptr_alignment)]
                 let chunk = _mm_loadu_si128(ptr.add(offset).cast::<__m128i>());
                 let mut eq = _mm_setzero_si128();
@@ -126,13 +93,10 @@ mod x86_simd {
         None
     }
 
-    /// Find first non-printable byte using SSE2 (16 bytes/iteration).
-    /// Returns None if all bytes are printable ASCII (0x20-0x7E).
-    ///
-    /// Same signed-bias trick as [`find_non_printable_avx2`]. SSE2 is baseline
-    /// on x86_64, so this needs no runtime detection and inlines into the
-    /// dispatcher — which matters for the short (8-31 byte) printable runs
-    /// that dominate line-oriented output.
+    /// Find the first byte outside printable ASCII (0x20-0x7E) with SSE2, by
+    /// the signed-bias trick of [`find_non_printable_avx2`]. Baseline, so it
+    /// inlines into the dispatcher with no detection: that matters for the
+    /// short (8-31 byte) printable runs of line-oriented output.
     #[inline]
     pub(crate) fn find_non_printable_sse2(input: &[u8]) -> Option<usize> {
         let len = input.len();
@@ -141,8 +105,6 @@ mod x86_simd {
         while offset + 16 <= len {
             // SAFETY: offset + 16 <= len; SSE2 is baseline on x86_64.
             let found = unsafe {
-                // `_mm_loadu_si128` is an explicitly UNALIGNED load, so the
-                // 1 -> 16 byte alignment increase in the pointer cast is fine.
                 #[allow(clippy::cast_ptr_alignment)]
                 let chunk = _mm_loadu_si128(ptr.add(offset).cast::<__m128i>());
 
@@ -183,8 +145,6 @@ mod x86_simd {
         while offset + 32 <= len {
             // SAFETY: offset + 32 <= len; caller guarantees AVX2.
             let found = unsafe {
-                // `_mm256_loadu_si256` is an explicitly UNALIGNED load, so the
-                // 1 -> 32 byte alignment increase in the pointer cast is fine.
                 #[allow(clippy::cast_ptr_alignment)]
                 let chunk = _mm256_loadu_si256(ptr.add(offset).cast::<__m256i>());
                 let threshold = _mm256_set1_epi8(0x20i8);
@@ -203,14 +163,10 @@ mod x86_simd {
         find_c0_control_sse2(&input[offset..]).map(|i| offset + i)
     }
 
-    /// Find the first byte equal to any of `needles` using AVX2.
-    ///
-    /// Used by the DCS/APC passthrough bulk fast paths: the needle set is a
-    /// small fixed terminator set, so we OR-reduce one `_mm256_cmpeq_epi8` per
-    /// needle over each 32-byte chunk. Equality compares are sign-agnostic, so
-    /// no signed-bias trick is needed and high needles like 0x9C (ST) match
-    /// correctly. The per-needle broadcasts are loop-invariant and hoisted out
-    /// of the chunk loop by the optimizer (mirroring `find_c0_control_avx2`).
+    /// Find the first byte equal to any of `needles` with AVX2: one
+    /// `_mm256_cmpeq_epi8` per needle, OR-reduced over each 32-byte chunk.
+    /// Equality compares are sign-agnostic, so a high needle like 0x9C needs
+    /// no bias.
     ///
     /// # Safety
     /// Caller must ensure AVX2 is available (use `has_avx2()` first).
@@ -229,8 +185,6 @@ mod x86_simd {
         while offset + 32 <= len {
             // SAFETY: offset + 32 <= len; caller guarantees AVX2.
             let found = unsafe {
-                // `_mm256_loadu_si256` is an explicitly UNALIGNED load, so the
-                // 1 -> 32 byte alignment increase in the pointer cast is fine.
                 #[allow(clippy::cast_ptr_alignment)]
                 let chunk = _mm256_loadu_si256(ptr.add(offset).cast::<__m256i>());
                 let mut eq = _mm256_setzero_si256();
@@ -265,35 +219,25 @@ mod x86_simd {
         let ptr = input.as_ptr();
         let mut offset = 0usize;
 
-        // Process 32 bytes at a time
         while offset + 32 <= len {
-            // SAFETY: We've checked that offset + 32 <= len, so reading 32 bytes
-            // from ptr.add(offset) is valid. Caller guarantees AVX2 is available.
+            // SAFETY: offset + 32 <= len; caller guarantees AVX2.
             let found = unsafe {
-                // `_mm256_loadu_si256` is an explicitly UNALIGNED load, so the
-                // 1 -> 32 byte alignment increase in the pointer cast is fine.
                 #[allow(clippy::cast_ptr_alignment)]
                 let chunk = _mm256_loadu_si256(ptr.add(offset).cast::<__m256i>());
 
-                // Check for bytes < 0x20 or > 0x7E
-                // AVX2 doesn't have unsigned compare, so we use signed with bias
-                //
-                // Bias trick: subtract 0x80 from each byte to convert to signed range
-                // Then printable range [0x20, 0x7E] becomes [-0x60, -0x02] in signed
+                // AVX2 has no unsigned compare: subtract 0x80 so the printable
+                // range [0x20, 0x7E] becomes [-0x60, -0x02] signed.
                 let bias = _mm256_set1_epi8(-128i8); // 0x80
                 let biased = _mm256_add_epi8(chunk, bias);
 
-                // Printable low (0x20 - 0x80 = -0x60 = -96 signed)
                 let biased_low = _mm256_set1_epi8(-96i8);
-                // Printable high (0x7E - 0x80 = -0x02 = -2 signed)
                 let biased_high = _mm256_set1_epi8(-2i8);
 
-                // Check if biased < biased_low (meaning original < 0x20)
+                // original < 0x20
                 let too_low = _mm256_cmpgt_epi8(biased_low, biased);
-                // Check if biased > biased_high (meaning original > 0x7E)
+                // original > 0x7E
                 let too_high = _mm256_cmpgt_epi8(biased, biased_high);
 
-                // Combine: any byte outside [0x20, 0x7E]
                 let outside = _mm256_or_si256(too_low, too_high);
 
                 _mm256_movemask_epi8(outside).cast_unsigned()
@@ -311,85 +255,37 @@ mod x86_simd {
     }
 }
 
-// =============================================================================
-// aarch64 SIMD (NEON)
-// =============================================================================
-
-/// aarch64 implementation: 16-byte chunked scans expressed as safe code.
+/// aarch64 scans: 16-byte chunks in safe code that LLVM vectorizes to NEON,
+/// rescanning only a matching chunk for the exact position. Not `std::arch`
+/// intrinsics: Trust's verifier fails closed on unmodeled intrinsic calls.
+/// The saturating position arithmetic is exact (`offset + i <= input.len()`).
 ///
-/// Each chunk is classified with a branch-free byte fold that LLVM
-/// auto-vectorizes to NEON byte-compare instructions; only a matching chunk
-/// is rescanned to locate the exact position. This replaces hand-written
-/// `std::arch::aarch64` intrinsics: Trust's verifier fails closed on
-/// unmodeled intrinsic calls, so the scans are expressed as safe,
-/// obligation-free code with identical results. The saturating position
-/// arithmetic is exact at runtime (`offset + i` never exceeds `input.len()`).
+/// ## Codegen contract
 ///
-/// ## Codegen contract — the classifier shape is load-bearing
+/// The range classifiers must be a min/max reduction over a `u8` accumulator,
+/// never an OR-reduction over a `bool` or `u8`: an i1 reduction over a
+/// short-circuiting `||` defeats the loop vectorizer, which unrolls the chunk
+/// into ~62 scalar instructions (17 `ldrb`, no vector op) against the reduce
+/// form's ~6 (`ldr q` / `sub.16b` / `umaxv.16b` / `fmov` / compare / branch).
+/// Judge it after inlining into `advance_simd_loop`: a `bool` fold can
+/// vectorize standalone and lose it once inlined. The reduce form measured
+/// 1.1-3.2x the `bool` fold's throughput across the aarch64 bench corpora.
+/// LLVM's choice is version-sensitive: if parser throughput falls off a cliff
+/// after a toolchain bump, check this module's `--emit asm` for
+/// `umaxv`/`uminv`.
 ///
-/// The chunk classifiers here MUST be written as a min/max reduction over a
-/// `u8` accumulator, never as an OR-reduction over a `bool`. The `bool` form
-/// (`let mut any = false; any |= byte < 0x20 || byte > 0x7E;`) reads as the
-/// obvious branch-free fold, but it does not survive to the emitted code: an
-/// i1 reduction over a short-circuiting `||` defeats LLVM's loop vectorizer,
-/// which instead fully unrolls the 16 lanes into scalar code — 17 `ldrb` and
-/// ZERO vector instructions per chunk (~62 scalar instructions per 16 bytes)
-/// against the ~6 the reduce form emits (`ldr q` / `sub.16b` / `umaxv.16b` /
-/// `fmov` / compare / branch).
+/// [`find_any_of_neon`] keeps its `bool` OR-reduce deliberately: a chain of
+/// `==` over a fixed needle set has no short-circuiting range test, and does
+/// vectorize (13 `.16b` ops per chunk).
 ///
-/// Do NOT judge this by compiling the classifier standalone. Under this
-/// repo's pinned compiler the old `bool` fold in `find_non_printable_neon`
-/// DOES vectorize when the function is compiled on its own — and then LLVM
-/// throws the vectorization away once the function inlines into
-/// `advance_simd_loop`, which is the only place that matters. (The `bool`
-/// fold in `find_c0_control_neon` never vectorized at all, standalone or
-/// not.) A plain `u8` OR-accumulator fails the same way; only the min/max
-/// reduce holds up after inlining.
+/// ## Why every test build compiles this module
 ///
-/// This is the hottest scan in the parser — `find_non_printable` runs once
-/// per ground-state printable run, i.e. per line, per SGR, per multibyte
-/// lead — so the shape change is worth real throughput. Measured in-tree on
-/// aarch64 (release profile, `advance_fast` + `NullSink`, 8 MiB corpora,
-/// best-of-5), `bool` fold -> reduce: 80-col CRLF text 4,608 -> 7,898 MB/s;
-/// 4 KiB printable flood 8,569 -> 27,691 MB/s; mixed international text
-/// 1,193 -> 1,590 MB/s; `CUP` + text 2,857 -> 3,748 MB/s; 40 chars + SGR
-/// 2,622 -> 2,951 MB/s.
-///
-/// LLVM's choice here is version-sensitive, so a toolchain bump that
-/// de-vectorizes these folds would be a silent throughput regression: check
-/// for `umaxv`/`uminv` in this module's `--emit asm` output if parser
-/// throughput ever falls off a cliff.
-///
-/// [`find_any_of_neon`] keeps its `bool` OR-reduce, and that is deliberate:
-/// equality compares over a fixed needle set DO vectorize (verified on this
-/// toolchain — 13 `.16b` ops per chunk, the only `ldrb` being the sub-16-byte
-/// tail), because the lane predicate is a chain of `==` with no
-/// short-circuiting range test for the vectorizer to choke on.
-///
-/// ## Why this module compiles into EVERY test build, not just aarch64
-///
-/// Nothing in here is an intrinsic or an `asm!` block — that is the whole
-/// point of the rewrite described above. `as_chunks::<16>()` plus a byte fold
-/// is portable safe Rust whose RESULTS are target-independent; only the
-/// instruction selection is aarch64's. So the `test` arm of the cfg below
-/// compiles these three functions on x86_64 (and on any other host) for one
-/// reason: so the differential tests can hold them against the scalar
-/// reference wherever `cargo test` runs.
-///
-/// That arm is load-bearing, not a convenience. While the cfg read
-/// `target_arch = "aarch64"` alone the aarch64 arm had NO
-/// differential guard anywhere — the exhaustive and random-buffer
-/// differentials were themselves `target_arch = "x86_64"`-gated. Breaking the
-/// `wrapping_sub(0x20)` / `worst > 0x5E` bias identity below (`0x5E` -> `0x5F`,
-/// which stops 0x7F from being seen) left the entire x86_64 suite green AND
-/// type-checked clean for aarch64-unknown-linux-gnu. A guard that cannot fail
-/// reads as coverage, which is worse than no guard. That break now fails
-/// `test_tiers_exhaustive_bytes_and_positions` on every host in the fleet,
-/// aarch64 hardware or not.
-///
-/// What a non-aarch64 host cannot check is the CODEGEN contract above — that
-/// these folds still lower to `umaxv`/`uminv`. That stays an `--emit asm`
-/// inspection on an aarch64 box; the differentials guard the semantics.
+/// It is portable safe Rust with target-independent results, so the `test`
+/// arm of the cfg compiles it on every host and the differential tests
+/// (`test_tiers_exhaustive_bytes_and_positions`) hold it to the scalar
+/// reference there: breaking the `wrapping_sub(0x20)` / `worst > 0x5E`
+/// identity fails on any host. Only the codegen contract needs an aarch64
+/// `--emit asm`.
 #[cfg(any(target_arch = "aarch64", test))]
 mod arm_simd {
     /// Find first C0 control byte (< 0x20) via chunked classification.
@@ -398,12 +294,8 @@ mod arm_simd {
         let (chunks, rem) = input.as_chunks::<16>();
         let mut offset = 0usize;
         for chunk in chunks {
-            // Min-reduce, not an OR-reduce over `bool`: LLVM lowers this to a
-            // single `uminv.16b`. The `let mut any = false; any |= byte < 0x20`
-            // form it replaced did NOT vectorize (an i1 reduction over a
-            // short-circuiting `||` defeats the loop vectorizer) — it fully
-            // unrolled to 16 `ldrb`/compare pairs per chunk. See the module
-            // doc for the codegen contract.
+            // Min-reduce (one `uminv.16b`), not a `bool` OR-fold, which does
+            // not vectorize; see the module doc.
             let mut lowest = 0xFFu8;
             for &byte in chunk {
                 lowest = if byte < lowest { byte } else { lowest };
@@ -425,12 +317,8 @@ mod arm_simd {
         None
     }
 
-    /// Find the first byte equal to any of `needles` via chunked classification.
-    ///
-    /// Mirrors [`find_c0_control_neon`] but matches a small fixed needle set by
-    /// OR-reducing one equality compare per needle over each 16-byte chunk.
-    /// Equality compares match the exact byte, so high needles like 0x9C (ST)
-    /// are handled correctly.
+    /// Find the first byte equal to any of `needles`: one equality compare per
+    /// needle, OR-reduced over each 16-byte chunk (exact, so 0x9C matches).
     #[inline]
     pub(crate) fn find_any_of_neon<const N: usize>(
         input: &[u8],
@@ -475,13 +363,10 @@ mod arm_simd {
         let (chunks, rem) = input.as_chunks::<16>();
         let mut offset = 0usize;
         for chunk in chunks {
-            // Max-reduce over `byte.wrapping_sub(0x20)`: LLVM lowers this to a
-            // single `umaxv.16b`. `biased > 0x5E` is exactly
-            // `byte < 0x20 || byte > 0x7E` over u8 — 0x20..=0x7E biases to
-            // 0..=0x5E, 0x7F..=0xFF to 0x5F..=0xDF, and 0x00..=0x1F wraps to
-            // 0xE0..=0xFF. The `bool` OR-reduce this replaced did NOT
-            // vectorize; see the module doc for the codegen contract and the
-            // measured cost.
+            // Max-reduce over `byte.wrapping_sub(0x20)` (one `umaxv.16b`):
+            // `biased > 0x5E` is exactly `byte < 0x20 || byte > 0x7E` (0x20..=0x7E
+            // maps to 0..=0x5E, 0x7F..=0xFF to 0x5F..=0xDF, 0x00..=0x1F to
+            // 0xE0..=0xFF). See the module doc for why not a `bool` fold.
             let mut worst = 0u8;
             for &byte in chunk {
                 let biased = byte.wrapping_sub(0x20);
@@ -497,7 +382,6 @@ mod arm_simd {
             }
             offset = offset.saturating_add(16);
         }
-        // Handle remaining bytes with scalar fallback
         for (i, &byte) in rem.iter().enumerate() {
             if !(0x20..=0x7E).contains(&byte) {
                 return Some(offset.saturating_add(i));
@@ -507,28 +391,15 @@ mod arm_simd {
     }
 }
 
-// =============================================================================
-// Public API with runtime dispatch
-// =============================================================================
-
-/// Find the first non-printable byte using the best available SIMD.
-///
-/// This function automatically selects the optimal implementation:
-/// - AVX2 on x86_64 with AVX2 support and a full 32-byte chunk
-/// - SSE2 on x86_64 otherwise (baseline, no detection)
-/// - NEON on aarch64
-/// - Scalar fallback on other platforms
+/// Find the first non-printable byte with the best tier: AVX2 on x86_64 when
+/// available and the input holds a full 32-byte chunk, else SSE2; NEON on
+/// aarch64; scalar elsewhere.
 #[inline]
 #[allow(unreachable_code)]
 fn find_non_printable_simd(input: &[u8]) -> Option<usize> {
-    // Empty-run fast boundary: if the FIRST byte is already non-printable there is no
-    // printable run to scan — return without the SIMD load + `has_avx2()` OnceLock. This
-    // is the common case on CRLF-terminated output (one empty run per line) and dense
-    // CSI/UTF-8 TUI redraws. Byte-identical to the SIMD/scalar result (which returns
-    // `Some(0)` for a non-printable first byte and `None` for empty input), and the
-    // predicate matches `find_non_printable_scalar` verbatim, which the tier
-    // differentials below hold every arm to. On the pure-ASCII hot run this is one
-    // predicted-not-taken branch before the existing dispatch.
+    // A non-printable first byte is an empty run (once per line on CRLF
+    // output, often in dense CSI/UTF-8 redraws): answer it before the SIMD load
+    // and the `has_avx2()` check, with the result every arm gives.
     match input.first() {
         Some(&b0) if !(0x20..=0x7E).contains(&b0) => return Some(0),
         None => return None,
@@ -554,37 +425,25 @@ fn find_non_printable_simd(input: &[u8]) -> Option<usize> {
     find_non_printable_scalar(input)
 }
 
-/// Scalar implementation (LLVM auto-vectorized).
-/// Used as fallback when SIMD is not available.
+/// The scalar reference and fallback.
 #[inline]
 fn find_non_printable_scalar(input: &[u8]) -> Option<usize> {
     input.iter().position(|&b| !(0x20..=0x7E).contains(&b))
 }
 
-/// Find the next byte that's not in the printable ASCII range.
-///
-/// This is the primary fast path function, using explicit SIMD when available:
-/// - AVX2 on x86_64 (32 bytes/iteration, runtime-detected)
-/// - SSE2 on x86_64 (16 bytes/iteration, baseline — no detection)
-/// - NEON on aarch64 (16 bytes/iteration)
-/// - Scalar fallback on other architectures
+/// Find the first byte outside printable ASCII (0x20-0x7E).
 #[inline]
 pub(super) fn find_non_printable(input: &[u8]) -> Option<usize> {
     find_non_printable_simd(input)
 }
 
-/// Count the number of printable ASCII bytes at the start of input.
-///
-/// Returns the length of the prefix that's all printable ASCII.
+/// The length of `input`'s printable-ASCII prefix.
 #[inline]
 pub(crate) fn count_printable(input: &[u8]) -> usize {
     find_non_printable(input).unwrap_or(input.len())
 }
 
-/// Optimized batch print: returns slice of printable ASCII at start.
-///
-/// This is used by the fast path to avoid per-byte dispatch for
-/// long runs of printable text.
+/// Split `input` into its printable-ASCII prefix and the rest.
 #[inline]
 pub(crate) fn take_printable(input: &[u8]) -> (&[u8], &[u8]) {
     let n = count_printable(input);
@@ -594,14 +453,8 @@ pub(crate) fn take_printable(input: &[u8]) -> (&[u8], &[u8]) {
     input.split_at_checked(n).unwrap_or((input, &[]))
 }
 
-/// Find the first C0 control byte (< 0x20) in input.
-///
-/// Used by the OSC/DCS fast paths to bulk-skip data bytes.
-/// In OscString state, bytes 0x20-0xFF are all OscPut (data);
-/// only bytes < 0x20 need state machine handling (BEL terminator,
-/// ESC for ST, CAN, SUB, etc.).
-///
-/// Returns `None` if the entire input is >= 0x20.
+/// Find the first C0 control byte (< 0x20): the OSC bulk path's boundary, since
+/// every byte 0x20-0xFF in `OscString` is data.
 #[inline]
 pub(crate) fn find_c0_control(input: &[u8]) -> Option<usize> {
     find_c0_control_simd(input)
@@ -632,16 +485,9 @@ fn find_c0_control_scalar(input: &[u8]) -> Option<usize> {
     input.iter().position(|&b| b < 0x20)
 }
 
-/// Find the first byte in `input` that equals any of the `needles`.
-///
-/// Used by the DCS/APC passthrough bulk fast paths to bulk-skip data bytes:
-/// `needles` is the small fixed terminator set ({0x18,0x1A,0x1B,0x9C}, plus
-/// 0x7F for `DcsPassthrough`). Mirrors [`find_c0_control`] but matches a fixed
-/// multi-byte set via OR-reduced equality compares instead of a single
-/// threshold, so megabyte DCS/APC payloads (Sixel, Kitty graphics) get the
-/// same SIMD throughput the OSC path already enjoys.
-///
-/// Returns `None` if no byte in `input` is in `needles`.
+/// Find the first byte in `input` that equals any of the `needles`: the DCS/APC
+/// bulk paths' terminator set ({0x18, 0x1A, 0x1B, 0x9C}, plus 0x7F for
+/// `DcsPassthrough`), so megabyte sixel and kitty payloads scan with SIMD.
 #[inline]
 pub(crate) fn find_any_of<const N: usize>(input: &[u8], needles: [u8; N]) -> Option<usize> {
     find_any_of_simd(input, needles)
@@ -830,13 +676,9 @@ mod tests {
         }
     }
 
-    // Random-buffer differential over the same arms, with buffer lengths that
-    // span the 16/32-byte chunk boundaries and bytes biased toward printable
-    // so the scans reach deep offsets and chunk-boundary tails. This is the
-    // half the planted-byte grid above cannot reach: several matches in one
-    // chunk, where an arm must still return the FIRST.
-    //
-    // Arch-neutral for the same reason, and by the same three layers.
+    // Random-buffer differential over the same arms and layers: lengths across
+    // the chunk boundaries, bytes biased toward printable, so one chunk can
+    // hold several matches and an arm must still return the first.
     #[test]
     fn test_tiers_random_buffers() {
         #[cfg(target_arch = "x86_64")]

@@ -1,0 +1,32 @@
+seq v=1 rig=screen program=codex build=0.164.0
+# 6F-4: the program's own reports (OSC 7501, `program` marks of its run,
+# src=engine conf=claim) move no turn, need or clause: the turn opens, its
+# box opens and closes, and the turn settles on the screen's words alone,
+# as in prompt-approval-box.seq.
+program working
+expect mark r1 program state=working src=engine conf=claim @0
+see busy
+half
+program blocked ask=permission
+expect mark r1 program state=blocked ask=permission src=engine conf=claim @500
+expect turn=open
+expect need=none
+see prompt bash:not-read-only
+expect open p1 approval par=t1 box=bash:not-read-only src=screen conf=strong @500
+expect need=approval:bash
+expect clause=approval · bash
+program working
+expect mark r1 program state=working src=engine conf=claim @500
+see busy
+expect close p1 approval out=passed
+expect need=none
+half
+program done
+expect mark r1 program state=done src=engine conf=claim @1000
+expect turn=open
+see idle
+half
+half
+expect open t1 turn
+expect close t1 turn out=done dur_ms=1000 steps=1 appr=1
+expect clause=idle

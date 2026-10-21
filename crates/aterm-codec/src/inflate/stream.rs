@@ -750,10 +750,9 @@ pub struct GzipReader<R> {
     crc: Crc32,
     member_len: u64,
     /// How many members have been read and verified. A gzip stream must contain
-    /// at least one: an EMPTY input is a truncated file, not a zero-member
+    /// at least one: an empty input is a truncated file, not a zero-member
     /// archive, and the `tar-gz` lane must refuse a zero-byte download rather
-    /// than hand the extractor an empty tar. (`flate2`'s `MultiGzDecoder`
-    /// refuses it; the differential oracle caught this crate accepting it.)
+    /// than hand the extractor an empty tar.
     members: u64,
 }
 

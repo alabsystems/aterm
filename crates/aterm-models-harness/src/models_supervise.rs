@@ -877,6 +877,40 @@ pub fn supervisor_cruise_model() -> Model {
 /// moves to, and so does that live read: told only at points, `✓ landed`
 /// stood through a person's new task for as long as it ran.
 ///
+/// WHY LAND STILL HOLDS (the Autopilot design's §12.3.3), as the loop tells
+/// its host (`IdleHost::land_held`, from its one teller, `Session::tell_hold`:
+/// at the loop's start, at each point folded in, at each live read of
+/// someone else's turn and at each act's ledger row): `hold` the hold
+/// the host was last told — 0 none, 1 a hold whose legs are unread, 2 a
+/// hold read at a land act's yield — and `hlegs` its legs, in the engine's
+/// own bits (`HoldLeg`: NEEDS 1, REPO 2, OPEN 4, DEFENSE 8). Two ghosts say
+/// what the hold is: `judged` 1 from a land act's yield that did not land
+/// (`pending` 1, or a wall's retry that delivered a land act, `pending` 3
+/// with `cut`) until someone else's turn (its live read or its end) or a
+/// landing; `relanded` 1 from a landing (and a landed record taken on)
+/// until Land's next act begins the hold again (`HoldStart::LANDED`). The
+/// law `TheHostIsToldWhatHoldsTheLanding`: no hold is told before the
+/// instruction, after a landing until Land's next act, at a landed task or
+/// a person's own exchange; else a hold is told, read exactly where
+/// `judged`, and then — unless a wall has cut the land act typed since
+/// (`cut`: the legs are the yield's, the model's `dirty` the wall's) — with
+/// the state's own legs: `defense` iff `said < 2`, `open` iff `said == 3`,
+/// `needs` iff `said == 2 && need == 1`, `repo` iff `dirty == 1`. The
+/// engine's `needs` leg is "said this turn"; the model's `need` is the
+/// standing set, which `YieldWork` and `YieldClaim` keep from an earlier
+/// report — so the law reads `need` only at a defense (`said == 2`), which
+/// replaces the set with its own lines, and there the two agree. Not
+/// modeled, and held by the engine's unit tests (3a's
+/// `turn_end_hold_tests.rs`): a work report's own `NEEDS YOU:` lines, a
+/// need said earlier in the turn (`turn_said`), and a reply read cut
+/// (`said_cut`, the `cut` leg); the model's `cut` is a wall's cut of a land
+/// act, no leg. `StaleHold = 1` leaves the hold told as it was at a yield
+/// while the face is told: the face law holds, and only the hold's law
+/// refutes it. `Buggy = 2` is the same mutant, the dial `aterm-models`'
+/// `non_vacuity` sweep (which turns `Buggy` alone) reaches it by: one
+/// mutant of the hold's own (`Buggy = 1`'s landing on a claim breaks the
+/// hold's law too, as it breaks the landing's).
+///
 /// `quiet`, `held`, `typed_landed` and `nudges` are the defects' ghosts.
 /// `Buggy = 1` lands the task on the retired token or a done phrase at a
 /// land act's yield (the policy before FOREVER LAND, whose done reply
@@ -899,13 +933,16 @@ pub fn supervisor_cruise_model() -> Model {
 /// wall, and that the face its teller tells is the model's — and three
 /// tellers that miss it each fail the walk: one told on the journal's
 /// `DONE`/`LEFT` notes alone, one told at points alone, and one that says
-/// landed for any done task.
+/// landed for any done task. The hold its teller tells is the model's too,
+/// and three tellers that miss it fail the walk: one that never tells it,
+/// one told at points alone, and one never told at an act's row.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_land_model() -> Model {
     aterm_spec::ty_model! {
         SupervisorLand {
             const Buggy = 0;
+            const StaleHold = 0;
             var typed = 0;
             var pending = 0;
             var said = 0;
@@ -924,6 +961,10 @@ pub fn supervisor_land_model() -> Model {
             var quiet = 0;
             var held = 0;
             var typed_landed = 0;
+            var judged = 0;
+            var relanded = 0;
+            var hold = 0;
+            var hlegs = 0;
 
             // The episode's instruction, at its first free point.
             action Instruction when (
@@ -932,6 +973,9 @@ pub fn supervisor_land_model() -> Model {
             ) {
                 typed = 1;
                 pending = 1;
+                relanded = 0;
+                hold = 1;
+                hlegs = 0;
             }
             // A nudge at every free point after it, with no bound (`Buggy`:
             // a landed task nudged too; its first two counted for the
@@ -944,6 +988,9 @@ pub fn supervisor_land_model() -> Model {
                 typed_landed = if landed == 1 { 1 } else { typed_landed };
                 nudges = if Buggy == 1 && nudges <= 1 { nudges + 1 } else { nudges };
                 pending = 1;
+                relanded = 0;
+                hold = if landed == 1 { 0 } else if judged == 1 { 2 } else { 1 };
+                hlegs = if landed == 1 { 0 } else { hlegs };
             }
             // A question: the land answer — a land act once the instruction
             // was typed.
@@ -953,6 +1000,9 @@ pub fn supervisor_land_model() -> Model {
             ) {
                 asked = 0;
                 pending = if typed == 1 { 1 } else { 2 };
+                relanded = 0;
+                hold = if typed == 0 { 0 } else if judged == 1 { 2 } else { 1 };
+                hlegs = if typed == 0 { 0 } else { hlegs };
             }
             // The wall's act, whatever stands: a wall is always acted on.
             action WallAct when (pending == 0 && walled == 1 && landed == 0 && left == 0) {
@@ -979,6 +1029,25 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 0 };
                 backoff = if pending == 3 { short } else { 0 };
                 pending = 0;
+                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    2
+                } else {
+                    hold
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    8
+                } else {
+                    hlegs
+                };
             }
             action YieldAsk when (pending > 0) {
                 said = 0;
@@ -990,6 +1059,25 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
+                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    2
+                } else {
+                    hold
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    8
+                } else {
+                    hlegs
+                };
             }
             action YieldWall when (pending > 0) {
                 walled = 1;
@@ -1020,6 +1108,25 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
+                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    2
+                } else {
+                    hold
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    8
+                } else {
+                    hlegs
+                };
             }
             action YieldDefense when (pending > 0) {
                 said = 2;
@@ -1032,6 +1139,22 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
+                judged = if pending == 1 || (pending == 3 && cut == 1) { 0 } else { judged };
+                relanded = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { relanded };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if typed == 0 || relanded == 1 || pending == 1 || (pending == 3 && cut == 1) {
+                    0
+                } else {
+                    hold
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if typed == 0 || relanded == 1 || pending == 1 || (pending == 3 && cut == 1) {
+                    0
+                } else {
+                    hlegs
+                };
             }
             action YieldDefenseDirty when (pending > 0) {
                 said = 2;
@@ -1052,6 +1175,25 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
+                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    2
+                } else {
+                    hold
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    2
+                } else {
+                    hlegs
+                };
             }
             action YieldDefenseNeeds when (pending > 0) {
                 said = 2;
@@ -1072,6 +1214,25 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
+                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    2
+                } else {
+                    hold
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    1
+                } else {
+                    hlegs
+                };
             }
             action YieldOpenDefense when (pending > 0) {
                 said = 3;
@@ -1084,6 +1245,25 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
+                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                hold = if StaleHold == 1 || Buggy == 2 {
+                    hold
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    2
+                } else {
+                    hold
+                };
+                hlegs = if StaleHold == 1 || Buggy == 2 {
+                    hlegs
+                } else if typed == 0 || relanded == 1 {
+                    0
+                } else if pending == 1 || (pending == 3 && cut == 1) {
+                    4
+                } else {
+                    hlegs
+                };
             }
             // A LIVE READ OF SOMEONE ELSE'S TURN (no act of the policy's
             // awaited), before its end: the face is open again, told at this
@@ -1091,6 +1271,9 @@ pub fn supervisor_land_model() -> Model {
             action OtherTurnRuns when (pending == 0 && walled == 0 && other == 0) {
                 other = 1;
                 told = if Buggy == 1 { told } else { 0 };
+                judged = 0;
+                hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
+                hlegs = 0;
             }
             // Someone else's turn of real work ends — on progress, or on a
             // defense, which lands nothing outside a land act's yield: the
@@ -1107,6 +1290,9 @@ pub fn supervisor_land_model() -> Model {
                 left = 0;
                 other = 0;
                 told = 0;
+                judged = 0;
+                hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
+                hlegs = 0;
             }
             action OtherTurnDefense when (pending == 0 && walled == 0) {
                 said = 2;
@@ -1120,6 +1306,9 @@ pub fn supervisor_land_model() -> Model {
                 left = 0;
                 other = 0;
                 told = 0;
+                judged = 0;
+                hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
+                hlegs = 0;
             }
             // A PERSON'S OWN EXCHANGE: their quick message where the policy
             // carries no task (the worker claimed done, or the task landed),
@@ -1137,6 +1326,9 @@ pub fn supervisor_land_model() -> Model {
                 left = 1;
                 other = 0;
                 told = 2;
+                judged = 0;
+                hold = 0;
+                hlegs = 0;
             }
             // Someone else's turn ends on a wall: no claim, no landing; the
             // streak stands.
@@ -1151,6 +1343,9 @@ pub fn supervisor_land_model() -> Model {
                 left = 0;
                 other = 0;
                 told = 0;
+                judged = 0;
+                hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
+                hlegs = 0;
             }
             // A new loop reads the task record's landing: taken on where the
             // point could be one (`Buggy`: at a wall too).
@@ -1162,6 +1357,10 @@ pub fn supervisor_land_model() -> Model {
                 said = 2;
                 dirty = 0;
                 told = 1;
+                judged = 0;
+                relanded = 1;
+                hold = 0;
+                hlegs = 0;
             }
             // `Buggy`: the landing spent after two nudges goes quiet.
             action SpentAfterTwo when (
@@ -1189,6 +1388,17 @@ pub fn supervisor_land_model() -> Model {
                 (other == 0 && left == 1 && told == 2) ||
                 (other == 0 && left == 0 && landed == 1 && told == 1) ||
                 (other == 0 && left == 0 && landed == 0 && told == 0);
+            invariant TheHostIsToldWhatHoldsTheLanding:
+                (hold == 0 && hlegs == 0 &&
+                    (typed == 0 || relanded == 1 || (other == 0 && (landed == 1 || left == 1)))) ||
+                (typed == 1 && relanded == 0 && (other == 1 || (landed == 0 && left == 0)) &&
+                    ((hold == 1 && judged == 0 && hlegs == 0) ||
+                        (hold == 2 && judged == 1 &&
+                            (cut == 1 ||
+                                hlegs == (if said <= 1 { 8 } else { 0 }) +
+                                    (if said == 3 { 4 } else { 0 }) +
+                                    (if said == 2 && need == 1 { 1 } else { 0 }) +
+                                    (if dirty == 1 { 2 } else { 0 })))));
         }
     }
 }

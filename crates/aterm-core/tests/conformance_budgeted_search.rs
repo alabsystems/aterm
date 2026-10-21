@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the budgeted full-buffer search lifecycle.
+//! Tier-1 conformance for the budgeted full-buffer search lifecycle: the trace projects
+//! the real `BudgetedSearchStep` (`rows_fed`, `total_rows`, `complete`, `cursor`,
+//! `search_id`, `reset`) through fresh start, valid resume, every modeled restart class,
+//! cancellation, ordinary and one-turn completion, token retirement, and a dense stream
+//! whose scan finishes before two drain-only turns deliver its backlog.
 //!
-//! The trace projects the real public `BudgetedSearchStep`: `rows_fed`,
-//! `total_rows`, `complete`, `cursor`, `search_id`, and `reset`. It drives fresh
-//! start, valid resume, every modeled restart class, cancellation, ordinary and
-//! one-turn completion, post-completion token retirement, and a dense result
-//! stream whose scan finishes before two drain-only turns deliver its backlog.
-//!
-//! Process-global `u64` identities are normalized by first-seen rank. A valid
-//! resume must therefore preserve its rank, while every `reset` step must expose
-//! the next never-before-seen rank even when it completes without a cursor.
-//! Result delivery is read the way a host sees it: the deltas it appended since
-//! the last `reset`, against the snapshot's real match count.
+//! Process-global `u64` identities are normalized by first-seen rank: a valid resume keeps
+//! its rank, and every `reset` step exposes the next unseen one. Delivery is read as a host
+//! sees it: the deltas appended since the last `reset`, against the real match count.
 
 use std::collections::BTreeMap;
 
@@ -64,13 +60,12 @@ fn snapshot_matches(terminal: &mut Terminal, query: &str) -> usize {
         .len()
 }
 
-/// Project one returned step. `prior_id` and `stream_id` are the trace ghosts:
-/// `prior_id` is the logical stream a real `reset` replaced, and `stream_id` is
-/// the identity the host last saw a `reset` announce (what a host accumulating
-/// deltas keys on). `delivery` counts backlog turns from the host's delivery
-/// ledger against `snapshot_matches`, not from `complete`: a finished scan
-/// whose deltas do not yet cover the snapshot holds a backlog. The real code's
-/// `complete` is `scan done && emitted >= result_count`, so the two agree.
+/// Project one returned step. `prior_id` (the stream a real `reset` replaced) and
+/// `stream_id` (the identity the last `reset` announced, which a host accumulating deltas
+/// keys on) are trace ghosts. `delivery` counts backlog turns from the host's ledger
+/// against `snapshot_matches`, not from `complete`: a finished scan whose deltas do not yet
+/// cover the snapshot holds a backlog. The real `complete` is
+/// `scan done && emitted >= result_count`, so the two agree.
 fn project_step(
     step: &BudgetedSearchStep,
     host: &mut HostTrace,
@@ -632,11 +627,9 @@ fn dense_result_backlog_drains_without_rescanning_or_replaying_deltas() {
     assert_eq!(got, oracle, "ordered deltas concatenate exactly once");
 }
 
-/// The model's other `Buggy=1` slips (the scan-only completion and the
-/// gate-free final drain are replayed in the dense test above), replayed on
-/// real steps: each is the step a slipped `search_budgeted` would return,
-/// projected through the same `project_step`, equal to the mutant's successor,
-/// and refused by the healthy model.
+/// The model's other `Buggy=1` slips (the dense test above replays two more), on real
+/// steps: each is the step a slipped `search_budgeted` would return, projects to the
+/// mutant's successor, and is refused by the healthy model.
 #[test]
 fn slipped_real_steps_are_the_buggy_transitions_and_are_rejected() {
     let model = budgeted_search_resume_model();

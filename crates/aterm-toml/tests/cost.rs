@@ -1,22 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Parse work is linear in the input: no step repeated once per line may
-//! re-read text an earlier line wrote.
-//!
-//! Pinned by input SIZE, never by a clock: each document here is a fraction of
-//! a second of linear work and minutes of quadratic work, so a regression is a
-//! test that does not finish rather than a timing that a loaded machine could
-//! fake.
+//! Parse work is linear in the input. Pinned by input size, never a clock: each document
+//! is a fraction of a second of linear work and minutes of quadratic work, so a regression
+//! is a test that does not finish.
 
 use aterm_toml::edit::DocumentMut;
 
-/// One header whose name is a megabyte, then a hundred thousand short
-/// key-value lines under it.
-///
-/// Every line resolves the table the header opened. Looked up by name, that
-/// hashes the megabyte once per line (10^11 byte-steps, minutes); by position
-/// it costs a step per header SEGMENT.
+/// A megabyte-long header name, then 100,000 key-value lines under it: resolving each
+/// line's table by name would hash the megabyte once per line.
 #[test]
 fn many_lines_under_a_long_header_cost_one_pass() {
     const NAME: usize = 1 << 20;

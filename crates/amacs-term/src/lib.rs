@@ -4,12 +4,13 @@
 //! The `amacs` program (docs/DESIGN-amacs-2026-10-19.md §5-§7): `amacs FILE`,
 //! the argv0 alias of the one `aterm` binary, and `aterm edit FILE`.
 //!
-//! [`run_client`] picks the face ([`decide`]) and, inside an aterm window,
-//! runs the native face's client ([`client`]): each file opens in a fresh
-//! Editor tab beside the caller's, and the client waits, silently, until the
-//! tab is closed. The terminal face (T3's terminal UI) and the machine
-//! protocol (A3) are planned; until T3 lands, a run that needs the terminal
-//! says so and exits 1.
+//! [`run_client`] picks the face ([`decide`]). Inside an aterm window it runs
+//! the native face's client ([`client`]): each file opens in a fresh Editor
+//! tab beside the caller's, and the client waits, silently, until the tab is
+//! closed. Everywhere else (over ssh, in tmux or screen, with `-nw`, or when
+//! the window will not take the file) it runs the terminal face ([`tui`]),
+//! which edits in the terminal itself with the same engine. The machine
+//! protocol (A3) is planned.
 
 // A contracted fn is written once, through `trust_contract_fn!`: under Trust's
 // verifying session (`cfg(trust_verify)`) it carries its native `ensures`
@@ -61,6 +62,8 @@ macro_rules! verify_island {
 
 pub mod client;
 pub mod decide;
+mod render;
+pub mod tui;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal as _, Write as _};
@@ -70,14 +73,13 @@ use std::process::ExitCode;
 /// terminal (`s-<hex>`), which every session's shell is given.
 const PARENT_SESSION_ENV: &str = "ATERM_PARENT_SESSION_ID";
 
-/// What the terminal face says until it exists.
-pub const NO_TERMINAL_EDITOR: &str =
-    "amacs: the terminal editor is not built yet; run amacs inside an aterm window";
-
 /// `amacs [ARGS]` / `aterm edit [ARGS]` (`args` past the program name or
-/// verb): the whole program, to its exit status.
+/// verb): the whole program, to its exit status. `write` is the run's one
+/// buffer-write capability, which the launcher mints
+/// (`aterm_cli::amacs_launch`) and only the terminal face uses: the native
+/// face's window does its own writing.
 #[must_use]
-pub fn run_client(args: Vec<OsString>) -> ExitCode {
+pub fn run_client(args: Vec<OsString>, write: aterm_buffer::WriteCap) -> ExitCode {
     let mut tty = std::io::stderr();
     let args = match client::parse_args(&args) {
         Ok(client::Command::Help) => {
@@ -117,26 +119,36 @@ pub fn run_client(args: Vec<OsString>) -> ExitCode {
         }
         // The native face needs `parent_session` (`decide::native_face`'s
         // proved contract), which is `sid.is_some()`: no `None` reaches it.
-        (decide::Face::Terminal, _) | (decide::Face::Native, None) => terminal_face(None),
+        (decide::Face::Terminal, _) | (decide::Face::Native, None) => {
+            terminal_face(write, &args.targets, None)
+        }
         (decide::Face::Native, Some(sid)) => {
             let for_word = client::for_word(client::parent_program().as_deref());
             let mut window = client::SessionWindow { sid };
             match client::edit_files(&args, for_word.as_deref(), &mut window, &mut tty) {
                 client::Ending::Done => ExitCode::SUCCESS,
-                client::Ending::Terminal(why) => terminal_face(Some(&why)),
+                // The window would not take a file: it and the files after it
+                // are this terminal's.
+                client::Ending::Terminal { why, from } => {
+                    let rest = args.targets.get(from..).unwrap_or_default();
+                    terminal_face(write, rest, Some(&why))
+                }
                 client::Ending::Exit(code) => ExitCode::from(code),
             }
         }
     }
 }
 
-/// The terminal face. Until T3 builds it, it says so (after why the window
-/// would not take the file, when that is why it was asked) and exits 1.
-fn terminal_face(why: Option<&str>) -> ExitCode {
-    let mut tty = std::io::stderr();
-    if let Some(why) = why {
-        client::say(&mut tty, why);
-    }
-    client::say(&mut tty, NO_TERMINAL_EDITOR.trim_start_matches("amacs: "));
-    ExitCode::FAILURE
+/// The terminal face over `targets`, the program the edit is for named on
+/// its modeline. `why`, when given, is why the window did not take them.
+fn terminal_face(
+    write: aterm_buffer::WriteCap,
+    targets: &[client::Target],
+    why: Option<&str>,
+) -> ExitCode {
+    let options = tui::Options {
+        for_word: client::for_word(client::parent_program().as_deref()),
+        ..tui::Options::default()
+    };
+    tui::run_tui(write, targets, options, why)
 }

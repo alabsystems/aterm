@@ -21,6 +21,8 @@
 
 use aterm_converge::{Class, Explain, Item, ItemReport, Layer, Mode, Outcome, Probe, Remedy};
 
+pub mod repair;
+
 /// (0) Which atpkg is speaking.
 pub const ATPKG: &str = "base.pkg.atpkg";
 /// (0) The aterm app's own update posture.

@@ -6,13 +6,11 @@ use super::{
     display_endpoints_from, linux_trial_start, loop_goes_first,
 };
 
-/// Leave at `path` the socket file a display server that exited leaves behind: one
-/// nothing answers. A DATAGRAM socket, never a dropped stream listener: macOS marks a
-/// socket close-on-exec only after `socket()` returns, so another test's
-/// `posix_spawn` in that window inherits the listener and keeps it listening after
-/// this test drops its copy, and a connect then succeeds into its backlog — a
-/// parallel test run then reads a stale-compositor answer. A stream connect to a
-/// datagram socket's path is refused (`EPROTOTYPE`) whoever still holds it.
+/// Leave at `path` the socket file of a display server that exited: one nothing answers.
+/// A datagram socket, not a dropped stream listener: macOS sets close-on-exec only after
+/// `socket()` returns, so a concurrent test's `posix_spawn` can inherit the listener and keep it
+/// listening, and a connect then succeeds into its backlog. A stream connect to a datagram
+/// socket's path is refused (`EPROTOTYPE`) whoever holds it.
 fn server_gone_socket(path: &std::path::Path) {
     drop(std::os::unix::net::UnixDatagram::bind(path).unwrap());
 }
@@ -25,16 +23,9 @@ fn only<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> +
     }
 }
 
-/// ROUND EIGHT OF THE UPDATE AUDIT, #82 — A DISPLAY VARIABLE NOTHING ANSWERS IS
-/// NO WINDOW START AT THE BOOT APPLY. `DISPLAY=:99` with no X server on :99 (a
-/// socket file left by a server that is gone, or none at all): a windowed launch
-/// fails "cannot open a display" whatever build it is, so its start is left for
-/// the display's opening, which never comes.
-///
-/// FAILS WITHOUT THE FIX: the variable alone made it a window start, counted
-/// before the event loop failed; the fourth rolled a healthy build back.
-///
-/// NEGATIVE CONTROL: a socket a server listens on is a window start.
+/// A `DISPLAY` nothing answers (`:99` with no X server: a stale socket file or none) is no
+/// window start at the boot apply: the launch fails "cannot open a display", so its start is
+/// left for the display's opening. Negative control: a listening socket is a window start.
 #[test]
 fn a_display_variable_nothing_answers_is_no_window_start() {
     let root = aterm_tempfile::TempDir::new().unwrap();

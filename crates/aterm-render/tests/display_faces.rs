@@ -543,9 +543,8 @@ fn from_system_with_family_draws_a_display_family_over_the_default_font() {
     assert_eq!(renderer.display_faces(), vec!["engraved"]);
 }
 
-/// MIX parsing is exact: 1..=3 distinct known ids joined by `+`; anything
-/// else (unknown id, duplicate, over the cap, empty) rejects the WHOLE
-/// request — never a silent partial mix.
+/// Mix parsing is exact: 1..=3 distinct known ids joined by `+`; anything else rejects the
+/// whole request, never a partial mix.
 #[test]
 fn display_mix_family_parsing_is_exact() {
     let solo = display_face_mix_for_family("display:pixel").expect("single id");
@@ -605,10 +604,8 @@ fn a_layer_routes_every_letter_across_its_faces() {
     assert_eq!(served.len(), 3, "every face of the mix draws some letter");
 }
 
-/// Ligatures on (the default) under a display face, alone or mixed, never put
-/// `.notdef` on screen: Monocraft's operator ligatures shape to glyph 0, so
-/// those runs must stay on the per-cell path and draw `=` and
-/// `>` themselves.
+/// With ligatures on (the default), a display face alone or mixed never puts `.notdef` on
+/// screen: Monocraft's operator ligatures shape to glyph 0, so those runs stay per-cell.
 #[test]
 fn display_face_operators_never_shape_to_notdef() {
     let operators = "a => b -> c != d <= e >= f";

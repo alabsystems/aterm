@@ -108,11 +108,40 @@ pub fn lay(layout: &Layout) -> std::io::Result<()> {
 /// stub: a copy run from a scratch dir keeps the standing stub's
 /// (installed) atpkg; a moved app re-points it at its own.
 pub(crate) fn lay_with(layout: &Layout, embedder: &crate::stub::Embedder) -> std::io::Result<()> {
+    match plan(layout, embedder) {
+        Plan::Nothing => Ok(()),
+        Plan::Remove(path) => {
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+        Plan::Lay(path, body) => {
+            layout.ensure_dir(&crate::reroute::dir(layout))?;
+            crate::lay::write_regenerable(&crate::lay::Executable::new(&path, body.as_bytes()))
+        }
+    }
+}
+
+/// Whether [`lay_with`] would write or remove the stub now: what `aterm pkg repair`'s
+/// `base.pkg.stubs` item reads beside the reroute stubs. Changes nothing.
+pub(crate) fn lay_pending(layout: &Layout, embedder: &crate::stub::Embedder) -> bool {
+    !matches!(plan(layout, embedder), Plan::Nothing)
+}
+
+/// What a lay of the stub does: nothing, remove an ours stub (abrew off), or write these
+/// bytes at this path.
+enum Plan {
+    Nothing,
+    Remove(PathBuf),
+    Lay(PathBuf, String),
+}
+
+/// [`lay_with`]'s decision, read and never acted on, so the lay and its probe are one rule.
+fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
     if cfg!(windows) {
-        return Ok(());
+        return Plan::Nothing;
     }
     if layout.declined().is_file() {
-        return Ok(());
+        return Plan::Nothing;
     }
     // The prefix this layout serves (never a test's neighbour): the env
     // override when engaged, else `<layout prefix>/abrew` — the same root
@@ -122,17 +151,12 @@ pub(crate) fn lay_with(layout: &Layout, embedder: &crate::stub::Embedder) -> std
         _ => Prefix::at(&layout.prefix.join("abrew")),
     };
     let path = stub_path(layout);
-    if !crate::config::load_abrew().enabled() {
-        if is_abrew_stub(&path) {
-            let _ = std::fs::remove_file(&path);
-        }
-        return Ok(());
-    }
-    if prefix.is_disabled() {
-        if is_abrew_stub(&path) {
-            let _ = std::fs::remove_file(&path);
-        }
-        return Ok(());
+    if !crate::config::load_abrew().enabled() || prefix.is_disabled() {
+        return if is_abrew_stub(&path) {
+            Plan::Remove(path)
+        } else {
+            Plan::Nothing
+        };
     }
     let standing = is_abrew_stub(&path)
         .then(|| std::fs::read_to_string(&path).ok())
@@ -146,16 +170,16 @@ pub(crate) fn lay_with(layout: &Layout, embedder: &crate::stub::Embedder) -> std
         &prefix.homebrew_bundle().join("bin/brew"),
     );
     match std::fs::symlink_metadata(&path) {
-        Err(_) => {}
+        Err(_) => Plan::Lay(path, body),
         Ok(_) if is_abrew_stub(&path) => {
             if std::fs::read(&path).is_ok_and(|have| have == body.as_bytes()) {
-                return Ok(());
+                Plan::Nothing
+            } else {
+                Plan::Lay(path, body)
             }
         }
-        Ok(_) => return Ok(()), // foreign: never touched
+        Ok(_) => Plan::Nothing, // foreign: never touched
     }
-    layout.ensure_dir(&crate::reroute::dir(layout))?;
-    crate::lay::write_regenerable(&crate::lay::Executable::new(&path, body.as_bytes()))
 }
 
 /// The one doctor row for the brew stub: laid/off/foreign/missing,

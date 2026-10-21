@@ -3,35 +3,26 @@
 
 //! The supervisor's hold on a worker that has stopped reading its input.
 //!
-//! A frozen worker's screen keeps showing what it last drew, and any key sent
-//! is queued behind unread input, so waiting for a box to go would wait
-//! forever. The server dates every input byte and `status` reports the oldest
-//! unread one's wait (`input=clear|pending|typeahead|stalled|stopped
-//! input_bytes=<n> input_wait_ms=<ms> fg_rss_mb=<n>`); past its threshold it
-//! publishes `agent=wall:unresponsive` and an attention entry of its own. A
-//! socket key behind input that has waited a second is still written, its `OK`
-//! carrying `warn=input-unread`; only one behind a published stall (or a
-//! stopped job) is refused `ERR busy input-unread`: a slow read is a
-//! warning, not a block.
+//! A frozen worker's screen keeps showing what it last drew and any key sent queues behind unread
+//! input, so waiting for a box to go would wait forever. The server dates every input byte;
+//! `status` reports `input=clear|pending|typeahead|stalled|stopped input_bytes=<n>
+//! input_wait_ms=<ms> fg_rss_mb=<n>` and, past its threshold, publishes `agent=wall:unresponsive`
+//! and an attention entry of its own. A key behind input unread for a second is still written
+//! (`OK … warn=input-unread`); only one behind a published stall or a stopped job is refused
+//! `ERR busy input-unread`.
 //!
 //! On `input=stalled|stopped` ([`Session::hold_for_stall`]) the loop unsets its
 //! own badge ([`Session::unset_if_ours`]), forgets the escalated box and the
 //! turn-end decision, presses nothing and journals `FROZEN …`. Any other word
 //! ([`Session::thaw`]) journals `THAWED …` and the point is decided afresh.
 //!
-//! The remedy ([`Session::stall_remedy`]): once a stall of `input=stalled` has
-//! stood `[harness] stall_term_after_s` (`0` never), with no person's hand
-//! within `human_grace_s`, no other hand, and a host that relaunches the agent
-//! ([`IdleHost::relaunches_after_stall`]), the loop warns once per episode
-//! (`STALL-WARNED …`, [`frozen_warning_text`]), or with `stall_term = true`
-//! sends the explicit restart, `restart pid=<leader> if-stalled
-//! quiet=<grace>` (design of 2026-10-08): the server stamps the agent before
-//! it signals it, so its exit is the restart's whoever reads it, and ends a
-//! program that lives through its `SIGTERM`. The server's own fences decide
-//! (`ERR not-stalled`, `busy`, `halted`: nothing, the next read decides;
-//! `ERR restart unavailable`: counted, the warning said instead); an older
-//! server that does not know the verb (`ERR unknown verb`, or `ERR denied`
-//! for a verb aimed at a session) gets the bare `signal term`.
+//! The remedy ([`Session::stall_remedy`]): once `input=stalled` has stood `[harness]
+//! stall_term_after_s` (`0` never), with no person's input within `human_grace_s`, no other hand,
+//! and a host that relaunches the agent, the loop warns once per episode (`STALL-WARNED …`), or
+//! under `stall_term = true` sends `restart pid=<leader> if-stalled quiet=<grace>`. The server
+//! stamps the agent before it signals (so its exit reads as the restart), ends a program that
+//! survives `SIGTERM`, and applies its own fences; a server without the verb gets the bare
+//! `signal term`.
 //!
 //! [`Session::stall_step`] runs after every unlatched wait step
 //! ([`Session::wait_for_next`]); [`Session::stall_look`] runs while a stall is
@@ -47,9 +38,8 @@ use super::escalate::status_field;
 use super::*;
 use crate::harness::resume::{AfterRestart, RELAUNCH_WORDS, restart_command};
 
-/// A worker the server says is not reading its input: `status
-/// input=stalled|stopped` and the numbers beside it (`-`, or absent, is
-/// `None`).
+/// A worker the server says is not reading its input: `status input=stalled|stopped` and the
+/// numbers beside it (`-` or absent is `None`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WorkerStall {
     /// `stalled` (frozen) or `stopped` (a stopped job with input queued).
@@ -227,10 +217,8 @@ pub(super) fn frozen_warning_text(
     );
     let then = match after {
         AfterRestart::Unknown => String::new(),
-        // Whole or not at all, as every remedy names it
-        // ([`crate::harness::resume::never_cut`]): the line, else its
-        // shorter forms (its permission mode alone, then bare), else none —
-        // a cut id names no conversation, or another's.
+        // Whole or not at all (`crate::harness::resume::never_cut`): the line, else a shorter
+        // form, else none; a cut id names no conversation, or another's.
         AfterRestart::Command(line) => std::iter::once(line.clone())
             .chain(crate::harness::resume::shorter(line))
             .map(|l| format!(", then `{l}` resumes it"))
@@ -241,18 +229,14 @@ pub(super) fn frozen_warning_text(
     format!("{program} frozen: not reading input{facts}\n{end}{then}")
 }
 
-/// The characters the window keeps of each further line of a supervisor's
-/// note ([`super::IdleHost::inform`]; `aterm_messages::DETAIL_LINE_CAP`,
-/// which cuts past it).
+/// The characters the window keeps of each further line of a supervisor's note
+/// (`aterm_messages::DETAIL_LINE_CAP`, which cuts past it).
 const NOTE_LINE_CHARS: usize = 240;
 
 impl<C: Ctl> Session<'_, C> {
-    /// Learn from any `status` reply the loop reads — for a box, a hold, the
-    /// fabric — whether the host measures the worker's input
-    /// ([`publishes_input`]), so the wait probes only a host that does; and
-    /// a stall it reports that the loop does not hold yet is suspected
-    /// ([`Self::stall_suspect`]), so nothing is pressed, typed or escalated
-    /// on the strength of the screen it came with ([`Self::stall_in_hand`]).
+    /// Learns from every `status` reply the loop reads whether the host measures the worker's
+    /// input ([`publishes_input`]), and suspects a stall it reports that is not held yet
+    /// ([`Self::stall_suspect`]), so nothing acts on the screen that came with it.
     pub(super) fn note_status(&mut self, args: &[&str], r: &CtlReply) {
         if args.first() == Some(&"status") && r.ok() {
             self.caps.input = Some(publishes_input(&r.stdout));
@@ -262,10 +246,9 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Whether a `status` read since the look began reported a stall this
-    /// watch does not hold yet ([`Self::note_status`]): the point on the
-    /// screen is not pressed, typed at, badged or asked about — no key
-    /// reaches a program that is not reading, and no answer does either.
+    /// Whether a `status` read since the look began reported a stall this watch does not hold
+    /// yet; if so the point on screen is not pressed, typed at, badged or asked about, since
+    /// nothing reaches a program that is not reading.
     pub(super) fn stall_in_hand(&self, review: &dyn Review) -> bool {
         review.unattended() && self.stall_suspect && self.stalled.is_none()
     }
@@ -407,9 +390,8 @@ impl<C: Ctl> Session<'_, C> {
         self.stall_remedy(&read_rest, seq, review)
     }
 
-    /// The stall is over (`status` reads another word, or no longer measures
-    /// the input): journaled `THAWED seq=<n> input=<w>`, and the point handed
-    /// over before it is forgotten, so the look decides it again.
+    /// The stall is over (`status` reads another word, or no longer measures the input): journaled
+    /// `THAWED seq=<n> input=<w>`, and the handed point forgotten so the look decides it again.
     pub(super) fn thaw(
         &mut self,
         seq: u64,
@@ -474,8 +456,7 @@ impl<C: Ctl> Session<'_, C> {
         // says `busy` for ever, and gated on its rest it was never restarted
         // and nobody was warned (the review of 2026-10-16, finding 2).
         if !self.stall_term {
-            // The default: a warning where the restart would be, once per
-            // episode: said, and one record for the person (the Messages).
+            // The default: a warning where the restart would be, once per episode.
             self.stall_termed = true;
             let after = self.after_restart();
             return self.warn_stall(
@@ -487,9 +468,7 @@ impl<C: Ctl> Session<'_, C> {
                 "(`[harness] stall_term = true` ends it)",
             );
         }
-        // THE EXPLICIT RESTART (design of 2026-10-08): the server stamps the
-        // agent before it signals, so its exit is the restart's whoever
-        // reads it, and its own fences decide under the same read.
+        // The explicit restart; the server's own fences decide under the same read.
         let leader = self.stall_host.as_ref().and_then(|h| h.agent_pid());
         let pid = leader.map(|p| format!("pid={p}"));
         let quiet = format!("quiet={}", self.stall_grace_s);
@@ -503,10 +482,6 @@ impl<C: Ctl> Session<'_, C> {
             return Err(Fail::Lost(format!("restart failed: {}", r.stderr.trim())));
         }
         if crate::supervise::report::without_verb(&r) {
-            // An older server: the bare `signal term` it knows. It answers a
-            // verb it does not know `ERR unknown verb` — or, aimed at a
-            // session as this one is (`@<sid>`), `ERR denied`: an unknown
-            // verb has no op class to authorize (review of 3eaa8f83c).
             return self.stall_signal_term(&stall, seq, review);
         }
         let reply = reply_line(&r);
@@ -543,9 +518,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The stall's warning in place of its remedy (once an episode): said
-    /// `STALL-WARNED … ended=no <why>`, and the record for a person
-    /// ([`frozen_warning_text`] with `after`) told the host.
+    /// The warning in place of the remedy, once an episode: said `STALL-WARNED … ended=no <why>`,
+    /// and [`frozen_warning_text`] given to the host.
     fn warn_stall(
         &mut self,
         read: &StallRead,
@@ -574,8 +548,8 @@ impl<C: Ctl> Session<'_, C> {
             .map_err(Fail::Hard)
     }
 
-    /// The remedy an older server knows (no `restart` verb): the bare `signal
-    /// term`, counted once it is sent.
+    /// The remedy for a server without the `restart` verb: the bare `signal term`, counted once
+    /// sent.
     fn stall_signal_term(
         &mut self,
         stall: &WorkerStall,
@@ -603,12 +577,10 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// After a step of [`Self::wait_for_next`] that did not latch: a probe,
-    /// unless a read has shown the host does not measure the input and no
-    /// stall is held or suspected ([`Caps::input`]: not known yet probes). A
-    /// stall seen for the first time is held ([`Self::hold_for_stall`]) and
-    /// the wait goes on; `true` when a held stall has LIFTED — the wait ends
-    /// and the next look thaws it ([`Self::stall_look`]).
+    /// After a wait step that did not latch: a probe, unless the host is known not to measure
+    /// input ([`Caps::input`]) and no stall is held or suspected. A new stall is held
+    /// ([`Self::hold_for_stall`]) and the wait goes on; `true` when a held stall has lifted, so
+    /// the wait ends and the next look thaws it ([`Self::stall_look`]).
     pub(super) fn stall_step(&mut self, seq: u64, review: &mut dyn Review) -> Result<bool, Fail> {
         if !review.unattended()
             || (self.caps.input == Some(false) && self.stalled.is_none() && !self.stall_suspect)
@@ -616,8 +588,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(false);
         }
         let read = self.stall_probe()?;
-        // This read is the fresh one: it decides whatever an earlier one
-        // suspected.
+        // This read decides whatever an earlier one suspected.
         self.stall_suspect = false;
         let Some(read) = read else {
             return Ok(self.stalled.is_some());
@@ -626,8 +597,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(self.stalled.is_some());
         }
         if self.stalled.is_some() {
-            // Held already: the numbers move, the episode does not — and the
-            // remedy is looked at again on them.
+            // Held already: the numbers move, the episode does not; the remedy is looked at again.
             self.stalled.clone_from(&read.stall);
             self.stall_remedy(&read, seq, review)?;
         } else {
@@ -636,11 +606,9 @@ impl<C: Ctl> Session<'_, C> {
         Ok(false)
     }
 
-    /// The top of a look, while a stall is held or a press was refused `ERR
-    /// busy input-unread` (or written with its warning): `status` is read
-    /// before anything is pressed. `true` holds the look (nothing pressed,
-    /// typed or escalated; the caller waits); `false` goes on, after
-    /// [`Self::thaw`] when a held stall has lifted.
+    /// The top of a look while a stall is held or suspected: `status` is read before anything is
+    /// pressed. `true` holds the look (the caller waits); `false` goes on, after [`Self::thaw`]
+    /// when a held stall has lifted.
     pub(super) fn stall_look(
         &mut self,
         seq: u64,

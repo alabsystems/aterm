@@ -65,18 +65,13 @@ use crate::{wire, words};
 /// person can act on.
 pub const NOT_SAVED: &str = "Log file could not be opened; messages are kept until aterm quits.";
 
-// The page's chrome words: the words the page paints or names a control by
-// that are not one entry's and that a page on any host shows (the heading and
-// subtitle, the filters' words, the report and Copy buttons, the empty log's
-// line), so every host says the same page. A host's own affordances, layout
-// and performers keep their words; `wire_lines`' doc lists them.
+// The page's chrome words, so every host says the same page.
 
 /// The page's heading: its name, which its list is read by too.
 pub const HEADING: &str = "Messages";
 
-/// The page's subtitle: what the log is. Most messages are records that were
-/// never on the band, so the log is what aterm reported, not only what it
-/// told you. One line at every width.
+/// The page's subtitle: most messages are records that were never on the band, so the
+/// log is what aterm reported, not only what it told you.
 pub const SUBTITLE: &str = "What aterm reported, newest first.";
 
 /// [`SUBTITLE`] while an open exception leads the list: one is placed first
@@ -126,10 +121,8 @@ pub fn severity_segment_words(all: usize, problems: usize) -> (String, String) {
     )
 }
 
-/// The tag pop-up's painted words, the form the tag filter takes on a compact
-/// page, and on a wider one where the severity segments and the chips would
-/// not fit in two lines: `Tag: All` with no tag down, else `Tag: ` and the
-/// chip's words ([`tag_words`]), e.g. `Tag: ALab tools`.
+/// The tag pop-up's painted words (the tag filter's form where the chips do not fit):
+/// `Tag: All` with no tag down, else `Tag: ` and the chip's words ([`tag_words`]).
 #[must_use]
 pub fn tag_menu_label(tag: Option<&str>) -> String {
     format!("Tag: {}", tag_menu_current(tag))
@@ -160,11 +153,9 @@ pub fn button_label(label: &str) -> String {
     }
 }
 
-/// Which offered intent is the page's Primary (the button drawn in the
-/// accent, the one a bare Return presses), as a position in `actions` (the
-/// offered capsules in order, [`MessageView::actions`]), not an
-/// `ActionIndex`. One rule, the engine's, so no page re-derives it (the lines
-/// carry it as `primary=`):
+/// Which offered intent is the page's Primary (the accent button a bare Return presses),
+/// as a position in `actions` ([`MessageView::actions`]), not an `ActionIndex`. The lines
+/// carry it as `primary=`:
 ///
 /// - the first offered intent while a press can still perform it, a decline
 ///   included;
@@ -183,13 +174,9 @@ pub fn primary_index(actions: &[MessageActionView]) -> Option<usize> {
     }
 }
 
-/// What Copy All puts on the clipboard: the host's build information, then
-/// each entry `shown` (the ones the filters admit, newest first) as its own
-/// Copy puts it ([`MessageView::copy_text`]), each after two line breaks
-/// (`\n\n`). The build information is the host's, taken verbatim: the macOS
-/// page's (`about::provenance_text`) ends in a line break of its own, so its
-/// first entry follows two blank lines and every later one a single blank
-/// line. An empty `build` leads with the two line breaks all the same.
+/// What Copy All puts on the clipboard: the host's build information verbatim, then each
+/// entry `shown` (the ones the filters admit, newest first) as its own Copy puts it
+/// ([`MessageView::copy_text`]), each after `\n\n`.
 #[must_use]
 pub fn copy_all_text<'a>(build: &str, shown: impl IntoIterator<Item = &'a MessageView>) -> String {
     let mut text = build.to_string();
@@ -200,11 +187,9 @@ pub fn copy_all_text<'a>(build: &str, shown: impl IntoIterator<Item = &'a Messag
     text
 }
 
-/// What only the host knows about one projection: the machine, the
-/// performers behind the intents, and one piece of reporter knowledge. A host
-/// implements it on a value that holds what it read once for the build (the
-/// macOS host's `PageDesk` reads the staged build and the upgrade clock
-/// once), so [`MessagesState::of`] may ask as often as it needs.
+/// What only the host knows about one projection: the machine, the performers behind the
+/// intents, and one piece of reporter knowledge. Implement it on a value holding what the
+/// host read once for the build, so [`MessagesState::of`] may ask as often as it needs.
 pub trait Host {
     /// The wall clock at the build, in milliseconds since the Unix epoch:
     /// what the page's relative times read from (the engine reads no clock).
@@ -246,9 +231,8 @@ pub trait Host {
     fn sentence_lines(&self, key: Option<&str>, detail: &[String]) -> usize;
 }
 
-/// The shared projection behind Settings ▸ Messages: built once
-/// ([`MessagesState::of`]) from the same [`LogRecord`]s the `messages` verb
-/// prints and handed to the page whole. The page never reaches the center.
+/// The shared projection behind Settings ▸ Messages, built once ([`MessagesState::of`])
+/// and handed to the page whole. The page never reaches the center.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessagesState {
     /// The center's revision the projection was built at.
@@ -269,19 +253,13 @@ pub struct MessagesState {
     /// `(tag, count)` for every tag present, in [`tags::ALL`] then first-seen
     /// order: the page's filter chips.
     pub tags: Vec<(String, usize)>,
-    /// The folder the log files live in (`aterm.log`, `messages.log`,
-    /// `packages.log`, the crash reports), what the page names where there is
-    /// no file manager to show it; the host opens it itself, never a path from
-    /// the view. `None` with no log dir.
+    /// The log folder as the page names it ([`Host::log_folder`]).
     pub log_folder: Option<String>,
-    /// Whether these messages are saved (`messages.log` has a writer). A page
-    /// over an in-memory ring only (a read-only log dir, a full disk) says so
-    /// ([`NOT_SAVED`]): the person must not believe the record survives a
-    /// quit.
+    /// Whether these messages are saved (`messages.log` has a writer). A page over an
+    /// in-memory ring only (a read-only log dir, a full disk) says so ([`NOT_SAVED`]).
     pub saved: bool,
-    /// The reader's local clock's offset from UTC, in seconds: what an expanded
-    /// entry's meta line reads its time on (`Today 12:53:49 PM`); 0 where the
-    /// host cannot say. Copy keeps UTC.
+    /// The reader's offset from UTC ([`Host::utc_offset_s`]), which an expanded entry's meta
+    /// line reads its time on; Copy keeps UTC.
     pub utc_offset_s: i64,
 }
 
@@ -403,9 +381,8 @@ impl MessagesState {
             .collect();
         let log = center.log();
         let mut entries = Vec::with_capacity(log.len());
-        // THE DIGEST STANDS FIRST (owner rule: one batched item to
-        // look at and dismiss): an open exception is placed at the top of the
-        // page whatever its age, so it is never buried under newer records.
+        // Open exceptions stand first, whatever their age, so they are never buried
+        // under newer records.
         let mut to_look_at = Vec::new();
         let mut counts: Vec<(String, usize)> = Vec::new();
         // (told on, the entry standing for it), and each standing entry's
@@ -450,8 +427,7 @@ impl MessagesState {
                 entries.push(view);
             }
         }
-        // Two or more open: the first carries `Dismiss all`, the page's twin of the
-        // menu-bar item's (one press files the whole digest).
+        // Two or more open: the first carries `Dismiss all`, the menu-bar item's twin.
         if to_look_at.len() >= 2
             && let Some(first) = to_look_at.first_mut()
         {
@@ -496,10 +472,9 @@ impl MessagesState {
     }
 }
 
-/// One record as the page shows it: the live row's current words while it is
-/// live (a restatement is never logged, so the record's own words would be
-/// its first ones), the record's final words once retired; the same choice
-/// `wire::message_row` makes.
+/// One record as the page shows it: the live row's current words while it is live (a
+/// restatement is never logged), the record's final words once retired, as the wire's
+/// `messages` rows choose.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageView {
     /// The raw message id.
@@ -525,12 +500,8 @@ pub struct MessageView {
     /// The detail lines, pre-split, unwrapped: the page wraps them to its own
     /// measure.
     pub detail: Vec<String>,
-    /// The `state=` word the `messages` verb prints ([`wire::state_word`]):
-    /// `live` / `held` / `folded` / `stale` / `unseen` / `superseded` /
-    /// `resolved-ok` / `resolved-warn` / `dismissed` / `answered` /
-    /// `evicted` / `carried` / `withdrawn` / `recorded` (a record, never on
-    /// the band); the page alone says `aged` for an exception the wire calls
-    /// `unseen` (it stood its 14 days).
+    /// The `state=` word the `messages` verb prints ([`wire::state_word`]), save `aged` for
+    /// an exception the wire calls `unseen`.
     pub state: &'static str,
     /// The band row (0 = topmost) while it is on the glass.
     pub on_glass: Option<u8>,
@@ -550,15 +521,13 @@ pub struct MessageView {
     pub sentences: usize,
 }
 
-/// The index of the page's own `Dismiss` button on an open exception. An
-/// exception's authored capsules number at most [`crate::MAX_ACTIONS`], so an
-/// index this high names no intent: it is a VIEW-TIME capsule (never stored in
-/// the record, never on the wire's `act` grammar) that the host answers by
-/// filing the entry (`App::dismiss_exception`).
+/// The index of the page's own `Dismiss` button on an open exception. Authored capsules
+/// number at most [`crate::MAX_ACTIONS`], so this index names no intent: a view-time
+/// capsule (never in the record or the wire's `act` grammar) the host answers by filing
+/// the entry.
 pub const DISMISS_ACTION: u8 = 250;
-/// The index of the page's `Dismiss all` button, offered on the first open
-/// exception when two or more are open: files every entry
-/// (`App::dismiss_exceptions`), as the menu-bar item's `Dismiss all N` does.
+/// The index of the page's `Dismiss all` button, offered on the first open exception
+/// when two or more are open: files every entry, as the menu-bar item does.
 pub const DISMISS_ALL_ACTION: u8 = 251;
 /// The label of [`DISMISS_ACTION`].
 pub const DISMISS_LABEL: &str = "Dismiss";
@@ -573,30 +542,24 @@ pub struct MessageActionView {
     pub index: u8,
     /// The full capsule label (`Intent::label`).
     pub label: &'static str,
-    /// Whether a press can still be performed: `Not now`, `Stop paste`, `Show
-    /// tab N` and `End sessions` only while the row is live; `Install now`
-    /// only while that build is still the staged one; `Open log` only while
-    /// the file is there as a regular file (the performer's own test, so a
-    /// capsule is not offered where the press would be refused); an agent
-    /// upgrade's word while its tab's upgrade still takes it
-    /// ([`Host::upgrade_takes`]); every navigation wherever the host performs
-    /// one ([`Host::performs_navigation`]).
+    /// Whether a press can still be performed: `Not now`, `Stop paste`, `Show tab N` and
+    /// `End sessions` only while the row is live; `Install now` only while that build is
+    /// still staged; `Open log` only while the file is a regular file (the performer's own
+    /// test); an agent upgrade's word while its tab's upgrade still takes it
+    /// ([`Host::upgrade_takes`]); every navigation wherever the host performs one
+    /// ([`Host::performs_navigation`]).
     pub still_actionable: bool,
-    /// A decline (`Not now`, `Not today`, `Skip version`,
-    /// [`Intent::is_decline`]): no page promotes one to its Primary past a
-    /// first intent a press cannot perform ([`primary_index`]). The page lines
-    /// do not carry it; `label=` names it, and `primary=` carries the decision
-    /// it takes part in.
+    /// A decline ([`Intent::is_decline`]): no page promotes one to its Primary past a
+    /// first intent a press cannot perform ([`primary_index`]). The page lines do not
+    /// carry it; `primary=` carries the decision it takes part in.
     pub declines: bool,
 }
 
 impl MessageView {
-    /// One record's view (the `wire::message_row` choice of words: the live
-    /// row's while it is live, the record's once retired). `on_glass` is the
-    /// band row it is on; `host` answers what only a host knows. `exception`
-    /// is the digest entry of an OPEN exception (a restatement is never
-    /// logged, so the record holds the words it was posted with: the page,
-    /// the menu bar and `aterm ctl messages` must all read the entry's).
+    /// One record's view, in the live row's words while it is live, the record's once
+    /// retired. `on_glass` is the band row it is on; `host` answers what only a host
+    /// knows. `exception` is the digest entry of an open exception, whose current words
+    /// the record lacks (a restatement is never logged).
     #[must_use]
     pub fn of(
         rec: &LogRecord,
@@ -631,9 +594,8 @@ impl MessageView {
             Some(Retired::Answered { label }) => (None, Some(label.clone())),
             _ => (None, None),
         };
-        // The wire keeps `unseen` (its documented word); on the page an
-        // exception that stood its 14 days is AGED OUT, not "too many at once"
-        // (that is the band queue's meaning of the word).
+        // The wire keeps `unseen`; on the page an exception that stood its 14 days is
+        // aged out, not "too many at once" (the band queue's meaning of the word).
         let state = match wire::state_word(rec, live) {
             "unseen" if rec.later => "aged",
             other => other,
@@ -668,13 +630,9 @@ impl MessageView {
                 // intent that can come back (`Install now`, `Open log`)
                 // stays, disabled while it cannot.
                 .filter(|(_, intent)| open || rec.still_offers(intent))
-                // A WORD FOR A SESSION THAT IS GONE is not offered either
-                // (ruling 315): `Upgrade now` / `Not today` on a record whose
-                // tab's session no longer runs here stood drawn, disabled,
-                // relaunches later. A session never comes
-                // back under its id, so the word never can; one whose
-                // upgrade still stands but moved to another build stays,
-                // disabled while it cannot.
+                // Nor is an upgrade word for a session that is gone: a session never
+                // comes back under its id. One whose upgrade still stands but moved to
+                // another build stays, disabled while it cannot.
                 .filter(|(_, intent)| open || !session_gone(intent, host))
                 .filter_map(|(k, intent)| {
                     Some(MessageActionView {
@@ -686,9 +644,8 @@ impl MessageView {
                 })
                 .collect(),
         };
-        // AN OPEN EXCEPTION CAN BE PUT AWAY FROM THE PAGE (owner rule: one
-        // batched item "that I can dismiss"): a view-time `Dismiss` after its own
-        // capsules. The menu-bar item files the whole digest; this files one.
+        // An open exception can be put away from the page: a view-time `Dismiss` after
+        // its own capsules. The menu-bar item files the whole digest; this files one.
         if exception.is_some() && live.is_none() && rec.later && rec.is_live() {
             view.actions.push(MessageActionView {
                 index: DISMISS_ACTION,
@@ -734,24 +691,20 @@ impl MessageView {
                 Some(_) => "showing now".to_string(),
                 None => "waiting to show".to_string(),
             },
-            // A record (`Hold::LogOnly`) retires at the instant it is posted:
-            // it was written down, never shown. A row that folded stood on the
-            // band for its hold, never zero.
+            // A record (`Hold::LogOnly`) retires at the instant it is posted; a row
+            // that folded stood on the band for its hold, never zero.
             "folded" if self.retired_unix_ms == Some(self.at_unix_ms) => self.record_words(),
             "folded" => match &span {
                 Some(span) => format!("shown for {span}"),
                 None => "shown".to_string(),
             },
-            // A row this process retired for going silent blames its
-            // reporter; a record replayed open from a process that is gone
-            // (killed or crashed: it wrote no ending, and a replayed record
-            // carries no retirement time) does not.
+            // A row this process retired for going silent blames its reporter; a record
+            // replayed open from a process that is gone (no retirement time) does not.
             "stale" if self.retired_unix_ms.is_none() => {
                 "still open when aterm stopped".to_string()
             }
             "stale" => after("stopped reporting"),
-            // Cut off by a graceful quit: the reporter did not end it, aterm
-            // did.
+            // Cut off by a graceful quit: aterm ended it, not the reporter.
             "quit" => after("still open when aterm quit"),
             "unseen" => "not shown \u{2014} too many at once".to_string(),
             "aged" => after("aged out"),
@@ -776,13 +729,11 @@ impl MessageView {
                 Some(label) => format!("answered: {label}"),
                 None => "answered".to_string(),
             },
-            // A record (`Retired::Recorded`, the log's `how=folded rec=1`) was
-            // never on the band: "shown for 0 s" would say it had been.
+            // A record (`Retired::Recorded`) was never on the band.
             "recorded" => self.record_words(),
             "evicted" => "dropped \u{2014} too many at once".to_string(),
             "carried" => "carried over to the updated aterm".to_string(),
-            // An exception is not on the band and never asks for a row: it is
-            // here and in the menu bar until it is dismissed (`Dismiss all`).
+            // An exception is in the page and the menu bar until it is dismissed.
             "review" => "here and in the menu bar".to_string(),
             other => after(other),
         }
@@ -810,12 +761,10 @@ impl MessageView {
     }
 
     /// The detail lines as an expanded entry sets them: the leading
-    /// [`MessageView::sentences`] lines (at least one) are the sentence (the
-    /// cause and the next step, a person's words) and the rest the technical
-    /// lines. A diagram (any line that opens with whitespace: a caret under a
-    /// column) is technical whole, and the `shown for …` line a record carries
-    /// is its meta line's ([`MessageView::record_words`]), so it is in
-    /// neither. Unwrapped: a host wraps each to its own measure.
+    /// [`MessageView::sentences`] lines (at least one) are the sentence and the rest the
+    /// technical lines. A diagram ([`MessageView::is_diagram`]) is technical whole, and a
+    /// record's `shown for …` line belongs to its meta line, so it is in neither.
+    /// Unwrapped: a host wraps each to its own measure.
     #[must_use]
     pub fn sentence_and_technical(&self) -> (Vec<&str>, Vec<&str>) {
         let shown = self.shown_line();
@@ -832,10 +781,9 @@ impl MessageView {
         (sentence, lines.collect())
     }
 
-    /// Whether the detail is a diagram (any line that opens with whitespace,
-    /// a caret under a column): its lines are all technical
-    /// ([`MessageView::sentence_and_technical`]), and a host cuts them to its
-    /// measure rather than wrapping them, so a column stays a column.
+    /// Whether the detail is a diagram (any line opens with whitespace: a caret under a
+    /// column): its lines are all technical, and a host cuts them to its measure rather
+    /// than wrapping them, so a column stays a column.
     #[must_use]
     pub fn is_diagram(&self) -> bool {
         self.detail
@@ -875,10 +823,9 @@ impl MessageView {
         }
     }
 
-    /// What Copy puts on the clipboard: the title, then `<stamp> · <tag> ·
-    /// <sev>`, then every detail line — byte for byte [`words::copy_text`] of
-    /// the record (`copy_text_of_a_view_is_the_engines`), built here because
-    /// the page holds views, not records.
+    /// What Copy puts on the clipboard: the title, then `<stamp> · <tag> · <sev>`, then
+    /// every detail line; byte for byte [`words::copy_text`] of the record, built here
+    /// because the page holds views, not records.
     #[must_use]
     pub fn copy_text(&self) -> String {
         let mut out = self.title.clone();
@@ -905,8 +852,7 @@ pub fn tag_words(tag: &str) -> Cow<'_, str> {
         "crash" => "Crashes",
         "config" => "Config",
         "update" => "Updates",
-        // One chip for the ALab lane's two tags, one for the agents' two: the
-        // wire keeps each tag.
+        // One chip for the ALab lane's two tags, one for the agents' two.
         "toolchain" | "packages" => "ALab tools",
         "privacy" => "Privacy",
         "session" => "Sessions",
@@ -921,15 +867,10 @@ pub fn tag_words(tag: &str) -> Cow<'_, str> {
     })
 }
 
-/// A script's own tag as a chip's words: capitalized like every chip beside
-/// it (`search` → `Search`), and a two-letter tag is an initialism (`ci` →
-/// `CI`). The wire and Copy keep the tag as the script wrote it.
-///
-/// Never one of aterm's own chips: chips merge by their words
-/// ([`same_chip`]), so a script's `updates` capitalized to `Updates` would
-/// count, filter and be spoken as aterm's own update lane. A tag whose
-/// capitalized words are an aterm chip's reads as the script wrote it
-/// (`updates`), a chip of its own.
+/// A script's own tag as a chip's words: capitalized like every chip beside it (`search`
+/// → `Search`), a two-letter tag an initialism (`ci` → `CI`). Never one of aterm's own
+/// chips: chips merge by their words ([`same_chip`]), so a tag whose capitalized words
+/// are an aterm chip's (`updates`) reads as the script wrote it.
 fn script_tag_words(tag: &str) -> Cow<'_, str> {
     let mut chars = tag.chars();
     let words = match chars.next() {
@@ -960,19 +901,13 @@ pub(crate) fn span_words(ms: u64) -> String {
     }
 }
 
-/// Whether pressing `intent` from the page would still do the thing (the
-/// rule on [`MessageActionView::still_actionable`]). The facts are the host's
-/// ([`Host::staged_build`], [`Host::is_regular_file`],
-/// [`Host::upgrade_takes`], [`Host::performs_navigation`]); the rule is this
-/// match. `Open log` asks the performer's own regular-file test (a symlink
-/// planted in the log dir is refused there, so it is not offered here); the
-/// press re-validates the whole rule.
+/// Whether pressing `intent` from the page would still do the thing
+/// ([`MessageActionView::still_actionable`]): the facts are the host's, the rule is this
+/// match, and the press re-validates it.
 fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
     match intent {
-        // An upgrade's word is for the build its row named: offered while the
-        // tab's upgrade still moves to it and takes that word, from a retired
-        // row or the waiting record too; the press re-checks under the
-        // harness's lock.
+        // An upgrade's word is for the build its row named, from a retired row too; the
+        // press re-checks under the harness's lock.
         Intent::AgentUpgrade { tab, to, word } => host.upgrade_takes(tab, to, *word),
         // A stop is for the paste still on its way: its row is live exactly
         // as long as the paste is watched; a row's tab is the one it named
@@ -996,11 +931,9 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
     }
 }
 
-/// The mark of work cut off: a row still moving when aterm stopped (`stale`,
-/// replayed open from a process that is gone) or quit (`quit`) is not in
-/// flight any more, so its record does not wear the working mark it was
-/// posted with (`↻ Rendering the video` would read as work under way). Its
-/// severity's own mark stands in; every other mark and state is kept.
+/// The mark of work cut off: a row still moving when aterm stopped (`stale`) or quit
+/// (`quit`) is not in flight any more, so its record does not wear the working mark it
+/// was posted with; its severity's own mark stands in.
 pub(crate) fn cut_off_mark(glyph: Glyph, severity: Severity, state: &str) -> Glyph {
     const IN_FLIGHT: [char; 5] = ['\u{21bb}', '\u{21e3}', '\u{2191}', '\u{2296}', '\u{2026}'];
     if matches!(state, "stale" | "quit") && IN_FLIGHT.contains(&glyph.ch()) {
@@ -1043,11 +976,9 @@ fn session_gone(intent: &Intent, host: &impl Host) -> bool {
     }
 }
 
-/// The page's feedback line for an act the host performed (`performed`) or
-/// refused: what happened, in the words a person would use. `applies`: an
-/// `Install now` press that really installs (the host's
-/// `update_bar_press_applies`); otherwise the press opened Software Update,
-/// and says so.
+/// The page's feedback line for an act the host performed (`performed`) or refused, in
+/// the words a person would use. `applies`: an `Install now` press that really installs;
+/// otherwise the press opened Software Update, and says so.
 #[must_use]
 #[allow(
     clippy::match_same_arms,
@@ -1093,13 +1024,9 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
     }
 }
 
-/// What the filters let through: a severity (All, or Problems: warnings and
-/// errors together) and a tag, or every tag. The two combine: "updates that
-/// failed" is the Updates chip and Problems together. A tag is matched by the
-/// chip it shows under ([`tag_words`]), so `fabric` and `harness` are one
-/// Agents chip and `toolchain` and `packages` one `ALab tools` chip, and a
-/// deep link to either tag of a pair selects that chip; the wire keeps each
-/// tag.
+/// What the filters let through: a severity (All, or Problems: warnings and errors) and a
+/// tag, or every tag; the two combine. A tag is matched by the chip it shows under
+/// ([`same_chip`]), so a deep link to either tag of a pair selects that chip.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MessagesFilter {
     /// Only this tag's chip.
@@ -1129,9 +1056,8 @@ pub fn same_chip(a: &str, b: &str) -> bool {
     tag_words(a) == tag_words(b)
 }
 
-/// The count line's words: `42 messages`, or `12 of 42` under a filter. The
-/// log is one scrolling list: the count is the whole of what the filters
-/// admit, never a page.
+/// The count line's words: `42 messages`, or `12 of 42` under a filter: the whole of what
+/// the filters admit, never a page.
 #[must_use]
 pub fn status_words(total: usize, shown: usize, all: bool) -> String {
     if all || total == 0 {
@@ -1141,12 +1067,10 @@ pub fn status_words(total: usize, shown: usize, all: bool) -> String {
     }
 }
 
-/// The log's calendar: the reader's local day, and whether any admitted entry
-/// is from an earlier day; only then does the list carry day headers (a list
-/// all of today would spend a line saying what every row's time already
-/// says). Under the headers a row older than today says its local time
-/// (`9:41 PM`), since its header names the day; today's rows, and every row
-/// of an unheaded list, keep their relative words (`3 h ago`).
+/// The log's calendar: the reader's local day, and whether any admitted entry is from an
+/// earlier day; only then does the list carry day headers. Under the headers a row older
+/// than today says its local time (`9:41 PM`); today's rows, and every row of an
+/// unheaded list, say relative words (`3 h ago`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessagesClock {
     /// The wall clock the page was built at.
@@ -1166,9 +1090,8 @@ impl MessagesClock {
     pub fn of(visible: &[&MessageView], now_unix_ms: u64, offset_s: i64) -> Self {
         let day = |e: &&MessageView| words::local_day(e.at_unix_ms, offset_s);
         let today = words::local_day(now_unix_ms, offset_s);
-        // Earlier, never merely other: an entry stamped past midnight by a
-        // writer whose clock runs ahead is today's; it heads no list of today
-        // alone, and its section is today's.
+        // Earlier, never merely other: an entry stamped past midnight by a writer whose
+        // clock runs ahead is today's.
         let headed = visible.iter().any(|e| day(e) < today);
         Self {
             now_unix_ms,
@@ -1188,16 +1111,10 @@ impl MessagesClock {
         }
     }
 
-    /// Each entry's SECTION day, newest first, when the list is headed: its
-    /// local day, never newer than the section above it — a record whose
-    /// stamp runs ahead of its neighbours' (another writer's clock) stays in
-    /// the section it is listed in, so within the open exceptions, and
-    /// within the log under them, every day has one header — and never
-    /// newer than today (ruling 281: a stamp from tomorrow opened a section
-    /// that read `Today` above today's own). The open exceptions listed first,
-    /// whatever their age, are a run of their own: the log under them starts
-    /// again from today, so an exception from yesterday never files today's
-    /// records under `Yesterday`.
+    /// Each entry's section day, newest first, when the list is headed: its local day,
+    /// never newer than the section above it (a stamp from another writer's clock stays in
+    /// the section it is listed in) and never newer than today. The open exceptions listed
+    /// first are a run of their own: the log under them starts again from today.
     #[must_use]
     pub fn sections(self, visible: &[&MessageView]) -> Option<Vec<i64>> {
         if !self.headed {
@@ -1221,9 +1138,8 @@ impl MessagesClock {
     }
 }
 
-/// An entry's name for a screen reader beyond its title: its severity, its
-/// chip name and when, in words (`Warning, ALab tools, 6 hours ago`), never
-/// the wire's `warn · toolchain`.
+/// An entry's name for a screen reader beyond its title: severity, chip name and when, in
+/// words (`Warning, ALab tools, 6 hours ago`).
 #[must_use]
 pub fn description(entry: &MessageView, now_unix_ms: u64) -> String {
     format!(
@@ -1234,10 +1150,8 @@ pub fn description(entry: &MessageView, now_unix_ms: u64) -> String {
     )
 }
 
-/// One tag chip as the page offers it: the first tag present (in
-/// [`MessagesState::tags`]' order) that shows under it, which is the filter
-/// a press sets; the chip's words ([`tag_words`]); and how many entries a
-/// press would show under the severity filter that is down.
+/// One tag chip as the page offers it: the tag a press filters by, the chip's words and
+/// how many entries a press would show under the severity filter that is down.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chip {
     /// The first tag present that shows under the chip.
@@ -1249,8 +1163,7 @@ pub struct Chip {
 }
 
 impl Chip {
-    /// The chip's painted and spoken words: its name and its count (`ALab
-    /// tools · 2`).
+    /// The chip's painted and spoken words: `ALab tools · 2`.
     #[must_use]
     pub fn label(&self) -> String {
         format!("{} \u{00b7} {}", self.words, self.count)
@@ -1258,11 +1171,9 @@ impl Chip {
 }
 
 impl MessagesState {
-    /// The tag chips, one per chip name present (`fabric` and `harness` one
-    /// Agents chip, `toolchain` and `packages` one `ALab tools` chip, a
-    /// script's own tag its own), in [`MessagesState::tags`]' order, each
-    /// counting what a press would show under the severity that is down
-    /// (`warn_only`: Problems).
+    /// The tag chips, one per chip name present, in [`MessagesState::tags`]' order, each
+    /// counting what a press would show under the severity that is down (`warn_only`:
+    /// Problems).
     #[must_use]
     pub fn chips(&self, warn_only: bool) -> Vec<Chip> {
         let mut chips: Vec<Chip> = Vec::new();
@@ -1285,10 +1196,8 @@ impl MessagesState {
         chips
     }
 
-    /// The severity segments' counts, `(all, problems)`: every entry, and the
-    /// warnings and errors together, under the chip of `tag` (every tag with
-    /// none). Independent of the severity that is down: each is what a press
-    /// on its segment would show.
+    /// The severity segments' counts, `(all, problems)`, under the chip of `tag` (every
+    /// tag with none), independent of the severity that is down.
     #[must_use]
     pub fn severity_counts(&self, tag: Option<&str>) -> (usize, usize) {
         self.entries
@@ -1300,18 +1209,14 @@ impl MessagesState {
     }
 }
 
-/// The page as lines: the page under `filter` with every word said, for a
-/// host whose view reads the page through a string (a web page): its model
-/// and its chrome (the words the macOS page paints and names its controls by
-/// that a page on any host shows). What the page that renders the lines still
-/// words or decides itself is listed at the end. One line per item, none
-/// carrying a `\n`: a kind word, then TAB-separated `key=value` fields in the
-/// `messages.log` codec's line style and escaping (`\` → `\\`, TAB → `\t`, LF
-/// → `\n`, CR → `\r`, US → `\u`), a field that is a list of lines joined by
-/// US first (the codec's `detail=`). Keys come in a fixed order, a key added
-/// later after every older key of its kind; a reader ignores a key or a kind
-/// it does not know. A bare key carries the wire's word (the `messages`
-/// verb's `tag=`, `sev=`, `state=`), a `…_words` key the person's.
+/// The page as lines: the page under `filter` with every word said, for a host whose view
+/// reads the page through a string (a web page). One line per item, none carrying a `\n`:
+/// a kind word, then TAB-separated `key=value` fields in the `messages.log` codec's line
+/// style and escaping (`\` → `\\`, TAB → `\t`, LF → `\n`, CR → `\r`, US → `\u`), a list of
+/// lines joined by US first (the codec's `detail=`). Keys come in a fixed order, a key added
+/// later after every older key of its kind; a reader ignores a key or a kind it does not
+/// know. A bare key carries the wire's word (`tag=`, `sev=`, `state=`), a `…_words` key the
+/// person's.
 ///
 /// - `page rev= now= total= shown= all= problems= status= [note=] [folder=]
 ///   heading= subtitle= all_words= problems_words= all_tags= all_tags_on=

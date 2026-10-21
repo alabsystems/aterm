@@ -22,6 +22,7 @@ const FRAME: ClientFrame = ClientFrame {
     maximized: false,
     edges: true,
     header: true,
+    layout: crate::client_frame::ButtonLayout::FALLBACK,
 };
 
 /// A headless window at scale 1 that draws its own frame (or, with `None`, one the

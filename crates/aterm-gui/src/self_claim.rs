@@ -315,10 +315,103 @@ pub(crate) fn copy_of_tab(sid: &str) -> Option<Copy> {
         .cloned()
 }
 
+/// What a codex-alab session's ROLLOUT TAP reads (session log 5G-3; ruling
+/// T15; `crate::codex_rollout_tap`): the proven agent's identity, its
+/// primary thread (its record's `sessionId`) and the `$CODEX_HOME` its
+/// record was read under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RolloutTarget {
+    /// The live claim revision that admitted this copy.
+    pub(crate) revision: u64,
+    /// The agent's pid and kernel start, as the claim proved them.
+    pub(crate) pid: u32,
+    pub(crate) start: String,
+    /// The thread whose rollout is tapped.
+    pub(crate) thread: String,
+    /// The `$CODEX_HOME` the record was read under (canonical).
+    pub(crate) home: std::path::PathBuf,
+}
+
+/// THE ROLLOUT TAP'S GATE, the claim's half (pure): a target only where a
+/// proven claim stands (`proven`) and aterm's copy of the record was read
+/// under that very identity, standing, naming a thread id as its
+/// `sessionId`. A vendor Codex proves no claim (its image is no ALab
+/// build's), so it names none, and neither does a copy kept past its claim
+/// for the exit's reader. The build's half is the tap's own
+/// (`aterm_agent::harness::codex_tap`: the build the rollout's
+/// `session_meta` names and the one the claimant's image runs now, both
+/// measured).
+#[must_use]
+pub(crate) fn target_of(
+    proven: Option<&Proven>,
+    revision: u64,
+    copy: Option<&Copy>,
+) -> Option<RolloutTarget> {
+    let proven = proven?;
+    let copy = copy.filter(|copy| copy.pid == proven.pid && copy.start == proven.start)?;
+    let self_claimed::Seen::Present(record) = &copy.seen else {
+        return None;
+    };
+    let thread = record
+        .session_id
+        .as_deref()
+        .filter(|t| aterm_agent::harness::codex_rollout::is_thread_id(t))?;
+    Some(RolloutTarget {
+        revision,
+        pid: proven.pid,
+        start: proven.start.clone(),
+        thread: thread.to_string(),
+        home: copy.home.clone(),
+    })
+}
+
+/// [`target_of`] for one current claim and its copy, under meta → copies.
+/// Neither lock crosses a file or process read.
+#[must_use]
+pub(crate) fn rollout_target(ctx: &crate::SessionCtx) -> Option<RolloutTarget> {
+    let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+    let copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+    target_of(
+        meta.live_claim(crate::metrics::now_us())
+            .and_then(|claim| claim.proven.as_ref()),
+        meta.supervisor_revision,
+        copies.get(ctx.self_id.as_str()),
+    )
+}
+
+/// Keeps the claim and its exact record copy current during one bounded
+/// timeline hold. The order is meta → copies → timeline; neither copy
+/// mutator takes the timeline while holding copies, and no timeline holder
+/// acquires either guard. No process or file read may run under this guard.
+pub(crate) struct RolloutGuard<'a> {
+    _meta: std::sync::MutexGuard<'a, crate::session_timeline::SessionMeta>,
+    _copies: std::sync::MutexGuard<'static, Copies>,
+}
+
+pub(crate) fn hold_rollout<'a>(
+    ctx: &'a crate::SessionCtx,
+    target: &RolloutTarget,
+) -> Option<RolloutGuard<'a>> {
+    let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+    let copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+    let current = target_of(
+        meta.live_claim(crate::metrics::now_us())
+            .and_then(|claim| claim.proven.as_ref()),
+        meta.supervisor_revision,
+        copies.get(ctx.self_id.as_str()),
+    );
+    (current.as_ref() == Some(target)).then_some(RolloutGuard {
+        _meta: meta,
+        _copies: copies,
+    })
+}
+
 /// The copy of the process `pid` started at `start` is TAKEN by the reader
 /// of that process's exit: one exit, one decision — a later exit in the tab
 /// (another agent's, with no snapshot to tell them apart) never meets it.
-pub(crate) fn take(sid: &str, pid: u32, start: &str) {
+/// Named `take_copy` because a bare `take` merges in the lock-order census
+/// with `std::mem::take` and `journal::take`.
+pub(crate) fn take_copy(sid: &str, pid: u32, start: &str) {
     let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
     if copies
         .get(sid)
@@ -334,7 +427,7 @@ pub(crate) fn take(sid: &str, pid: u32, start: &str) {
 pub(crate) fn discard_dead(sid: &str) {
     let dead = copy_of_tab(sid).filter(|copy| !restart_stamp::alive_as(copy.pid, &copy.start));
     if let Some(copy) = dead {
-        take(sid, copy.pid, &copy.start);
+        take_copy(sid, copy.pid, &copy.start);
     }
 }
 
@@ -523,6 +616,76 @@ pub(crate) mod stand_in {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copy of `pid`'s record, read under `start`, naming `session`.
+    fn copy_of(pid: u32, start: &str, seen: self_claimed::Seen) -> Copy {
+        Copy {
+            pid,
+            start: start.to_string(),
+            home: std::path::PathBuf::from("/private/tmp/x/codex-home"),
+            seen,
+            resume: Err("no-resume-line"),
+        }
+    }
+
+    fn present(session: Option<&str>) -> self_claimed::Seen {
+        self_claimed::Seen::Present(self_claimed::Record {
+            pid: 4242,
+            session_id: session.map(str::to_string),
+            resume_argv: None,
+            env: Vec::new(),
+            status: Some("busy".to_string()),
+            exit: None,
+            cwd: None,
+            draft_empty: None,
+            frame: None,
+        })
+    }
+
+    /// THE ROLLOUT TAP'S CLAIM GATE (session log 5G-3; ruling T15): only a
+    /// proven claim's own copy, standing and naming a thread id, names a
+    /// rollout to tap — its thread, under the home the record was read
+    /// under. No claim standing (a vendor Codex: no proof), a copy of
+    /// another identity (a reused pid, an earlier process), a record gone or
+    /// never written, and a `sessionId` that is no thread id name none.
+    /// NEGATIVE CONTROL (scratch, `codex_tap` notes): drop the proven check
+    /// and the vendor case names a target.
+    #[test]
+    fn only_a_proven_claims_own_copy_names_a_rollout_target() {
+        const THREAD: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
+        let start = "Mon Oct 20 16:37:58 2026";
+        let proven = Proven {
+            pid: 4242,
+            start: start.to_string(),
+        };
+        let own = copy_of(4242, start, present(Some(THREAD)));
+        assert_eq!(
+            target_of(Some(&proven), 7, Some(&own)),
+            Some(RolloutTarget {
+                revision: 7,
+                pid: 4242,
+                start: start.to_string(),
+                thread: THREAD.to_string(),
+                home: std::path::PathBuf::from("/private/tmp/x/codex-home"),
+            })
+        );
+        assert_eq!(
+            target_of(None, 7, Some(&own)),
+            None,
+            "a vendor Codex: no proof"
+        );
+        assert_eq!(target_of(Some(&proven), 7, None), None, "no copy read yet");
+        for other in [
+            copy_of(4243, start, present(Some(THREAD))),
+            copy_of(4242, "Mon Oct 20 09:00:00 2026", present(Some(THREAD))),
+            copy_of(4242, start, self_claimed::Seen::Removed),
+            copy_of(4242, start, self_claimed::Seen::Never),
+            copy_of(4242, start, present(None)),
+            copy_of(4242, start, present(Some("not-a-thread"))),
+        ] {
+            assert_eq!(target_of(Some(&proven), 7, Some(&other)), None, "{other:?}");
+        }
+    }
 
     /// Only a usage wall, only with the policy in effect and `resume_limits`
     /// on, is the self-claim's own to wait out; everything else stays a stop.

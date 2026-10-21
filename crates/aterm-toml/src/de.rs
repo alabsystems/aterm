@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deserialization: `serde::Deserializer` over the parse tree.
+//! Deserialization: a `serde::Deserializer` over the parse tree, so the tree's
+//! `#[derive(Deserialize)]` models work unchanged.
 //!
 //! # Why this half exists at all
 //!
@@ -154,9 +155,8 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
         result.map_err(|e| self.locate(e))
     }
 
-    /// A key that is absent never reaches the deserializer at all — the map
-    /// access simply never yields it — so anything that DOES arrive here is a
-    /// present value.
+    /// An absent key never reaches the deserializer (the map access never yields it), so
+    /// whatever arrives here is present.
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         visitor.visit_some(self)
     }
@@ -175,9 +175,7 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value> {
-        // A date-time has no serde data-model type, so it crosses as a struct
-        // under one reserved name. Only that exact name is special-cased, so a
-        // user struct cannot accidentally claim the protocol.
+        // Only the exact reserved name takes the date-time path (see `datetime`).
         if name == DATETIME_STRUCT
             && let Node::Value(EValue::Datetime(v)) = self.node
         {
@@ -264,11 +262,9 @@ impl<'de, 'a, I: Iterator<Item = (&'a Key, &'a Item)>> MapAccess<'de> for TableA
         .map_err(|e| e.with_span(self.source, key.span()))
     }
 
-    /// An error with no span of its own is located on the value, and failing
-    /// that on the KEY. A table made by a dotted key or implied by a deeper
-    /// header, and an array of tables, have no span, so without the key a
-    /// `missing field` in `net.listen = "x"` or a too-long `[[rows]]` came
-    /// back unlocated and the config editor underlined line 1.
+    /// An error with no span of its own is located on the value, else on the key: a table
+    /// made by a dotted key or implied by a deeper header, and an array of tables, have no
+    /// span.
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
         let (key, item) = self
             .pending
@@ -279,13 +275,10 @@ impl<'de, 'a, I: Iterator<Item = (&'a Key, &'a Item)>> MapAccess<'de> for TableA
     }
 }
 
-/// A sequence the visitor stopped reading early is an ERROR, not a truncation.
-///
-/// serde's array and tuple visitors take their N elements and return; whether
-/// anything was left is the deserializer's to say, and serde's own
-/// `SeqDeserializer::end` says it this way. Without the check, `[1, 2, 3]` read
-/// into a `[u32; 2]` as `[1, 2]`, the third value gone without a word. A
-/// visitor that drains (`Vec`, `Value`) always leaves `0`.
+/// A sequence the visitor stopped reading early is an error, not a truncation: `[1, 2, 3]`
+/// into a `[u32; 2]` fails. serde's array and tuple visitors leave that check to the
+/// deserializer (as its `SeqDeserializer::end` does); a draining visitor (`Vec`, `Value`)
+/// always leaves `0`.
 fn drained(left: usize, total: usize) -> Result<()> {
     if left == 0 {
         return Ok(());
@@ -517,8 +510,8 @@ impl<'de, 'a> EnumAccess<'de> for TableVariant<'a> {
     type Error = Error;
     type Variant = VariantValue<'a>;
 
-    /// An unknown variant is a fault in the KEY that names it, so the error is
-    /// located there: `background_material.glass = {}` points at `glass`.
+    /// An unknown variant is located on the key that names it:
+    /// `background_material.glass = {}` points at `glass`.
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
         let name = seed
             .deserialize(StrDeserializer {
@@ -543,9 +536,8 @@ struct VariantValue<'a> {
 }
 
 impl VariantValue<'_> {
-    /// Where an error in the variant's body points: the body, or, when it has
-    /// no span (a dotted or implied table), the variant's key — the same
-    /// fallback a table entry takes.
+    /// Where an error in the variant's body points: the body, or the variant's key when the
+    /// body has no span (a dotted or implied table).
     fn span(&self) -> Option<Range<usize>> {
         self.item.span().or_else(|| self.key.span())
     }
@@ -554,10 +546,8 @@ impl VariantValue<'_> {
 impl<'de> VariantAccess<'de> for VariantValue<'_> {
     type Error = Error;
 
-    /// The table spelling of a unit variant (`{ bar = {} }`) must carry
-    /// NOTHING. Anything else under the key is a value with nowhere to go, and
-    /// reading `{ bar = 99 }` as plain `bar` dropped it silently — the retired
-    /// `toml` refused it, and so does this.
+    /// The table spelling of a unit variant (`{ bar = {} }`) must be empty: `{ bar = 99 }` is
+    /// refused, not read as `bar`.
     fn unit_variant(self) -> Result<()> {
         let empty = match self.item {
             Item::Table(t) => t.items.len() == 0,
@@ -696,11 +686,8 @@ impl<'de> serde::Deserialize<'de> for crate::Table {
     }
 }
 
-/// Deserialize straight out of an already-parsed [`crate::Value`].
-///
-/// Routed through the edit tree rather than through a second `Deserializer`
-/// implementation: one deserializer means one answer to every coercion
-/// question, which is the same reason there is only one parser.
+/// Deserialize straight out of an already-parsed [`crate::Value`]. Routed through the edit
+/// tree, so one deserializer answers every coercion question.
 impl<'de> serde::Deserializer<'de> for crate::Value {
     type Error = Error;
 

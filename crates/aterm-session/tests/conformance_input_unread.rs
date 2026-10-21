@@ -1,55 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for `InputUnreadGate` (aterm-spec's
-//! `input_unread_gate_model`): the shipped `input_backlog::gate`, fed by the
-//! real sink's reading of a real pty, is the model's `DriverKey` /
-//! `DriverRefused` guard and its warning at every step, and `classify`'s
-//! entry is its `Publish` guard — and both the frozen-program incident and a
-//! static 1 s refusal replay as negative controls.
+//! Tier-1 conformance for `InputUnreadGate` (aterm-spec's `input_unread_gate_model`):
+//! the shipped `input_backlog::gate`, fed by the real sink's reading of a real pty, is
+//! the model's `DriverKey`/`DriverRefused` guard and its warning at every step, and
+//! `classify`'s entry is its `Publish` guard. A screen-only fence and a static 1 s
+//! refusal replay as negative controls. The frozen program is a raw slave this test
+//! never reads, which is all a frozen program is from the terminal's side.
 //!
-//! The incident: a frozen Claude Code left the owner's Enter unread in its
-//! slave's input queue; a supervisor, fencing its keys on a screen the frozen
-//! program never redrew, wrote a `down` into the same queue; and one `read()`
-//! later handed the program `\r\x1b[B` together. Here the "program" is a raw
-//! slave this test simply does not read — which is all a frozen program is,
-//! from the terminal's side.
-//!
-//! PROJECTION (real → model), at every step:
+//! Projection (real → model), at every step:
 //!
 //! * `raw` ← `!b.canonical`, the slave's own termios;
-//! * `q` ← the number of writes this test made that the slave has not read,
-//!   cross-checked against the kernel's `b.queued` (their byte sum) and a
-//!   drained spill;
-//! * `a1` ← the BAND of `b.wait`, the probe's lower bound on the oldest
-//!   unread byte's wait: `0` under `WARN_AFTER`, `1` under `STALL_AFTER`,
-//!   `2` from there. A `Tick` moves the reading's clock to the NEXT band
-//!   boundary of the oldest write's age;
-//! * `published` ← the model's own, handed to `gate` as the watch's
-//!   publication — the watch itself is aterm-gui's (`input_stall`), bound by
-//!   its own tests; what binds here is that the rule the watch's evidence
-//!   feeds (`classify`) and the rule the publication feeds (`gate`) are the
-//!   model's guards.
+//! * `q` ← the writes this test made that the slave has not read, cross-checked
+//!   against the kernel's `b.queued` (their byte sum) and an empty spill;
+//! * `a1` ← the band of `b.wait`: `0` under `WARN_AFTER`, `1` under `STALL_AFTER`,
+//!   `2` from there. A `Tick` moves the reading's clock to the next band boundary of
+//!   the oldest write's age;
+//! * `published` ← the model's own, handed to `gate` as the watch's publication. The
+//!   watch itself is aterm-gui's (`input_stall`), bound by its own tests; what binds
+//!   here is that `classify` and `gate` are the model's guards.
 //!
-//! THE CLOCK IS INJECTED, NOT SLEPT ON. The writes are real — a real pty, the
-//! real sink and ledger, the kernel's own queue count — but the instant a
-//! reading is taken AS OF is handed to `SinkWriter::input_backlog_at`: the
-//! writes' own bracketing instants plus the model's band boundary, so the
-//! reading is at or past its band's floor and under the next boundary
-//! whatever the scheduler does. Nothing sleeps, nothing is retried, and a
-//! mis-dated ledger or a moved `WARN_AFTER`/`STALL_AFTER` still fails at
-//! once. (The real kernel queue dating, wall clock and all, is
-//! `input_backlog_pty.rs`'s.)
+//! The clock is injected, not slept on: the writes, sink, ledger and queue count are
+//! real, but the instant a reading is taken as of is handed to
+//! `SinkWriter::input_backlog_at` (the writes' own instants plus the model's band
+//! boundary), so the reading lands in its band whatever the scheduler does. A
+//! mis-dated ledger or a moved threshold still fails at once; wall-clock dating is
+//! `input_backlog_pty.rs`'s.
 //!
-//! `reading` and `stopped` are the model's side of the reader: `Freeze`
-//! states that this test does not read, and `stopped` is `gate`'s own
-//! argument, checked in BOTH values at every step. `a2` is not projected —
-//! the probe dates only the oldest byte.
+//! `reading` and `stopped` are the model's side: `Freeze` states that this test does
+//! not read, and `stopped` is `gate`'s own argument, checked both ways at every step.
+//! `a2` is not projected (the probe dates only the oldest byte).
 //!
-//! macOS-only, like the queue probes. The pairs come from aterm-pty's
-//! `open_pty_pair`, both ends close-on-exec from birth, as every test's pair
-//! does: `openpty(3)`'s are inheritable, and a child spawned meanwhile keeps
-//! them.
+//! macOS-only, like the queue probes. Pairs come from aterm-pty's `open_pty_pair`,
+//! close-on-exec from birth: `openpty(3)`'s are inheritable, and a child spawned
+//! meanwhile would keep them.
 #![cfg(target_os = "macos")]
 
 use std::collections::{BTreeMap, VecDeque};
@@ -151,14 +135,11 @@ impl Rig {
         self.age = boundary(a1).expect("a band that ends");
     }
 
-    /// The instant a reading is taken as of. At age zero it is the instant
-    /// BEFORE the oldest unread write, ahead of every stamp the ledger can
-    /// have taken (a wait of exactly zero). Past zero it is the instant the
-    /// NEWEST unread write was accepted plus the [`Self::age`]: the ledger
-    /// dates a byte by one write's stamp, and coalescing dates a run by its
-    /// newest, so no stamp is later than that acceptance and the wait is at
-    /// least the age — and at most the age plus the span the test's writes
-    /// took, microseconds. With nothing queued there is no wait to date.
+    /// The instant a reading is taken as of. At age zero, the instant before the
+    /// oldest unread write, ahead of every ledger stamp (a wait of zero). Past zero,
+    /// the newest unread write's acceptance plus [`Self::age`]: the ledger dates a
+    /// byte by a write's stamp and a coalesced run by its newest, so no stamp is later
+    /// and the wait is at least the age, and at most the age plus the writes' span.
     fn now(&self) -> Instant {
         match (self.unread.front(), self.unread.back()) {
             (Some(&(_, sent, _)), _) if self.age.is_zero() => sent,
@@ -167,8 +148,7 @@ impl Rig {
         }
     }
 
-    /// The program reads everything it has been sent, in one `read()` — the
-    /// shape the incident's reader took. Returns what it read.
+    /// The program reads everything it has been sent, in one `read()`, and returns it.
     fn read_all(&mut self) -> Vec<u8> {
         let want: usize = self.unread.iter().map(|(n, _, _)| n).sum();
         let mut buf = [0u8; 64];
@@ -200,8 +180,8 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        // SAFETY: both fds are this rig's and still open. The sink shares
-        // only the master's NUMBER; nothing writes through it after this.
+        // SAFETY: both fds are this rig's and still open. The sink shares only the
+        // master's number; nothing writes through it after this.
         unsafe {
             libc::close(self.slave);
             libc::close(self.master);
@@ -223,13 +203,13 @@ fn assert_projects(rig: &Rig, b: &InputBacklog, st: &State, step: &str) {
 
 /// The conformance check proper, for a running job and a stopped one:
 ///
-/// * `gate` REFUSES exactly when the model's `DriverRefused` is enabled — and,
-///   whenever the queue has room, exactly when `DriverKey` is disabled;
-/// * `gate` WARNS exactly when a `DriverKey` fired from this state leaves
+/// * `gate` refuses exactly when the model's `DriverRefused` is enabled and, whenever
+///   the queue has room, exactly when `DriverKey` is disabled;
+/// * `gate` warns exactly when a `DriverKey` fired from this state leaves
 ///   `warned = 1`;
-/// * `classify`, fed the watch's evidence for the model's reader (a frozen
-///   reader spins and draws nothing; a reading one is seen drawing), enters
-///   `stalled` exactly when `Publish` is enabled.
+/// * `classify`, fed the watch's evidence for the model's reader (a frozen reader
+///   spins and draws nothing; a reading one is seen drawing), enters `stalled`
+///   exactly when `Publish` is enabled.
 fn assert_gate_is_the_guard(model: &Model, b: &InputBacklog, st: &State, step: &str) {
     let published = st["published"] == 1;
     for stopped in [false, true] {
@@ -294,14 +274,12 @@ fn step(rig: &Rig, model: &Model, st: &State, name: &'static str) -> InputBacklo
     b
 }
 
-/// THE STEP-BY-STEP BIND. A raw program that has stopped reading; the
-/// human's Enter goes in and ages band by band. At every step the real
-/// reading projects onto the model's state and `gate`/`classify` are its
-/// guards: open under a second, a WARNING from a second on — the key would be
-/// written — and still only a warning at ten seconds, until the watch's
-/// evidence publishes the stall; only then a refusal. A second human key
-/// lands while the gate refuses (the window keyboard is never gated). The
-/// program reading everything opens the gate, and the watch withdraws.
+/// A raw program that stopped reading; the human's Enter ages band by band, and at
+/// every step the reading projects onto the model and `gate`/`classify` are its
+/// guards: open under a second, a warning from a second on (the key is written),
+/// still a warning at ten seconds until the watch publishes the stall, then a
+/// refusal. A second human key lands while the gate refuses (the window keyboard is
+/// never gated); reading everything opens the gate and the watch withdraws.
 #[test]
 fn gate_and_classify_are_the_models_guards_at_every_step() {
     let model = input_unread_gate_model();
@@ -353,8 +331,8 @@ fn gate_and_classify_are_the_models_guards_at_every_step() {
     step(&rig, &model, &st, "withdrawn");
 }
 
-/// A driver's key into an EMPTY queue is written — and so is a second one
-/// straight behind it, which is younger than `WARN_AFTER`: no warning either.
+/// A driver's key into an empty queue is written, and so is a second one straight
+/// behind it, younger than `WARN_AFTER`: no warning either.
 #[test]
 fn a_driver_key_into_a_fresh_queue_is_written_without_a_warning() {
     let model = input_unread_gate_model();
@@ -372,9 +350,9 @@ fn a_driver_key_into_a_fresh_queue_is_written_without_a_warning() {
     assert_eq!(rig.read_all(), b"\x1b[B\r");
 }
 
-/// CANONICAL TYPE-AHEAD IS NEITHER WARNED NOR REFUSED. A shell's complete
-/// line `ls\n` that nothing has read yet ages past `WARN_AFTER` and the gate
-/// stays open — the model's `raw = 0` branch.
+/// Canonical type-ahead is neither warned nor refused: a complete line `ls\n` nothing
+/// has read ages past `WARN_AFTER` and the gate stays open (the model's `raw = 0`
+/// branch).
 #[test]
 fn aged_canonical_typeahead_is_written_without_a_warning() {
     let model = input_unread_gate_model();
@@ -393,13 +371,11 @@ fn aged_canonical_typeahead_is_written_without_a_warning() {
     assert_eq!(rig.read_all(), b"ls\n");
 }
 
-/// NEGATIVE CONTROL — THE STATIC CAP. The
-/// human's Enter has waited 1.1 s in a program that has not read it yet — on
-/// a machine at a load of 150 that is a healthy Claude Code. The shipped
-/// `gate` WARNS, and the driver's key is written: the program reads both, in
-/// order. The static cap (the model's mutant family) refuses the same key at
-/// the same projected state with nothing established, and firing its
-/// refusal falsifies `NoRefusalWithoutAnEstablishedStall`.
+/// Negative control, the static cap: an Enter unread for 1.1 s (on a loaded machine,
+/// a healthy program) gets a warning from the shipped `gate`, and the driver's key is
+/// written; the program reads both in order. The static cap (the model's mutant)
+/// refuses the same key with nothing established, falsifying
+/// `NoRefusalWithoutAnEstablishedStall`.
 #[test]
 fn a_slow_read_is_warned_and_written_and_the_static_cap_is_caught() {
     let model = input_unread_gate_model();
@@ -443,19 +419,17 @@ fn enter_and_age_to_stall(rigs: &mut [&mut Rig], model: &Model, st: &mut State) 
     }
 }
 
-/// NEGATIVE CONTROL — THE INCIDENT, REPLAYED. The human's Enter goes into a
-/// raw program that is not reading, ages past `STALL_AFTER`, and the watch's
-/// evidence publishes the stall.
+/// Negative control, a screen-only fence: the human's Enter goes into a raw program
+/// that is not reading, ages past `STALL_AFTER`, and the watch publishes the stall.
 ///
-/// The raw actuator, `try_write_frame_immediate`, refuses only on lock
-/// contention, a non-empty spill or a full queue, so the driver's `down`
-/// answers `Full` and the program's next `read()` returns `\r\x1b[B` — both
-/// keys together, the down acted on against a screen it never drew. The
-/// model's screen-only fence (`Buggy = 1`) admits `DriverKey` at the same
-/// projected state, and firing it falsifies `NoDriverKeyBehindStalledInput`.
+/// The raw actuator, `try_write_frame_immediate`, refuses only on lock contention, a
+/// non-empty spill or a full queue, so the driver's `down` answers `Full` and the
+/// program's next `read()` returns `\r\x1b[B`: both keys, the down acted on against a
+/// screen it never drew. The model's screen-only fence (`Buggy = 1`) admits
+/// `DriverKey` at the same state, falsifying `NoDriverKeyBehindStalledInput`.
 ///
-/// Through `gate` the same reading withholds the key, the correct model
-/// agrees `DriverKey` is disabled, and the program reads exactly `\r`.
+/// Through `gate` the same reading withholds the key, the correct model agrees
+/// `DriverKey` is disabled, and the program reads exactly `\r`.
 #[test]
 fn the_incident_replays_and_the_gate_withholds_the_key() {
     let model = input_unread_gate_model();

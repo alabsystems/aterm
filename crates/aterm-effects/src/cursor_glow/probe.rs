@@ -113,7 +113,8 @@ impl CursorGlow {
     /// (`(row, col)` active-grid, `seq` bumped per print action), sampled under
     /// the same lock as the cursor. `None` (an unwired host, a scrolled-back
     /// viewport) keeps the previous sample. Feeds [`Self::echo_anchor_pass`]
-    /// only; never a licence by itself. Clears the anchor's glyph.
+    /// and this tick's distant-park print provenance; never a licence by itself.
+    /// Clears the anchor's glyph.
     pub fn observe_print_anchor(&mut self, anchor: Option<(u16, u16, u64)>) {
         if let Some(sample) = anchor {
             self.print_anchor = Some(sample);
@@ -190,6 +191,9 @@ impl CursorGlow {
         let lo = (lo - 1 - Self::FRAME_TEXT_RISE).max(0);
         let hi = (hi + 1).min(cells.len() as i32 - 1).min(lo + MAX_ROWS - 1);
         ft.lo = lo;
+        if lo > hi {
+            return;
+        }
         // The widest row read sets the stride (a frame's rows need not all
         // carry every column; a missing cell reads as unread).
         ft.cols = (lo..=hi)
@@ -197,18 +201,28 @@ impl CursorGlow {
             .max()
             .unwrap_or(0);
         let rgb = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+        let n_rows = (hi - lo + 1) as usize;
+        ft.rows.reserve(n_rows);
+        ft.pairs.reserve(n_rows * ft.cols);
         for row in lo..=hi {
             let line = &cells[row as usize];
             let glyph = |c: &aterm_core::terminal::RenderCell| c.ch != ' ' || c.wide;
-            let first = line.iter().position(glyph);
-            let last = line.iter().rposition(glyph);
-            ft.rows
-                .push(first.zip(last).map(|(f, l)| (f as i32, l as i32 + 1)));
-            // A blank cell has a ground and no letter: its ink is `None`.
-            ft.pairs.extend((0..ft.cols).map(|c| {
-                line.get(c)
-                    .map(|cell| (glyph(cell).then(|| rgb(cell.fg)), rgb(cell.bg)))
-            }));
+            let mut span: Option<(i32, i32)> = None;
+            let n_cols = line.len().min(ft.cols);
+            for (c, cell) in line[..n_cols].iter().enumerate() {
+                let is_glyph = glyph(cell);
+                if is_glyph {
+                    let ci = c as i32;
+                    span = Some(span.map_or((ci, ci + 1), |(f, _)| (f, ci + 1)));
+                }
+                // A blank cell has a ground and no letter: its ink is `None`.
+                ft.pairs
+                    .push(Some((is_glyph.then(|| rgb(cell.fg)), rgb(cell.bg))));
+            }
+            if n_cols < ft.cols {
+                ft.pairs.resize(ft.pairs.len() + (ft.cols - n_cols), None);
+            }
+            ft.rows.push(span);
         }
     }
 

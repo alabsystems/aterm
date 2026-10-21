@@ -17,21 +17,20 @@ aterm-effects = { path = "../aterm-effects" }
 aterm-predict = { workspace = true }
 # The message band (aterm-wasm/src/messages_api.rs, mounted by `#[path]`).
 aterm-messages = { workspace = true }
-# Real monotonic clock for predict_api (performance.now() on wasm32): echo
-# reconciliation runs on real time, unlike the deterministic effects clock.
+# Real clock for predict_api (performance.now() on wasm32): the predictor
+# reconciles echo on real time, unlike the deterministic effects clock.
 aterm-time = { workspace = true }
 aterm-gpu = { path = "../aterm-gpu" }
-# aterm_types::Appearance for set_color_scheme (aterm-core does not re-export it).
+# Appearance, mouse, DOM-key and build-stamp types (aterm-core does not re-export
+# them).
 aterm-types = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The host boundary, with no dependency of its own: `#[export]` marks what JS
-# sees and `verify glue` writes the glue (no wasm-bindgen:
-# docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.8, as WP.7 did for
-# aterm-wasm); the panic hook reports `console.error` with the JS stack, in
-# console_error_panic_hook's format, through the `aterm_host` imports
-# src/host.rs names (WP.3). No GPU backend row: aterm-gpu's GL arm draws on
-# WebGL2 through its own `aterm_gl` imports, and `init` and `init_offscreen`
+# sees and `verify glue` writes the glue (no wasm-bindgen); the panic hook
+# reports `console.error` with the JS stack, in console_error_panic_hook's
+# format, through the `aterm_host` imports src/host.rs names. No GPU backend
+# row: aterm-gpu's GL arm draws on WebGL2 through its own `aterm_gl` imports, and `init` and `init_offscreen`
 # reach it through `aterm_gpu::web` (`GpuContext::for_canvas`,
 # `CanvasTarget`, `GpuRenderer::configure_canvas_surface`), whose canvas
 # types are aterm-wasm-abi JS objects. No wasm-bindgen, web-sys, js-sys or
@@ -41,8 +40,8 @@ aterm-wasm-abi = { workspace = true, features = ["export"] }
 # its only parents on this cell, so a defensive row alone shipped it
 # (deny.toml bans it outside ring; `forge check` [OB-18]).
 
-# No [profile.release]: profiles apply only at the workspace root. A wasm size
-# build (opt-level = "z") is chosen by the build tool's --profile.
+# No [profile.release]: profiles take effect only at the workspace root. A size
+# build (opt-level = "z") comes from the build tool's --profile.
 
 [dev-dependencies]
 # TEST-ONLY: `aterm_spec::host::could_not_run`, so a test the host cannot run

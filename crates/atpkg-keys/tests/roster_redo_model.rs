@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the real roster body/signature redo transaction.
+//! Tier-1 conformance for the real roster body/signature redo transaction. The derived
+//! [`RosterPairRedo`](aterm_spec::derive::roster_pair_redo_model) model is proved
+//! exhaustively in `aterm-spec`; these tests bind it to the shipping filesystem operations:
+//! byte-exact snapshot CAS, pair publication, recovery from every durable crash cut,
+//! fail-closed handling of an unrelated half, and the read-only lock's refusal to replay.
 //!
 //! The derived [`RosterPairRedo`](aterm_models_release::roster_pair_redo_model)
 //! model is proved exhaustively in `aterm-spec`.  These tests bind its decisions
@@ -78,11 +82,9 @@ impl Fixture {
         })
     }
 
-    /// Run the production snapshot CAS + redo commit under a real writer lock and
-    /// then DIE before completing it: the `CommittedRoster` is dropped, not
-    /// completed, which is byte for byte what a killed publisher leaves behind.
-    /// The lock is returned so a caller can promote canonical halves the way the
-    /// dead process would have, before releasing it.
+    /// Run the production snapshot CAS and redo commit under a real writer lock, then die:
+    /// drop the `CommittedRoster` uncompleted, as a killed publisher would. The lock is
+    /// returned so the caller can promote halves as the dead process would have.
     fn commit_and_die(&self, predecessor: Option<&RosterSnapshot>) -> RosterLock {
         let lock = lock_roster(self.roster_str()).expect("acquire real roster writer lock");
         let committed = commit_roster_pair(
@@ -272,7 +274,7 @@ fn every_durable_crash_cut_recovers_forward_through_real_lock_acquisition() {
         let mut events = Events::default();
         let initial = project(&model, &fixture, Some(&predecessor), events);
 
-        // The snapshot CAS and the redo commit are ONE production call
+        // The snapshot CAS and the redo commit are one production call
         // (`commit_roster_pair`); the model names the accepted snapshot as its own
         // step and exposes the commit only through the durable crash cuts below.
         let lock = fixture.commit_and_die(Some(&predecessor));
@@ -282,8 +284,7 @@ fn every_durable_crash_cut_recovers_forward_through_real_lock_acquisition() {
         assert!(model.fire("AcquireWriter", &mut accepted));
         assert!(model.fire("AcceptSnapshot", &mut accepted));
 
-        // THE CRASH: the dead publisher had promoted zero, one, or both canonical
-        // halves from the committed pair before it stopped.
+        // The crash: the dead publisher had promoted zero, one or both halves.
         if promote_body {
             std::fs::write(&fixture.roster, TARGET_BODY).unwrap();
         }
@@ -409,9 +410,9 @@ fn read_only_and_writer_recovery_preserve_an_unrelated_half() {
     );
     assert!(fixture.transaction().exists());
 
-    // NEGATIVE CONTROL: the historical unsafe result would replace the unrelated
-    // signature and retire the marker. Healthy transition admission rejects it,
-    // while Buggy=1 admits it and violates ForeignBytesAreNeverOverwritten.
+    // Negative control: the unsafe result (replace the unrelated signature, retire the
+    // marker) is rejected by healthy admission and admitted by Buggy=1, violating
+    // ForeignBytesAreNeverOverwritten.
     let buggy = interp::with_buggy(&model, 1);
     let unsafe_after = buggy.successors("BuggyOverwriteForeign", &after_readonly)[0].clone();
     let (healthy_admitted, evidence) = validate_transition_tiered(
@@ -552,12 +553,9 @@ fn stale_snapshot_and_clean_read_only_decisions_refine_the_model() {
     );
 }
 
-/// NEGATIVE CONTROL, replayed from history: before 8dbc4e967 `publish_roster`
-/// promoted the body, then the signature, with no redo record; a process death
-/// between the renames left the new body beside the old signature. This builds
-/// that exact disk, projects it, and shows the healthy model admits no
-/// transition to it while the `BuggyPromoteBodyWithoutRedo` mutant does — and
-/// that the real lock has nothing to replay, which is why the redo record exists.
+/// Negative control: with no redo record, a death between the two renames leaves the new
+/// body beside the old signature. The healthy model admits no transition to that disk while
+/// the `BuggyPromoteBodyWithoutRedo` mutant does, and the real lock has nothing to replay.
 #[test]
 fn the_pre_redo_torn_pair_is_the_model_s_mutant_and_nothing_can_replay_it() {
     let fixture = Fixture::new("pre-redo-torn", true);

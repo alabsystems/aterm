@@ -91,12 +91,9 @@ fn observe_pty(app: &mut App, wid: WindowId) -> [i32; 2] {
     pipe
 }
 
-/// Silence is EAGAIN on a live, empty observer pipe, and nothing else is. A
-/// positive read is the regression these tests guard (bytes reached the
-/// PTY). A zero read is EOF, which a pipe whose write end this test still
-/// holds cannot answer: one of the observer's descriptors was closed out
-/// from under the test (by another thread closing a number it no longer
-/// owned), and it is reported as that rather than as emitted bytes.
+/// Silence is EAGAIN on the observer pipe. A positive read means bytes reached the PTY; a zero
+/// read (EOF, impossible while the test holds the write end) means another thread closed a
+/// descriptor it no longer owned.
 #[cfg(unix)]
 fn assert_pty_silent_and_close(pipe: [i32; 2]) {
     let mut bytes = [0u8; 64];
@@ -123,9 +120,8 @@ fn assert_pty_silent_and_close(pipe: [i32; 2]) {
     }
 }
 
-/// Normal-shell route through the shipping physical-owner seams: Cmd-S opens,
-/// typing searches, a held key repeats locally, Cmd-R reverses and wraps, and both
-/// releases are swallowed even with Kitty event-type reporting enabled.
+/// Normal shell: Cmd-S opens, typing searches, a held key repeats locally, Cmd-R reverses and
+/// wraps, and both releases are swallowed with Kitty event-type reporting on.
 #[cfg(unix)]
 #[test]
 fn normal_terminal_cmd_s_r_press_repeat_release_emit_zero_kitty_bytes() {
@@ -164,9 +160,8 @@ fn normal_terminal_cmd_s_r_press_repeat_release_emit_zero_kitty_bytes() {
     assert_pty_silent_and_close(pipe);
 }
 
-/// Codex's protected-footer mutation may force a search recompute, but the local
-/// physical owner remains authoritative across the refresh: reverse direction and
-/// last-match selection survive, while Kitty observes no press/repeat/release.
+/// A Codex footer mutation forces a search recompute; the local physical owner survives it with
+/// reverse direction and last-match selection intact, and Kitty sees no press/repeat/release.
 #[cfg(unix)]
 #[test]
 fn codex_footer_refresh_during_cmd_r_hold_is_directional_and_pty_silent() {
@@ -198,9 +193,8 @@ fn codex_footer_refresh_during_cmd_r_hold_is_directional_and_pty_silent() {
     assert_pty_silent_and_close(pipe);
 }
 
-/// Claude classic and alternate-screen layouts both remain behind the same host
-/// intercept. Each initial Cmd-R query searches only the active grid, captures its
-/// repeat locally, and retires without a Kitty byte.
+/// Claude's classic and alternate-screen layouts both stay behind the host intercept: each Cmd-R
+/// searches only the active grid, repeats locally, and retires without a Kitty byte.
 #[cfg(unix)]
 #[test]
 fn claude_classic_and_alt_cmd_r_route_active_grid_and_emit_zero_kitty_bytes() {

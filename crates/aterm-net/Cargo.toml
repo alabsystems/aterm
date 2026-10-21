@@ -19,8 +19,8 @@ workspace = true
 # and this user's uid, which the key file must carry.
 aterm-uds = { workspace = true }
 # The fleet's proofs: HMAC-SHA256 over the channel exporter, HKDF over it, and
-# a constant-time compare. SHA-256 also fingerprints the pinned certificate
-# (tls.rs).
+# a constant-time compare, all astream-digest's (re-exported by aterm-digest).
+# SHA-256 also fingerprints the pinned certificate (tls.rs).
 aterm-digest = { workspace = true }
 # The workspace's one hex codec: a proof's tag and the certificate fingerprint.
 aterm-codec = { workspace = true }
@@ -44,11 +44,9 @@ aterm-spec-anchor = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# `WSAPoll` is Winsock's readiness primitive. `windows-sys` 0.61 is already in
-# the Windows graph; this only enables the narrow WinSock binding surface.
-windows-sys = { version = "0.61", default-features = false, features = [
-  "Win32_Networking_WinSock",
-] }
+# `WSAPoll` is Winsock's readiness primitive: aterm-win32's declaration,
+# generated from windows-sys 0.61.2 (WB.2 of docs/AUDIT-third-party-2026-10-15.md).
+aterm-win32 = { workspace = true }
 
 [dev-dependencies]
 # The interpreter, `verify`, `wait` and `host` the conformance tests drive.

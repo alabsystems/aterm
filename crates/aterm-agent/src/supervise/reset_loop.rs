@@ -1,79 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A LIMIT RESET IN THE LOOP
-//! (`docs/SPEC-claude-accounts-resets-2026-10-02.md` §3; the model is
-//! aterm-spec's `supervisor_limit_reset_model`): the usage-limit dialog's
-//! GRANT ROW taken where the host gives the go, and what the row opens seen
-//! through to its end — a step of the loop's own, shaped as the accounts
-//! probe is (`turn_end_loop.rs`'s `usage_probe`): fenced keys, an owed part
-//! at the top of every look, and no act of the turn-end policy's.
+//! Limit-reset state machine for the supervisor loop
+//! (`docs/SPEC-claude-accounts-resets-2026-10-02.md` §3;
+//! `supervisor_limit_reset_model`).
 //!
-//! NOTHING OF IT HAS BEEN SEEN. Every text the readers this stands on read
-//! (`aterm_phase::reset`) and every transition below is READ in the 2.1.304
-//! bundle, never on a screen; `[harness] limit_reset` ships `false`, and with
-//! it off no row is taken — [`Session::reset_take`] is reached only through a
-//! decision the approval policy makes with the key on — and the only step
-//! that runs is one an earlier loop left open in the session ledger:
-//! Escape-only, ended untold ([`Session::reset_end`]). [`ResetStep`] is
-//! `Idle` for the life of every loop whose ledger holds no open row of the
-//! rule and that takes none, and of every attended loop.
-//!
-//! A RESET IS THE OWNER'S SCARCE PURCHASE, so every part of the step refuses
-//! by default:
-//!
-//! * **Keys only, and never a command.** Nothing here calls `send` or `turn`:
-//!   the row is reached by the approval loop's own confirmed focus move
-//!   (`press_focused`, every key of it fenced on the judged read's person
-//!   count too), the confirmation's Enter is one fenced key, and everything
-//!   else is an Escape.
-//! * **A. The row** ([`Session::reset_take`]): the row the reader names
-//!   (`aterm_phase::reset_row`: the ONE reset on offer, a 5-hour, weekly or
-//!   full one, never a Fable one — or, under the owner's `[harness]
-//!   limit_reset_kinds`, the first listed kind on offer), the loop's gates, then
-//!   the host's word ([`IdleHost::reset_take`]) LAST, immediately before the
-//!   row's first key. The row's KIND rides in the ask and the go, and the
-//!   confirmation is held to it. Anything but its go passes the reset over for the
-//!   dialog's mount ([`Session::reset_passed`]), and the dialog is answered
-//!   with the decision made without the reset's rule on the same read — the
-//!   wait row, by the same keys a build without resets writes.
-//! * **B. What follows** ([`Session::reset_run`]): one ordinary read at a
-//!   time, every bound counted from the first read that showed what it
-//!   bounds. A pending line is waited on and never keyed — but `Checking…`
-//!   past its bound, which gets one guarded Escape (the vendor reads it as a
-//!   cancel that prints nothing). A box the row opened is the step's however
-//!   it is reworded, met on any read of the step but one after a box the
-//!   approval policy already judged: never another rule's to answer. A box
-//!   with nothing of the confirmation and an answer kept for good is never
-//!   the step's, and one with its head off the screen and no Esc read is a
-//!   frame half drawn: its Esc may be kept too (Claude Code's MCP server
-//!   dialogs).
-//! * **C. The confirmation** ([`Session::reset_confirmation`]): keyed only
-//!   once it has stood the box settle in this loop's sight (the vendor
-//!   refuses a key sooner and re-arms its refusal), with nobody's hand on
-//!   the session by a fresh `status`, the claim still this session's by the
-//!   host's word asked again. ENTER goes only where
-//!   [`confirm_verdict`] says so — the confirmation read exactly and agreeing
-//!   with the row taken — as `key if-human=<n> if-gen=<the read> if=<the Yes
-//!   row as drawn> enter`. EVERYTHING ELSE IS ESCAPE, `key if-human=<n>
-//!   if=<the title row> esc`: never an arrow, never the No row by keys. Once
-//!   an Escape was written no Enter follows it.
-//! * **D. The end** ([`Session::reset_end`]): the host reads the vendor's one
-//!   answer line from the transcript ([`IdleHost::reset_told`]) — the screen
-//!   says only that the dialog is gone — and the turn-end policy is told
-//!   what it owes ([`TurnEndState::reset_told`]): one continuation, typed by
-//!   its limit-resume rule.
-//! * **A successor never enters** (§3.1). A step the session ledger says an
-//!   earlier loop opened ([`approvals::reset_owed`]), and one whose own press
-//!   got no answer, carry no go: their confirmation is Escaped once it has
-//!   stood one person's grace in this loop's sight. A confirmation on a
-//!   session with no such step is a PERSON's, and is not touched here.
-//!   An open row older than a step can be ([`RESET_STALE`]) is a step all
-//!   the same, Escape-only, whose end is told to nobody.
-//! * **Nothing raises attention.** Ledger rows, journal lines
-//!   (`RESET seq=<n> rule=limit-reset@v1 …`), and one record through
-//!   [`IdleHost::inform`] for a dialog whose Escape does not take, or that
-//!   a step whose end is told leaves on a screen it cannot read.
+//! - **Disabled by default**: `[harness] limit_reset` defaults to `false`. When
+//!   off, no grant row is taken and any step left open in the ledger by an
+//!   earlier loop is closed with `Esc` and ended untold.
+//! - **Keys only**: navigates and confirms via fenced keys (`if-human=`,
+//!   `if-gen=`, `if=`), never `send` or `turn`.
+//! - **A. Grant row** ([`Session::reset_take`]): checks loop gates and asks the
+//!   host ([`IdleHost::reset_take`]) immediately before pressing the row.
+//! - **B. Follow-up reads** ([`Session::reset_run`]): waits on pending lines
+//!   (`Checking…` Escaped on timeout; `Resetting…` never keyed) with bounds
+//!   counted from first sight.
+//! - **C. Confirmation** ([`Session::reset_confirmation`]): presses `Enter` only
+//!   after box settle, fresh `status` human-idle check, exact
+//!   [`confirm_verdict`] match, and host claim re-verification; otherwise sends
+//!   a guarded `Esc`.
+//! - **D. Completion** ([`Session::reset_end`]): reads the transcript outcome
+//!   ([`IdleHost::reset_told`]) and notifies [`TurnEndState::reset_told`].
+//! - **Successor loops**: steps inherited from the ledger or after a lost press
+//!   have no `ResetGo` and only `Esc` out of confirmations.
 
 use super::super::policy::approval::{RULE_LIMIT_RESET, kept_for_good};
 use super::super::policy::reset::{Verdict as ResetVerdict, confirm_verdict};
@@ -548,25 +497,9 @@ impl<C: Ctl> Session<'_, C> {
         Ok(None)
     }
 
-    /// A. MAY THE GRANT ROW ON `turn` BE TAKEN? Asked where the approval
-    /// policy decided the row ([`RULE_LIMIT_RESET`]) and the stall check and
-    /// the person's hold have run as for any press, BEFORE ANY KEY:
-    ///
-    /// 1. the loop's gates ([`Self::reset_gate`]), any one shut a pass;
-    /// 2. the row read again from the same rows, and its day placed
-    ///    ([`Self::reset_day_start`]: `None` where it does not place);
-    /// 3. a session `status` says is halted is waited on
-    ///    ([`Session::park_on_hold`]) and looked at again: no key can be
-    ///    written under a hold, and a claim taken there would run out with
-    ///    none;
-    /// 4. the host's word, last ([`IdleHost::reset_take`]).
-    ///    [`ResetWord::Take`]: the go is kept for the row's press
-    ///    ([`Session::reset_taken`]). [`ResetWord::Again`]: one wait of
-    ///    [`ResetWaits::again`], and the dialog is looked at again — the
-    ///    sixth in a row is a pass. [`ResetWord::No`]: a pass, with its word.
-    ///
-    /// A pass says why once ([`Self::reset_pass`]) and the caller answers
-    /// the dialog with the decision made without the reset's rule.
+    /// Check whether the limit-reset grant row on `turn` may be taken: evaluate
+    /// [`Self::reset_gate`], place the grant day, wait out any session hold, and
+    /// query [`IdleHost::reset_take`].
     pub(super) fn reset_take(
         &mut self,
         turn: &Turn,
@@ -627,45 +560,11 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// What `screen` shows of a step that is owed, read by the reset's own
-    /// readers first: a pending line reads as an idle screen with no box to
-    /// every other reader. `before` is what the step's last read showed.
-    ///
-    /// A box that keeps NO part of the confirmation is still the step's
-    /// where it is of no kind the reader knows and draws unnumbered options,
-    /// on ANY READ OF THE STEP but one whose last read handed a box to the
-    /// approval policy (`before` is [`ResetShown::Other`]): the step's first
-    /// read (`Checking…` may come and go between two reads, and a step taken
-    /// up from the ledger has read nothing before) and a read after a frame
-    /// half drawn as much as one after the dialog. The row opened it,
-    /// whatever the vendor's server reworded it to, and no rule of the
-    /// approval policy is to say yes to it: it reads as a confirmation with
-    /// no title, and is Escaped. A box the policy was handed stays the
-    /// policy's while the reads go on showing a box, so one box never
-    /// changes hands. NEVER a box that offers an answer kept for good, read by
-    /// its role, its label or its rows as the press gate reads it
-    /// ([`kept_for_good`]: a frame whose roles the reader withheld, two
-    /// cursors mid-move, still offers one, and so does a narrow pane's whose
-    /// wrap joined the focused label onto the next option, `❯ Use this and
-    /// all future MCP servers in this project` over `Continue without using
-    /// this MCP server`; its rows are read again as defence in depth, the
-    /// reader's role already [`aterm_phase::prompt::Role::Persist`] where it
-    /// reads roles), nor a box whose head is off the screen and that reads
-    /// no Esc, a frame still being drawn: it reads as one ([`Shows::Unread`]),
-    /// never keyed. Claude Code's MCP server dialogs save their Esc as a
-    /// refusal for good (2.1.301). Read as one, its kind is
-    /// `McpServer`, never [`PromptKind::Other`]; retitled or cut, the
-    /// one-server dialog's three answers and the several-server dialog's
-    /// `Enable selected` are kept by their labels, and the several-server
-    /// dialog drawn only down to its server rows, its head cut, reads no Esc.
-    /// Such a box is the policy's — a person's.
-    ///
-    /// With no box read at all, a row that is the confirmation's title on a
-    /// screen with no composer is the confirmation in a layout the box
-    /// reader does not take (the vendor's other drawing of the buttons, READ
-    /// in the bundle): a confirmation with no options, Escaped on its title —
-    /// while no Enter was written; after one, that title stands over the
-    /// vendor's claim.
+    /// Classify `screen` for an active reset step (`Pending`, `Wall`, `Confirm`,
+    /// `Other`, `Gone`, or `Unread`). Unrecognized unnumbered boxes opened by the
+    /// step map to title-less `Confirm` (so they are Escaped), excluding prompts
+    /// with persistent options ([`kept_for_good`], e.g. MCP server dialogs) or
+    /// half-drawn frames missing both header and `Esc` hint.
     fn reset_shows(&self, screen: &Screen, before: Option<ResetShown>) -> Shows {
         let rows = &screen.rows;
         if let Some((line, row)) = aterm_phase::reset_pending(rows) {
@@ -723,16 +622,8 @@ impl<C: Ctl> Session<'_, C> {
             .min(deadline.saturating_duration_since(now))
     }
 
-    /// THE STEP OWED, at the top of every look ([`Session::look`], right
-    /// after the usage panel's own; the spec's §3.1). Nothing while none is
-    /// owed — but a claim given for a row that was never taken is told kept
-    /// once its dialog has left ([`Self::reset_untaken`]). `true`: a pending
-    /// line or a confirmation was handled — waited on, or keyed — or the
-    /// step's end was told, and the loop looks again; `false`: the screen
-    /// shows another box, which the approval policy judges while the step
-    /// stays owed.
-    ///
-    /// A stall of the worker's is held, never keyed into.
+    /// Step an owed limit reset at the top of [`Session::look`], or release an
+    /// untaken claim once its dialog leaves. Returns `true` if handled.
     pub(super) fn reset_look(
         &mut self,
         turn: &Turn,
@@ -761,38 +652,9 @@ impl<C: Ctl> Session<'_, C> {
         self.reset_run(Some(turn.screen.clone()), deadline, opts, review)
     }
 
-    /// B. WHAT FOLLOWS THE ROW, one ordinary read at a time, each after the
-    /// screen's next move ([`ResetWaits::step`] at most; a screen that moved
-    /// is given [`RESET_STILL_MS`] to hold still first), bounded by the
-    /// budget and ended by the loop's stop. `first`: a read already made
-    /// (the look's); `None` reads. What each read shows, and then:
-    ///
-    /// * `Checking for a reset…` — waited on; past [`ResetWaits::check`] one
-    ///   guarded Escape on its own row ([`KeepWhy::CheckTimeout`]);
-    /// * `Resetting your limits…` — waited on and NEVER keyed; past
-    ///   [`ResetWaits::claim`] the host is asked one last time
-    ///   ([`Self::reset_end`]);
-    /// * the usage-limit dialog still — read again until
-    ///   [`ResetWaits::open`]; then the row opened nothing
-    ///   ([`KeepWhy::NotOpened`]) and the step ends;
-    /// * a frame that reads as nothing — read again until
-    ///   [`ResetWaits::open`], or [`ResetWaits::claim`] once the
-    ///   confirmation's Enter was written (the vendor's claim may be under
-    ///   way on a screen this build does not read); then the step ends, and
-    ///   the host is left one record that a dialog may stand unread
-    ///   ([`RESET_UNREAD`]);
-    /// * the confirmation — [`Self::reset_confirmation`];
-    /// * another box — `false`: the approval policy judges it, the step
-    ///   stays owed;
-    /// * a composer frame, or the worker at work — the step ends
-    ///   ([`Self::reset_end`]).
-    ///
-    /// EVERY BOUND IS COUNTED FROM THE FIRST READ THAT SHOWED WHAT IT BOUNDS,
-    /// or from the step's last key where that is later
-    /// ([`ResetOwed::shown`], [`ResetOwed::keyed`]): a line first seen long
-    /// after the key — a person's own Enter on the yes while the loop held
-    /// its hand, an outage — has its whole bound from there, so a reset the
-    /// vendor is claiming is never told as ended at first sight.
+    /// Drive post-row reset reads until the dialog completes, yields to another
+    /// prompt (`Ok(false)`), or hits a timeout/stop. Phase bounds are measured from
+    /// the first read showing that phase (or the last key if later).
     pub(super) fn reset_run(
         &mut self,
         first: Option<Screen>,
@@ -982,34 +844,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(true)
     }
 
-    /// C. THE CONFIRMATION on `screen` (`prompt`, read as `read`; no box
-    /// where only its title reads), of a step that is owed. In order, each a
-    /// reason to write nothing yet:
-    ///
-    /// 1. it has stood the setup's box settle since this loop first read it
-    ///    — else the rest is waited and it is read again; a step taken up
-    ///    (no go) has stood one person's grace from there;
-    /// 2. an Enter already written is given [`ResetWaits::enter`];
-    /// 3. a failed Escape's pause is over, the worker reads its input and
-    ///    nobody's hand is on the session, by a fresh `status`
-    ///    ([`Self::reset_not_ready`]);
-    /// 4. the verdict ([`Self::reset_verdict`]); a host that cannot say yet
-    ///    whether the claim stands is asked again in a moment,
-    ///    [`RESET_AGAIN_MAX`] times, and then the reset is kept.
-    ///
-    /// ENTER: `key if-human=<n> if-gen=<gen> if=<the Yes row as drawn>
-    /// enter` ([`Session::fenced_key`]). Written, or cut off before its
-    /// answer came: the ledger's `approved` row with the head as read and
-    /// the journal's `confirmed` line, once a step
-    /// ([`Self::reset_yes_written`]). Skipped for a person's key: nothing,
-    /// the step stays owed. Skipped for a moved screen: settled, read and
-    /// judged again — [`RESET_SKIPS`] times in a row, and then the
-    /// confirmation is Escaped (`inexact-moving`). Turned away: parked or
-    /// backed off.
-    ///
-    /// ANYTHING ELSE: the guarded Escape on the title row
-    /// ([`Self::reset_escape`]) — on the Yes row as drawn where no title row
-    /// is on the screen, else on the box's first row.
+    /// Handle a reset confirmation screen: wait for box settle and input readiness,
+    /// evaluate [`Self::reset_verdict`], and send a fenced `Enter` or guarded `Esc`.
     fn reset_confirmation(
         &mut self,
         screen: &Screen,
@@ -1172,14 +1008,9 @@ impl<C: Ctl> Session<'_, C> {
         self.reset_escape(screen, &guard, why, title, opts, review)
     }
 
-    /// AN ENTER WAS WRITTEN ON THE CONFIRMATION, or may have been (its
-    /// answer never came): counted, the wait for what it opens runs from
-    /// now, and — once a step, with the first — the session ledger's
-    /// `approved` row on the vendor's yes of the confirmation's `kind`
-    /// (`Yes, use my weekly reset`; `head`: the body and detail as read) and
-    /// the journal's `confirmed` line. A loop that follows reads the row as
-    /// an Enter written ([`approvals::reset_owed`], which reads an older
-    /// build's `Yes, use my reset` too), and the host is told so.
+    /// Record that confirmation `Enter` was sent (or lost in flight): advance the
+    /// enter counter, reset the phase timer, and write the `approved` ledger row
+    /// and `confirmed` journal line once per step.
     fn reset_yes_written(
         &mut self,
         kind: aterm_phase::ResetKind,
@@ -1207,26 +1038,10 @@ impl<C: Ctl> Session<'_, C> {
         ));
     }
 
-    /// THE VERDICT ON THE CONFIRMATION AS `read`, its deadline placed at
-    /// `placed`: Enter, the reason it is kept, or to ask again. In order:
-    ///
-    /// * an Escape was written for it already — that reason, for good: no
-    ///   Enter follows an Escape;
-    /// * a step with no go (taken up from the ledger, or opened by a press
-    ///   whose answer never came) — [`KeepWhy::Successor`]: a loop that did
-    ///   not see the row taken holds nothing to hold the confirmation to;
-    /// * [`RESET_ENTERS`] Enters were written and it still stands —
-    ///   [`KeepWhy::EnterNotTaken`];
-    /// * what [`confirm_verdict`] says of the read against the row taken;
-    /// * and, only where that is Enter, THE CLAIM: asked for no longer ago
-    ///   than [`ResetWaits::enter_by`], and still this session's by the
-    ///   host's word, asked again now for the same wall
-    ///   ([`IdleHost::reset_take`]) — else [`KeepWhy::Claim`]; a host that
-    ///   cannot say yet ([`ResetWord::Again`]) is [`Judged::Again`];
-    /// * and THE WALL AS THE HOST READS IT NOW: the confirmation is judged
-    ///   once more against the go just given, so a wall that stood more than
-    ///   a day when the row was taken and no longer does is held to the
-    ///   deadline's rule like any short one.
+    /// Decide whether to `Enter`, `Keep(KeepWhy)` (`Esc`), or `Again` on a
+    /// confirmation: requires no prior `Esc`, a live `ResetGo` from this loop,
+    /// `< RESET_ENTERS` prior tries, [`confirm_verdict`] approval, and a fresh
+    /// [`IdleHost::reset_take`] re-confirming the claim within `enter_by`.
     fn reset_verdict(
         &mut self,
         read: &ConfirmRead,
@@ -1281,27 +1096,10 @@ impl<C: Ctl> Session<'_, C> {
         )
     }
 
-    /// ONE GUARDED ESCAPE of the step's, and what came of it: `key
-    /// if-human=<the read's person count> if=<guard> esc`
-    /// ([`Session::guarded_key`]; no `if-gen=`, as the probe's), then the
-    /// guarded row's leaving waited for ([`ResetWaits::close`]) and the
-    /// screen read again. `why` is the reason the reset is kept, written with
-    /// the first Escape as the ledger's `declined` row on `what` — and kept
-    /// from then on.
-    ///
-    /// * The dialog gone: the reads go on from that read.
-    /// * Still up — the Escape did not take, no row matched under a dialog
-    ///   that stands, or nothing could be pressed (a read with no person
-    ///   count: never an unfenced Escape): a failed try. The next is a pause of the survey's ladder away
-    ///   ([`SURVEY_RETRY`]: 5 s first, far outside the vendor's 250 ms
-    ///   re-arm, the last pause for ever), `WAITING` journaled, and at the
-    ///   [`RESET_STUCK_AT`]-th the host is told once ([`IdleHost::inform`])
-    ///   while the tries go on. Never an Enter.
-    /// * Skipped for a person's key: no try spent. Turned away: parked or
-    ///   backed off, no try spent.
-    ///
-    /// The caller has checked what the server cannot: the settle, the
-    /// ladder's pause, the worker's input and a person's grace.
+    /// Send one guarded `Esc` (`if-human=`, `if=<guard>`), record the `declined`
+    /// ledger row on the first attempt, wait up to `ResetWaits::close`, and back
+    /// off via `SURVEY_RETRY` (informing the host at `RESET_STUCK_AT`) if the
+    /// dialog remains.
     fn reset_escape(
         &mut self,
         screen: &Screen,
@@ -1364,31 +1162,10 @@ impl<C: Ctl> Session<'_, C> {
         Ok(Flow::Leave)
     }
 
-    /// D. THE STEP'S END: the dialog is gone (or `last`: its bound ran out),
-    /// and the host reads what the vendor answered
-    /// ([`IdleHost::reset_told`]: the transcript's one line, never the
-    /// screen). [`ResetOutcome::Pending`] is asked again — a pause of
-    /// [`ResetWaits::step`] between, the server's own wait — until
-    /// [`ResetWaits::line`] has passed, then once more with `last`. Any
-    /// other answer ends the step:
-    ///
-    /// * the ledger's `waiting` row (`ended: <the outcome's word>`), which
-    ///   is what a later loop reads the step closed by;
-    /// * the turn-end policy told what it owes ([`TurnEndState::reset_told`]:
-    ///   one continuation, at once or after the vendor's own);
-    /// * the journal's `RESET seq=<n> rule=limit-reset@v1 used (<kindResets>
-    ///   left)` (`used (1 weekly reset left)`; `…, the wall still stands`
-    ///   after the still-walled line), SAID — and `lifted`, `kept (<why>)`,
-    ///   `failed (<why>)`, `unread`, journal only.
-    ///
-    /// A step that ends UNTOLD ([`Self::reset_untold`]: `[harness]
-    /// limit_reset = false`, or a stale open row) tells the host and the
-    /// turn-end policy nothing: the `waiting` row (`ended: untold (key off)`,
-    /// `ended: stale`) and one journal note.
-    ///
-    /// No act of the turn-end policy is booked, and nothing is typed here.
-    /// A stop while the host is asked leaves the step owed: the loop that
-    /// follows reads the ledger.
+    /// Complete the reset step once the dialog closes or times out: poll
+    /// [`IdleHost::reset_told`] up to `ResetWaits::line`, record the closing
+    /// `waiting` ledger row and `RESET` journal line, and notify
+    /// [`TurnEndState::reset_told`] (unless ended untold).
     pub(super) fn reset_end(
         &mut self,
         seq: u64,
@@ -1402,11 +1179,6 @@ impl<C: Ctl> Session<'_, C> {
         else {
             return Ok(());
         };
-        // UNTOLD: the host records nothing of a reset with its key off, or
-        // of one whose claim lapsed long ago, and an outcome told to the
-        // turn-end policy would owe the session a continuation typed for the
-        // reset — against the owner's switch, or for a line that may be a
-        // later dialog's. The ledger's `waiting` row closes it.
         if let Some((ended, why)) = self.reset_untold(opts) {
             let waiting = approvals::Outcome::Waiting;
             self.ledger_row(RULE_LIMIT_RESET, waiting, RESET_SUBJECT, ended, seq);
@@ -1474,19 +1246,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// THE WORKER WORKS while a step is owed (a busy read of the wait,
-    /// [`Session::await_turn_from`]): its dialog is gone — the vendor's own
-    /// continuation after a reset, a person's turn — and the step ends here
-    /// ([`Self::reset_end`]), since the turn may run for hours and the look
-    /// that would tell the host comes only after it. Nothing while none is
-    /// owed, or while a pending line still stands under the busy row.
-    ///
-    /// `live`: the read shows the agent's LIVE TURN, not a break of its own
-    /// background work. That turn is the one the step's end leaves owed —
-    /// it is running — so the continuation the policy was just told of is
-    /// paid here ([`TurnEndState::took`]): told at this read, it was not
-    /// there for the read's own `took`, and a turn that ends before the
-    /// next busy read would be followed by a second, typed one.
+    /// End an owed reset step when the worker is observed busy during
+    /// `await_turn_from`; if `live`, mark the resulting continuation taken immediately.
     pub(super) fn reset_at_work(
         &mut self,
         screen: &Screen,

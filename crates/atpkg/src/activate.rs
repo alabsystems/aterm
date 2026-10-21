@@ -1,47 +1,31 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Activation (§10): the atomic POSIX symlink swap that makes a staged store build the
-//! live one, plus the `bin/` shim installation.
+//! Activation (§10): the atomic `store/<program>/current` flip that makes a staged store
+//! build live, and the `bin/` shims that forward into it.
 //!
-//! Activation is **not** the app updater's in-session handoff (that is aterm-gui/
-//! aterm-update's `.app` path). A CLI program's active build is selected by a symlink:
-//! `store/<program>/current` points at the chosen `store/<program>/<build>/`, and one
-//! `bin/<tool>` symlink per exposed binary points into it. Each flip is an **atomic replace** —
-//! write a sibling temp symlink, then `rename(2)` it over the target — so a reader never sees a
-//! missing or half-written link, and a concurrent run (under `apply.lock`) cannot observe a torn
-//! state. Every shim name is gated through [`crate::store::shim_allowed`]: a tool named
-//! `sudo`/`ssh`/`git`/… is refused a shim and reported, never silently installed.
+//! Every write is an atomic replace (sibling temp, then `rename(2)`), so a reader never
+//! sees a missing or half-written link or shim. Every shim name passes
+//! [`crate::store::shim_allowed`]: a tool named `sudo`/`ssh`/`git`/… gets no shim and is
+//! reported.
 //!
 //! # The `alab-<tool>` alias
 //!
-//! ALab's bare tool names collide with other software — Homebrew's p11-kit installs a
-//! certificate tool at `/opt/homebrew/bin/trust`, Homebrew core owns the formula names
-//! `ty` and `clean` — and the managed `bin/` is deliberately APPENDED to `PATH` (a managed
-//! tool never overrides what the user already had), so typing `trust` may run someone
-//! else's copy. The PATH order stays. Instead every program that is ALab's OWN
-//! ([`Aliases::Alab`]: its index entry has no `system` key) gets an
-//! `alab-<tool>` shim beside every `<tool>` shim, forwarding to the SAME store executable.
-//! Aliases are pruned, tombstoned, rolled back and uninstalled exactly like their primary
-//! — they resolve into the same build, and every sweep in this crate keys on where a shim
-//! resolves, not on its name. A vendor tool (`codex`, `claude`) or a system-satisfiable
-//! member (`gh`, `emacs`) gets no alias: the alias exists to say "ALab's copy", and those
-//! are not ALab's. A PENDING STUB is laid for the plain name only (`crate::stub`): the
-//! alias exists to be unambiguous once installed, and a second promising name on `PATH`
-//! before then would be noise.
+//! ALab's bare tool names collide with other software (Homebrew's p11-kit `trust`, the
+//! `ty` and `clean` formulae), and the managed `bin/` is appended to `PATH`, so `trust` may
+//! run someone else's copy. Every program that is ALab's own ([`Aliases::Alab`]) gets an
+//! `alab-<tool>` shim beside each `<tool>` shim, forwarding to the same executable. Every
+//! sweep keys on where a shim resolves, not its name, so aliases are pruned, tombstoned,
+//! rolled back and uninstalled with their primary. Vendor tools and system-satisfiable
+//! members get no alias, and a pending stub (`crate::stub`) is laid for the plain name only.
 //!
 //! # The shim environment (design S7)
 //!
-//! A manifest may declare `shim_env = ["DISABLE_AUTOUPDATER=1"]` ([`crate::shim_env`]):
-//! every shim of that program — primary and alias alike — then EXPORTS those variables
-//! before it execs the store binary, so a managed vendor tool runs with its own updater
-//! off. [`install_tools_env`] lays the shims with the env its caller holds (the signed
-//! manifest on the install path; the build's `<build>.shim-env` sidecar on the verbs
-//! that hold none), [`reassert_shim_env`] re-lays a primary whose exports have drifted
-//! from that sidecar (the pass's half — an up-to-date program is never laid again),
-//! [`reconcile_aliases`] mirrors the primary's env onto its alias, and every sweep below
-//! keys on where a shim RESOLVES — the exec line — so an env-carrying shim is pruned,
-//! tombstoned, rolled back and uninstalled exactly like a plain one.
+//! A manifest's `shim_env` ([`crate::shim_env`]) makes every shim of the program export
+//! those variables before it execs (e.g. a vendor tool's own updater off).
+//! [`install_tools_env`] lays shims with the env its caller holds (the signed manifest, or
+//! the build's `.shim-env` sidecar), [`reassert_shim_env`] re-lays a primary that drifted
+//! from the sidecar, and [`reconcile_aliases`] mirrors the primary's env onto its alias.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -51,7 +35,7 @@ use crate::platform::{self};
 use crate::store::{ToolName, split_exposed};
 
 /// Whether a program's exposed tools also get their `alab-<tool>` aliases (module doc).
-/// Decided from the SIGNED index entry by [`Aliases::for_program`] on the install path,
+/// Decided from the signed index entry by [`Aliases::for_program`] on the install path,
 /// and from what is already on disk by [`Aliases::laid_for`] on the verbs that run
 /// without an index (`unlink`'s restore, `rollback`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,9 +48,9 @@ pub enum Aliases {
 }
 
 impl Aliases {
-    /// The policy for an index entry: ALab's own ⇔ no `system` key and not an AGENT
-    /// PROGRAM (`claude`/`codex` are a vendor's, whatever their row says —
-    /// [`crate::stub::AGENT_PROGRAMS`] — so they never grow an `alab-claude`). An UNLISTED
+    /// The policy for an index entry: ALab's own ⇔ no `system` key and not an agent
+    /// program (`claude`/`codex` are a vendor's, whatever their row says —
+    /// [`crate::stub::AGENT_PROGRAMS`] — so they never grow an `alab-claude`). An unlisted
     /// program (`None`) is not ALab's: nothing vouches for it.
     #[must_use]
     pub fn for_program(name: &str, program: Option<&crate::manifest::Program>) -> Self {
@@ -101,25 +85,17 @@ impl Aliases {
     }
 }
 
-/// Atomically point `link` at `target`. The OS-specific indirection primitive:
-/// [`crate::platform::atomic_symlink`] — a temp-symlink + `rename(2)` on POSIX (atomic,
-/// no missing/half-written window), a directory **junction** on Windows. Re-exported here
-/// (and via [`crate`]) so every managed directory symlink shares one entry point.
+/// Atomically point `link` at `target` ([`crate::platform::atomic_symlink`]: temp symlink +
+/// `rename(2)` on POSIX, a directory junction on Windows): the one entry point for every
+/// managed directory link.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     platform::atomic_symlink(target, link)
 }
 
-/// Make `build_dir` the active build: atomically flip `store/<program>/current` to it —
-/// the per-program link [`crate::gc::live_builds`] reads as the liveness witness.
-/// Idempotent — re-activating the same build is a no-op-ish re-point.
-///
-/// The program name comes from the build dir's own place in the store, so the link can
-/// never name a different program than the build; a `build_dir` that is not a store build
-/// dir is refused (`InvalidInput`) rather than activated with no witness.
-///
-/// **One link.** The retired `channels/<channel>/current` was one link per channel NAME,
-/// shared by every program, so it witnessed only the last activation; a prefix that still
-/// carries it has it swept by [`crate::gc::sweep_retired_channel_links`].
+/// Make `build_dir` the active build: atomically flip `store/<program>/current` to it, the
+/// per-program link [`crate::gc::live_builds`] reads as the liveness witness. Idempotent.
+/// The program comes from the build dir's place in the store; a dir that is not a store
+/// build is refused (`InvalidInput`).
 pub fn activate_build(layout: &Layout, build_dir: &Path) -> io::Result<()> {
     let Some((program, _)) = crate::ops::store_build_of(&layout.prefix, build_dir) else {
         return Err(io::Error::new(
@@ -130,15 +106,9 @@ pub fn activate_build(layout: &Layout, build_dir: &Path) -> io::Result<()> {
     atomic_symlink(build_dir, &layout.program_current(&program))
 }
 
-/// Install `bin/` shims for the manifest's raw `exposes` list, each pointing at the tool's
-/// executable inside `<build_dir>/bin/`.
-///
-/// This is the crate's boundary between a `Vec<String>` off the wire and the validated
-/// [`ToolName`]: a name that fails [`crate::store::shim_allowed`] (collides with a sensitive
-/// command, or is malformed) never becomes a `ToolName` at all, so it is **skipped** and
-/// returned for the caller to surface in `status.toml`. Returns the refused RAW names — the
-/// report has to name what the manifest asked for, which is why the split happens here and
-/// not inside the type. Empty when everything was installed.
+/// Install `bin/` shims for the manifest's raw `exposes` list, each forwarding to the tool's
+/// executable in `<build_dir>/bin/`. A name that fails [`crate::store::shim_allowed`] never
+/// becomes a [`ToolName`] and is skipped; returns the refused raw names for `status.toml`.
 pub fn install_shims(
     layout: &Layout,
     build_dir: &Path,
@@ -150,10 +120,9 @@ pub fn install_shims(
     Ok(refused)
 }
 
-/// [`install_shims`] whose shims export `env` before they exec (design S7) — what a
-/// verb that re-lays an INSTALLED build passes its sidecar to
-/// ([`crate::shim_env::read_sidecar`]), so a re-lay never strips what the signed manifest
-/// declared (a `claude` laid plain would turn Claude Code's own updater back on).
+/// [`install_shims`] whose shims export `env` before they exec (design S7): a verb re-laying
+/// an installed build passes its sidecar ([`crate::shim_env::read_sidecar`]), so a re-lay
+/// never strips what the signed manifest declared.
 pub fn install_shims_env(
     layout: &Layout,
     build_dir: &Path,
@@ -161,19 +130,31 @@ pub fn install_shims_env(
     aliases: Aliases,
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<Vec<String>> {
+    install_shims_env_saying(layout, build_dir, exposes, aliases, env, &mut |line| {
+        println!("{line}");
+    })
+}
+
+/// [`install_shims_env`] that hands what it says (an exec root it laid) to `say` instead
+/// of stdout: a surface whose stdout is one document (`aterm pkg repair --json`, `aterm
+/// doctor --json`) gathers it into the row of the item that laid it.
+pub(crate) fn install_shims_env_saying(
+    layout: &Layout,
+    build_dir: &Path,
+    exposes: &[String],
+    aliases: Aliases,
+    env: &crate::shim_env::ShimEnv,
+    say: &mut dyn FnMut(String),
+) -> io::Result<Vec<String>> {
     let (tools, refused) = split_exposed(exposes);
-    install_tools_env(layout, build_dir, &tools, aliases, env)?;
+    install_tools_env_saying(layout, build_dir, &tools, aliases, env, say)?;
     Ok(refused)
 }
 
-/// The validated half of [`install_shims`]: install one shim per already-admitted
-/// [`ToolName`] (plus its `alab-` alias under [`Aliases::Alab`]), then prune the shims a
-/// previous build left behind. The `bin/` dir is created hardened first.
-///
-/// Split out (and `pub(crate)`) for the callers that already hold `ToolName`s — the
-/// transaction flip in [`crate::flow`], whose staged member carries the admitted set — so the
-/// raw list is not re-split, and so their refusal semantics cannot silently drift from this
-/// one loop's.
+/// The validated half of [`install_shims`]: lay one shim per admitted [`ToolName`] (plus
+/// its alias under [`Aliases::Alab`]), then prune what a previous build left. For callers
+/// that already hold `ToolName`s (the transaction flip in [`crate::flow`]), so the raw list
+/// is not re-split.
 pub(crate) fn install_tools(
     layout: &Layout,
     build_dir: &Path,
@@ -189,11 +170,9 @@ pub(crate) fn install_tools(
     )
 }
 
-/// [`install_tools`] whose shims — primary AND alias — export `env` before they exec
-/// (design S7, module doc). The install path passes the signed manifest's
-/// [`crate::manifest::PkgManifest::shim_env`]; the verbs that hold no manifest pass the
-/// build's sidecar ([`crate::shim_env::read_sidecar`]). An empty `env` is exactly
-/// [`install_tools`].
+/// [`install_tools`] whose shims, primary and alias, export `env` before they exec (design
+/// S7): the signed manifest's [`crate::manifest::PkgManifest::shim_env`] on the install
+/// path, the build's sidecar ([`crate::shim_env::read_sidecar`]) elsewhere.
 pub(crate) fn install_tools_env(
     layout: &Layout,
     build_dir: &Path,
@@ -201,39 +180,38 @@ pub(crate) fn install_tools_env(
     aliases: Aliases,
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<()> {
+    install_tools_env_saying(layout, build_dir, tools, aliases, env, &mut |line| {
+        println!("{line}");
+    })
+}
+
+/// [`install_tools_env`], saying through `say` ([`install_shims_env_saying`]).
+fn install_tools_env_saying(
+    layout: &Layout,
+    build_dir: &Path,
+    tools: &[ToolName],
+    aliases: Aliases,
+    env: &crate::shim_env::ShimEnv,
+    say: &mut dyn FnMut(String),
+) -> io::Result<()> {
     let bin = layout.bin_dir();
     layout.ensure_dir(&bin)?;
-    // THE EXEC ROOT BEFORE THE FIRST SHIM THAT NAMES THE BUILD (`crate::compat`). A trust
-    // build that ships `bin/rustc` as a separate copy of `trustc` (bundles 8571, 8589,
-    // 8590, 8595) has a tippy that refuses to run from the store; the renders below route
-    // through `<prefix>/compat/trust/<n>` exactly when a whole root stands there, so it
-    // has to stand before they are rendered — which also puts it ahead of the `current`
-    // flip on every lane that ends here: install, the transaction flip, repair, seed,
-    // flow's restore and linkmode's unlink (a rollback re-lays through
-    // `flow::rollback_member`, which ensures the prior build's root itself). `Shallow`: a
-    // few dozen `lstat`s when the root is already whole, and ZERO writes (a tippy running
-    // from it pins its own link counts and ctimes). Every other build answers `Plain` without
-    // creating anything, and a build without the copy keeps today's shims byte for byte. A
-    // root that cannot be put in order costs this lay nothing: the shims render through
-    // whatever whole root already stands, or plain — running the store path as they did
-    // before this existed — and the pass's own reconcile retries; behind a link or a file
-    // at `compat` or `compat/trust` no retry can, and `compat::not_laid_line` names that
-    // path and the manual fix instead of promising `repair`. A root laid here is SAID:
-    // it is the one moment the machine changes shape, and `repair` over a missing or
-    // tampered root otherwise printed only "done".
+    // The exec root (`crate::compat`) must stand before any shim naming the build renders,
+    // since the renders route through `<prefix>/compat/trust/<n>` exactly when a whole
+    // root stands; that also puts it ahead of the `current` flip on every lane ending here
+    // (a rollback ensures its own in `flow::rollback_member`). `Shallow` writes nothing over
+    // a whole root. A root that cannot be laid costs this lay nothing: the shims render
+    // plain and the pass's reconcile retries. A root laid here is said: it is the one moment
+    // the machine changes shape.
     if let Some(n) = crate::compat::trust_build_of(layout, build_dir) {
         match crate::compat::ensure_root(layout, build_dir, crate::seam::Depth::Shallow) {
-            Ok(crate::compat::Ensured::Built) => {
-                println!("{}", crate::compat::laid_line(layout, n))
-            }
+            Ok(crate::compat::Ensured::Built) => say(crate::compat::laid_line(layout, n)),
             Ok(crate::compat::Ensured::Plain | crate::compat::Ensured::Present) => {}
             Err(e) => eprintln!("{}", crate::compat::not_laid_line(layout, n, &e)),
         }
     }
-    // Rendered first, then laid: every primary and — under [`Aliases::Alab`] — its
-    // `alab-<tool>` alias forwarding to the SAME executable. The alias is the primary's
-    // target under the alias's file name — the pair [`platform::shim_executable_env`] keeps
-    // apart by taking the target's [`ToolName`] and the shim path separately.
+    // Render everything, then lay: each primary and, under [`Aliases::Alab`], its
+    // `alab-<tool>` alias forwarding to the same executable.
     let mut files = Vec::new();
     for tool in tools {
         files.push(platform::shim_executable_env(
@@ -259,55 +237,32 @@ pub(crate) fn install_tools_env(
         agents_checkpoint::at(layout, agents_checkpoint::Event::Written(tool.as_str()));
     }
     prune_stale_shims(layout, build_dir, tools, aliases);
-    // The front-of-PATH twin of an agent program's shim,
-    // laid from the `bin/` shim just written so the two can never disagree.
+    // The front-of-PATH twin, laid from the `bin/` shim just written so the two agree.
     reconcile_agents(layout);
     Ok(())
 }
 
-/// Bring `<prefix>/agents/` ([`Layout::agents_dir`]) in line with `bin/`: for every AGENT
-/// PROGRAM ([`crate::stub::AGENT_PROGRAMS`]) whose `bin/` shim resolves into the store — or
-/// into its recorded dev-link checkout, whose twin then carries no self-update block and
-/// leaves the link's `bin/` shim as the link laid it ([`agent_primary`]) —
-/// lay — or refresh — the twin `agents/<tool>` with the SAME target and the SAME exported
-/// environment (read off the `bin/` shim as laid, never re-derived, for the reason
-/// [`reconcile_aliases`] gives) plus the self-update block ([`crate::selfupdate`]),
-/// then sweep everything else out of `agents/` ([`sweep_agents_dir`]). The primary itself
-/// gets the same block (outside an aterm session `bin/<program>` is the managed name). Idempotent:
-/// a twin that already resolves where the primary does with the same env and the bytes the twin
-/// renderer lays ([`twin_is_rendered`]) is left alone, and so is a primary already carrying the
-/// block, so the six-hourly tick rewrites nothing.
+/// Bring `<prefix>/agents/` ([`Layout::agents_dir`]) in line with `bin/`: for every agent
+/// program ([`crate::stub::AGENT_PROGRAMS`]) whose `bin/` shim resolves into an agent
+/// program's store tree or the program's recorded dev-link checkout ([`agent_primary`]), lay
+/// or refresh the twin `agents/<tool>` with the same target and exported environment (read
+/// off the `bin/` shim) plus the self-update block ([`crate::selfupdate`]), which the primary
+/// gets too; then [`sweep_agents_dir`]. A dev link's twin gets no block and its `bin/` shim
+/// stays as the link laid it. What already matches is left alone.
 ///
-/// Called at the end of every shim-laying pass — [`install_tools_env`] (hence every
-/// install and `repair`), flow's undo, linkmode's link/unlink, and ONCE at the end of
-/// `cli::reconcile_aliases`, after its per-program loop — so an agent program installed
-/// by an older client gains its twin the first pass after this one lands, and an
-/// uninstalled or tombstoned one loses it in the same motion.
-///
-/// ONCE PER PASS, NEVER ONCE PER PROGRAM. Nothing here is a function of any one program:
-/// it walks [`crate::stub::AGENT_PROGRAMS`] and sweeps `agents/` whatever the caller was
-/// reconciling, so it must not hang off [`reconcile_aliases`], which the pass runs for
-/// EVERY active program.
-///
-/// BEST-EFFORT, like [`sweep_agents_dir`]: a twin that cannot be laid — `agents/`
-/// uncreatable, the link refused — is reported on stderr and the pass goes on, because
-/// this runs inside EVERY program's install and an `ay` or `trust` install must not fail
-/// over a directory only `claude` and `codex` use. The `bin/` shim
-/// is already laid by then; the twin is retried on the next pass.
-///
-/// The keep-predicate is [`sweep_agents_dir`]'s: the primary must resolve into an AGENT
-/// PROGRAM's store tree — a `bin/claude` into some other program's tree earns no twin,
-/// which is what the sweep would have removed again anyway.
-///
-/// One at a time in a process, with every sweep ([`AGENTS_TURN`]).
+/// Runs once at the end of every shim-laying pass ([`install_tools_env`], flow's undo,
+/// linkmode's link/unlink, and after `cli::reconcile_aliases`'s per-program loop), never
+/// per program, and one at a time with every sweep ([`AGENTS_TURN`]). Best-effort: a twin
+/// that cannot be laid is reported on stderr and retried next pass, so an `ay` install never
+/// fails over a directory only agent programs use.
 pub fn reconcile_agents(layout: &Layout) {
     let _turn = AGENTS_TURN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Reading a primary and publishing the bytes selected from it are one turn with
-    // every executable writer. Serializing reconciles alone lets a concurrent rollback,
-    // tombstone or first landing replace the primary after this read, then be overwritten
-    // by this read's stale target (including a dangling target from an emptied store).
+    // The read of each primary and the publish of what it selected hold the publication
+    // turn too: otherwise a concurrent rollback, tombstone or first landing could replace
+    // the primary after the read and be overwritten with its stale (possibly dangling)
+    // target.
     let publication = crate::lay::PUBLICATION_TURN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -366,20 +321,14 @@ pub fn reconcile_agents(layout: &Layout) {
                 &crate::yolo::policy_of(name),
             )
         };
-        // THE `bin/` SHIM ANSWERS THE SAME VERBS. Outside an aterm session
-        // the rc hook takes `agents/` off PATH and APPENDS `bin/` (`crate::hooks`), so in
-        // Terminal, iTerm, an editor's terminal or over ssh — wherever the person keeps no
-        // copy of their own — `claude` IS `bin/claude`, and a `claude update` typed there ran
-        // the vendor's updater on the managed copy: measured on 2.1.287/2.1.288 it set
-        // `installMethod` to `native` in `~/.claude.json` and fetched the vendor's latest for a
-        // native install under `~/.local`, the copy this block exists never to install. So
-        // `bin/` carries the twin's block too, laid here over a primary that resolves into an
-        // agent program's store (checked above) and only when its bytes are not already the
-        // render — the two files are then byte for byte the same. The verb's forward `exec`s
-        // `bin/` again; the block's re-entry guard ([`crate::selfupdate::REENTRY_VAR`]) lets
-        // that through to the store build. Its own target and environment, read off it above,
-        // so nothing a reader keys on moves; Windows renders no block and nothing is laid.
-        // A dev link's `bin/` shim is the link itself (`linkmode::link`), never rewritten here.
+        // `bin/` answers the same verbs: outside an aterm session the rc hook takes
+        // `agents/` off PATH and appends `bin/` (`crate::hooks`), so `claude` there is
+        // `bin/claude`, and the vendor's updater run on the managed copy sets `installMethod`
+        // to `native` in `~/.claude.json` and installs a copy under `~/.local`. Laid only when
+        // its bytes differ; the forward `exec`s `bin/` again and the re-entry guard
+        // ([`crate::selfupdate::REENTRY_VAR`]) lets it through to the store build. Windows
+        // renders no block. A dev link's `bin/` shim is the link itself (`linkmode::link`),
+        // never rewritten here.
         if !dev_link
             && !prelude.is_empty()
             && !twin_is_rendered(&primary, &target, &env, &prelude)
@@ -514,13 +463,12 @@ enum AgentPrimary {
     DevLink,
 }
 
-/// Whether `target`, what `program`'s `bin/` shim forwards to, is one an `agents/` twin may
-/// name: a build in an agent program's store tree, or — for a program dev-linked here
-/// ([`crate::linkmode::linked_checkout`]) — a file inside its recorded checkout, so a dev
-/// link wins at the front of PATH as it does on `bin/` (`aterm pkg link codex <pkgdir>
-/// bin/codex` inside aterm runs the linked build). `None` for anything else: a twin is never
-/// laid, and never kept, for a target nothing vouches for. Lexical, like the link's own
-/// record: the marker holds the absolute checkout, the shim its absolute target.
+/// What `target`, the forward of `program`'s `bin/` shim, is when an `agents/` twin may name
+/// it: a build in an agent program's store tree, or a file inside the program's recorded
+/// dev-link checkout ([`crate::linkmode::linked_checkout`]), so a dev link also wins at the
+/// front of `PATH`. `None` otherwise: no twin is laid or kept for a target nothing vouches
+/// for. The check is lexical: the link marker holds the absolute checkout, the shim its
+/// absolute target.
 fn agent_primary(layout: &Layout, program: &str, target: &Path) -> Option<AgentPrimary> {
     if crate::ops::store_build_of(&layout.prefix, target)
         .is_some_and(|(owner, _)| crate::stub::is_agent_program(&owner))
@@ -533,11 +481,11 @@ fn agent_primary(layout: &Layout, program: &str, target: &Path) -> Option<AgentP
     .then_some(AgentPrimary::DevLink)
 }
 
-/// The turn every reconcile and sweep of `agents/` takes. A first run's set completion lays
-/// its members' shims while the vendor lane lays the agents' on a thread of its own, and
-/// each ends in a reconcile: two walks interleaved would sweep a twin the other had just
-/// judged, or lay one name twice at once. Taken at each site (`AGENTS_TURN.lock()`), so the
-/// lock-order census sees every holder.
+/// The turn every reconcile and sweep of `agents/` takes, before
+/// [`crate::lay::PUBLICATION_TURN`]. A first run's set completion and the vendor lane's
+/// thread each lay shims and end in a reconcile; interleaved, one walk would sweep a twin
+/// the other had just judged, or both lay one name at once. Locked at each site, not through
+/// a helper, so the lock-order census sees every holder.
 static AGENTS_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A fixture may park a real agent-shim read or write for its own prefix only. Callbacks
@@ -610,7 +558,7 @@ pub(crate) mod agents_checkpoint {
     }
 }
 
-/// [`shim_is_rendered`] for an `agents/` twin: the bytes the TWIN renderer lays for
+/// [`shim_is_rendered`] for an `agents/` twin: the bytes the twin renderer lays for
 /// `target`, `env` and its `prelude` ([`platform::twin_executable_to_env`]).
 fn twin_is_rendered(
     shim: &Path,
@@ -618,33 +566,27 @@ fn twin_is_rendered(
     env: &crate::shim_env::ShimEnv,
     prelude: &str,
 ) -> bool {
-    // On every platform: an older Windows twin carries the landing prelude, and today's `.cmd` twin
-    // is the plain framed shim, so it is re-laid once. Safe while it runs: every `.cmd` starts with
-    // the frame (`platform::CMD_FRAME_HEAD`) and ends its batch on the line that runs the program,
-    // so `cmd.exe`'s byte-offset resume never re-reads the new file. Unverified on Windows.
+    // On every platform: an older Windows twin carries the landing prelude and today's `.cmd`
+    // twin is the plain framed shim, so it is re-laid once. Safe while it runs: every `.cmd`
+    // starts with the frame (`platform::CMD_FRAME_HEAD`) and ends its batch on the line that
+    // runs the program, so `cmd.exe`'s byte-offset resume never re-reads the new file.
+    // Unverified on Windows.
     platform::twin_executable_to_env(shim, target, env, prelude).is_ok_and(|want| {
         crate::metadata_io::read_bounded_regular(shim, platform::MAX_SHIM_BYTES)
             .is_ok_and(|have| have == want.body)
     })
 }
 
-/// Whether the shim at `shim` holds, byte for byte, what the one shim renderer
-/// (`platform::shim_executable_to_env`) lays for `target` and `env` NOW — the half of the
-/// alias and agents reconciles' "already right" that target and environment cannot see.
+/// Whether `shim` holds, byte for byte, what the one shim renderer
+/// (`platform::shim_executable_to_env`) lays for `target` and `env` now: the half of the
+/// reconciles' "already right" that target and environment cannot see.
 ///
-/// The render is not a function of target and environment alone: on Unix it carries the
-/// guard line of an exec root when [`crate::compat::route_for_shim`] finds one standing
-/// for the build. So a shim laid before that root stood (by an older client, or by a lay
-/// whose root could not be built then) forwards and exports exactly right and is still
-/// wrong, and a predicate reading only those two kept it on the store path — where the
-/// build's own tippy refuses to start — for as long as the program stayed up to date. The
-/// render is `stat`s and string building, no write; the read is one bounded, non-link
-/// regular file, so a symlink an older atpkg left, or anything unreadable, reads as not
-/// rendered and is re-laid the ordinary way (over the foreign-file guard where one
-/// applies). A second pass over what the first laid compares equal and writes nothing.
-///
-/// Windows answers `true`: no exec root exists there, every render is the plain one, and
-/// the reconciles keep today's target-and-environment predicate unchanged.
+/// On Unix the render carries an exec root's guard line when
+/// [`crate::compat::route_for_shim`] finds one for the build, so a shim laid before that
+/// root stood forwards and exports right yet stays on the store path, where the build's
+/// tippy refuses to start. The read is one bounded, non-link regular file: a symlink or
+/// anything unreadable reads as not rendered and is re-laid. Windows answers `true` (no
+/// exec roots there).
 fn shim_is_rendered(shim: &Path, target: &Path, env: &crate::shim_env::ShimEnv) -> bool {
     if cfg!(not(unix)) {
         return true;
@@ -655,13 +597,12 @@ fn shim_is_rendered(shim: &Path, target: &Path, env: &crate::shim_env::ShimEnv) 
     })
 }
 
-/// Keep `agents/` holding ONLY live agent shims: an entry stays iff its name is an agent
-/// program's, it resolves into that program's store tree or its recorded dev-link checkout
-/// ([`agent_primary`]), and the `bin/` shim of the same name resolves to the SAME target. Everything else — a name that is not an agent
-/// program's, a twin of a build the primary has moved off (rolled back, updated), a twin
-/// whose primary is now a tombstone or gone (uninstalled), a hand-dropped file — is
-/// removed: this directory is FIRST on every `PATH`, so nothing may sit in it that
-/// `bin/` does not vouch for. Best-effort and silent, like every sweep here.
+/// Keep only live agent shims in `agents/`: an entry stays iff its name is an agent
+/// program's, it resolves into an agent program's store tree or the program's recorded
+/// dev-link checkout ([`agent_primary`]), and `bin/`'s shim of the same name resolves to the
+/// same target (or it is the pending stub of a program not yet installed). `agents/` is
+/// first on every `PATH`, so nothing may sit there that `bin/` does not vouch for.
+/// Best-effort and silent; takes [`AGENTS_TURN`], then the publication turn.
 pub fn sweep_agents_dir(layout: &Layout) {
     let _turn = AGENTS_TURN
         .lock()
@@ -706,21 +647,15 @@ fn sweep_agents(layout: &Layout) {
     }
 }
 
-/// Bring the ALIASES of an already-installed program in line with `aliases` without
-/// touching its primary shims: under [`Aliases::Alab`] lay the missing `alab-<tool>` — or
-/// re-lay one whose bytes are not what the renderer lays now ([`shim_is_rendered`]) — for
-/// every `tool` whose shim resolves into `build_dir`; under [`Aliases::Off`] sweep any
-/// alias that resolves into this program's store. The primary shims are read, never
-/// written, so an up-to-date program — which the install pipeline short-circuits before it
-/// ever reaches [`install_tools`] — still gets its aliases the first pass after this
-/// client lands, and a program whose index entry stops being ALab's own loses them.
-/// Nothing here touches a dev-linked program's checkout shims (they resolve outside the
-/// store) or a pending stub (it resolves nowhere).
+/// Bring an installed program's aliases in line with `aliases` without writing its
+/// primaries: under [`Aliases::Alab`] lay a missing `alab-<tool>`, or re-lay one whose bytes
+/// are not the current render ([`shim_is_rendered`]), for every `tool` whose shim resolves
+/// into `build_dir`; under [`Aliases::Off`] sweep aliases resolving into this program's
+/// store. An up-to-date program never reaches [`install_tools`], so this is how it gains or
+/// loses aliases. Dev-link shims and pending stubs are untouched.
 ///
-/// ALIASES ONLY: `agents/` is NOT reconciled here. This runs once per active program and
-/// [`reconcile_agents`] answers for none of them in particular, so the pass calls it once
-/// after its loop (`cli::reconcile_aliases`) — see that function's doc for what the
-/// per-program repeat cost.
+/// `agents/` is not reconciled here: this runs per program, and the pass calls
+/// [`reconcile_agents`] once after its loop (`cli::reconcile_aliases`).
 pub(crate) fn reconcile_aliases(
     layout: &Layout,
     build_dir: &Path,
@@ -730,7 +665,7 @@ pub(crate) fn reconcile_aliases(
     if aliases == Aliases::Alab {
         for tool in tools {
             let Some(alias) = tool.alias() else { continue };
-            // The alias mirrors the PRIMARY's forward target as it is spelled on disk —
+            // The alias mirrors the primary's forward target as it is spelled on disk —
             // never a re-derived path that could differ in spelling (a canonicalized
             // build dir) and make the tick rewrite a correct alias every pass. A primary
             // that does not resolve into this build dir is not this build's to alias.
@@ -746,13 +681,9 @@ pub(crate) fn reconcile_aliases(
             // primary as laid, never re-derived, for the same reason as the target.
             let env = platform::shim_env_of(&layout.shim(tool));
             let shim = layout.shim(&alias);
-            // Already right (an alias resolving exactly where the primary does, with the
-            // same environment, whose bytes are what the renderer lays now) is left alone,
-            // so the six-hourly tick rewrites nothing. The byte half is what reaches an
-            // alias an older client laid PLAIN for a trust build that now has an exec
-            // root (`crate::compat`): the pass short-circuits the up-to-date program before
-            // any install renders it, and target + environment alone matched — so
-            // `alab-tippy` stayed on the store path its own tippy refuses, forever.
+            // Already right — same target, same env, and the bytes the renderer lays now —
+            // is left alone, so the tick rewrites nothing. The byte check catches an alias
+            // laid plain for a trust build that now has an exec root (`crate::compat`).
             if platform::resolve_shim(&shim).is_some_and(|t| t == wanted)
                 && platform::shim_env_of(&shim) == env
                 && shim_is_rendered(&shim, &wanted, &env)
@@ -777,8 +708,8 @@ pub(crate) fn reconcile_aliases(
     Ok(())
 }
 
-/// The PRIMARY shims of one build whose exported environment is not the one that build
-/// DECLARES ([`crate::shim_env::read_sidecar`], design S7) — what [`shim_env_drift`]
+/// The primary shims of one build whose exported environment is not the one that build
+/// declares ([`crate::shim_env::read_sidecar`], design S7) — what [`shim_env_drift`]
 /// found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EnvDrift {
@@ -789,20 +720,13 @@ pub(crate) struct EnvDrift {
     pub(crate) shims: Vec<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
-/// THE ONE DRIFT PREDICATE: among `tools`, the primaries whose shim resolves into
+/// The one drift predicate: among `tools`, the primaries whose shim resolves into
 /// `build_dir` and exports anything other than exactly what the build's sidecar declares.
-/// The pass heals what this finds ([`reassert_shim_env`]) and the doctor names it (check
-/// 10f), so the two can never disagree about which shim is wrong.
+/// The pass heals what it finds ([`reassert_shim_env`]) and the doctor's check 10f names it.
 ///
-/// `None` when nothing drifted — and always when the build declares NO environment (no
-/// sidecar: staged before S7, or a policy that declares none). That is the add-only half
-/// of the rule: an absent sidecar is no evidence the env a shim exports should go, so a
-/// shim's own exports stand. A build that DOES declare one is authoritative: its primaries
-/// export exactly that, no less and no other.
-///
-/// Only a shim that resolves into `build_dir` is looked at — a tombstone, a pending stub
-/// and a dev link resolve elsewhere, or nowhere. Reads only: one bounded sidecar read,
-/// then one bounded read per tool; nothing lists `bin/`.
+/// `None` when nothing drifted, and always when the build declares no environment: an
+/// absent sidecar is no evidence a shim's exports should go (add-only). A declaring build
+/// is authoritative. Reads only: one sidecar, then one bounded read per tool.
 pub(crate) fn shim_env_drift(
     layout: &Layout,
     build_dir: &Path,
@@ -823,29 +747,16 @@ pub(crate) fn shim_env_drift(
     (!shims.is_empty()).then_some(EnvDrift { declared, shims })
 }
 
-/// Re-lay every PRIMARY shim of `builds` (each a build dir and its active tools) that
-/// [`shim_env_drift`] finds exporting other than its build declares, with exactly the
-/// declared environment — the pass's half of the rule `install` and `repair` keep.
+/// Re-lay every primary shim of `builds` (build dir, active tools) that [`shim_env_drift`]
+/// finds exporting other than its build declares, with exactly the declared environment.
+/// An up-to-date program is never laid again, so without this a `claude` shim laid plain
+/// over a build declaring `DISABLE_AUTOUPDATER=1` would stay plain, and
+/// [`reconcile_agents`] would copy it onto the twin.
 ///
-/// WHY THE PASS NEEDS IT. An up-to-date program is never laid again: the index lane's
-/// `UpToDate` and the vendor lane's `KeepReason::UpToDate` both return before any shim is
-/// rendered. So a `claude` shim laid PLAIN over a build whose sidecar declares
-/// `DISABLE_AUTOUPDATER=1` would stay plain until the program's next build landed (for a
-/// held `claude`, forever), and [`reconcile_agents`] would mirror it onto the
-/// front-of-PATH twin: Claude Code's own updater back on under the managed name. The exec
-/// roots got [`crate::compat::reconcile`] for the same reason.
-///
-/// The target is the primary's own, as spelled on disk — never a re-derived path, for the
-/// reason [`reconcile_aliases`] gives — and the render goes through the one shim renderer,
-/// so a routed trust shim stays routed. Idempotent: a primary that already exports its
-/// build's declaration
-/// is never rewritten, so the six-hourly tick writes nothing once it is healed.
-/// Best-effort like every reconcile here: a lay that fails is said on stderr and retried
-/// next pass; one healed is said on stdout, once.
-///
-/// Called by the pass BEFORE its per-program alias reconcile and its agents reconcile,
-/// which both copy the primary's exports — so the alias and the twin carry the healed
-/// environment in the same pass.
+/// The target is the primary's own as spelled on disk and the render the one shim
+/// renderer's, so a routed trust shim stays routed. Best-effort: a failed lay is said on
+/// stderr and retried next pass. The pass runs this before the alias and agents
+/// reconciles, which copy the primary's exports.
 pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]) {
     let publication = crate::lay::PUBLICATION_TURN
         .lock()
@@ -895,28 +806,15 @@ pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]
     }
 }
 
-/// Remove `bin/` shims this program owns that still point at a DIFFERENT build — the tools
-/// a newer build dropped from its `exposes` — and every ALIAS of this program's that is no
-/// longer wanted (`aliases` is [`Aliases::Off`], or its base names neither `installed` nor
-/// any other tool of THIS build), whatever build it points at.
+/// Remove `bin/` shims this program owns that point at a different build (tools a newer
+/// build dropped from `exposes`), and every alias of this program's no longer wanted
+/// (`aliases` is [`Aliases::Off`], or its base is neither in `installed` nor another tool of
+/// this build). A dropped tool's shim would otherwise keep the old build looking active to
+/// `ops::active_builds`, so gc could reclaim the live one and no tombstone could revoke it.
 ///
-/// Why this must exist: `install_shims` only writes the names the NEW build exposes, so a
-/// dropped tool's shim survives pointing into the OLD build. `ops::active_builds` then folds
-/// every shim into one entry per program (last write wins), so the stale name can report the
-/// OLD build as active — and `gc::run`, which cli.rs invokes immediately after every install
-/// and update, reclaims the "superseded" LIVE build. It is also why a yanked build's dropped
-/// tool could never be tombstoned: `install_tombstone_shims` only revokes tools pointing at
-/// the current build.
-///
-/// The predicate is deliberately narrow, because this DELETES files on the user's PATH. A
-/// shim is removed only when it resolves into `<this prefix>/store/<this program>/<other
-/// build>/` — the exact shape this function itself creates — or, for an alias, into
-/// `<this prefix>/store/<this program>/` at all. Anything else is left alone: another
-/// program's shims, a dev-link, a tombstone, a hand-made file, or any target outside the
-/// store. The containment test is [`crate::ops::store_build_of`], which is ANCHORED to the
-/// prefix; the unanchored `program_build_of_target` used here before answered `("ay", 18)`
-/// for a dev-link into `~/src/store/ay/18/bin/ay`, i.e. it would have deleted a link into a
-/// tree this manager does not own.
+/// It deletes files on the user's PATH, so a shim goes only when it resolves into
+/// `<prefix>/store/<program>/<other build>/` (an alias: anywhere in
+/// `<prefix>/store/<program>/`), by the prefix-anchored [`crate::ops::store_build_of`].
 fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], aliases: Aliases) {
     let _publication = crate::lay::PUBLICATION_TURN
         .lock()
@@ -933,13 +831,9 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
             continue;
         }
         let Some(name) = name.to_str() else { continue };
-        // A `bin/` entry is a FILE name; `installed` holds LOGICAL names. Comparing the two
-        // directly — which is what this guard did — is the identity on Unix and always false
-        // on Windows, where the entry reads `ay.cmd`: the guard never fired, so every shim
-        // this call had just written was a deletion candidate. `from_shim_file` strips the
-        // suffix so the comparison is logical-to-logical on both platforms. Its `None` (an
-        // entry no `ToolName` could name, so nothing we could have written) also skips —
-        // fail-closed is the right direction for the one predicate here that deletes.
+        // `bin/` entries are file names (`ay.cmd` on Windows); `installed` holds logical
+        // names, so compare through `from_shim_file`. Its `None` (nothing we could have
+        // written) skips: fail closed in the one predicate that deletes.
         let Some(tool) = crate::store::ToolName::from_shim_file(name) else {
             continue;
         };
@@ -948,17 +842,9 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
         if installed.contains(&tool) {
             continue;
         }
-        // An alias is wanted when its base was just laid — or when the base is a tool of
-        // THIS SAME build that this pass simply did not name. A partial set is the normal
-        // shape on the unlink restore (`cli::restore_installed_shims` lays only the names
-        // the dev link's marker owned, which `default_link_bins` makes the single
-        // `target/release/<program>`), and the rule below already leaves every other tool's
-        // plain shim standing because it names this build. The alias of a shim that stands
-        // must stand too: without this, restoring a one-name link over a multi-tool program
-        // deleted `alab-aylint` — the unambiguous name, which is the whole point of the
-        // alias where Homebrew shadows the bare one — off a tool the restore never touched,
-        // until some later `reconcile_aliases` pass laid it again. The restore's contract
-        // is that it neither sweeps a store alias nor invents one.
+        // An alias stays when its base was just laid or is a tool of this same build the
+        // pass did not name — the partial set `cli::restore_installed_shims` lays — or the
+        // restore would delete the alias of a tool it never touched.
         let alias_wanted = aliases == Aliases::Alab
             && tool.alias_base().is_some_and(|base| {
                 installed.contains(&base)
@@ -973,9 +859,9 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
         let Some(target) = crate::platform::resolve_shim(&entry.path()) else {
             continue; // not a shim we can resolve (tombstone, real file, dangling)
         };
-        // A plain shim is stale at a DIFFERENT build of this program; an alias whose base
+        // A plain shim is stale at a different build of this program; an alias whose base
         // is wanted nowhere — not in this lay, not as a live tool of this build — is stale
-        // at ANY build of it, the same build included, which is the shape a policy flip
+        // at any build of it, the same build included, which is the shape a policy flip
         // (`Alab` → `Off`) or a dropped base leaves behind.
         if crate::ops::store_build_of(&layout.prefix, &target)
             .is_some_and(|(p, b)| p == program && (b != build || tool.is_alias()))
@@ -985,20 +871,13 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
     }
 }
 
-/// Best-effort undo of [`activate_build`] plus a partial [`install_tools`] pass, for a
-/// build that is about to be DISCARDED. An abort path that deletes a build AFTER activation
-/// succeeded (the sysroot resolve-check discard in `flow::install_program`) must call this
-/// first, or the deleted tree
-/// stays live everywhere that matters: its `current` link dangles into it (and a broken
-/// per-program link makes GC abstain on the program until the next activation), and any
-/// shims already written this pass point at nothing.
+/// Best-effort undo of [`activate_build`] and a partial [`install_tools`] pass, for a build
+/// about to be discarded after activation (`flow::abort_activated_install`): otherwise its
+/// `current` link dangles (and GC abstains on the program) and its shims point at nothing.
 ///
-/// Scoped strictly to THIS build: the `current` link is removed only if it names
-/// `build_dir` (one that points elsewhere — a prior build, a concurrent flip — is left
-/// alone), and only `bin/` entries resolving INTO `build_dir` are dropped. Removal goes
-/// through [`platform::remove_link`] for the link (a Windows junction refuses
-/// `remove_file`) and `remove_file` for the shims (a Windows shim is a `.cmd` regular
-/// file).
+/// Scoped to this build: `current` is removed only if it names `build_dir`, and only `bin/`
+/// entries resolving into `build_dir` go. The link goes through [`platform::remove_link`]
+/// (a Windows junction refuses `remove_file`).
 pub(crate) fn undo_activation(layout: &Layout, build_dir: &Path) {
     if let Some((program, _)) = crate::ops::store_build_of(&layout.prefix, build_dir) {
         let own = layout.program_current(&program);
@@ -1024,33 +903,23 @@ pub(crate) fn undo_activation(layout: &Layout, build_dir: &Path) {
     sweep_agents_dir(layout);
 }
 
-/// Install a **failing tombstone shim** at `bin/<tool>` — a tiny script that prints a
-/// yanked/revoked notice to stderr and exits nonzero — so a revoked build's OLD working shim
-/// is actively DISABLED, not left runnable (§7). Written atomically (temp + `rename(2)`), so a
-/// reader never sees a half-written script; the `rename` replaces the prior *symlink* shim
-/// in place.
-///
-/// A tombstone is still a shim, so it must never shadow a sensitive name either — which is now
-/// a property of the argument type rather than a repeated `shim_allowed` call: a tool named
-/// `sudo`/`git`/… has no [`ToolName`], never had a live shim to disable, and cannot be named
-/// here at all.
-///
-/// A later successful `atpkg update` re-runs [`install_shims`], whose `atomic_symlink` replaces
-/// this regular-file tombstone with a fresh symlink, so the disable clears itself on recovery.
+/// Install a failing tombstone shim at `bin/<tool>`: a tiny script that prints a
+/// yanked/revoked notice to stderr and exits nonzero, so a revoked build's shim is disabled,
+/// not left runnable (§7). Written atomically over the prior shim. A sensitive name has no
+/// [`ToolName`], so it can never be tombstoned. The next successful install re-lays the
+/// shim over it.
 pub fn install_tombstone_shim(layout: &Layout, tool: &ToolName) -> io::Result<()> {
     let bin = layout.bin_dir();
     layout.ensure_dir(&bin)?;
     let shim = layout.shim(tool);
 
-    // The failing-shim message. The tool-bearing text is the only variable part; the
-    // platform backend embeds it injection-safely (Unix: a single-quoted `printf` arg;
-    // Windows: a `cmd`-escaped `echo`).
+    // The platform backend embeds the tool-bearing text injection-safely (Unix: a
+    // single-quoted `printf` arg; Windows: a `cmd`-escaped `echo`).
     let message = format!(
         "atpkg: {} was yanked/revoked — run `aterm pkg update`",
         tool.as_str()
     );
-    // Atomic install through the platform backend (Unix: an executable `sh` script
-    // temp+rename; Windows: a `.cmd` batch wrapper), replacing whatever shim was there.
+    // Unix: an executable `sh` script; Windows: a `.cmd` batch. Both temp + rename.
     platform::install_tombstone_shim(&shim, &message)?;
     #[cfg(all(test, unix))]
     agents_checkpoint::at(layout, agents_checkpoint::Event::Written(tool.as_str()));
@@ -1097,9 +966,8 @@ mod tests {
         layout.shim(&tool(name))
     }
 
-    /// The `bin/` path a shim for `name` WOULD occupy — spelled out by hand because the
-    /// callers of this are the refusal tests, where `ToolName::new` returns `None` and so
-    /// `Layout::shim` cannot name the file at all. That is the property under test.
+    /// The `bin/` path a shim for `name` would occupy, for the refusal tests, where
+    /// `ToolName::new` is `None` and `Layout::shim` cannot name it.
     fn refused_shim_path(layout: &Layout, name: &str) -> PathBuf {
         layout
             .bin_dir()
@@ -1110,10 +978,8 @@ mod tests {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         for b in bins {
-            // The concrete executable name a shim forwards to (`<b>.exe` on Windows). Spelled
-            // out rather than routed through `ToolName::exe_file` on purpose: a build tree may
-            // legitimately ship a binary whose name is refused a SHIM (the `sudo` fixture
-            // below), and this fixture is laying down the build, not naming a shim.
+            // `<b>.exe` on Windows. Spelled out, not `ToolName::exe_file`: a build may ship a
+            // binary that is refused a shim (`sudo` below).
             let name = format!("{b}{}", crate::platform::EXE_SUFFIX);
             std::fs::write(dir.join("bin").join(name), b"#!/bin/true\n").unwrap();
         }
@@ -1122,10 +988,8 @@ mod tests {
 
     #[test]
     fn a_dropped_tool_leaves_no_stale_shim_pointing_at_the_prior_build() {
-        // The upstream drops `aylint` between 18 and 19. Before the prune, `bin/aylint`
-        // kept resolving into build 18, `ops::active_builds` last-write-wins picked 18 as
-        // ACTIVE (aylint sorts after ay), and the very next `gc::run` deleted the LIVE
-        // build 19 — self-destruct inside a single install verb.
+        // 19 drops `aylint`: a stale `bin/aylint` into 18 would make 18 read as active and
+        // the next `gc::run` delete the live 19.
         let layout = temp_prefix("stale-shim");
         let b18 = make_build(&layout, "ay", 18, &["ay", "aylint"]);
         install_shims(&layout, &b18, &["ay".into(), "aylint".into()], Aliases::Off).unwrap();
@@ -1172,16 +1036,15 @@ mod tests {
             .unwrap();
         };
         lay("ay", &b19, "ay"); // the tool this pass just laid
-        lay("aydoc", &b19, "aydoc"); // a tool of THIS build the pass did not name
-        lay("aylint", &b18, "aylint"); // dropped by 19 — stale at the OLD build
+        lay("aydoc", &b19, "aydoc"); // a tool of this build the pass did not name
+        lay("aylint", &b18, "aylint"); // dropped by 19, stale at the old build
         lay("alab-ay", &b19, "ay"); // alias whose base was just laid
         lay("alab-aydoc", &b19, "aydoc"); // alias whose base is a live tool of this build
         lay("alab-aylint", &b18, "aylint"); // alias of a dropped tool
         lay("ny", &n7, "ny"); // another program's shim
         lay("alab-ny", &n7, "ny"); // another program's alias
-        // A dev link into a checkout that happens to carry a `store/ay/18/bin/ay` tail: an
-        // unanchored parse answers `("ay", 18)` for it, so a prune using that would delete a
-        // link into a tree this manager does not own. `store_build_of` is anchored.
+        // A dev link into a checkout with a `store/ay/18/bin/ay` tail: `store_build_of` is
+        // anchored to the prefix, so it is not ours.
         let checkout = layout.prefix.join("checkout/store/ay/18/bin");
         std::fs::create_dir_all(&checkout).unwrap();
         std::fs::write(checkout.join("ay"), b"#!/bin/true\n").unwrap();
@@ -1274,7 +1137,7 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "no temp symlink should remain");
-        // Activation writes ONE link: the retired per-channel family is never recreated.
+        // Activation writes one link: the retired per-channel family is never recreated.
         assert!(!layout.prefix.join("channels").exists());
         // A directory that is not a store build is refused, not activated witness-less.
         let elsewhere = layout.prefix.join("elsewhere");
@@ -1287,9 +1150,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// Two programs activated one after the other each keep their own `current` — the
-    /// per-program witness `gc::live_builds` reads. (The retired per-channel link was
-    /// shared, so it only ever remembered the last activation.)
+    /// Two programs activated in turn each keep their own `current`, the per-program
+    /// witness `gc::live_builds` reads.
     #[test]
     fn two_programs_on_one_channel_each_keep_their_own_current() {
         let layout = temp_prefix("two-progs");
@@ -1331,14 +1193,13 @@ mod tests {
         let build = make_build(&layout, "ay", 18, &["ay", "sudo", "ny"]);
         let exposes = vec!["ay".to_string(), "sudo".to_string(), "ny".to_string()];
         let refused = install_shims(&layout, &build, &exposes, Aliases::Off).unwrap();
-        // sudo is refused (sensitive), reported with the RAW name the manifest asked for,
+        // sudo is refused (sensitive), reported with the raw name the manifest asked for,
         // and NOT shimmed — even though the build tree does ship a `bin/sudo`.
         assert_eq!(refused, vec!["sudo".to_string()]);
         let sudo = refused_shim_path(&layout, "sudo");
         assert!(!sudo.exists() && std::fs::symlink_metadata(&sudo).is_err());
-        // ay + ny shims exist and resolve into the build's bin/. resolve_shim reads the
-        // forward target cross-platform (symlink target on Unix, the `.cmd` target — the
-        // exe-suffixed concrete binary — on Windows).
+        // ay and ny resolve into the build's bin/ (the exec stub on Unix, the `.cmd` target
+        // on Windows).
         for name in ["ay", "ny"] {
             let t = tool(name);
             let shim = layout.shim(&t);
@@ -1352,19 +1213,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// ATERM-SPEC'S DISCOVERY READS EVERY SHIM ATPKG LAYS. `aterm_spec::verify`'s store
-    /// tier finds `ty`/`ay`/`trust-ir` for a process whose PATH lacks `<prefix>/bin` (a
-    /// `targo test`, CI, launchd). It mirrors this crate's shim format rather than depending
-    /// on it, and it had drifted: it accepted only a SYMLINK, and atpkg has laid exec stubs
-    /// since `targo` began refusing a symlinked `current_exe`, so the tier never answered
-    /// (measured on m3, 2026-09-23: 0 of 62 `bin/` entries are symlinks). Every shape is laid
-    /// here through atpkg's own writer and read back through aterm-spec's reader, so the next
-    /// change to either side is a red test:
-    /// * the plain stub, a stub exporting an environment, and a stub routed through an exec
-    ///   root all resolve to the STORE file (the first `exec '` line);
-    /// * a tombstone, a pending-program stub, and a live stub whose build was reclaimed all
-    ///   read as ABSENT — the probe runs before PATH, so any of them answering would shadow
-    ///   a working tool.
+    /// aterm-spec's store discovery (`aterm_spec::verify::resolve_store_shim`) mirrors this
+    /// crate's shim format rather than depending on it, so every shape is laid through
+    /// atpkg's writer and read back through aterm-spec's reader:
+    /// * the plain stub, one with exports, and one routed through an exec root resolve to
+    ///   the store file (the first `exec '` line);
+    /// * a tombstone, a pending stub and a stub whose build was reclaimed read as absent:
+    ///   the probe runs before PATH, so any of them answering would shadow a working tool.
     #[cfg(unix)]
     #[test]
     fn aterm_spec_discovery_reads_every_shim_atpkg_lays() {
@@ -1430,13 +1285,13 @@ mod tests {
         let exposes = vec!["ay".to_string()];
         install_shims(&layout, &build, &exposes, Aliases::Off).unwrap();
         let shim = shim_of(&layout, "ay");
-        // A LIVE forwarding shim (a symlink on Unix, a forwarding `.cmd` on Windows).
+        // A live forwarding shim (an exec stub on Unix, a forwarding `.cmd` on Windows).
         assert!(
             crate::platform::resolve_shim(&shim).is_some(),
             "live shim forwards into the build"
         );
 
-        // Tombstone it: the forwarding shim is REPLACED by a failing regular-file script.
+        // Tombstone it: the forwarding shim is replaced by a failing regular-file script.
         install_tombstone_shim(&layout, &tool("ay")).unwrap();
         let meta = std::fs::symlink_metadata(&shim).unwrap();
         assert!(
@@ -1467,11 +1322,7 @@ mod tests {
             "the notice goes to stderr, not stdout"
         );
 
-        // A sensitive name is refused a tombstone (never shadows a core command). That is no
-        // longer a runtime `Ok(false)` — `install_tombstone_shim(&layout, /* sudo */)` does
-        // not COMPILE, because `ToolName::new("sudo")` is `None` and there is no other way to
-        // name a `bin/` file. Assert the file the old fallible path could have written is
-        // still absent, which is the observable half of that guarantee.
+        // A sensitive name has no `ToolName`, so it cannot be tombstoned at all.
         assert!(ToolName::new("sudo").is_none());
         assert!(std::fs::symlink_metadata(refused_shim_path(&layout, "sudo")).is_err());
 
@@ -1549,11 +1400,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// `undo_activation` unwinds exactly the DOOMED build's footprint and nothing wider:
-    /// the doomed build's witness link and shim both go, a bystander program activated
-    /// afterwards keeps both. Without the
-    /// undo, the sysroot resolve-check discard (`flow::install_program`) left both `current` links
-    /// and the written shims dangling into a deleted tree.
+    /// `undo_activation` removes exactly the doomed build's `current` link and shims; a
+    /// bystander program activated afterwards keeps both.
     #[test]
     fn undo_activation_unwinds_only_the_doomed_build() {
         let layout = temp_prefix("undo");
@@ -1589,11 +1437,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE SHIM ENVIRONMENT (design S7) rides on every shim `install_tools_env` lays —
-    /// primary AND alias — and the env-carrying wrapper is still a shim to every sweep:
-    /// it RESOLVES into the build, a newer build that drops the tool PRUNES it, a policy
-    /// flip sweeps its alias, `undo_activation` unwinds it, `ops::uninstall` takes it,
-    /// and a re-lay without an env leaves nothing of the exports behind.
+    /// The shim environment (design S7) rides on every shim `install_tools_env` lays,
+    /// primary and alias, and an env-carrying shim resolves, prunes, sweeps, undoes and
+    /// uninstalls like a plain one; a re-lay without env leaves no exports.
     #[test]
     fn env_shims_resolve_prune_undo_and_uninstall_like_plain_ones() {
         let layout = temp_prefix("env-shims");
@@ -1630,7 +1476,7 @@ mod tests {
             crate::ops::active_tools(&layout, "claude", 18),
             vec![tool("claude"), tool("claudex")]
         );
-        // A newer build drops `claudex`: its env-carrying shim AND alias are pruned.
+        // A newer build drops `claudex`: its env-carrying shim and alias are pruned.
         let b19 = make_build(&layout, "claude", 19, &["claude"]);
         install_tools_env(&layout, &b19, &[tool("claude")], Aliases::Alab, &env).unwrap();
         for t in ["claudex", "alab-claudex"] {
@@ -1678,14 +1524,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// A PARTIAL lay must not strip the aliases of the tools it did not name. The restore
-    /// behind `atpkg unlink` (`cli::restore_installed_shims`) lays exactly the names the dev
-    /// link's marker owned — and `cli::default_link_bins` makes that the single
-    /// `target/release/<program>`, so a multi-tool program's link owns ONE name — at the
-    /// installed build the program's other tools are already live at. The prune counted
-    /// every other `alab-<x>` as unwanted at the current build and deleted it, while leaving
-    /// the plain shim it aliases standing: the unambiguous name (it exists because Homebrew
-    /// shadows the bare one) went away from a tool the restore never touched. The sweeps
+    /// A partial lay keeps the aliases of the tools it did not name: `atpkg unlink`'s
+    /// restore (`cli::restore_installed_shims`) lays only the names the dev link owned — one,
+    /// by `cli::default_link_bins` — at the build the other tools are live at. The sweeps
     /// that must still fire are asserted after it.
     #[test]
     fn a_partial_lay_keeps_the_aliases_of_this_builds_other_tools() {
@@ -1699,7 +1540,7 @@ mod tests {
                 "{t}: laid at this build"
             );
         }
-        // The restore's shape: the SAME build, only the subset the link owned.
+        // The restore's shape: the same build, only the subset the link owned.
         install_tools(&layout, &b18, &[tool("ay")], Aliases::Alab).unwrap();
         for t in ["ay", "aylint", "alab-ay", "alab-aylint"] {
             assert!(
@@ -1708,7 +1549,7 @@ mod tests {
                 "{t}: survives a lay that did not name it"
             );
         }
-        // A policy flip still takes EVERY alias of the program, subset or not.
+        // A policy flip still takes every alias of the program, subset or not.
         install_tools(&layout, &b18, &[tool("ay")], Aliases::Off).unwrap();
         for t in ["alab-ay", "alab-aylint"] {
             assert!(
@@ -1716,7 +1557,7 @@ mod tests {
                 "{t}: swept by Aliases::Off"
             );
         }
-        // And a NEWER build that drops `aylint` still prunes its shim AND its alias: the
+        // And a newer build that drops `aylint` still prunes its shim and its alias: the
         // base no longer names this build either, whichever order `bin/` is read in.
         install_tools(&layout, &b18, &[tool("ay"), tool("aylint")], Aliases::Alab).unwrap();
         let b19 = make_build(&layout, "ay", 19, &["ay"]);
@@ -1735,9 +1576,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// `reconcile_aliases` mirrors the PRIMARY's environment onto the alias it lays (an
-    /// install a pre-alias client made), rewrites an alias whose env drifted from its
-    /// primary's, and leaves an alias that already agrees alone.
+    /// `reconcile_aliases` mirrors the primary's environment onto the alias it lays,
+    /// rewrites an alias whose env drifted from its primary's, and leaves an agreeing one.
     #[test]
     fn reconcile_aliases_mirrors_the_primary_env() {
         let layout = temp_prefix("env-alias-reconcile");
@@ -1774,13 +1614,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// "ALREADY RIGHT" MEANS THE BYTES TOO. An alias and an agents twin that forward where
-    /// their primary does and export what it exports, but whose bytes are not what the
-    /// renderer lays — here a line an older writer appended; in production the exec-root
-    /// guard a plain shim lacks (`crate::compat`, whose own test drives that shape) — are
-    /// re-laid by the reconciles, and a second reconcile touches neither file. The two
-    /// reconciles a pass runs, in the order it runs them: [`reconcile_aliases`] per active
-    /// program, then [`reconcile_agents`] ONCE at the end.
+    /// "Already right" means the bytes too: an alias and a twin that forward and export
+    /// right but differ from the render (in production, the exec-root guard a plain shim
+    /// lacks, `crate::compat`) are re-laid, and a second reconcile writes neither. Pass
+    /// order: [`reconcile_aliases`], then [`reconcile_agents`].
     #[cfg(unix)]
     #[test]
     fn a_reconcile_relays_an_alias_or_twin_whose_bytes_differ_and_then_writes_nothing() {
@@ -1839,12 +1676,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE AGENTS TWIN: installing an agent program lays
-    /// `agents/<tool>` beside `bin/<tool>` — same target, same exported env — and nothing
-    /// else ever lands in `agents/`: an ALab tool gets no twin, a hand-dropped file and a
-    /// foreign name are swept, the twin follows its primary across an update, a
-    /// tombstone, a rollback-undo and an uninstall, and the pass's own agents reconcile
-    /// re-lays a twin an older client never laid.
+    /// Installing an agent program lays `agents/<tool>` beside `bin/<tool>` (same target,
+    /// same env); nothing else lands in `agents/`, and the twin follows its primary across an
+    /// update, a tombstone, an undo and an uninstall.
     #[cfg(unix)]
     #[test]
     fn an_agent_program_gets_a_front_of_path_twin_that_follows_its_primary() {
@@ -1871,12 +1705,12 @@ mod tests {
             env,
             "and exports exactly what the primary exports"
         );
-        // An ALab tool gets no twin; the agents dir holds ONLY agent programs.
+        // An ALab tool gets no twin; the agents dir holds only agent programs.
         let ay = make_build(&layout, "ay", 18, &["ay"]);
         install_shims(&layout, &ay, &["ay".into()], Aliases::Alab).unwrap();
         assert!(!layout.agent_shim(&tool("ay")).exists());
         // Foreign entries are swept: a hand-dropped file, and a symlink under an agent
-        // name that points OUTSIDE the store (nothing in bin/ vouches for it).
+        // name that points outside the store (nothing in bin/ vouches for it).
         std::fs::write(layout.agents_dir().join("mine"), b"#!/bin/sh\n").unwrap();
         std::os::unix::fs::symlink("/usr/bin/true", layout.agents_dir().join("codex")).unwrap();
         // A twin lay this process has in flight stays for its writer to rename; the temp a
@@ -2025,9 +1859,8 @@ mod tests {
             before
         );
         assert_eq!(std::fs::read_to_string(&twin).unwrap(), twin_body);
-        // The twins older clients laid, each re-laid to today's on the next reconcile:
-        // the primary's bytes (before any block); the LANDING-ONLY twin; the
-        // BLOCK-THEN-LANDING twin.
+        // Twins older clients laid, each re-laid to today's once: the primary's bytes (no
+        // block), landing-only, and block-then-landing.
         let atpkg = crate::stub::co_located_atpkg_path();
         let landing = platform::sh_landing_prelude("claude", &layout.prefix, &marker, &atpkg);
         let mut block_then_landing = platform::sh_selfupdate_prelude(
@@ -2075,17 +1908,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE PRELUDE NEVER STRANDS THE TOOL, run through a real `/bin/sh`: the self-update
-    /// block (`crate::selfupdate`) hands `update`
-    /// and `install latest --force` as the FIRST argument to the embedded atpkg as
-    /// `__selfupdate claude <prefix> -- <args verbatim>`; `--probe`, `-p update` and
-    /// `--debug install` run the store build untouched (the first token only — a prompt
-    /// and a debug filter are not verbs); with the embedded atpkg gone, `update` runs the
-    /// store build with nothing printed and exit 0 — an OLDER `atpkg` on `PATH` that would
-    /// answer `unknown verb` exit 2 is never consulted. AND A STANDING LANDING MARKER
-    /// CHANGES NOTHING: today's twin runs the store build; only a twin an older client laid
-    /// with the landing prelude still hands a non-verb to `__landing`, which now `exec`s
-    /// `bin/<program>` at once (`cli::cmd_landing`).
+    /// The prelude never strands the tool, under a real `/bin/sh`: `update` and `install
+    /// latest --force` as the first argument go to the embedded atpkg as `__selfupdate claude
+    /// <prefix> -- <args>`; `--probe`, `-p update` and `--debug install` run the store build;
+    /// with the embedded atpkg gone `update` runs the store build, silent, exit 0, never an
+    /// older `atpkg` on `PATH`. Only a twin an older client laid with the landing prelude
+    /// still hands a non-verb to `__landing`.
     #[cfg(unix)]
     #[test]
     fn the_twin_prelude_runs_the_store_build_when_the_embedded_atpkg_is_gone() {
@@ -2100,7 +1928,7 @@ mod tests {
         // The store build: records that it ran, with its arguments.
         let target = layout.build_dir("claude", 2026091601).join("bin/claude");
         exe(&target, "#!/bin/sh\necho \"store: $*\"\nexit 0\n");
-        // An OLDER atpkg on PATH: no `__selfupdate` verb.
+        // An older atpkg on PATH: no `__selfupdate` verb.
         let path_dir = layout.prefix.join("older-path");
         exe(
             &path_dir.join("atpkg"),
@@ -2160,7 +1988,7 @@ mod tests {
                 store("--probe -- x"),
                 "{label}"
             );
-            // THE SELF-UPDATE VERBS as the first argument hand over to the embedded
+            // The self-update verbs as the first argument hand over to the embedded
             // atpkg, the arguments verbatim.
             assert_eq!(
                 run(&render(&embedded), &["update"]),
@@ -2184,9 +2012,8 @@ mod tests {
                 "{label}"
             );
             assert_eq!(run(&render(&embedded), &[]), store(""), "{label}");
-            // The embedded atpkg is gone: `update` runs the STORE build, nothing printed,
-            // exit 0; the older atpkg on PATH is never consulted (the exec is the
-            // guarantee).
+            // The embedded atpkg is gone: `update` runs the store build, silently; the
+            // older atpkg on PATH is never consulted.
             assert_eq!(
                 run(
                     &render(Path::new("/gone/after/relocation/atpkg")),
@@ -2201,7 +2028,7 @@ mod tests {
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"atpkg-landing-v1 build=2026091702 pid=1\n").unwrap();
         check("a standing marker");
-        // A twin an OLDER client laid (the block, then the landing prelude) under that
+        // A twin an older client laid (the block, then the landing prelude) under that
         // marker still hands a non-verb to `__landing` — the verb that stays for it.
         let mut older = platform::sh_selfupdate_prelude(
             "claude",
@@ -2228,11 +2055,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The twin is BEST-EFFORT and agent-store-only: with `agents/`
-    /// unmakeable (a file squats on its name) an `ay` install — and a `claude` install —
-    /// still succeeds, `bin/` is laid, and nothing in `agents/` is claimed; and a
-    /// `bin/claude` that resolves into a NON-agent store tree earns no twin, which is the
-    /// predicate the sweep applies, so the two never disagree pass over pass.
+    /// The twin is best-effort and agent-store-only: with `agents/` unmakeable, an `ay` and
+    /// a `claude` install still succeed and lay `bin/`; a `bin/codex` resolving into a
+    /// non-agent store tree earns no twin, the same predicate the sweep applies.
     #[cfg(unix)]
     #[test]
     fn the_agents_twin_is_best_effort_and_agent_store_only() {
@@ -2270,7 +2095,7 @@ mod tests {
             platform::resolve_shim(&twin),
             platform::resolve_shim(&layout.shim(&claude))
         );
-        // A `bin/codex` into a NON-agent program's store tree: no twin laid — and the
+        // A `bin/codex` into a non-agent program's store tree: no twin laid — and the
         // sweep, which applies the same predicate, has nothing to remove.
         let codex = tool("codex");
         let foreign = make_build(&layout, "ay", 19, &["codex"]);
@@ -2316,9 +2141,8 @@ mod tests {
     }
 
     /// `alab-<tool>` is laid beside every `<tool>` shim of an ALab program, forwarding to
-    /// the SAME executable — `active_builds` still sees one build, `active_tools` lists the
-    /// primaries and `active_aliases` the aliases — and a program installed under
-    /// `Aliases::Off` gets none.
+    /// the same executable (`active_builds` still sees one build, `active_tools` lists the
+    /// primaries and `active_aliases` the aliases); a program under `Aliases::Off` gets none.
     #[test]
     fn an_alab_program_gets_an_alias_beside_every_shim_forwarding_to_the_same_target() {
         let layout = temp_prefix("alias-lay");
@@ -2343,7 +2167,7 @@ mod tests {
             );
             assert_eq!(via_alias, b18.join("bin").join(t.exe_file()));
             // The alias shim carries the platform's shim suffix and its target the
-            // PRIMARY's executable name — on Windows `alab-ay.cmd` → `…\bin\ay.exe`.
+            // primary's executable name — on Windows `alab-ay.cmd` → `…\bin\ay.exe`.
             assert_eq!(
                 layout.shim(&alias).file_name().unwrap().to_str().unwrap(),
                 format!("alab-{name}{}", crate::platform::SHIM_SUFFIX)
@@ -2411,7 +2235,7 @@ mod tests {
         let ny7 = make_build(&layout, "ny", 7, &["ny"]);
         install_shims(&layout, &ny7, &["ny".into()], Aliases::Alab).unwrap();
 
-        // Build 19 drops aylint: its shim AND its alias go; ay's alias moves to 19.
+        // Build 19 drops aylint: its shim and its alias go; ay's alias moves to 19.
         let b19 = make_build(&layout, "ay", 19, &["ay"]);
         install_shims(&layout, &b19, &["ay".into()], Aliases::Alab).unwrap();
         activate_build(&layout, &b19).unwrap();
@@ -2427,7 +2251,7 @@ mod tests {
         assert_eq!(crate::ops::active_builds(&layout).get("ay"), Some(&19));
 
         // The policy flips to Off for ay (say its index entry grew a `system` key): a
-        // re-shim of the SAME build sweeps ay's alias, keeps ay, and leaves ny's alias.
+        // re-shim of the same build sweeps ay's alias, keeps ay, and leaves ny's alias.
         install_shims(&layout, &b19, &["ay".into()], Aliases::Off).unwrap();
         assert!(crate::platform::resolve_shim(&shim_of(&layout, "ay")).is_some());
         assert!(
@@ -2461,10 +2285,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// An already-installed program — one the install pipeline short-circuits as up to
-    /// date, so `install_tools` never runs for it again — gets its aliases from the pass's
-    /// reconcile: laid when missing, left alone when right, swept under `Off`, and never
-    /// written over a file this manager did not lay.
+    /// An up-to-date program (the pipeline short-circuits, so `install_tools` never runs)
+    /// gets its aliases from the pass's reconcile: laid when missing, left alone when right,
+    /// swept under `Off`, and never written over a file this manager did not lay.
     #[test]
     fn reconcile_lays_the_aliases_of_an_already_installed_program() {
         let layout = temp_prefix("alias-reconcile");
@@ -2509,10 +2332,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The Windows `.cmd` alias, as content: the resume-proof frame every `.cmd` starts
-    /// with, then the shim named for the ALIAS forwarding to the PRIMARY's
-    /// `.exe`, ending its batch on that line — pure, so it is pinned from every build
-    /// host.
+    /// The Windows `.cmd` alias: the resume-proof frame, then a forward to the primary's
+    /// `.exe` that ends the batch on that line. Pure, so every build host pins it.
     #[test]
     fn the_cmd_alias_forwards_to_the_primary_exe() {
         let target = Path::new(r"C:\Users\me\.aterm\pkg\store\ay\18\bin\ay.exe");

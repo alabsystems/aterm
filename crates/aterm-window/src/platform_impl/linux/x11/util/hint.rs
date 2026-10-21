@@ -4,17 +4,12 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/hint.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-use crate::platform::x11::WindowType;
-use std::sync::Arc;
-
 use super::*;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum StateOperation {
     Remove = 0, // _NET_WM_STATE_REMOVE
     Add = 1,    // _NET_WM_STATE_ADD
-    Toggle = 2, // _NET_WM_STATE_TOGGLE
 }
 
 impl From<bool> for StateOperation {
@@ -24,31 +19,6 @@ impl From<bool> for StateOperation {
         } else {
             StateOperation::Remove
         }
-    }
-}
-
-impl WindowType {
-    pub(crate) fn as_atom(&self, xconn: &Arc<XConnection>) -> xproto::Atom {
-        use self::WindowType::*;
-        let atom_name = match *self {
-            Desktop => _NET_WM_WINDOW_TYPE_DESKTOP,
-            Dock => _NET_WM_WINDOW_TYPE_DOCK,
-            Toolbar => _NET_WM_WINDOW_TYPE_TOOLBAR,
-            Menu => _NET_WM_WINDOW_TYPE_MENU,
-            Utility => _NET_WM_WINDOW_TYPE_UTILITY,
-            Splash => _NET_WM_WINDOW_TYPE_SPLASH,
-            Dialog => _NET_WM_WINDOW_TYPE_DIALOG,
-            DropdownMenu => _NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
-            PopupMenu => _NET_WM_WINDOW_TYPE_POPUP_MENU,
-            Tooltip => _NET_WM_WINDOW_TYPE_TOOLTIP,
-            Notification => _NET_WM_WINDOW_TYPE_NOTIFICATION,
-            Combo => _NET_WM_WINDOW_TYPE_COMBO,
-            Dnd => _NET_WM_WINDOW_TYPE_DND,
-            Normal => _NET_WM_WINDOW_TYPE_NORMAL,
-        };
-
-        let atoms = xconn.atoms();
-        atoms[atom_name]
     }
 }
 
@@ -64,19 +34,13 @@ struct MwmHints {
     status: u32,
 }
 
-#[allow(dead_code)]
 mod mwm {
     // Motif WM hints are obsolete, but still widely supported.
     // https://stackoverflow.com/a/1909708
-    pub const MWM_HINTS_FUNCTIONS: u32 = 1 << 0;
+    //
+    // LOCAL PATCH (aterm), 2026-10-21 (WC.8): only the decorations hint is written; the
+    // function hints left with `set_enabled_buttons` and `set_resizable` on Linux.
     pub const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
-
-    pub const MWM_FUNC_ALL: u32 = 1 << 0;
-    pub const MWM_FUNC_RESIZE: u32 = 1 << 1;
-    pub const MWM_FUNC_MOVE: u32 = 1 << 2;
-    pub const MWM_FUNC_MINIMIZE: u32 = 1 << 3;
-    pub const MWM_FUNC_MAXIMIZE: u32 = 1 << 4;
-    pub const MWM_FUNC_CLOSE: u32 = 1 << 5;
 }
 
 impl MotifHints {
@@ -89,37 +53,6 @@ impl MotifHints {
     pub fn set_decorations(&mut self, decorations: bool) {
         self.hints.flags |= mwm::MWM_HINTS_DECORATIONS;
         self.hints.decorations = decorations as u32;
-    }
-
-    pub fn set_maximizable(&mut self, maximizable: bool) {
-        if maximizable {
-            self.add_func(mwm::MWM_FUNC_MAXIMIZE);
-        } else {
-            self.remove_func(mwm::MWM_FUNC_MAXIMIZE);
-        }
-    }
-
-    fn add_func(&mut self, func: u32) {
-        if self.hints.flags & mwm::MWM_HINTS_FUNCTIONS != 0 {
-            if self.hints.functions & mwm::MWM_FUNC_ALL != 0 {
-                self.hints.functions &= !func;
-            } else {
-                self.hints.functions |= func;
-            }
-        }
-    }
-
-    fn remove_func(&mut self, func: u32) {
-        if self.hints.flags & mwm::MWM_HINTS_FUNCTIONS == 0 {
-            self.hints.flags |= mwm::MWM_HINTS_FUNCTIONS;
-            self.hints.functions = mwm::MWM_FUNC_ALL;
-        }
-
-        if self.hints.functions & mwm::MWM_FUNC_ALL != 0 {
-            self.hints.functions |= func;
-        } else {
-            self.hints.functions &= !func;
-        }
     }
 }
 

@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-png` decode and encode.
+//! `aterm-png` decode and encode integration tests:
 //!
-//! 1. **The repository's own corpus** — every `.png` in the tree decodes (or is
+//! 1. **Repository corpus** — every `.png` in the tree decodes (or is
 //!    refused) under every transform without panicking, and every 8-bit image
 //!    round-trips through this encoder.
-//! 2. **A synthesized format matrix** — every legal (colour type x bit depth x
-//!    interlace x tRNS x palette length) combination, assembled from raw chunks
-//!    with STORED DEFLATE blocks so the builder shares no code with the decoder.
-//!    Its decoded output is pinned by digest; it was verified byte-identical to
-//!    the `png` crate's when this decoder replaced it.
-//! 3. **Malformed but decodable files** — IDAT padded past its zlib stream, an
-//!    index past PLTE, an over-long tRNS, a colour key with a stray high byte,
-//!    a zero-length chunk, and the chunk orderings PNG forbids.
+//! 2. **Synthesized format matrix** — every legal `(color_type, bit_depth,
+//!    interlace, tRNS, palette_len)` combination assembled with stored
+//!    DEFLATE blocks and verified against [`MATRIX_DIGEST`].
+//! 3. **Malformed but decodable files** — trailing IDAT padding, out-of-range
+//!    PLTE indices, oversized/empty `tRNS`, unmasked `tRNS` keys, and invalid
+//!    chunk orderings.
 //! 4. **Encoder round trips**, including indexed output and `sRGB`.
 
 use std::path::{Path, PathBuf};
@@ -218,10 +216,6 @@ fn the_repository_corpus_decodes_and_round_trips() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// A PNG builder that shares nothing with the decoder
-// ---------------------------------------------------------------------------
-
 /// CRC-32 (ISO-HDLC), written out here so the fixture builder does not borrow
 /// the implementation under test.
 fn crc32(data: &[u8]) -> u32 {
@@ -373,8 +367,7 @@ fn synth_filtered(width: u32, height: u32, depth: u8, color: u8, interlace: u8) 
     out
 }
 
-/// The decoded format matrix, pinned. Computed when it matched the `png` crate
-/// byte for byte under every transform.
+/// Pinned FNV-1a digest of the decoded format matrix across all transforms.
 const MATRIX_DIGEST: &str = "873b3aed06c78dbf";
 
 /// Every legal (colour type x bit depth) pair, both interlace settings, with and
@@ -485,13 +478,6 @@ fn decodes_the_whole_format_matrix_to_its_pinned_digest() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The malformed-but-decodable cases
-//
-// Each is a file some encoder can produce and the `png` crate rendered; a
-// decoder that refuses one turns a stray byte into a blank glyph.
-// ---------------------------------------------------------------------------
-
 /// A one-row indexed PNG, assembled from raw chunks.
 fn indexed_png(palette: &[u8], trns: Option<&[u8]>, indices: &[u8]) -> Vec<u8> {
     let mut filtered = vec![0u8]; // filter type None
@@ -573,15 +559,6 @@ fn image_data_far_past_the_declared_size_is_refused_as_its_own_error() {
         "expected ExcessImageData, got {err:?}",
     );
 }
-
-// ---------------------------------------------------------------------------
-// What a decode may allocate
-//
-// The output buffer is the one allocation that grows with the image, so a
-// budget that covers it must be enough: a decoder that also held the whole
-// decompressed stream (one filter byte per row more than the output, twice the
-// output for 16-bit samples) refused images its caller had admitted.
-// ---------------------------------------------------------------------------
 
 /// A limit of exactly the output buffer decodes every format: the image data
 /// is streamed, so nothing else the decoder allocates scales with the image.
@@ -1005,10 +982,6 @@ fn encoded_chunk_crcs_match_an_independent_crc_and_a_flipped_one_is_refused() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Encoder round trips
-// ---------------------------------------------------------------------------
-
 /// Test images for the encoder round trip: a gradient, a flat fill, noise, and
 /// a single pixel, at each of the colour types aterm writes.
 fn encoder_cases() -> Vec<(&'static str, aterm_png::ColorType, u32, u32, Vec<u8>)> {
@@ -1165,12 +1138,9 @@ fn rgba_writer(out: &mut Vec<u8>, w: u32, h: u32) -> aterm_png::Writer<&mut Vec<
     encoder.write_header().expect("header")
 }
 
-/// ROWS AND A SLICE ARE ONE ENCODER. Rows handed in one at a time write the
-/// same file, byte for byte, as the whole buffer, at widths 1, 3, 17 and 256
-/// (the last spans several `IDAT` chunks), and the file decodes to the pixels.
-/// NEGATIVE CONTROL: a row one byte short, or one byte long, is refused as
-/// `WrongDataSize` naming that row, and the writer then refuses to close the
-/// incomplete file.
+/// Streaming rows via `write_rows` produces the exact same bytes as
+/// `write_image_data` across widths 1, 3, 17, and 256, and rejects rows one
+/// byte short or long with `WrongDataSize`.
 #[test]
 fn write_rows_is_byte_identical_to_write_image_data() {
     for (w, h) in [(1u32, 5u32), (3, 7), (17, 33), (256, 300)] {

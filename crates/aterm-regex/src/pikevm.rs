@@ -1,59 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The simulation: every NFA state that is alive, advanced together, one code
-//! point at a time.
+//! The simulation: every live NFA state, advanced together one code point at a time.
 //!
-//! A backtracker explores one path at a time and can be made to explore
-//! exponentially many of them — the reason `(a|a)*b` is a denial-of-service in
-//! most languages. A Pike VM instead keeps the whole *set* of live states and
-//! steps it forward once per input code point. Each state is entered at most
-//! once per position, so the work is bounded by `program size × input length`,
-//! full stop. That linear-time guarantee is what the `regex` crate gives and
-//! what this replacement has to keep.
+//! A backtracker explores one path at a time and can be made to explore exponentially
+//! many (`(a|a)*b`). A Pike VM keeps the whole set of live states and enters each at most
+//! once per position, so work is bounded by `program size × input length`.
 //!
-//! ## The step budget, and why linear is not the same as bounded
+//! ## The step budget
 //!
-//! `program size × input length` is a *product*, and both factors are set by
-//! untrusted input: the pattern picks the first, the haystack picks the second.
-//! Linear in the haystack still means 30 seconds when the constant is sixteen
-//! thousand instructions (see the crate docs for the measured pair). So
-//! [`search`] takes a budget and charges every unit of work against it — one
-//! per input position visited, one per byte the prefilter skips, one per
-//! instruction entered in the epsilon closure, and one per live thread stepped.
-//! That sum *is* the `positions × live threads` product the paragraph above
-//! bounds only in theory, counted for real. The budget is taken by `&mut` and
-//! left holding what remains, because one search is not the unit a caller
-//! pays for: a `find_iter` runs one search per match, and leftmost-first
-//! iteration can re-walk the rest of the haystack in every one of them.
+//! Both factors of that product come from untrusted input, so [`search`] charges every
+//! unit of work to a budget: one per input position, per byte the prefilter skips, per
+//! instruction entered in an epsilon closure, and per live thread stepped. The budget is
+//! taken by `&mut` and left holding what remains, because a `find_iter` runs one search
+//! per match and they share it. When it runs out the search returns [`Exhausted`]
+//! (surfaced as [`StepLimitExceeded`](crate::StepLimitExceeded)) and no span: a truncated
+//! search has not established which match is leftmost-first. The check runs once per
+//! position, so a search overshoots by at most one position's work and the inner loops
+//! carry no check.
 //!
-//! When the budget runs out the search returns [`Exhausted`] — surfaced as
-//! [`StepLimitExceeded`](crate::StepLimitExceeded) — and no span at all. It
-//! deliberately does not return the best match found so far: a truncated
-//! search has not established that an earlier or longer match does not exist,
-//! so any span it could hand back might be the wrong one, and a wrong answer
-//! is worse than a refusal. The check runs once per input position
-//! rather than once per work unit, so the overshoot is bounded by one
-//! position's worth of work (at most the program size) and the inner loops stay
-//! branch-free.
+//! ## Priority
 //!
-//! ## Priority, and why the order of the thread list is the whole algorithm
+//! Matching is leftmost-first, not leftmost-longest: `a|ab` matches `a`, and `(?:a|ab)c`
+//! still matches `abc`. The live states are an ordered list, and three rules keep the
+//! order meaningful:
 //!
-//! Matching is *leftmost-first*, not leftmost-longest: `a|ab` matches just `a`,
-//! and `(?:a|ab)c` still matches `abc`, because alternation is a preference and
-//! not a choice. The set of live states is therefore kept as an ordered list,
-//! and three rules keep that order meaningful:
-//!
-//! * The epsilon closure is a depth-first walk that follows [`Inst::Split`]'s
-//!   `a` branch to exhaustion before touching `b`, so states enter the list in
-//!   preference order.
-//! * A new thread for "start matching here" is appended at the *end* of the
-//!   list, below every thread from an earlier starting position. That is what
-//!   makes the match leftmost.
-//! * When a thread reaches [`Inst::Match`], the match is recorded and every
-//!   lower-priority thread in the current list is discarded. Higher-priority
-//!   threads survive and may still overwrite it with a longer match — which is
-//!   exactly how a greedy `a+` keeps going.
+//! * The epsilon closure is a depth-first walk that follows [`Inst::Split`]'s `a` branch
+//!   to exhaustion before `b`, so states enter the list in preference order.
+//! * The thread for "start matching here" is appended at the end of the list, below every
+//!   thread from an earlier start. That makes the match leftmost.
+//! * When a thread reaches [`Inst::Match`], the match is recorded and every lower-priority
+//!   thread is discarded. Higher-priority threads survive and may overwrite it with a
+//!   longer match, which is how a greedy `a+` keeps going.
 
 use crate::compile::{Inst, Prefilter, Program};
 use crate::parse::Assertion;
@@ -115,8 +93,7 @@ impl ThreadList {
     }
 }
 
-/// Reusable scratch space for the simulation. Sized to the program on entry and
-/// then reused, so a search over ten thousand rows allocates once.
+/// Reusable scratch space for the simulation, sized to the program on entry.
 #[derive(Default)]
 pub(crate) struct Cache {
     clist: ThreadList,
@@ -132,20 +109,16 @@ impl Cache {
 
 /// Find the leftmost-first match at or after `start`.
 ///
-/// `text` is always the *whole* haystack, never a slice of it: `^`, `\b` and
-/// friends are evaluated against the code points that really surround a
-/// position, so `\ba` finds one match in `"aa"` and not two — which is what the
-/// `regex` crate does when it resumes a `find_iter`.
+/// `text` is always the whole haystack: assertions see the code points that really
+/// surround a position, so `\ba` finds one match in `"aa"`, as `regex` does when it
+/// resumes a `find_iter`.
 ///
-/// With `earliest`, the search returns as soon as any thread reaches
-/// [`Inst::Match`]. The span it reports is then not necessarily the leftmost
-/// -first one, so this is only for `is_match`, which asks a yes/no question.
+/// With `earliest`, return as soon as any thread reaches [`Inst::Match`]; the span is then
+/// not necessarily leftmost-first, so this is only for `is_match`.
 ///
-/// `budget` is the work this search may still charge — see the module docs —
-/// and is left holding what remains, so the searches of one `find_iter` can
-/// share a single budget rather than each starting from a full one. Exhausting
-/// it returns `Err(Exhausted)` and never a span: a search that was cut short
-/// has not established which match is leftmost-first, or whether one exists.
+/// `budget` is the work this search may still charge (see the module docs) and is left
+/// holding what remains, so the searches of one `find_iter` share it. Exhausting it
+/// returns `Err(Exhausted)`, never a span.
 pub(crate) fn search(
     prog: &Program,
     cache: &mut Cache,
@@ -166,10 +139,8 @@ pub(crate) fn search(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Exhausted;
 
-/// [`search`]'s simulation, charging every unit of work to `steps` and giving
-/// up once more than `step_limit` have been charged. Saturating everywhere: a
-/// `u64` of work units is unreachable in this universe, and saturation keeps
-/// the accounting from wrapping back under the limit if one ever were.
+/// [`search`]'s simulation, charging every unit of work to `steps` and giving up once more
+/// than `step_limit` are charged. Saturating, so the count never wraps under the limit.
 fn simulate(
     prog: &Program,
     cache: &mut Cache,
@@ -188,9 +159,8 @@ fn simulate(
     nlist.resize(prog.insts.len());
 
     let mut matched: Option<(usize, usize)> = None;
-    // `\A` holds at offset 0 of the text and nowhere else, so a start-anchored
-    // program asked to search from any later offset has already been answered.
-    // `find_iter` asks again from the end of a match at 0; this saves the rescan.
+    // `\A` holds only at offset 0, so a start-anchored program searched from a later
+    // offset (as `find_iter` does after a match at 0) has no match.
     if prog.start_anchored && start > 0 {
         return Ok(None);
     }
@@ -201,11 +171,8 @@ fn simulate(
         *steps = steps.saturating_add(1);
         if matched.is_none() {
             if prog.start_anchored {
-                // An anchored program starts threads at offset 0 and nowhere
-                // else. Once the list empties, nothing can revive it, and the
-                // prefilter — whose whole job is to find the next place a match
-                // could *begin* — has nowhere left to look. Walking the rest of
-                // the row is work spent proving what is already known.
+                // An anchored program starts threads only at 0; once the list empties
+                // nothing can revive it.
                 if pos > 0 && clist.dense.is_empty() {
                     return Ok(None);
                 }
@@ -214,20 +181,14 @@ fn simulate(
             {
                 let skipped = skip_to_candidate(prog, first, text, pos);
                 if skipped != pos {
-                    // The prefilter's own walk is one array lookup per byte, so
-                    // it is charged by the byte: cheap per unit, but not free,
-                    // and a 3 MB haystack of nothing but skipped bytes is real
-                    // work the budget has to see.
+                    // One unit per skipped byte: a 3 MB haystack of skipped bytes is real
+                    // work.
                     *steps = steps.saturating_add(u64::try_from(skipped - pos).unwrap_or(u64::MAX));
                     pos = skipped;
-                    // The list's visited marks describe the closure at the
-                    // position we just left. Empty of threads it may be, but a
-                    // stale mark is not harmless: the assertions in a pattern
-                    // like `ab\Bc` mark instructions without ever putting a
-                    // thread in `dense`, and the new start thread would then be
-                    // deduplicated against a position it never visited and
-                    // silently dropped. Retiring the generation costs nothing
-                    // here — there is nothing live to retire.
+                    // The visited marks describe the position just left: a failing
+                    // assertion (as in `ab\Bc`) marks instructions without adding a thread,
+                    // and a stale mark would drop the new start thread. Nothing is live, so
+                    // retiring the generation is free.
                     clist.begin();
                 }
             }
@@ -238,8 +199,7 @@ fn simulate(
         let mut i = 0;
         while let Some(&t) = clist.dense.get(i) {
             i += 1;
-            // One unit per live thread stepped. Summed over the loop this is
-            // the `positions × live threads` product the budget exists to cap.
+            // One unit per live thread stepped.
             *steps = steps.saturating_add(1);
             match prog.insts.get(t.pc) {
                 Some(&Inst::Char { c, next }) => {
@@ -271,14 +231,10 @@ fn simulate(
             return Ok(matched);
         }
         core::mem::swap(clist, nlist);
-        // Charged once per position, after the position is fully paid for, so
-        // the rule is simply: a search that spends more than `step_limit`
-        // without having answered yet is refused. A match already in hand is
-        // not a licence to keep going — the threads still alive are the ones
-        // that could extend it, and running them past the budget is exactly the
-        // cost being refused. The one search that outruns the budget and still
-        // answers is the `earliest` one above, which returned already: a
-        // positive answer is complete evidence and needs no more work.
+        // Checked once per position, after it is paid for: a search that has spent more
+        // than `step_limit` without answering is refused, even with a match in hand, since
+        // the live threads could still extend it. Only `earliest`, which returned above,
+        // may answer past the budget.
         if *steps > step_limit {
             return Err(Exhausted);
         }
@@ -293,18 +249,10 @@ fn simulate(
 
 /// Does code point `c` belong to `prog.classes[class]`?
 ///
-/// Below U+0080 the answer is one bit of a dense array — a shift and a test,
-/// touching sixteen bytes and no heap. Above it, the general path: reach
-/// through the `ClassSet`'s `Vec` header, binary search its ranges, then walk
-/// its perl classes.
-///
-/// The split earns its keep because of what this engine is FOR. Terminal rows
-/// are overwhelmingly ASCII, and the patterns that cost the most are the ones
-/// made entirely of classes — `(?i)ERROR` compiles to five `Inst::Class`, one
-/// per letter, where the case-sensitive form compiles to five `Inst::Char` that
-/// need no set at all. So the case-insensitive search, which is the find bar's
-/// default, is exactly the one paying per code point for a lookup structure
-/// built to answer questions about the whole of Unicode.
+/// Below U+0080 the answer is one bit of the class's ASCII bitmap; above it, a binary
+/// search of the set's ranges, then its perl classes. Terminal rows are mostly ASCII, and
+/// the costliest patterns are all classes: `(?i)ERROR`, the find bar's default, compiles
+/// to five `Inst::Class`.
 #[inline]
 fn class_matches(prog: &Program, class: usize, c: char) -> bool {
     let code = c as u32;
@@ -319,41 +267,23 @@ fn class_matches(prog: &Program, class: usize, c: char) -> bool {
 
 /// Advance past bytes that cannot begin a match.
 ///
-/// Sound only because the caller checks the thread list is empty first: with no
-/// thread alive, the only thing that could match at a position is a fresh start
-/// thread, and [`Prefilter`] is a superset of the code points such a thread
-/// survives its first step on.
-///
-/// The scan is byte-oriented, and steps by one byte rather than one code point.
-/// That is deliberate and safe: continuation bytes are never marked, so the walk
-/// can pass *through* the middle of a multi-byte code point but can only ever
-/// stop on a boundary. It is the difference between a decode plus a set of class
-/// tests per code point and one array lookup per byte, over text that is
-/// overwhelmingly going to be skipped.
+/// Sound only because the caller checks the thread list is empty: then only a fresh start
+/// thread could match, and [`Prefilter`] is a superset of what it survives its first step
+/// on. The scan steps by byte; continuation bytes are never marked, so it may pass through
+/// a multi-byte code point but stops only on a boundary.
 fn skip_to_candidate(prog: &Program, first: &Prefilter, text: &str, mut pos: usize) -> usize {
     let bytes = text.as_bytes();
     while let Some(&b) = bytes.get(pos) {
         if first.lead_bytes[b as usize] {
-            // THE SECOND BYTE FIRST, when the byte here is ASCII. Everything
-            // below this needs the decoded code point — the viability walk over
-            // `pcs` compares whole `char`s — and a decode plus that walk is far
-            // more than an array lookup. An ASCII lead byte IS its whole code
-            // point, so the next one starts at `pos + 1` and can be tested
-            // without decoding anything.
-            //
-            // Which matters because of what the lead-byte filter leaves behind:
-            // for `(?i)ERROR` it marks `E` and `e`, about a tenth of ordinary
-            // terminal output, and the second-byte test rejects the
-            // overwhelming majority of those. Doing it after the decode meant
-            // paying the decode on every one of them to reject almost all.
+            // When this byte is ASCII, test the second byte before decoding: an ASCII
+            // lead byte is its whole code point, so the next one starts at `pos + 1`, and
+            // a decode plus the walk over `pcs` costs far more than a lookup.
             if b < 0x80
                 && let Some(second) = first.second_bytes.as_ref()
                 && let Some(&next_byte) = bytes.get(pos + 1)
                 && !second[next_byte as usize]
             {
-                // Same resume rule as below: past this code point, not past the
-                // byte that failed — that byte is itself a position a match may
-                // begin at.
+                // Resume past this code point, as below.
                 pos += 1;
                 continue;
             }
@@ -368,25 +298,16 @@ fn skip_to_candidate(prog: &Program, first: &Prefilter, text: &str, mut pos: usi
                 _ => true,
             });
             if viable {
-                // One more byte of evidence, when the pattern provably has a
-                // second code point. This is what makes a common lead byte
-                // affordable: `(?i)ERROR` marks `E` and `e`, roughly a tenth
-                // of ordinary terminal output, and almost every one of those
-                // positions dies on the second character — after the
-                // simulation has been entered, a thread added and a step
-                // charged. One array lookup answers it instead.
+                // One more byte of evidence, when the pattern has a second code point.
                 if let Some(second) = first.second_bytes.as_ref() {
                     let after = pos + c.len_utf8();
-                    // No byte to test means the text ends here, and a pattern
-                    // needing a second code point cannot match at `pos` — but
-                    // saying so is the simulation's job, not the filter's. The
-                    // filter only ever excludes on POSITIVE evidence.
+                    // No next byte: the simulation decides. The filter excludes only
+                    // on positive evidence.
                     if let Some(&next_byte) = bytes.get(after)
                         && !second[next_byte as usize]
                     {
-                        // Nothing can start at `pos`. Resume at the code point
-                        // after it — NOT after the second byte, which is
-                        // itself a position a match may begin at.
+                        // Nothing can start at `pos`. Resume at the next code point,
+                        // not after the second byte, which may itself begin a match.
                         pos = after;
                         continue;
                     }
@@ -403,17 +324,12 @@ fn skip_to_candidate(prog: &Program, first: &Prefilter, text: &str, mut pos: usi
 
 /// Add `pc` and its epsilon closure to `list`, in preference order.
 ///
-/// The walk is an explicit-stack DFS, so a pattern of any nesting depth costs
-/// heap and not stack. Pushing `b` before `a` means `a` is popped first and its
-/// whole subtree is entered before `b` is looked at, which is the preference
-/// order the match semantics need. `mark` both deduplicates and terminates the
-/// walk: an epsilon cycle such as the one `()*` compiles to is entered once.
+/// An explicit-stack DFS, so nesting depth costs heap, not stack. Pushing `b` before `a`
+/// enters `a`'s whole subtree first. `mark` deduplicates and terminates the walk, so an
+/// epsilon cycle such as `()*`'s is entered once.
 ///
-/// Returns the number of instructions *entered*, which the caller charges to
-/// the step budget: that is where an amplifier such as `(?:x?){2000}z` really
-/// spends itself — four thousand epsilon instructions walked at every single
-/// position of the haystack. (Returned rather than taken as an eighth `&mut`
-/// parameter, which would put this function over clippy's argument ceiling.)
+/// Returns the number of instructions entered, for the step budget: that is where an
+/// amplifier such as `(?:x?){2000}z` spends itself, ~4,000 at every position.
 fn add(
     list: &mut ThreadList,
     stack: &mut Vec<usize>,
@@ -541,8 +457,7 @@ mod tests {
         }
     }
 
-    /// The budget is charged and enforced, and an exhausted search hands back
-    /// no span at all — the whole reason it is a `Result` and not an `Option`.
+    /// The budget is enforced, and an exhausted search returns no span.
     #[test]
     fn the_step_budget_stops_the_simulation() {
         let ast = parse("a+b", Flags::default()).expect("parses");
@@ -560,9 +475,7 @@ mod tests {
             Err(Exhausted),
             "and a hundred units cannot cross ten thousand positions"
         );
-        // The refusal is about the work, not the outcome: the same starved
-        // search over a haystack that *does* match still refuses rather than
-        // reporting the span it was about to find.
+        // A starved search refuses even over a haystack that matches.
         let matching = format!("{}b", "a".repeat(10_000));
         assert_eq!(
             search(&prog, &mut cache, &matching, 0, false, &mut 100),
@@ -574,10 +487,8 @@ mod tests {
         );
     }
 
-    /// Bytes the prefilter skips are charged too. Without that, the cheapest
-    /// possible haystack — megabytes of text no position can start a match on —
-    /// would be walked in a single unaccounted step, and the budget would stop
-    /// describing the time the search actually takes.
+    /// Bytes the prefilter skips are charged, so a haystack no position can start a match
+    /// on still costs its length.
     #[test]
     fn the_prefilter_skip_is_charged_by_the_byte() {
         let ast = parse("needle", Flags::default()).expect("parses");

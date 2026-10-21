@@ -120,8 +120,8 @@ fn registry_path() -> Option<OsString> {
 /// except `extra`'s LEAD: every entry before its first one `first` also names stays in
 /// front. That lead is what the spawn seam put first on purpose (the reroute and agents
 /// dirs, the running build's own folder: `reroute_path_env` in aterm-gui) and whatever a
-/// launcher prepended; behind the registry they lost to it, so a tab of a portable or
-/// scratch build ran the installed `aterm` its user PATH names (measured 2026-10-17).
+/// launcher prepended; behind the registry they would lose to an installed `aterm` on
+/// the user PATH.
 /// PURE (no I/O), so it is unit-tested below.
 fn union_paths(first: &OsString, extra: Option<&OsString>) -> OsString {
     let key_of = |seg: &str| seg.trim().trim_end_matches('\\').to_ascii_lowercase();

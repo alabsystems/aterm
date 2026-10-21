@@ -322,16 +322,17 @@ fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) {
     let glyph = &mut master.rows[slot * MASTER_H..(slot + 1) * MASTER_H];
     glyph.fill(0);
     for (sy, bits) in bitmap.into_iter().enumerate() {
+        if bits == 0 {
+            continue;
+        }
+        let mut row_mask = 0u32;
         for sx in 0..8usize {
-            if bits & (1 << sx) == 0 {
-                continue;
-            }
-            for dy in 0..5usize {
-                for dx in 0..2usize {
-                    plot(glyph, (4 + sx * 2 + dx) as i32, (4 + sy * 5 + dy) as i32);
-                }
+            if bits & (1 << sx) != 0 {
+                row_mask |= 0b11 << (4 + sx * 2);
             }
         }
+        let y0 = 4 + sy * 5;
+        glyph[y0..y0 + 5].fill(row_mask);
     }
 }
 

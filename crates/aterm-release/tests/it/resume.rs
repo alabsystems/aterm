@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Resume/recut logic proofs (release spec §5): the journal's re-entry
-//! contract and the remote-derived cut-mode decision table, as PURE logic
-//! over fake remote state — no network, no git. Plus the pure publish
-//! helpers the pipeline hangs off (version bump, monotonic
-//! gate, channel-floor carry-forward, exhaustive status selection) and the
-//! hand-rolled CLI parse table.
+//! Resume and recut logic as pure logic over fake remote state (no network, no git): the
+//! journal's re-entry contract and the remote-derived cut-mode table, plus the publish helpers
+//! (version bump, monotonic gate, channel-floor carry-forward, status selection) and the CLI
+//! parse table.
 
 use crate::{cli, gates, ledger, manifest_out, publish, verify};
 
@@ -35,15 +33,12 @@ fn state(current_version: &str, has_section: bool, published: bool) -> RemoteSta
 }
 
 // ---------------------------------------------------------------------------
-// the §5 remote-derived decision table (journal absent ⇒ derive from remote)
+// the remote-derived decision table (no journal: derive from the remote)
 // ---------------------------------------------------------------------------
 
-/// The whole table in one place, spec §5's sentence as executable rows, under
-/// the single-version scheme: `RemoteState.current_version` IS the release
-/// version, `[workspace.package] version` as written, so a cut NEVER invents a
-/// successor. "workspace-derived version already
-/// rolled into `## [X.Y.Z]` + no published vX.Y.Z release ⇒ recut" —
-/// everything else is a fresh cut of that same version (or a refusal).
+/// `RemoteState.current_version` is the release version as `[workspace.package] version`
+/// writes it, so a cut never invents a successor: a version rolled into `## [X.Y.Z]` with no
+/// published release recuts, and everything else is a fresh cut of that version or a refusal.
 #[test]
 fn remote_derived_cut_mode_decision_table() {
     let fresh = |v: &str| CutMode::Fresh {
@@ -55,13 +50,11 @@ fn remote_derived_cut_mode_decision_table() {
 
     // (workspace version, section?, published?) → want
     let table: &[(&str, bool, bool, CutMode)] = &[
-        // Steady state: the operator's bump is the ONLY thing that advances the
-        // version.
+        // Steady state: only the operator's bump advances the version.
         ("0.3.0", false, false, fresh("0.3.0")),
-        // THE wedge signature: roll+claim landed, nothing published ⇒ recut.
+        // Roll and claim landed, nothing published: recut.
         ("0.2.0", true, false, recut("0.2.0")),
-        // Negative control for the RETIRED ledger-tail bump: the old default
-        // path answered fresh("0.10.0") here. There is no arithmetic left.
+        // No successor arithmetic: 0.9.0 stays 0.9.0.
         ("0.9.0", false, false, fresh("0.9.0")),
         ("1.99.0", false, false, fresh("1.99.0")),
     ];
@@ -125,7 +118,7 @@ fn first_incomplete_walks_the_step_order() {
         Some("publish"),
         "a crash anywhere in the one publication resumes into its convergence"
     );
-    // Completion ORDER in the file is irrelevant — only membership counts.
+    // Order in the file is irrelevant; only membership counts.
     j.done = vec![
         "selfcheck".into(),
         "lock".into(),
@@ -133,9 +126,8 @@ fn first_incomplete_walks_the_step_order() {
         "tag".into(),
     ];
     assert_eq!(j.first_incomplete(), Some("publish"));
-    // A gap resumes at the GAP, not after the highest completed step: the
-    // journal records what finished; skipping an incomplete earlier one is
-    // never safe.
+    // A gap resumes at the gap, not after the highest completed step: skipping an incomplete
+    // earlier step is never safe.
     j.done = vec!["lock".into(), "sign".into(), "tag".into()];
     assert_eq!(j.first_incomplete(), Some("selfcheck"));
     j.done = STEPS.iter().map(|s| s.to_string()).collect();
@@ -168,8 +160,7 @@ fn current_journal_done_state_is_an_exact_canonical_prefix() {
     valid.save(&path).unwrap();
     assert_eq!(Journal::load(&path).unwrap().unwrap(), valid);
 
-    // The retired two-component spelling is no longer a version this cutter
-    // will journal — a current-format journal carries canonical X.Y.Z only.
+    // A current-format journal carries canonical X.Y.Z only.
     for malformed in ["0.26", "v0.26.0", "0.26.0.1", "01.26.0"] {
         let mut malformed_identity = journal();
         malformed_identity.version = malformed.into();
@@ -213,18 +204,16 @@ fn an_older_journal_format_is_refused_and_triaged_by_its_header() {
         )
         .unwrap();
     };
-    // The publish-once cutters' (0.94-0.101) list: `build` where this one signs.
+    // The format-11 step list: `build` where this cutter signs.
     let publish_once = "\"lock\", \"build\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"";
     for (format, done, named) in [
-        // A rebuilding cutter's journal: a cut it claimed is a cut only it can
-        // finish — this cutter would sign bytes it never measured.
+        // A rebuilding cutter's journal: only it may finish a cut it claimed (this cutter
+        // would sign bytes it never measured).
         ("format = 11\n", publish_once.to_string(), "format-11"),
-        // A pre-publish-once cutter's journal: a cut it started is a cut only it can
-        // finish.
+        // A pre-publish-once journal: only its own cutter finishes it.
         ("format = 10\n", through_unlock.to_string(), "format-10"),
-        // Both format-9 step lists: main's, which kept `site`, and this cutter's
-        // first, which had already dropped it — one number, two lists, so neither
-        // may reach the prefix check (the_finished_0_92_journal_... below).
+        // Format 9 named two step lists (with and without `site`): neither may reach the
+        // prefix check.
         (
             "format = 9\n",
             format!("{through_unlock}, \"site\""),
@@ -305,9 +294,8 @@ fn an_older_journal_format_is_refused_and_triaged_by_its_header() {
 /// in front of every cut, dry run, `--abandon` and recover launched from that
 /// checkout. Now it gets the refusal every retired format gets.
 ///
-/// Negative control: the same finished cut written at the current format with the
-/// current step list loads, reads as finished, and is cleared by the next cut —
-/// so the refusal is about the number, never the cut.
+/// Negative control: the same finished cut at the current format and step list loads, reads
+/// as finished, and is cleared by the next cut: the refusal is about the number, not the cut.
 #[test]
 fn the_finished_0_92_journal_main_cut_is_refused_by_name() {
     const V0_92_JOURNAL: &str = r#"format = 9
@@ -345,9 +333,8 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
     assert!(header.finished());
     assert!(publish::fresh_cut_journal_triage(Some(&header), publish::CutKind::Real).unwrap());
 
-    // NEGATIVE CONTROL: the same cut at the current format, with the current step
-    // list and the one release capability it records, is a finished journal the next
-    // cut clears.
+    // Negative control: the same cut at the current format, with the current step list and
+    // the one release capability it records, is a finished journal the next cut clears.
     let current = V0_92_JOURNAL
         .lines()
         .filter(|line| !line.starts_with("mirror_") && !line.starts_with("done = "))
@@ -378,12 +365,9 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
     );
 }
 
-/// THE JOURNAL v0.93.0 LEFT BEHIND, verbatim (`dist/cut-state.toml` in the clone that
-/// cut it, 2026-09-24): format 10, the pre-publish-once step list, finished through
-/// `unlock`. The first publish-once cut from that clone meets exactly this file. It is
-/// history to every command: a fresh cut (and a dry run) clears it, and the read-only
-/// commands take nothing from it and do not fail on it — while `Journal::load` still
-/// never walks its step list.
+/// The finished v0.93.0 journal, verbatim: format 10, the pre-publish-once step list, through
+/// `unlock`. It is history to every command: a fresh cut or dry run clears it, read-only
+/// commands take nothing from it and do not fail on it, and `Journal::load` never walks it.
 #[test]
 fn the_finished_0_93_journal_is_history_to_every_command() {
     const V0_93_JOURNAL: &str = r#"format = 10
@@ -428,8 +412,8 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
     let error = Journal::load(&path).unwrap_err().to_string();
     assert!(error.contains("format-10"), "{error}");
 
-    // NEGATIVE CONTROL: the same cut stopped short of `unlock` is NOT history — it
-    // holds a lease, and only its own cutter may finish or withdraw it.
+    // Negative control: the same cut stopped short of `unlock` is not history: it holds a
+    // lease, and only its own cutter may finish or withdraw it.
     std::fs::write(
         &path,
         V0_93_JOURNAL.replace(", \"mirror\", \"unlock\"]", "]"),
@@ -461,7 +445,7 @@ fn journal_round_trips_and_marks_persist_immediately() {
         "byte round-trip"
     );
 
-    // mark() persists IMMEDIATELY (journal-every-step) and is idempotent.
+    // `mark` persists at once and is idempotent.
     j.mark("lock", &path).expect("mark lock");
     j.mark("sign", &path).expect("mark sign");
     j.mark("sign", &path).expect("mark sign again");
@@ -473,8 +457,8 @@ fn journal_round_trips_and_marks_persist_immediately() {
     );
     assert_eq!(back.first_incomplete(), Some("selfcheck"));
 
-    // A torn/corrupt journal must STOP resume with an error — never read as
-    // "no journal" and silently restart a cut on top of a half-done one.
+    // A torn journal stops resume with an error, never reads as "no journal" (which would
+    // restart a cut over a half-done one).
     std::fs::write(&path, "version = [not toml").unwrap();
     assert!(
         Journal::load(&path).is_err(),
@@ -536,10 +520,10 @@ fn journal_persists_signature_ratchet_and_actual_key_fail_closed() {
 
 #[test]
 fn version_helpers_port_the_shell_derivations() {
-    // workspace_version: section-scoped, quote-delimited (the awk's read).
+    // workspace_version: section-scoped, quote-delimited.
     let cargo = "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nversion = \"0.25.0\"\nedition = \"2024\"\n\n[workspace.dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n";
     assert_eq!(publish::workspace_version(cargo).unwrap(), "0.25.0");
-    // A version key OUTSIDE [workspace.package] must never win.
+    // A version key outside [workspace.package] never wins.
     let decoy = "[package]\nversion = \"9.9.9\"\n\n[workspace.package]\nversion = \"0.25.0\"\n";
     assert_eq!(publish::workspace_version(decoy).unwrap(), "0.25.0");
     assert!(publish::workspace_version("[workspace]\n").is_err());
@@ -548,7 +532,7 @@ fn version_helpers_port_the_shell_derivations() {
     let dev = "[workspace.package]\nversion = \"0.2.1\"\n";
     assert_eq!(publish::workspace_version(dev).unwrap(), "0.2.1");
 
-    // A release IS the workspace version as written, and that is MAJOR.MINOR.0.
+    // A release is the workspace version as written, and that is MAJOR.MINOR.0.
     assert_eq!(
         publish::release_version_from_workspace("0.2.0").unwrap(),
         "0.2.0"
@@ -657,9 +641,8 @@ fn repo_slug_parses_the_repository_field_shapes() {
     );
 }
 
-/// The monotonic gate of spec §7 steps 4/5, including the resume subtlety: a
-/// live release at exactly our build under OUR tag is this very cut,
-/// half-flipped by a crashed attempt — resuming past it must not self-abort.
+/// The monotonic gate, with the resume case: a live release at exactly our build under our tag
+/// is this cut, half-published by a crashed attempt, and resuming past it must not refuse.
 #[test]
 fn monotonic_gate_accepts_only_strictly_newer_or_our_own_cut() {
     let ok = |n, best| publish::monotonic_ok(n, "v0.26.0", best).is_ok();
@@ -913,9 +896,8 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
         .to_string();
     assert!(err.contains("byte-identical"), "{err}");
 
-    // With no local artifact to compare (`targo --unverified ship verify`), the same corrupt
-    // bytes must still fail — on the Ed25519 check itself, which is the one
-    // branch the byte comparison above never reaches.
+    // With no local artifact to compare (`targo --unverified ship verify`), the same bytes
+    // still fail, on the Ed25519 check the byte comparison above never reaches.
     let err = publish::verify_channel_head_signature_with(
         &[head],
         "v0.55.0",
@@ -1007,9 +989,9 @@ const OTHER_KEY: &str = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
 
 #[test]
 fn without_a_paper_master_signing_stays_per_machine_opt_in() {
-    // Forks and private channels pin no master, so their behavior is per-machine
-    // opt-in: keyless cuts unsigned, a configured key signs. (With the master pinned
-    // — this tree — a keyless cut refuses pre-claim; `machine_roster.rs` pins that.)
+    // With no master pinned (forks, private channels) signing is per-machine opt-in: keyless
+    // cuts unsigned, a configured key signs. With it pinned, as in this tree, a keyless cut
+    // refuses pre-claim (`machine_roster.rs`).
     let unsigned = publish::unrostered_signature_policy(None).unwrap();
     assert!(!unsigned.required);
     assert_eq!(unsigned.pubkey, None);
@@ -1173,8 +1155,7 @@ fn published_snapshot_preserves_symbolic_target_but_claim_capability_does_not() 
     };
     publish::validate_release_object_snapshot(Some(&historical), &historical).unwrap();
 
-    // Negative control for the old false invariant: a valid historical
-    // snapshot is not a current-protocol claim-SHA capability.
+    // Negative control: a valid historical snapshot is not a claim-SHA capability.
     assert!(
         publish::validate_release_object_capability(
             Some(&historical),
@@ -1208,15 +1189,10 @@ fn published_snapshot_preserves_symbolic_target_but_claim_capability_does_not() 
     .unwrap();
 }
 
-/// A channel release is valid with a default-branch target: the claim commit lives
-/// on origin, so a channel release is anchored at the channel's default branch, and
-/// its identity is the immutable ID, the tag and the state — never a claim SHA.
-///
-/// This is the invariant the mirror violated on v0.6.0 and v0.7.0: both cuts put
-/// the release on the channel correctly, then ran a claim-SHA-bound scan over it and
-/// refused, wedging with the lease held. The negative control stays: the claim-SHA
-/// capability still refuses the object, so nobody "fixes" a channel scan by binding
-/// it to a target a channel release can never carry.
+/// A channel release is valid with a default-branch target: the claim commit lives on origin,
+/// so its identity is the immutable ID, the tag and the state, never a claim SHA. The negative
+/// control: the claim-SHA capability still refuses it, so a channel scan is never bound to a
+/// target a channel release cannot carry.
 #[test]
 fn a_channel_release_is_valid_with_a_default_branch_target() {
     let claim = "d".repeat(40);
@@ -1280,9 +1256,8 @@ fn yank_successor_first_requires_newer_order_build_and_checked_floor() {
     mismatched.version = "0.56.0".into();
     assert!(verify::yank_successor_covers(&bad, &mismatched).is_err());
 
-    // A retired two-component release is inert archive history that no client
-    // selects. It is not orderable against the current scheme, so it is
-    // refused at BOTH ends — never ordered, never a licence to delete.
+    // A retired two-component release is archive history no client selects and is not
+    // orderable against the current scheme: refused at both ends.
     let retired = yank_published("v0.61", 61, Some(61));
     for (bad_end, successor_end) in [(&retired, &successor), (&bad, &retired)] {
         assert!(
@@ -1356,9 +1331,8 @@ fn client_arbitration_is_permutation_invariant_and_skips_older_503() {
     }
 }
 
-/// The repository's thirteen real pre-canonical exact heads are ordinary
-/// three-component candidates under the single-version scheme — they simply
-/// order BELOW the current head, so only v0.54.0's manifest may be fetched.
+/// The repository's thirteen real pre-canonical heads are ordinary three-component candidates
+/// that order below the current head, so only v0.54.0's manifest is fetched.
 #[test]
 fn client_arbitration_tolerates_real_lower_numeric_legacy_heads() {
     let legacy_tags = [
@@ -1403,11 +1377,9 @@ fn client_arbitration_tolerates_real_lower_numeric_legacy_heads() {
     );
 }
 
-/// Garbage in the tag namespace fails closed rather than silently narrowing
-/// the candidate set: a tag that is neither canonical `vMAJOR.MINOR.PATCH`
-/// nor a retired two-component release aborts the whole scan before any
-/// download. Leading-zero spellings are refused too, so two tags can never
-/// share one numeric order.
+/// A tag that is neither canonical `vMAJOR.MINOR.PATCH` nor a retired two-component release
+/// refuses the whole scan before any download, rather than narrowing the candidates. Leading
+/// zeros are refused too, so two tags never share one numeric order.
 #[test]
 fn client_arbitration_refuses_unorderable_tags() {
     for rejected in [
@@ -1437,10 +1409,8 @@ fn client_arbitration_refuses_unorderable_tags() {
     }
 }
 
-/// The burned bridge, executable: retired two-component releases stay
-/// published in the archive and are neither candidates nor errors. A live
-/// v0.61 orders above v0.2.0 under the OLD two-field comparison, so without
-/// the skip the very first post-cut-over check would stall on it.
+/// Retired two-component releases stay published in the archive and are neither candidates nor
+/// errors (a live v0.61 would order above v0.2.0 under a two-field comparison).
 #[test]
 fn client_arbitration_skips_retired_two_component_releases() {
     let listing = [
@@ -1472,8 +1442,8 @@ fn client_arbitration_skips_retired_two_component_releases() {
         ("v0.2.0", 1_790_000_000)
     );
 
-    // With no current-scheme candidate at all, a page of retired releases
-    // selects NOTHING — it must never fall back to archive history.
+    // With no current-scheme candidate, a page of retired releases selects nothing; it never
+    // falls back to archive history.
     let retired_only = [
         release_metadata_row("v0.61", false, 1),
         release_metadata_row("v0.25", false, 1),
@@ -1544,9 +1514,9 @@ fn authoritative_fetch_and_version_mismatch_never_fall_back() {
     assert_eq!(fetched, ["v0.10.0"]);
 }
 
-/// `targo --unverified ship status` intentionally requests the exhaustive policy: drafts
-/// and appcast-less releases remain invisible, while every published appcast
-/// is downloaded so dangling ledger claims can be computed over the full set.
+/// `targo --unverified ship status` uses the exhaustive policy: drafts and appcast-less
+/// releases stay invisible, and every published appcast is downloaded so dangling ledger
+/// claims are computed over the full set.
 #[test]
 fn exhaustive_page_preserves_all_published_appcasts() {
     let listing = [
@@ -1588,8 +1558,8 @@ fn exhaustive_page_preserves_all_published_appcasts() {
     );
 }
 
-/// The production jq carries the exact appcast COUNT, so neither lane can collapse
-/// duplicate names to an arbitrary `[0]` result.
+/// The production jq carries the exact appcast count, so neither lane can collapse duplicate
+/// names to an arbitrary `[0]`.
 #[test]
 fn exhaustive_history_rejects_duplicate_exact_names() {
     let listing = release_metadata_row("v0.54.0", false, 2);
@@ -1605,7 +1575,7 @@ fn exhaustive_history_rejects_duplicate_exact_names() {
 }
 
 // ---------------------------------------------------------------------------
-// the hand-rolled CLI (spec §5 surface)
+// the hand-rolled CLI
 // ---------------------------------------------------------------------------
 
 fn parse(args: &[&str]) -> Result<cli::Cmd, String> {

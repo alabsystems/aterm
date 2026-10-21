@@ -61,29 +61,11 @@
 //! ## Under a Binding Budget
 //!
 //! The budget counts stored bytes: the hot tier raw, the warm and cold tiers
-//! compressed. When it binds (a host's [`Scrollback::set_memory_budget`],
-//! aterm-gui's memory-pressure shed), the store keeps the newest lines that
-//! fit, so the codec sets how much history survives. Every compressed tier is
-//! LZ4, which keeps fewer lines than the zstd level-1 cold tier the GUI ran
-//! before (docs/AUDIT-third-party-2026-10-15.md, step ZC.2; wasm builds were
-//! already LZ4). Lines kept by a [`Scrollback::with_defaults`] store with no
-//! line limit, at 80 and 120 columns, under the pressure shed's 1 MiB floor
-//! and its CRITICAL eighth of [`DEFAULT_MEMORY_BUDGET`]:
-//!
-//! | Output           | 1 MiB        | 12.5 MiB                                |
-//! |------------------|--------------|-----------------------------------------|
-//! | `git log -p`     | 26% fewer    | 28-30% fewer                            |
-//! | `ls -lR`         | 36-37% fewer | all 1.0-1.1M fit, in 41-44% more bytes  |
-//! | random printable | 19-20% fewer | 19-20% fewer                            |
-//!
-//! The figures move with the corpus: `git log -p` is this repository's whole
-//! history (1.2M lines), `ls -lR` is `/System/Library` and `/usr`, and random
-//! printable is 400k seeded rows.
-//!
-//! A budget that does not bind keeps every line and pays in bytes instead:
-//! 20-35% more per GUI session at the 100,000-line default.
-//!
-//! ## Verification
+//! compressed. When it binds ([`Scrollback::set_memory_budget`], aterm-gui's
+//! memory-pressure shed), the store keeps the newest lines that fit, so the
+//! codec's ratio sets how much history survives. Against zstd, LZ4 keeps
+//! 19-37% fewer lines under a binding budget and stores 20-35% more bytes
+//! under one that does not (docs/AUDIT-third-party-2026-10-15.md, ZC.2).
 //!
 //! - The tier laws are the `ty` models `EvictFull` and `TierResidency`
 //!   (aterm-spec), bound by aterm-buffer's conformance suites; the tiers
@@ -122,7 +104,7 @@ pub use error::ScrollbackError;
 pub(crate) use hot_tier::HotTier;
 pub use iter::{DenseScrollbackIter, ScrollbackIter};
 pub use line::{AttrRunCursor, CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
-// Block codec, public for `TerminalCheckpoint` grid-body encode/decode (B.3.2).
+// Block codec, public for `TerminalCheckpoint` grid-body encode/decode.
 pub use line::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, max_linked_record_bytes, serialize_lines,
@@ -139,9 +121,8 @@ pub(crate) use watermark::{
 
 /// Scrollback buffer with tiered storage.
 ///
-/// Lines flow from hot → warm → cold as they age.
-/// Memory budget is enforced by evicting warm blocks to cold tier, then
-/// dropping oldest cold pages if total memory is still over budget.
+/// Lines flow hot → warm → cold as they age. The memory budget is enforced by
+/// evicting warm blocks to cold, then dropping the oldest cold pages.
 ///
 /// # Examples
 ///
@@ -215,17 +196,14 @@ pub struct Scrollback {
     bytes_used: usize,
     /// Reclaimable storage bytes for budget enforcement (excludes cache + overhead).
     budgeted_bytes: usize,
-    /// Maximum total lines allowed (None = no limit).
-    /// When set, older lines are discarded when this limit is exceeded.
+    /// Maximum total lines; older lines are discarded past it (None = no limit).
     line_limit: Option<usize>,
-    /// Monotonic count of lines DROPPED by memory-pressure eviction (cold-tier
-    /// FIFO under the byte budget) or lost with a quarantined warm block —
-    /// real retention loss, exposed out-of-band (audit E10a). User-requested
-    /// `set_line_limit` truncation is NOT counted.
+    /// Monotonic count of lines dropped by memory-pressure eviction (cold FIFO
+    /// under the byte budget) or lost with a quarantined warm block.
+    /// `set_line_limit` truncation is not counted.
     pressure_evicted_lines: u64,
-    /// Monotonic count of history lines that crossed the IMAGE RETENTION
-    /// HORIZON — see
-    /// [`image_rows_dropped_by_compression`](Self::image_rows_dropped_by_compression).
+    /// Monotonic count of history lines that crossed the image retention
+    /// horizon; see [`Self::image_rows_dropped_by_compression`].
     image_rows_dropped_by_compression: u64,
     /// Current memory pressure watermark level.
     watermark_level: WatermarkLevel,
@@ -238,31 +216,20 @@ pub struct Scrollback {
 }
 
 impl Scrollback {
-    /// Create a new scrollback buffer with specified tier limits.
+    /// Create a new scrollback buffer with the given hot and warm line limits
+    /// and memory budget (bytes); `hot_limit` is clamped to at least 1.
     ///
-    /// # Arguments
-    /// * `hot_limit` - Maximum lines in hot tier before promotion
-    /// * `warm_limit` - Maximum lines in warm tier before eviction
-    /// * `memory_budget` - Total memory budget in bytes
-    ///
-    /// The line limit defaults to [`DEFAULT_LINE_LIMIT`] (100,000 lines)
-    /// to prevent unbounded scrollback growth from runaway stdout (#7929).
-    /// Callers that want unlimited history should call
-    /// [`set_line_limit(None)`](Self::set_line_limit) after construction.
-    ///
-    /// ENSURES: self.line_count() == 0
-    /// ENSURES: self.hot_limit() >= 1 (clamped from input)
-    /// ENSURES: self.memory_used() == 0
-    /// ENSURES: self.line_limit() == Some(DEFAULT_LINE_LIMIT)
+    /// The line limit defaults to [`DEFAULT_LINE_LIMIT`] against runaway
+    /// output; call [`set_line_limit(None)`](Self::set_line_limit) for
+    /// unlimited history.
     #[must_use]
     pub fn new(hot_limit: usize, warm_limit: usize, memory_budget: usize) -> Self {
         let hot = HotTier::new();
         let warm = WarmTier::new();
         let cold = ColdTier::new();
         Self {
-            // Saturating: fresh-tier struct sizes, so the sum always fits in
-            // `usize` — the saturation just discharges the strict L0 gate's
-            // unconstrained-input overflow counterexample.
+            // Saturating: fresh-tier sizes always fit; this only discharges the
+            // strict L0 gate's unconstrained-input overflow counterexample.
             bytes_used: hot
                 .memory_used()
                 .saturating_add(warm.memory_used())
@@ -286,19 +253,15 @@ impl Scrollback {
         }
     }
 
-    /// Create a scrollback buffer with sensible defaults.
-    ///
-    /// Uses: 1000 hot lines, 10000 warm lines, 100MB budget.
+    /// Create a scrollback buffer with the defaults: 1000 hot lines, 10000 warm
+    /// lines, a 100 MB budget.
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(DEFAULT_HOT_LIMIT, DEFAULT_WARM_LIMIT, DEFAULT_MEMORY_BUDGET)
     }
 
-    /// Create a scrollback buffer with custom block size.
-    ///
-    /// ENSURES: self.line_count() == 0
-    /// ENSURES: self.hot_limit() >= 1
-    /// ENSURES: block_size >= 1 && block_size <= hot_limit
+    /// Create a scrollback buffer with a custom block size, clamped to
+    /// `1..=min(hot_limit, MAX_DECODE_PAGE_LINES)`.
     #[must_use]
     pub fn with_block_size(
         hot_limit: usize,
@@ -307,10 +270,9 @@ impl Scrollback {
         block_size: usize,
     ) -> Self {
         let hot_limit = hot_limit.max(1);
-        // Block size must not exceed hot limit, otherwise promotion never triggers.
-        // Also clamp to MAX_DECODE_PAGE_LINES so a serialized block never holds more
-        // lines than the disk-decode cap will reconstruct — otherwise a legitimate
-        // oversized block would decode short and fail its line-count validation.
+        // Not above hot limit (else promotion never triggers), nor above
+        // MAX_DECODE_PAGE_LINES (else a legitimate block decodes short and
+        // fails its line-count validation).
         let block_size = block_size
             .max(1)
             .min(hot_limit)
@@ -372,14 +334,12 @@ impl Scrollback {
         self.cold.line_count()
     }
 
-    /// Get the hot+warm memory usage (bytes).
-    ///
-    /// Use [`cold_memory_used`](Self::cold_memory_used) to inspect the cold tier
-    /// separately. [`total_memory_used`](Self::total_memory_used) includes all tiers.
+    /// Get the hot+warm memory usage (bytes); see
+    /// [`cold_memory_used`](Self::cold_memory_used) and
+    /// [`total_memory_used`](Self::total_memory_used).
     #[must_use]
     pub fn memory_used(&self) -> usize {
-        // Saturating: both tiers report bytes of memory this process actually
-        // holds, so the true sum always fits in `usize` (see `Scrollback::new`).
+        // Saturating: both are bytes this process holds, so the sum fits.
         self.hot
             .memory_used()
             .saturating_add(self.warm.memory_used())
@@ -394,31 +354,24 @@ impl Scrollback {
         self.cold.compressed_size()
     }
 
-    /// Get total memory usage across all tiers (bytes).
-    ///
-    /// Returns hot + warm + cold tier memory.
+    /// Get total memory usage across all tiers (bytes), including cache and
+    /// overhead.
     #[must_use]
     pub fn total_memory_used(&self) -> usize {
         self.bytes_used
     }
 
-    /// Get reclaimable storage bytes used for budget enforcement.
-    ///
-    /// Unlike [`total_memory_used`](Self::total_memory_used), this excludes
-    /// diagnostic cache and metadata growth. This is the quantity compared
-    /// against [`memory_budget`](Self::memory_budget) by
-    /// [`over_budget`](Self::over_budget) and [`watermark_level`](Self::watermark_level).
+    /// Get reclaimable storage bytes used for budget enforcement: unlike
+    /// [`total_memory_used`](Self::total_memory_used), excludes cache and
+    /// metadata. [`over_budget`](Self::over_budget) and the watermark compare it.
     #[must_use]
     #[inline]
     pub fn budgeted_memory_used(&self) -> usize {
         self.budgeted_bytes
     }
 
-    /// Check if reclaimable storage exceeds the budget.
-    ///
-    /// Uses `budgeted_bytes` (reclaimable storage only), not `total_memory_used()`
-    /// (diagnostic, includes cache and metadata). This prevents read-only cache
-    /// fills from perturbing the budget signal.
+    /// Check if reclaimable storage exceeds the budget. Uses `budgeted_bytes`,
+    /// not `total_memory_used()`, so read-only cache fills do not perturb it.
     #[must_use]
     #[inline]
     pub fn over_budget(&self) -> bool {
@@ -439,10 +392,8 @@ impl Scrollback {
         self.warm_limit
     }
 
-    /// Get the (clamped) block size — lines per promoted warm block.
-    ///
-    /// Always `<= MAX_DECODE_PAGE_LINES`, so a serialized block never exceeds the
-    /// disk-decode line-count cap.
+    /// Get the (clamped) block size: lines per promoted warm block, always
+    /// `<= MAX_DECODE_PAGE_LINES`.
     #[cfg(test)]
     #[must_use]
     #[inline]
@@ -466,10 +417,8 @@ impl Scrollback {
         self.line_limit
     }
 
-    /// Get the current memory pressure watermark level.
-    ///
-    /// This is a lightweight O(1) read — the level is precomputed on every
-    /// accounting sync, not recalculated on each call.
+    /// Get the current memory pressure watermark level (precomputed on every
+    /// accounting sync).
     #[must_use]
     #[inline]
     pub fn watermark_level(&self) -> WatermarkLevel {
@@ -492,23 +441,21 @@ impl Default for Scrollback {
 /// sibling loss counters ([`Scrollback::pressure_evicted_lines`]) are line
 /// counts too.
 ///
-/// Costs one `Option` discriminant test per promoted line — `Line::images` is
-/// `None` for every line of every session that never drew a picture.
+/// The one seam both [`Scrollback`] and `DiskBackedScrollback` count the image
+/// retention horizon through, so their counters mean the same thing. Counts
+/// lines, not spans, like the sibling loss counters.
 pub(crate) fn count_image_rows(lines: &[Line]) -> u64 {
     let mut rows = 0u64;
     for line in lines {
         if line.has_images() {
-            // Saturating: `lines` is one warm block (thousands at most), so the
-            // count cannot approach u64::MAX on any real path — the saturation
-            // only discharges the strict L0 gate's unconstrained-input overflow
-            // obligation.
+            // Saturating: one warm block cannot approach u64::MAX; this only
+            // discharges the strict L0 gate's overflow obligation.
             rows = rows.saturating_add(1);
         }
     }
     rows
 }
 
-// Tests for the top-level Scrollback type and integration tests.
 #[cfg(test)]
 mod tests;
 
@@ -521,12 +468,10 @@ mod decode_fuzz_tests;
 #[path = "memory_tracking_tests.rs"]
 mod memory_tracking_tests;
 
-// Tests for the ScrollbackStorage abstraction.
 #[cfg(test)]
 #[path = "storage_tests.rs"]
 mod storage_tests;
 
-// Watermark backpressure system tests (#5233).
 #[cfg(test)]
 #[path = "watermark_tests.rs"]
 mod watermark_tests;

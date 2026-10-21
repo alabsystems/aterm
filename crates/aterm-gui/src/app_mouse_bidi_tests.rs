@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A selection made with the pointer on a BiDi row highlights the cells it
-//! copies (bug hunt 9, the copy lane).
+//! A selection made with the pointer on a BiDi row highlights the cells it copies.
 //!
 //! The frame paints an RTL run reversed in place, while the selection, the
 //! copy, the word rules and find read the grid in logical order. The pointer
@@ -92,11 +91,9 @@ fn shift_click(app: &mut App, wid: WindowId, sel_row: i32, col: u16, side: Selec
     );
 }
 
-/// A sweep over the painted cells of one RTL word, in either direction,
-/// selects exactly the cells it crossed: the press anchors at the left edge of
-/// the pressed cell, so a leftward sweep leaves the pressed cell out, as it
-/// does on an LTR row. Before the fix the press anchored logical column 4 and
-/// the highlight lit the swept cells while the copy read שלום's.
+/// A sweep over the painted cells of one RTL word, in either direction, selects exactly the
+/// cells it crossed: the press anchors at the left edge of the pressed cell, so a leftward sweep
+/// leaves the pressed cell out, as on an LTR row.
 #[test]
 fn a_sweep_over_an_rtl_word_highlights_and_copies_the_same_word() {
     let (mut app, wid, term) = window_with(MIXED);
@@ -117,10 +114,8 @@ fn a_sweep_over_an_rtl_word_highlights_and_copies_the_same_word() {
     assert_eq!(copied, "\u{05D5}\u{05DC}");
 }
 
-/// A sweep that crosses from LTR text into an RTL run is one logical range,
-/// so its highlight need not be contiguous on screen, but it lights exactly
-/// the text the copy takes (the finding's `abc אבג def` sweep over cells 2..=5
-/// painted `c גב` and copied `c אב`).
+/// A sweep that crosses from LTR text into an RTL run is one logical range, so its highlight need
+/// not be contiguous on screen, but it lights exactly the text the copy takes.
 #[test]
 fn a_sweep_across_the_run_boundary_highlights_what_it_copies() {
     let (mut app, wid, term) = window_with("abc \u{05D0}\u{05D1}\u{05D2} def");
@@ -141,10 +136,9 @@ fn a_sweep_across_the_run_boundary_highlights_what_it_copies() {
     }
 }
 
-/// A double-click on a painted RTL word selects that word (the word rules
-/// run at the logical cell under the pointer), and the highlight covers its
-/// painted cells. Before the fix, a double-click on painted עולם selected and
-/// copied שלום, the word at the same LOGICAL columns.
+/// A double-click on a painted RTL word selects that word (the word rules run at the logical
+/// cell under the pointer), not the word at the same logical columns, and the highlight covers
+/// its painted cells.
 #[test]
 fn a_double_click_on_an_rtl_word_copies_that_word() {
     let (mut app, wid, term) = window_with(MIXED);
@@ -237,12 +231,9 @@ fn a_scrolled_back_rtl_row_double_clicks_and_shift_clicks_its_painted_word() {
     assert_eq!(text, OLAM);
 }
 
-/// A click that stays on its cell deselects, whichever half the release is
-/// on, on an RTL cell as on an LTR one: the press and the drag compare
-/// logical cells (`sel_press_cell` is stored logical), so jitter across the
-/// middle of the pressed RTL cell is not a drag. Storing the painted column
-/// made the drag's logical cell differ from it, and the click completed a
-/// selection.
+/// A click that stays on its cell deselects, whichever half the release is on, on an RTL cell as
+/// on an LTR one: the press and the drag compare logical cells (`sel_press_cell` is stored
+/// logical), so jitter across the middle of the pressed RTL cell is not a drag.
 #[test]
 fn a_still_click_on_an_rtl_cell_deselects_as_on_an_ltr_cell() {
     for (row, pressed) in [(MIXED, 4), ("abc hello world def", 4)] {

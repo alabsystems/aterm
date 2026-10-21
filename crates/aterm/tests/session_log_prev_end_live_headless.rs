@@ -210,7 +210,7 @@ fn a_lab_desk_reads_how_its_previous_run_ended() {
     let world = World(launch_isolation::scratch_root("atpe"));
     let root = world.path();
     assert!(
-        root.join("run/aterm/a.sock.token").as_os_str().len() < headless_boot::MAX_SOCK_PATH,
+        launch_isolation::sock_fits(&root.join("run/aterm/a.sock.token")),
         "the private root's socket fits sun_path"
     );
 

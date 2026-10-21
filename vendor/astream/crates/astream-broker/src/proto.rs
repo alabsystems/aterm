@@ -252,6 +252,18 @@ pub const RETIRE_LOG_PREFIX: &str = "log: ";
 /// that prefix retention has cut (`base > 0`).
 pub const RETIRE_CUT_PREFIX: &str = "cut: ";
 
+/// How a `Fetch` below the OLDEST offset its filter can reach is refused, word for word:
+/// an [`ERR_RECORD_REFUSED`] whose message starts `retained-from=<off>`, the offset a
+/// read of that filter can start at (`REQUIREMENTS` R4). Retention gave the records
+/// below it up — the prefix rule's cut, or a hold class past its age or bytes — so the
+/// fetch is told, never answered with a page that silently starts later. Permanent: the
+/// floor never falls, so the same fetch is refused again; a fetch from `<off>` reads on.
+/// [`BrokerRefusal::retained_from`](crate::client::BrokerRefusal::retained_from) reads
+/// it. A head query (`max = 0`) is never refused: its `Mark` says the oldest
+/// ([`Response::Mark`]'s `oldest`). A broker that predates it clamped such a fetch to
+/// its base.
+pub const RETAINED_FROM_PREFIX: &str = "retained-from=";
+
 const TAG_PUBLISH: u8 = 0x01;
 const TAG_SUBSCRIBE: u8 = 0x02;
 const TAG_FORK_SUBSCRIBE: u8 = 0x03;
@@ -663,11 +675,21 @@ pub enum Response {
     /// broker that serves [`Tier::Ordered`] (or served it at its open, and latched to
     /// Strict since), a subscriber that asked for idle marks also gets a DURABLE mark
     /// when a full flush covers records it was delivered.
+    ///
+    /// `oldest` is a second optional trailer, after `durable`: on a `Fetch`'s `Mark`, the
+    /// OLDEST offset a read of the fetch's filter can reach (`REQUIREMENTS` R4: the base,
+    /// or for what a hold rule keeps records of, the oldest it still holds of them) — a
+    /// head query (`max = 0`) is the `Head`-style query that answers `oldest=`. `None` on
+    /// every other verb's `Mark`, and from a broker that predates it. It rides only
+    /// behind `durable`: one that has no `durable` to send writes `0` there, which claims
+    /// nothing. One to seven bytes after `durable` is a frame cut short (malformed);
+    /// bytes after its eight are a later trailer, skipped.
     Mark {
         next: u64,
         head: u64,
         resume: String,
         durable: Option<u64>,
+        oldest: Option<u64>,
     },
     /// This connection's fresh nonce (32 bytes), the answer to
     /// [`Request::Hello`]. An `Attach`'s proof is `HMAC-SHA256(tag, nonce ‖ grant)`
@@ -746,14 +768,22 @@ impl PartialEq for Response {
                     head: a_h,
                     resume: a_r,
                     durable: a_d,
+                    oldest: a_o,
                 },
                 Response::Mark {
                     next: b_n,
                     head: b_h,
                     resume: b_r,
                     durable: b_d,
+                    oldest: b_o,
                 },
-            ) => *a_n == *b_n && *a_h == *b_h && a_r.as_str() == b_r.as_str() && *a_d == *b_d,
+            ) => {
+                *a_n == *b_n
+                    && *a_h == *b_h
+                    && a_r.as_str() == b_r.as_str()
+                    && *a_d == *b_d
+                    && *a_o == *b_o
+            }
             (
                 Response::Nonce {
                     nonce: a_n,
@@ -1028,6 +1058,7 @@ const fn take_ext_entry_header(b: &[u8]) -> Option<(u8, usize, &[u8])> {
 /// | 0x02 | lineage    | `n u8`, then `n × (generation u64 LE, common u64 LE)` ([`Lineage`]) |
 /// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`]) |
 /// | 0x04 | health     | `flags u8` (bit 0: poisoned), `barrier u64 LE, full u64 LE, skipped u64 LE, failed u64 LE`, `n u16 LE`, `n` bytes of the poison's reason (UTF-8); bytes after it are a later build's, skipped ([`HelloHealth`]) |
+/// | 0x05 | retention  | the rules the log is retained by, as `Retention::encode` writes them (the `retention` feature) |
 ///
 /// No request tag, no protocol version and no error code are spent on it: a broker
 /// that predates the block sends a frame that ends at the identity, which reads here
@@ -1045,6 +1076,11 @@ pub struct NonceExt {
     pub requests: Option<u64>,
     /// Tag 0x04: whether the log is poisoned, and the flushes it has issued.
     pub health: Option<HelloHealth>,
+    /// Tag 0x05: the RETENTION RULES the log is retained by (`REQUIREMENTS` R4), encoded
+    /// as `Retention::encode` writes them, so the block reads the same in a build without
+    /// the `retention` feature; `NonceExt::retention_rules` (that feature's) reads them. `None`: no rules, or a
+    /// broker that predates them.
+    pub retention: Option<Vec<u8>>,
 }
 
 /// What a broker says about its log's health in the answer to every `Hello` — the
@@ -1086,6 +1122,7 @@ const EXT_DURABILITY: u8 = 0x01;
 const EXT_LINEAGE: u8 = 0x02;
 const EXT_REQUESTS: u8 = 0x03;
 const EXT_HEALTH: u8 = 0x04;
+const EXT_RETENTION: u8 = 0x05;
 
 fn put_ext_entry(p: &mut Vec<u8>, tag: u8, body: &[u8]) {
     p.push(tag);
@@ -1178,6 +1215,24 @@ impl NonceExt {
             h.put(&mut b);
             put_ext_entry(p, EXT_HEALTH, &b);
         }
+        // An entry's length is a u16: rules that do not fit are not advertised
+        // (`Retention::new` refuses them, so none are).
+        if let Some(r) = &self.retention {
+            if r.len() <= usize::from(u16::MAX) {
+                put_ext_entry(p, EXT_RETENTION, r);
+            }
+        }
+    }
+
+    /// The retention rules this block advertises, decoded (`None`: none advertised, or
+    /// bytes that are not rules).
+    #[cfg(feature = "retention")]
+    #[must_use]
+    pub fn retention_rules(&self) -> Option<crate::Retention> {
+        match &self.retention {
+            Some(b) => crate::Retention::decode(b),
+            None => None,
+        }
     }
 
     /// Read the block from `b` (the bytes after the identity) to its end; `None` for an
@@ -1198,6 +1253,14 @@ impl NonceExt {
                     ext.requests = Some(decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7]));
                 }
                 EXT_HEALTH => ext.health = Some(HelloHealth::from_wire(body)?),
+                // Kept as sent, bounded by the entry's u16 length; a build reads it with
+                // `retention_rules`.
+                EXT_RETENTION => {
+                    if body.len() > usize::from(u16::MAX) {
+                        return None;
+                    }
+                    ext.retention = Some(body.to_vec());
+                }
                 // Unknown tags: skipped by their length.
                 _ => {}
             }
@@ -1254,11 +1317,20 @@ const fn take_identity_trailer(b: &[u8]) -> Option<(Option<LogIdentity>, &[u8])>
     Some((Some(ident), rest))
 }
 
-const fn decode_mark_durable(b: &[u8]) -> Option<Option<u64>> {
+/// A `Mark`'s optional trailers after `resume`: `durable`, then `oldest`
+/// ([`Response::Mark`]).
+const fn decode_mark_trailers(b: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
     match b {
-        [] => Some(None),
-        &[b0, b1, b2, b3, b4, b5, b6, b7, ref _rest @ ..] => {
-            Some(Some(decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7])))
+        [] => Some((None, None)),
+        &[d0, d1, d2, d3, d4, d5, d6, d7] => Some((
+            Some(decode_u64_le_bytes(&[d0, d1, d2, d3, d4, d5, d6, d7])),
+            None,
+        )),
+        &[d0, d1, d2, d3, d4, d5, d6, d7, o0, o1, o2, o3, o4, o5, o6, o7, ref _rest @ ..] => {
+            Some((
+                Some(decode_u64_le_bytes(&[d0, d1, d2, d3, d4, d5, d6, d7])),
+                Some(decode_u64_le_bytes(&[o0, o1, o2, o3, o4, o5, o6, o7])),
+            ))
         }
         _ => None,
     }
@@ -1664,12 +1736,18 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             head,
             resume,
             durable,
+            oldest,
         } => {
             p[1] = TAG_MARK;
             p.extend_from_slice(&encode_u64_le_bytes(*next));
             p.extend_from_slice(&encode_u64_le_bytes(*head));
             put_str(&mut p, resume);
-            if let Some(d) = durable {
+            // `oldest` rides behind `durable`; with none to say, `0` claims nothing.
+            if let Some(o) = oldest {
+                let d = if let Some(d) = durable { *d } else { 0 };
+                p.extend_from_slice(&encode_u64_le_bytes(d));
+                p.extend_from_slice(&encode_u64_le_bytes(*o));
+            } else if let Some(d) = durable {
                 p.extend_from_slice(&encode_u64_le_bytes(*d));
             }
         }
@@ -1961,14 +2039,16 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
             // empty `resume` means something specific ("the scan reached the end of the
             // filter's range") that a truncation must not be read as.
             let resume = r.string()?;
-            // Optional: an older broker ends the body here. One to seven bytes more is a
-            // frame cut short; anything past eight is a later trailer, skipped.
-            let durable = decode_mark_durable(r.b)?;
+            // Optional: an older broker ends the body here, or after `durable`. One to
+            // seven bytes more than either is a frame cut short; anything past `oldest`'s
+            // eight is a later trailer, skipped.
+            let (durable, oldest) = decode_mark_trailers(r.b)?;
             Some(Response::Mark {
                 next,
                 head,
                 resume,
                 durable,
+                oldest,
             })
         }
         TAG_NONCE => {
@@ -2474,6 +2554,7 @@ mod tests {
                     head: 0,
                     resume: String::new(),
                     durable: Some(0),
+                    oldest: Some(0),
                 },
             ),
             (
@@ -2574,6 +2655,7 @@ mod tests {
             head: 9,
             resume: "/f/x".to_string(),
             durable: None,
+            oldest: None,
         });
         assert_eq!(
             decode_response(&full),
@@ -2582,6 +2664,7 @@ mod tests {
                 head: 9,
                 resume: "/f/x".to_string(),
                 durable: None,
+                oldest: None,
             })
         );
         // The 18-byte prefix: version, tag, next, head, and nothing more.
@@ -2610,8 +2693,8 @@ mod tests {
     /// `Mark.durable` is an ADDITIVE trailer both ways: an older client reads a `Mark`
     /// carrying it as the same `(next, head, resume)` (it never checked where the body
     /// ends); this build reads an older broker's `Mark`, which ends at `resume`, as
-    /// `durable: None`. One to seven bytes after `resume` is a frame cut short; bytes past
-    /// the eight are a later trailer, skipped.
+    /// `durable: None`. One to seven bytes after `resume` is a frame cut short (bytes after
+    /// the eight are `oldest`'s: `a_marks_oldest_trailer_is_additive_both_ways`).
     #[test]
     fn a_marks_durable_trailer_is_additive_both_ways() {
         let with = Response::Mark {
@@ -2619,6 +2702,7 @@ mod tests {
             head: 9,
             resume: "/f/x".to_string(),
             durable: Some(7),
+            oldest: None,
         };
         let bytes = encode_response(&with);
         assert_eq!(
@@ -2643,12 +2727,69 @@ mod tests {
                 "a trailer cut {cut} bytes short is malformed"
             );
         }
+    }
+
+    /// `Mark.oldest` is ADDITIVE both ways, as `durable` is: an older client reads a `Mark`
+    /// carrying both as the same `(next, head, resume)`, and a client of the release before
+    /// `oldest` read only `durable`'s eight bytes; this build reads a `Mark` that ends after
+    /// `durable` as `oldest: None`. One to seven bytes after `durable` is a frame cut short;
+    /// bytes past `oldest`'s eight are a later trailer, skipped. An `oldest` with no
+    /// `durable` to send writes `0` before it, which claims nothing.
+    #[test]
+    fn a_marks_oldest_trailer_is_additive_both_ways() {
+        let with = Response::Mark {
+            next: 200,
+            head: 251,
+            resume: String::new(),
+            durable: Some(251),
+            oldest: Some(151),
+        };
+        let bytes = encode_response(&with);
+        assert_eq!(
+            older_client_mark(&bytes),
+            Some((200, 251, String::new())),
+            "an older client reads a new broker's Mark"
+        );
+        assert_eq!(decode_response(&bytes), Some(with.clone()));
+        let before = &bytes[..bytes.len() - 8];
+        let Some(Response::Mark {
+            durable, oldest, ..
+        }) = decode_response(before)
+        else {
+            panic!("a Mark from the release before oldest decodes")
+        };
+        assert_eq!((durable, oldest), (Some(251), None));
+        for cut in 1..8 {
+            assert_eq!(
+                decode_response(&bytes[..bytes.len() - cut]),
+                None,
+                "an oldest cut {cut} bytes short is malformed"
+            );
+        }
         let mut later = bytes.clone();
         later.extend_from_slice(&[0xAB; 5]);
         assert_eq!(
             decode_response(&later),
             Some(with),
             "a later trailer is skipped"
+        );
+        let alone = Response::Mark {
+            next: 1,
+            head: 1,
+            resume: String::new(),
+            durable: None,
+            oldest: Some(1),
+        };
+        let Some(Response::Mark {
+            durable, oldest, ..
+        }) = decode_response(&encode_response(&alone))
+        else {
+            panic!("an oldest alone decodes")
+        };
+        assert_eq!(
+            (durable, oldest),
+            (Some(0), Some(1)),
+            "durable 0 claims nothing"
         );
     }
 
@@ -2746,6 +2887,7 @@ mod tests {
                 rules: 0,
             }),
             lineage: Some(Lineage::default().step(3, 41)),
+            retention: None,
             requests: Some(REQUEST_RETIRE),
             health: None,
         };
@@ -2787,9 +2929,9 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // Unknown tag 0x05 is skipped.
+        // An unknown tag (0x06) is skipped.
         let mut unknown = full.clone();
-        unknown.extend_from_slice(&[0x05, 1, 0, 0xff]);
+        unknown.extend_from_slice(&[0x06, 1, 0, 0xff]);
         assert_eq!(
             decode_response(&unknown),
             Some(nonce(Some(ident), ext.clone()))
@@ -2802,6 +2944,18 @@ mod tests {
         let mut bad_req = plain.clone();
         bad_req.extend_from_slice(&[0x03, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(decode_response(&bad_req), None);
+        // The retention entry (0x05) is kept as sent, after the others.
+        let with_rules = NonceExt {
+            retention: Some(vec![9, 8, 7]),
+            ..ext.clone()
+        };
+        let frame = encode_response(&nonce(Some(ident), with_rules.clone()));
+        assert_eq!(frame[..full.len()], full[..], "the older block is a prefix");
+        assert_eq!(frame[full.len()..], [0x05, 3, 0, 9, 8, 7]);
+        assert_eq!(
+            decode_response(&frame),
+            Some(nonce(Some(ident), with_rules))
+        );
     }
 
     /// The block's reader as it stood in the release before the health entry (0x04),
@@ -2856,6 +3010,7 @@ mod tests {
                 durability: Some(served),
                 lineage: Some(lineage.clone()),
                 requests: None,
+                retention: None,
                 health: Some(HelloHealth {
                     poisoned: poisoned.clone(),
                     flushes: crate::store::FlushCounts {
@@ -2935,6 +3090,38 @@ mod tests {
         }
     }
 
+    /// HELLO ADVERTISES THE RULES: a block carrying a broker's retention reads back as
+    /// those rules, and one carrying none as none.
+    #[cfg(feature = "retention")]
+    #[test]
+    fn the_nonce_extension_block_advertises_the_retention_rules() {
+        let rules = crate::parse_rules(
+            "prefix age=7d bytes=256MiB /f/F/pub/*/*/ev\n\
+             hold age=7d bytes=64MiB read=/f/{2}/cur/{4}/node/inbox /f/F/in/>\n\
+             hold last /f/F/pub/*/*/presence\n\
+             default age=7d bytes=32MiB\n",
+        )
+        .unwrap();
+        let ident = LogIdentity {
+            id: [0xee; 16],
+            generation: 1,
+        };
+        let ext = NonceExt {
+            retention: Some(rules.encode()),
+            ..NonceExt::default()
+        };
+        let frame = encode_response(&Response::Nonce {
+            nonce: vec![3; 32],
+            log: Some(ident),
+            ext,
+        });
+        let Some(Response::Nonce { ext, .. }) = decode_response(&frame) else {
+            panic!("the Nonce decodes")
+        };
+        assert_eq!(ext.retention_rules(), Some(rules));
+        assert_eq!(NonceExt::default().retention_rules(), None);
+    }
+
     /// THE HORIZON TELLS NO BOUND FROM A FLUSH AFTER EVERY BATCH. An Ordered broker with
     /// no horizon (a power loss can take every batch since the last escalation) and one
     /// with a zero horizon (a full flush after every batch) are opposite promises, and
@@ -2960,6 +3147,7 @@ mod tests {
                     rules: 1,
                 }),
                 lineage: None,
+                retention: None,
                 requests: None,
                 health: None,
             };
@@ -3051,6 +3239,7 @@ mod tests {
             head: 2,
             resume: String::new(),
             durable: None,
+            oldest: None,
         };
         assert_eq!(
             foreign_protocol(&stamped(&malformed, PROTO_VERSION - 1)),

@@ -353,8 +353,6 @@ fn gpu_matches_cpu_mixed_dpi_activate_px() {
         "2× window must have a larger cell box"
     );
 
-    // Draw window A (already active), then switch to B, back to A, to B — the
-    // exact thrash two continuously-animating mixed-DPI windows produce.
     let mut check_parity = |cpu: &mut Renderer, gpu: &mut aterm_gpu::GpuRenderer, tag: &str| {
         let cpu_frame = cpu.render_input(&input);
         let gpu_frame = gpu.render_input(&mut win, &input, None);
@@ -882,7 +880,6 @@ fn reused_renderer_across_dims_matches_fresh_render() {
 \u{2764}\u{fe0f} e\u{0301} \u{1b}[4;9mUu\u{1b}[0m"
         .as_bytes();
 
-    // Grow, shrink, grow, and repeat an earlier dimension.
     let dims: &[(usize, usize)] = &[(6, 16), (24, 80), (3, 8), (24, 80), (12, 40), (6, 16)];
 
     for (i, &(rows, cols)) in dims.iter().enumerate() {
@@ -1163,7 +1160,7 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
         input
     };
     let mut input_blank = input_at(b"\x1b[1;6H");
-    // Frame B: the SAME grid with the cursor ON the 'A' glyph — the
+    // Frame B: the same grid with the cursor on the 'A' glyph — the
     // translucent-cursor-over-text case (glyph shows through on both paths).
     let mut input_glyph = input_at(b"\x1b[1;2H");
     // The pane's OSC-11 provenance differs from the frame scalar; the opacity
@@ -1196,7 +1193,7 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
         "GPU: opacity 1.0 must be byte-identical to the default"
     );
 
-    // Both opacities active, cursor over a glyph: per-channel parity INCLUDING
+    // Both opacities active, cursor over a glyph: per-channel parity including
     // the alpha channel (top byte = transmittance on both paths).
     cpu.set_background_opacity(0.5);
     cpu.set_cursor_opacity(0.5);
@@ -1344,7 +1341,7 @@ fn ink_gpu_matches_cpu() {
             row: 1,
             col: 0,
             color: ink,
-        }, // 猫's LEAD cell
+        }, // 猫's lead cell
         InkCell {
             row: 2,
             col: 0,
@@ -1353,7 +1350,7 @@ fn ink_gpu_matches_cpu() {
     ];
 
     // The same text recoloured via SGR truecolor fg (rows 0-1); row 2's SGR 58
-    // underline keeps its explicit colour, so it is NOT recoloured.
+    // underline keeps its explicit colour, so it is not recoloured.
     let mut term_b = Terminal::new(rows as u16, cols as u16);
     term_b.process(
         "\x1b[?25l\x1b[38;2;124;200;255me\u{0301}\x1b[39m \x1b[38;2;124;200;255m\x1b[4mx\x1b[24m\
@@ -1418,7 +1415,7 @@ fn ink_selection_and_decdwl_gpu_match_cpu() {
         sel.complete_selection();
     }
     let mut input = term.cell_frame(rows, cols);
-    // Ink chosen near the selection band colour so the selection floor MUST
+    // Ink chosen near the selection band colour so the selection floor must
     // move it — pinning the ink→selection-floor order on both backends.
     let ink: [u8; 3] = [0x33, 0x41, 0x5E];
     input.ink = vec![
@@ -1508,7 +1505,7 @@ fn per_pane_selection_colours_gpu_match_cpu() {
             false,
         ),
         // Unfocused pane: no live colour at all, so it takes the theme policy —
-        // and, being unfocused, its INACTIVE derivation.
+        // and, being unfocused, its inactive derivation.
         pane(
             9,
             16,
@@ -1626,7 +1623,7 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
             "dims stable across frac and backend"
         );
 
-        // (1) CPU == GPU for the TRANSLATED frame, within the standard tolerance.
+        // (1) CPU == GPU for the translated frame, within the standard tolerance.
         let delta = max_channel_delta(&cpu_f, &gpu_f);
         assert!(
             delta <= 8,
@@ -1726,7 +1723,7 @@ fn incoming_row_apron_gpu_matches_cpu() {
     }
 }
 
-/// One cell's TOP pixel row — where `overline_rect` anchors its band.
+/// One cell's top pixel row, where `overline_rect` anchors its band.
 fn top_row(f: &Frame, cw: usize, col: usize) -> Vec<u32> {
     let x0 = col * cw;
     f.pixels[x0..(x0 + cw).min(f.width)].to_vec()
@@ -1888,12 +1885,10 @@ fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
     );
 }
 
-/// A SEAMED CHROME BLEED WHOSE LAST ROW CARRIES AN EDGE-TO-EDGE RAIL, ON BOTH
-/// BACKENDS: the rail covers the gutters (`chrome_rail_covers_gutters`), so
-/// neither backend draws the bleed's own seam segment there (a second line
-/// two pixels above the rail). Every padding pixel is exactly equal across the
-/// arms, the rail's colour is in the gutters' lowest pixel row, and the pixel
-/// row above it is the band's ground - no seam colour in the gutters at all.
+/// A seamed chrome bleed whose last row carries an edge-to-edge rail: the rail
+/// covers the gutters (`chrome_rail_covers_gutters`), so neither backend draws
+/// the bleed's own seam segment there. Padding pixels match exactly, the
+/// gutters' lowest pixel row is the rail and the row above it the band's ground.
 #[test]
 fn gpu_matches_cpu_with_a_seamed_bleed_under_an_edge_to_edge_rail() {
     let theme = Theme::default();
@@ -1951,13 +1946,12 @@ fn gpu_matches_cpu_with_a_seamed_bleed_under_an_edge_to_edge_rail() {
     }
 }
 
-/// THE PIXEL-RESOLUTION CHROME ROW ON BOTH BACKENDS (design ruling 242):
-/// one chrome row carrying a `ChromeRaster` — a per-pixel ground over its
-/// band and gutters, a rail in its lowest pixels, a cell left to its own
-/// background, and an ink split through one glyph — paints the SAME ground
-/// and rail pixels on the GPU as on the CPU (both place the runs of the one
-/// shared builder, `aterm_render::visit_chrome_raster_runs`), and its glyphs stay
-/// within the usual glyph tolerance, the split one included.
+/// A chrome row carrying a `ChromeRaster` (a per-pixel ground over its band and
+/// gutters, a rail in its lowest pixels, a cell left to its own background, an
+/// ink split through one glyph) paints the same ground and rail pixels on both
+/// backends, which place the runs of one shared builder
+/// (`aterm_render::visit_chrome_raster_runs`); glyphs, the split one included,
+/// stay within the glyph tolerance.
 #[test]
 fn gpu_matches_cpu_with_a_chrome_raster() {
     let theme = Theme::default();
@@ -2177,7 +2171,7 @@ fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
                 ring: RING,
                 inner: INNER,
                 // As on a band's last row: the ring draws the seam across
-                // its end cells (ruling 254).
+                // its end cells.
                 seam: Some(0x00A0_A2A8),
             }]
         } else {
@@ -2195,8 +2189,8 @@ fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
     input.chrome_rasters.push(with_icons(0, true));
     input.chrome_rasters.push(with_icons(1, false));
     input.chrome_rasters.push(with_icons(2, false));
-    // The capsule's floor is its cells' underline in the ring's colour
-    // (ruling 254), as the band stamps it.
+    // The capsule's floor is its cells' underline in the ring's colour, as the
+    // band stamps it.
     let floor_cols = aterm_render::chrome_ring_floor_cols(&input.chrome_rasters[0].rings[0]);
     let blank = aterm_core::terminal::RenderCell {
         bg: [0x30, 0x31, 0x35],

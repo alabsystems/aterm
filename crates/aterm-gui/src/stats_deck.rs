@@ -41,20 +41,30 @@
 //! A new snapshot re-lays the prims; positions are whole device pixels, so a
 //! frame is presented only when a drawn pixel moves (`WindowState::deck_memo`).
 
-use aterm_vitals::Motion;
+use std::sync::Arc;
+
+use aterm_render::font::Font;
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
-use aterm_vitals::model::{CpuView, GpuView, ScopeView, Snapshot, TabView};
-use aterm_vitals::trend::TrendView;
-use aterm_vitals::words;
+use aterm_vitals::model::{DiskLevel, HeatCell, Resource, ResourceView, ScopeFig, Snapshot, State};
+use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform, ScopeForms};
 
-use crate::stats_paint::{
-    Bar, Clause, Hit, Instrument, Mark, Painter, StatsMark, WellMark, a, panel,
+use crate::stats_paint::{Bar, Hit, Instrument, Painter, Rect, StatsMark, WellMark, panel};
+use crate::stats_plan::{
+    self as plan, BlockKind, BlockPlan, Cluster, Col, CoresAt, CoresMode, DeckForm, DeckSizePref,
+    FaceMetrics, FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem, Label, Rows, StateLabel,
+    Strip,
 };
-use crate::widget::{DrawPrim, rgba};
+use crate::type_scale::TypeStep;
+use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 
-/// The Deck's height in points: three 16 pt bars, 3 pt apart, 4 pt margins
-/// (124 device px at 2×, §12.2).
-pub(crate) const DECK_PT: f64 = 62.0;
+/// The Folded deck's height in points (124 device px at 2×, 62 at 1×):
+/// two blocks of four rows (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §2.1).
+pub(crate) const FOLDED_PT: f64 = 62.0;
+
+/// The Full table's height in points before what it adds to the Folded
+/// height is rounded up to whole terminal cells
+/// ([`crate::stats_plan::full_delta_px`], §2.1).
+pub(crate) const FULL_TABLE_PT: f64 = 100.0;
 
 /// Which form the stats bars take (`[sys] stats_bars`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -123,24 +133,42 @@ impl StatsBars {
     }
 }
 
-/// The Deck's height in device pixels at `scale`, or 0 when the Deck is not
-/// the form (the sill and off take no headroom).
-pub(crate) fn deck_px(form: StatsBars, scale: f64) -> usize {
-    match form {
-        f if f.takes_room() && scale.is_finite() && scale > 0.0 => {
-            (DECK_PT * scale).round() as usize
-        }
-        _ => 0,
+/// The Deck's height in device pixels at `scale` in the window's form
+/// `deck`, or 0 when the Deck is not the stats bars' form (the sill and off
+/// take no headroom). Full is the Folded height plus Δ, whole cells of
+/// `cell_px` (the window's own cell height), so a change of form moves the
+/// grid by whole rows (§2.1).
+pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usize) -> usize {
+    if !(form.takes_room() && scale.is_finite() && scale > 0.0) {
+        return 0;
+    }
+    let folded = (FOLDED_PT * scale).round() as usize;
+    match deck {
+        DeckForm::Folded => folded,
+        DeckForm::Full => folded + crate::stats_plan::full_delta_px(scale, cell_px),
     }
 }
 
 /// An attached window's chrome headroom in device pixels: the titlebar band
 /// (`head_pts`, measured from AppKit or the synthetic strip band) plus the
-/// Deck. Every site that derives `MetricsView::head` for a window with glass
-/// goes through here, so the Deck is counted by the grid fit, the frame size
-/// and the pointer map alike; `head_pts` keeps only the titlebar's part.
-pub(crate) fn chrome_head_px(head_pts: f64, scale: f64, form: StatsBars) -> usize {
-    (head_pts * scale).round().max(0.0) as usize + deck_px(form, scale)
+/// Deck in the window's form `deck` at its cell height `cell_px`. Every site
+/// that derives `MetricsView::head` for a window with glass goes through
+/// here ([`crate::App::deck_head_px`]), so the Deck is counted by the grid
+/// fit, the frame size and the pointer map alike; `head_pts` keeps only the
+/// titlebar's part.
+pub(crate) fn chrome_head_px(
+    head_pts: f64,
+    scale: f64,
+    form: StatsBars,
+    deck: DeckForm,
+    cell_px: usize,
+) -> usize {
+    band_px(head_pts, scale) + deck_px(form, deck, scale, cell_px)
+}
+
+/// The titlebar band's part of the head in device pixels.
+fn band_px(head_pts: f64, scale: f64) -> usize {
+    (head_pts * scale).round().max(0.0) as usize
 }
 
 /// Headless stats seam (development only, [`aterm_types::dev_seam!`]):
@@ -211,10 +239,57 @@ impl crate::App {
         self.config.stats_bars_or_default()
     }
 
+    /// The deck's size setting from the live config (`[sys] stats_deck_size`).
+    pub(crate) fn deck_size_pref(&self) -> DeckSizePref {
+        self.config.stats_deck_size_or_default()
+    }
+
+    /// Window `wid`'s chrome head in device pixels for a `head_pts` titlebar
+    /// band at `scale`: the band plus the Deck in the window's form, at the
+    /// window's own cell height ([`chrome_head_px`]).
+    ///
+    /// The form is re-decided here and nowhere else, from `frame_h_px`, the
+    /// window's frame height in device pixels: [`crate::stats_plan::deck_form_for`]
+    /// on the avail under the Folded deck, from the form the window had
+    /// (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §2.2). The callers are the
+    /// window events that re-derive the head: the macOS resize, the synthetic
+    /// strip, the metrics refresh (a font change, a zoom, a reload) and the
+    /// attach, which passes the window's carried frame or, for a new window,
+    /// the frame it would have under the Folded deck. No reading reaches it,
+    /// so the deck's height never moves with data, and a change of form is a
+    /// change of head that the grid fit those events run next books as their
+    /// one re-grid. A frame of 0 keeps the form: a window not sized yet, and
+    /// the scale change, whose frame is still the old scale's.
+    pub(crate) fn deck_head_px(
+        &mut self,
+        wid: crate::WindowId,
+        head_pts: f64,
+        scale: f64,
+        frame_h_px: u32,
+    ) -> usize {
+        let form = self.stats_bars_form();
+        let pref = self.deck_size_pref();
+        let (_, cell_px) = self.win_cell_size(wid);
+        let deck = match self.windows.get_mut(&wid) {
+            Some(ws) => {
+                if frame_h_px > 0 {
+                    let titlebar = band_px(head_pts, scale) as f64;
+                    let avail = crate::stats_plan::avail_pt(f64::from(frame_h_px), titlebar, scale);
+                    ws.deck_form = crate::stats_plan::deck_form_for(avail, ws.deck_form, pref);
+                }
+                ws.deck_form
+            }
+            None => DeckForm::Folded,
+        };
+        chrome_head_px(head_pts, scale, form, deck, cell_px)
+    }
+
     /// The Deck's height in window `wid`'s head when it draws there
-    /// ([`Self::deck_frame`]'s Deck): 0 under the sill or off, on a window
-    /// that draws no bars, or one whose head cannot hold it.
-    pub(crate) fn deck_head_px(&self, wid: crate::WindowId) -> usize {
+    /// ([`Self::deck_frame`]'s Deck), in the window's own form and at its own
+    /// cell height, as the head sites count it ([`Self::deck_head_px`]): 0
+    /// under the sill or off, on a window that draws no bars, or one whose
+    /// head cannot hold it.
+    pub(crate) fn deck_drawn_px(&self, wid: crate::WindowId) -> usize {
         let form = self.stats_bars_form();
         let Some(ws) = self.windows.get(&wid) else {
             return 0;
@@ -222,14 +297,15 @@ impl crate::App {
         if ws.cols == 0 || !stats_drawn_on(ws) {
             return 0;
         }
-        match deck_px(form, ws.scale) {
+        let (_, ch) = self.win_cell_size(wid);
+        match deck_px(form, ws.deck_form, ws.scale, ch) {
             deck if deck > 0 && ws.metrics.head >= deck => deck,
             _ => 0,
         }
     }
 
     /// The Deck's rows in window `wid`'s frame, `[top, bottom)` device px,
-    /// while it draws in the head ([`Self::deck_head_px`]). Under macOS's
+    /// while it draws in the head ([`Self::deck_drawn_px`]). Under macOS's
     /// titlebar it ends where the grid's top pad starts. Where the strip is
     /// the window's band (Linux, Windows), the band is the head's synthetic
     /// part, the top pad and the strip's own rows, which the grid's first row
@@ -239,7 +315,7 @@ impl crate::App {
     /// over the band's middle, where the band centres its cards (the lane's
     /// `proof-20261019-174123`).
     pub(crate) fn deck_rows_px(&self, wid: crate::WindowId) -> Option<std::ops::Range<usize>> {
-        let deck = self.deck_head_px(wid);
+        let deck = self.deck_drawn_px(wid);
         if deck == 0 {
             return None;
         }
@@ -261,7 +337,7 @@ impl crate::App {
     pub(crate) fn strip_band_top_px(&self, wid: crate::WindowId) -> usize {
         let top = self.win_pad_top(wid) + self.win_head(wid);
         if crate::tab_bar::STRIP_IS_CHROME_BAND {
-            top.saturating_sub(self.deck_head_px(wid))
+            top.saturating_sub(self.deck_drawn_px(wid))
         } else {
             top
         }
@@ -299,8 +375,6 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) tab_count: usize,
     /// Inks for the ground.
     pub(crate) inks: VitalsInks,
-    /// A hairline between the Deck and the grid.
-    pub(crate) seam: Rgb,
     /// Differentiate Without Color (System Settings ▸ Accessibility).
     pub(crate) dwc: bool,
     /// The instance's deviations, worst first (⊘ > ☠ > ◔ > ◇ > stopped).
@@ -310,683 +384,1795 @@ pub(crate) struct DeckInput<'a> {
     /// or opaque under Reduce Transparency (§12.2 "Plate"). `None` on an
     /// opaque floor and for the Deck, whose band is opaque.
     pub(crate) plate: Option<u8>,
+    /// The Deck's form for the window (Stats Deck v2 §2).
+    pub(crate) form: DeckForm,
+    /// Increase Contrast (System Settings ▸ Accessibility; §9.5).
+    pub(crate) contrast: bool,
+    /// Whose wording and which clock the words say times on.
+    pub(crate) locale: Locale,
 }
 
-/// The bars' label, figures and words for one scope row.
-struct Row<'a> {
-    bar: Bar,
+// ---------------------------------------------------------------------
+// THE HEAT TABLE (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §3, §4, §6, §9,
+// §10, §11.1–§11.2): the rows' words are read once from the snapshot
+// ([`DeckWords`]), then laid on the planner's columns for the deck's width
+// and drawn in the deck's form.
+
+/// A glyph's ink above the baseline, per em: the box T-G4 checks.
+pub(crate) const ASCENT_EM: f64 = 0.76;
+/// A descender's depth below the baseline, per em (§3.1: "descent ≈ 2 pt"
+/// at 9.5 pt).
+pub(crate) const DESCENT_EM: f64 = 0.22;
+/// The header line's baseline, Full (§3.5) and Folded (§4.2).
+const HEADER_BASE_FULL: f64 = 11.5;
+const HEADER_BASE_FOLDED: f64 = 9.5;
+/// Where the header's hit region ends: Full's row 0 starts its hit at
+/// 16 − 1.5 (§11.1), Folded's at 12.5 (§11.2).
+const HEADER_HIT_FULL: f64 = 14.5;
+const HEADER_HIT_FOLDED: f64 = 12.5;
+/// Where the per-minute gridlines start (§3.1, §4.1).
+const GRID_FROM_FULL: f64 = 14.5;
+const GRID_FROM_FOLDED: f64 = 12.5;
+/// The header's, the key's, Details' and a spanning phrase's size (§3.1).
+const SMALL_PT: f64 = 9.5;
+/// A mark's advance, per em (§10).
+const MARK_EM: f64 = 1.1;
+/// The gap between an amount and its state words (rule S).
+const STATE_GAP: f64 = 6.0;
+/// The strips' cell periods, seconds (§5.5): 60 × 10 s, 30 × 20 s and
+/// 20 × 30 s.
+const STRIP_PERIODS: [u32; 3] = [10, 20, 30];
+
+/// The chrome face's advances the deck measures with: the UI faces the
+/// rasterizer draws `TextFace::Ui` and `UiBold` in, or the pen's 0.6 em
+/// placeholder while none is installed (as in headless tests). Kept while
+/// the installed faces are the same ones.
+pub(crate) fn deck_metrics() -> Arc<FaceMetrics> {
+    type Held = (Option<Arc<Font>>, Option<Arc<Font>>, Arc<FaceMetrics>);
+    thread_local! {
+        static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+    }
+    let regular = crate::tray_raster::ui_font_of(TextFace::Ui);
+    let bold = crate::tray_raster::ui_font_of(TextFace::UiBold);
+    let same = |a: &Option<Arc<Font>>, b: &Option<Arc<Font>>| match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if let Some((r, b, m)) = held.as_ref()
+            && same(r, &regular)
+            && same(b, &bold)
+        {
+            return Arc::clone(m);
+        }
+        let metrics = Arc::new(match (&regular, &bold) {
+            (Some(r), Some(b)) => FaceMetrics::of_faces(r, b),
+            _ => FaceMetrics::placeholder(),
+        });
+        *held = Some((regular, bold, Arc::clone(&metrics)));
+        metrics
+    })
+}
+
+/// A text and its advance at 1 pt in the deck's face, regular and bold:
+/// measured once, so fitting it at any size is arithmetic.
+#[derive(Clone, Debug, PartialEq)]
+struct Txt {
+    s: String,
+    em: [f64; 2],
+}
+
+impl Txt {
+    fn new(s: impl Into<String>, m: &FaceMetrics) -> Self {
+        let s = s.into();
+        let em = [m.width(&s, 1.0, false), m.width(&s, 1.0, true)];
+        Self { s, em }
+    }
+
+    fn w(&self, pt: f64, bold: bool) -> f64 {
+        self.em[usize::from(bold)] * pt
+    }
+}
+
+fn txts(forms: impl IntoIterator<Item = String>, m: &FaceMetrics) -> Vec<Txt> {
+    forms.into_iter().map(|s| Txt::new(s, m)).collect()
+}
+
+/// Rule F (§6.0): the first form whose advance fits `room`, else the last
+/// form cut with "…".
+fn fit(forms: &[Txt], room: f64, pt: f64, bold: bool, m: &FaceMetrics) -> String {
+    if let Some(t) = forms.iter().find(|t| t.w(pt, bold) <= room + 0.01) {
+        return t.s.clone();
+    }
+    forms
+        .last()
+        .map_or_else(String::new, |last| m.fit(&[&last.s], room, pt, bold))
+}
+
+/// The scope bar's segments as shares of the row's capacity (§6), each
+/// `0..=1`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarFill {
+    /// The machine's; none on Tokens, which has no Global figure (§6.6).
+    global: Option<f32>,
+    aterm: Option<f32>,
+    tab: Option<f32>,
+    /// CPU's cores, a tick gap between each where they are 3 pt apart.
+    ticks: Option<u32>,
+    /// Disk's warn line, `1 − warn/total`, and whether the level is past it.
+    warn_tick: Option<(f32, bool)>,
+}
+
+/// A row's state for where Details is absent (rule S) and for the fslim
+/// header (§4.4).
+#[derive(Clone, Debug, PartialEq)]
+struct StateTxt {
+    state: State,
+    clauses: Vec<Txt>,
+    word: Txt,
+    amounts: Vec<Txt>,
     label: String,
-    scope: Option<&'a ScopeView>,
-    cpu_ink: Rgb,
-    mem_ink: Rgb,
-    cpu_fig: String,
-    mem_fig: String,
-    clauses: Vec<Clause>,
+    mark: WellMark,
+    ink: InkKind,
 }
 
-/// Lay the Deck out and paint it. Pure: the same input gives the same prims,
-/// at whole device pixels.
+/// A row's aterm and Tab cells (§6).
+#[derive(Clone, Debug, PartialEq)]
+enum ScopeTxt {
+    /// None drawn (the GPU with no reading).
+    None,
+    /// A cell in each column.
+    Each {
+        aterm: (Vec<Txt>, InkKind),
+        tab: (Vec<Txt>, InkKind),
+    },
+    /// One phrase across both.
+    Span(Vec<Txt>, InkKind),
+}
+
+/// One Details clause (rule D).
+#[derive(Clone, Debug, PartialEq)]
+struct ClauseTxt {
+    forms: Vec<Txt>,
+    prio: u8,
+    keep: bool,
+    mark: Option<WellMark>,
+    ink: InkKind,
+}
+
+/// Everything one row draws, read from the snapshot.
+#[derive(Clone, Debug, PartialEq)]
+struct RowWords {
+    res: Resource,
+    name: Txt,
+    well: Option<(WellMark, InkKind)>,
+    heat_now: Option<f32>,
+    pct: Txt,
+    /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
+    /// forms, longest first (rule F).
+    strip_text: Option<Vec<Txt>>,
+    /// The strip's columns at each of [`STRIP_PERIODS`].
+    cols: [Vec<HeatCell>; 3],
+    bar: Option<BarFill>,
+    /// The amount's forms on each ladder: Det (with the compact forms that
+    /// repeat no Details figure after them), Cols, NoCols.
+    amount: [Vec<Txt>; 3],
+    state: Option<StateTxt>,
+    scope: ScopeTxt,
+    details: Vec<ClauseTxt>,
+}
+
+/// One cluster of cores, fastest first.
+#[derive(Clone, Debug, PartialEq)]
+struct CoreCluster {
+    /// The OS's name; none where it names none (Linux's one "CPU").
+    name: Option<String>,
+    /// Each core's fast-average busy fraction; `None` when unreadable.
+    heat: Vec<Option<f32>>,
+}
+
+/// The deck's words for one snapshot: what every row says, measured in the
+/// deck's face. The layout reads them at any width.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DeckWords {
+    rows: Vec<RowWords>,
+    cores: Vec<CoreCluster>,
+    /// No snapshot yet: the rows say they are reading, and nothing is a hit.
+    reading: bool,
+}
+
+impl DeckWords {
+    /// `input`'s snapshot in words, measured with `m`.
+    pub(crate) fn new(input: &DeckInput<'_>, m: &FaceMetrics) -> Self {
+        let Some(snap) = input.snap else {
+            return Self::reading(m);
+        };
+        let rows = Resource::ALL
+            .iter()
+            .map(|&res| RowWords::new(res, snap, input.tab_key, &input.locale, m))
+            .collect();
+        let cores = snap
+            .cpu
+            .as_ref()
+            .map(|cpu| {
+                cpu.clusters
+                    .iter()
+                    .map(|c| CoreCluster {
+                        name: (c.name != "CPU").then(|| c.name.clone()),
+                        heat: c
+                            .cores
+                            .iter()
+                            .map(|&i| {
+                                cpu.cores
+                                    .get(i)
+                                    .map(|core| core.load.level)
+                                    .filter(|v| v.is_finite())
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            rows,
+            cores,
+            reading: false,
+        }
+    }
+
+    /// Before the first snapshot: each row's name and "reading…" where its
+    /// strip goes.
+    fn reading(m: &FaceMetrics) -> Self {
+        let rows = Resource::ALL
+            .iter()
+            .map(|&res| RowWords {
+                res,
+                name: Txt::new(words::resource_name(res), m),
+                well: None,
+                heat_now: None,
+                pct: Txt::new(words::pct(None), m),
+                strip_text: Some(vec![Txt::new("reading\u{2026}", m)]),
+                cols: [Vec::new(), Vec::new(), Vec::new()],
+                bar: None,
+                amount: [Vec::new(), Vec::new(), Vec::new()],
+                state: None,
+                scope: ScopeTxt::None,
+                details: Vec::new(),
+            })
+            .collect();
+        Self {
+            rows,
+            cores: Vec::new(),
+            reading: true,
+        }
+    }
+
+    /// The clusters as the planner counts them.
+    fn clusters(&self) -> Vec<Cluster<'_>> {
+        self.cores
+            .iter()
+            .map(|c| Cluster {
+                count: c.heat.len(),
+                name: c.name.as_deref(),
+            })
+            .collect()
+    }
+}
+
+impl RowWords {
+    fn new(
+        res: Resource,
+        snap: &Snapshot,
+        tab_key: Option<u64>,
+        loc: &Locale,
+        m: &FaceMetrics,
+    ) -> Self {
+        let view = snap.resource(res, tab_key);
+        let facts = &snap.facts;
+        let forms = |ladder| words::amount_forms(res, &view, facts, ladder, loc);
+        let mut det = forms(Ladder::Det);
+        let cols = forms(Ladder::Cols);
+        // With Details showing the amount never repeats its freed figure,
+        // but keeps every shorter form to fall back on (§6.0).
+        for f in &cols {
+            if !f.contains("freed") && !det.contains(f) {
+                det.push(f.clone());
+            }
+        }
+        let strip_text = words::strip_words(res, snap).map(|forms| txts(forms, m));
+        let unread_gpu = res == Resource::Gpu && view.now.is_none();
+        let scope = if unread_gpu {
+            ScopeTxt::None
+        } else {
+            match words::scope_forms(res, &view, loc) {
+                ScopeForms::Each { aterm, tab } => ScopeTxt::Each {
+                    aterm: (txts(aterm.forms, m), aterm.ink),
+                    tab: (txts(tab.forms, m), tab.ink),
+                },
+                ScopeForms::Span(cell) => ScopeTxt::Span(txts(cell.forms, m), cell.ink),
+            }
+        };
+        let state = words::state(res, snap, loc).map(|st| StateTxt {
+            state: st.state,
+            clauses: txts(st.clauses, m),
+            word: Txt::new(st.word, m),
+            amounts: txts(st.amount_forms, m),
+            label: st.label,
+            mark: WellMark::of(st.mark),
+            ink: st.ink,
+        });
+        let details = words::details(res, snap, loc)
+            .into_iter()
+            .map(|c| ClauseTxt {
+                forms: txts(c.forms, m),
+                prio: c.prio,
+                keep: c.keep,
+                mark: c.mark.map(WellMark::of),
+                ink: c.ink,
+            })
+            .collect();
+        Self {
+            res,
+            name: Txt::new(words::resource_name(res), m),
+            well: words::well(res, &view).map(|(mark, ink)| (WellMark::of(mark), ink)),
+            heat_now: view.heat_now.filter(|h| !h.is_nan()),
+            pct: Txt::new(words::pct(view.heat_now), m),
+            strip_text,
+            cols: STRIP_PERIODS
+                .map(|per| view.heat_columns(per, (600 / per) as usize, snap.at_unix_ms)),
+            bar: bar_fill(res, &view, snap),
+            amount: [txts(det, m), txts(cols, m), txts(forms(Ladder::NoCols), m)],
+            state,
+            scope,
+            details,
+        }
+    }
+}
+
+/// The scope bar's segments for `res` (§6): Global, aterm and Tab where
+/// the scopes count in the row's unit (CPU, Memory, Processes; Tokens
+/// without Global), the machine's alone where they do not.
+fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot) -> Option<BarFill> {
+    let cap = view.binding().capacity;
+    let share = |fig: &ScopeFig| -> Option<f32> {
+        let (v, c) = (fig.now?, cap?);
+        (c > 0.0).then(|| (v / c).clamp(0.0, 1.0) as f32)
+    };
+    let machine = view.heat_now.filter(|h| !h.is_nan()).map(|h| h.min(1.0));
+    let (global, scoped) = match res {
+        Resource::Cpu | Resource::Memory | Resource::Processes => (machine, true),
+        Resource::Gpu | Resource::Disk | Resource::Network => (machine, false),
+        Resource::Tokens => (None, true),
+    };
+    let aterm = if scoped { share(&view.aterm) } else { None };
+    let tab = if scoped { share(&view.tab) } else { None };
+    if global.is_none() && aterm.is_none() {
+        return None;
+    }
+    let ticks = (res == Resource::Cpu)
+        .then(|| view.capacity.map(|c| c.round() as u32))
+        .flatten();
+    let warn_tick = (res == Resource::Disk)
+        .then(|| {
+            let d = snap.facts.disk.as_ref().filter(|d| d.watch)?;
+            let total = view.capacity.filter(|&t| t > 0.0)?;
+            let at = (1.0 - d.warn? as f64 / total).clamp(0.0, 1.0) as f32;
+            Some((at, d.level.is_some_and(|l| l != DiskLevel::Ok)))
+        })
+        .flatten();
+    Some(BarFill {
+        global,
+        aterm,
+        tab,
+        ticks,
+        warn_tick,
+    })
+}
+
+/// The index into [`RowWords::cols`] of a strip's period.
+fn period_ix(strip: &Strip) -> usize {
+    STRIP_PERIODS
+        .iter()
+        .position(|&p| p == strip.period_s)
+        .unwrap_or(0)
+}
+
+/// Which amount ladder a table draws (§6.0 "Amount ladders").
+fn ladder_ix(details: bool, cols: bool) -> usize {
+    match (details, cols) {
+        (true, _) => 0,
+        (false, true) => 1,
+        (false, false) => 2,
+    }
+}
+
+/// What T-G4 records of a drawn deck: one text, mark or region, in points.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Boxed {
+    pub(crate) kind: BoxKind,
+    pub(crate) text: String,
+    /// `x0, y0, x1, y1`.
+    pub(crate) r: [f64; 4],
+    /// The column a text must stay inside, where it has one.
+    pub(crate) room: Option<(f64, f64)>,
+}
+
+/// What a recorded box is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxKind {
+    Text,
+    Mark,
+    /// A strip's cells and their over caps' room.
+    Strip,
+    Bar,
+    /// Disk's warn line, past the bar's top and bottom.
+    Tick,
+    /// A header swatch or a key item's cell or ramp.
+    Swatch,
+    /// A cluster's squares.
+    Core,
+}
+
+/// One table's columns: the Full plan's, or one Folded block's.
+#[derive(Clone, Copy, Debug)]
+struct Table {
+    rows: Rows,
+    name: Col,
+    well: Col,
+    strip: Strip,
+    pct: Option<Col>,
+    bar: Option<Col>,
+    amount: Option<Col>,
+    aterm: Option<Col>,
+    tab: Option<Col>,
+    details: Option<Col>,
+    /// The well mark's size.
+    mark_pt: f64,
+    /// Where a row's hit region ends.
+    end: f64,
+}
+
+impl Table {
+    fn of_full(p: &FullPlan) -> Self {
+        let end = [p.pct, p.bar, p.amount, p.aterm, p.tab, p.details]
+            .into_iter()
+            .flatten()
+            .map(Col::end)
+            .fold(p.strip.end(), f64::max);
+        Self {
+            rows: p.rows,
+            name: p.name,
+            well: p.well,
+            strip: p.strip,
+            pct: p.pct,
+            bar: p.bar,
+            amount: p.amount,
+            aterm: p.aterm,
+            tab: p.tab,
+            details: p.details,
+            mark_pt: match p.kind {
+                FullKind::Wide | FullKind::Mid => 10.0,
+                FullKind::Narrow | FullKind::Slim => 9.5,
+            },
+            end,
+        }
+    }
+
+    fn of_block(b: &BlockPlan) -> Self {
+        Self {
+            rows: b.rows,
+            name: b.name,
+            well: b.well,
+            strip: b.strip,
+            pct: b.pct,
+            bar: b.bar,
+            amount: b.amount,
+            aterm: b.aterm,
+            tab: b.tab,
+            details: b.details,
+            mark_pt: match b.kind {
+                BlockKind::Wide | BlockKind::Mid => 9.5,
+                BlockKind::Narrow | BlockKind::Slim => 8.5,
+            },
+            end: b.at.end(),
+        }
+    }
+
+    /// Row `r`'s hit band: its cell, and half the gap to each neighbour
+    /// (§11.1, §11.2).
+    fn band(&self, r: u32) -> (f64, f64) {
+        let gap = self.rows.pitch - self.rows.cell;
+        let top = self.rows.top(r);
+        (top - gap / 2.0, top + self.rows.cell + gap / 2.0)
+    }
+
+    fn ladder(&self) -> usize {
+        ladder_ix(self.details.is_some(), self.aterm.is_some())
+    }
+}
+
+/// An fslim block's state for its header (§4.4).
+struct HeadState<'w> {
+    /// The block's name x, where the planner put its label.
+    x: f64,
+    res: Resource,
+    st: &'w StateTxt,
+    full: String,
+}
+
+/// A state's ink: the mark's ink its words take in the deck's rows and the
+/// lens's answer line (§9.3).
+pub(crate) fn kind_ink(i: &VitalsInks, k: InkKind) -> Rgb {
+    match k {
+        InkKind::Words => i.words,
+        InkKind::Words2 => i.words2,
+        InkKind::Warn => i.warn_text,
+        InkKind::Critical => i.critical_text,
+        InkKind::Stuck => i.stuck,
+        InkKind::Over => i.over,
+    }
+}
+
+/// A grid of core squares on whole device px: its origin, its pitch and a
+/// square's side.
+struct Lattice {
+    x: f32,
+    y: f32,
+    step: f32,
+    side: f32,
+}
+
+/// The deck being drawn: its prims, hits and (under test) boxes.
+struct Deck<'a> {
+    p: Painter<'a>,
+    m: &'a FaceMetrics,
+    /// The inks, with Increase Contrast's applied (§9.5).
+    inks: VitalsInks,
+    s: f64,
+    /// The deck's width and height, pt.
+    w_pt: f64,
+    h_pt: f64,
+    ic: bool,
+    dwc: bool,
+    /// Draw the prims, or only lay out (T-G4's sweep).
+    draw: bool,
+    /// Strip cells drawn (T-G9).
+    cells: usize,
+    tab: &'a str,
+    machine: &'static str,
+    /// Hits by precedence: the first containing the pointer wins.
+    hits_first: Vec<Hit>,
+    hits_rows: Vec<Hit>,
+    hits_last: Vec<Hit>,
+    #[cfg(test)]
+    boxes: Option<Vec<Boxed>>,
+    /// The header line as planned (T-G14).
+    #[cfg(test)]
+    head: Option<HeaderPlan>,
+}
+
+impl<'a> Deck<'a> {
+    fn new(g: &DeckGeom, input: &'a DeckInput<'a>, m: &'a FaceMetrics, draw: bool) -> Self {
+        let s = f64::from(g.scale.max(0.5));
+        let mut inks = input.inks;
+        if input.contrast {
+            inks.hollow = inks.words2;
+            inks.rim = inks.words2;
+        }
+        Self {
+            p: Painter::new(&input.inks, g.scale, g.font_px, input.dwc),
+            m,
+            inks,
+            s,
+            w_pt: f64::from(g.w) / s,
+            h_pt: f64::from(g.h) / s,
+            ic: input.contrast,
+            dwc: input.dwc,
+            draw,
+            cells: 0,
+            tab: &input.tab_label,
+            machine: input.locale.platform.machine(),
+            hits_first: Vec::new(),
+            hits_rows: Vec::new(),
+            hits_last: Vec::new(),
+            #[cfg(test)]
+            boxes: None,
+            #[cfg(test)]
+            head: None,
+        }
+    }
+
+    /// `v` pt in whole device px: `floor(v·s + 0.5)` (§3.1).
+    fn px(&self, v: f64) -> f32 {
+        (v * self.s + 0.5).floor() as f32
+    }
+
+    /// A rect from pt edges, each edge on a whole device px.
+    fn px_rect(&self, x0: f64, y0: f64, x1: f64, y1: f64) -> Rect {
+        let (a, b) = (self.px(x0), self.px(y0));
+        (a, b, self.px(x1) - a, self.px(y1) - b)
+    }
+
+    #[cfg(test)]
+    fn note(&mut self, kind: BoxKind, r: [f64; 4], text: &str, room: Option<(f64, f64)>) {
+        if let Some(boxes) = self.boxes.as_mut() {
+            boxes.push(Boxed {
+                kind,
+                text: text.to_owned(),
+                r,
+                room,
+            });
+        }
+    }
+
+    /// The boxes T-G4 checks are recorded only under test.
+    #[cfg(not(test))]
+    fn note(&mut self, _: BoxKind, _: [f64; 4], _: &str, _: Option<(f64, f64)>) {}
+
+    fn ink(&self, k: InkKind) -> Rgb {
+        kind_ink(&self.inks, k)
+    }
+
+    /// A mark's ink: an arrow is words2 whatever its phrase's ink (§6.5).
+    fn mark_ink(&self, mark: WellMark, k: InkKind) -> Rgb {
+        match mark {
+            WellMark::Up | WellMark::Down => self.inks.words2,
+            _ => self.ink(k),
+        }
+    }
+
+    /// Heat step `step`'s ink: `heat_ic` under Increase Contrast (§9.5).
+    fn heat(&self, step: u8) -> Rgb {
+        let ramp = if self.ic {
+            &self.inks.heat_ic
+        } else {
+            &self.inks.heat
+        };
+        ramp[usize::from(step.min(6))]
+    }
+
+    /// A scope's ink, its `_ic` variant under Increase Contrast (§9.4).
+    fn scope_ink(&self, bar: Bar) -> Rgb {
+        let i = &self.inks;
+        match (bar, self.ic) {
+            (Bar::Global, false) => i.machine,
+            (Bar::Global, true) => i.machine_ic,
+            (Bar::Aterm, false) => i.aterm,
+            (Bar::Aterm, true) => i.aterm_ic,
+            (Bar::Tab, false) => i.tab,
+            (Bar::Tab, true) => i.tab_ic,
+        }
+    }
+
+    fn rect(&mut self, (x, y, w, h): Rect, radius: f32, ink: Rgb) {
+        if self.draw && w > 0.0 && h > 0.0 {
+            self.p
+                .prims
+                .push(panel(x, y, w, h, radius, rgba(ink, 0xFF)));
+        }
+    }
+
+    /// `s` at `(x, base)` in pt; answers its advance. `room` is the column
+    /// it belongs to.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a text run's place, size, weight, ink and column"
+    )]
+    fn text(
+        &mut self,
+        x: f64,
+        base: f64,
+        s: String,
+        pt: f64,
+        bold: bool,
+        ink: Rgb,
+        room: Option<(f64, f64)>,
+    ) -> f64 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let w = self.m.width(&s, pt, bold);
+        self.note(
+            BoxKind::Text,
+            [x, base - ASCENT_EM * pt, x + w, base + DESCENT_EM * pt],
+            &s,
+            room,
+        );
+        if self.draw {
+            let px = (pt * self.s) as f32;
+            self.p.prims.push(text_prim(
+                self.px(x),
+                self.px(base),
+                s,
+                TypeStep::Caption.px_clamped(px, px, px),
+                TextWeight::Regular,
+                if bold { TextFace::UiBold } else { TextFace::Ui },
+                rgba(ink, 0xFF),
+            ));
+        }
+        w
+    }
+
+    /// A mark `size` pt across centred at `(cx, cy)` (§10).
+    fn mark(&mut self, kind: WellMark, cx: f64, cy: f64, size: f64, ink: Rgb) {
+        let r = 0.36 * size;
+        self.note(
+            BoxKind::Mark,
+            [cx - r, cy - r, cx + r, cy + r],
+            kind.word(),
+            None,
+        );
+        if self.draw {
+            let lw = (0.9 * self.s).round().max(1.0) as f32;
+            let s = self.s;
+            self.p.mark_in(
+                kind,
+                ((cx * s) as f32, (cy * s) as f32, (r * s) as f32),
+                crate::stats_paint::QUIET_ARC,
+                ink,
+                lw,
+            );
+        }
+    }
+
+    /// `[mark] text`: the mark at `x + 0.42 em`, the words after 1.1 em;
+    /// answers the advance.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a marked run's place, mark, size, weight, ink and column"
+    )]
+    fn marked(
+        &mut self,
+        x: f64,
+        base: f64,
+        mark: Option<(WellMark, Rgb)>,
+        s: String,
+        pt: f64,
+        bold: bool,
+        ink: Rgb,
+        room: Option<(f64, f64)>,
+    ) -> f64 {
+        let mut adv = 0.0;
+        if let Some((kind, mark_ink)) = mark {
+            self.mark(kind, x + 0.42 * pt, base - 0.34 * pt, pt, mark_ink);
+            adv = MARK_EM * pt;
+        }
+        adv + self.text(x + adv, base, s, pt, bold, ink, room)
+    }
+
+    /// The ground and the seam, the deck's last point (§3.1).
+    fn ground(&mut self) {
+        let (w, h) = (self.px(self.w_pt), self.px(self.h_pt));
+        self.rect((0.0, 0.0, w, h), 0.0, self.inks.ground);
+        let seam = self.px(self.h_pt - 1.0);
+        self.rect((0.0, seam, w, h - seam), 0.0, self.inks.seam);
+    }
+
+    // -- strips -----------------------------------------------------------
+
+    /// The over cap at 2× (§3.1): its height and its gap above the cell, px.
+    fn cap_px(&self) -> Option<(f32, f32)> {
+        (self.s >= 2.0).then(|| {
+            (
+                (1.5 * self.s).round().max(2.0) as f32,
+                (0.5 * self.s).round().max(1.0) as f32,
+            )
+        })
+    }
+
+    /// Whether a strip's cells are too small for a hollow outline (§9.2).
+    fn small_cells(&self, strip: &Strip, cell_h: f64) -> bool {
+        self.px(strip.cell) < 4.0 || self.px(cell_h) < 4.0
+    }
+
+    /// A strip's cells (§5.5, §9.2, §9.3, §9.5).
+    fn strip(&mut self, strip: &Strip, top: f64, cell_h: f64, cols: &[HeatCell]) {
+        let cap_room = self
+            .cap_px()
+            .map_or(0.0, |(h, gap)| f64::from(h + gap) / self.s);
+        self.note(
+            BoxKind::Strip,
+            [strip.x, top - cap_room, strip.end(), top + cell_h],
+            "",
+            None,
+        );
+        let n = strip.cols as usize;
+        self.cells += n;
+        if !self.draw {
+            return;
+        }
+        let (x0, y, h) = (self.px(strip.x), self.px(top), self.px(cell_h));
+        let (pitch, cw) = (self.px(strip.pitch), self.px(strip.cell));
+        let radius = if self.s < 2.0 { 0.0 } else { 1.0 };
+        let small = self.small_cells(strip, cell_h);
+        let cap = self.cap_px();
+        // The columns end at now: a ring shorter than the strip leaves its
+        // oldest columns unread.
+        let unread = n.saturating_sub(cols.len());
+        for i in 0..n {
+            let x = x0 + i as f32 * pitch;
+            let cell = i
+                .checked_sub(unread)
+                .and_then(|j| cols.get(j))
+                .copied()
+                .unwrap_or_default();
+            let Some(v) = cell.heat.filter(|v| !v.is_nan()) else {
+                self.hollow_cell((x, y, cw, h), radius, small);
+                continue;
+            };
+            let step = ink::heat_step(v);
+            let hh = if self.dwc {
+                ink::dwc_height(h as u32, step) as f32
+            } else {
+                h
+            };
+            self.rect((x, y + h - hh, cw, hh), radius, self.heat(step));
+            if cell.over {
+                let over = self.inks.over;
+                match cap {
+                    Some((ch, gap)) => self.rect((x, y - ch - gap, cw, ch), 0.0, over),
+                    None => self.rect((x, y, cw, h.min(2.0)), 0.0, over),
+                }
+            }
+        }
+    }
+
+    /// A column with no reading: a 1 px outline, or a 1 px tick along the
+    /// bottom of a cell under 4 × 4 px (§9.2).
+    fn hollow_cell(&mut self, (x, y, w, h): Rect, radius: f32, small: bool) {
+        let ink = self.inks.hollow;
+        if small {
+            self.rect((x, y + h - 1.0, w, 1.0), 0.0, ink);
+        } else if self.draw {
+            self.p.prims.push(DrawPrim::Stroke {
+                x: x + 0.5,
+                y: y + 0.5,
+                w: w - 1.0,
+                h: h - 1.0,
+                radius,
+                width: 1.0,
+                color: rgba(ink, 0xFF),
+            });
+        }
+    }
+
+    /// The per-minute gridlines in the strip's inter-cell gaps from `y0` to
+    /// `y1`, broken over the rows in `holes` (§3.1).
+    fn gridlines(&mut self, strip: &Strip, y0: f64, y1: f64, holes: &[(f64, f64)]) {
+        if !self.draw {
+            return;
+        }
+        let per_min = (60 / strip.period_s.max(1)).max(1) as usize;
+        let pitch = self.px(strip.pitch);
+        let gap = pitch - self.px(strip.cell);
+        let x0 = self.px(strip.x);
+        let mut spans = Vec::new();
+        let mut y = y0;
+        for &(a, b) in holes {
+            if a > y {
+                spans.push((y, a));
+            }
+            y = y.max(b);
+        }
+        if y < y1 {
+            spans.push((y, y1));
+        }
+        let grid = self.inks.grid;
+        for c in (per_min..strip.cols as usize).step_by(per_min) {
+            let gx = x0 + c as f32 * pitch - gap;
+            for &(a, b) in &spans {
+                let (ya, yb) = (self.px(a), self.px(b));
+                self.rect((gx, ya, gap.max(1.0), yb - ya), 0.0, grid);
+            }
+        }
+    }
+
+    // -- the scope bar ------------------------------------------------------
+
+    /// The nested scope bar, Tab | aterm | Global from its left (§3.1, §9.4).
+    fn bar(&mut self, col: Col, top: f64, h_pt: f64, fill: &BarFill) {
+        self.note(BoxKind::Bar, [col.x, top, col.end(), top + h_pt], "", None);
+        if let Some((at, _)) = fill.warn_tick {
+            let x = col.x + f64::from(at) * col.w;
+            self.note(
+                BoxKind::Tick,
+                [x, top - 1.5, x + 1.0, top + h_pt + 1.5],
+                "",
+                None,
+            );
+        }
+        if !self.draw {
+            return;
+        }
+        let s = self.s as f32;
+        let (x, w, y, h) = (self.px(col.x), self.px(col.w), self.px(top), self.px(h_pt));
+        let r = (1.5 * s).round().max(1.0);
+        self.rect((x, y, w, h), r, self.inks.track);
+        let gap = s.round().max(1.0);
+        let at = |v: f32| x + (v * w).round().max(gap);
+        let seg = |deck: &mut Self, x1: f32, x2: f32, bar: Bar, first: bool| {
+            if x2 - x1 >= gap {
+                let hh = match (deck.dwc, bar) {
+                    (false, _) | (true, Bar::Global) => h,
+                    (true, Bar::Aterm) => (h * 0.67).round(),
+                    (true, Bar::Tab) => (h * 0.33).round().max(1.0),
+                };
+                let ink = deck.scope_ink(bar);
+                deck.rect(
+                    (x1, y + h - hh, x2 - x1, hh),
+                    if first { r } else { 0.0 },
+                    ink,
+                );
+            }
+        };
+        match (fill.global, fill.aterm, fill.tab) {
+            (Some(g), Some(a), Some(t)) => {
+                let (gx, ax, tx) = (at(g), at(a.min(g)), at(t.min(a)));
+                seg(self, x, tx, Bar::Tab, true);
+                seg(self, tx + gap, ax, Bar::Aterm, false);
+                seg(self, ax + gap, gx, Bar::Global, false);
+            }
+            (Some(g), Some(a), None) => {
+                let (gx, ax) = (at(g), at(a.min(g)));
+                seg(self, x, ax, Bar::Aterm, true);
+                seg(self, ax + gap, gx, Bar::Global, false);
+            }
+            (Some(g), None, _) => seg(self, x, at(g), Bar::Global, true),
+            (None, Some(a), Some(t)) => {
+                let (ax, tx) = (at(a), at(t.min(a)));
+                seg(self, x, tx, Bar::Tab, true);
+                seg(self, tx + gap, ax, Bar::Aterm, false);
+            }
+            (None, Some(a), None) => seg(self, x, at(a), Bar::Aterm, true),
+            (None, None, _) => {}
+        }
+        if let Some(n) = fill.ticks.filter(|&n| n > 1 && col.w / f64::from(n) >= 3.0) {
+            let tw = (0.5 * s).round().max(1.0);
+            let ground = self.inks.ground;
+            for i in 1..n {
+                let tx = x + (i as f32 * w / n as f32).round();
+                self.rect((tx, y, tw, h), 0.0, ground);
+            }
+        }
+        if let Some((at, warn)) = fill.warn_tick {
+            let lx = x + (at * w).round();
+            let ext = self.px(1.5);
+            let ink = if warn {
+                self.inks.warn_text
+            } else {
+                self.inks.rim
+            };
+            self.rect((lx, y - ext, s.round().max(1.0), h + 2.0 * ext), 0.0, ink);
+        }
+    }
+
+    // -- text cells -------------------------------------------------------
+
+    /// The amount slot, saying the row's state where Details is absent
+    /// (rule S, §6.0).
+    fn amount(&mut self, col: Col, base: f64, pt: f64, row: &RowWords, t: &Table) {
+        let room = Some((col.x, col.end()));
+        let words_ink = self.inks.words;
+        let Some(st) = row.state.as_ref().filter(|_| t.details.is_none()) else {
+            let forms = row.amount.get(t.ladder()).map_or(&[][..], Vec::as_slice);
+            let text = fit(forms, col.w, pt, false, self.m);
+            self.text(col.x, base, text, pt, false, words_ink, room);
+            return;
+        };
+        let madv = MARK_EM * pt;
+        let mark = Some((st.mark, self.mark_ink(st.mark, st.ink)));
+        let ink = self.ink(st.ink);
+        let says: Vec<&Txt> = st.clauses.iter().chain(std::iter::once(&st.word)).collect();
+        // Tiers 1 and 2: the amount, then the clause or the word.
+        for said in &says {
+            for am in &st.amounts {
+                if am.w(pt, false) + STATE_GAP + madv + said.w(pt, true) <= col.w + 0.01 {
+                    let w = self.text(col.x, base, am.s.clone(), pt, false, words_ink, room);
+                    let x = col.x + w + STATE_GAP;
+                    self.marked(x, base, mark, said.s.clone(), pt, true, ink, room);
+                    return;
+                }
+            }
+        }
+        // Tiers 3 and 4: the state alone, the word cut last. A mark never
+        // stands alone.
+        let text = says
+            .iter()
+            .find(|said| madv + said.w(pt, true) <= col.w + 0.01)
+            .map_or_else(
+                || self.m.fit(&[&st.word.s], col.w - madv, pt, true),
+                |said| said.s.clone(),
+            );
+        if !text.is_empty() {
+            self.marked(col.x, base, mark, text, pt, true, ink, room);
+        }
+    }
+
+    /// The aterm and Tab cells, or one phrase across both (§6).
+    fn scope_cells(&mut self, row: &RowWords, aterm: Col, tab: Col, base: f64, pt: f64) {
+        match &row.scope {
+            ScopeTxt::None => {}
+            ScopeTxt::Span(forms, ink) => {
+                let room = tab.end() - aterm.x;
+                let text = fit(forms, room, SMALL_PT, false, self.m);
+                let ink = self.ink(*ink);
+                self.text(
+                    aterm.x,
+                    base,
+                    text,
+                    SMALL_PT,
+                    false,
+                    ink,
+                    Some((aterm.x, tab.end())),
+                );
+            }
+            ScopeTxt::Each {
+                aterm: (af, ai),
+                tab: (tf, ti),
+            } => {
+                for (col, forms, ink) in [(aterm, af, ai), (tab, tf, ti)] {
+                    let text = fit(forms, col.w, pt, false, self.m);
+                    let ink = self.ink(*ink);
+                    self.text(col.x, base, text, pt, false, ink, Some((col.x, col.end())));
+                }
+            }
+        }
+    }
+
+    /// Details (rule D, §6.0): for each kept set, from every clause down to
+    /// the keep-only set, every clause long, then shortened one at a time
+    /// from the lowest priority up; the first arrangement that fits wins.
+    /// Else the keep clauses short, the last cut with "…".
+    fn details(&mut self, col: Col, base: f64, clauses: &[ClauseTxt]) {
+        let pt = SMALL_PT;
+        let sep = Txt::new(" \u{b7} ", self.m);
+        let madv = MARK_EM * pt;
+        let bold =
+            |c: &ClauseTxt| matches!(c.ink, InkKind::Warn | InkKind::Critical | InkKind::Stuck);
+        let form = |c: &ClauseTxt, short: bool| {
+            if short {
+                c.forms.len().min(2).saturating_sub(1)
+            } else {
+                0
+            }
+        };
+        let width = |arr: &[(&ClauseTxt, bool)]| -> f64 {
+            arr.iter()
+                .enumerate()
+                .map(|(i, &(c, short))| {
+                    c.forms
+                        .get(form(c, short))
+                        .map_or(0.0, |t| t.w(pt, bold(c)))
+                        + if c.mark.is_some() { madv } else { 0.0 }
+                        + if i > 0 { sep.w(pt, false) } else { 0.0 }
+                })
+                .sum()
+        };
+        let mut ps: Vec<&ClauseTxt> = clauses.iter().filter(|c| !c.forms.is_empty()).collect();
+        ps.sort_by_key(|c| c.prio);
+        let keepers: Vec<&ClauseTxt> = ps.iter().copied().filter(|c| c.keep).collect();
+        let others: Vec<&ClauseTxt> = ps.iter().copied().filter(|c| !c.keep).collect();
+        let mut choice: Option<Vec<(&ClauseTxt, bool)>> = None;
+        'sets: for n in (0..=others.len()).rev() {
+            let mut kept: Vec<&ClauseTxt> = keepers
+                .iter()
+                .chain(others.iter().take(n))
+                .copied()
+                .collect();
+            kept.sort_by_key(|c| c.prio);
+            let mut arr: Vec<(&ClauseTxt, bool)> = kept.iter().map(|&c| (c, false)).collect();
+            if width(&arr) <= col.w + 0.01 {
+                choice = Some(arr);
+                break;
+            }
+            for i in (0..arr.len()).rev() {
+                if let Some(slot) = arr.get_mut(i) {
+                    slot.1 = true;
+                }
+                if width(&arr) <= col.w + 0.01 {
+                    choice = Some(arr);
+                    break 'sets;
+                }
+            }
+        }
+        let choice = choice.unwrap_or_else(|| {
+            let base = if keepers.is_empty() {
+                ps.iter().take(1).copied().collect()
+            } else {
+                keepers.clone()
+            };
+            base.into_iter().map(|c| (c, true)).collect()
+        });
+        let room = Some((col.x, col.end()));
+        let words2 = self.inks.words2;
+        let mut x = col.x;
+        for (i, (c, short)) in choice.into_iter().enumerate() {
+            let sep_w = if i > 0 { sep.w(pt, false) } else { 0.0 };
+            let mark_w = if c.mark.is_some() { madv } else { 0.0 };
+            let Some(t) = c.forms.get(form(c, short)) else {
+                continue;
+            };
+            let left = col.end() - x - sep_w - mark_w;
+            let text = fit(std::slice::from_ref(t), left, pt, bold(c), self.m);
+            if text.is_empty() {
+                break;
+            }
+            if i > 0 {
+                x += self.text(x, base, sep.s.clone(), pt, false, words2, room);
+            }
+            let mark = c.mark.map(|m| (m, self.mark_ink(m, c.ink)));
+            let ink = self.ink(c.ink);
+            x += self.marked(x, base, mark, text, pt, bold(c), ink, room);
+        }
+    }
+
+    // -- rows ---------------------------------------------------------------
+
+    /// One resource row of `t` at row `r` (§6, §11).
+    fn row(&mut self, t: &Table, r: u32, row: &RowWords, reading: bool) {
+        let rows = t.rows;
+        let top = rows.top(r);
+        let base = top + rows.baseline;
+        let words_ink = self.inks.words;
+        self.text(
+            t.name.x,
+            base,
+            row.name.s.clone(),
+            rows.name_pt,
+            true,
+            words_ink,
+            Some((t.name.x, t.name.end())),
+        );
+        if let Some((mark, ink)) = row.well {
+            let ink = self.mark_ink(mark, ink);
+            let cy = base - 0.34 * t.mark_pt - 0.2;
+            self.mark(mark, t.well.x + t.well.w / 2.0, cy, t.mark_pt, ink);
+        }
+        match row.strip_text.as_ref() {
+            Some(forms) => {
+                let room = t.strip.end() - t.strip.x;
+                let text = fit(forms, room, SMALL_PT, false, self.m);
+                let ink = self.inks.words2;
+                // The sentence stands where the strip would, over the next
+                // row's strip: its descenders clear that row's caps.
+                let cap_room = self
+                    .cap_px()
+                    .map_or(0.0, |(h, gap)| f64::from(h + gap) / self.s);
+                let base = base.min(top + rows.pitch - cap_room - DESCENT_EM * SMALL_PT);
+                self.text(
+                    t.strip.x,
+                    base,
+                    text,
+                    SMALL_PT,
+                    false,
+                    ink,
+                    Some((t.strip.x, t.strip.end())),
+                );
+            }
+            None => {
+                let cols = row
+                    .cols
+                    .get(period_ix(&t.strip))
+                    .map_or(&[][..], Vec::as_slice);
+                self.strip(&t.strip, top, rows.cell, cols);
+            }
+        }
+        if let Some(col) = t.pct {
+            let (ink, bold) = match row.heat_now {
+                Some(h) => (self.inks.heat_text[usize::from(ink::heat_step(h))], true),
+                None => (self.inks.words2, false),
+            };
+            let w = row.pct.w(rows.name_pt, bold);
+            self.text(
+                col.end() - w,
+                base,
+                row.pct.s.clone(),
+                rows.name_pt,
+                bold,
+                ink,
+                Some((col.x, col.end())),
+            );
+        }
+        if let (Some(col), Some(fill)) = (t.bar, row.bar.as_ref()) {
+            self.bar(col, top + (rows.cell - rows.bar_h) / 2.0, rows.bar_h, fill);
+        }
+        if let Some(col) = t.amount {
+            self.amount(col, base, rows.amount_pt, row, t);
+        }
+        if let (Some(aterm), Some(tab)) = (t.aterm, t.tab) {
+            self.scope_cells(row, aterm, tab, base, rows.figure_pt);
+        }
+        if let Some(col) = t.details {
+            self.details(col, base, &row.details);
+        }
+        if reading {
+            return;
+        }
+        let (y0, y1) = t.band(r);
+        let inst = Instrument::of(row.res);
+        if let (Some(aterm), Some(tab)) = (t.aterm, t.tab) {
+            for (col, bar) in [(aterm, Bar::Aterm), (tab, Bar::Tab)] {
+                let rect = self.px_rect(col.x, y0, col.end(), y1);
+                self.hits_first.push(Hit::row(rect, inst, bar));
+            }
+        }
+        let rect = self.px_rect(t.name.x, y0, t.end, y1);
+        self.hits_rows.push(Hit::row(rect, inst, Bar::Global));
+    }
+
+    // -- cores --------------------------------------------------------------
+
+    /// The lattice a grid of core squares `side` pt at `pitch` pt sits on
+    /// from `(x, y)` pt: a pitch of whole device px (rounded down, so the
+    /// grid never outgrows its plan) and a square at least 1 px under it.
+    /// Rounding each square's edges on its own would let a square at a
+    /// fractional pitch (2 pt at 2.5 pt, at 1×) touch the next, and the
+    /// squares would read as a bar.
+    fn lattice(&self, x: f64, y: f64, pitch: f64, side: f64) -> Lattice {
+        let step = (pitch * self.s).floor().max(2.0) as f32;
+        Lattice {
+            x: self.px(x),
+            y: self.px(y),
+            step,
+            side: ((side * self.s).round() as f32).clamp(1.0, step - 1.0),
+        }
+    }
+
+    /// The core at column `col` and row `row` of `grid`; hollow when
+    /// unreadable. A square under 4 px has square corners.
+    fn core(&mut self, grid: &Lattice, (col, row): (usize, usize), heat: Option<f32>, radius: f32) {
+        if !self.draw {
+            return;
+        }
+        let side = grid.side;
+        let rect = (
+            grid.x + col as f32 * grid.step,
+            grid.y + row as f32 * grid.step,
+            side,
+            side,
+        );
+        let radius = if side < 4.0 { 0.0 } else { radius };
+        match heat {
+            Some(v) => self.rect(rect, radius, self.heat(ink::heat_step(v))),
+            None => self.hollow_cell(rect, radius, side < 4.0),
+        }
+    }
+
+    /// The cores block (wide, mid; §3.4): the title on the header line, then
+    /// each cluster's caption and squares.
+    fn cores_block(&mut self, at: Col, top0: f64, words: &DeckWords) {
+        let clusters = words.clusters();
+        let room = Some((at.x, at.end()));
+        let title = plan::cores_block_title(&clusters, self.m);
+        let words2 = self.inks.words2;
+        self.text(at.x, HEADER_BASE_FULL, title, SMALL_PT, false, words2, room);
+        let CoresMode::Block { pitch, sq, per_row } = plan::cores_block_mode(&clusters, self.h_pt)
+        else {
+            return;
+        };
+        let per_row = per_row.max(1) as usize;
+        let radius = self.s.round().max(1.0) as f32;
+        let mut y = top0;
+        for (cluster, cc) in clusters.iter().zip(&words.cores) {
+            let squares = match plan::cores_block_caption(cluster, self.m) {
+                Some(caption) => {
+                    let base = y + 8.0;
+                    let ink = self.inks.words;
+                    let w = self.text(at.x, base, caption.count, SMALL_PT, true, ink, room);
+                    self.text(at.x + w, base, caption.name, SMALL_PT, false, words2, room);
+                    y + 11.0
+                }
+                None => y + 1.0,
+            };
+            let grid = self.lattice(at.x, squares, pitch, sq);
+            for (i, &heat) in cc.heat.iter().enumerate() {
+                self.core(&grid, (i % per_row, i / per_row), heat, radius);
+            }
+            let rows = cluster.count.div_ceil(per_row) as f64;
+            let across = cluster.count.min(per_row) as f64;
+            let bottom = squares + rows * pitch - (pitch - sq);
+            self.note(
+                BoxKind::Core,
+                [at.x, squares, at.x + across * pitch - (pitch - sq), bottom],
+                "",
+                None,
+            );
+            y = bottom + 4.0;
+        }
+    }
+
+    /// A Cores row in `room` (§3.4, §4.5): per cluster its count and name,
+    /// then its squares in `mode`, or the count in words.
+    fn cores_row(
+        &mut self,
+        room: Col,
+        top: f64,
+        cell: f64,
+        mode: CoresMode,
+        caption_pt: f64,
+        words: &DeckWords,
+    ) {
+        let clusters = words.clusters();
+        let base = top + cell - 1.0;
+        let within = Some((room.x, room.end()));
+        let (ink, words2) = (self.inks.words, self.inks.words2);
+        if mode == CoresMode::CountOnly {
+            let text = plan::cores_count_text(&clusters, room.w, caption_pt, self.m);
+            self.text(room.x, base, text, caption_pt, false, words2, within);
+            return;
+        }
+        let radius = self.s.round().max(1.0) as f32;
+        let mut x = room.x;
+        for (cluster, cc) in clusters.iter().zip(&words.cores) {
+            x += self.text(
+                x,
+                base,
+                format!("{} ", cluster.count),
+                caption_pt,
+                true,
+                ink,
+                within,
+            );
+            if let Some(name) = cluster.name {
+                x += self.text(x, base, name.to_owned(), caption_pt, false, words2, within);
+            }
+            x += 3.0;
+            let n = cc.heat.len();
+            let (side, per_col, y0, step, r) = match mode {
+                CoresMode::Big => (cell, 1, top, 10.0, radius),
+                CoresMode::Tiny => (2.0, 3, top + (cell - 3.0 * 2.0 - 2.0 * 0.5) / 2.0, 2.5, 0.0),
+                _ => ((cell - 0.5) / 2.0, 2, top, (cell - 0.5) / 2.0 + 0.5, 0.0),
+            };
+            let grid = self.lattice(x, y0, step, side);
+            for (i, &heat) in cc.heat.iter().enumerate() {
+                self.core(&grid, (i / per_col, i % per_col), heat, r);
+            }
+            let cols = n.div_ceil(per_col) as f64;
+            let w = (cols - 1.0).max(0.0) * step + side;
+            let bottom = if per_col == 1 {
+                y0 + side
+            } else {
+                y0 + (per_col.min(n) as f64 - 1.0) * step + side
+            };
+            self.note(BoxKind::Core, [x, y0, x + w, bottom], "", None);
+            x += w + 8.0;
+        }
+    }
+
+    // -- the header line ----------------------------------------------------
+
+    /// A scope's swatch, a Panel on the baseline (§3.5).
+    fn swatch(&mut self, x: f64, base: f64, bar: Bar) {
+        let (w, h) = (0.62 * SMALL_PT, 0.7 * SMALL_PT);
+        self.note(BoxKind::Swatch, [x, base - h, x + w, base], "", None);
+        let rect = (
+            self.px(x),
+            self.px(base) - self.px(h),
+            self.px(w),
+            self.px(h),
+        );
+        let ink = self.scope_ink(bar);
+        self.rect(rect, self.s.max(1.0) as f32, ink);
+    }
+
+    /// The header line's labels and its key (§3.5, §3.6, §4.3, §4.4).
+    fn header(&mut self, head: &HeaderPlan, base: f64, small: bool, states: &[HeadState<'_>]) {
+        #[cfg(test)]
+        {
+            self.head = Some(head.clone());
+        }
+        let words2 = self.inks.words2;
+        let sep = " \u{b7} ";
+        for label in &head.labels {
+            match label.label {
+                Label::Time => {
+                    self.text(
+                        label.x,
+                        base,
+                        label.text.clone(),
+                        SMALL_PT,
+                        false,
+                        words2,
+                        None,
+                    );
+                }
+                Label::Now => {
+                    let w = self.m.width(&label.text, SMALL_PT, false);
+                    self.text(
+                        label.x - w,
+                        base,
+                        label.text.clone(),
+                        SMALL_PT,
+                        false,
+                        words2,
+                        None,
+                    );
+                }
+                Label::Scope(bar) => {
+                    self.swatch(label.x, base, bar);
+                    let x = label.x + 0.62 * SMALL_PT + 3.0;
+                    self.two_inks(x, base, &label.text, sep);
+                }
+                Label::Details => self.two_inks(label.x, base, &label.text, sep),
+                Label::State => {
+                    let Some(st) = states.iter().find(|st| (st.x - label.x).abs() < 0.01) else {
+                        continue;
+                    };
+                    let ink = self.ink(st.st.ink);
+                    let mark = Some((st.st.mark, self.mark_ink(st.st.mark, st.st.ink)));
+                    let w = self.marked(
+                        label.x,
+                        base,
+                        mark,
+                        label.text.clone(),
+                        SMALL_PT,
+                        true,
+                        ink,
+                        None,
+                    );
+                    let rect = self.px_rect(label.x, 0.0, label.x + w, HEADER_HIT_FOLDED);
+                    self.hits_first
+                        .push(Hit::row(rect, Instrument::of(st.res), Bar::Global));
+                }
+            }
+        }
+        for &(item, x) in &head.key.placed {
+            self.key(item, x, base, small);
+        }
+    }
+
+    /// Words before " · " in words ink, the rest in words2 (§3.5).
+    fn two_inks(&mut self, x: f64, base: f64, text: &str, sep: &str) {
+        let (head, tail) = text
+            .split_once(sep)
+            .map_or((text, None), |(a, b)| (a, Some(b)));
+        let ink = self.inks.words;
+        let w = self.text(x, base, head.to_owned(), SMALL_PT, false, ink, None);
+        if let Some(tail) = tail {
+            let ink = self.inks.words2;
+            self.text(
+                x + w,
+                base,
+                format!("{sep}{tail}"),
+                SMALL_PT,
+                false,
+                ink,
+                None,
+            );
+        }
+    }
+
+    /// One key item at `x` on the header line (rule K, §3.6): drawn the way
+    /// the strip beside it draws.
+    fn key(&mut self, item: KeyItem, x: f64, base: f64, small: bool) {
+        let words2 = self.inks.words2;
+        let top = base - 7.0;
+        match item {
+            KeyItem::Ramp => {
+                let w = self.text(x, base, "cold".into(), SMALL_PT, false, words2, None);
+                let xx = x + w + 3.0;
+                self.note(BoxKind::Swatch, [xx, top, xx + 34.0, base], "", None);
+                let radius = (0.5 * self.s).round().max(1.0) as f32;
+                for i in 0..7_u8 {
+                    let rect = (
+                        self.px(xx + f64::from(i) * 5.0),
+                        self.px(top),
+                        self.px(4.0),
+                        self.px(7.0),
+                    );
+                    let ink = self.heat(i);
+                    self.rect(rect, radius, ink);
+                }
+                self.text(
+                    xx + 35.0 + 3.0,
+                    base,
+                    "hot".into(),
+                    SMALL_PT,
+                    false,
+                    words2,
+                    None,
+                );
+            }
+            KeyItem::Over => {
+                self.note(BoxKind::Swatch, [x, top, x + 4.0, base], "", None);
+                let (cx, cy, cw, bottom) = (self.px(x), self.px(top), self.px(4.0), self.px(base));
+                let (over, hot) = (self.inks.over, self.heat(6));
+                match self.cap_px() {
+                    Some((ch, gap)) => {
+                        self.rect((cx, cy, cw, ch), 0.0, over);
+                        let y = cy + ch + gap;
+                        self.rect((cx, y, cw, bottom - y), 0.0, hot);
+                    }
+                    None => {
+                        self.rect((cx, cy, cw, bottom - cy), 0.0, hot);
+                        self.rect((cx, cy, cw, 2.0), 0.0, over);
+                    }
+                }
+                self.text(
+                    x + 7.0,
+                    base,
+                    "over max".into(),
+                    SMALL_PT,
+                    false,
+                    words2,
+                    None,
+                );
+            }
+            KeyItem::NotRead => {
+                self.note(BoxKind::Swatch, [x, top, x + 4.0, base], "", None);
+                let rect = (
+                    self.px(x),
+                    self.px(top),
+                    self.px(4.0),
+                    self.px(base) - self.px(top),
+                );
+                self.hollow_cell(rect, if self.s < 2.0 { 0.0 } else { 1.0 }, small);
+                self.text(
+                    x + 7.0,
+                    base,
+                    "not read".into(),
+                    SMALL_PT,
+                    false,
+                    words2,
+                    None,
+                );
+            }
+        }
+    }
+
+    // -- the forms ----------------------------------------------------------
+
+    /// The Full form (§3).
+    fn full(&mut self, words: &DeckWords) {
+        let plan = plan::plan_full(self.w_pt, self.m);
+        self.ground();
+        if plan.ground_only {
+            return;
+        }
+        let t = Table::of_full(&plan);
+        let rows = plan.rows;
+        let gap = rows.pitch - rows.cell;
+        let holes: Vec<(f64, f64)> = words
+            .rows
+            .iter()
+            .zip(0_u32..)
+            .filter(|(row, _)| row.strip_text.is_some())
+            .map(|(_, r)| (rows.top(r) - gap / 2.0, rows.top(r) + rows.cell + gap / 2.0))
+            .collect();
+        let last = rows.top(Resource::ALL.len() as u32 - 1) + rows.cell;
+        self.gridlines(&plan.strip, GRID_FROM_FULL, last, &holes);
+        match plan.cores {
+            CoresAt::Block { at, divider } => {
+                self.cores_block(at, rows.top0, words);
+                let w = (0.5 * self.s).round().max(1.0) as f32;
+                let (y0, y1) = (self.px(4.0), self.px(self.h_pt - 6.0));
+                let grid = self.inks.grid;
+                self.rect((self.px(divider), y0, w, y1 - y0), 0.0, grid);
+                if !words.reading {
+                    let rect = self.px_rect(at.x, 0.0, at.end(), self.h_pt - 6.0);
+                    self.hits_first.push(Hit::cores(rect));
+                }
+            }
+            CoresAt::Row(room) => {
+                let r = Resource::ALL.len() as u32;
+                let top = rows.top(r);
+                let ink = self.inks.words;
+                self.text(
+                    plan.name.x,
+                    top + rows.baseline,
+                    "Cores".into(),
+                    rows.name_pt,
+                    true,
+                    ink,
+                    Some((plan.name.x, plan.name.end())),
+                );
+                let mode = plan.cores_mode(&words.clusters(), self.h_pt, self.m);
+                self.cores_row(room, top, rows.cell, mode, SMALL_PT, words);
+                if !words.reading {
+                    let (y0, y1) = t.band(r);
+                    let rect = self.px_rect(plan.name.x, y0, room.end(), y1);
+                    self.hits_first.push(Hit::cores(rect));
+                }
+            }
+        }
+        for (row, r) in words.rows.iter().zip(0_u32..) {
+            self.row(&t, r, row, words.reading);
+        }
+        let text = HeaderText {
+            tab: self.tab,
+            machine: self.machine,
+        };
+        let head = plan::header_full(&plan, text, self.m);
+        let small = self.small_cells(&plan.strip, rows.cell);
+        self.header(&head, HEADER_BASE_FULL, small, &[]);
+        if !words.reading {
+            let rect = self.px_rect(0.0, 0.0, self.w_pt, HEADER_HIT_FULL);
+            self.hits_last.push(Hit::header(rect));
+        }
+    }
+
+    /// The Folded form (§4).
+    fn folded(&mut self, words: &DeckWords) {
+        let plan = plan::plan_folded(self.w_pt, self.m);
+        self.ground();
+        if plan.ground_only {
+            return;
+        }
+        let w = (0.5 * self.s).round().max(1.0) as f32;
+        let (y0, y1) = (self.px(4.0), self.px(self.h_pt - 6.0));
+        let grid = self.inks.grid;
+        self.rect((self.px(plan.divider), y0, w, y1 - y0), 0.0, grid);
+        let clusters = words.clusters();
+        let mut states: Vec<HeadState<'_>> = Vec::new();
+        for (bi, block) in plan.blocks.iter().enumerate() {
+            let t = Table::of_block(block);
+            let rows = block.rows;
+            let ours: Vec<&RowWords> = words.rows.iter().skip(bi * 4).take(4).collect();
+            let gap = 1.5;
+            let holes: Vec<(f64, f64)> = ours
+                .iter()
+                .zip(0_u32..)
+                .filter(|(row, _)| row.strip_text.is_some())
+                .map(|(_, r)| (rows.top(r) - gap, rows.top(r) + rows.cell + gap))
+                .collect();
+            let last = rows.top(ours.len().saturating_sub(1) as u32) + rows.cell;
+            self.gridlines(&block.strip, GRID_FROM_FOLDED, last, &holes);
+            for (row, r) in ours.iter().zip(0_u32..) {
+                self.row(&t, r, row, words.reading);
+            }
+            if let Some(st) = block_state(&ours, block.name.x) {
+                states.push(st);
+            }
+            if bi == 1 {
+                let r = 3;
+                let top = rows.top(r);
+                if block.kind != BlockKind::Slim {
+                    let ink = self.inks.words;
+                    self.text(
+                        block.name.x,
+                        top + rows.baseline,
+                        "Cores".into(),
+                        rows.name_pt,
+                        true,
+                        ink,
+                        Some((block.name.x, block.name.end())),
+                    );
+                }
+                let mode = block.cores_mode(&clusters, self.m);
+                let caption = block.kind.cores_caption_pt();
+                self.cores_row(block.cores, top, rows.cell, mode, caption, words);
+                if !words.reading {
+                    let (y0, y1) = t.band(r);
+                    let rect = self.px_rect(block.name.x, y0, block.at.end(), y1);
+                    self.hits_first.push(Hit::cores(rect));
+                }
+            }
+        }
+        let text = HeaderText {
+            tab: self.tab,
+            machine: self.machine,
+        };
+        let labels: [Option<StateLabel<'_>>; 2] = [0, 1].map(|bi| {
+            let x = plan.blocks.get(bi).map(|b| b.name.x)?;
+            states
+                .iter()
+                .find(|st| (st.x - x).abs() < 0.01)
+                .map(|st| StateLabel {
+                    full: &st.full,
+                    bare: &st.st.label,
+                })
+        });
+        let head = plan::header_folded(&plan, text, labels, self.m);
+        let small = plan
+            .blocks
+            .first()
+            .is_some_and(|b| self.small_cells(&b.strip, b.rows.cell));
+        let states = if words.reading { Vec::new() } else { states };
+        self.header(&head, HEADER_BASE_FOLDED, small, &states);
+        if !words.reading {
+            let rect = self.px_rect(0.0, 0.0, self.w_pt, HEADER_HIT_FOLDED);
+            self.hits_last.push(Hit::header(rect));
+        }
+    }
+
+    fn paint(&mut self, words: &DeckWords, form: DeckForm) {
+        match form {
+            DeckForm::Full => self.full(words),
+            DeckForm::Folded => self.folded(words),
+        }
+    }
+
+    fn hits(&mut self) -> Vec<Hit> {
+        let mut hits = std::mem::take(&mut self.hits_first);
+        hits.append(&mut self.hits_rows);
+        hits.append(&mut self.hits_last);
+        hits
+    }
+}
+
+/// A Folded block's worst state for an fslim header (§4.4): the worst of
+/// its rows' states, a ◢ before a ● at one level (the well's order, §6),
+/// else the first among equals; "+N" for the other rows that have one.
+fn block_state<'w>(rows: &[&'w RowWords], x: f64) -> Option<HeadState<'w>> {
+    let with: Vec<(&RowWords, &StateTxt)> = rows
+        .iter()
+        .filter_map(|row| row.state.as_ref().map(|st| (*row, st)))
+        .collect();
+    let rank = |st: &StateTxt| (st.state, st.mark == WellMark::Low);
+    let (row, st) = with.iter().copied().reduce(|best, next| {
+        if rank(next.1) > rank(best.1) {
+            next
+        } else {
+            best
+        }
+    })?;
+    let more = with.len() - 1;
+    Some(HeadState {
+        x,
+        res: row.res,
+        st,
+        full: if more > 0 {
+            format!("{} +{more}", st.label)
+        } else {
+            st.label.clone()
+        },
+    })
+}
+
+/// Lay the Deck out and paint it: Full or Folded, as the window's form
+/// says, on the planner's columns for its width. Pure: the same input gives
+/// the same prims, at whole device pixels.
+pub(crate) fn deck_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<Hit>) {
+    let m = deck_metrics();
+    let words = DeckWords::new(input, &m);
+    let mut deck = Deck::new(g, input, &m, true);
+    deck.paint(&words, input.form);
+    let hits = deck.hits();
+    (deck.p.prims, hits)
+}
+
+/// A laid-out deck as the tests read it.
+#[cfg(test)]
+pub(crate) struct Laid {
+    pub(crate) prims: Vec<DrawPrim>,
+    pub(crate) hits: Vec<Hit>,
+    pub(crate) boxes: Vec<Boxed>,
+    /// Strip cells drawn.
+    pub(crate) cells: usize,
+    /// The header line as planned.
+    pub(crate) head: Option<HeaderPlan>,
+}
+
+/// [`deck_paint`] on words already read and a face's metrics, recording
+/// every box; with `draw` false nothing is drawn (T-G4's sweep).
+#[cfg(test)]
+pub(crate) fn lay(
+    g: &DeckGeom,
+    input: &DeckInput<'_>,
+    words: &DeckWords,
+    m: &FaceMetrics,
+    draw: bool,
+) -> Laid {
+    let mut deck = Deck::new(g, input, m, draw);
+    deck.boxes = Some(Vec::new());
+    deck.paint(words, input.form);
+    let hits = deck.hits();
+    Laid {
+        boxes: deck.boxes.take().unwrap_or_default(),
+        head: deck.head.take(),
+        cells: deck.cells,
+        prims: deck.p.prims,
+        hits,
+    }
+}
+
+/// The Deck's prims alone.
 #[cfg(test)]
 pub(crate) fn deck_prims(g: &DeckGeom, input: &DeckInput<'_>) -> Vec<DrawPrim> {
     deck_paint(g, input).0
-}
-
-/// The core tiles by cluster and the GPU tank, from `x`; returns where the
-/// block ends.
-#[allow(clippy::too_many_arguments)]
-fn core_block(
-    p: &mut Painter<'_>,
-    cpu: &CpuView,
-    gpu: Option<&GpuView>,
-    x0: f32,
-    top: f32,
-    inner_h: f32,
-    budget: f32,
-    hits: &mut Vec<Hit>,
-) -> f32 {
-    let inks = *p.inks;
-    let gap = p.px(2.5);
-    let lab_pad = p.px(4.0);
-    let label_ws: Vec<f32> = cpu
-        .clusters
-        .iter()
-        .map(|c| {
-            p.label_w(&c.short, true, true)
-                .max(p.figure_w(&format!("\u{00D7}{}", c.cores.len()), true))
-                + lab_pad
-        })
-        .collect();
-    let gpu_lw = p.label_w("GPU", true, true).max(p.figure_w("100%", true)) + lab_pad;
-    // Rows of tiles: two (32 px tiles and up at 2×) unless the cores would
-    // take more than their share of the width; then more, smaller rows.
-    // Each cluster fills row-major, so no cluster is ragged.
-    let mut rows = if cpu.total() <= 2 { 1usize } else { 2 };
-    let (tile, cols) = loop {
-        let t = ((inner_h - gap * (rows as f32 - 1.0)) / rows as f32).floor();
-        let cols: Vec<usize> = cpu
-            .clusters
-            .iter()
-            .map(|c| c.cores.len().div_ceil(rows).max(1))
-            .collect();
-        let tank_w = (t * 0.62).round().max(p.px(6.0));
-        let need: f32 = cpu
-            .clusters
-            .iter()
-            .zip(cols.iter())
-            .zip(label_ws.iter())
-            .map(|((_, &k), &lw)| lw + k as f32 * (t + gap) + gap * 2.0)
-            .sum::<f32>()
-            + gpu.map_or(0.0, |_| gpu_lw + tank_w + gap * 2.0);
-        if need <= budget || rows >= 8 || t <= p.px(5.0) {
-            break (t, cols);
-        }
-        rows += 1;
-    };
-    let block_h = rows as f32 * tile + (rows as f32 - 1.0) * gap;
-    let top = top + ((inner_h - block_h) / 2.0).floor();
-    let name_base =
-        crate::tray_raster::row_baseline(top, tile.max(p.small_px.get()), p.small_px.get());
-    let count_base = crate::tray_raster::row_baseline(
-        top + block_h - tile.max(p.small_px.get()),
-        tile.max(p.small_px.get()),
-        p.small_px.get(),
-    );
-    let (name_base, count_base) = if rows == 1 {
-        let half = block_h / 2.0;
-        (
-            crate::tray_raster::row_baseline(top, half, p.small_px.get()),
-            crate::tray_raster::row_baseline(top + half, half, p.small_px.get()),
-        )
-    } else {
-        (name_base, count_base)
-    };
-    let mut x = x0;
-    for ((cluster, &k_cols), &lw) in cpu.clusters.iter().zip(cols.iter()).zip(label_ws.iter()) {
-        let start = x;
-        p.label(x, name_base, cluster.short.clone(), inks.words, true, true);
-        p.figure(
-            x,
-            count_base,
-            format!("\u{00D7}{}", cluster.cores.len()),
-            inks.words2,
-            true,
-        );
-        x += lw;
-        let used_rows = cluster.cores.len().div_ceil(k_cols).max(1);
-        let y_off = (((rows - used_rows) as f32) * (tile + gap) / 2.0).floor();
-        for (i, &core) in cluster.cores.iter().enumerate() {
-            let (col, row) = (i % k_cols, i / k_cols);
-            let tx = x + col as f32 * (tile + gap);
-            let ty = top + y_off + row as f32 * (tile + gap);
-            match cpu.cores.get(core) {
-                Some(view) => {
-                    p.tile(
-                        tx,
-                        ty,
-                        tile,
-                        Mark::of(&view.load, 1.0, words::LOAD_GATE),
-                        gap * 2.0,
-                    );
-                }
-                None => p.tile_unmeasured(tx, ty, tile, tile),
-            }
-        }
-        x += k_cols as f32 * (tile + gap) + gap;
-        hits.push(Hit {
-            rect: (start, top, x - start, block_h),
-            instrument: Instrument::Cores,
-            bar: Bar::Global,
-        });
-    }
-    if let Some(gpu) = gpu {
-        // The GPU, labelled like a cluster (its name over its figure), one
-        // tank for the device (Apple GPUs report device-wide use only).
-        let start = x;
-        let m = Mark::of(&gpu.load, 1.0, words::LOAD_GATE);
-        p.label(x, name_base, "GPU".into(), inks.words, true, true);
-        p.figure(
-            x,
-            count_base,
-            format!("{:.0}%", (gpu.load.raw * 100.0).round()),
-            inks.words2,
-            true,
-        );
-        x += gpu_lw;
-        let tw = (tile * 0.62).round().max(p.px(6.0));
-        p.tank((x, top, tw, block_h), m, gpu.cores, gap * 2.0);
-        x += tw + gap;
-        hits.push(Hit {
-            rect: (start, top, x - start, block_h),
-            instrument: Instrument::Gpu,
-            bar: Bar::Global,
-        });
-    }
-    x
-}
-
-/// Placeholder digits for a figure's widest form: `8` per digit of `n`.
-fn eights(n: usize) -> String {
-    "8".repeat(n.max(1).to_string().len())
-}
-
-/// The three rows' contents.
-fn rows<'a>(snap: &'a Snapshot, input: &DeckInput<'_>, inks: &VitalsInks) -> Vec<Row<'a>> {
-    let total_cores = snap.total_cores().map_or(1.0, |n| n as f32).max(1.0);
-    let tab: Option<&TabView> = input.tab_key.and_then(|k| snap.tab(k));
-    let cpu_motion = |t: &TrendView| t.motion(words::CORES_GATE);
-    let mut rows: Vec<Row<'_>> = Vec::with_capacity(3);
-    {
-        let busy = snap.cpu.as_ref().map(|c| c.busy);
-        let cpu_fig = busy.map_or_else(
-            || "\u{2014}".to_string(),
-            |b| words::cores_figure(b.level, snap.total_cores(), cpu_motion(&b)),
-        );
-        let mut clauses = Vec::new();
-        let mem_fig = snap.mem.as_ref().map_or_else(
-            || "\u{2014}".to_string(),
-            |m| {
-                let mut f = format!(
-                    "{}/{}G",
-                    words::gib_figure(m.sample.used()),
-                    words::gib_total(m.sample.total)
-                );
-                if m.sample.swap_used > 0 {
-                    f.push_str(&format!(" swap {}", words::mem(m.sample.swap_used)));
-                }
-                f
-            },
-        );
-        if let Some(m) = snap.mem.as_ref() {
-            // Windows fails an allocation at its commit limit while RAM is
-            // still free (design §9.6): near the limit the bar says so, in
-            // the warn ink, ahead of the pressure it raises, so it is the
-            // clause that stays when the words fold. Linux's heuristic
-            // commit is never said.
-            if let Some(pct) = m.sample.commit.and_then(|c| c.near_limit()) {
-                clauses.push(
-                    Clause::new(format!("commit {pct}% of limit"), inks.warn)
-                        .or_short(format!("commit {pct}%")),
-                );
-            }
-            match m.sample.pressure {
-                aterm_vitals::Pressure::Warn => clauses
-                    .push(Clause::new("memory pressure warn", inks.warn).or_short("pressure warn")),
-                aterm_vitals::Pressure::Critical => clauses.push(
-                    Clause::new("memory pressure critical", inks.critical)
-                        .or_short("pressure critical"),
-                ),
-                _ => {}
-            }
-        }
-        if let Some(v) = snap.volume.as_ref() {
-            let low = v.total > 0 && (v.available as f64) < v.total as f64 * 0.1;
-            let free = words::disk(v.available);
-            let short = free
-                .replace(" TB", "T")
-                .replace(" GB", "G")
-                .replace(" MB", "M");
-            let mark = if low { "\u{25E2} " } else { "" };
-            clauses.push(
-                Clause::new(
-                    format!("{mark}disk {free} free"),
-                    if low { inks.warn } else { inks.words2 },
-                )
-                .or_short(format!("{mark}{short} free")),
-            );
-        }
-        rows.push(Row {
-            bar: Bar::Global,
-            label: "Global".into(),
-            scope: Some(&snap.global),
-            cpu_ink: busy.map_or(inks.load[0], |b| inks.load_at(b.level / total_cores)),
-            mem_ink: inks.mem[0],
-            cpu_fig,
-            mem_fig,
-            clauses,
-        });
-    }
-    {
-        let at = snap.aterm.as_ref();
-        let cpu_fig = at.map_or_else(
-            || "\u{2014}".to_string(),
-            |sc| words::cores_figure(sc.cores.level, None, cpu_motion(&sc.cores)),
-        );
-        let mem_fig = at
-            .and_then(|sc| sc.footprint)
-            .map_or_else(String::new, |f| {
-                let mut s = words::mem(f);
-                if let Some(g) = at
-                    .map(|sc| sc.footprint_gib.motion(words::FOOTPRINT_GATE_GIB))
-                    .and_then(Motion::glyph)
-                {
-                    s.push(g);
-                }
-                s
-            });
-        let mut clauses = Vec::new();
-        match at {
-            None => clauses.push(Clause::new("measuring", inks.words2)),
-            Some(sc) => {
-                // Its share of what is busy, always with its noun: never a
-                // bare percentage.
-                if let Some(b) = snap
-                    .cpu
-                    .as_ref()
-                    .map(|c| c.busy.level)
-                    .filter(|b| *b > 0.05)
-                {
-                    clauses.push(Clause::new(
-                        format!(
-                            "{:.0}% of busy",
-                            (sc.cores.level / b * 100.0).clamp(0.0, 100.0)
-                        ),
-                        inks.words2,
-                    ));
-                }
-                if let Some((name, c)) = sc.top.as_ref().filter(|(_, c)| *c >= 0.05) {
-                    clauses.push(Clause::new(
-                        format!("{name} {}c", words::cores(*c)),
-                        inks.words2,
-                    ));
-                }
-                clauses.push(Clause::new(format!("{} proc", sc.procs), inks.words2));
-            }
-        }
-        rows.push(Row {
-            bar: Bar::Aterm,
-            label: "aterm".into(),
-            scope: at,
-            cpu_ink: inks.aterm,
-            mem_ink: inks.aterm,
-            cpu_fig,
-            mem_fig,
-            clauses,
-        });
-    }
-    {
-        let sc = tab.map(|t| &t.scope);
-        let label = tab.map_or_else(|| input.tab_label.clone(), |t| t.label.clone());
-        let cpu_fig = sc.map_or_else(
-            || "\u{2014}".to_string(),
-            |sc| words::cores_figure(sc.cores.level, None, cpu_motion(&sc.cores)),
-        );
-        let mem_fig = sc
-            .and_then(|sc| sc.footprint)
-            .map_or_else(String::new, words::mem);
-        let mut clauses = Vec::new();
-        match tab {
-            None => clauses.push(Clause::new("measuring", inks.words2)),
-            Some(t) => {
-                if !t.program.is_empty() {
-                    clauses.push(Clause::new(t.program.clone(), inks.words));
-                }
-                // With one tab the row says so (§12.2), before the clauses
-                // that fold first, so every width that shows the program
-                // shows it too.
-                if input.tab_count == 1 {
-                    clauses.push(Clause::new("the only tab", inks.words2));
-                }
-                if let Some((name, c)) = t
-                    .scope
-                    .top
-                    .as_ref()
-                    .filter(|(n, c)| *c >= 0.05 && *n != t.program)
-                {
-                    clauses.push(Clause::new(
-                        format!("{name} {}c", words::cores(*c)),
-                        inks.words2,
-                    ));
-                }
-                clauses.push(Clause::new(format!("{} proc", t.scope.procs), inks.words2));
-            }
-        }
-        rows.push(Row {
-            bar: Bar::Tab,
-            label,
-            scope: sc,
-            cpu_ink: inks.tab,
-            mem_ink: inks.tab,
-            cpu_fig,
-            mem_fig,
-            clauses,
-        });
-    }
-    rows
-}
-
-/// [`deck_prims`] with the hit regions a pointer can rest on (card pixels).
-pub(crate) fn deck_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<Hit>) {
-    let inks = input.inks;
-    let s = g.scale.max(0.5);
-    let mut p = Painter::new(&inks, s, g.font_px, input.dwc);
-    let mut hits = Vec::new();
-    let (w, h) = (g.w.round(), g.h.round());
-    // The ground, and a hairline seam to the grid below.
-    p.prims
-        .push(panel(0.0, 0.0, w, h, 0.0, rgba(inks.ground, 0xFF)));
-    let seam = p.hair();
-    p.prims
-        .push(panel(0.0, h - seam, w, seam, 0.0, rgba(input.seam, 0xFF)));
-
-    let margin_y = p.px(4.0);
-    let left = g.pad.round().max(p.px(8.0));
-    let right = w - left;
-    let Some(snap) = input.snap else {
-        let base = crate::tray_raster::row_baseline(0.0, h, p.text_px.get());
-        p.label(
-            left,
-            base,
-            "Reading the machine\u{2026}".into(),
-            inks.words2,
-            false,
-            false,
-        );
-        return (p.prims, hits);
-    };
-    let inner_h = h - 2.0 * margin_y - seam;
-    let mut x = left;
-
-    if let Some(cpu) = snap.cpu.as_ref() {
-        x = core_block(
-            &mut p,
-            cpu,
-            snap.gpu.as_ref(),
-            x,
-            margin_y,
-            inner_h,
-            (right - left) * 0.32,
-            &mut hits,
-        );
-        x += p.px(6.0);
-    }
-
-    let total_cores = snap.total_cores().map_or(1.0, |n| n as f32).max(1.0);
-    let mem_total = snap.mem.as_ref().map_or(0, |m| m.sample.total);
-    let rows = rows(snap, input, &inks);
-
-    let row_gap = p.px(3.0);
-    let row_h = ((inner_h - 2.0 * row_gap) / 3.0).floor();
-    let lane_h = (row_h * 0.40).round().max(p.px(2.0));
-    let gap = p.px(5.0);
-    let key_w = p.px(2.5).max(2.0);
-    let key_h = (p.text_px.get() * 0.70).round();
-    let label_w = rows
-        .iter()
-        .map(|r| p.label_w(&r.label, true, false))
-        .fold(0.0f32, f32::max)
-        + key_w
-        + p.px(4.0)
-        + gap;
-    let n = snap.total_cores().unwrap_or(8);
-    let cpu_fig_w = p.figure_w(&format!("{}.8c/{}\u{25B4}", eights(n), eights(n)), false) + gap;
-    // The memory figure's column holds the widest figure this machine can
-    // show now: swap widens it only while swap is in use.
-    let swapping = snap.mem.as_ref().is_some_and(|m| m.sample.swap_used > 0);
-    let total_word = snap
-        .mem
-        .as_ref()
-        .map_or_else(|| "32".to_string(), |m| words::gib_total(m.sample.total));
-    let mem_fig_w = if swapping {
-        p.figure_w(&format!("88.8/{total_word}G swap 88.8 GiB"), false)
-    } else {
-        p.figure_w(&format!("88.8/{total_word}G"), false)
-            .max(p.figure_w("888 MiB\u{25B4}", false))
-    } + gap;
-    let bracket_w = p.px(3.0);
-    let room = (right - x - label_w - cpu_fig_w - mem_fig_w - bracket_w).max(0.0);
-    // The words keep a column of their own, a fixed share of the room, so
-    // the lanes never move when a name changes; they leave only when the
-    // room is too small for the shortest clause.
-    let words_w = if room > p.px(150.0) {
-        (room * 0.30)
-            .max(p.label_w("disk 8.88 TB free", false, false))
-            .min(p.label_w(&"m".repeat(40), false, false))
-            .floor()
-    } else {
-        0.0
-    };
-    let avail = room - words_w;
-    // Width shares of the rest: the CPU lane, the sparkline, the memory lane.
-    // The trace stays down to a half-screen window (110 columns at 2×): it
-    // is the bar's two minutes, and the lanes give up width before it does.
-    let (cpu_w, spark_w, mem_w) = if avail > p.px(200.0) {
-        let spark = (avail * 0.18).floor().clamp(p.px(40.0), p.px(120.0));
-        let rest = avail - spark - gap;
-        ((rest * 0.55).floor(), spark, (rest * 0.45).floor())
-    } else if avail > p.px(90.0) {
-        ((avail * 0.56).floor(), 0.0, (avail * 0.44 - gap).floor())
-    } else {
-        (avail.floor(), 0.0, 0.0)
-    };
-    let pinned = snap
-        .cpu
-        .as_ref()
-        .is_some_and(|c| c.busy.level >= total_cores * 0.98);
-    for (i, row) in rows.iter().enumerate() {
-        let ry = margin_y + i as f32 * (row_h + row_gap);
-        let base = crate::tray_raster::row_baseline(ry, row_h, p.text_px.get());
-        let ly = (ry + (row_h - lane_h) / 2.0).round();
-        let mut cx = x;
-        if i > 0 {
-            // An engraved groove between two bars.
-            let gy = (ry - row_gap / 2.0).floor();
-            p.prims.push(panel(
-                x,
-                gy,
-                right - x,
-                p.hair(),
-                0.0,
-                rgba(inks.groove, 0xFF),
-            ));
-        }
-        // The key swatch, then the label: the swatch is the bar's legend.
-        let ky = (ry + (row_h - key_h) / 2.0).round();
-        match row.bar {
-            Bar::Global => p.ramp_keyline(cx, ky, key_w, key_h),
-            Bar::Aterm => p.keyline(cx, ky, key_w, key_h, inks.aterm),
-            Bar::Tab => p.keyline(cx, ky, key_w, key_h, inks.tab),
-        }
-        p.label(
-            cx + key_w + p.px(4.0),
-            base,
-            row.label.clone(),
-            inks.words,
-            true,
-            false,
-        );
-        let row_instrument_end = cx + label_w;
-        hits.push(Hit {
-            rect: (cx, ry, label_w, row_h),
-            instrument: Instrument::Cores,
-            bar: row.bar,
-        });
-        cx = row_instrument_end;
-        let slot = (
-            cx - gap / 2.0,
-            ry - row_gap / 2.0,
-            cpu_w + gap,
-            row_h + row_gap,
-        );
-        if cpu_w > 0.0 {
-            match row.scope {
-                Some(sc) => {
-                    let m = Mark::of(&sc.cores, total_cores, words::CORES_GATE);
-                    p.lane(cx, ly, cpu_w, lane_h, m, row.cpu_ink, slot, false);
-                }
-                None => p.prims.push(panel(
-                    cx,
-                    ly,
-                    cpu_w,
-                    lane_h,
-                    (lane_h / 2.0).floor(),
-                    a(inks.track, 0.6),
-                )),
-            }
-            let bh = lane_h + p.px(4.0);
-            p.bracket(
-                cx + cpu_w + p.px(1.0),
-                (ry + (row_h - bh) / 2.0).round(),
-                bh,
-                pinned && row.bar == Bar::Global,
-            );
-            hits.push(Hit {
-                rect: (cx, ry, cpu_w + bracket_w, row_h),
-                instrument: Instrument::Cores,
-                bar: row.bar,
-            });
-            cx += cpu_w + bracket_w;
-        }
-        p.figure(cx, base, row.cpu_fig.clone(), inks.words, false);
-        cx += cpu_fig_w;
-        if spark_w > 0.0 {
-            if let Some(sc) = row.scope {
-                let vals: Vec<Option<f32>> = sc
-                    .history
-                    .iter()
-                    .map(|v| v.map(|c| c / total_cores))
-                    .collect();
-                p.spark(
-                    cx,
-                    (ry + row_h * 0.12).round(),
-                    spark_w,
-                    (row_h * 0.76).round(),
-                    &vals,
-                    row.cpu_ink,
-                );
-                hits.push(Hit {
-                    rect: (cx, ry, spark_w, row_h),
-                    instrument: Instrument::Cores,
-                    bar: row.bar,
-                });
-            }
-            cx += spark_w + gap;
-        }
-        if mem_w > 0.0 {
-            let mem_slot = (
-                cx - gap / 2.0,
-                ry - row_gap / 2.0,
-                mem_w + gap,
-                row_h + row_gap,
-            );
-            if row.bar == Bar::Global {
-                if let Some(m) = snap.mem.as_ref() {
-                    global_memory(&mut p, cx, ly, mem_w, lane_h, m);
-                }
-            } else if let (Some(sc), true) = (row.scope, mem_total > 0) {
-                let mut t = sc.footprint_gib;
-                let cap = aterm_vitals::model::gib(mem_total);
-                if t.level == 0.0 && sc.footprint.is_some() {
-                    t = TrendView::flat(aterm_vitals::model::gib(sc.footprint.unwrap_or(0)));
-                }
-                let m = Mark::of(&t, cap, words::FOOTPRINT_GATE_GIB);
-                p.lane(cx, ly, mem_w, lane_h, m, row.mem_ink, mem_slot, false);
-            }
-            hits.push(Hit {
-                rect: (cx, ry, mem_w + gap, row_h),
-                instrument: Instrument::Memory,
-                bar: row.bar,
-            });
-            cx += mem_w + gap / 2.0;
-        }
-        if !row.mem_fig.is_empty() {
-            p.figure(cx, base, row.mem_fig.clone(), inks.words, false);
-        }
-        cx += mem_fig_w;
-        if words_w > 0.0 || cx < right {
-            let mut wx = cx;
-            if row.bar == Bar::Aterm && !input.marks.is_empty() {
-                // The attention marks lead the aterm bar's words.
-                let r = (p.text_px.get() * 0.36).round();
-                for m in input.marks.iter().take(3) {
-                    p.mark(m.kind, wx + r, (ry + row_h / 2.0).round(), r, m.frac);
-                    wx += 2.0 * r + p.px(2.0);
-                    let c = m.count.to_string();
-                    let cw = p.figure_w(&c, false);
-                    let ink = if m.kind == WellMark::Stuck {
-                        inks.stuck
-                    } else {
-                        inks.words2
-                    };
-                    p.figure(wx, base, c, ink, false);
-                    wx += cw + p.px(6.0);
-                }
-                hits.push(Hit {
-                    rect: (cx, ry, wx - cx, row_h),
-                    instrument: Instrument::Jobs,
-                    bar: Bar::Aterm,
-                });
-            }
-            let parts = p.fit_clauses(&row.clauses, (right - wx).max(0.0), false);
-            if !parts.is_empty() {
-                let end = p.clauses(wx, base, parts, false);
-                if row.bar == Bar::Global && snap.volume.is_some() {
-                    hits.push(Hit {
-                        rect: (wx, ry, end - wx, row_h),
-                        instrument: Instrument::Disk,
-                        bar: Bar::Global,
-                    });
-                }
-            }
-        }
-    }
-    (p.prims, hits)
-}
-
-/// The machine's memory by class in one lane: used, compressed, cached
-/// files, then free as the track, with the pressure cap at the end when
-/// pressure is not normal.
-pub(crate) fn global_memory(
-    p: &mut Painter<'_>,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    m: &aterm_vitals::model::MemView,
-) {
-    let inks = *p.inks;
-    let total = m.sample.total.max(1) as f32;
-    let r = (h / 2.0).floor();
-    p.prims.push(panel(x, y, w, h, r, rgba(inks.track, 0xFF)));
-    p.prims.push(DrawPrim::ClipPush { x, y, w, h });
-    let used_plain = m.sample.app.saturating_add(m.sample.wired) as f32;
-    let parts = [
-        (used_plain, inks.mem[0]),
-        (m.sample.compressed.unwrap_or(0) as f32, inks.mem[1]),
-        (m.sample.cached as f32, inks.mem[2]),
-    ];
-    let mut mx = x;
-    for (k, (bytes, c)) in parts.iter().enumerate() {
-        let pw = (bytes / total * w).round().min(x + w - mx);
-        if pw >= 1.0 {
-            let (px0, pw0) = if k == 0 { (mx - r, pw + r) } else { (mx, pw) };
-            p.prims.push(panel(
-                px0,
-                y,
-                pw0,
-                h,
-                if k == 0 { r } else { 0.0 },
-                rgba(*c, 0xFF),
-            ));
-            mx += pw;
-        }
-    }
-    p.prims.push(DrawPrim::ClipPop);
-    let cap = match m.sample.pressure {
-        aterm_vitals::Pressure::Warn => Some(inks.warn),
-        aterm_vitals::Pressure::Critical => Some(inks.critical),
-        _ => None,
-    };
-    if let Some(c) = cap {
-        let cw = p.px(2.0).max(2.0);
-        p.prims.push(panel(
-            (x + (m.sample.used() as f32 / total * w).round() - cw).max(x),
-            y - 1.0,
-            cw,
-            h + 2.0,
-            0.0,
-            rgba(c, 0xFF),
-        ));
-    }
 }
 
 /// A fingerprint of the prims, so an identical layout presents nothing.
@@ -1012,8 +2198,11 @@ pub(crate) struct DeckFrame {
     /// The lens's inks: always solved on the band ground (the lens sits in
     /// band-ground wells over either form).
     pub(crate) lens_inks: VitalsInks,
-    pub(crate) seam: Rgb,
     pub(crate) dwc: bool,
+    /// The window's Deck form (§2).
+    pub(crate) deck: DeckForm,
+    /// Increase Contrast.
+    pub(crate) contrast: bool,
 }
 
 impl crate::App {
@@ -1051,13 +2240,18 @@ impl crate::App {
         let w = ws.cols as usize * cw + 2 * pad;
         let (tab_key, tab_label) = self.deck_tab(wid);
         let tab_count = ws.tab_set.tabs().len();
-        let dwc = crate::native_appearance::current_preferences().differentiate_without_color;
+        let prefs = crate::native_appearance::current_preferences();
+        let (dwc, contrast) = (prefs.differentiate_without_color, prefs.high_contrast);
         let palette = self.chrome_palette(crate::app_render::ChromeSurface::Header);
         let band = crate::chrome_band::band_colors(palette);
         let band_inks = cached_inks(band.bar_bg, band.value, band.accent);
         match form {
             StatsBars::Off => None,
             StatsBars::Deck => {
+                // The window's own form and cell height, as its head sites
+                // count them (`App::deck_head_px`), at the rows the head
+                // gives it (`App::deck_rows_px`), so the card, the lens and
+                // the hit map sit where the head put the Deck.
                 let rows = self.deck_rows_px(wid)?;
                 let (dy, deck) = (rows.start, rows.len());
                 Some(DeckFrame {
@@ -1076,8 +2270,9 @@ impl crate::App {
                     tab_count,
                     inks: band_inks,
                     lens_inks: band_inks,
-                    seam: band.seam,
                     dwc,
+                    deck: ws.deck_form,
+                    contrast,
                 })
             }
             StatsBars::Sill => {
@@ -1090,7 +2285,6 @@ impl crate::App {
                 // solved on the background the pad is painted in (§12.2
                 // "Plate"), the front tab's own theme when it draws one.
                 let (floor, value, accent) = self.sill_floor(tab_key);
-                let prefs = crate::native_appearance::current_preferences();
                 let translucent = self.config.background_opacity_or_default() < 1.0
                     || self.config.wallpaper.is_some();
                 let plate = translucent.then_some(if prefs.reduced_transparency {
@@ -1114,8 +2308,9 @@ impl crate::App {
                     tab_count,
                     inks: cached_inks(floor, value, accent),
                     lens_inks: band_inks,
-                    seam: floor,
                     dwc,
+                    deck: ws.deck_form,
+                    contrast,
                 })
             }
         }
@@ -1192,8 +2387,11 @@ impl crate::App {
         f.tab_count.hash(&mut h);
         f.dwc.hash(&mut h);
         f.plate.hash(&mut h);
+        f.deck.hash(&mut h);
+        f.contrast.hash(&mut h);
         format!("{:?}", f.inks).hash(&mut h);
-        f.seam.hash(&mut h);
+        // The face the words are measured in: a new UI font re-lays them.
+        Arc::as_ptr(&deck_metrics()).hash(&mut h);
         // The marks come from the snapshot, whose sequence is hashed above.
         h.finish() | 1
     }
@@ -1208,10 +2406,17 @@ impl crate::App {
             tab_label: f.tab_label.clone(),
             tab_count: f.tab_count,
             inks: f.inks,
-            seam: f.seam,
             dwc: f.dwc,
             marks: self.stats_marks(),
             plate: f.plate,
+            form: f.deck,
+            contrast: f.contrast,
+            // A new snapshot re-lays the card each second, so the clock's
+            // zone is read again with it.
+            locale: Locale {
+                platform: Platform::host(),
+                utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
+            },
         };
         let (prims, hits) = match f.form {
             StatsBars::Sill => crate::stats_sill::sill_paint(&f.geom, &input),
@@ -1374,180 +2579,98 @@ impl crate::App {
     }
 }
 
-/// The stats bars as a reader meets them (design §12.2 Accessibility): a
-/// group a bar named for its scope and described by its sentence, its meters
-/// with value and range, the core row a grid of per-core meters. Pure, so a
-/// test reads it without an App.
+/// The deck's accessibility group's name (Stats Deck v2 §12).
 #[cfg(a11y_tree)]
-pub(crate) fn stats_a11y_groups(
-    snap: &Snapshot,
+const A11Y_TITLE: &str = "Stats deck, last 10 minutes";
+
+/// A share (1 is 100 %) as a meter's value: a whole percent, as the % column
+/// prints it, never past 100 (the over mark and the words carry the
+/// excess); `None` when unknown. A share above 0 that the column prints as
+/// "<1%" keeps a tenth of a percent, at least 0.1, so the value is not 0
+/// beside words that say "less than 1 percent".
+#[cfg(a11y_tree)]
+fn meter_pct(share: Option<f32>) -> Option<f32> {
+    share.filter(|v| v.is_finite()).map(|v| {
+        let pct = v * 100.0;
+        if pct > 0.0 && pct < 0.5 {
+            ((pct * 10.0).round() / 10.0).max(0.1)
+        } else {
+            pct.round().clamp(0.0, 100.0)
+        }
+    })
+}
+
+/// The deck as a reader meets it (Stats Deck v2 §12, whose
+/// `stats_a11y_groups` this is, one group now): a group named
+/// [`A11Y_TITLE`] holding one meter a resource in row order, each valued at
+/// its % of max (none when unknown) and described by its row's sentence
+/// (`words::row_sentence`, what ⌘C in the lens copies), and a group of one
+/// meter a core named by its cluster ("Super core 1"). Before the first
+/// snapshot every row says it is reading. Pure, so a test reads it without
+/// an App.
+#[cfg(a11y_tree)]
+pub(crate) fn stats_a11y_group(
+    snap: Option<&Snapshot>,
     tab_key: Option<u64>,
-    tab_label: &str,
-    marks: &[StatsMark],
-) -> Vec<crate::a11y_tree::StatsGroup> {
+    loc: &Locale,
+) -> crate::a11y_tree::StatsGroup {
     use crate::a11y_tree::{StatsGroup, StatsMeter};
-    let gib = aterm_vitals::model::gib;
-    let total_cores = snap.total_cores().unwrap_or(0);
-    let mem_total = snap.mem.as_ref().map_or(0, |m| m.sample.total);
-    let motion = |t: &TrendView, gate: f32| {
-        t.motion(gate)
-            .word()
-            .map_or(String::new(), |w| format!(", {w}"))
+    let empty;
+    let snap = match snap {
+        Some(snap) => snap,
+        None => {
+            empty = Snapshot::default();
+            &empty
+        }
     };
-    let cpu_meter = |level: f32, words: String| StatsMeter {
-        name: "CPU".into(),
-        value: f64::from(level),
-        min: 0.0,
-        max: total_cores.max(1) as f64,
-        words,
-    };
-    let footprint_meter = |bytes: u64| StatsMeter {
-        name: "Memory".into(),
-        value: f64::from(gib(bytes)),
-        min: 0.0,
-        max: f64::from(gib(mem_total.max(1))),
-        words: format!("{} footprint", words::mem(bytes)),
-    };
-    let mut global = Vec::new();
-    if let Some(cpu) = snap.cpu.as_ref() {
-        global.push(cpu_meter(
-            cpu.busy.level,
-            format!(
-                "{} of {} cores busy{}",
-                words::cores(cpu.busy.level),
-                cpu.total(),
-                motion(&cpu.busy, words::CORES_GATE)
+    let meters = Resource::ALL
+        .iter()
+        .map(|&res| StatsMeter {
+            name: words::resource_name(res).into(),
+            value: meter_pct(
+                (snap.seq > 0)
+                    .then(|| snap.resources[res.index()].heat_now)
+                    .flatten(),
             ),
-        ));
-    }
-    if let Some(g) = snap.gpu.as_ref() {
-        let pct = (g.load.raw * 100.0).round();
-        global.push(StatsMeter {
-            name: "GPU".into(),
-            value: f64::from(pct),
-            min: 0.0,
-            max: 100.0,
-            words: format!("{pct:.0} percent"),
-        });
-    }
-    if let Some(m) = snap.mem.as_ref() {
-        global.push(StatsMeter {
-            name: "Memory".into(),
-            value: f64::from(gib(m.sample.used())),
-            min: 0.0,
-            max: f64::from(gib(m.sample.total)),
-            words: format!(
-                "{} of {} GiB used, pressure {}",
-                words::gib_figure(m.sample.used()),
-                words::gib_total(m.sample.total),
-                m.sample.pressure.word()
-            ),
-        });
-    }
-    if let Some(v) = snap.volume.as_ref() {
-        let used = v.total.saturating_sub(v.available);
-        global.push(StatsMeter {
-            name: "Disk".into(),
-            value: used as f64 / 1e9,
-            min: 0.0,
-            max: v.total as f64 / 1e9,
-            words: format!(
-                "{} free of {}",
-                words::disk(v.available),
-                words::disk(v.total)
-            ),
-        });
-    }
-    let cores = snap.cpu.as_ref().map_or_else(Vec::new, |cpu| {
+            words: words::row_sentence(res, snap, tab_key, loc),
+        })
+        .collect();
+    let cores: Vec<StatsMeter> = snap.cpu.as_ref().map_or_else(Vec::new, |cpu| {
         cpu.clusters
             .iter()
             .flat_map(|cluster| {
-                cluster.cores.iter().enumerate().filter_map(|(k, &core)| {
-                    let view = cpu.cores.get(core)?;
-                    let m = Mark::of(&view.load, 1.0, words::LOAD_GATE);
-                    let pct = (view.load.level * 100.0).round();
-                    Some(StatsMeter {
+                cluster.cores.iter().enumerate().map(|(k, &core)| {
+                    let value = meter_pct(cpu.cores.get(core).map(|c| c.load.level));
+                    StatsMeter {
                         name: format!("{} core {}", cluster.name, k + 1),
-                        value: f64::from(pct),
-                        min: 0.0,
-                        max: 100.0,
-                        words: format!(
-                            "{pct:.0} %{}, {}",
-                            motion(&view.load, words::LOAD_GATE),
-                            m.edge_word()
+                        value,
+                        words: value.map_or_else(
+                            || "not read".to_owned(),
+                            |p| format!("{p:.0} percent busy"),
                         ),
-                    })
+                    }
                 })
             })
             .collect()
     });
-    let mut aterm = Vec::new();
-    if let Some(a) = snap.aterm.as_ref() {
-        aterm.push(cpu_meter(
-            a.cores.level,
-            format!(
-                "{} cores{}",
-                words::cores(a.cores.level),
-                motion(&a.cores, words::CORES_GATE)
-            ),
-        ));
-        if let Some(f) = a.footprint {
-            aterm.push(footprint_meter(f));
-        }
+    let n = cores.len();
+    StatsGroup {
+        name: A11Y_TITLE,
+        meters,
+        cores_name: format!("{n} CPU {}", if n == 1 { "core" } else { "cores" }),
+        cores,
     }
-    let mut tab_meters = Vec::new();
-    let tab = tab_key.and_then(|k| snap.tab(k));
-    if let Some(t) = tab {
-        tab_meters.push(cpu_meter(
-            t.scope.cores.level,
-            format!(
-                "{} cores{}",
-                words::cores(t.scope.cores.level),
-                motion(&t.scope.cores, words::CORES_GATE)
-            ),
-        ));
-        if let Some(f) = t.scope.footprint {
-            tab_meters.push(footprint_meter(f));
-        }
-    }
-    let marks = (!marks.is_empty()).then(|| {
-        marks
-            .iter()
-            .map(|m| m.words())
-            .collect::<Vec<_>>()
-            .join(", ")
-    });
-    vec![
-        StatsGroup {
-            name: "Global",
-            sentence: words::global_sentence(snap),
-            meters: global,
-            cores,
-            marks: None,
-        },
-        StatsGroup {
-            name: "aterm",
-            sentence: words::aterm_sentence(snap),
-            meters: aterm,
-            cores: Vec::new(),
-            marks,
-        },
-        StatsGroup {
-            name: "Tab",
-            sentence: crate::stats_lens::sentence(snap, Bar::Tab, tab_key, tab_label),
-            meters: tab_meters,
-            cores: Vec::new(),
-            marks: None,
-        },
-    ]
 }
 
 impl crate::App {
-    /// The stats bars for `wid`'s accessibility tree, while it shows them.
+    /// The stats deck for `wid`'s accessibility tree, while it shows one.
     #[cfg(a11y_tree)]
     pub(crate) fn stats_a11y(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridStats> {
         let f = self.deck_frame(wid)?;
-        let snap = self.vitals.snapshot.as_deref()?;
+        let loc = Locale {
+            platform: Platform::host(),
+            utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
+        };
         let (ox, oy) = self.frame_origin(wid);
         let bounds = aterm_a11y::model::Rect {
             x0: ox as f64,
@@ -1555,28 +2678,28 @@ impl crate::App {
             x1: ox as f64 + f64::from(f.geom.w),
             y1: oy as f64 + f64::from(f.dy) + f64::from(f.geom.h),
         };
-        let lens = self.lens_frame(wid).map(|(lg, lens, _)| {
-            let bar = match lens.bar {
-                Bar::Global => "Global",
-                Bar::Aterm => "aterm",
-                Bar::Tab => "Tab",
-            };
-            crate::a11y_tree::StatsLens {
-                keyboard: lens.how == crate::stats_lens::Opened::Keyboard,
-                bar,
-                bar_words: crate::stats_lens::sentence(snap, lens.bar, f.tab_key, &f.tab_label),
-                focus: lens.focus.word(),
-                focus_words: crate::stats_lens::readout(snap, lens.focus),
+        let lens = self
+            .stats_lens_words(wid)
+            .map(|(lg, lens, laid)| crate::a11y_tree::StatsLens {
+                keys: lens.how != crate::stats_lens::Opened::Hover,
+                name: laid.title,
+                // How to read is read whole: the grammar its sections draw
+                // in pieces (§12).
+                explainer: if lens.focus == Instrument::HowToRead {
+                    crate::stats_lens::how_to_read_words(loc.platform)
+                } else {
+                    laid.explainer
+                },
+                wells: laid.wells,
                 bounds: Some(aterm_a11y::model::Rect {
                     x0: ox as f64 + f64::from(lg.dx),
                     y0: oy as f64 + f64::from(lg.dy),
                     x1: ox as f64 + f64::from(lg.dx) + f64::from(lg.w),
                     y1: oy as f64 + f64::from(lg.dy) + f64::from(lg.h),
                 }),
-            }
-        });
+            });
         Some(crate::a11y_tree::GridStats {
-            groups: stats_a11y_groups(snap, f.tab_key, &f.tab_label, &self.stats_marks()),
+            group: stats_a11y_group(self.vitals.snapshot.as_deref(), f.tab_key, &loc),
             bounds: Some(bounds),
             lens,
         })
@@ -1592,9 +2715,7 @@ pub(crate) mod tests {
     };
 
     /// Gives this test thread's windows the stats bars, as glass gives a
-    /// real window ([`stats_drawn_on`]), until the guard drops. For the lens's
-    /// behaviour tests, which are unix's.
-    #[cfg(unix)]
+    /// real window ([`stats_drawn_on`]), until the guard drops.
     #[must_use]
     pub(crate) fn attach_stats() -> Attached {
         TESTS_ATTACHED.with(|c| c.set(true));
@@ -1602,10 +2723,8 @@ pub(crate) mod tests {
     }
 
     /// [`attach_stats`]'s guard: dropping it takes the bars away again.
-    #[cfg(unix)]
     pub(crate) struct Attached;
 
-    #[cfg(unix)]
     impl Drop for Attached {
         fn drop(&mut self) {
             TESTS_ATTACHED.with(|c| c.set(false));
@@ -1615,19 +2734,239 @@ pub(crate) mod tests {
     /// Only the Deck takes room: the head the grid fit reads is the same for
     /// the sill and off, so the config apply's re-grid predicate agrees with
     /// the head for every pair of forms, and a sill ↔ off change re-grids
-    /// nothing.
+    /// nothing. The Deck's own form moves the head only while the Deck takes
+    /// room, and then by whole cells (T-G5, T-G6).
     #[test]
     fn only_a_change_into_or_out_of_the_deck_moves_the_head() {
-        for a in StatsBars::ALL {
-            for b in StatsBars::ALL {
-                let moved = chrome_head_px(28.0, 2.0, a) != chrome_head_px(28.0, 2.0, b);
-                assert_eq!(a.takes_room() != b.takes_room(), moved, "{a:?} to {b:?}");
+        const CELL: usize = 28;
+        let head = |bars, deck| chrome_head_px(28.0, 2.0, bars, deck, CELL);
+        for deck in [DeckForm::Folded, DeckForm::Full] {
+            for a in StatsBars::ALL {
+                for b in StatsBars::ALL {
+                    let moved = head(a, deck) != head(b, deck);
+                    assert_eq!(
+                        a.takes_room() != b.takes_room(),
+                        moved,
+                        "{a:?} to {b:?}, {deck:?}"
+                    );
+                }
             }
         }
+        for bars in StatsBars::ALL {
+            let unfold = head(bars, DeckForm::Full) - head(bars, DeckForm::Folded);
+            assert_eq!(unfold != 0, bars.takes_room(), "{bars:?}");
+            assert_eq!(unfold % CELL, 0, "{bars:?}");
+        }
         assert_eq!(
-            chrome_head_px(28.0, 2.0, StatsBars::Sill),
-            chrome_head_px(28.0, 2.0, StatsBars::Off)
+            head(StatsBars::Sill, DeckForm::Folded),
+            head(StatsBars::Off, DeckForm::Full)
         );
+    }
+
+    /// T-G6: the head sites and `deck_frame` agree. Every site that derives
+    /// an attached window's head (the macOS resize, the synthetic strip, the
+    /// scale change, the metrics refresh and the attach) takes it from
+    /// `App::deck_head_px`; the card, the lens and the hit map take the Deck
+    /// from `deck_frame`. For one window in either form, at 1× and 2× and
+    /// cells of 10 to 40 px, both give the same Deck beside the same band:
+    /// under it on macOS, where the grid starts where the card ends; at the
+    /// head's top where the strip is the window's band (Linux, Windows),
+    /// where the band follows the card and the grid follows the band
+    /// (`App::deck_rows_px`). A change of form moves the head
+    /// by whole cells, so every frame on the whole-cell resize lattice fits
+    /// the grid with the same remainder in either form: the lattice has no
+    /// slack.
+    #[test]
+    fn head_sites_agree() {
+        use aterm_window::dpi::PhysicalSize;
+        let _attached = attach_stats();
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let band_pts = 28.0;
+        let mut cells = std::collections::BTreeSet::new();
+        for scale in [1.0, 2.0] {
+            let band = band_px(band_pts, scale);
+            for font_px in [8.0, 11.0, 14.0, 18.0, 23.0, 28.0, 35.0] {
+                {
+                    let ws = app.windows.get_mut(&wid).expect("the window");
+                    ws.scale = scale;
+                    ws.head_pts = band_pts;
+                    ws.metrics.font_px = font_px;
+                }
+                let (_, ch) = app.win_cell_size(wid);
+                cells.insert(ch);
+                let at = format!("{ch} px cells at {scale}×");
+                // One frame under the auto band's floor, one over its ceiling.
+                let mut heads = Vec::new();
+                for (avail, want) in [(700.0, DeckForm::Folded), (900.0, DeckForm::Full)] {
+                    let frame = band + (FOLDED_PT * scale) as usize + (avail * scale) as usize;
+                    let head = app.deck_head_px(wid, band_pts, scale, frame as u32);
+                    let ws = app.windows.get_mut(&wid).expect("the window");
+                    assert_eq!(ws.deck_form, want, "{at}");
+                    ws.metrics.head = head;
+                    app.backend.set_head(head);
+                    let f = app.deck_frame(wid).expect("the Deck shows");
+                    // Where the band sits above the card (macOS) and below
+                    // it (the band platforms).
+                    let (above, below) = if crate::tab_bar::STRIP_IS_CHROME_BAND {
+                        (0, band)
+                    } else {
+                        (band, 0)
+                    };
+                    assert_eq!(f.dy as usize, above, "{at}");
+                    assert_eq!(f.geom.h as usize + band, head, "{at}");
+                    assert_eq!(
+                        f.geom.h as usize,
+                        deck_px(StatsBars::Deck, want, scale, ch),
+                        "{at}"
+                    );
+                    assert_eq!(
+                        f.dy as usize + f.geom.h as usize + below,
+                        app.win_head(wid),
+                        "the grid starts under the card and the band, {at}"
+                    );
+                    if crate::tab_bar::STRIP_IS_CHROME_BAND {
+                        // The band lifts its canvas over the top pad and its
+                        // own height only: it spans what the card leaves.
+                        assert_eq!(
+                            app.strip_band_top_px(wid),
+                            app.win_pad_top(wid) + band,
+                            "the band starts where the card ends, {at}"
+                        );
+                    }
+                    heads.push(head);
+                }
+                let (folded, full) = (heads[0], heads[1]);
+                assert_eq!((full - folded) % ch, 0, "{at}");
+                let lost = (full - folded) / ch;
+                let fit = |app: &mut crate::App, head: usize, h: usize| {
+                    app.windows.get_mut(&wid).expect("the window").metrics.head = head;
+                    app.backend.set_head(head);
+                    let size = PhysicalSize::new(800, h as u32);
+                    let (rows, _) = app.grid_dims_for(wid, size);
+                    (rows, app.whole_cell_min_size(wid).height)
+                };
+                let low = full + 8 * ch;
+                for h in low..low + 3 * ch {
+                    let (folded_rows, folded_min) = fit(&mut app, folded, h);
+                    let (full_rows, full_min) = fit(&mut app, full, h);
+                    assert_eq!(
+                        usize::from(folded_rows - full_rows),
+                        lost,
+                        "a {h} px frame, {at}"
+                    );
+                    assert_eq!((full_min - folded_min) % ch as u32, 0, "{at}");
+                }
+            }
+        }
+        assert!(
+            // DejaVu Sans Mono's 8 px line (the Linux lane's) is 11 px.
+            cells.first().is_some_and(|c| *c <= 12) && cells.last().is_some_and(|c| *c >= 40),
+            "the cells span 12 to 40 px: {cells:?}"
+        );
+    }
+
+    /// The setting forces the form on every window event and never moves it
+    /// otherwise; a frame not sized yet keeps it.
+    #[test]
+    fn the_deck_size_setting_forces_the_form() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let form = |app: &crate::App| app.windows[&wid].deck_form;
+        let tall = 56 + 124 + 1800;
+        let short = 56 + 124 + 1400;
+        for (word, frame, want) in [
+            ("folded", tall, DeckForm::Folded),
+            ("full", short, DeckForm::Full),
+            ("auto", short, DeckForm::Folded),
+            ("auto", tall, DeckForm::Full),
+            ("auto", 0, DeckForm::Full),
+        ] {
+            app.config
+                .sys
+                .get_or_insert_with(Default::default)
+                .stats_deck_size = Some(word.into());
+            let head = app.deck_head_px(wid, 28.0, 2.0, frame);
+            assert_eq!(form(&app), want, "{word} at {frame} px");
+            let (_, ch) = app.win_cell_size(wid);
+            assert_eq!(
+                head,
+                56 + deck_px(StatsBars::Deck, want, 2.0, ch),
+                "{word} at {frame} px"
+            );
+        }
+    }
+
+    /// §2.3: a restored window decides its form from the frame it carries.
+    /// A Full window whose avail sits in the hysteresis band (850 to 870 pt
+    /// under the Folded deck, Full only because it was) comes back Full at
+    /// its own size; a Folded one in the same band stays Folded at its size;
+    /// a new window of the Full one's grid decides Folded, from the frame
+    /// that grid has under the Folded deck.
+    #[test]
+    fn a_restored_window_keeps_its_form_and_size() {
+        use aterm_window::dpi::PhysicalSize;
+        let _attached = attach_stats();
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let (band_pts, scale) = (28.0, 2.0);
+        {
+            let ws = app.windows.get_mut(&wid).expect("the window");
+            ws.scale = scale;
+            ws.head_pts = band_pts;
+        }
+        let (_, cell) = app.win_cell_size(wid);
+        let cols = 80;
+        let form = |app: &crate::App| app.windows[&wid].deck_form;
+        // The frame of `rows` under `deck`, and that frame's avail.
+        let frame_in = |app: &mut crate::App, deck: DeckForm, rows: u16| {
+            app.windows.get_mut(&wid).expect("the window").deck_form = deck;
+            let head = app.deck_head_px(wid, band_pts, scale, 0);
+            app.backend.set_head(head);
+            let frame = app.window_frame_px_for(wid, rows, cols);
+            let avail = crate::stats_plan::avail_pt(
+                f64::from(frame.height),
+                band_px(band_pts, scale) as f64,
+                scale,
+            );
+            (frame, avail)
+        };
+        // Attach `rows` at `carried` as the attach does, and the size it
+        // takes.
+        let attach = |app: &mut crate::App, rows: u16, carried: Option<PhysicalSize<u32>>| {
+            app.windows.get_mut(&wid).expect("the window").deck_form = DeckForm::Folded;
+            let head = app.attach_deck_head(wid, band_pts, scale, (rows, cols), carried);
+            app.windows.get_mut(&wid).expect("the window").metrics.head = head;
+            app.attach_frame_px(wid, rows, cols, carried)
+        };
+        let in_band = |avail: f64| (850.0..870.0).contains(&avail);
+        let rem = (cell / 2) as u32;
+        let mut checked = [false; 2];
+        for rows in 20..240 {
+            for (i, deck) in [DeckForm::Full, DeckForm::Folded].into_iter().enumerate() {
+                let (frame, _) = frame_in(&mut app, deck, rows);
+                let carried = PhysicalSize::new(frame.width, frame.height + rem);
+                let avail = crate::stats_plan::avail_pt(
+                    f64::from(carried.height),
+                    band_px(band_pts, scale) as f64,
+                    scale,
+                );
+                if !in_band(avail) {
+                    continue;
+                }
+                checked[i] = true;
+                let size = attach(&mut app, rows, Some(carried));
+                assert_eq!(form(&app), deck, "{rows} rows at avail {avail}");
+                assert_eq!(size, carried, "{deck:?}: the window keeps its size");
+                if deck == DeckForm::Full {
+                    let (_, folded_avail) = frame_in(&mut app, DeckForm::Folded, rows);
+                    assert!(folded_avail < 850.0, "PRECONDITION: {folded_avail}");
+                    let _ = attach(&mut app, rows, None);
+                    assert_eq!(form(&app), DeckForm::Folded, "a new window of that grid");
+                }
+            }
+        }
+        assert_eq!(checked, [true; 2], "CONTROL: both forms met the band");
     }
 
     /// A snapshot after three readings: ten cores in two clusters, memory, a
@@ -1672,11 +3011,12 @@ pub(crate) mod tests {
                 swap_total: 0,
                 pressure: Pressure::Normal,
                 commit: None,
+                ..MemSample::default()
             }),
             gpu: Some(GpuSample {
                 device_pct: Some(12),
                 cores: Some(10),
-                name: None,
+                ..GpuSample::default()
             }),
             volume: Some(VolumeSample {
                 total: 2_000_000_000_000,
@@ -1686,29 +3026,42 @@ pub(crate) mod tests {
             }),
             procs: Some(vec![
                 ProcSample {
+                    start: Some(1),
                     pid: 100,
                     ppid: 1,
                     cpu_ns: Some(cpu[0] * 1_000_000),
                     footprint: Some(300 << 20),
                     name: "aterm".into(),
+                    disk_written: None,
+                    uid: None,
+                    ..ProcSample::default()
                 },
                 ProcSample {
+                    start: Some(1),
                     pid: 200,
                     ppid: 100,
                     cpu_ns: Some(0),
                     footprint: Some(5 << 20),
                     name: "zsh".into(),
+                    disk_written: None,
+                    uid: None,
+                    ..ProcSample::default()
                 },
                 ProcSample {
+                    start: Some(1),
                     pid: 201,
                     ppid: 200,
                     cpu_ns: Some(cpu[1] * 1_000_000),
                     footprint: Some(400 << 20),
                     name: "claude".into(),
+                    disk_written: None,
+                    uid: None,
+                    ..ProcSample::default()
                 },
             ]),
             self_pid: 100,
             tabs: tabs.clone(),
+            ..Sample::default()
         };
         let _ = v.absorb(&mk(10, &[0; 10], &[0, 0]));
         let _ = v.absorb(&mk(11, &[20, 30, 10, 0, 5, 5, 5, 5, 5, 5], &[100, 400]));
@@ -1723,6 +3076,70 @@ pub(crate) mod tests {
         aterm_vitals::ink::vitals_inks([0x30, 0x31, 0x35], [0xF8, 0xF8, 0xF2], [0x50, 0xFA, 0x7B])
     }
 
+    /// T-V9 on every built-in theme's band (Stats Deck v2 §9.4): the inks
+    /// solved on the band ground, with the band's words and accent as
+    /// [`DeckFrame`] solves them, hold every Deck floor the ground leaves in
+    /// reach. The floors a band's ground puts out of reach are pinned with
+    /// the least its inks (the best the range allows) may measure against
+    /// them, so a theme that newly misses a floor, or misses one by more,
+    /// fails by name, and so does a pin whose floor now holds.
+    #[test]
+    fn deck_inks_hold_on_every_built_in_band() {
+        // The Increase Contrast ramp's step spacing, under HEAT_DL's 0.05 on
+        // bands lighter than the default: (theme, floor, the least measured).
+        // Those grounds are the theme blends macOS and Windows lay; Linux lays
+        // every dark band on the CSD headerbar's #303030
+        // (`chrome_band::PLATFORM_BAR_BASE`), where each floor holds.
+        let blends = matches!(
+            crate::chrome_band::PLATFORM_BAR_BASE,
+            aterm_messages::ink::BarBase::Blend
+        );
+        let pinned = if blends { &PINNED_ON_BLENDS[..] } else { &[] };
+        const PINNED_ON_BLENDS: [(&str, &str, f32); 5] = [
+            ("Catppuccin Mocha", "heat_ic steps", 0.047),
+            ("Dracula", "heat_ic steps", 0.038),
+            ("Gruvbox Dark", "heat_ic steps", 0.042),
+            ("Nord", "heat_ic steps", 0.038),
+            ("One Dark", "heat_ic steps", 0.049),
+        ];
+        let names = aterm_types::scheme::builtin_names();
+        assert!(names.len() > 2, "CONTROL: themes to judge");
+        let (mut failed, mut seen) = (Vec::new(), Vec::new());
+        for name in names {
+            let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
+            let band = crate::chrome_band::band_colors(crate::chrome_band::ChromePalette {
+                theme: aterm_render::Theme::from(&scheme),
+                ansi: Some(crate::chrome_band::ansi_of_scheme(&scheme)),
+                authored: aterm_messages::tokens::AuthoredChrome::NONE,
+            });
+            let inks = ink::vitals_inks(band.bar_bg, band.value, band.accent);
+            for miss in inks.deck_floor_misses() {
+                let line = format!("{name} (band {:?}): {}", band.bar_bg, miss.what);
+                let pin = pinned
+                    .iter()
+                    .find(|(theme, floor, _)| *theme == name && miss.what.starts_with(floor));
+                match pin {
+                    Some(&(theme, floor, least)) if miss.out_of_reach => {
+                        seen.push((theme, floor));
+                        if miss.measured < least {
+                            failed.push(format!("{line}, pinned at {least} or more"));
+                        }
+                    }
+                    _ if miss.out_of_reach => {
+                        failed.push(format!("{line}, out of reach, unpinned"))
+                    }
+                    _ => failed.push(line),
+                }
+            }
+        }
+        for &(theme, floor, _) in pinned {
+            if !seen.contains(&(theme, floor)) {
+                failed.push(format!("{theme}: {floor} is pinned out of reach but holds"));
+            }
+        }
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
     pub(crate) fn input(snap: &Snapshot) -> DeckInput<'_> {
         DeckInput {
             snap: Some(snap),
@@ -1730,30 +3147,26 @@ pub(crate) mod tests {
             tab_label: "Tab 1".into(),
             tab_count: 1,
             inks: dark_inks(),
-            seam: [0x50, 0x50, 0x55],
             dwc: false,
             marks: Vec::new(),
             plate: None,
+            form: DeckForm::Full,
+            contrast: false,
+            locale: Locale {
+                platform: Platform::MacOs,
+                utc_offset_s: 0,
+            },
         }
     }
 
+    /// 1119 pt at 2×, the Full form's height.
     const GEOM: DeckGeom = DeckGeom {
         w: 2238.0,
-        h: 124.0,
+        h: 208.0,
         pad: 24.0,
         scale: 2.0,
         font_px: 26.0,
     };
-
-    fn texts(prims: &[DrawPrim]) -> Vec<String> {
-        prims
-            .iter()
-            .filter_map(|p| match p {
-                DrawPrim::Text { s, .. } => Some(s.clone()),
-                _ => None,
-            })
-            .collect()
-    }
 
     /// Where the Deck sits in the head: under macOS's titlebar at the head's
     /// foot, as it always has; where the strip is the window's band (Linux,
@@ -1771,7 +3184,12 @@ pub(crate) mod tests {
             .sys
             .get_or_insert_with(Default::default)
             .stats_bars = Some("deck".into());
-        let deck = deck_px(StatsBars::Deck, app.windows[&wid].scale);
+        let deck = deck_px(
+            StatsBars::Deck,
+            app.windows[&wid].deck_form,
+            app.windows[&wid].scale,
+            app.win_cell_size(wid).1,
+        );
         let head = deck + 14;
         app.windows.get_mut(&wid).expect("window").metrics.head = head;
         app.backend.set_head(head);
@@ -1823,7 +3241,12 @@ pub(crate) mod tests {
             .sys
             .get_or_insert_with(Default::default)
             .stats_bars = Some("deck".into());
-        let deck = deck_px(StatsBars::Deck, app.windows[&wid].scale);
+        let deck = deck_px(
+            StatsBars::Deck,
+            app.windows[&wid].deck_form,
+            app.windows[&wid].scale,
+            app.win_cell_size(wid).1,
+        );
         let head = deck + 14;
         app.windows.get_mut(&wid).expect("window").metrics.head = head;
         app.backend.set_head(head);
@@ -1849,11 +3272,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_deck_is_62_points_tall_and_the_sill_and_off_take_no_headroom() {
-        assert_eq!(deck_px(StatsBars::Deck, 2.0), 124);
-        assert_eq!(deck_px(StatsBars::Deck, 1.0), 62);
-        assert_eq!(deck_px(StatsBars::Off, 2.0), 0);
-        assert_eq!(deck_px(StatsBars::Sill, 2.0), 0);
+    fn the_stats_bars_setting_reads_its_own_words() {
         assert_eq!(StatsBars::parse(None), StatsBars::Deck);
         assert_eq!(StatsBars::parse(Some("off")), StatsBars::Off);
         assert_eq!(StatsBars::parse(Some("sill")), StatsBars::Sill);
@@ -1866,494 +3285,209 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_deck_draws_every_core_and_all_three_scopes() {
-        let snap = snapshot();
-        let prims = deck_prims(&GEOM, &input(&snap));
-        let texts = texts(&prims);
-        for want in [
-            "Global",
-            "aterm",
-            "Tab 1",
-            "S",
-            "\u{00D7}4",
-            "E",
-            "\u{00D7}6",
-            "GPU",
-            "12%",
-        ] {
-            assert!(
-                texts.iter().any(|t| t == want),
-                "{want:?} missing from {texts:?}"
-            );
-        }
-        assert!(texts.iter().any(|t| t.contains("/10")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.starts_with("17.0/32G")), "{texts:?}");
-        assert!(texts.iter().any(|t| t == "disk 1.81 TB free"), "{texts:?}");
-        assert!(texts.iter().any(|t| t == "claude"), "{texts:?}");
-        // Everything stays inside the card.
-        for p in &prims {
-            if let DrawPrim::Panel { x, y, w, h, .. } = p {
-                assert!(
-                    *x + *w <= GEOM.w + 40.0 && *y + *h <= GEOM.h + 40.0,
-                    "{p:?}"
-                );
-            }
-        }
-    }
-
-    /// aterm's share of what is busy always carries its noun: a bare
-    /// percentage beside a cores figure reads as the machine's load (the
-    /// audit's finding 5).
-    #[test]
-    fn a_share_is_never_a_bare_percentage() {
-        let snap = snapshot();
-        let texts = texts(&deck_prims(&GEOM, &input(&snap)));
-        assert!(texts.iter().any(|t| t.ends_with("% of busy")), "{texts:?}");
-        assert!(
-            !texts
-                .iter()
-                .any(|t| t.ends_with('%') && t.contains('c') && t.contains(' ')),
-            "{texts:?}"
-        );
-    }
-
-    /// The GPU's label is set in its own column, like a cluster's, so it can
-    /// never overlap the core tiles or the tank (the audit's finding 2).
-    #[test]
-    fn the_gpu_label_never_overlaps_a_tile_or_the_tank() {
-        let snap = snapshot();
-        for w in [2238.0, 1698.0, 1248.0, 849.0] {
-            for scale in [2.0, 1.0] {
-                let g = DeckGeom {
-                    w: w * scale / 2.0,
-                    h: 62.0 * scale,
-                    pad: 12.0 * scale,
-                    scale,
-                    font_px: 12.0 * scale,
-                };
-                let (prims, hits) = deck_paint(&g, &input(&snap));
-                let gpu = hits
-                    .iter()
-                    .find(|h| h.instrument == Instrument::Gpu)
-                    .expect("a GPU hit");
-                let cores_end = hits
-                    .iter()
-                    .filter(|h| h.instrument == Instrument::Cores && h.bar == Bar::Global)
-                    .map(|h| h.rect.0 + h.rect.2)
-                    .fold(0.0f32, f32::max)
-                    .min(gpu.rect.0 + 1.0);
-                let label_x = prims
-                    .iter()
-                    .find_map(|p| match p {
-                        DrawPrim::Text { s, x, .. } if s == "GPU" => Some(*x),
-                        _ => None,
-                    })
-                    .expect("GPU label");
-                assert!(
-                    label_x >= cores_end - 1.0,
-                    "w {w} s {scale}: {label_x} < {cores_end}"
-                );
-                let pct_w = crate::tray_raster::measure_text(
-                    "12%",
-                    crate::stats_paint::stats_type(g.font_px, scale).1.get(),
-                    crate::widget::TextWeight::Regular,
-                );
-                // The tank starts after the label column.
-                let tank_x = prims
-                    .iter()
-                    .find_map(|p| match p {
-                        DrawPrim::Panel { x, w, h, .. }
-                            if *x > label_x && *h > *w * 1.4 && *x <= gpu.rect.0 + gpu.rect.2 =>
-                        {
-                            Some(*x)
-                        }
-                        _ => None,
-                    })
-                    .expect("tank");
-                assert!(
-                    tank_x >= label_x + pct_w,
-                    "w {w} s {scale}: tank {tank_x} label {label_x}+{pct_w}"
-                );
-            }
-        }
-    }
-
-    /// Each cluster fills row-major, so a narrow window never shows a ragged
-    /// cluster (four cores as 2 / 1 / 1; the audit's finding 6).
-    #[test]
-    fn a_narrow_window_never_shows_a_ragged_cluster() {
-        let snap = snapshot();
-        let g = DeckGeom { w: 1248.0, ..GEOM };
-        let prims = deck_prims(&g, &input(&snap));
-        // Every core tile's top-left; group by row.
-        let mut rows: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
-        let tile = prims
-            .iter()
-            .filter_map(|p| match p {
-                DrawPrim::Stroke { w, h, .. } if (*w - *h).abs() < 0.5 && *w >= 16.0 => Some(*w),
-                _ => None,
-            })
-            .next()
-            .expect("a crisp tile rim");
-        for p in &prims {
-            if let DrawPrim::Stroke { x, y, w, h, .. } = p
-                && *w == tile
-                && *h == tile
-                && *x < g.w / 2.0
-            {
-                *rows.entry(y.round() as i32).or_default() += 1;
-            }
-        }
-        // Rows in the S cluster have equal counts: no row holds a lone tile
-        // while another holds two.
-        let counts: Vec<usize> = rows.values().copied().collect();
-        assert!(counts.iter().all(|&c| c >= 2), "{rows:?}");
-    }
-
-    /// A machine as Linux or Windows reads it: `specs` over `n` cores, two
-    /// readings a second apart, with `mem`.
-    fn machine(specs: &[ClusterSpec], n: u64, mem: MemSample) -> Snapshot {
-        let mut v = aterm_vitals::Vitals::new();
-        let mk = |t: u64| Sample {
-            at_ns: t * 1_000_000_000,
-            cores: Some(
-                (0..n)
-                    .map(|i| Ticks {
-                        busy: t * (i % 50),
-                        total: t * 100,
-                    })
-                    .collect(),
-            ),
-            clusters: specs.to_vec(),
-            mem: Some(mem),
-            gpu: None,
-            volume: None,
-            procs: None,
-            self_pid: 1,
-            tabs: Vec::new(),
-        };
-        let _ = v.absorb(&mk(10));
-        v.absorb(&mk(11))
-    }
-
-    /// Where a text prim's ink ends: its face's own measure.
-    fn text_right(p: &DrawPrim) -> f32 {
-        let DrawPrim::Text {
-            x,
-            s,
-            px,
-            weight,
-            face,
-            ..
-        } = p
-        else {
-            unreachable!("a text prim");
-        };
-        x + match face {
-            crate::widget::TextFace::Mono => crate::tray_raster::measure_text(s, *px, *weight),
-            _ => crate::tray_raster::ui_text_width_for(*face, s, *px),
-        }
-    }
-
-    /// Each of `labels` is drawn, and ends left of its cluster's first tile
-    /// (a square in the track ink: every tile is laid on one).
-    fn labels_clear_their_tiles(prims: &[DrawPrim], labels: &[&str]) {
-        let track = rgba(dark_inks().track, 0xFF);
-        for want in labels {
-            let at = prims
-                .iter()
-                .position(|p| matches!(p, DrawPrim::Text { s, .. } if s == want))
-                .unwrap_or_else(|| panic!("{want:?} missing"));
-            let right = text_right(&prims[at]);
-            let tile_x = prims[at..]
-                .iter()
-                .find_map(|p| match p {
-                    DrawPrim::Panel { x, w, h, fill, .. }
-                        if (w - h).abs() < 0.5 && *fill == track =>
-                    {
-                        Some(*x)
-                    }
-                    _ => None,
-                })
-                .expect("a tile after the label");
-            assert!(
-                right <= tile_x,
-                "{want:?} ends at {right}, its tile at {tile_x}"
-            );
-        }
-    }
-
-    /// No two words on one baseline overlap.
-    fn words_never_overlap(prims: &[DrawPrim]) {
-        let spans: Vec<(f32, f32, f32, &str)> = prims
-            .iter()
-            .filter_map(|p| match p {
-                DrawPrim::Text { x, baseline, s, .. } => {
-                    Some((*baseline, *x, text_right(p), s.as_str()))
-                }
-                _ => None,
-            })
-            .collect();
-        for (i, a) in spans.iter().enumerate() {
-            for b in &spans[i + 1..] {
-                if (a.0 - b.0).abs() < 0.5 {
-                    assert!(a.2 <= b.1 || b.2 <= a.1, "{a:?} overlaps {b:?}");
-                }
-            }
-        }
-    }
-
-    fn mem_of(commit: Option<aterm_vitals::CommitSample>) -> MemSample {
-        MemSample {
-            total: 64 << 30,
-            app: 20 << 30,
-            wired: 2 << 30,
-            cached: 30 << 30,
-            free: 12 << 30,
-            pressure: Pressure::Normal,
-            commit,
-            ..MemSample::default()
-        }
-    }
-
-    /// Linux workstations whose cores are alike: one "CPU" cluster of 32,
-    /// and of 128 (a Threadripper's "×128" is wider than a Mac's "E×6"),
-    /// each label clear of its tiles. A NEGATIVE CONTROL: Linux's heuristic
-    /// commit past its advisory limit is never said.
-    #[test]
-    fn a_linux_machines_one_cpu_cluster_labels_clear_of_its_tiles() {
-        let commit = aterm_vitals::CommitSample {
-            charge: 90 << 30,
-            limit: 60 << 30,
-            exact: false,
-        };
-        for n in [32u16, 128] {
-            let specs = [ClusterSpec {
-                name: "CPU".into(),
-                logical: (0..n).collect(),
-            }];
-            let snap = machine(&specs, u64::from(n), mem_of(Some(commit)));
-            let prims = deck_prims(&GEOM, &input(&snap));
-            labels_clear_their_tiles(&prims, &["CPU", &format!("\u{00D7}{n}")]);
-            words_never_overlap(&prims);
-            assert!(
-                !texts(&prims).iter().any(|s| s.contains("commit")),
-                "a heuristic commit is never said"
-            );
-        }
-    }
-
-    /// A Windows laptop split by efficiency class (8 P, 16 E) with its commit
-    /// charge at 93 % of the limit: the labels clear their tiles, and the
-    /// Global bar says the commit in the warn ink without running into
-    /// another word. A NEGATIVE CONTROL: at 89 % it is not said.
-    #[test]
-    fn a_windows_laptop_labels_its_classes_and_says_its_commit() {
-        let specs = [
-            ClusterSpec {
-                name: "Performance".into(),
-                logical: (0..8).collect(),
-            },
-            ClusterSpec {
-                name: "Efficiency".into(),
-                logical: (8..24).collect(),
-            },
-        ];
-        let at = |charge| {
-            let mem = MemSample {
-                pressure: Pressure::Warn,
-                swap_used: 3 << 30,
-                ..mem_of(Some(aterm_vitals::CommitSample {
-                    charge,
-                    limit: 100,
-                    exact: true,
-                }))
-            };
-            machine(&specs, 24, mem)
-        };
-        let warn = rgba(dark_inks().warn, 0xFF);
-        for g in [GEOM, DeckGeom { w: 1698.0, ..GEOM }] {
-            let snap = at(93);
-            let prims = deck_prims(&g, &input(&snap));
-            labels_clear_their_tiles(&prims, &["P", "\u{00D7}8", "E", "\u{00D7}16"]);
-            words_never_overlap(&prims);
-            assert!(
-                prims.iter().any(|p| matches!(
-                    p,
-                    DrawPrim::Text { s, color, .. } if s.starts_with("commit 93%") && *color == warn
-                )),
-                "the commit is said: {:?}",
-                texts(&prims)
-            );
-            let snap = at(89);
-            let prims = deck_prims(&g, &input(&snap));
-            assert!(
-                !texts(&prims).iter().any(|s| s.contains("commit")),
-                "under the warn line the commit is not said"
-            );
-        }
-    }
-
-    #[test]
     fn the_same_snapshot_lays_the_same_pixels() {
         let snap = snapshot();
-        let a = deck_prims(&GEOM, &input(&snap));
-        let b = deck_prims(&GEOM, &input(&snap));
-        assert_eq!(prims_fp(&a), prims_fp(&b));
+        for form in [DeckForm::Full, DeckForm::Folded] {
+            let mut i = input(&snap);
+            i.form = form;
+            let a = deck_prims(&GEOM, &i);
+            let b = deck_prims(&GEOM, &i);
+            assert_eq!(prims_fp(&a), prims_fp(&b), "{form:?}");
+        }
     }
 
+    /// Before the first snapshot each row names itself and says "reading…"
+    /// where its strip goes, and nothing is a hit yet.
     #[test]
     fn before_the_first_snapshot_the_deck_says_it_is_reading() {
         let empty = Snapshot::default();
-        let mut i = input(&empty);
-        i.snap = None;
-        let (prims, hits) = deck_paint(&GEOM, &i);
-        // Words, and no instrument a pointer could rest on yet.
-        assert!(prims.iter().any(|p| matches!(p, DrawPrim::Text { .. })));
-        assert!(hits.is_empty(), "{hits:?}");
-    }
-
-    #[test]
-    fn a_110_column_window_keeps_the_disk_the_tab_program_and_the_sparkline() {
-        // 110 columns at 2x, as a lab instance and a half-screen window are:
-        // the lanes give up width before the words do, and the trace stays.
-        let snap = snapshot();
-        let g = DeckGeom { w: 1698.0, ..GEOM };
-        let (prims, hits) = deck_paint(&g, &input(&snap));
-        let texts: Vec<String> = prims
-            .iter()
-            .filter_map(|p| match p {
-                DrawPrim::Text { s, x, .. } => {
-                    assert!(*x < g.w, "{s:?} at {x}");
-                    Some(s.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert!(texts.iter().any(|t| t.contains("disk")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("claude")), "{texts:?}");
-        assert!(hits.iter().any(|h| h.instrument == Instrument::Disk));
-        assert!(
-            hits.iter()
-                .filter(|h| h.instrument == Instrument::Memory)
-                .count()
-                == 3
-        );
-        // The sparkline: a translucent track per bar beside the CPU figure.
-        let track = a(input(&snap).inks.track, 0.55);
-        assert_eq!(
-            prims
+        for form in [DeckForm::Full, DeckForm::Folded] {
+            let mut i = input(&empty);
+            i.snap = None;
+            i.form = form;
+            let (prims, hits) = deck_paint(&GEOM, &i);
+            let said: Vec<String> = prims
                 .iter()
-                .filter(|p| matches!(p, DrawPrim::Panel { fill, .. } if *fill == track))
-                .count(),
-            3,
-            "one trace per bar"
-        );
-    }
-
-    #[test]
-    fn a_narrow_window_still_lays_out_inside_the_card_and_never_cuts_a_word() {
-        let snap = snapshot();
-        for w in [700.0, 900.0, 1248.0] {
-            let g = DeckGeom { w, ..GEOM };
-            let prims = deck_prims(&g, &input(&snap));
-            for p in &prims {
-                if let DrawPrim::Text { x, s, .. } = p {
-                    assert!(*x < g.w, "{p:?}");
-                    assert!(!s.ends_with('\u{2026}'), "a clause folds whole: {s:?}");
-                }
+                .filter_map(|p| match p {
+                    DrawPrim::Text { s, .. } => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            for name in ["CPU", "Memory", "Disk", "Processes"] {
+                assert!(said.iter().any(|s| s == name), "{form:?}: {said:?}");
             }
+            let reading = said.iter().filter(|s| *s == "reading\u{2026}").count();
+            assert_eq!(reading, Resource::ALL.len(), "{form:?}: {said:?}");
+            assert!(hits.is_empty(), "{form:?}: {hits:?}");
         }
     }
 
-    /// Each bar's label carries its key: the Global bar's is the load ramp,
-    /// aterm's and the tab's their scope inks, so a newcomer reads which ink
-    /// is whose without a legend (the audit's finding 4).
+    /// The header's scope labels carry their inks as swatches (§3.5): the
+    /// machine's, aterm's and the tab's, so a newcomer reads which ink is
+    /// whose without a legend.
     #[test]
     fn every_bar_label_carries_its_ink_as_a_key() {
         let snap = snapshot();
         let inks = dark_inks();
-        let prims = deck_prims(&GEOM, &input(&snap));
-        for ink in [inks.aterm, inks.tab, inks.load[4], inks.load[0]] {
-            assert!(
-                prims
-                    .iter()
-                    .any(|p| matches!(p, DrawPrim::Panel { fill, w, .. }
-                    if fill[..3] == ink[..] && *w <= 6.0)),
-                "{ink:?}"
-            );
+        for (form, w) in [(DeckForm::Full, 2238.0), (DeckForm::Folded, 2238.0)] {
+            let mut i = input(&snap);
+            i.form = form;
+            let g = DeckGeom { w, ..GEOM };
+            let prims = deck_prims(&g, &i);
+            for ink in [inks.machine, inks.aterm, inks.tab] {
+                assert!(
+                    prims
+                        .iter()
+                        .any(|p| matches!(p, DrawPrim::Panel { fill, w, y, .. }
+                        if fill[..3] == ink[..] && *w <= 12.0 && *y < 28.0)),
+                    "{form:?}: {ink:?}"
+                );
+            }
         }
     }
 
-    /// A pinned machine fills the capacity bracket in the ramp's hottest ink.
-    #[test]
-    fn a_pinned_machine_fills_the_capacity_bracket() {
-        let mut snap = snapshot();
-        if let Some(cpu) = snap.cpu.as_mut() {
-            cpu.busy = TrendView::flat(10.0);
-        }
-        snap.global.cores = TrendView::flat(10.0);
-        let inks = dark_inks();
-        let hot = rgba(inks.load[4], 0xFF);
-        let count = |snap: &Snapshot| {
-            deck_prims(&GEOM, &input(snap))
-                .iter()
-                .filter(|p| matches!(p, DrawPrim::Panel { fill, w, h, .. } if *fill == hot && *w <= 2.0 && *h > 10.0))
-                .count()
-        };
-        assert_eq!(count(&snap), 1);
-        assert_eq!(count(&snapshot()), 0);
-    }
-
-    /// A reader meets three named groups of meters, the core row a grid of
-    /// per-core meters named stably ("Super core 1"), the values in range.
+    /// A meter's value is the share as a whole percent up to 100, but a
+    /// share above 0 that the % column prints as "<1%" keeps a tenth, so it
+    /// is not 0 beside words that say "less than 1 percent".
     #[cfg(a11y_tree)]
     #[test]
-    fn the_bars_read_as_groups_of_meters_and_a_grid_of_cores() {
-        let snap = snapshot();
-        let stuck = StatsMark::new(WellMark::Stuck, 1);
-        let groups = stats_a11y_groups(&snap, Some(7), "Tab 1", &[stuck]);
-        assert_eq!(groups.len(), 3, "one group a bar");
-        // Each group is described by the one words function the lens and
-        // the bars share, so a reader hears what a sighted person reads.
-        assert_eq!(groups[0].sentence, words::global_sentence(&snap));
-        assert_eq!(groups[1].sentence, words::aterm_sentence(&snap));
-        assert_eq!(
-            groups[2].sentence,
-            crate::stats_lens::sentence(&snap, Bar::Tab, Some(7), "Tab 1")
-        );
-        let global = &groups[0];
-        assert_eq!(global.meters.len(), 4, "CPU, GPU, memory and disk");
-        assert_eq!(
-            global.meters[0].max, 10.0,
-            "the CPU meter's range is the cores"
-        );
-        // One meter a core, each named apart and stably (only values move).
-        assert_eq!(global.cores.len(), 10);
-        let core_names: std::collections::BTreeSet<&str> =
-            global.cores.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(core_names.len(), 10, "every core's name is its own");
-        let again = stats_a11y_groups(&snap, Some(7), "Tab 1", &[stuck]);
-        assert_eq!(again[0].cores, global.cores);
-        for m in global.meters.iter().chain(&global.cores) {
-            assert!((m.min..=m.max).contains(&m.value), "{m:?}");
-            assert!(!m.words.is_empty(), "{m:?}");
-        }
-        // The marks ride on the aterm group only, in their own words.
-        assert_eq!(groups[1].marks, Some(stuck.words()));
-        assert!(groups[0].marks.is_none() && groups[2].marks.is_none());
+    fn a_meter_under_half_a_percent_is_not_zero() {
+        assert_eq!(super::meter_pct(Some(0.004)), Some(0.4));
+        assert_eq!(super::meter_pct(Some(0.000_1)), Some(0.1));
+        assert_eq!(super::meter_pct(Some(0.0)), Some(0.0));
+        assert_eq!(super::meter_pct(Some(0.006)), Some(1.0));
+        assert_eq!(super::meter_pct(Some(0.424)), Some(42.0));
+        assert_eq!(super::meter_pct(Some(1.3)), Some(100.0));
+        assert_eq!(super::meter_pct(Some(f32::NAN)), None);
+        assert_eq!(super::meter_pct(None), None);
+        assert_eq!(words::pct(Some(0.004)), "<1%");
     }
 
+    /// T-G12 (Stats Deck v2 §12): the deck reads as one group of seven
+    /// meters in row order, each valued at its % of max (no value when
+    /// unknown) and described by its row's sentence, then a group of one
+    /// meter a core named by its cluster. Before the first snapshot every
+    /// row says it is reading, and a row with no reading says so. The
+    /// lens's wells and How to read are read through the App
+    /// (`stats_lens::behaviour_tests::the_tree_reads_the_deck_and_its_lens`).
+    #[cfg(a11y_tree)]
     #[test]
-    fn marks_lead_the_aterm_bar_and_hit_as_jobs() {
-        let snap = snapshot();
-        let mut i = input(&snap);
-        i.marks = vec![
-            StatsMark::new(WellMark::Stuck, 1),
-            StatsMark::new(WellMark::Quiet, 2),
-        ];
-        let (prims, hits) = deck_paint(&GEOM, &i);
-        assert!(hits.iter().any(|h| h.instrument == Instrument::Jobs));
-        assert!(prims.iter().any(|p| matches!(p, DrawPrim::Ring { .. })));
+    fn a11y_meters() {
+        use super::paint_tests::{FRONT, Scene, scene};
+        use aterm_vitals::model::NoFigure;
+        const MAC: Locale = Locale {
+            platform: Platform::MacOs,
+            utc_offset_s: 0,
+        };
+        let said = |snap: &Snapshot| stats_a11y_group(Some(snap), Some(FRONT), &MAC);
+        let meter = |snap: &Snapshot, res: Resource| said(snap).meters[res.index()].clone();
+
+        let calm = scene(Scene::Calm);
+        let g = said(&calm);
+        assert_eq!(g.name, "Stats deck, last 10 minutes");
+        let names: Vec<&str> = g.meters.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "CPU",
+                "GPU",
+                "Memory",
+                "Disk",
+                "Network",
+                "Tokens",
+                "Processes"
+            ]
+        );
+        // Each meter says its row's sentence: what ⌘C copies.
+        for (m, &res) in g.meters.iter().zip(&Resource::ALL) {
+            assert_eq!(m.words, words::row_sentence(res, &calm, Some(FRONT), &MAC));
+        }
+        // CPU: the %, the amount, the scopes, the trend, then every Details
+        // clause.
+        assert_eq!(g.meters[0].value, Some(98.0));
+        assert_eq!(
+            g.meters[0].words,
+            "CPU 98 percent of capacity: 17.7 of 18 cores. aterm 6.8 cores, Tab 2 0.1 cores. \
+             Rose from about 49 percent. Over capacity 6 of the last 10 minutes. 8 waiting for \
+             a core, load 25.7 on 18 cores. Busiest rustc, 9 processes in Tab 3, 5.9 cores."
+        );
+        // The cores: one meter a core, named by its cluster, apart and
+        // stably (only the values move).
+        assert_eq!(g.cores_name, "18 CPU cores");
+        assert_eq!(g.cores.len(), 18);
+        assert_eq!(g.cores[0].name, "Super core 1");
+        assert_eq!(g.cores[6].name, "Performance core 1");
+        let core_names: std::collections::BTreeSet<&str> =
+            g.cores.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(core_names.len(), 18, "every core's name is its own");
+        for m in g.meters.iter().chain(&g.cores) {
+            let v = m.value.expect("read");
+            assert!((0.0..=100.0).contains(&v), "{m:?}");
+        }
+        assert_eq!(
+            g.cores[7].words,
+            format!("{:.0} percent busy", g.cores[7].value.unwrap())
+        );
+
+        // Disk in trouble.
+        let disk = meter(&scene(Scene::Trouble), Resource::Disk);
+        assert_eq!(disk.value, Some(98.0));
+        assert_eq!(
+            disk.words,
+            "Disk 98 percent of capacity: 1.96 of 2.00 terabytes used. aterm writes 410 \
+             megabytes per second, Tab 2 writes 0.2 megabytes per second. Steady near 98 \
+             percent. Disk full in about 34 minutes, filling 1.2 gigabytes per minute. Disk low, \
+             41 gigabytes free. aterm freed 12 gigabytes today. Used grew 12 gigabytes in the \
+             last 10 minutes. Most in ~/aterm/target, 212 gigabytes."
+        );
+
+        // Network learning its peak on the link's rate, an hour read.
+        let mut first = scene(Scene::FirstRun);
+        first.facts.net_read_s = 3_600;
+        let net = meter(&first, Resource::Network);
+        assert_eq!(net.value, Some(9.0));
+        assert_eq!(
+            net.words,
+            "Network 9 percent of its link rate: 2.1 of 22.9 megabytes per second, downloading. \
+             Learning its peak: 1 of 24 hours read. No per-app figure. Not read for 9 of the \
+             last 10 minutes. Sending 0.3 of 22.9 megabytes per second. Wi-Fi en0, link 22.9 \
+             megabytes per second."
+        );
+
+        // Tokens learning aterm's peak, no plan read, no agent in the tab:
+        // no value, since there is no maximum yet.
+        let no_agent = ScopeFig {
+            now: None,
+            missing: Some(NoFigure::NoAgent),
+        };
+        first.resources[Resource::Tokens.index()].tabs = vec![(FRONT, no_agent)];
+        let tokens = meter(&first, Resource::Tokens);
+        assert_eq!(tokens.value, None);
+        assert_eq!(
+            tokens.words,
+            "Tokens: learning aterm's peak, 1 of 10 minutes. aterm 3.1 thousand per minute. Tab \
+             2 has no agent. Not read for 9 of the last 10 minutes. Input 410 thousand tokens \
+             per minute, cache re-reads included. Plan limit not read."
+        );
+
+        // A row with no reading has no value and says so.
+        let mut unread = scene(Scene::Calm);
+        unread.resources[Resource::Gpu.index()] = ResourceView::default();
+        let gpu = meter(&unread, Resource::Gpu);
+        assert_eq!((gpu.value, gpu.words.as_str()), (None, "GPU: not read."));
+
+        // Before the first snapshot every row is reading and no core is
+        // named.
+        let reading = stats_a11y_group(None, Some(FRONT), &MAC);
+        for (m, &res) in reading.meters.iter().zip(&Resource::ALL) {
+            assert_eq!(m.value, None, "{m:?}");
+            assert_eq!(m.words, format!("{}: reading.", words::resource_name(res)));
+        }
+        assert_eq!(reading.meters.len(), Resource::ALL.len());
+        assert!(reading.cores.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "stats_deck_paint_tests.rs"]
+pub(crate) mod paint_tests;

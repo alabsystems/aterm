@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 trace conformance for `PressCustody` — WHO owns the reading position and
-//! the highlight, bound to the code that actually runs.
+//! Tier-1 trace conformance for `PressCustody` (who owns the reading position and the
+//! highlight), bound to the shipping code.
 //!
 //! `press_custody_model()` is model-checked in the abstract at Tier-0
 //! (`aterm-models/tests/derived_ring_ty.rs`), which proves the DESIGN sound: a release,
@@ -12,64 +12,59 @@
 //! invalidated coordinate space may not leave a selection dangling. None of that
 //! ties the model to the shipping engine. This closes that gap.
 //!
-//! WHY THIS COULD NOT BE WRITTEN BEFORE. Three of the (then) eleven actions — `RepeatPress`,
-//! `InertPress`, `ReleaseEvent` — are IDENTICAL in every observable variable. All
-//! three leave offset, ownership and the selection exactly as they found them; the
-//! model gives all three the same body; and all three used to reach
-//! `apply_press_custody` as the single value `disturbs == false`. A conformance that
-//! had to INFER the action from the state change could not tell them apart, so the
-//! three invariants that name them could only ever be "asserted" by not looking —
-//! which is the ghost the model's own header warns about. `OutputAtLive` was worse:
-//! at live the offset is already 0, so its `offset = 0` is a self-assignment.
+//! The action is not inferred from the state change: `RepeatPress`, `InertPress` and
+//! `ReleaseEvent` are identical in every observable, and at live `OutputAtLive` is a
+//! self-assignment. `Terminal::note_custody` records which transition fired at the site
+//! that decided it (`aterm_core::terminal::custody`), and each step is a three-part
+//! claim:
 //!
-//! The fix is the SEAM, not the harness. `Terminal::note_custody` records which
-//! transition fired, at the site that decided it, while the discriminating facts are
-//! still in hand (`aterm_core::terminal::custody`). This module reads that record
-//! back and validates the observed step against THE ACTION THE ENGINE NAMED — so the
-//! action tag is an observation, not a harness stamp, and the three inert classes are
-//! separable for the first time.
+//! 1. the record, cleared before the gesture, comes back `Some(_)`, so a seam that
+//!    stopped recording, or declined because what it observed was not the transition it
+//!    would name, fails rather than passing on a stale tag;
+//! 2. the recorded variant is the one the step is about, so a seam that misclassifies
+//!    fails even when the state change is identical. The four press classes are real
+//!    `App::input` key events, so `PressKind::of` and `is_modifier_or_lock_key` answer;
+//! 3. the observed `prev -> next` is admitted by the action the engine named.
 //!
-//! METHOD — strict per-transition validation, the same shape
-//! `selection_custody_conformance` uses: each step drives a REAL shipping seam,
-//! projects the real `Terminal` onto the spec variables, and asks
-//! [`aterm_spec::verify::validate_transition_tiered`] whether the observed step is one
-//! the derived `Next` admits (in-process interpreter always; `ty trace validate` on
-//! top wherever the Trust toolchain is installed). `Init` is pinned to `prev`, so a
-//! corrupted `next` is reliably REJECTED — which the negative controls at the end
-//! assert, so a pass is never vacuous.
+//! Seams driven (all sixteen actions are anchored; see each `#[refines]`):
 //!
-//! WHICH TIER CHECKS WHAT, because this module used to credit the wrong one.
-//! `validate_transition_tiered` is a REFINEMENT check and only that: the guard admits
-//! `prev`, and `next` is the action's exact update image. It evaluates no invariant at
-//! either tier — its `ty` config emits `SPECIFICATION Spec` with no `INVARIANT` lines
-//! and its interpreter verdict is `successors(action, prev).contains(next)`.
-//! Invariants over all reachable states are TIER-0's job (`derived_ring_ty.rs`). But
-//! Tier-0 quantifies over the MODEL's reachable states and this module supplies
-//! OBSERVED ones, so [`validate_transition`] additionally evaluates every invariant
-//! over `prev` and `next` here — eighteen expression evaluations per step (nine invariants over two states), and the only
-//! thing that can reject a projection which drifted out of `0..=MaxOffset`. Negative
-//! control (l) is a step the refinement check admits and only an invariant rejects.
+//! * `app_input::note_press_custody`, via `App::input` and `apply_press_custody`:
+//!   `TypingPress`, `RepeatPress`, `InertPress`, `ReleaseEvent`.
+//! * `app_mouse::note_selection_custody`, via `begin_selection` → `drag_selection` →
+//!   `finish_selection`: `UserSelect`, `UserClear`.
+//! * `Terminal::note_scroll_custody`, inside the aterm-core primitives that move
+//!   `display_offset` for a user (`scroll_display`, `scroll_to_top`,
+//!   `scroll_to_absolute_row`, `return_to_live`), via `InputEvent::ScrollView`, a real
+//!   `InputEvent::Wheel` notch on both of `input_wheel`'s motion routes, and the ⌘-V /
+//!   IME snap (`App::snap_to_bottom`): `UserScroll`, `UserScrollTowardLive`,
+//!   `SnapToLive`.
+//! * `Terminal::note_output_custody`, via real `Terminal::process` batches: the seven
+//!   `Output*` actions.
 //!
-//! EVERY STEP IS A THREE-PART CLAIM, and all three parts can fail:
+//! [`step`] runs each gesture inside a one-step-wide `aterm_spec::xref::StepEvidence`
+//! window, and `spec_xref_gate::spec_xref_closure` requires each action's annotated
+//! function to be entered by every window that drives it and by no window driving an
+//! action it is not anchored for. That evidence is function entry, not branch entry:
+//! each anchored function carries several actions, and `note_output_custody` runs on
+//! every non-screen-switching batch, so claim 2 is the discriminator the anchors
+//! cannot be.
 //!
-//! 1. the record is CLEARED before the gesture and must come back `Some(_)`, so a
-//!    seam that stopped recording — or that DECLINED to record because what it
-//!    observed was not the transition it was about to name — fails here rather than
-//!    passing on a stale tag;
-//! 2. the recorded variant must be the one this step is about, so a seam that
-//!    MIS-CLASSIFIES fails here even though the state change may be identical. All
-//!    four press classes are delivered as real `App::input` key events — a bare
-//!    `NamedKey::ShiftLeft` at `KeyEventType::Press`, a `Character` press, a Repeat
-//!    tick and a Release — so `PressKind::of` and `is_modifier_or_lock_key` are what
-//!    answer, not a `PressKind` the harness chose. Two of the four are additionally
-//!    AMBIGUOUS in the raw bits (`is_release && inert_modifier`,
-//!    `is_repeat && inert_modifier`), and a mis-ordered priority files them as
-//!    `InertPress` while changing nothing observable;
-//! 3. the observed `prev -> next` pair must be admitted by the action the ENGINE
-//!    named, so a seam that classified correctly and then moved something it may not
-//!    fails here.
+//! The abstraction function:
 //!
-//! THE SEAMS DRIVEN (all sixteen actions are anchored; see each `#[refines]`):
+//! * `offset` ← `Grid::display_offset()`, the identity on `0..=MaxOffset`. Steps move
+//!   one row at a time (`ScrollIntent::By(1)`, one-line batches), so the offset stays
+//!   in `0..=2`; bucketing a real wheel notch or PgUp would break the model's exact
+//!   `offset = offset + 1`. A step outside the range is rejected by `StateBounds` in
+//!   the invariant evaluation, not by the refinement check (control (l)).
+//! * `selection` ← `TextSelection::has_selection()`, the same read as the engine's
+//!   press-path clear gate, so `begin_selection` creates a selection and
+//!   `finish_selection`'s complete arm is an idempotent `UserSelect`.
+//! * `owner` ← `usize::from(offset > 0)`, derived: `TailOwnerAtBottom` with
+//!   `owner <= 1` is a biconditional, and a carried flag would satisfy it by
+//!   construction. Every `owner == prev_owner` conjunct is then entailed by an offset
+//!   clause except one: output may not carry a live view into scrollback.
+//! * `last_event` ← `CustodyTransition::last_event()` of the engine's record.
+//! * `prev_*` ← the harness's projection of the pre-state, re-read at every step.
 //!
 //! * `app_input::note_press_custody`, through the real `App::input` key seam and the
 //!   `apply_press_custody` authority under it — `TypingPress`, `RepeatPress`,
@@ -204,12 +199,9 @@ const VARS: [&str; 7] = [
     "last_event",
 ];
 
-/// The OBSERVED projection: `[owner, offset, selection]` read out of a real
-/// `Terminal`.
-///
-/// Named by every `#[refines(project = …)]` on the `PressCustody` seams. `owner` is
-/// DERIVED from the offset rather than carried — see the module header on why a
-/// carried ownership flag would make `TailOwnerAtBottom` unfalsifiable.
+/// The observed projection `[owner, offset, selection]` of a real `Terminal`, named by
+/// every `#[refines(project = …)]` on the `PressCustody` seams. `owner` is derived from
+/// the offset (see the module doc).
 pub(crate) fn project_press_custody(term: &Terminal) -> [i64; 3] {
     let offset = i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX);
     [
@@ -225,7 +217,7 @@ struct Press {
     /// `(prev_owner, prev_offset, prev_selection)` — the harness's own projection of
     /// the pre-state, re-read from the real terminal at every step.
     shadow: (i64, i64, i64),
-    /// The tag of the transition the ENGINE last recorded.
+    /// The tag of the transition the engine last recorded.
     last_event: i64,
 }
 
@@ -263,31 +255,15 @@ fn as_state(s: [i64; 7]) -> BTreeMap<&'static str, i64> {
     VARS.iter().copied().zip(s).collect()
 }
 
-/// Validate ONE real transition against the derived `PressCustody` spec.
-/// `Buggy` stays 0 — the committed, correct custody discipline the engine implements.
+/// Validate one real transition against the derived `PressCustody` spec (`Buggy` = 0).
 ///
-/// TWO CHECKS, and it is worth naming which does which, because this module used to
-/// credit the wrong one. [`aterm_spec::verify::validate_transition_tiered`] is a
-/// REFINEMENT check and nothing else: its interpreter verdict is
-/// `m.successors(action, prev).contains(next)`, and its `ty` twin writes a
-/// `Model::transition_cfg` that emits `SPECIFICATION Spec` with NO `INVARIANT` lines.
-/// Both tiers therefore answer exactly one question — does this action's GUARD admit
-/// `prev`, and is `next` its exact update image? — and no invariant is consulted at
-/// either. That is the HOUSE DIVISION OF LABOUR and it is the right one: Tier-0
-/// (`aterm_spec::verify::prove_and_catch`, run by `derived_ring_ty.rs`) evaluates every
-/// invariant over every state reachable from the model's own `Init`, which is strictly
-/// stronger than anything a two-state trace could say.
-///
-/// It is stronger over the MODEL's reachable states. This module feeds in states
-/// OBSERVED from a real terminal, and nothing makes those two sets the same. A
-/// projection that saturated, drifted or read the wrong field can hand Tier-1 a state
-/// the model never reaches, and the refinement check alone admits it happily: a real
-/// wheel notch moves `wheel_viewport_lines` rows, so an `InertPress` observed at
-/// `display_offset == 7` is the exact update image of `InertPress` at that state and
-/// used to validate cleanly even though `StateBounds` says `offset <= MaxOffset` (= 2).
-/// So the invariants are evaluated HERE as well, over `prev` AND `next`, at the cost of
-/// eighteen expression evaluations per step (nine invariants over two states). Negative control (l) is a step no refinement
-/// check can reject and only an invariant can, so this tier is not decorative either.
+/// [`aterm_spec::verify::validate_transition_tiered`] is a refinement check only: the
+/// action's guard admits `prev` and `next` is its exact update image; neither tier
+/// evaluates an invariant. Tier-0 checks invariants over the model's reachable states,
+/// but this module feeds in observed states, which a drifted projection can push outside
+/// them (an `InertPress` at `display_offset == 7` refines cleanly). So every invariant
+/// is also evaluated here over `prev` and `next`; negative control (l) is the step only
+/// this rejects.
 fn validate_transition(action: &str, prev: [i64; 7], next: [i64; 7]) -> (bool, String) {
     let model = press_custody_model();
     let (refines, mut why) = aterm_spec::verify::validate_transition_tiered(
@@ -315,17 +291,13 @@ fn validate_transition(action: &str, prev: [i64; 7], next: [i64; 7]) -> (bool, S
     (refines && holds, why)
 }
 
-/// Clear the custody record, so the step that follows must WRITE one.
-///
-/// This is what makes claim 1 of the three-part claim checkable: without it a seam
-/// that stopped recording altogether would leave the previous step's tag in place and
-/// a harness reading it back could not tell.
+/// Clear the custody record so the step that follows must write one (claim 1): a seam
+/// that stopped recording cannot pass on the previous step's tag.
 fn arm(term: &Arc<Mutex<Terminal>>) {
     let _ = term_lock(term).take_custody_transition();
 }
 
-/// Read back what the step recorded, requiring that it recorded SOMETHING and that it
-/// recorded the RIGHT thing.
+/// Read back what the step recorded; it must be `Some(expect)`.
 fn recorded(
     term: &Arc<Mutex<Terminal>>,
     expect: CustodyTransition,
@@ -346,20 +318,13 @@ fn recorded(
     expect
 }
 
-/// Drive ONE real step, then validate it against the action the ENGINE named.
+/// Drive one real step and validate it against the action the engine recorded.
 ///
-/// `gesture` runs the shipping seam. Nothing here holds the terminal lock while it
-/// runs — the pre-state read, the gesture and the post-state read are three separate
-/// acquisitions on purpose, because the SEAMS are what must read their own before and
-/// after inside one guard, and they do.
-///
-/// EXECUTION EVIDENCE. `gesture` — and only `gesture` — runs inside a one-step-wide
-/// `StepEvidence` window, so what the gate later audits is what THIS step called and
-/// not what the run as a whole touched. The pre-state read, the record read-back and
-/// the post-state projection are all outside it deliberately: they call
-/// `Terminal::grid`, `text_selection` and `take_custody_transition`, and a window that
-/// contained those would let an anchor parked on a HARNESS read path discharge a
-/// shipping obligation.
+/// The pre-state read, the gesture and the post-state read take the terminal lock
+/// separately; the seams read their own before/after inside one guard. Only `gesture`
+/// runs inside the `StepEvidence` window: the harness reads (`Terminal::grid`,
+/// `text_selection`, `take_custody_transition`) stay outside it, so an anchor parked on
+/// a harness read path cannot discharge a shipping obligation.
 fn step(
     term: &Arc<Mutex<Terminal>>,
     c: &mut Press,
@@ -385,10 +350,8 @@ fn step(
     next
 }
 
-/// A terminal with `history` retained scrollback lines and the viewport at live.
-///
-/// Built by feeding REAL bytes through `Terminal::process`, so the scrollback is the
-/// engine's own and the offsets the steps below take are offsets into real history.
+/// A terminal with `history` scrollback lines fed through `Terminal::process`, and the
+/// viewport at live.
 fn engine_fixture(rows: u16, history: usize) -> Terminal {
     let mut term = Terminal::new(rows, 20);
     term.set_scrollback_line_limit(Some(history + 8));
@@ -407,14 +370,10 @@ fn engine_fixture(rows: u16, history: usize) -> Terminal {
     term
 }
 
-/// Arm a completed selection over LIVE-SCREEN selection rows `first..=last` — the
-/// same coordinates `App::begin_selection` computes (viewport row minus
-/// `display_offset`), so row 0 is the top of the live screen however far back the
-/// view is scrolled.
-///
-/// FIXTURE CONSTRUCTION, not a claimed transition — the same status
-/// `App::headless_for_test()` has. The GUI gesture seam that really makes selections
-/// is driven for real in [`gui_gesture_chain`].
+/// Arm a completed selection over live-screen rows `first..=last`, in the coordinates
+/// `App::begin_selection` computes (viewport row minus `display_offset`). Fixture
+/// construction, not a claimed transition; the real gesture seam is driven in
+/// [`gui_gesture_chain`].
 fn arm_selection(term: &mut Terminal, first: i32, last: i32) {
     let sel = term.text_selection_mut();
     sel.start_selection(first, 0, SelectionSide::Left, SelectionType::Simple);
@@ -423,29 +382,16 @@ fn arm_selection(term: &mut Terminal, first: i32, last: i32) {
     assert!(sel.has_selection(), "the fixture selection must be alive");
 }
 
-/// `OutputDamagesTheSelectedRows`: one batch that BOTH replaces the rows the
-/// selection is sitting on AND scrolls a line in — driven from BOTH ownerships.
+/// `OutputDamagesTheSelectedRows`: one batch that both replaces the rows the selection
+/// sits on and scrolls a line in, driven from both ownerships.
 ///
-/// Both halves of the batch are load-bearing for the reading case. The action assigns
-/// `offset = offset + 1` when the user owns the viewport, so a batch that damaged
-/// without advancing any row would leave the offset where it was and be REJECTED —
-/// the action says the re-pin rides the new lines exactly as for undamaged output, and
-/// that is the half of it a damage-only batch could not check.
+/// The model's offset clause is `if owner == 1 { offset + 1 } else { 0 }`, so for the
+/// reader the batch must advance a row. At live, the commonest real instance is a
+/// status line or progress bar repainting the highlighted rows.
 ///
-/// BOTH OWNERSHIPS, because the engine records both. The action used to be guarded
-/// `owner == 1`, which disabled it outright at live — and at LIVE is where its
-/// commonest real instance happens: a status line or progress bar repainting the rows
-/// a highlight sits on, which is the shipping defect this design came from. The
-/// recorder never consulted the offset for this arm, so that instance was a step the
-/// spec could not admit while the gate called the machine 11/11 bound with zero
-/// waivers. The model now carries the split in its offset clause instead of its guard
-/// (`offset = if owner == 1 { offset + 1 } else { 0 }`), and both shapes are DRIVEN
-/// here rather than one of them being stated as a gap.
-///
-/// The band is aimed with EL (`\e[K`), which records exactly the cursor's row on the
-/// selection-damage lattice, at the LIVE screen's row 0 — the prologue has forced the
-/// offset to 0 for the duration of the batch, so VT row 1 is the live top, which is
-/// where the fixture's selection starts.
+/// EL (`\e[K`) damages exactly the cursor's row: the live screen's row 0, since the
+/// prologue forces the offset to 0 for the batch, so VT row 1 is the live top where the
+/// fixture's selection starts.
 fn damaged_rows_case(validated: &mut usize, ev: &mut StepEvidence) {
     // EL over the live top (the selection's own rows), then a line feed from the
     // bottom row so a row really enters scrollback.
@@ -477,8 +423,8 @@ fn damaged_rows_case(validated: &mut usize, ev: &mut StepEvidence) {
         "the highlight over replaced text goes, the reading position does NOT"
     );
 
-    // (b) The view is at LIVE — the dominant instance, and the one the model used to
-    // shut out. Same bytes, same action, ownership unchanged at the tail.
+    // (b) The view is at live, the commonest real instance. Same bytes, same action,
+    // ownership unchanged at the tail.
     let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
     {
         let mut t = term_lock(&term);
@@ -509,19 +455,17 @@ fn damaged_rows_case(validated: &mut usize, ev: &mut StepEvidence) {
     );
 }
 
-/// THE IN-PLACE AND UNATTRIBUTED TAKES — the shapes that used to be KNOWN GAPS.
+/// The in-place and unattributed takes:
 ///
-/// (a) An in-place rewrite over the selected rows under a READER: EL over the live
-/// top with no line feed, so no row enters scrollback and the view stays exactly
-/// where it was — `OutputDamagesTheSelectedRowsInPlace`, `[1, 1, 0]`.
+/// (a) EL over the selected rows under a reader, with no line feed, so the view stays
+/// put: `OutputDamagesTheSelectedRowsInPlace`, `[1, 1, 0]`.
 ///
-/// (b) The oldest retained row, selected, EVICTED at the history floor by output at
-/// LIVE — no damage band names it, so `post_process` fails closed —
-/// `OutputTookTheSelectionUnattributed` at the tail, `[0, 0, 0]`.
+/// (b) The selected oldest row evicted at the history floor by output at live; no
+/// damage band names it, so `post_process` fails closed:
+/// `OutputTookTheSelectionUnattributed`, `[0, 0, 0]`.
 ///
-/// (c) The same eviction under a reader parked at the TOP of a full two-line
-/// history: the re-pin saturates, the view does not move —
-/// `OutputTookTheSelectionUnattributedInPlace`, `[1, 2, 0]`.
+/// (c) The same eviction under a reader parked at the top of a full two-line history;
+/// the re-pin saturates: `OutputTookTheSelectionUnattributedInPlace`, `[1, 2, 0]`.
 fn in_place_and_unattributed_takes(validated: &mut usize, ev: &mut StepEvidence) {
     // (a)
     let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
@@ -600,12 +544,11 @@ fn in_place_and_unattributed_takes(validated: &mut usize, ev: &mut StepEvidence)
     }
 }
 
-/// BACK TOWARD LIVE WITHOUT TYPING — the gestures that used to record nothing.
-///
-/// A one-row scroll down that stops short of the tail is `UserScrollTowardLive`
-/// (the user still owns the view); End (`ScrollIntent::Bottom`), a page down that
-/// lands at the tail, and the ⌘-V / IME snap (`App::snap_to_bottom`) are
-/// `SnapToLive`. Every one runs with a live highlight to take, and keeps it.
+/// Back toward live without typing. A one-row scroll down that stops short of the tail
+/// is `UserScrollTowardLive` (the user still owns the view); End
+/// (`ScrollIntent::Bottom`), a page down that lands at the tail, and the ⌘-V / IME snap
+/// (`App::snap_to_bottom`) are `SnapToLive`. Each runs with a live highlight, and keeps
+/// it.
 fn toward_live_seams(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -702,14 +645,14 @@ fn toward_live_seams(validated: &mut usize, ev: &mut StepEvidence) {
     }
 }
 
-/// The GUI half: one real `App`, one real terminal, eleven validated transitions
-/// (the downward gestures have their own fixture in [`toward_live_seams`])
-/// driven through the genuine scroll, gesture and press seams.
+/// The GUI half: one real `App` and terminal, nine validated transitions through the
+/// real scroll, gesture and press seams (the downward gestures are in
+/// [`toward_live_seams`]).
 fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // Keep the REAL system clipboard untouched: `finish_selection`'s copy-on-select
-    // and X11-PRIMARY channels are exfil side effects, not custody.
+    // Keep the real system clipboard untouched: `finish_selection`'s copy-on-select
+    // and X11 PRIMARY writes are side effects, not custody.
     app.copy_on_select = false;
     let term = app
         .front_terminal(wid)
@@ -732,9 +675,8 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     }
     let mut c = Press::new();
 
-    // PROJECTION-DRIFT GUARD: the fixture at live with no selection must project to
-    // the model's own `Init`. If the field reads or the ownership derivation drift,
-    // this fails before any transition is validated.
+    // Projection-drift guard: a live, unselected fixture must project to the model's
+    // `Init` before any transition is validated.
     let init = press_custody_model().init_state();
     let model_init: [i64; 7] = VARS.map(|v| init[v]);
     assert_eq!(
@@ -744,7 +686,7 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     );
     assert_eq!(model_init, [0; 7], "sanity: Init is the all-zero state");
 
-    // --- UserScroll: the user takes the viewport, ONE row, through the real seam.
+    // --- UserScroll: the user takes the viewport, one row, through the real seam.
     step(
         &term,
         &mut c,
@@ -778,9 +720,8 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
         ev,
     );
 
-    // --- UserSelect again: the RELEASE that completes the drag. Idempotent in the
-    // model (`selection = 1` from `selection == 1`) and an honest report of a second
-    // user gesture that leaves a selection behind.
+    // --- UserSelect again: the release that completes the drag (idempotent in the
+    // model: `selection = 1` from `selection == 1`).
     step(
         &term,
         &mut c,
@@ -794,31 +735,16 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
         ev,
     );
 
-    // --- ALL FOUR PRESS CLASSES, each as a REAL `App::input` delivery.
+    // --- All four press classes, each a real `App::input` key event, so
+    // `PressKind::of` and `is_modifier_or_lock_key` classify them, not the harness.
     //
-    // These used to be `apply_press_custody(&mut t, kind)` with `kind` chosen by the
-    // harness, and `note_press_custody` is a four-arm identity match on that same
-    // value — so "a seam that MIS-CLASSIFIES fails here" was a claim about a
-    // hardcoded table, not about any classification of a real key event. Two of
-    // `PressKind::of`'s four arms were never reached, and the mutant that deletes the
-    // `inert_modifier` arm — a bare ⌘ keydown snapping the viewport and clearing the
-    // highlight, which is LITERALLY the defect this whole design exists to prevent —
-    // survived every check in this module. It does not survive now: the delivery
-    // below is a real `NamedKey::ShiftLeft` at `KeyEventType::Press`, so
-    // `is_modifier_or_lock_key` is the thing that decides, and the record comes back
-    // named by the seam's own resolution.
+    // The order is also the priority test: `is_modifier_or_lock_key` matches the key
+    // alone, so a Shift key-up is `is_release && inert_modifier` and a held Shift's
+    // auto-repeat is `is_repeat && inert_modifier`. A mis-ordered `PressKind::of` files
+    // both under `InertPress` and changes nothing observable.
     //
-    // THE ORDER IS ALSO THE PRIORITY TEST. The three press bits OVERLAP:
-    // `is_modifier_or_lock_key` matches on the KEY alone with no event-type term, so
-    // a Shift key-UP is `is_release && inert_modifier` at once and a held Shift's
-    // auto-repeat is `is_repeat && inert_modifier` at once. The old `!a && !b && !c`
-    // predicate was order-free; a four-way tag is not. A mis-ordered `PressKind::of`
-    // files the first two under `InertPress`, changes nothing observable, and is
-    // invisible to every other check here.
-    //
-    // Every one of the four runs with the user owning the viewport AND a live
-    // selection, so a press class that started disturbing has BOTH things to take and
-    // the step is rejected rather than passing on an empty state.
+    // Each runs with the user owning the viewport and a live selection, so a press
+    // class that started disturbing has both things to take.
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
     let shift_left = || Key::Named(NamedKey::ShiftLeft);
     for (key, mods, event_type, expect, what) in [
@@ -895,7 +821,7 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
         }
     }
 
-    // --- UserSelect then UserClear: a press and release inside ONE cell is a
+    // --- UserSelect then UserClear: a press and release inside one cell is a
     // deliberate deselect, and a deliberate deselect is always allowed.
     step(
         &term,
@@ -920,27 +846,10 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     assert_eq!(after_clear[2], 0, "a click without a drag deselects");
 }
 
-/// THE THREE SEAMS THAT USED TO BRING A SELECTION INTO EXISTENCE SILENTLY.
-///
-/// `UserSelect` was recorded only from `begin_selection` / `finish_selection`, and the
-/// module's own header justified the omission of the rest with a sentence that was
-/// false as written: that they "cannot turn `has_selection()` on from off without a
-/// `start_selection` that IS recorded". `App::select_all` reaches the `TextSelection`
-/// primitive directly from a menu command with no mouse-down before it and no
-/// `finish_selection` after it; a double- or triple-click's PRESS builds a completed
-/// selection through `control::select_word` / `select_line` and only ARMS the drag, so
-/// the record stayed stale for the whole press-to-release window; and a search jump
-/// clears and re-anchors the highlight with no gesture around it at all. All three
-/// moved the projected `selection` 0 -> 1 with nothing recorded.
-///
-/// Two of the three are driven here as real validated steps. The search jump needs a
-/// populated find-bar match vector and its freshness stamps, which this module cannot
-/// assemble, so it is driven from its own crate instead:
-/// `app_search::tests::a_search_jump_records_who_took_the_selection` builds that state
-/// and asserts the recorded transition. An earlier version of this sentence said the
-/// seam was "covered by its seam's assertion rather than by a step" — there was no
-/// such assertion, and four recorder call sites in `app_search` were exercised by
-/// nothing at all.
+/// Seams that bring a selection into existence with no drag around them: Select All (a
+/// menu command) and a double-click's press. The third, a search jump, needs find-bar
+/// match state this module cannot build;
+/// `app_search::tests::a_search_jump_records_who_took_the_selection` drives it.
 fn silent_select_seams(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -978,9 +887,8 @@ fn silent_select_seams(validated: &mut usize, ev: &mut StepEvidence) {
         "Select All really did bring a selection into existence"
     );
 
-    // A double-click PRESS: `control::select_word` completes a selection and
-    // `arm_gesture_drag` only ARMS the release. The release's own `UserSelect` is
-    // driven in `gui_gesture_chain`; this is the press that made the highlight.
+    // A double-click press: `control::select_word` completes a selection and
+    // `arm_gesture_drag` only arms the release.
     let after_word = step(
         &term,
         &mut c,
@@ -996,34 +904,18 @@ fn silent_select_seams(validated: &mut usize, ev: &mut StepEvidence) {
     );
 }
 
-/// THE WHEEL — the dominant scroll gesture, driven through both of `input_wheel`'s
-/// real motion routes.
+/// The wheel, driven through both of `input_wheel`'s motion routes. The recorder lives
+/// in the `Terminal` primitives that raise the offset, so every route records; these two
+/// are the ones the motion policy switches between:
 ///
-/// This is the check the module was missing entirely. `UserScroll` used to be
-/// anchored on a GUI helper wired into two of the roughly eight seams that raise
-/// `display_offset`, and the wheel was in neither: `input_wheel`'s instant arm, its
-/// glide tick, `settle_scroll_motion_at_target`, `control::apply_scroll_intent`, the
-/// cross-session `mouse` wheel fallback and the search jump all reached
-/// `Terminal::scroll_display` / `scroll_to_absolute_row` directly and recorded
-/// nothing, so after a wheel notch the `custody` verb named an innocent press beside a
-/// reading position that press had not moved. The Tier-1 body could not see it,
-/// because it drove `UserScroll` only through `InputEvent::ScrollView`, the one
-/// recorded route.
+/// * instant (`motion = reduced`, OS Reduce Motion, or an unfocused window):
+///   `scroll_wheel_animated`'s early arm calls `scroll_display` under its own lock.
+/// * glide + settle: the ~180 ms ease banks the target and
+///   `settle_scroll_motion_at_target` lands it in whole rows, on the terminal the glide
+///   pinned rather than whatever pane is frontmost now.
 ///
-/// The recorder now lives in the three `Terminal` primitives that can raise the
-/// offset, so every one of those routes records by construction. Two of them are
-/// driven here to prove it rather than assert it — and they are the two the motion
-/// policy switches between, so neither can regress without the other noticing:
-///
-/// * INSTANT (`motion = reduced`, OS Reduce Motion, or an unfocused window — the M1
-///   accessibility clause): `scroll_wheel_animated`'s early arm calls
-///   `scroll_display` under its own lock.
-/// * GLIDE + SETTLE: the ~180 ms ease banks the target and
-///   `settle_scroll_motion_at_target` lands it in whole rows, on the terminal the
-///   glide pinned rather than whatever pane is frontmost now.
-///
-/// One fixture each, because both start from live and the abstract offset is bounded
-/// at `MaxOffset = 2` — a chain of notches would saturate rather than step.
+/// One fixture each: both start from live, and a chain of notches would saturate at
+/// `MaxOffset = 2`.
 fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
     for (focused, what) in [
         (
@@ -1084,10 +976,8 @@ fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
                     },
                     Source::Human,
                 );
-                // The eased arm banks a whole-row target and lands it here. Inside
-                // the SAME step as the notch, because the gesture is the notch —
-                // `settle_scroll_motion_at_target` is how it finishes, not a second
-                // user action.
+                // The eased arm banks a whole-row target; settling it finishes the
+                // same gesture, not a second user action.
                 app.settle_scroll_motion_at_target(wid, std::time::Instant::now());
             },
             validated,
@@ -1101,26 +991,17 @@ fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
     }
 }
 
-/// The OUTPUT half: real `Terminal::process` batches, each on its own fixture so the
+/// The output half: real `Terminal::process` batches, each on its own fixture so the
 /// bounded offset never has to saturate.
 fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
-    // ---- OutputAtLive, WITH a live selection the batch does not touch. ----
+    // ---- OutputAtLive, with a live selection the batch does not touch. ----
     //
-    // The action is an identity transition on the observable variables — at live the
-    // offset is already 0, so its `offset = 0` is a self-assignment — and Tier-0 can
-    // therefore falsify nothing through it.
-    //
-    // WHAT ACTUALLY GUARDS THE SHIPPING DEFECT HERE, stated precisely rather than
-    // credited to the invariant. An engine that destroyed a live highlight when a
-    // status bar repainted rows it never selected — the defect this whole design came
-    // from — is caught by the named assertion below, and by `recorded()`: a batch
-    // that destroys a selection it did not damage is classified
-    // `OutputTookTheSelectionUnattributed` and one that damaged it is classified
-    // `OutputDamagesTheSelectedRows`, so either way the record does not come back
-    // `OutputAtLive` and the step fails at claim 2. `OutputSparesAnUndamagedSelection`
-    // IS evaluated on this step (see `validate_transition`), and it would reject the
-    // same shape — but it has no reachable counterexample under this recorder, so
-    // saying it is the thing doing the rejecting would be borrowed credit.
+    // An identity transition on the observables (at live `offset = 0` is a
+    // self-assignment). A highlight destroyed by a batch that did not damage it is
+    // caught by the named assertion below and by `recorded()`: such a batch records
+    // `OutputTookTheSelectionUnattributed` or `OutputDamagesTheSelectedRows`, never
+    // `OutputAtLive`. `OutputSparesAnUndamagedSelection` is evaluated too, but has no
+    // reachable counterexample under this recorder.
     {
         let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
         {
@@ -1153,12 +1034,9 @@ fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
 
     // ---- OutputWhileReading: the re-pin rides the arriving line. ----
     //
-    // ARMED WITH A SELECTION, like its at-live sibling. Without one this step's
-    // `selection` frame is the trivial 0 -> 0 and the event-5 claim "output that did
-    // not touch the selected rows leaves the highlight alone" says nothing here at
-    // all — the same emptiness the at-live case was accused of. The highlight is on
-    // the LIVE screen while the view is a row back in history, which is precisely the
-    // shape a `tail -f` under a scrolled-back reader produces.
+    // Armed with a live-screen selection while the view is a row back in history (a
+    // `tail -f` under a scrolled-back reader), so the `selection` frame is not a
+    // trivial 0 -> 0.
     {
         let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
         {
@@ -1214,10 +1092,8 @@ fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
         );
     }
 
-    // ---- …and RIS, the second producer of the SAME action through a different
-    // route: ED 3 records `SelectionDamage::All` and lets the drain clear, while RIS
-    // clears directly in `Terminal::reset`. A binding that only ever saw one of those
-    // would miss a regression in the other.
+    // ---- RIS: the same action by another route. ED 3 records `SelectionDamage::All`
+    // and lets the drain clear; RIS clears directly in `Terminal::reset`. ----
     {
         let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
         {
@@ -1250,52 +1126,46 @@ fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
 /// action's anchored function.
 pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
-    // EXECUTION EVIDENCE. `step` drives each seam inside a one-step-wide window, so
-    // the gate can require this action's anchored function to have been entered by
-    // THIS action's step rather than somewhere in a run that drives sixteen of them.
+    // Each step runs its seam in a one-step-wide evidence window, so the gate can
+    // require an action's anchored function to be entered by that action's own step.
     let mut ev = StepEvidence::new("PressCustody");
 
     gui_gesture_chain(&mut validated, &mut ev);
     wheel_seams(&mut validated, &mut ev);
     silent_select_seams(&mut validated, &mut ev);
     toward_live_seams(&mut validated, &mut ev);
-    // Everything counted so far came through the App's real input seams; the rest is
-    // the engine's own output path. Derived rather than hardcoded, so a step added to
-    // either half cannot make the summary line lie.
+    // Steps so far came through the App's input seams, the rest through the engine's
+    // output path; counted, not hardcoded, so the summary line stays true.
     let gui = validated;
     output_batches(&mut validated, &mut ev);
     damaged_rows_case(&mut validated, &mut ev);
     in_place_and_unattributed_takes(&mut validated, &mut ev);
 
-    // ---- NEGATIVE CONTROLS (non-vacuity). ----
-    // Each is a regression the model must REFUSE. If ANY were admitted, a real
-    // custody regression would sail through the checks above and the whole
-    // conformance would prove nothing. Every one of them is a state pair the
-    // interpreter evaluates against the named action's own guard and updates, so a
-    // rejection here is the model doing work, not the harness.
+    // ---- Negative controls: regressions the model must refuse, each evaluated
+    // against the named action's own guard and updates, so the passes above are not
+    // vacuous. ----
     let read_low = [1, 1, 1, 0, 0, 0, 0];
     let read_high = [1, 1, 1, 1, 1, 1, 0];
 
     let rejected: &[(&str, [i64; 7], [i64; 7], &str)] = &[
-        // (a) A bare modifier snaps the viewport and takes the highlight — the
-        // literal shipping defect, and why Cmd-C copied nothing.
+        // (a) A bare modifier snaps the viewport and takes the highlight, so Cmd-C
+        // would copy nothing.
         (
             "InertPress",
             read_low,
             [0, 0, 0, 1, 1, 1, 3],
             "a bare modifier expresses no intent and may disturb nothing",
         ),
-        // (b) An auto-repeat tick re-runs the snap — the ~30 Hz destroyer of any
-        // scroll or selection made mid-hold.
+        // (b) An auto-repeat tick (~30 Hz) re-runs the snap, destroying any scroll or
+        // selection made mid-hold.
         (
             "RepeatPress",
             read_low,
             [0, 0, 0, 1, 1, 1, 2],
             "the press already took custody; a tick of the same hold cannot take it twice",
         ),
-        // (c) A key RELEASE disturbs. Indistinguishable from (a) and (b) in every
-        // observable variable — it is a DIFFERENT control only because the record
-        // carries the discriminator.
+        // (c) A key release disturbs. Observably identical to (a) and (b); only the
+        // record tells them apart.
         (
             "ReleaseEvent",
             read_low,
@@ -1309,16 +1179,15 @@ pub(crate) fn run_conformance() -> StepEvidence {
             [0, 0, 1, 1, 1, 1, 5],
             "output may never take the reading position",
         ),
-        // (e) Output that MISSED the selected rows takes the highlight anyway — the
-        // `content_scroll_delta = i32::MAX` sentinel's whole failure mode, and the one
-        // regression `OutputAtLive` can catch now that the record makes it nameable.
+        // (e) Output that missed the selected rows takes the highlight anyway (the
+        // failure mode of the `content_scroll_delta == i32::MAX` sentinel).
         (
             "OutputAtLive",
             [0, 0, 1, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 1, 5],
             "a status bar repainting rows it never selected may not destroy the highlight",
         ),
-        // (f) Output that REPLACED the selected rows takes the reading position too.
+        // (f) Output that replaced the selected rows takes the reading position too.
         // Damaging the selection is not a licence to snap.
         (
             "OutputDamagesTheSelectedRows",
@@ -1326,8 +1195,8 @@ pub(crate) fn run_conformance() -> StepEvidence {
             [0, 0, 0, 1, 1, 1, 6],
             "damaging the selected rows is not a licence to move the view",
         ),
-        // (g) An invalidation leaves the highlight naming rows that no longer exist —
-        // the fail-OPEN direction, where a copy returns text from a destroyed space.
+        // (g) An invalidation leaves the highlight naming rows that no longer exist,
+        // so a copy would return text from a destroyed space.
         (
             "OutputInvalidatesTheCoordinateSpace",
             read_low,
@@ -1341,8 +1210,7 @@ pub(crate) fn run_conformance() -> StepEvidence {
             [1, 1, 0, 1, 1, 1, 1],
             "typing means take me to the prompt, so it lands at live or it is not typing",
         ),
-        // (f2) The in-place twins and the unattributed take snap the reader — the
-        // same licence (f) refuses, on the shapes that used to be unmodelled.
+        // (f2) The in-place twins and the unattributed take snap the reader.
         (
             "OutputDamagesTheSelectedRowsInPlace",
             read_low,
@@ -1374,45 +1242,32 @@ pub(crate) fn run_conformance() -> StepEvidence {
             [1, 1, 0, 1, 2, 1, 8],
             "a scroll down is not a deselect",
         ),
-        // (i) A GUARD, not an update: `UserScroll` is disabled at the abstract
-        // ceiling, so this control proves the guards bite and not merely the update
-        // expressions.
+        // (i) A guard, not an update: `UserScroll` is disabled at the abstract ceiling.
         (
             "UserScroll",
             [1, 2, 0, 0, 0, 0, 0],
             [1, 2, 0, 1, 2, 0, 0],
             "UserScroll is guarded `offset <= MaxOffset - 1` and cannot fire at the cap",
         ),
-        // (j) STATE CONSISTENCY: a user scroll that raises the offset but leaves the
-        // tail-follower owning the viewport. `TailOwnerAtBottom` is the invariant, and
-        // `UserScroll`'s own `owner = 1` is what enforces it here.
+        // (j) A user scroll that raises the offset but leaves the tail-follower owning
+        // the view (`TailOwnerAtBottom`; `UserScroll`'s `owner = 1` enforces it).
         (
             "UserScroll",
             [0, 0, 0, 0, 0, 0, 0],
             [0, 1, 0, 0, 0, 0, 0],
             "an offset above the tail means the USER owns the viewport",
         ),
-        // (k) A deliberate deselect that also moves the view. `UserClear` assigns the
-        // selection and nothing else — the model's claim that a deselecting click
-        // leaves the reading position alone.
+        // (k) A deselecting click that also moves the view: `UserClear` assigns only
+        // the selection.
         (
             "UserClear",
             read_high,
             [0, 0, 0, 1, 1, 1, 0],
             "a deselecting click is not a scroll",
         ),
-        // (l) THE INVARIANT TIER, and the proof that it is not decorative. This pair
-        // is the EXACT update image of `InertPress` at its own `prev` — offset,
-        // ownership and selection all carried through, the shadows written from the
-        // pre-state, `last_event = 3` — so the refinement check that
-        // `validate_transition_tiered` performs ADMITS it at both tiers, and every
-        // other control above would too. The only thing wrong with it is that the
-        // offset is 7, which `StateBounds` bounds at `MaxOffset` (= 2). That is not a
-        // hypothetical shape: a real wheel notch moves `wheel_viewport_lines` rows,
-        // so a projection that stopped being the identity on `0..=MaxOffset` lands
-        // exactly here. Before the invariants were evaluated at this tier, the
-        // module's claim that such a step "would be REJECTED by `StateBounds`, never
-        // silently clamped" was false.
+        // (l) The exact update image of `InertPress` at its own `prev`, so the
+        // refinement check admits it at both tiers; only `StateBounds` (`offset <=
+        // MaxOffset` = 2) rejects the offset of 7 a drifted projection would produce.
         (
             "InertPress",
             [1, 7, 0, 0, 0, 0, 0],

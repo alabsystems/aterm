@@ -2722,7 +2722,6 @@ mod tests {
                 .expect("catch up");
             std::fs::read_to_string(&fired).unwrap_or_default()
         };
-        let unclean;
         let (before, cut) = {
             let opened = durability::open(
                 &log,
@@ -2731,7 +2730,11 @@ mod tests {
                 Some(durability::test_boot(1)),
             )
             .unwrap();
-            unclean = durability::UncleanStop::capture(&log);
+            if !matches!(ended, Ended::Clean) {
+                // What a stop that never reached the clean close leaves
+                // (astream's seam): the log as a killed run left it.
+                opened.broker.arm_unclean_stop();
+            }
             let mut server = opened.broker.serve(&sock).unwrap();
             assert_eq!(run(), "", "an empty log: the cursor is claimed at 0");
             assert_eq!(escalate("help-0"), 0);
@@ -2740,14 +2743,11 @@ mod tests {
                 escalate(text);
             }
             assert_eq!(run().lines().count(), 4, "all four fire in boot 1");
-            // The last listener's shutdown is astream's clean close.
+            // The last listener's shutdown is astream's clean close, unless
+            // the seam was armed above.
             server.shutdown();
             (opened.broker.log_identity(), cut)
         };
-        if !matches!(ended, Ended::Clean) {
-            // What a stop that never reached the clean close leaves.
-            unclean.leave(&log);
-        }
         if matches!(ended, Ended::PowerLoss) {
             std::fs::OpenOptions::new()
                 .write(true)
@@ -3193,9 +3193,9 @@ mod tests {
         }
     }
 
-    /// A lineage of these steps ([`crate::durability::lineage_of`]).
+    /// A lineage of these steps (astream's [`astream_broker::Lineage::from_steps`]).
     fn lineage_of(steps: &[(u64, u64)]) -> astream_broker::Lineage {
-        crate::durability::lineage_of(steps).expect("rising generations, at most MAX")
+        astream_broker::Lineage::from_steps(steps).expect("rising generations, at most MAX")
     }
 
     #[test]

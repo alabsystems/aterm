@@ -9,29 +9,29 @@
 //! terminal engine routes into its existing inline-image placement/blit path
 //! (the same one OSC 1337 `File=` uses). The engine stores inline images
 //! undecoded (it decodes a PNG only to compose Kitty animation frames), so
-//! this crate is the ONLY place sixel pixels are materialized; it has no
+//! this crate is the only place sixel pixels are materialized; it has no
 //! dependencies and is pure `std`.
 //!
-//! ## Wire format handled (first correct increment)
+//! ## Wire format handled
 //!
 //! - **Data bytes** `0x3F..=0x7E`: `value = byte - 0x3F` is a 6-bit column of
 //!   pixels (LSB = topmost) painted in the current color at the current x, then
 //!   x advances by 1.
 //! - **`#` color introducer**: `#Pc` selects register `Pc`; `#Pc;Pu;Px;Py;Pz`
-//!   DEFINES register `Pc` — `Pu==2` is RGB with `Px,Py,Pz` in `0..=100`
+//!   defines register `Pc` — `Pu==2` is RGB with `Px,Py,Pz` in `0..=100`
 //!   (scaled to `0..=255`), `Pu==1` is HLS (`Px`=hue 0..360, `Py`=lightness
 //!   0..100, `Pz`=saturation 0..100) converted to RGB.
 //! - **`!Pn` DECGRI**: the next single data byte is repeated `Pn` times.
 //! - **`"Pan;Pad;Ph;Pv` DECGRA**: raster attributes — `Ph`/`Pv` declare the
 //!   image width/height (clamped to [`SIXEL_MAX_DIMENSION`]). The declared
-//!   geometry is recorded as the fallback output size but does NOT pre-size the
+//!   geometry is recorded as the fallback output size but does not pre-size the
 //!   backing raster, which grows on demand as pixels are painted (so the
 //!   engine's put()-time DCS pixel budget bounds it). The aspect-ratio
 //!   `Pan`/`Pad` are parsed but not applied (1:1 pixels).
 //! - **`$`**: graphics carriage return — x back to 0, y band unchanged.
 //! - **`-`**: graphics new-line — advance y by one 6-px band, x back to 0.
 //!
-//! ## Deliberately deferred (documented, not blockers for correctness)
+//! ## Deliberately deferred
 //!
 //! - HLS rounding edge-cases (a standard integer HLS→RGB is used).
 //! - P2 background-select transparency semantics: unset pixels are left fully
@@ -62,16 +62,10 @@ pub const MAX_COLOR_REGISTERS: usize = 1024;
 /// the largest that places.
 pub const SIXEL_MAX_DIMENSION: usize = 4096;
 
-/// Maximum total pixel count (width × height) of a decoded raster, INDEPENDENT
+/// Maximum total pixel count (width × height) of a decoded raster, independent
 /// of the per-axis [`SIXEL_MAX_DIMENSION`] clamp. 4 Mi pixels = 16 MiB at
-/// 4 bytes/pixel, matching the downstream inline-image rejection cap
-/// ([`SIXEL_MAX_IMAGE_BYTES`]) — so an over-cap raster (e.g. the 4096×4096 =
-/// 16.7 M-cell DECGRA a ~16-byte DCS can declare) is refused BEFORE the
-/// ~150 MB raster + compose allocation, not after. The per-axis clamp alone
-/// does not bound the product, so without this a tiny stream forces a huge
-/// transient allocation that also escapes the engine's DCS memory budget (the
-/// few stream bytes never trip it). This is the EARLY (raster-declaration and
-/// buffer-growth) guard; [`SIXEL_MAX_IMAGE_BYTES`] is the materialization guard.
+/// 4 bytes/pixel, matching [`SIXEL_MAX_IMAGE_BYTES`] so an over-cap raster
+/// (e.g. a 4096×4096 DECGRA) is refused before raster/compose allocation.
 pub const SIXEL_MAX_PIXELS: usize = 4 * 1024 * 1024;
 
 /// The six pixel rows a sixel byte paints, top first: bit `row` of the data
@@ -82,14 +76,9 @@ const SIXEL_ROW_MASKS: [u8; 6] = [1, 2, 4, 8, 16, 32];
 /// Maximum decoded-image byte budget (packed RGBA, 4 bytes/px) a single sixel
 /// sequence may materialize at [`unhook`](SixelDecoder::unhook).
 ///
-/// Mirrors `aterm-core`'s `MAX_IMAGE_BYTES` (16 MiB), the per-image cap that
-/// `place_sixel_image` enforces before storing/blitting an inline image. We
-/// duplicate the value here (the crate is dependency-free and the `unhook`
-/// signature is fixed) so the oversized-geometry rejection happens *before* the
-/// output `pixels` buffer is allocated and the fill loop runs — a DECGRA-only
-/// declaration that defers `apply_raster` to `unhook` would otherwise build a
-/// huge transient outside the engine's put()-time DCS pixel budget. Keep this
-/// in sync with `aterm-core` `MAX_IMAGE_BYTES` (= [`SIXEL_MAX_PIXELS`] × 4).
+/// Mirrors `aterm-core`'s `MAX_IMAGE_BYTES` (16 MiB, [`SIXEL_MAX_PIXELS`] × 4)
+/// so oversized declared geometry is rejected before allocating the output
+/// `pixels` buffer.
 pub const SIXEL_MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum numeric parameters a sixel introducer (`#`/`!`/`"`) may accumulate.
@@ -301,21 +290,17 @@ impl SixelDecoder {
                     self.params.push(d);
                 }
             }
-            // Commit the current slot and open a new one (default 0) — capped so a
-            // `;`-separator flood cannot grow `params` unbounded (it is excluded
-            // from the pixel-allocation budget, and no valid introducer needs more
-            // than 5 params). Past the cap the `;` falls through to the no-op `_`
-            // arm and is ignored — behavior-identical to an inner bound check, but
-            // as a match guard it does not trip clippy::collapsible_if.
+            // Commit the current slot and open a new one (default 0), capped at
+            // `SIXEL_MAX_PARAMS` so a `;`-separator flood cannot grow `params`
+            // unbounded.
             b';' if self.params.len() < SIXEL_MAX_PARAMS => {
                 self.params.push(0);
             }
             b'$' => {
                 self.finish_params();
                 self.x = 0;
-                // DECGRI `!Pn` applies ONLY to the immediately-following sixel data
-                // byte; a graphics-CR in between cancels a pending repeat (else
-                // `!3$~` would wrongly widen the next band). #adversarial-stream.
+                // DECGRI `!Pn` applies only to the immediately-following sixel data
+                // byte; a graphics-CR in between cancels a pending repeat.
                 self.pending_repeat = 0;
             }
             b'-' => {
@@ -356,45 +341,31 @@ impl SixelDecoder {
         let height = self.max_y.max(self.declared_h).min(SIXEL_MAX_DIMENSION);
         let total = width.saturating_mul(height);
         if width == 0 || height == 0 || total > SIXEL_MAX_PIXELS {
-            // Drop buffers and report nothing for a degenerate OR over-cap image.
-            // The over-cap case would be rejected downstream anyway; refuse to
-            // compose the width*height buffer rather than materialize it first.
             self.release();
             return None;
         }
 
-        // Reject oversized geometry BEFORE composing the output buffer, so a
-        // DECGRA-only declaration (whose `apply_raster` is deferred here, past
-        // the put()-time DCS pixel budget) cannot force a multi-MiB transient
-        // `pixels` Vec and a width*height fill loop. This mirrors the engine's
-        // `place_sixel_image` MAX_IMAGE_BYTES rejection (defense-in-depth kept
-        // there), just moved ahead of the allocation: over-cap images still
-        // yield no placed cells, identical to today's behavior.
+        // Reject oversized geometry before composing the output buffer so a
+        // DECGRA-only declaration cannot force a transient `pixels` allocation.
         let final_bytes = width.saturating_mul(height).saturating_mul(4);
         if final_bytes > SIXEL_MAX_IMAGE_BYTES {
             self.release();
             return None;
         }
 
-        // Compose the final packed-RGBA buffer of exactly width*height. This
-        // runs under the terminal lock at DCS ST, so it must be row-wise bulk
-        // copies — a per-pixel bounds-checked push costs ~4M checked
-        // iterations for a cap-size image and stalls keystrokes on the mutex.
-        // The alpha byte carries the set bit: in-range raster is already
-        // `0x00000000` for unpainted and `0xFF00_0000 | color` for painted
-        // pixels, so rows copy verbatim and all padding is TRANSPARENT (0).
+        // Compose the final packed-RGBA buffer of `width * height` via row-wise
+        // bulk copies. In-range raster cells are `0x00000000` (unpainted) or
+        // `0xFF00_0000 | color` (painted), and any padding is `TRANSPARENT`.
         let stride = self.alloc_width;
-        // `total` is the pixel count the cap check above bounded; the `min`
-        // cannot change it, and restates that bound AT the allocations, where
-        // the verifier can see it (it does not carry the early return down).
+        // Restate the `SIXEL_MAX_PIXELS` bound at the allocation for the verifier.
         let total = total.min(SIXEL_MAX_PIXELS);
         let mut pixels = Vec::with_capacity(total);
         let in_w = width.min(stride);
         let pad = width.saturating_sub(in_w);
         for y in 0..height.min(self.alloc_height) {
-            // In bounds: y < alloc_height and in_w <= stride, and the raster
-            // is exactly alloc_width * alloc_height long (ensure_capacity) —
-            // so `get` is always `Some`; one check per ROW, not per pixel.
+            // `y < alloc_height`, `in_w <= stride`, and `raster.len() ==
+            // alloc_width * alloc_height` (`ensure_capacity`), so `get` is
+            // always `Some` with one bounds check per row.
             let start = y.saturating_mul(stride);
             if let Some(row) = self.raster.get(start..start.saturating_add(in_w)) {
                 pixels.extend_from_slice(row);
@@ -421,7 +392,7 @@ impl SixelDecoder {
 
     /// Live pixel-buffer byte size, for the engine's DCS memory budget.
     ///
-    /// Counts the packed raster (4 bytes/px); the "set" bit now lives in each
+    /// Counts the packed raster (4 bytes/px); the "set" bit lives in each
     /// pixel's alpha byte, so there is no separate mask buffer to charge.
     #[must_use]
     pub fn pixel_alloc_bytes(&self) -> usize {
@@ -506,11 +477,9 @@ impl SixelDecoder {
         // `MAX_COLOR_REGISTERS` is 1024, so the subtraction can never wrap;
         // `saturating_sub` is identical and carries no panic obligation.
         let reg = (pc as usize).min(MAX_COLOR_REGISTERS.saturating_sub(1));
-        // Read the four define-params via `.get()` (native `match` on the
-        // Option) rather than `params[1..=4]`: the verifier reloads
-        // `params.len()` per access and cannot carry the `len() >= 5` guard
-        // across all four indexes. All four being `Some` is exactly `len >= 5`,
-        // so this is behavior-identical to the prior length-checked indexing.
+        // Read the four define-params via `.get()` rather than `params[1..=4]`:
+        // the verifier reloads `params.len()` per access and cannot carry a
+        // `len() >= 5` guard across all four indexes.
         if let (Some(&pu), Some(&px), Some(&py), Some(&pz)) = (
             self.params.get(1),
             self.params.get(2),
@@ -523,8 +492,8 @@ impl SixelDecoder {
                 _ => rgb_percent(px, py, pz),
             };
             // `reg < MAX_COLOR_REGISTERS == palette.len()`, so this is always
-            // `Some`; get_mut avoids the index obligation the verifier can't
-            // carry (it does not track the palette length across field reloads).
+            // `Some`; `get_mut` avoids the index obligation the verifier can't
+            // carry across field reloads.
             if let Some(slot) = self.palette.get_mut(reg) {
                 *slot = rgb;
             }
@@ -534,15 +503,9 @@ impl SixelDecoder {
 
     /// `"Pan;Pad;Ph;Pv` — record declared raster geometry.
     fn apply_raster(&mut self) {
-        // params: [Pan, Pad, Ph, Pv]; we use Ph (width) and Pv (height).
-        //
-        // Only RECORD the declared dimensions; do NOT pre-size the raster here.
-        // Eagerly allocating the full declared box (clamped to
-        // SIXEL_MAX_DIMENSION, i.e. up to 4096*4096*4 = 64 MiB) at this point
-        // bypasses the engine's put()-time DCS pixel budget when a DECGRA-only
-        // declaration defers `finish_params`/`apply_raster` to `unhook`. The
-        // raster is grown on demand by `emit_sixel`, and *that* growth is the
-        // budget-charged path (the put()-time pixel_alloc_bytes delta check).
+        // Record `[Pan, Pad, Ph, Pv]`'s `Ph` (width) and `Pv` (height) without
+        // pre-sizing `raster`: `emit_sixel` grows the buffer on demand so all
+        // growth goes through the put()-time `pixel_alloc_bytes` budget check.
         let ph = self.params.get(2).copied().unwrap_or(0) as usize;
         let pv = self.params.get(3).copied().unwrap_or(0) as usize;
         self.declared_w = ph.min(SIXEL_MAX_DIMENSION);
@@ -580,52 +543,21 @@ impl SixelDecoder {
         if stride == 0 {
             return;
         }
-        // The paint used to be a column-outer / row-inner nest that redid
-        // `py * stride`, a length compare, the store and TWO `self.max_*`
-        // read-modify-writes for every one of the `count * 6` pixels, and
-        // vectorized not at all. But the raster is row-major over `stride`, so a
-        // DECGRI run writes the SAME value into `count` CONTIGUOUS slots of each
-        // set row: the real shape of the work is one run per row, and the row
-        // set is column-invariant (the guards read only `bits`, `band_top`,
-        // `alloc_height`). Inverting the nest hoists the multiply and the
-        // bookkeeping out of the column dimension and lets the run become a
-        // vector memset. Same reasoning as the `unhook` compose loop: on this
-        // path the work must be row-wise and bulk.
-        //
-        // Measured on this machine (`-C opt-level=3 -C codegen-units=1`,
-        // 1024x768 raster painted band by band, vs the old nest): count=1 1.3x,
-        // count=2 1.4x, count=4 2.1x, count=8 3.5x, count=64 12x. The
-        // single-column split below is what keeps the count=1 case — a sixel
-        // stream with NO `!Pn` repeats, i.e. one data byte per column — a win
-        // instead of a ~4% regression: `fill` on a one-element slice costs more
-        // setup than the store it replaces.
-        //
-        // The fast path needs `raster.len() == alloc_width * alloc_height` to
-        // know a whole row-run is in bounds. `ensure_capacity` establishes that
-        // on all three of its exits (in-place resize, realloc, refused grow) and
-        // `new`/`hook`/`release` start from 0 == 0*0, so the `else` is dead —
-        // but it is spelled out (and `#[cold]`, off this function's hot body) so
-        // the rewrite is behavior-identical by CONSTRUCTION rather than by an
-        // invariant argument the loop does not itself establish.
+        // Paint row-wise across the contiguous `[self.x, run_end)` slice of
+        // each set row in the 6-px band so DECGRI repeats become slice fills,
+        // with a direct-store branch for `count == 1` to avoid `slice::fill`
+        // setup on unrepeated columns. `ensure_capacity` maintains
+        // `raster.len() == stride * alloc_height`; the `#[cold]` `else` branch
+        // keeps that invariant local.
         if self.raster.len() == stride.saturating_mul(self.alloc_height) {
-            // Columns at/past `alloc_width` were never painted by the old nest
-            // (it broke at the first `px >= self.alloc_width`), so the painted
-            // run is exactly `self.x .. min(self.x + count, alloc_width)`.
-            // Computed HERE, after `ensure_capacity` — that call grows
-            // `alloc_width`.
             let run_end = self.x.saturating_add(count).min(self.alloc_width);
             if run_end > self.x {
-                // Alpha 0xFF marks the pixel as set; `color` is already masked
-                // to 0x00FF_FFFF (line above), so no collision with the
-                // TRANSPARENT (0) sentinel even for painted black.
+                // Alpha 0xFF marks the pixel as set; `color` is masked to
+                // 0x00FF_FFFF above, so painted black remains distinct from
+                // `TRANSPARENT` (0).
                 let pixel = 0xFF00_0000 | color;
-                // Highest painted `py + 1`, folded into `self.max_y` once at the
-                // end instead of once per pixel. Zero means nothing landed.
                 let mut painted_max_y = 0usize;
                 if run_end.saturating_sub(self.x) == 1 {
-                    // Single column (no DECGRI repeat) — the common case for a
-                    // plain sixel stream. Store directly; `fill` over one
-                    // element is pure overhead here.
                     for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
                         if bits & mask == 0 {
                             continue;
@@ -635,8 +567,6 @@ impl SixelDecoder {
                             break;
                         }
                         let idx = py.saturating_mul(stride).saturating_add(self.x);
-                        // Total probe: fail-closes exactly like the old
-                        // `idx < self.raster.len()` guard, no panic site.
                         if let Some(slot) = self.raster.get_mut(idx) {
                             *slot = pixel;
                             painted_max_y = painted_max_y.max(py.saturating_add(1));
@@ -651,13 +581,9 @@ impl SixelDecoder {
                         if py >= self.alloc_height {
                             break;
                         }
-                        // One multiply per SET ROW, not per painted pixel.
                         let base = py.saturating_mul(stride);
                         let s = base.saturating_add(self.x);
                         let e = base.saturating_add(run_end);
-                        // Total probe again; under the length invariant checked
-                        // above (`py < alloc_height`, `run_end <= alloc_width`)
-                        // it always yields `Some`.
                         if let Some(slice) = self.raster.get_mut(s..e) {
                             slice.fill(pixel);
                             painted_max_y = painted_max_y.max(py.saturating_add(1));
@@ -665,13 +591,6 @@ impl SixelDecoder {
                     }
                 }
                 if painted_max_y > 0 {
-                    // The old code took the max of `px + 1` / `py + 1` over the
-                    // painted pixels. Since every column of the run paints the
-                    // identical row set, that is exactly `run_end` and
-                    // `painted_max_y`. The `max_x` fold is redundant with the
-                    // one below — `run_end <= self.x + count` and `run_end <=
-                    // alloc_width <= SIXEL_MAX_DIMENSION` — but it is kept so
-                    // the equality with the old code stays local.
                     self.max_x = self.max_x.max(run_end);
                     self.max_y = self.max_y.max(painted_max_y);
                 }
@@ -683,17 +602,8 @@ impl SixelDecoder {
         self.max_x = self.max_x.max(self.x.min(SIXEL_MAX_DIMENSION));
     }
 
-    /// The original per-PIXEL paint, verbatim, for the one state
-    /// [`Self::emit_sixel`]'s row-run fast path refuses: a raster whose length is
-    /// not `alloc_width * alloc_height`.
-    ///
-    /// `ensure_capacity` maintains that invariant on every exit and the decoder
-    /// starts at `0 == 0 * 0`, so this is unreachable — it exists so the run-fill
-    /// rewrite is behavior-identical by construction instead of resting on an
-    /// invariant proven elsewhere. `#[cold] #[inline(never)]` keeps it out of the
-    /// caller's body: this workspace builds with `lto = true` and
-    /// `codegen-units = 1`, where code merely PRESENT in a hot function's body
-    /// costs measurable throughput even when it never executes.
+    /// Cold fallback per-pixel paint when `raster.len() != alloc_width * alloc_height`.
+    /// Kept `#[cold] #[inline(never)]` out of [`Self::emit_sixel`]'s hot body.
     #[cold]
     #[inline(never)]
     fn paint_pixelwise(&mut self, bits: u8, count: usize, color: u32, stride: usize) {
@@ -742,47 +652,29 @@ impl SixelDecoder {
             return;
         }
         let new_h = need_h.max(self.alloc_height);
-        // Choose the new stride. When the width must ACTUALLY grow, over-allocate
-        // geometrically (double) so a column-at-a-time paint (each `put()` calls this
-        // per data byte, advancing x by 1) amortizes to O(area) instead of a fresh
-        // alloc + whole-raster copy on EVERY byte — the latter is Theta(H*W^2), a
-        // ~5000x-amplification DoS from a tiny DCS stream. When only the HEIGHT grows
-        // (need_w <= alloc_width) keep the stride EXACTLY equal so the in-place resize
-        // fast-path below still fires (this is what the round-5 attempt broke by
-        // over-allocating unconditionally). Geometric over-allocation is output-neutral:
-        // the composed image dimensions derive from max_x/max_y, not the stride, and
-        // unpainted cells stay the 0/TRANSPARENT sentinel.
+        // When the width grows, double the stride so column-at-a-time painting
+        // amortizes to O(area) instead of reallocating and copying the whole
+        // raster on every byte. When only the height grows (`need_w <=
+        // alloc_width`), keep the stride unchanged so the in-place `resize`
+        // fast path below fires.
         let new_w = if need_w > self.alloc_width {
             let geo = self
                 .alloc_width
                 .saturating_mul(2)
                 .max(need_w)
                 .min(SIXEL_MAX_DIMENSION);
-            // Prefer the doubled stride, but if doubling would exceed the total-pixel
-            // cap, grab the LARGEST stride that still fits the cap at this height
-            // instead of the exact needed width. Falling back to `need_w` (= alloc+1
-            // on a column-at-a-time paint) reallocs + copies the WHOLE raster on every
-            // byte — the Theta(H*W^2) blow-up the doubling exists to avoid, which
-            // re-appears for a TALL raster (new_h large ⇒ 2*alloc_width*new_h exceeds
-            // the cap while alloc_width is still moderate). Taking `cap/new_h` (clamped
-            // to the axis limit) allocates a wide stride ONCE, so the per-byte paint
-            // amortizes to O(area). Output-neutral (dims derive from max_x/max_y). If
-            // even `need_w` overflows the cap, `new_len` below refuses the grow
-            // (fail-closed) — identical to before.
+            // If doubling the stride exceeds `SIXEL_MAX_PIXELS` at `new_h`,
+            // clamp to the largest stride that fits `SIXEL_MAX_PIXELS / new_h`
+            // rather than `need_w` so tall rasters still grow their stride in
+            // one allocation instead of one column at a time.
             if geo
                 .checked_mul(new_h)
                 .is_some_and(|n| n <= SIXEL_MAX_PIXELS)
             {
                 geo
             } else {
-                // `new_h >= need_h >= 1` (`saturating_add(1)` then `max`), so
-                // this divisor is never zero — and even a hypothetical
-                // `new_h == 0` would take the `if` branch above
-                // (`checked_mul(0) == Some(0) <= cap`). The modular prover
-                // loses both facts across the `min`/`max`/`is_some_and` calls,
-                // so divide by `NonZeroUsize`: the nonzero divisor is
-                // established by type, leaving no zero-divisor MIR assert. The
-                // `else` arm is unreachable, hence no behavior change.
+                // `new_h >= 1`, and dividing by `NonZeroUsize` discharges the
+                // zero-divisor MIR assert for the modular prover.
                 let per_h = if let Some(h) = NonZeroUsize::new(new_h) {
                     SIXEL_MAX_PIXELS / h
                 } else {
@@ -797,21 +689,15 @@ impl SixelDecoder {
             self.alloc_width
         };
         let new_len = new_w.checked_mul(new_h).unwrap_or(0);
-        // Refuse to grow past the total-pixel cap. The per-axis clamp alone
-        // permits 4096×4096 = 16.7 M cells (≈150 MB across raster + mask +
-        // compose) from a tiny DCS. Leaving the buffer at its current bounded
-        // size makes the subsequent emit_sixel writes clamp harmlessly, and the
-        // over-cap image is dropped at unhook. #adversarial-stream.
+        // Refuse to grow past the total-pixel cap; subsequent `emit_sixel`
+        // writes clamp to the existing buffer and `unhook` drops the over-cap
+        // image.
         if new_len == 0 || new_len > SIXEL_MAX_PIXELS {
             return;
         }
         if new_w == self.alloc_width {
             // Stride is unchanged (only the height grew), so the old data is
-            // already a contiguous row-major prefix of the larger buffer: just
-            // extend in place with zero-filled trailing rows. Vec's geometric
-            // capacity growth amortizes this to O(area) total, avoiding the
-            // O(area * bands) realloc+copy of the allocate-new path. The result
-            // is byte-identical to reallocating and re-copying every old row.
+            // already a contiguous row-major prefix of the larger buffer.
             self.raster.resize(new_len, 0);
             self.alloc_height = new_h;
             return;
@@ -820,13 +706,9 @@ impl SixelDecoder {
         // each old row into the wider stride.
         let mut new_raster = vec![0u32; new_len];
         let old_stride = self.alloc_width;
-        // Copy row-major by zipping the destination's wide rows against the
-        // source's narrow rows. Iterator zipping carries no index obligations,
-        // so every element write is bounds-safe by construction; under the real
-        // invariant (old_stride <= new_w) this copies each old row in full,
-        // identically to the previous slice copy.
-        // `chunks`/`chunks_mut` divide by the chunk size, so both strides must be
-        // provably nonzero before we call them.
+        // Zip destination rows against source rows so every element write is
+        // bounds-safe without index obligations; both strides must be provably
+        // nonzero before `chunks`/`chunks_mut`.
         if old_stride != 0 && new_w != 0 {
             let dst_rows = new_raster.chunks_mut(new_w);
             let src_rows = self.raster.chunks(old_stride);
@@ -1027,24 +909,15 @@ pub const fn decode_sixel_header_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
 /// Convert DEC HLS (`h`=0..360, `l`=0..100, `s`=0..100) to packed `0x00RRGGBB`.
 ///
 /// DEC's hue origin differs from the usual HSL (0° = blue, increasing
-/// counter-clockwise); we use the standard HSL formula with DEC's hue offset so
-/// the common primaries land correctly enough for the first increment.
-// clippy would fold the `v >= 0.0 && v <= 1.0` range-pins below into
-// `(0.0..=1.0).contains(&v)`, but the manual comparison form is deliberate: the
-// verifier sees the two `PartialOrd` comparisons directly and pins the interval,
-// whereas `.contains()` is a library call it need not lower. This crate is at a
-// clean rc=0 Trust gate; the allow is for the clippy STYLE lint only and
-// suppresses no verification obligation.
+/// counter-clockwise); we use the standard HSL formula with DEC's hue offset.
 #[allow(
     clippy::manual_range_contains,
     reason = "manual comparisons keep the float range-pin transparent to the Trust verifier"
 )]
 fn hls_to_rgb(h: u32, l: u32, s: u32) -> u32 {
-    // Integer percentages, so the `as f64 / 100.0` results are in `[0.0, 1.0]`
-    // by construction. We rebuild each value through explicit comparison
-    // branches (inlined, not via a helper — the prover does not carry magnitude
-    // bounds across a call) so every float multiply below has operands the
-    // verifier knows are bounded, hence provably non-overflowing.
+    // Rebuild each operand through explicit comparison branches (inlined, since
+    // the prover does not carry magnitude bounds across a call) so every float
+    // operation below has bounded operands.
     let li = if l > 100 { 100 } else { l }; // 0..=100
     let si = if s > 100 { 100 } else { s }; // 0..=100
     let l = (li as f64) / 100.0; // 0.0..=1.0
@@ -1053,20 +926,11 @@ fn hls_to_rgb(h: u32, l: u32, s: u32) -> u32 {
     // DEC hue 0 points "up" (blue); rotate so the standard formula matches.
     let hue = (h + 240.0) % 360.0; // 0.0..360.0
     // chroma = (1 - |2l-1|) * s, with both factors in [0,1] => c in [0,1].
-    // Multiply only inside a branch that pins BOTH operands to `(0.0, 1.0]`, so
-    // the prover has an explicit upper bound and the product cannot overflow.
     let chroma_scale = 1.0 - (2.0 * l - 1.0).abs(); // mathematically 0.0..=1.0
     let c = if chroma_scale > 0.0 && chroma_scale <= 1.0 && s > 0.0 && s <= 1.0 {
-        // Bit-identical to `chroma_scale * s` (both in (0,1] => in (0,1]):
-        // IEEE-754 fma rounds the EXACT product once, and adding 0.0 to the
-        // positive product the guards pin here is a no-op — the same single
-        // rounding as `a * b`. Written as `mul_add` because the verifier's MIR
-        // lowering cannot discharge a float `Mul`/`Add` overflow-to-infinity
-        // check even with the operands branch-pinned (a full uncached run
-        // surfaces the same obligations for the literal-operand float ops in
-        // `to_u8` below, which now use `mul_add` too). Byte-exact equivalence also
-        // confirmed exhaustively over the full reduced input domain
-        // (360x101x101 h/l/s triples): zero mismatches.
+        // Written as `mul_add(s, 0.0)` because the verifier's MIR lowering
+        // cannot discharge a float `Mul`/`Add` overflow-to-infinity check even
+        // when operands are branch-pinned.
         chroma_scale.mul_add(s, 0.0)
     } else {
         0.0
@@ -1074,8 +938,6 @@ fn hls_to_rgb(h: u32, l: u32, s: u32) -> u32 {
     let h6 = hue / 60.0; // 0.0..6.0
     let xfac = 1.0 - ((h6 % 2.0) - 1.0).abs(); // mathematically 0.0..=1.0
     let x = if c > 0.0 && c <= 1.0 && xfac > 0.0 && xfac <= 1.0 {
-        // Bit-identical to `c * xfac` (both in (0,1] => in (0,1]); see the
-        // `mul_add` rationale above.
         c.mul_add(xfac, 0.0)
     } else {
         0.0
@@ -1089,38 +951,19 @@ fn hls_to_rgb(h: u32, l: u32, s: u32) -> u32 {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    // `chan = (v + m)` lies in `[0,1]` for valid HSL; clamp via inline branches
-    // so `* 255.0` has a bounded operand (no infinity) and matches the original
-    // `clamp(0.0, 255.0)` after rounding.
     let to_u8 = |v: f64| {
-        // The closure is verified as its own function, so its argument and its
-        // captures are UNCONSTRAINED in the open model (MAX + MAX would refute
-        // the add below). Re-pin both to their real ranges with explicit
-        // branches — identity on every reachable input: `v` is one of
-        // `c`/`x`/`0.0`, all in [0,1], and `m = l - c/2` is in [-0.5,1]
-        // (bounds are representable, so the float results respect them). The
-        // pinned sum stays in [-0.5,2], provably finite.
+        // The closure is verified as its own function, so re-pin `v` and `m`
+        // to their reachable ranges (`[0, 1]` and `[-0.5, 1]`) and use `mul_add`
+        // to avoid MIR float `Add`/`Mul` overflow obligations.
         let v = if v >= 0.0 && v <= 1.0 { v } else { 0.0 };
         let mb = if m >= -0.5 && m <= 1.0 { m } else { 0.0 };
-        // Bit-identical to `v + mb`: `v * 1.0` is exact, so the fused single
-        // rounding of `v * 1.0 + mb` is precisely the IEEE-754 addition. The
-        // MIR float `Add` assert has no supported lowering in the verifier;
-        // `mul_add` is a call and carries no such obligation.
         let chan = v.mul_add(1.0, mb);
-        // Map `chan` to an integer 0..=255 directly through comparison branches,
-        // so the prover sees each `* 255.0` operand pinned to a literal interval
-        // and no multiply can overflow. Matches the original
-        // `(chan * 255.0).round().clamp(0.0, 255.0) as u32` for in-range `chan`.
         if chan >= 1.0 {
             255
         } else if chan > 0.0 {
-            // `chan` is in `(0.0, 1.0)` here, so `chan * 255.0` is in `(0, 255)`
-            // and positive; `mul_add(255.0, 0.0)` rounds the exact product once
-            // with a `+ 0.0` no-op — bit-identical to `chan * 255.0` (see the
-            // `mul_add` rationale above).
             chan.mul_add(255.0, 0.0).round() as u32
         } else {
-            // Covers `chan <= 0.0` and NaN (NaN fails both comparisons).
+            // Covers `chan <= 0.0` and NaN.
             0
         }
     };

@@ -11,9 +11,8 @@ use super::{Decor, Key, Value};
 /// One entry in a table: a scalar/array/inline-table, a sub-table, an array of
 /// sub-tables, or nothing at all.
 ///
-/// [`Item::None`] is not a TOML value — it is the "vacant" state, so that
-/// indexing a document with a key that is not there yields a place to write
-/// rather than a panic.
+/// [`Item::None`] is not a TOML value but the vacant state, so indexing a document with a
+/// missing key yields a place to write rather than a panic.
 #[derive(Debug, Clone, Default)]
 pub enum Item {
     /// No entry.
@@ -51,8 +50,8 @@ impl Item {
         }
     }
 
-    /// The `[header]` table, if this entry is one. An inline table is NOT one —
-    /// use [`Item::as_table_like`] to span both spellings.
+    /// The `[header]` table, if this entry is one. An inline table is not one:
+    /// [`Item::as_table_like`] spans both spellings.
     #[must_use]
     pub fn as_table(&self) -> Option<&Table> {
         match self {
@@ -139,8 +138,8 @@ impl Item {
         self.as_value().and_then(Value::as_bool)
     }
 
-    /// The array, if this entry is one. An array of TABLES is a different
-    /// thing — see [`Item::as_array_of_tables`].
+    /// The array, if this entry is one. An array of tables is
+    /// [`Item::as_array_of_tables`].
     #[must_use]
     pub fn as_array(&self) -> Option<&super::Array> {
         self.as_value().and_then(Value::as_array)
@@ -182,8 +181,7 @@ impl Item {
         self.as_value().is_some_and(Value::is_datetime)
     }
 
-    /// Is this entry an array? An array of TABLES is a different thing — see
-    /// [`Item::is_array_of_tables`].
+    /// Is this entry an array? An array of tables is [`Item::is_array_of_tables`].
     #[must_use]
     pub fn is_array(&self) -> bool {
         self.as_value().is_some_and(Value::is_array)
@@ -228,12 +226,9 @@ impl From<Value> for Item {
     }
 }
 
-/// An insertion-ordered map from key to entry.
-///
-/// Order is the whole point: a document model that sorted its keys would
-/// reorder the user's file on the first write. Lookup rides a side index so a
-/// big generated table (aterm's lexicon is thousands of keys) does not turn
-/// every `get` into a scan.
+/// An insertion-ordered map from key to entry: sorting would reorder a user's file on the
+/// first write. A side index keeps `get` off a scan in big tables (the lexicon has
+/// thousands of keys).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct KeyMap {
     entries: Vec<(Key, Item)>,
@@ -250,9 +245,9 @@ impl KeyMap {
         Some(&mut self.entries[i].1)
     }
 
-    /// Where `key` sits among the entries. A position stays valid until an
-    /// entry is REMOVED; inserting never moves one, which is what lets the
-    /// parser keep a header's path as positions while it appends beneath it.
+    /// Where `key` sits among the entries. A position stays valid until an entry is
+    /// removed (inserting never moves one), so the parser can keep a header's path as
+    /// positions while it appends beneath it.
     pub(crate) fn position(&self, key: &str) -> Option<usize> {
         self.index.get(key).copied()
     }
@@ -269,9 +264,8 @@ impl KeyMap {
         })
     }
 
-    /// Insert, keeping an existing key's POSITION and authored spelling. That
-    /// is what makes `doc["font_px"] = new` a replacement of one value rather
-    /// than a move of the line to the bottom of the file.
+    /// Insert, keeping an existing key's position and authored spelling, so
+    /// `doc["font_px"] = new` replaces one value without moving its line.
     pub(crate) fn insert(&mut self, key: Key, value: Item) -> Option<Item> {
         match self.index.get(key.get()) {
             Some(&i) => Some(core::mem::replace(&mut self.entries[i].1, value)),
@@ -323,30 +317,22 @@ impl KeyMap {
 pub struct Table {
     pub(crate) items: KeyMap,
     pub(crate) decor: Decor,
-    /// No `[header]` line was authored for this table — it exists only because
-    /// a deeper one named it. An implicit table with no direct values prints no
-    /// header, so `[a.b]` alone does not grow a stray `[a]`.
+    /// No `[header]` was authored for this table; a deeper one named it. An implicit table
+    /// with no direct values prints no header, so `[a.b]` alone does not grow a stray `[a]`.
     pub(crate) implicit: bool,
     /// This table came from a dotted key (`a.b = 1`), so it is printed as part
     /// of its parent's key-value line, never as a header of its own.
     pub(crate) dotted: bool,
-    /// Where this table's header stood among all headers in the document.
-    /// Rendering sorts on it, which is how `[a.b]` written before `[a]` comes
-    /// back out in that order.
+    /// Where this table's header stood among all headers in the document. Rendering sorts
+    /// on it, so `[a.b]` written before `[a]` prints back in that order.
     pub(crate) position: Option<usize>,
     pub(crate) span: Option<Range<usize>>,
-    /// The verbatim text BETWEEN the header brackets, so `[ a . b ]` prints
-    /// back with its spacing. Anchored on the table rather than on the key
-    /// segments for the same reason [`super::Key::path_repr`] is: an implicit
-    /// parent's key node is shared with the deeper header that created it, and
-    /// two headers must not fight over one node's formatting.
+    /// The verbatim text between the header brackets, so `[ a . b ]` prints back with its
+    /// spacing. Kept on the table, not the key segments, because an implicit parent's key
+    /// node is shared with the deeper header that created it.
     pub(crate) header_repr: Option<super::RawString>,
-    /// Created by a dotted key, so a later `[header]` may not REDEFINE it.
-    ///
-    /// Only redefinition. A header may still add a sub-table BENEATH it —
-    /// `apple.color = "red"` then `[fruit.apple.texture]` is the spec's own
-    /// worked example — so the parser reads this flag when a header path ENDS
-    /// here, and ignores it when the path merely walks through.
+    /// Created by a dotted key, so a later `[header]` may not redefine it. A header may still
+    /// add a sub-table beneath it, so the parser reads this only when a header path ends here.
     pub(crate) closed: bool,
     /// Comment and blank lines printed after this table's key-value lines: the
     /// comment lines the parser read directly under its last line (up to the
@@ -415,17 +401,15 @@ impl Table {
         self.items.insert(key, item)
     }
 
-    /// Delete `key`, with everything its line holds — the comment lines written
-    /// above it included. [`super::DocumentMut::remove_path`] keeps those.
+    /// Delete `key` with everything its line holds, the comment lines above it included;
+    /// [`super::DocumentMut::remove_path`] keeps those.
     pub fn remove(&mut self, key: &str) -> Option<Item> {
         self.items.remove(key)
     }
 
-    /// Keep the comment and blank lines the removed line `removed` was written
-    /// under where they were: on the head of the next line this table prints,
-    /// else after its last one. The parser filed them at the front of that
-    /// line's head; the rest of the head — the line's indentation and dotted
-    /// path — went with the line.
+    /// Keep the comment and blank lines the removed line was written under where they were:
+    /// on the head of the next line this table prints, else after its last one. The rest of
+    /// the head (indentation, dotted path) goes with the line.
     pub(crate) fn keep_lines_above(&mut self, removed: &Key) {
         let Some(repr) = &removed.path_repr else {
             return;
@@ -448,12 +432,9 @@ impl Table {
         }
     }
 
-    /// Every scalar/array/inline-table leaf reachable WITHOUT crossing a header
-    /// boundary, paired with the dotted key path that names it.
-    ///
-    /// This is what a table's own key-value lines are: the direct values, plus
-    /// the leaves of any dotted sub-tables, which are printed on the parent's
-    /// lines rather than under headers of their own.
+    /// The table's own key-value lines, in authored order: every scalar, array or inline
+    /// table reachable without crossing a header (the direct values and the leaves of dotted
+    /// sub-tables), with the dotted key path that names it.
     #[must_use]
     pub fn get_values(&self) -> Vec<(Vec<&Key>, &Value)> {
         let mut out = Vec::new();
@@ -463,11 +444,9 @@ impl Table {
     }
 }
 
-/// Restore the order the lines were WRITTEN in. The tree groups every dotted
-/// key under its shared parent, which silently reorders a file that interleaves
-/// `net.listen`, `font_px`, `net.timeout_ms` — legal TOML, and a shape a
-/// hand-written config really has. The sort is stable, so keys that were never
-/// authored (all `usize::MAX`) keep their insertion order at the end.
+/// Restore the order the lines were written in: the tree groups dotted keys under their
+/// shared parent, which would reorder a file that interleaves `net.listen`, `font_px`,
+/// `net.timeout_ms`. Stable, so unauthored keys (`usize::MAX`) keep insertion order at the end.
 pub(crate) fn sort_by_authored_order(values: &mut [(Vec<&Key>, &Value)]) {
     values.sort_by_key(|(path, _)| path.last().map_or(usize::MAX, |key| key.order));
 }
@@ -549,8 +528,7 @@ impl<'a> IntoIterator for &'a ArrayOfTables {
 /// The operations shared by the two table spellings, `[header]` and
 /// `{ inline }`.
 ///
-/// Object-safe on purpose: callers walk a document without caring which
-/// spelling the author chose, holding a `&dyn TableLike`.
+/// Object-safe, so callers walk either spelling through a `&dyn TableLike`.
 pub trait TableLike {
     /// Entries in authored order.
     fn iter(&self) -> Box<dyn Iterator<Item = (&str, &Item)> + '_>;
@@ -564,8 +542,7 @@ pub trait TableLike {
     fn contains_key(&self, key: &str) -> bool;
     /// Set `key`, keeping an existing entry's position.
     fn insert(&mut self, key: &str, item: Item) -> Option<Item>;
-    /// Delete `key`, with everything its line holds — the comment lines written
-    /// above it included. [`super::DocumentMut::remove_path`] keeps those.
+    /// Delete `key` with everything its line holds, the comment lines above it included.
     fn remove(&mut self, key: &str) -> Option<Item>;
     /// Number of direct entries.
     fn len(&self) -> usize;

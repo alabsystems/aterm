@@ -12,7 +12,8 @@
 //!   (a `Waiting for N … to finish` over the turns it started itself:
 //!   [`phase`]'s module docs);
 //! * [`phase::context_left`] — the `<n>% until auto-compact` indicator, when
-//!   Claude Code shows it;
+//!   Claude Code shows it above the composer; [`phase::context_left_shown`] — the
+//!   same, or where Claude Code 2.1.305 draws it, on the row under the composer;
 //! * [`phase::survey_open`], [`survey::survey_block`], [`phase::transcript_end`],
 //!   [`phase::last_said_row`] — the rest of the live-zone geometry the supervisor's report views use,
 //!   and [`phase::busy_zone_start`], the row its waits on a busy row start

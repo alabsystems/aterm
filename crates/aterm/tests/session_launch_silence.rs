@@ -1,28 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A SESSION LAUNCH PRINTS NOTHING ABOUT UPDATES
-//! (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`): nothing prints into a
-//! shell the user did not ask to update.
+//! A session launch prints nothing about updates
+//! (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`): nothing prints into a shell
+//! the user did not ask to update.
 //!
-//! The real binary as a person launches it: `aterm --session` with a REAL terminal on
-//! stdin (the interactive lane — the one that spawns the background work) over a scratch
-//! `HOME`, `[packages]` ENABLED, and stderr captured on a pipe of its own. (The session's
-//! own greeting asks for a terminal on stderr too, so a pipe there keeps it out of the way;
-//! the assertion is on every byte, not on one line.) Three machines:
+//! The real binary as a person launches it: `aterm --session` with a real terminal on stdin
+//! (the interactive lane, which spawns the background work) over a scratch `HOME`,
+//! `[packages]` enabled, and stderr on a pipe of its own; the assertion is on every byte.
+//! Three machines: a store that has never completed a pass; a malformed `[packages]` table;
+//! and the reroute engaged over a store whose `reroute/` cannot be made, with a configured
+//! prefix this user cannot write.
 //!
-//! * a store that has never completed a pass;
-//! * a MALFORMED `[packages]` table;
-//! * the reroute ENGAGED over a store whose `reroute/` cannot be made, with a configured
-//!   prefix this user cannot write (the lay failure comes from a thread beside the live
-//!   shell).
-//!
-//! Nothing here reaches the machine: every root is private ([`launch_isolation`]), no
-//! one-shot `aterm pkg update` is spawned (the lane's own pass slot is claimed in the
-//! scratch prefix first, [`hold_the_pass`] — the lane is interactive and packages are
-//! ENABLED, so without the claim a real, networked pass would start), the `[machine]`
-//! settings are the fixture's `leave`, and the app updater is off (`[update] enabled =
-//! false`) as in every launch test.
+//! Nothing reaches the machine: every root is private ([`launch_isolation`]), the lane's pass
+//! slot is claimed in the scratch prefix first ([`hold_the_pass`]) so no networked `aterm
+//! pkg update` starts, the `[machine]` settings are `leave`, and the app updater is off.
 
 #![cfg(unix)]
 #![allow(
@@ -40,9 +32,8 @@ use std::time::{Duration, Instant};
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-/// The session gets this long to start the shell, run `exit` and leave, and
-/// its pipes this long to close after it: a hang detector (AGENTS.md), never a
-/// latency budget.
+/// The session gets this long to start the shell, run `exit` and leave, and its pipes this
+/// long to close after it: a hang detector.
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// The `[machine]` table every fixture carries: nothing on the host is touched.
@@ -90,9 +81,9 @@ fn make_prefix(root: &Path) -> PathBuf {
     prefix
 }
 
-/// Claim the session lane's pass slot NOW in the scratch prefix, so a launch with
-/// packages enabled spawns no pass: the machine-wide rule the lane runs on
-/// (`pkg_check::claim` on `session-pass.stamp`) says a sibling just started one.
+/// Claim the session lane's pass slot in the scratch prefix, so a launch with packages enabled
+/// spawns no pass: the lane's machine-wide rule (`pkg_check::claim` on `session-pass.stamp`)
+/// reads that a sibling just started one.
 fn hold_the_pass(root: &Path) {
     let layout = atpkg::store::Layout {
         prefix: make_prefix(root),
@@ -105,13 +96,12 @@ fn hold_the_pass(root: &Path) {
 /// `(stderr, screen)`. `reroute` leaves the reroute engaged; without it the launch
 /// carries `--no-reroute`.
 fn launch(root: &Path, reroute: bool) -> (String, String) {
-    // Every spawn in this binary is a `launch`, and each opens a pty: held from the
-    // open until this launch's own slave copies are dropped, this lock keeps a
-    // sibling launch's `aterm` from inheriting THIS launch's descriptors. The pty's
-    // ends are close-on-exec from birth (`aterm_pty::open_pty_pair`), but std's
-    // stderr pipe is made close-on-exec non-atomically on macOS. An inherited
-    // descriptor lives as long as the sibling's session, and this launch's drains
-    // would wait on it past their 10 s grace (the fd-copy sweep of 2026-09-27).
+    // Every spawn in this binary is a `launch` that opens a pty. Held from the open until
+    // this launch's slave copies are dropped, this lock keeps a sibling launch's `aterm` from
+    // inheriting this launch's descriptors: the pty's ends are close-on-exec from birth
+    // (`aterm_pty::open_pty_pair`), but std's stderr pipe is made close-on-exec
+    // non-atomically on macOS, and an inherited copy would hold this launch's drains open
+    // for as long as the sibling's session lives.
     static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let spawning = SPAWN
         .lock()
@@ -208,8 +198,8 @@ fn assert_silent(what: &str, stderr: &str, screen: &str) {
 
 #[test]
 fn an_interactive_session_launch_over_a_never_checked_store_writes_nothing_to_stderr() {
-    // PACKAGES ENABLED — the gate the never-checked line was printed under — with the
-    // pass slot held, so an interactive launch spawns no network work.
+    // Packages enabled, with the pass slot held so an interactive launch spawns no network
+    // work.
     let root = fixture("never-checked", "[packages]\nenabled = true\n");
     hold_the_pass(&root);
     let status = prefix(&root).join("status.toml");
@@ -227,9 +217,9 @@ fn an_interactive_session_launch_over_a_never_checked_store_writes_nothing_to_st
 /// is one record in the session's log, and the launch reads the file once.
 #[test]
 fn a_malformed_packages_table_is_not_reported_into_the_new_shell() {
-    // One typo: `enabled` wants a boolean. An unreadable table still lets what is
-    // installed update (config.rs's module doc), so the pass gate would spawn a real,
-    // networked pass: the slot is held. The table is read ahead of every gate.
+    // One typo: `enabled` wants a boolean. An unreadable table still lets what is installed
+    // update (atpkg's `config.rs`), so the pass gate would spawn a real, networked pass: the
+    // slot is held. The table is read ahead of every gate.
     let root = fixture("malformed", "[packages]\nenabled = \"yes\"\n");
     hold_the_pass(&root);
     let (stderr, screen) = launch(&root, false);
@@ -237,14 +227,14 @@ fn a_malformed_packages_table_is_not_reported_into_the_new_shell() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The reroute ENGAGED over a `reroute/` that cannot be made (a regular file stands
-/// there), so both the directory and the background lay fail — the lay on a thread beside
-/// the live shell — plus, where the test is not root, a configured prefix this user cannot
-/// write. Each is a log record now.
+/// The reroute engaged over a `reroute/` that cannot be made (a regular file stands there),
+/// so both the directory and the background lay fail (the lay on a thread beside the live
+/// shell), plus, where the test is not root, a configured prefix this user cannot write.
+/// Each is a log record, nothing printed.
 #[test]
 fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing() {
     // `/usr/…`: a root-owned chain the vet admits and this user cannot write, so the
-    // prefix falls back to the default, loudly — never tried as root, who could write it.
+    // prefix falls back to the default (a log record); never tried as root, who could write it.
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     let root_user = unsafe { libc::geteuid() } == 0;
     let foreign_prefix = if root_user {

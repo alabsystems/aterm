@@ -33,6 +33,15 @@ pub const PACKAGE_JSON: &str = "codex-package.json";
 /// bytes ALab built, not the vendor's.
 pub const ALAB_BUILD_JSON: &str = "alab-build.json";
 
+/// Optional package metadata is small. A malformed package must not park a
+/// sweep or rollout reader on a FIFO, or allocate an unbounded manifest.
+const MAX_PACKAGE_BYTES: u64 = 1024 * 1024;
+
+fn package_text(path: &Path) -> Option<String> {
+    let text = super::footer::read_small(path, MAX_PACKAGE_BYTES + 1)?;
+    (text.len() as u64 <= MAX_PACKAGE_BYTES).then_some(text)
+}
+
 /// Whether the Codex `exe` runs ALAB BYTES (codex-alab): its package root
 /// (the one [`package_version`] reads, whose manifest names `exe` itself) carries [`ALAB_BUILD_JSON`] as a regular file.
 /// `false` for an exe with no such package and for a marker that cannot be
@@ -47,15 +56,37 @@ pub fn alab_bytes(exe: &Path) -> bool {
 /// The [`ALAB_BUILD_JSON`] look of `exe`'s package root: `None` when `exe`
 /// has no package root whose manifest names it.
 pub(crate) fn alab_marker(exe: &Path) -> Option<std::io::Result<std::fs::Metadata>> {
-    let exe = std::fs::canonicalize(exe).ok()?;
-    let root = exe.ancestors().skip(1).take(2).find(|root| {
-        std::fs::read_to_string(root.join(PACKAGE_JSON))
-            .ok()
-            .and_then(|text| package_entrypoint(&text))
-            .and_then(|entry| std::fs::canonicalize(root.join(entry)).ok())
-            .is_some_and(|entry| entry == exe)
-    })?;
+    let (root, _) = package_root(exe)?;
     Some(std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON)))
+}
+
+/// The BUILD an ALab package's `exe` runs: its manifest's `version`, whole
+/// (`0.164.0-dev.12521+g3d3eb12d8`), when `exe` runs ALab bytes
+/// ([`alab_bytes`]: the package root whose manifest names `exe` carries
+/// [`ALAB_BUILD_JSON`]); `None` for any other exe. What the Codex rollout tap
+/// holds a thread's rows to (session log 5G-3, `super::codex_tap`): the
+/// build writing them now, which a thread resumed or re-exec'd onto another
+/// build never restates in its `session_meta`. Files only, never a run.
+#[must_use]
+pub fn alab_build(exe: &Path) -> Option<String> {
+    let (root, manifest) = package_root(exe)?;
+    let marker = std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON)).ok()?;
+    if !marker.file_type().is_file() {
+        return None;
+    }
+    let v: Value = aterm_json::from_str(&manifest).ok()?;
+    v.get("version")?.as_str().map(str::to_string)
+}
+
+/// `exe`'s package root (its parent or grandparent) whose manifest names
+/// `exe` itself, and that manifest's text.
+fn package_root(exe: &Path) -> Option<(PathBuf, String)> {
+    let exe = std::fs::canonicalize(exe).ok()?;
+    exe.ancestors().skip(1).take(2).find_map(|root| {
+        let text = package_text(&root.join(PACKAGE_JSON))?;
+        let entry = std::fs::canonicalize(root.join(package_entrypoint(&text)?)).ok()?;
+        (entry == exe).then(|| (root.to_path_buf(), text))
+    })
 }
 
 /// The version of the Codex `exe`, read from its package manifest, never by
@@ -67,7 +98,7 @@ pub(crate) fn alab_marker(exe: &Path) -> Option<std::io::Result<std::fs::Metadat
 pub fn package_version(exe: &Path) -> Option<Version> {
     let exe = std::fs::canonicalize(exe).ok()?;
     exe.ancestors().skip(1).take(2).find_map(|root| {
-        let text = std::fs::read_to_string(root.join(PACKAGE_JSON)).ok()?;
+        let text = package_text(&root.join(PACKAGE_JSON))?;
         let (version, entry) = parse_package(&text)?;
         (std::fs::canonicalize(root.join(entry)).ok()? == exe).then_some(version)
     })

@@ -530,11 +530,22 @@ fn mac_of(
 /// the entry the session is ranked by, the ask itself — a box's kind
 /// (`agent_detail`), a wall's kind and the reset it names. `None` for a
 /// stall (the row carries none of its words) or where the row says nothing.
+/// A harness's NEEDS YOU entry reads as a local row reads it, the need
+/// without aterm's frame then ` (+N more)` (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §12.2.9), so the menu's Needs you section reads one way. The row names
+/// no owner, so the entry is known by its form ([`crate::needs::need_words`]);
+/// any other text keeps its words.
 fn content_what(word: NeedWord, row: &aterm_json::Map) -> Option<String> {
+    use crate::needs::{HarnessAsk, ROW_WHAT_MAX, fold_clip, need_words};
     match word {
         NeedWord::Ask => field(row, "attention")
             .map(|text| text.trim().trim_start_matches('\u{26a0}').trim_start())
-            .map(|text| crate::needs::fold_clip(text, crate::needs::ROW_WHAT_MAX))
+            .map(|text| {
+                need_words(text).map_or_else(
+                    || fold_clip(text, ROW_WHAT_MAX),
+                    |words| HarnessAsk::of(words).line(ROW_WHAT_MAX),
+                )
+            })
             .filter(|what| !what.is_empty()),
         NeedWord::Approval | NeedWord::Question => {
             let detail = field(row, "agent_detail");

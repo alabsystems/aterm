@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The aterm-agent integration files as modules of ONE test binary: each file
-//! keeps its path and its own `#[test]`s. `conformance_upgrade_models` keeps its
-//! `#[path]`-mounted submodules (resolved from `tests/`, as before).
+//! The aterm-agent integration files as modules of one test binary.
 //!
 //! Sharing a process was checked, not assumed: no file below sets or removes an
 //! environment variable, installs a hook or an allocator, or re-executes
@@ -17,13 +15,10 @@
 //! (`footer_window_allocations`, `transcript_allocations`) are their own
 //! `[[test]]`s.
 //!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
-//!
-//! Run one file's tests with
-//! `targo --unverified test -p aterm-agent --test agent_suite -- <file>::`.
+//! One file: `targo --unverified test -p aterm-agent --test agent_suite -- <file>::`.
 
 mod common;
+mod conformance_account_key;
 mod conformance_disk_pass;
 mod conformance_footer_model;
 mod conformance_login_wall;

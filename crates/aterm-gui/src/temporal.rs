@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-session **temporal recorder** — the GUI-side capture half of the
-//! hydratable temporal buffer (design `HIERARCHICAL_SESSIONS.md` Addendum B, B.9).
+//! Per-session temporal recorder: the GUI-side capture half of the hydratable
+//! temporal buffer (design `HIERARCHICAL_SESSIONS.md` Addendum B, B.9).
 //!
 //! [`TemporalRecorder`] folds the live session into the `aterm-buffer` event-log
 //! spine: a [`Keyframe`](aterm_buffer::Op::Keyframe) (a serialized
-//! [`TerminalCheckpoint`]) plus the stream of
-//! [`RawIn`](aterm_buffer::Op::RawIn)/[`Reply`](aterm_buffer::Op::Reply)/
-//! [`Resize`](aterm_buffer::Op::Resize) events that drive the engine. Replaying
-//! `hydrate(keyframe) + process(RawIn…up to t)` reconstructs the engine state at
-//! any `t` — the property `recording_model` (B.8.3) proves and
-//! `conformance_recording` (B.8.4) binds to the real engine.
+//! [`TerminalCheckpoint`]) plus the [`RawIn`](aterm_buffer::Op::RawIn)/
+//! [`Reply`](aterm_buffer::Op::Reply)/[`Resize`](aterm_buffer::Op::Resize) events
+//! that drive the engine, so `hydrate(keyframe) + process(RawIn… up to t)`
+//! reconstructs the engine at any `t` (`recording_model`, B.8.3, bound to the
+//! real engine by `conformance_recording`, B.8.4).
 //!
 //! ## Discipline (mirrors [`CastRecorder`](crate::cast::CastRecorder))
 //! - **Handles, not payloads on the spine.** The spine carries `BlobId`/
@@ -87,11 +86,9 @@ pub(crate) enum TemporalMsg {
     /// is stamped with that hold's tick, not its own.
     Resize { rows: u16, cols: u16 },
     /// Resizes the engine applied that the spine will never hold: its journal
-    /// (`RESIZE_JOURNAL_CAP` deep) overran before a reader's hold read it —
-    /// between two holds, or while the session had no reader attached. Counted
-    /// ([`TemporalRecorder::lost_resizes`], `temporal status` `lost_resizes=`),
-    /// never silent: a replay across them lays the screen out without their row
-    /// moves.
+    /// (`RESIZE_JOURNAL_CAP` deep) overran before a reader read it. Counted
+    /// ([`TemporalRecorder::lost_resizes`], `lost_resizes=`); a replay across
+    /// them lacks their row moves.
     ResizesLost(u64),
     /// A keyframe of the live engine, taken by the reader inside a hold to close
     /// the break it opened when it could not queue input ([`SpineMark::record`]).
@@ -247,15 +244,13 @@ impl Drop for TemporalRx {
     }
 }
 
-/// Where the spine's resizes are up to, SHARED by every reader a session has
-/// (2026-09-28): the engine lifetime and resize ordinal through which a reader
-/// has handed the spine every resize. The live reader's [`SpineMark`]
-/// publishes each advance here, and the session's next reader starts from it
-/// ([`SpineMark::attach`]), so a resize that landed while no reader was
-/// attached (a park, a deferred attach) is read from the engine's journal and
-/// recorded — past the journal's depth, counted in `lost_resizes=` — rather
-/// than skipped. `temporal` compares it with the live engine to say how many
-/// resizes the spine has not been handed yet ([`Self::pending`]).
+/// Where the spine's resizes are up to, shared by every reader of a session: the
+/// engine lifetime and resize ordinal through which the spine holds every resize.
+/// The live reader's [`SpineMark`] publishes each advance, and the next reader
+/// starts from it ([`SpineMark::attach`]), so a resize that landed while no reader
+/// was attached (a park, a deferred attach) is recorded from the engine's journal,
+/// or counted lost, never skipped. Seeded from the recording's keyframe
+/// ([`Self::seed`]); `temporal` reads [`Self::pending`] from it.
 ///
 /// Seeded with the keyframe the recording starts from ([`Self::seed`]). Two
 /// atomics that never tear: after the seed (at spawn, before any reader
@@ -274,7 +269,7 @@ impl Drop for TemporalRx {
 pub(crate) struct SpineWatermark {
     /// The engine's lifetime token (never 0 for a real engine); 0 before the seed.
     lifetime: AtomicU64,
-    /// The resize ordinal every resize through which the spine was handed.
+    /// The resize ordinal through which the spine holds every resize.
     ordinal: AtomicU64,
     /// Input slices a reader could not queue (a full queue, for the slice's
     /// `RawIn` or a resize that had to precede it). Each opened a break.
@@ -307,10 +302,9 @@ impl SpineWatermark {
     }
 
     /// Resizes `term` (the caller holds its lock) applied that no reader has
-    /// handed the spine yet. They wait for the reader's next hold — the
-    /// program's next output — which records them first; a replay at the
-    /// spine's end lacks them until then. Against another engine lifetime than
-    /// the watermark's (or none), every resize this engine applied.
+    /// handed the spine yet; the reader's next hold (the program's next output)
+    /// records them. Against another engine lifetime (or none), every resize
+    /// this engine applied.
     #[must_use]
     pub(crate) fn pending(&self, term: &Terminal) -> u64 {
         match self.load() {
@@ -344,24 +338,16 @@ impl SpineWatermark {
     }
 }
 
-/// One reader's RESIZE WATERMARK (2026-09-28, P4(c)): the engine lifetime and
-/// resize ordinal (`Terminal::resize_ordinal`) up to which the spine holds
-/// every resize. The reader builds one per attach from the session's
-/// [`SpineWatermark`] ([`attach`](Self::attach)) and records through it
-/// ([`SpineMark::record`]) inside the hold that processes each slice.
-///
-/// It replaced a `(rows, cols)` watermark, which saw a resize only as a
-/// geometry DIFFERENT from the last one recorded: a net-zero flap between two
-/// reads (64→63→64, the 2026-09-28 incident) left the geometry where it was,
-/// so the spine never held it, and a replay kept every alternate-screen row
-/// where the live engine had moved it. The engine's own resize journal names
-/// each resize, both halves of a flap included. That watermark also started
-/// over at every attach; this one starts where the previous reader stopped.
+/// One reader's resize watermark: the engine lifetime and resize ordinal
+/// (`Terminal::resize_ordinal`) up to which the spine holds every resize. Built
+/// per attach from the session's [`SpineWatermark`] ([`attach`](Self::attach)),
+/// recording through [`record`](Self::record) inside the hold that processes
+/// each slice. It counts resizes off the engine's journal rather than comparing
+/// geometry, which would miss a net-zero flap between two reads.
 #[derive(Debug, Default)]
 pub(crate) struct SpineMark {
-    /// `(lifetime, ordinal)` recorded up to; `None` when the session's
-    /// watermark was never seeded (the next record then records the live
-    /// geometry, as the old `(0, 0)` sentinel did).
+    /// `(lifetime, ordinal)` recorded up to; `None` when the session's watermark
+    /// was never seeded (the next record then records the live geometry).
     at: Option<(u64, u64)>,
     /// The session's watermark, which every advance of `at` is published to.
     shared: Arc<SpineWatermark>,
@@ -370,11 +356,11 @@ pub(crate) struct SpineMark {
     broken: bool,
 }
 
-/// What one reader hold read BEFORE processing its bytes: the engine's resize
-/// lifetime and ordinal and its geometry. The spine records the resizes up to
-/// here BEFORE the bytes, so a resize a slice's own bytes caused (none today:
-/// DECCOLM is flag-only, XTWINOPS-8 a host callback) would replay from the
-/// bytes, never twice.
+/// What one reader hold read before processing its bytes: the engine's resize
+/// lifetime, ordinal and geometry. The spine records the resizes up to here
+/// before the bytes, so a resize the bytes themselves caused would replay from
+/// the bytes, never twice (none do: DECCOLM is flag-only, XTWINOPS 8 a host
+/// callback).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SpinePre {
     lifetime: u64,
@@ -487,9 +473,8 @@ impl SpineMark {
     /// refcount on the reader's batch ([`InputSlice`]); nothing here allocates
     /// or copies bytes unless the ordinal moved or a break is open.
     ///
-    /// * No watermark (the session's was never seeded), or one of another
-    ///   lifetime token (the engine was replaced): the live geometry `pre`
-    ///   names, once.
+    /// * No watermark (never seeded), or another lifetime token (the engine was
+    ///   replaced): the live geometry `pre` names, once.
     /// * A journal overrun (more than `RESIZE_JOURNAL_CAP` resizes since the
     ///   watermark, a reader's absence included): the lost count rides the
     ///   spine ([`TemporalMsg::ResizesLost`]), then the kept reports.
@@ -768,9 +753,8 @@ impl TemporalRecorder {
         self.handoff = Some(gap);
     }
 
-    /// What `temporal status` appends after `dropped_events=`: ` carried=0
-    /// from_build=<n|->` for a spine that starts at a seamless update, and
-    /// nothing otherwise — a fresh session's status line is unchanged.
+    /// What `temporal status` appends to its line: ` carried=0 from_build=<n|->`
+    /// for a spine that starts at a seamless update, else nothing.
     #[must_use]
     pub(crate) fn status_tail(&self) -> String {
         self.handoff
@@ -797,8 +781,6 @@ impl TemporalRecorder {
     /// taps call this so one session shares a single monotone tick timeline.
     #[must_use]
     pub(crate) fn now(&self) -> Ticks {
-        // Derives the recorded tick from the recorder epoch; this
-        // is the value we RECORD, not engine state read during process().
         Ticks(u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX))
     }
 
@@ -1193,17 +1175,10 @@ impl TemporalRecorder {
     /// The latest recorded instant on the live spine (the default replay target),
     /// or `Ticks(0)` before any event.
     ///
-    /// O(1): the newest live event's tick, not a `max` fold over the ring.
-    /// SOUND because this recorder's spine is monotone in `ts` BY
-    /// CONSTRUCTION — every append (`RawIn`, `Reply`, `Resize`, `Keyframe`)
-    /// stamps `self.now()`, which is `epoch.elapsed()` off ONE `Instant`, and
-    /// every append is serialized on the single temporal writer thread (the
-    /// reader hands bursts over a FIFO, and `Resize` is enqueued on that SAME
-    /// FIFO under `term_lock` precisely so the ordering holds). A monotone
-    /// clock read in append order gives a nondecreasing `ts` down the ring, so
-    /// `back()` IS the max — and it was being paid for with a walk over up to
-    /// `MAX_LOG_EVENTS` = 65,536 events, on the default replay target, from
-    /// inside the re-keyframe path that runs every 2 MiB of recorded input.
+    /// The newest live event's tick is the max: every append stamps `now()` off
+    /// one `Instant`, and appends are serialized on the writer thread (the reader
+    /// queues `Resize` on the same FIFO, under `term_lock`), so `ts` is
+    /// nondecreasing down the ring.
     #[must_use]
     pub(crate) fn latest_tick(&self) -> Ticks {
         self.log.newest_live().map(|e| e.ts).unwrap_or_default()
@@ -1359,7 +1334,7 @@ struct RetainedKeyframe {
     /// The `Seq` its `Op::Keyframe` event was appended at — the fold's start
     /// cursor, and the event whose eviction takes this keyframe with it.
     seq: Seq,
-    /// The tick it was recorded at — compared against the replay target.
+    /// The tick it was recorded at, compared against the replay target.
     ts: Ticks,
     /// `next_blob` when it was recorded: the first blob id of its chain (every
     /// `RawIn` after it). The chain is whole while no blob at or past it was
@@ -1568,10 +1543,8 @@ enum RekeyTrigger {
     Pressure,
 }
 
-/// The scrollback a re-keyframe retains (a recent window). Bounds keyframe size so
-/// periodic re-keyframing cannot accumulate all scrollback since t0 (replayed
-/// scrollback is restored unlimited); older history ages out under the byte budget,
-/// while the recent `[keyframe..latest]` replay window stays faithful.
+/// The scrollback a re-keyframe keeps, so keyframes stay bounded (see
+/// `maybe_rekeyframe`); older history ages out.
 const REKEY_SCROLLBACK_LINES: usize = 2048;
 
 /// The number of keyframes retained. The newest seeds a `[keyframe..latest]` replay;
@@ -1632,18 +1605,10 @@ mod tests {
         assert_eq!(r.total_events(), 2, "Keyframe event + RawIn event");
     }
 
-    /// DIFFERENTIAL for the whole `replay_at` seek. The reference here is the
-    /// EXACT pre-change body — full spine scan for the base, full spine scan for
-    /// the fold, `continue` (not `break`) on `ts > at` — run against the same
-    /// recorder, at every interesting instant: before the first keyframe, on and
-    /// between recorded ticks, at the latest tick, and past it. The two must
-    /// agree on reachability AND on the reconstructed screen text.
-    ///
-    /// It also pins the two invariants the seek rests on, so a future change
-    /// that broke either would fail HERE rather than silently hand back a
-    /// wrong-state engine: the spine's ticks are nondecreasing, and the retained
-    /// keyframes' `(seq, ts)` coordinates agree with the spine events that
-    /// announced them.
+    /// `replay_at` agrees with a full-spine-scan reference on reachability and
+    /// screen text at every interesting instant, and the two invariants its seek
+    /// rests on hold: nondecreasing spine ticks, and retained keyframes' `(seq,
+    /// ts)` matching the spine events that announced them.
     #[test]
     fn replay_at_seek_matches_the_full_spine_scan() {
         let mut t = aterm_core::terminal::Terminal::new(6, 20);
@@ -1664,8 +1629,8 @@ mod tests {
             "REACH: the fixture must mint several keyframes"
         );
 
-        // INVARIANT 1: nondecreasing ticks down the live spine (what turns the
-        // `max` fold into `back()` and the `continue` into a `break`).
+        // Invariant 1: nondecreasing ticks down the live spine (what lets
+        // `latest_tick` read the back and the fold stop at the first `ts > at`).
         let ticks: Vec<u64> = r.log.live().map(|e| e.ts.0).collect();
         assert!(
             ticks.windows(2).all(|w| w[1] >= w[0]),
@@ -1694,7 +1659,8 @@ mod tests {
             assert_eq!(ev.ts, kf.ts, "retained ts disagrees with the spine");
         }
 
-        // The pre-change body, verbatim, as the oracle.
+        // The reference: the last live keyframe with `ts <= at` as the base,
+        // then every later live event with `ts <= at`, both off full spine walks.
         let reference = |at: Ticks| -> Option<Vec<String>> {
             let mut base: Option<(Seq, KeyframeId)> = None;
             for ev in r.log.live() {
@@ -1754,9 +1720,7 @@ mod tests {
         );
     }
 
-    /// The visible screen text of a reconstructed engine, for differential
-    /// comparison (a `Terminal` is not `PartialEq`). Same row reader the
-    /// control-plane `screen` verb and the subscribe push loop use.
+    /// The visible screen text of an engine (a `Terminal` is not `PartialEq`).
     fn screen_of(t: &Terminal) -> Vec<String> {
         (0..t.rows() as usize)
             .map(|r| crate::control::visible_row(t, r))
@@ -1776,12 +1740,10 @@ mod tests {
         let burst: Arc<[u8]> = Arc::from(&[b'y'; 64][..]);
         let mut r = TemporalRecorder::with_budget(1024);
         r.record_raw_in_shared(burst.clone());
-        // The recorder retains the SAME allocation (refcount bump, no re-copy)...
         assert_eq!(Arc::strong_count(&burst), 2, "blob shares the caller's Arc");
-        // ...charging exactly the payload len against the budget.
+        // Charged exactly the payload len.
         assert_eq!(r.used, 64);
-        // Flood past the budget: evicting the oldest blob drops the shared ref
-        // and refunds the identical len.
+        // Evicting the oldest blob drops the shared ref and refunds the same len.
         for _ in 0..64 {
             r.record_raw_in(&[b'x'; 64]);
         }
@@ -1831,29 +1793,24 @@ mod tests {
         assert!(row0.starts_with("seed"), "replayed row 0 = {row0:?}");
     }
 
-    /// B.2.3: a resize is a first-class spine event and replay applies it in SPINE
-    /// ORDER, so a cursor-addressed write BEFORE a resize replays at its PRE-resize
-    /// column — never re-laid-out at the post-resize width. This is the invariant the
-    /// under-`term_lock` FIFO enqueue (reader per-chunk `RawIn` + main-thread `Resize`)
-    /// upholds: if a resize could jump ahead of already-processed input on the spine,
-    /// the write would land at the wrong column on replay.
+    /// B.2.3: replay applies a resize in spine order, so a cursor-addressed
+    /// write recorded before it lands at its pre-resize column.
     #[test]
     fn replay_applies_resize_in_spine_order_after_cursor_addressed_write() {
         let mut r = TemporalRecorder::new();
         // Seed a 4x10 keyframe (parser-ground, blank).
         let blank = aterm_core::terminal::Terminal::new(4, 10);
         r.record_keyframe(blank.checkpoint());
-        // Move to column 16 (1-based) and write X. At width 10 the cursor CLAMPS to
+        // Move to column 16 (1-based) and write X. At width 10 the cursor clamps to
         // the last column (col 9, 0-based).
         r.record_raw_in(b"\x1b[16GX");
-        // THEN widen to 20 columns (recorded AFTER the write — the spine order).
+        // Then widen to 20 columns, recorded after the write.
         r.record_resize(4, 20);
 
         let term = r.replay_at(None).expect("replay");
         assert_eq!(term.cols(), 20, "the resize is applied");
-        // X sits at col 9 (clamped at the OLD 10-col width), proving the write replayed
-        // BEFORE the resize. If the resize had jumped ahead (the bug), the width would
-        // be 20 when the write ran and X would land at col 15.
+        // X at col 9 (clamped at the old width) proves the write replayed before
+        // the resize; after it, X would land at col 15.
         let row0 = term.get_line_text(0, None).unwrap_or_default();
         assert_eq!(
             row0.find('X'),
@@ -1862,11 +1819,9 @@ mod tests {
         );
     }
 
-    /// A ConPTY session's recorded resizes replay under ITS seam policy. The
-    /// live engine keeps all 7 history lines across a 6→10 grow and the
-    /// conhost repaint recorded after it; the replay must rebuild that engine,
-    /// not the one a Native grow leaves once the same repaint lands (the 4
-    /// revealed lines painted over, 3 left in history).
+    /// A ConPTY session's resizes replay under its seam policy: the live engine
+    /// keeps all 7 history lines across a 6→10 grow and conhost's repaint, which
+    /// a Native replay would leave at 3 (the 4 revealed lines painted over).
     #[test]
     fn replay_resizes_under_the_sessions_seam_policy() {
         let mut live = Terminal::new(6, 20);
@@ -1916,8 +1871,8 @@ mod tests {
         );
         assert_eq!(screen_of(&replayed), screen_of(&live));
 
-        // Teeth: the same spine replayed as Native is the engine the live one
-        // is not.
+        // Negative control: replayed as Native, the repaint paints over the
+        // revealed lines.
         r.set_resize_policy(ResizePolicy::Native);
         let native = r.replay_at(None).expect("replay");
         assert_eq!(native.grid().scrollback_lines(), 3);
@@ -1998,9 +1953,8 @@ mod tests {
 
     #[test]
     fn blob_handle_resolves_after_eviction_shifts_the_deque() {
-        // Budget 150 retains two 64-byte blobs; the third evicts the oldest, so the
-        // deque's front is no longer BlobId(0) — the handle-resolution base must
-        // track that shift or the reader reads the wrong bytes.
+        // Budget 150 holds two 64-byte blobs; the third evicts the oldest, so
+        // handle resolution must track the deque's shifted base.
         let mut r = TemporalRecorder::with_budget(150);
         r.record_raw_in(&[b'a'; 64]); // BlobId(0)
         r.record_raw_in(&[b'b'; 64]); // BlobId(1)
@@ -2012,15 +1966,12 @@ mod tests {
         assert!(r.blob_bytes(BlobId(3)).is_none(), "unissued handle => None");
     }
 
-    /// R19: periodic re-keyframing keeps a recent `[keyframe..latest]` window
-    /// reachable even after cumulative I/O exceeds the budget MANY times over —
-    /// where a single t0 keyframe would be orphaned and replay would die forever.
-    /// The keyframes stay BOUNDED (their scrollback is trimmed), so they do not
-    /// accumulate and blow the budget.
+    /// R19: periodic re-keyframing keeps the latest instant reachable after
+    /// input exceeds the budget several times over, where a lone t0 keyframe
+    /// would be orphaned.
     #[test]
     fn rekeyframing_keeps_the_latest_reachable_past_the_budget() {
-        // A realistic-shaped budget with a modest screen. `interval` floors at
-        // 64 KiB, so re-keyframing engages here.
+        // A 1 MiB budget: the re-keyframe interval is 256 KiB.
         let mut r = TemporalRecorder::with_budget(1024 * 1024);
         let blank = aterm_core::terminal::Terminal::new(6, 24);
         r.record_keyframe(blank.checkpoint());
@@ -2033,8 +1984,7 @@ mod tests {
         }
         r.record_raw_in(b"FINAL-SENTINEL-LINE\r\n");
 
-        // Replay to the LATEST instant reconstructs the recent screen (the window
-        // survived eviction because re-keyframing minted fresh, bounded bases).
+        // The latest instant replays from a fresh, bounded base.
         let term = r
             .replay_at(None)
             .expect("re-keyframing keeps the latest instant reachable past the budget");
@@ -2052,8 +2002,6 @@ mod tests {
             found,
             "the recent sentinel is reconstructable after a 4x-budget flood"
         );
-        // Re-keyframing happened, and the keyframes did NOT accumulate unboundedly:
-        // the recorder stays within its byte budget.
         assert!(
             (2..=MAX_KEYFRAMES).contains(&r.keyframe_count()),
             "re-keyframing minted fresh keyframes, at most {MAX_KEYFRAMES} kept: {}",
@@ -2295,11 +2243,11 @@ mod tests {
         assert_eq!(r.bytes_since_keyframe, 0);
     }
 
-    // ---- THE RESIZE WATERMARK (P4(c)) --------------------------------------
+    // ---- The resize watermark ------------------------------------------------
 
     /// A Claude-shaped alternate-screen frame: `L<r>` on every row and `E` in
     /// its last column (`cols`), the cursor parked below the top, so a one-row
-    /// shrink DEMOTES the top row and a one-column shrink cuts every `E`.
+    /// shrink demotes the top row and a one-column shrink cuts every `E`.
     fn alt_frame(rows: u16, cols: u16) -> Vec<u8> {
         let mut f = String::from("\x1b[?1049h\x1b[2J");
         for r in 0..rows {
@@ -2363,18 +2311,13 @@ mod tests {
         n
     }
 
-    /// A NET-ZERO FLAP BETWEEN TWO READS that the engine cannot undo: 20 ->
-    /// 19 -> 20 columns on the alternate screen cuts the last column for good
-    /// (the grid's resize undo serves a rows-only shrink, never a width
-    /// change) and leaves the geometry where it was. The spine holds both
-    /// halves (the engine's resize journal names them), so a replay reaches the
-    /// live, CUT screen. The old `(rows, cols)` watermark saw the same geometry
-    /// at both reads and recorded no resize: that spine replays to a screen
-    /// the session never showed.
-    ///
-    /// The incident's own flap (6 -> 5 -> 6 rows, nothing between the halves)
-    /// is now an identity — the engine hands the demoted row back — and the
-    /// spine still holds both halves, so the replay folds the same undo.
+    /// A net-zero width flap between two reads (20 -> 19 -> 20 columns on the
+    /// alternate screen) cuts the last column for good (the grid's resize undo
+    /// serves a rows-only shrink, never a width change) yet leaves the geometry
+    /// unchanged. The spine holds both halves from the engine's resize journal,
+    /// so the replay reaches the live, cut screen. A rows-only flap (6 -> 5 -> 6)
+    /// is an identity on the engine; the spine still holds both halves and the
+    /// replay folds the same undo.
     #[test]
     fn a_net_zero_flap_between_two_reads_reaches_the_spine_and_the_replay() {
         const ROWS: u16 = 6;
@@ -2401,8 +2344,8 @@ mod tests {
         assert_eq!(screen_of(&replayed), screen_of(&live));
         assert_eq!(r.lost_resizes(), 0);
 
-        // The old watermark's spine: the same bytes, no resize (the geometry
-        // at both reads was 6x20).
+        // Negative control: the same bytes and no resize, what a watermark that
+        // compares only geometry records (6x20 at both reads).
         let mut old = TemporalRecorder::new();
         old.record_keyframe(Terminal::new(ROWS, COLS).checkpoint());
         old.record_raw_in(&frame);
@@ -2410,7 +2353,7 @@ mod tests {
         let uncut = old.replay_at(None).expect("replay");
         assert_ne!(screen_of(&uncut), screen_of(&live), "the flap it missed");
 
-        // The incident's flap: undone by the engine, and still on the spine.
+        // A rows-only flap: undone by the engine, and still on the spine.
         let mut live = Terminal::new(ROWS, COLS);
         let mut r = seeded(&live);
         let (tx, rx) = queue(64);
@@ -2522,8 +2465,8 @@ mod tests {
     }
 
     /// More resizes between two reads than the engine's journal keeps: the
-    /// overrun is COUNTED (`lost_resizes`, once), the kept ones reach the
-    /// spine in order, and the replay ends at the live geometry.
+    /// overrun is counted once (`lost_resizes`), the kept ones reach the spine
+    /// in order, and the replay ends at the live geometry.
     #[test]
     fn a_journal_overrun_is_counted_once_and_the_replay_ends_at_the_live_geometry() {
         let mut live = Terminal::new(6, 20);
@@ -2583,13 +2526,11 @@ mod tests {
         assert!(!r.spine_watermark().break_open());
     }
 
-    /// A FLAP WHILE NO READER WAS ATTACHED (a park, a deferred attach): the
-    /// next reader starts where the session's last one left the spine, reads
-    /// both halves from the engine's journal, and the replay reaches the live,
-    /// CUT screen (a width flap, which the engine's resize undo does not
-    /// serve). The negative control is a reader that starts over, as each
-    /// reader's own watermark used to: it records only the live geometry,
-    /// which the flap left where it was, so its spine replays uncut.
+    /// A width flap while no reader was attached (a park, a deferred attach):
+    /// the next reader starts where the last one left the spine, reads both
+    /// halves from the engine's journal, and the replay reaches the live, cut
+    /// screen. Negative control: a reader that starts over records only the
+    /// live geometry, which the flap left unchanged, so its spine replays uncut.
     #[test]
     fn a_flap_while_no_reader_was_attached_reaches_the_next_reader() {
         const ROWS: u16 = 6;
@@ -2622,7 +2563,7 @@ mod tests {
     }
 
     /// More resizes while no reader was attached than the engine's journal
-    /// keeps: the next reader COUNTS the overrun (`lost_resizes`) instead of
+    /// keeps: the next reader counts the overrun (`lost_resizes`) instead of
     /// starting over silently, and its replay ends at the live geometry.
     #[test]
     fn an_overrun_while_no_reader_was_attached_is_counted() {

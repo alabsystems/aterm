@@ -62,20 +62,8 @@ atom_manager! {
     _NET_STARTUP_INFO,
     _NET_STARTUP_ID,
 
-    // WM window types.
-    _NET_WM_WINDOW_TYPE_DESKTOP,
-    _NET_WM_WINDOW_TYPE_DOCK,
-    _NET_WM_WINDOW_TYPE_TOOLBAR,
-    _NET_WM_WINDOW_TYPE_MENU,
-    _NET_WM_WINDOW_TYPE_UTILITY,
-    _NET_WM_WINDOW_TYPE_SPLASH,
-    _NET_WM_WINDOW_TYPE_DIALOG,
-    _NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
-    _NET_WM_WINDOW_TYPE_POPUP_MENU,
-    _NET_WM_WINDOW_TYPE_TOOLTIP,
-    _NET_WM_WINDOW_TYPE_NOTIFICATION,
-    _NET_WM_WINDOW_TYPE_COMBO,
-    _NET_WM_WINDOW_TYPE_DND,
+    // The one WM window type a window is given (WC.8: the others left with
+    // `with_x11_window_type`, and `_XEMBED` with `with_embed_parent_window`).
     _NET_WM_WINDOW_TYPE_NORMAL,
 
     // Drag-N-Drop Atoms
@@ -100,7 +88,6 @@ atom_manager! {
     _NET_FRAME_EXTENTS,
     _NET_SUPPORTED,
     _NET_SUPPORTING_WM_CHECK,
-    _XEMBED,
     _XSETTINGS_SETTINGS
 }
 

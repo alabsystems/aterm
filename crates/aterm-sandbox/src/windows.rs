@@ -169,8 +169,6 @@ fn apply_ui_restrictions(job: RawHandle) -> io::Result<()> {
     Ok(())
 }
 
-// --- Job Object info structs (repr(C), matching the Win32 headers). ---
-
 /// `JOBOBJECT_BASIC_LIMIT_INFORMATION`.
 #[repr(C)]
 #[allow(non_snake_case)]

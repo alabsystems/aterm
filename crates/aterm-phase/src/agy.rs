@@ -741,6 +741,16 @@ pub fn fresh(rows: &[String]) -> bool {
     })
 }
 
+/// A MESSAGE STANDS ON `rows` ([`crate::ScreenReader::message_drawn`]): a
+/// person's message (its caret row under its rule, [`is_user_row`]) above
+/// the composer's top rule (anywhere where no composer is drawn), answered
+/// or not.
+#[must_use]
+pub fn message_drawn(rows: &[String]) -> bool {
+    let top = frame(rows).map_or(rows.len(), |f| f.top);
+    last_user(rows, top).is_some()
+}
+
 /// A reply's row: two columns in or more, and none of agy's own marks (`⎿`
 /// under a notice or a refusal, `└` under the spinner).
 fn is_reply_row(row: &str) -> bool {

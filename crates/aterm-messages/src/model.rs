@@ -52,9 +52,8 @@ impl fmt::Display for MessageId {
     }
 }
 
-/// FOUR severities. `Ord` is glass rank (Error first). "Notice" is a HOLD, not
-/// a severity: an Info row with [`Hold::Default`] holds [`HOLD_INFO`] (30 s,
-/// the old `appnotice` row).
+/// Four severities. `Ord` is glass rank (Error first). "Notice" is a hold, not a
+/// severity: an Info row with [`Hold::Default`] holds [`HOLD_INFO`] (30 s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     /// Good news: an install finished, an update applied.
@@ -215,13 +214,13 @@ pub mod tags {
     pub const A11Y: Tag = Tag::word("a11y");
     /// The fabric and peer messaging.
     pub const FABRIC: Tag = Tag::word("fabric");
-    /// An agent harness's notes (`appnotice harness`): records only, never a
-    /// row (design ruling 39, implemented by ruling 61).
+    /// An agent harness's notes (`aterm ctl appnotice harness`): records only, never a
+    /// row.
     pub const HARNESS: Tag = Tag::word("harness");
     /// Everything the host reports about itself.
     pub const SYSTEM: Tag = Tag::word("system");
-    /// A script's `notice progress` row that named no tag (design ruling
-    /// 265): a script's work is not aterm's own `system`.
+    /// A script's `notice progress` row that named no tag: a script's work is not
+    /// aterm's own `system`.
     pub const SCRIPT: Tag = Tag::word("script");
 
     /// The fourteen, in the tag chips' fixed order on Settings ▸ Messages:
@@ -234,11 +233,10 @@ pub mod tags {
     ];
 }
 
-/// One text-presentation glyph from the band's CLOSED set. `⚙` is OUTSIDE it
-/// on purpose: it renders BLANK in the headless CPU font
-/// (status_bars.rs:1626-1628). A capture test in the host asserts each
-/// admitted glyph paints a non-blank cell headless; [`Glyph::FALLBACK`] (`!`)
-/// stands in for anything a reporter tries outside the set.
+/// One text-presentation glyph from the band's closed set. `⚙` is outside it on purpose:
+/// it renders blank in the headless CPU font. The host's raster tests assert each
+/// admitted glyph paints a non-blank cell headless; [`Glyph::FALLBACK`] (`!`) stands in
+/// for anything outside the set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Glyph(char);
 
@@ -255,12 +253,10 @@ impl Glyph {
         '\u{23f8}', // ⏸
         '\u{2726}', // ✦
         '!', '\u{2026}', // …
-        '\u{2296}', // ⊖ — a removal in flight (ruling 304; the `·` it
-                    // replaced read as a bullet on the glass)
+        '\u{2296}', // ⊖ a removal in flight
     ];
-    /// The glyph a RETIRED member of the set is read back as: `·`, the
-    /// removal's lead glyph before ruling 304, from a record an older build
-    /// logged or carried.
+    /// Retired glyphs and what they read back as, for a record an older build logged or
+    /// carried (`·` was the removal's lead glyph).
     const RETIRED: &'static [(char, char)] = &[('\u{00b7}', '\u{2296}')];
     /// What stands in for a glyph outside the set.
     pub const FALLBACK: Glyph = Glyph('!');
@@ -294,15 +290,12 @@ impl Glyph {
 /// What a `Not now` answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// The Full Disk Access question. (A carried `not-now:admin-step:`, the
-    /// retired elevated-install question, decodes to nothing and the loader
-    /// drops it.)
+    /// The Full Disk Access question.
     FileAccess,
 }
 
-/// THE OWNER'S WORD on a live agent upgrade, pressed on its row: the three
-/// words `aterm harness upgrade <tab> --now|--defer|--skip` writes, as the
-/// band says them.
+/// The owner's word on a live agent upgrade, pressed on its row: the three words
+/// `aterm harness upgrade <tab> --now|--defer|--skip` writes, as the band says them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpgradeWord {
     /// Move the agent at its next turn end (`--now`).
@@ -334,9 +327,8 @@ impl UpgradeWord {
         Self::ALL.into_iter().find(|w| w.as_str() == word)
     }
 
-    /// The full label — the capsule's, the tab menu's and a screen reader's.
-    /// "Skip version", not "Skip this version": a label is at most 16 chars
-    /// (invariant 23).
+    /// The full label: the capsule's, the tab menu's and a screen reader's. "Skip
+    /// version", not "Skip this version": a label is at most 16 chars.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -347,11 +339,10 @@ impl UpgradeWord {
     }
 }
 
-/// Plain-data INTENTS the HOST performs (`ATERM_DESIGN` §2.2: the engine
-/// REQUESTS, the frontend PERFORMS). Every variant is codec-able (strings and
-/// ints only) so the log can re-offer it from Settings ▸ Messages. Labels are
-/// DERIVED from the intent — one table, [`Intent::label`] / [`Intent::short`]
-/// — so the reporter table and the label table cannot disagree.
+/// Plain-data intents the host performs (`ATERM_DESIGN` §2.2: the engine requests, the
+/// frontend performs). Every variant is codec-able (strings and ints only) so the log can
+/// re-offer it from Settings ▸ Messages. Labels are derived from the intent in one table
+/// ([`Intent::label`], [`Intent::short`]), so reporters and labels cannot disagree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Intent {
     /// The implicit last capsule; dropped if a reporter authors it.
@@ -391,11 +382,9 @@ pub enum Intent {
     },
     /// Open a new window (the GPU-lost remedy).
     NewWindow,
-    /// Drop the rest of a large paste still on its way to a session's
-    /// program (design ruling 231): the part the program already took stays,
-    /// a bracketed paste is closed, and input typed after the paste goes
-    /// through. The row's own work, so the one decision a progress row
-    /// carries.
+    /// Drop the rest of a large paste still on its way to a session's program: the part
+    /// the program already took stays, a bracketed paste is closed, and input typed after
+    /// the paste goes through.
     StopPaste {
         /// The session the paste is going to.
         session: u64,
@@ -464,13 +453,11 @@ const TAB_N: [&str; 10] = [
 ];
 
 impl Intent {
-    /// A press that only silences a row or opens its words: `Details`, a
-    /// declined decision (`Not now`) and the upgrade's `Not today` and `Skip
-    /// version`. It fixes nothing, so it is never "the one action": a row
-    /// that stands past a glance and whose only capsules decline is a record
-    /// ([`Message::admit`]).
-    /// A decline may ride BESIDE a real action (a button that moves the
-    /// outcome, or a sentence that says it).
+    /// A press that only silences a row or opens its words: `Details`, a declined
+    /// decision (`Not now`) and the upgrade's `Not today` and `Skip version`. It fixes
+    /// nothing, so it is never the one action: a row that stands past a glance and whose
+    /// only capsules decline is a record ([`Message::admit`]). A decline may ride beside a
+    /// real action.
     #[must_use]
     pub const fn is_snooze(&self) -> bool {
         matches!(
@@ -495,8 +482,8 @@ impl Intent {
                 "/manual" => "Manual",
                 "/appearance" => "Appearance",
                 "/messages" => "Messages",
-                // Beside an `OpenSystemPane` (`Open Settings`, short `Settings`):
-                // a line never shows two capsules that read alike.
+                // Shares a line with an `OpenSystemPane` (`Open Settings`, short
+                // `Settings`), so it never falls to `Settings`.
                 "/security" => "Security",
                 _ => "Settings",
             },
@@ -532,7 +519,7 @@ impl Intent {
             Self::OpenConfigEditor { .. } => "Edit",
             Self::OpenPath { .. } => "Log",
             Self::OpenSystemPane { .. } => "Settings",
-            // One install verb on every surface (ruling 69).
+            // One install verb on every surface.
             Self::ApplyUpdate { .. } => "Install",
             Self::NotNow { .. } => "Not now",
             Self::NewWindow => "Window",
@@ -544,9 +531,8 @@ impl Intent {
                 // What the press does, not when: a bare `Now` beside
                 // `Tomorrow` says neither what nor to whom (D6).
                 UpgradeWord::Now => "Upgrade",
-                // A day off, in the eight cells a short form has — said as
-                // the choice it is (ruling 305: `Tomorrow` alone read as a
-                // noun); the answered record says until when.
+                // A day off in the eight cells a short form has, said as the choice
+                // it is; the answered record says until when.
                 UpgradeWord::NotToday => "Not now",
                 UpgradeWord::Skip => "Skip",
             },
@@ -554,8 +540,8 @@ impl Intent {
         }
     }
 
-    /// ONLY `NotNow` closes its row: every other intent leaves the row for a
-    /// supersede or a fold (the R16 rule, design §1.4).
+    /// Only `NotNow` closes its row: every other intent leaves the row for a supersede or
+    /// a fold.
     #[must_use]
     pub(crate) const fn closes_row(&self) -> bool {
         matches!(self, Self::NotNow { .. })
@@ -577,23 +563,17 @@ impl Intent {
         )
     }
 
-    /// `NotNow`: a row carrying one is a DECISION row.
+    /// `NotNow`: a row carrying one is a decision row.
     #[must_use]
     pub const fn is_ask(&self) -> bool {
         matches!(self, Self::NotNow { .. })
     }
 
-    /// A CONSEQUENTIAL intent — a press that changes the machine or the
-    /// window rather than opening a page: `ApplyUpdate`, `OpenSystemPane`,
-    /// `NewWindow`, `StopPaste` (it drops bytes; ruling 231), and an agent
-    /// upgrade's `Upgrade now` (the agent is ended and resumed on the newer
-    /// build at its next turn end). The glass paints these, and only
-    /// these, as the accent-filled Primary chip; a navigation
-    /// (`OpenSettings`, `OpenPath`, `OpenConfigEditor`) or a decline
-    /// (`NotNow`, an upgrade's `Not today` and `Skip version`) is the quiet
-    /// Secondary chip, so a toolchain row's `Packages` never shouts and the
-    /// launch pass never stacks two accent chips (ruling 18). `Details` is
-    /// neither: it wears its own role.
+    /// A consequential intent: a press that changes the machine or the window rather than
+    /// opening a page (`ApplyUpdate`, `OpenSystemPane`, `NewWindow`, `StopPaste`,
+    /// `EndRecovered`, an agent upgrade's `Upgrade now`). The glass paints these, and only
+    /// these, as the accent-filled Primary chip; a navigation or a decline is the quiet
+    /// Secondary chip, and `Details` wears its own role.
     #[must_use]
     pub const fn is_consequential(&self) -> bool {
         matches!(
@@ -610,11 +590,9 @@ impl Intent {
         )
     }
 
-    /// A DECLINE — `Not now`, an upgrade's `Not today` or `Skip version`: a
-    /// press that answers by putting the work off, which the glass paints as
-    /// the quiet Secondary chip ([`Intent::is_consequential`]) and the page
-    /// never promotes to its Primary past a first intent a press cannot
-    /// perform (design ruling 403).
+    /// A decline (`Not now`, an upgrade's `Not today` or `Skip version`): a press that
+    /// puts the work off. The glass paints it as the quiet Secondary chip, and the page
+    /// never promotes it to its Primary past a first intent a press cannot perform.
     #[must_use]
     pub const fn is_decline(&self) -> bool {
         matches!(
@@ -627,19 +605,19 @@ impl Intent {
         )
     }
 
-    /// A press that STOPS the row's own work in flight (`StopPaste`, design
-    /// ruling 232): the one decision a progress row may carry. The glass
-    /// rule ([`Intent::is_consequential`]) paints it as the accent chip;
-    /// the attention rule keeps the row Progress.
+    /// A press that stops the row's own work in flight (`StopPaste`): the one decision a
+    /// progress row may carry. The glass paints it as the accent chip
+    /// ([`Intent::is_consequential`]); the attention rule keeps the row Progress.
     #[must_use]
     pub const fn stops_work(&self) -> bool {
         matches!(self, Self::StopPaste { .. })
     }
 
     /// The log/carry form: `details`, `open-settings:/packages`,
-    /// `open-config-editor:<line|->`, `open-path:<esc>`,
-    /// `open-system-pane:<pane>`, `apply-update:<build>`, `not-now:file-access`,
-    /// `new-window`, `agent-upgrade:<word>:<to>:<tab>` (`:` escaped in both).
+    /// `open-config-editor:<line|->`, `open-path:<esc>`, `open-system-pane:<pane>`,
+    /// `apply-update:<build>`, `not-now:file-access`, `new-window`, `stop-paste:<session>`,
+    /// `show-tab:<tab>:<window>`, `agent-upgrade:<word>:<to>:<tab>`,
+    /// `agent-upgrades:<word>(:<to>:<tab>)+` (`:` escaped in the fields), `end-recovered`.
     #[must_use]
     pub fn encode(&self) -> String {
         match self {
@@ -890,15 +868,13 @@ impl ActionIndex {
 
 /// How long a row stays and what ends it.
 ///
-/// [`Hold::Standing`] and [`Hold::Ask`] are PERSISTENT and SEALED: they carry
-/// a [`Persist`] token that only an [`Ask`] (and the carry decoder) can mint,
-/// so a reporter cannot write one — the rule at the door ([`crate::need`]) is
-/// a type, not a test. A message classed by the rule ([`Message::now`]) earns
-/// one from its ask.
+/// [`Hold::Standing`] and [`Hold::Ask`] are persistent and sealed: they carry a
+/// [`Persist`] token only an [`Ask`] (and the carry decoder) can mint, so a reporter
+/// cannot write one ([`crate::need`]). A message classed by the rule ([`Message::now`])
+/// earns one from its ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hold {
-    /// The severity's hold, anchored at FIRST glass
-    /// (status_bars.rs:906-917, generalised).
+    /// The severity's hold, anchored at first glass.
     Default,
     /// A specific hold, anchored the same way.
     For(Duration),
@@ -908,10 +884,9 @@ pub enum Hold {
         /// How long the row may go without a restate.
         stale_after: Duration,
     },
-    /// Until resolve, or until read (an agent that is down, GPU lost, a11y
-    /// dead): Details, a body press or a navigation capsule folds it (design
-    /// §10.4.3, E3), because the person has seen it and gone to fix it.
-    /// Sealed: built by [`Ask::standing`] only.
+    /// Until resolve, or until read (an agent that is down, GPU lost, a11y dead): Details,
+    /// a body press or a navigation capsule folds it, because the person has seen it and
+    /// gone to fix it. Sealed: built by [`Ask::standing`] only.
     Standing(Persist),
     /// A decision row: ranks first; leaves on `NotNow`, supersede or expiry.
     /// Sealed like [`Hold::Standing`]: built by [`Ask::question`] only.
@@ -1017,37 +992,34 @@ pub(crate) enum Admission {
     Demoted,
 }
 
-/// A row's progress: a fill, a volatile stats string (≤ [`STATS_CAP`]
-/// chars, never persisted, never in the spoken label), the continuous
-/// quantity behind the fill and the resource the current phase loads — or,
-/// with no known fraction, work in flight ([`Meter::busy`]).
+/// A row's progress: a fill, a volatile stats string (≤ [`STATS_CAP`] chars, never
+/// persisted, never in the spoken label), the continuous quantity behind the fill and the
+/// resource the current phase loads, or, with no known fraction, work in flight
+/// ([`Meter::busy`]).
 ///
-/// THE INDICATOR IS THE METER'S STATE, never the hold's (design ruling 139,
-/// the merge's M4): a fill draws the bar (glide, glint, stall), `busy` the
-/// comet, and neither draws no indicator at all — the row
-/// is still. A [`Hold::Live`] row that is WORK carries a fill or `busy`
-/// (its reporter sets it: [`Message::in_flight`] or [`Meter::busy`]); a
-/// Live row blocked on the person carries neither and stands still.
+/// The indicator is the meter's state, never the hold's: a fill draws the bar (glide,
+/// glint, stall), `busy` the comet, and with neither the row is still. A [`Hold::Live`] row
+/// that is work carries a fill or `busy` ([`Message::in_flight`] or [`Meter::busy`]); a
+/// Live row blocked on the person carries neither.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Meter {
     /// 0..=1000, or `None` for work with no fraction yet.
     pub fill_permille: Option<u16>,
     /// `512 MB / 1.2 GB` and the like.
     pub stats: String,
-    /// The continuous quantity behind the fill — the ETA's ONLY input. A
-    /// reporter supplies it only when `total` spans the deliverable the title
-    /// names; a phase of a larger job supplies none, and the row shows no ETA
-    /// rather than a wrong one. Volatile: never persisted, never carried.
+    /// The continuous quantity behind the fill, the ETA's only input. A reporter supplies
+    /// it only when `total` spans the deliverable the title names; a phase of a larger job
+    /// supplies none, and the row shows no ETA rather than a wrong one. Volatile: never
+    /// persisted, never carried.
     pub amount: Option<Amount>,
-    /// The resource the current phase loads, DECLARED by the reporter for the
-    /// phase's duration, and only for a very heavy phase (design §10.6).
+    /// The resource the current phase loads, declared by the reporter for the phase's
+    /// duration, and only for a very heavy phase.
     pub load: Option<Load>,
-    /// Work in flight with no known fraction: the comet along the row, on
-    /// the engine's frame grid ([`crate::animate`]); the row's glyph cell
-    /// keeps its own icon (no spinner beside the comet, ruling 251). Never
-    /// with a fill (normalized clears it). Volatile: never persisted and never on the wire; carried across the
-    /// handoff ([`crate::carry::CarriedMessage::busy`]); never spoken as a
-    /// word (the row is a progress indicator with no value).
+    /// Work in flight with no known fraction: the comet along the row, on the engine's
+    /// frame grid ([`crate::animate`]); the glyph cell keeps its own icon (no spinner).
+    /// Never with a fill (normalized clears it). Volatile: never persisted or on the wire,
+    /// but carried across the handoff ([`crate::carry::CarriedMessage::busy`]); never
+    /// spoken (the row is a progress indicator with no value).
     pub busy: bool,
 }
 
@@ -1071,12 +1043,10 @@ impl Meter {
         self.normalized_measured(false)
     }
 
-    /// [`Self::normalized`], with `measured` naming a fill measured finer
-    /// than its count by an amount not at hand: a CARRIED row's (ruling
-    /// 263) — the parent's fill already agreed with its count, and the carry
-    /// ships no amount — is kept inside the count's span as a measured one
-    /// is, never snapped back to the count's floor (`3 of 10 programs` at
-    /// 36 % stays 36 %, not 30 %, across a handoff).
+    /// [`Self::normalized`], with `measured` naming a fill measured finer than its count
+    /// by an amount not at hand (a carried row: the carry ships no amount). Such a fill is
+    /// kept inside the count's span, never snapped to its floor (`3 of 10 programs` at 36 %
+    /// stays 36 % across a handoff).
     #[must_use]
     pub(crate) fn normalized_measured(self, measured: bool) -> Self {
         let amount = self.amount.filter(|a| a.total > 0).map(|a| Amount {
@@ -1120,11 +1090,10 @@ impl Meter {
     }
 }
 
-/// The fill span a WHOLE-NUMBER COUNT in the stats' first clause allows —
-/// `3 of 4 tabs` → `(750, 1000)`, `(A/B, (A+1)/B)` in permille, the whole bar
-/// once the count is complete (design ruling 259) — or `None` when the first
-/// clause is no such count (`1.2M of 3.4M lines`, a pair of sizes, words),
-/// its total is zero, or it counts past its total.
+/// The fill span a whole-number count in the stats' first clause allows: `3 of 4 tabs` →
+/// `(750, 1000)`, `(A/B, (A+1)/B)` in permille, the whole bar once the count is complete.
+/// `None` when the first clause is no such count (`1.2M of 3.4M lines`, a pair of sizes,
+/// words), its total is zero, or it counts past its total.
 fn count_span(stats: &str) -> Option<(u16, u16)> {
     let (done, total) = count_of(stats)?;
     let at = |n: u64| {
@@ -1187,10 +1156,9 @@ impl Amount {
     }
 }
 
-/// What an [`Amount`] counts. Bytes read "stalled" ten seconds after they
-/// stop; a count of items or steps may honestly sit still while one item
-/// takes long, so it reads "stalled" only past several of its own gaps
-/// between advances (design ruling 265).
+/// What an [`Amount`] counts. Bytes read "stalled" ten seconds after they stop; a count
+/// of items or steps may sit still while one item takes long, so it reads "stalled" only
+/// past several of its own gaps between advances.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Unit {
     /// Bytes moved.
@@ -1199,13 +1167,12 @@ pub enum Unit {
     Items,
     /// Steps of a fixed plan.
     Steps,
-    /// [`Unit::Steps`] at a phase of the plan that HOLDS the fill with no
-    /// meter of its own — a toolchain program verifying or linking,
-    /// whose share sits at 500‰ or 990‰ until the phase ends (design ruling
-    /// 266). The same count as `Steps` (the estimator keeps its readings
-    /// across the switch), but its silence here is the plan, not a stall: it
-    /// never reads "stalled", and the count's patience restarts when the
-    /// phase ends. Never on the wire (its word is `steps`).
+    /// [`Unit::Steps`] at a phase of the plan that holds the fill with no meter of its own
+    /// (a toolchain program verifying or linking, its share at 500‰ or 990‰ until the
+    /// phase ends). The same count as `Steps` (the estimator keeps its readings across the
+    /// switch), but its silence is the plan, not a stall: it never reads "stalled", and the
+    /// count's patience restarts when the phase ends. Never on the wire (its word is
+    /// `steps`).
     HeldSteps,
 }
 
@@ -1220,7 +1187,7 @@ impl Unit {
         }
     }
 
-    /// What the count IS, for the estimator: a held step is a step.
+    /// What the count is, for the estimator: a held step is a step.
     #[must_use]
     pub(crate) const fn count(self) -> Self {
         match self {
@@ -1239,8 +1206,8 @@ impl Unit {
     }
 }
 
-/// The resource a very heavy phase loads — the words that explain why the
-/// machine is slow while it lasts (design §10.6).
+/// The resource a very heavy phase loads: the words that explain why the machine is slow
+/// while it lasts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Load {
     /// A large download.
@@ -1286,9 +1253,8 @@ impl Load {
     }
 }
 
-/// A set of [`Load`]s: the kinds a row may show over its life, which size its
-/// reserved load slot (design ruling 221). Empty is the undeclared row, whose
-/// slot is sized for every load's words.
+/// A set of [`Load`]s: the kinds a row may show over its life, which size its reserved
+/// load slot. Empty is the undeclared row, whose slot is sized for every load's words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Loads(u8);
 
@@ -1341,8 +1307,8 @@ impl Loads {
         Load::ALL.into_iter().filter(move |&l| self.contains(l))
     }
 
-    /// The set a row RESERVES once it shows `l` (design ruling 221): its
-    /// declaration with `l` in it, or — undeclared — every load, as before.
+    /// The set a row reserves once it shows `l`: its declaration with `l` in it, or, when
+    /// undeclared, every load.
     #[must_use]
     pub(crate) const fn reserved_with(self, l: Load) -> Self {
         if self.is_empty() {
@@ -1392,19 +1358,17 @@ impl Origin {
         }
     }
 
-    /// The wire OWNS a message minted by it or keyed in its namespace (a
-    /// carried keyed wire row's origin is `Carried`, its key is still
-    /// [`crate::WIRE_KEY_PREFIX`]'s; a carried keyless one keeps `Wire`, round
-    /// 43, ruling 415 (h)): the one class the duplicate test and the log
-    /// ring's wire share both use (design rulings 167, 192, 194).
+    /// The wire owns a message minted by it or keyed in its namespace (a carried keyed
+    /// wire row's origin is `Carried` but its key is still [`crate::WIRE_KEY_PREFIX`]'s; a
+    /// carried keyless one keeps `Wire`): the one class the duplicate test and the log
+    /// ring's wire share both use.
     #[must_use]
     pub fn wire_owned(self, key: Option<&str>) -> bool {
         self == Self::Wire || key.is_some_and(|k| k.starts_with(crate::WIRE_KEY_PREFIX))
     }
 }
 
-/// The wall clock at ingress, minted by the HOST (D4): the engine never reads
-/// one.
+/// The wall clock at ingress, minted by the host: the engine never reads one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
 pub struct WallStamp {
     /// Milliseconds since the Unix epoch.
@@ -1451,22 +1415,19 @@ pub struct Message {
     /// still rides Details, the log and Settings ▸ Messages, and the spoken
     /// name follows the paint.
     pub excerpt: bool,
-    /// `None`: eligible for the glass at post. `Some(d)`: not on the glass
-    /// until `posted_at + d` — a row that would appear and fold inside the
-    /// grace costs two re-grids for nothing (design §10.4.3, E2).
+    /// `None`: eligible for the glass at post. `Some(d)`: not on the glass until
+    /// `posted_at + d`; a row that would appear and fold inside the grace costs two
+    /// re-grids for nothing.
     pub reveal_after: Option<Duration>,
-    /// The words the row FINISHES with — what its Complete echo paints in
-    /// the title's place (`Installed aterm vX` for `Finishing aterm vX`).
-    /// `None`: [`Message::finished_title`] derives them from the title's
-    /// leading present participle ([`crate::words::finished_form`]). The
-    /// log keeps them too (design ruling 259): a live row that delivered is
-    /// LOGGED under its finished words, its live title the first detail
-    /// line; and an ask's declared words (`Asked for Full Disk Access`) are
-    /// the title it is logged under once it is answered or folds.
+    /// The words the row finishes with, which its Complete echo paints in the title's
+    /// place (`Installed aterm vX` for `Finishing aterm vX`). `None`:
+    /// [`Message::finished_title`] derives them from the title's leading present
+    /// participle. A live row that delivered is logged under its finished words, its live
+    /// title the first detail line; an ask's declared words (`Asked for Full Disk Access`)
+    /// are the title it is logged under once answered or folded.
     pub finished: Option<String>,
-    /// The loads the row may show over its life (design ruling 221), declared
-    /// by its reporter: its reserved load slot is sized to their words, not to
-    /// every load's. Empty (the default) reserves for every load.
+    /// The loads the row may show over its life, declared by its reporter: its reserved
+    /// load slot is sized to their words. Empty (the default) reserves for every load.
     pub loads: Loads,
     /// The load this work IS (design ruling 246): a download's network, a
     /// removal's disk, a build's CPU. Its words say nothing the title does not
@@ -1474,18 +1435,15 @@ pub struct Message {
     /// (a download's extraction making the disk busy) shows as before. `None`:
     /// every declared load shows.
     pub primary: Option<Load>,
-    /// A RECORD ABOUT A PREVIOUS RUN (design ruling 259): `aterm crashed
-    /// last time`. It ranks one severity class below its own on the glass
-    /// ([`crate::glass::rank`]), so a past run's news never takes the row
-    /// of something happening now. Set by the builder that knows it
-    /// ([`Message::retrospective`]); never inferred from the words.
+    /// A record about a previous run (`aterm crashed last time`): it ranks one severity
+    /// class below its own on the glass (`glass::rank`), so a past run's news never takes
+    /// the row of something happening now. Set by [`Message::retrospective`], never
+    /// inferred from the words.
     pub retrospective: bool,
-    /// What the message IS to the person ([`Need`]): the engine derives the
-    /// hold, the band's eligibility and the channel from it. Not a public
-    /// field — only the class constructors ([`Message::record`],
-    /// [`Message::working`], [`Message::notice`], [`Message::now`],
-    /// [`Message::later`]) write it, and [`Message::new`] leaves it
-    /// [`Need::Unclassified`].
+    /// What the message is to the person ([`Need`]): the engine derives the hold, the
+    /// band's eligibility and the channel from it. Only the class constructors
+    /// ([`Message::record`], [`Message::working`], [`Message::notice`], [`Message::now`],
+    /// [`Message::later`]) write it; [`Message::new`] leaves it [`Need::Unclassified`].
     pub(crate) need: Need,
 }
 
@@ -1519,7 +1477,7 @@ impl Message {
         }
     }
 
-    /// A RECORD: the log only, never on any glass.
+    /// A record: the log only, never on any glass.
     #[must_use]
     pub fn record(mut self) -> Self {
         self.need = Need::Record;
@@ -1527,9 +1485,8 @@ impl Message {
         self
     }
 
-    /// WORK IN FLIGHT: a live row that ends with the work (`stale_after` is
-    /// its silence cap). Declare its indicator with [`Message::in_flight`] or
-    /// a [`Meter`].
+    /// Work in flight: a live row that ends with the work (`stale_after` is its silence
+    /// cap). Declare its indicator with [`Message::in_flight`] or a [`Meter`].
     #[must_use]
     pub fn working(mut self, stale_after: Duration) -> Self {
         self.need = Need::Working;
@@ -1546,16 +1503,14 @@ impl Message {
         self
     }
 
-    /// THE OWNER IS NEEDED NOW: a band row. The ask's reason and its one
-    /// action lead the detail (the band's excerpt is the reason), the ask's
-    /// button is the first capsule, and the hold is derived from the ask —
-    /// [`Hold::Standing`] only for a standing one.
+    /// The owner is needed now: a band row. The ask's reason and its one action lead the
+    /// detail (the band's excerpt is the reason), the ask's button is the first capsule,
+    /// and the hold is derived from the ask ([`Hold::Standing`] only for a standing one).
     #[must_use]
     pub fn now(mut self, ask: Ask) -> Self {
         self.hold = ask.hold();
-        // A standing row is born late (the Row Law, clause 2): a row that is
-        // posted and withdrawn inside the progress grace never reaches the
-        // glass and costs no re-grid of any window.
+        // A standing row is born late (the row law): one posted and withdrawn inside the
+        // progress grace never reaches the glass and costs no re-grid.
         if ask.is_standing() && self.reveal_after.is_none() {
             self.reveal_after = Some(crate::PROGRESS_GRACE);
         }
@@ -1569,8 +1524,8 @@ impl Message {
         self
     }
 
-    /// THE OWNER IS NEEDED, BUT NOT NOW: an entry of the digest. It is never
-    /// seated on the band. Its key is the ask's fingerprint.
+    /// The owner is needed, but not now: an entry of the digest, never seated on the
+    /// band. Its key is the ask's fingerprint.
     #[must_use]
     pub fn later(mut self, ask: LaterAsk) -> Self {
         self.hold = Hold::LogOnly;
@@ -1598,8 +1553,7 @@ impl Message {
         self.hold.persists()
     }
 
-    /// `true` when the row shows work in flight: a fill or `busy` on its
-    /// meter (design ruling 139: the indicator is the meter's state).
+    /// `true` when the row shows work in flight: a fill or `busy` on its meter.
     #[must_use]
     pub(crate) fn has_indicator(&self) -> bool {
         self.meter
@@ -1607,13 +1561,10 @@ impl Message {
             .is_some_and(|m| m.fill_permille.is_some() || m.busy)
     }
 
-    /// The reason and the action as the first two detail lines, so the
-    /// band's excerpt IS the reason and Details opens on the action — but only
-    /// for a message that brought no detail of its own. A builder that already
-    /// wrote its lines wrote them to be read in that order (`gpu_lost`, the
-    /// screen-reader row): prepending would move its own `retry` line and
-    /// change what its tests and its readers pin. Rows built new for the rule
-    /// pass their ask alone and get the shape.
+    /// The reason and the action as the first two detail lines, so the band's excerpt is
+    /// the reason and Details opens on the action, but only for a message that brought no
+    /// detail of its own: a builder that wrote its lines (`gpu_lost`, the screen-reader
+    /// row) wrote them to be read in that order.
     fn lead_with(&mut self, why: &str, then: &str) {
         if !self.detail.is_empty() {
             return;
@@ -1626,17 +1577,14 @@ impl Message {
         self.detail.truncate(DETAIL_LINES_CAP);
     }
 
-    /// THE DOOR: make `hold` and `need` agree, and say what it did
-    /// ([`Admission`]). A CLASSIFIED message that cannot stand as written — a
-    /// standing ask with no key or with a fault, a `Working` row with no
-    /// indicator, a row whose only capsules decline — becomes a record with
-    /// its words kept ([`Admission::Demoted`]). An UNCLASSIFIED one (what
-    /// [`Message::new`] makes) cannot persist: the seal ([`Persist`]) keeps a
-    /// reporter from writing a persistent hold, so the only one the door meets
-    /// is an older parent's carry, which it adopts; a transient hold past
-    /// [`MAX_TRANSIENT`] is cut to it and counted, and a row that shows no
-    /// work at Warn or above is a record. The door does not guess a class for
-    /// a builder that has not declared one.
+    /// The door: make `hold` and `need` agree, and say what it did ([`Admission`]). A
+    /// classified message that cannot stand as written (a standing ask with no key or
+    /// with a fault, a `Working` row with no indicator, a row whose only capsules decline)
+    /// becomes a record with its words kept ([`Admission::Demoted`]). An unclassified one
+    /// cannot persist: the seal ([`Persist`]) keeps a reporter from writing a persistent
+    /// hold, so the only one the door meets is an older parent's carry, which it adopts;
+    /// a transient hold past [`MAX_TRANSIENT`] is cut to it and counted, and a Live row
+    /// that shows no work at Warn or above is a record. The door does not guess a class.
     #[must_use]
     pub(crate) fn admit(&mut self) -> Admission {
         let demote = |m: &mut Self| {
@@ -1661,9 +1609,8 @@ impl Message {
                     Admission::Demoted
                 }
             }
-            // WORK IN FLIGHT carries its indicator (a fill or `busy`, design
-            // ruling 139): a Live row with neither is a row blocked on a
-            // person, which is a claim on the owner and belongs to `.now()`.
+            // Work in flight carries its indicator (a fill or `busy`): a Live row with
+            // neither is blocked on a person, a claim on the owner that belongs to `.now()`.
             Need::Working => {
                 if !matches!(self.hold, Hold::Live { .. }) || !self.has_indicator() {
                     return demote(self);
@@ -1679,12 +1626,8 @@ impl Message {
                 // reporter can neither supersede nor resolve it, and the
                 // once-only rule has nothing to remember it by.
                 let keyed = !ask.is_standing() || ask.is_adopted() || self.key.is_some();
-                // A decline is not an action (owner rule R-4): a row that
-                // stands past a glance and whose only capsules are declines
-                // (`Not today`, `Skip version`, `Not now`, `Details`) offers
-                // no action, however good its sentence. A decline BESIDE a
-                // real capsule, or a row with no capsule (the sentence is the
-                // action), is fine.
+                // A persistent row whose only capsules decline offers no action; a decline
+                // beside a real capsule, or no capsule (the sentence is the action), is fine.
                 let declines_only =
                     ask.hold().persists() && !ask.is_adopted() && self.declines_only();
                 if ask.is_complete() && keyed && !declines_only {
@@ -1715,7 +1658,7 @@ impl Message {
                         Admission::Demoted
                     }
                     // A Live row that shows no indicator at Warn or above is
-                    // blocked on a person: it PERSISTS without saying why.
+                    // blocked on a person: it persists without saying why.
                     Hold::Live { .. }
                         if !carried && self.severity >= Severity::Warn && !self.has_indicator() =>
                     {
@@ -1733,8 +1676,8 @@ impl Message {
         !self.actions.is_empty() && self.actions.iter().all(Intent::is_snooze)
     }
 
-    /// The loads this row may show over its life (design ruling 221): its
-    /// load slot is reserved at the widest of their words.
+    /// The loads this row may show over its life: its load slot is reserved at the widest
+    /// of their words.
     #[must_use]
     pub fn loads(mut self, loads: impl IntoIterator<Item = Load>) -> Self {
         self.loads = loads.into_iter().collect();
@@ -1750,8 +1693,8 @@ impl Message {
         self
     }
 
-    /// A record about a PREVIOUS RUN ([`Message::retrospective`], ruling 259):
-    /// it ranks one severity class lower on the glass.
+    /// A record about a previous run ([`Message::retrospective`]): it ranks one severity
+    /// class lower on the glass.
     #[must_use]
     pub fn retrospective(mut self) -> Self {
         self.retrospective = true;
@@ -1792,10 +1735,10 @@ impl Message {
         self.finished_words().unwrap_or_else(|| self.title.clone())
     }
 
-    /// The row's words in the past tense, when there are any: the declared
-    /// finished words, else the title's participle read finished. `None` for
-    /// a free-text title (a wire script's `Uploading the backup`), whose
-    /// Complete echo still needs a word saying it finished (ruling 247).
+    /// The row's words in the past tense, when there are any: the declared finished words,
+    /// else the title's participle read finished. `None` for a free-text title (a wire
+    /// script's `Uploading the backup`), whose Complete echo still needs a word saying it
+    /// finished.
     #[must_use]
     pub fn finished_words(&self) -> Option<String> {
         match &self.finished {
@@ -1811,10 +1754,9 @@ impl Message {
         self
     }
 
-    /// Declares the row's indicator: work in flight. With no fraction yet
-    /// that is a BUSY meter ([`Meter::busy`]: the comet); a
-    /// meter the builder already set keeps its fill and stats, and is busy
-    /// only while it has no fill.
+    /// Declares the row's indicator: work in flight. With no fraction yet that is a busy
+    /// meter ([`Meter::busy`]: the comet); a meter the builder already set keeps its fill
+    /// and stats, and is busy only while it has no fill.
     #[must_use]
     pub fn in_flight(mut self) -> Self {
         let m = self.meter.get_or_insert_default();
@@ -1822,11 +1764,9 @@ impl Message {
         self
     }
 
-    /// One detail line (sanitized, capped; dropped past the line cap). An
-    /// EMPTY line is dropped too — the wire parser already does the same —
-    /// so the log's `detail=` is never ambiguous between no lines and one
-    /// blank one, and every message the engine holds reads back from its
-    /// own record.
+    /// One detail line (sanitized, capped; dropped past the line cap). An empty line is
+    /// dropped too, as the wire parser does, so the log's `detail=` is never ambiguous
+    /// between no lines and one blank one.
     #[must_use]
     pub fn line(mut self, l: impl AsRef<str>) -> Self {
         let l = clip(l.as_ref(), DETAIL_LINE_CAP);
@@ -1845,11 +1785,10 @@ impl Message {
         self
     }
 
-    /// A sentence received from elsewhere (an updater's error, a pass's
-    /// cause), kept WHOLE across detail lines ([`text::split_sentence`],
-    /// each ≤ [`DETAIL_LINE_CAP`], at most [`DETAIL_LINES_CAP`] of them) —
-    /// never pre-cut. A short excerpt the band should show first is a
-    /// [`Message::line`] before it.
+    /// A sentence received from elsewhere (an updater's error, a pass's cause), kept whole
+    /// across detail lines ([`crate::text::split_sentence`], each ≤ [`DETAIL_LINE_CAP`], at
+    /// most [`DETAIL_LINES_CAP`] of them), never pre-cut. A short excerpt the band should
+    /// show first is a [`Message::line`] before it.
     #[must_use]
     pub fn sentence(self, s: impl AsRef<str>) -> Self {
         self.lines(crate::text::split_sentence(s.as_ref(), DETAIL_LINE_CAP))
@@ -1914,11 +1853,10 @@ impl Message {
         self
     }
 
-    /// Applied by `post`: sanitize + cap title/detail/key/stats, drop empty
-    /// detail lines, drop `Intent::Details`, truncate to [`MAX_ACTIONS`], and
-    /// normalize the meter (a fill clears `busy`). The indicator is the
-    /// meter's state and is NEVER invented here: a Live row that declared
-    /// neither a fill nor `busy` is still (design ruling 139). Never rejects.
+    /// Applied by `post`: sanitize and cap title/detail/key/stats, drop empty detail
+    /// lines, drop `Intent::Details`, truncate to [`MAX_ACTIONS`], and normalize the meter
+    /// (a fill clears `busy`). Never invents an indicator: a Live row that declared
+    /// neither a fill nor `busy` is still. Never rejects.
     #[must_use]
     pub fn normalized(mut self) -> Self {
         self.title = clip(&self.title, TITLE_CAP);
@@ -1949,7 +1887,7 @@ impl Message {
         self
     }
 
-    /// `true` when any authored intent is a decision.
+    /// `true` for a decision row: a [`Hold::Ask`] hold or an authored decision intent.
     #[must_use]
     pub fn is_ask(&self) -> bool {
         matches!(self.hold, Hold::Ask { .. }) || self.actions.iter().any(Intent::is_ask)
@@ -1979,6 +1917,11 @@ pub struct Restatement {
     /// Left unset, a restatement that changes the title drops the old
     /// declared words — they finished the old title.
     pub finished: Option<Option<String>>,
+    /// The new title's short form ([`Message::short_title`]; `Some(None)`
+    /// clears it). Left unset, a restatement that changes the title drops
+    /// the old one — it shortened the old title — and the band cuts the new
+    /// title where it does not fit.
+    pub short_title: Option<Option<String>>,
 }
 
 impl Restatement {
@@ -1993,8 +1936,8 @@ impl Restatement {
 mod tests {
     use super::*;
 
-    /// Invariant 22: the vocabulary is closed and every word in it is a tag;
-    /// the glyph set admits the band's glyphs and nothing else.
+    /// The tag vocabulary is closed and every word in it is a tag; the glyph set admits
+    /// the band's glyphs and nothing else.
     #[test]
     fn tags_and_glyphs_are_closed_sets() {
         for tag in tags::ALL {
@@ -2152,9 +2095,8 @@ mod tests {
         assert_eq!(Hold::decode("for:x"), None);
     }
 
-    /// A BUSY meter is work with no known fraction: never with a fill —
-    /// `normalized` clears the flag where a fill arrives — and its stats are
-    /// clipped like any meter's.
+    /// A busy meter never carries a fill (`normalized` clears the flag where one arrives),
+    /// and its stats are clipped like any meter's.
     #[test]
     fn a_busy_meter_never_carries_a_fill() {
         let m = Meter::busy("45 MB");
@@ -2167,7 +2109,7 @@ mod tests {
         }
         .normalized();
         assert!(!filled.busy, "a fill is a fraction: not busy");
-        // A fill DERIVED from an amount is a fraction too.
+        // A fill derived from an amount is a fraction too.
         let counted = Meter {
             amount: Some(Amount {
                 series: 1,
@@ -2190,10 +2132,8 @@ mod tests {
         assert!(!posted.meter.unwrap().busy);
     }
 
-    /// THE INDICATOR IS THE METER'S STATE (design ruling 139): `in_flight`
-    /// declares a busy meter, or marks a fill-less one busy, and keeps a
-    /// fill; `normalized` never invents an indicator — a Live row that
-    /// declared none is still (a row blocked on the person).
+    /// `in_flight` declares a busy meter, or marks a fill-less one busy, and keeps a fill;
+    /// `normalized` never invents an indicator (a Live row that declared none is still).
     #[test]
     fn in_flight_declares_busy_and_normalized_invents_nothing() {
         let live = Hold::Live {

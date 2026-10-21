@@ -6,8 +6,9 @@
 //! leak test with its negative control.
 
 use aterm_slog::vocab::{
-    ACT_WORDS, BOX_WORDS, CAUSE_WORDS, CLS_WORDS, DIR_WORDS, END_WORDS, MAIL_KIND_WORDS,
-    NEED_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS,
+    ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
+    END_WORDS, HEALED_BY_WORDS, MAIL_KIND_WORDS, NEED_WORDS, NET_WORDS, ORIGIN_WORDS, OUT_WORDS,
+    PHASE_WORDS, POOL_WORDS, SOURCE_WORDS, STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS,
     WORD_WORDS,
 };
 use aterm_slog::{
@@ -110,6 +111,13 @@ fn every_vocabulary_word_is_one_wire_token_named_once() {
         ACT_WORDS,
         END_WORDS,
         POOL_WORDS,
+        ORIGIN_WORDS,
+        ASK_WORDS,
+        CHANGE_WORDS,
+        NET_WORDS,
+        CLASS_WORDS,
+        HEALED_BY_WORDS,
+        SOURCE_WORDS,
     ] {
         for (i, w) in list.iter().enumerate() {
             assert!(
@@ -301,6 +309,15 @@ fn no_host_or_content_key_survives_the_wire_tier() {
         .expect("cwd is declared");
     row.1 = Tier::Wire;
     assert_eq!(leaks(&doctored, Tier::Wire), vec![Key::Cwd]);
+    // Negative control (6F-2): a content key marked H leaks at the host
+    // tier, the journal's and the carry's (ruling U13's attention text).
+    let mut doctored: Vec<(Key, Tier, Cap)> = FIELDS.to_vec();
+    let row = doctored
+        .iter_mut()
+        .find(|row| row.0 == Key::AttnText)
+        .expect("attn_text is declared");
+    row.1 = Tier::Host;
+    assert_eq!(leaks(&doctored, Tier::Host), vec![Key::AttnText]);
 }
 
 #[test]
@@ -441,8 +458,14 @@ fn phase_3b_keys_and_kinds_are_appended_wire_numbers() {
         Key::Title,
         "the keys before 3B kept their places"
     );
-    let kinds = &Kind::ALL[..Kind::ALL.len() - 1];
-    assert_eq!(&kinds[kinds.len() - 2..], &[Kind::Source, Kind::MailLanded]);
+    let at = Kind::ALL
+        .iter()
+        .position(|k| *k == Kind::Source)
+        .expect("3B's first kind");
+    assert_eq!(
+        &Kind::ALL[at..at + 3],
+        &[Kind::Source, Kind::MailLanded, Kind::Task]
+    );
     for k in [Kind::Source, Kind::MailLanded] {
         assert!(k.is_mark() && k.node_level().is_none(), "{k:?}");
     }
@@ -464,7 +487,12 @@ fn phase_5_task_key_and_kind_are_appended_and_local() {
         (Key::Attention.tier(), Key::Attention.cap()),
         (Tier::Wire, Cap::U)
     );
-    assert_eq!(Kind::ALL.last(), Some(&Kind::Task));
+    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
+    assert_eq!(
+        kind_at(Kind::Task),
+        kind_at(Kind::MailLanded).map(|i| i + 1),
+        "appended after 3B's kinds, which kept their places"
+    );
     assert!(Kind::Task.is_mark() && Kind::Task.node_level().is_none());
     let f = Fields::new()
         .u(Key::Rev, 3)
@@ -683,7 +711,11 @@ fn phase_6_op_by_is_appended_host_only_and_an_older_reader_skips_it() {
 fn phase_6_pool_is_appended_host_only_and_closed() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
     assert_eq!(at(Key::Pool), at(Key::OpBy).map(|i| i + 1));
-    assert_eq!(FIELDS.len(), at(Key::Pool).map_or(0, |i| i + 1), "the last");
+    assert_eq!(
+        at(Key::Build),
+        at(Key::Pool).map(|i| i + 1),
+        "6F-2's keys come after it"
+    );
     assert_eq!(
         (Key::Pool.tier(), Key::Pool.cap()),
         (Tier::Host, Cap::Word(POOL_WORDS))
@@ -725,4 +757,575 @@ fn phase_6_pool_is_appended_host_only_and_closed() {
     let stranger = line.replace(" pool=shared ", " pool=maybe ");
     let read = decode(&stranger).expect("an unknown word reads");
     assert_eq!(read.f.get_word(Key::Pool), Some("unknown"), "{stranger}");
+}
+
+/// PHASE 6 (6F-2, plan item U2; rulings U11-U13, U17, U44): the ring's
+/// vocabulary is APPENDED, so no kind and no key moves: seven mark kinds after
+/// 5C-1's `task`, each a mark, none bus class, none a node; the wire keys,
+/// the host keys and the content keys after 6C-6's `pool=` (the last key), in
+/// that order, each at its tier with its cap; `mail` and `burst` the newest
+/// `why=` words; a session's and a program's state words. A record of every
+/// new key round-trips at the content tier, the host tier holds no content
+/// key and the wire none of the host's or content's, and AN OLDER READER
+/// skips each new key and maps each new kind to `unknown` (the R13 rule).
+#[test]
+fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
+    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
+    let kinds = [
+        Kind::State,
+        Kind::Policy,
+        Kind::Topic,
+        Kind::Advisory,
+        Kind::Program,
+        Kind::MailFetch,
+        Kind::Shown,
+    ];
+    let first = kind_at(Kind::Task).map(|i| i + 1).expect("5C-1's kind");
+    assert_eq!(
+        &Kind::ALL[first..],
+        &kinds,
+        "appended after `task`, the last"
+    );
+    let words: Vec<&str> = kinds.iter().map(|k| k.word()).collect();
+    assert_eq!(
+        words,
+        [
+            "state",
+            "policy",
+            "topic",
+            "advisory",
+            "program",
+            "mail-fetch",
+            "shown"
+        ]
+    );
+    for k in kinds {
+        assert!(k.is_mark() && k.node_level().is_none(), "{k:?} is a mark");
+        let r = Rec {
+            seq: 1,
+            t: 9,
+            op: Op::Mark,
+            node: Node::SESSION,
+            par: None,
+            k,
+            src: Src::Aterm,
+            conf: Conf::Exact,
+            by: Actor::Aterm,
+            f: Fields::new(),
+        };
+        assert!(!r.is_bus_class() && !r.is_turn_class(), "{k:?} stays local");
+    }
+
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    let rows: [(Key, &str, Tier, Cap); 17] = [
+        (Key::Build, "build", Tier::Wire, Cap::U),
+        (Key::Run, "run", Tier::Wire, Cap::U),
+        (Key::Displaced, "displaced", Tier::Wire, Cap::I),
+        (Key::At, "at", Tier::Wire, Cap::U),
+        (Key::Bytes, "bytes", Tier::Wire, Cap::U),
+        (Key::Producer, "producer", Tier::Wire, Cap::U),
+        (
+            Key::Reverted,
+            "reverted",
+            Tier::Wire,
+            Cap::Tok(aterm_slog::Charset::Rollup, 300),
+        ),
+        (Key::Origin, "origin", Tier::Wire, Cap::Word(ORIGIN_WORDS)),
+        (Key::Ask, "ask", Tier::Wire, Cap::Word(ASK_WORDS)),
+        (Key::Coalesced, "coalesced", Tier::Wire, Cap::U),
+        (Key::Holder, "holder", Tier::Host, Cap::Id),
+        (Key::Via, "via", Tier::Host, Cap::Text(256)),
+        (Key::Idem, "idem", Tier::Host, Cap::Text(64)),
+        (Key::Reason, "reason", Tier::Content, Cap::Text(212)),
+        (Key::AttnText, "attn_text", Tier::Content, Cap::Text(256)),
+        (Key::TopicName, "topic_name", Tier::Content, Cap::Text(64)),
+        (Key::Closer, "closer", Tier::Content, Cap::Text(64)),
+    ];
+    let first = at(Key::Pool).map(|i| i + 1).expect("6C-6's key");
+    for (i, (key, word, tier, cap)) in rows.iter().enumerate() {
+        assert_eq!(at(*key), Some(first + i), "{key:?} in its place");
+        assert_eq!(
+            (key.word(), key.tier(), key.cap()),
+            (*word, *tier, *cap),
+            "{key:?}"
+        );
+    }
+    assert_eq!(
+        FIELDS.get(first + rows.len()).map(|r| r.0),
+        Some(Key::Change),
+        "6F-5's `change=` follows `closer=`"
+    );
+    assert_eq!(
+        &WHY_WORDS[WHY_WORDS.len() - 4..WHY_WORDS.len() - 2],
+        ["mail", "burst"],
+        "6F-6's two follow"
+    );
+    for w in ["spawning", "alive", "exited", "closed"] {
+        assert!(Fields::new().word(Key::State, w).is_ok(), "session {w}");
+    }
+    for w in ["idle", "working", "blocked", "done", "error"] {
+        assert!(Fields::new().word(Key::State, w).is_ok(), "program {w}");
+    }
+    assert!(Fields::new().word(Key::Ask, "permission").is_ok());
+    assert!(Fields::new().word(Key::Ask, "teleport").is_err(), "closed");
+    assert!(Fields::new().word(Key::Origin, "fleet").is_ok());
+    assert!(Fields::new().word(Key::Origin, "anyone").is_err(), "closed");
+
+    // One record of each new key (twelve fields at most), at the content
+    // tier and at the tiers below it.
+    let wire = Fields::new()
+        .u(Key::Build, 7)
+        .and_then(|f| f.u(Key::Run, 3))
+        .and_then(|f| f.i(Key::Displaced, -2))
+        .and_then(|f| f.u(Key::At, 500))
+        .and_then(|f| f.u(Key::Bytes, 42))
+        .and_then(|f| f.u(Key::Producer, 9))
+        .and_then(|f| f.tok(Key::Reverted, "alt,kitty"))
+        .and_then(|f| f.word(Key::Origin, "fleet"))
+        .and_then(|f| f.word(Key::Ask, "auth"))
+        .and_then(|f| f.u(Key::Coalesced, 29))
+        .expect("the wire keys");
+    let rest = Fields::new()
+        .id(Key::Holder, "codex-alab@41")
+        .and_then(|f| f.text(Key::Via, "h-relay1,h-relay2"))
+        .and_then(|f| f.text(Key::Idem, "QZP6KEY1"))
+        .and_then(|f| f.text(Key::Reason, "QZP6REASON1"))
+        .and_then(|f| f.text(Key::AttnText, "QZP6ATTN1 needs you"))
+        .and_then(|f| f.text(Key::TopicName, "QZP6TOPIC1"))
+        .and_then(|f| f.text(Key::Closer, "s-closer9"))
+        .expect("the host and content keys");
+    for f in [wire, rest] {
+        let r = Rec {
+            seq: 40,
+            t: 9,
+            op: Op::Mark,
+            node: Node::SESSION,
+            par: None,
+            k: Kind::Program,
+            src: Src::Engine,
+            conf: Conf::Claim,
+            by: Actor::Nobody,
+            f,
+        };
+        let content = encode(&r, Tier::Content).expect("fits");
+        assert_eq!(decode(&content), Ok(r.clone()), "{content}");
+        let host = encode(&r, Tier::Host).expect("fits");
+        let wire = encode(&r, Tier::Wire).expect("fits");
+        for (key, _, tier, _) in &rows {
+            let token = format!(" {}=", key.word());
+            assert_eq!(
+                host.contains(&token),
+                r.f.get(*key).is_some() && *tier <= Tier::Host,
+                "{key:?} at the host tier: {host}"
+            );
+            assert_eq!(
+                wire.contains(&token),
+                r.f.get(*key).is_some() && *tier == Tier::Wire,
+                "{key:?} at the wire tier: {wire}"
+            );
+        }
+        for planted in ["QZP6REASON1", "QZP6ATTN1", "QZP6TOPIC1", "s-closer9"] {
+            assert!(!host.contains(planted), "{planted} below content: {host}");
+        }
+        // An older reader: every new key a token it does not know, every new
+        // kind a word it does not know.
+        let mut older = content.replace(" program ", " zz-kind-of-phase-9 ");
+        for (key, ..) in &rows {
+            older = older.replace(
+                &format!(" {}=", key.word()),
+                &format!(" zz_{}=", key.word()),
+            );
+        }
+        let read = decode(&older).expect("an older reader still reads it");
+        assert_eq!(read.k, Kind::Unknown, "{older}");
+        assert_eq!(read.f.iter().count(), 0, "every new key skipped: {older}");
+    }
+}
+
+/// PHASE 6 (6F-5 to 6F-7, rulings U11-U16): the keys the ring's rows carry
+/// once each row's writer writes a mark the row's whole payload is read
+/// from, APPENDED after 6F-2's `closer=` (the last key before them), so no
+/// key moves: each in its place, at its tier, with its cap. Each row's mark
+/// round-trips at the content tier; the host tier holds no content key and
+/// the wire no host or content key, the planted sentinels included; AN
+/// OLDER READER skips every one (the R13 rule).
+#[test]
+fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    let rows: [(Key, &str, Tier, Cap); 7] = [
+        (Key::Change, "change", Tier::Wire, Cap::Word(CHANGE_WORDS)),
+        (Key::Since, "since", Tier::Content, Cap::Text(64)),
+        (Key::Dl, "dl", Tier::Wire, Cap::U),
+        (
+            Key::HoldOrigin,
+            "hold_origin",
+            Tier::Wire,
+            Cap::Tok(aterm_slog::Charset::Rollup, 64),
+        ),
+        (Key::Floor, "floor", Tier::Host, Cap::U),
+        (Key::Seen, "seen", Tier::Wire, Cap::U),
+        (Key::Moved, "moved", Tier::Wire, Cap::U),
+    ];
+    let first = at(Key::Closer).map(|i| i + 1).expect("6F-2's last key");
+    for (i, (key, word, tier, cap)) in rows.iter().enumerate() {
+        assert_eq!(at(*key), Some(first + i), "{key:?} in its place");
+        assert_eq!(
+            (key.word(), key.tier(), key.cap()),
+            (*word, *tier, *cap),
+            "{key:?}"
+        );
+    }
+    assert_eq!(at(Key::Net), Some(first + rows.len()), "6F-7's keys follow");
+    assert_eq!(CHANGE_WORDS, ["add", "drop"]);
+    assert!(Fields::new().word(Key::Change, "rename").is_err(), "closed");
+    assert_eq!(
+        &WHY_WORDS[WHY_WORDS.len() - 2..],
+        ["not-carried", "log-replaced"]
+    );
+
+    let mark = |k: Kind, f: Fields| Rec {
+        seq: 41,
+        t: 9,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k,
+        src: Src::Fabric,
+        conf: Conf::Exact,
+        by: Actor::Nobody,
+        f,
+    };
+    // Each new key on the mark of the row it is read from, with the
+    // content and host sentinels its row can carry.
+    let marks = [
+        (
+            mark(
+                Kind::Topic,
+                Fields::new()
+                    .word(Key::Change, "add")
+                    .and_then(|f| f.id(Key::Fp, "00ff00ff00ff00ff"))
+                    .and_then(|f| f.text(Key::TopicName, "QZP6TOPIC2"))
+                    .and_then(|f| f.text(Key::Since, "@QZP6SINCE2"))
+                    .expect("a topic mark's fields"),
+            ),
+            &["QZP6TOPIC2", "QZP6SINCE2"][..],
+        ),
+        (
+            mark(
+                Kind::Mail,
+                Fields::new()
+                    .word(Key::Dir, "out")
+                    .and_then(|f| f.u(Key::Inbox, 3))
+                    .and_then(|f| f.u(Key::Dl, 60_000))
+                    .and_then(|f| f.text(Key::Idem, "QZP6IDEM2"))
+                    .expect("a post's fields"),
+            ),
+            &[][..],
+        ),
+        (
+            mark(
+                Kind::Hold,
+                Fields::new()
+                    .word(Key::State, "on")
+                    .and_then(|f| f.word(Key::Origin, "local"))
+                    .and_then(|f| f.tok(Key::HoldOrigin, "fleet,local"))
+                    .and_then(|f| f.text(Key::Reason, "QZP6REASON2"))
+                    .expect("a hold's fields"),
+            ),
+            &["QZP6REASON2"][..],
+        ),
+        (
+            mark(
+                Kind::MailSeen,
+                Fields::new()
+                    .u(Key::Inbox, 2)
+                    .and_then(|f| f.u(Key::Off, 7))
+                    .and_then(|f| f.u(Key::Floor, 8))
+                    .and_then(|f| f.u(Key::Seen, 2))
+                    .and_then(|f| f.u(Key::Moved, 0))
+                    .expect("a seen's fields"),
+            ),
+            &[][..],
+        ),
+    ];
+    for (r, planted) in &marks {
+        let content = encode(r, Tier::Content).expect("fits");
+        assert_eq!(decode(&content), Ok(r.clone()), "{content}");
+        let host = encode(r, Tier::Host).expect("fits");
+        let wire = encode(r, Tier::Wire).expect("fits");
+        for (key, _, tier, _) in rows.iter().filter(|(k, ..)| r.f.get(*k).is_some()) {
+            let token = format!(" {}=", key.word());
+            assert_eq!(
+                host.contains(&token),
+                *tier <= Tier::Host,
+                "{key:?}: {host}"
+            );
+            assert_eq!(
+                wire.contains(&token),
+                *tier == Tier::Wire,
+                "{key:?}: {wire}"
+            );
+        }
+        for planted in *planted {
+            assert!(content.contains(planted), "{planted} at content: {content}");
+            assert!(!host.contains(planted), "{planted} below content: {host}");
+        }
+        let mut older = content.clone();
+        for (key, ..) in &rows {
+            older = older.replace(
+                &format!(" {}=", key.word()),
+                &format!(" zz_{}=", key.word()),
+            );
+        }
+        let read = decode(&older).expect("an older reader still reads it");
+        assert!(
+            rows.iter().all(|(key, ..)| read.f.get(*key).is_none()),
+            "every new key skipped: {older}"
+        );
+    }
+    let topic = encode(&marks[0].0, Tier::Wire).expect("fits");
+    assert!(topic.contains(" fp=00ff00ff00ff00ff "), "{topic}");
+    let post = encode(&marks[1].0, Tier::Wire).expect("fits");
+    assert!(
+        !post.contains("QZP6IDEM2"),
+        "a post's idem= is host: {post}"
+    );
+    let hold = encode(&marks[2].0, Tier::Wire).expect("fits");
+    assert!(hold.contains(" hold_origin=fleet,local "), "{hold}");
+}
+
+/// PHASE 6 (6F-7, plan item U4b): the session rows' keys are appended after
+/// 6F-6's, at their tiers — the resize ledger's verdict, a reset's source
+/// and the handback's groups, a keyed write's sequence and reply — with
+/// closed words for each list; a pgid is host and a reply content, so the
+/// planted reply is in no line below the content tier and the groups in no
+/// wire line. An older reader skips each new key. NEGATIVE CONTROL: a word
+/// outside a list is refused.
+#[test]
+fn phase_6_session_row_keys_are_appended_at_their_tiers() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    let rows: [(Key, &str, Tier, Cap); 14] = [
+        (Key::Net, "net", Tier::Wire, Cap::Word(NET_WORDS)),
+        (Key::AfterMs, "after_ms", Tier::Wire, Cap::U),
+        (Key::ResizeEpoch, "resize_epoch", Tier::Wire, Cap::U),
+        (Key::Pushed, "pushed", Tier::Wire, Cap::I),
+        (Key::Cut, "cut", Tier::Wire, Cap::U),
+        (Key::Drew, "drew", Tier::Wire, Cap::U),
+        (Key::Class, "class", Tier::Wire, Cap::Word(CLASS_WORDS)),
+        (
+            Key::HealedBy,
+            "healed_by",
+            Tier::Wire,
+            Cap::Word(HEALED_BY_WORDS),
+        ),
+        (Key::Source, "source", Tier::Wire, Cap::Word(SOURCE_WORDS)),
+        (Key::FromPg, "from_pg", Tier::Host, Cap::I),
+        (Key::ToPg, "to_pg", Tier::Host, Cap::I),
+        (Key::KeySeq, "key_seq", Tier::Wire, Cap::U),
+        (Key::Reply, "reply", Tier::Content, Cap::Text(64)),
+        (Key::Build, "build", Tier::Wire, Cap::U),
+    ];
+    let first = at(Key::Moved).map(|i| i + 1).expect("6F-6's last key");
+    // The last row is 6F-2's `build=`, which 6F-7 is the first to write.
+    for (i, (key, word, tier, cap)) in rows[..13].iter().enumerate() {
+        assert_eq!(at(*key), Some(first + i), "{key:?} in its place");
+        assert_eq!(
+            (key.word(), key.tier(), key.cap()),
+            (*word, *tier, *cap),
+            "{key:?}"
+        );
+    }
+    assert_eq!(
+        at(Key::HarnessAct),
+        Some(first + 13),
+        "the review's `harness_act=` follows"
+    );
+    assert_eq!(NET_WORDS, ["zero", "changed"]);
+    assert_eq!(CLASS_WORDS, ["agent", "learned", "unknown"]);
+    assert_eq!(HEALED_BY_WORDS, ["app", "undo", "nudge"]);
+    assert_eq!(SOURCE_WORDS, ["ctl", "menu"]);
+    for (key, word) in [
+        (Key::Net, "same"),
+        (Key::Class, "shell"),
+        (Key::HealedBy, "-"),
+        (Key::Source, "palette"),
+    ] {
+        assert!(Fields::new().word(key, word).is_err(), "{key:?} {word}");
+    }
+    let mark = |k: Kind, f: Fields| Rec {
+        seq: 51,
+        t: 9,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k,
+        src: Src::Aterm,
+        conf: Conf::Exact,
+        by: Actor::Nobody,
+        f,
+    };
+    let marks = [
+        mark(
+            Kind::Render,
+            Fields::new()
+                .word(Key::State, "desync-risk")
+                .and_then(|f| f.u(Key::ResizeEpoch, 4))
+                .and_then(|f| f.i(Key::Displaced, -2))
+                .and_then(|f| f.i(Key::Pushed, 1))
+                .and_then(|f| f.u(Key::Cut, 6))
+                .and_then(|f| f.u(Key::Drew, 1))
+                .and_then(|f| f.word(Key::Class, "learned"))
+                .and_then(|f| f.u(Key::At, 70))
+                .expect("an epoch's risk"),
+        ),
+        mark(
+            Kind::Render,
+            Fields::new()
+                .word(Key::State, "healed")
+                .and_then(|f| f.u(Key::Run, 2))
+                .and_then(|f| f.word(Key::Net, "changed"))
+                .and_then(|f| f.u(Key::AfterMs, 40))
+                .and_then(|f| f.word(Key::HealedBy, "undo"))
+                .expect("a healed verdict"),
+        ),
+        mark(
+            Kind::Modes,
+            Fields::new()
+                .u(Key::N, 2)
+                .and_then(|f| f.word(Key::Source, "menu"))
+                .and_then(|f| f.i(Key::FromPg, 300))
+                .and_then(|f| f.i(Key::ToPg, 301))
+                .and_then(|f| f.tok(Key::Reverted, "alt,kitty"))
+                .and_then(|f| f.u(Key::Bytes, 42))
+                .expect("a modes mark"),
+        ),
+        mark(
+            Kind::InDoubt,
+            Fields::new()
+                .word(Key::Verb, "send")
+                .and_then(|f| f.u(Key::Producer, 3))
+                .and_then(|f| f.u(Key::KeySeq, 9))
+                .and_then(|f| f.text(Key::Reply, "QZP6REPLY1"))
+                .expect("an in-doubt mark"),
+        ),
+        mark(
+            Kind::Handoff,
+            Fields::new()
+                .u(Key::Carried, 4)
+                .and_then(|f| f.u(Key::Build, 7))
+                .expect("a handoff mark"),
+        ),
+    ];
+    for r in &marks {
+        let content = encode(r, Tier::Content).expect("fits");
+        assert_eq!(decode(&content), Ok(r.clone()), "{content}");
+        let host = encode(r, Tier::Host).expect("fits");
+        let wire = encode(r, Tier::Wire).expect("fits");
+        for (key, _, tier, _) in rows.iter().filter(|(k, ..)| r.f.get(*k).is_some()) {
+            let token = format!(" {}=", key.word());
+            assert_eq!(
+                host.contains(&token),
+                *tier <= Tier::Host,
+                "{key:?}: {host}"
+            );
+            assert_eq!(
+                wire.contains(&token),
+                *tier == Tier::Wire,
+                "{key:?}: {wire}"
+            );
+        }
+        assert!(
+            !host.contains("QZP6REPLY1"),
+            "a reply below content: {host}"
+        );
+        let mut older = content.clone();
+        for (key, ..) in &rows[..13] {
+            older = older.replace(
+                &format!(" {}=", key.word()),
+                &format!(" zz_{}=", key.word()),
+            );
+        }
+        let read = decode(&older).expect("an older reader still reads it");
+        assert!(
+            rows[..13]
+                .iter()
+                .all(|(key, ..)| read.f.get(*key).is_none()),
+            "every new key skipped: {older}"
+        );
+    }
+    assert!(
+        encode(&marks[3], Tier::Content)
+            .expect("fits")
+            .split(' ')
+            .any(|t| t == "reply=QZP6REPLY1"),
+        "the reply at content"
+    );
+    let handoff = encode_bus(&marks[4], Tier::Wire, 3, Some(1)).expect("fits");
+    assert!(
+        handoff.split(' ').any(|t| t == "build=7"),
+        "a handoff's build is wire: {handoff}"
+    );
+}
+
+/// PHASE 6 (the review of 6F-7): `harness_act=` is appended after 6F-7's
+/// `reply=`, the last key, HOST as `holder=` is: a self-claim's act as its
+/// holder told it, an owner token whose `/` and `@` no wire id holds, so the
+/// `harness-act` row is its record whole, an act with no word too
+/// (`word=unknown`). It round-trips at the host tier and leaves no trace on
+/// the wire, and an older reader skips it. NEGATIVE CONTROL: the act is no
+/// `rule=` (a wire id refuses its `/`, and its `@`).
+#[test]
+fn phase_6_harness_act_is_appended_host_only() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    assert_eq!(at(Key::HarnessAct), at(Key::Reply).map(|i| i + 1));
+    assert_eq!(
+        FIELDS.len(),
+        at(Key::HarnessAct).map_or(0, |i| i + 1),
+        "the last key"
+    );
+    assert_eq!(
+        (
+            Key::HarnessAct.word(),
+            Key::HarnessAct.tier(),
+            Key::HarnessAct.cap()
+        ),
+        ("harness_act", Tier::Host, Cap::Text(64))
+    );
+    let act = "forever/land@v2";
+    let r = Rec {
+        seq: 52,
+        t: 9,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Act,
+        f: Fields::new()
+            .word(Key::Word, "unknown")
+            .and_then(|f| f.id(Key::Holder, "codex-alab@41"))
+            .and_then(|f| f.text(Key::HarnessAct, act))
+            .expect("an act mark's fields"),
+        src: Src::Mark,
+        conf: Conf::Claim,
+        by: Actor::Ctl,
+    };
+    let host = encode(&r, Tier::Host).expect("fits");
+    assert_eq!(
+        host,
+        "52 mark - act word=unknown holder=codex-alab@41 harness_act=forever/land@v2 by=ctl \
+         src=mark conf=claim t=9"
+    );
+    assert_eq!(decode(&host), Ok(r.clone()), "{host}");
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert!(
+        !wire.contains("harness_act=") && !wire.contains(act),
+        "{wire}"
+    );
+    let older = host.replace(" harness_act=", " zz_harness_act=");
+    let mut without = r.clone();
+    without.f.remove(Key::HarnessAct);
+    assert_eq!(decode(&older), Ok(without), "{older}");
+    assert!(
+        Fields::new().id(Key::Rule, act).is_err(),
+        "no rule holds it"
+    );
 }

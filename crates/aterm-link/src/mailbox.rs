@@ -9,7 +9,9 @@
 //! > round so a halt never queues behind a redelivery backlog
 //!
 //! One FIFO cannot express that, so each source has its own queue and one
-//! condvar wakes the loop, which takes strictly by priority. Nothing polls.
+//! condvar wakes the loop, which takes by priority — strictly, except that
+//! an inbox record waits behind at most [`EVENT_RUN_MAX`] of aterm's events in
+//! a row ([`Queues::take`]). Nothing polls.
 //! And "every scheduling round" includes the rounds INSIDE one item: a duty
 //! that walks the bus in many requests takes the urgent queues between them
 //! ([`Mailbox::take_urgent`]), so a halt waits one request, not one walk.
@@ -142,6 +144,46 @@ pub const QUEUE_ROWS_MAX: usize = 1024;
 /// cap alone is no memory bound: a thousand 16 MiB bodies is 16 GiB.
 pub const QUEUE_BYTES_MAX: usize = 8 * 1024 * 1024;
 
+/// The most of aterm's events the loop takes IN A ROW while an inbox record
+/// waits ([`Queues::take`], aterm-0): at this many, the inbox record is next.
+///
+/// EVENTS FIRST, BECAUSE A RUN OF THEM IS MOSTLY ONE DRAIN'S WORK. A `post`
+/// event is a drain of the outbox, and the first drain of a run lists and
+/// publishes every post queued by then, so the events behind it find little
+/// left: a run of events costs about one drain, and a delivery is one
+/// `deliver` round trip each, whenever it is taken. (Since aterm reads a
+/// record at once, a run's `post` events no longer arrive together, and a
+/// drain that answered all its peek saw forgets the ones queued before that
+/// peek: [`Mailbox::forget_queued_drains`]. The measurements below were taken
+/// while aterm still batched them.) Strict turns — an event, a record, an
+/// event — spread the drains between the deliveries, so each
+/// drain found a post or two and did its whole work again, and the broker
+/// saw the posts in smaller batches. Measured on the fabric bench's burst
+/// (500 posts from 5 senders; docs/measured/fabric, 2026-10-21, dev build,
+/// one quiet M5 Max): turns ran the strict arm at 272.6 and 272.9 messages a
+/// second (`-4`, `-6`), below all four of the baseline's runs beside them
+/// (286.4-311.2: `-2`, `-8`, `-10`, `-16`), in 413-414 broker batches
+/// against 364-394. With this bound, 278.9 and 290.6 (`-12`, `-14`; 400 and
+/// 393 batches), and on the reviewed loop 287.8 and 309.5 (`-21`, `-24`; 399
+/// and 368) against 295.8 and 297.4 (`-18`, `-27`; 383 and 382): two runs a
+/// build, not separable from the baseline — and not shown equal to it.
+///
+/// THE NUMBER IS NO MEASURED OPTIMUM. A bound of 16, tried the same morning
+/// in runs that are not in the ledger (284 a second, 397-401 batches), sits
+/// between the bound's own two runs on both measures, so nothing measured
+/// tells 16 from 64. It is 64 by the argument above: a run's events are
+/// mostly one drain's work, so a bound well past the few events a drain
+/// leaves behind no longer splits a drain from its batch, and a record still
+/// waits behind no more than that many events' local work.
+///
+/// AND A BOUND, BECAUSE NOTHING ELSE LIMITS A RUN: events come from every
+/// session aterm hosts, so a node of many busy sessions could otherwise keep
+/// a delivery behind its own outbound work for as long as they stay busy.
+/// Before aterm-0 that wait was also a broker flush per drain — the loop
+/// parked on every owed ack and commit (remaining-power's item 5); now it is
+/// the loop's own work, and this bounds how much of it one record waits out.
+pub const EVENT_RUN_MAX: u32 = 64;
+
 /// The bytes one queued record occupies, as the bound counts them.
 fn record_bytes(r: &Record) -> usize {
     r.1.len() + r.2.len()
@@ -186,7 +228,12 @@ impl Face {
 #[derive(Default)]
 struct Queues {
     fleet: Face,
-    events: VecDeque<String>,
+    /// aterm's events, each with the number of its push
+    /// ([`Queues::events_pushed`]).
+    events: VecDeque<(u64, String)>,
+    /// How many events have ever been pushed: the number the next one takes,
+    /// and so the [`EventMark`] of this moment.
+    events_pushed: u64,
     inbox: Face,
     say: Face,
     /// Closure notices, in arrival order: `Item::Closed` and `Item::Refused`
@@ -200,6 +247,29 @@ struct Queues {
     /// aterm closed the lanes would sit behind `Closed(Aterm)` and be lost
     /// with the loop. The latch is what the closure arm reads instead.
     bye: Option<aterm_types::fabric_grammar::Bye>,
+    /// How many of aterm's events the loop has taken in a row while an inbox
+    /// record waited: at [`EVENT_RUN_MAX`] the inbox record is taken next, and
+    /// its take starts the count again ([`Queues::take`]).
+    events_run: u32,
+    /// The bound's NEGATIVE CONTROL: every event ahead of every inbox record,
+    /// however many, the order before the bound. Only this module's own tests
+    /// set it.
+    #[cfg(test)]
+    events_first: bool,
+}
+
+/// Where aterm's event queue stood at one moment ([`Mailbox::event_mark`]):
+/// every event pushed before that moment is below it, and every event pushed
+/// after it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EventMark(u64);
+
+/// Whether `line` is `EVENT <local> post …` or `EVENT <local> fetch …`: an
+/// event whose whole handling is an outbox drain
+/// ([`Mailbox::forget_queued_drains`]).
+fn is_drain_event(line: &str) -> bool {
+    let mut toks = line.split_whitespace();
+    toks.next() == Some("EVENT") && matches!(toks.nth(1), Some("post" | "fetch"))
 }
 
 /// Whether one source is over a bound AND non-empty: an empty queue must accept
@@ -238,10 +308,20 @@ impl Queues {
 
     /// The priority, in one place: a closure notice (the reconnect it starts
     /// clears and re-reads everything queued behind it), the fleet halt, a
-    /// paused face's resume, aterm's events, the inbox group, then broadcast.
+    /// paused face's resume, aterm's events — but never more than
+    /// [`EVENT_RUN_MAX`] of them in a row while an inbox record waits — the
+    /// inbox group, then broadcast.
     ///
     /// A resume is taken ahead of the records because it is half a queue
     /// early: the subscription reopens while the loop works the other half.
+    ///
+    /// EVENTS FIRST, AND A BOUND ON THEM ([`EVENT_RUN_MAX`]): see its note for
+    /// why an inbox record waits behind a run of events, why the run is
+    /// bounded, and what strict turns cost. Neither order is a safety rule
+    /// (§11.2's is the fleet face's, above): the two are separate sources with
+    /// no order between them, and a record for a session whose
+    /// `session-created` is still queued admits it first
+    /// (`Bridge::on_inbox_record`).
     ///
     /// Say is last because nobody on this node chose its volume: any
     /// co-permitted peer may shout as often as it likes, and each record costs
@@ -259,10 +339,21 @@ impl Queues {
         if let Some((s, from)) = self.resume.pop_front() {
             return Some((Item::Resume(s, from), false));
         }
-        if let Some(e) = self.events.pop_front() {
-            return Some((Item::Event(e), over_bound(self.events.len() + 1, 0)));
+        let waiting = !self.inbox.records.is_empty();
+        #[cfg(test)]
+        let inbox_due = waiting && !self.events_first && self.events_run >= EVENT_RUN_MAX;
+        #[cfg(not(test))]
+        let inbox_due = waiting && self.events_run >= EVENT_RUN_MAX;
+        if !inbox_due {
+            if let Some((_, e)) = self.events.pop_front() {
+                if waiting {
+                    self.events_run += 1;
+                }
+                return Some((Item::Event(e), over_bound(self.events.len() + 1, 0)));
+            }
         }
         if let Some(r) = self.take_record(Source::Inbox) {
+            self.events_run = 0;
             return Some((Item::Inbox(r), false));
         }
         self.take_record(Source::Say).map(|r| (Item::Say(r), false))
@@ -303,11 +394,19 @@ impl Queues {
     /// Forget everything one broker source has queued — its records, its
     /// pause, its resume, its closure notices — and move its generation:
     /// [`Mailbox::reset_source`]. A no-op for aterm's lane.
+    ///
+    /// The inbox's reset ends the run of events counted for the record it
+    /// forgets ([`Queues::events_run`]), as that record's take would have: the
+    /// count is of events taken while a record WAITS, and a record queued
+    /// after the reset has waited behind none of them.
     fn reset(&mut self, s: Source) {
         let Some(face) = self.face(s) else {
             return;
         };
         face.reset();
+        if s == Source::Inbox {
+            self.events_run = 0;
+        }
         self.resume.retain(|(face, _)| *face != s);
         self.closed.retain(|item| match item {
             Item::Closed(face) | Item::Refused(face, _) => *face != s,
@@ -404,6 +503,56 @@ impl Mailbox {
         self.lock().face(s).and_then(|face| face.paused)
     }
 
+    /// This moment in aterm's event queue: the events pushed so far are below
+    /// it, every later one is not ([`Mailbox::forget_queued_drains`]).
+    pub fn event_mark(&self) -> EventMark {
+        EventMark(self.lock().events_pushed)
+    }
+
+    /// Forget every queued `post` and `fetch` event, of any session, that was
+    /// pushed before `mark`, and leave every other event in place and in
+    /// order. Returns how many it forgot.
+    ///
+    /// The bridge calls it once an outbox drain ([`crate::bridge`]'s
+    /// `drain_outbox`) has answered all its peek listed, with the mark it took
+    /// just before that peek: those events asked for the drain that just ran.
+    ///
+    /// A DRAIN EVENT IS A LEVEL, NOT A MESSAGE. It says "the outbox has work"
+    /// and carries none of it: the drain peeks the whole outbox, and aterm
+    /// queues a post's row (or a fetch's slot) BEFORE it records the event
+    /// that rings this lane (`aterm-gui-fabric`'s `cmd_post` and its fetch,
+    /// under the guard that admits the row). So every drain event below a
+    /// peek's mark names work that peek saw, and one pushed after the mark
+    /// stays for a drain of its own. Taken one by one, a run of them is a
+    /// drain each: each waits for the posts the one before it published to be
+    /// answered, and peeks an outbox that one already emptied, while the
+    /// inbox records behind them wait ([`EVENT_RUN_MAX`]). aterm used to batch
+    /// them on its side, reading a session's events at most once per 16 ms;
+    /// it reads a record at once now (`aterm-gui`'s `subscribe.rs`,
+    /// `EVENTS_PACE`), so they arrive one at a time and are batched here, by
+    /// how many came while the loop was busy: none in a trickle, the run in a
+    /// burst.
+    ///
+    /// ONLY A DRAIN THAT ANSWERED ALL ITS PEEK SAW MAY CALL IT. A peek can
+    /// stop short of the outbox (aterm lists at most its drain budget, 4 MiB,
+    /// and says `more`), and a drain can leave what it listed queued (a
+    /// sender held by a refusal, a link lost, a roster it could not read).
+    /// The events it would forget are then what runs the next drain at once;
+    /// forgotten, the work would wait for a new event or the two-second
+    /// roster backstop.
+    pub fn forget_queued_drains(&self, mark: EventMark) -> usize {
+        let mut q = self.lock();
+        let before = q.events.len();
+        q.events
+            .retain(|(pushed, line)| *pushed >= mark.0 || !is_drain_event(line));
+        let forgot = before - q.events.len();
+        drop(q);
+        if forgot > 0 {
+            self.drained.notify_all();
+        }
+        forgot
+    }
+
     /// Push one aterm `EVENT` line, WAITING while the event queue is over its
     /// row bound (lines are small and coalesced, so only rows count).
     pub fn push_event(&self, line: String) {
@@ -411,7 +560,9 @@ impl Mailbox {
         while over_bound(q.events.len(), 0) {
             q = self.wait_for_room(q);
         }
-        q.events.push_back(line);
+        let pushed = q.events_pushed;
+        q.events_pushed = pushed.saturating_add(1);
+        q.events.push_back((pushed, line));
         drop(q);
         self.ready.notify_all();
     }
@@ -598,6 +749,188 @@ mod tests {
         }
         // Pushed out of order so the order below is priority, not arrival.
         assert_eq!(seen, ["closed", "fleet", "resume", "event", "inbox", "say"]);
+    }
+
+    /// **AN INBOX RECORD WAITS BEHIND AT MOST [`EVENT_RUN_MAX`] EVENTS IN A
+    /// ROW.** Three inbox records wait while twice the bound and five more
+    /// events are queued: the loop takes a whole run of events, then a record,
+    /// another run, a record, the last five, then the last record — events
+    /// first, as a run of them is mostly one drain's work, and never more than
+    /// the bound while a record waits. A halt queued mid-run is still taken
+    /// next. And a run with no record waiting is no run: the count starts only
+    /// once a record waits.
+    ///
+    /// NEGATIVE CONTROL: with the bound taken away (`events_first`), every
+    /// record waits behind every event.
+    #[test]
+    fn an_inbox_record_waits_behind_at_most_a_bounded_run_of_events() {
+        let k = usize::try_from(EVENT_RUN_MAX).expect("a small bound");
+        let order = |events_first: bool| {
+            let mb = Mailbox::default();
+            mb.lock().events_first = events_first;
+            for i in 0..3 {
+                assert_eq!(mb.push(Source::Inbox, rec(10 + i), 0), Pushed::Queued);
+            }
+            for i in 0..2 * k + 5 {
+                mb.push_event(format!("EVENT 1 post {i}"));
+            }
+            let mut seen = Vec::new();
+            while let Some(item) = mb.take(Duration::ZERO) {
+                seen.push(match item {
+                    Item::Event(_) => "event".to_string(),
+                    Item::Inbox((off, _, _)) => format!("inbox {off}"),
+                    Item::Fleet((off, _, _)) => format!("fleet {off}"),
+                    other => panic!("{other:?}"),
+                });
+                // A halt that arrives mid-run is taken next.
+                if seen.len() == 3 {
+                    assert_eq!(mb.push(Source::Fleet, rec(1), 0), Pushed::Queued);
+                }
+            }
+            seen
+        };
+        let mut want: Vec<String> = Vec::new();
+        let events = |n: usize| std::iter::repeat_n("event".to_string(), n);
+        want.extend(events(3));
+        want.push("fleet 1".to_string());
+        want.extend(events(k - 3));
+        want.push("inbox 10".to_string());
+        want.extend(events(k));
+        want.push("inbox 11".to_string());
+        want.extend(events(5));
+        want.push("inbox 12".to_string());
+        assert_eq!(order(false), want, "a run of {k}, a record, and so on");
+
+        let mut control: Vec<String> = Vec::new();
+        control.extend(events(3));
+        control.push("fleet 1".to_string());
+        control.extend(events(2 * k + 5 - 3));
+        control.extend(["inbox 10", "inbox 11", "inbox 12"].map(String::from));
+        assert_eq!(
+            order(true),
+            control,
+            "NEGATIVE CONTROL: unbounded, every record waits behind every event"
+        );
+
+        // NO RECORD WAITING, NO RUN: events taken alone count nothing, so a
+        // record that arrives after them waits behind a whole run of its own.
+        let mb = Mailbox::default();
+        for i in 0..k {
+            mb.push_event(format!("EVENT 1 post {i}"));
+        }
+        for _ in 0..k {
+            assert!(matches!(mb.take(Duration::ZERO), Some(Item::Event(_))));
+        }
+        assert_eq!(mb.push(Source::Inbox, rec(20), 0), Pushed::Queued);
+        for i in 0..=k {
+            mb.push_event(format!("EVENT 1 post {i}"));
+        }
+        for _ in 0..k {
+            assert!(matches!(mb.take(Duration::ZERO), Some(Item::Event(_))));
+        }
+        assert!(
+            matches!(mb.take(Duration::ZERO), Some(Item::Inbox((20, _, _)))),
+            "the record is next once its own run is spent"
+        );
+        assert!(matches!(mb.take(Duration::ZERO), Some(Item::Event(_))));
+    }
+
+    /// **THE DRAIN EVENTS QUEUED BEFORE THE MARK ARE FORGOTTEN, AND NOTHING
+    /// ELSE.** Behind a taken `post` event, the `post` and `fetch` events of
+    /// every session pushed before the mark go, and every other line stays,
+    /// in its order: an `inbox`, an `inbox-seen`, a `GAP`, and a `topic` row
+    /// whose payload says `post`. A drain event pushed after the mark (while
+    /// the drain ran, after its peek) stays, for a drain of its own, and so
+    /// does one pushed after the forget.
+    #[test]
+    fn the_drain_events_queued_before_the_mark_are_forgotten_and_nothing_else() {
+        let mb = Mailbox::default();
+        for line in [
+            "EVENT 1 post 1 to=@s-r kind=note",
+            "EVENT 2 inbox 7 from=s-a kind=note off=40",
+            "EVENT 1 post 2 to=@s-r kind=note",
+            "EVENT 3 fetch off=9",
+            "EVENT 2 inbox-seen 7 off=40 floor=- seen=7",
+            "GAP 2 events-dropped=1",
+            "EVENT 4 topic add post since=head",
+        ] {
+            mb.push_event(line.to_string());
+        }
+        assert!(matches!(
+            mb.take(Duration::ZERO),
+            Some(Item::Event(line)) if line.starts_with("EVENT 1 post 1 ")
+        ));
+        let mark = mb.event_mark();
+        mb.push_event("EVENT 1 post 3 to=@s-r kind=note".to_string());
+        assert_eq!(mb.forget_queued_drains(mark), 2, "post 2 and the fetch");
+        mb.push_event("EVENT 1 post 4 to=@s-r kind=note".to_string());
+        let mut left = Vec::new();
+        while let Some(Item::Event(line)) = mb.take(Duration::ZERO) {
+            left.push(line);
+        }
+        assert_eq!(
+            left,
+            [
+                "EVENT 2 inbox 7 from=s-a kind=note off=40",
+                "EVENT 2 inbox-seen 7 off=40 floor=- seen=7",
+                "GAP 2 events-dropped=1",
+                "EVENT 4 topic add post since=head",
+                "EVENT 1 post 3 to=@s-r kind=note",
+                "EVENT 1 post 4 to=@s-r kind=note",
+            ]
+        );
+        assert_eq!(
+            mb.forget_queued_drains(mark),
+            0,
+            "nothing left below the mark"
+        );
+    }
+
+    /// **A RUN ENDS WITH THE RECORD IT WAS COUNTED FOR, HOWEVER THAT RECORD
+    /// LEAVES.** A record waits while a whole run of events is taken, and the
+    /// reconnect's reset forgets the record ([`Mailbox::reset_broker_sources`])
+    /// — or the loop's own close of the face does ([`Mailbox::reset_source`]).
+    /// A fresh record queued after it has waited behind no event, so the event
+    /// queued beside it is taken first: the count starts only while a record
+    /// waits. CONTROL: a record that is not forgotten is next once its run is
+    /// spent.
+    #[test]
+    fn a_reset_of_the_inbox_ends_the_run_it_was_counted_for() {
+        let k = usize::try_from(EVENT_RUN_MAX).expect("a small bound");
+        let first_after = |reset: fn(&Mailbox)| {
+            let mb = Mailbox::default();
+            assert_eq!(mb.push(Source::Inbox, rec(10), 0), Pushed::Queued);
+            for i in 0..k {
+                mb.push_event(format!("EVENT 1 post {i}"));
+            }
+            for _ in 0..k {
+                assert!(matches!(mb.take(Duration::ZERO), Some(Item::Event(_))));
+            }
+            reset(&mb);
+            let g = mb.broker_generation(Source::Inbox);
+            mb.push_event("EVENT 1 post fresh".to_string());
+            assert_eq!(mb.push(Source::Inbox, rec(20), g), Pushed::Queued);
+            match mb.take(Duration::ZERO) {
+                Some(Item::Event(_)) => "event".to_string(),
+                Some(Item::Inbox((off, _, _))) => format!("inbox {off}"),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            first_after(Mailbox::reset_broker_sources),
+            "event",
+            "the reconnect's reset ended the run"
+        );
+        assert_eq!(
+            first_after(|mb| mb.reset_source(Source::Inbox)),
+            "event",
+            "the face's own close ended the run"
+        );
+        assert_eq!(
+            first_after(|mb| mb.reset_source(Source::Say)),
+            "inbox 10",
+            "CONTROL: another face's reset leaves the waiting record and its run"
+        );
     }
 
     /// BETWEEN THE REQUESTS OF A DUTY, only the urgent queues are taken: every

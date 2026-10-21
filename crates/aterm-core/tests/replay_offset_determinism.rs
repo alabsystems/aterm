@@ -15,11 +15,9 @@ use aterm_core::terminal::{ClockReading, Terminal};
 const ROWS: u16 = 12;
 const COLS: u16 = 40;
 
-/// A recorded output-byte log: the ordered records a PTY emitted. Deliberately
-/// exercises the determinism hazards (SGR, cursor moves, scroll region, wide
-/// CJK, a combining mark, alt-screen round-trip, autowrap toggle, OSC title,
-/// tab stops). The concatenation ends at parser-ground (required by
-/// `checkpoint()`); individual record boundaries may fall mid-sequence.
+/// A recorded output-byte log covering the determinism hazards (SGR, cursor moves, scroll
+/// region, wide CJK, a combining mark, alt-screen round-trip, autowrap toggle, OSC title, tab
+/// stops). The concatenation ends at parser ground, as `checkpoint()` requires.
 const SESSION: &[&[u8]] = &[
     b"\x1b[1;38;5;202mboot\x1b[0m\r\n",
     b"plain line one\r\nplain line two\r\n",
@@ -36,16 +34,15 @@ const SESSION: &[&[u8]] = &[
     b"\x1b[10;1Hlast",
 ];
 
-/// A single fixed clock reading reused for every batch, so any time-dependent
-/// path (bell rate-limit, mode-2026 timeout) observes a zero delta and the fold
-/// is bit-deterministic — for both the live and the replay timelines.
+/// One clock reading reused for every batch, so time-dependent paths (bell rate limit,
+/// mode-2026 timeout) see a zero delta.
 #[expect(
     clippy::disallowed_methods,
     reason = "test code: the one instant a test mints and feeds in"
 )]
 fn fixed_clock() -> ClockReading {
     ClockReading {
-        monotonic: std::time::Instant::now(), // captured once; reused for all batches so deltas are zero (determinism)
+        monotonic: std::time::Instant::now(),
         wall_ms: Some(0),
     }
 }
@@ -63,9 +60,8 @@ fn feed(term: &mut Terminal, chunks: &[&[u8]], clock: ClockReading) {
 
 #[test]
 fn from_checkpoint_hydration_continues_the_mirror() {
-    // A lash viewer that reattaches mid-stream: snapshot the host at an offset,
-    // hydrate a fresh engine from it, then feed the remaining records. It must
-    // land where the live host did — reattach is snapshot + tail.
+    // A viewer reattaching mid-stream (snapshot at an offset, hydrate, feed the tail) lands
+    // where the live host did.
     let clock = fixed_clock();
     const AT: usize = 8; // reattach after the alt-screen enter
 

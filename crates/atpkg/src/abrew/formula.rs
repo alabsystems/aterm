@@ -7,6 +7,8 @@ use std::cmp::Ordering;
 
 use aterm_json::Value;
 
+use super::machine::Machine;
+
 /// A formula as abrew needs it. Parsed from the API object; fields
 /// abrew does not use are dropped on purpose.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -20,11 +22,13 @@ pub struct Formula {
     pub revision: u64,
     pub stable_url: String,
     pub stable_sha256: String,
-    /// Bottle files: (tag, url, sha256), e.g. tag `arm64_tahoe`.
-    pub bottle_files: Vec<(String, String, String)>,
-    /// Tags whose API metadata needs no binary relocation, conditional platform
-    /// resolution or post-install recipe. Others use the announced brew fallback.
-    pub native_bottle_tags: Vec<String>,
+    /// Bottle files by tag (`arm64_tahoe`, `all`), sorted.
+    pub bottle_files: Vec<Bottle>,
+    /// Why no bottle of this formula pours natively whatever its cellar: a
+    /// post-install recipe, a pour condition, requirements or conflicts abrew
+    /// cannot evaluate, a variation it cannot resolve. Such a pour, like a
+    /// relocating bottle's, uses the announced brew fallback.
+    pub pour_needs: Option<String>,
     /// `conflicts_with` names, evaluated against abrew's census at install.
     pub conflicts: Vec<String>,
     /// Requirements in the plain data forms abrew evaluates at install.
@@ -41,6 +45,17 @@ pub struct Formula {
     pub caveats: String,
     pub aliases: Vec<String>,
     pub oldnames: Vec<String>,
+}
+
+/// One bottle file of a formula's stable version.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Bottle {
+    pub tag: String,
+    pub url: String,
+    pub sha256: String,
+    /// Where the bottle was built to live: only `:any_skip_relocation`
+    /// needs no binary relocation.
+    pub cellar: String,
 }
 
 fn s(v: Option<&Value>) -> String {
@@ -199,21 +214,6 @@ fn parse_formula_variations(v: Option<&Value>) -> Vec<(String, FormulaVariation)
     out
 }
 
-/// The macOS release name for a major version, newest first elsewhere.
-fn macos_release(major: u64) -> Option<&'static str> {
-    Some(match major {
-        27 => "golden_gate",
-        26 => "tahoe",
-        15 => "sequoia",
-        14 => "sonoma",
-        13 => "ventura",
-        12 => "monterey",
-        11 => "big_sur",
-        10 => "catalina",
-        _ => return None,
-    })
-}
-
 /// A formula requirement in a form abrew can evaluate from data alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Requirement {
@@ -291,31 +291,43 @@ impl Formula {
         let versions = v.get("versions");
         let stable = v.pointer("/urls/stable");
         let mut bottle_files = Vec::new();
-        let mut native_bottle_tags = Vec::new();
         let pour = v.get("pour_bottle_only_if").and_then(Value::as_str);
         let pour_requires_clt = pour == Some("clt_installed");
         let requirements = parse_requirements(v.get("requirements"));
         let parsed_conflicts = plain_names(v.get("conflicts_with"));
         let conflicts_plain = parsed_conflicts.is_some();
         let conflicts = parsed_conflicts.unwrap_or_default();
-        let no_conditions = matches!(
+        let pour_needs = if !matches!(
             v.get("post_install_defined"),
             None | Some(Value::Bool(false))
-        ) && (matches!(v.get("pour_bottle_only_if"), None | Some(Value::Null))
+        ) {
+            Some("a post_install recipe".to_string())
+        } else if !(matches!(v.get("pour_bottle_only_if"), None | Some(Value::Null))
             || pour_requires_clt)
-            && empty_metadata(v.get("post_install_steps"))
-            && requirements.is_ok()
-            && conflicts_plain;
+        {
+            Some(match pour {
+                Some(condition) => format!("pour_bottle_only_if :{condition}"),
+                None => "a pour condition abrew cannot read".to_string(),
+            })
+        } else if !empty_metadata(v.get("post_install_steps")) {
+            Some("post-install steps".to_string())
+        } else if requirements.is_err() {
+            Some("requirements abrew cannot evaluate".to_string())
+        } else if !conflicts_plain {
+            Some("conflicts abrew cannot evaluate".to_string())
+        } else {
+            None
+        };
         if let Some(files) = v.pointer("/bottle/stable/files")
             && let Value::Object(map) = files
         {
             for (tag, f) in map {
-                bottle_files.push((tag.clone(), s(f.get("url")), s(f.get("sha256"))));
-                if no_conditions
-                    && f.get("cellar").and_then(Value::as_str) == Some(":any_skip_relocation")
-                {
-                    native_bottle_tags.push(tag.clone());
-                }
+                bottle_files.push(Bottle {
+                    tag: tag.clone(),
+                    url: s(f.get("url")),
+                    sha256: s(f.get("sha256")),
+                    cellar: s(f.get("cellar")),
+                });
             }
         }
         bottle_files.sort();
@@ -333,7 +345,7 @@ impl Formula {
             stable_url: s(stable.and_then(|x| x.get("url"))),
             stable_sha256: s(stable.and_then(|x| x.get("checksum"))),
             bottle_files,
-            native_bottle_tags,
+            pour_needs,
             conflicts,
             requirements: requirements.unwrap_or_default(),
             pour_requires_clt,
@@ -355,22 +367,36 @@ impl Formula {
     /// The bottle file for this machine, best tag first (design §3):
     /// the first compatible OS tag supplied by the caller, then `all`.
     #[must_use]
-    pub fn bottle_for(&self, tags: &[String]) -> Option<&(String, String, String)> {
-        for want in tags {
-            if let Some(f) = self.bottle_files.iter().find(|(t, _, _)| t == want) {
-                return Some(f);
-            }
-        }
-        self.bottle_files.iter().find(|(t, _, _)| t == "all")
+    pub fn bottle_for(&self, tags: &[String]) -> Option<&Bottle> {
+        tags.iter()
+            .map(String::as_str)
+            .chain(["all"])
+            .find_map(|want| self.bottle_files.iter().find(|b| b.tag == want))
     }
 
-    /// Apply the variation for this machine, mirroring cask selection:
+    /// The bottle for `tags` that pours natively, or why the pour needs
+    /// Homebrew's recipe: no bottle for this machine, what the formula as a
+    /// whole needs ([`Formula::pour_needs`]), or a bottle that relocates.
+    pub fn native_bottle(&self, tags: &[String]) -> Result<&Bottle, String> {
+        let bottle = self
+            .bottle_for(tags)
+            .ok_or_else(|| "no bottle for this machine".to_string())?;
+        if let Some(needs) = &self.pour_needs {
+            return Err(needs.clone());
+        }
+        if bottle.cellar != ":any_skip_relocation" {
+            return Err(format!("its bottle relocates: cellar {}", bottle.cellar));
+        }
+        Ok(bottle)
+    }
+
+    /// Apply the variation for `machine`, mirroring cask selection:
     /// the API's top-level fields are the default arm64-mac system, so
     /// only an exact-system deviation applies (`arm64_<release>`, Intel
     /// `x86_64_<release>`/bare `<release>`, `<arch>_linux`). An
-    /// applicable-but-unsupported entry clears the native bottle tags
-    /// (delegate), as does an unprobable system with variations present.
-    pub(super) fn resolve_variations(&mut self) -> bool {
+    /// applicable-but-unsupported entry makes every pour need Homebrew
+    /// (delegate), as does an unnameable system with variations present.
+    pub(super) fn resolve_variations(&mut self, machine: &Machine) -> bool {
         if self.variations.is_empty() {
             return true;
         }
@@ -381,28 +407,9 @@ impl Formula {
         {
             return self.resolve_variations_for_keys(&[]);
         }
-        let arch = match std::env::consts::ARCH {
-            "aarch64" => "arm64",
-            other => other,
-        };
-        let keys: Vec<String> = if cfg!(target_os = "linux") {
-            vec![format!("{arch}_linux")]
-        } else if cfg!(target_os = "macos") {
-            let release = macos_version()
-                .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u64>().ok()))
-                .and_then(macos_release);
-            let Some(release) = release else {
-                self.native_bottle_tags.clear();
-                self.variations.clear();
-                return false;
-            };
-            if arch == "arm64" {
-                vec![format!("arm64_{release}")]
-            } else {
-                vec![format!("{arch}_{release}"), release.to_string()]
-            }
-        } else {
-            self.native_bottle_tags.clear();
+        let Some(keys) = machine.variation_keys() else {
+            self.pour_needs
+                .get_or_insert_with(|| "variations for a system abrew cannot name".to_string());
             self.variations.clear();
             return false;
         };
@@ -417,7 +424,8 @@ impl Formula {
             .iter()
             .any(|(key, entry)| key.is_empty() && entry.unsupported)
         {
-            self.native_bottle_tags.clear();
+            self.pour_needs
+                .get_or_insert_with(|| "variations abrew cannot read".to_string());
             self.variations.clear();
             return false;
         }
@@ -432,7 +440,8 @@ impl Formula {
             return true;
         };
         if variation.unsupported || variation.requirements_unsupported {
-            self.native_bottle_tags.clear();
+            self.pour_needs
+                .get_or_insert_with(|| "a variation abrew cannot resolve".to_string());
             return false;
         }
         if let Some(deps) = variation.dependencies {
@@ -469,8 +478,9 @@ pub struct Cask {
     pub sha256: Option<String>,
     pub artifacts: Vec<Artifact>,
     pub auto_updates: bool,
-    /// A top-level constraint the native resolver cannot evaluate.
-    pub unsupported_constraints: bool,
+    /// The first top-level constraint the native resolver cannot evaluate
+    /// (`container`, `depends_on`, `variations`, `conflicts_with`).
+    pub unsupported_constraints: Option<&'static str>,
     /// The `depends_on macos: ">= X"` floor, when the API states one in
     /// plain numeric form. Evaluated against the running OS at install.
     pub macos_min: Option<String>,
@@ -926,24 +936,8 @@ fn parse_variations(v: Option<&Value>) -> Option<Vec<(String, Variation)>> {
     Some(out)
 }
 
-/// macOS release names from newest to oldest, for variation selection.
-pub const MACOS_RELEASES: [&str; 12] = [
-    "golden_gate",
-    "tahoe",
-    "sequoia",
-    "sonoma",
-    "ventura",
-    "monterey",
-    "big_sur",
-    "catalina",
-    "mojave",
-    "high_sierra",
-    "sierra",
-    "el_capitan",
-];
-
 impl Cask {
-    /// The variation Homebrew would pick for `major`/`arch`. The API's
+    /// The variation Homebrew would pick for `machine`. The API's
     /// top-level fields are generated for the default system (arm64,
     /// newest macOS), so they already ARE that system's variation:
     /// bare release keys hold the Intel deviations and `arm64_<release>`
@@ -951,27 +945,11 @@ impl Cask {
     /// for every differing system, so selection is exact-OS. None means the
     /// top-level fields stand.
     #[must_use]
-    pub fn variation_for(&self, major: u64, arch: &str) -> Option<&Variation> {
-        let release = match major {
-            27 => MACOS_RELEASES[0],
-            26 => MACOS_RELEASES[1],
-            15 => MACOS_RELEASES[2],
-            14 => MACOS_RELEASES[3],
-            13 => MACOS_RELEASES[4],
-            12 => MACOS_RELEASES[5],
-            11 => MACOS_RELEASES[6],
-            10 => MACOS_RELEASES[7],
-            _ => return None,
-        };
-        let keys: [Option<String>; 2] = if arch == "arm64" {
-            [Some(format!("arm64_{release}")), None]
-        } else {
-            [Some(format!("{arch}_{release}")), Some(release.to_string())]
-        };
-        keys.into_iter().flatten().find_map(|key| {
+    pub fn variation_for(&self, machine: &Machine) -> Option<&Variation> {
+        machine.variation_keys()?.iter().find_map(|key| {
             self.variations
                 .iter()
-                .find(|(k, _)| k == &key)
+                .find(|(k, _)| k == key)
                 .map(|(_, variation)| variation)
         })
     }
@@ -1004,9 +982,9 @@ impl Cask {
                 .map(str::to_owned),
             _ => None,
         };
-        let mut unsupported_constraints = false;
+        let mut unsupported_constraints = None;
         if !empty_metadata(v.get("container")) && !naked && nested.is_none() {
-            unsupported_constraints = true;
+            unsupported_constraints = unsupported_constraints.or(Some("container"));
             artifacts.push(Artifact::Other("unsupported container".to_string()));
         }
         // `depends_on`/`conflicts_with` are admitted only in the plain
@@ -1027,7 +1005,7 @@ impl Cask {
                     depends_cask = deps.cask;
                 }
                 None => {
-                    unsupported_constraints = true;
+                    unsupported_constraints = unsupported_constraints.or(Some("depends_on"));
                     artifacts.push(Artifact::Other("unsupported depends_on".to_string()));
                 }
             }
@@ -1037,7 +1015,7 @@ impl Cask {
             match parse_variations(v.get("variations")) {
                 Some(parsed) => variations = parsed,
                 None => {
-                    unsupported_constraints = true;
+                    unsupported_constraints = unsupported_constraints.or(Some("variations"));
                     artifacts.push(Artifact::Other("unsupported variations".to_string()));
                 }
             }
@@ -1047,7 +1025,7 @@ impl Cask {
             match parse_conflicts(v.get("conflicts_with")) {
                 Some(names) => conflicts = names,
                 None => {
-                    unsupported_constraints = true;
+                    unsupported_constraints = unsupported_constraints.or(Some("conflicts_with"));
                     artifacts.push(Artifact::Other("unsupported conflicts_with".to_string()));
                 }
             }
@@ -1094,101 +1072,6 @@ impl Cask {
             nested,
         })
     }
-}
-
-/// Compatible bottle tags for this machine. An unknown macOS version admits
-/// only the formula's `all` fallback; it never guesses a newer OS requirement.
-#[must_use]
-/// The running macOS version string (sw_vers), for requirement floors.
-pub(super) fn macos_version() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = super::fetch::run_capture("/usr/bin/sw_vers", &["-productVersion"]).ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let version = String::from_utf8(out.stdout).ok()?;
-        let version = version.trim().to_string();
-        (!version.is_empty()).then_some(version)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-/// The installed Xcode version (`xcodebuild -version`'s first
-/// line), for `depends_on xcode:` floors. None off macOS, with no
-/// developer directory selected, or on any probe failure — an
-/// unmet requirement then delegates like the macOS floors do.
-pub(super) fn xcode_version() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = super::fetch::run_capture("/usr/bin/xcodebuild", &["-version"]).ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let text = String::from_utf8(out.stdout).ok()?;
-        let version = text
-            .lines()
-            .next()?
-            .strip_prefix("Xcode ")?
-            .split_whitespace()
-            .next()?
-            .to_string();
-        numeric_macos_version(&version).then_some(version)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-pub fn bottle_tags() -> Vec<String> {
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x86_64",
-        _ => return Vec::new(),
-    };
-    if cfg!(target_os = "linux") {
-        return vec![format!("{arch}_linux")];
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let major = super::fetch::run_capture("/usr/bin/sw_vers", &["-productVersion"])
-            .ok()
-            .filter(|out| out.status.success())
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .and_then(|version| version.trim().split('.').next()?.parse().ok());
-        macos_bottle_tags(arch, major)
-    }
-    #[cfg(not(target_os = "macos"))]
-    Vec::new()
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_bottle_tags(arch: &str, major: Option<u32>) -> Vec<String> {
-    let Some(major) = major else {
-        return Vec::new();
-    };
-    let prefix = match arch {
-        "arm64" => "arm64_",
-        "x86_64" => "",
-        _ => return Vec::new(),
-    };
-    [
-        (27, "golden_gate"),
-        (26, "tahoe"),
-        (15, "sequoia"),
-        (14, "sonoma"),
-        (13, "ventura"),
-        (12, "monterey"),
-        (11, "big_sur"),
-    ]
-    .into_iter()
-    .filter(|(minimum, _)| *minimum <= major)
-    .map(|(_, release)| format!("{prefix}{release}"))
-    .collect()
 }
 
 /// Homebrew-shaped version comparison (design §6): dotted tokens,
@@ -1300,43 +1183,28 @@ mod tests {
 
     #[test]
     fn bottles_never_require_a_newer_os_or_another_architecture() {
-        let newer = ("arm64_tahoe".into(), "newer".into(), "hash".into());
-        let older = ("arm64_sonoma".into(), "older".into(), "hash".into());
-        let universal = ("all".into(), "universal".into(), "hash".into());
+        let bottle = |tag: &str, url: &str| Bottle {
+            tag: tag.into(),
+            url: url.into(),
+            ..Bottle::default()
+        };
         let mut formula = Formula {
-            bottle_files: vec![newer, older, universal],
+            bottle_files: vec![
+                bottle("arm64_tahoe", "newer"),
+                bottle("arm64_sonoma", "older"),
+                bottle("all", "universal"),
+            ],
             ..Formula::default()
         };
+        let tags = |macos: &str| Machine::mac("arm64", macos, None, false).bottle_tags();
+        assert_eq!(formula.bottle_for(&tags("14.6")).unwrap().url, "older");
+        assert_eq!(formula.bottle_for(&tags("26.0")).unwrap().url, "newer");
         assert_eq!(
-            formula
-                .bottle_for(&macos_bottle_tags("arm64", Some(14)))
-                .unwrap()
-                .1,
-            "older"
-        );
-        assert_eq!(
-            formula
-                .bottle_for(&macos_bottle_tags("arm64", Some(26)))
-                .unwrap()
-                .1,
-            "newer"
-        );
-        assert_eq!(
-            formula
-                .bottle_for(&macos_bottle_tags("arm64", None))
-                .unwrap()
-                .1,
+            formula.bottle_for(&tags("unknown")).unwrap().url,
             "universal"
         );
-        assert_eq!(macos_bottle_tags("x86_64", Some(14))[0], "sonoma");
-        assert!(macos_bottle_tags("arm64", Some(10)).is_empty());
-        assert!(macos_bottle_tags("unknown", Some(26)).is_empty());
         formula.bottle_files.pop();
-        assert!(
-            formula
-                .bottle_for(&macos_bottle_tags("arm64", None))
-                .is_none()
-        );
+        assert!(formula.bottle_for(&tags("unknown")).is_none());
     }
 
     #[test]
@@ -1353,21 +1221,37 @@ mod tests {
     #[test]
     fn native_bottles_require_complete_supported_api_metadata() {
         let mut value: Value = aterm_json::from_str(r#"{"name":"demo","bottle":{"stable":{"files":{"all":{"url":"https://example.invalid/demo.tar.gz","sha256":"hash","cellar":":any_skip_relocation"}}}}}"#).unwrap();
+        let native = |f: &Formula| f.native_bottle(&[]).map(|bottle| bottle.tag.clone());
         assert_eq!(
-            Formula::from_api(&value).unwrap().native_bottle_tags,
-            ["all"]
+            native(&Formula::from_api(&value).unwrap()).as_deref(),
+            Ok("all")
         );
-        for unsupported in [
-            r#"{"name":"demo","post_install_defined":true,"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
-            r#"{"name":"demo","requirements":[{"name":"linux"}],"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
-            r#"{"name":"demo","pour_bottle_only_if":"condition","bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+        for (unsupported, needs) in [
+            (
+                r#"{"name":"demo","post_install_defined":true,"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+                "a post_install recipe",
+            ),
+            (
+                r#"{"name":"demo","requirements":[{"name":"linux"}],"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+                "requirements abrew cannot evaluate",
+            ),
+            (
+                r#"{"name":"demo","pour_bottle_only_if":"condition","bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+                "pour_bottle_only_if :condition",
+            ),
+            (
+                r#"{"name":"demo","post_install_steps":[{"step":"x"}],"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+                "post-install steps",
+            ),
+            (
+                r#"{"name":"demo","bottle":{"stable":{"files":{"arm64_tahoe":{"cellar":":any_skip_relocation"}}}}}"#,
+                "no bottle for this machine",
+            ),
         ] {
             value = aterm_json::from_str(unsupported).unwrap();
-            assert!(
-                Formula::from_api(&value)
-                    .unwrap()
-                    .native_bottle_tags
-                    .is_empty()
+            assert_eq!(
+                native(&Formula::from_api(&value).unwrap()),
+                Err(needs.to_string())
             );
         }
         // Data-evaluable requirements and conflicts keep the native tag;
@@ -1377,7 +1261,7 @@ mod tests {
         )
         .unwrap();
         let f = Formula::from_api(&value).unwrap();
-        assert_eq!(f.native_bottle_tags, ["all"]);
+        assert_eq!(native(&f).as_deref(), Ok("all"));
         assert_eq!(f.conflicts, ["other"]);
         // The build/test-context xcode row drops; the runtime xcode
         // floor stays as data for the preflight probe.
@@ -1396,11 +1280,11 @@ mod tests {
         )
         .unwrap();
         let mut f = Formula::from_api(&value).unwrap();
-        assert_eq!(f.native_bottle_tags, ["all"]);
+        assert_eq!(native(&f).as_deref(), Ok("all"));
         let mut mac = f.clone();
         assert!(mac.resolve_variations_for_keys(&["arm64_tahoe".to_string()]));
         assert_eq!(mac.dependencies, ["base"]);
-        assert_eq!(mac.native_bottle_tags, ["all"]);
+        assert_eq!(native(&mac).as_deref(), Ok("all"));
         assert!(f.resolve_variations_for_keys(&["arm64_linux".to_string()]));
         assert_eq!(f.dependencies, ["linuxonly"]);
         // A non-string condition/conflict is unknown metadata, not no condition.
@@ -1412,12 +1296,7 @@ mod tests {
             let malformed: Value = aterm_json::from_str(&format!(
                 r#"{{"name":"demo",{field},"bottle":{{"stable":{{"files":{{"all":{{"cellar":":any_skip_relocation"}}}}}}}}}}"#
             )).unwrap();
-            assert!(
-                Formula::from_api(&malformed)
-                    .unwrap()
-                    .native_bottle_tags
-                    .is_empty()
-            );
+            assert!(native(&Formula::from_api(&malformed).unwrap()).is_err());
         }
         for variation in [r#"[42]"#, r#"{"arm64_tahoe":{"dependencies":[42]}}"#] {
             let malformed: Value = aterm_json::from_str(&format!(
@@ -1425,19 +1304,19 @@ mod tests {
             )).unwrap();
             let mut parsed = Formula::from_api(&malformed).unwrap();
             assert!(!parsed.resolve_variations_for_keys(&["arm64_tahoe".to_string()]));
-            assert!(parsed.native_bottle_tags.is_empty());
+            assert!(native(&parsed).is_err());
         }
         let malformed: Value = aterm_json::from_str(r#"{"name":"demo","versions":{"stable":"1"},"revision":0,"dependencies":[],"variations":[42]}"#).unwrap();
-        assert!(super::super::api::dependency_formula(&malformed, "demo").is_err());
+        assert!(
+            super::super::api::dependency_formula(&malformed, "demo", Machine::this()).is_err()
+        );
         let complete: Value = aterm_json::from_str(r#"{"name":"demo","versions":{"stable":"1"},"revision":0,"dependencies":[],"variations":{}}"#).unwrap();
-        assert!(super::super::api::dependency_formula(&complete, "demo").is_ok());
+        assert!(super::super::api::dependency_formula(&complete, "demo", Machine::this()).is_ok());
         for cellar in [":any", "/opt/homebrew/Cellar", ""] {
             value = aterm_json::from_str(&format!(r#"{{"name":"demo","bottle":{{"stable":{{"files":{{"all":{{"cellar":"{cellar}"}}}}}}}}}}"#)).unwrap();
-            assert!(
-                Formula::from_api(&value)
-                    .unwrap()
-                    .native_bottle_tags
-                    .is_empty()
+            assert_eq!(
+                native(&Formula::from_api(&value).unwrap()),
+                Err(format!("its bottle relocates: cellar {cellar}"))
             );
         }
     }
@@ -1518,20 +1397,29 @@ mod tests {
         assert_eq!(cask.variations.len(), 2);
         // Bare release keys are Intel deviations; arm64 keeps top-level
         // unless an arm64_<release> deviation applies.
-        assert!(cask.variation_for(26, "arm64").is_none());
+        assert!(
+            cask.variation_for(&Machine::mac("arm64", "26.0", None, false))
+                .is_none()
+        );
         assert_eq!(
-            cask.variation_for(26, "x86_64")
+            cask.variation_for(&Machine::mac("x86_64", "26.0", None, false))
                 .and_then(|v| v.url.as_deref()),
             Some("https://x/tahoe.zip")
         );
         // Exact-OS only: a newer OS with no entry keeps the top-level.
-        assert!(cask.variation_for(27, "arm64").is_none());
+        assert!(
+            cask.variation_for(&Machine::mac("arm64", "27.0", None, false))
+                .is_none()
+        );
         assert_eq!(
-            cask.variation_for(14, "arm64")
+            cask.variation_for(&Machine::mac("arm64", "14.0", None, false))
                 .and_then(|v| v.url.as_deref()),
             Some("https://x/sonoma.zip")
         );
-        assert!(cask.variation_for(13, "x86_64").is_none());
+        assert!(
+            cask.variation_for(&Machine::mac("x86_64", "13.0", None, false))
+                .is_none()
+        );
         // Real API artifacts carry a computed `target` (the rename) and
         // casks carry uninstall/zap stanzas; neither blocks parsing.
         let real: Value = aterm_json::from_str(&format!(
@@ -1614,12 +1502,21 @@ mod tests {
         // R5 keeps unsupported variation work local to the selected system.
         let per_system: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"no_check","artifacts":[{"app":["Demo.app"]}],"variations":{"arm64_tahoe":{"unknown_recipe":true}}}"#).unwrap();
         let per_system = Cask::from_api(&per_system).unwrap();
-        assert!(!per_system.unsupported_constraints);
-        assert!(per_system.variation_for(27, "arm64").is_none());
-        assert!(per_system.variation_for(26, "arm64").unwrap().unsupported);
+        assert_eq!(per_system.unsupported_constraints, None);
+        assert!(
+            per_system
+                .variation_for(&Machine::mac("arm64", "27.0", None, false))
+                .is_none()
+        );
+        assert!(
+            per_system
+                .variation_for(&Machine::mac("arm64", "26.0", None, false))
+                .unwrap()
+                .unsupported
+        );
         let naked: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"no_check","container":{"type":"naked"},"artifacts":[{"binary":["tool"]}]}"#).unwrap();
         let naked = Cask::from_api(&naked).unwrap();
-        assert!(naked.naked && !naked.unsupported_constraints);
+        assert!(naked.naked && naked.unsupported_constraints.is_none());
         assert_eq!(
             naked.artifacts,
             [Artifact::Binary("tool".to_string(), None)]
@@ -1630,7 +1527,7 @@ mod tests {
         ] {
             let rich: Value = aterm_json::from_str(&format!(r#"{{"token":"demo","sha256":"no_check","container":{container},"artifacts":[{{"binary":["tool"]}}]}}"#)).unwrap();
             let rich = Cask::from_api(&rich).unwrap();
-            assert!(!rich.naked && rich.unsupported_constraints);
+            assert!(!rich.naked && rich.unsupported_constraints == Some("container"));
             assert!(
                 rich.artifacts
                     .iter()
@@ -1654,6 +1551,9 @@ mod tests {
         let f = Formula::from_api(&v).unwrap();
         assert_eq!(f.version, "1.25.0");
         assert_eq!(f.dependencies, ["openssl@3"]);
-        assert_eq!(f.bottle_for(&["arm64_tahoe".to_string()]).unwrap().2, "def");
+        assert_eq!(
+            f.bottle_for(&["arm64_tahoe".to_string()]).unwrap().sha256,
+            "def"
+        );
     }
 }

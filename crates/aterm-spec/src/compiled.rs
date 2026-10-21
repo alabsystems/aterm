@@ -4,37 +4,27 @@
 
 //! A [`Model`] resolved once for the interpreter's state-space walks.
 //!
-//! [`Expr::eval`] reads every identifier out of a `BTreeMap<&str, i64>`
-//! environment, so each `Var` costs a string-keyed tree search, and every walk
-//! step builds that environment afresh and clones a whole map per successor.
-//! A walk evaluates the same few expressions millions of times over states that
-//! all bind the same variables, so the name resolution is loop-invariant: this
-//! module does it ONCE. A state becomes its values in sorted-name order (the
-//! order a `BTreeMap` state iterates, and the identity [`crate::interp`]'s
-//! `seen` sets already key on), a variable becomes its index into that slice, a
-//! constant becomes its value, and a `\A` index becomes a slot on a small local
-//! stack.
+//! [`Expr::eval`] looks every identifier up in a `BTreeMap<&str, i64>` environment rebuilt at
+//! each step, and a walk evaluates the same few expressions millions of times over states that
+//! bind the same variables, so this module resolves names once. A state becomes its values in
+//! sorted-name order (the order a `BTreeMap` state iterates, and the identity
+//! [`crate::interp`]'s `seen` sets key on), a variable its index into that slice, a constant its
+//! value, and a `\A` index a slot on a small local stack.
 //!
-//! THE SEMANTICS ARE [`Expr::eval`]'s AND [`Model::successors_in`]'s, case for
-//! case, so a walk over this form visits the same states in the same order and
-//! returns the same verdicts:
+//! The semantics are [`Expr::eval`]'s and [`Model::successors_in`]'s, case for case, so a walk
+//! visits the same states in the same order and returns the same verdicts:
 //!
-//! * Resolution follows the environment's layering: a `\A` index shadows a state
-//!   variable, which shadows a constant (`eval_env` puts the state on top of the
-//!   constants, and `Forall` inserts its index on top of both). With a constant
-//!   declared twice the last declaration wins, as a `collect` into a map does.
-//! * Evaluation order, short-circuiting and wrapping arithmetic are `eval`'s, and
-//!   every panic is LAZY, raised with `eval`'s message only when the expression
-//!   is actually evaluated: an unbound identifier, a type error, a
-//!   function-valued or set-valued expression in a scalar position.
-//! * Successors are built exactly as `successors_in` builds them: guard first,
-//!   every update evaluated against the pre-state in declaration order, then the
-//!   cartesian product with each nondeterministic `lo..hi` ascending.
+//! * A `\A` index shadows a state variable, which shadows a constant (the layering of
+//!   `eval_env` and `Forall`); a constant declared twice takes its last declaration.
+//! * Evaluation order, short-circuiting and wrapping arithmetic are `eval`'s, and each panic
+//!   (unbound identifier, type error, function- or set-valued expression in a scalar position)
+//!   is raised lazily, with `eval`'s message, only when the expression is evaluated.
+//! * Successors: guard first, every update evaluated against the pre-state in declaration
+//!   order, then the cartesian product with each nondeterministic `lo..hi` ascending.
 //!
-//! A model this form cannot represent identically — an update to a name that
-//! is not one of its initial state's variables, which grows a `BTreeMap` state
-//! by a key — is not compiled ([`Compiled::new`] returns `None`), and the
-//! caller walks it the original way.
+//! A model with an update to a name its initial state does not bind (which grows a `BTreeMap`
+//! state by a key) is not compiled ([`Compiled::new`] returns `None`); the caller walks it the
+//! original way.
 
 use std::collections::BTreeMap;
 
@@ -138,9 +128,8 @@ impl Arith {
 }
 
 impl Node {
-    // Skip: a recursive evaluator over a boxed tree whose panics are `eval`'s
-    // audited fail-closed contracts, reproduced message for message.
-    // Spec-model machinery, same tier as `bmc`.
+    // Skip: a recursive evaluator over a boxed tree whose panics are `eval`'s, message for
+    // message.
     #[cfg_attr(trust_verify, trust::skip)]
     fn eval(&self, s: &[i64], locals: &mut Vec<i64>) -> Value {
         match self {
@@ -243,7 +232,6 @@ struct Scope<'a> {
 
 impl Scope<'_> {
     // Skip: recursive tree construction (Box allocation, map lookups).
-    // Spec-model machinery, same tier as `to_tla`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn node(&self, e: &Expr, bound: &mut Vec<&'static str>) -> Node {
         let two = |a: &Expr, b: &Expr, bound: &mut Vec<&'static str>| {
@@ -332,8 +320,7 @@ impl Scope<'_> {
 impl Compiled {
     /// Resolve `m`, or `None` when an update writes a name its initial state
     /// does not bind (see the module docs).
-    // Skip: map/Vec construction over the model's declarations. Spec-model
-    // machinery, same tier as `init_state`.
+    // Skip: map/Vec construction over the model's declarations.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn new(m: &Model) -> Option<Self> {
         let init_state = m.init_state();
@@ -402,7 +389,7 @@ impl Compiled {
     }
 
     /// The index of state variable `name` in a value slice, if it is one.
-    // Skip: a slice search over the model's own names. Spec-model machinery.
+    // Skip: a slice search over the model's own names.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn slot(&self, name: &str) -> Option<usize> {
         // `names` is a `BTreeMap`'s key order: sorted, so searchable.
@@ -410,22 +397,21 @@ impl Compiled {
     }
 
     /// The state `s` is, as the interpreter's public [`crate::interp::State`].
-    // Skip: a `collect` into a map. Spec-model machinery.
+    // Skip: a `collect` into a map.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn state(&self, s: &[i64]) -> BTreeMap<&'static str, i64> {
         self.names.iter().copied().zip(s.iter().copied()).collect()
     }
 
     /// `Model::check_invariant_in` for invariant `i` at `s`.
-    // Skip: drives the evaluator above. Spec-model machinery.
+    // Skip: drives the evaluator above.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn holds(&self, i: usize, s: &[i64]) -> bool {
         self.invariants[i].eval(s, &mut Vec::new()).as_bool()
     }
 
     /// `Model::successors_in` for action `a` at `s`, in the same order.
-    // Skip: the cartesian product's Vec bookkeeping, same class as
-    // `successors_in`, whose algorithm this is.
+    // Skip: the cartesian product's Vec bookkeeping, as in `successors_in`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn successors(&self, a: usize, s: &[i64]) -> Vec<Vec<i64>> {
         let act = &self.actions[a];
@@ -437,9 +423,8 @@ impl Compiled {
         {
             return Vec::new();
         }
-        // Every right-hand side reads the PRE-state `s`, never the states being
-        // built, so evaluating each just before it is applied is evaluating all
-        // of them first: same values, same order, same panics. Each one is
+        // Every right-hand side reads the pre-state `s`, so evaluating each just before it is
+        // applied matches evaluating all first (same values, order and panics). Each is
         // evaluated even once the product is empty, as `successors_in` does.
         let mut acc: Vec<Vec<i64>> = vec![s.to_vec()];
         for (slot, rhs) in &act.updates {
@@ -488,7 +473,7 @@ pub(crate) struct CompiledExpr(Node);
 
 impl CompiledExpr {
     /// The expression's value at `s` (`Expr::eval` over `eval_env(s)`).
-    // Skip: drives the evaluator above. Spec-model machinery.
+    // Skip: drives the evaluator above.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn eval(&self, s: &[i64]) -> Value {
         self.0.eval(s, &mut Vec::new())

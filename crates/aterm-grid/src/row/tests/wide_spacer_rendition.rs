@@ -2,18 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 //
-// The wide-char continuation spacer inherits its lead's rendition: a
-// double-width character is one character in two columns, so the spacer
-// carries the lead's visual attributes plus only its own role bit. Otherwise
-// SGR 7 paints the glyph's right half invisibly and underline, strikethrough
-// and overline gap under it.
+// A wide char's continuation spacer carries its lead's rendition plus only its own role bit
+// (`CellFlags::wide_continuation_of`), so SGR 7 and ruled decorations span both columns.
 
 use super::super::*;
 use super::make_row;
 use crate::{CellFlags, PackedColor};
 
-/// Every visual attribute bit, so a future SGR bit in 0-13 is covered
-/// automatically.
+/// Every visual attribute bit a spacer inherits.
 const EVERY_RENDITION: CellFlags = CellFlags::from_bits(CellFlags::SPACER_RENDITION_MASK);
 
 #[test]
@@ -62,7 +58,7 @@ fn wide_continuation_of_a_bare_lead_is_the_bare_role_bit() {
     );
 }
 
-/// The primary CJK path: `Row::write_wide_char_packed` (what `[7m漢` takes).
+/// The primary CJK path (`write_wide_char` -> `write_wide_char_packed`).
 #[test]
 fn write_wide_char_inverse_reaches_the_spacer() {
     let (_pages, mut row) = make_row(10);

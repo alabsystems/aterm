@@ -46,6 +46,35 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         },
         ctx,
     )?;
+    items.extend(attached_keyboard_items(ctx)?);
+    items.push(Box::new(Desktop {
+        user: user.clone(),
+        kind: DesktopKind::Widgets,
+        before: Mutex::new(Vec::new()),
+    }));
+    items.push(Box::new(Desktop {
+        user: user.clone(),
+        kind: DesktopKind::Desktop,
+        before: Mutex::new(Vec::new()),
+    }));
+    items.push(Box::new(Desktop {
+        user: user.clone(),
+        kind: DesktopKind::Dock,
+        before: Mutex::new(Vec::new()),
+    }));
+    Ok(items)
+}
+
+/// Apply Caps Lock as Control to attached HID services without replacing the
+/// persistent modifier preferences. Doctor uses this after its per-key backup.
+///
+/// # Errors
+/// The setup did not resolve exactly one local user.
+pub fn attached_keyboard_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("input activation requires exactly one local user".into());
+    };
+    let mut items: Vec<Box<dyn Item>> = Vec::new();
     let mut models: Vec<keyboard::Model> = ctx
         .facts
         .keyboards
@@ -63,16 +92,6 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
             user: user.clone(),
         }));
     }
-    items.push(Box::new(Desktop {
-        user: user.clone(),
-        kind: DesktopKind::Widgets,
-        before: Mutex::new(Vec::new()),
-    }));
-    items.push(Box::new(Desktop {
-        user: user.clone(),
-        kind: DesktopKind::Dock,
-        before: Mutex::new(Vec::new()),
-    }));
     Ok(items)
 }
 
@@ -302,6 +321,7 @@ fn parse_mapping(value: &str) -> Result<Vec<(i64, i64)>, String> {
 #[derive(Debug, Clone, Copy)]
 enum DesktopKind {
     Widgets,
+    Desktop,
     Dock,
 }
 
@@ -322,7 +342,7 @@ impl Desktop {
     fn changes(&self, sys: &dyn System) -> Result<Changes, String> {
         let mut changes = Vec::new();
         let mut consider =
-            |target: Target, want: PValue, semantic: fn(&PValue, &PValue) -> bool| {
+            |target: Target, want: PValue, semantic: &dyn Fn(&PValue, &PValue) -> bool| {
                 let read = target.read(sys);
                 match &read {
                     Read::Unusable(why) => return Err(why.clone()),
@@ -338,7 +358,7 @@ impl Desktop {
                     consider(
                         self.target("com.apple.WindowManager", key),
                         PValue::Bool(true),
-                        equivalent,
+                        &equivalent,
                     )?;
                 }
                 let target = self.target("com.apple.notificationcenterui", "widgets");
@@ -348,12 +368,30 @@ impl Desktop {
                     changes.push((target, read, want));
                 }
             }
+            DesktopKind::Desktop => {
+                for key in [
+                    "EnableStandardClickToShowDesktop",
+                    "StandardHideDesktopIcons",
+                    "StageManagerHideDesktopIcons",
+                ] {
+                    consider(
+                        self.target("com.apple.WindowManager", key),
+                        PValue::Bool(false),
+                        &equivalent,
+                    )?;
+                }
+                consider(
+                    self.target("com.apple.finder", "CreateDesktop"),
+                    PValue::Bool(true),
+                    &equivalent,
+                )?;
+            }
             DesktopKind::Dock => {
                 dock_apps_available(sys, &self.user)?;
                 consider(
                     self.target("com.apple.dock", "persistent-apps"),
                     dock_apps(),
-                    same_apps,
+                    &|now, want| same_apps(sys, now, want),
                 )?;
                 for key in [
                     "persistent-others",
@@ -364,7 +402,7 @@ impl Desktop {
                     consider(
                         self.target("com.apple.dock", key),
                         PValue::Array(Vec::new()),
-                        equivalent,
+                        &equivalent,
                     )?;
                 }
                 for (key, value) in [
@@ -375,7 +413,7 @@ impl Desktop {
                     consider(
                         self.target("com.apple.dock", key),
                         PValue::Bool(value),
-                        equivalent,
+                        &equivalent,
                     )?;
                 }
             }
@@ -385,6 +423,17 @@ impl Desktop {
 }
 
 impl Item for Desktop {
+    fn preference_changes(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+    ) -> Result<Vec<(Target, Read<PValue>)>, String> {
+        Ok(self
+            .changes(sys)?
+            .into_iter()
+            .map(|(target, read, _)| (target, read))
+            .collect())
+    }
     fn id(&self) -> String {
         format!("init.{}@{}", self.family(), self.user.name)
     }
@@ -392,6 +441,7 @@ impl Item for Desktop {
     fn family(&self) -> &'static str {
         match self.kind {
             DesktopKind::Widgets => "widgets",
+            DesktopKind::Desktop => "desktop",
             DesktopKind::Dock => "dock",
         }
     }
@@ -400,6 +450,9 @@ impl Item for Desktop {
         match self.kind {
             DesktopKind::Widgets => {
                 "No widgets on the desktop, in Stage Manager or Notification Center".into()
+            }
+            DesktopKind::Desktop => {
+                "Desktop icons visible; clicking wallpaper keeps windows in place".into()
             }
             DesktopKind::Dock => {
                 "Dock pins: aterm, System Settings, Safari; no stacks or recent apps".into()
@@ -622,7 +675,7 @@ fn dock_apps_available(sys: &dyn System, user: &User) -> Result<(), String> {
 /// Dock adds bookmarks and GUIDs and changes URL escaping or trailing separators.
 /// Compare the actual local file target as well as identity, type and order; a stale
 /// bundle-identifier field on a missing or different target is not the requested pin.
-fn same_apps(now: &PValue, want: &PValue) -> bool {
+fn same_apps(sys: &dyn System, now: &PValue, want: &PValue) -> bool {
     let (PValue::Array(now), PValue::Array(want)) = (now, want) else {
         return false;
     };
@@ -631,7 +684,12 @@ fn same_apps(now: &PValue, want: &PValue) -> bool {
             field(now, "tile-type") == field(want, "tile-type")
                 && field(now, "tile-data").and_then(|v| field(v, "bundle-identifier"))
                     == field(want, "tile-data").and_then(|v| field(v, "bundle-identifier"))
-                && matches!((dock_app_path(now), dock_app_path(want)), (Some(now), Some(want)) if now == want)
+                && dock_app_path(now)
+                    .zip(dock_app_path(want))
+                    .is_some_and(|(now, want)| {
+                        sys.canonicalize(&now).unwrap_or(now)
+                            == sys.canonicalize(&want).unwrap_or(want)
+                    })
         })
 }
 
@@ -876,11 +934,19 @@ mod tests {
             unreachable!()
         };
         first.push(("GUID".into(), PValue::Int(123)));
-        assert!(same_apps(&PValue::Array(pins.clone()), &want));
+        assert!(same_apps(
+            &Fake::root(),
+            &PValue::Array(pins.clone()),
+            &want
+        ));
         pins.swap(0, 1);
-        assert!(!same_apps(&PValue::Array(pins.clone()), &want));
+        assert!(!same_apps(
+            &Fake::root(),
+            &PValue::Array(pins.clone()),
+            &want
+        ));
         pins.push(PValue::Dict(vec![]));
-        assert!(!same_apps(&PValue::Array(pins), &want));
+        assert!(!same_apps(&Fake::root(), &PValue::Array(pins), &want));
     }
 
     #[test]
@@ -897,10 +963,11 @@ mod tests {
         ] {
             let changed = xml.replace("file:///Applications/aterm.app/", wrong);
             let changed = crate::plist::parse(changed.as_bytes()).unwrap();
-            assert!(!same_apps(&changed, &want), "{wrong}");
+            assert!(!same_apps(&Fake::root(), &changed, &want), "{wrong}");
         }
         let missing = xml.replacen("<key>file-data</key>", "<key>unusable-file-data</key>", 1);
         assert!(!same_apps(
+            &Fake::root(),
             &crate::plist::parse(missing.as_bytes()).unwrap(),
             &want
         ));
@@ -914,6 +981,7 @@ mod tests {
                 "file:///Applications/Safari.app",
             );
         assert!(same_apps(
+            &Fake::root(),
             &crate::plist::parse(normalized.as_bytes()).unwrap(),
             &want
         ));

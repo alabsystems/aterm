@@ -10,19 +10,20 @@
 //!
 //! * THE TIMELINE. [`overlap_rows`] projects the log's records of the exact
 //!   pairs ([`EXACT`]: `agent`, `status`, `mail dir=in` and `task`, T19's
-//!   set less `human` and `harness-act`) into the ring's `(kind, payload)`,
-//!   and over a scripted session the two are equal, row for record, in
-//!   order (ids and clocks aside): the WHOLE payload, so an exact pair has
-//!   no field the comparison does not see. `harness-act` pairs through its
-//!   word map ([`aterm_agent::harness::acts::self_claim_act`]): the ring's
-//!   row `act=<act> holder=<h>` is compared, row for record, as `word=<w>
-//!   rule=<act, @ .>`, and a row whose act has no word pairs with no record,
-//!   counted; the holder (the claim's lease holder; the mark's `by=` is the
-//!   connection's) is no field of the mark, so the kind is a named
-//!   difference, `Lossy` for `holder`, not an exact pair. Every other kind
-//!   of plan §0.1 is a row of [`KNOWN_DIFFERENCES`]: no record, a record
-//!   without the named fields, or a record on another trigger, each driven
-//!   through the row's own writer. `human` is no longer an exact pair:
+//!   set less `human`; since phase 6 the ring-only facts, 6F-5, the fabric
+//!   rows, 6F-6, the session rows, 6F-7, and since the review of 6F-7
+//!   `harness-act`, every act a record with the act whole) into the ring's
+//!   `(kind, payload)`, cut by the ring's own 256-byte rule
+//!   ([`crate::session_timeline::clamp_payload`]), and over a scripted
+//!   session, and each kind through its own writer ([`DRIVEN`]), at the
+//!   longest values its producer admits too, the two are equal, row for
+//!   record, in order (ids and clocks aside): the WHOLE payload, so an
+//!   exact pair has no field the comparison does not see. Every other kind
+//!   of plan §0.1 is a row of
+//!   [`KNOWN_DIFFERENCES`]: a record without the named fields, a record on
+//!   another trigger, or a record the log keeps under its own retention rule
+//!   (`program-state` since 6F-4, U39), each driven through the row's own
+//!   writer. `human` is no longer an exact pair:
 //!   since 5D-4 (T39) the log holds every ring row and, after delivered
 //!   mail, the person's next input that reached the program too
 //!   ([`SUPERSET`], log ⊇ ring (post-mail marks)); a burst's mark no such
@@ -37,7 +38,9 @@
 //!   process and the log is carried, so across an update the carried marks
 //!   stand before the epoch with no point beside them: pinned.
 //!
-//! NEGATIVE CONTROLS: a projection with `fp=` dropped fails; an exit map
+//! NEGATIVE CONTROLS: a projection with `fp=` dropped fails; a retained
+//! kind whose newest record is stale, or with more records than rows, fails;
+//! an exit map
 //! with `ctl-close` and `ui-close` swapped fails; a story mark written twice
 //! fails; a named difference that is closed fails.
 
@@ -60,14 +63,52 @@ use crate::{App, WindowId};
 
 /// The ring kinds the log equals row for record, the whole payload (T19's
 /// exact pairs: as built at 5B-6, `task-change` since 5C-3 writes its mark;
-/// `human` left for [`SUPERSET`] at 5D-4; `harness-act`, compared through
-/// its word map, is a named difference for the `holder` its mark does not
-/// carry, [`KNOWN_DIFFERENCES`]).
-const EXACT: [&str; 4] = [
+/// `human` left for [`SUPERSET`] at 5D-4; `harness-act` since the review of
+/// 6F-7, its act whole at `harness_act=` and an act with no word a record
+/// too). Since phase 6 (6F-5) the ring-only facts
+/// are marks and their rows exact pairs too: `state-change` (a `state` mark,
+/// and the session close for `state=closed`), `harness-policy`,
+/// `hold-advisory`, `fetch` and `topic`; since 6F-6 the lossy fabric rows:
+/// `inbox-seen` (every one, `moved=0|1`), `post`, `post-landed` (`off=-`
+/// too) and `hold`; since 6F-7 the lossy session rows: `spawned` (the
+/// open's `state=`, or a carried session's `state carried=1` mark),
+/// `closing` (the session close's `closer=`, ruling U12), `render` (every
+/// transition, whole), `modes-restored` (every row, nothing reverted too),
+/// `in-doubt` and `handoff` (`build=`; the ring is never carried, so its
+/// `carried=0`); each checked through its own writer ([`DRIVEN`]), at its
+/// producer's bounds too.
+const EXACT: [&str; 20] = [
     "agent-change",
     crate::session_status::STATUS_CHANGE,
     "inbox",
     "task-change",
+    "state-change",
+    crate::harness_policy_verb::HARNESS_POLICY_EVENT,
+    "hold-advisory",
+    "fetch",
+    "topic",
+    "inbox-seen",
+    "post",
+    "post-landed",
+    "hold",
+    "spawned",
+    "closing",
+    "render",
+    "modes-restored",
+    "in-doubt",
+    "handoff",
+    crate::session_timeline::HARNESS_ACT,
+];
+
+/// The exact pairs 5B-6's scripted session writes
+/// ([`the_ring_and_the_log_agree_on_the_exact_pairs`]); the others are
+/// [`DRIVEN`]'s, each through its own writer.
+const SCRIPTED: [&str; 5] = [
+    "agent-change",
+    crate::session_status::STATUS_CHANGE,
+    "inbox",
+    "task-change",
+    crate::session_timeline::HARNESS_ACT,
 ];
 
 /// The ring kinds whose every row the log holds, in order, with records of
@@ -117,8 +158,66 @@ fn text(f: &Fields, key: Key) -> String {
     }
 }
 
-/// One record as the ring row it pairs with, if it is an exact pair's.
-fn project(r: &Rec) -> Option<(String, String)> {
+/// A text field as it was written (`-` when it is not set).
+fn raw(f: &Fields, key: Key) -> &str {
+    f.get_str(key).unwrap_or("-")
+}
+
+/// One record as the ring rows it pairs with ([`project_whole`]), each
+/// payload cut by the ring's own rule, 256 bytes never inside an escape
+/// ([`crate::session_timeline::clamp_payload`]): a view prints the ring's
+/// grammar, its bound too.
+fn project(r: &Rec) -> Vec<(String, String)> {
+    project_whole(r)
+        .into_iter()
+        .map(|(k, p)| (k, crate::session_timeline::clamp_payload(p).to_string()))
+        .collect()
+}
+
+/// One record as the ring rows it pairs with: none, or the exact pairs'
+/// (the session close is two rows, `closing` and the last `state-change`,
+/// in that order, written in one hold as the ring's are; the first only
+/// for a close that names its reason, as the ring's `closing` row is).
+fn project_whole(r: &Rec) -> Vec<(String, String)> {
+    let row = |k: &str, p: String| vec![(k.to_string(), p)];
+    if r.node == Node::SESSION {
+        match r.op {
+            Op::Close => {
+                let mut rows = Vec::new();
+                match r.f.get_word(Key::Out) {
+                    Some("unknown") | None => {}
+                    Some(out) => rows.extend(row(
+                        "closing",
+                        format!(
+                            "reason={out} by={}",
+                            crate::control::pct_encode(raw(&r.f, Key::Closer))
+                        ),
+                    )),
+                }
+                rows.extend(row("state-change", "state=closed".to_string()));
+                return rows;
+            }
+            // The registration: the open (a carried session's is its
+            // `state carried=1` mark, below).
+            Op::Open => return row("spawned", format!("state={}", text(&r.f, Key::State))),
+            // An uncarried handoff's loss, or a keeper's crash adoption's.
+            Op::Gap if matches!(r.f.get_word(Key::Why), Some("handoff" | "crash")) => {
+                return row("handoff", handoff_row(&r.f));
+            }
+            _ => {}
+        }
+    }
+    project_mark(r).into_iter().collect()
+}
+
+/// A `handoff` row as its record says it: the ring is never carried, so
+/// `carried=0` whatever the log carried, and `build=` its `from_build=`.
+fn handoff_row(f: &Fields) -> String {
+    format!("carried=0 from_build={}", text(f, Key::Build))
+}
+
+/// A mark as the ring row it pairs with, if it is an exact pair's.
+fn project_mark(r: &Rec) -> Option<(String, String)> {
     if r.op != Op::Mark {
         return None;
     }
@@ -153,10 +252,15 @@ fn project(r: &Rec) -> Option<(String, String)> {
             )
         }
         Kind::Human => ("human", String::new()),
-        // A self-claim's act, through the word map ([`act_row`]).
-        Kind::Act => (
+        // A self-claim's act, whole (`harness_act=`, the review of 6F-7),
+        // and its holder; a relaunch's act (`src=aterm`) is no row's.
+        Kind::Act if r.src == aterm_slog::Src::Mark => (
             crate::session_timeline::HARNESS_ACT,
-            format!("word={} rule={}", text(f, Key::Word), text(f, Key::Rule)),
+            format!(
+                "act={} holder={}",
+                raw(f, Key::HarnessAct),
+                raw(f, Key::Holder)
+            ),
         ),
         // `exit=` is the log's `code=`, as a command's is (5C-1).
         Kind::Task => (
@@ -185,9 +289,182 @@ fn project(r: &Rec) -> Option<(String, String)> {
                 text(f, Key::Off)
             ),
         ),
+        // Phase 6 (6F-5): the ring-only facts, as marks; a carried
+        // session's registration is its `spawned` row (6F-7).
+        Kind::State if f.get_u(Key::Carried) == Some(1) => {
+            ("spawned", format!("state={}", text(f, Key::State)))
+        }
+        Kind::State => ("state-change", format!("state={}", text(f, Key::State))),
+        Kind::Policy => (
+            crate::harness_policy_verb::HARNESS_POLICY_EVENT,
+            format!("gen={}", text(f, Key::Gen)),
+        ),
+        Kind::Advisory => (
+            "hold-advisory",
+            format!(
+                "1 reason={} origin={}",
+                raw(f, Key::Reason),
+                text(f, Key::Origin)
+            ),
+        ),
+        Kind::MailFetch => ("fetch", format!("off={}", text(f, Key::Off))),
+        // Phase 6 (6F-6): the fabric rows, whole. A broadcast's `to=` is
+        // its topic's fingerprint on the record, the name beside it.
+        Kind::Mail if f.get_word(Key::Dir) == Some("out") => {
+            let to = match (raw(f, Key::To).strip_prefix("say:"), f.get(Key::TopicName)) {
+                (Some(_), Some(_)) => format!("say:{}", raw(f, Key::TopicName)),
+                _ => raw(f, Key::To).to_string(),
+            };
+            let opt = |k: Key, name: &str| match f.get(k) {
+                Some(_) => format!(" {name}={}", text(f, k)),
+                None => String::new(),
+            };
+            (
+                "post",
+                format!(
+                    "{} to={} kind={}{}{}{}{}",
+                    text(f, Key::Inbox),
+                    aterm_control::wire::pct_encode(&to),
+                    text(f, Key::MailKind),
+                    opt(Key::Re, "re"),
+                    opt(Key::Dl, "dl"),
+                    opt(Key::Via, "via"),
+                    opt(Key::Idem, "key"),
+                ),
+            )
+        }
+        Kind::MailLanded => (
+            "post-landed",
+            format!(
+                "{} off={}{}",
+                text(f, Key::Inbox),
+                text(f, Key::Off),
+                f.get_word(Key::Why)
+                    .map(|w| format!(" reason={w}"))
+                    .unwrap_or_default()
+            ),
+        ),
+        Kind::MailSeen => (
+            "inbox-seen",
+            format!(
+                "{} off={} floor={} seen={}{}",
+                text(f, Key::Inbox),
+                text(f, Key::Off),
+                text(f, Key::Floor),
+                text(f, Key::Seen),
+                match f.get_word(Key::Word) {
+                    Some(v) => format!(
+                        " verdict={v} kind={} from={}",
+                        text(f, Key::MailKind),
+                        raw(f, Key::From)
+                    ),
+                    None => String::new(),
+                }
+            ),
+        ),
+        Kind::Hold => (
+            "hold",
+            format!(
+                "{} reason={} origin={} hold_origin={}{}",
+                u8::from(f.get_word(Key::State) == Some("on")),
+                raw(f, Key::Reason),
+                text(f, Key::Origin),
+                text(f, Key::HoldOrigin),
+                if f.get_u(Key::Carried) == Some(1) {
+                    " carried=1"
+                } else {
+                    ""
+                }
+            ),
+        ),
+        Kind::Topic => (
+            "topic",
+            match f.get_word(Key::Change) {
+                Some("add") => format!(
+                    "add {} since={}",
+                    raw(f, Key::TopicName),
+                    raw(f, Key::Since)
+                ),
+                _ => format!("drop {}", raw(f, Key::TopicName)),
+            },
+        ),
+        // Phase 6 (6F-7): the session rows, whole.
+        Kind::Handoff => ("handoff", handoff_row(f)),
+        Kind::Render => ("render", render_row(f)),
+        Kind::Modes => {
+            let reverted = |none: &'static str| f.get_str(Key::Reverted).unwrap_or(none);
+            (
+                "modes-restored",
+                match f.get_word(Key::Source) {
+                    Some(source) => format!(
+                        "reason=manual source={source} reverted={} bytes={}",
+                        reverted("-"),
+                        text(f, Key::Bytes)
+                    ),
+                    None => format!(
+                        "from={} to={} program={} reverted={} bytes={}",
+                        text(f, Key::FromPg),
+                        text(f, Key::ToPg),
+                        f.get_str(Key::Prog)
+                            .map_or_else(|| "-".to_string(), crate::control::pct_encode),
+                        reverted(""),
+                        text(f, Key::Bytes)
+                    ),
+                },
+            )
+        }
+        Kind::InDoubt => (
+            "in-doubt",
+            format!(
+                "producer={} seq={} reply={}",
+                text(f, Key::Producer),
+                text(f, Key::KeySeq),
+                crate::control::pct_encode(f.get_str(Key::Reply).unwrap_or(""))
+            ),
+        ),
         _ => return None,
     };
     Some((row.0.to_string(), row.1))
+}
+
+/// A `render` mark as the resize ledger's row: a run's verdict or an
+/// epoch's (`resize_epoch=` set), into `desync-risk` or `healed`.
+fn render_row(f: &Fields) -> String {
+    let signed = |k: Key| match f.get(k) {
+        Some(Val::I(n)) => format!("{n:+}"),
+        _ => "-".to_string(),
+    };
+    let state = text(f, Key::State);
+    match (f.get(Key::ResizeEpoch).is_some(), state.as_str()) {
+        (false, "desync-risk") => format!(
+            "desync-risk run={} displaced={} net={} at={}",
+            text(f, Key::Run),
+            signed(Key::Displaced),
+            text(f, Key::Net),
+            text(f, Key::At)
+        ),
+        (false, _) => format!(
+            "{state} run={} after_ms={}",
+            text(f, Key::Run),
+            text(f, Key::AfterMs)
+        ),
+        (true, "desync-risk") => format!(
+            "desync-risk epoch={} displaced={} pushed={} cut={} drew={} class={} at={}",
+            text(f, Key::ResizeEpoch),
+            signed(Key::Displaced),
+            text(f, Key::Pushed),
+            text(f, Key::Cut),
+            text(f, Key::Drew),
+            text(f, Key::Class),
+            text(f, Key::At)
+        ),
+        (true, _) => format!(
+            "{state} epoch={} after_ms={} by={}",
+            text(f, Key::ResizeEpoch),
+            text(f, Key::AfterMs),
+            text(f, Key::HealedBy)
+        ),
+    }
 }
 
 /// The log's records of the exact pairs as the ring's `(kind, payload)`,
@@ -199,8 +476,16 @@ pub(crate) fn overlap_rows(log: &Log) -> Vec<(String, String)> {
 /// [`overlap_rows`] with `drop` taken out of every record first (the
 /// negative control's lossy projection).
 fn overlap_rows_without(log: &Log, drop: Option<Key>) -> Vec<(String, String)> {
-    log.window()
-        .filter_map(|r| {
+    projected(log.window(), drop)
+}
+
+/// `recs` projected ([`project`]), `drop` taken out of every record first.
+fn projected<'a>(
+    recs: impl IntoIterator<Item = &'a Rec>,
+    drop: Option<Key>,
+) -> Vec<(String, String)> {
+    recs.into_iter()
+        .flat_map(|r| {
             let mut r = r.clone();
             if let Some(k) = drop {
                 r.f.remove(k);
@@ -224,24 +509,6 @@ fn ring_rows(tl: &SessionTimeline, kinds: &[&str]) -> Vec<(String, String)> {
         .filter(|e| kinds.contains(&e.kind))
         .map(|e| (e.kind.to_string(), e.payload.to_string()))
         .collect()
-}
-
-/// The ring's `harness-act` rows through the word map ([`act_row`]),
-/// oldest first: the rows whose act has a word, as their marks say them.
-fn act_rows(tl: &SessionTimeline) -> Vec<(String, String)> {
-    tl.since(None)
-        .filter(|e| e.kind == crate::session_timeline::HARNESS_ACT)
-        .filter_map(|e| act_row(&e.payload).map(|p| (e.kind.to_string(), p)))
-        .collect()
-}
-
-/// A `harness-act` row's payload (`act=<act> holder=<h>`) through the word
-/// map, as its record says it: `word=<w> rule=<r>`, or `None` for an act
-/// the log has no word for (its row stands alone).
-fn act_row(payload: &str) -> Option<String> {
-    let act = value(payload, "act")?;
-    let (word, rule) = aterm_agent::harness::acts::self_claim_act(act)?;
-    Some(format!("word={word} rule={rule}"))
 }
 
 /// THE EXACT PAIRS AGREE (T19): over one scripted session, through each
@@ -326,7 +593,7 @@ fn the_ring_and_the_log_agree_on_the_exact_pairs() {
     }
     let g = ctx.timeline.lock().unwrap();
     let ring = ring_rows(&g, &EXACT);
-    for kind in EXACT {
+    for kind in SCRIPTED {
         assert!(
             ring.iter().any(|(k, _)| k == kind),
             "the script wrote no {kind} row: {ring:?}"
@@ -334,37 +601,28 @@ fn the_ring_and_the_log_agree_on_the_exact_pairs() {
     }
     let log = only(overlap_rows(g.slog().log()), &EXACT);
     assert_eq!(log, ring, "the log's exact pairs against the ring's rows");
-    // `harness-act` through its word map, row for record (its `holder` the
-    // named difference).
-    const ACT: [&str; 1] = [crate::session_timeline::HARNESS_ACT];
-    let acts = act_rows(&g);
-    assert_eq!(acts.len(), 2, "two worded acts: {acts:?}");
-    assert_eq!(
-        only(overlap_rows(g.slog().log()), &ACT),
-        acts,
-        "the log's act marks against the ring's acts"
-    );
-    // The act with no word is a row and no record, counted.
-    let unworded = g
-        .since(None)
-        .filter(|e| e.kind == crate::session_timeline::HARNESS_ACT)
-        .filter(|e| act_row(&e.payload).is_none())
-        .count();
-    assert_eq!(unworded, 1, "finished@v1 writes no act mark");
+    // Every act is a record (the review of 6F-7): the one with no word
+    // (`finished@v1`) too, `word=unknown`.
+    let acts = |words: &[&str]| {
+        g.slog()
+            .log()
+            .window()
+            .filter(|r| r.k == Kind::Act && r.src == aterm_slog::Src::Mark)
+            .filter(|r| words.contains(&r.f.get_word(Key::Word).unwrap_or("-")))
+            .count()
+    };
+    assert_eq!(acts(&["approve", "continue"]), 2, "two worded acts");
+    assert_eq!(acts(&["unknown"]), 1, "finished@v1 is a record too");
     // NEGATIVE CONTROLS: a lossy projection is caught, for the agent's
-    // `fp=`, the task's `rev=` and the act's `rule=` alike.
-    for key in [Key::Fp, Key::Rev] {
+    // `fp=`, the task's `rev=` and the act's `harness_act=` and `holder=`
+    // alike.
+    for key in [Key::Fp, Key::Rev, Key::HarnessAct, Key::Holder] {
         assert_ne!(
             only(overlap_rows_without(g.slog().log(), Some(key)), &EXACT),
             ring,
             "a projection with {key:?} dropped agrees"
         );
     }
-    assert_ne!(
-        only(overlap_rows_without(g.slog().log(), Some(Key::Rule)), &ACT),
-        acts,
-        "an act projection with rule= dropped agrees"
-    );
 }
 
 /// LOG ⊇ RING (post-mail marks), for `human` (ruling T39): a person's
@@ -420,14 +678,28 @@ fn the_log_holds_every_human_row_and_the_first_input_after_mail() {
 /// How a timeline kind and the log differ (T19's named differences).
 #[derive(Clone, Copy, Debug)]
 enum Diff {
-    /// The row's writer writes no record in its hold.
-    NoRecord,
     /// The writer writes a record (`<op> <kind>`), and each named field of
     /// the row is not the record's (absent, or another value).
     Lossy(&'static str, &'static [&'static str]),
     /// The record (`<op> <kind>`) is written on another trigger or dedupe
     /// rule: the driven call writes the row and no such record.
     Trigger(&'static str),
+    /// A record (`<op> <kind>`) for every row the log keeps, which it keeps
+    /// under the named rule (phase 6, 6F-4; U39): the driven call writes at
+    /// least one, never more records than rows, and its newest record is
+    /// the newest row ([`retained_row`]); row for row under the rule's rate
+    /// ([`the_program_marks_keep_the_rows_under_their_retention_rule`]).
+    Retention(&'static str, &'static str),
+}
+
+/// A `program` record line as the `program-state` row it keeps: `state=<w>
+/// kind=<ask|->`, `none` read as the row's `-`.
+fn retained_row(line: &str) -> String {
+    let state = match value(line, "state") {
+        Some("none") | None => "-",
+        Some(w) => w,
+    };
+    format!("state={state} kind={}", value(line, "ask").unwrap_or("-"))
 }
 
 /// One named difference.
@@ -439,34 +711,12 @@ struct Known {
     why: &'static str,
     /// The step that closes it, if one does.
     until: Option<&'static str>,
-    /// The row's own writer, driven; `None` for one no unit test reaches
-    /// without the live link's process-wide state.
+    /// The row's own writer, driven; `None` for one no unit test reaches.
     drive: Option<fn() -> Seen>,
 }
 
 /// Every §0.1 kind that is no exact pair, and how it differs.
 const KNOWN_DIFFERENCES: &[Known] = &[
-    Known {
-        row: "spawned",
-        diff: Diff::Lossy("open spawn", &["state"]),
-        why: "the session open names no state word (§0.1)",
-        until: None,
-        drive: Some(drive_spawned),
-    },
-    Known {
-        row: "closing",
-        diff: Diff::Lossy("close spawn", &["by"]),
-        why: "3A R1: a sid no one minted is no session's, so the close says by=-",
-        until: None,
-        drive: Some(drive_closing),
-    },
-    Known {
-        row: "state-change",
-        diff: Diff::NoRecord,
-        why: "T21: state stays ring-only",
-        until: None,
-        drive: Some(drive_state),
-    },
     Known {
         row: "title-change",
         diff: Diff::Trigger("mark title"),
@@ -491,114 +741,35 @@ const KNOWN_DIFFERENCES: &[Known] = &[
         drive: Some(drive_meta),
     },
     Known {
-        row: "render",
-        diff: Diff::Lossy("mark render", &["run", "displaced", "at"]),
-        why: "the mark is the state word alone, deduped by state",
-        until: None,
-        drive: Some(drive_render),
-    },
-    Known {
-        row: "modes-restored",
-        diff: Diff::Lossy("mark modes", &["reverted", "bytes"]),
-        why: "the mark counts the modes (n=)",
-        until: None,
-        drive: Some(drive_modes),
-    },
-    Known {
-        row: "in-doubt",
-        diff: Diff::Lossy("mark in-doubt", &["producer", "seq", "reply"]),
-        why: "the mark names the verb alone",
-        until: None,
-        drive: Some(drive_in_doubt),
-    },
-    Known {
-        row: "handoff",
-        diff: Diff::Lossy("mark handoff", &["carried", "from_build"]),
-        why: "the ring is never carried (carried=0); the log's mark counts what it carried \
-              and names no build",
-        until: None,
-        drive: Some(drive_handoff),
-    },
-    Known {
-        row: crate::session_timeline::HARNESS_ACT,
-        diff: Diff::Lossy("mark act", &["holder"]),
-        why: "T19 pairs it through its word map (self_claim_act): word= and rule= are compared \
-              row for record (the_ring_and_the_log_agree_on_the_exact_pairs); the mark names no \
-              holder, its by= being the connection's",
-        until: None,
-        drive: Some(drive_act),
-    },
-    Known {
         row: "program-state",
-        diff: Diff::NoRecord,
-        why: "T21: program stays ring-only",
+        diff: Diff::Retention(
+            "mark program",
+            "64 a run (6F-3); a flap past the bucket coalesced to its latest state",
+        ),
+        why: "U39: the ring keeps 256 rows a session (PROGRAM_STATE_ROWS_MAX), the log 64 \
+              program marks a run (T6's share), and a move past the run's bucket is coalesced \
+              into the next mark (U17, U44)",
         until: None,
         drive: Some(drive_program),
-    },
-    Known {
-        row: crate::harness_policy_verb::HARNESS_POLICY_EVENT,
-        diff: Diff::NoRecord,
-        why: "T21: policy stays ring-only",
-        until: None,
-        drive: Some(drive_policy),
-    },
-    Known {
-        row: "inbox-seen",
-        diff: Diff::Trigger("mark mail-seen"),
-        why: "the mark is written only when the watermark or a verdict moved",
-        until: None,
-        drive: Some(drive_inbox_seen),
-    },
-    Known {
-        row: "post",
-        diff: Diff::Lossy("mark mail", &["dl", "key"]),
-        why: "mail dir=out keeps no post options (§0.1)",
-        until: None,
-        drive: Some(drive_post),
-    },
-    Known {
-        row: "post-landed",
-        diff: Diff::Trigger("mark mail-landed"),
-        why: "a dead post (off=-) landed nowhere: no mark",
-        until: None,
-        drive: Some(drive_landed),
-    },
-    Known {
-        row: "hold",
-        diff: Diff::Lossy("mark hold", &["reason"]),
-        why: "the mark is the hold's state alone: a reason is the owner's text",
-        until: None,
-        drive: Some(drive_hold),
-    },
-    Known {
-        row: "fetch",
-        diff: Diff::NoRecord,
-        why: "dropped by design (§4.1, DESIGN:382); its writer parks only under a live link",
-        until: None,
-        drive: None,
-    },
-    Known {
-        row: "topic",
-        diff: Diff::NoRecord,
-        why: "T21: topic stays ring-only",
-        until: None,
-        drive: Some(drive_topic),
-    },
-    Known {
-        row: "hold-advisory",
-        diff: Diff::NoRecord,
-        why: "T21: advisory stays ring-only; its writer runs only on the live link's loss",
-        until: None,
-        drive: None,
     },
 ];
 
 /// What one driven call wrote: the ring's rows, and the log's records at
-/// the content tier.
+/// the content tier (`recs`, as lines; `log`, as records).
 #[derive(Clone, Debug, Default)]
 struct Seen {
     rows: Vec<(String, String)>,
     recs: Vec<String>,
+    log: Vec<Rec>,
+}
+
+impl Seen {
+    /// `self`, then what `more` wrote.
+    fn extend(&mut self, more: Seen) {
+        self.rows.extend(more.rows);
+        self.recs.extend(more.recs);
+        self.log.extend(more.log);
+    }
 }
 
 /// What `f` wrote on `tl`.
@@ -625,6 +796,13 @@ fn seen_since(tl: &Mutex<SessionTimeline>, id: Option<u64>, seq: u64) -> Seen {
             .window()
             .filter(|r| r.seq > seq)
             .map(|r| aterm_slog::encode(r, Tier::Content).expect("fits"))
+            .collect(),
+        log: g
+            .slog()
+            .log()
+            .window()
+            .filter(|r| r.seq > seq)
+            .cloned()
             .collect(),
     }
 }
@@ -670,11 +848,6 @@ fn holds(k: &Known, seen: &Seen) -> Result<(), String> {
     let of =
         |sel: &str| -> Vec<&String> { seen.recs.iter().filter(|l| op_kind(l) == sel).collect() };
     match k.diff {
-        Diff::NoRecord if seen.recs.is_empty() => Ok(()),
-        Diff::NoRecord => Err(format!(
-            "{}: closed? its writer now writes {:?}",
-            k.row, seen.recs
-        )),
         Diff::Lossy(sel, fields) => {
             let recs = of(sel);
             if recs.is_empty() {
@@ -696,6 +869,28 @@ fn holds(k: &Known, seen: &Seen) -> Result<(), String> {
             k.row,
             of(sel)
         )),
+        Diff::Retention(sel, rule) => {
+            let recs = of(sel);
+            let (Some(newest_rec), Some(newest_row)) = (recs.last(), rows.last()) else {
+                return Err(format!("{}: no {sel} record: {:?}", k.row, seen.recs));
+            };
+            if recs.len() > rows.len() {
+                return Err(format!(
+                    "{}: {} records for {} rows ({rule})",
+                    k.row,
+                    recs.len(),
+                    rows.len()
+                ));
+            }
+            if retained_row(newest_rec) != **newest_row {
+                return Err(format!(
+                    "{}: the newest record {newest_rec} is not the newest row {newest_row} \
+                     ({rule})",
+                    k.row
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -718,10 +913,20 @@ fn drive_closing() -> Seen {
     })
 }
 
+/// The registry's every state move: back to spawning (a test handle is
+/// alive), its reader's first read, the exit, then the close (whose
+/// `state=closed` row is the session close's).
 fn drive_state() -> Seen {
     let (h, store) = rig(43);
     during(&h.ctx.timeline, || {
+        store.write().unwrap().set_state(43, SessionState::Spawning);
+        assert!(store.write().unwrap().mark_alive(43));
         store.write().unwrap().set_state(43, SessionState::Exited);
+        let _ =
+            store
+                .write()
+                .unwrap()
+                .deregister_local_as(43, ExitReason::Unknown, ExitActor::Unknown);
     })
 }
 
@@ -763,71 +968,225 @@ fn drive_meta() -> Seen {
     })
 }
 
+/// Every kind of render transition: a run's (into the risk, signed, and
+/// healed) and an epoch's (into it, healed, and healed while still open).
 fn drive_render() -> Seen {
+    use crate::resize_epoch::{EpochBy, ProgramClass};
+    use crate::resize_ledger::Transition as T;
     let (h, _store) = rig(48);
     during(&h.ctx.timeline, || {
         let _ = h.ctx.timeline.lock().unwrap().record_render(&[
-            crate::resize_ledger::Transition::Risk {
+            T::Risk {
                 run: 1,
                 displaced: 2,
                 net_zero: true,
                 at_ms: 3,
             },
+            T::Healed {
+                run: 1,
+                after_ms: 40,
+            },
+            T::Risk {
+                run: 2,
+                displaced: -3,
+                net_zero: false,
+                at_ms: 50,
+            },
+            T::EpochRisk {
+                epoch: 4,
+                shift: -2,
+                pushed: 1,
+                cut: 6,
+                drew: true,
+                class: ProgramClass::Learned,
+                at_ms: 70,
+            },
+            T::EpochHealed {
+                epoch: 4,
+                after_ms: 80,
+                by: EpochBy::Undo,
+            },
+            T::EpochHealed {
+                epoch: 5,
+                after_ms: 90,
+                by: EpochBy::None,
+            },
         ]);
     })
 }
 
+/// A person's reset and a verb's that reverted nothing, then a handback
+/// through the reader's own recorder and one that put nothing back.
 fn drive_modes() -> Seen {
+    use crate::manual_reset::{ResetReport, ResetSource};
     let (h, _store) = rig(49);
     during(&h.ctx.timeline, || {
-        crate::manual_reset::record(
-            49,
-            &h.ctx.timeline,
-            crate::manual_reset::ResetSource::Menu,
-            &crate::manual_reset::ResetReport {
-                reverted: vec!["mouse", "paste"],
-                bytes: 12,
-            },
-        );
+        for (source, reverted, bytes) in [
+            (ResetSource::Menu, vec!["mouse", "paste"], 12),
+            (ResetSource::Verb, vec![], 0),
+        ] {
+            crate::manual_reset::record(
+                49,
+                &h.ctx.timeline,
+                source,
+                &ResetReport { reverted, bytes },
+            );
+        }
+        for (reverted, bytes) in [(&["alt", "kitty"][..], 42), (&[][..], 0)] {
+            let _ = crate::foreground_handback::record_restored(
+                &mut h.ctx.timeline.lock().unwrap(),
+                crate::foreground_handback::FgEdge::group(0, 300, 301),
+                reverted,
+                bytes,
+            );
+        }
     })
 }
 
+/// Two keyed writes in doubt, one with no reply at all.
 fn drive_in_doubt() -> Seen {
     let (h, _store) = rig(50);
-    let key = crate::pty_idem::parse_key(&format!("{}:3:9", h.ctx.nonce.to_hex()), h.ctx.nonce)
-        .expect("a key");
+    let key = |seq: u64| {
+        crate::pty_idem::parse_key(&format!("{}:3:{seq}", h.ctx.nonce.to_hex()), h.ctx.nonce)
+            .expect("a key")
+    };
     during(&h.ctx.timeline, || {
-        let _ = crate::pty_idem::record_in_doubt(&h.ctx, "send", key, "ERR write failed\n");
+        let _ = crate::pty_idem::record_in_doubt(&h.ctx, "send", key(9), "ERR write failed\n");
+        let _ = crate::pty_idem::record_in_doubt(&h.ctx, "paste", key(10), "");
     })
 }
 
+/// A seamless update's successor, carried and not (each past the
+/// predecessor's records: the ring is never carried), then a shell the PTY
+/// keeper held through a crash: each one's handoff and registration.
 fn drive_handoff() -> Seen {
-    let (h, store) = rig(51);
-    h.ctx
-        .timeline
-        .lock()
-        .unwrap()
-        .record_cwd_change(Some("/tmp"));
-    let (next, _next_store, _hand) = hand_over(&h, &store.read().unwrap(), 1_000, true);
-    seen_since(&next.ctx.timeline, None, 0)
+    let mut all = Seen::default();
+    for carry in [true, false] {
+        let (h, store) = rig(51);
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .record_cwd_change(Some("/tmp"));
+        let head = h.ctx.timeline.lock().unwrap().slog().log().last_seq();
+        let (next, _next_store, _hand) = hand_over(&h, &store.read().unwrap(), 1_000, carry);
+        all.extend(seen_since(&next.ctx.timeline, None, head));
+    }
+    let kept = test_handle(65);
+    crate::spawn::mark_handoff_gap(
+        &kept.ctx.timeline,
+        &kept.ctx.cast,
+        &kept.ctx.temporal,
+        Some(9),
+        0,
+        crate::session_log::LogAdopt::default(),
+        true,
+    );
+    new_store().write().unwrap().register(kept.clone());
+    all.extend(seen_since(&kept.ctx.timeline, None, 0));
+    all
 }
 
-fn drive_act() -> Seen {
-    let (h, _store) = rig(59);
-    during(&h.ctx.timeline, || {
-        let _ = h.ctx.timeline.lock().unwrap().note_harness_act(
-            "approve-all@v1",
-            "codex-alab@1",
-            Actor::Ctl,
-        );
-    })
+/// A program's report, as the gate shows it.
+fn program_report(
+    state: aterm_core::terminal::program_state::ProgramStateWord,
+    kind: Option<aterm_core::terminal::program_state::ProgramBlockedKind>,
+) -> aterm_core::terminal::program_state::ProgramState {
+    aterm_core::terminal::program_state::ProgramState { state, kind }
 }
 
 fn drive_program() -> Seen {
+    use aterm_core::terminal::program_state::{ProgramBlockedKind, ProgramStateWord};
     let (h, _store) = rig(53);
     during(&h.ctx.timeline, || {
-        let _ = h.ctx.timeline.lock().unwrap().note_program_state(None);
+        let mut g = h.ctx.timeline.lock().unwrap();
+        let _ = g.note_program_state(Some(program_report(ProgramStateWord::Working, None)));
+        let _ = g.note_program_state(Some(program_report(
+            ProgramStateWord::Blocked,
+            Some(ProgramBlockedKind::Permission),
+        )));
+        let _ = g.note_program_state(None);
     })
+}
+
+/// THE PROGRAM MARKS KEEP THE ROWS UNDER THEIR RETENTION RULE (6F-4; U39):
+/// moves a second apart (under the run's bucket) are the ring's rows, row
+/// for record, in order; a burst of 60 at one instant is past it, and once a
+/// token frees the log's newest program mark is the ring's newest row,
+/// with the states it replaced counted. NEGATIVE CONTROL: the burst's
+/// records are fewer than its rows, so row for record no longer holds.
+#[test]
+fn the_program_marks_keep_the_rows_under_their_retention_rule() {
+    use aterm_core::terminal::program_state::{ProgramBlockedKind, ProgramStateWord as W};
+    let (h, _store) = rig(54);
+    let hand = super::super::tests::hand_clock(&h.ctx.timeline);
+    let moves = [
+        (W::Working, None),
+        (W::Blocked, Some(ProgramBlockedKind::Question)),
+        (W::Working, None),
+        (W::Done, None),
+        (W::Idle, None),
+        (W::Error, None),
+    ];
+    let rows_and_marks = |g: &SessionTimeline| {
+        let rows: Vec<String> = g
+            .since(None)
+            .filter(|e| e.kind == crate::session_timeline::PROGRAM_STATE)
+            .map(|e| e.payload.to_string())
+            .collect();
+        let marks: Vec<String> = g
+            .slog()
+            .log()
+            .window()
+            .filter(|r| r.k == Kind::Program)
+            .map(|r| retained_row(&aterm_slog::encode(r, Tier::Content).expect("fits")))
+            .collect();
+        (rows, marks)
+    };
+    for (i, (state, kind)) in moves.into_iter().enumerate() {
+        hand.set(1_000 * (i as u64 + 1));
+        let mut g = h.ctx.timeline.lock().unwrap();
+        let _ = g.note_program_state(Some(program_report(state, kind)));
+    }
+    let (rows, marks) = rows_and_marks(&h.ctx.timeline.lock().unwrap());
+    assert_eq!(rows.len(), moves.len());
+    assert_eq!(marks, rows, "under the bucket: row for record");
+    // A burst past the bucket, then a token.
+    hand.set(60_000);
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        for i in 0..60 {
+            let state = if i % 2 == 0 { W::Working } else { W::Blocked };
+            let kind = (state == W::Blocked).then_some(ProgramBlockedKind::Auth);
+            let _ = g.note_program_state(Some(program_report(state, kind)));
+        }
+    }
+    hand.set(61_000);
+    let mut g = h.ctx.timeline.lock().unwrap();
+    let at = g.slog().now();
+    g.slog_mut().program_tick(at);
+    let (rows, marks) = rows_and_marks(&g);
+    assert_eq!(
+        marks.last(),
+        rows.last(),
+        "past it: the newest row is the newest mark"
+    );
+    assert_eq!(
+        rows.last().map(String::as_str),
+        Some("state=blocked kind=auth")
+    );
+    let newest = g
+        .slog()
+        .log()
+        .window()
+        .rfind(|r| r.k == Kind::Program)
+        .map(|r| aterm_slog::encode(r, Tier::Content).expect("fits"))
+        .expect("a program mark");
+    assert!(newest.contains(" coalesced="), "{newest}");
+    assert!(
+        marks.len() < rows.len(),
+        "NEGATIVE CONTROL: no longer row for record"
+    );
 }
 
 fn drive_policy() -> Seen {
@@ -852,12 +1211,26 @@ fn delivered(local: u64) -> (SessionHandle, Store) {
     (h, store)
 }
 
+/// Every `inbox seen` (6F-6): a verdict decided, the same again (moved
+/// nothing: `moved=0`), and a bare seen past it on a second row.
 fn drive_inbox_seen() -> Seen {
-    let (h, _store) = delivered(54);
-    let seen = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
-    assert!(seen.starts_with("OK seen=1"), "{seen}");
+    let (h, store) = delivered(54);
+    let line = format!(
+        "{} off=9 from=s-peer@n-lab kind=ask trust=agent text=SENTINEL",
+        h.ctx.self_id.as_str()
+    );
+    assert_eq!(
+        crate::fabric::cmd_deliver_waking(&store, &line, &|_| {}),
+        "OK 2\n"
+    );
     during(&h.ctx.timeline, || {
-        let _ = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
+        for (args, reply) in [
+            ("1 handled", "OK seen=1\n"),
+            ("1 handled", "OK seen=1\n"),
+            ("2", "OK seen=2\n"),
+        ] {
+            assert_eq!(crate::fabric::cmd_inbox_seen(&h.ctx, args), reply);
+        }
     })
 }
 
@@ -868,38 +1241,67 @@ fn post(h: &SessionHandle) {
         "to=@s-peer kind=ask dl=60000 key=k1 --wait=0 SENTINEL-POST",
         None,
     );
-    assert!(
-        reply.starts_with("OK 1") || reply.contains(" id=1 "),
-        "{reply}"
-    );
+    assert!(queued(&reply, 1), "{reply}");
 }
 
+/// A post with every option (6F-6), then a broadcast on a topic: its
+/// `to=say:<topic>` is the topic's fingerprint on the record.
 fn drive_post() -> Seen {
     let (h, _store) = rig(55);
-    during(&h.ctx.timeline, || post(&h))
-}
-
-fn drive_landed() -> Seen {
-    let (h, store) = rig(56);
-    post(&h);
-    let line = format!("{} 1 off=-", h.ctx.self_id.as_str());
     during(&h.ctx.timeline, || {
-        let reply = crate::fabric::cmd_outbox_sent_waking(&store, &line, &|_| {});
-        assert!(reply.starts_with("OK"), "{reply}");
+        post(&h);
+        let reply = crate::fabric::cmd_post(
+            &h.ctx,
+            "to=say:builds kind=note re=7 via=n-lab --wait=0 SENTINEL-POST",
+            None,
+        );
+        assert!(queued(&reply, 2), "{reply}");
     })
 }
 
+/// Two posts retired: one landed at an offset, one nowhere (`off=-`).
+fn drive_landed() -> Seen {
+    let (h, store) = rig(56);
+    post(&h);
+    post_again(&h);
+    let sid = h.ctx.self_id.as_str().to_string();
+    during(&h.ctx.timeline, || {
+        for line in [format!("{sid} 1 off=90"), format!("{sid} 2 off=-")] {
+            let reply = crate::fabric::cmd_outbox_sent_waking(&store, &line, &|_| {});
+            assert!(reply.starts_with("OK"), "{line}: {reply}");
+        }
+    })
+}
+
+/// A second post from `h` (post id 2).
+fn post_again(h: &SessionHandle) {
+    let reply = crate::fabric::cmd_post(&h.ctx, "to=@s-peer kind=note --wait=0 SENTINEL", None);
+    assert!(queued(&reply, 2), "{reply}");
+}
+
+/// Whether `post`'s reply says post `id` is queued, whatever the link: `OK
+/// <id>`, or a refusal of the wait that names the queued id (`ERR fabric
+/// absent id=<id>` with no bridge, `ERR timeout id=<id>` while a parallel
+/// test's link section has one up).
+pub(super) fn queued(reply: &str, id: u64) -> bool {
+    let named = format!("id={id}");
+    reply.starts_with(&format!("OK {id}")) || reply.split_whitespace().any(|t| t == named)
+}
+
+/// The owner's hold, on with its reason and lifted.
 fn drive_hold() -> Seen {
     let (h, store) = rig(57);
-    let line = format!("{} on reason=demo", h.ctx.self_id.as_str());
+    let sid = h.ctx.self_id.as_str().to_string();
     during(&h.ctx.timeline, || {
-        let reply = crate::fabric::cmd_hold_waking(
-            &store,
-            &line,
-            crate::fabric::HoldIssuer::Owner,
-            &|_| {},
-        );
-        assert!(reply.starts_with("OK hold="), "{reply}");
+        for rest in ["on reason=demo", "off"] {
+            let reply = crate::fabric::cmd_hold_waking(
+                &store,
+                &format!("{sid} {rest}"),
+                crate::fabric::HoldIssuer::Owner,
+                &|_| {},
+            );
+            assert!(reply.starts_with("OK hold="), "{reply}");
+        }
     })
 }
 
@@ -910,7 +1312,414 @@ fn drive_topic() -> Seen {
             h.ctx.fabric.topic_add("news", "head", &h.ctx.timeline),
             Ok(true)
         );
+        assert!(h.ctx.fabric.topic_drop("news", &h.ctx.timeline));
     })
+}
+
+/// A bridge attached to `store` and its link up: the fabric's `connected`
+/// (inside [`crate::fabric::with_link_reset`]).
+pub(super) fn link_up(store: &Store) -> crate::fabric::BridgeGeneration {
+    let generation = crate::fabric::next_bridge_generation();
+    crate::fabric::bridge_attached(generation);
+    assert!(crate::fabric::link_report(
+        store,
+        Some(generation),
+        true,
+        "",
+        Some(1)
+    ));
+    generation
+}
+
+/// THE FETCH'S OWN WRITER (`inbox get @<off>`): a read the ring cannot
+/// answer parks, writing its `fetch` row as it parks (the watchers' ring a
+/// one-minute hang detector), and the bridge's `fetched= err=no-record`
+/// answer ends it (inside [`crate::fabric::with_link_reset`]).
+pub(super) fn fetch_answered(h: &SessionHandle, store: &Store, off: u64) {
+    let watcher = crate::session_watch::Subscription::single(&h.ctx.watchers);
+    let ctx = Arc::clone(&h.ctx);
+    let reader =
+        std::thread::spawn(move || crate::fabric::cmd_inbox_get(&*ctx, &format!("@{off}")));
+    // The row is written under the inbox guard the read parks with: once
+    // it is there, the bridge's answer lands in the read's own slot.
+    let asked = |h: &SessionHandle| {
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .any(|e| e.kind == "fetch" && *e.payload == *format!("off={off}"))
+    };
+    while !asked(h) {
+        assert!(
+            watcher.wait(aterm_spec::wait::MUST_HAPPEN),
+            "the fetch never parked"
+        );
+    }
+    let answer = format!("{} fetched={off} err=no-record", h.ctx.self_id.as_str());
+    let reply = crate::fabric::cmd_deliver_waking(store, &answer, &|_| {});
+    assert_eq!(reply, "OK\n", "{answer}");
+    let read = reader.join().expect("the reader");
+    assert!(read.starts_with("ERR "), "{read}");
+}
+
+fn drive_fetch() -> Seen {
+    crate::fabric::with_link_reset(|| {
+        let (h, store) = rig(63);
+        let _ = link_up(&store);
+        during(&h.ctx.timeline, || fetch_answered(&h, &store, 7))
+    })
+}
+
+/// THE ADVISORY'S OWN WRITER: a bridge that governed the session (a
+/// delivery) is lost, and by default nothing is held: an advisory is put
+/// (inside [`crate::fabric::with_link_reset`]).
+fn drive_advisory() -> Seen {
+    crate::fabric::with_link_reset(|| {
+        let (h, store) = rig(64);
+        let generation = link_up(&store);
+        let line = format!(
+            "{} off=7 from=h-andrew kind=note trust=human text=SENTINEL",
+            h.ctx.self_id.as_str()
+        );
+        assert_eq!(
+            crate::fabric::cmd_deliver_waking(&store, &line, &|_| {}),
+            "OK 1\n"
+        );
+        during(&h.ctx.timeline, || {
+            assert_eq!(crate::fabric::bridge_lost(&store, generation), 1);
+        })
+    })
+}
+
+/// The longest principal of `class` the grammar admits: its prefix and
+/// [`aterm_types::fabric_grammar::PRINCIPAL_NAME_MAX`] bytes of `fill`.
+fn longest(class: &str, fill: &str) -> String {
+    format!(
+        "{class}-{}",
+        fill.repeat(aterm_types::fabric_grammar::PRINCIPAL_NAME_MAX)
+    )
+}
+
+/// MAIL AT ITS PRODUCER'S BOUNDS (the review of 6F-6): a delivery from the
+/// longest sender the grammar admits (`s-<32>@n-<32>`, 69 bytes), then its
+/// `inbox seen` with a verdict, which names that sender too.
+fn drive_mail_at_its_bounds() -> Seen {
+    let (h, store) = rig(66);
+    let from = format!("{}@{}", longest("s", "c"), longest("n", "d"));
+    let line = format!(
+        "{} off=7 from={from} kind=ask trust=agent text=SENTINEL",
+        h.ctx.self_id.as_str()
+    );
+    during(&h.ctx.timeline, || {
+        assert_eq!(
+            crate::fabric::cmd_deliver_waking(&store, &line, &|_| {}),
+            "OK 1\n"
+        );
+        assert_eq!(
+            crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled"),
+            "OK seen=1\n"
+        );
+    })
+}
+
+/// A POST AT ITS PRODUCER'S BOUNDS (the review of 6F-6): to the longest
+/// address (`@s-<32>@n-<32>`), of the longest kind, `re=` and `dl=` at their
+/// widest, through sixteen hops of the longest principal (559 bytes) and
+/// with a 64-byte key — a record the hops leave no room in, so they are cut
+/// there, its row cut by the ring's 256 bytes — then a broadcast whose row
+/// shows 233 bytes of the same hops.
+fn drive_post_at_its_bounds() -> Seen {
+    let via = vec![longest("n", "v"); aterm_types::fabric_grammar::VIA_MAX_HOPS].join(",");
+    let (h, _store) = rig(67);
+    during(&h.ctx.timeline, || {
+        let reply = crate::fabric::cmd_post(
+            &h.ctx,
+            &format!(
+                "to=@{}@{} kind=control re={max} dl={max} via={via} key={} --wait=0 SENTINEL",
+                longest("s", "a"),
+                longest("n", "b"),
+                "k".repeat(crate::fabric::KEY_MAX),
+                max = u64::MAX
+            ),
+            None,
+        );
+        assert!(queued(&reply, 1), "{reply}");
+        let reply = crate::fabric::cmd_post(
+            &h.ctx,
+            &format!("to=say kind=note via={via} --wait=0 SENTINEL"),
+            None,
+        );
+        assert!(queued(&reply, 2), "{reply}");
+    })
+}
+
+/// A HOLD AT ITS PRODUCER'S BOUNDS (the review of 6F-6): an owner's local
+/// hold whose reason is a flood of `%` (each the caller's literal percent,
+/// its own escape: 42 of them), then the fleet's hold over it, by the
+/// bridge (the longest record's author), whose reason is 42 escapes and two
+/// bytes (128 bytes, 212 encoded: the cap), both standing
+/// (`hold_origin=fleet,local`), then each lifted by its own.
+fn drive_hold_at_its_bounds() -> Seen {
+    use crate::fabric::HoldIssuer::{Bridge, Owner};
+    let (h, store) = rig(68);
+    let sid = h.ctx.self_id.as_str().to_string();
+    let flood = format!("{}ab", "%".repeat(126));
+    let escapes = format!("{}ab", "%E9".repeat(42));
+    during(&h.ctx.timeline, || {
+        for (rest, issuer) in [
+            (format!("on reason={flood} origin=local"), Owner),
+            (format!("on reason={escapes} origin=fleet"), Bridge),
+            ("off origin=fleet".to_string(), Bridge),
+            ("off origin=local".to_string(), Owner),
+        ] {
+            let reply =
+                crate::fabric::cmd_hold_waking(&store, &format!("{sid} {rest}"), issuer, &|_| {});
+            assert!(reply.starts_with("OK hold="), "{rest}: {reply}");
+        }
+    })
+}
+
+/// A KEYED WRITE IN DOUBT AT ITS PRODUCER'S BOUNDS (the review of 6F-7): a
+/// reply whose words are longer than the log's `reply=` holds, and one with
+/// a hidden character: the row prints the words as the mark holds them.
+fn drive_in_doubt_at_its_bounds() -> Seen {
+    let (h, _store) = rig(69);
+    let key = |seq: u64| {
+        crate::pty_idem::parse_key(&format!("{}:3:{seq}", h.ctx.nonce.to_hex()), h.ctx.nonce)
+            .expect("a key")
+    };
+    let long = format!("ERR {} tail\n", "x".repeat(300));
+    during(&h.ctx.timeline, || {
+        let _ = crate::pty_idem::record_in_doubt(&h.ctx, "send", key(11), &long);
+        let _ =
+            crate::pty_idem::record_in_doubt(&h.ctx, "send", key(12), "ERR\u{200b}hidden words\n");
+    })
+}
+
+/// Every mode this test can leave on: the kitty keyboard (main and alt), the
+/// alternate screen, mouse reports and their encoding, focus, size and
+/// colour-scheme reports, the alternate scroll off, the xterm keyboard,
+/// cursor and keypad keys, backarrow, num lock, meta and alt sending escape,
+/// insert, newline, reverse video, the DEC graphics in G0 shifted into GL, a
+/// hidden cursor, an open hyperlink, origin mode, margins and a region, a
+/// palette colour, synchronized output, and a sequence cut short.
+const MODES_ON: &[u8] = b"\x1b[>1u\x1b[?1049h\x1b[>1u\x1b[?1000h\x1b[?1006h\x1b[?1004h\
+    \x1b[?2048h\x1b[?2031h\x1b[?1007l\x1b[>4;2m\x1b[>4;1f\x1b[?1h\x1b=\x1b[?67h\x1b[?1035h\
+    \x1b[?1036h\x1b[?1039h\x1b[4h\x1b[20h\x1b[?5h\x1b(0\x0e\x1b[?25l\x1b]8;;http://x\x1b\\\
+    \x1b[?6h\x1b[?69h\x1b[2;10s\x1b[2;10r\x1b]4;1;rgb:00/00/00\x1b\\\x1b[?2026h\x1b[1";
+
+/// A HANDBACK AT ITS PRODUCER'S BOUNDS (the review of 6F-7): a terminal a
+/// program left with [`MODES_ON`], handed back through the reader's own
+/// recorder with the engine's own list of what it put back, longer than the
+/// row's payload shows.
+fn drive_modes_at_its_bounds() -> Seen {
+    let mut t = aterm_core::terminal::Terminal::new(24, 80);
+    t.process(MODES_ON);
+    let back = t.foreground_handback().expect("the alt screen is evidence");
+    let joined = back.reverted.join(",");
+    assert!(joined.len() > 200, "{} bytes: {joined}", joined.len());
+    let (h, _store) = rig(70);
+    during(&h.ctx.timeline, || {
+        let _ = crate::foreground_handback::record_restored(
+            &mut h.ctx.timeline.lock().unwrap(),
+            crate::foreground_handback::FgEdge::group(0, 300, 301),
+            &back.reverted,
+            back.bytes.len(),
+        );
+    })
+}
+
+/// A kind that left [`KNOWN_DIFFERENCES`] for [`EXACT`] (phase 6, 6F-5 to
+/// 6F-7), with its row's own writer, driven, and a key its projection
+/// cannot do without (the negative control's).
+struct Driven {
+    row: &'static str,
+    drive: fn() -> Seen,
+    needs: Key,
+}
+
+/// Every [`EXACT`] kind 5B-6's script does not write, through its writer.
+const DRIVEN: &[Driven] = &[
+    Driven {
+        row: "state-change",
+        drive: drive_state,
+        needs: Key::State,
+    },
+    Driven {
+        row: crate::harness_policy_verb::HARNESS_POLICY_EVENT,
+        drive: drive_policy,
+        needs: Key::Gen,
+    },
+    Driven {
+        row: "hold-advisory",
+        drive: drive_advisory,
+        needs: Key::Reason,
+    },
+    Driven {
+        row: "fetch",
+        drive: drive_fetch,
+        needs: Key::Off,
+    },
+    Driven {
+        row: "topic",
+        drive: drive_topic,
+        needs: Key::TopicName,
+    },
+    Driven {
+        row: "inbox-seen",
+        drive: drive_inbox_seen,
+        needs: Key::Seen,
+    },
+    Driven {
+        row: "post",
+        drive: drive_post,
+        needs: Key::Idem,
+    },
+    Driven {
+        row: "post-landed",
+        drive: drive_landed,
+        needs: Key::Off,
+    },
+    Driven {
+        row: "hold",
+        drive: drive_hold,
+        needs: Key::Reason,
+    },
+    Driven {
+        row: "spawned",
+        drive: drive_spawned,
+        needs: Key::State,
+    },
+    Driven {
+        row: "closing",
+        drive: drive_closing,
+        needs: Key::Closer,
+    },
+    Driven {
+        row: "render",
+        drive: drive_render,
+        needs: Key::Run,
+    },
+    Driven {
+        row: "modes-restored",
+        drive: drive_modes,
+        needs: Key::Reverted,
+    },
+    Driven {
+        row: "in-doubt",
+        drive: drive_in_doubt,
+        needs: Key::KeySeq,
+    },
+    Driven {
+        row: "handoff",
+        drive: drive_handoff,
+        needs: Key::Build,
+    },
+    // AT THEIR PRODUCERS' BOUNDS (the review of 6F-6 and 6F-7): each row's
+    // longest values, whole in the log, where the ring's 256 bytes show them.
+    Driven {
+        row: "inbox",
+        drive: drive_mail_at_its_bounds,
+        needs: Key::From,
+    },
+    Driven {
+        row: "post",
+        drive: drive_post_at_its_bounds,
+        needs: Key::Via,
+    },
+    Driven {
+        row: "hold",
+        drive: drive_hold_at_its_bounds,
+        needs: Key::Reason,
+    },
+    Driven {
+        row: "in-doubt",
+        drive: drive_in_doubt_at_its_bounds,
+        needs: Key::Reply,
+    },
+    Driven {
+        row: "modes-restored",
+        drive: drive_modes_at_its_bounds,
+        needs: Key::Reverted,
+    },
+];
+
+/// EVERY EXACT KIND AGREES THROUGH ITS OWN WRITER (phase 6, 6F-5 to 6F-7):
+/// each [`DRIVEN`] kind's writer, driven as production runs it, writes rows
+/// whose every exact pair is a record of the log, projected, row for record
+/// and in order: the whole payload. Every [`EXACT`] kind is the script's or
+/// [`DRIVEN`]'s. NEGATIVE CONTROL: each kind's projection without the key
+/// its row cannot do without differs.
+#[test]
+fn every_exact_kind_agrees_through_its_own_writer() {
+    for kind in EXACT {
+        assert!(
+            SCRIPTED.contains(&kind) || DRIVEN.iter().any(|d| d.row == kind),
+            "{kind} is checked nowhere"
+        );
+    }
+    // Every kind is judged, and every one that fails is named.
+    let mut errs = Vec::new();
+    for d in DRIVEN {
+        let s = (d.drive)();
+        let rows = only(s.rows.clone(), &EXACT);
+        let log = only(projected(&s.log, None), &EXACT);
+        if !rows.iter().any(|(k, _)| k == d.row) {
+            errs.push(format!("{}: the writer wrote no row: {:?}", d.row, s.rows));
+        } else if log != rows {
+            errs.push(format!(
+                "{}: the log's records {log:?} against the ring's rows {rows:?} ({:?})",
+                d.row, s.recs
+            ));
+        } else if only(projected(&s.log, Some(d.needs)), &EXACT) == rows {
+            errs.push(format!(
+                "{}: a projection without {:?} agrees",
+                d.row, d.needs
+            ));
+        }
+    }
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+/// THE SESSION ROWS' WORDS ARE THE LOG'S (6F-7): each word a session row
+/// prints for a field its mark carries as a closed word is in that key's
+/// list, so the mark always carries it and the projection prints the
+/// row's word — a render epoch's program class and healer (an open
+/// epoch's `-` is no word, and its mark has no `healed_by=`), a reset's
+/// source, and a close's reason (the session close's `out=` for each
+/// `ExitReason`). NEGATIVE CONTROL: a word outside a list is refused.
+#[test]
+fn the_session_rows_words_are_the_logs() {
+    use crate::manual_reset::ResetSource;
+    use crate::resize_epoch::{EpochBy, ProgramClass};
+    let words = |k: Key| match k.cap() {
+        aterm_slog::Cap::Word(w) => w,
+        cap => panic!("{k:?} is {cap:?}"),
+    };
+    assert_eq!(
+        words(Key::Class),
+        [
+            ProgramClass::Agent,
+            ProgramClass::Learned,
+            ProgramClass::Unknown
+        ]
+        .map(ProgramClass::wire)
+    );
+    assert_eq!(
+        words(Key::HealedBy),
+        [EpochBy::App, EpochBy::Undo, EpochBy::Nudge].map(EpochBy::wire)
+    );
+    assert_eq!(EpochBy::None.wire(), "-");
+    assert_eq!(
+        words(Key::Source),
+        [ResetSource::Verb, ResetSource::Menu].map(ResetSource::as_str)
+    );
+    for r in ExitReason::ALL {
+        let out = aterm_slog::Out::Session(crate::session_log::exit_out(r));
+        assert_eq!(out.word(), r.as_str(), "{r:?}");
+    }
+    assert!(Fields::new().word(Key::Source, "palette").is_err());
 }
 
 /// THE TABLE IS WHOLE: every kind of §0.1 is an exact pair, a superset
@@ -951,11 +1760,11 @@ fn every_timeline_kind_is_an_exact_pair_or_a_named_difference() {
 }
 
 /// EVERY NAMED DIFFERENCE STILL HOLDS, through its row's own writer: a
-/// step that closes one (a record where there was none, a field the record
-/// now carries, a record on the row's own trigger) turns this red, and its
-/// row moves to [`EXACT`] in the same commit. The two writers no unit test
-/// reaches are named. NEGATIVE CONTROL: each kind of difference, closed on
-/// what its driver wrote, fails.
+/// step that closes one (a field the record now carries, a record on the
+/// row's own trigger) turns this red, and its row moves to [`EXACT`] in the
+/// same commit. Every writer is driven (since 6F-5 the fetch and the
+/// advisory too, under the live link's test reset). NEGATIVE CONTROL: each
+/// kind of difference, closed on what its driver wrote, fails.
 #[test]
 fn every_named_difference_still_holds() {
     let mut errs = Vec::new();
@@ -974,7 +1783,7 @@ fn every_named_difference_still_holds() {
         .filter(|k| k.drive.is_none())
         .map(|k| k.row)
         .collect();
-    assert_eq!(undriven, ["fetch", "hold-advisory"]);
+    assert!(undriven.is_empty(), "every writer is driven: {undriven:?}");
     // NEGATIVE CONTROLS: each difference closed.
     let known = |row: &str| {
         KNOWN_DIFFERENCES
@@ -982,23 +1791,39 @@ fn every_named_difference_still_holds() {
             .find(|k| k.row == row)
             .expect("named")
     };
+    // A retained kind whose newest record is a stale state, and one with a
+    // record more than its rows.
     let mut program = seen["program-state"].clone();
-    program
-        .recs
-        .push("9 mark - unknown state=working src=engine conf=claim t=1".into());
+    if let Some(l) = program.recs.last_mut() {
+        *l = l.replace(" state=none ", " state=working ");
+    }
     assert!(
         holds(known("program-state"), &program).is_err(),
-        "a program record"
+        "a stale newest program record"
     );
-    let mut hold = seen["hold"].clone();
-    for l in &mut hold.recs {
-        if op_kind(l) == "mark hold" {
-            *l = l.replace(" state=on ", " state=on reason=demo ");
+    let mut program = seen["program-state"].clone();
+    let first = program.recs[0].clone();
+    program.recs.insert(0, first);
+    assert!(
+        holds(known("program-state"), &program).is_err(),
+        "a program record more than its rows"
+    );
+    let mut meta = seen["meta-change"].clone();
+    let row = meta
+        .rows
+        .iter()
+        .find(|(k, _)| k == "meta-change")
+        .map(|(_, p)| p.clone())
+        .expect("a meta row");
+    let v = value(&row, "value").expect("its value").to_string();
+    for l in &mut meta.recs {
+        if op_kind(l) == "mark meta" {
+            *l = l.replace(" src=", &format!(" value={v} src="));
         }
     }
     assert!(
-        holds(known("hold"), &hold).is_err(),
-        "a hold with its reason"
+        holds(known("meta-change"), &meta).is_err(),
+        "a meta mark with its value"
     );
     let mut title = seen["title-change"].clone();
     title
@@ -1008,18 +1833,8 @@ fn every_named_difference_still_holds() {
         holds(known("title-change"), &title).is_err(),
         "a title mark"
     );
-    let mut act = seen[crate::session_timeline::HARNESS_ACT].clone();
-    for l in &mut act.recs {
-        if op_kind(l) == "mark act" {
-            *l = l.replace(" word=", " holder=codex-alab@1 word=");
-        }
-    }
-    assert!(
-        holds(known(crate::session_timeline::HARNESS_ACT), &act).is_err(),
-        "an act mark with its holder"
-    );
     let none = Seen::default();
-    assert!(holds(known("state-change"), &none).is_err(), "no row");
+    assert!(holds(known("title-change"), &none).is_err(), "no row");
 }
 
 // ---- exits --------------------------------------------------------------------
@@ -1130,7 +1945,7 @@ fn the_roster_and_the_closed_index_agree_on_every_exit() {
             let mut g = ctx.timeline.lock().unwrap();
             if g.slog().log().is_empty() {
                 let now = g.slog().now();
-                g.slog_mut().open_session(None, now);
+                g.slog_mut().open_session(None, None, now);
             }
         }
         n += 1;

@@ -22,7 +22,7 @@
 //!   that) and re-stamps the clock, spending the interrupted gap credit.
 //!
 //! With `RATE × τ = 1.3` the flood equilibrium clamps at 1.0; flat-out typing
-//! crosses the cat's 0.75 band in ~1.7 s and reaches 1.0 in ~2.9 s, the arc
+//! crosses the cat's 0.65 band in ~1.4 s and reaches 1.0 in ~2.9 s, the arc
 //! the thresholds in [`crate::kitty_cursor`] are tuned against.
 
 use aterm_time::Instant;
@@ -70,11 +70,18 @@ impl TypingMomentum {
     /// [`TYPING_MOMENTUM_TAU`], snapping to exactly 0 once negligible.
     #[must_use]
     pub fn value(&self, now: Instant) -> f32 {
+        if self.value < SNAP_ZERO {
+            return 0.0;
+        }
         let Some(at) = self.at else {
             return 0.0;
         };
         let dt = now.saturating_duration_since(at).as_secs_f32();
-        let v = self.value * (-dt / TYPING_MOMENTUM_TAU).exp();
+        let v = if dt == 0.0 {
+            self.value
+        } else {
+            self.value * (-dt / TYPING_MOMENTUM_TAU).exp()
+        };
         if v < SNAP_ZERO { 0.0 } else { v }
     }
 

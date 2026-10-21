@@ -141,6 +141,15 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
     for line in attested.log.lines() {
         let _ = writeln!(log, "    {line}");
     }
+    if !attested.unverified.is_empty() {
+        notes += 1;
+        let _ = writeln!(
+            log,
+            "  • NOTE [OB-7] UNVERIFIED for {}: attest diffed none of its files (no pristine copy \
+             here), so this check does not attest its §4(b) notices.",
+            attested.unverified.join(", ")
+        );
+    }
     if let Some(why) = attested.could_not_run {
         could_not_run.get_or_insert(why);
     } else if !attested.ok {
@@ -714,6 +723,7 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
                 live_build,
                 carved: carved.len(),
                 notes,
+                unverified: &attested.unverified,
             })
         );
     } else {
@@ -735,7 +745,7 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
 // --- pieces ----------------------------------------------------------------
 
 /// What a green `forge check` run measured, for [`green_verdict`].
-struct GreenCounts {
+struct GreenCounts<'a> {
     /// Vendored forks (third-party source under review).
     forks: usize,
     /// Absorbed crates (upstream source aterm owns as workspace members).
@@ -751,15 +761,25 @@ struct GreenCounts {
     live_build: usize,
     carved: usize,
     notes: usize,
+    /// The forks attest's `[OB-7]` could not diff ([`attest::Attestation::unverified`]).
+    unverified: &'a [String],
 }
 
 /// The sentence a green run ends on: where the patch targets are live, as
 /// measured.
 fn green_verdict(c: &GreenCounts) -> String {
+    let attested = if c.unverified.is_empty() {
+        "provenance attested".to_string()
+    } else {
+        format!(
+            "provenance attested except [OB-7] for {} (UNVERIFIED)",
+            c.unverified.join(", ")
+        )
+    };
     format!(
         "forge check: GREEN — {} vendored fork(s) + {} absorbed crate(s) + {} first-party patch \
          target(s): {} live in all {} cells, {} in some, {} build-only; no unpatched sibling; \
-         {} carved path(s) absent; provenance attested; {} note(s).",
+         {} carved path(s) absent; {attested}; {} note(s).",
         c.forks,
         c.absorbed,
         c.first_party,
@@ -1286,6 +1306,34 @@ fn describe(finding: &crate::deny::Finding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A GREEN run whose attest could not diff a fork says so instead of "provenance attested";
+    /// the control, with nothing unverified, keeps the plain words.
+    #[test]
+    fn a_green_verdict_names_the_forks_ob7_could_not_diff() {
+        let counts = |unverified: &[String]| {
+            green_verdict(&GreenCounts {
+                forks: 0,
+                absorbed: 0,
+                first_party: 14,
+                cells: 8,
+                live_all: 0,
+                live_some: 0,
+                live_build: 0,
+                carved: 0,
+                notes: unverified.len(),
+                unverified,
+            })
+        };
+        let plain = counts(&[]);
+        assert!(plain.contains("; provenance attested;"), "{plain}");
+        let winit = counts(&["winit".to_string()]);
+        assert!(
+            winit.contains("provenance attested except [OB-7] for winit (UNVERIFIED)"),
+            "{winit}"
+        );
+    }
+
     /// Only a `path` patch is a fork; `git` and `version` patches are named
     /// apart, and a manifest with no patch table has neither.
     #[test]

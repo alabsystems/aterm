@@ -7,9 +7,20 @@ use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// aterm-win32's hand-written modules (under its `src/`): the COM vocabulary
+/// and the DXGI slice of `windows` 0.62.2, which windows-sys does not carry.
+/// `gen` neither emits nor deletes them, and their `crate::` paths into the
+/// generated tree are harvested like a consumer's.
+pub const HAND_WRITTEN: [&str; 2] = ["com.rs", "dxgi.rs"];
+/// The crate first-party code names directly (`aterm_win32::`), as against
+/// the `windows-sys` facade third-party code reaches.
+const CRATE: &str = "aterm-win32";
+
 pub struct Model {
     pub up: Upstream,
     pub consumers: BTreeMap<(String, String), PathBuf>,
+    /// The packages that name `aterm_win32` themselves, not the facade.
+    pub direct: BTreeMap<(String, String), PathBuf>,
     pub enabled: BTreeSet<String>,
     pub requested: BTreeSet<String>,
     pub seeds: BTreeMap<Key, BTreeSet<String>>,
@@ -56,6 +67,7 @@ impl Model {
     pub fn load(root: &Path, upstream: &Path, tools: &Tools) -> Result<Self> {
         let up = Upstream::load(upstream)?;
         let mut consumers = BTreeMap::new();
+        let mut direct = BTreeMap::new();
         let mut features = BTreeSet::new();
         for triple in TRIPLES {
             let meta = metadata(root, tools, Some(triple))?;
@@ -72,15 +84,23 @@ impl Model {
                 ));
             }
             let target = targets[0];
+            let own: Vec<_> = pkgs
+                .iter()
+                .filter(|(_, p)| p.get("name").and_then(Value::as_str) == Some(CRATE))
+                .map(|(id, _)| id)
+                .collect();
             for node in nodes(&meta)? {
-                if array(node, "deps")?
-                    .iter()
-                    .any(|d| d.get("pkg").and_then(Value::as_str) == Some(target.as_str()))
-                {
-                    let p = pkgs
-                        .get(text(node, "id")?)
-                        .ok_or("resolve names absent package")?;
-                    consumers.insert(
+                let names = |id: &str| {
+                    array(node, "deps").map(|deps| {
+                        deps.iter()
+                            .any(|d| d.get("pkg").and_then(Value::as_str) == Some(id))
+                    })
+                };
+                let p = pkgs
+                    .get(text(node, "id")?)
+                    .ok_or("resolve names absent package")?;
+                let entry = || -> Result<_> {
+                    Ok((
                         (
                             text(p, "name")?.to_string(),
                             text(p, "version")?.to_string(),
@@ -89,7 +109,16 @@ impl Model {
                             .parent()
                             .ok_or("manifest has no parent")?
                             .to_path_buf(),
-                    );
+                    ))
+                };
+                if names(target.as_str())? {
+                    let (k, v) = entry()?;
+                    consumers.insert(k, v);
+                }
+                // The facade itself names aterm-win32 only to re-export it.
+                if !is_target(p) && own.iter().any(|id| names(id.as_str()).unwrap_or(false)) {
+                    let (k, v) = entry()?;
+                    direct.insert(k, v);
                 }
             }
             let spec = format!("windows-sys@{VERSION}");
@@ -143,13 +172,49 @@ impl Model {
         let mut notes = vec![];
         for ((name, _), dir) in &consumers {
             for file in rust_files(dir)? {
-                harvest_file(&up, &file, name, &enabled, &mut seeds, &mut notes)?
+                harvest_file(
+                    &up,
+                    &file,
+                    name,
+                    "windows_sys",
+                    &enabled,
+                    &mut seeds,
+                    &mut notes,
+                )?
             }
         }
         let keep = closure(&up, seeds.keys().cloned().collect(), &enabled)?;
+        // aterm-win32 has no features: what a direct consumer or the crate's
+        // hand-written modules name is resolved against every upstream
+        // feature, and enables the features upstream gates it on.
+        let every = up.implied(&up.features.keys().cloned().collect())?;
+        let mut own = BTreeMap::new();
+        let mut sources = vec![];
+        for ((name, _), dir) in &direct {
+            for file in rust_files(dir)? {
+                sources.push((name.clone(), "aterm_win32", file));
+            }
+        }
+        for file in HAND_WRITTEN {
+            sources.push((
+                CRATE.to_string(),
+                "crate",
+                root.join("crates/aterm-win32/src").join(file),
+            ));
+        }
+        for (name, token, file) in sources {
+            harvest_file(&up, &file, &name, token, &every, &mut own, &mut notes)?
+        }
+        let (direct_keep, enabled) = grown_closure(&up, own.keys().cloned().collect(), enabled)?;
+        for (key, by) in own {
+            seeds.entry(key).or_default().extend(by);
+        }
+        let mut keep = keep;
+        keep.extend(direct_keep);
         Ok(Self {
             up,
             consumers,
+            direct,
             enabled,
             requested,
             seeds,
@@ -172,8 +237,9 @@ impl Model {
             *kinds.entry(&it.kind).or_default() += 1
         }
         format!(
-            "consumers: {:?}\nfeatures: {}; lock features: {}\nseeds: {}; closure: {} names, {} declarations ({kinds:?})",
+            "consumers: {:?}; direct: {:?}\nfeatures: {}; lock features: {}\nseeds: {}; closure: {} names, {} declarations ({kinds:?})",
             self.consumers.keys().collect::<Vec<_>>(),
+            self.direct.keys().collect::<Vec<_>>(),
             self.enabled.len(),
             self.requested.len(),
             self.seeds.len(),
@@ -187,6 +253,21 @@ pub fn closure(
     seeds: BTreeSet<Key>,
     enabled: &BTreeSet<String>,
 ) -> Result<BTreeSet<Key>> {
+    gated_closure(up, seeds, enabled)?.map_err(|key| {
+        format!(
+            "closure reaches a gated or absent item {}::{}",
+            key.0.join("::"),
+            key.1
+        )
+    })
+}
+/// The closure of `seeds` under `enabled`, or the first item it reaches that
+/// `enabled` gates off.
+fn gated_closure(
+    up: &Upstream,
+    seeds: BTreeSet<Key>,
+    enabled: &BTreeSet<String>,
+) -> Result<std::result::Result<BTreeSet<Key>, Key>> {
     let mut keep = BTreeSet::new();
     let mut todo: Vec<_> = seeds.into_iter().collect();
     while let Some(key) = todo.pop() {
@@ -195,17 +276,41 @@ pub fn closure(
         }
         let variants = up.variants(&key, enabled);
         if variants.is_empty() {
-            return Err(format!(
-                "closure reaches a gated or absent item {}::{}",
-                key.0.join("::"),
-                key.1
-            ));
+            return Ok(Err(key));
         }
         for it in variants {
             todo.extend(up.refs(it));
         }
     }
-    Ok(keep)
+    Ok(Ok(keep))
+}
+/// The closure of the direct seeds, `enabled` grown by the features upstream
+/// gates each reached item on (its modules' and its own) until nothing it
+/// reaches is gated off; an item no feature set reaches is an error.
+pub fn grown_closure(
+    up: &Upstream,
+    seeds: BTreeSet<Key>,
+    mut enabled: BTreeSet<String>,
+) -> Result<(BTreeSet<Key>, BTreeSet<String>)> {
+    let mut wanted: BTreeSet<String> = seeds.iter().flat_map(|k| up.gates(k)).collect();
+    loop {
+        wanted.extend(enabled.iter().cloned());
+        enabled = up.implied(&wanted)?;
+        match gated_closure(up, seeds.clone(), &enabled)? {
+            Ok(keep) => return Ok((keep, enabled)),
+            Err(key) => {
+                let gates = up.gates(&key);
+                if gates.is_subset(&enabled) {
+                    return Err(format!(
+                        "closure reaches an absent item {}::{}",
+                        key.0.join("::"),
+                        key.1
+                    ));
+                }
+                wanted.extend(gates);
+            }
+        }
+    }
 }
 pub fn rust_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut todo = vec![root.to_path_buf()];
@@ -273,6 +378,14 @@ impl Harvest<'_> {
             self.file.display(),
             self.source[..pos].bytes().filter(|b| *b == b'\n').count() + 1
         );
+        if segs.len() > 1
+            && HAND_WRITTEN
+                .iter()
+                .any(|f| f.strip_suffix(".rs") == Some(segs[1].as_str()))
+            && ["aterm_win32", "crate"].contains(&segs[0].as_str())
+        {
+            return Ok(None);
+        }
         let Some(key) = self.up.resolve(base, segs) else {
             self.notes.push(format!(
                 "{where_}: {} names no upstream item",
@@ -343,16 +456,21 @@ impl Harvest<'_> {
         Ok(i)
     }
 }
+/// Seeds every upstream declaration `file` names through `root`
+/// (`windows_sys` for the facade's consumers, `aterm_win32` for a direct one,
+/// `crate` in aterm-win32's own hand-written modules), whose paths to those
+/// hand-written modules are not upstream's.
 pub fn harvest_file(
     up: &Upstream,
     file: &Path,
     consumer: &str,
+    root: &str,
     enabled: &BTreeSet<String>,
     seeds: &mut BTreeMap<Key, BTreeSet<String>>,
     notes: &mut Vec<String>,
 ) -> Result<()> {
     let src = read(file)?;
-    if !src.contains("windows_sys") {
+    if !src.contains(root) {
         return Ok(());
     }
     let ts = raw_tokens(&src);
@@ -366,8 +484,18 @@ pub fn harvest_file(
         notes,
         aliases: BTreeMap::new(),
     };
+    let hand_written = |ts: &[Token], idx: usize| {
+        ts.get(idx + 2).is_some_and(|t| {
+            HAND_WRITTEN
+                .iter()
+                .any(|f| f.strip_suffix(".rs") == Some(t.text.as_str()))
+        })
+    };
     for (idx, t) in ts.iter().enumerate() {
-        if t.text != "windows_sys" || !ts.get(idx + 1).is_some_and(|t| t.text == "::") {
+        if t.text != root
+            || !ts.get(idx + 1).is_some_and(|t| t.text == "::")
+            || hand_written(&ts, idx)
+        {
             continue;
         }
         let back = if idx > 0 && ts[idx - 1].text == "::" {
@@ -376,10 +504,10 @@ pub fn harvest_file(
             idx.checked_sub(1)
         };
         if back.is_some_and(|b| ts[b].text == "use") {
-            h.use_tree(&ts, idx + 2, &["windows_sys".into()])?;
+            h.use_tree(&ts, idx + 2, &[root.into()])?;
             continue;
         }
-        let mut segs = vec!["windows_sys".to_string()];
+        let mut segs = vec![root.to_string()];
         let mut j = idx + 1;
         while j + 1 < ts.len()
             && ts[j].text == "::"

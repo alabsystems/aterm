@@ -267,10 +267,11 @@ fn pending_font_text_save() -> (App, crate::tab_model::ViewId) {
     let field = pending
         .semantic(&key)
         .expect("the pending field stays visible");
+    // It takes the next press while its save is on its way.
     assert!(
         field
             .state
-            .is_some_and(|state| !state.enabled && state.busy)
+            .is_some_and(|state| state.enabled && !state.busy)
     );
     (app, view)
 }
@@ -295,8 +296,8 @@ fn text_save_completion_preserves_newer_same_text_undo_history() {
     let (mut app, view) = pending_font_text_save();
     let submitted = font_input(&app, view).unwrap();
     let wid = WindowId(0);
-    // These go through the real keyboard route even while the semantic
-    // SetValue control is busy. Undo restores the text, not its old history.
+    // These go through the real keyboard route while the save is on its
+    // way. Undo restores the text, not its old history.
     assert!(app.native_input_event(wid, &crate::input::InputEvent::Text("X".to_string())));
     assert!(app.native_input_event(
         wid,

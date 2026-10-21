@@ -687,6 +687,7 @@ fn a_native_windows_claude_code_is_read_as_one() {
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             config: None,
             home: None,
+            stored_login: true,
         }),
         cwd: Some(PathBuf::from(r"C:\Users\x\proj")),
         started: None,
@@ -738,6 +739,7 @@ fn running(pid: u32, exe: &Path, argv: &[&str]) -> Process {
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             config: None,
             home: None,
+            stored_login: true,
         }),
         cwd: Some(PathBuf::from(r"C:\Users\x\proj")),
         started: None,
@@ -771,6 +773,7 @@ fn scratch_at(root: &str) -> Scratch {
         fstype: "NTFS".to_owned(),
         local: true,
         automounted: false,
+        removable: false,
         read_only: false,
         container: Some("Volume{6140fc3b-044f-43d7-b060-cb98170c7a63}".to_owned()),
     };
@@ -970,6 +973,8 @@ fn a_running_claude_holds_its_project_in_any_windows_spelling() {
         pid: 1,
         started: None,
         cwd: Some(PathBuf::from(cwd)),
+        profile: None,
+        stored_login: true,
     };
     let project = std::ffi::OsStr::new("C--Users-m6-an-aterm");
     for cwd in [

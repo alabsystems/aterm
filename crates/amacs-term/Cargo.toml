@@ -11,7 +11,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The amacs program: the face decision and the native client that hands a file to the aterm window hosting its tab and waits. The terminal UI and the machine protocol are planned in docs/DESIGN-amacs-2026-10-19.md."
+description = "The amacs program: the face decision, the native client that hands a file to the aterm window hosting its tab and waits, and the terminal UI that edits in the terminal itself everywhere else. The machine protocol is planned in docs/DESIGN-amacs-2026-10-19.md."
+
+[features]
+# Development seams (`aterm_types::dev_seam!`, read in the calling crate) in an
+# optimized build: the terminal face's injected panic (`tui.rs`). A debug build
+# compiles them anyway; the release build never enables this.
+dev-seams = []
 
 [dependencies]
 # The `edit` request and ticket replies, and the file-URI codec the window
@@ -21,10 +27,32 @@ amacs = { workspace = true }
 aterm-ctl = { path = "../aterm-ctl" }
 # The parent process's executable (`for=`), and a verb's answer on stdout.
 aterm-uds = { workspace = true }
+# The terminal face's file I/O, the GUI's own: admission (realpath, size
+# limit, UTF-8, BOM and CRLF kept, a missing file allowed), the atomic save
+# that refuses a file changed on disk, and the flock door.
+amacs-files = { workspace = true }
+# The terminal face's terminal: raw mode, the input decoder, the capability
+# probe and the diffing screen writer.
+aterm-tty = { workspace = true }
+# The key vocabulary the decoder hands the engine, and the ambiguous-width
+# policy the screen lays text out under.
+aterm-types = { workspace = true }
+# The type of the document store's write capability, which the launcher
+# mints (`aterm-cli`'s `amacs_launch`) and the terminal face's store takes.
+aterm-buffer = { path = "../aterm-buffer" }
+# Grapheme clusters for laying a projected line out cell by cell.
+aterm-grapheme = { workspace = true }
+# Base64 for the OSC 52 clipboard write a kill makes.
+aterm-codec = { workspace = true }
 
 [dev-dependencies]
 # Scratch directories for the realpath tests, removed on drop.
 aterm-tempfile = { workspace = true }
+# The terminal UI's tests mint a root authority for the store's write cap;
+# only a test may, below the launchers (the `launcher-mint` guard).
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
+# aterm's own engine as the screen oracle the terminal UI's output draws on.
+aterm-core = { workspace = true }
 
 [[test]]
 name = "amacs_term_suite"

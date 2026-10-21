@@ -133,6 +133,7 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         alt_wait_ms: take.alt_wait_ms,
         typed_gap_ms: take.typed_gap_ms,
         driven_ms: take.driven_ms,
+        band: take.band,
     })
 }
 
@@ -144,6 +145,7 @@ struct Take {
     alt_wait_ms: u64,
     typed_gap_ms: Option<(u64, u64)>,
     driven_ms: Option<(i64, i64)>,
+    band: super::instance::Band,
 }
 
 /// The config the row runs under: its style line first (the key absent for
@@ -228,6 +230,7 @@ fn run_take(
         alt_wait_ms,
         typed_gap_ms,
         driven_ms: capture.driven_ms,
+        band: inst.band.clone(),
     })
 }
 

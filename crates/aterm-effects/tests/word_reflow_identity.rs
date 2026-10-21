@@ -117,14 +117,14 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
         "positive control: first occurrence bursts"
     );
 
-    // Spend the complete 2400 ms supernova before the redraw under test.
+    // Past the 2400 ms supernova (`SUPER_TOTAL_MS`).
     let settled_at = t0 + Duration::from_millis(3000);
     let settled = tick(&mut engine, &cfg, settled_at);
     assert!(settled.nova.is_empty(), "the original burst is fully spent");
 
-    // A Codex-style full-row redraw, at the SAME terminal width, moves the old
-    // sentence down one row and right one column while the composer shows the
-    // nonmatching word `fix`. The moved surface/context is one logical episode.
+    // A Codex-style full-row redraw at the same width moves the old sentence down one row and
+    // right one column while the composer shows the nonmatching word `fix`: one logical
+    // episode.
     let redrawn = snapshot(&[(2, " old fuck remains visible"), (5, "fix")]);
     let moved_at = t0 + Duration::from_millis(3100);
     rescan(&mut engine, &lexicon, &cfg, &redrawn, 2, moved_at);
@@ -144,9 +144,8 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
         "the visible `fix` row owns no word-reaction decoration"
     );
 
-    // Warm both directions of the horizontal transfer, then measure a same-row
-    // scan and a rekey scan over the same two nonempty rows. Every scanner and
-    // identity buffer is resident: both paths must allocate absolutely nothing.
+    // Warm both directions of the transfer, then measure a same-row scan and a rekey scan over
+    // the same two rows: with every scanner and identity buffer resident, neither allocates.
     let redraw_back = snapshot(&[(1, "old fuck remains visible"), (5, "fix")]);
     rescan(
         &mut engine,
@@ -210,8 +209,7 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
     assert_eq!(no_match.fp, 0);
     assert!(no_match.decorations.is_empty() && no_match.ink.is_empty() && no_match.nova.is_empty());
 
-    // Preserve intentional new-occurrence behavior: a distinct profanity in a
-    // different sentence is not the moved episode and therefore still bursts.
+    // A distinct profanity in a different sentence is not the moved episode, so it still bursts.
     let with_new_occurrence = snapshot(&[
         (2, " old fuck remains visible"),
         (5, "fix"),
@@ -232,11 +230,9 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
         "positive control: a genuinely new occurrence still bursts"
     );
 
-    // Adversarial neighbor/status churn: every ±4 context voter changes, the
-    // exact profanity moves down one row and eight columns, and `fix` appears
-    // on that same physical row. This is the real Codex full-redraw witness:
-    // lexical matching is clean, but treating the old profanity as a fresh
-    // episode would make it look as though `fix` caused the flash.
+    // Neighbour churn: every ±4 context voter changes, the profanity moves down one row and
+    // eight columns, and `fix` appears on that row. Re-arming the old profanity as a fresh
+    // episode would look as though `fix` caused the flash.
     let mut churn_engine = WordDecorations::default();
     let before_churn = snapshot(&[(1, "one two three fuck four five six")]);
     rescan(&mut churn_engine, &lexicon, &cfg, &before_churn, 1, t0);

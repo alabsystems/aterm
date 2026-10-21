@@ -1367,6 +1367,9 @@ impl MessageCenter {
                 .map(|w| clip(&w, TITLE_CAP))
                 .filter(|w| !w.is_empty());
         }
+        if let Some(short) = r.short_title {
+            row.msg.short_title = short.map(|w| clip(&w, TITLE_CAP)).filter(|w| !w.is_empty());
+        }
         if let Some(detail) = r.detail {
             row.msg.detail = detail
                 .iter()

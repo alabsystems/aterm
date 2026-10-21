@@ -42,18 +42,35 @@
 //! [`TurnEndState::other_turn`], which must be the model's face and `other`,
 //! at every step.
 //!
+//! WHY LAND STILL HOLDS (the Autopilot design's §12.3.3): the projection
+//! holds the hold the real teller told its host too — the loop's one teller
+//! (`Session::tell_hold`: [`TurnEndState::held_moved`] asked after each
+//! point folded in, each live read of someone else's turn, each act's
+//! ledger row, and the loop's start) — as the model's `hold` (none, a hold
+//! unread, a hold read) and `hlegs` (its legs, the engine's own bits:
+//! NEEDS 1, REPO 2, OPEN 4, DEFENSE 8), which `TheHostIsToldWhatHoldsTheLanding`
+//! holds to the state: none where no hold stands, read exactly where a land
+//! act's yield was judged with no turn of someone else's since, and then the
+//! yield's own legs.
+//!
 //! Negative controls: three tellers each fail the walk — one told on the
 //! journal's `DONE`/`LEFT` notes alone, one told at points alone, and one
 //! that says landed for any done task; and where the `Buggy = 1` model goes
 //! quiet after two nudges, holds a point a need stands at, lands on the
 //! retired token, over a dirty repository or over a need, nudges a landed
 //! task, takes a landed record on at a wall, or tells nothing at the live
-//! read, the real decider and its state say otherwise.
+//! read, the real decider and its state say otherwise. Three tellers of the
+//! hold each fail the walk too — one that tells the face and never the hold,
+//! one told at points alone (never at a live read), and one never told at
+//! an act's row — and the model's own mutant, `StaleHold = 1` (a yield
+//! tells the face and leaves the hold as it was), is refuted by
+//! `TheHostIsToldWhatHoldsTheLanding` alone, as is `Buggy = 2`, the dial
+//! `aterm-models`' sweep turns it on by.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::acts::TaskFace;
+use aterm_agent::harness::acts::{HoldLeg, LandHeld, TaskFace};
 use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
@@ -138,6 +155,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         said_cut: false,
         turn_said: None,
         opened_by: None,
+        message_drawn: false,
         worked,
         rules: None,
         pending_input: false,
@@ -156,6 +174,8 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         auto_continue: None,
         since_limit: None,
         served_in_transcript: false,
+        chosen_in_transcript: None,
+        conversation: aterm_agent::supervise::policy::turn_end::Conversation::Hostless,
         notice_elsewhere: false,
         reset_clock: None,
         reach: Default::default(),
@@ -268,9 +288,26 @@ enum Teller {
     LandedForDone,
 }
 
+/// HOW THE HOLD IS TOLD to the host: the loop's one teller, and three that
+/// miss a move (the negative controls).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldTeller {
+    /// The loop's (`Session::tell_hold`): [`TurnEndState::held_moved`] at
+    /// the start, after each point folded in, after each live read of
+    /// someone else's turn, and after each act's ledger row.
+    Loop,
+    /// The face told, the hold never.
+    Never,
+    /// At points (and the start, and the acts' rows) alone, never at a live
+    /// read: beside `fold_point`'s call to the face's teller, not inside it.
+    AtPointsOnly,
+    /// At points and live reads, never at an act's ledger row.
+    NotAtActs,
+}
+
 /// The real side of one walk: the decider's state, the loop's clock, the
-/// last words of the point it stands at, and the face its host was last
-/// told, by `teller`.
+/// last words of the point it stands at, and the face and the hold its host
+/// was last told, by `teller` and `hold_teller`.
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
@@ -281,6 +318,11 @@ struct Real {
     teller: Teller,
     /// The task was done at the last point ([`Teller::OnEndNotes`]).
     noted: bool,
+    /// The hold the host was last told (`IdleHost::land_held`).
+    held: Option<LandHeld>,
+    hold_teller: HoldTeller,
+    /// The ledger's clock, unix ms: each act's row a minute after the last.
+    row_ms: i64,
 }
 
 impl Real {
@@ -342,6 +384,37 @@ impl Real {
                 });
             }
         }
+        // The hold is told where the face is (`Session::tell_face`), by this
+        // walk's teller of it.
+        let tells = match self.hold_teller {
+            HoldTeller::Loop | HoldTeller::NotAtActs => true,
+            HoldTeller::AtPointsOnly => !busy,
+            HoldTeller::Never => false,
+        };
+        if tells {
+            self.tell_hold();
+        }
+    }
+
+    /// The hold told where it moved ([`TurnEndState::held_moved`]).
+    fn tell_hold(&mut self) {
+        if let Some(held) = self.st.held_moved(true) {
+            self.held = held;
+        }
+    }
+
+    /// An act typed and its ledger row written (`ledger_row`): the row's
+    /// stamp is the hold's `since` where the act began it
+    /// ([`TurnEndState::ledgered`]), and the row tells the hold.
+    fn ledgered(&mut self, rule: &'static str) {
+        self.row_ms += 60_000;
+        self.st.ledgered(rule, self.row_ms);
+        if matches!(
+            self.hold_teller,
+            HoldTeller::Loop | HoldTeller::AtPointsOnly
+        ) {
+            self.tell_hold();
+        }
     }
 
     /// The act's turn — read running — ended on `said` after `worked`.
@@ -372,6 +445,33 @@ fn face(st: &State) -> TaskFace {
         TaskFace::Landed
     } else {
         TaskFace::Open
+    }
+}
+
+/// The hold of `held` as the model's `hold` and `hlegs` name it: none 0, a
+/// hold unread 1, a hold read 2; its legs, the engine's own bits but
+/// [`HoldLeg::Cut`], which no reply of the walk is (the model's `cut` is a
+/// wall's cut of a land act, no leg).
+fn hold_of(held: Option<LandHeld>) -> (i64, i64) {
+    match held {
+        None => (0, 0),
+        Some(h) => {
+            assert!(!h.holds(HoldLeg::Cut), "a reply read whole cut: {h:?}");
+            (if h.read { 2 } else { 1 }, i64::from(h.legs))
+        }
+    }
+}
+
+/// The hold the host was told by `real` against the model's at `st`: the
+/// walk's teller's miss is the error handed back.
+fn holds(real: &Real, st: &State) -> Result<(), String> {
+    if hold_of(real.held) == (st["hold"], st["hlegs"]) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{:?} told the hold {:?} where the model says hold={} hlegs={} at {st:?}",
+            real.hold_teller, real.held, st["hold"], st["hlegs"]
+        ))
     }
 }
 
@@ -464,6 +564,9 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
             );
             let r = point(real.said, real.at, None);
             real.st.acted(&a, &r, real.now);
+            if let TurnEndAction::Type { rule_id, .. } = &a {
+                real.ledgered(rule_id);
+            }
         }
         "BackoffDue" => real.now += real.st.short_wait().expect("a back-off runs"),
         "YieldWork" => real.yields(PROGRESS, plain, LONG),
@@ -522,8 +625,9 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
 }
 
 /// The real side at the walk's start: a point that ended someone's turn of
-/// real work, the loop's start told first.
-fn start(base: Instant, teller: Teller) -> Real {
+/// real work, the loop's start told first (the face, and the hold whatever
+/// stands: `Session::tell_start_face`).
+fn start(base: Instant, teller: Teller, hold_teller: HoldTeller) -> Real {
     let mut real = Real {
         st: TurnEndState::default(),
         now: base,
@@ -532,8 +636,14 @@ fn start(base: Instant, teller: Teller) -> Real {
         told: None,
         teller,
         noted: false,
+        held: None,
+        hold_teller,
+        row_ms: 1_760_000_000_000,
     };
     real.told = Some(real.st.face_start());
+    if hold_teller != HoldTeller::Never {
+        real.tell_hold();
+    }
     real.st
         .observe(&point(PROGRESS, Seen::default(), Some(LONG)), real.now);
     real.tell(false);
@@ -543,7 +653,7 @@ fn start(base: Instant, teller: Teller) -> Real {
 /// `path` fired on the model `m` from its start, mirrored on the real side.
 fn walk(m: &Model, path: &[&str], base: Instant) -> (State, Real) {
     let mut st = m.init_state();
-    let mut real = start(base, Teller::Loop);
+    let mut real = start(base, Teller::Loop, HoldTeller::Loop);
     for action in path {
         let before = st.clone();
         assert!(m.fire(action, &mut st), "{action} at {before:?}");
@@ -553,12 +663,17 @@ fn walk(m: &Model, path: &[&str], base: Instant) -> (State, Real) {
 }
 
 /// Every reachable state of `m` walked against the real decider, the face
-/// told by `teller`: the verdicts seen, or the first state where the face
-/// the host was told is not the model's.
-fn walk_all(m: &Model, teller: Teller) -> Result<BTreeMap<String, usize>, String> {
+/// told by `teller` and the hold by `hold_teller`: the verdicts seen and the
+/// holds told (`hold=<n> hlegs=<n>`), or the first state where the face or
+/// the hold the host was told is not the model's.
+fn walk_all(
+    m: &Model,
+    teller: Teller,
+    hold_teller: HoldTeller,
+) -> Result<BTreeMap<String, usize>, String> {
     let base = Instant::now() + Duration::from_secs(3600);
     let mut seen: BTreeSet<State> = BTreeSet::new();
-    let mut queue = VecDeque::from([(m.init_state(), start(base, teller))]);
+    let mut queue = VecDeque::from([(m.init_state(), start(base, teller, hold_teller))]);
     let mut verdicts = BTreeMap::<String, usize>::new();
     while let Some((st, real)) = queue.pop_front() {
         if !seen.insert(st.clone()) {
@@ -568,6 +683,10 @@ fn walk_all(m: &Model, teller: Teller) -> Result<BTreeMap<String, usize>, String
             assert!(m.check_invariant(inv.name, &st), "{} at {st:?}", inv.name);
         }
         faces(&real, &st)?;
+        holds(&real, &st)?;
+        *verdicts
+            .entry(format!("hold={} hlegs={}", st["hold"], st["hlegs"]))
+            .or_default() += 1;
         if st["pending"] == 0 {
             projects(&real.st, &st);
             // A landed record is taken on wherever the model's seed is
@@ -607,6 +726,7 @@ fn walk_all(m: &Model, teller: Teller) -> Result<BTreeMap<String, usize>, String
             mirror(action.name, &st, &mut r);
             // Along EVERY transition, not only at a state's first visit.
             faces(&r, &next)?;
+            holds(&r, &next)?;
             queue.push_back((next, r));
         }
     }
@@ -624,7 +744,8 @@ fn tier1_the_real_decider_lands_only_on_a_clean_defense_and_never_goes_quiet() {
     assert!(!says_done(Some(PROGRESS)) && !says_done(Some(ANSWERED)));
 
     let m = supervisor_land_model();
-    let verdicts = walk_all(&m, Teller::Loop).unwrap_or_else(|e| panic!("the face told: {e}"));
+    let verdicts = walk_all(&m, Teller::Loop, HoldTeller::Loop)
+        .unwrap_or_else(|e| panic!("the face or the hold told: {e}"));
     for word in [
         "Instruction",
         "Nudge",
@@ -658,7 +779,8 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
         Teller::AtPointsOnly,
         Teller::LandedForDone,
     ] {
-        assert!(walk_all(&m, teller).is_err(), "{teller:?} passed the walk");
+        let missed = walk_all(&m, teller, HoldTeller::Loop).expect_err("a face teller passed");
+        assert!(missed.starts_with(&format!("{teller:?} told ")), "{missed}");
     }
     // …and the `Buggy` model that tells nothing at that read is caught by
     // `TheHostIsToldTheTasksFace`, which the model proper holds there.
@@ -769,4 +891,89 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert!(!real.st.seed_task_done());
     assert!(!real.st.task_done());
     assert_eq!(verdict(&real.clone().decide()), Verdict::WallAct);
+}
+
+/// WHY LAND STILL HOLDS, TOLD (the Autopilot design's §12.3.3): along every
+/// reachable state the hold the loop's teller told its host is the model's —
+/// none before the instruction, at a landing and until Land's next act, at a
+/// person's own exchange; unread once the instruction is typed and again
+/// from someone else's turn (its live read, or its end where no read saw it
+/// run); read, with the yield's own legs, from a land act's yield that did
+/// not land — and every hold the model can tell is told somewhere on the
+/// walk.
+///
+/// NEGATIVE CONTROLS: a teller that tells the face and never the hold, one
+/// told at points alone (never at a live read: beside `fold_point`'s call,
+/// not inside `tell_face`), and one never told at an act's ledger row each
+/// fail the walk; and the model's own mutant, `StaleHold = 1`, is refuted
+/// by `TheHostIsToldWhatHoldsTheLanding` alone, every other law holding —
+/// and so is `Buggy = 2`, the dial that turns it on in `aterm-models`'
+/// `non_vacuity` sweep (which turns `Buggy` alone), so the sweep sees the
+/// hold's law broken by a mutant of its own.
+#[test]
+fn tier1_the_real_teller_tells_what_holds_the_landing() {
+    let m = supervisor_land_model();
+    let seen = walk_all(&m, Teller::Loop, HoldTeller::Loop)
+        .unwrap_or_else(|e| panic!("the hold told: {e}"));
+    // None; unread; read with each yield's legs: no defense (a claim, work,
+    // a question), open work, the repository's, a need.
+    for hold in [
+        "hold=0 hlegs=0",
+        "hold=1 hlegs=0",
+        "hold=2 hlegs=8",
+        "hold=2 hlegs=4",
+        "hold=2 hlegs=2",
+        "hold=2 hlegs=1",
+    ] {
+        assert!(seen.contains_key(hold), "{hold} never told: {seen:?}");
+    }
+
+    // THE TELLERS THAT MISS A MOVE: each fails the walk on the hold.
+    for teller in [
+        HoldTeller::Never,
+        HoldTeller::AtPointsOnly,
+        HoldTeller::NotAtActs,
+    ] {
+        let missed = walk_all(&m, Teller::Loop, teller).expect_err("a hold teller passed");
+        assert!(
+            missed.starts_with(&format!("{teller:?} told the hold ")),
+            "{teller:?}: {missed}"
+        );
+    }
+
+    // THE MODEL'S MUTANT: a yield tells the face and leaves the hold as it
+    // was. The face law holds; only the hold's law refutes it.
+    assert!(
+        aterm_spec::interp::violated_invariants(&m).is_empty(),
+        "the model proper breaks a law"
+    );
+    let stale = aterm_spec::interp::with_consts(&m, &[("StaleHold", 1)]);
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&stale),
+        BTreeSet::from(["TheHostIsToldWhatHoldsTheLanding"]),
+    );
+    assert!(m.mutant_dials().contains(&2), "{:?}", m.mutant_dials());
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&aterm_spec::interp::with_consts(
+            &m,
+            &[("Buggy", 2)]
+        )),
+        BTreeSet::from(["TheHostIsToldWhatHoldsTheLanding"]),
+        "the sweep's own dial"
+    );
+    // …first where the instruction's yield names open work: told unread.
+    let mut st = stale.init_state();
+    for action in ["Instruction", "YieldOpenDefense"] {
+        assert!(stale.fire(action, &mut st), "{action} at {st:?}");
+    }
+    assert!(!stale.check_invariant("TheHostIsToldWhatHoldsTheLanding", &st));
+    assert!(stale.check_invariant("TheHostIsToldTheTasksFace", &st));
+    let (_, real) = walk(&m, &["Instruction", "YieldOpenDefense"], Instant::now());
+    let held = real.held.expect("a hold told");
+    assert!(held.read && held.holds(HoldLeg::Open), "{held:?}");
+    assert!(
+        held.open_words().any(|w| w == "not merged"),
+        "the word Land read: {:?}",
+        held.open_words().collect::<Vec<_>>()
+    );
 }

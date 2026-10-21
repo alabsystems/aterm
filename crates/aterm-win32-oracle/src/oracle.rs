@@ -194,26 +194,31 @@ pub fn import_table(
     let conformance = libs
         .get("conformance")
         .ok_or("probe did not report conformance rlib")?;
-    let subject = if side == "facade" {
-        "facade"
+    // Upstream is two crates: windows-sys for the generated declarations, and
+    // `windows` 0.62.2 for the hand-written DXGI slice (src/dxgi.rs).
+    let subjects: &[&str] = if side == "facade" {
+        &["facade"]
     } else {
-        "windows_sys"
+        &["windows_sys", "windows"]
     };
-    let library = libs
-        .get(subject)
-        .ok_or("probe did not report subject rlib")?;
     let refs = referenced(&nm(
         runner,
         tools,
         &["-u".into(), conformance.to_string_lossy().into_owned()],
         workspace,
     )?);
-    let defs = defined(&nm(
-        runner,
-        tools,
-        &[library.to_string_lossy().into_owned()],
-        workspace,
-    )?);
+    let mut defs = BTreeMap::new();
+    for subject in subjects {
+        let library = libs
+            .get(*subject)
+            .ok_or("probe did not report subject rlib")?;
+        defs.extend(defined(&nm(
+            runner,
+            tools,
+            &[library.to_string_lossy().into_owned()],
+            workspace,
+        )?));
+    }
     if refs.is_empty() || refs.iter().any(|s| !defs.contains_key(s)) {
         return Err(format!(
             "{feature} imports could not be completely inspected"
@@ -235,21 +240,37 @@ pub fn caught_import(
 ) -> Result<bool> {
     Ok(got? != *want)
 }
-fn expected_imports(model: &Model, triple: &str) -> usize {
+/// The imports `triple`'s probes must name: every generated function the
+/// model keeps for its architecture, plus each `link!` of aterm-win32's
+/// hand-written files (`hand_written`, counted by [`hand_written_imports`]).
+fn expected_imports(model: &Model, triple: &str, hand_written: usize) -> usize {
     let arch = triple.split('-').next().unwrap_or("");
-    model
-        .variants()
-        .iter()
-        .filter(|it| {
-            it.kind == "fn"
-                && !it
-                    .arch
-                    .iter()
-                    .any(|a| a.contains("target_arch") && !a.contains(&format!("\"{arch}\"")))
-        })
-        .map(|it| &it.name)
-        .collect::<BTreeSet<_>>()
-        .len()
+    hand_written
+        + model
+            .variants()
+            .iter()
+            .filter(|it| {
+                it.kind == "fn"
+                    && !it
+                        .arch
+                        .iter()
+                        .any(|a| a.contains("target_arch") && !a.contains(&format!("\"{arch}\"")))
+            })
+            .map(|it| &it.name)
+            .collect::<BTreeSet<_>>()
+            .len()
+}
+/// The `link!` imports aterm-win32's hand-written files declare (the DXGI
+/// slice's `CreateDXGIFactory1`): none of them is in the generated model.
+pub fn hand_written_imports(krate: &Path) -> Result<usize> {
+    let mut count = 0;
+    for file in crate::model::HAND_WRITTEN {
+        count += read(&krate.join("src").join(file))?
+            .lines()
+            .filter(|l| l.trim_start().starts_with("link!("))
+            .count();
+    }
+    Ok(count)
 }
 fn checked(
     runner: &mut impl Runner,
@@ -376,7 +397,11 @@ pub fn gate(root: &Path, model: &Model, tools: &Tools, target: &Path) -> Result<
                 findings.push(format!("{triple} conformance"));
             }
             let want = import_table(&mut runner, tools, &workspace, target, triple, "upstream")?;
-            let expected = expected_imports(model, triple);
+            let expected = expected_imports(
+                model,
+                triple,
+                hand_written_imports(&root.join("crates/aterm-win32"))?,
+            );
             if want.len() != expected {
                 return Err(format!(
                     "upstream gave {} of {expected} imports",
@@ -596,6 +621,71 @@ mod tests {
             assert_eq!(result.ok(), expected, "{name}");
             assert!(fake.0.is_empty(), "{name}: no hidden skipped command");
         }
+    }
+    #[test]
+    fn upstream_imports_come_from_windows_sys_and_windows() {
+        let rlibs = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| format!(r#"{{"reason":"compiler-artifact","target":{{"name":"{name}"}},"filenames":["/fixture/{name}.rlib"]}}"#))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let refs = " U __imp_PeekMessageW\n U __imp_CreateDXGIFactory1\n";
+        let sys = "user32.dll:\n000000 T __imp_PeekMessageW\n";
+        let windows = "dxgi.dll:\n000000 T __imp_CreateDXGIFactory1\n";
+        let mut both = Fake(VecDeque::from([
+            answer(0, ""),
+            answer(0, &rlibs(&["conformance", "windows_sys", "windows"])),
+            answer(0, refs),
+            answer(0, sys),
+            answer(0, windows),
+        ]));
+        let got = import_table(
+            &mut both,
+            &tools(),
+            Path::new("/fixture"),
+            Path::new("/target"),
+            TRIPLES[0],
+            "upstream",
+        )
+        .unwrap();
+        assert_eq!(got["__imp_CreateDXGIFactory1"], "dxgi.dll");
+        assert_eq!(got["__imp_PeekMessageW"], "user32.dll");
+        assert!(both.0.is_empty());
+        // Without `windows`' rlib the DXGI import is uninspected:
+        // could-not-run, never a table that silently lacks it.
+        let mut missing = Fake(VecDeque::from([
+            answer(0, ""),
+            answer(0, &rlibs(&["conformance", "windows_sys"])),
+            answer(0, refs),
+            answer(0, sys),
+        ]));
+        assert!(
+            import_table(
+                &mut missing,
+                &tools(),
+                Path::new("/fixture"),
+                Path::new("/target"),
+                TRIPLES[0],
+                "upstream",
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn hand_written_link_lines_are_counted() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/com.rs"), "// link!( in prose\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/dxgi.rs"),
+            "link!(\"dxgi.dll\" \"system\" fn A());\n  link!(\"dxgi.dll\" \"system\" fn B());\n",
+        )
+        .unwrap();
+        assert_eq!(hand_written_imports(dir.path()).unwrap(), 2);
+        std::fs::remove_file(dir.path().join("src/com.rs")).unwrap();
+        assert!(hand_written_imports(dir.path()).is_err());
     }
     #[test]
     fn plant_changes_exactly_one_real_source_occurrence() {

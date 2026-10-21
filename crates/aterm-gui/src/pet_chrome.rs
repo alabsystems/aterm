@@ -16,6 +16,11 @@
 //! (`app_render::pet_console_exclusions`): protected, like a selection or the
 //! find bar — the pet never rests on them and seats itself beside them.
 //!
+//! * A RULE'S STROKES ARE THE RULE'S. A footer write that repaints a rule
+//!   (the harness tints the composer's whole upper rule) records only the
+//!   runs that carry words and marks ([`PetChrome::note_painted`]): its `─`
+//!   strokes are the program's own rule, ink to the pet, and walled whole
+//!   they kept the cat off the composer's first line.
 //! * ONE FRAME LATE, NEVER LEFT STALE. The splices run after the pet's tick,
 //!   so a frame's pet reads the cells the previous frame painted ([`held`]).
 //!   Where a pass paints a different set than the one its pet read, the
@@ -42,7 +47,11 @@
 //!
 //! [`held`]: PetChrome::held
 
+use aterm_core::terminal::RenderCell;
 use aterm_effects::pet_world::PetRect;
+
+/// The stroke a composer's rule is drawn in ([`PetChrome::note_painted`]).
+const RULE_STROKE: char = '\u{2500}';
 
 /// The cells the host's chrome splices painted over the focused pane, for
 /// the resident pet (module docs). Held on the window
@@ -96,6 +105,36 @@ impl PetChrome {
     pub(crate) fn note(&mut self, row: usize, col: usize, rows: usize, cols: usize) {
         if let Some(rect) = self.pane_local(row, col, rows, cols) {
             self.next.push(rect);
+        }
+    }
+
+    /// A splice painted `cells` from frame cell `(row, col)`: the runs of them
+    /// that carry the host's words and marks, as [`PetChrome::note`] notes a
+    /// write. A rule's stroke (`─`) is a rule, whoever paints it: the harness
+    /// repaints the composer's whole upper rule in its tint
+    /// (`claude_footer::collect_composer_border_brand_edits`), the same
+    /// strokes over the same cells as the program's own rule, which the pet
+    /// reads as ink. Noted whole, the rule was protected from end to end, a
+    /// cat on the composer's first line (its 1.7-row body reaches into the
+    /// rule) was refused at every column, and it waited off the line up to
+    /// fifty columns behind the caret and bounded back at every line
+    /// (2026-10-20, real Claude Code 2.1.305 with the harness on, windowed).
+    /// The tool's mark and the switch on that rule, the chips and facts on
+    /// the lower one, the card's line, stay protected.
+    pub(crate) fn note_painted(&mut self, row: usize, col: usize, cells: &[RenderCell]) {
+        let mut run: Option<usize> = None;
+        for (i, cell) in cells.iter().enumerate() {
+            match (cell.ch == RULE_STROKE, run) {
+                (false, None) => run = Some(i),
+                (true, Some(start)) => {
+                    self.note(row, col + start, 1, i - start);
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = run {
+            self.note(row, col + start, 1, cells.len() - start);
         }
     }
 

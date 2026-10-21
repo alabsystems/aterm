@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The escape-sequence policy document under every mutation the first-party
-//! serde must answer exactly as registry serde did (docs/AUDIT-third-party-
-//! 2026-10-15.md, SP.3). Every table is `deny_unknown_fields`: a key this build
-//! does not know refuses the whole policy rather than being ignored, so the
-//! answers here are as much the security surface as the parse.
+//! Escape-sequence policy corpus tests. Every table is `deny_unknown_fields`:
+//! an unknown key refuses the whole policy rather than being ignored.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;

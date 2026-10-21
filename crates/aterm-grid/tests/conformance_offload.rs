@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Scrollback-offload detach window: derived spec plus Tier-1 binding to the
-//! real `Grid`.
+//! Scrollback-offload detach window: the `ty_model!` spec (`include!`d from
+//! `offload_window_spec.rs`) bound to the real `Grid`.
 //!
-//! The `ty_model!` source is `include!`d from `offload_window_spec.rs`.
+//! - Tier 0: the invariants hold over every Produce/Erase/config/replacement/Reattach/Abort
+//!   interleaving, with a counterexample required at `Buggy=1`.
+//! - Tier 1: every bounded history interleaving and every distinct detached-settings
+//!   ordering class runs against a real tiered `Grid` in lockstep with the model, each real
+//!   transition judged against the spec's `Next`.
+//! - Negative controls: corrupted observations are rejected, and the resurrection scanner
+//!   finds pre-erase tags before the erase.
 //!
-//! - Tier 0: `ty check` proves the invariants over every Produce/Erase/config/
-//!   replacement/Reattach/Abort interleaving and requires a counterexample at
-//!   `Buggy=1`.
-//! - Tier 1: every bounded history interleaving, and every distinct
-//!   detached-settings ordering class, is driven against a real tiered `Grid`
-//!   in lockstep with the model; each real transition is judged against the
-//!   spec's `Next` by `ty trace validate`.
-//! - Negative controls: corrupted observations are rejected, and the
-//!   resurrection scanner finds pre-erase tags before the erase.
-//!
-//! An absent Trust `ty` fails these tests.
+//! The interpreter always judges; `ty` (`ty check`, `ty trace validate`) also does wherever
+//! it is installed, and the verdicts must agree.
 
 use aterm_scrollback::{Line, Scrollback, ScrollbackStorage};
 use aterm_spec::derive::Model;
@@ -45,8 +42,6 @@ const BUDGET_LOW: usize = 2 * BUDGET_UNIT;
 const BUDGET_HIGH: usize = 3 * BUDGET_UNIT;
 const REPLACEMENT_BUDGET: usize = 4 * BUDGET_UNIT;
 
-// Real-Grid driver
-
 fn feed_line(g: &mut Grid, s: &str) {
     g.set_cursor(ROWS - 1, 0);
     for c in s.chars() {
@@ -56,13 +51,11 @@ fn feed_line(g: &mut Grid, s: &str) {
     g.carriage_return();
 }
 
-/// Saturate the detach-window ring so the next scroll-off stages into the lazy
-/// buffer.
+/// Saturate the detach-window ring so the next scroll-off stages into the lazy buffer.
 ///
-/// The window opens with an empty ring (its rows go to the detached job), and
-/// the model's `Produce` means "a line scrolls off and is staged", which holds
-/// only once the ring is full. These lines are un-modelled environment output
-/// (`produced`/`retained` stay 0); the precondition is asserted both ways.
+/// The window opens with an empty ring (its rows go to the detached job), and the model's
+/// `Produce` ("a line scrolls off and is staged") holds only once the ring is full. These
+/// lines are unmodelled environment output (`produced`/`retained` stay 0).
 fn saturate_window_ring(g: &mut Grid) {
     for i in 0..RING {
         if g.ring_buffer_scrollback() >= RING {
@@ -228,12 +221,8 @@ fn project_replacement_history(st: &mut BTreeMap<&'static str, i64>, g: &Grid) {
     );
 }
 
-// ty-as-judge: validate one projected transition against the spec's Next.
-
-/// Tiered per-transition conformance (see [`verify::validate_transition_tiered`]):
-/// the interpreter's `Next`-admission check always runs; `ty trace validate`
-/// also validates the two-step trace wherever installed (verdicts must agree).
-/// The trace's step 0 is `prev`; the cfg carries the real regime overrides.
+/// Tiered per-transition conformance (see [`verify::validate_transition_tiered`]); the
+/// trace's step 0 is `prev` and the cfg carries the real regime overrides.
 fn validate_transition(
     m: &Model,
     prev: &BTreeMap<&'static str, i64>,
@@ -440,7 +429,7 @@ fn run_lockstep(
         );
 
         let mut next = st.clone();
-        // Final step: substitute the real measured `retained`, so `ty` judges the
+        // Final step: substitute the real measured `retained`, so the spec judges the
         // grid rather than the model echoing itself.
         if i == trace.len() - 1 && *s == Step::Reattach {
             let baseline = if cleared { 0 } else { H as i64 };
@@ -477,7 +466,7 @@ fn run_lockstep(
 
 /// Drive one detached-settings schedule against the public Grid API, projecting
 /// getters, raw store settings, backend presence and the inferred ring share
-/// into each successor before `ty` judges it.
+/// into each successor before the spec judges it.
 #[allow(clippy::type_complexity)]
 fn run_settings_lockstep(
     trace: &[ConfigStep],
@@ -563,20 +552,17 @@ fn run_settings_lockstep(
     (g, steps)
 }
 
-// Tests
-
 /// Tier 0: the invariants prove at `Buggy=0` and are caught at `Buggy=1`.
 #[test]
 fn offload_window_spec_model_checked_in_trust() {
-    // Interpreter prove-and-catch always; ty too where installed.
     verify::prove_and_catch_scalar(
         &offload_window_model(),
         "scrollback-offload detach-window spec",
     );
 }
 
-/// Tier 1: every bounded interleaving on the real Grid in lockstep with the
-/// model, judged by `ty trace validate`.
+/// Tier 1: every bounded interleaving on the real Grid in lockstep with the model, each
+/// transition judged against the spec's `Next`.
 #[test]
 fn real_grid_offload_window_conforms_to_spec_exhaustively() {
     let m = offload_window_model();
@@ -700,8 +686,8 @@ fn replacement_backed_abort_preserves_window_output_in_spec() {
     let pending = g
         .resize_offloading_scrollback(ROWS, NEW_COLS)
         .expect("open detach window");
-    // RFL-1: the window opens with the ring history riding the job, so refill
-    // the ring first — the modelled Produce steps below assume a full ring.
+    // The window opens with the ring history riding the job; the modelled Produce steps
+    // below assume a full ring.
     saturate_window_ring(&mut g);
 
     let mut st = m.init_state();
@@ -773,7 +759,7 @@ fn replacement_backed_abort_preserves_window_output_in_spec() {
         );
     }
 
-    // Negative control: forge the old lossy Abort (second staged row vanished).
+    // Negative control: a lossy Abort (the second staged row vanished) is rejected.
     let mut forged = next;
     forged.insert("relocated", forged["relocated"] - 1);
     let (ok, _) = validate_transition(&m, &prev, &forged, "Abort");

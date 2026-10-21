@@ -40,14 +40,16 @@ const STATUS: &str = "OK schema=1 sid=0 subject=%E2%97%90%20Git%20commit%20and%2
 /// [`file_holders`] (the holder scan) names the holders `lsof -t` names, of a lock held through
 /// descriptors: this process and two children, one given the file through a symlink, asked by
 /// the file's path and by the link's (both follow it to the file); nobody once each lets go;
-/// neither reads a path that is not there.
+/// neither reads a path that is not there. The scan's OWN reads name them too, whatever other
+/// process it could not read: on a Mac where some agent of this uid holds a file in a protected
+/// folder every scan is incomplete, and [`file_holders`] adds what `lsof` names of the processes
+/// it could not read.
 ///
 /// The test runs ALONE, in a re-run of this binary: `lsof` and the scan each read every process
 /// at their own instant, and beside the other tests a sibling's child forked short of its exec
 /// holds every descriptor of this process, the lock's included (`disk_target_tests`'
-/// `Parked::fork` keeps one there on purpose), for one read and not the other. The landing
-/// check of 2026-10-20 caught it: the scan named 44480 beside this process and its two
-/// children, `lsof` did not.
+/// `Parked::fork` keeps one there on purpose), for one read and not the other: run beside them,
+/// the scan named such a child beside this process and its two children, and `lsof` did not.
 #[cfg(target_os = "macos")]
 #[test]
 fn file_holders_are_lsof_s() {
@@ -93,10 +95,18 @@ fn file_holders_are_lsof_s() {
             h
         })
     };
+    let scanned = |path: &std::path::Path| {
+        let mut scan = aterm_uds::holders::scan_file_holders(path, &[]).expect("scan the file");
+        scan.holders.sort_unstable();
+        scan
+    };
+    let captured_scans = [scanned(&lock), scanned(&link)];
     let while_held = [
         sorted(lsof_holders(&lock)),
         sorted(file_holders(&lock)),
         sorted(file_holders(&link)),
+        Some(captured_scans[0].holders.clone()),
+        Some(captured_scans[1].holders.clone()),
     ];
     for child in &mut children {
         let _ = child.kill();
@@ -108,14 +118,203 @@ fn file_holders_are_lsof_s() {
     assert_eq!(while_held[1], held, "the scan, by the file's path");
     assert_eq!(while_held[2], held, "the scan, by a link to it");
     assert_eq!(
+        while_held[3], held,
+        "the scan's own reads, by the file's path"
+    );
+    assert_eq!(while_held[4], held, "the scan's own reads, by a link to it");
+    assert_eq!(
         file_holders(&lock),
         Some(Vec::new()),
         "the scan, once let go"
     );
+    let check_complete = |scan: aterm_uds::holders::HolderScan, expected: &[u32], context| {
+        assert_eq!(scan.holders, expected, "{context}: positive holders");
+        let unreadable = scan.unreadable.clone();
+        let answer = complete_file_holders(scan);
+        if unreadable.is_empty() {
+            assert_eq!(answer.as_deref(), Some(expected), "{context}: complete");
+        } else {
+            assert_eq!(answer, None, "{context}: unreadable is never free");
+            println!("{context}: unknown tables {unreadable:?}");
+        }
+    };
+    for (scan, context) in captured_scans
+        .into_iter()
+        .zip(["the file's path", "a link to it"])
+    {
+        check_complete(scan, held.as_deref().expect("held set"), context);
+    }
+    assert_eq!(lsof_holders(&lock), Some(Vec::new()), "lsof, once let go");
+    check_complete(scanned(&lock), &[], "once let go");
     let gone = dir.join("gone.lock");
     assert_eq!(lsof_holders(&gone), None, "lsof, no such file");
     assert_eq!(file_holders(&gone), None, "the scan, no such file");
     println!("{DONE}");
+}
+
+#[test]
+fn only_a_complete_holder_scan_can_establish_the_holder_set() {
+    let scan = |holders, unreadable| aterm_uds::holders::HolderScan {
+        holders,
+        unreadable,
+        scanned: 4,
+    };
+    assert_eq!(complete_file_holders(scan(vec![], vec![])), Some(vec![]));
+    assert_eq!(
+        complete_file_holders(scan(vec![42, 73], vec![])),
+        Some(vec![42, 73])
+    );
+    assert_eq!(complete_file_holders(scan(vec![], vec![99])), None);
+    assert_eq!(complete_file_holders(scan(vec![42], vec![99])), None);
+}
+
+/// THE CENSUS ASKS `lsof` ONLY WHERE THE SCAN COULD NOT ANSWER: a complete scan is the answer,
+/// lsof never run; one that could not read some processes' tables asks lsof about those alone
+/// and adds what it names, unknown where lsof's answer is; an unsupported scan is lsof's answer
+/// over every process; a scan that failed outright is unknown, lsof never run. NEGATIVE
+/// CONTROL: a complete scan stands against an lsof that would say otherwise.
+#[test]
+fn the_census_asks_lsof_only_where_the_scan_could_not_answer() {
+    use aterm_uds::holders::HolderScan;
+    use std::io::{Error, ErrorKind};
+    let scan = |holders: &[u32], unreadable: &[u32]| {
+        Ok(HolderScan {
+            holders: holders.to_vec(),
+            unreadable: unreadable.to_vec(),
+            scanned: 9,
+        })
+    };
+    let asked: std::cell::RefCell<Vec<String>> = std::cell::RefCell::default();
+    let among = |answer: Option<Vec<u32>>| {
+        let asked = &asked;
+        move |pids: &[u32]| {
+            asked.borrow_mut().push(format!("among {pids:?}"));
+            answer
+        }
+    };
+    let whole = |answer: Option<Vec<u32>>| {
+        let asked = &asked;
+        move || {
+            asked.borrow_mut().push("whole".to_string());
+            answer
+        }
+    };
+    assert_eq!(
+        holder_census(scan(&[7], &[]), among(Some(vec![8])), whole(Some(vec![8]))),
+        Some(vec![7])
+    );
+    assert_eq!(
+        holder_census(scan(&[], &[]), among(Some(vec![8])), whole(Some(vec![8]))),
+        Some(Vec::new())
+    );
+    assert!(asked.borrow().is_empty(), "a complete scan asks nothing");
+    assert_eq!(
+        holder_census(scan(&[7], &[9, 3]), among(Some(vec![9])), whole(None)),
+        Some(vec![7, 9])
+    );
+    assert_eq!(
+        holder_census(scan(&[7], &[9]), among(Some(Vec::new())), whole(None)),
+        Some(vec![7])
+    );
+    assert_eq!(
+        holder_census(scan(&[7], &[9]), among(None), whole(Some(vec![7]))),
+        None
+    );
+    let unsupported = Err(Error::new(ErrorKind::Unsupported, "off macOS"));
+    assert_eq!(
+        holder_census(unsupported, among(None), whole(Some(vec![8]))),
+        Some(vec![8])
+    );
+    assert_eq!(
+        *asked.borrow(),
+        ["among [9, 3]", "among [9]", "among [9]", "whole"],
+        "an incomplete scan asks about its unreadable processes alone"
+    );
+    let failed = Err(Error::new(ErrorKind::NotFound, "no such file"));
+    assert_eq!(
+        holder_census(failed, among(Some(vec![8])), whole(Some(vec![8]))),
+        None
+    );
+    assert_eq!(asked.borrow().len(), 4, "a failed scan asks nothing");
+}
+
+/// `lsof`'S LISTING OF THE PROCESSES THE SCAN COULD NOT READ (`-F 0pftDin`, each field ended by
+/// a NUL) names a holder by a numbered descriptor on the file's device and inode, exit 1
+/// included (lsof's word that some pid it was given has no file: an exited one). A descriptor
+/// that closed as lsof read it (`vnode: FD unavailable`, no type, device or inode) holds
+/// nothing, as the holder scan holds it. It is unknown wherever it cannot say: a pid it listed
+/// nothing for while that pid lives, a regular file's descriptor (or one of no reported type)
+/// with no device or inode for any other reason, a process it was not asked about or listed
+/// twice, a field that does not parse, anything on stderr, any other exit. NEGATIVE CONTROLS:
+/// the file as a working directory or a mapping (`cwd`, `txt`) holds nothing, nor does a socket
+/// with no inode, nor another inode.
+#[cfg(unix)]
+#[test]
+fn the_unreadable_processes_are_read_by_lsofs_own_listing() {
+    use std::os::unix::process::ExitStatusExt as _;
+    const KEY: (u64, u64) = (0x100_000f, 294_134_038);
+    let read = |status: i32, fields: &str, stderr: &str, alive: &[u32]| {
+        // One field a line here; lsof ends each with a NUL and each set with a newline.
+        let stdout = fields.replace('\n', "\0\n");
+        lsof_fd_holders(
+            &std::process::Output {
+                status: std::process::ExitStatus::from_raw(status),
+                stdout: stdout.into_bytes(),
+                stderr: stderr.as_bytes().to_vec(),
+            },
+            &[41, 42, 43],
+            KEY,
+            |pid| alive.contains(&pid),
+        )
+    };
+    let held = "f9\ntREG\nD0x100000f\ni294134038\nn/w/writer.lock\n";
+    let other = "f3\ntREG\nD0x100000f\ni7\nn/w/other\n";
+    let socket = "f4\ntunix\nn->0xe1286e4cf8d006a7\n";
+    let closed = "f27\nnvnode: FD unavailable\n";
+    let cwd = "fcwd\ntDIR\nD0x100000f\ni294134038\nftxt\ntREG\nD0x100000f\ni294134038\n";
+    let all = format!("p41\n{other}{held}{held}p42\n{cwd}{socket}{closed}p43\n{other}");
+    assert_eq!(read(0, &all, "", &[]), Some(vec![41]), "the holder, once");
+    let gone = format!("p42\n{held}");
+    assert_eq!(
+        read(1 << 8, &gone, "", &[]),
+        Some(vec![42]),
+        "exit 1: pids 41 and 43 exited"
+    );
+    assert_eq!(
+        read(1 << 8, "", "", &[]),
+        Some(Vec::new()),
+        "all three exited"
+    );
+    let escaped = "p41\nf9\ntREG\nD0x100000f\ni294134038\nn/w/a\\nb\np42\np43\n";
+    assert_eq!(
+        read(0, escaped, "", &[]),
+        Some(vec![41]),
+        "a name's newline is escaped"
+    );
+    let unknown = [
+        read(1 << 8, &gone, "", &[43]),
+        read(0, &format!("p41\n{held}p42\nf5\ntREG\np43\n"), "", &[]),
+        read(
+            0,
+            "p41\nf5\nnvnode: Operation not permitted\np42\np43\n",
+            "",
+            &[],
+        ),
+        read(0, "p41\nf5\nD0x100000f\np42\np43\n", "", &[]),
+        read(0, &format!("p41\np42\np43\np44\n{held}"), "", &[]),
+        read(0, "p41\np41\np42\np43\n", "", &[]),
+        read(0, &format!("{held}p41\np42\np43\n"), "", &[]),
+        read(0, "p41\nf9\ntREG\nD100000f\ni1\np42\np43\n", "", &[]),
+        read(0, "p41\nf9\ntREG\nD0x100000f\nix\np42\np43\n", "", &[]),
+        read(0, "p4x\np42\np43\n", "", &[]),
+        read(0, &all, "lsof: WARNING: can't stat()\n", &[]),
+        read(2 << 8, &all, "", &[]),
+        read(libc::SIGKILL, &all, "", &[]),
+    ];
+    assert!(
+        unknown.iter().all(Option::is_none),
+        "LSOF_UNKNOWN_MUST_NOT_FREE_THE_LOCK: {unknown:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -12978,11 +13177,19 @@ fn a_pass_reads_every_claude_home_its_tabs_agents_run_under() {
         sid: sid.to_string(),
         fgpgid: group,
     };
-    // Two live leaders whose home cannot be named (this process and its
-    // parent), and one gone.
+    // Two live leaders whose home cannot be named (this process and a parked
+    // child of it), and one gone. Not this process's parent: an orphaned
+    // runner's is launchd, pid 1, a leader the script names.
     let me = std::process::id();
-    // SAFETY: getppid takes nothing and cannot fail.
-    let parent = u32::try_from(unsafe { libc::getppid() }).expect("a parent");
+    struct Reaped(aterm_uds::spawnfd::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let child = Reaped(parked_bare().spawn().expect("a second live leader"));
+    let other = child.0.id();
     let gone = dead_pid();
     let tabs = [
         tab("s-a", Some(1)),
@@ -12990,7 +13197,7 @@ fn a_pass_reads_every_claude_home_its_tabs_agents_run_under() {
         tab("s-c", Some(3)),
         tab("s-d", Some(4)),
         tab("s-e", Some(i64::from(me))),
-        tab("s-f", Some(i64::from(parent))),
+        tab("s-f", Some(i64::from(other))),
         tab("s-g", Some(7)),
         tab("s-h", None),
         tab("s-i", Some(1)),
@@ -13013,7 +13220,7 @@ fn a_pass_reads_every_claude_home_its_tabs_agents_run_under() {
         // Set and empty: its working directory itself, `/work/d`.
         4 => env(Some("")),
         // Relative, its working directory unread.
-        p if p == parent => env(Some("rel/.claude")),
+        p if p == other => env(Some("rel/.claude")),
         // The user's own, by a link.
         7 => env(Some(&link)),
         // Its exec record unread (`me`; `gone`, which leads nothing now).
@@ -14050,6 +14257,9 @@ fn held_step_shown(
     looks: Looks,
     wait: Duration,
 ) -> (Report, St, usize, Vec<Row>) {
+    // Every look here is a stand-in's ([`ShellHolds`], the scripted instance): the step's
+    // waits run on their own steps.
+    let _waits = crate::harness::relaunch::virtual_waits();
     let dir = scratch(name);
     let (sock, _asked) = instance(&dir);
     if let Some((_, blocks)) = looks.block {

@@ -877,7 +877,7 @@ impl AbBook {
     }
 
     /// SESSION `session`'S TASK OPENED at `at_ms` (§11.2.3, item 2): its
-    /// face moved from a known face to open, done or landed
+    /// face moved from a known face to open or landed
     /// (`App::apply_task_face`; at an end, after the end has read the sum).
     /// The work is zeroed and counts only what is charged after `at_ms` —
     /// the CLIP: a reply whose busy time ran before the move that opened the

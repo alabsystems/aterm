@@ -10,7 +10,15 @@
 //!
 //! Terminal emulation core.
 //!
-//! ## Verification
+//! - [`terminal`]: the terminal emulation state machine
+//! - [`config`]: runtime configuration and hot-reload types
+//! - [`render`]: the engine-owned render snapshot a renderer consumes
+//! - [`search`]: trigram-indexed search (logic in `aterm-search`)
+//! - [`shell_integration`]: shell integration injection
+//! - [`bell`]: bell presentation state machines
+//! - [`fault`]: deterministic fault injection for fail-closed-path tests
+//! - [`grapheme`], [`grid`], [`selection`], [`scrollback`]: re-exports of the `aterm-grapheme`,
+//!   `aterm-grid`, `aterm-selection` and `aterm-scrollback` crates
 //!
 //! - **Derived models** (`ty_model!`) for key invariants: `crates/aterm-models-core`
 //!   (the alternate-screen round trip, `tests/conformance_altscreen.rs`)
@@ -40,8 +48,7 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
-// Test code (compiled via --all-targets) is exempt from strict clippy.
-// Production code is still checked: `verify lint` (tippy -D warnings) enforces all + pedantic.
+// Test code is exempt from strict clippy; production code is held to all + pedantic.
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
 #![allow(
     unexpected_cfgs,
@@ -111,10 +118,8 @@
     reason = "FFI match-and-return pattern clearer than let-else"
 )]
 
-/// Bell presentation state: the pure flash/beep decision logic
-/// (timestamps injected) behind a host's BEL handling. The engine fires
-/// [`terminal::Terminal::set_bell_callback`]; the host feeds these state
-/// machines and does the actual painting/beeping.
+/// Bell presentation state: the flash/beep decisions behind a host's BEL handling. The engine
+/// fires [`terminal::Terminal::set_bell_callback`]; the host feeds these state machines.
 pub mod bell;
 pub mod config;
 pub(crate) mod domain;
@@ -126,10 +131,10 @@ pub mod grid;
 pub(crate) use aterm_parser as parser;
 /// Text selection and smart semantic selection (re-exported from `aterm-selection`).
 pub use aterm_selection as selection;
-/// The engine-owned render snapshot: [`render::RenderInput`] is the
-/// `Terminal`-free value a renderer consumes for one frame; the engine builds it via
-/// [`terminal::Terminal::cell_frame_into`]. Hosted here so the engine can emit
-/// it without a dependency cycle; `aterm_render::render_api` re-exports it.
+/// The engine-owned render snapshot: [`render::RenderInput`] is the `Terminal`-free value a
+/// renderer consumes for one frame, built by [`terminal::Terminal::cell_frame_into`]. It lives
+/// here so the engine emits it without a dependency cycle; `aterm_render::render_api`
+/// re-exports it.
 pub mod render;
 /// The fx-layer primitive, re-exported from [`render`] beside `GlowQuad`.
 mod render_fx;
@@ -141,7 +146,5 @@ pub(crate) use aterm_sixel as sixel;
 pub mod terminal;
 pub(crate) mod vt_level;
 
-/// Shell integration injection (zsh, bash, fish).
-///
-/// Re-exported from the standalone `aterm-shell-integration` crate.
+/// Shell integration injection (the `aterm-shell-integration` crate).
 pub use aterm_shell_integration as shell_integration;

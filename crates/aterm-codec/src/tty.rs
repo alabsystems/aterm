@@ -23,12 +23,11 @@
 //! for the bus, `aterm ctl survey` for its excerpts) and the control wire's JSON
 //! escape ([`crate::json`]).
 //!
-//! Ruling 2026-10-10 (round fifteen, OUT-1): the function lives here, in the
+//! The function lives here, in the
 //! leaf `aterm-ctl`, `aterm-agent`, `aterm-control` and `aterm-link` all depend
 //! on already, so no crate gains an edge, and no edge runs upward (`aterm-ctl`
 //! depending on `aterm-agent` or `aterm-link` would invert the client under its
-//! users). The leaf was dependency-free then; since 2026-10-20 it is std plus
-//! astream-wire (itself dependency-free, no platform code) for the CRC-32.
+//! users).
 
 /// Whether a terminal acts on `c`, or reorders or breaks the line around it:
 /// every C0 control (U+0000-U+001F, `\n` and `\t` included — a caller that

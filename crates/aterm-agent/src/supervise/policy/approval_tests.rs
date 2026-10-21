@@ -1047,6 +1047,9 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
         "~/.cargo/credentials.toml",
         "~/.config/gh/hosts.yml",
         "~/.claude.json",
+        // `aterm secrets`' files and its machine key.
+        "~/.secrets/gh_access_token",
+        "~/.config/aterm/secrets/identity",
     ] {
         let d = on_screen(&read_box(secret), &wide);
         assert!(reason(&d).contains("secret"), "{secret}: {d:?}");
@@ -2643,7 +2646,15 @@ fn a_read_through_a_symlink_is_judged_where_it_leads() {
         .split('/')
         .map(str::to_string)
         .collect();
-    assert!(super::super::probe_live::hidden_twin_within(&comps, 1).is_err());
+    assert!(
+        super::super::probe_live::hidden_twin_within(
+            &comps,
+            1,
+            None,
+            &super::super::probe_live::folder_names
+        )
+        .is_err()
+    );
     // The control: no twin, the same shape.
     std::fs::write(root.join("plainly.txt"), "benign").expect("file");
     let d = on_screen(&read_call_box(&at("plainly.txt")), &c);
@@ -2663,6 +2674,149 @@ fn a_read_through_a_symlink_is_judged_where_it_leads() {
         assert_eq!(approved(&d).is_some(), safe, "{name}: {d:?}");
     }
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `hidden_twin_within` never calls the directory-entry reader on a folder at
+/// or under `~/Library/Containers`, `~/Library/Group Containers`,
+/// `~/Library/CloudStorage` or `~/Library/Mobile Documents`, whether reached
+/// directly or through a symlink outside `$HOME`, and holds the Read for a
+/// person instead. Control: `~/Documents` (a per-folder root the owner may
+/// grant as a trust root) and `~/Library/Caches` ARE listed.
+#[cfg(unix)]
+#[test]
+fn the_twin_scan_never_lists_inside_another_apps_data() {
+    use super::super::probe_live::{HIDDEN_TWIN_ENTRIES, folder_names, hidden_twin_within};
+    use std::os::unix::fs::symlink;
+    // An owned temporary directory under `/tmp`, never `$TMPDIR`: the scan lists
+    // every folder on the way, and a busy machine's `$TMPDIR` holds more entries
+    // than it proves (see `a_read_through_a_symlink_is_judged_where_it_leads`).
+    let scratch = crate::supervise::ScratchDir::new("twin", "appdata");
+    let base = scratch.canonicalize().expect("scratch");
+    let home = base.join("home");
+    let container_dir = home.join("Library/Containers/com.other.App/Data");
+    let group_dir = home.join("Library/Group Containers/group.other");
+    let cloud_dir = home.join("Library/CloudStorage/Provider");
+    let docs_dir = home.join("Documents/project");
+    let caches_dir = home.join("Library/Caches/tool");
+    for d in [
+        &container_dir,
+        &group_dir,
+        &cloud_dir,
+        &docs_dir,
+        &caches_dir,
+    ] {
+        std::fs::create_dir_all(d).expect("dirs");
+        std::fs::write(d.join("f.txt"), "x").expect("file");
+    }
+    let outside = base.join("work");
+    std::fs::create_dir_all(&outside).expect("outside");
+    symlink(&container_dir, outside.join("into-container")).expect("symlink");
+
+    let comps_of = |p: &std::path::Path| -> Vec<String> {
+        p.to_string_lossy()
+            .trim_start_matches('/')
+            .split('/')
+            .map(str::to_string)
+            .collect()
+    };
+
+    for guarded in [
+        container_dir.join("f.txt"),
+        group_dir.join("f.txt"),
+        cloud_dir.join("f.txt"),
+        outside.join("into-container/f.txt"),
+    ] {
+        let listed = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let res = hidden_twin_within(
+            &comps_of(&guarded),
+            HIDDEN_TWIN_ENTRIES,
+            Some(&home),
+            &|dir| {
+                assert!(
+                    !atpkg::protected::under_app_data(&home, dir)
+                        && !atpkg::protected::under_file_provider_domain(&home, dir),
+                    "reader must never be called on a fenced directory: {}",
+                    dir.display()
+                );
+                if let Ok(real) = std::fs::canonicalize(dir) {
+                    assert!(
+                        !atpkg::protected::under_app_data(&home, &real)
+                            && !atpkg::protected::under_file_provider_domain(&home, &real),
+                        "reader must never be called on a symlink into a fenced directory: {} -> {}",
+                        dir.display(),
+                        real.display()
+                    );
+                }
+                listed.borrow_mut().push(dir.to_path_buf());
+                folder_names(dir)
+            },
+        );
+        let err = res.expect_err("guarded path must hold the Read");
+        assert!(
+            err.contains("never listed"),
+            "reason must name the fence: {err}"
+        );
+    }
+
+    // End-to-end through `on_screen`: even when `~/Library` is removed from
+    // `ctx.secrets` (or reached via a symlink outside `~/Library`), a Read box
+    // whose path traverses `Library/Containers` escalates with `"never listed"`.
+    let mut c = ApprovalCtx::new(
+        base.join("cwd"),
+        Some(home.clone()),
+        502,
+        None,
+        std::sync::Arc::new(crate::supervise::policy::LiveProbe),
+    );
+    c.approve = Approve::Safe;
+    c.secrets
+        .retain(|rule| !matches!(rule, SecretRule::Under(p) if p.ends_with("Library")));
+    c.set_trust_roots(
+        &[
+            home.to_string_lossy().to_string(),
+            outside.to_string_lossy().to_string(),
+        ],
+        502,
+    );
+    for path in [
+        container_dir.join("f.txt"),
+        outside.join("into-container/f.txt"),
+    ] {
+        let d = on_screen(&read_call_box(&path.to_string_lossy()), &c);
+        assert!(approved(&d).is_none(), "{}: {d:?}", path.display());
+    }
+    let sym_decision = on_screen(
+        &read_call_box(&outside.join("into-container/f.txt").to_string_lossy()),
+        &c,
+    );
+    assert!(
+        reason(&sym_decision).contains("never listed"),
+        "end-to-end Read into container must hit the twin-scan fence: {sym_decision:?}"
+    );
+
+    // Controls: `~/Documents/project/f.txt` and `~/Library/Caches/tool/f.txt`
+    // ARE listed by the twin scan and return `Ok(None)`.
+    for allowed in [docs_dir.join("f.txt"), caches_dir.join("f.txt")] {
+        let saw_parent = std::cell::Cell::new(false);
+        let parent = allowed.parent().unwrap().to_path_buf();
+        let res = hidden_twin_within(
+            &comps_of(&allowed),
+            HIDDEN_TWIN_ENTRIES,
+            Some(&home),
+            &|dir| {
+                if dir == parent {
+                    saw_parent.set(true);
+                }
+                folder_names(dir)
+            },
+        );
+        assert_eq!(res, Ok(None), "{}", allowed.display());
+        assert!(
+            saw_parent.get(),
+            "control parent {} must be listed",
+            parent.display()
+        );
+    }
 }
 
 /// Claude Code draws a folder grant (`Yes, allow reading from <dir> …`) on EVERY
@@ -3505,14 +3659,15 @@ fn full_power_answers_gemini_cli_boxes_by_role() {
     );
 }
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG IS NEVER PRESSED (`Usage limit reached
-/// for <model>.` over `1. Keep trying` and `2. Stop`, measured on 0.46.0): at
-/// every level it goes to a person, with its own words — `Keep trying` sends
-/// the turn again into a quota that resets hours later, so a supervisor's
-/// press would repeat at every return — and its `/stats model`. NEGATIVE
-/// CONTROL: the dialog is read whole, a usage-limit box the reader vouches
-/// for, the focus on `Keep trying`, so it is the rule and not the read that
-/// leaves it unpressed.
+/// GEMINI CLI'S USAGE-LIMIT DIALOG THAT NAMES NO RESET IS NEVER PRESSED
+/// (`Usage limit reached for <model>.` over `1. Keep trying` and `2. Stop`,
+/// measured on 0.46.0; a key's per-day quota): at every level it goes to a
+/// person, with its own words — `Keep trying` sends the turn again into a
+/// quota whose reset nothing names, so a supervisor's press would repeat at
+/// every return — and its `/stats model`, even with the loop's clock saying
+/// a retry is due. NEGATIVE CONTROL: the dialog is read whole, a usage-limit
+/// box the reader vouches for, the focus on `Keep trying`, so it is the rule
+/// and not the read that leaves it unpressed.
 #[test]
 fn gemini_clis_usage_limit_is_never_pressed() {
     let rows = phase_fixtures::screen(aterm_phase::gemini::fixtures::LIMIT_DIALOG);
@@ -3525,15 +3680,107 @@ fn gemini_clis_usage_limit_is_never_pressed() {
     );
     assert_eq!(p.focused().map(|o| o.label.as_str()), Some("Keep trying"));
     for level in [full(), ctx(), none(full())] {
-        let d = decide_screen(Some("node"), &rows, &level).expect("a box");
-        assert_eq!(approved(&d), None, "{:?}: {d:?}", level.approve);
-        let why = reason(&d);
-        assert!(why.starts_with("Gemini CLI's usage limit"), "{why}");
+        for due in [false, true] {
+            let level = ApprovalCtx {
+                limit_retry: due,
+                ..level.clone()
+            };
+            let d = decide_screen(Some("node"), &rows, &level).expect("a box");
+            assert_eq!(approved(&d), None, "{:?}: {d:?}", level.approve);
+            let why = reason(&d);
+            assert!(why.starts_with("Gemini CLI's usage limit"), "{why}");
+            assert!(
+                why.contains("Keep trying") && why.contains("/stats model"),
+                "{why}"
+            );
+            assert!(why.chars().count() <= 120, "kept whole in its badge: {why}");
+        }
+    }
+}
+
+/// GEMINI CLI'S USAGE-LIMIT DIALOG THAT NAMES ITS RESET IS KEPT TRYING PAST
+/// IT ([`RULE_LIMIT_RETRY`]): a Google account's spent quota (`Access resets
+/// at 5:06 AM PDT.`, measured on 0.46.0) gets its `1. Keep trying` by digit
+/// at every level once the loop's clock says the reset and its grace have
+/// passed ([`ApprovalCtx::limit_retry`]), guarded on the reset's own row, so
+/// the same dialog drawn again with another reset does not take the digit.
+/// NEGATIVE CONTROLS: before the reset it is not pressed, and the reason
+/// names the reset; with `limit_wait` off it is a person's; the dialog with
+/// its options in another order is a person's; and the dialog that names no
+/// reset stays a person's with the clock due
+/// ([`gemini_clis_usage_limit_is_never_pressed`]).
+#[test]
+fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
+    let rows = phase_fixtures::screen(aterm_phase::gemini::fixtures::LIMIT_DIALOG_ACCOUNT);
+    let reset_row = rows
+        .iter()
+        .find(|r| r.contains("Access resets at 5:06 AM PDT."))
+        .expect("the reset row")
+        .clone();
+    for level in [full(), ctx(), none(full())] {
+        let due = ApprovalCtx {
+            limit_retry: true,
+            ..level.clone()
+        };
+        let d = decide_screen(Some("node"), &rows, &due).expect("a box");
+        let Decision::Approve {
+            rule_id,
+            choice,
+            guard,
+            subject,
+            unproven,
+        } = &d
+        else {
+            panic!("{:?}: expected a press, got {d:?}", level.approve);
+        };
+        assert_eq!(
+            (*rule_id, choice, unproven),
+            (RULE_LIMIT_RETRY, &Choice::Digit(1), &None)
+        );
+        assert_eq!(subject, "Keep trying (reset 5:06 AM)");
+        let m = aterm_observe::row_matcher(guard).expect("compiles");
+        let hits: Vec<&String> = rows.iter().filter(|r| m.matches(r)).collect();
+        assert_eq!(hits, [&reset_row], "the reset's own row");
+        let later = reset_row.replacen("5:06 AM PDT.", "7:41 AM PDT.", 1);
+        assert!(!m.matches(&later), "another reset is judged again");
+
+        let early = decide_screen(Some("node"), &rows, &level).expect("a box");
+        assert_eq!(approved(&early), None, "{early:?}");
+        let why = reason(&early);
         assert!(
-            why.contains("Keep trying") && why.contains("/stats model"),
+            why.starts_with("Gemini CLI's usage limit resets at 5:06 AM")
+                && why.contains("Keep trying"),
             "{why}"
         );
         assert!(why.chars().count() <= 120, "kept whole in its badge: {why}");
+
+        let off = ApprovalCtx {
+            limit_wait: false,
+            ..due.clone()
+        };
+        let d = decide_screen(Some("node"), &rows, &off).expect("a box");
+        assert!(reason(&d).contains("limit_wait is off"), "{d:?}");
+    }
+    let swapped: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.replacen("1. Keep trying", "1. Stop       ", 1).replacen(
+                "2. Stop       ",
+                "2. Keep trying",
+                1,
+            )
+        })
+        .collect();
+    let d = decide_screen(
+        Some("node"),
+        &swapped,
+        &ApprovalCtx {
+            limit_retry: true,
+            ..full()
+        },
+    );
+    if let Some(d) = d {
+        assert_eq!(approved(&d), None, "options in another order: {d:?}");
     }
 }
 

@@ -1492,6 +1492,19 @@ fn rescan_while_unknown(attempts: usize, mut scan: impl FnMut() -> Scan) -> Scan
     Scan::Unknown
 }
 
+/// The escape scan's `Unknown` on the run's own shell `s_pid` (`why`): none
+/// named (`s_pid` ≤ 1), its record unread, gone before the scan ended, or in
+/// no listing of its uid. Every other `Unknown` is the listing's (a pid that
+/// did not settle, a record read stale, a table read failed): a busy host's
+/// churn, which another scan settles. This one is the run's, or its caller's
+/// (a wrong pid), so the log says so, where the live suite tells the two
+/// apart.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_unknown(s_pid: i32, why: &str) -> Scan {
+    aterm_log::info!("spare gate: scan unknown: the run's shell {s_pid} {why}");
+    Scan::Unknown
+}
+
 /// Every pid of `uid`, or `None` when the listing cannot be whole (a full
 /// buffer may have omitted a process born after the size query).
 #[cfg(target_os = "macos")]
@@ -1662,7 +1675,7 @@ fn escape_scan_with_owner(
     mut read_stdio_dead: impl FnMut(i32) -> Option<bool>,
 ) -> Scan {
     if s_pid <= 1 {
-        return Scan::Unknown;
+        return shell_unknown(s_pid, "unread");
     }
     // SAFETY: `getuid` is a side-effect-free getter.
     let uid = unsafe { libc::getuid() };
@@ -1670,7 +1683,7 @@ fn escape_scan_with_owner(
         read_pid(p).filter(|i| p > 0 && i.pbsd.pbi_pid == p as u32 && i.pbsd.pbi_uid == uid)
     };
     let Some(shell) = read(s_pid) else {
-        return Scan::Unknown;
+        return shell_unknown(s_pid, "unread");
     };
     let shell_start = std::time::UNIX_EPOCH
         + Duration::from_secs(shell.pbsd.pbi_start_tvsec)
@@ -1756,12 +1769,9 @@ fn escape_scan_with_owner(
     // a record that cannot be read again, makes an otherwise clean scan
     // incomplete, never an escape unseen.
     let mut incomplete = stale || !unsettled.is_empty();
-    if !infos
+    let shell_listed = infos
         .iter()
-        .any(|(p, i)| *p == s_pid && i.p_uniqueid == shell.p_uniqueid)
-    {
-        incomplete = true;
-    }
+        .any(|(p, i)| *p == s_pid && i.p_uniqueid == shell.p_uniqueid);
     let parent_of = |pid: i32| -> Option<i32> {
         infos
             .iter()
@@ -1969,18 +1979,12 @@ fn escape_scan_with_owner(
             // and the adoption, not an exec after the leader's exit (0 of 30
             // such orphans kept it); a `setsid` session's members never have it.
             //
-            // So that `$(...)` child exec'ing its `locale` after its tab's zsh
-            // has gone reads as born on no terminal: it is told by its standard
-            // descriptors instead. The exit of a terminal's session leader
-            // revokes that terminal for every holder, and such a child still
-            // holds its stdin and stderr on it (dead vnodes:
-            // [`aterm_uds::holders::stdio_on_dead_vnode`]). The run's processes
-            // hold the shell's terminal, live while the shell lives (a scan of a
-            // gone shell is `Unknown`), a file, a pipe or nothing, so one on a
-            // revoked terminal is another terminal's, with the same hole as the
-            // flag's: a terminal the run opened, its opener gone in the window.
-            // Measured: such an orphan reads flags `0x21404010` and `ENOENT` for
-            // each of 0, 1 and 2, as the live suite's `locale` stranger did.
+            // A dead standard vnode is diagnostic context only. The read
+            // reports no terminal identity: a force-unmounted ordinary file
+            // answers the same way as a revoked terminal. It cannot show that
+            // this orphan came from another terminal, even after confirming
+            // the same process birth. Keep the terminal-flag rule, then let
+            // the ownership rule below judge the orphan as before.
             if !attached && line != LeaderLine::Run {
                 if info.pbsd.pbi_flags & PROC_FLAG_CONTROLT != 0 {
                     continue;
@@ -1990,7 +1994,7 @@ fn escape_scan_with_owner(
                     Some(true)
                         if read(*pid).is_some_and(|now| now.p_uniqueid == info.p_uniqueid) =>
                     {
-                        continue;
+                        "dead"
                     }
                     Some(false) => "live",
                     _ => "unread",
@@ -2050,10 +2054,12 @@ fn escape_scan_with_owner(
         }
     }
     if !read(s_pid).is_some_and(|now| now.p_uniqueid == shell.p_uniqueid) {
-        return Scan::Unknown;
+        return shell_unknown(s_pid, "gone");
     }
     if escaped {
         Scan::Escaped
+    } else if !shell_listed {
+        shell_unknown(s_pid, "unlisted")
     } else if incomplete {
         Scan::Unknown
     } else {
@@ -2562,13 +2568,13 @@ fn linux_escape_scan(
 ) -> Scan {
     use std::collections::{HashMap, HashSet};
     if s_pid <= 1 {
-        return Scan::Unknown;
+        return shell_unknown(s_pid, "unread");
     }
     let Ok(Some(shell)) = table.read(s_pid) else {
-        return Scan::Unknown;
+        return shell_unknown(s_pid, "unread");
     };
     if shell.uid != uid || shell.ended {
-        return Scan::Unknown;
+        return shell_unknown(s_pid, "unread");
     }
     let Some(pids) = table.list() else {
         return Scan::Unknown;
@@ -2716,12 +2722,24 @@ fn linux_escape_scan(
             }
         };
         if owned {
+            // The process the verdict rests on, named as macOS's scan names
+            // it, for whoever reads why a generation does not learn (the live
+            // suite's L4 cases read this line: without it a Linux escape was
+            // an Unclean fold that named nothing).
+            aterm_log::info!(
+                "spare gate: escape: pid={pid} ppid={} session={} in_session={} \
+                 reparented={reparented} left_session={left_session} start={}",
+                r.ppid,
+                r.session,
+                r.session == s_pid,
+                r.start,
+            );
             escaped = true;
             break;
         }
     }
     if !matches!(table.read(s_pid), Ok(Some(now)) if now.start == shell.start && !now.ended) {
-        return Scan::Unknown;
+        return shell_unknown(s_pid, "gone");
     }
     if escaped {
         Scan::Escaped
@@ -3627,6 +3645,7 @@ impl Wake {
             | Wake::DevToolsProbeReady
             | Wake::DebuggerAccessResult
             | Wake::DevToolsHandOver
+            | Wake::SecretsVault(..)
             | Wake::GpuSurfaceReady { .. }
             | Wake::MacosAccessCardDecided { .. }
             | Wake::ReadDims { .. }
@@ -3649,6 +3668,7 @@ impl Wake {
             | Wake::NativeMachineStateFinished { .. }
             | Wake::HarnessStatsCollected { .. }
             | Wake::Vitals
+            | Wake::DiskWalk
             | Wake::NativeUpdateReconcileFinished { .. }
             | Wake::NativeUpdateWorkerDrained
             | Wake::NativeDocumentQueueSlotAvailable
@@ -3664,6 +3684,7 @@ impl Wake {
             | Wake::ControlTextScale { .. }
             | Wake::LoginNotice { .. }
             | Wake::CardSeed { .. }
+            | Wake::PersonStandIn { .. }
             | Wake::ControlSecurityPosture { .. }
             | Wake::UpdateHealth { .. }
             | Wake::DevBuildStanding { .. }

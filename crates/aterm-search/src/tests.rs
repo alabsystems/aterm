@@ -4,9 +4,7 @@
 
 use super::*;
 
-/// CRITICAL: an empty query returns nothing, on every path, without looping.
-///
-/// This catches the bug where `"text".find("")` returns `Some(0)` forever.
+/// An empty query returns nothing on every path without looping.
 #[test]
 fn empty_query_search_with_positions() {
     let mut index = SearchIndex::new();
@@ -103,10 +101,7 @@ fn terminal_search_find_next_prev() {
     assert_eq!(m.end_col, 5);
 }
 
-/// Verify that find_next/find_prev same-line column filtering uses strict
-/// inequality (> / <), not inclusive (>= / <=). An off-by-one here would
-/// cause find_next to re-find the current match or find_prev to skip valid
-/// matches at the boundary.
+/// Verify `find_next`/`find_prev` same-line column filtering uses strict inequality (`>` / `<`).
 #[test]
 fn find_next_prev_same_line_column_boundary() {
     let mut search = TerminalSearch::new();
@@ -417,9 +412,7 @@ fn find_next_past_last_line() {
     assert!(search.find_next("match", 1, 0).is_none());
 }
 
-/// Round-8: the case-insensitive ASCII path switched from an O(L·Q) per-start
-/// compare to str::find. Verify it still reports every (overlapping) match at the
-/// correct columns, matching the historical semantics.
+/// Case-insensitive ASCII search reports all overlapping matches at the expected columns.
 #[test]
 fn case_insensitive_ascii_search_reports_overlapping_matches() {
     let mut index = SearchIndex::new();
@@ -443,9 +436,7 @@ fn case_insensitive_ascii_search_reports_overlapping_matches() {
     assert!(none.is_empty());
 }
 
-/// Round-8: batch queries are bounded at MAX_SEARCH_MATCHES so repetitive content
-/// cannot allocate one SearchMatch per occurrence unbounded; search_results_opts
-/// reports the truncation via `incomplete`.
+/// Batch queries cap results at `MAX_SEARCH_MATCHES` and report truncation via `incomplete`.
 #[test]
 fn batch_search_caps_matches_and_flags_incomplete() {
     let mut index = SearchIndex::with_capacity(30_000);
@@ -473,9 +464,7 @@ fn batch_search_caps_matches_and_flags_incomplete() {
         "case-insensitive batch must cap at MAX_SEARCH_MATCHES"
     );
 
-    // Deterministic cap: it must keep the LOWEST-line matches, not an arbitrary
-    // hash-order subset (codex round-8 follow-up — self.lines is a hash map, so the
-    // trigram-less scan sorts line numbers before capping).
+    // Deterministic cap: keep the lowest-line matches in sorted line order.
     assert!(
         ci.iter().any(|m| m.line == 0),
         "capped result must include the lowest line"
@@ -593,9 +582,7 @@ fn single_line_overlaps_are_streamed_under_the_batch_cap() {
     );
 }
 
-/// Round-8 codex follow-up: the regex batch path also caps, and must iterate
-/// lines in ascending order so the cap keeps the lowest-line matches
-/// deterministically (self.lines is a hash map).
+/// Regex batch search caps at `MAX_SEARCH_MATCHES` in ascending line order.
 #[test]
 fn regex_batch_search_caps_matches_deterministically() {
     let mut index = SearchIndex::with_capacity(30_000);
@@ -689,11 +676,7 @@ fn bloom_rebuild_tracks_trigram_volume_for_bulk_scrollback() {
     );
 }
 
-// Regression: regex patterns that produce zero-length matches (^, \b, x*)
-// must be filtered to prevent `SearchMatch` with `start_col == end_col`.
-// Such matches cause `saturating_sub(1)` in `convert_search_match` to produce
-// backwards (end < start) or incorrect (fake 1-char) Match objects.
-// Part of algorithm audit for #5455 regex find bar.
+// Regex patterns that produce zero-length matches (`^`, `\b`, `x*`) are filtered out.
 #[test]
 fn regex_search_filters_zero_length_matches() {
     let mut index = SearchIndex::new();
@@ -759,17 +742,10 @@ fn regex_search_preserves_nonzero_matches_alongside_zero_length() {
     }
 }
 
-/// Regression: case-insensitive search must match across all three forms of
-/// Greek sigma (capital Σ, medial σ, word-final ς).
-///
-/// `str::to_lowercase` applies the contextual Final_Sigma rule (a word-final
-/// Σ lowercases to ς), while the per-line scan buffer and `LowerByteMap` use
-/// the non-contextual `char::to_lowercase` (always σ). Before the fix the
-/// trigram index/query (built with `str::to_lowercase`) and the scan buffer
-/// disagreed on a word-final Σ, so indexing the Greek word for "street"
-/// (ΟΔΟΣ) and searching for it case-insensitively returned 0 matches for
-/// every form of the query. The shared lower+sigma-fold routine collapses
-/// Σ/σ/ς to a single canonical form so all forms match.
+/// Case-insensitive search matches across all three Greek sigma forms
+/// (`Σ`, `σ`, `ς`): both trigram folding and the scan buffer collapse
+/// word-final `ς` (`str::to_lowercase`) and medial `σ` (`char::to_lowercase`)
+/// to a single canonical form.
 #[test]
 fn case_insensitive_greek_final_sigma_unified() {
     let mut index = SearchIndex::new();
@@ -1092,10 +1068,8 @@ fn owned_numbered_content_matches_borrowed_indexing() {
     assert_eq!(owned_results, borrowed_results);
 }
 
-/// Eviction with sparse (widely-spaced) line numbers is O(n log n) in cached
-/// entries, not O(gap_size). Indexes 10 lines at positions 1M, 2M, ..., 10M,
-/// triggers eviction, and verifies the oldest lines are evicted while the
-/// newest survive (#7246).
+/// Eviction with sparse line numbers is O(n log n) in cached entries, evicting
+/// the oldest lines while retaining the newest.
 #[test]
 fn eviction_with_sparse_line_numbers() {
     let mut index = SearchIndex::new();
@@ -1153,17 +1127,11 @@ fn eviction_with_sparse_line_numbers() {
     }
 }
 
-/// DL-2: eviction sets the incomplete-results signal and the retained-line
-/// watermark, and the cap is configurable via the public API.
-///
-/// Indexing past a small configured cap must:
-/// 1. flip `results_may_be_incomplete()` from false to true,
-/// 2. advance `lowest_retained_line()` above 0,
-/// 3. keep `len()` growing to the highest indexed line (caller sees no shrink),
-/// 4. surface the same signal through `search_results_opts`.
+/// Indexing past `max_cached_lines` sets `results_may_be_incomplete()`,
+/// advances `lowest_retained_line()`, keeps `len()` at the highest indexed
+/// line, and surfaces both through `search_results_opts`.
 #[test]
 fn eviction_sets_incomplete_signal_and_watermark() {
-    // Cap configurable through the constructor (not the old hard-coded const).
     let mut index = SearchIndex::with_max_cached_lines(8);
     assert_eq!(index.max_cached_lines(), 8, "cap must be configurable");
 
@@ -1192,8 +1160,7 @@ fn eviction_sets_incomplete_signal_and_watermark() {
         index.lowest_retained_line()
     );
 
-    // (3) len() still reflects the highest indexed line — it does NOT shrink,
-    //     which is exactly why a silent eviction was dangerous before DL-2.
+    // (3) len() still reflects the highest indexed line.
     assert_eq!(
         index.len(),
         40,
@@ -1233,8 +1200,8 @@ fn eviction_sets_incomplete_signal_and_watermark() {
     }
 }
 
-/// DL-2: the cap is configurable after construction via `set_max_cached_lines`,
-/// a 0 cap is clamped to 1, and `clear()` resets the incomplete signal.
+/// `set_max_cached_lines` reconfigures the cap at runtime (clamping 0 to 1),
+/// and `clear()` resets the incomplete signal and watermark.
 #[test]
 fn cap_is_configurable_and_clear_resets_signal() {
     let mut index = SearchIndex::new();
@@ -1272,8 +1239,7 @@ fn cap_is_configurable_and_clear_resets_signal() {
     assert_eq!(index.len(), 0, "clear empties the index");
 }
 
-/// DL-2: `TerminalSearch` forwards the eviction signal so the future
-/// `cmd_search` can read it without reaching into `SearchIndex`.
+/// `TerminalSearch` forwards the eviction signal and retained-line watermark.
 #[test]
 fn terminal_search_surfaces_eviction_signal() {
     let mut search = TerminalSearch::with_capacity_and_max(16, 8);
@@ -1297,11 +1263,8 @@ fn terminal_search_surfaces_eviction_signal() {
     assert!(!results.is_empty(), "surviving lines remain searchable");
 }
 
-// Regression for the lowercased-trigram fast path: gating the lowered pass
-// behind `lower_need` must keep insert/remove/rebuild symmetric. An
-// all-lowercase line skips the lowered pass entirely, while a mixed-case line
-// runs it; overwriting one with the other (which drives `remove_trigrams` on
-// the old text) must not leak or double-delete shared trigrams.
+// Gating the lowered trigram pass behind `lower_need` keeps insert/remove
+// symmetric when overwriting between all-lowercase and mixed-case lines.
 #[test]
 fn lowercase_fast_path_keeps_insert_remove_symmetric() {
     let mut index = SearchIndex::new();
@@ -1346,17 +1309,9 @@ fn lowercase_fast_path_keeps_insert_remove_symmetric() {
     );
 }
 
-/// Regression (round 11): a query that resolves to ZERO display columns
-/// (`start_col == end_col`) must not be emitted as a match. Such a match spans
-/// no visible columns and would `saturating_sub(1)` into an inverted highlight
-/// span in downstream consumers (`convert_search_match`).
-///
-/// A combining mark (U+0301, width 0) that shares its grapheme with the base
-/// character is the canonical trigger: `text.find` locates a nonzero-byte
-/// occurrence, but both endpoints map to the same display column. This exercises
-/// every push site: `search_with_positions` (case-sensitive literal), the
-/// non-ASCII case-insensitive path, the forward/reverse match iterators, and —
-/// when built with `regex` — the regex path's post-resolution guard.
+/// Matches that resolve to zero display columns (`start_col == end_col`,
+/// e.g. a standalone combining mark U+0301 sharing its base char's grapheme)
+/// are filtered out across literal, case-insensitive, iterator, and regex paths.
 #[test]
 fn zero_display_width_matches_are_skipped() {
     let mut index = SearchIndex::new();
@@ -1455,18 +1410,10 @@ fn max_cached_for_retained_protects_the_newest_lines() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// SA-1 incremental narrowing: differential battery.
-//
-// The contract under test: `search_literal_narrowed(q, case, None)` equals the
-// forward batch path exactly, and `search_literal_narrowed(q + c, case,
-// Some(frame_of(q)))` equals the batch path for `q + c` — for EVERY prefix
-// step, both case modes, over corpora chosen to hit the treacherous shapes
-// (Kelvin sign, sigma forms, prepend clusters, zero-width characters,
-// combining marks, overlapping matches). The frame is OCCURRENCE lines, so
-// zero-display-width matches (dropped from results) still keep their line
-// narrable — the exact hazard a reported-match frame would lose.
-// ---------------------------------------------------------------------------
+// Incremental narrowing differential battery: `search_literal_narrowed` with
+// an occurrence-line frame must match the batch search at every prefix step
+// across both case modes, including lines where a prefix has only zero-width
+// occurrences.
 
 /// Corpus with every shape the narrowing proof cares about.
 fn narrowing_corpus() -> Vec<&'static str> {
@@ -1562,23 +1509,10 @@ fn narrowed_typing_equals_batch_for_every_prefix_step() {
     }
 }
 
-/// THE zero-width hazard, isolated — with the shapes this engine's fold and
-/// column map really produce. `visit_matches` drops any match whose ORIGINAL
-/// span resolves to zero display columns (`start_col == end_col`), so a line
-/// can hold a genuine occurrence of `q` with ZERO reported matches while
-/// `q + c` matches for real:
-///
-/// - a PREPEND cluster (U+0600 + "1"): the digit lives inside the cluster, so
-///   "1" alone spans no column, while "1x" crosses the cluster boundary;
-/// - a zero-width character (U+200B): it spans no column on its own, but the
-///   two-char query straddling it into the next cell does.
-///
-/// (The multi-char-fold intuition — U+FB01 as "fi", sharp s as "ss" — is NOT
-/// one of them here: this index folds with `char::to_lowercase`, which leaves
-/// both alone, so those lines carry no such occurrence at all.)
-///
-/// A reported-match frame would lose these lines outright; the occurrence
-/// frame must keep them.
+/// `occurrence_lines` retains lines where `q` has only zero-display-column
+/// occurrences (dropped by `visit_matches`) that become non-empty under
+/// `q + c`, such as a digit inside a U+0600 prepend cluster or a U+200B
+/// zero-width space straddled by a longer query.
 #[test]
 fn occurrence_frame_keeps_zero_width_only_lines_narrable() {
     // (line text, zero-width-only query, one-char extension that DOES match)
@@ -1614,11 +1548,9 @@ fn occurrence_frame_keeps_zero_width_only_lines_narrable() {
     }
 }
 
-/// The narrowing COST GUARD's input: `literal_candidate_bound` must report
-/// what the engine's own candidate machinery would really visit — `None` when
-/// there is no selectivity to offer (sub-trigram range scan), `Some(0)` when
-/// a trigram is absent outright, and otherwise the SMALLEST involved posting
-/// list (the list the candidate driver walks).
+/// `literal_candidate_bound` returns `None` for sub-trigram queries,
+/// `Some(0)` when any trigram is absent, and otherwise the smallest posting
+/// list length.
 #[test]
 fn literal_candidate_bound_reports_the_engines_own_candidate_count() {
     let mut index = SearchIndex::new();
@@ -1730,12 +1662,9 @@ fn narrowed_walk_carries_eviction_honesty_like_batch() {
     assert_eq!(step2.results, batch_forward(&index, "needle ", false));
 }
 
-/// SA-3 (set-diff changed-row re-index): an arbitrary in-place edit script
-/// must leave the index RESULT-identical to a from-scratch build over the
-/// final texts — across shared / old-only / new-only trigram classes, the
-/// unchanged-row skip, Unicode↔ASCII rewrites (the lowered-pass symmetry),
-/// sigma folding, and the emptied-list prune. This is the oracle the
-/// remove-all/insert-all → symmetric-difference rewrite is gated on.
+/// In-place line re-indexing via trigram symmetric difference produces an
+/// index identical to a fresh build across shared, old-only, and new-only
+/// trigrams, case transitions, sigma folding, and emptied-list pruning.
 #[test]
 fn changed_row_reindex_matches_from_scratch_rebuild() {
     let script: &[(usize, &str)] = &[
@@ -1848,12 +1777,9 @@ fn changed_row_reindex_round_trip_is_identity() {
     }
 }
 
-/// `drop_history_below` (the complete-retention twin of `retain_history_from`)
-/// must leave the index OBSERVATIONALLY IDENTICAL to a from-scratch build over
-/// the surviving rows: same matches, same completeness (complete!), same
-/// watermark — the equivalence `Terminal::indexed_search`'s incremental
-/// refresh rests on. `retain_history_from` on the same input is the contrast:
-/// identical matches but an honest `incomplete` flag.
+/// `drop_history_below` leaves the index observationally identical to a
+/// fresh build over the surviving rows (keeping `incomplete == false`),
+/// whereas `retain_history_from` marks `incomplete == true`.
 #[test]
 fn drop_history_below_matches_fresh_rebuild_including_completeness() {
     let mut dropped = SearchIndex::new();
@@ -1896,11 +1822,8 @@ fn drop_history_below_matches_fresh_rebuild_including_completeness() {
     );
     assert_eq!(retained.lowest_retained_line(), 15);
 
-    // Dropped rows are really gone from the posting lists, not merely masked:
-    // queries that ONLY ever matched below the cut return nothing, exactly as
-    // in the fresh build. (The probes must be rows with no numeric extension
-    // in range — "row 3" would also match rows 30..=39, which SURVIVE the
-    // cut, and would pass for the wrong reason.)
+    // Dropped rows are removed from posting lists; probe strings have no
+    // numeric prefix overlap with surviving rows 25..40.
     for below_cut in ["row 7", "row 14"] {
         assert!(
             dropped.search_with_positions(below_cut).is_empty(),

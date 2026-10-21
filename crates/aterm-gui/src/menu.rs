@@ -1,30 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The native macOS application MENU BAR (the Apple `NSMenu` main menu).
+//! The native macOS application menu bar (`NSApp.mainMenu`).
 //!
-//! aterm installs a standard Mac menu bar — App (aterm) / File / Edit / View /
-//! Window / Help with the usual items — so it presents as a native app. The menu
-//! is built and installed once, after the window exists, in [`crate::App::resumed`]
-//! (skipped under `--headless`, so tests create no menu and stay byte-identical).
-//!
-//! **No behavior duplication.** A menu item is a thin DISPATCH stub: it carries a
-//! VISUAL key-equivalent only (so the shortcut shows next to the item) and, when
-//! clicked, posts a [`Wake::MenuAction`](crate::Wake) carrying a [`MenuAction`],
-//! marked so the keys typed behind its key equivalent wait for its dispatch
-//! (`tab_spawn::post_native_menu_action`).
-//! The main loop's `user_event` turns that into a call on the SAME `App` command
-//! method the existing keybinding uses (see `App::dispatch_menu_action`). The
-//! real keypresses still flow through `App::on_key` exactly as before — the menu
-//! adds a second entry point to the existing commands, never a parallel one.
-//!
-//! Each item's [`MenuAction`] is encoded in its `NSMenuItem.tag` (a plain
-//! integer), so a SINGLE Objective-C action selector (`menuAction:`) reads the
-//! sender's tag and forwards it — no per-item method, no per-item Rust object.
-//! The action target is a small custom `NSObject` subclass that owns an
-//! [`EventLoopProxy<Wake>`]; AppKit holds a target only weakly, so [`install`]
-//! returns the retained target for the caller (`App`) to keep alive for the whole
-//! run loop.
+//! Installed once, with the first OS window (`App::attach_os_window`), so a headless process
+//! builds none. An item is a dispatch stub: it shows its key equivalent and, when chosen, posts
+//! [`Wake::MenuAction`](crate::Wake) with a [`MenuAction`], marked so keys typed behind its key
+//! equivalent wait for its dispatch (`tab_spawn::post_native_menu_action`), which
+//! `App::dispatch_menu_action` turns into the same `App` command the keybinding calls. The action
+//! rides in the item's `NSMenuItem.tag`, so one selector (`menuAction:`) serves every item. AppKit
+//! holds the target weakly, so [`install`] returns it retained for `App` to keep.
 //!
 //! Everything imperative is `#[cfg(target_os = "macos")]`. On other targets the
 //! [`MenuAction`] enum and a no-op [`install`] still exist so the workspace builds
@@ -161,10 +146,10 @@ pub(crate) fn admit_native_terminate(systems: bool) -> NativeTerminateDecision {
     })
 }
 
-/// Cancel the quit of `generation` if it is the one pending. A cancelled quit
-/// is no longer the system's either ([`crate::system_quit::forget`]): EVERY
-/// cancel runs through here or [`cancel_current_native_termination`], so a
-/// logout aterm answered Cancel to can never mark the person's next ⌘Q.
+/// Cancel the quit of `generation` if it is the one pending. A cancelled quit is no longer the
+/// system's either ([`crate::system_quit::forget`]): every cancel runs through here or
+/// [`cancel_current_native_termination`], so a logout aterm answered Cancel to never marks the
+/// person's next ⌘Q.
 #[cfg(unix)]
 pub(crate) fn cancel_native_termination(generation: u64) -> bool {
     with_native_terminate(|state| {
@@ -188,10 +173,9 @@ pub(crate) fn cancel_current_native_termination() -> bool {
     })
 }
 
-/// Serialises the tests that drive the process-wide arbiter and the system-quit
-/// mark, and hands each a fresh arbiter. No test can reach the event-loop paths
-/// that complete a quit (they need an `ActiveEventLoop`), so a reset between
-/// tests discards nothing real.
+/// Serialises the tests that drive the process-wide arbiter and the system-quit mark, and hands
+/// each a fresh arbiter. No test reaches the paths that complete a quit (they need an
+/// `ActiveEventLoop`), so the reset discards nothing real.
 #[cfg(test)]
 pub(crate) fn terminate_test_serial() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -210,46 +194,31 @@ pub(crate) fn complete_current_native_termination() -> bool {
     with_native_terminate(NativeTerminateArbiter::complete_current)
 }
 
-/// One menu command, identified independently of AppKit. The discriminant is the
-/// integer stored in the originating `NSMenuItem.tag` and round-tripped back via
-/// [`MenuAction::from_tag`]; `user_event` matches on the value to call the
-/// matching existing `App` command method (`App::dispatch_menu_action`).
-///
-/// Standard AppKit responder items (window minimise/zoom/fullscreen, hide, quit)
-/// are routed through here too, rather than via `nil`-target responder selectors,
-/// so the WHOLE menu has one uniform, auditable dispatch path that lands in `App`.
+/// One menu command, independent of AppKit. Its [`MenuAction::tag`] is the `NSMenuItem.tag`,
+/// decoded by [`MenuAction::from_tag`]; `App::dispatch_menu_action` calls the matching command.
+/// Standard responder items (minimise, zoom, full screen, hide, quit) route here too, not via
+/// `nil`-target selectors, so the whole menu has one dispatch path into `App`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuAction {
     // App menu
     /// About aterm — open the About route in the native Settings tab.
     About,
-    /// Check for Updates… — the DETAILS update entry point. Opens the Software Update
-    /// route in the native Settings tab AND kicks off a fresh
-    /// check: current + staged build, what's-new notes, and Update to Latest Now. The same
-    /// route the Version menu's "Update details…" item and the [`MenuAction::ApplyUpdate`]
-    /// nothing-staged fallback open. (The old separate "Check for Updates…" NSAlert action
-    /// — tag 34 — is folded into this one.)
+    /// Check for Updates… — open the Software Update route in the native Settings tab and start
+    /// a fresh check. The Version menu's "Update details…" and the [`MenuAction::ApplyUpdate`]
+    /// fallback open the same route.
     SoftwareUpdate,
-    /// Version — the dedicated top-level menu-bar menu whose title shows `v<version>`
-    /// (glanceable build/version identity; a trailing ⬆️ while an update is staged —
-    /// see [`update_version_menu`] and [`staged_for_version_menu`]). Choosing its About item
-    /// opens the native About route, which carries the full build & versioning
-    /// details. Replaces the old floating top-right badge as the primary version surface.
-    /// Off macOS, Windows' tab-strip version label fires it too ([`version_slot_click`]).
+    /// Version — the top-level menu whose title shows `v<version>`, with a trailing ⬆️ while
+    /// an update is staged ([`update_version_menu`], [`staged_for_version_menu`]). Its About
+    /// item opens the native About route. Off macOS, Windows' tab-strip version label fires it
+    /// too ([`version_slot_click`]).
     Version,
-    /// ONE-CLICK UPDATE (`App::apply_update_or_details`): the Version menu's
-    /// "⬆️ Install aterm v<staged> now" item / the palette's
-    /// Version row / the
-    /// "Update ready" notice pill / the off-macOS tab-strip ↻ all fire this. A
-    /// strictly-newer STAGED build applies immediately (the same re-exec path
-    /// `Wake::ApplyStagedUpdate` takes — no intermediate route change, per the owner's
-    /// "click-upgrade" ask), unless it is on hold (`latched_activation_trial_spent`),
-    /// which opens the Software Update route like an empty stage; with nothing actually
-    /// staged it falls back to that route (honest details, never a silent dead click
-    /// or a blind restart).
+    /// One-click update (`App::apply_update_or_details`), fired by the Version menu's install
+    /// item, the palette's Version row, the "Update ready" pill and the off-macOS tab-strip ↻.
+    /// A strictly newer staged build applies at once (`Wake::ApplyStagedUpdate`); one on hold or
+    /// nothing staged opens the Software Update route instead.
     ApplyUpdate,
-    /// Open aterm.toml — open the canonical config in Settings ▸ Manual's native,
-    /// assisted editor. This is cross-platform and shares the exact document/save host.
+    /// Open aterm.toml — the canonical config in Settings ▸ Manual's assisted editor, on every
+    /// platform.
     Preferences,
     /// Quit aterm.
     Quit,
@@ -270,10 +239,10 @@ pub(crate) enum MenuAction {
     /// Move Tab to New Window — pull the active tab out into a fresh in-process
     /// window (`App::detach_active_tab`).
     MoveTabToNewWindow,
-    /// Move Tab to Next Window — move the active tab into the NEXT EXISTING window
+    /// Move Tab to Next Window — move the active tab into the next existing window
     /// (wrapping; `App::migrate_active_tab_to_next_window`).
     MoveTabToNextWindow,
-    /// Open Session in New Window — show the active session in a SECOND window
+    /// Open Session in New Window — show the active session in a second window
     /// (same live grid in two windows; `App::open_active_session_in_new_window`).
     ViewSessionInNewWindow,
     /// Close Tab — close the focused pane; a tab's last pane closes the tab
@@ -306,34 +275,25 @@ pub(crate) enum MenuAction {
     SplitVertical,
     /// Split the focused pane top/bottom (`split_focused_pane(Horizontal)`).
     SplitHorizontal,
-    /// Toggle PHOSPHOR matrix rain for the FRONT SESSION of the frontmost window
-    /// (`App::toggle_matrix_rain` — a per-session runtime override that wins over
-    /// the `[matrix_rain]` config bit, in either direction, until the session
-    /// ends). Terminal-only ([`requires_terminal_tab`]): a native whole tab has
-    /// no session to toggle. The palette row's checkmark mirrors the front
-    /// session's effective state.
+    /// Toggle matrix rain for the front session of the frontmost window
+    /// (`App::toggle_matrix_rain`): a per-session override of `[matrix_rain]`, either way,
+    /// until the session ends. Terminal-only ([`requires_terminal_tab`]). The palette
+    /// checkmark mirrors the front session's effective state.
     ToggleMatrixRain,
-    /// Promote the front window's PROMOTABLE kitty — the tenured program cat
+    /// Promote the front window's promotable kitty — the tenured program cat
     /// on its glass, else the launch kitty (the base cat generated at launch,
-    /// per computer; owner rulings 2026-08-17) — into the durable kitty
+    /// per computer) — into the durable kitty
     /// registry and pin it as the cursor companion (`App::favourite_kitty_checked`).
-    /// Owner: "if somebody really likes that kitty it goes into the kitty
-    /// registry" — and since a pinned favourite outranks both program cats
-    /// and the launch kitty, this is also how a cat you like is KEPT across
+    /// Since a pinned favourite outranks both program cats
+    /// and the launch kitty, this is also how a cat is kept across
     /// launches and programs. Process-wide (never terminal-only: the launch
     /// kitty exists without a front session). The palette row's checkmark
     /// reports whether that promotable kitty is the current pin. One-way: the
     /// pin is transferable, not toggleable. Wire id 46 is kept.
     FavouriteKitty,
-    /// **WEAR THE NEXT CAT IN THE COLLECTION.** The switch
-    /// [`Self::FavouriteKitty`] cannot make: that one pins the cat that would
-    /// ride ANYWAY (the focused window's tenured program cat, else the launch
-    /// kitty), so pressing it never puts on a DIFFERENT cat — to wear another
-    /// you had to make it appear first, by relaunching or by running a program
-    /// long enough to earn tenure. This walks the collection instead, one cat
-    /// per press, wrapping at the end, which is a picker you can use without
-    /// a picker. `kitty wear <key>` on the control socket is the addressed
-    /// form for anyone who knows which cat they want.
+    /// Wear the next cat in the collection, one per press, wrapping at the end.
+    /// [`Self::FavouriteKitty`] pins the cat that would ride anyway, so it never puts on a
+    /// different one. `kitty wear <key>` on the control socket is the addressed form.
     NextKitty,
     /// Toggle the process-wide serious-mode policy. While enabled it suppresses
     /// every audible and decorative effect without overwriting the underlying
@@ -342,15 +302,12 @@ pub(crate) enum MenuAction {
     /// Focus or create the process-singleton Settings tab. The app-menu Settings…
     /// item — ⌘, — uses the standard macOS settings chord.
     ToggleSettings,
-    /// View ▸ Show Needs in Windows — checkable
-    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): the window's needs
+    /// View ▸ Show Needs in Windows — checkable: the window's needs
     /// border and its pill, on or off together. Persisted as `[presence] rim`
     /// through the one serialized config lane
-    /// (`App::user_toggle_needs_in_windows`). It replaces Presence Band and
-    /// Presence Rim; `TogglePresenceRim` (the same key) is its alias.
+    /// (`App::user_toggle_needs_in_windows`). `TogglePresenceRim` (the same key) is its alias.
     ToggleNeedsInWindows,
-    /// View ▸ Stats Bars: Deck — one of three radio rows
-    /// (`docs/DESIGN-system-awareness-2026-10-16.md` §12.2): the three bars
+    /// View ▸ Stats Bars: Deck — one of three radio rows: the three bars
     /// at full size under the titlebar, the default. Persisted as
     /// `[sys] stats_bars = "deck"` through the one serialized config lane
     /// (`App::user_set_stats_bars`); a change into or out of the Deck
@@ -361,21 +318,29 @@ pub(crate) enum MenuAction {
     StatsBarsSill,
     /// View ▸ Stats Bars: Off — no bars (`"off"`).
     StatsBarsOff,
+    /// View ▸ Deck Size: Automatic — one of three radio rows
+    /// (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §2.2, §11.5): each window's
+    /// Deck is Full or Folded by its height, the default. Persisted as
+    /// `[sys] stats_deck_size = "auto"` through the one serialized config
+    /// lane (`App::user_set_deck_size`); every window re-decides its form,
+    /// and one whose Deck changes height re-grids once.
+    DeckSizeAuto,
+    /// View ▸ Deck Size: Full — every window's Deck Full (`"full"`).
+    DeckSizeFull,
+    /// View ▸ Deck Size: Folded — every window's Deck Folded (`"folded"`).
+    DeckSizeFolded,
     /// View ▸ Stats Lens (⌘I): open the keyboard lens, the bars' close-up,
     /// on the front window, or close the open one (`App::toggle_stats_lens`).
     ToggleStatsLens,
-    /// Open Settings AT the Packages route (the batteries-included toolchain
+    /// Open Settings at the Packages route (the batteries-included toolchain
     /// surface: install/update the ALab toolset, posture, consent switches).
     /// The app-menu Packages… item beneath Settings… — the menu-bar path to the
     /// same page the seed notice pill points at.
     Packages,
-    /// Open Settings AT the Messages route (docs/DESIGN-unified-messages-2026-09-21.md
-    /// §4): everything aterm told the person, newest first. The app-menu
-    /// Messages… item beneath Packages… — the menu-bar path to the page the
-    /// band's `Details ›` opens.
+    /// Open Settings at the Messages route:
+    /// everything aterm told the person, newest first; the page the band's `Details ›` opens.
     Messages,
-    /// Toggle the own-rendered, cross-platform command PALETTE overlay
-    /// (`App::toggle_palette`).
+    /// Toggle the command palette overlay (`App::toggle_palette`).
     OpenPalette,
     /// View ▸ Choose Theme… — open the command palette scoped to its Theme
     /// section (`App::open_theme_palette`): the arrow keys preview each theme
@@ -396,46 +361,41 @@ pub(crate) enum MenuAction {
     /// View ▸ Clear Tab Theme — the front session draws the instance theme
     /// again (`theme session clear`). Terminal-only.
     ClearTabTheme,
-    // Tab-strip CONTEXT menu (session-metadata stage 2). These two live ONLY in
-    // the per-tab right-click menu the native strip pops (`toolbar.rs` /
-    // `session_chrome::compose_tab_menu`) — NOT in the menu bar, so they are
-    // deliberately absent from `MENU_MODEL`. They ride the same tag→action decode
-    // as every bar item.
+    // Tab-strip context menu. These two live only in the per-tab right-click
+    // menu the native strip pops (`toolbar.rs` / `session_chrome::compose_tab_menu`),
+    // not in the menu bar, so they are absent from `MENU_MODEL`. They ride the
+    // same tag→action decode as every bar item.
     /// Copy the right-clicked tab's session id (the registry `sid`) to the
     /// clipboard — the handle an agent needs to address this session over the
     /// control socket (`meta`, `timeline`, `turn`, …).
     CopySessionId,
-    /// Copy the right-clicked tab's shell-reported cwd (RAW, never
-    /// `~`-abbreviated — a pasted path must be real) to the clipboard.
+    /// Copy the right-clicked tab's shell-reported cwd to the clipboard, raw (never
+    /// `~`-abbreviated: a pasted path must be real).
     CopyCwd,
-    /// Overview… ⌃⌘O (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6, was
-    /// Show Connection Map): every session of this aterm on one card — what
+    /// Overview… ⌃⌘O: every session of this aterm on one card — what
     /// each needs, else what it is doing, its task, who drives it, and who
     /// manages whom — `App::open_overview` (app_overview.rs) on the front
-    /// window. Its old names (`ShowConnectionMap`, `Fleet`, `ShowFleet`) are
-    /// aliases.
+    /// window. `ShowConnectionMap`, `Fleet` and `ShowFleet` are aliases.
     Overview,
-    // The Agents menu (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, was the
-    // Fabric menu): what needs the person, everyone at a glance, stepping in.
+    // The Agents menu: what needs the person, everyone at a glance, stepping in.
     /// Next That Needs You ⇧⌘J: go to the most pressing local need, stuck
     /// before decide; pressed again, to the next (`App::next_need`, the cursor
     /// keyed by need so a need that resolved drops out).
     NextNeed,
-    /// Harness Log for This Tab ⇧⌘L (was Ledger for This Session): the ledger
+    /// Harness Log for This Tab ⇧⌘L: the ledger
     /// key's action (`App::open_session_ledger`: `aterm drive ledger @<sid>
     /// --format html`, opened in the browser). `LedgerForSession` and
     /// `OpenLedger` are its aliases.
     HarnessLog,
-    /// Take Over This Tab (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4):
-    /// the PERSON'S hold on the focused session (`fabric::person_hold`,
+    /// Take Over This Tab:
+    /// the person's hold on the focused session (`fabric::person_hold`,
     /// `origin=person`, `App::take_over`) — only the person types there until
     /// they hand it back. Greyed while the person's hold already stands.
-    /// [`InvokeAuthority::PersonOnly`]: no socket fires it. Its old name,
-    /// `HoldSession`, is an alias.
+    /// [`InvokeAuthority::PersonOnly`]: no socket fires it. `HoldSession` is an alias.
     TakeOver,
     /// Hand Back This Tab: lift the person's hold, and only it
     /// (`App::hand_back`). Enabled only while it stands.
-    /// [`InvokeAuthority::PersonOnly`]; its old name, `LiftHold`, is an alias.
+    /// [`InvokeAuthority::PersonOnly`]; `LiftHold` is an alias.
     HandBack,
     /// Read This Mac: `aterm ctl survey` as a child, its text in a document
     /// tab (`App::run_cli_to_tab`).
@@ -462,44 +422,30 @@ pub(crate) enum MenuAction {
     /// Fleet Machines — `aterm fleet peers` into a document tab.
     FleetMachines,
     // Window menu
-    /// Edit the FOCUSED PANE's session pin in place on the tab strip — the
-    /// keyboard/menu twin of double-clicking a tab. Named "Rename SESSION", not
-    /// "Rename Tab", because it mutates session metadata (`meta set title`) and
-    /// a tab can hold several split sessions. A bar item (not context-only) so
-    /// it earns a palette row and an `invoke` name; it ALSO appears in the tab
-    /// context menu, exactly as `CloseTab` does.
+    /// Edit the focused pane's session pin in place on the tab strip — the keyboard/menu twin
+    /// of double-clicking a tab. "Rename Session", not "Rename Tab": it sets session metadata
+    /// (`meta set title`) and a tab can hold several split sessions. Also in the tab context
+    /// menu.
     RenameSession,
-    /// Set Role… — the same inline editor over the active tab, editing the
-    /// focused session's `meta role` (the presence band's first slot and the
-    /// name a driven peer's band prints for its driver). Terminal-only, like
-    /// the pin.
+    /// Set Role… — the same inline editor over the active tab, editing the focused session's
+    /// `meta role` (the presence band's first slot). Terminal-only.
     SetRole,
-    /// Show Identity — READ-ONLY: the focused session's agent identity (round
-    /// 18), opened as a Markdown tab — the `identities <name>` row and its
-    /// agents, or a sentence saying the session runs under the user's own
-    /// agent configuration. Terminal-only, directly under Set Role….
+    /// Show Identity — read-only: the focused session's agent identity (its `identities
+    /// <name>` row and agents, or a sentence saying it runs under the user's own agent
+    /// configuration) as a Markdown tab. Terminal-only.
     ShowIdentity,
-    /// New Window With Identity… — the identity PICKER (`App::open_identity_picker`):
-    /// every identity by name, and a NEW one named by typing into its filter;
-    /// choosing opens a window whose first shell runs under it — the menu twin
-    /// of `spawn place=window identity=<name>`, and like that verb the one path
-    /// that may CREATE an identity. (Decided 2026-09-25 under the owner's
-    /// standing direction: one own-rendered, introspectable picker on every
-    /// platform rather than runtime-built NSMenu submenus.)
+    /// New Window With Identity… — the identity picker (`App::open_identity_picker`): choosing
+    /// an identity, or typing a new name, opens a window whose first shell runs under it. Like
+    /// `spawn place=window identity=<name>`, it may create the identity.
     NewWindowWithIdentity,
     /// New Tab With Identity… — the same picker; choosing opens a tab in the
     /// front window under the chosen identity.
     NewTabWithIdentity,
-    /// Edit ▸ Reset Terminal (2026-09-26, `crate::manual_reset`): hand the
-    /// front session's terminal back to its host defaults — every mode a
-    /// program negotiates, a torn escape sequence, an open OSC 8 link —
-    /// keeping the screen and the scrollback. The menu twin of the `reset`
-    /// verb, and the escape hatch for a terminal the automatic foreground
-    /// handback cannot reach (modes armed before it existed, a missed
-    /// foreground change, a shifted charset). Terminal-only.
+    /// Edit ▸ Reset Terminal (`crate::manual_reset`): return the front session's terminal modes,
+    /// a torn escape sequence and an open OSC 8 link to host defaults, keeping the screen and
+    /// scrollback. The menu twin of the `reset` verb. Terminal-only.
     ResetTerminal,
-    /// View ▸ Coding Agent Harness… (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-    /// §1): the one Settings tab, at Settings ▸ Harness — the harness's
+    /// View ▸ Coding Agent Harness…: the one Settings tab, at Settings ▸ Harness — the harness's
     /// switches, the default Autopilot, each session's Autopilot and what the
     /// harness did. The menu and palette twin of the Autopilot menu's
     /// `Harness settings…` (`App::open_harness_settings`). Instance-level: no session needed.
@@ -518,16 +464,14 @@ pub(crate) enum MenuAction {
 }
 
 impl MenuAction {
-    /// The integer stored in the menu item's `tag`. Stable, dense, starting at 1
-    /// (0 is the `NSMenuItem` default tag, reserved so an untagged item never
-    /// looks like a real action).
+    /// The integer stored in the menu item's `tag`: stable, starting at 1 (0 is the
+    /// `NSMenuItem` default, so an untagged item never looks like an action).
     #[must_use]
     pub(crate) fn tag(self) -> isize {
         match self {
             MenuAction::About => 1,
             MenuAction::Preferences => 2,
-            // 3 was Hide aterm, removed — the tag stays reserved so it can never
-            // be reused for a different command by accident.
+            // 3 is retired (was Hide aterm). A retired tag is never reused.
             MenuAction::Quit => 4,
             MenuAction::NewWindow => 5,
             MenuAction::NewTab => 6,
@@ -552,12 +496,10 @@ impl MenuAction {
             MenuAction::SplitHorizontal => 25,
             MenuAction::NextTab => 26,
             MenuAction::PrevTab => 27,
-            // 28, 29, 32, and 33 were bottom-HUD commands. Keep them reserved.
+            // 28, 29, 32 and 33 are retired (bottom-HUD commands).
             MenuAction::ToggleSettings => 30,
             MenuAction::OpenPalette => 31,
-            // 34 was "Check for Updates…" (a separate NSAlert check) — folded into
-            // SoftwareUpdate (35), the details entry point. The tag stays reserved so
-            // it can never be reused for a different command by accident.
+            // 34 is retired (a separate Check for Updates… alert).
             MenuAction::SoftwareUpdate => 35,
             MenuAction::Version => 36,
             MenuAction::ApplyUpdate => 37,
@@ -572,15 +514,12 @@ impl MenuAction {
             MenuAction::FavouriteKitty => 46,
             MenuAction::Packages => 47,
             MenuAction::RenameSession => 48,
-            // 49-53, 55 and 56 were the connection presets and ids, retired
-            // 2026-10-16 (their invoke names answer `ERR retired`).
+            // 49-53, 55 and 56 are retired (connection presets and ids; their
+            // invoke names answer `ERR retired`).
             MenuAction::Overview => 54,
             MenuAction::NextKitty => 57,
-            // Round 19 (SPEC19 §9): the Fabric menu, Set Role…, the presence
-            // toggles. Dense from 59; the retired tags above stay retired.
             // 58 is retired (was Fleet).
-            // 59 was Inbox, retired 2026-10-16. 60 is the ledger row, now
-            // Harness Log.
+            // 59 is retired (was Inbox).
             MenuAction::HarnessLog => 60,
             MenuAction::TakeOver => 61,
             MenuAction::HandBack => 62,
@@ -588,24 +527,16 @@ impl MenuAction {
             MenuAction::FabricOn => 64,
             MenuAction::FabricOff => 65,
             MenuAction::SetRole => 66,
-            // 67 was Presence Band, retired 2026-10-16; 68 is the rim's key,
-            // now Show Needs in Windows.
+            // 67 is retired (was Presence Band); 68 is Show Needs in Windows.
             MenuAction::ToggleNeedsInWindows => 68,
-            // Phase 2 of the unified message system (2026-09-22).
             MenuAction::Messages => 69,
-            // Round 18's identity rows (SPEC19 §9), 2026-09-25.
             MenuAction::ShowIdentity => 70,
             MenuAction::NewWindowWithIdentity => 71,
             MenuAction::NewTabWithIdentity => 72,
-            // The manual reset (2026-09-26).
             MenuAction::ResetTerminal => 73,
-            // Settings ▸ Harness (the Autopilot design, 2026-10-15).
             MenuAction::HarnessSettings => 74,
-            // The palette's Theme section (the theme overhaul, 2026-10-15).
             MenuAction::ChooseTheme => 75,
-            // Settings ▸ Themes, the Theme Showcase (the theme overhaul).
             MenuAction::BrowseThemes => 76,
-            // The Agents menu (2026-10-16), after the per-session themes'.
             MenuAction::NextNeed => 79,
             MenuAction::ReadThisMac => 80,
             MenuAction::ReadFleet => 81,
@@ -615,15 +546,18 @@ impl MenuAction {
             MenuAction::StatsBarsSill => 85,
             MenuAction::StatsBarsOff => 86,
             MenuAction::ToggleStatsLens => 87,
+            // The Deck's size (Stats Deck v2, 2026-10-20).
+            MenuAction::DeckSizeAuto => 88,
+            MenuAction::DeckSizeFull => 89,
+            MenuAction::DeckSizeFolded => 90,
             // Per-session themes (palette-256-session).
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
         }
     }
 
-    /// Inverse of [`MenuAction::tag`]: recover the action from a menu item's tag,
-    /// or `None` for an unknown/zero tag (defensive — the action selector ignores
-    /// a tag it can't decode rather than dispatching the wrong command).
+    /// Inverse of [`MenuAction::tag`]; `None` for an unknown, retired or zero tag, so the action
+    /// selector ignores a tag it cannot decode rather than dispatching the wrong command.
     #[must_use]
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn from_tag(tag: isize) -> Option<MenuAction> {
@@ -654,10 +588,8 @@ impl MenuAction {
             25 => MenuAction::SplitHorizontal,
             26 => MenuAction::NextTab,
             27 => MenuAction::PrevTab,
-            // 28, 29, 32, and 33 are retired bottom-HUD tags.
             30 => MenuAction::ToggleSettings,
             31 => MenuAction::OpenPalette,
-            // 34 retired (was CheckForUpdates) — see `tag`.
             35 => MenuAction::SoftwareUpdate,
             36 => MenuAction::Version,
             37 => MenuAction::ApplyUpdate,
@@ -705,15 +637,17 @@ impl MenuAction {
             85 => MenuAction::StatsBarsSill,
             86 => MenuAction::StatsBarsOff,
             87 => MenuAction::ToggleStatsLens,
+            88 => MenuAction::DeckSizeAuto,
+            89 => MenuAction::DeckSizeFull,
+            90 => MenuAction::DeckSizeFolded,
             _ => return None,
         })
     }
 }
 
 /// Fold a legacy `invoke` spelling onto the current Debug token. The rule of
-/// this table: a wire name an agent may already call is NEVER broken — it is
-/// aliased. Round 19's menu rework (SPEC19 §9) renamed no variant, so every
-/// pre-round-19 name still resolves as itself (pinned by
+/// this table: a wire name an agent may already call is never broken — it is
+/// aliased. Every earlier name still resolves as itself (pinned by
 /// `every_earlier_invoke_name_resolves_or_is_retired`); the aliases here are the
 /// spellings a caller could reasonably have written for a row whose bar
 /// identity moved:
@@ -725,14 +659,14 @@ impl MenuAction {
 ///   the Fabric menu's retired Fleet row, both now the Overview
 ///   ([`MenuAction::Overview`]).
 /// * `HoldSession` / `LiftHold` — the Fabric menu's halt pair, now Take Over
-///   and Hand Back on the person's slot (2026-10-16): the same row, the hold
+///   and Hand Back on the person's slot: the same row, the hold
 ///   the person meant. [`InvokeAuthority::PersonOnly`], so both spellings
 ///   answer `ERR denied` over the wire.
 /// * `TogglePresenceRim` — View ▸ Presence Rim, whose key (`[presence] rim`)
 ///   Show Needs in Windows writes ([`MenuAction::ToggleNeedsInWindows`]).
 ///
 /// A name whose row is gone with nothing in its place is not aliased: it is
-/// RETIRED ([`retired_invoke_name`]) and answers `ERR retired: <what to use>`.
+/// retired ([`retired_invoke_name`]) and answers `ERR retired: <what to use>`.
 #[must_use]
 pub(crate) fn canonical_invoke_name(name: &str) -> &str {
     match name {
@@ -745,9 +679,8 @@ pub(crate) fn canonical_invoke_name(name: &str) -> &str {
     }
 }
 
-/// What a RETIRED `invoke` name answers instead (`ERR retired: <this>`), or
-/// `None` for a name that is not retired. These rows went
-/// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, §7) with nothing that does
+/// What a retired `invoke` name answers instead (`ERR retired: <this>`), or
+/// `None` for a name that is not retired. These rows went with nothing that does
 /// what they did, so the name is refused with the thing to use instead —
 /// never resolved to a different act, never an unknown-action error that
 /// says nothing.
@@ -785,13 +718,9 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
         MenuAction::SplitVertical
             | MenuAction::SplitHorizontal
             | MenuAction::ViewSessionInNewWindow
-            // The rain toggle acts on the front SESSION; a native whole tab
-            // has none, so the item greys out rather than dead-clicking.
             | MenuAction::ToggleMatrixRain
-            // The pin is SESSION metadata; a native whole tab owns no session,
-            // so the item greys rather than opening an editor over nothing.
             | MenuAction::RenameSession
-            // The Agents menu's SESSION rows: the harness log and the person's
+            // The Agents menu's session rows: the harness log and the person's
             // hold are the focused session's; the role is its metadata, like
             // the pin. Overview, the reads, Summarize and the bus commands
             // are instance-wide and deliberately not listed.
@@ -799,14 +728,9 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::TakeOver
             | MenuAction::HandBack
             | MenuAction::SetRole
-            // The focused session's identity: no session under a native tab.
-            // (The two identity SPAWNS need no focused session — a new window
-            // or tab under an identity is instance-level.)
             | MenuAction::ShowIdentity
-            // The reset acts on the front SESSION's terminal; a native whole
-            // tab has none.
             | MenuAction::ResetTerminal
-            // A tab's own theme is the front SESSION's.
+            // A tab's own theme is the front session's.
             | MenuAction::ChooseTabTheme
             | MenuAction::ClearTabTheme
     )
@@ -814,8 +738,8 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
 
 /// A value the App publishes for AppKit's synchronous `validateMenuItem:`,
 /// which cannot reach the App; [`Published::published`] is its one access.
-/// A shipping build keeps ONE PER PROCESS, written and read on the main
-/// thread. A TEST BINARY keeps ONE PER THREAD (`menu_static!`): each test
+/// A shipping build keeps one per process, written and read on the main
+/// thread. A test binary keeps one per thread (`menu_static!`): each test
 /// runs on a thread of its own and every test App publishes (each focus runs
 /// `sync_active_session`), so a value shared by the process would hand a test
 /// another test's bits between its write and its read. A test reads exactly
@@ -979,6 +903,34 @@ pub(crate) fn stats_bars_form() -> crate::stats_deck::StatsBars {
         .unwrap_or(crate::stats_deck::StatsBars::Deck)
 }
 
+menu_static! {
+    /// View ▸ Deck Size's LIVE choice (`[sys] stats_deck_size` as the App
+    /// applies it: 0 Automatic, 1 Full, 2 Folded), published and read exactly
+    /// as [`STATS_BARS_FORM`] is.
+    static DECK_SIZE_PREF: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+}
+
+/// Publish View ▸ Deck Size's radio.
+pub(crate) fn set_deck_size_pref(pref: crate::stats_plan::DeckSizePref) {
+    let bits = crate::stats_plan::DeckSizePref::ALL
+        .iter()
+        .position(|p| *p == pref)
+        .unwrap_or(0) as u8;
+    DECK_SIZE_PREF.published(|bit| bit.store(bits, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// The published Deck Size choice ([`set_deck_size_pref`]); Automatic before
+/// any publish, as the config defaults. Read by the native menu's checkmark
+/// ([`native_menu_checked`]), so it exists where that does.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn deck_size_pref() -> crate::stats_plan::DeckSizePref {
+    let bits = DECK_SIZE_PREF.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed));
+    crate::stats_plan::DeckSizePref::ALL
+        .get(usize::from(bits))
+        .copied()
+        .unwrap_or_default()
+}
+
 impl MenuAction {
     /// The Stats Bars form a radio row names, or `None` for any other row.
     pub(crate) const fn stats_bars_form(self) -> Option<crate::stats_deck::StatsBars> {
@@ -989,9 +941,19 @@ impl MenuAction {
             _ => None,
         }
     }
+
+    /// The Deck Size choice a radio row names, or `None` for any other row.
+    pub(crate) const fn deck_size_pref(self) -> Option<crate::stats_plan::DeckSizePref> {
+        match self {
+            MenuAction::DeckSizeAuto => Some(crate::stats_plan::DeckSizePref::Auto),
+            MenuAction::DeckSizeFull => Some(crate::stats_plan::DeckSizePref::Full),
+            MenuAction::DeckSizeFolded => Some(crate::stats_plan::DeckSizePref::Folded),
+            _ => None,
+        }
+    }
 }
 
-/// THE AGENTS MENU'S LIVE BITS, as `validateMenuItem:` needs them when the
+/// The Agents menu's live bits, as `validateMenuItem:` needs them when the
 /// menu opens (it cannot reach the App): Next That Needs You is live while a
 /// local need stands, Overview while a window exists, Read the Fleet and
 /// Fleet Machines in a fleet, and Summarize while a worker can start here —
@@ -1080,23 +1042,18 @@ pub(crate) const fn full_screen_title(fullscreen: bool) -> &'static str {
     }
 }
 
-/// The ⌘W row's title: what it closes now. On a split tab ⌘W closes the
-/// focused PANE (`App::close_active_tab`), so the row says so; a tab's last
-/// pane closes the tab. The palette row and the native File item both take it
-/// from here — the tab context menu's own "Close Tab" really closes the tab
-/// and keeps its words.
+/// The ⌘W row's title: on a split tab ⌘W closes the focused pane (`App::close_active_tab`), so
+/// the row says so. Shared by the palette row and the native File item; the tab context menu's
+/// "Close Tab" really closes the tab and keeps its words.
 pub(crate) const fn close_row_title(split: bool) -> &'static str {
     if split { "Close Pane" } else { "Close Tab" }
 }
 
-/// The front window's live state that the palette's `resolve` reads from
-/// `PaletteLive` and the native bar's `validateMenuItem:` needs synchronously:
-/// the checkmarks on Serious Mode, Matrix Rain and Favourite This Kitty, the
-/// enabled bits of Copy, Show Next / Previous Tab and the two Reopen rows, and
-/// the ⌘W row's title. Published by `App::publish_menu_live` on the way to
-/// every wait, because these move on a selection drag, a toggle or a close —
-/// not only on the tab switch `sync_active_session` publishes at. macOS only:
-/// no other platform has the native bar.
+/// The front window's live state that the palette's `resolve` reads from `PaletteLive` and the
+/// native bar's `validateMenuItem:` needs synchronously: the checkmarks (Serious Mode, Matrix
+/// Rain, Favourite This Kitty), the enabled bits (Copy, Show Next / Previous Tab, the two Reopen
+/// rows) and the ⌘W title. `App::publish_menu_live` publishes it before every wait, since these
+/// move on a selection drag, a toggle or a close, not only on a tab switch.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MenuLive {
@@ -1120,8 +1077,7 @@ pub(crate) struct MenuLive {
 
 #[cfg(any(target_os = "macos", test))]
 impl MenuLive {
-    /// Before the first publish: every row enabled, nothing checked, the static
-    /// titles — the bar exactly as it read before these bits existed.
+    /// Before the first publish: every row enabled, nothing checked, the static titles.
     pub(crate) const UNPUBLISHED: MenuLive = MenuLive {
         has_selection: true,
         multi_tab: true,
@@ -1187,6 +1143,9 @@ pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
         MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
             Some(action.stats_bars_form() == Some(stats_bars_form()))
         }
+        MenuAction::DeckSizeAuto | MenuAction::DeckSizeFull | MenuAction::DeckSizeFolded => {
+            Some(action.deck_size_pref() == Some(deck_size_pref()))
+        }
         MenuAction::ToggleSeriousMode => Some(menu_live().serious_mode),
         MenuAction::ToggleMatrixRain => Some(menu_live().rain_on),
         MenuAction::FavouriteKitty => Some(menu_live().kitty_favourited),
@@ -1247,13 +1206,11 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
         }
         _ => {}
     }
-    // The palette's own preconditions (`PaletteState::resolve`): a row whose
-    // action would do nothing greys out instead of taking a silent click. A
-    // disabled row's key equivalent goes to the first responder: normally
-    // `on_key`, whose ⌘C / ⇧⌘] / ⇧⌘T arms behave the same, so a stale bit
-    // costs no keystroke. An open overlay swallows the ⌘ chord
-    // (`App::on_key_overlay_mode`), and a native rename field's editor has no
-    // ⌘C of its own, so a live rename keeps Copy enabled (`App::publish_menu_live`).
+    // The palette's preconditions (`PaletteState::resolve`): a row that would do nothing greys
+    // out. A disabled row's key equivalent falls to the first responder, normally `on_key`,
+    // whose ⌘C / ⇧⌘] / ⇧⌘T arms do the same, so a stale bit costs no keystroke. An open overlay
+    // swallows the ⌘ chord (`App::on_key_overlay_mode`) and a native rename field has no ⌘C of
+    // its own, so a live rename keeps Copy enabled (`App::publish_menu_live`).
     let live = menu_live();
     let precondition = match action {
         MenuAction::Copy => live.has_selection,
@@ -1268,7 +1225,7 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
                 .published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
-/// Take Over's tool tip (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): what
+/// Take Over's tool tip: what
 /// the person's hold does, and what any hold costs the whole instance, in
 /// the one sentence the You hold section and `aterm ctl help hold` use too
 /// ([`aterm_types::control_verbs::HOLD_COST`]). Gated as [`MenuAction::help`],
@@ -1280,32 +1237,30 @@ pub(crate) const TAKE_OVER_TIP: &str = concat!(
     aterm_types::hold_cost!()
 );
 
-/// The CONTROL-AUTHORITY a socket caller must hold to reach a [`MenuAction`] through the
-/// `invoke <action>` verb (and its `open <surface>` twins). The `invoke` verb's BASE op
+/// The control authority a socket caller must hold to reach a [`MenuAction`] through the
+/// `invoke <action>` verb (and its `open <surface>` twins). The `invoke` verb's base op
 /// is the benign `WriteInput` (it drives the human input vocabulary), but several menu
 /// actions reach a strictly-greater capability that a plain child `WriteInput` edge must
-/// NOT inherit — this is the classification the control layer's `argument_escalation`
-/// reads to fence those indirect seams. Compiler-EXHAUSTIVE over every variant (see
+/// not inherit — this is the classification the control layer's `argument_escalation`
+/// reads to fence those indirect seams. Compiler-exhaustive over every variant (see
 /// [`MenuAction::invoke_authority`]): a new `MenuAction` cannot compile until it is
 /// classified here, so the fence can never silently miss a newly-added privileged action.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum InvokeAuthority {
-    /// Benign: the `invoke` verb's base `WriteInput` gate suffices (view/window/tab/
+    /// Benign: the `invoke` verb's base `WriteInput` gate suffices (view, window, tab and
     /// navigation state, runtime-only font zoom — nothing durable or exfiltrating).
     WriteInput,
     /// Rewrites durable `aterm.toml` on invoke or raises the durable-config surface
     /// (`Preferences` opens aterm.toml in the native editor;
     /// `ToggleSettings` raises Top Settings) — the `ConfigWrite` fine op.
     ConfigWrite,
-    /// Moves the selection onto / reads it off the OS pasteboard — the same exfil/inject
-    /// boundary as the `copy` verb, the `ClipboardWrite` fine op.
+    /// Moves text onto or off the OS pasteboard — the `copy` verb's `ClipboardWrite` fine op.
     ClipboardWrite,
-    /// OWNER-ONLY: no single fine op expresses it. Either a GATEWAY that can reach EVERY
-    /// action (`OpenPalette` — the palette dispatches any `MenuAction`) or a RE-EXEC of a
-    /// staged update (`SoftwareUpdate`/`ApplyUpdate`, the MenuAction twins of the
-    /// already-Owner-only `update` verb). Only the per-instance god token may run these.
+    /// Owner-only, which no single fine op expresses: a gateway to every action
+    /// (`OpenPalette`) or a re-exec of a staged update (`SoftwareUpdate`/`ApplyUpdate`, twins
+    /// of the Owner-only `update` verb).
     OwnerOnly,
-    /// THE PERSON'S OWN: no socket scope fires it, the Owner token included —
+    /// The person's own: no socket scope fires it, the Owner token included —
     /// every in-session client holds Owner, so [`Self::OwnerOnly`] would let
     /// the held agent invoke its own Hand Back. Take Over and Hand Back
     /// (`invoke TakeOver|HandBack`, and their aliases) answer `ERR denied`;
@@ -1316,21 +1271,16 @@ pub(crate) enum InvokeAuthority {
 }
 
 impl MenuAction {
-    /// The [`InvokeAuthority`] a socket caller must satisfy to fire this action via
-    /// `invoke <action>`. EXHAUSTIVE and fail-closed: every variant is classified, so
-    /// adding a `MenuAction` forces a decision here (and thus in the control-layer
-    /// fence) rather than silently defaulting a new privileged action to `WriteInput`.
+    /// The [`InvokeAuthority`] a socket caller needs to fire this action via `invoke <action>`.
+    /// Exhaustive and fail-closed: a new `MenuAction` must be classified here.
     pub(crate) fn invoke_authority(self) -> InvokeAuthority {
-        // Force every platform menu face through the canonical command registry
-        // before adapting to the legacy socket-op vocabulary below. The registry
-        // carries the finer effect ceiling used by native reducers.
+        // Every menu face goes through the command registry, which carries the finer effect
+        // ceiling native reducers use, before mapping to the socket-op classes below.
         let _ = crate::command_registry::menu_command(self);
         use InvokeAuthority::{ClipboardWrite, ConfigWrite, OwnerOnly, PersonOnly, WriteInput};
         match self {
-            // Clipboard exfil/inject boundary — the `copy` verb's fine op. The
-            // tab-context copies land here too: `CopySessionId`/`CopyCwd` move
-            // session identity/cwd text onto the OS pasteboard, the exact
-            // boundary the fine op fences.
+            // The clipboard boundary, the `copy` verb's fine op; the tab-context copies put
+            // session id and cwd text on the pasteboard.
             MenuAction::Copy
             | MenuAction::Paste
             | MenuAction::SelectAll
@@ -1351,7 +1301,7 @@ impl MenuAction {
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
-            // Round 18's identity rows: a spawn under an identity may CREATE it
+            // Identity rows: a spawn under an identity may create it
             // (`spawn identity=` is Owner-only on the wire), and Show Identity
             // discloses the `identities` roster row (Owner-only too).
             MenuAction::NewWindowWithIdentity
@@ -1359,12 +1309,12 @@ impl MenuAction {
             | MenuAction::ShowIdentity => OwnerOnly,
             // The Agents menu. The Overview lists every session of the
             // instance (the `open overview` OwnerOnly class). The harness log
-            // runs a child on THIS instance's own socket and raises the
+            // runs a child on this instance's own socket and raises the
             // browser; Read This Mac / the Fleet and Fleet Machines run a
             // child that discloses the whole Mac or fleet; Summarize starts a
             // worker (`spawn agent=` is Owner-only on the wire). The three bus
             // commands run `aterm fabric` as a child: `on`/`off` rewrite the
-            // machine's bus (the round-13 verb is Owner-only by its own doc),
+            // machine's bus (the verb is Owner-only by its own doc),
             // and `status` discloses all of it. No fine op expresses any of
             // these.
             MenuAction::Overview
@@ -1386,6 +1336,10 @@ impl MenuAction {
             // The Stats Bars radio writes `[sys] stats_bars` in aterm.toml:
             // durable config, as Show Needs in Windows is.
             MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
+                ConfigWrite
+            }
+            // The Deck Size radio writes `[sys] stats_deck_size`: the same.
+            MenuAction::DeckSizeAuto | MenuAction::DeckSizeFull | MenuAction::DeckSizeFolded => {
                 ConfigWrite
             }
             // The lens is the person's close-up, summoned by their hand
@@ -1426,21 +1380,17 @@ impl MenuAction {
             | MenuAction::SplitHorizontal
             // Runtime-only per-session visual toggle: nothing durable is written.
             | MenuAction::ToggleMatrixRain
-            // Writes ONLY the machine-owned toy ledger (`kitty-collectibles.toml`
-            // and its `kitty-log.toml` mirror) — never `aterm.toml`, no security
-            // knob, no capability escalation. That is why it is not `ConfigWrite`.
+            // Writes only the machine-owned toy ledger (`kitty-collectibles.toml` and its
+            // `kitty-log.toml` mirror), never `aterm.toml`, so not `ConfigWrite`.
             | MenuAction::FavouriteKitty
-            // Same ledger, same reasoning: walking to the next collected cat
-            // moves one pin stamp in the toy ledger and changes what the user
-            // is looking at. Nothing durable outside it, so `WriteInput`, which
-            // is also the class the `kitty` control verb carries.
+            // Same ledger: moves one pin stamp; also the class of the `kitty` control verb.
             | MenuAction::NextKitty
             // Opens the inline pin editor. Its eventual write is `meta set title`,
             // which the control verb table's `meta` form already classifies as
             // `WriteInput` (not `ConfigWrite` — nothing durable on disk is
             // rewritten), so this matches rather than tunnels under it.
             | MenuAction::RenameSession
-            // Same editor, same eventual write (`meta set role`), same class.
+            // Same editor, same eventual write (`meta set role`).
             | MenuAction::SetRole
             // Moves focus to the tab that needs the person: what `raise`
             // does, and it writes nothing.
@@ -1462,9 +1412,9 @@ impl MenuAction {
         }
     }
 
-    /// Whether firing this action writes INPUT BYTES to a session's PTY — the
+    /// Whether firing this action writes input bytes to a session's PTY — the
     /// question the unread-input gate (`crate::input_stall::gate`)
-    /// asks of `invoke <action>`. EXHAUSTIVE for the reason
+    /// asks of `invoke <action>`. Exhaustive for the reason
     /// [`Self::invoke_authority`] is: a new action that pastes must be
     /// classified here, not default to "writes nothing" and slip past the gate.
     /// Only `Paste` writes input (the OS clipboard into the front tab's PTY);
@@ -1473,10 +1423,14 @@ impl MenuAction {
     pub(crate) const fn writes_pty_input(self) -> bool {
         match self {
             MenuAction::Paste => true,
-            // The stats bars' form is config; the lens is a view.
+            // The stats bars' form and the Deck's size are config; the lens
+            // is a view.
             MenuAction::StatsBarsDeck
             | MenuAction::StatsBarsSill
             | MenuAction::StatsBarsOff
+            | MenuAction::DeckSizeAuto
+            | MenuAction::DeckSizeFull
+            | MenuAction::DeckSizeFolded
             | MenuAction::ToggleStatsLens => false,
             MenuAction::About
             | MenuAction::SoftwareUpdate
@@ -1536,8 +1490,7 @@ impl MenuAction {
             | MenuAction::ShowIdentity
             | MenuAction::NewWindowWithIdentity
             | MenuAction::NewTabWithIdentity
-            // Resets the TERMINAL's modes; nothing reaches the program's input
-            // (the menu form never flushes it either).
+            // Resets the terminal's modes; nothing reaches the program's input.
             | MenuAction::ResetTerminal
             // Recolour one session; nothing reaches its input.
             | MenuAction::ChooseTabTheme
@@ -1550,10 +1503,8 @@ impl MenuAction {
         }
     }
 
-    /// The row's HELP: one sentence a human reads as the item's tooltip (the
-    /// native `NSMenuItem` tool tip) and a screen reader hears as the palette
-    /// row's description — the accessibility label SPEC19 §9 asks for on every
-    /// item. Exhaustive, so a new action cannot ship without one. Plain
+    /// The row's help: one sentence, the native `NSMenuItem` tool tip and the palette row's
+    /// accessibility description. Exhaustive, so a new action cannot ship without one. Plain
     /// sentences: no command text, no mail body, nothing a session wrote.
     #[must_use]
     #[cfg(any(unix, a11y_tree, test))]
@@ -1692,6 +1643,17 @@ impl MenuAction {
                  padding, which takes no terminal row; saved in aterm.toml."
             }
             MenuAction::StatsBarsOff => "Hide the stats bars; saved in aterm.toml.",
+            MenuAction::DeckSizeAuto => {
+                "Show each window's stats deck Full when the window is tall and Folded when it \
+                 is short; saved in aterm.toml."
+            }
+            MenuAction::DeckSizeFull => {
+                "Show the stats deck Full, a row per resource, in every window; saved in \
+                 aterm.toml."
+            }
+            MenuAction::DeckSizeFolded => {
+                "Show the stats deck Folded into two blocks in every window; saved in aterm.toml."
+            }
             MenuAction::ToggleStatsLens => {
                 "Open the stats bars' close-up, or close it: arrows move between instruments \
                  and bars, Escape closes."
@@ -1700,18 +1662,9 @@ impl MenuAction {
         }
     }
 
-    /// Whether this build's platform can DO what the row offers. The in-app
-    /// updater exists only where [`aterm_update::enabled`] says so (macOS and
-    /// Linux; it is false on Windows, where `update status` answers `no updater
-    /// on this platform`), so "Check for Updates…" and the Version menu's
-    /// install row are dead rows everywhere else: the palette greys the first
-    /// and never shows the second, while the static model behind the `chrome`
-    /// verb went on listing both — measured 2026-09-22 on Windows, a `menu
-    /// "Version": ↑ Update — apply now, …` line (the row's label then) beside a
-    /// `controls menu` with no such row. (Where an updater exists, `chrome`
-    /// prints the install row only while it is live: `menu_chrome_lines`.)
-    /// ONE predicate for every surface, so they cannot disagree again — and it
-    /// asks the updater itself rather than restating its platform list.
+    /// Whether this platform can do what the row offers: the update rows only where the in-app
+    /// updater exists ([`aterm_update::enabled`]). The palette, the native bar and the `chrome`
+    /// lines all ask this.
     #[must_use]
     pub(crate) fn offered_on_this_platform(self) -> bool {
         match self {
@@ -1795,6 +1748,9 @@ impl MenuAction {
             "StatsBarsDeck" => Some(MenuAction::StatsBarsDeck),
             "StatsBarsSill" => Some(MenuAction::StatsBarsSill),
             "StatsBarsOff" => Some(MenuAction::StatsBarsOff),
+            "DeckSizeAuto" => Some(MenuAction::DeckSizeAuto),
+            "DeckSizeFull" => Some(MenuAction::DeckSizeFull),
+            "DeckSizeFolded" => Some(MenuAction::DeckSizeFolded),
             "ToggleStatsLens" => Some(MenuAction::ToggleStatsLens),
             "ResetTerminal" => Some(MenuAction::ResetTerminal),
             "ChooseTabTheme" => Some(MenuAction::ChooseTabTheme),
@@ -1819,26 +1775,22 @@ pub(crate) enum MenuMods {
 }
 
 /// One entry of a menu section: a command item or a divider.
-// macOS reads the live NSMenu for `chrome`, so these fields are read only off macOS + in
-// tests (the serialiser/builder consume them there) — allow the per-target "never read".
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MenuEntry {
     Separator,
     Item {
         label: &'static str,
         action: MenuAction,
-        /// Lowercase key-equivalent character ("" for none) — VISUAL only; the real
-        /// keystroke is handled by `App::on_key`.
+        /// Lowercase key-equivalent character ("" for none), visual only: `App::on_key`
+        /// handles the keystroke.
         key: &'static str,
         mods: MenuMods,
     },
 }
 
 impl MenuEntry {
-    /// This entry's ITEM, if it is one — the one walk every consumer shares
-    /// (the completeness proof, the palette, the accelerator hints). (File ▸
-    /// Driving, the one submenu the bar had, went with the connection presets,
-    /// 2026-10-16; the bar is flat.)
+    /// This entry's item, if it is one — the one walk every consumer shares
+    /// (the completeness proof, the palette, the accelerator hints). The bar is flat.
     pub(crate) fn items(
         &self,
     ) -> impl Iterator<Item = (&'static str, MenuAction, &'static str, MenuMods)> {
@@ -1884,24 +1836,18 @@ const APP_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Separator,
-    // ⌘, focuses or creates the native Settings tab. "Open aterm.toml" opens
-    // or reuses the separate native config Editor tab used by Manual.
     Item {
         label: "Settings…",
         action: MenuAction::ToggleSettings,
         key: ",",
         mods: MenuMods::Command,
     },
-    // Settings at the /packages route — the batteries-included toolchain
-    // surface (install/update the ALab toolset; the seed notice points here).
     Item {
         label: "Packages…",
         action: MenuAction::Packages,
         key: "",
         mods: MenuMods::None,
     },
-    // Settings at the /messages route — the log behind the message band
-    // (design §4.1); the band's `Details ›` opens the same page at an entry.
     Item {
         label: "Messages…",
         action: MenuAction::Messages,
@@ -1957,9 +1903,8 @@ const FILE_MENU: &[MenuEntry] = &[
         key: "t",
         mods: MenuMods::Command,
     },
-    // ROUND 18'S IDENTITY ROWS (SPEC19 §9): each opens the identity picker —
-    // every identity by name, plus a new one typed into its filter. No key
-    // equivalents: choosing may CREATE an identity, an Owner act.
+    // The identity rows open the identity picker. No key equivalents: choosing may create an
+    // identity, an Owner act.
     Item {
         label: "New Window With Identity…",
         action: MenuAction::NewWindowWithIdentity,
@@ -2025,8 +1970,7 @@ const FILE_MENU: &[MenuEntry] = &[
     },
 ];
 
-/// The AGENTS menu (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, was the
-/// Fabric menu): what needs the person, everyone at a glance, stepping in,
+/// The Agents menu: what needs the person, everyone at a glance, stepping in,
 /// and reading the Mac or the fleet. Placed between View and Window, where an
 /// application's own menus go on macOS. Live greying comes from
 /// `validateMenuItem:`'s statics ([`AgentsLive`], [`front_person_hold`]); the
@@ -2092,7 +2036,7 @@ const AGENTS_MENU: &[MenuEntry] = &[
     },
 ];
 
-/// The PALETTE-ONLY rows (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4):
+/// The palette-only rows:
 /// commands with no bar item, listed in the palette under [`PALETTE_ONLY_SECTION`]
 /// and reachable by `invoke`. The message bus's administration lives here and
 /// on the CLI (`aterm fabric`), never in a menu: a bus that is off (the
@@ -2148,9 +2092,8 @@ const EDIT_MENU: &[MenuEntry] = &[
         mods: MenuMods::CommandShift,
     },
     Separator,
-    // The manual reset (2026-09-26): no key equivalent — Terminal.app's ⌥⌘R
-    // needs an Option modifier `MenuMods` does not carry, and every free ⌘
-    // letter is the shell's.
+    // No key equivalent: Terminal.app's ⌥⌘R needs an Option modifier `MenuMods` does not carry,
+    // and every free ⌘ letter is the shell's.
     Item {
         label: "Reset Terminal",
         action: MenuAction::ResetTerminal,
@@ -2209,7 +2152,9 @@ const VIEW_MENU: &[MenuEntry] = &[
     },
     Separator,
     // The stats bars' form (design §12.2): a radio of three, the Deck by
-    // default, persisted as `[sys] stats_bars`; then the lens, ⌘I.
+    // default, persisted as `[sys] stats_bars`; the Deck's size (Stats Deck
+    // v2 §11.5), a radio of three, Automatic by default, persisted as
+    // `[sys] stats_deck_size`; then the lens, ⌘I.
     Item {
         label: "Stats Bars: Deck",
         action: MenuAction::StatsBarsDeck,
@@ -2225,6 +2170,24 @@ const VIEW_MENU: &[MenuEntry] = &[
     Item {
         label: "Stats Bars: Off",
         action: MenuAction::StatsBarsOff,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Deck Size: Automatic",
+        action: MenuAction::DeckSizeAuto,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Deck Size: Full",
+        action: MenuAction::DeckSizeFull,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Deck Size: Folded",
+        action: MenuAction::DeckSizeFolded,
         key: "",
         mods: MenuMods::None,
     },
@@ -2336,9 +2299,8 @@ const WINDOW_MENU: &[MenuEntry] = &[
         mods: MenuMods::CommandShift,
     },
     Separator,
-    // No key equivalent by default: every free ⌘ letter near "rename" is either
-    // claimed by the bar or by the shell. The chord is bindable instead
-    // (`rename_session` in `[keybindings]`).
+    // No key equivalent: every free ⌘ letter near "rename" is the bar's or the shell's. Bind
+    // `rename_session` in `[keybindings]` instead.
     Item {
         label: "Rename Session…",
         action: MenuAction::RenameSession,
@@ -2354,16 +2316,11 @@ const HELP_MENU: &[MenuEntry] = &[Item {
     mods: MenuMods::None,
 }];
 
-/// The dedicated top-level Version menu. Its live macOS title is the runtime
-/// `v<version>` string (see [`version_menu_bar_title`] — with a trailing ⬆️ while an
-/// update is staged); the model uses the stable "Version" placeholder (the
-/// model is only serialised off-macOS + in tests, where a runtime version string would
-/// be non-deterministic). Two items: the ONE-CLICK update apply first (the PRIMARY
-/// update affordance — the palette rewrites its label with the live staged/realized
-/// version and REMOVES it when neither applies; the live NSMenu is rebuilt likewise by
-/// [`update_version_menu`], which also appends a staged-only "Update details…"
-/// SoftwareUpdate item — the one deliberate, documented dynamic divergence from this
-/// static model), then About.
+/// The top-level Version menu. Its live macOS title is `v<version>` ([`version_menu_bar_title`]);
+/// the model says "Version" because it is serialised only off macOS and in tests, where a
+/// runtime version would be nondeterministic. The one-click apply comes first (the palette
+/// relabels it with the live version and drops it when nothing applies; [`update_version_menu`]
+/// rebuilds the live NSMenu likewise and adds a staged-only "Update details…" row), then About.
 const VERSION_MENU: &[MenuEntry] = &[
     Item {
         label: "↑ Install update now",
@@ -2398,7 +2355,7 @@ const VERSION_MENU: &[MenuEntry] = &[
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn version_menu_bar_title(attention: bool) -> String {
     let facts = VersionFacts::this_build();
-    // A dev build leads with the wrench (owner, 2026-08-16); a release does not.
+    // A dev build leads with the wrench; a release does not.
     let wrench = if facts.release {
         ""
     } else {
@@ -2423,11 +2380,9 @@ pub(crate) enum VersionRung {
     Short,
 }
 
-/// The compile-time facts a version signature is composed from — every one of them
-/// stamped by `build.rs` and read from [`crate::build_info`], never recalled.
-/// Separate from the constants so a test can compose every kind of build (release,
-/// dev, dirty, no git) from one test binary, which is always a clean or dirty dev
-/// build itself.
+/// The compile-time facts a version signature is composed from, stamped by `build.rs` and read
+/// from [`crate::build_info`]. Separate from the constants so one test binary can compose every
+/// kind of build (release, dev, dirty, no git).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct VersionFacts<'a> {
     /// A release lane produced the binary ([`crate::build_info::is_release_build`]).
@@ -2454,22 +2409,14 @@ impl VersionFacts<'static> {
     }
 }
 
-/// THE VERSION SIGNATURE, without any glyph a surface adds around it: `v0.101.0` on
-/// a release, `v0.101.1576+g25a5963 · DEV` on a dev build (`*` after the hash for a
-/// dirty tree), and on the [`VersionRung::Short`] rung the dev form without its hash
-/// (`v0.101.1576 · DEV`). `None` only for a release's short rung, which has none.
+/// The version signature, without any glyph a surface adds: `v0.101.0` on a release,
+/// `v0.101.1576+g25a5963 · DEV` on a dev build (`*` after the hash for a dirty tree), and on
+/// the [`VersionRung::Short`] rung the dev form without its hash (`v0.101.1576 · DEV`). `None`
+/// only for a release's short rung.
 ///
-/// THE DEV SIGNATURE (owner, 2026-08-16: "some kind of marker in the menu bar where
-/// the version numbers are so that I know what is a development build … using the
-/// 3rd developer number and the hash"). A release's third slot is always literal 0,
-/// so the DEV COUNTER in that slot (commits since the newest release tag) is an
-/// unambiguous non-release signature; the short hash pins WHICH dev build, and the
-/// trailing marker makes it readable at a glance without parsing numbers. A dirty
-/// tree keeps its `*` on both rungs. The display version is display-only by
-/// contract, so none of this can reach an update comparison.
-///
-/// The middle dot is U+00B7 with one space either side — a BMP character both the
-/// AppKit menu bar and the own-rendered UI face cover.
+/// A release's third slot is always 0, so the dev counter there (commits since the newest
+/// release tag) marks a non-release unambiguously. Display only: none of this reaches an update
+/// comparison. The AppKit bar and the own-rendered face both cover U+00B7.
 #[must_use]
 pub(crate) fn version_signature(facts: VersionFacts<'_>, rung: VersionRung) -> Option<String> {
     if facts.release {
@@ -2497,7 +2444,7 @@ pub(crate) fn version_signature(facts: VersionFacts<'_>, rung: VersionRung) -> O
     })
 }
 
-/// The text of Windows' tab-strip VERSION LABEL (`tab_bar::TabHit::Version`): this
+/// The text of Windows' tab-strip version label (`tab_bar::TabHit::Version`): this
 /// build's [`strip_version_text`] at `rung`, plus ` ↑` (a space and U+2191) while
 /// `attention` holds — plain, because the own-rendered strip has no colour-emoji
 /// face. `attention` is the bar's own staged-only rule ([`staged_for_version_menu`]),
@@ -2512,14 +2459,10 @@ pub(crate) fn strip_version_label(rung: VersionRung, attention: bool) -> Option<
     })
 }
 
-/// The strip label's QUIET form of the version: `v<maj.min>.<dev commits>` on a
+/// The strip label's quiet form of the version: `v<maj.min>.<dev commits>` on a
 /// dev build (`v0.106.3605`) and `v<maj.min>` on its short rung; a release's
 /// `v<version>` and no short rung, as [`version_signature`].
 ///
-/// The owner asked for the version at a glance on Windows (2026-10-01), and the
-/// strip used to carry the whole dev signature, `v0.106.3605+g8b6f0a8* · DEV`:
-/// 22 columns of the band, permanently, and on Windows every build reads `· DEV`
-/// (no Windows build goes through the release cutter), so the mark told nothing.
 /// The commit and a dirty tree's mark stay one click away: the label opens
 /// Settings ▸ About ([`version_slot_click`]), which names the whole build.
 #[must_use]
@@ -2537,12 +2480,10 @@ pub(crate) fn strip_version_text(facts: VersionFacts<'_>, rung: VersionRung) -> 
     })
 }
 
-/// What a click on the tab-strip version label fires: the Software Update details
-/// while an update is staged AND this platform has an updater to show
-/// ([`MenuAction::offered_on_this_platform`]), otherwise [`MenuAction::Version`] —
-/// Settings ▸ About, the macOS Version menu's About row. Never an install: the
-/// label names the build, and the strip's leading `↻` stays the one-click apply.
-/// On Windows, which has no updater, this is always `Version`.
+/// What a click on the tab-strip version label fires: Software Update while an update is staged
+/// and this platform has an updater ([`MenuAction::offered_on_this_platform`]), otherwise
+/// [`MenuAction::Version`] (Settings ▸ About). Never an install: the strip's leading `↻` is the
+/// one-click apply.
 #[must_use]
 pub(crate) fn version_slot_click(attention: bool) -> MenuAction {
     if attention && MenuAction::SoftwareUpdate.offered_on_this_platform() {
@@ -2552,51 +2493,16 @@ pub(crate) fn version_slot_click(attention: bool) -> MenuAction {
     }
 }
 
-/// The apply-now label for a staged build, given the arrow glyph the calling surface
-/// can actually render (`⬆️` in an NSMenu, plain `↑` in own-rendered overlay text).
+/// The apply-now label for a staged build, given the arrow the calling surface can render
+/// (`⬆️` in an NSMenu, `↑` in own-rendered text). The install is the overlap handoff, which
+/// keeps every window, tab and live shell, so the row never asks for a restart.
 ///
-/// WHY THE BUILD NUMBER IS NOT COSMETIC HERE. The updater orders releases by the
-/// monotonic BUILD NUMBER, never by the display version — `build_info` states the
-/// version is "display-only by contract" and "can never affect an update comparison".
-/// So a strictly-newer build may legally carry the SAME `MAJOR.MINOR.PATCH` as the
-/// running one, and the ledger really does ship such pairs (two distinct 0.11.0
-/// builds). Meanwhile the menu-bar badge prints the RUNNING version and this row
-/// printed the STAGED version, both dropping the one field that distinguishes them —
-/// so a machine running a 0.14.0 build with the 0.14.0 RELEASE staged over it showed
-/// "v0.14.0 ⬆️" above "Update to v0.14.0", i.e. an offer to update itself to itself.
-/// Nothing was wrong with the update; the label just could not express it.
-///
-/// So: name the version when it actually differs, and fall back to the build number
-/// — the thing the updater is really comparing — when it does not.
-///
-/// # The words are the update row's (2026-09-23)
-///
-/// "Install aterm vX now": the verb the status bar's row uses ("Updating to aterm
-/// vX", "click to install"), so one update is described in one vocabulary on every
-/// surface. The install is the in-session overlap handoff, which hands every
-/// window, tab, split and live shell to the successor, so the row never asks for a
-/// restart (it read "restart now" over exactly that mechanism until 2026-08-30),
-/// and it no longer repeats "shells keep running" either — the row said it on every
-/// surface of one flow.
-///
-/// `trouble` is the apply lane's standing failure for this exact build
-/// (`App::apply_trouble_for`). While one is present the bare "now" is REPLACED by
-/// [`crate::update_apply_trouble::ApplyTrouble::row_tail`], because a clean "install
-/// now" beside a build that has already refused to start twice is an instruction
-/// the machine has no reason to believe. On 2026-08-21 this row read "⬆️ Update to
-/// v0.56.0 — restart now" for hours while `aterm ctl update status` carried
-/// `failing_applies=2` and the reason both attempts died — the whole defect, in one
-/// label. The tail still ends on what the row DOES, so a manual-only latch says
-/// "try again now" and a scheduled retry says it will, instead of demanding an
-/// action that is already on its way.
-///
-/// `on_hold` is the build ON HOLD (`App::latched_activation_trial_spent`: its
-/// next start is the one its boot trial rolls back) — the same fact the click
-/// refuses on, whether or not the ledger still names the failures. Such a build
-/// is not offered at all: the row reads as the band's record does, "aterm vX is
-/// on hold", with the trouble's tail when there is one and otherwise that a
-/// newer release replaces it, and a press opens the details
-/// (`App::apply_update_or_details`), never that start.
+/// [`crate::update_words::staged_build_name`] names the build number when a strictly newer build
+/// carries the running one's display version (the updater orders by build number), so the row
+/// never offers to update a build to itself. `trouble` (`App::apply_trouble_for`) replaces the
+/// bare "now" with [`ApplyTrouble::row_tail`]: "install now" beside a build that already failed
+/// to start is not credible. `on_hold` (`App::latched_activation_trial_spent`) reads "aterm vX is
+/// on hold" instead of offering it; a press then opens the details.
 #[must_use]
 pub(crate) fn staged_apply_label(
     arrow: &str,
@@ -2617,39 +2523,30 @@ pub(crate) fn staged_apply_label(
     }
 }
 
-/// The post-update row's words, the Version menu's and the palette's alike
-/// (`arrow` as for [`staged_apply_label`]). No age: the row stays up for
-/// [`crate::relaunch_notice::REALIZED_ARROW_TTL`] (ten minutes) and nothing
-/// rewrites it meanwhile, so a "just now" read false for most of its life.
+/// The post-update row's words, the Version menu's and the palette's alike (`arrow` as for
+/// [`staged_apply_label`]). No age: the row stays up for
+/// [`crate::relaunch_notice::REALIZED_ARROW_TTL`] (ten minutes) unrewritten, so "just now" would
+/// be false for most of its life.
 #[must_use]
 pub(crate) fn realized_row_label(arrow: &str, version: &str) -> String {
     format!("{arrow} Updated to aterm v{version}")
 }
 
-/// Whether the always-visible menu-bar Version arrow should show. It tracks a STAGED
-/// update ONLY (action needed) — deliberately NOT the post-update `realized`
-/// celebration. The celebration is carried by self-dismissing surfaces (the menu's
-/// "Updated to aterm v…" row and its palette twin), so an apply
-/// that re-execs into the staged build (`staged` → `None`) clears the persistent bar
-/// badge the instant it lands, instead of leaving an arrow up for the full realized
-/// TTL that reads as "the update never resolved". A staged build ON HOLD gets no
-/// arrow: no press may start it, and only a newer release moves it.
+/// Whether the menu-bar Version arrow shows: for a staged update not on hold (no press may start
+/// a held build), never for the post-update `realized` state. That lives on self-dismissing
+/// surfaces (the menu's "Updated to aterm v…" row and its palette twin), so an apply that
+/// re-execs into the staged build clears the badge the instant it lands.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn bar_title_attention(staged_present: bool, on_hold: bool, _realized: bool) -> bool {
     staged_present && !on_hold
 }
 
-/// The staged update the Version menu may offer, given the RUNNING build: only one
-/// strictly newer than it (2026-09-24).
-///
-/// The updater orders builds by number, so a staged record naming this build or an
-/// older one is not an update — it is a record the process outlived: the build this
-/// process was handed off INTO, or one a newer install overtook. An offer drawn from
-/// it reads `v<running> ⬆️` over "Install … now" for the build already running,
-/// which is how an update that DID land looks like one that never did. Every
-/// surface that draws the offer (`App::refresh_version_menu`) asks this first, so
-/// the bar cannot claim a pending update the running build already is.
+/// The staged update the Version menu may offer, given the running build: only one strictly
+/// newer. The updater orders builds by number, so a staged record naming this build or an older
+/// one is a record the process outlived (the build it was handed off into, or one a newer
+/// install overtook), and offering it would make a landed update look pending. Every surface
+/// that draws the offer (`App::refresh_version_menu`) asks this first.
 #[must_use]
 pub(crate) fn staged_for_version_menu(
     staged: Option<(u64, &str)>,
@@ -2658,20 +2555,16 @@ pub(crate) fn staged_for_version_menu(
     staged.filter(|(build, _)| *build > running_build)
 }
 
-/// The Version title an OUTGOING process publishes for its successor once that
-/// successor's proof is in (2026-09-24): the successor's own plain `v<version>`,
+/// The Version title an outgoing process publishes for its successor once that
+/// successor's proof is in: the successor's own plain `v<version>`,
 /// no arrow — or `None` when this process cannot name it (a same-image relaunch
 /// is not a new version; a staged record for another build is not this target).
 ///
-/// WHY THE OUTGOING SIDE. After the 0.91 → 0.92 seamless apply the menu bar
-/// read `v0.91.0 ⬆️` for three hours over a running 0.92.0, and the owner took
-/// it for an update that never landed. The unified log says why: the parent was
-/// not frontmost (it quit `wasFront=0`; a UI-element app held the front), the
-/// successor's launch-time activation was DENIED ("presents 0 windows"), and it
-/// was first made the front process only when the owner clicked it. With no
-/// regular app claiming the bar in between, the bar kept the menu the DEAD
-/// parent published last. Nothing the successor does can fix that without
-/// stealing focus; the parent's last-published title can simply be the right one.
+/// If the outgoing parent quits while not frontmost and the successor's
+/// launch-time activation is denied, the menu bar keeps the menu the parent
+/// published last until the user clicks the successor; publishing the
+/// successor's title on the outgoing side avoids leaving the stale arrow up
+/// without stealing focus.
 #[cfg(any(unix, test))]
 #[must_use]
 pub(crate) fn handoff_target_bar_title(
@@ -2686,11 +2579,11 @@ pub(crate) fn handoff_target_bar_title(
     (build == target_build && !version.is_empty()).then(|| format!("v{version}"))
 }
 
-/// The WHOLE menu bar, declaratively — the platform-neutral description the
+/// The whole menu bar, declaratively — the platform-neutral description the
 /// cross-platform `chrome` introspection serialiser ([`menu_chrome_lines`]) renders so
-/// the menu is introspectable on EVERY platform (off macOS there is no `NSMenu` to read),
-/// the palette flattens, AND — since round 19 — the macOS `install` builds its
-/// `NSMenu`s from item-for-item (`macos::build_section`), so the model IS the menu:
+/// the menu is introspectable on every platform (off macOS there is no `NSMenu` to read),
+/// the palette flattens, and the macOS `install` builds its
+/// `NSMenu`s from item-for-item (`macos::build_section`), so the model is the menu:
 /// what `chrome` prints off macOS and what the live bar reads back agree by
 /// construction, not by a second hand-kept list. Order is the standard Mac arrangement
 /// (App / File / Edit / View / <the app's own: Agents> / Window / Help), the App section
@@ -2729,9 +2622,7 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
         title: "Help",
         entries: HELP_MENU,
     },
-    // The version identity lives in its own top-level menu placed LAST — after Help,
-    // i.e. rightmost in the menu bar — so `v<version>` reads as a quiet trailing badge
-    // and one click reaches About.
+    // Last, so `v<version>` is the rightmost item in the bar, a quiet trailing badge.
     MenuSection {
         title: "Version",
         entries: VERSION_MENU,
@@ -2743,16 +2634,13 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
 /// `app_introspect::read_native_chrome`, so the cross-platform (off-macOS) `chrome`
 /// reports the SAME logical menu the macOS bar shows.
 ///
-/// One line per section: the model holds no submenu since File ▸ Driving went with the
-/// connection presets (2026-10-16). (The macOS live reader still prints a submenu AppKit
+/// One line per section: the model holds no submenu. (The macOS live reader still prints a submenu AppKit
 /// adds on its own as `<label> ▸` in its parent's line, then that submenu's own line.)
 ///
-/// The Version menu's first row is DYNAMIC, as on the macOS bar and in the palette:
-/// `apply_row` is its live label ([`crate::palette::apply_row_label`] — the staged
-/// install offer or the post-update row), and with `None` the row is left out. The
-/// model's static "↑ Install update now" was printed whenever an updater existed,
-/// naming a row no person could see. So is ⌘W's title: `front_tab_split` prints it
-/// as the palette row reads it ([`close_row_title`]), Close Pane on a split tab.
+/// A submenu prints twice, as both readers do: `<label> ▸` in its parent's line, then its own
+/// line titled `"<parent> ▸ <label>"`. The Version menu's first row is dynamic: `apply_row` is
+/// its live label ([`crate::palette::apply_row_label`]) and `None` leaves it out. ⌘W's title
+/// follows `front_tab_split` ([`close_row_title`]).
 #[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn menu_chrome_lines(apply_row: Option<&str>, front_tab_split: bool) -> Vec<String> {
     let mut out = Vec::with_capacity(MENU_MODEL.len() + 1);
@@ -2779,9 +2667,7 @@ fn chrome_lines_for(
     let mut labels: Vec<String> = Vec::new();
     for e in entries {
         match e {
-            // A row this platform cannot act on is not reported as offered:
-            // on Windows there is no updater, and `controls menu` (the palette)
-            // does not offer it either ([`MenuAction::offered_on_this_platform`]).
+            // A row this platform cannot act on is not reported (`offered_on_this_platform`).
             MenuEntry::Item { action, .. } if !action.offered_on_this_platform() => {}
             // The dynamic update row: its live label, or nothing.
             MenuEntry::Item {
@@ -2808,22 +2694,11 @@ pub(crate) use macos::{
     update_version_menu,
 };
 
-/// Whether this process was launched `--headless`, published ONCE by
-/// `main_entry` the moment the mode is decided ([`mark_process_headless`]).
-///
-/// A process-wide fact rather than an `App` field because the helpers that
-/// read it are free functions every subsystem calls, and because the fact it
-/// guards is process-wide too: a headless process has no application object
-/// to present anything from (on macOS its display-free loop never builds an
-/// `NSApplication`, and creating one would open the WindowServer connection a
-/// headless process must not; AGENTS.md). A modal it tried to run
-/// (`choose_local_file`, `confirm`, `notify`) would park the main thread in a
-/// nested run loop nothing can see or dismiss, and an `NSWorkspace` open
-/// (`open_in_workspace`: Open Log, Help, a Privacy pane) would bring ANOTHER app
-/// to the front — focus theft by a process with no glass. Guarding here covers
-/// every caller, including ones written later; the per-caller guards (the
-/// palette's picker rows, the document-open path) stay as the honest "disabled"
-/// answer.
+/// Whether this process was launched `--headless`, set once by `main_entry`
+/// ([`mark_process_headless`]). A headless process has no application object, so a modal
+/// (`choose_local_file`, `confirm`, `notify`) would park the main thread in a nested run loop
+/// nothing can see or dismiss, and an `NSWorkspace` open would steal focus for a process with
+/// no glass. Process-wide because its readers are free functions.
 static PROCESS_HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Record that this process is headless. Called once, by `main_entry`.
@@ -2874,9 +2749,8 @@ pub(crate) fn reveal_file_in_workspace(_path: &std::path::Path) -> bool {
 #[cfg(not(target_os = "macos"))]
 pub(crate) type MenuHandle = ();
 
-/// Non-macOS stub: no platform menu bar exists, so installing one is a no-op that
-/// installs nothing (`None`). Returns `Option<MenuHandle>` so the `resumed` call
-/// site (`self._menu = menu::install(..)`) is identical on every target.
+/// Non-macOS stub: there is no platform menu bar, so nothing is installed (`None`). The shared
+/// signature keeps `AppRt::install_menu` identical on every target.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn install(
     _proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
@@ -2931,16 +2805,10 @@ pub(crate) fn choose_local_image(_title: &str, _prompt: &str) -> Option<std::pat
     None
 }
 
-/// Whether [`choose_local_file`] can actually produce a path here — the ONE
+/// Whether [`choose_local_file`] can actually produce a path here — the one
 /// predicate every picker-backed surface gates on (the palette's File rows, and
-/// Settings ▸ Wallpaper's "Choose Image…").
-///
-/// It exists because those surfaces used to disagree: the palette greyed its rows
-/// out on `cfg!(target_os = "macos")` while the Settings button stayed
-/// unconditionally enabled, so on Windows one surface was honestly wrong (the
-/// capability was there, only the dialog was missing) and the other was a dead
-/// click. Routing both through here means a platform gains or loses the rows and
-/// the button together, and can never gain one without the other.
+/// Settings ▸ Wallpaper's "Choose Image…"), so a platform gains or loses the rows and
+/// the button together.
 ///
 /// Windows answers with a live probe rather than a `cfg!` — see
 /// [`crate::file_picker_win::available`].
@@ -2959,44 +2827,31 @@ pub(crate) fn local_file_picker_available() -> bool {
     false
 }
 
-/// WINDOWS: a real modal alert. This was an empty body until the parity audit
-/// found the consequence — a GUI-subsystem launch has no stderr, so every
-/// failure routed through `notify` (a rejected document path, an update-check
-/// result) reached the user through NO channel at all. The picker ships an
-/// unrestricted `*.*` row, so one click can reach any of the document host's
-/// rejections; silence there is the same class of defect as the dead button
-/// the picker itself was added to fix.
+/// Windows: a real modal alert. A GUI-subsystem launch has no stderr, so without it a failure
+/// routed through `notify` (a rejected document path, an update-check result) reaches no one.
 #[cfg(windows)]
 pub(crate) fn notify(title: &str, body: &str) {
     crate::win_alert_ok(title, body);
 }
 
-/// The remaining platforms (Linux) still have no native alert to wire; the
-/// caller's own `eprintln!` is the channel there, and a Linux GUI launch does
-/// keep its stderr.
+/// Linux has no native alert wired: the caller's own `eprintln!` is the channel, and a Linux
+/// GUI launch keeps its stderr.
 #[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn notify(_title: &str, _body: &str) {}
 
-/// Help, off macOS: the project page in the default browser, through the SAME
-/// helper a Ctrl-clicked link goes through (`open_url_external` —
-/// `ShellExecuteW` on Windows, `xdg-open` on Linux).
-///
-/// This was an empty body while the palette's Help row stayed enabled on both
-/// platforms, so the only command surface Windows has answered a row with
-/// nothing at all. There is no bundled `Help.html` to prefer here: the macOS arm
-/// reads it out of the `.app`'s `Contents/Resources`, which no other target has.
+/// Help, off macOS: the project page in the default browser, through the helper a Ctrl-clicked
+/// link uses (`open_url_external`: `ShellExecuteW` on Windows, `xdg-open` on Linux). No other
+/// target has the `.app`'s bundled `Help.html`.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn open_help_url() {
     crate::app_mouse::open_url_external(&help_url());
 }
 
-/// The project page — Help's destination when no bundled guide is reachable
-/// (every non-macOS target, and macOS outside the `.app`). One function so the
-/// two arms cannot drift, and `is_safe_url`-clean because `open_url_external`
-/// trusts its input. It is the PUBLIC channel the updater reads
-/// ([`aterm_update_core::DEFAULT_OWNER`] / [`aterm_update_core::DEFAULT_REPO`]),
-/// not `[workspace.package] repository`: that is the private staging repo, a
-/// 404 for anyone without its token.
+/// The project page — Help's destination when no bundled guide is reachable (every non-macOS
+/// target, and macOS outside the `.app`). `is_safe_url`-clean because `open_url_external`
+/// trusts its input. The public channel the updater reads
+/// ([`aterm_update_core::DEFAULT_OWNER`] / [`aterm_update_core::DEFAULT_REPO`]), not
+/// `[workspace.package] repository`, which is the private staging repo.
 fn help_url() -> String {
     format!(
         "https://github.com/{}/{}",
@@ -3006,38 +2861,25 @@ fn help_url() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// System Settings deep links — the macOS privacy panes (design §3.4, §3.7)
+// System Settings deep links — the macOS privacy panes
 // ---------------------------------------------------------------------------
 
-/// Which section of Privacy & Security a deep link aims at.
-///
-/// Only two sections are spellable, and both are REGISTERED anchors in the
-/// Settings extension's own `searchTerms` index (design Appendix A.2). The
-/// per-folder strings that also appear in the extension's Mach-O
-/// (`Privacy_DocumentsFolder` and its siblings) are NOT anchors — they name
-/// sub-rows of one combined Files-and-Folders section — so they are not
-/// offered here and cannot be reached by mistake.
+/// Which section of Privacy & Security a deep link aims at. Only registered anchors in the
+/// Settings extension's `searchTerms` index are spellable; the per-folder strings in its Mach-O
+/// (`Privacy_DocumentsFolder` and siblings) name sub-rows of the one Files & Folders section,
+/// not anchors, so they are not offered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PrivacyPane {
-    /// Full Disk Access — the single grant macOS offers for this class.
-    ///
-    /// Which folders HOLDING it covers has not been measured on this machine
-    /// (design §7 S4 is unrun), so neither this module nor its callers may say
-    /// that the grant covers any particular one. Nothing in this block names a
-    /// folder; the route strings below name only the pane.
+    /// Full Disk Access — the single grant macOS offers for this class. Which folders it covers
+    /// is unmeasured, so neither this module nor its callers may name one.
     FullDiskAccess,
-    /// The per-app Files & Folders list — §3.7's repair route, where a folder
-    /// row that was already answered can be turned back on.
+    /// The per-app Files & Folders list — the repair route, where an already-answered folder
+    /// row can be turned back on.
     FilesAndFolders,
-    /// The Developer Tools list (`kTCCServiceDeveloperTool`,
-    /// `docs/DESIGN-macos-debugger-access-2026-09-29.md` §9.1): in Apple's
-    /// words, apps allowed to "run software locally that does not meet the
-    /// system's security policy"; whether a listed app's new programs skip the
-    /// first-run check is spike D14. A human adds an app there
-    /// with `+`; aterm only opens the page. `Privacy_DevTools` is a registered
-    /// anchor (the extension's `searchTerms`, TCC design Appendix A.2). On
-    /// macOS 26 the same page also holds the Processor Trace switch, a
-    /// different setting.
+    /// The Developer Tools list (`kTCCServiceDeveloperTool`): apps allowed to "run software
+    /// locally that does not meet the system's security policy". A human adds an app there
+    /// with `+`; aterm only opens the page. `Privacy_DevTools` is a registered anchor. On
+    /// macOS 26 the page also holds the Processor Trace switch, a different setting.
     DeveloperTools,
 }
 
@@ -3051,13 +2893,10 @@ impl PrivacyPane {
     ];
 }
 
-/// Full Disk Access, through the modern Settings extension.
-///
-/// The scheme is `x-apple.systempreferences` — **with a dot**. The hyphenated
-/// `x-apple-systempreferences` spelling is a different string, and it is the
-/// one `crate::is_safe_url`'s rejection test names; keeping the two apart is
-/// why [`open_privacy_settings`] documents its own call site rather than
-/// borrowing the link allowlist.
+/// Full Disk Access, through the modern Settings extension. The scheme is
+/// `x-apple.systempreferences`, with a dot; the hyphenated spelling is a different string, the
+/// one `crate::is_safe_url`'s rejection test names, so [`open_privacy_settings`] does not borrow
+/// the link allowlist.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const SETTINGS_FULL_DISK_ACCESS: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles";
@@ -3078,33 +2917,25 @@ pub(crate) const SETTINGS_FILES_AND_FOLDERS: &str = "x-apple.systempreferences:c
 const SETTINGS_FILES_AND_FOLDERS_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
 
-/// The Developer Tools list, through the modern Settings extension: the
-/// consent module's one spelling, which `aterm doctor` prints too.
+/// The Developer Tools list, through the modern Settings extension (the consent module's
+/// spelling).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const SETTINGS_DEVELOPER_TOOLS: &str = aterm_containment::consent::DEVTOOLS_SETTINGS_URL;
 
-/// The Developer Tools list, through the legacy pane id: the consent module's
-/// one spelling, which `aterm doctor` opens too.
+/// The Developer Tools list, through the legacy pane id (the consent module's spelling).
 #[cfg(any(target_os = "macos", test))]
 const SETTINGS_DEVELOPER_TOOLS_LEGACY: &str =
     aterm_containment::consent::DEVTOOLS_SETTINGS_URL_LEGACY;
 
-/// The Privacy & Security page with NO anchor — the degradation target. It
-/// carries no `?`, which is the invariant
-/// `the_last_candidate_is_the_unanchored_pane_root` pins: the last entry of
-/// [`privacy_settings_urls`] must always be an anchor-free page that opens
-/// even if every anchor stops resolving.
+/// The Privacy & Security page with no anchor (no `?`), the degradation target: always the last
+/// of [`privacy_settings_urls`] (`the_last_candidate_is_the_unanchored_pane_root`).
 #[cfg(any(target_os = "macos", test))]
 const SETTINGS_PRIVACY_ROOT: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension";
 
-/// Every URL that may be tried for `pane`, best first: the modern extension
-/// id, the legacy alias, then the un-anchored pane root.
-///
-/// The last entry is why this can never be a dead end. None of the three is
-/// Apple-documented; if the anchors stop resolving, the Privacy & Security
-/// page still opens and the caller shows [`privacy_settings_path_words`] so
-/// the rest of the route is in words.
+/// Every URL that may be tried for `pane`, best first: the modern extension id, the legacy
+/// alias, then the unanchored pane root. None is Apple-documented; the root keeps this from
+/// being a dead end, and the caller shows [`privacy_settings_path_words`] for the rest.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3] {
     match pane {
@@ -3126,14 +2957,9 @@ pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3
     }
 }
 
-/// The route to `pane` in words — what a person reads when the anchor did not
-/// land them on the section.
-///
-/// Always available to the caller, not only on the degraded path: an accepted
-/// anchor is not a HONOURED anchor (`openURL:` answers "System Settings took
-/// the URL", never "it scrolled to the row"), so the surface that opens the
-/// pane can always say where to look. It names the pane and nothing else — no
-/// folder, and no claim about what a grant there covers.
+/// The route to `pane` in words, for when the anchor did not land the person on the section.
+/// Always offered: `openURL:` accepting a URL means System Settings took it, not that it
+/// scrolled to the row. Names the pane only — no folder, no claim about what a grant covers.
 pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static str {
     match pane {
         PrivacyPane::FullDiskAccess => {
@@ -3146,11 +2972,8 @@ pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static s
     }
 }
 
-/// What [`macos::open_privacy_settings`] actually achieved.
-///
-/// The caller needs the difference because the degraded outcomes change what
-/// it must SAY, not merely what it logs: on anything but [`Self::Anchored`]
-/// the words are the only route the person has.
+/// What [`macos::open_privacy_settings`] achieved. On anything but [`Self::Anchored`] the words
+/// are the person's only route, so the caller must say them, not just log.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SettingsOpen {
     /// An anchored URL was accepted. System Settings opened; whether it
@@ -3175,12 +2998,11 @@ impl SettingsOpen {
 }
 
 /// Open System Settings at `pane` — the owner-gesture entry point the Security
-/// page presses (design §3.4's FDA button, §3.7's repair link), the Developer
-/// Tools hand-over's opener (`devtools_helper::Reach::live`), which the
+/// page presses, the Developer Tools hand-over's opener (`devtools_helper::Reach::live`), which the
 /// window's own lane and `aterm ctl devtools hand-over` reach at a quiet
 /// moment, and the Full Disk Access hand-over's opener
 /// (`devtools_helper::FdaReach::live`), which only the window's own launch
-/// check reaches at a quiet moment (owner ask 2026-10-16).
+/// check reaches at a quiet moment.
 ///
 /// macOS does the work in [`macos::open_privacy_settings`], which documents why
 /// a Settings URL may be opened from here and never from a hyperlink. Off macOS
@@ -3190,7 +3012,7 @@ impl SettingsOpen {
 ///
 /// A degraded outcome is logged with that route, because a windowed launch has
 /// no stderr and "the button did nothing visible" is otherwise unexplainable
-/// after the fact. The caller still has to SHOW the words; the log is the
+/// after the fact. The caller still has to show the words; the log is the
 /// diagnostic copy, not the user-facing one.
 pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
     #[cfg(target_os = "macos")]
@@ -3209,15 +3031,6 @@ pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
 #[cfg(target_os = "macos")]
 mod macos {
     use aterm_objc::{Id, Obj, Retained, Sel, autoreleasepool, class, sel};
-    // THE SEAM IS CLOSED. `confirm` below was the ONLY thing in this module
-    // still on `objc2`, held there because its key interceptor is
-    // `crate::alert_keys`, whose `RcBlock` event monitor is shared with the
-    // multi-line-paste SHEET in `lib.rs` — a different subsystem with its own
-    // `NSAlert`, its own completion block and its own `PasteConfirm` state.
-    // Porting one without the other would have left two spellings of the same
-    // monitor, so W13 ported the whole modal-alert subsystem in one move:
-    // `alert_keys.rs`, this function, and the sheet. There is no seam left to
-    // import, which is why this block names only first-party crates.
     use aterm_window::event_loop::EventLoopProxy;
 
     use crate::appkit::consts::{
@@ -3238,12 +3051,10 @@ mod macos {
     /// state remains on the event-loop thread.
     static TERMINATE_PROXY: std::sync::OnceLock<EventLoopProxy<Wake>> = std::sync::OnceLock::new();
 
-    /// What [`install`] returns: the retained action target PLUS the Version menu's
-    /// top-level `NSMenuItem` (rightmost in the bar), kept so [`update_version_menu`]
-    /// can retitle it and rebuild its submenu live when an update stages / realizes /
-    /// expires. AppKit references a menu item's target WEAKLY, so the target must
-    /// outlive the run loop — `App` holds this handle in a field for the process
-    /// lifetime. Named the same on every platform (`()` off macOS).
+    /// What [`install`] returns: the retained action target and the Version menu's top-level
+    /// `NSMenuItem`, which [`update_version_menu`] retitles and rebuilds as an update stages,
+    /// realizes or expires. AppKit holds item targets weakly, so `App` keeps this for the
+    /// process lifetime. `()` off macOS.
     pub(crate) struct MenuHandle {
         /// The single `menuAction:` relay target every item is wired to.
         target: Retained<MenuTarget>,
@@ -3253,32 +3064,17 @@ mod macos {
     }
 
     aterm_objc::declare_class! {
-        /// The target object for every menu item. Owns the `EventLoopProxy<Wake>`
-        /// and exposes one `menuAction:` selector: it reads the sending
-        /// `NSMenuItem`'s `tag`, decodes a [`MenuAction`], and posts a
-        /// [`Wake::MenuAction`] so the main loop dispatches it on `App` (off the
-        /// AppKit menu-tracking call, on the next loop turn). No menu logic lives
-        /// here — it is a pure relay from AppKit into the existing `Wake` channel.
-        ///
-        /// `pub(crate)` so the `MenuHandle` alias (held in an `App` field) and
-        /// `install`'s return type are not "more private than the item" — the
-        /// type itself is never named outside this module.
-        ///
-        /// Declared with [`aterm_objc::declare_class!`]. The class name, the
-        /// superclass, both selectors and the behaviour are unchanged from the
-        /// `objc2` declaration this replaces. What objc2 spelled
-        /// `type Mutability = InteriorMutable` has no counterpart and needs none:
-        /// the proxy is never mutated, [`aterm_objc::Retained`] is
-        /// unconditionally `!Send`, and the two entry points take a
-        /// [`MainThread`] witness.
+        /// The target of every menu item: relays `menuAction:` (the sender's `tag`, decoded to a
+        /// [`MenuAction`]) as [`Wake::MenuAction`] for `App` to dispatch on the loop's next turn.
+        /// No menu logic lives here. `pub(crate)` only so `MenuHandle` and `install`'s return
+        /// type are not more private than it; [`aterm_objc::Retained`] is `!Send` and
+        /// instantiation takes a [`MainThread`] witness.
         pub(crate) struct MenuTarget: NSObject {
             const NAME: &str = "ATermMenuTarget";
             type Ivars = EventLoopProxy<Wake>;
 
-            /// `menuAction:` — the single selector wired to every item. `sender`
-            /// is the clicked `NSMenuItem`; its `tag` decodes to the action. A tag
-            /// that doesn't decode is ignored (no dispatch), so a stray/zero tag
-            /// is inert rather than firing the wrong command.
+            /// `menuAction:`, wired to every item: `sender` is the clicked `NSMenuItem`, whose
+            /// `tag` decodes to the action. A tag that does not decode is ignored.
             @sel(menuAction:)
             fn menu_action(&self, sender: Id) {
                 if sender.is_null() {
@@ -3294,15 +3090,11 @@ mod macos {
                 }
             }
 
-            /// AppKit asks this immediately before displaying/dispatching a menu
-            /// item. Terminal-only commands grey out over a native whole tab instead
-            /// of accepting a click that the host can only ignore.
+            /// AppKit asks this just before displaying or dispatching an item. Terminal-only
+            /// commands grey out over a native whole tab.
             ///
-            /// The return is [`aterm_objc::Bool`], not Rust's `bool`, and that is
-            /// D3's rule rather than a style choice: on the `x86_64-apple-darwin`
-            /// compat slice `BOOL` is `signed char`, so `bool` is the wrong ABI
-            /// type. objc2 hid the conversion inside `#[method]`; here it is
-            /// written once, in the return position.
+            /// Returns [`aterm_objc::Bool`], not `bool`: on the `x86_64-apple-darwin` slice
+            /// `BOOL` is `signed char`, so `bool` is the wrong ABI type.
             @sel(validateMenuItem:)
             fn validate_menu_item(&self, sender: Id) -> aterm_objc::Bool {
                 if sender.is_null() {
@@ -3325,8 +3117,7 @@ mod macos {
                     // passed, main thread, no preconditions.
                     unsafe { appkit::send_v_isize(sender, sel!(setState:), isize::from(on)) };
                 }
-                // The full-screen row names what it does now, as its palette
-                // row does.
+                // The full-screen row names what it does now, as its palette row does.
                 if matches!(action, MenuAction::ToggleFullScreen) {
                     stamp_full_screen_title(sender);
                 }
@@ -3404,10 +3195,8 @@ mod macos {
 
         let main = new_menu()?;
 
-        // Each section is built FROM THE MODEL (`MENU_MODEL`, round 19) and
-        // attached under its title, in the model's order — App / File / Edit /
-        // View / Fabric / Window / Help; the Version menu below is the one
-        // dynamic section, so the model's static placeholder for it is skipped.
+        // Each section is built from `MENU_MODEL`, in its order; the Version section's rows are
+        // dynamic, so it is built below instead.
         for section in MENU_MODEL {
             if section.title == "Version" {
                 continue;
@@ -3418,13 +3207,9 @@ mod macos {
                 build_section(&target, section.entries)?,
             );
         }
-        // The version identity goes LAST — after Help, so `v<version>` is the rightmost
-        // menu-bar title (a quiet trailing build badge). Installed in its PLAIN state
-        // (no update staged at boot); `App::refresh_version_menu` retitles it (via
-        // [`update_version_menu`], through the retained item below) when an update
-        // stages or the post-update realized arrow appears/expires. A bare top-level
-        // item with an action greys out in the main menu bar, so its commands are
-        // reached via this submenu (the reliable, idiomatic AppKit shape).
+        // The Version menu goes last (rightmost), installed plain; `App::refresh_version_menu`
+        // retitles it through the retained item. A bare top-level item with an action greys out
+        // in the main menu bar, so its commands live in this submenu.
         let version_item = attach_submenu(
             &main,
             &super::version_menu_bar_title(false),
@@ -3448,21 +3233,12 @@ mod macos {
         })
     }
 
-    /// Re-sync the LIVE Version menu (title + items) to the update state — the hook the
-    /// `Wake::UpdateStaged` handler, the post-update boot, and the realized-arrow TTL
-    /// sweep call (`App::refresh_version_menu`). `staged` is the strictly-newer
-    /// `(build, version)` ready to apply; `realized` marks the freshly-updated arrow
-    /// window. Rebuilding the submenu (rather than toggling item hidden-flags) keeps the
-    /// item set an exact function of the state — no stale "install now" rows. Best-effort:
-    /// off the main thread it is a no-op (never a panic), like every AppKit helper here.
-    ///
-    /// The persistent MENU-BAR arrow tracks `staged` ONLY — it means "an update is
-    /// waiting, act on it". After an apply re-execs into that build `staged` is `None`,
-    /// so the bar arrow clears the instant the update lands (no 10-min lingering badge
-    /// that reads as "the update never resolved"). The freshly-REALIZED celebration
-    /// still lives INSIDE the menu — its "Updated to aterm v…" row — and in its
-    /// palette twin, both of which self-dismiss; only the
-    /// always-visible bar badge is gated to the action-needed state.
+    /// Re-sync the live Version menu (title and items) to the update state, from
+    /// `App::refresh_version_menu` (on `Wake::UpdateStaged`, the post-update boot and the
+    /// realized-arrow TTL sweep). `staged` is the strictly newer `(build, version)` ready to
+    /// apply; `realized` marks the freshly updated window. Rebuilding the submenu, not toggling
+    /// hidden flags, keeps the items an exact function of the state. The bar arrow tracks
+    /// `staged` only ([`super::bar_title_attention`]). Off the main thread it is a no-op.
     pub(crate) fn update_version_menu(
         handle: &MenuHandle,
         staged: Option<(u64, &str)>,
@@ -3485,13 +3261,12 @@ mod macos {
         set_version_menu(&_main_thread, handle, &title, &submenu);
     }
 
-    /// The OUTGOING side of a seamless handoff: retitle this process's Version
-    /// item to the successor's plain `title` (`super::handoff_target_bar_title`)
-    /// over the quiet About-only submenu, so the bar is right even if no app
-    /// claims it after this process exits (the 2026-09-24 `v0.91.0 ⬆️`). Called
-    /// from the successor's ProofReady, which leaves the ≥30 ms dispatch fence
-    /// for AppKit to publish it before Commit; a returned attempt re-syncs the
-    /// item (`App::refresh_version_menu`). Steals no focus.
+    /// The outgoing side of a seamless handoff: retitle this process's Version item to the
+    /// successor's plain `title` (`super::handoff_target_bar_title`) over the About-only
+    /// submenu, so the bar is right even if no app claims it after this process exits. Called
+    /// from the successor's ProofReady, which leaves the ≥30 ms dispatch fence for AppKit to
+    /// publish it before Commit; a returned attempt re-syncs the item
+    /// (`App::refresh_version_menu`). Steals no focus.
     pub fn show_handoff_target_version(handle: &MenuHandle, title: &str) {
         let Some(_main_thread) = MainThread::new() else {
             return;
@@ -3513,9 +3288,8 @@ mod macos {
         let Some(ns_title) = appkit::nsstring(title) else {
             return;
         };
-        // Set the title on BOTH the bar item and the submenu: AppKit takes a top-level
-        // bar title from whichever is authoritative for the toolkit version in play
-        // (historically the submenu's title), so writing both is the robust retitle.
+        // Set the title on both the bar item and the submenu: which one AppKit takes for a
+        // top-level title has varied by toolkit version.
         // SAFETY: `-setTitle:` is `-(void)(NSString *)` and `-setSubmenu:` is
         // `-(void)(NSMenu *)`, both plain main-thread setters on live objects
         // that COPY/RETAIN their argument, so the +1 title and the submenu may
@@ -3527,18 +3301,14 @@ mod macos {
         }
     }
 
-    /// The Version submenu for the given update state. Mirrors [`super::VERSION_MENU`]
-    /// in the portable model (whose ApplyUpdate row the palette rewrites the same way):
-    ///   * STAGED: "⬆️ Install aterm v<staged> now" (ONE click installs in place — the
-    ///     owner's "click-upgrade" ask), then About, then
-    ///     "Update details…" (the
-    ///     Software Update route stays reachable as the DETAILS surface). A build
-    ///     on hold reads "⬆️ aterm v<staged> is on hold — …" and its click opens
-    ///     those details ([`super::staged_apply_label`]).
-    ///   * REALIZED (fresh post-update, no new stage): "⬆️ Updated to aterm v<current>"
-    ///     (fires About — the celebration row is informative, not destructive),
-    ///     then About.
-    ///   * NEITHER: just About — the quiet steady-state badge menu.
+    /// The Version submenu for the given update state (the palette rewrites
+    /// [`super::VERSION_MENU`]'s apply row the same way):
+    ///   * staged: "⬆️ Install aterm v<staged> now" (one click installs in place), About, then
+    ///     "Update details…". A build on hold reads "⬆️ aterm v<staged> is on hold — …" and its
+    ///     click opens the details ([`super::staged_apply_label`]).
+    ///   * realized (fresh post-update, nothing staged): "⬆️ Updated to aterm v<current>"
+    ///     (fires About), then About.
+    ///   * neither: just About.
     fn build_version_menu(
         target: &MenuTarget,
         staged: Option<(u64, &str)>,
@@ -3597,8 +3367,8 @@ mod macos {
     /// Build one menu from the model's entries: every [`MenuEntry::Item`] as an
     /// item wired to `menuAction:` with the model's key equivalent and modifier
     /// mask and the action's [`MenuAction::help`] as its tool tip, every
-    /// separator as a separator. The ONE builder for
-    /// every static section since round 19 — so the live bar the `chrome`
+    /// separator as a separator. The one builder for
+    /// every static section — so the live bar the `chrome`
     /// verb reads back on macOS and the model `menu_chrome_lines` prints off
     /// it are the same tree by construction.
     fn build_section(target: &MenuTarget, entries: &[super::MenuEntry]) -> Option<Obj> {
@@ -3632,12 +3402,12 @@ mod macos {
         NS_EVENT_MODIFIER_FLAG_COMMAND
     }
 
-    /// `Cmd-Ctrl` mask (Enter Full Screen's standard equivalent).
+    /// `Cmd-Ctrl` mask (Enter Full Screen's ⌃⌘F).
     fn command_control_mask() -> usize {
         NS_EVENT_MODIFIER_FLAG_COMMAND | NS_EVENT_MODIFIER_FLAG_CONTROL
     }
 
-    /// `Cmd-Shift` mask (Move Tab to New Window's ⇧⌘N equivalent).
+    /// `Cmd-Shift` mask (Move Tab to New Window's ⇧⌘N).
     fn command_shift_mask() -> usize {
         NS_EVENT_MODIFIER_FLAG_COMMAND | NS_EVENT_MODIFIER_FLAG_SHIFT
     }
@@ -3669,11 +3439,9 @@ mod macos {
         }
     }
 
-    /// Build one menu item wired to `menuAction:` on `target`, tagged with
-    /// `action`, and append it to `menu`. `key` is the lowercase key-equivalent
-    /// character ("" for none); `cmd` adds the ⌘ modifier (a Cmd shortcut). The
-    /// equivalent is VISUAL only — it just renders next to the item; the actual
-    /// keystroke is still handled by `App::on_key`.
+    /// Build one menu item wired to `menuAction:` on `target`, tagged with `action`, and append
+    /// it to `menu`. `key` is the lowercase key-equivalent character ("" for none); `cmd` adds
+    /// ⌘. The equivalent is visual only: `App::on_key` handles the keystroke.
     fn add_item(
         menu: &Obj,
         target: &MenuTarget,
@@ -3696,13 +3464,10 @@ mod macos {
         key: &str,
         mods: usize,
     ) {
-        // Build with the menuAction: selector so AppKit dispatches to `target`.
         let Some(item) = new_item(title, sel!(menuAction:), key) else {
             return;
         };
-        // The row's help sentence (`MenuAction::help`) is its tool tip — what a
-        // human hovers and what VoiceOver reads as the item's help (round 19:
-        // an accessibility label on every item).
+        // The help sentence is the tool tip, which VoiceOver reads as the item's help.
         let tip = appkit::nsstring(action.help());
         // SAFETY: plain setters on a fresh NSMenuItem, then `-addItem:` on the
         // live menu. `-setTarget:` is `-(void)(id)` and holds the target WEAKLY
@@ -3818,22 +3583,16 @@ mod macos {
         })
     }
 
-    /// Attach `submenu` under a new top-level item titled `title` on `bar`, returning
-    /// the retained bar item so a caller can keep a live handle to it (the Version
-    /// menu is retitled/rebuilt through its item — see [`update_version_menu`]; the
-    /// other menus ignore the return). The item carries no action (its only job is to
-    /// hold the submenu). The submenu is titled to match: AppKit takes a top-level
-    /// bar title from the submenu on some paths, so both must agree.
+    /// Attach `submenu` under a new action-less top-level item titled `title` on `bar`,
+    /// returning the retained item (the Version menu is retitled through it, see
+    /// [`update_version_menu`]). The submenu gets the same title: AppKit takes a top-level bar
+    /// title from the submenu on some paths.
     fn attach_submenu(bar: &Obj, title: &str, submenu: Obj) -> Option<Obj> {
         let ns_title = appkit::nsstring(title)?;
-        // A top-level bar item carries NO action — its only job is to hold the
-        // submenu — which is [`Sel::NULL`], the value W2 had to add to
-        // `aterm-objc` to express this at all.
         let item = new_item(title, Sel::NULL, "")?;
-        // SAFETY: `-setTitle:` is `-(void)(NSString *)`, `-setSubmenu:` is
-        // `-(void)(NSMenu *)` and RETAINS, `-addItem:` is `-(void)(NSMenuItem *)`
-        // and RETAINS — so both the +1 title and the moved `submenu` may drop at
-        // the end of this frame, exactly as the objc2 form's `Retained` did.
+        // SAFETY: `-setTitle:` is `-(void)(NSString *)`, `-setSubmenu:` is `-(void)(NSMenu *)`
+        // and retains, `-addItem:` is `-(void)(NSMenuItem *)` and retains, so both the +1 title
+        // and the moved `submenu` may drop at the end of this frame.
         unsafe {
             appkit::send_v_id(submenu.id(), sel!(setTitle:), ns_title.id());
             appkit::send_v_id(item.id(), sel!(setSubmenu:), submenu.id());
@@ -3842,45 +3601,31 @@ mod macos {
         Some(item)
     }
 
-    /// Show a native modal confirmation alert (a ⌘Q quit, or a close gesture that
-    /// would lose work) and block until the user answers. `title` is the primary
-    /// message, `body` the secondary explanatory line, and `proceed_label` titles the
-    /// affirmative (destructive) button — the DEFAULT button; a "Cancel" button is
-    /// always added and Escape maps to it. Returns `true` iff the user chose to proceed.
-    ///
-    /// `runModal` spins a nested modal run loop on the main thread (the standard
-    /// AppKit pattern, the same one native file pickers use), so it is safe to call
-    /// straight from the winit event handler. Best-effort: if somehow off the main
-    /// thread it returns `true` (proceed) so a quit can never wedge.
+    /// Show a native modal confirmation (a ⌘Q quit, or a close that would lose work) and block
+    /// until the user answers. `proceed_label` titles the affirmative, default button; a Cancel
+    /// button is always added and Escape maps to it. Returns `true` iff the user proceeds.
+    /// `runModal` spins a nested modal loop on the main thread, so this is safe straight from
+    /// the winit event handler.
     ///
     /// # Return with ⌘ held
     ///
-    /// The default button's Return equivalent carries an EMPTY modifier mask and
-    /// AppKit's key-equivalent match is exact, so ⌘Return answers this alert no more
-    /// than it answered the paste sheet — and ⌘Q is precisely a gesture that leaves ⌘
-    /// under the finger. So the same [`crate::alert_keys`] interceptor is installed for
-    /// the duration of the `runModal` call: Return (any modifiers) clicks PROCEED,
-    /// Escape clicks Cancel, everything else passes through. The watch is a LOCAL whose
-    /// scope ends with the blocking call, so it cannot outlive the alert.
+    /// The default button's Return equivalent has an empty modifier mask and AppKit matches key
+    /// equivalents exactly, so ⌘Return (⌘ still held after ⌘Q) would not answer. The
+    /// [`crate::alert_keys`] interceptor is installed for the `runModal` call: Return (any
+    /// modifiers) proceeds, Escape cancels, everything else passes through.
     pub(crate) fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
-        // Headless never shows a confirm: proceed, as `confirm_destructive_close`
-        // already does for a headless instance. Every other case where no alert
-        // could be shown proceeds too: a quit that cannot ask must not wedge.
+        // Proceed whenever no alert could be shown (headless included, as
+        // `confirm_destructive_close` does): a quit that cannot ask must not wedge.
         ask(title, body, proceed_label, AlertDefault::Proceed).unwrap_or(true)
     }
 
-    /// [`confirm`] for an owner gesture that changes this Mac — the Security
-    /// panel's reset, warm-up and *Move to Trash*. It fails CLOSED: with no
-    /// window, off the main thread, or with no alert built, nobody is asked and
-    /// it returns `None` — never a yes.
-    /// Control input arrives as a `Wake`, which is queued while `runModal` spins
-    /// and never becomes an event the alert receives, so no control verb can
-    /// answer it. And because a program can choose WHEN the alert appears, its
-    /// default button is Cancel and the destructive button refuses keyboard
-    /// focus: a Return, Escape, Tab or Space the owner was typing elsewhere
-    /// never says yes — only a deliberate click on `proceed_label` does.
-    /// `None` when no alert could be shown — nobody was asked, which the caller
-    /// must not read as a decline.
+    /// [`confirm`] for an owner gesture that changes this Mac (the Security panel's reset,
+    /// warm-up and *Move to Trash*). Fails closed: with no window, off the main thread or with
+    /// no alert built, nobody is asked and it returns `None`, which the caller must not read as
+    /// a decline. Control input arrives as a `Wake`, queued while `runModal` spins, so no
+    /// control verb can answer it. Since a program can choose when the alert appears, its
+    /// default button is Cancel and the destructive button refuses keyboard focus: only a
+    /// deliberate click on `proceed_label` says yes.
     pub(crate) fn confirm_owner(title: &str, body: &str, proceed_label: &str) -> Option<bool> {
         ask(title, body, proceed_label, AlertDefault::Cancel)
     }
@@ -3912,30 +3657,26 @@ mod macos {
             // Foundation refused a string, so no alert can be built.
             return None;
         };
-        // A missing alert is "could not ask" too. The `objc2` form could not
-        // reach this case — `msg_send_id![…, new]` panicked on nil.
-        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init),
-        // which is what `Obj::from_owned` adopts.
+        // A nil alert is "could not ask" too.
+        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init), which is what
+        // `Obj::from_owned` adopts.
         let alert =
             unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) }?;
-        // SAFETY: standard `NSAlert` setters + `runModal`, all on the main thread
-        // (`MainThread::new()` above proves it). `-setMessageText:` and
-        // `-setInformativeText:` are `-(void)(NSString *)` and COPY their argument,
-        // so the +1 strings may drop at the end of this frame.
-        // `-addButtonWithTitle:` is `-(NSButton *)(NSString *)` and `-window` is
-        // `-(NSWindow *)` — both +0, so both are RETAINED into `Obj` rather than
-        // adopted, which is the retain `objc2`'s `Retained` returns carried. The
-        // alert keeps the default `NSAlertStyleWarning` (the app-icon caution panel).
-        // `-runModal` is `-(NSModalResponse)`, an `NSInteger`.
+        // SAFETY: standard `NSAlert` setters and `runModal`, on the main thread
+        // (`MainThread::new()` above proves it). `-setMessageText:` and `-setInformativeText:`
+        // are `-(void)(NSString *)` and copy their argument, so the +1 strings may drop at the
+        // end of this frame. `-addButtonWithTitle:` is `-(NSButton *)(NSString *)` and `-window`
+        // is `-(NSWindow *)`, both +0, so both are retained into `Obj`, not adopted. The alert
+        // keeps the default `NSAlertStyleWarning`. `-runModal` is `-(NSModalResponse)`, an
+        // `NSInteger`.
         unsafe {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
             if default == AlertDefault::Cancel {
-                // The first button added is the default, so Cancel goes first:
-                // Return and Escape both cancel, and the destructive button
-                // takes a click — it refuses keyboard focus, so with keyboard
-                // navigation on neither Tab nor Space reaches it either. No key
-                // watch — its job is to make Return proceed.
+                // The first button added is the default, so Cancel goes first: Return and
+                // Escape both cancel, and the destructive button refuses keyboard focus, so
+                // neither Tab nor Space reaches it. No key watch: its job is to make Return
+                // proceed.
                 let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), cancel.id());
                 let proceed_button =
                     appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), proceed.id());
@@ -3947,9 +3688,8 @@ mod macos {
                 let response = appkit::send_isize(alert.id(), sel!(runModal));
                 return Some(response == NS_ALERT_SECOND_BUTTON_RETURN);
             }
-            // First button added is the default (Return, with an EMPTY modifier mask —
-            // hence the key watch below): the PROCEED action. The second is Cancel
-            // (AppKit binds Escape to it).
+            // The first button added is the default (Return with an empty modifier mask, hence
+            // the key watch below): proceed. The second is Cancel (AppKit binds Escape to it).
             let accept = Obj::retain(appkit::send_id_id(
                 alert.id(),
                 sel!(addButtonWithTitle:),
@@ -3961,13 +3701,9 @@ mod macos {
                 cancel.id(),
             ));
             let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
-            // Dropped when this function returns — i.e. the moment `runModal` comes
-            // back — so the interceptor's lifetime is exactly the alert's.
-            //
-            // A missing button or panel means there is nothing to click, so the watch
-            // is simply not installed and the alert keeps its stock keys. That is the
-            // same degradation `watch_alert_keys` already documents for the case where
-            // AppKit declines the monitor, and `confirm` still asks its question.
+            // Dropped when this function returns, the moment `runModal` comes back, so the
+            // interceptor lives exactly as long as the alert. With a button or the panel
+            // missing there is nothing to click: no watch, and the alert keeps its stock keys.
             let _keys = match (panel, accept, refuse) {
                 (Some(panel), Some(accept), Some(refuse)) => {
                     crate::alert_keys::watch_alert_keys(panel, None, accept, refuse)
@@ -3979,11 +3715,8 @@ mod macos {
         }
     }
 
-    /// Show a simple informational alert (a single OK button) and block until the user
-    /// dismisses it — the visible result of App menu ▸ Check for Updates…. `title` is the
-    /// primary line, `body` the details (version + "what changed"). Best-effort: off the
-    /// main thread it does nothing. `runModal` is the same nested-modal pattern `confirm`
-    /// uses, safe to call straight from the winit event handler.
+    /// Show an informational alert (one OK button) and block until it is dismissed: a file that
+    /// could not open, a failed start. Off the main thread it does nothing.
     pub(crate) fn notify(title: &str, body: &str) {
         if super::os_ui_refused(title) || MainThread::new().is_none() {
             return;
@@ -4027,11 +3760,10 @@ mod macos {
         }
     }
 
-    /// Whether the `terminate:` AppKit is asking about now is the SYSTEM's —
-    /// a logout, a restart or a shutdown: the quit Apple Event being handled
-    /// carries a `kAEQuitReason` naming one ([`crate::system_quit::reason_is_the_systems`]).
-    /// A person's Dock Quit or an AppleScript `quit` carries none; ⌘Q is the
-    /// app menu's and never reaches here. Any read that fails is no reason.
+    /// Whether the `terminate:` AppKit is asking about now is the system's — a logout, a restart
+    /// or a shutdown: the quit Apple Event being handled carries a `kAEQuitReason` naming one
+    /// ([`crate::system_quit::reason_is_the_systems`]). A Dock Quit or an AppleScript `quit`
+    /// carries none; ⌘Q is the app menu's and never reaches here. A failed read is no reason.
     fn terminate_is_the_systems() -> bool {
         // SAFETY: Foundation sends on the main thread inside
         // `applicationShouldTerminate:`. `+sharedAppleEventManager` and
@@ -4071,11 +3803,9 @@ mod macos {
     /// the generation complete, a re-entrant terminate is allowed (normal aterm
     /// shutdown uses `ActiveEventLoop::exit` and does not need to re-enter AppKit).
     pub(crate) fn defer_quit_for_terminate() -> bool {
-        // WHY AppKit asks (2026-09-27): a restart, a logout or a shutdown is
-        // an exit the person did not choose for aterm, so its quit keeps the
-        // agents aterm hosts for the next launch (`crate::system_quit`) — noted
-        // against the generation this request rides, so a cancel of that quit
-        // takes the mark with it.
+        // A restart, logout or shutdown is an exit the person did not choose, so its quit keeps
+        // the agents aterm hosts for the next launch (`crate::system_quit`), noted against this
+        // request's generation so a cancel takes the mark with it.
         let decision = super::admit_native_terminate(terminate_is_the_systems());
         match decision {
             NativeTerminateDecision::AllowExit(_) => true,
@@ -4097,10 +3827,9 @@ mod macos {
         }
     }
 
-    /// Help ▸ aterm Help: open the bundled, offline features guide
-    /// (`Contents/Resources/Help.html`, bundled by the ship tool — aterm-release
-    /// `bundle.rs`) in the default browser. Falls back to the project page when
-    /// running outside the `.app` (e.g. `cargo run`), where no bundled resource exists.
+    /// Help ▸ aterm Help: open the bundled offline guide (`Contents/Resources/Help.html`, put
+    /// there by aterm-release's `bundle.rs`) in the default browser, or the project page when
+    /// running outside the `.app`.
     pub(crate) fn open_help_url() {
         if let Some(help) = bundled_resource("Help.html") {
             open_in_workspace(&help, true);
@@ -4118,17 +3847,10 @@ mod macos {
         res.is_file().then(|| res.to_string_lossy().into_owned())
     }
 
-    /// Open `s` via `NSWorkspace openURL:` — a file path (`is_file`) becomes a
-    /// `file://` URL, otherwise it is parsed as an absolute URL. Best-effort; main
-    /// thread only.
-    ///
-    /// Returns what `openURL:` answered: whether the shell ACCEPTED the URL —
-    /// which is not the same as "the app did what the URL asked", and for the
-    /// Settings anchors is emphatically not the same (see
-    /// [`open_privacy_settings`]). Help ignores it; the deep link needs it to
-    /// walk its fallback chain. `false` also covers the off-main-thread refusal,
-    /// so a caller that reads the answer cannot mistake "not attempted" for
-    /// "opened".
+    /// Open `s` via `NSWorkspace openURL:` — a file path (`is_file`) as a `file://` URL,
+    /// otherwise an absolute URL. Main thread only. Returns whether the shell accepted the URL,
+    /// which is not whether the app did what it asked (see [`open_privacy_settings`]); `false`
+    /// also covers a refusal, so "not attempted" never reads as "opened".
     fn open_in_workspace(s: &str, is_file: bool) -> bool {
         if super::os_ui_refused(&format!("opening {s}")) || MainThread::new().is_none() {
             return false;
@@ -4162,16 +3884,15 @@ mod macos {
         })
     }
 
-    /// Open a LOCAL FILE aterm itself names — Settings ▸ Packages' "Open Log", for the
-    /// package log atpkg resolved (Phase 4) — through `NSWorkspace openURL:` with a
-    /// `file://` URL: macOS opens it in the app that owns the type (Console for a `.log`).
-    /// No shell and no Terminal are spawned, and nothing a program printed can reach this
-    /// (the link path's allowlist stays closed). Main thread only; `false` when refused.
+    /// Open a local file aterm itself names (Settings ▸ Packages' "Open Log", for the package log
+    /// atpkg resolved) through `NSWorkspace openURL:` with a `file://` URL, so macOS opens it in
+    /// the app that owns the type. No shell or Terminal is spawned, and nothing a program printed
+    /// can reach this (the link allowlist stays closed). Main thread only; `false` when refused.
     pub(crate) fn open_file_in_workspace(path: &std::path::Path) -> bool {
         path.to_str().is_some_and(|s| open_in_workspace(s, true))
     }
 
-    /// Show the LOCAL FILE `path` aterm itself names — Settings ▸ Manual's
+    /// Show the local file `path` aterm itself names — Settings ▸ Manual's
     /// aterm.toml — selected in a Finder window: `NSWorkspace
     /// selectFile:inFileViewerRootedAtPath:` with an empty root (Finder's own
     /// viewer). Its answer is Finder's: `false` when the file could not be
@@ -4212,56 +3933,21 @@ mod macos {
     /// launching cold, short enough that it is one gesture rather than two.
     const SECOND_OPEN_DELAY_SECS: f64 = 1.0;
 
-    /// Open System Settings at `pane` — twice, roughly [`SECOND_OPEN_DELAY_SECS`]
-    /// apart — and report how far it got.
+    /// Open System Settings at `pane` — twice, about [`SECOND_OPEN_DELAY_SECS`] apart, the second
+    /// a delayed perform on the main run loop ([`open_in_workspace_after_delay`]) — and report how
+    /// far it got.
     ///
-    /// # Why a Settings URL may be opened here, and never from a link
+    /// The URL is a `&'static str` compiled into aterm with no untrusted bytes, reached from
+    /// the owner's presses (a button on the Security page, a digest line's capsule) and from
+    /// the Developer Tools (`App::hand_devtools_to_owner`) and Full Disk Access
+    /// (`App::hand_fda_to_owner`) hand-over lanes at a quiet moment (`devtools_helper::quiet`).
+    /// It goes to `NSWorkspace` directly rather than through the link path, so the allowlist
+    /// stays closed.
     ///
-    /// `crate::is_safe_url` is the allowlist a Cmd-clicked hyperlink from
-    /// PROGRAM OUTPUT must pass, and it admits only `http`/`https`/`mailto`. Its
-    /// rejection test names an `x-apple-systempreferences:` URL on purpose:
-    /// output that a program printed must never be able to open a privacy pane,
-    /// because a pane a program can raise is a consent surface that program
-    /// controls — the same rule that keeps the warm-up and the `tccutil` repair
-    /// off the control verbs (design §3.5, §3.7). **Nothing here widens that
-    /// allowlist, and it must not be widened to accommodate this path.**
-    ///
-    /// This URL is a different kind of thing: a `&'static str` compiled into
-    /// aterm, with no untrusted bytes anywhere in it, reached from the owner's
-    /// own presses (a button on aterm's own Security page, a digest line's
-    /// capsule) and from one lane of aterm's own, for two pages: the Developer
-    /// Tools hand-over (`App::hand_devtools_to_owner`), which opens that page —
-    /// once per aterm version on its own, and when `aterm ctl devtools
-    /// hand-over` asks — and the Full Disk Access hand-over
-    /// (`App::hand_fda_to_owner`, owner ask 2026-10-16), which opens that page
-    /// once per aterm version when the launch check reads the grant off on a Mac
-    /// where aterm never verified it, and which no control verb reaches. Both
-    /// open only at a quiet moment the lane judges itself
-    /// (`devtools_helper::quiet`). A
-    /// program's ask chooses neither the page nor the moment: the verb names no
-    /// URL, and the lane holds it to the same gates as its own (the owner's Not
-    /// now, a build whose grant would not last, ten minutes since the page last
-    /// opened, a lapse after 30 minutes); its `now` form opens nothing here at
-    /// all, showing only aterm's panel while its asker (`aterm doctor`) opens
-    /// the page. It goes to `NSWorkspace` directly rather than through the link
-    /// path, so the two never share a gate and the allowlist stays closed.
-    ///
-    /// # Twice, without blocking
-    ///
-    /// The second issue is a delayed perform on the main run loop, NOT a sleep:
-    /// this function returns to the event loop immediately and the second open
-    /// arrives later as an ordinary run-loop callback (see
-    /// [`open_in_workspace_after_delay`]).
-    ///
-    /// # Never a dead end
-    ///
-    /// Candidates are tried best-first from [`privacy_settings_urls`], whose last
-    /// entry carries no anchor at all. If both anchored URLs are refused, the
-    /// Privacy & Security page still opens and the answer is
-    /// [`SettingsOpen::PaneRoot`], which tells the caller to show
-    /// [`privacy_settings_path_words`] — the route in words. Off the main thread
-    /// nothing is attempted and the answer is [`SettingsOpen::Refused`], which is
-    /// the same instruction to the caller.
+    /// Candidates come best first from [`privacy_settings_urls`], whose last has no anchor, so a
+    /// refused anchor still opens Privacy & Security ([`SettingsOpen::PaneRoot`]); off the main
+    /// thread nothing is attempted ([`SettingsOpen::Refused`]). Either way the caller shows
+    /// [`privacy_settings_path_words`].
     pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
         if MainThread::new().is_none() {
             return SettingsOpen::Refused;
@@ -4304,20 +3990,11 @@ mod macos {
     }
 
     /// Issue `s` through `NSWorkspace openURL:` again after `secs`.
-    ///
-    /// `performSelector:withObject:afterDelay:` schedules on the CALLING thread's
-    /// run loop, and the only way in is from the main thread
-    /// ([`open_privacy_settings`] has already checked, and this re-checks), so the
-    /// second open runs on the main thread while the main thread stays free in the
-    /// meantime. No worker, no timer object to own, and nothing to cancel: the
-    /// worst case is one extra `openURL:` for a pane the owner asked for a second
-    /// earlier.
-    ///
-    /// Best-effort in one respect worth naming: a delayed perform is scheduled in
-    /// the default run-loop mode, so if the main thread is inside a tracking loop
-    /// (a drag, an open menu) when the second open comes due, it lands when
-    /// tracking ends rather than on the second. That only ever makes the second
-    /// issue LATE; it cannot lose it, and the first open has already happened.
+    /// `performSelector:withObject:afterDelay:` schedules on the calling thread's run loop and
+    /// this runs only on the main thread, so the second open runs there while the thread stays
+    /// free meanwhile: no worker, no timer to own, nothing to cancel. The perform uses the
+    /// default run-loop mode, so during a tracking loop (a drag, an open menu) the second open
+    /// lands late, when tracking ends, but is never lost.
     fn open_in_workspace_after_delay(s: &str, secs: f64) {
         if super::os_ui_refused(&format!("opening {s}")) || MainThread::new().is_none() {
             return;
@@ -4325,13 +4002,12 @@ mod macos {
         let Some(ns) = appkit::nsstring(s) else {
             return;
         };
-        // SAFETY: standard AppKit. Every `s` reaching here is one of this module's
-        // own `&'static str` URL constants, so `URLWithString:` is non-nil.
-        // `NSWorkspace` retains both the receiver and the argument until the
-        // perform fires, so nothing here has to outlive this frame. The scheduled
-        // selector is `openURL:`, whose real return is `BOOL` while the delayed
-        // perform invokes it as `id`-returning; the value lands in the same return
-        // register on every target aterm builds for and is discarded either way.
+        // SAFETY: standard AppKit. Every `s` reaching here is one of this module's own
+        // `&'static str` URL constants, so `URLWithString:` is non-nil. `NSWorkspace` retains
+        // the receiver and the argument until the perform fires, so nothing here outlives this
+        // frame. The delayed perform invokes `openURL:` (really `BOOL`-returning) as
+        // `id`-returning; the value lands in the same return register on every target aterm
+        // builds for and is discarded.
         autoreleasepool(|_| unsafe {
             let url = appkit::send_id_id(class(c"NSURL").as_id(), sel!(URLWithString:), ns.id());
             let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
@@ -4380,17 +4056,11 @@ mod macos {
             }
         }
 
-        /// THE PROOF for the ENCODINGS — read back out of the runtime with
-        /// `method_getTypeEncoding`, against the verified table.
-        ///
-        /// `validateMenuItem:` is the D3 shape: `- (BOOL)validateMenuItem:(id)`
-        /// registers `"B@:@"` on `aarch64-apple-darwin` and `"c@:@"` on the
-        /// `x86_64-apple-darwin` compat slice, because `@encode(BOOL)` differs
-        /// between them. The expectation is written FROM `Bool::ENCODING`
-        /// rather than hard-coded, which is what makes it a check on both
-        /// arches from one source; the literal is asserted alongside on the arch
-        /// that can execute, so a `Bool::ENCODING` that went wrong could not
-        /// make this test vacuous.
+        /// The method encodings, read back from the runtime with `method_getTypeEncoding`.
+        /// `validateMenuItem:` registers `"B@:@"` on `aarch64-apple-darwin` and `"c@:@"` on
+        /// `x86_64-apple-darwin` (`@encode(BOOL)` differs), so the expectation is built from
+        /// `Bool::ENCODING`, and the literal is asserted on aarch64 so a wrong `Bool::ENCODING`
+        /// cannot make the test vacuous.
         #[test]
         fn the_runtime_reports_the_encodings_the_table_says() {
             let cls = MenuTarget::class();
@@ -4419,24 +4089,15 @@ mod tests {
         set_active_tab_is_terminal, staged_apply_label, version_menu_bar_title,
     };
 
-    /// REGRESSION: the menu bar badged "v0.14.0 ⬆️" over a row reading "Update to
-    /// v0.14.0 — apply now" (today "Install aterm v0.14.0 now"), which reads as an
-    /// offer to update a build to itself.
-    ///
-    /// Nothing was wrong with the update. The updater orders by BUILD NUMBER (the
-    /// display version is documented as never affecting an update comparison), so a
-    /// strictly-newer staged build may legally share the running build's version
-    /// string — the ledger ships such pairs. The badge printed the running version
-    /// and the row printed the staged version, and BOTH dropped the build, which was
-    /// the only field that told them apart.
-    ///
-    /// The invariant: the apply row must never be spellable as the badge.
+    /// The updater orders by build number (the display version never affects an
+    /// update comparison), so a strictly-newer staged build may share the running
+    /// build's version string, and the apply row must never be spellable as the badge.
     #[test]
     fn the_apply_row_can_never_read_as_the_version_already_running() {
         let running = crate::build_info::version_display();
         let badge = version_menu_bar_title(true);
 
-        // The colliding case: staged build carries the SAME version string.
+        // The colliding case: the staged build carries the same version string.
         let same = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, running, None, false);
         assert!(
             same.contains("build 1785910394"),
@@ -4456,10 +4117,9 @@ mod tests {
         );
     }
 
-    /// THE ALWAYS-VISIBLE OFFER MUST CARRY THE APPLY LANE'S VERDICT ON ITSELF
-    /// (2026-08-21: the row said "restart now" above a build that had already
-    /// refused to start twice). A scheduled retry asks for nothing; a lane that
-    /// stopped names the action that resumes it; a build on hold offers no start.
+    /// The always-visible offer must carry the apply lane's verdict on itself:
+    /// a scheduled retry asks for nothing; a lane that stopped names the action
+    /// that resumes it; a build on hold offers no start.
     #[test]
     fn the_apply_row_admits_when_applying_has_already_been_tried() {
         use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
@@ -4504,11 +4164,9 @@ mod tests {
             .collect()
     }
 
-    /// Every `invoke` name an agent's script may already carry, verbatim:
-    /// the names that resolved before round 19's menu rework, and the round's
-    /// own and the Agents menu's predecessors. Each still resolves (to the
-    /// action it named, or the alias its row became) or answers `ERR retired:
-    /// <what to use>` — never an unknown action. Pinned by
+    /// Every `invoke` name an agent's script may already carry, verbatim. Each
+    /// resolves (to the action it named, or the alias its row became) or answers
+    /// `ERR retired: <what to use>` — never an unknown action. Pinned by
     /// `every_earlier_invoke_name_resolves_or_is_retired`.
     const EARLIER_INVOKE_NAMES: &[&str] = &[
         "About",
@@ -4562,7 +4220,6 @@ mod tests {
         "ShowConnectionMap",
         "ConfigureConnection",
         "DisconnectSession",
-        // Round 19's Fabric menu and View checkables.
         "Inbox",
         "ShowInbox",
         "LedgerForSession",
@@ -4589,10 +4246,10 @@ mod tests {
             .collect()
     }
 
-    /// The tab-context actions are a deliberate NON-bar vocabulary: their invoke
+    /// The tab-context actions are a deliberate non-bar vocabulary: their invoke
     /// names round-trip (so `invoke CopySessionId` is fenceable + dispatchable),
     /// each classifies at its honest boundary (the copies move text onto the
-    /// pasteboard), and they must NOT leak into `MENU_MODEL` (the bar mirror
+    /// pasteboard), and they must not leak into `MENU_MODEL` (the bar mirror
     /// stays exactly the bar).
     #[test]
     fn tab_context_actions_round_trip_and_stay_out_of_the_bar() {
@@ -4611,12 +4268,9 @@ mod tests {
         }
     }
 
-    /// EVERY EARLIER `invoke` NAME RESOLVES OR IS RETIRED (SPEC19 §9: "add
-    /// aliases, never break a name an agent may already call"; design §4: a
-    /// row that went with nothing in its place answers `ERR retired: <what to
-    /// use>`). A name resolves to the action its canonical spelling names, or
-    /// it is retired with a replacement, and no name is both. The aliases the
-    /// Agents menu added land on the rows whose identity moved.
+    /// Every earlier `invoke` name resolves or is retired: a name resolves to
+    /// the action its canonical spelling names, or is retired with a replacement
+    /// (`ERR retired: <what to use>`), and no name is both.
     #[test]
     fn every_earlier_invoke_name_resolves_or_is_retired() {
         for name in EARLIER_INVOKE_NAMES {
@@ -4667,16 +4321,15 @@ mod tests {
                 "{retired}: the palette's lookup says so too"
             );
         }
-        // CONTROL: a live name is neither refused nor retired.
+        // Control: a live name is neither refused nor retired.
         assert_eq!(
             crate::control::control_media::invoke_refusal("NewTab"),
             None
         );
     }
 
-    /// THE AGENTS MENU (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4) sits
-    /// where an app's own menu goes, between View and Window, and holds its
-    /// rows in the design's order with their chords (⇧⌘J, ⌃⌘O, ⇧⌘L). Its
+    /// The Agents menu sits where an app's own menu goes, between View and Window,
+    /// and holds its rows in order with their chords (⇧⌘J, ⌃⌘O, ⇧⌘L). Its
     /// classification: Take Over and Hand Back are the person's own; Next
     /// That Needs You and Set Role… are `WriteInput` (they move focus or open
     /// an editor); every other row sees the whole Mac or fleet and is
@@ -4756,7 +4409,7 @@ mod tests {
         }
     }
 
-    /// THE PERSON'S HOLD PAIR reads the live projection: no person hold ⇒
+    /// The person's hold pair reads the live projection: no person hold ⇒
     /// Take Over live, Hand Back not; the person's hold ⇒ the other way. No
     /// session at all greys both with every other session row.
     #[test]
@@ -4780,7 +4433,7 @@ mod tests {
         set_active_tab_is_terminal(true);
     }
 
-    /// THE AGENTS ROWS GREY FROM THEIR LIVE BITS, as the palette's do: Next
+    /// The Agents rows grey from their live bits, as the palette's do: Next
     /// That Needs You only with a local need, Overview only with a window,
     /// Read the Fleet only in a fleet; Summarize greys with its block, and
     /// its tool tip says why, and its title names the fleet or this Mac.
@@ -4839,8 +4492,8 @@ mod tests {
         set_agents_live(AgentsLive::UNPUBLISHED);
     }
 
-    /// View ▸ Show Needs in Windows is CHECKABLE and reads its checkmark from
-    /// the published live state; it replaced the two presence rows.
+    /// View ▸ Show Needs in Windows is checkable and reads its checkmark from
+    /// the published live state.
     #[test]
     fn the_needs_row_is_checkable_from_the_live_state() {
         super::set_needs_in_windows(false);
@@ -4868,18 +4521,15 @@ mod tests {
         );
     }
 
-    /// THE NATIVE BAR SAYS WHAT THE PALETTE SAYS. The palette checkmarks Serious
-    /// Mode, Matrix Rain and Favourite This Kitty and greys Copy with no
-    /// selection, Show Next / Previous Tab with one tab and the Reopen rows with
-    /// nothing to reopen; the bar checked only the presence pair and left the
-    /// rest enabled, so a click did nothing and said nothing. Both now read the
-    /// same facts (`MenuLive`, published beside `PaletteLive`).
+    /// The native bar checks and greys what the palette does (Serious Mode, Matrix Rain and
+    /// Favourite This Kitty checkmarks; Copy, Show Next / Previous Tab and the Reopen rows
+    /// enabled bits), from the same facts (`MenuLive`, published beside `PaletteLive`).
     #[test]
     fn the_native_bar_checks_and_greys_what_the_palette_does() {
         use super::{MenuLive, menu_live, native_live_title, native_menu_checked, set_menu_live};
         set_active_tab_is_terminal(true);
         let before = menu_live();
-        // Nothing staged yet: the bar reads as it always did.
+        // Before the first publish: every row enabled.
         set_menu_live(MenuLive::UNPUBLISHED);
         assert_eq!(menu_live(), MenuLive::UNPUBLISHED);
         for a in [
@@ -4981,10 +4631,9 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// ROUND 18'S IDENTITY ROWS sit right under New Terminal Tab in the File
+    /// The identity rows sit right under New Terminal Tab in the File
     /// menu, with no key equivalents (choosing may create an identity), and
-    /// the File menu holds no submenu: File ▸ Driving went with the
-    /// connection presets.
+    /// the File menu holds no submenu.
     #[test]
     fn the_identity_rows_sit_under_new_terminal_tab() {
         let file = MENU_MODEL.iter().find(|s| s.title == "File").unwrap();
@@ -5084,9 +4733,8 @@ mod tests {
         set_active_tab_is_terminal(true);
         assert!(native_menu_action_enabled(MenuAction::ApplyUpdate));
 
-        // Tier-1 negative control: the modeled old predicate is not merely
-        // unexercised. With a native tab frontmost it disables the row, violates
-        // the obligation, and cannot reach decode/dispatch.
+        // Negative control: the modeled buggy predicate disables the row with a native tab
+        // frontmost, violating the obligation, and cannot reach decode/dispatch.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let mut disabled = buggy.init_state();
         assert!(buggy.fire("StageUpdate", &mut disabled));
@@ -5096,14 +4744,12 @@ mod tests {
         assert!(buggy.successors("DecodeApplyTag", &disabled).is_empty());
     }
 
-    /// THE MENU TREE, STRUCTURALLY — the `chrome` serialiser's lines over
-    /// section titles and row counts, so a label's rewording never churns it
-    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §10). One `menu "<title>":
-    /// …` line per section, in the standard Mac order with the app's own
-    /// Agents menu between View and Window; each line lists exactly the rows
-    /// its section offers here (the dynamic update row only while live); no
-    /// separator artifacts and no submenu (the bar is flat since File ▸
-    /// Driving went, 2026-10-16).
+    /// The menu tree, structurally — the `chrome` serialiser's lines over
+    /// section titles and row counts, so a label's rewording never churns it.
+    /// One `menu "<title>": …` line per section, in the standard Mac order with
+    /// the app's own Agents menu between View and Window; each line lists
+    /// exactly the rows its section offers here (the dynamic update row only
+    /// while live); no separator artifacts and no submenu.
     #[test]
     fn chrome_lines_render_titled_sections() {
         let lines = menu_chrome_lines(None, false);
@@ -5140,14 +4786,9 @@ mod tests {
         );
     }
 
-    /// The `chrome` verb's menu lines offer "Check for Updates…" exactly where an
-    /// updater exists ([`aterm_update::enabled`]), and the Version menu's install
-    /// row only where one exists AND the row is live — so they agree with
-    /// `controls menu` (the palette, which greys the first where there is no
-    /// updater and shows the second only while an update is staged or just
-    /// landed) and with `update status` (`no updater on this platform`).
-    /// Measured 2026-09-22 on Windows: both rows listed, neither actionable; and
-    /// until 2026-09-28 the install row was listed on Linux with nothing staged.
+    /// `chrome` offers "Check for Updates…" exactly where an updater exists
+    /// ([`aterm_update::enabled`]), and the Version menu's install row only there and only while
+    /// it is live, agreeing with `controls menu` (the palette) and `update status`.
     #[test]
     fn update_rows_are_not_offered_where_no_updater_exists() {
         let offered = |label: &str| {
@@ -5184,8 +4825,8 @@ mod tests {
         }
     }
 
-    /// The anti-shadowing key-equivalents the comments call load-bearing are transcribed
-    /// correctly (a wrong chord here silently shadows a primary keybinding on macOS).
+    /// The load-bearing key equivalents are transcribed correctly: a wrong chord silently
+    /// shadows a primary keybinding on macOS.
     #[test]
     fn critical_key_equivalents_are_correct() {
         let item = |action: MenuAction| {
@@ -5194,7 +4835,7 @@ mod tests {
                 .find_map(|(_, a, key, mods)| (a == action).then_some((key, mods)))
                 .unwrap_or_else(|| panic!("{action:?} not in MENU_MODEL"))
         };
-        // ⇧⌘O (must NOT be "d", which would shadow ⇧⌘D split — see the menu.rs comment).
+        // ⇧⌘O, not "d", which would shadow ⇧⌘D (Split Down).
         assert_eq!(
             item(MenuAction::ViewSessionInNewWindow),
             ("o", super::MenuMods::CommandShift)
@@ -5215,8 +4856,7 @@ mod tests {
             item(MenuAction::ToggleFullScreen),
             ("f", super::MenuMods::CommandControl)
         );
-        // ⌘, belongs to the Settings tab (the ONE settings surface); the
-        // aterm.toml escape hatch must NOT carry a chord that would shadow it.
+        // ⌘, is the Settings tab's; the aterm.toml escape hatch carries no chord to shadow it.
         assert_eq!(
             item(MenuAction::ToggleSettings),
             (",", super::MenuMods::Command)
@@ -5245,7 +4885,7 @@ mod tests {
         }
     }
 
-    /// THE SIGNATURE FOR EVERY KIND OF BUILD, on both rungs, composed from
+    /// The signature for every kind of build, on both rungs, composed from
     /// synthetic facts — the test binary is one dev build, so this is the only
     /// place a release, a dirty tree and a build without git are exercised.
     #[test]
@@ -5400,8 +5040,8 @@ mod tests {
         assert!(short.contains('*'), "a dirty short rung keeps `*`: {short}");
     }
 
-    /// The label opens About — and the update details only where an update is
-    /// staged AND this platform has an updater to describe. It never installs.
+    /// The label opens About — and the update details only where an update is staged and this
+    /// platform has an updater to describe. It never installs.
     #[test]
     fn version_slot_click_opens_about_and_details_only_where_offered() {
         use super::{MenuAction, version_slot_click};
@@ -5451,12 +5091,9 @@ mod tests {
         assert_eq!(super::handoff_target_bar_title(b, false, None), None);
     }
 
-    /// THE BAR NEVER OFFERS THE BUILD IT IS RUNNING (2026-09-24). A staged record
-    /// for build B read by a process running B — the build a handoff landed it on,
-    /// or one a newer install overtook — is not an update: the title is plain
-    /// `v<version>` and the submenu has no install row. A strictly newer build is
-    /// still offered, and a running build the process cannot name (`0`, a dev
-    /// binary without a build number) filters nothing.
+    /// A staged record for the running build or an older one is not offered (plain title, no
+    /// install row); a strictly newer build is, and a running build of `0` (a dev binary
+    /// without a build number) filters nothing.
     #[test]
     fn the_version_menu_never_offers_the_running_build() {
         let running = 1_790_278_596;
@@ -5488,13 +5125,8 @@ mod tests {
         assert_eq!(super::staged_for_version_menu(None, running), None);
     }
 
-    /// The PERSISTENT menu-bar arrow tracks a STAGED update ONLY — never the post-update
-    /// `realized` celebration. This is the fix for "the Update icon in the menu bar is
-    /// NOT resolved": before, a freshly-applied update lit the SAME bar arrow for the
-    /// full realized TTL (10 min), indistinguishable from the pre-update "waiting" arrow,
-    /// so an update that DID land still looked unresolved. Now an apply re-execs into the
-    /// staged build (`staged` → `None`) and the bar arrow clears immediately; the "just
-    /// updated" celebration lives only in self-dismissing surfaces.
+    /// The menu-bar arrow tracks a staged update only, never the post-update `realized` state,
+    /// so an apply that re-execs into the staged build clears it at once.
     #[test]
     fn menu_bar_arrow_tracks_staged_not_realized() {
         // Action-needed staged update -> arrow.
@@ -5502,7 +5134,7 @@ mod tests {
             super::bar_title_attention(true, false, false),
             "staged shows the arrow"
         );
-        // Fresh post-update celebration is NOT a persistent bar badge.
+        // The post-update celebration is not a persistent bar badge.
         assert!(
             !super::bar_title_attention(false, false, true),
             "realized alone must not light the persistent bar arrow"
@@ -5548,16 +5180,10 @@ mod tests {
         );
     }
 
-    /// A QUIT THAT REACHES AN UPDATE'S SUCCESSOR BEFORE COMMIT IS ANSWERED
-    /// (2026-09-28). The successor's `terminate:` hook admitted it — the arbiter
-    /// went pending and AppKit was answered Cancel — and the event loop then
-    /// SWALLOWED its wake, as it swallows every structural wake before Commit
-    /// (`App::drops_wake_before_commit`). Nothing ever resolved that generation, so
-    /// every later request met `DeferExisting` and was answered Cancel too: the
-    /// committed successor cancelled every logout, restart and shutdown for the
-    /// rest of its life. The drop now cancels the generation (AppKit already
-    /// cancelled it; a replay at Commit would quit aterm after the logout was
-    /// aborted), the system's mark goes with it, and the next request dispatches.
+    /// A quit that reaches an update's successor before Commit is resolved: the event loop
+    /// swallows the wake (`App::drops_wake_before_commit`), so the drop cancels the generation
+    /// (AppKit already answered Cancel) and its system mark, and the next request dispatches
+    /// instead of meeting `DeferExisting` for the rest of the process's life.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_dropped_candidate_terminate_frees_the_arbiter() {
@@ -5619,10 +5245,8 @@ mod tests {
         assert!(!arbiter.is_current(second));
     }
 
-    /// Help's destination must survive the gate `open_url_external` trusts its
-    /// callers to have run: off macOS the row now actually opens a browser, and
-    /// the URL it hands the OS shell must be one `is_safe_url` accepts —
-    /// http(s)/mailto only, no control bytes, no `file://`.
+    /// Help's destination passes `is_safe_url`, the gate `open_url_external` trusts its callers
+    /// to have run.
     #[test]
     fn the_help_destination_passes_the_url_gate() {
         let url = super::help_url();
@@ -5634,12 +5258,9 @@ mod tests {
 
     // ---- the System Settings deep link (design §3.4, §3.7, Appendix A.2) --------
 
-    /// THE SCHEME HAS A DOT. `x-apple.systempreferences` is the real scheme;
-    /// `x-apple-systempreferences` (hyphen) is a different string, and it is the
-    /// one the link allowlist's rejection list names. A one-character slip here
-    /// is invisible on screen and turns every deep link into a no-op, so every
-    /// candidate is pinned — modern id, legacy alias and the un-anchored root
-    /// alike.
+    /// Every candidate uses the dotted `x-apple.systempreferences` scheme. The hyphenated
+    /// spelling is a different string (the one the link allowlist's rejection list names), and a
+    /// one-character slip turns every deep link into a no-op.
     #[test]
     fn every_settings_deep_link_uses_the_dotted_scheme() {
         for pane in super::PrivacyPane::ALL {
@@ -5668,14 +5289,9 @@ mod tests {
         );
     }
 
-    /// NEVER A DEAD END. None of these URLs is Apple-documented, so the last
-    /// candidate must be a page with NO anchor at all: if both anchors stop
-    /// resolving, Privacy & Security still opens and the caller falls back to
-    /// the route in words. Every pane must degrade to the SAME root — the
-    /// sections live on the one page — and only the three registered anchors
-    /// may ever appear, never a per-folder pseudo-anchor
-    /// (`Privacy_DocumentsFolder` and its siblings are not anchors; Appendix
-    /// A.2).
+    /// The last candidate is the unanchored Privacy & Security page, the same for every pane,
+    /// so the deep link is never a dead end; only the three registered anchors ever ship
+    /// (`Privacy_DocumentsFolder` and its siblings are not anchors).
     #[test]
     fn the_last_candidate_is_the_unanchored_pane_root() {
         let fda = super::privacy_settings_urls(super::PrivacyPane::FullDiskAccess);
@@ -5710,14 +5326,9 @@ mod tests {
         }
     }
 
-    /// THE ALLOWLIST STAYS CLOSED. `is_safe_url` decides what a Cmd-clicked
-    /// hyperlink out of PROGRAM OUTPUT may open, and it must keep rejecting
-    /// every one of these: a Settings pane a program can raise is a consent
-    /// surface that program controls. The deep link is safe for the opposite
-    /// reason — it is a compiled-in constant behind an owner gesture in aterm's
-    /// own UI — and it reaches `NSWorkspace` on its own path, so widening the
-    /// allowlist is never the way to make it work. This test fails the moment
-    /// someone tries.
+    /// `is_safe_url` keeps rejecting every deep link: a pane a program can raise is a consent
+    /// surface that program controls. The deep link has its own path to `NSWorkspace`, so the
+    /// allowlist is never widened for it.
     #[test]
     fn program_output_still_cannot_open_a_settings_pane() {
         for pane in super::PrivacyPane::ALL {

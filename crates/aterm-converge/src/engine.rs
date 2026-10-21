@@ -5,7 +5,8 @@
 //! `after` edges give (design §3.3).
 
 use crate::Item;
-use crate::model::{Explain, ItemReport, Mode, Outcome, Probe, Remedy, StoodAside};
+use crate::model::{Explain, ItemReport, Mode, Outcome, Probe, Remedy, Requires, StoodAside};
+use crate::scope::Scope;
 use std::fmt;
 
 /// Where the engine records a value before it changes it.
@@ -181,15 +182,64 @@ pub fn run_with(
     journal: &mut dyn Journal,
     on_row: &mut dyn FnMut(&ItemReport),
 ) -> Result<Vec<ItemReport>, Refusal> {
+    run_scoped(items, mode, Scope::EVERY, journal, on_row)
+}
+
+/// [`run_with`] within what a surface allows (design §3.2, [`Scope`]).
+///
+/// # Errors
+/// As [`run`].
+pub fn run_scoped(
+    items: &[Box<dyn Item + '_>],
+    mode: Mode,
+    scope: Scope,
+    journal: &mut dyn Journal,
+    on_row: &mut dyn FnMut(&ItemReport),
+) -> Result<Vec<ItemReport>, Refusal> {
     let order = order(items)?;
+    // Outside a shell of the account's own (root, another `$HOME`, a private state root),
+    // an account item is read and its change named, never made (design §3.2).
+    let hold = scope.not_own_account.map(crate::scope::not_own_account);
     let mut rows: Vec<ItemReport> = Vec::with_capacity(items.len());
     for index in order {
         let item = items[index].as_ref();
+        // Where a console item may not run, nothing of it is read (a workstation item over
+        // SSH reads another login's session otherwise).
+        if item.requires() == Requires::Console && !scope.admits(Requires::Console) {
+            let why = scope.not_own_account.map_or_else(
+                || crate::scope::NOT_AT_CONSOLE.to_owned(),
+                crate::scope::not_own_account,
+            );
+            let mut row = blank(item);
+            row.outcome = Outcome::Blocked;
+            row.explain = Some(item.explain(&Probe::Blocked { why: why.clone() }));
+            row.why = Some(why);
+            on_row(&row);
+            rows.push(row);
+            continue;
+        }
+        // A class this surface does not apply is planned in an apply run: probed, never
+        // applied, and anything after it waits.
+        let mode = if mode == Mode::Apply && !scope.applies(item.class()) {
+            Mode::Plan
+        } else {
+            mode
+        };
         let blocker = (mode == Mode::Apply)
             .then(|| unmet_prerequisite(item, &rows))
             .flatten();
         let row = match blocker {
-            Some(on) => {
+            // The prerequisite stood aside (a lock, the network): so does what waits for
+            // it, with the same line, so a surface's 75/69 counts it.
+            Some((on, Some(aside))) => {
+                let mut row = blank(item);
+                row.outcome = Outcome::Blocked;
+                row.why = Some(format!("waits for {on}: {}", aside.why()));
+                row.explain = Some(explain_aside(item, &aside));
+                row.stood_aside = Some(aside);
+                row
+            }
+            Some((on, None)) => {
                 let why = format!("waits for {on}");
                 let mut row = blank(item);
                 row.outcome = Outcome::Blocked;
@@ -200,7 +250,7 @@ pub fn run_with(
                 row.why = Some(why);
                 row
             }
-            None => run_one(item, mode, journal, &rows),
+            None => run_one(item, mode, journal, &rows, hold.as_deref()),
         };
         on_row(&row);
         rows.push(row);
@@ -208,12 +258,16 @@ pub fn run_with(
     Ok(rows)
 }
 
-/// The first earlier row `item` must wait for that did not end `Ok` or `Changed`.
-fn unmet_prerequisite(item: &dyn Item, rows: &[ItemReport]) -> Option<String> {
+/// The first earlier row `item` must wait for that did not end `Ok` or `Changed`, and
+/// what it stood aside on, if it did.
+fn unmet_prerequisite(
+    item: &dyn Item,
+    rows: &[ItemReport],
+) -> Option<(String, Option<StoodAside>)> {
     for want in item.after() {
         for row in rows.iter().filter(|r| names(&want, &r.id)) {
             if !matches!(row.outcome, Outcome::Ok | Outcome::Changed) {
-                return Some(row.id.clone());
+                return Some((row.id.clone(), row.stood_aside.clone()));
             }
         }
     }
@@ -242,19 +296,36 @@ fn blank(item: &dyn Item) -> ItemReport {
 }
 
 /// One item through probe, plan, apply and read-back; `earlier` are the rows before it.
+/// With `hold`, the change the item would make is named and `Blocked` with that line, and
+/// nothing of it is applied, refreshed or journaled.
 fn run_one(
     item: &dyn Item,
     mode: Mode,
     journal: &mut dyn Journal,
     earlier: &[ItemReport],
+    hold: Option<&str>,
 ) -> ItemReport {
     let mut row = blank(item);
     // The probe the row's explanation reads: the first, or the read-back that judged it.
     let mut last = item.probe();
     match last.clone() {
         Probe::Ok { now } => {
-            row.to = Some(now);
-            if mode == Mode::Apply
+            row.to = Some(now.clone());
+            // A refresh that changes the machine is journaled before it runs, as an apply
+            // is ([`Item::refresh_changes`]); a refused record leaves it unrun.
+            let recorded = if mode == Mode::Apply && hold.is_none() && item.refresh_changes() {
+                journal
+                    .before_change(&row.id, &now, &now, item.revert().as_deref())
+                    .map_err(|why| format!("not refreshed: the journal refused the record ({why})"))
+            } else {
+                Ok(())
+            };
+            if let Err(why) = recorded {
+                row.outcome = Outcome::Failed;
+                last = Probe::Blocked { why: why.clone() };
+                row.why = Some(why);
+            } else if mode == Mode::Apply
+                && hold.is_none()
                 && let Some(refreshed) = item.refresh()
             {
                 match refreshed {
@@ -327,8 +398,21 @@ fn run_one(
             row.from = Some(from.clone());
             row.to = Some(to.clone());
             row.revert = item.revert();
-            if mode == Mode::Plan {
+            if let Some(why) = hold {
+                // Named, never made: not even a plan, since no apply from here makes it.
+                row.outcome = Outcome::Blocked;
+                last = Probe::Blocked {
+                    why: why.to_owned(),
+                };
+                row.why = Some(why.to_owned());
+            } else if mode == Mode::Plan {
                 row.outcome = Outcome::Planned;
+            } else if let Some(aside) = item.stands_aside() {
+                // It stands aside before it acts (`standing_aside`: a lock the change
+                // needs is held): no journal line for a change nobody makes.
+                row.outcome = Outcome::Blocked;
+                row.why = Some(aside.why().to_owned());
+                row.stood_aside = Some(aside);
             } else if let Err(why) =
                 journal.before_change(&row.id, &from, &to, row.revert.as_deref())
             {
@@ -392,13 +476,17 @@ fn run_one(
 
 /// A stood-aside row's explanation: the line the apply stood aside with, and the remedy
 /// its kind gives. Offline, the next pass once the network is back
-/// ([`Remedy::Network`]); a lock, the item's own remedy for a change put off to its next
-/// run.
+/// ([`Remedy::Network`]); a lock or a wait on someone else, the item's own remedy for a
+/// change put off to its next run; a missing permission, the item's remedy for that
+/// precondition.
 fn explain_aside(item: &dyn Item, aside: &StoodAside) -> Explain {
     let why = aside.why().to_owned();
     let remedy = match aside {
         StoodAside::Offline(_) => Remedy::Network,
-        StoodAside::Lock(_) => item.explain(&Probe::Deferred { why: why.clone() }).remedy,
+        StoodAside::Lock(_) | StoodAside::Waiting(_) => {
+            item.explain(&Probe::Deferred { why: why.clone() }).remedy
+        }
+        StoodAside::Permission(_) => item.explain(&Probe::Blocked { why: why.clone() }).remedy,
     };
     Explain { why, remedy }
 }
@@ -1082,6 +1170,13 @@ pub(crate) mod tests {
         Remedy::Command("aterm pkg install --default-set".into())
     }
 
+    fn permission() -> Remedy {
+        Remedy::Person {
+            pane: "Privacy & Security > Accessibility".into(),
+            how: "allow aterm to control account Settings".into(),
+        }
+    }
+
     impl Item for Aside {
         fn id(&self) -> String {
             self.0.id()
@@ -1110,6 +1205,10 @@ pub(crate) mod tests {
                     why: format!("{probe:?}"),
                     remedy: retry(),
                 },
+                Probe::Blocked { .. } => Explain {
+                    why: format!("{probe:?}"),
+                    remedy: permission(),
+                },
                 _ => explained(probe),
             }
         }
@@ -1131,6 +1230,11 @@ pub(crate) mod tests {
                 75,
                 retry(),
             ),
+            (
+                StoodAside::Permission("Accessibility permission has not been granted".into()),
+                77,
+                permission(),
+            ),
         ] {
             // The second probe would read Ok: a stood-aside apply must not reach it.
             let item = Scripted::new(vec![change(), ok()], Ok(()));
@@ -1145,7 +1249,8 @@ pub(crate) mod tests {
             );
             assert_eq!(probed.load(Ordering::SeqCst), 1, "{aside:?} was read back");
             // Explained by the line it stood aside with, never by the change it planned:
-            // offline waits for the network, a lock for the item's own next run.
+            // offline waits for the network, a lock for the item's own next run,
+            // and permission for the item's blocked-precondition remedy.
             assert_eq!(
                 rows[0].explain,
                 Some(Explain {

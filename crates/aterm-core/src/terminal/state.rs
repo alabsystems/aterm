@@ -309,7 +309,8 @@ pub struct Terminal {
     pub(super) marks_state: MarksState,
     /// Taskbar progress state (ConEmu OSC 9;4), for the host's taskbar/dock.
     pub(super) taskbar_progress: Option<TaskbarProgress>,
-    /// The program's own state report (OSC 7501, [`super::program_state`]), for display.
+    /// The program's own state report (OSC 7501, [`super::program_state`]), a claim the
+    /// host shows and logs.
     pub(super) program_state: super::program_state::ProgramStateReport,
     /// Kitty keyboard protocol state.
     pub(super) kitty_keyboard: KittyKeyboardState,
@@ -463,6 +464,8 @@ impl Terminal {
 
     /// The active grid, mutably.
     pub fn grid_mut(&mut self) -> &mut Grid {
+        // The caller may replace or regrid it without a parsed close.
+        self.transient.sync_end_caret = None;
         &mut self.grid
     }
 
@@ -560,6 +563,24 @@ impl Terminal {
     #[must_use]
     pub fn sync_end_seq(&self) -> u64 {
         self.transient.sync_end_seq
+    }
+
+    /// Cursor cell at the latest ordered synchronized-output close, on this
+    /// screen and grid. Read with [`Self::sync_end_seq`] and [`Self::cursor`]:
+    /// an advanced close count alone does not prove the current cursor ended
+    /// that frame, since later unbracketed output may already have moved it.
+    /// A timeout, reset, screen replacement or resize invalidates the reading;
+    /// it is transient and a restored engine starts with none.
+    #[must_use]
+    pub fn sync_end_caret(&self) -> Option<(u16, u16)> {
+        self.transient
+            .sync_end_caret
+            .filter(|end| {
+                end.seq == self.transient.sync_end_seq
+                    && end.screen == self.transient.screen_replaced
+                    && end.grid == (self.grid.rows(), self.grid.cols())
+            })
+            .map(|end| end.caret)
     }
 
     /// Whether the open synchronized-output window has accepted a complete PTY action since

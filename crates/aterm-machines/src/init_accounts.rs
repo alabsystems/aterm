@@ -15,6 +15,8 @@ use crate::plist::{self, Entries};
 use crate::port::{Cmd, System};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 const STORE: &str = "Library/IdentityServices/Persistence/accounts.data";
 const GZIP: &str = "/usr/bin/gzip";
@@ -57,18 +59,12 @@ impl Service {
             Self::FaceTime => "com.apple.imservice.ids.FaceTime",
         }
     }
-
-    const fn settings(self) -> &'static str {
-        match self {
-            Self::Messages => "Messages > Settings > iMessage > Sign Out",
-            Self::FaceTime => "FaceTime > Settings > General > Sign Out",
-        }
-    }
 }
 
 struct SignOut {
     service: Service,
     user: User,
+    blocked: Mutex<Option<String>>,
 }
 
 /// The two account items for each selected local user.
@@ -85,6 +81,7 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
             items.push(Box::new(SignOut {
                 service,
                 user: user.clone(),
+                blocked: Mutex::new(None),
             }));
         }
     }
@@ -126,47 +123,46 @@ impl Item for SignOut {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
         // This does not prompt for or change Accessibility permission. In particular,
         // already-signed-out users never launch either app or reach this preflight.
-        let permission = Cmd::new(OSASCRIPT)
-            .args(["-l", "JavaScript", "-e", AX_PREFLIGHT])
-            .as_user(&self.user)
-            .in_session();
-        let answer = sys.run_complete_stdout(&permission).map_err(|_| {
-            "could not check Accessibility permission for account sign-out".to_owned()
-        })?;
-        if !answer.success() || answer.out().trim() != "true" {
-            return Err(format!(
-                "account sign-out needs Accessibility permission for aterm; or use {}",
-                self.service.settings()
-            ));
+        if !accessibility_ready_for(sys, Some(&self.user), Some(deadline))? {
+            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some("macOS Accessibility permission for aterm is unavailable; account setup will retry automatically".into());
+            return Ok(());
         }
-        let command = signout_cmd(&self.user, self.service);
-        let ran = sys.run_complete_stdout(&command).map_err(|_| {
-            format!(
-                "{} sign-out could not run; use {}",
-                self.service.name(),
-                self.service.settings()
-            )
-        })?;
+        let labels = localized_labels(sys, &self.user, self.service, Some(deadline))?;
+        let command = limited(
+            signout_cmd(&self.user, self.service, &labels),
+            Some(deadline),
+        )?;
+        let ran = sys
+            .run_complete_stdout(&command)
+            .map_err(|_| format!("{} sign-out could not run", self.service.name()))?;
+        if ran.success() && ran.out().trim() == "permission-blocked" {
+            *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some("macOS Automation permission to control System Events is unavailable; account setup will retry automatically".into());
+            return Ok(());
+        }
         if !ran.success() || ran.out().trim() != "sign-out-requested" {
             // An AppleEvent refusal can contain personal UI text: never forward it.
             return Err(format!(
-                "{} sign-out needs its Settings controls and Automation permission for System Events; use {}",
-                self.service.name(),
-                self.service.settings()
+                "{} account Settings controls were unavailable; sign-out remains unverified",
+                self.service.name()
             ));
         }
         // Deregistration and cfprefsd updates can follow the UI acknowledgment. The
-        // wait is at most 60 registration attempts, not a shared minute deadline:
-        // each probe and sleep retains the port's own command budget. Only the
-        // same durable registration probe ends this wait successfully.
+        // UI work, registration reads and sleeps share one minute. Each child
+        // receives only the remaining budget, so a stalled read cannot restart
+        // the clock. Only durable deregistration ends the wait successfully.
         for attempt in 0..60 {
-            if !registered(sys, &self.user, self.service)? {
+            if !registered_until(sys, &self.user, self.service, Some(deadline))? {
                 return Ok(());
             }
             if attempt != 59 {
-                let wait = Cmd::new("/bin/sleep").arg("1").as_user(&self.user);
+                let wait = limited(
+                    Cmd::new("/bin/sleep").arg("1").as_user(&self.user),
+                    Some(deadline),
+                )?;
                 let ran = sys
                     .run(&wait)
                     .map_err(|_| "could not await account deregistration".to_owned())?;
@@ -177,6 +173,14 @@ impl Item for SignOut {
         }
         Err("the account remains registered after Sign Out; verify its account settings".into())
     }
+
+    fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
+        self.blocked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .map(aterm_converge::StoodAside::Permission)
+    }
 }
 
 fn store_path(user: &User) -> PathBuf {
@@ -184,6 +188,15 @@ fn store_path(user: &User) -> PathBuf {
 }
 
 fn registered(sys: &dyn System, user: &User, service: Service) -> Result<bool, String> {
+    registered_until(sys, user, service, None)
+}
+
+fn registered_until(
+    sys: &dyn System,
+    user: &User,
+    service: Service,
+    deadline: Option<Instant>,
+) -> Result<bool, String> {
     let path = store_path(user);
     let persisted = match sys.stat(&path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
@@ -192,16 +205,22 @@ fn registered(sys: &dyn System, user: &User, service: Service) -> Result<bool, S
             return Err("persisted account store is not a regular file".into());
         }
         Ok(_) => {
-            let gzip = Cmd::new(GZIP).args(["-dc", "--"]).arg(path).as_user(user);
+            let gzip = limited(
+                Cmd::new(GZIP).args(["-dc", "--"]).arg(path).as_user(user),
+                deadline,
+            )?;
             let unpacked = sys
                 .run_complete_stdout(&gzip)
                 .map_err(|_| "cannot read the complete persisted account store".to_owned())?;
             if !unpacked.success() {
                 return Err("cannot decompress the persisted account store".into());
             }
-            let convert = Cmd::new(PLUTIL)
-                .args(["-convert", "xml1", "-o", "-", "--", "-"])
-                .as_user(user);
+            let convert = limited(
+                Cmd::new(PLUTIL)
+                    .args(["-convert", "xml1", "-o", "-", "--", "-"])
+                    .as_user(user),
+                deadline,
+            )?;
             let xml = sys
                 .run_complete_stdout_input(&convert, &unpacked.stdout)
                 .map_err(|_| "cannot decode the complete persisted account store".to_owned())?;
@@ -216,9 +235,12 @@ fn registered(sys: &dyn System, user: &User, service: Service) -> Result<bool, S
     };
     // Check cfprefsd's live account lists as well as the durable account store. Neither
     // an empty exported domain nor an offline connection alone establishes sign-out.
-    let cmd = Cmd::new("/usr/bin/defaults")
-        .args(["export", service.domain(), "-"])
-        .as_user(user);
+    let cmd = limited(
+        Cmd::new("/usr/bin/defaults")
+            .args(["export", service.domain(), "-"])
+            .as_user(user),
+        deadline,
+    )?;
     let ran = sys
         .run_complete_stdout(&cmd)
         .map_err(|_| "cannot read the complete account service preferences".to_owned())?;
@@ -284,10 +306,183 @@ fn persisted_registration(entries: &Entries, service: Service) -> Result<bool, S
 }
 
 const AX_PREFLIGHT: &str = "ObjC.import('ApplicationServices'); $.AXIsProcessTrusted()";
+const AX_REQUEST: &str = "ObjC.import('Foundation'); ObjC.import('ApplicationServices'); $.AXIsProcessTrustedWithOptions($.NSDictionary.dictionaryWithObjectForKey($.NSNumber.numberWithBool(true), $.kAXTrustedCheckOptionPrompt))";
 
-fn signout_cmd(user: &User, service: Service) -> Cmd {
+/// Whether the shared account plan found a registration that needs sign-out.
+/// Already-signed-out logins and unreadable account stores never request consent.
+///
+/// # Errors
+/// The console account or the shared plan cannot be resolved.
+pub fn accessibility_needed(sys: &dyn System) -> Result<bool, String> {
+    let rows = crate::init::run_workstation(
+        sys,
+        crate::init::WorkstationGroup::Accounts,
+        crate::model::Mode::Plan,
+    )?;
+    Ok(rows
+        .iter()
+        .any(|row| row.outcome == crate::model::Outcome::Planned))
+}
+
+/// Ask macOS to show its native Accessibility consent once for automatic setup.
+/// The caller persists that request before invoking this function. Apple's prompt
+/// is asynchronous: a false return means permission has not yet been granted.
+///
+/// # Errors
+/// The bounded trust request could not run or returned an unknown result.
+pub fn request_accessibility(sys: &dyn System) -> Result<bool, String> {
+    let request = Cmd::new(OSASCRIPT)
+        .args(["-l", "JavaScript", "-e", AX_REQUEST])
+        .budget(Duration::from_secs(10));
+    let answer = sys.run_complete_stdout(&request).map_err(|_| {
+        "could not request Accessibility permission for account sign-out".to_owned()
+    })?;
+    if !answer.success() {
+        return Err("could not request Accessibility permission for account sign-out".into());
+    }
+    trust_answer(answer.out().trim())
+}
+
+/// Inspect Accessibility trust without requesting permission or opening an app.
+/// First-run setup uses this to retry promptly after the owner grants consent.
+///
+/// # Errors
+/// The OS trust query could not run or returned an unknown result.
+pub fn accessibility_ready(sys: &dyn System) -> Result<bool, String> {
+    accessibility_ready_for(sys, None, None)
+}
+
+fn accessibility_ready_for(
+    sys: &dyn System,
+    user: Option<&User>,
+    deadline: Option<Instant>,
+) -> Result<bool, String> {
+    let mut permission = Cmd::new(OSASCRIPT).args(["-l", "JavaScript", "-e", AX_PREFLIGHT]);
+    if let Some(user) = user {
+        permission = permission.as_user(user).in_session();
+    }
+    let answer = sys
+        .run_complete_stdout(&limited(permission, deadline)?)
+        .map_err(|_| "could not check Accessibility permission for account sign-out".to_owned())?;
+    if !answer.success() {
+        return Err("could not check Accessibility permission for account sign-out".into());
+    }
+    trust_answer(answer.out().trim())
+}
+
+fn trust_answer(answer: &str) -> Result<bool, String> {
+    match answer {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err("Accessibility trust query returned an unknown result".into()),
+    }
+}
+
+fn limited(cmd: Cmd, deadline: Option<Instant>) -> Result<Cmd, String> {
+    let Some(deadline) = deadline else {
+        return Ok(cmd);
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("account sign-out exceeded its one-minute deadline".into());
+    }
+    let budget = cmd.budget.min(remaining);
+    Ok(cmd.budget(budget))
+}
+
+#[derive(Clone)]
+struct Labels {
+    panes: Vec<String>,
+    sign_out: Vec<String>,
+}
+
+fn labels_cmd(user: &User, service: Service) -> Cmd {
     Cmd::new(OSASCRIPT)
-        .args(["-e", SIGN_OUT, "--", service.name()])
+        .args([
+            "-l",
+            "JavaScript",
+            "-e",
+            LOCALIZED_LABELS,
+            "--",
+            service.name(),
+        ])
+        .as_user(user)
+}
+
+fn localized_labels(
+    sys: &dyn System,
+    user: &User,
+    service: Service,
+    deadline: Option<Instant>,
+) -> Result<Labels, String> {
+    let answer = sys
+        .run_complete_stdout(&limited(labels_cmd(user, service), deadline)?)
+        .map_err(|_| {
+            "could not read account Settings labels from the installed Apple app".to_owned()
+        })?;
+    if !answer.success() {
+        return Err("the installed app's account Settings labels are unsupported".into());
+    }
+    let value: aterm_json::Value = aterm_json::from_slice(&answer.stdout)
+        .map_err(|_| "unrecognized account Settings labels".to_owned())?;
+    let read = |key: &str| -> Result<Vec<String>, String> {
+        let labels = value[key]
+            .as_array()
+            .ok_or("account Settings label list is missing")?;
+        if labels.is_empty() || labels.len() > 128 {
+            return Err("account Settings label list is unsupported".into());
+        }
+        labels
+            .iter()
+            .map(|label| {
+                label
+                    .as_str()
+                    .filter(|s| !s.is_empty() && s.len() <= 512 && !s.contains(['\r', '\n']))
+                    .map(str::to_owned)
+                    .ok_or_else(|| "account Settings label is unsupported".into())
+            })
+            .collect()
+    };
+    Ok(Labels {
+        panes: read("panes")?,
+        sign_out: read("sign_out")?,
+    })
+}
+
+// Read only trusted bundle localization tables. Collecting every translation
+// also covers per-app language overrides; no account UI or identifiers are read.
+const LOCALIZED_LABELS: &str = r#"ObjC.import('Foundation');
+function labels(path, key) {
+    const table = $.NSDictionary.dictionaryWithContentsOfFile(path);
+    if (!table || table.isNil()) throw Error('label table unavailable');
+    const entries = ObjC.deepUnwrap(table);
+    const values = Object.values(entries).map(x => x && typeof x === 'object' ? x[key] : null)
+        .filter(x => typeof x === 'string' && x.length > 0);
+    if (values.length === 0) throw Error('label key unavailable');
+    return [...new Set(values)].sort();
+}
+function run(argv) {
+    if (argv[0] === 'Messages') {
+        const path = '/System/Applications/Messages.app/Contents/PlugIns/MessagesAppKitBridge.bundle/Contents/Resources/MessagesAppKitBridgeLocalizable.loctable';
+        return JSON.stringify({panes: labels(path, 'SETTINGS_TAB_IMESSAGE'), sign_out: labels(path, 'IMESSAGE_SIGN_OUT_BUTTON_SIGN_OUT')});
+    }
+    if (argv[0] === 'FaceTime') {
+        const path = '/System/iOSSupport/System/Library/PrivateFrameworks/FaceTimeSettingsUI.framework/Resources/Localizable.loctable';
+        return JSON.stringify({panes: labels(path, 'GENERAL_TAB_TITLE'), sign_out: labels(path, 'SIGN_OUT_BUTTON_TEXT')});
+    }
+    throw Error('unsupported app');
+}"#;
+
+fn signout_cmd(user: &User, service: Service, labels: &Labels) -> Cmd {
+    Cmd::new(OSASCRIPT)
+        .args([
+            "-e",
+            SIGN_OUT,
+            "--",
+            service.name(),
+            &labels.panes.join("\n"),
+            &labels.sign_out.join("\n"),
+        ])
         .as_user(user)
         .in_session()
 }
@@ -296,57 +491,58 @@ fn signout_cmd(user: &User, service: Service) -> Cmd {
 // Never use Messages' `logout`: it disconnects accounts without removing registration.
 // Apple documents these controls at support.apple.com/guide/messages/ichte16154fb/mac
 // and support.apple.com/guide/facetime/fctme7243ba3/mac.
-const SIGN_OUT: &str = r#"on run argv
+const SIGN_OUT: &str = r#"property stopAt : missing value
+on run argv
     set appName to item 1 of argv
+    set paneNames to paragraphs of item 2 of argv
+    set signOutNames to paragraphs of item 3 of argv
+    set deadline to (current date) + 40
+    set my stopAt to deadline
+    with timeout of 3 seconds
     if appName is not "Messages" and appName is not "FaceTime" then error "unsupported app"
-    tell application "System Events"
-        set priorApp to name of first application process whose frontmost is true
-        set wasRunning to exists process appName
-    end tell
     set settingsWindow to missing value
     set closeSettings to false
-    if appName is "Messages" then
-        set paneName to "iMessage"
-    else
-        set paneName to "General"
-    end if
+    set priorApp to missing value
+    set wasRunning to true
     try
+        tell application "System Events"
+            set priorApp to name of first application process whose frontmost is true
+            set wasRunning to exists process appName
+        end tell
         tell application appName to activate
-        set settingsMenu to missing value
+        set settingsReady to false
         repeat 120 times
+            my checkDeadline(deadline)
             tell application "System Events"
                 if exists process appName then
                     tell process appName
-                        if exists menu bar 1 then
-                            if exists menu item "Settings…" of menu appName of menu bar item appName of menu bar 1 then
-                                set candidateMenu to menu item "Settings…" of menu appName of menu bar item appName of menu bar 1
-                                if enabled of candidateMenu then set settingsMenu to candidateMenu
-                            end if
-                        end if
+                        if exists menu bar 1 then set settingsReady to true
                     end tell
                 end if
             end tell
-            if settingsMenu is not missing value then exit repeat
+            if settingsReady then exit repeat
             delay 0.1
         end repeat
-        if settingsMenu is missing value then error "account Settings menu unavailable"
-        set priorSettings to my accountSettings(appName, paneName)
+        if settingsReady is false then error "account Settings menu unavailable"
+        set priorSettings to my accountSettings(appName, paneNames)
         set closeSettings to priorSettings is missing value
         tell application "System Events"
-            click settingsMenu
+            tell process appName to keystroke "," using command down
         end tell
         repeat 120 times
-            set settingsWindow to my accountSettings(appName, paneName)
+            my checkDeadline(deadline)
+            set settingsWindow to my accountSettings(appName, paneNames)
             if settingsWindow is not missing value then exit repeat
             delay 0.1
         end repeat
         if settingsWindow is missing value then error "account Settings window unavailable"
-        set paneButton to my namedButton(settingsWindow, paneName)
+        set paneButton to my namedButton(settingsWindow, paneNames)
         if paneButton is missing value then error "account settings pane unavailable"
         tell application "System Events" to click paneButton
         set signOutButton to missing value
         repeat 120 times
-            set signOutButton to my namedButton(settingsWindow, "Sign Out")
+            my checkDeadline(deadline)
+            set signOutButton to my namedButton(settingsWindow, signOutNames)
             if signOutButton is not missing value then exit repeat
             delay 0.1
         end repeat
@@ -354,16 +550,17 @@ const SIGN_OUT: &str = r#"on run argv
         tell application "System Events" to click signOutButton
         set acknowledged to false
         repeat 120 times
+            my checkDeadline(deadline)
             tell application "System Events"
                 if exists sheet 1 of settingsWindow then
-                    set confirmButton to my namedButton(sheet 1 of settingsWindow, "Sign Out")
+                    set confirmButton to my namedButton(sheet 1 of settingsWindow, signOutNames)
                     if confirmButton is not missing value then
                         click confirmButton
                         set acknowledged to true
                     end if
                 else if not (exists settingsWindow) then
                     set acknowledged to true
-                else if my existingButton(settingsWindow, "Sign Out") is missing value then
+                else if my existingButton(settingsWindow, signOutNames) is missing value then
                     set acknowledged to true
                 end if
             end tell
@@ -372,25 +569,44 @@ const SIGN_OUT: &str = r#"on run argv
         end repeat
         if acknowledged is false then error "account Sign Out did not finish"
         my closeOwnedSettings(settingsWindow, closeSettings)
-    on error
+    on error errorText number errorNumber
         my closeOwnedSettings(settingsWindow, closeSettings)
-        if wasRunning is false then tell application appName to quit
-        tell application priorApp to activate
-        error "account sign-out controls unavailable or permission refused"
+        my restoreApplications(appName, wasRunning, priorApp)
+        if errorNumber is -1743 or errorNumber is -25211 then return "permission-blocked"
+        error "account sign-out controls unavailable"
     end try
-    if wasRunning is false then tell application appName to quit
-    tell application priorApp to activate
+    my restoreApplications(appName, wasRunning, priorApp)
     return "sign-out-requested"
+    end timeout
 end run
 
-on accountSettings(appName, paneName)
+on checkDeadline(deadline)
+    if (current date) is greater than deadline then error "account Settings deadline expired"
+end checkDeadline
+
+on restoreApplications(appName, wasRunning, priorApp)
+    try
+        with timeout of 2 seconds
+            if wasRunning is false then tell application appName to quit
+        end timeout
+    end try
+    try
+        with timeout of 2 seconds
+            if application priorApp is running then tell application priorApp to activate
+        end timeout
+    end try
+end restoreApplications
+
+on accountSettings(appName, paneNames)
     tell application "System Events"
         tell process appName
             repeat with candidateWindow in windows
+                my checkDeadline(my stopAt)
                 -- Inspect only toolbar controls until the account Settings window is
                 -- identified; never traverse a conversation or call-history view.
                 repeat with candidateToolbar in toolbars of candidateWindow
-                    set paneButton to my namedButton(candidateToolbar, paneName)
+                    my checkDeadline(my stopAt)
+                    set paneButton to my namedButton(candidateToolbar, paneNames)
                     if paneButton is not missing value then return candidateWindow
                 end repeat
             end repeat
@@ -399,8 +615,8 @@ on accountSettings(appName, paneName)
     return missing value
 end accountSettings
 
-on namedButton(containerElement, buttonName)
-    set buttonRef to my existingButton(containerElement, buttonName)
+on namedButton(containerElement, buttonNames)
+    set buttonRef to my existingButton(containerElement, buttonNames)
     if buttonRef is missing value then return missing value
     tell application "System Events"
         if enabled of buttonRef then return buttonRef
@@ -408,11 +624,12 @@ on namedButton(containerElement, buttonName)
     return missing value
 end namedButton
 
-on existingButton(containerElement, buttonName)
+on existingButton(containerElement, buttonNames)
     tell application "System Events"
         repeat with elementRef in entire contents of containerElement
+            my checkDeadline(my stopAt)
             if role of elementRef is in {"AXButton", "AXRadioButton"} then
-                if name of elementRef is buttonName then return elementRef
+                if name of elementRef is in buttonNames then return elementRef
             end if
         end repeat
     end tell
@@ -422,6 +639,7 @@ end existingButton
 on closeOwnedSettings(settingsWindow, closeSettings)
     if closeSettings and settingsWindow is not missing value then
         try
+            with timeout of 2 seconds
             tell application "System Events"
                 if exists settingsWindow then
                     repeat with closeButton in buttons of settingsWindow
@@ -432,6 +650,7 @@ on closeOwnedSettings(settingsWindow, closeSettings)
                     end repeat
                 end if
             end tell
+            end timeout
         end try
     end if
 end closeOwnedSettings"#;
@@ -452,6 +671,7 @@ mod tests {
         let item = SignOut {
             service: Service::Messages,
             user,
+            blocked: Mutex::new(None),
         };
         (Fake::root(), ctx, item)
     }
@@ -526,12 +746,55 @@ mod tests {
             .as_user(&item.user)
             .in_session();
         sys.on(&cmd.display(), Ran::ok("false"));
-        assert!(
-            item.apply(&sys, &ctx)
-                .unwrap_err()
-                .contains("Accessibility")
-        );
+        item.apply(&sys, &ctx)
+            .expect("permission block is a structured outcome");
+        assert!(matches!(
+            item.stood_aside(),
+            Some(aterm_converge::StoodAside::Permission(_))
+        ));
         assert_eq!(sys.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_consent_request_is_bounded_and_waits_for_the_grant() {
+        for (answer, expected) in [
+            ("false", Some(false)),
+            ("true", Some(true)),
+            ("unknown", None),
+        ] {
+            let sys = Fake::root();
+            let request = Cmd::new(OSASCRIPT)
+                .args(["-l", "JavaScript", "-e", AX_REQUEST])
+                .budget(Duration::from_secs(10));
+            sys.on(&request.display(), Ran::ok(answer));
+            assert_eq!(request_accessibility(&sys).ok(), expected);
+            assert_eq!(sys.calls(), vec![request.display()]);
+        }
+    }
+
+    #[test]
+    fn unsupported_localized_labels_refuse_before_launching_the_app() {
+        let (sys, ctx, item) = fixture();
+        let preflight = Cmd::new(OSASCRIPT)
+            .args(["-l", "JavaScript", "-e", AX_PREFLIGHT])
+            .as_user(&item.user)
+            .in_session();
+        sys.on(&preflight.display(), Ran::ok("true"));
+        sys.on(
+            &labels_cmd(&item.user, item.service).display(),
+            Ran::ok(r#"{"panes":[],"sign_out":[]}"#),
+        );
+        assert!(item.apply(&sys, &ctx).is_err());
+        assert_eq!(sys.calls().len(), 2);
+        assert!(sys.calls().iter().all(|c| !c.contains("keystroke")));
+    }
+
+    #[test]
+    fn an_expired_shared_deadline_refuses_before_running_another_child() {
+        let (sys, _ctx, item) = fixture();
+        let expired = Instant::now() - Duration::from_secs(60);
+        assert!(registered_until(&sys, &item.user, item.service, Some(expired)).is_err());
+        assert!(sys.calls().is_empty());
     }
 
     #[test]
@@ -551,8 +814,16 @@ mod tests {
                 .as_user(&item.user)
                 .in_session();
             sys.on(&preflight.display(), Ran::ok("true"));
+            let labels = Labels {
+                panes: vec!["iMessage".into()],
+                sign_out: vec!["Sign Out".into()],
+            };
             sys.on(
-                &signout_cmd(&item.user, item.service).display(),
+                &labels_cmd(&item.user, item.service).display(),
+                Ran::ok(r#"{"panes":["iMessage"],"sign_out":["Sign Out"]}"#),
+            );
+            sys.on(
+                &signout_cmd(&item.user, item.service, &labels).display(),
                 Ran::ok("sign-out-requested"),
             );
             sys.on(

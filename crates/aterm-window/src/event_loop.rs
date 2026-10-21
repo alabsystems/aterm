@@ -17,9 +17,10 @@
 //! See the root-level documentation for information on how to create and use an event loop to
 //! handle events.
 // LOCAL PATCH (aterm), 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5): an
-// item here marked `#[cfg(not(macos_platform))]` is API no aterm crate calls (custom cursors,
+// item here marked `#[cfg(windows_platform)]` is API no aterm crate calls (custom cursors,
 // device-event filters, owned display handles, the control-flow getter). The macOS backend no
-// longer implements it; the Windows and Linux carves delete it with their halves.
+// longer implements it, nor (2026-10-21, WC.8) the Linux module; the Windows carve deletes the
+// rest with its half.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,9 +33,11 @@ use crate::error::{EventLoopError, OsError};
 use crate::event::Event;
 use crate::monitor::MonitorHandle;
 use crate::platform_impl;
-#[cfg(not(macos_platform))]
+#[cfg(any(macos_platform, windows_platform))]
+use crate::window::Theme;
+#[cfg(windows_platform)]
 use crate::window::{CustomCursor, CustomCursorSource};
-use crate::window::{Theme, Window, WindowAttributes};
+use crate::window::{Window, WindowAttributes};
 
 /// Provides a way to retrieve events from the system and from the windows that were registered to
 /// the events loop.
@@ -92,9 +95,8 @@ impl<T> EventLoopBuilder<T> {
     /// Attempting to create the event loop off the main thread will panic. This
     /// restriction isn't strictly necessary on all platforms, but is imposed to
     /// eliminate any nasty surprises when porting to platforms that require it.
-    /// `EventLoopBuilderExt::any_thread` functions are exposed in the relevant
-    /// [`platform`] module if the target platform supports creating an event
-    /// loop on any thread.
+    /// On Windows, [`platform`]'s `EventLoopBuilderExtWindows::with_any_thread` lifts it;
+    /// X11's and Wayland's `with_any_thread` had no aterm caller and are gone (WC.8).
     ///
     /// ## Platform-specific
     ///
@@ -215,7 +217,7 @@ impl<T> EventLoop<T> {
     /// Gets a persistent reference to the underlying platform display.
     ///
     /// See the [`OwnedDisplayHandle`] type for more information.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn owned_display_handle(&self) -> OwnedDisplayHandle {
         OwnedDisplayHandle { platform: self.event_loop.window_target().p.owned_display_handle() }
     }
@@ -225,7 +227,7 @@ impl<T> EventLoop<T> {
     /// See [`ActiveEventLoop::listen_device_events`] for details.
     ///
     /// [`DeviceEvent`]: crate::event::DeviceEvent
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn listen_device_events(&self, allowed: DeviceEvents) {
         let _span = tracing::debug_span!(
             "aterm_window::EventLoop::listen_device_events",
@@ -242,7 +244,7 @@ impl<T> EventLoop<T> {
     }
 
     /// Create custom cursor.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn create_custom_cursor(&self, custom_cursor: CustomCursorSource) -> CustomCursor {
         self.event_loop.window_target().p.create_custom_cursor(custom_cursor)
     }
@@ -283,7 +285,7 @@ impl ActiveEventLoop {
     }
 
     /// Create custom cursor.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn create_custom_cursor(&self, custom_cursor: CustomCursorSource) -> CustomCursor {
         let _span =
             tracing::debug_span!("aterm_window::ActiveEventLoop::create_custom_cursor",).entered();
@@ -327,7 +329,7 @@ impl ActiveEventLoop {
     /// - **Wayland / macOS / iOS / Android / Orbital:** Unsupported.
     ///
     /// [`DeviceEvent`]: crate::event::DeviceEvent
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn listen_device_events(&self, allowed: DeviceEvents) {
         let _span = tracing::debug_span!(
             "aterm_window::ActiveEventLoop::listen_device_events",
@@ -344,7 +346,9 @@ impl ActiveEventLoop {
     ///
     /// ## Platform-specific
     ///
-    /// - **iOS / Android / Wayland / x11 / Orbital:** Unsupported.
+    /// - **X11, Wayland:** not built (WC.8: no aterm crate asks there, and the answer was
+    ///   always `None`).
+    #[cfg(any(macos_platform, windows_platform))]
     pub fn system_theme(&self) -> Option<Theme> {
         self.p.system_theme()
     }
@@ -355,7 +359,7 @@ impl ActiveEventLoop {
     }
 
     /// Gets the current [`ControlFlow`].
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn control_flow(&self) -> ControlFlow {
         self.p.control_flow()
     }
@@ -379,7 +383,7 @@ impl ActiveEventLoop {
     /// Gets a persistent reference to the underlying platform display.
     ///
     /// See the [`OwnedDisplayHandle`] type for more information.
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     pub fn owned_display_handle(&self) -> OwnedDisplayHandle {
         OwnedDisplayHandle { platform: self.p.owned_display_handle() }
     }
@@ -406,14 +410,14 @@ impl rwh_06::HasDisplayHandle for ActiveEventLoop {
 ///
 /// - A zero-sized type that is likely optimized out.
 /// - A reference-counted pointer to the underlying type.
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Clone)]
 pub struct OwnedDisplayHandle {
     #[cfg_attr(not(feature = "rwh_06"), allow(dead_code))]
     platform: platform_impl::OwnedDisplayHandle,
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl fmt::Debug for OwnedDisplayHandle {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -421,7 +425,7 @@ impl fmt::Debug for OwnedDisplayHandle {
     }
 }
 
-#[cfg(all(feature = "rwh_06", not(macos_platform)))]
+#[cfg(all(feature = "rwh_06", windows_platform))]
 impl rwh_06::HasDisplayHandle for OwnedDisplayHandle {
     #[inline]
     fn display_handle(&self) -> Result<rwh_06::DisplayHandle<'_>, rwh_06::HandleError> {
@@ -482,7 +486,7 @@ impl<T> fmt::Display for EventLoopClosed<T> {
 impl<T: fmt::Debug> error::Error for EventLoopClosed<T> {}
 
 /// Control when device events are captured.
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub enum DeviceEvents {
     /// Report device events regardless of window focus.

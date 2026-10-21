@@ -1,48 +1,29 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The verify-and-stage chain (§8/§9): turning a downloaded bundle into a verified,
-//! ready-to-activate store build.
+//! The verify-and-stage chain: a downloaded bundle becomes a verified, ready-to-activate
+//! store build, however the bytes were fetched (the manifest is already signature-verified
+//! upstream). Given the signed [`Artifact`] and a downloaded archive, [`verify_and_stage`]
+//! enforces, in order:
 //!
-//! This is the integrity heart of an install, independent of *how* the bytes were
-//! fetched (the network fetch reuses `aterm-update-core`'s `download_to`; the manifest
-//! was already root/release-signature-verified upstream, §8). Given the signed
-//! [`Artifact`] and a downloaded archive on disk, [`verify_and_stage`] enforces, in order:
+//! 1. Download integrity: the compressed asset's digest equals the signed one
+//!    ([`Artifact::digest`]: its `sha256`, or a vendor row's `sha512`; [`check_signed_digest`])
+//!    before extraction.
+//! 2. Slip-safe staging into a scratch sibling of the build dir, through the lane the row's
+//!    `payload` names ([`stage_payload`]), then the row's `links` under `bin/`. Every entry
+//!    is vetted before a byte is written and size-capped from the signed `disk_installed`;
+//!    the live tree is never extracted over.
+//! 3. Apply-time re-verify (TOCTOU): the tree's [`crate::tree::tree_root`], folded by the
+//!    extractor as it writes, equals the signed `artifact.tree_root` when one is set.
+//! 4. Durability, then an atomic swap with rollback: the tree's contents and directory
+//!    entries are flushed first ([`crate::store::sync_tree`]), since a rename is metadata,
+//!    then the tree is renamed into `build_dir` and the build marked complete, durably.
+//! 5. Caller hooks ([`StageHooks`]): a gate over the verified tree before anything publishes
+//!    it ([`developer_id_gate`]), and sidecars written durably after the swap and before the
+//!    marker.
 //!
-//! 1. **Download integrity** — the COMPRESSED asset's digest equals the signed one
-//!    ([`Artifact::digest`]: its `sha256`, or a vendor row's `sha512`), checked by
-//!    [`check_signed_digest`]. A corrupted/substituted download is refused before
-//!    extraction.
-//! 2. **Slip-safe staging** — into a scratch SIBLING of the build dir, through the lane
-//!    the signed row's `payload` names ([`stage_payload`]): the `.tar.zst`
-//!    extraction for a release bundle, or one of the `https` protocol lanes (`tar-zst` /
-//!    `tar-gz` / `zip` archives with `strip_components` and in-root symlinks, a
-//!    `raw-binary` or `tar-gz-binary` that becomes `bin/<entry>`, a `dmg` whose single
-//!    `.app` is copied out of the mounted image), then the row's `links` as relative
-//!    symlinks under `bin/`. Every archive entry is vetted before a byte is written and
-//!    size-capped from the signed `disk_installed`. The live tree is never extracted over.
-//! 3. **Apply-time re-verify (TOCTOU)** — the extracted tree's [`crate::tree::tree_root`]
-//!    equals the signed `artifact.tree_root` (when the producer set one). An already-
-//!    extracted tree can't be re-checked against the compressed digest, so this closes
-//!    the extract→activate window: a file swapped post-extraction moves the root.
-//!    The root is folded BY THE EXTRACTOR as it writes
-//!    (`crate::extract::extract_tar_zst_tree`) instead of by re-reading the whole
-//!    payload back off disk — see [`verify_and_stage`] step 3 for exactly which bytes
-//!    that still proves and which window it gives up.
-//! 4. **Durability, then an atomic swap with rollback** — the staged tree's file contents
-//!    and directory entries are flushed FIRST ([`crate::store::sync_tree`]): a rename is
-//!    metadata, so without that flush a power loss can leave the swap and the completeness
-//!    marker durable over file data that was never written back. Only then is a tree that
-//!    passed every check above renamed into `build_dir`, and only then is the build marked
-//!    complete — durably too, so a marker whose NAME survives a crash can never vouch for
-//!    contents that did not.
-//! 5. **Caller hooks** ([`StageHooks`]) — a gate over the verified tree before anything
-//!    publishes it (the darwin Developer ID check, [`developer_id_gate`]), and sidecars
-//!    written durably after the swap and before the marker, so a marked build has them.
-//!
-//! Any failure removes the scratch tree and returns fail-closed — a half- or wrongly-staged
-//! build never reaches activation, and **a stage that cannot install the new build must not
-//! have uninstalled the old one**.
+//! Any failure removes the scratch and fails closed, and a stage that cannot install the new
+//! build never uninstalls the old one.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -54,15 +35,11 @@ use crate::extract::{
 use crate::manifest::{Artifact, DigestAlg};
 use crate::tree::{DeclaredModes, tree_root, tree_root_declared};
 
-/// Opt-in belt-and-suspenders, a DEVELOPMENT SEAM (`aterm_types::dev_seam!` — a shipped
-/// binary does not read it): when this is set to a non-empty value, [`verify_and_stage`]
-/// ALSO walks the staged tree with [`crate::tree::tree_root`] and refuses the stage unless
-/// the walk agrees with the root the extractor folded.
-///
-/// It checks the fused digest's equivalence over real bundles, for a developer chasing a
-/// suspected filesystem fault. OFF by default: it costs a second full pass over the
-/// uncompressed payload (3.44 GB for the shipped `trust` member). `aterm pkg verify`
-/// re-attests installed bytes in every build.
+/// A development seam (`aterm_types::dev_seam!`; a shipped binary does not read it): set
+/// non-empty, [`verify_and_stage`] also walks the staged tree with [`crate::tree::tree_root`]
+/// and refuses unless the walk agrees with the root the extractor folded. For a developer
+/// chasing a suspected filesystem fault; off by default, since it costs a second full pass
+/// over the payload. `aterm pkg verify` re-attests installed bytes in every build.
 const DISK_REVERIFY_ENV: &str = "ATPKG_STAGE_DISK_REVERIFY";
 
 /// Why staging a downloaded bundle failed. Each aborts the stage fail-closed.
@@ -95,12 +72,10 @@ pub enum StageError {
     /// script, a symlinked Mach-O) ([`developer_id_gate`]). Deterministic for these bytes,
     /// which already matched their digest, so it is memoized like a digest refusal.
     SignerRefused(String),
-    /// The platform signer check did not FINISH: codesign was still reading a Mach-O when
-    /// its deadline ran out ([`developer_id_gate`]). No verdict on the bytes and no fault
-    /// of this machine's store — the program is DEFERRED: nothing is memoized, the verified
-    /// archive is kept for the next pass to re-stage without a download, and the vendor
-    /// lane reports it as a wait, not a failure (a large binary under the window's utility
-    /// clamp can run out the deadline and verify on retry).
+    /// The platform signer check did not finish: codesign was still reading a Mach-O at its
+    /// deadline ([`developer_id_gate`]). No verdict on the bytes: nothing is memoized, the
+    /// verified archive is kept for the next pass to re-stage without a download, and the
+    /// vendor lane reports a wait, not a failure.
     VerifyDeferred(String),
 }
 
@@ -161,7 +136,7 @@ impl StageHooks<'_> {
     };
 }
 
-/// A [`StageError::Io`] that names the STEP it came from: `io: <step>: <error>`.
+/// A [`StageError::Io`] that names the step it came from: `io: <step>: <error>`.
 ///
 /// `std::io::Error` carries no path and no verb, and on Windows one `Access is denied`
 /// covers a tree flush, a rename and a sweep, each with a different fix. The kind is kept,
@@ -173,10 +148,10 @@ fn io_step(step: &str, e: std::io::Error) -> StageError {
     StageError::Io(std::io::Error::new(e.kind(), m))
 }
 
-/// THE download-integrity gate: whether `file` holds the bytes `artifact`'s signed digest
-/// ([`Artifact::digest`]) names — the stage's step 1, and every place that asks the same
-/// question before it (a carried archive, a group member's fresh download). A row that
-/// signs no digest matches no file.
+/// The download-integrity gate: whether `file` holds the bytes `artifact`'s signed digest
+/// ([`Artifact::digest`]) names. The stage's step 1, and every earlier place that asks the
+/// same (a carried archive, a group member's fresh download). A row that signs no digest
+/// matches no file.
 ///
 /// # Errors
 /// [`StageError::DigestMismatch`] naming the algorithm, or [`StageError::Io`] when `file`
@@ -194,18 +169,15 @@ pub(crate) fn check_signed_digest(artifact: &Artifact, file: &Path) -> Result<()
     Ok(())
 }
 
-/// Uncompressed-size cap for extraction: twice the signed `disk_installed`, at least
-/// 1 MiB, so a decompression bomb is bounded by the *signed* size, never an
-/// attacker-chosen tar header. A `disk_installed` of 0 (older/loose manifest) falls back
-/// to a 2 GiB ceiling rather than unbounded.
+/// Uncompressed-size cap for extraction: twice the signed `disk_installed`, at least 1 MiB,
+/// so a decompression bomb is bounded by the signed size, never a tar header. A
+/// `disk_installed` of 0 falls back to 2 GiB.
 ///
-/// The extractor holds a tar to it twice, apart: once for file content, once for the
-/// structure around it (headers, padding, extension records — `extract::TooLargeReason::
-/// StructureCap`), so the whole decompressed stream is at most twice this. The packers
-/// sign `disk_installed` as the larger of the files' apparent sizes and half the
-/// decompressed stream (`atpkg_publish::artifact::tarwrite`), so a bundle they sign fits
-/// either allowance by construction; the factor of two is headroom for a
-/// row signed by an older packer, whose `disk_installed` counted content alone.
+/// The extractor holds a tar to it twice, once for file content and once for the structure
+/// around it (`extract::TooLargeReason::StructureCap`). The packers sign `disk_installed`
+/// as the larger of the apparent file sizes and half the decompressed stream
+/// (`atpkg_publish::artifact::tarwrite`), so their bundles fit either allowance; the factor
+/// of two is headroom for a row whose `disk_installed` counted content alone.
 fn size_cap(artifact: &Artifact) -> u64 {
     let signed = artifact.cost.disk_installed;
     if signed == 0 {
@@ -228,37 +200,30 @@ pub(crate) const UNSIGNED_SIZE_CAP: u64 = 2u64 << 30;
 /// the swap ([`verify_and_stage`], step 3b).
 const STAGING_SCRATCH_MODE: u32 = 0o700;
 
-/// Verify a downloaded `archive` against the signed `artifact` and stage it at
-/// `build_dir` (see the module docs). On success `build_dir` holds the verified,
-/// ready-to-activate tree. On any failure the partial tree is removed and the error
-/// returned fail-closed — and, crucially, **whatever was installed at `build_dir` before
-/// the call is still installed and still marked complete**.
+/// Verify a downloaded `archive` against the signed `artifact` and stage it at `build_dir`
+/// (module docs). On success `build_dir` holds the verified tree; on any failure the partial
+/// tree is removed, and whatever was installed at `build_dir` before is still installed and
+/// still marked complete.
 ///
-/// # Why this stages beside the build instead of into it
+/// The tree is built in a scratch sibling and becomes `build_dir` only once it passes every
+/// check, with the marker cleared for the swap: deleting first would destroy a working build
+/// before its replacement verified and leave `<build>.ready` vouching for a half-written
+/// tree. A crash leaves one of two honest states: the old build, complete; or no build,
+/// unmarked and re-installable.
 ///
-/// Deleting first would destroy a working build before its replacement verified, leave
-/// the SIBLING `<build>.ready` marker vouching for a half-written tree, and leak a
-/// marker-less partial no reclaimer lists. So the tree is built in a scratch sibling and
-/// only becomes `build_dir` once it has passed every check, and the marker is cleared for
-/// the duration of the swap. Crash at
-/// any point and the store is left in one of exactly two honest states: the OLD build,
-/// complete; or NO build, unmarked and therefore re-installable.
-///
-/// Returns the `tree_root` folded while staging (the verified one when the row signs
-/// one).
+/// Returns the `tree_root` folded while staging (the verified one when the row signs one).
 pub fn verify_and_stage(
     artifact: &Artifact,
     archive: &Path,
     build_dir: &Path,
     hooks: &StageHooks<'_>,
 ) -> Result<String, StageError> {
-    // 1. Download integrity — the compressed asset's digest must match the signed value,
-    //    BEFORE we spend any work extracting it.
+    // 1. Download integrity, before any work extracting.
     check_signed_digest(artifact, archive)?;
 
-    // 2. Extract into a scratch SIBLING (tar-slip-safe, size-capped from the signed size).
-    //    The live tree is untouched throughout. Any scratch left by a killed earlier run is
-    //    swept first — the store lock makes it ours to reclaim.
+    // 2. Extract into a scratch sibling (tar-slip-safe, size-capped from the signed size);
+    //    the live tree is untouched. Scratch a killed earlier run left is swept first: the
+    //    store lock makes it ours.
     crate::store::sweep_stage_scratch(build_dir);
     let incoming = crate::store::incoming_dir(build_dir).ok_or_else(|| {
         StageError::Io(std::io::Error::new(
@@ -266,25 +231,18 @@ pub fn verify_and_stage(
             "build dir has no name",
         ))
     })?;
-    //    THE SCRATCH IS PRIVATE WHILE IT FILLS, whatever the umask: born `0700`
-    //    ([`crate::platform::make_dir_born`], exclusively, so it is provably this stage's),
-    //    under a `store/<program>/` made at the store's directory mode. A
-    //    `create_dir_all` left it `0777 & ~umask`, and a stage under umask `000` or `002`
-    //    swapped a world- or group-writable root into place (AT3, 2026-10-10): its group
-    //    or every user of a system prefix could rename `bin/` or `Foo.app` and put their
-    //    own in its place, and a root `ditto` laid its members where anyone could reach
-    //    them before the walk sanitized them. It is opened to the build mode just before
-    //    the swap (step 3b).
+    //    The scratch is private while it fills, whatever the umask: born `0700`, exclusively
+    //    ([`crate::platform::make_dir_born`]), under a `store/<program>/` made at the store's
+    //    directory mode. A umask-derived mode would let a group, or every user of a system
+    //    prefix, swap `bin/` or `Foo.app` before the walk sanitizes it. Opened to the build
+    //    mode in step 3b.
     crate::store::make_build_parent(build_dir)
         .and_then(|()| crate::platform::make_dir_born(&incoming, STAGING_SCRATCH_MODE))
         .map_err(|e| io_step("create the staging scratch", e))?;
-    //    The stage hands back the `tree_root` of what it wrote, folded from the bytes
-    //    as they went past (see `crate::extract::extract_tar_zst_tree`). This is
-    //    the ONE pass over the uncompressed payload: the digest step 3 compares is a
-    //    by-product of the writing, not a second reading of it. (The `dmg` lane is
-    //    the exception — `ditto` wrote its bytes, so it walks them once.)
-    //    It also hands back the modes it DECLARED per regular file, which step 4c records
-    //    beside the build for the on-disk walk on a filesystem with no POSIX bits.
+    //    The stage hands back the `tree_root` folded from the bytes as they were written,
+    //    the one pass over the uncompressed payload (the `dmg` lane walks once, since
+    //    `ditto` wrote its bytes), and the modes it declared per regular file, which step 4c
+    //    records for a filesystem with no POSIX bits.
     let (extracted_root, modes) = match stage_payload_modes(artifact, archive, &incoming) {
         Ok(staged) => staged,
         Err(e) => {
@@ -293,32 +251,19 @@ pub fn verify_and_stage(
         }
     };
 
-    // 3. Apply-time re-verify (TOCTOU): the extracted tree must match the signed tree_root
-    //    (when the producer emitted one). A mismatch — tamper or partial extract — aborts,
-    //    and the previously-installed build is still there, untouched.
+    // 3. Apply-time re-verify (TOCTOU): the tree must match the signed tree_root when the row
+    //    signs one; a mismatch (tamper, partial extract) aborts with the installed build
+    //    untouched. The root is the one the extractor folded from the bytes it wrote, so it
+    //    refuses a substituted or corrupt archive, a truncated extraction and any layout, mode
+    //    or content that differs from what was signed. It gives up one window, a mutation
+    //    after the write inside the `0700` scratch while this process holds the store lock:
+    //    closing it costs re-reading the whole payload (3.44 GB for `trust`), which the
+    //    `ATPKG_STAGE_DISK_REVERIFY` dev seam does.
     //
-    //    WHAT THIS STILL PROVES, EXACTLY. The digest now describes the bytes the extractor
-    //    WROTE rather than the bytes a subsequent walk READ BACK. Both forms refuse:
-    //      * a substituted or corrupt archive — the compressed `sha256` gate in step 1
-    //        already ran, and this catches anything that survives it;
-    //      * a truncated, partial or aborted extraction (short files move the root);
-    //      * a bundle whose laid-down layout, modes or contents differ in any way from the
-    //        one the publisher signed — that is the whole point, and it is unchanged.
-    //    WHAT IT GIVES UP is one thing: a mutation landing in the window BETWEEN the write
-    //    and the read, inside the `0700` staging scratch (`STAGING_SCRATCH_MODE`, made so
-    //    whatever the umask since 2026-10-10), while this process holds the
-    //    store lock — not the threat the private prefix is hardened against, and closing
-    //    it costs re-reading the entire payload (3.44 GB for the shipped `trust` member).
-    //
-    //    The byte format is a CROSS-VERSION contract (signed manifests embed roots computed
-    //    by earlier releases), so the two producers share one formatter and one fold
-    //    (`tree::entry_line` / `tree::root_of_entry_lines`) and an exhaustive parity test
-    //    pins them together (`extract.rs`,
-    //    `fused_tree_root_is_byte_identical_to_the_on_disk_walk`). The
-    //    `ATPKG_STAGE_DISK_REVERIFY` development seam re-arms the on-disk walk as a
-    //    cross-check in a dev build, and `atpkg verify`
-    //    — the surface whose claim really IS "what is on disk right now" — still walks the
-    //    tree, unchanged.
+    //    The byte format is a cross-version contract (signed manifests embed roots from
+    //    earlier releases): both producers share `tree::entry_line` and
+    //    `tree::root_of_entry_lines`, pinned together by `extract.rs`'s
+    //    `fused_tree_root_is_byte_identical_to_the_on_disk_walk`.
     let root = if artifact.tree_root.is_empty() {
         extracted_root
     } else {
@@ -339,10 +284,9 @@ pub fn verify_and_stage(
         got
     };
 
-    // 3a. THE CALLER'S GATE AND RECORDS, on the verified tree and before anything
-    //     publishes it: a refusal here leaves no build, no marker and no sidecar. The
-    //     sidecars are rendered now so a bad suffix refuses before the swap too; they are
-    //     written after it.
+    // 3a. The caller's gate and records, on the verified tree before anything publishes it:
+    //     a refusal leaves no build, no marker and no sidecar. The sidecars are rendered now
+    //     so a bad suffix refuses before the swap too; they are written after it.
     if let Some(pre_swap) = hooks.pre_swap
         && let Err(e) = pre_swap(&incoming)
     {
@@ -367,22 +311,17 @@ pub fn verify_and_stage(
         ));
     }
 
-    // 3b. DURABILITY, before anything publishes this tree. Every check above is about the
-    //     bytes this process WROTE; none of them is about bytes the filesystem has
-    //     COMMITTED. The swap below is renames, and a rename is metadata: on a
-    //     delayed-allocation filesystem (ext4's default) the directory entries for
-    //     `<build>/` and the `<build>.ready` marker beside it can reach the journal while
-    //     the gigabytes behind them are still page cache. A power loss in that window would
-    //     leave the store saying "build N is complete" over zero-length or truncated files — a
-    //     state nothing repairs, because `decide` then answers `UpToDate` and the swap has
-    //     already reclaimed the tree it superseded. So the CONTENTS go down first, and the
-    //     names that vouch for them only afterwards.
+    // 3b. Durability, before anything publishes this tree. The swap is renames, and a
+    //     rename is metadata: on a delayed-allocation filesystem (ext4's default) the
+    //     entries for `<build>/` and `<build>.ready` can reach the journal while the data is
+    //     still page cache, and a power loss would leave "build N is complete" over
+    //     truncated files, which nothing repairs (`decide` answers `UpToDate`). So the
+    //     contents go down first, and the names that vouch for them after.
     //
-    //     First the verified root is opened from the scratch's `0700` to the mode every
-    //     directory in a build has ([`crate::extract::safe_mode`], `0755`): every user of
-    //     a system prefix runs from it, and by now every member has its final mode. A
-    //     single-binary build's `bin/` is then sealed against its vendor's own in-place
-    //     updater ([`crate::store::seal_bin`]); nothing writes into the tree after this.
+    //     First the root opens from the scratch's `0700` to the build mode
+    //     ([`crate::extract::safe_mode`], `0755`), every member having its final mode by
+    //     now; a single-binary build's `bin/` is then sealed against its vendor's in-place
+    //     updater ([`crate::store::seal_bin`]). Nothing writes into the tree after this.
     if let Err(e) = crate::platform::set_mode(&incoming, crate::extract::safe_mode(0, true)) {
         let _ = crate::store::remove_tree(&incoming);
         return Err(io_step("give the staged tree the build's mode", e));
@@ -398,16 +337,15 @@ pub fn verify_and_stage(
         return Err(io_step("flush the staged tree", e));
     }
 
-    // 4. SWAP. Marker down first (mid-swap, the build is honestly not complete), then the
-    //    old tree aside, then the verified tree into place, then the old tree reclaimed.
+    // 4. Swap: marker down first (mid-swap the build is honestly not complete), the old tree
+    //    aside, the verified tree into place, the old tree reclaimed.
     if let Err(e) = swap_into_place(build_dir, &incoming) {
         let _ = crate::store::remove_tree(&incoming);
         return Err(io_step("swap the staged tree into place", e));
     }
 
-    // 4b. THE CALLER'S SIDECARS, durably, then the directory that names them: `.ready`
-    //     below implies each one exists. A write that fails leaves the verified tree
-    //     unmarked, re-stageable.
+    // 4b. The caller's sidecars, durably, then the directory that names them: `.ready`
+    //     below implies each one exists. A failed write leaves the tree unmarked.
     if !sidecars.is_empty() {
         for (suffix, bytes) in &sidecars {
             crate::store::write_sidecar_durably(build_dir, suffix, bytes)
@@ -420,39 +358,24 @@ pub fn verify_and_stage(
         }
     }
 
-    // 4c. THE DECLARED-MODE RECORD (`<build>.modes`, a sibling like `.ready`, outside
-    //     the hashed tree) — on a filesystem that stores no permission bits, the only way
-    //     a later on-disk walk (`atpkg verify`) can fold the mode slot the signed root
-    //     was folded with; a no-op where the inode stores them (Unix). Before the marker,
-    //     like the sidecars above: a build whose record could not be written is left
-    //     unmarked and re-stageable rather than marked complete and unverifiable.
+    // 4c. The declared-mode record (`<build>.modes`, a sibling outside the hashed tree): on
+    //     a filesystem that stores no permission bits, the only way a later on-disk walk
+    //     (`atpkg verify`) can fold the mode slot the signed root used; a no-op on Unix.
+    //     Before the marker, so a build without it stays unmarked and re-stageable.
     if let Err(e) = crate::store::write_declared_modes(build_dir, &modes) {
         return Err(io_step("record the declared modes beside the build", e));
     }
 
-    // 5. Mark the build COMPLETE — the last step, written atomically AFTER the tree_root
-    //    re-verify (so the marker itself is never part of the hashed tree) and after the
-    //    swap. Its presence is what distinguishes a fully-installed build from one left
-    //    partial by a crash; `list_installed` skips marker-less build dirs so such a
-    //    partial is re-installed, not treated as up-to-date.
+    // 5. Mark the build complete, last: after the tree_root re-verify (the marker is never
+    //    part of the hashed tree) and after the swap. `list_installed` skips marker-less
+    //    build dirs, so a partial a crash left is re-installed, not treated as up to date.
     if let Err(e) = crate::store::mark_build_ready(build_dir) {
-        // LEAVE THE TREE. By this point the swap has succeeded and the outgoing tree has
-        // already been reclaimed, so deleting the new one is the single enumerated path
-        // that ends with NEITHER the old build nor the new — the exact state the module
-        // invariant forbids, reached by a 3-byte write failing (realistically: the volume
-        // is full, which is precisely the condition this module exists for), and reached
-        // with a `current` link already naming this build when a live build was re-staged.
-        //
-        // The tree on disk passed every check above, so keeping it is not keeping a
-        // partial: it is the verified toolchain, honestly UNMARKED. `list_installed` skips
-        // marker-less dirs and `flow::installed_for_decide` drops one from the apply
-        // decision (the shim view alone would call it up to date forever, even here where
-        // its shims still resolve), so it reads as not-installed to the readers AND to
-        // `decide`, and the next run re-stages it; a `current` link that named this build
-        // still resolves to correct bytes instead of dangling. Nothing extracts into
-        // `build_dir` (it is swapped onto), so an unmarked leftover is never extracted over,
-        // and it is reclaimable: the next stage renames it aside and deletes it, and `gc`'s
-        // partial arm sweeps it once nothing claims it.
+        // Leave the tree: the outgoing one is already reclaimed, so deleting this one would
+        // leave neither build, with `current` perhaps naming this one. It passed every check,
+        // so it is the verified toolchain, honestly unmarked: it reads as not installed
+        // (`list_installed`, `flow::installed_for_decide`) and the next run re-stages it,
+        // while a `current` link naming it still resolves. Nothing extracts into
+        // `build_dir` (it is swapped onto); the next stage or `gc`'s partial arm reclaims it.
         return Err(io_step("mark the build complete", e));
     }
     if let Some(parent) = build_dir.parent() {
@@ -463,28 +386,23 @@ pub fn verify_and_stage(
     Ok(root)
 }
 
-/// How long [`developer_id_gate`] may spend verifying one tree, across every Mach-O in
-/// it: each codesign call is bounded on its own, and this bounds their number. It grows by
-/// each file's size-scaled allowance above the 30 s floor
-/// ([`aterm_update_core::codesign::verify_timeout_for`]), so a tree of large binaries is
-/// not cut short by a budget sized for small ones.
+/// How long [`developer_id_gate`] may spend on one tree, across every Mach-O: each codesign
+/// call is bounded on its own, and this bounds their number. It grows by each file's
+/// size-scaled allowance above the 30 s floor
+/// ([`aterm_update_core::codesign::verify_timeout_for`]).
 const DEVELOPER_ID_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// A [`StageHooks::pre_swap`] gate for a darwin agent build: every Mach-O in the staged
-/// tree ([`crate::macho::find_macho`], by magic, regular files only, no interpreter
-/// script) must verify as signed by Developer ID `team` (`check`, production:
-/// [`codesign_team_check`]), there must be at least one, each exposed tool's
-/// `bin/<tool>` — what its shim runs — must be one of them, and no other file may carry
-/// an execute bit. Off macOS there is no platform anchor and it passes.
+/// A [`StageHooks::pre_swap`] gate for a darwin agent build: every Mach-O in the staged tree
+/// ([`crate::macho::find_macho`]: by magic, regular files only) must verify as signed by
+/// Developer ID `team` (`check`; production [`codesign_team_check`]), there must be at least
+/// one, each exposed tool's `bin/<tool>` (what its shim runs) must be one of them, and no
+/// other file may carry an execute bit. Off macOS there is no platform anchor and it passes.
 ///
-/// codesign's verdict on these bytes ([`CodesignError::is_verdict`]) is
-/// [`StageError::SignerRefused`]; a team or tool name that is not one is a
-/// [`StageError::Payload`]; codesign failing to judge them (an unreadable file, an
-/// internal error) is [`StageError::Io`] — a fact about this machine, retried rather than
-/// memoized; and codesign not FINISHING by its deadline — which scales with the file's
-/// size ([`aterm_update_core::codesign::verify_timeout_for`]) — is
-/// [`StageError::VerifyDeferred`]: the program waits for the next pass, and no warning is
-/// raised for it.
+/// codesign's verdict ([`CodesignError::is_verdict`]) is [`StageError::SignerRefused`]; an
+/// inadmissible team or tool name is [`StageError::Payload`]; codesign failing to judge (an
+/// unreadable file, an internal error) is [`StageError::Io`], a fact about this machine,
+/// retried rather than memoized; and codesign not finishing by its size-scaled deadline
+/// ([`aterm_update_core::codesign::verify_timeout_for`]) is [`StageError::VerifyDeferred`].
 ///
 /// [`CodesignError::is_verdict`]: aterm_update_core::codesign::CodesignError::is_verdict
 pub(crate) fn developer_id_gate(
@@ -664,8 +582,7 @@ fn check_signed_tree(
         return Err(StageError::SignerRefused(m));
     }
     // Each file's deadline scales with its size: codesign's time is its read time, and the
-    // window's passes run it IO-throttled under the utility clamp (see
-    // `VERIFY_MIN_BYTES_PER_SEC`).
+    // window's passes run it IO-throttled (`VERIFY_MIN_BYTES_PER_SEC`).
     let allowance = |path: &Path| {
         let len = std::fs::symlink_metadata(path).map_or(0, |m| m.len());
         verify_timeout_for(len)
@@ -710,43 +627,38 @@ fn check_signed_tree(
     Ok(())
 }
 
-/// Lay the verified download at `archive` down under `dest` in the shape
-/// `artifact.payload` names, and return the `tree_root` of what was laid down.
+/// Lay the verified download at `archive` down under `dest` in the shape `artifact.payload`
+/// names, and return the `tree_root` of what was laid down.
 ///
-/// THE ONE PRODUCER of a staged tree, shared by the client stage ([`verify_and_stage`],
-/// step 2) and the authoring ceremony: the tool that writes a signed row's `tree_root`
-/// must stage through THIS function over the same download, or the two roots disagree
-/// by construction — the normalizations below (mode sanitizing, `strip_components`,
-/// the `links` shape, which `.app` is copied) are not something a second implementation
-/// can be trusted to reproduce. Lanes, by `payload`:
+/// The one producer of a staged tree, shared by the client stage ([`verify_and_stage`],
+/// step 2) and the authoring ceremony: the tool that writes a signed row's `tree_root` must
+/// stage through this function, or the two roots disagree (mode sanitizing,
+/// `strip_components`, the `links` shape and which `.app` is copied are not reproducible by
+/// a second implementation). Lanes, by `payload`:
 ///
-/// * `""` — a release bundle (`binary` / `sysroot-bundle`): `.tar.zst`, symlinks
-///   refused, nothing stripped;
-/// * `tar-zst` / `tar-gz` / `zip` — a vendor archive: `strip_components` applied and
-///   in-root symlinks admitted ([`crate::extract::ExtractOptions`]), modes sanitized to
-///   `0755`/`0644` exactly as for a release bundle;
-/// * `raw-binary` — the download IS the binary: it becomes `bin/<entry>`, mode `0755`;
-/// * `tar-gz-binary` — a gzip tar of exactly one regular file at its root: that file
-///   becomes `bin/<entry>`, mode `0755`, exactly as a `raw-binary` of its bytes would;
-/// * `dmg` — the single `.app` at the image root, copied with `ditto` and no ACL, then
-///   given the same modes as every other lane ([`crate::extract::safe_mode`]:
-///   [`vet_copied_tree`]), macOS only. Its links, contents and extended attributes are
-///   the vendor's as laid out; its permissions are the stage's (AT3, ruling
-///   2026-10-10, docs/AUDIT-atpkg-inputs-2026-10-04.md).
+/// * `""`: a release bundle (`binary` / `sysroot-bundle`): `.tar.zst`, symlinks refused,
+///   nothing stripped;
+/// * `tar-zst` / `tar-gz` / `zip`: a vendor archive, `strip_components` applied and in-root
+///   symlinks admitted ([`crate::extract::ExtractOptions`]);
+/// * `raw-binary`: the download is the binary, laid as `bin/<entry>` at `0755`;
+/// * `tar-gz-binary`: a gzip tar of exactly one regular file at its root, laid as a
+///   `raw-binary` of its bytes would be;
+/// * `dmg` (macOS only): the single `.app` at the image root, copied with `ditto` and no
+///   ACL, then given the modes of every other lane ([`vet_copied_tree`]). Its links,
+///   contents and extended attributes are the vendor's; its permissions are the stage's
+///   (docs/AUDIT-atpkg-inputs-2026-10-04.md).
 ///
-/// Every lane's directories are `0755` and its regular files `0755` (any `x` bit) or
-/// `0644`, so the mode slot of every `tree_root` line one of them folds is `755` or
-/// `644`: never a setuid, setgid or sticky bit, never group- or other-writable.
+/// Every lane's directories are `0755` and its regular files `0755` (any `x` bit) or `0644`
+/// ([`crate::extract::safe_mode`]): never setuid, setgid or sticky, never group- or
+/// other-writable.
 ///
-/// Then, for every lane, the row's `links` are created as RELATIVE symlinks
-/// `bin/<name> -> ../<target>` ([`apply_links`]) so the shims resolve `bin/<tool>`. The
-/// root is folded from what was written for the archive and raw lanes, and handed out
-/// only once a listing of the tree spells back every name it records
-/// (`TreeAccumulator::require_spelled_back`); the `dmg` lane walks the finished tree
-/// once (its bytes were laid by `ditto`, not by this process's write loop).
+/// Then the row's `links` become relative symlinks `bin/<name> -> ../<target>`
+/// ([`apply_links`]). The root is folded from what was written for the archive and raw
+/// lanes, and handed out only once a listing spells back every name it records
+/// (`TreeAccumulator::require_spelled_back`); the `dmg` lane walks the finished tree once.
 ///
-/// `dest` must be an empty (or absent) directory the caller owns — the fold's
-/// precondition, enforced by every lane. On error the caller removes `dest`.
+/// `dest` must be an empty (or absent) directory the caller owns. On error the caller
+/// removes `dest`.
 ///
 /// # Errors
 /// [`StageError::Extract`] for anything the extractor refused (a slip, a cap, a
@@ -761,13 +673,10 @@ pub fn stage_payload(
     stage_payload_modes(artifact, archive, dest).map(|(root, _)| root)
 }
 
-/// [`stage_payload`], also handing back the permission bits the stage DECLARED per
-/// regular file ([`TreeAccumulator::declared_modes`]): the mode slot a walk on a
-/// filesystem with no POSIX bits (Windows) must fold to reproduce the same root
-/// ([`crate::tree::tree_root_declared`]). The body of [`stage_payload`], for the caller
-/// that also records the declared modes beside the build ([`verify_and_stage`]). Empty
-/// for the `dmg` lane, whose tree `ditto` laid and this process walked (macOS only,
-/// where the inode answers).
+/// [`stage_payload`], also handing back the permission bits it declared per regular file
+/// ([`TreeAccumulator::declared_modes`]): the mode slot a walk on a filesystem with no POSIX
+/// bits (Windows) must fold to reproduce the root ([`crate::tree::tree_root_declared`]).
+/// Empty for the `dmg` lane, which is macOS only, where the inode answers.
 ///
 /// # Errors
 /// As [`stage_payload`].
@@ -784,10 +693,10 @@ pub(crate) fn stage_payload_modes(
     };
     // A row that signs no `tree_root` has nothing to compare the decoded tree against
     // ([`verify_and_stage`] step 3), so its zstd frames must carry the producer's content
-    // checksum: either the signed root or the checksum catches a decoding defect. In
-    // practice that is a release bundle (`payload = ""`) from a packer that predates
-    // `tree_root` (`zstd -19`, which writes the checksum); an `https` row signs a root
-    // (`crate::vendor::check_row`) and the vendor-direct lanes take no `tar-zst`.
+    // checksum. Admission (`crate::vendor::check_row`) lets no such row through on the zstd
+    // lanes: a release bundle (`payload = ""`) and an `https` row must sign a root, and the
+    // vendor-direct lanes take no `tar-zst`. This stays for a caller that stages a row
+    // without admitting it, and for a `tar-zst` row over the release protocol.
     let checksum = if artifact.tree_root.is_empty() {
         FrameChecksum::Required
     } else {
@@ -827,9 +736,8 @@ pub(crate) fn stage_payload_modes(
     apply_links(dest, &artifact.links, folded.as_mut())?;
     match folded {
         Some(tree) => {
-            // Every name is laid: the disk must spell the fold back before its root is
-            // anyone's record (`TreeAccumulator`'s docs: a filesystem that rewrites one
-            // name collides with nothing the exclusive creates could refuse).
+            // The disk must spell the fold back before its root is anyone's record
+            // (`TreeAccumulator`'s docs).
             tree.require_spelled_back(dest)
                 .map_err(StageError::Extract)?;
             let modes = tree.declared_modes();
@@ -847,22 +755,19 @@ fn payload2(head: &str, detail: &str) -> StageError {
     StageError::Payload(format!("{head}{detail}"))
 }
 
-/// The single-binary lanes: the download (`raw-binary`), or the one regular file at the
-/// root of its gzip tar (`tar-gz-binary`, [`crate::extract::stage_tar_gz_member`]),
-/// becomes `bin/<entry>` at mode `0755` — under the platform's EXECUTABLE spelling of the
-/// logical name (`bin/claude` on Unix, `bin/claude.exe` on Windows:
-/// [`crate::store::ToolName::exe_file`], the file the shim forwards to) — through the very
-/// write loop the archive lanes use, so the one file folds into the digest exactly as an
-/// archived `bin/<entry>` would.
+/// The single-binary lanes: the download (`raw-binary`), or the one regular file at the root
+/// of its gzip tar (`tar-gz-binary`, [`crate::extract::stage_tar_gz_member`]), becomes
+/// `bin/<entry>` at `0755` under the platform's executable spelling
+/// ([`crate::store::ToolName::exe_file`]: `bin/claude`, `bin/claude.exe` on Windows),
+/// through the archive lanes' write loop, so it folds as an archived `bin/<entry>` would.
 fn stage_binary(
     artifact: &Artifact,
     archive: &Path,
     dest: &Path,
     cap: u64,
 ) -> Result<TreeAccumulator, StageError> {
-    // Belt and braces over `vendor::check_row` (which the client ran before download):
-    // this function is also the AUTHORING producer, and a separator here would be a
-    // path, not a name.
+    // Repeats `vendor::check_row` (run before download): this is also the authoring
+    // producer, and a separator here would be a path, not a name.
     let Some(tool) = crate::store::ToolName::new(&artifact.entry) else {
         return Err(payload2(
             "the entry is not a single admissible tool name: ",
@@ -873,9 +778,8 @@ fn stage_binary(
     crate::extract::require_empty_destination(dest).map_err(StageError::Extract)?;
     let bin = dest.join("bin");
     refuse_symlinked_bin(&bin)?;
-    // Made through the fold, as every folding lane makes its directories (at their one
-    // directory mode, `0755`), so the `links` laid after it find `bin` among the names
-    // this stage made.
+    // Made through the fold at the one directory mode, `0755`, so the `links` laid after it
+    // find `bin` among the names this stage made.
     let mut tree = TreeAccumulator::new();
     crate::extract::make_dir_exact(dest, &bin, Path::new("bin"), &mut tree)
         .map_err(StageError::Extract)?;
@@ -892,9 +796,8 @@ fn stage_binary(
     Ok(tree)
 }
 
-/// Whether a `links` TARGET is admissible here: a relative, `..`-free, `.`-free,
-/// separator-clean path (the same rule `vendor::check_row` applied to the signed row;
-/// repeated because this is also the authoring producer).
+/// Whether a `links` target is admissible: a relative, `..`-free, `.`-free, separator-clean
+/// path (`vendor::check_row`'s rule, repeated because this is also the authoring producer).
 fn link_target_admissible(target: &str) -> bool {
     if target.is_empty()
         || target.starts_with('/')
@@ -912,11 +815,9 @@ fn link_target_admissible(target: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// Refuse a staged `bin` that exists as anything but a real directory. `create_dir_all`,
-/// `set_mode` and the link creation after them all FOLLOW a `bin` symlink, so a staged
-/// `bin -> <anywhere>` would chmod that directory and plant links in it, outside the
-/// stage. The extractor's vet keeps every in-root link inside the root; this refuses the
-/// shape outright, whatever laid it.
+/// Refuse a staged `bin` that exists as anything but a real directory: `create_dir_all`,
+/// `set_mode` and the link creation all follow a `bin` symlink, so a staged
+/// `bin -> <anywhere>` would chmod that directory and plant links in it, outside the stage.
 fn refuse_symlinked_bin(bin: &Path) -> Result<(), StageError> {
     match std::fs::symlink_metadata(bin) {
         Ok(m) if !m.is_dir() => Err(StageError::Payload(String::from(
@@ -943,14 +844,12 @@ fn target_ancestor_is_symlink(dest: &Path, target: &str) -> bool {
     false
 }
 
-/// Create the row's `links`: for every `(name, target)`, the RELATIVE symlink
-/// `bin/<name> -> ../<target>`, and record it in the open fold (when there is one) so
-/// the root closes over the finished tree. Fail-closed on a name that is not a tool
-/// name, a target that is not a clean relative path, a target absent from the staged
-/// tree (an authoring slip: the link would dangle), a target reached through a symlinked
-/// directory, a staged `bin` that is not a real directory ([`refuse_symlinked_bin`]), or a
-/// `bin/<name>` something already occupies (the link would either fail or shadow an
-/// extracted entry).
+/// Create the row's `links`: for every `(name, target)`, the relative symlink
+/// `bin/<name> -> ../<target>`, recorded in the open fold (when there is one) so the root
+/// closes over the finished tree. Fail-closed on a name that is not a tool name, a target
+/// that is not a clean relative path, is absent (the link would dangle) or is reached
+/// through a symlinked directory, a staged `bin` that is not a real directory, or a
+/// `bin/<name>` something already occupies.
 fn apply_links(
     dest: &Path,
     links: &BTreeMap<String, String>,
@@ -986,10 +885,7 @@ fn apply_links(
         let link = bin.join(name);
         // The fold records the link as `bin/<name>`, so `bin` must be the name the stage
         // made, not one the filesystem folds onto it (an archive's `Bin/` on
-        // case-insensitive APFS): the same exact-name rule as the archive's own members.
-        // Either way at the stage's one directory mode (`extract::safe_mode`):
-        // `make_dir_exact` gives it to a directory it makes, and an archive's own `bin`
-        // already has it.
+        // case-insensitive APFS), at the stage's one directory mode.
         match tree.as_deref_mut() {
             Some(tree) => {
                 let raw = Path::new("bin").join(name);
@@ -1020,11 +916,10 @@ fn apply_links(
     Ok(())
 }
 
-/// The mount point for a `dmg` stage: a SIBLING of `dest` named `<dest>.mnt`. The
-/// name is deliberately outside every scratch recogniser (`store::stage_scratch_of`
-/// wants `<n>.incoming-<digits>`), so neither the store sweep nor GC will ever
-/// `remove_dir_all` a directory that may be a live mount; the [`Mount`] guard is what
-/// reclaims it, on every path.
+/// The mount point for a `dmg` stage: a sibling of `dest` named `<dest>.mnt`, outside every
+/// scratch recogniser (`store::stage_scratch_of` wants `<n>.incoming-<digits>`), so neither
+/// the store sweep nor gc ever `remove_dir_all`s a live mount; the [`Mount`] guard reclaims
+/// it on every path.
 #[cfg(target_os = "macos")]
 #[cfg(not(test))]
 fn dmg_mount_point(dest: &Path) -> Result<PathBuf, StageError> {
@@ -1054,9 +949,8 @@ fn run_tool(tool: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
     Err(tool_failed(tool, out.status.code(), &out.stderr))
 }
 
-/// `<tool> failed (exit N): <reason>` — the LAST stderr line is where hdiutil and ditto
-/// put the reason (`hdiutil: attach failed - Resource temporarily unavailable`), which
-/// is why neither is run under `-quiet`'s suppression of it.
+/// `<tool> failed (exit N): <reason>`: the last stderr line is where hdiutil and ditto put
+/// the reason (`hdiutil: attach failed - Resource temporarily unavailable`).
 #[cfg(target_os = "macos")]
 fn tool_failed(tool: &str, code: Option<i32>, stderr: &[u8]) -> StageError {
     let mut m = String::from(tool);
@@ -1092,9 +986,9 @@ fn capture_tool(tool: &str, args: &[&std::ffi::OsStr]) -> Result<String, StageEr
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// One image as `hdiutil info` reports it: the device node to eject it by (the FIRST
-/// `/dev/` entity of the block, which is the image's own node — ejecting it tears the
-/// synthesised APFS container down with it) and where each of its entities is mounted.
+/// One image as `hdiutil info` reports it: the device node to eject it by (the block's first
+/// `/dev/` entity, the image's own node, whose eject tears the synthesised APFS container
+/// down with it) and where each of its entities is mounted.
 #[cfg(target_os = "macos")]
 struct AttachedImage {
     image: PathBuf,
@@ -1102,16 +996,14 @@ struct AttachedImage {
     mounted_at: Vec<PathBuf>,
 }
 
-/// Parse `hdiutil info`'s plain-text report into one [`AttachedImage`] per attached
-/// image. The format is stable and simple: a `====…` rule separates the blocks, `key :
-/// value` lines carry `image-path`, and every entity is a TAB-separated
-/// `<dev-entry>\t<content-hint>[\t<mount-point>]` line whose third field is present only
-/// while that entity is mounted. A block with no `/dev/` entity (an image being attached
-/// at this instant) is skipped: there is nothing to eject.
+/// Parse `hdiutil info`'s plain-text report into one [`AttachedImage`] per attached image:
+/// a `====…` rule separates the blocks, `key : value` lines carry `image-path`, and every
+/// entity is a tab-separated `<dev-entry>\t<content-hint>[\t<mount-point>]` line whose third
+/// field is present only while it is mounted. A block with no `/dev/` entity (an image being
+/// attached at this instant) is skipped.
 ///
-/// Kept a PURE function over the text so the carcass shape that motivated it is
-/// pinned on any machine, hdiutil or no hdiutil
-/// (`a_failed_attach_leaves_a_carcass_the_hdiutil_report_names`).
+/// A pure function over the text, so the shape a failed attach leaves is pinned on any
+/// machine (`a_failed_attach_leaves_a_carcass_the_hdiutil_report_names`).
 #[cfg(target_os = "macos")]
 fn parse_hdiutil_info(report: &str) -> Vec<AttachedImage> {
     let mut out: Vec<AttachedImage> = Vec::new();
@@ -1128,7 +1020,7 @@ fn parse_hdiutil_info(report: &str) -> Vec<AttachedImage> {
     out
 }
 
-/// One `hdiutil info` block; `None` unless it names an image AND lists a device.
+/// One `hdiutil info` block; `None` unless it names an image and lists a device.
 #[cfg(target_os = "macos")]
 fn parse_hdiutil_block(lines: &[&str]) -> Option<AttachedImage> {
     let mut image: Option<PathBuf> = None;
@@ -1161,10 +1053,8 @@ fn parse_hdiutil_block(lines: &[&str]) -> Option<AttachedImage> {
     })
 }
 
-/// Whether two paths name the same file. `hdiutil info` echoes the path the attaching
-/// process passed, so the literal comparison is the one that usually fires; the
-/// canonical one covers a symlinked temp dir (`/var/folders` vs `/private/var/folders`)
-/// or a relative path on either side.
+/// Whether two paths name the same file: literally (`hdiutil info` echoes the path the
+/// attaching process passed), or canonically (`/var/folders` vs `/private/var/folders`).
 #[cfg(target_os = "macos")]
 fn same_file(a: &Path, b: &Path) -> bool {
     a == b
@@ -1247,26 +1137,22 @@ mod image_arm {
 /// explicit [`Attached::detach`] on the happy path so a detach failure is reported
 /// rather than swallowed). The mount point directory is removed with it.
 ///
-/// The guard is armed BEFORE `hdiutil attach` runs, not after it succeeds, because a
-/// non-zero `attach` does not mean nothing was attached. On this machine `attach` fails
-/// with `Resource temporarily unavailable` in roughly one attempt in five under
-/// back-to-back attach/detach traffic, and each of those failures leaves the image's
-/// `/dev/disk*` entities behind with nothing mounted on them — devices that survive for
-/// the life of the boot and make the NEXT attach of the same image fail `Resource busy`.
+/// The guard is armed before `hdiutil attach` runs: a non-zero `attach` (about one attempt
+/// in five under back-to-back traffic, `Resource temporarily unavailable`) can leave the
+/// image's `/dev/disk*` entities behind, unmounted, for the life of the boot, and they make
+/// the next attach of the same image fail `Resource busy`.
 #[cfg(target_os = "macos")]
 struct Mount {
     image: PathBuf,
     point: PathBuf,
-    /// `hdiutil attach` has been SPAWNED for this image: the guard owes a detach
-    /// whatever the exit status claimed.
+    /// `hdiutil attach` has been spawned for this image: the guard owes a detach whatever
+    /// the exit status claimed.
     attached: bool,
 }
 
-/// How many times `hdiutil attach` is attempted before the stage gives up. The failure
-/// it exists for is a transient `Resource temporarily unavailable` — measured at 5
-/// failures in 20 attaches on an idle Mac, every one of which succeeded on the next
-/// attempt once the failed attempt's devices had been reclaimed. A genuinely bad image
-/// costs this many attach attempts and no more.
+/// How many times `hdiutil attach` is attempted. The failure it exists for, a transient
+/// `Resource temporarily unavailable`, was measured at 5 in 20 attaches on an idle Mac,
+/// each succeeding on the next attempt once the failed one's devices were reclaimed.
 #[cfg(target_os = "macos")]
 #[cfg(not(test))]
 const ATTACH_ATTEMPTS: u32 = 4;
@@ -1274,21 +1160,16 @@ const ATTACH_ATTEMPTS: u32 = 4;
 #[cfg(target_os = "macos")]
 impl Mount {
     /// `hdiutil attach -nobrowse -readonly -noverify -noautoopen -mountpoint <point>
-    /// <image>`: not in Finder, never written, no second checksum pass (the download's
-    /// sha256 gate already ran over these bytes), nothing auto-opened. With stdin closed
-    /// an image that demands a license click fails instead of hanging.
-    ///
-    /// NOT `-quiet`: that flag suppresses the failure line too, which turns every
-    /// diagnosable refusal into a bare `hdiutil failed (exit 1)`. Its stdout (the device
-    /// table) is captured and dropped by [`run_tool`] either way.
-    ///
-    /// A failed attempt is reclaimed ([`Mount::detach_now`]) and retried, up to
+    /// <image>`: not in Finder, never written, no second checksum pass (the download's digest
+    /// gate already ran), nothing auto-opened. With stdin closed an image that demands a
+    /// license click fails instead of hanging. Not `-quiet`, which suppresses the failure
+    /// line too. A failed attempt is reclaimed ([`Mount::detach_now`]) and retried, up to
     /// [`ATTACH_ATTEMPTS`].
     #[cfg(not(test))]
     fn attach(image: &Path, dest: &Path) -> Result<Self, StageError> {
         let point = dmg_mount_point(dest)?;
-        // An EMPTY leftover from a crashed run is ours; a live mount there refuses the
-        // `remove_dir` and then refuses the attach below, which is the right outcome.
+        // An empty leftover from a crashed run is ours; a live mount there refuses the
+        // `remove_dir` and then the attach, which is the right outcome.
         let _ = std::fs::remove_dir(&point);
         std::fs::create_dir_all(&point).map_err(StageError::Io)?;
         let mut last: Option<StageError> = None;
@@ -1313,9 +1194,8 @@ impl Mount {
             ) {
                 Ok(()) => return Ok(m),
                 Err(e) => {
-                    // Reclaim whatever the failed attempt left attached before trying
-                    // again: otherwise the retry meets our own carcass as `Resource
-                    // busy` and the devices leak for the life of the boot.
+                    // Reclaim what the failed attempt left attached, or the retry meets it
+                    // as `Resource busy` and the devices leak for the life of the boot.
                     let _ = m.detach_now();
                     last = Some(e);
                 }
@@ -1339,25 +1219,21 @@ impl Mount {
         let r = match by_point {
             Ok(()) => Ok(()),
             // Either nothing is mounted at our point (an `attach` that exited non-zero
-            // after attaching the devices) or something still holds a file open on the
-            // image (Spotlight is the usual culprit). Ask the system which devices this
-            // image actually has, and eject those.
+            // after attaching the devices) or something holds a file open on the image
+            // (usually Spotlight): eject the devices the system lists for this image.
             Err(_) => self.eject_own_devices(),
         };
         let _ = std::fs::remove_dir(&self.point);
         r
     }
 
-    /// Eject every device `hdiutil info` still lists for THIS image, and PROVE it worked
-    /// by re-reading the report.
+    /// Eject every device `hdiutil info` still lists for this image, and prove it worked by
+    /// re-reading the report.
     ///
-    /// Only an attachment that is wholly unmounted, or mounted nowhere but our own mount
-    /// point, is ejected. `-mountpoint` puts OUR mount at our point and nowhere else, so
-    /// an attachment mounted elsewhere cannot be ours — it is the user's own copy, not
-    /// ours to yank, and reporting nothing left behind is the true answer rather than a
-    /// silent miss. That is also the right reading of a `Resource busy` attach failure
-    /// against a copy the user already has open: a refusal worth reporting, not papering
-    /// over.
+    /// Only an attachment wholly unmounted, or mounted nowhere but our own point, is
+    /// ejected: `-mountpoint` puts our mount there and nowhere else, so one mounted
+    /// elsewhere is the user's own copy, not ours to yank (and a `Resource busy` attach
+    /// against it is a refusal worth reporting).
     fn eject_own_devices(&self) -> Result<(), StageError> {
         let nodes = self.own_devices()?;
         if nodes.is_empty() {
@@ -1404,8 +1280,7 @@ impl Mount {
     }
 
     /// The device nodes an `hdiutil info` report holds for this image that are ours to
-    /// eject. Split out from [`Mount::own_devices`] so the rule is a pure function of
-    /// the report text and a test can state it without a disk image.
+    /// eject: a pure function of the report text.
     fn reclaimable(&self, report: &str) -> Vec<PathBuf> {
         parse_hdiutil_info(report)
             .into_iter()
@@ -1427,10 +1302,9 @@ impl Attached for Mount {
     }
 }
 
-/// The ONE `.app` directory at the root of `dir` (a mounted image). Anything else there
+/// The one `.app` directory at the root of `dir` (a mounted image). Anything else there
 /// (`Applications` link, `.background`, `.DS_Store`, a README) is ignored; zero or several
-/// apps is a refusal — the row said which bundle to stage by saying there is one. A free
-/// function of the directory, so the picking rule is testable without a disk image.
+/// apps is a refusal. A function of the directory, so the rule is testable without an image.
 #[cfg(target_os = "macos")]
 fn single_app_in(dir: &Path) -> Result<PathBuf, StageError> {
     let mut apps: Vec<PathBuf> = Vec::new();
@@ -1548,24 +1422,18 @@ fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
     mount.detach()
 }
 
-/// Make the copied `.app` at `dir` a tree the archive lanes could have laid, under the
-/// stage `root`. `dir` and every directory and regular file under it get the archive
-/// lanes' mode ([`crate::extract::safe_mode`]: `0755` for a directory or a file with
-/// any `x` bit, else `0644`; see [`stage_dmg`] for why) and lose any immutable or
-/// append-only flag (no archive lane lays one), each directory before it is read, so
-/// one its owner could not list is opened up first. Every entry, links included, gets
-/// the owner and group of the stage `root` ([`give_owner`]), which this stage made
-/// (exclusively, [`crate::platform::make_dir_born`]), so its owner is the stager.
+/// Make the copied `.app` at `dir` a tree the archive lanes could have laid, under the stage
+/// `root`. `dir` and every directory and regular file under it get the archive lanes' mode
+/// ([`crate::extract::safe_mode`]) and lose any immutable or append-only flag, each directory
+/// before it is read. Every entry, links included, gets the owner and group of the stage
+/// `root` ([`give_owner`]), which this stage made exclusively, so its owner is the stager.
 ///
-/// Every SYMLINK under `dir` must resolve LEXICALLY inside the stage `root` — the rule
-/// the archive lanes enforce per entry ([`crate::extract::vet_symlink`]), applied after
-/// the fact because `ditto` preserves links as the image carries them. An image whose
-/// bundle holds `Contents/MacOS/x -> /usr/bin/x` or `-> ../../../..` would otherwise sit
-/// in a tree the digest describes only by target bytes, and a `links` target or a shim
-/// could then resolve through it to somewhere outside the store. A link's own mode is
-/// left alone (nothing reads it, and the tree root leaves it out). Anything that is not
-/// a file, a directory or a symlink is refused as well (the walk would refuse it at the
-/// re-verify, but saying which entry is better than a bare mismatch).
+/// Every symlink under `dir` must resolve lexically inside the stage `root`
+/// ([`crate::extract::vet_symlink`], the archive lanes' per-entry rule, applied after the
+/// fact because `ditto` keeps links as the image carries them): otherwise a `links` target
+/// or a shim could resolve through one out of the store. A link's own mode is left alone
+/// (the tree root leaves it out). Anything that is not a file, a directory or a symlink is
+/// refused, naming the entry.
 #[cfg(target_os = "macos")]
 fn vet_copied_tree(root: &Path, dir: &Path) -> Result<(), StageError> {
     use std::os::unix::fs::MetadataExt as _;
@@ -1614,13 +1482,11 @@ fn vet_copied_entries(root: &Path, dir: &Path, owner: Owner) -> Result<(), Stage
     Ok(())
 }
 
-/// Give the copied directory or regular file at `path` (never a link: the caller read
-/// its kind without following one) the stage's `owner` ([`give_owner`]) and its
-/// [`crate::extract::safe_mode`], when it has any other, after clearing any flag that
-/// stops its owner changing or removing it
-/// ([`crate::platform::OWNER_BINDING_FLAGS`]: `ditto` copies a `uchg` member immutable,
-/// measured 2026-10-10, and an immutable entry refuses the `chmod` and every later
-/// `remove_dir_all`, the store's reclaim of a superseded build among them).
+/// Give the copied directory or regular file at `path` (never a link) the stage's `owner`
+/// ([`give_owner`]) and its [`crate::extract::safe_mode`], after clearing any flag that stops
+/// its owner changing or removing it ([`crate::platform::OWNER_BINDING_FLAGS`]): `ditto`
+/// copies a `uchg` member immutable, which refuses the `chmod` and every later
+/// `remove_dir_all`.
 #[cfg(target_os = "macos")]
 fn give_safe_mode(path: &Path, is_dir: bool, owner: Owner) -> Result<(), StageError> {
     use std::os::macos::fs::MetadataExt as _;
@@ -1642,19 +1508,13 @@ fn give_safe_mode(path: &Path, is_dir: bool, owner: Owner) -> Result<(), StageEr
 /// Give the copied entry at `path` (never followed through a link), whose `lstat` is
 /// `meta`, the stage root's `owner` and group when it has any other: `lchown(2)`.
 ///
-/// `ditto` keeps a member's owner and group: as root it keeps both as the image records
-/// them (ditto(1); hdiutil(1), PERMISSIONS VS. OWNERS: root "can see through" the
-/// `noowners` mapping), and unprivileged it keeps any group its user is a member of
-/// (measured 2026-10-10: a member of group `admin` copies as `admin`). An image built by
-/// `hdiutil create -srcfolder` records its builder's ids, so under a root-owned system
-/// prefix even an honest image would land its bundle owned by the uid that built it
-/// (often `501`, the first admin of a Mac) or by `_unknown` (`99`, which every user
-/// owns), and that owner could `chmod` a member back to writable and rewrite a program
-/// every user runs. An archive lane's entry is owned by the stager and, on macOS, takes
-/// its directory's group, which down the copied tree is the stage root's: the walk gives
-/// each entry exactly that (AT3 review, 2026-10-10). Unprivileged, only a group can
-/// differ, and the change is one the kernel allows its owner; a foreign owner can only
-/// have been laid by root, which may change it. A refusal fails the stage.
+/// `ditto` keeps a member's owner and group: as root both as the image records them, and
+/// unprivileged any group its user belongs to. An image built by `hdiutil create
+/// -srcfolder` records its builder's ids, so under a root-owned system prefix a bundle could
+/// land owned by the uid that built it, or `_unknown` (`99`, which every user owns), and
+/// that owner could make a member writable again. An archive lane's entry is owned by the
+/// stager with its directory's group, which down the copied tree is the stage root's; the
+/// walk gives each entry exactly that. A refusal fails the stage.
 #[cfg(target_os = "macos")]
 fn give_owner(
     path: &Path,
@@ -1676,24 +1536,16 @@ fn stage_dmg(_image: &Path, _dest: &Path) -> Result<(), StageError> {
     )))
 }
 
-/// Whether [`DISK_REVERIFY_ENV`] arms the on-disk cross-check. Read here, passed DOWN as a
-/// bool, so the decision is one env lookup per stage and [`reverified_root`] stays a pure
-/// function two tests can drive both ways without mutating process-global state (which
-/// `std::env::set_var` is `unsafe` for in edition 2024, and is a data race under a
-/// multi-threaded test runner regardless).
+/// Whether [`DISK_REVERIFY_ENV`] arms the on-disk cross-check. Passed down as a bool so
+/// [`reverified_root`] stays pure and tests drive both ways without `std::env::set_var`.
 fn disk_reverify_armed() -> bool {
     aterm_types::dev_seam!(DISK_REVERIFY_ENV).is_some_and(|v| !v.is_empty())
 }
 
-/// The root step 3 compares against the signed value: the one the extractor folded, or —
-/// when [`DISK_REVERIFY_ENV`] is armed — that root AND a full on-disk
-/// [`crate::tree::tree_root_declared`] walk (over the stage's declared `modes`, which
-/// only a filesystem without POSIX bits folds), which must agree.
-///
-/// Disagreement is an ERROR, never a silent preference for one of them: two producers of a
-/// cross-version byte contract that differ over the same tree is exactly the condition a
-/// fail-closed stage exists for, and the message names both so the drift is diagnosable
-/// rather than merely fatal.
+/// The root step 3 compares against the signed value: the one the extractor folded, or,
+/// when [`DISK_REVERIFY_ENV`] is armed, that root and a full on-disk
+/// [`crate::tree::tree_root_declared`] walk over the declared `modes`, which must agree.
+/// Disagreement is an error naming both, never a silent preference for one.
 fn reverified_root(
     incoming: &Path,
     extracted_root: String,
@@ -1714,25 +1566,19 @@ fn reverified_root(
     Ok(walked)
 }
 
-/// Move `incoming` onto `build_dir`, retiring whatever was there.
+/// Move `incoming` onto `build_dir`, retiring whatever was there, in this order:
 ///
-/// The ordering is the whole point, so it is spelled out rather than inlined:
-///
-/// 1. `clear_build_ready` — from here until step 5 of the caller the build is not
-///    complete, and every reader agrees with that.
+/// 1. `clear_build_ready`: until the caller's step 5 the build is not complete.
 /// 2. `build_dir` → `<build>.superseded-<pid>` (skipped when nothing is installed).
-/// 3. `incoming` → `build_dir`. If THIS fails, the old tree is moved back: a stage that
-///    cannot install the new build must not have uninstalled the old one.
-/// 4. the superseded tree is reclaimed.
+/// 3. `incoming` → `build_dir`; if this fails the old tree is moved back.
+/// 4. The superseded tree is reclaimed.
 ///
-/// Both renames restore the marker on failure when the outgoing tree was complete before
-/// the call. That is not cosmetic bookkeeping: the marker is the ONLY thing that makes a
-/// tree visible to `list_installed`, so leaving a perfectly good toolchain unmarked
-/// downgrades "the update did not happen" into "re-download and re-extract gigabytes".
+/// Both renames restore the marker on failure when the outgoing tree was complete: the
+/// marker is the only thing that makes a tree visible to `list_installed`, so leaving a good
+/// toolchain unmarked turns "the update did not happen" into "re-download gigabytes".
 fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
-    // Whether the tree we are replacing was itself complete decides what a rollback may
-    // claim about it: re-marking a tree that was NEVER complete would promote a crash
-    // leftover to "installed" on the way out of an unrelated failure.
+    // Whether the tree we replace was complete decides what a rollback may claim: re-marking
+    // a tree that never was would promote a crash leftover to "installed".
     let was_complete = crate::store::build_is_complete(build_dir);
     crate::store::clear_build_ready(build_dir)?;
     if let Some(parent) = build_dir.parent() {
@@ -1746,10 +1592,9 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
         Some(ref old) if build_dir.exists() => {
             let _ = crate::store::remove_tree(old);
             if let Err(e) = std::fs::rename(build_dir, old) {
-                // The swap could not even BEGIN. A rename that returns an error has not
-                // moved anything, so the old tree is provably still at `build_dir`,
-                // exactly as complete as it was one line ago; the marker we just took down
-                // is the only thing that changed, and re-marking asserts nothing new.
+                // The swap could not begin: a failed rename moved nothing, so the old tree
+                // is still at `build_dir`, as complete as it was, and re-marking asserts
+                // nothing new.
                 if was_complete {
                     let _ = crate::store::mark_build_ready(build_dir);
                 }
@@ -1760,8 +1605,8 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
         _ => false,
     };
     if let Err(e) = std::fs::rename(incoming, build_dir) {
-        // Put the old build back before reporting the failure — a rollback here is the
-        // difference between "the update did not happen" and "the toolchain is gone".
+        // Put the old build back before reporting: the difference between "the update did
+        // not happen" and "the toolchain is gone".
         if retired && let Some(ref old) = superseded {
             restore_outgoing(old, build_dir, was_complete);
         }
@@ -1773,16 +1618,12 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Move the parked outgoing tree back to `build_dir` and, only if it was complete BEFORE the
+/// Move the parked outgoing tree back to `build_dir` and, only if it was complete before the
 /// swap, re-mark it. `true` when the tree really came back.
 ///
-/// The `was_complete` guard and the restore guard are two different questions and both have
-/// to be asked. [`crate::store::mark_build_ready`] has no existence precondition — it writes
-/// a temp file beside the build and renames it onto `<build>.ready` without ever looking at
-/// `<build>` — so re-marking after a restore that FAILED writes a completeness marker for a
-/// tree that is not there. Nothing believes such a marker today (every reader of
-/// `build_is_complete` enumerates directories first), and nothing reclaims it either, so it
-/// would sit there as a durable lie one refactor away from being believed.
+/// Both guards are needed: [`crate::store::mark_build_ready`] never looks at `<build>`, so
+/// re-marking after a failed restore would write a durable completeness marker for a tree
+/// that is not there.
 fn restore_outgoing(old: &Path, build_dir: &Path, was_complete: bool) -> bool {
     if std::fs::rename(old, build_dir).is_err() {
         return false;
@@ -1853,12 +1694,11 @@ mod tests {
         )
     }
 
-    /// An archive whose EXTRACTION fails part-way: a good first entry (so real bytes land in
-    /// the staging tree and the extractor is genuinely mid-flight), then a `../escape` entry
-    /// that [`crate::extract::vet_entry`] refuses as a tar-slip.
+    /// An archive whose extraction fails part-way: a good first entry (real bytes land in
+    /// the staging tree), then a `../escape` entry [`crate::extract::vet_entry`] refuses.
     ///
-    /// Its own sha256 is whatever it is — the caller signs THAT value, so the download-
-    /// integrity gate passes and the failure lands where this test needs it: in step 2.
+    /// The caller signs its sha256, so the download gate passes and the failure lands in
+    /// step 2.
     fn make_slip_archive(dir: &Path) -> PathBuf {
         let mut tar = tar_entry("bin/ay", b"a plausible first entry");
         tar.extend(tar_entry("../escape", b"pwned"));
@@ -1882,15 +1722,11 @@ mod tests {
         let archive = make_archive(&dir);
         let sha = file_sha256(&archive).unwrap();
         let probe = dir.join("probe");
-        // NOTE — this fixture is a live DIFFERENTIAL, not just a fixture. The expected
-        // `tree_root` is learned by walking the extracted tree ON DISK, while
-        // `verify_and_stage` compares against the root the extractor FOLDS as it writes.
-        // Every staging test below therefore fails the moment the two producers of that
-        // cross-version byte contract disagree over this bundle — hardlinks, modes, empty
-        // files and all — on top of the exhaustive corpus in `extract.rs`. The walk is
-        // given the fold's DECLARED modes, which only a filesystem without permission
-        // bits (Windows) consults: there the plain walk folds `0` and could agree with
-        // nothing, so it would be a differential against the wrong producer.
+        // A live differential: the expected root comes from walking the extracted tree on
+        // disk, while `verify_and_stage` compares against the root the extractor folds, so
+        // every staging test fails if the two producers disagree over this bundle. The walk
+        // gets the fold's declared modes, which only a filesystem without permission bits
+        // (Windows) consults.
         let modes = crate::extract::extract_tar_zst_tree(
             &archive,
             &probe,
@@ -1917,11 +1753,9 @@ mod tests {
             self.dir.join("store/ay/18")
         }
 
-        /// Install build 18 for real, through the real stage, and leave a witness file inside
-        /// the installed tree. Returns `(build_dir, witness)`.
-        ///
-        /// The witness is how every "the old build survived" assertion below distinguishes
-        /// *this* tree from a replacement that merely happens to contain the same files.
+        /// Install build 18 through the real stage and leave a witness file inside it, so
+        /// "the old build survived" means this tree, not a replacement with the same files.
+        /// Returns `(build_dir, witness)`.
         fn installed(&self) -> (PathBuf, PathBuf) {
             let build = self.build();
             verify_and_stage(&self.art, &self.archive, &build, &StageHooks::NONE).unwrap();
@@ -2055,10 +1889,9 @@ mod tests {
         assert_eq!(cap(u64::MAX), u64::MAX);
     }
 
-    /// A row that signs a sha512 is gated by it: the matching archive stages, and one whose
-    /// sha512 differs is refused naming that algorithm — even when the value it carries is
-    /// the archive's sha256. A row that signs both digests or neither has no gate, and is
-    /// refused before extraction too.
+    /// A row that signs a sha512 is gated by it: the matching archive stages, and a differing
+    /// sha512 is refused naming that algorithm, even when it carries the archive's sha256. A
+    /// row that signs both digests or neither is refused before extraction too.
     #[test]
     fn a_sha512_row_is_gated_by_its_sha512() {
         let b = bundle("sha512");
@@ -2104,12 +1937,10 @@ mod tests {
         assert!(!other.exists(), "nothing staged past a refused digest");
     }
 
-    /// ZC.5's rule (docs/AUDIT-third-party-2026-10-15.md): a row that signs no
-    /// `tree_root` has nothing to compare its decoded tree against, so its zstd frame must
-    /// carry the producer's content checksum. Over the release-bundle lane and the
-    /// `tar-zst` vendor lane: the bundle's tar in a frame WITHOUT one is refused in
-    /// extraction and nothing is staged; signing its root admits that same frame (the root
-    /// is the check there), and the checksummed frame stages with no root.
+    /// A row that signs no `tree_root` must carry the zstd frame's content checksum, over the
+    /// release-bundle lane and the `tar-zst` vendor lane: the bundle's tar in a frame without
+    /// one is refused in extraction and nothing is staged; signing its root admits that same
+    /// frame (the root is the check there), and the checksummed frame stages with no root.
     #[test]
     fn an_unsigned_tree_root_requires_the_frame_checksum() {
         let dir = tmp("frame-checksum");
@@ -2247,15 +2078,9 @@ mod tests {
         );
     }
 
-    /// THE ROLLBACK. If the SECOND rename fails — the one that puts the verified tree where
-    /// the old one was — the old tree is already parked in `<build>.superseded-<pid>`
-    /// and `build_dir` does not exist. Leaving it there is exactly the state this whole
-    /// module exists to forbid: no old build, no new build.
-    ///
-    /// Driven through the real `swap_into_place` with the `incoming` tree absent, which is
-    /// the one way to make ONLY the second rename fail in-process: both renames happen in the
-    /// same directory, so anything that blocks the second (permissions, an occupied
-    /// destination) blocks the first as well.
+    /// The rollback: when the second rename fails, the old tree parked at
+    /// `<build>.superseded-<pid>` comes back, complete. An absent `incoming` is the one way
+    /// to fail only the second rename in-process (both renames share a directory).
     #[test]
     fn a_failed_final_rename_rolls_the_old_build_back_and_re_marks_it() {
         let b = bundle("rollback-complete");
@@ -2288,17 +2113,13 @@ mod tests {
         );
     }
 
-    /// …and the other half of that decision. A rollback restores the TREE unconditionally,
-    /// but re-marks it ready only if it was ready to begin with. Re-marking a tree that was
-    /// never complete would promote a crash leftover to "installed" on the way out of an
-    /// unrelated failure — the manager would then run a half-extracted toolchain and report
-    /// it up to date.
+    /// A rollback restores the tree unconditionally but re-marks it only if it was complete
+    /// before, so a crash leftover is never promoted to installed.
     #[test]
     fn a_rollback_never_promotes_a_tree_that_was_never_complete() {
         let b = bundle("rollback-incomplete");
         let (build, witness) = b.installed();
-        // Demote it to what a crash between extract and mark leaves: a populated tree with
-        // no marker.
+        // What a crash between extract and mark leaves: a populated tree, no marker.
         crate::store::clear_build_ready(&build).unwrap();
         assert!(
             !crate::store::build_is_complete(&build),
@@ -2318,10 +2139,8 @@ mod tests {
         assert!(scratch_beside(&build).is_empty());
     }
 
-    /// The marker is written LAST, and it is a SIBLING — so it is never part of the tree the
-    /// signed `tree_root` covers. Two consequences, both asserted: the freshly-staged tree
-    /// still hashes to the signed value with the marker in place, and the marker file itself
-    /// lives outside `build_dir`.
+    /// The marker is written last, as a sibling, so it is never part of the signed tree: the
+    /// staged tree still hashes to the signed value and the marker lives outside `build_dir`.
     #[test]
     fn the_marker_is_written_last_and_is_never_part_of_the_hashed_tree() {
         let b = bundle("marker-last");
@@ -2329,9 +2148,7 @@ mod tests {
         verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
 
         assert!(crate::store::build_is_complete(&build));
-        // The walk `atpkg verify` runs: over the declared-mode record the stage left
-        // beside the build (consulted only where the inode stores no bits — Windows —
-        // and empty, never read, on Unix).
+        // The walk `atpkg verify` runs, over the declared-mode record beside the build.
         let modes = crate::store::declared_modes(&build).unwrap();
         assert_eq!(
             tree_root_declared(&build, &modes).unwrap(),
@@ -2342,13 +2159,9 @@ mod tests {
         assert!(marker.is_file(), "the marker is the SIBLING <build>.ready");
     }
 
-    /// Block `mark_build_ready`'s temp write by planting a NON-EMPTY DIRECTORY at the exact
-    /// `<parent>/.ready.tmp-<pid>` path it writes to: `fs::write` then fails EISDIR.
-    ///
-    /// This is the one failure the marker step can actually suffer that nothing earlier in
-    /// the chain trips over — `clear_build_ready` only touches `<n>.ready`, and
-    /// `sweep_stage_scratch` only matches `<n>.incoming-*` / `<n>.superseded-*` — so the
-    /// swap completes and the failure lands exactly where the test needs it: step 5.
+    /// Block `mark_build_ready`'s temp write with a non-empty directory at the exact
+    /// `<parent>/.ready.tmp-<pid>` path it writes to. Nothing earlier in the chain touches
+    /// that name, so the failure lands at step 5.
     fn block_the_marker_write(build_dir: &Path) -> PathBuf {
         let parent = build_dir.parent().unwrap();
         std::fs::create_dir_all(parent).unwrap();
@@ -2358,12 +2171,8 @@ mod tests {
         blocker
     }
 
-    // THE INVARIANT AT ITS LAST STEP. When the marker write fails the swap has ALREADY
-    // succeeded and the old tree has already been reclaimed, so removing the new tree is
-    // the one enumerated path that ends with NEITHER build. It must not: the tree on disk
-    // passed every check, so it is left in place, honestly unmarked (`list_installed`
-    // skips it, the next run re-stages it) — and a `current` link that named this build
-    // still resolves to a verified toolchain instead of dangling.
+    // The invariant at its last step: when the marker write fails after the swap, the
+    // verified tree stays, unmarked (see `verify_and_stage` step 5).
     #[test]
     fn a_marker_write_that_fails_after_the_swap_keeps_the_verified_tree() {
         let b = bundle("marker-fail-keeps-tree");
@@ -2380,8 +2189,7 @@ mod tests {
             "the marker write is what failed: {err:?}"
         );
 
-        // The governing invariant: this stage could not FINISH installing the new build, so
-        // it must not have left the store with nothing.
+        // The stage could not finish installing the new build, yet the tree is still there.
         assert!(
             build.is_dir(),
             "a failed marker write destroyed a fully verified, correctly swapped-in tree"
@@ -2395,28 +2203,26 @@ mod tests {
             b"#!/bin/true\nthe ay binary",
             "and the tree left behind is the VERIFIED one, not a partial"
         );
-        // Honest: unmarked, so it reads as not-installed and the next run re-stages it.
+        // Unmarked, so it reads as not installed and the next run re-stages it.
         assert!(
             !crate::store::build_is_complete(&build),
             "a build that could not be marked must never read as complete"
         );
 
-        // Non-vacuity: clear the blocker and the very same call marks it ready.
+        // Non-vacuity: with the blocker cleared the same call marks it ready.
         std::fs::remove_dir_all(&blocker).unwrap();
         verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
     }
 
-    // THE TWO-RENAME CRASH WINDOW. A SIGKILL between `rename(build, superseded)` and
-    // `rename(incoming, build)` leaves the ONLY copy of the old tree at
-    // `<build>.superseded-<pid>` with nothing at `<build>`. Housekeeping must MOVE IT BACK,
-    // never delete it as scratch: a crash is not a reason to lose the only tree there is.
+    // The two-rename crash window: a SIGKILL between `rename(build, superseded)` and
+    // `rename(incoming, build)` leaves the only copy of the old tree parked, and the sweep
+    // moves it back rather than deleting it as scratch.
     #[test]
     fn a_crash_between_the_two_renames_recovers_the_old_tree_instead_of_deleting_it() {
         let b = bundle("crash-window-recover");
         let (build, witness) = b.installed();
-        // Reproduce the killed-mid-swap state exactly: marker down, tree parked at the
-        // superseded name, nothing at the build path.
+        // The killed-mid-swap state: marker down, tree parked, nothing at the build path.
         let superseded = crate::store::superseded_dir(&build).unwrap();
         crate::store::clear_build_ready(&build).unwrap();
         std::fs::rename(&build, &superseded).unwrap();
@@ -2435,9 +2241,8 @@ mod tests {
             build.join(witness.file_name().unwrap()).exists(),
             "and it is THAT tree, not a lookalike"
         );
-        // Deliberately NOT re-marked: the swap cleared the marker before the rename, so
-        // whether the tree was complete is unrecoverable from disk. Unmarked means the next
-        // run re-stages it — honest, and it never promotes a partial to "installed".
+        // Not re-marked: the swap cleared the marker before the rename, so completeness is
+        // unrecoverable from disk, and the next run re-stages it.
         assert!(
             !crate::store::build_is_complete(&build),
             "recovery must never claim a completeness it cannot prove"
@@ -2513,16 +2318,9 @@ mod tests {
         assert!(crate::store::build_is_complete(&build));
     }
 
-    // A rollback may only re-mark a tree it actually put back. `mark_build_ready` has no
-    // existence precondition — it writes a temp beside the build and renames it onto
-    // `<n>.ready` without ever looking at `<n>` — so a rollback whose restoring rename ALSO
-    // failed would leave a completeness marker asserting a tree that is not there.
-    //
-    // Driven through `restore_outgoing` directly rather than through `verify_and_stage`,
-    // and honestly so: the compound failure needs BOTH renames in one directory to fail,
-    // and on a real filesystem anything that blocks the second (permissions, an occupied
-    // destination) blocks the first as well. `restore_outgoing` is the production function,
-    // not a restatement of it, and a missing source is a real rename failure.
+    // A rollback re-marks only a tree it put back: `mark_build_ready` never looks at `<n>`.
+    // Driven through `restore_outgoing` directly, since on a real filesystem anything that
+    // blocks the restoring rename blocks the first rename too.
     #[test]
     fn a_rollback_that_cannot_restore_the_tree_writes_no_marker() {
         let b = bundle("rollback-restore-fails");
@@ -2713,12 +2511,9 @@ mod tests {
         }
     }
 
-    /// The `tar-gz-binary` lane on agy's measured shape — one regular file `antigravity`,
-    /// mode `0755`, at the archive root: it becomes `bin/agy` at `0755` (a `0644` member
-    /// too: the lane's one file is the executable), the root the stage folds with no
-    /// signed root to compare (the vendor-direct row) is the one a hand-laid `bin/agy`
-    /// walks to, and the darwin Developer ID gate asks about `bin/agy` as the one Mach-O
-    /// its shim runs.
+    /// The `tar-gz-binary` lane on agy's shape (one regular file `antigravity` at the archive
+    /// root) stages it as `bin/agy` at `0755`, a `0644` member too, to the root a hand-laid
+    /// `bin/agy` walks to, and the Developer ID gate asks about `bin/agy` as the one Mach-O.
     #[cfg(unix)]
     #[test]
     fn a_one_member_tar_gz_binary_stages_its_file_at_bin_entry_0755() {
@@ -2756,12 +2551,10 @@ mod tests {
         }
     }
 
-    /// A single-binary build's `bin/` is SEALED `0555` on both lanes: agy's own updater,
-    /// which writes `agy.<nanos>.old` beside the store build, cannot write there. Every
-    /// removal of a store tree still takes it: a re-stage's swap retires and reclaims the
-    /// sealed tree, `discard_build` (gc's reclaim, an aborted stage) removes it, and so
-    /// does `uninstall`. The control: a plain `remove_dir_all` of the sealed tree fails,
-    /// so the unseal is what each removal needs.
+    /// A single-binary build's `bin/` is sealed `0555` on both lanes, so agy's own updater
+    /// (which writes `agy.<nanos>.old` beside the binary) cannot write there, and every
+    /// removal still takes it: a re-stage's swap, `discard_build` and `uninstall`. The
+    /// control: a plain `remove_dir_all` of the sealed tree fails.
     #[cfg(unix)]
     #[test]
     fn a_single_binary_builds_bin_is_sealed_and_every_removal_still_takes_it() {
@@ -3112,17 +2905,10 @@ mod tests {
         }
     }
 
-    /// `hdiutil info`'s report, parsed: the block a FAILED attach leaves behind — the
-    /// image attached, every entity mounted NOWHERE — is recognised as a carcass with a
-    /// device node to eject, while an image mounted somewhere that is not our mount
-    /// point is left alone.
-    ///
-    /// This is the defect the `dmg` lane leaked on. `hdiutil attach` can exit non-zero
-    /// having ALREADY attached the image (`Resource temporarily unavailable`, measured
-    /// at 5 attempts in 20 on an idle Mac); the guard read that non-zero exit as
-    /// "nothing attached" and the devices outlived the process. The report is the only
-    /// place the carcass is visible, so the rule that reads it is pinned here rather
-    /// than left to a test that has to lose a race to exercise it.
+    /// `hdiutil info`'s report, parsed: the block a failed attach leaves (the image attached,
+    /// every entity mounted nowhere) is a carcass with a device node to eject, while an image
+    /// mounted anywhere but our mount point is left alone. `hdiutil attach` can exit non-zero
+    /// having already attached the image, and only the report shows it.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_failed_attach_leaves_a_carcass_the_hdiutil_report_names() {
@@ -3356,12 +3142,9 @@ image-alias     : /tmp/stage/bar.dmg
         );
     }
 
-    /// The dmg lane's `.app` picker over a plain directory — the rule a mounted image's
-    /// root is judged by, without the image: exactly one REAL `.app` directory is picked
-    /// whatever else sits beside it (a README, an `Applications` link, a link that merely
-    /// NAMES an app), and zero or two are refused with the count. The real-image half of
-    /// the refusal, detach included, is
-    /// `a_dmg_with_no_app_is_refused_and_detached`.
+    /// The dmg lane's `.app` picker over a plain directory: exactly one real `.app` directory
+    /// is picked whatever else sits beside it (a README, an `Applications` link, a link that
+    /// merely names an app), and zero or two are refused with the count.
     #[cfg(target_os = "macos")]
     #[test]
     fn dmg_picker_refuses_anything_but_exactly_one_real_app() {
@@ -3530,12 +3313,11 @@ image-alias     : /tmp/stage/bar.dmg
         );
     }
 
-    /// AT3's review (2026-10-10): `ditto` keeps a member's owner and group (all of them as
-    /// root, ditto(1); unprivileged, any group its user is a member of), so the dmg walk
-    /// gives every entry, links included, the stage root's owner and group: what an
-    /// archive lane's entry gets (its stager, and on macOS its directory's group). A test
-    /// cannot lay a foreign OWNER without root, so a file, a directory and a link are laid
-    /// in another group of this user's, the half `ditto` keeps at any privilege.
+    /// `ditto` keeps a member's owner and group (all of them as root; unprivileged, any group
+    /// its user is in), so the dmg walk gives every entry, links included, the stage root's
+    /// owner and group, as an archive lane's entry gets. A test cannot lay a foreign owner
+    /// without root, so a file, a directory and a link are laid in another of this user's
+    /// groups, the half `ditto` keeps at any privilege.
     #[cfg(target_os = "macos")]
     #[test]
     fn dmg_copy_walk_gives_every_entry_the_stage_roots_owner_and_group() {
@@ -3592,13 +3374,9 @@ image-alias     : /tmp/stage/bar.dmg
         }
     }
 
-    /// AT3's review (2026-10-10): the scratch a stage fills is its owner's alone until the
-    /// swap, and the build it becomes has the mode of every other directory in a build,
-    /// both whatever the umask. `create_dir_all` gave it `0777 & ~umask`: `0755` under
-    /// the usual `022`, so anyone could reach a member before the dmg walk had sanitized
-    /// it, and `0777` under `000`, so anyone could rename `bin/` out of the swapped-in
-    /// build (`an_install_under_an_open_umask_leaves_nothing_others_can_write`, in
-    /// `flow`, stages under that umask).
+    /// The scratch a stage fills is its owner's alone until the swap, and the build it
+    /// becomes is `0755`, whatever the umask (`flow`'s
+    /// `an_install_under_an_open_umask_leaves_nothing_others_can_write` stages under `000`).
     #[cfg(unix)]
     #[test]
     fn the_staging_scratch_is_private_until_the_swap_and_the_build_is_0755() {
@@ -3634,9 +3412,9 @@ image-alias     : /tmp/stage/bar.dmg
         vec![(crate::store::VENDOR_SIDECAR_SUFFIX, body.into_bytes())]
     }
 
-    /// THE ORDER. `pre_swap` sees the verified `.incoming` tree while nothing is at the
-    /// build path; the sidecars are rendered from the root the stage verified and are on
-    /// disk beside the marked build; and the stage returns that same root.
+    /// The order: `pre_swap` sees the verified `.incoming` tree while nothing is at the build
+    /// path, the sidecars are rendered from the verified root and are on disk beside the
+    /// marked build, and the stage returns that same root.
     #[test]
     fn hooks_run_before_the_swap_and_sidecars_land_before_the_marker() {
         let b = bundle("hooks-order");
@@ -3692,10 +3470,9 @@ image-alias     : /tmp/stage/bar.dmg
         );
     }
 
-    /// `.ready` IMPLIES THE SIDECARS. A sidecar that cannot be written stops the stage
-    /// between the swap and the marker — the state a kill there leaves: the verified tree
-    /// in place, unmarked, so it reads as not installed and is re-staged; the next stage
-    /// that can write the record marks it.
+    /// `.ready` implies the sidecars: one that cannot be written stops the stage between the
+    /// swap and the marker, leaving the verified tree unmarked (read as not installed), and
+    /// the next stage that can write it marks the build.
     #[test]
     fn a_stage_stopped_between_swap_and_marker_leaves_no_complete_build() {
         let b = bundle("hooks-kill");
@@ -3776,10 +3553,10 @@ image-alias     : /tmp/stage/bar.dmg
         }
     }
 
-    /// THE PASS PATH, on every machine: a codex-shaped tree whose Mach-Os all verify
-    /// passes — each Mach-O asked about exactly once, in order, fat or thin, the data
-    /// files not at all. The genuine package's executable-mode JSON arrives here demoted
-    /// to 0644 by the vendor lane ([`crate::macho::demote_foreign_executables`]).
+    /// The pass path: a codex-shaped tree whose Mach-Os all verify passes, each Mach-O asked
+    /// about once, in order, fat or thin, the data files not at all. The genuine package's
+    /// executable-mode JSON arrives here demoted to 0644 by the vendor lane
+    /// ([`crate::macho::demote_foreign_executables`]).
     #[cfg(unix)]
     #[test]
     fn the_gate_passes_a_tree_whose_every_macho_verifies_and_asks_about_each_once() {
@@ -3802,9 +3579,9 @@ image-alias     : /tmp/stage/bar.dmg
         );
     }
 
-    /// THE ENTRY IS BOUND. What a shim runs (`bin/<tool>` for each exposed tool) must be
-    /// one of the verified Mach-Os: a shebang-less text entry, a missing one, or a link
-    /// beside a genuinely signed decoy is refused — as is an interpreter-script helper.
+    /// The entry is bound: what a shim runs (`bin/<tool>` for each exposed tool) must be one
+    /// of the verified Mach-Os, so a text entry, a missing one or a link beside a signed decoy
+    /// is refused, as is an interpreter-script helper.
     #[cfg(unix)]
     #[test]
     fn an_entry_that_is_not_a_verified_macho_or_a_script_helper_is_refused() {
@@ -3841,9 +3618,9 @@ image-alias     : /tmp/stage/bar.dmg
         refused_as(&d, &["codex"], "codex-path/rg ");
     }
 
-    /// NO EXECUTE BIT OFF A VERIFIED MACH-O. A data file at 0755 beside Mach-Os that all
-    /// verify is refused by name — `/bin/sh` would run it unsigned — and passes once the
-    /// lane's demotion has cleared its bits, while every Mach-O keeps its own.
+    /// No execute bit off a verified Mach-O: a data file at 0755 beside Mach-Os that all
+    /// verify is refused by name (`/bin/sh` would run it unsigned) and passes once the lane's
+    /// demotion has cleared its bits, while every Mach-O keeps its own.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_executable_that_is_not_a_macho_is_refused_until_demoted() {

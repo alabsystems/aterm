@@ -204,9 +204,15 @@ pub enum Remedy {
         /// The item id or layer name.
         only: String,
     },
-    /// `aterm init --develop`.
+    /// `aterm init --develop`. Neither this nor [`Remedy::Provision`] has a producer yet:
+    /// each names a verb its own slice adds (S8's flag, S7's verb), and only an item of
+    /// that slice may answer with it, so no row names a command this build lacks (#89).
+    /// They are in the wire already because a report crosses builds (the machines agent
+    /// reads the person's `aterm pkg doctor --json`, whatever aterm that is), and an
+    /// agent older than S7 must still read a report that carries one.
     Develop,
-    /// `targo --unverified verify provision <args>` (`--linux`, `--record`, or nothing).
+    /// `targo --unverified verify provision <args>` (`--linux`, `--record`, or nothing);
+    /// S7's, as [`Remedy::Develop`] says.
     Provision {
         /// The verb's arguments.
         args: String,
@@ -234,6 +240,11 @@ pub enum StoodAside {
     Lock(String),
     /// A network the change needs is down (atpkg's exit 69).
     Offline(String),
+    /// The change waits on someone else's act (an admin approving this Mac's join to the
+    /// secrets vault); the line says whose and what.
+    Waiting(String),
+    /// The account has not granted permission the change needs (exit 77).
+    Permission(String),
 }
 
 impl StoodAside {
@@ -241,17 +252,21 @@ impl StoodAside {
     #[must_use]
     pub fn why(&self) -> &str {
         match self {
-            Self::Lock(why) | Self::Offline(why) => why,
+            Self::Lock(why) | Self::Offline(why) | Self::Waiting(why) | Self::Permission(why) => {
+                why
+            }
         }
     }
 
     /// The exit status a run whose only incomplete rows stood aside this way ends with:
-    /// 75 (`EX_TEMPFAIL`) for a lock, 69 (`EX_UNAVAILABLE`) offline (design §3.3).
+    /// 75 (`EX_TEMPFAIL`) for a lock or a wait on someone else, 69 (`EX_UNAVAILABLE`)
+    /// offline, or 77 (`EX_NOPERM`) when a required permission has not been granted.
     #[must_use]
     pub const fn exit_status(&self) -> u8 {
         match self {
-            Self::Lock(_) => 75,
+            Self::Lock(_) | Self::Waiting(_) => 75,
             Self::Offline(_) => 69,
+            Self::Permission(_) => 77,
         }
     }
 }
@@ -302,11 +317,13 @@ pub struct ItemReport {
     /// leave `Ok` or `Changed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<Explain>,
-    /// Set when the apply stood aside (a held lock, no network); the row is `Blocked`.
+    /// Set when the apply stood aside (a held lock, no network, missing permission);
+    /// the row is `Blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stood_aside: Option<StoodAside>,
-    /// The item's [`crate::Item::essential`]: whether this row left wrong fails the surface
-    /// that ran it ([`ItemReport::fails_surface`]). A structural fault and an advisory both
+    /// The item's [`crate::Item::essential`]: whether this row left wrong fails a surface
+    /// using [`ItemReport::fails_surface`]. A surface using [`Readiness`] has a stricter
+    /// rule. A structural fault and an advisory both
     /// plan a change, so `outcome` alone cannot tell a reader which one decided the exit.
     /// Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -314,7 +331,7 @@ pub struct ItemReport {
 }
 
 impl ItemReport {
-    /// Whether this row fails the surface that ran it: a change that did not land, or an
+    /// Whether this row fails a surface using the essential-item policy: a change that did not land, or an
     /// essential item the run left other than done (`Ok`, `Changed`), not applicable or
     /// waiting for an idle Mac. One rule for the surface's exit and for a reader of its
     /// `--json` (the machines toolset probe) naming the rows that decided it.
@@ -346,6 +363,64 @@ pub enum ReportMode {
     Check,
 }
 
+/// Whether the checks in a report are satisfied, independently of a surface's
+/// failure policy. A plan, a manual step or an unreadable state is not green.
+/// Changes explicitly requiring login/restart await activation. This describes the
+/// reported checks, not unmeasured configuration or unobserved running processes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Readiness {
+    /// Every reported check is satisfied or explicitly not applicable. An empty
+    /// report is not evidence of readiness.
+    pub all_green: bool,
+    /// The requested selectors; empty means the surface's full default scope.
+    pub scope: Vec<String>,
+    /// Checks already satisfied or changed and confirmed by read-back.
+    pub satisfied: usize,
+    /// Checks explicitly inapplicable to this host or accepted configuration.
+    pub not_applicable: usize,
+    /// Changed configuration awaiting login or restart, according to the row's
+    /// effect. A configured value is not evidence that it is already active.
+    pub pending_activation: Vec<String>,
+    /// Stable ids of checks still planned, manual, blocked, deferred, unknown or
+    /// failed. Their report rows carry the evidence and remedies.
+    pub unresolved: Vec<String>,
+}
+
+impl Readiness {
+    /// Summarize the evidence in `items`, without changing any outcome or the
+    /// failure policy used by other surfaces.
+    #[must_use]
+    pub fn of(items: &[ItemReport], scope: &[String]) -> Self {
+        let mut readiness = Self {
+            all_green: false,
+            scope: scope.to_vec(),
+            satisfied: 0,
+            not_applicable: 0,
+            pending_activation: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        for row in items {
+            match row.outcome {
+                Outcome::Changed if matches!(row.effect, Effect::Login | Effect::Restart) => {
+                    readiness.pending_activation.push(row.id.clone());
+                }
+                Outcome::Ok | Outcome::Changed => readiness.satisfied += 1,
+                Outcome::NotApplicable => readiness.not_applicable += 1,
+                Outcome::Planned
+                | Outcome::Person
+                | Outcome::Blocked
+                | Outcome::Deferred
+                | Outcome::Unknown
+                | Outcome::Failed => readiness.unresolved.push(row.id.clone()),
+            }
+        }
+        readiness.all_green = !items.is_empty()
+            && readiness.unresolved.is_empty()
+            && readiness.pending_activation.is_empty();
+        readiness
+    }
+}
+
 /// The report of one run, in the one schema `--json` prints on every surface (design
 /// §3.3): `aterm init` and `aterm pkg doctor` today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,10 +430,14 @@ pub struct Report {
     /// What was asked.
     pub mode: ReportMode,
     /// Whether the surface's exit rule held: its exit status is 0 exactly when this is
-    /// true (a stood-aside init exits 75 or 69, never 0).
+    /// true (a stood-aside init exits 75, 69 or 77, never 0).
     pub complete: bool,
     /// One row per item, in run order.
     pub items: Vec<ItemReport>,
+    /// Optional stricter readiness assessment. `aterm doctor` uses this for its
+    /// exit rule; older reports and other surfaces may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Readiness>,
 }
 
 impl Report {
@@ -370,6 +449,7 @@ impl Report {
             mode,
             complete,
             items,
+            readiness: None,
         }
     }
 }
@@ -387,6 +467,68 @@ mod tests {
         assert!(!Outcome::NotApplicable.is_failure());
         assert!(!Outcome::Deferred.is_failure());
         assert!(!Outcome::Planned.is_failure());
+    }
+
+    #[test]
+    fn readiness_is_stricter_than_the_failure_policy_and_requires_evidence() {
+        assert!(!Readiness::of(&[], &[]).all_green);
+        let mut r = row();
+        r.essential = false;
+        for outcome in [
+            Outcome::Ok,
+            Outcome::Changed,
+            Outcome::NotApplicable,
+            Outcome::Planned,
+            Outcome::Person,
+            Outcome::Blocked,
+            Outcome::Deferred,
+            Outcome::Unknown,
+            Outcome::Failed,
+        ] {
+            r.outcome = outcome;
+            let ready = matches!(
+                outcome,
+                Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+            );
+            let assessment = Readiness::of(std::slice::from_ref(&r), &["base".into()]);
+            assert_eq!(assessment.all_green, ready, "{outcome:?}");
+            assert_eq!(assessment.scope, ["base"]);
+            assert_eq!(assessment.unresolved.is_empty(), ready, "{outcome:?}");
+            assert_eq!(r.fails_surface(), outcome == Outcome::Failed);
+        }
+    }
+
+    #[test]
+    fn optional_readiness_round_trips_without_changing_older_reports() {
+        let mut report = Report::new(ReportMode::Check, false, vec![row()]);
+        let old = aterm_json::to_string(&report).unwrap();
+        assert!(!old.contains("readiness"));
+        assert_eq!(aterm_json::from_str::<Report>(&old).unwrap(), report);
+        report.readiness = Some(Readiness::of(&report.items, &["base".into()]));
+        let text = aterm_json::to_string(&report).unwrap();
+        assert_eq!(aterm_json::from_str::<Report>(&text).unwrap(), report);
+        assert!(text.contains(r#""all_green":false"#));
+    }
+
+    #[test]
+    fn changed_settings_await_login_or_restart_without_inventing_pending_work_for_ok_rows() {
+        let mut r = row();
+        for effect in [
+            Effect::Now,
+            Effect::Relaunch,
+            Effect::Login,
+            Effect::Restart,
+        ] {
+            r.effect = effect;
+            r.outcome = Outcome::Changed;
+            let readiness = Readiness::of(std::slice::from_ref(&r), &[]);
+            let pending = matches!(effect, Effect::Login | Effect::Restart);
+            assert_eq!(readiness.all_green, !pending, "{effect:?}");
+            assert_eq!(readiness.pending_activation.len(), usize::from(pending));
+            assert_eq!(readiness.satisfied, usize::from(!pending));
+            r.outcome = Outcome::Ok;
+            assert!(Readiness::of(std::slice::from_ref(&r), &[]).all_green);
+        }
     }
 
     fn row() -> ItemReport {
@@ -517,8 +659,10 @@ mod tests {
     }
 
     #[test]
-    fn standing_aside_ends_with_atpkgs_own_exit_statuses() {
+    fn standing_aside_ends_with_the_reason_specific_exit_status() {
         assert_eq!(StoodAside::Lock(String::new()).exit_status(), 75);
         assert_eq!(StoodAside::Offline(String::new()).exit_status(), 69);
+        assert_eq!(StoodAside::Waiting(String::new()).exit_status(), 75);
+        assert_eq!(StoodAside::Permission(String::new()).exit_status(), 77);
     }
 }

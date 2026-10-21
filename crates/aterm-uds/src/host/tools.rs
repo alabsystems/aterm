@@ -60,12 +60,13 @@ const fn toolset(name: &'static str, program: &'static str, why: &'static str) -
     }
 }
 
-/// A tool the checkout pins and `verify provision` provides.
+/// A tool the checkout pins, got today the way `meanwhile` says ([`Provider::Workspace`]).
 const fn workspace(
     name: &'static str,
     when: When,
     pin: Option<Pin>,
     at: &'static [&'static str],
+    meanwhile: &'static str,
     why: &'static str,
 ) -> Tool {
     Tool {
@@ -74,7 +75,33 @@ const fn workspace(
         at,
         missing: None,
         pin,
-        provider: Provider::Workspace { when },
+        provider: Provider::Workspace {
+            when,
+            meanwhile,
+            by: None,
+        },
+    }
+}
+
+/// A [`workspace`] row a command of this tree fetches today, `targo --unverified <by>`:
+/// its remedy and its provider in `verify list` name that command.
+const fn fetched(
+    name: &'static str,
+    by: &'static str,
+    meanwhile: &'static str,
+    why: &'static str,
+) -> Tool {
+    Tool {
+        name,
+        why,
+        at: &[],
+        missing: None,
+        pin: None,
+        provider: Provider::Workspace {
+            when: When::Always,
+            meanwhile,
+            by: Some(by),
+        },
     }
 }
 
@@ -176,9 +203,12 @@ pub const TOOLS: &[Tool] = &[
             "/usr/local/bin/fish",
             "/usr/bin/fish",
         ],
+        "get fish-shell's official release from github.com/fish-shell/fish-shell/releases (on \
+         macOS, `pkgutil --expand-full <pkg> <dir>` unpacks its .pkg without installing it, the \
+         program at `<dir>/fish.pkg/Payload/usr/local/bin/fish`)",
         "only fish can judge the fish integration aterm ships (a fish integration once shipped broken \
-         while every fish test passed without running fish); built locally from upstream's pinned \
-         source, with the Linux guest's apt fish as the floor lane (§6.2)",
+         while every fish test passed without running fish); S7 builds the pin locally from \
+         upstream's source, with the Linux guest's apt fish as the floor lane (§6.2)",
     ),
     workspace(
         "pwsh",
@@ -194,6 +224,8 @@ pub const TOOLS: &[Tool] = &[
             "/usr/bin/pwsh",
             "/snap/bin/pwsh",
         ],
+        "get Microsoft's official PowerShell archive from github.com/PowerShell/PowerShell/releases, \
+         unpacked anywhere, with `chmod +x pwsh`",
         "only PowerShell can judge the PowerShell integration aterm ships: the 3 unix tests and \
          atpkg's every-dialect lane are the only PowerShell coverage that runs anywhere; Microsoft's \
          signed archive, pinned by the tree (§6.3)",
@@ -803,28 +835,27 @@ pub const TOOLS: &[Tool] = &[
     ),
     toolset("agy", "agy", "an agent of the roster (row 31)"),
     toolset("muse", "muse", "an agent of the roster (row 31)"),
-    // ---- pinned by the tree, provided by `verify provision` (§6.2–§6.4) --------------
+    // ---- pinned by the tree; upstream's build, or this tree's fetch, until S7 (§6.2–§6.4) --
     workspace(
         "rustup",
         When::Always,
         None,
         &[],
+        "get rustup from rustup.rs, which installs it for this user only",
         "stable's foreign standard libraries and wasm32 (STOCK EXCEPTION), until Trust ships them: \
          the cells, the web modules and the shipped binary's x86_64 slice (rows 23, 24)",
     ),
-    workspace(
+    fetched(
         "chrome-headless-shell",
-        When::Always,
-        None,
-        &[],
+        "verify fetch-browser",
+        "`targo --unverified verify fetch-browser` fetches the pinned build into this user's cache",
         "the browser lane tests the web modules in Chromium itself; pinned by version and sha256 in \
          aterm-verify's browser module (row 23)",
     ),
-    workspace(
+    fetched(
         "firefox",
-        When::Always,
-        None,
-        &[],
+        "verify fetch-browser",
+        "`targo --unverified verify fetch-browser` fetches the pinned build into this user's cache",
         "the browser lane's second engine (row 23)",
     ),
     workspace(
@@ -832,6 +863,8 @@ pub const TOOLS: &[Tool] = &[
         When::Always,
         None,
         &[],
+        "get binaryen's official release from github.com/WebAssembly/binaryen/releases and put its \
+         bin directory on PATH",
         "binaryen's optimizer: the site ships the engine only after its -O3 pass, and the perf lane \
          measures what ships; an optimizer is not worth rebuilding (row 21)",
     ),
@@ -844,6 +877,8 @@ pub const TOOLS: &[Tool] = &[
             built: true,
         }),
         &[],
+        "the wasm-glue lane's skip names the `targo --unverified install` that builds the pinned \
+         CLI into the tooling cache",
         "the wasm-glue oracle, only to re-record its goldens: no module aterm ships is bound with it \
          (row 20)",
     ),
@@ -852,6 +887,7 @@ pub const TOOLS: &[Tool] = &[
         When::Linux,
         None,
         &["/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"],
+        "get lima's official release from github.com/lima-vm/lima/releases",
         "the Linux lane's VM (vz backend), for the Linux-only tests and the fish floor (row 25)",
     ),
     // ---- nobody's yet: §6.1 replaces, drops or leaves it outside (rows 13, 14, 17-19) ----

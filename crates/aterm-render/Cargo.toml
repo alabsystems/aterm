@@ -59,38 +59,29 @@ aterm-core = { path = "../aterm-core", default-features = false }
 # The Unicode `Emoji_Presentation` gate: a default-text code point (⏺ U+23FA) is
 # never resolved to the colour-emoji face merely because that face covers it.
 aterm-grapheme = { workspace = true }
-# The bidi class of a cell (R/AL): the run planner shapes a stretch of
-# right-to-left letters a reordered row paints backwards in logical order. The
-# font oracle (tests/font_oracle.rs) reorders its visual-order runs with the
-# same UAX #9 code aterm-core calls. First-party, already linked through
-# aterm-font.
+# Bidi classes (R/AL): the run planner shapes, in logical order, a stretch of
+# right-to-left letters a reordered row paints backwards. tests/font_oracle.rs
+# reorders runs with the same UAX #9 code aterm-core calls.
 aterm-bidi = { workspace = true }
-# Ligature config (LigatureMode / TextShapingConfig / FontFeature): the shaping
-# settings that gate liga/calt. Plain data types, no default features.
+# Shaping config (ligature mode, font features, ambiguous width) and the `dev_seam!`
+# macro. Plain data types, no default features.
 aterm-types = { workspace = true }
-# The unified message engine (docs/DESIGN-unified-messages-2026-09-21.md,
-# ruling 331): `src/band.rs` turns its resolved band rows into this renderer's
-# input, the one composition the native window and the web module share.
-# `aterm-time` is its only dependency — clockless, wasm-clean.
+# The unified message engine (docs/DESIGN-unified-messages-2026-09-21.md):
+# src/band.rs turns its resolved band rows into renderer input, the one composition
+# the native window and the web module share.
 aterm-messages = { workspace = true }
-# Fast unkeyed hasher (FxHash) for the per-cell glyph caches — the render profile
-# showed ~10% of rasterize time in SipHash. Glyph-cache keys are local render state
-# (font glyphs), not an untrusted hashmap-flood vector, so FxHash is the right
-# choice there (matches the engine's grid/core caches, which already use it). The
-# memos keyed by text a pane's program prints use its `KeyedHashMap` instead.
+# FxHash for the per-cell glyph caches (SipHash cost ~10% of rasterize time): their
+# keys are local font state, not a hash-flood vector. Memos keyed by text a pane's
+# program prints use `KeyedHashMap`.
 aterm-hash = { workspace = true }
-# First-party PNG (crates/aterm-png), which retired `png` and the flate2/
-# miniz_oxide/fdeflate/simd-adler32/crc32fast/adler2 compression stack behind
-# it — 7 packages / 33,439 lines. Decode is the inline-image and colour-emoji
-# path (`decode_png_rgba8`); encode is the `image` verb's framebuffer dump.
+# Decode for inline images and colour emoji (`decode_png_rgba8`); encode for the
+# `image` verb's framebuffer dump.
 aterm-png = { workspace = true }
-# THE font reader and shaper (first-party since TF.5 and TF.6 of
-# docs/AUDIT-third-party-2026-10-15.md, carved from ttf-parser 0.25.1 and
-# rustybuzz 0.20.1): `src/font.rs` reads the cmap, `hmtx`, `hhea`/OS/2 and
-# legacy `kern` through it and outlines every glyph through it, `src/colr.rs`
-# paints COLR glyphs, the colour-emoji path reads `sbix`/`CBDT` bitmaps, and
-# `src/ligature_shaping.rs` shapes runs with `aterm_font::shape` (the colour
-# face's clusters too, except on macOS, where CoreText shapes them).
+# The font reader and shaper: src/font.rs reads cmap, hmtx, hhea/OS/2 and legacy kern
+# and outlines glyphs through it; src/colr.rs paints COLR glyphs; the colour-emoji
+# path reads `sbix`/`CBDT` bitmaps; src/ligature_shaping.rs shapes runs with
+# `aterm_font::shape`, which also shapes colour-face clusters except on macOS
+# (CoreText).
 aterm-font = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
@@ -130,10 +121,8 @@ aterm-uds = { workspace = true }
 # this crate) is fine — cargo permits dev-dependency cycles. Dev-only: the
 # shipped renderer lib gains no effects dep.
 aterm-effects = { workspace = true }
-# Trust/ty derived-model proof of the colour-presentation gate invariant
-# (tests/presentation_gate.rs): a default-text code point never resolves to the
-# colour-emoji face. Same in-process model interpreter the scrollback/session
-# proofs use.
+# tests/presentation_gate.rs: a derived-model proof that a default-text code point
+# never resolves to the colour-emoji face.
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-effects = { workspace = true }

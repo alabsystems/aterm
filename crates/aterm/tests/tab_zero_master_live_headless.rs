@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance: A CLOSED TAB 0 RELEASES ITS PTY MASTER
-//! (2026-09-29).
+//! Live-headless conformance: a closed tab 0 releases its PTY master. The byte sink owns the
+//! master and closes it only with its last clone, so a clone of session 0's engine or sink
+//! held for the event loop's life (a startup local) would keep tab 0's master open, and its
+//! shell, exiting with output unread, could not finish its exit.
 //!
-//! The owner's window (v0.98.0) held a PTY master, fd 6 on `ttys000`, with no
-//! process left on its terminal: the master of the session it had started
-//! with, closed hours before (`exits`: `local=0 reason=ui-close`). Its later
-//! tabs closed cleanly. The startup function kept named clones of session 0's
-//! engine and byte sink as locals, and every local there lives until the event
-//! loop returns; the sink owns the master and closes it only with its last
-//! clone, so tab 0's master stayed open for the window's life (and its shell,
-//! exiting with output unread, could not finish its exit).
+//! Through the real binary: boot, open a second tab, close the boot session (local 0), and
+//! read both the instance's PTY census (`metrics`: `pty_masters=` vs `pty_sessions=`) and,
+//! where the platform can say it, the PTY masters the process has open. NEGATIVE CONTROL:
+//! before the close both counts read two, so a one afterwards is the close, not a count that
+//! never counted.
 //!
 //! Driven through the real binary: boot, open a second tab, close the BOOT
 //! session (local 0), and read both the instance's own PTY census (`metrics`:
@@ -51,9 +50,8 @@ use crate::headless_boot;
 
 use headless_boot::{Instance, ctl_ok, field};
 
-/// How long something that MUST happen may take before it is read as a hang
-/// (a hang detector, never a latency budget). A closing session's master
-/// closes once its reader has wound down, normally well under a second.
+/// How long something that must happen may take before it is read as a hang. A closing
+/// session's master closes once its reader has wound down, normally well under a second.
 const HANG: Duration = Duration::from_secs(60);
 
 /// One poll of the instance's PTY census and, right after it, the OS's count.

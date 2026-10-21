@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FOREGROUND CUT (2026-09-25): where in the PTY byte stream the
-//! foreground process group changed, so the parse thread can hand the terminal
-//! back to its host exactly there.
+//! The foreground cut: where in the PTY byte stream the foreground process group changed, so
+//! the parse thread can hand the terminal back to its host exactly there.
 //!
-//! The incident: a Claude Code killed while it held the terminal left the alt
-//! screen, kitty flags, modifyOtherKeys, mouse tracking, focus reporting, 2026
-//! and a hidden cursor armed under the shell that reclaimed it. The tab looked
-//! crashed — every mouse move typed `ESC[<32;…M` at the prompt, and zle rang
-//! the bell at each CSI-u chord. The engine half of the fix is
-//! [`aterm_core::terminal::Terminal::foreground_handback`]; this module is the
-//! host half's pure core: the gather thread samples `tcgetpgrp(master)` at
-//! every dry-gap park and at every batch end, and [`FgCutter`] turns those
-//! samples into at most one [`FgEdge`] per batch.
+//! A program killed while it holds the terminal leaves its modes (alt screen, kitty flags,
+//! modifyOtherKeys, mouse tracking, focus reporting, 2026, a hidden cursor) armed under the
+//! shell that reclaims it: every mouse move types `ESC[<32;…M` at the prompt. The engine half
+//! is [`aterm_core::terminal::Terminal::foreground_handback`]; this module is the host half's
+//! pure core. The gather thread samples `tcgetpgrp(master)` at every dry-gap park and every
+//! batch end, and [`FgCutter`] turns those samples into at most one [`FgEdge`] per batch.
 //!
 //! # Why the cut is sound
 //!
@@ -28,101 +24,47 @@
 //! in the stream. The derived model is `ForegroundHandback`
 //! (`aterm-models-gui/src/models_foreground_handback.rs`).
 //!
-//! # Only ORPHANED modes are handed back (the 2026-09-25 review)
+//! # What is handed back
 //!
-//! A foreground change is not a death. Ctrl-Z stops a job and the shell takes
-//! the terminal; `gdb -tui` gives the terminal to its inferior on `run` and
-//! takes it back at a breakpoint; ssh's `~^Z` suspends a remote vim. Handing
-//! back at every change stripped those programs' modes while they still ran,
-//! and nothing re-armed them after `fg` or `continue`. So [`FgOwners`]
-//! attributes each evidence bit ([`aterm_core::terminal::program_evidence`])
-//! to the foreground group whose bytes set it, and the parse stage restores
-//! only when one of those groups is GONE ([`group_gone`]): its leader pid
-//! answers `ESRCH` ([`leader_gone`]) and no surviving member is stopped
-//! ([`group_has_stopped_member`]). The LEADER, not the group: the incident's
-//! SIGKILLed Claude Code left same-group children (MCP servers, tool
-//! processes) alive, and a group check would have kept the incident. But not
-//! the leader ALONE: a pipeline's first stage is its leader, so in
-//! `producer | tui` the leader is gone as soon as the producer exits, and
-//! Ctrl-Z on the still-running TUI read as a death (the review's live probe,
-//! `sleep 0 | sh -c …`). A STOPPED member proves the job lives and will be
-//! resumed; the incident's MCP children run, and none is stopped. That rule
-//! is for the group that lost the terminal at the edge ([`FgRole::Holder`]),
-//! which the incident's killed program always is at its death edge. Any
-//! OTHER owner of an input bit ([`FgRole::Bystander`]) counts as gone only
-//! when no member of its group survives ([`group_empty`], the third
-//! 2026-09-25 review): the stopped leaderless pipeline, `bg`'d, runs on with
-//! no member stopped, and the holder rule stripped its modes at the next
-//! command the shell ran.
-//! Attribution is what keeps `gdb -tui` whole when its inferior exits: the
-//! inferior is gone, but the alt screen is gdb's, and gdb lives. A holder that
-//! is gone with only a torn escape sequence to its name still gets the `CAN`.
+//! A foreground change is not a death (Ctrl-Z, `gdb -tui` handing the terminal to its
+//! inferior, ssh's `~^Z`). [`FgOwners`] attributes each evidence bit
+//! ([`aterm_core::terminal::program_evidence`]) to the group whose bytes set it, and the parse
+//! stage restores only when an owning group is gone ([`group_gone`], by [`FgRole`]), so
+//! `gdb -tui` keeps its alt screen when its inferior exits. Gone is not killed: `tput civis`,
+//! `tput smcup` and `tput smcup; cmd` must keep their effect, so a gone group orphans the
+//! terminal only when it owns an input-hijacking mode
+//! ([`program_evidence::INPUT`](aterm_core::terminal::program_evidence::INPUT)); an input
+//! owner's death restores every mode. A gone holder with only a torn escape sequence to its
+//! name still gets the `CAN`.
 //!
-//! # Only a gone group that hijacked INPUT orphans the terminal
+//! Liveness is probed once per group before the term lock is taken ([`FgOwners::probe_edge`]);
+//! the locked half reads the verdicts.
 //!
-//! Gone is not killed: a one-shot command that exits cleanly is gone too, and
-//! nothing tells the two apart. The second 2026-09-25 review found `tput
-//! civis`, `tput smcup` and `/usr/bin/printf '\e[?1000h'` all reverted the
-//! moment the command exited, and `tput smcup; cmd` drawing `cmd` on the main
-//! screen. The incident's harm is the input-hijacking modes
-//! ([`program_evidence::INPUT`](aterm_core::terminal::program_evidence::INPUT)),
-//! so a gone group orphans the terminal only when it owns one of those;
-//! display bits alone (alt screen, VT52, hidden cursor, 2026) are kept, and
-//! an input owner's death still restores every mode.
+//! The overlap handoff parks every reader, and a job can die and its shell reclaim the terminal
+//! in between, so the gather keeps the last holder on the session (`Session::fg_holder`), the
+//! handoff carries it (`SessionRecord::fg_holder`), and a new reader's cutter starts from it: a
+//! differing first sample is an edge at offset 0, the handoff boundary.
 //!
-//! # Liveness is decided outside the term lock
+//! # Residuals
 //!
-//! At an edge the parse stage probes, BEFORE it takes the term lock for the
-//! slice that starts at the cut, each group the handback can ask about, once
-//! ([`FgOwners::probe_edge`]); the locked half reads the verdicts. The probe
-//! runs at nearly every edge — after any finished command the old leader is
-//! reaped — and on Linux it walks processes, so the review measured it as a
-//! lock-path cost. That walk is bounded by the session's own process tree
-//! ([`group_has_stopped_member`]).
-//!
-//! # The holder survives a reader restart
-//!
-//! The overlap handoff parks every reader and either resumes it or hands the
-//! session to the next process; a job can die, and its shell reclaim and draw
-//! its prompt, in between. A new reader that seeded its holder from a fresh
-//! probe saw the shell as holder from its first sample — no edge, no handback,
-//! the incident exactly. So the gather keeps the last holder it saw on the
-//! session (`Session::fg_holder`), the handoff carries it on the session's
-//! manifest record (`SessionRecord::fg_holder`) whatever rung the screen
-//! crosses at, and a new reader's cutter starts from it: a first sample that
-//! differs is an edge at offset 0, which is the handoff boundary. (The first
-//! cut carried it in the control-carry sidecar, which a Sanitized or Repaint
-//! session, a repainted one and one past the aggregate sidecar budget all go
-//! without, while still restoring their modes.)
-//!
-//! Residuals (documented there and in the plan): old-group bytes still unread
-//! at the change are parsed after the cut (bounded by one tty queue, needs
-//! backpressure); a reap+reclaim inside one µs spin window; a job whose whole
-//! life falls between two samples; no foreground change at all (ssh, tmux,
-//! `-e`); a stopped job killed while stopped is handed back at the NEXT
-//! foreground change, not at its death (nothing samples between); a job
-//! whose leader exited and whose RUNNING non-leader hands the terminal to its
-//! own child (`cat f | gdb -tui`, then `run`) counts as orphaned, because no
-//! member is stopped (a stopped one, Ctrl-Z on `producer | tui`, is not);
-//! a bystander ([`FgRole::Bystander`]) whose leader alone was killed while
-//! other members of its group run on keeps its modes until the last of them
-//! is gone (`kill %1` signals the whole group, so a job killed from the shell
-//! is not this); on macOS a member's status is read with
-//! `PROC_PIDT_SHORTBSDINFO`, which answers for another user's process (a
-//! stopped `producer | sudo tui`), where `PROC_PIDTBSDINFO` is refused;
-//! nested programs' modes cannot be told apart (a TUI inferior under
-//! `gdb -tui` that dies takes gdb's modes with it, and so does one that arms
-//! gdb's mode again); a restarted reader attributes the modes already in
-//! force to the carried holder, until a program arms one again; a job whose
-//! bytes were all parsed as the shell's (the whole life of `printf
-//! '\e[?1000h'` between two samples, or read after the reclaim) loses its
-//! own handback — only its own: the next program that arms that mode again
-//! owns it ([`FgOwners`], 2026-09-27); a mode the shell arms again over a
-//! stopped job's is the shell's from then on; a one-shot
-//! that arms an INPUT mode on purpose and exits is handed back, and a program
-//! killed with only DISPLAY modes armed (a SIGKILLed `less`) is not; on Linux
-//! a stopped member outside the session leader's process tree (reparented
-//! away) is not seen.
+//! * Old-group bytes still unread at the change are parsed after the cut (bounded by one tty
+//!   queue).
+//! * A reap and reclaim inside one µs spin window, a job whose whole life falls between two
+//!   samples, and no foreground change at all (ssh, tmux, `-e`) are not seen.
+//! * A job killed while stopped is handed back at the next foreground change, not at its death.
+//! * A job whose leader exited and whose running non-leader hands the terminal to its own child
+//!   (`cat f | gdb -tui`, then `run`) counts as orphaned: no member is stopped.
+//! * A bystander whose leader alone was killed keeps its modes until its last member is gone.
+//! * Nested programs' modes cannot be told apart: a TUI inferior under `gdb -tui` that dies, or
+//!   that re-arms gdb's mode, takes gdb's modes with it.
+//! * A restarted reader attributes the modes already in force to the carried holder until a
+//!   program arms one again.
+//! * A job whose bytes were all parsed as the shell's (a one-shot `printf '\e[?1000h'` between
+//!   two samples, or read after the reclaim) loses its own handback; the next program that arms
+//!   that mode owns it. A mode the shell re-arms over a stopped job's is the shell's.
+//! * A one-shot that arms an input mode on purpose and exits is handed back; a program killed
+//!   with only display modes armed (a SIGKILLed `less`) is not.
+//! * On Linux a stopped member outside the session leader's process tree is not seen.
 
 /// One foreground change inside a gathered batch: the group in front changed
 /// ([`EdgeKind::Group`]), or its leader replaced its image in place
@@ -199,10 +141,9 @@ pub(crate) struct FgCutter {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 impl FgCutter {
-    /// A cutter whose holder is the reader's first sample. A reader attached
-    /// while a job holds the terminal (an adopted session) starts with the JOB
-    /// as holder, so the job's death is still an edge. `first <= 0` (no tty,
-    /// ConPTY) means "no holder yet": the first valid sample becomes it.
+    /// A cutter whose holder is the reader's first sample, so a job holding the terminal when
+    /// the reader attached (an adopted session) still has its death as an edge. `first <= 0`
+    /// (no tty, ConPTY): the first valid sample becomes the holder.
     pub(crate) fn new(first: i32) -> Self {
         Self {
             running: first.max(0),
@@ -398,28 +339,23 @@ impl FgCutter {
     }
 }
 
-/// Which foreground group armed each evidence bit that is in force — the
-/// parse stage's half of "only orphaned modes are handed back" (module docs).
+/// Which foreground group armed each evidence bit in force: the parse stage's half of the
+/// handback rule (module doc).
 ///
-/// [`Self::observe`] is called after each run of bytes one holder wrote, with
-/// the engine's [`program_evidence`](aterm_core::terminal::Terminal::program_evidence)
-/// reading and the bits whose setters those bytes carried
-/// ([`take_evidence_asserted`](aterm_core::terminal::Terminal::take_evidence_asserted)):
-/// a bit that came on, or that the holder's bytes armed again, is that
-/// holder's; a bit that went off belongs to nobody; any other bit that stayed
-/// on keeps its owner. Bits already in force at the first observation (an
-/// adopted screen, a restarted reader) are the first holder's. `0` is
-/// "unknown" (no probe answer) and is never reported gone.
+/// [`Self::observe`] runs after each run of bytes one holder wrote, with the engine's
+/// [`program_evidence`](aterm_core::terminal::Terminal::program_evidence) and the bits whose
+/// setters those bytes carried
+/// ([`take_evidence_asserted`](aterm_core::terminal::Terminal::take_evidence_asserted)): a bit
+/// that came on, or that the holder's bytes armed again, is that holder's; a bit that went off
+/// is nobody's; any other bit keeps its owner. Bits in force at the first observation (an
+/// adopted screen, a restarted reader) are the first holder's. `0` is "unknown" and is never
+/// reported gone.
 ///
-/// Why a re-arm moves the owner (2026-09-27, the lane at load 59-65): a
-/// starved gather read a one-shot `/usr/bin/printf '\e[?1000h'` only after
-/// zsh had taken the terminal back, so its mouse bit was the SHELL's. Losing
-/// that one handback is residual R1/R3. But when only a bit that CAME ON moved
-/// its owner, every later job that armed mouse tracking over it (`?1003h`: the
-/// bit stays on) never owned it, the shell — the new holder at every death
-/// edge, and alive — was its only owner, and no later death in that session
-/// was handed back again (ten lane rows). zsh's builtin `printf` reached it
-/// with no load. The derived model is `ForegroundHandbackOwnership`.
+/// A re-arm moves the owner because a one-shot's bit can be parsed as the shell's (a starved
+/// gather reads it after the reclaim): if only a bit that came on moved, every later job that
+/// re-armed it (`?1003h` over `?1000h`) would leave the live shell its owner, and no later
+/// death in the session would be handed back. The derived model is
+/// `ForegroundHandbackOwnership`.
 #[derive(Debug, Default)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct FgOwners {
@@ -460,7 +396,7 @@ impl FgOwners {
         self.last = evidence;
     }
 
-    /// Whether `owner` armed an INPUT-HIJACKING bit that is still in force
+    /// Whether `owner` armed an input-hijacking bit that is still in force
     /// ([`program_evidence::INPUT`](aterm_core::terminal::program_evidence::INPUT)).
     fn owns_input(&self, owner: i32) -> bool {
         use aterm_core::terminal::program_evidence::INPUT;
@@ -492,16 +428,10 @@ impl FgOwners {
         out.into_iter().take(n)
     }
 
-    /// The first group that armed an INPUT-HIJACKING bit still in force and
-    /// is gone now — `to` (the new holder) and unknown owners excepted. `gone`
-    /// is asked at most once per distinct owner.
-    ///
-    /// A gone group that owns only DISPLAY bits (alt screen, VT52, hidden
-    /// cursor, 2026) orphans nothing (the second 2026-09-25 review): that is
-    /// a one-shot `tput smcup` or `tput civis` that exited cleanly, and the
-    /// `tput smcup; cmd; tput rmcup` wrapper depends on the alt screen
-    /// outliving `tput`. A gone group that owns an input bit takes its
-    /// display bits with it — the handback restores every mode.
+    /// The first group that armed an input-hijacking bit still in force and is gone now (`to`
+    /// and unknown owners excepted); `gone` is asked at most once per owner. A gone group that
+    /// owns only display bits orphans nothing (`tput smcup; cmd; tput rmcup` needs the alt
+    /// screen to outlive `tput`); one that owns an input bit takes its display bits with it.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -514,21 +444,15 @@ impl FgOwners {
         self.suspects(to).find(|&owner| gone(owner))
     }
 
-    /// Probe, BEFORE the term lock is taken, every group the handback at the
-    /// edge `from → to` can ask about: `from` itself (the torn-sequence `CAN`
-    /// asks whether it is gone, and the cut's own [`Self::observe`] can only
-    /// attribute a new bit to `from`) and every [`Self::orphaned_by`]
-    /// suspect. Each distinct group is probed once, `from` as the
-    /// [`FgRole::Holder`] and every other suspect as a [`FgRole::Bystander`]
-    /// (the rules differ: [`group_gone`]).
+    /// Probe, before the term lock is taken, every group the handback at the edge `from → to`
+    /// can ask about: `from` as the [`FgRole::Holder`] (the torn-sequence `CAN` asks about it,
+    /// and the cut's own [`Self::observe`] can attribute a new bit only to it), and every other
+    /// [`Self::orphaned_by`] suspect as a [`FgRole::Bystander`], each once.
     ///
-    /// Why before the lock (the second 2026-09-25 review): the probe is a
-    /// `kill(pgid, 0)` and, for a gone leader, a member listing — one
-    /// `proc_listpgrppids` on macOS (6.7 µs measured with 561 processes), a
-    /// walk of the session's process tree on Linux. It runs at nearly every
-    /// foreground edge: after ANY finished command the old holder's leader is
-    /// reaped, so the `CAN` check asks about it. Asked under the term lock, the
-    /// render and input paths waited on it.
+    /// Before the lock because it runs at nearly every edge (after any finished command the old
+    /// leader is reaped) and costs a `kill(pgid, 0)` plus, for a gone leader, a member listing:
+    /// one `proc_listpgrppids` on macOS (6.7 µs with 561 processes), a session-tree walk on
+    /// Linux. Under the lock the render and input paths would wait on it.
     pub(crate) fn probe_edge(
         &self,
         from: i32,
@@ -555,9 +479,8 @@ impl FgOwners {
     }
 }
 
-/// The liveness verdicts [`FgOwners::probe_edge`] took before the term lock,
-/// read under it. A group that was not probed reads as alive: when in doubt
-/// the modes stay, which is how the terminal behaved before the handback.
+/// The liveness verdicts [`FgOwners::probe_edge`] took before the term lock, read under it. A
+/// group that was not probed reads as alive: when in doubt the modes stay.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct FgVerdicts {
@@ -585,7 +508,7 @@ impl FgVerdicts {
         self.asked().any(|(p, g)| p == pgid && g)
     }
 
-    /// How many groups were probed (the tests' once-each check).
+    /// The groups probed, in order (the tests' once-each check).
     #[cfg(test)]
     pub(crate) fn probed(&self) -> Vec<i32> {
         self.asked().map(|(p, _)| p).collect()
@@ -597,14 +520,13 @@ impl FgVerdicts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) enum FgRole {
-    /// The group that lost the terminal at this edge (`from`): gone when its
-    /// LEADER is gone and no member is stopped ([`group_orphaned`]). The
-    /// incident's killed holder is always this at its death edge.
+    /// The group that lost the terminal at this edge (`from`): gone when its leader is gone
+    /// and no member is stopped ([`group_orphaned`]). A program killed while it holds the
+    /// terminal is always this at its death edge, so the stricter bystander rule cannot miss it.
     Holder,
-    /// Any other owner of an input bit (neither `from` nor `to`): gone only
-    /// when NO member of its group survives ([`group_empty`]). Its leader
-    /// alone proves nothing: a `bg`'d pipeline whose first stage exited runs
-    /// on leaderless, with no member stopped.
+    /// Any other owner of an input bit: gone only when no member of its group survives
+    /// ([`group_empty`]). A `bg`'d pipeline whose first stage exited runs on leaderless, with
+    /// no member stopped.
     Bystander,
 }
 
@@ -612,11 +534,10 @@ pub(crate) enum FgRole {
 /// role)`, shipping [`group_gone`]. A plain `fn` so the reader threads copy it.
 pub(crate) type FgGone = fn(i32, i32, FgRole) -> bool;
 
-/// The leader half of the shipping liveness probe ([`group_gone`]): whether
-/// process group `pgid`'s LEADER no longer exists — `kill(pgid, 0)` fails with
-/// `ESRCH`. A zombie leader (not yet reaped), a live one, a pid owned by
-/// another user (`EPERM`) and `pgid <= 0` all answer `false`: when in doubt
-/// the modes stay, which is how the terminal behaved before the handback.
+/// The leader half of the shipping liveness probe ([`group_gone`]): whether process group
+/// `pgid`'s leader no longer exists (`kill(pgid, 0)` fails with `ESRCH`). A zombie or live
+/// leader, another user's pid (`EPERM`) and `pgid <= 0` answer `false`: when in doubt the modes
+/// stay.
 pub(crate) fn leader_gone(pgid: i32) -> bool {
     #[cfg(unix)]
     {
@@ -635,38 +556,24 @@ pub(crate) fn leader_gone(pgid: i32) -> bool {
     }
 }
 
-/// THE ORPHAN RULE, pure: a group's modes are orphaned when its LEADER is
-/// gone and no surviving member of the group is STOPPED. `member_stopped` is
-/// asked only when the leader is gone.
+/// The orphan rule, pure: a group's modes are orphaned when its leader is gone and no surviving
+/// member is stopped; `member_stopped` is asked only when the leader is gone.
 ///
-/// Why the second half (the 2026-09-25 review's live probe): zsh and bash make
-/// a pipeline's FIRST stage its group leader. In `sleep 0 | sh -c 'printf
-/// "\e[?1049h\e[?1003h"; sleep 30'` the `sleep 0` leader is reaped at once,
-/// so `kill(pgid, 0)` answers `ESRCH` for a job that is alive. Ctrl-Z then
-/// read as a death: the stop edge stripped the alt screen and mouse, and `fg`
-/// resumed the job without them. A stopped member is proof the job lives and
-/// will be resumed, so its modes stay. The incident still qualifies: the
-/// SIGKILLed Claude Code's same-group MCP children keep RUNNING, and none of
-/// them is stopped.
+/// The leader, not the group: a killed program's same-group children (MCP servers) live on.
+/// Not the leader alone: zsh and bash make a pipeline's first stage its leader, so in
+/// `producer | tui` the leader is reaped at once and Ctrl-Z would strip the live job's modes.
 pub(crate) fn group_orphaned(leader_gone: bool, member_stopped: impl FnOnce() -> bool) -> bool {
     leader_gone && !member_stopped()
 }
 
-/// THE LIVENESS RULE, pure, by [`FgRole`]: the edge's [`FgRole::Holder`]
-/// is gone by [`group_orphaned`] (leader gone, no member stopped); a
-/// [`FgRole::Bystander`] only when its whole group is (`group_empty`). Each
-/// fact is asked only when its rule needs it.
+/// The liveness rule, pure, by [`FgRole`]: a [`FgRole::Holder`] is gone by [`group_orphaned`],
+/// a [`FgRole::Bystander`] only when its whole group is (`group_empty`). Each fact is asked only
+/// when its rule needs it.
 ///
-/// Why a bystander needs the whole group (the third 2026-09-25 review): a
-/// pipeline whose first stage (its leader) exited, stopped by Ctrl-Z (kept:
-/// a member is stopped) and then `bg`'d, runs on in the background with its
-/// leader gone and no member stopped. It still owns its input bits, so it is
-/// a suspect at every later edge (shell → `ls`), and the holder rule judged
-/// it gone there: its modes were handed back while it ran, and `fg` resumed
-/// it without them. A background group cannot be the incident (the incident's
-/// program is killed while it HOLDS the terminal, so it is the edge's
-/// `from`), and a job killed while stopped or in the background (`kill %1`
-/// signals its whole group) is still handed back at the next edge.
+/// Bystanders need the stricter rule: a leaderless pipeline stopped and then `bg`'d runs on with
+/// no member stopped, so the holder rule would hand its modes back while it ran. A job killed in
+/// the background (`kill %1` signals the whole group) empties its group and is still handed back
+/// at the next edge.
 pub(crate) fn owner_gone(
     role: FgRole,
     leader_gone: impl FnOnce() -> bool,
@@ -692,11 +599,10 @@ pub(crate) fn group_gone(master: i32, pgid: i32, role: FgRole) -> bool {
     )
 }
 
-/// Whether NO process of group `pgid` exists: `kill(-pgid, 0)` fails with
-/// `ESRCH`. A group with any member (running, stopped, or another user's:
-/// `EPERM`) answers `false`, and so does `pgid <= 1`: `kill(-1, …)` is the
-/// broadcast to every process, not group 1, and no job runs in init's group.
-/// When in doubt the modes stay. One syscall on every unix, no walk.
+/// Whether no process of group `pgid` exists: `kill(-pgid, 0)` fails with `ESRCH`. A group
+/// with any member (running, stopped, or another user's: `EPERM`) answers `false`, and so does
+/// `pgid <= 1`: `kill(-1, …)` is the broadcast to every process, not group 1, and no job runs
+/// in init's group. One syscall, no walk.
 pub(crate) fn group_empty(pgid: i32) -> bool {
     #[cfg(unix)]
     {
@@ -715,26 +621,18 @@ pub(crate) fn group_empty(pgid: i32) -> bool {
     }
 }
 
-/// Whether any live process of group `pgid` is STOPPED (job-control stop or a
-/// trace stop). Asked only when the group's leader is gone, and only from
-/// [`FgOwners::probe_edge`], which runs OUTSIDE the term lock.
+/// Whether any live process of group `pgid` is stopped (job-control or trace stop). Asked only
+/// when the leader is gone, and only from [`FgOwners::probe_edge`], outside the term lock.
 ///
-/// macOS lists the group itself (`proc_listpgrppids`, one syscall plus one
-/// `proc_pidinfo` per member). Linux has no group listing, so it walks the
-/// process tree under the terminal's SESSION LEADER (`tcgetsid(master)`, the
-/// shell): a job's stages are the shell's children, and Ctrl-Z stops every
-/// member of the group, so a stopped job has a stopped member there. That
-/// walk is bounded by the session's own processes, not the machine's (the
-/// second 2026-09-25 review: the first cut walked all of `/proc`, one
-/// `open`+`read` per process in the system, at nearly every foreground edge).
-/// Only a kernel without `/proc/<pid>/task/<tid>/children`
-/// (`CONFIG_PROC_CHILDREN`), or an unknown session, falls back to that full
-/// walk.
+/// macOS lists the group (`proc_listpgrppids`, plus one `proc_pidinfo` per member). Linux has
+/// no group listing, so it walks the process tree under the terminal's session leader
+/// (`tcgetsid(master)`, the shell): a job's stages are the shell's children, and Ctrl-Z stops
+/// every member. Only a kernel without `/proc/<pid>/task/<tid>/children`
+/// (`CONFIG_PROC_CHILDREN`), or an unknown session, falls back to walking all of `/proc`.
 ///
-/// A table that cannot be read answers `false`, which leaves the decision to
-/// the leader alone, as before this check: the incident (a dead program's
-/// modes under the prompt) is the failure that must not come back, and a
-/// stopped pipeline losing its modes is the lesser one.
+/// A table that cannot be read answers `false`, leaving the decision to the leader alone: a
+/// dead program's modes under the prompt is the failure that must not happen, a stopped
+/// pipeline losing its modes the lesser one.
 pub(crate) fn group_has_stopped_member(master: i32, pgid: i32) -> bool {
     if pgid <= 0 {
         return false;
@@ -853,11 +751,9 @@ fn tree_any(
 /// for another user's processes.
 #[cfg(target_os = "macos")]
 fn darwin_group_has_stopped_member(pgid: i32) -> bool {
-    // SAFETY (declaration): exported by libproc in libSystem on every
-    // supported macOS (`<libproc.h>`) with exactly this signature: a pgid, a
-    // buffer of `buffersize` bytes, and the number of pids written (or -1).
-    // Declared here rather than in the first-party `libc` shim, which is
-    // generated and conformance-checked, never hand-edited.
+    // SAFETY (declaration): exported by libproc in libSystem (`<libproc.h>`) with exactly this
+    // signature: a pgid, a buffer of `buffersize` bytes, and the number of pids written (or
+    // -1). Declared here because the first-party `libc` shim is generated, never hand-edited.
     unsafe extern "C" {
         fn proc_listpgrppids(
             pgrpid: libc::pid_t,
@@ -898,13 +794,9 @@ fn darwin_group_has_stopped_member(pgid: i32) -> bool {
 /// macOS: one process's `(p_stat, pgid)`, `None` when it cannot be read (it
 /// exited mid-walk).
 ///
-/// `PROC_PIDT_SHORTBSDINFO`, not `PROC_PIDTBSDINFO`: the long record is
-/// refused (`EPERM`) for a pid another user owns, so a stopped member of a
-/// `producer | sudo tui` pipeline read as "not stopped" and the stopped job
-/// was judged orphaned (the third 2026-09-25 review, measured against
-/// launchd: the long flavor answered 0 with `EPERM`, the short one 64 of 64
-/// bytes). The short record carries no same-user check, and its
-/// `pbsi_status`/`pbsi_pgid` are all this needs. Pinned by
+/// `PROC_PIDT_SHORTBSDINFO`, not `PROC_PIDTBSDINFO`: the long record is refused (`EPERM`) for
+/// another user's pid, so a stopped member of `producer | sudo tui` would read as running.
+/// The short record has no same-user check and carries `pbsi_status`/`pbsi_pgid`. Pinned by
 /// `foreground_handback_another_users_member_status_reads_back`.
 #[cfg(target_os = "macos")]
 fn darwin_member_status(pid: i32) -> Option<(u32, i32)> {
@@ -912,10 +804,10 @@ fn darwin_member_status(pid: i32) -> Option<(u32, i32)> {
     Some((info.pbsi_status, i32::try_from(info.pbsi_pgid).ok()?))
 }
 
-/// Linux: whether one `/proc/<pid>/stat` line is a STOPPED (`T`, or `t` for a
-/// trace stop) member of group `pgid`. The fields after the command's closing
-/// parenthesis are `state ppid pgrp …`; the command itself may hold spaces and
-/// parentheses, so the split is at the LAST `)`.
+/// Linux: whether one `/proc/<pid>/stat` line is a stopped (`T`, or `t` for a trace stop)
+/// member of group `pgid`. The fields after the command's closing parenthesis are
+/// `state ppid pgrp …`; the command itself may hold spaces and parentheses, so the split is at
+/// the last `)`.
 #[cfg(any(target_os = "linux", test))]
 fn proc_stat_is_stopped_in(stat: &str, pgid: i32) -> bool {
     let Some((_, rest)) = stat.rsplit_once(')') else {
@@ -939,6 +831,37 @@ pub(crate) fn splice_at(buf: &[u8], at: usize, handback: &[u8]) -> Vec<u8> {
     out.extend_from_slice(handback);
     out.extend_from_slice(&buf[at..]);
     out
+}
+
+/// Record a handback that put `reverted` modes back with `bytes` bytes at
+/// `edge`: the timeline's `modes-restored` row ([`restored_payload`]) and, in
+/// its hold, the session log's `modes` mark with every field of the row
+/// (phase 6, 6F-7; nothing reverted too). Returns the payload. The caller
+/// holds the timeline, a strict leaf, and no other lock; the mark's wake
+/// rides the reader's coalesced `Wake::Output`, whose sweep takes it (ruling
+/// S29).
+pub(crate) fn record_restored(
+    tl: &mut crate::session_timeline::SessionTimeline,
+    edge: FgEdge,
+    reverted: &[&'static str],
+    bytes: usize,
+) -> String {
+    let program = tl.program_of(edge.from).map(str::to_string);
+    let payload = restored_payload(edge, program.as_deref(), reverted, bytes);
+    tl.record("modes-restored", payload.clone());
+    let at = tl.slog().now();
+    tl.slog_mut().observe_modes(
+        crate::session_log::observed::ModesFrom::Handback {
+            from: edge.from,
+            to: edge.to,
+            program: program.as_deref(),
+        },
+        reverted,
+        bytes,
+        aterm_slog::Actor::Nobody,
+        at,
+    );
+    payload
 }
 
 /// The `modes-restored` timeline payload:
@@ -1226,11 +1149,8 @@ mod tests {
         assert_eq!(o.orphaned_by(SHELL, |_| true), None);
     }
 
-    /// The 2026-09-27 lane at load 59-65: a one-shot's `?1000h` parsed as the
-    /// SHELL's bytes (the reader never saw the one-shot hold the terminal),
-    /// then a job that arms mouse tracking over it and dies. RED on the
-    /// replaced rule (a bit that stayed on kept its owner): the shell stayed
-    /// the owner, and at every death edge the shell is `to` and alive.
+    /// A bit re-armed over the shell's (a one-shot's `?1000h` parsed as the shell's, then a
+    /// job's `?1003h`) moves to the re-armer, so the job's death hands it back.
     #[test]
     fn foreground_handback_owners_give_a_re_armed_bit_to_its_re_armer() {
         let dead = |pids: &'static [i32]| move |p: i32| pids.contains(&p);
@@ -1258,19 +1178,16 @@ mod tests {
         o.observe(SHELL, KITTY, KITTY);
         assert_eq!(o.orphaned_by(SHELL, dead(&[JOB])), None);
 
-        // NEGATIVE CONTROL, and the residual: a job that never re-arms the
-        // shell's bit does not own it — its death hands back nothing of it.
+        // Negative control (a residual): a job that never re-arms the shell's bit does not
+        // own it.
         let mut o = FgOwners::default();
         o.observe(SHELL, MOUSE, MOUSE);
         o.observe(JOB, MOUSE | ALT_SCREEN, ALT_SCREEN);
         assert_eq!(o.orphaned_by(SHELL, dead(&[JOB])), None);
     }
 
-    /// The second 2026-09-25 review's live probe: `tput civis`, `tput smcup`
-    /// and the `tput smcup; cmd` wrapper were reverted the moment `tput`
-    /// exited. A gone group that owns only DISPLAY bits orphans nothing; one
-    /// that owns an input-hijacking bit orphans all of its bits. RED on the
-    /// reviewed rule (every owner of any bit counted).
+    /// A gone group owning only display bits (`tput civis`, `tput smcup`, `tput smcup; cmd`)
+    /// orphans nothing; one owning an input bit orphans all of its bits.
     #[test]
     fn foreground_handback_a_display_only_one_shot_orphans_nothing() {
         const TPUT: i32 = 500;
@@ -1300,12 +1217,11 @@ mod tests {
         // handback (which restores every mode) takes tput's alt screen too.
         o.observe(CMD, ALT_SCREEN | MOUSE, 0);
         assert_eq!(o.orphaned_by(SHELL, |p| p == TPUT || p == CMD), Some(CMD));
-        // A one-shot that arms an input bit on purpose is handed back: the
-        // documented residual (`/usr/bin/printf '\e[?1000h'`).
+        // A one-shot that arms an input bit on purpose is handed back (a residual).
         let mut o = FgOwners::default();
         o.observe(TPUT, MOUSE, 0);
         assert_eq!(o.orphaned_by(SHELL, |_| true), Some(TPUT));
-        // The incident: an input owner with display bits of its own.
+        // A killed TUI: an input owner with display bits of its own.
         let mut o = FgOwners::default();
         o.observe(JOB, ALT_SCREEN | CURSOR_HIDDEN | SYNC | KITTY | MOUSE, 0);
         assert_eq!(o.orphaned_by(SHELL, |_| true), Some(JOB));
@@ -1326,11 +1242,9 @@ mod tests {
         assert_eq!(asked, vec![JOB]);
     }
 
-    /// The pre-lock probe (the second 2026-09-25 review): every group the
-    /// locked handback can ask about is probed once, `from` included even
-    /// when it also owns bits (the first cut probed a gone, stopped `from`
-    /// twice), the new holder and display-only owners never, and a group
-    /// that was not probed reads as alive.
+    /// The pre-lock probe asks each group the locked handback can ask about once (`from`
+    /// included even when it also owns bits), never the new holder or a display-only owner;
+    /// a group not probed reads as alive.
     #[test]
     fn foreground_handback_probe_edge_asks_each_group_once_before_the_lock() {
         const TPUT: i32 = 500;
@@ -1443,10 +1357,8 @@ mod tests {
         assert!(leader_gone(pid), "a reaped leader is gone");
     }
 
-    /// The orphan rule (the 2026-09-25 review's pipeline probe): a gone leader
-    /// with a stopped member is a stopped job, not a dead one; a gone leader
-    /// with only running members is the incident; a live leader is alive and
-    /// the member listing is never asked for.
+    /// The orphan rule: a gone leader with a stopped member is a stopped job, with only running
+    /// members a killed one; a live leader never asks for the member listing.
     #[test]
     fn foreground_handback_a_gone_leader_with_a_stopped_member_is_not_orphaned() {
         assert!(!group_orphaned(true, || true), "Ctrl-Z on `producer | tui`");
@@ -1475,7 +1387,7 @@ mod tests {
             !proc_stat_is_stopped_in("4321 (sh) T 4000 4301 4000", 4300),
             "another group's"
         );
-        // A command name with spaces and parentheses: split at the LAST `)`.
+        // A command name with spaces and parentheses: split at the last `)`.
         assert!(proc_stat_is_stopped_in(
             "4321 (a) T (b) T 4000 4300 4000",
             4300
@@ -1484,13 +1396,9 @@ mod tests {
         assert!(!proc_stat_is_stopped_in("4321 (sh) T", 4300));
     }
 
-    /// The real process table: a group whose leader exited while a member
-    /// lives, the review's `sleep 0 | sh -c …` shape. As the edge's HOLDER,
-    /// with the member running the group is gone (the incident's shape); with
-    /// the member STOPPED it is not (Ctrl-Z); resumed, it is gone again. RED
-    /// on the reviewed probe (`leader_gone` alone), which calls the stopped
-    /// group gone. As a BYSTANDER (`bg`) it is gone only once its last member
-    /// is: RED on the holder rule for every suspect (the third review's L2).
+    /// The real process table, a group whose leader exited while a member lives: as the
+    /// holder it is gone while the member runs, not while it is stopped, and gone again once
+    /// resumed; as a bystander only once its last member is.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn foreground_handback_a_stopped_member_of_a_leaderless_group_is_seen() {
@@ -1585,11 +1493,8 @@ mod tests {
         );
     }
 
-    /// A member owned by ANOTHER user (a stopped `producer | sudo tui`) must
-    /// read back: `PROC_PIDTBSDINFO` refuses a pid that is not the caller's
-    /// (`EPERM`), so a stopped root member read as "not stopped" and a
-    /// leaderless stopped pipeline was judged orphaned. pid 1 (launchd, root)
-    /// is the other user here; run as root this test cannot tell.
+    /// A member owned by another user reads back (`PROC_PIDTBSDINFO` would refuse it with
+    /// `EPERM`). pid 1 (launchd, root) is the other user; run as root this test cannot tell.
     #[cfg(target_os = "macos")]
     #[test]
     fn foreground_handback_another_users_member_status_reads_back() {

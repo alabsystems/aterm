@@ -1,33 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! NATIVE CRISPNESS (W13 Linux, then Windows): grid-fitted (hinted) glyph
-//! rasterization for the native non-macOS raster paths.
+//! Grid-fitted (hinted) glyph rasterization for the native non-macOS raster paths (Linux and
+//! Windows).
 //!
-//! fontdue rasterizes an outline faithfully but has NO hinting: at desktop
-//! sizes (DejaVu Sans Mono 12px on a scale-1.0 display) stems land at
-//! fractional pixel phases (`fract(bounds.xmin)` is baked into the bitmap) and
-//! cap/x-height horizontal features straddle two pixel rows — measured on a
-//! live frame as a 'T' crossbar split ~75%/25% across adjacent rows and every
-//! stem trailing a ~20%-coverage ghost column. That is the "fuzzy on Linux"
-//! the macOS path never shows, because CoreText applies its own grid
-//! discipline + smoothing.
+//! The first-party `crate::font::Font` raster fills an outline faithfully but does not hint:
+//! at desktop sizes stems land at fractional pixel phases and cap/x-height features straddle
+//! two pixel rows, so text reads fuzzy where CoreText's grid fitting keeps macOS crisp. This
+//! module is the non-CoreText twin of `Renderer::ct_glyph`: aterm-font's automatic hinter
+//! ([`aterm_font::autohint::HintingInstance`], FreeType's autofit) hands back a grid-fitted
+//! outline in pixel space, which the same [`crate::raster`] coverage fill as
+//! `variation::varied_glyph_raster` turns into an 8-bit mask in the
+//! `(width, height, xmin, ymin, advance, bytes)` convention. The font's own TrueType bytecode
+//! and CFF hints never run (see [`HintMode`]). Every function returns `Option`, and `None`
+//! falls back to the unhinted path.
 //!
-//! Windows had no grid fitting at all until this module reached it — the raw
-//! outline fill, on the one platform whose reference renderers (Windows
-//! Terminal, VS Code, conhost) are all DirectWrite-hinted in the next window.
+//! Advances stay linear: the returned advance is the scaled `hmtx` value, never the hinted
+//! advance, read through the same [`crate::variation::VariedFace`] product as the unhinted
+//! raster at the same instance. It is bit-identical to what `off` reports, so cell geometry,
+//! wide-glyph centering and spill accounting cannot move with the mode; only the coverage
+//! and its integer placement change.
 //!
-//! This module is the non-CoreText twin of the macOS `ct_glyph` seam:
-//! aterm-font's automatic hinter ([`aterm_font::autohint::HintingInstance`],
-//! FreeType's autofit as skrifa 0.46.2 ports it, carved at TF.4 of
-//! docs/AUDIT-third-party-2026-10-15.md) — never the font's own TrueType
-//! bytecode or CFF hints, see [`HintMode`] — hands back a grid-fitted outline
-//! in pixel space, which the SAME [`crate::raster`] coverage fill as the
-//! FONT-2 variation path (`variation::varied_glyph_raster`) turns into an
-//! 8-bit mask in fontdue's metric convention
-//! `(width, height, xmin, ymin, advance, bytes)`. Every function returns
-//! `Option` and every `None` falls back to the untouched fontdue path, so this
-//! is always a SAFE enhancement — exactly the CoreText seam's contract.
+//! Every entry point carries the user-space variation coords, so the outline that gets
+//! grid-fitted is the instantiated one. A variable primary such as Windows' `CascadiaMono.ttf`
+//! has no Bold file, so its regular and `wght`≈700 cuts are both instances, and a hinter pinned
+//! to the default location would reset the configured weight. Linux passes an empty coord
+//! slice, the default location.
 //!
 //! Measured at DejaVu Sans Mono 12px over a pangram + digits strip: fully
 //! covered (>240) texels rise from 6.6% (fontdue) to 25.7% (mode `full`), and
@@ -74,26 +72,22 @@ use aterm_font::autohint::{HintingInstance, Target};
 /// no cache is ever split between two modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HintMode {
-    /// FreeType-ported autohinter, normal smooth target: snaps stems and
-    /// horizontal features in BOTH axes — the crispest antialiased result and
-    /// the DEFAULT. Chosen over the font's own bytecode because a TrueType
-    /// interpreter in FreeType's v40 mode applies bytecode vertical-only,
-    /// which leaves the stem fringing this module exists to remove; the
-    /// autohinter is also uniform across fonts with and without bytecode.
+    /// FreeType-ported autohinter, normal target: snaps stems and horizontal features in both
+    /// axes, the crispest antialiased result and the default. Preferred to the font's own
+    /// bytecode because a TrueType interpreter in FreeType's v40 mode applies it vertically
+    /// only, leaving the stem fringing this module removes; the autohinter is also uniform
+    /// across fonts with and without bytecode.
     #[default]
     Full,
     /// Autohinter, light target: vertical-only grid fit (the common desktop
     /// Linux `hintslight` look) — crossbars/tops snap, stem phases keep the
     /// designed fractional positions.
     ///
-    /// Also what the retired `native` spelling renders as (TF.2b of
-    /// docs/AUDIT-third-party-2026-10-15.md). `native` ran the font's own
-    /// TrueType bytecode or CFF hints, and both interpreters fit vertically
-    /// only here (see [`Full`](Self::Full)), so `light` is the nearest look;
-    /// keeping the real thing would have meant carrying ~7.3k upstream lines
-    /// of interpreter into `aterm-font` for an opt-in mode.
+    /// The `native` spelling (the font's own TrueType or CFF hints, which aterm does not
+    /// interpret) parses to this too: those interpreters fit vertically only (see
+    /// [`Full`](Self::Full)), so `light` is the nearest look.
     Light,
-    /// No grid fitting: the pure fontdue path, bit-for-bit.
+    /// No grid fitting: the unhinted path, bit-for-bit.
     Off,
 }
 
@@ -101,7 +95,7 @@ impl HintMode {
     /// Parse one mode spelling of the config key (`font_hinting`, via
     /// `Renderer::set_font_hinting`). Unrecognized = the default
     /// ([`HintMode::Full`]); explicit disable spellings match the workspace's
-    /// usual off/0/none family; the retired `native` is [`HintMode::Light`].
+    /// usual off/0/none family; `native` is [`HintMode::Light`].
     pub(crate) fn parse(s: &str) -> Self {
         match s.trim() {
             "light" | "native" => Self::Light,
@@ -110,11 +104,10 @@ impl HintMode {
         }
     }
 
-    /// Whether the `ATERM_RASTERIZER` development seam is pinning the raster
-    /// backend to the byte-stable PORTABLE path the golden/parity tests export
-    /// ([`crate::portable_raster_forced`]). It forces `Off` at construction AND
-    /// wins over the `font_hinting` config setter, so those tests keep the exact
-    /// bytes they were written against.
+    /// Whether the `ATERM_RASTERIZER` development seam pins the raster backend to the
+    /// byte-stable portable path the golden/parity tests use ([`crate::portable_raster_forced`]).
+    /// It forces `Off` at construction and wins over the `font_hinting` setter, so those tests
+    /// keep their exact bytes.
     pub(crate) fn portable_forced() -> bool {
         crate::portable_raster_forced()
     }
@@ -129,9 +122,9 @@ impl HintMode {
         }
     }
 
-    /// The hinter target this mode stands for; `None` = hinting disabled.
-    /// Horizontal fitting is wanted INSIDE the cell (that is the crispness);
-    /// advances reported upstream stay linear regardless, see the module doc.
+    /// The hinter target this mode stands for; `None` = hinting disabled. Horizontal fitting
+    /// inside the cell is wanted (that is the crispness); advances reported upstream stay linear
+    /// regardless (module doc).
     fn options(self) -> Option<Target> {
         match self {
             Self::Full => Some(Target::Normal),
@@ -141,29 +134,25 @@ impl HintMode {
     }
 }
 
-/// Per-face-size-and-INSTANCE [`HintingInstance`] cache — the hinter's twin
-/// of the CoreText `ct_cache`. Building an instance computes the autohinter's
-/// glyph styles, so it must not happen per glyph; keyed
-/// like `ct_cache` on the face bytes' POINTER identity (faces are immutable
-/// `Arc`s), collection index, the raster px bits, and the variation SLOT
-/// (`0` = default instance, `1` = the resolved primary coords, `2` = the bold
-/// instance — the same three-slot discipline, and the same caller, as
-/// `ct_cache`; one face can hold several instantiations of the same bytes).
+/// Per-face, size and instance [`HintingInstance`] cache, the hinter's twin of the CoreText
+/// `ct_cache`. Building an instance computes the autohinter's glyph styles, so it must not
+/// happen per glyph. Keyed like `ct_cache`: the face bytes' pointer identity (faces are
+/// immutable `Arc`s), collection index, raster px bits, and variation slot (`0` default
+/// instance, `1` the resolved primary coords, `2` the bold instance), since one face can hold
+/// several instantiations of the same bytes.
 #[derive(Default)]
 pub(crate) struct HintBank {
     map: aterm_hash::FxHashMap<(usize, u32, u32, u8), Option<std::sync::Arc<HintingInstance>>>,
 }
 
 impl HintBank {
-    /// Fetch (or build + memoize) the hinting instance for one face at `px`,
-    /// at the variation `coords` discriminated by `slot`. A face the hinter
-    /// cannot read (or a degenerate px) memoizes `None`, so the fontdue fallback is
-    /// taken WITHOUT re-attempting the build every glyph.
+    /// Fetch (or build and memoize) the hinting instance for one face at `px`, at the variation
+    /// `coords` discriminated by `slot`. `None` for a disabled mode, a degenerate px, or a face
+    /// the hinter cannot read; the last is memoized, so the unhinted fallback is taken without
+    /// rebuilding every glyph.
     ///
-    /// The arity is the face's identity spelled out (`key_ptr`/`bytes`/`index`
-    /// pin WHICH face, `px`/`mode` WHICH instance, `coords`/`slot` WHICH
-    /// variation); a params struct here would be the same fields with one more
-    /// name to keep in step at every call site.
+    /// The arity is face, size, mode and variation spelled out; a params struct would only
+    /// rename the same fields.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn instance(
         &mut self,
@@ -178,13 +167,11 @@ impl HintBank {
         self.instance_with(key_ptr, bytes, index, px, mode.options(), coords, slot)
     }
 
-    /// [`Self::instance`] with the hinter target handed in directly — the seam
-    /// the subpixel raster ([`crate::subpixel`]) uses to memoize LCD-target
-    /// instances in its OWN bank (the map key does not carry the target, so one
-    /// bank must never hold two targets for the same face+px). `None` target =
-    /// hinting disabled = no instance. The `(coords, slot)` instance discipline
-    /// is the same as [`Self::instance`]'s; the subpixel raster's stage-1 set
-    /// excludes variable instances, so it always passes `(&[], 0)`.
+    /// [`Self::instance`] with the hinter target handed in directly: the seam the subpixel
+    /// raster ([`crate::subpixel`]) uses to memoize LCD-target instances in its own bank (the
+    /// map key does not carry the target, so one bank must never hold two targets for one
+    /// face and px). A `None` target means no instance. The subpixel raster excludes variable
+    /// instances, so it always passes `(&[], 0)`.
     #[allow(clippy::too_many_arguments)] // see `instance`
     pub(crate) fn instance_with(
         &mut self,
@@ -215,32 +202,26 @@ impl HintBank {
     }
 }
 
-/// Map a char through the face's UNICODE cmap (aterm-font's `glyph_index`,
-/// which the production paths use via the renderer's memoized
-/// `primary_unicode_gid`/`unicode_gid` resolvers; this standalone form serves
-/// the module's own tests).
+/// Map a char through the face's Unicode cmap with aterm-font's `glyph_index`, as production
+/// does through the renderer's memoized `primary_unicode_gid`/`unicode_gid`. For this
+/// module's tests.
 #[cfg(all(test, feature = "embedded-font"))]
 pub(crate) fn unicode_gid(bytes: &[u8], index: u32, ch: char) -> Option<u16> {
     let face = aterm_font::Face::parse(bytes, index).ok()?;
     face.glyph_index(ch).map(|g| g.0).filter(|&g| g != 0)
 }
 
-/// Rasterize glyph `gid` of the face at `px` with `hint` applied, in the
-/// fontdue-compatible tuple `(width, height, xmin, ymin, advance, coverage)` —
-/// the drop-in shape the raster path expects (see
-/// [`variation::varied_glyph_raster`](crate::variation::varied_glyph_raster),
-/// whose metric conventions this follows exactly). `xmin`/`ymin` are the
-/// FLOOR of the grid-fitted outline's ink box (baseline-relative, y up), so
-/// the integer blit anchor `(cell_x + xmin, baseline - height - ymin)` places
-/// the fitted outline at pixel phase < 1 ulp — hinted edges land ON texel
-/// boundaries instead of between them. A blank glyph (space) is `(0, 0, ..)`
-/// with just the advance; `None` on any parse/draw failure = fontdue fallback.
+/// Rasterize glyph `gid` of the face at `px` with `hint` applied, as the tuple
+/// `(width, height, xmin, ymin, advance, coverage)` the raster path expects (the conventions
+/// of [`variation::varied_glyph_raster`](crate::variation::varied_glyph_raster)). `xmin`/`ymin`
+/// are the floor of the grid-fitted ink box (baseline-relative, y up), so the integer blit
+/// anchor `(cell_x + xmin, baseline - height - ymin)` puts hinted edges on texel boundaries. A
+/// blank glyph (space) is `(0, 0, ..)` with just the advance; `None` on any parse or draw
+/// failure falls back to the unhinted path.
 ///
-/// `coords` must be the SAME user-space variation coords `hint` was built at
-/// (the caller's slot discipline guarantees it): the outline comes from the
-/// instance, so the advance has to be measured at that instance too — an
-/// `HVAR`-varying face would otherwise report the default cut's width. A face
-/// the sfnt reader cannot open is a `None` like any other parse failure.
+/// `coords` must be the user-space variation coords `hint` was built at (the caller's slot
+/// discipline guarantees it): the advance is measured at that instance too, or an
+/// `HVAR`-varying face would report the default cut's width.
 pub(crate) fn hinted_glyph_raster(
     bytes: &[u8],
     index: u32,
@@ -249,8 +230,8 @@ pub(crate) fn hinted_glyph_raster(
     hint: &HintingInstance,
     coords: &[(u32, f32)],
 ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
-    // LINEAR advance at the same instance, never the hinted one: metrics
-    // upstream must not move when hinting lands (module doc).
+    // Linear advance at the same instance, never the hinted one: metrics upstream must not
+    // move with hinting (module doc).
     let advance =
         crate::variation::VariedFace::parse(bytes, index, coords)?.linear_advance(gid, px)?;
     let mut pen = PathPen::default();
@@ -265,20 +246,16 @@ pub(crate) fn hinted_glyph_raster(
     let y_min = pen.min_y.floor();
     let y_max = pen.max_y.ceil();
     let (w, h) = ((x_max - x_min) as i32, (y_max - y_min) as i32);
-    // Same sanity caps as the variation raster: a degenerate or absurd box is
-    // a `None` (fontdue fallback), never a huge allocation.
+    // Same sanity caps as the variation raster: a degenerate or absurd box is a `None`
+    // (unhinted fallback), never a huge allocation.
     if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
         return None;
     }
     let (w, h) = (w as usize, h as usize);
-    // Fill into a grid with `RASTER_PAD` px of slack on every side and crop the
-    // ink box back out. Grid fitting is exactly what makes the unpadded fill
-    // unsafe: the autohinter snaps stem edges to whole pixels, so the fitted
-    // outline routinely sits EXACTLY on `x = floor(min_x)` — the grid's left
-    // edge — where the rasterizer's incremental x march drifts sub-ULP negative
-    // and drops a whole scanline's area, smearing the rest of the glyph into a
-    // filled block. See `variation::RASTER_PAD` for the full mechanism and the
-    // measured damage map ('?' at ppem 17, '2' at ppem 19 on the default face).
+    // Fill into a grid with `RASTER_PAD` px of slack on every side and crop the ink box back
+    // out: the autohinter snaps stem edges to whole pixels, so a fitted outline often sits
+    // exactly on the grid's left edge, where an unpadded fill can drop a scanline's area
+    // (`variation::RASTER_PAD`).
     let pad = crate::variation::RASTER_PAD as f32;
     let mut ras = crate::raster::Rasterizer::new(
         w + 2 * crate::variation::RASTER_PAD,
@@ -291,9 +268,8 @@ pub(crate) fn hinted_glyph_raster(
     Some((w, h, x_min as i32, y_min as i32, advance, cov))
 }
 
-/// One recorded outline segment, in hinted pixel space (y UP). Recorded rather
-/// than streamed because the ink box must be known BEFORE the rasterizer (and
-/// its y flip about the box top) can exist.
+/// One recorded outline segment, in hinted pixel space (y up). Recorded rather than streamed
+/// because the ink box must be known before the rasterizer (and its y flip) can exist.
 enum Cmd {
     Move(f32, f32),
     Line(f32, f32),
@@ -302,10 +278,10 @@ enum Cmd {
     Close,
 }
 
-/// Collects a hinted outline (pixels, y up) and its ink bounds, then replays
-/// it into a [`crate::raster`] grid (pixels, y DOWN, origin at the ink
-/// box's top-left) — the same mapping as `variation::OutlineToRaster`, minus
-/// the design-unit scale (the hinter already delivers pixel coordinates).
+/// Collects an outline (pixels, y up) and its ink bounds, then replays
+/// it into a [`crate::raster`] grid (pixels, y down, origin at the ink
+/// box's top-left): the same mapping as `variation::OutlineToRaster`, minus
+/// the design-unit scale (callers record pixel coordinates).
 /// `pub(crate)` for the subpixel raster ([`crate::subpixel`]), which replays
 /// the same recorded outline at 3× horizontal resolution.
 #[derive(Default)]
@@ -334,12 +310,10 @@ impl PathPen {
         }
     }
 
-    /// Replay into `ras`, flipping y about `y_max` and translating by `x_min`,
-    /// with the x axis scaled by `xs` AFTER the translate (`xs = 1.0` is the
-    /// exact identity — multiplying an f32 by 1.0 is bit-precise — and `3.0`
-    /// is the subpixel raster's horizontal oversample). Contours are
-    /// implicitly closed (TrueType/CFF convention; the rasterizer needs the closing
-    /// edge for nonzero winding), matching `OutlineToRaster`.
+    /// Replay into `ras`, flipping y about `y_max` and translating by `x_min`, with x scaled by
+    /// `xs` after the translate (`1.0` is an exact identity; `3.0` is the subpixel raster's
+    /// horizontal oversample). Contours close implicitly (TrueType/CFF convention; nonzero
+    /// winding needs the closing edge), matching `OutlineToRaster`.
     pub(crate) fn fill(
         &self,
         ras: &mut crate::raster::Rasterizer,
@@ -390,9 +364,8 @@ impl PathPen {
     }
 }
 
-/// The recording half, in pixels (y up), as plain methods: the hinter's pen
-/// trait below and the subpixel raster's unhinted outline (which comes from the
-/// sfnt reader, not the hinter) both feed it.
+/// The recording half (pixels, y up), as plain methods so both the `OutlineSink` impl below
+/// and the subpixel raster's unhinted outline can feed it.
 impl PathPen {
     pub(crate) fn move_to(&mut self, x: f32, y: f32) {
         self.see(x, y);
@@ -444,9 +417,8 @@ mod tests {
     /// stores coords in ([`crate::variation::WGHT_TAG`]).
     const WGHT: u32 = u32::from_be_bytes(*b"wght");
 
-    /// The embedded DejaVu Sans Mono — present under the (default)
-    /// `embedded-font` feature, so these tests never depend on system font
-    /// files (and vanish, rather than break, on a --no-default-features run).
+    /// The embedded DejaVu Sans Mono (the default `embedded-font` feature), so these tests
+    /// never depend on system font files.
     fn dejavu() -> &'static [u8] {
         crate::embedded_font()
     }
@@ -463,11 +435,8 @@ mod tests {
             .count()
     }
 
-    /// CRISPNESS, the measured claim of this module: at 12px the grid-fitted
-    /// 'l' carries a near-fully-saturated stem texel on (almost) EVERY row,
-    /// where the unhinted fontdue raster's fractional stem phase splits the
-    /// same stem ~85/190 across two columns (measured, see the module doc) and
-    /// peaks near-full on at most a couple of rows.
+    /// At 12px the grid-fitted 'l' has a near-saturated stem texel on nearly every row, where
+    /// the unhinted raster's fractional stem phase splits the stem across two columns.
     #[test]
     fn full_hinting_snaps_the_l_stem_at_12px() {
         let hint = full_instance(12.0);
@@ -490,12 +459,10 @@ mod tests {
         );
     }
 
-    /// The reported advance is LINEAR (scaled hmtx), not the hinted advance,
-    /// and it is the unhinted path's own number to the bit: cell geometry must
-    /// not move when hinting lands. JetBrains Mono's 1000-unit em is where the
-    /// two could part: FreeType's 16.16 scaling (what the hinter's own metrics
-    /// answered before TF.2) gives its 600-unit advance as 7.200058 at 12px,
-    /// the f32 product every unhinted raster reports as 7.2000003.
+    /// The reported advance is linear (scaled hmtx), not the hinted advance, and bit-identical
+    /// to the unhinted `Font`'s: cell geometry must not move with hinting. JetBrains Mono's
+    /// 1000-unit em discriminates: FreeType-style 16.16 scaling gives its 600-unit advance as
+    /// 7.200058 at 12px, where the unhinted raster's f32 product is 7.2000003.
     #[test]
     fn advance_stays_linear() {
         let jetbrains: &[u8] = include_bytes!("../tests/fixtures/jetbrains-mono.ttf");
@@ -534,8 +501,8 @@ mod tests {
         assert!(adv > 0.0);
     }
 
-    /// `HintMode::Off` yields no options, so the bank hands out no instance:
-    /// the fontdue path is reached bit-for-bit.
+    /// `HintMode::Off` yields no options, so the bank hands out no instance and the unhinted
+    /// path runs bit-for-bit.
     #[test]
     fn off_mode_disables_the_bank() {
         let mut bank = HintBank::default();
@@ -551,10 +518,9 @@ mod tests {
         );
     }
 
-    /// Re-fill the SAME recorded outline into a grid with a GENEROUS slack ring
-    /// (4 px, four times what production uses) and crop the ink box back out.
-    /// The coverage of a correct fill cannot depend on how much empty grid
-    /// surrounds it — so this is the reference the production raster is held to.
+    /// Re-fill the same recorded outline with a 4 px slack ring (four times production's) and
+    /// crop the ink box back out. A correct fill's coverage cannot depend on the empty grid
+    /// around it, so this is the reference the production raster is held to.
     fn generous_slack_raster(pen: &PathPen, w: usize, h: usize) -> Vec<u8> {
         const SLACK: usize = 4;
         let (x_min, y_max) = (pen.min_x.floor(), pen.max_y.ceil());
@@ -574,9 +540,9 @@ mod tests {
         cov
     }
 
-    /// `(area, perimeter)` of the fitted outline in px / px², by the shoelace
+    /// `(area, perimeter)` of the fitted outline in px² / px, by the shoelace
     /// formula over a fine flattening. The area is the ink a correct nonzero
-    /// fill MUST deposit; the perimeter bounds how far antialiasing (and the
+    /// fill must deposit; the perimeter bounds how far antialiasing (and the
     /// rasterizer's own coarser curve flattening) can move it, since both are
     /// boundary effects.
     fn area_and_perimeter(pen: &PathPen) -> (f32, f32) {
@@ -638,12 +604,8 @@ mod tests {
         ((area * 0.5).abs(), perim)
     }
 
-    /// The glyph set the ppem sweep covers: every printable ASCII code point
-    /// (the digits the bug ate live here), the box-drawing / block run a
-    /// terminal draws frames and progress bars out of, a Nerd-Font PUA sample
-    /// (the bundled symbols face carries nothing else, and its icon outlines
-    /// look nothing like Latin text), and a CJK sample for any face that
-    /// carries one.
+    /// The ppem sweep's glyphs: printable ASCII, the box-drawing and block run, a Nerd Font PUA
+    /// sample (all the bundled symbols face carries), and a CJK sample for a face that has one.
     fn sweep_chars() -> Vec<char> {
         let mut v: Vec<char> = (' '..='~').collect();
         v.extend("─│┌┐└┘├┤┬┴┼━┃█▀▄▌▐░▒▓".chars());
@@ -654,35 +616,17 @@ mod tests {
         v
     }
 
-    /// THE ppem-19 BROKEN-DIGIT REGRESSION (see `variation::RASTER_PAD`).
+    /// No glyph rasterizes as a filled block at any desktop ppem, in any mode. A fitted outline
+    /// sitting exactly on the grid's left edge can lose a scanline's area in [`crate::raster`]
+    /// and smear the glyph into a block (see `variation::RASTER_PAD`; on the default face `'2'`
+    /// at ppem 19, a 125% desktop, and `'?'` at ppem 17). Two nets:
     ///
-    /// Grid fitting snaps stem edges to whole pixels, so a fitted outline
-    /// routinely sits EXACTLY on `x = floor(min_x)` — the coverage grid's left
-    /// edge. [`crate::raster`] marches x incrementally down a segment's
-    /// scanlines, drifts a sub-ULP past that edge, floors to `-1`, and drops the
-    /// whole scanline's area; `for_each_pixel`'s single running accumulator then
-    /// carries the loss through every remaining texel and the glyph paints as a
-    /// filled block. On the shipped default face that ate `'2'` at ppem 19 —
-    /// which is `round(15 * 1.25)`, i.e. what the Linux auto-scale law hands
-    /// every 125%-scale desktop — and `'?'` at ppem 17.
-    ///
-    /// TWO independent nets over the whole ppem range, both modes-wide:
-    ///
-    /// 1. SLACK INVARIANCE (sharp). Coverage cannot depend on how much empty
-    ///    grid surrounds the outline, so the production raster must match a
-    ///    4-px-slack fill of the same outline to within one 8-bit step.
-    ///    Pre-fix, the two broken glyphs differ from it on EVERY texel, by up
-    ///    to 180/255.
-    /// 2. INK PLAUSIBILITY (the "implausibly high ink for its shape" net).
-    ///    Rasterized ink must equal the fitted outline's geometric area; the
-    ///    slack is proportional to the outline's PERIMETER because antialiasing
-    ///    and the rasterizer's own curve flattening are boundary effects.
-    ///    Measured over the 11 571 (mode, ppem, glyph) combinations this sweep
-    ///    covered while it also ran `native`'s bytecode (retired at TF.2b),
-    ///    the honest residual peaks at 0.029·perimeter; the pre-fix
-    ///    `'2'` at ppem 19 sat at 0.097·perimeter and `'?'` at ppem 17 at
-    ///    0.491·perimeter, so 0.06·perimeter separates them with margin on
-    ///    both sides.
+    /// 1. Slack invariance: coverage cannot depend on how much empty grid surrounds the
+    ///    outline, so the production raster matches a 4-px-slack fill within one 8-bit step.
+    /// 2. Ink plausibility: rasterized ink equals the outline's area within a slack
+    ///    proportional to its perimeter (antialiasing and curve flattening are boundary
+    ///    effects). Over this sweep honest glyphs stay within 0.029·perimeter and a lost
+    ///    scanline measured 0.097 and up, so 0.06·perimeter separates them.
     #[test]
     fn ppem_sweep_no_glyph_rasterizes_as_a_filled_block() {
         // Both bundled faces: the text default the bug bit, and the Nerd icon
@@ -763,16 +707,11 @@ mod tests {
     /// unhinted raster's, to the bit: both read `hmtx` + `HVAR` at the same
     /// coords through the same reader.
     ///
-    /// The fixture is the bundled `engraved` display face (Cinzel, `wght`
-    /// 400..=900 with an `HVAR`), so the test runs wherever this module
-    /// compiles rather than on whatever `%WINDIR%\Fonts` holds. It has to be a
-    /// face whose ADVANCES move with the instance: a monospaced variable face
-    /// such as Windows' Cascadia Mono is the same width at every weight, so a
-    /// hinted path that measured the default cut would still pass. The CONTROL
-    /// is that regression run for real: the same call with the coords dropped
-    /// (the default cut's width, which [`hinted_glyph_raster`]'s doc warns
-    /// about) must answer differently for some probed glyph, or the equality
-    /// proves nothing.
+    /// The fixture is the bundled `engraved` face (Cinzel, `wght` 400..=900 with an `HVAR`), so
+    /// the test runs wherever this module compiles, and its advances move with the instance (a
+    /// monospaced variable face would pass even if the default cut were measured). Control: the
+    /// same call without the coords must differ for some probed glyph, or the equality proves
+    /// nothing.
     #[test]
     fn advance_at_an_instance_is_the_unhinted_one() {
         let bytes = crate::display_face_bytes("engraved").expect("the bundled engraved face");
@@ -803,11 +742,9 @@ mod tests {
         );
     }
 
-    /// The bank keys on the variation SLOT, so two instantiations of the SAME
-    /// bytes at the same px are distinct instances — the invariant that lets
-    /// the regular cut and the `wght`≈700 bold cut coexist in one atlas
-    /// (Windows' Cascadia Mono ships as one variable file with no Bold
-    /// sibling, so both cuts come out of these very bytes).
+    /// The bank keys on the variation slot, so two instantiations of the same bytes at one px
+    /// are distinct instances: the regular and `wght`≈700 bold cuts of a variable face with no
+    /// Bold sibling (Windows' Cascadia Mono) coexist in one atlas.
     #[test]
     fn bank_keys_on_the_variation_slot() {
         let mut bank = HintBank::default();
@@ -823,7 +760,7 @@ mod tests {
             !std::sync::Arc::ptr_eq(&a, &b),
             "slot 0 and slot 2 must not share one hinting instance"
         );
-        // …and the same slot memoizes, so `fpgm`/`prep` is not replayed per glyph.
+        // …and the same slot memoizes, so glyph styles are not recomputed per glyph.
         let a2 = bank
             .instance(ptr, bytes, 0, 12.0, HintMode::Full, &[], 0)
             .unwrap();

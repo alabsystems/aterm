@@ -299,7 +299,7 @@ fn drain_master(master: libc::c_int, buf: &mut [u8], pass: &mut impl FnMut(&[u8]
 }
 
 /// Test seam: run at the one point of every loop turn between the signal flag
-/// checks and the `poll(2)` that waits, where a flag-only signal was lost.
+/// checks and the `poll(2)` that waits, where a flag-only signal would be lost.
 #[cfg(test)]
 static BEFORE_POLL: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
@@ -336,7 +336,7 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     // the fork and exec all ran in between) was dropped. Now that the handler
     // sees every later one, catch up once: when the host's grid is no longer
     // the PTY's, the first turn of the loop applies it. An unmoved grid sends
-    // the program nothing, as before.
+    // the program nothing.
     if aterm_pty::size(master) != Some(host_winsize()) {
         GOT_WINCH.store(true, Ordering::Release);
     }
@@ -368,7 +368,7 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     // held in `pending` while the output keeps flowing, and stdin is not read
     // while `pending` holds [`INPUT_BACKLOG_MAX`]: the rest waits in the host's
     // own terminal, never in this process's memory. Should the fcntl fail (it
-    // cannot on a live master), writes park as they always did.
+    // cannot on a live master), writes block.
     let _ = aterm_pty::set_nonblocking(master, true);
     let mut pending: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     let mut stdin_open = true;

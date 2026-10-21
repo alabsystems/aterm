@@ -287,10 +287,12 @@ impl Log {
             log.session_bytes = log.session_bytes.saturating_add(bytes);
             log.heap = log.heap.saturating_add(super::entry_heap(&rec));
             log.bump_chain(Node::SESSION, true);
+            // A summary is text: it holds no process-clock reading (6F-1).
             log.ring.push_back(super::Entry {
                 rec: rec.into(),
                 bytes,
                 ms: 0,
+                mono: 0,
             });
             log.bytes = log.bytes.saturating_add(bytes);
         }

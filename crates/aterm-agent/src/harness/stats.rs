@@ -3,10 +3,10 @@
 
 //! WHAT THE HARNESS DID, folded from the ledgers it already writes, for
 //! Settings ▸ Harness (`docs/DESIGN-harness-autopilot-2026-10-15.md` §4, item
-//! 4): boxes approved, questions answered, continuations, Land's wrap-ups,
-//! resumes after walls, relaunches, upgrades, escalations and the time they
-//! waited on a person — over a window that starts at `since_ms` (unix ms;
-//! the page asks for today and for 7 days).
+//! 4): boxes approved, questions answered, continuations, Land's prompts and
+//! its landings, resumes after walls, relaunches, upgrades, escalations and
+//! the time they waited on a person — over a window that starts at
+//! `since_ms` (unix ms; the page asks for today and for 7 days).
 //!
 //! Three files are read, and each fact is counted from ONE of them, so a
 //! session whose ledger and journal both record a press counts it once:
@@ -32,7 +32,7 @@
 //! | ledger | `typed` `usage-resume@v1`, `api-retry@v1`, `api-back@v1`, `api-cutoff@v1`, `login-back@v1`, and `context-compact@v1`'s continuation (not its `/compact`) | [`HarnessStats::resumed`] |
 //! | ledger | `typed` under any other rule (`auth-login@v1`, `consent-accept@v1`, `model-fallback@v1`, `model-restore@v1`, `account-rotate@v1`, `memory-restart@v1`, `model-wind-down@v1`, `harness-turn@v1`, `usage-probe@v1`, `context-compact@v1`'s `/compact`, …) | nothing but [`HarnessStats::by_rule`] |
 //! | ledger | `waiting` `wall-wait@v1`, to the session's `wall-wait-end@v1` or its next `typed` row | [`HarnessStats::limit_wait_ms`] |
-//! | ledger | `escalated`, `skipped`, `deferred`, any other `waiting` | nothing but [`HarnessStats::rows`] |
+//! | ledger | `escalated`, `skipped`, `deferred`, any other `waiting` — `task-done@v1` among them, which older builds wrote at a Cruise done claim too and every restarted loop writes again, so it is no landing | nothing but [`HarnessStats::rows`] |
 //! | journal | `chose` | [`HarnessStats::answered`] (a question dialog the loop's own keys answered, said once it is done) |
 //! | journal | `escalated` whose badge went up (`attention=OK`) — not `attention=skipped: …` ([`ATTENTION_SKIPPED`]: another supervisor answers the session, or a stall withheld the ask), and not a badge set again (its `again=<why>`: [`AGAIN_RETRY`], [`AGAIN_ADOPTED`], [`AGAIN_UNPARKED`]) | [`HarnessStats::escalated`], and a person's wait opens (one open goes on) |
 //! | journal | `escalated` of a badge set again: a limit episode's whose retry hit the wall again, or that was adopted from a previous loop (one an Off park took down too); the turn-end policy's an Off park took down, set again as it ends | no escalation; a person's wait opens if none is open |
@@ -41,6 +41,9 @@
 //! | journal | `FROZEN` (kind `other`, [`FROZEN`]): a stall's hold, which takes the loop's point badge down with no `CLEARED` line | the wait closes only on `attention=OK` or `attention=none`; kept, skipped, refused and unknown results leave it open |
 //! | journal | `exit`, `timeout`: a loop's end | the session's open wait ends, counting nothing |
 //! | journal | `needs` whose entry went up (`attention=OK`): the worker's NEEDS YOU on the person's screen | [`HarnessStats::needs_told`] (no escalation, no wait; its `CLEARED … needs` closes none) |
+//! | journal | `DONE … rule=land@v1` (kind `other`): Land's landing — its first note, after a land act (module docs, THE LANDINGS) | [`HarnessStats::landed`], at the note's own time |
+//! | journal | `DONE … rule=land@v1` restating a landing: a restarted loop's or the task's own wake's (its `ended`), or any note with no land act journaled since the session's last one | nothing but [`HarnessStats::rows`] |
+//! | journal | `continued`, `typed` under `land@v1`, `land-nudge@v1`, `land-answer@v1`, or a wall's continuation in Land's own words under the wall's rule: a land act | nothing but [`HarnessStats::rows`]; the session's next landing note may count |
 //! | journal | every other kind | nothing but [`HarnessStats::rows`] (its `approved`, `declined`, `typed`, `continued` and `unproven` lines repeat the ledger's rows) |
 //! | upgrade | `relaunched` on the build it ran | [`HarnessStats::relaunched`] (a crash relaunched, a restart in place) |
 //! | upgrade | `relaunched` onto another build | [`HarnessStats::upgraded`] |
@@ -64,6 +67,34 @@
 //! neither: they bring the work down, and count as
 //! [`HarnessStats::land_prompts`] — the prompts typed, never the landings
 //! they led to.
+//!
+//! THE LANDINGS (design §12.4.3, item 2) are Land's ends, counted from the
+//! journal alone as [`HarnessStats::landed`]: one for each landing, at the
+//! time its first note was journaled. A landing is noted once by the loop
+//! that lands it (`DONE seq=<n> rule=land@v1 …`, a clean defense at a land
+//! act's yield, FOREVER LAND), and noted AGAIN, as the same landing, by every
+//! loop that restarts over it (a seamless update, a relaunch) and after the
+//! task's own wake (`policy::turn_end::WAKE_KEPT`), each with the first
+//! note's time as its `ended` ([`JournalRecord::ended`]); those
+//! restatements count nothing. A landing comes only at a land act's yield,
+//! so a note with no land act journaled since the session's last landing
+//! note counts nothing either. A land act is what the engine lands at: a
+//! `CONTINUED`/`TYPED` under `land@v1`, `land-nudge@v1` or `land-answer@v1`,
+//! or a wall's continuation that typed Land's own words ([`LAND`],
+//! [`LAND_NUDGE`]) under the wall's rule (`usage-resume@v1`,
+//! `consent-accept@v1`, `context-compact@v1`: a reopened landed tab whose
+//! next turn ended at a limit lands again at the reset's resume). A wall's
+//! retry in other words delivers again the land act the wall cut, whose own
+//! line came before it. The rule keeps older builds' journals right: they
+//! restated a landing with no `ended` (before 2026-10-19) and noted someone
+//! else's later done turn as a landing (the Together run of 2026-10-16), and
+//! each reads as the one landing it was.
+//! The session's first landing note in its file counts (a cut may have
+//! dropped its land act); a restatement never does, first or not (a cold
+//! restore's tab restates, under its own id, the landing its earlier tab's
+//! journal noted). Never the ledger's `task-done@v1` row, which older builds
+//! wrote at a Cruise done claim too and every restarted loop writes again;
+//! and no Cruise done claim, which ends nothing.
 //!
 //! THE WAITS are pairs, matched per session in the files' order (time
 //! order). A PERSON'S WAIT runs while a badge of the loop's stands: the
@@ -168,7 +199,9 @@ use crate::supervise::policy::approval::{
 };
 use crate::supervise::policy::question::{CHOSE_RECOMMENDED, CHOSE_UNMARKED};
 use crate::supervise::policy::reset::KeepWhy;
-use crate::supervise::policy::turn_end::{RULE_ANSWER, RULE_LAND_ANSWER};
+use crate::supervise::policy::turn_end::{
+    LAND, LAND_NUDGE, RULE_ANSWER, RULE_LAND, RULE_LAND_ANSWER, is_land_rule,
+};
 use crate::supervise::run::LINE_CHARS;
 
 /// How much older than the window's start a file's last write may be before
@@ -204,6 +237,10 @@ pub struct HarnessStats {
     /// Land's instruction and its nudges typed (`land@v1`,
     /// `land-nudge@v1`): land prompts, never landings.
     pub land_prompts: u64,
+    /// Land's landings: the journal's `DONE … rule=land@v1` notes, one per
+    /// landing at its first note's time, never a restatement of it (module
+    /// docs, THE LANDINGS). Never the ledger's `task-done@v1` row.
+    pub landed: u64,
     /// The work carried on past a wall: a usage reset, an API error, a reply
     /// cut off, a full context.
     pub resumed: u64,
@@ -269,6 +306,8 @@ pub struct Tally {
     pub continued: u64,
     /// [`HarnessStats::land_prompts`]' share.
     pub land_prompts: u64,
+    /// [`HarnessStats::landed`]' share.
+    pub landed: u64,
     /// [`HarnessStats::resumed`]'s share.
     pub resumed: u64,
     /// [`HarnessStats::escalated`]'s share.
@@ -302,6 +341,8 @@ enum Count {
     Escalated,
     /// A NEEDS YOU set put on the person's screen.
     NeedsTold,
+    /// Land's landing, at its first note.
+    Landed,
     /// An agent started again on the build it ran.
     Relaunched,
     /// An agent relaunched onto another build.
@@ -339,6 +380,7 @@ impl Counts for HarnessStats {
             Count::Unproven => &mut self.unproven,
             Count::Escalated => &mut self.escalated,
             Count::NeedsTold => &mut self.needs_told,
+            Count::Landed => &mut self.landed,
             Count::Relaunched => &mut self.relaunched,
             Count::Upgraded => &mut self.upgraded,
         }
@@ -366,6 +408,7 @@ impl Counts for Tally {
             Count::Unproven => &mut self.unproven,
             Count::Escalated => &mut self.escalated,
             Count::NeedsTold => &mut self.needs_told,
+            Count::Landed => &mut self.landed,
             Count::Relaunched => &mut self.relaunched,
             Count::Upgraded => &mut self.upgraded,
         }
@@ -390,6 +433,10 @@ struct Open {
     limit: BTreeMap<String, i64>,
     /// The sessions [`HarnessStats::sessions`] counted.
     seen: BTreeSet<String>,
+    /// The sessions whose last landing note has no land act journaled
+    /// after it: their next note restates that landing (module docs, THE
+    /// LANDINGS).
+    landed_since_act: BTreeSet<String>,
 }
 
 impl HarnessStats {
@@ -492,6 +539,27 @@ impl HarnessStats {
     fn act(&mut self, rule: &str) {
         let n = self.by_rule.entry(rule.to_string()).or_insert(0);
         *n = n.saturating_add(1);
+    }
+
+    /// `sid`'s journal says `line` of Land's landings (module docs, THE
+    /// LANDINGS); `inside`: the record is in the window. A land act opens
+    /// the session's next landing note; a landing's own note counts where
+    /// it is the session's first or one opened, and every note closes it.
+    fn land(&mut self, sid: &str, line: LandLine, inside: bool) {
+        match line {
+            LandLine::Act => {
+                self.open.landed_since_act.remove(sid);
+            }
+            LandLine::Note | LandLine::Restated => {
+                if self.open.landed_since_act.contains(sid) {
+                    return;
+                }
+                if line == LandLine::Note && inside {
+                    self.count(sid, Count::Landed);
+                }
+                self.open.landed_since_act.insert(sid.to_string());
+            }
+        }
     }
 
     /// A badge of the loop's went up on `sid` at `at` (unix ms), or was
@@ -1523,6 +1591,90 @@ fn is_adopted(r: &JournalRecord) -> bool {
     r.kind == "other" && r.line.split(' ').next() == Some(ADOPTED)
 }
 
+/// What a journal record says of Land's landings (module docs, THE
+/// LANDINGS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandLine {
+    /// A land act typed: `CONTINUED` or `TYPED` under `land@v1`,
+    /// `land-nudge@v1` or `land-answer@v1`, or a wall's continuation that
+    /// typed Land's own words under the wall's rule ([`opens_with_land_words`]).
+    /// The session's next landing note may be a landing.
+    Act,
+    /// A landing's note, `DONE [seq=<n>] rule=land@v1 …` (kind `other`),
+    /// that restates no landing: no `ended`.
+    Note,
+    /// A note that restates a landing noted before, its first time its
+    /// `ended`: a restarted loop's, or the task's own wake's.
+    Restated,
+}
+
+/// [`LandLine`] of a journal record; `None` for every other line. Only a
+/// `continued`, `typed` or `other` record is looked at, and an `other`
+/// line's first words alone.
+fn land_line(r: &JournalRecord) -> Option<LandLine> {
+    match r.kind.as_str() {
+        "continued" | "typed" => {
+            (is_land_rule(&r.phase) || opens_with_land_words(&r.summary)).then_some(LandLine::Act)
+        }
+        "other" => {
+            // The loop's words (`turn_end_loop.rs`, `task_edge_with`):
+            // `DONE seq=<n> rule=<id> <why>`.
+            let mut words = r.line.split(' ');
+            if words.next() != Some("DONE") {
+                return None;
+            }
+            let mut word = words.next()?;
+            if word.starts_with("seq=") {
+                word = words.next()?;
+            }
+            if word.strip_prefix("rule=") != Some(RULE_LAND) {
+                return None;
+            }
+            Some(if r.ended.is_some() {
+                LandLine::Restated
+            } else {
+                LandLine::Note
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether an act's journaled words (`said`: the loop's line clips them to
+/// their first [`LINE_CHARS`] characters) open with Land's own: [`LAND`] or
+/// [`LAND_NUDGE`], as far as the line keeps them. Under Land a wall's
+/// continuation types those words under the WALL's rule
+/// (`usage-resume@v1`, `consent-accept@v1`, a `/compact`'s
+/// `context-compact@v1`: `policy::turn_end`'s `continue_as`), and the engine
+/// reads that act as the land act its clean defense lands at
+/// (`policy::turn_end::is_land_words`), so the fold reads it so too. Two
+/// byte-prefix compares against heads cut once, at compile time.
+fn opens_with_land_words(said: &str) -> bool {
+    const LAND_SAID: &[u8] = LAND.as_bytes().split_at(clip_len(LAND)).0;
+    const NUDGE_SAID: &[u8] = LAND_NUDGE.as_bytes().split_at(clip_len(LAND_NUDGE)).0;
+    let said = said.as_bytes();
+    said.starts_with(LAND_SAID) || said.starts_with(NUDGE_SAID)
+}
+
+/// The byte length of `s`'s first [`LINE_CHARS`] characters: what of it a
+/// loop's line keeps.
+const fn clip_len(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut chars = 0;
+    while i < bytes.len() {
+        // A character starts at every byte that is no UTF-8 continuation.
+        if bytes[i] & 0xC0 != 0x80 {
+            if chars == LINE_CHARS {
+                return i;
+            }
+            chars += 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
 /// Whether a journal record is a stall's hold that took the loop's badge
 /// down: a `FROZEN` line ([`FROZEN`]: kind `other`, the line's first word)
 /// whose `attention=<reply>` confirms success or no entry, as for CLEARED.
@@ -1548,9 +1700,11 @@ fn frozen_takes_badge_down(r: &JournalRecord) -> bool {
 
 /// Fold a session journal's records ([`crate::supervise::journal`]) into
 /// `acc`, over its window ([`HarnessStats::since_ms`]): the escalations and
-/// the person's waits their badges opened, and the question dialogs the loop
-/// answered (the module docs' table). A record before the window counts
-/// nothing, but still opens or closes a wait the window may hold the rest of.
+/// the person's waits their badges opened, the question dialogs the loop
+/// answered and Land's landings (the module docs' table). A record before
+/// the window counts nothing, but still opens or closes a wait the window
+/// may hold the rest of, and a landing's note before it still closes the
+/// session's next.
 pub fn fold_journal(acc: &mut HarnessStats, recs: &[JournalRecord]) {
     for r in recs {
         let sid = r.sid.as_deref().unwrap_or_default();
@@ -1577,6 +1731,13 @@ pub fn fold_journal(acc: &mut HarnessStats, recs: &[JournalRecord]) {
             "other" if is_adopted(r) => acc.badge_up(sid, r.t),
             "other" if frozen_takes_badge_down(r) => acc.badge_down(sid, r.t),
             "chose" if inside => acc.count(sid, Count::Act(Counter::Answered)),
+            // Land's landings (module docs, THE LANDINGS): its notes, and
+            // the land acts a landing comes at the yield of.
+            "other" | "continued" | "typed" => {
+                if let Some(line) = land_line(r) {
+                    acc.land(sid, line, inside);
+                }
+            }
             _ => {}
         }
         if inside {

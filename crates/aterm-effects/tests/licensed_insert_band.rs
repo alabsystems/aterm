@@ -3,9 +3,8 @@
 
 //! A licensed insert is laid, however its frame is torn.
 //!
-//! Cells the program writes at the caret after a Tab or a paste (a
-//! completion, a pasted word) must be laid, so the hand's next key does not
-//! start a second band with a dark gap between.
+//! Cells the program writes at the caret after a Tab or a paste (a completion, a pasted word)
+//! must be laid, so the hand's next key does not start a second band with a dark gap between.
 //!
 //! The take: a line typed to `…BEST WORK IN` at 12 cps, the program inserts
 //! `TO ` at the caret (a Tab's completion, a three-cell paste, or no key at
@@ -20,23 +19,16 @@
 //! (`?2026h ?25l … ?25h ?2026l`) whole or torn after its hide, and a shell's
 //! print at a visible caret.
 //!
-//! The hard case is a frame torn before its glyphs (the hide alone in the
-//! first read): the next present shows the caret the insert's width on, with
-//! the print arriving in the same present. `CursorGlow::hidden_bridge_source`
-//! bridges a hidden→visible reappearance that a fresh insert licence lays,
-//! with the insert's reach and whatever the hide's age. Its predicate is the
-//! one `spawn` lays the insert by (`visible_insert_echo`), so it admits
-//! nothing the insert arm refuses: a reappearance wider than the paste, a
-//! Tab's echo past its one-second window, and unlicensed output stay dark.
+//! The hard case is a frame torn before its glyphs: the next present shows the caret the insert's
+//! width on, with the print in the same present. `CursorGlow::hidden_bridge_source` bridges a
+//! hidden→visible reappearance a fresh insert licence lays, whatever the hide's age, by the same
+//! predicate `spawn` lays the insert by (`visible_insert_echo`), so a reappearance wider than the
+//! paste, a Tab's echo past its one-second window, and unlicensed program output (T1, v3's X1)
+//! stay dark.
 //!
-//! Unlicensed program output (T1, v3's X1) keeps its cells dark; the hand's
-//! next key past them still starts a second band, with the gap beside it kept
-//! while the hand types. That behaviour is not pinned either way here.
-//!
-//! The census is the plan's coverage on the composer row every frame: `#` at
-//! ≥ 20 coverage, `.` dark. A hole is a dark column strictly between two lit
-//! ones. A licensed take allows none lasting longer than [`HOLE_FRAMES_MAX`]
-//! frames, from the first key to the end of the take.
+//! The census is the plan's coverage on the composer row every frame (`#` at ≥ `LIT_COV`, `.`
+//! dark); a hole is a dark column strictly between two lit ones. A licensed take allows none
+//! lasting longer than [`HOLE_FRAMES_MAX`] frames.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, coverage, geom, holes_of, note_blink, observe_caret_row,
@@ -51,7 +43,7 @@ const CW: usize = 8;
 const CH: usize = 16;
 const ROWS: usize = 60;
 const COLS: usize = 140;
-/// 12 cps, the owner's pace.
+/// 12 cps.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
 /// The Ink-shaped composer's pause between a redraw's two reads.
@@ -59,7 +51,7 @@ const INK_SPLIT_MS: u64 = 30;
 /// A hole standing longer than this many frames is the defect.
 const HOLE_FRAMES_MAX: usize = 3;
 
-/// The owner's line.
+/// The line the take ends with.
 const LINE: &str = "zoom out. first of all, STOP LANDING BRANCHES AND PATCHES! YOU NEED TO FUCKING MERGE ALL BEST WORK INTO MAIN!!!!";
 /// Where the hand's typing stops before the insert.
 const TYPED_TO: &str = "WORK IN";
@@ -177,9 +169,9 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// Exactly the render path: the frame hold's caret row and every ribbon
-    /// row whether or not the caret is visible, the print anchor fed just
-    /// before the tick (`app_render.rs`), the tick, then the census.
+    /// The render path: the frame hold's caret row and every ribbon row whether or not the caret
+    /// is visible, the print anchor fed just before the tick (`app_render.rs`), the tick, then
+    /// the census.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
@@ -506,10 +498,8 @@ fn torn_timings() -> Vec<(Shape, u64, u64)> {
         .collect()
 }
 
-// Every law below replays independent takes, each its own host on its own
-// clock, so each runs them on the binary's threads (`crate::common::par_map`)
-// and the first failing take in the law's order raises its own panic (0.8 to
-// 4.0 s a law alone on one thread).
+// Every law below replays independent takes, each its own host on its own clock, on the binary's
+// threads (`crate::common::par_map`); the first failing take in the law's order raises its panic.
 
 /// A tab completion or a paste whose frame is torn before its glyphs. Before
 /// the fix the Tab was declined `hidden-relocation`, `O` and ` ` of `INTO `
@@ -629,11 +619,10 @@ fn a_torn_reappearance_the_licence_cannot_buy_lays_nothing() {
     });
 }
 
-/// Torn-frame guard: with the hand typing `MAIN!!!!` after `INTO `, one Ink
-/// repaint shows the line damaged for a frame and the next restores it. Every
-/// shape heals: three interior cells blanked or replaced, the suffix from
-/// `TO ` cut off (a 1024-byte tear), on the first key after `INTO `, or one
-/// cell short of the caret, under a key or between keys.
+/// Torn-frame guard: with the hand typing `MAIN!!!!` after `INTO `, one Ink repaint shows the
+/// line damaged for a frame and the next restores it. Every tear heals, under a key or between
+/// keys: `TO ` blanked or overwritten, the line cut at `TO ` (a 1024-byte tear; also on the first
+/// key after `INTO `), or cut one cell short of the caret.
 #[test]
 fn a_one_frame_tear_of_the_completed_word_heals_while_the_hand_types() {
     fn blank_to(text: &str) -> String {

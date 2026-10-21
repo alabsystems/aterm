@@ -66,9 +66,9 @@ use super::upgrade::{Agent, Phase};
 use super::{
     Client, Hand, Kernel, Live, LiveTab, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
     STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of, exe_of, exit_status, held, ids,
-    is_generation, ledger, line_status, load, now_s, registry_graph, registry_life, roster,
+    is_generation, ledger, line_status, load, now_s, pause, registry_graph, registry_life, roster,
     running_block, said, save, screen, shell_dialect_of, squash, state_dir, table, turn_takes_gen,
-    turn_verdict, type_relaunch_line_with, under_hand, upgrade, wait_until,
+    turn_verdict, type_relaunch_line_with, under_hand, upgrade, wait_now, wait_until,
 };
 use crate::supervise::run::composer_guard_at;
 
@@ -1048,7 +1048,7 @@ fn relaunch_held(
         return said(r, "wait:orphan-reads");
     }
     // The shell draws its prompt after it takes the terminal back.
-    std::thread::sleep(opts.timings.prompt_drawn);
+    pause(opts.timings.prompt_drawn);
     let tab = st.tab.clone();
     let chats = st_chats(st);
     // Nothing is typed while another live Gemini CLI of the project may run
@@ -1234,8 +1234,12 @@ fn await_held(
         if let Some(pid) = new {
             found(st, pid, k);
         }
-        if new.is_none() && looked.is_none_or(|at| at.elapsed() >= opts.timings.shell_look) {
-            looked = Some(std::time::Instant::now());
+        if new.is_none()
+            && looked.is_none_or(|at| {
+                wait_now().saturating_duration_since(at) >= opts.timings.shell_look
+            })
+        {
+            looked = Some(wait_now());
             ended = line_word(c, st, k);
         }
         new.is_some() || ended.is_some()
@@ -1606,7 +1610,7 @@ fn carry_on(
                             break;
                         }
                         Err(Typed::Changed | Typed::Yielded) => {
-                            std::thread::sleep(Duration::from_millis(400));
+                            pause(Duration::from_millis(400));
                         }
                         Err(Typed::Cut(_) | Typed::Refused(_)) => break,
                     }

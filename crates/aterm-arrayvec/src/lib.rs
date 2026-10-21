@@ -1,119 +1,36 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `arrayvec`: aterm's first-party replacement for the upstream `arrayvec`
-//! crate. It contains no implementation: every item is a re-export of
-//! [`aterm_alloc`].
+//! First-party `arrayvec` facade re-exporting [`aterm_alloc::ArrayVec`],
+//! [`IntoIter`](aterm_alloc::ArrayVecIntoIter), [`Drain`](aterm_alloc::ArrayVecDrain),
+//! and [`CapacityError`](aterm_alloc::CapacityError).
 //!
-//! This crate is published into the build under the package name `arrayvec`
-//! (the directory is `crates/aterm-arrayvec`; see the manifest for why the two
-//! names differ) so that `[patch.crates-io]` can redirect the four third-party
-//! consumers in aterm's graph — `naga`, `wgpu`, `wgpu-core` and `wgpu-hal` — at
-//! code we own. (`tiny-skia`, a fifth on Linux under `sctk-adwaita`, left with
-//! it at linux-windowing LW.5.)
+//! Published under package name `arrayvec` in `crates/aterm-arrayvec` so
+//! `[patch.crates-io]` redirects `naga`, `wgpu`, `wgpu-core`, and `wgpu-hal`
+//! to `aterm_alloc` (`#![no_std]`).
 //!
-//! The claim is narrower and more checkable than "our ArrayVec is as good as
-//! theirs". It is: **every item the consumers name resolves, with the same
-//! signature and the same behaviour.** Three things back it up.
+//! ## Verification
 //!
-//! 1. **The surface was enumerated from the consumers' source, not guessed.**
-//!    62 distinct `ArrayVec<…>` uses across the consumers were read out of the
-//!    registry copies and reduced to a list of methods, trait impls and syntactic
-//!    forms. Seven impls were MISSING from `aterm_alloc::ArrayVec` and were
-//!    written for this swap: `Hash`, `Extend`, `IntoIterator` by value, by `&`
-//!    and by `&mut`, `into_inner` and `drain`. Two more differed in SIGNATURE
-//!    (`try_push`'s error type, `retain`'s closure bound) and were changed to
-//!    upstream's. They all live in `crates/aterm-alloc/src/array_vec.rs`,
-//!    because the orphan rule puts them there: a foreign trait on a foreign
-//!    type cannot be implemented here.
+//! * `tests/consumer_forms.rs` compiles and runs every `ArrayVec` invocation
+//!   form across all four consumers, including SPIR-V, DX12, GLES, and Vulkan
+//!   sites that are `cfg`'d off in macOS host builds.
+//! * `crates/aterm-alloc/tests/arrayvec_differential.rs` checks operations
+//!   and deterministic LCG fuzz sequences against a `Vec`-backed reference model.
 //!
-//! 2. **`tests/consumer_forms.rs` compiles every invocation form verbatim.**
-//!    Each block is commented with the crate, file and line it was copied from.
-//!    Compiling that file is the proof that the surface accepts what the real
-//!    consumers write — and it has to be, because no cell compiles all of what
-//!    they write, and this one compiles least of all. On macOS the four wgpu-
-//!    family crates do build, but with the feature sets that switch most of
-//!    their `ArrayVec` sites off. See the per-cell note below for exactly which
-//!    impls that leaves untested here.
+//! ## Intentional Divergences from Upstream
 //!
-//! 3. **A differential runs this type and a `Vec`-backed model of upstream's
-//!    contract through the same operation scripts and asserts they agree**,
-//!    element by element, hash by hash, panic by panic — including a
-//!    deterministic-LCG op-sequence fuzz. It lives at
-//!    `crates/aterm-alloc/tests/arrayvec_differential.rs`, beside the
-//!    implementation it exercises.
-//!
-//!    Re-check the whole claim with:
-//!
-//!    ```text
-//!    cargo test -p arrayvec                    # the consumer forms
-//!    cargo test -p aterm-alloc                 # the differential + unit tests
-//!    ```
-//!
-//! ## The per-cell scope, stated plainly
-//!
-//! `cargo test -p arrayvec` on macOS does NOT compile the consumers, and a
-//! `cargo check -p aterm-gui` on macOS compiles only a *fraction* of the
-//! surface: naga resolves with `default,msl-out,wgsl-in` (so its SPIR-V writer
-//! is `cfg`'d off) and wgpu-hal with `metal,portable-atomic` (and the Metal
-//! backend contains zero `ArrayVec` uses). That cell exercises `Hash`,
-//! `Extend`, by-value `IntoIterator` and `into_inner`; it does NOT exercise
-//! `drain`, by-`&`/`&mut` `IntoIterator`, `new_const` or `clone_from`. Windows
-//! (`dx12` + naga's `spv-out`) is the cell that covers the whole surface.
-//! `tests/consumer_forms.rs` exists precisely to close that gap here, on any
-//! cell.
-//!
-//! # Where the replacement is NOT exactly upstream
-//!
-//! Four divergences, all deliberate, none reachable by anything in the graph:
-//!
-//! * **Capacity-panic message.** Upstream's `extend`/`from_iter` overflow says
-//!   `ArrayVec: capacity exceeded in extend/from_iter`; ours says
-//!   `ArrayVec overflow: capacity exceeded`, because that literal is what
-//!   `crates/aterm-alloc`'s `#[trust::contract_panic(message_contains = …)]`
-//!   annotation binds. Same panic, same place, different words. Nothing in the
-//!   graph matches on the text.
-//! * **`size_of`.** Upstream stores the length as a `u32`; `aterm_alloc` stores
-//!   a `usize`. That is a divergence, but a smaller one than it sounds, and the
-//!   numbers are measured rather than reasoned (aarch64-apple-darwin, ours vs
-//!   upstream): `ArrayVec<u8, 4>` 16 vs 8, `ArrayVec<u32, 8>` 40 vs 36,
-//!   `ArrayVec<u64, 4>` 40 vs 40, `ArrayVec<Arc<u32>, 3>` 32 vs 32. Once `T` is
-//!   8-aligned, upstream's `u32` is padded to 8 anyway and the two are
-//!   IDENTICAL — which covers the `Arc<TextureView>` / handle-carrying vectors
-//!   that dominate the wgpu side. The growth is real only for small, weakly
-//!   aligned `T`. No consumer puts an `ArrayVec` in a `#[repr(C)]` type either,
-//!   so this is not an ABI break.
-//! * **`Drain` under `mem::forget` or a panicking destructor.** Upstream
-//!   shortens the vector up front and restores the tail in `Drop`, so
-//!   forgetting a `Drain` loses the un-drained elements, and an element
-//!   destructor that panics in its `Drop` leaks the rest of the range and the
-//!   tail; ours removes as it yields, so forgetting one keeps them, and its
-//!   `Drop` still drops the rest of the range and closes the tail up (std
-//!   `Vec::Drain`'s outcome). Ours is the safer answer in both cases, and
-//!   nothing in the graph forgets a `Drain` or drops elements whose destructor
-//!   panics.
-//! * **`IntoIter` cost.** Ours is O(n²) in element moves rather than O(n),
-//!   because it moves each element out with `remove(0)` instead of an index
-//!   cursor plus a hand-written `Drop`. The largest capacity anywhere in the
-//!   graph is 32 and every by-value iteration site is pipeline/attachment
-//!   setup rather than per-frame work. The reason for the trade is written out
-//!   on `aterm_alloc::ArrayVecIntoIter`: holding the `ArrayVec` makes the
-//!   "leak an `Arc` on every early return" and "double-free the yielded
-//!   elements" failure modes unrepresentable instead of merely untested.
-//!
-//! `#![no_std]` holds for the whole graph under this crate: `aterm-alloc` is
-//! `#![no_std]` too (it needs only `core` and `alloc`), so a consumer taking
-//! this crate with `default-features = false` — which all of them do — links no
-//! `std` through it.
-//!
-//! # Surface
-//!
-//! Upstream's three public exports are [`ArrayVec`], `ArrayString` and
-//! [`CapacityError`]. `ArrayString` is deliberately absent: no crate in aterm's
-//! graph names it, and a half-written one would be worse than none. The two
-//! iterator types [`IntoIter`] and [`Drain`] are re-exported under upstream's
-//! names (they are `ArrayVecIntoIter` / `ArrayVecDrain` inside `aterm_alloc`,
-//! where the flat `IntoIter` spelling already belongs to `SmallVec`).
+//! * **Overflow panic message**: `extend`/`from_iter` panics with
+//!   `"ArrayVec overflow: capacity exceeded"` (matching `aterm-alloc`'s
+//!   `#[trust::contract_panic]` annotation).
+//! * **Length field width**: stores `len` as `usize` rather than `u32`
+//!   (identical size for 8-aligned `T` such as `Arc<TextureView>`).
+//! * **`Drain` drop/forget safety**: removes elements as they are yielded
+//!   rather than truncating up front, avoiding element loss on `mem::forget`
+//!   or leaks on panicking destructors.
+//! * **`IntoIter` move cost**: pops from the front via `remove(0)` (`O(n²)`
+//!   moves, with max consumer capacity `<= 32` in setup paths) so `IntoIter`
+//!   wraps `ArrayVec` directly without manual drop-range bookkeeping.
+//! * **`ArrayString`**: omitted because no crate in the dependency graph uses it.
 
 #![no_std]
 

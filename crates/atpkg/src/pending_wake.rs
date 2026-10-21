@@ -250,8 +250,7 @@ mod tests {
         std::fs::rename(staged, &shim).unwrap();
         std::fs::remove_dir_all(&stage).unwrap();
 
-        // The rename can finish BEFORE the wait starts. The registered watch
-        // must retain that event rather than sleeping out the fallback.
+        // The rename finished before the wait started: the registered watch keeps the event.
         assert!(wake.wait(aterm_spec::wait::MUST_HAPPEN));
         assert_eq!(crate::which(&layout, "ty"), Some(target));
         std::fs::remove_dir_all(&dir).unwrap();

@@ -1,39 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `session_edge` AUDIT seam (design §1.4#5, §7): one structured, hex-free
-//! event per connection-authority act — grant, token revoke, source sweep —
-//! emitted identically for the wire verbs and the UI paths, on the dedicated
-//! log target `session_edge` (the `containment_audit` pattern) so operators can
-//! route/filter the authority stream independently of general logging:
+//! The `session_edge` audit stream: one event per connection-authority act (grant, revoke,
+//! source sweep, handoff drop), the same for wire verbs and UI paths, on its own log target so
+//! operators can filter it (`RUST_LOG=session_edge=info`).
 //!
-//! ```text
-//! RUST_LOG=session_edge=info
-//! ```
-//!
-//! The bearer token NEVER appears in an event: an act is audited by its
-//! `(src, dst, op)` identity. `EdgeToken`'s `Debug` is redacted for the same
-//! reason — nothing routed through here may weaken that.
+//! The bearer token never appears in an event: an act is identified by `(src, dst, op)`.
 
 use aterm_session::SessionId;
 
-/// The closed vocabulary of audited authority acts. An enum rather than a free
-/// string so a call site cannot typo a new action into the stream — the
-/// `action=` grammar is part of the surface operators grep.
+/// The audited authority acts; closed so the `action=` values operators grep stay fixed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum EdgeAction {
-    /// One edge minted (the `grant` verb / a connection mint — one event per op).
+    /// One edge minted (one event per op).
     Grant,
     /// One edge revoked by its bearer token.
     Revoke,
-    /// EVERY edge from one source swept (`revoke src=<sid>` / source death,
-    /// design §1.4#4).
+    /// Every edge from one source swept (`revoke src=<sid>` or the source's close).
     RevokeSrc,
-    /// One carried seamless-handoff triple NOT re-established at adoption
-    /// (design §1.4#6 fail-soft): its endpoint vanished across the swap, or
-    /// its op is outside the connection vocabulary the one kind-bounded mint
-    /// helper can express (a re-mint there would WIDEN authority). Dropping
-    /// only loses authority — audited so the dissolution is on record.
+    /// One carried seamless-handoff edge not re-established at adoption: its endpoint vanished
+    /// across the swap, or re-minting its op would widen authority. Dropping only loses authority.
     Drop,
 }
 
@@ -49,19 +35,14 @@ impl EdgeAction {
     }
 }
 
-/// Emit one `session_edge` audit event:
+/// Emit one `session_edge` audit event at `Info`:
 /// `EDGE: action=<act> origin=<origin> src=<sid> dst=<sid> op=<op>`.
 ///
-/// `origin` names the surface that performed the act — `"wire"` for the
-/// control-socket verbs; UI paths pass their own surface (`"menu"`/`"drag"`,
-/// design §7). `op` is the edge's wire token ([`aterm_session::Op::as_str`]),
-/// or `"*"` for a source sweep (it removes every op the source held). Emitted
-/// at `Info` — these are acts, not denials — mirroring `containment_audit`'s
-/// posture tier, so `RUST_LOG=session_edge=info` shows the full trail.
+/// `origin` names the surface that acted: `"wire"` for the control-socket verbs, else the UI or
+/// lifecycle path (`"menu"`, `"drag"`, `"close"`, `"handoff"`). `op` is the edge's wire token
+/// ([`aterm_session::Op::as_str`]), or `"*"` for a source sweep.
 pub(crate) fn emit(action: EdgeAction, origin: &str, src: &SessionId, dst: &SessionId, op: &str) {
-    // Direct `__log` (the `containment_audit` idiom): the log macros stamp
-    // `module_path!()` as the target, and this stream's whole point is the
-    // dedicated, stable `session_edge` target.
+    // Direct `__log`: the log macros would stamp `module_path!()` as the target.
     aterm_log::__log(
         aterm_log::Level::Info,
         "session_edge",

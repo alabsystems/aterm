@@ -37,6 +37,7 @@ pub mod init_accounts;
 pub mod init_activation;
 pub mod init_github;
 pub mod init_preferences;
+pub mod init_secrets;
 pub mod init_spotlight;
 pub mod init_trackpad;
 pub mod items;

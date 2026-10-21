@@ -1050,6 +1050,51 @@ pub fn move_block_anchor(document: &MarkdownDocument, source_anchor: usize, delt
     document.blocks[target].source().start
 }
 
+/// THE COLUMNS A CHAR TAKES in the reader's wrap and in its estimate of a
+/// block's rows, which measure a line in a face's average advance: one, and
+/// two for a wide char (a CJK ideograph, kana, Hangul, a fullwidth form, an
+/// emoji, [`aterm_grapheme::char_width`]), which draws about twice an
+/// average Latin advance. Counted as one, a Japanese paragraph's rows were
+/// laid out nearly twice the column's width and painted past it, and its
+/// block was reserved half the rows it painted.
+#[must_use]
+pub fn reader_columns(c: char) -> usize {
+    aterm_grapheme::char_width(c).max(1)
+}
+
+/// [`reader_columns`] of each char of `text`, up to `limit` chars.
+fn text_columns(text: &str, limit: usize) -> usize {
+    text.chars().take(limit).map(reader_columns).sum()
+}
+
+/// The rows a code block's first `limit` chars take at `chars_per_line` columns
+/// ([`estimated_block_height`]): a row per line, and a wide char that would end
+/// past a row starts the next, as the reader's wrap lays it. A function of its
+/// own: with this loop inline, the Trust verifier's inventory of
+/// `estimated_block_height` came out incomplete and its float checks unproved.
+fn code_visual_lines(code: &str, chars_per_line: usize, limit: usize) -> usize {
+    let mut visual_lines = 1usize;
+    let mut column = 0usize;
+    for character in code.chars().take(limit) {
+        if character == '\n' {
+            visual_lines = visual_lines.saturating_add(1);
+            column = 0;
+            continue;
+        }
+        let width = reader_columns(character);
+        if column > 0 && column.saturating_add(width) > chars_per_line {
+            visual_lines = visual_lines.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(width);
+        if column >= chars_per_line {
+            visual_lines = visual_lines.saturating_add(1);
+            column = 0;
+        }
+    }
+    visual_lines
+}
+
 fn estimated_block_height(block: &MarkdownBlock, viewport_width: f32) -> f32 {
     const MAX_LAYOUT_CHARS_PER_BLOCK: usize = 128 * 1024;
     let measure = (viewport_width.min(760.0) - 24.0).max(120.0);
@@ -1068,41 +1113,29 @@ fn estimated_block_height(block: &MarkdownBlock, viewport_width: f32) -> f32 {
                 _ => 8.0,
             };
             (
-                text.chars().take(MAX_LAYOUT_CHARS_PER_BLOCK).count(),
+                text_columns(text, MAX_LAYOUT_CHARS_PER_BLOCK),
                 line,
                 if *level == 1 { 16.0 } else { 14.0 },
                 advance,
             )
         }
         MarkdownBlock::Paragraph { text, .. } | MarkdownBlock::ListItem { text, .. } => (
-            text.chars().take(MAX_LAYOUT_CHARS_PER_BLOCK).count(),
+            text_columns(text, MAX_LAYOUT_CHARS_PER_BLOCK),
             24.0,
             4.0,
             8.0,
         ),
         MarkdownBlock::Quote { text, .. } => (
-            text.chars().take(MAX_LAYOUT_CHARS_PER_BLOCK).count(),
+            text_columns(text, MAX_LAYOUT_CHARS_PER_BLOCK),
             24.0,
             12.0,
             8.0,
         ),
         MarkdownBlock::CodeBlock { code, .. } => {
             let chars_per_line = (measure / 8.0).max(12.0) as usize;
-            let mut visual_lines = 1usize;
-            let mut column = 0usize;
-            for character in code.chars().take(MAX_LAYOUT_CHARS_PER_BLOCK) {
-                if character == '\n' {
-                    visual_lines = visual_lines.saturating_add(1);
-                    column = 0;
-                    continue;
-                }
-                column = column.saturating_add(1);
-                if column >= chars_per_line {
-                    visual_lines = visual_lines.saturating_add(1);
-                    column = 0;
-                }
-            }
-            return visual_lines as f32 * 22.0 + 28.0;
+            return code_visual_lines(code, chars_per_line, MAX_LAYOUT_CHARS_PER_BLOCK) as f32
+                * 22.0
+                + 28.0;
         }
         MarkdownBlock::Table { rows, .. } => {
             return (rows.len().saturating_add(1) as f32 * 30.0) + 20.0;
@@ -2441,6 +2474,45 @@ mod tests {
         assert_eq!(
             move_block_anchor(&document, middle, -3),
             document.blocks[2_497].source().start
+        );
+    }
+
+    /// A WIDE CHAR RESERVES TWO COLUMNS OF A BLOCK'S ROWS, as the reader's
+    /// wrap lays it on two ([`reader_columns`]): a Japanese paragraph and a
+    /// heading are estimated the rows of Latin text of twice their chars, at
+    /// every width, and a code line no fewer (a wide char that would end
+    /// past a line starts the next). NEGATIVE CONTROL: counted a column a
+    /// char, each was reserved the rows of Latin text its own length, half
+    /// the rows it paints.
+    #[test]
+    fn a_wide_char_reserves_two_columns_of_a_blocks_rows() {
+        let cjk = "設定ファイルを読み込めませんでした".repeat(12);
+        let latin = "ab".repeat(cjk.chars().count());
+        for (wide, narrow) in [
+            (cjk.clone(), latin.clone()),
+            (format!("# {cjk}"), format!("# {latin}")),
+            (format!("```\n{cjk}\n```"), format!("```\n{latin}\n```")),
+        ] {
+            let (wide, narrow) = (parse(&wide), parse(&narrow));
+            let code = matches!(wide.blocks[0], MarkdownBlock::CodeBlock { .. });
+            for width in [240.0_f32, 250.0, 480.0, 760.0] {
+                let (wide_rows, narrow_rows) = (
+                    block_visual_rows(&wide.blocks[0], width),
+                    block_visual_rows(&narrow.blocks[0], width),
+                );
+                assert!(
+                    wide_rows == narrow_rows || (code && wide_rows > narrow_rows),
+                    "{wide_rows} rows for {narrow_rows} at {width}: {:?}",
+                    wide.blocks[0]
+                );
+            }
+        }
+        assert_eq!(reader_columns('設'), 2);
+        assert_eq!(reader_columns('a'), 1);
+        assert_eq!(
+            reader_columns('\u{301}'),
+            1,
+            "a combining mark, as a char always was"
         );
     }
 

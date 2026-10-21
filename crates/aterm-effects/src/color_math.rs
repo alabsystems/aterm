@@ -60,6 +60,7 @@ pub fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
 /// cache of the scalar expression (same rounded `f32` multiplies, same add
 /// order); built at runtime because `powf` is not `const`.
 pub(crate) struct RelativeLuminanceTable {
+    pub(crate) linear: [f32; 256],
     red: [f32; 256],
     green: [f32; 256],
     blue: [f32; 256],
@@ -79,6 +80,7 @@ static RELATIVE_LUMINANCE: std::sync::LazyLock<RelativeLuminanceTable> =
             red: std::array::from_fn(|i| 0.2126 * linear[i]),
             green: std::array::from_fn(|i| 0.7152 * linear[i]),
             blue: std::array::from_fn(|i| 0.0722 * linear[i]),
+            linear,
         }
     });
 
@@ -128,12 +130,18 @@ pub fn contrast_ratio(a: u32, b: u32) -> f32 {
 pub fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
     let rgb = rgb & 0x00FF_FFFF;
     // A ratio of 1 or less (or NaN) asks for no floor.
-    if min.partial_cmp(&1.0) != Some(std::cmp::Ordering::Greater)
-        || contrast_ratio(rgb, ground) >= min
-    {
+    if min.partial_cmp(&1.0) != Some(std::cmp::Ordering::Greater) {
         return rgb;
     }
-    let lg = relative_luminance(ground);
+    let table = relative_luminance_table();
+    let lg = relative_luminance_with(table, ground);
+    let meets = |c: u32| {
+        let lc = relative_luminance_with(table, c);
+        (lc.max(lg) + 0.05) / (lc.min(lg) + 0.05) >= min
+    };
+    if meets(rgb) {
+        return rgb;
+    }
     // contrast(black, g) = (L + 0.05) / 0.05 wins iff (L + 0.05)² >= 0.0525.
     let darken = (lg + 0.05) * (lg + 0.05) >= 0.05 * 1.05;
     let chan = |sh: u32| ((rgb >> sh) & 0xff) as f32;
@@ -158,21 +166,27 @@ pub fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
             pack(tint(r), tint(g), tint(b))
         }
     };
-    let meets = |c: u32| contrast_ratio(c, ground) >= min;
     let end = path(1.0);
     if !meets(end) {
         return end;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    for _ in 0..24 {
+    let (mut lo_rgb, mut hi_rgb) = (rgb, end);
+    for i in 0..24 {
         let mid = 0.5 * (lo + hi);
-        if meets(path(mid)) {
+        let mid_rgb = path(mid);
+        if meets(mid_rgb) {
             hi = mid;
+            hi_rgb = mid_rgb;
         } else {
             lo = mid;
+            lo_rgb = mid_rgb;
+        }
+        if i >= 1 && lo_rgb == hi_rgb {
+            break;
         }
     }
-    path(hi)
+    hi_rgb
 }
 
 /// Below this HSV saturation a colour reads as grey: its hue is noise, so
@@ -254,6 +268,9 @@ pub fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
     } else {
         0.0
     };
+    if k <= 0.0 || pinned == styled {
+        return pinned & 0x00FF_FFFF;
+    }
     let ch = |sh: u32| {
         let (a, b) = (
             ((pinned >> sh) & 0xff) as f32,
@@ -267,15 +284,10 @@ pub fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
 /// OKLab `[L, a, b]` of a `0x00RRGGBB` colour (Björn Ottosson's matrices), the
 /// uniform space a tint's distance from its page is weighed in.
 pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
-    let lin = |sh: u32| {
-        let n = ((rgb >> sh) & 0xff) as f32 / 255.0;
-        if n <= 0.040_45 {
-            n / 12.92
-        } else {
-            ((n + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    let (r, g, b) = (lin(16), lin(8), lin(0));
+    let linear = &relative_luminance_table().linear;
+    let r = linear[((rgb >> 16) & 0xff) as usize];
+    let g = linear[((rgb >> 8) & 0xff) as usize];
+    let b = linear[(rgb & 0xff) as usize];
     let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
     let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
     let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();

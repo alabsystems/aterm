@@ -24,9 +24,11 @@ pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {
 /// durable). It is still a real flush, made at the same point and in the same order,
 /// so a test sees the same files, renames and errors. What it drops is the drive-cache
 /// barrier. No test can observe that barrier, because it only orders the disk against
-/// a power loss. It also stalls the whole VOLUME while it runs, so every test binary
-/// running beside this one waits behind it. Measured: one `aterm-agent --lib` run made
-/// 2,561 `F_FULLFSYNC`s (17.7 s of flushing); with these arms it makes 2, and the run
+/// a power loss. It also holds up most flushes, growing writes, creates and renames on
+/// the volume while it runs, so a test binary running beside this one waits behind it
+/// for its own temp-dir metadata (a read or an in-place page-cache write did not wait
+/// in `docs/measured/flush-wait-2026-10-21.md`). Measured: one `aterm-agent --lib` run
+/// made 2,561 `F_FULLFSYNC`s (17.7 s of flushing); with these arms it makes 2, and the run
 /// takes about 4 s less alone and slows its neighbours less. Off Apple targets
 /// `sync_all` already is `fsync(2)`. Integration tests, shipped builds and dependent
 /// crates keep the full barrier.

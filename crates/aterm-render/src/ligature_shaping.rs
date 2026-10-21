@@ -3,33 +3,20 @@
 
 //! Programming-ligature run shaping for the terminal grid.
 //!
-//! aterm renders text strictly per-cell on a monospace cadence. Ligatures
-//! (`=>`, `!=`, `===`, `->`, `<=`, …) need the OpenType `liga`/`calt` features:
-//! `aterm_font::shape` shapes a RUN of adjacent same-style cells, and the font substitutes
-//! the run's glyphs — for a monospace ligature font (JetBrains Mono / Fira Code)
-//! the substitution keeps ONE glyph per input cell (each advance stays one cell),
-//! turning the lead cells of a ligature into empty placeholder glyphs and the
-//! final cell into the wide ligature glyph (whose negative left bearing overflows
-//! back across the run). So a ligature draws on the SAME cells the characters
-//! occupied — no cadence change, no cell consumed.
+//! `aterm_font::shape` shapes a run of adjacent same-style cells with `liga`/`calt`. A
+//! monospace ligature font keeps one glyph per input cell: empty placeholders on the lead
+//! cells and, on the last, the wide ligature glyph, which overflows back across the run.
+//! So a ligature draws on the cells its characters occupy and the cadence never changes.
 //!
-//! This module is the SHARED shaping seam: both the CPU [`crate::Renderer`] row
-//! painter and the GPU `encode_frame` consume the SAME per-cell plan (the same
-//! [`crate::GlyphKey`] at the same column), so the CPU==GPU byte-identical invariant
-//! holds. A run only ligates when the shaper actually changes the glyph ids;
-//! otherwise the plan is identical to the plain per-cell path (byte-identical to
-//! the pre-ligature renderer).
+//! The CPU [`crate::Renderer`] and the GPU renderer consume the same per-cell plan, so
+//! their output matches. A run whose glyph ids shaping leaves unchanged draws exactly as
+//! the plain per-cell path.
 //!
-//! A row aterm-core reordered for bidi reaches the renderer in VISUAL order,
-//! with the permutation in `RenderInput::visual_to_logical`. [`plan_row_runs`]
-//! reads that map: a stretch of right-to-left letters the reorder laid out
-//! backwards is shaped in logical order and its glyphs placed back, so Arabic
-//! joining and every `GSUB` rule read the letters as they were written;
-//! everything else, and every row the reorder left alone (bidi off, the
-//! web modules, a pure left-to-right row), is shaped as the row holds it
-//! (TF.6 of docs/AUDIT-third-party-2026-10-15.md; rustybuzz shaped a
-//! reordered Arabic run as if it were logical, which swapped `init` and
-//! `fina`).
+//! A row aterm-core reordered for bidi arrives in visual order, with the permutation in
+//! `RenderInput::visual_to_logical`. [`plan_row_runs`] shapes a stretch of right-to-left
+//! letters the reorder laid out backwards in logical order and puts its glyphs back, so
+//! Arabic joining and every `GSUB` rule read the letters as written. Everything else, and
+//! every row the reorder left alone, is shaped as the row holds it.
 
 use std::borrow::Borrow;
 
@@ -42,29 +29,13 @@ use aterm_types::text_shaping::FontFeature;
 
 use crate::StyleBits;
 
-/// Build the feature list applied to every ligature shaping run.
+/// Build the feature list for every shaping run: `liga`/`calt` at `1`, or `0` when
+/// ligatures are off (so a run can apply `zero` or `ss01` without forming `=>`), then the
+/// user's `font_features`. Every entry applies over the whole run and the later entry wins
+/// for a tag, so an explicit user `liga`/`calt` overrides the base. The list is
+/// first-party; `engine_features` builds the shaper's form of it.
 ///
-/// The base pair is the programming-ligature features `liga`/`calt`, set to `1`
-/// when `ligatures_on` (the default), or `0` when ligatures are globally off
-/// (`LigatureMode::Disabled`). Setting them to `0` lets a shaping run still apply
-/// the user's OTHER features (e.g. `ss01`, `zero`) WITHOUT forming `=>`/`!=`
-/// ligatures — the "slashed zero but no ligatures" combination. The caller's
-/// OpenType `font_features` (`ss01`, `cv01`, `zero`, stylistic sets, …) are
-/// appended AFTER the base pair. The shaper resolves overlapping features by
-/// LAST-writer-wins for a given tag, so an explicit user `liga`/`calt` value still
-/// overrides the base.
-///
-/// Every entry applies across the WHOLE shaped run (every cluster), matching how
-/// the on/off `liga`/`calt` features are applied, so a [`FontFeature`] (tag and
-/// value, no range) says all there is to say. The list is first-party on purpose:
-/// the shaping engine is an implementation detail of this crate
-/// (docs/AUDIT-third-party-2026-10-15.md, TF.2), and the engine's own feature
-/// form is built from it in one place (`engine_features`).
-///
-/// HOT-PATH NOTE: this is built ONCE when the shaping config is resolved
-/// ([`crate::Renderer::set_text_shaping`]) and stored on the renderer — it is
-/// NOT called per row/run/cell. When `user` is empty the result is exactly the
-/// two-element base list, so the empty-features path costs the same as before.
+/// Built once per shaping config ([`crate::Renderer::set_text_shaping`]), not per run.
 #[must_use]
 pub fn build_feature_list(user: &[FontFeature], ligatures_on: bool) -> Vec<FontFeature> {
     let base = u32::from(ligatures_on);
@@ -75,9 +46,8 @@ pub fn build_feature_list(user: &[FontFeature], ligatures_on: bool) -> Vec<FontF
     features
 }
 
-/// The shaping engine's form of a [`build_feature_list`] result: each feature
-/// over the GLOBAL run range, in order (order is precedence, last writer wins).
-/// Built once per shaping-config change, beside the first-party list it mirrors.
+/// The shaper's form of a [`build_feature_list`] result: each feature over the whole run,
+/// in order (the last writer wins). Built once per shaping-config change.
 pub(crate) fn engine_features(features: &[FontFeature]) -> Vec<Feature> {
     features
         .iter()
@@ -145,13 +115,13 @@ pub fn shaping_min_run(has_user_features: bool) -> usize {
     if has_user_features { 1 } else { 2 }
 }
 
-/// The grid-mappability verdict for a shaping result: `n_out` output glyphs over
-/// `n_in` input cells (M4 — ligature slicing).
+/// Whether a shaping result (`n_out` glyphs over `n_in` cells) maps onto the monospace grid.
 ///
-/// aterm's grid renders on a strict monospace cadence, so a shaped run is only
-/// usable if its glyphs map cleanly onto cells. There are exactly TWO admissible
-/// forms; every other shape is rejected back to the per-cell path (byte-identical
-/// to no-ligature):
+/// - [`ShapeVerdict::OneToOne`]: `n_out == n_in`, the spacer convention of Fira Code and
+///   JetBrains Mono (empty placeholders on the lead cells, the wide glyph on the last).
+/// - [`ShapeVerdict::Collapsed`]: `n_out == 1`, `n_in >= 2`, Cascadia's merged convention.
+///   Admitted only with `admit_collapsed` (config, default off), since it needs the
+///   raster-slicing path ([`extract_cell_slice`]).
 ///
 /// - [`ShapeVerdict::OneToOne`] — `n_out == n_in`: the Fira/JetBrains "spacer
 ///   convention" every shipped ligature font uses (one advance per input cell:
@@ -173,13 +143,12 @@ pub fn shaping_min_run(has_user_features: bool) -> usize {
 /// that admits collapse without the flag) by the derived ty model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeVerdict {
-    /// Not grid-mappable — use the per-cell path (byte-identical to no-ligature).
+    /// Not grid-mappable: use the per-cell path.
     Reject,
-    /// One glyph per input cell (Fira/JetBrains spacer convention) — the existing
-    /// 1:1 path, drawn as one [`ColumnGlyph::Ligated`] per column.
+    /// One glyph per input cell, drawn as one [`ColumnGlyph::Ligated`] per column.
     OneToOne,
-    /// `n_in` cells collapsed to ONE wide glyph (Cascadia) — rasterize once and
-    /// slice into `n_in` per-cell tiles. Only when `admit_collapsed`.
+    /// `n_in` cells collapsed to one wide glyph, rasterized once and sliced into `n_in`
+    /// cell tiles. Only with `admit_collapsed`.
     Collapsed,
 }
 
@@ -204,22 +173,11 @@ pub fn classify_shape(n_in: usize, n_out: usize, admit_collapsed: bool) -> Shape
 
 /// What to draw at one column of a row, resolved by [`plan_row_runs`].
 ///
-/// `Ligated` carries the primary-face glyph id the shaper produced for this
-/// column's cell within its run; the caller blits it as a [`crate::GlyphKey::mono_gid`]
-/// at the column's monospace origin (the lead cells of a ligature get the empty
-/// placeholder glyph, the final cell the wide ligature glyph). `PerCell` means
-/// the column was not part of a ligated run — the caller uses its ordinary
-/// per-cell glyph dispatch ([`crate::Renderer::resolve_cell_key`]), so it stays
-/// byte-identical to the non-ligature path.
-///
-/// `LigatedSlice` (M4 — Cascadia N:1 merged ligatures) marks cell `k` of an
-/// `n`-cell run that shaping COLLAPSED to a single wide glyph `gid`: the wide
-/// glyph is rasterized once and this cell draws its per-cell TILE (slice `k`),
-/// a CELL-LOCAL coverage bitmap (`cell_w` wide, left bearing 0) the caller keys
-/// with [`crate::Renderer::ligature_slice_key`]. Because each slice is confined
-/// to its own cell, per-cell foreground / selection / block-cursor recolour all
-/// work over the ligature without spanning neighbours — unlike `Ligated`, whose
-/// wide glyph overflows across the run's lead cells.
+/// `Ligated` is blitted as a [`crate::GlyphKey::mono_gid`] whose wide glyph overflows back
+/// across the run's lead cells. A `LigatedSlice` tile is cell-local (keyed by
+/// [`crate::Renderer::ligature_slice_key`]), so per-cell foreground, selection and
+/// block-cursor recolour work over the ligature. `PerCell` takes the ordinary dispatch
+/// ([`crate::Renderer::resolve_cell_key`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColumnGlyph {
     /// Use the ordinary per-cell dispatch for this column (no ligature touched it).
@@ -231,44 +189,30 @@ pub enum ColumnGlyph {
     LigatedSlice { gid: u16, k: u16, n: u16 },
 }
 
-/// The result of shaping one coalesced run, returned by the [`plan_row_runs`]
-/// `shape` closure (M4).
-///
-/// - `PerColumn` — the Fira/JetBrains 1:1 "spacer convention": one gid per input
-///   cell, `Some(gid)` for a column whose glyph shaping CHANGED, `None` to keep it
-///   on the per-cell path. This is the historical, byte-identical accept.
-/// - `Collapsed` — the Cascadia "merged" N:1 convention: the whole run collapsed
-///   to ONE wide glyph `gid` spanning `n` input cells. The planner expands it to
-///   `n` [`ColumnGlyph::LigatedSlice`] columns; the raster path slices the wide
-///   glyph into per-cell tiles. Only produced when `admit_collapsed` is set.
+/// The result of shaping one run, returned by the [`plan_row_runs`] `shape` closure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShapedRun {
-    /// 1:1 per-column plan (spacer convention).
+    /// 1:1 spacer convention (Fira, JetBrains): `Some(gid)` where shaping changed the
+    /// column's glyph, `None` to keep it per-cell.
     PerColumn(Box<[Option<u16>]>),
-    /// N:1 collapse: one wide `gid` over `n` cells (Cascadia merged ligatures).
+    /// N:1 collapse (Cascadia): one wide `gid` over `n` cells, expanded to `n`
+    /// [`ColumnGlyph::LigatedSlice`] columns. Only with `admit_collapsed`.
     Collapsed { gid: u16, n: u16 },
 }
 
-/// The largest cell count an N:1 collapse is admitted for. A merged ligature
-/// spanning more than this many cells is pathological (real programming
-/// ligatures span 2–4 cells); beyond the cap the run falls back to the per-cell
-/// path (never worse than today). The cap also keeps the slice index in the
-/// child glyph-key encoding ([`crate::Renderer::ligature_slice_key`]) small.
+/// The most cells an N:1 collapse is admitted for (real programming ligatures span 2–4);
+/// a longer run stays per-cell. Keeps the slice index in
+/// [`crate::Renderer::ligature_slice_key`] small.
 pub const LIG_SLICE_MAX: usize = 64;
 
-/// Extract cell `k`'s slice of a wide ligature raster into a CELL-LOCAL tile
-/// (`cell_w × height`, left bearing 0), accounting for the wide glyph's left
-/// bearing `xmin` (M4 — Cascadia N:1 slicing). Tile column `j` is source column
-/// `k*cell_w + j - xmin` of the raster, or 0 where that falls outside
-/// `[0, raster_w)` — so blitting the returned tile at the cell's dest column
-/// reproduces the wide glyph's coverage over exactly that cell. Concatenating the
-/// tiles for `k = 0..n` (with `n*cell_w >= xmin + raster_w`), dropping the leading
-/// `xmin` pad, reproduces the raster exactly
-/// (`extract_cell_slice_reassembles_wide_raster`).
+/// Extract cell `k`'s slice of a wide ligature raster as a cell-local tile (`cell_w ×
+/// height`, left bearing 0). Tile column `j` is raster column `k*cell_w + j - xmin`, or 0
+/// outside `[0, raster_w)`, so the tile at the cell's origin reproduces the wide glyph's
+/// coverage over that cell, and the tiles for `k = 0..n`, minus the leading `xmin` pad,
+/// reassemble the raster (`extract_cell_slice_reassembles_wide_raster`).
 ///
-/// Returns an empty `Vec` for a degenerate `cell_w == 0`, `height == 0`, or a
-/// byte slice too short — the caller keeps the per-cell path rather than reading
-/// out of bounds.
+/// Empty for `cell_w == 0`, `height == 0` or a too-short `raster`; the caller then keeps
+/// the per-cell path.
 #[must_use]
 pub fn extract_cell_slice(
     raster: &[u8],
@@ -297,15 +241,10 @@ pub fn extract_cell_slice(
     tile
 }
 
-/// Whether `cell` is eligible to join a ligature shaping run.
-///
-/// A run is contiguous cells that are: drawable (not wide-continuation, not a
-/// space, not a control char), NOT an explicit emoji/text-presentation cell,
-/// NOT part of a shaped emoji cluster, and NOT image-covered. Spaces and controls BREAK the
-/// run (so `a => b` shapes `=>` but not across the spaces); wide/emoji/image
-/// cells route to their existing colour/wide paths untouched. The caller also
-/// breaks on a STYLE change (bold/italic) and per-frame on the cursor/selection
-/// columns so those stay per-cell and correct.
+/// Whether `cell` may join a ligature shaping run: not a wide continuation, space or
+/// control, not emoji/text-presentation, not in a shaped emoji cluster, not image-covered.
+/// Spaces break runs, so `a => b` shapes only `=>`. The caller also breaks runs on a
+/// style change and at the cursor and selection columns.
 #[must_use]
 pub fn cell_is_shapeable(cell: &RenderCell, has_cluster: bool, image_covered: bool) -> bool {
     !cell.wide
@@ -344,13 +283,9 @@ impl<'a> RowShaper<'a> {
         }
     }
 
-    /// Shape one run string and return its grid plan. Accepted ONLY when the
-    /// shape yields one output glyph per input `char` ([`ShapedRun::PerColumn`])
-    /// or, with `admit_collapsed`, one wide glyph for the whole run
-    /// ([`ShapedRun::Collapsed`]), AND it changed a glyph vs the plain cmap (the
-    /// `!changed` decline, byte-identical to the per-cell path). Each accepted
-    /// glyph is placed at its column's monospace origin, so the grid cadence is
-    /// preserved by PLACEMENT and the per-glyph advance is not consulted.
+    /// Shape one run and return its grid plan, or `None` unless the shape is grid-mappable
+    /// ([`classify_shape`]) and changed a glyph vs the plain cmap. Each glyph is placed at
+    /// its column's monospace origin, so the cadence comes from placement, not advances.
     pub(crate) fn shape(
         &mut self,
         run: &str,
@@ -379,9 +314,9 @@ impl<'a> RowShaper<'a> {
         result
     }
 
-    /// Shape `run` as given, in LOGICAL order: [`plan_row_runs`] has already
-    /// put a visual-order right-to-left stretch back the way it was written.
-    /// Direction and script are guessed from the text, as rustybuzz did.
+    /// Shape `run` in the order given, which is logical: [`plan_row_runs`] has already put
+    /// a backwards right-to-left stretch back in written order. Direction and script are
+    /// guessed from the text.
     fn shape_buffer(&mut self, run: &str, scratch: &mut UnicodeBuffer) -> GlyphBuffer {
         let mut buffer = std::mem::take(scratch);
         buffer.push_str(run);
@@ -435,15 +370,10 @@ fn map_shaped_run(
     admit_collapsed: bool,
     glyphs: &[GlyphInfo],
 ) -> Option<ShapedRun> {
-    // M4: classify the shape against the grid-mappable forms. `OneToOne`
-    // (Fira/JetBrains spacer convention) is the historical accept, drawn as one
-    // gid per column below. `Collapsed` (Cascadia N:1) is admitted ONLY when
-    // `admit_collapsed`; the single output glyph is the wide ligature gid, which
-    // the raster path slices into per-cell tiles ([`extract_cell_slice`]) — so
-    // here we return the wide gid + cell count and let the planner expand it to
-    // `n` [`ColumnGlyph::LigatedSlice`] columns. Any other count (partial
-    // collapse / expansion) is `Reject`. With `admit_collapsed == false` this is
-    // byte-identical to the legacy `infos.len() != run_chars.len()` decline.
+    // `OneToOne` is drawn as one gid per column below. `Collapsed` (only with
+    // `admit_collapsed`) returns the wide gid and cell count; the planner expands it to
+    // `n` `LigatedSlice` columns and the raster path slices the glyph. Anything else
+    // stays per-cell.
     match classify_shape(run_chars.len(), glyphs.len(), admit_collapsed) {
         ShapeVerdict::OneToOne => {}
         ShapeVerdict::Collapsed => {
@@ -462,25 +392,14 @@ fn map_shaped_run(
         }
         ShapeVerdict::Reject => return None,
     }
-    // Map each output glyph to its INPUT char by `cluster` (the byte offset we
-    // pushed). For a per-char run on a monospace font the clusters are the char
-    // boundaries in order; build a glyph id per char position.
+    // Map each output glyph to its input char by `cluster` (the pushed byte offset).
     let n = run_chars.len();
-    // ALL-ASCII FAST PATH: when the run's byte length equals its char count every
-    // char is one byte, so the byte offset table would be exactly `0, 1, 2, …` and
-    // the cluster IS the char index — `binary_search(&cluster)` returns
-    // `Ok(cluster)` iff `cluster < n` and `Err` otherwise, which is precisely the
-    // branch below. The ligature runs this path exists for (`=>`, `!=`, `->`, `::`)
-    // are all-ASCII, so the table and its allocation are now only built for the
-    // mixed-width fallback.
+    // All-ASCII fast path: when byte length equals char count the cluster is the char
+    // index and no offset table is built. Ligature runs (`=>`, `!=`, `::`) take it.
     let ascii = run.len() == n;
-    // The table is STRICTLY INCREASING by construction (every entry is the
-    // previous plus a non-zero `len_utf8`), so the lookup is a binary search,
-    // not a linear `position` scan: the run length is bounded only by `cols`,
-    // and a 200-column run of shapeable cells (a `---` separator, a base64
-    // blob, one-line JSON) turned an O(n) probe per output glyph into O(n²)
-    // per run on every ShapedRunCache miss — i.e. on every newly scrolled-in
-    // line. Same unique `Ok(idx)` `position` returned, same `Err` → bail.
+    // The table is strictly increasing, so lookup is a binary search: a run can be as
+    // long as the row (a `---` rule, a base64 blob), and a linear scan per glyph would be
+    // O(n²) on every shaped-run cache miss.
     let mut byte_to_idx: Vec<usize> = Vec::new();
     if !ascii {
         byte_to_idx.reserve_exact(n);
@@ -513,21 +432,13 @@ fn map_shaped_run(
             return None; // non-1:1 cluster collision — bail to per-cell
         }
     }
-    // PER-COLUMN accept: a column is `Some(gid)` (drawn as the shaped primary glyph)
-    // ONLY when shaping CHANGED its glyph vs the plain cmap glyph; otherwise it is
-    // `None` and stays on the per-cell dispatch. This is what keeps an EFFECTIVE
-    // feature/ligature on one cell from dragging its neighbours onto the
-    // primary-by-glyph-id path:
-    //   - a char the primary face LACKS maps to gid 0 == cmap(0) -> None -> the
-    //     per-cell path routes it to the fallback face (no `.notdef` tofu);
-    //   - a procedurally-rendered or simply non-substituted neighbour has
-    //     gid == cmap -> None -> keeps its procedural/per-cell glyph;
-    //   - a char the face DOES cover that shaping turned into `.notdef` is a
-    //     ligature the face cannot draw (Monocraft's arrows):
-    //     the whole run goes back to the per-cell path, never a box.
-    // A ligature like `=>` legitimately changes BOTH cells (wide glyph + placeholder),
-    // so both stay `Some`. If NO column changed there is nothing to draw specially —
-    // return None so the whole run is byte-identical to the per-cell path.
+    // A column keeps its shaped gid only when shaping changed it from the plain cmap
+    // glyph; otherwise it is `None` and stays per-cell. So a char the primary face lacks
+    // (gid 0 == cmap 0) still reaches the fallback face (no `.notdef` tofu), and an
+    // unsubstituted or procedural neighbour keeps its glyph. A char the face covers that
+    // shaping turned into `.notdef` is a ligature the face cannot draw (Monocraft's
+    // arrows): the whole run goes per-cell rather than draw a box. If nothing changed,
+    // the whole run declines to the per-cell path.
     let mut any_changed = false;
     for (slot, &ch) in out.iter_mut().zip(run_chars) {
         let gid = (*slot)?;
@@ -572,12 +483,9 @@ pub fn face_has_ligature_features(face: &aterm_font::Face<'_>) -> bool {
     face_gsub_has(face, |t| t == *b"liga" || t == *b"calt")
 }
 
-/// Whether the primary face's `GSUB` table advertises `tag` (e.g. `zero`, `ss01`,
-/// `cv01`). A face with no `GSUB` (e.g. Apple's Menlo/Monaco) advertises
-/// NOTHING, so a configured feature can never substitute a glyph: the shaper returns
-/// the plain cmap ids and the run shaper's `!changed` decline keeps the run
-/// per-cell. Used for the GUI's "font_features had no effect on this font" diagnostic
-/// so a configured-but-unsupported feature is a warning, not a silent no-op.
+/// Whether the primary face's `GSUB` table advertises `tag` (e.g. `zero`, `ss01`). A face
+/// without `GSUB` (Menlo, Monaco) advertises nothing, so no configured feature can
+/// substitute; this backs the GUI's "font_features had no effect" warning.
 #[must_use]
 pub fn font_advertises_feature(rb_bytes: &[u8], index: u32, tag: [u8; 4]) -> bool {
     aterm_font::Face::parse(rb_bytes, index).is_ok_and(|face| face_gsub_has(&face, |t| t == tag))
@@ -594,27 +502,21 @@ fn face_gsub_has(face: &aterm_font::Face<'_>, hit: impl Fn([u8; 4]) -> bool) -> 
         .is_some_and(|gsub| gsub.features.into_iter().any(|f| hit(f.tag.to_bytes())))
 }
 
-/// Build the per-column glyph plan for one row of `cells`.
+/// Build the per-column glyph plan for one row of `cells`: `Ligated` in a 1:1 ligated run,
+/// `LigatedSlice` in a collapsed (N:1) run, `PerCell` elsewhere.
 ///
-/// `shapeable[c]` is whether column `c` may join a run (computed by the caller
-/// from [`cell_is_shapeable`] PLUS any per-frame exclusion columns — cursor /
-/// selection / `CursorDisabled` ligature mode). `run_boundary_before[c]` starts
-/// a fresh run at `c` without excluding that cell; pane boundaries need this
-/// distinction so a right pane beginning with `=>` can still ligate.
-/// `style_of(c)` returns the cell's SGR style bits so a style change BREAKS the
-/// run. `order` is the row's bidi visual→logical map
-/// (`RenderInput::visual_to_logical`, empty for a row in logical order): a
-/// coalesced run is shaped in pieces, a stretch of right-to-left letters the
-/// map lays out backwards in logical order ([`logical_rtl_stretch`]) and the
-/// rest as the row holds it. `shape(run, chars, style)` shapes one piece in
-/// logical order (the caller caches it by that text) and returns a
-/// [`ShapedRun`], or `None` if it did not ligate. The result is one
-/// [`ColumnGlyph`] per column:
-/// `Ligated` for cells inside a 1:1 ligated run, `LigatedSlice` for cells of a
-/// collapsed (Cascadia N:1) run, `PerCell` everywhere else.
+/// `shapeable[c]` says whether column `c` may join a run ([`cell_is_shapeable`] plus the
+/// caller's per-frame exclusions: cursor, selection, `CursorDisabled` mode).
+/// `run_boundary_before[c]` starts a fresh run at `c` without excluding it, so a right
+/// pane that begins with `=>` can still ligate. A change in `style_of` also breaks a run.
 ///
-/// SHARED by the CPU and GPU renderers so both place the identical glyph at the
-/// identical column — the byte-identical invariant.
+/// `order` is the row's bidi visual→logical map (`RenderInput::visual_to_logical`, empty
+/// for a row in logical order). A run is shaped in pieces: a stretch of right-to-left
+/// letters the map lays out backwards ([`logical_rtl_stretch`]) in logical order, the rest
+/// as the row holds it. `shape` shapes one piece in logical order (the caller caches it by
+/// that text) and returns `None` if it did not ligate.
+///
+/// Shared by the CPU and GPU renderers so both draw the same glyph at the same column.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_row_runs<S, F, R>(
     cells: &[RenderCell],
@@ -630,16 +532,14 @@ pub fn plan_row_runs<S, F, R>(
     out: &mut Vec<ColumnGlyph>,
 ) where
     S: Fn(usize) -> StyleBits,
-    // The shaped run is only READ into the column plan here and then dropped, so the
-    // closure may hand back anything that borrows as a `ShapedRun` — a bare owned
-    // `ShapedRun` (tests) or an `Arc<ShapedRun>` (the renderer's memo, whose cache
-    // hits are then a refcount bump, not a deep clone of the boxed gid slice).
+    // Anything that borrows as a `ShapedRun` will do: an owned one (tests) or the
+    // renderer memo's `Arc<ShapedRun>`, so a cache hit is a refcount bump.
     F: FnMut(&str, &[char], StyleBits) -> Option<R>,
     R: Borrow<ShapedRun>,
 {
     out.clear();
-    // A 268M-column terminal is physically impossible; this dominating guard bounds
-    // the resize allocation (and every `start + i < cols` write below).
+    // A 268M-column terminal is physically impossible; this guard bounds the resize
+    // allocation.
     if cols >= 268_435_456 {
         return;
     }
@@ -651,7 +551,7 @@ pub fn plan_row_runs<S, F, R>(
             c = c.saturating_add(1);
             continue;
         }
-        // Coalesce a maximal run of shapeable cells with the SAME style.
+        // Coalesce a maximal run of shapeable cells with the same style.
         let style = style_of(c);
         let start = c;
         while c < n
@@ -692,16 +592,15 @@ fn next_piece(cells: &[RenderCell], order: &[u16], start: usize, end: usize) -> 
     (piece_end, false)
 }
 
-/// Whether the cells from `start` (before `end`) open a stretch of
-/// right-to-left letters (bidi class R or AL) that `order` lays out
-/// backwards — each painted one column left of its logical successor — and
-/// if so where the stretch ends. Only such a stretch is reversed for
-/// shaping: the reorder put it there, and joining reads it the other way.
-/// Neutrals at a right-to-left level (an operator between two Hebrew words)
-/// and left-to-right text keep the order the grid shows, which is the order
-/// a programming ligature's one-glyph-per-cell convention is drawn in. An
-/// empty `order` (a row the reorder left alone) or an ascending one (a
-/// logical-order pane composed beside a reordered one) has no such stretch.
+/// Whether the cells from `start` (before `end`) open a stretch of right-to-left letters
+/// (bidi class R or AL) that `order` lays out backwards, each painted one column left of
+/// its logical successor, and if so where the stretch ends. Only such a stretch is
+/// reversed for shaping: the reorder put it there, and joining reads it the other way.
+/// Neutrals at a right-to-left level (an operator between two Hebrew words) and
+/// left-to-right text keep the order the grid shows, the order a programming ligature's
+/// one-glyph-per-cell convention is drawn in. An empty `order` (a row the reorder left
+/// alone) or an ascending one (a logical-order pane composed beside a reordered one) has
+/// no such stretch.
 fn logical_rtl_stretch(
     cells: &[RenderCell],
     order: &[u16],
@@ -770,8 +669,7 @@ fn plan_piece<F, R>(
         cols.iter().for_each(&mut push);
     }
     if run_chars.len() < min_run {
-        return; // too short for the active mode; stays PerCell. (min_run is
-        // 2 for plain ligatures, 1 when user features can act on one cell)
+        return; // too short for this mode; stays PerCell
     }
     // The column of the piece's `i`th character in logical order.
     let column = |i: usize| {
@@ -789,11 +687,9 @@ fn plan_piece<F, R>(
     {
         Some(ShapedRun::PerColumn(gids)) => {
             for (i, slot) in gids.iter().enumerate() {
-                // Only columns shaping actually CHANGED become Ligated; the rest
-                // stay PerCell so procedural/fallback cells in the run keep their
-                // own face. `shape` is a caller-supplied closure; an oversized
-                // return must NOT index out of bounds. `column` and get_mut make
-                // a bad gid array a no-op instead of a panic.
+                // Only columns shaping changed become Ligated, so procedural and
+                // fallback cells keep their own face. `shape` is caller-supplied:
+                // `column` and get_mut make an oversized gid array a no-op.
                 if let Some(gid) = *slot
                     && let Some(cell) = column(i).and_then(|col| out.get_mut(col))
                 {
@@ -802,11 +698,8 @@ fn plan_piece<F, R>(
             }
         }
         Some(&ShapedRun::Collapsed { gid, n }) => {
-            // Cascadia N:1: the wide glyph `gid` spans `n` cells. Mark each cell
-            // of the run as slice `k`; the raster path draws the wide glyph's
-            // per-cell tile at each column (`extract_cell_slice`). `n` is the
-            // shaped run's cell count, so `[start, start+n)` is exactly this
-            // piece; the wide glyph is drawn left to right whichever order its
+            // N:1: the wide glyph spans the piece's `n` cells; column `start + k` draws
+            // slice `k` of it (`extract_cell_slice`), left to right whichever order the
             // characters were shaped in.
             for k in 0..(n as usize) {
                 if let Some(cell) = start
@@ -892,9 +785,8 @@ mod tests {
                     let mut shaper = RowShaper::new(ShapeFace::new(face.clone()), features);
                     let fresh_face = ShapeFace::new(face);
                     for run in runs.iter().chain(runs.iter().rev()) {
-                        // The same buffer `shape_buffer` builds, shaped with a
-                        // plan built for it alone: the run as given, in
-                        // logical order, its direction guessed.
+                        // The buffer `shape_buffer` builds (the run as given, its
+                        // direction guessed), shaped with a plan built for it alone.
                         let mut fresh = UnicodeBuffer::new();
                         fresh.push_str(run);
                         fresh.guess_segment_properties();
@@ -949,8 +841,8 @@ mod tests {
         }
     }
 
-    /// The engine form is the first-party list entry for entry, in order (order
-    /// is precedence); the shaper applies every one over the whole run.
+    /// The engine form mirrors the first-party list entry for entry, in order (order is
+    /// precedence).
     #[test]
     fn engine_features_mirror_the_list_over_the_whole_run() {
         let list = build_feature_list(
@@ -1002,15 +894,10 @@ mod tests {
         );
     }
 
-    /// ITEM C — a ligature run must BREAK across an image cell. Row `= > [img] = >`:
-    /// the image cell (column 2) is image-covered, so the two `=>` operators sit on
-    /// OPPOSITE sides of it. With a shaping closure that ligates any 2-char `=>` run,
-    /// each side ligates independently (columns 0..=1 and 3..=4) and the image
-    /// column stays `PerCell` — proving no single run spanned the image cell.
+    /// A ligature run breaks at an image-covered cell: the `=>` on each side ligates alone.
     #[test]
     fn ligature_run_breaks_on_image_cell() {
         let cells = [cell('='), cell('>'), cell('='), cell('='), cell('>')];
-        // image_covers is true only for column 2 (the middle operator-shaped cell).
         let shapeable: Vec<bool> = (0..cells.len())
             .map(|c| cell_is_shapeable(&cells[c], false, c == 2))
             .collect();
@@ -1040,10 +927,8 @@ mod tests {
             &mut run_chars,
             &mut out,
         );
-        // Columns 0..=1: the first '=>' ligated. Column 2: image cell, PerCell.
-        // Columns 3..=4: the second '=>' ligated. If a run had spanned the image
-        // cell, the planner would have tried to shape "=>==>" (which our closure
-        // declines), leaving EVERYTHING PerCell — the asserts below would fail.
+        // Had one run spanned the image cell, the closure would decline "=>==>" and leave
+        // every column PerCell.
         assert_eq!(out[0], ColumnGlyph::Ligated(900));
         assert_eq!(out[1], ColumnGlyph::Ligated(901));
         assert_eq!(
@@ -1055,9 +940,8 @@ mod tests {
         assert_eq!(out[4], ColumnGlyph::Ligated(901));
     }
 
-    /// A pane edge is a boundary BETWEEN runs, not a request to exclude the
-    /// right-hand endpoint. The right pane may legitimately begin with a
-    /// programming ligature; its first `=` must remain shapeable with `>`.
+    /// A pane edge starts a new run without excluding its first cell, so a right pane that
+    /// begins with `=>` still ligates.
     #[test]
     fn run_boundary_preserves_right_pane_initial_ligature() {
         let cells = [cell('x'), cell('x'), cell('='), cell('>')];
@@ -1123,19 +1007,18 @@ mod tests {
         gids.iter().map(|&g| ColumnGlyph::Ligated(g)).collect()
     }
 
-    /// TF.6: a stretch of right-to-left letters the bidi reorder painted
-    /// backwards is shaped in logical order, and each glyph goes back to the
-    /// column its letter is painted at; the left-to-right operator after it is
-    /// shaped as the row holds it. Visual `ابحرم==` is logical `مرحبا==`.
+    /// A stretch of right-to-left letters the bidi reorder painted backwards is shaped in
+    /// logical order, and each glyph goes back to the column its letter is painted at; the
+    /// left-to-right operator after it is shaped as the row holds it. Visual `ابحرم==` is
+    /// logical `مرحبا==`.
     #[test]
     fn a_backwards_rtl_stretch_is_shaped_in_logical_order() {
         let visual = "\u{627}\u{628}\u{62D}\u{631}\u{645}==";
         let (seen, out) = plan_pieces(visual, &[4, 3, 2, 1, 0, 5, 6]);
         assert_eq!(seen, ["\u{645}\u{631}\u{62D}\u{628}\u{627}", "=="]);
         assert_eq!(out, ligated(&[104, 103, 102, 101, 100, 100, 101]));
-        // NEGATIVE CONTROL: the same cells in logical order (no map, or the
-        // identity a logical-order pane is composed with) are one piece,
-        // shaped as the row holds them.
+        // Negative control: the same cells in logical order (no map, or the identity a
+        // logical-order pane is composed with) are one piece, shaped as the row holds them.
         for order in [&[][..], &[0, 1, 2, 3, 4, 5, 6]] {
             let (seen, out) = plan_pieces(visual, order);
             assert_eq!(seen, [visual], "{order:?}");
@@ -1143,11 +1026,10 @@ mod tests {
         }
     }
 
-    /// Neutrals at a right-to-left level keep the order the grid shows: in
-    /// logical `אב==גד` the operator sits between two Hebrew words, so the
-    /// reorder paints the whole token backwards (`דג==בא`), but only the
-    /// letters are shaped reversed. A programming ligature's spacer and wide
-    /// glyph are drawn left to right, as rustybuzz shaped them.
+    /// Neutrals at a right-to-left level keep the order the grid shows: in logical `אב==גד`
+    /// the operator sits between two Hebrew words, so the reorder paints the whole token
+    /// backwards (`דג==בא`), but only the letters are shaped reversed. A programming
+    /// ligature's spacer and wide glyph are drawn left to right.
     #[test]
     fn rtl_level_neutrals_keep_the_painted_order() {
         let (seen, out) = plan_pieces("\u{5D3}\u{5D2}==\u{5D1}\u{5D0}", &[5, 4, 3, 2, 1, 0]);
@@ -1155,16 +1037,12 @@ mod tests {
         assert_eq!(out, ligated(&[101, 100, 100, 101, 101, 100]));
     }
 
-    /// M4 — a `Collapsed` shape result expands to `n` `LigatedSlice` columns over
-    /// the run, each carrying the wide gid and its cell index `k`. The columns
-    /// OUTSIDE the run stay `PerCell` (byte-identical to no-ligature). This is the
-    /// planner half of the Cascadia N:1 path (the raster half is
-    /// `extract_cell_slice`).
+    /// A `Collapsed` result expands to `n` `LigatedSlice` columns; columns outside the run
+    /// stay `PerCell`.
     #[test]
     fn plan_row_runs_expands_collapsed_to_slices() {
-        // Row: `x <=> y` with the operator run `<=>` (cols 2..=4) collapsing to
-        // one wide glyph. `x`/`y` are shapeable single cells (min_run 2 keeps them
-        // per-cell); the spaces break the run.
+        // `x <=> y`: the `<=>` run (cols 2..=4) collapses; spaces break the run and the lone
+        // `x`/`y` stay per-cell (min_run 2).
         let cells = [
             cell('x'),
             cell(' '),
@@ -1178,7 +1056,7 @@ mod tests {
             .iter()
             .map(|c| cell_is_shapeable(c, false, false))
             .collect();
-        // Collapse ANY 3-char run to wide gid 700 over 3 cells.
+        // Collapse any 3-char run to wide gid 700 over 3 cells.
         let shape = |_run: &str, chars: &[char], _s: StyleBits| -> Option<ShapedRun> {
             (chars.len() == 3).then_some(ShapedRun::Collapsed { gid: 700, n: 3 })
         };
@@ -1227,12 +1105,8 @@ mod tests {
         assert_eq!(out[6], ColumnGlyph::PerCell, "lone 'y' stays per-cell");
     }
 
-    /// M4 — `extract_cell_slice` reassembles the wide raster byte-exactly. For a
-    /// raster `raster_w` wide with left bearing `xmin`, concatenating the tiles for
-    /// `k = 0..n` (each `cell_w` wide) and reading back the columns that map to
-    /// `[0, raster_w)` reproduces every source byte. Non-zero `xmin` (both signs)
-    /// shifts which cell each source column lands in — the tile placement law the
-    /// blitter relies on.
+    /// The `extract_cell_slice` tiles reassemble the wide raster byte-exactly, for left
+    /// bearings of both signs.
     #[test]
     fn extract_cell_slice_reassembles_wide_raster() {
         let (raster_w, height, cell_w) = (23usize, 4usize, 8usize);

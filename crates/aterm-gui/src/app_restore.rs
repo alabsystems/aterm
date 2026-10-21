@@ -624,11 +624,11 @@ impl App {
             .enumerate()
             .map(|(index, (&wid, ws))| {
                 // A window system that went away answers nothing (an X11
-                // window's position is an unwrapped round trip on the dead
-                // connection), nor is one asked after any other failure of the
-                // event loop: its windows are captured from this App's own
-                // state alone, with no origin, show state, maximized bit or
-                // full-screen state.
+                // window's position is a round trip on the dead connection,
+                // which fails since X11-GONE), nor is one asked after any
+                // other failure of the event loop: its windows are captured
+                // from this App's own state alone, with no origin, show
+                // state, maximized bit or full-screen state.
                 let os_window = ws.os_window.as_ref().filter(|_| !self.event_loop_failed);
                 // W3 (Windows): show state + frame origin, read TOGETHER from
                 // `GetWindowPlacement` when the window is maximized. winit's

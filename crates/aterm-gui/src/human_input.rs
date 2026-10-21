@@ -1,32 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PERSON'S STAMP: when a PERSON last gave a session input, per session
-//! — `status human_ms=<ms|->` and `text --json`'s `"human_ms"`.
+//! When a person last gave a session input: `status human_ms=<ms|->` and `text --json`'s
+//! `"human_ms"`, with the count in `human_seq=` and `"human_seq"`.
 //!
-//! **Why it exists** (the critique of 2026-09-25, R1, on the harness that
-//! answers a question dialog with its recommended option): the supervisor
-//! presses keys into a dialog a person may be navigating at that moment, and
-//! nothing the screen shows says so. A person's `↓` into Claude Code's
-//! question dialog echoes nothing (the dialog hides the cursor), so the
-//! cursor effects' typing momentum — the only presence signal the harness had
-//! (`await momentum`) — never latched for it, and it was kept per WINDOW, not
-//! per session. The OS-wide HID idle (`user_input_recent`, the updater's; its
-//! APIs fenced by the aterm-census guard `input-probe`) answers "is anyone at this Mac", not "did
-//! anyone key THIS session". So the server stamps, per session, the instant a
-//! [`crate::input::Source::Human`] gesture addressed to it passed the App
-//! input seam ([`crate::App::input_to_session`]) — before any filter that
-//! classifies a key as navigation, so an arrow, a digit, Enter, Tab, Esc and
-//! a paste all count — and a client asks how long ago that was.
+//! The supervisor presses keys into dialogs a person may be navigating, and neither the screen
+//! (an arrow into a dialog echoes nothing) nor the OS-wide HID idle says whether anyone keyed
+//! this session. So the App input seam ([`crate::App::input_to_session`]) stamps each
+//! [`crate::input::Source::Human`] gesture addressed to a session, before any filter that
+//! classifies a key as navigation.
 //!
-//! **What counts** ([`is_person_gesture`]): a key press or repeat, committed
-//! text, a `[key_sequences]` chord, a paste, a mouse button, a drag, a wheel
-//! notch, and a scroll of the view — typing, and the pointer a person reads
-//! back or selects with, which a supervisor's keys would undo (they snap the
-//! view and clear the selection). NOT a key release, a hover (buttonless
-//! motion is not intent), a focus change or a resize. An IME composition
-//! stamps too (`App::on_ime_preedit`): it sends no byte and moves no screen
-//! generation, yet it is a person typing.
+//! What counts is [`is_person_gesture`] (a view scroll too: a supervisor's keys would snap the
+//! view and clear the selection), plus an IME composition (`App::on_ime_preedit`). A
+//! [`crate::input::Source::Controller`] input (every control verb, the owner's included, and
+//! the shift+tabs the Claude Code lights press after a click) is never stamped. The first
+//! gesture, and the first after [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without one,
+//! opens a burst ([`HumanInputStamp::note`]): one `human` timeline row and one
+//! `EVENT <local> human` push (`crate::app_input::note_person`).
 //!
 //! **The burst** ([`HumanInputStamp::note_reaching`]): the first gesture ever, and the
 //! first after [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without one,
@@ -318,9 +308,7 @@ impl HumanInputStamp {
         }
     }
 
-    /// The raw stamp: equal to an earlier reading exactly when no person's
-    /// gesture has reached the session since that reading — what the tests
-    /// pair with [`Self::seq`].
+    /// The raw stamp; the tests pair it with [`Self::seq`].
     #[cfg(test)]
     pub(crate) fn last(&self) -> u64 {
         self.at.load(Ordering::Relaxed)
@@ -762,9 +750,8 @@ mod tests {
     }
 
     /// The first gesture and the first after
-    /// [`crate::session_timeline::HUMAN_BURST_GAP_MS`] of quiet open a burst
-    /// (the `human` event), gestures inside one do not — however long it
-    /// lasts; an unstamped session reads `-`, never `0`.
+    /// [`crate::session_timeline::HUMAN_BURST_GAP_MS`] of quiet open a burst; gestures inside one
+    /// do not, however long it lasts. An unstamped session reads `-`.
     #[test]
     fn a_persons_burst_opens_after_the_gap_without_input() {
         let gap_us = crate::session_timeline::HUMAN_BURST_GAP_MS * 1000;
@@ -779,8 +766,7 @@ mod tests {
             !s.note(5_400_000 + gap_us - 1_000, Gesture::Other),
             "a gesture just inside the gap after the last is inside it"
         );
-        // A slow typist — a key every few seconds for ten minutes — is still
-        // the one burst: one row, not one a keystroke (the ring it shares).
+        // A key every three seconds for ten minutes is still one burst.
         let mut t = 5_400_000 + gap_us - 1_000;
         for _ in 0..200 {
             t += 3_000_000;
@@ -797,11 +783,8 @@ mod tests {
         assert!(!early.note(3_000, Gesture::Other));
     }
 
-    /// THE SEAM STAMPS A PERSON AND NEVER A CONTROLLER: the same arrow from a
-    /// control verb ([`Source::Controller`]) leaves session 0 unstamped, and
-    /// so do a person's key release and a focus change; the person's arrow
-    /// stamps it. Driven through the real App input seam
-    /// ([`crate::App::input`]), on the headless App's session 0.
+    /// The App input seam ([`crate::App::input`]) stamps a person's arrow, never a controller's
+    /// arrow, a key release or a focus change.
     #[test]
     fn the_seam_stamps_a_persons_arrow_and_never_a_controllers() {
         use crate::input::Source;

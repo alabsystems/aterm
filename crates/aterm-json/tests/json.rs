@@ -718,11 +718,8 @@ fn typed_deserialization_verdicts_and_values_are_pinned() {
         r#"{"rows":[{"pair":[7,"x","extra"]}]}"#,
         r#"{"rows":[{"nested_fixed":[1,2,3]}]}"#,
         r#"{"rows":[{"nested_fixed":[1,2,3,4]}]}"#,
-        // NEGATIVE ZERO into a typed integer field. `serde_json` refuses it —
-        // its typed integer path runs the same `parse_number` its untyped one
-        // does, and that turns `-0` into the float `-0.0` on both. This reader
-        // used to accept it as plain `0`, which is an acceptance-set widening
-        // on the path that reads the GitHub Releases discovery reply.
+        // Negative zero into a typed integer field: `serde_json` refuses it
+        // because `parse_number` turns `-0` into the float `-0.0`.
         r#"{"v":-0}"#,
         r#"{"v":-0.0}"#,
         r#"{"v":0}"#,
@@ -734,9 +731,8 @@ fn typed_deserialization_verdicts_and_values_are_pinned() {
     golden.check(TYPED_READS);
 }
 
-/// Every integer WIDTH against the same literals, at the top level — the typed
-/// entry points `deserialize_u8` … `u128` each dispatch separately, and `-0`
-/// and the 128-bit range are exactly where they used to diverge.
+/// Every integer width against the same literals at the top level — the typed
+/// entry points `deserialize_u8` … `u128` each dispatch separately.
 #[test]
 fn scalar_integer_targets_are_pinned() {
     let mut golden = Golden::new();
@@ -830,13 +826,9 @@ fn a_value_that_cannot_serialize_is_refused() {
 //
 // A JSON object key is a string, so a map keyed by anything else — an integer,
 // a `bool`, a `char`, a unit variant, a newtype over one of them — is written
-// with its key spelled as text. The property: every map the writer accepts
-// reads back as itself, whether the reader takes it straight from the document
-// or from serde's buffer (a flattened map, an untagged or internally tagged
-// enum). It did not: the reader handed every key to `visit_str`, so `{"7":"x"}`
-// refused to read back into the `HashMap<u32, String>` that wrote it
-// (`invalid type: string "7", expected u32`), and the buffer did the same after
-// the reader was fixed.
+// with its key spelled as text. Every map the writer accepts must read back as
+// itself, whether the reader takes it straight from the document or from
+// serde's buffer (a flattened map, an untagged or internally tagged enum).
 
 /// Write `value` and read it back: `Ok` when what comes back equals it, else
 /// what went wrong.

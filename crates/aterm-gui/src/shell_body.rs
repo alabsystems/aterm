@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BODY POINTER, host side (the LOADER / BODY split, 2026-09-26): how a
-//! shell that is ALREADY RUNNING comes to run this build's integration, and how
-//! `status integration_rev=` says which integration each shell runs.
+//! The body pointer, host side: how an already-running shell comes to run this build's
+//! integration, and how `status integration_rev=` says which integration each shell runs.
 //!
-//! WHY (gap 20 of the 2026-09-24 audit): a shell's integration script was fixed
-//! at spawn. Only its nonce (`shell_rekey`) and its PATH order were live, so any
-//! fix to the marks or other integration behaviour reached only new tabs, and
-//! the long-lived agent tabs (2 and 14 days old on the owner's Mac) kept the old
-//! script with no status word flagging them.
+//! Each zsh/bash/fish integration script is a loader around one body
+//! (aterm-shell-integration). The body is also written alone into the script folder, named
+//! by a SHA-256 over its contents, so a folder's 16-hex address names one body. At spawn the
+//! host exports [`POINTER_VAR`] = `<control dir>/integration/<sid>`; the loader captures and
+//! scrubs it and checks the file at every prompt (one fork-free `[[ -f ]]`). A successor
+//! that adopts the shell across an update writes its own folder's address there
+//! ([`hand_over`]: the folder installed first, then the file `0600`, renamed into place
+//! whole, never through a symlink, in the `0700` control dir, as `shell_rekey::deliver`
+//! does), and the shell sources that body at its next prompt. The loader takes a body only
+//! from `<root>/<address>/`, `<root>` being its own folder, and only for a 16-hex address,
+//! so nothing a peer can write names a file it sources.
 //!
 //! THE SPLIT (aterm-shell-integration, "THE LOADER" in the zsh script): each
 //! zsh/bash/fish script is a LOADER around one BODY. The body is also written
@@ -26,27 +31,18 @@
 //! `<root>/<address>/`, `<root>` being the folder it was itself loaded from, and
 //! only a 16-hex address; nothing a peer can write names a file it sources.
 //!
-//! Under an OVERLAP handoff the write waits for the update's Commit
-//! (`shell_rekey::Deferred`, which holds re-keys for the same reason): an
-//! abandoned attempt hands its sessions back to the old process, and a pointer
-//! written for the candidate would have moved the shell onto the candidate's
-//! body.
+//! The body signs `633;P;AtermIntegration=<address>` before every 133;A; the engine keeps
+//! the last signed one (`Terminal::shell_integration_rev`), the seamless carry takes it
+//! across an update, and [`status_word`] reads it against this build's address.
 //!
-//! WHAT THE HOST SEES: the body signs `633;P;AtermIntegration=<address>` before
-//! every 133;A; the engine keeps the last SIGNED one
-//! (`Terminal::shell_integration_rev`) and the seamless carry takes it across an
-//! update. [`status_word`] reads it against this build's address.
-//!
-//! A shell spawned BEFORE loaders has no pointer to read and signs no revision.
-//! Nothing reaches it by itself — its record says so ([`SessionRecord::loader`]
-//! absent) and `status` says `frozen` — until the live agent upgrade types its
-//! relaunch line there: `shell_rekey::typed` then also hands it this build's
-//! folder and its pointer path, and the line sources the loader
-//! (`aterm_shell_integration::typed_rekey_with_loader`). The same line reaches
-//! a LOADER whose prompt hook never runs — a fish from before the prompt event
-//! (2026-10-01) under a prompt its config.fish defines reads no pointer and
-//! signs no revision for its life, though its record says it has a loader —
-//! which is why `typed` asks the revision the engine holds, never the record.
+//! A shell spawned before loaders has no pointer and signs no revision: its record says so
+//! ([`SessionRecord::loader`] false) and `status` says `frozen`, until the live agent
+//! upgrade types its relaunch line, to which `shell_rekey::typed` also hands this build's
+//! folder and pointer path so the line sources the loader
+//! (`aterm_shell_integration::typed_rekey_with_loader`). The same line reaches a fish loader
+//! whose prompt hook never runs (one that predates the fish prompt event, under a prompt
+//! its config.fish defines): it signs no revision though its record has a loader, so
+//! `typed` asks the revision the engine holds, never the record.
 //!
 //! [`SessionRecord::loader`]: crate::session_store::SessionRecord::loader
 
@@ -83,12 +79,10 @@ pub(crate) fn own_rev() -> &'static str {
     aterm_core::shell_integration::script_set_address()
 }
 
-/// First half of pointing an adopted shell at this build's body: install (or
-/// verify byte for byte) this build's script folder and return the pointer
-/// naming it, ready to write to `path`. `None` (logged) when the folder cannot
-/// be verified. `carried` is the revision the shell last signed; a shell
-/// already on this build's body needs no pointer. Does file I/O, so the caller
-/// holds no engine lock.
+/// First half of pointing an adopted shell at this build's body: install (or verify byte
+/// for byte) this build's script folder and return the pointer naming it, ready to write
+/// to `path`. `None` when the shell already signed this build's revision (`carried`) or
+/// the folder cannot be verified (logged). Does file I/O: the caller holds no engine lock.
 pub(crate) fn pending(
     path: &Path,
     id: u64,
@@ -135,8 +129,8 @@ fn pending_with(
     }
 }
 
-/// [`pending`], written now — or, under an overlap handoff, held for the
-/// update's Commit (`deferred`).
+/// [`pending`], written now or, under an overlap handoff, held for the update's Commit
+/// (`deferred`).
 pub(crate) fn hand_over(
     path: &Path,
     id: u64,
@@ -157,18 +151,16 @@ pub(crate) fn hand_over(
 /// `status integration_rev=`: which integration body the session's shell runs,
 /// against the one this build ships.
 ///
-/// - `current` — the shell's last signed revision is this build's.
-/// - `stale:<rev>` — it signed another build's (a successor points an adopted
-///   shell at its own body, which the shell takes at its next prompt).
-/// - `frozen` — the shell's integration predates loaders: adopted from a
-///   record with no loader, signing marks (`integration=on`/`degraded`) but no
-///   revision. Only a new tab or the live agent upgrade's relaunch line
-///   reaches it.
-/// - `-` — nothing to say: no integrated shell, no first prompt yet, or the
-///   terminal lock was contended (`engine` is `None`).
+/// - `current`: the shell's last signed revision is this build's.
+/// - `stale:<rev>`: it signed another build's (a successor points an adopted shell at its
+///   own body, which the shell takes at its next prompt).
+/// - `frozen`: the integration predates loaders (adopted from a record with no loader,
+///   signing marks but no revision). Only a new tab or the live agent upgrade reaches it.
+/// - `-`: no integrated shell, no first prompt yet, or the terminal lock was contended
+///   (`engine` is `None`).
 ///
-/// `engine` is the shell's signed revision and its integration posture, read
-/// under the one terminal guard `status` takes.
+/// `engine` is the shell's signed revision and integration posture, read under the one
+/// terminal guard `status` takes.
 pub(crate) fn status_word(
     engine: Option<(Option<&str>, ShellIntegrationPosture)>,
     frozen: bool,
@@ -207,8 +199,8 @@ mod tests {
         let word = |rev, posture, frozen| status_word_against(Some((rev, posture)), frozen, OWN);
         assert_eq!(word(Some(OWN), On, false), "current");
         assert_eq!(word(Some(OLD), On, false), format!("stale:{OLD}"));
-        // A signed revision wins over the carried mark: a frozen shell that took
-        // the typed upgrade signs one.
+        // A signed revision wins over the frozen mark: a frozen shell that took the typed
+        // upgrade signs one.
         assert_eq!(word(Some(OWN), On, true), "current");
         assert_eq!(word(None, On, true), "frozen");
         assert_eq!(word(None, Degraded, true), "frozen");
@@ -225,11 +217,10 @@ mod tests {
         );
     }
 
-    /// A shell already signing this build's revision is not pointed anywhere;
-    /// any other is pointed at this build's folder only once that folder is
-    /// verified (a failing installer, or a folder not named by this build's
-    /// address, points nothing). The pointer is the address and a newline,
-    /// `0600`, as the re-key channel writes a key.
+    /// A shell already on this build's revision is not pointed anywhere; any other is
+    /// pointed only once this build's folder is verified (a failing installer or a folder
+    /// not named by this build's address points nothing). The pointer is the address and a
+    /// newline, `0600`.
     #[test]
     fn an_adopted_shell_is_pointed_at_this_builds_body_unless_it_runs_it() {
         use std::os::unix::fs::PermissionsExt as _;

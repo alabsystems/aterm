@@ -81,16 +81,8 @@ fn every_corpus_folds_chunk_independently() {
 /// Tier-1 bind of `aterm_models_session::coalesce_model()`: the two write lanes,
 /// compared after every parser-ground prefix rather than only at the end.
 ///
-/// The single lane feeds one byte per `process_at` (the per-glyph writer); the
-/// bulk lane feeds each record whole (the batched writers). A model element is
-/// a run of records ending at parser ground, where a checkpoint is defined.
-/// After each element `diverged` is projected from both lanes' real
-/// `checkpoint()`s and every element must be the model's `Emit` at `Buggy = 0`,
-/// so a divergence at any grounded prefix is rejected, even one a later record
-/// would overwrite.
-///
-/// Negative control: a diverging record, projected from a real prefix, is
-/// rejected by the committed model and admitted by `Buggy = 1` at `SKIPAT`.
+/// Negative control: a diverging record from a real prefix is rejected by the committed model
+/// and admitted by `Buggy = 1` at `SKIPAT`.
 #[test]
 fn every_corpus_record_conforms_to_coalesce_model() {
     use aterm_models_session::coalesce_model;

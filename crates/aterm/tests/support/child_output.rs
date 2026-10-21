@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A child's output, read until the child has EXITED and its pipes are empty —
-//! never until end-of-file.
+//! A child's output, read until the child has exited and its pipes are empty, never until
+//! end-of-file.
 //!
-//! A pipe reads end-of-file only once every copy of its write end is closed,
-//! and a sibling thread's spawn can take a copy: on macOS std marks a new pipe
-//! close-on-exec in a second step (there is no `pipe2`), and a child forked
-//! between the two keeps the write end for its whole life (a 20 ms `aterm ctl
-//! who` once read for 150 s while an `await` spawned beside it held the copy).
-//! Once the child has exited, everything it wrote is already in the pipe, so
-//! this reads what is there and stops.
+//! A pipe reads end-of-file only once every copy of its write end is closed, and a sibling
+//! thread's spawn can take a copy: on macOS std marks a new pipe close-on-exec in a second
+//! step (there is no `pipe2`), and a child forked between the two keeps the write end for its
+//! whole life. Once the child has exited, everything it wrote is already in the pipe, so this
+//! reads what is there and stops.
 
 use std::fs::File;
 use std::io::{ErrorKind, Read};

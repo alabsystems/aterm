@@ -87,6 +87,16 @@
 //! read loop feeds this same parse stage). The harness answers under it only on a
 //! `status input=clear`, which needs the tty's input queue measured — today
 //! macOS alone; elsewhere `input=-`, and the grace holds.
+//!
+//! **The launch's instant** ([`LaunchWitness::started`]). The hold also notes
+//! the wall clock it took the mark at, whatever its word: the start of the
+//! command that runs whatever holds the tab now, of any program. The window
+//! harness reads it as the launch of the agent there
+//! (`harness_host::WorkerIdle::launch`, P3 of
+//! `docs/measured/forever-lab-2026-10-20.md`): where the agent's process
+//! began at or after it and no person has keyed since, nobody has asked the
+//! agent anything, so a first point before any message on its screen is no
+//! turn's end.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -145,11 +155,27 @@ pub(crate) struct Unread {
     rows: Vec<String>,
 }
 
+/// THE LAST COMMAND'S START, whatever its word ([`LaunchWitness::started`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Started {
+    /// The person count loaded in the mark's hold ([`Launch::seq`]).
+    pub(crate) seq: u64,
+    /// The wall clock the hold took the mark at, unix ms.
+    pub(crate) at_ms: u64,
+}
+
+/// The last mark and the wall clock its hold took it at, unix ms.
+#[derive(Clone, Copy, Debug)]
+struct Mark {
+    launch: Launch,
+    at_ms: u64,
+}
+
 /// One session's last mark. Lives on [`crate::SessionCtx`]; its lock is a leaf,
 /// taken after the terminal lock and never before it.
 #[derive(Debug, Default)]
 pub(crate) struct LaunchWitness {
-    mark: Mutex<Option<Launch>>,
+    mark: Mutex<Option<Mark>>,
 }
 
 impl LaunchWitness {
@@ -201,11 +227,14 @@ impl LaunchWitness {
                 .map(|r| crate::control::visible_row(t, r))
                 .collect(),
         });
-        *self.lock() = Some(Launch {
-            id,
-            seq: probe.seq,
-            word,
-            why,
+        *self.lock() = Some(Mark {
+            launch: Launch {
+                id,
+                seq: probe.seq,
+                word,
+                why,
+            },
+            at_ms: now_unix_ms(),
         });
         unread
     }
@@ -228,6 +257,7 @@ impl LaunchWitness {
         if let Some(mark) = self
             .lock()
             .as_mut()
+            .map(|m| &mut m.launch)
             .filter(|m| m.id == id && m.why == Why::Pending)
         {
             mark.why = if boxed { Why::Boxed } else { Why::Person };
@@ -237,11 +267,23 @@ impl LaunchWitness {
     /// The last mark against a read whose person count is `human_seq`: a
     /// `person` mark the count has moved past reads `since`. `None`: no mark.
     pub(crate) fn read(&self, human_seq: u64) -> Option<Launch> {
-        let mut launch = (*self.lock())?;
+        let mut launch = (*self.lock())?.launch;
         if launch.why == Why::Person && launch.seq != human_seq {
             launch.why = Why::Since;
         }
         Some(launch)
+    }
+
+    /// THE LAST COMMAND'S START, of any word: the person count its hold
+    /// loaded and the wall clock it took it at ([module docs](self), "the
+    /// launch's instant"). `None`: no signed command start since this
+    /// process began serving the session.
+    pub(crate) fn started(&self) -> Option<Started> {
+        let mark = (*self.lock())?;
+        Some(Started {
+            seq: mark.launch.seq,
+            at_ms: mark.at_ms,
+        })
     }
 
     /// `status`'s `launch=<why|none> launch_seq=<n|->`.
@@ -270,12 +312,29 @@ impl LaunchWitness {
     /// A mark as the parse stage would leave it, for a test of a reader of it.
     #[cfg(test)]
     pub(crate) fn mark_for_test(&self, launch: Launch) {
-        *self.lock() = Some(launch);
+        self.mark_at_for_test(launch, 0);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Launch>> {
+    /// [`Self::mark_for_test`] taken at `at_ms` (unix ms).
+    #[cfg(test)]
+    pub(crate) fn mark_at_for_test(&self, launch: Launch, at_ms: u64) {
+        *self.lock() = Some(Mark { launch, at_ms });
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Mark>> {
         self.mark.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// The wall clock, unix ms: a mark's instant ([`Started::at_ms`]), which is
+/// compared with the kernel's start of a process (unix seconds), so it is
+/// the wall clock, not this process's monotonic one. `0` before 1970.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 /// The program a command line starts, when it is one of [`AGENTS`]: the
@@ -482,6 +541,59 @@ mod tests {
             w.read(2).map(|l| (l.id, l.seq, l.why)),
             Some((2, 2, Why::Other))
         );
+    }
+
+    /// THE LAUNCH'S INSTANT is every mark's, whatever its word: a command no
+    /// rule covers (`sh run-gemini.sh`, a controller's line) is started at
+    /// the wall clock its hold read, with the person count loaded there; a
+    /// newer command's start replaces both. Negative controls: no mark, an
+    /// unsigned session's command start, and a slice that starts no command
+    /// note no start.
+    #[test]
+    fn every_command_start_notes_its_instant_and_count() {
+        let (t, hex) = signed_prompt();
+        let term = Mutex::new(t);
+        let (person, w) = (HumanInputStamp::default(), LaunchWitness::default());
+        assert_eq!(w.started(), None, "no mark yet");
+        hold(&term, b"sh run-gemini.sh", &person, &w);
+        assert_eq!(w.started(), None, "no command start");
+        typed_and_entered(&person, "x");
+        let before = now_unix_ms();
+        hold(&term, &preexec("sh run-gemini.sh", &hex), &person, &w);
+        let after = now_unix_ms();
+        let started = w.started().expect("a start");
+        assert_eq!(started.seq, 2, "the count its hold loaded");
+        assert!(
+            (before..=after).contains(&started.at_ms),
+            "{before} <= {} <= {after}",
+            started.at_ms
+        );
+        assert_eq!(w.read(2).map(|l| l.why), Some(Why::Other));
+        // A gesture after the hold moves the count, never the start's.
+        person.note(0, Gesture::Other);
+        assert_eq!(w.started(), Some(started));
+        // The next command's start replaces it.
+        hold(
+            &term,
+            format!("\x1b]133;D;0;id={hex}\x07\x1b]133;A;id={hex}\x07$ \x1b]133;B;id={hex}\x07")
+                .as_bytes(),
+            &person,
+            &w,
+        );
+        hold(&term, &preexec("gemini", &hex), &person, &w);
+        let next = w.started().expect("the next start");
+        assert_eq!(next.seq, 3);
+        assert!(next.at_ms >= started.at_ms);
+        // An unsigned session's command start notes nothing.
+        let term = Mutex::new(Terminal::new(24, 80));
+        let w = LaunchWitness::default();
+        hold(
+            &term,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07gemini\r\n\x1b]633;E;gemini\x07\x1b]133;C\x07",
+            &person,
+            &w,
+        );
+        assert_eq!(w.started(), None, "unsigned");
     }
 
     /// The mark is taken IN the hold that parsed the command start, never

@@ -61,10 +61,9 @@ fn judge(r: ProcessReading) -> ForeignFacts {
     ForeignFacts::judge(Some(written), written + Duration::from_secs(3600), r)
 }
 
-/// PID REUSE: a process born AFTER the entry was last written cannot have
-/// written it, however much it looks like the orphan — launchd's child, the
-/// pid the entry names. It is called stale and offered no `kill`. CONTROL:
-/// the same reading born before the write is the writer, and is offered one.
+/// A process born after the entry was last written cannot have written it, however much it
+/// looks like the orphan: it is stale and offered no `kill`. Control: born before the write,
+/// it is the writer and is offered one.
 #[test]
 fn a_pid_younger_than_its_entry_is_stale_and_never_offered_a_kill() {
     let stranger = judge(orphan_reading(at(WRITTEN + 600)));
@@ -81,9 +80,8 @@ fn a_pid_younger_than_its_entry_is_stale_and_never_offered_a_kill() {
     assert!(note.contains("`kill 501`"), "{note}");
 }
 
-/// The identity's edges: a birth inside the write slack (an mtime's
-/// filesystem granularity) is still the writer; one past it is not; and
-/// with no entry time nothing is proven, so nothing is said or offered.
+/// A birth inside the write slack is still the writer, one past it is not, and with no entry
+/// time nothing is proven.
 #[test]
 fn identity_needs_an_entry_time_and_tolerates_only_the_write_slack() {
     assert!(judge(orphan_reading(at(WRITTEN + 1))).orphaned());
@@ -95,9 +93,8 @@ fn identity_needs_an_entry_time_and_tolerates_only_the_write_slack() {
     );
 }
 
-/// Only aterm is described: an executable named anything but `aterm` or
-/// `aterm-*` gets no facts and no `kill`, even as launchd's child born
-/// before the entry. The dev-only `aterm-gui` target counts as aterm.
+/// Only `aterm` or `aterm-*` executables (the dev-only `aterm-gui` included) get facts or a
+/// `kill`.
 #[test]
 fn a_process_that_is_not_aterm_gets_no_facts_and_no_kill() {
     for name in ["Safari", "loginwindow", "atermx", "aterm_ctl-0123abcd"] {

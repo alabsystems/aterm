@@ -703,3 +703,641 @@ fn beside_a_self_claim_a_given_back_or_released_claim_unsets_no_needs_entry() {
         assert!(forgot);
     }
 }
+
+// -- the window hears the whole set (§12.2.3, slice 2b) -----------------------
+
+/// A need of 150 characters: whole on the window's host, cut to the entry's
+/// 64 cells on the wire.
+const LONG_NEED: &str = "grant Screen Recording to com.aterm.aterm in System Settings ▸ Privacy \
+                         & Security ▸ Screen Recording, so the windowed checks can capture the \
+                         menu bars";
+
+/// The door the window's host is told the needs set at, on a tape.
+const NEEDS_DOOR: &str = "host.needs_standing";
+
+/// A window's host that keeps every NEEDS YOU set it is told
+/// ([`IdleHost::needs_standing`]), with the entry's text it was told with.
+#[derive(Debug, Default)]
+struct Hears {
+    told: Mutex<Vec<(Vec<String>, String)>>,
+}
+
+impl Hears {
+    fn told(&self) -> Vec<(Vec<String>, String)> {
+        self.told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl IdleHost for Hears {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn needs_standing(&self, needs: &[String], entry: &str) {
+        self.told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((needs.to_vec(), entry.to_string()));
+    }
+}
+
+/// `screens` watched under Cruise with `host` as the window's, every screen
+/// of `gates` sitting until the loop's next act, RECORDED, beside a proven
+/// self-claim when `beside` (codex-alab's own entry standing): the scripted
+/// server and the recorded run, whose tape replays (strict and in acts mode)
+/// as recorded.
+fn heard(
+    screens: Vec<Vec<String>>,
+    gates: Vec<usize>,
+    host: &Arc<Hears>,
+    beside: bool,
+) -> (Mock, RecordedWatch) {
+    heard_with(screens, gates, host, beside, Vec::new())
+}
+
+/// [`heard`], the scripted server answering the `owner=needs` requests with
+/// `replies` first (none left: `OK`).
+fn heard_with(
+    screens: Vec<Vec<String>>,
+    gates: Vec<usize>,
+    host: &Arc<Hears>,
+    beside: bool,
+    replies: Vec<CtlReply>,
+) -> (Mock, RecordedWatch) {
+    let last = u32::try_from(screens.len()).expect("a short script");
+    let mut m = Mock::new(screens);
+    m.autopilot = Some("cruise");
+    m.turn_gates = gates;
+    m.needs_replies = replies.into();
+    m.vanish_after = Some(last - 1);
+    m.stall_sleep = Some(Duration::from_secs(20));
+    if beside {
+        m.needs_attention = Some(self_claims_entry());
+    }
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
+        ..auto(30)
+    };
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
+            ..TurnEndTiming::default()
+        });
+        if beside {
+            s.set_beside(Some(SELF_CLAIM.to_string()));
+        }
+    });
+    crate::supervise::tape::testing::assert_replays(&run.tape, &run.header, &run.sent, &run.lines);
+    (m, run)
+}
+
+/// The recorded run's tells of the needs set and its `owner=needs`
+/// requests, in the tape's order: `host <entry>` for a tell, `ctl set` or
+/// `ctl unset` for a request.
+fn needs_doors(run: &RecordedWatch) -> Vec<String> {
+    let read = crate::supervise::tape::recover::recover(&run.tape.sink.bytes());
+    read.items
+        .iter()
+        .filter_map(|i| match i.record()? {
+            astream_effects::EffectRecord::Emit { door, bytes } if door == NEEDS_DOOR => {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                let entry = text.split_once("\nentry=").map_or("?", |(_, e)| e);
+                Some(format!("host {entry}"))
+            }
+            astream_effects::EffectRecord::Exchange { door, request, .. }
+                if door == crate::supervise::tape::doors::CTL =>
+            {
+                let words = crate::supervise::tape::codec::ctl_args(request).ok()?;
+                let at = words.iter().position(|w| w == "owner=needs")?;
+                Some(format!("ctl {}", words[at - 2]))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The report of a run's NEEDS YOU set: [`LONG_NEED`] said at two points in
+/// turn, then `NEEDS YOU: nothing`.
+fn long_need_then_none() -> Vec<Vec<String>> {
+    vec![
+        busy_screen(),
+        said(&[
+            "Pushed the parser fix; the release is next.",
+            &format!("NEEDS YOU: {LONG_NEED}"),
+        ]),
+        busy_screen(),
+        said(&[
+            "Built the release notes; still carrying on.",
+            &format!("NEEDS YOU: {LONG_NEED}"),
+        ]),
+        busy_screen(),
+        said(&["Shipped the docs.", "NEEDS YOU: nothing"]),
+    ]
+}
+
+/// THE HOST HEARS THE WHOLE SET BEFORE THE ENTRY GOES UP
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3, §12.2.6): over a
+/// recorded run, the window's host is told the set — a 150-character need
+/// whole, where the entry carries it cut at 64 cells — and the entry's exact
+/// text BEFORE the `meta set attention owner=needs` that puts it up, and
+/// `(&[], "")` before the `unset` that takes it down; told once per change:
+/// nothing at the busy reads, nothing at the next point that says the same
+/// need. The tape, holding the tells, replays strict and in acts mode. Beside
+/// a proven self-claim (codex-alab raises its own) the host is told nothing.
+/// NEGATIVE CONTROLS: a run whose report names no need tells the host
+/// nothing (no point where nothing moved is told); the tell moved after the
+/// request (run as a mutant, reported in the landing commit) puts `ctl set`
+/// before `host` and fails the order.
+#[test]
+fn the_host_hears_the_whole_set_before_the_entry_goes_up() {
+    assert_eq!(LONG_NEED.chars().count(), 150);
+    let host = Arc::new(Hears::default());
+    let (m, run) = heard(long_need_then_none(), vec![1, 3], &host, false);
+    let sets: Vec<&String> = m
+        .needs_calls
+        .iter()
+        .filter(|c| c.starts_with("set "))
+        .collect();
+    assert_eq!(sets.len(), 1, "{:#?}", m.needs_calls);
+    let entry = sets[0]
+        .strip_prefix("set attention owner=needs kind=ask ")
+        .expect("the needs owner's entry")
+        .to_string();
+    assert!(
+        entry.contains('…') && !entry.contains(LONG_NEED),
+        "the entry carries the need cut: {entry}"
+    );
+    assert_eq!(
+        host.told(),
+        [
+            (vec![LONG_NEED.to_string()], entry.clone()),
+            (Vec::new(), String::new())
+        ],
+        "the set whole with the entry's exact text, then the take-down, once each"
+    );
+    assert_eq!(
+        needs_doors(&run),
+        [
+            format!("host {entry:?}"),
+            "ctl set".to_string(),
+            "host \"\"".to_string(),
+            "ctl unset".to_string(),
+        ],
+        "the host hears first, each time"
+    );
+    // Beside a proven self-claim: nothing told, nothing sent.
+    let host = Arc::new(Hears::default());
+    let (m, _) = heard(long_need_then_none(), vec![1, 3], &host, true);
+    assert!(host.told().is_empty(), "{:#?}", host.told());
+    assert!(m.needs_calls.is_empty(), "{:#?}", m.needs_calls);
+    // NEGATIVE CONTROL: no need named, nothing told.
+    let host = Arc::new(Hears::default());
+    let (m, _) = heard(
+        vec![
+            busy_screen(),
+            said(&["Pushed the parser fix; the release is next."]),
+            busy_screen(),
+            said(&["Built the release notes; still carrying on."]),
+        ],
+        vec![1],
+        &host,
+        false,
+    );
+    assert!(host.told().is_empty(), "{:#?}", host.told());
+    assert!(m.needs_calls.is_empty(), "{:#?}", m.needs_calls);
+}
+
+/// The window's host, the scripted server's `owner=needs` requests and the
+/// entry it holds after [`NEED`]'s point is decided and carried out
+/// `edges` times, the server answering those requests with `replies` first.
+fn told_at_one_point(replies: Vec<CtlReply>, edges: usize) -> (Arc<Hears>, Mock) {
+    let mut m = Mock::new(vec![needing("Pushed the parser fix; the release is next.")]);
+    m.autopilot = Some("cruise");
+    m.needs_replies = replies.into();
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        ..auto(30)
+    };
+    let host = Arc::new(Hears::default());
+    let mut notes = Notes::default();
+    {
+        let mut s = session(&mut m, None);
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(720)), &opts)
+            .expect("decided");
+        for _ in 0..edges {
+            s.task_edge(&point.screen, &opts, &mut notes)
+                .expect("the point's edge");
+        }
+    }
+    (host, m)
+}
+
+/// A CAP'S REFUSAL TELLS THE HOST THE CUT TEXT (§12.2.3): the server refuses
+/// the entry as too long for a tighter cap than the loop's own, the loop
+/// cuts it to that cap and sets it again — and tells the host again first,
+/// with the cut text, so what the host holds is the text the server stores.
+/// NEGATIVE CONTROL (run as a mutant, reported in the landing commit):
+/// without the second tell, the told text is the uncut one and differs from
+/// the stored one.
+#[test]
+fn a_cap_refusal_tells_the_host_the_cut_text() {
+    let (host, m) = told_at_one_point(vec![err("attention too long (max 40 bytes)")], 1);
+    let sets: Vec<&String> = m
+        .needs_calls
+        .iter()
+        .filter(|c| c.starts_with("set "))
+        .collect();
+    assert_eq!(sets.len(), 2, "the refused set and the cut one: {sets:#?}");
+    let stored = m.needs_attention.clone().expect("the cut entry stands");
+    assert!(stored.len() <= 40, "{stored}");
+    let full = format!("claude needs you: {NEED} — carrying on");
+    assert_eq!(
+        host.told(),
+        [
+            (vec![NEED.to_string()], full),
+            (vec![NEED.to_string()], stored.clone())
+        ]
+    );
+    assert_eq!(
+        host.told().last().map(|(_, e)| e.as_str()),
+        Some(stored.as_str()),
+        "the host holds what the server stores"
+    );
+}
+
+/// A REQUEST THE CONNECTION LOST TELLS THE HOST NOTHING TWICE: the set's
+/// first `meta set` is lost (the server replaced under it), so the next
+/// point sends it again — the same set, the same text — and the host, told
+/// before the first, is not told again: once per change, never where nothing
+/// moved. The entry stands after the second request. NEGATIVE CONTROL (run
+/// as a mutant, reported in the landing commit): with no memory of what the
+/// host heard (`Session::needs_heard`), it is told twice.
+#[test]
+fn a_lost_request_tells_the_host_nothing_twice() {
+    let (host, m) = told_at_one_point(
+        vec![replaced(
+            "aterm (pid 10) went away before it answered (exit 75)",
+        )],
+        2,
+    );
+    let sets: Vec<&String> = m
+        .needs_calls
+        .iter()
+        .filter(|c| c.starts_with("set "))
+        .collect();
+    assert_eq!(
+        sets.len(),
+        2,
+        "the lost set and the one sent again: {sets:#?}"
+    );
+    let full = format!("claude needs you: {NEED} — carrying on");
+    assert_eq!(m.needs_attention.as_deref(), Some(full.as_str()));
+    assert_eq!(host.told(), [(vec![NEED.to_string()], full)]);
+}
+
+/// A SET THAT MOVES UNDER THE SAME ENTRY IS TOLD (§12.2.3 item 2): `[A, B]`
+/// and then `[A, C]` put up the same entry (`claude needs you: A (+1 more)
+/// — carrying on`), so only the window's host can learn that the second
+/// need moved: it is told each set whole, the same entry's text with each,
+/// and then the take-down, while the loop sends the entry again for the
+/// moved set. NEGATIVE CONTROL (run as a mutant, reported in the landing
+/// commit): a `tell_needs` that compares the entry's text alone and not the
+/// set's key tells the moved set nothing.
+#[test]
+fn a_set_that_moves_under_the_same_entry_is_told() {
+    let (a, b, c) = (
+        NEED,
+        "the release credential to sign 0.48.0",
+        "a reply on the pricing page wording",
+    );
+    let host = Arc::new(Hears::default());
+    let (m, _) = heard(
+        vec![
+            busy_screen(),
+            said(&[
+                "Pushed the parser fix; the release is next.",
+                &format!("NEEDS YOU: {a}"),
+                &format!("NEEDS YOU: {b}"),
+            ]),
+            busy_screen(),
+            said(&[
+                "Built the release notes; still carrying on.",
+                &format!("NEEDS YOU: {a}"),
+                &format!("NEEDS YOU: {c}"),
+            ]),
+            busy_screen(),
+            said(&["Shipped the docs.", "NEEDS YOU: nothing"]),
+        ],
+        vec![1, 3],
+        &host,
+        false,
+    );
+    let entry = format!("claude needs you: {a} (+1 more) — carrying on");
+    let set = |n: &[&str]| n.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        host.told(),
+        [
+            (set(&[a, b]), entry.clone()),
+            (set(&[a, c]), entry.clone()),
+            (Vec::new(), String::new()),
+        ],
+        "{:#?}",
+        m.needs_calls
+    );
+    let put_up = format!("set attention owner=needs kind=ask {entry}");
+    assert_eq!(
+        m.needs_calls,
+        [put_up.as_str(), &put_up, "unset attention owner=needs"],
+        "the entry sent again, the same text, for the moved set"
+    );
+}
+
+/// A LOST REQUEST LEAVES THE WINDOW TOLD WHAT STANDS: each tell comes
+/// before its request, so a request the connection lost leaves the
+/// window's host told what never landed — (a) the take-down of an entry
+/// whose `unset` was lost twice and that still stands, (b) another set
+/// whose `meta set` was lost twice while the first stands. When the next
+/// point names the standing set again, the loop sends nothing (that set is
+/// the one it holds up) and tells the host that set again, with the text it
+/// was put up with — (c) cut, where a cap's refusal cut it; where the host
+/// heard just that, nothing. The tape replays strict and in acts mode.
+/// NEGATIVE CONTROLS (run as mutants, reported in the landing commit):
+/// without `retell_standing` the host is left holding the take-down, or the
+/// other set's words, beside the entry that stands; told again with the
+/// set's uncut text, it holds what the server never stored.
+#[test]
+fn a_lost_request_leaves_the_window_told_what_stands() {
+    let lost = || replaced("aterm (pid 10) went away before it answered (exit 75)");
+    let other = "the release credential to sign 0.48.0";
+    let three = |first: &str, second: &str| {
+        vec![
+            busy_screen(),
+            said(&[
+                "Pushed the parser fix; the release is next.",
+                &format!("NEEDS YOU: {first}"),
+            ]),
+            busy_screen(),
+            said(&[
+                "Built the release notes; still carrying on.",
+                &format!("NEEDS YOU: {second}"),
+            ]),
+            busy_screen(),
+            said(&[
+                "Shipped the docs; carrying on.",
+                &format!("NEEDS YOU: {first}"),
+            ]),
+            busy_screen(),
+        ]
+    };
+    let entry = format!("claude needs you: {NEED} — carrying on");
+    let put_up = format!("set attention owner=needs kind=ask {entry}");
+    let down = "unset attention owner=needs";
+    let gone = (Vec::new(), String::new());
+    // (a) The take-down's `unset` lost twice: the entry stands.
+    let host = Arc::new(Hears::default());
+    let (m, run) = heard_with(
+        three(NEED, "nothing"),
+        vec![1, 3, 5],
+        &host,
+        false,
+        vec![ok("OK\n"), lost(), lost()],
+    );
+    assert_eq!(
+        host.told(),
+        [
+            (vec![NEED.to_string()], entry.clone()),
+            gone.clone(),
+            (vec![NEED.to_string()], entry.clone()),
+            gone.clone(),
+        ],
+        "{:#?}",
+        m.needs_calls
+    );
+    assert_eq!(m.needs_calls, [put_up.as_str(), down, down, down]);
+    assert_eq!(
+        needs_doors(&run),
+        [
+            format!("host {entry:?}"),
+            "ctl set".to_string(),
+            "host \"\"".to_string(),
+            "ctl unset".to_string(),
+            "ctl unset".to_string(),
+            format!("host {entry:?}"),
+            "host \"\"".to_string(),
+            "ctl unset".to_string(),
+        ],
+        "told again with no request, before the loop's end takes it down"
+    );
+    // (b) Another set's `meta set` lost twice: the first set's entry stands.
+    let host = Arc::new(Hears::default());
+    let (m, _) = heard_with(
+        three(NEED, other),
+        vec![1, 3, 5],
+        &host,
+        false,
+        vec![ok("OK\n"), lost(), lost()],
+    );
+    let other_entry = format!("claude needs you: {other} — carrying on");
+    assert_eq!(
+        host.told(),
+        [
+            (vec![NEED.to_string()], entry.clone()),
+            (vec![other.to_string()], other_entry.clone()),
+            (vec![NEED.to_string()], entry.clone()),
+            gone.clone(),
+        ],
+        "{:#?}",
+        m.needs_calls
+    );
+    let other_up = format!("set attention owner=needs kind=ask {other_entry}");
+    assert_eq!(m.needs_calls, [put_up.as_str(), &other_up, &other_up, down]);
+    // (c) (a) with the entry put up cut by a cap's refusal: told again cut.
+    let host = Arc::new(Hears::default());
+    let (m, _) = heard_with(
+        three(NEED, "nothing"),
+        vec![1, 3, 5],
+        &host,
+        false,
+        vec![
+            err("attention too long (max 40 bytes)"),
+            ok("OK\n"),
+            lost(),
+            lost(),
+        ],
+    );
+    let cut = m.needs_calls[1]
+        .strip_prefix("set attention owner=needs kind=ask ")
+        .expect("the cut entry")
+        .to_string();
+    assert!(cut.len() <= 40 && cut != entry, "{cut}");
+    assert_eq!(
+        host.told(),
+        [
+            (vec![NEED.to_string()], entry),
+            (vec![NEED.to_string()], cut.clone()),
+            gone.clone(),
+            (vec![NEED.to_string()], cut),
+            gone,
+        ],
+        "{:#?}",
+        m.needs_calls
+    );
+}
+
+/// THE WINDOW FORGETS WITH THE LOOP WHERE THE ENTRY STOPS BEING ITS OWN
+/// (`Session::needs_not_ours`): a set this loop put up and told, then a
+/// claim behind another supervisor, then an Off park — the loop forgets
+/// its set and sends nothing (the entry is the other's to keep), and the
+/// window's host is told `(&[], "")`, so it keeps no words for an entry
+/// this loop no longer holds; the claim back and the same set named again,
+/// the host hears it again with the entry put up again. A set never told
+/// (an entry a loop before this one left) is taken back from no one:
+/// nothing told. NEGATIVE CONTROL (run as a mutant, reported in the landing
+/// commit): with no tell in `needs_down`'s not-ours arm the host keeps the
+/// forgotten set's words.
+#[test]
+fn the_window_forgets_with_the_loop_where_the_entry_stops_being_ours() {
+    let mut m = Mock::new(vec![needing("Pushed the parser fix; the release is next.")]);
+    m.autopilot = Some("cruise");
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        ..auto(30)
+    };
+    let host = Arc::new(Hears::default());
+    let mut notes = Notes::default();
+    let (calls_behind, forgot) = {
+        let mut s = session(&mut m, None);
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(720)), &opts)
+            .expect("decided");
+        s.task_edge(&point.screen, &opts, &mut notes)
+            .expect("the point's edge");
+        let ours = std::mem::replace(
+            &mut s.claim,
+            claim::Claim::Behind {
+                holder: "another".to_string(),
+                tried: Instant::now(),
+            },
+        );
+        assert_eq!(
+            s.needs_down(101, "the session's autopilot is off", &mut notes),
+            Ok(())
+        );
+        let forgot = s.needs_told.is_none();
+        let calls_behind = s.ctl.needs_calls.len();
+        s.claim = ours;
+        s.task_edge(&point.screen, &opts, &mut notes)
+            .expect("the point's edge, the claim back");
+        (calls_behind, forgot)
+    };
+    let entry = format!("claude needs you: {NEED} — carrying on");
+    let put_up = format!("set attention owner=needs kind=ask {entry}");
+    assert!(forgot, "the set is forgotten");
+    assert_eq!(calls_behind, 1, "nothing sent behind: {:#?}", m.needs_calls);
+    assert_eq!(m.needs_calls, [put_up.as_str(), &put_up]);
+    assert_eq!(
+        host.told(),
+        [
+            (vec![NEED.to_string()], entry.clone()),
+            (Vec::new(), String::new()),
+            (vec![NEED.to_string()], entry),
+        ]
+    );
+    // A set never told is taken back from no one.
+    let mut m = Mock::new(vec![idle_screen()]);
+    let host = Arc::new(Hears::default());
+    {
+        let mut s = session(&mut m, None);
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        s.needs_told = Some(escalate::NEEDS_LEFT);
+        s.claim = claim::Claim::Behind {
+            holder: "another".to_string(),
+            tried: Instant::now(),
+        };
+        assert_eq!(s.needs_down(101, "the loop ended", &mut notes), Ok(()));
+    }
+    assert!(host.told().is_empty(), "{:#?}", host.told());
+    assert!(m.needs_calls.is_empty(), "{:#?}", m.needs_calls);
+}
+
+/// A TAPE RECORDED BEFORE THE HOST HEARD THE SET (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §12.7, "the engine lift"): the recorded run of
+/// [`the_host_hears_the_whole_set_before_the_entry_goes_up`] with its
+/// `host.needs_standing` outputs taken off, as a build before them taped it.
+/// In acts mode it is REPRODUCED, every act taken, the two tells the only
+/// records the replay could not match (`unmatched_outputs`, nothing dropped,
+/// repeated or made up); a strict replay diverges, and at
+/// `host.needs_standing`, the new call. NEGATIVE CONTROL: the tape as
+/// recorded replays strict and in acts mode exactly ([`heard`]'s
+/// `assert_replays`).
+#[test]
+fn an_old_tape_replays_in_acts_mode_and_strictly_differs_at_the_new_call() {
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+
+    let host = Arc::new(Hears::default());
+    let (_, run) = heard(long_need_then_none(), vec![1, 3], &host, false);
+    let tape = crate::supervise::tape::show::open(&run.tape.reframed(&run.header.encode()), false)
+        .expect("the tape reads");
+    let kept: Vec<_> = tape
+        .items
+        .iter()
+        .filter(|i| {
+            !matches!(i.record(),
+                Some(astream_effects::EffectRecord::Emit { door, .. }) if door == NEEDS_DOOR)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(tape.items.len() - kept.len(), 2, "two tells taken off");
+    let old = crate::supervise::tape::text::render(tape.header.as_deref(), &kept).into_bytes();
+    let strict = replay(&old, &Options::default()).expect("a strict replay");
+    match &strict.verdict {
+        Verdict::Diverged(d) => {
+            assert_eq!(d.door.as_deref(), Some(NEEDS_DOOR), "{}", strict.render());
+        }
+        other => panic!("the strict replay differs at the new call: {other:?}"),
+    }
+    let acts = replay(
+        &old,
+        &Options {
+            candidate: Some(crate::supervise::tape::acts::Candidate::default()),
+            ..Options::default()
+        },
+    )
+    .expect("an acts replay");
+    assert_eq!(acts.verdict, Verdict::Reproduced, "{}", acts.render());
+    let account = &acts.acts.as_ref().expect("an acts report").account;
+    assert_eq!(account.unmatched_outputs, 2, "{account:?}");
+    assert_eq!(account.taken, account.acts, "{account:?}");
+    assert_eq!(
+        (
+            account.dropped,
+            account.repeated,
+            account.keyed,
+            account.tainted
+        ),
+        (0, 0, 0, 0),
+        "{account:?}"
+    );
+}

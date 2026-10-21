@@ -936,3 +936,46 @@ fn the_clause_names_its_row_and_the_proven_clause_skips_a_ctl_label() {
         );
     }
 }
+
+/// ONLY A MOVE CLOSES MAIL (phase 6, 6F-6): every `inbox seen` is a
+/// `mail-seen` mark, `moved=1` when it moved the watermark or decided a
+/// verdict and `moved=0` when it moved nothing. Two mails in and one seen
+/// that moved leave one open, and that seen repeated three times leaves the
+/// fold's mail counts where they were; a mark with no `moved=` (an older
+/// writer's, written only on a move) closes one. NEGATIVE CONTROL (by
+/// scratch revert): a fold that reads the unmoved marks closes the second
+/// mail on the first repeat.
+#[test]
+fn a_repeated_inbox_seen_moves_no_mail_count() {
+    let mut log = Log::new(0);
+    let mark = |log: &mut Log, k: Kind, f: Fields, ms: u64| {
+        log.mark(Mark::new(k, Src::Fabric, Conf::Exact).fields(f), at(ms))
+            .expect("a mail mark");
+    };
+    for (inbox, ms) in [(1, 1), (2, 2)] {
+        let f = Fields::new()
+            .word(Key::Dir, "in")
+            .and_then(|f| f.u(Key::Inbox, inbox))
+            .expect("dir");
+        mark(&mut log, Kind::Mail, f, ms);
+    }
+    let seen = |moved: Option<u64>| {
+        let f = Fields::new()
+            .u(Key::Inbox, 1)
+            .and_then(|f| f.u(Key::Seen, 1))
+            .expect("seen");
+        match moved {
+            Some(m) => f.u(Key::Moved, m).expect("moved"),
+            None => f,
+        }
+    };
+    mark(&mut log, Kind::MailSeen, seen(Some(1)), 3);
+    let counts = |log: &Log| (log.state().mail_open, log.state().totals.mail_in);
+    assert_eq!(counts(&log), (1, 2));
+    for ms in 4..7 {
+        mark(&mut log, Kind::MailSeen, seen(Some(0)), ms);
+        assert_eq!(counts(&log), (1, 2), "a repeat at {ms} closed mail");
+    }
+    mark(&mut log, Kind::MailSeen, seen(None), 7);
+    assert_eq!(counts(&log), (0, 2), "an older writer's seen is a move");
+}

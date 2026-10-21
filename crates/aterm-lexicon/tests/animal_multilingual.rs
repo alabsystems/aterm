@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The menagerie's CJK/Thai contract. Four laws under test:
+//! The animal class's CJK/Thai load rules:
 //!
-//! 1. Multi-character CJK animal compounds load PLAIN — they match on the
-//!    DEFAULT builtin (`languages = ["en"]`), inside running CJK text, with
-//!    default scan options. No opt-in required.
-//! 2. Single-character forms (象 / 馬 / 새 / 곰 …) ride the class-agnostic
-//!    `cjk_single_char` opt-in: silent without it, species-correct with it.
-//! 3. Finite prefix bombs are suppressed via exceptions.toml (カメラ never
-//!    grows a turtle), while the bare animal keeps matching.
-//! 4. Open-ended in-language homographs ride `ambiguous = true` language
-//!    gates (ja くま, ko 판다) — the kuma treatment.
+//! 1. Multi-character CJK animal compounds load plain: they match on the default builtin
+//!    (`languages = ["en"]`), inside running CJK text, with default scan options.
+//! 2. Single-character forms (象 / 馬 / 새 / 곰 …) need the class-agnostic `cjk_single_char`
+//!    opt-in.
+//! 3. Finite prefix bombs are suppressed by `exceptions.toml` (カメラ is no turtle) while the
+//!    bare animal still matches.
+//! 4. Open-ended in-language homographs are language-gated with `ambiguous = true` (ja くま,
+//!    ko 판다).
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions};
 
@@ -36,8 +35,7 @@ fn gate_on() -> ScanOptions<'static> {
     }
 }
 
-/// The turkey, in all three languages, inside running text, on the DEFAULT
-/// builtin.
+/// The turkey in zh, ja and ko, inside running text, on the default builtin.
 #[test]
 fn turkey_speaks_chinese_japanese_and_korean() {
     let lex = Lexicon::builtin();
@@ -54,8 +52,7 @@ fn turkey_speaks_chinese_japanese_and_korean() {
     }
 }
 
-/// Plain multi-character forms for a spread of species, mixed into real
-/// prose (including mixed-script terminal-ish lines), default options.
+/// Plain multi-character forms for a spread of species in prose and terminal-ish lines.
 #[test]
 fn big_animals_match_whole_word_in_mixed_cjk_text() {
     let lex = Lexicon::builtin();
@@ -125,8 +122,8 @@ fn panda_compounds_are_pandas_not_suppressions_and_never_cats() {
     }
 }
 
-/// Law 3: the finite prefix bombs stay suppressed even under the opt-in —
-/// and the bare animal that motivated each suppression still matches.
+/// Law 3: the prefix bombs stay suppressed even under the opt-in, and the bare animal behind each
+/// suppression still matches.
 #[test]
 fn prefix_bomb_exceptions_stay_silent_and_animals_survive() {
     let lex = Lexicon::builtin();
@@ -181,8 +178,7 @@ fn prefix_bomb_exceptions_stay_silent_and_animals_survive() {
     }
 }
 
-/// Law 4, the kuma treatment: open-ended in-language homographs load only for
-/// users who list the language — silent on the default builtin.
+/// Law 4: open-ended in-language homographs load only for users who list the language.
 #[test]
 fn homograph_bombs_are_language_gated() {
     let dflt = Lexicon::builtin();
@@ -211,9 +207,8 @@ fn homograph_bombs_are_language_gated() {
     assert_eq!(single_species(&id, "ada kalkun di sana", &o), "turkey");
 }
 
-/// The whole-word law holds for the new scripts: an animal compound inside a
-/// LONGER listed key resolves to the longer key's species (maximal munch), and
-/// hangul particles attach without breaking the match.
+/// An animal compound inside a longer listed key resolves to the longer key's species (maximal
+/// munch), and hangul particles attach without breaking the match.
 #[test]
 fn maximal_munch_and_particles_behave() {
     let lex = Lexicon::builtin();

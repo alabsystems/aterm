@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Unix implementations behind [`control_auth`](super): POSIX
-//! private-dir/mode provisioning, `getentropy` token minting, the `latest`
-//! symlink, and the `getpeereid`/`SO_PEERCRED` same-uid peer gate. Moved
-//! VERBATIM from `control_auth.rs` in the Windows-port module split — zero
-//! semantic change on Unix.
+//! Unix implementations behind [`control_auth`](super): private-dir and socket-file modes,
+//! the token file, pid liveness, and the `getpeereid`/`SO_PEERCRED` same-uid peer gate.
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -13,19 +10,12 @@ use std::path::Path;
 
 use aterm_uds::CtlStream;
 
-/// Create `dir` (and parents) if absent, force its mode to `0700` when it is not
-/// already that, and VERIFY it is owned by us and not group/other-writable before
-/// returning success.
+/// Create `dir` (and parents) if absent, force its mode to `0700`, and verify it is owned by
+/// us and not group/other-writable.
 ///
-/// SEC-3: forcing the mode to 0700 is not enough on its own — if `dir` already
-/// existed and is owned by ANOTHER user (an attacker who pre-created
-/// `$XDG_RUNTIME_DIR/aterm`), our `set_permissions` does not change its owner,
-/// and that user could still have planted contents or could swap files in. After
-/// ensuring the directory exists and tightening the mode, we `stat` it and apply
-/// the same owned-and-unshared predicate the snapshot path uses
-/// ([`aterm_types::fs_restricted::dir_safe_for_private_write`]); a foreign-owned
-/// or group/other-writable directory is REFUSED (fail closed) rather than
-/// provisioned into.
+/// SEC-3: the mode alone is not enough: a directory pre-created by another user keeps its
+/// owner, who can plant or swap files. A foreign-owned or group/other-writable directory
+/// fails [`aterm_types::fs_restricted::dir_safe_for_private_write`] and is refused.
 pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     ensure_private_dir_as(dir, our_uid())
 }
@@ -94,8 +84,7 @@ fn tighten_and_verify(dir: &Path, owner: u32) -> std::io::Result<()> {
     if !std::fs::metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    // Ownership-safety gate: stat AFTER tightening, then verify owner == us and
-    // no group/other write bits. set_permissions cannot fix a foreign owner.
+    // Stat after tightening: set_permissions cannot fix a foreign owner.
     let meta = std::fs::metadata(dir)?;
     let safe =
         aterm_types::fs_restricted::dir_safe_for_private_write(owner, meta.uid(), meta.mode());
@@ -113,12 +102,9 @@ fn tighten_and_verify(dir: &Path, owner: u32) -> std::io::Result<()> {
     }
 }
 
-/// Pid liveness via `kill(pid, 0)`: delivery permission is checked without
-/// sending anything, and only `ESRCH` — no such process — means "dead"; 0,
-/// `EPERM` and any other answer mean "alive", because a sweep that removes a
-/// live instance's files breaks it while one that keeps a dead one's costs a
-/// file. Pids that cannot be real (0, or wider than `pid_t`) are dead — files
-/// naming them are garbage.
+/// Pid liveness via `kill(pid, 0)`: only `ESRCH` means dead; 0, `EPERM` and anything else
+/// mean alive, because sweeping a live instance's files breaks it while keeping a dead one's
+/// costs a file. Pids that cannot be real (0, or wider than `pid_t`) are dead.
 pub(crate) fn pid_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -129,23 +115,17 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// Provision the capability token: generate a fresh token, write it to
-/// `path` at mode `0600` (truncating any prior token), and return the hex
-/// string. The token rotates every launch — a leaked token from a prior run
-/// is worthless.
+/// Write a fresh capability token to `path` at mode `0600` and return its hex. It rotates
+/// every launch, so a token leaked from a prior run is worthless.
 ///
-/// Returns `None` when entropy is unavailable or the file cannot be written; a
-/// `None` here MUST make the caller skip binding the socket (fail closed).
+/// `None` (no entropy, or the file cannot be written) must make the caller skip binding the
+/// socket (fail closed).
 #[must_use]
 pub(crate) fn provision_token(path: &Path) -> Option<String> {
     let token = super::random_token_hex()?;
-    // SEC-3: create the token EXCLUSIVELY and refuse to follow a symlink.
-    // Remove any prior file first (a stale token from our own previous run, or
-    // an attacker-planted file/symlink at this path), then `O_CREAT|O_EXCL|
-    // O_NOFOLLOW`: O_EXCL means we only ever write a file WE just created (never
-    // through a pre-existing symlink or someone else's file), and O_NOFOLLOW
-    // refuses a symlink even racing the unlink. The token is thus never written
-    // through an attacker-controlled path, and never briefly world-readable.
+    // SEC-3: remove any prior file (our stale token, or a planted file or symlink), then
+    // `O_CREAT|O_EXCL|O_NOFOLLOW`: we only write a file we just created, never through a
+    // symlink even one raced in after the unlink, and it is never briefly world-readable.
     let _ = std::fs::remove_file(path);
     write_fresh_token(path, &token)?;
     Some(token)
@@ -160,8 +140,7 @@ pub(super) fn write_fresh_token(path: &Path, token: &str) -> Option<()> {
     opts.write(true).create_new(true).mode(0o600);
     opts.custom_flags(libc::O_NOFOLLOW);
     let f = opts.open(path).ok()?;
-    // Force 0600 via the OPEN fd (`fchmod`), never a path-based set_permissions
-    // that would re-resolve (and could follow) the path.
+    // `fchmod` through the open fd: a path-based chmod would re-resolve the path.
     f.set_permissions(std::fs::Permissions::from_mode(0o600))
         .ok()?;
     let mut f = f;
@@ -176,9 +155,8 @@ pub(crate) fn lock_socket_file(path: &str) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
-/// The connecting peer's effective uid (`getpeereid(2)` on macOS/BSD,
-/// `SO_PEERCRED` on Linux), or `None` if the kernel will not say. Moved to
-/// `aterm_uds::peer` (2026-09-28), shared with the PTY keeper.
+/// The connecting peer's effective uid (`getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on
+/// Linux) via `aterm_uds::peer`, or `None` if the kernel will not say.
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
 #[must_use]
 pub(crate) fn peer_uid(stream: &CtlStream) -> Option<u32> {
@@ -199,9 +177,8 @@ pub(crate) fn our_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// The accept-time peer gate: refuse any connection NOT from our own uid.
-/// `None` (cannot verify) also refuses — fail closed. The `Err` carries the
-/// exact denial text the accept loop has always audit-logged.
+/// The accept-time peer gate: refuse any connection not from our own uid, including one
+/// whose uid cannot be read (fail closed). The `Err` is the audit-logged denial text.
 pub(crate) fn peer_check(stream: &CtlStream) -> Result<(), String> {
     peer_verdict(peer_uid(stream), our_uid())
 }

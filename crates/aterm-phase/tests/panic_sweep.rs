@@ -1,32 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PANIC SWEEP: the reader never panics, on any window of any screen.
+//! Panic sweep: the reader never panics on any window of any screen.
 //!
-//! The window runs [`aterm_phase::read`] on its MAIN THREAD, every frame, for
-//! every agent session, and a panic there takes down the terminal and every
-//! session in it. The live harness validation of 2026-09-24 found one (a
-//! question box cut below its top by a 40-row `tail=`: `rows[1..0]`). A
-//! screen is whatever the pane shows — any contiguous run of any screen,
-//! each row cut at any width — so this sweep reads the fixture FILES under
-//! `aterm-phase/src/fixtures/` and (when this crate sits in the aterm
-//! workspace) `aterm-agent/src/supervise/policy/fixtures/`, read at test
-//! time, and the in-crate builders (`prompt::fixtures`). It does NOT read the
-//! box screens written inline in other crates' unit tests. Each is read
-//! through:
+//! The window runs [`aterm_phase::read`] on its main thread every frame for
+//! every agent session. A screen is whatever the pane shows — any contiguous
+//! run of rows, each cut at any width — so this sweep reads the fixture files
+//! under `aterm-phase/src/fixtures/` and (when in the workspace)
+//! `aterm-agent/src/supervise/policy/fixtures/`, plus the in-crate builders
+//! (`prompt::fixtures`), through:
 //!
 //! * every tail cut `rows[k..]` and every head cut `rows[..k]`;
 //! * every middle window of heights 1..=12;
-//! * each row truncated to a few widths (on char boundaries), under the same
+//! * each row truncated to [`WIDTHS`] (on char boundaries), under the same
 //!   tail and head cuts and a deterministic sample of the middles;
 //!
-//! with the reader for Claude Code, the screen-identified reader (`None`)
-//! and Codex's, with no cursor and a couple of cursor columns, plus the
-//! other pure functions a caller runs on the same rows (the approval loop's
-//! `parse_prompt_v2`, the lights' `composer_draft`, …) and every accessor a
-//! caller runs on a box the reader returns ([`read_box`]). It asserts ONLY that
-//! nothing panics, and names the fixture, the window and the panic's
-//! location when something does.
+//! across every [`Program::ALL`] reader, [`aterm_phase::continuation_suggestion`]
+//! at several cursor columns, the standalone phase/prompt/launch-card entry
+//! points, and every [`PromptV2`](aterm_phase::PromptV2) accessor
+//! ([`read_box`]).
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -120,16 +112,10 @@ fn truncated(rows: &[String], width: usize) -> Vec<String> {
 
 /// Every call the sweep makes on one window.
 fn read_all(w: &[String]) {
-    // `read` is a function of its arguments alone, so each reader reads the
-    // window once and its box is handed to `read_box` from that one reading.
-    // Every reader ([`Program::ALL`], so a new agent's is swept with no edit
-    // here) reads it with the cursor at column 0: the cursor's column enters
-    // a reading only as its `suggestion` (the one `ScreenReader::read`, which
-    // no reader overrides), so that reading is the one without a cursor plus
-    // `continuation_suggestion(w, 0)`, called with the other columns below.
-    // The screen-identified reading (`read(None, …)`) is one of these
-    // readers' (`identify`), so it is not taken again (the readers were 2/3
-    // of the sweep's CPU, Claude Code's 9/10 of that).
+    // Each `Program::ALL` reader reads the window once at cursor column 0:
+    // the cursor column only affects `suggestion` (`continuation_suggestion`,
+    // tested across columns below), and `read(None, …)` dispatches to one of
+    // `Program::ALL` via `identify`.
     for col in [0, 1, 2, 200] {
         let _ = aterm_phase::continuation_suggestion(w, col);
     }
@@ -227,14 +213,9 @@ std::thread_local! {
     static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// One window that panicked: the fixture, the window, the location and the
-/// message. Each distinct window is read once: the reader is a function of
-/// the rows alone, and half the sweep's windows repeat one already read — a
-/// shared footer, a blank run, the narrow cuts (2026-09-30, the fixture
-/// files: 162,884 of 321,033 windows distinct).
+/// Check one window and record any panic. Each distinct window is read once
+/// (sharded by hash across 64 locks to avoid contention across threads).
 fn check(name: &str, what: &str, w: &[String], failures: &Mutex<Vec<String>>) {
-    // Sharded by hash: one set under one lock had the sweep's threads
-    // queueing on it.
     static READ: [Mutex<BTreeSet<u64>>; 64] = [const { Mutex::new(BTreeSet::new()) }; 64];
     let mut h = std::hash::DefaultHasher::new();
     w.hash(&mut h);
@@ -298,10 +279,7 @@ fn sweep(
     }
 }
 
-/// How many parts one cut of an `n`-row screen is swept in ([`sweep`]): its
-/// tail and head cuts are quadratic in its rows, and as one job per cut the
-/// 528-row capture's seven were the run's wall (2026-10-05: its whole cut 50 s
-/// of an 86 s run on 6 threads, every other job under 6 s).
+/// Number of parts to split an `n`-row screen's quadratic tail/head sweep into.
 fn parts_for(n: usize) -> usize {
     n.div_ceil(32).max(1)
 }
@@ -332,11 +310,8 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
     }));
     let all = screens();
     let failures = Mutex::new(Vec::new());
-    // One job per screen, cut and part ([`parts_for`]), tallest screen first:
-    // the sweep of one tall capture is quadratic in its rows (every tail and
-    // head), and as one job per screen the 528-row capture was the run's wall
-    // on a single thread (2026-09-30: 62 s of wall for 152 s of CPU on 14
-    // threads), as one job per cut still (2026-10-05).
+    // One job per (screen, cut, part), tallest screen first so quadratic
+    // sweeps of tall captures do not straggle at the end of the queue.
     let mut jobs: Vec<(&Screen, Cut, (usize, usize))> = Vec::new();
     for s in &all {
         let parts = parts_for(s.rows.len());

@@ -53,10 +53,8 @@ pub(crate) fn scheme_from_word(
 /// Map a winit window [`Theme`](aterm_window::window::Theme) onto the engine's
 /// [`Appearance`](aterm_types::Appearance).
 ///
-/// `Some(Light)`/`Some(Dark)` map across directly. `None` — winit could not
-/// determine the OS appearance (some platforms / no theme support) — falls back to
-/// [`Appearance::Dark`], which is the engine's OWN default, so an "unknown" OS leaves
-/// the engine at the value it already held (no spurious change/push).
+/// `None` (winit cannot tell) maps to `Dark`, the engine's own default, so an unknown OS
+/// appearance pushes no change.
 #[must_use]
 pub(crate) fn theme_to_appearance(
     theme: Option<aterm_window::window::Theme>,
@@ -302,39 +300,20 @@ impl App {
     /// `appearance` control verb), window attach, and on Windows the window's
     /// `ThemeChanged` event.
     pub(crate) fn sync_app_theme_to_appearance(&mut self, appearance: aterm_types::Appearance) {
-        // WINDOWS ONLY: re-assert the resolved title-bar appearance after the OS flip.
-        // With config `window_theme = "auto"` the window's winit `preferred_theme` is
-        // `None`, so winit's own `WM_SETTINGCHANGE` handler has just re-themed the
-        // non-client area straight from the new OS preference — which is precisely the
-        // decision the Windows arm overrides (it resolves the caption from the TERMINAL
-        // background instead, so a dark grid never wears a white caption bar). That
-        // clobber lands while the event is being produced, i.e. strictly before this
-        // handler runs, so re-applying here is the last word.
+        // Re-assert the resolved title-bar appearance after the OS flip. Under
+        // `window_theme = "auto"`, winit's own `WM_SETTINGCHANGE` handler has just re-themed the
+        // non-client area from the OS preference, overriding the caption the Windows arm
+        // resolves from the terminal background; it runs before this handler, so re-applying
+        // here is the last word.
         //
-        // ABOVE the dedupe below, and that placement is load-bearing. Windows broadcasts
-        // `WM_SETTINGCHANGE` to EVERY top-level window and winit's handler is PER-HWND,
-        // dispatching `ThemeChanged` inline from inside each window's `WndProc`. With two
-        // windows open across one OS flip the order is: W1's proc re-themes W1 and emits
-        // `ThemeChanged(W1)` → we land here and re-assert both → THEN W2's proc runs,
-        // re-themes W2, and emits `ThemeChanged(W2)` → we land here again with the
-        // appearance already recorded, so an early return would leave W2 wearing the OS
-        // caption for good. Hoisting costs one idempotent re-apply per window per event
-        // and removes the hole entirely.
-        //
-        // Not folded into the `theme_changed` branch below either: a plain, non-split
-        // `theme` keeps the SAME background across an OS flip, so `apply_theme_live` (and
-        // with it `window_set_background_color`, the other re-resolution seam) never runs
-        // — yet winit repainted the caption anyway. When it DOES run it re-publishes the
-        // new background to every window afterwards, so the final word still carries the
-        // freshly resolved colour.
-        //
-        // This is only the CHANGE-SIGNALLED half. winit re-themes on every
-        // `WM_SETTINGCHANGE` but reports only the ones that move the OS theme, so the
-        // silent broadcasts are caught on the frame path by
-        // `platform_win::verify_chrome_appearance`.
-        //
-        // macOS/Linux are untouched: `window_theme_for_chrome` still passes `Auto`
-        // through to AppKit/winit unchanged there, and this block does not compile.
+        // Above the dedupe below: `WM_SETTINGCHANGE` reaches every top-level window and winit
+        // emits `ThemeChanged` per HWND, so with two windows the second event arrives with the
+        // appearance already recorded, and an early return would leave that window on the OS
+        // caption. Not in the `theme_changed` branch either: a plain `theme` keeps its
+        // background across a flip, so `apply_theme_live` never runs, yet winit repainted the
+        // caption; when it does run, it re-publishes the new background afterwards. winit
+        // reports only the broadcasts that move the OS theme; the silent ones are caught on the
+        // frame path by `platform_win::verify_chrome_appearance`.
         #[cfg(windows)]
         {
             for wid in self.appearance_redraw_targets() {
@@ -345,7 +324,7 @@ impl App {
         }
 
         if self.os_appearance == appearance {
-            return; // unchanged — nothing to re-resolve
+            return;
         }
         self.os_appearance = appearance;
 
@@ -495,13 +474,8 @@ mod tests {
         );
     }
 
-    /// REGRESSION (audit: vacuous `os_appearance_flip_repaints`): when the
-    /// rendered theme is UNCHANGED, an OS appearance flip must nudge EVERY
-    /// window — the pre-fix front-window-only nudge left an unfocused Settings
-    /// window compositing its `window_theme=auto` titlebar mock stale through
-    /// the flip. Headless windows carry no `os_window` (the `request_redraw`
-    /// itself is unobservable here), so the pinned surface is the fan-out SET
-    /// `sync_app_theme_to_appearance` draws its nudge loop from.
+    /// With the rendered theme unchanged, a flip nudges every window, not just the front one.
+    /// Headless windows have no `os_window`, so the fan-out set is what is pinned.
     #[test]
     fn appearance_flip_nudges_every_window() {
         let mut app = crate::App::headless_for_test();
@@ -561,14 +535,10 @@ mod tests {
         );
     }
 
-    /// The winit theme → engine appearance mapping: Light/Dark map across, and an
-    /// unknown (`None`) OS appearance falls back to the engine default (Dark) so it
-    /// never spuriously flips the engine off its own default.
     #[test]
     fn theme_maps_light_dark_and_unknown_to_default() {
         assert_eq!(theme_to_appearance(Some(Theme::Light)), Appearance::Light);
         assert_eq!(theme_to_appearance(Some(Theme::Dark)), Appearance::Dark);
-        // None == engine default == Appearance::default().
         assert_eq!(theme_to_appearance(None), Appearance::Dark);
         assert_eq!(theme_to_appearance(None), Appearance::default());
     }

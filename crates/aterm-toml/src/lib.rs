@@ -1,21 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TOML 1.0.0 for aterm — the serde front end and the comment-preserving
-//! document model, first-party.
-//!
-//! # What it serves
-//!
-//! | job | what it needs |
-//! |-----|---------------|
-//! | load `aterm.toml`, every `Cargo.toml`, the art assets | a `serde::Deserializer` |
-//! | save the Preferences window's edits without touching a comment | a format-preserving DOM |
-//! | underline a config diagnostic in the editor | byte spans on every node |
-//!
-//! All three run over one parser. It replaces `toml` and `toml_edit` (six
-//! packages, 64,783 lines of third-party source, including a forked `winnow`).
-//!
-//! # The two halves
+//! TOML 1.0.0 for aterm, first-party: a serde front end (`aterm.toml`, every
+//! `Cargo.toml`, the art assets) and a comment-preserving document model with
+//! byte spans on every node (the Preferences window's edits, config
+//! diagnostics), both over one parser. It replaces `toml` and `toml_edit`.
 //!
 //! ```
 //! # use serde::Deserialize;

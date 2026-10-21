@@ -5,27 +5,45 @@
 // Derived from x11rb-protocol 0.13.2 (MIT OR Apache-2.0, used under
 // Apache-2.0) src/resource_manager/parser.rs (`parse_database`,
 // `parse_entry`, `parse_query`) and src/resource_manager/matcher.rs
-// (`check_match`, `compare_matches`, `match_entry`), and rewritten by the
-// aterm project in 2026: one module, no `#include` (a database read from the
-// RESOURCE_MANAGER property has no directory to include from), and a bound on
-// the matcher's states.
+// (`check_match`, `compare_matches`, `match_entry`), and src/resource_manager/
+// mod.rs (`parse_data_with_base_directory`), rewritten by the aterm project in
+// 2026: one module, `#include` followed only in a resource file (a database
+// read from the RESOURCE_MANAGER property is xrdb's output, which xrdb's cpp
+// has already expanded), only into regular files and within a byte budget,
+// and a bound on the matcher's states.
 
 //! The X resource manager's database (Xrm): `name.class*rest: value` lines,
-//! as `RESOURCE_MANAGER` on the root window holds them (`xrdb`), and the
-//! precedence rules that pick one entry for a query such as `Xft.dpi`. The
-//! answers are x11rb's for the same database and query
-//! (`tests/recorded/x11rb-protocol-0.13.2-xrm.tsv`).
+//! as `RESOURCE_MANAGER` on the root window holds them (`xrdb`) or a resource
+//! file such as `~/.Xresources` does, and the precedence rules that pick one
+//! entry for a query such as `Xft.dpi`. The answers are x11rb's for the same
+//! database and query (`tests/recorded/x11rb-protocol-0.13.2-xrm.tsv`, and
+//! `-xrm-include.tsv` for files that `#include` others).
 //!
 //! Any client may write `RESOURCE_MANAGER`, so the parser takes arbitrary
 //! bytes: it never panics, skips what it cannot read, and the matcher keeps
-//! at most [`MAX_STATES`] partial matches per entry.
+//! at most [`MAX_STATES`] partial matches per entry. A file's includes are
+//! read at most [`MAX_INCLUDE_DEPTH`] deep and [`MAX_INCLUDED_BYTES`] in all.
 
 use std::cmp::Ordering;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
 /// The most partial matches the matcher tracks for one entry. A query is a
 /// handful of components, which needs a handful; a hostile entry of many
 /// loose bindings cannot make it more.
 pub const MAX_STATES: usize = 256;
+
+/// The deepest `#include` a resource file's database follows: a file the
+/// root file reaches through more includes than this is not read. Xlib's
+/// limit, and x11rb's (`MAX_INCLUSION_DEPTH`), so a file that includes itself
+/// ends.
+pub const MAX_INCLUDE_DEPTH: u8 = 100;
+
+/// The most bytes of included files one resource file's database reads, all
+/// of its includes together; an include that would pass it is not read. A
+/// resource file is a few kilobytes. x11rb had no bound, so a large file that
+/// includes itself was parsed [`MAX_INCLUDE_DEPTH`] + 1 times.
+pub const MAX_INCLUDED_BYTES: u64 = 64 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Binding {
@@ -68,23 +86,44 @@ fn is_octal(c: u8) -> bool {
     (b'0'..=b'7').contains(&c)
 }
 
+/// What a resource file's `#include` reads: the file at a path, given the
+/// bytes it may still take ([`MAX_INCLUDED_BYTES`] less what earlier includes
+/// read), or `None` to skip it.
+pub type IncludeReader<'a> = dyn FnMut(&Path, u64) -> Option<Vec<u8>> + 'a;
+
 impl Database {
     /// Parse a database. Lines that do not parse are skipped, as Xlib skips
-    /// them; `#include` and every other directive is ignored.
-    pub fn parse(mut data: &[u8]) -> Database {
+    /// them; `#include` and every other directive is ignored: this is the
+    /// `RESOURCE_MANAGER` property's reading, whose text `xrdb` has already
+    /// run through cpp.
+    pub fn parse(data: &[u8]) -> Database {
         let mut entries = Vec::new();
-        while let Some(&first) = data.first() {
-            match first {
-                b'\n' => data = &data[1..],
-                b'!' | b'#' => data = skip_to_eol(data),
-                _ => {
-                    let (entry, rest) = parse_entry(data);
-                    data = rest;
-                    entries.extend(entry);
-                }
-            }
-        }
+        parse_into(data, &mut entries, &mut |_, _| {});
         Database { entries }
+    }
+
+    /// Parse a resource file's text, `data`, read from a file in `dir`: each
+    /// `#include "path"` line is replaced by the entries of the file it names,
+    /// a relative path taken from the including file's directory, as Xlib and
+    /// x11rb read `~/.Xresources`. A file that cannot be read (missing, not a
+    /// regular file, past [`MAX_INCLUDED_BYTES`] or [`MAX_INCLUDE_DEPTH`]) is
+    /// skipped, as a line that does not parse is.
+    pub fn parse_file(data: &[u8], dir: &Path) -> Database {
+        Database::parse_file_with(data, dir, &mut read_regular_file)
+    }
+
+    /// [`Database::parse_file`] with includes read by `read`.
+    pub fn parse_file_with(data: &[u8], dir: &Path, read: &mut IncludeReader<'_>) -> Database {
+        let mut entries = Vec::new();
+        let mut budget = MAX_INCLUDED_BYTES;
+        parse_file_into(data, dir, 0, &mut entries, read, &mut budget);
+        Database { entries }
+    }
+
+    /// `other`'s entries after this one's, as the text of `other` read after
+    /// this one's would give them: a later entry of equal precedence wins.
+    pub fn append(&mut self, other: Database) {
+        self.entries.extend(other.entries);
     }
 
     /// The value of the best entry for the query `name` / `class` (dotted,
@@ -108,6 +147,109 @@ impl Database {
     pub fn get_string(&self, name: &str, class: &str) -> Option<&str> {
         std::str::from_utf8(self.get(name, class)?).ok()
     }
+}
+
+/// Parse `data`'s lines into `entries`; `include` is handed the file of each
+/// well-formed `#include "file"` line (x11rb's `parse_database`: `#`, spaces,
+/// `include`, spaces, then the name between quotes on that line) and appends
+/// what it reads in the directive's place.
+fn parse_into(
+    mut data: &[u8],
+    entries: &mut Vec<Entry>,
+    include: &mut dyn FnMut(&[u8], &mut Vec<Entry>),
+) {
+    while let Some(&first) = data.first() {
+        match first {
+            b'\n' => data = &data[1..],
+            b'!' => data = skip_to_eol(data),
+            b'#' => {
+                let directive = span(&data[1..], |c| c == b' ').1;
+                data = skip_to_eol(directive);
+                if let Some(rest) = directive.strip_prefix(b"include") {
+                    let rest = span(rest, |c| c == b' ').1;
+                    if let Some(rest) = rest.strip_prefix(b"\"") {
+                        let (file, rest) = span(rest, |c| c != b'"' && c != b'\n');
+                        if rest.first() == Some(&b'"') {
+                            include(file, entries);
+                        }
+                    }
+                }
+            }
+            _ => {
+                let (entry, rest) = parse_entry(data);
+                data = rest;
+                entries.extend(entry);
+            }
+        }
+    }
+}
+
+/// [`parse_into`] for a file in `dir` reached through `depth` includes (at
+/// most [`MAX_INCLUDE_DEPTH`]), its includes read by `read` from what `budget`
+/// has left (x11rb's `parse_data_with_base_directory`): a name that is not
+/// UTF-8 is skipped, as x11rb skipped it.
+fn parse_file_into(
+    data: &[u8],
+    dir: &Path,
+    depth: u8,
+    entries: &mut Vec<Entry>,
+    read: &mut IncludeReader<'_>,
+    budget: &mut u64,
+) {
+    parse_into(data, entries, &mut |file, entries| {
+        // x11rb read the file one level past the limit and then parsed
+        // nothing of it; it is not read at all here.
+        let Ok(name) = std::str::from_utf8(file) else {
+            return;
+        };
+        if depth >= MAX_INCLUDE_DEPTH {
+            return;
+        }
+        let path = dir.join(name);
+        let Some(text) = read(&path, *budget) else {
+            return;
+        };
+        let Some(left) = u64::try_from(text.len())
+            .ok()
+            .and_then(|n| budget.checked_sub(n))
+        else {
+            return;
+        };
+        *budget = left;
+        let next = path
+            .parent()
+            .map_or_else(|| dir.to_path_buf(), Path::to_path_buf);
+        parse_file_into(&text, &next, depth + 1, entries, read, budget);
+    });
+}
+
+/// [`Database::parse_file`]'s reader: the regular file at `path` (a symbolic
+/// link followed), when it holds at most `limit` bytes. Anything else (a
+/// directory, a FIFO a read would block on, a device, a file that grew past
+/// the limit while it was read) is `None`.
+pub fn read_regular_file(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    // Asked of the path before the open: opening a FIFO for reading waits
+    // for a writer. Asked again of what was opened.
+    let regular = |meta: std::fs::Metadata| meta.is_file() && meta.len() <= limit;
+    if !regular(std::fs::metadata(path).ok()?) {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    if !regular(file.metadata().ok()?) {
+        return None;
+    }
+    let mut text = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut text)
+        .ok()?;
+    (u64::try_from(text.len()).ok()? <= limit).then_some(text)
+}
+
+/// The directory a resource file at `path` includes from: its parent.
+#[must_use]
+pub fn include_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 fn parse_components(mut data: &[u8]) -> (Vec<(Binding, Component)>, &[u8]) {

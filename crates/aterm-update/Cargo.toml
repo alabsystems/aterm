@@ -16,7 +16,7 @@ description = "aterm — signature-pinned in-app updater: stages verified releas
 dev-seams = ["aterm-update-core/dev-seams"]
 
 [dependencies]
-# Manifest (aterm-appcast.toml) + the on-disk `ready.toml` staging marker.
+# The manifest (aterm-appcast.toml) and the `ready.toml` staging marker.
 aterm-toml = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 # The Linux lane's compiled binary identity crosses as JSON
@@ -28,25 +28,18 @@ libc = { workspace = true }
 aterm-durable = { workspace = true }
 # The shared RFC3339 civil-calendar math (`aterm_types::rfc3339`).
 aterm-types = { workspace = true }
-# The workspace's one epoch-clock read (`aterm_time::unix_secs`).
+# `aterm_time::unix_secs`, the workspace's one epoch-clock read.
 aterm-time = { workspace = true }
-# The artifact-agnostic, portable update primitives (Source resolution, FileLock +
-# same_volume, the download host's curl plumbing, ensure_private_dir, sha256_file, the
-# pin idiom).
+# Portable update primitives: Source resolution, FileLock, curl downloads, sha256_file.
 aterm-update-core = { workspace = true }
-# Route updater diagnostics through the global logger aterm-gui installs, so they
-# land in the app log file (visible for a Finder-launched .app, unlike stderr).
+# Diagnostics go to the app log file, visible for a Finder-launched .app.
 aterm-log = { workspace = true }
-# Decode the base64-pinned paper master (32 raw bytes) for its fingerprint.
-# `decode_strict`: canonical padding required and no trailing bits, so a pinned
-# key has exactly one spelling.
+# `base64::decode_strict` for the compiled update key (one spelling per key), and hex.
 aterm-codec = { workspace = true }
-# Fingerprints the decoded compile-time update key (the bytes the verifier
-# consumes, not the base64 literal).
+# SHA-256 of the decoded update key and of Linux binaries.
 aterm-digest = { workspace = true }
-# The ONE audited entropy surface (`aterm_uds::rand`) for the re-exec nonce —
-# never a hand-rolled `/dev/urandom` read (that pattern caused kernel panics).
-# aterm-uds has no dependencies, so no cycle.
+# `aterm_uds::rand`, the audited entropy source (nonces, jitter); never a hand-rolled
+# `/dev/urandom` read.
 aterm-uds = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
@@ -69,8 +62,7 @@ atpkg = { workspace = true }
 # Signing side (Ed25519KeyPair::from_seed_unchecked + .sign) for the roster-chain
 # fixtures; the verifying side is `aterm_update_core::roster`'s.
 ring = { workspace = true, features = ["default"] }
-# Tier-1 binds the real updater reducers to their single-source derived models;
-# production builds retain no spec dependency.
+# Tier-1 conformance tests bind the updater reducers to their derived models.
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-misc = { workspace = true }

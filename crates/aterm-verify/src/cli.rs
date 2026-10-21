@@ -253,15 +253,16 @@ Run aterm's checks in place, offline, alone or in any combination.
                                   a wasm module's JS glue (`--record-toy`: the
                                   wasm-glue check's goldens; `--record-replay`:
                                   wasm-smoke's CPU replay answers)
-  verify fetch-browser            the pinned chrome-headless-shell and Firefox
-                                  the browser check drives, into this
-                                  machine's cache
+  verify fetch-browser            the pinned chrome-headless-shell, Firefox
+                                  and WebKit the browser check drives, into
+                                  this machine's cache
   verify browser-site DIR         the browser check's first half: both web
                                   modules built and the site laid in DIR
-  verify browser-drive SITE OUT [--engine metal|swiftshader|firefox]...
+  verify browser-drive SITE OUT [--engine metal|swiftshader|firefox|webkit]...
                                   its second half: the sessions run on a laid
                                   site, frames in OUT (no targo: the Linux
-                                  lane's guest)
+                                  lane's guest); webkit, whose pages keep
+                                  windows, only when named
 
 Sets:
   dev      fmt census lint test doc (the default)

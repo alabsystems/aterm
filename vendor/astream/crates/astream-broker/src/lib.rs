@@ -125,6 +125,8 @@ mod compact;
 mod crash_sim;
 mod escalation;
 pub mod health;
+#[cfg(feature = "retention")]
+mod held;
 mod last_view;
 pub use last_view::{LastStep, LastView, LastViewError, LastViewGarbage};
 pub mod logid;
@@ -133,6 +135,8 @@ pub mod logid;
 mod power_loss;
 pub mod proto;
 mod recover;
+#[cfg(feature = "retention")]
+pub mod retention;
 /// cfg(unix): sharding binds one Unix-domain socket per shard, and std has no
 /// Unix-domain sockets on Windows (where the broker serves TCP only).
 #[cfg(unix)]
@@ -169,6 +173,8 @@ pub use astream_cap::{mint, producer_id_of, Capability};
 /// identity without depending on `astream-aead` directly.
 #[cfg(feature = "identity")]
 pub use astream_aead::{IdentityKeypair, ID_PUB_LEN};
+#[cfg(feature = "retention")]
+pub use broker::RETENTION_INTERVAL;
 pub use escalation::{Escalate, Escalation};
 pub use health::{health_path, read_health, BrokerHealth, HealthRead, HealthWriter, HEALTH_SUFFIX};
 pub use logid::{
@@ -179,12 +185,16 @@ pub use proto::{
     HELLO_REASON_MAX, REQUEST_RETIRE,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
+#[cfg(feature = "retention")]
+pub use retention::{parse_rule_line, parse_rules, record_bytes, Class, Keep, Retention, Rule};
 #[cfg(unix)]
 pub use sharded::{
     sharded_clamp_index, sharded_count_nonzero, ShardedBroker, ShardedClient, ShardedHandle,
     ShardedSubscription,
 };
 pub use storage::{storage_len_advance, storage_truncate_within_len};
+#[cfg(feature = "retention")]
+pub use store::RetentionTick;
 pub use store::{
     incarnation_base, incarnation_of, is_hidden_record, on_boot_volume,
     store_ack_seq_in_reserved_half, store_head_advance, will_seq, Boot, BrokerLog, Durability,

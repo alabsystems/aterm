@@ -1,30 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A SEED WITHOUT THE INSTALL CONSENT ADOPTS NOTHING, at the real process edge.
+//! A seed without install consent adopts nothing, and a consenting seed makes
+//! the toolchain reachable immediately.
 //!
-//! A seed that is switched off must notice before it writes `<prefix>/adopted`, lays a
-//! pending stub under `bin/` and `agents/`, lays the reroute stubs, writes the shell hooks
-//! under `~/.aterm` or the rc block, or reasserts the rustup seam: every stub would promise
-//! a pass the switch refuses, and the adoption would install the whole set the first tick
-//! after the switch was lifted. The switch is the ONE install consent, `[packages]
-//! auto_install = false` in a scratch aterm.toml, and a recorded decline outranks it. The
-//! store stays untouched — then, as the non-vacuity half, the SAME fixture with the
-//! default config adopts, so the first half cannot pass merely because the fixture never
-//! reaches the adoption line.
+//! A seed that is switched off must stop before it writes `<prefix>/adopted`,
+//! lays a pending stub under `bin/` and `agents/`, lays the reroute stubs,
+//! writes the shell hooks under `~/.aterm` or the rc block, or reasserts the
+//! rustup seam. The switch is `[packages] auto_install = false` in a scratch
+//! `aterm.toml`, and a recorded decline outranks it. As a non-vacuity control,
+//! the same fixture with the default config adopts.
 //!
-//! AND A CONSENTING SEED MAKES THE TOOLCHAIN REACHABLE AT ONCE (2026-10-15): the shell
-//! hooks are written by the seed, not a minute later at the end of the first update pass,
-//! they append `bin/` behind the caller's PATH, and `bin/` already answers `targo` — a
-//! stub that says `trust`'s state, and waits for it while a pass installs it or, before
-//! that pass begins, while the window's seed has promised it (`pass-owed.json`).
+//! A consenting seed writes the shell hooks immediately: they append `bin/`
+//! behind the caller's `PATH`, and `bin/` answers `targo` with a stub that
+//! reports `trust`'s state and waits for it while a pass installs it or while
+//! the window's seed has promised a pass (`pass-owed.json`).
 //!
-//! NEVER THE REAL STORE OR MACHINE. HOME is a temp directory (so the default prefix
-//! and `~/.rustup` sit under it, and the machine-settings lane refuses a synthetic
-//! home), XDG_CONFIG_HOME is a temp directory holding the scratch config, and the
-//! registry is an empty local dir (no network) — except for the one test that watches the
-//! network fetcher itself, whose every request goes to a local proxy that counts the
-//! connection and drops it, so nothing leaves the machine.
+//! `HOME` and `XDG_CONFIG_HOME` are temp directories and the registry is an
+//! empty local directory, except for the test that exercises the network
+//! fetcher against a local counting proxy that drops each connection.
 
 #![cfg(unix)]
 use aterm_uds::spawnfd::{Child, Command, Stdio};
@@ -758,15 +752,9 @@ fn a_whole_update_ends_the_promise_it_was_spawned_on() {
     );
 }
 
-/// THE WINDOW'S SEED ASKS NO INDEX; A TYPED ONE STILL DOES. On an empty store whose config
-/// wants no vendor program (every one excluded), the seed's one sentence resolved the signed
-/// index — a discovery walk, the index quads and every manifest, dozens of requests under
-/// the store lock — though the update the window runs right behind it
-/// resolves the same index and says the same verdict. The window's seed (`--wait-lock`)
-/// now makes no request at all. The typed seed still asks, and that is also what proves the
-/// observable: every request the network fetcher makes goes through the proxy this test
-/// listens as (`/usr/bin/curl` honours `https_proxy`), which counts the connection and
-/// drops it, so nothing leaves the machine.
+/// The window's seed (`--wait-lock`) makes no network request on an empty store
+/// with all vendor programs excluded, while a typed seed resolves the index
+/// through the local counting proxy.
 #[test]
 fn a_window_seed_asks_no_index_and_a_typed_one_does() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1035,19 +1023,13 @@ fn a_pending_stub_says_whether_a_person_asked() {
     );
 }
 
-/// A STUB THAT CANNOT READ THE OWNER'S START TIME STILL WAITS ON ITS LIVE PROMISE. An agent's
-/// tool call run in a sandbox that denies process-info (`EPERM` from `proc_pidinfo`, while
-/// `kill(pid, 0)` still answers) cannot tell the owner's start time; that says nothing about
-/// the owner, so the promise rides on its pid as it did before start times were recorded,
-/// and `targo` waits for trust and runs — never 127 "nothing is installing" while the window
-/// is about to install it.
+/// A stub run in a sandbox that denies `process-info-pidinfo` (`EPERM` from
+/// `proc_pidinfo`, while `kill(pid, 0)` still answers) falls back to checking
+/// the owner's pid and waits for `trust` to land.
 ///
-/// The profile denies `process-info-pidinfo`, the operation the start-time read is
-/// (`proc_pidinfo` on the owner: `EPERM`, `ESRCH` for a dead pid, `kill(pid, 0)` still
-/// answering), and nothing wider. `process-info*` also denies `process-info-setcontrol`, which
-/// std's runtime init uses on itself before `main` (`pthread_setname_np("main")` on Apple):
-/// a Trust std built with debug assertions aborts there (macOS 27.0.1, trust 450403669), so
-/// atpkg would die of SIGABRT before it read anything — not the case under test.
+/// The profile denies only `process-info-pidinfo`; denying `process-info*`
+/// would also deny `process-info-setcontrol` (`pthread_setname_np("main")` in
+/// runtime init before `main`).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandboxed_stub_that_cannot_read_the_owners_start_time_still_waits() {

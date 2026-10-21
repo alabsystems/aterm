@@ -1,21 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Security panel's *Move to Trash* for conflicting copies of aterm
-//! (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md`, "Security page").
+//! The Security panel's *Move to Trash* for conflicting copies of aterm.
 //!
-//! A copy that claims aterm's bundle id with a different code requirement
-//! resets the Full Disk Access grant for every copy whenever it asks
-//! (`aterm_containment::consent`, "The claimant census"). The panel offers to
-//! move such a copy to the Trash when the census reads it as offered
-//! (`consent::TrashOffer`); this is the worker behind that button.
+//! A copy that claims aterm's bundle id with a different code requirement resets the Full Disk
+//! Access grant for every copy whenever it asks (`aterm_containment::consent`, "The claimant
+//! census"). This is the worker behind the button the panel shows for a copy the census offers
+//! (`consent::TrashOffer`).
 //!
-//! Owner gesture only: an AppKit alert no control verb can answer confirms the
-//! press, and no verb, config key or automatic trigger starts it. Off the main
-//! thread it re-checks (a fresh census, the copy's identity right before the
-//! move, whether a process runs from it) and moves the copy with
-//! `/usr/bin/trash` ([`atpkg::copies::trash`], the move `aterm doctor`'s prune
-//! makes too), so it stays recoverable.
+//! Owner gesture only: an AppKit alert no control verb can answer confirms the press, and no
+//! verb, config key or automatic trigger starts it. Off the main thread it re-checks (a fresh
+//! census, the copy's identity right before the move, whether a process runs from it) and moves
+//! the copy with [`atpkg::copies::trash`], as `aterm doctor` does, so it stays recoverable.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -114,9 +110,8 @@ impl RetireState {
         }
     }
 
-    /// The worker's slot, locked. A guard-returning helper registered in the
-    /// lock-order census's `GUARD_HELPERS` (identity `shared`, the `Arc` the
-    /// worker thread locks by that name), so callers' holds are graphed.
+    /// The worker's slot, locked. Registered in the lock-order census's `GUARD_HELPERS`
+    /// (identity `shared`, the name the worker thread locks it by), so callers' holds are graphed.
     fn retire_slot(&self) -> std::sync::MutexGuard<'_, Slot> {
         self.shared.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -277,8 +272,7 @@ mod tests {
         assert!(!state.take_arrival(), "one arrival per report");
     }
 
-    /// The inert arms read nothing and move nothing: with no census, nothing is
-    /// offered, so the one planned copy is left in place.
+    /// With no census nothing is offered, so the inert arms leave the planned copy in place.
     #[test]
     fn the_inert_arms_move_nothing() {
         let state = RetireState::new(true);
@@ -311,9 +305,7 @@ mod tests {
         let _ = wait_for_report(&state);
     }
 
-    /// A windowed instance gets the real checks (census, identity re-read,
-    /// process-table walk, trash tool); a headless one gets inert arms that move
-    /// nothing.
+    /// A windowed instance gets the real checks; a headless one gets inert arms.
     #[test]
     fn the_live_arms_are_the_real_checks() {
         fn same(a: &RetireArms, b: &RetireArms) -> bool {

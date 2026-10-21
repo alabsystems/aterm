@@ -212,8 +212,6 @@ pub fn decode_strict(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
     decode_strict_with_table(input, &STANDARD_DECODE)
 }
 
-// ── Internal ────────────────────────────────────────────────────────────────
-
 /// The four alphabet symbols of the 24-bit group `n`, high sextet first.
 #[inline]
 fn sextets(n: u32) -> [u8; 4] {
@@ -391,8 +389,6 @@ fn decode_byte(table: &[u8; 256], byte: u8, pos: usize) -> Result<u8, DecodeErro
         Ok(val)
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

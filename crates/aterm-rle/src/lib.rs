@@ -93,10 +93,8 @@ pub struct RleCapacityError {
 
 impl fmt::Display for RleCapacityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Spelled as `write_str` + `Display::fmt` (byte-identical output to the
-        // equivalent `write!`): the `format_args!` expansion places an unsafe
-        // `fmt::Arguments` constructor call in THIS function's body, which the
-        // Trust verifier fails closed on as an unmodeled unsafe operation.
+        // Avoid `write!`/`format_args!`, which expands an unsafe `fmt::Arguments`
+        // call in this body that the Trust verifier rejects.
         f.write_str("RLE capacity exceeded: requested ")?;
         fmt::Display::fmt(&self.requested, f)?;
         f.write_str(" but only ")?;
@@ -352,13 +350,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 
     /// Create an RLE sequence with a single value repeated `length` times.
     #[must_use]
-    // clippy would rewrite the two lines below to `vec![...]`, but that is the
-    // one spelling we must avoid: `vec!` expands alloc's unsafe boxed-array
-    // construction (`Box::new_uninit`/`assume_init`) into THIS function's span,
-    // which the Trust lane (`ship trust run`) then has to prove here. The `with_capacity` +
-    // `push` form (same resulting Vec: len 1, cap 1) keeps that code inside
-    // `alloc`, scoped out as a Conditional dependency. The allow is for the
-    // clippy STYLE lint only — it suppresses no Trust verification obligation.
     #[allow(
         clippy::vec_init_then_push,
         reason = "vec! expands alloc unsafe into the Trust-verified span; with_capacity+push keeps it out"
@@ -375,17 +366,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         }
     }
 
-    /// Create an RLE sequence from an iterator of values.
-    ///
-    /// Prefer using `.collect::<Rle<T>>()` or `Rle::from_iter(...)` via the
-    /// standard `FromIterator` trait.
-    // Trust L0 note: the generic `IntoIterator::into_iter`/`Iterator::next`
-    // trait-method calls on the type parameter are a construct the Level-0
-    // verifier cannot model pre-monomorphization (reported unsupported =>
-    // one inconclusive obligation). No spelling of generic iteration avoids
-    // that call target (a `while let` + explicit `into_iter` restructure was
-    // tried and reported identically), so this is a documented coverage gap,
-    // not a refutation.
     fn from_iter_inner<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut rle = Self::new();
         for value in iter {
@@ -403,12 +383,8 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 
     #[inline]
     fn checked_run_length_sum(lhs: u32, rhs: u32) -> u32 {
-        // Run-length sums never exceed `u32::MAX`: every entry point clamps
-        // or rejects against `remaining_capacity`, and every internal sum is
-        // bounded by the `total_length == sum(run.length)` invariant (checked
-        // by tests/fuzz_rle.rs), so the saturation cannot fire. It is spelled
-        // as saturation, not a panic, because the verifier cannot carry the
-        // callers' invariant and would refute a reachable panic here.
+        // `saturating_add` discharges the overflow obligation for the verifier;
+        // `total_length <= u32::MAX` guarantees it never saturates.
         lhs.saturating_add(rhs)
     }
 
@@ -558,29 +534,21 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
             return;
         }
 
-        // Find start and end runs
         let Some((start_run_idx, start_offset)) = self.find_run(start) else {
             return;
         };
 
-        // The end-1 index gives us the last cell to modify. `end >= 1` here:
-        // the guard gives `end > start >= 0`, and the clamp keeps it `>= 1`
-        // because `total_length > start >= 0`. So the saturating_sub never
-        // actually saturates; it just discharges the underflow obligation the
-        // verifier cannot carry through the opaque `min` call.
+        // `end >= 1` because `total_length > start >= 0` and `end > start`;
+        // `saturating_sub` discharges the verifier's underflow obligation.
         let Some((end_run_idx, end_offset)) = self.find_run(end.saturating_sub(1)) else {
             return;
         };
 
-        // Simple case: same run
         if start_run_idx == end_run_idx {
             let run = &self.runs[start_run_idx];
             if run.value == value {
-                return; // Already the correct value
+                return;
             }
-            // `end_offset < runs[idx].length <= u32::MAX` by find_run's
-            // contract, so `+ 1` cannot overflow; saturating_add just
-            // discharges the obligation on the opaque call's result.
             self.split_range_single_run(
                 start_run_idx,
                 start_offset,
@@ -590,8 +558,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
             return;
         }
 
-        // Complex case: spans multiple runs
-        // (same `end_offset + 1` no-overflow reasoning as above)
         self.split_range_multi_run(
             start_run_idx,
             start_offset,
@@ -613,10 +579,8 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         }
 
         if new_length > self.total_length {
-            // Extend with default
             self.extend_with(T::default(), new_length - self.total_length);
         } else {
-            // Truncate
             self.truncate(new_length);
         }
     }
@@ -687,19 +651,9 @@ impl<T: Copy> Iterator for RleIter<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Single bounds-checked access (`get`) instead of a manual
-        // `run_idx >= len()` guard plus a slice index: identical
-        // None-when-exhausted behavior, but no local MIR bounds assert for
-        // the hardened-boundary verifier to refute (it cannot relate the two
-        // separate `self.runs` loads of the guard-then-index spelling).
         let run = *self.runs.get(self.run_idx)?;
         let value = run.value;
 
-        // `offset_in_run < run.length <= u32::MAX` between calls by
-        // construction (it is reset to 0 whenever it reaches the run length),
-        // and `run_idx < runs.len() <= isize::MAX` whenever it advances, so
-        // these saturating ops never actually saturate; they just discharge
-        // the overflow obligations on the symbolic iterator state.
         self.offset_in_run = self.offset_in_run.saturating_add(1);
         if self.offset_in_run >= run.length {
             self.run_idx = self.run_idx.saturating_add(1);
@@ -711,14 +665,7 @@ impl<T: Copy> Iterator for RleIter<'_, T> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let mut remaining = 0usize;
-        // `iter().skip(run_idx)` instead of slicing `runs[run_idx..]`:
-        // identical traversal, but no slice-construction obligation for the
-        // verifier to refute (it cannot see the `run_idx <= len` invariant
-        // across method boundaries).
         for run in self.runs.iter().skip(self.run_idx) {
-            // Total length is `<= u32::MAX` by invariant, so this saturating
-            // add never actually saturates; it just makes the no-overflow
-            // obligation provable.
             remaining = remaining.saturating_add(run.length as usize);
         }
         remaining = remaining.saturating_sub(self.offset_in_run as usize);

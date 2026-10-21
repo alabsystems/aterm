@@ -16,7 +16,9 @@
 //! The network links are read twice a second apart, and each link that
 //! counts toward the machine's traffic prints what it moved in that second;
 //! the process sweep prints the disk bytes of this example and of the shell
-//! that ran it, up its parent chain.
+//! that ran it, up its parent chain. The process counts are the machine's
+//! and this process's user's. `net_links_into` is timed with one buffer
+//! kept across its calls, as the probe thread keeps one.
 //!
 //! `--qos-check` (macOS) checks that the layout's logical ids are the CPU
 //! numbers the kernel runs threads on: threads at each QoS class spin for
@@ -67,6 +69,8 @@ fn main() {
     }
     println!("load         {:?}", aterm_sysprobe::load_average());
     println!("limits       {:?}", aterm_sysprobe::process_limits());
+    let uid = self_uid();
+    println!("pid_counts   {:?}", aterm_sysprobe::pid_counts(uid));
     links_check();
     disk_check();
 
@@ -93,6 +97,15 @@ fn main() {
         cost(calls, || aterm_sysprobe::volume(Path::new("/"))),
     );
     report("net_links", cost(calls, aterm_sysprobe::net_links));
+    let mut scratch = Vec::new();
+    report(
+        "net_links_into",
+        cost(calls, || aterm_sysprobe::net_links_into(&mut scratch)),
+    );
+    report(
+        "pid_counts",
+        cost(calls, || aterm_sysprobe::pid_counts(uid)),
+    );
     report(
         "process_limits",
         cost(calls, aterm_sysprobe::process_limits),
@@ -182,6 +195,19 @@ fn disk_check() {
         }
         pid = p.ppid;
     }
+}
+
+/// This process's real user id, whose processes `pid_counts` counts; 0
+/// where the platform has none.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn self_uid() -> u32 {
+    // SAFETY: `getuid` takes nothing and always succeeds.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn self_uid() -> u32 {
+    0
 }
 
 /// Every call's wall time, sorted.

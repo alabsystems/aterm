@@ -16,7 +16,7 @@ const RECORD: &[u8] = b"aterm init desktop activation pending v1\n";
 const DIRECTORY: &str = "Library/Application Support/aterm/init-activation";
 
 fn path(user: &User, family: &str) -> Result<PathBuf, String> {
-    if !Path::new(&user.home).is_absolute() || !matches!(family, "dock" | "widgets") {
+    if !Path::new(&user.home).is_absolute() || !matches!(family, "dock" | "widgets" | "desktop") {
         return Err("invalid local initialization activation scope".into());
     }
     Ok(Path::new(&user.home)
@@ -126,11 +126,19 @@ pub fn finish(sys: &dyn System, user: &User, family: &str) -> Result<(), String>
 /// An incomplete process census, failed relaunch, interrupted wait or surviving
 /// old consumer. The caller must retain the marker on every error.
 pub fn activate(sys: &dyn System, user: &User, family: &str) -> Result<(), String> {
-    let process = match family {
-        "dock" => "Dock",
-        "widgets" => "NotificationCenter",
+    let processes: &[&str] = match family {
+        "dock" => &["Dock"],
+        "widgets" => &["NotificationCenter"],
+        "desktop" => &["Dock", "Finder"],
         _ => return Err("invalid desktop activation family".into()),
     };
+    for process in processes {
+        activate_process(sys, user, process)?;
+    }
+    Ok(())
+}
+
+fn activate_process(sys: &dyn System, user: &User, process: &str) -> Result<(), String> {
     let census = Cmd::new("/usr/bin/pgrep")
         .args(["-u", &user.uid.to_string(), "-x", process])
         .as_user(user);

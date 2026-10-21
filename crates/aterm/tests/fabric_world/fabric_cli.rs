@@ -1190,6 +1190,7 @@ fn refusing_broker(sock: &str) {
                             head: 7,
                             resume: String::new(),
                             durable: None,
+                            oldest: None,
                         },
                         _ => Response::Error {
                             code: 5,

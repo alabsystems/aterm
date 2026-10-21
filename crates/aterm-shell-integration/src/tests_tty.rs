@@ -6,15 +6,12 @@
 // `include!`d into lib.rs's `#[cfg(test)] mod tests` after tests_loader.rs, whose
 // helpers (`LiveShell`, `LiveFixture`, `shell_command`, `stdout_between`) it uses.
 //
-// THE INCIDENT. A raw-mode program that dies without restoring the tty — Claude
-// Code SIGKILLed while it held the terminal (measured on a real Claude Code
-// 2.1.283 in a headless aterm, 2026-09-26), or any `tty.setraw` script that exits
-// on an error — left the integrated zsh running every later command under
-// `-isig -iexten -icrnl -ixon -opost`: Ctrl-C arrived as a literal ^C and
-// interrupted nothing, and Enter sent a bare CR that ended no line (`read x`
-// returned `hello\r`, and only on Ctrl-J). bash puts the tty back after a job that
-// dies by a SIGNAL, but adopts it after one that EXITS, so an `exit 1` broke it
-// the same way. The scripts' "tty settings" blocks carry the whole story.
+// A raw-mode program that dies without restoring the tty (an agent SIGKILLed while it held
+// the terminal, a `tty.setraw` script exiting on an error) must not leave the shell running
+// every later command under `-isig -iexten -icrnl -ixon -opost`, where Ctrl-C is a literal
+// ^C and Enter a bare CR that ends no line. bash restores the tty after a job that dies by
+// a signal but adopts it after one that exits, so an `exit 1` breaks it too. The scripts'
+// "tty settings" blocks say how they repair it.
 //
 // These tests drive REAL shells on a REAL pty (`script`, like the fish lanes),
 // started the way aterm starts a tab — the ZDOTDIR wrapper for zsh, the
@@ -36,8 +33,8 @@
 #[cfg(unix)]
 const UNFIXED_REV: &str = "00000000000000aa";
 
-/// The call sites that arm the fix, per script. Cutting exactly these yields the
-/// script as it was before 2026-09-26 in everything that matters here.
+/// The call sites that arm the fix, per script. Cutting exactly these yields the unfixed
+/// script in everything that matters here.
 #[cfg(unix)]
 const ZSH_TTY_CALLS: [&str; 2] = [
     "    (( __aterm_tty_armed )) || __aterm_tty_arm\n",
@@ -83,7 +80,7 @@ impl RawEnd {
 }
 
 /// The tty flags a raw mode clears, as `isig=on icrnl=off …`, read by a child
-/// `stty -a` (the tty as the NEXT command sees it).
+/// `stty -a` (the tty as the next command sees it).
 #[cfg(unix)]
 const FLAGS_LINE: &str = "__s=\" $(command stty -a | tr '\\n' ' ') \"; for __f in isig icanon iexten icrnl opost ixon; do case \"$__s\" in *\" -$__f \"*) printf '%s=off ' \"$__f\";; *) printf '%s=on ' \"$__f\";; esac; done; echo FLAGS$((40+2))";
 
@@ -452,7 +449,7 @@ fn an_integrated_zsh_keeps_its_tty_when_a_raw_program_dies() {
     std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
     let ours = install_script_set(&fx.base).expect("install");
 
-    // The control: the unfixed scripts reproduce the owner's tab.
+    // The control: the unfixed scripts reproduce the defect.
     let unfixed = unfixed_folder(&fx.base);
     let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, &unfixed, &[]);
     sh.kill_raw_child(RawEnd::Sigkill);
@@ -647,7 +644,7 @@ fn an_integrated_zsh_with_its_own_stty_is_repaired_not_frozen() {
     }
     sh.finish();
 
-    // An ALIAS for one of the three names rules it out the same way.
+    // An alias for one of the three names rules it out the same way.
     std::fs::write(fx.home.join(".zshrc"), "alias reset='command reset'\n").expect(".zshrc");
     let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, &ours, &[]);
     assert!(
@@ -661,12 +658,11 @@ fn an_integrated_zsh_with_its_own_stty_is_repaired_not_frozen() {
     sh.finish();
 }
 
-/// A zsh that was ALREADY RUNNING — and already broken — when the fix shipped
-/// gets it through the loader channel: started from the unfixed scripts, a
-/// SIGKILLed raw child breaks it (the in-test negative control); the host then
-/// points it at this build's folder, and at its next prompt the new body both
-/// REPAIRS the tty it had adopted and freezes it — so the next command, and the
-/// next raw child's death, leave Ctrl-C and Enter working.
+/// A running zsh with a broken tty, from the unfixed scripts, gets the fix through the
+/// loader channel: a SIGKILLed raw child breaks it (the negative control); the host points
+/// it at this build's folder, and at its next prompt the new body repairs the tty it had
+/// adopted and freezes it, so the next command and the next raw child's death leave Ctrl-C
+/// and Enter working.
 #[cfg(unix)]
 #[test]
 fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers() {
@@ -734,7 +730,7 @@ fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
     sh.finish();
 
     let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &ours, &[]);
-    // bash's own restore after a SIGNAL death puts IXON back too; the repair
+    // bash's own restore after a signal death puts IXON back too; the repair
     // after an `exit 1` cannot tell a raw mode's IXON-off from the user's and
     // leaves it off (which bash then keeps, as the state it saved).
     for (end, ixon) in [
@@ -752,17 +748,12 @@ fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
     sh.finish();
 }
 
-/// A user whose rc sets `setopt err_return`: the
-/// thawing wrapper ran under the USER's options, so a failing wrapped command —
-/// `stty bogusflag`, a typo — returned from `__aterm_tty_thaw_run` before its
-/// `ttyctl -f`. The shell stayed THAWED for good while `__aterm_tty_frozen` still
-/// said 1, which also switches the fallback repair off: measured in a pty, a raw
-/// child's `exit 1` then left `isig=off iexten=off icrnl=off opost=off ixon=off`
-/// and Ctrl-C into `sleep 3` took 3.03–4.04 s — the original defect, in full. The
-/// wrapper now opens with `emulate -L zsh` and re-freezes in an `always` block.
-/// The failing command's status must still reach the prompt (`133;D;1`), the
-/// shell must report its tty frozen, and a raw child dying by `exit 1` AND by
-/// `exit 0` (which no fallback repair catches) must leave the next command sane.
+/// Under `setopt err_return`, a failing wrapped command (`stty bogusflag`) must not return
+/// from `__aterm_tty_thaw_run` before its `ttyctl -f`, which would leave the shell thawed
+/// while `__aterm_tty_frozen` says 1 (switching the fallback repair off too). The wrapper
+/// opens with `emulate -L zsh` and re-freezes in an `always` block. The failing status
+/// still reaches the prompt (`133;D;1`), the tty reports frozen, and a raw child dying by
+/// `exit 1` and by `exit 0` (which no fallback repair catches) leaves the next command sane.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_with_err_return_stays_frozen_after_a_failing_stty() {
@@ -834,14 +825,14 @@ fn an_integrated_zsh_refreezes_when_a_thawed_command_is_interrupted() {
 
 // ─── 133;B whatever the rc does to zle-line-init ───
 
-/// The folder of the body from BEFORE the lead (16 lowercase hex no build
-/// writes): what a rollback, or an older build adopting the shell, points it at.
+/// The folder of a body from before the lead (`__aterm_line_init_lead`, which puts 133;B in
+/// front of whatever holds zle-line-init; 16 lowercase hex no build writes): what a rollback,
+/// or an older build adopting the shell, points it at.
 #[cfg(unix)]
 const BEFORE_LEAD_REV: &str = "00000000000000bb";
 
-/// That body's zle-line-init, as main had it until 2026-10-01, defined last in
-/// this build's body: no per-prompt re-assertion, and the loader's widget marks
-/// every line it is reached on.
+/// That body's zle-line-init, defined last in this build's body: no per-prompt
+/// re-assertion, and the loader's widget marks every line it is reached on.
 #[cfg(unix)]
 const BEFORE_LEAD_ZSH: &str = "\
 __aterm_line_init_wire() { :; }
@@ -851,71 +842,44 @@ __aterm_zle_line_init() {
 }
 ";
 
-/// Every prompt of an integrated zsh carries ONE 133;B, whatever its ~/.zshrc
-/// does to zle-line-init after the loader wired it, and every widget the rc put
-/// there still runs once per line — through a body switch to the build before
-/// (a rollback) and back. The rc runs AFTER the loader (zsh reads it from the
-/// ZDOTDIR .zshenv), so:
+/// Every prompt of an integrated zsh carries one 133;B whatever its ~/.zshrc does to
+/// zle-line-init after the loader wired it (the engine takes C only after a B, so a prompt
+/// without one keeps no block or exit code), and every widget the rc put there still runs
+/// once per line, through a body switch to the build before (a rollback) and back. The rc
+/// runs after the loader (zsh reads it from the ZDOTDIR .zshenv). The rcs:
 ///
-/// - one that REPLACES zle-line-init (oh-my-zsh's `echoti smkx` widget, vi-mode
-///   cursor snippets) left no prompt a 133;B — and the engine, which takes C only
-///   after a B, kept no block and no exit code for any command. Here it is also
-///   WRAPPED again by a precmd hook at the first prompt (powerlevel10k does that
-///   over oh-my-zsh), and the wrapper must still run the replacing widget, which
-///   reads in `$?` the status of the command before the line, as in bare zsh
-///   (behind the lead it read 0: the lead's own commands ran first);
-/// - one that WRAPS it (powerlevel10k alone, add-zle-hook-widget) already chained
-///   the loader's widget: the line must not be marked twice, nor loop. After a
-///   switch to the build before, that build's widget marks the line once more
-///   where the chain reaches it (the engine ignores a B outside a prompt) — and
-///   never loops, which re-pointing the loader's alias did (measured: ~250 marks
-///   and FUNCNEST errors at every prompt);
-/// - one that wraps it AGAIN at every prompt, from a precmd hook, whenever its
-///   wrapper no longer holds the front: a lead that took the front back at every
-///   precmd was wrapped each time, and the wrapper must still run once;
-/// - one that HOOKS it with add-zle-hook-widget, at load and again from a precmd
-///   hook: the dispatcher stops at the first hook that fails, and the loader's
-///   widget is that first hook (the build before returned 1 there, so the user's
-///   hooks never ran — nor do they after a switch to it), and the line carries
-///   one 133;B however often the hook is added;
-/// - one that wraps it again whenever its wrapper lost the front, under a NEW
-///   name each time (zsh-autosuggestions does, once `zle-*` is out of its ignore
-///   list): a lead that took the front back at every precmd was wrapped again at
-///   every prompt, and each line ran every wrapper so far — until FUNCNEST
-///   stopped the line (measured: from prompt 139 on);
-/// - one that READS the table to choose: at its first precmd, wrapping a widget
-///   listed under another function's name and replacing one listed under its own
-///   (zsh-vi-mode), and while it expands its first prompt, wrapping whatever
-///   holds zle-line-init (powerlevel10k). A lead found in front by the first made
-///   it wrap where bare zsh replaces, so the replaced widget kept running
-///   (oh-my-zsh's `echoti smkx`: the cursor-key and keypad modes stayed set
-///   while every command ran); the widget it replaces runs NEVER, as in bare zsh;
-/// - one that registers through add-zle-hook-widget where the dispatcher holds
-///   the front and wraps otherwise (powerlevel10k, again while it expands its
-///   first prompt), over a dispatcher, with a hook added from a later precmd: a
-///   lead in front of the dispatcher made it wrap, and that later hook made the
-///   dispatcher call the wrapper that calls the dispatcher;
-/// - one whose zle-line-init returns non-zero, which a user's ZERR trap sees
-///   once, from that widget, as in bare zsh;
-/// - one whose precmd hook fails with an error, after which zsh runs no due
-///   `sched` event until zle reads the line.
+/// - one that replaces zle-line-init (oh-my-zsh's `echoti smkx` widget), then wraps it
+///   again from a precmd hook at the first prompt (powerlevel10k over oh-my-zsh): the
+///   replacing widget still runs and reads in `$?` the status of the command before the
+///   line, as in bare zsh;
+/// - one that wraps it (powerlevel10k alone): the line is marked once and never loops;
+/// - one that wraps it again from a precmd hook whenever its wrapper lost the front: the
+///   wrapper runs once;
+/// - one that hooks it with add-zle-hook-widget, at load and from a precmd hook: the
+///   dispatcher stops at the first hook that fails, and the loader's widget is that first
+///   hook, so it succeeds (the build before's returns 1, so after a switch to it the user's
+///   hooks do not run); one 133;B however often the hook is added;
+/// - one that wraps it under a new name each time it lost the front (zsh-autosuggestions):
+///   each line runs one wrapper, not every wrapper so far;
+/// - one that reads the widget table to choose between wrapping and replacing (zsh-vi-mode
+///   at its first precmd, powerlevel10k while it expands its first prompt): the widget it
+///   replaces never runs, as in bare zsh;
+/// - one that registers through add-zle-hook-widget where the dispatcher leads and wraps
+///   otherwise, with a hook added from a later precmd: no dispatcher-wrapper loop;
+/// - one whose zle-line-init returns non-zero, which a user's ZERR trap sees once, from
+///   that widget;
+/// - one whose precmd hook fails with an error, after which zsh runs no due `sched` event
+///   until zle reads the line.
 ///
-/// Every rc also sets PRINT_EXIT_VALUE, and the lines' statuses cycle through 3, 1
-/// and 0: zsh reports a failed command's status once, below the command. The
-/// event that hands a status of 2 or more back reported it again, above the next
-/// prompt. And every rc sets WARN_NESTED_VAR and WARN_CREATE_GLOBAL, which a
-/// function of aterm's that runs with the user's options (the precmd, the
-/// preexec, the widgets) must give nothing to warn about, and a ZERR trap, which
-/// fires for the failed command as in bare zsh and never inside aterm's precmd.
-/// And every rc sets VERBOSE, which echoes the text of a scheduled event before
-/// it runs, and every line of a file sourced — the body, at a switch: aterm's
-/// own code (`__aterm…`) never reaches the user's screen, and each typed line is
-/// still echoed once, as in bare zsh.
+/// Every rc also sets PRINT_EXIT_VALUE (a failed command's status is reported once, below
+/// the command), WARN_NESTED_VAR and WARN_CREATE_GLOBAL (aterm's functions that run with
+/// the user's options give nothing to warn about), a ZERR trap (fires for the failed
+/// command, never inside aterm's precmd) and VERBOSE (aterm's own code never reaches the
+/// screen; each typed line is echoed once).
 ///
-/// After a switch to the build before, a line is marked where that build's
-/// widget is reached, and no more often than twice. The build before is also the
-/// negative control: from its folder, the replacing rc's prompts carry no
-/// 133;B.
+/// After a switch to the build before, a line is marked where that build's widget is
+/// reached, at most twice (the engine ignores a B outside a prompt). The build before is
+/// also the negative control: from its folder, the replacing rc's prompts carry no 133;B.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() {
@@ -1060,10 +1024,8 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
             .collect()
     };
 
-    // Every rc also reports the status of a command that fails, as zsh's own
-    // PRINT_EXIT_VALUE does: once, below that command; warns at a function that
-    // sets a global by a plain assignment; echoes what it runs (VERBOSE); and
-    // traps ZERR, naming the function the failed command ran in.
+    // The options and ZERR trap every rc runs under; the trap names the function the
+    // failed command ran in.
     let rc_file = |rc: &str| {
         std::fs::write(
             fx.home.join(".zshrc"),
@@ -1237,14 +1199,12 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
     }
 }
 
-/// A user's XTRACE traces the user's commands, not aterm's, and never the
-/// capability nonce. Bare zsh traces nothing between two commands; aterm's load,
-/// precmd, preexec and scheduled event traced every line they ran — 80 to 660
-/// per command — and the nonce in them at every mark, into the screen and the
-/// scrollback. XTRACE comes from `.zshenv` here, so the load runs under it too,
-/// and the rc replaces zle-line-init (oh-my-zsh's shape), so the event runs: its
-/// own line, which zsh prints before it runs, is all of aterm's that is left —
-/// `stty`'s wrapper included, as bare zsh traces only the line that ran it.
+/// A user's XTRACE traces the user's commands, not aterm's, and never the capability
+/// nonce (bare zsh traces nothing between two commands). XTRACE comes from `.zshenv` here,
+/// so the load runs under it too, and the rc replaces zle-line-init (oh-my-zsh's shape), so
+/// the scheduled event runs: its own line, which zsh prints before it runs, is all of
+/// aterm's that is left, `stty`'s wrapper included, as bare zsh traces only the line that
+/// ran it.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_under_xtrace_traces_the_users_commands_and_not_aterms() {
@@ -1282,7 +1242,7 @@ fn an_integrated_zsh_under_xtrace_traces_the_users_commands_and_not_aterms() {
         "zsh: the capability nonce reached the trace\n{text}"
     );
     // The event's own line names `__aterm_line_init_late` at the top level
-    // (`+zsh:<n>> …`); a line traced INSIDE a function of aterm's carries its
+    // (`+zsh:<n>> …`); a line traced inside a function of aterm's carries its
     // name as PS4's `%N` (`+__aterm_…:<n>> …`), that function's included.
     for line in text.lines().filter(|line| line.contains("__aterm")) {
         assert!(
@@ -1309,14 +1269,11 @@ fn cut_osc(raw: &str) -> String {
     text
 }
 
-/// bash's twin of the test above: a user's XTRACE traces the user's commands
-/// and their PROMPT_COMMAND, not aterm's, and never the capability nonce. Bare
-/// bash traces one line per command here; aterm's DEBUG-trap preexec and
-/// PROMPT_COMMAND traced about 165, the nonce about 18 times among them (bash
-/// 3.2.57 and 5.2.37). XTRACE comes from `.bashrc`, so the load runs under it
-/// too, and PS4 names the function a line runs in: what is left of aterm's is
-/// bash's own trace of the two hooks' calls, at the top level, and the user's
-/// PROMPT_COMMAND, which aterm's prompt handler runs.
+/// bash's twin of the test above: a user's XTRACE traces the user's commands and their
+/// PROMPT_COMMAND, not aterm's, and never the capability nonce. XTRACE comes from
+/// `.bashrc`, so the load runs under it too, and PS4 names the function a line runs in:
+/// what is left of aterm's is bash's own trace of the two hooks' calls, at the top level,
+/// and the user's PROMPT_COMMAND, which aterm's prompt handler runs.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
@@ -1379,21 +1336,15 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
     sh.finish();
 }
 
-/// A user's ERR trap, `set -e` and `set -o functrace` meet the commands bare
-/// bash shows them. aterm's PROMPT_COMMAND returned the command's status and
-/// ran a `( exit <status> )` before the user's own PROMPT_COMMAND — failed
-/// commands both — so the ERR trap fired again at the prompt after every
-/// failure, and `set -e` closed the shell at the prompt after a failure bash
-/// itself lets pass (`false && true`; on bash 5 so did a missing atpkg hook's
-/// failed open). In a tab with atpkg's agents/ it still did, at the prompt
-/// after any command that hashed a name (`hash -d claude codex agy muse` fails
-/// for a name not hashed) and after atpkg wrote its hook (the reroute
-/// derivation says no). Under functrace the DEBUG trap fired inside aterm's own
-/// prompt functions: every prompt reported one of their lines as the user's
-/// command, and the command typed at it got no 633;E — and without functrace a
-/// function wrapping the trap (starship's layering on bash < 4.4) is no
-/// function the trap fired in: the commands typed after it are reported. The
-/// user's PROMPT_COMMAND still reads the command's `$?`.
+/// A user's ERR trap, `set -e` and `set -o functrace` meet the commands bare bash shows
+/// them. aterm's PROMPT_COMMAND runs no failing command of its own (a returned status, a
+/// `( exit <status> )`, a `hash -d` of a name not hashed, a reroute derivation that says
+/// no, a missing atpkg hook's open): each would fire the ERR trap again at the prompt, or
+/// close a `set -e` shell after a failure bash lets pass (`false && true`). Under
+/// functrace the DEBUG trap does not fire inside aterm's prompt functions (it would report
+/// one of their lines as the user's command and drop the typed command's 633;E); without
+/// functrace, a function wrapping the trap (starship's layering on bash < 4.4) still
+/// reports the commands typed after it. The user's PROMPT_COMMAND still reads `$?`.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bash_does() {
@@ -1486,7 +1437,10 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
 /// CONTROL: the same scripts with the wrapper's hand-over cut, where the
 /// integration's own `trap -p DEBUG` inside the `.` sees no trap: bash 3.2
 /// puts the rc's trap back over aterm's when the `.` returns (no mark), bash
-/// 4.4 and later keep aterm's and drop the rc's (no output) — never both.
+/// 4.4 and later keep aterm's and drop the rc's (no output) — never both. The
+/// line is one bash does not save (ignorespace), which only the DEBUG trap
+/// marks: bash 5.3's PS0 marks a saved line whatever the trap, so a saved line
+/// showed nothing of a chained trap that stopped marking.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
@@ -1495,7 +1449,8 @@ fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
     let fx = LiveFixture::new();
     std::fs::write(
         fx.home.join(".bashrc"),
-        "trap '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n",
+        "HISTCONTROL=ignorespace\n\
+         trap '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n",
     )
     .expect(".bashrc");
     let ours = install_script_set(&fx.base).expect("install");
@@ -1528,7 +1483,7 @@ fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
         };
         let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
         let from = sh.len();
-        sh.send_bytes(b"echo typed$((6*7))\r");
+        sh.send_bytes(b" echo typed$((6*7))\r");
         let ran = sh.wait_for_after("typed42", from);
         let done = sh.wait_for_after("\x1b]133;A", ran);
         let text = stdout_between(&sh, from, done);
@@ -1570,7 +1525,9 @@ const BASH_HANDOVER_GUARD: &str = "if [ -z \"${ATERM_SHELL_INTEGRATION_INSTALLED
 /// the wrapper's own load is then an upgrade in place that wires nothing, so
 /// the wrapper hands nothing over. NEGATIVE CONTROL: the hand-over unguarded,
 /// as 195c01197d wrote it, clears the trap the rc's load set, and the typed
-/// command goes unmarked.
+/// command goes unmarked. The line is one bash does not save (ignorespace),
+/// which only the DEBUG trap marks: bash 5.3's PS0 marks a saved line whatever
+/// the trap, so a saved line showed the control nothing there.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
@@ -1579,7 +1536,8 @@ fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
     let fx = LiveFixture::new();
     std::fs::write(
         fx.home.join(".bashrc"),
-        ". \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n",
+        "HISTCONTROL=ignorespace\n\
+         . \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n",
     )
     .expect(".bashrc");
     let ours = install_script_set(&fx.base).expect("install");
@@ -1613,7 +1571,7 @@ fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
         };
         let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
         let from = sh.len();
-        sh.send_bytes(b"echo typed$((6*7))\r");
+        sh.send_bytes(b" echo typed$((6*7))\r");
         let ran = sh.wait_for_after("typed42", from);
         let done = sh.wait_for_after("\x1b]133;A", ran);
         let marked = stdout_between(&sh, from, done).contains("\x1b]133;C");
@@ -1854,7 +1812,10 @@ fn an_integrated_bash_keeps_the_users_last_argument() {
 /// both on the file (the marks then take /dev/tty: `script` gives the shell a
 /// controlling terminal), and stdout moved for the shell itself (`exec >f`),
 /// which put every mark of every prompt in the file. This build's script with
-/// the writer's terminal test cut is the negative control.
+/// the writer's terminal test cut is the negative control. On bash 5.3+ PS0
+/// starts a line bash saved before the compound's redirections apply, and the
+/// DEBUG trap starts only a line bash did not save (ignorespace): the control
+/// types those, and this build's script both.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
@@ -1880,7 +1841,11 @@ fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
         ("{ echo both; } > out-both 2>&1", "out-both", "both\n"),
     ];
     let fx = LiveFixture::new();
-    std::fs::write(fx.home.join(".bashrc"), "cd \"$HOME\"\n").expect(".bashrc");
+    std::fs::write(
+        fx.home.join(".bashrc"),
+        "HISTCONTROL=ignorespace\ncd \"$HOME\"\n",
+    )
+    .expect(".bashrc");
     let nonce = [("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")];
     let read = |file: &str| {
         let path = fx.home.join(file);
@@ -1903,10 +1868,10 @@ fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
     );
     let mut sh = spawn_pty_shell(ShellType::Bash, bash_shell(), &fx, &unfixed, &nonce);
     for (line, file, _) in compounds {
-        sh.run_line(line, "0");
+        sh.run_line(&format!(" {line}"), "0");
         assert!(
             read(file).contains("\x1b]133;C"),
-            "unfixed: `{line}` should show the defect, its marks in {file}: {:?}\n{}",
+            "unfixed: ` {line}` should show the defect, its marks in {file}: {:?}\n{}",
             read(file),
             sh.transcript()
         );
@@ -1940,6 +1905,14 @@ fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
         }
     };
     for (line, file, want) in compounds {
+        let from = sh.len();
+        let end = sh.run_line(&format!(" {line}"), "0");
+        assert_eq!(read(file), want, "bash: ` {line}` wrote into {file}");
+        assert!(
+            stdout_between(&sh, from, end).contains(&format!("\x1b]133;C;id={REKEY_OLD}\x07")),
+            "bash: ` {line}`: its 133;C did not reach the terminal\n{}",
+            sh.transcript()
+        );
         block(&mut sh, line);
         assert_eq!(read(file), want, "bash: `{line}` wrote into {file}");
     }

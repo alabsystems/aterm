@@ -1,63 +1,40 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-// Owner-only POSIX tool (0600 secret-key files; its sole consumer, atpkg, is
-// itself unix-gated): the crate compiles empty on Windows and the binary
-// prints an honest "unsupported" stub instead.
+// Owner-only POSIX tool (0600 key files; its consumer atpkg is unix-gated too): the crate
+// compiles empty on Windows and the binary prints an "unsupported" stub.
 #![cfg(unix)]
 
-//! Owner-side Ed25519 signing for atpkg manifests (§8/§12) — the producer half of the
-//! signature contract whose verifier is `atpkg::sig`.
+//! Owner-side Ed25519 signing for atpkg manifests: the producer half of the signature
+//! contract whose verifier is `atpkg::sig`.
 //!
-//! The atpkg client is **verify-only** (`ring` with `default-features = false`, no RNG/
-//! alloc). The owner must *generate* the paper master and the per-machine keys (`setup` /
-//! `join`) and *sign* `index.toml` / `pkg-*.toml` with the machine key over their **exact
-//! raw bytes**. That needs the full `ring` crate, so it lives in this owner-only tool,
-//! never shipped to clients.
+//! The atpkg client is verify-only (`ring` without default features, so no RNG). Generating
+//! the paper master and machine keys and signing `index.toml` / `pkg-*.toml` needs the full
+//! `ring` crate, so it lives in this owner-only tool, never shipped to clients. The signed
+//! unit is the exact asset bytes (no canonicalization), checked by `aterm_update_core::roster`,
+//! the same verifier the app updater runs.
 //!
-//! The unit signed is the exact asset bytes (no canonicalization), so a detached signature
-//! here is byte-for-byte what the client checks: `atpkg::sig::TrustedRoster::authorize_bytes`
-//! (and `TrustedIndex::verify_pkg`, which calls it), delegating to
-//! `aterm_update_core::roster` — the same verifier the app updater runs. A test verifies
-//! this tool's output with that actual verifier, pinning the contract.
-//!
-//! # The paper master and the machine roster
-//!
-//! This tool is also where the owner's **paper master** lives operationally. [`master`]
-//! generates the 52 base32 characters that go on paper, reads them back from a
-//! no-echo `/dev/tty` prompt with a public fingerprint the owner can eyeball, and derives
-//! the master identity — without ever writing the secret anywhere. [`roster_ops`] holds
-//! the three edits the master authorizes (add a machine, revoke a machine, start a fresh
-//! roster) as pure functions over the shared `aterm_update_core::roster::Roster` type the
-//! updater client parses, so producer and client cannot disagree about what a valid
-//! roster is. See `docs/RELEASE-KEYS.md` for the decision and the runbook.
-//!
-//! # Provisioning: the human's only step is writing the phrase on paper
-//!
-//! [`provision`] is the engine behind the two verbs that arm the release channel with no
-//! hand-transcription — `atpkg-keys setup` on the first machine and
-//! `atpkg-keys join` on every later one. It derives the master's public identity, mints
-//! the machine keypair, edits the roster and, through [`pins_edit`], WRITES the two public
-//! keys into `aterm_update_core::pins` itself, so no one ever copies 44 base64 characters
-//! into the file that decides what the fleet trusts. It stops short of `git commit` on
-//! purpose: arming a trust anchor is a reviewed act.
+//! [`master`] handles the paper master: 52 base32 characters, read back from a no-echo
+//! `/dev/tty` and never written anywhere. [`roster_ops`] holds the roster edits as pure
+//! functions over the shared `Roster` type the updater parses, so producer and client cannot
+//! disagree on a valid roster. [`provision`] is the engine behind `setup` (first machine) and
+//! `join` (each later one): through [`pins_edit`] it writes the public keys into
+//! `aterm_update_core::pins` itself, and stops short of `git commit`, since arming a trust
+//! anchor is a reviewed act. See `docs/RELEASE-KEYS.md`.
 
 pub mod fsio;
 pub mod master;
 pub mod pins_edit;
 pub mod provision;
 pub mod roster_ops;
-/// Unit-test scratch directories, removed when the test ends however it ends.
 #[cfg(test)]
 mod testdir;
 
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
-/// Generate a fresh Ed25519 keypair: returns `(pkcs8 private-key bytes, base64 raw
-/// 32-byte public key)`. The pkcs8 bytes are the **secret** — write them `0600` and keep
-/// them offline. The base64 public key is what goes into the committed paper-master
-/// anchor, or a roster-named machine key.
+/// Generate a fresh Ed25519 keypair: `(pkcs8 private-key bytes, base64 raw 32-byte public
+/// key)`. The pkcs8 bytes are the secret: write them `0600` and keep them offline.
 pub fn generate() -> Result<(Vec<u8>, String), String> {
     let rng = SystemRandom::new();
     let pkcs8 =
@@ -66,16 +43,15 @@ pub fn generate() -> Result<(Vec<u8>, String), String> {
     Ok((pkcs8.as_ref().to_vec(), pub_b64))
 }
 
-/// The base64 raw public key for a pkcs8 private key (so the owner can recover the
-/// publishable pubkey from a stored key file without re-generating).
+/// The base64 raw public key of a pkcs8 private key.
 pub fn pubkey_b64(pkcs8: &[u8]) -> Result<String, String> {
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|_| "invalid pkcs8 key".to_string())?;
     aterm_codec::base64::encode(kp.public_key().as_ref())
         .map_err(|_| "public key too large to encode".to_string())
 }
 
-/// Detached-sign `msg`'s exact bytes with the pkcs8 key → the 64-byte Ed25519 signature
-/// the client verifies. `msg` must be the exact raw manifest asset bytes.
+/// Detached-sign `msg`'s exact bytes (the raw manifest asset) with the pkcs8 key, giving the
+/// 64-byte Ed25519 signature the client verifies.
 pub fn sign(pkcs8: &[u8], msg: &[u8]) -> Result<Vec<u8>, String> {
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|_| "invalid pkcs8 key".to_string())?;
     Ok(kp.sign(msg).as_ref().to_vec())
@@ -91,16 +67,13 @@ pub struct Signed {
 }
 
 /// Verify a detached Ed25519 signature over `file`'s exact bytes by a machine the
-/// master-signed roster authorizes — the client's own rule for an appcast
-/// (`aterm_update_core::roster`): the roster verifies under one of `master_pubkeys`, parses,
-/// is fresh at `now_unix`, and one of its LIVE machines (listed, not revoked, not expired)
-/// signed the file.
+/// master-signed roster authorizes, by the client's own appcast rule: the roster verifies
+/// under one of `master_pubkeys`, parses, is fresh at `now_unix`, and one of its live machines
+/// (listed, not revoked, not expired) signed the file.
 ///
-/// The ALab lane (`atpkg-publish lane run alab`) runs this over an ALab source release's
-/// `SHA256SUMS` before it builds that source, against the roster the channel's verified
-/// index ships — so a release signed by no rostered machine, or by one revoked since, is
-/// never built beside the machine key. The refusal is the verifier's own reason, never an
-/// oracle about which key was close.
+/// The ALab lane (`atpkg-publish lane run alab`) runs this over a source release's
+/// `SHA256SUMS` before building it, so a release signed by no rostered machine, or by one
+/// since revoked, is never built.
 ///
 /// # Errors
 ///
@@ -128,8 +101,7 @@ pub fn verify_signed(
 mod tests {
     use super::*;
 
-    /// A master-signed one-machine roster (plus an optional revoked id and a validity
-    /// deadline), minted in memory with keys this tool generates.
+    /// A master-signed one-machine roster, with optional revoked ids and a deadline.
     fn signed_roster(
         master: &[u8],
         machine_pub: &str,
@@ -157,8 +129,7 @@ mod tests {
         (bytes, sig)
     }
 
-    // `verify-signed`: the release-side twin of the client's appcast rule. The positive
-    // case names the machine; every negative control is one link of the chain broken.
+    // Each negative control breaks one link of the chain.
     #[test]
     fn verify_signed_accepts_a_rostered_signature_and_nothing_else() {
         use aterm_update_core::roster::RosterReject;
@@ -220,12 +191,9 @@ mod tests {
         );
     }
 
-    // THE contract: a signature produced here is accepted by the actual client verifier
-    // over the exact bytes, and a 1-byte tamper is rejected.
-    //
-    // The verifier is `aterm_update_core::roster` — the one atpkg's index chain and the
-    // app updater both run. The full owner→client chain, through `atpkg::flow::install`
-    // and a real archive, is `tests/owner_to_client.rs`.
+    // The contract: the client verifier (`aterm_update_core::roster`) accepts this tool's
+    // signature over the exact bytes and rejects a 1-byte tamper. The full owner→client chain
+    // through `atpkg::flow::install` is `tests/owner_to_client.rs`.
     #[test]
     fn produces_signatures_the_client_verifier_accepts() {
         use aterm_update_core::roster::{Machine, Roster, RosterReject};
@@ -233,9 +201,8 @@ mod tests {
         let (key, pub_b64) = generate().unwrap();
         let manifest = b"schema = 2\nindex_build = 7\nvalid_until = \"2099-01-01T00:00:00Z\"\n";
         let sig = sign(&key, manifest).unwrap();
-        // A one-machine roster naming the key this tool just minted. Building it here (in
-        // memory) keeps this a unit test of the SIGNATURE; the master-signature half is
-        // proved wherever a roster is published.
+        // An in-memory roster keeps this a test of the signature; the master-signature half
+        // is `verify_signed_accepts_a_rostered_signature_and_nothing_else`.
         let roster = Roster {
             schema: 1,
             roster_seq: 1,
@@ -263,7 +230,7 @@ mod tests {
             roster.authorize_appcast(&bad, &sig, now).err(),
             Some(RosterReject::Verify)
         );
-        // A different key's signature is rejected (no cross-key acceptance).
+        // Another key's signature is rejected.
         let (other, _) = generate().unwrap();
         let other_sig = sign(&other, manifest).unwrap();
         assert_eq!(
@@ -276,7 +243,7 @@ mod tests {
     fn pubkey_b64_recovers_the_published_key() {
         let (key, pub_b64) = generate().unwrap();
         assert_eq!(pubkey_b64(&key).unwrap(), pub_b64);
-        // A 32-byte base64 pubkey decodes to exactly 32 bytes (the client's BadKey gate).
+        // The client's BadKey gate: the pubkey decodes to exactly 32 bytes.
         assert_eq!(
             aterm_codec::base64::decode_strict(pub_b64.as_bytes())
                 .unwrap()

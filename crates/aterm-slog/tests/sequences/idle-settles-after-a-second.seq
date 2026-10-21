@@ -13,4 +13,4 @@ wait 999
 expect turn=open
 wait 1
 expect open t1 turn
-expect close t1 turn out=done dur_ms=2220 at=2220
+expect close t1 turn out=done dur_ms=2220 @2220

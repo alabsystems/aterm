@@ -323,11 +323,6 @@ struct Lookup {
     size: usize,
     /// The scan's key of the vnode read.
     key: fn(&Vnode) -> u128,
-    /// Whether a descriptor whose vnode the kernel refuses to describe
-    /// ([`Failed::Refused`]) is known not to be the one sought: true of a file
-    /// this process has `stat`ed itself, which the same check let through for
-    /// the same vnode, so a refused vnode is another.
-    refused_is_another: bool,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -339,20 +334,17 @@ impl Lookup {
         flavor: ffi::PROC_PIDFDVNODEPATHINFO,
         size: ffi::VNODE_PATH_SIZE,
         key: Vnode::rdev_key,
-        refused_is_another: false,
     };
     /// A file by its device and inode, read without the path
     /// (`PROC_PIDFDVNODEINFO`), which the match does not need. A descriptor on
-    /// a file in a protected folder is refused (`EPERM`) with or without it,
-    /// where `lsof` reads it through its entitlement
-    /// (`com.apple.rootless.datavault.metadata`; measured 2026-10-20: eight
-    /// system agents of this uid, `lsd`'s and `dmd`'s databases among them):
-    /// the file sought was `stat`ed, so such a descriptor is not on it.
+    /// a file in a protected folder can be refused (`EPERM`) with or without
+    /// it. A refusal is unknown: libproc also checks permission to inspect the
+    /// process before reading its vnode. A successful `stat` of the file sought
+    /// does not establish that permission across the separate reads.
     const BY_FILE: Self = Self {
         flavor: ffi::PROC_PIDFDVNODEINFO,
         size: ffi::VNODE_FD_SIZE,
         key: Vnode::file_key,
-        refused_is_another: true,
     };
 }
 
@@ -376,6 +368,19 @@ fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
     };
     #[cfg(test)]
     hook::after_listing(pid, &fds);
+    read_listed_table(wanted, lookup, fds, |fd| vnode_of(pid, fd, lookup))
+}
+
+/// Fold a listed table's vnode reads. Keeping the fold separate from libproc
+/// lets captured failures exercise the same positive/unknown decisions.
+#[cfg(target_vendor = "apple")]
+fn read_listed_table(
+    wanted: &[u128],
+    lookup: Lookup,
+    fds: Vec<(i32, u32)>,
+    mut read: impl FnMut(i32) -> Result<Vnode, Failed>,
+) -> Vec<TableRead> {
+    let every = |read| vec![read; wanted.len()];
     // Each asked key, sorted, with where its answer goes.
     let mut wanted: Vec<(u128, usize)> = wanted.iter().copied().zip(0..).collect();
     wanted.sort_unstable();
@@ -386,7 +391,7 @@ fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
         if kind != ffi::PROX_FDTYPE_VNODE {
             continue;
         }
-        match vnode_of(pid, fd, lookup) {
+        match read(fd) {
             // The scan's key of it: a device's `st_rdev` (32 bits on Darwin, widened),
             // or a file's device and inode.
             Ok(vnode) => {
@@ -410,9 +415,6 @@ fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
             // and one on a dead vnode names no device: nothing is held
             // through either.
             Err(Failed::Closed | Failed::Dead) => {}
-            // A vnode whose metadata is refused is not a file this process
-            // could `stat` (`Lookup::refused_is_another`).
-            Err(Failed::Refused) if lookup.refused_is_another => {}
             // Any other failure makes the verdict unknown for every key
             // not found.
             Err(Failed::Refused | Failed::Other) => unreadable = true,
@@ -935,7 +937,9 @@ mod paths;
 pub use paths::a_force_detached_volume_is_no_working_directory;
 #[cfg(all(windows, any(test, debug_assertions)))]
 pub use paths::scan_path_users_of_within;
-pub use paths::{Exe, PathScan, PathUse, exe_of, scan_path_users, scan_path_users_of};
+pub use paths::{
+    Exe, PathScan, PathUse, exe_of, scan_path_users, scan_path_users_of, write_open_files,
+};
 
 /// Test seams: run a closure between one table's listing and the reads of its descriptors (to
 /// make a race certain), read a dead vnode as unknown (for a negative control), and read a
@@ -1153,6 +1157,43 @@ mod tests {
         assert_eq!(Failed::of(1), Failed::Refused, "EPERM");
         for other in [0, 12, 13, 22] {
             assert_eq!(Failed::of(other), Failed::Other, "errno {other}");
+        }
+
+        // A successful stat of the sought file cannot turn a per-descriptor
+        // EPERM into absence: process authorization precedes the vnode read.
+        // Exercise both actual lookup modes without asking the live kernel.
+        let vnode = super::Vnode {
+            dev: 7,
+            ino: 9,
+            rdev: 11,
+        };
+        for lookup in [super::Lookup::BY_FILE, super::Lookup::BY_RDEV] {
+            let wanted = (lookup.key)(&vnode);
+            let fds = || vec![(3, ffi::PROX_FDTYPE_VNODE)];
+            assert_eq!(
+                super::read_listed_table(&[wanted], lookup, fds(), |_| Err(Failed::Refused)),
+                [super::TableRead::Unreadable],
+                "EPERM is unknown for every unconfirmed key"
+            );
+            assert_eq!(
+                super::read_listed_table(&[wanted], lookup, fds(), |_| Ok(vnode)),
+                [super::TableRead::Holds],
+                "a positive match remains a positive match"
+            );
+            assert_eq!(
+                super::read_listed_table(
+                    &[wanted, wanted + 1],
+                    lookup,
+                    vec![(3, ffi::PROX_FDTYPE_VNODE), (4, ffi::PROX_FDTYPE_VNODE)],
+                    |fd| if fd == 3 {
+                        Err(Failed::Refused)
+                    } else {
+                        Ok(vnode)
+                    },
+                ),
+                [super::TableRead::Holds, super::TableRead::Unreadable],
+                "a refusal obscures only keys not positively found"
+            );
         }
     }
 

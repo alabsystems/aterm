@@ -16,8 +16,6 @@
 //!   routing from parser actions to state transitions or side effects.
 //! - Side effects (inline in protocol handlers): callbacks and external
 //!   services (bell, notifications, clipboard, window ops).
-// Zero tolerance: the bell's rate limit judges only the injected instant (a
-// clock read here was an incident), so no `#[expect]` may excuse one.
 #![forbid(clippy::disallowed_methods)]
 
 use crate::grid::Grid;
@@ -212,10 +210,6 @@ pub(super) struct CursorStateHandler<'a> {
     /// Whether a hyperlink is currently set (read-only snapshot for extras recomputation).
     pub(super) has_hyperlink: bool,
 }
-
-// ---------------------------------------------------------------------------
-// Narrow reborrow constructors used directly by the routing modules
-// ---------------------------------------------------------------------------
 
 impl TerminalHandler<'_> {
     /// Fail-closed marker for the DEC 2026 close+reopen present license: called
@@ -458,35 +452,9 @@ pub(super) fn apply_absolute_row_update(
     }
 }
 
-/// Drop the anchors a scrollback erase (ED 3, Cmd-K) took with their lines:
-/// those wholly below `oldest`, the oldest absolute row the erased grid still
-/// holds, and start the command still being entered or run at `oldest` if
-/// the erase took its first rows.
-///
-/// The erase renumbers nothing. `Grid::erase_scrollback` keeps the visible
-/// rows and leaves `absolute_row_counter` alone, so a row on the screen keeps
-/// its absolute number, and an anchor on it still names the same line. A
-/// finished block whose rows straddle the erase keeps its numbers too: the
-/// erased part reads `BlockText::Evicted`, as rows the ring evicted do, and
-/// nothing reads another line in its place.
-///
-/// The blocks and command marks being built (`current_block`,
-/// `current_mark`) always stay. They reach the cursor, which is on the
-/// screen, and the A→B→C→D phase the erase leaves alone still needs them: a
-/// running command's D (`clear`, or a program that redraws on resume) lands
-/// on its block with its exit status. While its command has not finished,
-/// every row of it the erase took becomes `oldest`: what is left from there
-/// is still its own, and its writer goes on writing below it, so it reads
-/// that rather than `Evicted` for the rest of its run. This is what lets a
-/// program that scrolls and then clears with macOS `clear` (a full clear and
-/// an erase, in either order; [`note_full_clear`] keeps a running block's rows
-/// in the history) read what it drew after the clear. If the erase took any
-/// of its command line, that reads `Evicted` unless OSC 633;E named it
-/// (`OutputBlock::command_text_cleared`). A block whose command finished (its
-/// D came, the next prompt not yet) keeps its numbers, as an archived one
-/// does. Archived blocks and completed marks go oldest first and stop at the
-/// first one with a row left, so the ids still held stay one run (what a
-/// block read counts drops by).
+/// Prune absolute-row anchors evicted by a scrollback erase (`< oldest`),
+/// clamping an in-progress block/mark's start rows to `oldest` and marking
+/// its command text cleared if its command rows were erased.
 pub(super) fn forget_erased_history(
     oldest: u64,
     shell: &mut super::ShellIntegrationState,
@@ -597,51 +565,14 @@ pub(super) fn mark_rows_end(m: &super::CommandMark) -> u64 {
     .unwrap_or(0)
 }
 
-/// What a full clear of the main screen (ED 2, or ED 0 from home: `clear`,
-/// Ctrl-L) does to the blocks and command marks. It blanks the screen, from
-/// `top` (its top absolute row) down, renumbers nothing and leaves the history
-/// above `top` as it was. `from_home`: the cursor was at the screen's home
-/// when it came.
+/// Update output blocks and command marks on a full main-screen clear from
+/// `top` (`from_home` when cursor was at `(0, 0)`):
 ///
-/// What is written on the blanked rows next is no older block's. So each
-/// archived block that reads text from one (a non-empty command or output
-/// range reaching `top`) loses its text (`OutputBlock::text_cleared`): it
-/// reads `BlockText::Evicted`, never another command's lines, and keeps its
-/// rows, state, exit code and id (a block read counts the ids it no longer
-/// finds). A block with no text there keeps reading what it had: zsh's ED 0
-/// at the start of a prompt drawn on the top row (after `clear`) is a full
-/// clear, and the `clear` command's own block above it is empty, not gone.
-///
-/// The block being built (and its command mark) reached the cursor, so the
-/// clear blanked its latest rows, while its writer goes on writing on the
-/// cleared screen. Its id, state and exit code stay (the shell's D still
-/// lands on it), and no row of it is left below where its writer goes on
-/// writing, so none is below its end (the next prompt's row) and no range of
-/// it runs backwards:
-/// - A running command's block moves each row the clear blanked to `top` and
-///   keeps the ones in the history: its output reads what is still in the
-///   history, then what the command wrote after the clear, and its prompt row
-///   stays where the prompt is. If the clear blanked any of its command line,
-///   that reads `Evicted` unless OSC 633;E named it
-///   (`OutputBlock::command_text_cleared`).
-/// - A command that had finished (its D came, the next prompt not yet) has
-///   nothing more to write. Its rows move the same way, and it loses its text
-///   as an archived block does if its command, or its output up to the D's row
-///   (on the command mark that D completed), reached a blanked row.
-/// - A prompt being edited is redrawn by its line editor from the clear's home
-///   when the line editor sent the clear (Ctrl-L homes first): prompt and
-///   buffer. It starts again at `top`, with its command row (where the
-///   shell's B came) as far below the prompt's first row as it was, and
-///   nothing is marked. A clear away from home is none the line editor sent
-///   (a background job's): nothing redraws, typing goes on where it was, and
-///   the prompt keeps its rows.
-///
-/// Where the shell writes after that is its own: the redraw can leave out
-/// lines that were above its B, or come with an A of its own (fish). So the
-/// shell's next mark holds the order: its C keeps the prompt and command rows
-/// at most its own, and its A every row of a prompt it archives (no C came) at
-/// most that A's (`TerminalHandler::shell_execution_start`,
-/// `TerminalHandler::shell_prompt_start`).
+/// - Archived blocks whose command/output ranges reach `top` mark
+///   `text_cleared` (`BlockText::Evicted`) while keeping their row numbers.
+/// - An in-progress running/completed block clamps blanked rows to `top`.
+/// - A prompt being edited (`PromptOnly` / `EnteringCommand`) restarts at
+///   `top` when cleared `from_home` (e.g. Ctrl-L).
 pub(super) fn note_full_clear(top: u64, from_home: bool, shell: &mut super::ShellIntegrationState) {
     // Whether a block reads text from a blanked row: a non-empty range of it
     // reaching `top`.

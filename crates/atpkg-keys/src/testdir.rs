@@ -1,15 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit-test scratch directories, removed when the test ends HOWEVER it ends — atpkg's
+//! Unit-test scratch directories, removed when the test ends however it ends: atpkg's
 //! `testdir::Dir`, which a test-only module there cannot lend to this crate.
 //!
-//! The directory is an [`aterm_tempfile::TempDir`], so a failing assertion unwinds
-//! through its drop and the shared `$TMPDIR` is left as it was found. The name keeps the
-//! helper's label and is unique per call, so concurrent runs of the suite never share or
-//! wipe each other's tree.
-//! Only a BORROW of the guard is a path: moving it into a path-taking call would drop —
-//! and delete — the directory at that call, so it does not compile.
+//! Only a borrow of the guard is a path: moving the guard into a path-taking call would drop,
+//! and delete, the directory at that call, so it does not compile.
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -42,8 +38,7 @@ impl Deref for Dir {
     }
 }
 
-/// The borrow, not the guard: see the module doc for why `Dir` itself is not
-/// `AsRef<Path>`.
+/// The borrow, not the guard (see the module doc).
 impl AsRef<Path> for &Dir {
     fn as_ref(&self) -> &Path {
         &self.path

@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The chrome TYPE SCALE: one named 5-step scale for every text size the
-//! own-rendered chrome (Settings / About / command palette / tray widgets)
-//! draws, replacing the ~18 ad-hoc per-site multipliers (`px * 0.92`,
-//! `px * 0.78`, `px * 1.1`, …) that had accreted across the painters.
+//! The chrome type scale: one named 5-step scale for every text size the own-rendered
+//! chrome draws.
 //!
 //! TOTALITY BY CONSTRUCTION: a [`DrawPrim::Text`](crate::widget::DrawPrim) is
 //! only constructible through [`crate::widget::text_prim`], whose size
@@ -13,22 +11,19 @@
 //! Every chrome text site therefore maps to a named step; an orphan multiplier
 //! cannot compile. The funnel itself is [`crate::widget::text_prim`].
 
-/// A named step of the chrome type scale, largest to smallest. The factor is
-/// applied to the chrome's base size (the terminal `font_px` for the
-/// Settings/Palette overlay cards; the NATIVE `BASE_PT × display scale` for the
-/// About dialog — `crate::about`; [`crate::widget`]'s fixed tray base for the
-/// compact tray).
+/// A named step of the chrome type scale, largest to smallest. Each chrome surface passes
+/// its own base size (the overlay cards use the terminal `font_px`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TypeStep {
-    /// The wordmark ("aterm" in About). 1.6×.
+    /// The wordmark.
     Display,
-    /// Overlay titles ("Settings", "Commands") and the tray's headline values. 1.15×.
+    /// Overlay titles ("Settings", "Commands") and the tray's headline values.
     Title,
-    /// Row labels and primary content. 1.0×.
+    /// Row labels and primary content (the 1.0 anchor).
     Body,
-    /// Values, buttons, menu options, field text — secondary emphasis. 0.9×.
+    /// Values, buttons, menu options, field text.
     Secondary,
-    /// Hints, footers, section headers, chips, counts, captions. 0.8×.
+    /// Hints, footers, section headers, chips, counts, captions.
     Caption,
 }
 
@@ -51,10 +46,8 @@ impl TypeStep {
         StepPx(base * self.factor())
     }
 
-    /// [`Self::px`] clamped into `[lo, hi]` — for the one site whose text must
-    /// also FIT a box (the settings preview's terminal sample). Inverted bounds
-    /// (degenerate geometry) pin to the achievable upper bound, floored at
-    /// zero, mirroring `settings::fit`.
+    /// [`Self::px`] clamped into `[lo, hi]`, for text that must also fit a box; inverted
+    /// bounds (degenerate geometry) pin to `hi.max(0)`, as `settings::fit` does.
     pub(crate) fn px_clamped(self, base: f32, lo: f32, hi: f32) -> StepPx {
         let v = base * self.factor();
         StepPx(if hi <= lo {
@@ -65,9 +58,8 @@ impl TypeStep {
     }
 }
 
-/// A text size that provably came off the named type scale (the field is
-/// private; only [`TypeStep`] mints values). Carries plain f32 px inside —
-/// call [`Self::get`] for measurement/layout math.
+/// A text size that came off the named type scale: the field is private, so only
+/// [`TypeStep`] mints one.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct StepPx(f32);
 

@@ -124,7 +124,7 @@ impl HarnessPosture {
 /// (`prefs::agent_switch_label`: `Supervise <product> sessions`, and Codex's
 /// `Watch codex-alab sessions` since aterm supervises no Codex) and `is off`
 /// — `Supervise Claude Code sessions is off` — so the chip, its row and the
-/// menu name the switch a click opens Settings ▸ Harness to.
+/// menu name the switch a click turns on (`App::press_harness_switch`).
 #[must_use]
 pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static str {
     use aterm_phase::Program;
@@ -151,8 +151,8 @@ pub(crate) enum AutopilotView {
     /// Off: the harness keeps its hands off this session.
     Off,
     /// `[harness] enabled = false`: no session is supervised, whatever its
-    /// word ([`HarnessPosture::MasterOff`]). The chip opens Settings ▸
-    /// Harness instead of cycling.
+    /// word ([`HarnessPosture::MasterOff`]). A click on the chip turns the
+    /// master switch on instead of cycling (`App::press_harness_switch`).
     MasterOff,
     /// No host (no control socket): nothing supervises any session
     /// ([`HarnessPosture::Unhosted`]). The footer draws no chip for it — the
@@ -164,7 +164,7 @@ pub(crate) enum AutopilotView {
     /// The master switch on and this agent's own switch off
     /// ([`HarnessPosture::AgentOff`], §10.2.3 item 5): read as the master
     /// switch's off everywhere — `off` on the wire, no word a cycle writes,
-    /// a click opening Settings ▸ Harness — but NAMED as the agent's switch
+    /// a click turning that switch on — but NAMED as the agent's switch
     /// (`Supervise Claude Code sessions is off`, [`agent_switch_off`]).
     AgentOff(aterm_phase::Program),
 }
@@ -184,8 +184,8 @@ pub(crate) enum ChipTone {
 /// "changing"): `◐`, drawn alone.
 pub(crate) const PENDING_GLYPH: &str = "\u{25d0}";
 
-/// The clause v1's spelling of the Autopilot chip's title ends with where the
-/// harness runs no mode and a click opens Settings ▸ Harness
+/// The clause v1's spelling of the Autopilot chip's title ends with where no
+/// host runs a harness and a click opens Settings ▸ Harness
 /// ([`AutopilotView::title`], which the face table's tests hold
 /// `claude_lights::autopilot_title` to): the page by the name its rail row
 /// shows (`SettingsRoute::Harness`). Test-only since the `⚙` chip, whose
@@ -195,6 +195,17 @@ pub(crate) const PENDING_GLYPH: &str = "\u{25d0}";
 macro_rules! open_harness_click {
     () => {
         "click: open Settings \u{25b8} Harness"
+    };
+}
+
+/// The clause v1's spelling of the title ends with where a switch of
+/// aterm.toml holds the harness off — the master switch, the agent's own —
+/// and a click turns it on, as the top rule's `on` does (owner, 2026-10-20:
+/// "remove the harness settings button in the UX").
+#[cfg(test)]
+macro_rules! harness_on_click {
+    () => {
+        "click: turn the harness on"
     };
 }
 
@@ -271,8 +282,8 @@ impl AutopilotView {
 
     /// The word a click writes ([`App::cycle_session_autopilot`]): the next
     /// mode in [`Autopilot::ALL`]'s order (Cruise → Land → Off → Cruise).
-    /// `None` where the harness runs no mode: the chip opens Settings ▸
-    /// Harness there instead.
+    /// `None` where the harness runs no mode: the chip turns on the switch
+    /// that holds it off there instead (`App::press_harness_switch`).
     #[must_use]
     pub(crate) fn next(self) -> Option<Autopilot> {
         let mode = self.mode()?;
@@ -340,7 +351,7 @@ impl AutopilotView {
             Self::Cruise => "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land",
             Self::Land => "autopilot: land \u{2014} wrapping up \u{b7} click: off",
             Self::Off => "autopilot: off \u{2014} hands off \u{b7} click: cruise",
-            Self::MasterOff => concat!("harness off in Settings \u{b7} ", open_harness_click!()),
+            Self::MasterOff => concat!("harness off in Settings \u{b7} ", harness_on_click!()),
             Self::Unhosted => concat!(
                 "no harness: this aterm has no control socket \u{b7} ",
                 open_harness_click!()
@@ -349,7 +360,7 @@ impl AutopilotView {
                 use aterm_phase::Program;
                 macro_rules! agent_off {
                     ($switch:literal) => {
-                        concat!($switch, " is off \u{b7} ", open_harness_click!())
+                        concat!($switch, " is off \u{b7} ", harness_on_click!())
                     };
                 }
                 match agent {
@@ -374,6 +385,163 @@ impl AutopilotView {
             Self::Land => "land",
             Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => "off",
         }
+    }
+}
+
+/// THE HARNESS SWITCH (owner, 2026-10-20: "there needs to be an "on" button
+/// drawn for the claude harness"): the one on/off switch at the right of a
+/// hosted agent session's composer top rule, where ` ✦ alab kitty · claude
+/// harness ● on ` stands while the harness carries the session. In every
+/// state the harness does not carry it — the session's own Off, its agent's
+/// switch off, the master switch off — the same switch is drawn off, with
+/// an `on` button: `claude harness ○ off ▐ on ▌` (`claude_footer`'s
+/// `switch_face`). A window with no host has no switch: nothing there could
+/// turn a harness on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HarnessSwitch {
+    /// The harness carries the session (Cruise or Land): `● on` lit; a click
+    /// turns the session Off ([`App::toggle_session_harness`]).
+    On,
+    /// The harness's hands are off, held so by the switch named: `○ off` lit
+    /// and `on` drawn as a button; a click turns it on
+    /// ([`App::switch_harness_on`]).
+    Off(SwitchOff),
+    /// A click turned a switch of aterm.toml on and the policy in force has
+    /// not read it back yet: `◐ turning on`, and a click does nothing until
+    /// it does or [`SWITCH_SETTLE`] passes (`claude_lights`).
+    Turning,
+}
+
+/// Which switch holds a session's harness off ([`HarnessSwitch::Off`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SwitchOff {
+    /// The session's own Autopilot word is `off` (or, with none, the
+    /// table's default is).
+    Session,
+    /// Its agent's own switch, `[harness.<agent>] enabled = false`.
+    Agent(aterm_phase::Program),
+    /// The master switch, `[harness] enabled = false` (or a headless
+    /// instance under `[harness] headless = false`).
+    Master,
+}
+
+/// How long a click's switch write may take to read back before the switch
+/// stops saying `◐ turning on` ([`HarnessSwitch::Turning`]): the config
+/// lane's write, the watcher's next poll (half a second) and the host's
+/// adoption, with room to spare. A write the lane refuses says so at once
+/// and lets the switch go then.
+pub(crate) const SWITCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl HarnessSwitch {
+    /// The switch a session under `view` shows: `None` with no host. A
+    /// click's write in flight is the window's to know (`claude_lights`),
+    /// which shows [`Self::Turning`] over an off reading.
+    #[must_use]
+    pub(crate) const fn of(view: AutopilotView) -> Option<Self> {
+        match view {
+            AutopilotView::Cruise | AutopilotView::Land => Some(Self::On),
+            AutopilotView::Off => Some(Self::Off(SwitchOff::Session)),
+            AutopilotView::AgentOff(agent) => Some(Self::Off(SwitchOff::Agent(agent))),
+            AutopilotView::MasterOff => Some(Self::Off(SwitchOff::Master)),
+            AutopilotView::Unhosted => None,
+        }
+    }
+
+    /// Whether the switch reads on.
+    #[must_use]
+    pub(crate) const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+
+    /// Its state as a screen reader is told it (`Role::Switch`'s toggled
+    /// state): on, off, or mixed while it turns on.
+    #[must_use]
+    pub(crate) const fn toggled(self) -> Option<bool> {
+        match self {
+            Self::On => Some(true),
+            Self::Off(_) => Some(false),
+            Self::Turning => None,
+        }
+    }
+
+    /// What the switch is, said after its name (the accessibility node's
+    /// description): what holds it off, and what a click does.
+    #[must_use]
+    pub(crate) fn described(self, product: &str) -> String {
+        match self {
+            Self::On => format!(
+                "The aterm harness carries this {product} session. Click to turn it off for this \
+                 session."
+            ),
+            Self::Turning => "The aterm harness is turning on.".to_owned(),
+            Self::Off(SwitchOff::Session) => format!(
+                "The aterm harness is off for this {product} session. Click on to turn it on."
+            ),
+            Self::Off(SwitchOff::Agent(agent)) => format!(
+                "{}. Click on to turn it on.",
+                crate::autopilot::agent_switch_off(agent)
+            ),
+            Self::Off(SwitchOff::Master) => {
+                "Supervise coding agents is off. Click on to turn it on.".to_owned()
+            }
+        }
+    }
+}
+
+/// The aterm.toml key of the headless gate (`[harness] headless`), which
+/// turns supervision off in a headless instance alone.
+pub(crate) const HARNESS_HEADLESS_KEY: &str = "harness.headless";
+
+/// The aterm.toml key of `agent`'s own switch (`harness.<agent>.enabled`),
+/// found among the switch rows Settings ▸ Harness draws
+/// ([`crate::prefs::agent_switch`]): `None` for an agent with no table.
+#[must_use]
+pub(crate) fn agent_switch_key(agent: aterm_phase::Program) -> Option<&'static str> {
+    crate::prefs::NESTED_LEAVES
+        .iter()
+        .map(|leaf| leaf.key)
+        .find(|key| crate::prefs::agent_switch(key) == Some(agent))
+}
+
+/// What turning the harness on for one session writes
+/// ([`App::switch_harness_on`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SwitchOnPlan {
+    /// The aterm.toml switches that hold it off, each written `true`.
+    pub(crate) keys: Vec<&'static str>,
+    /// The session's own word is written `cruise`: it, or the table's
+    /// default under no word, would leave the session Off with every switch
+    /// on.
+    pub(crate) cruise: bool,
+}
+
+/// [`SwitchOnPlan`] for a session of `agent` whose own word is `word`,
+/// under `cfg` in an instance that is `headless` or not: every switch of
+/// aterm.toml that holds it off — the master switch, the headless gate, the
+/// agent's own switch — and its word where that would still leave it Off.
+#[must_use]
+pub(crate) fn switch_on_plan(
+    cfg: &SupervisorConfig,
+    headless: bool,
+    agent: Option<aterm_phase::Program>,
+    word: Option<Autopilot>,
+) -> SwitchOnPlan {
+    let mut keys = Vec::new();
+    if !cfg.enabled {
+        keys.push(crate::prefs::EDIT_HARNESS_ENABLED);
+    }
+    if headless && !cfg.headless {
+        keys.push(HARNESS_HEADLESS_KEY);
+    }
+    if let Some(agent) = agent
+        && cfg.off.contains(&agent)
+        && let Some(key) = agent_switch_key(agent)
+    {
+        keys.push(key);
+    }
+    SwitchOnPlan {
+        keys,
+        cruise: cfg.autopilot_for(word) == Autopilot::Off,
     }
 }
 
@@ -857,13 +1025,18 @@ impl App {
         // The timer the write may drop, read BEFORE the index is built again
         // from what is stored (§10.2.3, item 8): the record names it.
         let dropped = self.autopilot_timers.glass(local_id);
-        self.index_autopilot_timer(local_id, None);
+        // Unstamped: a moved pair stamps the tab chrome below, the hover's
+        // timer words in it (§12.4.1), so each strip is stamped once.
+        let timer_moved = self.index_autopilot_timer_unstamped(local_id, None);
         self.refresh_autopilot_menu(local_id);
         // The person's word about typing: the crash journal carries it at
         // once (`App::journal_owner_words`; a pair it already carries owes
         // nothing).
         self.journal_owner_words(local_id);
         if !moved {
+            if timer_moved {
+                self.restamp_for_hover(local_id);
+            }
             return false;
         }
         // What a `meta set` from the window refreshes
@@ -1022,8 +1195,9 @@ impl App {
     /// [`AutopilotView::next`]) and is written as its own word
     /// ([`Self::set_session_autopilot`]). Under [`AutopilotView::MasterOff`]
     /// (and [`AutopilotView::Unhosted`]) nothing is written: the view is
-    /// returned unchanged and the caller opens Settings ▸ Harness
-    /// ([`Self::open_harness_settings`]) instead. The view after the click.
+    /// returned unchanged, and the caller turns on the switch that holds the
+    /// harness off (`App::press_harness_switch`) instead. The view after the
+    /// click.
     pub(crate) fn cycle_session_autopilot(&mut self, local_id: u64) -> AutopilotView {
         let (_, view, _) = self.session_autopilot(local_id);
         let Some(next) = view.next() else {
@@ -1033,24 +1207,60 @@ impl App {
         self.session_autopilot(local_id).1
     }
 
-    /// Single toggle on-off switch for a running session's harness: flips
-    /// session `local_id` directly between `Autopilot::Off` (disabling the
-    /// entire harness — supervision, launch card rainbow kitty, composer
-    /// border branding, and glass transcript rewrites) and `Autopilot::Cruise`
-    /// (seamlessly re-enabling the entire harness during the running session).
+    /// THE HARNESS SWITCH, flipped (the composer top rule's switch,
+    /// [`HarnessSwitch`]): a session the harness carries (Cruise or Land) is
+    /// turned Off — its own word written `off`, which takes the whole
+    /// harness off it (supervision, the launch card's rainbow kitty, the
+    /// composer border's branding and the glass transcript rewrites) — and one
+    /// it does not carry is turned on from whichever switch holds it off
+    /// ([`Self::switch_harness_on`]). With no host there is no switch, and
+    /// nothing is written. The view after the flip: a switch of aterm.toml
+    /// turned on reads back when the watcher adopts the file, not here.
     pub(crate) fn toggle_session_harness(&mut self, local_id: u64) -> AutopilotView {
-        let (word, view, _) = self.session_autopilot(local_id);
-        let currently_off = matches!(
-            view,
-            AutopilotView::Off | AutopilotView::MasterOff | AutopilotView::AgentOff(_)
-        ) || word == Some(Autopilot::Off);
-        let next = if currently_off {
-            Autopilot::Cruise
-        } else {
-            Autopilot::Off
-        };
-        self.set_session_autopilot(local_id, Some(next), Surface::Border);
+        let (_, view, _) = self.session_autopilot(local_id);
+        match HarnessSwitch::of(view) {
+            Some(HarnessSwitch::On) => {
+                self.set_session_autopilot(local_id, Some(Autopilot::Off), Surface::Border);
+            }
+            Some(HarnessSwitch::Off(_)) => {
+                self.switch_harness_on(local_id);
+            }
+            Some(HarnessSwitch::Turning) | None => {}
+        }
         self.session_autopilot(local_id).1
+    }
+
+    /// THE SWITCH'S "ON" (owner, 2026-10-20: "there needs to be an "on"
+    /// button drawn for the claude harness"): turn the harness on for session
+    /// `local_id` in ONE click, from whichever switch holds it off
+    /// ([`switch_on_plan`]) — the master switch, the session's agent's own
+    /// switch, and the session's own word, as many of them as are off. The
+    /// switches are aterm.toml's, written `true` on the config lane
+    /// ([`Self::queue_harness_switch_write`]) and in force once the watcher
+    /// adopts the file (`App::adopt_harness_policy`); the word is the
+    /// store's, read back at once. What it wrote.
+    ///
+    /// The master switch is turned on, not opened in Settings (owner,
+    /// 2026-10-20: "remove the harness settings button in the UX"): "turn the
+    /// Claude harness on" from a pane the master switch holds off can only
+    /// mean the switch that is off, and a session the switch would still
+    /// leave off (its word, or the table's default, `off`) is carried too,
+    /// so the one click is never a click that shows nothing.
+    pub(crate) fn switch_harness_on(&mut self, local_id: u64) -> SwitchOnPlan {
+        let (word, _, _) = self.session_autopilot(local_id);
+        let plan = switch_on_plan(
+            &self.harness_policy.get().policy,
+            self.headless,
+            self.session_agent(local_id),
+            word,
+        );
+        if plan.cruise {
+            self.set_session_autopilot(local_id, Some(Autopilot::Cruise), Surface::Border);
+        }
+        for key in &plan.keys {
+            self.queue_harness_switch_write(key);
+        }
+        plan
     }
 
     /// Open Settings ▸ Harness in window `wid` (the chip under the master
@@ -1090,6 +1300,112 @@ mod set_by_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE `on` BUTTON'S PLAN ([`switch_on_plan`]): it writes exactly the
+    /// switches that hold the session off — the master switch, the headless
+    /// gate in a headless instance only, the session's agent's own switch
+    /// and no other agent's — and the session's word `cruise` only where
+    /// its word, or the table's default under none, would leave it Off with
+    /// every switch on. For every case the posture after the plan carries
+    /// the session. NEGATIVE CONTROL: nothing held off, nothing written.
+    #[test]
+    fn the_on_button_writes_exactly_the_switches_that_hold_it_off() {
+        use aterm_phase::Program;
+        let cfg = |text: &str| crate::app_config::HarnessPolicy::read(text).policy;
+        let claude = Some(Program::Claude);
+        let plan = |text: &str, headless: bool, word: Option<Autopilot>| {
+            switch_on_plan(&cfg(text), headless, claude, word)
+        };
+        assert_eq!(
+            plan("[harness]\n", false, None),
+            SwitchOnPlan::default(),
+            "control: nothing holds it off"
+        );
+        assert_eq!(
+            plan("[harness]\n", false, Some(Autopilot::Off)),
+            SwitchOnPlan {
+                keys: Vec::new(),
+                cruise: true
+            },
+            "its own word off"
+        );
+        assert!(
+            plan("[harness]\nautopilot = \"off\"\n", false, None).cruise,
+            "the table's default off, no word"
+        );
+        assert!(
+            !plan(
+                "[harness]\nautopilot = \"off\"\n",
+                false,
+                Some(Autopilot::Land)
+            )
+            .cruise,
+            "its own word carries it"
+        );
+        assert_eq!(
+            plan("[harness]\nenabled = false\n", false, None).keys,
+            [crate::prefs::EDIT_HARNESS_ENABLED]
+        );
+        assert_eq!(
+            plan("[harness]\nheadless = false\n", false, None).keys,
+            Vec::<&str>::new(),
+            "the headless gate holds a windowed instance nothing"
+        );
+        assert_eq!(
+            plan("[harness]\nheadless = false\n", true, None).keys,
+            [HARNESS_HEADLESS_KEY]
+        );
+        assert_eq!(
+            plan("[harness.claude]\nenabled = false\n", false, None).keys,
+            [crate::prefs::EDIT_HARNESS_CLAUDE_ENABLED]
+        );
+        assert_eq!(
+            plan("[harness.agy]\nenabled = false\n", false, None).keys,
+            Vec::<&str>::new(),
+            "another agent's switch is not Claude Code's"
+        );
+        assert_eq!(
+            agent_switch_key(Program::Agy),
+            Some(crate::prefs::EDIT_HARNESS_AGY_ENABLED)
+        );
+        assert_eq!(
+            agent_switch_key(Program::Muse),
+            Some(crate::prefs::EDIT_HARNESS_MUSE_ENABLED)
+        );
+    }
+
+    /// THE SWITCH A VIEW SHOWS ([`HarnessSwitch::of`]): lit while the
+    /// harness carries the session, off — naming the switch that holds it —
+    /// in every other hosted view, and none without a host; a screen reader
+    /// is told on, off, or mixed while it turns on.
+    #[test]
+    fn every_hosted_view_has_a_switch_and_no_unhosted_one_does() {
+        for view in AutopilotView::ALL {
+            let switch = HarnessSwitch::of(view);
+            match view {
+                AutopilotView::Cruise | AutopilotView::Land => {
+                    assert_eq!(switch, Some(HarnessSwitch::On));
+                }
+                AutopilotView::Off => {
+                    assert_eq!(switch, Some(HarnessSwitch::Off(SwitchOff::Session)));
+                }
+                AutopilotView::MasterOff => {
+                    assert_eq!(switch, Some(HarnessSwitch::Off(SwitchOff::Master)));
+                }
+                AutopilotView::AgentOff(agent) => {
+                    assert_eq!(switch, Some(HarnessSwitch::Off(SwitchOff::Agent(agent))));
+                }
+                AutopilotView::Unhosted => assert_eq!(switch, None),
+            }
+            assert_eq!(
+                switch.map(HarnessSwitch::is_on),
+                switch.map(|_| view.carries())
+            );
+        }
+        assert_eq!(HarnessSwitch::On.toggled(), Some(true));
+        assert_eq!(HarnessSwitch::Off(SwitchOff::Master).toggled(), Some(false));
+        assert_eq!(HarnessSwitch::Turning.toggled(), None);
+    }
 
     /// §2.1's precedence: no host and the master switch win over every word;
     /// otherwise the word, else the table's default — the one resolver's rule,
@@ -1209,7 +1525,7 @@ mod tests {
         );
         assert_eq!(
             AutopilotView::MasterOff.title(),
-            "harness off in Settings \u{b7} click: open Settings \u{25b8} Harness"
+            "harness off in Settings \u{b7} click: turn the harness on"
         );
         // The click's cycle visits every mode once and comes back.
         let mut view = AutopilotView::Cruise;
@@ -1229,12 +1545,12 @@ mod tests {
     /// AN AGENT'S OWN SWITCH OFF IS NAMED (§10.2.1, §10.2.5): for each
     /// supervisable agent, its switch off under the master switch on joins to
     /// `AgentOff` — `⊘ off`, dim, titled with the switch's own Settings label
-    /// and a click to Settings, `off` on the wire, no word a cycle writes, no
-    /// default — and counts as Off in the A/B where no claim is live, while
-    /// every other agent of the same policy runs the table's default. An
-    /// agent not yet read reads `MasterOff`, and the master switch off wins
-    /// over the agent's. NEGATIVE CONTROL: with the agent's switch on, its
-    /// sessions run the default.
+    /// and a click that turns it on, `off` on the wire, no word a cycle
+    /// writes, no default — and counts as Off in the A/B where no claim is
+    /// live, while every other agent of the same policy runs the table's
+    /// default. An agent not yet read reads `MasterOff`, and the master switch
+    /// off wins over the agent's. NEGATIVE CONTROL: with the agent's switch
+    /// on, its sessions run the default.
     #[test]
     fn an_agents_own_switch_off_reads_agent_off_and_the_master_wins() {
         use crate::harness_screen::AbArm;
@@ -1251,7 +1567,11 @@ mod tests {
                 let view = AutopilotView::of(joined, word);
                 assert_eq!(view, AutopilotView::AgentOff(agent), "{agent:?} {word:?}");
                 assert_eq!(view.mode(), None);
-                assert_eq!(view.next(), None, "a click opens Settings");
+                assert_eq!(
+                    view.next(),
+                    None,
+                    "a click turns the switch on, writing no word"
+                );
                 assert!(!view.carries());
                 assert_eq!(view.wire(), "off");
                 assert_eq!(view.label(), "\u{2298} off");
@@ -1274,7 +1594,7 @@ mod tests {
             );
             assert_eq!(
                 AutopilotView::AgentOff(agent).title(),
-                format!("{switch} \u{b7} click: open Settings \u{25b8} Harness")
+                format!("{switch} \u{b7} click: turn the harness on")
             );
             assert_eq!(
                 AbArm::of(AutopilotView::AgentOff(agent), false, false),
@@ -1472,7 +1792,8 @@ mod tests {
         .unwrap();
         assert!(!app.session_autopilot(0).2, "this host's lapsed lease");
 
-        // The master switch off: the chip opens Settings, writing nothing.
+        // The master switch off: the cycle writes no word (the chip turns the
+        // switch on instead, `App::press_harness_switch`).
         app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
             crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
         );
@@ -1582,8 +1903,8 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// The master-off chip's page (and the Autopilot menu's `Harness
-    /// settings…`): Settings ▸ Harness, opened in the window it was pressed in
+    /// The Autopilot menu's `Harness settings…` page (and the no-host
+    /// chip's): Settings ▸ Harness, opened in the window it was pressed in
     /// (View ▸ Coding Agent Harness… opens it in the front one).
     #[test]
     fn open_harness_settings_opens_the_page_the_chip_names() {
@@ -1598,9 +1919,9 @@ mod tests {
             app.native_settings_route_view_target(SettingsRoute::Harness)
                 .is_some()
         );
-        // The master-off title names the page the click opens, by its rail
-        // name.
-        let title = AutopilotView::MasterOff.title();
+        // The no-host title names the page the click opens, by its rail
+        // name (under a switch off the click turns it on instead).
+        let title = AutopilotView::Unhosted.title();
         assert!(
             title.ends_with(&format!(
                 "Settings \u{25b8} {}",

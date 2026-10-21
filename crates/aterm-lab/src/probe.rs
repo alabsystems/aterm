@@ -73,6 +73,11 @@ pub enum Op {
     Serve(Option<String>),
     /// `bootstrap_look_up` of a Mach service.
     Mach(String),
+    /// A kernel policy query only: never looks up a service or reads preferences.
+    PreferencePolicy(String, String),
+    /// Open and map a parent-owned named shared-memory canary read-only.
+    #[cfg(test)]
+    ShmRead(String),
     /// `kill(…, 0)` of the parent, self, a child or a grandchild.
     Signal(String),
     /// Start `/usr/bin/security`, `/usr/bin/open`, `/bin/ps`, or the tripwire
@@ -149,7 +154,7 @@ impl RemoveHow {
 }
 
 impl Op {
-    fn encode(&self) -> String {
+    pub(crate) fn encode(&self) -> String {
         let b = |v: bool| if v { "1" } else { "0" };
         match self {
             Op::Reach(p, r) => format!("reach\t{p}\t{}", b(*r)),
@@ -158,6 +163,9 @@ impl Op {
             Op::Udp => "udp".into(),
             Op::Serve(d) => format!("serve\t{}", d.as_deref().unwrap_or("")),
             Op::Mach(n) => format!("mach\t{n}"),
+            Op::PreferencePolicy(scope, n) => format!("preference-policy\t{scope}\t{n}"),
+            #[cfg(test)]
+            Op::ShmRead(n) => format!("shm-read\t{n}"),
             Op::Signal(w) => format!("signal\t{w}"),
             Op::Exec(w, s) => format!("exec\t{w}\t{s}"),
             Op::Claude(p) => format!("claude\t{p}"),
@@ -178,6 +186,9 @@ impl Op {
             "udp" => Op::Udp,
             "serve" => Op::Serve(s(1).filter(|d| !d.is_empty())),
             "mach" => Op::Mach(s(1)?),
+            "preference-policy" => Op::PreferencePolicy(s(1)?, s(2)?),
+            #[cfg(test)]
+            "shm-read" => Op::ShmRead(s(1)?),
             "signal" => Op::Signal(s(1)?),
             "exec" => Op::Exec(s(1)?, s(2)?),
             "claude" => Op::Claude(s(1)?),
@@ -250,6 +261,10 @@ impl Op {
                 1102 => "ENOENT".into(),
                 kr => format!("kr={kr}"),
             },
+            Op::PreferencePolicy(scope, n) => crate::sys::preference_policy(scope, n)
+                .map_or_else(name, |allowed| if allowed { "yes" } else { "EPERM" }.into()),
+            #[cfg(test)]
+            Op::ShmRead(n) => crate::sys::read_named_shm(n).map_or_else(name, |()| "yes".into()),
             Op::Signal(who) => signal(who).map_or_else(name, |()| "yes".into()),
             Op::Exec(what, shim) => exec(what, shim, jailed),
             Op::Claude(p) => match fs::File::open(p).and_then(|mut f| f.read(&mut [0u8; 4])) {
@@ -493,6 +508,8 @@ pub struct World {
     pub replica: bool,
     /// Its home.
     pub home: String,
+    /// The caller's separate HOME (a second owned home in the replica).
+    pub caller_home: String,
     /// Its Claude socket directory.
     pub cc: String,
     /// Its run directory.
@@ -528,6 +545,25 @@ fn sibling_build(w: &World) -> String {
         .map(Path::to_path_buf)
         .unwrap_or_default();
     store.join("0/bin/codex").to_string_lossy().into_owned()
+}
+
+/// Owned files outside the old protected list, including preferences and
+/// containers that resolve through account identity rather than HOME.
+fn home_canaries(w: &World) -> Vec<String> {
+    [&w.home, &w.caller_home]
+        .into_iter()
+        .filter(|h| !h.is_empty())
+        .flat_map(|h| {
+            [
+                "plain-canary",
+                "Library/Preferences/lab-canary.plist",
+                "Library/Containers/lab-canary/data",
+                "Library/Group Containers/lab-canary/data",
+                "Developer/unselected/canary",
+            ]
+            .map(|n| format!("{h}/{n}"))
+        })
+        .collect()
 }
 
 /// The checks of one world; `decoy` is the socket of another private
@@ -624,6 +660,64 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
             }
         }
     }
+    if w.replica {
+        for path in home_canaries(w) {
+            add(
+                "data",
+                short(&path),
+                Denied,
+                Op::Reach(path, true),
+                true,
+                false,
+            );
+        }
+        for path in [
+            format!("{}/plain-canary", w.caller_home),
+            format!("{}/plain-canary", w.home),
+        ] {
+            add(
+                "writes",
+                short(&path),
+                Denied,
+                Op::Write(path, WriteHow::Append),
+                true,
+                false,
+            );
+        }
+        add(
+            "allowed",
+            "read the selected source inside the account home".into(),
+            Allowed,
+            Op::Reach(format!("{}/Developer/selected-source/canary", w.home), true),
+            true,
+            false,
+        );
+    }
+    // Query the sandbox instead of touching the owner's actual preferences
+    // daemons/domains. The allow-default control must admit each operation.
+    for (scope, name) in [
+        ("global", "com.apple.cfprefsd.daemon"),
+        ("global", "com.apple.cfprefsd.agent"),
+        ("local", "com.apple.cfprefsd.agent"),
+        ("read", ""),
+    ] {
+        add(
+            "preferences",
+            format!("preferences policy {scope} {name}"),
+            Denied,
+            Op::PreferencePolicy(scope.into(), name.into()),
+            true,
+            false,
+        );
+    }
+    add(
+        "allowed",
+        "an unrelated Mach policy remains available (query only)".into(),
+        Allowed,
+        Op::PreferencePolicy("global".into(), "com.apple.TrustEvaluationAgent".into()),
+        true,
+        false,
+    );
     // -- unix sockets: only the lab's own socket dir
     add(
         "sockets",
@@ -1181,6 +1275,13 @@ pub fn judge(
 
 /// Every protected path of the replica as files this process owns, and what the other checks need.
 fn build_replica(w: &World) -> std::io::Result<()> {
+    for path in home_canaries(w).into_iter().chain(std::iter::once(format!(
+        "{}/Developer/selected-source/canary",
+        w.home
+    ))) {
+        fs::create_dir_all(Path::new(&path).parent().unwrap())?;
+        fs::write(path, "owned replica\n")?;
+    }
     for (kind, path) in protected_paths(&w.home, &w.cc) {
         let names = match kind {
             Kind::Subpath => {
@@ -1531,6 +1632,7 @@ fn probe_in(
                 name: "this lab's jail.sb, against this machine".into(),
                 replica: false,
                 home: p.real_home.clone(),
+                caller_home: p.caller_home.clone(),
                 cc: CCSOCKS.into(),
                 run: r.run.to_string_lossy().into_owned(),
                 sockdir: r.sockdir.clone(),
@@ -1572,6 +1674,7 @@ fn probe_in(
                 name: "this lab's jail.sb, against this machine".into(),
                 replica: false,
                 home: p.real_home.clone(),
+                caller_home: p.caller_home.clone(),
                 cc: CCSOCKS.into(),
                 run: run.to_string_lossy().into_owned(),
                 sockdir: sock.to_string_lossy().into_owned(),
@@ -1597,6 +1700,7 @@ fn probe_in(
         rrun.join("scratch"),
         rep.join("sock"),
         rep.join("home"),
+        rep.join("caller-home"),
         rep.join("cc"),
         pst.join("lab/state/runs"),
         pst.join("T"),
@@ -1609,6 +1713,8 @@ fn probe_in(
     let mut rspec =
         crate::jail::Spec::for_lab(&st(&rrun), &st(&rclaude), &st(&rcodex), &rs("sock"), "");
     rspec.home = rs("home");
+    rspec.caller_home = rs("caller-home");
+    rspec.lab_dirs.push(rs("home/Developer/selected-source"));
     rspec.ccsocks = rs("cc");
     rspec.state = st(&pst.join("lab/state"));
     rspec.user_tmp = st(&pst.join("T"));
@@ -1619,6 +1725,7 @@ fn probe_in(
             .into(),
         replica: true,
         home: rs("home"),
+        caller_home: rs("caller-home"),
         cc: rs("cc"),
         run: st(&rrun),
         sockdir: rs("sock"),
@@ -1627,7 +1734,7 @@ fn probe_in(
         codex: st(&rcodex),
         shim,
         state: st(&pst.join("lab/state")),
-        lab_dirs,
+        lab_dirs: rspec.lab_dirs.clone(),
         aterm: rspec.aterm.clone(),
         usertmp: st(&pst.join("T")),
         build_dirs,
@@ -1650,6 +1757,7 @@ mod tests {
             name: "w".into(),
             replica,
             home: "/H".into(),
+            caller_home: "/caller-H".into(),
             cc: "/C".into(),
             run: "/R".into(),
             sockdir: "/S".into(),
@@ -1675,6 +1783,8 @@ mod tests {
                 c.label
             );
         }
+        let owned_shm = Op::ShmRead("/apple.cfprefs.owned-fixture".into());
+        assert_eq!(Op::decode(&owned_shm.encode()), Some(owned_shm));
     }
 
     #[test]

@@ -684,25 +684,11 @@ pub(super) fn fit_keeping_path_tail(text: &str, path: Option<&str>, width: f32) 
         return cut_at_joint_or_word(text, width, &fits);
     };
     let (before, after) = (&text[..start], &text[start + path.len()..]);
-    let parts = path.split('/').collect::<Vec<_>>();
-    // The path's shorter forms, longest first: its head and its tail around
-    // an ellipsis, the tail never under two components (the folder and the
-    // binary) where it has them; then the tail alone.
-    let mut forms = Vec::new();
-    let least = 2.min(parts.len().saturating_sub(1)).max(1);
-    for tail in (least..parts.len()).rev() {
-        for head in (1..parts.len() - tail).rev() {
-            forms.push(format!(
-                "{}/\u{2026}/{}",
-                parts[..head].join("/"),
-                parts[parts.len() - tail..].join("/")
-            ));
-        }
-        forms.push(format!(
-            "\u{2026}/{}",
-            parts[parts.len() - tail..].join("/")
-        ));
-    }
+    // The path's shorter forms, longest first ([`crate::native_ui::path_forms`]).
+    let forms: Vec<String> = crate::native_ui::path_forms(path)
+        .into_iter()
+        .map(|(form, _, _)| form)
+        .collect();
     let shortest = forms.last().cloned().unwrap_or_else(|| path.to_string());
     if let Some(line) = forms
         .iter()
@@ -733,7 +719,7 @@ pub(super) fn fit_keeping_path_tail(text: &str, path: Option<&str>, width: f32) 
         return shortest;
     }
     // Not even the tail with its folder: the binary's name, whole.
-    parts.last().map_or(shortest, |name| (*name).to_string())
+    path[crate::native_ui::path_name_start(path)..].to_string()
 }
 
 /// A line with no path cut honestly: back to its last ` · ` joint that fits

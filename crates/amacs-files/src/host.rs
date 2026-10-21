@@ -24,7 +24,8 @@ use aterm_gui_consent::durable::Flush;
 
 use crate::io::{
     AtomicSaveProof, AtomicSaveResult, AtomicSaveStage, ContentFingerprint, Decoded, DiskEncoding,
-    ObservedFileVersion, SaveError, SaveGeneration, SavePlan, SaveReducer, SaveReduction,
+    ObservedFileVersion, SaveCause, SaveError, SaveGeneration, SavePlan, SaveReducer,
+    SaveReduction, SaveTouch,
 };
 
 /// The save-side half of admission's decoding ([`Decoded::hold`]): a face that
@@ -264,7 +265,10 @@ pub enum AtomicCommitResult {
     },
     Failed {
         stage: AtomicSaveStage,
+        /// The step's own account, for a log; never words for a person.
         message: String,
+        /// What the step met, for a caller to word ([`SaveCause`]).
+        cause: Option<SaveCause>,
     },
     /// The atomic replacement succeeded, but a later durability, binding, or
     /// content-proof step failed. Callers must retain their dirty state and
@@ -274,7 +278,50 @@ pub enum AtomicCommitResult {
         stage: AtomicSaveStage,
         observed: Option<ObservedFileVersion>,
         message: String,
+        cause: Option<SaveCause>,
     },
+}
+
+/// A failed step of a commit: its account, for a log, and the I/O error
+/// behind it with what the step was doing ([`SaveCause`]), which is what a
+/// caller words for a person (a folder that is not writable, a full disk);
+/// `None` is a refusal of the step's own (a hostile lock entry, a target
+/// with no parent, an observation that moved).
+#[derive(Debug)]
+struct StepFailure {
+    message: String,
+    cause: Option<SaveCause>,
+}
+
+impl StepFailure {
+    fn io(touch: SaveTouch, message: String, error: &std::io::Error) -> Self {
+        Self::met(touch, message, error.kind())
+    }
+
+    fn met(touch: SaveTouch, message: impl Into<String>, kind: std::io::ErrorKind) -> Self {
+        Self {
+            message: message.into(),
+            cause: Some(SaveCause { kind, touch }),
+        }
+    }
+
+    fn own(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            cause: None,
+        }
+    }
+
+    /// A refused read of the document: the I/O error's kind where it had one.
+    fn read(error: &DocumentHostError) -> Self {
+        Self {
+            message: error.to_string(),
+            cause: error.io_kind().map(|kind| SaveCause {
+                kind,
+                touch: SaveTouch::Read,
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -413,6 +460,7 @@ fn require_existing_directory(path: &Path) -> Result<(), DocumentHostError> {
         Ok(_) => Err(DocumentHostError::NotAFile),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(DocumentHostError::Io {
             stage: AtomicSaveStage::Preflight,
+            kind: Some(std::io::ErrorKind::NotFound),
             message: format!("{}{MISSING_SUFFIX}", parent.display()),
         }),
         Err(error) => Err(open_read_error(parent, error)),
@@ -433,6 +481,7 @@ pub fn open_path(path: &Path) -> Result<(PathBuf, String), DocumentHostError> {
             if fs::symlink_metadata(path).is_ok() {
                 return Err(DocumentHostError::SymlinkComponent {
                     path: path.to_path_buf(),
+                    dangling: true,
                 });
             }
             let Some(name) = path.file_name() else {
@@ -447,6 +496,7 @@ pub fn open_path(path: &Path) -> Result<(PathBuf, String), DocumentHostError> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Err(DocumentHostError::Io {
                         stage: AtomicSaveStage::Preflight,
+                        kind: Some(std::io::ErrorKind::NotFound),
                         message: format!("{}{MISSING_SUFFIX}", directory.display()),
                     });
                 }
@@ -475,17 +525,23 @@ pub enum DocumentHostError {
     Io {
         stage: AtomicSaveStage,
         message: String,
+        /// The kind of the I/O error behind it, where one was.
+        kind: Option<std::io::ErrorKind>,
     },
     ChangedWhileReading,
     SymlinkComponent {
         path: PathBuf,
+        /// The link names no file: the final component of a path to open
+        /// is a symbolic link whose target does not exist ([`open_path`]),
+        /// not a link met on the way to a file (which a retry may pass).
+        dangling: bool,
     },
     TargetRetargeted,
     /// The target is a DATALESS file — evicted from iCloud Drive (or another
     /// File Provider) — and the reading thread's policy forbids waiting for the
     /// download. macOS reports exactly this as `EDEADLK` from `read(2)` when
     /// `IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES` is OFF for the thread (see
-    /// aterm-gui's `dataless_files`); open/stat/realpath all succeed first, so the
+    /// aterm-diskwalk's `iopol`); open/stat/realpath all succeed first, so the
     /// read is the only place it can surface.
     #[cfg(unix)]
     NotDownloaded {
@@ -511,7 +567,7 @@ impl DocumentHostError {
             Self::SymlinkComponent { .. } => "symlink",
             #[cfg(unix)]
             Self::NotDownloaded { .. } => "file-provider",
-            Self::Io { stage, message }
+            Self::Io { stage, message, .. }
                 if *stage == AtomicSaveStage::Preflight && message.ends_with(MISSING_SUFFIX) =>
             {
                 "missing"
@@ -525,6 +581,16 @@ impl DocumentHostError {
             | Self::UnknownGrant
             | Self::ChangedWhileReading
             | Self::TargetRetargeted => "unreadable",
+        }
+    }
+
+    /// The kind of the I/O error behind a refused read, where one was: what
+    /// a caller words for a person (a file that is not readable, a volume
+    /// that does not answer), never the error's own text.
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Io { kind, .. } => *kind,
+            _ => None,
         }
     }
 }
@@ -541,9 +607,17 @@ impl std::fmt::Display for DocumentHostError {
             Self::TooLarge { limit } => write!(f, "document exceeds the {limit}-byte limit"),
             Self::InvalidUtf8 => f.write_str("document is not valid UTF-8"),
             Self::UnknownGrant => f.write_str("unknown document grant"),
-            Self::Io { stage, message } => write!(f, "{stage:?}: {message}"),
+            Self::Io { stage, message, .. } => write!(f, "{stage:?}: {message}"),
             Self::ChangedWhileReading => f.write_str("document changed while it was being read"),
-            Self::SymlinkComponent { path } => write!(
+            Self::SymlinkComponent {
+                path,
+                dangling: true,
+            } => write!(
+                f,
+                "{} is a symbolic link to a file that does not exist",
+                path.display()
+            ),
+            Self::SymlinkComponent { path, .. } => write!(
                 f,
                 "symbolic-link path components are not writable capabilities: {}",
                 path.display()
@@ -839,6 +913,35 @@ impl DocumentPersistenceStore {
         text: &str,
     ) -> Result<(), PersistenceError> {
         self.rebind(document, observed, text, SameReading::Exact)
+    }
+
+    /// Rebind `document`'s baseline to `observed`, a fresh read of a file
+    /// that changed under the buffer, for a save that replaces that version
+    /// with the buffer's text: the overwrite a person asks for after a save
+    /// refused as a conflict (the terminal face's second `C-x C-s`).
+    ///
+    /// The buffer keeps the mapping its text is held with, whatever the new
+    /// bytes' own reading says: its save writes the text back the way it was
+    /// read, never with a carriage return a different reading would add
+    /// before each held one (a mixed buffer saved as CRLF) or drop (a CRLF
+    /// buffer saved as LF). No exact image is kept, since the buffer is not
+    /// that version's text; the save's own completion records the next.
+    pub fn accept_overwrite(
+        &mut self,
+        document: DocumentId,
+        observed: ObservedFileVersion,
+    ) -> Result<(), PersistenceError> {
+        let persistence = self
+            .documents
+            .get_mut(&document)
+            .ok_or(PersistenceError::UnknownDocument)?;
+        let encoding = persistence.save.observed().encoding();
+        persistence
+            .save
+            .accept_observation(observed.with_encoding(encoding))
+            .map_err(PersistenceError::Save)?;
+        persistence.observed_image = None;
+        Ok(())
     }
 
     fn rebind(
@@ -1152,6 +1255,7 @@ enum RegularReadHandle {
 fn open_read_error(path: &Path, error: std::io::Error) -> DocumentHostError {
     DocumentHostError::Io {
         stage: AtomicSaveStage::Preflight,
+        kind: Some(error.kind()),
         message: format!("could not open {}: {error}", path.display()),
     }
 }
@@ -1176,6 +1280,7 @@ fn open_regular_read(path: &Path) -> Result<RegularReadHandle, DocumentHostError
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
             return Err(DocumentHostError::SymlinkComponent {
                 path: path.to_path_buf(),
+                dangling: false,
             });
         }
         Err(error) => return Err(open_read_error(path, error)),
@@ -1261,7 +1366,7 @@ fn open_regular_read(path: &Path) -> Result<RegularReadHandle, DocumentHostError
 
 /// Classify one failed `read(2)` on an already-open regular file. `EDEADLK` is
 /// the kernel's one signal that the file is DATALESS and this thread may not
-/// wait for its download (aterm-gui's `dataless_files`); every other error is an
+/// wait for its download (aterm-diskwalk's `iopol`); every other error is an
 /// ordinary preflight I/O failure.
 fn read_error(path: &Path, error: std::io::Error) -> DocumentHostError {
     #[cfg(unix)]
@@ -1272,6 +1377,7 @@ fn read_error(path: &Path, error: std::io::Error) -> DocumentHostError {
     }
     DocumentHostError::Io {
         stage: AtomicSaveStage::Preflight,
+        kind: Some(error.kind()),
         message: format!("could not read {}: {error}", path.display()),
     }
 }
@@ -1298,6 +1404,7 @@ fn bounded_read(
         .map_err(|error| read_error(path, error))?;
     let after = file.metadata().map_err(|error| DocumentHostError::Io {
         stage: AtomicSaveStage::Preflight,
+        kind: Some(error.kind()),
         message: error.to_string(),
     })?;
     if !after.file_type().is_file() || metadata_token(metadata) != metadata_token(&after) {
@@ -1317,6 +1424,7 @@ fn read_stable_file(
         }
         return Err(DocumentHostError::Io {
             stage: AtomicSaveStage::Preflight,
+            kind: Some(std::io::ErrorKind::NotFound),
             message: format!("{}{MISSING_SUFFIX}", path.display()),
         });
     };
@@ -1414,6 +1522,7 @@ fn resolve_atomic_target(
     if !allow_config_symlinks && let Some(binding) = logical_symlinks.first() {
         return Err(DocumentHostError::SymlinkComponent {
             path: binding.path.clone(),
+            dangling: false,
         });
     }
     let target_path = canonical_target_path(&normalized)?;
@@ -1421,6 +1530,7 @@ fn resolve_atomic_target(
     if !allow_config_symlinks && let Some(binding) = confirmed_symlinks.first() {
         return Err(DocumentHostError::SymlinkComponent {
             path: binding.path.clone(),
+            dangling: false,
         });
     }
     if confirmed_symlinks != logical_symlinks {
@@ -1452,6 +1562,7 @@ fn canonical_target_path(path: &Path) -> Result<PathBuf, DocumentHostError> {
         }
         Err(error) => Err(DocumentHostError::Io {
             stage: AtomicSaveStage::Preflight,
+            kind: Some(error.kind()),
             message: error.to_string(),
         }),
     }
@@ -1485,6 +1596,7 @@ fn normalize_process_temp_root(path: &Path) -> Result<PathBuf, DocumentHostError
     };
     let root = fs::canonicalize(&temporary).map_err(|error| DocumentHostError::Io {
         stage: AtomicSaveStage::Preflight,
+        kind: Some(error.kind()),
         message: format!(
             "could not canonicalize the process temporary root {}: {error}",
             temporary.display()
@@ -1557,6 +1669,7 @@ where
             Err(error) => {
                 return Err(DocumentHostError::Io {
                     stage: AtomicSaveStage::Preflight,
+                    kind: Some(error.kind()),
                     message: format!("could not validate {}: {error}", prefix.display()),
                 });
             }
@@ -1589,6 +1702,7 @@ fn reject_symlink_components(path: &Path) -> Result<(), DocumentHostError> {
         if metadata.file_type().is_symlink() {
             return Err(DocumentHostError::SymlinkComponent {
                 path: prefix.to_path_buf(),
+                dangling: false,
             });
         }
         Ok(())
@@ -1607,12 +1721,14 @@ fn logical_symlink_bindings(path: &Path) -> Result<Vec<LogicalSymlinkBinding>, D
         }
         let destination = fs::read_link(prefix).map_err(|error| DocumentHostError::Io {
             stage: AtomicSaveStage::Preflight,
+            kind: Some(error.kind()),
             message: format!("could not read symbolic link {}: {error}", prefix.display()),
         })?;
         // Require each admitted link to resolve at admission time. In particular,
         // this distinguishes a missing config suffix from a dangling final link.
         fs::canonicalize(prefix).map_err(|error| DocumentHostError::Io {
             stage: AtomicSaveStage::Preflight,
+            kind: Some(error.kind()),
             message: format!(
                 "could not resolve symbolic link {}: {error}",
                 prefix.display()
@@ -1644,17 +1760,20 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, DocumentHostError>
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let name = cursor.file_name().ok_or_else(|| DocumentHostError::Io {
                     stage: AtomicSaveStage::Preflight,
+                    kind: None,
                     message: format!("{} has no existing ancestor", path.display()),
                 })?;
                 suffix.push(name.to_os_string());
                 cursor = cursor.parent().ok_or_else(|| DocumentHostError::Io {
                     stage: AtomicSaveStage::Preflight,
+                    kind: None,
                     message: format!("{} has no parent", path.display()),
                 })?;
             }
             Err(error) => {
                 return Err(DocumentHostError::Io {
                     stage: AtomicSaveStage::Preflight,
+                    kind: Some(error.kind()),
                     message: error.to_string(),
                 });
             }
@@ -1695,14 +1814,22 @@ fn validate_logical_binding(
 /// an attacker-grown file to EOF. When lengths can match, the complete content
 /// is necessarily within the limit and its fingerprint remains exact.
 pub fn observe_file(path: &Path, content_limit: usize) -> Result<ObservedFileVersion, String> {
-    let opened = open_regular_read(path).map_err(|error| error.to_string())?;
+    observe_target(path, content_limit).map_err(|failure| failure.message)
+}
+
+/// [`observe_file`], its failure keeping the I/O error behind a refused read
+/// for a commit to report ([`StepFailure::read`]).
+fn observe_target(path: &Path, content_limit: usize) -> Result<ObservedFileVersion, StepFailure> {
+    let opened = open_regular_read(path).map_err(|error| StepFailure::read(&error))?;
     let RegularReadHandle::Open { mut file, metadata } = opened else {
         return Ok(ObservedFileVersion::missing());
     };
     let (bytes, after) = bounded_read(path, &mut file, &metadata, content_limit)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| StepFailure::read(&error))?;
     if bytes.len() <= content_limit && after.len() != bytes.len() as u64 {
-        return Err("target changed while it was being observed".to_string());
+        return Err(StepFailure::own(
+            "target changed while it was being observed",
+        ));
     }
     Ok(ObservedFileVersion {
         exists: true,
@@ -1770,15 +1897,25 @@ fn execute_atomic_save(target: &AtomicFileTarget, plan: &SavePlan) -> AtomicSave
             observed,
             equivalent_rebind_allowed: validate_atomic_target(target).is_ok(),
         },
-        AtomicCommitResult::Failed { stage, message } => failed(stage, message),
+        AtomicCommitResult::Failed {
+            stage,
+            message,
+            cause,
+        } => AtomicSaveResult::Failed {
+            stage,
+            message,
+            cause,
+        },
         AtomicCommitResult::PublishedUnverified {
             stage,
             observed,
             message,
+            cause,
         } => AtomicSaveResult::PublishedUnverified {
             stage,
             observed,
             message,
+            cause,
         },
     }
 }
@@ -1790,10 +1927,34 @@ fn write_lock_not_regular(path: &Path) -> String {
     )
 }
 
+/// The save lock every commit of `path` (in `parent`) takes, a hidden
+/// sibling of it.
+fn save_lock_path(path: &Path, parent: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
+    parent.join(format!(".{}.aterm-write.lock", name.to_string_lossy()))
+}
+
+/// The save lock a commit of `path` takes, which a person may have to
+/// remove when it is another user's ([`SaveTouch::Lock`]); `None` for a
+/// path with no folder.
+pub fn save_lock_of(path: &Path) -> Option<PathBuf> {
+    path.parent().map(|parent| save_lock_path(path, parent))
+}
+
+/// What a failed open of the save lock at `path` was doing: opening the lock
+/// already there (another user's, say), or making it in the folder.
+fn lock_open_touch(path: &Path) -> SaveTouch {
+    if fs::symlink_metadata(path).is_ok() {
+        SaveTouch::Lock
+    } else {
+        SaveTouch::Folder
+    }
+}
+
 /// Open one sibling write lock without following or waiting on its final
 /// component. The handle which will be locked is itself proved regular.
 #[cfg(unix)]
-fn open_write_lock(path: &Path) -> Result<File, String> {
+fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     let file = OpenOptions::new()
@@ -1804,22 +1965,40 @@ fn open_write_lock(path: &Path) -> Result<File, String> {
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|error| format!("could not open save lock {}: {error}", path.display()))?;
+        .map_err(|error| {
+            StepFailure::io(
+                lock_open_touch(path),
+                format!("could not open save lock {}: {error}", path.display()),
+                &error,
+            )
+        })?;
     if !file
         .metadata()
-        .map_err(|error| format!("could not inspect save lock {}: {error}", path.display()))?
+        .map_err(|error| {
+            StepFailure::io(
+                SaveTouch::Lock,
+                format!("could not inspect save lock {}: {error}", path.display()),
+                &error,
+            )
+        })?
         .file_type()
         .is_file()
     {
-        return Err(write_lock_not_regular(path));
+        return Err(StepFailure::own(write_lock_not_regular(path)));
     }
     file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("could not protect save lock {}: {error}", path.display()))?;
+        .map_err(|error| {
+            StepFailure::io(
+                SaveTouch::Lock,
+                format!("could not protect save lock {}: {error}", path.display()),
+                &error,
+            )
+        })?;
     Ok(file)
 }
 
 #[cfg(windows)]
-fn open_write_lock(path: &Path) -> Result<File, String> {
+fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -1831,30 +2010,41 @@ fn open_write_lock(path: &Path) -> Result<File, String> {
         .truncate(false)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|error| format!("could not open save lock {}: {error}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("could not inspect save lock {}: {error}", path.display()))?;
+        .map_err(|error| {
+            StepFailure::io(
+                lock_open_touch(path),
+                format!("could not open save lock {}: {error}", path.display()),
+                &error,
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        StepFailure::io(
+            SaveTouch::Lock,
+            format!("could not inspect save lock {}: {error}", path.display()),
+            &error,
+        )
+    })?;
     if !metadata.file_type().is_file()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
-        return Err(write_lock_not_regular(path));
+        return Err(StepFailure::own(write_lock_not_regular(path)));
     }
     Ok(file)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_write_lock(path: &Path) -> Result<File, String> {
+fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err(write_lock_not_regular(path));
+            return Err(StepFailure::own(write_lock_not_regular(path)));
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(format!(
-                "could not inspect save lock {}: {error}",
-                path.display()
+            return Err(StepFailure::io(
+                SaveTouch::Lock,
+                format!("could not inspect save lock {}: {error}", path.display()),
+                &error,
             ));
         }
     }
@@ -1864,14 +2054,26 @@ fn open_write_lock(path: &Path) -> Result<File, String> {
         .create(true)
         .truncate(false)
         .open(path)
-        .map_err(|error| format!("could not open save lock {}: {error}", path.display()))?;
+        .map_err(|error| {
+            StepFailure::io(
+                lock_open_touch(path),
+                format!("could not open save lock {}: {error}", path.display()),
+                &error,
+            )
+        })?;
     if !file
         .metadata()
-        .map_err(|error| format!("could not inspect save lock {}: {error}", path.display()))?
+        .map_err(|error| {
+            StepFailure::io(
+                SaveTouch::Lock,
+                format!("could not inspect save lock {}: {error}", path.display()),
+                &error,
+            )
+        })?
         .file_type()
         .is_file()
     {
-        return Err(write_lock_not_regular(path));
+        return Err(StepFailure::own(write_lock_not_regular(path)));
     }
     Ok(file)
 }
@@ -2123,14 +2325,22 @@ impl Drop for HeldAdvisoryLock {
 fn acquire_write_lock_within(
     lock_file: File,
     budget: std::time::Duration,
-) -> Result<HeldAdvisoryLock, String> {
+) -> Result<HeldAdvisoryLock, StepFailure> {
     acquire_advisory_lock_within(lock_file, budget).map_err(|refusal| match refusal {
-        AdvisoryLockRefusal::Busy => write_lock_busy(),
-        AdvisoryLockRefusal::Failed(error) => format!("could not acquire save lock: {error}"),
+        AdvisoryLockRefusal::Busy => StepFailure::met(
+            SaveTouch::Lock,
+            write_lock_busy(),
+            std::io::ErrorKind::WouldBlock,
+        ),
+        AdvisoryLockRefusal::Failed(error) => StepFailure::io(
+            SaveTouch::Lock,
+            format!("could not acquire save lock: {error}"),
+            &error,
+        ),
     })
 }
 
-fn acquire_write_lock(lock_file: File) -> Result<HeldAdvisoryLock, String> {
+fn acquire_write_lock(lock_file: File) -> Result<HeldAdvisoryLock, StepFailure> {
     acquire_write_lock_within(lock_file, WRITE_LOCK_RETRY_BUDGET)
 }
 
@@ -2191,7 +2401,7 @@ fn lock_and_verify_target(
     let Some(parent) = path.parent() else {
         return Err(atomic_failed(
             AtomicSaveStage::CreateTemporary,
-            "target has no parent",
+            StepFailure::own("target has no parent"),
         ));
     };
     match directories {
@@ -2199,7 +2409,7 @@ fn lock_and_verify_target(
             if let Err(error) = fs::create_dir_all(parent) {
                 return Err(atomic_failed(
                     AtomicSaveStage::CreateTemporary,
-                    error.to_string(),
+                    StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
                 ));
             }
         }
@@ -2212,7 +2422,10 @@ fn lock_and_verify_target(
                         message,
                     }
                 } else {
-                    atomic_failed(AtomicSaveStage::CreateTemporary, message)
+                    atomic_failed(
+                        AtomicSaveStage::CreateTemporary,
+                        StepFailure::met(SaveTouch::Folder, message, std::io::ErrorKind::NotFound),
+                    )
                 });
             }
         }
@@ -2224,14 +2437,13 @@ fn lock_and_verify_target(
             error,
         ));
     }
-    let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
-    let lock_path = parent.join(format!(".{}.aterm-write.lock", name.to_string_lossy()));
+    let lock_path = save_lock_path(path, parent);
     let lock_file = open_write_lock(&lock_path)
-        .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
+        .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
     // Every refusal below re-enters the preflight retry, whose next take must not
     // meet this attempt's own fork residue: the guard releases by LOCK_UN.
     let lock = acquire_write_lock(lock_file)
-        .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
+        .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
 
     if let Err(error) = validate_atomic_target(target) {
         return Err(atomic_validation_failure(
@@ -2241,8 +2453,8 @@ fn lock_and_verify_target(
         ));
     }
     let baseline_limit = observation_limit(baseline.observed.len);
-    let actual = observe_file(path, baseline_limit)
-        .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
+    let actual = observe_target(path, baseline_limit)
+        .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
     if crate::io::detect_version_conflict(baseline.observed, actual).is_some() {
         return Err(AtomicCommitResult::Conflict {
             observed: actual,
@@ -2262,13 +2474,20 @@ fn commit_atomic_bytes_with_seed(
     if exceeds_document_limit(bytes.len() as u64) {
         return atomic_failed(
             AtomicSaveStage::Preflight,
-            format!("save exceeds the {DOCUMENT_LIMIT_LEN}-byte document limit"),
+            StepFailure::met(
+                SaveTouch::Replace,
+                format!("save exceeds the {DOCUMENT_LIMIT_LEN}-byte document limit"),
+                std::io::ErrorKind::FileTooLarge,
+            ),
         );
     }
     let target = &baseline.target;
     let path = target.target_path();
     let Some(parent) = path.parent() else {
-        return atomic_failed(AtomicSaveStage::CreateTemporary, "target has no parent");
+        return atomic_failed(
+            AtomicSaveStage::CreateTemporary,
+            StepFailure::own("target has no parent"),
+        );
     };
     let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
 
@@ -2301,25 +2520,36 @@ fn commit_atomic_bytes_with_seed(
 
     let (temporary, mut file) = match create_unique_temporary(parent, name, seed) {
         Ok(created) => created,
-        Err(message) => return atomic_failed(AtomicSaveStage::CreateTemporary, message),
+        Err(failure) => return atomic_failed(AtomicSaveStage::CreateTemporary, failure),
     };
     let result: Result<AtomicSaveProof, AtomicCommitResult> = (|| {
         if let Ok(metadata) = fs::metadata(path) {
             fs::set_permissions(&temporary, metadata.permissions()).map_err(|error| {
-                atomic_failed(AtomicSaveStage::CreateTemporary, error.to_string())
+                atomic_failed(
+                    AtomicSaveStage::CreateTemporary,
+                    StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
+                )
             })?;
         }
-        file.write_all(bytes)
-            .map_err(|error| atomic_failed(AtomicSaveStage::WriteTemporary, error.to_string()))?;
-        aterm_gui_consent::durable::finish(&file, flush)
-            .map_err(|error| atomic_failed(AtomicSaveStage::SyncTemporary, error.to_string()))?;
+        file.write_all(bytes).map_err(|error| {
+            atomic_failed(
+                AtomicSaveStage::WriteTemporary,
+                StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
+            )
+        })?;
+        aterm_gui_consent::durable::finish(&file, flush).map_err(|error| {
+            atomic_failed(
+                AtomicSaveStage::SyncTemporary,
+                StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
+            )
+        })?;
         drop(file);
 
         validate_atomic_target(target).map_err(|error| {
             atomic_validation_failure(target, AtomicSaveStage::RenameTarget, error)
         })?;
-        let before_rename = observe_file(path, baseline_limit)
-            .map_err(|message| atomic_failed(AtomicSaveStage::RenameTarget, message))?;
+        let before_rename = observe_target(path, baseline_limit)
+            .map_err(|failure| atomic_failed(AtomicSaveStage::RenameTarget, failure))?;
         if let Some(conflict) = crate::io::detect_version_conflict(baseline.observed, before_rename)
         {
             return Err(AtomicCommitResult::Conflict {
@@ -2332,8 +2562,12 @@ fn commit_atomic_bytes_with_seed(
                 atomic_published_unverified(
                     AtomicSaveStage::RenameTarget,
                     None,
-                    format!(
-                        "replacement reported {error}; its target could not be reconciled: {message}"
+                    StepFailure::io(
+                        SaveTouch::Replace,
+                        format!(
+                            "replacement reported {error}; its target could not be reconciled: {message}"
+                        ),
+                        &error,
                     ),
                 )
             })?;
@@ -2344,7 +2578,13 @@ fn commit_atomic_bytes_with_seed(
                 return Err(atomic_published_unverified(
                     AtomicSaveStage::RenameTarget,
                     Some(after_error),
-                    format!("replacement reported {error}, but the desired bytes are now visible"),
+                    StepFailure::io(
+                        SaveTouch::Replace,
+                        format!(
+                            "replacement reported {error}, but the desired bytes are now visible"
+                        ),
+                        &error,
+                    ),
                 ));
             }
             if let Some(conflict) =
@@ -2357,25 +2597,25 @@ fn commit_atomic_bytes_with_seed(
             }
             return Err(atomic_failed(
                 AtomicSaveStage::RenameTarget,
-                error.to_string(),
+                StepFailure::io(SaveTouch::Replace, error.to_string(), &error),
             ));
         }
         sync_directory(parent, flush).map_err(|error| {
             atomic_published_unverified(
                 AtomicSaveStage::SyncDirectory,
                 observe_file(path, bytes.len()).ok(),
-                error.to_string(),
+                StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
             )
         })?;
         validate_atomic_target(target).map_err(|error| {
             atomic_published_unverified(
                 AtomicSaveStage::ObserveCommitted,
                 observe_file(path, bytes.len()).ok(),
-                error.to_string(),
+                StepFailure::read(&error),
             )
         })?;
-        let observed = observe_file(path, bytes.len()).map_err(|message| {
-            atomic_published_unverified(AtomicSaveStage::ObserveCommitted, None, message)
+        let observed = observe_target(path, bytes.len()).map_err(|failure| {
+            atomic_published_unverified(AtomicSaveStage::ObserveCommitted, None, failure)
         })?;
         if !observed.exists
             || observed.len != bytes.len() as u64
@@ -2384,7 +2624,7 @@ fn commit_atomic_bytes_with_seed(
             return Err(atomic_published_unverified(
                 AtomicSaveStage::VerifyProof,
                 Some(observed),
-                "committed bytes did not match the save plan".to_string(),
+                StepFailure::own("committed bytes did not match the save plan"),
             ));
         }
         Ok(AtomicSaveProof {
@@ -2407,7 +2647,7 @@ fn create_unique_temporary(
     parent: &Path,
     name: &OsStr,
     seed: u64,
-) -> Result<(PathBuf, File), String> {
+) -> Result<(PathBuf, File), StepFailure> {
     for attempt in 0_u64..64 {
         let temporary = parent.join(format!(
             ".{}.aterm-{}-{}-{}.tmp",
@@ -2421,10 +2661,18 @@ fn create_unique_temporary(
         match options.open(&temporary) {
             Ok(file) => return Ok((temporary, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                return Err(StepFailure::io(
+                    SaveTouch::Folder,
+                    error.to_string(),
+                    &error,
+                ));
+            }
         }
     }
-    Err("could not allocate a unique sibling temporary file".to_string())
+    Err(StepFailure::own(
+        "could not allocate a unique sibling temporary file",
+    ))
 }
 
 fn next_temporary_seed() -> u64 {
@@ -2457,26 +2705,28 @@ fn atomic_validation_failure(
         | DocumentHostError::SymlinkComponent { .. }) => {
             atomic_conflict(target, conflict.to_string())
         }
-        other => atomic_failed(stage, other.to_string()),
+        other => atomic_failed(stage, StepFailure::read(&other)),
     }
 }
 
-fn atomic_failed(stage: AtomicSaveStage, message: impl Into<String>) -> AtomicCommitResult {
+fn atomic_failed(stage: AtomicSaveStage, failure: StepFailure) -> AtomicCommitResult {
     AtomicCommitResult::Failed {
         stage,
-        message: message.into(),
+        message: failure.message,
+        cause: failure.cause,
     }
 }
 
 fn atomic_published_unverified(
     stage: AtomicSaveStage,
     observed: Option<ObservedFileVersion>,
-    message: impl Into<String>,
+    failure: StepFailure,
 ) -> AtomicCommitResult {
     AtomicCommitResult::PublishedUnverified {
         stage,
         observed,
-        message: message.into(),
+        message: failure.message,
+        cause: failure.cause,
     }
 }
 
@@ -2579,6 +2829,7 @@ fn failed(stage: AtomicSaveStage, message: impl Into<String>) -> AtomicSaveResul
     AtomicSaveResult::Failed {
         stage,
         message: message.into(),
+        cause: None,
     }
 }
 
@@ -2588,13 +2839,13 @@ mod tests {
     use crate::io::{SaveReducer, SaveReduction};
 
     fn unique_file(name: &str, bytes: &[u8]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-native-document-host-{}-{}",
-            std::process::id(),
-            name
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        // The callers remove this directory: keep only one we created
+        // exclusively, never a predictable name left by another run.
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-native-document-host-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("hello world.md");
         fs::write(&path, bytes).unwrap();
         path
@@ -2912,6 +3163,59 @@ mod tests {
                     .observed_text_matches(opened.document, &refreshed.text),
                 "{name}: the watch finds the buffer's own save unchanged"
             );
+            let _ = fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    /// A save refused because the file changed under the buffer is refused
+    /// again until the disk's version is taken; taken by an overwrite, the
+    /// next save writes the buffer with the mapping the buffer holds it with,
+    /// whatever the new bytes would read as: a CRLF buffer over an LF file
+    /// keeps its CRLF, and a mixed buffer (its CRs in the text) over a CRLF
+    /// file gains no second CR.
+    #[test]
+    fn an_overwrite_keeps_the_buffers_mapping() {
+        for (name, read, theirs, ours, written) in [
+            (
+                "overwrite-crlf",
+                &b"one\r\ntwo\r\n"[..],
+                &b"theirs\n"[..],
+                "ours\n",
+                &b"ours\r\n"[..],
+            ),
+            (
+                "overwrite-mixed",
+                b"a\r\nb\n",
+                b"x\r\ny\r\n",
+                "a\r\nb\nc\n",
+                b"a\r\nb\nc\n",
+            ),
+        ] {
+            let path = unique_file(name, read);
+            let mut opened = open_document(&path, AdmitOptions::DOCUMENT);
+            opened.set_text(ours);
+            fs::write(&path, theirs).unwrap();
+            assert!(
+                matches!(opened.save(), SaveReduction::Conflict(_)),
+                "{name}"
+            );
+            let snapshot = opened.documents.snapshot(opened.document).unwrap();
+            assert!(matches!(
+                opened.persistence.begin(&snapshot),
+                Err(PersistenceError::Save(SaveError::ConflictRequiresReconcile))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), theirs, "{name}: nothing written");
+
+            let fresh = opened
+                .grants
+                .refresh_local(opened.granted.grant.id, DEFAULT_DOCUMENT_LIMIT)
+                .unwrap();
+            opened
+                .persistence
+                .accept_overwrite(opened.document, fresh.observed)
+                .unwrap();
+            assert!(matches!(opened.save(), SaveReduction::Durable(_)), "{name}");
+            assert_eq!(fs::read(&path).unwrap(), written, "{name}");
             let _ = fs::remove_dir_all(path.parent().unwrap());
         }
     }
@@ -3239,6 +3543,10 @@ mod tests {
                 SaveReduction::Failed {
                     stage: AtomicSaveStage::CreateTemporary,
                     message,
+                    cause: Some(SaveCause {
+                        kind: std::io::ErrorKind::NotFound,
+                        touch: SaveTouch::Folder,
+                    }),
                 } if message.ends_with(MISSING_SUFFIX)
             ),
             "{reduction:?}"
@@ -3364,7 +3672,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The main thread's dataless-file policy is OFF (aterm-gui's `dataless_files`),
+    /// The main thread's dataless-file policy is OFF (aterm-diskwalk's `iopol`),
     /// so an evicted iCloud Drive item's first `read(2)` returns `EDEADLK`
     /// instead of blocking. That one errno — and only that one — is the
     /// "download it in Finder first" verdict; every other read failure stays an
@@ -3543,6 +3851,7 @@ mod tests {
             AtomicCommitResult::Failed {
                 stage: AtomicSaveStage::Preflight,
                 message,
+                cause: None,
             } if message.contains("regular non-link")
         ));
         // Refuses-without-BLOCKING: opening the FIFO for write parks FOREVER (no
@@ -3621,6 +3930,10 @@ mod tests {
             AtomicCommitResult::Failed {
                 stage: AtomicSaveStage::Preflight,
                 message,
+                cause: Some(SaveCause {
+                    kind: std::io::ErrorKind::WouldBlock,
+                    touch: SaveTouch::Lock,
+                }),
             } if message.contains("busy") && message.contains("retry Save")
         ));
         // Refuses-without-BLOCKING: a blocking `flock` on a lock nobody releases
@@ -3727,7 +4040,7 @@ mod tests {
 
         assert!(matches!(
             read_stable_file(target.target_path(), 1024, false),
-            Err(DocumentHostError::SymlinkComponent { path: rejected })
+            Err(DocumentHostError::SymlinkComponent { path: rejected, .. })
                 if rejected == target.target_path()
         ));
         assert_eq!(fs::read(&displaced).unwrap(), b"original");
@@ -3774,6 +4087,10 @@ mod tests {
             AtomicCommitResult::Failed {
                 stage: AtomicSaveStage::Preflight,
                 message,
+                cause: Some(SaveCause {
+                    kind: std::io::ErrorKind::FileTooLarge,
+                    ..
+                }),
             } if message.contains("document limit")
         ));
         assert_eq!(fs::read(&path).unwrap(), b"old");
@@ -3815,12 +4132,17 @@ mod tests {
                 AtomicSaveStage::Preflight,
                 DocumentHostError::Io {
                     stage: AtomicSaveStage::Preflight,
+                    kind: Some(std::io::ErrorKind::PermissionDenied),
                     message: "permission denied".to_string(),
                 },
             ),
             AtomicCommitResult::Failed {
                 stage: AtomicSaveStage::Preflight,
                 message,
+                cause: Some(SaveCause {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    touch: SaveTouch::Read,
+                }),
             } if message.contains("permission denied")
         ));
         assert!(matches!(

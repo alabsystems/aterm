@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The snapshot install and its units, in a scratch home with a fake build and a
-//! recording service manager — nothing here touches launchd, systemd or a machine key —
-//! plus the snapshot self-check `lane run` makes against its own executable.
+//! The snapshot install and its units, in a scratch home with a fake build and a recording
+//! service manager (nothing touches launchd, systemd or a machine key), plus the snapshot
+//! self-check `lane run` makes against its own executable.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

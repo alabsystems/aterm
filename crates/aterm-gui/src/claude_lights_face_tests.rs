@@ -258,8 +258,7 @@ fn rows() -> Vec<Row> {
             "\u{2298} off",
             "\u{2298}",
             (Dim, Dim),
-            "harness off in Settings \u{b7} click: open Settings \u{25b8} Harness \u{b7} right-click: \
-             more",
+            "harness off in Settings \u{b7} click: turn the harness on \u{b7} right-click: more",
             "harness off in Settings",
             "Autopilot: off. The harness is off in Settings.",
         ),
@@ -272,8 +271,8 @@ fn rows() -> Vec<Row> {
             "\u{2298} off",
             "\u{2298}",
             (Dim, Dim),
-            "Supervise Claude Code sessions is off \u{b7} click: open Settings \u{25b8} Harness \
-             \u{b7} right-click: more",
+            "Supervise Claude Code sessions is off \u{b7} click: turn the harness on \u{b7} \
+             right-click: more",
             "Supervise Claude Code sessions is off",
             "Autopilot: off. Supervise Claude Code sessions is off in Settings.",
         ),

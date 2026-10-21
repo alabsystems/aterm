@@ -1,23 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A lane never waits on its peer (`control_lanes.rs`). It is given a
-//! connection only with a whole request in hand, and it writes the answer
-//! without waiting for the peer to read it; the parker waits for the rest of a
-//! handshake, line or frame a peer began, and delivers the part of an answer
-//! it has not read yet. Before, a client that dribbled its `AUTH` line (no
-//! token needed), stopped mid-line or mid-frame, or did not read a large
-//! answer held its lane for as long as it liked, and eight of them answered
-//! every other client `ERR control server busy; retry`; a deadline on each wait
-//! only made such peers reconnect when it ran out. The one wait that IS the
-//! request, a relay, runs on a wait lane: a relayed `subscribe` held a request
-//! lane for the whole subscription.
+//! A lane never waits on its peer (`control_lanes.rs`): it takes a connection only with a
+//! whole request in hand and writes the answer without waiting for it to be read. The parker
+//! waits for the rest of a begun handshake, line or frame and delivers the unread part of an
+//! answer; a relay, the one wait that is the request, runs on a wait lane.
 //!
-//! These drive the genuine [`Lanes`] — one request lane, so a lane held is a
-//! fresh client refused — over real socket pairs, with a stub service (the
-//! relay with the genuine classifier and forward, to a stand-in sibling). Every
-//! wait for something that must happen is a hang detector
-//! ([`aterm_spec::wait::MUST_HAPPEN`]), never a latency budget.
+//! These drive the genuine [`Lanes`] with one request lane (so a lane held is a fresh client
+//! refused) over real socket pairs, with a stub service.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -217,12 +207,8 @@ fn next_line(reader: &mut impl std::io::BufRead) -> String {
     }
 }
 
-/// THE UNREAD ANSWER (a pager, a consumer that paused). A client asks for a
-/// large answer and reads none of it for now: the lane wrote on until the peer
-/// read, holding it — and a write bound cut the reader off instead. Now the
-/// lane delivers what fits and the parker the rest, as the peer reads; the
-/// answer arrives whole and in order, and the request pipelined behind it is
-/// answered after it.
+/// A large answer the client does not read yet keeps no lane; it arrives whole and in order,
+/// and the request pipelined behind it is answered after it.
 #[test]
 fn an_unread_answer_keeps_no_lane_and_arrives_whole_in_order() {
     let rig = Rig::new();
@@ -259,10 +245,7 @@ fn an_answer_whose_peer_hangs_up_unread_is_dropped() {
     rig.settle("the connection closed", |census| census.open == 0);
 }
 
-/// THE ABANDONED LINE. An authenticated peer sends half a request (`vers`) and
-/// stops: the lane waited for the newline (a deadline on it only made such
-/// peers reconnect). Now the parker holds what came, and the request is
-/// served once the rest arrives.
+/// Half a request (`vers`) parks, and is served once the rest arrives.
 #[test]
 fn a_begun_request_keeps_no_lane_and_is_served_once_whole() {
     let rig = Rig::new();
@@ -275,10 +258,8 @@ fn a_begun_request_keeps_no_lane_and_is_served_once_whole() {
     assert_eq!(line_of(&halfway), "OK version", "nothing begun was lost");
 }
 
-/// THE ABANDONED FRAME, and its header. `feed-bin <n>` announces a body; a peer
-/// that sends part of it held the lane. Now the header is acted on as soon as
-/// it is whole — the input boundary it is — and the parker waits for the body;
-/// the frame is served once it is whole.
+/// A frame header (`feed-bin <n>`) is acted on as soon as it is whole, being an input
+/// boundary; the parker waits for the body, and the frame is served once it is whole.
 #[test]
 fn a_frame_header_is_acted_on_at_once_and_its_body_keeps_no_lane() {
     let rig = Rig::new();
@@ -312,7 +293,7 @@ fn a_frame_header_is_acted_on_at_once_and_its_body_keeps_no_lane() {
     );
 }
 
-/// A LARGE REQUEST ARRIVING SLOWLY is held off the heap: half a 200 000-byte
+/// A large request arriving slowly is held off the heap: half a 200 000-byte
 /// frame body, then half of a line that has no newline yet, are held parked in
 /// a mapping sized for the whole request (the frame's line and body; the
 /// longest line plus one), whether the parker read them or a lane began to
@@ -473,11 +454,8 @@ impl LaneService for FramedWaits {
     }
 }
 
-/// A framed wait refused busy (no wait lane takes it, no inline place is
-/// free) is closed once its busy line is out. Before, the connection was kept
-/// and the next turn served the unread body line by line AS REQUESTS, under
-/// the connection's scope: a paste's text became control verbs. With a parker
-/// and without one.
+/// A framed wait refused busy (no wait lane, no free inline place) closes once its busy line
+/// is out, so its unread body is never served as requests. With a parker and without one.
 #[test]
 fn a_framed_wait_refused_busy_closes_and_serves_none_of_its_body() {
     for open in [16, 0] {
@@ -619,14 +597,11 @@ impl Drop for ScratchDir {
     }
 }
 
-/// THE RELAYED SUBSCRIPTION. `subscribe @<sid>` for a session another
-/// instance hosts is relayed to it for as long as the subscription lives. Its
-/// selector comes second, so it was classed request-lane work, and eight
-/// watchers of another window's sessions held every request lane: every other
-/// client was answered `ERR control server busy; retry` while they watched.
+/// The relayed subscription: `subscribe @<sid>` for a session another
+/// instance hosts is relayed to it for as long as the subscription lives.
 /// Here the genuine lanes, classifier, forward and relay carry one such
 /// subscription to a stand-in sibling that serves it with the genuine
-/// subscribe handler, with ONE request lane: the relay runs on a wait lane,
+/// subscribe handler, with one request lane: the relay runs on a wait lane,
 /// and a fresh client is answered while it lives. So does a line the request
 /// grammar reads the same with tabs for spaces, which a sibling hop forwards
 /// as written: the sibling's handler acks it too.
@@ -768,10 +743,8 @@ impl Drop for Dribbler {
     }
 }
 
-/// THE TOKENLESS DRIBBLE. Peers with no token send `AUTH ` and then a byte
-/// every 10 ms: each held a lane while its handshake was read, and with a
-/// deadline on it reconnected when it ran out. Now the parker holds them, and
-/// a fresh client is answered while they dribble.
+/// Tokenless peers that dribble `AUTH ` a byte every 10 ms park, and a fresh client is answered
+/// while they dribble.
 #[test]
 fn dribbled_handshakes_keep_no_lane() {
     let rig = Rig::new();
@@ -806,8 +779,8 @@ fn a_handshake_that_never_ends_is_dropped_at_its_lifetime() {
     });
 }
 
-/// Without a parker the lane serves as it always did, waiting on its peer: a
-/// large answer is written whole to a client that reads it.
+/// Without a parker the lane waits on its peer: a large answer is written whole to a client
+/// that reads it.
 #[test]
 fn without_a_parker_the_lane_writes_and_reads_waiting() {
     let rig = Rig::with_open(0);
@@ -825,11 +798,8 @@ fn without_a_parker_the_lane_writes_and_reads_waiting() {
     assert_eq!(next, "OK version\n");
 }
 
-/// THE TOKENLESS DRIBBLE on a lane with no parker. Each read came back long
-/// before a per-read timeout, so the lane read on until the 64 KiB line cap
-/// (about eleven minutes at a byte every 10 ms; 22 days at one every 29 s). The
-/// handshake's deadline is the whole line's, so the lane gives up at it however
-/// many bytes still arrive.
+/// Without a parker, a dribbled handshake ends at its deadline, which bounds the whole line
+/// rather than each read, however many bytes still arrive.
 #[test]
 fn a_dribbled_handshake_ends_at_its_deadline() {
     let (client, server) = CtlStream::pair().expect("socket pair");

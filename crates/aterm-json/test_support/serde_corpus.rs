@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Recorded answers for the serde corpus (docs/AUDIT-third-party-2026-10-15.md,
-//! SP.3): what aterm's models do with a document, written down while the models
-//! derived through registry serde, so the first-party serde that replaced it at
-//! SP.6 is held to every answer.
+//! Recorded answers for the serde corpus: what aterm's models do with a
+//! document, holding first-party serde to the reference verdicts.
 //!
 //! Each crate whose models carry a persistence or security surface includes
 //! this file by `#[path]` and records one case per input: an `Ok` as the value
@@ -62,6 +60,23 @@ impl Corpus {
     /// Hold the recorded answers to the committed file (or rewrite it under
     /// `ATERM_BLESS_SERDE_CORPUS=1`).
     pub(crate) fn finish(self) {
+        let got = self.render();
+        if std::env::var_os("ATERM_BLESS_SERDE_CORPUS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            if let Some(dir) = std::path::Path::new(&self.path).parent() {
+                std::fs::create_dir_all(dir).expect("serde corpus directory");
+            }
+            std::fs::write(&self.path, got).expect("bless serde corpus");
+            return;
+        }
+        self.compare(&got);
+    }
+
+    /// The answers file the recorded cases make, exactly as [`Self::finish`]
+    /// holds it to the committed one (and blesses it): refused when a case id
+    /// is recorded twice or every case answers alike.
+    pub(crate) fn render(&self) -> String {
         let mut ids: Vec<&str> = self.cases.iter().map(|(id, _, _)| id.as_str()).collect();
         ids.sort_unstable();
         if let Some(pair) = ids.windows(2).find(|pair| pair[0] == pair[1]) {
@@ -87,15 +102,11 @@ impl Corpus {
         for (id, verdict, text) in &self.cases {
             let _ = writeln!(got, "{id}\t{verdict}\t{text}");
         }
-        if std::env::var_os("ATERM_BLESS_SERDE_CORPUS").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-        {
-            if let Some(dir) = std::path::Path::new(&self.path).parent() {
-                std::fs::create_dir_all(dir).expect("serde corpus directory");
-            }
-            std::fs::write(&self.path, got).expect("bless serde corpus");
-            return;
-        }
+        got
+    }
+
+    /// Panic, naming each moved answer, unless `got` is the committed file.
+    fn compare(&self, got: &str) {
         let want = std::fs::read_to_string(&self.path).unwrap_or_else(|e| {
             panic!(
                 "missing serde corpus {}: {e}; record it with ATERM_BLESS_SERDE_CORPUS=1",
@@ -118,7 +129,7 @@ impl Corpus {
                 })
                 .collect()
         };
-        let (want, got) = (answers(&want), answers(&got));
+        let (want, got) = (answers(&want), answers(got));
         let mut report = String::new();
         let mut moved = 0usize;
         for (id, answer) in &got {

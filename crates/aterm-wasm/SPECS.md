@@ -3,41 +3,19 @@
 
 # aterm-wasm: spec recovery from its 161 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 51 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+> The 73 specs below are the crate's migration worklist: each is proved through Trust/Clean about
+> the compiled Rust function, then the tests it subsumes are deleted. `predict_api.rs` exports
+> `predict_edit_key` (`←`, `→`, Backspace to `Predictor::predict_edit`; `predict_backspace` routes
+> through it) and `predict_overlay_cursor` (a state chain's cursor), covered by `predict-off-inert`,
+> `predict-no-echo-contexts` and `predict-binding-refines-predictor`. A glyph typed inside a line is
+> a shift whose overlay emits `[row, col, codepoint]` triples for both the typed glyph and the text
+> it moved. Because the web reads no signed OSC 133 `B` prompt marks and no row below the cursor,
+> every `KeySample` passes `input_start: None`, `wrap_pending: Some(Grid::pending_wrap())` and
+> `below: None` (so Home, End, Ctrl-A, Ctrl-E and Delete remain unmodelled input).
 
-> Status 2026-10-20, predictive editing increment 2: `predict_api.rs` has 14 tests (13 before) and two
-> new exports, `predict_edit_key` (`←`, `→`, Backspace to `Predictor::predict_edit`; `predict_backspace`
-> routes through it) and `predict_overlay_cursor` (a state chain's cursor). `predict-off-inert`,
-> `predict-no-echo-contexts` and `predict-binding-refines-predictor` state them, and the CPU replay
-> (`abi_replay.json`) records them on a terminal of their own.
-
-> Status 2026-10-20, predictive editing increment 3: `predict_api.rs` has 15 tests. A glyph typed inside a
-> line is a SHIFT, and its overlay is the typed glyph and the text it moved, each a `[row, col, codepoint]`
-> triple (`predict-binding-refines-predictor`): the native host paints a moved glyph as the cell it came from,
-> the web page as any ghost, the state's text exact either way. The CPU replay records a shift on a terminal of
-> its own.
-
-> Status 2026-10-20, predictive editing increment 4: the predictor places Home, End, Ctrl-A, Ctrl-E and Delete
-> only on a line started at a buffer start the shell authenticated with a signed OSC 133 `B`, which the web
-> never reads: every `KeySample` hands `input_start: None` (`predict-binding-refines-predictor`), and those keys
-> stay unmodelled input. No export, test or replay step changes.
->
-> 2026-10-20, after review of increment 4: every `KeySample` also hands the engine's own deferred-wrap flag
-> (`wrap_pending: Some(Grid::pending_wrap())`), which the predictor places a glyph by at the last column, and no
-> row under the cursor (`below: None`, so the predictor's floor check has nothing to compare there). No export, test
-> or replay step changes.
-
-> Status 2026-10-16: nothing has been proved or deleted yet. The 73 specs below are the crate's
-> migration worklist: each is proved through Trust/Clean about the compiled Rust function, then the
-> tests it subsumes are deleted. One test (§4) samples no spec and is deleted outright.
-
-Source: `crates/aterm-wasm` (read only). Every `#[test]` was read: src/{dirty_band_present_api 8,
-effects_api 2, lib 74, messages_api 37, notifications_api 5, predict_api 12, scroll_input_api 14,
-scrollback_tiers_api 8, facade_api 1} = 161, plus the code they reach in the engine crates. The recovery pass saw
-158; the two `effects_api.rs` tests were added at merge time as `streak-polarity`. Nothing was
-compiled or run. The claims below come from reading the code.
+Source: `crates/aterm-wasm` (read only). Every `#[test]` is mapped across `src/{dirty_band_present_api,
+effects_api, lib, messages_api, notifications_api, predict_api, scroll_input_api,
+scrollback_tiers_api, facade_api, theme_api}`, plus the code they reach in the engine crates.
 
 Result: **73 specs**, covering **160 tests**. **1 test is not a spec sample** (§4).
 
@@ -355,18 +333,15 @@ src/theme_api.rs	web_translucency_raises_the_effective_floor	web-contrast-floor
 
 - 161 tests read. 160 map to one of the 73 specs; 1 is not a spec sample (§4).
 - The biggest collapses: `scroll-accumulator` (6), `predict-binding-refines-predictor` (6), `band-next-wake` (6), `scroll-input-export` (5), `reflow-offload-contract` (5), `band-is-translation` (5).
-- Merge decisions: the recovery pass's `scroll-navigation` is clause (c) of `scroll-input-export` and
-  was folded into it. `notifications_api::cursor_color_follows_osc12_and_resets_on_112`
-  is the export-level view of `theme-reset-baseline` and maps there. `streak-polarity` is new (the 2 `effects_api.rs` tests the pass missed).
+- `scroll-navigation` is clause (c) of `scroll-input-export`. `notifications_api::cursor_color_follows_osc12_and_resets_on_112`
+  is the export-level view of `theme-reset-baseline` and maps there.
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: deleted (session_reset_forgets_rtt_while_coordinate_reset_preserves_it removed from src/predict_api.rs).
->
-> Status 2026-10-17: its row here and in §2 is gone. It depended on timing (a real 20 ms sleep
-> pushed the measured RTT over aterm-predict's adaptive threshold). Its binding half (`predict_reset` → `Predictor::reset`, `predict_session_reset` →
-> `reset_session`) is in `predict-binding-refines-predictor`; RTT retention belongs to
-> aterm-predict's clock-injected spec.
+`session_reset_forgets_rtt_while_coordinate_reset_preserves_it` (deleted from `src/predict_api.rs`)
+depended on timing (a 20 ms sleep over `aterm-predict`'s adaptive threshold). Its binding half
+(`predict_reset` → `Predictor::reset`, `predict_session_reset` → `reset_session`) is in
+`predict-binding-refines-predictor`; RTT retention belongs to `aterm-predict`'s clock-injected spec.
 
 No other test is a pure regression with no general property; each is an instance of a spec in §1.
 
@@ -404,8 +379,8 @@ No other test is a pure regression with no general property; each is an instance
    parallel tests share, serialized by a test-only RwLock, and weakens its assertions to `<=` because
    the live-pane divisor depends on which tests run at once. The exact share
    `min(configured, global/live_panes)` is never checked; `scrollback-budget` states it.
-9. The recovery pass missed `effects_api.rs`'s test module (`#[cfg(all(test, not(target_arch = "wasm32")))]`);
-   its two tests are `streak-polarity`.
+9. `effects_api.rs`'s test module (`#[cfg(all(test, not(target_arch = "wasm32")))]`) is covered by
+   `streak-polarity`.
 
 ## 6. Proof order (easiest high-value first)
 

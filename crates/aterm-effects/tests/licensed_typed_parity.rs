@@ -39,8 +39,7 @@ fn geom() -> Geom {
 fn cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
         classic_mono: false,
-        // This parity script follows the shipping default; explicit underline
-        // geometry has its own resolver, geometry, and live-paint pins.
+        // The shipping default; explicit underline geometry has its own pins.
         ribbon_tall: true,
         ribbon_flat: false,
         enabled: true,
@@ -215,8 +214,8 @@ fn earned_light_survives_a_cold_program_move() {
         let earned_trail = trail_out.len();
         assert!(earned > 0, "{style:?}: the typed echo must earn light");
         assert!(earned_trail > 0, "{style:?}: the comet must exist");
-        // …and a cold program hop at the SAME instant (so nothing can decay)
-        // must leave every cell of it alone.
+        // …and a cold program hop at the same instant (so nothing can decay) leaves every cell
+        // of it alone.
         glow.tick(Some((4, 20)), typed, &c, g, &mut out);
         trail.tick(Some((4, 20)), typed, &tc, &mut trail_out);
         assert_eq!(

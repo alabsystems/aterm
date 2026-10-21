@@ -1,30 +1,22 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A DEV BUILD'S STANDING AGAINST THE CHANNEL (gap #30).
+//! A dev build's standing against the channel. The updater leaves a dev-marked bundle
+//! alone ([`crate::running_is_dev_marked`]), so this says how far behind it has fallen.
 //!
-//! The updater leaves a dev-marked bundle (`ATermDevBuild`) alone
-//! ([`crate::running_is_dev_marked`]), so without this nothing says how far behind
-//! the channel it has fallen.
+//! One anonymous `HEAD` of the public channel's evergreen appcast URL
+//! ([`aterm_update_core::pointer`]) on the compiled-in channel
+//! ([`crate::DEFAULT_OWNER`]/[`crate::DEFAULT_REPO`]), whatever `[update] owner/repo`
+//! says. Redirects are refused: the `302`'s `Location` names the newest tag. No file is
+//! written.
 //!
-//! The one request: an anonymous `HEAD` of the PUBLIC channel's evergreen appcast URL
-//! ([`aterm_update_core::pointer`]), on the compiled-in channel
-//! ([`crate::DEFAULT_OWNER`]/[`crate::DEFAULT_REPO`]) whatever `[update] owner/repo`
-//! says, so it never reads a staging repo. Redirects are refused: the `302`'s
-//! `Location` names the newest tag and nothing is fetched. This module writes NO file.
+//! The answer is a [`DevLag`] by version, for display only; update decisions use the
+//! build number. The count is of minor versions (one app release per minor), never
+//! across a major. An unreachable channel is `None`: offline is weather.
 //!
-//! The answer is a [`DevLag`] by VERSION, for display only — update decisions stay
-//! the build number's (`build_info`). The count is a MINOR-version count (the channel
-//! publishes one app release per minor; v0.86.0 through v0.93.0 were contiguous); a
-//! count across a MAJOR bump is not claimed.
-//!
-//! An unreachable channel (transport failure, 404, 429/5xx, refused redirect) is
-//! `None`, never an error or a row: offline is weather.
-//!
-//! WHEN it asks: at the window's start and then daily ([`RECHECK_EVERY`], on the wall
-//! clock), only in a dev-marked copy and only while "Check for updates automatically"
-//! (`[update] enabled`) is on — [`should_watch`]. `aterm update check` asks it once when
-//! typed; `aterm update status` asks it only while automatic checks are on.
+//! The window asks at start and then daily ([`RECHECK_EVERY`], wall clock), only in a
+//! dev-marked copy with automatic checks on ([`should_watch`]). `aterm update check`
+//! asks once; `aterm update status` asks only while automatic checks are on.
 
 use std::time::Duration;
 
@@ -32,21 +24,18 @@ use aterm_update_core::pointer::{self, PointerError};
 use aterm_update_core::tag::{TagKind, parse_release_tag};
 use aterm_update_core::{HeadAnswer, HttpError};
 
-/// The asset whose evergreen URL names the channel head — the updater's own
-/// (`github::APPCAST_ASSET` is this constant).
+/// The asset whose evergreen URL names the channel head (`github::APPCAST_ASSET`).
 pub(crate) const APPCAST_ASSET: &str = "aterm-appcast.toml";
 
 /// How often a running dev build asks again: daily, the channel's release cadence;
 /// the updater's two-minute cadence buys a dev build nothing.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Where a dev build stands against the newest release on the public channel.
-/// `latest` is the channel head's tag (`v0.93.0`), already proved canonical by the
-/// pointer.
+/// Where a dev build stands against the newest release on the public channel. `latest`
+/// is the channel head's tag (`v0.93.0`), proved canonical by the pointer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DevLag {
-    /// Older than the newest release. `releases` is how many minor versions behind it
-    /// is, or `None` across a major bump (a count this module does not claim).
+    /// Older than the newest release.
     Behind {
         /// The newest release's tag.
         latest: String,
@@ -58,7 +47,7 @@ pub enum DevLag {
         /// The newest release's tag.
         latest: String,
     },
-    /// Newer than the newest release — a dev build of work not yet released.
+    /// Newer than the newest release: unreleased work.
     Ahead {
         /// The newest release's tag.
         latest: String,
@@ -82,10 +71,10 @@ impl DevLag {
         matches!(self, Self::Behind { .. })
     }
 
-    /// The standing in words, naming the release as every update surface does
-    /// (`aterm v0.93.0`): `2 releases behind aterm v0.93.0`, `1 release behind …`,
-    /// `older than aterm v1.0.0` (across a major), `at aterm v0.93.0, the newest
-    /// release`, `newer than aterm v0.93.0, the newest release`.
+    /// The standing in words, naming the release as every update surface does:
+    /// `2 releases behind aterm v0.93.0`, `older than aterm v1.0.0` (across a major),
+    /// `at aterm v0.93.0, the newest release`, `newer than aterm v0.93.0, the newest
+    /// release`.
     #[must_use]
     pub fn words(&self) -> String {
         let release = format!("aterm {}", self.latest());
@@ -103,8 +92,7 @@ impl DevLag {
     }
 }
 
-/// `MAJOR.MINOR.PATCH` of a canonical three-component version, `v`-prefixed or not;
-/// `None` for anything else (a two-component legacy tag, garbage).
+/// `MAJOR.MINOR.PATCH` of a canonical three-component version, `v`-prefixed or not.
 fn triple(version: &str) -> Option<[u64; 3]> {
     let tagged;
     let tag = if version.starts_with('v') {
@@ -119,9 +107,8 @@ fn triple(version: &str) -> Option<[u64; 3]> {
     }
 }
 
-/// Where `running_version` (`0.91.0`, the workspace version compiled in) stands against
-/// `latest_tag` (`v0.93.0`), or `None` when either is not a canonical three-component
-/// version — a standing that cannot be read is not guessed.
+/// Where `running_version` (`0.91.0`, compiled in) stands against `latest_tag`
+/// (`v0.93.0`); `None` when either is not a canonical three-component version.
 #[must_use]
 pub fn classify(running_version: &str, latest_tag: &str) -> Option<DevLag> {
     let running = triple(running_version)?;
@@ -137,10 +124,9 @@ pub fn classify(running_version: &str, latest_tag: &str) -> Option<DevLag> {
     })
 }
 
-/// ONE `HEAD` of the public channel through `head` (the redirect-refusing transport),
-/// and `running_version`'s standing against the release it names — or `None` when the
-/// channel said nothing usable (unreachable, no release, weather, a redirect this client
-/// refuses, a head that is not an app release). Never a second request.
+/// One `HEAD` of the public channel through `head` (redirect-refusing), and
+/// `running_version`'s standing against the release it names; `None` when the channel
+/// said nothing usable. Never a second request.
 pub fn standing_with(
     running_version: &str,
     head: &mut dyn FnMut(&str) -> Result<HeadAnswer, HttpError>,
@@ -155,7 +141,7 @@ pub fn standing_with(
     match answer {
         Ok(found) => classify(running_version, &found.tag),
         Err(error) => {
-            // Offline is weather, not news: the log's debug level, nothing else.
+            // Offline is weather, not news: debug level only.
             let why = match &error {
                 PointerError::Transport(_) => "unreachable",
                 PointerError::NoRelease { .. } => "no published release",
@@ -168,9 +154,8 @@ pub fn standing_with(
     }
 }
 
-/// [`standing_with`] over the real transport: one `curl` HEAD, one try, a five-second
-/// deadline ([`aterm_update_core::head_no_redirect_quick`]) — a hint, never worth a
-/// retry ladder.
+/// [`standing_with`] over the real transport: one curl HEAD, one try, five seconds
+/// ([`aterm_update_core::head_no_redirect_quick`]); a hint is not worth a retry ladder.
 #[must_use]
 pub fn standing(running_version: &str) -> Option<DevLag> {
     standing_with(
@@ -179,9 +164,8 @@ pub fn standing(running_version: &str) -> Option<DevLag> {
     )
 }
 
-/// What decides whether a process watches the channel for itself: a dev-marked copy
-/// ([`crate::running_is_dev_marked`]) with automatic checks on ([`crate::automatic`],
-/// `[update] enabled`). Both are read by the caller, so a test drives every arm.
+/// Whether a process watches the channel: a dev-marked copy with automatic checks on.
+/// Read by the caller, so a test drives every arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchGate {
     /// `[update] enabled` on a platform the updater runs on.
@@ -201,19 +185,17 @@ impl WatchGate {
     }
 }
 
-/// Whether the watch runs at all. `[update] enabled = false` is the one switch that
-/// turns off everything aterm checks by itself (`settings`), and a copy that is not
-/// dev-marked has the updater's own check thread instead.
+/// Whether the watch runs at all. `[update] enabled = false` turns off everything aterm
+/// checks by itself, and a copy that is not dev-marked has the updater's own check.
 #[must_use]
 pub fn should_watch(gate: WatchGate) -> bool {
     gate.automatic && gate.dev_marked
 }
 
-/// The watch, over injected seams: ask ([`standing_with`]), tell `notify` when the
-/// standing CHANGED since the last one told (the first is always new), then `wait`
-/// [`RECHECK_EVERY`] and ask again — until `wait` answers `false`. A gate that says no
-/// ([`should_watch`]) asks nothing at all. A cycle whose channel said nothing tells
-/// nothing and keeps the last standing (an offline morning is not news either way).
+/// The watch, over injected seams: ask ([`standing_with`]), `notify` when the standing
+/// changed since the last told (the first always), then `wait` [`RECHECK_EVERY`] and ask
+/// again until `wait` answers `false`. A closed gate asks nothing; a cycle whose channel
+/// said nothing tells nothing and keeps the last standing.
 pub fn watch_with(
     gate: WatchGate,
     running_version: &str,
@@ -239,10 +221,8 @@ pub fn watch_with(
     }
 }
 
-/// Sleep until `period` has passed on the WALL clock, in slices of at most an hour, so a
-/// Mac that slept through the day asks within the hour it wakes (a monotonic sleep
-/// would not count the night). Always answers `true`: the watch lives as long as the
-/// process.
+/// Sleep until `period` has passed on the wall clock, in slices of at most an hour, so a
+/// Mac that slept through the day asks within an hour of waking. Always `true`.
 fn wait_on_wall_clock(period: Duration) -> bool {
     const SLICE: Duration = Duration::from_secs(60 * 60);
     let due = std::time::SystemTime::now() + period;
@@ -255,10 +235,9 @@ fn wait_on_wall_clock(period: Duration) -> bool {
     true
 }
 
-/// Start this process's watch on its own thread when [`should_watch`] says so (a
-/// dev-marked copy with automatic checks on), and answer whether it started. `notify`
-/// runs on that thread, once per CHANGE of standing; it must only hand the standing to
-/// the caller's loop.
+/// Start this process's watch on its own thread when [`should_watch`] says so, and
+/// answer whether it started. `notify` runs on that thread once per change of standing,
+/// and must only hand it to the caller's loop.
 pub fn spawn_watch(running_version: &'static str, notify: Box<dyn Fn(DevLag) + Send>) -> bool {
     let gate = WatchGate::of_this_process();
     if !should_watch(gate) {
@@ -282,14 +261,13 @@ pub fn spawn_watch(running_version: &'static str, notify: Box<dyn Fn(DevLag) + S
 mod tests {
     use super::*;
 
-    /// The public channel's evergreen URL — the one string any fetch below may see.
+    /// The public channel's evergreen URL, the only one a fetch below may see.
     fn evergreen() -> String {
         pointer::latest_download_url(crate::DEFAULT_OWNER, crate::DEFAULT_REPO, APPCAST_ASSET)
             .expect("the compiled channel is URL-safe")
     }
 
-    /// A HEAD transport that answers the channel head `tag` with the 302 GitHub serves
-    /// (measured shape: `pointer`'s tests), counting every request and the URL asked.
+    /// A HEAD transport answering the channel head `tag` with GitHub's 302.
     fn channel_at(tag: &'static str) -> impl FnMut(&str) -> Result<HeadAnswer, HttpError> {
         move |url: &str| {
             assert_eq!(
@@ -313,8 +291,7 @@ mod tests {
         dev_marked: true,
     };
 
-    /// Run the watch for `cycles` cycles against `head`, answering what it told and how
-    /// many requests it made.
+    /// Run the watch for `cycles` cycles: what it told, its request count and its waits.
     fn run(
         gate: WatchGate,
         running: &str,
@@ -341,7 +318,7 @@ mod tests {
         (told, requests, waits)
     }
 
-    /// A dev build is told its standing against the channel head from ONE HEAD of
+    /// A dev build is told its standing against the channel head from one HEAD of
     /// the compiled public channel's evergreen appcast URL (`channel_at` refuses any
     /// other), then waits a day: behind by a count, current, or ahead (work not yet
     /// released is never "behind", never a negative count).
@@ -367,9 +344,8 @@ mod tests {
         }
     }
 
-    /// UNREACHABLE: a transport failure (offline), a 404, a 429/5xx, a refused
-    /// redirect and a head that is not an app release each say NOTHING — no standing,
-    /// no error — and the watch keeps its daily schedule.
+    /// Offline, 404, 5xx, a refused redirect and a non-app head each say nothing, and the
+    /// daily schedule holds.
     #[test]
     fn an_unreachable_channel_says_nothing() {
         let answers: [Box<dyn Fn() -> Result<HeadAnswer, HttpError>>; 5] = [
@@ -415,9 +391,8 @@ mod tests {
         }
     }
 
-    /// DISABLED: `[update] enabled = false` asks the channel NOTHING — zero requests —
-    /// and so does a copy that is not dev-marked (it has the updater's own check).
-    /// The control: the same watch with both on makes its request.
+    /// Automatic checks off, or a copy that is not dev-marked, makes no request; the
+    /// control, both on, makes one.
     #[test]
     fn automatic_checks_off_or_a_release_copy_asks_nothing() {
         for gate in [
@@ -443,9 +418,8 @@ mod tests {
         assert_eq!(requests, 1, "the control: a dev build with checks on asks");
     }
 
-    /// The watch tells a standing ONCE, and again only when it CHANGES: three days at
-    /// v0.93.0 are one notice; the channel moving to v0.94.0 is a second; an offline
-    /// day in between neither repeats nor clears it.
+    /// Three days at v0.93.0 are one notice and v0.94.0 a second; an offline day in between
+    /// neither repeats nor clears it.
     #[test]
     fn the_watch_tells_a_change_once() {
         let heads = ["v0.93.0", "v0.93.0", "offline", "v0.93.0", "v0.94.0"];
@@ -482,8 +456,7 @@ mod tests {
         );
     }
 
-    /// The count is a MINOR count within one major; across a major it is not claimed,
-    /// and a version that is not canonical is no standing at all.
+    /// Across a major the count is not claimed; a non-canonical version is no standing.
     #[test]
     fn the_count_is_minors_within_a_major() {
         assert_eq!(

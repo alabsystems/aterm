@@ -77,6 +77,7 @@ impl TerminalHandler<'_> {
         }
         self.modes.synchronized_output = false;
         self.transient.sync_start = None;
+        self.transient.sync_end_caret = None;
         self.transient.sync_open_dirty = false;
         self.transient.app_sync_open = false;
         self.transient.app_sync_dirty = false;

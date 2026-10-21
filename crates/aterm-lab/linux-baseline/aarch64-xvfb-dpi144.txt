@@ -3,11 +3,11 @@
 # replay: targo --unverified lab linux baseline --arch aarch64 --screen xvfb-dpi144 (add --record to rewrite this file)
 # not-driven.header.gestures system-frame: an X11 window's frame is the window manager's (this lane runs none), so aterm draws no header and its band is not caption
 # not-driven.touch no-touchscreen: the lane's X servers have no touch device, which XInput 2's touch events come from, and XTEST fakes no touchscreen; Mutter's is driven, through a RemoteDesktop finger
-@ crate.aterm-dl 0.106.0 (path)
-@ crate.aterm-wayland 0.106.0 (path)
+@ crate.aterm-dl 0.108.0 (path)
+@ crate.aterm-wayland 0.108.0 (path)
 @ crate.aterm-window 0.30.13 (path)
-@ crate.aterm-x11 0.106.0 (path)
-@ crate.aterm-xkb 0.106.0 (path)
+@ crate.aterm-x11 0.108.0 (path)
+@ crate.aterm-xkb 0.108.0 (path)
 @ crate.softbuffer 0.4.8
 @ crate.wgpu 29.0.3
 @ crate.wgpu-hal 29.0.3
@@ -49,14 +49,14 @@
 = resizes.summary total=6 risks=0 render=ok unledgered=0 lost=0
 ~ resizes.summary.detail total=6 runs=6 flaps=0 risks=0 render=ok unledgered=0 lost=0 nudge=idle nudged=0
 = cast.drift verdict=clean fidelity=pass against=screen drift_rows=0 culprit=- geom=80x24
-~ cast.drift.detail OK 1 verdict=clean fidelity=pass against=screen drift_rows=0 runs=1 candidates=1 capped=0 culprit=- seed=primary seed_basis=live geom=80x24 evicted=0 dropped=0 cut=quiescent folds=2
+~ cast.drift.detail OK 1 verdict=clean fidelity=pass against=screen drift_rows=0 runs=1 candidates=1 capped=0 culprit=- seed=primary seed_basis=live geom=80x24 evicted=0 dropped=0 cut=quiescent folds=2 fold_events=50
 = clipboard.out copy OK 7; xclip read "LANE-42"
 = clipboard.in xclip's XCLIP-42 pasted: x-xclip-42
 = primary.out drag; xclip read "LANE-42"
 = primary.in xclip's XPRIMARY-42 pasted: x-xprimary-42
 @ keyrepeat.server X server autorepeat delay=660 rate=25
 = keyrepeat repeats
-~ keyrepeat.count 22 characters for a 1500 ms hold
+~ keyrepeat.count 21 characters for a 1500 ms hold
 = compose X-xé-Y printed; no IME event
 = dnd.aware 5
 = dnd.hover.status accept=1 action=XdndActionPrivate
@@ -83,11 +83,12 @@
 = atspi.walk.end.3 depth=2 role=terminal name="aterm terminal" description="" states=enabled,focusable,focused,sensitive,showing,visible interfaces=Accessible,Component,Text attributes=- characters=177 caret=161 text="lane$ echo LANE-$((6*7))\nLANE-42\nlane$ echo X-XCLIP-42 | tr A-Z a-z\nx-xclip-42\nlane$ echo X-XPRIMARY-42 | tr A-Z a-z\nx-xprimary-42\nlane$ echo X-xé-Y\nX-xé-Y\nlane$\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n" extents_window=18,54,1120,720 extents_screen=18,54,1120,720 children=0 child_count=0
 ~ atspi.path.end.3 /org/a11y/atspi/accessible/0/18446744073709551616
 @ gpu llvmpipe (LLVM 20.1.2, 128 bits) (Gl)
-~ present.software software rendering (llvmpipe (LLVM 20.1.2, 128 bits) (Gl)): n_present=46 present_p50/p95/p99_ms=5.77/10.49/335.54
-~ input.software n_input=37 input_p50/p95/p99_ms=6.82/41.94/335.54
+~ present.software software rendering (llvmpipe (LLVM 20.1.2, 128 bits) (Gl)): n_present=45 present_p50/p95/p99_ms=6.29/9.44/335.54
+~ input.software n_input=36 input_p50/p95/p99_ms=7.86/41.94/335.54
+~ present.slowest 315.24 ms, ending in echo +348 ms; gap 1010.20 ms; max_frame_render_ms=312.72 max_redraw_total_ms=315.09 max_turn_ms=315.39 max_turn_owner=window_event
 = atspi.events.kinds Object.ActiveDescendantChanged@application Object.BoundsChanged@terminal Object.ChildrenChanged:add@application Object.StateChanged:active=1@frame Object.StateChanged:focused=1@terminal Object.TextCaretMoved@terminal Object.TextChanged:delete@terminal Object.TextChanged:insert@terminal Window.Activate@frame
 = atspi.events.text the text changes undo cleanly from the end walk's text; the last caret event names the end walk's caret
-~ atspi.events.count 93
+~ atspi.events.count 91
 ~ atspi.event.1 Object.ChildrenChanged <application> detail="add" d1=0 d2=0 any=ref(<frame>)
 ~ atspi.event.2 Object.TextChanged <terminal> detail="insert" d1=5 d2=19 any=" echo LANE-$((6*7))"
 ~ atspi.event.3 Object.TextChanged <terminal> detail="delete" d1=25 d2=1 any="\n"
@@ -161,26 +162,24 @@
 ~ atspi.event.71 Object.TextCaretMoved <terminal> detail="" d1=157 d2=0 any=0
 ~ atspi.event.72 Object.TextChanged <terminal> detail="insert" d1=157 d2=1 any="a"
 ~ atspi.event.73 Object.TextCaretMoved <terminal> detail="" d1=158 d2=0 any=0
-~ atspi.event.74 Object.TextChanged <terminal> detail="insert" d1=158 d2=1 any="a"
-~ atspi.event.75 Object.TextCaretMoved <terminal> detail="" d1=159 d2=0 any=0
-~ atspi.event.76 Object.TextChanged <terminal> detail="delete" d1=136 d2=23 any=" aaaaaaaaaaaaaaaaaaaaaa"
-~ atspi.event.77 Object.TextCaretMoved <terminal> detail="" d1=136 d2=0 any=0
-~ atspi.event.78 Object.TextChanged <terminal> detail="insert" d1=136 d2=8 any=" echo X-"
-~ atspi.event.79 Object.TextCaretMoved <terminal> detail="" d1=144 d2=0 any=0
-~ atspi.event.80 Object.TextChanged <terminal> detail="insert" d1=144 d2=1 any="x"
-~ atspi.event.81 Object.TextCaretMoved <terminal> detail="" d1=145 d2=0 any=0
-~ atspi.event.82 Object.TextChanged <terminal> detail="insert" d1=145 d2=1 any="é"
-~ atspi.event.83 Object.TextCaretMoved <terminal> detail="" d1=146 d2=0 any=0
-~ atspi.event.84 Object.TextChanged <terminal> detail="insert" d1=146 d2=2 any="-Y"
-~ atspi.event.85 Object.TextCaretMoved <terminal> detail="" d1=148 d2=0 any=0
-~ atspi.event.86 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
-~ atspi.event.87 Object.TextChanged <terminal> detail="delete" d1=149 d2=1 any="\n"
-~ atspi.event.88 Object.TextChanged <terminal> detail="insert" d1=149 d2=12 any="X-xé-Y\nlane$"
-~ atspi.event.89 Object.TextCaretMoved <terminal> detail="" d1=161 d2=0 any=0
-~ atspi.event.90 Object.TextChanged <terminal> detail="insert" d1=161 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
-~ atspi.event.91 Object.TextCaretMoved <terminal> detail="" d1=199 d2=0 any=0
-~ atspi.event.92 Object.TextChanged <terminal> detail="delete" d1=161 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
-~ atspi.event.93 Object.TextCaretMoved <terminal> detail="" d1=161 d2=0 any=0
+~ atspi.event.74 Object.TextChanged <terminal> detail="delete" d1=136 d2=22 any=" aaaaaaaaaaaaaaaaaaaaa"
+~ atspi.event.75 Object.TextCaretMoved <terminal> detail="" d1=136 d2=0 any=0
+~ atspi.event.76 Object.TextChanged <terminal> detail="insert" d1=136 d2=8 any=" echo X-"
+~ atspi.event.77 Object.TextCaretMoved <terminal> detail="" d1=144 d2=0 any=0
+~ atspi.event.78 Object.TextChanged <terminal> detail="insert" d1=144 d2=1 any="x"
+~ atspi.event.79 Object.TextCaretMoved <terminal> detail="" d1=145 d2=0 any=0
+~ atspi.event.80 Object.TextChanged <terminal> detail="insert" d1=145 d2=1 any="é"
+~ atspi.event.81 Object.TextCaretMoved <terminal> detail="" d1=146 d2=0 any=0
+~ atspi.event.82 Object.TextChanged <terminal> detail="insert" d1=146 d2=2 any="-Y"
+~ atspi.event.83 Object.TextCaretMoved <terminal> detail="" d1=148 d2=0 any=0
+~ atspi.event.84 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
+~ atspi.event.85 Object.TextChanged <terminal> detail="delete" d1=149 d2=1 any="\n"
+~ atspi.event.86 Object.TextChanged <terminal> detail="insert" d1=149 d2=12 any="X-xé-Y\nlane$"
+~ atspi.event.87 Object.TextCaretMoved <terminal> detail="" d1=161 d2=0 any=0
+~ atspi.event.88 Object.TextChanged <terminal> detail="insert" d1=161 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
+~ atspi.event.89 Object.TextCaretMoved <terminal> detail="" d1=199 d2=0 any=0
+~ atspi.event.90 Object.TextChanged <terminal> detail="delete" d1=161 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
+~ atspi.event.91 Object.TextCaretMoved <terminal> detail="" d1=161 d2=0 any=0
 @ server.extensions BIG-REQUESTS,Composite,DAMAGE,DOUBLE-BUFFER,GLX,Generic Event Extension,MIT-SCREEN-SAVER,MIT-SHM,Present,RANDR,RECORD,RENDER,SECURITY,SHAPE,SYNC,X-Resource,XC-MISC,XFIXES,XINERAMA,XInputExtension,XKEYBOARD,XTEST,XVideo
 @ server.keymap us intl
 @ guest.at-spi2-core:arm64 2.52.0-1build1
@@ -203,3 +202,10 @@
 @ guest.xvfb:arm64 2:21.1.12-1ubuntu1.9
 @ guest.xwayland:arm64 2:23.2.6-1ubuntu0.8
 = xim ibus XIM, engine xkb:us::eng: X-xé-Y printed; IME events
+= xim.cjk ibus XIM, engine libpinyin: X-你好-Y printed; IME events
+= xim.cjk.preedit ime preedit="你好" caret=6 spot=256,114,14x30; typed line "echo X-"
+= x11.wire.requests BIG-REQUESTS:Enable ChangeProperty ChangeWindowAttributes ConfigureWindow CreateGC CreatePixmap CreateWindow FreeGC FreePixmap Generic Event Extension:QueryVersion GetAtomName GetGeometry GetInputFocus GetModifierMapping GetProperty GetSelectionOwner GetWindowAttributes InternAtom MIT-SHM:Attach MIT-SHM:Detach MIT-SHM:PutImage MapWindow PutImage QueryExtension RANDR:GetCrtcInfo RANDR:GetOutputInfo RANDR:GetOutputPrimary RANDR:GetScreenResourcesCurrent RANDR:QueryVersion RANDR:SelectInput RENDER:CreateCursor RENDER:CreatePicture RENDER:FreePicture RENDER:QueryPictFormats RENDER:QueryVersion SendEvent TranslateCoordinates XFIXES:QueryVersion XFIXES:SetCursorName XInputExtension:GetExtensionVersion XInputExtension:XIQueryDevice XInputExtension:XIQueryPointer XInputExtension:XIQueryVersion XInputExtension:XISelectEvents XKEYBOARD:GetCompatMap XKEYBOARD:GetControls XKEYBOARD:GetDeviceInfo XKEYBOARD:GetIndicatorMap XKEYBOARD:GetMap XKEYBOARD:GetNames XKEYBOARD:GetState XKEYBOARD:PerClientFlags XKEYBOARD:SelectEvents XKEYBOARD:UseExtension
+= x11.wire.atoms 46: CARD32 None UTF8_STRING WM_CHANGE_STATE WM_CLIENT_MACHINE WM_DELETE_WINDOW WM_PROTOCOLS WM_STATE XIM_SERVERS XdndActionPrivate XdndAware XdndDrop XdndEnter XdndFinished XdndLeave XdndPosition XdndSelection XdndStatus XdndTypeList _GTK_THEME_VARIANT _MOTIF_WM_HINTS _NET_ACTIVE_WINDOW _NET_CLIENT_LIST _NET_FRAME_EXTENTS _NET_STARTUP_ID _NET_STARTUP_INFO _NET_STARTUP_INFO_BEGIN _NET_SUPPORTED _NET_SUPPORTING_WM_CHECK _NET_WM_ICON _NET_WM_MOVERESIZE _NET_WM_NAME _NET_WM_PID _NET_WM_PING _NET_WM_STATE _NET_WM_STATE_ABOVE _NET_WM_STATE_BELOW _NET_WM_STATE_FULLSCREEN _NET_WM_STATE_HIDDEN _NET_WM_STATE_MAXIMIZED_HORZ _NET_WM_STATE_MAXIMIZED_VERT _NET_WM_WINDOW_TYPE _NET_WM_WINDOW_TYPE_NORMAL _XSETTINGS_S0 _XSETTINGS_SETTINGS text/uri-list
+= x11.wire.selects XKB 0001070000000700ff00ff00; root RANDR ScreenChangeNotifyMask,OutputPropertyNotifyMask; root XI2 all HierarchyChanged; window XI2 all-master ButtonPress,ButtonRelease,Motion,Enter,Leave,FocusIn,FocusOut,TouchBegin,TouchUpdate,TouchEnd; window events KeyPress,KeyRelease,ButtonPress,ButtonRelease,PointerMotion,KeymapState,Exposure,VisibilityChange,StructureNotify,PropertyChange
+= x11.wire.messages window _NET_WM_STATE remove _NET_WM_STATE_ABOVE; window _NET_WM_STATE remove _NET_WM_STATE_BELOW
+= x11.wire.errors BadShmSeg on MIT-SHM:Detach

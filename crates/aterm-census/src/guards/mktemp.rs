@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! checked-mktemp: a scratch directory comes from a CHECKED `mktemp`.
+//! checked-mktemp: a scratch directory comes from a checked `mktemp`.
 //!
-//! Under /bin/bash 3.2 `cd ""` succeeds and stays put, so the fused
-//! `T="$(cd "$(mktemp -d …)" && pwd -P)"` sets T to the caller's directory with
-//! status 0 when mktemp fails (a TMPDIR that is gone, a full disk), and the EXIT
-//! trap's `rm -rf "$T"` then deletes that directory — the checkout, when a suite
-//! runs from the repository root. Write two statements, each checked. Read over
+//! Under /bin/bash 3.2 `cd ""` succeeds and stays put, so a fused
+//! `T="$(cd "$(mktemp -d …)" && pwd -P)"` whose mktemp fails sets T to the
+//! caller's directory with status 0, and the EXIT trap's `rm -rf "$T"` deletes
+//! it (the checkout, when a suite runs from the repository root). Read over
 //! every script and every Rust file's text view (a script in a Rust string
 //! counts); a match after a `#` on its line is a comment.
 

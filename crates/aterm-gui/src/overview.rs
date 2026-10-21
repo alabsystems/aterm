@@ -88,8 +88,9 @@ pub(crate) enum Driver {
     /// A manager on no session of this aterm started it (`worker of <sid>
     /// (not here)`).
     WorkerOfElsewhere(String),
-    /// aterm's harness drives it, at this Autopilot (`driven by aterm
-    /// (cruise)`).
+    /// aterm's harness drives it, at this Autopilot in its chip's own
+    /// words (`driven by aterm (cruise)`, `(land, landed)`:
+    /// `crate::app_presence::driven_words`, which the tab's hover says too).
     Aterm(String),
 }
 
@@ -139,6 +140,15 @@ pub(crate) struct OverviewChip {
     pub(crate) task_words: Option<String>,
     /// Who drives it: one word, the person's hold first, so it is no count.
     pub(crate) driver: Option<Driver>,
+    /// WHY LAND STILL HOLDS (Autopilot v5 §12.3.1, slice 3c), where a land
+    /// act's yield did not land: the hold's words with no clock, as the menu
+    /// bar's landing worker's tip says them (`not landed yet: 2 unpushed
+    /// commits; open work in its report: follow-up · 3 nudges`,
+    /// `crate::harness_glass::hold_words`), painted on a line of its own
+    /// under the chip's ([`OverviewLine::Held`]), so the chip's own line
+    /// keeps its words (`driven by aterm (land) · typed by …`) and the card's
+    /// width cuts neither. `None` for every other chip.
+    pub(crate) held: Option<String>,
     /// Who last typed into it over the socket and when, in words (S9:
     /// `lab-sweep`, `4m ago`).
     pub(crate) typed: Option<(String, String)>,
@@ -208,6 +218,13 @@ pub(crate) enum OverviewAct {
 enum OverviewLine {
     Group(usize),
     Chip {
+        item: usize,
+        group: usize,
+        chip: usize,
+    },
+    /// Why Land still holds a chip ([`OverviewChip::held`]), under its
+    /// line: part of the chip's item (a click there is a click on it).
+    Held {
         item: usize,
         group: usize,
         chip: usize,
@@ -307,12 +324,19 @@ impl OverviewState {
         let mut item = 0;
         for (g, group) in self.groups.iter().enumerate() {
             out.push(OverviewLine::Group(g));
-            for c in 0..group.chips.len() {
+            for (c, chip) in group.chips.iter().enumerate() {
                 out.push(OverviewLine::Chip {
                     item,
                     group: g,
                     chip: c,
                 });
+                if chip.held.is_some() {
+                    out.push(OverviewLine::Held {
+                        item,
+                        group: g,
+                        chip: c,
+                    });
+                }
                 item += 1;
             }
         }
@@ -453,6 +477,10 @@ impl OverviewState {
             OverviewLine::Chip { item, group, chip } => {
                 self.chip_text(item, &self.groups[group].chips[chip])
             }
+            OverviewLine::Held { group, chip, .. } => self.groups[group].chips[chip]
+                .held
+                .clone()
+                .unwrap_or_default(),
             OverviewLine::ManagesHeader => format!("manages ({})", self.manages.len()),
             OverviewLine::Manages { line, .. } => self.manages_text(&self.manages[line]),
             OverviewLine::Empty => "no sessions".to_string(),
@@ -587,10 +615,16 @@ impl OverviewState {
             return;
         }
         if let Some(line) = self.line_of_item(self.selected) {
+            // The chip's held line (`OverviewLine::Held`) comes into view
+            // with it: its last line is what must fit.
+            let last = match self.lines().get(line + 1) {
+                Some(OverviewLine::Held { item, .. }) if *item == self.selected => line + 1,
+                _ => line,
+            };
             if line < self.scroll {
                 self.scroll = line;
-            } else if line >= self.scroll + body {
-                self.scroll = line + 1 - body;
+            } else if last >= self.scroll + body {
+                self.scroll = (last + 1 - body).min(line);
             }
         }
         self.scroll = self.scroll.min(total.saturating_sub(body));
@@ -753,7 +787,7 @@ impl OverviewState {
             for chip in &group.chips {
                 out.push(format!(
                     "overview chip sid={} local={} mark={} need={} task_state={} driver={} \
-                     typed_by={} result={} stoppable={} selected={} confirm={}",
+                     typed_by={} result={} stoppable={} selected={} confirm={} held={}",
                     chip.sid.as_str(),
                     chip.local_id,
                     chip.mark.word(),
@@ -767,6 +801,7 @@ impl OverviewState {
                     u8::from(chip.stoppable),
                     item == self.selected,
                     self.confirm == Some(item),
+                    u8::from(chip.held.is_some()),
                 ));
                 item += 1;
             }
@@ -808,6 +843,7 @@ impl OverviewState {
                 chip.doing.hash(&mut h);
                 chip.task_words.hash(&mut h);
                 chip.driver.hash(&mut h);
+                chip.held.hash(&mut h);
                 chip.typed.hash(&mut h);
                 chip.worker_of.hash(&mut h);
                 chip.held_by_person.hash(&mut h);
@@ -912,14 +948,44 @@ pub(crate) fn overview_item_hit(
         let (rx, ry, rw, rh) = overview_row_rect_in(&layout, g, slot)?;
         if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
             return match lines.get(state.scroll + slot) {
-                Some(OverviewLine::Chip { item, .. } | OverviewLine::Manages { item, .. }) => {
-                    Some(*item)
-                }
+                Some(
+                    OverviewLine::Chip { item, .. }
+                    | OverviewLine::Held { item, .. }
+                    | OverviewLine::Manages { item, .. },
+                ) => Some(*item),
                 _ => None,
             };
         }
     }
     None
+}
+
+/// `s` as the card paints it in `room` px at `px`: whole where it fits, else
+/// cut on a whole char to end in `…`. Measured with the face's own advances
+/// ([`crate::settings::text_w`]), because the grid's cell is rounded to the
+/// device pixel and the chrome's monospace face is not: at 1x a 7 px cell
+/// carries a 7.5 px glyph, so a count of cells runs a long line past the
+/// ring. The run's mean advance puts the first cut within a char of the
+/// edge, so a line costs two or three measures, not one per char.
+fn fit_body(s: &str, room: f32, px: f32) -> String {
+    let cells = crate::tab_menu::display_cells(s);
+    let whole = crate::settings::text_w(s, px);
+    if whole <= room {
+        return crate::tab_menu::ellipsize(s, cells);
+    }
+    let advance = whole / cells.max(1) as f32;
+    let mut fit = if advance > 0.0 {
+        ((room / advance).floor().max(0.0) as usize).min(cells)
+    } else {
+        0
+    };
+    loop {
+        let cut = crate::tab_menu::ellipsize(s, fit);
+        if fit == 0 || crate::settings::text_w(&cut, px) <= room {
+            return cut;
+        }
+        fit -= 1;
+    }
 }
 
 /// Paint the card: title and counts, the grouped band (cursor washed and
@@ -944,6 +1010,7 @@ pub(crate) fn overview_tray(
         rgba(r.text_primary, 0xFF),
     );
     let lines = state.lines();
+    let body_px = TypeStep::Body.px(px).get();
     for slot in 0..layout.body_rows {
         let Some(line) = lines.get(state.scroll + slot).copied() else {
             break;
@@ -952,13 +1019,24 @@ pub(crate) fn overview_tray(
         let (indent, color) = match line {
             OverviewLine::Group(_) | OverviewLine::ManagesHeader => (cw * 1.5, r.text_secondary),
             OverviewLine::Chip { .. } | OverviewLine::Manages { .. } => (cw * 2.5, r.text_primary),
+            // Under the chip's words, past its mark: the chip's own line.
+            OverviewLine::Held { .. } => (cw * 4.5, r.text_secondary),
             OverviewLine::Empty => (cw * 2.0, r.text_tertiary),
         };
         if let OverviewLine::Chip { item, .. } | OverviewLine::Manages { item, .. } = line
             && item == state.selected
         {
-            let (x, y, w, h) = overview_row_rect_in(&layout, g, slot)
+            let (x, y, w, mut h) = overview_row_rect_in(&layout, g, slot)
                 .expect("painted overview slot has a row rectangle");
+            // A held chip's ring takes in its held line where it is painted.
+            if slot + 1 < layout.body_rows
+                && matches!(
+                    lines.get(state.scroll + slot + 1),
+                    Some(OverviewLine::Held { item: under, .. }) if *under == item
+                )
+            {
+                h += ch;
+            }
             let ring = if state.confirm == Some(item) {
                 r.danger
             } else {
@@ -982,12 +1060,14 @@ pub(crate) fn overview_tray(
                 color: rgba(ring, 0xCC),
             });
         }
+        // A line the card is too narrow for ends in `…` inside the ring's
+        // edge, never cut mid-word by the frame.
         text_at(
             &mut prims,
             card_x + indent,
             y0,
             TypeStep::Body,
-            state.line_text(line),
+            fit_body(&state.line_text(line), layout.card.2 - indent - cw, body_px),
             rgba(color, 0xFF),
         );
     }
@@ -1017,7 +1097,12 @@ pub(crate) fn overview_a11y(state: &OverviewState) -> aterm_a11y::model::TreeUpd
         let mut node = Node::new(Role::MenuItem);
         let label = match *item {
             OverviewItem::Chip { group, chip } => {
-                state.chip_text(slot, &state.groups[group].chips[chip])
+                let chip = &state.groups[group].chips[chip];
+                let text = state.chip_text(slot, chip);
+                match &chip.held {
+                    Some(held) => format!("{text} \u{00b7} {held}"),
+                    None => text,
+                }
             }
             OverviewItem::Manages { line } => state.manages_text(&state.manages[line]),
         };
@@ -1048,6 +1133,7 @@ mod tests {
             task: None,
             task_words: None,
             driver: None,
+            held: None,
             typed: None,
             worker_of: false,
             held_by_person: false,
@@ -1304,6 +1390,134 @@ mod tests {
         groups[0].chips[2].stoppable = false;
         assert!(s.retarget(groups, state().manages));
         assert!(s.controls_lines()[0].contains("confirm=-"));
+    }
+
+    /// WHY LAND HOLDS IS A LINE OF ITS OWN UNDER ITS CHIP (Autopilot v5
+    /// §12.3.1, the review of slice 3c): at the card's widest (760 px) a held
+    /// chip's own line keeps its words whole, `typed by` last, and the hold's
+    /// words are painted under it, past its mark, in the secondary ink; a
+    /// line too long for the card ends in `…` at its edge, never cut
+    /// mid-word by the frame. The held line is the chip's item: a click
+    /// there selects it, the selection ring takes it in, the band's rows
+    /// count it, a scroll brings it into view with its chip, and `controls`
+    /// says `held=1`. NEGATIVE CONTROLS (as run): the painter without its
+    /// `…` clip paints the held line whole past the card's edge; the clip
+    /// counted in grid cells runs the held line past the ring on a grid
+    /// whose cell is narrower than the face's glyph; the held line drawn as
+    /// a chip line (no `Held` arm in the hit test) is no click on the chip.
+    #[test]
+    fn a_held_chip_says_why_on_a_line_of_its_own_cut_with_an_ellipsis() {
+        let held = "not landed yet: needs you; 3 changed files, 1 untracked file, 1 stash, 4 \
+                    commits not on the remote main; open work in its report: follow-up, not \
+                    pushed, local, a part; no \u{201c}Nothing left:\u{201d} defense yet; a reply \
+                    too tall to read whole \u{b7} 3 nudges";
+        let mut landing = chip("h", 4);
+        landing.label = "docs pass".to_string();
+        landing.mark = ChipMark::Working;
+        landing.task = Some("working");
+        landing.task_words = Some("task working 2m".to_string());
+        landing.driver = Some(Driver::Aterm("land".to_string()));
+        landing.typed = Some(("aterm".to_string(), "2m ago".to_string()));
+        landing.held = Some(held.to_string());
+        let mut s = OverviewState::new(
+            crate::WindowId(0),
+            vec![OverviewGroup {
+                label: "Window 1".to_string(),
+                chips: vec![chip("a", 1), landing, chip("z", 5)],
+            }],
+            Vec::new(),
+        );
+        let g = geom();
+        let layout = overview_layout(&s, &g);
+        assert_eq!(layout.card.2, MAX_CARD_WIDTH, "the card at its widest");
+        // Header, a, the held chip and its line, z.
+        assert_eq!(s.lines().len(), 5);
+        assert_eq!(s.wanted_rows(), CHROME_ROWS + 5);
+        let texts = |s: &OverviewState| -> Vec<(f32, String)> {
+            overview_tray(s, &g, Theme::default())
+                .prims
+                .into_iter()
+                .filter_map(|p| match p {
+                    DrawPrim::Text { x, s, .. } => Some((x, s)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let painted = texts(&s);
+        let row = painted
+            .iter()
+            .find(|(_, t)| t.contains("docs pass"))
+            .expect("the chip's line");
+        assert!(
+            row.1
+                .ends_with("driven by aterm (land) \u{b7} typed by aterm 2m ago"),
+            "the chip's own words whole: {}",
+            row.1
+        );
+        let under = painted
+            .iter()
+            .find(|(_, t)| t.starts_with("not landed yet: "))
+            .expect("the held line");
+        assert!(under.0 > row.0, "past the chip's mark");
+        assert!(
+            under.1.ends_with('\u{2026}') && held.starts_with(under.1.trim_end_matches('\u{2026}')),
+            "cut with `…`: {}",
+            under.1
+        );
+        // Every line ends inside the ring, measured as the face draws it, on
+        // this grid and on one whose cell is narrower than the face's glyph
+        // (a 7 px cell at 1x carries a 7.5 px glyph).
+        let px = TypeStep::Body.px(g.font_px).get();
+        let narrow = SettingsGeom {
+            cw: crate::settings::text_w("0", px) * 0.9,
+            ..g
+        };
+        for g in [g, narrow] {
+            let card = overview_layout(&s, &g).card;
+            let ring_right = card.0 + card.2 - g.cw;
+            let painted = overview_tray(&s, &g, Theme::default()).prims;
+            let body: Vec<(f32, String)> = painted
+                .into_iter()
+                .filter_map(|p| match p {
+                    DrawPrim::Text { x, s, .. } if !s.contains("esc close") => Some((x, s)),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                body.iter()
+                    .any(|(_, t)| t.starts_with("not landed yet: ") && t.ends_with('\u{2026}')),
+                "the held line cut: {body:?}"
+            );
+            for (x, t) in &body {
+                let right = x + crate::settings::text_w(t, px);
+                assert!(
+                    right <= ring_right + 0.01,
+                    "{t:?} ends at {right} past the ring's {ring_right} (cw {})",
+                    g.cw
+                );
+            }
+        }
+        // The held line is the chip's: a click there selects it.
+        let (x, y, w, h) = overview_row_rect_in(&layout, &g, 3).expect("its slot");
+        assert_eq!(overview_item_hit(&s, &g, x + w * 0.5, y + h * 0.5), Some(1));
+        assert!(
+            s.controls_lines()
+                .iter()
+                .any(|l| l.contains("sid=h") && l.ends_with(" held=1")),
+            "{:?}",
+            s.controls_lines()
+        );
+        // Selected, its ring takes in both lines.
+        s.select(1);
+        let ring = overview_tray(&s, &g, Theme::default())
+            .prims
+            .into_iter()
+            .find_map(|p| match p {
+                DrawPrim::Stroke { x, h, .. } if x == layout.card.0 + g.cw => Some(h),
+                _ => None,
+            })
+            .expect("the ring");
+        assert!(ring > g.ch * 1.5, "two rows tall: {ring}");
     }
 
     /// Painter and hit-test share one row rectangle; the fingerprint moves

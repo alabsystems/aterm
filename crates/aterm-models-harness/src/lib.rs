@@ -19,6 +19,7 @@
 mod models_agent_verdict;
 mod models_disk;
 mod models_harness;
+mod models_harness_account_key;
 mod models_harness_host;
 mod models_harness_policy_writer;
 mod models_harness_progress;
@@ -33,6 +34,7 @@ mod models_supervise_tape;
 pub use models_agent_verdict::claude_idle_at_composer_model;
 pub use models_disk::{disk_await_liveness, disk_await_model, disk_reclaim_pass_model};
 pub use models_harness::*;
+pub use models_harness_account_key::harness_account_key_model;
 pub use models_harness_host::{
     harness_agy_exit_witness_model, harness_agy_quiet_upgrade_model, harness_commit_owed_model,
     harness_exit_record_model, harness_gemini_exit_witness_model, harness_handoff_claim_model,

@@ -1,0 +1,641 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! `sys jobs` (§13.6): the stuck engine's view ([`crate::jobs::JobsView`],
+//! which the host hangs on every snapshot) for one scope, as text and JSON.
+//!
+//! The row words are the engine's own ([`JobRow::wire`], the findings'
+//! [`Findings::wire_lines`]), so `sys jobs`, the stats bars and the engine's
+//! tests read one spelling. This module picks the rows a scope covers, says
+//! the summary sentence, and builds the JSON shapes (no float, no null:
+//! φ is `phi_m`, φ × 1000).
+//!
+//! PRIVACY: a scope covers only its sessions' rows; findings name a process
+//! of any user, so a finding prints only for a session the scope covers,
+//! except in `scope=global`, which is the owner's (the access arm escalates
+//! it). No command text is printed: the engine keeps none on its rows.
+
+use super::json::Jv;
+use super::view::Line;
+use crate::jobs::wire::{exe_word, phi_text};
+use crate::jobs::{Class, Findings, JobRow, JobsView, Verdict};
+use crate::model::Snapshot;
+
+/// The rows of `view` in the sessions `keys`: live rows before exited ones,
+/// then by id.
+#[must_use]
+pub fn rows_in<'a>(view: &'a JobsView, keys: &[u64]) -> Vec<&'a JobRow> {
+    sorted(view.rows.iter().filter(|r| keys.contains(&r.tab)).collect())
+}
+
+/// Every row of `view` (`scope=global`, the owner's), ordered as
+/// [`rows_in`].
+#[must_use]
+pub fn rows_all(view: &JobsView) -> Vec<&JobRow> {
+    sorted(view.rows.iter().collect())
+}
+
+fn sorted(mut rows: Vec<&JobRow>) -> Vec<&JobRow> {
+    rows.sort_by(|a, b| {
+        (a.verdict == Verdict::Exited)
+            .cmp(&(b.verdict == Verdict::Exited))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    rows
+}
+
+/// Why a snapshot carries no jobs view: the first sample (`warming`), or a
+/// host that read none (`not_sampled`).
+#[must_use]
+pub fn missing_why(s: &Snapshot) -> &'static str {
+    if s.procs_window_ns.is_none() {
+        "warming"
+    } else {
+        "not_sampled"
+    }
+}
+
+/// Whether a row is running: its class says so and it has not exited.
+fn running(r: &JobRow) -> bool {
+    r.class == Class::Running && r.verdict != Verdict::Exited
+}
+
+/// The verdicts the summary counts, in the closed set's order (`fine` is
+/// counted as jobs, not said).
+const SAID: [Verdict; 8] = [
+    Verdict::WaitingYou,
+    Verdict::Parked,
+    Verdict::Quiet,
+    Verdict::Busy,
+    Verdict::Slow,
+    Verdict::Stuck,
+    Verdict::NeverReturns,
+    Verdict::Exited,
+];
+
+/// The suspect row with the highest φ, for `worst:`.
+fn worst<'a>(rows: &[&'a JobRow]) -> Option<&'a JobRow> {
+    rows.iter()
+        .copied()
+        .filter(|r| {
+            matches!(
+                r.verdict,
+                Verdict::Quiet | Verdict::Busy | Verdict::Slow | Verdict::Stuck
+            )
+        })
+        .filter(|r| r.phi_milli.is_some_and(|p| p > 0))
+        .max_by_key(|r| r.phi_milli.unwrap_or(0))
+}
+
+/// The summary clauses: `3 jobs · 1 running · 1 quiet · 1 stuck · worst:
+/// silent 19m12s, about 19× its usual 60 s gap, φ 8.34`; `no jobs` for none.
+/// Words only: no name any process chose.
+#[must_use]
+pub fn summary(rows: &[&JobRow]) -> String {
+    if rows.is_empty() {
+        return "no jobs".to_owned();
+    }
+    let mut parts = vec![format!(
+        "{} job{}",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    )];
+    let run = rows.iter().filter(|r| running(r)).count();
+    if run > 0 {
+        parts.push(format!("{run} running"));
+    }
+    for v in SAID {
+        let n = rows.iter().filter(|r| r.verdict == v).count();
+        if n > 0 {
+            parts.push(format!("{n} {}", v.word()));
+        }
+    }
+    if let Some(w) = worst(rows) {
+        let phi = phi_text(w.phi_milli.unwrap_or(0));
+        parts.push(match w.gap() {
+            Some(gap) => format!("worst: {gap}, φ {phi}"),
+            None => format!("worst: φ {phi}"),
+        });
+    }
+    parts.join(" · ")
+}
+
+/// How much a verdict asks for a look, most first: the order `status job=`
+/// picks a session's worst job by. `exited` is not a live job's.
+fn urgency(v: Verdict) -> Option<u8> {
+    Some(match v {
+        Verdict::Stuck => 0,
+        Verdict::NeverReturns => 1,
+        Verdict::Quiet => 2,
+        Verdict::Slow => 3,
+        Verdict::Busy => 4,
+        Verdict::WaitingYou => 5,
+        Verdict::Parked => 6,
+        Verdict::Fine => 7,
+        Verdict::Exited => return None,
+    })
+}
+
+/// The live job of `rows` whose verdict asks most for a look (then the one
+/// quiet longest); `None` when every row has exited or there is none.
+#[must_use]
+pub fn worst_live<'a>(rows: &[&'a JobRow]) -> Option<&'a JobRow> {
+    rows.iter()
+        .copied()
+        .filter_map(|r| urgency(r.verdict).map(|u| (u, r)))
+        .min_by_key(|(u, r)| (*u, std::cmp::Reverse(r.quiet_ms.unwrap_or(0))))
+        .map(|(_, r)| r)
+}
+
+/// `status`'s two additive fields (§11.2): `job=<verdict> job_quiet_ms=<ms>`
+/// of the session's worst live job; `job=none job_quiet_ms=-` when the engine
+/// read the session and found no live job; `job=- job_quiet_ms=-` without a
+/// view to read (none yet, or too old to speak for now). The view is
+/// `age_ms` old: the quiet age is the time since the last progress the engine
+/// saw, so it counts on past the reading.
+#[must_use]
+pub fn status_fields(view: Option<&JobsView>, keys: &[u64], age_ms: u64) -> String {
+    let Some(view) = view else {
+        return "job=- job_quiet_ms=-".to_owned();
+    };
+    match worst_live(&rows_in(view, keys)) {
+        Some(r) => format!(
+            "job={} job_quiet_ms={}",
+            r.verdict.word(),
+            r.quiet_ms
+                .map_or_else(|| "-".to_owned(), |q| q.saturating_add(age_ms).to_string())
+        ),
+        None => "job=none job_quiet_ms=-".to_owned(),
+    }
+}
+
+/// The `brief` jobs line (§19 P2a): `jobs 2 jobs · 1 running · 1 stuck ·
+/// worst: …`, the `sys jobs` summary of the session's rows, when it has a
+/// live job; `None` otherwise (a brief spends no tokens on an idle tab).
+#[must_use]
+pub fn brief_line(view: &JobsView, keys: &[u64]) -> Option<String> {
+    let rows = rows_in(view, keys);
+    worst_live(&rows)?;
+    Some(format!("jobs {}", summary(&rows)))
+}
+
+fn value_line(key: String, text: String) -> Line {
+    Line {
+        key,
+        text,
+        value: true,
+    }
+}
+
+/// The findings a scope may print: those in its sessions, or every one for
+/// `all` (`scope=global`, the owner's).
+#[must_use]
+pub fn findings_in(f: &Findings, keys: &[u64], all: bool) -> Findings {
+    let mine = |tab: Option<u64>| all || tab.is_some_and(|t| keys.contains(&t));
+    Findings {
+        stopped: f.stopped.iter().filter(|n| mine(n.tab)).cloned().collect(),
+        zombies: f.zombies.iter().filter(|z| mine(z.tab)).cloned().collect(),
+        d_state: f.d_state.iter().filter(|n| mine(n.tab)).cloned().collect(),
+        busy_orphans: f
+            .busy_orphans
+            .iter()
+            .filter(|n| mine(n.tab))
+            .cloned()
+            .collect(),
+        own_procs: f.own_procs,
+        process_limit: f.process_limit,
+    }
+}
+
+/// The body lines after the `jobs` sentence: one `job` row per job (with
+/// `tab=<n>` when the scope spans tabs), the findings, the lanes that are
+/// off. At most `top` rows; the caller counts the rest on the reply's one
+/// `more=` line ([`overflow`]).
+pub fn row_lines(
+    view: &JobsView,
+    rows: &[&JobRow],
+    findings: &Findings,
+    wide: bool,
+    top: usize,
+    tab_number: &dyn Fn(u64) -> Option<usize>,
+) -> Vec<Line> {
+    let mut out = Vec::new();
+    for r in rows.iter().take(top) {
+        let mut t = r.wire();
+        if wide && let Some(n) = tab_number(r.tab) {
+            t.push_str(&format!(" tab={n}"));
+        }
+        out.push(value_line(format!("job {}:{}", r.tab, r.id), t));
+    }
+    for (i, f) in findings.wire_lines().into_iter().enumerate() {
+        out.push(value_line(format!("finding {i}"), f));
+    }
+    if !view.lanes_off.is_empty() {
+        out.push(value_line(
+            "lanes".into(),
+            format!("lanes {}", view.lanes_off.join(" ")),
+        ));
+    }
+    out
+}
+
+/// The rows `top` left out, as the `more=` line's first words (`3 jobs ·
+/// top=11`, the `top=` that would print them all, at most 64); `None` when
+/// every row printed.
+#[must_use]
+pub fn overflow(rows: usize, top: usize) -> Option<String> {
+    (rows > top).then(|| format!("{} jobs · top={}", rows - top, rows.min(64)))
+}
+
+/// `kind`/`consumer` words as JSON enum strings: `agent-call` → `agent_call`.
+fn enum_word(w: &str) -> String {
+    w.replace('-', "_")
+}
+
+/// One row as JSON (§13.6): integers in base units, φ as `phi_m`.
+#[must_use]
+pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
+    let mut o = Jv::obj([
+        ("id", Jv::s(r.id.clone())),
+        (
+            "tab",
+            tab_number.map_or_else(|| Jv::why("gone"), |n| Jv::u(n as u64)),
+        ),
+        ("kind", Jv::s(enum_word(r.kind.word()))),
+        ("consumer", Jv::s(enum_word(r.consumer.word()))),
+    ]);
+    if let Some(t) = &r.task {
+        o.set("task", Jv::s(exe_word(t)));
+    }
+    if let Some(p) = r.promoted_ms {
+        o.set("promoted_ms", Jv::u(p));
+    }
+    o.set("pgid", Jv::u(u64::from(r.pgid)));
+    o.set("exe", Jv::s(exe_word(&r.exe)));
+    o.set("members", Jv::u(r.members as u64));
+    o.set("class", Jv::s(r.class.word()));
+    if let Some(w) = &r.wait {
+        let mut wj = Jv::obj([("name", Jv::s(w.name.word()))]);
+        if let Some(p) = w.peer {
+            wj.set("peer", Jv::u(u64::from(p)));
+        }
+        if let Some((remote, state, queued)) = &w.tcp {
+            if let Some(a) = remote {
+                wj.set("remote", Jv::s(a.to_string()));
+            }
+            wj.set("state", Jv::s(state.word()));
+            wj.set("queued_bytes", Jv::u(*queued));
+        }
+        if let Some(fd) = w.fd {
+            wj.set("fd", Jv::u(fd));
+        }
+        if let Some(port) = w.port {
+            wj.set("port", Jv::u(u64::from(port)));
+        }
+        o.set("wait", wj);
+    }
+    o.set(
+        "named",
+        r.named.as_ref().map_or_else(
+            || Jv::why("not_sampled"),
+            |n| {
+                let mut nj = Jv::obj([("word", Jv::s(n.word.word()))]);
+                if let Some(h) = &n.holder {
+                    let mut hj = Jv::obj([
+                        ("pid", Jv::u(u64::from(h.pid))),
+                        ("exe", Jv::s(exe_word(&h.exe))),
+                    ]);
+                    if let Some(t) = h.tab {
+                        hj.set("tab", Jv::u(u64::from(t)));
+                    }
+                    if let Some(c) = h.class {
+                        hj.set("class", Jv::s(c.word()));
+                    }
+                    nj.set("holder", hj);
+                }
+                nj
+            },
+        ),
+    );
+    if let Some(s) = &r.stop {
+        o.set(
+            "stop",
+            Jv::obj([
+                ("parked", Jv::Bool(s.parked)),
+                ("pid", Jv::u(u64::from(s.pid))),
+                ("exe", Jv::s(exe_word(&s.name))),
+            ]),
+        );
+    }
+    if let Some(i) = &r.input {
+        o.set(
+            "input",
+            Jv::obj([
+                ("word", Jv::s(i.word.word())),
+                ("bytes", Jv::u(i.bytes)),
+                ("wait_ms", Jv::u(i.wait_ms)),
+            ]),
+        );
+    }
+    // The engine carries CPU only where a class rests on it (unread input,
+    // busy-silent); elsewhere it is no evidence, and the row, like the
+    // text one, leaves it out rather than call it warming.
+    if let Some(c) = r.cpu_mc {
+        o.set("cpu_mc", Jv::u(c));
+    }
+    if let Some(z) = &r.zombies {
+        o.set(
+            "zombies",
+            Jv::obj([
+                ("count", Jv::u(u64::from(z.count))),
+                ("parent", Jv::u(u64::from(z.parent))),
+                ("per_min_deci", Jv::u(z.per_min_deci)),
+            ]),
+        );
+    }
+    if let Some(q) = r.quiet_ms {
+        o.set("quiet_ms", Jv::u(q));
+    }
+    if let Some(p) = r.phi_milli {
+        o.set("phi_m", Jv::u(p));
+    }
+    if let Some(mu) = r.mu_ms {
+        o.set("mu_ms", Jv::u(mu));
+    }
+    if let Some(from) = r.mu_from {
+        o.set("mu_from", Jv::s(from.word()));
+    }
+    o.set("verdict", Jv::s(r.verdict.word()));
+    // Beside the verdict, never one: an agent's quiet call whose members
+    // used no CPU over its silence.
+    o.set("no_progress", Jv::Bool(r.no_progress));
+    o.set("episode", Jv::u(u64::from(r.episode)));
+    if let Some(e) = r.exit {
+        o.set("exit", Jv::Int(i64::from(e)));
+    }
+    o
+}
+
+/// The summary as JSON: counts by running and by each verdict said, and the
+/// worst suspect's quiet age and φ.
+#[must_use]
+pub fn summary_json(rows: &[&JobRow]) -> Jv {
+    let mut o = Jv::obj([
+        ("jobs", Jv::u(rows.len() as u64)),
+        (
+            "running",
+            Jv::u(rows.iter().filter(|r| running(r)).count() as u64),
+        ),
+    ]);
+    for v in SAID {
+        let n = rows.iter().filter(|r| r.verdict == v).count() as u64;
+        o.set(&enum_word(v.word()), Jv::u(n));
+    }
+    if let Some(w) = worst(rows) {
+        if let Some(q) = w.quiet_ms {
+            o.set("worst_quiet_ms", Jv::u(q));
+        }
+        o.set("worst_phi_m", Jv::u(w.phi_milli.unwrap_or(0)));
+    }
+    o
+}
+
+/// The findings as JSON objects, one per finding, and the process table.
+#[must_use]
+pub fn findings_json(f: &Findings) -> Jv {
+    let named = |kind: &str, n: &crate::jobs::Named| {
+        Jv::obj([
+            ("kind", Jv::s(kind)),
+            ("pid", Jv::u(u64::from(n.pid))),
+            ("exe", Jv::s(exe_word(&n.name))),
+            ("for_ms", Jv::u(n.for_ms)),
+        ])
+    };
+    let mut items: Vec<Jv> = Vec::new();
+    items.extend(f.stopped.iter().map(|n| named("stopped", n)));
+    items.extend(f.zombies.iter().map(|z| {
+        Jv::obj([
+            ("kind", Jv::s("zombies")),
+            ("parent", Jv::u(u64::from(z.ppid))),
+            ("exe", Jv::s(exe_word(&z.name))),
+            ("count", Jv::u(u64::from(z.count))),
+            ("per_min_deci", Jv::u(z.per_min_deci)),
+        ])
+    }));
+    items.extend(f.d_state.iter().map(|n| named("d_state", n)));
+    items.extend(f.busy_orphans.iter().map(|n| named("busy_orphan", n)));
+    Jv::obj([
+        ("items", Jv::Arr(items)),
+        ("own_procs", Jv::u(f.own_procs)),
+        (
+            "process_limit",
+            Jv::known_or(f.process_limit, "unsupported"),
+        ),
+    ])
+}
+
+/// Rows for the tests of this module and of `await sys`'s job terms.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use crate::jobs::{
+        Class, Consumer, JobKind, JobRow, MuFrom, Standing, Tick, Verdict, Wait, WaitName,
+    };
+
+    pub(crate) fn row(id: &str, tab: u64, class: Class, verdict: Verdict) -> JobRow {
+        JobRow {
+            id: id.into(),
+            tab,
+            kind: JobKind::AgentCall,
+            consumer: Consumer::AgentBg,
+            promoted_ms: None,
+            task: Some("bq7f2k1za".into()),
+            pgid: 40977,
+            leader: (40977, None),
+            exe: "curl".into(),
+            members: 2,
+            class,
+            wait: None,
+            named: None,
+            stop: None,
+            input: None,
+            cpu_mc: None,
+            zombies: None,
+            standing: None,
+            quiet_ms: None,
+            phi_milli: None,
+            mu_ms: None,
+            mu_from: None,
+            verdict,
+            no_progress: false,
+            episode: 1,
+            exit: None,
+            tick: Tick::default(),
+        }
+    }
+
+    pub(crate) fn stuck(id: &str, tab: u64) -> JobRow {
+        let mut r = row(id, tab, Class::Waiting, Verdict::Stuck);
+        let mut w = Wait::bare(WaitName::Tcp, Standing::Capable, 40978, "curl");
+        w.tcp = Some((
+            Some("127.0.0.1:47811".parse().unwrap()),
+            crate::jobs::TcpState::Established,
+            0,
+        ));
+        r.wait = Some(w);
+        r.quiet_ms = Some(1_152_000);
+        r.phi_milli = Some(8_338);
+        r.mu_ms = Some(60_000);
+        r.mu_from = Some(MuFrom::Prior);
+        r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{row, stuck};
+    use super::*;
+    use crate::jobs::Named;
+
+    #[test]
+    fn status_says_the_worst_live_job_and_brief_spends_nothing_on_an_idle_tab() {
+        assert_eq!(status_fields(None, &[7], 0), "job=- job_quiet_ms=-");
+        let mut quiet = row("a1", 7, Class::Waiting, Verdict::Quiet);
+        quiet.quiet_ms = Some(400_000);
+        let view = JobsView {
+            rows: vec![
+                row("a0", 7, Class::Running, Verdict::Fine),
+                quiet,
+                stuck("a2", 7),
+                row("a3", 7, Class::Exited, Verdict::Exited),
+                stuck("a9", 8),
+            ],
+            ..JobsView::default()
+        };
+        assert_eq!(
+            status_fields(Some(&view), &[7], 0),
+            "job=stuck job_quiet_ms=1152000"
+        );
+        assert_eq!(
+            status_fields(Some(&view), &[7], 3_000),
+            "job=stuck job_quiet_ms=1155000",
+            "the quiet age counts on past a view 3 s old"
+        );
+        let calm = JobsView {
+            rows: vec![row("a3", 7, Class::Exited, Verdict::Exited)],
+            ..JobsView::default()
+        };
+        assert_eq!(
+            status_fields(Some(&calm), &[7], 0),
+            "job=none job_quiet_ms=-"
+        );
+        assert_eq!(brief_line(&calm, &[7]), None);
+        assert_eq!(
+            status_fields(Some(&view), &[5], 0),
+            "job=none job_quiet_ms=-"
+        );
+        let line = brief_line(&view, &[7]).expect("live jobs");
+        assert!(
+            line.starts_with("jobs 4 jobs · 1 running · 1 quiet · 1 stuck · 1 exited · worst: "),
+            "{line}"
+        );
+        assert!(!line.contains("curl"), "no name a process chose: {line}");
+    }
+    use crate::sys::json::contract_violations;
+
+    fn view(rows: Vec<JobRow>) -> JobsView {
+        JobsView {
+            rows,
+            findings: Findings::default(),
+            demand: crate::jobs::Demand::Fast,
+            lanes_off: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_scope_reads_only_its_sessions_rows_live_first() {
+        let mut done = row("a1", 7, Class::Exited, Verdict::Exited);
+        done.exit = Some(0);
+        let v = view(vec![
+            done,
+            row("a3", 9, Class::Running, Verdict::Fine),
+            stuck("a2", 7),
+            row("b4", 7, Class::Running, Verdict::Fine),
+        ]);
+        let rows = rows_in(&v, &[7]);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a2", "b4", "a1"], "tab 9's row is not this scope's");
+        assert_eq!(
+            summary(&rows),
+            "3 jobs · 1 running · 1 stuck · 1 exited · worst: silent 19m12s, about 19× its usual 60 s gap, φ 8.34"
+        );
+        assert_eq!(summary(&rows_in(&v, &[42])), "no jobs");
+    }
+
+    #[test]
+    fn rows_print_the_engines_words_and_json_keeps_the_contract() {
+        let v = view(vec![stuck("a40977", 7)]);
+        let rows = rows_in(&v, &[7]);
+        let lines = row_lines(&v, &rows, &Findings::default(), true, 8, &|k| {
+            (k == 7).then_some(1)
+        });
+        // The row, then the process table the engine always reports.
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].text, "finding kind=process-table own=0");
+        assert!(
+            lines[0].text.starts_with("job id=a40977 kind=agent-call"),
+            "{}",
+            lines[0].text
+        );
+        assert!(lines[0].text.contains(" remote=127.0.0.1:47811"));
+        assert!(lines[0].text.ends_with(" verdict=stuck tab=1"));
+        let j = row_json(rows[0], Some(1));
+        assert!(contract_violations(&j).is_empty(), "{:?}", j.to_text());
+        assert_eq!(j.get("phi_m"), Some(&Jv::Int(8_338)));
+        assert_eq!(j.get("kind"), Some(&Jv::s("agent_call")));
+        let s = summary_json(&rows);
+        assert!(contract_violations(&s).is_empty());
+        assert_eq!(s.get("stuck"), Some(&Jv::Int(1)));
+        assert_eq!(s.get("worst_quiet_ms"), Some(&Jv::Int(1_152_000)));
+    }
+
+    #[test]
+    fn a_finding_prints_only_where_the_scope_reaches_unless_global() {
+        let f = Findings {
+            stopped: vec![
+                Named {
+                    pid: 10,
+                    name: "vim".into(),
+                    tab: Some(7),
+                    for_ms: 0,
+                },
+                Named {
+                    pid: 11,
+                    name: "someone-elses".into(),
+                    tab: None,
+                    for_ms: 0,
+                },
+            ],
+            own_procs: 300,
+            process_limit: Some(5_000),
+            ..Findings::default()
+        };
+        let mine = findings_in(&f, &[7], false);
+        assert_eq!(mine.stopped.len(), 1);
+        assert_eq!(mine.stopped[0].pid, 10);
+        assert_eq!(findings_in(&f, &[7], true).stopped.len(), 2);
+        let j = findings_json(&mine);
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        // A name no exe word may carry prints as `-`.
+        let odd = Findings {
+            stopped: vec![Named {
+                pid: 12,
+                name: "evil\u{1b}[31m".into(),
+                tab: Some(7),
+                for_ms: 0,
+            }],
+            ..Findings::default()
+        };
+        let lines = row_lines(&view(Vec::new()), &[], &odd, false, 8, &|_| None);
+        assert_eq!(lines[0].text, "finding kind=stopped pid=12 exe=-");
+    }
+}

@@ -1,20 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tar-slip-safe extraction vetting (§4.2/§15) — the fail-closed decision for whether a
-//! single archive entry may be written under the per-program store root.
+//! Tar-slip-safe archive extraction (§4.2/§15): the fail-closed decision for whether an
+//! archive entry may be written under the per-program store root, and the one writer that
+//! lays every lane's entries.
 //!
-//! A bundle is attacker-influenced input (it is only signature-verified as a
-//! *compressed blob*; the extracted layout is re-checked against `tree_root` afterwards,
-//! §8). The classic tar-slip escapes — an absolute path, a `..` traversal, or a
-//! symlink/hardlink that redirects a later write outside the store — must each abort the
-//! WHOLE staged group, never partially extract. This module is the pure, dependency-free
-//! core of that defence: [`vet_entry`] turns a `(raw path, kind)` pair into either a
-//! **safe absolute destination under the root** or a [`ExtractReject`]. Every reader
-//! (the first-party tar parser in `crate::tarread`, the first-party zip parser in
-//! `extract/zipread.rs`) feeds every entry through it before writing a single byte.
+//! A bundle is attacker-influenced input: only the compressed blob is signature-verified,
+//! and the extracted layout is re-checked against `tree_root` afterwards (§8). Any slip
+//! aborts the whole staged group. [`vet_entry`] turns a `(raw path, kind)` pair into a safe
+//! absolute destination under the root or an [`ExtractReject`]; every reader (`tarread`,
+//! `extract/zipread.rs`) feeds each entry through it before writing a byte.
 //!
-//! **Fail closed by construction:**
 //! * absolute paths, `..` components, and root/prefix components are refused;
 //! * any non-regular/non-directory/non-link entry type is refused, except
 //!   explicitly admitted descriptive global PAX metadata, which creates no file;
@@ -47,12 +43,9 @@
 //! * the validated path is re-joined to the root and confirmed to still be under it
 //!   (defence in depth against any normalization surprise).
 //!
-//! **One writer for every lane.** The decompressors differ (zstd, gzip, deflate-in-zip)
-//! and the container parsers differ (tar, zip), but everything that touches the disk —
-//! the vet, `strip_components`, the entry-count and byte caps, the mode sanitizing, the
-//! symlink discipline and the `tree_root` fold — is one code path, [`Layer`]. A slip rule
-//! that held for `.tar.zst` therefore holds for `.tar.gz` and `.zip` by construction, not
-//! by parallel implementation.
+//! The decompressors (zstd, gzip, deflate-in-zip) and container parsers (tar, zip) differ,
+//! but everything that touches the disk (the vet, `strip_components`, the caps, the mode
+//! sanitizing, the symlink rules and the `tree_root` fold) is one code path, [`Layer`].
 
 use std::cell::Cell;
 use std::io::{self, Read, Write};
@@ -63,8 +56,7 @@ use crate::tarread::EntryType as TarEntryType;
 
 mod zipread;
 
-/// Why an archive entry was refused. Any variant aborts the entire staged group — a
-/// half-extracted bundle never activates (§7).
+/// Why an archive entry was refused. Any variant aborts the whole staged group (§7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractReject {
     /// The entry path is absolute (`/etc/...`) — it must be relative to the store root.
@@ -84,27 +76,23 @@ pub enum ExtractReject {
     /// A hardlink whose target had not been extracted by the time the link entry
     /// appeared — a forward/self reference no honest archiver produces.
     HardlinkTargetMissing,
-    /// The entry's destination passes THROUGH a symlink laid down earlier in the same
-    /// archive: the bytes would land somewhere other than the path the digest records.
+    /// The entry's destination passes through a symlink laid earlier in the same archive,
+    /// so the bytes would land somewhere other than the path the digest records.
     ThroughSymlink,
-    /// A symlink entry names a path something already occupies, a file/directory entry
-    /// names a path an earlier symlink occupies, or an entry names a file, or passes
-    /// through a directory, that the filesystem resolves to a name ANOTHER member laid
-    /// under different bytes (a case-insensitive or normalization-insensitive spelling of
-    /// it). No honest archiver produces any of them for the filesystem it is unpacked on;
-    /// each would make the on-disk tree disagree with the folded digest.
+    /// A symlink entry names an occupied path, a file/directory entry names a path an
+    /// earlier symlink occupies, or an entry names a file or passes through a directory
+    /// the filesystem resolves to another member's name under different bytes (case- or
+    /// normalization-insensitive). Each would make the disk disagree with the digest.
     Occupied,
-    /// The filesystem stored a name the extraction laid under OTHER bytes, or laid nothing
-    /// for it: HFS+ decomposes an NFC name to NFD, Win32 drops a trailing `.` or space,
-    /// and a device name such as `nul` writes no file. Nothing collided (that is
-    /// [`Self::Occupied`]); the one name came back changed or not at all, so the walk of
-    /// the staged tree would never find the line the fold recorded. Found when the stage
-    /// reads its names back (`TreeAccumulator::require_spelled_back`); the path is the
-    /// first recorded name the disk does not hold under those bytes.
+    /// The filesystem stored a laid name under other bytes, or laid nothing for it (HFS+
+    /// decomposing NFC to NFD, Win32 dropping a trailing `.` or space, a device name such
+    /// as `nul`), so the walk would never find the line the fold recorded. Found when the
+    /// stage reads its names back (`TreeAccumulator::require_spelled_back`); the path is
+    /// the first recorded name the disk does not hold under those bytes.
     Respelled,
-    /// A single-file archive ([`stage_tar_gz_member`]) that is not EXACTLY ONE member
-    /// named by one bare component at its root: a second member, a nested or dotted name
-    /// (`dir/agy`, `./agy`, `agy/`), or — carried with an empty path — no member at all.
+    /// A single-file archive ([`stage_tar_gz_member`]) that is not exactly one member named
+    /// by one bare component: a second member, a nested or dotted name (`dir/agy`,
+    /// `./agy`, `agy/`), or (with an empty path) no member at all.
     NotSingleFile,
 }
 
@@ -138,10 +126,10 @@ pub enum EntryKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExtractOptions {
     /// Leading path components dropped from every entry (GNU tar `--strip-components`):
-    /// `gh_2.80.0_macOS_arm64/bin/gh` → `bin/gh` at `1`. An entry with no components
-    /// left is skipped, its body drained through the same byte cap. Hardlink targets are
-    /// stripped the same way. The FULL path is vetted BEFORE stripping, so `..` above the
-    /// strip depth is still a refusal, never a way in.
+    /// `gh_2.80.0_macOS_arm64/bin/gh` → `bin/gh` at `1`. An entry with nothing left is
+    /// skipped, its body drained through the same byte cap; hardlink targets strip the
+    /// same way. The full path is vetted before stripping, so `..` above the strip depth
+    /// is still a refusal.
     pub strip_components: u32,
     /// Which symlink targets may be preserved. All admitted links are leaves:
     /// later entries may never write on or through them.
@@ -180,16 +168,15 @@ pub(crate) enum FrameChecksum {
     Required,
 }
 
-/// Steps 2–4 of [`vet_entry`]: the pure component walk. Accepts ONLY `Normal` segments
+/// Steps 2–4 of [`vet_entry`]: the pure component walk. Accepts only `Normal` segments
 /// (`.` dropped; `..` is traversal; a root/prefix component is an absolute escape) and
-/// refuses a path that names nothing. Returns the validated RELATIVE path.
+/// refuses a path that names nothing. Returns the validated relative path.
 fn vet_components(raw: &Path) -> Result<PathBuf, ExtractReject> {
     // An absolute entry path can never be made relative to the root.
     if raw.is_absolute() {
         return Err(ExtractReject::AbsolutePath);
     }
-    // Component-walk. This distinguishes a `..` *component* from a filename that merely
-    // contains dots (`foo..bar` stays a Normal component, correctly allowed).
+    // A `..` component is traversal; a name containing dots (`foo..bar`) is Normal.
     let mut rel = PathBuf::new();
     for comp in raw.components() {
         match comp {
@@ -225,16 +212,12 @@ fn strip_leading(rel: &Path, strip: u32) -> Option<PathBuf> {
     }
 }
 
-/// How many leading `.` components the entry path carries AS WRITTEN (`./x` → 1,
-/// `././x` → 2, `x` → 0) — the count `strip_components` has to spend on them, because
-/// the tar that AUTHORS these rows spends it: measured on bsdtar 3.5.3 (libarchive
-/// 3.7.4), `tar -x --strip-components 1` over an archive of `./top/bin/gh` lays
-/// `top/bin/gh`, having spent the strip on the `.`. [`vet_components`] drops `.` before
-/// anything can count it, so the count is taken from the raw path instead and subtracted
-/// from the budget [`strip_leading`] then spends on the vetted one. Without that, a
-/// `tar -C dir -c .` archive lays one component DEEPER on every client than in the tree
-/// the authoring ceremony staged with the system tar and signed the `tree_root` of — a
-/// row that verifies and then installs nothing.
+/// How many leading `.` components the raw entry path carries (`./x` → 1, `././x` → 2).
+/// The tar that authors these rows spends `strip_components` on them (bsdtar 3.5.3:
+/// `--strip-components 1` over `./top/bin/gh` lays `top/bin/gh`), and [`vet_components`]
+/// drops `.`, so the count is taken from the raw path and subtracted from the strip.
+/// Otherwise a `tar -C dir -c .` archive lays one component deeper than the tree the
+/// authoring ceremony signed.
 fn leading_curdirs(raw: &Path) -> u32 {
     let n = raw
         .components()
@@ -253,14 +236,9 @@ fn join_under(root: &Path, rel: &Path) -> Result<PathBuf, ExtractReject> {
     Ok(dest)
 }
 
-/// Vet one archive entry against the store `root`. On success returns the safe absolute
-/// destination (`root` joined with the validated relative path); otherwise a fail-closed
-/// [`ExtractReject`]. `root` is the per-program staging directory the caller owns; it is
-/// returned-into only for [`EntryKind::Regular`]/[`EntryKind::Directory`] entries whose
-/// path is purely relative and traversal-free.
-///
-/// Pure and side-effect-free (no filesystem access), so the full adversarial matrix is
-/// unit-testable without writing any files.
+/// Vet one archive entry against the store `root`: the safe absolute destination for a
+/// purely relative, traversal-free [`EntryKind::Regular`]/[`EntryKind::Directory`] entry,
+/// else a fail-closed [`ExtractReject`]. Pure (no filesystem access).
 pub fn vet_entry(root: &Path, raw: &Path, kind: EntryKind) -> Result<PathBuf, ExtractReject> {
     // 1. Only real files/dirs are laid down through THIS vet. Symlinks (the
     //    classic slip + TOCTOU vector) and exotic types are refused outright;
@@ -278,11 +256,10 @@ pub fn vet_entry(root: &Path, raw: &Path, kind: EntryKind) -> Result<PathBuf, Ex
     join_under(root, &rel)
 }
 
-/// [`vet_entry`] with `strip_components`: the FULL raw path is vetted first (so `..` or
-/// an absolute prefix above the strip depth is still refused), THEN the leading
-/// components are dropped. `Ok(None)` when nothing remains — skip the entry. A leading
-/// `.` is one of the components the strip spends itself on ([`leading_curdirs`]), as it
-/// is for the tar that writes these archives.
+/// [`vet_entry`] with `strip_components`: the full raw path is vetted first (so `..` or an
+/// absolute prefix above the strip depth is still refused), then the leading components
+/// are dropped. `Ok(None)` when nothing remains: skip the entry. A leading `.` is one of
+/// the components the strip spends ([`leading_curdirs`]).
 pub fn vet_entry_stripped(
     root: &Path,
     raw: &Path,
@@ -329,24 +306,19 @@ pub fn vet_hardlink_stripped(
     Ok(Some((dest, target)))
 }
 
-/// Vet one SYMLINK entry for the lanes that admit them: the entry path passes the
-/// component walk (and `strip`), and the target — which is created VERBATIM, so the
-/// on-disk link and the digest agree — must resolve *lexically inside the root*. A
-/// relative target is resolved from the link's own directory, `..` popping one level;
-/// popping above the root is [`ExtractReject::RootEscape`], an absolute target is
-/// [`ExtractReject::AbsolutePath`], an empty one [`ExtractReject::EmptyPath`]. Returns
-/// the link's safe absolute path; `Ok(None)` when the entry strips away.
+/// Vet one symlink entry for the lanes that admit them: the entry path passes the
+/// component walk (and `strip`), and the target, created verbatim, must resolve lexically
+/// inside the root. A relative target resolves from the link's own directory; popping
+/// above the root is [`ExtractReject::RootEscape`], an absolute target
+/// [`ExtractReject::AbsolutePath`], an empty one [`ExtractReject::EmptyPath`]. Returns the
+/// link's safe absolute path; `Ok(None)` when the entry strips away.
 ///
-/// Lexical on purpose: the resolution never consults the filesystem, so it cannot be
-/// raced. That is only sound because `..` is admitted as a LEADING run and nowhere else
-/// ([`ExtractReject::RootEscape`] after any normal component): a `..` that follows a
-/// component pops from wherever that component points on disk, and when it is a link laid
-/// earlier in the same archive the lexical walk and the disk disagree — `a/b/c/up ->
-/// ../../..` and `bin -> a/b/c/up/../OUTSIDE` each vet in-root and chain out of it.
-/// Leading pops start from the link's own directory, which is always a
-/// real directory (the ancestors and the landing path are guarded against links); after
-/// them the target only descends, through entries each vetted in-root, so no chain of
-/// links can climb out whatever order they are laid in.
+/// Lexical, so it cannot be raced. That is sound only because `..` is admitted as a
+/// leading run and nowhere else: a `..` after a component pops from wherever that
+/// component points on disk, and if it is an earlier link the walk and the disk disagree
+/// (`a/b/c/up -> ../../..` plus `bin -> a/b/c/up/../OUTSIDE` would chain out). Leading
+/// pops start from a real directory (ancestors and the landing path are guarded against
+/// links), and after them the target only descends.
 pub fn vet_symlink(
     root: &Path,
     raw: &Path,
@@ -385,63 +357,51 @@ pub fn vet_symlink(
     join_under(root, &rel).map(Some)
 }
 
-/// A failure while extracting a bundle. Any variant aborts the WHOLE stage — the caller
-/// removes the (partial) `dest_root` so a half-extracted tree never activates.
+/// A failure while extracting a bundle. Any variant aborts the whole stage; the caller
+/// removes the partial `dest_root`.
 #[derive(Debug)]
 pub enum ExtractError {
     /// An I/O / decompression / container-format error.
     ///
-    /// `op` names the step that failed and `path` the filesystem path it was on —
-    /// the two things a bare errno cannot say. A 508-member toolchain bundle that
-    /// dies at member 300 has to name the member and the destination, because the
-    /// caller then DELETES the partial `dest_root` and nothing else survives to say
-    /// how far it got; and on macOS an `EPERM` is usually privacy consent arriving
-    /// with no dialog, where the whole question is *which path* needs it.
-    ///
-    /// The two travel together: `path: None` (with `op` `""`) is an error from a reader
-    /// with no path in scope, rendered `io: <errno>`.
+    /// `op` names the failing step and `path` the filesystem path it was on: the caller
+    /// deletes the partial `dest_root`, so this is the only record of how far a bundle got,
+    /// and on macOS an `EPERM` is usually privacy consent, where the question is which
+    /// path. `path: None` (with `op` `""`) is an error from a reader with no path in scope.
     Io {
         /// The underlying error.
         err: io::Error,
-        /// The operation that failed (`"create_dir_all"`, `"open"`, `"write"`,
-        /// `"set_mode"`, `"hard_link"`, `"symlink"`, `"read"`, `"fstat"`), or `""`.
+        /// The operation that failed (`"open"`, `"write"`, `"set_mode"`, …), or `""`.
         op: &'static str,
         /// The path the operation was attempted on, when the failing site knew it.
         path: Option<PathBuf>,
     },
     /// An entry failed [`vet_entry`] — a tar-slip escape. Carries the offending raw path.
     Rejected(ExtractReject, PathBuf),
-    /// The bundle tripped one of the decompression-bomb / tar-bomb defences — see
-    /// [`TooLargeReason`] for WHICH one, and on which member. The caps come from the
-    /// *signed* `disk_installed`/`size` (§9), never an attacker-chosen header field.
+    /// The bundle tripped a decompression-bomb / tar-bomb defence ([`TooLargeReason`]). The
+    /// caps come from the signed `disk_installed`/`size` (§9), never a header field.
     TooLarge(TooLargeReason),
 }
 
-/// WHICH bomb defence refused the bundle.
-///
-/// Seven unrelated refusals: one shared "size cap" line would send the operator to
-/// chase `disk_installed` when the cause is one malformed member. Each renders as what
-/// it is, and the header-shaped ones carry the raw member path.
+/// Which bomb defence refused the bundle. Each renders as what it is, so a malformed
+/// member is not reported as the size cap; the member-shaped ones carry the raw path.
 #[derive(Debug)]
 pub enum TooLargeReason {
     /// The signed uncompressed-content cap (`max_total_bytes`) was reached mid-stream.
     ContentCap,
-    /// A tar's STRUCTURE — every header, the padding after each body, GNU/PAX extension
-    /// headers and their bodies — exceeded its own allowance, which is the signed cap
-    /// again, counted apart from content (see [`TAR_ENTRY_STRUCTURAL_BUDGET`]).
+    /// A tar's structure (headers, padding, GNU/PAX extension headers and bodies) exceeded
+    /// its own allowance: the signed cap again, counted apart from content.
     StructureCap,
     /// The signed entry-count cap (`max_entries`) was reached.
     EntryCap,
-    /// One entry's STRUCTURAL reads — its header, its content padding, or a GNU
-    /// longname/longlink or PAX extension body — exceeded the per-entry structural
-    /// budget (`TAR_ENTRY_STRUCTURAL_BUDGET`).
+    /// One entry's structural reads (header, padding, GNU longname/longlink or PAX body)
+    /// exceeded the per-entry budget (`TAR_ENTRY_STRUCTURAL_BUDGET`).
     StructuralBudget,
-    /// A DIRECTORY member declared a nonzero body size — a skip-bomb the byte cap
-    /// never sees. Carries the offending raw member path.
+    /// A directory member declared a nonzero body size, a skip-bomb the byte cap never
+    /// sees. Carries the raw member path.
     DirectoryWithBody(PathBuf),
-    /// A HARDLINK member declared a nonzero body size. Carries the raw member path.
+    /// A hardlink member declared a nonzero body size. Carries the raw member path.
     HardlinkWithBody(PathBuf),
-    /// A SYMLINK member declared a nonzero body size. Carries the raw member path.
+    /// A symlink member declared a nonzero body size. Carries the raw member path.
     SymlinkWithBody(PathBuf),
     /// A zip symlink member whose declared target exceeds the 4096-byte link-target
     /// limit. Carries the raw member path.
@@ -549,16 +509,14 @@ fn classify(ty: TarEntryType) -> EntryKind {
 }
 
 /// Sanitize an archive file mode: never setuid/setgid/sticky, never group/other-writable.
-/// Executables (any `x` bit set) become `0o755`, everything else `0o644`, dirs `0o755`.
-/// Deterministic, so the post-extraction [`crate::tree::tree_root`] matches what the
-/// publish-side producer (Phase 6) computes the same way.
+/// Executables (any `x` bit set) and directories become `0o755`, everything else `0o644`.
+/// Deterministic, so the staged [`crate::tree::tree_root`] matches the publisher's.
 ///
-/// THE ONE MODE RULE of a staged tree, whatever lane laid it: the archive members
+/// The one mode rule of a staged tree, whatever lane laid it: archive members
 /// ([`Layer::regular`], [`Layer::directory`]), the directories a folding lane makes on a
 /// member's way ([`make_dir_exact`]), and the `.app` bundle the `dmg` lane's `ditto`
-/// copied (`install::vet_copied_tree`, AT3 in docs/AUDIT-atpkg-inputs-2026-10-04.md),
-/// so no lane lays a bit another one strips. The single-binary lanes' one file
-/// (`raw-binary`, `tar-gz-binary`) is the executable class, `0o755`.
+/// copied (`install::vet_copied_tree`, AT3 in docs/AUDIT-atpkg-inputs-2026-10-04.md). The
+/// single-binary lanes' one file (`raw-binary`, `tar-gz-binary`) is `0o755`.
 pub fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
     if is_dir || entry_mode & 0o111 != 0 {
         0o755
@@ -567,35 +525,24 @@ pub fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
     }
 }
 
-/// The PER-ENTRY structural byte budget: the maximum decompressed bytes the tar reader
-/// may pull for a SINGLE entry's non-content parts — its header, its content padding,
-/// and (crucially) any GNU longname/longlink or PAX extension-header body. Reset before
-/// each entry (see [`extract_stream`]) so it never accumulates, and refunded for file
-/// content in [`write_capped`], so it bounds ONLY the structural reads. 1 MiB dwarfs any
-/// legitimate header/`PATH_MAX` long name / PAX record, and it is what bounds the MEMORY
-/// one entry's structure can take (the reader holds an extension body whole).
+/// The per-entry structural byte budget: the most decompressed bytes the tar reader may
+/// pull for one entry's non-content parts (header, padding, GNU longname/longlink or PAX
+/// extension body). Reset before each entry ([`extract_stream`]) and refunded for content
+/// ([`write_capped`]). 1 MiB dwarfs any legitimate header, `PATH_MAX` name or PAX record;
+/// it bounds the memory one entry's structure takes (the reader holds an extension body
+/// whole).
 ///
-/// It is not what bounds their TOTAL. A per-entry allowance times the entry count is the
-/// same slack as one budget scaled by `max_entries`: counted per entry alone, a 12 KB
-/// `.tar.zst` of PAX `comment` records decompresses 297 MiB under the 1 MiB signed cap of
-/// the smallest row, and `MAX_ENTRIES = 4_000_000` such entries are ~4 TiB of
-/// decompression work. Every structural byte is therefore ALSO charged to an allowance of its own
-/// ([`Layer::charge_structure`]) the size of the signed cap, so the whole decompressed stream is at
-/// most twice the signed cap, and an entry costs at least one 512-byte header of it.
-///
-/// Its own allowance, not the content's: a tree of small files carries more structure
-/// than content (a 512-byte header and up to 511 bytes of padding per file, plus any PAX
-/// record), and `disk_installed` signed only the content, so one shared counter refused
-/// honest bundles — `/usr/share/terminfo` tarred with the packers' flags is 2.9 MB of
-/// content in a 6.4 MB stream against a 5.9 MB cap. The packers sign at least half
-/// the decompressed stream (`atpkg_publish::artifact::tarwrite`), so a bundle they sign
-/// passes either count by construction.
+/// The total is bounded separately, since a per-entry budget alone scales with
+/// `max_entries`: every structural byte is also charged to an allowance the size of the
+/// signed cap ([`Layer::charge_structure`]), so the whole stream is at most twice the
+/// signed cap. That allowance is not the content's: a tree of small files carries more
+/// structure than content, and `disk_installed` signs only content. The packers sign at
+/// least half the decompressed stream (`atpkg_publish::artifact::tarwrite`), so their
+/// bundles fit either.
 const TAR_ENTRY_STRUCTURAL_BUDGET: u64 = 1 << 20;
 
 /// Marker error the [`CappedReader`] raises when the structural budget is exhausted, so
-/// extraction maps it to `TooLargeReason::StructuralBudget` (not a generic I/O error) no
-/// matter WHERE the over-read happens — a directory skip, or a GNU/PAX extension-header
-/// body read INSIDE the entries iterator, before per-file write-capping can see it.
+/// extraction maps it to `TooLargeReason::StructuralBudget` wherever the over-read happens.
 #[derive(Debug)]
 struct SizeCapExceeded;
 
@@ -608,13 +555,9 @@ impl std::fmt::Display for SizeCapExceeded {
 impl std::error::Error for SizeCapExceeded {}
 
 /// Wraps the decompressor and bounds every byte the tar reader pulls against a shared,
-/// per-entry-reset budget. This catches the GNU longname/longlink/PAX extension-header
-/// bodies the reader pulls INSIDE its `entries()` iterator, before per-file
-/// write-capping can ever see them — without it a single extension header declaring a
-/// huge size (up to 2^64) with a highly-compressible body is a decompression bomb that
-/// [`write_capped`]'s per-file cap never bounds. File-content reads are refunded by
-/// `write_capped` (they are separately bounded by the signed content cap), so the
-/// budget constrains only structural bytes and a legitimate multi-GiB file still streams.
+/// per-entry-reset budget, catching extension-header bodies the reader pulls inside its
+/// entry iterator before [`write_capped`] sees anything. `write_capped` refunds content
+/// bytes, so the budget constrains only structure and a multi-GiB file still streams.
 struct CappedReader<R> {
     inner: R,
     budget: Rc<Cell<u64>>,
@@ -667,108 +610,56 @@ fn map_tar_io_at(e: io::Error, op: &'static str, path: &Path) -> ExtractError {
 /// a symlink (one per path — links share nothing).
 #[derive(Debug, Clone)]
 enum Node {
-    /// `(the folded permission bits — `platform::folded_mode`, masked to 0o7777;
-    /// lowercase-hex content sha256)`.
+    /// The folded permission bits (`platform::folded_mode`, masked to `0o7777`) and the
+    /// lowercase-hex content sha256.
     File(u32, String),
     /// Lowercase-hex sha256 of the raw target bytes ([`crate::tree::symlink_target_sha`]).
     Link(String),
 }
 
-/// The extraction-time twin of [`crate::tree::tree_root`]: the same digest, folded from
-/// the bytes the extractor already has in a register, instead of re-opening and
-/// re-reading the whole payload off disk afterwards.
+/// The extraction-time twin of [`crate::tree::tree_root`]: the same digest, folded from the
+/// bytes as the extractor writes them, which saves the stage a full read pass over the
+/// uncompressed payload.
 ///
-/// # Why this exists
+/// The line format and the fold are shared with the on-disk walk
+/// ([`crate::tree::entry_line`], [`crate::tree::symlink_line`],
+/// [`crate::tree::root_of_entry_lines`]); this type supplies the inputs per entry, modelling
+/// the filesystem the walk would see rather than the archive stream:
 ///
-/// `verify_and_stage` used to make TWO full passes over the *uncompressed* payload: one
-/// to write it, then one to hash it. For the dominant shipped member (`trust-5520`,
-/// signed `disk_installed` = 3,439,406,710 B over 508 tar entries, several of them
-/// 175–600 MB) the second pass is 3.44 GB of read I/O issued immediately after 3.44 GB
-/// of dirty writeback — a genuine disk read on any machine with less free RAM than the
-/// bundle, which is every machine for this bundle. The SHA-256 CPU is not saved (it is
-/// the same bytes hashed once either way, ~0.26 s per 630 MB with hardware SHA); what
-/// is deleted is one whole pass of I/O plus ~480 file opens.
+/// * **relpath**: the vetted, stripped destination under `dest_root`, spelled by
+///   [`crate::tree::rel_line_bytes`] as the walk spells it.
+/// * **mode**: [`crate::platform::folded_mode`], read back after `set_mode` on Unix (so a
+///   filesystem that stores other bits moves both digests together); on Windows, which
+///   stores no POSIX bits, the requested mode (also kept in [`Self::declared_modes`] for
+///   the walk).
+/// * **content digest**: hashed chunk by chunk as [`write_capped`] writes it.
+/// * **symlink target**: the verbatim bytes handed to `symlink(2)`.
 ///
-/// # Why it is the SAME digest, not a similar one
+/// Two entries sharing one inode share one node: a hardlink aliases its target's node, and
+/// a duplicate path (re-opened with `O_TRUNC`) reuses the node it already names. A symlink
+/// is never re-opened, because [`Layer`] refuses any entry landing on or passing through
+/// one ([`ExtractReject::Occupied`] / [`ExtractReject::ThroughSymlink`]).
 ///
-/// The line format and the fold are not reimplemented here — [`crate::tree::entry_line`],
-/// [`crate::tree::symlink_line`] and [`crate::tree::root_of_entry_lines`] are the single
-/// source of all three, shared with the on-disk walk. What this type has to get right
-/// is only the INPUTS per entry, and it models the filesystem the walk would have
-/// observed rather than the archive stream:
-///
-/// * **relpath** — `dest.strip_prefix(dest_root)`, i.e. exactly what
-///   [`crate::tree::tree_root`]'s walk computes for the same file, built by the same
-///   `Path::join` of the same vetted (and stripped) components, and spelled into line
-///   bytes by the same [`crate::tree::rel_line_bytes`] (`/`-separated on every
-///   platform, see `crate::tree`'s module docs).
-/// * **mode** — [`crate::platform::folded_mode`]: on Unix read BACK from the file after
-///   `set_mode`, through the same `platform::permission_mode` the walk uses, so a
-///   filesystem that stores something other than what we asked for moves both digests
-///   together; on Windows, which stores no POSIX bits and reads back `0`, the mode the
-///   extractor was asked to apply — the only value that reproduces a root a producer
-///   with real bits signed. The declared modes are also kept ([`Self::declared_modes`])
-///   so the on-disk walk can fold the same slot there.
-/// * **content digest** — hashed chunk by chunk as [`write_capped`] writes it.
-/// * **symlink target** — the verbatim bytes handed to `symlink(2)`, which are the
-///   bytes `read_link` hands the walk back.
-///
-/// # The inode model, and why a path table alone is not enough
-///
-/// The walk sees the FINAL state of the tree, so anything that makes two archive entries
-/// share one inode must make them share one digest here:
-///
-/// * a **hardlink** entry aliases its target's node (this is also strictly cheaper than
-///   the walk, which re-hashes the alias through the shared inode);
-/// * a **duplicate path** re-opens the SAME inode with `O_TRUNC`, so every alias of it
-///   changes too — modelled by reusing the node the path already names instead of
-///   pushing a new one.
-///
-/// Both are pathological in a bundle produced by the publisher's directory walk; they
-/// are modelled anyway because "the digest the re-verify compares against" is not a
-/// place to be approximately right. A path that is a SYMLINK is never re-opened: the
-/// [`Layer`] refuses any entry landing on, or passing through, a link it laid
-/// ([`ExtractReject::Occupied`] / [`ExtractReject::ThroughSymlink`]), which is what
-/// keeps this model exact without modelling link resolution.
-///
-/// # Names are the archive's bytes, so the disk must spell them the same
-///
-/// A line's relpath is the member's own bytes; the walk's is the names the directory
-/// listing hands back. They agree only while every name the extraction lays is one the
-/// filesystem stores apart from every other — and "the same name" is the filesystem's
-/// question, not the bytes': `bin/tool` and `BIN/TOOL`, or `Dir/f` and `dir/g`, are one
-/// path on case-insensitive APFS (the macOS default) and NTFS, and so are the NFC and
-/// NFD spellings of `café` on APFS. So a folding extraction lays every name — a file
-/// ([`TreeAccumulator::wrote_file`]), a link, and each directory on the way to either
-/// ([`make_dir_exact`], which keeps the directories it made in `dirs`) — exclusively,
-/// unless it laid that exact name before, and refuses one the filesystem already holds
-/// ([`ExtractReject::Occupied`]). The rule is the bytes, not a case or Unicode fold of
-/// them, so it is the same answer on every filesystem.
-///
-/// That refuses two names the filesystem takes for one. It cannot see ONE name the
-/// filesystem stores under other bytes, which collides with nothing: HFS+ decomposes an
-/// NFC `café` to NFD, Win32 drops a trailing `.` or space and lays no file at all for a
-/// device name such as `nul`. Staged onto HFS+, an NFC `café/f` extracted cleanly and
-/// recorded a root the walk never reproduces. So the stage reads the names back once
-/// before it hands out the root ([`Self::require_spelled_back`]: directory listings only,
-/// no content) and refuses a tree the disk does not spell as the fold does
-/// ([`ExtractReject::Respelled`]). A filesystem that keeps every name it is given (APFS,
-/// ext4) never meets that refusal, and NTFS meets it only for a name the Win32 layer
-/// rewrites. On any filesystem, wherever a stage succeeds, the fold is the archive's and
-/// the disk spells it back.
+/// A line's relpath is the member's bytes, the walk's is what the directory listing
+/// returns, so they agree only while the filesystem stores every name apart and as given.
+/// Two names the filesystem takes for one (`bin/tool` and `BIN/TOOL` on case-insensitive
+/// APFS or NTFS, NFC and NFD `café` on APFS) are caught by laying every name exclusively
+/// unless this extraction laid those exact bytes before ([`TreeAccumulator::wrote_file`],
+/// [`make_dir_exact`]), refusing [`ExtractReject::Occupied`]. The rule compares bytes, not
+/// a case or Unicode fold, so it answers the same on every filesystem. One name stored
+/// under other bytes (HFS+ decomposing NFC, Win32 dropping a trailing `.` or laying
+/// nothing for `nul`) is caught by reading the names back once
+/// ([`Self::require_spelled_back`]), refusing [`ExtractReject::Respelled`].
 #[derive(Debug)]
 pub(crate) struct TreeAccumulator {
-    /// relpath bytes → index into `nodes`: WHICH node that path currently names.
-    /// A `BTreeMap` because the fold wants the lines sorted anyway and because it makes
-    /// the duplicate-path lookup exact rather than best-effort.
+    /// relpath bytes → index into `nodes`: which node that path currently names. Sorted,
+    /// as the fold wants the lines.
     paths: std::collections::BTreeMap<Vec<u8>, usize>,
     /// One entry per distinct node laid down.
     nodes: Vec<Node>,
-    /// The directories this extraction made, as a tree of exact names: `dirs[i]` maps the
-    /// name bytes of each child directory of directory `i` to the child's own index, and
-    /// `dirs[0]` is the root. A tree of components, not a set of whole relpaths, so a deep
-    /// member costs its name bytes once, never once per ancestor: the memory is linear in
-    /// the member names read, which the structure allowance already bounds.
+    /// The directories this extraction made, as a tree of exact names: `dirs[i]` maps each
+    /// child directory's name bytes to its index, and `dirs[0]` is the root. Memory is
+    /// linear in the member names read, which the structure allowance bounds.
     dirs: Vec<std::collections::BTreeMap<Vec<u8>, usize>>,
 }
 
@@ -800,14 +691,11 @@ impl TreeAccumulator {
         child
     }
 
-    /// Record a regular file written at `rel`. A path written twice re-uses its node —
-    /// the second `open(O_TRUNC)` lands on the same inode, so every alias of it observes
-    /// the new content and the new mode, which is exactly what the on-disk walk would
-    /// report.
+    /// Record a regular file written at `rel`. A path written twice reuses its node: the
+    /// second `open(O_TRUNC)` lands on the same inode, so every alias sees the new content
+    /// and mode, as the on-disk walk would.
     pub(crate) fn record_file(&mut self, rel: Vec<u8>, mode: u32, content_sha_hex: String) {
-        // `copied()` first so the `paths` borrow is over before `nodes` is taken
-        // mutably — the two are disjoint fields, but not relying on that keeps the
-        // borrow shape obvious to a reader as well as to the compiler.
+        // `copied()` first so the `paths` borrow ends before `nodes` is borrowed mutably.
         let existing = self.paths.get(&rel).copied();
         if let Some(node) = existing
             && let Some(slot) = self.nodes.get_mut(node)
@@ -833,13 +721,9 @@ impl TreeAccumulator {
             .is_some_and(|&node| matches!(self.nodes.get(node), Some(Node::File(..))))
     }
 
-    /// Record a hardlink at `rel` aliasing the already-extracted `target_rel`.
-    ///
-    /// Fails CLOSED when the target is not one of the regular files this extraction
-    /// wrote under exactly these bytes. [`Layer::hardlink`] asks [`Self::wrote_file`]
-    /// before it links, so this never fires there; it stays a refusal rather than a
-    /// guess, because guessing a digest for a file we did not write is precisely what
-    /// this digest is supposed to refuse.
+    /// Record a hardlink at `rel` aliasing the already-extracted `target_rel`. False (fail
+    /// closed) when the target is not a regular file this extraction wrote under exactly
+    /// these bytes; [`Layer::hardlink`] checks [`Self::wrote_file`] first.
     fn record_alias(&mut self, rel: Vec<u8>, target_rel: &[u8]) -> bool {
         let Some(&node) = self.paths.get(target_rel) else {
             return false;
@@ -861,11 +745,10 @@ impl TreeAccumulator {
         self.paths.insert(rel, node);
     }
 
-    /// The mode each recorded REGULAR FILE folds — keyed by its line bytes, the map the
-    /// on-disk walk needs on a filesystem that stores no permission bits
-    /// ([`crate::tree::tree_root_declared`]). An alias reports its target's node, so two
-    /// names of one inode carry one mode, exactly as the walk would read them. Links
-    /// have no mode slot and are not listed.
+    /// The mode each recorded regular file folds, keyed by line bytes: the map the on-disk
+    /// walk needs where the filesystem stores no permission bits
+    /// ([`crate::tree::tree_root_declared`]). An alias reports its target's mode; links are
+    /// not listed.
     pub(crate) fn declared_modes(&self) -> crate::tree::DeclaredModes {
         let mut modes = crate::tree::DeclaredModes::new();
         for (rel, node) in &self.paths {
@@ -878,9 +761,8 @@ impl TreeAccumulator {
 
     /// Refuse a staged tree the disk does not spell as this fold does: the recorded paths
     /// must be exactly the names a listing of `dest` returns ([`crate::tree::line_names`]),
-    /// or the root folded here is one the walk of `dest` — the one `aterm pkg verify`
-    /// takes — never reproduces (see the type's docs). A stage asks this once, after its
-    /// last name is laid and before it hands out the root.
+    /// or the walk `aterm pkg verify` takes never reproduces this root. Asked once, after
+    /// the last name is laid and before the root is handed out.
     ///
     /// # Errors
     /// [`ExtractReject::Respelled`] naming the first recorded path the listing lacks (else
@@ -901,14 +783,13 @@ impl TreeAccumulator {
         Err(ExtractError::Rejected(ExtractReject::Respelled, blamed))
     }
 
-    /// Fold every recorded path into the tree root, through the SAME formatters and the
-    /// SAME sort+SHA-256 the on-disk walk uses.
+    /// Fold every recorded path into the tree root, through the on-disk walk's formatters
+    /// and sort+SHA-256.
     pub(crate) fn root(self) -> String {
         let mut lines: Vec<Vec<u8>> = Vec::with_capacity(self.paths.len());
         for (rel, node) in &self.paths {
-            // A node index always came from `self.nodes`, so the `get` never misses;
-            // skipping a miss (rather than indexing) keeps the fold panic-free, and a
-            // skipped line could only ever produce a MISMATCHING root, i.e. fail closed.
+            // Every index came from `self.nodes`; a miss is skipped rather than indexed,
+            // which could only produce a mismatching root (fail closed).
             match self.nodes.get(*node) {
                 Some(Node::File(mode, sha)) => {
                     lines.push(crate::tree::entry_line(rel, *mode, sha));
@@ -923,14 +804,9 @@ impl TreeAccumulator {
     }
 }
 
-/// The line bytes of `path` relative to `root` — the relpath half of a `tree_root`
-/// entry line, computed exactly as [`crate::tree::tree_root`]'s walk computes it, through
-/// the one spelling function ([`crate::tree::rel_line_bytes`]: raw OS bytes,
-/// `/`-separated on every platform).
-///
-/// Both ends are already inside `root` by construction ([`vet_entry`] re-checked the
-/// join), so the `strip_prefix` cannot fail; it is mapped to the same fail-closed
-/// `RootEscape` rejection anyway rather than unwrapped.
+/// The line bytes of `path` relative to `root`, the relpath half of a `tree_root` entry
+/// line, through the walk's own spelling function ([`crate::tree::rel_line_bytes`]).
+/// `path` is inside `root` by construction; a miss is still the fail-closed `RootEscape`.
 pub(crate) fn rel_bytes_under(root: &Path, path: &Path) -> Result<Vec<u8>, ExtractError> {
     let rel = path
         .strip_prefix(root)
@@ -938,28 +814,21 @@ pub(crate) fn rel_bytes_under(root: &Path, path: &Path) -> Result<Vec<u8>, Extra
     Ok(crate::tree::rel_line_bytes(rel))
 }
 
-/// Make directory `dir` and every missing ancestor of it below `root`, ONE component at a
-/// time, for an extraction folding into `tree`; `raw` is the member blamed on refusal.
+/// Make directory `dir` and every missing ancestor below `root`, one component at a time,
+/// for an extraction folding into `tree`; `raw` is the member blamed on refusal.
 ///
 /// A component `tree` already holds under exactly these bytes is this extraction's own
-/// directory and costs nothing. Any other is created with a plain `mkdir`, which is
-/// exclusive: it fails `EEXIST` when the name already resolves, and in a root that started
-/// empty everything there was laid by this extraction under OTHER bytes — `dir` after
-/// `Dir` on case-insensitive APFS or NTFS, the NFD spelling of a name after its NFC one on
-/// APFS, or a file or link of that name. The member would then land under the earlier
-/// spelling on disk while the fold recorded its own, a line the walk never finds, so it is
-/// refused as [`ExtractReject::Occupied`] (see [`TreeAccumulator`]). `create_dir_all` asks
-/// "is there a directory here?", which a folding filesystem answers yes to for the wrong
-/// name; this asks "did WE make this name?", which only the bytes answer.
+/// directory. Any other is made with a plain, exclusive `mkdir`: in a root that started
+/// empty, `EEXIST` means this extraction laid that name under other bytes (`dir` after
+/// `Dir` on case-insensitive APFS or NTFS, NFD after NFC on APFS, or a file or link), so
+/// the member would land under the earlier spelling while the fold recorded its own. That
+/// is refused as [`ExtractReject::Occupied`]. `create_dir_all` would answer "a directory
+/// is here" for the wrong name.
 ///
-/// The file and link creates make the same decision for the last component
-/// ([`Layer::regular`], [`Layer::symlink`], [`Layer::hardlink`]); this is the one maker of
-/// directories for every folding lane and for the links a stage adds afterwards.
-///
-/// Each directory it makes is given the directory mode of [`safe_mode`], `0755`, as a
-/// directory MEMBER is: `mkdir` alone leaves `0777 & ~umask`, so before 2026-10-10 a
-/// directory no member named (every parent of a file in an archive that lists no
-/// directories) was group-writable under umask `002` and world-writable under `000`.
+/// The file and link creates make the same decision for the last component; this is the
+/// one maker of directories for every folding lane and for the links a stage adds
+/// afterwards. Each directory gets [`safe_mode`]'s `0755`, as a directory member does,
+/// rather than `0777 & ~umask`.
 pub(crate) fn make_dir_exact(
     root: &Path,
     dir: &Path,
@@ -999,20 +868,14 @@ pub(crate) fn make_dir_exact(
     Ok(())
 }
 
-/// THE precondition the folded digest stands on, ENFORCED rather than assumed.
+/// The precondition the folded digest stands on, enforced: the fold describes what this
+/// extraction wrote, and the on-disk walk describes everything under `dest_root`; they are
+/// the same set only while `dest_root` starts empty. A stranger's file would make the walk
+/// fail closed but the fold pass, so it is refused here. The staging contract provides an
+/// empty root (`verify_and_stage` re-creates `incoming` under the store lock), and
+/// `TreeAccumulator::record_alias` relies on it too.
 ///
-/// The accumulator describes the entries this extraction WROTE; the on-disk walk it
-/// replaces described every entry under `dest_root`. Those are the same set only while
-/// `dest_root` starts empty — which is what the staging contract provides
-/// (`verify_and_stage` sweeps the scratch siblings and re-creates `incoming` under the
-/// store lock) and what `TreeAccumulator::record_alias` already relies on to refuse a
-/// hardlink onto a file it did not write. If a stranger's file were ever present, the
-/// walk would have hashed it into a MISMATCHING root (fail closed) while the fold would
-/// silently ignore it (fail OPEN), which is the one direction a re-verify may never
-/// move. One `read_dir` per stage buys that back.
-///
-/// A `dest_root` that does not exist yet is fine — extraction creates it — and is the
-/// shape several in-crate probes use.
+/// A `dest_root` that does not exist yet is fine; extraction creates it.
 pub(crate) fn require_empty_destination(dest_root: &Path) -> Result<(), ExtractError> {
     if let Ok(mut existing) = std::fs::read_dir(dest_root)
         && let Some(entry) = existing.next()
@@ -1027,20 +890,16 @@ pub(crate) fn require_empty_destination(dest_root: &Path) -> Result<(), ExtractE
     Ok(())
 }
 
-/// One extraction in progress: the vetted, capped, digest-folding WRITER every archive
+/// One extraction in progress: the vetted, capped, digest-folding writer every archive
 /// lane lays its entries through. The container readers (tar in [`extract_stream`], zip
-/// in `zipread`) only parse and hand over `(raw path, kind, mode, body)`; everything
-/// that touches the disk goes through these methods, so the slip rules, the caps, the
-/// mode sanitizing, the symlink discipline and the fold are one code path for every
-/// container and every compressor.
+/// in `zipread`) only parse and hand over `(raw path, kind, mode, body)`.
 struct Layer<'a> {
     root: &'a Path,
     opts: ExtractOptions,
     /// The signed content cap, decremented as bytes are written (or drained).
     remaining: u64,
-    /// A tar's STRUCTURE allowance — the signed cap again, decremented as headers,
-    /// padding and extension bodies are decompressed ([`Self::charge_structure`]).
-    /// Untouched by the zip lane, whose reader has no structural stream.
+    /// A tar's structure allowance: the signed cap again, decremented as headers, padding
+    /// and extension bodies are decompressed ([`Self::charge_structure`]). Unused by zip.
     structure_remaining: u64,
     max_entries: u64,
     count: u64,
@@ -1048,25 +907,19 @@ struct Layer<'a> {
     /// [`write_capped`] can refund content bytes into it. The zip lane has no
     /// structural reader; it hands over a budget nothing decrements.
     budget: Rc<Cell<u64>>,
-    /// ONE copy buffer for the whole archive. A `[0u8; 64 * 1024]` local inside
-    /// `write_capped` would be zero-initialized per ENTRY and LLVM cannot elide it (the
-    /// buffer goes to an opaque `Read::read`), so every unpacked file paid a 16-page
-    /// stack probe plus a 64 KiB `bzero` on top of the decode and the write —
-    /// gigabyte-scale memset across a real toolchain bundle. Heap `vec!`, not a boxed
-    /// array literal: `Box::new([0u8; N])` materializes the array on the stack first.
+    /// One copy buffer for the whole archive: a 64 KiB local in `write_capped` would be
+    /// zeroed per entry (LLVM cannot elide it behind `Read::read`). Heap `vec!`, not
+    /// `Box::new([0u8; N])`, which builds the array on the stack first.
     copy_buf: Vec<u8>,
     /// The tree_root of what we are writing, folded as we write it (see
     /// [`TreeAccumulator`]) — so `verify_and_stage` need not walk the payload a second
     /// time. `None` for a write-only pass.
     tree: Option<TreeAccumulator>,
-    /// Whether any symlink has been laid down yet. Until one has, no entry can pass
-    /// through or land on a link, so the per-entry `lstat` walks are skipped entirely —
-    /// a sysroot bundle with tens of thousands of files pays nothing for a discipline
-    /// it never triggers.
+    /// Whether any symlink has been laid yet. Until one has, no entry can pass through or
+    /// land on a link, so the per-entry `lstat` walks are skipped.
     laid_symlink: bool,
-    /// The parent directory the last laid entry needed, already known to be a directory
-    /// — so a RUN of entries in one directory asks for it once instead of once per
-    /// entry. See [`Layer::ensure_parent`].
+    /// The parent directory the last laid entry needed, known to be a directory
+    /// ([`Layer::ensure_parent`]).
     last_parent: Option<PathBuf>,
 }
 
@@ -1081,8 +934,8 @@ impl<'a> Layer<'a> {
     ) -> Result<Self, ExtractError> {
         if fold {
             require_empty_destination(root)?;
-            // The fold's directory tree starts AT the root ([`TreeAccumulator::new`]), so
-            // the root is made here — the one directory whose own name is in no line.
+            // The fold's directory tree starts at the root ([`TreeAccumulator::new`]), so
+            // the root is made here: the one directory whose own name is in no line.
             std::fs::create_dir_all(root).map_err(|e| io_at(e, "create_dir_all", root))?;
         }
         Ok(Self {
@@ -1109,12 +962,9 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Charge `n` decompressed STRUCTURAL bytes — a tar header, the padding before it, a
-    /// GNU/PAX extension header and its body — against the structure allowance (the signed
-    /// cap, counted apart from content). The per-entry [`TAR_ENTRY_STRUCTURAL_BUDGET`]
-    /// bounds what ONE entry's structure may hold in memory; this bounds what all of them
-    /// may cost together, so no count of content-free entries decompresses more than the
-    /// signed size admits.
+    /// Charge `n` decompressed structural bytes (a tar header, padding, a GNU/PAX extension
+    /// header and body) against the structure allowance. [`TAR_ENTRY_STRUCTURAL_BUDGET`]
+    /// bounds one entry; this bounds all of them together by the signed size.
     fn charge_structure(&mut self, n: u64) -> Result<(), ExtractError> {
         if n > self.structure_remaining {
             return Err(ExtractError::TooLarge(TooLargeReason::StructureCap));
@@ -1166,25 +1016,14 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Make sure `dest`'s parent directory exists, remembering the last one so a RUN of
-    /// entries in the same directory pays for it once.
+    /// Make sure `dest`'s parent directory exists, remembering the last one so a run of
+    /// entries in one directory asks once (a `create_dir_all` on an existing parent is a
+    /// failing `mkdir` plus a `stat`, per file). An archive may omit directory members, so
+    /// the make itself stays.
     ///
-    /// The make stays ([`Self::ensure_dir`]) — an archive may omit directory members
-    /// entirely, and a file whose parent has no member of its own still has to land.
-    /// What goes is repeating it per FILE: on a parent that already exists
-    /// `create_dir_all` is not free, it is a `mkdir` that fails `EEXIST` plus an `is_dir`
-    /// `stat`, each re-resolving a path as deep as
-    /// `<prefix>/store/trust/<build>.incoming-<pid>/lib/rustlib/...`. The shipped
-    /// `trust` sysroot lays 4114 regular files across 918 directories, so 4114 of those
-    /// pairs where 918 say the same thing. Tar (and zip) members arrive grouped by
-    /// directory because a directory walk wrote them, so remembering ONE path collapses
-    /// the run; an archive that interleaves directories simply pays what it paid before.
-    ///
-    /// Skipping is sound because nothing can turn a directory this extraction already
-    /// made into something else: [`Layer::symlink`] refuses any path anything occupies
-    /// ([`ExtractReject::Occupied`]), and no method here removes a directory. The memo
-    /// compares paths byte for byte, so it only ever elides a call for the exact name
-    /// that call already answered, and would have been a no-op.
+    /// Skipping is sound because nothing can turn a directory this extraction made into
+    /// something else: [`Layer::symlink`] refuses any occupied path and nothing here
+    /// removes a directory.
     fn ensure_parent(&mut self, dest: &Path, raw: &Path) -> Result<(), ExtractError> {
         let Some(parent) = dest.parent() else {
             return Ok(());
@@ -1209,10 +1048,9 @@ impl<'a> Layer<'a> {
         }
     }
 
-    /// Lay down a directory entry. `declared_size` is the entry's EFFECTIVE body size
-    /// — a legitimate directory always declares 0, and a non-zero one is a
-    /// decompression-bomb vector the byte cap never sees (the reader skips the body
-    /// without writing it), so it is refused on the header alone.
+    /// Lay down a directory entry. A non-zero `declared_size` (the effective body size) is
+    /// a bomb the content cap never sees, since the reader skips the body, so it is
+    /// refused on the header.
     fn directory(&mut self, raw: &Path, declared_size: u64, mode: u32) -> Result<(), ExtractError> {
         if declared_size != 0 {
             return Err(ExtractError::TooLarge(TooLargeReason::DirectoryWithBody(
@@ -1221,17 +1059,11 @@ impl<'a> Layer<'a> {
         }
         let vetted = match vet_entry_stripped(self.root, raw, EntryKind::Directory, self.strip()) {
             Ok(v) => v,
-            // A DIRECTORY member that names the stage root ITSELF — `.`, `./`, `././` —
-            // asks for nothing: the root is already there (`Layer::open` made it), no
-            // `tree_root` line describes it, and no byte lands. So it is the same no-op
-            // as a member the strip consumes, not a refusal. Every archive written as
-            // `tar -C dir -c .` OPENS with exactly this member (bsdtar and GNU tar both
-            // emit it), and the vendor `tar-gz`/`tar-zst` lanes do not get to choose how
-            // an upstream builds its tarball — refusing it aborted the install of an
-            // otherwise honest archive at its first entry. The member's mode is
-            // deliberately NOT applied: the root's bits are the store's, never an
-            // archive's. `EmptyPath` stays a hard refusal everywhere it names no target
-            // at all — regular files, symlinks, and both ends of a hardlink.
+            // A directory member naming the stage root itself (`.`, `./`) is a no-op, like
+            // a member the strip consumes: `Layer::open` made the root and no line
+            // describes it. `tar -C dir -c .` archives open with one. Its mode is not
+            // applied (the root's bits are the store's). `EmptyPath` stays a refusal for
+            // files, symlinks and both ends of a hardlink.
             Err(ExtractReject::EmptyPath) => return Ok(()),
             Err(r) => return Err(ExtractError::Rejected(r, raw.to_path_buf())),
         };
@@ -1257,23 +1089,19 @@ impl<'a> Layer<'a> {
             .map_err(|r| ExtractError::Rejected(r, raw.to_path_buf()))?
         else {
             // Stripped away: the body still has to be consumed for the stream to
-            // advance, through the SAME caps as a body that is written.
+            // advance, through the same caps as a body that is written.
             return drain_capped(body, &mut self.remaining, &self.budget, &mut self.copy_buf);
         };
         self.guard_ancestors(&dest, raw)?;
         self.refuse_if_link(&dest, raw)?;
         self.ensure_parent(&dest, raw)?;
-        // THE CREATE. A folding lane starts from an empty root, and `ensure_parent` has
-        // just proved every directory on the way is one it made under exactly these
-        // bytes, so a name that already resolves here is one of two things. This exact
-        // path, written earlier: a duplicate member, re-opened and truncated as tar does,
-        // which the fold models by reusing its node. Or a name the filesystem FOLDS onto
-        // another member's file — `bin/tool` and `bin/TOOL` on case-insensitive APFS or
-        // NTFS, the NFC and NFD spellings of one name on APFS: its bytes would replace
-        // that member's while the fold kept both, so the root would describe a file that
-        // is not on disk. That is refused, as a link landing on an occupied name is.
-        // `O_EXCL` asks the filesystem's own name equality, at no cost to the create it
-        // replaces.
+        // A folding lane starts from an empty root and `ensure_parent` made every
+        // directory on the way under exactly these bytes, so a name that already resolves
+        // is either this exact path written earlier (a duplicate member, truncated as tar
+        // does; the fold reuses its node) or a name the filesystem folds onto another
+        // member's file (`bin/tool` and `bin/TOOL` on case-insensitive APFS or NTFS, NFC
+        // and NFD on APFS). The second is refused: `O_EXCL` asks the filesystem's own name
+        // equality.
         let rel = match self.tree {
             Some(_) => Some(rel_bytes_under(self.root, &dest)?),
             None => None,
@@ -1315,14 +1143,10 @@ impl<'a> Layer<'a> {
     }
 
     /// Lay down a hardlink: both ends vetted (and stripped), the target already an
-    /// extracted REGULAR FILE, the alias recorded against the target's node.
-    /// `declared_size` is the entry's EFFECTIVE body size. A hardlink is a pure alias
-    /// — bsdtar and GNU tar both write 0 — and a non-zero one is the same skip-bomb as
-    /// a directory's or a symlink's, only worse: nothing here reads that body, so the
-    /// reader discards it on its next `next_entry` bounded by the per-entry STRUCTURAL
-    /// budget alone (reset to 1 MiB before every entry), and the signed
-    /// `max_total_bytes` cap never sees a byte of it — slack that scales with
-    /// `max_entries` all over again. Refused on the header, before any body is read.
+    /// extracted regular file, the alias recorded against the target's node. A hardlink
+    /// carries no body (bsdtar and GNU tar write 0); a non-zero `declared_size` would be
+    /// discarded by the reader against the per-entry structural budget alone, never the
+    /// content cap, so it is refused on the header.
     fn hardlink(
         &mut self,
         raw: &Path,
@@ -1341,20 +1165,13 @@ impl<'a> Layer<'a> {
         };
         self.guard_ancestors(&dest, raw)?;
         self.refuse_if_link(&dest, raw)?;
-        // …and the TARGET's ancestors, for the same reason and before anything touches
-        // it: `symlink_metadata` and `hard_link` decline to follow only the LAST
-        // component, so a target named through a directory link this archive laid
-        // earlier (`lnk/f`, `lnk -> real`) would be lstat'd as a regular file and
-        // PHYSICALLY LINKED to `real/f` first, with nothing but the fold's
-        // `record_alias` — which cannot find `lnk/f` among the paths it wrote — to
-        // refuse it afterwards (and nothing at all in the write-only lane, which folds
-        // no tree). The vet decides it, lexically, before the link exists.
+        // …and the target's ancestors: `symlink_metadata` and `hard_link` follow every
+        // component but the last, so a target named through an earlier directory link
+        // (`lnk/f`, `lnk -> real`) would otherwise be linked to `real/f`.
         self.guard_ancestors(&target_abs, raw)?;
-        // The target must already be an extracted REGULAR FILE: honest
-        // archivers emit the file before its links, and linking to a
-        // directory/nothing names no valid bundle. `symlink_metadata` so a
-        // symlink AT the target is not followed either — a link is not a regular file,
-        // so the `is_file` check below refuses it.
+        // The target must already be an extracted regular file (honest archivers emit the
+        // file before its links). `symlink_metadata`, so a symlink at the target fails
+        // `is_file` rather than being followed.
         let target_meta = std::fs::symlink_metadata(&target_abs).map_err(|_| {
             ExtractError::Rejected(ExtractReject::HardlinkTargetMissing, raw.to_path_buf())
         })?;
@@ -1364,11 +1181,9 @@ impl<'a> Layer<'a> {
                 raw.to_path_buf(),
             ));
         }
-        // A folding lane also asks the FOLD, before the link exists: the target must be a
-        // file this extraction wrote under exactly these bytes. The `lstat` above is
-        // answered by the filesystem's own name equality, so on case-insensitive APFS a
-        // target spelled `DIR/F` passes it for a written `dir/f` — a name no line carries,
-        // which only the bytes can refuse.
+        // A folding lane also asks the fold: the target must be a file this extraction
+        // wrote under exactly these bytes. The `lstat` above uses the filesystem's name
+        // equality, so on case-insensitive APFS `DIR/F` would pass for a written `dir/f`.
         let rels = match self.tree.as_ref() {
             Some(tree) => {
                 let target_rel = rel_bytes_under(self.root, &target_abs)?;
@@ -1383,11 +1198,9 @@ impl<'a> Layer<'a> {
             None => None,
         };
         self.ensure_parent(&dest, raw)?;
-        // A same-inode alias of already-counted bytes: no content stream, no
-        // size-cap charge (a body-carrying alias was refused on the header
-        // above); the entry COUNT cap still applies. `link(2)` never replaces, so a
-        // name already there — this one, or one the filesystem folds it onto — is
-        // occupied, as it is for a file or a symlink.
+        // A same-inode alias of already-counted bytes: no content-cap charge (the entry
+        // cap still applies). `link(2)` never replaces, so a name already there is
+        // occupied, as for a file or a symlink.
         std::fs::hard_link(&target_abs, &dest).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
                 ExtractError::Rejected(ExtractReject::Occupied, raw.to_path_buf())
@@ -1395,15 +1208,12 @@ impl<'a> Layer<'a> {
                 io_at(e, "hard_link", &dest)
             }
         })?;
-        // …and, for the digest, a same-NODE alias: it reuses the target's already
-        // computed (mode, content sha) instead of re-hashing the same inode through
-        // a second name, which is what the on-disk walk had to do.
+        // …and for the digest a same-node alias, reusing the target's (mode, content sha).
         if let (Some(tree), Some((dest_rel, target_rel))) = (self.tree.as_mut(), rels)
             && !tree.record_alias(dest_rel, &target_rel)
         {
-            // Unreachable: the fold answered for this very target above, and nothing
-            // in between removes a file. Fail closed rather than invent a digest for
-            // bytes we did not write.
+            // Unreachable: the fold answered for this target above. Fail closed rather
+            // than invent a digest.
             return Err(ExtractError::Rejected(
                 ExtractReject::HardlinkTargetMissing,
                 raw.to_path_buf(),
@@ -1470,10 +1280,9 @@ impl<'a> Layer<'a> {
     }
 }
 
-/// Create the symlink `link -> target` with the target bytes VERBATIM (what the digest
-/// records and what `read_link` hands back). Unix only: no platform atpkg stages a
-/// vendor archive on lacks it, and a platform without it fails closed here rather than
-/// laying down a tree the digest could not describe.
+/// Create the symlink `link -> target` with the target bytes verbatim (what the digest
+/// records and `read_link` hands back). Unix only; elsewhere it fails closed rather than
+/// lay a tree the digest could not describe.
 pub(crate) fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -1489,17 +1298,11 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     }
 }
 
-/// Extract a `.tar.zst` bundle at `archive` into `dest_root`, with **every entry vetted
-/// before a byte is written** ([`vet_entry`]). On the first rejected entry — or on
-/// exceeding `max_total_bytes` / `max_entries` — extraction aborts with an
-/// [`ExtractError`]; the caller then removes the partial `dest_root` (a half-extracted
-/// bundle must never activate, §7). Symlinks/exotic entries are refused, modes are
-/// sanitized (no setuid/setgid/sticky, no group/other-write; executables `0o755`, else
-/// `0o644`), and the uncompressed size is capped (the cap is derived from the *signed*
-/// manifest, never a header field).
-///
-/// `dest_root` should already exist as a hardened (`0700`, owned-by-uid) directory the
-/// caller owns; entries are written strictly beneath it.
+/// Extract a `.tar.zst` bundle at `archive` into `dest_root`, every entry vetted before a
+/// byte is written ([`vet_entry`]). The first rejected entry, or exceeding
+/// `max_total_bytes` / `max_entries`, aborts with an [`ExtractError`] and the caller
+/// removes the partial `dest_root` (§7). Symlinks and exotic entries are refused and modes
+/// are sanitized ([`safe_mode`]).
 ///
 /// The zstd decoder is first-party (`aterm_zstd::Decoder`). It verifies the content
 /// checksum of every frame that carries one, so the stream is read to its end, past the
@@ -1527,12 +1330,10 @@ pub fn extract_tar_zst(
     .map(|_| ())
 }
 
-/// [`extract_tar_zst`], folding the [`crate::tree::tree_root`] of the tree it writes —
-/// computed from the bytes as they were written (see the `TreeAccumulator` docs in this
-/// module), so the staging path does not have to re-read the whole payload back off disk
-/// to learn the same number. The digest is over WHAT THE EXTRACTOR WROTE; that is a real
-/// semantic difference from walking the finished tree, and it is `verify_and_stage`'s to
-/// argue (see the re-verify step there).
+/// [`extract_tar_zst`], folding the [`crate::tree::tree_root`] of what it writes as it
+/// writes it, so the stage need not re-read the payload. The digest is over what the
+/// extractor wrote, not a walk of the finished tree; `verify_and_stage` argues why that
+/// suffices.
 ///
 /// Takes [`ExtractOptions`] and hands back the OPEN fold so the
 /// stage can record the `links` it creates afterwards before closing the root. The
@@ -1628,9 +1429,7 @@ pub(crate) fn extract_zip_tree(
     zipread::extract(archive, dest_root, max_total_bytes, max_entries, opts)
 }
 
-/// The fold a `fold = true` extraction always produces. Fail CLOSED on its absence
-/// rather than substitute a default — an empty root would be compared against the
-/// signed `tree_root` and refused anyway, but saying so is better than relying on that.
+/// The fold a `fold = true` extraction always produces; its absence fails closed.
 fn folded(tree: Option<TreeAccumulator>) -> Result<TreeAccumulator, ExtractError> {
     tree.ok_or_else(|| io::Error::other("extraction produced no tree_root").into())
 }
@@ -1664,16 +1463,12 @@ fn extract_stream(
     opts: ExtractOptions,
     trailer: Trailer,
 ) -> Result<Option<TreeAccumulator>, ExtractError> {
-    // Bound the decompressed bytes the tar reader pulls for each entry's STRUCTURAL
-    // parts (header, padding, GNU/PAX extension-header body — the last read inside
-    // `entries()`'s `next()`, BEFORE write_capped can see it), so an extension-header
-    // bomb cannot decompress unbounded memory. `budget` is shared with the reader; we
-    // reset it per entry (structural reads never accumulate) and `write_capped` refunds
-    // file-content bytes (separately bounded by the signed `max_total_bytes` cap), so a
-    // legitimate large file still streams while a single entry's structural reads stay
-    // under TAR_ENTRY_STRUCTURAL_BUDGET. What each entry's structure DID cost is then
-    // charged to the structure allowance (`Layer::charge_structure`): the per-entry
-    // budget bounds one entry, the signed cap bounds the stream's structure as a whole.
+    // `budget` bounds the decompressed bytes the reader pulls for one entry's structure
+    // (header, padding, GNU/PAX extension body, read before `write_capped` sees anything),
+    // so an extension-header bomb cannot exhaust memory. It is reset per entry and
+    // `write_capped` refunds content bytes, so a large file still streams. What each
+    // entry's structure cost is charged to the signed structure allowance
+    // (`Layer::charge_structure`).
     let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
     let mut layer = Layer::open(
         dest_root,
@@ -1687,21 +1482,19 @@ fn extract_stream(
         inner: decoded,
         budget: Rc::clone(&budget),
     });
-    // We drive extraction ourselves — the reader is a PARSER with no `unpack` at all
-    // (crate::tarread) — so every entry is vetted before a byte reaches the disk.
+    // `tarread` only parses (it has no `unpack`), so every entry is vetted before a byte
+    // reaches the disk.
     let mut entries = tar.entries().map_err(map_tar_io)?;
     loop {
-        // Fresh per-entry structural allowance (does NOT roll over, so one entry's
-        // structure is capped at TAR_ENTRY_STRUCTURAL_BUDGET wherever it sits); their SUM
-        // is bounded by the structure allowance, charged just below.
+        // A fresh per-entry budget (no roll-over); the sum is charged to the structure
+        // allowance just below.
         budget.set(TAR_ENTRY_STRUCTURAL_BUDGET);
-        // `next_entry()` is where the reader resolves GNU longname/longlink/PAX
-        // extension headers by reading their body through this same CappedReader — a
-        // budget trip here maps to TooLarge.
+        // `next_entry()` reads GNU longname/longlink/PAX bodies through the CappedReader;
+        // a budget trip here maps to TooLarge.
         let next = entries.next_entry().map_err(map_tar_io)?;
-        // Everything the reader pulled since the reset is structure — the previous
-        // entry's padding, extension headers and bodies, this header — because content is
-        // read only below, through `write_capped`/`drain_capped`, which refund it.
+        // Everything pulled since the reset is structure (the previous entry's padding,
+        // extension headers, this header): content is read only through
+        // `write_capped`/`drain_capped`, which refund it.
         layer.charge_structure(TAR_ENTRY_STRUCTURAL_BUDGET.saturating_sub(budget.get()))?;
         let Some(mut entry) = next else {
             break;
@@ -1710,10 +1503,8 @@ fn extract_stream(
         let raw = entry.path()?.into_owned();
         let kind = classify(entry.header().entry_type());
         let mode = entry.header().mode().unwrap_or(0o644);
-        // The EFFECTIVE size — the reader's, after any PAX `size` record overrode the
-        // header field. Reading `header()` here would let an `x` record declare 0
-        // while the ustar field declares gigabytes (or the reverse), which is the
-        // exact reader-disagreement the hardlink/directory/symlink size guards close.
+        // The effective size, after any PAX `size` record overrode the header field: the
+        // raw ustar field could disagree with it, which is what the size guards close.
         let declared = entry.entry_size();
         match kind {
             EntryKind::Hardlink => {
@@ -1730,8 +1521,8 @@ fn extract_stream(
                 if opts.symlinks == SymlinkPolicy::Refuse {
                     return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
                 }
-                // An absent link name is an EMPTY target, which the vet refuses as
-                // `EmptyPath` — the same verdict the zip lane reaches for an empty body.
+                // An absent link name is an empty target, which the vet refuses as
+                // `EmptyPath`, as the zip lane does for an empty body.
                 let target = entry
                     .link_name()
                     .map_err(map_tar_io)?
@@ -1771,12 +1562,10 @@ fn extract_stream(
 /// never read.
 #[derive(Debug)]
 pub(crate) struct WrittenFile {
-    /// The permission bits the fold records for the file we just wrote, masked to
-    /// `0o7777` — [`crate::platform::folded_mode`] over an `fstat` of the handle we
-    /// still hold (after `set_mode`) and the requested `mode`. On Unix that is the mode
-    /// READ BACK rather than the request, the same number the on-disk walk reads; on
-    /// Windows, which stores no POSIX bits, it is the request itself — the only value a
-    /// producer's signed root can be reproduced from (`crate::tree`'s module docs).
+    /// The permission bits the fold records, masked to `0o7777`:
+    /// [`crate::platform::folded_mode`] over an `fstat` of the handle (after `set_mode`).
+    /// On Unix that is the mode read back, as the on-disk walk reads it; on Windows, which
+    /// stores no POSIX bits, the requested mode (`crate::tree`'s module docs).
     pub(crate) mode: u32,
     /// Lowercase-hex SHA-256 of the content, accumulated over the SAME 64 KiB chunks the
     /// copy loop writes. Byte-for-byte the digest `tree::file_sha256` would produce by
@@ -1795,17 +1584,13 @@ struct Sink<'p> {
     mode: u32,
 }
 
-/// Stream `reader` into `sink`'s freshly opened file with permission `sink.mode`,
-/// decrementing `remaining`; abort with [`ExtractError::TooLarge`] the moment the running
-/// total would exceed the cap (so a decompression bomb is stopped mid-stream, never fully
-/// written).
+/// Stream `reader` into `sink`'s freshly opened file with `sink.mode`, decrementing
+/// `remaining`; abort with [`ExtractError::TooLarge`] the moment the total would exceed it,
+/// so a decompression bomb stops mid-stream.
 ///
-/// With `fold`, also returns the file's [`WrittenFile`] digest+mode, hashed inline: the
-/// bytes are already in the copy buffer, so this is the one pass over the payload the
-/// staging path needs. Without it, nothing is hashed and no `fstat` is issued — the
-/// historical write-only loop.
-///
-/// `buf` is the caller's single reusable copy buffer (see [`Layer`]).
+/// With `fold`, the content is hashed inline and the mode read back ([`WrittenFile`]);
+/// without it, nothing is hashed and no `fstat` is issued. `buf` is the caller's one
+/// reusable copy buffer (see [`Layer`]).
 fn write_capped(
     mut reader: impl Read,
     sink: Sink<'_>,
@@ -1835,10 +1620,8 @@ fn write_capped(
         // The `Read` contract guarantees `n <= buf.len()`; the clamp keeps a
         // nonconforming reader from panicking the slice below.
         let n = if n <= buf.len() { n } else { buf.len() };
-        // Refund the file-content bytes to the structural budget: file content is
-        // separately bounded by `remaining` (the signed content cap), so it must not
-        // deplete the per-entry structural budget — otherwise a legitimate file larger
-        // than TAR_ENTRY_STRUCTURAL_BUDGET would trip it mid-stream.
+        // Refund content bytes to the structural budget: content is bounded by `remaining`,
+        // and a file larger than TAR_ENTRY_STRUCTURAL_BUDGET must not trip it.
         budget.set(
             budget
                 .get()
@@ -1854,38 +1637,28 @@ fn write_capped(
         // saturation never engages; it carries the no-underflow proof.
         *remaining = remaining.saturating_sub(n);
         len = len.saturating_add(n);
-        // `take <= buf.len()` by the clamp above; `get` + full-slice fallback is a
-        // no-op restatement of that bound in a panic-free shape (the gate could
-        // not carry the clamp across the intervening statements).
+        // `take <= buf.len()` by the clamp above; the `get` restates that bound in a
+        // panic-free shape the gate can check.
         let chunk = match buf.get(..take) {
             Some(c) => c,
             None => &buf[..],
         };
-        // Hash the EXACT slice that is written, in the same order — so the digest
-        // describes the file's contents by construction, not by a second reading of it.
+        // Hash the exact slice that is written, in order, so the digest describes the
+        // file's contents by construction, not by a second reading of it.
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(chunk);
         }
         f.write_all(chunk).map_err(|e| io_at(e, "write", dest))?;
-        // Live-progress meter (R5): this is the ONE in-process byte loop of an
-        // install, so the extract phase's honest byte source is exactly here. One
-        // relaxed atomic load per 64 KiB chunk when no `--progress-file` pass is
-        // live — unmeasurable next to the decompress and the write it sits between.
+        // Live progress: the one in-process byte loop of an install (one relaxed atomic
+        // load per chunk when no `--progress-file` pass is live).
         crate::progress::extract_tick(n);
     }
-    // Force the sanitized mode even if umask or a pre-existing file loosened it —
-    // through the handle we are still holding (`fchmod`), not by resolving `dest` a
-    // second time. Same bits, same failure mapping, minus one full path walk per file:
-    // the shipped `trust` sysroot lays 4114 of them, each under a
-    // `<prefix>/store/trust/<build>.incoming-<pid>/lib/rustlib/...` path. It is also
-    // the same property the read-back below already relies on — the mode lands on the
-    // inode we wrote, with no second resolution to race.
+    // Force the sanitized mode even if umask or a pre-existing file loosened it, through
+    // the handle (`fchmod`), not by resolving `dest` again.
     crate::platform::set_mode_on(&f, mode).map_err(|e| io_at(e, "set_mode", dest))?;
-    // Read the mode BACK, from the handle still open on the file we just wrote (so this
-    // is the inode's stored value, not our request), through the very function the
-    // on-disk walk uses. `File::metadata` is an `fstat` — no path resolution, nothing
-    // to race, and no second open. Where the inode stores no bits (Windows) the fold
-    // takes the request instead — `platform::folded_mode` decides, per platform.
+    // Read the mode back off the same handle (an `fstat`), through the function the
+    // on-disk walk uses; where the inode stores no bits (Windows) `folded_mode` takes the
+    // request instead.
     match hasher {
         Some(hasher) => {
             let meta = f.metadata().map_err(|e| io_at(e, "fstat", dest))?;
@@ -1904,7 +1677,7 @@ fn write_capped(
     }
 }
 
-/// Consume `reader` to EOF without writing, through the SAME caps as [`write_capped`]:
+/// Consume `reader` to EOF without writing, through the same caps as [`write_capped`]:
 /// the bytes of an entry `strip_components` skipped still count against the signed
 /// content cap (a skipped bomb is still a bomb) and still refund the structural budget.
 /// Returns the bytes drained.
@@ -1937,11 +1710,9 @@ fn drain_capped(
     Ok(len)
 }
 
-/// Lay ONE file down from `reader` at `dest` with permission `mode`, capped at
-/// `max_total_bytes`, and hand back what was written — the `raw-binary` vendor lane's
-/// whole extraction (the download IS the binary), through the very same write loop and
-/// mode read-back the archive lanes use, so `bin/<entry>` folds into the digest exactly
-/// as an archived `bin/<entry>` would.
+/// Lay one file down from `reader` at `dest` with `mode`, capped at `max_total_bytes`: the
+/// `raw-binary` vendor lane's whole extraction, through the archive lanes' write loop and
+/// mode read-back, so `bin/<entry>` folds as an archived `bin/<entry>` would.
 pub(crate) fn stage_file(
     reader: impl Read,
     dest: &Path,
@@ -1965,19 +1736,15 @@ pub(crate) fn stage_file(
 }
 
 /// The `tar-gz-binary` vendor lane's whole extraction: the gzip tar at `archive` holds
-/// EXACTLY ONE member, a regular file named by one bare component at its root, and that
-/// member's body is laid at `dest` with permission `mode`. The member's own name is vetted
-/// and dropped (the caller names the file). The body streams through the reader, the
-/// structural budget and allowance of [`extract_tar_gz_tree`] and the write loop of
-/// [`stage_file`], capped at `max_total_bytes`, so the file folds exactly as a
-/// `raw-binary` download of the same bytes would.
+/// exactly one regular file named by one bare component, and its body is laid at `dest`
+/// with `mode` (the member's own name is vetted and dropped). The body goes through the
+/// structural budget of [`extract_tar_gz_tree`] and the write loop of [`stage_file`], so
+/// it folds as a `raw-binary` download of the same bytes would.
 ///
-/// Refused before a byte of it is written: an archive with no member or a member whose
-/// name is not one bare component ([`ExtractReject::NotSingleFile`]), or a directory,
-/// link, device or other non-regular member ([`ExtractReject::DisallowedKind`]). A tar
-/// names its members as it goes, so a SECOND member shows only after the first one's
-/// body; it refuses the stage the same way, and the caller removes what was laid, as for
-/// any refusal mid-archive.
+/// Refused before a byte is written: no member or a name that is not one bare component
+/// ([`ExtractReject::NotSingleFile`]), or a non-regular member
+/// ([`ExtractReject::DisallowedKind`]). A second member shows only after the first one's
+/// body; it is refused the same way and the caller removes what was laid.
 pub(crate) fn stage_tar_gz_member(
     archive: &Path,
     dest: &Path,
@@ -2116,9 +1883,9 @@ pub(crate) mod fixtures {
         }
     }
 
-    /// One member of a test zip. `mode` is the FULL `st_mode` (type bits included) that
-    /// lands in the Unix external attributes; `0` means "no Unix attributes at all"
-    /// (the version-made-by host is then FAT, as a Windows zip would carry).
+    /// One member of a test zip. `mode` is the full `st_mode` (type bits included) that
+    /// lands in the Unix external attributes; `0` means no Unix attributes at all (the
+    /// version-made-by host is then FAT, as a Windows zip would carry).
     pub(crate) struct ZipMember<'a> {
         pub(crate) name: &'a str,
         pub(crate) mode: u32,
@@ -2370,10 +2137,9 @@ mod tests {
         );
     }
 
-    /// The symlink vet: in-root targets (relative from the link's own directory) pass;
-    /// anything that pops above the root, a `..` after a normal component, an absolute
-    /// target, or an empty one is refused; the resolution is lexical (a `..` after a `..`
-    /// that reached the root escapes even if a later component would come back in).
+    /// The symlink vet: in-root targets (relative to the link's directory) pass; a pop
+    /// above the root, a `..` after a normal component, an absolute or an empty target is
+    /// refused.
     #[test]
     fn symlink_vet_resolves_targets_lexically_inside_the_root() {
         let r = root();
@@ -2403,7 +2169,7 @@ mod tests {
             "lexical: no coming back"
         );
         // `..` only as a leading run: after a normal component it would pop from inside
-        // whatever that component is on disk — possibly a link laid earlier (K1).
+        // whatever that component is on disk, possibly a link laid earlier.
         assert_eq!(
             bad("bin", "a/b/c/up/../OUTSIDE"),
             ExtractReject::RootEscape,
@@ -2424,7 +2190,7 @@ mod tests {
             vet_symlink(&r, Path::new("top"), Path::new("y"), 1).unwrap(),
             None
         );
-        // …and the depth is the STRIPPED depth: `top/x -> ../y` would be in-root before
+        // …and the depth is the stripped depth: `top/x -> ../y` would be in-root before
         // stripping (from `top/`), but at the root after it, so it escapes.
         assert_eq!(
             vet_symlink(&r, Path::new("top/x"), Path::new("../y"), 1),
@@ -2438,14 +2204,12 @@ mod tests {
         crate::testdir::dir(&format!("atpkg-ex-{label}-"))
     }
 
-    /// Build a single raw USTAR header — so tests can inject adversarial names (`../`,
-    /// symlinks) that the high-level `tar::Builder` would refuse to *write*.
+    /// [`raw_header_mode`] at mode `0o644`.
     fn raw_header(name: &str, typeflag: u8, linkname: &str, size: usize) -> [u8; 512] {
         raw_header_mode(name, typeflag, linkname, size, 0o644)
     }
 
-    /// Assemble raw tar bytes (`(name, typeflag, linkname, content)` per entry) + the
-    /// trailing two zero blocks, then zstd-compress them to `dir/<label>.tar.zst`.
+    /// [`tar_bytes`] at mode `0o644`, zstd-compressed to `dir/<label>.tar.zst`.
     fn make_archive(dir: &Path, label: &str, entries: &[(&str, u8, &str, &[u8])]) -> PathBuf {
         let moded: Vec<_> = entries
             .iter()
@@ -2454,12 +2218,9 @@ mod tests {
         make_archive_moded(dir, label, &moded)
     }
 
-    /// The fold `tree` produced and the on-disk walk that must agree with it, byte for
-    /// byte: the plain walk where the inode stores modes (Unix — `tree_root_declared`
-    /// never consults the record there), the declared-mode walk where it stores none
-    /// (Windows, where the plain walk folds `0` and can agree with nothing a producer
-    /// signed). ONE call shape for every parity site, so the Windows fix is exercised
-    /// by the same tests that pin the Unix contract.
+    /// The fold `tree` produced and the on-disk walk that must agree with it: the
+    /// declared-mode walk, which on Unix reads modes from the inode and on Windows (which
+    /// stores none) uses the fold's declared modes.
     fn fused_and_walked(tree: TreeAccumulator, root: &Path) -> (String, String) {
         // Every parity site is also a tree the stage's name check must pass: a refusal
         // here would be a false one, on a filesystem that kept every name.
@@ -2491,12 +2252,8 @@ mod tests {
         "extract::tests::probe_stages_its_directories_0755_under_an_open_umask";
 
     /// The child half of [`a_folding_lane_makes_every_directory_0755_whatever_the_umask`]:
-    /// under umask `000`, a tar.zst whose files arrive with no directory member of their
-    /// own (`share/` and `share/doc/` exist only as their parents) and one that names its
-    /// directory (`bin/`) stages every directory at `0755`, the archive lanes' one
-    /// directory mode (`safe_mode`), not at `0777 & ~umask`. Outside that child (the env
-    /// unset) it does nothing: the umask is the whole process's, so it is set only in a
-    /// process running this one test.
+    /// under umask `000`, implicit (`share/`, `share/doc/`) and explicit (`bin/`)
+    /// directories stage at `0755`. With the env unset it does nothing.
     #[cfg(unix)]
     #[test]
     fn probe_stages_its_directories_0755_under_an_open_umask() {
@@ -2539,14 +2296,10 @@ mod tests {
         }
     }
 
-    /// AT3's check of the archive lanes (2026-10-10): the directories a folding lane
-    /// makes because a member's path passes through them are made by
-    /// [`make_dir_exact`], and they get the same `0755` a directory member gets, whatever
-    /// umask the stage runs under; a plain `mkdir` left them at `0777 & ~umask`, so a
-    /// stage under umask `002` (what Debian's `login.defs` gives a user whose group is
-    /// their own) laid them group-writable and one under `000` world-writable. The umask is
-    /// process-wide, so the stage runs in a child of this test binary that runs only
-    /// [`probe_stages_its_directories_0755_under_an_open_umask`].
+    /// The directories a folding lane makes because a member's path passes through them
+    /// ([`make_dir_exact`]) get `0755` whatever the umask, like a directory member. The
+    /// umask is process-wide, so the stage runs in a child of this test binary that runs
+    /// only [`probe_stages_its_directories_0755_under_an_open_umask`].
     #[cfg(unix)]
     #[test]
     fn a_folding_lane_makes_every_directory_0755_whatever_the_umask() {
@@ -3014,26 +2767,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// THE parity gate for the fused digest (§8 cross-version byte contract).
-    ///
-    /// `verify_and_stage` compares the extraction's own root against the SIGNED
-    /// `tree_root`, and those signed values were computed — by the publisher, and by
-    /// every earlier client that re-verified — with `tree::tree_root` over a finished
-    /// directory. So "the fused root is a good hash of the tree" is not the property
-    /// that matters: it must be the SAME 64 hex characters the on-disk walk produces,
-    /// for every shape the extractor can lay down. One archive covers them all:
-    ///
-    /// * nested directories and an explicit directory entry (dirs contribute no line),
-    /// * an EMPTY file (a real entry, digest of nothing),
-    /// * both mode classes — `safe_mode` maps any `x` bit to `0o755`, else `0o644`,
-    /// * a file spanning many 64 KiB copy-buffer chunks (the streaming hash),
-    /// * a HARDLINK, which the walk hashes through a second name and the accumulator
-    ///   aliases to one node,
-    /// * a DUPLICATE path (the second `open(O_TRUNC)` lands on the same inode),
-    /// * a duplicate that overwrites a hardlink TARGET, so both names change content —
-    ///   the case a path→digest table without the inode indirection would get wrong.
-    ///
-    /// Fails if the fused root ever drifts from the walk in either direction.
+    /// The parity gate for the fused digest (§8): the extraction-time root must be the same
+    /// 64 hex characters `tree::tree_root` computes over the finished directory, since that
+    /// is what signed the row. One archive covers every shape: nested and explicit
+    /// directories, an empty file, both mode classes, a multi-chunk file, a hardlink, a
+    /// duplicate path, and a duplicate that overwrites a hardlink target.
     #[test]
     fn fused_tree_root_is_byte_identical_to_the_on_disk_walk() {
         let d = dest("fused-parity");
@@ -3054,8 +2792,8 @@ mod tests {
                 ("lib/big.so", b'0', "", big.as_slice(), 0o644),
                 // Duplicate path: last write wins on the same inode.
                 ("share/doc/readme", b'0', "", b"hello, again", 0o644),
-                // Duplicate that overwrites a HARDLINK TARGET: `bin/cargo` aliases this
-                // inode, so the walk sees BOTH names carrying the new bytes.
+                // Duplicate that overwrites a hardlink target: `bin/cargo` aliases this
+                // inode, so the walk sees both names carrying the new bytes.
                 ("bin/targo", b'0', "", b"the replaced binary", 0o755),
             ],
         );
@@ -3074,9 +2812,7 @@ mod tests {
             "the extraction-time root must equal the on-disk walk byte for byte"
         );
         assert_eq!(fused.len(), 64);
-        // Two-sided reach guard: the fixture must actually have exercised the shapes.
-        // Without this the assertion above passes vacuously if the corpus ever shrinks
-        // to "one plain file" (or, worse, to nothing).
+        // Reach guard: the fixture must actually have exercised the shapes.
         assert_eq!(
             std::fs::read(root.join("bin/cargo")).unwrap(),
             b"the replaced binary",
@@ -3115,21 +2851,15 @@ mod tests {
         }
     }
 
-    /// Two members whose names differ in bytes but name ONE file on the filesystem being
-    /// unpacked onto — a case pair on case-insensitive APFS or NTFS, the NFC and NFD
-    /// spellings of `café` on APFS. Before 2026-10-04 the second silently replaced the
-    /// first while the fold recorded both, so the root described a `bin/tool` holding
-    /// `benign` over a disk whose `bin/tool` held the other member's bytes, and a signed
-    /// root folded the same way passed it. Now the second is refused (`O_EXCL`); where
-    /// the filesystem keeps both names (case- and normalization-sensitive), both are laid
-    /// and the fold equals the walk. Either way the fold never describes a file the disk
-    /// does not hold — through the tar lane and the zip lane, which share the writer.
+    /// Two members whose names differ in bytes but name one file on the filesystem (a case
+    /// pair on case-insensitive APFS or NTFS, NFC and NFD `café` on APFS): the second is
+    /// refused (`O_EXCL`); where the filesystem keeps both names, both are laid and the
+    /// fold equals the walk. Through the tar and zip lanes.
     #[test]
     fn a_member_the_filesystem_names_like_another_never_replaces_it_unseen() {
         let d = dest("fs-folded-names");
-        // `bin/TOOL`, not `BIN/TOOL`: the pair shares its directory under one spelling, so
-        // what refuses it is the FILE's exclusive create; a folded directory is the test
-        // below's.
+        // `bin/TOOL`, not `BIN/TOOL`: the pair shares its directory, so what refuses it is
+        // the file's exclusive create (a folded directory is the next test's).
         for (first, second) in [("bin/tool", "bin/TOOL"), ("caf\u{e9}", "cafe\u{301}")] {
             let entries = [
                 (first, b'0', "", b"benign".as_slice(), 0o755),
@@ -3156,21 +2886,11 @@ mod tests {
         }
     }
 
-    /// The DIRECTORY half of the test above. Two members whose directory components
-    /// differ in bytes but name ONE directory on the filesystem being unpacked onto —
-    /// `Dir` and `dir` on case-insensitive APFS or NTFS, the NFC and NFD spellings of
-    /// `café` on APFS, at the top or below a shared parent. Made with `create_dir_all`,
-    /// the second member's directory silently WAS the first's: its file, link or alias
-    /// landed in `Dir/` on disk while the fold recorded it under `dir/`, so the root
-    /// described a path the walk never finds and `aterm pkg verify` called an untampered
-    /// install drifted. A component this extraction did not make under those exact bytes
-    /// is created exclusively and refused as `Occupied` when the filesystem already has
-    /// it; where the filesystem keeps both spellings apart (case- and normalization-
-    /// sensitive), both are laid and the fold equals the walk. The same two members with
-    /// the directory spelled ONE way always extract, so the refusal is the spelling's,
-    /// not the member kind's. Every kind (a link only where the platform lays links),
-    /// through the tar lane and the zip lane (which has no hardlinks), which share the
-    /// writer.
+    /// The directory half of the test above: a directory component spelled differently
+    /// (`Dir`/`dir`, NFC/NFD `café`, at the top or below a shared parent) that the
+    /// filesystem folds onto another is refused as `Occupied` for every member kind; where
+    /// the filesystem keeps both spellings, both are laid and the fold equals the walk. The
+    /// same members spelled one way always extract. Through the tar and zip lanes.
     #[test]
     fn a_directory_the_filesystem_names_like_another_never_merges_unseen() {
         let d = dest("fs-folded-dirs");
@@ -3277,9 +2997,8 @@ mod tests {
         }
     }
 
-    /// The other side of the parity gate: the fused root must MOVE for exactly the
-    /// mutations the on-disk walk moves for. A digest that agreed with the walk but
-    /// ignored content or mode would pass the test above and detect nothing.
+    /// The other side of the parity gate: the fused root moves for exactly the mutations
+    /// (content, mode) the on-disk walk moves for.
     #[test]
     fn the_fused_root_moves_with_content_and_mode_exactly_as_the_walk_does() {
         /// Extract a one-file bundle and return the (walk-agreeing) fused root.
@@ -3307,22 +3026,14 @@ mod tests {
         assert_eq!(other_mode.len(), 64);
         assert_ne!(base, other_content, "content must move the fused root");
         // On Unix the mode is read back from the inode; on Windows, which stores no
-        // permission bits, the fold records the DECLARED mode (`0755` here against
-        // `0644`) — so the root moves with the archive's mode class on every platform,
-        // exactly as the producer's did when it signed the row (until 2026-09-22 the
-        // Windows fold was a constant `0`, and no signed root could ever match it).
+        // permission bits, the fold records the declared mode, so the root moves with the
+        // archive's mode class on every platform.
         assert_ne!(base, other_mode, "mode must move the fused root");
     }
 
-    /// The fold's precondition, enforced: a destination that already holds something is
-    /// REFUSED rather than folded.
-    ///
-    /// This is the one direction the fused digest could have moved that a re-verify may
-    /// never move. The on-disk walk hashed every regular file under the root, so a
-    /// stranger's file produced a MISMATCHING root and the stage failed closed; a fold
-    /// over "what the extractor wrote" would not have seen it at all and would have
-    /// passed. The staging contract already guarantees an empty scratch dir — this makes
-    /// the guarantee load-bearing instead of merely documented.
+    /// The fold's precondition: a destination that already holds something is refused
+    /// rather than folded, since a fold over what the extractor wrote would never see a
+    /// stranger's file that the on-disk walk hashes.
     #[test]
     fn a_non_empty_destination_is_refused_rather_than_folded() {
         let d = dest("fused-nonempty");
@@ -3526,12 +3237,9 @@ mod tests {
         assert!(extract("truncated", 1 << 20, 2, opts).is_err());
     }
 
-    /// An upstream tarball written as `tar -C dir -c .` — the shape both bsdtar and GNU
-    /// tar produce — opens with a root-naming `./` DIRECTORY member and names every path
-    /// `./…`. The authoring ceremony stages such an archive with the SYSTEM tar and signs
-    /// the `tree_root` of what that lays, so the client lanes have to lay the same tree:
-    /// before the fix the first member aborted the lane with `Rejected(EmptyPath, "./")`
-    /// and every install of an otherwise honest row failed.
+    /// A `tar -C dir -c .` archive opens with a root-naming `./` directory member and names
+    /// every path `./…`; the lanes lay the same tree the system tar does, and the strip
+    /// spends itself on the leading `.`.
     #[test]
     fn dot_rooted_archives_extract_like_the_tar_that_authored_them() {
         let d = dest("dot-root");
@@ -3624,10 +3332,8 @@ mod tests {
         lanes
     }
 
-    /// Slip refusals per lane: `..`, an absolute path, an escaping symlink and an
-    /// absolute symlink each abort the gzip AND the zip lane with nothing written outside
-    /// the root — and with `strip_components` set, so stripping is proven not to be a
-    /// way around the vet.
+    /// Slip refusals per lane: `..`, an absolute path, and an escaping, absolute or empty
+    /// symlink target each abort the gzip and zip lanes with `strip_components` set.
     #[test]
     fn gzip_and_zip_lanes_refuse_every_slip_shape() {
         let d = dest("lanes-slip");
@@ -3682,9 +3388,9 @@ mod tests {
         );
     }
 
-    /// A symlink can never redirect a later write: an entry whose path passes THROUGH a
-    /// link laid earlier, a file entry landing ON a link, and a link landing on an
-    /// existing path are each refused — in the tar lane and the zip lane alike.
+    /// A symlink can never redirect a later write: a path through an earlier link, a file
+    /// or hardlink landing on a link, and a link landing on an existing path are each
+    /// refused, in the tar and zip lanes alike.
     #[cfg(unix)]
     #[test]
     fn writes_through_or_onto_a_symlink_are_refused() {
@@ -3747,12 +3453,9 @@ mod tests {
         }
     }
 
-    /// A hardlink whose TARGET is named through a symlink is refused by the VET, before
-    /// the link is made. `lstat` and `link` decline to follow only the last component,
-    /// so `alias -> lnk/f` (with `lnk -> real` laid earlier in the same archive) was
-    /// once proved "a regular file", physically linked as a second name for `real/f`,
-    /// and only then refused — by the digest fold failing to find `lnk/f` among the
-    /// paths it had written, which is a refusal by accident, in the folding lanes only.
+    /// A hardlink whose target is named through a symlink (`alias -> lnk/f`, `lnk -> real`)
+    /// is refused by the vet before the link is made: `lstat` and `link` follow every
+    /// component but the last.
     #[cfg(unix)]
     #[test]
     fn a_hardlink_target_named_through_a_symlink_is_refused_before_the_link_exists() {
@@ -3812,11 +3515,9 @@ mod tests {
         }
     }
 
-    /// Two symlinks that each vet in-root cannot ADD UP to one that leaves it: a `..` that
-    /// follows a component which is itself a link pops from wherever that link points on
-    /// disk, not from where the lexical walk thinks it is. `a/b/c/up -> ../../..` is the
-    /// root; `bin -> a/b/c/up/../OUTSIDE` then walks out of it. Refused in the tar and zip
-    /// lanes, and in either order (audit K1, 2026-09-12).
+    /// Two symlinks that each vet in-root cannot add up to one that leaves it:
+    /// `a/b/c/up -> ../../..` is the root, and `bin -> a/b/c/up/../OUTSIDE` would walk out
+    /// of it. Refused in the tar and zip lanes, in either order.
     #[cfg(unix)]
     #[test]
     fn a_chain_of_in_root_symlinks_cannot_escape_the_root() {
@@ -4077,14 +3778,8 @@ mod tests {
         assert!(matches!(err, ExtractError::TooLarge(_)), "capped: {err:?}");
     }
 
-    /// A disk failure mid-bundle names the step AND the path it was on.
-    ///
-    /// The caller deletes the partial `dest_root` on any failure, so `io: No space left
-    /// on device (os error 28)` was the entire record of a 508-member bundle that died
-    /// at member 300 — no member, no destination, no read-vs-write. On macOS the same
-    /// bare line covered an `EPERM` that is usually privacy consent arriving with no
-    /// dialog, where the operator's only question is which path needs it. EACCES from a
-    /// write-protected stage root is that shape, without needing a full disk.
+    /// A disk failure mid-bundle names the step and the path it was on (EACCES from a
+    /// write-protected stage root stands in for a full disk).
     #[cfg(unix)]
     #[test]
     fn an_io_failure_names_the_operation_and_the_path() {
@@ -4107,15 +3802,8 @@ mod tests {
         assert_eq!(path.as_deref(), Some(root.join("bin").as_path()));
     }
 
-    /// `write_capped` forces the sanitized mode through the HANDLE it is still holding.
-    ///
-    /// The chmod used to go by path — `platform::set_mode(dest, mode)`, a full
-    /// resolution of a `<build>.incoming-<pid>/lib/rustlib/...` path — while `f` was
-    /// open and one line away from being `fstat`ed for those very bits, once per file
-    /// (4114 of them in the shipped `trust` sysroot). A reader that unlinks `dest`
-    /// mid-body is the witness that the handle is what gets chmod'd now: the bytes, the
-    /// `fchmod` and the mode read-back all describe the file we wrote, where the path
-    /// form had nothing left to resolve and failed the whole extraction with `ENOENT`.
+    /// `write_capped` sets the mode through the handle it holds, not by path: a reader that
+    /// unlinks `dest` mid-body leaves no path to resolve, yet the write succeeds.
     #[cfg(unix)]
     #[test]
     fn write_capped_sets_the_mode_through_the_open_handle() {

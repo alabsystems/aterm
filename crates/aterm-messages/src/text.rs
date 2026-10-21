@@ -107,7 +107,8 @@ pub(crate) fn clip(s: &str, cap: usize) -> String {
 /// `cap` chars (sanitized first): while the rest is longer than `cap`, it is
 /// cut at the last `; ` whose head fits (the joint dropped), else the last
 /// ` · ` (dropped), else the last `. ` (the period kept), else the last space,
-/// else hard at `cap`. Pieces are trimmed and never empty; rejoined at the
+/// else between the last two CJK characters that fit, kinsoku kept
+/// ([`aterm_grapheme::word_breaks`]), else hard at `cap`. Pieces are trimmed and never empty; rejoined at the
 /// joints they cut, they are the sanitized sentence. No reporter pre-cuts a
 /// sentence it received: the log entry is the whole of it, and the band
 /// shapes only `detail[0]`.
@@ -144,6 +145,20 @@ pub fn split_sentence(s: &str, cap: usize) -> Vec<String> {
                     let head_end = if *keep_head { i + 1 } else { i };
                     (head_end, i + joint.len())
                 })
+        });
+        // A sentence written without spaces breaks between its characters:
+        // read through the char just past the head, which says whether the
+        // head may end before it, and no further.
+        let cut = cut.or_else(|| {
+            let scan = rest[limit..]
+                .chars()
+                .next()
+                .map_or(rest.len(), |next| limit + next.len_utf8());
+            aterm_grapheme::word_breaks(&rest[..scan])
+                .into_iter()
+                .take_while(|brk| brk.at <= limit)
+                .last()
+                .map(|brk| (brk.at, brk.at))
         });
         let (head_end, tail_start) = cut.unwrap_or((limit, limit));
         let head = rest[..head_end].trim();
@@ -420,7 +435,9 @@ fn shape_path_in(clean: &str, cap: usize) -> Option<String> {
 }
 
 /// Prose cut to at most `cap` chars on a word boundary, ending in `…`:
-/// "these are what…", never "these are wha…".
+/// "these are what…", never "these are wha…". A word ends at a space, and
+/// in a script written without spaces at each of its characters, kinsoku
+/// kept ([`aterm_grapheme::word_breaks`]).
 #[must_use]
 pub(crate) fn trim_words(s: &str, cap: usize) -> String {
     if char_width(s) <= cap {
@@ -430,12 +447,17 @@ pub(crate) fn trim_words(s: &str, cap: usize) -> String {
         return String::new();
     }
     let keep = cap - 1;
-    let mut out: String = s.chars().take(keep).collect();
-    if s.chars().nth(keep).is_some_and(|next| next != ' ')
-        && let Some(space) = out.rfind(' ')
-        && space > 0
+    // The byte just past the `keep` chars that fit.
+    let limit = s.char_indices().nth(keep).map_or(s.len(), |(at, _)| at);
+    let mut out = &s[..limit];
+    if s[limit..].starts_with(|next: char| next != ' ')
+        && let Some(brk) = aterm_grapheme::word_breaks(s)
+            .into_iter()
+            .take_while(|brk| brk.at <= limit)
+            .last()
+        && !s[..brk.at].trim_end().is_empty()
     {
-        out.truncate(space);
+        out = &s[..brk.at];
     }
     let mut out = out.trim_end().to_string();
     out.push('\u{2026}');

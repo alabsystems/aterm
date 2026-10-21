@@ -32,9 +32,11 @@
 //!   swap, commit, pressure), [`gpu`] (the GPU's device-wide use), [`volume`]
 //!   (the volume a path lives on), [`capacity`] (a cgroup's ceiling),
 //!   [`net_links`] (every network interface's counters, with
-//!   [`counts_toward_machine`] naming the machine's own links; the macOS
-//!   message layouts in [`iflist`]), [`process_limits`] (the process
-//!   table's ceilings) and [`load_average`] (the kernel's load averages).
+//!   [`counts_toward_machine`] naming the machine's own links;
+//!   [`net_links_into`] reads them into a buffer the caller keeps; the
+//!   macOS message layouts in [`iflist`]), [`process_limits`] (the process
+//!   table's ceilings), [`pid_counts`] (how many processes the machine and
+//!   one user run) and [`load_average`] (the kernel's load averages).
 //! * [`processes`] — one sweep of the process table: each process's parent,
 //!   group, state, CPU time, footprint, disk bytes and name (the stats'
 //!   aterm and tab scopes, and the job units of the stuck-process engine).
@@ -124,9 +126,11 @@ pub use procs::{ProcessReading, Sweep, processes};
 pub use caps::{Cap, CapSource, Caps, Why};
 pub use machine::{
     Capacity, Cluster, Commit, CoreTicks, CpuLayout, GpuReading, LinkCounters, LinkKind,
-    LinkReading, MAX_LINKS, MemoryDetail, Probe, ProcessLimits, Throttle, ThrottleLevel,
-    VolumeReading, capacity, caps, counts_toward_machine, cpu_layout, gpu, layout_by_rank,
-    level_names, load_average, memory_detail, net_links, process_limits, volume, withdrawn_cores,
+    LinkReading, MAX_LINKS, MachineWords, MemoryDetail, Probe, ProcessLimits, Throttle,
+    ThrottleLevel, VmCounters, VolumeReading, WorkqueueLimits, capacity, caps,
+    counts_toward_machine, cpu_layout, gpu, layout_by_rank, level_names, load_average,
+    machine_words, memory_detail, net_links, net_links_into, pid_counts, process_limits, volume,
+    withdrawn_cores, workqueue_limits,
 };
 
 /// A path buffer (`PROC_PIDPATHINFO_MAXSIZE`).
@@ -420,8 +424,8 @@ pub const MAX_GROUP_PIDS: usize = 256;
 /// One process group's memory ([`group_memory`]): the PHYSICAL FOOTPRINT of
 /// every member this user may read, summed.
 ///
-/// WHY THE FOOTPRINT, NOT THE RESIDENT SET (measured 2026-09-29 on the
-/// owner's 128 GB Mac, a live Claude Code): `top` read `MEM 214G CMPRS 187G`
+/// Why the footprint, not the resident set (measured on a 128 GB Mac, a live
+/// Claude Code): `top` read `MEM 214G CMPRS 187G`
 /// for a process whose `ps` RSS was 29.8 GiB. The compressor and swap hold
 /// most of a runaway agent's pages, so the resident set UNDER-reads it
 /// sevenfold exactly when it matters; the footprint (`ri_phys_footprint`,
@@ -491,8 +495,8 @@ impl GroupMemory {
 /// The memory of `pid`'s whole PROCESS GROUP ([`GroupMemory`]): a Claude
 /// Code's Bun process and the children it forks into its own group. A child
 /// that took a group of its own (Claude Code's Bash tool starts each shell
-/// with one: measured 2026-09-29, every `zsh -c source …/shell-snapshots/…`
-/// led its own group) is not counted, so a build the agent runs is not the
+/// with one: every `zsh -c source …/shell-snapshots/…` leads its own group)
+/// is not counted, so a build the agent runs is not the
 /// agent's memory. `None` where it cannot be read: the pid is gone or not
 /// ours, the platform has no reader here (every platform but macOS).
 ///
@@ -819,7 +823,7 @@ pub(crate) fn read_into(path: &Path, buf: &mut [u8]) -> Result<(usize, bool), st
 /// `f` over the text of at most [`READ_CAP`] bytes of `path`, read into one
 /// stack buffer ([`read_bounded`] without its heap copy); `None` when the
 /// file cannot be read. Bytes that are not UTF-8 end the text where they
-/// start. Compiled everywhere: [`linux::links_under`] reads a fixture root
+/// start. Compiled everywhere: [`linux::links_under_into`] reads a fixture root
 /// through it on any host.
 pub(crate) fn with_bounded<T>(path: &Path, f: impl FnOnce(&str) -> T) -> Option<T> {
     let mut buf = [0u8; READ_CAP];

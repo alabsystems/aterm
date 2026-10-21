@@ -26,13 +26,18 @@
 //!   module doc): P1 holds by construction, P2 is checked as a prefix (not at
 //!   a batch boundary), P8's rot — refused, or cut with a move — is not
 //!   modelled, and a weak tier's generation move after a crash off the boot
-//!   volume is never drawn;
+//!   volume is never drawn; and in half the worlds it answers some acks
+//!   after the records they name are readable ([`bus`]'s held acks), the
+//!   order the bridge's non-blocking loop (aterm-0) must survive;
 //! * the STATE DIR'S DEVICE ([`device`]): the state dir's writes go to a
 //!   scratch directory and are journalled, and a power cut rewrites the
 //!   directory to an image aterm-durable's contract allows (a durable write
-//!   and a flushed directory entry kept, an atomic-only write kept or lost —
-//!   WHOLE: the committed device never tears a file, because the bridge does
-//!   not survive one torn, finding F1, kept as its own seed test);
+//!   and a flushed directory entry kept, an atomic-only write kept or lost,
+//!   whole or — POSIX's worst case, which the committed device draws — TORN:
+//!   finding F1, which the bridge now survives by setting a torn file aside;
+//!   an unflushed unlink kept or lost: finding F2, a landed post's in-flight
+//!   entry brought back and republished behind its sender's later posts,
+//!   which the bridge now closes by retiring an earlier boot's entries);
 //! * ATERM'S ENDPOINT ([`endpoint`]): a model of the verb lane's bridge plane
 //!   (`deliver` with its `off=` dedup, `outbox` and its retirements, receipts,
 //!   `hold`, `link log` with lane 3's `continues=`, the roster, a session's
@@ -198,6 +203,11 @@ pub(crate) struct Core {
     trace: Mutex<Vec<String>>,
     /// The bridge rules this world switched off ([`crate::fx::Fx::mutant`]).
     pub(crate) mutants: Mutex<BTreeSet<world::Mutant>>,
+    /// What the broker held unanswered for a process when it PARKED with
+    /// nothing queued ([`Process::idle`]): `(offset, subject, body)` of each
+    /// record whose ack was still in its batch's flush. The oracle's idle law
+    /// reads and empties it after every step.
+    pub(crate) idle_held: Mutex<Vec<(u64, String, Vec<u8>)>>,
 }
 
 impl Core {
@@ -215,6 +225,7 @@ impl Core {
             readers: Mutex::new(Vec::new()),
             trace: Mutex::new(Vec::new()),
             mutants: Mutex::new(BTreeSet::new()),
+            idle_held: Mutex::new(Vec::new()),
         })
     }
 
@@ -320,6 +331,8 @@ pub(crate) struct Process {
     pub(crate) core: Arc<Core>,
     pub(crate) pid: u64,
     alive: AtomicBool,
+    /// Inside a read that must not wait ([`Process::trying`]).
+    trying: AtomicBool,
 }
 
 impl Process {
@@ -328,7 +341,29 @@ impl Process {
             core,
             pid,
             alive: AtomicBool::new(true),
+            trying: AtomicBool::new(false),
         })
+    }
+
+    /// RUN `op` AS A READ THAT MUST NOT WAIT ([`crate::fx::Fx::unwaited`]):
+    /// while it runs, this process's bus reads answer "not yet" for an answer
+    /// the broker still holds ([`bus`]'s held acks) instead of releasing it.
+    /// Set back however `op` ends, an unwind included.
+    pub(crate) fn trying<T>(&self, op: impl FnOnce() -> T) -> T {
+        struct Unset<'a>(&'a AtomicBool);
+        impl Drop for Unset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        self.trying.store(true, Ordering::SeqCst);
+        let _unset = Unset(&self.trying);
+        op()
+    }
+
+    /// Whether this process is inside a read that must not wait.
+    pub(crate) fn is_trying(&self) -> bool {
+        self.trying.load(Ordering::SeqCst)
     }
 
     /// Whether the world switched `rule` off.
@@ -359,7 +394,15 @@ impl Process {
     }
 
     /// The loop parked `wait` with nothing queued: the virtual time passes.
+    /// First, what the broker still holds unanswered for this process is
+    /// noted for the oracle's idle law ([`Core::idle_held`]): a sender's
+    /// answer in a batch's flush while the loop goes to sleep is one nothing
+    /// will read before the idle backstop's grace.
     pub(crate) fn idle(&self, wait: Duration) {
+        let held = self.core.broker.held_for(self.pid);
+        if !held.is_empty() {
+            lock(&self.core.idle_held).extend(held);
+        }
         self.core.advance(wait);
     }
 

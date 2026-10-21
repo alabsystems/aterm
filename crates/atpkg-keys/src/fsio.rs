@@ -1,26 +1,19 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The crate's file-I/O leaves, in ONE place.
-//!
-//! Trust charges the std fs FFI boundary to the enclosing function, so every reader and
-//! writer in this tool funnels through the leaf functions here rather than scattering
-//! obligations across call sites. They moved out of `main.rs` when [`crate::provision`]
-//! needed the same discipline: a second, subtly different bounded reader living in the
-//! library would be exactly the drift this consolidation prevents.
+//! The crate's file-I/O leaves, in one place: Trust charges the std fs FFI boundary to the
+//! enclosing function, so every reader and writer funnels through these.
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Distinguishes one staged temporary from every other one this process makes, so a
-/// temporary left behind by a process death can never be reused, mistaken for a later
-/// run's bytes, or wedge that run on `create_new` (see [`stage_sibling_temp`]).
+/// Per-process counter that makes each staged temporary's name unique (see
+/// [`stage_sibling_temp`]).
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Everything this tool reads is tiny — a pkcs8 key is under a hundred bytes, a manifest
-/// a few KiB, `pins.rs` a few tens of KiB — so 1 MiB is a generous ceiling, not a tight
-/// fit.
+/// Everything this tool reads is small (a pkcs8 key is under 100 bytes, `pins.rs` tens of
+/// KiB), so 1 MiB is a generous ceiling.
 pub const READ_CAP: u64 = 1024 * 1024;
 
 /// Build a message by concatenation — deliberately not `format!`: the macro's inlined
@@ -55,25 +48,19 @@ fn file_type_name(t: std::fs::FileType) -> &'static str {
     }
 }
 
-/// Read a file's exact bytes — the one shared file-read site.
+/// Read a file's exact bytes, the one shared file-read site.
 ///
-/// Regular-file-only and bounded: an unbounded `read_to_end` of an operator-supplied path
-/// is the seamless.rs `/dev/urandom` kernel-panic incident in miniature — a never-EOF
-/// character device fills RAM+swap until the machine dies. The type check runs on the OPEN
-/// handle's fstat (so it cannot race a path swap) and refuses devices, directories, FIFOs
-/// and sockets before a single byte is read; `take` then bounds the read at
-/// `READ_CAP + 1` so even a regular file growing underneath us cannot allocate unboundedly
-/// — the +1 byte is how we DETECT overflow (exactly CAP+1 bytes arriving proves the file
-/// exceeds the cap) without reading further. (One residual: a writerless FIFO parks the
-/// tool in open(2) itself — POSIX blocks there until a writer arrives — but past open,
-/// nothing can hang or overallocate.)
+/// Regular files only, and bounded: an unbounded `read_to_end` of a never-EOF character device
+/// such as `/dev/urandom` fills RAM and swap. The type check runs on the open handle's fstat
+/// (no path-swap race) and refuses devices, directories, FIFOs and sockets before any read;
+/// `take(cap + 1)` bounds the read, and the extra byte detects an oversized file. A writerless
+/// FIFO still blocks in open(2) itself, as POSIX specifies.
 pub fn read_bytes(path: &str) -> std::io::Result<Vec<u8>> {
     read_bytes_up_to(path, READ_CAP)
 }
 
-/// [`read_bytes`] with a larger bound, for the one input that is not a key or a manifest:
-/// a release's `SHA256SUMS`, which lists every file of a source tree (the `trust` repo's
-/// runs to ~9 MB) and which `verify-signed` must read whole to check its signature.
+/// [`read_bytes`] with a caller's bound, for a release's `SHA256SUMS`: it lists every file of
+/// a source tree (the `trust` repo's runs to ~9 MB) and `verify-signed` must read it whole.
 pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let f = std::fs::File::open(path)?;
@@ -102,87 +89,53 @@ pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Write `bytes` to `path` — the one shared plain-file-write site (see [`read_bytes`]).
+/// Write `bytes` to `path`, the one plain-file-write site.
 ///
-/// Known Trust L0 artifact: `File::create` is a hardened raw-path boundary
-/// (Trust's own obligation kind `hardened_raw_path_api`, fail-closed absent
-/// capability contracts). It must stay:
-/// re-signing overwrites an existing `.sig`, so the non-clobbering `File::create_new`
-/// (which Trust does not flag) would be a behavior change.
+/// `File::create` is a Trust hardened raw-path boundary (`hardened_raw_path_api`). It stays:
+/// re-signing overwrites an existing `.sig`, which `File::create_new` would refuse.
 pub fn write_bytes(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     std::fs::File::create(path)?.write_all(bytes)
 }
 
-/// Replace `path` ATOMICALLY: write a sibling temporary file, flush it to the device, then
-/// `rename(2)` it over the target.
+/// Replace `path` atomically: write a sibling temporary, `sync_all` it, then `rename(2)` it
+/// over the target, so a reader sees the whole old file or the whole new one.
 ///
-/// # Why the trust anchor may not be written with `File::create`
+/// `File::create` truncates first, so ENOSPC, a signal or a crash mid-write would leave
+/// `pins.rs` empty or torn. The `sync_all` before the rename keeps this true across a power
+/// loss: renaming a file whose bytes are only in the page cache can expose a correctly named
+/// empty file after a reset. The temporary lives in the target's own directory, never `/tmp`:
+/// `rename` across filesystems fails with EXDEV, and a fallback copy would reopen the
+/// truncate window. Every failure path removes it.
 ///
-/// `File::create` truncates first and writes second, so every failure in between —
-/// ENOSPC, a signal, a crash, a full inode table — leaves `pins.rs` empty or half-written.
-/// That is the "silently mangled anchor file" the writer module exists to prevent, and it
-/// was reachable: a plan that produced text the verifier then rejected left the damaged
-/// bytes on disk while the tool told the operator "nothing was written". `rename` within a
-/// directory is atomic on every POSIX filesystem, so a reader sees either the whole old
-/// file or the whole new one and never a torn one.
-///
-/// The `sync_all` before the rename is the ordering that makes that true across a power
-/// loss as well as across a crash: renaming a file whose contents are still only in the
-/// page cache can, after a reset, expose a correctly-named file full of nothing.
-///
-/// The temporary is created in the TARGET'S OWN DIRECTORY, never in `/tmp`: `rename` across
-/// filesystems fails with EXDEV, and a fallback copy would reintroduce exactly the
-/// truncate-then-write window this function removes. It is created `create_new` under a
-/// unique pid+sequence name, so a dead run's leftover is neither reused nor in the way
-/// (see [`stage_sibling_temp`]), and it is removed on every failure path so a refusal
-/// leaves no litter beside a trust anchor.
-///
-/// Known Trust L0 artifact: `OpenOptions::open` and `fs::rename` are hardened raw-path
-/// boundaries (Trust's obligation kind `hardened_raw_path_api`, fail-closed
-/// absent capability contracts), the same
-/// residual [`stage_sibling_temp_with_mode`] carries and for the same reason — there is no
-/// non-raw-path spelling of "atomically replace this file".
+/// `OpenOptions::open` and `fs::rename` carry the raw-path residual described at
+/// [`stage_sibling_temp_with_mode`]: atomic replace has no other spelling.
 pub fn write_bytes_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = stage_sibling_temp(path, bytes)?;
     promote_staged(&tmp, path)
 }
 
-/// The STAGING half of [`write_bytes_atomic`].
+/// The staging half of [`write_bytes_atomic`]: writes `bytes` to a unique sibling temporary
+/// (`create_new`), flushes it, and returns its path. Every ordinary failure removes it first.
 ///
-/// Writes `bytes` to a UNIQUE sibling temporary (`create_new`), flushes it to the device,
-/// and returns the temporary's path. Every ordinary failure removes the temporary before
-/// returning: a stray `.tmp` beside a trust anchor is confusing at exactly the moment
-/// nobody can afford to be confused.
-///
-/// The name carries this process's pid and a per-process counter. A fixed name would let
-/// a process DEATH — the one failure no error path can clean up — wedge every later run on
-/// `create_new`. A unique name cannot be reused or block anybody; the residual is a litter
-/// file, which is what a crash leaves anyway.
+/// The name carries the pid and a per-process counter: a fixed name would let a process
+/// death, which no error path can clean up, wedge every later run on `create_new`.
 fn stage_sibling_temp(path: &str, bytes: &[u8]) -> std::io::Result<String> {
     stage_sibling_temp_with_mode(path, bytes, 0o666)
 }
 
-/// [`stage_sibling_temp`] with an explicit creation mode, so an OWNER-SECRET staging file
-/// is never briefly world-readable between `create_new` and a later `chmod`. `0o666` is
-/// what `OpenOptions` uses by default (umask applies either way); `0o600` is what
-/// [`write_owner_file_create_new`] stages with — this is the crate's one owner-secret
-/// file-create FFI site.
+/// [`stage_sibling_temp`] with an explicit creation mode, so an owner-secret staging file is
+/// never briefly world-readable before a `chmod`. `0o666` is the `OpenOptions` default (umask
+/// applies either way); [`write_owner_file_create_new`] stages with `0o600`.
 ///
-/// Write access is requested via `append(true)`, deliberately NOT `write(true)`: Trust's
-/// FFI-summary matcher keys on the callee's LAST path segment, so `OpenOptions::write`
-/// false-matches the libc `write(fd, buf, len)` summary and manufactures refuted
-/// fd-range/non-null/writes-global obligations for a plain builder-flag call. The two
-/// spellings are byte-identical here: `create_new` (O_EXCL) guarantees a brand-new empty
-/// file, and it is written exactly once by a single `write_all`, for which append-at-EOF
-/// (EOF = 0) and write-at-offset-0 coincide.
+/// Write access is `append(true)`, not `write(true)`: Trust's FFI-summary matcher keys on the
+/// callee's last path segment, so `OpenOptions::write` false-matches libc `write(2)` and
+/// manufactures refuted obligations. The two are identical here: `create_new` (O_EXCL) makes a
+/// new empty file and one `write_all` fills it, so append-at-EOF is write-at-offset-0.
 ///
-/// Known Trust L0 artifact: `OpenOptions::open` itself is a hardened raw-path boundary
-/// (Trust's obligation kind `hardened_raw_path_api`, fail-closed) that can only be
-/// discharged by capability
-/// contracts, which this campaign does not add. `File::create` cannot express
-/// create-new + 0600, which the machine key requires, so the residual obligation is
-/// confined to this leaf.
+/// `OpenOptions::open` is a Trust hardened raw-path boundary (`hardened_raw_path_api`,
+/// fail-closed without capability contracts). `File::create` cannot express create-new +
+/// `0600`, which the machine key needs, so the residual obligation is confined to this leaf.
 fn stage_sibling_temp_with_mode(path: &str, bytes: &[u8], mode: u32) -> std::io::Result<String> {
     use std::io::Write as _;
     let (tmp, mut f) = loop {
@@ -220,10 +173,8 @@ fn stage_sibling_temp_with_mode(path: &str, bytes: &[u8], mode: u32) -> std::io:
     Ok(tmp)
 }
 
-/// The PROMOTION half of [`write_bytes_atomic`]: `rename(2)` a staged temporary over its
-/// target, removing the temporary if the rename itself fails so no litter survives, then
-/// flushing the DIRECTORY ENTRY so the new name survives a power loss (see
-/// [`sync_parent`]).
+/// The promotion half of [`write_bytes_atomic`]: `rename(2)` the staged temporary over its
+/// target (removing it if the rename fails), then sync the directory entry ([`sync_parent`]).
 fn promote_staged(tmp: &str, path: &str) -> std::io::Result<()> {
     if let Err(e) = std::fs::rename(tmp, path) {
         let _ = std::fs::remove_file(tmp);
@@ -232,15 +183,12 @@ fn promote_staged(tmp: &str, path: &str) -> std::io::Result<()> {
     sync_parent(path)
 }
 
-/// Install a NEW owner-only file atomically, without ever replacing an existing path.
+/// Install a new owner-only (`0600`) file atomically, never replacing an existing path.
 ///
-/// The complete `0600` inode is `fsync`ed before a `hard_link` publishes its final name,
-/// so the name and the bytes cannot appear out of order across a reset — a machine key
-/// that exists but is empty is indistinguishable from a key the roster does not name.
-/// The link is what makes "never replace" and "atomic" hold at once: `rename` would
-/// clobber, and `create_new` + write is exactly the truncate-window
-/// [`write_bytes_atomic`] exists to remove. The parent directory is synced before the
-/// caller may publish authority that depends on the file surviving a power loss.
+/// The complete inode is `fsync`ed before a `hard_link` publishes its final name, so a reset
+/// cannot expose an empty key under that name. The link gives "never replace" and "atomic" at
+/// once: `rename` would clobber, and `create_new` + write has the truncate window. The parent
+/// is synced before return, so the caller may then publish authority that depends on the file.
 pub fn write_owner_file_create_new(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = stage_sibling_temp_with_mode(path, bytes, 0o600)?;
     if let Err(e) = std::fs::hard_link(&tmp, path) {
@@ -255,10 +203,9 @@ pub fn write_owner_file_create_new(path: &str, bytes: &[u8]) -> std::io::Result<
     sync_parent(path)
 }
 
-/// Flush the DIRECTORY ENTRY containing `path`. A file's own `sync_all` persists its
-/// BYTES; it does not persist the name that reaches them, so without this a power loss
-/// after a rename can expose the old name, or no name at all, beside a roster signature
-/// that has already been published against the new one.
+/// Flush the directory entry containing `path`. A file's `sync_all` persists its bytes, not
+/// the name that reaches them: without this a power loss after a rename can expose the old
+/// name, or none, beside a roster signature already published against the new one.
 pub fn sync_parent(path: &str) -> std::io::Result<()> {
     let parent = std::path::Path::new(path)
         .parent()
@@ -282,13 +229,8 @@ pub fn sync_parent_ordered(path: &str) -> std::io::Result<()> {
     aterm_durable::ordered(&std::fs::File::open(parent)?)
 }
 
-/// Create every missing directory above `path`, so a write to it cannot fail with ENOENT.
-///
-/// This exists because it did. The machine key at `$HOME/.aterm/machine.key` was created
-/// on machines where `$HOME/.aterm` had never been created — which is every first machine,
-/// the one `setup` is for — and failed at the LAST step of a run that had already armed the
-/// trust anchor. Directories are created before anything secret exists, so a failure here
-/// costs an error message and nothing else.
+/// Create every missing directory above `path`, so a write to it cannot fail with ENOENT, and
+/// sync each new directory entry so a file written below survives a power loss.
 pub fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     let Some(parent) = std::path::Path::new(path)
         .parent()
@@ -296,7 +238,7 @@ pub fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     else {
         return Ok(());
     };
-    // Which directories this call is about to CREATE, learned before creating them.
+    // Which directories this call is about to create, learned before creating them.
     let mut missing = Vec::new();
     let mut cursor = parent;
     while !cursor.as_os_str().is_empty() && std::fs::symlink_metadata(cursor).is_err() {
@@ -307,10 +249,8 @@ pub fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
         cursor = next;
     }
     std::fs::create_dir_all(parent)?;
-    // Persist each newly-created directory entry, shallowest first. `sync_all` on
-    // `$HOME/.aterm/machine.key` cannot make that key durable if `$HOME/.aterm` itself
-    // can still vanish in the reset — the key would come back as an ENOENT on a path the
-    // roster already authorizes.
+    // Persist each new directory entry, shallowest first: syncing the key cannot make it
+    // durable if `$HOME/.aterm` itself can vanish in a reset.
     for directory in missing.iter().rev() {
         let directory = directory.to_str().ok_or_else(|| {
             std::io::Error::new(
@@ -412,13 +352,8 @@ mod tests {
         assert_eq!(std::fs::read(&fresh).unwrap(), b"hello");
     }
 
-    /// A FAILED WRITE LEAVES THE ORIGINAL EXACTLY AS IT WAS.
-    ///
-    /// This is the property `File::create` could not offer: it truncates first, so a
-    /// failure after that point leaves a trust anchor empty or half-written while the tool
-    /// reports that nothing was written. The failure is manufactured by taking away the
-    /// directory's write permission, which is what ENOSPC or a crash would look like from
-    /// the caller's side.
+    /// A failed write leaves the original untouched (`File::create` would have truncated it).
+    /// Revoking the directory's write permission stands in for ENOSPC or a crash.
     #[test]
     fn a_failed_atomic_write_leaves_the_original_intact() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -436,8 +371,7 @@ mod tests {
             b"the trust anchor",
             "the original is untouched — not truncated, not partial"
         );
-        // The temporary's name is unique per run, so this must be a SCAN, not a guess at
-        // one fixed name — a spelled-out name would pass vacuously.
+        // The temporary's name is unique per run, so scan rather than probe one name.
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -473,10 +407,7 @@ mod tests {
         assert!(read_bytes(dir.to_str().unwrap()).is_err(), "a directory");
     }
 
-    /// A TEMPORARY LEFT BY A DEAD PROCESS NEVER WEDGES THE NEXT WRITE.
-    ///
-    /// MUTATION: give `stage_sibling_temp_with_mode` back the fixed name and the write
-    /// below fails with EEXIST instead of landing.
+    /// Mutation check: with a fixed temporary name the write below fails with EEXIST.
     #[test]
     fn a_crash_left_temp_never_wedges_the_next_atomic_write() {
         let dir = scratch("stale-temp");
@@ -486,8 +417,7 @@ mod tests {
 
         write_bytes_atomic(&path, b"current").expect("a unique temp bypasses stale litter");
         assert_eq!(std::fs::read(&path).unwrap(), b"current");
-        // And it is left alone rather than silently consumed: it is somebody else's
-        // evidence, not this run's scratch space.
+        // Another run's litter is left alone.
         assert_eq!(std::fs::read(&stale).unwrap(), b"bytes from a dead process");
 
         // A dead run under a reused pid left litter at the very name this write draws: the
@@ -509,10 +439,8 @@ mod tests {
         );
     }
 
-    /// AN OWNER FILE IS WHOLE, PRIVATE, AND NEVER REPLACED. All three at once is the
-    /// point: `create_new` + `write_all` gives "never replaced" but exposes a
-    /// zero-length key under its final name, and `write_bytes_atomic` gives "whole" but
-    /// clobbers. The link-after-fsync route gives both.
+    /// `create_new` + `write_all` would expose a zero-length key under its final name and
+    /// `write_bytes_atomic` would clobber; link-after-fsync is whole, private and never replaces.
     #[test]
     fn an_owner_file_is_complete_private_and_never_replaced() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -543,8 +471,6 @@ mod tests {
         );
     }
 
-    /// The parent-directory helper creates a missing chain and is happy with one that
-    /// already exists.
     #[test]
     fn ensure_parent_dir_creates_a_missing_chain_and_is_idempotent() {
         let dir = scratch("parents");

@@ -1,17 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Registry-free dev loop (§13): symlink curated bins from a sibling checkout into `bin/`
-//! under a `0600` per-program marker; `update`/`apply` HARD-SKIP a linked program until
-//! `atpkg unlink`.
+//! Registry-free dev loop: shim curated bins from a sibling checkout into `bin/` under a
+//! `0600` per-program marker; `update`/`apply` skip a linked program until `atpkg unlink`.
 //!
-//! Every linked bin still passes [`crate::store::shim_allowed`] — a dev link can no more
-//! shadow `sudo`/`git`/`rustc` than an installed shim can. The link marker is a DISTINCT
-//! file from the pin-state file ([`crate::pin`]), so a pin survives a link→unlink cycle
-//! untouched (linkmode never reads/writes/clears any pin-state). The marker is a local dev
-//! artifact with NO signature — it is not a trust boundary; it can only SUPPRESS registry
-//! management of a dev-linked program, never advance a program onto a build, so it cannot
-//! bypass a Tombstone or the floor.
+//! Every linked bin passes [`crate::store::shim_allowed`], so a dev link can no more shadow
+//! `sudo`/`git`/`rustc` than an installed shim can. The marker is a separate file from the
+//! pin state ([`crate::pin`]), which linkmode never touches, so a pin survives a
+//! link→unlink cycle. The marker is unsigned and not a trust boundary: it can only suppress
+//! registry management of a program, never move one onto a build, so it cannot bypass a
+//! tombstone or the floor.
 
 use std::fmt;
 use std::fs;
@@ -30,9 +28,9 @@ pub const MAX_LINK_MARKER_BINS: usize = 1024;
 /// linked-program enumeration.
 pub const MAX_LINKED_PROGRAMS: usize = 256;
 
-/// Proven local provisioning shared by doctor and unattended update. A marker
-/// protects a checkout from registry replacement but is not evidence that its
-/// tools still exist, execute, or resolve inside the declared checkout.
+/// The dev-linked programs whose every tool shim resolves to an executable file inside the
+/// recorded checkout, and a problem line for each that does not (doctor and unattended
+/// update share it). A marker alone proves none of that.
 pub(crate) fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<String>, Vec<String>) {
     let mut live = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
@@ -80,10 +78,10 @@ pub(crate) fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<Str
     (live, problems)
 }
 
-/// What a [`link`]/[`refresh`] did: the bins symlinked, and any refused (sensitive-name).
+/// What a [`link`]/[`refresh`] did: the bins shimmed, and any refused (sensitive-name).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkOutcome {
-    /// The bin names symlinked into `bin/`.
+    /// The bin names shimmed into `bin/`.
     pub linked: Vec<String>,
     /// The bin names refused a link (on the [`crate::store::shim_allowed`] deny-list).
     pub refused: Vec<String>,
@@ -143,7 +141,7 @@ impl fmt::Display for LinkError {
 
 impl std::error::Error for LinkError {}
 
-/// The `0600` per-program link marker (toml; NOT a trust boundary).
+/// The `0600` per-program link marker (toml; not a trust boundary).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LinkMarker {
     schema: u32,
@@ -157,8 +155,8 @@ struct LinkMarker {
     linked_at: String,
 }
 
-/// Reject a program name that is not a single safe path component (same shape rule
-/// [`crate::store::shim_allowed`] / [`crate::ops::uninstall`] use).
+/// Whether `name` is a single safe path component (the shape rule
+/// [`crate::store::shim_allowed`] and [`crate::ops::uninstall`] share).
 fn safe_component(name: &str) -> bool {
     !(name.is_empty()
         || name == "."
@@ -174,31 +172,22 @@ pub fn is_linked(layout: &Layout, program: &str) -> bool {
     safe_component(program) && read_marker_for_program(layout, program).is_ok()
 }
 
-/// Dev-link `program`: symlink each of `bins` (relative paths under `checkout`) into `bin/`,
-/// every name gated through [`crate::store::shim_allowed`], and record a `0600` marker so
-/// `update`/`apply` HARD-SKIP the program until [`unlink`]. NEVER touches any pin-state.
-/// The shim/tool name for a bin path: its file name with the platform executable extension
-/// removed (`foo.exe` → `foo` on Windows, case-insensitively; unchanged on Unix, where
-/// `EXE_SUFFIX` is empty). Deriving the name this way is what makes a dev-linked tool
-/// invokable by its bare name (Windows resolves `foo` → `foo.cmd` via `PATHEXT`, never
-/// `foo.exe.cmd`) AND lets the sensitive-name deny-list see the real name (`ssh.exe` is
-/// refused as `ssh`). Returns `None` if the path has no usable UTF-8 file name. `link` and
-/// `unlink` MUST derive names identically so an unlink removes the exact shim a link created.
+/// The shim name for a bin path: its file name minus the platform executable suffix
+/// (`foo.exe` → `foo` on Windows, case-insensitively), so the tool runs by its bare name
+/// (`PATHEXT` finds `foo.cmd`) and the deny-list sees the real name (`ssh.exe` is refused as
+/// `ssh`). `None` without a UTF-8 file name. `link` and `unlink` both derive names here, so
+/// an unlink removes the exact shim a link created.
 fn bin_tool_name(rel: &Path) -> Option<&str> {
     let name = rel.file_name().and_then(|s| s.to_str())?;
     Some(strip_exe_suffix(name, std::env::consts::EXE_SUFFIX))
 }
 
-/// `name` with a trailing `ext` removed, compared case-insensitively — the platform
-/// executable suffix split out so both halves are exercisable off the platform that
-/// has one (`EXE_SUFFIX` is `".exe"` on Windows and `""` everywhere else).
+/// `name` with a trailing `ext` removed, compared case-insensitively; split out so every
+/// host runs it (`EXE_SUFFIX` is `".exe"` on Windows, `""` elsewhere).
 ///
-/// Compare bytes, never slice the `str`: `len - ext.len()` is a byte offset a non-ASCII
-/// name can put inside a multi-byte character, and `&name[cut..]` panics there (`"日本語"`
-/// is nine bytes, so `len - 4` is 5). Everything that derives a name — [`link`],
-/// [`unlink`], [`refresh`], [`linked_bins`], [`linked_tool_names`] — comes through here.
-/// The slice below is safe by construction: the suffix matches only when those trailing
-/// bytes are ASCII, which makes `cut` a char boundary.
+/// Compares bytes rather than slicing at `len - ext.len()`, which a non-ASCII name can put
+/// inside a character (`"日本語"` is nine bytes); the suffix matches only when those bytes
+/// are ASCII, which makes `cut` a char boundary.
 fn strip_exe_suffix<'a>(name: &'a str, ext: &str) -> &'a str {
     if ext.is_empty() {
         return name;
@@ -211,28 +200,21 @@ fn strip_exe_suffix<'a>(name: &'a str, ext: &str) -> &'a str {
     }
 }
 
-/// What stood at a `bin/<tool>` name before this [`link`] replaced it — enough to put it
-/// back exactly, captured before the overwrite.
-///
-/// A rollback restores what was there, never what this build would render today: a store
-/// shim's body carries its own target, its own exported environment ([`crate::shim_env`])
-/// and its own compat route, and a tombstone carries no target at all.
+/// What stood at a `bin/<tool>` name before [`link`] replaced it, so a rollback restores
+/// exactly that rather than what this build would render: a store shim carries its own
+/// target, exported environment ([`crate::shim_env`]) and compat route, a tombstone none.
 enum PriorShim {
-    /// Nothing stood there. The rollback removes the shim this call created, which is the
-    /// only arm on which it deletes anything at all.
+    /// Nothing stood there: the rollback removes the new shim (its only deleting arm).
     Absent,
-    /// A regular file — the store's exec stub, a tombstone, or a Windows `.cmd` — kept as
-    /// its bytes and its mode.
+    /// A regular file (an exec stub, a tombstone, a Windows `.cmd`): its bytes and mode.
     File(Vec<u8>, fs::Permissions),
-    /// A symlink, the shape a shim laid by an older atpkg still has: its target.
+    /// A symlink, as an older atpkg laid shims: its target.
     Symlink(PathBuf),
 }
 
-/// Read what stands at `shim` into a [`PriorShim`], or refuse to touch it.
-///
-/// Only a regular file is read: a FIFO at a shim name would park this process on the open
-/// forever, and neither a directory nor a device is a shim this manager laid. Those are an
-/// error raised before the overwrite, rather than something replaced with no way back.
+/// Read what stands at `shim` into a [`PriorShim`], or refuse to touch it: only a regular
+/// file is read (a FIFO would park the open forever), and a directory or device is an error
+/// before the overwrite rather than something replaced with no way back.
 fn capture_shim(shim: &Path) -> Result<PriorShim, LinkError> {
     let meta = match fs::symlink_metadata(shim) {
         Ok(meta) => meta,
@@ -314,13 +296,9 @@ fn restore_symlink(shim: &Path, _target: &Path) -> std::io::Result<()> {
 }
 
 /// Undo the shim mutations of a failed [`link`], best-effort and newest first: a name this
-/// call brought into existence is removed, a name it overwrote is put back byte for byte.
-///
-/// Both arms matter. Removing only the new shims left an already-installed program's shim
-/// re-pointed at the dev binary with no marker recording it — the untracked dev shim this
-/// rollback exists to prevent, and the one state `unlink` cannot undo, since `unlink` reads
-/// that marker. Only paths this call itself replaced are passed in, so the removal arm can
-/// never widen into a name that already stood.
+/// call created is removed, a name it overwrote is put back byte for byte. An overwritten
+/// shim left pointing at the dev binary has no marker, so `unlink` could not undo it. Only
+/// paths this call replaced are passed in.
 fn roll_back(replaced: &[(PathBuf, PriorShim)]) {
     for (shim, prior) in replaced.iter().rev() {
         let _ = match prior {
@@ -331,6 +309,9 @@ fn roll_back(replaced: &[(PathBuf, PriorShim)]) {
     }
 }
 
+/// Dev-link `program`: shim each of `bins` (relative paths under `checkout`) into `bin/`,
+/// every name gated through [`crate::store::shim_allowed`], and record a `0600` marker so
+/// `update`/`apply` skip the program until [`unlink`]. Never touches pin state.
 pub fn link(
     layout: &Layout,
     program: &str,
@@ -340,13 +321,10 @@ pub fn link(
     if !safe_component(program) {
         return Err(LinkError::BadName(program.to_string()));
     }
-    // Absolutize the checkout so the shim embeds an ABSOLUTE target. A relative target is
-    // resolved at INVOCATION time, not link time: a Windows `.cmd` resolves it against the
-    // caller's CWD (tool not found from elsewhere, or worse runs a same-named binary in the
-    // caller's CWD), and a Unix relative symlink resolves against `bin/`, not the checkout.
-    // `path::absolute` is lexical (no filesystem hit, no `\\?\` verbatim prefix), so the
-    // embedded path stays clean; the marker then also records an absolute checkout so
-    // `refresh` works from any directory.
+    // Absolutize the checkout so the shim embeds an absolute target: a relative one resolves
+    // against the caller's CWD at invocation (tool not found, or a same-named binary there
+    // run). `path::absolute` is lexical (no filesystem hit, no `\\?\` verbatim prefix), and
+    // the marker records the absolute checkout so `refresh` works from any directory.
     let checkout = std::path::absolute(checkout).unwrap_or_else(|_| checkout.to_path_buf());
     if !checkout.is_dir() {
         return Err(LinkError::NoCheckout(checkout.clone()));
@@ -383,8 +361,8 @@ pub fn link(
         let Some(name) = bin_tool_name(rel) else {
             continue;
         };
-        // SECURITY: the sensitive-name deny-list is honored for dev links too — here by the
-        // only constructor that can produce a name `Layout::shim` will accept.
+        // The sensitive-name deny-list holds for dev links too: `ToolName::new` is the only
+        // constructor of a name `Layout::shim` accepts.
         let Some(tool) = crate::store::ToolName::new(name) else {
             refused.push(name.to_string());
             continue;
@@ -419,28 +397,23 @@ pub fn link(
         return Err(LinkError::NoBins { missing, refused });
     }
 
-    // The marker is what makes a dev link tracked. Letting a failed marker write propagate
-    // left a checkout wired into `bin/` that nothing recorded: `is_linked` said no, so
-    // `update`/`apply` would re-point the shims under the developer, and `unlink` — which
-    // reads the marker — had nothing to undo. Every shim this call touched is rolled back,
-    // so a link either stands recorded or does not stand.
+    // The marker is what makes a dev link tracked: without it `is_linked` says no, so
+    // `update`/`apply` would re-point the shims and `unlink` would have nothing to read. A
+    // failed write rolls back every shim, so a link either stands recorded or does not stand.
     if let Err(e) = write_marker(&layout.link_marker(program), &marker) {
         roll_back(&replaced);
         return Err(LinkError::Io(e.to_string()));
     }
-    // A DEV LINK HAS TO WIN ON PATH. For an agent program (`crate::stub::AGENT_PROGRAMS`)
-    // `agents/<tool>` goes FIRST on every PATH, so a link that re-pointed only `bin/<tool>`
-    // left the dev checkout unreachable — `claude` kept running the installed copy with
-    // nothing to say why. The reconcile lays the twin onto the link's own target (a primary
-    // inside the recorded checkout, now the marker is written), so `codex` typed inside
-    // aterm runs the linked build (the native harness contract §8).
+    // The dev link has to win on PATH. Inside aterm an agent program's
+    // (`crate::stub::AGENT_PROGRAMS`) `agents/<tool>` comes first, so the reconcile lays that
+    // twin onto the link's target; it does so only for a primary inside the checkout the
+    // marker records, which is why it runs after the marker write.
     crate::activate::reconcile_agents(layout);
     Ok(LinkOutcome { linked, refused })
 }
 
-/// Un-link `program`: remove the shims that STILL point into its recorded checkout (never a
-/// re-installed store shim), then delete the marker. Leaves any pin-state untouched, so a
-/// pin survives the cycle.
+/// Un-link `program`: remove the shims that still point into its recorded checkout (never a
+/// re-installed store shim), then delete the marker. Pin state is untouched.
 pub fn unlink(layout: &Layout, program: &str) -> Result<(), LinkError> {
     if !safe_component(program) {
         return Err(LinkError::BadName(program.to_string()));
@@ -458,17 +431,14 @@ pub fn unlink(layout: &Layout, program: &str) -> Result<(), LinkError> {
         let Some(name) = bin_tool_name(Path::new(rel)) else {
             continue;
         };
-        // A name `link` refused was never given a shim, so there is nothing here to remove —
-        // and this is why `link` and `unlink` must derive names identically (see
-        // `bin_tool_name`): the admission is now part of that derivation.
+        // A name `link` refused never got a shim.
         let Some(tool) = crate::store::ToolName::new(name) else {
             continue;
         };
         let link = layout.shim(&tool);
-        // Only remove a link STILL pointing into the checkout — never nuke a re-installed
-        // store shim that happens to share the name. `resolve_shim` reads the forward
-        // target cross-platform (symlink target on Unix, the `.cmd` target on Windows) —
-        // a bare `fs::read_link` would Err on a Windows `.cmd` and leak the dev shim.
+        // Only a shim still pointing into the checkout goes, never a re-installed store shim
+        // of the same name. `resolve_shim` reads the target of every shim shape (an exec
+        // stub, a `.cmd`, an older symlink); `fs::read_link` would miss the first two.
         if let Some(target) = crate::platform::resolve_shim(&link)
             && target.starts_with(&checkout)
         {
@@ -476,19 +446,17 @@ pub fn unlink(layout: &Layout, program: &str) -> Result<(), LinkError> {
         }
     }
     let _ = fs::remove_file(&marker_path);
-    // Symmetrically: the shims just removed, and the marker, were the only things that
-    // could vouch for the link's twin, which the sweep now removes. The cli's unlink restores the installed build's shims after this — and
-    // reconciles through `install_tools_env` — but only when there IS an installed build
-    // and a name to put back; this is what keeps `agents/` from outliving `bin/` otherwise.
+    // The removed shims and marker were the only things vouching for the link's twin, so the
+    // reconcile's sweep drops it. The cli's unlink restores the installed build's shims (and
+    // reconciles) only when there is one to put back; this keeps `agents/` from outliving
+    // `bin/` otherwise.
     crate::activate::reconcile_agents(layout);
     Ok(())
 }
 
-/// The recorded checkout root of a dev-linked `program` (from its `0600` marker), or
-/// `None` when it is not linked / the marker is unreadable. Read-only. The config
-/// link reconciliation (`[packages.links]`) uses this to detect a HAND-MADE link
-/// pointing at a DIFFERENT checkout — which it must refuse to touch, loudly, rather
-/// than silently re-point a developer's live dev loop.
+/// The recorded checkout root of a dev-linked `program`, or `None` when it is not linked or
+/// the marker is unreadable. The `[packages.links]` reconcile uses it to refuse, loudly, to
+/// re-point a hand-made link at a different checkout.
 #[must_use]
 pub fn linked_checkout(layout: &Layout, program: &str) -> Option<PathBuf> {
     linked_checkout_checked(layout, program).ok().flatten()
@@ -511,12 +479,8 @@ pub fn linked_checkout_checked(layout: &Layout, program: &str) -> std::io::Resul
     }
 }
 
-/// Re-assert a program's dev links (idempotent): re-run [`link`] from the recorded marker,
-/// picking up any newly-built/added bins. No build is invoked — building is producer scope,
-/// absent from the consumer (a documented divergence from aterm-pkg's `refresh`).
-/// The tool names a dev-linked `program` puts on PATH, from its link marker (the rel
-/// bins it was linked with, by file stem) — empty when it is not linked. For `which
-/// <program>` to name what the link exposes without re-walking the managed bin/.
+/// The tool names a dev-linked `program` puts on PATH, from its marker's bins; empty when it
+/// is not linked. Lets `which <program>` name what the link exposes without walking `bin/`.
 #[must_use]
 pub fn linked_bins(layout: &Layout, program: &str) -> Vec<String> {
     if !safe_component(program) {
@@ -532,6 +496,8 @@ pub fn linked_bins(layout: &Layout, program: &str) -> Vec<String> {
         .collect()
 }
 
+/// Re-assert a program's dev links (idempotent): re-run [`link`] from the recorded marker,
+/// picking up newly built bins. No build is invoked; building is producer scope.
 pub fn refresh(layout: &Layout, program: &str) -> Result<LinkOutcome, LinkError> {
     if !safe_component(program) {
         return Err(LinkError::BadName(program.to_string()));
@@ -554,10 +520,8 @@ pub fn linked_programs(layout: &Layout) -> Vec<String> {
     linked_programs_checked(layout).unwrap_or_default()
 }
 
-// The directory's OS-level identity — the value that must be IDENTICAL before and
-// after an enumeration for that enumeration to describe one directory. `None` means
-// the platform could not determine it, which the caller treats as a failure (never as
-// "unchanged"), so every arm fails CLOSED.
+// The directory's OS-level identity, which must match before and after an enumeration for it
+// to describe one directory. `None` (unknowable) is a failure to the caller, never "unchanged".
 
 #[cfg(unix)]
 fn directory_identity(_path: &Path, metadata: &fs::Metadata) -> Option<(u64, u64)> {
@@ -597,8 +561,8 @@ pub fn linked_programs_checked(layout: &Layout) -> std::io::Result<Vec<String>> 
             "package links path is not a real directory",
         ));
     }
-    // Fail CLOSED on an unknowable identity: without it the post-enumeration compare
-    // below would be `None != None` — false — and would wave a swapped directory through.
+    // Fail closed on an unknowable identity: without one the compare after the enumeration
+    // cannot catch a swapped directory.
     let Some(identity) = directory_identity(&directory, &before) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -634,17 +598,12 @@ pub fn linked_programs_checked(layout: &Layout) -> std::io::Result<Vec<String>> 
     Ok(out)
 }
 
-/// The tool NAMES a program's dev link currently owns, or `None` when it is not linked.
+/// The tool names a program's dev link owns, or `None` when it is not linked.
 ///
-/// Exposed so `unlink` can restore exactly what the link took over — no more, and no fewer.
-/// Deriving that set any other way is unsafe: the installed build's `bin/` is NOT the answer
-/// for a sysroot bundle, because a toolchain ships backends belonging to OTHER atpkg
-/// programs (`trust`'s bin/ carries `ay`, `clean`, `ty`), and restoring from the directory
-/// listing repoints those programs' shims at the wrong build. Measured: doing exactly that
-/// clobbered `ay`, `clean` and `ty` onto `store/trust/6459`.
-///
-/// The marker is the only record that is both LOCAL and SCOPED to this program's link, which
-/// makes unlink's restoration symmetric with link's takeover by construction.
+/// `unlink` restores exactly this set. The installed build's `bin/` is not the answer: a
+/// toolchain bundle ships other atpkg programs' backends (`trust`'s bin/ carries `ay`,
+/// `clean`, `ty`), and restoring from that listing repoints their shims at the wrong build.
+/// The marker is the only record both local and scoped to this program's link.
 pub fn linked_tool_names(layout: &Layout, program: &str) -> Option<Vec<String>> {
     let marker = read_marker_for_program(layout, program).ok()?;
     let names: Vec<String> = marker
@@ -726,11 +685,9 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
         )
     })?;
     let tmp = parent.join(format!(".link.tmp-{}", std::process::id()));
-    // No temp may survive a failure: `links_dir` is enumerated by name, and
-    // `linked_programs` admits every entry that is a safe path component, so a leftover
-    // `.link.tmp-<pid>` was reported as a dev-linked program by `atpkg list`, by `which` and
-    // by the Packages screen — one nobody linked and no `unlink` could remove. Born `0600`
-    // through `create_new` because `fs::write` creates at the umask default.
+    // No temp may survive a failure: `linked_programs` admits every safe-component entry in
+    // `links_dir`, so a leftover `.link.tmp-<pid>` would read as a dev-linked program no
+    // `unlink` can remove. Born `0600` through `create_new` (`fs::write` uses the umask).
     let _ = fs::remove_file(&tmp);
     let staged = crate::platform::create_private_new(&tmp)
         .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
@@ -769,10 +726,8 @@ mod tests {
         d
     }
 
-    /// The exe suffix is stripped by bytes, so a name can never be cut mid-character.
-    /// Driven with an explicit `".exe"` rather than `EXE_SUFFIX`, so the Windows behaviour
-    /// is exercised on every host: only the byte offset matters, and `&name[cut..]` panicked
-    /// on `"日本語"` (nine bytes, so `len - 4` is 5, inside its third character).
+    /// The exe suffix is stripped by bytes, never mid-character; an explicit `".exe"` runs
+    /// the Windows case on every host.
     #[test]
     fn the_exe_suffix_is_stripped_without_ever_slicing_mid_character() {
         // A non-ASCII name whose length puts the cut inside a character.
@@ -814,21 +769,15 @@ mod tests {
         );
         assert!(!shim_of(&l, "ay").exists());
     }
-    /// A marker that cannot be written leaves no dev shim and no temp.
-    ///
-    /// The marker is the only thing that records a dev link, so a failed marker write that
-    /// propagated left a checkout wired into `bin/` that nothing tracked: `is_linked`
-    /// answered no and `unlink` had nothing to undo. A leaked `.link.tmp-<pid>` was worse —
-    /// `linked_programs` admits every safe-named entry of the links dir, so the litter was
-    /// reported as a dev-linked program that no `unlink` could remove.
+    /// A marker that cannot be written leaves no dev shim and no temp (a leaked
+    /// `.link.tmp-<pid>` would list as a dev-linked program).
     #[cfg(unix)]
     #[test]
     fn a_link_whose_marker_cannot_be_written_rolls_back_and_leaves_no_temp() {
         let l = layout("markerfail");
         let co = checkout("markerfail", &["ay"]);
         let bins = [PathBuf::from("target/release/ay")];
-        // The marker's destination is a non-empty directory, so the rename cannot replace
-        // it — the arm that used to leak the temp with the shim already laid.
+        // The marker's destination is a non-empty directory, so the rename cannot replace it.
         fs::create_dir_all(l.links_dir().join("ay").join("occupied")).unwrap();
 
         let out = link(&l, "ay", &co, &bins);
@@ -862,13 +811,7 @@ mod tests {
         let _ = fs::remove_dir_all(&co);
     }
 
-    /// And it puts back the shim it overwrote, not only the ones it created.
-    ///
-    /// Recording a shim only when the name was new undid nothing for an already-installed
-    /// program — the ordinary case for a dev link, and the only one in which a shim is
-    /// overwritten at all. A failed marker write then left `bin/ay` re-pointed at the dev
-    /// checkout with nothing recording it, which `unlink` cannot put back either. The
-    /// store's shim must come out of a failed link byte for byte.
+    /// A failed link puts back the store shim it overwrote, byte for byte.
     #[cfg(unix)]
     #[test]
     fn a_failed_link_restores_the_shim_it_overwrote() {
@@ -940,14 +883,13 @@ mod tests {
         ];
         let out = link(&l, "ay", &co, &bins).unwrap();
         assert_eq!(out.linked, vec!["ay".to_string(), "ny".to_string()]);
-        // Shims point INTO the checkout; marker exists 0600; is_linked true. resolve_shim
-        // reads the forward target cross-platform (a `.cmd` is not read_link-able).
+        // The shim forwards into the checkout.
         assert_eq!(
             crate::platform::resolve_shim(&shim_of(&l, "ay")).unwrap(),
             co.join("target/release/ay")
         );
         assert!(is_linked(&l, "ay"));
-        // marker is 0600 — Unix-only mode check.
+        // The marker is 0600 (a Unix mode check).
         #[cfg(unix)]
         {
             let mode = fs::metadata(l.link_marker("ay"))
@@ -971,14 +913,10 @@ mod tests {
         let _ = fs::remove_dir_all(&co);
     }
 
-    /// A DEV LINK MUST WIN AT THE FRONT OF PATH. For an agent program, `agents/<tool>` is
-    /// laid beside `bin/<tool>` and goes FIRST on every PATH, so a `link` that re-pointed
-    /// only `bin/claude` left the dev checkout unreachable: typing `claude` still ran the
-    /// installed copy. So the link's twin names the link's target (the native harness
-    /// contract §8: `aterm pkg link codex <pkgdir> bin/codex` wins inside aterm), carries
-    /// no self-update block, and leaves `bin/` as the link laid it. `unlink` is the mirror:
-    /// the shims and the marker it removes were the only things vouching for that twin.
-    /// NEGATIVE CONTROL: a twin onto a checkout no marker records is swept.
+    /// For an agent program, `agents/<tool>` comes first on PATH inside aterm, so `link` lays
+    /// its twin onto the dev link's target, with no self-update block, and leaves `bin/` as
+    /// the link laid it; `unlink` sweeps that twin. Negative control: a twin onto a checkout
+    /// no marker records is swept and never laid.
     #[test]
     fn link_and_unlink_sweep_the_front_of_path_agents_twin() {
         let l = layout("agents-twin");
@@ -1045,9 +983,7 @@ mod tests {
             .unwrap();
         let _ = fs::remove_dir_all(&stray);
 
-        // A twin an older client laid before the link goes on unlink too — the cli's
-        // restore reconciles only when there is an installed build and an owned name to
-        // put back.
+        // A twin onto the store build, laid while the link stands, goes on unlink too.
         lay_twin();
         unlink(&l, "claude").unwrap();
         assert!(
@@ -1093,15 +1029,13 @@ mod tests {
         let l = layout("scoped");
         let co = checkout("scoped", &["ay"]);
         link(&l, "ay", &co, &[PathBuf::from("target/release/ay")]).unwrap();
-        // Overwrite the ay shim with a store-style shim (a re-install) OUTSIDE the checkout,
-        // via the same primitive a real install uses (a symlink on Unix, a `.cmd` on Windows
-        // — atomic_symlink is the DIRECTORY-junction primitive there, wrong for a bin shim).
+        // Re-install a store shim of the same name outside the checkout, as an install lays
+        // it (`atomic_symlink` is a directory junction on Windows, wrong for a bin shim).
         let store_target = l.build_dir("ay", 18).join("bin/ay");
         fs::create_dir_all(store_target.parent().unwrap()).unwrap();
         fs::write(&store_target, b"#!/bin/true\n").unwrap();
         crate::platform::install_shim_to(&shim_of(&l, "ay"), &store_target).unwrap();
         unlink(&l, "ay").unwrap();
-        // The store shim survived — unlink only removes links into the checkout.
         assert_eq!(
             crate::platform::resolve_shim(&shim_of(&l, "ay")).unwrap(),
             store_target

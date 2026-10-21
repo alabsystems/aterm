@@ -6,13 +6,12 @@
 # file, so they are repeated here; the root file says why each exists) and THE
 # INJECTED CLOCK.
 #
-# THE INJECTED CLOCK. `Terminal::process` is a pure function of (bytes,
-# injected instant), so a hydrated buffer replays exactly: every
-# state-affecting clock read goes through `process_at(input, now)`. A read
-# that cannot affect that state (the one capture the pipeline injects,
-# gated profiling) carries `#[expect(clippy::disallowed_methods, reason = "…")]`
-# saying so. `aterm_time::Instant::now` is `std::time::Instant::now` on every
-# native target, so the std row names it too; `elapsed` reads the clock as well.
+# The injected clock. `Terminal::process` is a pure function of (bytes, injected clock
+# reading), so a hydrated buffer replays exactly: every state-affecting clock read goes through
+# `process_at(input, clock)`. A read that cannot affect that state (gated profiling, the one
+# capture the pipeline injects) carries `#[expect(clippy::disallowed_methods, reason = "…")]`.
+# `aterm_time::Instant::now` is `std::time::Instant::now` on native targets, so the std row
+# names it too; `elapsed` reads the clock as well.
 disallowed-methods = [
   { path = "std::fs::File::lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },

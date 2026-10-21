@@ -63,13 +63,17 @@ fn longest_reset() -> String {
 /// limit's reset: each says when the limit resets, where that is known. (The
 /// roster's reports where it continues none, [`LIMIT_ROSTER_KEPT`] and
 /// [`LIMIT_UNREAD_KEPT`], have no reset to name.)
-const LIMITS: [NoticeText; 10] = [
+const LIMITS: [NoticeText; 14] = [
     LIMIT_SIGN_IN,
     LIMIT_RENEW,
     LIMIT_RENEW_HELD,
     LIMIT_LOGIN,
     LIMIT_LOGIN_HELD,
     LIMIT_USE,
+    LIMIT_DRAFT,
+    LIMIT_DRAFT_OWN,
+    LIMIT_DRAFT_MENU,
+    LIMIT_UNMADE,
     LIMIT_STAY,
     LIMIT_STAY_HELD,
     LIMIT_ROSTER,
@@ -586,4 +590,69 @@ fn a_short_title_says_what_happened_in_two_or_three_words() {
     assert!(short_title_fault("Limit in tab 1", "Claude usage limit reached in tab 1").is_some());
     assert!(short_title_fault(title, title).is_some());
     assert!(short_title_fault("Limit", title).is_some());
+}
+
+/// The arguments after `aterm harness` of the command `f`'s step runs, whole
+/// (its line of Details where the step points there); `None` for a step that
+/// runs none.
+fn step_args(f: &Filled) -> Option<Vec<String>> {
+    let step = f.command.as_deref().unwrap_or(&f.todo);
+    let at = step.find(COMMAND)?;
+    Some(
+        step[at + COMMAND.len()..]
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// EVERY COMMAND A STEP RUNS IS ONE `aterm harness` TAKES: the owner copies
+/// it from the band or from Details, so it parses as the verb's own grammar
+/// does (`crate::harness::cli::parse`), at a label of every length.
+/// NEGATIVE CONTROL: a verb the grammar does not have is refused by the same
+/// parse.
+#[test]
+fn every_command_a_step_runs_is_one_aterm_harness_takes() {
+    use crate::harness::cli::parse;
+    let mut commands = 0;
+    for n in ALL {
+        for label in ["main".to_string(), longest_label()] {
+            let f = n.fill(Some(&label), longest_why(n));
+            let Some(args) = step_args(&f) else {
+                continue;
+            };
+            commands += 1;
+            assert!(parse(&args).is_ok(), "{}: {args:?}", n.id);
+        }
+    }
+    assert!(commands > 0, "a step runs a command");
+    let unknown = ["accounts", "adds", "main"].map(str::to_string);
+    assert!(parse(&unknown).is_err(), "the control");
+}
+
+/// A NOTICE'S RECORD CLOSES IN WORDS TRUE OF HOW IT ENDED (the review of the
+/// login carry, r8c-7): a usage limit, where no login was lost, closes as the
+/// switch to another account that ends it, never as a login back; a lost or
+/// renewed login closes as its login back. Either is a glass title with the
+/// tab's place fitted on. NEGATIVE CONTROL: the two words differ, so a usage
+/// limit closed in a lost login's would be caught.
+#[test]
+fn a_notice_closes_in_words_true_of_how_it_ended() {
+    let limits: Vec<&str> = LIMITS
+        .iter()
+        .chain(&[LIMIT_ROSTER_KEPT, LIMIT_UNREAD_KEPT])
+        .map(|n| n.id)
+        .collect();
+    for n in ALL {
+        let limit = limits.contains(&n.id);
+        assert_eq!(n.back, if limit { SWITCHED } else { BACK }, "{}", n.id);
+        let closed = format!("{} in tab 12", n.back);
+        assert_eq!(
+            aterm_messages::text::glass_title_fault(&closed),
+            None,
+            "{}: {closed:?}",
+            n.id
+        );
+    }
+    assert_ne!(SWITCHED, BACK, "the control");
 }

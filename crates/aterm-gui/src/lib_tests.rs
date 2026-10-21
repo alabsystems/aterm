@@ -15,7 +15,7 @@ use crate::app_config::Config;
 fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     use std::sync::atomic::Ordering;
 
-    // Exactly the call site in `about_to_wait`, with the retry due.
+    // `App::boot_health_guard_open`'s terms, with the retry due.
     fn would_dispatch(app: &App) -> bool {
         should_dispatch_boot_health_confirmation(
             app.headless,
@@ -331,14 +331,11 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     );
 }
 
-/// THE RESIDENT UNDER A LOAD SHED keeps its motion and leaves only the
-/// frame train: a moving pet is armed at its owner's coarse offer
-/// (`RESIDENT_SHED_CADENCE`) through the shed-free `pet_motion` gate, a
-/// settled one owes nothing but its own breath, no sooner than that
-/// cadence, and the latch clearing — on the envelope's recovery ramp, not
-/// after it — hands the train back.
-/// Negative control: the pet gate with the latch folded in (the old
-/// `cursor_cat_motion` gate) arms nothing, and the moving pet freezes.
+/// A resident under a load shed keeps its motion and leaves only the frame train: a moving pet
+/// is armed at its owner's coarse offer (`RESIDENT_SHED_CADENCE`) through the shed-free
+/// `pet_motion` gate, a settled one owes only its own next step no sooner than that cadence,
+/// and the latch clearing (on the envelope's recovery ramp) hands the train back. Negative
+/// control: a pet gate carrying the latch, as `cursor_cat_motion` does, arms nothing.
 #[test]
 fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
     use aterm_effects::companion::RESIDENT_SHED_CADENCE;
@@ -501,9 +498,7 @@ fn wake_expiry_preserves_exactly_one_cursor_effect_settle_present() {
     assert_eq!(settled["effect_active"], 0);
 }
 
-// -----------------------------------------------------------------------
 // The effect lane's wake census.
-// -----------------------------------------------------------------------
 
 use std::time::{Duration, Instant};
 
@@ -516,10 +511,9 @@ enum LaneGesture {
     Enter,
 }
 
-/// The before capture's schedule, in ms from the first key: 35 keys at
-/// 70 ms, a 1.5 s pause, 9 keys at 35 ms, a 1 s pause, four Ctrl-A /
-/// Ctrl-E jumps 500 ms apart, four backspaces at 100 ms, Enter — and the
-/// tail the lane is judged on. The seam's twin of this list lives in
+/// The capture's schedule, in ms from the first key: 35 keys at 70 ms, a 1.5 s pause, 9 keys
+/// at 35 ms, a 1 s pause, four Ctrl-A / Ctrl-E jumps 500 ms apart, four backspaces at 100 ms,
+/// Enter, then the tail the lane is judged on. The engine-side twin is
 /// `cursor_glow::tests::wake_census::census_schedule`.
 fn lane_census_schedule() -> Vec<(u64, LaneGesture)> {
     let mut s = Vec::new();
@@ -684,7 +678,7 @@ fn lane_wake_census() -> LaneCensus {
         if now >= last_at {
             let since = now.saturating_duration_since(last_at).as_millis() as u64;
             census.tail_arms += u32::from(a) + u32::from(b);
-            // The park is the POST-redraw decision: arm A judged the state
+            // The park is the post-redraw decision: arm A judged the state
             // before this frame; arm B is the level the loop sleeps on.
             if b {
                 census.park_ms = None;
@@ -1024,9 +1018,8 @@ fn static_collection_hello_uses_cursor_effect_presentability() {
         "a recorded static hello also owns its bounded erase wake"
     );
 
-    // Synthetic focus is not sufficient to RESUME state paused by a
-    // different presentation gate. Focus loss may preserve a live hello,
-    // but ownership of re-admission stays with the renderer's full fold.
+    // Synthetic focus does not resume state paused by a different presentation gate:
+    // focus loss may preserve a live hello, but re-admission stays with the renderer's fold.
     let mut paused = App::headless_for_test();
     {
         let ws = paused.windows.get_mut(&wid).expect("test window");
@@ -1083,7 +1076,6 @@ fn disabling_serious_mode_restores_latest_underlying_requests() {
     );
 
     // A preference edited while the overlay is active is the value restored.
-    // Keeping a stale snapshot here was the subtle destructive-toggle failure.
     assert!(app.set_serious_mode(true));
     app.config.cursor_trail = Some(false);
     assert!(!app.set_serious_mode(false));
@@ -1326,7 +1318,7 @@ fn config_parsing() {
         c.applied_terminal_config().cursor_style,
         CursorStyle::BlinkingBlock
     );
-    // Partial + UNKNOWN keys/tables ignored (forward-compatible).
+    // Partial config; unknown keys and tables are ignored (forward-compatible).
     let c: Config =
         aterm_toml::from_str("gpu = false\nfuture_key = \"x\"\n[unknown]\nk = 1").unwrap();
     assert_eq!(c.font_px, None);
@@ -1394,17 +1386,17 @@ fn paste_confirm_flags_any_line_end_only_when_unbracketed() {
     // for the person's own Enter, trailing newline or not.
     assert!(!super::paste_needs_confirm("a\nb\nc", true));
     assert!(!super::paste_needs_confirm("make test\n", true));
-    // A single line with no line end does not run on its own: NOT flagged.
+    // A single line with no line end does not run on its own: not flagged.
     assert!(!super::paste_needs_confirm("ls -la", false));
-    // Unbracketed, a trailing newline submits the line the moment it lands —
-    // one planted look-alike command is the pastejack, so it IS flagged.
+    // Unbracketed, a trailing newline submits the line the moment it lands:
+    // one planted look-alike command is the pastejack, so it is flagged.
     assert!(super::paste_needs_confirm("make test\n", false));
     assert!(super::paste_needs_confirm("make test\r\n", false)); // CRLF trailing
     assert!(super::paste_needs_confirm("make test\r", false)); // lone CR trailing
-    // An EMBEDDED newline with bracketed paste OFF IS flagged (pastejacking risk).
+    // An embedded newline with bracketed paste off is flagged (pastejacking risk).
     assert!(super::paste_needs_confirm("ls\nrm -rf ~\n", false));
     assert!(super::paste_needs_confirm("a\rb", false)); // embedded CR
-    // Default config: confirmation is ON.
+    // Default config: confirmation is on.
     assert!(Config::default().confirm_multiline_paste_or_default());
     assert!(
         !aterm_toml::from_str::<Config>("confirm_multiline_paste = false")
@@ -1421,8 +1413,8 @@ fn controls_prefs_projects_current_native_top_settings_tree() {
     use crate::app_introspect::AuxTarget;
     let mut app = crate::App::headless_for_test();
 
-    // A closed native tab has no visible route or controls. Preserve the
-    // historical first line for callers that only test open/closed.
+    // A closed native tab has no visible route or controls; the first line stays
+    // `state open=…` for callers that only test open/closed.
     let closed = app.read_aux_controls(AuxTarget::Prefs);
     assert_eq!(closed[0], "state open=false");
     assert!(closed.iter().any(|line| line == "prefs fields=0"));
@@ -1539,11 +1531,9 @@ fn keybindings_table_parses() {
     );
 }
 
-/// The real proof themes work: a config colour flows config → engine → the
-/// rendered `RenderCell.fg/bg` (no renderer change involved) — the default
-/// fg/bg, a `palette` slot (SGR 31 is ANSI index 1), and a `palette` entry
-/// layered OVER a named theme's slot (last-wins: the theme seeds all 16
-/// slots, then `palette[i]` overwrites slot `i`, S8).
+/// A config colour flows config → engine → the rendered `RenderCell.fg/bg`: the default
+/// fg/bg, a `palette` slot (SGR 31 is ANSI index 1), and a `palette` entry layered over a
+/// named theme's slot (the theme seeds all 16 slots, then `palette[i]` overwrites slot `i`).
 #[test]
 fn theme_colors_reach_rendercell() {
     use aterm_core::terminal::Terminal;
@@ -1674,11 +1664,10 @@ fn font_px_precedence_flag_beats_config_beats_default() {
     assert!(font_px_is_explicit_with(Some(24.0), Some(9999.0)));
 }
 
-/// The reload engine path genuinely re-themes a live terminal: applying a new
-/// `applied_terminal_config` recolours already-rendered default cells, and
-/// reverting the key reverts the colour — exactly what `App::reload_config` does
-/// to every session via `apply_config`. Crucially, the revert lands on the theme
-/// background, never spec-black (the black-backed-text fix).
+/// The reload engine path re-themes a live terminal: applying a new `applied_terminal_config`
+/// recolours already-rendered default cells, and reverting the key reverts the colour, as
+/// `App::reload_config` does to every session via `apply_config`. The revert lands on the
+/// theme background, never spec-black.
 #[test]
 fn reload_retheme_then_revert_live_terminal() {
     use aterm_core::terminal::Terminal;
@@ -1812,7 +1801,7 @@ fn a_hit_that_straddles_a_soft_wrap_is_found_once_at_the_row_it_starts_on() {
     );
 
     // Both halves round-trip through the selection the find bar arms: the far
-    // anchor is the end column DIVIDED by the width, so it lands on row 1.
+    // anchor is the end column divided by the width, so it lands on row 1.
     let (row, c0, c1) = matches[0];
     let cols = usize::from(term.lock().unwrap().grid().cols());
     let mut t = term.lock().unwrap();
@@ -1826,14 +1815,9 @@ fn a_hit_that_straddles_a_soft_wrap_is_found_once_at_the_row_it_starts_on() {
     assert_eq!(t.selection_to_string().as_deref(), Some("wrapmatch"));
 }
 
-/// R15 content-4: a VS16 base in the last column of a soft-wrapped row stays
-/// one cell wide (the grid has no room to widen it), so the row is exactly
-/// the grid's width. Find reports every hit on the run's later rows in the
-/// cells the grid drew it in, on the screen and after the run scrolls into
-/// history: each reported span selects exactly the needle. On origin/main
-/// the joined run measured one column wider than its stride per such row, so
-/// `Q` was reported one cell right, `Y` (the last column) at column 0 of the
-/// next row, and `Z` two cells right after the second such row.
+/// A VS16 base in the last column of a soft-wrapped row stays one cell wide (the grid has no
+/// room to widen it), so the row keeps the grid's width: every hit on the run's later rows, on
+/// screen and in history, is reported in the cells it is drawn in.
 #[test]
 fn a_vs16_base_left_narrow_in_the_last_column_keeps_the_runs_stride() {
     use crate::app_search::map_matches;
@@ -1908,10 +1892,10 @@ fn a_vs16_base_left_narrow_in_the_last_column_keeps_the_runs_stride() {
     );
 }
 
-/// The join pads a continued row back out to the grid's width before it
-/// appends the next one. Grid rows are read TRIMMED, so without that padding
-/// a run whose row ends in blanks would splice its neighbour's first column
-/// onto its last non-blank one — inventing a match that is not on the glass.
+/// The join pads a continued row back out to the grid's width before it appends the next
+/// one. Grid rows are read trimmed, so without that padding a run whose row ends in blanks
+/// would splice its neighbour's first column onto its last non-blank one, inventing a match
+/// that is not on the glass.
 #[test]
 fn a_soft_wrap_does_not_splice_a_match_across_the_blanks_at_a_row_end() {
     use crate::control::search_full_history;
@@ -1967,18 +1951,14 @@ fn url_detection_in_text() {
     assert_eq!(url_at("ftp://x.y not-a-link", 0), None);
 }
 
-/// A detected URL is as long as what the row PAINTS, and says when any of
-/// it is painted faintly. Concealed text (SGR 8) keeps its characters in
-/// the grid but paints with its own background, so `google.com` followed
-/// by a hidden `.evil.example/login` opens `google.com`, the hidden cells
-/// open nothing, and a minimum-contrast floor does not reveal them. A tail
-/// a shade off its background IS painted — even one step off it (1.002:1
-/// on the default theme's `#111318`) — so it stays in the URL, and below
-/// 3:1 it marks the URL faint, the run that earns the destination caption;
-/// at 3.05:1 it does not. An ordinary URL is not faint, and with the floor
-/// on, a 1.11:1 URL (Dracula's palette black on its own background) is
-/// read the way the renderer lifts it: clickable, and legible enough to
-/// need no caption.
+/// A detected URL is as long as what the row paints, and says when any of it is painted
+/// faintly. Concealed text (SGR 8) keeps its characters but paints in its background, so
+/// `google.com` followed by a hidden `.evil.example/login` opens `google.com`, the hidden cells
+/// open nothing, and a minimum-contrast floor does not reveal them. A tail even one step off
+/// its background (1.002:1 on `#111318`) is painted, so it stays in the URL, and below 3:1 it
+/// marks the URL faint (the run that earns the destination caption); at 3.05:1 it does not.
+/// With the floor on, a 1.11:1 URL (Dracula's palette black on its background) is read as the
+/// renderer lifts it: not faint.
 #[test]
 fn a_plain_url_is_as_long_as_its_ink_and_says_when_the_ink_is_faint() {
     let row_of = |bytes: &str| {
@@ -2050,7 +2030,7 @@ fn safe_url_allowlist() {
     }
 }
 
-// ---- W12: per-window metrics for mixed DPI -----------------------------------
+// Per-window metrics for mixed DPI.
 
 use super::{MetricsView, font_px_for_scale};
 
@@ -2130,7 +2110,7 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
         (app.font_px - MetricsView::for_scale(2.0).font_px).abs() < 0.5,
         "the active font follows the 2× window"
     );
-    // The CRUX: window 0's geometry is UNPERTURBED while the renderer is at 2×.
+    // Window 0's geometry is unperturbed while the renderer is at 2×.
     assert_eq!(
         app.win_cell_size(w0),
         (c0w, c0h),

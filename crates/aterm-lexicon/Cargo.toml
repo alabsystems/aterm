@@ -3,8 +3,7 @@
 
 [package]
 name = "aterm-lexicon"
-# Integration tests are declared below, not discovered: the files are modules of
-# one suite binary where they can share a process. With autotests off a
+# Integration tests are modules of the suite binaries declared below; with autotests off, a
 # `tests/*.rs` file listed nowhere never compiles.
 autotests = false
 version.workspace = true

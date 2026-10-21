@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a pointer report goes, read off each program's own wire: the pane
-//! under the pointer for a gesture that begins nothing, the session a press
-//! went to for its drag and release, one report per position, and the lowest
-//! held button of a chord (bug hunt 8, the mouse lane).
+//! Where a pointer report goes, read off each program's own wire: the pane under the pointer for
+//! a gesture that begins nothing, the session a press went to for its drag and release, one
+//! report per position, and the lowest held button of a chord.
 
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::UnixStream;
@@ -138,10 +137,9 @@ fn window_cell(app: &App, wid: WindowId, session: u64, (row, col): (u16, u16)) -
     (ro + row, co + col)
 }
 
-/// Hover, the wheel and the right, middle and thumb buttons over the pane that
-/// does NOT have focus reach THAT pane's program at its own cell, and the
-/// focused pane's program sees nothing: before, all of it went to the focused
-/// pane at a row clamped onto its top edge (`ESC[<35;6;1M`).
+/// Hover, the wheel and the right, middle and thumb buttons over the pane that does not have
+/// focus reach that pane's program at its own cell, never the focused pane's at a row clamped
+/// onto its top edge.
 #[test]
 fn a_pointer_over_an_unfocused_pane_reaches_that_panes_program_at_its_own_cell() {
     let mut f = stacked();
@@ -182,8 +180,7 @@ fn a_pointer_over_an_unfocused_pane_reaches_that_panes_program_at_its_own_cell()
     );
     assert_eq!(app.windows[&wid].reported_buttons, 0);
 
-    // Negative control: over the focused pane the focused pane's program is
-    // the one addressed, exactly as before.
+    // Negative control: over the focused pane the focused pane's program is the one addressed.
     let over_bottom = window_cell(app, wid, f.bottom, (2, 3));
     move_to(app, wid, over_bottom, 0.0);
     click(app, wid, MouseButton::Right);
@@ -194,9 +191,9 @@ fn a_pointer_over_an_unfocused_pane_reaches_that_panes_program_at_its_own_cell()
     assert_eq!(drain(&mut f.top_wire), "");
 }
 
-/// Side by side, the unfocused RIGHT pane's report is at its own column: the
-/// window cell less the pane's column origin as well as its row origin (the
-/// stacked fixture has no column offset to get wrong).
+/// Side by side, the unfocused right pane's report is at its own column: the window cell less
+/// the pane's column origin as well as its row origin (the stacked fixture has no column offset
+/// to get wrong).
 #[test]
 fn a_pointer_over_an_unfocused_pane_beside_the_focused_one_reports_its_own_column() {
     let (mut left_wire, left_sink) = observer();
@@ -223,8 +220,8 @@ fn a_pointer_over_an_unfocused_pane_beside_the_focused_one_reports_its_own_colum
     assert_eq!(drain(&mut left_wire), "");
 }
 
-/// With no program tracking the mouse, the wheel over the unfocused pane scrolls
-/// THAT pane's history, never the focused pane's.
+/// With no program tracking the mouse, the wheel over the unfocused pane scrolls that pane's
+/// history, never the focused pane's.
 #[test]
 fn a_wheel_over_an_unfocused_pane_scrolls_that_panes_history() {
     let mut f = stacked();
@@ -258,11 +255,8 @@ fn a_wheel_over_an_unfocused_pane_scrolls_that_panes_history() {
     assert_eq!(drain(&mut f.bottom_wire), "");
 }
 
-/// A glide the wheel started on the unfocused pane survives what the FOCUSED
-/// pane does next: a key typed there (its press runs
-/// `drop_front_scroll_motion`) and its snap to live. Before, the window's one
-/// glide was dropped whatever pane it scrolled, and the notch not yet eased in
-/// was lost.
+/// A glide the wheel started on the unfocused pane survives what the focused pane does next: a
+/// key typed there (its press runs `drop_front_scroll_motion`) and its snap to live.
 #[test]
 fn a_glide_on_the_unfocused_pane_survives_typing_in_the_focused_one() {
     let mut f = stacked();
@@ -328,15 +322,14 @@ fn a_pointer_over_a_native_sibling_addresses_no_terminal() {
     let cell = (rect.origin.y as u16 + 2, rect.origin.x as u16 + 2);
     move_to(&mut app, wid, cell, 0.0);
     assert_eq!(app.pointer_route(wid, None), PointerRoute::Nowhere);
-    // …and over the focused terminal it is the front, as always.
+    // …and over the focused terminal it is the front.
     let (ro, co, ..) = app.focused_pane_rect(wid);
     move_to(&mut app, wid, (ro + 1, co + 1), 0.0);
     assert_eq!(app.pointer_route(wid, None), PointerRoute::Front);
 }
 
-/// A press's drag and release follow the session it went to when the keyboard
-/// moves focus to the other pane mid-drag: before, both went to the newly
-/// focused pane, which never saw the press.
+/// A press's drag and release follow the session it went to when the keyboard moves focus to
+/// the other pane mid-drag; the newly focused pane never saw the press.
 #[test]
 fn a_held_buttons_drag_and_release_stay_with_its_pane_across_a_focus_move() {
     let mut f = stacked();
@@ -396,10 +389,9 @@ fn a_tab_switch_releases_a_held_button_to_the_tab_it_leaves() {
     assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
 }
 
-/// A two-button chord under DEC 1002 names the LOWEST held button in its motion
-/// (xterm's `FirstBitN`), and releasing one button keeps the other's drag
-/// reported: before, motion named the last press, and the first release made
-/// every later motion buttonless, which 1002 drops.
+/// A two-button chord under DEC 1002 names the lowest held button in its motion (xterm's
+/// `FirstBitN`), and releasing one button keeps the other's drag reported (a buttonless motion,
+/// which 1002 drops, would end it).
 #[test]
 fn a_chords_motion_names_the_lowest_held_button_until_its_release() {
     let (mut wire, sink) = observer();
@@ -427,10 +419,10 @@ fn a_chords_motion_names_the_lowest_held_button_until_its_release() {
     assert_eq!(app.windows[&wid].held_mouse_button, None);
 }
 
-/// Motion is reported once per position (xterm: "only if the mouse pointer has
-/// moved to a different character cell"): pixel moves inside one cell repeat
-/// nothing, a drag that never leaves the pressed cell reports no motion, and
-/// under DEC 1016 every new pixel IS a new position.
+/// Motion is reported once per position (xterm: "only if the mouse pointer has moved to a
+/// different character cell"): pixel moves inside one cell repeat nothing, a drag that never
+/// leaves the pressed cell reports no motion, and under DEC 1016 every new pixel is a new
+/// position.
 #[test]
 fn motion_reports_once_per_position() {
     let (mut wire, sink) = observer();
@@ -472,12 +464,10 @@ fn motion_reports_once_per_position() {
     );
 }
 
-/// A right-click copy/paste over the UNFOCUSED pane is decided by that pane's
-/// program and acts on that pane: the clipboard is pasted into it (focused
-/// first, as Windows Terminal and kitty focus on any press), its selection is
-/// what is copied, and the focused pane's mouse-tracking program gets neither
-/// a paste nor a report. Before, the decision read the pane under the pointer
-/// and the paste went to the focused pane.
+/// A right-click copy/paste over the unfocused pane is decided by that pane's program and acts
+/// on that pane: the clipboard is pasted into it (focused first, as Windows Terminal and kitty
+/// focus on any press), its selection is what is copied, and the focused pane's mouse-tracking
+/// program gets neither a paste nor a report.
 #[test]
 fn a_right_click_copy_or_paste_acts_on_the_pane_under_the_pointer() {
     let mut f = stacked();
@@ -531,8 +521,8 @@ fn a_right_click_copy_or_paste_acts_on_the_pane_under_the_pointer() {
     crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
 }
 
-/// Over a native pane no terminal is under the pointer, so a right-click
-/// copy/paste pastes into none: before, it pasted into the focused terminal.
+/// Over a native pane no terminal is under the pointer, so a right-click copy/paste pastes into
+/// none.
 #[test]
 fn a_right_click_over_a_native_pane_pastes_into_no_terminal() {
     let (mut wire, sink) = observer();
@@ -569,10 +559,8 @@ fn a_right_click_over_a_native_pane_pastes_into_no_terminal() {
     crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
 }
 
-/// A gesture held over the UNFOCUSED pane stays that pane's: the second button
-/// of its chord, a wheel notch during it and its drag all reach the program
-/// that got the first press. Before, a held button routed everything to the
-/// focused pane at a cell clamped onto its top edge.
+/// A gesture held over the unfocused pane stays that pane's: the second button of its chord, a
+/// wheel notch during it and its drag all reach the program that got the first press.
 #[test]
 fn a_gesture_held_over_an_unfocused_pane_keeps_its_chord_wheel_and_drag() {
     let mut f = stacked();
@@ -604,10 +592,8 @@ fn a_gesture_held_over_an_unfocused_pane_keeps_its_chord_wheel_and_drag() {
     assert_eq!(app.windows[&wid].reported_buttons, 0);
 }
 
-/// A release after the keyboard moved focus INTO the pane that has the press,
-/// with the pointer still, lands on the cell the pointer is on, and so does a
-/// wheel notch after it: before, both used a cell clamped into the pane focus
-/// had left (`ESC[<2;6;1m`).
+/// A release after the keyboard moved focus into the pane that has the press, with the pointer
+/// still, lands on the cell the pointer is on, and so does a wheel notch after it.
 #[test]
 fn a_release_after_a_keyboard_focus_move_lands_on_the_pointers_cell() {
     let mut f = stacked();
@@ -655,8 +641,8 @@ fn a_tab_switch_releases_at_the_last_cell_the_drag_reached() {
     assert_eq!(drain(&mut wire_b), "");
 }
 
-/// A trackpad's sub-row scroll over the UNFOCUSED pane moves that pane's
-/// history band, as its whole rows do.
+/// A trackpad's sub-row scroll over the unfocused pane moves that pane's history band, as its
+/// whole rows do.
 #[test]
 fn a_trackpad_band_over_an_unfocused_pane_moves_that_panes_history() {
     let mut f = stacked();
@@ -724,10 +710,10 @@ fn a_wheel_on_the_next_pane_lands_the_glide_it_interrupts() {
     );
 }
 
-/// A release that goes to a pane BEHIND the front (its press's owner, after a
-/// keyboard focus move), from a program that has since stopped tracking the
-/// mouse, runs no local gesture: it leaves the front's pointer cell alone, so
-/// the next wheel notch over the front reports where the pointer is.
+/// A release that goes to a pane behind the front (its press's owner, after a keyboard focus
+/// move), from a program that has since stopped tracking the mouse, runs no local gesture: it
+/// leaves the front's pointer cell alone, so the next wheel notch over the front reports where
+/// the pointer is.
 #[test]
 fn a_release_to_a_pane_behind_the_front_leaves_the_fronts_pointer_cell() {
     let mut f = stacked();
@@ -779,9 +765,9 @@ fn a_wheel_report_is_a_position_for_the_next_motion() {
     assert_eq!(drain(&mut wire), "\x1b[<64;8;5M");
 }
 
-/// A hover report to the UNFOCUSED pane's program leaves the focused pane's
-/// typed-move licence alive (that program's bytes cannot move the front's
-/// caret); a report to the focused pane's own program still retires it.
+/// A hover report to the unfocused pane's program leaves the focused pane's typed-move licence
+/// alive (that program's bytes cannot move the front's caret); a report to the focused pane's
+/// own program still retires it.
 #[test]
 fn a_hover_report_to_a_sibling_keeps_the_fronts_typed_move_licence() {
     let mut f = stacked();

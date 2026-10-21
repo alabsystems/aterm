@@ -3,10 +3,13 @@
 
 //! THE PROGRAM'S OWN STATE (OSC 7501, the native harness contract §6): what a
 //! `codex` in front says about itself, shown as `status program_state=`, in
-//! the needs border's hover (`presence::state_line`), as one `program-state` row on the session's timeline per
-//! move the gate shows (`SessionTimeline::note_program_state`: `timeline` is
-//! then the program's turn ledger), and as the edge an `fx celebrate on=done`
-//! arm waits for (`App::note_program_done`), and NOTHING ELSE.
+//! the needs border's hover (`presence::state_line`), as one `program-state`
+//! row on the session's timeline per move the gate shows
+//! (`SessionTimeline::note_program_state`: `timeline` is then the program's
+//! turn ledger) and, in the same hold, one `program` mark in the session log
+//! (`mark <run|-> program state= [ask=] [coalesced=] src=engine conf=claim`,
+//! phase 6 step 6F-4), and as the edge an `fx celebrate on=done` arm waits
+//! for (`App::note_program_done`), and NOTHING ELSE.
 //!
 //! The engine keeps each session's last report with a sequence
 //! (`aterm_core::terminal::program_state`). This gate, run by the status sweep
@@ -22,11 +25,25 @@
 //!   sweeps cannot be distinguished. `state=clear` and a full reset clear the
 //!   engine's report.
 //!
-//! It is a claim for display. It never reaches `agent=`, `agent_since_ms=`,
-//! `phase_authoritative`, the zone hash an act reads, nor any `await`: nothing
-//! here is read by a decision (the timeline row and the celebration are
-//! display too), and the verdict those carry stays the screen reader's. A report the sweep did not see (one superseded between two
-//! sweeps) is simply not shown; the next one is.
+//! It is a claim. It never reaches `agent=`, `agent_since_ms=`,
+//! `phase_authoritative` nor the zone hash an act reads: no decision of
+//! aterm's reads it (the timeline row and the celebration are display), and
+//! the verdict those carry stays the screen reader's. It is NO LONGER DISPLAY
+//! ONLY (6F-4, ruling U17, T24's reversal): its log mark is a fact a consumer
+//! may wait on (`await log kind=program`, `subscribe … log`), written through
+//! a per-run bucket that coalesces a flap to its latest state and never drops
+//! the newest; the log's fold never reads it, `brief` prints none, and it
+//! stays on this host. A report the sweep did not see (one superseded between
+//! two sweeps) is simply not shown; the next one is.
+//!
+//! ONE FACT BESIDE THE SHOWN REPORT: the engine's count of the turns its
+//! reports began (`ProgramStateReport::turns`), as the sweep last read it
+//! ([`ProgramStateGate::turns`]), whatever the gate shows. It is counted as
+//! each report is parsed, so a turn that began and ended between two sweeps
+//! still moves it, where the shown report does not. A proven self-claim's
+//! landing reopens at one past the count its landing was recorded over
+//! (`App::reopen_self_claim_landing`): the task's face, never a typing
+//! decision.
 
 use std::time::Instant;
 
@@ -53,6 +70,9 @@ pub(crate) struct ProgramStateGate {
     turn_starts: u64,
     /// When the gate counted the latest of those starts.
     turn_started: Option<Instant>,
+    /// The engine's count of turns begun (`ProgramStateReport::turns`) at the
+    /// last sweep's reading, honoured or not (the module doc).
+    turns: u64,
 }
 
 impl ProgramStateGate {
@@ -67,6 +87,7 @@ impl ProgramStateGate {
         group_moved: bool,
         now: Instant,
     ) -> bool {
+        self.turns = report.turns;
         if group_moved {
             // Discard reports already seen under the previous group. An
             // unseen report remains eligible; its writer is not attributable.
@@ -123,6 +144,12 @@ impl ProgramStateGate {
     /// The report shown, and since when.
     pub(crate) fn shown(&self) -> Option<(ProgramState, Instant)> {
         self.shown
+    }
+
+    /// The engine's count of turns begun as the last sweep read it, whatever
+    /// the gate shows (the module doc).
+    pub(crate) fn turns(&self) -> u64 {
+        self.turns
     }
 }
 

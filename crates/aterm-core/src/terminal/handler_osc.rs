@@ -74,8 +74,8 @@ impl TerminalHandler<'_> {
             // OSC 1337 (iTerm2): only `File=` inline images; other sub-commands
             // are ignored.
             1337 => self.handle_osc_1337(params),
-            // OSC 7501: the program's own lifecycle state, kept for display only
-            // (`program_state.rs`).
+            // OSC 7501: the program's own lifecycle state, kept for the host to
+            // show and log as a claim (`program_state.rs`).
             7501 => self.handle_osc_7501(params),
             30001 => self.handle_osc_30001(),
             30101 => self.handle_osc_30101(),
@@ -84,8 +84,8 @@ impl TerminalHandler<'_> {
     }
 
     /// OSC 7501 (`state=<word>:app=codex[:kind=<k>]`, `state=clear`): the
-    /// program's own state report, kept as one value for display
-    /// ([`super::program_state`]). The body is one parameter: a `;` inside it
+    /// program's own state report, kept as one value for the host to show
+    /// and log as a claim ([`super::program_state`]). The body is one parameter: a `;` inside it
     /// makes it no report, never one read from its first half.
     fn handle_osc_7501(&mut self, params: &[&[u8]]) {
         let [_, body] = params else {

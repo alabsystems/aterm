@@ -1,43 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The comment-preserving document model — aterm's replacement for `toml_edit`.
+//! The comment-preserving document model (replaces `toml_edit`).
 //!
-//! # Why a second model exists next to [`crate::Value`]
+//! [`crate::from_str`] keeps only what a file means. This model keeps what it says: the
+//! original text of every token and of the whitespace and comments between tokens, plus byte
+//! spans. The Preferences window uses it to rewrite only the keys a user changed, the config
+//! editor to underline a diagnostic's token. Rendering is concatenation, so parse then print
+//! is the identity by construction.
 //!
-//! [`crate::from_str`] answers "what does this file MEAN": it throws away
-//! comments, key order, quoting style, and whitespace, because a
-//! `#[derive(Deserialize)]` struct has nowhere to put them. Three jobs in aterm
-//! need the opposite answer — what the file SAYS, byte for byte:
-//!
-//! * the Preferences window writes back only the keys the user touched and must
-//!   leave every other line of `aterm.toml` exactly as it was found;
-//! * the config editor underlines diagnostics, which needs the byte span of the
-//!   offending token, not its value;
-//! * `targo --unverified forge` rewrites `vendor/forge.toml` and asserts the round-trip does
-//!   not move a single byte.
-//!
-//! So this module parses into a tree that keeps the ORIGINAL text of every
-//! token and every run of whitespace and comments between tokens. Rendering is
-//! concatenation, which is what makes "parse then print is the identity" a
-//! structural property rather than a hope.
-//!
-//! # The formatting model
-//!
-//! Every node carries a [`Decor`]: the raw text immediately BEFORE it
-//! (`prefix`) and immediately AFTER it (`suffix`). Whitespace, newlines, and
-//! comments all live in one of those two strings, owned by whichever node they
-//! precede or follow, so no byte of the source is unaccounted for.
-//!
-//! aterm's decor differs from `toml_edit`'s in exactly one deliberate way: the
-//! LINE TERMINATOR belongs to the suffix. `toml_edit` writes the newline from
-//! the encoder and so cannot represent a file whose last line has none; folding
-//! it into the suffix makes the encoder a pure `concat` and makes round-trip
-//! exact for those files too.
-//!
-//! A `None` prefix/suffix means "this node was built, not parsed — use the
-//! canonical spacing for its position", which is how a freshly inserted key
-//! comes out as `key = value` and not `key=value`.
+//! Every node carries a [`Decor`]: the raw text immediately before it (`prefix`) and after it
+//! (`suffix`), so every source byte belongs to some node. Unlike `toml_edit`, the line
+//! terminator belongs to the suffix, so a file whose last line has no newline round-trips
+//! too. A `None` side means the node was built, not parsed: the encoder uses the canonical
+//! spacing for its position (`key = value`, not `key=value`).
 
 mod document;
 mod encode;
@@ -56,11 +32,6 @@ pub(crate) use parse::{ParseLimits, parse_document};
 
 /// Raw, unparsed source text: a run of whitespace, newlines, and comments, or
 /// the verbatim spelling of a scalar.
-///
-/// It is a distinct type rather than a bare `String` for the same reason
-/// `toml_edit` makes one — so a `set_prefix("junk")` reads as a formatting
-/// operation at the call site, and so the crate can later validate that what a
-/// caller injects is actually whitespace/comment without a breaking change.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RawString(String);
 
@@ -273,35 +244,21 @@ impl ValueRepr for crate::Datetime {
 
 /// One segment of a key: what it means, and how it was spelled.
 ///
-/// Equality, ordering, and hashing are on the DECODED text only, so
-/// `"font-px"`, `'font-px'`, and `font-px` are the same key — which is what the
-/// spec says and what duplicate detection has to agree with.
+/// Equality, ordering, and hashing use the decoded text only, so `"font-px"`, `'font-px'`,
+/// and `font-px` are the same key, as the spec and duplicate detection require.
 #[derive(Debug, Clone)]
 pub struct Key {
     key: String,
     repr: Option<Repr>,
     decor: Decor,
     span: Option<Range<usize>>,
-    /// The verbatim text of the key-value LINE this key leads, when it was
-    /// parsed as the leaf of one.
-    ///
-    /// This is the crate's answer to a problem a per-segment decor model cannot
-    /// solve. `a.b = 1` and `a.c = 2` share one `a` node in the tree, so the two
-    /// lines' leading comments and indentation have nowhere separate to live if
-    /// formatting hangs off path segments. Anchoring the whole authored path on
-    /// the LEAF — which is unique per line, because a duplicate leaf is a parse
-    /// error — makes round-trip exact by construction: the head is literally the
-    /// source bytes from the start of the line's trivia to the leaf key.
+    /// The authored text of the key-value line this key is the leaf of. Dotted lines
+    /// (`a.b = 1`, `a.c = 2`) share their parent nodes, so each line's trivia lives on its leaf,
+    /// which is unique per line (a duplicate leaf is a parse error).
     pub(crate) path_repr: Option<PathRepr>,
-    /// Where this key's LINE stood among the document's key-value lines.
-    ///
-    /// Dotted keys share their parent nodes, so tree order alone cannot tell
-    /// `net.listen` / `font_px` / `net.timeout_ms` apart from the same three
-    /// lines regrouped — and regrouping a user's file is exactly what the
-    /// non-destructive-save contract forbids. Flattening sorts on this.
-    /// `usize::MAX` means "not authored", which sends programmatically inserted
-    /// keys to the end of their table rather than into the middle of someone
-    /// else's lines.
+    /// Position of this key's line among the document's key-value lines. Dotted keys share
+    /// parent nodes, so flattening sorts on this to keep the authored line order. `usize::MAX`
+    /// (not authored) sends inserted keys to the end of their table.
     pub(crate) order: usize,
 }
 
@@ -339,11 +296,8 @@ impl Key {
         }
     }
 
-    /// Split a dotted key EXPRESSION (`a.b."c.d"`) into its segments.
-    ///
-    /// This is the parser, not a `split('.')`: a dot inside a quoted segment is
-    /// part of the name, and the segments come back with their authored
-    /// spellings intact.
+    /// Split a dotted key (`a.b."c.d"`) into its segments, each with its authored spelling; a
+    /// dot inside a quoted segment is part of the name.
     ///
     /// # Errors
     /// If `repr` is not a syntactically valid TOML key.

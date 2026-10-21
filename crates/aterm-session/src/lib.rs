@@ -8,15 +8,14 @@
 //! Hierarchical-session routing fabric: the per-edge authority and write seam
 //! (`docs/design/HIERARCHICAL_SESSIONS.md` §§2, 4, 6.3, 7).
 //!
-//! It lets one terminal drive another: stable [`SessionId`]s and per-launch
-//! [`LaunchNonce`]s ([`id`]); the per-edge, op-scoped, fail-closed authority
-//! table ([`Op`]/[`Edge`]/[`EdgeToken`]/[`EdgeTable`]/[`decide_edge`]); and the
-//! single byte sink that serializes every writer to one PTY master with
-//! whole-frame atomicity ([`sink::SinkWriter`]), which also dates the input the
-//! program at that master has not read yet ([`input_backlog`]).
+//! Stable [`SessionId`]s and per-launch [`LaunchNonce`]s; the per-edge, op-scoped,
+//! fail-closed authority table ([`EdgeTable`], [`decide_edge`]); and the single byte
+//! sink that serializes every writer to one PTY master with whole-frame atomicity
+//! ([`sink::SinkWriter`]) and dates the input its program has not read yet
+//! ([`input_backlog`]).
 //!
-//! It does no filesystem or socket I/O (headless invariant): the GUI owns those
-//! and calls into this policy and serialization core.
+//! No filesystem or socket I/O (headless invariant): the GUI owns those and calls
+//! into this core.
 //!
 //! ## Status
 //!
@@ -29,8 +28,8 @@
 //! over the uid-checked control socket and is sound independently of the mint.
 
 #![forbid(unsafe_code)]
-// Under the Trust verifier, register the `trust` tool namespace so the
-// `trust::skip` on `fill_random` resolves; inert under plain rustc.
+// Under the Trust verifier, register the `trust` tool namespace so the crate's
+// `trust::skip`/`trust::paired` attributes resolve; inert under plain rustc.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
@@ -123,12 +122,10 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         // verifier treats as an absent callee; `*x ^ *y` is the primitive op.
         diff |= *x ^ *y;
     }
-    // No `std::hint::black_box`, unlike aterm's other constant-time comparators:
-    // it is a Rust-ABI callee with no body in the verification bundle, which
-    // would cost this crate proofs against its floor in
-    // aterm-release's `trust/floors.tsv`. The loop compiles branch-free (it exits
-    // only on the index bound); if that stops holding, add the barrier and
-    // re-measure the proved count.
+    // No `std::hint::black_box`, unlike aterm's other constant-time comparators: it
+    // has no body in the verification bundle and would cost proofs against this
+    // crate's floor in aterm-release's `trust/floors.tsv`. The loop compiles
+    // branch-free; if that stops holding, add the barrier and re-measure.
     diff == 0
 }
 

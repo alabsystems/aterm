@@ -5,18 +5,19 @@
 # THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
 # crates/aterm-windows-sys-052: `[patch.crates-io]` matches on PACKAGE name,
 # so this must be called `windows-sys` to take the `windows-sys = "0.61"`
-# edges of winit (crates/aterm-window), softbuffer and aterm-http, and the
-# directory keeps the `aterm-` prefix so it reads as ours
+# edges of winit (crates/aterm-window) and softbuffer, and the directory
+# keeps the `aterm-` prefix so it reads as ours
 # (docs/AUDIT-third-party-2026-10-15.md, windows-bindings step 3).
+# aterm-http and aterm-net, which asked `^0.61` here, name aterm-win32
+# directly since WB.2 (the audit's section 5.5).
 name = "windows-sys"
 # NOT `version.workspace = true`: a SEMVER CONTRACT with the consumers, not an
-# aterm release number. winit and softbuffer ask `^0.61.2`, aterm-http and
-# aterm-net `^0.61`, and no lock-only parent is left (async-io, async-signal,
-# errno, polling, rustix 1.x, tempfile, uds_windows and zbus have all left the
-# lock; rustix, errno and polling at linux-windowing LW.7); 0.61.2 is
-# what the lock held, so the lock's version line does not move. A registry
-# 0.61.x above it would outrank the patch (`targo --unverified forge check`
-# [OB-12] fails if one does).
+# aterm release number. winit and softbuffer ask `^0.61.2`, and no lock-only
+# parent is left (async-io, async-signal, errno, polling, rustix 1.x,
+# tempfile, uds_windows and zbus have all left the lock; rustix, errno and
+# polling at linux-windowing LW.7); 0.61.2 is what the lock held, so the
+# lock's version line does not move. A registry 0.61.x above it would outrank
+# the patch (`targo --unverified forge check` [OB-12] fails if one does).
 version = "0.61.2"
 # NOT A WORKSPACE MEMBER, so no field is inherited: cargo refuses two members
 # of one package name ("two packages named `windows-sys` in this workspace"),
@@ -60,10 +61,7 @@ Win32_Graphics = ["Win32"]
 Win32_Graphics_Dwm = ["Win32_Graphics"]
 Win32_Graphics_Gdi = ["Win32_Graphics"]
 Win32_Media = ["Win32"]
-Win32_Networking = ["Win32"]
-Win32_Networking_WinSock = ["Win32_Networking"]
 Win32_Security = ["Win32"]
-Win32_Security_Cryptography = ["Win32_Security"]
 Win32_System = ["Win32"]
 Win32_System_Com = ["Win32_System"]
 Win32_System_Com_StructuredStorage = ["Win32_System_Com"]

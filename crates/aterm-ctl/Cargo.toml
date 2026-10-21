@@ -16,17 +16,15 @@ description = "aterm — a std-only command-line client for the aterm introspect
 [[bin]]
 name = "aterm-ctl"
 path = "src/main.rs"
-# No test lives in main.rs (no #[test], no cfg(test), no `mod`); its libtest
-# harness ran 0 tests in every gate. Integration tests still get the binary.
+# main.rs holds no tests; integration tests still get the binary.
 test = false
 
 [dependencies]
-# Engine-side socket naming/discovery decisions, shared with the server so
-# the two can never drift. Platform-free; no external dependencies.
+# Workspace crates only: this binary has no third-party dependencies.
+#
+# Socket naming and discovery, shared with the server so the two cannot drift.
 aterm-types = { workspace = true }
-# The portable control-socket stream + `latest`-alias resolution (std Unix
-# sockets on Unix; AF_UNIX-over-winsock on Windows). Workspace crate, std-only
-# — this binary stays free of third-party dependencies.
+# The portable control-socket stream and `latest`-alias resolution.
 aterm-uds = { workspace = true }
 # The control wire's percent escape (`sessions` titles, `conn`), the one copy
 # the server's `aterm_control::wire::pct_*` re-export. Workspace crate: std plus
@@ -38,16 +36,12 @@ aterm-codec = { workspace = true }
 amacs = { workspace = true }
 
 [dev-dependencies]
-# Scratch directories removed on drop (the tests' sockets live in them).
-# Workspace crate, std-only, zero dependencies.
+# Scratch directories for the tests' sockets, removed on drop.
 aterm-tempfile = { workspace = true }
-# The tests' scratch-directory stamp: the workspace's one epoch-clock read, already
-# in the graph via aterm-types.
+# The tests' scratch-directory stamp.
 aterm-time = { workspace = true }
 
-# A real terminal for tests/terminal_output.rs: the CLI's stdout or stderr on a pty
-# slave, both ends close-on-exec from birth (`open_pty_pair`), as atpkg-keys'
-# pty fixture does. Workspace crate, already in the workspace graph.
+# tests/terminal_output.rs puts the CLI's stdout or stderr on a real pty.
 [target.'cfg(unix)'.dev-dependencies]
 aterm-pty = { workspace = true }
 

@@ -22,9 +22,12 @@
 //! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
 //!   permission-mode row: model + effort, working directory, branch, read
 //!   from the files Claude Code already keeps.
-//! * [`spend`] — the dated list-price table and the Codex conversation fold
-//!   used by `harness usage`; unknown models and token classes stay unpriced.
-//!   It does not scan account homes or estimate remaining account capacity.
+//! * [`spend`] — THE DOLLAR FIGURES of the account stats: every transcript
+//!   of a Claude Code home folded into list-price dollars per time bucket
+//!   (the shipped, dated `prices.toml`, injected), kept with byte cursors in
+//!   a spend file so a second fold reads only appended bytes, and a window's
+//!   capacity (`C ≥ $ ÷ used`) and what is left (`≈ C × (1 − used)`). A leaf
+//!   that nothing deciding anything imports.
 //! * [`session_usage`] — THIS session's usage, one implementation for the
 //!   footer and `harness usage`: its tokens per model, folded incrementally
 //!   from its own transcript and its subagents' (live), and the limit wall
@@ -119,6 +122,14 @@
 //!   Fable, from the `.claude.json` of a home, and the account's key hashed
 //!   from its id — never a field off the list, so never the credentials
 //!   that file can hold. `accounts stats` prints it.
+//! * [`account_stats`] — THE ACCOUNT STATS OF ONE MACHINE
+//!   (`docs/DESIGN-account-stats-2026-10-15.md` §3, §7): the view `accounts
+//!   stats` prints — each window's figure from every source by one merge
+//!   rule, current or void at its own reset, cut by a limit reset used inside
+//!   it, with its `as of`, source and machine; the plan, the credits, the
+//!   Fable week as last seen, list-price dollars, the sessions on it, its
+//!   login — every empty figure with the closed word that says why. A leaf
+//!   that nothing deciding anything imports.
 //! * [`acts`] — WHAT THE HARNESS JUST DID, AND HOW A LANDING ENDED, in the
 //!   words the window shows (`docs/DESIGN-harness-autopilot-2026-10-15.md`
 //!   §9): an act the Autopilot chip lights for a moment, the page's counter
@@ -148,18 +159,18 @@
 //! Nothing here has run against a REAL exhausted window: the `/usage` panel
 //! reader is exercised against captured and hand-built fixtures.
 
-/// The harness's mark as a literal ([`upgrade::HARNESS_MARK`] is this), for
-/// the texts `concat!` builds on it: every turn the harness types into an
-/// agent's conversation begins with it.
+/// [`upgrade::HARNESS_MARK`] as a literal for `concat!`: every turn the harness
+/// types into an agent's conversation begins with it.
 macro_rules! harness_mark {
     () => {
         "[aterm harness]"
     };
 }
-// By path too, for the texts built outside this module on the same mark (the
-// turn-end policy's land instruction, `supervise::policy::turn_end::LAND`).
+// Exported by path for texts built on the mark outside this module
+// (`supervise::policy::turn_end::LAND`).
 pub(crate) use harness_mark;
 
+pub mod account_stats;
 pub mod accounts;
 pub mod accounts_sync;
 pub mod acts;
@@ -168,6 +179,7 @@ pub mod cli;
 pub mod codex_alab;
 pub mod codex_rollout;
 pub mod codex_steps;
+pub mod codex_tap;
 pub mod disk;
 pub mod drive_retention;
 pub mod excerpt;
@@ -208,13 +220,8 @@ pub mod upgrade_muse_live;
 pub mod upgrade_wake;
 pub mod usage;
 
-/// The longest prefix of `s` that is at most `max` BYTES and ends on a
-/// character boundary — never a split character, whatever the input.
-///
-/// Every reader in this module quotes text it did not write (a command line,
-/// a banner, a transcript field) into a bounded ledger row, and each one used
-/// to carry its own copy of this walk-back. This is the one copy; a caller
-/// that wants an ellipsis appends its own.
+/// The longest prefix of `s` that is at most `max` bytes and ends on a
+/// character boundary. A caller that wants an ellipsis appends its own.
 pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -240,11 +247,9 @@ pub(crate) fn one_line(text: &str, max: usize) -> String {
         .to_string()
 }
 
-/// Whether [`one_line`] would hand `text` back as it is: printable ASCII
-/// (nothing a fold turns into a space, nothing `trim` takes), no space at
-/// either end and no two together. A roster label, a session id or a
-/// window's name is such a word, and the roster folds each one every time it
-/// is read or written.
+/// Whether [`one_line`] would hand `text` back as it is: printable ASCII, no
+/// space at either end and no two together. The fast path for roster labels,
+/// session ids and window names, folded on every read and write.
 fn is_one_line_already(text: &str) -> bool {
     let mut spaced = true;
     for &b in text.as_bytes() {
@@ -256,11 +261,11 @@ fn is_one_line_already(text: &str) -> bool {
     !spaced || text.is_empty()
 }
 
-// Each control fixture owns a listener, cancellation pipe and connected
-// sockets, alongside the processes its caller may be observing. Bound those
-// fixtures before opening descriptors; the default test runner can otherwise
-// crowd out the real process/record reads that guard a restart. One caller
-// may keep several instances alive, so its instances share a reentrant lease.
+// Each control fixture holds a listener, a cancellation pipe and connected
+// sockets. Admission bounds how many are live at once, taken before any
+// descriptor opens, so parallel tests cannot crowd out the descriptors the real
+// process and record reads that guard a restart need. The lease is per thread
+// and reentrant: one test may hold several fixtures.
 #[cfg(all(test, unix))]
 struct FakeInstanceLease;
 
@@ -347,14 +352,13 @@ impl Drop for FakeInstanceLease {
     }
 }
 
-/// A control socket at `sock` standing in for an aterm instance, for tests:
-/// its token, `token`, written where a client reads it, each connection
-/// opened with `AUTH <token>` (acknowledged with nothing, as the server does;
-/// any other first line drops the connection), and every request after it
-/// answered with `answer`'s reply and logged, in order, into the list
-/// returned beside the socket's path. That log owns the server: retain it
-/// through the fixture's client uses, then dropping its last copy closes the
-/// listener and any active client and joins the server, including on unwind.
+/// A test control socket at `sock` standing in for an aterm instance: `token`
+/// written where a client reads it, each connection required to open with
+/// `AUTH <token>` (acknowledged with nothing, as the server does; any other
+/// first line drops it), and every later request answered with `answer`'s reply
+/// and logged in order into the returned log. The log owns the server: keep it
+/// alive while the test uses the socket; dropping its last copy closes the
+/// listener and any client and joins the server thread, on unwind too.
 #[cfg(all(test, unix))]
 pub(crate) fn fake_instance(
     sock: &std::path::Path,
@@ -496,7 +500,7 @@ struct FakeInstanceServer {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cancel: Option<std::io::PipeWriter>,
     join: Option<std::thread::JoinHandle<()>>,
-    // Released after Drop has canceled and joined the descriptor owner.
+    // Released only after `drop` has cancelled and joined the server thread.
     _lease: std::sync::Arc<FakeInstanceLease>,
 }
 
@@ -507,8 +511,8 @@ impl Drop for FakeInstanceServer {
         self.stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(client) = self.active.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            // Each half separately: on Darwin Both may refuse a half-closed
-            // peer and shut neither half, leaving its BufReader parked.
+            // Each half separately: on Darwin `Both` may refuse a half-closed
+            // peer and shut neither half, leaving the server's reader parked.
             let _ = client.shutdown(std::net::Shutdown::Write);
             let _ = client.shutdown(std::net::Shutdown::Read);
         }
@@ -571,14 +575,12 @@ mod tests {
         // `U+2028` is Zl, not Cc: a `char::is_control()` sweep would pass it.
         assert_eq!(one_line("a\u{2028}b", 99), "a b");
         assert_eq!(one_line("a\u{2029}b", 99), "a b");
-        // The cut is a BYTE cut on a character boundary, taken before the
+        // The cut is a byte cut on a character boundary, taken before the
         // fold, and it never splits a character.
         assert_eq!(one_line("abcdef", 3), "abc");
         assert_eq!(one_line("é😀", 2), "é");
         assert_eq!(one_line("", 0), "");
-        // A word handed back as it is reads exactly as the fold reads it, and
-        // every near miss (a space at an end, two together, a control, a
-        // non-ASCII space, a cut) takes the fold.
+        // The fast path agrees with the fold, and every near miss takes the fold.
         for (text, max) in [
             ("work", 80),
             ("a@b.example", 80),

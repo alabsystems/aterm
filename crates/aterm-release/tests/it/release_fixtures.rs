@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release's own handoff fixtures ([`crate::fixtures`]): staged once per reserved
-//! identity by the in-tree generator (a fake runner here, writing what the generator
-//! writes), refused when the generator refuses or leaves a required desk out, and
-//! landed on origin/main with their `PINNED_DESKS` rows by a compare-and-swap push —
-//! REAL git against a local bare origin, a rival's push landed between the fetch and
-//! the push to make the race deterministic, as `ledger_race` does for the claim.
+//! The release's handoff fixtures ([`crate::fixtures`]): staged once per reserved identity by
+//! the generator (a fake runner here), refused when it refuses or leaves a required desk out,
+//! and landed on origin/main with their `PINNED_DESKS` rows by a compare-and-swap push. Real
+//! git against a local bare origin; a rival's push between fetch and push makes the race
+//! deterministic.
 
 use aterm_uds::spawnfd::Command;
 use std::cell::{Cell, RefCell};
@@ -14,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use crate::fixtures::{self, Landed, Pins};
+use crate::fixtures::{self, Answers, Landed, Pins};
 use crate::gates::{HANDOFF_FIXTURE_GUARD, HANDOFF_FIXTURE_ROOT};
 use crate::ledger::testing::Git;
 use crate::ledger::{GitRunner, RunOut};
@@ -22,6 +21,17 @@ use crate::ledger::{GitRunner, RunOut};
 const GUARD: &str = "// the guard\nconst PINNED_DESKS: &[(&str, &str)] = &[\n    (\"v0.5.0\", \"history\"),\n];\n\nconst REQUIRED_DESKS: &[(&str, &str)] = &[\n    (\"v0.5.0\", \"history\"),\n];\n";
 
 const RELEASE: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+/// The shipped-state corpus's header, as the serde corpus writes it (four comment lines).
+const HEADER: &str = "# serde corpus `shipped-state`: one case per line.\n# ok: the value.\n# escapes.\n# FNV-1a digest and length.\n";
+
+/// Main's shipped-state corpus: v0.5.0's one desk, then the negative control.
+fn corpus() -> String {
+    format!(
+        "{HEADER}v0.5.0/history/manifest\tok\tfnv1a64:5 len=5\n\
+         negative-control/torn-manifest\terr\tTOML parse error\n"
+    )
+}
 
 fn pins(build: u64) -> Pins {
     Pins {
@@ -81,6 +91,9 @@ impl Origin {
         fs::create_dir_all(&old).unwrap();
         fs::write(old.join("parent.toml"), "producer_version = \"0.5.0\"\n").unwrap();
         fs::write(rival.join("README.md"), "aterm\n").unwrap();
+        let answers = rival.join(fixtures::SHIPPED_STATE_CORPUS);
+        fs::create_dir_all(answers.parent().unwrap()).unwrap();
+        fs::write(&answers, corpus()).unwrap();
         git(&rival, &["add", "-A"]);
         git(&rival, &["commit", "-q", "-m", "seed"]);
         git(&rival, &["push", "-q", "-u", "origin", "main"]);
@@ -124,13 +137,25 @@ fn passed() -> String {
     )
 }
 
-/// A runner that does what the generator does: the desks `desks` and the rendezvous
-/// record, each written as the pins in its environment say.
+/// The shipped-state answers the generator writes for `desks`: main's corpus as the cut's
+/// tree reads it, with v0.6.0's cases after v0.5.0's.
+fn staged_answers(desks: &[&str]) -> String {
+    let cases: String = desks
+        .iter()
+        .map(|desk| format!("v0.6.0/{desk}/manifest\tok\tfnv1a64:6 len=6\n"))
+        .collect();
+    corpus().replacen("negative-control/", &format!("{cases}negative-control/"), 1)
+}
+
+/// A runner that does what the generator does: the desks `desks`, the rendezvous record and
+/// the shipped-state answers, each written as the pins in its environment say.
 fn generator<'a>(
     desks: &'a [&'a str],
     runs: &'a Cell<usize>,
 ) -> impl FnMut(&mut Command) -> std::io::Result<Output> + 'a {
     move |cmd: &mut Command| {
+        let answers = PathBuf::from(env_of(cmd, fixtures::ANSWERS_OUT).unwrap());
+        fs::write(answers, staged_answers(desks)).unwrap();
         runs.set(runs.get() + 1);
         let args: Vec<String> = cmd
             .get_args()
@@ -221,6 +246,29 @@ fn a_generator_that_refuses_or_leaves_a_required_desk_out_stages_nothing() {
     let mut partial = generator(&["held-pane"], &runs);
     fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut partial).unwrap_err();
     assert!(fixtures::staged(&root, &pins(7)).is_none());
+
+    // a generator that wrote the desks and no answers for them (an older tree's)
+    let mut unanswered = |cmd: &mut Command| {
+        let out = generator(&["history"], &runs)(cmd);
+        let answers = PathBuf::from(env_of(cmd, fixtures::ANSWERS_OUT).unwrap());
+        fs::write(answers, corpus()).unwrap();
+        out
+    };
+    let refused = fixtures::stage(
+        Path::new("targo"),
+        &o.work,
+        &root,
+        &pins(7),
+        &mut unanswered,
+    )
+    .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("it wrote no shipped-state answers for v0.6.0's desks"),
+        "{refused}"
+    );
+    assert!(fixtures::staged(&root, &pins(7)).is_none());
 }
 
 #[test]
@@ -236,10 +284,29 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         .to_string();
 
     let landed = fixtures::land(&work, &staged, &pins(7), 5).unwrap();
-    let Landed::Pushed { commit, attempt } = &landed else {
+    let Landed::Pushed {
+        commit,
+        attempt,
+        answers,
+    } = &landed
+    else {
         panic!("{landed:?}");
     };
     assert_eq!(*attempt, 1);
+    assert_eq!(*answers, Answers::Recorded(2));
+    // the release's cases recorded where main's sweep reads them: after v0.5.0's, before the
+    // negative control
+    assert_eq!(
+        String::from_utf8(o.on_main(fixtures::SHIPPED_STATE_CORPUS)).unwrap(),
+        staged_answers(&["history", "twelve-panes"])
+    );
+    assert!(
+        landed
+            .words(&pins(7))
+            .contains("with its 2 shipped-state answers"),
+        "{}",
+        landed.words(&pins(7))
+    );
     let grid = format!("{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/s0.grid");
     assert_eq!(
         o.on_main(&grid),
@@ -254,7 +321,7 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         ),
         "{guard}"
     );
-    // one commit on the tip, moving nothing but the fixtures and the rows
+    // one commit on the tip, moving nothing but the fixtures, the rows and the answers
     git(&o.work, &["fetch", "-q", "origin", "main"]);
     assert_eq!(
         git(&o.work, &["rev-parse", "origin/main"]).trim(),
@@ -267,7 +334,14 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
     let moved = git(&o.work, &["diff", "--name-only", &before, commit]);
     assert!(
         moved.lines().all(|path| path == HANDOFF_FIXTURE_GUARD
+            || path == fixtures::SHIPPED_STATE_CORPUS
             || path.starts_with(&format!("{HANDOFF_FIXTURE_ROOT}/v0.6.0/"))),
+        "{moved}"
+    );
+    assert!(
+        moved
+            .lines()
+            .any(|path| path == fixtures::SHIPPED_STATE_CORPUS),
         "{moved}"
     );
     assert_eq!(
@@ -391,5 +465,89 @@ fn a_fixture_directory_on_main_the_gate_refuses_is_never_overwritten() {
             "{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml"
         )),
         b"by hand\n"
+    );
+}
+
+/// The release's cases go after the case they follow in the cut's answers, found by its id in
+/// main's corpus, so an answer main re-recorded since the cut stays as main holds it; a corpus
+/// that cannot take them, or answers that are not one block after a line, are named.
+#[test]
+fn the_release_answers_go_after_the_case_they_follow_and_a_corpus_that_cannot_take_them_is_named() {
+    let staged = staged_answers(&["history", "twelve-panes"]);
+    let (merged, cases) = fixtures::with_release_answers(&corpus(), &staged, "v0.6.0").unwrap();
+    assert_eq!((merged.as_str(), cases), (staged.as_str(), 2));
+
+    let moved = corpus().replace("fnv1a64:5 len=5", "fnv1a64:55 len=55");
+    let (merged, _) = fixtures::with_release_answers(&moved, &staged, "v0.6.0").unwrap();
+    assert_eq!(
+        merged,
+        format!(
+            "{HEADER}v0.5.0/history/manifest\tok\tfnv1a64:55 len=55\n\
+             v0.6.0/history/manifest\tok\tfnv1a64:6 len=6\n\
+             v0.6.0/twelve-panes/manifest\tok\tfnv1a64:6 len=6\n\
+             negative-control/torn-manifest\terr\tTOML parse error\n"
+        ),
+        "main's answer kept, the release's after it"
+    );
+
+    let refused = |corpus: &str, staged: &str| {
+        fixtures::with_release_answers(corpus, staged, "v0.6.0")
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(refused(&staged, &staged).contains("records v0.6.0 already"));
+    let lost = corpus().replace("v0.5.0/history/manifest\tok\tfnv1a64:5 len=5\n", "");
+    assert!(refused(&lost, &staged).contains("holds 0 lines with the case id they go after"));
+    assert!(refused(&corpus(), &corpus()).contains("hold no case of its desks"));
+    let apart = staged.replacen("v0.6.0/twelve-panes/manifest\tok\tfnv1a64:6 len=6\n", "", 1)
+        + "v0.6.0/twelve-panes/manifest\tok\tfnv1a64:6 len=6\n";
+    assert!(refused(&corpus(), &apart).contains("apart, not as one block"));
+    let first = format!("v0.6.0/history/manifest\tok\tfnv1a64:6 len=6\n{}", corpus());
+    assert!(refused(&corpus(), &first).contains("before the file's header"));
+}
+
+/// A tip whose corpus cannot take the release's answers (here it lost the case they follow)
+/// still gets the desks and their rows: the commit leaves the corpus as main holds it, and
+/// the landing says the answers are not recorded.
+#[test]
+fn a_landing_whose_corpus_cannot_take_the_answers_lands_the_desks_and_says_so() {
+    let o = Origin::new();
+    let answers = o.rival.join(fixtures::SHIPPED_STATE_CORPUS);
+    let lost = corpus().replace("v0.5.0/history/manifest\tok\tfnv1a64:5 len=5\n", "");
+    fs::write(&answers, &lost).unwrap();
+    git(&o.rival, &["commit", "-q", "-am", "a peer's re-record"]);
+    git(&o.rival, &["push", "-q", "origin", "main"]);
+    let runs = Cell::new(0);
+    let mut run = generator(&["history"], &runs);
+    let staged = fixtures::stage(
+        Path::new("targo"),
+        &o.work,
+        &o.stage_root(),
+        &pins(7),
+        &mut run,
+    )
+    .unwrap();
+    let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5).unwrap();
+    let Landed::Pushed { answers, .. } = &landed else {
+        panic!("{landed:?}");
+    };
+    assert!(
+        matches!(answers, Answers::Unrecorded(why) if why.contains("the case id they go after")),
+        "{answers:?}"
+    );
+    assert!(
+        landed
+            .words(&pins(7))
+            .contains("WITHOUT its shipped-state answers"),
+        "{}",
+        landed.words(&pins(7))
+    );
+    assert_eq!(
+        String::from_utf8(o.on_main(fixtures::SHIPPED_STATE_CORPUS)).unwrap(),
+        lost
+    );
+    assert_eq!(
+        o.on_main(&format!("{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/s0.grid")),
+        [0u8, 159, 146, 150, 10]
     );
 }

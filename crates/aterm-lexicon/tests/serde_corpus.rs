@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The lexicon, exceptions and tricks documents under the mutations the
-//! first-party serde must answer exactly as registry serde did
-//! (docs/AUDIT-third-party-2026-10-15.md, SP.3). Every table is
-//! `deny_unknown_fields`, the reviewer `notes` ride a `rename` into a field
-//! never read, `mode` defaults through a function, and `user` is `skip`.
+//! The lexicon, exceptions and tricks documents under mutations, against recorded answers the
+//! first-party serde must reproduce. Every table is
+//! `deny_unknown_fields`, the reviewer `notes` ride a `rename` into a field never read, `mode`
+//! defaults through a function, and `user` is `skip`.
 //!
-//! The models are private and not `Serialize`; an `Ok` is recorded as what the
-//! build made of it: the sorted surface forms with their class, the species
-//! and the conflicts for a lexicon, and the rows' `Debug` for tricks.
+//! The models are private and not `Serialize`, so an `Ok` records what the build made of it: the
+//! sorted surfaces with their class, the species and the conflicts for a lexicon, and the rows'
+//! `Debug` for tricks.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;

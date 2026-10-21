@@ -1,47 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE METER'S HUE (docs/DESIGN-unified-messages-2026-09-21.md, ruling 250):
-//! which of the theme's own colours a band meter's fill wears, decided here —
-//! host-agnostic, on plain sRGB bytes — so every host paints the same bar.
+//! The meter's hue (docs/DESIGN-unified-messages-2026-09-21.md): which of the theme's
+//! own colours a band meter's fill wears, decided on plain sRGB bytes so every host
+//! paints the same bar.
 //!
-//! The fill is the theme's cursor, the owner's "cursor trail theme" (ruling
-//! 137). Most schemes set the cursor to their foreground, a near-grey, and
-//! then the bar was a grey slab: on Solarized Light the round-12 judge saw it
-//! and asked the owner. The owner chose ("Borrow theme blue/cyan",
-//! 2026-09-25): *use the theme's own ANSI blue or cyan when the cursor is
-//! near-grey, so the bar keeps colour and life; every other theme keeps the
-//! cursor-trail colour.*
+//! The fill is the theme's cursor. Most schemes set the cursor to their foreground, a
+//! near-grey ([`NEAR_GREY_CHROMA`]), and there the bar borrows the theme's ANSI blue or
+//! cyan so it keeps colour. Blue is taken when one of the band's word inks (the
+//! terminal's and the band's grounds and the band's value ink) reads on it at WCAG AA;
+//! else cyan when cyan does; else whichever the words read better on (the host still
+//! floors each word to AA on the fill). A candidate under [`BORROW_CHROMA`] is never
+//! borrowed, so a monochrome palette keeps its cursor.
 //!
-//! *Near-grey* is measured, not guessed: a cursor whose `OkLCh` chroma is under
-//! [`NEAR_GREY_CHROMA`]. Across the built-in schemes the cursors fall in two
-//! groups with the widest gap of the whole set between them — the foregrounds
-//! and their tints at 0.007–0.057 (Gruvbox Light, Nord, Dracula, Solarized
-//! Dark, One Dark, Catppuccin Mocha's rosewater, Solarized Light, Gruvbox
-//! Dark's cream) and the real accents at 0.104–0.220 (Catppuccin Latte's
-//! rosewater, Tokyo Night's blue, GitHub's blue, the default green) — and the
-//! threshold sits in the middle of that gap.
-//!
-//! *Blue, else cyan:* the borrowed hue must carry the band's words. Blue is
-//! taken when one of the band's own word inks (the host passes them: the
-//! terminal's and the band's grounds and the band's value ink) reads on it at
-//! WCAG AA as it is; else cyan when cyan does; else whichever of the two the
-//! words read better on (the host still floors each word to AA on it, as on
-//! any fill). A candidate with no colour of its own — under
-//! [`BORROW_CHROMA`] — is never borrowed (a monochrome palette keeps its
-//! cursor); Nord's frost blue (0.059) is a colour, a grey ANSI slot is not.
-//!
-//! *The pastel fill* (ruling 264, a default the supervisor took that the owner
-//! can overrule): a hue the band's 3:1 floor would darken into brown keeps its
-//! own pastel, and a darker edge line carries the boundary ([`keeps_pastel`],
-//! [`pastel_edge`]) — Catppuccin Latte's rosewater, which the floor made a
-//! brick bar.
+//! A hue the band's 3:1 floor would darken into brown keeps its own pastel and a darker
+//! edge line carries the boundary ([`keeps_pastel`], [`pastel_edge`]).
 
 use crate::ink::contrast;
 
-/// A cursor at an `OkLCh` chroma under this is NEAR-GREY (ruling 250): its bar
-/// borrows the theme's blue or cyan. The middle of the widest gap in the
-/// built-in schemes' cursor chromas (0.057 → 0.104).
+/// A cursor at an `OkLCh` chroma under this is near-grey: its bar borrows the theme's
+/// blue or cyan. The middle of the widest gap in the built-in schemes' cursor chromas
+/// (0.057 → 0.104).
 pub const NEAR_GREY_CHROMA: f64 = 0.08;
 
 /// The least `OkLCh` chroma a borrowed blue or cyan must have: half the
@@ -64,9 +43,9 @@ pub enum MeterHue {
 }
 
 impl MeterHue {
-    /// The hue a meter's fill wears for a theme whose cursor is `cursor` and
-    /// whose ANSI blue and cyan are `blue` and `cyan`, where `words` are the
-    /// inks the band writes on a fill (ruling 250).
+    /// The hue a meter's fill wears for a theme whose cursor is `cursor` and whose ANSI
+    /// blue and cyan are `blue` and `cyan`, where `words` are the inks the band writes on
+    /// a fill.
     #[must_use]
     pub fn pick(cursor: [u8; 3], blue: [u8; 3], cyan: [u8; 3], words: &[[u8; 3]]) -> Self {
         if !near_grey(cursor) {
@@ -105,55 +84,37 @@ impl MeterHue {
     }
 }
 
-/// THE OUTLINE'S HUE (design ruling 260): a metered row's outlined Primary
-/// rings and labels in the meter's hue floored to AA on its inside — and a
-/// WARM hue floored that far reads BROWN (Catppuccin Latte's rosewater cursor
-/// darkened for its label is a terracotta ring around a brown word, the look
-/// round 13 flagged). Brown is measured, not guessed: an `OkLCh` hue between
-/// 20 and 110 degrees (orange through olive) at a lightness under 0.62,
-/// with colour of its own
-/// ([`BORROW_CHROMA`]). Such an outline borrows the theme's ANSI blue — the
-/// accent family every built-in scheme's blue belongs to — when the blue has
-/// colour of its own and does not read brown itself; else it keeps the meter.
-/// The FILL is not moved by this: it keeps its own pastel and a darker edge
-/// ([`keeps_pastel`], ruling 264).
+/// Whether a metered row's outlined Primary borrows the theme's ANSI blue: its ring and
+/// label wear the meter's hue floored to AA on the outline's inside, and a warm hue
+/// floored that far reads brown. The blue is borrowed when it has colour of its own
+/// ([`BORROW_CHROMA`]) and does not read brown itself; else the outline keeps the meter.
 ///
-/// `floored` is the label as the host floors it (the meter's hue at AA on
-/// the outline's inside); `blue_floored` the blue floored the same way.
+/// `floored` is the label as the host floors it; `blue_floored` the blue floored the
+/// same way.
 #[must_use]
 pub fn outline_borrows_blue(floored: [u8; 3], blue: [u8; 3], blue_floored: [u8; 3]) -> bool {
     reads_brown(floored) && chroma(blue) >= BORROW_CHROMA && !reads_brown(blue_floored)
 }
 
-/// THE PASTEL FILL (design ruling 264 — a default the supervisor took, the
-/// owner can overrule it): a meter hue the band's 3:1 non-text floor would
-/// darken into BROWN keeps its own pastel for the FILL, and a darker EDGE line
-/// at the fill's end carries the boundary the floor was there for. Catppuccin
-/// Latte's rosewater cursor is the one built-in case: floored, it was a brick
-/// bar; as the theme gives it, it is the theme's own soft rose, and the words
-/// on it are floored to AA against it as on any fill.
-///
-/// `hue` is the meter's hue as the theme gives it (the cursor, or the blue or
-/// cyan it borrows); `floored` is that hue as the host floors it on the band.
-/// The pastel is kept exactly when the floor MOVED a hue that does not read
-/// brown into one that does ([`reads_brown`]) — so a hue the floor leaves
-/// alone, a cool hue, or one already dark keeps its floored fill, byte for
-/// byte.
+/// Whether a meter fill keeps its own pastel: the band's 3:1 non-text floor would darken
+/// `hue` (the theme's cursor, or the blue or cyan it borrows) into brown, so the fill
+/// stays as the theme gives it and a darker edge line ([`pastel_edge`]) carries the
+/// boundary. True exactly when the floor moved a hue that does not read brown
+/// ([`reads_brown`]) into one that does (`floored`, as the host floors it on the band);
+/// otherwise the floored fill stands byte for byte. Catppuccin Latte's rosewater is the
+/// one built-in case.
 #[must_use]
 pub fn keeps_pastel(hue: [u8; 3], floored: [u8; 3]) -> bool {
     floored != hue && reads_brown(floored) && !reads_brown(hue)
 }
 
-/// The contrast the pastel fill's EDGE line stands from the track beside it:
-/// the non-text floor (WCAG 1.4.11), the boundary the pastel alone cannot
-/// carry.
+/// The contrast a pastel fill's edge line stands from the track: the WCAG 1.4.11
+/// non-text floor.
 pub const EDGE_CONTRAST: f64 = 3.0;
 
-/// The darker EDGE of a pastel fill ([`keeps_pastel`]): `fill` moved in LINEAR
-/// light toward the far end of the scale from `track` — its chromaticity
-/// kept, only its lightness moved, so it reads as the same rose deepened — by
-/// the least amount that stands it [`EDGE_CONTRAST`]:1 from the track.
-/// `fill` itself where it already does.
+/// The edge line of a pastel fill ([`keeps_pastel`]): `fill` mixed in linear light toward
+/// black (toward white when the fill is the lighter of the two) by the least amount that
+/// stands it [`EDGE_CONTRAST`]:1 from `track`; `fill` itself where it already does.
 #[must_use]
 pub fn pastel_edge(fill: [u8; 3], track: [u8; 3]) -> [u8; 3] {
     if contrast(fill, track) >= EDGE_CONTRAST {
@@ -177,15 +138,15 @@ pub fn pastel_edge(fill: [u8; 3], track: [u8; 3]) -> [u8; 3] {
     at(hi)
 }
 
-/// The warm hues that darken into brown: orange through olive, in `OkLCh`
-/// degrees.
+/// The lower end of the warm hues that darken into brown (orange through olive), in
+/// `OkLCh` degrees.
 pub(crate) const WARM_HUE_MIN: f64 = 20.0;
-/// …the other end.
+/// The upper end of those warm hues.
 pub(crate) const WARM_HUE_MAX: f64 = 110.0;
 /// Below this `OkLCh` lightness a warm hue reads brown, not orange or gold.
 pub(crate) const BROWN_LIGHTNESS: f64 = 0.62;
 
-/// Whether `c` reads BROWN (ruling 260): a warm `OkLCh` hue, dark, with colour.
+/// Whether `c` reads brown: a warm `OkLCh` hue, dark, with colour.
 #[must_use]
 pub fn reads_brown(c: [u8; 3]) -> bool {
     let (l, ch, h) = oklch(c);
@@ -239,11 +200,10 @@ pub fn oklab_distance(a: [u8; 3], b: [u8; 3]) -> f64 {
     (p[0] - q[0]).hypot(p[1] - q[1]).hypot(p[2] - q[2])
 }
 
-/// The WCAG relative luminance of an sRGB colour, with a FUSED weighted sum.
+/// The WCAG relative luminance of an sRGB colour, with a fused weighted sum.
 ///
-/// The band's SIDE decisions (which end of the scale a word or a fill sits
-/// toward) read this luminance, as they always have. Every contrast RATIO is
-/// [`contrast`], `aterm_types::Rgb`'s unfused arithmetic (ruling 438).
+/// The band's side decisions (which end of the scale a word or a fill sits toward) read
+/// this; every contrast ratio is [`contrast`], `aterm_types::Rgb`'s unfused arithmetic.
 #[must_use]
 pub fn luminance(c: [u8; 3]) -> f64 {
     let [r, g, b] = c.map(lin);
@@ -350,9 +310,8 @@ mod tests {
         );
     }
 
-    /// BROWN IS MEASURED (ruling 260): a warm hue gone dark reads brown; the
-    /// same hue light, a cool hue dark, or a grey does not. Catppuccin
-    /// Latte's rosewater floored for a label is brown; its blue is not.
+    /// A warm hue gone dark reads brown; the same hue light, a cool hue dark, or a grey
+    /// does not.
     #[test]
     fn a_dark_warm_hue_reads_brown_and_borrows_blue() {
         assert!(reads_brown([0x8b, 0x4a, 0x2b]), "a saddle brown");
@@ -373,11 +332,9 @@ mod tests {
         ));
     }
 
-    /// THE PASTEL FILL (ruling 264): Latte's rosewater, which the 3:1 floor
-    /// on its light band darkens to a brick that reads brown, keeps its own
-    /// pastel; a hue the floor leaves alone, a cool hue floored, and a hue
-    /// already brown do not. Its edge is the same rose deepened until it
-    /// stands 3:1 from the track, and reads darker than the fill.
+    /// Latte's rosewater, floored to brown on its light band, keeps its pastel; an
+    /// unfloored hue, a cool hue and an already-brown hue do not. The edge is the same
+    /// hue deepened to the least 3:1 from the track.
     #[test]
     fn a_warm_pastel_floored_brown_keeps_its_fill_and_takes_a_darker_edge() {
         let rosewater = [0xdc, 0x8a, 0x78];

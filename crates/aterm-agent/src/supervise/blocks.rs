@@ -9,15 +9,13 @@
 //! found by
 //! what it starts with:
 //! * `❯` in column 0, then whitespace: the user's turn ([`BlockKind::User`]);
-//! * `⏺` (or `●`; never the session survey) in column 0: the worker's message
-//!   ([`BlockKind::Message`]) or a tool row ([`BlockKind::Tool`]): a call as
-//!   the phase reader reads one ([`is_tool_call`]: `⏺ Bash(…`, one to three
-//!   capitalised words run into `(`, an MCP tool `⏺ <server> - <title>
-//!   (MCP)(…)`, an integration's `⏺ Claude in Chrome[<tool>](…)`), one of
-//!   Claude Code's notices (`NOTICE_HEADS`), or a head whose `⎿` output is
-//!   on the next row and which does not end like a sentence;
-//! * a shell-mode command in column 0 (`! cmd`, or `❯ !cmd`): a tool row, its
-//!   output under it, never the person's words;
+//! * `⏺` (or `●`; never the session survey) in column 0: a tool row
+//!   ([`BlockKind::Tool`]) when it is a call ([`is_tool_call`]), one of Claude
+//!   Code's notices (`NOTICE_HEADS`), or a head whose `⎿` output is on the next
+//!   row and which does not end like a sentence; else the worker's message
+//!   ([`BlockKind::Message`]);
+//! * a shell-mode command in column 0 (`! cmd`, or `❯ !cmd`): a tool row, never the user's
+//!   turn;
 //! * a spinner glyph in column 0: a done row ending a turn
 //!   ([`BlockKind::Done`]) or a status row still in flight
 //!   ([`BlockKind::Status`]);
@@ -210,10 +208,9 @@ fn head_kind(rows: &[String], i: usize) -> Option<BlockKind> {
     is_group_row(row).then_some(BlockKind::Summary)
 }
 
-/// Whether the `⏺` row at `i` is a tool call or a notice, not the worker's
-/// words (see the module doc). A call is the phase reader's
-/// ([`is_tool_call`]): one reader of "a call" for both, so a report and the
-/// wall placement never disagree about whose words a `⎿` block holds.
+/// Whether the `⏺` row at `i` is a tool call or a notice, not the worker's words. A call is
+/// what [`is_tool_call`] reads, so a report and the wall placement agree on whose words a `⎿`
+/// block holds.
 fn is_tool_head(rows: &[String], i: usize) -> bool {
     let text = rows[i].trim_start_matches(['⏺', '●']).trim_start();
     if NOTICE_HEADS.iter().any(|h| text.starts_with(h)) || is_tool_call(&rows[i]) {
@@ -369,9 +366,8 @@ mod tests {
         blocks(&r).iter().map(|b| (b.kind, b.start)).collect()
     }
 
-    /// The heads as a live worker's archive draws them: a message, a call, a
-    /// notice, a tool shown by its description, a collapsed group right under
-    /// a message row, a done row and a status row.
+    /// A message, a call, a notice, a tool shown by its description, a group under a message
+    /// row, a done row and a status row.
     #[test]
     fn each_head_opens_its_kind_of_block() {
         use BlockKind::*;
@@ -413,9 +409,8 @@ mod tests {
         );
     }
 
-    /// A message's own rows are never heads: its wrapped rows, a paragraph
-    /// after a blank row, a sentence that starts like a group but is prose,
-    /// a call-shaped word in a sentence, a bullet, a table.
+    /// A message's own rows are never heads: wrapped rows, a paragraph after a blank row, prose
+    /// that starts like a group, a call-shaped word in a sentence, a bullet, a table.
     #[test]
     fn a_messages_rows_stay_in_its_block() {
         for row in [
@@ -442,9 +437,7 @@ mod tests {
         );
     }
 
-    /// The two views on a turn: `--final` is the last message and the done
-    /// row that ended it; `--messages` every message and user block and done
-    /// row, no tool, group or status row and no `⎿` output.
+    /// The two views on one turn ([`view_rows`]).
     #[test]
     fn the_views_keep_what_was_said() {
         let r = rows(&[

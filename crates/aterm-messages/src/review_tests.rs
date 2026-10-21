@@ -483,6 +483,9 @@ fn a_flood_keeps_every_bound() {
                             finished: rng
                                 .chance(10)
                                 .then(|| rng.chance(50).then(|| rand_str(&mut rng, 300))),
+                            short_title: rng
+                                .chance(10)
+                                .then(|| rng.chance(50).then(|| rand_str(&mut rng, 300))),
                             actions: rng.chance(20).then(|| {
                                 (0..rng.below(5))
                                     .map(|_| pool[rng.below(pool.len())].clone())

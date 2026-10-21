@@ -527,15 +527,17 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
     );
 
     // AND THE SEQUENCE DID NOT REPEAT. Every publish of the new incarnation is
-    // above `(inc << 32)`, so no record of it can collide with — and be deduped
-    // away by — a record of the old one.
+    // above the old one's will, the top of its space in astream's layout
+    // (`astream_broker::will_seq`), so no record of it can collide with — and be
+    // deduped away by — a record of the old one.
     let seq: u64 = std::fs::read_to_string(w.state.join("seq"))
         .expect("the restart reserved a sequence")
         .trim()
         .parse()
         .expect("a number");
+    let old_top = astream_broker::will_seq(second_inc).expect("an attached incarnation");
     assert!(
-        seq > (second_inc << 32) | 0xFFFF_FFFF,
+        seq > old_top,
         "the new incarnation's sequences must be above the old one's reserved top: {seq}"
     );
 }

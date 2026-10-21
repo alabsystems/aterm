@@ -120,6 +120,15 @@ pub struct TerminalFacts {
     /// ([`crate::companion::CompanionOwner::prepare`]). A host that hands the
     /// pet no hidden caret passes `false`.
     pub frame_unfinished: bool,
+    /// The terminal's count of synchronized-output closes
+    /// ([`Terminal::sync_end_seq`]), read under the same lock: a program
+    /// that brackets its frames moves it on with every frame it finishes.
+    /// [`Self::sync_end_caret`] identifies where that frame ended: output
+    /// after the close may already have moved the current caret elsewhere.
+    pub sync_end_seq: u64,
+    /// The latest close's cell on this screen/grid, read under the same lock
+    /// ([`Terminal::sync_end_caret`]); `None` after an invalidating boundary.
+    pub sync_end_caret: Option<(u16, u16)>,
     pub display_offset: i32,
     /// `display_offset == 0`: the viewport is at the live bottom.
     pub live_viewport: bool,
@@ -159,6 +168,8 @@ impl TerminalFacts {
             caret,
             cursor_visible,
             frame_unfinished: term.sync_frame_unfinished(),
+            sync_end_seq: term.sync_end_seq(),
+            sync_end_caret: term.sync_end_caret(),
             display_offset,
             live_viewport,
             content_seq: term.content_seq(),

@@ -130,7 +130,7 @@ fn assert_scrollback_parity_dims(rows: u16, cols: u16, input: &[u8], find: char)
 
 #[test]
 fn scrollback_parity_rows() {
-    // (rows, cols, input, first char of the row). Each row was its own test.
+    // (rows, cols, input, first char of the row).
     let rows: &[(u16, u16, &str, char)] = &[
         // An SMP emoji, a combining mark, a truecolor foreground and a ZWJ
         // family: the extras live in scrollback, not the live extras map, so
@@ -172,8 +172,7 @@ fn scrollback_parity_rows() {
         // blank (a status bar): the materialized row keeps the trailing coloured
         // blanks, as the live row does.
         (6, 80, "Q\x1b[48;2;10;20;30m    \x1b[0m", 'Q'),
-        // Regression guard: naturally-wide + combining (😀 é) stay at full parity
-        // under the whole-RenderCell check.
+        // Naturally wide + combining (😀 é).
         (6, 80, "Q\u{1F600}e\u{0301}Z", 'Q'),
     ];
     for &(rows, cols, input, find) in rows {
@@ -221,11 +220,8 @@ fn assert_scrollback_parity_underline(input: &[u8], find: char, col: usize, expe
 
 #[test]
 fn scrollback_parity_underline_colour_rows() {
-    // (input, first char, column of the underlined cell, its live colour). Each
-    // row was its own test; the helper pins the live colour first, so no row can
-    // pass with both sides None.
-    // SGR 58:5:1 resolves against the live palette; scrolled back it must
-    // resolve to the same entry (the index is preserved).
+    // (input, column of the underlined cell, its live colour); every row starts with 'Q'.
+    // SGR 58:5:1 resolves against the live palette, and scrolled back against the same entry.
     let red = Terminal::new(6, 80).color_palette().get(1);
     let rows: &[(&str, usize, [u8; 3])] = &[
         // SGR 58:2 explicit RGB (packed 0x01) + SGR 4; 'U' sits at col 1.
@@ -304,13 +300,10 @@ fn scrollback_spacer_keeps_lead_underline_colour() {
 
 #[test]
 fn scrollback_spacer_underline_index_reresolves_after_palette_change() {
-    // The spacer's copy must be the packed form, not a frozen RGB triple.
-    // Redefine palette entry 1 after the row scrolls off: both halves of the one
-    // character must re-resolve to the new colour. A mirror reading
-    // `underline_color()` (the RGB-only accessor) would leave the spacer `None`,
-    // because storing an index deliberately clears `HAS_UNDERLINE_COLOR`; one
-    // that resolved the index eagerly would pin the spacer to the old colour
-    // while the lead moved.
+    // The spacer's copy is the packed form, not a frozen RGB triple, so both halves
+    // re-resolve after palette entry 1 changes. A mirror reading `underline_color()` (RGB
+    // only) would leave the spacer `None`, since storing an index clears
+    // `HAS_UNDERLINE_COLOR`; one that resolved the index eagerly would pin the old colour.
     let mut t = Terminal::new(6, 80);
     t.process("Q\u{1b}[4;58:5:1m\u{4E2D}\u{1b}[0mZ".as_bytes());
     t.process(b"\r\n");
@@ -335,11 +328,10 @@ fn scrollback_spacer_underline_index_reresolves_after_palette_change() {
 
 #[test]
 fn vs16_widened_spacer_carries_the_lead_underline_colour_live() {
-    // The law does not care which widening produced the pair. VS16 promotes a
-    // narrow base to two columns after `apply_cell_extras_preflagged` ran with
-    // `cols = 1`; the emoji's right half must still answer the SGR 58 colour,
-    // as a CJK char's does. The history mirror copies the lead unconditionally,
-    // so a live spacer left empty would make history disagree with the screen.
+    // VS16 promotes a narrow base to two columns after `apply_cell_extras_preflagged` ran
+    // with `cols = 1`; the right half still answers the SGR 58 colour, as a CJK char's does.
+    // The history mirror copies the lead unconditionally, so an empty live spacer would make
+    // history disagree with the screen.
     let mut t = Terminal::new(6, 80);
     t.process("Q\u{1b}[4;58:2::0:0:255m\u{2764}\u{FE0F}\u{1b}[0mZ".as_bytes());
     let live = t.cell_frame(6, 80);

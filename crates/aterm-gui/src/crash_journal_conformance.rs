@@ -31,10 +31,14 @@
 //! wherever the model forbids a claim, the real claim is run anyway and must
 //! change nothing.
 //!
-//! NEGATIVE CONTROL: the same real steps against `Buggy = 1` — a claim that
-//! takes a running window's journal, copies instead of renaming, and reopens
-//! whatever it took, and a writer that unlinks before it publishes — must be
-//! rejected: at the claim of a live owner's journal, and at every write.
+//! Each schedule is replayed a second time in which, before each claim, a windowed launch that
+//! does not claim reads (and renames `.seen`) every run's evidence, so the verdict must not
+//! depend on who read it first. Every real step must be a transition the committed model admits
+//! (interpreter, and `ty` where installed), every reached state must satisfy every invariant,
+//! and where the model forbids a claim the real claim runs anyway and must change nothing.
+//!
+//! Negative control: the real steps disagree with `Buggy = 1`
+//! (`the_defects_reject_the_real_steps`).
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -67,9 +71,8 @@ use crate::crash_signal::{MarkerOwner, markers};
 pub(crate) struct Desk {
     dir: aterm_tempfile::TempDir,
     logs: aterm_tempfile::TempDir,
-    /// Pids that WERE processes and are not any more, reaped as first needed:
-    /// a replay names its first run for the first and each successor it adopts
-    /// for the next, so no two runs of one replay share a pid.
+    /// Pids of already-reaped processes, made as first needed: run `k` of a replay is named for
+    /// the `k`th, so no two runs of one replay share a pid.
     pids: Vec<u32>,
 }
 
@@ -90,9 +93,7 @@ impl Desk {
         self.pids[run]
     }
 
-    /// Empty both directories for the next replay, as fresh ones are: every
-    /// entry a replay left is removed, and each directory is then read back
-    /// empty.
+    /// Empty both directories for the next replay, then check each reads back empty.
     fn clear(&self) {
         for dir in [self.dir.path(), self.logs.path()] {
             for entry in std::fs::read_dir(dir).expect("the desk reads") {
@@ -124,8 +125,7 @@ pub(crate) struct Rig {
     runs: usize,
     id: JournalId,
     owner: Option<JournalOwner>,
-    /// TRUTH: the run's crash marker while it exists, and its lock while the
-    /// run lives.
+    /// The run's crash marker while it exists, and its lock while the run lives.
     marker: Option<(PathBuf, Option<OwnedFd>)>,
     /// Before every claim, a windowed launch that does not claim reads every
     /// run's evidence first.
@@ -150,8 +150,7 @@ pub(crate) struct Rig {
     successor: bool,
 }
 
-/// The quit's layout in the rig's directory, where `session.toml` sits beside
-/// the journals.
+/// The quit layout's file, beside the journals in the rig's directory.
 const SESSION: &str = "session.toml";
 
 impl Rig {
@@ -215,11 +214,9 @@ impl Rig {
         self.dir().join(self.id.file_name())
     }
 
-    /// The run starts: its crash marker is armed (empty, locked, the installed
-    /// app's), before its journal, and named for the start the journal is
-    /// named for (`JournalId::of_this_run`). `second`: the journal it
-    /// reopened was a second chance's to give (`Lane::begin_probation`'s
-    /// flag, ruling 285).
+    /// The run starts: its crash marker (empty, locked, the app's) is armed before its journal
+    /// and named for the same start (`JournalId::of_this_run`). `second`: the reopened journal
+    /// was a second chance (`Lane::begin_probation`'s flag).
     fn boot(&mut self, probation: bool, second: bool) {
         let armed = markers::arm(self.logs(), self.id.pid, self.id.nanos, MarkerOwner::App)
             .expect("marker armed");
@@ -233,12 +230,10 @@ impl Rig {
         self.second = second;
     }
 
-    /// THE SUCCESSOR'S COMMIT (`release_committed_readers`, then
-    /// `Lane::adopt_predecessor` at its wake): a new run — its crash marker
-    /// armed at its start, as `boot` arms one — takes the handed-off image
-    /// over onto its own journal by the real `JournalOwner::adopt`, and from
-    /// here the journal is that run's; then, and only then, its readers run
-    /// on the live sessions (round eight of the update audit, finding 45).
+    /// The successor's commit (`release_committed_readers`, then `Lane::adopt_predecessor` at
+    /// its wake): a new run, its marker armed as `boot` arms one, takes the handed-off image
+    /// over onto its own journal by the real `JournalOwner::adopt`; only then do its readers run
+    /// on the live sessions.
     fn adopt(&mut self) {
         let parent = self.id;
         let mut id = JournalId::now(self.desk.pid(self.runs));
@@ -277,12 +272,9 @@ impl Rig {
         self.written = true;
     }
 
-    /// The process ends. `clean`: through an exit path, which removes its
-    /// crash marker before the process goes. Its locks go with it however it
-    /// ends, as the kernel releases a dead process's locks when no child
-    /// forked under them is still short of its `exec`: by `LOCK_UN`, because a
-    /// close alone leaves a lock held in the copy of its description that any
-    /// sibling test's child forked meanwhile keeps until its `exec`.
+    /// The process ends; `clean` means through an exit path, which removes its crash marker.
+    /// Its locks go however it ends, by `LOCK_UN`: a close alone leaves the lock held by any
+    /// sibling test's child forked meanwhile, until that child's `exec`.
     fn end(&mut self, clean: bool) {
         if let Some((path, lock)) = self.marker.as_mut() {
             if clean {
@@ -320,10 +312,9 @@ impl Rig {
         .expect("the quit layout written");
     }
 
-    /// What a later launch reads of the quit's `session.toml` before it claims
-    /// (`restore::take` then `JournalId::parse_stem`, as `main_entry` does):
-    /// read, not taken, so a claim the model forbids, run anyway, leaves it
-    /// for the next.
+    /// The quit's `session.toml` as a later launch reads it before claiming (`main_entry` via
+    /// `restore::take` and `JournalId::parse_stem`), but read, not taken, so a forbidden claim
+    /// run anyway leaves it for the next.
     fn quit_layout(&self) -> QuitLayout {
         let path = self.dir().join(SESSION);
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -342,9 +333,8 @@ impl Rig {
         .holding(&crate::restore::quit_also_of(&text))
     }
 
-    /// A later launch's claim: the real one, over the real directory — after,
-    /// on the consumed pass, an earlier windowed launch that did not claim
-    /// read (and renamed) every run's evidence, as its boot does.
+    /// A later launch's real claim. On the consumed pass, a windowed launch that does not claim
+    /// first reads (and renames) every run's evidence, as its boot does.
     fn claim(&mut self) {
         if self.consumed_first {
             let killed =
@@ -722,10 +712,9 @@ fn the_real_journal_conforms_to_the_model() {
     );
 }
 
-/// NEGATIVE CONTROL: `Buggy = 1` is rejected by the real steps — at the claim
-/// of a running window's journal (the real claim takes nothing: its owner's
-/// lock is held) and at every write (the real publish is one rename, never an
-/// empty name). A pass of the committed model is therefore not vacuous.
+/// Negative control: `Buggy = 1` disagrees with the real steps at a write (the real publish is
+/// one rename), at a claim blind to the quit layout's run, and at the claim of a running
+/// window's journal (its owner's lock is held), so a pass of the committed model is not vacuous.
 #[test]
 fn the_defects_reject_the_real_steps() {
     let buggy = interp::with_buggy(&crash_journal_claim_model(), 1);

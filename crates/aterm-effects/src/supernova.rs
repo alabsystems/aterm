@@ -105,6 +105,26 @@ const COMBO_TIER_WINDOWS: [(u64, u64); COMBO_EXTREME_LEVEL as usize] = [
     (0, 450),
     (0, 0),
 ];
+const _: () = {
+    let mut i = 0;
+    while i < COMBO_TIER_WINDOWS.len() {
+        let (f, n) = COMBO_TIER_WINDOWS[i];
+        assert!(f <= n && n <= 1000, "COMBO_TIER_WINDOWS bucket bounds");
+        if i + 1 < COMBO_TIER_WINDOWS.len() {
+            let (f_next, n_next) = COMBO_TIER_WINDOWS[i + 1];
+            assert!(
+                f_next <= f && n_next < n,
+                "COMBO_TIER_WINDOWS must lower P(Flash) and raise P(Nuke) each level"
+            );
+        }
+        i += 1;
+    }
+    assert!(
+        COMBO_TIER_WINDOWS[COMBO_EXTREME_LEVEL as usize - 1].0 == 0
+            && COMBO_TIER_WINDOWS[COMBO_EXTREME_LEVEL as usize - 1].1 == 0,
+        "COMBO_EXTREME_LEVEL must be 100% Nuke"
+    );
+};
 
 /// Decode the tier from the high half of the birth draw at a combo level;
 /// `level <= 1` uses the base windows.
@@ -267,6 +287,8 @@ impl QuadSink<'_> {
         if x1 <= x0 || y1 <= y0 {
             return;
         }
+        let x0_u = x0 as u16;
+        let w_u = (x1 - x0) as u16;
         let mut yy = y0;
         while yy < y1 {
             if self.budget == 0 {
@@ -276,9 +298,9 @@ impl QuadSink<'_> {
             let band_end = ((row + 1) * self.cell_h).min(y1);
             self.out.push(GlowQuad {
                 row: row as u16,
-                x: x0 as u16,
+                x: x0_u,
                 y: yy as u16,
-                w: (x1 - x0) as u16,
+                w: w_u,
                 h: (band_end - yy) as u16,
                 color: premul,
                 // Additive light: this emitter has no other mode.
@@ -677,10 +699,15 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             .clamp(0, i32::from(env.cols).saturating_sub(width as i32).max(0));
         let mut stamped = 0usize;
         for dr in 0..rows_span {
+            if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
+                break;
+            }
             let r = r0 + dr;
             if r < 0 {
                 continue;
             }
+            let ny = (dr - rows_span / 2) as f32 / (rows_span as f32 / 2.0);
+            let ny2 = ny * ny;
             for dc in 0..width as i32 {
                 if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
                     break;
@@ -688,9 +715,8 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 // Radial (elliptical) falloff from the word centre: alpha peaks
                 // over the word and fades out before the rect edge, so the veil
                 // has no hard rim. Sub-threshold corner stamps are skipped.
-                let ny = (dr - rows_span / 2) as f32 / (rows_span as f32 / 2.0);
                 let nx = (c0 + dc - word_mid) as f32 / (width as f32 / 2.0);
-                let d2 = (nx * nx + ny * ny).min(1.0);
+                let d2 = (nx * nx + ny2).min(1.0);
                 let a = 235.0 * env_a * (1.0 - d2).powf(0.8);
                 if a < 14.0 {
                     continue;
@@ -712,14 +738,18 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         // (as for motes and debris) rather than clamped, so a word near the top
         // never piles stamps onto row 0.
         for point in 0..8 {
+            if out.len() >= cap {
+                break;
+            }
             let ang = core::f32::consts::TAU * point as f32 / 8.0;
+            let (cos_a, sin_a) = (ang.cos(), ang.sin());
             for seg in 1..=3 {
                 if out.len() >= cap {
                     break;
                 }
                 let d = env.r_max * 0.3 * seg as f32;
-                let x = env.cx + (ang.cos() * d) as i32;
-                let y = env.cy + (ang.sin() * d * 0.75) as i32;
+                let x = env.cx + (cos_a * d) as i32;
+                let y = env.cy + (sin_a * d * 0.75) as i32;
                 if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
                     continue;
                 }
@@ -742,6 +772,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         let q = (t_ms - DETONATION_END_MS) as f32 / (SHOCK_END_MS - DETONATION_END_MS) as f32;
         let r = env.r_max * ease_out(q);
         let fade = 1.0 - q;
+        let alpha = (170.0 * fade * env.intensity) as u8;
         let n = 16usize;
         for k in 0..n {
             if out.len() >= cap {
@@ -764,7 +795,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 glyph: DecoGlyph::Shade,
                 blend: DecoBlend::Over,
                 color: VEIL_TONE,
-                alpha: (170.0 * fade * env.intensity) as u8,
+                alpha,
             });
         }
     }
@@ -910,6 +941,9 @@ fn peak_shade_quadratic(decos: &[WordDecoration]) -> u32 {
 /// radial falloff; the peak scan ([`peak_shade_probe`]) is linear and runs only
 /// while Shade stamps exist.
 fn bound_shade_opacity(decos: &mut [WordDecoration]) {
+    if decos.is_empty() {
+        return;
+    }
     // Pre-count first: dark frames and light debris carry no Shade and should
     // cost one scan, not a 6 KB table clear; the count also bounds the probe
     // loop (distinct keys ≤ stamps ≤ SHADE_TAB / 2).
@@ -1567,17 +1601,14 @@ mod tests {
     /// without lifting a configured 0.
     #[test]
     fn combo_ladder_climbs_to_guaranteed_nuke() {
-        let n = 200_000u64;
+        // Exhaustively sweep all 1,000 high-half buckets `(draw >> 32) % 1000`.
+        let n = 1_000u64;
         let mut flash_pct = Vec::new();
         let mut nuke_pct = Vec::new();
         for level in 1..=COMBO_EXTREME_LEVEL {
             let (mut flash, mut nuke) = (0u32, 0u32);
-            for i in 0..n {
-                let mut x = i ^ SUPERNOVA_SALT;
-                x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                let draw = x ^ (x >> 31);
-                match tier_for(draw, level) {
+            for bucket in 0..n {
+                match tier_for(bucket << 32, level) {
                     SuperTier::Flash => flash += 1,
                     SuperTier::Nova => {}
                     SuperTier::Nuke => nuke += 1,

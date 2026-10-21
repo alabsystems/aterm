@@ -391,9 +391,8 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
             "the contended newcomer is still unclassified"
         );
 
-        // The lock is released: the very next wake classifies the newcomer
-        // — by retrying IT, not by walking the pool (the gate stays exactly
-        // equivalent to the scan it replaces, at O(newcomers)).
+        // Released: the next wake classifies the newcomer by retrying it alone, not by
+        // walking the pool.
         release_tx.send(()).expect("holder alive");
         holder.join().expect("holder thread");
         let pool2 = wake_census::pool_visits();

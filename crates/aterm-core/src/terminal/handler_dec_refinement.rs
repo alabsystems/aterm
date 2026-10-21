@@ -271,6 +271,13 @@ impl TerminalHandler<'_> {
         // ESU: a complete frame is ready; the host's present-hold releases on this edge
         // (`Terminal::sync_end_seq`).
         self.transient.sync_end_seq += 1;
+        let cursor = self.grid.cursor();
+        self.transient.sync_end_caret = Some(super::transient_state::SyncEndCaret {
+            seq: self.transient.sync_end_seq,
+            screen: self.transient.screen_replaced,
+            grid: (self.grid.rows(), self.grid.cols()),
+            caret: (cursor.row, cursor.col),
+        });
     }
 
     // --- ANSI modes with TLA+ actions ---

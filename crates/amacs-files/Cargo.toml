@@ -39,6 +39,8 @@ aterm-time = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# Exclusive scratch directories whose cleanup belongs to the fixture.
+aterm-tempfile = { workspace = true }
 # The tests mint a root authority for the store's write cap; only a test may,
 # below the launchers (the `launcher-mint` guard).
 aterm-cap = { workspace = true, features = ["launcher-mint"] }

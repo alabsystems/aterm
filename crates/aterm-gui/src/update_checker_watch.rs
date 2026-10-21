@@ -1,40 +1,30 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE UPDATE CHECKER'S WATCHDOG, on the window's event loop (the 2026-09-22/23
-//! update audit, plan P2-1).
+//! The update checker's watchdog, on the window's event loop.
 //!
-//! The background check loop (`aterm_update`'s `aterm-update` thread) once went
-//! silent for 4.6 days in a live window: v0.74.0 and v0.75.0 were published inside
-//! that silence and never staged, and nothing in the process noticed — the one
-//! trace was `stale_check=` on `aterm ctl update status`, four hours in, for
-//! whoever thought to ask. The loop now stamps a heartbeat
-//! (`aterm_update::checker_watch`), and this module is the reader that acts on it:
-//! when the stamp has gone stale for its phase — and is still the same stale stamp
-//! one [`checker_watch::STALL_CONFIRM`] later — the window
+//! The background check loop (`aterm_update`'s `aterm-update` thread) stamps a heartbeat
+//! (`aterm_update::checker_watch`), and this module acts on it. When the stamp has gone stale
+//! for its phase, and is still the same stale stamp one [`checker_watch::STALL_CONFIRM`]
+//! later, the window
 //!
 //! * logs it (WARN, with the generation, the phase and how long),
-//! * raises the update-health warning through main's messages system
-//!   ([`App::note_update_health`], under its own title,
-//!   [`crate::update_words::CHECKER_STALLED_TITLE`], never with an OS banner: that
-//!   is owed to a copy in Applications that is not the signed release alone) — and heals it the first time a check completes
+//! * raises the update-health warning through [`App::note_update_health`] under its own title
+//!   ([`crate::update_words::CHECKER_STALLED_TITLE`]), never with an OS banner (that is owed
+//!   only to a cause a person must clear), and heals it the first time a check completes
 //!   after it,
 //! * starts a replacement checker under a new generation
-//!   (`aterm_update::respawn_stalled_checker`), which retires the stalled thread
-//!   the moment it wakes, and
+//!   (`aterm_update::respawn_stalled_checker`), which retires the stalled thread when it
+//!   wakes, and
 //! * leaves `checker_stalled=<secs>:<phase>` on `aterm ctl update status`
-//!   ([`checker_status_tokens`]) for as long as the stall stands — including while
-//!   the retired generation still holds the check lane and its replacement cannot
-//!   check ([`checker_watch::standing_stall`]).
+//!   ([`checker_status_tokens`]) while the stall stands, including while the retired
+//!   generation still holds the check lane ([`checker_watch::standing_stall`]).
 //!
-//! NO NEW THREAD AND NO POLLING. The look runs on the way into every park
-//! (`about_to_wait`), where it costs a few atomic loads, and the event loop folds
-//! ONE wake ([`App::update_checker_deadline`], `DeadlineOwner::UpdateChecker`) at
-//! the next instant the look has something to decide: when the stamp would go
-//! stale, when a suspected stall is due its second look, or at once when a stale
-//! stamp has not been looked at yet — so an idle window still looks exactly when
-//! a stall becomes one, and a healthy loop (which re-stamps long before that
-//! instant) costs a wake about once an hour.
+//! No new thread and no polling: the look runs on the way into every park (`about_to_wait`)
+//! for a few atomic loads, and the event loop folds one wake ([`App::update_checker_deadline`],
+//! `DeadlineOwner::UpdateChecker`) at the next instant the look has something to decide (the
+//! stamp going stale, a suspected stall's second look, or at once for a stale stamp not yet
+//! looked at), so a healthy loop costs a wake about once an hour.
 
 use aterm_update::checker_watch::{self, CheckerBeat, CheckerPhase, CheckerVerdict};
 
@@ -61,16 +51,12 @@ pub(crate) struct CheckerWatchState {
 }
 
 impl CheckerWatchState {
-    /// A STALL WARNING THE PARENT CARRIED ACROSS AN UPDATE is this watchdog's to
-    /// heal (round eight, findings 15 and 301; round seven, finding 206). It
-    /// was about the parent's check thread, and this process runs a new one,
-    /// which stands to it as a replacement generation does in one process: the
-    /// first check it completes heals the warning and records the healing
-    /// ([`App::look_at_update_checker`]). Every check this process completes
-    /// comes after the parent's warning, so the count it waits past is 0. A
-    /// stall of this process's own checker before then is its own episode,
-    /// said with its row ([`App::announce_update_checker_stall`]); its count
-    /// then stands in for this one.
+    /// A stall warning the parent carried across an update is this watchdog's to heal: it was
+    /// about the parent's check thread, and this process's checker stands to it as a
+    /// replacement generation does, so the first check it completes heals the warning
+    /// ([`App::look_at_update_checker`]). Every check here comes after the parent's warning,
+    /// so the count it waits past is 0. A stall of this process's own checker before then is
+    /// its own episode ([`App::announce_update_checker_stall`]), whose count then stands in.
     pub(crate) fn adopt_carried_stall(&mut self) {
         self.announced_at_checks.get_or_insert(0);
     }
@@ -81,14 +67,11 @@ impl CheckerWatchState {
         self.announced_at_checks.is_some()
     }
 
-    /// A LOCK-HELD WARNING THE PARENT CARRIED ACROSS AN UPDATE is this
-    /// watchdog's to heal (round eight, findings 15 and 301): the sibling
-    /// holding the lock is untouched by the landing, but this process's checker
-    /// sees the streak's end as a replacement generation does (round six,
-    /// finding 9) — a check completed without deferring ends it, and a deferral
-    /// takes it over, so the same sibling is never said a second time
-    /// ([`lock_held_look`]). The streak is the parent's,
-    /// [`CARRIED_GENERATION`]'s.
+    /// A lock-held warning the parent carried across an update is this watchdog's to heal. The
+    /// sibling holding the lock is untouched by the landing, and this process's checker sees
+    /// the streak's end as a replacement generation does (a check completed without deferring
+    /// ends it; a deferral takes it over, so the sibling is never said twice;
+    /// [`lock_held_look`]). The streak is followed under [`CARRIED_GENERATION`].
     pub(crate) fn adopt_carried_lock_held(&mut self) {
         if self.lock_held.is_none() {
             self.lock_held = Some(LockHeldSaid {
@@ -100,9 +83,8 @@ impl CheckerWatchState {
 }
 
 /// The generation a streak carried from the parent process is followed under
-/// ([`CheckerWatchState::adopt_carried_lock_held`]): none of this process's —
-/// the heartbeat's generation 0 means no checker registered, and the first one
-/// registers as 1.
+/// ([`CheckerWatchState::adopt_carried_lock_held`]): none of this process's, since generation 0
+/// means no checker registered and the first registers as 1.
 const CARRIED_GENERATION: u64 = 0;
 
 /// The streak the lock-held warning stands for ([`lock_held_look`]).
@@ -127,29 +109,19 @@ pub(crate) enum LockHeld {
     Heal,
 }
 
-/// A STOPPED SIBLING HOLDING `checker.lock` (round four of the 2026-09 update
-/// robustness work, plan item 14), judged at one look (pure). The check loop
-/// publishes its consecutive deferrals to a holder showing NO progress in the
-/// heartbeat (a holder still checking rewrites the lock as it works, a slow
-/// download included, and is never counted — the round-four review) and, past
-/// [`checker_watch::CHECKER_UNGATED_AFTER`] of them, checks without the lock:
-/// that much the loop handles by itself, and this says it, once per streak — the
-/// holder is another aterm that is stopped or hung, and before round four every
-/// other aterm on the machine waited on it for good with no notice. The warning
-/// heals when the streak ends; a check never heals it (the loop checks without
-/// the lock while the holder stands).
+/// A stopped sibling holding `checker.lock`, judged at one look (pure). The check loop
+/// publishes its consecutive deferrals to a holder showing no progress in the heartbeat (a
+/// holder still checking rewrites the lock as it works, a slow download included, and is not
+/// counted) and, past [`checker_watch::CHECKER_UNGATED_AFTER`] of them, checks without the
+/// lock; this says so once per streak. The warning heals when the streak ends, never on a
+/// check (the loop checks without the lock while the holder stands).
 ///
-/// A ZERO FROM A REPLACEMENT IS NOT THE STREAK'S END (round six, finding 9). The
-/// deferrals are published per generation, and the watchdog's replacement of a
-/// stalled generation starts them at zero — the sibling may hold the lock still,
-/// and the stuck generation the lane. Only the generation that deferred can end
-/// its streak with a zero (it got the lock, or saw its holder working); a later
-/// generation proves it by a check completed without deferring — the loop's
-/// check count moving past where the streak's generation left it — and one that
-/// defers in turn takes the streak over. A streak the parent carried across an
-/// update is followed the same way
-/// ([`CheckerWatchState::adopt_carried_lock_held`]): this process's checker is
-/// its replacement.
+/// A zero from a replacement is not the streak's end: deferrals are published per
+/// generation, and a replacement starts at zero while the sibling may still hold the lock.
+/// Only the generation that deferred ends its streak with a zero; a later generation proves
+/// it by a check completed without deferring (the check count moving past where the streak's
+/// generation left it), and one that defers in turn takes the streak over. A streak carried
+/// from the parent ([`CheckerWatchState::adopt_carried_lock_held`]) is followed the same way.
 pub(crate) fn lock_held_look(
     state: &mut CheckerWatchState,
     beat: Option<CheckerBeat>,
@@ -177,9 +149,8 @@ pub(crate) fn lock_held_look(
         return Some(LockHeld::Announce(deferrals));
     }
     let said = said?;
-    // No checker left is the streak's end — but not for a streak carried from
-    // the parent (round eight, finding 15), which no look of this process has
-    // answered: its checker may not have registered yet.
+    // No checker left is the streak's end, but not for a streak carried from the parent,
+    // which no look of this process has answered: its checker may not have registered yet.
     let ended = deferrals == 0
         && beat.map_or(said.generation != CARRIED_GENERATION, |beat| {
             beat.generation == said.generation || beat.checks > said.checks
@@ -234,18 +205,16 @@ pub(crate) struct CheckerStall {
     pub(crate) checks: u64,
 }
 
-/// Judge one look (pure: the event loop and the tests ask the same question).
-/// `Some` exactly once per stalled generation, and only for a stale stamp that
-/// was ALREADY stale, unchanged, one [`checker_watch::STALL_CONFIRM`] earlier;
-/// `None` for a fresh beat, for no checker at all (headless, automatic checks off,
-/// an uninstalled copy), for a stale stamp seen for the first time (its second
-/// look is armed), and for a stall this watchdog has already acted on.
+/// Judge one look (pure: the event loop and the tests ask the same question). `Some` once per
+/// stalled generation, only for a stamp that was already stale, unchanged, one
+/// [`checker_watch::STALL_CONFIRM`] earlier; `None` for a fresh beat, for no checker
+/// (headless, automatic checks off, an uninstalled copy), for a stale stamp seen the first
+/// time (its second look is armed), and for a stall already acted on.
 ///
-/// WHY TWO LOOKS: the clock leaves the machine's sleep out but not a stop of this
-/// process (`SIGSTOP`, a debugger pause), and the first look after the process is
-/// continued sees every stamp as old as the stop — while the checker, stopped with
-/// it, has had no chance to stamp. It stamps within the confirmation window; a
-/// stuck one does not.
+/// Two looks because the clock leaves out machine sleep but not a stop of this process
+/// (`SIGSTOP`, a debugger pause): the first look after a continue sees every stamp as old as
+/// the stop, while the checker, stopped too, has had no chance to stamp. It stamps within the
+/// confirmation window; a stuck one does not.
 pub(crate) fn judge(
     state: &mut CheckerWatchState,
     beat: Option<CheckerBeat>,
@@ -284,16 +253,12 @@ pub(crate) fn judge(
     })
 }
 
-/// Running seconds from `now_secs` until the watchdog's next look has something to
-/// decide (pure): the stamp going stale, a suspected stall's second look, or — `0`
-/// — a stale stamp no look has seen yet. `None` with no checker, and while a stall
-/// that was acted on stands (a past deadline would only spin the loop).
-///
-/// Derived from the SAME state [`judge`] keeps, never from the beat alone: the
-/// look and this fold run hundreds of lines apart in one `about_to_wait`, and a
-/// stamp that crossed its threshold between them used to fold no wake at all (the
-/// beat was stale, so "the watchdog has acted on it") — an idle window then parked
-/// with the stall unacted on until something else woke it.
+/// Running seconds from `now_secs` until the watchdog's next look has something to decide
+/// (pure): the stamp going stale, a suspected stall's second look, or `0` for a stale stamp no
+/// look has seen yet. `None` with no checker, and while an acted-on stall stands (a past
+/// deadline would only spin the loop). Derived from the same state [`judge`] keeps, not the
+/// beat alone: the look and this fold run apart in one `about_to_wait`, and a stamp that
+/// crosses its threshold between them must still fold a wake.
 pub(crate) fn next_look_in(
     state: &CheckerWatchState,
     beat: Option<CheckerBeat>,
@@ -322,18 +287,15 @@ fn heartbeat_look_in(state: &CheckerWatchState, beat: CheckerBeat, now_secs: u64
     }
 }
 
-/// The checker's tokens on `aterm ctl update status`, each present only in the
-/// state it names, so a healthy line stays byte-identical (the `stale_check=` /
-/// `installable=` precedent):
+/// The checker's tokens on `aterm ctl update status`, each present only in the state it
+/// names, so a healthy line stays byte-identical:
 ///
-/// * `checker_stalled=<secs>:<phase>` — the loop's heartbeat is stale right now,
-///   or a retired generation that stalled holding the check lane still holds it
-///   (its replacement cannot check): running seconds since the stuck generation's
-///   last stamp, and the phase it stamped ([`checker_watch::standing_stall`]);
-/// * `checker_respawns=<n>` — replacement checkers this process has started;
-/// * `checker_deferred=<n>` — consecutive cycles that found `checker.lock` held
-///   past its bound by another aterm showing no progress, and deferred to it (a
-///   holder still checking rewrites the lock as it works and is not counted).
+/// * `checker_stalled=<secs>:<phase>`: the heartbeat is stale now, or a retired generation
+///   that stalled holding the check lane still holds it; running seconds since the stuck
+///   generation's last stamp, and its phase ([`checker_watch::standing_stall`]);
+/// * `checker_respawns=<n>`: replacement checkers this process has started;
+/// * `checker_deferred=<n>`: consecutive cycles that found `checker.lock` held past its bound
+///   by another aterm showing no progress, and deferred to it.
 pub(crate) fn checker_status_tokens(beat: Option<CheckerBeat>, now_secs: u64) -> String {
     let Some(beat) = beat else {
         return String::new();
@@ -441,27 +403,20 @@ impl App {
         }
     }
 
-    /// Say that a sibling aterm holds the machine's update check without making
-    /// progress ([`lock_held_look`]): the update-health warning under this
-    /// watchdog's title, through the one door every producer shares. No OS
-    /// banner: this aterm checks without waiting for the sibling, so nothing has
-    /// stopped here and the band row says the whole of it. The log already named
-    /// the holder's pid (the check loop's line).
-    ///
-    /// Under its own kind ([`crate::update_words::HealthKind::LockHeld`], round
-    /// six): a heartbeat stall's warning standing beside it neither swallows it
-    /// nor heals it.
+    /// Say that a sibling aterm holds the machine's update check without making progress
+    /// ([`lock_held_look`]): the update-health warning under its own kind
+    /// ([`crate::update_words::HealthKind::LockHeld`], so a stall warning beside it neither
+    /// swallows nor heals it). No OS banner: this aterm checks without waiting for the sibling,
+    /// so nothing has stopped here. The check loop's log line already named the holder's pid.
     pub(crate) fn announce_checker_lock_held(&mut self, cycles: u64) {
         let title = crate::update_words::CHECKER_LOCK_HELD_TITLE;
         let body = crate::update_words::checker_lock_held_body(cycles);
         self.note_update_health_as(crate::update_words::HealthKind::LockHeld, title, &body);
     }
 
-    /// THE SIBLING LET GO: the deferral streak the lock-held warning stood for
-    /// is over ([`lock_held_look`]). Its latch, its row, its day's digest entry
-    /// and the record of its healing go, through the one heal every
-    /// update-health proof shares; a heartbeat stall's warning stays for its
-    /// own proof.
+    /// The sibling let go: the deferral streak the lock-held warning stood for is over
+    /// ([`lock_held_look`]). Its latch, row, digest entry and the record of its healing go
+    /// through the one update-health heal; a heartbeat stall's warning stays for its own proof.
     pub(crate) fn heal_checker_lock_held(&mut self) {
         let held = crate::update_words::HealthKind::LockHeld;
         aterm_log::info!(
@@ -470,10 +425,9 @@ impl App {
         self.heal_update_health_where(|kind| kind == held);
     }
 
-    /// THE STALL IS OVER: a check completed after this watchdog's warning was
-    /// posted. The warning — its latch, its row if it is still up, its day's
-    /// digest entry and the record of its healing — goes, and nothing else
-    /// does: a ledger warning under another title is the ledger's to heal.
+    /// The stall is over: a check completed after this watchdog's warning was posted. The
+    /// warning (latch, row, digest entry, the record of its healing) goes, and nothing else: a
+    /// ledger warning under another title is the ledger's to heal.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -543,10 +497,8 @@ mod tests {
         judge(state, Some(beat), now + CONFIRM)
     }
 
-    /// A STALL IS ACTED ON ONCE PER GENERATION, AND ONLY A STALL. The code before
-    /// this change had no look at all: the stall below (a checker parked in the
-    /// lock wait for 4.6 days) produced nothing until someone read `update
-    /// status`, four hours in.
+    /// A stall is acted on once per generation, and only a stall (here a checker parked in the
+    /// lock wait for four days).
     #[test]
     fn a_stall_is_acted_on_once_per_generation_and_a_fresh_beat_never() {
         let mut state = CheckerWatchState::default();
@@ -580,13 +532,8 @@ mod tests {
         assert!(confirmed(&mut state, replacement, later).is_some());
     }
 
-    /// A PROCESS THAT WAS STOPPED IS NOT A STALLED CHECKER. The clock runs on while
-    /// the process is `SIGSTOP`ped or paused in a debugger, so the first look after
-    /// it is continued sees a stale stamp, and the checker, stopped too, has not
-    /// had a chance to stamp. Before this change that first look acted — a WARN,
-    /// the health warning, and one of the three lifetime
-    /// replacements spent on a healthy loop (the first assertion fails against
-    /// it). Now it only suspects; the checker stamps; nothing happens.
+    /// A process that was stopped is not a stalled checker: the first look after a continue
+    /// only suspects, the checker stamps, and nothing happens.
     #[test]
     fn a_stamp_that_moves_before_the_second_look_is_no_stall() {
         let mut state = CheckerWatchState::default();
@@ -616,18 +563,14 @@ mod tests {
         );
         assert_eq!(state.suspect, None, "the suspicion is dropped");
         assert_eq!(state.acted_on, None);
-        // A stale stamp that did NOT move by its second look is acted on.
+        // A stale stamp that did not move by its second look is acted on.
         let stuck = beat(1, CheckerPhase::Checking, 0);
         let stale = stall_threshold_secs(CheckerPhase::Checking, 1_100) + 1;
         assert!(confirmed(&mut state, stuck, stale).is_some());
     }
 
-    /// THE WAKE IS FOLDED FROM THE LOOK'S OWN STATE. The look and the deadline
-    /// fold run far apart in one `about_to_wait`; a stamp that went stale between
-    /// them used to fold NO wake (the old deadline read "stale" as "already acted
-    /// on"), and an idle window then parked with the stall unseen. A stale stamp no
-    /// look has seen now folds an immediate wake, a suspicion its second look, and
-    /// only a stall that was acted on folds nothing.
+    /// The wake is folded from the look's own state: a stale stamp no look has seen folds an
+    /// immediate wake, a suspicion its second look, and only an acted-on stall folds nothing.
     #[test]
     fn a_stamp_gone_stale_between_the_look_and_the_fold_still_folds_a_wake() {
         let mut state = CheckerWatchState::default();
@@ -695,9 +638,8 @@ mod tests {
             checker_status_tokens(Some(stalled), 3_600),
             " checker_stalled=3600:lock-wait checker_respawns=1 checker_deferred=7"
         );
-        // Generation 2 is fresh, but generation 1 stalled in its check and still
-        // holds the lane: before this change the line read healthy but for the
-        // respawn count.
+        // Generation 2 is fresh, but generation 1 stalled in its check and still holds the
+        // lane.
         let mut blocked = beat(2, CheckerPhase::Waiting, 5_000);
         blocked.respawns = 1;
         blocked.lane = Some(LaneHolder {
@@ -711,12 +653,9 @@ mod tests {
         );
     }
 
-    /// THE WARNING, THROUGH MAIN'S ONE DOOR, UNDER ITS OWN TITLE. A stall posts
-    /// the stall warning once per launch with the stall's own sentence — and the
-    /// ledger's "can't check for updates" is NOT latched by it: before this change
-    /// the stall borrowed that title, so a real network or manifest failure later
-    /// in the launch was "already said" (the ledger assertion below fails against
-    /// it).
+    /// A stall posts its own warning once per launch with its own sentence, and does not latch
+    /// the ledger's "can't check for updates": a later network or manifest failure is still
+    /// said.
     #[test]
     fn a_stall_raises_its_own_warning_once_and_never_silences_the_ledgers() {
         let mut app = App::headless_for_test();
@@ -755,12 +694,11 @@ mod tests {
         );
     }
 
-    /// THE STALL'S ⚠ ROW IS ON THE BAND WHATEVER `desktop_alerts` SAYS, and the
-    /// desktop banner is never its own: a check that stopped answering, or a
-    /// sibling's lock, is not a cause the owner alone can end (the banner is owed
-    /// to `NeedsPerson` only: `App::post_update_health_banner`). NEGATIVE
-    /// CONTROL: the announcement itself is not withheld — the row, the latch and
-    /// the second call's silence are the same under every setting.
+    /// The stall's ⚠ row is on the band whatever `desktop_alerts` says, and it never posts a
+    /// desktop banner: a stopped check or a sibling's lock is not a cause only the owner can
+    /// end (the banner is owed to `NeedsPerson` only: `App::post_update_health_banner`).
+    /// Negative control: the row, the latch and the second call's silence are the same under
+    /// every setting.
     #[test]
     fn a_checker_stall_posts_no_desktop_banner_whatever_desktop_alerts_says() {
         use crate::messages_host::UPDATE_HEALTH_BANNERS;
@@ -830,9 +768,7 @@ mod tests {
         );
     }
 
-    /// THE WARNING HEALS ON THE FIRST CHECK COMPLETED AFTER IT. Before this change
-    /// nothing a replacement's ordinary checks produced healed it: the latch and
-    /// the row stood for the rest of the launch.
+    /// The stall warning heals on the first check completed after it.
     #[test]
     fn the_stall_warning_heals_when_a_check_completes_after_it() {
         let mut app = App::headless_for_test();
@@ -881,19 +817,12 @@ mod tests {
         );
     }
 
-    /// ROUND-SEVEN UPDATE AUDIT, GROUP RL (the review of finding 206) — THE
-    /// LEDGER'S HEALING IS NO PROOF THE STALL IS OVER. The process announced
-    /// "Couldn't check for updates"; generation 1 then stalled holding the check
-    /// lane, and its replacement can never check (every cycle finds the lane
-    /// busy). Every generation ticks with what the process announced, so when a
-    /// sibling aterm's good check heals the shared ledger, the blocked
-    /// replacement sends the recovery of `manifest` — true of the ledger, and it
-    /// takes the check warning down. It took "Update check stopped" down with it
-    /// (a `Checked` proof answered the stall): row gone, latch lifted, "aterm
-    /// updates work again" on record, while no check could run here (L5). The
-    /// stall now stands until THIS process completes a check, whichever class
-    /// the ledger's healing names. NEGATIVE CONTROL: a check this process ran —
-    /// its progress, `HealthProof::Checked` — still answers the stall.
+    /// The ledger's healing is no proof the stall is over: with generation 1 stalled holding
+    /// the lane and its replacement blocked, a sibling's good check heals the shared ledger and
+    /// the replacement reports the recovery, which takes the check warning down but not the
+    /// stall's. The stall stands until this process completes a check, whatever class the
+    /// ledger's healing names. Negative control: this process's own check
+    /// (`HealthProof::Checked`) answers it.
     #[test]
     fn a_blocked_replacement_over_a_healed_ledger_leaves_the_stall_up() {
         use crate::update_words::HealthKind;
@@ -966,7 +895,7 @@ mod tests {
             assert!(app.live_update_health(|k| k == stalled).is_empty());
             assert_eq!(recorded(&app).len(), 2, "the stall's healing, once");
         }
-        // NEGATIVE CONTROL: this process's own check's progress answers it.
+        // Negative control: this process's own check's progress answers it.
         let mut app = App::headless_for_test();
         app.announce_update_checker_stall(
             CheckerStall {
@@ -983,18 +912,12 @@ mod tests {
         assert!(app.live_update_health(|k| k == stalled).is_empty());
     }
 
-    /// ROUND FOUR, PLAN ITEM 14: A SIBLING HOLDING `checker.lock` WITHOUT MAKING
-    /// PROGRESS IS SAID, once per streak, when the loop's published deferrals
-    /// reach `CHECKER_UNGATED_AFTER` — where the loop starts checking without
-    /// the lock — and the warning heals when the streak ends. A check completing
-    /// meanwhile (the loop's own, without the lock) does NOT heal it: the holder
-    /// is still stuck. An idle window looks again within a minute while a streak
-    /// stands. NEGATIVE CONTROLS: a streak below the bound says nothing, and a
-    /// healthy beat folds no minute-look.
-    ///
-    /// RED before the change: nothing read `deferrals` but the status token, so
-    /// the machine's update checks stopped behind a stopped sibling with no row
-    /// — the look below left the messages empty at every count.
+    /// A sibling holding `checker.lock` without progress is said once per streak, when the
+    /// published deferrals reach `CHECKER_UNGATED_AFTER` (where the loop starts checking
+    /// without the lock), and the warning heals when the streak ends, not when a lock-free
+    /// check completes. An idle window looks again within a minute while a streak stands.
+    /// Negative controls: a streak below the bound says nothing, and a healthy beat folds no
+    /// minute-look.
     #[test]
     fn a_sibling_holding_the_checker_lock_is_said_once_and_healed_when_it_lets_go() {
         use aterm_update::checker_watch::CHECKER_UNGATED_AFTER;
@@ -1084,14 +1007,10 @@ mod tests {
             .count()
     }
 
-    /// ROUND SIX, FINDING 9: A REPLACEMENT CHECKER STARTS AT ZERO DEFERRALS, AND
-    /// THAT IS NO PROOF THE SIBLING LET GO. The lock-held warning was up; the loop's
-    /// lock-free check then hung and the watchdog retired it, and the supersede
-    /// zeroes the published deferrals. The next look read that zero as "the streak
-    /// ended", healed the warning and put "aterm updates work again" on record —
-    /// while the sibling still held the lock and the stuck generation still held the
-    /// lane. NEGATIVE CONTROL: once the replacement completes a check without
-    /// deferring, the streak really is over and it heals.
+    /// A replacement checker starts at zero deferrals, which is no proof the sibling let go:
+    /// with the lock-held warning up and generation 1 retired, the replacement's zero leaves
+    /// the warning standing. Negative control: once the replacement completes a check without
+    /// deferring, the streak is over and it heals.
     #[test]
     fn a_replacement_at_zero_deferrals_is_no_proof_the_sibling_let_go() {
         use aterm_update::checker_watch::CHECKER_UNGATED_AFTER;
@@ -1130,10 +1049,8 @@ mod tests {
         assert_eq!(lock_held_rows(&app), 0, "healed once a check proves it");
     }
 
-    /// ROUND SIX, FINDING 36: THE LOCK-HELD WARNING IS NEVER SWALLOWED BY A STALL
-    /// WARNING. Both shared one latch: announced while a heartbeat stall's warning
-    /// stood, the lock-held one was marked said, posted nothing, and was cleared
-    /// with the stall's heal — then never said again while the sibling stayed stuck.
+    /// The lock-held warning is never swallowed by a stall warning already up: each kind has
+    /// its own latch.
     #[test]
     fn a_stall_warning_up_first_does_not_swallow_the_lock_held_warning() {
         use aterm_update::checker_watch::CHECKER_UNGATED_AFTER;
@@ -1162,10 +1079,8 @@ mod tests {
         );
     }
 
-    /// ROUND SIX, FINDING 53: A DOWNLOAD IS NO PROOF THE SIBLING LET GO. The
-    /// lock-free check found a release and its bytes started arriving; the progress
-    /// report healed every warning a check answers — the lock-held one included —
-    /// and recorded "aterm updates work again" while the sibling was still stuck.
+    /// A download is no proof the sibling let go: download progress leaves the lock-held
+    /// warning up.
     #[test]
     fn a_download_does_not_heal_the_lock_held_warning() {
         use aterm_update::checker_watch::CHECKER_UNGATED_AFTER;

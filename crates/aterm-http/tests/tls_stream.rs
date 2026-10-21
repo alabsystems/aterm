@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The global deadline and the authority guard hold for EVERY socket call a
-//! TLS stream makes — after the handshake as well as during it.
+//! The global deadline and the authority guard hold for every socket call a TLS
+//! stream makes, after the handshake as well as during it.
 //!
 //! rustls's `Read` for a stream loops `complete_io` until a whole record has
 //! arrived, so one `Stream::read` is many socket reads. A timeout and a guard
@@ -106,10 +106,10 @@ fn client_config() -> Arc<rustls::ClientConfig> {
     )
 }
 
-/// A TLS server that completes the handshake, then announces an application
-/// record of 16 KiB and sends it ONE BYTE AT A TIME, `step` apart, for up to
-/// five minutes. `dribbling` gets a message once the first bytes are out. The
-/// peer stops at the first byte the closed client refuses.
+/// A TLS server that completes the handshake, then announces a 16 KiB
+/// application record and sends it one byte per `step` for up to five minutes,
+/// stopping at the first byte the closed client refuses. `dribbling` gets a
+/// message once the first bytes are out.
 fn dribbling_tls_server(step: Duration) -> (u16, mpsc::Receiver<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -257,9 +257,8 @@ fn a_dribbled_handshake_cannot_outlive_the_global_deadline() {
 
 #[test]
 fn a_record_dribbled_after_the_handshake_cannot_outlive_the_global_deadline() {
-    // Each byte arrives 50 ms after the last, so a timeout armed once before
-    // rustls's read loop never fires: the record would take ~14 minutes. The
-    // 3 s deadline is the bound; the minute below is the hang detector.
+    // At 50 ms a byte the record would take ~14 minutes; the 3 s deadline is
+    // the bound and the minute below the hang detector.
     let (_dribbling, outcome) = read_from_dribbler(
         Arc::new(aterm_http::AlwaysAuthorized),
         Duration::from_secs(3),
@@ -276,10 +275,8 @@ fn a_record_dribbled_after_the_handshake_cannot_outlive_the_global_deadline() {
 
 #[test]
 fn authority_revoked_during_a_tls_read_stops_it() {
-    // The deadline is far away; only the guard can end this read. The guard
-    // must be CONSULTED while the record dribbles in — i.e. from inside
-    // rustls's read loop, not only once before it — and once it is, it is
-    // revoked and the read must stop.
+    // Only the guard can end this read: it must be consulted from inside
+    // rustls's read loop, and once revoked the read stops.
     let guard = Arc::new(Revocable {
         allowed: AtomicBool::new(true),
         asked: AtomicUsize::new(0),

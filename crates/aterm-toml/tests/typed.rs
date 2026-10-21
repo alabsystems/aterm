@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Typed serde: the path 43 call sites in aterm take, and the 161
-//! `#[derive(Deserialize)]` models behind them.
+//! Typed serde: `from_str::<T>` and `to_string` over `#[derive]` models shaped like
+//! aterm's.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -127,9 +127,8 @@ fn absent_keys_and_none_values() {
     assert_eq!(aterm_toml::from_str::<S>(&ours).expect("reparse"), value);
 }
 
-/// Unknown keys must still be an error where the model asks for it — the
-/// `deny_unknown_fields` on `Config` is what stops a typo silently doing
-/// nothing.
+/// Unknown keys are an error where the model asks for it (`deny_unknown_fields` on
+/// `Config`), so a typo does not silently do nothing.
 #[test]
 fn unknown_fields_are_refused_where_the_model_asks() {
     let text = "font_px = 1.0\nscrollback_lines = 10\nfont_pxx = 2.0\n";
@@ -260,10 +259,8 @@ fn a_fixed_length_target_refuses_a_longer_array() {
     );
 }
 
-/// A unit variant spelled as a one-key table carries NOTHING.
-///
-/// `cursor_style = { bar = {} }` is `Bar`. `cursor_style = { bar = 99 }` is a
-/// value with nowhere to go: an error, not `Bar` with the `99` dropped.
+/// A unit variant spelled as a one-key table carries nothing: `cursor_style = { bar = {} }`
+/// is `Bar`, and `cursor_style = { bar = 99 }` is an error, not `Bar` with the `99` dropped.
 #[test]
 fn a_unit_variant_in_table_form_carries_nothing() {
     #[derive(Debug, Deserialize)]
@@ -311,11 +308,8 @@ fn datetimes_round_trip_through_serde() {
     );
 }
 
-/// `Table: FromStr` and `Value` indexing — the untyped path.
-///
-/// The art-asset suites read a parsed document with `doc["layer"][0]["role"]`,
-/// which goes through no derived model, so it is not covered by the typed
-/// cases above.
+/// `Table: FromStr` and `Value` indexing: the untyped path the art-asset suites read a
+/// document through (`doc["layer"][0]["role"]`), with no derived model.
 #[test]
 fn the_untyped_table_and_index_surface() {
     const SOURCE: &str = "\

@@ -3,37 +3,19 @@
 
 //! Pattern text → [`Ast`].
 //!
-//! The parser is a single flat loop over the pattern's code points with an
-//! explicit [`Group`] stack, so no amount of `(((((…)))))` can recurse it into
-//! the guard page. What *is* recursive is the [`Ast`] it produces — and its
-//! `Drop` with it — so every node records its own depth and construction fails
-//! past [`MAX_NESTING_DEPTH`]. That is the same 250 the `regex` crate defaults
-//! its own nest limit to.
+//! A single flat loop over the pattern's code points with an explicit [`Group`] stack,
+//! so no `(((((…)))))` can recurse it into the guard page. The [`Ast`] it produces, and
+//! its `Drop`, are recursive, so every node records its depth and parsing fails past
+//! [`MAX_NESTING_DEPTH`].
 //!
-//! ## What the syntax is, and where it stops
+//! ## Syntax
 //!
-//! Everything the tree ships or accepts from a user: literals, `.`, character
-//! classes with ranges/negation/escapes/`\d\w\s`/POSIX names, the perl classes,
-//! the assertions `^ $ \A \z \b \B \< \>`, groups (capturing, `(?:`, named) with
-//! inline flags `i m s x U`, alternation, and the quantifiers `* + ? {n} {n,}
-//! {n,m}` in greedy and lazy forms.
-//!
-//! Four things `regex` accepts are refused here, each with a message that says
-//! so. They are refusals, never silent reinterpretations, which is the whole
-//! point — a regex engine that quietly matches something *else* is worse than
-//! one that declines:
-//!
-//! * `\p{…}` / `\pL` Unicode property classes.
-//! * Character-class set operations — `[a&&b]`, `[a--b]`, `[a~~b]` — and the
-//!   nested `[…]` that go with them. A naive reading of `[a--b]` is "a, -, b",
-//!   which is exactly the silent mismatch this refusal exists to prevent. An
-//!   escaped `\-`, `\&` or `\~` is always a literal and always fine.
-//! * `(?-u)` byte-oriented mode: this engine matches over `&str` by code point.
-//! * `(?R)` CRLF mode.
-//!
-//! No backreferences and no look-around either — but those are not divergences,
-//! because `regex` does not have them: a Thompson NFA is a faithful replacement
-//! for it, not a reduced one.
+//! Literals, `.`, character classes (ranges, negation, escapes, `\d\w\s`, POSIX names),
+//! the assertions `^ $ \A \z \b \B \< \>`, groups (capturing, `(?:`, named) with inline
+//! flags `i m s x U`, alternation, and the quantifiers `* + ? {n} {n,} {n,m}`, greedy and
+//! lazy. The constructs `regex` accepts and this engine refuses are listed in the crate
+//! docs; each is an [`Error::Syntax`] naming it, never a reinterpretation (a naive reading
+//! of `[a--b]` is "a, -, b"). Backreferences and look-around are refused, as in `regex`.
 
 use crate::Error;
 use crate::unicode;
@@ -169,8 +151,7 @@ impl ClassSet {
         let mut merged: Vec<(char, char)> = Vec::with_capacity(self.ranges.len());
         for &(lo, hi) in &self.ranges {
             match merged.last_mut() {
-                // Coalesce overlapping *and* adjacent ranges: `[a-mn-z]` is one
-                // range, and `range_tables_are_well_formed` relies on it.
+                // Coalesce overlapping and adjacent ranges: `[a-mn-z]` is one range.
                 Some(last) if lo as u32 <= last.1 as u32 + 1 => {
                     if hi > last.1 {
                         last.1 = hi;
@@ -183,13 +164,10 @@ impl ClassSet {
         self.perls.dedup();
     }
 
-    /// Mark, in `out`, every *leading* UTF-8 byte of a code point this class can
-    /// match. Continuation bytes (`0x80..=0xBF`) are never marked, which is what
-    /// lets the prefilter walk the haystack a byte at a time: it may step into
-    /// the middle of a code point while skipping, but it can never stop there.
-    ///
-    /// Over-marking is always safe — the prefilter only ever skips a position no
-    /// candidate could match — so the non-ASCII side is answered conservatively.
+    /// Mark, in `out`, every leading UTF-8 byte of a code point this class can match. A
+    /// continuation byte (`0x80..=0xBF`) is never marked, so the prefilter's byte-at-a-time
+    /// walk can only stop on a boundary. The non-ASCII side is marked conservatively, which
+    /// is safe: the prefilter skips only positions no candidate could match.
     pub(crate) fn mark_lead_bytes(&self, out: &mut [bool; 256]) {
         for b in 0u8..0x80 {
             if self.matches(b as char) {
@@ -225,17 +203,14 @@ impl ClassSet {
         self.normalize();
     }
 
-    /// Add one POSIX item — `[:lower:]`, or `[:^lower:]` — to this class.
+    /// Add one POSIX item (`[:lower:]` or `[:^lower:]`) to this class.
     ///
-    /// The item's own `^` is applied the way a bracketed class applies its own
-    /// and in the same order: fold, THEN complement (the `regex` crate's
-    /// `unicode_fold_and_negate`, at both levels). The other order is a wrong
-    /// answer, not a slower one: the complement of `[a-z]` holds `A-Z`, `ſ` and
-    /// the KELVIN SIGN, whose orbits are `a-z`, `s` and `k`, so folding it hands
-    /// back every code point there is and `(?i)[[:^lower:]]` matches letters.
-    /// The whole class is folded again when it closes, which is idempotent
-    /// here: a complement taken after folding holds no member of any orbit it
-    /// excluded.
+    /// The item's own `^` is applied after folding, as a bracketed class's is (`regex`'s
+    /// `unicode_fold_and_negate`). The other order is wrong: the complement of `[a-z]`
+    /// holds `A-Z`, `ſ` and the KELVIN SIGN, whose orbits cover `a-z`, so folding it
+    /// yields every code point and `(?i)[[:^lower:]]` matches letters. Folding the whole
+    /// class again when it closes is idempotent: a complement taken after folding holds no
+    /// member of any orbit it excluded.
     fn add_posix(&mut self, table: &[(char, char)], negated: bool, case_insensitive: bool) {
         let mut item = Self {
             ranges: table.to_vec(),
@@ -309,15 +284,12 @@ struct Parser<'a> {
     stack: Vec<Group>,
     alts: Vec<Ast>,
     concat: Vec<(Ast, usize)>,
-    /// Capture groups are parsed and then ignored — nothing in the tree reads a
-    /// capture — but their names are still tracked, because a duplicate name is
-    /// an error in the `regex` crate and accepting one here would be a
-    /// divergence for no gain.
+    /// Capture names, tracked only to reject a duplicate as `regex` does; captures are
+    /// otherwise ignored.
     group_names: Vec<String>,
-    /// A flag directive (`(?i)`) is the last thing parsed in this branch. It is
-    /// an item in the `regex` crate's grammar, so a quantifier after it has
-    /// nothing to repeat — it must not reach back past the directive to the
-    /// item before it. Set by the directive, cleared by every item pushed.
+    /// A flag directive (`(?i)`) is the last thing parsed in this branch. It is an item
+    /// in `regex`'s grammar, so a quantifier after it has nothing to repeat and must not
+    /// reach back to the item before it. Set by the directive, cleared by every push.
     after_flag_directive: bool,
 }
 
@@ -555,10 +527,8 @@ impl Parser<'_> {
 
     /// `{n}`, `{n,}`, `{n,m}`.
     ///
-    /// An unescaped `{` always opens one. That is the `regex` crate's rule too —
-    /// `a{b}` and `a{,3}` are errors there, not literals — and a divergence here
-    /// would mean accepting a pattern `regex` rejects. A literal brace is
-    /// `\{`; a `}` on its own is already a literal, in both engines.
+    /// An unescaped `{` always opens one, as in `regex` (`a{b}` and `a{,3}` are errors
+    /// there too). A literal brace is `\{`; a lone `}` is a literal.
     fn parse_counted(&mut self) -> Result<(u32, Option<u32>), Error> {
         debug_assert_eq!(self.peek(), Some('{'));
         let open = self.pos;
@@ -926,7 +896,7 @@ impl Parser<'_> {
     fn parse_class(&mut self) -> Result<ClassSet, Error> {
         let open = self.pos;
         self.pos += 1; // '['
-        // Likewise for the negation: in `x` mode `[ ^a]` is `[^a]`.
+        // In `x` mode `[ ^a]` is `[^a]`.
         self.skip_ignorable();
         let negated = self.peek() == Some('^');
         if negated {
@@ -997,9 +967,7 @@ impl Parser<'_> {
             if self.flags.ignore_whitespace {
                 self.skip_ignorable();
             }
-            // A `--` right after an item is the set-difference operator, not a
-            // range whose end happens to be `-`. Refused for the same reason as
-            // the other two: a naive reading silently means something else.
+            // A `--` right after an item is set difference, not a range ending in `-`.
             if self.peek() == Some('-') && self.peek_at(1) == Some('-') {
                 return self.err(
                     "character-class set operations (`--`) are not supported; escape the \
@@ -1106,12 +1074,8 @@ fn perl_class(c: char) -> Option<PerlClass> {
 /// A static, sorted, inclusive range list — the shape every class table takes.
 type Ranges = &'static [(char, char)];
 
-/// The POSIX bracket classes. ASCII-only — `[[:alpha:]]` does not match `é` in
-/// the `regex` crate either.
-///
-/// Positive tables only: an item's own `^` is applied by
-/// [`ClassSet::add_posix`], after case folding, never baked in here — a
-/// precomputed complement folds in the wrong order.
+/// The POSIX bracket classes, ASCII-only as in `regex`. Positive tables only: an item's
+/// `^` is applied by [`ClassSet::add_posix`] after folding.
 fn posix_class(name: &str) -> Option<Ranges> {
     let table: Ranges = match name {
         "alnum" => &[('0', '9'), ('A', 'Z'), ('a', 'z')],
@@ -1251,10 +1215,8 @@ mod tests {
         assert!(message("[[:nosuch:]]").contains("nested character classes"));
     }
 
-    /// An item's own `^` is the exact complement of its FOLDED table: every
-    /// code point a POSIX table or its fold can reach, and the edges of the
-    /// scalar-value space and of the surrogate gap, land in exactly one of the
-    /// two.
+    /// An item's own `^` is the exact complement of its folded table, over every code
+    /// point a POSIX table or its fold reaches and the edges of the scalar-value space.
     #[test]
     fn a_negated_posix_item_is_the_complement_of_its_folded_table() {
         let names = [
@@ -1281,8 +1243,8 @@ mod tests {
                 }
             }
         }
-        // The fold is applied BEFORE the complement: `(?i)[:^lower:]` excludes
-        // the exotic members of the `k` and `s` orbits along with `A-Z`.
+        // Fold before complement: `(?i)[:^lower:]` excludes the exotic members of the
+        // `k` and `s` orbits along with `A-Z`.
         let mut no = ClassSet::default();
         no.add_posix(posix_class("lower").expect("known"), true, true);
         for c in ['a', 'Z', '\u{17f}', '\u{212a}'] {

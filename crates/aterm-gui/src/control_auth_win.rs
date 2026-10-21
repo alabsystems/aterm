@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows implementations behind [`control_auth`](super), delegating the
-//! platform work to `aterm_uds::{latest, process, rand}`.
+//! Windows implementations behind [`control_auth`](super).
 //!
 //! HONEST POSTURE (never overstated; disclosed by the one-line startup notice
 //! `control::spawn` prints): the isolation boundary is an OWNER-verified,
@@ -97,16 +96,11 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     aterm_uds::process::pid_alive(pid)
 }
 
-/// The directory every build before eb0a37b3b (2026-07-05) bound the control
-/// socket in — `%LOCALAPPDATA%\aterm`, falling back to
-/// `%USERPROFILE%\AppData\Local\aterm`, the resolution that code used — so the
-/// launch sweep can retire what those builds left there. The 2026-09-22 audit
-/// counted twelve zero-byte `.sock` files dated July 2026 in it:
-/// nothing has bound there since the move to `%TEMP%\aterm`, and nothing swept
-/// it, because `sweep_stale_instances` only ever walks the CURRENT directory.
-/// It is still a live directory — `logs\` and the atpkg store live under it —
-/// so a sweep of it touches `*.sock` entries and nothing else. Empty when the
-/// per-user base cannot be resolved at all.
+/// `%LOCALAPPDATA%\aterm` (else `%USERPROFILE%\AppData\Local\aterm`), where older builds
+/// bound the control socket, so the launch sweep can retire the `.sock` files left there;
+/// `sweep_stale_instances` only walks the current directory. `logs\` and the atpkg store
+/// still live under it, so a sweep touches `*.sock` entries only. Empty when the per-user
+/// base cannot be resolved.
 pub(crate) fn legacy_socket_dirs() -> Vec<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .filter(|v| !v.is_empty())
@@ -115,9 +109,7 @@ pub(crate) fn legacy_socket_dirs() -> Vec<PathBuf> {
     base.map(|b| b.join("aterm")).into_iter().collect()
 }
 
-/// Provision the capability token: fresh token, written through
-/// `create_new(true)` after an unlink-first, and returned as hex. The token
-/// rotates every launch — a leaked token from a prior run is worthless.
+/// Write a fresh per-launch capability token to `path` and return its hex.
 ///
 /// `CREATE_NEW` atomically refuses ANY pre-existing object at the path —
 /// including a planted symlink/junction — which is the `O_EXCL|O_NOFOLLOW`
@@ -147,9 +139,7 @@ pub(crate) fn provision_token(path: &Path) -> Option<String> {
     Some(token)
 }
 
-/// No-op on Windows (documented): there are no POSIX mode bits to tighten;
-/// the socket file inherits the private dir's ACL, and the directory ACL +
-/// mandatory token are the in-force gates.
+/// No-op: no mode bits; the socket file inherits the private directory's ACL.
 pub(crate) fn lock_socket_file(_path: &str) {}
 
 /// The accept-time peer gate: the peer pid afunix recorded, and the user its
@@ -201,12 +191,9 @@ mod acl {
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
     const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
     const TOKEN_QUERY: u32 = 0x0008;
-    /// `TOKEN_INFORMATION_CLASS::TokenOwner` — the SID assigned as OWNER to
-    /// objects this process creates. For a standard user this is the user SID; for
-    /// an ELEVATED admin it is the Administrators group SID (the default owner of
-    /// objects an elevated token creates), so comparing an object's owner against
-    /// it correctly accepts directories we could have created in BOTH cases (and
-    /// rejects one owned by a different principal) — where `TokenUser` would wrongly
+    /// `TOKEN_INFORMATION_CLASS::TokenOwner`: the default owner of objects this process
+    /// creates, the user SID for a standard user and the Administrators SID when elevated.
+    /// Comparing against it accepts a directory we created in either case; `TokenUser` would
     /// refuse every elevated launch.
     const TOKEN_OWNER_CLASS: u32 = 4;
     /// `TOKEN_INFORMATION_CLASS::TokenUser` — the user the token runs as.
@@ -373,7 +360,7 @@ mod acl {
         String::from_utf16_lossy(slice)
     }
 
-    /// The current process token's `TokenOwner` blob (the returned buffer OWNS the
+    /// The current process token's `TokenOwner` blob (the returned buffer owns the
     /// SID the pointer at its head references). `None` on any query failure.
     fn current_token_owner_info() -> Option<Vec<u8>> {
         // SAFETY: GetCurrentProcess returns a pseudo-handle, always valid.
@@ -427,7 +414,7 @@ mod acl {
         }
     }
 
-    /// The `class` blob of `process`'s token (the buffer OWNS any SID the
+    /// The `class` blob of `process`'s token (the buffer owns any SID the
     /// pointer at its head references). `None` on any query failure.
     fn token_info(process: Handle, class: u32) -> Option<Vec<u8>> {
         let mut token: Handle = 0;
@@ -463,7 +450,7 @@ mod acl {
 
     /// The `PSID` at the head of a `TokenOwner`/`TokenUser` blob
     /// (`TOKEN_OWNER.Owner` / `TOKEN_USER.User.Sid`, the first pointer-sized
-    /// field). Points INTO `buf`, valid while `buf` lives.
+    /// field). Points into `buf`, valid while `buf` lives.
     fn sid_ptr(buf: &[u8]) -> *mut c_void {
         if buf.len() < std::mem::size_of::<*mut c_void>() {
             return null_mut();
@@ -472,9 +459,8 @@ mod acl {
         unsafe { *(buf.as_ptr().cast::<*mut c_void>()) }
     }
 
-    /// Verify `dir` is owned by the current user (else refuse — fail closed) and
-    /// rewrite its DACL to a protected owner-only grant. Runs on every
-    /// `ensure_private_dir`; idempotent on a directory we already hardened.
+    /// Refuse `dir` unless the current user owns it, then rewrite its DACL to a protected
+    /// owner-only grant. Idempotent.
     pub(super) fn verify_owner_and_harden(dir: &Path) -> io::Result<()> {
         let owner_buf = current_token_owner_info()
             .ok_or_else(|| io::Error::other("cannot query process token owner SID"))?;
@@ -534,10 +520,9 @@ mod acl {
         ))
     }
 
-    /// Replace `dir`'s DACL with a PROTECTED (non-inheriting) grant of full access
-    /// to the owning principal + LocalSystem + Builtin Administrators — the
-    /// owner-only posture (analogous to Unix `0700`), so nothing else can read the
-    /// token or connect to the socket even if the directory inherited a loose ACL.
+    /// Replace `dir`'s DACL with a protected (non-inheriting) full-access grant to the owning
+    /// principal, LocalSystem and Builtin Administrators: the Unix `0700` analogue, whatever
+    /// ACL the directory inherited.
     fn harden_dacl(wide: &mut [u16], owner_sid: *mut c_void) -> io::Result<()> {
         let mut sid_str: *mut u16 = null_mut();
         // SAFETY: `owner_sid` is a valid SID from our own token blob.
@@ -908,17 +893,14 @@ mod acl {
 mod tests {
     use super::*;
 
-    /// A freshly-created, current-user-owned directory passes the owner check and
-    /// is hardened without error, and the owner retains full access afterward
-    /// (guards against the FFI ever bricking the socket for a legitimate launch).
+    /// An owned directory verifies and hardens, and the owner keeps full access.
     #[test]
     fn ensure_private_dir_accepts_and_hardens_owned_dir() {
         let dir = std::env::temp_dir().join(format!("aterm-win-acl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         ensure_private_dir(&dir).expect("current-user-owned dir must verify + harden");
         assert!(dir.is_dir());
-        // Idempotent: the dir now carries a protected DACL; a second pass still
-        // succeeds and we can still create files inside (owner keeps full access).
+        // A second pass over the protected DACL succeeds and the owner can still write.
         ensure_private_dir(&dir).expect("second pass over a hardened dir is idempotent");
         std::fs::write(dir.join("probe"), b"x").expect("owner can still write inside");
         let _ = std::fs::remove_dir_all(&dir);

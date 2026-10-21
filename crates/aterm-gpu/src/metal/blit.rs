@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The present-path blit on Metal, for the blit differential.
+//! The present-path blit on Metal, test-only: the macOS backend runs its blit
+//! from the same pipeline row inside [`super::present::encode_present_sequence`].
 //!
 //! [`super::tests::blit_matches_wgpu_byte_for_byte`] pushes the same source
-//! pixels and 112 uniform bytes through the wgpu blit and through this one and
-//! requires every byte to agree. That is stronger than `blit_invert.rs` and
-//! `blit_bands.rs`, which assert properties of one backend's output, because a
-//! gamma shift, swapped channel, filtered sample or half-texel offset shows as
-//! a byte difference on arbitrary pixels.
+//! pixels and 112 uniform bytes through the wgpu blit and this one and requires
+//! every byte to agree, so a gamma shift, swapped channel, filtered sample or
+//! half-texel offset fails on arbitrary pixels.
 //!
 //! # Binding map
 //!
@@ -185,7 +184,7 @@ impl MetalBlit {
                 dst_w: dw,
                 dst_h: dh,
                 // Opaque black; the pass writes every pixel, so this only
-                // matters for an aborted pass.
+                // matters if the pass fails.
                 load: ffi::LoadAction::Clear(ffi::ClearColor {
                     r: 0.0,
                     g: 0.0,

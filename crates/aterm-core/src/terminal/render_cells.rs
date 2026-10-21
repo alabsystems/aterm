@@ -1588,7 +1588,10 @@ impl Terminal {
         // which the consumer treats as untrusted.
         scratch.row_rev.clear();
         {
-            let revisions = self.grid_mut().row_revisions();
+            // Access `self.grid` directly: `Terminal::grid_mut` is the external
+            // escape hatch that invalidates `sync_end_caret`, whereas snapshotting
+            // row revisions during `cell_frame` must preserve the frame's close cell.
+            let revisions = self.grid.row_revisions();
             scratch.row_rev.extend_from_slice(revisions);
         }
         scratch.row_rev.resize(rows, 0);

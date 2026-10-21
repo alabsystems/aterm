@@ -15,9 +15,11 @@ use commands::*;
 pub mod api;
 pub mod bundle;
 pub mod cask;
+pub mod census;
 pub mod fetch;
 pub mod formula;
 pub mod install;
+pub mod machine;
 pub mod prefix;
 pub mod stub;
 pub mod tap;
@@ -210,6 +212,43 @@ fn failed(msg: &str) -> ExitCode {
     ExitCode::from(1)
 }
 
+/// Brew boolean env config is presence-based (`boolean: :set`).
+pub(super) fn env_set(name: &str) -> bool {
+    std::env::var_os(name).is_some()
+}
+
+/// The success badge brew prints after an install: suppressed by
+/// `HOMEBREW_NO_EMOJI`, overridable via `HOMEBREW_INSTALL_BADGE`.
+fn badge_from(no_emoji: bool, badge: Option<String>) -> Option<String> {
+    if no_emoji {
+        None
+    } else {
+        Some(
+            badge
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "🍺".to_string()),
+        )
+    }
+}
+
+pub(super) fn install_badge() -> Option<String> {
+    badge_from(
+        env_set("HOMEBREW_NO_EMOJI"),
+        std::env::var("HOMEBREW_INSTALL_BADGE").ok(),
+    )
+}
+
+/// `HOMEBREW_NO_INSTALL_CLEANUP`: skip removing superseded versions
+/// after install/upgrade (explicit `cleanup` still works).
+pub(super) fn no_install_cleanup() -> bool {
+    env_set("HOMEBREW_NO_INSTALL_CLEANUP")
+}
+
+/// `HOMEBREW_NO_ENV_HINTS`: suppress environment-behaviour hints.
+pub(super) fn no_env_hints() -> bool {
+    env_set("HOMEBREW_NO_ENV_HINTS")
+}
+
 fn from_install(prefix: &Prefix, args: &[String], r: Result<(), InstallError>) -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -218,14 +257,31 @@ fn from_install(prefix: &Prefix, args: &[String], r: Result<(), InstallError>) -
     }
 }
 
-/// A later fallback must not replay earlier successful native work in another prefix.
+/// A later fallback must not replay possibly retained native work in another prefix.
 fn after_native_progress(error: InstallError, completed: bool) -> InstallError {
     match error {
         InstallError::PassThrough(reason) if completed => InstallError::Failed(format!(
-            "{reason}; an earlier native step succeeded; refusing whole-command delegation"
+            "{reason}; an earlier native attempt may have retained changes; refusing whole-command delegation"
         )),
         error => error,
     }
+}
+
+/// A failed native attempt may already have retained an upgraded dependency.
+/// Keep a direct PassThrough eligible for the existing initial fallback;
+/// an ordinary failure conservatively forbids later whole-argv replay too.
+fn native_attempt_may_have_progress<T>(result: &Result<T, InstallError>) -> bool {
+    !matches!(result, Err(InstallError::PassThrough(_)))
+}
+
+/// Carry one actual native attempt through a dependency walk. A failed
+/// attempt can retain work too; a later fallback must honor that boundary.
+fn after_native_attempt<T>(
+    possible_progress: &mut bool,
+    result: Result<T, InstallError>,
+) -> Result<T, InstallError> {
+    *possible_progress |= native_attempt_may_have_progress(&result);
+    result.map_err(|error| after_native_progress(error, *possible_progress))
 }
 
 /// True for commands that mutate the prefix (they take the lock).
@@ -382,6 +438,9 @@ fn native_args(
                 "--json=v1",
                 "--json=v2",
                 "--installed",
+                "--analytics",
+                "--days",
+                "--category",
             ],
             0,
             usize::MAX,
@@ -482,11 +541,13 @@ fn native_args(
         // are not in the flag set and keep delegating.
         "--cache" => (&["--formula", "--cask"], 0, usize::MAX, true),
         "--repository" | "--repo" => (&[], 0, 1, false),
+        "--taps" => (&[], 0, 0, false),
         "analytics" => (&[], 0, 1, false),
         "doctor" | "dr" => (&["--quiet", "-q"], 0, 0, false),
         "shellenv" => (&[], 0, 1, false),
         "on" | "off" | "status" | "--version" | "-v" | "--env" | "env" | "formulae" | "casks"
-        | "commands" | "config" | "developer" | "update" => (&[], 0, 0, false),
+        | "config" | "developer" | "update" => (&[], 0, 0, false),
+        "commands" => (&["--quiet", "--include-aliases"], 0, 0, false),
         "leaves" => (
             &["--installed-on-request", "--installed-as-dependency"],
             0,
@@ -497,6 +558,11 @@ fn native_args(
     };
     let flag_ok = |arg: &str| {
         flags.contains(&arg)
+            || (cmd == "info"
+                && (arg
+                    .strip_prefix("--days=")
+                    .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    || arg.strip_prefix("--category=").is_some_and(valid_component)))
             || (cmd == "cleanup"
                 && arg.strip_prefix("--prune=").is_some_and(|v| {
                     v == "all" || (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
@@ -522,7 +588,11 @@ fn native_args(
         // they are a native refusal, never a reason to run a different prefix.
         cleanup_max_age(rest).map_err(|error| InstallError::Failed(error.to_string()))?;
     }
-    let ops = operands(rest);
+    let ops = if cmd == "info" {
+        operands_without_flag_values(rest, &["--days", "--category"])
+    } else {
+        operands(rest)
+    };
     if cmd == "completions"
         && !ops
             .first()
@@ -597,6 +667,33 @@ fn native_args(
     // --tree over every installed formula) is implemented.
     if cmd == "deps" && !has_flag(rest, "--installed", "") && ops.is_empty() {
         return Err(unsupported());
+    }
+    // info --analytics: named packages only here (the no-names
+    // global form reads a separate analytics endpoint); --days and
+    // --category depend on it in brew, and it does not combine
+    // with --json/--installed.
+    if cmd == "info" {
+        let analytics = has_flag(rest, "--analytics", "");
+        let json = rest
+            .iter()
+            .any(|s| matches!(s.as_str(), "--json" | "--json=v1" | "--json=v2"));
+        let days = flag_value(rest, "--days").map_err(|()| unsupported())?;
+        let category = flag_value(rest, "--category").map_err(|()| unsupported())?;
+        if days
+            .as_deref()
+            .is_some_and(|v| !matches!(v, "30" | "90" | "365"))
+            || category
+                .as_deref()
+                .is_some_and(|v| !matches!(v, "install" | "install-on-request" | "build-error"))
+        {
+            return Err(unsupported());
+        }
+        if (days.is_some() || category.is_some()) && !analytics {
+            return Err(unsupported());
+        }
+        if analytics && (json || has_flag(rest, "--installed", "") || ops.is_empty()) {
+            return Err(unsupported());
+        }
     }
     // desc's three search modes conflict in brew (it errors there,
     // so combined spellings delegate), and named mode keeps the
@@ -765,9 +862,8 @@ fn prelock_delegation(
         any = true;
         result = if want_cask || (!want_formula && api.formula(name).is_err()) {
             match api.cask(name) {
-                Ok(c) => {
-                    cask::preflight(prefix, &c).and_then(|()| cask::preflight_deps(api, prefix, &c))
-                }
+                Ok(c) => cask::preflight(prefix, &c, machine::Machine::this())
+                    .and_then(|()| cask::preflight_deps(api, prefix, &c)),
                 Err(_) => continue,
             }
         } else {
@@ -881,6 +977,10 @@ fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode 
             let api0 = api::Api::new(prefix.clone());
             return commands::cmd_cache_query(prefix, &api0, args, rest);
         }
+        "--taps" => {
+            println!("{}", prefix.taps_dir().display());
+            return ExitCode::SUCCESS;
+        }
         "--repository" | "--repo" => {
             // Admission validated the operand as a tap name. Like
             // brew, the path prints whether or not the tap stands.
@@ -957,7 +1057,7 @@ fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode 
                         Ok(())
                     } else {
                         match api0.cask(n) {
-                            Ok(c) => cask::preflight(prefix, &c)
+                            Ok(c) => cask::preflight(prefix, &c, machine::Machine::this())
                                 .and_then(|()| cask::preflight_deps(&api0, prefix, &c)),
                             Err(e) => Err(InstallError::Failed(e)),
                         }
@@ -1003,7 +1103,7 @@ fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode 
         "formulae" => list_index(&api, false),
         "casks" => list_index(&api, true),
         "commands" => {
-            for c in COMMANDS {
+            for c in command_names(has_flag(rest, "--include-aliases", "")) {
                 println!("{c}");
             }
             ExitCode::SUCCESS
@@ -1033,7 +1133,7 @@ fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode 
         "cleanup" => cmd_cleanup(prefix, &api, rest),
         "autoremove" => cmd_autoremove(prefix, &api, rest),
         "pin" => each_name(rest, |n| prefix.pin(Formula::short_name(n))),
-        "unpin" => each_name(rest, |n| prefix.unpin(Formula::short_name(n))),
+        "unpin" => cmd_unpin(prefix, &api, rest),
         "link" | "ln" => cmd_link(prefix, &api, args, rest, true),
         "unlink" => cmd_link(prefix, &api, args, rest, false),
         "switch" => cmd_switch(prefix, &api, args, rest),
@@ -1161,6 +1261,33 @@ const COMMANDS: &[&str] = &[
     "uses",
 ];
 
+/// Alternate spellings dispatch accepts for a roster command, as
+/// brew's `commands --include-aliases` lists them: merged into the
+/// same sorted listing, never in the plain one.
+const COMMAND_ALIASES: &[&str] = &[
+    "--repo",
+    "-S",
+    "-v",
+    "dependents",
+    "dr",
+    "homepage",
+    "ln",
+    "ls",
+    "remove",
+    "rm",
+];
+
+/// The `commands` listing: the roster, with aliases merged and the
+/// whole set sorted when asked (brew's shape in both forms).
+fn command_names(include_aliases: bool) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = COMMANDS.to_vec();
+    if include_aliases {
+        names.extend(COMMAND_ALIASES.iter().copied());
+        names.sort_unstable();
+    }
+    names
+}
+
 const HELP_MAIN: &str = "\
 abrew — aterm's Homebrew (docs/DESIGN-abrew-2026-10-19.md)
 
@@ -1197,6 +1324,9 @@ fn help_for(cmd: &str) -> &'static str {
         }
         "list" | "ls" => {
             "Usage: abrew list [--formula|--cask] [--versions] [--multiple] [--pinned] [--full-name] [-l|--long] [name…]\n       abrew list --versions --json [--formula|--cask]\n"
+        }
+        "info" => {
+            "Usage: abrew info [--formula|--cask] [--json[=v1|v2]] [--installed] [name…]\n       abrew info --analytics [--days N] [--category C] [--formula|--cask] <name>…\n"
         }
         "outdated" => {
             "Usage: abrew outdated [--formula|--cask] [--greedy] [--verbose|-v|--quiet|-q] [--json[=v1|v2]] [name…]\n"
@@ -1236,6 +1366,35 @@ mod admission_tests {
     }
 
     #[test]
+    fn badge_follows_brew_env_rules() {
+        assert_eq!(badge_from(false, None).as_deref(), Some("🍺"));
+        assert_eq!(
+            badge_from(false, Some(String::new())).as_deref(),
+            Some("🍺")
+        );
+        assert_eq!(
+            badge_from(false, Some("✅".to_string())).as_deref(),
+            Some("✅")
+        );
+        assert_eq!(badge_from(true, None), None);
+        assert_eq!(badge_from(true, Some("✅".to_string())), None);
+    }
+
+    #[test]
+    fn command_names_merge_aliases_sorted() {
+        let plain = command_names(false);
+        assert_eq!(plain.len(), COMMANDS.len());
+        assert!(!plain.contains(&"ls"));
+        let merged = command_names(true);
+        assert_eq!(merged.len(), COMMANDS.len() + COMMAND_ALIASES.len());
+        assert!(merged.windows(2).all(|w| w[0] < w[1]), "merged is sorted");
+        for alias in COMMAND_ALIASES {
+            assert!(merged.contains(alias), "{alias} listed");
+            assert!(!COMMANDS.contains(alias), "{alias} not duplicated");
+        }
+    }
+
+    #[test]
     fn unsupported_arguments_delegate_before_native_effects() {
         for (cmd, args) in [
             ("install", vec!["--HEAD", "wget"]),
@@ -1244,7 +1403,49 @@ mod admission_tests {
                 "install",
                 vec!["--cask", "--ignore-dependencies", "firefox"],
             ),
-            ("info", vec!["--analytics", "wget"]),
+            // info --analytics: the global form, dependent flags
+            // without it, and json/installed combos delegate.
+            ("info", vec!["--analytics"]),
+            ("info", vec!["--days=30", "wget"]),
+            ("info", vec!["--category", "install", "wget"]),
+            ("info", vec!["--analytics", "--json", "wget"]),
+            ("info", vec!["--analytics", "--installed", "wget"]),
+            ("info", vec!["--analytics", "wget", "--days=40"]),
+            ("info", vec!["--analytics", "--days", "40", "wget"]),
+            ("info", vec!["--analytics", "wget", "--days"]),
+            ("info", vec!["--analytics", "wget", "--days="]),
+            ("info", vec!["--analytics", "--days", "wget"]),
+            ("info", vec!["--analytics", "--days", "--formula", "wget"]),
+            ("info", vec!["--analytics", "wget", "--category=other"]),
+            ("info", vec!["--analytics", "--category", "other", "wget"]),
+            ("info", vec!["--analytics", "wget", "--category"]),
+            ("info", vec!["--analytics", "wget", "--category="]),
+            (
+                "info",
+                vec!["--analytics", "--category", "--days=30", "wget"],
+            ),
+            // Values alone are not named packages; the global form still delegates.
+            ("info", vec!["--analytics", "--days", "30"]),
+            ("info", vec!["--analytics", "--category", "install"]),
+            (
+                "info",
+                vec!["--analytics", "--days=30", "--category=install"],
+            ),
+            // Conflicting/repeated value options have no native precedence policy.
+            (
+                "info",
+                vec!["--analytics", "--days=30", "--days=90", "wget"],
+            ),
+            (
+                "info",
+                vec![
+                    "--analytics",
+                    "--category=install",
+                    "--category",
+                    "build-error",
+                    "wget",
+                ],
+            ),
             ("link", vec!["--overwrite", "wget"]),
             ("services", vec!["start", "wget"]),
             ("uninstall", vec!["--zap", "firefox"]),
@@ -1397,6 +1598,34 @@ mod admission_tests {
             ("outdated", vec!["--json=v2"]),
             ("outdated", vec!["--json", "--formula"]),
             ("info", vec!["--json=v2", "wget"]),
+            ("info", vec!["--analytics", "wget"]),
+            ("info", vec!["--analytics", "--days=30", "wget"]),
+            (
+                "info",
+                vec!["--analytics", "--days", "90", "--cask", "firefox"],
+            ),
+            ("info", vec!["--analytics", "--category", "install", "wget"]),
+            ("info", vec!["--analytics", "--days=365", "wget"]),
+            ("info", vec!["--analytics", "wget", "--days", "30"]),
+            (
+                "info",
+                vec!["--analytics", "--category=install-on-request", "wget"],
+            ),
+            (
+                "info",
+                vec!["--analytics", "wget", "--category", "build-error"],
+            ),
+            (
+                "info",
+                vec![
+                    "--analytics",
+                    "--category=install",
+                    "--days",
+                    "90",
+                    "--formula",
+                    "homebrew/core/wget",
+                ],
+            ),
             ("info", vec!["--installed", "--json"]),
             ("doctor", vec!["--quiet"]),
             ("shellenv", vec!["fish"]),
@@ -1495,6 +1724,60 @@ mod admission_tests {
         for completed in [false, true] {
             let native = InstallError::Failed("native refusal".to_string());
             assert_eq!(after_native_progress(native.clone(), completed), native);
+        }
+
+        // An inner dependency plan can retain progress and return Failed.
+        // Accumulating that failure must not authorize a later member to
+        // replay the whole command. A direct initial fallback stays allowed.
+        let fallback = || InstallError::PassThrough("later recipe needs brew".to_string());
+        let initial: Result<(), _> = Err(fallback());
+        assert!(!native_attempt_may_have_progress(&initial));
+        assert_eq!(
+            after_native_progress(fallback(), native_attempt_may_have_progress(&initial)),
+            fallback()
+        );
+        for earlier in [
+            Ok(()),
+            Err(InstallError::Failed("retained dependency work".to_string())),
+        ] {
+            let possible_progress = native_attempt_may_have_progress(&earlier);
+            assert!(possible_progress);
+            assert!(matches!(
+                after_native_progress(fallback(), possible_progress),
+                InstallError::Failed(_)
+            ));
+            assert_eq!(
+                after_native_progress(
+                    InstallError::Failed("ordinary failure".to_string()),
+                    possible_progress
+                ),
+                InstallError::Failed("ordinary failure".to_string())
+            );
+        }
+
+        // Recursive cask dependencies share this same boundary. Empty or
+        // already-installed walks record no attempt; an initial fallback
+        // remains unchanged. A successful F1 or a failed partial attempt
+        // makes F2's later fallback a local failure.
+        let mut possible_progress = false;
+        let initial: Result<(), _> = after_native_attempt(&mut possible_progress, Err(fallback()));
+        assert_eq!(initial, Err(fallback()));
+        assert!(!possible_progress);
+        for first in [
+            Ok(()),
+            Err(InstallError::Failed("retained dependency work".to_string())),
+        ] {
+            let mut possible_progress = false;
+            let expected = first.clone();
+            assert_eq!(
+                after_native_attempt(&mut possible_progress, first),
+                expected
+            );
+            assert!(possible_progress);
+            let later: Result<(), _> =
+                after_native_attempt(&mut possible_progress, Err(fallback()));
+            assert!(matches!(later, Err(InstallError::Failed(_))));
+            assert!(possible_progress);
         }
     }
 

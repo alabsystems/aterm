@@ -1,48 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THRU-4a — the never-done half of SIMD-UTF8: a bulk validate+decode fast lane
-//! for HOMOGENEOUS multibyte runs (long stretches of same-length sequences —
-//! CJK/Hangul/Greek/Cyrillic 3-byte, Latin-extended 2-byte, SMP-emoji 4-byte),
-//! the shape that dominates the `cjk`/`mixed` and `wide_unicode` corpora.
+//! Bulk validate-and-decode for runs of same-length UTF-8 sequences (3-byte
+//! CJK/Hangul/Greek/Cyrillic, 2-byte Latin extensions, 4-byte emoji).
 //!
-//! It is an ADDITIVE fast lane, not a replacement: [`bulk_decode_run`] consumes
-//! only the maximal prefix of the input that is one uniformly-valid sequence
-//! class, and STOPS — returning the bytes consumed so far — at the first byte it
-//! cannot take (a class change, an invalid/overlong/surrogate sequence, an
-//! incomplete tail, or a full output buffer). The caller (`decode_multibyte_run`
-//! in `dispatch.rs`) handles that one boundary byte with the scalar
-//! `decode_multibyte_char` oracle and then re-enters this lane, so the byte-exact
-//! decoding semantics — including the U+FFFD replacement policy for malformed
-//! input — remain entirely the scalar path's, proven by the `utf8_parity` /
-//! `utf8_errors` suites and the `bulk_matches_scalar_*` differential tests here.
+//! [`bulk_decode_run`] takes only the prefix that is one class of valid
+//! sequences and stops at the first byte it cannot take (class change,
+//! invalid/overlong/surrogate sequence, incomplete tail, full buffer). The
+//! caller (`decode_multibyte_run` in `dispatch.rs`) decodes that one with the
+//! scalar `decode_multibyte_char` and re-enters, so the scalar path owns the
+//! decoding and U+FFFD semantics; the `bulk_*` differential tests hold the lane
+//! to it.
 //!
-//! WHY THIS IS FASTER: each per-class loop is monomorphic — it drops the
-//! three-way lead-class dispatch and the per-character "is the next byte still a
-//! multibyte lead?" re-check that the general scalar loop pays every iteration,
-//! leaving a tight fixed-stride body (continuation-byte mask + shift/or codepoint
-//! assembly) the branch predictor and LLVM's autovectorizer both handle far
-//! better. It is SAFE code with no `std::arch` intrinsics — the sanctioned
-//! aarch64 idiom (the Trust verifier fails closed on unmodeled intrinsics), so
-//! it stays inside the always-on verification gate; the hand-NEON variant is the
-//! separate, proof-carried THRU-4(b).
+//! Each loop is monomorphic: no per-character lead-class dispatch, just a
+//! fixed-stride body. Safe code with no `std::arch` intrinsics, which Trust's
+//! verifier fails closed on.
 
 use aterm_alloc::ArrayVec;
 
-/// Multibyte output batch cap — must match `dispatch.rs`'s `ArrayVec<char, 256>`.
+/// The run buffer's capacity (`decode_multibyte_run`'s `ArrayVec<char, 256>`).
 pub(crate) const RUN_CAP: usize = 256;
 
-/// Decode a maximal run of consecutive, fully-valid, SAME-LENGTH UTF-8 multibyte
-/// sequences from the front of `bytes`, appending decoded `char`s to `out` (never
-/// past its [`RUN_CAP`] capacity). Returns the number of bytes consumed.
-///
-/// Dispatches on the class of `bytes[0]` and defers to the matching fixed-stride
-/// loop. Returns `0` (consumes nothing) when `bytes` is empty, does not start on
-/// a multibyte lead, or its first sequence is not fully valid — in every such
-/// case the caller's scalar boundary step makes progress, so no caller loop can
-/// spin. Because each loop's acceptance test is byte-for-byte the scalar
-/// `decode_multibyte_char`'s, the chars produced here are exactly the chars the
-/// scalar path would produce for the bytes consumed.
+/// Decode the run of valid same-length multibyte sequences at the front of
+/// `bytes` into `out` (up to its capacity); returns the bytes consumed. `0`
+/// when `bytes` is empty, does not start on a multibyte lead, or begins with an
+/// invalid sequence, so the caller's scalar step always makes progress. Each
+/// loop accepts exactly what `decode_multibyte_char` accepts.
 pub(crate) fn bulk_decode_run(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
     match bytes.first() {
         Some(&b0) if (0xE0..=0xEF).contains(&b0) => bulk_3byte(bytes, out),
@@ -52,12 +35,11 @@ pub(crate) fn bulk_decode_run(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -
     }
 }
 
-/// 3-byte run (BMP non-ASCII: CJK, Hangul, Greek, Cyrillic, …) — the dominant
-/// class in the target corpora.
+/// 3-byte run (BMP: CJK, Hangul, Greek, Cyrillic, ...).
 fn bulk_3byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
     let mut i = 0usize;
     while !out.is_full() {
-        // Total, panic-free: a slice of exactly 3 or nothing (incomplete tail).
+        // Exactly 3 bytes, or none left (an incomplete tail).
         let Some(&[b0, b1, b2]) = bytes.get(i..i + 3) else {
             break;
         };
@@ -65,27 +47,23 @@ fn bulk_3byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
         if !(0xE0..=0xEF).contains(&b0) {
             break;
         }
-        // Continuation bytes.
         if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
             break;
         }
         let cp = (u32::from(b0 & 0x0F) << 12) | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F);
-        // Overlong (< 0x800) and surrogates (0xD800..=0xDFFF) are handed back to
-        // the scalar path, which emits the U+FFFD replacement exactly as before.
+        // Overlong and surrogate: left to the scalar path, which replaces them.
         if cp < 0x800 || (0xD800..=0xDFFF).contains(&cp) {
             break;
         }
-        // cp is in 0x800..=0xFFFF and non-surrogate ⇒ a valid scalar value, so
-        // `from_u32` is always `Some`; `unwrap_or` never yields the fallback (it
-        // exists only to keep the loop free of `unwrap`/panic obligations).
+        // A scalar value, so `from_u32` is `Some`; the fallback only keeps the
+        // loop free of panic obligations.
         out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
         i += 3;
     }
     i
 }
 
-/// 2-byte run (Latin-1 supplement, Latin Extended, IPA, Greek, Cyrillic in the
-/// 0x80..=0x7FF range).
+/// 2-byte run (U+0080..=U+07FF: Latin extensions, IPA, Greek, Cyrillic).
 fn bulk_2byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
     let mut i = 0usize;
     while !out.is_full() {
@@ -99,7 +77,7 @@ fn bulk_2byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
             break;
         }
         let cp = (u32::from(b0 & 0x1F) << 6) | u32::from(b1 & 0x3F);
-        // Overlong 2-byte forms (leads 0xC0/0xC1 ⇒ cp < 0x80) go to the scalar path.
+        // Overlong (leads 0xC0/0xC1): left to the scalar path.
         if cp < 0x80 {
             break;
         }
@@ -142,9 +120,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    /// The scalar oracle: decode ONE multibyte char exactly as `dispatch.rs`'s
-    /// `decode_multibyte_char` does, so the differential tests compare against
-    /// the shipping semantics (kept a byte-for-byte copy on purpose).
+    /// A deliberate copy of `Parser::decode_multibyte_char`, the scalar oracle.
     fn scalar_one(lead: u8, rem: &[u8]) -> Option<(char, usize)> {
         if lead >= 0xF0 {
             if let &[c0, c1, c2, ..] = rem
@@ -187,9 +163,8 @@ mod tests {
         }
     }
 
-    /// Reference: decode a homogeneous run one scalar char at a time, exactly the
-    /// way the caller's boundary step would, and stop where `bulk_decode_run`
-    /// must stop (class change / invalid / incomplete / full).
+    /// Reference: decode a run one scalar char at a time, stopping where
+    /// `bulk_decode_run` must (class change, invalid, incomplete, full).
     fn ref_run(bytes: &[u8]) -> (Vec<char>, usize) {
         let mut out = Vec::new();
         let mut i = 0usize;
@@ -256,8 +231,7 @@ mod tests {
 
     #[test]
     fn bulk_respects_the_run_cap() {
-        // 300 CJK chars but the batch caps at RUN_CAP: consume exactly RUN_CAP
-        // sequences (RUN_CAP*3 bytes), leaving the rest for the next call.
+        // 300 chars, but a call takes at most RUN_CAP.
         let s = "中".repeat(300);
         let (bc, bi) = bulk_run(s.as_bytes());
         assert_eq!(bc.len(), RUN_CAP);
@@ -303,8 +277,7 @@ mod tests {
         }
     }
 
-    /// Exhaustive-ish differential fuzz: random byte buffers, bulk vs the scalar
-    /// reference must agree on (chars, consumed) for every one.
+    /// Random buffers: bulk and the scalar reference agree on (chars, consumed).
     #[test]
     fn bulk_matches_scalar_on_random_buffers() {
         let mut state = 0x1234_5678_9abc_def0u64;

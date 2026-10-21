@@ -3,10 +3,8 @@
 
 //! `ArrayVec<T, N>`: fixed-capacity inline-only storage.
 //!
-//! The implementation names only `core` items and the crate root is
-//! `#![no_std]`: `crates/aterm-arrayvec` republishes this type as `arrayvec`,
-//! and some of its third-party consumers (`naga`, and `tiny-skia` until LW.5)
-//! take it with `default-features = false`.
+//! Uses only `core` items (`#![no_std]`) so `crates/aterm-arrayvec` can
+//! re-export it as `arrayvec` for `default-features = false` consumers.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -175,8 +173,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// Clear all elements.
-    // Skip: it is `truncate(0)`, the init-tracking class of `pop`; skipped as
-    // before so the parser's verified calls see the same callee.
+    // Skip: `truncate(0)` is in the same init-tracking class as `pop`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn clear(&mut self) {
         self.truncate(0);
@@ -326,15 +323,11 @@ impl<T, const N: usize> ArrayVec<T, N> {
         impl<T, const N: usize> Drop for RetainGuard<'_, T, N> {
             fn drop(&mut self) {
                 // `0..write` are kept, `write..read` are vacated (moved down
-                // or dropped), and `read..original_len` were never decided —
-                // only a panic leaves any: the predicate's, or a rejected
-                // element's destructor's. Keep those, closing the vacated gap
-                // by rotating it past them (ruling 2026-10-10: upstream and
-                // std keep them; this used to drop them all).
-                // Rotating `MaybeUninit` slots moves bytes and runs no user
-                // code. The bounds are clamped (identical when the invariant
-                // `write <= read <= original_len <= N` holds) so the subslice
-                // and the arithmetic carry their proofs.
+                // or dropped), and `read..original_len` were never decided if a
+                // panic occurred in the predicate or a rejected element's
+                // destructor. Rotate the vacated gap past the undecided tail so
+                // undecided elements are preserved, with bounds clamped for the
+                // verifier.
                 let end = if self.original_len < N {
                     self.original_len
                 } else {
@@ -815,18 +808,11 @@ impl<T, const N: usize> ExactSizeIterator for Drain<'_, T, N> {}
 
 impl<T, const N: usize> Drop for Drain<'_, T, N> {
     fn drop(&mut self) {
-        // The un-yielded part of the range is `start..start + remaining`.
-        // Rotate it to the end of the vec, which closes the tail up behind the
-        // prefix, then cut it off with `truncate`, which lowers `len` first and
-        // drops the cut slots with slice drop glue. So an early-dropped `Drain`
-        // leaves the same vec an exhausted one would, even when one of the
-        // range's destructors panics (ruling 2026-10-10: removing one element
-        // at a time stopped at the panic and left the rest of the range in the
-        // vec). Rotation moves bytes and runs no user code. The bounds are
-        // clamped against the slices' own lengths, and the new length is a
-        // saturating difference (all identical when the invariant
-        // `start + remaining <= len` holds), so the index, the rotation and
-        // the arithmetic carry their proofs.
+        // Rotate the un-yielded range (`start..start + remaining`) to the end
+        // of the vec and `truncate` it off so `len` is lowered before slice
+        // drop glue runs, leaving the vec valid even if a destructor panics.
+        // Bounds are clamped so the index, rotation, and arithmetic carry their
+        // proofs.
         if self.remaining == 0 {
             return;
         }

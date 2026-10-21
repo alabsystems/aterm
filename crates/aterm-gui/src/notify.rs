@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Native desktop notification DELIVERY for OSC 9 / OSC 99 / OSC 777.
+//! Native desktop notification delivery for OSC 9 / OSC 99 / OSC 777.
 //!
 //! The engine (`aterm-core`) already PARSES these escapes and fires
 //! `set_notification_callback` (OSC 9 / 777, a plain body string) and
@@ -11,14 +11,14 @@
 //! callbacks into real macOS / Windows / Linux notifications, with two hard
 //! rules borrowed from the OSC 52 clipboard path:
 //!
-//! 1. **Never block the engine.** The callbacks fire on a tab's PTY reader
-//!    thread, under the `Terminal` lock. They MUST NOT spawn a subprocess
-//!    there. Instead each callback does a single lock-free, NON-BLOCKING
-//!    `mpsc::SyncSender::try_send` of a [`NotifyMsg`] onto a BOUNDED channel (cap
-//!    [`NOTIFY_QUEUE_CAP`]) — DROPPING the message when the queue is full, so a
-//!    notification flood can never grow the queue unbounded or block the engine;
-//!    a dedicated delivery thread ([`spawn_delivery`]) owns the receiver and runs
-//!    the (blocking) notifier subprocess off the hot path.
+//! 1. Never block the engine. The callbacks run on a tab's PTY reader thread under the
+//!    `Terminal` lock, so each only `try_send`s a [`NotifyMsg`] onto a bounded channel
+//!    ([`NOTIFY_QUEUE_CAP`]); a delivery thread ([`spawn_delivery`]) runs the notifier.
+//! 2. Untrusted content. A body is program output (over SSH, the remote's): the osascript
+//!    fallback escapes it into an AppleScript literal ([`applescript_escape`]) passed as one
+//!    argv entry, never a shell string; `terminal-notifier` takes argv directly; the Windows
+//!    path writes fixed-size WCHAR fields, so [`fold_to_utf16`] only folds control bytes and
+//!    truncates.
 //!
 //! 2. **Untrusted content.** A notification body is program output — over SSH it
 //!    is fully attacker-controlled. The osascript fallback builds an AppleScript
@@ -42,17 +42,13 @@
 //! `suppress-sound` hint at normal urgency, never `urgency = low`, which GNOME
 //! Shell shows with no banner at all.
 //!
-//! **Focus-aware suppression.** The delivery thread reads a shared SUPPRESSION SET
-//! the main (UI) thread keeps current: the active-tab focused-pane session id of
-//! EVERY focused window. A notification is suppressed ONLY when its originating
-//! session is in that set (the user is already looking at it in some focused
-//! window). App unfocused (empty set), OR a background tab fired it → delivered.
-//! Carrying the SET (not a single `focused` bool + one `active` id) makes this
-//! per-window-correct: with two windows, a focused non-front window's active tab
-//! suppresses correctly, and the front window's active tab does NOT suppress when
-//! the front window is unfocused. At one window the set is `{active}` (focused) or
-//! `{}` (unfocused) — byte-identical to the old two-atomic behavior. This matches
-//! the iTerm2 / Terminal.app default and keeps background-tab activity visible.
+//! Identity and consent (macOS): both delivery paths are subprocesses that run with aterm as
+//! their TCC "responsible" app, so they ask the system for things in aterm's name at a
+//! program's request. Program notifications therefore sit behind the fail-closed
+//! `allow_notifications` opt-in (`handler_osc_notify.rs` fires no callback while it is off).
+//! On macOS 26 an osascript under aterm raises only WindowServer's `kTCCServiceListenEvent`
+//! preflight, which never prompts. An in-process `UNUserNotificationCenter` path would move the
+//! identity to the bundle and need its own notification consent.
 //!
 //! **Identity and consent (macOS).** Both delivery paths are SUBPROCESSES, and a
 //! subprocess of aterm runs with aterm as its TCC "responsible" app — whatever it
@@ -176,8 +172,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 
-/// One pending notification handed from a tab's engine callback to the delivery
-/// thread. `session` is the originating tab's id (for focus-aware suppression).
+/// One pending notification handed from a tab's engine callback to the delivery thread.
 pub(crate) struct NotifyMsg {
     /// Originating session/tab id (matched against the active tab to suppress
     /// self-notifications the user is already watching). Only a host with real
@@ -197,10 +192,8 @@ pub(crate) struct NotifyMsg {
 }
 
 impl NotifyMsg {
-    /// One PROGRAM notification (OSC 9/99/777), already admitted by the
-    /// `allow_notifications` opt-in. Off a delivery host (`spawn_delivery` there
-    /// only drains the channel) the session and title have no reader, and are
-    /// dropped here.
+    /// One program notification (OSC 9/99/777), already admitted by `allow_notifications`.
+    /// Off a delivery host the session and title have no reader and are dropped here.
     pub(crate) fn program(session: u64, title: Option<String>, body: String) -> Self {
         Self::with_origin(session, title, body, false)
     }
@@ -263,15 +256,10 @@ fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>, own_alerts: bool) -> boo
     !suppressed.contains(&msg.session)
 }
 
-/// Bound on the notification delivery queue, mirroring the OSC 52 clipboard
-/// pipeline's queue-bounding. Each [`NotifyMsg`] is up to ~4 KiB and the delivery
-/// thread blocks ~100 ms per notifier subprocess, so an UNBOUNDED channel let a
-/// program flooding OSC 9/99/777 grow the queue without bound (memory exhaustion)
-/// and spawn one blocking subprocess per message (subprocess spam). A small
-/// `sync_channel` cap bounds queue memory to `N·msg`; the producer (the engine
-/// callback) `try_send`s and DROPS on `Full` rather than blocking the PTY reader
-/// thread. Unlike the clipboard (last-writer-wins, coalesced), notifications are
-/// DISTINCT, so the overflow is dropped — never coalesced.
+/// Bound on the delivery queue. The delivery thread blocks ~100 ms per notifier subprocess, so
+/// a flood of OSC 9/99/777 must grow neither memory nor subprocesses: producers `try_send` and
+/// drop on `Full`. Notifications are distinct (unlike OSC 52's last-writer-wins clipboard), so
+/// overflow is dropped, not coalesced.
 const NOTIFY_QUEUE_CAP: usize = 16;
 
 /// Whether this build has a host that can turn a queued notification into an
@@ -494,10 +482,8 @@ fn deliver(
         return;
     }
 
-    // Fallback: osascript. The body + title go into an AppleScript string
-    // literal, so both are escaped. The script itself is passed as a single
-    // `-e` argv entry (never via a shell), closing the shell-injection vector;
-    // `applescript_escape` closes the AppleScript-injection vector.
+    // Fallback: osascript. Body and title land in an AppleScript string literal, so both are
+    // escaped, and the script is one `-e` argv entry, never a shell string.
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
         applescript_escape(body),
@@ -868,7 +854,7 @@ fn deliver(title: Option<&str>, body: &str, silent: bool) {
         return;
     }
     let title = title.unwrap_or("aterm");
-    // An empty `szInfo` HIDES the balloon entirely, so a title-only OSC 99
+    // An empty `szInfo` hides the balloon entirely, so a title-only OSC 99
     // (body absent) promotes the title into the body slot.
     let (title, body) = if body.is_empty() {
         ("aterm", title)
@@ -1174,10 +1160,9 @@ mod win_balloon {
     /// `RegisterClassW` "failure" that is fine: the class already exists.
     const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
 
-    /// How long the transient icon (and thus the balloon/toast) stays before
-    /// `NIM_DELETE`. The shell's default balloon display time is ~5 s; this
-    /// covers it, and the bounded queue drops overflow while we linger, so a
-    /// flood costs at most `NOTIFY_QUEUE_CAP` lingers.
+    /// How long the transient icon (and so the balloon) stays before `NIM_DELETE`: the shell's
+    /// default display time is ~5 s, and the bounded queue drops overflow meanwhile, so a flood
+    /// costs at most `NOTIFY_QUEUE_CAP` lingers.
     const BALLOON_LINGER: Duration = Duration::from_secs(6);
 
     /// `POINT`.
@@ -1341,9 +1326,8 @@ mod win_balloon {
     }
 
     impl Notifier {
-        /// Register the (idempotent) window class and create the hidden
-        /// message-only window; `None` on any failure (delivery then stays a
-        /// silent drain, matching the pre-Windows-arm behavior).
+        /// Register the (idempotent) window class and create the hidden message-only window;
+        /// `None` on any failure, and delivery then drains silently.
         fn create() -> Option<Self> {
             let class: Vec<u16> = "aterm_notify_wnd\0".encode_utf16().collect();
             // SAFETY: `class` is a live NUL-terminated UTF-16 buffer for the
@@ -1438,9 +1422,8 @@ mod win_balloon {
             if unsafe { Shell_NotifyIconW(NIM_ADD, &mut nid) } == 0 {
                 return;
             }
-            // Keep the icon alive while the balloon shows, PUMPING messages so
-            // the tray's liveness pings on our window are answered (an
-            // unresponsive owner gets its icon reaped mid-balloon).
+            // Keep the icon alive while the balloon shows, pumping messages so the tray's
+            // liveness pings are answered (an unresponsive owner's icon is reaped mid-balloon).
             pump_for(BALLOON_LINGER);
             // SAFETY: same `nid` identifies the icon added above.
             unsafe { Shell_NotifyIconW(NIM_DELETE, &mut nid) };
@@ -1478,13 +1461,9 @@ mod win_balloon {
     }
 }
 
-/// Escape a string for embedding inside an AppleScript double-quoted string
-/// literal. Backslash and double-quote are the literal's two metacharacters and
-/// are backslash-escaped; newlines/carriage-returns would break the single-line
-/// literal and are folded to spaces; any other C0 control byte is also folded to
-/// a space (notifications are one-liners — control bytes carry no display value
-/// and only invite terminal/AppleScript quirks). Defined platform-independently
-/// so it is unit-tested on every target.
+/// Escape a string for an AppleScript double-quoted literal: backslash and double-quote are
+/// backslash-escaped, and newlines and every other C0 control fold to spaces (a notification
+/// is one line). Built on every target for tests.
 #[cfg(any(target_os = "macos", test))]
 fn applescript_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -1500,13 +1479,10 @@ fn applescript_escape(s: &str) -> String {
     out
 }
 
-/// Sanitize + truncate a notification string into a fixed-size NUL-terminated
-/// UTF-16 field (the Windows `NOTIFYICONDATAW.szInfo`/`szInfoTitle`/`szTip`
-/// buffers). Control bytes are folded to spaces exactly as
-/// [`applescript_escape`] folds them (no escaping — the bytes land in a plain
-/// WCHAR buffer, never an interpreter); the copy stops at `out.len() - 1` units
-/// WITHOUT splitting a surrogate pair (truncation is per `char`). Defined
-/// platform-independently so it is unit-tested on every target.
+/// Fold and truncate a notification string into a fixed-size NUL-terminated UTF-16 field
+/// (`NOTIFYICONDATAW.szInfo`/`szInfoTitle`/`szTip`). Control bytes become spaces as in
+/// [`applescript_escape`] (no escaping: a WCHAR buffer is no interpreter); the copy stops at
+/// `out.len() - 1` units without splitting a surrogate pair. Built on every target for tests.
 #[cfg(any(windows, test))]
 fn fold_to_utf16(s: &str, out: &mut [u16]) {
     let Some(cap) = out.len().checked_sub(1) else {
@@ -1892,12 +1868,9 @@ mod tests {
         );
     }
 
-    /// The consent path's instance-level notice (the warm-up's denial, which
-    /// belongs to no tab) is not suppressed by the first tab's focus. Session
-    /// `0` is that tab, and the suppression set starts as `{0}`; the notice
-    /// used to carry `0`, so it was dropped whenever the first tab was focused,
-    /// and its one-shot gate was already spent. NEGATIVE CONTROL: a notice that
-    /// does name session `0` is suppressed by the same set.
+    /// The consent path's instance-level notice (the warm-up's denial, which belongs to no tab)
+    /// is not suppressed by the first tab's focus (session `0`, the set's initial member).
+    /// Negative control: a notice that does name session `0` is suppressed.
     #[test]
     fn an_instance_level_consent_notice_is_not_suppressed_by_the_first_tab() {
         use crate::consent_observer::{AttentionEvent, AttentionGate};

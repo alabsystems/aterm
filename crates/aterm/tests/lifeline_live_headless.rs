@@ -30,8 +30,6 @@ use std::time::{Duration, Instant};
 /// machine, and a wait that is met ends the moment it is.
 const CEILING: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(20);
-/// Keep a unix-socket path well inside the 104-byte `sun_path`.
-const MAX_SOCK_PATH: usize = 100;
 
 /// A scratch world, removed on drop.
 struct World(PathBuf);
@@ -48,12 +46,7 @@ fn world(tag: &str) -> World {
     let name = format!("atll{tag}-{}", std::process::id());
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
         let root = base.join(&name);
-        if root
-            .join("run/aterm/aterm-4294967295.sock.token")
-            .as_os_str()
-            .len()
-            >= MAX_SOCK_PATH
-        {
+        if !launch_isolation::sock_fits(&root.join("run/aterm/aterm-4294967295.sock.token")) {
             continue;
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -336,10 +329,15 @@ fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
     launch_isolation::apply(&mut cmd, &root_b);
     let out = cmd
         .arg("doctor")
+        .args(["--read-only", "--only", "base.session.instances"])
         .stdin(Stdio::null())
         .output()
         .expect("run aterm doctor");
-    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         out.status.success(),
         "an unreachable instance is a note, not a failure:\n{report}"

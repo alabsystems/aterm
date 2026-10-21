@@ -1052,6 +1052,9 @@ pub struct UsageFacts {
     pub unread: usize,
     /// More files may exist than were seen ([`Refresh::walk_cut`]).
     pub unread_more: bool,
+    /// The refresh that folded these totals read the whole session ([`Refresh::complete`]):
+    /// a rate taken between two facts is a rate only where both are complete.
+    pub complete: bool,
     /// The limit wall still standing, from the transcript ([`wall_of`]).
     pub wall: Option<Wall>,
     /// Seconds Claude was working in this conversation: the union of its main transcript's
@@ -1064,7 +1067,8 @@ impl UsageFacts {
     /// The facts — the tokens, the wall, and what `left_out` (the refresh
     /// that folded them) left out of the totals, said whether or not any
     /// tokens are shown yet — or `None` when there is nothing to show. No
-    /// runtime: [`Self::with_runtime`] adds it.
+    /// runtime: [`Self::with_runtime`] adds it. Complete only where that
+    /// refresh says so ([`Refresh::complete`]); with no refresh, not.
     #[must_use]
     pub fn of(
         models: (Vec<ModelTokens>, More),
@@ -1078,9 +1082,27 @@ impl UsageFacts {
             more,
             unread,
             unread_more,
+            complete: left_out.is_some_and(Refresh::complete),
             wall,
             runtime: None,
         })
+    }
+
+    /// Every output token these facts count: the named models' and [`Self::more`]'s.
+    #[must_use]
+    pub fn output_total(&self) -> u64 {
+        self.models
+            .iter()
+            .fold(self.more.output, |sum, m| sum.saturating_add(m.output))
+    }
+
+    /// Every input token these facts count, as [`ModelTokens::input`] counts them: the
+    /// named models' and [`Self::more`]'s.
+    #[must_use]
+    pub fn input_total(&self) -> u64 {
+        self.models
+            .iter()
+            .fold(self.more.input, |sum, m| sum.saturating_add(m.input))
     }
 
     /// These facts with Claude's working time: `busy_ms` (the main
@@ -1309,15 +1331,7 @@ pub fn usage_text_at(facts: &UsageFacts, grain: UsageGrain) -> Option<String> {
             text
         }
         _ if facts.models.is_empty() => String::new(),
-        _ => {
-            let (input, output) = facts
-                .models
-                .iter()
-                .fold((facts.more.input, facts.more.output), |(i, o), m| {
-                    (i.saturating_add(m.input), o.saturating_add(m.output))
-                });
-            pair(input, output)
-        }
+        _ => pair(facts.input_total(), facts.output_total()),
     };
     parts.extend((!tokens.is_empty()).then_some(tokens));
     match (facts.unread, facts.unread_more) {

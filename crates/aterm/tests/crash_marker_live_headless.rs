@@ -31,8 +31,6 @@ use std::time::Duration;
 
 use crate::{headless_boot, launch_isolation};
 
-use headless_boot::MAX_SOCK_PATH;
-
 /// How long a wait for something that must happen (a reply, a marker going) may take before it
 /// is read as a hang (AGENTS.md).
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -66,7 +64,7 @@ fn world() -> World {
     let name = format!("atcm-{}", std::process::id());
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
         let root = base.join(&name);
-        if root.join("run/aterm/c.sock.token").as_os_str().len() >= MAX_SOCK_PATH {
+        if !launch_isolation::sock_fits(&root.join("run/aterm/c.sock.token")) {
             continue;
         }
         if launch_isolation::prepare(&root).is_ok() {

@@ -151,4 +151,73 @@ pub struct DWM_BLURBEHIND {"###,
         old: r###"link!("user32.dll" "system" fn PeekMessageW("###,
         new: r###"link!("kernel32.dll" "system" fn PeekMessageW("###,
     },
+    // The hand-written COM vocabulary and DXGI slice (WB.2), held to
+    // `windows` 0.62.2 by win32-oracle/conformance/src/com.rs.
+    Plant {
+        name: r###"com-slot-inserted"###,
+        phase: r###"conformance"###,
+        file: r###"src/dxgi.rs"###,
+        old: r###"    // IDXGIOutput6
+    pub GetDesc1:"###,
+        new: r###"    // IDXGIOutput6
+    pub Reserved: usize,
+    pub GetDesc1:"###,
+    },
+    Plant {
+        name: r###"com-slot-order"###,
+        phase: r###"conformance"###,
+        file: r###"src/dxgi.rs"###,
+        old: r###"    // IDXGIOutput
+    pub GetDesc: usize,
+    pub GetDisplayModeList: usize,"###,
+        new: r###"    // IDXGIOutput
+    pub GetDisplayModeList: usize,
+    pub GetDesc: usize,"###,
+    },
+    Plant {
+        name: r###"com-iunknown-order"###,
+        phase: r###"conformance"###,
+        file: r###"src/com.rs"###,
+        old: r###"    pub AddRef: unsafe extern "system" fn(this: *mut c_void) -> u32,
+    pub Release: unsafe extern "system" fn(this: *mut c_void) -> u32,"###,
+        new: r###"    pub Release: unsafe extern "system" fn(this: *mut c_void) -> u32,
+    pub AddRef: unsafe extern "system" fn(this: *mut c_void) -> u32,"###,
+    },
+    Plant {
+        name: r###"com-slot-type"###,
+        phase: r###"conformance"###,
+        file: r###"src/dxgi.rs"###,
+        old: r###"fn(*mut c_void, DXGI_COLOR_SPACE_TYPE, *mut u32) -> HRESULT,"###,
+        new: r###"fn(*mut c_void, DXGI_COLOR_SPACE_TYPE, *mut i32) -> HRESULT,"###,
+    },
+    Plant {
+        name: r###"com-iid"###,
+        phase: r###"conformance"###,
+        file: r###"src/dxgi.rs"###,
+        old: r###"0x068346e8_aaec_4b84_add7_137f513f77a1"###,
+        new: r###"0x068346e8_aaec_4b84_add7_137f513f77a2"###,
+    },
+    Plant {
+        name: r###"com-field-order"###,
+        phase: r###"conformance"###,
+        file: r###"src/dxgi.rs"###,
+        old: r###"    pub MinLuminance: f32,
+    pub MaxLuminance: f32,"###,
+        new: r###"    pub MaxLuminance: f32,
+    pub MinLuminance: f32,"###,
+    },
+    Plant {
+        name: r###"com-const-value"###,
+        phase: r###"conformance"###,
+        file: r###"src/dxgi.rs"###,
+        old: r###"DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: DXGI_COLOR_SPACE_TYPE = 12i32;"###,
+        new: r###"DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: DXGI_COLOR_SPACE_TYPE = 13i32;"###,
+    },
+    Plant {
+        name: r###"com-dll"###,
+        phase: r###"import"###,
+        file: r###"src/dxgi.rs"###,
+        old: r###"link!("dxgi.dll" "system" fn CreateDXGIFactory1("###,
+        new: r###"link!("d3d11.dll" "system" fn CreateDXGIFactory1("###,
+    },
 ];

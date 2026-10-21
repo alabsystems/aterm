@@ -9,7 +9,6 @@
 
 use super::{util, IgnoreError as _, X11Error, XConnection};
 use crate::dpi::{PhysicalPosition, PhysicalSize};
-use crate::platform_impl::VideoModeHandle as PlatformVideoModeHandle;
 use aterm_x11::proto::{randr, xproto};
 
 // Used for testing. This should always be committed as false.
@@ -22,42 +21,12 @@ impl XConnection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct VideoModeHandle {
-    pub(crate) size: (u32, u32),
-    pub(crate) bit_depth: u16,
-    pub(crate) refresh_rate_millihertz: u32,
-    pub(crate) native_mode: randr::Mode,
-    pub(crate) monitor: Option<MonitorHandle>,
-}
-
-impl VideoModeHandle {
-    #[inline]
-    pub fn size(&self) -> PhysicalSize<u32> {
-        self.size.into()
-    }
-
-    #[inline]
-    pub fn bit_depth(&self) -> u16 {
-        self.bit_depth
-    }
-
-    #[inline]
-    pub fn refresh_rate_millihertz(&self) -> u32 {
-        self.refresh_rate_millihertz
-    }
-
-    #[inline]
-    pub fn monitor(&self) -> MonitorHandle {
-        self.monitor.clone().unwrap()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct MonitorHandle {
     /// The actual id
     pub(crate) id: randr::Crtc,
-    /// The name of the monitor
+    /// The name of the monitor: which monitor a RandR change moved the scale of (WC.8: no
+    /// longer answered by `MonitorHandle::name`, which no aterm crate asks for on Linux).
     pub(crate) name: String,
     /// The size of the monitor
     dimensions: (u32, u32),
@@ -71,8 +40,6 @@ pub struct MonitorHandle {
     pub(crate) scale_factor: f64,
     /// Used to determine which windows are on this monitor
     pub(crate) rect: util::AaRect,
-    /// Supported video modes on this monitor
-    video_modes: Vec<VideoModeHandle>,
 }
 
 impl PartialEq for MonitorHandle {
@@ -119,7 +86,7 @@ impl MonitorHandle {
         crtc: &randr::GetCrtcInfoReply,
         primary: bool,
     ) -> Option<Self> {
-        let (name, scale_factor, video_modes) = xconn.get_output_info(resources, crtc)?;
+        let (name, scale_factor) = xconn.get_output_info(crtc)?;
         let dimensions = (crtc.width as u32, crtc.height as u32);
         let position = (crtc.x as i32, crtc.y as i32);
 
@@ -142,7 +109,6 @@ impl MonitorHandle {
             position,
             primary,
             rect,
-            video_modes,
         })
     }
 
@@ -156,22 +122,12 @@ impl MonitorHandle {
             refresh_rate_millihertz: None,
             primary: true,
             rect: util::AaRect::new((0, 0), (1, 1)),
-            video_modes: Vec::new(),
         }
     }
 
     pub(crate) fn is_dummy(&self) -> bool {
         // Zero is an invalid XID value; no real monitor will have it
         self.id == 0
-    }
-
-    pub fn name(&self) -> Option<String> {
-        Some(self.name.clone())
-    }
-
-    #[inline]
-    pub fn native_identifier(&self) -> u32 {
-        self.id as _
     }
 
     pub fn size(&self) -> PhysicalSize<u32> {
@@ -189,15 +145,6 @@ impl MonitorHandle {
     #[inline]
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
-    }
-
-    #[inline]
-    pub fn video_modes(&self) -> impl Iterator<Item = PlatformVideoModeHandle> {
-        let monitor = self.clone();
-        self.video_modes.clone().into_iter().map(move |mut x| {
-            x.monitor = Some(monitor.clone());
-            PlatformVideoModeHandle::X(x)
-        })
     }
 }
 

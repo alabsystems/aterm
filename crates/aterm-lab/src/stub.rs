@@ -69,10 +69,10 @@
 //! "stream", "text", "delay_ms", "times", "auth", "replies"}`; `times`: the
 //! first N requests, then `ok`; `auth`: only a request that carried that lab
 //! credential gets it, the others are answered as `ok`; its `headers` go out
-//! on a streamed answer too; `replies`: `[{"when", "last", "text"}, …]`, a
-//! turn's text picked by the words its conversation's user texts and its
-//! newest one hold, in every API, a side request answered as `ok`
-//! ([`scripted_reply`])).
+//! on a streamed answer too; `replies`: `[{"when", "last", "after", "text"}, …]`, a
+//! turn's text picked by the words its conversation's user texts, its
+//! newest one and one before it hold, in every API, a side request answered
+//! as `ok` ([`scripted_reply`])).
 //!
 //! A Codex request (`/v1/responses`) is answered by the same modes: `ok`,
 //! `long`, `numbered` and `slow` as text; `overloaded` as a 503
@@ -513,26 +513,32 @@ pub fn text_of(content: Option<&J>) -> String {
 }
 
 /// THE SCRIPTED REPLY OF A CUSTOM MODE (`"replies": [{"when", "last",
-/// "text"}, …]`, the per-turn script of `forever`): the `text` of the first
-/// rule whose `when` stands in one of the conversation's user texts `users`
-/// (in order, oldest first) and whose `last` stands in the newest of them,
-/// either left out or empty matching any. The stub keeps no state: a
+/// "after", "text", "delay_ms", "pace_s"}, …]`, the per-turn script of
+/// `forever`): the first rule with a `text` whose `when` stands in one of the
+/// conversation's user texts `users` (in order, oldest first), whose `last`
+/// stands in the newest of them and whose `after` stands in one before the
+/// newest (a turn told apart from another of the same words by an act the
+/// conversation met earlier), each left out or empty matching any — its
+/// `text` the reply, its own `delay_ms` and `pace_s` (where it
+/// carries them) the spec's for that reply ([`with_reply`]: a conversation
+/// answered at once beside others paced). The stub keeps no state: a
 /// conversation's turn is told by what it holds (the scenario's word in its
 /// prompt, the harness's act it answers), so several tabs of one lab, each
 /// its own conversation, are scripted at once. `None` where the spec has no
 /// rules or none matches.
 #[must_use]
-pub fn scripted_reply(spec: &J, users: &[String]) -> Option<String> {
+pub fn scripted_reply<'a>(spec: &'a J, users: &[String]) -> Option<&'a J> {
     let rules = spec.get("replies").and_then(J::as_arr)?;
     fn word<'a>(r: &'a J, k: &str) -> Option<&'a str> {
         r.get(k).and_then(J::as_str).filter(|w| !w.is_empty())
     }
     let last = users.last().map_or("", String::as_str);
-    rules.iter().find_map(|r| {
-        let text = r.get("text").and_then(J::as_str)?;
+    let before = &users[..users.len().saturating_sub(1)];
+    rules.iter().find(|r| {
         let when = word(r, "when").is_none_or(|w| users.iter().any(|u| u.contains(w)));
         let at_last = word(r, "last").is_none_or(|w| last.contains(w));
-        (when && at_last).then(|| text.to_string())
+        let after = word(r, "after").is_none_or(|w| before.iter().any(|u| u.contains(w)));
+        r.get("text").and_then(J::as_str).is_some() && when && at_last && after
     })
 }
 
@@ -544,18 +550,21 @@ pub fn is_scripted(spec: &J) -> bool {
     spec.get("replies").is_some()
 }
 
-/// `spec` with its `text` the reply `users` pick ([`scripted_reply`]), else
-/// as it is.
+/// `spec` with its `text` the reply `users` pick ([`scripted_reply`]) — its
+/// `delay_ms` and `pace_s` the rule's own, where the rule carries them —
+/// else as it is.
 #[must_use]
 pub fn with_reply(spec: J, users: &[String]) -> J {
-    match scripted_reply(&spec, users) {
-        Some(text) => {
-            let mut spec = spec;
-            spec.set("text", J::s(text));
-            spec
+    let Some(rule) = scripted_reply(&spec, users).cloned() else {
+        return spec;
+    };
+    let mut spec = spec;
+    for key in ["text", "delay_ms", "pace_s"] {
+        if let Some(v) = rule.get(key) {
+            spec.set(key, v.clone());
         }
-        None => spec,
     }
+    spec
 }
 
 /// The user texts of a Messages API request, oldest first: each user

@@ -51,13 +51,29 @@
 //! log off the boot volume, whose page cache it cannot vouch for, and here a
 //! crash never moves.
 //!
+//! ## Held acks: the answer behind the record (aterm-0)
+//!
+//! A real broker's writer appends a batch, wakes its tails and writes the
+//! batch's acks, and a subscriber can read a record before its publisher
+//! reads the ack — or the other way round. With [`State::holds`] set, an ack
+//! is HELD at the seed's choice: the record is on the log and readable, and
+//! the answer waits ([`ConnState::held`]), with every answer behind it on that
+//! connection. A read that may wait gets it (the wait is the batch's flush);
+//! a read that must not wait — the bridge's try ([`crate::fx::Fx::unwaited`])
+//! — finds it not yet there; the world's [`Broker::answer_held`] sends it, as
+//! a flush landing between two of the bridge's passes. So the bridge's
+//! non-blocking loop meets every order of a delivery and its own post's ack,
+//! a reply and the commit before it, and the counts say it did
+//! ([`Broker::held_counts`]).
+//!
 //! ## Deterministic by construction
 //!
 //! A request is processed inside the client's own `write`, on the bridge's
-//! thread, and its reply queued for the client's next `read`; a subscription's
-//! deliveries are produced only when the scheduler's pump reads it
-//! ([`crate::sim::Core::pump`]). A connection a client drops or closes ends at
-//! that call, and its will fires then.
+//! thread, and its reply queued for the client's next `read` — or held, at
+//! the seed's choice, until a read that waits or the world releases it; a
+//! subscription's deliveries are produced only when the scheduler's pump
+//! reads it ([`crate::sim::Core::pump`]). A connection a client drops or
+//! closes ends at that call, and its will fires then.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
@@ -220,9 +236,25 @@ struct ConnState {
     pid: u64,
     inbound: Vec<u8>,
     out: VecDeque<u8>,
+    /// Answers the broker has made and not yet SENT, oldest first: a write
+    /// whose batch is still in its flush ([`State::answer`]). Released whole
+    /// by a read that may wait (the wait is the flush) or by the world's
+    /// [`Broker::answer_held`]; a read that must not wait finds them not yet
+    /// there ([`crate::fx::Fx::unwaited`]).
+    held: VecDeque<Held>,
     open: bool,
     /// `Some((cursor, filter))` once it is a subscription.
     sub: Option<(u64, Filter)>,
+}
+
+/// One answer the broker holds ([`ConnState::held`]).
+#[derive(Debug)]
+struct Held {
+    /// The record a `PublishAck` names: what the reorder count reads
+    /// ([`State::seen_before_ack`]).
+    ack_of: Option<u64>,
+    /// The framed answer.
+    frame: Vec<u8>,
 }
 
 /// The simulated broker's state.
@@ -253,9 +285,22 @@ pub(crate) struct State {
     next_conn: u64,
     /// Producer id -> principal, for the principal rule.
     principals: BTreeMap<u64, String>,
-    /// Refuse the next this-many publishes by a NODE producer `ERR_REFUSED`
-    /// (a batch rolled back), appending nothing.
+    /// Refuse the next this-many publishes by a NODE producer, and group
+    /// commits, `ERR_REFUSED` (a batch rolled back), appending nothing.
     pub(crate) refuse_next: u32,
+    /// HELD ACKS (aterm-0): the seed's stream that decides which of a
+    /// connection's acks the broker answers late — its batch still in its
+    /// flush while the record is already readable — or `None` for a broker
+    /// that answers every write as it serves it ([`State::answer`]).
+    pub(crate) holds: Option<Rng>,
+    /// How many answers were held, how many reads that must not wait found
+    /// one not yet there, and how many records a subscription handed over
+    /// while their publish's ack was still held — the reorder the non-blocking
+    /// loop must survive: the bridge can take its own post's delivery before
+    /// its ack.
+    pub(crate) held_total: u64,
+    pub(crate) tries_not_yet: u64,
+    pub(crate) seen_before_ack: u64,
     /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s): lose below the
     /// durable head; lose with no move.
     pub(crate) mutant: ArmMutant,
@@ -320,6 +365,10 @@ impl Broker {
                 next_conn: 1,
                 principals: BTreeMap::new(),
                 refuse_next: 0,
+                holds: None,
+                held_total: 0,
+                tries_not_yet: 0,
+                seen_before_ack: 0,
                 mutant: ArmMutant::None,
                 notes: Vec::new(),
             }),
@@ -353,6 +402,58 @@ impl Broker {
             return None;
         }
         s.publish(producer, seq, subject, body).ok()
+    }
+
+    /// HOLD ACKS from now on, `rng` deciding which ([`State::answer`]).
+    pub(crate) fn hold_acks(&self, rng: Rng) {
+        lock(&self.state).holds = Some(rng);
+    }
+
+    /// THE BROKER ANSWERS WHAT IT HELD: every held answer on every connection
+    /// is sent, as a batch's flush landing does; and with `and_stop`, none is
+    /// held from now on. How many were sent.
+    pub(crate) fn answer_held(&self, and_stop: bool) -> usize {
+        let mut s = lock(&self.state);
+        if and_stop {
+            s.holds = None;
+        }
+        let mut sent = 0;
+        // Only a connection still open: a dead one's answers died with it.
+        for c in s.conns.values_mut().filter(|c| c.open) {
+            sent += c.held.len();
+            for h in c.held.drain(..) {
+                c.out.extend(h.frame);
+            }
+        }
+        if sent > 0 {
+            s.notes.push(format!("broker answers {sent} held"));
+        }
+        sent
+    }
+
+    /// The held-ack counts ([`State::held_total`]): held, tries that found
+    /// one not yet there, records handed over before their ack.
+    pub(crate) fn held_counts(&self) -> (u64, u64, u64) {
+        let s = lock(&self.state);
+        (s.held_total, s.tries_not_yet, s.seen_before_ack)
+    }
+
+    /// THE RECORDS WHOSE ACKS THIS BROKER HOLDS for process `pid` on its open
+    /// connections ([`ConnState::held`]): `(offset, subject, body)`, what a
+    /// writer still waits to be told landed — the oracle's idle law reads it
+    /// when the process parks ([`crate::sim::Process::idle`]). A record a
+    /// restart cut is gone from the log and named no more.
+    pub(crate) fn held_for(&self, pid: u64) -> Vec<(u64, String, Vec<u8>)> {
+        let s = lock(&self.state);
+        s.conns
+            .values()
+            .filter(|c| c.open && c.pid == pid)
+            .flat_map(|c| c.held.iter().filter_map(|h| h.ack_of))
+            .filter_map(|off| {
+                let r = s.log.get(usize::try_from(off).ok()?)?;
+                Some((off, r.subject.clone(), r.body.clone()))
+            })
+            .collect()
     }
 
     /// The Ordered horizon's full flush (and nothing on another tier).
@@ -408,8 +509,11 @@ impl Broker {
         // Every connection ends with the process; no will fires until the
         // next open re-fires every will the log still holds.
         s.up = false;
+        // What it held unanswered dies with it: a write it took and never
+        // answered is one whose fate the writer must learn by its retry.
         for c in s.conns.values_mut() {
             c.open = false;
+            c.held.clear();
         }
         let cuts = s.allowed_cuts(stop);
         let pick = usize::try_from(rng.below(cuts.len() as u64)).unwrap_or(0);
@@ -597,6 +701,45 @@ impl State {
         self.principals.get(&producer).map(String::as_str)
     }
 
+    /// QUEUE `responses` ON `conn`'S STREAM, in order: sent at once, or HELD
+    /// (aterm-0) — an ack the broker answers late, its batch still in its
+    /// flush, while the record it names is already readable, as a real
+    /// broker's writer wakes its tails and writes its acks in no fixed order
+    /// — when this broker holds acks ([`State::holds`]) and the seed says so;
+    /// and always behind an answer already held, because a connection is
+    /// answered in the order it wrote. Only an ack starts a hold: every other
+    /// answer is a request's own reply, read by a read that waits.
+    fn answer(&mut self, conn: u64, responses: &[Response]) {
+        let State {
+            conns,
+            holds,
+            held_total,
+            ..
+        } = self;
+        let Some(c) = conns.get_mut(&conn) else {
+            return;
+        };
+        for r in responses {
+            let ack_of = match r {
+                Response::PublishAck { offset, .. } => Some(*offset),
+                _ => None,
+            };
+            let hold = !c.held.is_empty()
+                || (ack_of.is_some() && holds.as_mut().is_some_and(|rng| rng.chance(1, 3)));
+            if hold {
+                let mut frame = VecDeque::new();
+                put(&mut frame, r);
+                c.held.push_back(Held {
+                    ack_of,
+                    frame: Vec::from(frame),
+                });
+                *held_total += 1;
+            } else {
+                put(&mut c.out, r);
+            }
+        }
+    }
+
     /// One publish: dedup, the reserved subjects, the retire, the append.
     fn publish(
         &mut self,
@@ -742,6 +885,7 @@ impl State {
             head: self.log.len() as u64,
             resume,
             durable: Some(self.durable),
+            oldest: None,
         }
     }
 
@@ -771,10 +915,11 @@ impl State {
                 lineage: if self.lineage.is_empty() {
                     None
                 } else {
-                    crate::durability::lineage_of(&self.lineage)
+                    astream_broker::Lineage::from_steps(&self.lineage)
                 },
                 requests: Some(astream_broker::REQUEST_RETIRE),
                 health: None,
+                retention: None,
             },
         }
     }
@@ -843,6 +988,19 @@ impl State {
                 vec![self.mark(self.log.len() as u64, String::new())]
             }
             Request::Commit { group, upto } => {
+                // A BATCH ROLLED BACK refuses the group commit in it too: the
+                // bridge's commit rides the pipeline beside its publishes
+                // (aterm-0), and only a bridge's connection commits here.
+                if self.refuse_next > 0 {
+                    self.refuse_next -= 1;
+                    self.notes.push(format!(
+                        "refuse commit {group} upto={upto} (batch rolled back)"
+                    ));
+                    return vec![Response::Error {
+                        code: astream_broker::proto::ERR_REFUSED,
+                        msg: "commit failed: the batch was rolled back (simulated)".to_string(),
+                    }];
+                }
                 let kind = Kind::Commit {
                     group: group.clone(),
                     upto,
@@ -1013,6 +1171,7 @@ pub(crate) fn dial(p: &Arc<Process>) -> io::Result<(Conn, BusCloser)> {
                 pid: p.pid,
                 inbound: Vec::new(),
                 out: VecDeque::new(),
+                held: VecDeque::new(),
                 open: true,
                 sub: None,
             },
@@ -1052,6 +1211,14 @@ impl Read for SimStream {
         if out_empty && open && up {
             if let Some((cursor, filter)) = sub {
                 if let Some(off) = s.next_match(cursor, &filter) {
+                    // THE REORDER aterm-0 must survive: a record handed to a
+                    // reader while its publisher's ack is still held.
+                    if s.conns
+                        .values()
+                        .any(|c| c.held.iter().any(|h| h.ack_of == Some(off)))
+                    {
+                        s.seen_before_ack += 1;
+                    }
                     let rec = s.log[usize::try_from(off).unwrap_or(0)].clone();
                     if let Some(c) = s.conns.get_mut(&self.conn) {
                         c.sub = Some((off + 1, filter));
@@ -1065,6 +1232,30 @@ impl Read for SimStream {
                         );
                     }
                     out_empty = false;
+                }
+            }
+        }
+        // AN ANSWER THE BROKER HOLDS (aterm-0, [`State::answer`]): a read that
+        // may wait waits for its batch's flush, and gets every held answer; a
+        // read that must not wait ([`crate::fx::Fx::unwaited`]) finds it not
+        // yet there.
+        if out_empty && open && up {
+            let trying = self.process.is_trying();
+            let State {
+                conns,
+                tries_not_yet,
+                ..
+            } = &mut *s;
+            if let Some(c) = conns.get_mut(&self.conn) {
+                if !c.held.is_empty() {
+                    if trying {
+                        *tries_not_yet += 1;
+                    } else {
+                        for h in c.held.drain(..) {
+                            c.out.extend(h.frame);
+                        }
+                        out_empty = false;
+                    }
                 }
             }
         }
@@ -1151,11 +1342,7 @@ impl std::io::Write for SimStream {
                         msg: "malformed request".to_string(),
                     }],
                 };
-                if let Some(c) = s.conns.get_mut(&self.conn) {
-                    for r in &responses {
-                        put(&mut c.out, r);
-                    }
-                }
+                s.answer(self.conn, &responses);
             }
             // A kill AFTER: served and answered, the answer never read.
             self.process.step("bus-after");
@@ -1197,6 +1384,7 @@ impl SimCloser {
         let mut s = lock(&self.process.core.broker.state);
         if let Some(c) = s.conns.get_mut(&self.conn) {
             c.out.clear();
+            c.held.clear();
         }
         s.end(self.conn);
     }

@@ -36,8 +36,12 @@ use super::rm_breaker::abs_components;
 use super::shell_startup::ShellStartup;
 
 impl PolicyProbe for LiveProbe {
-    fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String> {
-        hidden_twin_within(comps, HIDDEN_TWIN_ENTRIES)
+    fn hidden_twin_in(
+        &self,
+        comps: &[String],
+        home: Option<&Path>,
+    ) -> Result<Option<String>, String> {
+        hidden_twin_within(comps, HIDDEN_TWIN_ENTRIES, home, &folder_names)
     }
 
     fn real_components(&self, comps: &[String]) -> Option<Vec<String>> {
@@ -119,7 +123,44 @@ pub(crate) fn bound_to(worker: WorkerEnv, group: u32, sid: &str) -> Result<Worke
 /// How many entries of one folder [`hidden_twin_within`] lists before it holds the press
 /// for a person (a build folder of hundreds of thousands costs a decision a
 /// third of a second, and the loop looks again until the box leaves).
-const HIDDEN_TWIN_ENTRIES: usize = 20_000;
+pub(crate) const HIDDEN_TWIN_ENTRIES: usize = 20_000;
+
+/// One folder's entry names, as [`hidden_twin_within`] reads them.
+pub(crate) type FolderNames = dyn Iterator<Item = OsString>;
+
+/// The real [`std::fs::read_dir`] reader for [`hidden_twin_within`].
+pub(crate) fn folder_names(dir: &Path) -> std::io::Result<Box<FolderNames>> {
+    let entries = std::fs::read_dir(dir)?;
+    Ok(Box::new(entries.flatten().map(|e| e.file_name())))
+}
+
+/// Whether `dir` lies at or under a root macOS guards with a consent dialog that
+/// a held Full Disk Access grant does not cover or whose Allow is forgotten when
+/// the responsible process exits (`~/Library/Containers`,
+/// `~/Library/Group Containers`, `~/Library/CloudStorage`,
+/// `~/Library/Mobile Documents`), as spelled or after resolving symlinks.
+///
+/// The per-folder `$HOME` roots (`~/Documents`, `~/Desktop`, …) are NOT refused
+/// here: when the owner has added one as a trust root and granted access, the
+/// twin scan must still prove no hidden twin sits beside the shown file there.
+/// App Data and file-provider domains are the two classes where an ambient
+/// `read_dir` from the supervisor raises a modal dialog on every launch without
+/// FDA (App Data, design §1.6a) or even under FDA (file-provider domains, §3.4).
+fn never_listed(dir: &Path, home: Option<&Path>, real_home: Option<&Path>) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+    let under = |h: &Path, p: &Path| {
+        atpkg::protected::under_app_data(h, p) || atpkg::protected::under_file_provider_domain(h, p)
+    };
+    if under(home, dir) || real_home.is_some_and(|rh| under(rh, dir)) {
+        return true;
+    }
+    let Ok(real_dir) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    under(home, &real_dir) || real_home.is_some_and(|rh| under(rh, &real_dir))
+}
 
 /// An entry of a folder on `comps`' way whose name differs from the one the box
 /// draws only by characters the box may not have drawn. Claude Code's Read
@@ -133,24 +174,34 @@ const HIDDEN_TWIN_ENTRIES: usize = 20_000;
 /// character outside it, compared as the default volume compares names (APFS
 /// ignores case: `Q<ZWSP>R` is what a Read of `qr` opens). The twin's full
 /// path (it may be a folder on the way), or `Err` for a folder that cannot be
-/// listed, and for one too big to list in a decision
-/// ([`HIDDEN_TWIN_ENTRIES`]: about a microsecond an entry, measured). At most
-/// `max_entries` of one folder are listed (a test's small bound).
+/// listed, for one inside another app's data or a file-provider domain
+/// ([`never_listed`], checked before `names` is called), and for one too big to
+/// list in a decision ([`HIDDEN_TWIN_ENTRIES`]: about a microsecond an entry,
+/// measured). At most `max_entries` of one folder are listed (a test's small
+/// bound).
 pub(crate) fn hidden_twin_within(
     comps: &[String],
     max_entries: usize,
+    home: Option<&Path>,
+    names: &dyn Fn(&Path) -> std::io::Result<Box<FolderNames>>,
 ) -> Result<Option<String>, String> {
+    let real_home = home.and_then(|h| std::fs::canonicalize(h).ok());
     let mut dir = PathBuf::from("/");
     for comp in comps {
-        match std::fs::read_dir(&dir) {
+        if never_listed(&dir, home, real_home.as_deref()) {
+            return Err(format!(
+                "a Read whose folder is under another app's data or a file-provider domain and is never listed: {dir:?}"
+            ));
+        }
+        match names(&dir) {
             Ok(entries) => {
-                for (n, entry) in entries.flatten().enumerate() {
+                for (n, file_name) in entries.enumerate() {
                     if n >= max_entries {
                         return Err(format!(
                             "a Read in a folder too big to prove (over {max_entries} entries): {dir:?}"
                         ));
                     }
-                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let name = file_name.to_string_lossy().into_owned();
                     let shown: String = name.chars().filter(|c| (' '..='~').contains(c)).collect();
                     if name != shown && shown.eq_ignore_ascii_case(comp) {
                         return Ok(Some(dir.join(&name).to_string_lossy().into_owned()));
@@ -165,6 +216,11 @@ pub(crate) fn hidden_twin_within(
             }
         }
         dir.push(comp);
+        if never_listed(&dir, home, real_home.as_deref()) {
+            return Err(format!(
+                "a Read whose folder is under another app's data or a file-provider domain and is never listed: {dir:?}"
+            ));
+        }
         // Nothing below a name that is no folder, or is not there.
         match std::fs::metadata(&dir) {
             Ok(m) if m.is_dir() => {}

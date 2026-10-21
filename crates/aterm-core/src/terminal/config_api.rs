@@ -264,7 +264,7 @@ impl Terminal {
         // move every baseline and set live = baseline, then replay the diff.
         // So OSC 104/110-119 and RIS reset to the new theme, slots the program
         // never touched follow it, and a reload (any key, a theme-folder edit,
-        // an OS appearance flip) no longer wipes a base16 palette or an editor's
+        // an OS appearance flip) preserves a base16 palette or an editor's
         // OSC 11 background. The diff's palette entries are replayed only while
         // the host allows palette sets, so turning the gate off takes a
         // program's palette out of every live session at once; its fg/bg/

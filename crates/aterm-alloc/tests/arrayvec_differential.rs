@@ -6,10 +6,9 @@
 //!
 //! `crates/aterm-arrayvec` republishes `aterm_alloc::ArrayVec` under the
 //! package name `arrayvec` so that `[patch.crates-io]` can point `naga`,
-//! `wgpu`, `wgpu-core` and `wgpu-hal` at it (and `tiny-skia`, on Linux, until
-//! linux-windowing LW.5 took it out of the graph).
-//! `crates/aterm-arrayvec/tests/consumer_forms.rs` proves the surface ACCEPTS
-//! what those crates write. This file proves it COMPUTES what they expect: both
+//! `wgpu`, `wgpu-core` and `wgpu-hal` at it.
+//! `crates/aterm-arrayvec/tests/consumer_forms.rs` proves the surface accepts
+//! what those crates write. This file proves it computes what they expect: both
 //! are driven through the same scripts and a deterministic-LCG operation fuzz,
 //! and their state is compared after every step — contents, length, capacity
 //! accounting, `Debug` rendering, `Hash` output, drop counts and whether an
@@ -179,7 +178,7 @@ fn hash_of<T: Hash + ?Sized>(v: &T) -> u64 {
 /// Compare every observable of the two vectors.
 ///
 /// `Hash` is compared as a raw `u64` on purpose: both implementations are meant
-/// to delegate to the slice, so the two hashers must produce the SAME NUMBER,
+/// to delegate to the slice, so the two hashers must produce the same number,
 /// not merely be internally consistent. An implementation that hashed the
 /// backing `[MaybeUninit<T>; N]` would still satisfy Hash/Eq inside one process
 /// — it would pass every self-consistency test ever written — and this is the
@@ -228,7 +227,7 @@ where
 }
 
 /// Run a closure with panic output suppressed, reporting only whether it
-/// unwound. Used to compare PANIC BEHAVIOUR, which for a fixed-capacity vector
+/// unwound. Used to compare panic behaviour, which for a fixed-capacity vector
 /// is as much a part of the contract as the contents.
 fn panicked(f: impl FnOnce()) -> bool {
     let prev = panic::take_hook();
@@ -506,13 +505,13 @@ fn lcg_operation_fuzz() {
 
 // ── The behaviours that are dangerous to get subtly wrong ───────────────────
 
-/// `Extend` and `FromIterator` must PANIC on overflow, never truncate — and the
+/// `Extend` and `FromIterator` must panic on overflow, never truncate — and the
 /// elements written before the panic must survive on both sides. A truncating
 /// `extend` would silently drop DXC compiler arguments in `wgpu-hal` and a
 /// destination barrier in `wgpu-core`, with nothing to observe but wrong pixels.
 #[test]
 fn overflow_policy_parity() {
-    // CONTROL: an extend that FITS must not panic on either side. Without this,
+    // Control: an extend that fits must not panic on either side. Without this,
     // "both panicked" below could be satisfied by an implementation that
     // panics unconditionally.
     let mut mine: MyArrayVec<u32, 4> = MyArrayVec::new();
@@ -536,7 +535,7 @@ fn overflow_policy_parity() {
         "the prefix retained after an overflowing extend differs"
     );
 
-    // Overflowing collect (`from_iter`), the load-bearing over-limit GUARD at
+    // Overflowing collect (`from_iter`), the load-bearing over-limit guard at
     // wgpu-core/src/device/resource.rs:3740 and wgpu/src/backend/wgpu_core.rs:1308.
     let a = panicked(|| {
         let _: MyArrayVec<u32, 4> = (1..=5).collect();
@@ -559,7 +558,7 @@ fn overflow_policy_parity() {
     assert!(!a && !b, "control: a fitting collect must not panic");
 }
 
-/// `into_inner` returns `Ok` ONLY when the vector is full. naga spells this
+/// `into_inner` returns `Ok` only when the vector is full. naga spells this
 /// `.into_inner().unwrap()` in its const-expression evaluator; an inverted test
 /// would build shader constants out of a partially-filled array and never
 /// panic.
@@ -589,7 +588,7 @@ fn into_inner_polarity_parity() {
 
 /// By-value iteration: order, `size_hint`, `DoubleEndedIterator`, and — the
 /// part that cannot be seen from the outside — that the un-yielded remainder is
-/// dropped EXACTLY ONCE. A missing drop leaks an `Arc<Texture>` per early
+/// dropped exactly once. A missing drop leaks an `Arc<Texture>` per early
 /// return in `wgpu-core`; a double drop is a use-after-free.
 #[test]
 fn into_iter_parity_including_drop_counts() {
@@ -651,7 +650,7 @@ fn into_iter_parity_including_drop_counts() {
     }
 }
 
-/// `drain` must actually REMOVE, on every range shape, and dropping the
+/// `drain` must actually remove, on every range shape, and dropping the
 /// iterator early must leave the same vector an exhausted one would.
 #[test]
 fn drain_parity_over_every_range_shape() {
@@ -795,7 +794,7 @@ fn owning_elements_drop_parity() {
     );
 }
 
-/// `retain` whose predicate PANICS keeps what the predicate had kept and every
+/// `retain` whose predicate panics keeps what the predicate had kept and every
 /// element it had not yet returned for, closes the hole between them, and
 /// drops each element exactly once overall: std `Vec::retain`'s contract, which
 /// upstream's `BackshiftOnDrop` mirrors. Swept over every panic position and

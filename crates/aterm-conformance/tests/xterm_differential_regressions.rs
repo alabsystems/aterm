@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Regression tests for engine bugs found by differential testing against
-// alacritty_terminal on identical byte streams, adjudicated against xterm
-// ground truth.
-//
-// Every expectation below is the xterm behavior, with the xterm source
-// cited inline (charproc.c / util.c / tabs.c / cursor.c). Each test pins a
-// bug class that aterm originally got wrong.
+// Differential conformance regressions adjudicated against xterm (`charproc.c`,
+// `util.c`, `tabs.c`, `cursor.c`).
 
 use aterm_conformance::{Screen, run};
-
-// =========================================================================
-// 1. G1 defaults to ASCII at VT100+ level (not DEC Special Graphics)
-// =========================================================================
 
 /// xterm resetCharsets() does `initCharset(screen, 1, nrc_ASCII)`: G0-G3
 /// all default to ASCII at VT100+ level. (DEC Special Graphics is the
@@ -25,10 +16,6 @@ fn g1_defaults_to_ascii_so_prints_plain_text() {
     assert_eq!(s.row(0), "x", "SO + 'x' with default G1 must print 'x'");
     assert_eq!(s.cursor(), (0, 1));
 }
-
-// =========================================================================
-// 2. HT preserves the wrap-pending (do_wrap) flag
-// =========================================================================
 
 /// xterm CASE_TAB -> TabToNextStop() (tabs.c) only calls set_cur_col and
 /// never touches screen->do_wrap: a TAB issued while autowrap is pending
@@ -75,10 +62,6 @@ fn ht_ride_to_last_stop_matches_xterm_layout() {
     assert_eq!(s.cursor(), (1, 9));
 }
 
-// =========================================================================
-// 3. Alt screen 1049 SET does not move the cursor
-// =========================================================================
-
 /// xterm srm_OPT_ALTBUF_CURSOR SET (charproc.c) = CursorSave + ToAlternate +
 /// ClearScreen — none of which moves the cursor. The single cursor is
 /// shared by both buffers; entering the 1049 alt screen must not home it.
@@ -90,10 +73,6 @@ fn mode_1049_enter_keeps_cursor_position() {
     assert_eq!(s2.cursor(), (9, 30), "cursor stays at (9,30) on 1049 enter");
     assert_eq!(s2.screen(), "", "alt screen is still cleared on enter");
 }
-
-// =========================================================================
-// 4. Invalid DECSTBM is ignored entirely (no margins, no home)
-// =========================================================================
 
 /// xterm CASE_DECSTBM (charproc.c) guards both set_tb_margins and
 /// CursorSet(0,0) behind `if (bot > top)`: a region that is empty or
@@ -140,10 +119,6 @@ fn valid_decstbm_still_sets_region_and_homes() {
     assert_eq!(s.cursor(), (0, 0), "valid DECSTBM homes the cursor");
 }
 
-// =========================================================================
-// 5. Autowrap below the scroll region at the last screen row never scrolls
-// =========================================================================
-
 /// xterm xtermIndex (util.c): `cur_row > bot_marg` means CursorDown, not a
 /// scroll — and CursorDown clamps at max_row. So autowrap on the BOTTOM
 /// SCREEN row while the cursor sits below the scroll region neither scrolls
@@ -173,10 +148,6 @@ fn lf_below_scroll_region_at_bottom_row_does_not_scroll() {
     );
     assert_eq!(s.cursor(), (23, 8));
 }
-
-// =========================================================================
-// 6. REP re-translates the raw char through the current GL charset
-// =========================================================================
 
 /// xterm CASE_REP (charproc.c) does `dotext(xw, screen->gsets[curgl],
 /// lastchar)`: the RAW last received character is replayed through the GL
@@ -214,10 +185,6 @@ fn rep_plain_ascii_bulk_path_still_repeats() {
     assert_eq!(s.row(0), "XXXXXXXXXX", "1 print + 9 repeats = 10 X's");
     assert_eq!(s.cursor(), (0, 10));
 }
-
-// =========================================================================
-// 7. DECSC/DECRC never touch DECAWM
-// =========================================================================
 
 /// xterm DECSC_FLAGS = (ATTRIBUTES|ORIGIN|PROTECTED) (cursor.c) — WRAPAROUND
 /// is not among them, so DECRC neither restores a saved autowrap state nor
@@ -257,10 +224,6 @@ fn unsaved_decrc_still_resets_origin_and_homes() {
     assert_eq!(s.row(0), "Z", "ORIGIN cleared: home is screen-absolute");
 }
 
-// =========================================================================
-// 8. Mode 1049 shares the DECSC saved-cursor slot
-// =========================================================================
-
 /// xterm srm_OPT_ALTBUF_CURSOR SET does CursorSave(xw) into the same
 /// per-buffer slot DECSC uses (screen->sc[whichBuf]), and the RESET-side
 /// CursorRestore reads it without consuming (sc->saved stays True). A bare
@@ -284,11 +247,6 @@ fn mode_1049_save_overwrites_decsc_slot() {
     let s = run(b"main\x1b7\x1b[5;10H\x1b[?1049h\x1b[?1049l\x1b8X");
     assert_eq!(s.cursor(), (4, 10), "ESC 8 lands at the 1049-saved spot");
 }
-
-// =========================================================================
-// 9. Explicit SU/SD scrolling preserves the wrap-pending flag; LF/RI clear it
-//    (LF is a cursor-down — it clears the flag even when it scrolls)
-// =========================================================================
 
 /// LF is a cursor-down and always resets the deferred wrap (xterm CursorDown
 /// ResetWrap, as in xterm.js), including the at-bottom LF that scrolls. So an
@@ -327,10 +285,8 @@ fn moving_lf_clears_pending_wrap() {
     assert_eq!(s.row(2), "", "nothing wrapped to row 2");
 }
 
-/// The same under DECSLRM margins: xterm's `xtermIndex` runs `CursorDown`
-/// (by 0) before `xtermScroll` whether or not left/right margins are set, so
-/// an LF that scrolls the margin rectangle clears the wrap too. aterm's
-/// margined LF kept it: `Z` wrapped and scrolled the rectangle a second time.
+/// Under DECSLRM left/right margins, xterm's `xtermIndex` still runs
+/// `CursorDown` before `xtermScroll`, clearing the pending wrap on a scrolling LF.
 #[test]
 fn margined_scrolling_lf_clears_pending_wrap() {
     let s = run(b"\x1b[?69h\x1b[2;5s\x1b[24;5Ha\nZ");
@@ -348,10 +304,6 @@ fn su_preserves_pending_wrap() {
     assert_eq!(s.row(1), "!", "wrap still pending after SU: '!' wraps");
     assert_eq!(s.cursor(), (1, 1));
 }
-
-// =========================================================================
-// 10. The wrap-pending flag is independent of DECAWM
-// =========================================================================
 
 /// xterm arms `do_wrap` whenever a print fills to the margin regardless of
 /// WRAPAROUND (charproc.c dotext: `screen->do_wrap = need_wrap`), and
@@ -391,10 +343,6 @@ fn decawm_reset_does_not_clear_armed_wrap() {
     assert_eq!(s.row(1), "!", "flag survived the DECAWM off/on round trip");
     assert_eq!(s.cursor(), (1, 1));
 }
-
-// =========================================================================
-// 11. DECSTBM/DECSLRM margins persist across alt-screen switches
-// =========================================================================
 
 /// xterm keeps the margins in the shared TScreen (top_marg/bot_marg):
 /// ToAlternate/FromAlternate (modes 47/1047/1049) do not reset them. RI at

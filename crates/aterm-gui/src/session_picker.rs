@@ -12,12 +12,8 @@
 //! (`docs/DESIGN-owner-surfaces-2026-10-16.md` §7): every in-session client
 //! already holds Owner, and workers start with `spawn agent=claude`.
 //!
-//! Reuses the palette machinery deliberately: the SAME fuzzy filter
-//! ([`crate::palette::fuzzy_subsequence`]), the same cursor/scroll/pointer
-//! arming discipline, the same centred opaque card shape — so the two
-//! type-to-filter surfaces read and drive identically. Lives in the single
-//! modal [`crate::overlay::Overlay`] slot, so its keys are structurally gated
-//! BEFORE the terminal.
+//! It reuses the palette's fuzzy filter, cursor/scroll/pointer arming and card shape, and lives
+//! in the modal [`crate::overlay::Overlay`] slot, so its keys are consumed before the terminal.
 
 #[cfg(test)]
 use aterm_render::Theme;
@@ -42,7 +38,7 @@ const MAX_CARD_WIDTH: f32 = 720.0;
 pub(crate) enum PickerIntent {
     /// Open a new WINDOW whose first shell runs under the chosen identity.
     NewWindowWithIdentity,
-    /// Open a new TAB (front window) under the chosen identity.
+    /// Open a new tab in the front window under the chosen identity.
     NewTabWithIdentity,
 }
 
@@ -76,8 +72,7 @@ pub(crate) enum PickerRow {
     NewIdentity,
 }
 
-/// What activating a row chooses — resolved against the live query, so the
-/// new-identity row yields the name typed into the filter.
+/// What activating a row chooses; the new-identity row yields the name typed into the filter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PickerChoice {
     /// An identity to spawn under; `create` only for the new-identity row.
@@ -109,11 +104,10 @@ pub(crate) struct SessionPickerState {
     pub(crate) intent: PickerIntent,
     rows: Vec<PickerRow>,
     query: String,
-    /// Cursor WITHIN the filtered set.
+    /// Cursor within the filtered set.
     selected: usize,
     scroll: usize,
-    /// Exact filtered index under the pointer (the palette's distinct-from-
-    /// selected rule).
+    /// Filtered index under the pointer, distinct from `selected`.
     pointer_over: Option<usize>,
     pointer_armed: Option<usize>,
 }
@@ -158,9 +152,8 @@ impl SessionPickerState {
         }
     }
 
-    /// The identity the new-identity row would create: the query, when it parses
-    /// as a name ([`crate::agent_identity::parse_name`], folded) that is not
-    /// already listed. `None` otherwise — activating the row is then a no-op.
+    /// The identity the new-identity row would create: the query, parsed and folded by
+    /// [`crate::agent_identity::parse_name`], when not already listed.
     pub(crate) fn new_identity_name(&self) -> Option<String> {
         let name = crate::agent_identity::parse_name(self.query.trim()).ok()?;
         let listed = self
@@ -188,15 +181,13 @@ impl SessionPickerState {
         self.pointer_armed = None;
     }
 
-    /// Indices into `rows` passing the fuzzy filter, in listing order — the
-    /// SAME subsequence match the palette uses, over `"title"  @sid`.
+    /// Indices into `rows` passing the palette's fuzzy filter over the row line, in listing order.
     pub(crate) fn filtered(&self) -> Vec<usize> {
         self.filtered_indices().collect()
     }
 
     fn filtered_indices(&self) -> impl Iterator<Item = usize> + '_ {
-        // Trimmed, as the new-identity row reads it: " work" still finds the
-        // `work` row that row tells the person to choose.
+        // Trimmed, as the new-identity row reads it, so " work" still finds the `work` row.
         let q = self.query.trim().to_ascii_lowercase();
         (0..self.rows.len()).filter(move |&i| {
             // Opening the picker shows every identity. No display-string formatting
@@ -221,7 +212,7 @@ impl SessionPickerState {
         self.filtered_count().min(MAX_ROWS)
     }
 
-    /// Move the cursor over the FILTERED set (wrapping), keeping it on-screen.
+    /// Move the cursor over the filtered set (wrapping), keeping it on-screen.
     pub(crate) fn move_selection(&mut self, delta: isize) {
         self.pointer_over = None;
         self.pointer_armed = None;
@@ -264,7 +255,7 @@ impl SessionPickerState {
             )
     }
 
-    /// Move the cursor to FILTERED index `idx` (a11y Focus/Click land here).
+    /// Move the cursor to filtered index `idx` (a11y Focus/Click).
     #[cfg(a11y_tree)]
     pub(crate) fn select(&mut self, idx: usize) {
         self.pointer_over = None;
@@ -299,8 +290,8 @@ impl SessionPickerState {
         changed
     }
 
-    /// Settle a left release: `(changed, activate)` — activation requires the
-    /// SAME filtered index at press and release.
+    /// Settle a left release: `(changed, activate)`; activation requires the same filtered
+    /// index at press and release.
     pub(crate) fn pointer_release(&mut self, idx: Option<usize>) -> (bool, bool) {
         let mut changed = self.pointer_hover(idx);
         let armed = self.pointer_armed.take();
@@ -352,7 +343,7 @@ impl SessionPickerState {
         self.row_at_filtered(self.selected)
     }
 
-    /// The row at an exact FILTERED index (pointer release path).
+    /// The row at a filtered index.
     pub(crate) fn row_at_filtered(&self, idx: usize) -> Option<&PickerRow> {
         self.filtered_indices().nth(idx).map(|i| &self.rows[i])
     }
@@ -362,8 +353,7 @@ impl SessionPickerState {
         (self.scroll, self.rows.len(), self.body())
     }
 
-    /// Machine-readable lines for `controls session-picker` — the SAME rows
-    /// the card paints, so screen == introspection.
+    /// Lines for `controls session-picker`: the rows the card paints.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let vis = self.filtered();
         let mut out = Vec::with_capacity(vis.len() + 1);
@@ -403,7 +393,7 @@ impl SessionPickerState {
         h.finish() | 1
     }
 
-    /// A11y row-identity epoch over the FILTERED set (the palette's scheme).
+    /// A11y row-identity epoch over the filtered set (the palette's scheme).
     #[cfg(a11y_tree)]
     fn a11y_epoch(&self) -> u32 {
         use std::hash::{Hash, Hasher};
@@ -415,15 +405,14 @@ impl SessionPickerState {
         a11y_epoch_from(h.finish())
     }
 
-    /// Decode a node minted by the CURRENT epoch to its filtered index.
+    /// Decode a node minted by the current epoch to its filtered index.
     #[cfg(a11y_tree)]
     pub(crate) fn a11y_filtered_index(&self, node: aterm_a11y::model::NodeId) -> Option<usize> {
         a11y_slot_for(self.a11y_epoch(), node, self.filtered_count())
     }
 }
 
-/// One pure geometry projection shared by paint and hit-testing — the
-/// palette's centred, width-capped, content-height card.
+/// The card geometry paint and hit-testing share: centred, width-capped, content height.
 fn picker_layout_for_count(count: usize, g: &SettingsGeom) -> PickerLayout {
     let tray_w = (g.cols as f32 * g.cw).max(0.0);
     let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
@@ -452,7 +441,7 @@ fn picker_layout(state: &SessionPickerState, g: &SettingsGeom) -> PickerLayout {
     picker_layout_for_count(state.filtered_count(), g)
 }
 
-/// Exact painted selection/hit rectangle for one VISIBLE slot.
+/// Painted selection/hit rectangle for one visible slot.
 fn picker_row_rect_in(
     layout: &PickerLayout,
     g: &SettingsGeom,
@@ -470,8 +459,7 @@ fn picker_row_rect_in(
     ))
 }
 
-/// Filtered-list index under a card-local point (the palette's rule: only
-/// painted rows participate).
+/// Filtered-list index under a card-local point; only painted rows hit.
 pub(crate) fn picker_row_hit(
     state: &SessionPickerState,
     g: &SettingsGeom,
@@ -617,8 +605,8 @@ pub(crate) fn picker_tray(
     )
 }
 
-/// The picker's accessibility tree — the palette scheme verbatim: a ListBox of
-/// the FILTERED rows, epoch-guarded ids, focus follows the cursor.
+/// The picker's accessibility tree, as the palette's: a list of the filtered rows with
+/// epoch-guarded ids, focus following the cursor.
 #[cfg(a11y_tree)]
 pub(crate) fn picker_a11y(state: &SessionPickerState) -> aterm_a11y::model::TreeUpdate {
     use aterm_a11y::model::{Action, Node, Role};
@@ -718,8 +706,7 @@ mod tests {
         assert_eq!(p.scroll_extent(), (0, 3, 3));
     }
 
-    /// Pointer press/release arming: activation requires the SAME filtered row
-    /// at press and release (the palette's rule).
+    /// Activation requires the same filtered row at press and release.
     #[test]
     fn pointer_release_requires_same_armed_row() {
         let mut p = picker();
@@ -787,7 +774,7 @@ mod tests {
                 .any(|l| l.contains("identity=review") && l.contains("selected=true")),
             "{lines:?}"
         );
-        // Fingerprint tracks the cursor (repaint-key law), nonzero.
+        // The fingerprint tracks the cursor and is nonzero.
         let before = p.fingerprint();
         assert_ne!(before, 0);
         p.move_selection(1);

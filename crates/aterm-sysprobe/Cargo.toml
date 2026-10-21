@@ -6,7 +6,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings, the load average, and what this OS can report at all) and of its volumes (the mount table, one volume's free space, one file's identity), on macOS, Linux and Windows, and the one rule that places a path under a directory across Windows' spellings. Every platform cfg of those readers lives here; it holds no timer and no thread."
+description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings and counts, the load average, and what this OS can report at all) and of its volumes (the mount table, one volume's free space, one file's identity), on macOS, Linux and Windows, and the one rule that places a path under a directory across Windows' spellings. Every platform cfg of those readers lives here; it holds no timer and no thread."
 
 # The macOS arm: libproc, `sysctlbyname`, Mach host and processor statistics
 # and `statfs` (declared in the first-party `libc`, each with its oracle row),

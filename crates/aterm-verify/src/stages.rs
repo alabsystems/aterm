@@ -383,6 +383,31 @@ pub fn tippy_oracle_args(scope: &Scope) -> Option<Vec<String>> {
     Some(a)
 }
 
+/// The package of the one shipped executable, which `ship` builds `--release`.
+pub const SHIPPED: &str = "aterm";
+
+/// `<tippy> -p aterm --release --keep-going -- -D warnings`: the lint's pass
+/// over the shipped build as `ship` builds it. Every other pass compiles with
+/// `debug_assertions` on, so an item whose every reader is test- or
+/// debug-gated is dead code only here. Its lib and bin targets, never
+/// `--all-targets`: a test that calls a `cfg(any(test, debug_assertions))`
+/// seam does not compile in a release build. `None` when the selection does
+/// not hold the shipped package.
+#[must_use]
+pub fn tippy_release_args(scope: &Scope) -> Option<Vec<String>> {
+    let spec = scope.spec_of(SHIPPED)?;
+    let a = [
+        "-p",
+        spec.as_str(),
+        "--release",
+        "--keep-going",
+        "--",
+        "-D",
+        "warnings",
+    ];
+    Some(a.map(String::from).into())
+}
+
 /// `targo --unverified run -q --profile gate -p aterm-release -- <verb>`: the
 /// release tools, built as the `ship` alias builds them.
 #[must_use]
@@ -1266,6 +1291,19 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
             ctx,
             r,
             &format!("tippy required-features targets -D warnings{borrowed}"),
+            &tippy_cmd(ctx, &bin, args),
+        );
+    }
+    // The shipped build, under `release` only: the passes above lint with
+    // `debug_assertions` on, so the release build's own dead code is seen here
+    // or nowhere ([`tippy_release_args`]). Its own row.
+    if ctx.release
+        && let Some(args) = tippy_release_args(&ctx.scope)
+    {
+        run_scoped(
+            ctx,
+            r,
+            &format!("tippy -p {SHIPPED} --release -D warnings{borrowed}"),
             &tippy_cmd(ctx, &bin, args),
         );
     }
@@ -2927,6 +2965,42 @@ mod tests {
         assert_eq!(tippy_oracle_args(&Scope::crate_only("aterm-core")), None);
     }
 
+    /// The shipped build is linted as `ship` builds it: `--release`, so with
+    /// `debug_assertions` off, its lib and bin only (a test's debug seams do not
+    /// compile there), and wherever the selection holds the shipped package.
+    #[test]
+    fn the_shipped_build_is_linted_with_debug_assertions_off() {
+        let want = [
+            "-p",
+            "aterm",
+            "--release",
+            "--keep-going",
+            "--",
+            "-D",
+            "warnings",
+        ];
+        for scope in [
+            Scope::workspace(),
+            Scope::changed("main", vec!["aterm-font".into(), "aterm".into()], true),
+        ] {
+            assert_eq!(tippy_release_args(&scope).expect("holds aterm"), want);
+        }
+        assert_eq!(tippy_release_args(&Scope::crate_only("aterm-font")), None);
+        // The rows are the property, whatever the (absent) driver's outcome.
+        let row = |release: bool| {
+            let mut c = ctx(Scope::crate_only("aterm")).with_release(release);
+            c.tools.tippy = Some(PathBuf::from("/repo/bin").join(crate::toolchain::TIPPY));
+            let mut r = Report::new("lint");
+            tippy(&c, &mut r);
+            r.outcomes()
+                .filter(|(_, l)| l.contains("--release"))
+                .count()
+        };
+        assert_eq!(row(true), 1);
+        // CONTROL: the dev set leaves the release build alone.
+        assert_eq!(row(false), 0);
+    }
+
     #[test]
     fn no_targo_is_fail_closed_at_the_test_compile_and_honest_everywhere_after() {
         let c = ctx(Scope::workspace());
@@ -3464,12 +3538,12 @@ mod tests {
             linux_lane_outcome(Some(1), "").0,
             Outcome::Fail(Severity::GateFailed)
         );
-        let transcript = "aterm-lab: NOT RUN: no limactl: `targo --unverified verify provision \
-                          --linux` provides it (or LAB_LIMACTL=/path/to/limactl names one)\n";
+        let transcript = "aterm-lab: NOT RUN: no limactl: LAB_LIMACTL=/path/to/limactl names \
+                          one; get lima's official release from github.com/lima-vm/lima/releases\n";
         let (outcome, label) = linux_lane_outcome(Some(3), transcript);
         assert_eq!(outcome, Outcome::Fail(Severity::CouldNotRun));
         assert!(
-            label.contains("no limactl: `targo --unverified verify provision"),
+            label.contains("no limactl: LAB_LIMACTL=/path/to/limactl names one"),
             "{label}"
         );
         assert_eq!(

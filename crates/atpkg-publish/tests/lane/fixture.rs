@@ -188,7 +188,6 @@ pub fn row(program: &str, build: u64, t: Triple, unproven: bool) -> String {
 
 /// The scratch world one lane test runs in.
 pub struct Fx {
-    /// Removed on drop.
     pub tmp: aterm_tempfile::TempDir,
     /// The master, the machine, the roster.
     pub keys: Arc<Keys>,
@@ -196,11 +195,8 @@ pub struct Fx {
     pub host: Arc<FakeHost>,
     /// The machine.
     pub ctx: Ctx,
-    /// The packer.
     pub packer: FakePacker,
-    /// The indexer.
     pub indexer: FakeIndexer,
-    /// The notifier.
     pub notes: Recorded,
     ledger: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
 }
@@ -353,8 +349,8 @@ impl Fx {
         );
     }
 
-    /// A published `pkg-<program>-<build>.toml` — the same signed bytes on BOTH owners, as
-    /// the mirror leaves them.
+    /// A published `pkg-<program>-<build>.toml`: the same signed bytes on both owners, as the
+    /// mirror leaves them.
     pub fn publish_pkg(&self, program: &str, build: u64, text: &str) {
         self.stage_text(program, build, text);
         let repo = atpkg_publish::programs::get(program).map_or(program, |d| d.repo);

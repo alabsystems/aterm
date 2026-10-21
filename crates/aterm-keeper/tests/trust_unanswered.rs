@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A CODE CHECK macOS NEVER ANSWERS IS A REFUSAL, NAMED, AND NEVER A HANG.
+//! A code check macOS never answers is a named refusal, never a hang.
 //!
-//! When `trustd` stops answering, the keeper's code checks would block forever
-//! (measured 2026-10-01). Both run through the process's one `trustd` gate,
-//! `aterm_uds::deadline::TRUST`, which refuses every call at once while an
-//! earlier one is overdue. This binary — a process of its own, so nothing else
-//! shares its gate — makes the gate's state what a wedged `trustd` makes it
-//! (work that never returns, past its suspect age), and drives the shipped
-//! checks through it: whatever the real `trustd` is doing, each must come back
-//! refused, naming the service. Then the stand-in "answers", and the very same
-//! checks pass again with no restart. The checks are of this test binary's own
-//! ad-hoc code, which needs no `trustd` once the gate lets the call through.
+//! When `trustd` stops answering, the keeper's code checks would block forever.
+//! Both run through the process's one `trustd` gate, `aterm_uds::deadline::TRUST`,
+//! which refuses every call at once while an earlier one is overdue. This binary
+//! — a process of its own, so nothing else shares its gate — makes the gate's
+//! state what a wedged `trustd` makes it (work that never returns, past its
+//! suspect age), and drives the shipped checks through it: whatever the real
+//! `trustd` is doing, each must come back refused, naming the service. Then the
+//! stand-in "answers", and the same checks pass again with no restart. The
+//! checks are of this test binary's own ad-hoc code, which needs no `trustd`
+//! once the gate lets the call through.
 
 #![cfg(target_vendor = "apple")]
 

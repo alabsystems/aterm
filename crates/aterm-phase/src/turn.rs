@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a finished turn leaves on the screen for whoever decides what comes
-//! next: Claude Code's own suggestion for the next message, whether a `/goal`
-//! is armed, and the worker's last words.
+//! What a turn leaves on the screen for whoever decides what comes next: a
+//! fresh launch and its card, Claude Code's suggested next message, an armed
+//! `/goal`, the worker's last words, and a person's interrupt.
 
 use crate::phase::{
     composer_frame, composer_text, is_against_right_edge, is_placeholder, is_tool_call,
@@ -43,16 +43,24 @@ pub fn fresh(rows: &[String]) -> bool {
     }
 }
 
-/// What Claude Code's launch card says about the process that drew it:
-/// its version row (`Claude Code v2.1.283`, anchor `launch.banner`) and the
-/// row under it (`Opus 5.5 with xhigh effort · Claude Max`, `Haiku 4.5 ·
-/// Claude Max`). The model and effort are the ones the card was drawn with:
-/// the process's starting ones on a fresh screen. The inline renderer draws
-/// it once; the fullscreen renderer draws it again after a `/model` choice,
-/// with the new model (measured 2026-09-28 on 2.1.283: `Haiku 4.5 · Claude
-/// Max` became `Sonnet 5 · Claude Max` after a switch; the model-switch
-/// capture still shows `Haiku 4.5` while the switch is being confirmed) —
-/// under a user row by then, where [`launch_card`] does not read it.
+/// A MESSAGE STANDS ON `rows` ([`crate::ScreenReader::message_drawn`]): a
+/// user's `❯` row in column 0 above the composer's frame (anywhere where no
+/// frame is drawn), answered or not — save the `❯ /clear` a cleared
+/// conversation's card is redrawn with, which [`fresh`] reads as no turn.
+#[must_use]
+pub fn message_drawn(rows: &[String]) -> bool {
+    let top = composer_frame(rows).map_or(rows.len(), |f| f.top);
+    rows[..top]
+        .iter()
+        .any(|r| r.starts_with('❯') && crate::text::trim_end(r) != "❯ /clear")
+}
+
+/// What Claude Code's launch card says about the process that drew it: its
+/// version row (`Claude Code v2.1.283`, anchor `launch.banner`) and the row
+/// under it (`Opus 5.5 with xhigh effort · Claude Max`, `Haiku 4.5 · Claude
+/// Max`), so the model and effort the card was drawn with. The fullscreen
+/// renderer redraws the card after a `/model` choice with the new model, but
+/// under a user row, where [`launch_card`] does not read it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LaunchCard {
     /// The build the card names (`2.1.283`).
@@ -665,13 +673,11 @@ pub fn continuation_suggestion(rows: &[String], cursor_col: usize) -> Option<Str
     composer_text(rows).filter(|t| !t.is_empty())
 }
 
-/// Whether a `/goal` is armed: Claude Code's `◎ /goal active (3h)` indicator
-/// in the live zone — between the status row (the last transcript row when
-/// there is none) and the composer's top rule, or in the footer — against
-/// the right edge, where it was measured (2026-09-21, right-aligned above
-/// the rule). A worker's words quoting it are transcript: with no done row
-/// under them they fall in the live zone too, but at the message's column,
-/// so they do not count. Without the frame, `false`.
+/// Whether a `/goal` is armed: Claude Code's right-aligned `◎ /goal active
+/// (3h)` indicator in the live zone (between the status row, or the last
+/// transcript row when there is none, and the composer's top rule) or in the
+/// footer. A worker's words quoting it can fall in the live zone too, but at
+/// the message's column, so they do not count. Without the frame, `false`.
 #[must_use]
 pub fn goal_active(rows: &[String]) -> bool {
     let Some(frame) = composer_frame(rows) else {
@@ -698,11 +704,11 @@ pub(crate) fn asks(said: &str) -> bool {
 }
 
 /// The worker's last words: the `⏺` message that holds the last thing said
-/// ([`last_said_index`]), from its `⏺` row down to that row, the marker and
-/// indentation stripped, blank rows and any `⎿` block under it (the
-/// vendor's or a tool's rows) left out, one line per row. `None` when the
-/// last thing said is not in a message — a user row, a tool call, a shell's
-/// screen — so a stop-phrase check never reads anyone else's words.
+/// ([`last_said_index`]), from its `⏺` row down to that row, marker and
+/// indentation stripped, blank rows and any `⎿` block under it left out, one
+/// line per row. `None` when the last thing said is not in a message (a user
+/// row, a tool call, a shell's screen), so a stop-phrase check never reads
+/// anyone else's words.
 ///
 /// A message TALLER than the screen has its `⏺` row scrolled off: every
 /// visible row above the last said is indented (the message's continuation
@@ -1020,21 +1026,16 @@ pub fn idle_compacted(rows: &[String]) -> bool {
         .is_some_and(|(_, said)| is_idle_notice(&said))
 }
 
-/// Whether a PERSON stopped the last turn: the vendor's `⎿  Interrupted ·
-/// What should Claude do instead?` row (anchor `turn.interrupted`) under
-/// the transcript's last block — the last `⏺` message or tool row, with
-/// no user `❯` row after it — above the live zone. A turn stopped so is a
-/// stop, never a point to continue: the person is at the keyboard and the
-/// next message is theirs, never a `keep going`. Negative: the same words
-/// in a message, or an interrupt a new user message has answered.
+/// Whether a person stopped the last turn: the vendor's `⎿  Interrupted ·
+/// What should Claude do instead?` row (anchor `turn.interrupted`) under the
+/// transcript's last block (the last `⏺` message or tool row, no user `❯` row
+/// after it). The next message is the person's, never a `keep going`. The same
+/// words in a message, or an interrupt a new user message answered, are not.
 ///
-/// A question dialog a person declined — Esc on it, or `2. Cancel` on its
-/// review tab — is the same stop: the last block is `⏺ User declined to
-/// answer questions` (anchor `question.declined`; measured 2026-09-25, S7
-/// and S8), no `Interrupted ·` row under it, and the tool result tells the
-/// model to STOP and wait for the person: read as no interrupt, a turn-end
-/// policy would type `keep going` over the person's refusal. Negative: the
-/// words inside a longer message row.
+/// A declined question dialog (Esc, or `2. Cancel` on its review tab) is the
+/// same stop: the last block is exactly `⏺ User declined to answer questions`
+/// (anchor `question.declined`) with no `Interrupted ·` row, and the tool
+/// result tells the model to wait for the person.
 #[must_use]
 pub fn interrupted(rows: &[String]) -> bool {
     let end = transcript_end(rows).min(rows.len());
@@ -1374,12 +1375,9 @@ mod tests {
         assert!(!interrupted(&answered));
     }
 
-    /// R12 (the critique of 2026-09-25): a question dialog a person declined
-    /// — `2. Cancel` on its review tab (S7-03), Esc on it (S8-02), both
-    /// MEASURED — ends the turn on `⏺ User declined to answer questions`
-    /// with no `Interrupted ·` row, and reads as a person's stop. Negative
-    /// controls: the words inside a longer message row, and a decline a new
-    /// user message has answered.
+    /// A question dialog declined with `2. Cancel` on its review tab (S7-03) or
+    /// Esc (S8-02) is a person's stop. Negative controls: the words inside a
+    /// longer message row, and a decline a new user message has answered.
     #[test]
     fn a_declined_question_is_a_persons_stop() {
         use crate::prompt::fixtures::{QUESTION_DECLINED_CANCEL, QUESTION_DECLINED_ESC, screen};
@@ -1652,10 +1650,9 @@ mod tests {
             .collect()
     }
 
-    /// THE LAUNCH CARD, over the measured 2.1.283 screens: the owner's fresh
-    /// bypass screen names `Opus 5.5` at `xhigh` even with its `⏺ agents-md`
-    /// notice between the card and the composer (which [`fresh`] refuses);
-    /// a model with no effort levels names none. NEGATIVE CONTROLS: a user
+    /// On measured 2.1.283 screens: the fresh bypass screen names `Opus 5.5`
+    /// at `xhigh` despite its `⏺ agents-md` notice (which [`fresh`] refuses);
+    /// a model with no effort levels names none. Negative controls: a user
     /// message under the card, a box over the composer, a model row cut or
     /// split for a narrow pane, and a newer card below the frame.
     #[test]
@@ -1677,8 +1674,8 @@ mod tests {
                 effort: None,
             })
         );
-        // The inline renderer relaunched in the same tab: the NEWEST card,
-        // the one above the live frame, is read — never its predecessor's.
+        // The inline renderer relaunched in the same tab: the newest card,
+        // the one above the live frame, is read.
         let mut relaunch = measured("claude-2.1.283-inline-relaunch-repl-ready.txt");
         let first = relaunch
             .iter()
@@ -1689,7 +1686,7 @@ mod tests {
             launch_card(&relaunch).map(|c| c.model).as_deref(),
             Some("Haiku 4.5")
         );
-        // A newer card BELOW the frame: that frame is a predecessor's.
+        // A newer card below the frame: that frame is a predecessor's.
         let mut below = measured("claude-2.1.283-launch-repl-ready.txt");
         let card: Vec<String> = below
             .iter()

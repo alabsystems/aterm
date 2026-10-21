@@ -6,27 +6,35 @@
 //! bench's ping-pong arm reads (`crates/aterm/tests/fabric_bench/run/pingpong.rs`).
 //!
 //! WHY IT IS COUNTED IN HERE. The bridge is one thread. While it waits for a
-//! group commit's answer or a publish's ack it does nothing else: a reply a
-//! session posted the moment its message arrived usually sits in aterm's
-//! outbox until the commit for that very delivery comes back. (Not always: the
+//! broker's answer it does nothing else. Before aterm-0 it waited for every
+//! group commit and, at every idle moment, every owed ack, so a reply a
+//! session posted the moment its message arrived usually sat in aterm's
+//! outbox until the commit for that very delivery came back (not always: the
 //! roster round at the top of a loop's pass reads the outbox too,
 //! `Bridge::roster_backstop`, before that pass commits, and a reply it finds
-//! there is published ahead of the commit.) From outside, a bench sees only
-//! the round trip; how much of it is the loop parked on the broker is a fact
-//! only this process has. So the loop counts it, at the two places every wait
-//! passes through:
+//! there is published ahead of the commit). Since, it waits only where a reply
+//! must be judged (`Bridge::settle_owed` lists where) and at its idle
+//! backstop. From outside, a bench sees only the round trip; how much of it is
+//! the loop parked on the broker is a fact only this process has. So the loop
+//! counts it, at the two places every wait passes through:
 //!
-//! - every request that reads its own reply — a `Fetch`, a `Last` page, a
-//!   `Commit`, the `Will`, a `Budget`, a blocking `Publish` — hands its answer
-//!   to `Bridge::observe`, which notes [`Recorder::request`] from the moment
-//!   the request was written to the moment its reply was read, and the group
-//!   commit, one of them, is noted again apart ([`Recorder::commit`]). (A
-//!   `Last` walk the bridge gives up on for running past its bound hands
-//!   `observe` an error of its own making: one more request, and no wait.)
-//! - every PIPELINED publish's ack is read in `Bridge::settle_one`, which
-//!   notes [`Recorder::ack`] around the read alone: an ack that was already
-//!   waiting in the socket costs what the read costs, not the time since its
-//!   publish was sent, which the loop spent working.
+//! - every request that reads its own reply — a `Fetch`, a `Last` page, the
+//!   `Will`, a `Budget`, a blocking `Publish` — hands its answer to
+//!   `Bridge::observe`, which notes [`Recorder::request`] from the moment the
+//!   request was written to the moment its reply was read. (A `Last` walk the
+//!   bridge gives up on for running past its bound hands `observe` an error of
+//!   its own making: one more request, and no wait.)
+//! - every PIPELINED ack — a publish's, and since aterm-0 the inbox group's
+//!   commit's, which rides the pipeline (`Then::Commit`) instead of being a
+//!   request — is read in `Bridge::settled`, which notes [`Recorder::ack`]
+//!   around the read alone: an ack that was already waiting in the socket
+//!   costs what the read costs, not the time since its publish was sent,
+//!   which the loop spent working; and a read that does not wait
+//!   (`Bridge::try_settle_one`) costs what it costs. The group commits among
+//!   them are noted again apart ([`Tally::commits`]). Before aterm-0 the
+//!   commit was a request, counted among the requests, and its time was the
+//!   flush the loop parked for; a tally says which by where its commits'
+//!   count sits.
 //!
 //! What is NOT a wait on the broker is not counted: writing a pipelined
 //! publish, the verb lane's round trips to aterm (`deliver`, the outbox), the
@@ -36,8 +44,10 @@
 //!
 //! HOW IT LEAVES THE PROCESS. With [`SEAM`] set in a build that reads seams,
 //! the bridge opens `<state>/`[`FILE`] at its start and, at each idle moment —
-//! its loop found nothing queued and has read the acks it owed
-//! (`Bridge::settle_owed`) — when the tally has moved since the last write,
+//! its loop found nothing queued and has read its posts' answers (waiting, as
+//! their senders wait) and the other acks that had arrived
+//! (`Bridge::settle_owed`), and again once its idle backstop has read the rest
+//! (`Bridge::park_and_take`) — when the tally has moved since the last write,
 //! writes the tally there ([`Recorder::idle`]): one positioned write of one
 //! line of constant length at offset 0 — no temp, no rename, no flush. The line
 //! carries a checksum of itself ([`Tally::parse`]), so a reader that raced a
@@ -45,10 +55,10 @@
 //! half new.
 //!
 //! The line also names this process's pid, and the inbox group cursor the loop
-//! last committed: a reader waits for a tally that has committed past the
-//! message it just saw (the loop's idle write after that commit), and refuses
-//! a pair of tallies from two processes ([`Tally::since`]) — a relaunched
-//! bridge starts again from zero.
+//! last committed — once the commit's ack was read: a reader waits for a tally
+//! that has committed past the message it just saw (the loop's idle write
+//! after that commit landed), and refuses a pair of tallies from two processes
+//! ([`Tally::since`]) — a relaunched bridge starts again from zero.
 //!
 //! WHAT IT COSTS THE LOOP IT MEASURES. The loop the arm measures is NOT the
 //! loop that runs without the seam: it is that loop plus this, small beside a
@@ -57,28 +67,27 @@
 //!
 //! - Per request that reads its own reply: one clock read and two additions
 //!   ([`Recorder::request`]; the `Instant` at the write is read with or
-//!   without the seam, for the link's own round-trip note). Per group commit,
-//!   one clock read and two additions more ([`Recorder::commit`]).
-//! - Per settle of the owed pipelined acks (`Bridge::settle_acks`, run before
-//!   each request on the publisher connection that reads its own reply,
-//!   `Bridge::conn_now`, at each idle moment, and before an inbox commit a
-//!   claim rides on): one clock read before each look for an owed ack
+//!   without the seam, for the link's own round-trip note).
+//! - Per read of the owed pipelined acks — waited for (`Bridge::settle_one`:
+//!   before each request on the publisher connection that reads its own
+//!   reply, `Bridge::conn_now`, and wherever else a reply must be judged,
+//!   `Bridge::settle_owed` lists them) or not (`Bridge::try_settle_one`, at
+//!   each idle moment): one clock read before each look for an owed ack
 //!   ([`Recorder::ack_starts`]) — including the last look, which finds none
-//!   owed and reads nothing — and, per ack read, one clock read and two
-//!   additions after it ([`Recorder::ack`]). So two clock reads per ack, and
-//!   one more per settle, owed or not. (The settle's own `Instant`, for the
-//!   link's round-trip note, is read with or without the seam.)
+//!   owed or none arrived and reads nothing — and, per ack read, one clock
+//!   read and two additions after it, two more for a commit's
+//!   ([`Recorder::ack`]). So two clock reads per ack, and one more per settle,
+//!   owed or not. (The settle's own `Instant`, for the link's round-trip note,
+//!   is read with or without the seam.)
 //! - Per idle moment: one comparison, and when the tally (cursor included)
 //!   differs from the one last written, rendering the line, hashing it, and
-//!   one `pwrite` ([`Recorder::idle`]). The loop judges the moment idle BEFORE
-//!   it settles its owed acks, and that settle blocks on each ack still in
-//!   flight (an fsync, on Strict), so an item queued during it is already
-//!   waiting when the write runs, and waits for it — as does one that arrives
-//!   while it runs. On the ping-pong arm's own path that is expected, not
-//!   rare: the bridge publishes a message, finds nothing queued and blocks on
-//!   the message's ack; on Strict the message turns visible at that same
-//!   fsync, so its delivery — the one the arm times — can be queued before the
-//!   settle returns, and then waits behind the write that ack just moved.
+//!   one `pwrite` ([`Recorder::idle`]). An item that arrives while the write
+//!   runs waits for it. Before aterm-0 the loop judged the moment idle and
+//!   then blocked on every ack still in flight before writing, so an item
+//!   queued during that wait — on the ping-pong arm, the delivery the arm
+//!   times — waited behind the write as well; now the settle at an idle
+//!   moment reads only what has arrived, and the backstop's write comes after
+//!   a park in which nothing came.
 //!
 //! A RELEASED BINARY HAS NO TALLY. `dev_seam!` is `None` there, the recorder is
 //! off, and every note below is one branch on that.
@@ -109,10 +118,13 @@ pub struct Tally {
     /// Requests that read their own reply, and the time spent waiting for it.
     pub requests: u64,
     pub request_ns: u64,
-    /// Of those, the inbox group's commits.
+    /// Of the requests and the acks together, the inbox group's commits: a
+    /// request each before aterm-0, a pipelined ack each since (so the line
+    /// says which by where its count sits: `requests` or `acks`).
     pub commits: u64,
     pub commit_ns: u64,
-    /// Pipelined publishes' acks read, and the time the reads blocked.
+    /// Pipelined acks read — publishes', and since aterm-0 the group
+    /// commits' — and the time the reads blocked.
     pub acks: u64,
     pub ack_ns: u64,
     /// The inbox group cursor this process last committed (0 before any).
@@ -316,29 +328,25 @@ impl Recorder {
         }
     }
 
-    /// A group commit written at `started` has had its reply read now — a
-    /// request [`Recorder::request`] counts as well, timed at the same reply.
-    pub(crate) fn commit(&mut self, started: Instant) {
-        if self.on() {
-            self.tally.commits += 1;
-            self.tally.commit_ns = self
-                .tally
-                .commit_ns
-                .saturating_add(nanos(started.elapsed()));
-        }
-    }
-
     /// When an ack read is about to start: `None` while off, so a released
     /// bridge reads no clock for it.
     pub(crate) fn ack_starts(&self) -> Option<Instant> {
         self.on().then(Instant::now)
     }
 
-    /// The ack read that [`Recorder::ack_starts`] began has returned.
-    pub(crate) fn ack(&mut self, started: Option<Instant>) {
+    /// The ack read that [`Recorder::ack_starts`] began has returned an ack —
+    /// the inbox group's commit's when `commit` (aterm-0's pipelined commit,
+    /// counted in [`Tally::commits`] as well, timed by the same read). A read
+    /// that did not wait (a try) is counted the same way, at what it cost.
+    pub(crate) fn ack(&mut self, started: Option<Instant>, commit: bool) {
         if let Some(started) = started {
+            let ns = nanos(started.elapsed());
             self.tally.acks += 1;
-            self.tally.ack_ns = self.tally.ack_ns.saturating_add(nanos(started.elapsed()));
+            self.tally.ack_ns = self.tally.ack_ns.saturating_add(ns);
+            if commit {
+                self.tally.commits += 1;
+                self.tally.commit_ns = self.tally.commit_ns.saturating_add(ns);
+            }
         }
     }
 
@@ -491,10 +499,9 @@ mod tests {
         // OFF: nothing counted, no clock read for an ack, nothing written.
         let mut off = Recorder::default();
         off.request(Instant::now());
-        off.commit(Instant::now());
         let started = off.ack_starts();
         assert_eq!(started, None);
-        off.ack(started);
+        off.ack(started, true);
         off.idle(9);
         assert_eq!(off.tally(), Tally::default());
 
@@ -504,21 +511,23 @@ mod tests {
         assert!(on.on());
         let read = || std::fs::read_to_string(&path).expect("read the tally");
         assert_eq!(read(), "", "nothing until the first idle moment");
-        let t = Instant::now();
-        on.commit(t);
-        on.request(t);
         on.request(Instant::now());
+        on.request(Instant::now());
+        // A publish's ack, then a pipelined commit's: both acks, one commit,
+        // and the commit's time is the time of the read that returned it.
         let started = on.ack_starts();
         assert!(started.is_some());
-        on.ack(started);
+        on.ack(started, false);
+        let started = on.ack_starts();
+        on.ack(started, true);
         on.idle(17);
         let written = Tally::parse(&read()).expect("a whole line");
         assert_eq!(
             (written.pid, written.requests, written.commits, written.acks),
-            (std::process::id(), 2, 1, 1)
+            (std::process::id(), 2, 1, 2)
         );
         assert_eq!(written.committed, 17);
-        assert!(written.commit_ns <= written.request_ns);
+        assert!(written.commit_ns <= written.ack_ns);
 
         // AN IDLE MOMENT WITH NOTHING MOVED WRITES NOTHING: the file is
         // overwritten from outside, and the next idle moment leaves it.

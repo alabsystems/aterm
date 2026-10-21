@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The encoder: multi-pass command buffers.
-//!
-//! A frame needs several coalesced passes with pipeline, atlas and buffer
-//! switches inside a pass, mid-frame texture copies, and non-blocking
-//! completion. This module provides a command buffer that opens multiple render
-//! passes, a pass encoder that switches state between draws with every bind
-//! index supplied by the caller (from the pipeline table's `BindSpec`), blit
-//! copies, and a [`Submitted`] handle whose [`Submitted::try_outcome`] polls
-//! status instead of parking the thread.
+//! The encoder: multi-pass command buffers. A [`CommandBuffer`] holds several
+//! render passes and blit copies; a [`PassEncoder`] switches pipeline, atlas and
+//! buffers between draws, every bind index supplied by the caller (the pipeline
+//! table's `BindSpec`); [`Submitted::try_outcome`] polls completion instead of
+//! parking the thread.
 //!
 //! # Queue ownership
 //!
@@ -612,7 +608,7 @@ pub(crate) struct PassEncoder<'cb, 's> {
     /// +1 on the `MTLRenderCommandEncoder` (retained out of the creation
     /// pool). `endEncoding` runs exactly once, on drop.
     enc: Obj,
-    /// The exclusive borrow that keeps this the command buffer's ONLY open
+    /// The exclusive borrow that keeps this the command buffer's only open
     /// encoder.
     _cb: &'cb mut CommandBuffer<'s>,
     /// Draw state Metal validates only in the debug layer: a draw with no
@@ -736,7 +732,7 @@ impl PassEncoder<'_, '_> {
         }
     }
 
-    /// `-setViewport:` — the letterbox (one call site in the renderer).
+    /// `-setViewport:` (the present's blit pass states the full destination).
     pub(crate) fn set_viewport(&self, vp: MtlViewport) {
         // SAFETY: `MTLViewport` travels indirectly per its ffi doc.
         unsafe {
@@ -905,7 +901,7 @@ impl Submitted {
         }
     }
 
-    /// Record the ONE terminal outcome: feed the latch, fill the cache.
+    /// Record the one terminal outcome: feed the latch, fill the cache.
     fn settle_terminal(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.settled.set(Some(outcome));
         self.settle(outcome)
@@ -991,7 +987,7 @@ mod tests {
 
         let src = uploaded_texture(&mint, W, H, &unique);
 
-        // FULL copy: every texel of a sentinel-filled destination becomes src.
+        // Full copy: every texel of a sentinel-filled destination becomes src.
         let dst_full = uploaded_texture(&mint, W, H, &sentinel_frame);
         let mut cb = session.begin().expect("cb");
         cb.copy_texture_to_texture(&src, &dst_full)
@@ -1003,7 +999,7 @@ mod tests {
             "the full copy must reproduce the source byte-for-byte"
         );
 
-        // SUB-RECT copy: 5x6 from src (3,2) to dst (8,7).
+        // Sub-rect copy: 5x6 from src (3,2) to dst (8,7).
         const CW: usize = 5;
         const CH: usize = 6;
         const SO: (usize, usize) = (3, 2);
@@ -1118,8 +1114,7 @@ mod tests {
             .expect_err("4-byte -> 1-byte texels");
         assert!(err.contains("copy-compatible"), "got: {err}");
 
-        // The stride-bug class, on THIS path: a 16-wide f16 row is 128 bytes,
-        // and 16*4 understates it exactly the way the fixed blit bug did.
+        // An understated stride: a 16-wide f16 row is 128 bytes, not 16*4.
         let big = dev.new_buffer(128 * 16).expect("big");
         let err = cb
             .copy_texture_to_buffer(&f16, 16, 16, &big, 16 * 4)
@@ -1139,7 +1134,7 @@ mod tests {
             .expect_err("oversized readback region");
         assert!(err.contains("exceeds"), "got: {err}");
 
-        // Every refusal above encoded NOTHING: the same command buffer still
+        // Every refusal above encoded nothing: the same command buffer still
         // commits and completes clean.
         assert_eq!(cb.commit().wait_outcome(), loss::CbOutcome::Completed);
         assert!(
@@ -1293,7 +1288,7 @@ mod tests {
             "a wait after the terminal poll answers from the cache"
         );
 
-        // The injection seam stays UNCACHED: every settle feeds.
+        // The injection seam stays uncached: every settle feeds.
         #[cfg(debug_assertions)]
         {
             let seam_before = latch.fed_count();
@@ -1385,7 +1380,7 @@ mod tests {
             );
         }
 
-        // Instanced draw with a pipeline but NO stream: the silent-misdraw
+        // Instanced draw with a pipeline but no stream: the silent-misdraw
         // class, refused by name. The vertex-id draws stay legal.
         {
             let cell = pipelines::compile_library(&dev, crate::pipeline_table::ShaderLibrary::Cell)

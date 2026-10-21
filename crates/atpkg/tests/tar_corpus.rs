@@ -191,12 +191,9 @@ fn raw_header(name: &str, typeflag: u8, linkname: &str, size: u64, mode: u32) ->
     raw_header_magic(name, typeflag, linkname, size, mode, b"ustar\0", b"00")
 }
 
-/// [`raw_header`] with the magic and version chosen by the caller.
-///
-/// The two fields together are what separates POSIX ustar (`"ustar\0"` + `"00"`)
-/// from GNU (`"ustar "` + `" \0"`) from something that is neither — and every
-/// fixture in this file used to write POSIX, which is precisely why the
-/// magic-blind bugs this now covers were invisible.
+/// [`raw_header`] with the magic and version chosen by the caller, separating
+/// POSIX ustar (`"ustar\0"` + `"00"`) from GNU (`"ustar "` + `" \0"`) and
+/// headers that match neither.
 fn raw_header_magic(
     name: &str,
     typeflag: u8,
@@ -1454,8 +1451,7 @@ const PAX_GLOBAL_HEADERS: &str = "921b7363448ceb57";
 const DUPLICATE_AND_RECOVERED_PAX_RECORDS: &str = "709decb1b388bf9a";
 // The four corpora below carry non-UTF-8 path bytes, and pin a second digest on Windows:
 // there `tarread` refuses such a path (`path is not valid unicode`) where unix reads the
-// bytes as they are, since a Windows path has no spelling for them. Every other answer is
-// the unix one: under a lossless Windows arm all four matched their unix pins (2026-10-17).
+// bytes as they are, since a Windows path has no spelling for them.
 const MAGIC_AND_VERSION_COMBINATIONS: &str = if cfg!(windows) {
     "bee39615eac71f98"
 } else {

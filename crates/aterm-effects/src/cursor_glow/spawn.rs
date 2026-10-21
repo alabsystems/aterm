@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SPAWNING — the light, particles, rings, bolts and poofs a licensed move
-//! or an erase mints into the engine's state.
+//! Spawning: the light, particles, rings, bolts and poofs a licensed move or an
+//! erase mints into the engine's state.
 
 use super::*;
 
 // ---- the erase poof's energy -------------------------------------------------
 //
-// The delete poof scales with two independent terms, multiplied
-// (owner, 2026-08-06):
-//
-//   * momentum: how hard the delete run is going, from
-//     [`CursorGlow::erase_mom`], the mirror of the canonical typing metric;
-//   * weight: how much vanished, in cells.
-//
-// So a lone Backspace, a held delete run and a killed line poof differently.
+// The delete poof scales with momentum (`CursorGlow::erase_mom`, the mirror of
+// the typing metric) times weight (cells vanished), so a lone Backspace, a held
+// delete run and a killed line poof differently.
 /// Floor of the momentum term, deliberately high: a single cold delete is
 /// still clearly acknowledged, and momentum carries it from there.
 pub(super) const ERASE_MOM_FLOOR: f32 = 0.55;
@@ -31,33 +26,24 @@ pub(super) const ERASE_POOF_STARS: f32 = 8.0;
 /// held Ctrl-U mash cannot crowd out the rest of the family, with headroom for
 /// a line kill over a word kill.
 pub(super) const ERASE_POOF_CAP: usize = 18;
-/// How wide, in cells, one poof's debris may spread regardless of the erased
-/// span. A long span spread evenly would read as a dotted rule; the span sets
-/// the poof's energy (via [`erase_weight`]) but not its geometry. Debris
-/// clusters at the collapse point (the span's start, where the caret ends up)
-/// and thins outward.
+/// How wide, in cells, one poof's debris may spread whatever the erased span:
+/// a long span spread evenly would read as a dotted rule, so the span sets the
+/// energy ([`erase_weight`]), not the geometry. Debris clusters at the collapse
+/// point (the span's start, where the caret ends up) and thins outward.
 pub(super) const ERASE_POOF_SPREAD_CELLS: f32 = 9.0;
 /// How much headroom above the erased row the debris needs before it is allowed
 /// to rise. Inside this, the poof falls instead — see `spawn_erase_sparkles`.
 pub(super) const ERASE_POOF_LIFT_CELLS: f32 = 1.2;
-/// The hero grain's `cov_scale` band, at the top of the glitter sentinel range
-/// (`< 0.9`): `MIN` at a single character, `MIN + SPAN` at a killed line.
-/// `emit_particles` decodes it into a size multiplier, so the poof's central
-/// pop grows with the weight of what vanished.
+/// The hero grain's `cov_scale` (its coverage multiplier in `emit_particles`):
+/// `MIN` at a single character, `MIN + SPAN` at a killed line, so the poof's
+/// central pop grows with the weight of what vanished.
 pub(super) const ERASE_HERO_SCALE_MIN: f32 = 0.80;
 pub(super) const ERASE_HERO_SCALE_SPAN: f32 = 0.09;
-/// The round-spark band, at the bottom of the glitter sentinel range: the
-/// poof's body grains spawn at [`ERASE_ROUND_SCALE`], and `emit_particles`
-/// draws anything under [`ERASE_ROUND_SCALE_MAX`] as a round point of cool
-/// light, not a 4-point plus. A cloud of small crosses at glyph size would read
-/// as literal '+' characters in the buffer, so the poof keeps exactly one plus
-/// (the hero band above). Other glitter-band grains fall through to the
-/// population deal in `emit_particles` (round [`dust_r`] stardust unless dealt
-/// the 1-in-[`crate::effect_util::STAR_ACCENT_DEN`] accent, see
-/// [`star_accent`]).
+/// The poof's body grains' `cov_scale` (their coverage multiplier in
+/// `emit_particles`).
 pub(super) const ERASE_ROUND_SCALE: f32 = 0.5;
 
-/// The WEIGHT term: how big the vanished span reads, in
+/// The weight term: how big the vanished span reads, in
 /// `1.0..=`[`ERASE_WEIGHT_CAP`]. Monotone non-decreasing in `cells` (pinned by
 /// `erase_poof_drive_grows_with_momentum_and_weight`).
 #[inline]
@@ -74,10 +60,8 @@ pub(super) fn erase_poof_drive(mom: f32, cells: u16) -> f32 {
 }
 
 impl CursorGlow {
-    /// A real jump slams the flare and forgets the rainbow kitty tail memory; the
-    /// abandoned ribbon, a backward TUI re-anchor's stranded ribbon, and a TUI
-    /// repaint's OFF-ROW stranded ribbon are retired so stale light never parks
-    /// over cells the typing left.
+    /// A non-typing move slams the flare, except a fire jump (its meteor carries
+    /// the drama) and a pure navigation move (no light).
     pub(super) fn retire_abandoned_light(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             typing,
@@ -85,8 +69,6 @@ impl CursorGlow {
             navigation,
             ..
         } = mv;
-        // A NON-TYPING move flares the head — except a fire jump (its meteor
-        // carries the drama) and a pure navigation move (T1: no light).
         if !typing && !fire && !navigation {
             self.flare = 1.0;
         }
@@ -108,22 +90,12 @@ impl CursorGlow {
             navigation,
             ..
         } = mv;
-        // Sound: the aural twin of this spawn, with the classification the light
-        // computed (after the heat/flare update). Kill cues fire at the poof site
-        // instead, since a kill's echo may not move the caret.
-        //
-        // An admitted navigation move sings in the melody: a short scrub glides
-        // one in-key step, a fast run sweeps a short scale, both carrying
-        // direction.
-        //
-        // One keypress, one click, debited only by the arms a printable key's
-        // echo can land on (`typing` and the `else` Jump), never by `deletion`
-        // or `navigation`. Those two are hint-only, so a printable echo overtaken
-        // by the next key's hint can misclassify into them; if the credit were
-        // retired there, the echo would later fall through to `typing` with an
-        // empty ledger and click spuriously (`x` then Backspace would make three
-        // sounds). The trade-off, a swallowed echo leaving a credit that mutes
-        // one later click until `KEYED_CLICK_FRESH`, is milder.
+        // Kill cues fire at the poof site instead, since a kill's echo may not
+        // move the caret. One keypress, one click: only the arms a printable
+        // key's echo can land on (`typing` and the `else` Jump) debit the key
+        // credit. `deletion` and `navigation` are hint-only, so a printable
+        // echo overtaken by the next key's hint can land there, and retiring
+        // its credit would make the echo click again later.
         if deletion {
             self.cue_sound(crate::trail_sound::SoundKind::Backspace, cc);
         } else if navigation {
@@ -147,21 +119,16 @@ impl CursorGlow {
                 self.cue_cursor(kind, cc, dir);
             }
         } else if typing {
-            // One character, one click: if the host already clicked this glyph at
-            // the physical keypress ([`Self::cue_keystroke`]), spend that credit
-            // and stay silent. An advance with no credit (pure PTY output, a host
-            // without the key seam, an echo past the freshness window) clicks
-            // here.
+            // One character, one click: a glyph the host already clicked at the
+            // keypress ([`Self::cue_keystroke`]) spends that credit silently.
             if !self.take_keyed_click(now) {
                 self.cue_sound(crate::trail_sound::SoundKind::Typed, cc);
             }
         } else {
-            // A printable keystroke whose echo moves the cursor more than one
-            // cell (vim motions, keys in less/htop/fzf, a multi-cell IME commit)
-            // classifies as a Jump, so the key credit is spent here too.
-            // Otherwise one keypress speaks twice (`Jump` bypasses MIN_GAP), and
-            // the unspent credit would later mute a real click. A Jump with no
-            // credit (pure PTY output, a program moving the cursor) still cues.
+            // A printable key whose echo moves the cursor more than one cell
+            // (vim motions, keys in less/htop/fzf, a multi-cell IME commit)
+            // classifies as a Jump, so its key credit is spent here too, or one
+            // keypress would speak twice. A Jump with no credit still cues.
             if !self.take_keyed_click(now) {
                 self.cue_sound(crate::trail_sound::SoundKind::Jump, cc);
             }
@@ -195,19 +162,17 @@ impl CursorGlow {
     pub(super) fn move_spark_life(&self, mv: &MoveCtx, gap: f32) -> f32 {
         let &MoveCtx { cfg, typing, .. } = mv;
         // Typing gets a short tight wake (~100 ms) so the cursor reads as
-        // leading; a real jump gets the full comet duration, so a long jump trail
-        // does not smear typing. Heat stretches the typing wake (up to ~2.3×).
+        // leading, stretched by heat; a real jump gets the full comet duration.
         // During a rhythm (inter-key gap ≤ CHAIN_GAP_MAX) a spark's life also
         // chains to the observed cadence (gap + margin, capped), so the wake is
         // continuous; the first key of a burst (gap = ∞) takes no floor.
         let full_life = cfg.duration.as_secs_f32().max(0.001);
         if typing {
             match cfg.style {
-                // Phaser: a constant-distance streak. The band always spans the
-                // last two typed cells fully lit: life is
+                // Phaser: a constant-distance streak. Within a rhythm life is
                 // [`Self::PHASER_CHAIN_KEYS`]× the inter-key gap (+ fade margin),
-                // not heat-stretched. Only a burst's first key takes the base
-                // time; the window and cap are generous so slow rhythms chain.
+                // not heat-stretched, so the band spans the same letters at any
+                // cadence; a burst's first key takes the base time.
                 GlowStyle::Phaser => {
                     if gap <= Self::PHASER_CHAIN_GAP_MAX {
                         (Self::PHASER_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
@@ -397,11 +362,9 @@ impl CursorGlow {
             let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
             let (x1, y1) = geom.cell_center(cr, cc);
             // Multi-hop coalescing: shell repaints hop the cursor through parked
-            // intermediate positions within a frame or two. A fresh meteor whose
+            // intermediate positions within a frame or two, so a meteor whose
             // origin is a young live meteor's landing retargets that meteor in
-            // place (one choreography, one streak). Every live meteor is searched,
-            // newest first, since up to METEOR_CAP can overlap. The anchor must
-            // convert to window space exactly as the landing does.
+            // place (newest first; up to METEOR_CAP can overlap).
             let (o_x, o_y) = geom.cell_center(pr, pc);
             let retarget = self.fire_meteors.iter_mut().rev().find(|m| {
                 now.saturating_duration_since(m.born).as_secs_f32() <= Self::METEOR_RETARGET_S
@@ -419,7 +382,7 @@ impl CursorGlow {
                 // lagging choreography (a prompt reprint can lag ~100 ms) keeps
                 // chaining into one streak.
                 m.born = now;
-                m.arrived = false; // the strike now happens at the NEW landing
+                m.arrived = false; // the strike now happens at the new landing
             } else {
                 if self.fire_meteors.len() >= Self::METEOR_CAP {
                     self.fire_meteors.remove(0);
@@ -454,12 +417,10 @@ impl CursorGlow {
             };
             self.path_scratch.clear();
             if shape_wrap {
-                // Non-rainbow-kitty wrap run: the trail lives behind the cursor,
-                // so lay the typed cells the echo swept through the fold (the
-                // old row's last cells and glyphs already on the new row,
-                // excluding the live caret cell), not a diagonal across skimmed
-                // cells nor just the empty cursor cell. Bounded by the wrap shape
-                // guards: ≤4 tail + ≤3 head cells.
+                // Wrap run: lay the typed cells the echo swept through the fold
+                // (the old row's last cells and glyphs already on the new row,
+                // excluding the caret cell), not a diagonal across skimmed cells.
+                // The wrap shape bounds it to ≤4 tail + ≤3 head cells.
                 let pane_col1 = pane_col0.saturating_add(pane_cols);
                 for c in (pc as i32)..(pane_col1 as i32) {
                     self.path_scratch.push((pr as i32, c));
@@ -468,17 +429,14 @@ impl CursorGlow {
                     self.path_scratch.push((cr as i32, c));
                 }
             } else if re_anchor {
-                // TUI re-anchor (non-rainbow-kitty): the repaint relocated the
-                // caret, so only the landing gets a wake. (A fold carrying
-                // admitted typed intent takes the wrap-run arm above.)
+                // TUI re-anchor: the repaint relocated the caret, so only the
+                // landing gets a wake.
                 self.path_scratch.push((cr as i32, cc as i32));
             } else {
-                // A real jump, or a coalesced echo (2-3 glyphs in one observed
-                // move, collapsed to typing by `echo_run`), lays the trail behind
-                // the cursor. For a short echo `line_cells_tail` lays every swept
-                // cell gap-free, excluding the caret cell, each a typed head in
-                // successive hue via `typing_run`. The echo must classify as
-                // typing: jump sparks would interleave and gap the trail.
+                // A real jump, or a coalesced echo collapsed to typing by
+                // `echo_run`, lays the trail behind the cursor; for a short echo
+                // `line_cells_tail` lays every swept cell gap-free, excluding the
+                // caret cell.
                 line_cells_tail(
                     &mut self.path_scratch,
                     (pr as i32, pc as i32),
@@ -499,24 +457,15 @@ impl CursorGlow {
                 }
             }
             // Fire stays on one line: a row change (Enter, wrap, arrow down, a
-            // click) leaves no fire on the line you left. The swept path keeps
-            // only its landing-row segment, and every spark and ember on another
-            // row is snuffed (life clamped to a fast die-down, so the old line
-            // gutters out). The jump flare, landing ring and ember fountain still
-            // announce the leap.
-            //
-            // A backward same-row leap is treated the same way: at the bottom
-            // row an Enter scrolls instead of moving down and arrives as a jump
-            // back to column 0. Forward same-row leaps still sweep.
-            //
-            // The phaser shares this discipline: its trail is the last three
-            // letters, so navigation never drags or strands the bar.
+            // click) keeps only the path's landing-row segment and snuffs every
+            // spark and ember on another row. A backward same-row leap is
+            // treated the same way, since at the bottom row an Enter scrolls and
+            // arrives as a jump back to column 0. The phaser shares this
+            // discipline: its trail is the last three letters.
             let fire_back_leap = !typing && cc < pc && pr == cr;
-            // Exemptions for the phaser: a typing wrap (the band follows the
-            // typing through the fold; the pre-wrap tail fades on its own life)
-            // and a settled resize (the band shows where the cursor's home
-            // moved; it rides the same one-shot license as every style). Fire
-            // keeps its one-line rule even on a wrap.
+            // The phaser is exempt on a typing wrap (the band follows the
+            // typing through the fold) and on a settled resize; fire keeps its
+            // one-line rule even on a wrap.
             let phaser_wrap_follow = matches!(cfg.style, GlowStyle::Phaser) && typing;
             if matches!(cfg.style, GlowStyle::Fire | GlowStyle::Phaser)
                 && (dr_abs >= 1 || fire_back_leap)
@@ -533,9 +482,8 @@ impl CursorGlow {
                 self.snuff_off_line((cr, cc), fire_back_leap, now, geom);
             }
             if !self.path_scratch.is_empty() {
-                // A coalesced typing run treats every swept cell as a typed head.
-                // Ancillary hue advances one step per cell; classic positions are
-                // assigned together by the run reflow after spawning.
+                // A coalesced typing run treats every swept cell as a typed head,
+                // and the ancillary hue advances one step per cell.
                 let typing_run = echo_run || shape_wrap;
                 if typing_run {
                     hue_advances = self.path_scratch.len() as f32;
@@ -579,9 +527,8 @@ impl CursorGlow {
                         pos,
                         life: spark_life,
                         typing,
-                        // Ancillary birth hue. Phaser renders this field;
-                        // RainbowKitty retains it for compatibility clocks and
-                        // seeds but renders `classic_t` instead.
+                        // Ancillary birth hue: Phaser renders it; Rainbow
+                        // Kitty's ribbon does not read it.
                         hue: if typing_run {
                             (self.hue + hue_step * i as f32 + 0.5).fract()
                         } else {
@@ -657,11 +604,9 @@ impl CursorGlow {
             navigation,
             ..
         } = mv;
-        // Lightning (laser): a real jump is a strike (a jagged main channel with
-        // branch forks), and sustained hot typing crackles short arcs off the
-        // head. Geometry is forged once here (deterministic rng); only
-        // brightness animates. Navigation-blind like the ring/particle gates:
-        // Ctrl-A/E and Home/End earn no strike or crackle.
+        // Geometry is forged once here (deterministic rng); only brightness
+        // animates. Navigation-blind like the ring/particle gates: Ctrl-A/E and
+        // Home/End earn no strike or crackle.
         if matches!(cfg.style, GlowStyle::Laser) && !navigation {
             let chf = geom.ch as f32;
             if dist >= 2.0 {
@@ -686,25 +631,20 @@ impl CursorGlow {
                 let a = self.frand() * std::f32::consts::TAU;
                 let len = (1.6 + self.frand() * 2.8) * chf;
                 let (rr, rc) = {
-                    let live = |s: &&Spark| {
-                        s.typing && now.saturating_duration_since(s.born).as_secs_f32() < s.life
-                    };
-                    let trail = self
-                        .sparks
-                        .iter()
-                        .rev()
-                        .take(Self::CRACKLE_TRAIL_CELLS)
-                        .filter(live);
-                    let n = trail.clone().count();
+                    let mut cells = [(0u16, 0u16); Self::CRACKLE_TRAIL_CELLS];
+                    let mut n = 0usize;
+                    for s in self.sparks.iter().rev().take(Self::CRACKLE_TRAIL_CELLS) {
+                        if s.typing && now.saturating_duration_since(s.born).as_secs_f32() < s.life
+                        {
+                            cells[n] = (s.row, s.col);
+                            n += 1;
+                        }
+                    }
                     if n == 0 {
                         (cr, cc)
                     } else {
                         let i = ((pick * n as f32) as usize).min(n - 1);
-                        let s = trail
-                            .clone()
-                            .nth(i)
-                            .expect("index bounded by the trail count");
-                        (s.row, s.col)
+                        cells[i]
                     }
                 };
                 let (x0, y0) = geom.cell_center(rr, rc);
@@ -719,7 +659,7 @@ impl CursorGlow {
         }
     }
 
-    /// Landing ring on a real jump (fire meteors ping at ARRIVAL instead).
+    /// Landing ring on a real jump (fire meteors ring at arrival instead).
     pub(super) fn spawn_landing_ring(&mut self, mv: &MoveCtx, fire_meteor: bool) {
         let &MoveCtx {
             cr,
@@ -777,22 +717,22 @@ impl CursorGlow {
         if leaves_line && cfg.style.has_particles() && !matches!(cfg.style, GlowStyle::Fire) {
             self.snuff_sparks_off_line(cr, true, now, geom, 0.0);
         }
-        let leap_from = {
-            let (fx, fy) = geom.cell_center(pr, pc);
-            let (tx, ty) = geom.cell_center(cr, cc);
-            let k = if leaves_line {
-                (Self::LEAP_BIRTH_SKIP_CELLS / dist.max(1.0)).min(0.5)
-            } else {
-                0.0
-            };
-            (fx + (tx - fx) * k, fy + (ty - fy) * k)
-        };
         // Particles (sparkle / fire / water / laser): a burst scaled by jump
         // distance, or by heat when typing (a lone key sheds one ember or
         // droplet, a fast run a shower). Water has the widest range. Fire
         // meteor moves defer their debris to the strike
         // (`meteor_strike_fountain`), along the final coalesced path.
         if cfg.style.has_particles() && !fire_meteor && !navigation {
+            let (ox, oy) = geom.cell_center(cr, cc);
+            let leap_from = {
+                let (fx, fy) = geom.cell_center(pr, pc);
+                let k = if leaves_line {
+                    (Self::LEAP_BIRTH_SKIP_CELLS / dist.max(1.0)).min(0.5)
+                } else {
+                    0.0
+                };
+                (fx + (ox - fx) * k, fy + (oy - fy) * k)
+            };
             let water = matches!(cfg.style, GlowStyle::Water);
             let fire = matches!(cfg.style, GlowStyle::Fire);
             let laser = matches!(cfg.style, GlowStyle::Laser);
@@ -807,10 +747,10 @@ impl CursorGlow {
                     // swept path so the whole line catches.
                     ((12.0 + dist * 1.8) as usize).min(44)
                 } else if laser {
-                    // The beam LANDS like a cutting torch: a hard ablation shower.
+                    // The beam lands like a cutting torch: a hard ablation shower.
                     ((8.0 + dist * 1.3) as usize).min(30)
                 } else if beam {
-                    // A warp leap stirs a modest wake of STARDUST along the rod —
+                    // A warp leap stirs a modest wake of stardust along the rod:
                     // stars, not exhaust; the rod itself is the show.
                     ((4.0 + dist * 0.5) as usize).min(14)
                 } else if comet {
@@ -827,11 +767,11 @@ impl CursorGlow {
             } else if water {
                 1 + (self.heat * 6.0) as usize
             } else if fire {
-                // ONE smoldering mote at a slow peck; a roaring ember COLUMN at
-                // full key-repeat blaze — the fire visibly feeds on typing speed.
+                // One smoldering mote at a slow peck, a roaring ember column at
+                // full key-repeat blaze: the fire visibly feeds on typing speed.
                 1 + (blaze * 13.0) as usize
             } else if laser {
-                // A cold beam cuts CLEAN (no sparks for a lone keystroke); only a
+                // A cold beam cuts clean (no sparks for a lone keystroke); only a
                 // sustained fast run grinds a spark shower off the page.
                 (self.heat * 5.0) as usize
             } else if beam {
@@ -849,12 +789,26 @@ impl CursorGlow {
             } else {
                 1 + (self.heat * 3.0) as usize
             };
-            let (ox, oy) = geom.cell_center(cr, cc);
             let cell = geom.ch as f32;
             let hue0 = self.hue;
+            let laser_cov_scale = if burst > 0 {
+                (burst as f32).sqrt().recip()
+            } else {
+                1.0
+            };
+            let jl = if dist >= 2.0 { 0.5 } else { 1.0 };
+            let pop_p = 0.25 * blaze;
+            let smolder_p = 0.55 - 0.35 * blaze;
+            let heat = self.heat;
+            let bubble_p = if heat > 0.45 { 0.30 } else { 0.0 };
+            let drip_p = 0.75 - 0.55 * heat;
+            let comet_drift = {
+                let (mvx, mvy) = (ox - leap_from.0, oy - leap_from.1);
+                let ml = (mvx * mvx + mvy * mvy).sqrt();
+                (ml > 0.5).then(|| (-mvx / ml, -mvy / ml))
+            };
             for _ in 0..burst {
-                // Draw all randomness into locals FIRST (each `frand` borrows self),
-                // then build the particle — no borrow overlap with `self.particles`.
+                // All randomness is drawn first: `frand` borrows self.
                 let r0 = self.frand();
                 let r1 = self.frand();
                 let r2 = self.frand();
@@ -879,9 +833,6 @@ impl CursorGlow {
                         };
                         // Jump embers die in half the time, so the landing row is
                         // quiet again well under a second.
-                        let jl = if dist >= 2.0 { 0.5 } else { 1.0 };
-                        let pop_p = 0.25 * blaze;
-                        let smolder_p = 0.55 - 0.35 * blaze;
                         if r5 < pop_p {
                             Particle {
                                 x0: bx,
@@ -930,7 +881,6 @@ impl CursorGlow {
                         //            sustained speed.
                         // A jump is a splash instead: crown droplets arcing over
                         // plus a fast low skim across the surface.
-                        let heat = self.heat;
                         if dist >= 2.0 {
                             if r5 < 0.4 {
                                 // Low skim: fast, flat, short-lived.
@@ -960,8 +910,6 @@ impl CursorGlow {
                                 }
                             }
                         } else {
-                            let bubble_p = if heat > 0.45 { 0.30 } else { 0.0 };
-                            let drip_p = 0.75 - 0.55 * heat;
                             if r5 < bubble_p {
                                 // Bubble: born in the wake behind the head,
                                 // drifting up under buoyancy.
@@ -1024,15 +972,13 @@ impl CursorGlow {
                             // shower divides its punch: 1/√n keeps a lone spark at
                             // full brightness while a 30-spark landing stacks to
                             // the beam hue rather than white.
-                            cov_scale: (burst as f32).sqrt().recip(),
+                            cov_scale: laser_cov_scale,
                             born: now,
                         }
                     }
                     GlowStyle::Beam => {
-                        // Stardust is weightless: no gravity or arcs. Motes are
-                        // born in the rod's wake (along the leap on a jump,
-                        // slightly behind the head when typing) and drift
-                        // slowly; drawn as twinkling 4-point stars.
+                        // Stardust is weightless: motes are born in the rod's wake
+                        // and drift slowly, drawn as twinkling 4-point stars.
                         let (bx, by) = if dist >= 2.0 {
                             // Window-absolute like `ox`/`oy`, so motes follow the
                             // real leap; adds 0.0 at origin (0,0).
@@ -1068,22 +1014,18 @@ impl CursorGlow {
                         // origin (0,0)).
                         let (fx, fy) = leap_from;
                         let (bx, by) = if dist >= 2.0 {
-                            // r0 walks the leap vector; grains sit ON the tail.
+                            // r0 walks the leap vector; grains sit on the tail.
                             (fx + (ox - fx) * r0, fy + (oy - fy) * r0)
                         } else {
                             (ox + (r0 - 0.5) * geom.cw as f32, oy)
                         };
-                        // Drift BEHIND the motion: the shed dust falls back along
+                        // Drift behind the motion: the shed dust falls back along
                         // the tail. A stationary re-key (no vector) disperses on a
                         // random angle instead.
-                        let (mvx, mvy) = (ox - fx, oy - fy);
-                        let ml = (mvx * mvx + mvy * mvy).sqrt();
-                        let (tx, ty) = if ml > 0.5 {
-                            (-mvx / ml, -mvy / ml)
-                        } else {
+                        let (tx, ty) = comet_drift.unwrap_or_else(|| {
                             let a = r0 * std::f32::consts::TAU;
                             (a.cos(), a.sin())
-                        };
+                        });
                         let speed = (0.25 + r1 * 0.55) * cell;
                         Particle {
                             x0: bx,
@@ -1099,11 +1041,9 @@ impl CursorGlow {
                     }
                     GlowStyle::Sparkle => {
                         // The celestial pour: stars, moons and mini-comets spill
-                        // from the ribbon. Same spread-birth rule as the default
-                        // arm (r2 walks the leap or jitters the cell, r4 scatters
-                        // off the centre line), with a gentler toss and longer
-                        // life. `hue` doubles as the shape seed in
-                        // `emit_particles`.
+                        // from the ribbon, spread like the default arm with a
+                        // gentler toss and longer life. `hue` doubles as the shape
+                        // seed in `emit_particles`.
                         let a = r0 * std::f32::consts::TAU;
                         let speed = (0.35 + r1 * 1.3) * cell;
                         let (bx, by) = if dist >= 2.0 {
@@ -1332,9 +1272,7 @@ impl CursorGlow {
         {
             self.kill_hint = None;
         }
-        // The plain-Backspace poof hint self-disarms on the same freshness
-        // window as the kill hint (an unconsumed hint would keep the animation
-        // timer armed — see `has_live_motion`).
+        // The plain-Backspace poof hint self-disarms on the same window.
         if self
             .bs_poof_hint
             .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH)
@@ -1343,10 +1281,7 @@ impl CursorGlow {
             self.bs_baseline = None;
         }
         // A poof is licensed by a kill chord (`kill_hint`) or a plain Backspace
-        // (`bs_poof_hint`); both share the span/fallback machinery and the
-        // `POOF_MIN_GAP` rate gate. The cue belongs to the kill chord alone: a
-        // plain Backspace already spoke on its cursor retreat, so its poof is
-        // visual-only and one key never clicks twice.
+        // (`bs_poof_hint`) under one `POOF_MIN_GAP` rate gate.
         let kill_chord = self.kill_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
         });
@@ -1385,7 +1320,7 @@ impl CursorGlow {
         {
             let cur_fill = cur.fill as usize;
             let prev_fill = prev.fill as usize;
-            // Common PREFIX, capped at the survivor's fill: past it the new row
+            // Common prefix, capped at the survivor's fill: past it the new row
             // is blanks, and blanks matching old blanks prove nothing.
             let p = self
                 .row_prev
@@ -1409,9 +1344,7 @@ impl CursorGlow {
                 .count();
             // Stable survivors: everything on the row is accounted for by the
             // unmoved prefix plus the shifted suffix (repeated chars may double
-            // count). The test is vacuous for a blank new row, and a page scroll
-            // can slide in a row sharing an accidental prefix, so a non-trivial
-            // survivor is also required below.
+            // count).
             if cur_fill > 0 && p + s >= cur_fill {
                 // The vanished span: prefix end .. old fill minus the survivors
                 // that shifted in from the right. `s_span` re-caps the suffix so
@@ -1420,12 +1353,10 @@ impl CursorGlow {
                 let s_span = s.min(cur_fill - p.min(cur_fill));
                 let c0 = p.min(prev.caret as usize).min(cur_fill) as u16;
                 let c1 = (prev_fill - s_span).max(c0 as usize + 1) as u16;
-                // Non-trivial survivor: at least one non-blank cell must survive
-                // outside the span (inked prefix left of `c0`, or a shifted
-                // suffix). A real kill always leaves such a remnant; a page-scroll
-                // replacement or blank scroll-in does not, and stays dark. A
-                // refusal falls through: licences keep their freshness windows
-                // and the caret fallback below may answer.
+                // Non-trivial survivor: a non-blank cell must survive outside
+                // the span. A real kill always leaves one; a page-scroll
+                // replacement or blank scroll-in does not, and falls through to
+                // the caret fallback.
                 let survivor_holds_ink = s_span > 0
                     || self.row_cur[..(c0 as usize).min(self.row_cur.len())]
                         .iter()
@@ -1441,31 +1372,25 @@ impl CursorGlow {
                 }
             }
         }
-        // Caret-anchored fallback: every kill keypress earns one poof. The span
-        // branch covers a row that shrank in place (a shell's Ctrl-K/EL); a TUI
-        // that reflows on a kill defeats any row diff. The hint already proves a
-        // kill key was pressed, so answer at the caret with a modest fixed puff.
-        // Requires a probe this frame and respects the rate gate. The kill
-        // chord's `POOF_FALLBACK_GRACE` gives the span branch first chance.
+        // Caret-anchored fallback: every kill keypress earns one poof, since a
+        // TUI that reflows on a kill defeats any row diff. The hint proves a
+        // kill key was pressed, so answer at the caret with a modest fixed puff,
+        // after the kill chord's `POOF_FALLBACK_GRACE` gives the span branch
+        // first chance.
         let poof_hint_at = match (self.kill_hint, self.bs_poof_hint) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
         // A plain Backspace must prove it erased something before the fallback
-        // answers (the kill-chord fallback stays permissive). A Backspace at
-        // column 0 or on an empty row erases nothing.
-        //
-        // Two witnesses: `erasure_proven` is the live frame-to-frame diff,
-        // which does not exist after a pause; `bs_erased` compares against the
-        // row stamped at the key ([`Self::bs_baseline`]).
+        // answers (the kill-chord fallback stays permissive). `erasure_proven`
+        // is the live frame-to-frame diff, which does not exist after a pause.
         let erasure_proven = self
             .row_prev_meta
             .zip(self.row_cur_meta)
             .is_some_and(|(prev, cur)| prev.row == cur.row && cur.fill < prev.fill);
-        // The same question against the row at the key ([`Self::bs_baseline`]).
-        // With no baseline the host was not composing, so fall back to the
-        // weaker witness: the caret is off column 0, so the Backspace could
-        // have erased. A no-op Backspace at the left margin stays silent.
+        // `bs_erased` asks the same against the row stamped at the key
+        // ([`Self::bs_baseline`]). With no baseline the host was not composing,
+        // so the weaker witness stands: the caret is off column 0.
         let erase_on_glass = self.poof_erase_witnessed();
         let bs_erased = erase_on_glass
             || matches!(
@@ -1473,12 +1398,9 @@ impl CursorGlow {
                 (None, Some(cur)) if cur.caret > 0
             );
         // Skip the rest of the grace when the erase is already on glass: the
-        // span branch ran on this same probe and declined, so waiting only adds
-        // latency. It cannot steal the span branch's chance: a later match would
-        // need a further shrink, i.e. a second erase, which `POOF_MIN_GAP`
-        // governs. The timed grace remains the cap when there is no witness (a
-        // reflow that re-rowed the caret, an echo that never shows, no probe at
-        // the key).
+        // span branch ran on this same probe and declined, and a later match
+        // would need a second erase, which `POOF_MIN_GAP` governs. Without a
+        // witness the timed grace is the cap.
         if fresh_kill
             && gap_ok
             && !poofed
@@ -1516,16 +1438,11 @@ impl CursorGlow {
         }
     }
 
-    /// Emit one erase poof over the vanished span `[c0..c1)` of `row` (`n` =
-    /// net columns erased) in the style's own language (additive light or
-    /// source-over veils, never squares over glyphs):
-    /// - default (Lumen/Laser/Beam/Phaser): a little smoke poof, neutral grey
-    ///   [`VaporKind::Poof`] puffs with buoyant motion and a short life;
-    /// - fire: quench steam (the deletion-echo burst params), while
-    ///   [`Self::note_kill`]'s quench damps the flame;
-    /// - rainbow kitty and sparkle: star-power sparkles strewn across the span;
-    /// - water: droplets spraying up and falling out of the span;
-    /// - comet: ice glints.
+    /// Emit one erase poof over the vanished span `[c0..c1)` of `row` (`n` net
+    /// columns erased) in the style's own language, never squares over glyphs:
+    /// neutral smoke puffs (plus sparkles on rainbow kitty and sparkle, droplets
+    /// on water, ice glints on comet), or quench steam on fire while
+    /// [`Self::note_kill`]'s quench damps the flame.
     #[allow(
         clippy::too_many_arguments,
         reason = "span + clock + config + geometry + cue ownership; kept explicit at the three poof_scan branches"
@@ -1541,27 +1458,21 @@ impl CursorGlow {
         geom: Geom,
         voice: PoofVoice,
     ) {
-        // Sound: the poof's own noise, under the same `POOF_MIN_GAP` rate limit
-        // as the light. The voice depends on the licensing key:
-        //
-        // * a line kill (^U/^K) has no keystroke of its own, so the downward
-        //   [`SoundKind::Kill`] swoosh is its whole voice;
-        // * a word kill (^W, Alt-D, Alt/Ctrl-Backspace) gets
-        //   [`SoundKind::KillWord`], one size up from the erase poof;
-        // * a plain Backspace already spoke on its cursor retreat, so it gets
-        //   the quiet [`SoundKind::Poof`] air under that voice.
+        // The poof's own sound, under the light's `POOF_MIN_GAP` rate limit: a
+        // line kill (^U/^K) has no keystroke of its own, so the
+        // [`SoundKind::Kill`] swoosh is its whole voice; a word kill gets
+        // [`SoundKind::KillWord`]; a plain Backspace already spoke on its cursor
+        // retreat, so it gets the quiet [`SoundKind::Poof`] air.
         match voice {
             PoofVoice::Swoosh => self.cue_sound(crate::trail_sound::SoundKind::Kill, c0),
             PoofVoice::WordPoof => self.cue_sound(crate::trail_sound::SoundKind::KillWord, c0),
             PoofVoice::Puff => self.cue_sound(crate::trail_sound::SoundKind::Poof, c0),
         }
         // A kill reaches v2 from here, the erase detector, which holds both the
-        // proven span (`n`) and the licence's scale (`voice`), with the caret
-        // where the kill left it. A plain Backspace mints nothing (its `Erase`
-        // went out at the key). A caret-moving kill whose `Kill` went out with
-        // its retreat (`kill_reported_to_v2`) is not minted twice; otherwise it
-        // is minted here once, keyed on the kill hint's stamp. The hint is still
-        // armed here; callers clear it after.
+        // proven span (`n`) and the licence's scale (`voice`). A plain Backspace
+        // mints nothing (its `Erase` went out at the key), and a kill whose
+        // `Kill` went out with its retreat (`kill_reported_to_v2`) is not minted
+        // twice. The hint is still armed here; callers clear it after.
         if self.v2.engaged() {
             let scope = match voice {
                 PoofVoice::Swoosh => Some(rk::KillScope::Line),
@@ -1583,12 +1494,9 @@ impl CursorGlow {
         let oy = geom.origin_y as f32 + (row as f32 + 0.2) * cell;
         // Puff x-centers spread across the span (k+0.5 of `puffs` slots).
         let nf = n as f32;
-        // The particle-only styles (rainbow kitty, sparkle, water, comet) also
-        // shed a few neutral grey puffs on every theme: on light grounds via
-        // `push_halo_over`'s veil path, on dark via the renderer's dark
-        // `VaporKind::Poof` arm. A delete then reads as removal (grey, buoyant,
-        // dispersing) rather than the rising glitter that means creation
-        // (owner, 2026-08-29).
+        // The particle-only styles also shed neutral grey puffs on every theme,
+        // so a delete reads as removal rather than the rising glitter that
+        // means creation.
         if matches!(
             cfg.style,
             GlowStyle::RainbowKitty | GlowStyle::Sparkle | GlowStyle::Water | GlowStyle::Comet
@@ -1659,17 +1567,12 @@ impl CursorGlow {
         }
     }
 
-    /// The erase sparkle poof, shared by both entry points: the span detector
-    /// ([`Self::spawn_poof`], exact erased range) and the deletion echo in
-    /// [`Self::spawn`] (one vacated cell as the caret steps left). The rainbow
-    /// kitty / sparkle language for "text went away": glitter twinkles off the
-    /// vanished span plus one bright white-cored pop at its centre.
-    ///
-    /// Energy is [`erase_poof_drive`] (momentum × weight), setting star count,
-    /// launch speed and life. Erasing walks the caret left, so the debris
-    /// streams right, mirroring the typing plume.
-    ///
-    /// Bounded by [`ERASE_POOF_CAP`] and the shared `MAX_PARTICLES` ceiling.
+    /// The erase sparkle poof (v1 rainbow kitty / sparkle): glitter twinkles off
+    /// the vanished span plus one bright white-cored pop at its centre. Energy
+    /// is [`erase_poof_drive`] (momentum × weight), setting star count, launch
+    /// speed and life. Erasing walks the caret left, so the debris streams
+    /// right, mirroring the typing plume. Bounded by [`ERASE_POOF_CAP`] and the
+    /// shared `MAX_PARTICLES` ceiling.
     #[allow(
         clippy::too_many_arguments,
         reason = "span + geometry scalars + clock; the two internal call sites are the two erase detectors"
@@ -1696,13 +1599,16 @@ impl CursorGlow {
             1.0
         };
         let stars = ((ERASE_POOF_STARS * drive) as usize).clamp(4, ERASE_POOF_CAP);
-        // Speed rides the RUN, size rides the SPAN: a fast correction flicks,
+        // Speed rides the run, size rides the span: a fast correction flicks,
         // a killed line heaves.
         let speed = 0.55 + 0.85 * mom.clamp(0.0, 1.0);
         let heft = erase_weight(n) / ERASE_WEIGHT_CAP; // 0..1
         // Debris clusters at the collapse point ([`ERASE_POOF_SPREAD_CELLS`]):
         // `f²` biases toward the span's start and the width is capped.
         let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
+        let heft_y = 0.6 + 0.9 * heft;
+        let gy = 0.9 * cell;
+        let life_scale = 0.85 + 0.45 * heft;
         for k in 0..stars {
             if self.particles.len() >= Self::MAX_PARTICLES {
                 break;
@@ -1715,20 +1621,16 @@ impl CursorGlow {
             let f = (k as f32 + 0.5) / stars as f32;
             self.particles.push(Particle {
                 x0: span_x0 + spread_w * f * f + (r0 - 0.5) * cwf,
-                // A heavier erase has more VOLUME, not just more grains.
-                y0: oy + (r1 - 0.5) * cell * (0.6 + 0.9 * heft),
-                // RIGHTWARD — trailing the leftward-walking caret (see the doc).
+                // A heavier erase has more volume, not just more grains.
+                y0: oy + (r1 - 0.5) * cell * heft_y,
+                // Rightward, trailing the leftward-walking caret.
                 vx: (0.35 + r2 * 1.25) * cell * speed,
                 vy: -lift * (0.3 + r3 * 1.1) * cell * speed,
                 // Gravity is down whichever way the debris was thrown, so a
                 // downward poof does not accelerate back up off the viewport.
-                gy: 0.9 * cell,
-                life: (0.42 + r4 * 0.55) * (0.85 + 0.45 * heft),
+                gy,
+                life: (0.42 + r4 * 0.55) * life_scale,
                 hue: r0, // twinkle seed
-                // Round-spark sentinel ([`ERASE_ROUND_SCALE`], inside the glitter
-                // band `< 0.9`): a deletion keeps full brightness regardless of
-                // typing momentum (the glitter arm pins `mom = 1.0`), and the body
-                // draws round; the hero below is the poof's one plus.
                 cov_scale: ERASE_ROUND_SCALE,
                 born: now,
             });
@@ -1750,9 +1652,8 @@ impl CursorGlow {
                 // selects a band, and 0.02 lands on the family's red, which reads
                 // as a spark on both grounds.
                 hue: 0.02,
-                // The hero: in the reserved top of the glitter band,
-                // `emit_particles` reads 0.80..=0.89 as "draw big", scaled by the
-                // heft in the fraction, so the poof shows how much vanished.
+                // The hero's coverage grows with the heft, so the poof shows how
+                // much vanished.
                 cov_scale: ERASE_HERO_SCALE_MIN + ERASE_HERO_SCALE_SPAN * heft,
                 born: now,
             });
@@ -1781,8 +1682,7 @@ impl CursorGlow {
         // Weight, as for the sparkles: a killed line billows where a single
         // character wisps.
         let puffs = ((1.0 + f32::from(n).sqrt() * 1.4) as usize).clamp(1, 8);
-        // Clustered: the spread is capped and `f²` biases births toward the
-        // span's start, so the puffs overlap into a billow where the line
+        // Clustered, so the puffs overlap into a billow where the line
         // collapsed rather than thin wisps spread along it.
         let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
         for k in 0..puffs {

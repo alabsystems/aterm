@@ -108,6 +108,49 @@ fn a_json_post_puts_the_expected_bytes_on_the_wire_and_parses_the_reply() {
 }
 
 #[test]
+fn a_get_and_a_put_put_their_methods_on_the_wire() {
+    let (endpoint, rx) = stub(b"HTTP/1.1 200 OK\r\nETag: \"7\"\r\nContent-Length: 5\r\n\r\nvault");
+    let response = client()
+        .get(&format!("{endpoint}?after=6"))
+        .limit(64)
+        .send(&[])
+        .expect("GET succeeds");
+    let (head, sent) = rx.recv_timeout(HANG_DETECTOR).unwrap();
+    assert!(
+        head.starts_with("GET /api/chat?after=6 HTTP/1.1\r\n"),
+        "{head}"
+    );
+    assert!(head.contains("Connection: close\r\n"), "{head}");
+    // A GET anticipates no content, so it names no length.
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length"),
+        "{head}"
+    );
+    assert!(sent.is_empty());
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.header("etag"), Some("\"7\""));
+    assert_eq!(response.body(), b"vault");
+
+    let (endpoint, rx) = stub(b"HTTP/1.1 204 No Content\r\n\r\n");
+    let body = b"alab-vault/1\n";
+    let response = client()
+        .put(&endpoint)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .limit(64)
+        .send(body)
+        .expect("PUT succeeds");
+    let (head, sent) = rx.recv_timeout(HANG_DETECTOR).unwrap();
+    assert!(head.starts_with("PUT /api/chat HTTP/1.1\r\n"), "{head}");
+    assert!(
+        head.contains(&format!("Content-Length: {}\r\n", body.len())),
+        "{head}"
+    );
+    assert_eq!(sent, body);
+    assert_eq!(response.status(), 204);
+    assert!(response.body().is_empty());
+}
+
+#[test]
 fn a_chunk_size_at_the_top_of_usize_is_an_error_not_a_panic() {
     // The exact byte sequence that reproduced the defect: one real chunk, then
     // a chunk-size line of ffffffffffffffff (usize::MAX). The old `body.len() +
@@ -177,9 +220,9 @@ fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
 fn a_silent_server_hits_the_deadline_instead_of_hanging() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // Accept and then never reply: the connection is held for five minutes,
-    // so a client that waited for the server is told from one that hit its
-    // 250 ms deadline by a minute's hang detector.
+    // Accept and never reply for five minutes, so the minute's hang detector
+    // tells a client that waited for the server from one that hit its 250 ms
+    // deadline.
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
             std::thread::sleep(Duration::from_secs(300));
@@ -284,8 +327,7 @@ fn an_https_endpoint_puts_a_client_hello_on_the_wire_and_never_the_body() {
 }
 
 /// A peer that completes the TCP connect, claims a big TLS record, and then
-/// emits one byte at a time forever. It never speaks TLS; the point is only
-/// that bytes keep ARRIVING.
+/// sends one byte at a time; it never speaks TLS, it only keeps bytes arriving.
 fn dribbling_tls_peer(step: Duration, steps: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -310,14 +352,10 @@ fn dribbling_tls_peer(step: Duration, steps: usize) -> String {
 
 #[test]
 fn a_dribbling_tls_peer_cannot_outlive_the_global_deadline() {
-    // The deadline has to be enforced INSIDE the handshake, not just before it:
-    // `complete_io` loops on `read_tls`, so a per-syscall timeout applied once
-    // at the top bounds one read while every dribbled byte restarts the clock.
-    // This peer dribbles for ~5 minutes against a client budgeted 1s. Before
-    // the fix the client stayed on the socket until the stub gave up; the
-    // bound below — a minute's hang detector, never a latency budget — is what
-    // makes this test non-vacuous rather than the error alone. The peer stops
-    // at the first byte the closed client refuses, so a pass pays none of it.
+    // The deadline holds inside the handshake: `complete_io` loops on
+    // `read_tls`, so a timeout applied once at the top would let every dribbled
+    // byte restart the clock. The peer dribbles for ~5 minutes against a 1 s
+    // budget and stops at the first byte the closed client refuses.
     let endpoint = dribbling_tls_peer(Duration::from_millis(100), 3_000);
     let client = Client::new(
         Trust::PlatformVerifier,
@@ -349,11 +387,9 @@ impl aterm_http::proxy::EnvSource for HttpsProxyEnv {
 
 #[test]
 fn a_proxy_that_sends_an_interim_response_before_its_connect_answer_still_tunnels() {
-    // RFC 9110 §15.2: a client MUST parse 1xx responses before the final one,
-    // and the CONNECT exchange is no exception. Reading the `100` as the answer
-    // refused a tunnel the proxy went on to grant. The stub proxy reports the
-    // first byte the client sends AFTER the final 200: a TLS handshake record
-    // (0x16) means the tunnel was taken.
+    // RFC 9110 §15.2 applies to CONNECT too: a `100` before the `200` is not the
+    // answer. The stub reports the first byte sent after the 200; a TLS
+    // handshake record (0x16) means the tunnel was taken.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -391,7 +427,7 @@ fn a_proxy_that_sends_an_interim_response_before_its_connect_answer_still_tunnel
 #[test]
 fn userinfo_in_the_proxy_url_authenticates_the_connect() {
     // `user:password@` in HTTPS_PROXY becomes the CONNECT's
-    // `Proxy-Authorization: Basic`, never a silent direct connection.
+    // `Proxy-Authorization: Basic`.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -431,8 +467,7 @@ fn userinfo_in_the_proxy_url_authenticates_the_connect() {
 
 #[test]
 fn an_https_proxy_is_refused_before_any_byte_reaches_it() {
-    // An https:// proxy expects TLS from its first byte, so it is refused
-    // with an error naming the variable, and no connection is opened to it.
+    // An https:// proxy is refused, naming the variable, before any connect.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     // Nothing waits under the refusal; the short deadline only bounds a

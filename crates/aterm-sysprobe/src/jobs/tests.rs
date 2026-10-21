@@ -530,6 +530,7 @@ fn table(mounts: &[(&str, bool, bool)]) -> Table {
                 fstype: if *automounted { "autofs" } else { "apfs" }.to_owned(),
                 local: *local,
                 automounted: *automounted,
+                removable: false,
                 read_only: false,
                 container: None,
             })
@@ -729,4 +730,35 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
         (RunState::Zombie, std::process::id())
     );
     child.wait().expect("reaped");
+}
+
+// ---------------------------------------------------------------------------
+// Live CPU time (macOS): units, read from a stopped child.
+// ---------------------------------------------------------------------------
+
+/// The job probe's CPU times are nanoseconds: a spinning child, stopped so
+/// that every reading counts the same CPU at any load, reads its counters and
+/// the sum of its threads each within 2x of what `wait4` reports for it. The
+/// two come in different units: `proc_pid_rusage` counts the kernel's Mach
+/// ticks, and `PROC_PIDTHREADINFO` gives nanoseconds. Thread times scaled as
+/// ticks read 125/3 too large, natively and under Rosetta (measured
+/// 2026-10-20, `docs/measured/rosetta-mac-2026-10-20.md`).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() {
+    use crate::procs::stopped_spinner::{read, within_2x};
+    let cpu = |pid: u32| {
+        let f = JobsReader::new().read(ReadReq { pid, fds: false })?;
+        let threads = f.threads?.iter().map(|t| t.cpu_ns).sum::<Option<u64>>()?;
+        Some((f.counters?.cpu_ns, threads))
+    };
+    // Burn until the counters say 50 ms.
+    let (both, kernel) = read(|pid| cpu(pid).is_some_and(|(c, _)| c >= 50_000_000), cpu);
+    let (counters, threads) = both.expect("the probe reads its own child");
+    assert!(
+        within_2x(counters, kernel) && within_2x(threads, kernel),
+        "counters {counters} ns and threads {threads} ns; the reap's rusage for the same \
+         stopped child is {kernel} ns (timebase {:?})",
+        crate::procs::kernel_timebase()
+    );
 }

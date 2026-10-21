@@ -1,36 +1,42 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cryptographic digests for aterm: SHA-256 and HMAC-SHA256.
+//! Cryptographic digests for aterm: SHA-256, HMAC-SHA256, HKDF-SHA256 and a
+//! constant-time compare — every one of them astream-digest's, re-exported.
 //!
-//! A first-party replacement for the `sha2` and `hmac` crates, covering the
-//! surface aterm uses: [`Sha256::new`], [`Sha256::digest`], `update` and
-//! `finalize`, plus HMAC's `new_from_slice` / `update` / `finalize` /
-//! `verify_slice`. [`ct_eq`] replaces aterm's use of `subtle` (the package
-//! stays in the graph through `rustls`).
+//! Covers [`Sha256::new`], [`Sha256::digest`], `update` and `finalize`; HMAC's
+//! `new_from_slice` / `update` / `finalize` / `verify_slice`, and
+//! [`hmac_sha256_parts`] for a MAC over a list of parts; HKDF's
+//! [`hkdf_extract`] and [`hkdf_expand_32`]; and constant-time slice comparison
+//! ([`ct_eq`]).
 //!
 //! # Exported types
 //!
-//! - [`Sha256`] -- FIPS 180-4 SHA-256, streaming or one-shot: astream's
-//!   `astream_digest::Sha256`, re-exported (below)
+//! - [`Sha256`] -- FIPS 180-4 SHA-256, streaming or one-shot
 //! - [`HmacSha256`] -- RFC 2104 HMAC keyed with SHA-256
+//! - [`hmac_sha256_parts`] -- the same MAC over the concatenation of parts
+//! - [`hkdf_extract`], [`hkdf_expand_32`] -- RFC 5869 HKDF-SHA256, wiping the
+//!   key blocks they key with
 //! - [`ct_eq`] -- constant-time byte-slice comparison
 //! - [`InvalidLength`], [`MacError`] -- API-compatible error types
 //!
-//! ONE SHA-256. The hash is astream-digest's, the same type astream-cap hashes
-//! aterm-link's capability grants and producer ids with: zero dependencies,
-//! `forbid(unsafe)`, its streaming buffer's obligations discharged as a Clean
-//! island. It began as this crate's own `sha256.rs`, ported to astream with its
-//! tests; keeping both meant two 320-line transcriptions of FIPS 180-4 that
-//! nothing held to each other, so a fix or a proof had to land twice. This crate
-//! keeps what astream does not export: the HMAC construction and [`ct_eq`]
-//! (astream-cap's own HMAC is private to it).
+//! ONE HASH, ONE MAC. This crate began as aterm's own SHA-256 and HMAC; astream-digest
+//! was ported from it with its tests and became the hash under astream-cap's
+//! capability tags and producer ids, then the one HMAC under them, astream-aead's
+//! handshake and this crate alike (`digest.hmac-one-construction`). A copy here was a
+//! second transcription of FIPS 180-4 or RFC 2104 that nothing held to the first, so
+//! a fix or a proof had to land twice; the SHA-256 went first (729d4b049c), and the
+//! HMAC, its `ct_eq` and aterm-net's private HKDF followed. What is left of this crate
+//! is the name aterm's crates import and the two envelope headers below. The MAC's
+//! tests, its RFC 4231 vectors, its length sweeps and its `hmac-*`, `hkdf-*` and
+//! `ct-eq-*` spec rows live beside the one copy (`vendor/astream/crates/astream-digest`);
+//! the `sha256-*` rows and `opaque-debug`'s `Sha256` half stay in this crate's
+//! `SPECS.md`, describing astream's SHA-256, until astream-digest's `SPECS.md` takes
+//! them too.
 //!
 //! No SIMD, SHA-NI, assembly or `unsafe`: this hashes release manifests and
 //! capability tokens, not bulk traffic. atpkg's bulk content (archive digests and
 //! the extract fold) runs on ring's hardware SHA-256 (`atpkg::tree::BulkSha256`).
-//! Input is consumed in 64-byte blocks straight from the caller's slice with one
-//! partial-block buffer.
 //!
 //! # Example
 //!
@@ -59,34 +65,10 @@
 
 #![forbid(unsafe_code)]
 
-mod hmac_sha256;
-
-pub use astream_digest::Sha256;
-pub use hmac_sha256::{HmacSha256, InvalidLength, MacError};
-
-/// Compares two byte slices in constant time with respect to their contents.
-///
-/// Returns `true` when the slices have the same length and the same bytes.
-///
-/// An early-exit loop would leak the position of the first differing byte
-/// through timing, letting an attacker recover an HMAC tag byte by byte. Every
-/// byte pair is folded into one accumulator with `|=`, with no branch and no
-/// early exit. Length is not secret (it is visible in the wire format), so an
-/// unequal length may short-circuit. The final [`std::hint::black_box`] keeps
-/// the optimiser from reintroducing an early exit once `diff` is non-zero.
-#[must_use]
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    let mut i = 0usize;
-    while i < a.len() && i < b.len() {
-        diff |= a[i] ^ b[i];
-        i += 1;
-    }
-    std::hint::black_box(diff) == 0
-}
+pub use astream_digest::{
+    HmacSha256, InvalidLength, MacError, Sha256, ct_eq, hkdf_expand_32, hkdf_extract,
+    hmac_sha256_parts,
+};
 
 /// Wire size in bytes of an encoded digest envelope header (`"SH25"`).
 pub const DIGEST_ENVELOPE_WIRE_BYTES: usize = 16;
@@ -207,58 +189,12 @@ pub const fn decode_hmac_prefix_wire(bytes: &[u8]) -> Option<(u32, u64)> {
     Some((key_len, tag_prefix))
 }
 
-/// Lowercase hex, for test vectors only.
-#[cfg(test)]
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn ct_eq_accepts_identical_slices() {
-        assert!(ct_eq(b"", b""));
-        assert!(ct_eq(b"a", b"a"));
-        assert!(ct_eq(&[0u8; 32], &[0u8; 32]));
-        let tag = Sha256::digest(b"the quick brown fox");
-        assert!(ct_eq(&tag, &tag));
-    }
-
-    #[test]
-    fn ct_eq_rejects_same_length_differences() {
-        // First byte differs.
-        assert!(!ct_eq(b"abcdef", b"Xbcdef"));
-        // Last byte differs -- the case an early-return loop would answer
-        // slowest, and the one a timing attacker walks toward.
-        assert!(!ct_eq(b"abcdef", b"abcdeX"));
-        // A single bit differs.
-        let mut a = [0u8; 32];
-        let mut b = [0u8; 32];
-        b[31] = 0x01;
-        assert!(!ct_eq(&a, &b));
-        a[0] = 0x80;
-        b[31] = 0x00;
-        assert!(!ct_eq(&a, &b));
-    }
-
-    #[test]
-    fn ct_eq_rejects_length_mismatch() {
-        assert!(!ct_eq(b"", b"a"));
-        assert!(!ct_eq(b"a", b""));
-        // A prefix is not a match, in either direction.
-        assert!(!ct_eq(b"abc", b"abcd"));
-        assert!(!ct_eq(b"abcd", b"abc"));
-        // A truncated tag must never validate against a full one.
-        let tag = Sha256::digest(b"payload");
-        assert!(!ct_eq(&tag[..16], &tag));
-    }
-
+    /// The two headers round-trip, and a digest envelope whose tag is longer
+    /// than SHA-256's 32 bytes is refused (the negative control).
     #[test]
     fn digest_envelope_and_hmac_prefix_wire_roundtrip() {
         let ew = encode_digest_envelope_wire(1, 32, 0x0003, 65536);

@@ -1,72 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The crate's one reader of a presence row: `Last{/f/<F>/pub/*/*/presence}`
-//! parsed into rows. `aterm fabric status` reads through [`read`] and
-//! [`Row::parse`], `notify --on attention` through [`Row::parse`].
+//! The crate's one reader of presence rows: `Last{/f/<F>/pub/*/*/presence}` parsed into
+//! [`Row`]s, for `aterm fabric status` ([`read`]) and `notify --on attention` ([`Row::parse`]).
 //!
-//! ## A row IS the `Last` answer, not a summary of it
+//! A row is the `Last` answer, not a summary: every `key=value` body token is kept verbatim
+//! under its own name, unknown ones included, so two readers of one fleet cannot disagree. The
+//! [`RESERVED`] names come from the subject the broker handed back, and a body token of one is
+//! dropped, or a node could publish itself as somebody else's session. `attention=` and
+//! `fabric=` are always present (`-` when missing).
 //!
-//! Every `key=value` token of the body is carried verbatim under its own name,
-//! with the subject and offset it was read at; a token this build has never
-//! heard of survives, so two readers of one fleet cannot disagree.
-//! [`Row::fields`] is therefore a map, not a struct.
-//!
-//! Four exceptions, all cap-forced: the [`RESERVED`] names `subject`, `offset`,
-//! `node` and `owner` come from the subject the broker handed back, and a body
-//! token of one of them is dropped ([`fields_of`]) — otherwise a node could
-//! publish itself as somebody else's session on somebody else's host.
-//!
-//! `attention=` (why a session wants a human) and `fabric=` (whether its node is
-//! reachable) are always present; a missing one reads `-`, as `ls` renders it.
-//!
-//! ## Bounds
-//!
-//! * At most [`MAX_ROWS`] rows: a `Last` answer is one row per subject ever
-//!   hosted. A cut answer sets [`Glance::truncated`] rather than passing as
-//!   complete.
-//! * Every key and value is cut to [`FIELD_CAP`] bytes (the `…` mark inside
-//!   the cap) and a row keeps at most [`FIELDS_MAX`] tokens: a record is
-//!   16 MiB at the broker, and a hostile node's `detail=` must not reach every
-//!   reader. [`ATTENTION_CAP`] is the same number as aterm's own (§4.1).
-//! * Values stay pct-encoded as they crossed the bus; decoding here would put a
-//!   publisher-chosen newline or ESC into every rendered string. The reader
-//!   decodes at the moment it shows a value.
+//! Bounds: [`MAX_ROWS`] rows, with a cut answer marked [`Glance::truncated`]; [`FIELD_CAP`]
+//! bytes per key and value and [`FIELDS_MAX`] tokens per row, since a record may be 16 MiB at
+//! the broker. Values stay pct-encoded as they crossed the bus: decoding here would put a
+//! publisher-chosen newline or ESC into every rendered string, so a reader decodes when it
+//! shows a value.
 
 use std::collections::BTreeMap;
 use std::io;
 
 use crate::transport::Conn;
 
-/// The most rows one roster read may hold. See the module note on bounds.
+/// The most rows one roster read may hold: a `Last` answer is one row per subject ever hosted.
 pub const MAX_ROWS: usize = 4096;
 
-/// The byte cap on ANY one key or value a row carries, INCLUDING the `…`
-/// that marks a cut.
-///
-/// One number for every field, so no two components hold different implicit
-/// limits for one value. 256 bytes holds every token `bridge.rs`'s presence
-/// body writes (`attention=` at exactly this cap).
+/// The byte cap on any one key or value a row carries, including the `…` that marks a cut.
+/// 256 holds every token the bridge's presence rows carry (`attention=` sits at exactly this cap).
 pub const FIELD_CAP: usize = 256;
 
-/// The byte cap on `attention=`, matching aterm's own (§4.1) — and the same
-/// number as [`FIELD_CAP`], so a reader that budgets from either is right.
+/// The byte cap on `attention=`, matching aterm's own (§4.1) and [`FIELD_CAP`].
 pub const ATTENTION_CAP: usize = FIELD_CAP;
 
-/// The most `key=value` tokens one row's fields map keeps.
-///
-/// The publisher chooses the token count; `bridge.rs` writes nine. 64 bounds a
-/// row at [`FIELDS_MAX`] × 2 × [`FIELD_CAP`] bytes. Tokens past it are dropped
-/// but the row is kept: a node that pads its row must not erase itself from an
-/// operator's view.
+/// The most `key=value` tokens one row keeps, bounding a row at [`FIELDS_MAX`] × 2 ×
+/// [`FIELD_CAP`] bytes. Tokens past it are dropped but the row is kept: a node that pads its
+/// row must not erase itself from an operator's view.
 pub const FIELDS_MAX: usize = 64;
 
 /// The two tokens every row carries whether or not the publisher wrote them.
 const GUARANTEED: [&str; 2] = ["attention", "fabric"];
 
-/// The row keys [`Row::parse`] fills from the cap-forced SUBJECT; [`fields_of`]
-/// drops a body token of any of these names. See the module note on the four
-/// exceptions, and `tests::no_body_token_can_shadow_a_cap_forced_row_fact`.
+/// The row keys [`Row::parse`] fills from the cap-forced subject; [`fields_of`] drops a body
+/// token of any of these names.
 pub const RESERVED: [&str; 4] = ["subject", "offset", "node", "owner"];
 
 /// The value a missing token reads as — the same dash `ls` prints.
@@ -165,9 +139,8 @@ fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
         if RESERVED.contains(&key.as_str()) {
             continue;
         }
-        // The count is bounded too. [`GUARANTEED`] tokens pass the bound so
-        // padding cannot push them off, and a key already in the map is never
-        // refused (last occurrence wins).
+        // The count is bounded too; [`GUARANTEED`] tokens pass it so padding cannot push them
+        // off, and a key already in the map is never refused (last occurrence wins).
         if out.len() >= FIELDS_MAX && !GUARANTEED.contains(&key.as_str()) && !out.contains_key(&key)
         {
             continue;
@@ -181,11 +154,8 @@ fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
     out
 }
 
-/// Truncate `v` to at most `cap` BYTES, on a char boundary, marking a cut with a
-/// trailing `…`.
-///
-/// The `…` is inside the cap, so a caller sizing from the constant gets at most
-/// `cap` bytes; a `cap` too small for the mark cuts without one.
+/// Truncate `v` to at most `cap` bytes on a char boundary, counting the `…` that marks a cut;
+/// a `cap` too small for the mark cuts without one.
 fn truncate(v: &str, cap: usize) -> String {
     if v.len() <= cap {
         return v.to_string();
@@ -214,13 +184,9 @@ pub struct Glance {
     pub truncated: bool,
 }
 
-/// Read every presence row of `fleet` through one connection.
-///
-/// The walk is astream's [`astream_broker::Client::last_walk`], which pages on
-/// the `resume` cursor (§5.2: a short page, an empty one included, is not the
-/// end of the answer) and bounds how many pages it asks for.
-/// [`Glance::truncated`] is set only when a further row exists past
-/// [`MAX_ROWS`].
+/// Read every presence row of `fleet` through one connection, with astream's
+/// [`astream_broker::Client::last_walk`] (§5.2: a short page is not the end of the answer).
+/// [`Glance::truncated`] is set only when a further row exists past [`MAX_ROWS`].
 ///
 /// # Errors
 ///
@@ -298,9 +264,8 @@ mod tests {
         assert_eq!(bare.field("attention"), ABSENT);
     }
 
-    /// The subject shape is re-checked HERE, by position, whatever the broker's
-    /// filter promised. Note the eight-segment forgery: right-anchored, its tail
-    /// reads as a presence row of node `n-a`.
+    /// The subject shape is re-checked here, by position, whatever the broker's filter
+    /// promised. Right-anchored, the eight-segment forgery's tail would read as node `n-a`'s row.
     #[test]
     fn only_a_presence_subject_of_this_fleet_becomes_a_row() {
         for bad in [
@@ -344,7 +309,6 @@ mod tests {
         assert_eq!(r.field("state"), "live", "a short value is untouched");
         assert!(r.field("detail").ends_with('…'), "a cut is marked");
 
-        // And the number of them.
         let many: String = (0..5000).map(|i| format!("k{i}=v{i} ")).collect();
         let r = row("/f/f1/pub/n-a/node/presence", &many);
         assert!(
@@ -372,8 +336,7 @@ mod tests {
         for k in RESERVED {
             assert!(!r.fields.contains_key(k), "{k}= survived into the fields");
         }
-        // The tokens that are NOT reserved are untouched: this drops four names,
-        // not a publisher's row.
+        // Tokens that are not reserved are untouched.
         assert_eq!(r.field("state"), "live");
     }
 }

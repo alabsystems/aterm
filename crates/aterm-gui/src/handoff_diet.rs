@@ -1,64 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OUTGOING PROCESS'S ARTIFACT DIET (warm successor P5, 2026-09-29;
-//! `docs/DESIGN-warm-successor-2026-09-29.md` §5).
+//! The outgoing process's artifact diet (`docs/DESIGN-warm-successor-2026-09-29.md` §5):
+//! write before the park what does not change between the launch and the park.
 //!
-//! # What the freeze paid for
+//! On the launched lane the park-to-transfer interval is all artifacts, and most of it is one
+//! file, the attempt-bound layout sidecar (`seamless-<pid>-<nonce>.layout.toml`): the restore
+//! writer publishes it under a lock with a temporary sibling, syncs, renames and syncs the
+//! directory, and on macOS each sync is an `F_FULLFSYNC` (about 4 ms).
 //!
-//! On the launched lane the park->transfer interval is all artifacts (P0
-//! stamps: 12 ms of 12). Most of that is ONE file, the attempt-bound layout
-//! sidecar (`seamless-<pid>-<nonce>.layout.toml`). The restore writer
-//! publishes it under a lock with a temporary sibling, then syncs the file,
-//! renames it and syncs the directory. On macOS each sync is an
-//! `F_FULLFSYNC`, about 4 ms on the machine P5 was measured on.
+//! Static between the launch and the park:
 //!
-//! # What is static between the launch and the park, read from the code
+//! * The layout sidecar (`App::capture_handoff_layout`: frames, tabs, splits, each leaf's
+//!   folder and title, Settings drafts) moves only when the person changes the desk. It is
+//!   written before the park by [`speculate_layout`]; at the park [`seal_layout`] reads it
+//!   back with the successor's reader and keeps it only when it is byte-equal to the park's
+//!   bytes, else writes it again.
+//! * The two private pipes (the proof and Commit channels) hold no state, so the launched lane
+//!   makes them before the park too (`app_update_handoff`).
 //!
-//! * The LAYOUT SIDECAR. It is the window/tab/pane arrangement
-//!   (`App::capture_handoff_layout`): frames, tabs, splits, each leaf's
-//!   folder and title, Settings drafts. It moves when the person changes the
-//!   desk, and not otherwise. So it is written BEFORE the park, at the
-//!   attempt's own name, by [`speculate_layout`]. At the park,
-//!   [`seal_layout`] reads it back with the reader the successor uses and
-//!   compares it with the park's own bytes. It is kept only when it is
-//!   byte-equal to them; otherwise it is discarded and written again.
-//! * The two private PIPES (the proof and the Commit channels). They hold no
-//!   state at all, so the launched lane makes them before the park too
-//!   (`app_update_handoff`).
+//! Not static, and written after the park: the window facts (`WindowCarry`, a field of the
+//! manifest); the control carry's sidecars (exported from the park's own fence, unsynced);
+//! and the manifest, screen sidecars and adoption proof, the digested state, whose one writer
+//! is `seamless::write_outgoing_with_held`.
 //!
-//! # What is not static, and stays after the park
-//!
-//! * The WINDOW FACTS (`WindowCarry`) are a field of the manifest, not a file
-//!   of their own, and the manifest is post-park.
-//! * The CONTROL CARRY's sidecars are exported from the park's own fence (the
-//!   archive's counters and the differ's screen-sized state, taken under the
-//!   freeze). They move with every turn and every line of output, and they
-//!   are written without a sync.
-//! * The MANIFEST, the SCREEN sidecars and the ADOPTION PROOF are the
-//!   digested state. `seamless::write_outgoing_with_held` stays their one
-//!   writer.
-//!
-//! # The contract
-//!
-//! `NativeUpdateSpeculativeSidecar` (aterm-spec) is a writer/reader pair.
-//! The writer is this module, before the park and at it. The reader is the
-//! successor, which reads the sidecar at its name after its grant and hashes
-//! those bytes into the proof it must match. The successor never reads the
-//! file before its grant, and the grant waits for [`seal_layout`]. Every
-//! failure path retires the attempt's files by their prefix
-//! (`seamless::discard_outgoing`), and the speculative sidecar carries that
-//! prefix. The Tier-1 is [`conformance`].
+//! The contract, `NativeUpdateSpeculativeSidecar` (aterm-spec), is a writer/reader pair: this
+//! module writes, and the successor reads the sidecar after its grant and hashes those bytes
+//! into the proof it must match. The grant waits for [`seal_layout`]. Every failure path
+//! retires the attempt's files by their prefix (`seamless::discard_outgoing`), which the
+//! speculative sidecar carries. The Tier-1 is [`conformance`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// A layout sidecar written before the park.
 ///
-/// Only the launched lane, macOS's alone, builds one. Elsewhere on unix no code
-/// builds one, but [`seal_layout`] still takes it and reads its fields, so
-/// rustc does not count it as dead code. An `expect(dead_code)` here went
-/// unfulfilled on an aarch64-linux type-check.
+/// Only the launched lane (macOS) builds one. Elsewhere on unix [`seal_layout`] still takes
+/// and reads it, so rustc does not count it dead; an `expect(dead_code)` here goes unfulfilled
+/// on aarch64-linux.
 #[derive(Debug)]
 pub(crate) struct SpeculativeLayout {
     /// Where it was written: the attempt's layout sidecar.
@@ -69,15 +48,13 @@ pub(crate) struct SpeculativeLayout {
     took: Duration,
 }
 
-/// Write the attempt's layout sidecar BEFORE the park: `layout` (captured
-/// with every reader live), serialized, at `path` (the attempt's own
-/// `seamless-<pid>-<nonce>.layout.toml`), through the same writer the park
-/// would use (`restore::write_wire_once_to`: lock, sync, rename, directory
-/// sync).
+/// Write the attempt's layout sidecar before the park: `layout` (captured with every reader
+/// live), serialized, at `path` (the attempt's `seamless-<pid>-<nonce>.layout.toml`), through
+/// the writer the park would use (`restore::write_wire_once_to`: lock, sync, rename,
+/// directory sync).
 ///
-/// A layout that does not survive its own TOML round trip is not written:
-/// the park refuses such a layout anyway. A write that fails leaves nothing
-/// at `path` — the park then writes the sidecar itself.
+/// A layout that does not survive its own TOML round trip is not written (the park refuses it
+/// anyway). A failed write leaves nothing at `path`, and the park writes the sidecar itself.
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -118,9 +95,8 @@ pub(crate) enum Mismatch {
     /// The file no longer reads back as what was written (replaced,
     /// truncated, removed or unreadable).
     FileDisturbed,
-    /// The speculation was written under another name than this attempt's
-    /// sidecar (never, as the lane derives both from one nonce; checked
-    /// rather than assumed).
+    /// The speculation was written under another name than this attempt's sidecar (the lane
+    /// derives both from one nonce; checked rather than assumed).
     OtherName,
 }
 
@@ -167,20 +143,14 @@ impl std::fmt::Display for LayoutSeal {
     }
 }
 
-/// SEAL the attempt's layout sidecar at the park: after this returns `Ok`,
-/// `path` holds exactly `wire`, the park's own serialized layout, and nothing
-/// else.
+/// Seal the attempt's layout sidecar at the park: after `Ok`, `path` holds exactly `wire`,
+/// the park's own serialized layout.
 ///
-/// A `speculative` sidecar is KEPT only when the bytes it wrote are `wire`
-/// AND the file at `path` still reads back as `wire`. The read-back uses the
-/// successor's own reader, so what was found equal is what the successor
-/// will read. Otherwise the file is discarded and written again from `wire`,
-/// and the result says why. With no speculation, the sidecar is written here,
-/// as the park always did.
-///
-/// Correctness over speed: the read-back costs one small read, and it is
-/// what makes "kept" mean "the successor reads the park's bytes" rather than
-/// "this process remembers writing them" (`SealHoldsTheParksBytes`).
+/// A `speculative` sidecar is kept only when the bytes it wrote are `wire` and the file at
+/// `path` still reads back as `wire`, through the successor's own reader, so "kept" means the
+/// successor reads the park's bytes, not that this process remembers writing them
+/// (`SealHoldsTheParksBytes`). Otherwise the file is discarded and written again, and the
+/// result says why. With no speculation the sidecar is written here.
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -231,9 +201,8 @@ pub(crate) fn seal_layout(
             _ => Mismatch::FileDisturbed,
         }
     };
-    // DISCARD, THEN REWRITE. The discard is explicit rather than left to the
-    // rename below, so a rewrite that fails leaves no stale sidecar at the
-    // name either (and the failure path's sweep finds nothing to miss).
+    // Discard, then rewrite. The discard is explicit rather than left to the rename, so a
+    // rewrite that fails leaves no stale sidecar at the name either.
     for stale in [speculative.path.as_path(), path] {
         match std::fs::remove_file(stale) {
             Ok(()) => {}

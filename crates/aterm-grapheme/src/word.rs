@@ -2,48 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Where a word starts and ends: the one rule a double-click, the find field's
-//! word motions and the native editor's word motions share, so the three agree
-//! on every line.
+//! Word boundaries shared by double-click selection, find-field word motions,
+//! and native editor word motions.
 //!
-//! Which characters are word characters on their own is the caller's to say
-//! ([`is_word_char`] by default, or "not a separator" under a configured
-//! separator set). This module places the characters a reader does not see as
-//! letters of their own:
+//! The caller supplies the base word-character predicate ([`is_word_char`] by
+//! default, or non-separator under a configured separator set). Zero-width
+//! characters are placed as follows:
 //!
-//! - A mark (`Grapheme_Cluster_Break` Extend or SpacingMark, or any other
-//!   zero-width character that is no control) belongs to the word of the
-//!   character it hangs off, and to no word after a separator.
-//! - A prepended mark (`Grapheme_Cluster_Break=Prepend`: the Arabic number
-//!   sign, end of ayah) belongs to the word of the character after it.
-//! - A format control that spells a word belongs to it, only inside it and
-//!   only where it spells it. ZWNJ and ZWJ do so next to a virama, where they
-//!   pick a conjunct's form (Devanagari half forms, Marathi eyelash ra, Bengali
-//!   ya-phala, Sinhala `ශ්‍රී`); between two letters of a cursive-joining
-//!   script, where they decide whether the two join (the Persian half space in
-//!   `می‌خواهم`); and, for ZWJ, inside an emoji ZWJ sequence. A script's own
-//!   format controls do so between two of its letters: the Mongolian vowel
-//!   separator before a final a or e (`ᠬᠠᠷ᠎ᠠ`), the Egyptian hieroglyph format
-//!   controls that stack signs into a quadrat (in runs, as quadrats nest), and
-//!   the shorthand format controls that overlap and step Duployan letters. A
-//!   control at either end of a run, or between two letters it does nothing to
-//!   (`foo`, ZWJ, `bar`; `ab`, the Mongolian vowel separator, `cd`), is in no
-//!   word.
-//! - Every other zero-width control ends a word, under any classifier: the
-//!   Arabic letter mark, ZWSP, LRM and RLM, the bidi embeddings, overrides and
-//!   isolates, the word joiner and the invisible operators, BOM, the
-//!   interlinear annotation characters, the musical beam, tie, slur and phrase
-//!   controls, the language tag, and the C0 and C1 controls. Invisible
-//!   characters never weld two words together. A control the grid draws in a
-//!   cell of its own (the soft hyphen, the line and paragraph separators) is a
-//!   visible character, and the caller's classifier places it.
-//!
-//! The joiner contexts are IDNA's (RFC 5892 Appendix A.1 and A.2: a joiner
-//! after a virama, a ZWNJ between two letters that join), widened to the
-//! spellings that put a ZWJ before the virama (Bengali ya-phala, the Kannada
-//! and Telugu non-repha forms), to a half space after a right-joining letter
-//! (`دیو‌ها`: it changes no glyph, but Persian writes it), and to emoji ZWJ
-//! sequences (UTS #51).
+//! - Marks (`Grapheme_Cluster_Break` Extend/SpacingMark or other non-control
+//!   zero-width chars) attach to the preceding character's word, and to no word
+//!   after a separator.
+//! - Prepended marks (`Grapheme_Cluster_Break=Prepend`) attach to the following
+//!   word character.
+//! - Format controls that spell a word belong to it only in context: ZWNJ/ZWJ
+//!   next to a virama, between two cursive-joining letters, or (for ZWJ) between
+//!   `Extended_Pictographic` characters; and script-specific format controls
+//!   ([`SCRIPT_CONTROLS`]) between two letters of their script.
+//! - Every other zero-width control ends a word under any classifier; visible
+//!   controls (`char_width > 0`) are classified as base characters.
 
 use std::ops::Range;
 

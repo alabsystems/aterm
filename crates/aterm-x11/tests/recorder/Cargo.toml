@@ -16,6 +16,7 @@
 #   targo --unverified run --release --locked -- events   > ../recorded/x11rb-protocol-0.13.2-events.tsv.new
 #   targo --unverified run --release --locked -- icccm    > ../recorded/x11rb-0.13.2-icccm.tsv.new
 #   targo --unverified run --release --locked -- xrm      > ../recorded/x11rb-protocol-0.13.2-xrm.tsv.new
+#   targo --unverified run --release --locked -- xrm-include > ../recorded/x11rb-protocol-0.13.2-xrm-include.tsv.new
 # Each prints rows only; the committed TSVs add the `#` header that says what
 # the rows are. Diff the rows against the committed ones: a difference is
 # x11rb changing, never a reason to edit the corpus by hand. `--release`

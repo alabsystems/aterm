@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-core's integration suite: ONE test binary for the files listed below.
+//! aterm-core's integration suite: the files listed below as modules of one test binary.
+//! None of them sets the environment, installs a hook or an allocator, re-executes itself
+//! or keeps a process global, and each `ty` check gets a scratch directory of its own.
 //!
 //! Each file keeps its path (so citations of `aterm-core/tests/<file>.rs` still
 //! resolve) and becomes a module here, instead of linking and exec'ing its own

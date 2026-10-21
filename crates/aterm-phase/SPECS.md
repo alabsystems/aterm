@@ -3,62 +3,24 @@
 
 # aterm-phase: spec recovery from its 342 unit tests
 
-> Current 2026-10-19: the eight host-dependent vendor drift checks now run in the
-> explicit `vendor_drift` acceptance bench, not the ordinary unit suite:
-> `targo --unverified bench -p aterm-phase --bench vendor_drift`.
-> Its one sequential plan checks Claude anchors, transcript keys, reset templates
-> and wall phrases; Codex rollout keys; agy and Muse anchors; and Gemini bundle
-> anchors. Every row returns Pass, Fail or CouldNotRun through the shared acceptance
-> runner; any missing build (including Gemini) prevents a passing aggregate.
-> Existing version, managed-path, build-record, template, committed-rollout and
-> Gemini package fixtures remain ordinary tests. The counts and §4 migration
-> inventory below describe the historical recovery, not the current test total.
+> Status: migration worklist for `aterm-phase`. Each spec below is proved through Trust/Clean
+> about the compiled Rust function, and then the tests it subsumes are deleted.
+> - Host-dependent vendor drift checks run in the explicit `vendor_drift` acceptance bench
+>   (`targo --unverified bench -p aterm-phase --bench vendor_drift`), checking Claude anchors,
+>   transcript keys, reset templates and wall phrases; Codex rollout keys; agy and Muse anchors;
+>   and Gemini bundle anchors. Pure version, managed-path, build-record, template, committed-rollout
+>   and Gemini package fixtures remain ordinary unit tests.
+> - **Blocked on Trust seal `150efe4a` (gap 1):** `cursor-inside-text` (`Option<(u64, u64)>` outside
+>   the v1 scalar fragment) and `reads-limited-table` (`&self` on enum `wall::WallKind` and
+>   `<Option<u16> as PartialEq>::eq`) are refused at the E6 FACET gate.
+> - The Codex screen lane is retired (`src/codex_tests.rs` and the nine `codex-*` /
+>   `claude-reader-on-codex-screens` specs removed); the Codex reader identifies the program only.
+> - The limit-reset reader targets Claude Code 2.1.304's wording (`docs/SPEC-claude-accounts-resets-2026-10-02.md`
+>   R2; `reset-*` specs).
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 62 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-16: this is the crate's migration worklist. Nothing has been proved or deleted yet.
-> Each spec below is proved through Trust/Clean about the compiled Rust function, and then the tests
-> it subsumes are deleted. The 12 tests in §4 sample no spec and leave the unit suite now.
->
-> **Measured on Trust seal `150efe4a` (2026-10-16): `cursor-inside-text` and `reads-limited-table`
-> are still blocked by gap 1**, and the code is unchanged. Each fn was given an island-calling
-> `ensures` and run through `targo trust check -p aterm-phase`; E6 refused both at the FACET gate.
-> `cursor_inside_text`: "local `cursor` has type `Option<(u64, u64)>` … outside the v1 scalar
-> fragment", plus an `Unreachable` terminator from the exhaustive `matches!`. With a cited theorem,
-> no `trust_import_aterm_phase__cursor_inside_text` is minted (`AutoBoundHeadOverApplied`).
-> `WallKind::reads_limited`: "a read-only borrow is admitted for a STRUCT pointee; `wall::WallKind`
-> is not a struct: an enum field is variant-relative and is reached through a `Downcast` this lane
-> refuses", plus the call `<Option<u16> as PartialEq>::eq`. Even when admitted, a `&self` row is graded
-> `frozen-shared-erased`, not Certified. No test is deleted for either spec.
-
-Source: `crates/aterm-phase` (read only). The recovery chunk was sized at 332 tests. Reading every
-file finds 342 `#[test]` fns: src/phase.rs 67, src/prompt.rs 66, src/codex_tests.rs 43, src/wall.rs 39,
-src/question_tests.rs 27, src/turn.rs 22, src/reader.rs 16, src/anchors.rs 13, src/survey.rs 12,
-src/reset.rs 10, src/resume_tests.rs 10, src/panel.rs 6, src/wrap.rs 3, src/text.rs 2,
-tests/live_zone_sweep.rs 4, tests/busy_zone_sweep.rs 1 and tests/panic_sweep.rs 1. The `#[test]` in
-`tests/phase_suite.rs` is in a doc comment; that file only gathers the integration files into one
-binary. Nothing was compiled or run. The claims below come from reading the code.
+Source: `crates/aterm-phase` (`src/` and `tests/`).
 
 Result: **82 specs**, covering **278 tests**. **3 tests are not spec samples** (§4).
-
-Since then (2026-10-16) the Codex screen lane's retirement deleted `src/codex_tests.rs`, its fixtures
-and the nine Codex specs (`codex-*`, `claude-reader-on-codex-screens`): aterm reads no Codex screen,
-and the Codex reader names its program alone. The file counts above are the recovery's; the
-Result line, §2's header, §3 and §4 are recounted from §1 and §2.
-
-Since then (2026-10-19) the limit-reset reader was ported to Claude Code 2.1.304's wording alone
-(`docs/SPEC-claude-accounts-resets-2026-10-02.md` R2): the four `reset-*` specs state the kinds
-(`ResetKind`), the one reset on offer, the kind-held confirmation and the kind's spent line;
-`an_answer_line_is_spent_only_by_its_opening_words` became `a_spent_line_is_read_by_its_kinds_head`
-(a spend read by its kind's head, its count where it reads whole: R16),
-four tests were added (`every_kind_is_drawn_by_its_own_words`,
-`a_row_is_taken_only_as_the_one_reset_on_offer_and_never_a_fable_row`,
-`the_chooser_is_neither_the_dialog_nor_the_confirmation`,
-`a_row_opens_as_a_kind_only_where_the_kinds_head_is_a_word_of_its_own`), and the measured no-reset
-test (2.1.301's and 2.1.304's frames, and the 2.1.304 frame with reset rows put in), never listed, is
-now in §2.
 
 ## 0. Notation used in the statements
 
@@ -124,7 +86,7 @@ dead-frame-prefix-invariance	invariant	phase::worker_phase, phase::busy_signal, 
 live-zone-start	contract	reader::live_zone_start, reader::live_zone_reaches_above, reader::zone_walk, reader::BLANK_GAP	Let d = 1 + the last drawn index (0 if none). live_zone_start(rows,n) is where a walk from d upward stops, spending 1 per row and 1 in total for each maximal blank run of ≥ BLANK_GAP (4) rows, when the budget n is spent or row 0 is reached. Corollaries ∀ rows, n: (a) result ≤ d, and = 0 when nothing is drawn; (b) if len > n and the last row is drawn: result < len-n ⇔ some maximal blank run of length ≥ BLANK_GAP ends at an index ≥ len-n, else result = len-n; (c) appending blank rows leaves the result unchanged; (d) for |tail| = n: live_zone_reaches_above(tail,n) ⇔ tail's last row is drawn and tail holds BLANK_GAP consecutive blank rows; |tail| < n or a blank last row gives false; (e) a zone above the tail that the tail cannot see has a blank run cut by the tail's top row (rows[len-n] and rows[len-n-1] blank).	src/reader.rs::the_live_zone_counts_drawn_rows, src/reader.rs::a_long_blank_gap_does_not_cut_the_last_thing_said_out_of_the_zone, src/reader.rs::a_tail_that_holds_a_gap_says_the_zone_reaches_above_it, src/reader.rs::an_inline_repl_above_the_last_40_rows_is_read_in_the_live_zone, tests/live_zone_sweep.rs::the_plan_approval_is_read_whole_through_its_zone	1,3,5,7	&[String] rows, nested while loops with a budget counter
 read-trailing-blank-invariance	invariant	reader::read, reader::live_zone_start, reader::identify	∀ rows R, program p in {Some(claude), Some(codex), None}, cursor c in {None, Some(2)}, k ≥ 0: with T = R ++ [""; k] and tight = R cut after its last drawn row, live_zone_start(T,40) = live_zone_start(tight,40) and read(p, T[live_zone_start(T,40)..], c) = read(p, tight[live_zone_start(tight,40)..], c): the blank rows under what is drawn decide nothing, for every reader.	tests/live_zone_sweep.rs::blank_rows_under_the_drawing_decide_nothing	1,3,5,7,11	&[String] rows, trait objects (dyn ScreenReader), Reading struct equality
 reader-no-panic	no-panic	reader::read, reader::identify, reader::ScreenReader::read, prompt::parse_prompt, prompt::parse_prompt_v2, prompt::PromptV2::{readings,focused,with_role,header,base_title,origin,runs_on,unsandboxed,tool_card,rm_breaker}, question::QuestionDialog::{question,guard_row,focus,same_question}, prompt::prompt_box_span, prompt::prompt_box_first_row, phase::busy_zone_start, phase::transcript_end, phase::composer_draft, phase::composer_rules, phase::composer_index, phase::composer_bottom, phase::last_said_row, phase::limit_notice, turn::interrupted, turn::launch_card, turn::launch_card_place, turn::launch_card_version, turn::launch_card_scan, turn::launch_card_unmoved, turn::continuation_suggestion	∀ rows: &[String] (any contents, any length, any char widths - not only windows and width cuts of fixtures), ∀ program name, ∀ cursor column (200 included), ∀ banner/changed index (usize::MAX included): none of the listed functions panics - no slice index out of range, no reversed range such as rows[1..0], no slice off a char boundary, no arithmetic overflow, no unwrap/expect failure; busy_zone_start(rows) ≤ len; launch_card_version(rows', place) does not panic for a place read off other rows.	tests/panic_sweep.rs::the_reader_never_panics_on_any_window_of_any_fixture	1,3,7,11	all of the crate's slicing and index arithmetic, trait objects; Trust's own panic-freedom obligations are this spec
-reading-composition	contract	reader::ScreenReader::read, reader::ScreenReader::read_at, reader::ClaudeReader, reader::CodexReader, reader::GenericReader, reader::Program::reader	∀ reader R, rows, cursor c: R.read(rows,c) = Reading{program: R.program(), phase: p = R.phase(rows), phase_authoritative: R.phase_authoritative(rows,&p), prompt: (p = Prompt).then(R.prompt(rows)).flatten(), wall: if p = Prompt {None} else if p = Busy ∧ busy_signal(rows) is hard {R.health_wall(rows)} else {R.wall(rows)}, survey, context_left, suggestion: c.and_then(|c| R.suggestion(rows,c)), goal_active, said_tail, interrupted, fresh, composer}; R.read_at(rows,row,c) = R.read(rows,c) with phase_authoritative &= R.cursor_vouches(rows,&reading,row). Claude: phase_authoritative ⇔ phase ≠ Idle ∨ has_composer_frame ∨ has_shell_mode_frame ∨ wall(rows) ≠ None; cursor_vouches ⇔ phase ≠ Idle ∨ wall ≠ None ∨ row.is_some_and(|r| prompt_box_holds(rows,r)); health_wall = memory_wall; composer = has_composer_frame.then(composer_draft); caret ❯; busy_guard = guard_regex(anchor busy.interrupt). Generic: phase Idle, never authoritative, every other field its default (never Prompt or Question, no wall, no caret, busy guard or paste guard). Codex (identity only since its screen lane's retirement, 2026-10-16): phase Idle, never authoritative, every other field its default. Corollaries: a box carries no wall; a Limited reading carries its wall; the memory banner is the one wall kept under a hard busy.	src/reader.rs::a_default_idle_is_not_authoritative, src/reader.rs::the_generic_reader_is_never_a_question_or_a_prompt, src/reader.rs::each_reader_says_how_to_type_into_its_program, src/reader.rs::the_codex_reader_reads_nothing, src/reader.rs::a_reading_carries_the_wall_and_the_turn_end_facts, src/reader.rs::the_memory_banner_is_a_wall_even_under_a_busy_spinner, src/reader.rs::claude_codes_idle_is_read_at_its_composer, src/reader.rs::claude_codes_shell_mode_is_its_prompt_box, src/reader.rs::claude_codes_idle_is_the_prompt_box_that_holds_the_cursor, src/resume_tests.rs::a_wall_behind_background_work_is_one_reading	1,3,4,7,11	trait default methods, dyn dispatch, struct construction, Option combinators
+reading-composition	contract	reader::ScreenReader::read, reader::ScreenReader::read_at, reader::ClaudeReader, reader::CodexReader, reader::GenericReader, reader::Program::reader	∀ reader R, rows, cursor c: R.read(rows,c) = Reading{program: R.program(), phase: p = R.phase(rows), phase_authoritative: R.phase_authoritative(rows,&p), prompt: (p = Prompt).then(R.prompt(rows)).flatten(), wall: if p = Prompt {None} else if p = Busy ∧ busy_signal(rows) is hard {R.health_wall(rows)} else {R.wall(rows)}, survey, context_left: R.context_shown(rows) (default R.context(rows); Claude: context_left_shown), suggestion: c.and_then(|c| R.suggestion(rows,c)), goal_active, said_tail, interrupted, fresh, composer}; R.read_at(rows,row,c) = R.read(rows,c) with phase_authoritative &= R.cursor_vouches(rows,&reading,row). Claude: phase_authoritative ⇔ phase ≠ Idle ∨ has_composer_frame ∨ has_shell_mode_frame ∨ wall(rows) ≠ None; cursor_vouches ⇔ phase ≠ Idle ∨ wall ≠ None ∨ row.is_some_and(|r| prompt_box_holds(rows,r)); health_wall = memory_wall; composer = has_composer_frame.then(composer_draft); caret ❯; busy_guard = guard_regex(anchor busy.interrupt). Generic: phase Idle, never authoritative, every other field its default (never Prompt or Question, no wall, no caret, busy guard or paste guard). Codex (identity only since its screen lane's retirement, 2026-10-16): phase Idle, never authoritative, every other field its default. Corollaries: a box carries no wall; a Limited reading carries its wall; the memory banner is the one wall kept under a hard busy.	src/reader.rs::a_default_idle_is_not_authoritative, src/reader.rs::the_generic_reader_is_never_a_question_or_a_prompt, src/reader.rs::each_reader_says_how_to_type_into_its_program, src/reader.rs::the_codex_reader_reads_nothing, src/reader.rs::a_reading_carries_the_wall_and_the_turn_end_facts, src/reader.rs::a_reading_carries_the_context_the_screen_shows, src/reader.rs::the_memory_banner_is_a_wall_even_under_a_busy_spinner, src/reader.rs::claude_codes_idle_is_read_at_its_composer, src/reader.rs::claude_codes_shell_mode_is_its_prompt_box, src/reader.rs::claude_codes_idle_is_the_prompt_box_that_holds_the_cursor, src/resume_tests.rs::a_wall_behind_background_work_is_one_reading	1,3,4,7,11	trait default methods, dyn dispatch, struct construction, Option combinators
 prompt-box-holds	contract	phase::prompt_box_holds	∀ rows, row: prompt_box_holds(rows,row) ⇔ letting i be the greatest index in 1..=min(row+1, len-1) with rows[i] a caret row (starts ❯, or '!' followed by nothing, ' ' or U+00A0) ∧ is_rule(rows[i-1]), such an i exists, a rule exists at some index > i (b = the first), and row ≤ b. Corollaries: the rows held are exactly that box's top rule ..= bottom rule; a caret with no rule over it, or with no bottom rule yet, holds nothing; a whole box does not stretch down to a half-drawn one under it.	src/reader.rs::a_prompt_box_holds_its_rows_and_nothing_else	1,3,5,7	&[String] rows, reverse find over a range
 cursor-inside-text	contract	phase::cursor_inside_text	∀ cursor: Option<(usize,usize)>, caret: cursor_inside_text(cursor,caret) ⇔ cursor = Some((caret,col)) ∧ col ≠ 2 (the code's behaviour). The intended spec is col > 2 (§5.1); fix the code or the doc before proving.	src/phase.rs::the_cursor_only_proves_text_it_stands_inside	1	scalar match on an Option of a tuple; admissible for E6 import once Option carriers are
 identify-dispatch	contract	reader::identify, reader::program_of, reader::program_word, reader::may_host_agent, reader::Program::supervisable, reader::Program::harness_table	program_word(p) = lowercase(basename(first whitespace-separated word of p)) with leading '-' stripped. program_of(p) = Some(Claude) if program_word(p) ∈ {claude, claude-code}, Some(Codex) if = codex, else None. identify(program, rows) = program_of's reader when Some; GenericReader when program_word ∈ NOT_AGENTS (shells, pagers, editors, cat, tail, watch); otherwise ClaudeReader if has_composer_frame(rows) or parse_prompt_v2(rows) = Some(p) with p.kind ≠ Other ∨ p.footer ≠ None; else GenericReader (no screen names Codex). supervisable(p) ⇔ p ∈ {Claude, Agy, Muse, Gemini}; harness_table(p) ⇔ supervisable(p) ∨ p = Codex; may_host_agent(p) ⇔ program_word(p) ∈ {node, bun, deno}.	src/reader.rs::identify_takes_the_program_name_then_the_screen, src/reader.rs::every_programs_name_reads_back	1,3,5,11	string split/rsplit/to_lowercase, const tables, &'static dyn trait returns

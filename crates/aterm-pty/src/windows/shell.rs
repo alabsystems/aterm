@@ -126,12 +126,10 @@ fn search_path_with_ext(name: &str, ext: &str) -> Option<OsString> {
 /// [`resolve_shell_name`] acts on, published so a VALIDATOR can ask the real
 /// resolver instead of modelling it.
 ///
-/// Config validation used to re-implement this from POSIX habit (`execve` takes
-/// a path, so "a bare name cannot work") and consequently told Windows users
-/// that `pwsh` was broken and to write `/bin/zsh`. On Windows a bare name is the
-/// NORMAL spelling: it is resolved HERE, before `CreateProcessW` — which is
-/// handed the result as `lpApplicationName` and does no searching of its own.
-/// Exposing the verdict rather than the rule is what keeps the two in step.
+/// On Windows a bare name is the normal spelling: it is resolved here, before
+/// `CreateProcessW` — which is handed the result as `lpApplicationName` and
+/// does no searching of its own. Exposing the verdict rather than the rule
+/// keeps the validator and the spawn in step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellResolution {
     /// A bare name the spawn's own resolution FOUND (alias discovery or
@@ -240,15 +238,11 @@ fn discover_git_bash() -> Option<OsString> {
 /// WHICH arm of [`select_shell_with_origin`] chose the shell — published so
 /// `aterm doctor` / `show-config` can name the program a new tab will run AND
 /// say why this machine gets it, instead of reporting the CLI process's own
-/// `$SHELL`/`%COMSPEC%` (measured 2026-09-22: inside a pwsh 7 tab `doctor` said
-/// `cmd.exe`, from Git Bash it said `bash.exe` — neither the shell a tab
-/// spawns, which this resolver never reads from either variable).
+/// `$SHELL`/`%COMSPEC%` (which this resolver never reads).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellOrigin {
     /// The caller's `override_shell` (the window passes config `shell`, with
     /// `--shell` already collapsed over it), through [`resolve_shell_name`].
-    /// (`%ATERM_SHELL%` is retired — the launch knob is the `--shell` flag — so
-    /// no environment arm exists to name.)
     Override,
     /// `pwsh.exe` on PATH — the first platform default.
     Pwsh,
@@ -331,13 +325,9 @@ pub(crate) fn resolve_spawn_target(
     if let Some(ov) = argv_override {
         // `wsl.exe` is the one shell whose `shell_args` are OPTIONS OF THE
         // LAUNCHER rather than of the interactive shell: `-d <distro>`,
-        // `-u <user>`, `--system` choose WHICH Linux the tab is. The historical
-        // "an argv override REPLACES argv" rule would silently drop them the
-        // moment shell integration started supplying an override, quietly
-        // moving a `shell = "wsl"` + `shell_args = ["-d", "Debian"]` user from
-        // Debian to their default distro. Splice them in ahead of the override's
-        // own arguments (wsl.exe takes options before the command), keeping
-        // argv[0] — the display token — first.
+        // `-u <user>`, `--system` choose WHICH Linux the tab is. Splice them
+        // in ahead of the override's own arguments (wsl.exe takes options
+        // before the command), keeping argv[0] — the display token — first.
         //
         // Deliberately WSL-only. bash's override is `bash --rcfile <wrapper>`,
         // and splicing a `shell_args = ["-l"]` in front of it would make bash a
@@ -645,10 +635,8 @@ mod tests {
     #[test]
     fn wsl_shell_args_survive_the_integration_argv_override() {
         // `shell = "wsl"` + `shell_args = ["-d", "Debian"]` chooses WHICH distro
-        // the tab is. Once shell integration started supplying an argv override,
-        // the historical "override replaces argv" rule silently moved that user
-        // to their DEFAULT distro. The options must be spliced in ahead of the
-        // override's own arguments (wsl.exe takes options before the command).
+        // the tab is; the options must be spliced in ahead of the override's own
+        // arguments (wsl.exe takes options before the command).
         let args = vec!["-d".to_string(), "Debian".to_string()];
         let ov = vec![
             "wsl".to_string(),

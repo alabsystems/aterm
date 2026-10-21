@@ -1470,6 +1470,59 @@ fn a_routed_model_id_is_named_as_its_model() {
     assert_eq!(more.models, 1, "opus5.5, gathered");
 }
 
+/// The totals count every model, the ones past [`NAMED_MODELS`] included, and the facts
+/// are complete exactly where the refresh that folded them was (Stats Deck v2 T-A2).
+#[test]
+fn usage_totals_cover_every_model() {
+    let spends = [
+        ("claude-opus-5-5", spend(1_001, 70_003, 20_005, 9_000_007)),
+        ("claude-fable-5-1", spend(2_011, 50_013, 30_017, 4_000_019)),
+        ("claude-sonnet-5", spend(3_023, 9_029, 0, 700_031)),
+        ("claude-haiku-4-5-20251001", spend(4, 5, 6, 7)),
+        ("claude-nimbus-1", spend(11, 13, 17, 19)),
+    ];
+    let per: BTreeMap<String, ModelSpend> = spends
+        .iter()
+        .map(|(id, s)| ((*id).to_owned(), *s))
+        .collect();
+    let (models, more) = model_tokens(&per);
+    assert_eq!((models.len(), more.models), (NAMED_MODELS, 2));
+    let input: u64 = spends
+        .iter()
+        .map(|(_, s)| s.input + s.cache_write + s.cache_read)
+        .sum();
+    let output: u64 = spends.iter().map(|(_, s)| s.output).sum();
+    let whole = Refresh {
+        caught_up: true,
+        ..Refresh::default()
+    };
+    for (refresh, complete) in [
+        (whole, true),
+        (
+            Refresh {
+                caught_up: false,
+                ..whole
+            },
+            false,
+        ),
+        (Refresh { unread: 1, ..whole }, false),
+        (
+            Refresh {
+                walk_cut: true,
+                ..whole
+            },
+            false,
+        ),
+    ] {
+        let facts = UsageFacts::of((models.clone(), more), None, Some(&refresh)).expect("facts");
+        assert_eq!((facts.input_total(), facts.output_total()), (input, output));
+        assert_eq!(facts.complete, refresh.complete(), "{refresh:?}");
+        assert_eq!(facts.complete, complete, "{refresh:?}");
+    }
+    let unfolded = UsageFacts::of((models, more), None, None).expect("facts");
+    assert!(!unfolded.complete, "no refresh said the totals were whole");
+}
+
 /// The `Σ` text at each grain: the footer's total (runtime, then every model's tokens merged into
 /// one pair, the gathered ones included, no model named) and its runtime alone; `harness usage`'s
 /// per model (a model named only where two or more spent, the models past [`NAMED_MODELS`]

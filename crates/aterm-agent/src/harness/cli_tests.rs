@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the `aterm harness` command: the four read views, the retired
-//! hook-bridge tombstones, the refusal of the verbs deleted with the second
-//! harness stack, and the `accounts` verbs.
-//!
-//! Every path and clock is injected through [`Env`]; the one verb that opens
-//! a control connection (`limits`) is driven through a scripted [`Ctl`], and
-//! the one `accounts` verb that runs `claude` (`login`: its flow, then one
-//! `auth status` after a flow that exits 0) through a scripted
-//! [`AccountsHost`], its clock after a login flow included: no verb here
-//! runs a `claude`. The two runners behind that host are tested on their
-//! own, each over a `/bin/sh` stand-in written under a temp dir. Every
-//! account label is invented (`main`, `work-2`, `pool-a`) and every login
-//! directory is under a temp dir.
+//! Tests for `aterm harness`. Every path and clock is injected through [`Env`];
+//! `limits` runs over a scripted [`Ctl`] and `accounts login` over a scripted
+//! [`AccountsHost`], so no test here runs `claude`. The two runners behind that
+//! host are tested on their own over `/bin/sh` stand-ins. Every account label is
+//! invented and every login directory is under a temp dir.
 
 use aterm_phase::Program;
 use aterm_phase::prompt::fixtures::{composer, rows};
@@ -55,6 +47,7 @@ fn env_at(tmp: &Tmp) -> Env {
         claude_tmp: Some(tmp.path().join("claude-tmp")),
         // The test's universe: no process names another Claude Code directory.
         claude_running: Some(Ok(disk::discover::Running::default())),
+        tz_s: 0,
     }
 }
 
@@ -209,9 +202,8 @@ fn the_grammar_parses_what_the_help_text_advertises() {
             }),
         ),
         ("accounts use --auto", Cmd::Accounts(AccountsCmd::Auto)),
-        // `help` is this command's help word wherever it stands, so it is
-        // never taken as a label: `add help` adds nothing.
-        // The page it prints is the verb's own.
+        // `help` is the help word wherever it stands, never a label: `add help` adds
+        // nothing and prints the verb's own page.
         ("accounts add help", Cmd::Help(HelpPage::Accounts)),
         ("accounts --help", Cmd::Help(HelpPage::Accounts)),
         ("upgrade models", Cmd::UpgradeModels { set: None }),
@@ -378,8 +370,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "accounts use",
         // One of a label and --auto.
         "accounts use work-2 --auto",
-        // --shared is `accounts add`'s and --auto is `accounts use`'s, as the
-        // owner's flags are `upgrade`'s.
+        // --shared belongs to `accounts add`, --auto to `accounts use`.
         "accounts --shared",
         "accounts login work-2 --shared",
         "accounts --auto",
@@ -391,8 +382,8 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "accounts login work-2 --json",
         "accounts use work-2 --json",
         "ledger account",
-        // --dry-run and --sock are not `accounts`': a flag the verb does
-        // not take is refused, never swallowed by a verb that then writes.
+        // A flag or operand the verb does not take is refused, never swallowed by a verb that
+        // then writes: no `accounts` form takes --dry-run or --sock.
         "accounts --dry-run",
         "accounts --json --dry-run",
         "accounts stats --dry-run",
@@ -630,7 +621,7 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
     assert!(ok);
     assert!(out.contains("source=none"), "{out}");
 
-    // A build that names only the PROCESS (`CLAUDE_PID`).
+    // A build that names only the process (`CLAUDE_PID`).
     env.claude_session = None;
     let claude = env.claude_dir().expect("a claude dir");
     std::fs::create_dir_all(claude.join("sessions")).expect("sessions dir");
@@ -702,21 +693,11 @@ impl ClaudeProcess for FakeClaude {
     }
 }
 
-/// `usage` names its account by the roster's label for the login the Claude
-/// Code it runs under was started with, where two or more are listed: the
-/// HUD's `acct <label>` and the JSON's `label`, `active` true and no `dir`.
-/// The login is read from the process `CLAUDE_PID` names and from nothing
-/// else — [`run_usage`] has no other source for it — once, and only when a
-/// roster of two or more and a named session ask for it.
-///
-/// NEGATIVE CONTROLS, each `acct account`: what the process's environment
-/// says (not read, empty, a login no row names, a home of its own, a
-/// credential, a route); what the roster says (refused, missing, empty, one
-/// row: the process is not read at all); the newest-transcript pick, which
-/// may be another session's (not read either); and a pid that is not proven
-/// to be the Claude Code of the session folded — no registry row, a row that
-/// names another session, a row for a process born at another second (the
-/// pid was reused), a row or a kernel with no start to compare.
+/// `usage` names its account by the roster's label for the login its Claude Code was started
+/// with (`CLAUDE_PID`'s exec environment, read once, only for a roster of two or more and a
+/// named session). Negative controls, each `acct account`: an environment that names no row's
+/// login; a roster refused, missing, empty or of one row; the newest-transcript pick; and a pid
+/// not proven to be the folded session's Claude Code.
 #[test]
 fn usage_names_the_account_its_claude_code_runs_under() {
     let tmp = tmp_dir("usage-account");
@@ -788,7 +769,7 @@ fn usage_names_the_account_its_claude_code_runs_under() {
     let on_work = FakeClaude::with(&[home, (accounts::LOGIN_ENV, work)]);
     assert_eq!(shown(&env, &on_work), "work-2");
 
-    // NEGATIVE CONTROLS: what the process's environment says.
+    // Negative controls: what the process's environment says.
     let slashed = format!("{work}/");
     let not_named: [FakeClaude; 6] = [
         FakeClaude {
@@ -805,8 +786,8 @@ fn usage_names_the_account_its_claude_code_runs_under() {
         assert_eq!(shown(&env, process), "account", "{:?}", process.env);
     }
 
-    // NEGATIVE CONTROLS: the pid is not proven to be this session's Claude
-    // Code. The environment says `main` in each.
+    // Negative controls: the pid is not proven to be this session's Claude Code. The
+    // environment says `main` in each.
     let other = row("another-1", Some(FakeClaude::STARTED));
     let reused = row("mine-1", Some(FakeClaude::STARTED - 60));
     let unstamped = row("mine-1", None);
@@ -833,7 +814,7 @@ fn usage_names_the_account_its_claude_code_runs_under() {
     assert_eq!(shown(&env, &no_start), "account", "no kernel start");
     assert_eq!(shown(&env, &main), "main", "the row is back");
 
-    // NEGATIVE CONTROLS: what the roster says. The process is not read.
+    // Negative controls: what the roster says. The process is not read.
     let refused = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
                    [[account]]\nlabel = \"main\"\nclass = \"shared\"\ndir = \"/logins/x\"\n";
     let unread = FakeClaude::with(&[home]);
@@ -850,8 +831,8 @@ fn usage_names_the_account_its_claude_code_runs_under() {
         assert_eq!(shown(&env, &unread), "account", "{what}");
     }
 
-    // NEGATIVE CONTROLS: no pid named; and the newest transcript, which may
-    // be another session's, is not named by this process's login.
+    // Negative controls: no pid named; and the newest-transcript pick, which may be another
+    // session's.
     std::fs::write(&roster, &two).expect("write");
     assert_eq!(shown(&env, &main), "main", "the roster is back");
     env.claude_pid = None;
@@ -1257,13 +1238,11 @@ fn the_memory_banner_is_its_own_wall_and_no_limit() {
     );
 }
 
-/// `limits` asks the named session's `status` (which program draws it), makes
-/// ONE screen read and prints its wall — the engine's own reading (a screen
-/// that names no program read by what it shows, here Claude Code's frame),
-/// its reset placed by the supervisor's clock, nothing re-parsed — at
-/// `source=grid`. NEGATIVE CONTROLS: an idle screen is `wall=none` with no
-/// window, and a read that fails is exit 1 naming the session — never
-/// `wall=none`, which would read as "measured, nothing wrong".
+/// `limits` asks the named session's `status` which program is in front, makes one screen read,
+/// and prints the engine's own wall reading by that program's grammar at `source=grid` (a reply
+/// that names none, as here, leaves it to the screen), its reset placed by the supervisor's
+/// clock. Negative controls: an idle screen is `wall=none`, and a failed read is exit 1 naming
+/// the session, never `wall=none`.
 #[test]
 fn limits_reads_the_sessions_screen_once_and_names_its_wall() {
     let tmp = tmp_dir("limits");
@@ -1408,7 +1387,7 @@ fn limits_reads_each_tab_by_its_own_programs_grammar() {
     let codex = read(Some("codex"), wall);
     assert!(codex.starts_with("wall=none "), "{codex}");
 
-    // Negative control: a Claude Code tab, by its own reader as ever.
+    // Negative control: a Claude Code tab, by its own reader.
     let claude = read(Some("claude"), limited_screen());
     assert!(
         claude.starts_with("wall=usage-session resets_at=2025-09-21T03:00:00Z "),
@@ -1578,7 +1557,7 @@ fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
         "{} bytes",
         after.len()
     );
-    // The NEWEST rows survive, in order, and this run's row is last.
+    // The newest rows survive, in order, and this run's row is last.
     let first_kept = rows - DISK_LEDGER_KEEP_ROWS;
     assert!(
         after
@@ -1604,8 +1583,7 @@ fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
     assert!(!after.lines().last().unwrap().contains("\"seq\""));
     assert!(!path.with_file_name("disk.jsonl.tmp").exists());
 
-    // Negative control: under the bound nothing is cut, and the pure cut says
-    // so.
+    // Negative control: under the bound nothing is cut.
     let before = std::fs::read(&path).unwrap();
     assert!(!bound_ledger(&path, DISK_LEDGER_MAX_BYTES, DISK_LEDGER_KEEP_ROWS).unwrap());
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -2049,7 +2027,7 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
     };
     assert!(done.removed.is_empty(), "{done:?}");
     assert!(target.join("debug/incremental").exists());
-    // CONTROL: measured on its own volume, the same idle cache goes.
+    // Control: measured on its own volume, the same idle cache goes.
     let DiskTick::Reclaimed(done, _) = disk_tick(
         &look(tmp.path()),
         disk::Config::default(),
@@ -2311,8 +2289,7 @@ fn the_disk_knobs_are_read_from_aterm_toml() {
         0,
         "the floor switched off"
     );
-    // A floor below zero is never crossed: `-1` written to stop the removal
-    // stops it (it read as the default, 10, and left the removal on).
+    // A negative floor stops the removal, as `0` does.
     let (cfg, notes) = read("[disk]\nauto_free_gib = -3\n");
     assert_eq!(
         cfg.auto_free_gib, 0,
@@ -2403,17 +2380,12 @@ fn every_spelling_the_window_parser_reads_reads_the_same_knobs() {
     }
 }
 
-/// A removal knob that cannot be read turns every removal off — `apply`, the
-/// automatic floor and the whole-directory reclaim — whatever the rest of the
-/// file grants, and the reading names it: a file the parser refuses (a typo
-/// elsewhere, a key said twice, a key with no value), a `disk` that is not a
-/// table, a removal knob of another type, and one TOML files under another
-/// table. The line reader read `[theme] disk.target_stale_days = 0` as the
-/// knob; the parser files it as `theme.disk.target_stale_days`, and a
-/// misplaced off switch must not become the default by being ignored. A
-/// misplaced warning threshold removes nothing, so it only says so. The floor
-/// the file sets is unknown where the file or `auto_free_gib` itself cannot be
-/// read, and read as written where another knob cannot.
+/// A removal knob that cannot be read turns every removal off (`apply`, the automatic floor, the
+/// whole-directory reclaim) whatever the rest of the file grants, and the reading names it: a
+/// file the parser refuses, a `disk` that is not a table, a removal knob of another type, and
+/// one TOML files under another table. A misplaced warning threshold removes nothing, so it only
+/// says so. The floor is unknown where the file or `auto_free_gib` itself cannot be read, and
+/// read as written where another knob cannot.
 #[test]
 fn a_disk_knob_that_cannot_be_read_turns_every_removal_off() {
     const GRANT: &str = "[disk]\napply = true\nauto_free_gib = 20\ndead_build_dirs = true\ntarget_stale_days = 30\n";
@@ -2561,14 +2533,10 @@ fn a_disk_knob_that_cannot_be_read_turns_every_removal_off() {
     );
 }
 
-/// The window's disk watch ends a `disk.low` line only on a volume at or
-/// above the floor the file sets ([`DiskReading::at_or_above_floor`]). Where
-/// the reading turned the removal off because the file could not be read, the
-/// effective floor is `0`, which no figure is below; the floor the owner wrote
-/// is unknown, so no figure is at or above it, and a short volume is never
-/// said to have space back. Where the floor was read, the answer is the one
-/// [`disk::Config::below_auto_floor`] gives for it, whatever else turned the
-/// removal off.
+/// The window's disk watch ends a `disk.low` line only at or above the floor the file sets
+/// ([`DiskReading::at_or_above_floor`]). Where that floor is unknown no figure is at or above
+/// it, so a short volume is never said to have space back; where it was read, the answer is
+/// [`disk::Config::below_auto_floor`]'s for it, whatever else turned the removal off.
 #[test]
 fn a_floor_the_file_does_not_say_never_reads_as_space_back() {
     const GIB: u64 = 1 << 30;
@@ -2756,14 +2724,12 @@ fn a_hand_run_upgrade_stands_down_while_the_master_switch_is_off() {
     assert!(lock.exists(), "a sweep that ran takes the lock");
 }
 
-/// A hand-run `upgrade` leaves out the sessions of an agent whose OWN switch
-/// is off (`[harness.claude] enabled = false`), says so on stderr, and still
-/// answers: a Claude Code restart an earlier sweep left part way — its agent
-/// gone, its time up, so a dry run says `would-fail:` — is not this pass's,
-/// and stderr names it as stopped until the switch is back on (no lane this
-/// pass runs carries it). NEGATIVE CONTROLS: with Codex's switch off
-/// instead, or none, the same restart is the pass's and named stopped by
-/// nothing; with the master switch off as well the pass is refused as ever.
+/// A hand-run `upgrade` leaves out the sessions of an agent whose own switch is off
+/// (`[harness.claude] enabled = false`), says so on stderr, and still runs: a Claude Code restart
+/// an earlier sweep left part way (its agent gone and its time up, so a dry run says
+/// `would-fail:`) is not this pass's, and stderr names it as stopped until the switch is back on.
+/// Negative controls: with Codex's switch off instead, or none, the same restart is the pass's
+/// and nothing names it stopped; with the master switch off as well the pass is refused.
 #[cfg(unix)]
 #[test]
 fn a_hand_run_upgrade_leaves_out_an_agent_whose_switch_is_off() {
@@ -3113,12 +3079,10 @@ fn the_worst_give_up_row_fits_its_cut_whole() {
     }
 }
 
-/// `upgrade --status` prints what the sweep recorded (how long behind, what it
-/// waits on, the owner's word, whether stalled) for each upgrade a live Claude
-/// Code still holds behind its target, taking no lock. The owner's word lands
-/// under the lock and shows in the next `--status` and in `ledger upgrade`.
-/// Negative controls: a recorded upgrade with no live holder is not listed; a
-/// tab with nothing recorded is refused (exit 1), writing nothing.
+/// `upgrade --status` prints what the sweep recorded for each upgrade a live Claude Code still
+/// holds behind its target, taking no lock; the owner's word lands under the lock and shows in
+/// the next `--status` and in `ledger upgrade`. Negative controls: a record with no live holder
+/// is not listed; a tab with nothing recorded is refused (exit 1), writing nothing.
 #[cfg(unix)]
 #[test]
 fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
@@ -3201,12 +3165,10 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
     let _ = agent.wait();
 }
 
-/// A record no look has read shows `stalled=unwatched` and `told=unwatched` in
-/// `--status` once the Mac has been awake past the wake grace. With `[harness]
-/// enabled` or `upgrade` off no window watches anything, and stderr names the
-/// switch as the reason. Negative controls: both switches on, nothing else is
-/// said; within the wake grace the record shows its last look; with no
-/// `unwatched` row no switch is named.
+/// A record no look has read shows `stalled=unwatched` and `told=unwatched` once the Mac has
+/// been awake past the wake grace; with `[harness] enabled` or `upgrade` off stderr names the
+/// switch as the reason. Negative controls: both switches on, nothing is said; within the wake
+/// grace the record's last look stands.
 #[cfg(unix)]
 #[test]
 fn an_unwatched_upgrade_says_so_and_a_switch_off_says_why() {
@@ -3264,8 +3226,7 @@ fn an_unwatched_upgrade_says_so_and_a_switch_off_says_why() {
 /// A tab held by another supervisor's claim reads so in `--status` (from the
 /// instance's `sessions` `supervisor=`), not `stalled=unwatched`. Negative
 /// controls: with `[harness] enabled` or `upgrade` off the instance is not
-/// asked, and `unwatched` with the switch's note stands; with no instance
-/// answering, see `an_unwatched_upgrade_says_so_and_a_switch_off_says_why`.
+/// asked, and `unwatched` with the switch's note stands.
 #[cfg(unix)]
 #[test]
 fn a_tab_another_supervisor_claims_reads_so_unless_a_switch_is_off() {
@@ -3332,11 +3293,9 @@ fn a_tab_another_supervisor_claims_reads_so_unless_a_switch_is_off() {
     let _ = agent.wait();
 }
 
-/// A conversation resumed outside aterm (`claude --resume` in another terminal)
-/// is never `unwatched`: its holder is in no tab, so no aterm host will look at
-/// it, and blaming aterm would be wrong. The row shows its own stall
-/// (`overdue`). Negative control: the same record held in its tab is
-/// `unwatched` after a day awake.
+/// A conversation resumed outside aterm (`claude --resume` in another terminal) is never
+/// `unwatched`, since no aterm host will look at it: the row shows its own stall. Negative
+/// control: held in its tab it is `unwatched` after a day awake.
 #[cfg(unix)]
 #[test]
 fn a_conversation_resumed_outside_aterm_is_never_told_unwatched() {
@@ -3536,11 +3495,10 @@ fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
     assert!(lines[1].contains(r#""pending_for_s":null"#), "{}", lines[1]);
 }
 
-/// `harness limits` says the
-/// time the supervisor will continue at. A weekly wall hit at 8 pm that says
-/// `resets 9am` resets tomorrow, 13 hours off — the print is the done row's
-/// clock — where the session window's rule (a five-hour window) put it 11
-/// hours in the past; a SESSION window's `9am` is still today's.
+/// `harness limits` says the time the supervisor will continue at. A weekly wall hit at 8 pm
+/// that says `resets 9am` resets tomorrow, 13 hours off (the done row's clock is the print),
+/// where the session window's five-hour rule would put it 11 hours in the past; a session
+/// window's `9am` is still today's.
 #[test]
 fn the_view_places_a_weekly_walls_bare_clock_after_its_print() {
     use aterm_phase::prompt::fixtures::{composer, rows};
@@ -3575,7 +3533,7 @@ fn the_view_places_a_weekly_walls_bare_clock_after_its_print() {
         &|z, _| pdt(z),
     );
     assert_eq!(session.resets_at, Some(now - 11 * 3600));
-    // No done row: no evidence of the print — the session rule, as before.
+    // No done row, no evidence of the print: the session rule.
     let mut bare = wall("You've hit your weekly limit", "8:00 PM");
     bare.retain(|r| !r.contains("done"));
     assert_eq!(
@@ -3600,14 +3558,10 @@ fn exit(code: u8) -> String {
     format!("{:?}", ExitCode::from(code))
 }
 
-/// A scripted [`AccountsHost`]. `auth status` — the check after a flow that
-/// exits 0 — is answered by `status`, keyed by the login string it was
-/// handed; every call is recorded, so a test can say what was run and with
-/// which string. Nothing is spawned. Its clock reads `now`: 0, behind every
-/// [`Env::now`], until a test moves it. A login can be asked unless
-/// `unaskable` says why not. With `writes_home` a flow that starts writes
-/// `.claude.json` into the home it is handed, whatever it then exits, as the
-/// vendor's start does (MEASURED on 2.1.287).
+/// A scripted [`AccountsHost`]: `auth status` is answered by `status`, keyed by the login
+/// string it was handed, and every call is recorded; nothing is spawned. Its clock reads `now`
+/// (0, behind every [`Env::now`], until a test moves it). With `writes_home` a flow writes
+/// `.claude.json` into its home whatever it then exits, as the vendor's start does (2.1.287).
 struct FakeHost<'a> {
     tty: bool,
     status: &'a dyn Fn(&str) -> Result<Captured, String>,
@@ -3669,9 +3623,8 @@ fn never_asked(login: &str) -> Result<Captured, String> {
     panic!("this verb runs no `claude` (asked under {login:?})");
 }
 
-/// What `claude auth status --json` prints and exits with, MEASURED on
-/// 2.1.286 for the one key read here (design §1): `loggedIn: true` and exit
-/// 0, or `loggedIn: false` and exit 1.
+/// What `claude auth status --json` prints and exits with on 2.1.286, for the one key read here
+/// (design §1): `loggedIn: true` and exit 0, or `loggedIn: false` and exit 1.
 fn said(logged_in: bool) -> Result<Captured, String> {
     Ok(Captured {
         stdout: format!(r#"{{"loggedIn":{logged_in},"authMethod":"claude.ai"}}"#).into_bytes(),
@@ -3696,9 +3649,8 @@ fn acc_quiet(form: AccountsCmd, env: &Env) -> (String, String, String) {
     acc(form, env, &FakeHost::new(&never_asked))
 }
 
-/// What each login is ON RECORD as, written as an observation is — through
-/// the store's own transaction ([`accounts::note_auth`] at `env.now`, its
-/// ledger rows, the wake marker) — with no verb run.
+/// Record each login's auth as an observation is recorded, through the store's own transaction
+/// ([`accounts::note_auth`] at `env.now`), with no verb run.
 fn on_record(env: &Env, seen: &[(&str, Auth)]) {
     let mut note = None;
     env.accounts_store()
@@ -3720,9 +3672,8 @@ fn add(label: &str, class: Class) -> AccountsCmd {
     }
 }
 
-/// A LOGIN MADE in the login directory `dir`: the directory, and one file in
-/// it — what the vendor's flow leaves when it is run with the directory as
-/// its home. A directory that holds nothing is not enrolled
+/// A login made in the login directory `dir`: the directory and one file in it, as the
+/// vendor's flow leaves it. A directory that holds nothing is not enrolled
 /// ([`accounts::login_made`]).
 fn login_made_in(dir: impl AsRef<Path>) {
     let dir = dir.as_ref();
@@ -3730,10 +3681,9 @@ fn login_made_in(dir: impl AsRef<Path>) {
     std::fs::write(dir.join("a-login-file"), "{}").expect("write");
 }
 
-/// The design's own roster under `env`: `main` (this machine's login),
-/// `work-2` (dedicated, a login made in its directory) and `pool-a` (shared,
-/// its directory NOT made: not enrolled here). Answers the two directory
-/// strings.
+/// The design's own roster under `env`: `main` (this machine's login), `work-2` (dedicated, a
+/// login made in its directory) and `pool-a` (shared, its directory not made: not enrolled
+/// here). Answers the two directory strings.
 fn three_accounts(tmp: &Tmp, env: &Env) -> (String, String) {
     let work = tmp.path().join("logins").join("work-2");
     login_made_in(&work);
@@ -3796,11 +3746,72 @@ fn with_no_roster_the_report_names_the_file_and_the_add_line_and_writes_nothing(
     assert!(!env.state.exists(), "the report made no state directory");
 }
 
-/// A ROSTER THAT DOES NOT ADMIT is refused whole, by name, exit 1 — by the
-/// report (text and JSON, whose `refused` carries the reason), and by every
-/// verb that would act on it, none of which writes anything or runs
-/// anything. Negative control: the same file with the bad row fixed is read
-/// and exits 0.
+/// WHERE NO ACCOUNT CAN TAKE OVER, THE REPORT NAMES THE ONE STEP THAT CHANGES
+/// IT (the review of the login carry, r8c-3: it said `next: none` and closed
+/// on a paragraph about the build): the line that lists another account, the
+/// step a usage limit's notice gives there. NEGATIVE CONTROLS: a row
+/// ready to run is `next`, and a listed row left to sign in names its own
+/// sign-in, neither with that line.
+#[test]
+fn where_no_account_can_take_over_the_report_names_another() {
+    let tmp = tmp_dir("accounts-another");
+    let env = env_at(&tmp);
+    let work = tmp.path().join("logins").join("work-2");
+    login_made_in(&work);
+    let mut roster = String::new();
+    for (label, dir) in [("main", None), ("work-2", work.to_str())] {
+        roster = accounts::append_row(&roster, label, Class::Dedicated, dir).expect("admits");
+    }
+    std::fs::write(env.accounts_roster().expect("a config dir"), &roster).expect("write");
+    let names_add = |out: &str| {
+        out.lines()
+            .filter_map(|line| line.split_once("aterm harness "))
+            .any(|(_, args)| {
+                let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+                matches!(
+                    parse(&args).map(|(cmd, _)| cmd),
+                    Ok(Cmd::Accounts(AccountsCmd::Add { .. }))
+                )
+            })
+    };
+    let report = |env: &Env| {
+        let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, env);
+        assert_eq!(code, exit(0), "{err}");
+        out
+    };
+    let mut state = accounts::State {
+        active: Some("main".to_string()),
+        ..accounts::State::default()
+    };
+    // NEGATIVE CONTROL: `work-2` is ready, so it is `next`.
+    env.accounts_store().save(&state).expect("save");
+    let out = report(&env);
+    assert!(out.contains("next: work-2"), "{out}");
+    assert!(!names_add(&out), "{out}");
+    // `work-2` limited too: none can take over, and the line lists another.
+    accounts::note_wall(
+        &mut state,
+        "work-2",
+        "seven_day",
+        Some(env.now + 3 * 86_400),
+        env.now - 10,
+        env.now,
+    );
+    env.accounts_store().save(&state).expect("save");
+    let out = report(&env);
+    assert!(names_add(&out), "{out}");
+    // NEGATIVE CONTROL: a listed row left to sign in names its own sign-in.
+    let pool = tmp.path().join("logins").join("pool-a");
+    roster = accounts::append_row(&roster, "pool-a", Class::Shared, pool.to_str()).expect("admits");
+    std::fs::write(env.accounts_roster().expect("a config dir"), &roster).expect("write");
+    let out = report(&env);
+    assert!(out.contains("accounts login pool-a"), "{out}");
+    assert!(!names_add(&out), "{out}");
+}
+
+/// A roster that does not admit is refused whole, by name, exit 1: by the report (text, and
+/// JSON whose `refused` carries the reason) and by every verb that would act on it, none of
+/// which writes or runs anything. Negative control: the bad row fixed, the file is read.
 #[test]
 fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     let tmp = tmp_dir("accounts-refused");
@@ -3854,7 +3865,7 @@ fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
         "nothing was recorded"
     );
 
-    // NEGATIVE CONTROL: the second row renamed, the file admits.
+    // Negative control: the second row renamed, the file admits.
     std::fs::write(
         &roster,
         bad.replacen(
@@ -3869,11 +3880,10 @@ fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     assert!(out.contains("pool-a"), "{out}");
 }
 
-/// `accounts add`: the FIRST add on a machine with no roster lists this
-/// machine's own login as `main` (dedicated, no dir) before the new row and
-/// says so; the row's dir is the login directory it made, 0700; the line to
-/// run next is printed. A second add appends one row and no second `main`;
-/// `--shared` is the class. The file it writes is one the reader admits.
+/// The first `accounts add` on a machine with no roster lists this machine's own login as
+/// `main` (dedicated, no dir) before the new row and says so; the row's dir is the login
+/// directory it made, 0700, and the line to run next is printed. A second add appends one row
+/// and no second `main`. The file it writes is one the reader admits.
 #[test]
 fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     let tmp = tmp_dir("accounts-add");
@@ -3926,19 +3936,12 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     assert_eq!(read.row("pool-a").map(|r| r.class), Some(Class::Shared));
 }
 
-/// A ROW JUST ADDED IS LISTED, NOT SIGNED IN (the regression: `accounts add`
-/// makes the login directory, and the report read the row `unseen` and named
-/// it `next:` with no login behind it). With its
-/// directory empty the row is `not-enrolled` in the report and its JSON, is
-/// never `next:`, and its reason names the line that signs it in; `accounts
-/// use` refuses it with that same line; and `accounts login` STILL RUNS on
-/// it — it is what fills the directory — but a flow that exits 0 and leaves
-/// nothing there made no login: the row is said `not enrolled`, exit 1, with
-/// nothing asked. Once the flow has written there the row is `unseen` and
-/// the report's `next:`, and a flow that exits 0 asks that login once.
-///
-/// NEGATIVE CONTROL: `main`, the row with no directory, is enrolled through
-/// all of it — never told to log in.
+/// A row just added is listed, not signed in: with its directory empty it is `not-enrolled` in
+/// the report and its JSON, never `next:`, and its reason names the line that signs it in;
+/// `accounts use` refuses it with that line; and `accounts login` still runs on it, but a flow
+/// that exits 0 and leaves nothing there is `not enrolled`, exit 1, nothing asked. Once the
+/// flow has written there the row is `unseen` and `next:`, and a flow that exits 0 asks that
+/// login once. Negative control: `main`, the row with no directory, is enrolled throughout.
 #[test]
 fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     let tmp = tmp_dir("accounts-empty-dir");
@@ -4015,9 +4018,8 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     assert_eq!(*tty.asked.borrow(), vec![dir_text]);
 }
 
-/// NEGATIVE CONTROL for the first-add rule: a roster that already has a row
-/// — here one written by hand, with a dir — is not a new roster, and `add`
-/// lists no `main` into it.
+/// Negative control for the first-add rule: a roster that already has a row (here one written
+/// by hand, with a dir) is not a new roster, and `add` lists no `main` into it.
 #[test]
 fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
     let tmp = tmp_dir("accounts-add-existing");
@@ -4043,10 +4045,9 @@ fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
     );
 }
 
-/// `accounts add` REFUSES, exit 1, by name, and leaves the roster as it was:
-/// a label already listed (the second add of one label), a label outside the
-/// grammar, `main` as the first label of a new roster, and a state directory
-/// that is not absolute (the row's dir would be relative).
+/// `accounts add` refuses by name, exit 1, leaving the roster as it was: a label already
+/// listed, one outside the grammar, `main` as the first label of a new roster, and a state
+/// directory that is not absolute.
 #[test]
 fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
     let tmp = tmp_dir("accounts-add-refused");
@@ -4094,14 +4095,11 @@ fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
     );
 }
 
-/// `accounts login`: the line is `CLAUDE_CONFIG_DIR='<dir>' claude auth
-/// login` with the dir VERBATIM from the roster (a trailing slash and a quote
-/// survive, the quote escaped for the shell). With stdin not a terminal the
-/// line is printed and NOTHING is run, exit 0, and what is said to run is this
-/// verb at a terminal (it records; the printed line alone does not); at a
-/// terminal the flow is run under exactly that string. The row with no dir is
-/// this machine's own login: its line is `claude auth login`, and piped it
-/// runs nothing either. An unlisted label is refused by name.
+/// `accounts login` prints `CLAUDE_CONFIG_DIR='<dir>' claude auth login` with the dir verbatim
+/// from the roster (a trailing slash and a quote survive, the quote shell-escaped). Piped, it
+/// runs nothing, exit 0, and says to run this verb at a terminal; at a terminal the flow runs
+/// under exactly that string. The row with no dir prints `claude auth login`. An unlisted label
+/// is refused by name.
 #[test]
 fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     let tmp = tmp_dir("accounts-login");
@@ -4162,20 +4160,12 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     assert_eq!(tty.logins.borrow().len(), before, "neither ran anything");
 }
 
-/// A FAILED FLOW RUNS NOTHING MORE UNDER ANY LOGIN (this host's `auth
-/// status` panics), exit 1: whatever login the directory holds is not brand
-/// new, and `claude auth status` would spend its single-use refresh token. Over
-/// `work-2`, whose directory held a login and which is recorded `ok`, and
-/// over `main`, the row with no `dir`, a flow that exits non-zero — 3, or
-/// Ctrl-C's 130 after the start wrote its files — and a `claude` that cannot
-/// be started record NOTHING: the state file, the ledger and the wake marker
-/// are byte for byte as they were.
-///
-/// NEGATIVE CONTROL: over a row just added, whose directory held nothing, a
-/// failed flow that left nothing records nothing either (the row stays
-/// `not-enrolled`), and the same failed flow once its start wrote there is
-/// recorded `signed-out` — one `auth` ledger row, still with nothing asked —
-/// so the row is not `unseen`: not the report's `next:`, refused by `use`.
+/// A failed flow runs nothing more under any login (this host's `auth status` panics), exit 1.
+/// Over `work-2`, whose directory held a login, and over `main`, a flow exiting 3 or 130 and a
+/// `claude` that cannot start record nothing: state, ledger and wake marker are unchanged.
+/// Negative control: over a row just added, a failed flow that left nothing records nothing,
+/// and one whose start wrote there records `signed-out` (one `auth` row, nothing asked), so the
+/// row is not `unseen`: not `next:`, refused by `use`.
 #[test]
 fn a_failed_flow_runs_nothing_and_records_only_a_first_login_signed_out() {
     let tmp = tmp_dir("accounts-login-failed");
@@ -4222,7 +4212,7 @@ fn a_failed_flow_runs_nothing_and_records_only_a_first_login_signed_out() {
     #[cfg(unix)]
     assert_eq!(wake_id(&store), woken, "nobody is woken");
 
-    // NEGATIVE CONTROL: a row just added, its directory empty.
+    // Negative control: a row just added, its directory empty.
     let (code, _, err) = acc_quiet(add("work-3", Class::Dedicated), &env);
     assert_eq!(code, exit(0), "{err}");
     let fresh = store.login_dir("work-3").expect("a label");
@@ -4274,15 +4264,10 @@ fn wake_id(store: &accounts::Store) -> Option<u64> {
     std::fs::metadata(store.wake_path()).ok().map(|m| m.ino())
 }
 
-/// `accounts login` AT A TERMINAL WAITS FOR THE FLOW AND RECORDS WHAT THE
-/// LOGIN THEN ANSWERS: the flow exits 0, that ONE login is asked under its
-/// own string, its line is printed after the flow's, and a login that works
-/// is recorded — the state's word, a ledger `auth` row `ok`, the wake marker
-/// replaced — exit 0. The answer is stamped by the host's clock, read after
-/// the flow, where that is ahead of the command's own.
-///
-/// NEGATIVE CONTROL: before it the state said `signed-out` (as a login wall
-/// records it), and no other login was asked or recorded.
+/// `accounts login` at a terminal waits for the flow, asks that one login under its own string,
+/// prints its answer after the flow's line, and records a login that works (the state's word, a
+/// ledger `auth` row `ok`, the wake marker replaced), exit 0, stamped by the host's clock read
+/// after the flow.
 #[test]
 fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     let tmp = tmp_dir("accounts-login-records");
@@ -4464,19 +4449,21 @@ fn the_login_flow_runs_under_the_home_it_is_given() {
             (accounts::LOGIN_ENV.to_string(), None)
         ]
     );
-    // NEGATIVE CONTROL: no such program.
+    // Negative control: no such program.
     let missing = tmp.path().join("nowhere").join("claude");
     assert!(login_flow_of(missing.as_os_str(), None).is_err());
 }
 
-/// Process dispositions belong to one exact-test child, never the parallel
-/// test runner. Its bounded runner kills/reaps only this owned process group.
+/// Signal dispositions are process-wide, so a test that changes them runs alone in a child of
+/// this test binary (`<test> --exact`), never beside the parallel runner's threads: true in that
+/// child, which runs the body; false in the parent once the child passed. The bounded runner
+/// kills and reaps only the child's own process group.
 #[cfg(unix)]
 fn isolated_terminal_signals(test: &str) -> bool {
     const CHILD: &str = "ATERM_TEST_TERMINAL_SIGNALS";
     if std::env::var(CHILD).as_deref() == Ok(test) {
-        // A parallel flow in the parent may have been ignoring the signals
-        // when this child exec'd. Start this private process at the defaults.
+        // A flow in the parent may have been ignoring the signals when it spawned this child,
+        // and an ignored signal is inherited across exec: start at the defaults.
         for sig in [libc::SIGINT, libc::SIGQUIT] {
             // SAFETY: all-zero is a valid empty action and mask.
             let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -4566,9 +4553,8 @@ fn terminal_flows_admit_spawns_after_the_previous_wait_restores_signals() {
         )
         .unwrap();
     });
-    // Old code sends Spawned while A ignores the signals; proper admission
-    // sends Contended. Either event lets the controller release A, without
-    // a sleep or an assertion based on how long B failed to make progress.
+    // B sends Contended when admission makes it wait for A, or Spawned (under A's SIG_IGN) when
+    // it does not; either event releases A, so no sleep or timing decides the outcome.
     let first = rx.recv_timeout(Duration::from_secs(60));
     let _ = release_tx.send(());
     let a_done = a.join();
@@ -4679,17 +4665,11 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
     assert_eq!(state.account("work-2").auth, Auth::Ok);
 }
 
-/// THE SECRECY CONTROL. `claude auth status --json` names an email and an
-/// organization. The fake host's output carries both — in a document that
-/// answers, in plain text that does not parse, and inside the `loggedIn` key
-/// itself — and no byte of them reaches stdout, stderr, the ledger, the state
-/// file or any other file `accounts login` wrote after a flow that exited 0,
-/// nor the report or the ledger view read afterwards.
-///
-/// NEGATIVE CONTROL: the strings ARE in what the host handed over (asserted
-/// on the fake's own output), and the document that carried them was still
-/// read for its one key (`main: signed in`), so their absence is the reader's
-/// doing and not an empty fixture.
+/// The secrecy control: `claude auth status --json` names an email and an organization. The
+/// fake host's output carries both (in a document that answers, in plain text, and inside the
+/// `loggedIn` key) and no byte of them reaches stdout, stderr, any file `accounts login` wrote,
+/// the report or the ledger view. Negative control: the fixture carries the strings, and the
+/// document was still read for its one key (`main: signed in`).
 #[test]
 fn login_keeps_no_byte_of_the_vendors_output() {
     let tmp = tmp_dir("accounts-secrecy");
@@ -4794,9 +4774,8 @@ fn login_keeps_no_byte_of_the_vendors_output() {
 
 /// `accounts use <label>` records the owner's pin — `active`, `proven`,
 /// `pinned`, a ledger `use` row, the wake marker replaced — and says that it
-/// is recorded ([`ACCOUNTS_USE_RECORDED`]); the report ends on
-/// [`ACCOUNTS_ROTATION`]. `use --auto` ends the pin with an `unpin` row; with
-/// no pin standing it writes nothing.
+/// is recorded ([`ACCOUNTS_USE_RECORDED`]). `use --auto` ends the pin with
+/// an `unpin` row; with no pin standing it writes nothing.
 #[test]
 fn use_records_the_owners_pin_and_claims_no_move() {
     let tmp = tmp_dir("accounts-use");
@@ -4848,10 +4827,9 @@ fn use_records_the_owners_pin_and_claims_no_move() {
     assert_eq!(store.tail(20).expect("ledger").len(), 2, "no pin: no row");
 }
 
-/// `accounts use` REFUSES BY NAME, exit 1, with nothing changed: a label the
-/// roster does not list, one with no login directory here, and one on record
-/// as signed out — each with what to run. Negative control: the signed-out
-/// label is accepted once `accounts login` has signed it in.
+/// `accounts use` refuses by name, exit 1, with nothing changed: a label the roster does not
+/// list, one not enrolled here, and one on record as signed out, each with what to run.
+/// Negative control: the signed-out label is accepted once `accounts login` signed it in.
 #[test]
 fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
     let tmp = tmp_dir("accounts-use-refused");
@@ -4877,7 +4855,7 @@ fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
     );
     assert_eq!(store.tail(20).expect("ledger").len(), rows);
 
-    // NEGATIVE CONTROL: signed in again, the same label is taken.
+    // Negative control: signed in again, the same label is taken.
     let signed_in = |_: &str| said(true);
     let mut tty = FakeHost::new(&signed_in);
     tty.tty = true;
@@ -4893,10 +4871,10 @@ fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
     assert_eq!(code, exit(0), "{err}");
 }
 
-/// A state with something of everything, written through the store: `main`
-/// sampled five minutes ago with its session window read and its week NOT
-/// read, a reset offer, a session on it; `work-2` at a wall, with a session
-/// that could not move; `pool-a` never observed and not enrolled here.
+/// A state with something of everything, written through the store: `main` sampled five
+/// minutes ago with its session window read and its week not, a reset offer, a session on it;
+/// `work-2` at a wall, with a session that could not move; `pool-a` never observed and not
+/// enrolled here.
 fn reported_state(env: &Env) {
     let now = env.now;
     let mut state = accounts::State {
@@ -5053,7 +5031,7 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
         .expect("the wall, by the vendor's limit type");
     assert_eq!(int(wall, "until"), Some(now + 3600));
 
-    // NEVER 0 FOR AN UNKNOWN: the account nobody observed is nulls throughout.
+    // Never 0 for an unknown: the account nobody observed is nulls throughout.
     assert_eq!(text(pool_a, "dir"), Some(pool));
     assert_eq!(pool_a.get("enrolled"), Some(&Value::from(false)));
     assert_eq!(text(pool_a, "condition").as_deref(), Some("not-enrolled"));
@@ -5083,13 +5061,9 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     );
 }
 
-/// THE CHECK AFTER A SIGN-IN IS NOT RUN WITH NEITHER USER NOR LOGNAME SET.
-/// Claude Code then answers `loggedIn: false`, exit 1, for a login that
-/// works (MEASURED, 2.1.286), and the check would record a signed-in account
-/// as signed out — ending a pin on it, and keeping it out of every rotation.
-/// So the question is not asked, and `accounts login` does not start the flow
-/// whose login it could not ask afterwards
-/// (`a_login_nobody_could_ask_afterwards_is_not_started`).
+/// The check after a sign-in is not run with neither USER nor LOGNAME set: Claude Code then
+/// answers `loggedIn: false`, exit 1, for a login that works (2.1.286), which would record it
+/// signed out and end a pin on it.
 #[test]
 fn the_check_after_a_sign_in_needs_user_or_logname() {
     type Vars = &'static [(&'static str, &'static str)];
@@ -5110,8 +5084,8 @@ fn the_check_after_a_sign_in_needs_user_or_logname() {
     assert_eq!(names(&[("ATERM_CHILD", "1")]), refused);
     // Set and empty names nobody.
     assert_eq!(names(&[("USER", ""), ("LOGNAME", "")]), refused);
-    // NEGATIVE CONTROLS: either one is enough, and what goes through is
-    // those two and the reroute markers — never anything else that is set.
+    // Negative controls: either one is enough, and what goes through is those two and the
+    // reroute markers, never anything else that is set.
     assert_eq!(names(&[("USER", "u")]), Ok(vec!["USER"]));
     assert_eq!(names(&[("LOGNAME", "u")]), Ok(vec!["LOGNAME"]));
     assert_eq!(
@@ -5220,7 +5194,7 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
         newer
     );
 
-    // NEGATIVE CONTROL: a torn file is replaced, with a note.
+    // Negative control: a torn file is replaced, with a note.
     std::fs::write(store.state_file(), &newer[..newer.len() / 2]).expect("write");
     let (code, _, err) = acc_quiet(
         AccountsCmd::Use {
@@ -5234,13 +5208,8 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
     assert_eq!(state.active.as_deref(), Some("work-2"));
 }
 
-/// `accounts add` ON A ROSTER THAT IS A SYMLINK (a dotfiles checkout) writes
-/// THROUGH the link: the link survives and the file it points at gets the
-/// row. Renamed over the link, the roster became a regular file the checkout
-/// knew nothing of, and the linked file never got the row.
-///
-/// The file it points at KEEPS ITS MODE: it is replaced by a rename, and the
-/// replacement used to be 0600 whatever the owner had made the file.
+/// `accounts add` on a roster that is a symlink (a dotfiles checkout) writes through the link:
+/// the link survives, and the file it points at gets the row and keeps its mode.
 #[cfg(unix)]
 #[test]
 fn add_writes_a_symlinked_roster_through_the_link() {
@@ -5296,8 +5265,7 @@ fn add_writes_a_symlinked_roster_through_the_link() {
         1,
         "no temp file is left beside the target"
     );
-    // NEGATIVE CONTROL: a roster that is no link is this command's to keep
-    // private, whatever mode it had.
+    // Negative control: a roster that is no link is kept private, whatever mode it had.
     let plain = tmp_dir("accounts-add-plain");
     let env = env_at(&plain);
     let roster = env.accounts_roster().expect("a config dir");
@@ -5322,11 +5290,9 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     assert!(!env.accounts_store().logins_dir().exists());
 }
 
-/// A ROSTER THAT DEFINES `account` INLINE (`account = [ { … } ]`) admits, is
-/// reported — and cannot be appended to: an `[[account]]` table cannot
-/// extend an array written that way. `add` used to blame the owner's file as
-/// `not valid TOML`, at a line it had itself appended. It says what is so,
-/// prints the row to add by hand, and writes nothing.
+/// A roster that defines `account` inline (`account = [ { … } ]`) admits and is reported, but
+/// cannot be appended to (an `[[account]]` table cannot extend it): `add` says so, prints the
+/// row to add by hand, and writes nothing.
 #[test]
 fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     let tmp = tmp_dir("accounts-add-inline");
@@ -5358,11 +5324,9 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
         Some((Class::Shared, dir.to_str().map(str::to_owned)))
     );
 
-    // THE EMPTY INLINE ARRAY (`account = []`) is a roster with no rows, so a
-    // first `add` lists this machine's own login before the one asked for.
-    // The refusal prints BOTH rows, in that order, and says whose the first
-    // is; it used to print the row for `main` alone, and never the one that
-    // was asked for.
+    // The empty inline array (`account = []`) is a roster with no rows, so a first `add` lists
+    // this machine's own login first: the refusal prints both rows, in that order, and says
+    // whose the first is.
     let empty = "account = []\n";
     std::fs::write(&roster, empty).expect("write");
     let (code, out, err) = acc_quiet(add("work-2", Class::Shared), &env);
@@ -5441,14 +5405,11 @@ fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
     assert_eq!(code, exit(0), "no longer refused as signed-out: {err}");
 }
 
-/// THE ONE RUNNER OF `auth status --json` ([`auth_status_of`]: the check
-/// after a sign-in) runs THE PROGRAM IT IS GIVEN, by its path, under the
-/// login it is given, with USER handed through: a stand-in that answers
-/// `loggedIn: true` only with USER set and the login variable set-and-empty
-/// reads signed in for the default login and signed out for a directory. NEGATIVE CONTROLS: with neither USER nor LOGNAME it
-/// is NOT RUN (the vendor then reports a login that works as signed out) —
-/// the stand-in leaves no mark of having run; and a program that does not
-/// exist could not run, with no word of any output.
+/// The `auth status --json` runner ([`auth_status_of`]) runs the program it is given, by its
+/// path, under the login it is given, with USER handed through: a stand-in that answers signed
+/// in only with USER set and the login variable set and empty reads signed in for the default
+/// login and signed out for a directory. Negative controls: with neither USER nor LOGNAME it is
+/// not run, and a missing program could not run.
 #[cfg(unix)]
 #[test]
 fn the_auth_runner_runs_the_program_it_is_given_under_the_login() {
@@ -5476,7 +5437,7 @@ fn the_auth_runner_runs_the_program_it_is_given_under_the_login() {
         };
     let none = |_: &str| None;
 
-    // NEGATIVE CONTROL: no USER, not run.
+    // Negative control: no USER, not run.
     assert_eq!(
         auth_status(program.as_os_str(), "", &none).err(),
         Some(AUTH_CHECK_NO_USER.to_string())
@@ -5497,7 +5458,7 @@ fn the_auth_runner_runs_the_program_it_is_given_under_the_login() {
         2,
         "it was this program that ran, once an ask"
     );
-    // NEGATIVE CONTROL: no such program.
+    // Negative control: no such program.
     let missing = tmp.path().join("nowhere").join("claude");
     assert!(matches!(
         login_check(auth_status(missing.as_os_str(), "", &user)),
@@ -5565,8 +5526,8 @@ fn harness_limits_attributes_credits_only_to_claude_code() {
         assert!(claude.credits);
         assert!(limits_text(&claude).contains(" credits=in-use "));
         assert!(limits_json(&claude).contains(r#""credits":"in-use""#));
-        // A shell can print the same framed bytes, or they can remain on
-        // screen while another program takes over. Its reader owns the read.
+        // A shell can print the same framed bytes, or they can stay on screen after another
+        // program takes over: the tab's own program's reader owns the read.
         for program in [Program::Codex, Program::Generic] {
             let other = view(program, &rows);
             assert!(!other.credits, "{program:?} inherited Claude's credits");
@@ -5577,13 +5538,11 @@ fn harness_limits_attributes_credits_only_to_claude_code() {
     assert!(!view(Program::Claude, &screen(END_SESSION_LIMIT)).credits);
 }
 
-/// `harness accounts` SHOWS WHAT THE RECORD SAYS OF AN ACCOUNT'S USAGE
-/// (accounts v2 S5): with no roster, the machine's own row once its usage is
-/// on record (`[harness] usage_notes`) — credits in use since a time, then,
-/// over, the vendor's word that they are off and its weekly warning — and
-/// on a roster's row the same words before `on:`. NEGATIVE CONTROL: with
-/// nothing on record the report is the packaged one, word for word, and a
-/// row with no usage on record is unchanged.
+/// `harness accounts` shows what the record says of an account's usage: with no roster, the
+/// machine's own row once its usage is on record (`[harness] usage_notes`), credits in use since
+/// a time and then, written over that, the vendor's word that they are off and its weekly
+/// warning; on a roster's row the same words come before `on:`. Negative control: with nothing
+/// on record the report is the packaged one, and a row with no usage on record is unchanged.
 #[test]
 fn the_accounts_report_shows_the_record_of_usage() {
     use super::super::accounts::{Credits, CreditsOff, CreditsUse, WindowSaid};
@@ -5769,13 +5728,21 @@ fn accounts_with_no_roster_shows_this_logins_tap_reading() {
             Ok(accounts::note_reading(
                 state,
                 ACCOUNTS_OWN_LABEL,
-                accounts::Sample {
-                    session_pct: Some(42),
-                    session_reset: Some(env.now + 3_600),
-                    week_pct: Some(61),
-                    week_reset: Some(env.now + 86_400),
+                &accounts::TapRead {
+                    five_hour: Some(accounts::WindowRead {
+                        pct_x10: 420,
+                        reset: env.now + 3_600,
+                        refilled: None,
+                    }),
+                    seven_day: Some(accounts::WindowRead {
+                        pct_x10: 610,
+                        reset: env.now + 86_400,
+                        refilled: None,
+                    }),
                     at: env.now,
-                    by: String::new(),
+                    seen_before: true,
+                    born: None,
+                    key: None,
                 },
                 env.now,
             ))
@@ -5788,6 +5755,87 @@ fn accounts_with_no_roster_shows_this_logins_tap_reading() {
     assert_eq!(rows.len(), 1, "{out}");
     assert_eq!(rows[0]["label"], Value::from("main"));
     assert_eq!(rows[0]["session_pct"], Value::from(42u64));
+}
+
+/// A FIGURE HELD ONLY IN THE SAMPLE IS SHOWN BY BOTH VIEWS (the
+/// account-stats design §3.2): a state the usage tap of an older build wrote
+/// — this login's sample, session 42% and no week, no window record — reads
+/// `session 42% until …` in `accounts`, and in `accounts --json` the row's
+/// `session_pct` and its `windows[0]` agree (`source: sample`). The empty
+/// week says why as `accounts stats` says it: `usage-tap-off` with the tap
+/// off, `no-reading` with it on. NEGATIVE CONTROL: once the sample's window
+/// has reset, it says nothing — `session ?`, `window-reset`.
+#[test]
+fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
+    let tmp = tmp_dir("accounts-sample");
+    let env = env_at(&tmp);
+    let reset = env.now + 3_600;
+    let mut note = None;
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            let sample = accounts::Sample {
+                session_pct: Some(42),
+                session_reset: Some(reset),
+                at: env.now - 300,
+                ..accounts::Sample::default()
+            };
+            Ok(accounts::note_sample(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                sample,
+                env.now,
+            ))
+        })
+        .expect("a transaction");
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(
+        out.contains(&format!(
+            "session 42% until {} \u{b7} week ?",
+            rfc3339_utc(reset)
+        )),
+        "{out}"
+    );
+    let row = |env: &Env| -> Value {
+        let (code, out, _) = acc_quiet(AccountsCmd::Report { json: true }, env);
+        assert_eq!(code, exit(0));
+        let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+        doc["accounts"][0].clone()
+    };
+    let main = row(&env);
+    assert_eq!(main["session_pct"], Value::from(42u64));
+    let five = &main["windows"][0];
+    assert_eq!(
+        (&five["used_pct"], &five["source"], &five["as_of"]),
+        (
+            &Value::from(42u64),
+            &Value::from("sample"),
+            &Value::from(env.now - 300)
+        ),
+        "{main}"
+    );
+    assert_eq!(
+        main["windows"][1]["missing"]["reason"],
+        Value::from("usage-tap-off")
+    );
+    std::fs::write(
+        env.config.as_ref().expect("a config"),
+        "[harness]\nusage_tap = true\n",
+    )
+    .expect("config");
+    assert_eq!(
+        row(&env)["windows"][1]["missing"]["reason"],
+        Value::from("no-reading")
+    );
+    // NEGATIVE CONTROL: the sample's window reset.
+    let mut after = env.clone();
+    after.now = reset + 60;
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &after);
+    assert!(out.contains("session ? \u{b7} week ?"), "{out}");
+    assert_eq!(
+        row(&after)["windows"][0]["missing"]["reason"],
+        Value::from("window-reset")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5837,10 +5885,9 @@ fn stats_env(tmp: &Tmp, dir: PathBuf, profile: PathBuf) -> Env {
     env
 }
 
-/// `accounts stats` reads the default home's profile through the allowlist
-/// reader: the plan, its tier, the credits word and the Fable plan answer,
-/// labelled `main` and keyed by the id's hash — and not one sentinel, the
-/// id or the email, in either form.
+/// `accounts stats` reads the default home's profile through the allowlist reader: the plan,
+/// its tier, the credits word and the Fable plan answer, labelled `main` and keyed by the id's
+/// hash, and prints no sentinel, id, email or vendor flag name in either form.
 #[test]
 fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     let tmp = tmp_dir("stats");
@@ -5875,8 +5922,12 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
 
     let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
     assert!(
+        text.contains("main \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n"),
+        "{text}"
+    );
+    assert!(
         text.contains(
-            "main \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n  Fable  plan: Fable included\n"
+            "  Fable  \u{2014}  no /usage seen on this home \u{b7} plan: Fable included\n"
         ),
         "{text}"
     );
@@ -5924,7 +5975,9 @@ fn accounts_stats_names_a_missing_profile_and_labels_another_home_by_key() {
     assert_eq!(doc["missing"][0]["what"], Value::from("profile"));
     let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
     assert!(
-        text.contains("main \u{b7} claude \u{b7} plan \u{2014} (no-profile)\n"),
+        text.contains(
+            "main \u{b7} claude \u{b7} plan \u{2014} (no-profile) \u{b7} credits \u{2014}\n"
+        ),
         "{text}"
     );
 
@@ -5943,18 +5996,14 @@ fn accounts_stats_names_a_missing_profile_and_labels_another_home_by_key() {
     );
 }
 
-/// `accounts stats` reads the profile Claude Code keeps for the home this
-/// command's environment names ([`claude_profile_of`]), its plain file
-/// `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")` (READ in the
-/// 2.1.301 bundle: `b()`; a file Claude Code reads in its place,
-/// `accounts_stats_reads_the_file_claude_code_reads_for_the_home`), and
-/// labels the login it holds. The user's own
-/// `~/.claude` named by `CLAUDE_CONFIG_DIR` (how the real-Claude lab launches
-/// Claude Code) keeps its own profile inside it, and its own keychain item:
-/// `home-<key6>`, never the default home's `main`. An EMPTY one keeps
-/// `$HOME`'s, its directory unresolved (no `CLAUDE_PID`) included, and the
-/// default login: `main`. CONTROL: unset, beside `~/.claude`, `main`; a
-/// relative one whose directory is unknown, and no `HOME`, name none.
+/// `accounts stats` reads the profile Claude Code keeps for the home this command's environment
+/// names ([`claude_profile_of`]), the plain file `join(CLAUDE_CONFIG_DIR || homedir(),
+/// ".claude.json")` (the 2.1.301 bundle's `b()`), and labels the login it holds. The user's own
+/// `~/.claude` named by `CLAUDE_CONFIG_DIR` (as the real-Claude lab launches Claude Code) keeps
+/// its own profile inside it and its own keychain item: `home-<key6>`, never the default home's
+/// `main`. An empty `CLAUDE_CONFIG_DIR`, its directory unresolved (no `CLAUDE_PID`) included,
+/// keeps `$HOME`'s profile and the default login: `main`. Control: unset, the profile beside
+/// `~/.claude`; a relative one whose directory is unknown, and no `HOME`, name none.
 #[test]
 fn accounts_stats_reads_the_profile_claude_code_keeps_for_the_home_it_names() {
     let tmp = tmp_dir("stats-homes");
@@ -5993,7 +6042,7 @@ fn accounts_stats_reads_the_profile_claude_code_keeps_for_the_home_it_names() {
     assert_eq!(account["plan"]["word"], Value::from("max"), "{account}");
     assert_eq!(account["label"], Value::from("main"));
 
-    // CONTROL: unset, beside `~/.claude`; nothing to name.
+    // Control: unset, beside `~/.claude`; nothing to name.
     assert_eq!(
         claude_profile_of(Some(&home), None, Some(&own)),
         Some(home.join(".claude.json"))
@@ -6005,13 +6054,11 @@ fn accounts_stats_reads_the_profile_claude_code_keeps_for_the_home_it_names() {
     assert_eq!(claude_profile_of(None, Some(""), None), None);
 }
 
-/// `accounts stats` reads the file Claude Code reads for the home
-/// ([`profile::effective`]), and keeps the home's own label: a
-/// `~/.claude/.config.json` that holds a byte is read over a stale
-/// `~/.claude.json`, or where there is none, and `CLAUDE_CODE_CUSTOM_OAUTH_URL`
-/// reads `~/.claude-custom-oauth.json`; each is still the default home,
-/// `main`. CONTROL: the `.config.json` emptied and read-only, and the
-/// variable unset, read `~/.claude.json`.
+/// `accounts stats` reads the file Claude Code reads for the home ([`profile::effective`]) and
+/// keeps the home's own label: a non-empty `~/.claude/.config.json` is read over a stale
+/// `~/.claude.json` or in its absence, and `CLAUDE_CODE_CUSTOM_OAUTH_URL` reads
+/// `~/.claude-custom-oauth.json`; each is still the default home, `main`. Control: the
+/// `.config.json` emptied and read-only, and the variable unset, read `~/.claude.json`.
 #[cfg(unix)]
 #[test]
 fn accounts_stats_reads_the_file_claude_code_reads_for_the_home() {
@@ -6042,7 +6089,7 @@ fn accounts_stats_reads_the_file_claude_code_reads_for_the_home() {
     );
     std::fs::write(home.join(".claude.json"), &pro).expect("stale profile");
 
-    // CONTROL: emptied and read-only, it stands in for nothing.
+    // Control: emptied and read-only, it stands in for nothing.
     std::fs::write(&legacy, "").expect("empty");
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o444)).expect("chmod");
     assert_eq!(stats(&env), (main.clone(), Value::from("pro")));
@@ -6051,19 +6098,17 @@ fn accounts_stats_reads_the_file_claude_code_reads_for_the_home() {
     std::fs::write(home.join(".claude-custom-oauth.json"), stats_profile()).expect("custom");
     env.claude_custom_oauth = true;
     assert_eq!(stats(&env), (main.clone(), Value::from("max")));
-    // CONTROL: unset, the plain file.
+    // Control: unset, the plain file.
     env.claude_custom_oauth = false;
     assert_eq!(stats(&env), (main, Value::from("pro")));
 }
 
-/// `accounts stats` labels a home by its ROSTER ROW where the home is
-/// enrolled (design §3.1), the same name `accounts` lists the login by: the
-/// row whose `dir` names the home a set `CLAUDE_CONFIG_DIR` resolved to,
-/// however a trailing `/` spells it, once a login was made there; the row
-/// with no `dir` for the default home. CONTROL: no roster, a refused one, a
-/// row naming another directory, and a row whose directory holds no login
-/// yet each leave `home-<key6>` (`home` with no key), and the default home
-/// with no row is `main`.
+/// `accounts stats` labels an enrolled home by its roster row, the name `accounts` lists the
+/// login by: the row whose `dir` names the home a set `CLAUDE_CONFIG_DIR` resolved to (with or
+/// without a trailing `/`) once a login was made there, or the row with no `dir` for the default
+/// home. Control: no roster, a refused one, a row naming another directory, and a row whose
+/// directory holds no login yet each leave `home-<key6>` (`home` with no key), and the default
+/// home with no row is `main`.
 #[test]
 fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     let tmp = tmp_dir("stats-roster");
@@ -6094,7 +6139,7 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     let env = stats_env(&tmp, work.clone(), work.join(".claude.json"));
     let path = env.accounts_roster().expect("a config dir");
 
-    // CONTROL: no roster, the home by its key.
+    // Control: no roster, the home by its key.
     assert_eq!(label(&env), keyed);
 
     std::fs::write(&path, roster(&[("work", Some(work.as_path()))])).expect("write");
@@ -6108,7 +6153,7 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     std::fs::write(&path, roster(&[("work", Some(slashed.as_path()))])).expect("write");
     assert_eq!(label(&env), Value::from("work"), "one home however spelled");
 
-    // CONTROL: a row naming another directory; a refused roster.
+    // Control: a row naming another directory; a refused roster.
     std::fs::write(&path, roster(&[("fresh", Some(fresh.as_path()))])).expect("write");
     assert_eq!(label(&env), keyed);
     // The admitted `work` row with its class taken out: refused whole, so it
@@ -6118,7 +6163,7 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     std::fs::write(&path, &refused).expect("write");
     assert_eq!(label(&env), keyed, "a refused roster lists no row");
 
-    // CONTROL: the row's directory holds no login yet: not enrolled.
+    // Control: the row's directory holds no login yet: not enrolled.
     let env = stats_env(&tmp, fresh.clone(), fresh.join(".claude.json"));
     std::fs::write(&path, roster(&[("fresh", Some(fresh.as_path()))])).expect("write");
     assert_eq!(label(&env), Value::from("home"));
@@ -6136,10 +6181,9 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     assert_eq!(label(&env), Value::from("main"));
 }
 
-/// A home that could not be resolved — a relative `CLAUDE_CONFIG_DIR` with
-/// no `CLAUDE_PID`, or no absolute `HOME` ([`claude_profile_of`]: `None`) —
-/// is `no-home` in both forms: no file was looked for, so it is not the
-/// `no-profile` of a home whose file is missing. CONTROL: a home that
+/// A home that could not be resolved (a relative `CLAUDE_CONFIG_DIR` with no `CLAUDE_PID`, or no
+/// absolute `HOME`: [`claude_profile_of`] is `None`) is `no-home` in both forms, since no file was
+/// looked for, never the `no-profile` of a home whose file is missing. Control: a home that
 /// resolved, its file missing, is `no-profile`.
 #[test]
 fn accounts_stats_names_a_home_it_could_not_resolve() {
@@ -6158,18 +6202,835 @@ fn accounts_stats_names_a_home_it_could_not_resolve() {
     assert_eq!(doc["missing"][0]["reason"], Value::from("no-home"));
     let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
     assert!(
-        text.contains("home \u{b7} claude \u{b7} plan \u{2014} (no-home)\n"),
+        text.contains(
+            "home \u{b7} claude \u{b7} plan \u{2014} (no-home) \u{b7} credits \u{2014}\n"
+        ),
         "{text}"
     );
 
-    // CONTROL: resolved, and no file there.
+    // Control: resolved, and no file there.
     let other = tmp.path().join("srv-claude-c");
     let env = stats_env(&tmp, other.clone(), other.join(".claude.json"));
     let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
     assert!(
-        text.contains("home \u{b7} claude \u{b7} plan \u{2014} (no-profile)\n"),
+        text.contains(
+            "home \u{b7} claude \u{b7} plan \u{2014} (no-profile) \u{b7} credits \u{2014}\n"
+        ),
         "{text}"
     );
+}
+
+/// `accounts stats` SHOWS THE ACCOUNT'S RECORD ON THIS MACHINE (the
+/// account-stats design §3, §7.2; slice A1): a usage-tap reading recorded
+/// through the store as the host records it — 42.5% of the five-hour window
+/// under its reset, the week at 71% — is the account's block: `used_pct_x10:
+/// 425`, the reset the vendor named, `source: tap`, `by` this machine's kept
+/// id, which `machine.id` names too and a second run names again; the Claude
+/// Code running on this home is counted and one on another home is not.
+/// After the window's reset the figure is `void`. A refill (100%, then 5%
+/// from the same process served since, under the same reset) shows 5% and
+/// leaves ONE `reset` row in the ledger. NEGATIVE CONTROL: on a machine
+/// whose tap is off and that recorded nothing, every empty figure names its
+/// reason.
+#[test]
+fn accounts_stats_shows_the_accounts_record_on_this_machine() {
+    use super::accounts::{TapRead, WindowRead};
+    let tmp = tmp_dir("stats-record");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
+    let mut env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+    std::fs::write(
+        env.config.as_ref().expect("a config"),
+        "[harness]\nusage_tap = true\n",
+    )
+    .expect("config");
+    let five_end = env.now + 85 * 60;
+    let read = |five: u32, refilled: Option<u32>, at: i64| TapRead {
+        five_hour: Some(WindowRead {
+            pct_x10: five,
+            reset: five_end,
+            refilled,
+        }),
+        seven_day: Some(WindowRead {
+            pct_x10: 710,
+            reset: env.now + 3 * 86_400,
+            refilled: None,
+        }),
+        at,
+        seen_before: true,
+        born: None,
+        key: super::profile::AccountKey::claude(STATS_UUID),
+    };
+    let record = |env: &Env, r: TapRead| {
+        let mut note = None;
+        env.accounts_store()
+            .transact(env.now, &mut note, |state| {
+                Ok(accounts::note_reading(
+                    state,
+                    ACCOUNTS_OWN_LABEL,
+                    &r,
+                    env.now,
+                ))
+            })
+            .expect("recorded");
+    };
+    record(&env, read(425, None, env.now - 60));
+    env.claude_running = Some(Ok(disk::discover::Running {
+        claudes: [
+            Some(home.join(".claude.json")),
+            Some(tmp.path().join("b/.claude.json")),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, profile)| disk::discover::RunningClaude {
+            pid: 100 + u32::try_from(i).expect("small"),
+            started: None,
+            cwd: None,
+            profile,
+            stored_login: true,
+        })
+        .collect(),
+        dirs: Vec::new(),
+    }));
+    let stats = |env: &Env| -> Value {
+        let (code, out, err) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        assert_eq!(code, format!("{:?}", ExitCode::SUCCESS), "{err}");
+        aterm_json::from_str(out.trim()).expect("one JSON document")
+    };
+    let doc = stats(&env);
+    let kept = std::fs::read_to_string(env.accounts_store().machine_file()).expect("kept");
+    let id = Value::from(kept.trim().to_owned());
+    assert_eq!(doc["machine"]["id"], id);
+    let account = &doc["accounts"][0];
+    assert_eq!(account["label"], Value::from("main"));
+    let five = &account["windows"][0];
+    assert_eq!(five["id"], Value::from("five_hour"));
+    assert_eq!(five["used_pct_x10"], Value::from(425u64));
+    assert_eq!(five["resets_at"], Value::from(five_end));
+    assert_eq!(five["source"], Value::from("tap"));
+    assert_eq!(five["by"], id);
+    assert_eq!(five["as_of"], Value::from(env.now - 60));
+    assert_eq!(five["state"], Value::from("current"));
+    assert_eq!(account["windows"][1]["used_pct_x10"], Value::from(710u64));
+    assert_eq!(account["used_by"][0]["sessions"], Value::from(1u64));
+    assert_eq!(
+        stats(&env)["machine"]["id"],
+        id,
+        "the same machine, run again"
+    );
+    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+    assert!(
+        text.contains("  5h     42.5% used \u{b7} 57.5% left \u{b7} resets 01:25 (in 1h25m)   as of 1m (tap, here)\n"),
+        "{text}"
+    );
+    assert!(text.contains("  used   here (1 session)\n"), "{text}");
+    // The account's report says the same figure, by the same view.
+    let (_, report, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert!(report.contains("session 42.5% until"), "{report}");
+
+    // After the reset: void.
+    let mut after = env.clone();
+    after.now = five_end + 60;
+    let five = &stats(&after)["accounts"][0]["windows"][0];
+    assert_eq!(five["state"], Value::from("void"), "{five}");
+    assert_eq!(five["missing"]["reason"], Value::from("window-reset"));
+
+    // A refill under one reset: 5%, and one `reset` row.
+    record(&env, read(1000, None, env.now - 30));
+    record(&env, read(50, Some(1000), env.now));
+    let five = &stats(&env)["accounts"][0]["windows"][0];
+    assert_eq!(five["used_pct_x10"], Value::from(50u64), "{five}");
+    let resets = env
+        .accounts_store()
+        .tail(64)
+        .expect("the ledger")
+        .iter()
+        .filter(|e| e.kind == accounts::Kind::Reset)
+        .count();
+    assert_eq!(resets, 1);
+
+    // NEGATIVE CONTROL: the tap off, nothing recorded.
+    let quiet = tmp_dir("stats-record-off");
+    let qhome = quiet.path().join("home");
+    std::fs::create_dir_all(&qhome).expect("home");
+    std::fs::write(qhome.join(".claude.json"), stats_profile()).expect("profile");
+    let off = stats_env(&quiet, qhome.join(".claude"), qhome.join(".claude.json"));
+    let doc = stats(&off);
+    let windows = &doc["accounts"][0]["windows"];
+    for (i, reason) in [
+        (0, "usage-tap-off"),
+        (1, "usage-tap-off"),
+        (2, "no-usage-seen"),
+    ] {
+        assert_eq!(
+            windows[i]["missing"]["reason"],
+            Value::from(reason),
+            "{windows}"
+        );
+    }
+}
+
+/// Account B's id, beside [`STATS_UUID`]'s A (invented).
+const STATS_OTHER: &str = "7d1e4a90-5b2c-4f3e-8a6d-0c9b8e7f6a5d";
+
+/// `aterm harness accounts` SHOWS NO FIGURE OF ANOTHER ACCOUNT under the one
+/// the default home's profile names, as `accounts stats` shows none (the
+/// account-stats design §3.1): A was walled at 100% on the five hours with
+/// the week at 80%, then B signed in to the home and nothing of B was read.
+/// With no roster or one listed row, no observation of A is shown under B:
+/// samples, walls, offers, auth, credits and warnings are unread in both
+/// renderings, as are the condition and next-account advice derived from
+/// them. The report never rewrites the stored observations. Same-key A,
+/// an unkeyed legacy record, and several-logins label inventory retain them.
+#[test]
+fn the_accounts_report_shows_no_figure_of_another_account() {
+    use super::accounts::{TapRead, WindowRead};
+    let tmp = tmp_dir("accounts-other-key");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+    std::fs::write(
+        env.config.as_ref().expect("a config"),
+        "[harness]\nusage_tap = true\n",
+    )
+    .expect("config");
+    let reset = env.now + 3_600;
+    let mut note = None;
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            let mut events = accounts::note_reading(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                &TapRead {
+                    five_hour: Some(WindowRead {
+                        pct_x10: 1000,
+                        reset,
+                        refilled: None,
+                    }),
+                    seven_day: Some(WindowRead {
+                        pct_x10: 800,
+                        reset: env.now + 86_400,
+                        refilled: None,
+                    }),
+                    at: env.now - 60,
+                    seen_before: true,
+                    born: None,
+                    key: super::profile::AccountKey::claude(STATS_UUID),
+                },
+                env.now,
+            );
+            events.extend(accounts::note_wall(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                accounts::SESSION_LIMIT,
+                Some(reset),
+                env.now,
+                env.now,
+            ));
+            events.extend(accounts::note_auth(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                Auth::Ok,
+                env.now,
+            ));
+            assert!(accounts::note_offer(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                None,
+                2,
+                Some(reset),
+                env.now,
+                env.now,
+            ));
+            let account = state
+                .accounts
+                .get_mut(ACCOUNTS_OWN_LABEL)
+                .expect("account A");
+            account.credits = Some(accounts::Credits::InUse(accounts::CreditsUse {
+                since: env.now - 60,
+                seen: env.now,
+                until: Some(reset),
+                told: false,
+            }));
+            account.warned_week = Some(accounts::WindowSaid {
+                pct: Some(80),
+                reset: Some(env.now + 86_400),
+                at: env.now,
+            });
+            Ok(events)
+        })
+        .expect("a transaction");
+    let signed_in = |uuid: &str| {
+        let profile = stats_profile().replace(STATS_UUID, uuid);
+        std::fs::write(home.join(".claude.json"), profile).expect("profile");
+    };
+    let report = |env: &Env| {
+        let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, env);
+        assert_eq!(code, exit(0), "{err}");
+        let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, env);
+        let doc: Value = aterm_json::from_str(json.trim()).expect("one JSON document");
+        let (_, stats, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let stats: Value = aterm_json::from_str(stats.trim()).expect("one JSON document");
+        (
+            out,
+            doc["accounts"][0].clone(),
+            stats["accounts"][0].clone(),
+            doc["next"].clone(),
+        )
+    };
+    let b = super::profile::AccountKey::claude(STATS_OTHER).expect("a key");
+    let absent = |row: &Value| {
+        for field in [
+            "session_pct",
+            "session_reset",
+            "session_reset_rfc3339",
+            "week_pct",
+            "week_reset",
+            "week_reset_rfc3339",
+            "sampled_at",
+            "sampled_at_rfc3339",
+            "limited_until",
+            "limited_until_rfc3339",
+            "auth_at",
+            "auth_at_rfc3339",
+            "offer",
+        ] {
+            assert_eq!(row[field], Value::Null, "{field}: {row}");
+        }
+        assert_eq!(row["condition"], Value::from("unseen"), "{row}");
+        assert_eq!(row["auth"], Value::from("unseen"), "{row}");
+        assert!(row["walls"].as_object().expect("walls").is_empty(), "{row}");
+    };
+    let observed = |row: &Value| {
+        assert_eq!(row["session_pct"], Value::from(100u64), "{row}");
+        assert_eq!(row["week_pct"], Value::from(80u64), "{row}");
+        // The tap's compatibility sample is stamped when it is recorded;
+        // the wall's actionable end includes the public reset grace.
+        assert_eq!(row["sampled_at"], Value::from(env.now), "{row}");
+        assert_eq!(row["condition"], Value::from("limited"), "{row}");
+        assert_eq!(
+            row["limited_until"],
+            Value::from(reset + accounts::RESET_GRACE_S),
+            "{row}"
+        );
+        assert_eq!(row["auth"], Value::from("ok"), "{row}");
+        assert_eq!(row["auth_at"], Value::from(env.now), "{row}");
+        assert_eq!(row["offer"]["left"], Value::from(2u64), "{row}");
+        assert_eq!(
+            row["walls"][accounts::SESSION_LIMIT]["until"],
+            Value::from(reset),
+            "{row}"
+        );
+        assert_eq!(row["windows"][0]["used_pct"], Value::from(100u64), "{row}");
+    };
+    let listed_words = |out: &str| {
+        for words in [
+            "limited until",
+            "offer: 2 left",
+            "credits: in use since",
+            "warned: weekly 80%",
+        ] {
+            assert!(out.contains(words), "missing {words}: {out}");
+        }
+    };
+    let roster = env.accounts_roster().expect("roster");
+    let own = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n";
+    let stored = std::fs::read(env.accounts_store().state_file()).expect("state before reports");
+    for listed in [false, true] {
+        if listed {
+            std::fs::write(&roster, own).expect("one listed row");
+        }
+        signed_in(STATS_OTHER);
+        let (out, row, stats, next) = report(&env);
+        if !listed {
+            assert!(
+                out.contains("this login (main): nothing read of it by the usage tap yet"),
+                "{out}"
+            );
+        }
+        for words in ["100%", "limited until", "offer:", "credits:", "warned:"] {
+            assert!(!out.contains(words), "old account's {words}: {out}");
+        }
+        assert_eq!(row["key"], Value::from(b.to_string()));
+        assert_eq!(stats["key"], row["key"]);
+        assert_eq!(next["wait_until"], Value::Null, "{next}");
+        absent(&row);
+        for i in 0..2 {
+            assert_eq!(row["windows"][i]["used_pct"], Value::Null, "{row}");
+            assert_eq!(
+                row["windows"][i]["missing"]["reason"],
+                Value::from("no-reading")
+            );
+            assert_eq!(row["windows"][i], stats["windows"][i]);
+        }
+        // Same-key positive control for every admitted observation.
+        signed_in(STATS_UUID);
+        let (out, row, stats, next) = report(&env);
+        observed(&row);
+        assert_eq!(
+            next["wait_until"],
+            Value::from(reset + accounts::RESET_GRACE_S),
+            "{next}"
+        );
+        assert_eq!(row["windows"][0], stats["windows"][0]);
+        if listed {
+            listed_words(&out);
+        } else {
+            assert!(out.contains("session 100% until"), "{out}");
+        }
+    }
+    assert_eq!(
+        std::fs::read(env.accounts_store().state_file()).expect("state after reports"),
+        stored
+    );
+
+    // Unkeyed legacy records remain compatible with the observed home key.
+    let mut note = None;
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            state
+                .accounts
+                .get_mut(ACCOUNTS_OWN_LABEL)
+                .expect("account")
+                .key = None;
+            Ok(Vec::new())
+        })
+        .expect("legacy record");
+    signed_in(STATS_OTHER);
+    let (out, row, _, _) = report(&env);
+    observed(&row);
+    listed_words(&out);
+    assert_eq!(row["key"], Value::from(b.to_string()));
+
+    // Several logins retain keyed A's label inventory, not B's identity.
+    let a = super::profile::AccountKey::claude(STATS_UUID).expect("a key");
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            state
+                .accounts
+                .get_mut(ACCOUNTS_OWN_LABEL)
+                .expect("account")
+                .key = Some(a);
+            Ok(Vec::new())
+        })
+        .expect("keyed record");
+    std::fs::write(
+        &roster,
+        format!(
+            "{own}\n[[account]]\nlabel = \"work\"\nclass = \"shared\"\ndir = '{}'\n",
+            tmp.path().join("other-login").display()
+        ),
+    )
+    .expect("several rows");
+    let stored = std::fs::read(env.accounts_store().state_file()).expect("keyed state");
+    let (out, row, _, _) = report(&env);
+    observed(&row);
+    listed_words(&out);
+    assert_eq!(row["key"], Value::from(a.to_string()));
+    assert_eq!(
+        std::fs::read(env.accounts_store().state_file()).expect("state after inventory"),
+        stored
+    );
+
+    // The stats login word also admits account-derived auth, while the
+    // label's binding still supplies its service stamp and renewal forecast.
+    let store = env.accounts_store();
+    store
+        .transact(env.now, &mut note, |state| {
+            Ok(accounts::note_auth(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                Auth::SignedOut,
+                env.now,
+            ))
+        })
+        .expect("A signed out");
+    let ends = env.now + 7 * 86_400;
+    let mut logins = accounts::Logins::default();
+    logins.labels.insert(
+        ACCOUNTS_OWN_LABEL.to_owned(),
+        accounts::Binding {
+            notice_end: Some(ends),
+            served_at: Some(env.now),
+            ..accounts::Binding::default()
+        },
+    );
+    store.save_logins(&logins).expect("binding");
+    let bindings = std::fs::read(store.logins_file()).expect("bindings before stats");
+    for several in [false, true] {
+        let mut rows = format!("{own}email = 'invented@example.invalid'\n");
+        if several {
+            rows.push_str(&format!(
+                "\n[[account]]\nlabel = 'work'\nclass = 'shared'\ndir = '{}'\n",
+                tmp.path().join("other-login").display()
+            ));
+        }
+        std::fs::write(&roster, rows).expect("email roster");
+        for (held, observed, expected) in [
+            (Some(a), STATS_OTHER, "ok"),
+            (Some(a), STATS_UUID, "expired"),
+            (None, STATS_OTHER, "expired"),
+        ] {
+            store
+                .transact(env.now, &mut note, |state| {
+                    state
+                        .accounts
+                        .get_mut(ACCOUNTS_OWN_LABEL)
+                        .expect("account")
+                        .key = held;
+                    Ok(Vec::new())
+                })
+                .expect("held identity");
+            signed_in(observed);
+            let stored = std::fs::read(store.state_file()).expect("state before stats");
+            let (code, json, err) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+            assert_eq!(code, exit(0), "{err}");
+            let doc: Value = aterm_json::from_str(json.trim()).expect("stats JSON");
+            let row = &doc["accounts"][0];
+            assert_eq!(row["login"][0]["state"], Value::from(expected), "{doc}");
+            assert_eq!(
+                row["login"][0]["renew_by"],
+                Value::from(ends - accounts::DUE_S),
+                "{doc}"
+            );
+            if held == Some(a) && observed == STATS_OTHER {
+                assert_eq!(row["key"], Value::from(b.to_string()), "{doc}");
+                assert_eq!(
+                    row["spend"]["attribution"],
+                    Value::from("unattributed"),
+                    "{doc}"
+                );
+            }
+            let (code, text, err) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+            assert_eq!(code, exit(0), "{err}");
+            assert!(
+                text.contains(&format!("login: here {expected}, renew by ")),
+                "{text}"
+            );
+            assert_eq!(
+                std::fs::read(store.state_file()).expect("state after stats"),
+                stored
+            );
+            assert_eq!(
+                std::fs::read(store.logins_file()).expect("bindings after stats"),
+                bindings
+            );
+        }
+    }
+}
+
+/// A WINDOW THE USAGE TAP NEVER RECORDS SAYS SO (`tap-not-this-home`, the
+/// host's own rule `accounts::tap_roster`): under a roster that does not
+/// admit, no tap reading is recorded for the default home, so its empty
+/// windows say the tap does not record it — never `no-reading`, which
+/// promises one — in `accounts stats` and in `accounts --json`'s rows.
+/// NEGATIVE CONTROLS: no roster, a roster of one row, and one of two (each
+/// process's reading is the account it is judged on) are `no-reading`.
+#[test]
+fn a_window_the_tap_never_records_says_so() {
+    let tmp = tmp_dir("stats-tap-roster");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
+    let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+    std::fs::write(
+        env.config.as_ref().expect("a config"),
+        "[harness]\nusage_tap = true\n",
+    )
+    .expect("config");
+    let roster = env.accounts_roster().expect("a roster path");
+    let reason = |env: &Env| {
+        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+        doc["accounts"][0]["windows"][0]["missing"]["reason"].clone()
+    };
+    assert_eq!(reason(&env), Value::from("no-reading"), "no roster");
+    let one = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n";
+    std::fs::write(&roster, one).expect("roster");
+    assert_eq!(reason(&env), Value::from("no-reading"), "one row");
+    let two = format!(
+        "{one}\n[[account]]\nlabel = \"work\"\nclass = \"shared\"\ndir = \"/logins/work\"\n"
+    );
+    std::fs::write(&roster, &two).expect("roster");
+    assert_eq!(reason(&env), Value::from("no-reading"), "two rows");
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+    assert_eq!(
+        doc["accounts"][0]["windows"][0]["missing"]["reason"],
+        Value::from("no-reading"),
+        "{doc}"
+    );
+    let refused = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+                   [[account]]\nlabel = \"main\"\nclass = \"shared\"\ndir = \"/logins/x\"\n";
+    std::fs::write(&roster, refused).expect("roster");
+    assert_eq!(reason(&env), Value::from("tap-not-this-home"), "refused");
+    // A roster with no row for the default login: the host records none of
+    // the default home's readings (no label they are judged on).
+    let work = tmp.path().join("logins").join("work");
+    std::fs::create_dir_all(&work).expect("work");
+    std::fs::write(work.join(".claude.json"), stats_profile()).expect("its login");
+    let work_row = format!(
+        "[[account]]\nlabel = \"work\"\nclass = \"shared\"\ndir = '{}'\n",
+        work.display()
+    );
+    std::fs::write(&roster, &work_row).expect("roster");
+    assert_eq!(
+        reason(&env),
+        Value::from("tap-not-this-home"),
+        "no row for the default login"
+    );
+    // The home of a listed login: the host records its row's readings, of
+    // its sessions on the default home — `no-reading`, as `accounts --json`
+    // says of that row.
+    std::fs::write(&roster, format!("{one}\n{work_row}")).expect("roster");
+    let at_work = stats_env(&tmp, work.clone(), work.join(".claude.json"));
+    let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &at_work);
+    let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+    assert_eq!(doc["accounts"][0]["label"], Value::from("work"), "{doc}");
+    assert_eq!(
+        reason(&at_work),
+        Value::from("no-reading"),
+        "a listed login"
+    );
+    let (_, out, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+    assert_eq!(
+        doc["accounts"][1]["windows"][0]["missing"]["reason"],
+        Value::from("no-reading"),
+        "{doc}"
+    );
+}
+
+/// The account's record as the host records a usage tap's reading under
+/// `label` in `env`'s store: the five hours at 100% (walled) under `reset`
+/// and the week at 80%, keyed `key`.
+fn walled_record(env: &Env, label: &str, reset: i64, key: Option<super::profile::AccountKey>) {
+    use super::accounts::{TapRead, WindowRead};
+    let mut note = None;
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            let mut events = accounts::note_reading(
+                state,
+                label,
+                &TapRead {
+                    five_hour: Some(WindowRead {
+                        pct_x10: 1000,
+                        reset,
+                        refilled: None,
+                    }),
+                    seven_day: Some(WindowRead {
+                        pct_x10: 800,
+                        reset: env.now + 86_400,
+                        refilled: None,
+                    }),
+                    at: env.now - 60,
+                    seen_before: true,
+                    born: None,
+                    key,
+                },
+                env.now,
+            );
+            events.extend(accounts::note_wall(
+                state,
+                label,
+                accounts::SESSION_LIMIT,
+                Some(reset),
+                env.now,
+                env.now,
+            ));
+            Ok(events)
+        })
+        .expect("a transaction");
+}
+
+/// A ROSTER OF SEVERAL ACCOUNTS KEEPS ITS LABEL-SCOPED RECORDS, while
+/// `accounts stats` follows the profile's observed identity. `own`'s record
+/// holds A at 100%/80%, and the profile and cached usage name B at 20%/30%:
+/// the report retains A's row, but stats names B and takes only B's cache.
+/// The label remains the home's alias, its spend is unattributed, and its
+/// sessions are not counted for one label. Same-key A is the positive
+/// control. Under one roster row, the report too withholds A's legacy
+/// sample and windows when the profile names B; stats still has B's cache.
+#[test]
+fn under_several_accounts_the_default_homes_profile_keys_no_row() {
+    let tmp = tmp_dir("stats-several");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+    std::fs::write(
+        env.config.as_ref().expect("a config"),
+        "[harness]\nusage_tap = true\n",
+    )
+    .expect("config");
+    let roster = env.accounts_roster().expect("a roster path");
+    let own = "[[account]]\nlabel = \"own\"\nclass = \"dedicated\"\n";
+    std::fs::write(
+        &roster,
+        format!(
+            "{own}\n[[account]]\nlabel = \"work\"\nclass = \"shared\"\ndir = \"/logins/work\"\n"
+        ),
+    )
+    .expect("roster");
+    let a = super::profile::AccountKey::claude(STATS_UUID).expect("a key");
+    let b = super::profile::AccountKey::claude(STATS_OTHER).expect("a key");
+    walled_record(&env, "own", env.now + 3_600, Some(a));
+    let signed_in = |uuid: &str| {
+        let mut profile: Value =
+            aterm_json::from_str(&stats_profile().replace(STATS_UUID, uuid)).expect("profile");
+        profile.as_object_mut().expect("profile object").insert(
+            "cachedUsageUtilization".to_owned(),
+            aterm_json::json!({
+                "fetchedAtMs": env.now * 1000,
+                "accountUuid": uuid,
+                "utilization": {
+                    "five_hour": {"utilization": 20.0, "resets_at": rfc3339_utc(env.now + 3_600)},
+                    "seven_day": {"utilization": 30.0, "resets_at": rfc3339_utc(env.now + 86_400)}
+                }
+            }),
+        );
+        std::fs::write(home.join(".claude.json"), profile.to_string()).expect("profile");
+    };
+    signed_in(STATS_OTHER);
+    let docs = |env: &Env| {
+        let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, env);
+        let report: Value = aterm_json::from_str(json.trim()).expect("one JSON document");
+        let (_, stats, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let stats: Value = aterm_json::from_str(stats.trim()).expect("one JSON document");
+        (report, stats)
+    };
+    let (report, stats) = docs(&env);
+    let row = &report["accounts"][0];
+    assert_eq!(row["label"], Value::from("own"));
+    assert_eq!(row["key"], Value::from(a.to_string()), "{row}");
+    assert_eq!(row["windows"][0]["used_pct"], Value::from(100u64), "{row}");
+    let work = &report["accounts"][1];
+    assert_eq!(work["label"], Value::from("work"));
+    assert_eq!(work["key"], Value::Null, "{work}");
+    let account = &stats["accounts"][0];
+    assert_eq!(account["label"], Value::from("own"));
+    assert_eq!(account["key"], Value::from(b.to_string()), "{account}");
+    assert_eq!(
+        account["windows"][0]["used_pct"],
+        Value::from(20u64),
+        "{account}"
+    );
+    assert_eq!(
+        account["windows"][1]["used_pct"],
+        Value::from(30u64),
+        "{account}"
+    );
+    assert_eq!(account["windows"][0]["source"], Value::from("usage-cache"));
+    assert_eq!(
+        account["spend"]["attribution"],
+        Value::from("unattributed"),
+        "{account}"
+    );
+    let missing = stats["missing"].as_array().expect("a list");
+    assert!(
+        missing
+            .iter()
+            .any(|m| m["what"] == Value::from("used_by")
+                && m["reason"] == Value::from("several-logins")),
+        "{missing:?}"
+    );
+    // Same-key positive control: A's held wall stands over its own lower cache.
+    signed_in(STATS_UUID);
+    let (_, stats) = docs(&env);
+    let account = &stats["accounts"][0];
+    assert_eq!(account["key"], Value::from(a.to_string()), "{account}");
+    assert_eq!(
+        account["windows"][0]["used_pct"],
+        Value::from(100u64),
+        "{account}"
+    );
+    assert_eq!(account["windows"][0]["source"], Value::from("wall"));
+
+    // NEGATIVE CONTROL: a roster of one row, with B observed again.
+    signed_in(STATS_OTHER);
+    std::fs::write(&roster, own).expect("roster");
+    let (report, stats) = docs(&env);
+    let row = &report["accounts"][0];
+    assert_eq!(row["key"], Value::from(b.to_string()), "{row}");
+    assert_eq!(row["session_pct"], Value::Null, "{row}");
+    assert_eq!(row["week_pct"], Value::Null, "{row}");
+    assert_eq!(
+        row["windows"][0]["missing"]["reason"],
+        Value::from("no-reading"),
+        "{row}"
+    );
+    assert_eq!(
+        stats["accounts"][0]["windows"][0]["used_pct"],
+        Value::from(20u64)
+    );
+}
+
+/// A CLAUDE CODE ON NO STORED LOGIN SUPPRESSES THE CAPACITY (the
+/// account-stats design §3.6, `api-key-seen`): a process the census finds
+/// running on the home with an API key of its own spends into the home's
+/// transcripts, so no window's capacity is claimed from them. NEGATIVE
+/// CONTROL: every Claude Code on its stored login claims one as before
+/// (here `low`: the home spent nothing).
+#[test]
+fn a_claude_code_on_no_stored_login_suppresses_the_capacity() {
+    let tmp = tmp_dir("stats-api-key");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
+    let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+    walled_record(&env, ACCOUNTS_OWN_LABEL, env.now + 3_600, None);
+    let suppressed = |env: &Env, stored_login: bool| {
+        let mut env = env.clone();
+        env.claude_running = Some(Ok(disk::discover::Running {
+            claudes: vec![disk::discover::RunningClaude {
+                pid: 100,
+                started: None,
+                cwd: None,
+                profile: Some(home.join(".claude.json")),
+                stored_login,
+            }],
+            dirs: Vec::new(),
+        }));
+        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+        let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
+        doc["accounts"][0]["spend"]["windows"][0]["suppressed"].clone()
+    };
+    assert_eq!(suppressed(&env, false), Value::from("api-key-seen"));
+    // NEGATIVE CONTROL.
+    assert_eq!(suppressed(&env, true), Value::from("low"));
+}
+
+/// AN UNKEYED RECORD'S ROW CARRIES THE KEY `accounts stats` NAMES (one
+/// view, one answer, design §7.2): a record an older build's tap wrote holds
+/// no key, and the default home's profile names A — `accounts --json`'s row
+/// and `accounts stats --json` both say A's key. NEGATIVE CONTROL: with no
+/// profile, neither names a key.
+#[test]
+fn an_unkeyed_records_row_carries_the_key_stats_names() {
+    let tmp = tmp_dir("stats-unkeyed");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+    walled_record(&env, ACCOUNTS_OWN_LABEL, env.now + 3_600, None);
+    let keys = |env: &Env| {
+        let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, env);
+        let report: Value = aterm_json::from_str(json.trim()).expect("one JSON document");
+        let (_, stats, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let stats: Value = aterm_json::from_str(stats.trim()).expect("one JSON document");
+        (
+            report["accounts"][0]["key"].clone(),
+            stats["accounts"][0]["key"].clone(),
+        )
+    };
+    // NEGATIVE CONTROL: no profile.
+    assert_eq!(keys(&env), (Value::Null, Value::Null));
+    std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
+    let a = Value::from(
+        super::profile::AccountKey::claude(STATS_UUID)
+            .expect("a key")
+            .to_string(),
+    );
+    assert_eq!(keys(&env), (a.clone(), a));
 }
 
 #[path = "cli_renew_tests.rs"]
@@ -6311,31 +7172,38 @@ fn a_compressed_reserve_folder_is_refused_and_journalled_once() {
 /// it was taken on: a gone workspace's names its idle time and the sweep's
 /// window (a day while the volume is only low, not a fixed ten minutes); one
 /// taken for a month unwritten names that and never says its workspace was
-/// removed; an earlier sweep's half-removed stage says so. The intent row and
-/// the removal row carry the same words.
+/// removed; an earlier sweep's half-removed stage says so; what went from a
+/// build directory that stays names its counts and window. The intent row and
+/// the removal row carry the same words, the reason's own
+/// ([`disk::sweep_words`]).
 #[test]
 fn the_sweep_rows_say_why_each_build_cache_went() {
-    use atpkg::build_cache::{RECLAIM_GONE, Unused};
+    use atpkg::build_cache::{RECLAIM_GONE, RECLAIM_STALE, Unused};
     let tmp = tmp_dir("sweep-why");
     let state = tmp.path().join("state");
     let path = Path::new("/c/ws/.cargo-build");
-    let cases = [
+    let cases: [(Unused, &[&str]); 4] = [
         (
             Unused::Gone {
                 idle: std::time::Duration::from_secs(26 * 3_600),
                 after: RECLAIM_GONE,
             },
-            "its workspace is gone, and nothing wrote it for 26h (the sweep takes one unwritten 24h)",
+            &["26h", "24h"],
         ),
         (
             Unused::Idle {
                 idle: std::time::Duration::from_secs(31 * 86_400),
             },
-            "nothing wrote it for 31d, a month or more, whatever its workspace's state",
+            &["31d"],
         ),
+        (Unused::Unfinished, &[]),
         (
-            Unused::Unfinished,
-            "an earlier sweep renamed it aside and did not finish removing it",
+            Unused::Stale {
+                incremental: 2,
+                units: 5,
+                after: RECLAIM_STALE,
+            },
+            &["2 incremental", "5 unit", "3d"],
         ),
     ];
     for (why, _) in cases {
@@ -6347,16 +7215,22 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
         .lines()
         .map(|l| aterm_json::from_str(l).expect("a row"))
         .collect();
-    assert_eq!(rows.len(), 6);
-    for (pair, (_, words)) in rows.chunks(2).zip(cases) {
+    assert_eq!(rows.len(), 2 * cases.len());
+    for (pair, (why, figures)) in rows.chunks(2).zip(cases) {
         let actions: Vec<&str> = pair
             .iter()
             .map(|r| r["action"].as_str().unwrap_or(""))
             .collect();
         assert_eq!(actions, ["removing", "removed"]);
+        let words = disk::sweep_words(why);
+        let part = matches!(why, Unused::Stale { .. });
         for r in pair {
             let text = r["text"].as_str().unwrap_or_default();
-            assert!(text.contains(words), "{text}");
+            assert!(text.contains(&words), "{why:?}: {text}");
+            assert_eq!(text.contains("whole"), !part, "{why:?}: {text}");
+            for figure in figures {
+                assert!(text.contains(figure), "{why:?} names {figure}: {text}");
+            }
             assert!(!text.contains("ten minutes"), "{text}");
         }
     }

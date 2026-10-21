@@ -7,12 +7,9 @@
 
 use std::path::Path;
 
-use crate::support::{Lib, Scratch, bash, install_sh, q, s, sh, symlink, system_path};
+use aterm_spec::wait::{MUST_HAPPEN, PARKED_SECS, until_within};
 
-/// Long enough that a script's first exec, waiting on the system's code
-/// assessment on a loaded machine, still answers; short of the batch's hang
-/// detector.
-const ANSWER_SECS: u32 = 50;
+use crate::support::{Lib, Scratch, bash, install_sh, q, read, s, sh, symlink, system_path};
 
 const ATERM: &str = "#!/bin/sh\necho \"aterm 0.99.0\"\n";
 const OTHER: &str = "#!/bin/sh\necho \"other 1.0\"\n";
@@ -44,7 +41,6 @@ fn the_app_destination_verdict() {
     scratch.stand_in("own/impostor.app/Contents/MacOS/aterm", OTHER);
     symlink(&damaged, &linked);
     let mut lib = Lib::new();
-    lib.step(format!("VERSION_PROBE_SECS={ANSWER_SECS}"));
     let verdict =
         |lib: &mut Lib, app: &Path| lib.call(format!("app_dest_verdict {}", q(s(app))), &[]);
     let absent = verdict(&mut lib, &scratch.join("own/none.app"));
@@ -127,7 +123,6 @@ fn the_bin_entry_verdict() {
     );
     scratch.write("bin.unrunnable/aterm", "not executable\n");
     let mut lib = Lib::new();
-    lib.step(format!("VERSION_PROBE_SECS={ANSWER_SECS}"));
     let rows = [
         (&absent, "absent".to_string()),
         (&bundle, "ours".into()),
@@ -179,57 +174,266 @@ fn the_bin_entry_verdict() {
     }
 }
 
-/// The verdict runs a file the installer did not place: never on the
-/// installer's stdin (under `curl … | bash` that is the rest of the script),
-/// and cut off when it never exits — after 5 s in production.
+/// Reads its stdin to the end, then says it is not aterm.
+const READER: &str = "#!/bin/sh\ncat >/dev/null\necho \"not-aterm 1.0\"\n";
+
+/// Says `$STALL_ANSWER`; then, unless its first argument is `$STALL_FINISHES`,
+/// parks a child (a second process: a kill of the staller's pid alone leaves it),
+/// writes its own pid and the child's to `$STALL_PARKED` (the line that shows it
+/// ran) and waits on it: a run that outlasts the hang detector unless something
+/// ends it.
+fn staller() -> String {
+    format!(
+        "#!/bin/sh\necho \"${{STALL_ANSWER:?}}\"\n[ \"$1\" = \"${{STALL_FINISHES:-}}\" ] && exit 0\n\
+         sleep {PARKED_SECS} &\necho \"$$ $!\" >\"${{STALL_PARKED:?}}\"\nwait\n"
+    )
+}
+
+/// The batch's clock as a bound reads it: a look at a parked [`staller`] (`$!`, the
+/// run the bound watches, is the pid it wrote) costs the clock an hour and no real
+/// time, and is counted in `$STALL_PARKED.looks`; every other sleep is real. And
+/// `uname` says Darwin, where find_bundle_cli looks.
+const PARKED_CLOCK: &str = r#"sleep() {
+	local run watched
+	watched="$(set +u; printf %s "$!")"
+	if read -r run _ 2>/dev/null <"$STALL_PARKED" && [[ "$run" == "$watched" ]]; then
+		SECONDS=$((SECONDS + 3600))
+		echo look >>"$STALL_PARKED.looks"
+		return 0
+	fi
+	command sleep "$@"
+}
+uname() { echo Darwin; }"#;
+
+/// Every place the installer asks a binary what it is runs it off the
+/// installer's stdin: under `curl … | bash` that is the rest of the script.
 #[test]
-fn a_foreign_binary_can_neither_swallow_nor_stall_the_installer() {
+fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
     let scratch = Scratch::new();
     let store = scratch.mkdir("store");
-    let reader = scratch.stand_in(
-        "reader/aterm",
-        "#!/bin/sh\ncat >/dev/null\necho \"not-aterm 1.0\"\n",
-    );
-    let staller = scratch.stand_in("staller/aterm", "#!/bin/sh\nexec sleep 60\n");
-    let script = format!(
-        "printf 'echo LINE-AFTER-THE-PROBE\\n' | {bash} -c '
-			ATERM_INSTALL_LIBRARY_ONLY=1; . \"$1\" >/dev/null 2>&1
-			VERSION_PROBE_SECS={ANSWER_SECS}
-			printf \"verdict=%s\\n\" \"$(bin_aterm_verdict \"$2\" \"$3\")\"
-			while IFS= read -r line; do eval \"$line\"; done' _ {install} {reader} {store}",
-        bash = q(s(&bash())),
-        install = q(s(&install_sh())),
-        reader = q(s(&reader)),
-        store = q(s(&store)),
-    );
+    let tmp = scratch.mkdir("tmp");
     let home = scratch.mkdir("home");
-    let run = sh(&script, &[("PATH", system_path()), ("HOME", s(&home))]);
-    assert_eq!(
-        run.stdout,
-        "verdict=foreign not a symlink — a hand-built binary this installer did not place\nLINE-AFTER-THE-PROBE\n",
-        "{}",
-        run.stderr
-    );
+    let reader = scratch.stand_in("rd/aterm", READER);
+    let bundle = scratch.mkdir("rd/reader.app");
+    scratch.stand_in("rd/reader.app/Contents/MacOS/aterm", READER);
+    let dest = scratch.mkdir("rd/dest");
+    scratch.stand_in("rd/dest/aterm.app/Contents/MacOS/aterm", READER);
+    let apps = scratch.mkdir("rd/apps");
+    let answering = scratch.stand_in("rd/apps/aterm.app/Contents/MacOS/aterm", ATERM);
+    let bin = scratch.mkdir("rd/bin");
+    scratch.stand_in("rd/bin/aterm-ctl", READER);
+    let placed = scratch.mkdir("rd/store");
+    scratch.stand_in("rd/store/aterm", READER);
+    let none = scratch.mkdir("rd/none");
+    let cases: [(&str, &[&Path], String); 5] = [
+        (
+            "bin_aterm_verdict \"$2\" \"$3\"",
+            &[&reader, &store],
+            "foreign not a symlink — a hand-built binary this installer did not place".into(),
+        ),
+        (
+            "app_dest_verdict \"$2\"",
+            &[&bundle],
+            format!(
+                "foreign no readable CFBundleIdentifier and no binary that answers as aterm — if \
+                 it is a damaged aterm install, move it aside (mv '{0}' '{0}.broken') and re-run",
+                s(&bundle)
+            ),
+        ),
+        (
+            "DEST=\"$2\" ATERM_INSTALL_DIR=\"$3\" find_bundle_cli",
+            &[&dest, &apps],
+            s(&answering).into(),
+        ),
+        (
+            "BIN_DIR=\"$2\" STORE_DIR=\"$3\" retire_exposed_siblings; [[ -e \"$2/aterm-ctl\" ]] && echo kept",
+            &[&bin, &store],
+            "kept".into(),
+        ),
+        (
+            "setup_aterm self-uninstall \"$2\" \"$3\"",
+            &[&none, &placed],
+            String::new(),
+        ),
+    ];
+    for (call, args, said) in cases {
+        let args: Vec<String> = args.iter().map(|path| q(s(path))).collect();
+        let script = format!(
+            "printf 'echo LINE-AFTER-THE-PROBE\\n' | {bash} -c '
+			ATERM_INSTALL_LIBRARY_ONLY=1; . \"$1\" >/dev/null 2>&1
+			uname() {{ echo Darwin; }}
+			printf \"said=%s\\n\" \"$({call})\"
+			while IFS= read -r line; do eval \"$line\"; done' _ {install} {args}",
+            bash = q(s(&bash())),
+            install = q(s(&install_sh())),
+            args = args.join(" "),
+        );
+        let run = sh(
+            &script,
+            &[
+                ("PATH", system_path()),
+                ("HOME", s(&home)),
+                ("TMPDIR", s(&tmp)),
+            ],
+        );
+        assert_eq!(
+            run.stdout,
+            format!("said={said}\nLINE-AFTER-THE-PROBE\n"),
+            "{call}: {}",
+            run.stderr
+        );
+    }
+}
+
+/// Every place the installer asks a binary what it is cuts off a run that
+/// never finishes once the hang detector has passed on the clock, process
+/// group and all, and takes what it printed before as no answer; setup_aterm
+/// bounds its `pkg help <verb>` likewise.
+#[test]
+fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
+    let scratch = Scratch::new();
+    let store = scratch.mkdir("store");
+    let stall = staller();
+    let lone = scratch.stand_in("stall/aterm", &stall);
+    let damaged = scratch.mkdir("stall/damaged.app");
+    scratch.stand_in("stall/damaged.app/Contents/MacOS/aterm", &stall);
+    let dest = scratch.mkdir("stall/dest");
+    scratch.stand_in("stall/dest/aterm.app/Contents/MacOS/aterm", &stall);
+    let apps = scratch.mkdir("stall/apps");
+    let answering = scratch.stand_in("stall/apps/aterm.app/Contents/MacOS/aterm", ATERM);
+    let bin = scratch.mkdir("stall/bin");
+    scratch.stand_in("stall/bin/aterm-ctl", &stall);
+    let placed = scratch.mkdir("stall/store");
+    scratch.stand_in("stall/store/aterm", &stall);
+    let none = scratch.mkdir("stall/none");
+    // (the case, what the staller says first, the argument it finishes on, the call, what
+    // the call says)
+    let cases = [
+        (
+            "version",
+            "aterm 0.99.0",
+            "",
+            format!("bin_aterm_verdict {} {}", q(s(&lone)), q(s(&store))),
+            "foreign not a symlink — a hand-built binary this installer did not place".to_string(),
+        ),
+        (
+            "damaged",
+            "aterm 0.99.0",
+            "",
+            format!("app_dest_verdict {}", q(s(&damaged))),
+            format!(
+                "foreign no readable CFBundleIdentifier and no binary that answers as aterm — if \
+                 it is a damaged aterm install, move it aside (mv '{0}' '{0}.broken') and re-run",
+                s(&damaged)
+            ),
+        ),
+        (
+            "bundle",
+            "aterm 0.99.0",
+            "",
+            format!(
+                "DEST={} ATERM_INSTALL_DIR={} find_bundle_cli",
+                q(s(&dest)),
+                q(s(&apps))
+            ),
+            s(&answering).to_string(),
+        ),
+        (
+            "ctl",
+            "aterm-ctl 0.99.0",
+            "",
+            format!(
+                "BIN_DIR={0} STORE_DIR={1} retire_exposed_siblings; [[ -e {0}/aterm-ctl ]] && echo kept",
+                q(s(&bin)),
+                q(s(&store))
+            ),
+            "kept".to_string(),
+        ),
+        (
+            "verb",
+            "aterm 0.99.0",
+            "--version",
+            format!(
+                "setup_aterm self-uninstall {} {}",
+                q(s(&none)),
+                q(s(&placed))
+            ),
+            String::new(),
+        ),
+    ];
+    let parked = |name: &str| scratch.join(&format!("stall/{name}.parked"));
     let mut lib = Lib::new();
-    let production = lib.call(":", &["VERSION_PROBE_SECS"]);
-    lib.step("VERSION_PROBE_SECS=1");
-    let stalled = lib.call(
-        format!("bin_aterm_verdict {} {}", q(s(&staller)), q(s(&store))),
+    lib.step(PARKED_CLOCK);
+    let calls: Vec<usize> = cases
+        .iter()
+        .map(|(name, answer, finishes, call, _)| {
+            lib.step(format!(
+                "export STALL_PARKED={} STALL_ANSWER={} STALL_FINISHES={}",
+                q(s(&parked(name))),
+                q(answer),
+                q(finishes)
+            ));
+            lib.call(call.as_str(), &[])
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((name, _, _, call, want), at) in cases.iter().zip(calls) {
+        assert_eq!(
+            &recs[at].out, want,
+            "{call}: a run cut off answered nothing"
+        );
+        assert_eq!(
+            read(&scratch.join(&format!("stall/{name}.parked.looks")))
+                .lines()
+                .count(),
+            1,
+            "{call}: the bound reads the clock, so its first look past it is its last"
+        );
+        let ran = read(&parked(name));
+        let child: u32 = ran
+            .split_whitespace()
+            .nth(1)
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("{call}: the staller's line: {ran:?}"));
+        until_within(
+            MUST_HAPPEN,
+            &format!("{call}: the cut-off run's process group, its parked child too, is killed"),
+            || (!aterm_uds::process::pid_alive(child)).then_some(()),
+        );
+    }
+}
+
+/// setup_aterm asks each binary once, whichever names reach it: the placed
+/// path, our bin link and the store's path are often one file, and a binary
+/// that never answers costs one hang detector, not one per name.
+#[test]
+fn setup_aterm_asks_each_binary_once() {
+    let scratch = Scratch::new();
+    let store = scratch.mkdir("once/store");
+    let bin = scratch.mkdir("once/bin");
+    let log = scratch.join("once/asked.log");
+    let aterm = scratch.stand_in(
+        "once/store/aterm",
+        "#!/bin/sh\necho \"$*\" >>\"${STUB_LOG:?}\"\n[ \"$1\" = --version ] || exit 1\n\
+         echo \"aterm 0.99.0\"\n",
+    );
+    symlink(&aterm, &bin.join("aterm"));
+    let mut lib = Lib::new();
+    lib.env("STUB_LOG", s(&log));
+    let found = lib.call(
+        format!(
+            "PLACED_ATERM={} setup_aterm shell-setup {} {}",
+            q(s(&aterm)),
+            q(s(&bin)),
+            q(s(&store))
+        ),
         &[],
     );
-    let started = std::time::Instant::now();
     let recs = lib.run(&scratch);
+    assert_eq!(recs[found].out, "", "it knows no shell-setup");
     assert_eq!(
-        recs[production].var("VERSION_PROBE_SECS"),
-        "5",
-        "an install waits 5 s for a foreign binary's --version"
-    );
-    assert_eq!(
-        recs[stalled].out,
-        "foreign not a symlink — a hand-built binary this installer did not place"
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(60),
-        "cut off, not waited out"
+        read(&log),
+        "--version\npkg help shell-setup\n",
+        "the placed path, the bin link and the store's path are one binary, asked once"
     );
 }

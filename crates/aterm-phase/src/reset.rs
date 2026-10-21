@@ -327,10 +327,8 @@ pub struct ResetRow {
 /// there is no grant row, and it claims at once, so a menu that shows it is
 /// refused whole. Never by its place: the row is found wherever it stands.
 ///
-/// Only in the dialog read whole as the usage-limit dialog
-/// ([`PromptKind::UsageLimit`], its title on the screen), its options
-/// numbered `1.` on in order with one cursor at most, as the vendor's Select
-/// draws them.
+/// Only in a dialog read whole as [`PromptKind::UsageLimit`], its options numbered `1.`
+/// on in order with one cursor at most, as the vendor's Select draws them.
 #[must_use]
 pub fn reset_row(prompt: &PromptV2, order: &[ResetKind]) -> Option<ResetRow> {
     if prompt.kind != PromptKind::UsageLimit || prompt.head_off_screen {
@@ -804,17 +802,15 @@ fn confirm_text(
 /// A line the vendor draws while a reset is being looked up or claimed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetPending {
-    /// `Checking for a reset…` under the wall dialog's title: the row was
-    /// taken and the offer is being read. Escape there closes the dialog and
-    /// prints nothing (READ).
+    /// `Checking for a reset…` under the wall dialog's title: the offer is being read.
+    /// Escape closes the dialog and prints nothing.
     Checking,
     /// `Resetting your limits…` under a confirmation's title: the yes was
     /// taken and the claim is in flight. The vendor takes no key there (READ).
     Resetting,
 }
 
-/// The pending line on `rows` and its row, where one is what the screen
-/// shows. `Some` only when ALL hold:
+/// The pending line on `rows` and its row. `Some` only when all hold:
 ///
 /// * no composer frame is on the rows (the dialog replaces the composer);
 /// * the LOWEST row that is a dialog title of the reset program — `What do
@@ -826,10 +822,8 @@ pub enum ResetPending {
 ///   rows, and at most one input guide as the last row — all at the title's
 ///   column.
 ///
-/// The usage-limit dialog itself (options under its title), the confirmation
-/// (its body), a pending line quoted in a transcript (no rule over a title
-/// above it, or a composer under it) and the two lines under the wrong title
-/// are none.
+/// The usage-limit dialog itself, the confirmation, a quoted pending line and either
+/// line under the wrong title are none.
 #[must_use]
 pub fn reset_pending(rows: &[String]) -> Option<(ResetPending, usize)> {
     let named = |row: &str| {
@@ -908,17 +902,14 @@ pub enum ResetLine {
     /// `Couldn't reset your limits with this login · run /login, then try
     /// again`: the claim was refused for the login.
     Login,
-    /// Anything else: every other answer of the vendor's is a failure, and
-    /// so is a line this reader does not know. A failure of THIS attempt,
-    /// which is not to say nothing was ever spent: two of the vendor's
-    /// answers say an EARLIER try at the same grant went through (`Your
-    /// earlier reset went through after all · …`, `That reset was already
-    /// used · …`).
+    /// Anything else: every other answer, and any line this reader does not know, is a
+    /// failure of this attempt, though two answers say an earlier try at the same grant
+    /// went through (`Your earlier reset went through after all · …`, `That reset was
+    /// already used · …`).
     Other,
 }
 
-/// One line of the vendor's text, as the answer to a reset. The lines of a
-/// claim made at a wall (READ, module header), and what each reads as:
+/// One line of the vendor's text, as the answer to a reset made at a wall:
 ///
 /// | the line | reads |
 /// |---|---|
@@ -1248,9 +1239,9 @@ mod tests {
         reset_confirm(&boxed(rows), rows)
     }
 
-    /// `rows`, a screen of the fullscreen renderer's panel, as the inline
-    /// renderer draws the same Dialog (MEASURED on 2.1.295, the wall dialog
-    /// [`LIMIT_OPTIONS_DIALOG`]): a `─` rule and the box two columns in.
+    /// `rows`, a screen of the fullscreen renderer's panel, as the inline renderer draws
+    /// the same Dialog (measured on 2.1.295, [`LIMIT_OPTIONS_DIALOG`]): a `─` rule and the
+    /// box two columns in.
     fn inline(rows: &[String]) -> Vec<String> {
         rows.iter()
             .map(|row| {
@@ -2422,7 +2413,7 @@ mod tests {
                     ConfirmRead::Inexact("title"),
                     "{what}, cut {cut}: {rows:#?}"
                 );
-                // With the plain `Yes` the reviewers' reading took.
+                // With a plain `Yes`.
                 let rows = boxed_as(QUESTION, body, "Yes", no, cut);
                 assert_eq!(
                     confirm_read(&rows),
@@ -2441,8 +2432,8 @@ mod tests {
             let other = boxed_as(QUESTION, &[PLAIN], "Yes", "No", cut);
             assert_eq!(confirm_read(&other), ConfirmRead::Not, "cut {cut}");
         }
-        // NEGATIVE CONTROL: numbered options — the body's words and a no of
-        // that spelling make no confirmation of a permission box.
+        // Negative control: on numbered options (a permission box) neither the body's
+        // words nor a no of that spelling make a confirmation.
         let rows = boxed_as(QUESTION, &[BODY, DETAIL], "Yes", "No, keep it", false);
         let mut numbered = boxed(&rows);
         assert_eq!(
@@ -2551,9 +2542,8 @@ mod tests {
         wrapped.push("   Resetting your limits… this usually takes a few".to_string());
         wrapped.push("   seconds".to_string());
         assert_eq!(reset_pending(&wrapped), Some((ResetPending::Resetting, 5)));
-        // What the crate's own reader says of a pending screen: idle by
-        // default, no composer, no box — its word is no evidence, and this
-        // reader is the only one that names the state.
+        // The crate's reader says idle by default of a pending screen, no composer, no
+        // box: no evidence; only this reader names the state.
         for rows in [&checking, &resetting] {
             let reading = crate::read(Some("claude"), rows, None);
             assert_eq!(
@@ -2638,8 +2628,8 @@ mod tests {
                 "the composer under it"
             );
         }
-        // The composer's frame ABOVE the dialog (its rows under it are
-        // refused for their column alone): the frame's own refusal.
+        // The composer's frame above the dialog, out of the column check's reach:
+        // refused for the frame alone.
         for base in [&checking, &resetting] {
             let rule = "─".repeat(60);
             let framed: Vec<String> = [rule.clone(), "❯ ".to_string(), rule]

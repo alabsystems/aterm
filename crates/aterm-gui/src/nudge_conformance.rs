@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of the repaint nudge and of the render debt's handoff carry (R07,
-//! R08): the shipping `App` tick, the real resize ledger, the real engine and a
-//! REAL pty pair, in process - no window, no WindowServer (a headless `App`
-//! and a raw pty; the stand-in program lives on the slave end).
+//! Tier-1 of the repaint nudge and of the render debt's handoff carry: the shipping `App`
+//! tick, the real resize ledger and engine, and a real pty pair, in process and headless (the
+//! stand-in program lives on the slave end).
 //!
-//! The stand-in is a SIZE-COMPARING full-screen program, the class Claude Code
-//! belongs to: it reads the kernel's `TIOCGWINSZ` of its tty and repaints (a
-//! full clear and its whole UI) only when the size it reads CHANGED from the
-//! size it last read. So a flap it never saw twice leaves it drawing onto a
-//! screen the engine moved, and only a nudge that makes it read each size
-//! repairs it.
+//! The stand-in is a size-comparing full-screen program, like Claude Code: it reads its tty's
+//! `TIOCGWINSZ` and repaints (a full clear and its whole UI) only when the size changed since
+//! its last read. A flap it never saw leaves it drawing onto a screen the engine moved; only a
+//! nudge that makes it read each size repairs it.
 //!
 //! Each schedule runs the real event-loop steps in order - the epoch look
 //! (`observe_render_epochs`), then the nudge tick (`tick_nudges`) - on a clock
@@ -83,10 +80,9 @@ fn tty_size(fd: i32) -> (u16, u16) {
 }
 
 impl Rig {
-    /// An `App` whose session 0 owns a real pty master, the engine on the
-    /// alternate screen with every row painted (the incident's shape), a flap's
-    /// residue as the render debt when `debt`, and the presence classifier
-    /// reading Claude Code when `agent`.
+    /// An `App` whose session 0 owns a real pty master, the engine on the alternate screen
+    /// with every row painted, a flap's residue as the render debt when `debt`, and the
+    /// presence classifier reading Claude Code when `agent`.
     fn nudge_rig(mode: Mode, debt: bool, agent: bool, answer: Answer) -> Self {
         let (master, slave) = raw_pty_pair();
         aterm_pty::set_nonblocking(master, true).expect("nonblocking master");
@@ -282,9 +278,8 @@ impl Drop for Rig {
     }
 }
 
-/// THE REPAIR, end to end: adopted with a seeded debt, the size-comparing
-/// stand-in that the adoption pulse could not make repaint is repainted by the
-/// closed loop, once, with the engine untouched.
+/// Adopted with a seeded debt, the stand-in the adoption pulse could not make repaint is
+/// repainted by the closed loop, once, with the engine untouched.
 #[test]
 fn an_adopted_tab_that_owes_rows_is_repainted_by_the_closed_loop_once() {
     let mut rig = Rig::nudge_rig(Mode::On, true, true, Answer::Repaint);
@@ -311,12 +306,9 @@ fn an_adopted_tab_that_owes_rows_is_repainted_by_the_closed_loop_once() {
     );
 }
 
-/// A REAL RESIZE THAT SUPERSEDED THE HOLD AND DID NOT LAST. While it stands the
-/// program has a size of its own, so the attempt ends superseded and nothing is
-/// said; once the window is back at the size the hold found, after the
-/// attempt's wait, the epoch is at risk again with its one try spent: the
-/// give-up the same attempt is when the resize comes back inside its wait, one
-/// digest line. It used to end there in silence, the tab still displaced.
+/// A real resize supersedes the hold: while it stands nothing is said; once the window is back
+/// at the size the hold found, the epoch is at risk again with its one try spent, and the
+/// give-up is one digest line.
 #[test]
 fn a_superseded_repair_whose_resize_comes_back_is_a_give_up() {
     let mut rig = Rig::nudge_rig(Mode::On, true, true, Answer::Silent);
@@ -340,9 +332,8 @@ fn a_superseded_repair_whose_resize_comes_back_is_a_give_up() {
     assert_ne!(rig.debt(), (0, 0), "still displaced");
 }
 
-/// NEGATIVE CONTROL: a program that never answers is let go at the engine's
-/// size, once, and the epoch stays at risk (the owner's one action is the
-/// digest's).
+/// Negative control: a program that never answers is let go at the engine's size, once, and
+/// the epoch stays at risk.
 #[test]
 fn a_program_that_never_answers_is_let_go_at_the_engines_size() {
     let mut rig = Rig::nudge_rig(Mode::On, true, true, Answer::Silent);

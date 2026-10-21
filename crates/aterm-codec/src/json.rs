@@ -17,12 +17,8 @@
 //! other character, non-ASCII included, is verbatim UTF-8, so a styled frame
 //! of CJK text stays its size.
 //!
-//! Ruling 2026-10-10 (round fifteen, OUT-2): one escape here, in the leaf
-//! both `aterm-control` and `aterm-agent` reach (std plus, since 2026-10-20, the
-//! dependency-free astream-wire for the CRC-32), in place of the wire's copy
-//! and the supervisor's two. `aterm_link::glance`'s
-//! `json_string` stays its own: it escapes every character outside printable
-//! ASCII, a stricter contract (ASCII-only bytes in a file) that has no gap.
+//! `aterm_link::glance`'s `json_string` stays separate because it escapes every
+//! character outside printable ASCII for an ASCII-only file contract.
 
 /// `s` as a JSON string body (no quotes) — see the module docs.
 #[must_use]

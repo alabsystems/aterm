@@ -10,18 +10,14 @@ use std::path::PathBuf;
 
 use crate::sig::testkit;
 
-/// The synthetic paper master, and the one machine its roster authorizes. The whole
-/// crate signs with this same pair, so a flow test cannot prove something under a
-/// trust shape no other layer uses. (`ROOT_SEED` still names the ROOT of trust — it
-/// is just the paper master now, not a package-specific root.)
+/// The synthetic paper master (the root of trust) and the one machine its roster
+/// authorizes: the pair the whole crate signs with.
 const ROOT_SEED: [u8; 32] = testkit::MASTER_SEED;
 const RELEASE_SEED: [u8; 32] = testkit::MACHINE_SEED;
 
 /// A durable build floor of `index_build`, recorded under the generation these fixtures
-/// publish at — i.e. a floor that actually BINDS. Written as a helper rather than a bare
-/// integer because `BuildFloor` carries the generation that set it: a floor stamped with
-/// some OTHER generation is waived, and a floor test that accidentally built one would
-/// pass vacuously. `fl(0)` is "nothing recorded", which admits everything.
+/// publish at so it binds (a floor stamped with another generation is waived, and a test
+/// that built one would pass vacuously). `fl(0)` records nothing.
 fn fl(index_build: u64) -> BuildFloor {
     BuildFloor {
         index_build,
@@ -29,8 +25,8 @@ fn fl(index_build: u64) -> BuildFloor {
     }
 }
 
-/// The anchor every flow test resolves under: armed with the synthetic master, roster
-/// floor 0. `anchor_of` is the seam the negative tests use to arm a DIFFERENT master.
+/// The anchor every flow test resolves under: the synthetic master, roster floor 0.
+/// `anchor_of` arms a different master for the negative tests.
 fn anchor() -> Anchor {
     anchor_of(&ROOT_SEED)
 }
@@ -77,9 +73,8 @@ fn make_archive(dir: &Path) -> PathBuf {
     make_archive_with(dir, b"#!/bin/true\nay", b"0000755\0")
 }
 
-/// As [`make_archive`], but with explicit `bin/ay` content + tar mode (the
-/// resolve-check rollback tests ship a native-object magic with NO exec bit, so the
-/// spawn fails and the fail-loud check takes its spawn-failure arm).
+/// As [`make_archive`], but with explicit `bin/ay` content and tar mode (the resolve-check
+/// tests ship a native-object magic with no exec bit, so the spawn fails).
 fn make_archive_with(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8]) -> PathBuf {
     fn entry(name: &str, content: &[u8], mode: &[u8; 8]) -> Vec<u8> {
         let mut h = [0u8; 512];
@@ -124,8 +119,8 @@ struct Fake {
 }
 impl Fetcher for Fake {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
-        // The master-signed roster is published WITH the index, exactly as a real
-        // release carries `aterm-machines.toml` beside `index.toml`.
+        // The master-signed roster is published with the index, as a real release carries
+        // `aterm-machines.toml` beside `index.toml`.
         let (roster_bytes, roster_sig) = testkit::published_roster();
         Ok(vec![Candidate {
             label: "v0".into(),
@@ -160,8 +155,8 @@ fn fixture(dir: &Path) -> Fake {
     fixture_with_kind(dir, "binary")
 }
 
-/// As [`fixture`], but with an explicit artifact `kind` (to exercise the
-/// per-member dispatch — e.g. `sysroot-bundle`, which must fail closed).
+/// As [`fixture`], but with an explicit artifact `kind` (`app-bundle`, `sysroot-bundle`)
+/// for the per-kind dispatch.
 fn fixture_with_kind(dir: &Path, kind: &str) -> Fake {
     fixture_from(dir, kind, make_archive(dir), None)
 }
@@ -173,11 +168,9 @@ fn fixture_with(dir: &Path, kind: &str, ay_content: &[u8], ay_mode: &[u8; 8]) ->
     fixture_from(dir, kind, make_archive_with(dir, ay_content, ay_mode), None)
 }
 
-/// The `tree_root` a producer SIGNS for `archive`: a throwaway stage into `probe`
-/// through the extractor's own fold — the digest the real stage computes, which on
-/// Windows folds the DECLARED modes (`crate::tree`'s module docs). The plain on-disk
-/// walk folds `0` there and would sign a root no client can reproduce; on Unix the
-/// two are byte-identical.
+/// The `tree_root` a producer signs for `archive`: a throwaway stage into `probe` through
+/// the extractor's own fold, which on Windows folds the declared modes (`crate::tree`'s
+/// module docs) where the plain on-disk walk folds `0`. On Unix the two agree.
 fn signed_root_of(archive: &Path, probe: &Path) -> String {
     let _ = std::fs::remove_dir_all(probe);
     crate::extract::extract_tar_zst_tree(
@@ -194,11 +187,10 @@ fn signed_root_of(archive: &Path, probe: &Path) -> String {
 
 /// The signed release over an archive the caller already built.
 ///
-/// `signed_root` overrides the `tree_root` the manifest carries. `None` is the honest
-/// case — the real root of the real archive. `Some(..)` is how a test makes the SIGNED
-/// value disagree with the bytes on disk, which is the only way to reach the apply-time
-/// TOCTOU re-verify through the real flow: the artifact's `sha256` covers the compressed
-/// asset, so no substituted archive can satisfy that gate and still fail a later one.
+/// `signed_root` overrides the manifest's `tree_root`: `None` is the real root; `Some(..)`
+/// makes the signed value disagree with the bytes, the only way to reach the apply-time
+/// re-verify through the real flow (`sha256` covers the compressed asset, so no substituted
+/// archive passes that gate and fails a later one).
 fn fixture_from(dir: &Path, kind: &str, archive: PathBuf, signed_root: Option<&str>) -> Fake {
     let sha = crate::tree::file_sha256(&archive).unwrap();
     // Learn the extracted tree_root by a throwaway stage.
@@ -240,10 +232,9 @@ fn fixture_from(dir: &Path, kind: &str, archive: PathBuf, signed_root: Option<&s
     }
 }
 
-/// A signed release whose ONE artifact row carries the archive's REAL digests
-/// (sha256/tree_root/size) and, appended verbatim, `row` — the `kind`/`protocol` pair
-/// and the vendor keys under test — so a row that passes admission can stage end to
-/// end through a fetcher that serves the archive on `download_url`.
+/// A signed release whose one artifact row carries the archive's real digests
+/// (sha256/tree_root/size) plus `row` verbatim (the `kind`/`protocol` pair and the vendor
+/// keys under test), so an admitted row stages through a fetcher serving `download_url`.
 fn fixture_vendor(dir: &Path, row: &str) -> Fake {
     let archive = make_archive(dir);
     let sha = crate::tree::file_sha256(&archive).unwrap();
@@ -285,9 +276,9 @@ fn fixture_vendor(dir: &Path, row: &str) -> Fake {
 /// The `(kind, protocol)` head of an https binary row.
 const HTTPS_HEAD: &str = "kind = \"binary\"\nprotocol = \"https\"\n";
 
-/// The vendor row every vendor-lane test starts from: a binary over https from a
-/// real allow-listed host, the tar-zst lane (the archive fixture IS a tar.zst, and
-/// that extractor predates the payload lanes), no raw-binary `entry`.
+/// The vendor row every vendor-lane test starts from: a binary over https from a real
+/// allow-listed host on the tar-zst lane (the archive fixture is a tar.zst), no raw-binary
+/// `entry`.
 const VENDOR_ROW: &str = "kind = \"binary\"\nprotocol = \"https\"\nurl = \"https://github.com/openai/codex/releases/download/rust-v0.150.0/codex-package-aarch64-apple-darwin.tar.zst\"\npayload = \"tar-zst\"\nvendor = \"OpenAI\"\n";
 
 fn layout(dir: &Path) -> Layout {
@@ -311,27 +302,22 @@ fn tool_bin(build_dir: &Path, name: &str) -> PathBuf {
     build_dir.join("bin").join(tool(name).exe_file())
 }
 
-/// The sidecar a FAILED stage wrote goes with the build that never came to exist, and
-/// the sidecar of a build the failed stage left standing does not.
-///
-/// Nothing else reclaims an orphan sidecar — `gc::interrupted_debris` walks `store/`
-/// for directories, and `store::discard_build` needs a tree. The second half guards
-/// the other way: a re-stage over a LIVE build fails with the old tree still in place,
-/// and that tree's shims still need its environment.
+/// The sidecar a failed stage wrote goes with the build that never came to exist, and a
+/// build the failed stage left standing keeps its own: its shims still need their
+/// environment.
 #[test]
 fn a_failed_stage_takes_its_sidecar_and_spares_a_standing_build_s() {
     let dir = scratch("orphan-sidecar");
     let l = layout(&dir);
     let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
     // The reference `https` row: its signed sha256 is not this archive's, so the stage
-    // refuses at step 1 — before any directory is created, and before the live tree in
-    // the second half could be touched.
+    // refuses before any directory is created.
     let art = crate::vendor::testkit::row();
     let archive = dir.join("asset");
     std::fs::write(&archive, b"not the signed bytes").unwrap();
 
-    // Fresh install: the lane writes the sidecar (creating `store/claude/` to do it),
-    // the stage fails, no build directory exists — the sidecar must not survive.
+    // Fresh install: the lane writes the sidecar (creating `store/claude/`), the stage fails,
+    // no build directory exists, and the sidecar must not survive.
     let build_dir = l.build_dir("claude", 2_026_091_301);
     crate::shim_env::write_sidecar(&build_dir, &env).unwrap();
     assert!(
@@ -369,9 +355,9 @@ fn a_failed_stage_takes_its_sidecar_and_spares_a_standing_build_s() {
     );
 }
 
-// THE capstone: `ay` installs end-to-end from a synthetic SIGNED release — index verified
-// under the root key, pkg verified under the delegated release key, artifact downloaded,
-// sha256 + tree_root checked, activated, and shimmed (with the sensitive `git` refused).
+// `ay` installs end to end from a synthetic signed release: index verified under the root
+// key, pkg under the delegated release key, sha256 and tree_root checked, then activated and
+// shimmed (the sensitive `git` refused).
 #[test]
 fn ay_installs_end_to_end_from_a_signed_release() {
     let dir = scratch("e2e");
@@ -507,11 +493,9 @@ fn writable_by_others(base: &Path, dir: &Path, out: &mut Vec<String>) {
 }
 
 /// The child half of [`an_install_under_an_open_umask_leaves_nothing_others_can_write`]:
-/// under umask `000`, the end-to-end install of
-/// [`ay_installs_end_to_end_from_a_signed_release`], a shim-environment sidecar and a
-/// stage-refusal memo leave no directory or file in the prefix that its group or anyone
-/// else could write. Outside that child (the env unset) it does nothing: the umask is
-/// the whole process's.
+/// under umask `000`, the end-to-end install plus a shim-env sidecar and a stage-refusal
+/// memo leave nothing in the prefix writable by group or others. Without the env it does
+/// nothing, since the umask is the whole process's.
 #[cfg(unix)]
 #[test]
 fn probe_an_install_under_an_open_umask() {
@@ -533,8 +517,7 @@ fn probe_an_install_under_an_open_umask() {
     let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
     assert_eq!(report.build, 18);
     // The two records a stage writes beside a build when there is cause, each the first
-    // writer of its program's directory: the environment a vendor row's shims export,
-    // and the memo of a refused stage.
+    // writer of its program's directory: a shim-env sidecar and a refused stage's memo.
     let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
     crate::shim_env::write_sidecar(&layout.build_dir("claude", 2_026_091_301), &env).unwrap();
     let digest = (crate::manifest::DigestAlg::Sha256, "aa");
@@ -545,15 +528,12 @@ fn probe_an_install_under_an_open_umask() {
     assert!(loose.is_empty(), "laid writable by others: {loose:#?}");
 }
 
-/// AT3's review (2026-10-10): an install's store must not depend on the umask it runs
-/// under. A system prefix (`root`-owned, every user runs from it) staged by a `root`
-/// whose umask is `002` or `000` laid `store/`, `store/<program>/`, the build root
-/// itself, `staging/` and `staging/<program>/` at `0777 & ~umask`, and the records
-/// beside a build at `0666 & ~umask`: its group or every user could rename a build's
-/// `bin/` and put their own in its place, rename or rewrite the downloaded asset between
-/// its digest check and its extraction, or rewrite a record a later verb believes. The
-/// umask is process-wide, so the install runs in a child of this test binary that runs
-/// only [`probe_an_install_under_an_open_umask`].
+/// An install's store must not depend on the umask it runs under: in a root-staged system
+/// prefix, a `002`/`000` umask would leave `store/`, build roots, `staging/` and the records
+/// beside a build writable by group or others, so another user could swap a build's `bin/`,
+/// the asset between its digest check and extraction, or a record a later verb believes.
+/// The umask is process-wide, so the install runs in a child that runs only
+/// [`probe_an_install_under_an_open_umask`].
 #[cfg(unix)]
 #[test]
 fn an_install_under_an_open_umask_leaves_nothing_others_can_write() {
@@ -620,13 +600,9 @@ fn install_phases_land_in_the_progress_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE GOVERNING STAGING INVARIANT, THROUGH THE REAL INSTALL FLOW: a re-install that
-/// fails to stage must leave the toolchain already on the machine installed, complete,
-/// and on PATH.
-///
-/// The sequence: a live `ay@18`, then a re-install whose signed `tree_root` does not
-/// describe the bytes. The unit tests in `install.rs` pin the staging chain itself;
-/// this pins that the flow the user actually runs goes through it.
+/// Through the real install flow: a re-install that fails to stage (a live `ay@18`, then a
+/// signed `tree_root` that does not describe the bytes) leaves the toolchain installed,
+/// complete and on PATH. `install.rs` pins the staging chain itself.
 #[test]
 fn a_restage_that_fails_leaves_the_live_toolchain_installed_and_on_path() {
     let dir = scratch("restage-keeps-toolchain");
@@ -647,9 +623,8 @@ fn a_restage_that_fails_leaves_the_live_toolchain_installed_and_on_path() {
     let ay = tool_bin(&build, "ay");
     let original = std::fs::read(&ay).unwrap();
 
-    // The SAME archive bytes (so the sha256 gate passes and the failure lands late) under
-    // a signed tree_root that cannot match — the apply-time TOCTOU re-verify, i.e. the
-    // last point at which the old shape had already destroyed the live tree.
+    // The same archive bytes (the sha256 gate passes, so the failure lands late) under a
+    // signed tree_root that cannot match: the apply-time re-verify.
     let tampered = fixture_from(&dir, "binary", make_archive(&dir), Some(&"a".repeat(64)));
     let err = install(&tampered, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
     assert!(
@@ -696,11 +671,10 @@ fn staged_assets(layout: &Layout, program: &str) -> Vec<String> {
     out
 }
 
-// THE COMPRESSED ASSET OF A FAILED STAGE IS RETAINED — ONE COPY, REUSED — WHEN THE
-// BYTES WERE RIGHT, and reclaimed with its `.part` when they were not: a stage that
-// failed for a reason that was not the bytes' (a permission refusal, a full disk) must
-// not re-download the same archive (743 MB for `trust`) on every pass. The strandage
-// bound still holds: `sweep_foreign_partials` keeps one archive per program, this pass's.
+// A failed stage's compressed asset is retained (one copy, reused) when the bytes were
+// right, so a stage that failed for another reason does not re-download it every pass; it
+// is reclaimed with its `.part` when they were wrong. `sweep_foreign_partials` still keeps
+// at most one archive per program.
 #[test]
 fn a_failed_stage_retains_one_verified_archive_and_a_digest_failure_none() {
     let dir = scratch("staging-retain");
@@ -753,20 +727,17 @@ fn a_failed_stage_retains_one_verified_archive_and_a_digest_failure_none() {
     );
     let _ = std::fs::remove_dir_all(&ddir);
 
-    // Non-vacuity, and the reuse itself: the good row has the SAME bytes under the
-    // right root, so the retained archive is what it stages — no fetch — and a
-    // successful install leaves staging empty as it always did.
+    // Non-vacuity and the reuse itself: the good row has the same bytes under the right
+    // root, so the retained archive is what it stages, and success leaves staging empty.
     install(&fixture(&dir), &layout, &anchor(), &req, fl(0), 0).unwrap();
     assert!(staged_assets(&layout, "ay").is_empty());
     assert!(crate::store::build_is_complete(&layout.build_dir("ay", 18)));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A SIGNER refusal is handled as a digest refusal is: the archive and its `.part` go,
-/// and the memo holds the next pass off the wire — from the first refusal and
-/// whatever the clock says, because the refused bytes matched their digests — until
-/// the digests move. A machine fault (codesign that could not answer) records
-/// nothing and keeps the archive.
+/// A signer refusal is handled as a digest refusal: the archive and its `.part` go, and the
+/// memo holds the next pass off the wire from the first refusal until the digests move. A
+/// machine fault (codesign could not answer) records nothing and keeps the archive.
 #[test]
 fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
     let dir = scratch("signer-refusal");
@@ -817,12 +788,10 @@ fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// THE SAME BLIND SPOT ON THE SINGLE-PROGRAM PATH. `abort_activated_install` unwinds an
-// install that failed AFTER activation, and its discard is sound for a build this call
-// created. It is not sound for one that was already live: the failures that land there
-// are `install_tools` (an EACCES/EROFS/full disk while writing `bin/` shims — a fact
-// about the environment, not the tree) and the resolve check, and deleting a verified
-// multi-gigabyte tree in response leaves the user with no toolchain at all.
+// The same rule on the single-program path: `abort_activated_install` discards a build this
+// call created, never one that was already live. The failures that land there
+// (`install_tools` hitting EACCES/EROFS/a full disk, or the resolve check) are facts about
+// the environment, not the tree.
 #[test]
 fn a_post_activation_abort_never_discards_a_build_that_was_already_live() {
     let dir = scratch("single-abort-live");
@@ -848,9 +817,9 @@ fn a_post_activation_abort_never_discards_a_build_that_was_already_live() {
         "PRECONDITION: and really live"
     );
 
-    // Break `install_tools` the way an unwritable prefix does: a regular FILE where the
-    // `bin/` directory must be, so `ensure_private_dir` fails AFTER activation. The
-    // `installed: None` request is the shim view being silent about a live program.
+    // Break `install_tools` as an unwritable prefix does: a regular file where `bin/` must
+    // be, so `ensure_private_dir` fails after activation. `installed: None` is the shim view
+    // being silent about a live program.
     std::fs::remove_dir_all(layout.bin_dir()).unwrap();
     std::fs::write(layout.bin_dir(), b"not a dir").unwrap();
 
@@ -874,10 +843,9 @@ fn a_post_activation_abort_never_discards_a_build_that_was_already_live() {
         "it must still read as installed, so the retry re-stages it in place"
     );
 
-    // AND THE KEEP MUST OUTLIVE THE RUN. `was_live` is read off the two `current`
-    // links, and the unwind removes both; the witness is re-pointed at the kept build
-    // so a SECOND failure of the same unwritable `bin/` still knows it was live and
-    // does not discard the tree the first abort kept.
+    // The keep must outlive the run: `was_live` is read off the `current` link the unwind
+    // removes, so the witness is re-pointed at the kept build and a second failure still
+    // knows it was live.
     assert_eq!(
         std::fs::read_link(layout.program_current("ay")).unwrap(),
         build,
@@ -903,8 +871,8 @@ fn a_post_activation_abort_never_discards_a_build_that_was_already_live() {
         "and the keep stays durable for the attempt after that"
     );
 
-    // Non-vacuity: a build this call really did create IS still discarded. Restore the
-    // prefix, then fail a FRESH install of a program that was never live.
+    // Non-vacuity: a build this call created is still discarded. Restore the prefix, then
+    // fail a fresh install of a program that was never live.
     std::fs::remove_file(layout.bin_dir()).unwrap();
     let ndir = scratch("single-abort-fresh");
     std::fs::create_dir_all(nlayout.prefix.join("store")).unwrap();
@@ -919,15 +887,10 @@ fn a_post_activation_abort_never_discards_a_build_that_was_already_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// THE RETRY IS BOUNDED TO WHAT ACTUALLY FAILED. A coherence group aborts all-or-nothing
-// and discards every staged sibling's extracted tree — that invariant is not negotiable
-// (a complete-but-inactive build would be mis-read as the active build and split the
-// tuple). Their verified DOWNLOADS are kept: refetching a ~3.4 GB toolchain on every
-// tick could leave a tuple on a slow link never converging.
-//
-// The saving is made OBSERVABLE the only way a local-copy fetcher can show it: pass 2
-// runs with the sibling's asset REMOVED from the registry, so the sole way it can stage
-// is from the archive pass 1 carried.
+// The retry is bounded to what failed: an aborted group discards every staged sibling's
+// extracted tree (a complete-but-inactive build would split the tuple) but keeps their
+// verified downloads, so a multi-GB toolchain is not refetched on every tick. Pass 2 runs
+// with the sibling's asset removed from the registry, so it can stage only from the carry.
 #[test]
 fn an_aborted_tuple_carries_its_verified_siblings_so_the_retry_refetches_only_the_failure() {
     let dir = scratch("group-carry-archive");
@@ -935,9 +898,8 @@ fn an_aborted_tuple_carries_its_verified_siblings_so_the_retry_refetches_only_th
     let layout = layout(&dir);
     let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
 
-    // PASS 1: trust's asset is unfetchable (the flaky-link case). `ay` stages first and
-    // COMPLETELY — downloaded, sha256-verified, tree_root-verified, extracted — and
-    // then trust's download fails and takes the whole tuple down with it.
+    // Pass 1: trust's asset is unfetchable. `ay` stages completely (downloaded, verified,
+    // extracted), then trust's download fails and the tuple aborts.
     let good_trust = fake.archives.remove("trust-4821.tar.zst").unwrap();
     let report = apply_channel(
         &fake,
@@ -966,7 +928,7 @@ fn an_aborted_tuple_carries_its_verified_siblings_so_the_retry_refetches_only_th
         "the sibling's verified archive is carried to the next pass"
     );
 
-    // The pass-end gc must not undo that — the CLI's wiring, verbatim.
+    // The pass-end gc must not undo that (the CLI's wiring).
     let _ = crate::gc::run_keeping_pinned_partials(&layout, None, &|p| {
         report.resolved_assets.get(p).cloned()
     });
@@ -976,8 +938,8 @@ fn an_aborted_tuple_carries_its_verified_siblings_so_the_retry_refetches_only_th
         "the pass-closing sweep spares the carried archive, as it does the `.part`"
     );
 
-    // PASS 2: trust is reachable again, but `ay`'s asset is GONE from the registry, so
-    // re-downloading it cannot succeed. The tuple must converge anyway.
+    // Pass 2: trust is reachable again, but `ay`'s asset is gone from the registry, so the
+    // tuple can converge only from the carried archive.
     fake.archives
         .insert("trust-4821.tar.zst".to_string(), good_trust);
     fake.archives.remove("ay-18.tar.zst");
@@ -1004,9 +966,7 @@ fn an_aborted_tuple_carries_its_verified_siblings_so_the_retry_refetches_only_th
         &layout.build_dir("trust", 4821)
     ));
 
-    // A SETTLED tuple keeps nothing: the carry exists only BETWEEN passes, so the
-    // strandage bound `a_member_stage_failure_aborts_the_group_and_a_retry_heals_it`
-    // pins is not widened by any of this.
+    // A settled tuple keeps nothing: the carry exists only between passes.
     assert!(
         staged_assets(&layout, "ay").is_empty(),
         "a settled tuple reclaims the carried archive: {:?}",
@@ -1020,19 +980,17 @@ fn an_aborted_tuple_carries_its_verified_siblings_so_the_retry_refetches_only_th
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// THE RESUME-ACROSS-PASSES WIRING (R4), update lane: a member whose DOWNLOAD fails
-// mid-pass reaches `ChannelApplyReport::resolved_assets` anyway — the name is recorded
-// when the verified manifest selects the artifact, BEFORE any byte moves — so the CLI's
-// pass-end `gc::run_keeping_pinned_partials`, fed exactly that map, spares the `.part`
-// the fetcher left and the next pass resumes instead of refetching from byte 0.
+// Resume across passes, update lane: a member whose download fails mid-pass still reaches
+// `ChannelApplyReport::resolved_assets` (the name is recorded when the verified manifest
+// selects the artifact), so the CLI's pass-end `gc::run_keeping_pinned_partials` spares the
+// `.part` and the next pass resumes.
 #[test]
 fn a_failed_download_survives_its_own_pass_end_gc_and_a_plain_gc_still_sweeps_it() {
     let dir = scratch("resume-survives-pass-end");
     let mut fake = group_fixture(&dir);
     let layout = layout(&dir);
-    // trust's asset is unfetchable: the download fails AFTER its manifest verified —
-    // the window that leaves a `.part` behind in production. `Fake` copies whole
-    // files or fails, so the test seeds the resume bytes the real fetcher would leave.
+    // trust's download fails after its manifest verified, the window that leaves a `.part`.
+    // `Fake` copies whole files or fails, so the test seeds the resume bytes.
     fake.archives.remove("trust-4821.tar.zst");
     let staging = layout.staging_dir("trust");
     std::fs::create_dir_all(&staging).unwrap();
@@ -1060,8 +1018,8 @@ fn a_failed_download_survives_its_own_pass_end_gc_and_a_plain_gc_still_sweeps_it
         part.exists(),
         "PRECONDITION: the resume state survived the abort"
     );
-    // The FAILED member is in the map — resolution happened before its download —
-    // and so is the sibling that staged fine (harmless: it has no `.part` left).
+    // The failed member is in the map (resolution precedes its download), and so is the
+    // sibling that staged fine.
     assert_eq!(
         report.resolved_assets.get("trust").map(String::as_str),
         Some("trust-4821.tar.zst"),
@@ -1072,7 +1030,7 @@ fn a_failed_download_survives_its_own_pass_end_gc_and_a_plain_gc_still_sweeps_it
         Some("ay-18.tar.zst")
     );
 
-    // The CLI's pass-end wiring, verbatim: the sparing closure IS the report's map.
+    // The CLI's pass-end wiring: the sparing closure is the report's map.
     let _ = crate::gc::run_keeping_pinned_partials(&layout, None, &|p| {
         report.resolved_assets.get(p).cloned()
     });
@@ -1081,8 +1039,8 @@ fn a_failed_download_survives_its_own_pass_end_gc_and_a_plain_gc_still_sweeps_it
         "the pass-end sweep spares the failed member's resume state"
     );
 
-    // `uninstall --all` and the standalone `atpkg gc` keep the PLAIN form on purpose
-    // (the user asked for the disk back): everything spared above stays reclaimable.
+    // `uninstall --all` and the standalone `atpkg gc` keep the plain form: everything spared
+    // above stays reclaimable.
     let _ = crate::gc::run(&layout, None);
     assert!(
         !part.exists(),
@@ -1091,9 +1049,9 @@ fn a_failed_download_survives_its_own_pass_end_gc_and_a_plain_gc_still_sweeps_it
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// The same wiring on the singleton lane (`bootstrap_singleton` / `do_install`): a
-// failed install returns NO report, so the resolved asset rides the collector
-// out-param — filled before the download, surviving the `Err`.
+// The same wiring on the singleton lane (`bootstrap_singleton` / `do_install`): a failed
+// install returns no report, so the resolved asset rides the collector out-param, filled
+// before the download.
 #[test]
 fn a_failed_singleton_download_still_fills_the_resolved_asset_collector() {
     let dir = scratch("resume-collector-singleton");
@@ -1131,8 +1089,8 @@ fn a_failed_singleton_download_still_fills_the_resolved_asset_collector() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The FETCHER CONTRACT for the vendor lane: `download_url` is refused by default —
-/// a test fetcher and the `dir:` registry fetcher never reach the network by accident.
+/// The fetcher contract for the vendor lane: `download_url` is refused by default, so a
+/// test fetcher and the `dir:` registry fetcher never reach the network by accident.
 #[test]
 fn a_fetcher_refuses_vendor_urls_unless_it_opts_in() {
     struct Inert;
@@ -1162,8 +1120,8 @@ fn a_fetcher_refuses_vendor_urls_unless_it_opts_in() {
     );
     assert!(!dest.exists(), "a refusal writes nothing");
 
-    // The vendor-direct lanes answer "unreachable" by default: a fetcher with no
-    // network leg keeps what is installed, quietly, and writes nothing.
+    // The vendor-direct lanes answer "unreachable" by default: a fetcher with no network
+    // leg keeps what is installed and writes nothing.
     const HEAD: &str = "https://downloads.claude.ai/claude-code-releases/latest";
     let unreachable = |e: VendorFetchError| {
         assert!(matches!(e, VendorFetchError::Unreachable(_)), "{e:?}");
@@ -1182,11 +1140,9 @@ fn a_fetcher_refuses_vendor_urls_unless_it_opts_in() {
     assert!(!dest.exists(), "a refusal writes nothing");
 }
 
-/// A `github-release` row's `asset` is joined onto `staging/<program>/`, and the flow
-/// unlinks that path and sweeps every `*.part` beside it BEFORE any download. An asset
-/// that is a PATH — absolute (`Path::join` replaces the base) or climbing with `..` —
-/// must be refused before either runs, so a signed row can never delete a file outside
-/// staging.
+/// A `github-release` row's `asset` is joined onto `staging/<program>/`, which the flow
+/// unlinks and sweeps for `*.part` before any download, so an asset that is a path
+/// (absolute, or climbing with `..`) is refused before either runs.
 #[test]
 fn install_never_unlinks_outside_staging_for_a_release_row() {
     let req = InstallRequest {
@@ -1250,16 +1206,13 @@ fn install_never_unlinks_outside_staging_for_a_release_row() {
     }
 }
 
-/// THE VENDOR LANE, end to end through the real flow:
-/// 1. a `binary` row over the `https` protocol is DISPATCHED (never
-///    `UnsupportedKind`) and admitted BEFORE any byte moves — a row with no url is
-///    `VendorRefused` and the staging dir stays empty;
-/// 2. an admitted row downloads through `download_url` ONLY: the slug lane
-///    (`download`/`download_for`) is never consulted, and a fetcher without the vendor
-///    lane fails as a `Download` naming it, leaving nothing installed;
-/// 3. a fetcher that serves the signed URL installs, shims and activates exactly like a
-///    plain binary, under the signed sha256 + tree_root gates, with the signed `size`
-///    as the exact cap and NO account slug or asset name on the request.
+/// The vendor lane end to end through the real flow:
+/// 1. a `binary` row over `https` is dispatched (never `UnsupportedKind`) and admitted
+///    before any byte moves; a row with no url is `VendorRefused`, staging untouched;
+/// 2. an admitted row downloads only through `download_url`: the slug lane is never
+///    consulted, and a fetcher without the vendor lane fails as a `Download` naming it;
+/// 3. a fetcher that serves the signed URL installs like a plain binary under the sha256
+///    and tree_root gates, with the signed `size` as the exact cap.
 #[test]
 fn an_https_row_is_admitted_then_downloaded_only_through_the_vendor_lane() {
     let req = InstallRequest {
@@ -1291,7 +1244,7 @@ fn an_https_row_is_admitted_then_downloaded_only_through_the_vendor_lane() {
     let err = install(&hostile, &layout(&hdir), &anchor(), &req, fl(0), 0).unwrap_err();
     assert!(matches!(err, FlowError::VendorRefused(_)), "{err:?}");
 
-    // 2. Admitted, but this fetcher has no vendor lane: the slug lane is NOT a fallback.
+    // 2. Admitted, but this fetcher has no vendor lane: the slug lane is not a fallback.
     let ndir = scratch("vendor-no-lane");
     let no_lane = fixture_vendor(&ndir, VENDOR_ROW);
     let nlay = layout(&ndir);
@@ -1305,7 +1258,7 @@ fn an_https_row_is_admitted_then_downloaded_only_through_the_vendor_lane() {
         "nothing installed"
     );
 
-    // 3. A fetcher WITH the vendor lane installs end to end — and only that lane is used.
+    // 3. A fetcher with the vendor lane installs end to end, through that lane only.
     struct VendorFake {
         inner: Fake,
         served: PathBuf,
@@ -1361,19 +1314,10 @@ fn an_https_row_is_admitted_then_downloaded_only_through_the_vendor_lane() {
     }
 }
 
-/// THE RELEASE LANE IS CAPPED BY THE ROW'S SIGNED SIZE, not by the fetcher's own
-/// ceiling — the property the vendor lane above has always had, now proven for
-/// `github-release` too.
-///
-/// `disk_gate(size + disk_installed)` is computed from the signed number and is
-/// checked ONCE, before the transfer; nothing bounds the bytes as they land but the
-/// cap the fetcher is given, and the sha256 gate sees the file only after it is
-/// whole. A release lane capped at its own 8 GiB constant therefore let a
-/// mis-uploaded or substituted asset (GitHub takes up to 2 GiB per asset) write
-/// through the free-space floor the preflight had just defended — for a row whose
-/// signed size says 100 bytes — and refused it only afterwards. So the number the
-/// flow hands `download_for` is the row's own `size`, exactly as `download_url` has
-/// always taken it.
+/// The release lane is capped by the row's signed size, as the vendor lane is: the disk
+/// gate runs once before the transfer and the sha256 gate sees only the whole file, so the
+/// cap the fetcher is given is all that bounds the bytes as they land. `download_for` gets
+/// the row's own `size`.
 #[test]
 fn a_github_release_download_is_capped_at_the_rows_signed_size() {
     struct CapFake {
@@ -1405,9 +1349,8 @@ fn a_github_release_download_is_capped_at_the_rows_signed_size() {
         }
     }
     let dir = scratch("release-lane-cap");
-    // The fixture's signed row states `size = 100` — a number nothing else in the
-    // flow reads back, so an assertion on it can only be satisfied by the SIGNED
-    // value actually reaching the lane.
+    // The fixture's signed row states `size = 100`, which nothing else in the flow reads
+    // back.
     let f = CapFake {
         inner: fixture(&dir),
         seen: RefCell::new(Vec::new()),
@@ -1432,13 +1375,10 @@ fn a_github_release_download_is_capped_at_the_rows_signed_size() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// DESIGN S7, end to end through the real flow: a manifest declaring
-/// `shim_env = ["DISABLE_AUTOUPDATER=1"]` installs like any vendor row, and the shim
-/// it lays EXPORTS that variable before it execs — read back off the shim, recorded
-/// beside the build in its `<build>.shim-env` sidecar (so the verbs that hold no
-/// manifest re-lay it the same way), and still a shim `which` resolves. A manifest
-/// whose `shim_env` breaks the rule is refused at PARSE as `ShimEnv` naming the entry,
-/// before any byte moves.
+/// Design S7 end to end: a manifest declaring `shim_env = ["DISABLE_AUTOUPDATER=1"]` lays a
+/// shim that exports it before it execs, records it in the `<build>.shim-env` sidecar for
+/// the verbs that hold no manifest, and still resolves with `which`. A `shim_env` that
+/// breaks the rule is refused at parse as `ShimEnv`, before any byte moves.
 #[test]
 fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
     struct VendorFake {
@@ -1467,9 +1407,8 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
         triple: TRIPLE,
         installed: None,
     };
-    // `fixture_vendor` appends `row` INSIDE the artifact table; a top-level key has to
-    // come before it, so re-head the signed body: the same bytes with `shim_env` after
-    // `exposes`, re-signed.
+    // `fixture_vendor` appends `row` inside the artifact table, so a top-level key goes in
+    // by re-heading the signed body: `shim_env` after `exposes`, re-signed.
     let with_env = |dir: &Path, list: &str| {
         let mut fake = fixture_vendor(dir, VENDOR_ROW);
         let (body, _) = fake.pkg.remove(&("ay".to_string(), 18u64)).unwrap();
@@ -1575,10 +1514,9 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
     let _ = std::fs::remove_dir_all(&bdir);
 }
 
-/// Rule 2 on the `requires` path: a dependency the user's OWN copy satisfies
-/// (`system = "<bin>"`, the binary on PATH outside the prefix) is reported
-/// `DepResult::System(path)` and never installed — no manifest fetched, no byte
-/// moved, no managed copy laid beside the user's.
+/// A dependency the user's own copy satisfies (`system = "<bin>"`, on PATH outside the
+/// prefix) is reported `DepResult::System(path)` and never installed: no manifest fetched,
+/// no managed copy laid beside it.
 #[cfg(unix)]
 #[test]
 fn a_system_satisfied_dependency_is_never_pulled_in_as_a_managed_copy() {
@@ -1586,8 +1524,8 @@ fn a_system_satisfied_dependency_is_never_pulled_in_as_a_managed_copy() {
     let sys = dir.join("usr-local-bin");
     let gh = lay_exe(&sys, "gh");
     let path = std::env::join_paths([sys.clone()]).unwrap();
-    // `ay` requires `gh`; gh declares `system = "gh"` and is pinned, but its pkg
-    // manifest is deliberately ABSENT: fetching it would fail loudly.
+    // `ay` requires `gh`; gh declares `system = "gh"` and is pinned, but its pkg manifest is
+    // absent, so fetching it would fail.
     let ay_dir = dir.join("ay");
     std::fs::create_dir_all(&ay_dir).unwrap();
     let fake = requires_fixture(&ay_dir, &[], &["gh"], &[]);
@@ -1639,9 +1577,8 @@ fn lay_exe(dir: &Path, name: &str) -> PathBuf {
 
 #[test]
 fn app_bundle_refused_closed_but_sysroot_bundle_installs() {
-    // app-bundle is the app's own in-session apply topology, NOT a tool install — it
-    // stays refused CLOSED on this path (atpkg never swaps the app), before any
-    // download: the fetcher serves no archive, so a later refusal would read as one.
+    // app-bundle is the app's own in-session apply topology, not a tool install: refused
+    // before any download (the fetcher serves no archive, so a later refusal would show).
     let adir = scratch("dispatch-app");
     let mut app = fixture_with_kind(&adir, "app-bundle");
     app.archives.clear();
@@ -1653,8 +1590,8 @@ fn app_bundle_refused_closed_but_sysroot_bundle_installs() {
         installed: None,
     };
     let err = install(&app, &alay, &anchor(), &areq, fl(0), 0).unwrap_err();
-    // Refused as the app's own pair — a distinct refusal rather than a blanket
-    // UnsupportedKind, so the pass can say the app updates itself.
+    // Refused as the app's own pair, distinct from UnsupportedKind, so the pass can say the
+    // app updates itself.
     assert!(
         matches!(err, FlowError::AppBundleRefused(ref p) if p == "ay"),
         "got {err:?}"
@@ -1665,10 +1602,9 @@ fn app_bundle_refused_closed_but_sysroot_bundle_installs() {
     );
     let _ = std::fs::remove_dir_all(&adir);
 
-    // sysroot-bundle (self-contained default: pack-time-relocated, no rustup
-    // needed) is NO LONGER refused — it stages, wires (no-op for self-contained),
-    // activates + shims, and passes the fail-loud resolve check (the fixture bin
-    // `#!/bin/true` runs to a clean exit, proving the loader resolved it).
+    // sysroot-bundle (self-contained: relocated at pack time, no rustup needed) stages,
+    // activates, shims and passes the resolve check (the fixture's `#!/bin/true` exits
+    // cleanly).
     let sdir = scratch("dispatch-sr");
     let sr = fixture_with_kind(&sdir, "sysroot-bundle");
     let slay = layout(&sdir);
@@ -1706,10 +1642,9 @@ const BROKEN_NATIVE_BIN: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0];
 #[cfg(unix)]
 const NO_EXEC_MODE: &[u8; 8] = b"0000644\0";
 
-// THE resolve-failure unwind (fresh install): a sysroot-bundle whose exposed binary
-// cannot load must NOT be left ACTIVE (`decide` would read it as UpToDate forever).
-// The install path unwinds like the transactional flip: no pointer survives, the build
-// is discarded, and a retry with a healthy bundle re-installs cleanly.
+// The resolve-failure unwind (fresh install): a sysroot-bundle whose exposed binary cannot
+// load is not left active (`decide` would read it as UpToDate forever): no pointer
+// survives, the build is discarded, and a retry re-installs.
 #[cfg(unix)]
 #[test]
 fn failed_bundle_resolve_check_unwinds_a_fresh_install() {
@@ -1735,7 +1670,7 @@ fn failed_bundle_resolve_check_unwinds_a_fresh_install() {
         "the broken build is discarded, never re-read as complete"
     );
     assert!(crate::ops::active_builds(&layout).is_empty());
-    // …so a retry (healthy bundle, SAME store) re-installs instead of 'already current'.
+    // …so a retry (healthy bundle, same store) re-installs instead of 'already current'.
     let hdir = scratch("resolve-fresh-retry");
     let healthy = fixture_with_kind(&hdir, "sysroot-bundle");
     let rep = install(&healthy, &layout, &anchor(), &req, fl(0), 0)
@@ -1752,10 +1687,9 @@ fn failed_bundle_resolve_check_unwinds_a_fresh_install() {
     let _ = std::fs::remove_dir_all(&hdir);
 }
 
-// The upgrade variant of the resolve-failure unwind: ay@17 is live, the pinned
-// ay@18 bundle fails its resolve check — shims, witness, and channel `current` all
-// revert to 17 (the prior working surface) and 18 is discarded, exactly what
-// `flip_member` guarantees on the transactional path.
+// The upgrade variant: ay@17 is live and the pinned ay@18 fails its resolve check, so the
+// shims and witness revert to 17 and 18 is discarded, as `flip_member` does on the
+// transactional path.
 #[cfg(unix)]
 #[test]
 fn failed_bundle_resolve_check_reverts_an_upgrade_to_the_prior_build() {
@@ -1794,15 +1728,15 @@ fn failed_bundle_resolve_check_reverts_an_upgrade_to_the_prior_build() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// §7 (step 21): the single-program `install` path also DISABLES a tombstoned build's old
-// working shim. ay@17 is active + shimmed; the channel pins ay=18 but yanks it, so decide()
-// tombstones — install must both return Tombstoned AND replace bin/ay with a failing shim.
+// The single-program `install` path also disables a tombstoned build's old working shim:
+// the channel pins ay=18 but yanks it, so install returns Tombstoned and bin/ay becomes a
+// failing shim.
 #[test]
 fn install_tombstone_disables_the_old_shim() {
     let dir = scratch("install-tomb");
     let layout = layout(&dir);
     seed_build(&layout, "ay", 17, true); // ay@17 active + shimmed
-    // A LIVE forwarding shim (a symlink on Unix, a forwarding `.cmd` on Windows).
+    // A live forwarding shim (a symlink on Unix, a forwarding `.cmd` on Windows).
     assert!(crate::platform::resolve_shim(&shim_of(&layout, "ay")).is_some());
     // Index pins ay=18 but yanks ay@18 → decide() == Tombstone for the installed ay@17.
     let fake = rollback_index(0, &["ay@18"]);
@@ -1834,17 +1768,15 @@ fn install_tombstone_disables_the_old_shim() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An up-to-date pass re-points a MISSING `current` witness at the build the pin and
-/// the shims already agree on — the `doctor` remedy for a program that is on PATH
-/// with no link selecting it (`NoLiveWitness`). No fetch happens, and a second pass
-/// over the now-healthy store is a no-op.
+/// An up-to-date pass re-points a missing `current` witness at the build the pin and the
+/// shims agree on (the `doctor` remedy for `NoLiveWitness`), with no fetch; a second pass
+/// is a no-op.
 #[test]
 fn an_up_to_date_pass_reasserts_a_missing_current_witness() {
     let dir = scratch("witness");
     let fake = fixture(&dir);
     let layout = layout(&dir);
-    // Build 18 on disk and shimmed, exactly as an older manager left it: no
-    // `store/ay/current`, no channel link.
+    // Build 18 on disk and shimmed, with no `store/ay/current`.
     let build_dir = layout.build_dir("ay", 18);
     std::fs::create_dir_all(build_dir.join("bin")).unwrap();
     std::fs::write(build_dir.join("bin").join("ay"), b"#!/bin/true\n").unwrap();
@@ -1878,13 +1810,9 @@ fn an_up_to_date_pass_reasserts_a_missing_current_witness() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE ROSETTA REPAIR, driven through the real apply decision. A build that is LIVE —
-/// its shims resolve into it, so [`crate::ops::active_builds`] reports it and every
-/// apply path feeds that number to `decide` — but whose `<build>.ready` marker this
-/// slice refuses must be RE-STAGED, not read as already-current.
-///
-/// [`installed_for_decide`] is what keeps `decide` from answering UpToDate off the shim
-/// view, which would leave the store on the other architecture's binaries.
+/// The Rosetta repair through the real apply decision: a live build (the shim view reports
+/// it) whose `<build>.ready` this slice refuses is re-staged, not read as already current.
+/// [`installed_for_decide`] keeps `decide` from answering UpToDate off the shim view.
 #[test]
 fn a_live_build_this_slice_cannot_vouch_for_is_re_staged() {
     let dir = scratch("otherslice");
@@ -1897,13 +1825,13 @@ fn a_live_build_this_slice_cannot_vouch_for_is_re_staged() {
         triple: TRIPLE,
         installed: None,
     };
-    // 1. A real install: ay@18 is live, shimmed, and marked by THIS slice.
+    // 1. A real install: ay@18 is live, shimmed, and marked by this slice.
     let first = install(&fake, &layout, &anchor(), &fresh, fl(0), 0).unwrap();
     assert!(!first.already_current);
     assert!(crate::store::build_is_complete(&build_dir));
 
-    // 2. Forge the marker the x86_64 slice would have left on this machine: the
-    //    SIBLING `<build>.ready`, the one file `store::build_is_complete` reads.
+    // 2. Forge the sibling `<build>.ready` another slice would have left, the one file
+    //    `store::build_is_complete` reads.
     let marker = build_dir.with_file_name("18.ready");
     std::fs::write(&marker, "ok\nplatform=some-other-arch-macos\n").unwrap();
     assert!(
@@ -1916,7 +1844,7 @@ fn a_live_build_this_slice_cannot_vouch_for_is_re_staged() {
         "PRECONDITION: the shim view — what every apply path feeds `decide` — says 18"
     );
 
-    // 3. The next native pass, fed exactly what the CLI feeds it.
+    // 3. The next native pass, fed what the CLI feeds it.
     let live = InstallRequest {
         installed: Some(18),
         ..fresh
@@ -1988,8 +1916,7 @@ fn missing_triple_is_a_clean_skip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// Disk preflight is a PURE gate over an injected `available`, so the flow's disk logic is
-// unit-tested WITHOUT a real statvfs (keeping the e2e tests hermetic).
+// Disk preflight is a pure gate over an injected `available`, tested without a real statvfs.
 #[test]
 fn disk_gate_is_pure_and_fails_only_on_a_real_shortfall() {
     // A genuine measured shortfall refuses.
@@ -2018,7 +1945,7 @@ fn disk_gate_is_pure_and_fails_only_on_a_real_shortfall() {
     assert!(disk_gate(1 << 20, Some(u64::MAX)).is_ok());
 }
 
-// --- coherence-group transactional apply (apply_channel over the REAL flow) --------
+// --- coherence-group transactional apply -------------------------------------------
 
 /// A single-file USTAR + zstd archive carrying `bin/<program>`.
 fn prog_archive(dir: &Path, program: &str, build: u64) -> PathBuf {
@@ -2054,7 +1981,7 @@ fn prog_archive(dir: &Path, program: &str, build: u64) -> PathBuf {
 }
 
 /// A signed release whose `stable` channel pins a `rustc` coherence group (trust@4821 +
-/// ay@18) plus consistent per-build manifests + archives.
+/// ay@18), with consistent per-build manifests and archives.
 fn group_fixture(dir: &Path) -> Fake {
     group_fixture_with(dir, &[])
 }
@@ -2120,8 +2047,8 @@ fn group_fixture_of(dir: &Path, unserved: &[&str], bundles: &[&str]) -> Fake {
 /// Unix seconds the quiet-flip tests start from.
 const QUIET_T0: i64 = 1_790_000_000;
 
-/// A store whose `rustc` tuple is live at trust@4800 + ay@17 — what an unattended pass
-/// would supersede with [`group_fixture`]'s trust@4821 + ay@18.
+/// A store whose `rustc` tuple is live at trust@4800 + ay@17, which [`group_fixture`]'s
+/// trust@4821 + ay@18 supersede.
 fn live_toolchain(layout: &Layout) -> std::collections::BTreeMap<String, u64> {
     seed_build(layout, "trust", 4800, true);
     seed_build(layout, "ay", 17, true);
@@ -2239,12 +2166,11 @@ fn a_busy_toolchain_flips_at_once_when_waiting_cannot_help() {
     }
 }
 
-/// STAGE NOW, FLIP WHEN QUIET (gap #12(b)). An unattended pass meets a build running from
-/// the live toolchain: every member it would move has its signed archive in `staging/`,
-/// nothing is extracted, nothing flips, and the wait is recorded. A second pass, still
-/// busy, downloads nothing and keeps the FIRST deferral's clock. The pass that finds the
-/// toolchain quiet flips the tuple from those archives, with no download, and the record
-/// goes.
+/// Stage now, flip when quiet: an unattended pass meeting a build running from the live
+/// toolchain stages every moving member's signed archive, extracts and flips nothing, and
+/// records the wait. A second busy pass downloads nothing and keeps the first deferral's
+/// clock; the pass that finds the toolchain quiet flips from those archives and ends the
+/// record.
 #[test]
 fn an_unattended_pass_stages_the_toolchain_and_flips_it_when_quiet() {
     let dir = scratch("quiet-stage");
@@ -2302,9 +2228,8 @@ fn an_unattended_pass_stages_the_toolchain_and_flips_it_when_quiet() {
         crate::quiet::read(&layout).unwrap().checked,
         QUIET_T0 + 3600
     );
-    // The record names each staged archive, and a gc that resolved none of them — a
-    // person's `atpkg gc`, an install's or the seed's pass-end sweep — keeps them for the
-    // flip, so the flip below still downloads nothing.
+    // The record names each staged archive, so a gc that resolved none of them keeps them
+    // for the flip.
     assert_eq!(
         record.assets,
         std::collections::BTreeMap::from([
@@ -2332,9 +2257,8 @@ fn an_unattended_pass_stages_the_toolchain_and_flips_it_when_quiet() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A DOWNLOAD THAT FAILS ITS SIGNED DIGEST while the flip waits is the stage's failure,
-/// said and recorded the stage's way: the pass aborts, the bad archive goes, and the
-/// refusal memo keeps the next pass from paying the download to be told again.
+/// A download that fails its signed digest while the flip waits is the stage's failure: the
+/// pass aborts, the bad archive goes, and the refusal memo is written.
 #[test]
 fn a_staged_archive_that_fails_its_digest_aborts_and_is_remembered() {
     let dir = scratch("quiet-poison");
@@ -2401,9 +2325,8 @@ fn a_lease_or_an_unreadable_table_holds_the_flip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE WAIT IS BOUNDED: at four hours from the first deferral the flip lands however
-/// busy the toolchain is. A PERSON NEVER WAITS: a pass without the unattended policy
-/// flips at once over the same busy toolchain.
+/// The wait is bounded: four hours from the first deferral the flip lands however busy the
+/// toolchain is. A person never waits: a pass without the unattended policy flips at once.
 #[test]
 fn the_ceiling_flips_a_busy_toolchain_and_a_person_never_waits() {
     {
@@ -2460,9 +2383,8 @@ fn the_ceiling_flips_a_busy_toolchain_and_a_person_never_waits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A HELD FLIP NO GROUP HOLDS ANY LONGER IS OVER: a pass that skips the toolchain's
-/// group whole — nothing of it installed any more — ends the record, so the window's
-/// park stops looking at a flip nobody will make.
+/// A held flip no group holds any longer is over: a pass that skips the toolchain's group
+/// whole (nothing of it installed) ends the record.
 #[test]
 fn a_held_flip_no_group_holds_is_ended_by_the_next_pass() {
     let dir = scratch("quiet-orphan");
@@ -2536,12 +2458,9 @@ fn a_build_started_during_the_extract_holds_the_flip_after_all() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// [`group_fixture`]'s signed release, re-published with the `rustc` tuple pinned ONLY
-/// through a `pin_by_target` overlay for [`TRIPLE`]: the platform-agnostic `pin` names
-/// `trust@4820` (a build with no manifest this fetcher serves, i.e. another target's
-/// pin) and never names `ay`, while the overlay REPLACES trust with 4821 and ADDS
-/// ay@18. A lane that reads the raw pin plans `trust` alone and stages a build that
-/// cannot be fetched; only the per-target view reaches the builds this host can run.
+/// [`group_fixture`]'s release with the `rustc` tuple pinned only through a `pin_by_target`
+/// overlay for [`TRIPLE`]: the raw `pin` names trust@4820 (no manifest served) and no `ay`;
+/// the overlay replaces trust with 4821 and adds ay@18.
 fn overlay_group_fixture(dir: &Path) -> Fake {
     let mut fake = group_fixture(dir);
     let index_body = format!(
@@ -2558,9 +2477,8 @@ fn overlay_group_fixture(dir: &Path) -> Fake {
     fake
 }
 
-/// The update lane honours the per-target pin: `apply_channel` and `apply_program`
-/// plan the tuple from `channel_for(.., TRIPLE)`, so the overlay-ADDED `ay` is a
-/// member at all and `trust` lands on the overlay's 4821, never the raw channel's.
+/// The update lanes honour the per-target pin: the overlay-added `ay` is a member and
+/// `trust` lands on the overlay's 4821, never the raw channel's.
 #[test]
 fn update_lanes_apply_the_per_target_pin_overlay() {
     for lane in ["channel", "program"] {
@@ -2610,10 +2528,8 @@ fn update_lanes_apply_the_per_target_pin_overlay() {
     }
 }
 
-/// The tuple-bootstrap lane stages what its caller planned: `bootstrap_group` resolves
-/// the same per-target view the CLI's plan and `group_missing_triple` prescan used, so
-/// a group the prescan says is served installs whole (the raw pin, pkg-trust-4820, is
-/// not served for this host).
+/// The tuple-bootstrap lane stages what its caller planned: `bootstrap_group` resolves the
+/// same per-target view as the CLI's plan and the `group_missing_triple` prescan.
 #[test]
 fn bootstrap_group_stages_the_per_target_pin_overlay() {
     let dir = scratch("overlay-bootstrap");
@@ -2655,9 +2571,8 @@ fn bootstrap_group_stages_the_per_target_pin_overlay() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `plan_update` decides against the per-target pin: trust@4821 installed from the
-/// overlay is up to date (not a "move" to another target's 4820), and the overlay-added
-/// `ay` is pinned (not `NotPinned`).
+/// `plan_update` decides against the per-target pin: trust@4821 is up to date (not a move to
+/// another target's 4820), and the overlay-added `ay` is pinned.
 #[test]
 fn plan_update_decides_against_the_per_target_pin_overlay() {
     let dir = scratch("overlay-plan");
@@ -2693,10 +2608,8 @@ fn plan_update_decides_against_the_per_target_pin_overlay() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// Atomicity under failure: corrupt one member's archive so its stage fails; the WHOLE
-// group aborts during the stage phase, NOTHING is flipped, AND the already-staged
-// sibling's build is DISCARDED (not left complete-but-inactive) — then a retry with the
-// corruption cleared heals the tuple coherently.
+// Atomicity under failure: one member's stage fails, the whole group aborts before any
+// flip, the already-staged sibling's build is discarded, and a retry heals the tuple.
 #[test]
 fn a_member_stage_failure_aborts_the_group_and_a_retry_heals_it() {
     let dir = scratch("group-abort");
@@ -2739,8 +2652,8 @@ fn a_member_stage_failure_aborts_the_group_and_a_retry_heals_it() {
         crate::ops::which(&layout, "ay").is_none(),
         "ay never flipped (group is atomic)"
     );
-    // CRUCIAL — the already-staged ay@18 build was DISCARDED, so it can't be mis-read as
-    // active on the next run (which would permanently split the tuple).
+    // The already-staged ay@18 was discarded, so the next run cannot read it as active and
+    // split the tuple.
     assert!(
         !layout.build_dir("ay", 18).exists(),
         "aborted-group staged build is discarded"
@@ -2749,10 +2662,8 @@ fn a_member_stage_failure_aborts_the_group_and_a_retry_heals_it() {
         !crate::store::build_is_complete(&layout.build_dir("ay", 18)),
         "no lingering completeness marker for the discarded build"
     );
-    // The FAILED member's archive is reclaimed — nobody ever comes back for it — while
-    // the sibling that staged fine BEFORE the abort KEEPS its verified archive: the
-    // abort takes its extracted tree (it must), and taking the download with it made
-    // the next pass refetch a member that never failed (the carry test above).
+    // The failed member's archive is reclaimed, while the sibling that staged fine keeps
+    // its verified archive so the next pass does not refetch it.
     assert!(
         staged_assets(&layout, "trust").is_empty(),
         "the failing member stranded its archive: {:?}",
@@ -2763,7 +2674,7 @@ fn a_member_stage_failure_aborts_the_group_and_a_retry_heals_it() {
         vec!["ay-18.tar.zst".to_string()]
     );
 
-    // Heal: clear the corruption (re-create the real signed archive) and retry.
+    // Heal: re-create the real signed archive and retry.
     prog_archive(&dir, "trust", 4821);
     let report2 = apply_channel(
         &fake,
@@ -2792,12 +2703,10 @@ fn a_member_stage_failure_aborts_the_group_and_a_retry_heals_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// The abort discard must never delete a build that was ALREADY LIVE when this
-// transaction re-staged it. The shim-derived `installed` view goes silent when a
-// program's tools are gone (`atpkg unlink`, tombstones, dev-link mode) while the
-// `current` authority links still name the live build, so `decide` legitimately
-// returns Install for the build that is already active. A SIBLING member then failing
-// to stage must not take that live toolchain down with it.
+// The abort discard never deletes a build that was already live when this transaction
+// re-staged it: with a program's shims gone the shim view is silent, so `decide` returns
+// Install for the build `current` still names, and a sibling's stage failure must not take
+// that toolchain down.
 #[test]
 fn a_group_abort_never_discards_a_member_that_was_already_live() {
     let dir = scratch("group-abort-live");
@@ -2824,11 +2733,9 @@ fn a_group_abort_never_discards_a_member_that_was_already_live() {
         "PRECONDITION: ay@18 is installed and complete"
     );
 
-    // 2. `atpkg unlink`-shaped state: ay's shims are gone — the primary AND the
-    //    `alab-ay` alias the flip laid beside it (ay is ALab's own in this index), since
-    //    the alias resolves into the same build and would keep the shim view talking —
-    //    so the SHIM view is silent for ay while the authority link still names ay@18
-    //    as live.
+    // 2. `atpkg unlink`-shaped state: ay's shims are gone (the primary and its `alab-ay`
+    //    alias, which would keep the shim view talking), so the shim view is silent for ay
+    //    while the authority link still names ay@18.
     std::fs::remove_file(layout.shim(&tool("ay"))).unwrap();
     std::fs::remove_file(layout.shim(&tool("alab-ay"))).unwrap();
     assert!(
@@ -2841,7 +2748,7 @@ fn a_group_abort_never_discards_a_member_that_was_already_live() {
         "PRECONDITION: the authority link still names ay@18, so it IS live"
     );
 
-    // 3. A SIBLING member fails to stage → the group aborts after ay re-staged fine.
+    // 3. A sibling fails to stage, so the group aborts after ay re-staged fine.
     std::fs::write(fake.archives.get("trust-4821.tar.zst").unwrap(), b"corrupt").unwrap();
     let report = apply_channel(
         &fake,
@@ -2867,7 +2774,7 @@ fn a_group_abort_never_discards_a_member_that_was_already_live() {
         report.groups[0].1
     );
 
-    // The casualty test: the failing member is `trust`; `ay` must survive intact.
+    // The failing member is `trust`; `ay` must survive intact.
     assert!(
         ay18.is_dir(),
         "the abort discarded a build that was already LIVE — the toolchain is gone"
@@ -2890,12 +2797,9 @@ fn a_group_abort_never_discards_a_member_that_was_already_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The same repair inside the GROUP transaction, which decides per member from its own
-/// `decide` call: a tuple member whose store tree this slice cannot vouch for must be
-/// re-staged, not held at UpToDate beside its healthy sibling. `update` routes every
-/// coherence-group member (trust, ay, …) through here, so without this the Rosetta
-/// store and the marker-less live tree were permanent for exactly the programs the
-/// platform record was written for.
+/// The same repair inside the group transaction, which decides per member: a tuple member
+/// whose store tree this slice cannot vouch for is re-staged, not held at UpToDate beside
+/// its healthy sibling.
 #[test]
 fn a_group_member_this_slice_cannot_vouch_for_is_re_staged() {
     let dir = scratch("group-otherslice");
@@ -2921,9 +2825,8 @@ fn a_group_member_this_slice_cannot_vouch_for_is_re_staged() {
         "PRECONDITION: ay@18 is installed and complete"
     );
 
-    // 2. ay@18 loses the marker this slice reads — the other slice's `platform=` record,
-    //    or a restore/interrupted-swap recovery that left the tree unmarked. The shims
-    //    still resolve into it, so the shim view keeps reporting 18.
+    // 2. ay@18 loses the marker this slice reads (another slice's `platform=` record, or an
+    //    unmarked recovery). The shims still resolve into it, so the shim view says 18.
     crate::store::clear_build_ready(&ay18).unwrap();
     let live = crate::ops::active_builds(&layout);
     assert_eq!(
@@ -2933,7 +2836,7 @@ fn a_group_member_this_slice_cannot_vouch_for_is_re_staged() {
     );
     assert_eq!(live.get("trust").copied(), Some(4821));
 
-    // 3. The next pass, fed that map exactly as `cmd_update_all` feeds it.
+    // 3. The next pass, fed that map as `cmd_update_all` feeds it.
     let report = apply_channel(
         &fake,
         &layout,
@@ -2963,8 +2866,7 @@ fn a_group_member_this_slice_cannot_vouch_for_is_re_staged() {
         "and the tool still resolves into the re-staged tree"
     );
 
-    // A healthy tuple is still a no-op — the completeness input never re-downloads a
-    // store that is sound.
+    // A healthy tuple is still a no-op.
     let report = apply_channel(
         &fake,
         &layout,
@@ -2981,9 +2883,9 @@ fn a_group_member_this_slice_cannot_vouch_for_is_re_staged() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// The missing-triple hold at the flow layer: an installed tuple (ay@17 + trust@4820)
-// whose new pin trust@4821 publishes no artifact for this triple is held whole on its
-// current builds — never staged, never aborted, nothing resolved for download.
+// The missing-triple hold: an installed tuple (ay@17 + trust@4820) whose new pin trust@4821
+// publishes nothing for this triple is held whole: never staged or aborted, nothing
+// resolved.
 #[test]
 fn an_installed_group_whose_new_pin_lacks_this_triple_is_held_whole() {
     let dir = scratch("group-unpublished");
@@ -3081,8 +2983,7 @@ fn an_up_to_date_member_whose_pin_lacks_this_triple_never_holds_its_sibling() {
 
 // --- rollback + local pin + apply_program (steps 9/10/11) --------------------------
 
-/// Lay down a COMPLETE build dir with `bin/<program>`; `activate` also shims + activates
-/// it (making it the ACTIVE build).
+/// A complete build dir with `bin/<program>`; `activate` also shims and activates it.
 fn seed_build(layout: &Layout, program: &str, build: u64, activate: bool) {
     let dir = layout.build_dir(program, build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -3104,8 +3005,8 @@ fn seed_build(layout: &Layout, program: &str, build: u64, activate: bool) {
     crate::store::mark_build_ready(&dir).unwrap();
 }
 
-/// An index-only Fake (empty pkg/archives — rollback never downloads) pinning `ay` with a
-/// configurable `min_build` + `yanked` list, so the floor/yank gate is exercised.
+/// An index-only Fake (rollback never downloads) pinning `ay`, with a configurable
+/// `min_build` and `yanked` list.
 fn rollback_index(min_build: u64, yanked: &[&str]) -> Fake {
     let yanked_toml = if yanked.is_empty() {
         String::new()
@@ -3128,9 +3029,8 @@ fn rollback_index(min_build: u64, yanked: &[&str]) -> Fake {
     }
 }
 
-/// [`rollback_index`] with the floor published PER PROGRAM (`min_build_by_program`), the
-/// channel-wide floor left at 0 — the only shape that can floor one program of a channel
-/// whose members have independent build counters without refusing the others' builds.
+/// [`rollback_index`] with the floor published per program (`min_build_by_program`) and the
+/// channel-wide floor at 0.
 fn rollback_index_per_program(floor_ay: u64) -> Fake {
     let index_body = format!(
         "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
@@ -3147,19 +3047,15 @@ fn rollback_index_per_program(floor_ay: u64) -> Fake {
     }
 }
 
-/// EXHAUSTIVE CONFORMANCE FOR THE REMOVED-MEMBER HOLD: what an unattended update does
-/// to a coherence tuple when the user has deliberately uninstalled part of it. The
-/// state space is small but too big to hold in your head: per member, {absent, safe,
-/// revoked} × {recorded-removed or not}, against {clean, installed-build-yanked,
-/// pin-yanked} — so it is enumerated instead of argued about. The assertions below are the
-/// INVARIANTS, not the expected outputs of any particular branch — they are what
-/// must hold whatever the implementation decides:
+/// Exhaustive conformance for the removed-member hold: what an unattended update does to a
+/// coherence tuple part of which the user uninstalled, enumerated over ay {absent, safe,
+/// revoked} × trust {absent, installed} × removal records × exclusions, against {clean,
+/// installed-build-yanked, pin-yanked}. The assertions are invariants, not expected outputs;
+/// the core three (the rest are stated inline):
 ///
-///   I1. A member that is recorded-removed AND absent is never installed. That is
-///       the whole point of the record.
-///   I2. A revoked installed build is never left RUNNABLE. It is either upgraded to
-///       the valid pin or its tools are tombstoned — never silently kept.
-///   I3. The pass never claims `UpToDate` while some installed member is revoked.
+/// - I1. A member recorded-removed and absent is never installed.
+/// - I2. A revoked installed build is never left runnable: upgraded or tombstoned.
+/// - I3. The pass never claims `UpToDate` while an installed member is revoked.
 ///
 /// Each channel — clean, the INSTALLED build (`ay@17`) yanked, the PIN (`ay@18`) yanked —
 /// enumerates its own 72 cases over ONE signed fixture: the release (two real archives,
@@ -3189,8 +3085,8 @@ fn the_removed_member_hold_is_exhaustively_safe() {
     }
 }
 
-/// Every case of the removed-member hold on ONE channel; returns how many cases
-/// reached a report (a resolve/verify failure is not this predicate's business).
+/// Every case of the removed-member hold on one channel; returns how many reached a report
+/// (a resolve/verify failure is not this predicate's business).
 fn removed_member_hold_cases(cname: &str, make: fn(&Path) -> Fake) -> usize {
     let fixture_dir = scratch(&format!("hold-fixture-{cname}"));
     let fake = make(&fixture_dir);
@@ -3426,8 +3322,7 @@ fn removed_member_hold_lane(cname: &str, fake: &Fake, ay: Ay) -> usize {
     checked
 }
 
-/// [`group_fixture`] but whose stable channel YANKS `ay@18`, so `decide` tombstones the
-/// group (to prove a pin never suppresses a tombstone).
+/// [`group_fixture`] with `ay@18` yanked, so `decide` tombstones the group.
 fn group_fixture_yanking_ay18(dir: &Path) -> Fake {
     let mut f = group_fixture(dir);
     let index_body = format!(
@@ -3444,8 +3339,8 @@ fn group_fixture_yanking_ay18(dir: &Path) -> Fake {
     f
 }
 
-// THE pin-authority test: a local pin freezes the WHOLE group on its current builds; the
-// upgrade is suppressed, nothing is staged, and the sibling is not pulled in.
+// A local pin freezes the whole group on its current builds: no upgrade staged, no sibling
+// pulled in.
 #[test]
 fn a_local_pin_holds_a_whole_group_and_never_moves_it() {
     let dir = scratch("pin-holds");
@@ -3481,8 +3376,8 @@ fn a_local_pin_holds_a_whole_group_and_never_moves_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fixture: the pin (ay=18) is VALID, but the currently-installed build ay@17 is YANKED.
-/// decide() returns Install (force-upgrade off 17), NOT Tombstone.
+/// Fixture: the pin (ay=18) is valid but the installed ay@17 is yanked, so `decide` returns
+/// Install (force-upgrade off 17), not Tombstone.
 fn group_fixture_yanking_ay17(dir: &Path) -> Fake {
     let mut f = group_fixture(dir);
     let index_body = format!(
@@ -3499,9 +3394,8 @@ fn group_fixture_yanking_ay17(dir: &Path) -> Fake {
     f
 }
 
-// THE critical-fix regression: a local pin must NOT keep a YANKED current build running.
-// ay@17 is active + pinned, but 17 is yanked and the pin (18) is valid — the pin is IGNORED
-// and the tuple force-upgrades off the revoked build, rather than freezing on it.
+// A local pin never keeps a yanked current build running: ay@17 is pinned but yanked and
+// the pin (18) is valid, so the tuple force-upgrades.
 #[test]
 fn a_local_pin_does_not_hold_a_yanked_current_build() {
     let dir = scratch("pin-yanked-current");
@@ -3535,7 +3429,7 @@ fn a_local_pin_does_not_hold_a_yanked_current_build() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// A pin NEVER suppresses a tombstone: a yanked pin tombstones the group even when pinned.
+// A pin never suppresses a tombstone: a yanked pin tombstones the group even when pinned.
 #[test]
 fn a_pin_never_suppresses_a_tombstone() {
     let dir = scratch("pin-tombstone");
@@ -3569,8 +3463,8 @@ fn a_pin_never_suppresses_a_tombstone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// [`fixture`] — the SINGLETON `ay` (no `coherence_group`) — with its own pin YANKED,
-/// so `decide` tombstones it and the pass disables its live shims for real.
+/// [`fixture`] (the singleton `ay`, no `coherence_group`) with its own pin yanked, so
+/// `decide` tombstones it and the pass disables its live shims.
 fn fixture_yanking_the_pin(dir: &Path) -> Fake {
     let mut f = fixture(dir);
     let index_body = format!(
@@ -3586,11 +3480,10 @@ fn fixture_yanking_the_pin(dir: &Path) -> Fake {
     f
 }
 
-// THE TOMBSTONE'S OWN INSTRUCTION HAS TO WORK. The failing shim says "run `aterm pkg
-// update`", and for a tombstoned SINGLETON (or a tuple every member of which was
-// tombstoned) the plain pass must re-stage it although `installed` is the shim view and
-// a tombstone resolves nowhere. On a machine that installed one program by name (never
-// adopted the set) the set-completion lane cannot stand in.
+// The tombstone's own instruction ("run `aterm pkg update`") has to work: the plain pass
+// re-stages a tombstoned singleton although a tombstone resolves nowhere in the shim view
+// `installed` is. The set-completion lane cannot stand in on a machine that never adopted
+// the set.
 #[test]
 fn a_plain_update_revives_a_tombstoned_singleton_when_its_pin_is_good_again() {
     let dir = scratch("tombstone-singleton-revive");
@@ -3620,15 +3513,14 @@ fn a_plain_update_revives_a_tombstoned_singleton_when_its_pin_is_good_again() {
         crate::platform::resolve_shim(&shim).is_none(),
         "bin/ay is now the failing tombstone that says to run `aterm pkg update`"
     );
-    // PRECONDITION: the shim view `cmd_update_all_code` feeds this lane is SILENT for
-    // ay.
+    // Precondition: the shim view `cmd_update_all_code` feeds this lane is silent for ay.
     let live = crate::ops::active_builds(&layout);
     assert!(
         !live.contains_key("ay"),
         "a tombstone resolves nowhere, so the shim view does not name ay"
     );
-    // 2. The publisher re-points the pin at a good build. A PLAIN `update` pass — fed
-    //    that silent map, exactly as the CLI feeds it — must re-stage the singleton.
+    // 2. The publisher re-points the pin at a good build: a plain `update` pass fed that
+    //    silent map, as the CLI feeds it, re-stages the singleton.
     let report = apply_channel(
         &fixture(&dir),
         &layout,
@@ -3711,12 +3603,8 @@ fn rollback_selects_the_highest_gate_valid_build_below_current() {
     }
 }
 
-/// A GUTTED ROLLBACK TARGET: a build with orphaned `lib/`, no `bin/`, and a `.ready`
-/// marker still saying `ok`. Rolled back to, every shim would be removed and the
-/// machine left with no compiler. A build on disk may carry a marker written by a
-/// version that recorded nothing, so selection asks the tree directly. The fixture
-/// forges exactly that: a LEGACY marker (a bare `ok\n`, which every older atpkg wrote)
-/// over a gutted tree.
+/// A gutted rollback target (orphaned `lib/`, no `bin/`, a legacy bare `ok\n` marker) would
+/// remove every shim, so selection asks the tree directly and skips it.
 #[test]
 fn rollback_refuses_a_target_whose_tools_are_gone_and_takes_the_one_below() {
     let dir = scratch("rollback-gutted");
@@ -3725,8 +3613,7 @@ fn rollback_refuses_a_target_whose_tools_are_gone_and_takes_the_one_below() {
     seed_build(&layout, "ay", 16, false);
     seed_build(&layout, "ay", 17, false);
     seed_build(&layout, "ay", 18, true); // active
-    // Gut 17 the way an interrupted removal does, and re-mark it the way every atpkg
-    // before the contents record did: a bare `ok`, vouching for a tree with no `bin/`.
+    // Gut 17 as an interrupted removal does, under a legacy bare `ok` marker.
     std::fs::remove_dir_all(layout.build_dir("ay", 17).join("bin")).unwrap();
     std::fs::write(
         layout.build_dir("ay", 17).with_file_name("17.ready"),
@@ -3749,8 +3636,7 @@ fn rollback_refuses_a_target_whose_tools_are_gone_and_takes_the_one_below() {
         "and the shim points at a binary that is actually there"
     );
 
-    // …and when the gutted build is the ONLY candidate, the verb REFUSES rather than
-    // disarming the machine. Nothing may be removed on the way to that refusal.
+    // …and when the gutted build is the only candidate, the verb refuses, removing nothing.
     std::fs::remove_dir_all(layout.build_dir("ay", 16).join("bin")).unwrap();
     std::fs::write(
         layout.build_dir("ay", 16).with_file_name("16.ready"),
@@ -3937,9 +3823,9 @@ fn rollback_reports_the_pins_that_hold_it() {
     );
 }
 
-// --- requires dependency pull-in (step 17) -----------------------------------------
+// --- requires dependency pull-in ----------------------------------------------------
 
-/// A signed release naming `ay`@18 + `ny`@9 (NO coherence group), with configurable
+/// A signed release naming `ay`@18 + `ny`@9 (no coherence group), with configurable
 /// per-program `requires` and channel `yanked`.
 fn requires_fixture(
     dir: &Path,
@@ -4000,11 +3886,10 @@ fn requires_fixture(
     }
 }
 
-/// THE RETIRED `requires` (§5.3(b)) is refused on BOTH lanes: `ay`'s signed index row
-/// names it, so `install` refuses ay before any manifest is fetched, and the update
-/// lane aborts ay's group with the same sentence — held on its current build, nothing
-/// resolved or staged — even though what it names (`ny`) is live. `ny`, which names
-/// nothing, installs as ever; and an up-to-date group has nothing to refuse.
+/// The retired index-row `requires` is refused on both lanes: `install` refuses ay before any
+/// manifest is fetched, and the update lane aborts ay's group with the same sentence, held on
+/// its current build. `ny`, which names nothing, installs; an up-to-date group refuses
+/// nothing.
 #[test]
 fn a_program_naming_the_retired_requires_is_refused_on_both_lanes() {
     let dir = scratch("requires-retired");
@@ -4118,8 +4003,8 @@ fn requires_pulls_in_missing_dep() {
         crate::ops::which(&layout, "ny").is_some(),
         "the dep is live too"
     );
-    // The alias policy through the REAL pipeline (§17.11): ALab's own programs (no
-    // `system`) get `alab-<tool>` beside `<tool>`, a pulled-in dependency included.
+    // The alias policy through the real pipeline: ALab's own programs (no `system`) get
+    // `alab-<tool>` beside `<tool>`, a pulled-in dependency included.
     for program in ["ay", "ny"] {
         let alias = format!("alab-{program}");
         assert!(
@@ -4130,9 +4015,8 @@ fn requires_pulls_in_missing_dep() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A dependency the gate refuses — a yanked build, or a program the signed index does
-/// not list (requires can't install an unlisted repo) — is Skipped, not fatal: `ay`
-/// still installs, and the gate is NOT bypassed for the dependency.
+/// A dependency the gate refuses (a yanked build, or a program the signed index does not
+/// list) is skipped, not fatal: `ay` still installs, and the gate is not bypassed.
 #[test]
 fn requires_skips_a_yanked_or_unreachable_dep() {
     for (label, yanked, dep) in [
@@ -4203,7 +4087,7 @@ fn requires_already_present_dep_not_reinstalled() {
 #[test]
 fn requires_cycle_terminates() {
     let dir = scratch("req-cycle");
-    // ay requires ny AND ny requires ay.
+    // ay requires ny and ny requires ay.
     let fake = requires_fixture(&dir, &[], &["ny"], &["ay"]);
     let layout = layout(&dir);
     let req = InstallRequest {
@@ -4242,10 +4126,8 @@ fn install_report_carries_signed_tree_root() {
         !report.tree_root.is_empty(),
         "the signed tree_root is recorded"
     );
-    // The walk `atpkg verify` runs: over the declared-mode record the stage left
-    // beside the build on a filesystem without permission bits (Windows), and the
-    // plain read-back walk where the inode has them (Unix, where the record is
-    // empty and never consulted).
+    // The walk `atpkg verify` runs: over the declared-mode record where the filesystem has
+    // no permission bits (Windows), the plain read-back walk where it does (Unix).
     let build_dir = layout.build_dir("ay", 18);
     let modes = crate::store::declared_modes(&build_dir).unwrap();
     assert_eq!(
@@ -4256,10 +4138,9 @@ fn install_report_carries_signed_tree_root() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- dev-link skip + dir fetcher + same-source cache (steps 13/14) ------------------
+// --- dev-link skip + dir fetcher + same-source cache ---------------------------------
 
-/// Mark `program` dev-linked by writing a minimal marker (no real checkout needed to
-/// exercise the is_linked HARD-SKIP).
+/// Mark `program` dev-linked with a minimal marker (no real checkout needed).
 fn mark_linked(layout: &Layout, program: &str) {
     std::fs::create_dir_all(layout.links_dir()).unwrap();
     std::fs::write(
@@ -4327,9 +4208,8 @@ fn apply_channel_skips_a_linked_group_member() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A [`Fake`] wrapper whose index fetch can be toggled to fail — or to succeed
-/// EMPTY (the pushed-off-the-page listing) — with a controllable `source_id`
-/// (to exercise the same-source cache guard + the empty-success fallback).
+/// A [`Fake`] whose index fetch can be toggled to fail or to succeed empty, with a
+/// controllable `source_id` for the same-source cache guard.
 struct FlakyFake {
     inner: Fake,
     fail: std::cell::Cell<bool>,
@@ -4383,14 +4263,13 @@ fn cached_index_is_used_only_on_same_source_fetch_failure() {
         triple: TRIPLE,
         installed: None,
     };
-    // 1. A good fetch installs AND caches the index under source "src:A".
+    // 1. A good fetch installs and caches the index under source "src:A".
     install(&f, &layout, &anchor(), &req, fl(0), 0).unwrap();
-    // 2. Fetch now fails, SAME source → the install is served from the cache.
+    // 2. Fetch now fails, same source: the install is served from the cache.
     f.fail.set(true);
     install(&f, &layout, &anchor(), &req, fl(0), 0).expect("cache fallback serves the index");
-    // 3. A DIFFERENT source with a failing fetch has no cache to fall back on.
-    //    The error must name TRANSPORT, not trust: this is the state an offline,
-    //    proxied or rate-limited machine reaches, and its fix is the network, not keys.
+    // 3. A different source with a failing fetch has no cache to fall back on, and the
+    //    error names transport, not trust: the fix is the network, not keys.
     let f2 = FlakyFake::new(fixture(&dir), "src:B");
     f2.fail.set(true);
     let err = install(&f2, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
@@ -4402,10 +4281,9 @@ fn cached_index_is_used_only_on_same_source_fetch_failure() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE TYPED LANES NAME THE NETWORK. `plan_update` (the typed `update <program>`
-/// lane, like `rollback` and `apply_program`) resolves live with no cache: a fetch
-/// that could not reach the source is `Unreachable` with the transport's reason,
-/// and a source reached that lists nothing is `NoIndex`.
+/// The typed lanes name the network: `plan_update` resolves live with no cache, so an
+/// unreached source is `Unreachable` with the transport's reason, and a reached source that
+/// lists nothing is `NoIndex`.
 #[test]
 fn a_typed_lane_reports_an_unreached_index_as_the_network() {
     let dir = scratch("typed-unreachable");
@@ -4441,10 +4319,8 @@ fn a_typed_lane_reports_an_unreached_index_as_the_network() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// An EMPTY listing success is a fetch that FOUND nothing — the index tag pushed off
-// the release page by app-release cadence, a repo with no index release — and must
-// take the SAME §14 same-source fallback as a hard Err, never a repo-wide NoIndex
-// while a good cache sits on disk.
+// An empty listing is a fetch that found nothing: it takes the same same-source cache
+// fallback as a hard `Err`, never a NoIndex while a good cache sits on disk.
 #[test]
 fn empty_candidates_success_takes_the_same_source_cache_fallback() {
     let dir = scratch("cache-empty");
@@ -4456,11 +4332,10 @@ fn empty_candidates_success_takes_the_same_source_cache_fallback() {
         triple: TRIPLE,
         installed: None,
     };
-    // 1. A good fetch installs AND caches under "src:A".
+    // 1. A good fetch installs and caches under "src:A".
     install(&f, &layout, &anchor(), &req, fl(0), 0).unwrap();
-    // 2. The listing now succeeds EMPTY, SAME source → served from the cache, and the
-    //    resolve says it ran on the cache: the cache's bytes are no verification of what
-    //    the source served (no success stamp, no current yank latch).
+    // 2. The listing now succeeds empty from the same source: served from the cache, and
+    //    the resolve says so (no success stamp, no current yank latch).
     f.empty.set(true);
     let live = live_verifications();
     install(&f, &layout, &anchor(), &req, fl(0), 0)
@@ -4497,7 +4372,7 @@ fn stale_cached_index_is_still_refused() {
         install(&f, &layout, &anchor(), &req, fl(0), 2_000_000_000),
         Err(FlowError::Stale)
     ));
-    // The fetch now fails → fallback to the cached bytes, which are STILL past valid_until.
+    // The fetch now fails: fallback to the cached bytes, which are still past valid_until.
     f.fail.set(true);
     assert!(
         matches!(
@@ -4517,8 +4392,7 @@ fn dir_fetcher_installs_end_to_end() {
     std::fs::create_dir_all(&reg).unwrap();
     std::fs::write(reg.join("index.toml"), &fake.index).unwrap();
     std::fs::write(reg.join("index.toml.sig"), &fake.index_sig).unwrap();
-    // A `dir:` registry publishes the master-signed roster too, exactly as a release
-    // does: index without the generation that authorized its signer is not a registry.
+    // A `dir:` registry publishes the master-signed roster too, as a release does.
     let (rb, rs) = testkit::published_roster();
     std::fs::write(reg.join(aterm_update_core::roster::ROSTER_ASSET), &rb).unwrap();
     std::fs::write(reg.join(aterm_update_core::roster::ROSTER_SIG_ASSET), &rs).unwrap();
@@ -4570,11 +4444,8 @@ fn bare_build(l: &Layout, program: &str, build: u64, bins: &[&str]) -> PathBuf {
     dir
 }
 
-/// ROLLBACK RESTORES THE PRIOR BUILD'S WHOLE SURFACE. A tool the prior build shipped
-/// and the new build DROPPED has no shim by rollback time — the new build's
-/// `install_tools` prune deleted it (same program, different build: exactly its job) —
-/// so a rollback iterating only the NEW exposes list re-activates the prior build with
-/// that tool missing from PATH. The restore set is the union with the prior `bin/`.
+/// Rollback restores the prior build's whole surface: a tool the new build dropped lost its
+/// shim to the new build's prune, so the restore set is the new exposes plus the prior `bin/`.
 #[test]
 fn rollback_restores_a_tool_the_new_build_dropped() {
     let dir = scratch("rb-union");
@@ -4615,18 +4486,12 @@ fn rollback_restores_a_tool_the_new_build_dropped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A TRUST ROLLBACK NEVER TAKES ANOTHER PROGRAM'S SHIM. A sysroot bundle's `bin/`
-/// carries backends belonging to other atpkg programs (trust's carries `ay`, `clean`
-/// and `ty`); were the rollback's LISTING half to re-point `bin/ty` at
-/// `store/trust/<prior>`, the next trust flip's prune would delete it as a stale trust
-/// shim. Covered here: a shim another program owns (ty), another
-/// installed program's own name whose shim is already missing (ay), a dev link into a
-/// checkout (clean) — each left alone. The tool the prior trust build ships and nobody
-/// owns (`trustd`, absent) is still restored, AS IT ALWAYS WAS: that pins the old
-/// behaviour for an unowned name, not a requirement. The listing half exists to restore a
-/// tool the prior build EXPOSED and the new one dropped; `trustd` is in trust's `bin/`
-/// but not its signed exposes, and laying it is a known over-reach this manager cannot
-/// tell apart until each build records its signed exposes at stage time.
+/// A trust rollback never takes another program's shim: a sysroot bundle's `bin/` carries
+/// other programs' backends, and a `bin/ty` re-pointed into `store/trust/<prior>` would be
+/// pruned by the next trust flip. A shim another program owns (ty), an installed program's
+/// own name with no shim (ay) and a dev link (clean) are left alone. The unowned `trustd` is
+/// still restored: it is in trust's `bin/` but not its signed exposes, a known over-reach
+/// until each build records its signed exposes at stage time.
 #[cfg(unix)]
 #[test]
 fn a_trust_rollback_never_takes_another_programs_shim() {
@@ -4704,7 +4569,7 @@ fn a_trust_rollback_never_takes_another_programs_shim() {
         into("trustd")
     );
 
-    // The flip that follows prunes stale TRUST shims; ty's must survive it.
+    // The flip that follows prunes stale trust shims; ty's must survive it.
     activate_build(&l, &t2).unwrap();
     install_tools(&l, &t2, &[tool("trustc")], Aliases::Alab).unwrap();
     owned_by_ty("after the next trust flip");
@@ -4712,12 +4577,9 @@ fn a_trust_rollback_never_takes_another_programs_shim() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LISTING NAME'S ALIAS GETS ITS OWN OWNERSHIP CHECK. The primary `bin/trustd` is
-/// absent — free, so the rollback may restore it into the prior trust build — while
-/// `alab-trustd` is a dev link into a checkout. Restoring the primary must not drag the
-/// alias along: the alias is someone else's, and is left exactly where it points. The
-/// counter-case in the same run: `trustc`, a signed expose, has its alias re-pointed
-/// unconditionally, as before.
+/// A listing name's alias gets its own ownership check: the free primary `trustd` is
+/// restored into the prior build, but the dev-linked `alab-trustd` is left alone. A signed
+/// expose's alias (`alab-trustc`) is re-pointed unconditionally.
 #[cfg(unix)]
 #[test]
 fn a_rollback_never_takes_a_foreign_alias_of_a_listing_name() {
@@ -4775,13 +4637,10 @@ fn a_rollback_never_takes_a_foreign_alias_of_a_listing_name() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AN OLDER PREFIX STILL OWNS ITS PROGRAMS' NAMES. A prefix laid before the
-/// per-program `store/<program>/current` link has an installed `ay` — a COMPLETE build
-/// under `store/ay/` — and no link. Its shim is gone. A trust rollback finds `ay` in
-/// the prior bundle's `bin/` and must still refuse it: an absent shim is not a free
-/// name when a program of that name is installed, or the next trust flip prunes it
-/// and `ay` is lost. The negative half: the same rollback with the ay
-/// build left INCOMPLETE (no marker, so not installed) does restore `ay` for trust.
+/// A program installed without a `current` link and with no shim still owns its names: a
+/// trust rollback that finds `ay` in the prior bundle's `bin/` must not take it while a
+/// complete `ay` build is in the store, or the next trust flip prunes it. With the ay build
+/// incomplete (not installed) the rollback restores `ay` for trust.
 #[cfg(unix)]
 #[test]
 fn a_rollback_respects_a_program_installed_without_a_current_link() {
@@ -4829,12 +4688,10 @@ fn a_rollback_respects_a_program_installed_without_a_current_link() {
     }
 }
 
-/// A ROLLBACK TO AN AFFECTED TRUST BUILD LAYS ITS EXEC ROOT BEFORE ITS SHIMS. Live on
-/// trust 8595 (routed through its root), rolled back to a retained 8590 that has no root
-/// yet — both shipping `bin/rustc` as a separate file from `bin/trustc`: the undo lays
-/// `compat/trust/8590` itself and the re-pointed `tippy` shim routes through it on the
-/// first render, with no reconcile: the single-program update and install lanes run
-/// no reconcile after a failed flip.
+/// A rollback to an affected trust build lays its exec root before its shims: rolled back
+/// from 8595 to a retained 8590 with no root yet, the undo lays `compat/trust/8590` and the
+/// re-pointed `tippy` shim routes through it at once, since the single-program lanes run no
+/// reconcile after a failed flip.
 #[cfg(unix)]
 #[test]
 fn rollback_to_an_affected_trust_build_lays_its_root_and_routes() {
@@ -4892,11 +4749,9 @@ fn rollback_to_an_affected_trust_build_lays_its_root_and_routes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// ALIASES RIDE WITH THEIR PRIMARY through the transaction's other exits: a rollback
-/// re-points `alab-<tool>` at the prior build beside `<tool>` (and drops the alias of
-/// a tool the prior build lacks), a fresh-install rollback removes it, and a
-/// tombstone disables it — a revoked build must not stay runnable under its other
-/// name.
+/// Aliases ride with their primary: a rollback re-points `alab-<tool>` at the prior build
+/// (dropping the alias of a tool the prior build lacks), a fresh-install rollback removes it,
+/// and a tombstone disables it.
 #[test]
 fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
     let dir = scratch("rb-alias");
@@ -4940,7 +4795,7 @@ fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
             "{t}: a tool the prior build lacks loses its shim AND its alias"
         );
     }
-    // The rollback VERB reads the policy off the disk: aliases laid ⇒ kept.
+    // The rollback verb reads the policy off the disk: aliases laid ⇒ kept.
     assert_eq!(Aliases::laid_for(&l, "ay"), Aliases::Alab);
 
     // A fresh install's rollback removes the alias with the primary.
@@ -4975,17 +4830,11 @@ fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE FRONT-OF-PATH TWIN FOLLOWS THE ROLLBACK. An agent program is laid twice — at
-/// `bin/<tool>` and again under `agents/`, which the shell hook MOVES TO THE FRONT of
-/// PATH — and the twin names its store build directly, so it only ever changes when a
-/// reconcile runs. This lane lays shims through `install_shim_env`, not
-/// `install_tools_env`, so none did: `aterm pkg rollback claude` re-pointed
-/// `bin/claude` at the prior build and said so while `agents/claude` — the copy that
-/// actually runs — kept exec'ing the build the user rolled away from, until gc
-/// reclaimed it (its claim union reads `bin/` and the `current` links, never
-/// `agents/`) and the front-of-PATH name exec'd a deleted file. The fresh-install arm
-/// is the same wound: the flip's own lay wrote the twin, and the abort is about to
-/// delete the build it names.
+/// The front-of-PATH twin follows the rollback. An agent program is laid at `bin/<tool>` and
+/// again under `agents/` (which the shell hook puts first on PATH), and the twin names its
+/// store build directly; a rollback must re-point it with `bin/`, and a fresh-install undo
+/// remove it, or `claude` keeps running the build being rolled away from (which gc's claim
+/// union, blind to `agents/`, may then delete).
 #[test]
 fn rollback_repoints_the_front_of_path_agents_twin() {
     let dir = scratch("rb-agents-twin");
@@ -5027,8 +4876,7 @@ fn rollback_repoints_the_front_of_path_agents_twin() {
         "the front-of-PATH twin followed it, so `claude` runs what was rolled back to"
     );
 
-    // The fresh-install arm: no prior build to re-point, so the primary goes — and
-    // nothing in `bin/` is left to vouch for the twin.
+    // The fresh-install arm: no prior build, so the primary goes and the twin with it.
     let fresh = Staged {
         build: 2_026_091_001,
         build_dir: b1,
@@ -5058,12 +4906,9 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// A FAILED FLIP LEAVES THE WITNESS AGREEING WITH THE SHIMS. When the link write
-/// fails, `flip_member` reports failure with `store/<program>/current` still naming
-/// the prior build — the shims were never touched — never the build the abort
-/// cleanup deletes (a broken own link makes GC abstain on the program until the next
-/// successful activation). The write here fails the way a Windows junction swap does:
-/// the old link is removed first, so without the repair the witness would be GONE.
+/// A failed flip leaves `store/<program>/current` naming the prior build, agreeing with the
+/// untouched shims, never the build the abort deletes. The write here fails as a Windows
+/// junction swap does, removing the old link first.
 #[test]
 fn a_failed_flip_points_the_witness_back_at_the_prior_build() {
     let dir = scratch("flip-witness");
@@ -5098,10 +4943,8 @@ fn a_failed_flip_points_the_witness_back_at_the_prior_build() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The fresh-install variant of the failed flip: no prior build exists, so the repair
-/// REMOVES the witness link a half-made write left naming the new build — the abort
-/// cleanup deletes the build it named, and a program that was never installed must
-/// not keep a (dangling) witness.
+/// The fresh-install variant: no prior build exists, so the repair removes the witness link
+/// a half-made write left naming the new build, which the abort cleanup deletes.
 #[test]
 fn a_failed_fresh_install_flip_removes_the_witness_link() {
     let dir = scratch("flip-fresh");
@@ -5338,9 +5181,8 @@ fn a_resumable_download_strands_at_most_one_partial_per_program() {
         bystander.exists(),
         "a file that is neither partial nor archive is left alone"
     );
-    // Since archives of a failed stage are RETAINED for reuse, a complete
-    // archive of ANOTHER asset name is swept too: at most one of each survives per
-    // program, and it is this pass's.
+    // A failed stage's archive is retained for reuse, so a complete archive of another
+    // asset name is swept: at most one of each survives per program.
     assert!(
         !finished.exists(),
         "a superseded build's retained archive is reclaimed"
@@ -5349,10 +5191,8 @@ fn a_resumable_download_strands_at_most_one_partial_per_program() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The GROUP path holds the same strandage bound as the singleton path: staging a
-/// member reclaims every foreign partial in that program's staging dir (the mirror
-/// of [`a_resumable_download_strands_at_most_one_partial_per_program`], driven
-/// through `apply_channel` so it pins `stage_member`'s call, not just the helper).
+/// The group path holds the same strandage bound, driven through `apply_channel` so it pins
+/// `stage_member`'s call.
 #[test]
 fn a_group_member_stage_strands_at_most_one_partial_per_program() {
     let dir = scratch("group-part-sweep");
@@ -5390,9 +5230,7 @@ fn a_group_member_stage_strands_at_most_one_partial_per_program() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A [`Fake`] that COUNTS the artifact downloads it is asked for, by asset name.
-/// Transfers are the whole subject of the two tests below, and the only honest way to
-/// measure "this pass moved no bytes" is to ask the fetcher.
+/// A [`Fake`] that counts the artifact downloads it is asked for, by asset name.
 struct Counting {
     inner: Fake,
     downloads: std::cell::RefCell<HashMap<String, usize>>,
@@ -5430,9 +5268,8 @@ impl Fetcher for Counting {
     }
 }
 
-/// Append bytes to a fixture's archive AFTER its manifest signed the honest sha256, so
-/// every download of it fails the signed digest gate — a publish-pipeline slip, exactly
-/// as a machine meets it.
+/// Append bytes to a fixture's archive after its manifest signed the honest sha256, so every
+/// download fails the signed digest gate.
 fn poison(archive: &Path) {
     use std::io::Write as _;
     let mut f = std::fs::OpenOptions::new()
@@ -5442,8 +5279,7 @@ fn poison(archive: &Path) {
     f.write_all(b"poison").unwrap();
 }
 
-/// Rewrite a refusal memo's `at=` line so its cooldown has lapsed, the way the clock
-/// does on a real machine.
+/// Rewrite a refusal memo's `at=` line so its cooldown has lapsed.
 fn age_refusal(memo: &Path) {
     let text = std::fs::read_to_string(memo).unwrap();
     let aged: Vec<String> = text
@@ -5459,12 +5295,10 @@ fn age_refusal(memo: &Path) {
     std::fs::write(memo, aged.join("\n") + "\n").unwrap();
 }
 
-/// THE REFETCH BOUND, singleton lane. Re-proving that a published asset does not match
-/// its pin's signed sha256 costs the whole asset, every six hours, for as long as the
-/// pin stands. The first retry is still free — one mismatch can be a truncated
-/// transfer, and a repair under the same pin must be found — but the SECOND identical
-/// verdict arms a cooldown that holds the next pass off the wire entirely and SAYS
-/// why; once it lapses the pass tries again, once, and the memo re-arms for longer.
+/// The refetch bound on the singleton lane: re-proving a digest mismatch costs the whole
+/// asset. The first retry is free; the second identical verdict arms a cooldown that keeps
+/// the next pass off the wire and says why; once it lapses the pass tries once more and the
+/// memo re-arms for longer.
 #[test]
 fn a_digest_refusal_is_not_refetched_on_every_tick() {
     let dir = scratch("digest-refusal");
@@ -5487,11 +5321,8 @@ fn a_digest_refusal_is_not_refetched_on_every_tick() {
     let memo = layout.build_dir("ay", 18).with_file_name("18.refused");
     assert!(memo.is_file(), "the verdict is recorded beside the build");
 
-    // THE FIRST RETRY IS FREE — one mismatch can be a truncated transfer, and a
-    // publisher who repairs the asset under the same pin must be found on the next
-    // tick (`a_member_stage_failure_aborts_the_group_and_a_retry_heals_it` pins
-    // exactly that healing). So this pass downloads again, and it is its IDENTICAL
-    // verdict that arms the cooldown.
+    // The first retry is free: one mismatch can be a truncated transfer, and a repair under
+    // the same pin must be found. Its identical verdict arms the cooldown.
     let second = install(&fake, &layout, &anchor(), &req, fl(0), 0)
         .expect_err("a corrupted asset must fail the signed digest gate");
     assert!(
@@ -5500,8 +5331,8 @@ fn a_digest_refusal_is_not_refetched_on_every_tick() {
     );
     assert_eq!(fake.count("ay-18.tar.zst"), 2, "it really did retry");
 
-    // The tick after THAT, pin unchanged: no transfer at all, and the refusal carries
-    // the original stage failure's own words plus the way out.
+    // The tick after that: no transfer, and the refusal carries the original verdict and
+    // the way out.
     let third = install(&fake, &layout, &anchor(), &req, fl(0), 0)
         .expect_err("the pin still names digests the asset does not match");
     let FlowError::StageRefused(note) = &third else {
@@ -5517,9 +5348,7 @@ fn a_digest_refusal_is_not_refetched_on_every_tick() {
         "every six-hourly tick re-downloaded the whole asset; it must not"
     );
 
-    // Once the cooldown lapses the machine asks again — exactly once — and the memo
-    // re-arms, longer, so a publisher's repair under the same pin is never hidden
-    // forever.
+    // Once the cooldown lapses the machine asks again, once, and the memo re-arms longer.
     age_refusal(&memo);
     let fourth = install(&fake, &layout, &anchor(), &req, fl(0), 0)
         .expect_err("the lapsed cooldown lets the attempt through");
@@ -5541,15 +5370,10 @@ fn a_digest_refusal_is_not_refetched_on_every_tick() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE HOLD, singleton lane. A `tree_root` mismatch is the same verdict on every
-/// re-stage — the archive passed the signed sha256, the extraction is deterministic —
-/// so re-staging it on every pass only repeats the failure. From the FIRST such verdict the
-/// row is HELD: no download, no stage, the canonical `held: last attempt failed with
-/// …` row naming the retry; the verified archive is kept so the retry is free of
-/// transfer; the hold never lapses on its own; and the explicit door (what
-/// `install <p>` and `update --retry` do) forgets it — after which the stage runs
-/// again over the kept archive, honestly reaching the same verdict here because the
-/// fixture's signed root is wrong on purpose.
+/// The hold on the singleton lane: a `tree_root` mismatch repeats on every re-stage, so from
+/// the first such verdict the row is held (no download, no stage, the canonical `held:` row
+/// naming the retry), the verified archive is kept, the hold never lapses, and the explicit
+/// door forgets it.
 #[test]
 fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
     let dir = scratch("tree-root-hold");
@@ -5582,8 +5406,8 @@ fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
     let kept = staged_download_path(&layout, "ay", "ay-18.tar.zst").unwrap();
     assert!(kept.is_file(), "the verified archive is KEPT for the retry");
 
-    // THE VERY NEXT TICK IS HELD: nothing fetched, nothing staged, and the row
-    // says what failed and how to retry — in the words every surface repeats.
+    // The very next tick is held: nothing fetched or staged, and the row names the verdict
+    // and the retry.
     let second = install(&fake, &layout, &anchor(), &req, fl(0), 0)
         .expect_err("the hold refuses the re-stage");
     let FlowError::StageRefused(row) = &second else {
@@ -5614,9 +5438,8 @@ fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
         "a held memo has no cooldown to lapse"
     );
 
-    // THE EXPLICIT DOOR FORGETS IT (`install <p>`, `update --retry`): the next
-    // attempt stages again — over the kept archive, so still no download — and
-    // reaches the same honest verdict, which re-arms the hold.
+    // The explicit door (`install <p>`, `update --retry`) forgets it: the next attempt
+    // stages over the kept archive and re-arms the hold on the same verdict.
     assert_eq!(crate::store::clear_stage_refusals(&layout, "ay"), 1);
     let fourth = install(&fake, &layout, &anchor(), &req, fl(0), 0)
         .expect_err("the signed root is still wrong");
@@ -5639,8 +5462,8 @@ fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
         "the hold re-arms on the same verdict"
     );
 
-    // A memo ANOTHER atpkg wrote binds nothing: the fix a held row can get on the
-    // client side ships as a new atpkg, which is allowed its one attempt.
+    // A memo another atpkg wrote binds nothing: a client-side fix ships as a new atpkg,
+    // which gets its one attempt.
     let foreign = std::fs::read_to_string(&memo)
         .unwrap()
         .lines()
@@ -5665,11 +5488,8 @@ fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE REFETCH BOUND, group lane — the one the fleet meets, because the biggest
-/// member of the `rustc` tuple is the multi-gigabyte one. The tuple still aborts (a
-/// member that cannot stage aborts the group, as always) and still retries once for
-/// free; what stops is paying for the download to be told the same thing a third
-/// time, and the abort's own sentence says so.
+/// The refetch bound on the group lane: the tuple still aborts and retries once for free,
+/// but the third download is skipped and the abort says so.
 #[test]
 fn a_group_member_s_digest_refusal_is_not_refetched_on_every_tick() {
     let dir = scratch("group-digest-refusal");
@@ -5734,9 +5554,8 @@ fn a_group_member_s_digest_refusal_is_not_refetched_on_every_tick() {
         2,
         "every six-hourly tick re-downloaded the whole bundle; it must not"
     );
-    // The default set's disk check reads the same memo: the tuple aborts at its held
-    // member, so it lands nothing — and once the memo is forgotten, its figure is both
-    // Install members' bytes, what its own gate sums.
+    // The default set's disk check reads the same memo: a held tuple lands nothing, and
+    // once the memo is forgotten its figure is both members' bytes.
     let index = resolve_verified_index(&fake, &layout, &anchor(), fl(0), 0).unwrap();
     let ch = index.channel_for("stable", TRIPLE).unwrap();
     let group = crate::plan_groups(&index, &ch).remove(0);
@@ -5755,10 +5574,9 @@ fn a_group_member_s_digest_refusal_is_not_refetched_on_every_tick() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The default set's disk check reads a tuple as its transaction does: a sibling's local
-/// pin or a revoked pin lands nothing, so the tuple is left out of the set, and what it
-/// does count is every member the transaction stages — an installed member whose tree is
-/// incomplete for this slice beside the absent one, not the absent one alone.
+/// The default set's disk check reads a tuple as its transaction does: a sibling's local pin
+/// or a revoked pin lands nothing, and it counts every member the transaction stages,
+/// including an installed member incomplete for this slice.
 #[test]
 fn a_tuple_s_planned_landing_is_what_its_transaction_stages() {
     let dir = scratch("planned-tuple");
@@ -5820,11 +5638,9 @@ fn a_tuple_s_planned_landing_is_what_its_transaction_stages() {
     let _ = std::fs::remove_dir_all(&other);
 }
 
-/// The set's peak is what each unit's gate checks in the worst order the priority queue
-/// can choose: with that much free (plus the reserve), every order passes every gate —
-/// each unit's archives and tree on top of the trees landed before it — and with one
-/// byte less some order fails one. Summing the trees alone (the figure the default set
-/// once refused on) is short by the largest unit's archives.
+/// The set's peak is what each unit's gate checks in the worst queue order: with that much
+/// free (plus the reserve) every order passes, with one byte less some order fails. Summing
+/// the trees alone is short by the largest unit's archives.
 #[test]
 fn the_set_peak_is_what_every_unit_gate_checks_in_any_order() {
     const MIB: u64 = 1 << 20;

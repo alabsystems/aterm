@@ -123,7 +123,7 @@ fn not_regular() -> io::Error {
 /// file. `O_NONBLOCK` prevents a planted writerless FIFO from parking `open`;
 /// `O_NOFOLLOW` closes the final-component replacement/link ambiguity.
 #[cfg(unix)]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     note_open_attempt(path);
@@ -131,10 +131,11 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return Err(not_regular());
     }
-    Ok(file)
+    Ok((file, metadata.len()))
 }
 
 /// Windows' reparse-point flag is the closest equivalent of `O_NOFOLLOW`.
@@ -144,7 +145,7 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 /// with `ERROR_ACCESS_DENIED`, and a toy pack path naming a folder read
 /// "unreadable (Access is denied.)".
 #[cfg(windows)]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -162,29 +163,32 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     {
         return Err(not_regular());
     }
-    Ok(file)
+    Ok((file, metadata.len()))
 }
 
 /// Portable fallback. Targets without a non-blocking filesystem-open flag use
 /// a no-link precheck and still verify the opened handle before reading.
 #[cfg(not(any(unix, windows)))]
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(not_regular());
     }
     note_open_attempt(path);
     let file = std::fs::File::open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return Err(not_regular());
     }
-    Ok(file)
+    Ok((file, metadata.len()))
 }
 
-fn check_observed_size(file: &std::fs::File, max_bytes: usize) -> io::Result<()> {
-    if file.metadata()?.len() > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+fn check_observed_size(observed_len: u64, max_bytes: usize) -> io::Result<usize> {
+    if observed_len > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
         return Err(too_large(max_bytes));
     }
-    Ok(())
+    Ok(usize::try_from(observed_len)
+        .unwrap_or(max_bytes)
+        .min(max_bytes))
 }
 
 /// Read a same-handle regular file into a bounded byte vector.
@@ -193,22 +197,16 @@ fn check_observed_size(file: &std::fs::File, max_bytes: usize) -> io::Result<()>
 /// still authoritative, so a regular file which grows after `fstat` cannot
 /// exceed the allocation or enter a parser truncated at the limit.
 pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
-    let file = open_regular(path)?;
-    check_observed_size(&file, max_bytes)?;
+    let (file, observed_len) = open_regular(path)?;
+    let reserve_len = check_observed_size(observed_len, max_bytes)?;
     let read_limit = limit_plus_sentinel(max_bytes)?;
     let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(
-            usize::try_from(file.metadata()?.len())
-                .unwrap_or(max_bytes)
-                .min(max_bytes),
+    bytes.try_reserve_exact(reserve_len).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("visual-feed allocation refused: {error}"),
         )
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("visual-feed allocation refused: {error}"),
-            )
-        })?;
+    })?;
     file.take(read_limit as u64).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
         return Err(too_large(max_bytes));
@@ -259,12 +257,13 @@ fn invalid_utf8() -> io::Error {
 /// across two read buffers is carried explicitly, so fingerprints cannot wait
 /// for a FIFO writer or allocate in proportion to an oversized path.
 pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<u64> {
-    let mut file = open_regular(path)?;
-    check_observed_size(&file, max_bytes)?;
+    let (mut file, observed_len) = open_regular(path)?;
+    let _ = check_observed_size(observed_len, max_bytes)?;
     let read_limit = limit_plus_sentinel(max_bytes)?;
     let mut total = 0usize;
     let mut hash = Fnv1a64::new();
     let mut read_buffer = [0u8; 8 * 1024];
+    let mut utf8_buffer = [0u8; 8 * 1024 + 3];
     let mut carry = [0u8; 3];
     let mut carry_len = 0usize;
 
@@ -284,10 +283,13 @@ pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Re
         }
         hash.write(&read_buffer[..count]);
 
-        let mut utf8_buffer = [0u8; 8 * 1024 + 3];
-        utf8_buffer[..carry_len].copy_from_slice(&carry[..carry_len]);
-        utf8_buffer[carry_len..carry_len + count].copy_from_slice(&read_buffer[..count]);
-        let candidate = &utf8_buffer[..carry_len + count];
+        let candidate = if carry_len == 0 {
+            &read_buffer[..count]
+        } else {
+            utf8_buffer[..carry_len].copy_from_slice(&carry[..carry_len]);
+            utf8_buffer[carry_len..carry_len + count].copy_from_slice(&read_buffer[..count]);
+            &utf8_buffer[..carry_len + count]
+        };
         match std::str::from_utf8(candidate) {
             Ok(_) => carry_len = 0,
             Err(error) if error.error_len().is_none() => {

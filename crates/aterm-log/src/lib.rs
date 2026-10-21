@@ -55,8 +55,6 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// ── Log levels ──────────────────────────────────────────────────────────────
-
 /// Log severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(usize)]
@@ -208,13 +206,8 @@ impl LevelFilter {
     }
 }
 
-// ── Host policy helpers ─────────────────────────────────────────────────────
-// Pure decisions for hosts that install a file logger (rotation and record
-// hygiene). Kept engine-side so they are unit-testable without I/O.
-
-/// The size one log file may reach before a host rotates it: the file is
-/// renamed to `<name>.1` (replacing the older copy) and a fresh one started,
-/// so a log and its one older copy stay near twice this, about 8 MiB.
+/// The size one log file may reach before a host rotates it to `<name>.1`
+/// (keeping total log size near 8 MiB).
 pub const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Maximum bytes of one sanitized INFO, DEBUG or TRACE record body (see
@@ -222,16 +215,11 @@ pub const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_RECORD_BYTES: usize = 512;
 
 /// Maximum bytes of one sanitized WARN or ERROR record body (see
-/// [`sanitize_record_for`]). These are the lines a failure is diagnosed from
-/// and they arrive a few times a day, so they keep twice the text.
+/// [`sanitize_record_for`]).
 pub const MAX_ALERT_RECORD_BYTES: usize = 1024;
 
-// A contracted fn is written once, through `trust_contract_fn!`: under Trust's
-// verifying session (`cfg(trust_verify)`) it carries its native `ensures`
-// clause, and every other compiler (stock rustc in the foreign cells) gets the
-// plain fn and never parses the clause. The cited theorem is stated over
-// `trust_import_aterm_log__<fn>`, the kernel definition Trust mints from the
-// compiled body, so the proof is about this code, not a copy of it.
+// Emits native `ensures` clauses under `cfg(trust_verify)` and a plain fn on
+// other compilers. Theorems refer to `trust_import_aterm_log__<fn>`.
 #[cfg(trust_verify)]
 macro_rules! trust_contract_fn {
     (
@@ -305,12 +293,9 @@ pub fn record_cap(level: Level) -> usize {
 
 /// Sanitize one formatted record body for a line-oriented log file.
 ///
-/// Log messages embed caller-influenced text (requested paths, error
-/// strings); raw control characters in them could forge record boundaries
-/// (`\n`) or smuggle terminal escapes (`ESC]…`) to whoever `cat`s the log.
-/// Every control character (C0, DEL, C1) is replaced with U+FFFD and the
-/// result is capped near [`MAX_RECORD_BYTES`] (with a `…` marker) so a single
-/// record cannot balloon the file. Clean short input is returned borrowed.
+/// Replaces control characters (C0, DEL, C1) with U+FFFD to prevent record
+/// forgery (`\n`) or terminal escape injection (`ESC]…`), and caps length near
+/// [`MAX_RECORD_BYTES`] with `…`. Clean short input is returned borrowed.
 #[must_use]
 pub fn sanitize_record(msg: &str) -> Cow<'_, str> {
     sanitize_capped(msg, MAX_RECORD_BYTES)
@@ -322,8 +307,6 @@ pub fn sanitize_record_for(level: Level, msg: &str) -> Cow<'_, str> {
     sanitize_capped(msg, record_cap(level))
 }
 
-/// The one sanitizer behind [`sanitize_record`] and [`sanitize_record_for`];
-/// `cap` is at most [`MAX_ALERT_RECORD_BYTES`].
 fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     let mut clean = true;
     for c in msg.chars() {
@@ -335,9 +318,7 @@ fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     if clean && msg.len() <= cap {
         return Cow::Borrowed(msg);
     }
-    // A constant capacity, so the verifier can bound the reservation: output is
-    // at most `cap <= MAX_ALERT_RECORD_BYTES` plus a 3-byte `…`. The add lives in
-    // a `const` so `with_capacity` receives a plain literal.
+    // Constant capacity so the verifier can bound the reservation (`cap` plus a 3-byte `…`).
     const OUT_CAPACITY: usize = MAX_ALERT_RECORD_BYTES + 4;
     let cap = if cap > MAX_ALERT_RECORD_BYTES {
         MAX_ALERT_RECORD_BYTES
@@ -346,8 +327,7 @@ fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     };
     let mut out = String::with_capacity(OUT_CAPACITY);
     for c in msg.chars() {
-        // Measure the bytes actually pushed: a 1-byte control char becomes a
-        // 3-byte U+FFFD, and the original width would overrun the reservation.
+        // Count the replacement's 3-byte width so 1-byte control chars cannot overrun `cap`.
         let (pushed, pushed_len) = if c.is_control() {
             ('\u{FFFD}', 3usize)
         } else {
@@ -362,10 +342,7 @@ fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-// ── Metadata and Record ─────────────────────────────────────────────────────
-
-/// Metadata about a log record: its level, which is all a logger's `enabled`
-/// gate reads.
+/// Metadata about a log record.
 #[derive(Debug)]
 pub struct Metadata {
     level: Level,
@@ -427,8 +404,6 @@ impl<'a> Record<'a> {
     }
 }
 
-// ── Logger trait ─────────────────────────────────────────────────────────────
-
 /// Trait for logger implementations.
 pub trait Log: Send + Sync {
     /// Whether this logger is interested in a record at the given metadata.
@@ -440,8 +415,6 @@ pub trait Log: Send + Sync {
     /// Flush any buffered output.
     fn flush(&self);
 }
-
-// ── Global state ─────────────────────────────────────────────────────────────
 
 static MAX_LEVEL: AtomicUsize = AtomicUsize::new(0); // LevelFilter::Off
 static LOGGER: std::sync::OnceLock<&'static dyn Log> = std::sync::OnceLock::new();
@@ -506,8 +479,6 @@ pub fn __log(
         logger.log(&record);
     }
 }
-
-// ── Macros ──────────────────────────────────────────────────────────────────
 
 /// Log at the error level.
 #[macro_export]
@@ -579,41 +550,22 @@ macro_rules! trace {
     };
 }
 
-// ── Process environment ─────────────────────────────────────────────────────
-
-/// The ONE serialization point for process-global environment MUTATION.
+/// Process-global environment mutation serialized through a single lock.
 ///
-/// `set_var`/`remove_var` are `unsafe` on every modern Rust because they race
-/// `getenv` in any other thread — including threads inside libc and the dynamic
-/// loader, which the caller does not control and cannot stop. The Trust toolchain
-/// denies them outright (`env_mutation`), and the fix it asks for is exactly this:
-/// route every mutation through one lock-scoped helper and bless that single call
-/// site, so the mutations at least cannot race EACH OTHER or a same-process reader
-/// that takes the same lock.
-///
-/// It lives in `aterm-log` because this is the dependency-free leaf every crate
-/// links: a lock only serializes the mutators that share it, so the one binary
-/// needs one lock.
-///
-/// **This does not make environment mutation safe.** It bounds the in-process race
-/// between our own writers; a `getenv` in a C library on another thread is still
-/// unsynchronized. Every caller must still be a single-threaded startup,
-/// trusted-launcher or test path, and say why.
+/// `set_var` and `remove_var` are `unsafe` because they race `getenv` on other
+/// threads, and the Trust toolchain denies them via `env_mutation`. Routing all
+/// in-process mutations through [`ENV_LOCK`] serializes our own writers and
+/// lock-aware readers, though `getenv` in C libraries on other threads remains
+/// unsynchronized; callers must still be single-threaded startup, launcher, or
+/// test paths.
 pub mod env {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard};
 
-    /// Serializes our own mutations against each other and against `read`.
-    /// Poisoning is irrelevant here — the guarded section is a couple of libc calls
-    /// with no invariant to break — so every acquisition recovers from a poisoned
-    /// lock rather than propagating a panic into a startup path.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Acquire [`ENV_LOCK`]. Named distinctly (not a bare `lock`) because it
-    /// RETURNS the guard: its callers hold the lock invisibly, so the lock-order
-    /// census registers it in `GUARD_HELPERS` by this symbol — a free fn called
-    /// `lock` would carry no `.lock()` token at its call sites and hide those
-    /// holds from the graph.
+    /// Acquire [`ENV_LOCK`], recovering from poisoning. Named `env_lock` (not
+    /// `lock`) so `aterm-census` registers it in `GUARD_HELPERS`.
     fn env_lock() -> MutexGuard<'static, ()> {
         match ENV_LOCK.lock() {
             Ok(guard) => guard,
@@ -621,15 +573,8 @@ pub mod env {
         }
     }
 
-    /// The one blessed `remove_var`. Callers hold [`ENV_LOCK`].
     fn remove_locked(key: &OsStr) {
-        // `env_mutation` is a Trust-only lint, so its `allow` is gated on the cfgs
-        // only Trust lanes set (`trust_verify`, `clean_islands`); upstream lanes
-        // have no such lint.
-        //
-        // SAFETY: the module contract — the caller is a single-threaded startup,
-        // trusted-launcher or test path, and this is one of the two blessed
-        // mutation sites, reached only with `ENV_LOCK` held.
+        // SAFETY: caller is a startup, launcher, or test path and holds `ENV_LOCK`.
         #[cfg_attr(
             any(trust_verify, clean_islands),
             allow(
@@ -642,7 +587,6 @@ pub mod env {
         };
     }
 
-    /// The one blessed `set_var`. Callers hold [`ENV_LOCK`].
     fn set_locked(key: &OsStr, value: &OsStr) {
         // SAFETY: as `remove_locked` — blessed mutation site, `ENV_LOCK` held.
         #[cfg_attr(
@@ -657,14 +601,7 @@ pub mod env {
         };
     }
 
-    /// Read `key` and REMOVE it, atomically with respect to every other user of
-    /// this module — the startup HANDOFF idiom: a parent process passes authority
-    /// in the environment, the child consumes it once, and no later reader (nor any
-    /// child process we spawn, nor the user's shell) can observe it.
-    ///
-    /// Read-then-remove must be one critical section: split, two callers racing the
-    /// same key can both observe the value, and a one-shot authority that is
-    /// consumed twice is not one-shot.
+    /// Read `key` and remove it in one critical section under [`ENV_LOCK`].
     #[must_use]
     pub fn take(key: impl AsRef<OsStr>) -> Option<OsString> {
         let key = key.as_ref();
@@ -674,33 +611,19 @@ pub mod env {
         value
     }
 
-    /// Remove `key` under the lock, discarding any value — the "make sure this is
-    /// not set" idiom (a test establishing a clean baseline, a launcher clearing an
-    /// inherited setting). [`take`] when the value matters; this when it does not.
+    /// Remove `key` under [`ENV_LOCK`], discarding any value.
     pub fn unset(key: impl AsRef<OsStr>) {
         let _ = take(key);
     }
 
-    /// Set `key` to `value` under the same lock — the trusted-LAUNCHER idiom: an
-    /// explicit command-line flag establishing the mode that a later env-gated
-    /// reader consumes, so the flag beats any inherited value through the exact
-    /// same code path a bare environment variable would take.
+    /// Set `key` to `value` under [`ENV_LOCK`].
     pub fn set(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
         let _guard = env_lock();
         set_locked(key.as_ref(), value.as_ref());
     }
 
-    /// Run `body` with `key` OVERRIDDEN to `value`, restoring the previous state
-    /// (including "was unset") on the way out — on a panic as well as a return.
-    /// The lock is held for the whole scope, so the override is exclusive against
-    /// every other user of this module for exactly as long as it is in effect:
-    /// this is the "sets and restores the variable under a global lock" shape the
-    /// `env_mutation` lint asks for.
-    ///
-    /// **`body` must not call back into this module** — the lock is a plain
-    /// `Mutex`, so a nested [`set`]/[`take`]/`read` would deadlock. `body` may
-    /// freely call code that READS the environment through `std::env` directly,
-    /// which is the entire point: it observes the override.
+    /// Run `body` with `key` set to `value`, holding [`ENV_LOCK`] and restoring
+    /// the prior state on return or unwind. `body` must not re-enter this module.
     pub fn scoped<T>(
         key: impl AsRef<OsStr>,
         value: impl AsRef<OsStr>,
@@ -709,16 +632,13 @@ pub mod env {
         scoped_opt(key.as_ref(), Some(value.as_ref()), body)
     }
 
-    /// Run `body` with `key` guaranteed UNSET, restoring the previous state on the
-    /// way out — the complement of [`scoped`], for the "what happens when this is
-    /// absent?" case. Same lock discipline and the same no-reentrancy rule.
+    /// Run `body` with `key` unset, holding [`ENV_LOCK`] and restoring the prior
+    /// state on return or unwind. `body` must not re-enter this module.
     pub fn scoped_unset<T>(key: impl AsRef<OsStr>, body: impl FnOnce() -> T) -> T {
         scoped_opt(key.as_ref(), None, body)
     }
 
     fn scoped_opt<T>(key: &OsStr, value: Option<&OsStr>, body: impl FnOnce() -> T) -> T {
-        /// Restores the prior value and releases the lock on drop, so an unwinding
-        /// `body` cannot leak the override into the rest of the process.
         struct Restore {
             key: OsString,
             prev: Option<OsString>,
@@ -747,9 +667,6 @@ pub mod env {
         body()
     }
 
-    /// Read `key` under the lock, so a reader cannot observe a key mid-mutation by
-    /// one of our own writers. Test-only: what the tests read the helpers above
-    /// back through.
     #[cfg(test)]
     #[must_use]
     pub(super) fn read(key: impl AsRef<OsStr>) -> Option<OsString> {
@@ -757,8 +674,6 @@ pub mod env {
         std::env::var_os(key.as_ref())
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -870,10 +785,7 @@ mod tests {
 
 #[cfg(test)]
 mod env_tests {
-    //! Each test uses its OWN key: the helpers serialize mutation against each
-    //! other, but this is a multithreaded test binary and two tests sharing a key
-    //! would still race on the VALUE. Distinct keys make the assertions honest
-    //! without pretending the lock does more than it does.
+    //! Each test uses a distinct key so parallel tests do not race on values.
 
     #[test]
     fn take_reads_and_removes_in_one_step() {
@@ -881,13 +793,10 @@ mod env_tests {
         super::env::set(KEY, "authority");
         assert_eq!(super::env::read(KEY).as_deref(), Some("authority".as_ref()));
         assert_eq!(super::env::take(KEY).as_deref(), Some("authority".as_ref()));
-        // ONE-SHOT: a consumed handoff authority is gone, so a second consumer
-        // cannot observe it. This is the property `take` exists for.
         assert_eq!(super::env::take(KEY), None);
         assert_eq!(super::env::read(KEY), None);
     }
 
-    /// `scoped` restores what it found — a value, or the absence of one.
     #[test]
     fn scoped_restores_the_previous_value_and_the_previous_absence() {
         const KEY: &str = "ATERM_LOG_TEST_SCOPED";

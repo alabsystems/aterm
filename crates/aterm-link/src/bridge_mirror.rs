@@ -47,7 +47,8 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use super::{
-    past_the_budget, refused_for_good, Bridge, Opens, Then, DEADLINE_RETRY, PIPELINE_WINDOW,
+    past_the_budget, read_back_rows, refused_for_good, Bridge, Opens, Then, DEADLINE_RETRY,
+    PIPELINE_WINDOW,
 };
 use crate::ctl::Reply;
 use crate::mirror::{self, Bucket, LandedWord, LogMode, Pin, PinSlot};
@@ -809,8 +810,10 @@ impl Bridge {
         // checked by ([`Bridge::publish_reserved`]): these bytes at the
         // answered offset on the slot's face are ours, and another record
         // there is another writer's, the collision path. NO RECORD THERE IS
-        // NO EVIDENCE YET: retention may have taken it since the answer, or
-        // the record at that offset is on a subject this face does not hold.
+        // NO EVIDENCE YET: retention may have taken it since the answer (a
+        // broker of astream's R4 then refuses the read `retained-from=`, which
+        // [`read_back_rows`] takes as no rows), or the record at that offset is
+        // on a subject this face does not hold.
         // The slot is sent again at its pinned seq, and its answer tells them
         // apart. astream drops a record's dedup entry with the record, so
         // after retention the slot appends anew; a second dedup naming the
@@ -841,9 +844,10 @@ impl Bridge {
                 return;
             };
             let started = fx.now();
-            let answer = conn.fetch(off, &face, 1);
+            // Retention taking the record since the answer is no rows.
+            let answer = read_back_rows(conn.fetch(off, &face, 1), off);
             let read = match self.observe(started, answer, Some("read")) {
-                Ok((rows, _)) => match rows.iter().find(|(at, f, _)| *at == off && *f == face) {
+                Ok(rows) => match rows.iter().find(|(at, f, _)| *at == off && *f == face) {
                     Some((_, _, bytes)) if bytes == body.as_bytes() => ReadBack::Ours,
                     Some(_) => ReadBack::Other,
                     None => ReadBack::Unread,

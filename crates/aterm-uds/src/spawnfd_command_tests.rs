@@ -1504,7 +1504,7 @@ fn responsible_for(pid: u32) -> i32 {
 /// true only if the stage really was disclaimed); and a DISCLAIMED
 /// `/bin/sleep` it starts (that child's own pid, where its plain sibling
 /// answered the stage's). The stage's answer about itself proves little
-/// alone: MEASURED 2026-10-16, a process no ancestor was made responsible
+/// alone: a process no ancestor was made responsible
 /// for (a shell under aterm, its children) answers its own pid. The plain
 /// child is the proof — run undisclaimed (the stage variable set by hand),
 /// that child answered its own pid and the CONTROL assertion failed.
@@ -1735,7 +1735,7 @@ fn an_exec_hands_over_a_close_on_exec_source() {
     assert_eq!(wrote, "wrote\nstderr-open\n");
 }
 
-/// A PROGRAM STILL OPEN FOR WRITING IS TRIED AGAIN, NOT REFUSED AT ONCE (2026-10-17): Linux
+/// A program still open for writing is tried again, not refused at once: Linux
 /// refuses its exec (`ETXTBSY`) while anything holds it open for writing — a child another
 /// thread forked while it was being written holds that descriptor until its own exec — and
 /// the spawn tries again after the pause between tries, here the moment this test's writer

@@ -5,8 +5,8 @@ seq v=1 rig=screen program=claude build=2.1.0
 see busy
 half
 see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
-expect open p1 approval par=t1 box=bash:not-read-only at=500
+expect open p1 approval par=t1 box=bash:not-read-only @500
 admit harness act=approve
 accept
 at 750 see busy
-expect close p1 approval out=approved by=harness at=750
+expect close p1 approval out=approved by=harness @750

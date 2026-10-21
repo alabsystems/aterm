@@ -3,17 +3,12 @@
 
 //! The baked model catalog inside a Claude Code build.
 //!
-//! Every 2.1.28x build carries a model catalog as a JavaScript object literal:
-//! one `{id:"claude-…",family:"…",display_name:"…",…,context:{…},…,
-//! capabilities:[…]}` per model and, after them,
-//! `latest_per_family:{fable:"claude-fable-5-1",opus:"claude-opus-5-5",…}`,
-//! the build's own statement of the newest model of each family. That is how a
-//! new build recommends a new model without a network call, and how the
-//! harness knows whether a model id is one the build understands.
-//!
-//! The scan reads the binary in bounded chunks, finds `latest_per_family:{`,
-//! and parses the entries before it. The caller caches the result per build
-//! path, size and mtime.
+//! A build carries its model catalog as a JavaScript object literal: one
+//! `{id:"claude-…",family:"…",display_name:"…",…,capabilities:[…]}` per model, then
+//! `latest_per_family:{opus:"claude-opus-5-5",…}`, the build's newest model of each family.
+//! That is how a new build recommends a new model offline, and how the harness knows whether a
+//! model id is one the build understands. The scan finds `latest_per_family:{` and parses the
+//! entries before it.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -110,8 +105,7 @@ fn field<'a>(entry: &'a str, key: &str) -> Option<&'a str> {
     rest.get(..rest.find('"')?)
 }
 
-/// Parse the catalog out of the text around the marker. `text` is the window
-/// that ENDS with the `latest_per_family` object.
+/// Parse the catalog out of `text`, a window that ends with the `latest_per_family` object.
 #[must_use]
 pub fn parse_window(text: &str) -> Option<Baked> {
     let at = text.rfind("latest_per_family:{")?;
@@ -196,10 +190,8 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Scan a Claude Code binary once for its catalog and its version, reading
-/// in bounded chunks (a 217 MB file is never held whole). The result is
-/// cached by the caller per (path, size, mtime), in memory and on disk, so a
-/// build is read once in its life.
+/// Scan a Claude Code binary once for its catalog and its version, in bounded chunks (a 217 MB
+/// file is never held whole). [`baked_cached`] caches the result.
 #[must_use]
 pub fn scan_build(binary: &Path) -> BuildFacts {
     const VNEEDLE: &[u8] = b"VERSION:\"";
@@ -218,8 +210,7 @@ pub fn scan_build(binary: &Path) -> BuildFacts {
         let mut hay = std::mem::take(&mut carry);
         let carried = hay.len();
         hay.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
-        // Version literals that START in the new bytes (older ones were
-        // counted with the previous chunk).
+        // Version literals that start in the new bytes; older ones were counted already.
         let mut from = carried.saturating_sub(VNEEDLE.len() + 24);
         while let Some(at) = find_from(&hay, VNEEDLE, from) {
             from = at + 1;
@@ -374,9 +365,8 @@ pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-/// The baked catalog of `binary`, scanned once per build in its life: cached on
-/// disk under `cache_dir`, keyed by path, size and mtime (the sweep runs every
-/// minute; a 217 MB scan must not).
+/// The baked catalog of `binary`, cached on disk under `cache_dir` by path, size and mtime: the
+/// sweep runs every minute, and a 217 MB scan must not.
 #[must_use]
 pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
     let m = std::fs::metadata(binary).ok()?;
@@ -406,7 +396,7 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
 mod tests {
     use super::*;
 
-    /// A trimmed copy of the 2.1.280 literal (strings L312348), two entries.
+    /// A trimmed copy of the 2.1.280 literal, two entries.
     const WINDOW: &str = concat!(
         r#"models:[{id:"claude-opus-5",family:"opus",display_name:"Opus 5",knowledge_cutoff:"May 2026","#,
         r#"context:{window:2e5,native_1m:!1,supports_1m_beta:!0},capabilities:["effort","max_effort","adaptive_thinking"],default_effort:"high"},"#,

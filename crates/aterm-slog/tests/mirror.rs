@@ -154,15 +154,17 @@ fn the_bus_class_is_its_own_predicate_and_holds_the_turn_class() {
 }
 
 /// RULING Q5: `ms` costs exactly its 8 bytes a record in heap, mirror on or
-/// off, and numbers the bus class densely; a local record has none.
+/// off, and numbers the bus class densely; a local record has none. Phase 6
+/// (6F-1) adds the record's process-clock reading, another 8 bytes an entry,
+/// which the footprint counts with the rest.
 #[test]
 fn ms_costs_eight_bytes_a_record_and_numbers_the_bus_class_densely() {
     assert_eq!(
         ENTRY_BYTES,
         std::mem::size_of::<std::sync::Arc<Rec>>()
             + std::mem::size_of::<usize>()
-            + std::mem::size_of::<u64>(),
-        "an entry is its shared record, its bytes and its ms"
+            + 2 * std::mem::size_of::<u64>(),
+        "an entry is its shared record, its bytes, its ms and its mono"
     );
     let mut log = Log::new(1);
     session(&mut log);

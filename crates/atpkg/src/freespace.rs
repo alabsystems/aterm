@@ -1,21 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The OS-edge helper for disk preflight (§9) — the free-space query [`crate::cost`]
-//! deliberately excludes so its decision core stays pure.
+//! The free-space query for the disk preflight, the OS edge [`crate::cost`] leaves out.
 //!
-//! Preflight is a **safety net, not a security gate**: [`available_bytes`] returns `None`
-//! on any query failure and callers then fail **OPEN** (an FFI hiccup must never wedge an
-//! install). The only hard refusal is a genuine, measured shortfall. The per-volume query
-//! itself ([`crate::platform::volume_free_bytes`]: `statvfs` on Unix,
-//! `GetDiskFreeSpaceExW` on Windows) is the one OS-specific edge; the walk-up here is
-//! portable.
+//! Preflight is a safety net, not a security gate: a failed query is `None` and callers fail
+//! open, so only a measured shortfall refuses an install.
 
 use std::path::Path;
 
-/// Free bytes on the volume that will hold `start`. If `start` does not exist yet (a
-/// not-yet-created staging/build dir), walks up to its nearest existing ancestor and
-/// queries that (same volume). `None` on any query failure — callers fail OPEN.
+/// Free bytes on the volume that will hold `start`, queried at its nearest existing ancestor
+/// when `start` does not exist yet. `None` on any query failure.
 #[must_use]
 pub fn available_bytes(start: &Path) -> Option<u64> {
     let mut p = start;
@@ -35,11 +29,8 @@ mod tests {
     fn walks_up_to_existing_ancestor() {
         let d = std::env::temp_dir();
         let ghost = d.join("atpkg-freespace-does/not/exist");
-        // A raw statvfs of a non-existent path fails (None); the walk-up makes the query
-        // succeed by resolving to the nearest existing ancestor (same volume). So the ghost
-        // path yields Some — that Some IS the walk-up. (Exact byte equality with the ancestor
-        // is deliberately NOT asserted: free space fluctuates as other tests touch the temp
-        // volume, which would make an equality check flaky.)
+        // A raw statvfs of a missing path fails; the walk-up resolves it to the existing
+        // ancestor. Byte equality is not asserted: free space moves as other tests write.
         assert!(
             available_bytes(&d).is_some(),
             "the existing ancestor queries fine"

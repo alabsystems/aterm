@@ -3,36 +3,15 @@
 
 //! `aterm`: a transparent, introspecting terminal.
 //!
-//! Spawns your shell in a PTY and passes I/O through unchanged; the host
-//! terminal draws the bytes and nothing in this process reads them back (no VT
-//! parse, grid or scrollback). This mode serves no control socket: the
-//! introspectable surface driven via `aterm ctl` is the window mode
-//! (`aterm --window`, or `--headless` for an engine + socket with no window).
+//! Spawns a shell in a PTY and passes I/O through unchanged without a VT parser,
+//! grid, scrollback, or control socket (`aterm --window` or `--headless` runs the
+//! introspectable engine).
 //!
-//! A thin platform driver (`poll(2)`/termios in `driver_unix`, console events
-//! in `driver_windows`) over the [`aterm_pty`] spawn seam: cap-gated,
-//! fail-closed fork/exec, resource-bounded in the confinement modes (see
-//! `session_limits`) and OS-sandboxed when the containment mode demands it,
-//! exactly like `aterm-gui`. Window resize is forwarded to the PTY, the loop is
-//! EINTR-robust, and aterm exits with the shell's status.
-//!
-//! Containment mode is launcher-owned (`--containment`, ATERM_DESIGN §5):
-//! the default is `User` — no OS sandbox, so the daily-driver shell keeps full
-//! network/credential access and behaves as before, confined by the cap gate and
-//! INHERITING the launching shell's `rlimit`s unchanged (the rule `aterm-gui`
-//! applies at its own spawn — see `session_limits`; on Windows, where the same
-//! `Limits` go onto the child's Job Object, that means no job caps); Safety
-//! gets soft caps and Containment binding ones. `--sandbox` (`--containment containment`) opts
-//! into the macOS Seatbelt sandbox (no network, no debugger attach, no mach service
-//! lookup but the user and group queries, writes only to the temp roots, no
-//! credential/private-data access) and is REFUSED where no OS sandbox exists; a
-//! malformed value fails CLOSED to Containment.
-
-// The macOS consent tier (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.3):
-// owns the prompt-free Full Disk Access probe, the in-bundle fence that keeps
-// headless paths away from `tccd`, and every protected-folder path literal
-// (the aterm-census guard `protected-folder`). `doctor` threads its verdict
-// into the pure report.
+//! Containment mode is launcher-owned (`--containment`):
+//! `User` (default) applies no OS sandbox and inherits the launching shell's
+//! `rlimit`s (no Job Object caps on Windows); `Safety` applies soft caps;
+//! `Containment` (`--sandbox`) applies hard caps and the macOS Seatbelt sandbox,
+//! refusing where no OS sandbox exists. Malformed values fail closed to `Containment`.
 #![cfg_attr(
     test,
     allow(
@@ -45,8 +24,6 @@ use aterm_containment::consent::{
     DrClass, FdaState, ProbeGate, ProbeLabel, SelfHardening,
 };
 
-// The platform console driver behind a shared surface (host_winsize /
-// shell_check / run): termios + poll on POSIX, ConPTY console events on Windows.
 #[cfg(unix)]
 #[path = "driver_unix.rs"]
 mod driver;
@@ -54,17 +31,19 @@ mod driver;
 #[path = "driver_windows.rs"]
 mod driver;
 
-// The manual behind `aterm help [topic]`.
+/// `aterm doctor`'s own rows as converge items; `crates/aterm` composes them with the
+/// packages' repair items and `aterm pkg doctor`.
+pub mod doctor;
 mod manual;
 mod spotlight;
 
-// `aterm edit` and the `amacs` argv0 alias: the amacs program's one entry.
 pub mod amacs_launch;
 
-// How the print-and-exit verbs spell their text for its stream: as it is, except
-// into a pipe a Windows shell made under a legacy code page, which gets the
-// punctuation in ASCII.
 mod cli_text;
+
+/// The macOS fleet settings profile, also used by the first interactive launch.
+#[cfg(target_os = "macos")]
+pub mod macos_doctor;
 
 // `aterm theme`: the theme listing (`list`, also `aterm list-themes`), theme
 // authoring (`check`, `new`, `export`, `schema`) and another terminal's theme
@@ -75,9 +54,6 @@ mod theme_pack_cmd;
 pub use theme_cmd::main_entry as theme_main_entry;
 pub use theme_cmd::{ThemeHost, ThemeListFormat, ThemeListRequest, list_themes_alias};
 
-// The wt-shaped windowing grammar (`new-tab` / `new-window` / `split-pane`) and
-// its `windowing_behavior` routing policy: pure parse + pure decision,
-// unit-testable without a socket, window or config file.
 mod windowing;
 
 pub use windowing::{
@@ -165,9 +141,10 @@ const HELP_HEAD: &str = concat!(
     "    show-config               Print this session's shell, TERM, size and\n",
     "                              containment default.\n",
     "    explain-config            Explain how aterm resolves its configuration.\n",
-    "    doctor                    Check shell, access (macOS), instances, the\n",
-    "                              fabric's broker, crashes; exit 1 only when the\n",
-    "                              shell cannot start.\n",
+    "    doctor                    Check health, instances, the fabric broker and the\n",
+    "                              packages, and repair what aterm lays; --read-only\n",
+    "                              changes nothing. --check / --apply / --restore: the\n",
+    "                              macOS fleet settings profile alone.\n",
     "    list-fonts                List available font families.\n",
     "    show-face <family>        Show a font family's file and cell metrics.\n",
     "    list-themes               List the built-in and custom themes (the same as\n",
@@ -177,62 +154,36 @@ const HELP_HEAD: &str = concat!(
     "\n",
 );
 
-/// How a Windows install is updated while no Windows updater exists, shared by
-/// `aterm update status|check`, `aterm help update` and the manual's header.
-/// Nothing checks, stages or applies a build on Windows; the lane is the build
-/// scripts or the MSIX (`apps\aterm-win\msix\build-msix.ps1`).
-///
-/// The scripts are named only where the checkout has them (`win_scripts`, set by
-/// build.rs). The public source snapshot ships no `apps/`, so a build from it
-/// names a workspace rebuild with Trust's `targo` (the only compiler its build
-/// accepts natively) and, as the README does, that Trust for Windows is not
-/// published yet — in the const, so the verb and the page both carry it.
+/// Windows update instructions shared by `aterm update status|check` and `aterm help update`.
 #[cfg(win_scripts)]
 pub const WINDOWS_UPDATE_LANE: &str =
     "git pull, then apps\\aterm-win\\build.ps1 and apps\\aterm-win\\install.ps1";
-/// The lane in a checkout without the Windows scripts.
+/// Windows update instructions in a checkout without `apps/`.
 #[cfg(not(win_scripts))]
 pub const WINDOWS_UPDATE_LANE: &str = "git pull, then targo --unverified build --locked -p aterm \
      (this needs the Trust toolchain for Windows, which is not published yet)";
 
-/// The front-door verb roster: the one place a verb exists.
+/// The front-door verb roster.
 ///
-/// A verb's name, help and dispatch are tied together here:
-///   * name and help text live here and `--help` renders this list, so an
-///     unadvertised verb is unrepresentable;
-///   * dispatch in `crates/aterm/src/main.rs` matches this enum exhaustively, so
-///     a new variant fails the build until it is routed;
-///   * [`is_tool_candidate`] consults this list, so every verb is shielded from
-///     toolchain-program shadowing;
-///   * `crates/aterm/tests/front_door_verbs.rs` drives every variant through the
-///     real binary under a real pty, where the mode fork picks the session.
+/// Ties each verb's name, `--help` entry, exhaustive dispatch in `crates/aterm/src/main.rs`,
+/// and [`is_tool_candidate`] shielding together.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Verb {
     /// `aterm ctl` — the introspection / control client.
     Ctl,
     /// `aterm conn` — session connections (the pull/push wiring front door).
     Conn,
+    /// `aterm resource-run` — explicitly attribute one external job to a tab.
+    ResourceRun,
     /// `aterm pkg` — the toolchain package manager.
     Pkg,
-    /// `aterm fleet` — this machine's membership in a fleet (`init`, `join`,
-    /// `peers`, `allow`, `leave`): the machines `aterm ctl survey --fleet`
-    /// (or `--host <h>`, one of them) reads with no grant, and THE STEP-IN — a
-    /// machine whose person ran `aterm fleet allow drive --from <node>` is
-    /// driven from that node with `aterm ctl --host <h> spawn|await
-    /// task|result|turn|key|send|hold|close` (`crates/aterm-ctl/src/remote.rs`;
-    /// `aterm help workers`). `aterm ctl --host <h> survey` is that read, not a
-    /// drive.
+    /// `aterm fleet` — fleet membership (`init`, `join`, `peers`, `allow`, `leave`).
     Fleet,
-    /// `aterm drive` — the window harness's readers by hand (classify, phase,
-    /// answer, ledger; tape and replay for a harness tape).
+    /// `aterm drive` — the window harness's readers (`classify`, `phase`, `answer`, `ledger`, `tape`, `replay`).
     Drive,
-    /// `aterm link` — the fabric bridge (`serve`, `ls`, `notify`, `broker`,
-    /// `mint`, `fabric`). The retired `hook` is no verb of it: a surviving
-    /// settings entry still runs it, so it answers exit 0 and does nothing
-    /// (`aterm_link::cli::RETIRED_HOOK_LINE`).
+    /// `aterm link` — the fabric bridge (`serve`, `ls`, `notify`, `broker`, `mint`, `fabric`).
     Link,
-    /// `aterm fabric` — the fabric's state on one screen, its traffic live, and
-    /// `on|off|doctor`: the one command that turns it on and proves it.
+    /// `aterm fabric` — fabric state, live traffic, and `on|off|doctor`.
     Fabric,
     /// `aterm ship` — the release tool (publishing; source checkouts only).
     Ship,
@@ -240,42 +191,30 @@ pub enum Verb {
     Update,
     /// `aterm agents` — the coding-agent primer installer.
     Agents,
-    /// `aterm ai` — this machine's AI CLIs: one working login each, the doctor
-    /// that signs in what needs it, and reviews one AI asks of another
-    /// (docs/DESIGN-ai-connections-2026-10-16.md).
+    /// `aterm ai` — AI CLI login management, doctor, and cross-AI reviews.
     Ai,
-    /// `aterm machines` — one controller Mac configures and keeps configured a lab of
-    /// Macs over SSH, no MDM and no Apple account (docs/DESIGN-machines-2026-10-16.md).
-    /// macOS only: elsewhere the verb refuses by name.
+    /// `aterm machines` — macOS lab configuration over SSH.
     Machines,
     /// `aterm init` — configure the current macOS login and optional GitHub bootstrap.
     Init,
-    /// `aterm harness` — the Claude Code harness's read views, the accounts
-    /// roster (docs/DESIGN-claude-accounts-2026-10-01.md) and the live agent
-    /// upgrade (docs/DESIGN-aterm-wrapper-2026-09-17.md §0.4). The window host
-    /// supervises; `upgrade` restarts an agent onto a newer build.
+    /// `aterm secrets` — the credentials vault, its keyless server and `~/.secrets`
+    /// (docs/DESIGN-secrets-2026-10-20.md). Unix only: on Windows the verb refuses by name.
+    Secrets,
+    /// `aterm harness` — Claude Code harness read views, accounts roster, and live upgrade.
     Harness,
-    /// `aterm keeper`: the PTY keeper (`start | stop | status | serve`), the
-    /// per-login holder of a custody copy of every terminal's master
-    /// (docs/DESIGN-pty-keeper-2026-09-26.md). Opt-in via `[keeper] enabled`.
+    /// `aterm keeper` — the PTY keeper (`start | stop | status | serve`).
     Keeper,
-    /// `aterm caffeine`: the menu-bar keep-awake mug (`start | on | off |
-    /// status | startup | quit | serve`), its own launchd job run from its own
-    /// copy of the app. macOS only: elsewhere the verb refuses by name.
+    /// `aterm caffeine` — the macOS menu-bar keep-awake helper.
     Caffeine,
-    /// `aterm theme` — list, validate, create, export and import themes, and
-    /// inspect the native theme schema.
+    /// `aterm theme` — list, validate, create, export, and import themes.
     Theme,
-    /// `aterm edit` — amacs, aterm's editor (docs/DESIGN-amacs-2026-10-19.md):
-    /// in a window's tab, a file opens in a fresh Editor tab beside it and the
-    /// command waits until that tab is closed. Also the `amacs` argv0 alias,
-    /// the name `$EDITOR` holds.
+    /// `aterm edit` — amacs editor (also the `amacs` argv0 alias).
     Edit,
-    /// `aterm new-tab` — a tab, routed by `windowing_behavior` (S12 / design §5).
+    /// `aterm new-tab` — open a tab routed by `windowing_behavior`.
     NewTab,
-    /// `aterm new-window` — a window, unconditionally (the `attach` escape hatch).
+    /// `aterm new-window` — open a window unconditionally.
     NewWindow,
-    /// `aterm split-pane` — a pane beside the focused one.
+    /// `aterm split-pane` — open a pane beside the focused one.
     SplitPane,
 }
 
@@ -284,6 +223,7 @@ impl Verb {
     pub const ALL: &'static [Verb] = &[
         Verb::Ctl,
         Verb::Conn,
+        Verb::ResourceRun,
         Verb::Pkg,
         Verb::Fleet,
         Verb::Drive,
@@ -295,6 +235,7 @@ impl Verb {
         Verb::Ai,
         Verb::Machines,
         Verb::Init,
+        Verb::Secrets,
         Verb::Harness,
         Verb::Keeper,
         Verb::Caffeine,
@@ -310,6 +251,7 @@ impl Verb {
         match self {
             Verb::Ctl => "ctl",
             Verb::Conn => "conn",
+            Verb::ResourceRun => "resource-run",
             Verb::Pkg => "pkg",
             Verb::Fleet => "fleet",
             Verb::Drive => "drive",
@@ -321,6 +263,7 @@ impl Verb {
             Verb::Ai => "ai",
             Verb::Machines => "machines",
             Verb::Init => "init",
+            Verb::Secrets => "secrets",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
             Verb::Caffeine => "caffeine",
@@ -344,6 +287,7 @@ impl Verb {
             // `conn` never was a sibling binary — it is presentation over the
             // ctl wire verbs, shipped only as a front-door word.
             Verb::Conn => None,
+            Verb::ResourceRun => None,
             Verb::Pkg => Some("atpkg"),
             Verb::Fleet => Some("aterm-fleet"),
             Verb::Drive => Some("aterm-drive"),
@@ -360,6 +304,7 @@ impl Verb {
             | Verb::Ai
             | Verb::Machines
             | Verb::Init
+            | Verb::Secrets
             | Verb::Harness
             | Verb::Keeper
             | Verb::Caffeine
@@ -383,6 +328,7 @@ impl Verb {
             Verb::NewTab | Verb::NewWindow | Verb::SplitPane => true,
             Verb::Ctl
             | Verb::Conn
+            | Verb::ResourceRun
             | Verb::Pkg
             | Verb::Fleet
             | Verb::Drive
@@ -394,6 +340,7 @@ impl Verb {
             | Verb::Ai
             | Verb::Machines
             | Verb::Init
+            | Verb::Secrets
             | Verb::Harness
             | Verb::Keeper
             | Verb::Caffeine
@@ -407,6 +354,7 @@ impl Verb {
         match self {
             Verb::Ctl => "aterm ctl <args>",
             Verb::Conn => "aterm conn [<cmd>]",
+            Verb::ResourceRun => "aterm resource-run <args>",
             Verb::Pkg => "aterm pkg <args>",
             Verb::Fleet => "aterm fleet <args>",
             Verb::Drive => "aterm drive <args>",
@@ -417,7 +365,8 @@ impl Verb {
             Verb::Agents => "aterm agents [<cmd>]",
             Verb::Ai => "aterm ai [<cmd>]",
             Verb::Machines => "aterm machines <cmd>",
-            Verb::Init => "aterm init [--plan|--check]",
+            Verb::Init => "aterm init [--plan|--check] [--json]",
+            Verb::Secrets => "aterm secrets [<cmd>]",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
             Verb::Caffeine => "aterm caffeine [<cmd>]",
@@ -441,6 +390,10 @@ impl Verb {
             Verb::Conn => &[
                 "See & wire SESSION CONNECTIONS: which sessions pull or",
                 "push each other (ls | add | set | rm | spawn | show | map).",
+            ],
+            Verb::ResourceRun => &[
+                "Run an exact command with authenticated per-tab resource ownership.",
+                "--session @self --job label -- program [args]; optional --ai label.",
             ],
             Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
             Verb::Fleet => &[
@@ -482,8 +435,14 @@ impl Verb {
                 "scan | enroll | status | plan | apply | person | screen). macOS.",
             ],
             Verb::Init => &[
-                "Configure this Mac's keyboard, scrolling, widgets, Dock and accounts.",
+                "Restore aterm's commands and shell integration (over SSH too), then set",
+                "this Mac's keyboard, scrolling, widgets, Dock and accounts (at its console).",
                 "Optional init.toml GitHub authentication and clones. Current macOS user.",
+            ],
+            Verb::Secrets => &[
+                "One credentials file for every machine: the vault, its server",
+                "and ~/.secrets (status | join | sync | edit | approve | serve …);",
+                "`status` is the default.",
             ],
             Verb::Harness => &[
                 "Claude Code's spend, limits and accounts, the disk, the ledger",
@@ -605,7 +564,7 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "doctor",
-        "Check the shell, macOS access (and whether macOS checks each new program aterm starts), running instances, the fabric's broker (does it answer, what tier it serves, is its log poisoned) and past crashes, and fix what aterm can (stale copies of aterm to the Trash; the Developer Tools pane opened for you); --read-only fixes nothing; exits 1 only when the shell cannot start.",
+        "Check the shell, macOS access (and whether macOS checks each new program aterm starts), running instances, the fabric's broker (does it answer, what tier it serves, is its log poisoned), past crashes and the packages (`aterm pkg doctor`'s view), and fix what aterm can (the shell integration, the installed commands and their ~/.local/bin links, the reroute stubs, the rustup link, exec roots and stale copies of aterm to the Trash; the Developer Tools pane opened for you); --read-only fixes nothing; --json prints every row in the one report schema; --only <id,...> narrows to those items, families or layers; exits 0 only when all selected checks are satisfied or not applicable; unresolved plans, manual steps, blocked or deferred work, unknown state and failed changes exit 1; the shell is always checked. On macOS the fleet settings profile is settings-only: --check checks it, --apply backs it up and applies it, --restore restores the backup (--json: its fleet report; drift exits 1). See `aterm help doctor`.",
     ),
     ("list-fonts", "List available font families (one per line)."),
     ("show-face", "Show a font family's file and cell metrics."),
@@ -628,7 +587,7 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
 fn diag_usage(cmd: &str) -> String {
     match cmd {
         "show-face" => format!("aterm {cmd} <family>"),
-        "doctor" => format!("aterm {cmd} [--read-only]"),
+        "doctor" => format!("aterm {cmd} {}", doctor::GRAMMAR),
         "exceptions" => format!("aterm {cmd} [--all]"),
         _ => format!("aterm {cmd}"),
     }
@@ -649,7 +608,9 @@ fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
     match cmd {
         "show-config" => Some((show_config_report(), 0)),
         "explain-config" => Some((explain_config_report(), 0)),
-        "doctor" => Some(doctor_report(arg != Some("--read-only"))),
+        // `doctor` is not answered here: `crates/aterm` composes it (this crate's items,
+        // the packages' repair items and `aterm pkg doctor`'s rows) and routes it before
+        // this parser runs ([`doctor::args`] is its grammar).
         "list-fonts" => Some((list_fonts_report(), 0)),
         "show-face" => Some(show_face_report(arg)),
         // `list-themes` is not answered here: the listing needs the theme
@@ -773,13 +734,6 @@ const WINDOWS_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         the display scale.\n";
 
 /// The `[machine]` paragraph of `explain-config`.
-///
-/// It says when the settings are applied (by `aterm pkg machine apply`, which
-/// aterm runs once a day at the first window or interactive terminal session,
-/// and by a package pass when the table changed, while `[packages] enabled` is
-/// on); that `defaults` writes the account's per-host domain, so a redirected
-/// `$HOME` is refused; and that every change is undoable by one printed line. It
-/// names no Settings control shape, so a page change cannot make it stale.
 #[cfg(target_os = "macos")]
 const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      [machine] — macOS host settings (aterm.toml; applied by `aterm pkg`):\n\
@@ -800,18 +754,7 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20 com.apple.universalcontrol Disable`, then the same for DisableMagicEdges) AND\n\
      \x20 set universal_control = \"leave\", or the next apply disables it again.\n";
 
-/// The `[privacy]` paragraph of `explain-config` (design §4).
-///
-/// It says that the probes (Full Disk Access's `open()` of a `TCC.db` and
-/// `DevToolsSecurity -status`) read existing state and raise no dialog; that
-/// at launch, while the grant reads off, aterm brings up the Full Disk Access
-/// page with its panel (owner ask 2026-10-16); that `notice` off also keeps
-/// the once-per-Mac debugger-access alert from coming up (owner ruling O29),
-/// and no key raises it; that the warm-up deliberately
-/// raises the prompts, so it runs on the owner's press or at a quiet moment of
-/// a launch that reads the grant off, never from a session; and that no key is
-/// deferred. It does not claim a grant ends macOS
-/// consent dialogs, since which services a grant covers is unmeasured.
+/// The `[privacy]` paragraph of `explain-config`.
 #[cfg(target_os = "macos")]
 const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      [privacy] — macOS consent (aterm.toml; the window reads it, `aterm doctor` only `observer`):\n\
@@ -1217,12 +1160,11 @@ pub(crate) fn list_kitty_commands_report() -> String {
     out
 }
 
-/// A doctor row's verdict. `Note` and `Warn` report something worth acting on
-/// without moving the exit code, so `aterm doctor && aterm` works on a machine
-/// without Full Disk Access or with builds stalling on macOS's first-run check.
-/// Only [`Mark::Fail`] fails; the health line counts the warnings.
+/// A doctor row's presentation. The legacy fact renderer counts warnings and
+/// fails only for [`Mark::Fail`]; the composed doctor assesses readiness from
+/// typed item outcomes, including whether a note represents missing evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mark {
+pub enum Mark {
     /// The check passed.
     Ok,
     /// A fact worth reporting that is not a failure — nothing to fix, or
@@ -1264,11 +1206,14 @@ impl Mark {
 struct DoctorRow {
     /// The row's left column, e.g. `shell:`.
     label: &'static str,
-    /// The verdict; only [`Mark::Fail`] moves the exit code.
+    /// The presentation; readiness is assessed separately.
     mark: Mark,
     /// The fact alone, no label (`/bin/sh (executable)`): the row prints it after
     /// the mark.
     fact: String,
+    /// The read did not establish the state. Separate from `mark`: a quiet note
+    /// may be either an ordinary advisory or missing evidence.
+    unmeasured: bool,
 }
 
 /// The macOS consent facts behind the `privacy:` row, gathered by
@@ -1302,21 +1247,16 @@ impl PrivacyFacts {
     }
 }
 
-/// Gather the consent facts for the `privacy:` row: the impure half, alongside
-/// the shell check.
+/// Gather the consent facts for the `privacy:` row.
 ///
-/// [`aterm_containment::probe_fda`] performs its `open()` only when the
-/// running executable resolves inside a `.app` (design §3.3, AGENTS.md), and
-/// `ProbeLabel::refused()` reports whether a syscall happened. From
-/// `target/debug/…` or a test binary it takes the refused arm: no probe, no
-/// responsible-app lookup, no `codesign`.
+/// [`aterm_containment::probe_fda`] opens `TCC.db` only when the running
+/// executable resolves inside a `.app`; outside a bundle it returns the
+/// refused arm without running a probe, responsible-app lookup, or `codesign`.
 fn privacy_facts() -> PrivacyFacts {
     let probe = aterm_containment::probe_fda(ProbeGate::on());
     if probe.label.refused() {
         return PrivacyFacts::not_measured(probe.label);
     }
-    // Past the fence: this is the bundled CLI, so naming the responsible app and
-    // reading the signature are both in bounds.
     let responsible = i32::try_from(std::process::id())
         .ok()
         .and_then(aterm_containment::responsible_app)
@@ -1329,30 +1269,19 @@ fn privacy_facts() -> PrivacyFacts {
     }
 }
 
-/// The class of the running bundle's designated requirement, which `tccd`
-/// stores beside a grant: whether a grant survives the next build.
+/// Classify the running bundle's designated requirement via `codesign -d -r-`.
 ///
-/// `codesign -d -r-` is the only unprivileged way to read it, and it is spawned
-/// ONLY from inside a resolved `.app` (the same fence as the probe). Any failure
-/// — no bundle, no `codesign`, a `codesign` that does not finish in 10 s,
-/// unparseable output — is [`DrClass::Unknown`],
-/// which claims nothing: the `privacy:` row names a dev build only on a
-/// positively identified cdhash/unsigned requirement.
+/// Spawned only inside a resolved `.app`; any failure or timeout returns
+/// [`DrClass::Unknown`].
 #[cfg(target_os = "macos")]
 fn designated_requirement_class() -> DrClass {
-    // The executable the probes' fence judges: the bundle's, also when this
-    // CLI was started through a symlink such as `~/.local/bin/aterm`.
     let Some(exe) = aterm_containment::consent::fence_exe() else {
         return DrClass::Unknown;
     };
     let Some(app_root) = aterm_containment::consent::app_bundle_root(&exe) else {
         return DrClass::Unknown;
     };
-    // Within the ceiling containment's own `codesign -d` reads use: the read
-    // takes tens of milliseconds, and when macOS's code-signing service
-    // (trustd) does not answer, codesign never finishes (measured 2026-10-01)
-    // and is killed — Unknown, which claims nothing, instead of a doctor that
-    // hangs.
+    // Bounded to 10 s: when macOS's trustd does not answer, `codesign` hangs indefinitely.
     let Ok(out) = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command("/usr/bin/codesign")
             .args(["-d", "-r-"])
@@ -1361,8 +1290,7 @@ fn designated_requirement_class() -> DrClass {
     ) else {
         return DrClass::Unknown;
     };
-    // codesign writes the requirement to stderr; read both streams so the
-    // classifier sees whatever it printed.
+    // `codesign` writes the requirement to stderr; read both streams.
     let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stdout));
     aterm_containment::classify_dr(&text)
@@ -1432,22 +1360,16 @@ fn privacy_row(facts: &PrivacyFacts) -> (Mark, String) {
     }
 }
 
-/// The debugger-access facts behind the `debugger:` row
-/// (docs/DESIGN-macos-debugger-access-2026-09-29.md §3.10), gathered by
-/// [`debugger_facts`] and consumed by the pure [`doctor_checks_with_origin`] exactly as
-/// [`PrivacyFacts`] is.
+/// Debugger-access facts behind the `debugger:` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DebuggerFacts {
-    /// One `DevToolsSecurity -status` plus the membership query. A refused
-    /// label means nothing was spawned.
+    /// `DevToolsSecurity -status` plus the membership query.
     probe: DebuggerProbe,
-    /// Whether this aterm has the hardened runtime without `get-task-allow` —
-    /// read only past the fence, [`SelfHardening::Unknown`] otherwise.
+    /// Whether this binary has the hardened runtime without `get-task-allow`.
     hardening: SelfHardening,
 }
 
 impl DebuggerFacts {
-    /// What every host that measured nothing reports: no state, no claim.
     const fn not_measured(label: DebuggerProbeLabel) -> Self {
         Self {
             probe: DebuggerProbe::refused(label),
@@ -1456,14 +1378,7 @@ impl DebuggerFacts {
     }
 }
 
-/// Gather the facts for the `debugger:` row, behind the same fence as
-/// [`privacy_facts`]: [`aterm_containment::consent::probe_debugger`] spawns its
-/// one `-status` only inside a `.app`, so from `target/debug/…` or a test
-/// binary no spawn, directory query or `csops` happens.
-///
-/// The gate is [`ProbeGate::on`]: the passthrough CLI reads none of
-/// `[privacy]`'s probe switches (only `observer`, for [`devtools_facts`]) and
-/// `-status` raises no dialog. It observes and never actuates.
+/// Gather the facts for the `debugger:` row behind the in-bundle fence.
 fn debugger_facts() -> DebuggerFacts {
     let probe = aterm_containment::consent::probe_debugger(ProbeGate::on());
     if probe.label.refused() {
@@ -1475,7 +1390,6 @@ fn debugger_facts() -> DebuggerFacts {
     }
 }
 
-/// Why the debugger probe reports what it does ([`probe_reason`]'s twin).
 const fn debugger_probe_reason(label: DebuggerProbeLabel) -> &'static str {
     match label {
         DebuggerProbeLabel::Pending => "the check is pending",
@@ -1494,22 +1408,7 @@ const fn debugger_probe_reason(label: DebuggerProbeLabel) -> &'static str {
     }
 }
 
-/// The `debugger:` row: mark + detail, pure over [`DebuggerFacts`] (design
-/// §4.6).
-///
-/// Never [`Mark::Fail`]: a Mac that asks for a password when lldb attaches is a
-/// normal Mac, and nothing here is a reason to refuse to launch. It observes
-/// only. Where developer mode would help it names the owner's switch as a PLACE,
-/// aterm's Settings ▸ Security (ruling O7), never the command that turns it on,
-/// on every build (ruling O8); an aterm that is not hardened says on the same
-/// line that with developer mode on any program the owner runs could take
-/// control of it. The one command it prints is the undo, and only once the rule
-/// is on.
-///
-/// `mode=disabled` with an unknown membership says only what was measured: an
-/// admin is also a `_developer` member, so an admin check that could not answer
-/// leaves whether the switch would help unknown, and the row says that rather
-/// than guess.
+/// Format the `debugger:` row from [`DebuggerFacts`]. Never returns [`Mark::Fail`].
 fn debugger_row(facts: &DebuggerFacts) -> (Mark, String) {
     let probe = &facts.probe;
     if probe.label.refused() || probe.mode == DebuggerMode::Unknown {
@@ -1548,8 +1447,6 @@ fn debugger_row(facts: &DebuggerFacts) -> (Mark, String) {
             const ASKS: &str = "macOS asks for a password when lldb attaches";
             const CACHED: &str = "(Developer Tools Access, cached up to 10 h)";
             const SWITCH: &str = "to turn it on: aterm Settings ▸ Security";
-            // What turning it on would expose, for an aterm that is not
-            // hardened (O8): said wherever the switch is named.
             let exposure = match facts.hardening {
                 SelfHardening::Hardened => "",
                 SelfHardening::NotHardened => {
@@ -1637,22 +1534,19 @@ fn unix_shell(
     (program.to_string_lossy().into_owned(), label)
 }
 
-/// `aterm doctor` — the shell (`$SHELL` on Unix, or the account's login shell
-/// when it is unset; the shell a new WINDOW tab spawns on Windows), the macOS consent
-/// posture (Full Disk Access, debugger access, and whether macOS checks each
-/// new program aterm starts), the aterm instances no control socket reaches,
-/// the fabric's broker (Unix: [`fabric_fact`]), the recovery ledger and open
-/// exceptions, plus the version. Reads env/fs +
-/// the consent tier, then delegates to the pure [`doctor_checks_with_origin`].
-/// Exit 1 only when the shell cannot start. Scriptable: `aterm doctor && aterm`.
+/// `aterm doctor`'s own facts (the shell, the macOS consent posture, unreachable instances,
+/// the fabric's broker, the recovery ledger and open exceptions) as [`doctor_rows`] makes
+/// them; the stale copies are left to their item ([`doctor::Gathered`]).
 ///
-/// With `fix` (every run but `--read-only`; owner ruling 2026-10-14) it also
-/// handles what aterm can: stale copies of aterm go to the Trash
-/// ([`atpkg::copies::prune`]), and when aterm is not on the Developer Tools
-/// list the owner is brought to it — through the running aterm window, whose
-/// panel explains it beside System Settings, or by doctor itself when no window
-/// answers ([`devtools_hand_over`]) — then re-read. The report says what it did.
-fn doctor_report(fix: bool) -> (String, i32) {
+/// With `fix` (every run but `--read-only`), when aterm is not on the Developer Tools list
+/// the person is brought to it ([`devtools_hand_over`], at most once per ten minutes), then
+/// the list is re-read.
+fn doctor_facts_rows(fix: bool) -> Vec<DoctorRow> {
+    // The program check first (one `ps -p`, under 10 ms, bounded): while its pool is at
+    // the kernel's limit the reads that list every program's command line are not made
+    // ([`args_read_withheld`]).
+    let program_check = program_check_fact();
+    let withheld = args_read_withheld(program_check.as_ref());
     std::thread::scope(|scope| {
         // The Developer Tools read (one `sqlite3` and one `log show`, up to 8 s)
         // runs beside the other facts, not after them.
@@ -1660,21 +1554,25 @@ fn doctor_report(fix: bool) -> (String, i32) {
         let spotlight = scope.spawn(spotlight::facts);
         let privacy = privacy_facts();
         let debugger = debugger_facts();
-        let instances = aterm_ctl::census::window_census();
+        let instances = match withheld {
+            Some(why) => Err(why.to_owned()),
+            None => aterm_ctl::census::window_census(),
+        };
         let recovery = recovery_facts();
         let exceptions = exceptions_facts();
-        let mut machine = machine_facts(fix);
+        let mut machine = machine_facts(withheld);
         let devtools = devtools
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         machine.spotlight = spotlight
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        machine.program_check = program_check;
         // Unix: the program this passthrough session spawns.
         #[cfg(not(windows))]
         {
             let (shell, origin) = unix_shell(aterm_pty::select_shell_with_origin(None));
-            doctor_checks_with_origin(
+            doctor_rows(
                 &shell,
                 driver::shell_check(&shell),
                 origin,
@@ -1692,7 +1590,7 @@ fn doctor_report(fix: bool) -> (String, i32) {
         #[cfg(windows)]
         {
             let window_shell = driver::WindowShell::resolve();
-            doctor_checks_with_origin(
+            doctor_rows(
                 &window_shell.program,
                 driver::shell_check(&window_shell.program),
                 Some(&window_shell.origin_sentence()),
@@ -1708,6 +1606,30 @@ fn doctor_report(fix: bool) -> (String, i32) {
     })
 }
 
+/// `aterm-cli`'s half of `aterm doctor` run alone, as `crates/aterm` runs it with its
+/// packages' items beside: gathered with `fix`, applied (the stale copies to the Trash)
+/// or, without `fix`, planned. For the tests that read the live report, which run on
+/// macOS and Windows alone.
+#[cfg(all(test, any(windows, target_os = "macos")))]
+fn doctor_report(fix: bool) -> (String, i32) {
+    let gathered = doctor::gather(fix);
+    let items = gathered.items();
+    let mode = if fix {
+        aterm_converge::Mode::Apply
+    } else {
+        aterm_converge::Mode::Plan
+    };
+    let rows = aterm_converge::run_scoped(
+        &items,
+        mode,
+        aterm_converge::Scope::REPAIR,
+        &mut aterm_converge::ReadOnly,
+        &mut |_| {},
+    )
+    .expect("doctor's items name no other");
+    doctor::render(&gathered, &rows, &[])
+}
+
 /// The stale copies of aterm as `doctor` reads them ([`atpkg::copies`]), with
 /// what this run did about them, the console host a new window's tab runs
 /// in, and the fabric's broker. Each is `None` where there is nothing to say
@@ -1718,10 +1640,13 @@ struct MachineFacts {
     /// Windows: the console host a new window's tab gets ([`console_host_fact`]).
     console_host: Option<aterm_pty::ConsoleHostReport>,
     /// Unix: the fabric's broker in one row ([`fabric_fact`]).
-    fabric: Option<(Mark, String)>,
+    fabric: Option<(Mark, String, bool)>,
     /// macOS: what Spotlight indexes of Rust build output and rustup's docs
     /// ([`spotlight::facts`]).
     spotlight: Option<Result<spotlight::Spotlit, String>>,
+    /// macOS: one look at the program check's pool
+    /// ([`aterm_uds::program_check::look`]).
+    program_check: Option<aterm_uds::program_check::Look>,
 }
 
 impl MachineFacts {
@@ -1732,47 +1657,110 @@ impl MachineFacts {
             console_host: None,
             fabric: None,
             spotlight: None,
+            program_check: None,
         }
     }
 }
 
-/// Gather [`MachineFacts`]: the stale-copy prune — a look alone under
-/// `--read-only` (the census only reads), so the row still says what a prune
-/// would move — and the console host.
-fn machine_facts(fix: bool) -> MachineFacts {
-    let console_host = console_host_fact();
-    let fabric = fabric_fact();
-    if !cfg!(target_os = "macos") {
-        return MachineFacts {
-            console_host,
-            fabric,
-            ..MachineFacts::absent()
-        };
-    }
+/// Gather [`MachineFacts`]: the console host and the fabric's broker, whose process table
+/// is not read while `withheld` says why ([`args_read_withheld`]). The stale copies are
+/// their own item ([`doctor::Gathered`]), whose probe looks and whose apply prunes.
+fn machine_facts(withheld: Option<&str>) -> MachineFacts {
     MachineFacts {
-        copies: Some(atpkg::copies::prune(!fix)),
-        console_host,
-        fabric,
-        spotlight: None,
+        console_host: console_host_fact(),
+        fabric: match withheld {
+            Some(why) => Some((Mark::Note, format!("not read ({why})"), true)),
+            None => fabric_fact(),
+        },
+        ..MachineFacts::absent()
     }
 }
 
-/// The fabric's broker in one row, read by aterm-link's own probe
-/// ([`aterm_link::fabric::doctor_summary`]: connect, `Hello`, the ring
-/// attached, the head query — `aterm fabric`'s, for the command the
-/// configuration names; a bridge an instance kept after `off` is `aterm
-/// fabric`'s alone to report, and the `off` row says so): whether
-/// it answers, the tier it SAYS it serves, and whether it says its log is
-/// poisoned. aterm-link's weights in this report's marks: a broker that does
-/// not answer, a bus that cannot be read and a poisoned log are a counted
-/// `warn` — mail does not move, and `aterm fabric doctor` names the fix — but
-/// never a failure, since no shell needs the fabric to start. `None` off Unix,
-/// where aterm has no fabric (crates/aterm's Cargo.toml says why).
-fn fabric_fact() -> Option<(Mark, String)> {
+/// Read the program check's pool for its row (`None` off macOS): one bounded `ps`.
+fn program_check_fact() -> Option<aterm_uds::program_check::Look> {
+    cfg!(target_os = "macos")
+        .then(|| aterm_uds::program_check::look(aterm_uds::program_check::PS_HANG))
+}
+
+/// Why doctor lists no program's command line now: macOS's program check is at the
+/// kernel's thread limit.
+const ARGS_WITHHELD: &str = "macOS's program check is at its thread limit, and listing every \
+                             program's command line would wait on the programs it holds \
+                             mid-start; see the `syspolicyd:` row";
+
+/// [`ARGS_WITHHELD`] while `look` reads `syspolicyd`'s pool at the kernel's limit, else
+/// `None`. The instance census and the fabric's process table read every program's
+/// arguments, and reading a program the check holds mid-start waits with it, for good in a
+/// deadlock (M29 of `docs/DESIGN-leftover-processes-2026-10-16.md`): doctor would print
+/// nothing, its `syspolicyd:` row included, and leave its `ps` hung. Pure.
+fn args_read_withheld(look: Option<&aterm_uds::program_check::Look>) -> Option<&'static str> {
+    matches!(look, Some(aterm_uds::program_check::Look::Read(r)) if r.full())
+        .then_some(ARGS_WITHHELD)
+}
+
+/// The `syspolicyd:` row (macOS), pure over one look: `ok` while
+/// `syspolicyd`'s pool has room or none runs, a `warn` while the kernel holds
+/// it at its limit (held there it is deadlocked, which only a restart ends;
+/// one reading cannot say how long it has stood, which a window's `status`
+/// does), a `note` when it could not be read. Never a failure.
+fn program_check_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
+    use aterm_uds::program_check::Look;
+    let Some(look) = &facts.program_check else {
+        return Vec::new();
+    };
+    let (mark, fact) = match look {
+        Look::Unread => (
+            Mark::Note,
+            "syspolicyd's pool could not be read (the process table, syspolicyd's image or \
+             `ps` gave no reading)"
+                .to_owned(),
+        ),
+        Look::NoneRunning => (
+            Mark::Ok,
+            "no syspolicyd runs (launchd starts one at the next request)".to_owned(),
+        ),
+        Look::Read(r) => {
+            let limit = r
+                .limit
+                .map_or_else(|| "its limit".to_owned(), |l| format!("a limit of {l}"));
+            if r.full() {
+                (
+                    Mark::Warn,
+                    format!(
+                        "syspolicyd is at the kernel's thread limit ({} pool threads against \
+                         {limit})\n\
+                         held there it is deadlocked: no new program starts until the Mac \
+                         restarts\n\
+                         a window's `aterm ctl @self status` says syspolicyd=stuck once it \
+                         has held five minutes",
+                        r.workers
+                    ),
+                )
+            } else {
+                (
+                    Mark::Ok,
+                    format!(
+                        "syspolicyd answers ({} pool threads against {limit})",
+                        r.workers
+                    ),
+                )
+            }
+        }
+    };
+    vec![DoctorRow {
+        label: "syspolicyd:",
+        mark,
+        fact,
+        unmeasured: matches!(look, Look::Unread),
+    }]
+}
+
+/// Probe the fabric broker for the `fabric:` row (`None` off Unix). Never [`Mark::Fail`].
+fn fabric_fact() -> Option<(Mark, String, bool)> {
     #[cfg(unix)]
     {
         let summary = aterm_link::fabric::doctor_summary();
-        Some((fabric_mark(summary.level), summary.text))
+        Some((fabric_mark(summary.level), summary.text, summary.unmeasured))
     }
     #[cfg(not(unix))]
     {
@@ -1780,8 +1768,6 @@ fn fabric_fact() -> Option<(Mark, String)> {
     }
 }
 
-/// aterm-link's weight for the fabric row in this report's marks: never
-/// [`Mark::Fail`].
 #[cfg(unix)]
 const fn fabric_mark(level: aterm_link::fabric::SummaryLevel) -> Mark {
     use aterm_link::fabric::SummaryLevel;
@@ -1792,25 +1778,21 @@ const fn fabric_mark(level: aterm_link::fabric::SummaryLevel) -> Mark {
     }
 }
 
-/// The `fabric:` row, pure over the facts ([`fabric_fact`]); none where there
-/// is no fabric.
 fn fabric_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     facts
         .fabric
         .as_ref()
-        .map(|(mark, fact)| DoctorRow {
+        .map(|(mark, fact, unmeasured)| DoctorRow {
             label: "fabric:",
             mark: *mark,
             fact: fact.clone(),
+            unmeasured: *unmeasured,
         })
         .into_iter()
         .collect()
 }
 
-/// Windows: the console host a new window's tab runs in under aterm.toml's
-/// `conpty`, STARTED once to prove it (`aterm_pty::probe_console_host`: the
-/// default starts the OpenConsole beside aterm, `inbox` starts nothing). `None`
-/// elsewhere: no console host.
+/// Probe the Windows console host for a new window's tab (`None` off Windows).
 fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     #[cfg(windows)]
     {
@@ -1824,37 +1806,21 @@ fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     }
 }
 
-/// Read the Developer Tools list ([`atpkg::devtools::facts`]) and, with `fix`
-/// and aterm `not_granted`, bring the owner to the switch through the running
-/// aterm window when one answers ([`devtools_hand_over`]), so the owner gets
-/// aterm's helper panel beside System Settings, and read the list again when
-/// this run opened the page. Never over ssh (no pane can open on the Mac's
-/// screen from there). A test binary reads nothing: the probes refuse outside an
-/// app bundle, so nothing is asked or opened.
+/// Read the Developer Tools list and, when `fix` is set and aterm is `NotGranted`
+/// on a local session, hand over the System Settings pane via [`devtools_hand_over`].
 fn devtools_facts(fix: bool) -> DevtoolsFacts {
     let (facts, did) = devtools_read_and_hand_over(fix);
     DevtoolsFacts { facts, did }
 }
 
-/// [`devtools_facts`]'s two halves: the facts read last, and what was done.
 fn devtools_read_and_hand_over(fix: bool) -> (Option<atpkg::devtools::Facts>, Option<String>) {
     use atpkg::devtools as dt;
     use std::io::IsTerminal as _;
     let Some(facts) = dt::facts() else {
         return (None, None);
     };
-    if !fix || facts.grant() != aterm_containment::DevToolGrant::NotGranted {
-        return (Some(facts), None);
-    }
-    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        return (
-            Some(facts),
-            Some(
-                "did nothing: this shell is over ssh, so no pane can open on the Mac's screen"
-                    .to_string(),
-            ),
-        );
-    }
+    let over_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
     let person = std::io::stdout().is_terminal();
     let subject = facts.subject.clone().unwrap_or_default();
     let version = aterm_types::version::app_version();
@@ -1875,14 +1841,43 @@ fn devtools_read_and_hand_over(fix: bool) -> (Option<atpkg::devtools::Facts>, Op
         local_day: &|at| local_day_words(at, i64::try_from(at).ok().and_then(local_offset_at)),
         say: &|words| eprintln!("{words}"),
     };
-    let (did, opened) = devtools_hand_over(&facts, person, &reach);
+    let (facts, did) = devtools_hand_over_when(fix, facts, over_ssh, person, &reach, dt::facts);
+    (Some(facts), did)
+}
+
+/// The fix-mode hand-over over the facts read: nothing without `fix` or when aterm is not
+/// missing from the list, a sentence over ssh, else [`devtools_hand_over`] — the window
+/// first, doctor's own open at most once per [`atpkg::devtools::REOPEN_AFTER_S`] — and
+/// the list read again (`reread`) when this run opened the page. Split out so the
+/// throttle `aterm doctor` keeps is proved through the path it runs.
+fn devtools_hand_over_when(
+    fix: bool,
+    facts: atpkg::devtools::Facts,
+    over_ssh: bool,
+    person: bool,
+    reach: &DevtoolsReach<'_>,
+    reread: impl FnOnce() -> Option<atpkg::devtools::Facts>,
+) -> (atpkg::devtools::Facts, Option<String>) {
+    if !fix || facts.grant() != aterm_containment::DevToolGrant::NotGranted {
+        return (facts, None);
+    }
+    if over_ssh {
+        return (
+            facts,
+            Some(
+                "did nothing: this shell is over ssh, so no pane can open on the Mac's screen"
+                    .to_string(),
+            ),
+        );
+    }
+    let (did, opened) = devtools_hand_over(&facts, person, reach);
     // Re-read: the row says what holds now, not what held before the hand-over.
     let facts = if opened {
-        dt::facts().unwrap_or(facts)
+        reread().unwrap_or(facts)
     } else {
         facts
     };
-    (Some(facts), Some(did))
+    (facts, Some(did))
 }
 
 /// What the running aterm window answered `devtools hand-over`, as `aterm
@@ -1972,36 +1967,11 @@ struct DevtoolsReach<'a> {
 const DEVTOOLS_WAIT_LINE: &str = "aterm doctor: waiting up to 2 min for aterm's switch to read on \
                                   in Developer Tools (ctrl-c stops doctor)\u{2026}";
 
-/// THE HAND-OVER FROM `aterm doctor` (owner ask 2026-10-15): ask the running
-/// window first, so the owner gets aterm's panel beside System Settings, and act
-/// on what it answers. `(did, opened)`: what this run did, in the report's
-/// words, and whether doctor opened the page (the list is read again then).
+/// Coordinate the Developer Tools hand-over with any running aterm window.
 ///
-/// * No window answers (none runs, or the request never went out: the connect
-///   phase failed or refused it), or one too old to know the verb: doctor opens
-///   the page itself, as before — when no person is at the terminal (an agent may
-///   run doctor in a loop) never while the owner's Not now holds and at most once
-///   per [`atpkg::devtools::REOPEN_AFTER_S`], with the whole banner first when a
-///   person is here.
-/// * `OK shown` (a person here, `now`): the panel is up; doctor opens the page
-///   (the window's `now` form never does) after a short banner naming the panel.
-///   `OK unshown`: no panel, so the whole banner, then the page.
-/// * The request went out with a person here and no reply came: the window's
-///   `now` form never opens the page, so doctor opens it, with the whole banner.
-///   With no person here (the bare form) the window may still bring the page up
-///   at a quiet moment, so doctor opens nothing.
-/// * `OK queued` (no person here): the window brings the page up itself at a
-///   quiet moment. Doctor opens nothing.
-/// * `OK granted` or `OK unknown` with a person here contradicts the
-///   `not_granted` doctor itself read a moment ago: the window answers from a
-///   verdict it took earlier (it reads again on a focus gain, and only while it
-///   awaits the owner), so doctor opens the page itself, with the whole banner.
-/// * Anything else is the window's decision that nothing opens — granted or
-///   unknown with nobody here, declined, unstable, recent, headless or an error
-///   — and doctor opens nothing either, saying why.
-///
-/// With a person here and the list readable, doctor then waits up to two
-/// minutes for the switch.
+/// Asks the running window first so its helper panel can appear beside System Settings,
+/// and opens the pane directly only when no window answers, the window is older than
+/// the verb, or `now` left the page open to `doctor`. Returns `(did, opened)`.
 fn devtools_hand_over(
     facts: &atpkg::devtools::Facts,
     person: bool,
@@ -2012,8 +1982,6 @@ fn devtools_hand_over(
         WindowAnswer::Unreachable => {
             return devtools_open_here(facts, person, reach, true, !person);
         }
-        // `now` shows at most the panel, never the page: a person here gets it
-        // from doctor whatever the window did.
         WindowAnswer::Unanswered(_) if person => {
             return devtools_open_here(facts, person, reach, true, false);
         }
@@ -2036,14 +2004,9 @@ fn devtools_hand_over(
     let did = match reply.as_str() {
         "OK shown" => return devtools_open_here(facts, person, reach, false, false),
         "OK unshown" => return devtools_open_here(facts, person, reach, true, false),
-        // The window's verdict is older than doctor's own read, which says
-        // not_granted (doctor asks only then): a person here gets the page from
-        // doctor, with the whole banner, as with no window.
         "OK granted" | "OK unknown" if person => {
             return devtools_open_here(facts, person, reach, true, false);
         }
-        // A window older than the verb: it cannot hand anything over, so this is
-        // the no-window path (it raised nothing, so nothing opens twice).
         _ if reply.starts_with("ERR unknown verb") => {
             return devtools_open_here(facts, person, reach, true, !person);
         }
@@ -2051,9 +2014,6 @@ fn devtools_hand_over(
             "asked the aterm window to show the owner the page at a quiet moment (status: {})",
             dt::STATUS_PAGE
         ),
-        // `now`'s `recent` is the window's minute, which its own last answer to a
-        // `now` also starts (the shared marker moves only when a page opens), so
-        // no time read from the marker is promised for it.
         "OK recent" if person => format!(
             "did nothing: within the last minute aterm opened the page, or the aterm window \
              answered a request for it, or aterm's Full Disk Access page is waiting or open and \
@@ -2100,13 +2060,7 @@ fn devtools_hand_over(
     (did, false)
 }
 
-/// Doctor's own open (no window answered, or the window showed its panel and
-/// leaves the page to doctor): atpkg's hand-over, with the banner printed just
-/// before the page opens when a person is here — the whole banner with `full`,
-/// two lines naming the panel without — and the wait. `rate_limited` (no
-/// person here, no window that judged it): refuse while the owner's Not now
-/// holds, as the window's own hand-over does, and within
-/// [`atpkg::devtools::REOPEN_AFTER_S`] of the last opening.
+/// Open the Developer Tools pane directly from `doctor` and optionally wait for the switch.
 fn devtools_open_here(
     facts: &atpkg::devtools::Facts,
     person: bool,
@@ -2202,14 +2156,7 @@ fn opened_ago_words(ago: u64) -> String {
     }
 }
 
-/// The banner a person at doctor's terminal reads as System Settings opens, in
-/// atpkg's one spelling: with `full`, the title, why, how (by what the list
-/// holds of aterm: [`atpkg::devtools::Step`]), which switch matters
-/// (`listed_terminal`: this run's `spctl` added Terminal), the trade and where
-/// the status lives; without, two lines naming aterm's panel, which says the
-/// rest beside the list — and, when this run's `spctl` added Terminal, that
-/// Terminal stays off (the panel was shown before `spctl` ran, so it cannot
-/// say so). Pure.
+/// Format the stderr banner printed when `doctor` opens System Settings.
 fn devtools_banner(facts: &atpkg::devtools::Facts, full: bool, listed_terminal: bool) -> String {
     use atpkg::devtools as dt;
     let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
@@ -2258,6 +2205,7 @@ fn console_host_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         label: "conpty:",
         mark: if host.fell_back { Mark::Note } else { Mark::Ok },
         fact: host.line.clone(),
+        unmeasured: false,
     }]
 }
 
@@ -2274,6 +2222,7 @@ fn spotlight_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
                 label: "spotlight:",
                 mark: if clean { Mark::Ok } else { Mark::Note },
                 fact,
+                unmeasured: measured.is_err(),
             }
         })
         .into_iter()
@@ -2292,6 +2241,15 @@ fn copies_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         label: "copies:",
         mark: mark_of_level(row.level),
         fact: row.text,
+        unmeasured: matches!(
+            pruned,
+            atpkg::copies::Pruned::NotLooked(_)
+                | atpkg::copies::Pruned::Incomplete { .. }
+                | atpkg::copies::Pruned::Found {
+                    complete: false,
+                    ..
+                }
+        ),
     }]
 }
 
@@ -2304,15 +2262,18 @@ fn mark_of_level(level: atpkg::doctor::Level) -> Mark {
     }
 }
 
-/// The recovery ledger as `doctor` reads it: its rows and its path, or `None` when
-/// no log directory resolves (`aterm_update::recovery_ledger`).
-type RecoveryFacts = Option<(Vec<aterm_update::recovery_ledger::Row>, std::path::PathBuf)>;
+/// The recovery ledger as `doctor` reads it: its rows and path, or why the history
+/// could not be read (`aterm_update::recovery_ledger`).
+type RecoveryFacts = Result<(Vec<aterm_update::recovery_ledger::Row>, std::path::PathBuf), String>;
 
 /// Read the recovery ledger — the rows the window's recovery census writes at each
 /// windowed launch of the installed app. Read-only and bounded.
 fn recovery_facts() -> RecoveryFacts {
-    let path = aterm_update::recovery_ledger::default_ledger_path()?;
-    Some((aterm_update::recovery_ledger::read_rows(&path), path))
+    let path = aterm_update::recovery_ledger::default_ledger_path()
+        .ok_or_else(|| "no log folder, so there is no ledger".to_owned())?;
+    aterm_update::recovery_ledger::read_rows_checked(&path)
+        .map(|rows| (rows, path.clone()))
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// The `recovery:` row, pure over the ledger: how the runs before each recorded
@@ -2323,11 +2284,9 @@ fn recovery_row(facts: &RecoveryFacts) -> (Mark, String) {
     if cfg!(windows) {
         return (Mark::Note, "not recorded on Windows".to_string());
     }
-    let Some((rows, path)) = facts else {
-        return (
-            Mark::Note,
-            "not measured (no log folder, so there is no ledger)".to_string(),
-        );
+    let (rows, path) = match facts {
+        Ok(read) => read,
+        Err(why) => return (Mark::Note, format!("not measured ({why})")),
     };
     let (lines, unexpected) = aterm_update::recovery_ledger::doctor_lines(rows, path);
     let mark = if unexpected { Mark::Note } else { Mark::Ok };
@@ -2375,16 +2334,7 @@ fn instances_row(census: &Result<aterm_ctl::census::Census, String>) -> (Mark, S
     (Mark::Note, detail)
 }
 
-/// Pure core of `doctor` (all state is an input, so it is deterministically
-/// testable): the checks as a stable report + exit code (0 = nothing failed,
-/// 1 = any [`Mark::Fail`]).
-///
-/// The verdict is four-valued, and `health`/the exit code are computed from
-/// `Fail` ALONE, so a `Note` or `Warn` row — the macOS consent posture is the
-/// first — reports a fact without making `aterm doctor && aterm` refuse to launch.
-///
-/// The `shell:` row is unlabelled here; [`doctor_checks_with_origin`] is the
-/// same report with the row labelled, which is what the live paths call.
+/// Pure core of `doctor` without a `shell_origin` label.
 #[cfg(test)]
 fn doctor_checks(
     shell: &str,
@@ -2409,24 +2359,125 @@ fn doctor_checks(
     )
 }
 
-/// What to do when the shell cannot start — the one row that can fail.
 const SHELL_REMEDY: &str = if cfg!(windows) {
     "set `shell` in aterm.toml to an installed shell"
 } else {
     "set $SHELL to an installed shell"
 };
 
-/// `doctor_checks` with the `shell:` row labelled by WHERE the shell came from
-/// (`shell_origin`, appended after the fact as ` — <label>`). Windows passes
-/// `driver::WindowShell::origin_sentence`, so the row says whose shell it names
-/// and which input chose it — a reader who sees `pwsh.exe` from inside a
-/// Git Bash tab must not have to guess whether doctor looked at `$SHELL`. Unix
-/// labels only a shell `$SHELL` did not name ([`unix_shell`]). `None` renders exactly
-/// the unlabelled row.
+/// Render the `doctor` report and exit code (`0` = no [`Mark::Fail`], `1` = any [`Mark::Fail`]).
 ///
-/// The privacy, debugger and devtools rows exist only where their probe
-/// applies: on a platform without them (`UnsupportedPlatform`) the rows are
-/// left out rather than printed as a `note` nobody can act on.
+/// Appends `shell_origin` to the `shell:` row when present and omits rows whose
+/// platform probe returned `UnsupportedPlatform`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one gathered fact; passing them in is what keeps the report pure"
+)]
+fn doctor_rows(
+    shell: &str,
+    shell_check: ShellCheck,
+    shell_origin: Option<&str>,
+    privacy: &PrivacyFacts,
+    debugger: &DebuggerFacts,
+    devtools: &DevtoolsFacts,
+    instances: &Result<aterm_ctl::census::Census, String>,
+    recovery: &RecoveryFacts,
+    exceptions: &ExceptionsFacts,
+    machine: &MachineFacts,
+) -> Vec<DoctorRow> {
+    let (shell_ok, shell_fact) = match (shell, shell_check) {
+        ("", _) => (false, "$SHELL is empty".to_string()),
+        (p, ShellCheck::Runs) => (true, format!("{p} (executable)")),
+        (p, ShellCheck::Missing) => (false, format!("{p} does not exist")),
+        (p, ShellCheck::NotExecutable) => (false, format!("{p} is not executable")),
+    };
+    let shell_fact = match shell_origin {
+        Some(origin) => format!("{shell_fact} — {origin}"),
+        None => shell_fact,
+    };
+
+    let mut checks = vec![DoctorRow {
+        label: "shell:",
+        mark: Mark::from_ok(shell_ok),
+        fact: shell_fact,
+        unmeasured: false,
+    }];
+    if privacy.fda_label != ProbeLabel::UnsupportedPlatform {
+        let (mark, fact) = privacy_row(privacy);
+        checks.push(DoctorRow {
+            label: "privacy:",
+            mark,
+            fact,
+            unmeasured: privacy.fda_label.refused() || privacy.fda == FdaState::Unknown,
+        });
+    }
+    if debugger.probe.label != DebuggerProbeLabel::UnsupportedPlatform {
+        let (mark, fact) = debugger_row(debugger);
+        checks.push(DoctorRow {
+            label: "debugger:",
+            mark,
+            fact,
+            unmeasured: debugger.probe.label.refused()
+                || matches!(
+                    debugger.probe.mode,
+                    DebuggerMode::Unknown | DebuggerMode::Unrecognized
+                )
+                || debugger.hardening == SelfHardening::Unknown
+                || debugger.probe.member == DebuggerMember::Unknown,
+        });
+    }
+    if let Some(row) = devtools.facts.as_ref().and_then(atpkg::devtools::row) {
+        // atpkg's weights: a `warn` is counted, never a failure.
+        let mark = mark_of_level(row.level);
+        let fact = match &devtools.did {
+            Some(did) => format!("{}\n{did}", row.text),
+            None => row.text,
+        };
+        checks.push(DoctorRow {
+            label: "devtools:",
+            mark,
+            fact,
+            unmeasured: devtools.facts.as_ref().is_some_and(|facts| {
+                facts.grant() == aterm_containment::consent::DevToolGrant::Unknown
+            }),
+        });
+    }
+    checks.extend(copies_rows(machine));
+    checks.extend(spotlight_rows(machine));
+    checks.extend(program_check_rows(machine));
+    checks.extend(console_host_rows(machine));
+    let (instances_mark, instances_fact) = instances_row(instances);
+    let (recovery_mark, recovery_fact) = recovery_row(recovery);
+    let (exceptions_mark, exceptions_fact) = exceptions_row(exceptions);
+    checks.push(DoctorRow {
+        label: "instances:",
+        mark: instances_mark,
+        fact: instances_fact,
+        unmeasured: instances.is_err(),
+    });
+    // The fabric beside the instances that carry it.
+    checks.extend(fabric_rows(machine));
+    checks.extend([
+        DoctorRow {
+            label: "recovery:",
+            mark: recovery_mark,
+            fact: recovery_fact,
+            unmeasured: !cfg!(windows) && recovery.is_err(),
+        },
+        DoctorRow {
+            label: "exceptions:",
+            mark: exceptions_mark,
+            fact: exceptions_fact,
+            unmeasured: exceptions.is_err(),
+        },
+    ]);
+
+    checks
+}
+
+/// [`doctor_rows`] through the engine and rendered: the report the pure tests read,
+/// planned and never applied — the items and the renderer `aterm doctor` runs.
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is one gathered fact; passing them in is what keeps the report pure"
@@ -2443,77 +2494,26 @@ fn doctor_checks_with_origin(
     exceptions: &ExceptionsFacts,
     machine: &MachineFacts,
 ) -> (String, i32) {
-    let (shell_ok, shell_fact) = match (shell, shell_check) {
-        ("", _) => (false, "$SHELL is empty".to_string()),
-        (p, ShellCheck::Runs) => (true, format!("{p} (executable)")),
-        (p, ShellCheck::Missing) => (false, format!("{p} does not exist")),
-        (p, ShellCheck::NotExecutable) => (false, format!("{p} is not executable")),
-    };
-    let shell_fact = match shell_origin {
-        Some(origin) => format!("{shell_fact} — {origin}"),
-        None => shell_fact,
-    };
+    let gathered = doctor::Gathered::of_rows(doctor_rows(
+        shell,
+        shell_check,
+        shell_origin,
+        privacy,
+        debugger,
+        devtools,
+        instances,
+        recovery,
+        exceptions,
+        machine,
+    ));
+    let rows = gathered.plan();
+    doctor::render(&gathered, &rows, &[])
+}
 
-    let mut checks = vec![DoctorRow {
-        label: "shell:",
-        mark: Mark::from_ok(shell_ok),
-        fact: shell_fact,
-    }];
-    if privacy.fda_label != ProbeLabel::UnsupportedPlatform {
-        let (mark, fact) = privacy_row(privacy);
-        checks.push(DoctorRow {
-            label: "privacy:",
-            mark,
-            fact,
-        });
-    }
-    if debugger.probe.label != DebuggerProbeLabel::UnsupportedPlatform {
-        let (mark, fact) = debugger_row(debugger);
-        checks.push(DoctorRow {
-            label: "debugger:",
-            mark,
-            fact,
-        });
-    }
-    if let Some(row) = devtools.facts.as_ref().and_then(atpkg::devtools::row) {
-        // atpkg's weights: a `warn` is counted, never a failure.
-        let mark = mark_of_level(row.level);
-        let fact = match &devtools.did {
-            Some(did) => format!("{}\n{did}", row.text),
-            None => row.text,
-        };
-        checks.push(DoctorRow {
-            label: "devtools:",
-            mark,
-            fact,
-        });
-    }
-    checks.extend(copies_rows(machine));
-    checks.extend(spotlight_rows(machine));
-    checks.extend(console_host_rows(machine));
-    let (instances_mark, instances_fact) = instances_row(instances);
-    let (recovery_mark, recovery_fact) = recovery_row(recovery);
-    let (exceptions_mark, exceptions_fact) = exceptions_row(exceptions);
-    checks.push(DoctorRow {
-        label: "instances:",
-        mark: instances_mark,
-        fact: instances_fact,
-    });
-    // The fabric beside the instances that carry it.
-    checks.extend(fabric_rows(machine));
-    checks.extend([
-        DoctorRow {
-            label: "recovery:",
-            mark: recovery_mark,
-            fact: recovery_fact,
-        },
-        DoctorRow {
-            label: "exceptions:",
-            mark: exceptions_mark,
-            fact: exceptions_fact,
-        },
-    ]);
-
+/// The report's lines, the version and the health line, from one mark and fact per
+/// row ([`doctor::render`] reads them off the rows the engine returned): only
+/// [`Mark::Fail`] fails, and the health line names every `warn`.
+fn render_doctor_lines(checks: &[DoctorRow]) -> (String, i32) {
     // Only the shell row can be `Fail`, so a failing report names it and the fix.
     let all_ok = !checks.iter().any(|row| row.mark.is_fail());
     let warned: Vec<&str> = checks
@@ -2522,11 +2522,31 @@ fn doctor_checks_with_origin(
         .map(|row| row.label.trim_end_matches(':'))
         .collect();
 
+    let mut out = render_doctor_rows(checks);
+    if all_ok && warned.is_empty() {
+        out.push_str("health: OK\n");
+    } else if all_ok {
+        out.push_str(&format!(
+            "health: OK — {} warning{} ({})\n",
+            warned.len(),
+            if warned.len() == 1 { "" } else { "s" },
+            warned.join(", ")
+        ));
+    } else {
+        out.push_str(&format!(
+            "health: FAIL — aterm cannot start this shell; {SHELL_REMEDY}\n"
+        ));
+    }
+    (out, i32::from(!all_ok))
+}
+
+/// Facts and version, before the caller's health/readiness assessment.
+fn render_doctor_rows(checks: &[DoctorRow]) -> String {
     // One row per check: the label, the mark, the fact. A fact of several lines
     // keeps its later lines under the fact column.
     const LABEL: usize = "exceptions: ".len();
     let mut out = String::new();
-    for row in &checks {
+    for row in checks {
         let mut lines = row.fact.lines();
         out.push_str(&format!(
             "{:<LABEL$}{:<5} {}\n",
@@ -2544,21 +2564,7 @@ fn doctor_checks_with_origin(
         "version: {}\n\n",
         aterm_types::version::app_version()
     ));
-    if all_ok && warned.is_empty() {
-        out.push_str("health: OK\n");
-    } else if all_ok {
-        out.push_str(&format!(
-            "health: OK — {} warning{} ({})\n",
-            warned.len(),
-            if warned.len() == 1 { "" } else { "s" },
-            warned.join(", ")
-        ));
-    } else {
-        out.push_str(&format!(
-            "health: FAIL — aterm cannot start this shell; {SHELL_REMEDY}\n"
-        ));
-    }
-    (out, i32::from(!all_ok))
+    out
 }
 
 /// The outcome of parsing the command line: print-and-exit (help/version),
@@ -2644,17 +2650,15 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
         // The tail is parsed, never dropped, so a wrong flag is an error rather
         // than silently accepted.
         let takes_operand = cmd == "show-face";
-        // `aterm doctor [--read-only]`: the flag keeps it from fixing anything.
+        // `aterm doctor`'s grammar ([`doctor::args`], [`doctor::GRAMMAR`]): the
+        // grammar is checked here too, so a wrong flag is a usage error on every path.
         if cmd == "doctor" {
-            return match rest.as_slice() {
-                [] => CliAction::Diag { cmd, arg: None },
-                [flag] if flag == "--read-only" => CliAction::Diag {
+            return match doctor::args(&rest) {
+                Ok(_) => CliAction::Diag {
                     cmd,
-                    arg: Some(flag.clone()),
+                    arg: (!rest.is_empty()).then(|| rest.join(" ")),
                 },
-                [other, ..] => CliAction::Usage(format!(
-                    "aterm doctor: unknown argument {other:?} — usage: aterm doctor [--read-only]"
-                )),
+                Err(usage) => CliAction::Usage(usage),
             };
         }
         // `aterm exceptions [--all]`: its one optional operand is a flag.
@@ -2760,23 +2764,10 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
     }
 }
 
-/// The `-V`/`--version` text:
-///
-/// * `aterm <version>`, the identity line `tools/install.sh` greps (`^aterm `);
-/// * `build: <N>`, the monotonic build number the updater orders by (the
-///   pre-swap start probe requires it to name the build being installed);
-///   omitted when the binary installed no stamp, or build `0` (no git);
-/// * which copy runs (`docs/DESIGN-which-copy-runs-2026-08-27.md`):
-///   `running: <path>` and `another copy: <path> (<version>) — …` lines as
-///   spelled by `aterm_update::which_copy`; identity only with no executable
-///   path;
-/// * `trusts: master=<sha256>`, the fingerprint of the compiled-in paper
-///   master (`empty` names an unarmed tier).
+/// Format the `-V`/`--version` output: identity line, origin line, optional build
+/// number, `which_copy` lines, and the compiled update trust anchor fingerprint.
 #[must_use]
 pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> String {
-    // Identity line first (install.sh and the release gates read only this
-    // line), then the origin line, then build number, which copy runs, and
-    // trust roots.
     let mut out = format!(
         "aterm {}\n{}\n",
         aterm_types::version::app_version(),
@@ -2795,8 +2786,6 @@ pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> Strin
     out
 }
 
-/// The running build number from the binary's installed stamp
-/// (`aterm_types::version`); `None` without one, or for build `0` (no git).
 fn running_build() -> Option<u64> {
     let build = aterm_types::version::installed()?
         .build_number
@@ -2805,20 +2794,15 @@ fn running_build() -> Option<u64> {
     (build > 0).then_some(build)
 }
 
-/// Hook run when the session's shell first writes output. The launcher
-/// (`crates/aterm/src/main.rs`) uses it to confirm a replaced Linux
-/// executable's trial: a prompt on screen proves a healthy start. First
-/// registration wins.
+/// Hook run when the session's shell first writes output (used by the launcher
+/// to confirm a replaced Linux executable's trial).
 static FIRST_SHELL_OUTPUT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
-/// Register the hook [`FIRST_SHELL_OUTPUT`] names; `false` when one is already
-/// set. It runs once on the passthrough loop, so it must not block. Register it
-/// before [`session_main`] spawns the shell.
+/// Register the [`FIRST_SHELL_OUTPUT`] hook; returns `false` if already set.
 pub fn on_first_shell_output(hook: fn()) -> bool {
     FIRST_SHELL_OUTPUT.set(hook).is_ok()
 }
 
-/// The shell's first output reached the terminal: run the hook, if one is registered.
 #[cfg(unix)]
 fn first_shell_output() {
     if let Some(hook) = FIRST_SHELL_OUTPUT.get() {
@@ -2826,7 +2810,6 @@ fn first_shell_output() {
     }
 }
 
-/// The `trusts:` line of [`version_text`].
 fn trust_anchors_line() -> String {
     format!(
         "trusts: master={}\n",
@@ -2834,11 +2817,8 @@ fn trust_anchors_line() -> String {
     )
 }
 
-/// Print a print-and-exit verb's answer and exit `code`: never `print!`, which PANICKED
-/// (exit 101, "failed printing to stdout: Broken pipe") when the reader had gone. A reader
-/// that went away ends the answer; an answer that could not be written for any other reason
-/// exits 1, saying why ([`aterm_uds::stdout::answer_status`]). The text is spelled for its
-/// reader first (`cli_text::for_stdout`: unchanged everywhere but a Windows shell's pipe).
+/// Write `text` to stdout without panicking on `EPIPE` and exit with `code`
+/// (or `1` on non-pipe write errors).
 fn answer_and_exit(text: &str, code: i32) -> ! {
     let written = aterm_uds::stdout::write_all(cli_text::for_stdout(text).as_bytes());
     std::process::exit(
@@ -3046,36 +3026,14 @@ const HOOK_AGENTS_ENV: &str = "ATPKG_AGENTS";
 /// empty means none. Re-exported so a nested session reads the same.
 const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 
-/// The managed `agents/` directory (shims for `claude`, `codex`) a TTY session
-/// puts in front of its shell's PATH, as the window's spawn seam does
-/// (`aterm-gui`'s `spawn::managed_agents_dir`).
+/// Resolve the managed `agents/` directory for a TTY session:
 ///
-/// This is a pre-rc hint: the session spawns a login shell with no aterm shell
-/// integration, so on macOS `path_helper` rebuilds PATH before any rc runs.
-/// What puts `agents/` (and, inside aterm, `reroute/` ahead of it) first at the
-/// prompt is the rc-sourced `~/.aterm/shell.d/00-atpkg.<shell>` hook, once at
-/// shell start; there is no per-prompt re-assert in this lane.
-///
-/// Which directory, in order (pinned by
-/// `managed_agents_dir_prefers_the_front_doors_handoff_then_the_sibling_then_the_hook`):
-///
-/// 1. `handed`: `$ATERM_AGENTS_DIR`, the front door's handoff. It resolves the
-///    store and ensures `<prefix>/agents` via `Layout::ensure_agents_dir` on
-///    every lane (reroute engaged or not), and clears an inherited stray when
-///    it hands nothing. Taken when it is an absolute path to an existing real
-///    directory (not a symlink); nothing is created here.
-/// 2. The sibling of the reroute directory (`$ATERM_REROUTE_DIR`): `reroute/`
-///    and `agents/` share one manager prefix (pinned by
-///    `the_agents_dir_is_the_reroute_dirs_sibling_in_atpkgs_layout`). The
-///    fallback when the front door refused; ensured here, silently on refusal.
-/// 3. `enclosing_agents`: `$ATPKG_AGENTS` from an enclosing hook-sourced shell,
+/// 1. `handed` (`$ATERM_AGENTS_DIR` from the front door) when it is an absolute
+///    existing real directory;
+/// 2. `<prefix>/agents` alongside `reroute_dir` (`$ATERM_REROUTE_DIR`), ensured
+///    via [`ensure_agents_dir`];
+/// 3. `enclosing_agents` (`$ATPKG_AGENTS` from an enclosing hook-sourced shell)
 ///    when it is an absolute existing directory.
-///
-/// Rule 2 ensures the directory as `Layout::ensure_dir` does, with the mode
-/// from the prefix's metadata ([`agents_dir_mode`]): one `mkdir`, never
-/// through a symlink at `agents/`, and a refusal is silent here because the
-/// front door already reported it. No `ATPKG_AGENTS` is exported, so the shell
-/// integration still sources the hook.
 fn managed_agents_dir(
     handed: Option<&str>,
     reroute_dir: Option<&str>,
@@ -3090,8 +3048,6 @@ fn managed_agents_dir(
         .and_then(|reroute| {
             let prefix = reroute.parent()?;
             let dir = prefix.join("agents");
-            // Refused: the front door already reported it once with the right
-            // remedy. Fall through to rule 3.
             if ensure_agents_dir(prefix, &dir).is_err() {
                 return None;
             }
@@ -3230,42 +3186,24 @@ pub fn is_tool_candidate(first: Option<&str>) -> bool {
     }
 }
 
-/// The [`aterm_sandbox::Limits`] the session hands the spawn seam, by
-/// containment mode (the same rule as `aterm-gui`'s `spawn.rs` and
-/// [`aterm_sandbox::Limits::inherit`]'s doc): `user` (the default) requests
-/// nothing, so the shell inherits the launching shell's `rlimit`s;
-/// `safety` gets [`aterm_sandbox::Limits::shell_default`]'s soft caps, which
-/// its rc can raise, and `containment` the same caps as hard limits, which its
-/// program cannot ([`aterm_sandbox::Limits::contained`], ruling 2026-10-10).
-///
-/// On Windows the same set goes onto the child's Job Object: `inherit()`
-/// installs no job caps; `shell_default()` installs 16 GiB per-process memory,
-/// 512 active processes and the UI restrictions.
-///
-/// Capping in the daily-driver modes would force the soft `RLIMIT_NOFILE` to
-/// the cap in both directions (the actuator sets `min(cap, hard)`); a terminal
-/// must not constrain programs more than the shell that started it.
+/// Map a containment mode to the [`aterm_sandbox::Limits`] handed to the spawn seam:
+/// `User` inherits the parent's limits (`no job caps` on Windows), `Safety` applies
+/// soft caps ([`aterm_sandbox::Limits::shell_default`]), and `Containment` applies
+/// hard caps ([`aterm_sandbox::Limits::contained`]).
 fn session_limits(mode: aterm_containment::ContainmentMode) -> aterm_sandbox::Limits {
     use aterm_containment::ContainmentMode as Cm;
     match mode {
         Cm::User => aterm_sandbox::Limits::inherit(),
         Cm::Safety => aterm_sandbox::Limits::shell_default(),
-        // Containment — and, the enum being `#[non_exhaustive]`, any mode this
-        // build does not know: fail-safe to the binding caps.
         _ => aterm_sandbox::Limits::contained(),
     }
 }
 
-/// The whole transparent session: containment init, the root-authority mint,
-/// the protected shell spawn, and the passthrough loop. Never returns. The one
-/// `aterm` binary calls this after routing; `quiet` is `-q`/`--quiet`.
+/// Run the transparent PTY session: containment init, root-authority mint,
+/// protected shell spawn, and passthrough loop. Never returns.
 pub fn session_main(quiet: bool) -> ! {
     let (rows, cols) = driver::host_winsize();
 
-    // The shell runs through the protected spawn seam. Containment mode is
-    // launcher-owned: default `User` has no OS sandbox and inherited rlimits
-    // (`session_limits`); `--sandbox` opts into Seatbelt; a malformed value
-    // fails closed to Containment.
     let flags = session_flags();
     let mode = aterm_containment::init_mode_from_flag(
         flags.containment.as_deref(),
@@ -3281,9 +3219,6 @@ pub fn session_main(quiet: bool) -> ! {
         aterm_containment::ContainmentMode::Containment
     });
 
-    // Ask the actuator whether the shell may spawn and, for Containment on
-    // macOS, the SBPL profile to wrap it in. `Deny` fails closed: no shell, and
-    // the reason on stderr.
     let sandbox_wrap: Option<String> = match aterm_containment::decide_spawn(mode) {
         aterm_containment::SpawnDecision::Permit { sbpl, .. } => sbpl,
         aterm_containment::SpawnDecision::Deny { reason, .. } => {
@@ -3296,27 +3231,11 @@ pub fn session_main(quiet: bool) -> ! {
         }
     };
 
-    // The single root-authority mint in this binary, granting the
-    // spawn + sandbox capabilities the seam requires.
-    // SAFETY: trusted process entry point, reached exactly once before the spawn
-    // and before any untrusted PTY input is read.
+    // SAFETY: trusted process entry point, reached once before spawning or reading PTY input.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
 
-    // The session PATH, one `("PATH", value)` pair composed like the window's
-    // `env_add` (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching
-    // PATH"): the reroute dir (so a bare `cargo`/`rustc` is announced or
-    // signposted), the managed `agents/` (`managed_agents_dir`), the selected CLI
-    // link directory, aterm's own binary dir, then the inherited PATH. The front
-    // door has already given it the managed `bin/` at its end where the machine consents
-    // (`atpkg::session_bin_dir`). `--no-reroute` means no reroute prepend and
-    // no export.
-    //
-    // This holds only until the login shell's startup files run (see
-    // `managed_agents_dir`). The reroute and agents dirs are re-exported
-    // (blank when not taken) so a nested window or session reads the same
-    // handles; `ATPKG_AGENTS` is not exported.
     let reroute_dir = reroute_dir_from_env();
     let agents_dir = managed_agents_dir(
         std::env::var(AGENTS_DIR_ENV).ok().as_deref(),
@@ -3343,8 +3262,6 @@ pub fn session_main(quiet: bool) -> ! {
     if let Some(dir) = &reroute_dir {
         env_add.push((REROUTE_DIR_ENV.to_string(), dir.clone()));
     } else if std::env::var_os(REROUTE_DIR_ENV).is_some() {
-        // The escape is engaged (or nothing is laid) and an enclosing session's
-        // directory was inherited: blank it so "no export" means "not set".
         env_add.push((REROUTE_DIR_ENV.to_string(), String::new()));
     }
     if let Some(dir) = &agents_dir {
@@ -3352,42 +3269,28 @@ pub fn session_main(quiet: bool) -> ! {
     } else if std::env::var_os(AGENTS_DIR_ENV).is_some() {
         env_add.push((AGENTS_DIR_ENV.to_string(), String::new()));
     }
-    // `ATERM_CHILD` is not set in this lane: `fleet_listen`'s root-only nesting
-    // guard reads it, and the reroute gates only on its own two variables.
+    // `ATERM_CHILD` is omitted here so `fleet_listen`'s root-only nesting guard stays clear.
     env_add.push(("AGY_CLI_FAST_PROMPT_EDITOR".to_string(), "true".to_string()));
 
-    // Protected spawn: cap-gated, fail-closed, resource-bounded per
-    // `session_limits` (`setrlimit` before execve on POSIX, the Job Object on
-    // Windows), and sandbox-wrapped when `sandbox_wrap` is `Some` (the seam
-    // refuses to spawn unsandboxed if a demanded wrapper is missing). Returns
-    // the PTY master + child pid; the unix driver waits on exactly this pid,
-    // never `waitpid(-1)`.
     let shell = aterm_pty::spawn_shell_with_pid(
         rows,
         cols,
         &spawn_cap,
         &sandbox_cap,
-        &env_add, // the session PATH and the reroute/agents handles, above
-        None,     // shell_override — platform default
-        None,     // shell_args
-        None,     // argv_override
-        None,     // exec_command — interactive $SHELL
-        None,     // cwd — inherit
+        &env_add,
+        None,
+        None,
+        None,
+        None,
+        None,
         sandbox_wrap.as_deref(),
-        session_limits(mode), // by mode — NOT a blanket `shell_default()`; see its doc
+        session_limits(mode),
     )
     .unwrap_or_else(|e| {
         eprintln!("aterm: could not start the shell: {e}");
         std::process::exit(1);
     });
 
-    // One stderr line once the shell HAS spawned, interactive sessions only, so
-    // a bare `aterm` visibly did something and `aterm help` is discoverable.
-    // Never before: a refused `--sandbox` (no OS sandbox off macOS) or a failed
-    // spawn said "session started" and then that no shell was started. Still
-    // ahead of every byte of the shell's, which reaches the terminal only through
-    // `driver::run` below. It never enters the PTY stream; piped/CI runs stay
-    // silent; `-q` silences it.
     {
         use std::io::IsTerminal as _;
         if !quiet && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
@@ -3398,9 +3301,6 @@ pub fn session_main(quiet: bool) -> ! {
         }
     }
 
-    // The platform driver owns raw mode, the passthrough loop, resize
-    // forwarding, terminal restore and the reap, and returns the shell's exit
-    // status (non-exit → 1).
     let code = driver::run(shell, flags.verbose);
     std::process::exit(code);
 }
@@ -3425,30 +3325,24 @@ mod tests {
     #[cfg(windows)]
     use super::show_config_report;
     #[cfg(unix)]
-    use super::{fabric_mark, machine_facts, unix_shell};
+    use super::{ARGS_WITHHELD, args_read_withheld, fabric_mark, machine_facts, unix_shell};
 
     fn decide(args: &[&str]) -> CliAction {
         decide_args(args.iter().map(|s| s.to_string()))
     }
 
-    /// The privacy facts a test binary produces: nothing measured (the
-    /// in-bundle fence refuses the probe).
     fn unmeasured() -> PrivacyFacts {
         PrivacyFacts::not_measured(ProbeLabel::RefusedOutOfBundle)
     }
 
-    /// The debugger facts a test binary produces: nothing measured.
     fn no_debugger() -> DebuggerFacts {
         DebuggerFacts::not_measured(DebuggerProbeLabel::RefusedOutOfBundle)
     }
 
-    /// No Developer Tools list to read: no `devtools:` row, so a doctor test that
-    /// is not about that row reads as it would without it.
     fn no_devtools() -> DevtoolsFacts {
         DevtoolsFacts::absent()
     }
 
-    /// A completed debugger probe, for the rows that only exist on a real install.
     fn debugger(
         mode: DebuggerMode,
         member: DebuggerMember,
@@ -3464,23 +3358,17 @@ mod tests {
         }
     }
 
-    /// An empty recovery ledger: the default for every doctor test that is not
-    /// about the `recovery:` row itself.
     fn no_recovery() -> RecoveryFacts {
-        Some((
+        Ok((
             Vec::new(),
             std::path::PathBuf::from("/logs/recovery-ledger.log"),
         ))
     }
 
-    /// Nothing open in the exceptions log: the default for every doctor test that is
-    /// not about the `exceptions:` row itself.
     fn no_exceptions() -> ExceptionsFacts {
         Ok(0)
     }
 
-    /// A census with nothing running: the default for every doctor test that is
-    /// not about the `instances:` row itself.
     fn no_census() -> Result<aterm_ctl::census::Census, String> {
         Ok(aterm_ctl::census::Census {
             dir: "/run/aterm".to_string(),
@@ -3489,7 +3377,81 @@ mod tests {
         })
     }
 
-    /// A measured posture, for the rows that only exist on a real install.
+    #[test]
+    fn doctor_readiness_keeps_unmeasured_notes_unknown_and_advisories_nonfatal() {
+        use aterm_converge::{Outcome, Readiness};
+        let census = Err("process table unavailable".to_owned());
+        let exceptions = Err("log unreadable".to_owned());
+        let machine = MachineFacts {
+            spotlight: Some(Err("index unavailable".to_owned())),
+            program_check: Some(aterm_uds::program_check::Look::Unread),
+            fabric: Some((Mark::Note, "withheld".to_owned(), true)),
+            ..MachineFacts::absent()
+        };
+        let gathered = super::doctor::Gathered::of_rows(super::doctor_rows(
+            "/bin/sh",
+            ShellCheck::Runs,
+            None,
+            &unmeasured(),
+            &no_debugger(),
+            &no_devtools(),
+            &census,
+            &Err("ledger unreadable".to_owned()),
+            &exceptions,
+            &machine,
+        ));
+        let all = gathered.plan();
+        for id in [
+            "base.privacy.fda",
+            "base.privacy.debugger",
+            "base.session.instances",
+            "base.session.exceptions",
+            "base.machine.spotlight",
+            "base.machine.syspolicyd",
+            "base.session.fabric",
+            "base.session.recovery",
+        ] {
+            if cfg!(windows) && id == "base.session.recovery" {
+                continue;
+            }
+            let rows: Vec<_> = all
+                .iter()
+                .filter(|r| r.id == id || r.id == super::doctor::SHELL)
+                .cloned()
+                .collect();
+            assert_eq!(
+                rows.iter().find(|r| r.id == id).unwrap().outcome,
+                Outcome::Unknown,
+                "{id}"
+            );
+            let readiness = Readiness::of(&rows, &[id.to_owned()]);
+            assert!(!readiness.all_green, "{id}");
+            assert_eq!(readiness.unresolved, [id]);
+            let text = super::doctor::render_readiness(&gathered, &rows, &[], &readiness);
+            assert!(text.contains("readiness: NOT READY"), "{id}: {text}");
+        }
+
+        // Known optional choices and facts for later retain their note semantics.
+        let gathered = super::doctor::Gathered::of_rows(super::doctor_rows(
+            "/bin/sh",
+            ShellCheck::Runs,
+            None,
+            &measured(FdaState::Denied, DrClass::Identity, "aterm"),
+            &debugger(
+                DebuggerMode::Disabled,
+                DebuggerMember::Admin,
+                SelfHardening::Hardened,
+            ),
+            &no_devtools(),
+            &no_census(),
+            &no_recovery(),
+            &Ok(2),
+            &MachineFacts::absent(),
+        ));
+        let rows = gathered.plan();
+        assert!(Readiness::of(&rows, &[]).all_green, "{rows:?}");
+    }
+
     fn measured(fda: FdaState, dr: DrClass, who: &str) -> PrivacyFacts {
         PrivacyFacts {
             fda,
@@ -3552,26 +3514,37 @@ mod tests {
         }
     }
 
-    /// `aterm doctor` takes one optional flag, `--read-only` (it then fixes
-    /// nothing); anything else is a usage error naming the grammar.
+    /// The diagnostic edge passes doctor's full grammar to the typed parser.
     #[test]
     fn doctor_operand_grammar_is_enforced_at_the_edge() {
+        const USAGE: &str = "usage: aterm doctor [--read-only | --check | --apply | --restore] [--json] [--only <id,...>]";
         assert_eq!(decide(&["doctor"]), diag("doctor", None));
         assert_eq!(
             decide(&["doctor", "--read-only"]),
             diag("doctor", Some("--read-only"))
         );
-        for argv in [vec!["doctor", "--json"], vec!["doctor", "--read-only", "x"]] {
+        assert_eq!(
+            decide(&["doctor", "--json", "--only", "pkg"]),
+            diag("doctor", Some("--json --only pkg"))
+        );
+        assert_eq!(
+            decide(&["doctor", "--check", "--json"]),
+            diag("doctor", Some("--check --json"))
+        );
+        for argv in [
+            vec!["doctor", "--fix"],
+            vec!["doctor", "--read-only", "x"],
+            vec!["doctor", "--json", "--json"],
+            vec!["doctor", "--check", "--apply"],
+            vec!["doctor", "--apply", "--only", "pkg"],
+        ] {
             match decide(&argv) {
-                CliAction::Usage(msg) => assert!(
-                    msg.contains("usage: aterm doctor [--read-only]"),
-                    "{argv:?}: {msg}"
-                ),
+                CliAction::Usage(msg) => assert!(msg.contains(USAGE), "{argv:?}: {msg}"),
                 other => panic!("{argv:?} must be a usage error, got {other:?}"),
             }
         }
         // `aterm doctor --help` states the same grammar as the refusal.
-        assert_eq!(super::diag_usage("doctor"), "aterm doctor [--read-only]");
+        assert_eq!(format!("usage: {}", super::diag_usage("doctor")), USAGE);
         assert_eq!(super::diag_usage("exceptions"), "aterm exceptions [--all]");
         assert_eq!(super::diag_usage("show-face"), "aterm show-face <family>");
         assert_eq!(super::diag_usage("list-fonts"), "aterm list-fonts");
@@ -3727,10 +3700,8 @@ mod tests {
         lines
     }
 
-    /// THE READER WORKS WITH ATERM NOT RUNNING: it replays `messages.log` (and its
-    /// rotated pair) with the engine's own decoder and prints what needs a look with
-    /// why the owner is needed and the one action, then what was filed, newest
-    /// first; a torn line is counted, a missing file is said.
+    /// Replays `messages.log` (and its rotated `.1` pair) without a window running,
+    /// rendering open and filed entries while counting torn lines.
     #[test]
     fn the_exceptions_reader_replays_the_log_without_a_window() {
         let dir = Scratch::new();
@@ -3948,9 +3919,13 @@ mod tests {
                     .any(|l| l.trim_start().starts_with(name)),
                 "subcommand {name:?} is not advertised as a --help line"
             );
-            // `list-themes` is dispatched as `aterm theme list`.
+            // `list-themes` is dispatched as `aterm theme list`; `doctor` is composed by
+            // the front door (`crates/aterm`'s doctor, whose tests run it) over this
+            // crate's items ([`doctor::gather`]).
             assert!(
-                diag_report(name, None).is_some() || list_themes_alias(name, &[]).is_some(),
+                diag_report(name, None).is_some()
+                    || list_themes_alias(name, &[]).is_some()
+                    || *name == "doctor",
                 "subcommand {name:?} is in the registry but has no dispatch"
             );
             // And it must actually be recognized by the parser (`show-face`
@@ -5095,7 +5070,7 @@ mod tests {
             restores: None,
         };
         let path = std::path::PathBuf::from("/logs/recovery-ledger.log");
-        let (r, code) = check(Some((vec![killed], path)));
+        let (r, code) = check(Ok((vec![killed], path)));
         assert_eq!(code, 0, "a past kill never fails doctor: {r}");
         assert_eq!(mark_of(&r, "recovery:"), "note", "{r}");
         assert!(
@@ -5106,7 +5081,7 @@ mod tests {
         // column, as every multi-line row prints.
         assert_eq!(r.matches("recovery:").count(), 1, "{r}");
 
-        let (r, code) = check(None);
+        let (r, code) = check(Err("no log folder, so there is no ledger".to_owned()));
         assert_eq!(code, 0, "{r}");
         assert_eq!(mark_of(&r, "recovery:"), "note", "{r}");
         // The label is said once, by the row: the fact under it does not repeat it.
@@ -5176,9 +5151,9 @@ mod tests {
         );
     }
 
-    /// THE FENCE, end to end: this test binary runs from `target/debug/deps`,
-    /// the shape that makes `tccd` walk a million-entry directory, so
-    /// `doctor_report` must report `not measured` with no syscall behind it.
+    /// Running `doctor_report` from a test binary outside an `.app` bundle must
+    /// report `not measured` without probing `tccd`, `DevToolsSecurity`, `csops`,
+    /// `Copies`, or Spotlight.
     #[cfg(target_os = "macos")]
     #[test]
     fn doctor_run_from_a_test_binary_measures_nothing() {
@@ -5188,9 +5163,6 @@ mod tests {
                 .find(|l| l.starts_with(label))
                 .unwrap_or_else(|| panic!("no {label} row in\n{r}"))
         };
-        // Consent state, the debugger rule and the Developer Tools read sit
-        // behind the fence: no `DevToolsSecurity` spawn, no `csops`, no
-        // TCC.db, no `log` — so no verdict, only a note.
         for label in ["privacy:", "debugger:", "devtools:"] {
             assert_eq!(mark_of(&r, label), "note", "{r}");
             assert!(
@@ -5198,22 +5170,18 @@ mod tests {
                 "the fence let a {label} verdict through\n{r}"
             );
         }
-        // Nothing opened in System Settings and nothing moved to the Trash.
         assert!(
             row("copies:").contains("not checked"),
             "a test binary must never prune\n{r}"
         );
-        // Spotlight is not asked either.
         assert!(
             row("spotlight:").contains("not measured (a test binary)"),
             "{r}"
         );
     }
 
-    /// **THE `spotlight:` ROW REPORTS, NEVER FAILS.** What Spotlight indexes of
-    /// build output and rustup's docs is a `note` (the health line stays OK and
-    /// names nothing) under `copies:`; none indexed is `ok`. NEGATIVE CONTROL:
-    /// with no count — off macOS — there is no row.
+    /// The `spotlight:` row reports indexed build/doc folders as `note` (exit 0),
+    /// clean state as `ok`, and omits the row when `spotlight` is `None`.
     #[test]
     fn the_spotlight_row_is_a_note_at_worst() {
         let report = |spotlight| {
@@ -5235,7 +5203,7 @@ mod tests {
         };
         let lit = crate::spotlight::Spotlit {
             builds: vec![("~/w/target".into(), 12)],
-            docs: None,
+            rustup: None,
         };
         let (r, code) = report(Some(Ok(lit)));
         assert_eq!(code, 0, "{r}");
@@ -5244,7 +5212,7 @@ mod tests {
         assert!(r.contains("health: OK\n"), "{r}");
         let clean = crate::spotlight::Spotlit {
             builds: vec![],
-            docs: None,
+            rustup: None,
         };
         let (r, _) = report(Some(Ok(clean)));
         assert_eq!(mark_of(&r, "spotlight:"), "ok", "{r}");
@@ -5252,12 +5220,65 @@ mod tests {
         assert!(!r.contains("spotlight:"), "{r}");
     }
 
-    /// **THE `fabric:` ROW IS ATERM-LINK'S VERDICT, A COUNTED WARNING AT
-    /// WORST.** It sits right after `instances:`, says aterm-link's words, and
-    /// a broker that does not answer (or a poisoned log) is a `warn` the
-    /// health line names while the exit stays 0: no shell needs the fabric to
-    /// start. One that answers is `ok`. NEGATIVE CONTROL: with no fabric fact
-    /// — off Unix — there is no row at all, and the health line names nothing.
+    /// The `syspolicyd:` row is `ok` with room or with none running, a counted
+    /// `warn` while the kernel holds the pool at its limit (exit 0: a restart is
+    /// the person's), a `note` when unread, and absent off macOS.
+    #[test]
+    fn the_syspolicyd_row_warns_while_the_pool_is_full() {
+        let report = |program_check| {
+            doctor_checks_with_origin(
+                "/bin/sh",
+                ShellCheck::Runs,
+                None,
+                &unmeasured(),
+                &no_debugger(),
+                &DevtoolsFacts::absent(),
+                &no_census(),
+                &no_recovery(),
+                &no_exceptions(),
+                &MachineFacts {
+                    program_check,
+                    ..MachineFacts::absent()
+                },
+            )
+        };
+        let reading = |workers, at_limit| {
+            Some(aterm_uds::program_check::Look::Read(
+                aterm_uds::program_check::Reading {
+                    daemon: aterm_uds::program_check::Daemon {
+                        pid: 690,
+                        start_s: 1,
+                        start_us: 0,
+                    },
+                    workers,
+                    at_limit,
+                    limit: Some(90),
+                },
+            ))
+        };
+        let (r, code) = report(reading(4, false));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "syspolicyd:"), "ok", "{r}");
+        assert!(r.contains("4 pool threads against a limit of 90"), "{r}");
+        let (r, code) = report(reading(95, true));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "syspolicyd:"), "warn", "{r}");
+        assert!(r.contains("restarts"), "{r}");
+        assert!(r.contains("at the kernel's thread limit"), "{r}");
+        // Negative control: a count past the limit with no kernel flag is
+        // overcommit and idle threads, not a full pool.
+        let (r, _) = report(reading(100, false));
+        assert_eq!(mark_of(&r, "syspolicyd:"), "ok", "{r}");
+        let (r, _) = report(Some(aterm_uds::program_check::Look::Unread));
+        assert_eq!(mark_of(&r, "syspolicyd:"), "note", "{r}");
+        let (r, _) = report(Some(aterm_uds::program_check::Look::NoneRunning));
+        assert_eq!(mark_of(&r, "syspolicyd:"), "ok", "{r}");
+        let (r, _) = report(None);
+        assert!(!r.contains("syspolicyd:"), "{r}");
+    }
+
+    /// The `fabric:` row renders after `instances:`, counts warnings on the health
+    /// line without failing exit status, and is omitted when `fabric` is `None`.
     #[test]
     fn the_fabric_row_is_a_counted_warning_never_a_failure() {
         let report = |fabric: Option<(Mark, String)>| {
@@ -5272,7 +5293,7 @@ mod tests {
                 &no_recovery(),
                 &no_exceptions(),
                 &MachineFacts {
-                    fabric,
+                    fabric: fabric.map(|(mark, fact)| (mark, fact, false)),
                     ..MachineFacts::absent()
                 },
             )
@@ -5301,7 +5322,6 @@ mod tests {
         assert!(r.contains("health: OK\n"), "{r}");
     }
 
-    /// aterm-link's three weights map onto the report's marks, none a failure.
     #[cfg(unix)]
     #[test]
     fn the_fabric_weights_are_never_a_failure() {
@@ -5314,18 +5334,53 @@ mod tests {
         }
     }
 
-    /// **`aterm doctor` READS THE FABRIC'S ROW.** `machine_facts` is where the
-    /// row is read (aterm-link's `doctor_summary`), and every other test here
-    /// builds `MachineFacts` by hand — so a fact dropped there would pass them
-    /// all and leave `aterm doctor` with no `fabric:` row. Whatever this
-    /// process's fabric is (a test binary's own config root names none, so
-    /// usually `off`), the row is there, says something, and is no failure.
+    /// `machine_facts` populates `fabric` on Unix and never produces `Mark::Fail`.
     #[cfg(unix)]
     #[test]
     fn the_doctors_machine_facts_read_the_fabric_row() {
-        let (mark, fact) = machine_facts(false).fabric.expect("a fabric row on Unix");
+        let (mark, fact, _) = machine_facts(None).fabric.expect("a fabric row on Unix");
         assert!(!mark.is_fail(), "{fact}");
         assert!(!fact.trim().is_empty());
+    }
+
+    /// While the program check's pool is at the kernel's limit, doctor lists no
+    /// program's command line: the census and the fabric's process table say why
+    /// instead of reading. Room, no reading, no daemon and no macOS read as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_program_check_withholds_the_argument_reads() {
+        use aterm_uds::program_check::{Daemon, Look, Reading};
+        let reading = |workers, at_limit| {
+            Look::Read(Reading {
+                daemon: Daemon {
+                    pid: 690,
+                    start_s: 1,
+                    start_us: 0,
+                },
+                workers,
+                at_limit,
+                limit: Some(90),
+            })
+        };
+        assert_eq!(
+            args_read_withheld(Some(&reading(95, true))),
+            Some(ARGS_WITHHELD)
+        );
+        for look in [
+            Some(&reading(4, false)),
+            Some(&reading(100, false)),
+            Some(&Look::Unread),
+            Some(&Look::NoneRunning),
+            None,
+        ] {
+            assert_eq!(args_read_withheld(look), None, "{look:?}");
+        }
+        let (mark, fact, unmeasured) = machine_facts(Some(ARGS_WITHHELD))
+            .fabric
+            .expect("the fabric row says why it was not read");
+        assert_eq!(mark, Mark::Note);
+        assert_eq!(fact, format!("not read ({ARGS_WITHHELD})"));
+        assert!(unmeasured);
     }
 
     /// The `devtools:` and `copies:` rows: aterm not on the Developer Tools list
@@ -5363,6 +5418,7 @@ mod tests {
             console_host: None,
             fabric: None,
             spotlight: None,
+            program_check: None,
         };
         let report = |d: &DevtoolsFacts| {
             doctor_checks_with_origin(
@@ -5428,6 +5484,13 @@ mod tests {
         /// Run the hand-over for `facts` with a person at the terminal or not:
         /// `(did, opened, log)`.
         fn run(&self, facts: &atpkg::devtools::Facts, person: bool) -> (String, bool, Vec<String>) {
+            let ((did, opened), log) =
+                self.with(|reach| super::devtools_hand_over(facts, person, reach));
+            (did, opened, log)
+        }
+
+        /// `act` over this script's reach, and the log of what it did.
+        fn with<R>(&self, act: impl FnOnce(&super::DevtoolsReach<'_>) -> R) -> (R, Vec<String>) {
             let note = |entry: String| self.log.borrow_mut().push(entry);
             let reach = super::DevtoolsReach {
                 ask_window: &|now| {
@@ -5456,8 +5519,68 @@ mod tests {
                 local_day: &|at| super::local_day_words(at, Some(0)),
                 say: &|words| note(format!("say {words}")),
             };
-            let (did, opened) = super::devtools_hand_over(facts, person, &reach);
-            (did, opened, self.log.take())
+            let out = act(&reach);
+            (out, self.log.take())
+        }
+    }
+
+    /// THE PANE THROTTLE HOLDS IN THE DOCTOR'S OWN PATH (S5). Bare `aterm doctor`
+    /// gathers its facts with `fix`, which hands the owner to the Developer Tools pane
+    /// ([`super::devtools_hand_over_when`]): within ten minutes of the last opening, with
+    /// no window and no person here, it opens nothing, and the doctor's `devtools:` row
+    /// says why. `--read-only` asks nothing at all, and over ssh nothing opens.
+    #[test]
+    fn the_doctors_devtools_hand_over_keeps_the_ten_minute_throttle() {
+        use super::WindowAnswer;
+        use aterm_containment::DevToolListing;
+        let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+        let mut recent = Scripted::new(WindowAnswer::Unreachable);
+        recent.opened_ago = Some(120);
+        let ((facts, did), log) = recent.with(|reach| {
+            super::devtools_hand_over_when(true, absent.clone(), false, false, reach, || {
+                panic!("nothing opened, so nothing is read again")
+            })
+        });
+        assert_eq!(
+            did.as_deref(),
+            Some("did nothing: aterm opened the pane 2 min ago")
+        );
+        assert_eq!(log, ["ask now=false"], "the pane is not opened");
+        let (report, code) = super::doctor_checks_with_origin(
+            "/bin/sh",
+            ShellCheck::Runs,
+            None,
+            &unmeasured(),
+            &no_debugger(),
+            &DevtoolsFacts {
+                facts: Some(facts),
+                did,
+            },
+            &no_census(),
+            &no_recovery(),
+            &no_exceptions(),
+            &MachineFacts::absent(),
+        );
+        assert_eq!(code, 0);
+        assert!(
+            report.contains("did nothing: aterm opened the pane 2 min ago"),
+            "{report}"
+        );
+
+        // Past the ten minutes, the same run opens the page.
+        let mut stale = Scripted::new(WindowAnswer::Unreachable);
+        stale.opened_ago = Some(atpkg::devtools::REOPEN_AFTER_S + 1);
+        let (_, log) = stale.with(|reach| {
+            super::devtools_hand_over_when(true, absent.clone(), false, false, reach, || None)
+        });
+        assert!(log.iter().any(|entry| entry == "open"), "{log:?}");
+
+        // `--read-only` and ssh: nothing asked, nothing opened.
+        for (fix, over_ssh) in [(false, false), (true, true)] {
+            let (_, log) = Scripted::new(WindowAnswer::Unreachable).with(|reach| {
+                super::devtools_hand_over_when(fix, absent.clone(), over_ssh, false, reach, || None)
+            });
+            assert!(log.is_empty(), "fix={fix} ssh={over_ssh}: {log:?}");
         }
     }
 
@@ -5485,18 +5608,9 @@ mod tests {
         }
     }
 
-    /// THE HAND-OVER FROM `aterm doctor` (owner ask 2026-10-15) asks the running
-    /// window first, so the owner gets aterm's panel beside System Settings, and
-    /// opens the page itself only where the window leaves it to doctor: `OK shown`
-    /// (a person here: a short banner naming the panel, then the page), `OK
-    /// unshown`, no window to ask, or a window too old to know the verb (the whole
-    /// banner, then the page). The banner is printed before the page opens and
-    /// after `spctl`, so it can say whose Terminal row that is. Every other answer
-    /// is the window's decision that nothing opens, and doctor opens nothing
-    /// either — the negative control for each — nor after a request that reached
-    /// the window and got no reply. The bare form (no person) waits for the
-    /// window's quiet moment; only the no-window path keeps doctor's own ten
-    /// minutes.
+    /// `devtools_hand_over` asks the running window first and opens System Settings
+    /// directly only when no window answers, the window is older than the verb, or
+    /// `now` left the page open to `doctor`.
     #[test]
     fn doctor_asks_the_window_first_and_opens_only_where_the_window_leaves_it() {
         use super::{DEVTOOLS_WAIT_LINE, WindowAnswer};
@@ -6211,13 +6325,9 @@ mod tests {
         String::from_utf8_lossy(&out).into_owned()
     }
 
-    /// End to end through the real seam: `ulimit -n` in the spawned `/bin/sh`
-    /// of a User-mode session equals this process's soft `RLIMIT_NOFILE`, and a
-    /// Safety-mode child reads the cap (clamped to the inherited hard ceiling)
-    /// and can raise it, while a Containment-mode child cannot (ruling
-    /// 2026-10-10, P1 of the r13 policy hunt). Discriminating whenever the
-    /// parent's soft limit differs from the cap and its hard limit exceeds the
-    /// raise.
+    /// End-to-end check that `ulimit -n` in a spawned `/bin/sh` matches the
+    /// parent's soft limit in `User` mode, can be raised above the soft cap in
+    /// `Safety` mode, and is hard-capped in `Containment` mode.
     #[cfg(unix)]
     #[test]
     fn the_session_child_sees_the_posture_of_its_mode() {

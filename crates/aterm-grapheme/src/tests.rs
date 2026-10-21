@@ -198,11 +198,9 @@ fn vs16_zwj_and_vs15_grid_columns_follow_the_grid() {
     }
 }
 
-/// A UAX #29 GB9b Prepend cluster is measured at its spacing BASE's width, not
-/// the leading zero-width Prepend sign's. Charging the first codepoint
-/// reported these as width 0. The signs are real Arabic/Kaithi
-/// number marks that prepend a digit (U+0600 ARABIC NUMBER SIGN, U+06DD ARABIC
-/// END OF AYAH — common in Quranic text — U+110BD KAITHI NUMBER SIGN).
+/// A UAX #29 GB9b Prepend cluster (e.g. U+0600, U+06DD, U+110BD before a
+/// digit) is measured at its spacing base's width rather than the leading
+/// zero-width Prepend mark's.
 #[test]
 fn prepend_cluster_is_measured_at_its_base() {
     for (s, display, columns) in [
@@ -246,14 +244,9 @@ fn prepend_cluster_is_measured_at_its_base() {
     );
 }
 
-/// The grid's fold state crosses UAX #29 cluster boundaries, so the columns
-/// are measured over the whole line, never one cluster at a time. Sinhala
-/// writes yansaya and rakaransaya with a ZWJ that ENDS a cluster (its virama
-/// is no conjunct linker), and the grid folds the next cluster's letter into
-/// the same cell: `ක්‍ය` and `ශ්‍රී` are one cell. A doubled ZWJ (or a mark
-/// between ZWJs) ends a cluster too, and the grid still folds the pictograph
-/// after it; a regional indicator pairs past a mark on the first. ASCII
-/// takes the grid's bulk path, which never folds.
+/// Grid fold state crosses UAX #29 cluster boundaries across the whole line
+/// (e.g. Sinhala `ක්‍ය` / `ශ්‍රී` with cluster-ending ZWJ, doubled ZWJs, and
+/// regional indicator pairs with marks).
 #[test]
 fn grid_columns_carry_fold_state_across_cluster_boundaries() {
     for (s, cells, clusters) in [
@@ -281,15 +274,9 @@ fn grid_columns_carry_fold_state_across_cluster_boundaries() {
     }
 }
 
-/// The two public position converters count GRID cells, the unit every caller
-/// measures in: the soft-wrap join pads each row out to the grid width, the
-/// double-click word walk asks whether a clicked cell lies past the text, and
-/// the status line cuts a scraped prompt at the shell's start column. A
-/// Devanagari conjunct is one cluster that looks one cell wide and occupies
-/// three (`न्`, `द`, `ी`); charging its display width put every later column two
-/// cells to the left of its text, so a double-click on the word after it
-/// selected a single cell. A zero-width format character the grid folds into
-/// the previous cell occupies no column.
+/// `byte_to_column` and `column_to_char_index` count terminal grid cells
+/// (e.g. a 3-cell Devanagari conjunct `न्दी` advances by 3 columns, and a
+/// folded zero-width format character advances by 0).
 #[test]
 fn position_converters_count_grid_cells() {
     let conjunct = "\u{0928}\u{094D}\u{0926}\u{0940}";

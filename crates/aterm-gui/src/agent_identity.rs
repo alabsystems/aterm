@@ -3,33 +3,19 @@
 
 //! Session identities: a session can carry its own agent identity, set at spawn.
 //!
-//! `identity` is a spawn-time, immutable session property (like `frozen_path`,
-//! unlike the `meta set` fields). It names a directory `<state>/identities/<name>/`
-//! ([`aterm_types::dirs::identities_dir`]), and every agent aterm knows
-//! ([`aterm_primer::agent_homes`]) gets its home variable pointed at its own
-//! conventional subdirectory there: `CLAUDE_CONFIG_DIR=<idir>/.claude`,
-//! `CODEX_HOME=<idir>/.codex`. Because the subdirs carry the agents' own names,
-//! [`ensure`] primes the identity dir unchanged, so a worker under
-//! `identity=worker` has the aterm skills, the manual pointer, and its own login.
+//! `identity` is a spawn-time, immutable session property (unlike the `meta set` fields). It
+//! names `<state>/identities/<name>/` ([`aterm_types::dirs::identities_dir`]), and every agent
+//! in [`aterm_primer::agent_homes`] gets its home variable pointed at its own subdirectory
+//! there (`CLAUDE_CONFIG_DIR=<idir>/.claude`, `CODEX_HOME=<idir>/.codex`). The subdirs carry
+//! the agents' own names, so [`ensure`] primes the identity dir unchanged: a worker under
+//! `identity=worker` has the aterm skills, the manual pointer and its own login.
 //!
-//! aterm never opens a login: `agents=<prog>:present|absent` (the `identities`
-//! verb) is a `read_dir` name listing. The macOS keychain is the one login
-//! channel outside the dir; aterm never reads, names or deletes a keychain item
-//! it did not create.
-//!
-//! MEASURED 2026-09-27 (the isolation half; Claude Code 2.1.283, an isolated
-//! dev-seams instance on the owner's Mac with the real `HOME`): a tab from
-//! `spawn identity=probe` carried `CLAUDE_CONFIG_DIR=<idir>/.claude`, and `claude`
-//! there went through onboarding to `Select login method:` — it did NOT come up
-//! logged in as the owner. It wrote only under `<idir>/.claude`, and the login
-//! keychain still held one `Claude Code-credentials` item. The other half — a
-//! login completed under an identity leaves the default session's account alone —
-//! is READ from the vendor code (Claude Code 2.1.285 and 2.1.286, 2026-09-30):
-//! its keychain read, write and delete all name the service
-//! `Claude Code-credentials`, plus `-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>`
-//! whenever that variable is set, with account `$USER` — so an identity's login
-//! is a different item from the default tab's, which carries no
-//! `CLAUDE_CONFIG_DIR`. Version-dependent: re-read when the claude pin moves
+//! aterm never opens a login: `agents=<prog>:present|absent` (the `identities` verb) is a
+//! `read_dir` name listing. The macOS keychain is the one login channel outside the dir; aterm
+//! never reads, names or deletes a keychain item it did not create. Claude Code names its item
+//! `Claude Code-credentials`, plus `-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>` when that
+//! variable is set, so an identity's login is a different item from the default tab's. That is
+//! read from the vendor code: re-read it when the claude pin moves
 //! (`docs/AGENT-EXPERIENCE-2026-08-26.md` §7.3).
 //!
 //! `spawn identity=<name>` (Owner-only) and the session picker's new-identity
@@ -899,8 +885,7 @@ fn presence_word(present: bool) -> &'static str {
     if present { "present" } else { "absent" }
 }
 
-/// The agents' files under `dir`, per table row: `present` iff the agent's
-/// subdirectory has at least one entry (a name listing; nothing is opened).
+/// The agents' files under `dir`, per table row: `present` iff the subdirectory is non-empty.
 fn agent_presence(dir: &Path) -> Vec<(aterm_primer::AgentHome, bool)> {
     aterm_primer::agent_homes()
         .map(|row| {
@@ -1747,9 +1732,6 @@ mod tests {
         assert_eq!(parse_name("Worker"), parse_name("wOrKeR"));
     }
 
-    /// `ensure(create = true)`: the dir and every agent subdir exist at 0700 and
-    /// are primed; a second call is the same dir; two names are two dirs; and
-    /// `create = false` finds what exists and refuses what does not.
     #[test]
     fn ensure_creates_0700_dirs_once_primes_them_and_never_creates_on_restore() {
         let root = scratch("ensure").join("identities");
@@ -1769,7 +1751,7 @@ mod tests {
                 assert_eq!(mode(&dir.join(row.sub)), 0o700, "{}", row.agent);
             }
         }
-        // The primer reached every measured agent: its context file and skills.
+        // The primer reached every agent: its context file and skills.
         assert!(dir.join(".claude/CLAUDE.md").is_file());
         assert!(dir.join(".claude/skills/aterm-fabric/SKILL.md").is_file());
         assert!(
@@ -1807,8 +1789,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
-    /// The env seam: one pair per table row, each pointing into the identity
-    /// dir at the agent's own subdir.
     #[test]
     fn env_points_every_table_var_into_the_identity_dir() {
         let dir = PathBuf::from("/state/identities/worker");
@@ -1853,10 +1833,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// The list: every real directory in the root whose name is its own folded
-    /// spelling, by name, with the live count and `present`/`absent` per agent
-    /// by a non-empty subdirectory. A file, a symlink and a mis-spelt directory
-    /// are not listed.
+    /// A file, a symlink and a directory whose name is not its own folded spelling are not
+    /// listed; `present` means a non-empty subdirectory.
     #[test]
     fn identities_lists_names_live_counts_and_presence_by_non_empty_subdir() {
         let root = scratch("verb-list");
@@ -1888,9 +1866,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// One identity: `OK <1+agents>`, the row then one line per agent. `present`
-    /// is a name listing (the sentinel file is mode 0000, so opening it would
-    /// fail the test), and the name folds. An unknown name is named back.
+    /// `present` is a name listing: the sentinel is mode 0000, so opening it would fail the
+    /// test. The name folds; an unknown name is named back.
     #[test]
     fn identities_one_names_each_agents_var_and_home_and_never_opens_a_file() {
         let root = scratch("verb-one");
@@ -1930,9 +1907,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Forget: no or wrong confirm word gives the confirm line; a live user gives
-    /// `ERR identity in use` naming the sids; both touch nothing. Then the tree
-    /// goes and the reply says `left=keychain`.
+    /// Both refusals touch nothing; the removal reply says `left=keychain`.
     #[test]
     fn identities_forget_needs_the_confirm_word_refuses_a_live_user_then_removes_the_tree() {
         let root = scratch("verb-forget");
@@ -2239,10 +2214,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// Restore and the verb agree on what an identity is: a symlink in the root
-    /// is not one to either (both read [`identity_dir`]), so a restore never
-    /// re-injects env pointing outside the identities tree. Unix only: the
-    /// fixture is a symlink.
+    /// A symlink in the root is an identity to neither restore nor the verb (both read
+    /// [`identity_dir`]), so restore never points env outside the identities tree.
     #[cfg(unix)]
     #[test]
     fn restore_and_the_verb_agree_on_what_an_identity_is() {

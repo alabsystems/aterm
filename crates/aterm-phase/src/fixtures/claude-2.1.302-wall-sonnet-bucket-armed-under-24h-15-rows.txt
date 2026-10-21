@@ -1,0 +1,15 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x15, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Sonnet bucket limit (seven_day_sonnet, 100 s) whose reset is under 24 h away, on a pane 15 rows tall: Claude Code arms its own continue, no dialog; the turn's notice still drawn
+
+❯ carry on with the task
+  ⎿  You've hit your Sonnet limit · resets 1:56am (America/Los_Angeles)
+
+⏺ Usage limit reached · continuing automatically at 1:56am · esc to cancel
+
+✻ Worked for 0s · done 1:54 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Usage limit reached · limit resets 1:56am
+    Continuing automatically at 1:56am · esc to cancel
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                       ◐ medium · /effort

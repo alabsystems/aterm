@@ -2,30 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! COLR (vector color glyph) rasterization (M3).
+//! COLR (vector color glyph) rasterization.
 //!
-//! `sbix`/`CBDT` color emoji are bitmaps (handled via `glyph_raster_image`); COLR
-//! glyphs are VECTOR — a stack of outline layers, each filled with a palette color
-//! (COLRv0) or a gradient (COLRv1), under affine transforms. aterm-font drives the
-//! paint graph through its [`Painter`](aterm_font::colr::Painter) trait; this module
-//! implements that trait with a small self-contained scanline rasterizer (no extra
-//! deps — outlines come from aterm-font, the fill is ours), compositing each layer
-//! into an RGBA8 buffer the renderer blits like any other color glyph.
+//! `sbix`/`CBDT` emoji are bitmaps (`glyph_raster_image`); COLR glyphs are outline layers
+//! filled with a palette color (COLRv0) or a gradient (COLRv1) under affine transforms.
+//! aterm-font walks the paint graph through its [`Painter`](aterm_font::colr::Painter)
+//! trait; this module implements it with a small scanline rasterizer into an RGBA8 buffer.
 //!
-//! Scope: solid layers (COLRv0 + COLRv1 solid) render exactly, with full affine
-//! transform support. Linear, radial and sweep gradients are filled PER PIXEL
-//! from the `ColorLine` stops and extend mode (pad / repeat / reflect),
-//! evaluated in paint space through the inverse of the affine stack; stop
-//! interpolation is premultiplied-alpha, per the COLRv1 spec. Sweep angles
-//! carry the spec's 1.0 bias (`degrees = v·180 + 180`), 0° at +x, measured
-//! counter-clockwise in the font's y-up space. Ill-formed gradient geometry
-//! (coincident linear points, coincident radial circles, an empty sweep) skips
-//! the layer, as the spec requires. Clip boxes and composite modes beyond
-//! src-over are treated as src-over (a documented refinement — the layer
-//! outlines self-clip, which renders emoji-style layered COLR correctly).
-//! Per the spec, a PaintGlyph outline is FIXED in the coordinate space where
-//! the PaintGlyph appears: transforms pushed in its subtree reposition the
-//! child paint's gradient geometry only, never the outline itself.
+//! Solid layers render exactly. Linear, radial and sweep gradients are filled per pixel
+//! from the `ColorLine` stops and extend mode, in paint space through the inverse affine,
+//! with premultiplied stop interpolation. Sweep angles carry the spec's 1.0 bias
+//! (`degrees = v·180 + 180`), 0° at +x, counter-clockwise in y-up font space. Ill-formed
+//! gradient geometry skips the layer, as the spec requires. Clips are ignored and every
+//! composite mode is src-over; layer outlines self-clip, which is enough for emoji. A
+//! PaintGlyph outline is fixed in the space where the PaintGlyph appears: transforms in its
+//! subtree move only the child paint's gradient geometry.
 
 use aterm_font::colr::{ColorStop, CompositeMode, GradientExtend, Paint, Painter};
 use aterm_font::{Face, GlyphId, RgbaColor, Transform};
@@ -153,16 +144,13 @@ impl aterm_font::OutlineSink for OutlineCollector {
     }
 }
 
-/// Component equality (kept explicit rather than leaning on the colour type's
-/// derive surface, which shifted between ttf-parser versions).
+/// Component-wise color equality.
 fn rgba_eq(a: RgbaColor, b: RgbaColor) -> bool {
     (a.red, a.green, a.blue, a.alpha) == (b.red, b.green, b.blue, b.alpha)
 }
 
-/// Premultiplied-alpha linear interpolation between two straight-alpha colors,
-/// returned straight (identical to a straight lerp when both stops are opaque,
-/// which is the common emoji case; the premultiplied form is what the COLRv1
-/// spec prescribes and avoids gray fringes toward transparent stops).
+/// Premultiplied-alpha lerp between two straight-alpha colors, returned straight. The
+/// COLRv1 spec prescribes it; it avoids gray fringes toward transparent stops.
 fn lerp_premul(c0: RgbaColor, c1: RgbaColor, u: f32) -> RgbaColor {
     let (a0, a1) = (f32::from(c0.alpha) / 255.0, f32::from(c1.alpha) / 255.0);
     let a = a0 + (a1 - a0) * u;
@@ -261,7 +249,7 @@ impl ColorRamp {
     }
 }
 
-/// Per-pixel gradient geometry in PAINT space (the coordinate system active
+/// Per-pixel gradient geometry in paint space (the coordinate system active
 /// when the paint was applied).
 enum GradientKind {
     /// `p0` plus the projected gradient vector `q` ([`linear_projection`]);
@@ -389,12 +377,9 @@ struct ColrCanvas<'a> {
     cur: Affine,
     palette: u16,
     foreground: RgbaColor,
-    /// The PaintGlyph clip waiting for its fill: the glyph id plus the affine
-    /// that was CURRENT when `outline_glyph` ran. COLRv1 fixes the clip
-    /// outline in the coordinate space where PaintGlyph appears; a transform
-    /// pushed between PaintGlyph and its child paint moves only the paint
-    /// (gradient geometry), never the outline — so the outline's transform
-    /// must be captured here, not read from `cur` again at paint time.
+    /// The PaintGlyph clip waiting for its fill: the glyph id and the affine current when
+    /// `outline_glyph` ran. COLRv1 fixes the outline in the space where PaintGlyph
+    /// appears, so it is captured then, not read from `cur` at paint time.
     pending: Option<(GlyphId, Affine)>,
 }
 
@@ -417,10 +402,9 @@ impl ColrCanvas<'_> {
         self.buf[i + 3] = ((sa + da * (1.0 - sa)) * 255.0).round() as u8;
     }
 
-    /// Scanline-fill the pending PaintGlyph outline — transformed by the
-    /// affine captured when `outline_glyph` ran, NOT by paint-time `cur` —
-    /// with `src` (a solid color, or a gradient sampled per pixel), 4×
-    /// vertical supersampling + analytic horizontal coverage, nonzero winding.
+    /// Scanline-fill the pending PaintGlyph outline (in the affine captured by
+    /// `outline_glyph`, not paint-time `cur`) with `src`: 4× vertical supersampling,
+    /// analytic horizontal coverage, nonzero winding.
     fn fill_pending(&mut self, src: &FillSource) {
         let Some((gid, clip_xform)) = self.pending.take() else {
             return;
@@ -441,21 +425,11 @@ impl ColrCanvas<'_> {
         }
         const SS: usize = 4;
         let (w, h) = (self.w, self.h);
-        // Flatten the contours into ONE edge list per layer instead of re-walking
-        // the Vec-of-Vec (with its `% n` wrap) for each of the h×SS sample lines.
-        // The closing edge still comes from the `contour[(i + 1) % n]` rule, so
-        // contour closure is preserved, and edges are emitted in the SAME
-        // contour-then-index order — the per-scanline crossings are therefore
-        // pushed in the same order and the STABLE `sort_by` below yields the
-        // identical ordering. Horizontal edges are dropped: `y0 == y1` can never
-        // satisfy the straddle test `(y0 <= sy && y1 > sy) || (y1 <= sy && y0 > sy)`
-        // (one endpoint would have to be both ≤ and > sy), so removing them is
-        // exact. A NaN endpoint makes `y0 == y1` false, so such an edge is KEPT and
-        // still fails the test, exactly as before.
+        // One flat edge list per layer, closed by the `(i + 1) % n` rule. Horizontal edges
+        // never straddle a sample line, so dropping them is exact.
         let mut edges: Vec<(f32, f32, f32, f32)> = Vec::new();
-        // The layer's y extent, folded from the same edges. `f32::min`/`max` ignore
-        // NaN, so a NaN endpoint cannot poison the range (and its edge can never
-        // cross a scanline anyway).
+        // The layer's y extent. `f32::min`/`max` ignore NaN, so a NaN endpoint cannot
+        // poison it.
         let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
         for contour in &contours {
             let n = contour.len();
@@ -473,19 +447,12 @@ impl ColrCanvas<'_> {
         if edges.is_empty() {
             return;
         }
-        // Scan only the rows the layer's y extent can reach. OUTSIDE that range no
-        // edge satisfies the straddle test for any sample line, so `xs` would be
-        // empty, `wind` would stay 0, `add_span` would never run and `cov` would
-        // stay all-zero — and the `c > 0.0` guard already suppresses every `blend`
-        // for a zero row. So the skipped rows wrote nothing: this is exact, not an
-        // approximation. The 1-row margin absorbs the +0.125/+0.875 sample offsets.
-        // Float→int casts saturate (and NaN → 0), so a degenerate extent collapses
-        // to an empty range rather than wrapping.
+        // Scan only rows the layer's y extent reaches: outside it no edge straddles a
+        // sample line, so skipping them is exact. The 1-row margin covers the sample
+        // offsets; saturating casts collapse a degenerate extent to an empty range.
         let py_lo = (min_y - 1.0).floor().max(0.0) as usize;
         let py_hi = ((max_y + 1.0).ceil().max(0.0) as usize).min(h);
-        // Both scratch buffers are hoisted out of the loops and reused: `fill(0.0)`
-        // is exactly the old fresh `vec![0.0f32; w]`, and `clear()` + the identical
-        // push sequence is exactly the old fresh `Vec` — only the capacity survives.
+        // Scratch buffers reused across rows and sample lines.
         let mut cov = vec![0.0f32; w];
         let mut xs: Vec<(f32, i32)> = Vec::new();
         for py in py_lo..py_hi {
@@ -530,13 +497,10 @@ impl ColrCanvas<'_> {
         }
     }
 
-    /// Resolve a `Paint` into a concrete fill. Gradients are evaluated per
-    /// pixel; geometry the COLRv1 spec calls ill-formed (coincident linear
-    /// points, coincident radial circles, an empty sweep) resolves to `None`
-    /// and the layer is not rendered, exactly as the spec requires. A paint
-    /// transform that cannot be inverted falls back to the first stop so the
-    /// layer still shows. `stops(palette, coords)` — default (non-variable)
-    /// coords, matching the outline path.
+    /// Resolve a `Paint` into a fill. Ill-formed gradient geometry (coincident linear
+    /// points, coincident radial circles, an empty sweep) is `None`: the spec says the
+    /// layer does not render. A non-invertible paint transform falls back to the first
+    /// stop. Stops use default (non-variable) coords, matching the outline path.
     fn resolve_paint(&self, paint: &Paint) -> Option<FillSource> {
         let (extend, stops, kind) = match paint {
             Paint::Solid(c) => return Some(FillSource::Solid(*c)),
@@ -592,8 +556,7 @@ impl ColrCanvas<'_> {
                 )
             }
         };
-        // An empty color line: keep the pre-gradient fallback (foreground)
-        // rather than dropping the layer of a degenerate font.
+        // An empty color line fills with the foreground rather than dropping the layer.
         let Some(&(_, first)) = stops.first() else {
             return Some(FillSource::Solid(self.foreground));
         };
@@ -614,23 +577,18 @@ impl ColrCanvas<'_> {
 
 impl<'a> Painter<'a> for ColrCanvas<'a> {
     fn outline_glyph(&mut self, glyph_id: GlyphId) {
-        // Snapshot `cur` NOW: this is the space the PaintGlyph clip lives in.
-        // A PaintTransform in the SUBTREE (push_transform arriving before the
-        // child paint) repositions gradient geometry only. Fluent leans on
-        // this: 🔥's radial ramps sit under mirroring transforms whose
-        // pad-extended far ends are alpha 0 — warping the outline through
-        // those same transforms both displaces the silhouette and samples the
-        // ramp out where it is transparent, all but erasing the glyph. When
-        // PaintGlyphs nest, each snapshot pairs the inner glyph with the
-        // transforms above ITS PaintGlyph (outer clips are not intersected —
-        // the module-level src-over/self-clip simplification, unchanged).
+        // Snapshot `cur` now: the PaintGlyph clip lives in this space, and a transform
+        // pushed in its subtree moves only the gradient geometry. Fluent's 🔥 depends on
+        // it: warping the outline through its mirroring paint transforms samples the pad
+        // ramps at their alpha-0 ends and all but erases the glyph. Nested PaintGlyph
+        // clips are not intersected (the module's src-over simplification).
         self.pending = Some((glyph_id, self.cur));
     }
     fn paint(&mut self, paint: Paint<'a>) {
         match self.resolve_paint(&paint) {
             Some(src) => self.fill_pending(&src),
-            // Ill-formed gradient geometry: the spec says the layer must not
-            // render; consume the pending outline so painter state stays sane.
+            // Ill-formed geometry (`resolve_paint`): the layer does not render; drop the
+            // pending outline so painter state stays sane.
             None => self.pending = None,
         }
     }
@@ -890,9 +848,8 @@ pub(crate) fn rasterize_colr_run(
     Some(buf)
 }
 
-/// Convert a premultiplied RGBA8 accumulator to STRAIGHT alpha in place.
-/// Fully-opaque/transparent pixels are already correct (×1 / rgb=0), so they
-/// are skipped — the opaque case stays byte-exact.
+/// Convert a premultiplied RGBA8 accumulator to straight alpha in place. Opaque and
+/// transparent pixels are already correct and are skipped, so opaque output is byte-exact.
 fn unpremultiply_straight(buf: &mut [u8]) {
     for px in buf.as_chunks_mut::<4>().0 {
         let a = u32::from(px[3]);
@@ -1069,9 +1026,8 @@ mod tests {
         assert_eq!(m.apply(0.0, 0.0), (6.0, 8.0));
     }
 
-    /// The COLRv1 test font, checked in (`tests/fixtures/colr_1.ttf`, the
-    /// googlefonts/color-fonts one ttf-parser 0.25.1 ships in its
-    /// `tests/fonts`, Apache-2.0), so the COLR tests run on every host.
+    /// `tests/fixtures/colr_1.ttf`: the googlefonts/color-fonts COLRv1 test font
+    /// (Apache-2.0) that ttf-parser 0.25.1 ships in its `tests/fonts`.
     fn colr_test_font() -> &'static [u8] {
         include_bytes!("../tests/fixtures/colr_1.ttf")
     }
@@ -1080,16 +1036,10 @@ mod tests {
     fn colr_glyph_rasterizes_straight_alpha() {
         let bytes = colr_test_font();
         let face = Face::parse(bytes, 0).expect("valid font");
-        // The blend accumulator stores PREMULTIPLIED rgb but `GlyphImage::Rgba`
-        // is blitted as STRAIGHT alpha, so `rasterize_colr` un-premultiplies
-        // before returning. The exact arithmetic is pinned by the synthetic
-        // `unpremultiply_restores_straight_rgb` (this font's one translucent
-        // solid is BLACK, which premultiplication cannot darken further); the
-        // end-to-end probe here pins the rest: every single-SOLID-layer glyph
-        // comes back carrying its layer's palette rgb at each fully-covered
-        // pixel, with the layer's alpha landing in the alpha channel.
-        // (The font's solid glyphs are probed, not assumed: its FIRST color
-        // glyph is a linear gradient, which renders as a per-pixel spread.)
+        // Every single-solid-layer glyph returns its palette rgb at fully-covered pixels,
+        // with the layer's alpha in the alpha channel. The exact un-premultiply arithmetic
+        // is `unpremultiply_restores_straight_rgb` (this font's translucent solid is black).
+        // The font's first colour glyph is a gradient, so solids are found by probing.
         let fg = RgbaColor::new(0, 0, 0, 255);
         let (mut opaque_checked, mut translucent_checked) = (false, false);
         for gid in (0..face.number_of_glyphs()).map(GlyphId) {
@@ -1148,9 +1098,8 @@ mod tests {
 
     #[test]
     fn unpremultiply_restores_straight_rgb() {
-        // A premultiplied half-transparent orange (straight 200,100,40 at
-        // α=128 → premultiplied 100,50,20), an opaque pixel (byte-exact
-        // passthrough) and a transparent one (untouched).
+        // Premultiplied half-transparent orange (straight 200,100,40 at α=128), an opaque
+        // pixel and a transparent one.
         let mut buf = vec![
             100, 50, 20, 128, //
             9, 8, 7, 255, //
@@ -1175,9 +1124,8 @@ mod tests {
         f: 0.0,
     };
 
-    /// A gradient stop as the fixtures below write it: an offset plus a raw RGBA
-    /// quadruple, before `RgbaColor::new` gives it a type. Named because the tuple
-    /// nests two deep and `-D warnings` counts that as a complex type.
+    /// A fixture gradient stop: offset plus raw RGBA (named to keep clippy's complex-type
+    /// lint quiet).
     type RawStop = (f32, (u8, u8, u8, u8));
 
     fn ramp(extend: GradientExtend, stops: &[RawStop]) -> ColorRamp {
@@ -1287,8 +1235,8 @@ mod tests {
         assert_eq!(g.sample_at(-10.0, 1e-4).expect("defined").red, 200); // 180°
     }
 
-    /// Records how many painted layers were multi-colour gradients vs solids
-    /// (and the last solid colour seen), without rasterizing anything.
+    /// Counts multi-colour gradient layers vs solid layers (and the last solid colour)
+    /// without rasterizing.
     #[derive(Default)]
     struct PaintProbe {
         gradient_layers: usize,
@@ -1377,10 +1325,8 @@ mod tests {
         best
     }
 
-    /// REGRESSION (Windows parity rank 7 — "colour emoji stop rendering
-    /// flat"): gradients used to collapse to their first colour stop, so a
-    /// pure-gradient glyph rasterized to at most one opaque colour per layer.
-    /// The per-pixel fill must produce a genuine spread.
+    /// A pure-gradient glyph sweeps many colours, not one per layer (a gradient flattened to
+    /// its first stop renders flat).
     #[test]
     fn colr_gradient_renders_a_colour_spread() {
         let bytes = colr_test_font();
@@ -1395,8 +1341,7 @@ mod tests {
             if face.paint_color_glyph(gid, 0, fg, &mut probe).is_none() {
                 continue;
             }
-            // Only pure-gradient glyphs with few layers (belt-and-braces on
-            // top of the run metric's own compositing immunity).
+            // Pure-gradient glyphs with few layers only.
             if probe.gradient_layers == 0 || probe.solid_layers != 0 || probe.gradient_layers > 4 {
                 continue;
             }

@@ -363,6 +363,13 @@ const STATS_BARS_FORMS: &[&str] = &[
     crate::stats_deck::StatsBars::Sill.word(),
     crate::stats_deck::StatsBars::Off.word(),
 ];
+/// `[sys] stats_deck_size` - the Deck's size choices (`stats_plan::DeckSizePref`'s
+/// own words).
+const STATS_DECK_SIZES: &[&str] = &[
+    crate::stats_plan::DeckSizePref::Auto.word(),
+    crate::stats_plan::DeckSizePref::Full.word(),
+    crate::stats_plan::DeckSizePref::Folded.word(),
+];
 const WINDOWING_BEHAVIOR_ALIASES: &[&str] = &[
     "new-window",
     "newwindow",
@@ -1260,6 +1267,26 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &[
             "system", "cpu", "gpu", "memory", "disk", "stats", "deck", "sill", "bars", "lens",
         ],
+        true,
+    ),
+    // The Deck's form (Stats Deck v2, 2026-10-20): Full or Folded by the
+    // window's height, or forced. Read live; View ▸ Stats Bars writes it.
+    manual(
+        "sys.stats_deck_size",
+        "Stats deck size: by the window's height, full or folded",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: STATS_DECK_SIZES,
+        }),
+        &[
+            "system", "stats", "deck", "size", "full", "folded", "height", "rows",
+        ],
+        true,
+    ),
+    manual(
+        "sys.disk_roots",
+        "Folders the disk walker may size in ~/Library or a protected folder",
+        ConfigSchemaKind::StringList,
+        &["disk", "folders", "sizes", "library", "protected", "walker"],
         true,
     ),
     // The `[claude_footer]` table (owner, 2026-09-30): what the Claude Code
@@ -2483,6 +2510,11 @@ fn manual_default_shown(key: &str) -> Option<String> {
             key,
             config.stats_bars_or_default(),
             crate::stats_deck::StatsBars::from_word,
+        )?,
+        "sys.stats_deck_size" => word(
+            key,
+            config.stats_deck_size_or_default(),
+            crate::stats_plan::DeckSizePref::from_word,
         )?,
         "agents_auto_prime" => config.agents_auto_prime_or_default().to_string(),
         "claude_footer.usage" => config.claude_footer_usage().to_string(),
@@ -6370,7 +6402,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · on (the default): a record of what each session did under the logs folder's `session-log/`: each command's first word as typed (`detail=`, so a secret typed at a prompt and run is kept too) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, the oldest deleted first to keep its own near 64 MiB and 2048 files (files a running instance still writes can hold it above that), so `log @<sid>` and `brief @<sid>` answer for a session from an earlier run or a crash · off: aterm keeps no journal, creates no file and deletes nothing · read at launch; follows restore_session; a window's only · macOS and Linux"
         }
         "sys.stats_bars" => {
-            " · default deck: three bars under the titlebar (Global, aterm, Tab), each core a tile whose fill is its use, with a warm glow and a notch for rising load and a dotted ghost at the 20-second average; the GPU, memory and swap, and the disk the tab is in · sill: the same three bars as thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on an instrument, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
+            " · default deck: a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network, tokens and processes, plus the cores: each row's last 10 minutes as a heat strip (cold to hot, 0 to 100% of that resource's max, a hollow cell where nothing was read), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity and the amount with its unit; Full or Folded by the window's height (`stats_deck_size`) · sill: thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
+        }
+        "sys.stats_deck_size" => {
+            " · default auto: the Deck is Full (a header line and the seven rows, about 100 pt) once the window's grid would be 870 pt tall under the Folded deck, and folds back only below 850 pt, so a resize across one line does not flip it; Folded is two blocks of four rows in 62 pt · full: always Full · folded: always Folded · decided when a window opens, resizes, changes display or the font changes, never by what the deck shows; Full takes whole terminal rows · View ▸ Deck Size picks one · read live"
         }
         "session_log.clause" => {
             " · on (the default): one more line after `activity:`, `now:` and what the session's log says the tab is doing (`now: running shell`, `now: approval · bash`, `now: limit · resets 14:05`; what needs you first), in the menu with how long it has held; never a label another client wrote; the tab's name is unchanged · off: a tab's tooltip and context menu are as they were · read live"

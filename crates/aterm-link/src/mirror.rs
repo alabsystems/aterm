@@ -207,8 +207,19 @@ impl Pin {
     /// # Errors
     ///
     /// Anything that does not read: a header of another version, a slot line
-    /// that does not parse, a count that is not the lines'.
+    /// that does not parse, a count that is not the lines' — and a pin that does
+    /// not end at the newline every line of it ends with ([`Pin::render`]): a
+    /// power cut may leave a prefix, and one cut inside its header still reads
+    /// as a pin with a lower total and no key (rulings Q13 and Q6, reset), one
+    /// cut inside its last slot as that slot with its body's tail gone.
     pub fn parse(text: &str) -> Result<Pin, String> {
+        if !text.ends_with('\n') {
+            return Err(if text.is_empty() {
+                "an empty logpin".to_string()
+            } else {
+                "a logpin cut short of its last newline".to_string()
+            });
+        }
         let mut lines = text.lines();
         let head = lines.next().ok_or("an empty logpin")?;
         let mut toks = head.split(' ');

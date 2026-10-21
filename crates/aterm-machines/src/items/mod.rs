@@ -5,7 +5,7 @@
 //! [`expand`] collects them all, in the order they must run.
 
 use crate::baseline::Baseline;
-use crate::model::{Effect, HostFacts, Probe, User};
+use crate::model::{Effect, HostFacts, PValue, Probe, Read, User};
 use crate::port::System;
 use std::path::PathBuf;
 
@@ -80,6 +80,20 @@ pub trait Item: Send + Sync {
     /// # Errors
     /// One line saying what did not work.
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String>;
+
+    /// Typed before-images of the preference keys this item currently plans to
+    /// change. A caller can persist these before running a workstation repair;
+    /// account credentials and runtime-only input mappings are never included.
+    ///
+    /// # Errors
+    /// A preference that would be overwritten cannot be read safely.
+    fn preference_changes(
+        &self,
+        _sys: &dyn System,
+        _ctx: &Ctx,
+    ) -> Result<Vec<(defaults::Target, Read<PValue>)>, String> {
+        Ok(Vec::new())
+    }
 
     /// Reapply an idempotent runtime setting whose saved preferences already match.
     /// Called only in apply mode after an `Ok` probe. `Some` requires another matching

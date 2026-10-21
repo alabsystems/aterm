@@ -6,21 +6,13 @@
 
 use super::*;
 
-/// The row-band law: where a grid row lands when screen rows `top..=bottom`
-/// moved by `delta`, for a mark (a ribbon cell, a spark, a classifier anchor, a
-/// veil). A row outside the band is untouched, a row inside moves by `delta`,
-/// and a row whose new index leaves the band is gone (`None`), never clamped:
-/// clamping would pile a departed trail into a bar on the edge row, or make a
-/// false source for the next observed move. [`CursorGlow::note_scroll`] applies
-/// the same law to the whole grid.
-///
-/// Producers are the terminal's region scrolls: Codex's inline viewport riding
-/// down per streamed line (`ESC[{vt};57r … RI`: `[vt..56] +1`), its transcript
-/// archiving up (`ESC[1;52r … LF`: `[0..51] −1`), an Enter's `RI×k`, tmux/vim/
-/// less status rows, IL/DL. The grid records each (`aterm_grid::RowBandMove`),
-/// the core keeps them in `ContentScrollState`'s explained-motion ring, and the
-/// host replays them oldest-first through `note_band_move` on the present that
-/// observed the batch, so the next tick sees every mark where its text now is.
+/// The row-band law: where a mark's grid row lands when screen rows
+/// `top..=bottom` moved by `delta`. Outside the band a row is untouched; inside
+/// it moves by `delta`; a row whose new index leaves the band is gone (`None`),
+/// never clamped (clamping piles a departed trail on the edge row and makes a
+/// false source for the next move). The grid records each region scroll
+/// (`aterm_grid::RowBandMove`) and the host replays them oldest-first through
+/// [`CursorGlow::note_band_move`].
 #[inline]
 #[must_use]
 pub fn band_row(row: u16, top: u16, bottom: u16, delta: i16) -> Option<u16> {
@@ -34,10 +26,8 @@ pub fn band_row(row: u16, top: u16, bottom: u16, delta: i16) -> Option<u16> {
 }
 
 /// [`band_row`] for a position rather than a mark (the caret, the cell the last
-/// Backspace emptied). A position cannot be dropped (the engine must still
-/// answer `field_at_caret`), so a row carried past the band's edge saturates at
-/// that edge, as the scroll path parks a scrolled-out caret on row 0. Outside
-/// the band the row is untouched.
+/// Backspace emptied). A position cannot be dropped, so a row carried past the
+/// band's edge saturates at that edge.
 #[inline]
 #[must_use]
 pub fn band_pos(row: u16, top: u16, bottom: u16, delta: i16) -> u16 {
@@ -49,17 +39,12 @@ pub fn band_pos(row: u16, top: u16, bottom: u16, delta: i16) -> u16 {
 }
 
 /// [`band_row`] for the pixel-addressed pools (starfield, landing ring, fire
-/// meteors, vapor, bolts, v2's stars, flights and landings): the band becomes
-/// the half-open pixel span `[y_lo, y_hi)` = `[origin_y + top·ch, origin_y +
-/// (bottom+1)·ch)` with displacement `dy = delta·ch`. A point inside moves by
-/// `dy` and is kept iff still inside; a point outside is untouched. A span (a
-/// meteor's tail→head, a bolt's polyline) moves whole when every point is
-/// inside, is untouched when none is, and is dropped when it straddles the edge.
-///
-/// `origin_y` is the grid interior's top in window px (chrome above the grid
-/// would otherwise shift every band edge). A caller with no geometry yet
-/// (`cell_h == 0`) must not build one: every pool would read as outside, so it
-/// drops the pools instead, as `CursorGlow::translate_scroll_state` does.
+/// meteors, vapor, bolts, v2's stars, flights and landings): the band is the
+/// half-open span `[origin_y + top·ch, origin_y + (bottom+1)·ch)` in window px,
+/// displaced by `delta·ch`. A point inside moves and is kept iff still inside.
+/// A span moves whole when every point is inside, is untouched when none is,
+/// and is dropped when it straddles the edge. With no geometry yet
+/// (`cell_h == 0`) callers drop the pools instead.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BandPx {
     pub(super) y_lo: f32,
@@ -88,8 +73,8 @@ impl BandPx {
         (self.y_lo..self.y_hi).contains(&y)
     }
 
-    /// A POINT: moved iff inside, kept iff still inside; outside → untouched
-    /// and kept. The return is the `retain` verdict.
+    /// A point: moved iff inside, kept iff still inside; outside, untouched and
+    /// kept. Returns the `retain` verdict.
     #[inline]
     pub fn point(&self, y: &mut f32) -> bool {
         if !self.inside(*y) {
@@ -117,13 +102,10 @@ impl BandPx {
 }
 
 impl CursorGlow {
-    /// A PTY-driven scroll shifted the whole screen up `rows` lines this frame:
-    /// translate the trail anchors so the next move classifies against where the
-    /// previous caret cell now sits. A wrap that grows a bottom-anchored TUI box
-    /// (Claude Code with a full transcript) scrolls in the same repaint; without
-    /// this the caret's move flattens to dr==0 with a huge column delta and the
-    /// full jump choreography fires. Alt screens have no scrollback, so vim's
-    /// scrolls never translate.
+    /// A PTY-driven scroll shifted the whole screen up `rows` lines: translate
+    /// the trail anchors so the next move classifies against where the previous
+    /// caret cell now sits. Otherwise a wrap that grows a bottom-anchored TUI box
+    /// reads as a same-row move with a huge column delta and fires the full jump.
     pub fn note_scroll(&mut self, rows: u16) {
         if rows == 0 {
             return;
@@ -140,14 +122,11 @@ impl CursorGlow {
         self.scroll_rows = self.scroll_rows.saturating_add(rows);
     }
 
-    /// A held park ([`HeldPark`]) rides a scroll or band move with its row, as
-    /// `last`, `last_visible`, the sparks, the v2 mirror and the buffered events
-    /// do (`map`: an absolute row to its new row, `None` once carried off the top
-    /// or past the band's edge). Carried off, it has no honest row, so it is
-    /// judged first in the pre-move space; then everything it laid translates.
-    /// A transcript line printed inside Ink's ~40 ms park/rewrite gap therefore
-    /// does not strand the key's cell. Called before the callers' poof,
-    /// baseline and quench clears: the flush reads `quench_hint`.
+    /// Carry a held park ([`HeldPark`]) with its row (`map`: an absolute row to
+    /// its new row, `None` once carried off), so a line printed inside Ink's
+    /// ~40 ms park/rewrite gap does not strand the key's cell. Carried off, it is
+    /// judged first in the pre-move space. Runs before the callers clear
+    /// `quench_hint`, which the flush reads.
     pub(super) fn carry_held_park(&mut self, map: impl Fn(u16) -> Option<u16>) {
         if let Some(p) = self.held_park {
             match (map(p.row), map(p.landing_row)) {
@@ -196,6 +175,10 @@ impl CursorGlow {
         self.hide_bridge_shown = self
             .hide_bridge_shown
             .and_then(|(row, col)| map(row).map(|row| (row, col)));
+        self.v2_stop = self.v2_stop.and_then(|(t, at)| match at {
+            Some((row, col)) => map(row).map(|row| (t, Some((row, col)))),
+            None => Some((t, None)),
+        });
         self.forget_anchor_rows();
         // The hand's row is where the hand is: the scroll moved the input line
         // and the hand with it, unless the line was redrawn on its own screen
@@ -223,19 +206,13 @@ impl CursorGlow {
         self.classic.translate_rows(map);
     }
 
-    /// Move every live, position-bearing member with a PTY scroll. `cell_h`
-    /// comes from the outermost engine because an outgoing style ghost may not
-    /// have ticked (and set its own [`Self::last_ch`]) though its geometry is
-    /// already on glass.
-    ///
-    /// One family operation: a member of the transient-light family is either
-    /// translated here or dropped when its geometry is unknown or off-top, never
-    /// left over unrelated post-scroll cells.
+    /// Move every live, position-bearing member with a PTY scroll; a transient
+    /// whose geometry is unknown or off-top is dropped, never left over
+    /// unrelated cells. `cell_h` comes from the outermost engine: an outgoing
+    /// style ghost may not have ticked (and set its own [`Self::last_ch`]).
     pub(super) fn translate_scroll_state(&mut self, rows: u16, cell_h: u16) {
         self.translate_row_addressed(&|row: u16| row.checked_sub(rows));
-        // Pixel-addressed pools: the starfield, landing ring, zoom streaks,
-        // landing starbursts, fast-glide stars and landing anchor, fire meteors,
-        // vapor and bolt polylines are window-absolute px and need a pixel
+        // Pixel-addressed pools are window-absolute px and need a pixel
         // translation (a stale glide head would later mint a landing burst at
         // the old Y). With no tick observed the height is unknown, so every pool
         // is dropped (fail closed).
@@ -248,8 +225,7 @@ impl CursorGlow {
             self.bolts.clear();
         } else {
             // Dropped once past the window top, with one cell of allowance (the
-            // starfield uses the sky band just above row 0). Measured against
-            // the window, not this scroll's distance.
+            // starfield uses the sky band just above row 0).
             let top = -f32::from(cell_h);
             // Analytic particles/vapor are translated at their birth origin;
             // that moves their whole trajectory without rebasing the clock.
@@ -278,11 +254,10 @@ impl CursorGlow {
             });
         }
 
-        // Outgoing style ghosts paint into the same frame and can outlive the
-        // switch by 250 ms; recurse with the outer row height, which covers a
-        // ghost that has not yet set its own `last_ch`. The frozen anchor uses
-        // checked subtraction: it is visible geometry, so an off-top cursor is
-        // not clamped to row 0.
+        // Outgoing style ghosts paint into the same frame for up to 250 ms:
+        // recurse with the outer row height (a ghost may not have set its own
+        // `last_ch`). The frozen anchor is visible geometry, so an off-top
+        // cursor is dropped, not clamped to row 0.
         for fade in &mut self.fading {
             fade.engine.translate_scroll_state(rows, cell_h);
             fade.anchor = fade
@@ -301,24 +276,13 @@ impl CursorGlow {
 
     /// A row band moved: the host replays one `aterm_grid::RowBandMove` recorded
     /// this present (screen rows `top..=bottom` are now `delta` rows from where
-    /// the previous frame drew them; the [`band_row`] law). The sibling of
-    /// [`Self::note_scroll`] for motion a whole-grid translation cannot express:
-    /// Codex's inline viewport sliding down per streamed line (`[vt..56] +1`),
-    /// its transcript archiving up under a fixed composer (`[0..51] −1`), an
-    /// Enter's `RI×k`, a tmux pane or vim status row scrolling in its DECSTBM
-    /// region, IL/DL. A band move is a coordinate transform, never a licence:
-    /// nothing is judged or spawned, and the next move classifies against where
-    /// the previous caret cell now sits, so banked keys and momentum survive.
+    /// the previous frame drew them; the [`band_row`] law). A coordinate
+    /// transform, never a licence: nothing is judged or spawned, so banked keys
+    /// and momentum survive.
     ///
-    /// The plain-Backspace poof classifier and its `(row, fill)` baseline
-    /// describe pre-move content and are retired (the host's `drop_row_probe`
-    /// lands beside this). `quench_hint` is kept, unlike the scroll path: under
-    /// Codex a Backspace's echo often lands after a streamed line slid the
-    /// composer
-    /// (`a_backspace_echo_that_lands_after_a_band_move_is_still_licensed`). A
-    /// held park ([`HeldPark`]) rides `delta` with its row inside the band;
-    /// carried past the edge it is judged first ([`Self::carry_held_park`]).
-    /// `coord_band_moves` counts the replay for `trail status`.
+    /// Unlike [`Self::note_scroll`], `quench_hint` is kept: under Codex a
+    /// Backspace's echo often lands after a streamed line slid the composer.
+    /// Each replay is counted ([`Self::band_moves`]).
     pub fn note_band_move(&mut self, top: u16, bottom: u16, delta: i16) {
         if delta == 0 || top > bottom {
             return;
@@ -336,7 +300,7 @@ impl CursorGlow {
     /// hand through a content-proved row move; it grants no movement licence.
     pub(super) fn key_in_flight(&self, now: Instant) -> bool {
         self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
-            || self.type_press_ring.presses_within(now) > 0
+            || self.type_press_ring.any_within(now)
             || self.last_erase.is_some_and(|erase| erase.owed_at(now))
     }
 
@@ -358,6 +322,9 @@ impl CursorGlow {
         self.last = self.last.map(|(r, c)| (map(r), c));
         self.last_visible = self.last_visible.map(|((r, c), at)| ((map(r), c), at));
         self.hide_bridge_shown = self.hide_bridge_shown.map(|(r, c)| (map(r), c));
+        if let Some((_, Some((row, _)))) = &mut self.v2_stop {
+            *row = map(*row);
+        }
         // The retained source probes describe that same line. Their neighbour
         // captures have no such identity proof and cannot ride with it.
         for probe in self
@@ -391,7 +358,7 @@ impl CursorGlow {
         self.last_licensed_row = self.last_licensed_row.map(|(r, at)| (map(r), at));
         self.last_anchor_sweep = self.last_anchor_sweep.map(|(r, at)| (map(r), at));
         self.wrap_paid_row = self.wrap_paid_row.map(map);
-        self.translate_insert_rows(&|r| Some(map(r)));
+        self.insert.translate_rows(|r| Some(map(r)));
         for slot in &mut self.anchor_rows {
             match slot {
                 Some(m) if m.row == to => *slot = None,
@@ -402,15 +369,9 @@ impl CursorGlow {
     }
 
     /// Move every live, position-bearing member with a row-band move, under the
-    /// [`band_row`] law: outside untouched, inside moved by `delta`, past either
-    /// edge gone. `cell_h` and `origin_y` come from the outermost engine (see
-    /// the scroll twin) and name the band's half-open pixel span `y_lo =
-    /// origin_y + top·ch`, `y_hi = origin_y + (bottom+1)·ch` for the pixel
-    /// pools.
-    ///
-    /// Spans (a fire meteor's tail→head, a bolt's polyline): all points inside,
-    /// the whole span moves; none inside, untouched; straddling the edge,
-    /// dropped. A dropped flight mints no landing.
+    /// [`band_row`] law. `cell_h` and `origin_y` come from the outermost engine
+    /// (see the scroll twin) and give the pixel pools the band's span
+    /// ([`BandPx`]). A dropped flight mints no landing.
     pub(super) fn translate_band_state(
         &mut self,
         top: u16,
@@ -449,10 +410,12 @@ impl CursorGlow {
                 if n != bolt.pts.len() {
                     return false;
                 }
+                let mut keep = true;
                 for (_, y) in &mut bolt.pts {
                     *y += px.dy;
+                    keep &= px.inside(*y);
                 }
-                bolt.pts.iter().all(|&(_, y)| px.inside(y))
+                keep
             });
         }
 

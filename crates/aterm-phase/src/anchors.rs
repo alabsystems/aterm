@@ -822,6 +822,10 @@ pub const ANCHORS: &[Anchor] = &[
         "Usage limit has reset · press enter to continue",
         "2.1.283",
     ),
+    // The command Claude Code submits itself to open its usage-limit dialog
+    // (a reset over 24 h away), echoed as `❯ /rate-limit-options` with the
+    // dialog's answer under it (`wall::left_wall`).
+    lit("wall.limit_dialog", "/rate-limit-options", "2.1.300"),
     lit("wall.context", "Context limit reached", "2.1.280"),
     lit("wall.server", "This is a server-side issue", "2.1.280"),
     lit(
@@ -1407,6 +1411,28 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     // binary holds ` to view ` and puts the rest together; the lab's capture
     // `end-of-turn-work-hint`).
     composed("muse.panel.view", "(↓ to view ", "1.4.10-R6427.1"),
+    // The head of a `/status` card and the run's state at its right, `│
+    // MUSE CODE 1.4.10 / sea-pasiphae  RUNNING │`: `IDLE` before any turn,
+    // `RUNNING` while one runs, `COMPLETED` after a turn, `FAILED` after a
+    // wall, `CANCELLED` after a person's Esc — each put in capitals at run
+    // time (the lab's captures `status`, `status-mid-turn`,
+    // `limit-status-cards`, `fresh-status-cards`, `interrupted-status-cards`,
+    // `limit-unnamed-status-cards`, `completed-status-cards`).
+    composed("muse.card.status", "MUSE CODE ", "1.4.10-R6427.1"),
+    composed("muse.card.idle", "IDLE", "1.4.10-R6427.1"),
+    composed("muse.card.running", "RUNNING", "1.4.10-R6427.1"),
+    composed("muse.card.completed", "COMPLETED", "1.4.10-R6427.1"),
+    composed("muse.card.failed", "FAILED", "1.4.10-R6427.1"),
+    composed("muse.card.cancelled", "CANCELLED", "1.4.10-R6427.1"),
+    // A `/status` card's count of the tokens the session spent, `│  USAGE
+    // 0 tokens · 0 turns · 0 subagents │` (`0` before any turn: the lab's
+    // captures `fresh-status-cards`, `interrupted-status-cards`).
+    composed("muse.card.usage", "USAGE", "1.4.10-R6427.1"),
+    composed("muse.card.tokens", "tokens", "1.4.10-R6427.1"),
+    // A `/usage` card's count of the session's turns, `│    Turns    1 │`
+    // (`0` before any, and after a first turn a person stopped: the lab's
+    // captures `usage`, `fresh-status-cards`).
+    composed("muse.card.turns", "Turns", "1.4.10-R6427.1"),
     // The warning a resumed session opens with after a run that recorded no
     // clean shutdown (SIGHUP, SIGKILL): `warning: the previous run of this
     // session ended abnormally around <time> …` (the harness's relaunch on
@@ -1698,9 +1724,13 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
     // Several questions: the review tab's head and its key row.
     lit("gemini.question.review", "Review your answers:", "0.46.0"),
     hint("gemini.question.submit", "Enter to submit", "0.46.0"),
-    // The per-day quota's dialog: neither option is pressed.
+    // The usage-limit dialog: a per-day quota's is pressed by no rule; a
+    // spent quota's that names its reset is kept trying past it.
     lit("gemini.usage.title", "Usage limit reached for", "0.46.0"),
     lit("gemini.usage.retry", "Keep trying", "0.46.0"),
+    // A Google account's spent quota names its reset under the title:
+    // `Access resets at 5:06 AM PDT.` (`gemini::limit_reset`).
+    lit("gemini.usage.resets", "Access resets at ", "0.46.0"),
     // The messages typed while the agent worked, over the status row (and
     // under a box kept over the composer) — drawn from a `\u2191` escape, so
     // composed for the canary.
@@ -1784,6 +1814,12 @@ pub const TRANSCRIPT_KEYS: &[Anchor] = &[
 /// (session log 5G, 2026-10-19), reduced and committed as `aterm-agent`'s
 /// `harness/testdata/steps/codex-0.163.0.jsonl` and its `-subagent` leg
 /// (`every_rollout_key_is_in_its_committed_rollout`), never a guessed key.
+/// The codex-alab builds 0.164.0-dev.12521 and 12479 the lab measured
+/// (session log 6D-3a, `lab codex-alab-proof`, their legs committed as
+/// `codex-alab-<release>-<leg>.jsonl`, `rollout_reduction_stem`) spell
+/// every key of the steps their rollouts show as 0.163.0 did, and add one
+/// call name the fold classes: `exec_command`, a shell command; so does
+/// the forever-port build 0.164.0-dev.12672 (B5c), with no new key.
 /// A key a build renames is a turn, a call or a wall the fold no longer
 /// sees, so the drift canary greps the store's Codex build for each
 /// (`every_rollout_key_is_in_the_store_codex`), as it does Claude Code's
@@ -1838,6 +1874,13 @@ pub const ROLLOUT_KEYS: &[Anchor] = &[
     // (`spawn_agent` in `collaboration`; the lab's subagent leg).
     lit("rollout.collaboration", "collaboration", "0.163.0"),
     lit("rollout.spawn_agent", "spawn_agent", "0.163.0"),
+    // And a shell command, in no namespace (codex-alab's approval leg: the
+    // command its model ran, approved).
+    lit(
+        "rollout.exec_command",
+        "exec_command",
+        "0.164.0-dev.12479+g07a25d86a",
+    ),
     // The usage wall's word, on the turn's `task_complete` (the lab's
     // usage leg: the stub's 429 `usage_limit_reached`).
     lit(
@@ -1861,6 +1904,24 @@ pub fn newer_than(a: &str, b: &str) -> bool {
             .collect::<Vec<_>>()
     };
     parts(a) > parts(b)
+}
+
+/// The name stem a Codex build's committed rollout reductions carry in
+/// `aterm-agent`'s step testdata (`harness/testdata/steps/<stem>.jsonl`, or
+/// a leg of it, `<stem>-<leg>.jsonl`): `codex-<build>`, and for an ALab
+/// build, whose version is a pre-release with its commit as build metadata
+/// (`X.Y.Z-dev.N+g<sha>`, the publication scheme a codex-alab package
+/// names), `codex-alab-<the version before its +>` (session log 6D-3a). The
+/// one rule both the key table's test and the step fold's read it by.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn rollout_reduction_stem(build: &str) -> String {
+    match build.split_once('+') {
+        Some((release, meta)) if release.contains("-dev.") && meta.starts_with('g') => {
+            format!("codex-alab-{release}")
+        }
+        _ => format!("codex-{build}"),
+    }
 }
 
 /// The text of the anchor `id`. Panics on an id the table does not have —
@@ -2145,8 +2206,8 @@ mod tests {
     }
 
     /// Where the lab's Codex rollouts are committed, reduced (`aterm-agent`'s
-    /// step testdata, session log 5G): `codex-<build>.jsonl` and its legs,
-    /// `codex-<build>-<leg>.jsonl`.
+    /// step testdata, session log 5G, 6D-3a): `<stem>.jsonl` and its legs,
+    /// `<stem>-<leg>.jsonl`, the stem [`rollout_reduction_stem`]'s.
     const ROLLOUTS: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../aterm-agent/src/harness/testdata/steps"
@@ -2155,15 +2216,15 @@ mod tests {
     /// The committed rollout reductions of `build`, joined, each checked to
     /// open with the reducer's own line naming that build.
     fn committed_rollouts(build: &str) -> Vec<u8> {
-        let leg = format!("{build}-");
+        let stem = rollout_reduction_stem(build);
+        let leg = format!("{stem}-");
         let mut names: Vec<String> = std::fs::read_dir(ROLLOUTS)
             .expect("the step testdata")
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| {
-                n.strip_prefix("codex-")
-                    .and_then(|n| n.strip_suffix(".jsonl"))
-                    .is_some_and(|b| b == build || b.starts_with(&leg))
+                n.strip_suffix(".jsonl")
+                    .is_some_and(|b| b == stem || b.starts_with(&leg))
             })
             .collect();
         names.sort();
@@ -2200,10 +2261,94 @@ mod tests {
                 a.since
             );
         }
+        // The codex-alab build the lab measured (6D-3a) needed one new key,
+        // the shell call's name (`rollout.exec_command`, checked above
+        // against the earlier measured build's rollouts, and here against
+        // this one's): what else its rollouts show of the steps it took (a
+        // turn's context and end, its tokens, a call and its output, the
+        // usage wall, the thread's own settings line) is spelled as 0.163.0
+        // spelled it.
+        for build in [ALAB_BUILD, FOREVER_BUILD] {
+            let alab = committed_rollouts(build);
+            for key in [
+                "rollout.session_meta",
+                "rollout.turn_context",
+                "rollout.task_complete",
+                "rollout.thread_settings_applied",
+                "rollout.token_count",
+                "rollout.function_call",
+                "rollout.function_call_output",
+                "rollout.cli_version",
+                "rollout.turn_id",
+                "rollout.call_id",
+                "rollout.duration_ms",
+                "rollout.last_token_usage",
+                "rollout.total_token_usage",
+                "rollout.model",
+                "rollout.codex_error_info",
+                "rollout.usage_limit_exceeded",
+                "rollout.exec_command",
+            ] {
+                let a = ROLLOUT_KEYS.iter().find(|a| a.id == key).expect("a key");
+                assert!(contains_bytes(&alab, &quoted(a)), "{key} on {build}");
+            }
+            // NEGATIVE CONTROL.
+            assert!(!contains_bytes(&alab, &quoted(&PLANTED_ROLLOUT_KEY[0])));
+        }
         // NEGATIVE CONTROLS.
         let rollouts = committed_rollouts("0.163.0");
         assert!(!contains_bytes(&rollouts, &quoted(&PLANTED_ROLLOUT_KEY[0])));
         assert!(committed_rollouts("9.9.999").is_empty());
+    }
+
+    /// The codex-alab build the lab measured (session log 6D-3a).
+    const ALAB_BUILD: &str = "0.164.0-dev.12521+g3d3eb12d8";
+
+    /// The forever-port codex-alab build the lab measured (B5c), whose
+    /// rollouts spell every key of the steps they show as 0.163.0 did.
+    const FOREVER_BUILD: &str = "0.164.0-dev.12672+g089291d37";
+
+    /// THE NAME RULE (6D-3a): a vendor build's reductions are
+    /// `codex-<build>`, an ALab build's `codex-alab-<release>`, its commit
+    /// left to the reducer's own line; each committed reduction is of the
+    /// build its own line names. NEGATIVE CONTROLS: build metadata that is
+    /// no ALab commit, or on no pre-release, keeps the whole build.
+    #[test]
+    fn a_rollout_reduction_is_named_by_its_build() {
+        assert_eq!(rollout_reduction_stem("0.163.0"), "codex-0.163.0");
+        assert_eq!(
+            rollout_reduction_stem(ALAB_BUILD),
+            "codex-alab-0.164.0-dev.12521"
+        );
+        assert!(!committed_rollouts(ALAB_BUILD).is_empty());
+        for e in std::fs::read_dir(ROLLOUTS)
+            .expect("the step testdata")
+            .filter_map(Result::ok)
+        {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("codex-") {
+                continue;
+            }
+            let text = std::fs::read_to_string(e.path()).expect("a reduction");
+            let build = text
+                .strip_prefix("# codex ")
+                .and_then(|t| t.split(' ').next())
+                .unwrap_or_else(|| panic!("{name} opens with the reducer's line"));
+            let stem = rollout_reduction_stem(build);
+            assert!(
+                name == format!("{stem}.jsonl") || name.starts_with(&format!("{stem}-")),
+                "{name} is a reduction of {build}"
+            );
+        }
+        // NEGATIVE CONTROLS.
+        assert_eq!(
+            rollout_reduction_stem("1.0.0+g3d3eb12"),
+            "codex-1.0.0+g3d3eb12"
+        );
+        assert_eq!(
+            rollout_reduction_stem("0.164.0-dev.1+build7"),
+            "codex-0.164.0-dev.1+build7"
+        );
     }
 
     /// THE RESET'S TEMPLATES ARE ITS ANCHORS' WORDS, WHOLE: each is built

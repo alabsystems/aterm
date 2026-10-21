@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The usage-limit episode's clock: when the notice says the limit resets,
-//! read as a Unix time, so the turn-end policy can continue the worker 150 s
-//! past it (`turn_end_loop.rs`'s `wall_reset_at`) and the loop can
-//! stretch its budget past it (`run.rs`'s `Session::extend`). The band's
-//! countdown reads the same grammar (aterm-gui `presence::countdown_to_reset`).
+//! The usage-limit episode's clock: when the notice says the limit resets, as a Unix time, so
+//! the turn-end policy can continue the worker 150 s past it (`turn_end_loop.rs`'s
+//! `wall_reset_at`) and the loop can stretch its budget past it (`run.rs`'s
+//! `Session::extend`). The band's countdown reads the same grammar (aterm-gui
+//! `presence::countdown_to_reset`).
 //!
-//! Spellings after `resets ` / `reset at ` (as `aterm_phase::limit_notice`
-//! hands them over):
+//! Spellings after `resets ` / `reset at ` (as `aterm_phase::limit_notice` hands them over):
 //!
 //! * a clock time, with or without a month and day and a zone
 //!   (`Sep 19 at 11am (America/Los_Angeles)`, `3am`; [`ResetSpec::At`]);
-//! * a span (`in 2h 30m`, `in 3 hours`; [`ResetSpec::In`]), counted from the
-//!   loop's first read, once per episode;
-//! * the auto-continue notice's time or `shortly` (a minute from now,
-//!   [`SHORTLY`]); such a notice is over once the worker is busy
-//!   ([`resumes_by_itself`]).
+//! * a span (`in 2h 30m`, `in 3 hours`; [`ResetSpec::In`]), counted from the loop's first
+//!   read, once per episode;
+//! * the auto-continue notice's time or word (`⚠ Usage limit reached · continuing automatically
+//!   at 1:50pm · esc to cancel`, then `continuing shortly`): a bare clock time (today's or
+//!   tomorrow's), or `shortly`, read as a minute from now ([`SHORTLY`]) so Claude Code's own
+//!   continuation goes first. Such a notice is over once the worker is read busy
+//!   ([`resumes_by_itself`]); its row stays on screen while it works.
 //!
 //! The auto-continue notice (`⚠ Usage limit reached · continuing
 //! automatically at 1:50pm · esc to cancel`, then `continuing shortly`) names
@@ -60,12 +61,10 @@ pub enum ResetSpec {
     In(Duration),
 }
 
-/// A clock time with no date that passed less than this long ago is today's,
-/// passed (the notice sat unread across it); older, it is tomorrow's. A
-/// session limit resets within its five-hour window, so the time a notice
-/// names is never more than five hours ahead: tomorrow's is right only once
-/// today's is 19 hours gone (24 − 5), and `3am` read at 3:30pm is twelve and
-/// a half hours passed, not eleven and a half ahead.
+/// A clock time with no date that passed less than this long ago is today's, passed (the
+/// notice sat unread across it); older, it is tomorrow's. A session limit resets within its
+/// five-hour window, so tomorrow's is right only once today's is 19 hours gone (24 − 5): `3am`
+/// read at 3:30pm is 12.5 hours passed, not 11.5 ahead.
 const SAME_DAY: i64 = 19 * 3600;
 
 /// The furthest ahead a session limit's bare clock time can be, in real
@@ -209,23 +208,19 @@ impl ResetClock {
     }
 }
 
-/// Whether the notice says Claude Code goes on by itself — `continuing
-/// automatically at …` / `continuing shortly` — so that the worker read
-/// BUSY after it is the continuation, and the episode is over then, the
-/// notice row on the screen or not. A notice naming a reset (`resets Sep 19
-/// at 11am`) says no such thing: a busy spell after it is someone's turn
-/// (the manager's retry, a human's, the continuation), which may hit the wall
-/// again, and the episode ends when the worker answers on a point that is
-/// not the notice.
+/// Whether the notice says Claude Code goes on by itself (`continuing automatically at …`,
+/// `continuing shortly`), so the worker read busy after it is the continuation and the episode
+/// is over, notice row on screen or not. A notice naming a reset (`resets Sep 19 at 11am`) says
+/// no such thing: a busy spell after it is someone's turn, which may hit the wall again, and
+/// the episode ends when the worker answers on a point that is not the notice.
 pub fn resumes_by_itself(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains(aterm_phase::anchor("wall.auto_continue"))
         || lower.contains("continuing shortly")
         // The moment the vendor fires it (2.1.284).
         || lower.replace('\u{2219}', "\u{b7}").contains("available again \u{b7} continuing now")
-        // The /goal echo of a wall whose auto-continue is
-        // armed (`Goal paused · usage limit reached · continues
-        // automatically when it resets`).
+        // The /goal echo of a wall whose auto-continue is armed (`Goal paused · usage limit
+        // reached · continues automatically when it resets`).
         || lower.contains(&aterm_phase::anchor("wall.goal_auto").to_ascii_lowercase())
 }
 
@@ -309,15 +304,11 @@ fn month_of(word: &str) -> Option<u32> {
         .map(|i| u32::try_from(i + 1).unwrap_or(1))
 }
 
-/// The reset as Unix seconds, from the spec and `now`: a span is added to
-/// `now`; a clock time is placed in its zone (`zone_offset(zone)` seconds
-/// east of UTC, `local_offset_s` when the notice named none or the machine
-/// does not know it) on the date named, in whichever of last year, this
-/// year and next puts it nearest `now` (`Jan 2` said on Dec 30 is three
-/// days ahead, `Dec 31` read on Jan 2 two days behind — never a year off
-/// either way), and with no date, today, or tomorrow when today's is more
-/// than [`SAME_DAY`] gone. A time in the past is returned as it is: the
-/// limit reset while the notice sat, and the continuation goes at once.
+/// The reset as Unix seconds, placed by [`reset_in_zone`]'s rule for a session limit with one
+/// offset: `zone_offset(zone)` seconds east of UTC, or `local_offset_s` when the notice named no
+/// zone or the machine does not know it. A dated time takes the year that puts it nearest `now`
+/// (`Jan 2` said on Dec 30 is three days ahead); a time in the past is returned as is (the limit
+/// reset while the notice sat, and the continuation goes at once).
 pub fn reset_at(
     spec: &ResetSpec,
     now: i64,
@@ -327,13 +318,10 @@ pub fn reset_at(
     reset_at_with(spec, now, local_offset_s, &|zone, _| zone_offset(zone))
 }
 
-/// [`reset_at`] with the zone's offset read AT the instant a reset is placed
-/// for (`zone_offset_at(zone, unix)`, [`zone_offset_at`] in production): each
-/// candidate day takes the offset its zone has THAT day, so a reset that falls
-/// across a daylight-saving change lands where the zone's clock shows it. Read
-/// on Oct 30 at 12:00 PDT, `Nov 2 at 9am (America/Los_Angeles)` is 17:00Z, PST,
-/// where [`reset_at`] says 16:00Z. A zone the reader does not know, or none
-/// named, is the local zone at `local_offset_s`.
+/// [`reset_at`] with the zone's offset read at the instant placed (`zone_offset_at(zone,
+/// unix)`, [`zone_offset_at`] in production), so a reset across a daylight-saving change lands
+/// where the zone's clock shows it: read on Oct 30 at 12:00 PDT, `Nov 2 at 9am
+/// (America/Los_Angeles)` is 17:00Z (PST), where [`reset_at`] says 16:00Z.
 pub fn reset_at_with(
     spec: &ResetSpec,
     now: i64,
@@ -390,7 +378,7 @@ pub fn reset_in_zone(
     let now_offset = offset_at(now)?;
     let (y, m, d) = civil((now + now_offset).div_euclid(86_400));
     // The instant the zone's clock reads `clock` on civil day `day`: placed
-    // with the offset at a first guess, then with the offset THERE.
+    // with the offset at a first guess, then with the offset there.
     let place = |day: i64| -> Option<i64> {
         let local = day * 86_400 + clock;
         Some(local - offset_at(local - now_offset)?)
@@ -422,32 +410,23 @@ pub fn reset_in_zone(
     }
 }
 
-/// How long before the loop's first look at a wall it may
-/// have been drawn, for a wall the loop saw ARRIVE (the turn it watched
-/// ended on it) and whose done row says no more. A minute, the resolution of
-/// the done row's own clock and the loop's lag to a wall it watches arrive
-/// (ten minutes put a weekly wall printed in
-/// the ten minutes after the clock it names — the reset really a day off — in
-/// the past).
+/// How long before the loop's first look a wall it saw arrive (the watched turn ended on it),
+/// whose done row says no more, may have been drawn: a minute, the done row clock's resolution
+/// and the loop's lag. A longer lag would put a weekly wall printed just after the clock it
+/// names (its reset a day off) in the past.
 pub const PRINT_LAG_S: i64 = 60;
 
-/// A clock that passed this long BEFORE the print is read as
-/// passed, not as tomorrow's: the vendor does not print a reset already gone,
-/// but the machine's clock and the server's are not the same clock, and a
-/// wrong "tomorrow" is a day's stall where a wrong "passed" is one rejected
-/// try (the wall answers and the notice printed again is placed on the
-/// loop's own watching). Five minutes, and the done row's minute.
+/// A clock that passed this long before the print is read as passed, not tomorrow's. The
+/// vendor does not print a reset already gone, but the machine's and the server's clocks
+/// differ, and a wrong "tomorrow" is a day's stall where a wrong "passed" is one rejected try.
+/// Five minutes, plus the done row's minute.
 pub const CLOCK_SLACK_S: i64 = 6 * 60;
 
-/// A RESET NOTHING DATED, kept within a session window: a bare clock time
-/// placed at `at` more than [`SESSION_AHEAD_MAX`] after `now` is the day
-/// before's, PASSED; anything else is `at`. For a limit a cancel left that
-/// only the screen read as a turn's answer (`Session::wall_reset_at`): a
-/// conversation `/resume`d meanwhile ends on its own older cancelled limit,
-/// which draws the same, and its clock already past, placed on the print of
-/// the act it was taken to answer, is tomorrow's — a day's wait on a
-/// session that may be free, where a wrong "passed" costs one try the limit
-/// answers with a notice the loop places as it arrives.
+/// A bare clock time kept within a session window: placed at `at` more than
+/// [`SESSION_AHEAD_MAX`] after `now`, it is the day before's, passed; anything else is `at`.
+/// Used for a cancelled limit read as a turn's answer (`Session::wall_reset_at`): a `/resume`d
+/// conversation's older cancelled limit draws the same, and read as tomorrow's it would cost a
+/// day's wait; a wrong "passed" costs one try.
 #[must_use]
 pub fn within_a_session_window(spec: &ResetSpec, at: i64, now: i64) -> i64 {
     if matches!(spec, ResetSpec::At { date: None, .. })
@@ -459,21 +438,19 @@ pub fn within_a_session_window(spec: &ResetSpec, at: i64, now: i64) -> i64 {
     }
 }
 
-/// Whether a wall's notice names a SESSION window (`session limit`,
-/// `5-hour limit`): five hours at most, so the session rule places its bare
-/// clock. A `Usage limit reached · …` that names no window may be a weekly one.
+/// Whether a wall's notice names a session window (`session limit`, `5-hour limit`), so the
+/// session rule places its bare clock. A `Usage limit reached · …` that names no window may be
+/// a weekly one.
 #[must_use]
 pub fn names_a_session_window(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("session limit") || lower.contains("5-hour")
 }
 
-/// When the wall on `rows` was printed, as far as the screen and the loop's
-/// watching say — less [`CLOCK_SLACK_S`] — for [`place_reset`]: the done row's
-/// clock (`done 7:58 PM`, Claude Code's own stamp of when the turn ended, on a
-/// wall when it ended on one), its last occurrence within a day, at the start
-/// of its minute; else, for a wall the loop saw ARRIVE (`live`),
-/// [`PRINT_LAG_S`] ago; else `None` — no evidence, the session rule places it.
+/// When the wall on `rows` was printed, less [`CLOCK_SLACK_S`], for [`place_reset`]: the done
+/// row's clock (`done 7:58 PM`, Claude Code's stamp of when the turn ended), its last
+/// occurrence within a day, at the start of its minute; else, for a wall the loop saw arrive
+/// (`live`), [`PRINT_LAG_S`] ago; else `None`, and the session rule places it.
 #[must_use]
 pub fn printed_by_the_screen(
     rows: &[String],
@@ -499,35 +476,21 @@ pub fn done_row_ended(rows: &[String], now: i64, local_offset_s: i64) -> Option<
         .filter(|d| *d <= now)
 }
 
-/// Where a WALL's reset falls, by the wall's kind: `harness limits` says it by
-/// the zone's offset today, the loop's wait by the offset at the instant placed
-/// ([`place_reset_with`]) — the same answer unless a daylight-saving change
-/// falls between.
+/// Where a wall's reset falls. `harness limits` places it by the zone's offset today, the
+/// loop's wait by the offset at the instant placed ([`place_reset_with`]).
 ///
-/// A session window resets within five hours, so a bare clock time on one is
-/// [`reset_at`]'s. Every other wall's bare clock time is the vendor's own
-/// doing: its formatter prints one only for a reset within 24 hours of the
-/// print and the date beyond that (`nu(resetsAt, …)` in the 2.1.283/284
-/// binary), so the reset is the FIRST OCCURRENCE OF THAT CLOCK STRICTLY AFTER
-/// THE PRINT (`printed`, unix seconds: when the notice was drawn, as far as
-/// anything on the screen or in the loop's own watching says). With NO
-/// evidence of the print (`None`: a wall found sitting, no done row drawn) the
-/// session rule stands — [`reset_at`]'s — which is right whenever the next
-/// occurrence is under five hours off and, when it is not, at worst one
-/// blind try early: the wall answers it (printed again after a turn, or
-/// standing with the line held and no turn run), and that is a print the loop
-/// sees ([`Session::wall_reset_at`]). A span (`in 3h`) and a
-/// dated time are placed as [`reset_at`] places them. A time in the past is
-/// returned as it is: the wall lifted and the continuation goes at once.
+/// Claude Code prints a bare clock time only for a reset within 24 hours of the print and the
+/// date beyond that (2.1.283/284), so a bare clock time is the first occurrence of that clock
+/// strictly after the print (`printed`, Unix seconds). With no evidence of the print (`None`:
+/// a wall found sitting, no done row) the session rule stands ([`reset_at`]): right whenever
+/// the next occurrence is under five hours off, else at worst one blind try early, which the
+/// wall answers with a print the loop sees (`Session::wall_reset_at`). A span and a dated
+/// time are placed as [`reset_at`] places them; a time in the past is returned as is.
 ///
-/// A SESSION window (`session_window`: the notice names one) is placed by the
-/// print too (a fresh loop that found a
-/// stale session wall — `done 9:22 PM`, `resets 9:50pm` — at 08:00 waited
-/// 13.8 hours for the five-hour rule's tonight, where the print says 10.2
-/// hours ago and the continuation goes at once) — but only where the clock
-/// falls within [`SESSION_AHEAD_MAX`] of it, which a session window's must.
-/// A clock further off than that contradicts the notice's own window (a
-/// stale row, a misread), and the session rule places it as it always did.
+/// A session window (`session_window`) is placed by the print too, so a stale session wall
+/// found sitting reads as passed rather than tonight's, but only where the clock falls within
+/// [`SESSION_AHEAD_MAX`] of it; a clock further off contradicts the window (a stale row, a
+/// misread) and the session rule places it.
 pub fn place_reset(
     spec: &ResetSpec,
     session_window: bool,
@@ -595,10 +558,9 @@ pub fn unix_now_ms() -> i64 {
     aterm_time::unix_millis().map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX))
 }
 
-/// The local time's offset from UTC in seconds, from `date +%z` (the one
-/// place a zone is read; UTC when it cannot be run). Through `aterm_uds::spawnfd::command`:
-/// on Windows a `date` on `PATH` (Git for Windows, MSYS) is a console image, and
-/// from the window's harness host, which has no console, it would flash one.
+/// The local time's offset from UTC in seconds, from `date +%z` (UTC when it cannot be run).
+/// Through `aterm_uds::spawnfd::command`: on Windows a `date` on `PATH` (Git for Windows, MSYS)
+/// is a console image, which would flash a console from the window's harness host.
 pub fn tz_offset_s() -> i64 {
     let mut cmd = aterm_uds::spawnfd::command("date");
     cmd.arg("+%z");
@@ -872,12 +834,9 @@ mod tests {
         }
     }
 
-    /// The auto-continue notice's two shapes: the time after `continuing
-    /// automatically at ` (as handed over, `1:50pm`, and as the phrase) is a
-    /// bare clock time, today's when ahead or just passed, tomorrow's once
-    /// today's is long gone, am and pm alike; `continuing shortly` (and
-    /// `shortly`) is a minute from now. The predicate telling such a notice
-    /// from one naming a reset reads the words, not the time.
+    /// The auto-continue notice: its time (handed over as `1:50pm`, or the phrase) is a bare
+    /// clock time, and `continuing shortly` (or `shortly`) a minute from now. Whether a notice
+    /// resumes by itself is read from its words, not its time.
     #[test]
     fn the_auto_continue_shapes_are_a_time_today_or_tomorrow_or_a_minute() {
         let one_fifty = ResetSpec::At {
@@ -928,8 +887,7 @@ mod tests {
         // NOW is 08:55 local: 1:50pm is ahead today, 4 h 55 min.
         assert_eq!(at("1:50pm") - NOW, (4 * 60 + 55) * 60);
         assert_eq!(at("continuing automatically at 1:50pm"), at("1:50pm"));
-        // Read at 13:50:18 — as the live notice was, the time it named 18 s
-        // gone — it is today's, passed: the continuation goes at once.
+        // Read 18 s after 1:50pm it is today's, passed: the continuation goes at once.
         let read_at = NOW + (4 * 60 + 55) * 60 + 18;
         assert_eq!(read_at - reset_at(&one_fifty, read_at, PDT, zones), 18);
         // `3am` read at 23:00 is tomorrow's, four hours ahead; `11:05 am` read
@@ -1014,8 +972,8 @@ mod tests {
         assert_eq!(at("in 3h"), NOW + 3 * 3600);
     }
 
-    /// A clock time with no date: today's when ahead, or passed less than
-    /// 12 hours ago; else tomorrow's — and midnight is `12am`.
+    /// A clock time with no date: today's when ahead or passed at most 19 hours ago
+    /// ([`SAME_DAY`]), else tomorrow's; midnight is `12am`.
     #[test]
     fn a_bare_time_is_todays_or_tomorrows_and_midnight_is_12am() {
         // NOW is 08:55 local. 7:30pm is ahead today.
@@ -1030,10 +988,9 @@ mod tests {
         assert_eq!(NOW - at("12am"), (8 * 60 + 55) * 60);
         // 12pm is noon, ahead.
         assert_eq!(at("12pm") - NOW, (3 * 60 + 5) * 60);
-        // A session limit names a time at most five hours ahead: `3am` read
-        // at 15:30 (a watcher started onto a stale screen) is twelve and a
-        // half hours passed — the continuation goes now — not eleven and a half
-        // ahead; read at 23:00 it is tomorrow's, four hours ahead.
+        // A session limit names a time at most five hours ahead: `3am` read at 15:30 (a watcher
+        // started onto a stale screen) is 12.5 hours passed, not 11.5 ahead; read at 23:00 it
+        // is tomorrow's, four hours ahead.
         let half_past_three = NOW + (6 * 60 + 35) * 60; // 15:30 local
         let t = reset_at(&parse_reset("3am").unwrap(), half_past_three, PDT, zones);
         assert_eq!(half_past_three - t, (12 * 60 + 30) * 60);
@@ -1082,7 +1039,7 @@ mod tests {
             reset_in_zone(&three, fall, SESSION_AHEAD_MAX, &la_at),
             Some(1_793_530_800)
         );
-        // A DATED reset on the far side of the jump, too.
+        // A dated reset on the far side of the jump, too.
         let dated = parse_reset("Mar 8 at 9am (America/Los_Angeles)").unwrap();
         assert_eq!(
             reset_in_zone(&dated, spring, SESSION_AHEAD_MAX, &la_at),
@@ -1128,11 +1085,9 @@ mod tests {
         assert!(offset_at(None, 0).is_some(), "the local clock's own");
     }
 
-    /// A DATED RESET IS PLACED WITH THE OFFSET ITS ZONE HAS WHERE IT FALLS, not
-    /// today's: read on 2026-10-30 12:00 PDT, `Nov 2 at 9am` is PST, 17:00Z,
-    /// where one offset for the whole of it says 16:00Z and the loop types an
-    /// hour early; read on 2026-03-06 12:00 PST, `Mar 9 at 9am` is PDT,
-    /// 16:00Z, not 17:00Z.
+    /// A dated reset is placed with the offset its zone has where it falls: read on 2026-10-30
+    /// 12:00 PDT, `Nov 2 at 9am` is PST, 17:00Z, not 16:00Z; read on 2026-03-06 12:00 PST,
+    /// `Mar 9 at 9am` is PDT, 16:00Z, not 17:00Z.
     #[test]
     fn a_dated_reset_across_a_dst_change_is_placed_with_the_offset_there() {
         let la = |text: &str, now: i64| {
@@ -1183,15 +1138,12 @@ mod tests {
             assert_eq!(zone_offset_at("../etc/passwd", unix), None);
         }
     }
-    /// EXHAUSTIVELY: with the
-    /// print known, a wall's bare clock time is the first occurrence of that
-    /// clock STRICTLY AFTER it — checked against a brute-force scan, minute by
-    /// minute, for every print over two days and every clock at the hour and
-    /// half hour — and a session window's is [`reset_at`]'s whatever the
-    /// print. With NO print the session rule stands, so a wall found sitting
-    /// is never placed worse than before. NEGATIVE CONTROL: [`reset_at`]
-    /// itself disagrees with the scan wherever the next occurrence is five
-    /// hours or more off (it says "today's, passed").
+    /// With the print known, a wall's bare clock time is the first occurrence of that clock
+    /// strictly after it, checked against a brute-force scan for every print over two days and
+    /// every clock on the hour and half hour; a session window's is too while within
+    /// [`SESSION_AHEAD_MAX`] of the print, else [`reset_at`]'s. With no print the session rule
+    /// stands. Control: [`reset_at`] disagrees with the scan wherever the next occurrence is
+    /// five hours or more off.
     #[test]
     fn a_walls_bare_clock_is_the_first_occurrence_after_its_print() {
         fn zone(_: &str) -> Option<i64> {
@@ -1200,14 +1152,9 @@ mod tests {
         let local = -7 * 3600;
         // 2026-09-17 00:00 PDT.
         let day0 = 1_789_628_400_i64;
-        // The oracle walks the clock forward from the print, a SECOND at a time
-        // up to the first whole local minute and a MINUTE at a time from there:
-        // every clock swept here is on the minute, and so is every instant whose
-        // local time of day equals one (86,400 is a whole number of minutes), so
-        // the seconds skipped can never match and the first match is the one a
-        // walk of every second finds. The second-by-second walk (~43,000 steps
-        // for each of ~40,000 scans) was all of this test's 4.0 s alone (~40 s
-        // on a loaded machine); by the minute it is 0.09 s.
+        // The oracle walks forward from the print a second at a time up to the first whole
+        // local minute, then a minute at a time: every clock swept is on the minute, and so is
+        // every instant whose local time of day equals one, so the skipped seconds never match.
         let scan = |clock_s: i64, printed: i64| -> i64 {
             assert_eq!(clock_s % 60, 0, "a clock on the minute");
             let mut t = printed + 1;
@@ -1243,10 +1190,8 @@ mod tests {
                         got, want,
                         "print {printed_min} min, clock {hour}:{minute:02}"
                     );
-                    // A session window: placed by the print where the clock is
-                    // within five hours of it (a stale wall found after a
-                    // night), else by the five-hour rule (a clock the window
-                    // cannot reach contradicts the notice).
+                    // A session window: placed by the print where the clock is within five
+                    // hours of it, else by the five-hour rule.
                     let printed_earlier = printed - 999;
                     let want_earlier = scan(clock_s, printed_earlier);
                     let expect = if want_earlier - printed_earlier <= SESSION_AHEAD_MAX {

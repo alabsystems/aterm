@@ -313,12 +313,14 @@ fn paint(
     text: &str,
 ) -> crate::native_ui::PaintNode {
     crate::native_ui::PaintNode {
+        cut_edges: crate::native_ui::CutEdges::NONE,
         key: crate::native_ui::UiKey::new(key),
         rect,
         clip: rect,
         content: crate::native_ui::UiContent::Text(crate::native_ui::TextSpec::text(text)),
         peek: false,
         fade: None,
+        joins: crate::native_ui::Joins::default(),
     }
 }
 

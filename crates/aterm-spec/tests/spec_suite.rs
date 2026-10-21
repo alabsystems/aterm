@@ -8,12 +8,8 @@
 //! Each file keeps its path and its own `#[test]`s; a test is named
 //! `<file>::<test>` here.
 //!
-//! Sharing a process was checked, not assumed: no file below sets or removes an
-//! environment variable, installs a hook or an allocator, or re-executes
-//! itself.
-//!
-//! `autotests = false`: a `tests/*.rs` file that is neither a `mod` line here
-//! nor a `[[test]]` of its own NEVER COMPILES. Run one file's tests with
+//! `autotests = false`: a `tests/*.rs` file that is neither a `mod` here nor a `[[test]]` never
+//! compiles. One file's tests:
 //! `targo --unverified test -p aterm-spec --test spec_suite -- <file>::`.
 
 mod macro_ty_model;

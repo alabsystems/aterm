@@ -28,24 +28,19 @@ use aterm_render::{FaceId, Renderer, Theme};
 // the Windows font seal is allowed to keep.
 // ---------------------------------------------------------------------------
 
-/// What the seal may LEAVE BEHIND on the heap. It was **55,086 kB** while the
-/// seal read the eleven files of `docs/measured/win-heap-2026-08-29.md` §2 into
-/// the heap (the files to within 0.01%, and nothing else). Since
-/// `font_file::admit_font_file` MAPS a file under `C:\Windows\Fonts`
-/// (`MAPPABLE_FONT_ROOTS`), what is left is the faces' bookkeeping, not their
-/// bytes: 814 kB, measured 2026-09-29 on the development tree whose mapping arm
-/// main ported (not re-measured on main). The cap sits where any of the big
-/// faces coming back as a heap copy (`msyh.ttc` 19.7 MB, `malgun.ttf` 13.5 MB,
-/// `seguiemj.ttf` 12.5 MB, `Nirmala.ttc` 5.3 MB), or an EAGER fontdue parse of
-/// any chain face, blows straight through it; the residency assertion catches
-/// the small ones.
+/// What the seal may leave behind on the heap. Since
+/// `font_file::admit_font_file` maps files under `C:\Windows\Fonts`
+/// (`MAPPABLE_FONT_ROOTS`), what is left is the faces' bookkeeping (~814 kB),
+/// not their bytes (~55 MB across the eleven system faces). The cap sits where
+/// any of the big faces coming back as a heap copy (`msyh.ttc` 19.7 MB,
+/// `malgun.ttf` 13.5 MB, `seguiemj.ttf` 12.5 MB, `Nirmala.ttc` 5.3 MB), or an
+/// eager fontdue parse of any chain face, blows straight through it; the
+/// residency assertion catches the small ones.
 const MAX_SEAL_LIVE_KB: i64 = 4 * 1024;
 
-/// What the seal may allocate TRANSIENTLY over what it keeps. It was **2 kB**
-/// when the faces were read straight into the discovery store, and **5,063 kB**
-/// before `intern_discovered_font_bytes` took the reader's handle, so this bound
-/// still catches a return to a copying intern on any face that is read rather
-/// than mapped.
+/// What the seal may allocate transiently over what it keeps (~2 kB when
+/// `intern_discovered_font_bytes` takes the reader's handle directly, vs
+/// ~5,063 kB with a copying intern).
 const MAX_SEAL_TRANSIENT_KB: i64 = 4 * 1024;
 
 /// The Windows font seal MAPS its system faces and keeps no heap copy of them.

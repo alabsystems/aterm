@@ -4,28 +4,20 @@
 //! Tier-1 conformance of the typed re-key (`shell_rekey::typed`) to
 //! `aterm_models_gui::typed_rekey_model` (`TypedRekey`).
 //!
-//! Every schedule of the model is replayed on the SHIPPING code: a real engine
-//! (lost nonce, or a working one), the real `typed::issue_in` writing a real
-//! file in a scratch control dir — or, for `Upgrade` (2026-09-26), the real
-//! `typed::issue_upgrading_in` for a working tab whose shell predates loaders —
-//! the shell's typed line (read the file's first line into the key the shell
-//! signs with, remove it — what `aterm_shell_integration::typed_rekey` runs,
-//! and the older sweeps' key-only line too), and the real
-//! `typed::settle_issued`. Each step is projected onto the model and checked as
-//! a transition the committed model admits (interpreter, and `ty` wherever
-//! installed); a step the real code REFUSES (a healthy tab's issue) must be
-//! one the model's guard refuses too.
+//! Each schedule replays on the shipping code: a real engine (lost nonce or working), the
+//! real `typed::issue_in` / `typed::issue_upgrading_in` writing a file in a scratch control
+//! dir, the shell's typed line (take the first line as the key, remove the file), and the real
+//! `typed::settle_issued`. Each step must be a transition the model admits (interpreter, and
+//! `ty` where installed); a step the code refuses (a healthy tab's issue) must be one the
+//! model's guard refuses.
 //!
-//! `eng` — which key the engine verifies — is read by signing a mark with each
-//! key and watching the drop counter. A verified mark ends a pending key's way
-//! back, so the read is the LAST thing done to a replay: every projection
-//! replays its prefix afresh.
+//! `eng` (which key the engine verifies) is read by signing a mark with each key and watching
+//! the drop counter. A verified mark ends a pending key's way back, so that read is the last
+//! thing done to a replay and every projection replays its prefix afresh.
 //!
-//! NEGATIVE CONTROL: the same real steps against `Buggy = 1` — the re-key
-//! channel's semantics on a hookless shell, posture-blind, and an upgrade whose
-//! first line is empty — must be rejected (the settle that takes an unread key
-//! back, file and all; the upgrade that writes the shell's own key) and must
-//! disagree with the real refusal of a healthy tab.
+//! Negative control: `Buggy = 1` (posture-blind, an upgrade's first line empty) must reject
+//! the real take-back settle and the real upgrade, and disagree with the real refusal of a
+//! healthy tab.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -94,7 +86,7 @@ impl Replay {
                 }
                 Err(_) => false,
             },
-            // The typed UPGRADE of a shell from before loaders.
+            // The typed upgrade of a shell from before loaders.
             "Upgrade" => {
                 let up = typed::Upgrade {
                     folder: dir.join("shell-integration").join("0123456789abcdef"),
@@ -186,8 +178,7 @@ const SCHEDULES: &[&[&str]] = &[
     &["Keep", "Upgrade", "Settle", "Read"],
 ];
 
-/// The key a one-use file's FIRST line holds — what every typed line reads as
-/// the shell's key — or `None` for an empty (or unreadable) line.
+/// The key a one-use file's first line holds, or `None` for an empty line.
 fn first_key(path: &std::path::Path) -> Option<[u8; 32]> {
     let text = std::fs::read_to_string(path).expect("the key file");
     ShellIntegrationNonce::from_hex(text.lines().next().unwrap_or("")).map(|k| k.0)
@@ -219,10 +210,8 @@ fn replay(model: &Model, schedule: &[&str], tag: &str) -> Vec<(String, bool)> {
     verdicts
 }
 
-/// The shipping typed re-key refines `TypedRekey` on every schedule: the heal
-/// (the shell reads the key; the settle keeps it; shell and engine agree), the
-/// take-back (settled before the line: the file removed, the lost nonce
-/// restored, the late line finding nothing), and the healthy tab refused.
+/// The shipping typed re-key refines `TypedRekey` on every schedule: the heal, the take-back
+/// (settled before the line ran), and the healthy tab refused.
 #[test]
 fn the_real_typed_rekey_conforms_to_the_model() {
     let model = typed_rekey_model();
@@ -253,9 +242,8 @@ fn the_real_typed_rekey_conforms_to_the_model() {
     }
 }
 
-/// NEGATIVE CONTROL: `Buggy = 1` rejects the real settle that takes an unread
-/// key back, and its posture-blind `Issue` disagrees with the real refusal of a
-/// healthy tab — so the conformance above cannot pass vacuously.
+/// Negative control: `Buggy = 1` rejects the real take-back settle, and its posture-blind
+/// `Issue` disagrees with the real refusal of a healthy tab.
 #[test]
 fn the_no_way_back_design_rejects_the_real_steps() {
     let buggy = interp::with_buggy(&typed_rekey_model(), 1);
@@ -273,8 +261,7 @@ fn the_no_way_back_design_rejects_the_real_steps() {
             .any(|(l, ok)| l.ends_with("step Issue") && !ok),
         "{healthy:?}"
     );
-    // The upgrade whose first line is empty: the real one writes the shell's own
-    // key, and the step is rejected there.
+    // Buggy's upgrade leaves the first line empty; the real one writes the shell's own key.
     let upgrade = replay(&buggy, &["Keep", "Upgrade", "Read"], "buggy-upgrade");
     assert!(
         upgrade

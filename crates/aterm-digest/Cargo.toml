@@ -7,16 +7,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's SHA-256 (astream-digest's, re-exported) and its HMAC-SHA256 and constant-time compare (replaces sha2 and hmac)"
+description = "aterm's name for astream-digest's SHA-256, HMAC-SHA256, HKDF-SHA256 and constant-time compare, re-exported (replaces sha2 and hmac)"
 
 [dependencies]
-# ONE SHA-256. astream-digest is the hash under astream-cap's capability tags and
-# producer ids, astream-aead's handshake and astream-evidence's output pins: zero
-# dependencies, forbid(unsafe), its streaming buffer's L0 obligations discharged as
-# a Clean island. It began as this crate's own sha256.rs (the same author, ported
-# with its tests), and aterm kept a second copy of the same 320 lines, which nothing
-# held to the first. Re-exporting it makes `aterm_digest::Sha256` the very type
-# aterm-link's grants are already hashed with, so a fix or a proof lands once.
+# ONE HASH, ONE MAC. astream-digest is the SHA-256, the HMAC-SHA256, the
+# HKDF-SHA256 and the constant-time compare under astream-cap's capability tags
+# and producer ids, astream-aead's handshake and astream-evidence's output pins:
+# zero dependencies, forbid(unsafe), its streaming buffer's L0 obligations
+# discharged as a Clean island. It began as this crate's own sha256.rs and
+# hmac_sha256.rs (the same author, ported with their tests), and aterm kept
+# second copies of both, which nothing held to the first; and aterm-net kept a
+# third HKDF over them. Re-exporting makes `aterm_digest::Sha256` and
+# `aterm_digest::HmacSha256` the very types aterm-link's grants are already
+# tagged and hashed with, so a fix or a proof lands once.
 #
 # Still no third-party code: `sha2` + `hmac` pulled in 8 packages (49,474 lines)
 # for four methods; `cargo forge survey --cell mac-arm` measured 161 -> 153

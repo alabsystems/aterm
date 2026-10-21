@@ -1,24 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The walk's continuity census: the typed band's colour is smooth and
-//! continuous. A cell's colour at a column is `Cohort::t_at(col) = walk_zero() +
-//! walk_t(walk_d(col))`; along one input neighbouring lit cells step by exactly
-//! one walk step (`1/16` over the walk's first sixteen cells, `WALK_LAY_RATE`
-//! after), and a wrap carries both colour and distance. The designed restarts
-//! (a new line via Return, a line kill, a cross-row keyed Nav keep the colour
-//! and restart the pace) never put two lit cells of one line side by side, so
-//! per presented frame ([`walk_census::Snap::judge`]):
+//! The walk's continuity census: the typed band's colour is smooth and continuous. A cell's
+//! colour is `Cohort::t_at(col) = walk_zero() + walk_t(walk_d(col))`; along one input,
+//! neighbouring lit cells step by exactly one walk step (`1/16` over the walk's first sixteen
+//! cells, `WALK_LAY_RATE` after), and a wrap carries both colour and distance. The designed
+//! restarts (Return, a line kill, a cross-row keyed Nav: colour kept, pace restarted) never put
+//! two lit cells of one line side by side. So per presented frame ([`walk_census::Snap::judge`]):
 //!
-//! * every pair of text-adjacent lit cells steps forward by one walk step,
-//!   never back (`Back`), never the same stop twice (`Repeat`), never more than
-//!   one step or any other step (`Jump`);
-//! * a `1/16` step never follows a `1/36` one to its left (`Restart`), and a
-//!   line's first sixteen cells step `1/16` (`NoFastLeg`);
+//! * every pair of text-adjacent lit cells steps forward by one walk step, never back
+//!   (`Back`), never the same stop twice (`Repeat`), never more than one step or any other
+//!   step (`Jump`);
+//! * a `1/16` step never follows a `1/36` one to its left (`Restart`), and a line's first
+//!   sixteen cells step `1/16` (`NoFastLeg`);
 //! * no text cell between two lit ones is dark (`Hole`);
 //!
-//! and across frames ([`walk_census::recolours`]): no text cell is lit again in
-//! another colour while the text up to it stayed the same.
+//! and across frames ([`walk_census::recolours`]) no text cell is lit again in another colour
+//! while the text up to it stayed the same.
 //!
 //! A flag standing [`STANDING_FRAMES`] frames or more is a defect; fewer, a
 //! transient. The host is the GUI's frame seam (`tests/claude_wrap_band.rs`'s

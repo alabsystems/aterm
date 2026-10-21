@@ -37,8 +37,9 @@
 //! the session key (it completed the DH). App data flows only after M4 verifies.
 //!
 //! We own the protocol, the framing, the transcript, and (via Rung 7) the
-//! HKDF/HMAC and X25519 glue; the only delegated primitive here is the raw
-//! Ed25519 sign/verify, to the vetted `ed25519-dalek`.
+//! X25519 glue and the key schedule over astream-digest's HKDF/HMAC; the only
+//! delegated primitive here is the raw Ed25519 sign/verify, to the vetted
+//! `ed25519-dalek`.
 
 use crate::handshake::{
     ephemeral, hkdf_sha256_32, read_hs_msg, transcript as record_binding, write_hs_msg,

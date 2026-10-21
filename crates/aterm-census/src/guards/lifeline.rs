@@ -6,9 +6,9 @@
 //! bench or dev tool starts holds a lifeline.
 //!
 //! An instance only its launcher's `Drop` ends outlives a launcher that is
-//! SIGKILLed or timed out. The launch hands the instance
-//! the far end of a FIFO the launcher holds (`--lifeline-fd`,
-//! `aterm_uds::lifeline`), and the instance quits when the launcher goes.
+//! SIGKILLed or timed out. The launch hands the instance the far end of a FIFO
+//! the launcher holds (`--lifeline-fd`, `aterm_uds::lifeline`), and the
+//! instance quits when the launcher goes.
 //!
 //! Lexically, per file:
 //! * a Rust launch is an `.arg(…)`/`.args([…])` naming `"--headless"`, or an
@@ -25,9 +25,9 @@
 //! * a Python launch is a `"--headless"` list element; it is armed when the
 //!   three lines on either side of it name the lifeline.
 //!
-//! Either is waived by a `NO LIFELINE …: <reason>` comment on its line or in
-//! the eight above (an instance meant to outlive its launcher, a stand-in that
-//! is no aterm). A launch spelled another way (the flag in a variable, a
+//! Any launch is waived by a `NO LIFELINE …: <reason>` comment on its line or
+//! in the eight above (an instance meant to outlive its launcher, a stand-in
+//! that is no aterm). A launch spelled another way (the flag in a variable, a
 //! `format!`ed command line) is not seen.
 
 use super::{Finding, Rule, Script, SourceFile, Tree, is_word};

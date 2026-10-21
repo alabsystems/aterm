@@ -1,28 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The bounds, and the API contract the call sites rely on.
-//!
-//! Patterns reaching this engine are user input — a selection rule, an
-//! `await match <re>` argument, a search box — so "it compiles and matches" is
-//! only half the requirement. The other half is that no pattern, and no
-//! pattern-plus-haystack pair, can be made to eat unbounded memory, unbounded
-//! stack or unbounded time.
+//! The compile and scan bounds, and the API contract the call sites rely on. Patterns are
+//! user input, so no pattern or pattern-haystack pair may take unbounded memory, stack or
+//! time.
 
 use std::time::{Duration, Instant};
 
 use aterm_regex::{Error, Regex, RegexBuilder};
 
-/// The limits `aterm-observe` and `aterm-search` pass at their entry points.
-///
-/// 128 KiB, not the 1 MiB these call sites started with, and the reason is the
-/// *scan* rather than the compile. A Pike VM's search is linear in the haystack,
-/// but the constant of that linearity is the program size — so `size_limit` is
-/// the only thing bounding per-row match cost as well as compile cost. At 1 MiB
-/// a thirteen-byte pattern could compile to ~16k instructions and cost 37 ms on
-/// a single 4,096-column row; 128 KiB caps that at ~2,048 instructions and
-/// ~18 ms, refusing the amplifiers outright. See
-/// [`the_worst_program_under_the_ceiling_still_scans_a_row_promptly`].
+/// The limits `aterm-observe` and `aterm-search` pass. 128 KiB (~2,048 instructions)
+/// because the program size is also the per-row scan constant; it refuses the amplifiers
+/// outright (see [`the_worst_program_under_the_ceiling_still_scans_a_row_promptly`]).
 const SIZE_LIMIT: usize = 128 * 1024;
 const DFA_SIZE_LIMIT: usize = 1 << 20;
 /// The pattern-length ceiling both entry points enforce ahead of compilation.
@@ -41,10 +30,8 @@ fn bounded(pattern: &str) -> Result<Regex, Error> {
         .build()
 }
 
-/// `(a{200}){200}` — thirteen bytes of pattern, forty thousand instructions of
-/// automaton. `aterm-observe` has a test asserting this exact pattern compiles
-/// under the default limit and is rejected under its 128 KiB one, and that test
-/// has to keep passing after the migration.
+/// `(a{200}){200}`: thirteen bytes, forty thousand instructions. Compiles under the
+/// default limit and is refused at 128 KiB, as `aterm-observe`'s own test expects.
 #[test]
 fn the_amplifier_pattern_is_rejected_under_the_bounded_builder() {
     let amplifier = "(a{200}){200}";
@@ -77,24 +64,9 @@ fn a_pattern_at_the_length_ceiling_still_compiles() {
     assert!(!re.is_match("prefix alt00042y suffix"));
 }
 
-/// A counted repeat whose body emits *nothing* must collapse, not spin.
-///
-/// `size_limit` is charged per instruction emitted, so a body that emits no
-/// instructions replays `min` times without ever consulting the ceiling — and
-/// the ceiling is the only thing standing between the call sites and a
-/// user-supplied pattern. `(?:){4294967295}` is sixteen bytes, passes the
-/// 1024-byte length gate at every call site, and took **6.4 seconds** in
-/// release through this exact builder before the fix. Nested, the two counts multiply:
-/// `(?:(?:){4294967295}){4294967295}` is thirty-two bytes and 1.8e19 steps,
-/// which is not a slow compile but an unkillable hang — no allocation, no
-/// error, nothing for `CompiledTooBig` to fire on.
-///
-/// Both `{n}` and `{n,}` reach it, through five spellings. The fix is a fixed
-/// point rather than a new limit: a body that emitted nothing emits nothing
-/// every subsequent time, so the replay loop stops at the first no-op copy. The
-/// resulting program is *identical*, which is why every case here is also
-/// pinned — a collapse that changed the answer would be a worse bug than the
-/// hang.
+/// A counted repeat whose body emits nothing stops at its fixed point instead of replaying
+/// `min` times without charging the ceiling (`(?:(?:){4294967295}){4294967295}` would
+/// never finish). The collapse keeps the answer: an empty match at every boundary.
 #[test]
 fn an_empty_body_repeat_collapses_instead_of_spinning() {
     let started = Instant::now();
@@ -135,8 +107,8 @@ fn an_empty_body_repeat_collapses_instead_of_spinning() {
     );
 }
 
-/// The ceiling has to stop the compiler *while* it is emitting, not after: a
-/// pattern asking for four billion instructions must fail promptly.
+/// The ceiling stops the compiler while it emits: a pattern asking for four billion
+/// instructions fails promptly.
 #[test]
 fn an_unbounded_repetition_count_fails_fast_instead_of_allocating() {
     let started = Instant::now();
@@ -158,8 +130,7 @@ fn an_unbounded_repetition_count_fails_fast_instead_of_allocating() {
     );
 }
 
-/// Raising the limit raises what compiles, and lowering it lowers it — the knob
-/// is real, not decorative.
+/// The size limit decides what compiles, in both directions.
 #[test]
 fn the_size_limit_is_the_thing_that_decides() {
     let pattern = "(a{50}){50}"; // 2,500 instructions
@@ -179,10 +150,7 @@ fn the_size_limit_is_the_thing_that_decides() {
     );
 }
 
-/// `dfa_size_limit` is accepted, and — deliberately — changes
-/// nothing about what compiles. A Pike VM has no DFA to bound, and quietly
-/// repurposing the setting as a second cap on the program would reject patterns
-/// the caller expected to work.
+/// `dfa_size_limit` is accepted and changes nothing about what compiles.
 #[test]
 fn dfa_size_limit_is_accepted_and_inert() {
     let pattern = "(a{50}){50}";
@@ -191,9 +159,8 @@ fn dfa_size_limit_is_accepted_and_inert() {
     assert!(builder.dfa_size_limit(usize::MAX).build().is_ok());
 }
 
-/// Deep nesting must return an error, not overflow the stack. The parser is
-/// iterative, but the tree it builds is not, so the depth cap is what keeps
-/// even `Drop` bounded.
+/// Deep nesting is an error, not a stack overflow: the parser is iterative, but the tree
+/// and its `Drop` are not.
 #[test]
 fn deeply_nested_patterns_are_rejected_rather_than_overflowing() {
     for depth in [300usize, 5_000, 100_000] {
@@ -214,9 +181,8 @@ fn deeply_nested_patterns_are_rejected_rather_than_overflowing() {
     assert!(err.to_string().contains("nests more than"));
 }
 
-/// A deeply nested pattern must not overflow the stack even while being torn
-/// down — run it on a thread with a small stack so a recursive `Drop` would be
-/// caught rather than tolerated.
+/// Deep nesting is dropped without overflow on a 256 KiB stack, where a recursive `Drop`
+/// would fail.
 #[test]
 fn nesting_is_bounded_on_a_small_stack() {
     let handle = std::thread::Builder::new()
@@ -232,13 +198,7 @@ fn nesting_is_bounded_on_a_small_stack() {
     assert_eq!(handle.join().expect("no stack overflow"), "survived");
 }
 
-/// The linear-time property, which is the entire reason for the Pike VM.
-///
-/// `(a|a)*b` against a long run of `a`s is the textbook exponential blow-up: a
-/// backtracker explores `2^n` paths and never returns. Here the work is bounded
-/// by program size times input length, so it finishes in milliseconds — and the
-/// test asserts that it finishes, under [`HANG_DETECTOR`], rather than merely
-/// asserting the answer.
+/// No exponential blow-up: `(a|a)*b` and friends finish against long runs of `a`.
 #[test]
 fn pathological_patterns_finish_promptly() {
     for (pattern, n) in [
@@ -265,9 +225,7 @@ fn pathological_patterns_finish_promptly() {
     }
 }
 
-/// `a^n b^n`-shaped adversarial input: nested quantifiers over a long run that
-/// *does* eventually match. Still linear: an automaton that kept every path the
-/// nested quantifiers open never finishes, and [`HANG_DETECTOR`] names it.
+/// Nested quantifiers over a run that does eventually match are linear too.
 #[test]
 fn adversarial_matching_input_is_also_linear() {
     let re = Regex::new("(a+)+b+").expect("compiles");
@@ -352,40 +310,12 @@ fn offsets_are_byte_offsets_on_code_point_boundaries() {
     );
 }
 
-/// The compile ceiling has to bound the *scan*, because nothing else does.
-///
-/// `pathological_patterns_finish_promptly` proves there is no exponential
-/// blow-up, which is the guarantee a backtracking engine cannot give. It does
-/// not prove the scan is cheap: every pattern in it compiles to a handful of
-/// instructions, so it cannot see the cost that actually matters here. A Pike VM
-/// advances *every live thread* at every position, so a scan costs
-/// `O(|haystack| x program size)` — linear in the input, with the program as the
-/// constant — and `size_limit` is the only bound on that constant.
-///
-/// That is the whole reason the call sites dropped from 1 MiB to 128 KiB. Under
-/// 1 MiB, `(?:x?){2000}z` — thirteen bytes, inside every length gate in the
-/// tree — compiled to ~16k instructions and took 37 ms on one 4,096-column row
-/// and 28.5 s on a 3 MB scrollback, against 24 us and 74 us for `regex`.
-/// Under 128 KiB it does not compile at all.
-///
-/// The precise half of this test is the pair of **refusals**: those are
-/// deterministic, and they are what the 128 KiB ceiling actually buys. The
-/// timing half is a coarse backstop for the shapes the ceiling still admits —
-/// ~18 ms per row in release and ~0.7 s in an unoptimised test build on the m21
-/// box, bounded here by [`HANG_DETECTOR`] like the rest of this file, because a
-/// wall-clock assertion tight enough to be interesting is also tight enough to
-/// be flaky on a loaded machine. It catches a regression of orders of magnitude,
-/// which is the only kind that has ever mattered here.
-///
-/// What this test does **not** claim: that the scan is bounded in absolute
-/// terms. It is not. At ~18 ms per row an adversarial pattern still costs
-/// minutes over a 20,000-row scrollback — bounded and interruptible, since
-/// `BudgetedSearch` feeds rows in budgeted batches, but slow. Bounding that
-/// needs a step budget in the VM that the call sites opt into; see the crate
-/// docs, which say so rather than implying the ceiling is a complete answer.
+/// The 128 KiB ceiling bounds the per-row scan cost (program size × row length): it
+/// refuses the amplifiers outright, and the heaviest programs it admits still finish a
+/// full row. The step budget (`step_budget_tests` in `src/lib.rs`) bounds the rest.
 #[test]
 fn the_worst_program_under_the_ceiling_still_scans_a_row_promptly() {
-    // Refused outright: the two amplifiers that motivated the 128 KiB ceiling.
+    // Refused outright under 128 KiB.
     for pattern in ["(?:x?){2000}z", "(?:x|x|x|x|x|x|x|x){400}z"] {
         assert!(
             pattern.len() <= MAX_PATTERN_LEN,
@@ -397,7 +327,7 @@ fn the_worst_program_under_the_ceiling_still_scans_a_row_promptly() {
         );
     }
 
-    // Admitted, and therefore pinned: just under the ceiling, on a full row.
+    // Admitted: just under the ceiling, on a full row.
     let row = "x".repeat(4096);
     for pattern in ["(?:x?){1020}z", "(?:x|x|x|x|x|x|x|x){100}z"] {
         let Ok(re) = bounded(pattern) else { continue };

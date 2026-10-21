@@ -444,8 +444,9 @@ toolchain and carries the embedded checker, the conformance, property and fuzz
 tests and the CPU/GPU parity suites (the `ay` bundles stay internal). These
 prove or test named, bounded contracts, not the whole emulator, renderer or OS.
 Windows-only runtime tests (`windows_smoke`, the Windows half of the PowerShell
-key tests) run on no lane; `verify cells` type-checks them for both Windows
-targets and runs none of them.
+key tests) run in no check: `verify cells` type-checks them for both Windows
+targets and runs none of them. `targo --unverified lab windows exec` runs them
+by hand in a Windows 11 arm64 VM on an Apple-silicon Mac, x86_64 under Prism.
 There is no hosted CI and no push gate: every release runs the release checks
 (`targo --unverified verify release`) before it claims a build number.
 [CONTRIBUTING.md](CONTRIBUTING.md) says what you can run here.

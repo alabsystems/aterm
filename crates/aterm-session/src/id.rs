@@ -161,7 +161,6 @@ mod tests {
         let round = LaunchNonce::from_hex(&n.to_hex()).expect("hex roundtrip");
         assert_eq!(n, round);
         assert!(n.ct_eq(&round));
-        // A different nonce must not compare equal.
         let other = LaunchNonce::generate();
         assert!(!n.ct_eq(&other));
         // Malformed hex is rejected, never silently zeroed.

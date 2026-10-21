@@ -1,25 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Case folding, diacritic stripping, and character classification used by the
-//! matcher and the lexicon builder.
+//! Case folding, diacritic stripping and character classification for the matcher and the
+//! lexicon builder. There is no Unicode normalization dependency; the contract is small:
 //!
-//! There is intentionally NO dependency on a full Unicode normalization crate
-//! (that would violate aterm's vendoring norm). Instead we define a small,
-//! auditable contract:
+//! * **Case**: `char::to_lowercase` plus `ß`/`ẞ` → `ss` and final sigma `ς` → `σ`.
+//! * **Diacritics**: combining marks in the Latin, Greek, Cyrillic, Arabic and Hebrew ranges are
+//!   dropped, so `e` + U+0301 folds like `é` and omitted harakat or niqqud never block a match.
+//!   Indic, Thai and other spacing marks stay: they are part of the syllable.
 //!
-//! * **Case** — `char::to_lowercase` (locale-independent simple lowering) plus a
-//!   handful of special cases (`ß`/`ẞ` → `ss`, Greek final sigma `ς` → `σ`).
-//! * **Diacritics** — combining marks in the Latin / Greek / Cyrillic / Arabic /
-//!   Hebrew ranges are *dropped*, so terminal text emitted as base+combining
-//!   (e.g. `e` + U+0301) folds identically to a precomposed `é`, and Arabic
-//!   harakat / Hebrew niqqud (usually omitted when typing) never block a match.
-//!   Indic / Thai / other *spacing* combining marks are NOT stripped — they are
-//!   integral to the syllable and removing them would corrupt the word.
-//!
-//! Both the scanned token and every lexicon key are folded through the SAME
-//! function, so the "compare in one normal form" invariant is enforced by
-//! construction, not assumed. See the `fold_is_idempotent` test.
+//! The scanned token and every lexicon key fold through the same function, so both compare in
+//! one normal form by construction.
 
 /// Lowercase, drop strippable diacritics, and apply the special-case folds.
 /// The result is the canonical surface used for every lexicon lookup.
@@ -30,20 +21,13 @@ pub fn fold(s: &str) -> String {
     out
 }
 
-/// [`fold`] writing into a caller-provided buffer (cleared first) so a hot
-/// per-token scanner reuses a single allocation instead of allocating one
-/// folded `String` per probed token. [`fold`] is the thin owning wrapper.
-///
-/// Public because the host's context tokenizer (the sparkle-words genome's ±K
-/// neighbor-token walk, which must be allocation-free on resident scratch)
-/// folds candidate tokens through the SAME function as the scanner — a
-/// re-implemented look-alike fold would drift.
+/// [`fold`] into a caller-provided buffer (cleared first), so a per-token scanner reuses one
+/// allocation. Public so the host's context tokenizer (the sparkle-words genome's ±K
+/// neighbor-token walk) folds through the scanner's own function.
 pub fn fold_into(s: &str, out: &mut String) {
     out.clear();
-    // After `clear()` this reserves `s.len()`; the saturating form keeps
-    // `len + additional` provably in range for the verifier, which cannot see
-    // `clear`'s effect on `len`. The reserve is only a hint, and the clamp
-    // bounds the up-front allocation the verifier must budget for.
+    // Reserves `s.len()` (capped); the saturating form keeps `len + additional` provably in range
+    // for the verifier, which cannot see `clear`'s effect on `len`.
     out.reserve(s.len().saturating_sub(out.len()).min(4096));
     for c in s.chars() {
         if is_strippable_mark(c) {
@@ -54,14 +38,12 @@ pub fn fold_into(s: &str, out: &mut String) {
             'ς' => out.push('σ'), // Greek final sigma → medial sigma
             _ => {
                 for lc in c.to_lowercase() {
-                    // Lowercasing can itself emit a combining mark (e.g. Turkish
-                    // 'İ' → 'i' + U+0307); drop those too so `fold` is idempotent.
+                    // Lowercasing can emit a combining mark (`İ` → `i` + U+0307); drop it so
+                    // `fold` is idempotent.
                     if is_strippable_mark(lc) {
                         continue;
                     }
-                    // Map a precomposed Latin/Greek accented letter to its base
-                    // so it folds identically to the decomposed (base+combining)
-                    // form the terminal emits.
+                    // Precomposed `é` folds like the decomposed form the terminal emits.
                     out.push(base_letter(lc).unwrap_or(lc));
                 }
             }
@@ -69,16 +51,11 @@ pub fn fold_into(s: &str, out: &mut String) {
     }
 }
 
-/// Map a (lowercase) precomposed accented Latin or Greek letter to its base
-/// letter. Returns `None` for characters that need no accent folding. Covers the
-/// Latin-1 / Latin Extended-A letters and Greek monotonic-accented vowels that
-/// appear in the lexicon's languages. Cyrillic is intentionally left untouched
-/// (its accented letters are distinct phonemes, not decorations).
+/// The base letter of a lowercase precomposed accented Latin (Latin-1, Extended-A) or monotonic
+/// Greek letter, or `None`. Cyrillic is left alone: its accented letters are distinct phonemes.
 #[must_use]
 fn base_letter(c: char) -> Option<char> {
-    // Every arm below matches an ACCENTED letter, all of them above ASCII (the
-    // ASCII letters in this table are the results, not the patterns). So an
-    // ASCII input has no accent to fold and needs none of the walk.
+    // Every pattern below is non-ASCII; the ASCII letters are results.
     if c.is_ascii() {
         return None;
     }
@@ -114,19 +91,13 @@ fn base_letter(c: char) -> Option<char> {
     Some(b)
 }
 
-/// True when `s` carries diacritic information that [`fold`] DROPS: a
-/// strippable combining mark, or a precomposed accented letter that folds to
-/// its bare base (`đ` → `d`, `ç` → `c`, `ä` → `a`, Turkish `ı` → `i`).
+/// True when [`fold`] drops diacritic information from `s`: a strippable combining mark, or a
+/// precomposed accented letter that folds to its base (`đ` → `d`, `ä` → `a`, Turkish `ı` → `i`).
+/// `ß` → `ss` and final sigma are respellings, not mark loss.
 ///
-/// The `ß`→`ss` and final-sigma folds are NOT mark loss — they are canonical
-/// respellings whose result spells the same word — so they do not count.
-///
-/// This is the witness the scanner's marks-required gate keys on: a lexicon
-/// surface that loses marks in folding (Vietnamese `đm` → `dm`, whose entry
-/// says the tone marks are essential) compiles to a bare-ASCII key that plain
-/// ASCII typing would otherwise complete (`dm` mid-`dmg`). Such a surface
-/// only matches a token that itself folds marks away — `đm`, `ĐM`, or a
-/// decomposed `d` + combining stroke — never the bare skeleton.
+/// The scanner's marks-required gate keys on this: a surface that loses essential marks (Vietnamese
+/// `đm` → `dm`) matches only a token that itself folds marks away (`đm`, `ĐM`, decomposed `d` +
+/// stroke), never the bare skeleton (`dm` in `dmg`).
 #[must_use]
 pub fn has_foldable_marks(s: &str) -> bool {
     s.chars().any(|c| {
@@ -219,21 +190,15 @@ pub fn is_no_space_script(c: char) -> bool {
     matches!(c as u32, no_space_script_ranges!())
 }
 
-/// True for a character that can sit *inside* a whitespace-delimited token: a
-/// letter, a decimal digit, a connector (`_`), or a non-spacing mark we keep.
-/// Digits are token-internal so that identifiers like `cat5` do not tokenize as
-/// the word `cat`.
+/// True for a character inside a whitespace-delimited token: a letter or number, `_`, or a
+/// combining mark. Digits are token-internal so `cat5` does not tokenize as `cat`.
 ///
-/// Public because the host's context tokenizer (the ±K neighbor-token walk that
-/// feeds the sparkle-words genome) MUST use the same predicate as the scanner —
-/// a re-implemented look-alike would drift.
+/// Public so the host's context tokenizer (the sparkle-words genome's ±K neighbor-token walk)
+/// uses the scanner's own predicate.
 #[must_use]
 pub fn is_token_char(c: char) -> bool {
-    // The ASCII answer in one branch. For an ASCII scalar `is_no_space_script`,
-    // `is_strippable_mark` and `is_kept_mark` are all provably false (their
-    // lowest ranges are U+0E00, U+0300 and U+0900), and `char::is_alphanumeric`
-    // — a Unicode table lookup — agrees exactly with `is_ascii_alphanumeric`
-    // over ASCII. So the whole predicate collapses to two comparisons.
+    // For ASCII the three range predicates are false (their lowest ranges are U+0E00, U+0300 and
+    // U+0900) and `is_alphanumeric` agrees with `is_ascii_alphanumeric`.
     if c.is_ascii() {
         return c.is_ascii_alphanumeric() || c == '_';
     }
@@ -257,18 +222,18 @@ macro_rules! kept_mark_ranges {
 /// A spacing/combining mark we KEEP (Indic / Thai etc.) — these are part of the
 /// token but are not stripped by `fold`.
 fn is_kept_mark(c: char) -> bool {
-    // Same argument, one range further up: the lowest here is U+0900.
+    // The lowest range is U+0900.
     if c.is_ascii() {
         return false;
     }
     matches!(c as u32, kept_mark_ranges!())
 }
 
-/// THE ASCII EARLY-OUTS ARE ONLY SOUND WHILE THE TABLES STAY ABOVE ASCII, and
+/// The ASCII early-outs are only sound while the tables stay above ASCII, and
 /// the hazard is the day someone adds an ASCII codepoint to one of them and the
 /// early-out silently shadows it. Asserting "every ASCII scalar answers false"
 /// of the predicates would be circular (the early-out is what makes it true),
-/// so the build asks the TABLES, early-outs aside, about all 128 ASCII scalars:
+/// so the build asks the tables, early-outs aside, about all 128 ASCII scalars:
 /// a table that grows an ASCII entry stops the compile. The predicates match
 /// the same pattern macros inline, so they call nothing (no obligation the
 /// Trust lane would have to discharge through a callee).
@@ -322,7 +287,6 @@ mod tests {
 
     #[test]
     fn fold_greek_final_sigma() {
-        // ΓΑΤΕΣ vs γάτες should both collapse the final sigma
         assert_eq!(fold("γάτες"), fold("γατες"));
     }
 

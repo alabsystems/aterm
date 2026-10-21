@@ -58,6 +58,18 @@ rustflags = ["-Zthreads=4"]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
 
+# AN x86_64 MAC LINK IS SIGNED AS AN arm64 ONE IS. Apple's linker signs every
+# arm64 Mach-O ad hoc itself (`linker-signed`) and leaves an x86_64 one unsigned
+# unless asked, so a dev or test build of the Intel slice had no code identity:
+# `aterm keeper serve` could not read its own designated requirement
+# (errSecCSUnsigned, OSStatus -67062) and exited, and the update rendezvous
+# refused every dialer (ROSETTA-MAC, docs/measured/rosetta-mac-2026-10-20.md).
+# `strip` re-signs a linker-signed slice and `lipo` keeps it; the release signs
+# the universal bundle over both. Stock Rust builds this target (STOCK
+# EXCEPTION: Trust has no x86_64-apple-darwin std), so the flag reaches it.
+[target.x86_64-apple-darwin]
+rustflags = ["-Clink-arg=-Wl,-adhoc_codesign"]
+
 # THE C FLOOR IS THE RUST FLOOR. cc-rs passes no macOS minimum, so clang would
 # target the SDK's version, and a C symbol newer than macOS 11 in any C
 # dependency would become a hard import that stops aterm launching on older

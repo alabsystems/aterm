@@ -317,9 +317,8 @@ impl<C: Ctl> Session<'_, C> {
                     self.claim_said.push(line);
                 }
             }
-            // Not served: the loop's own request is about to find the
-            // outage. Whose the session is, is not known until one is
-            // answered: pending, asked again before the next request.
+            // Not served: whose the session is stays unknown until a request is answered;
+            // pending, asked again before the next request.
             None => {
                 self.claim = Claim::Pending {
                     tried: self.fx.mono(),
@@ -353,10 +352,9 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// The loop's last act: the claim released, when it is held — and only
-    /// while it is still this loop's (`holder=`): a
-    /// lease that lapsed in an outage may have been taken by another
-    /// supervisor since, and a bare unset would clear that one's live claim.
+    /// The loop's last act: the claim released when held, and only while it is still this
+    /// loop's (`holder=`): a lease that lapsed in an outage may be another supervisor's now,
+    /// and a bare unset would clear it.
     pub(super) fn release_claim(&mut self) {
         if matches!(self.claim, Claim::Held { .. }) {
             self.unset_claim();

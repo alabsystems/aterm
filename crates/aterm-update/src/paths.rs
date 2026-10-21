@@ -39,12 +39,8 @@ impl Staging {
     /// Resolve (and create, `0700`, ownership-verified) the staging layout.
     /// Returns `None` if `HOME` is unset or the directory cannot be made private.
     pub fn resolve() -> Option<Self> {
-        // The base derivation — the `ATERM_UPDATE_ROOT` development seam first
-        // (2026-08-15: without it every `cargo test -p aterm-gui` run drove
-        // the REAL per-user ledgers; a shipped binary reads no seam, and a
-        // scratch `$HOME` isolates it), else the HOME-keyed Application Support
-        // base — lives in `aterm_update_core::seal_guard::updates_root`, the one
-        // derivation every reader of `Updates/` shares.
+        // Resolve `ATERM_UPDATE_ROOT` (test/dev override) or
+        // `~/Library/Application Support/aterm/Updates`.
         let root = aterm_update_core::seal_guard::updates_root()?;
         let download = root.join("download");
         ensure_private_dir(&download).ok()?;
@@ -87,11 +83,9 @@ impl Staging {
         self.root.join("quarantine.toml")
     }
 
-    /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`), written beside
-    /// the boot sentinel at apply time so a LATER crash-loop revert — which no longer
-    /// holds the ready marker — can poison exactly the build that crash-looped, so it
-    /// isn't re-downloaded + re-applied into another loop (C1). Reuses the
-    /// `manifest::FailedMark` (build+sha) record shape.
+    /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`), written
+    /// beside the boot sentinel at apply time so a subsequent crash-loop
+    /// revert can quarantine the exact build that failed (`manifest::FailedMark`).
     pub fn trial(&self) -> PathBuf {
         self.root.join("trial.toml")
     }
@@ -103,38 +97,23 @@ impl Staging {
         self.root.join("installed.toml")
     }
 
-    /// The single-use re-exec nonce stamp (`reexec.stamp`), written just before the
-    /// apply re-exec and validated (then deleted) by the post-swap guard. Lives in the
-    /// `0700` `Updates` root so only we can create/read it — the spoof-resistant
-    /// replacement for trusting a bare inherited `ATERM_UPDATE_REEXEC` env var (F9).
+    /// Single-use re-exec nonce (`reexec.stamp`) inside the `0700` `Updates`
+    /// root, written before apply re-exec and consumed by the post-swap guard.
     pub fn reexec_stamp(&self) -> PathBuf {
         self.root.join("reexec.stamp")
     }
 
-    /// Retire only the currently published stage. The caller must hold
-    /// [`Self::apply_lock`], which is also acquired for the stager's short final
-    /// publication transaction. Deliberately do not touch `download/` or an
-    /// unpublished incoming bundle: those belong to a possibly in-flight producer
-    /// holding [`Self::stage_lock`].
-    ///
-    /// Also forgets the ledger's authorized tag ([`crate::status::clear_latest_tag`]):
-    /// every caller retires "so the next check re-stages", and a check whose pointer
-    /// still names the retired stage's tag would otherwise stop at its HEAD with "up
-    /// to date" forever — the machine stranded on the old build until the
-    /// publisher cut a NEW tag.
+    /// Retire the currently published stage (`ready`, `staged_app`, and the
+    /// authorized tag in `status.toml`) while holding [`Self::apply_lock`],
+    /// leaving `download/` and any in-flight `stage_lock` producer untouched.
     pub fn retire_published(&self) {
         let _ = std::fs::remove_file(&self.ready);
         let _ = std::fs::remove_dir_all(&self.staged_app);
         crate::status::clear_latest_tag(self);
     }
 
-    /// A `Staging` rooted at a fresh, unique temp dir with `download/` created — the
-    /// one scratch layout every test module in this crate builds. Field-by-field
-    /// rather than through [`Self::resolve`] + `$ATERM_UPDATE_ROOT`, because
-    /// `std::env::set_var` is `unsafe` in edition 2024 and a data race under a
-    /// multi-threaded test runner — and because a test must never be able to touch
-    /// the real per-user ledgers. The root goes when the returned [`ScratchStaging`]
-    /// does, so a test that panics, or forgets, leaves nothing in `$TMPDIR`.
+    /// Create an isolated `Staging` rooted in a fresh temporary directory
+    /// (cleaned up on drop by [`ScratchStaging`]) without mutating process env.
     #[cfg(test)]
     pub(crate) fn scratch(label: &str) -> ScratchStaging {
         let dir = aterm_tempfile::Builder::new()

@@ -48,6 +48,11 @@ aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket clie
 # Already in the graph through aterm-gui; no new crate reaches the binary.
 aterm-control = { path = "../aterm-control" }
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
+# `aterm doctor` composed here (docs/DESIGN-init-system-2026-10-20.md §3.4): aterm-cli's
+# items, the packages' repair items and `pkg doctor`'s rows through the one engine, its
+# `--json` in the one report schema. Both already in the graph through atpkg.
+aterm-converge = { workspace = true }
+aterm-json = { workspace = true }
 # The Full Disk Access probe's child, `aterm __tcc-open` (`consent::run_open_probe_verb`);
 # already in the graph through aterm-gui.
 aterm-containment = { workspace = true }
@@ -112,6 +117,13 @@ aterm-uds = { workspace = true }
 # `link_unavailable`) instead of failing to exist.
 [target.'cfg(unix)'.dependencies]
 aterm-link = { path = "../aterm-link" }
+# `aterm secrets` — one credentials file for every machine
+# (docs/DESIGN-secrets-2026-10-20.md): the vault's client, its keyless
+# long-poll server and the launchd/systemd services. UNIX ONLY: the secrets
+# are kept private by POSIX file modes (0600 files in a 0700 ~/.secrets),
+# which Windows has none of, so there the verb stays on the roster and
+# refuses by name (`secrets_unavailable` in src/main.rs).
+aterm-secrets = { workspace = true }
 
 # `aterm machines` — a lab of Macs managed from this one over SSH
 # (docs/DESIGN-machines-2026-10-16.md). MACOS ONLY: it drives macOS's own tools
@@ -132,6 +144,7 @@ aterm-machines = { workspace = true }
 # development").
 dev-seams = [
     "aterm-agent/dev-seams",
+    "aterm-cli/dev-seams",
     "aterm-gui/dev-seams",
     "aterm-link/dev-seams",
     "aterm-update/dev-seams",
@@ -163,8 +176,8 @@ aterm-toml = { workspace = true }
 # The bus mirror's world (`tests/fabric_world/log_mirror.rs`) decodes and folds
 # the session logs' bus bodies as every reader does (`aterm_slog::bus`).
 aterm-slog = { workspace = true }
-# `fabric status --json` is asserted as JSON, not as substrings.
-aterm-json = { workspace = true }
+# `fabric status --json` is asserted as JSON, not as substrings: aterm-json is a
+# [dependencies] row (the doctor's `--json`), which the tests reach too.
 # The spare suite asks which system files the host's zsh reads before aterm's
 # parked hold (`pre_hold_files`). Already in the graph through aterm-gui.
 aterm-shell-integration = { workspace = true }

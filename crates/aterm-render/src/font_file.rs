@@ -24,13 +24,9 @@ use std::io::{self, Read as _};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Largest external font blob admitted by aterm.
-///
-/// Apple Color Emoji is currently about 192 MiB, so 256 MiB retains the largest
-/// useful shipping system collection while bounding hostile input. Ordinary
-/// terminal and styled faces are generally well below 16 MiB. Reads happen only
-/// on cold construction/config paths (and Settings semantic previews use their
-/// parked worker), never per glyph.
+/// Largest external font blob admitted: room for Apple Color Emoji (~192 MiB), the largest
+/// useful system collection, while bounding hostile input. Reads happen only on cold
+/// construction/config paths, never per glyph.
 pub const MAX_FONT_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 fn limit_plus_sentinel(max_bytes: usize) -> io::Result<usize> {
@@ -129,9 +125,8 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
     Ok((file, Cow::Borrowed(path)))
 }
 
-/// [`open_regular`] with an explicit share mode. The copy path shares
-/// everything (std's own default); the mapping path ([`open_for_admission`])
-/// refuses WRITE sharing.
+/// [`open_regular`] with an explicit share mode: the copy path shares everything (std's
+/// default); the mapping path ([`open_for_admission`]) refuses write sharing.
 #[cfg(windows)]
 fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -175,13 +170,10 @@ fn check_observed_size(file: &std::fs::File, max_bytes: usize) -> io::Result<u64
     Ok(length)
 }
 
-/// Validate an explicit path without consuming or parsing its bytes.
-///
-/// This is suitable for diagnostics and resolution. It shares the exact
-/// open/handle/type/metadata-size rules with [`read_bounded_font_file`], so a
-/// writerless FIFO returns immediately and an already-oversized regular file has
-/// an exact diagnostic. The eventual read repeats admission because the path may
-/// legitimately change between validation and application.
+/// Validate an explicit path without reading or parsing its bytes, under the same
+/// open/handle/type/size rules as [`read_bounded_font_file`]: a writerless FIFO returns at
+/// once and an oversized file gets an exact diagnostic. The eventual read repeats admission,
+/// since the path may change in between.
 pub fn validate_bounded_font_file(path: &Path, max_bytes: usize) -> io::Result<()> {
     let (file, _) = open_regular(path)?;
     let _ = check_observed_size(&file, max_bytes)?;
@@ -199,38 +191,18 @@ pub fn read_bounded_font_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u
     Ok(bytes)
 }
 
-/// [`read_bounded_font_file`] into a buffer the caller supplies and REUSES.
+/// [`read_bounded_font_file`] into a buffer the caller supplies and reuses: the one
+/// implementation of admission ([`read_bounded_font_file`] is it with a fresh `Vec`).
 ///
-/// Identical admission: same single `open_regular` handle, same metadata
-/// pre-check, same `max + 1` sentinel, same over-limit refusal — this is the one
-/// implementation, and [`read_bounded_font_file`] is it with a fresh `Vec`.
+/// A caller that reads many files and keeps little (the cmap-coverage index reads every system
+/// font) should reuse one buffer: glibc raises its `mmap` threshold after the first large
+/// free, so per-file buffers leave the arena's high-water mark resident (27.5 MB against
+/// 1.4 MB measured). On success `buf` holds exactly the file's bytes, with the capacity the
+/// largest file so far needed.
 ///
-/// WHY A REUSED BUFFER IS A DIFFERENT THING FROM A FRESH ONE. A caller that
-/// reads MANY files and keeps almost nothing — the cmap-coverage index
-/// (`font_coverage_index`) reads every system font on the box, 358 files and
-/// 174 MB on this Linux host, and retains ~214 kB of range tables — hands the
-/// allocator 358 alloc/free pairs whose sizes swing from a few kB to 26 MB.
-/// glibc frees the first large block by `munmap` and then RAISES its dynamic
-/// `mmap` threshold to that block's size, so every read after it is served from
-/// the arena instead, and the arena's high-water mark never comes back. MEASURED
-/// on this host: the index build left **27.5 MB** of RSS behind it, on the main
-/// thread and on the spawned warm thread alike, in every aterm process. One
-/// buffer that only ever grows is one block, and it is returned when it drops:
-/// the same build leaves **1.4 MB**. Same files, same bytes, same index.
-///
-/// On success `buf` holds exactly the file's bytes; its CAPACITY is whatever the
-/// largest file so far needed, which is the point.
-///
-/// ON FAILURE THE BUFFER IS EMPTY OR PARTIAL, NEVER THE PREVIOUS FONT. The
-/// clear happens BEFORE the first fallible step, and the ordering is the whole
-/// point: admission refuses a path (unopenable, non-regular, already over the
-/// limit) before one byte is read, so clearing afterwards would leave a REUSED
-/// buffer holding the last file's complete, parseable face. A caller that
-/// mishandles the error would then read a font it never asked for and could not
-/// tell from a success. Cleared-first, the same mistake yields an empty buffer;
-/// a failure part-way through the read leaves a partial one, which at least
-/// cannot pass for a font. Callers that skip the file — every caller today —
-/// are unaffected either way.
+/// On failure the buffer is empty or partial, never the previous font. It is cleared before
+/// the first fallible step: admission refuses a path before reading a byte, so a later clear
+/// would leave the last file's complete, parseable face for a caller that mishandles the error.
 pub fn read_bounded_font_file_into(
     path: &Path,
     max_bytes: usize,
@@ -243,8 +215,8 @@ pub fn read_bounded_font_file_into(
 }
 
 /// The read half of [`read_bounded_font_file_into`], over a handle
-/// [`open_regular`] + [`check_observed_size`] already admitted — so the mapping
-/// path can fall back to the copy WITHOUT reopening the pathname.
+/// [`open_regular`] + [`check_observed_size`] already admitted, so the mapping
+/// path can fall back to the copy without reopening the pathname.
 fn read_admitted_handle(
     file: std::fs::File,
     length: u64,
@@ -253,10 +225,10 @@ fn read_admitted_handle(
 ) -> io::Result<()> {
     buf.clear();
     let read_limit = limit_plus_sentinel(max_bytes)?;
-    // `try_reserve_exact` on an EMPTY vec asks for exactly the observed length,
-    // which is what keeps a fresh buffer's capacity slack-free (`read_to_end`
-    // probes for EOF with a stack array rather than doubling an exact-fit
-    // buffer). A reused buffer already big enough asks for nothing.
+    // `try_reserve_exact` on an empty vec asks for exactly the observed length, which keeps
+    // a fresh buffer's capacity slack-free (`read_to_end` probes for EOF with a stack array
+    // rather than doubling an exact-fit buffer). A reused buffer already big enough asks for
+    // nothing.
     let want = usize::try_from(length).unwrap_or(max_bytes).min(max_bytes);
     if buf.capacity() < want {
         buf.try_reserve_exact(want).map_err(|error| {
@@ -281,79 +253,60 @@ pub fn read_font_file(path: &Path) -> io::Result<Vec<u8>> {
 /// One font file mapped whole and read-only, unmapped on drop. Unix uses
 /// `PROT_READ` and `MAP_PRIVATE`; Windows uses a read-only section and view.
 ///
-/// This is the handle [`admit_font_file`] hands back for a file on the system
-/// font volume, and it is what turns the seal's ~240 MB of system-font
-/// admission on a Mac — Apple Color Emoji 192 MB, Hiragino Sans GB 23.5 MB,
-/// Arial Unicode 23.3 MB, STIX Two Math 0.8 MB, every one read whole into
-/// anonymous heap at every windowed launch and held for the process's life
-/// — into file-backed pages: shared across every aterm process through the
-/// unified buffer cache, evictable under pressure, and faulted in only for
-/// the tables and glyphs actually touched (an ASCII-only session touches a
-/// few pages of the emoji collection's table directory and nothing else).
+/// [`admit_font_file`] hands this back for a file under a system font root, so the ~240 MB of
+/// Mac system fonts a seal admits are file-backed pages: shared across aterm processes through
+/// the buffer cache, evictable, and faulted in only for the tables and glyphs touched.
 ///
 /// # Unix truncation safety
 ///
-/// A page of a `MAP_PRIVATE` file mapping that lies PAST the file's current
-/// end faults with `SIGBUS`, so a file truncated after it was mapped crashes
-/// the reader on its next cold glyph — and bytes changing under a live
-/// `&[u8]` is undefined behaviour besides. That is why [`admit_font_file`]
-/// maps ONLY paths under the sealed system font volume
-/// ([`MAPPABLE_FONT_ROOTS`] — `/System/Library/Fonts`, which is SIP-protected
-/// and mounted read-only; an OS update replaces its files as new inodes, so
-/// an old mapping stays valid) and copies everything else. Every byte the
-/// residency finding measured lives on that volume, so the exclusion costs
-/// nothing; and every user-writable directory — `~/Library/Fonts`, `~/.fonts`,
-/// `~/.local/share/fonts`, `/Library/Fonts`, the Linux package roots, a
-/// download directory named in the config — keeps the bounded copy, because
-/// `cp new.ttf ~/Library/Fonts/Font.ttf` truncates and rewrites the SAME
-/// inode while a terminal may hold it, and a face reachable through
-/// `fallback_fonts` / `symbol_font` / `emoji_font` can live exactly there.
+/// A `MAP_PRIVATE` page past the file's current end faults with `SIGBUS`, so a file truncated
+/// after mapping crashes the reader on its next cold glyph, and bytes changing under a live
+/// `&[u8]` are undefined behaviour. So only paths under [`MAPPABLE_FONT_ROOTS`] map:
+/// `/System/Library/Fonts` is SIP-protected and read-only, and an OS update replaces its
+/// files as new inodes, so an old mapping stays valid. Every user-writable directory
+/// (`~/Library/Fonts`, `~/.fonts`, `~/.local/share/fonts`, `/Library/Fonts`, the Linux package
+/// roots, a configured download directory) copies, because
+/// `cp new.ttf ~/Library/Fonts/Font.ttf` truncates and rewrites the same inode.
 /// [`maps_in_place`] is the one definition of the rule.
 ///
-/// The bytes are validated exactly as a copy would be: same `open_regular`
-/// (regular file, `O_NOFOLLOW`, `O_NONBLOCK`), same `fstat` size bound
-/// ([`MAX_FONT_FILE_BYTES`]), and the mapping's length IS that observed
-/// size, so no byte past the admission bound is ever addressable.
+/// Validation matches a copy's: the same handle checks as `open_regular` and the same size
+/// bound ([`MAX_FONT_FILE_BYTES`]), and the mapping's length is that observed size.
 ///
-/// `identity` is the file's `(st_dev, st_ino)` — on Windows its volume serial
-/// number and file index: two mappings of the same file are the same bytes,
-/// and the discovery intern uses that to converge on one mapping without
-/// comparing 192 MB of pages.
+/// `identity` is the file's `(st_dev, st_ino)` (Windows: volume serial number and file index),
+/// so the discovery intern can converge two mappings of one file without comparing their pages.
 ///
 /// # Windows
 ///
-/// The same handle, over a `PAGE_READONLY` section and a `FILE_MAP_READ`
-/// view. What stands in for the sealed volume is [`MAPPABLE_FONT_ROOTS`]'s
-/// Windows entry plus the handle itself: [`admit_font_file`] opens a file
-/// it will map WITHOUT write sharing and the mapping keeps that handle
-/// (`_file`), so while the view is live no process can open the file for
-/// writing — to rewrite it or to truncate it.
+/// A `PAGE_READONLY` section viewed `FILE_MAP_READ`. The stand-in for a sealed volume is
+/// [`MAPPABLE_FONT_ROOTS`]'s Windows entry plus the handle: [`admit_font_file`] opens a file it
+/// will map without write sharing and the mapping keeps a duplicate of that handle (`_file`),
+/// so while the view is live no process can open the file for writing, to rewrite or truncate
+/// it.
 #[cfg(any(unix, windows))]
 pub struct MappedFontFile {
     ptr: std::ptr::NonNull<u8>,
     len: usize,
     identity: (u64, u64),
-    /// The admission handle, opened without write sharing, held so the share
-    /// mode outlives the admission for as long as the bytes are addressable.
+    /// A duplicate of the admission handle, held so its no-write-share mode lasts as long as
+    /// the bytes are addressable.
     #[cfg(windows)]
     _file: std::fs::File,
 }
 
-/// Without a mapping constructor (neither unix nor Windows) the type is
-/// uninhabited: the `FaceBytes::Mapped` arm exists on every target and can be
-/// built on none of these, which keeps every `match` over the handle cfg-free.
+/// Elsewhere (neither unix nor Windows) the type is uninhabited: the `FaceBytes::Mapped` arm
+/// exists on every target but can be built on none of these, which keeps every `match` over
+/// the handle cfg-free.
 #[cfg(not(any(unix, windows)))]
 pub struct MappedFontFile {
     never: core::convert::Infallible,
 }
 
-// SAFETY: the mapping is read-only (unix: PROT_READ and MAP_PRIVATE; Windows:
-// a PAGE_READONLY section viewed FILE_MAP_READ) — nothing writes through it,
-// and the kernel owns the pages — so sharing or moving the handle between
-// threads is sharing an immutable byte slice. `Drop` runs once, on the last
-// `Arc` holder. Windows admission also excludes an existing writable mapping:
-// CreateFileW's FILE_SHARE_WRITE rule covers mappings as well as open handles;
-// the retained no-write-share handle prevents later writable opens/mappings.
+// SAFETY: the mapping is read-only (unix: PROT_READ and MAP_PRIVATE; Windows: a PAGE_READONLY
+// section viewed FILE_MAP_READ) — nothing writes through it, and the kernel owns the pages — so
+// sharing or moving the handle between threads is sharing an immutable byte slice. `Drop` runs
+// once, on the last `Arc` holder. On Windows, CreateFileW's FILE_SHARE_WRITE rule covers
+// mappings as well as open handles, so the no-write-share admission open also excludes an
+// existing writable mapping, and the retained handle refuses later writable opens and mappings.
 // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
 #[cfg(any(unix, windows))]
 unsafe impl Send for MappedFontFile {}
@@ -414,13 +367,10 @@ impl MappedFontFile {
 
 #[cfg(windows)]
 impl MappedFontFile {
-    /// Map `len` bytes of an already-admitted handle, read-only. `len` is the
-    /// size [`check_observed_size`] bounded, so the view never addresses a byte
-    /// past the admission limit. An empty file cannot be mapped
-    /// (`CreateFileMappingW` refuses a zero-length file) and is refused here
-    /// the same way as on unix. The view keeps its section alive, so the
-    /// section handle is closed at once; a duplicate of `file` is kept (see
-    /// the `_file` field).
+    /// Map `len` bytes of an already-admitted handle, read-only, as the unix `map` does: `len`
+    /// is the size [`check_observed_size`] bounded, and an empty file (which
+    /// `CreateFileMappingW` refuses) is refused up front. The view keeps its section alive, so
+    /// the section handle closes at once; a duplicate of `file` is kept (`_file`).
     fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
         use std::os::windows::io::AsRawHandle as _;
 
@@ -561,10 +511,9 @@ impl Drop for MappedFontFile {
 /// admitted root: even the same pathname has no sealed-volume guarantee, and
 /// package-managed font directories may be rewritten in place.
 ///
-/// Windows maps only the conventional `C:\Windows\Fonts` system directory.
-/// The admission handle denies write sharing for the view's lifetime; this
-/// does not rely on a font's ACL. Per-user font directories and installations
-/// under another Windows directory retain the bounded copy path.
+/// Windows maps only `C:\Windows\Fonts`, guarded by the admission handle's write-sharing
+/// refusal rather than the fonts' ACLs; per-user font directories and a Windows installed
+/// elsewhere copy.
 pub const MAPPABLE_FONT_ROOTS: &[&str] = &[
     #[cfg(target_os = "macos")]
     "/System/Library/Fonts",
@@ -580,8 +529,8 @@ pub const MAPPABLE_FONT_ROOTS: &[&str] = &[
 /// matters because the seal's callers admit paths with the promise that no
 /// pathname is touched afterwards.
 ///
-/// On Windows the root comparison ignores ASCII case: font discovery and
-/// configured paths can spell the Windows directory with different case.
+/// On Windows the root comparison ignores ASCII case, since discovery and config can spell
+/// the directory differently (`%WINDIR%` is `C:\WINDOWS`).
 #[must_use]
 pub fn maps_in_place(path: &Path) -> bool {
     !path
@@ -609,15 +558,12 @@ fn lies_under(path: &Path, root: &Path) -> bool {
     })
 }
 
-/// Admit one font file under the production budget, MAPPING it when the path
-/// lies under the system font volume ([`maps_in_place`]) and COPYING it
-/// otherwise.
+/// Admit one font file under the production budget: mapped when [`maps_in_place`] and
+/// `open_for_admission` allow it, copied otherwise.
 ///
-/// One `open_regular`, one `fstat` bound, for either outcome: the copy arm
-/// reads the very handle the mapping arm would have mapped, so a path that
-/// changes underneath us after admission cannot swap in a different file.
-/// A mapping failure (`mmap` refused, an empty file) falls back to the copy
-/// on the same handle rather than failing the admission — the mapping is a
+/// One open and one size bound serve either outcome, so the bytes come from the admitted
+/// handle and a path swapped after admission cannot substitute a file. A mapping failure (the
+/// OS refuses, an empty file) falls back to the copy on the same handle: mapping is a
 /// residency choice, never a correctness one.
 pub fn admit_font_file(path: &Path) -> io::Result<crate::font::FaceBytes> {
     // Residency is decided on the path the handle was OPENED at, not the one
@@ -738,12 +684,10 @@ fn open_for_admission(
     Ok((file, may_map))
 }
 
-/// Windows: a file [`maps_in_place`] would map is opened WITHOUT write
-/// sharing, and the mapping keeps that handle ([`MappedFontFile`]), so no
-/// process can open the file for writing while its bytes are a live `&[u8]`.
-/// If a writer already holds it (a sharing violation), it is copied through
-/// the ordinary fully-shared open instead — a residency choice, never a
-/// refused font.
+/// Windows: a file [`maps_in_place`] would map is opened without write sharing, which the
+/// mapping keeps ([`MappedFontFile`]), so no process can open it for writing while its bytes
+/// are a live `&[u8]`. If a writer (or a writable mapping) already holds it, the sharing
+/// violation sends it through the ordinary fully-shared open to be copied instead of refused.
 #[cfg(windows)]
 fn open_for_admission(
     path: &Path,
@@ -839,8 +783,8 @@ mod win {
     }
 }
 
-/// Production-font-budget twin of [`read_bounded_font_file_into`], for the one
-/// caller that reads the whole font tree and keeps only a summary of it.
+/// Production-font-budget twin of [`read_bounded_font_file_into`], for a caller that reads the
+/// whole font tree and keeps only a summary of it.
 pub fn read_font_file_into(path: &Path, buf: &mut Vec<u8>) -> io::Result<()> {
     read_bounded_font_file_into(path, MAX_FONT_FILE_BYTES, buf)
 }
@@ -879,10 +823,8 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A REUSED buffer must answer exactly what a fresh one does, including when
-    /// the previous file was LARGER — the case a missing `clear()` turns into a
-    /// font whose tail is the previous font's bytes. Sizes go big → small → big
-    /// so both the stale-tail and the grow-again paths are exercised.
+    /// A reused buffer reads what a fresh one does, including after a larger file (the stale
+    /// tail a missing `clear()` would leave). Sizes go big → small → big.
     #[test]
     fn a_reused_buffer_reads_the_same_bytes_a_fresh_one_does() {
         let root = fixture_dir("reuse");
@@ -908,11 +850,8 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A REFUSED path must not leave the PREVIOUS font's bytes in a reused
-    /// buffer. Every admission failure happens before a single byte is read, so
-    /// a clear placed after them leaves the buffer holding the last file whole —
-    /// a complete, parseable face, indistinguishable from a success to a caller
-    /// that mishandles the `Err`. One case per fallible step, in source order.
+    /// A refused path must not leave the previous font in a reused buffer. One case per
+    /// fallible admission step, in source order.
     #[test]
     fn a_refused_path_leaves_no_stale_font_in_a_reused_buffer() {
         let root = fixture_dir("stale");
@@ -945,9 +884,8 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// The delegation must not cost the ONE-SHOT callers any slack: a font blob
-    /// read here is interned for the life of the process, so an over-reserved
-    /// `Vec` would be permanently resident waste.
+    /// A one-shot read allocates no slack: the blob is interned for the process's life, so
+    /// over-reserved capacity would stay resident.
     #[test]
     fn a_fresh_read_allocates_no_slack() {
         let root = fixture_dir("exact-capacity");
@@ -979,11 +917,9 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// The residency rule has ONE definition, and it is the system font
-    /// volume: a file there maps; a file under any user-writable directory
-    /// — every `$HOME`-joined search dir and `/Library/Fonts` included — is
-    /// copied; and a `..` traversal that lexically begins on the volume is
-    /// refused rather than mapped.
+    /// A file under the system font directory maps; one under any user-writable directory (the
+    /// per-user `$HOME` dirs, `/Library/Fonts`) copies, as does a `..` traversal that begins in
+    /// the system directory.
     #[test]
     fn maps_in_place_admits_the_system_font_volume_and_nothing_user_writable() {
         #[cfg(target_os = "macos")]
@@ -1009,9 +945,8 @@ mod tests {
             "/System/Library/Fonts/../../../Users//x/y.ttf"
         )));
         assert!(!maps_in_place(Path::new("System/Library/Fonts/Menlo.ttc")));
-        // Windows: the system font directory maps; the per-user font
-        // directory, anything else on the drive, and a `..` walk out of the
-        // system directory are copied.
+        // Windows: the system font directory maps; the per-user font directory, the rest of
+        // the drive, and a `..` walk out of the system directory copy.
         #[cfg(windows)]
         {
             assert!(maps_in_place(Path::new("C:\\Windows\\Fonts\\msyh.ttc")));
@@ -1123,12 +1058,10 @@ mod tests {
         }
     }
 
-    /// The Windows mapping arm's stand-in for a read-only volume, checked
-    /// against the OS rather than assumed: while a view is live, opening the
-    /// file for WRITING fails with a sharing violation (the admission handle
-    /// refuses write sharing and the mapping keeps it), readers still open it,
-    /// and the refusal lifts with the view. A fixture directory cannot sit
-    /// under the system font directory, so this drives the same open and map
+    /// The Windows stand-in for a read-only volume, checked against the OS: while a view is live,
+    /// opening the file for writing fails with a sharing violation (the mapping keeps the
+    /// no-write-share handle), readers still open it, and the refusal lifts with the view. A
+    /// fixture cannot sit under the system font directory, so this drives the open and map
     /// [`admit_font_file`] makes for a path there.
     #[cfg(windows)]
     #[test]

@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, mpsc};
 
-/// Admission includes a published result that the caller has not taken yet.
+/// `pending` covers a published result the caller has not taken yet.
 pub(crate) const fn request_allowed(pending: bool, closed: bool) -> bool {
     !pending && !closed
 }
@@ -37,12 +37,10 @@ pub(crate) enum AcquireOutcome<O> {
 pub(crate) struct Completed<O> {
     pub(crate) generation: u64,
     /// Time this request spent queued, from `try_request` until the worker
-    /// dequeued it, separate from the acquisition the outcome carries.
-    ///
-    /// The caller pays it: a frame without a prefetched drawable returns
-    /// `AcquireRefusal::Pending` and cannot present until the worker runs. The
-    /// acquisition's own clock (`LayerAcquire::run`) starts inside the worker
-    /// and cannot see this. Published beside the acquire wait as
+    /// dequeued it; the acquisition's own clock (`LayerAcquire::run`) starts
+    /// inside the worker and cannot see it. The caller pays it: a frame without a
+    /// prefetched drawable returns `AcquireRefusal::Pending` and cannot present
+    /// until the worker runs. Published beside the acquire wait as
     /// `acquire_queue_*`.
     pub(crate) queue_ns: u64,
     pub(crate) outcome: AcquireOutcome<O>,
@@ -84,14 +82,10 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
         acquire: impl FnMut(I) -> O + Send + 'static,
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<Self> {
-        // At most one Request is admitted. The second slot is reserved for the
-        // ONE consuming close, so retirement can never wait for acquisition.
+        // At most one Request is admitted; the second slot is reserved for the
+        // one consuming close, so retirement never waits for acquisition.
         let (commands, requests) = mpsc::sync_channel(2);
         let (completed, results) = mpsc::sync_channel(1);
-        // The wasm census scans lexically and cannot see that `mod metal` is
-        // macOS-only (lib.rs), so the marker states it where the scanner reads.
-        // Redundant to the compiler.
-        #[cfg(not(target_arch = "wasm32"))]
         std::thread::Builder::new()
             .name("aterm-drawable-acquire".to_owned())
             .spawn(move || run_worker(acquire, notify, requests, completed))?;
@@ -221,9 +215,8 @@ fn run_worker<I, O, R>(
                 // `try_request`.
                 let queue_ns = u64::try_from(queued.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let outcome = if poisoned {
-                    // Normal admission closes when the panic result
-                    // is taken. Do not reuse an unwound callback if
-                    // that contract is accidentally weakened.
+                    // Admission closes when the panic result is taken; never
+                    // reuse an unwound callback even if that contract weakens.
                     drop(input);
                     AcquireOutcome::Panicked
                 } else {
@@ -326,8 +319,8 @@ mod tests {
         let mut premature = state.clone();
         assert!(buggy.fire("Retire", &mut premature));
         assert!(!buggy.check_invariant("RetirementFollowsAcquisition", &premature));
-        // The fake acquire cannot finish until AFTER all caller operations,
-        // including close, return. This pins progress without a timing guess.
+        // The fake acquire cannot finish until all caller operations, close
+        // included, have returned: progress pinned without a timing guess.
         assert!(matches!(
             retirement.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -396,8 +389,8 @@ mod tests {
         ));
         release.send(()).unwrap();
         assert!(!retirement.recv_timeout(LIMIT).unwrap());
-        // Joining is test cleanup AFTER retirement; AcquireWorker itself never
-        // owns a JoinHandle and its caller cannot accidentally join on close.
+        // Joining is test cleanup after retirement; AcquireWorker never owns a
+        // JoinHandle, so its caller cannot join on close.
         thread.join().unwrap();
     }
 
@@ -451,8 +444,8 @@ mod tests {
             model.action_enabled("AcceptResult", &state)
         );
         assert!(!result_is_current(result.generation, 1, false));
-        // Historical stale acceptance (checking dimensions / open alone) is
-        // rejected by the same guard that the shipping caller invokes.
+        // The buggy model accepts on dimensions or openness alone; the shipped
+        // guard rejects that.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         assert!(buggy.action_enabled("AcceptResult", &state));
         assert!(!model.action_enabled("AcceptResult", &state));

@@ -2,9 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Packed cell representation (8 bytes).
+//! Packed 8-byte cell (16 MB for 10,000 lines x 200 cols).
 //!
-//! ## Design
+//! - `char_data` (2 bytes): the UTF-16 code unit of a BMP character, or an
+//!   overflow table index when `COMPLEX` is set.
+//! - `colors` (4 bytes, [`PackedColors`]): FG index in bits 0-7 and BG index in
+//!   bits 8-15 (a StyleId in bits 0-15 when `USES_STYLE_ID` is set), the
+//!   has-extras bit 16, FG mode in bits 24-27 and BG mode in bits 28-31.
+//! - `flags` (2 bytes, [`CellFlags`]): attributes in bits 0-13, `USES_STYLE_ID`
+//!   in bit 14, `COMPLEX` in bit 15.
 //!
 //! Every cell is 8 bytes (16 MB for 10,000 lines x 200 cols).
 //!
@@ -54,9 +60,7 @@ pub use super::cell_flags::CellFlags;
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct Cell {
-    /// Character data.
-    /// - BMP characters (U+0000-U+FFFF): UTF-16 code unit directly
-    /// - Complex/non-BMP: overflow table index (when COMPLEX flag set)
+    /// A BMP code unit, or an overflow index when `COMPLEX` is set.
     char_data: u16,
     /// Packed foreground and background colors.
     colors: PackedColors,
@@ -64,7 +68,6 @@ pub struct Cell {
     flags: CellFlags,
 }
 
-// Compile-time size check - MUST be exactly 8 bytes
 const _: () = assert!(std::mem::size_of::<Cell>() == 8);
 
 impl Default for Cell {
@@ -76,7 +79,6 @@ impl Default for Cell {
 
 impl std::fmt::Debug for Cell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Copy packed fields to avoid unaligned reference errors
         let char_data = self.char_data;
         let flags = self.flags;
         let colors = self.colors;
@@ -109,21 +111,15 @@ impl Cell {
         flags: CellFlags::empty(),
     };
 
-    /// Create a BCE (Background Color Erase) blank cell.
-    ///
-    /// Per VT420/xterm, erase operations fill cells with a space that inherits
-    /// the current SGR background color. This cell has a space character,
-    /// default foreground, the given background color, and no flags.
-    ///
-    /// When the background is default, this returns `Cell::EMPTY`.
+    /// A BCE (Background Color Erase) blank, as VT420/xterm erases fill: a space
+    /// with default foreground, the given background and no flags. A default
+    /// background gives `Cell::EMPTY`.
     #[must_use]
     #[inline]
     pub const fn bce_blank(bg_colors: PackedColors) -> Self {
-        // Extract only the BG portion — clear FG mode bits and any extras flag.
-        // BG mode is in bits 28-31, BG index is in bits 8-15.
+        // Keep only BG mode (bits 28-31) and BG index (bits 8-15).
         let bg_only = bg_colors.0 & 0xF000_FF00;
         if bg_only == 0 {
-            // Default background — fast path
             Self::EMPTY
         } else {
             Self {
@@ -134,13 +130,8 @@ impl Cell {
         }
     }
 
-    /// Create a BCE blank cell from a `PackedColor` background.
-    ///
-    /// Converts the legacy `PackedColor` bg format to `PackedColors` layout
-    /// and delegates to `bce_blank`. Handles default, indexed, and RGB modes.
-    ///
-    /// For RGB mode, the cell will have the RGB mode flag set but the actual
-    /// RGB values must be written to `CellExtras` separately at each position.
+    /// Create a BCE blank cell from a `PackedColor` background. For RGB only the
+    /// mode bit is set; the RGB value is written to `CellExtras` per position.
     #[must_use]
     #[inline]
     #[cfg(test)]
@@ -150,7 +141,6 @@ impl Cell {
         } else if bg.is_indexed() {
             Self::bce_blank(PackedColors::with_indexed_bg(bg.index()))
         } else {
-            // RGB mode: set the bg mode flag. Actual RGB values are in extras.
             Self::bce_blank(PackedColors(0).with_rgb_bg())
         }
     }
@@ -172,40 +162,31 @@ impl Cell {
     #[must_use]
     #[inline]
     pub const fn is_complex(&self) -> bool {
-        // Copy from packed struct to avoid unaligned access
         let flags = self.flags;
         flags.is_complex()
     }
 
-    /// Get the Unicode codepoint (only valid for non-complex cells).
-    ///
-    /// For complex cells, use the overflow table with `char_data()` as key.
+    /// The Unicode codepoint, or U+FFFD for a complex cell.
     #[must_use]
     #[inline]
     #[cfg(test)]
     pub const fn codepoint(&self) -> u32 {
-        // Copy from packed struct to avoid unaligned access
         let flags = self.flags;
         if flags.is_complex() {
-            // Complex cell - return replacement char, caller should use overflow
             0xFFFD
         } else {
             self.char_data as u32
         }
     }
 
-    /// Get the character (may be replacement char if complex or invalid).
+    /// Get the character, or U+FFFD for a complex cell (non-BMP character or
+    /// grapheme cluster), whose text lives in `CellExtras`.
     ///
-    /// Returns `'\u{FFFD}'` for complex cells that contain non-BMP characters
-    /// or grapheme clusters. For those cells, the actual character data is
-    /// stored in the overflow table (`CellExtras`).
-    ///
-    /// For a higher-level API that transparently resolves complex cells,
-    /// use [`Grid::resolved_char(row, col)`](crate::Grid::resolved_char).
+    /// [`Grid::resolved_char(row, col)`](crate::Grid::resolved_char) resolves
+    /// complex cells.
     #[must_use]
     #[inline]
     pub fn char(&self) -> char {
-        // Copy from packed struct to avoid unaligned access
         let flags = self.flags;
         let char_data = self.char_data;
         if flags.is_complex() {
@@ -259,19 +240,14 @@ impl Cell {
             "set_char() called with non-BMP character U+{cp:04X}; use set_overflow_index() instead"
         );
         let char_data = if cp <= Self::MAX_DIRECT_CODEPOINT {
-            // The mask is a no-op on this path (cp <= 0xFFFF), but makes the
-            // truncating cast provably lossless for the L0 verifier.
             (cp & 0xFFFF) as u16
         } else {
             0xFFFD // U+FFFD REPLACEMENT CHARACTER (non-BMP misuse fallback)
         };
         self.char_data = char_data;
-        // Clear structural flags: COMPLEX (not a multi-codepoint character),
-        // WIDE (set_char always writes a single-width BMP character), and
-        // WIDE_CONTINUATION (no longer a spacer). Otherwise DECFRA over wide
-        // characters would leave stale WIDE flags, and over continuations a
-        // stale bit 10 misread as PROTECTED. Copy-modify-write for the packed
-        // struct.
+        // set_char writes a single-width BMP character, so clear COMPLEX, WIDE and
+        // WIDE_CONTINUATION; otherwise DECFRA over wide characters leaves stale WIDE
+        // flags, and over continuations a stale bit 10 that reads as PROTECTED.
         let mut flags = self.flags;
         flags.remove(CellFlags::COMPLEX);
         flags.remove(CellFlags::WIDE);
@@ -283,7 +259,6 @@ impl Cell {
     #[inline]
     pub(crate) fn set_overflow_index(&mut self, index: u16) {
         self.char_data = index;
-        // Copy-modify-write for packed struct
         let mut flags = self.flags;
         flags.insert(CellFlags::COMPLEX);
         self.flags = flags;
@@ -295,18 +270,17 @@ impl Cell {
         self.flags = flags;
     }
 
-    /// Set the foreground color (indexed).
+    /// Set the foreground color.
     #[cfg(any(test, debug_assertions))]
     #[inline]
     pub fn set_fg(&mut self, fg: PackedColor) {
-        // Copy from packed struct for modification
         let colors = self.colors;
         if fg.is_default() {
             self.colors = colors.set_fg_default();
         } else if fg.is_indexed() {
             self.colors = colors.set_fg_indexed(fg.index());
         } else {
-            // RGB - mark as needing overflow
+            // RGB: the value itself lives in `CellExtras`.
             self.colors = colors.with_rgb_fg();
         }
     }
@@ -315,7 +289,6 @@ impl Cell {
     #[must_use]
     #[inline]
     pub const fn is_wide(&self) -> bool {
-        // Copy from packed struct to avoid unaligned access
         let flags = self.flags;
         flags.contains(CellFlags::WIDE)
     }
@@ -324,33 +297,23 @@ impl Cell {
     #[must_use]
     #[inline]
     pub const fn is_wide_continuation(&self) -> bool {
-        // Copy from packed struct to avoid unaligned access
         let flags = self.flags;
         flags.contains(CellFlags::WIDE_CONTINUATION)
     }
 
     /// Check if this cell is protected from selective erase.
     ///
-    /// `PROTECTED` and `WIDE_CONTINUATION` share bit 10, so this returns
-    /// `true` for both protected cells **and** wide continuation spacers.
-    /// Use `Row::is_cell_protected()` for context-aware disambiguation
-    /// when iterating over row cells.
-    ///
-    /// Correct for: normal cells, wide main cells.
-    /// False positive for: unprotected wide-continuation spacers.
+    /// `PROTECTED` shares bit 10 with `WIDE_CONTINUATION`, so this is also true for
+    /// every wide-continuation spacer; `Row::is_cell_protected()` disambiguates.
     #[must_use]
     #[inline]
     #[cfg(test)]
     pub const fn is_protected(&self) -> bool {
-        // Copy from packed struct to avoid unaligned access
         let flags = self.flags;
         flags.contains(CellFlags::PROTECTED)
     }
 
-    /// Check if this cell has a CellExtras entry (per-cell flag).
-    ///
-    /// When true, the rendering path should probe the CellExtras HashMap for
-    /// this cell. When false, the probe can be skipped entirely.
+    /// Check if this cell has a CellExtras entry; cells without one skip the probe.
     #[must_use]
     #[inline]
     pub const fn has_extras(&self) -> bool {
@@ -373,7 +336,6 @@ impl Cell {
     #[must_use]
     #[inline]
     pub const fn is_empty(&self) -> bool {
-        // Copy from packed struct to avoid unaligned access
         let colors = self.colors;
         let flags = self.flags;
         self.char_data == ' ' as u16 && colors.is_default() && flags.0 == 0

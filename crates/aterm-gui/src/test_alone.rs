@@ -1,36 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: run the calling `#[test]` ALONE, in a child of the test binary —
-//! or a NAMED helper test as a stand-in process ([`StandIn`]).
+//! Test-only: run the calling `#[test]` alone in a child of the test binary, or
+//! a named helper test as a stand-in process ([`StandIn`]).
 //!
-//! Some tests cannot share the lib-test process: one that changes something
-//! process-wide (the cwd, `RLIMIT_NOFILE`, the appearance preferences, the
-//! config home), or one whose subject a sibling's fork disturbs — a child any
-//! thread forks holds a copy of every descriptor until it execs, so a socket
-//! this test closed stays open in it (`control_retire_tests`). Such a test
-//! starts with `if !test_alone::alone() { return; }`: in the lib-test process
-//! [`alone`] runs `<test binary> --exact <this test> --test-threads=1` and
-//! answers `false`; in that child it answers `true`, and the body runs there.
+//! A test that changes something process-wide (the cwd, `RLIMIT_NOFILE`, the
+//! appearance preferences, the config home), or whose subject a sibling's fork
+//! disturbs (a forked child holds a copy of every descriptor until it execs,
+//! `control_retire_tests`), starts with `if !test_alone::alone() { return; }`.
+//! In the lib-test process [`alone`] runs `<test binary> --exact <this test>
+//! --test-threads=1` and answers `false`; in that child it answers `true`.
 //!
-//! The child must have run EXACTLY that test and passed it. An exit status is
-//! not that: `--exact` with a name that selects nothing runs zero tests and
-//! exits 0, so the hand-written copies this replaces passed vacuously the
-//! moment a test or its module was renamed. The name is the harness's own —
-//! the thread libtest runs the test on is named after it — so it cannot go
-//! stale, and the child's `1 passed` is required all the same.
+//! The child must have run exactly that test and passed it: `--exact` with a
+//! name that selects nothing exits 0, so an exit status alone passes a renamed
+//! test. The name is the harness's own (libtest names the test's thread after
+//! it), and the child's `1 passed` is required.
 //!
-//! A STAND-IN is the same child for a test that needs a second process of its
-//! own — a successor that dials, a racer, a parent that dies, a live process
-//! whose table is read — with that process's role in the caller's own
-//! environment and arguments ([`StandIn::command`]). It runs a helper test the
-//! caller names ([`StandIn::helper`]: the module by `module_path!()`, so only
-//! the function's name is written by hand) or the calling test itself
-//! ([`StandIn::this_test`]), and the caller judges its end by the same rule:
-//! [`Running::passed`] requires exactly `1 passed`, [`Running::selected`] —
-//! for a helper whose own exit is the subject — that libtest ran exactly that
-//! one test. A renamed helper fails there, by name, instead of running nothing
-//! and passing.
+//! A stand-in is the same child for a test that needs a second process (a
+//! successor that dials, a racer, a parent that dies), with its role in the
+//! caller's environment and arguments ([`StandIn::command`]). It runs a named
+//! helper test ([`StandIn::helper`]) or the calling test itself
+//! ([`StandIn::this_test`]). [`Running::passed`] requires exactly `1 passed`;
+//! [`Running::selected`], for a helper whose own exit is the subject, that
+//! libtest ran exactly that one test.
 //!
 //! The child is spawned with no `pre_exec` (std takes its `posix_spawn` path),
 //! writes into files rather than pipes, and is reaped by a bounded wait on its
@@ -39,11 +31,8 @@
 //! it execs — seconds for a child demoted to the background band before its
 //! exec.
 //!
-//! A stand-in that needs a DESCRIPTOR of its starter's is given it by [`hand`]
-//! (whose hook makes that one spawn a fork) and takes it by [`handed`], which
-//! checks what arrived: a descriptor number in an environment variable is
-//! only a number, and which descriptors a `Command` child holds depends on
-//! the std that spawned it.
+//! A stand-in that needs one of its starter's descriptors is given it by
+//! [`hand`] and takes it by [`handed`], which checks what arrived.
 
 use std::ffi::OsStr;
 #[cfg(unix)]
@@ -59,8 +48,7 @@ const ALONE: &str = "ATERM_TEST_ALONE";
 
 /// How long the child may run before it is named wedged and SIGKILLed: a hang
 /// detector, never a latency budget. Five of [`aterm_spec::wait::MUST_HAPPEN`],
-/// because each wait inside the child is a minute of its own, and a child that
-/// fails should fail with its own message, not this one.
+/// so a child whose own one-minute wait fails fails with its own message.
 const CHILD_HANG: Duration = Duration::from_secs(5 * 60);
 
 /// The calling test's name, as libtest gives it to `--exact`.
@@ -96,9 +84,9 @@ pub(crate) fn alone() -> bool {
     false
 }
 
-/// [`alone`]'s lib-test half with `env` added to the child's environment —
-/// for a caller that prepares something the child reads (a scratch config
-/// home) and so tests [`in_child`] itself.
+/// [`alone`]'s lib-test half with `env` added to the child's environment, for
+/// a caller that prepares something the child reads (a scratch config home)
+/// and so tests [`in_child`] itself.
 ///
 /// # Panics
 ///
@@ -159,9 +147,8 @@ impl StandIn {
 
     fn new(test: &str, how: &'static str) -> Self {
         let output = Output::new();
-        // std's Command: callers hand a stand-in descriptors (a PTY slave and its
-        // `pre_exec`, fds named in its environment: [`hand`]) and shipped
-        // `&mut Command` helpers.
+        // std's Command: callers hand a stand-in descriptors (a PTY slave and
+        // its `pre_exec`, [`hand`]) and use shipped `&mut Command` helpers.
         let mut command = Command::new(std::env::current_exe().expect("the test binary"));
         command
             .args([
@@ -211,20 +198,19 @@ impl StandIn {
     }
 }
 
-/// The variable beside `var` that says what the descriptor named in `var` IS.
+/// The variable beside `var` that says what the descriptor named in `var` is.
 #[cfg(unix)]
 fn is_var(var: &str) -> String {
     format!("{var}_IS")
 }
 
 /// What this process holds at `fd`, as the kernel names it: `fstat`'s file
-/// type, device, inode and (for a device) device number, with the
-/// descriptor's access mode. Every process that holds that open object reads
-/// the same answer. MEASURED on Darwin 25.6.0 (2026-10-13): a pipe end, a
-/// unix-socket end, a PTY end and a file each keep their answer across `fork`
-/// and `exec`, and the two ends of one pipe or socket pair give two. (Linux
-/// gives a pipe's two ends one inode, by its source — not measured — and the
-/// access mode then tells them apart.) `Err` says why there is no answer.
+/// type, device, inode and (for a device) device number, plus the access mode.
+/// Every process holding that open object reads the same answer: on Darwin a
+/// pipe end, a unix-socket end, a PTY end and a file each keep theirs across
+/// `fork` and `exec`, and the two ends of one pipe or socket pair differ (on
+/// Linux a pipe's ends share an inode; the access mode tells them apart).
+/// `Err` says why there is no answer.
 #[cfg(unix)]
 fn descriptor(fd: RawFd) -> Result<String, String> {
     let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -255,37 +241,25 @@ fn descriptor(fd: RawFd) -> Result<String, String> {
     ))
 }
 
-/// HAND A CHILD A DESCRIPTOR, SO THAT IT CAN CHECK WHAT ARRIVED. `fd` reaches
-/// the child `command` starts — a stand-in's ([`StandIn::command`]) or one
-/// that replaces this process (`exec`) — at its own number, which the child
-/// finds in `var` and takes with [`handed`]; `fd` itself may stay
-/// close-on-exec here, as it should.
+/// Hand `fd` to the child `command` starts (a stand-in's, [`StandIn::command`],
+/// or an `exec` replacing this process) at its own number, which the child
+/// finds in `var` and takes with [`handed`]. `fd` may stay close-on-exec here.
 ///
 /// The hand-over is a `pre_exec` hook that clears close-on-exec on exactly
-/// `fd`, in the child: the one spelling that works under every std. A std
-/// with the SP-1 strip (Trust seals from `62f89f11` on) gives a `Command`
-/// child its stdio and nothing else, whatever flags this process's
-/// descriptors carry — a hook sends `Command` down its fork path, where that
-/// std marks the child's table close-on-exec BEFORE the hooks run — and a std
-/// without it marks nothing, so the clear is all a flagged descriptor needs
-/// there. (`CommandExt::inherit_fd` exists only with SP-1 and is unstable
-/// there, feature `trust_process_inherit_fds`.)
+/// `fd` in the child, the one spelling that works under every std: a std with
+/// the SP-1 strip gives a `Command` child only its stdio (a hook sends it down
+/// the fork path, which marks the child's table close-on-exec before the hooks
+/// run), and a std without it marks nothing. (`CommandExt::inherit_fd` exists
+/// only with SP-1, unstable, feature `trust_process_inherit_fds`.)
 ///
-/// ONLY FROM A PROCESS THAT RUNS ONE TEST. The hook makes the spawn a `fork`,
-/// and a fork of the whole lib-test process holds a copy of every sibling
-/// test's descriptors until it execs (the module docs). So the caller is a
-/// stand-in, or a test behind [`alone`], or it `exec`s, which forks nothing.
+/// Only from a process that runs one test: the hook makes the spawn a fork,
+/// and a fork of the lib-test process holds every sibling test's descriptors
+/// until it execs. So the caller is a stand-in, a test behind [`alone`], or
+/// an `exec`.
 ///
-/// WHY THE CHILD CHECKS. Until 2026-10-13 the one fixture that handed a
-/// stand-in descriptors (`seamless::tests::commit_parent_death_helper`)
-/// cleared `FD_CLOEXEC` in the parent, spawned a bare `Command` and wrote the
-/// numbers into its environment. Under an SP-1 std nothing arrived: the
-/// stand-in wrapped two numbers that were not open, the production code it
-/// armed on them stopped at once for a reason the test was not about, and
-/// the test passed on that exit — it could not fail for the regression in its
-/// name (measured: a mutant of that regression passed 5 runs of 5). So the
-/// number travels with what the descriptor IS ([`descriptor`]), and the child
-/// refuses anything else by name.
+/// `var`'s companion carries what the descriptor is ([`descriptor`]), so the
+/// child refuses anything else by name: under an SP-1 std a number alone names
+/// nothing open, and a test armed on it passes for a reason it is not about.
 ///
 /// # Panics
 ///
@@ -311,23 +285,19 @@ pub(crate) fn hand(command: &mut Command, var: &str, fd: RawFd) {
     }
 }
 
-/// The descriptor this process was handed under `var` ([`hand`]), now its
-/// own: found at its number and found to be the very descriptor its starter
-/// named, or the process stops here and says which it holds instead.
+/// The descriptor this process was handed under `var` ([`hand`]), now its own:
+/// found at its number and found to be the descriptor its starter named, or
+/// the process stops here saying what it holds instead.
 ///
-/// Taken ONCE, and close-on-exec from then on, as the product's intake leaves
-/// a descriptor it was handed (`seamless::take_commit_fd_from`): a child this
-/// process starts later holds it only if it is handed on. The flag is also
-/// how a second take is refused, which would make two owners of one number —
-/// a descriptor crosses an `exec` only with the flag clear, so one that
-/// carries it was taken here already.
+/// Taken once, and close-on-exec from then on (as `seamless::take_commit_fd_from`
+/// leaves a handed descriptor), so a later child holds it only if handed on.
+/// The flag also refuses a second take: a descriptor crosses an `exec` only
+/// with the flag clear, so one that carries it was taken here already.
 ///
 /// # Panics
 ///
-/// When `var` is not [`hand`]'s, or the number holds anything but that
-/// descriptor: THE HAND-OVER FAILED, and whatever the caller meant to do on
-/// the descriptor would have been done on something else. And on a second
-/// take.
+/// When `var` is not [`hand`]'s, when the number holds anything but that
+/// descriptor (the hand-over failed), or on a second take.
 #[cfg(unix)]
 #[track_caller]
 pub(crate) fn handed(var: &str) -> OwnedFd {
@@ -414,8 +384,8 @@ impl Running {
         self.status.is_some()
     }
 
-    /// Wait for its exit — a hang detector of [`CHILD_HANG`], past which it
-    /// is SIGKILLed and reads as wedged — and answer what it did.
+    /// Wait for its exit (a hang detector of [`CHILD_HANG`], past which it is
+    /// SIGKILLed and reads as wedged) and answer what it did.
     pub(crate) fn wait(mut self) -> Ran {
         self.finish()
     }
@@ -490,10 +460,10 @@ impl Running {
     }
 }
 
-/// Wait until `ready` — a hang detector of [`aterm_spec::wait::MUST_HAPPEN`]
-/// — or until one of `stand_ins` ends first, which is then judged by its own
-/// run: it failed, or ran no test of its name (a renamed helper), and its
-/// output says which. One that passed before `ready` never readied it.
+/// Wait until `ready` (a hang detector of [`aterm_spec::wait::MUST_HAPPEN`])
+/// or until one of `stand_ins` ends first, which is then judged by its own
+/// run: it failed or ran no test of its name, and its output says which. One
+/// that passed before `ready` never readied it.
 ///
 /// An end is judged only after `ready` is asked once more: what a stand-in did
 /// before its exit is there once its exit is seen, so one that readied and
@@ -548,8 +518,7 @@ impl Drop for Running {
         if self.detached || self.status.is_some() {
             return;
         }
-        // `Child::kill` is SIGKILL (AGENTS.md); unreaped, the pid is
-        // still the child's.
+        // `Child::kill` is SIGKILL; unreaped, the pid is still the child's.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -569,9 +538,9 @@ impl Ran {
         format!("stdout:\n{}\nstderr:\n{}", self.stdout, self.stderr)
     }
 
-    /// `Ok` when it exited 0 having run exactly its test and passed it — the
-    /// verdict [`Running::passed`] panics with, for a caller that judges
-    /// several stand-ins before it fails.
+    /// `Ok` when it exited 0 having run exactly its test and passed it: the
+    /// verdict [`Running::passed`] panics with, for a caller that judges several
+    /// stand-ins before it fails.
     pub(crate) fn passed_one(&self) -> Result<(), String> {
         let (test, how) = (&self.test, self.how);
         let Some(status) = self.status else {
@@ -639,7 +608,7 @@ impl Ran {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{Running, StandIn, until_or_ended};
 
@@ -653,7 +622,6 @@ mod tests {
     /// question only, which is that interleaving every time.
     /// NEGATIVE CONTROL: on the wait that judged the end on its first look,
     /// this panicked with `passed without: the second look`.
-    #[cfg(unix)]
     #[test]
     fn a_stand_in_that_readied_then_ended_between_two_looks_readied() {
         if std::env::var_os(ROLE).is_some() {

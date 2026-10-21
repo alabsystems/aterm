@@ -1,60 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `App` glue for the UPDATE FLOW: the ONE-CLICK apply every "update ready" affordance
-//! fires ([`App::apply_update_or_details`] — the Version menu's ⬆️ item, the palette's
-//! Version row, a press on the staged band row's `Install now` (`App::perform_intent`), the
-//! off-macOS tab-strip ↻), the live Version-menu
-//! re-sync ([`App::refresh_version_menu`]), and the process updater state projected into
-//! the native Settings `/updates` route. (The retired own-rendered modal's glue —
-//! `update_screen_exit`/`_refresh`/`_check`, `update_hit_at`, `update_screen_click`,
-//! `on_key_update_mode`, `update_input_event` — was DELETED on 2026-09-15 with the card
-//! itself; see `update_screen.rs`.)
+//! `App` glue for the update flow: one-click apply ([`App::apply_update_or_details`]),
+//! live Version-menu re-sync ([`App::refresh_version_menu`]), and updater state
+//! projection into the native Settings `/updates` route.
 
 use crate::App;
 use crate::native_app::UpdateOutcome;
 use crate::update_screen::UpdateState;
 
-/// Whether an apply outcome's `source` is the AUTOMATIC lane's own — every
-/// automatic caller labels itself `automatic…` ("automatic", "automatic handoff",
-/// "automatic · retrying later", "automatic policy fallback"); a person's lanes
-/// are "manual", "manual handoff" and "control request". Only a retry of the
-/// lane's OWN attempt goes unannounced.
+/// Whether an apply outcome's `source` is automatic (`"automatic..."`) rather than
+/// user-initiated (`"manual"`, `"manual handoff"`, `"control request"`).
 fn source_is_automatic(source: &str) -> bool {
     source.starts_with("automatic")
 }
 
-/// Serializes tests that record failures or read standing failure facts in the
-/// process-wide scratch update ledger.
-///
-/// `App::headless_for_test` points `ATERM_UPDATE_ROOT` at ONE scratch root per test
-/// process (so the unit suite cannot write the developer's real `health.toml`), and
-/// the ledger's standing slots — `last_apply_failure_target_build` above all — are
-/// single-valued. A test that records a failure for its own build number and then
-/// asks the reducer to read it back is therefore racing every sibling that records
-/// one for a different build: observed, not theorised, on the first parallel run.
-/// The build numbers below are already unique per test, which keeps the COUNTS
-/// independent; this keeps the standing slots independent too.
-/// Every failure writer must participate, including tests that assert only the
-/// in-memory retry policy. The ledger's own file lock protects each individual
-/// write; this guard also protects a test's later read from another test's write.
-///
-/// Poison is absorbed deliberately: a panicking test has already failed, and letting
-/// it convert every later ledger test into a second failure only hides the first.
+/// Serializes tests that access the process-wide scratch update ledger
+/// (`ATERM_UPDATE_ROOT`), whose standing slots (`last_apply_failure_target_build`)
+/// are single-valued across parallel tests. Absorbs poison so one panicking test
+/// does not cascade.
 #[cfg(test)]
 pub(crate) static UPDATE_LEDGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Take [`UPDATE_LEDGER_TEST_LOCK`] for the rest of the calling test, on the
-/// scratch ledger and with it quiet:
-///
-/// - the scratch root is primed first ([`crate::prime_test_update_root`]): a
-///   test that writes the ledger before it builds its first headless `App`
-///   would otherwise write the developer's REAL per-user ledger and read back
-///   a scratch one that never saw the write;
-/// - then, lock held, it waits until no detached ledger writer is in flight
-///   ([`crate::app_update_handoff::ledger_writers`]): every one was started by
-///   an earlier holder that has let go, and could otherwise land between this
-///   test's write and its read-back.
+/// Hold [`UPDATE_LEDGER_TEST_LOCK`] after priming the scratch root
+/// ([`crate::prime_test_update_root`]) and draining detached ledger writers
+/// ([`crate::app_update_handoff::ledger_writers`]).
 #[cfg(test)]
 pub(crate) fn hold_update_ledger_for_test() -> std::sync::MutexGuard<'static, ()> {
     crate::prime_test_update_root();
@@ -68,11 +38,7 @@ pub(crate) fn hold_update_ledger_for_test() -> std::sync::MutexGuard<'static, ()
 
 #[cfg(test)]
 impl App {
-    /// The update lane's NEWEST live row's words, `"<title> — <detail>"`, or
-    /// `None` with no update row up — for the tests that used to read the
-    /// floating pill and then the one bar. The center can hold the progress
-    /// row and an outcome row side by side (design §5.3); the newest — the
-    /// highest id — is the one an outcome test asks about.
+    /// The update lane's newest live row as `"<title> — <detail>"`, or `None`.
     pub(crate) fn update_row_text(&self) -> Option<String> {
         self.messages
             .live_rows()
@@ -81,9 +47,7 @@ impl App {
             .map(|l| format!("{} — {}", l.msg.title, l.msg.detail.join("; ")))
     }
 
-    /// The update lane's NEWEST RECORDED outcome's words, `"<title> — <detail>"`
-    /// — ruling 143: an outcome the lane answers by itself is a record, never a
-    /// band row, so the tests that read its words read them off the log.
+    /// The update lane's newest recorded outcome as `"<title> — <detail>"`.
     pub(crate) fn update_record_text(&self) -> Option<String> {
         self.messages
             .log()
@@ -96,32 +60,24 @@ impl App {
             .map(|r| format!("{} — {}", r.title, r.detail.join("; ")))
     }
 
-    /// The update lane's PROGRESS row's detail, its lines joined back with
-    /// `; ` (the staged sentence is split at those joints when it exceeds the
-    /// line cap); `None` with no progress row up.
+    /// The update lane's progress row detail joined with `; `, or `None`.
     pub(crate) fn update_row_detail(&self) -> Option<String> {
         self.messages
             .live_by_key(crate::update_words::KEY_PROGRESS)
             .map(|l| l.msg.detail.join("; "))
     }
 
-    /// Start the center over: an empty ring, nothing live — what a test that
-    /// wants a clean lane does between cases.
+    /// Reset the message center and update flow state between test cases.
     pub(crate) fn clear_messages_for_test(&mut self) {
         self.messages = aterm_messages::MessageCenter::new(
             aterm_messages::MessageLog::empty(),
             std::time::Instant::now(),
         );
         self.update_row_before_install = None;
-        // A fresh center mints ids from 1 again: a remembered flow id would
-        // name whatever row the next test posts under it.
         self.update_flow = None;
         self.staged_said = None;
-        // Who is waiting on the update is the scene's to say again.
         self.update_ctl_checks = 0;
         self.update_quiet = None;
-        // The committed count mirrors the center's; a fresh center commits
-        // nothing, so the geometry gives its rows back at once.
         if self.message_band_rows != 0 {
             self.message_band_rows = 0;
             self.regrid_for_chrome_rows();
@@ -130,33 +86,14 @@ impl App {
     }
 }
 
-/// `true` while the `ATERM_DEBUG_SEAMLESS_REEXEC` QA seam is armed — and it SAYS
-/// SO, once per process, the first time anything asks. A DEVELOPMENT SEAM
-/// (`aterm_types::dev_seam!`, 2026-09-23): a shipped binary never reads it, so it is
-/// always `false` there.
-///
-/// The seam re-execs the SAME binary through the full seamless handoff + adopt
-/// path so the shell-survives-an-update contract is testable without cutting a
-/// release. That is worth keeping. What is not worth keeping is a release binary
-/// that reports "update ready" and takes the handoff route because of an ambient
-/// variable, with nothing on the record saying which of the two it did. It no
-/// longer relaxes the adoption identity gate either — see
-/// `seamless::normalize_commit`, where the `unknown`-commit admission is now
-/// `cfg!(debug_assertions)` alone.
+/// `true` while the `ATERM_DEBUG_SEAMLESS_REEXEC` dev seam is armed (always `false`
+/// in release builds). Re-execs the running binary through the seamless handoff
+/// and adopt path.
 pub(crate) fn debug_seamless_reexec_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| {
-        // THE ENVIRONMENT ANSWERS THIS, and nothing else can. Calling this
-        // function here — as the "make the knobs loud" refactor did — is a
-        // self-recursive `OnceLock`: the initializer waits on the `Once` it is
-        // itself running, so the FIRST caller parks forever. It is reached from
-        // `apply_staged_update_now`, i.e. the main thread, on every apply.
-        //
-        // Value semantics via the ONE shared flag rule (`env_flag_engaged`):
-        // unset, EMPTY and "0" do NOT arm the seam. `is_some()` here armed it on
-        // a present-but-empty variable — the 2026-09-01 empty-inherited-var
-        // species — and an armed seam re-execs THIS binary and reports the apply
-        // as done while the staged build never lands (2026-09-14 audit).
+        // Read the environment directly (`env_flag_engaged` rejects unset, empty, and "0")
+        // rather than calling `debug_seamless_reexec_armed` recursively inside `OnceLock`.
         let on = aterm_types::control_socket::env_flag_engaged(
             aterm_types::dev_seam!("ATERM_DEBUG_SEAMLESS_REEXEC")
                 .map(|v| v.to_string_lossy().into_owned())
@@ -174,13 +111,7 @@ pub(crate) fn debug_seamless_reexec_armed() -> bool {
     })
 }
 
-/// The update bar's words for a build that is already installed on disk where
-/// nothing will switch to it by itself: the reducer imports it as an ACTIVATION
-/// stage, and policy requires a person's request. (With a retry scheduled the
-/// flow row says the lane is still on it, and no outcome is posted.)
-/// ONE install verb (audit 2026-09-24): the row the `Install now` capsule
-/// stands on says the ready row's own words (`aterm vX is ready`), never
-/// "installed" beside a press that installs, nor "finish".
+/// Update bar wording for a build already installed on disk awaiting manual activation.
 #[cfg(any(unix, test))]
 pub(crate) fn update_installed_title(version: Option<&str>) -> String {
     version.map_or_else(
@@ -190,46 +121,28 @@ pub(crate) fn update_installed_title(version: Option<&str>) -> String {
 }
 #[cfg(any(unix, test))]
 pub(crate) const UPDATE_INSTALLED_DETAIL: &str = crate::update_words::INSTALL_FROM_MENU;
-/// An update the lane has stopped trying by itself: the person's next step is
-/// the Version menu's "Install aterm vX now" — the row's `Install now`. In
-/// the band's one failure grammar (ruling 309: main's `Update didn't install`
-/// read apart from every other `Couldn't …` beside it).
+/// Headline when automatic apply has stopped retrying and requires `Install now`.
 pub(crate) const UPDATE_DIDNT_INSTALL: &str = "Couldn't install the update";
-/// An attempt that failed with no staged build left to retry (main's words,
-/// ruling 68, in the failure grammar since ruling 309): a failure row with
-/// the details page.
+/// Headline when an apply attempt failed with no staged build left to retry.
 pub(crate) const UPDATE_DIDNT_FINISH: &str = "Couldn't finish the update";
-/// The install waits on work only the person can save or close (the close
-/// preflight's blocker, painted beneath it — ruling 143's editor block, said
-/// on its own row when no flow row is up to say it).
+/// Headline when the install is blocked on unsaved user work.
 pub(crate) const UPDATE_WAITS_FOR_YOU: &str = "Update waits for you";
 
-/// The three answers about this process [`App::apply_posture_for`] folds in,
-/// read ONCE at the call site so the pure half ([`App::apply_posture_with`]) is
-/// testable without touching process environment (the tests in this crate
-/// assert those variables' ABSENCE).
+/// Process-level inputs to [`App::apply_posture_for`], separated so
+/// [`App::apply_posture_with`] is testable without mutating process environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ApplyPostureEnv {
-    /// Why the in-session handoff cannot run in this process, if it cannot —
-    /// [`App::seamless_handoff_unavailable`], the SAME reading the apply gate
-    /// takes for `seamless_capable`. With a reason here the apply is REFUSED
-    /// while any terminal is open (`native_update_admission::classify` admits
-    /// the cold lane only with zero live PTYs), so no promise about WHEN it
-    /// applies is true.
+    /// Why in-session handoff is unavailable ([`App::seamless_handoff_unavailable`]).
+    /// When `Some`, cold apply is refused while any PTY is open.
     pub(crate) handoff_unavailable: Option<crate::app_update_handoff::HandoffUnavailable>,
-    /// `[update] auto_apply` (the environment veto that was folded in here is gone,
-    /// 2026-09-23).
+    /// Configured `[update] auto_apply` policy.
     pub(crate) auto_apply: crate::app_config::AutoApplySetting,
     /// `$ATERM_DEBUG_RELAUNCH_NUDGE` is set: the screenshot seam vetoes the lane.
     pub(crate) nudge_seam: bool,
 }
 
 impl ApplyPostureEnv {
-    /// The live answers. Plain reads — `var_os` and two fields of the App
-    /// (`seamless_handoff_unavailable`), and the fixed-shape memo in
-    /// `relaunch_nudge_seam_suppresses_auto_apply`, whose initializer reads the
-    /// ENVIRONMENT — never a memo whose initializer could call its own owner:
-    /// that exact shape parked the main thread forever on 2026-08-30.
+    /// Observe live process and `App` posture inputs.
     pub(crate) fn observe(app: &App) -> Self {
         Self {
             handoff_unavailable: app.seamless_handoff_unavailable(),
@@ -240,18 +153,11 @@ impl ApplyPostureEnv {
 }
 
 impl App {
-    /// Snapshot the current process-owned updater reducer into a fresh [`UpdateState`].
-    /// This is memory-only: ledger and installed-bundle facts enter the reducer solely
-    /// through typed worker completions, so Settings/introspection never block input.
-    /// `checking` marks a manual check as in flight.
+    /// Snapshot the updater reducer into a fresh [`UpdateState`] without disk I/O.
     pub(crate) fn update_snapshot(&self, checking: bool) -> UpdateState {
         let snapshot = self.native_updater_service.snapshot();
-        // The retry disposition is EVENT-LOOP state, so only the host can answer it —
-        // and the answer is half of what a person needs from a failed apply ("wait" vs
-        // "press this").
         let staged_build = snapshot.staged.as_ref().map(|staged| staged.build);
         let retry = self.apply_retry_for(staged_build);
-        // The one on-hold fact, the one the Version menu's press refuses on.
         let on_hold = staged_build.is_some_and(|build| self.latched_activation_trial_spent(build));
         UpdateState::from_service(snapshot, checking, retry)
             .with_staged_on_hold(on_hold)
@@ -264,12 +170,8 @@ impl App {
             .with_install_posture(self.install_posture)
     }
 
-    /// Whether a PERSON is waiting on the update's work right now (design ruling
-    /// 220): a check they started from Settings ▸ Software Update, the Version
-    /// menu or Check for Updates… (the updater service's live ticket, which only
-    /// [`Self::start_native_update_check`] mints), or an `aterm ctl update check`
-    /// in flight (`Wake::UpdateCheckAsked`). The background loop's checks are
-    /// neither: what they download is nobody's wait.
+    /// Whether a user-initiated update check (`start_native_update_check` or
+    /// `aterm ctl update check`) is in flight.
     pub(crate) fn update_awaited(&self) -> bool {
         self.native_updater_service.snapshot().active.is_some() || self.update_ctl_checks > 0
     }
@@ -283,16 +185,9 @@ impl App {
         };
     }
 
-    /// THE UNATTENDED DOWNLOAD IS SILENT (design ruling 220; the owner's R3,
-    /// "seamless, non-interrupting (ideally silent)"): a download or check the
-    /// background loop runs, with no person waiting on it and no flow row already
-    /// up, raises no row and re-grids nothing. Settings ▸ Software Update shows
-    /// it ([`crate::update_screen::QuietDownload`]): its words count whole MB
-    /// ([`quiet_bytes`]), they are republished only when they change, and only
-    /// to the Settings views ([`Self::publish_quiet_update_words`]) — no menu,
-    /// palette, tab or every-window repaint for a download nobody waits on. How
-    /// it ends is the record the lane already writes. `true` when the report
-    /// was taken here.
+    /// Record progress for an unattended background download without raising a band row.
+    /// Republishes whole-MB progress to open Settings views only when the text changes.
+    /// Returns `true` when handled quietly.
     fn note_quiet_update_progress(&mut self, progress: &aterm_update::Progress) -> bool {
         use aterm_update::Progress as P;
         let quiet = match progress {
@@ -313,16 +208,12 @@ impl App {
                     quiet_bytes(*bytes_done)
                 },
             },
-            // Still the download's headline: the detail alone says it is
-            // checked ("Checking the download."), so the page never reads as
-            // a check for updates.
             P::Verifying { version } => crate::update_screen::QuietDownload {
                 version: version.clone(),
                 title: crate::update_words::flow_title("Downloading", version),
                 progress: String::new(),
             },
             P::Staged { .. } | P::Failed { .. } | P::Deferred { .. } | P::Withheld { .. } => {
-                // Over: the page reads the stage (or the ledger) from here on.
                 if self.update_quiet.take().is_some() {
                     self.publish_native_update_state();
                 }
@@ -337,8 +228,6 @@ impl App {
             )
         });
         if self.update_awaited() || flow_up {
-            // A person is waiting, or the row is already theirs: it keeps moving
-            // to its end, so its Complete echo and the records stay one story.
             if self.update_quiet.take().is_some() {
                 self.publish_native_update_state();
             }
@@ -351,26 +240,9 @@ impl App {
         true
     }
 
-    /// Whether the automatic apply lane still INTENDS this exact staged build — the
-    /// difference between "leave it alone and it will land" and "this will not move
-    /// until you ask for it".
-    ///
-    /// ASK EVERY CARRIER OF THE ANSWER, NOT ONE. There are two — a live
-    /// `auto_apply_intent` (a failure does not necessarily consume it; a
-    /// control-request apply, for one, leaves it armed) and an `AutoApplyManualOnly`
-    /// latch that still carries a lapse deadline — and either one means the loop will
-    /// come back to this artifact.
-    ///
-    /// Both must name the current stage's build AND digest: a leftover from a
-    /// superseded artifact schedules nothing for different bytes sharing its build.
-    /// Automatic apply must also be enabled, including the screenshot-seam veto,
-    /// or a lapse would re-arm into a poll that answers `Clear`.
-    ///
-    /// Extracted from the failure-pill decision in
-    /// [`Self::react_to_update_apply_outcome`] so the STANDING surfaces (the Version
-    /// menu, the palette's Version row, the Settings page) answer the question the
-    /// same way the transient pill does. Two answers to "will this retry?" in one
-    /// program is how a user ends up waiting on something that stopped.
+    /// Whether automatic apply will still attempt `staged_build` — via either a live
+    /// `auto_apply_intent` or an `AutoApplyManualOnly` latch with a lapse deadline
+    /// matching the current stage's build and digest while auto-apply is enabled.
     pub(crate) fn automatic_apply_retry_scheduled(&self, staged_build: u64) -> bool {
         if !crate::app_config::update_auto_apply(&self.config)
             || Self::relaunch_nudge_seam_suppresses_auto_apply()
@@ -396,23 +268,14 @@ impl App {
             })
     }
 
-    /// [`Self::automatic_apply_retry_scheduled`] as the typed value the wording law
-    /// reads. `None` — no build on offer — answers `ManualOnly`, the conservative
-    /// half: promising a retry that is not scheduled is the one error that costs the
-    /// reader real time. A latched activation whose boot trial is spent answers
-    /// `NewerRelease`: the press "try again now" asks for is the start the trial
-    /// rolls back ([`crate::update_words::ApplyPosture::TrialSpent`], the band
-    /// row's twin).
+    /// Typed retry disposition ([`crate::update_apply_trouble::ApplyRetry`]) for
+    /// `staged_build` (`ManualOnly` when `None`, `NewerRelease` when the boot trial is spent).
     pub(crate) fn apply_retry_for(
         &self,
         staged_build: Option<u64>,
     ) -> crate::update_apply_trouble::ApplyRetry {
         use crate::update_apply_trouble::ApplyRetry;
-        // The historical failure describes the previous attempt. A current
-        // environmental block can require repair; a later verified repair can
-        // restore scheduling without rewriting that history. The remedy is the
-        // BLOCK's (round eight, finding 14's review): the ledger's latest reason
-        // may be an ordinary failure booked while it stands.
+        // A standing environmental block's remedy takes precedence over the ledger's last failure reason.
         if let Some(remedy) =
             staged_build.and_then(|build| self.auto_apply_environment_remedy(build))
         {
@@ -425,9 +288,7 @@ impl App {
         }
     }
 
-    /// The remedy [`Self::apply_retry_for`] names for `staged_build`, when it
-    /// answers [`crate::update_apply_trouble::ApplyRetry::NeedsPerson`]: the
-    /// standing block's, for a row that says what the person does next.
+    /// Standing block remedy for `staged_build` when [`Self::apply_retry_for`] returns `NeedsPerson`.
     fn person_remedy_for(
         &self,
         staged_build: u64,
@@ -438,23 +299,13 @@ impl App {
         }
     }
 
-    /// HOW the staged `build` will be applied — the band row's finer law
-    /// ([`crate::update_words::ApplyPosture`]), which must agree with
-    /// [`Self::apply_retry_for`]: a `ManualOnlyLatched { lapses: true }` bar and a
-    /// `Scheduled` row are the same fact. The bar says this instead of "restart
-    /// aterm to apply", which it said over the in-session handoff until
-    /// 2026-08-30.
+    /// Compute [`crate::update_words::ApplyPosture`] for the staged `build`.
     pub(crate) fn apply_posture_for(&self, build: u64) -> crate::update_words::ApplyPosture {
         self.apply_posture_with(build, ApplyPostureEnv::observe(self))
     }
 
-    /// The pure half of [`Self::apply_posture_for`]: the three answers about
-    /// this process supplied, the lane's own state read from `self`. Order: an
-    /// unavailable handoff first, whatever its reason (it changes WHETHER
-    /// anything applies while a terminal is open, so it outranks everything that
-    /// only changes WHEN), then policy (the config), then the screenshot seam (a
-    /// development build's only), then this build's own stand-down latch; what is left is
-    /// the automatic lane.
+    /// Pure posture evaluation: unavailable handoff outranks policy, screenshot seam,
+    /// and per-build stand-down latch.
     pub(crate) fn apply_posture_with(
         &self,
         build: u64,
@@ -463,10 +314,7 @@ impl App {
         use crate::app_config::AutoApplySetting;
         use crate::update_words::{ApplyPosture as P, AutoApplyVeto};
         if let Some(why) = env.handoff_unavailable {
-            // The warning outranks policy, but its fallback clause depends on
-            // it: a vetoed automatic lane never takes the cold apply at zero
-            // live PTYs, so the bar must not promise that landing. Same
-            // precedence as the standalone arms below.
+            // Carry the policy veto into `HandoffOff` so it does not promise a cold apply when vetoed.
             let veto = match env.auto_apply {
                 AutoApplySetting::OffByConfig => Some(AutoApplyVeto::Config),
                 AutoApplySetting::On if env.nudge_seam => Some(AutoApplyVeto::Env {
@@ -515,22 +363,10 @@ impl App {
         P::Automatic
     }
 
-    /// One report from the updater's own check reached the event loop
-    /// (`Wake::UpdateProgress`): the update's FLOW ROW moves on — with the
-    /// apply posture computed for a `Staged` build, so the row says how it
-    /// installs — which settles, re-grids and repaints. A check that DOWNLOADS
-    /// is a check that works: a health warning that said checking (or, once
-    /// the build is staged, downloading) was broken is over. The
-    /// `Staged` report is emitted from the check thread BEFORE the `on_staged`
-    /// callback posts `Wake::UpdateStaged`, so it lands here before the stage
-    /// is reconciled and armed: only the POLICY posture is knowable now; the
-    /// ARMED fact is re-stated onto the row a moment later by
-    /// `arm_native_auto_apply`. A POSTPONED download posts no row: a live
-    /// download row leaves quietly and the updater's sentence is a record.
+    /// Handle `Wake::UpdateProgress`: advance the update flow row, heal superseded
+    /// check/download health warnings, and record postponed or automatic-stage outcomes.
     pub(crate) fn note_update_progress(&mut self, progress: &aterm_update::Progress) {
         use crate::messages_host::FlowPhase;
-        // The updater's own sentence for how a download ended is the log's (and
-        // the row's further detail): the row says it in the flow's words.
         match progress {
             aterm_update::Progress::Failed { detail } => {
                 aterm_log::warn!("update download failed: {detail}");
@@ -548,9 +384,6 @@ impl App {
         } else {
             None
         };
-        // A check that downloads is a check that works — and a download that
-        // staged is a download that works; neither says an install does
-        // (`App::heal_update_health` heals only the warning its proof answers).
         match progress {
             aterm_update::Progress::Downloading { .. }
             | aterm_update::Progress::Verifying { .. } => {
@@ -563,8 +396,6 @@ impl App {
             | aterm_update::Progress::Failed { .. }
             | aterm_update::Progress::Withheld { .. } => {}
         }
-        // The version a failed or postponed report does not carry: the live
-        // download's, else the quiet one's (read before the quiet lane clears it).
         let quiet_version = self.update_quiet.as_ref().map(|q| q.version.clone());
         if self.note_quiet_update_progress(progress) {
             return;
@@ -578,10 +409,7 @@ impl App {
             .unwrap_or_default();
         let downloading = downloading.map(|flow| flow.id);
         let msg = crate::update_words::progress(progress, posture, &flow_version);
-        // A STAGED BUILD IS SAID ONCE per build and posture (ruling 119): every
-        // reconcile re-states the stage, and a repeat neither asks a lapsed
-        // question again nor writes the same record twice — the Version menu and
-        // Software Update still offer the build. A download row still up is over.
+        // Announce a staged build at most once per `(build, posture)`.
         let staged_key = match (progress, posture) {
             (aterm_update::Progress::Staged { build, .. }, Some(posture)) => {
                 Some((*build, posture))
@@ -599,14 +427,7 @@ impl App {
             self.staged_said = staged_key;
         }
         if msg.hold == aterm_messages::Hold::LogOnly {
-            // A RECORD (ruling 143) — a staged build that installs by itself,
-            // now or once the terminals close, a download postponed or failed: the
-            // live download row, if one is up, is over first — `Ok` when the
-            // download DELIVERED (a staged build: its Complete echo), `Warn` when
-            // it failed (the Fault echo), and a postponement leaves with no
-            // outcome to claim (a fade, never `⚠ failed`) — and the words are
-            // recorded. A record never supersedes a live row (the engine's
-            // rule, ruling 47), so the row is ended by id.
+            // Log-only outcomes resolve or withdraw any live download row before recording.
             if let Some(id) = downloading {
                 self.update_flow = None;
                 match progress {
@@ -632,20 +453,14 @@ impl App {
             aterm_update::Progress::Staged { version, build } => {
                 (version.clone(), FlowPhase::Staged { build: *build })
             }
-            // All three are records, answered above.
             aterm_update::Progress::Failed { .. }
             | aterm_update::Progress::Deferred { .. }
             | aterm_update::Progress::Withheld { .. } => {
                 return;
             }
         };
-        // A report that moves only the METER — the download poller's next
-        // byte count under the same words — restates the live row in place
-        // (no log line; the meter is volatile), exactly as the toolchain
-        // tailer's reads do. A report with new WORDS — the next phase — posts,
-        // and the key supersedes the last phase's row so the log keeps every
-        // one. Posted as-is the byte tick would be the center's Duplicate
-        // (same key, same words) and the meter would never move.
+        // Byte-count ticks under identical wording restate the live row in place without
+        // logging; phase changes supersede the row.
         let same_words = self
             .live_update_flow()
             .and_then(|flow| self.messages.live(flow.id))
@@ -657,34 +472,15 @@ impl App {
         }
     }
 
-    /// Re-state HOW the staged `build` installs on its live ready row, if the
-    /// row is still up for it (`App::update_flow`, never its words), and repaint
-    /// only when the words changed — the full words, re-anchoring the ready
-    /// row's short hold. A no-op must not re-anchor it, so identical words
-    /// restate nothing.
-    ///
-    /// EVERY site that changes the posture calls this — arming the lane and
-    /// each of the physical stand-down paths that latch manual-only (the
-    /// refused physical attempt, the policy fallback, the reaped abort, the
-    /// returned-apply reconcile). Until 2026-08-30 only the first two did:
-    /// an admission refusal is synchronous and lands inside the `Staged` row's
-    /// hold, so the row kept promising the old words while the Version-menu
-    /// row already said the attempt did not start — two surfaces, two answers.
-    ///
-    /// A posture whose words are a RECORD (ruling 143: the lane armed, a
-    /// stand-down that retries later, the handoff off) folds the live ready row
-    /// — withdrawn, no outcome to claim — and records the words. With no staged
-    /// row up, a posture that has just become a DECISION (the lane stopped)
-    /// raises the ready row once ([`Self::ensure_staged_decision_in`], ruling 119);
-    /// anything else is a no-op.
+    /// Update the live ready row's wording when `build`'s [`ApplyPosture`] changes.
+    /// Withdraws the row if the posture becomes log-only, or raises the ready decision
+    /// once if the lane just stopped with no row up.
     pub(crate) fn restate_staged_bar_posture(&mut self, build: u64) {
         let posture = self.apply_posture_for(build);
         self.restate_staged_bar_posture_in(build, posture);
     }
 
-    /// [`Self::restate_staged_bar_posture`] under an explicit `posture` — the
-    /// caller's own `apply_posture_for(build)`, or a test's, since a headless
-    /// App's posture is always the handoff-off record.
+    /// [`Self::restate_staged_bar_posture`] with an explicit `posture`.
     pub(crate) fn restate_staged_bar_posture_in(
         &mut self,
         build: u64,
@@ -726,42 +522,18 @@ impl App {
         self.restate_update_flow(r, Some(FlowPhase::Staged { build }));
     }
 
-    /// The apply lane's standing trouble for the build a surface is offering, or
-    /// `None` when there is none to report.
-    ///
-    /// Memory-only, like every other read a repaint may take: the failure COUNT and
-    /// the failure REASON both arrive through the updater reducer's typed worker
-    /// completions ([`crate::native_updater_service::UpdaterSnapshot`]), and the
-    /// retry disposition is event-loop state. Nothing here touches the ledger.
-    ///
-    /// `staged_build` is passed in rather than read from the snapshot so the caller's
-    /// own notion of "the build being offered" (the `relaunch` nudge drives the menu
-    /// and the palette; the reducer's stage drives Settings) is the one the trouble
-    /// describes. A streak belonging to a superseded artifact must not decorate a
-    /// fresh offer.
-    ///
-    /// THE LEDGER HAS TO NAME THE ARTIFACT, and that is why it now does. The apply
-    /// streak `failing_applies` carries is expiry-bound to the RUNNING build — it
-    /// means "this machine cannot be moved through the lane" — so staging a NEWER
-    /// artifact resets nothing at all: stage X failing twice, superseded by a fresh
-    /// download Y, left every surface telling the reader that Y had already been
-    /// tried twice and had watched its successor die, while the automatic lane had
-    /// just armed a clean first attempt for it. `apply_failure_build` /
-    /// `apply_failures_for_target` are the artifact-scoped pair; nothing is reported
-    /// unless they name the build on offer.
+    /// Standing apply trouble for `staged_build` from the in-memory reducer snapshot,
+    /// scoped to `apply_failure_build == staged_build` so a superseded stage's streak
+    /// never decorates a newer offer.
     pub(crate) fn apply_trouble_for(
         &self,
         staged_build: u64,
     ) -> Option<crate::update_apply_trouble::ApplyTrouble> {
         use crate::update_apply_trouble::ApplyTrouble;
         let snapshot = self.native_updater_service.snapshot();
-        // Only a genuinely newer artifact is on offer at all…
         if staged_build <= snapshot.current_build {
             return None;
         }
-        // …and only the artifact the failures were actually about may wear them. A
-        // zero target is a ledger that predates this field, or an attempt with no
-        // stage behind it (the QA seam): unknown, therefore silent.
         if snapshot.apply_failure_build != staged_build {
             return None;
         }
@@ -773,10 +545,7 @@ impl App {
         .map(|trouble| trouble.with_retry_in(self.automatic_apply_retry_in(staged_build)))
     }
 
-    /// How long until the automatic lane's next attempt at `staged_build`, when a
-    /// latch carries the instant (2026-09-14, audit OBS-5). A live intent's own
-    /// deadline is folded into the event loop and not surfaced here; the latch —
-    /// the stand-down — is the one with a horizon a person plans around.
+    /// Remaining time until the stand-down latch retries `staged_build`.
     pub(crate) fn automatic_apply_retry_in(
         &self,
         staged_build: u64,
@@ -790,11 +559,7 @@ impl App {
             .map(|at| at.saturating_duration_since(std::time::Instant::now()))
     }
 
-    /// Canonical human "Check for Updates…" gesture: reveal the durable Settings
-    /// route, then request work from the process-owned updater. The service returns
-    /// `Joined` for an in-flight ticket, so repeated menu/compatibility gestures never
-    /// create a second physical check. Explicit `open app settings /updates` remains
-    /// navigation-only and does not call this method.
+    /// Reveal the Settings `/updates` route and start or join a manual update check.
     pub(crate) fn open_software_update_route_and_check(&mut self) -> Result<UpdateOutcome, String> {
         if !self.open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate) {
             return Err("could not open the native Software Update route".to_string());
@@ -802,11 +567,8 @@ impl App {
         Ok(self.start_native_update_check())
     }
 
-    /// TRUE iff the process reducer owns a verified, STRICTLY-newer staged build.
-    /// Callers that originate outside the updater worker reconcile the durable ledger
-    /// once before consulting this snapshot; keeping this predicate memory-only avoids
-    /// repeated filesystem work in one menu click. Mirrors the
-    /// `ATERM_DEBUG_SEAMLESS_REEXEC` QA seam so the handoff remains exercisable.
+    /// Whether the reducer holds a verified staged build strictly newer than running
+    /// (or the `ATERM_DEBUG_SEAMLESS_REEXEC` seam is armed).
     pub(crate) fn staged_update_ready(&self) -> bool {
         if crate::app_update_screen::debug_seamless_reexec_armed() {
             return true;
@@ -819,29 +581,16 @@ impl App {
                 .is_some_and(|staged| staged.build > snapshot.current_build)
     }
 
-    /// ONE-CLICK UPDATE (the owner's "click-upgrade" ask): every "update ready"
-    /// affordance — the Version menu's ⬆️ item ([`crate::menu::MenuAction::ApplyUpdate`]),
-    /// the palette's Version row, a press on the staged status-bar row
-    /// (the band row's `Install now` capsule), the off-macOS tab-strip ↻ — lands here. A strictly-newer STAGED build applies IMMEDIATELY via
-    /// the process updater's one-shot apply authorization (which consumes the same
-    /// `apply_staged_update_now` path after close preflight) — no intermediate overlay.
-    /// With nothing actually staged
-    /// (a stale nudge, the `ATERM_DEBUG_RELAUNCH_NUDGE` QA seam, a ledger cleared under
-    /// us) it opens the Software Update route in the native Settings tab: honest
-    /// details, never a dead click or a legacy modal — and nothing on this path
-    /// ever restarts the app: a staged build is applied IN PLACE by the seamless
-    /// overlap handoff, and the shells keep running. A staged build ON HOLD
-    /// ([`Self::latched_activation_trial_spent`]: its next start is the one its
-    /// boot trial rolls back) opens those details too, never that start.
+    /// One-click update handler: applies a strictly-newer staged build in place via
+    /// seamless handoff, or opens Settings `/updates` when nothing is staged or the
+    /// build's boot trial is spent.
     pub(crate) fn apply_update_or_details(&mut self) {
         let debug_seamless = crate::app_update_screen::debug_seamless_reexec_armed();
         let staged_ready = self.staged_update_ready();
         let _ = self.apply_update_or_details_with_facts(staged_ready, debug_seamless);
     }
 
-    /// Exact menu-action reducer with environment/disk observations supplied once.
-    /// Keeping mechanics behind this seam lets tests drive the genuinely blocked
-    /// click path without mutating process-global environment or fabricating a ledger.
+    /// [`Self::apply_update_or_details`] with pre-observed stage and debug-seam state.
     pub(crate) fn apply_update_or_details_with_facts(
         &mut self,
         staged_ready: bool,
@@ -860,9 +609,7 @@ impl App {
             } else {
                 self.apply_native_update(crate::native_updater_service::ApplyMode::Immediate)
             };
-            // A simulated apply is still fully visible — it just does not get to
-            // leave an `apply`-class failure in the durable ledger, which nothing
-            // but a real successful apply can clear.
+            // Debug re-exec routes through `react_to_update_apply_outcome` to avoid writing the durable ledger.
             if debug_seamless {
                 self.react_to_update_apply_outcome("manual", outcome.clone(), true);
             } else {
@@ -875,13 +622,7 @@ impl App {
         }
     }
 
-    /// Make every returned updater outcome observable. A manual click opens the native
-    /// Software Update route on failure/block so the enabled menu item can never look
-    /// inert; automatic/control paths retain the non-disruptive notification + log.
-    ///
-    /// The durable ledger is written FIRST, then the UI reacts. A simulated apply takes
-    /// the other door ([`Self::react_to_update_apply_outcome`]) so it stays visible
-    /// without leaving a real failure behind it.
+    /// Persist an apply outcome to the durable ledger and update the UI.
     pub(crate) fn surface_update_apply_outcome(
         &mut self,
         source: &str,
@@ -897,9 +638,7 @@ impl App {
         self.surface_update_apply_outcome_for_target(source, outcome, open_details, target_build);
     }
 
-    /// A returned worker keeps its attempted build even if reconciliation has
-    /// already imported a different stage. The current stage cannot identify
-    /// which artifact failed.
+    /// [`Self::surface_update_apply_outcome`] attributed to an explicit `attempted_build`.
     pub(crate) fn surface_update_apply_outcome_for_target(
         &mut self,
         source: &str,
@@ -911,37 +650,13 @@ impl App {
         self.react_to_update_apply_outcome_for(source, outcome, open_details, Some(target_build));
     }
 
-    /// Persist the apply-lane verdict into the updater's own health ledger and
-    /// status file. Until this existed the apply lane was invisible to
-    /// `aterm-ctl update status`: a handoff could fail every single time for three
-    /// releases while `health.toml` stayed all-zero and status said "up to date",
-    /// because only the download lane was ever recorded.
-    ///
-    /// `Deferred`/`Blocked` mean "not yet, conditions were not met" — normal and
-    /// self-correcting, so they must NOT touch the failure streak: doing that
-    /// would manufacture an escalation every time the user happened to be typing.
-    ///
-    /// But silent was the wrong other extreme, and it is what the owner actually
-    /// hit: a staged build sat unapplied across two releases while `update
-    /// status` reported `failing=0 failing_applies=0` and said the build was
-    /// merely waiting to be applied,
-    /// because the refusal reached this function and stopped here. "Nothing is
-    /// wrong" and "we declined, here is why" are different answers and the file
-    /// could only say the first. `record_apply_refusal` is the separate,
-    /// non-streak slot for the second; it is expiry-bound to the RUNNING build,
-    /// since a successful in-session apply execs away and never returns to clear
-    /// it. Which outcome is which — and why nothing here can record a SUCCESS —
-    /// is [`apply_ledger_verdict`].
-    ///
-    /// A FAILURE ALSO REPUBLISHES, because the write is the only moment the window
-    /// can learn about it in time — see the comment on the `Failed` arm.
+    /// Persist the apply outcome into `health.toml` (`record_apply_failure` for failed
+    /// attempts, `record_apply_refusal` for non-streak deferrals/blocks) and feed any
+    /// recorded failure back into the reducer immediately.
     pub(crate) fn record_apply_outcome_in_ledger(
         &mut self,
         outcome: &crate::native_app::UpdateOutcome,
     ) {
-        // Synchronous submission outcomes still describe this stage. A returned
-        // worker uses the explicit-target entry point above: its reconciliation
-        // may have retired this artifact and imported another one already.
         let target_build = self
             .native_updater_service
             .snapshot()
@@ -957,22 +672,12 @@ impl App {
         target_build: u64,
     ) {
         let current_build = self.native_updater_service.snapshot().current_build;
-        // THE PHYSICAL SCHEDULE'S STANDING NOTE rides the write of the failure it
-        // explains, and goes AFTER it, because booking a failure clears any
-        // standing refusal (the 2026-09-22/23 update audit, plan P1-1(a): the
-        // asynchronous lanes wrote the latch with no note at all). Taken on
-        // every verdict so a note can never outlive the outcome it was queued
-        // for; an outcome that is itself a refusal supersedes it.
+        // Record any queued schedule standing note after `record_apply_failure` (which clears
+        // prior refusals); a refusal outcome supersedes the note.
         let standing = self.apply_schedule_standing.take();
         match apply_ledger_verdict(outcome) {
             ApplyLedgerVerdict::Failed(message) => {
-                // FEED THE REDUCER AT THE WRITE. The facts that used to carry a
-                // failure back to the window are gathered by a worker that has
-                // already run by the time this executes, so the FIRST failed apply
-                // — the case this surface exists for — reached the Version menu and
-                // the palette only when some later, unrelated reconcile landed.
-                // `record_apply_failure` hands back what it just wrote, under the
-                // same lock, so the surfaces move now.
+                // Feed the recorded failure back into the reducer immediately so menus and Settings update.
                 if let Some(recorded) =
                     aterm_update::record_apply_failure(current_build, target_build, &message)
                     && self.native_updater_service.note_apply_failure(&recorded)
@@ -986,8 +691,6 @@ impl App {
             ApplyLedgerVerdict::Refused(reason) => {
                 aterm_update::record_apply_refusal(current_build, &reason);
             }
-            // A charged failure whose candidate swapped the bundle surfaces as
-            // `InstalledNeedsRelaunch`: nothing to book, but its schedule stands.
             ApplyLedgerVerdict::Silent => {
                 if let Some(standing) = standing {
                     aterm_update::record_apply_refusal(current_build, &standing);
@@ -996,24 +699,9 @@ impl App {
         }
     }
 
-    /// React to an apply outcome in the UI and the log WITHOUT writing the durable
-    /// health ledger.
-    ///
-    /// THE QA SEAM ENTERS HERE, AND THAT IS THE WHOLE POINT. Under
-    /// `ATERM_DEBUG_SEAMLESS_REEXEC` the handoff runs with no
-    /// `ApplyAttemptTicket` (`App::apply_staged_update_now` refuses a `None` ticket
-    /// in every other case but a launch-record renewal, which never reaches here: its
-    /// return goes to `App::reduce_returned_launch_record_renewal`), so a failed debug
-    /// handoff describes a SIMULATED apply of the running binary — not a staged build
-    /// that could not be made to run.
-    /// Routing it through [`Self::surface_update_apply_outcome`] recorded it as a
-    /// genuine `apply`-class failure, and that streak is cleared only by a
-    /// successful apply ([`Health::record_apply_success`]) — never by a healthy
-    /// check. So QA runs accumulated permanently and drove the machine to
-    /// `is_persistent()`, raising the "aterm auto-update is failing" notification
-    /// on a machine whose apply lane had never actually been asked to do anything.
-    /// Observed in the field: 497 counted apply failures, every one of them a
-    /// `"debug overlap handoff failed safely"` from this seam.
+    /// Update UI and logs for an apply outcome without writing the durable health ledger
+    /// (used directly by `ATERM_DEBUG_SEAMLESS_REEXEC` so simulated handoffs do not
+    /// accumulate persistent apply failure streaks).
     pub(crate) fn react_to_update_apply_outcome(
         &mut self,
         source: &str,
@@ -1023,13 +711,8 @@ impl App {
         self.react_to_update_apply_outcome_for(source, outcome, open_details, None);
     }
 
-    /// [`Self::react_to_update_apply_outcome`] for the build the attempt TRIED
-    /// (`attempted`; `None` where the current stage is that build by
-    /// construction). A returned worker's reconciliation may already have
-    /// imported another stage (a sibling aterm published one while this
-    /// attempt ran, round six, finding 29): its failure is then not that
-    /// stage's, so it is never worded with that stage's version nor offered as
-    /// that stage's `Install now` — the new stage's own posture speaks for it.
+    /// [`Self::react_to_update_apply_outcome`] for `attempted` (handling a stage that
+    /// was superseded while the worker ran).
     pub(crate) fn react_to_update_apply_outcome_for(
         &mut self,
         source: &str,
@@ -1037,14 +720,7 @@ impl App {
         open_details: bool,
         attempted: Option<u64>,
     ) {
-        // ONE ROW PER UPDATE (2026-09-23; ruling 143): a retry the lane has
-        // scheduled raises NOTHING on the glass — the flow row, where one is up,
-        // already says the lane is on it, and the log keeps every attempt. Each
-        // "Update postponed / waiting / delayed" row the owner read that day
-        // described a retry he could do nothing about, and each covered the row
-        // for 8 s and re-painted it. What the person CAN act on is a row: unsaved
-        // editor work, and a lane that stopped (`Install now`, the Version
-        // menu's press on the glass).
+        // Scheduled retries stay log-only; only actionable blockers or a stopped lane raise a band row.
         let staged = self
             .native_updater_service
             .snapshot()
@@ -1071,9 +747,6 @@ impl App {
                 } else if retry_scheduled {
                     self.restate_staged_bar_posture(build);
                 } else {
-                    // The download's ready row is obsolete now that its bytes
-                    // are installed; the switch is the person's to request, and
-                    // the decision says so with its press.
                     self.retire_staged_update_row(true);
                     let version = staged
                         .as_ref()
@@ -1089,13 +762,7 @@ impl App {
             }
             crate::native_app::UpdateOutcome::Deferred { reason } => {
                 aterm_log::info!("update apply ({source}) deferred: {reason}");
-                // THE SCREEN FROZE AND THEN CAME BACK. On the automatic lane a
-                // deferral lands AFTER the readers parked (the user touched the
-                // keyboard, and the lane stood down for them): a row the attempt
-                // rewrote comes back with its words (`retire_update_installing`),
-                // and the automatic lane, which raised none, says nothing. Only a
-                // lane that will NOT come back by itself, with no ready row up to
-                // say how the build installs, owes the person a row.
+                // Restore any row rewritten to "installing", and raise a decision row only if the lane stopped.
                 self.retire_update_installing();
                 if open_details {
                     let _ = self
@@ -1118,12 +785,7 @@ impl App {
             }
             #[cfg(any(unix, test))]
             crate::native_app::UpdateOutcome::CaptureRefused { message } => {
-                // NOT "you were using the terminal" (the v0.91 wording for this
-                // very fact) and not "Update paused" either: the lane is still
-                // coming back by itself, and what it is waiting for is the desk.
                 aterm_log::warn!("update apply ({source}) could not carry a session: {message}");
-                // The switch this attempt put on record stops here, in this
-                // record when the lane retries (one record per attempt).
                 #[cfg(unix)]
                 if open_details || !retry_scheduled {
                     self.record_update_switch_stopped(retry_scheduled, &message);
@@ -1133,15 +795,7 @@ impl App {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
                 } else if retry_scheduled {
-                    // The lane retries when the desk changes: the flow row is
-                    // re-stated to the lane's words and the fact is a RECORD
-                    // (ruling 143) — never a row for a retry nobody can hurry.
-                    // A refusal that came back says how long its spacing holds
-                    // the next try (round eight, U43 review). Titled by the
-                    // switch it stops, which it closes on record; a later
-                    // attempt at the same build opened none (one fact, one
-                    // entry: `note_update_switch_started`) and is still that
-                    // switch, so it is titled by the staged build all the same.
+                    // When a retry is scheduled, restate the flow row and log the capture refusal.
                     self.retire_charging_surge();
                     if let Some((staged_build, _)) = &staged {
                         self.restate_staged_bar_posture(*staged_build);
@@ -1161,7 +815,6 @@ impl App {
                         aterm_messages::Severity::Info,
                     ));
                 } else {
-                    // A lane that stopped names the one control that moves it.
                     let msg = self.stopped_lane_outcome(UPDATE_DIDNT_INSTALL);
                     self.note_update_outcome(msg);
                 }
@@ -1189,24 +842,12 @@ impl App {
                         posture,
                     );
                 } else if let Some((staged_build, version)) = staged {
-                    // WHICH ANSWER IS TRUE IS A QUESTION ABOUT SCHEDULING STATE
-                    // (`automatic_apply_retry_scheduled` asks every carrier of it:
-                    // a live intent, or a manual-only latch with a lapse deadline,
-                    // each for THIS artifact, with automatic apply enabled). A
-                    // physical failure inside its budget schedules another attempt,
-                    // so the flow row is re-stated to the stand-down's words and
-                    // nothing else is said — unless a PERSON asked for this one: a
-                    // person's failure charges the lane nothing, so the flow row
-                    // would not change, and whoever just asked is exactly who must
-                    // be told it did not happen (once, and that the lane has it). A
-                    // lane that has stopped names the one control that moves it.
+                    // If a retry is scheduled, restate the flow row (and notify on manual press);
+                    // if the lane stopped, raise the `Install now` failure row.
                     if retry_scheduled {
                         self.retire_charging_surge();
                         self.restate_staged_bar_posture(staged_build);
                         if !source_is_automatic(source) {
-                            // The person's own press: its switch row ends in the
-                            // Fault echo, and the lane has it — a self-retry is a
-                            // RECORD (ruling 143).
                             self.note_update_outcome(crate::update_words::outcome(
                                 &format!("Couldn't install aterm v{version}"),
                                 crate::update_words::TRIES_AGAIN,
@@ -1214,16 +855,7 @@ impl App {
                             ));
                         }
                     } else {
-                        // The failure's few words, where they change what the
-                        // person does before `Install now` (ruling 246) — and a
-                        // refusal only a person can clear says what they do
-                        // first (round eight, finding 14): "install it from the
-                        // Version menu" over a folder this user cannot write, or
-                        // an installed copy that is not the signed release, named
-                        // a press that refuses the same way until they act. A
-                        // standing block's remedy outranks this attempt's own
-                        // message, which may be an ordinary failure met before
-                        // the refusal was reached (finding 14's review).
+                        // Standing block remedy takes precedence over the attempt's raw failure message.
                         let detail = self
                             .person_remedy_for(staged_build)
                             .or_else(|| {
@@ -1247,16 +879,7 @@ impl App {
                         ));
                     }
                 } else {
-                    // A retired/consumed artifact is not "still ready". The row
-                    // says only that it did not finish: the details page is the
-                    // Warn row's `Software Update` capsule and its `Details ›`
-                    // (R37: the "click for details" clause became those capsules),
-                    // so the row carries no excerpt.
-                    // An UNATTENDED attempt is a record (audit 2026-09-24, as
-                    // §10.3 U14): the artifact is gone, nothing can be pressed,
-                    // the next check re-stages it, and the health lane raises
-                    // `Couldn't install updates` if it keeps failing. A
-                    // person's own press is told.
+                    // With no staged build left, unattended failures are log-only; manual presses show `UPDATE_DIDNT_FINISH`.
                     if source_is_automatic(source) {
                         self.note_update_outcome(crate::update_words::outcome(
                             UPDATE_DIDNT_FINISH,
@@ -1273,27 +896,15 @@ impl App {
                             false,
                         ));
                     }
-                    // …and the ready row does not stand beside it: the
-                    // artifact this row was offering is the one that is gone,
-                    // so it is WITHDRAWN — resolved `Ok` it would claim a
-                    // delivery beside this failure (ruling 159).
+                    // Withdraw any ready row for the consumed artifact.
                     self.retire_staged_update_row(false);
                 }
             }
         }
     }
 
-    /// A close preflight refused the install: name the one blocker a PERSON can
-    /// clear ([`App::update_blocker_for_person`] — unsaved editor or Settings
-    /// work) as an outcome row — and say nothing else while the lane will try
-    /// again by itself; a lane that has stopped points at the Version menu. A
-    /// build ON HOLD ([`App::latched_activation_trial_spent`]) is moved by no
-    /// press and no cleared blocker: a staged row up for it takes the on-hold
-    /// words ([`crate::update_words::ApplyPosture::TrialSpent`], the fact the
-    /// refusal read), and no row offers `Install now`. Not
-    /// [`App::apply_posture_for`]: it ranks the handoff and `[update]
-    /// auto_apply` first, and under either would restate the build as ready
-    /// or raise its `Install now` again.
+    /// Surface a close-preflight refusal: show user-actionable blockers (unsaved editor
+    /// or Settings drafts), or mark a trial-spent build on hold.
     pub(crate) fn note_update_blockers(&mut self, reasons: &[String], retry_scheduled: bool) {
         if let Some(held) = self
             .native_updater_service
@@ -1305,10 +916,6 @@ impl App {
         {
             self.restate_staged_bar_posture_in(held, crate::update_words::ApplyPosture::TrialSpent);
         } else if let Some(blocker) = Self::update_blocker_for_person(reasons) {
-            // The blocker IS what the person does: painted (ruling 77). Where the
-            // lane retries by itself it STANDS (round eight, lead U38): the lane
-            // lands once the work is saved and says nothing else meanwhile, the
-            // overdue notice included, so this row is the wait's one notice.
             if retry_scheduled {
                 self.say_update_waits_for_you(blocker);
             } else {
@@ -1324,18 +931,8 @@ impl App {
         }
     }
 
-    /// THE WAIT'S ONE NOTICE ([`crate::update_words::waits_for_you`], round eight
-    /// of the update audit, lead U38): the standing row that says a person's
-    /// unsaved work holds the automatic lane. Its key is one for every wait, and
-    /// a standing row the person read, dismissed or answered stays quiet for a
-    /// day (`aterm_messages::need::STANDING_QUIET`) — about THAT wait. So the
-    /// first raise of a wait in this process is news (the review of U38): the
-    /// quiet an earlier wait's row earned — this process's, or one before an
-    /// update or a relaunch — is ended first
-    /// ([`aterm_messages::MessageCenter::end_standing_quiet`]), or a later build,
-    /// or the same one held again after the work was saved once, waited with no
-    /// row and the overdue notice off (L5). A raise later in the same wait keeps
-    /// the quiet a read of this wait's row earned.
+    /// Raise the standing "Update waits for you" row for `blocker`, clearing any
+    /// quiet period from an earlier wait.
     pub(crate) fn say_update_waits_for_you(&mut self, blocker: &str) {
         if !self.update_wait_said {
             let _ = self.messages.end_standing_quiet(
@@ -1348,11 +945,7 @@ impl App {
         self.note_update_outcome(crate::update_words::waits_for_you(blocker));
     }
 
-    /// Nothing a person must save holds the update any more (round eight of the
-    /// update audit, lead U38): the standing "Update waits for you" row
-    /// ([`crate::update_words::waits_for_you`]) leaves, WITHDRAWN — no ✓ stands on
-    /// a wait's words, and the record keeps what it said — and the wait it said
-    /// is over, so the next one is news ([`Self::say_update_waits_for_you`]).
+    /// Withdraw the standing "Update waits for you" row once user blockers clear.
     pub(crate) fn withdraw_update_waits_for_you(&mut self) {
         self.update_wait_said = false;
         if let Some(id) = self
@@ -1364,22 +957,9 @@ impl App {
         }
     }
 
-    /// THE WAIT ON A PERSON ENDS WITH THE LANE THAT WAITED (round eight of the
-    /// update audit, the review of lead U38). The wait — the standing row and the
-    /// overdue notice's exemption ([`Self::update_lands_by_itself`]) — stands on
-    /// the automatic lane's promise to land the build once the work is saved
-    /// ([`Self::automatic_apply_retry_scheduled`], the very fact the row was
-    /// raised on), and only an attempt answered that. A lane that stopped trying
-    /// (`[update] auto_apply` turned off, the stage retired, yanked or consumed,
-    /// the intent cleared, a newer build staged) returns before any attempt, so
-    /// the row said "Save the work in the open editor" under Problems for its
-    /// day's patience, and saving changed nothing. Read on every loop turn
-    /// (`about_to_wait`) and where the lane drops its intent: with no automatic
-    /// retry scheduled for the waited build, the wait ends. Idempotent, and free
-    /// while no wait stands.
+    /// Withdraw "Update waits for you" if automatic retry is no longer scheduled
+    /// for the waited build.
     pub(crate) fn settle_update_wait_on_person(&mut self) {
-        // The row is up only while the wait is said (`say_update_waits_for_you`
-        // sets it; every withdrawal clears it).
         if self.update_waits_on_person.is_none() && !self.update_wait_said {
             return;
         }
@@ -1401,11 +981,7 @@ impl App {
         self.withdraw_update_waits_for_you();
     }
 
-    /// A lane that STOPPED, titled `title` (ruling 143): a decision row whose
-    /// `Install now` is the Version menu's press for the staged build — its
-    /// detail the standing block's remedy where a person's block stopped it
-    /// ([`Self::person_remedy_for`]) — or, with no build staged to press for,
-    /// the same words on record.
+    /// Build the `Install now` decision row (or log record when nothing is staged) for a stopped lane.
     fn stopped_lane_outcome(&self, title: &str) -> aterm_messages::Message {
         let staged = self
             .native_updater_service
@@ -1431,27 +1007,9 @@ impl App {
         }
     }
 
-    /// A RETURNED ATTEMPT WHOSE BUILD IS NO LONGER THE STAGE (round six,
-    /// finding 29): another download (`replacement`) replaced the build it
-    /// tried (`tried`) while it ran. Three things are said, in this order:
-    ///
-    /// 1. what stood for `tried` leaves — the attempt's own "installing" words
-    ///    are put back first ([`Self::retire_update_installing`]), and a flow
-    ///    row that is then `tried`'s ready row (the row the press came from,
-    ///    or the lane's) is withdrawn: its bytes are gone, and a ready row whose
-    ///    capsule no longer has a stage to press must not stand beside the
-    ///    failure;
-    /// 2. the failure itself, without `replacement`'s version and without a
-    ///    press for bytes nobody tried — a record for an unattended attempt, a
-    ///    row for a person's press;
-    /// 3. how `replacement` installs, in `posture`
-    ///    ([`Self::restate_staged_bar_posture_in`]): the reconcile that
-    ///    imported it on the return was a Refresh, which announces no stage,
-    ///    so where a press is how it installs its ready row is raised here, and
-    ///    where the lane installs it by itself nothing more is said.
-    ///
-    /// `posture` is the caller's `apply_posture_for(replacement)`; a
-    /// parameter so a test can drive the decision a headless App never has.
+    /// Handle a failed attempt whose target build `tried` was superseded by `replacement`:
+    /// withdraw `tried`'s row, record/show the failure without `replacement`'s version,
+    /// and restate `replacement`'s posture.
     pub(crate) fn say_superseded_apply_failure(
         &mut self,
         source: &str,
@@ -1485,28 +1043,14 @@ impl App {
         self.restate_staged_bar_posture_in(replacement, posture);
     }
 
-    /// One apply-lane OUTCOME (ruling 143): a stopped lane, an install that
-    /// needs a press, a person's failed attempt — a row of its own
-    /// (`update.outcome`) beside the flow row when the person acts on it, a
-    /// RECORD when the lane answers it by itself (`msg`'s hold says which,
-    /// `update_words`). A charging surge is retired with it: the attempt it
-    /// explained is over.
+    /// Post or log an apply-lane outcome (`update.outcome`) and retire the charging surge.
     pub(crate) fn note_update_outcome(&mut self, msg: aterm_messages::Message) {
-        // Over an "installing…" row the attempt is over: the words it replaced
-        // come back first (or the row it added faults out), so the outcome
-        // stands beside the flow row.
         self.retire_update_installing();
         if msg.hold == aterm_messages::Hold::LogOnly {
             self.record_message(msg);
             return;
         }
-        // ONE DECISION PER STOPPED LANE (rulings 119 and 143; review
-        // 2026-09-24). An outcome that carries `Install now` IS the lane's
-        // decision: a staged row still up — the ready row a stand-down's
-        // posture restatement just turned the flow row into — would be a
-        // second row with the same press for the same fact. It leaves first,
-        // withdrawn (no outcome to claim: the attempt it offered failed), so
-        // the outcome's words — why it did not install — are the one row.
+        // Withdraw any live ready row before posting an outcome that carries `Install now`.
         if msg
             .actions
             .iter()
@@ -1516,13 +1060,8 @@ impl App {
             self.update_flow = None;
             self.withdraw_message(id);
         }
-        // A HELD outcome this one replaces is resolved first, so `appstatus`
-        // keeps every outcome of one update as a finished activity (a
-        // superseded row records nothing). The SAME words are not a
-        // replacement: they are the center's Duplicate (one row, its hold
-        // re-anchored) — resolving first would end the row in its echo and post
-        // it straight back (the editor blocker an announced first attempt
-        // raised, said again at the budget's exhaustion; 2026-09-24).
+        // Resolve a distinct prior held outcome before superseding it; identical words
+        // re-anchor the existing row in place.
         let normalized = msg.clone().normalized();
         let repeats = self
             .messages
@@ -1538,13 +1077,8 @@ impl App {
         self.post_message(msg);
     }
 
-    /// The update lane's press rule for its `Install now` capsule: a STAGED row
-    /// whose build is really ready applies it in place (the retired floating
-    /// card's one-click gesture, moved to the row) — but never where the
-    /// seamless handoff is off: the row carries no capsule there, and a press
-    /// that could only record a refusal opens the details page instead, like
-    /// every other row. Pure, so the two press paths (mouse, screen reader)
-    /// cannot drift (`App::perform_intent`, the `ApplyUpdate` arm).
+    /// Whether pressing the update row applies the staged build in place (requires
+    /// `FlowPhase::Staged`, `staged_ready`, and `handoff_available`).
     pub(crate) fn update_bar_press_applies(
         bar_is_staged: bool,
         staged_ready: bool,
@@ -1553,17 +1087,8 @@ impl App {
         bar_is_staged && staged_ready && handoff_available
     }
 
-    /// The upgrade rim's motion amplitude.
-    ///
-    /// SERIOUS MODE KEEPS THE RIM AND TAKES ITS MOVEMENT (2026-09-09). The rim is
-    /// not decorative — it is the ONLY thing on screen that says why the terminal
-    /// stopped echoing, and on the automatic lane (no row at apply time) it is
-    /// the only explanation the person gets at all. `motion.rs`'s own charter
-    /// draws the line: serious mode "removes decorative output, but must not
-    /// demote functional motion … and it must not affect cursor blink, visual
-    /// bell, or window attention". So serious mode resolves amplitude `0`, the
-    /// same still rim Reduce Motion resolves (information kept, movement
-    /// removed).
+    /// Upgrade rim motion amplitude (`0.0` under serious mode or Reduce Motion so the
+    /// rim stays visible without animation).
     fn upgrade_rim_motion(&self) -> f32 {
         if self
             .serious_mode_policy()
@@ -1576,8 +1101,7 @@ impl App {
         }
     }
 
-    /// THE UPGRADE RIM (`crate::level_up`): start charging for `build` under
-    /// the amplitude [`Self::upgrade_rim_motion`] resolves.
+    /// Start charging the upgrade rim for `build`.
     #[cfg(any(unix, test))]
     pub(crate) fn spawn_upgrade_surge(&mut self, build: u64) {
         self.level_up = Some(crate::level_up::LevelUp::charging(
@@ -1588,9 +1112,7 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// The SUCCESSOR's half of the rim: the outgoing process has been charging
-    /// its rim from the park, so this process's starts already charged — no
-    /// ramp-in dip, no rebuild — and the swap reads as one continuous rim.
+    /// Start the successor's upgrade rim already charged so the handoff swap is continuous.
     pub(crate) fn spawn_upgrade_surge_continued(&mut self, build: u64) {
         self.level_up = Some(crate::level_up::LevelUp::charging_continued(
             build,
@@ -1600,33 +1122,16 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// End the rim: the successor took over (Commit), or an attempt ended
-    /// without it.
+    /// Retire the upgrade rim charging surge.
     pub(crate) fn retire_charging_surge(&mut self) {
         if self.level_up.take().is_some() {
             self.request_redraw_all_windows();
         }
     }
 
-    /// APPLY BEGINS (before the carry is built, before the readers park): the
-    /// update bar says "installing". With the row already up its WORDS change — a
-    /// repaint, not a re-grid. With no row up, an EXPLICIT apply (`explicit`: the
-    /// Version menu, Software Update, a clean quit) ADDS the row and commits the
-    /// re-grid at once, so the carry built next reads the rows the successor must
-    /// reproduce; the automatic lane adds none — its own re-check reads the
-    /// re-grid's SIGWINCH as activity and stands down — and there the upgrade rim
-    /// alone explains the frozen frame. What the row said before is kept so a
-    /// refusal can put it back (`retire_update_installing`) — across a press held
-    /// for the candidate's read and run again too, whose second begin finds the
-    /// row installing already and leaves it as it is.
-    ///
-    /// The rim is NOT started here (round eight of the update audit, leads U60
-    /// and U40): it explains a FREEZE, and on the launched lane the readers park
-    /// only after the successor's boot, its dial and the park gate's hold — up
-    /// to two and a half minutes during which the terminal is live. Started here,
-    /// it pulsed around a working terminal for all of that, and its cap could run
-    /// out before the freeze it is the one explanation of. Each lane starts it
-    /// where its readers park ([`Self::charge_upgrade_rim_at_park`]).
+    /// Mark the update row as installing before building the handoff carry (adding a row
+    /// only for explicit user-initiated applies). The upgrade rim starts later at reader
+    /// park ([`Self::charge_upgrade_rim_at_park`]).
     #[cfg(any(unix, test))]
     pub(crate) fn begin_update_installing(&mut self, explicit: bool) {
         use crate::messages_host::FlowPhase;
@@ -1638,11 +1143,7 @@ impl App {
             .map(|staged| staged.version.clone())
             .unwrap_or_default();
         let installing = crate::update_words::installing(&version);
-        // The preflight passed, so no unsaved work holds the lane: its standing
-        // row is answered (round eight, lead U38), and left out of the carry
-        // built next — an older successor would adopt it with nothing to answer
-        // it. The band settles it with the rest; nothing re-grids here. The wait
-        // it said is over: a later one is news.
+        // Preflight passed: withdraw any standing user-blocker wait row before building carry.
         self.update_wait_said = false;
         if let Some(id) = self
             .messages
@@ -1651,11 +1152,7 @@ impl App {
         {
             self.messages.withdraw(id, std::time::Instant::now());
         }
-        // A HELD PRESS RUNNING AGAIN (`App::run_held_person_apply`, round eight
-        // of the update audit, U35's review): the row already says it installs,
-        // and what it said before the press is what a refusal puts back — kept,
-        // never re-read from the installing words, which a refusal would then
-        // restore and leave up. The rim keeps charging from where it was.
+        // On a held press re-entry, keep the pre-install row snapshot captured on the first entry.
         if self
             .live_update_flow()
             .is_some_and(|flow| flow.phase == FlowPhase::Installing)
@@ -1668,8 +1165,6 @@ impl App {
             .cloned()
             .and_then(|flow| self.messages.live(flow.id).map(|l| (flow, l.msg.clone())));
         if let Some((flow, previous)) = live {
-            // The flow row is re-worded in place — a repaint, not a re-grid; no
-            // log line.
             let id = flow.id;
             self.update_row_before_install = Some((previous, flow));
             self.messages.restate(
@@ -1681,23 +1176,12 @@ impl App {
                 flow.phase = FlowPhase::Installing;
             }
         } else if explicit {
-            // Posted through the seam that commits the re-grid at once.
             self.post_update_row(installing, &version, FlowPhase::Installing);
         }
         self.request_redraw_all_windows();
     }
 
-    /// THE READERS PARK: the upgrade rim starts charging for `build`. Called by
-    /// each lane at its reader park, the instant the terminal stops echoing — the
-    /// freeze the rim explains, whose cap (`level_up::CHARGE_TTL`) is counted from
-    /// here. A rim an earlier park of the same attempt started (one that missed
-    /// its budget and re-parks at once) runs on, continuous, with its cap counted
-    /// again from this park (`LevelUp::re_anchor`; the review of round eight's
-    /// leads U60 and U40): a park first missed early and admitted late froze the
-    /// terminal on a cap counted from the first. A miss that sends the launched
-    /// lane back to its gate's wait takes the rim away there
-    /// (`park_and_transfer_to_prelaunched_successor`). The attempt's end retires
-    /// it (`retire_update_installing`, `retire_charging_surge`).
+    /// Start or re-anchor the upgrade rim for `build` when PTY readers park.
     #[cfg(any(unix, test))]
     pub(crate) fn charge_upgrade_rim_at_park(&mut self, build: u64) {
         match self.level_up.as_mut() {
@@ -1706,12 +1190,8 @@ impl App {
         }
     }
 
-    /// The handoff did not take over — a synchronous refusal before the park, or
-    /// an asynchronous one after it (a failed proof, a revoked lane, a dead
-    /// successor): the row goes back to what it was — its words, its animation
-    /// and its phase — (or to no row) and the charging surge ends. Idempotent,
-    /// and a no-op for a row an outcome has already been posted over. The row is
-    /// identified by its STATE (`FlowPhase::Installing`), never its words.
+    /// Restore the update row from `FlowPhase::Installing` and retire the charging surge
+    /// when a handoff is refused or aborted.
     pub(crate) fn retire_update_installing(&mut self) {
         use crate::messages_host::FlowPhase;
         let previous = self.update_row_before_install.take();
@@ -1727,9 +1207,6 @@ impl App {
                         .restate(id, crate::messages_host::restatement_of(&words), now);
                     self.update_flow = Some(flow);
                 }
-                // The explicit lane added it; the refusal takes it away — a
-                // refusal is not a delivery, so it resolves `Warn` and its
-                // indicator ends in the Fault echo (design §10.2 #7).
                 None => {
                     self.messages
                         .resolve(id, aterm_messages::Outcome::Warn, now);
@@ -1738,28 +1215,13 @@ impl App {
             }
         }
         self.retire_charging_surge();
-        // WORDS ONLY — no row sync here. A refusal is followed, in the same
-        // wake, by the outcome that explains it (`surface_update_apply_outcome`),
-        // and on the explicit lane that outcome takes the very row this attempt
-        // added: a sync here would re-grid every window twice (1→0→1). The one
-        // trailing sync — `Wake::UpdateHandoffFinished`'s, or the next park's
-        // row check in `about_to_wait` — commits whatever the center finally wants.
+        // Defer row geometry sync to the trailing outcome/handoff wake to avoid a double re-grid.
         self.request_redraw_all_windows();
     }
 
-    /// Re-sync the macOS VERSION menu (the rightmost menu-bar title) to the live update
-    /// state: `v<cur> ⬆️` + the one-click "Install aterm v<staged> now" first item
-    /// while a strictly-newer build is staged; `v<cur> ⬆️` + the "Updated to aterm v<cur> just
-    /// now" celebration item while the post-update realized arrow is live; plain
-    /// `v<cur>` otherwise. The PERSISTENT update affordance lives here now (the titlebar
-    /// "Update" capsule is retired). A no-op headless / off macOS (no menu handle).
-    /// Call on every transition: `Wake::UpdateStaged`, the JUST_UPDATED boot, and the
-    /// realized-arrow TTL expiry sweep in `about_to_wait`.
+    /// Sync the macOS Version menu title and items with the current staged/realized update state.
     pub(crate) fn refresh_version_menu(&self) {
         if let Some(handle) = self._menu.as_ref() {
-            // Only a build strictly newer than the running one is an offer
-            // (`menu::staged_for_version_menu`): the bar must not say `⬆️` over
-            // the build it is already running.
             let running = self.native_updater_service.snapshot().current_build;
             let staged = crate::menu::staged_for_version_menu(
                 self.relaunch
@@ -1772,16 +1234,9 @@ impl App {
                 && self
                     .upgrade_realized
                     .is_some_and(|t| t.elapsed() < crate::relaunch_notice::REALIZED_ARROW_TTL);
-            // The always-visible offer carries the apply lane's verdict on ITSELF. A
-            // Version menu that says "apply now" while the engine has already tried
-            // and failed is the surface that made the 2026-08-21 field state
-            // unreadable; the row now says how many attempts died, why, and whether
-            // anything is still scheduled.
             let trouble = staged
                 .as_ref()
                 .and_then(|(build, _)| self.apply_trouble_for(*build));
-            // A build on hold reads "on hold" whether or not the ledger still
-            // names its failures: the same fact the press refuses on.
             let on_hold = staged
                 .as_ref()
                 .is_some_and(|(build, _)| self.latched_activation_trial_spent(*build));
@@ -1795,13 +1250,7 @@ impl App {
         }
     }
 
-    /// The OUTGOING side of a seamless handoff whose successor has proven itself:
-    /// retitle this process's Version item to the successor's plain `v<target>`
-    /// ([`crate::menu::handoff_target_bar_title`]), so the menu bar reads the
-    /// running build even when nothing claims it after this process exits — the
-    /// 2026-09-24 `v0.91.0 ⬆️` that stood over a running 0.92.0 for three hours.
-    /// Returns the published title (for the log and the tests); a returned
-    /// attempt re-syncs the item through [`Self::refresh_version_menu`].
+    /// Retitle the outgoing process's Version menu to the proven successor's `v<target>`.
     #[cfg(unix)]
     pub(crate) fn publish_handoff_target_to_menu_bar(&self) -> Option<String> {
         let pending = self.pending_update_handoff.as_ref()?;
@@ -1819,10 +1268,8 @@ impl App {
     }
 }
 
-/// The quiet download's bytes as Settings ▸ Software Update says them (design
-/// ruling 220): whole MB, so the page's words — and its republish — change at
-/// most once per MB (per 100 MB past 1 GB), never per 10 Hz poll; and unpadded,
-/// since they sit in a sentence (`5 MB / 1.2 GB downloaded.`), not a band cell.
+/// Format quiet download progress in whole MB (or 0.1 GB from 1 GB) so Settings
+/// republishes at most once per MB.
 fn quiet_bytes(n: u64) -> String {
     const MB: u64 = 1_000_000;
     match n - n % MB {
@@ -1831,48 +1278,22 @@ fn quiet_bytes(n: u64) -> String {
     }
 }
 
-/// What one apply outcome must write to the DURABLE health ledger.
-///
-/// Split out of [`App::surface_update_apply_outcome`]'s UI reaction because the write
-/// itself is unobservable from this crate — `aterm_update::record_apply_*` resolve
-/// `HOME` and rewrite `Updates/health.toml` — so the routing is the only part a unit
-/// test can hold still. The streak arithmetic behind each verdict is `aterm-update`'s
-/// (`Health::record_apply_failure` / `record_apply_success`).
+/// Durable health-ledger action for an [`UpdateOutcome`].
 #[derive(Debug, PartialEq, Eq)]
 enum ApplyLedgerVerdict {
-    /// The apply was ATTEMPTED and the staged build did not become the running
-    /// build. Advances the apply streak — the one that escalates to the
-    /// "aterm auto-update is failing" notification.
+    /// Attempt failed; increments the apply failure streak.
     Failed(String),
-    /// Refused before it could become a failure. Fills the standing-explanation
-    /// slot and touches no streak: a terminal that happened to be busy must not
-    /// manufacture an escalation.
+    /// Attempt refused before execution; records the standing refusal without incrementing the streak.
     Refused(String),
     /// Nothing durable to say yet.
     Silent,
 }
 
-/// Route one apply outcome to its ledger verdict.
-///
-/// `Accepted` IS DELIBERATELY SILENT: it means the apply worker was started, or that
-/// we joined an in-flight/`Applying` request — never that an apply completed, because
-/// a successful one execs away and never returns here (`app_native.rs`: "A successful
-/// replacement never returns"). Recording success on it was the bug that made the
-/// ledger blind: every manual/control click WIPED the streak (and the standing refusal
-/// with it) seconds before the asynchronous `Failed` arrived, so the apply streak was
-/// capped at 1, `PERSISTENT_AFTER = 3` was unreachable on those lanes, and one
-/// troubleshooting click could erase a background streak that had already climbed.
-/// The apply lane is cleared at the ONE place success is provable — a boot sentinel
-/// armed for the build that is now running, in `aterm-update`'s `confirm_boot_health`.
-///
-/// `InstalledNeedsRelaunch` is likewise silent, but for the opposite reason: it is
-/// neither a refusal nor a pending attempt — the bytes ARE in place and the next
-/// launch runs them, which the status line already reports from the staged marker.
+/// Map an [`UpdateOutcome`] to its [`ApplyLedgerVerdict`]. `Accepted` and
+/// `InstalledNeedsRelaunch` are `Silent`: apply success is confirmed only by
+/// `confirm_boot_health` on the new build.
 fn apply_ledger_verdict(outcome: &UpdateOutcome) -> ApplyLedgerVerdict {
     match outcome {
-        // A capture refusal is RECORDED as a failure (plan P0-3): the v0.91 shape
-        // filed it in the non-streak refusal slot, so `failing_applies` stayed 0
-        // across a whole day of refused attempts.
         UpdateOutcome::Failed { message } => ApplyLedgerVerdict::Failed(message.clone()),
         #[cfg(any(unix, test))]
         UpdateOutcome::CaptureRefused { message } => ApplyLedgerVerdict::Failed(message.clone()),
@@ -1895,16 +1316,7 @@ pub(crate) mod tests {
     use crate::native_app::{AppViewState, UpdateOutcome};
     use crate::native_updater_service::CheckStart;
 
-    /// REGRESSION — the QA seam's own flag used to hang the process that asked
-    /// for it. Its `OnceLock` initializer called the function it was
-    /// initializing, so the first caller waited on the `Once` it was itself
-    /// inside, forever. `apply_staged_update_now` reaches it on the MAIN
-    /// THREAD, which made every update apply a permanent freeze — the exact
-    /// failure the whole handoff design exists to avoid.
-    ///
-    /// This test deadlocks rather than fails if the shape comes back. That is
-    /// the honest signal: the defect IS a hang, and a suite that stops is
-    /// louder than an assertion that never runs.
+    /// Verify `debug_seamless_reexec_armed` does not deadlock on first initialization.
     #[test]
     fn the_reexec_seam_reads_the_environment_and_never_itself() {
         let armed = debug_seamless_reexec_armed();
@@ -1921,12 +1333,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE PRESS RULE for the update row (2026-09-07): only a Staged row whose
-    /// build is really ready applies on a press; every other row opens the
-    /// details page — never a modal, never a ledger entry. The ONE-CLICK menu
-    /// item with nothing strictly newer staged opens the same honest surface
-    /// rather than doing nothing or re-exec'ing the process (the staged branch,
-    /// a real apply, is the release-flow E2E's: exec never returns).
+    /// Only a ready `Staged` row applies on press; other rows and un-staged clicks open `/updates`.
     #[test]
     fn the_update_row_and_menu_apply_only_when_staged_and_ready() {
         let on_software_update = |app: &App| {
@@ -1969,10 +1376,7 @@ pub(crate) mod tests {
         assert!(on_software_update(&app), "the menu item");
     }
 
-    /// SERIOUS MODE TURNED ON MID-UPDATE STILLS THE RIM AND KEEPS IT (2026-09-24).
-    /// The rim is the one explanation of the frozen frame (`upgrade_rim_motion`),
-    /// and with the landing burst deleted it is all `level_up` holds — so the
-    /// switch takes its movement, as a rim spawned under serious mode never had.
+    /// Enabling serious mode mid-update zeroes the upgrade rim's motion while keeping the rim active.
     #[test]
     fn serious_mode_mid_update_stills_the_rim_and_keeps_it() {
         let mut app = App::headless_for_test();
@@ -1990,12 +1394,7 @@ pub(crate) mod tests {
         assert!(!moving(&app), "serious mode keeps the rim, still");
     }
 
-    /// THE RIM AND THE ROW AT THE APP'S SEAMS (2026-09-07): apply-begins
-    /// rewrites the row and the reader park charges the rim (round eight, leads
-    /// U60 and U40: apply begin no longer does — nothing is frozen yet); a
-    /// refusal restores both, and is idempotent; an explicit apply with no row up
-    /// adds one and a refusal removes it; the automatic lane never adds one; the
-    /// rim ends with the outcome posted over the attempt.
+    /// Verify row wording and upgrade rim lifecycle across begin, reader park, refusal, and outcome.
     #[test]
     fn apply_begins_charges_the_rim_and_a_refusal_restores_the_row() {
         use crate::messages_host::FlowPhase;
@@ -2040,8 +1439,6 @@ pub(crate) mod tests {
             );
         }
 
-        // No row up: the automatic lane adds none; an explicit apply adds one,
-        // and a refusal takes it away again.
         app.clear_messages_for_test();
         app.begin_update_installing(false);
         assert_eq!(
@@ -2070,8 +1467,6 @@ pub(crate) mod tests {
             "a refusal retires the words without a re-grid of its own"
         );
 
-        // The rim ends with the outcome posted over the attempt; the outcome's
-        // row is not retired, and the ready row stands once it has had its say.
         app.clear_messages_for_test();
         post_staged(&mut app);
         app.begin_update_installing(false);
@@ -2106,9 +1501,6 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("draft.md");
         std::fs::write(&path, "draft\n").unwrap();
-        // The shipping encoder, not a hand-rolled `format!` — the latter is
-        // malformed on Windows (drive letter + backslashes after the authority
-        // slot), so this test could not even open its document there.
         let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
 
         let mut app = App::headless_for_test();
@@ -2123,9 +1515,6 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // These are the exact observed facts that the production ApplyUpdate menu
-        // method passes after seeing the QA same-binary stage. No global env mutation
-        // and no process replacement can occur: dirty-state preflight must win first.
         let outcome = app
             .apply_update_or_details_with_facts(true, true)
             .expect("staged click produces an apply outcome");
@@ -2145,23 +1534,10 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Stage one strictly-newer build through the REAL check reducer, so the
-    /// snapshot the pill predicate reads is the one production reads.
-    /// Stage `build` through the SHIPPING check reducer, carrying the apply-lane
-    /// facts a real `durable_update_status` read would carry beside it.
-    ///
-    /// `apply_lane` is read from the ledger the test itself just wrote, through the
-    /// same `aterm_update::apply_lane_report` the worker uses, so a check landing
-    /// after a failure reproduces exactly what production hands the reducer.
+    /// Stage `build` through the check reducer along with the current ledger's `apply_lane` report.
     #[cfg(target_os = "macos")]
     fn stage_build_with_ledger(app: &mut App, build: u64) {
         let current_build = app.native_updater_service.snapshot().current_build;
-        // THE SHIPPING READER, not a hand-built literal. `durable_update_status` is
-        // the one place the check lane's status and the apply lane's ledger are read
-        // side by side, and it is the only path a FRESH PROCESS has to the apply
-        // reason at all — so a fixture that assembled those three fields itself would
-        // leave the startup lane untested while looking thorough. Only the staged
-        // artifact is substituted: the scratch root has no real download in it.
         let base = aterm_update::status(current_build)
             .map(crate::app_native::durable_update_status)
             .expect("the scratch staging root yields a status under test");
@@ -2202,17 +1578,8 @@ pub(crate) mod tests {
         });
     }
 
-    /// A RETURNED FAILURE IS NEVER WORDED FOR THE STAGE THAT REPLACED ITS
-    /// BUILD (round six, finding 29): with a sibling's stage imported while
-    /// the attempt ran, the failure of the attempted build is not offered as
-    /// the new stage's `Couldn't install aterm v<new>` / `Install now`, nor
-    /// folded into the new stage's retry — on either lane. The attempted
-    /// build's own ready row, the one the press came from and the one
-    /// `retire_update_installing` puts back on the return, leaves with it
-    /// (review two: it used to stand, capsule-less, beside the failure), and
-    /// where a press is how the new stage installs, its ready row is raised
-    /// (the Refresh reconcile that imported it announces nothing). Negative
-    /// control: the same failure against the stage it tried keeps main's words.
+    /// When a sibling stages a replacement build while an apply attempt runs, a returned
+    /// failure is attributed to the attempted build rather than the replacement stage.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_returned_failure_is_not_worded_for_the_stage_that_replaced_it() {
@@ -2228,9 +1595,6 @@ pub(crate) mod tests {
         let failed = || UpdateOutcome::Failed {
             message: message.to_string(),
         };
-        // `decision`: the new stage's posture is one a press installs — driven
-        // through the reaction's own seam, since a headless App's posture is
-        // always the handoff-off record; otherwise the whole shipping surface.
         for decision in [false, true] {
             for source in ["manual handoff", "automatic handoff"] {
                 let case = format!("{source} decision={decision}");
@@ -2240,17 +1604,12 @@ pub(crate) mod tests {
                 let replacement = tried + 1;
                 stage_build_with_ledger(&mut app, tried);
                 app.clear_messages_for_test();
-                // The attempted build's ready row is up, and the press (or the
-                // lane) re-words it to "installing".
                 app.ensure_staged_decision_in(tried, ApplyPosture::ManualByConfig);
                 assert!(
                     app.staged_update_row().is_some(),
                     "{case}: PRECONDITION: its ready row"
                 );
                 app.begin_update_installing(!super::source_is_automatic(source));
-                // The attempt at `tried` returns after a sibling published
-                // `replacement`: the shipping return retires the stage it tried,
-                // and the reconcile imports the replacement.
                 let ApplyPreflightStart::Inspect(preflight) =
                     app.native_updater_service.begin_apply_preflight()
                 else {
@@ -2282,9 +1641,6 @@ pub(crate) mod tests {
                 if !decision {
                     arm_intent(&mut app, replacement);
                 }
-                // `reduce_returned_handoff_completion`'s order: the
-                // "installing" words go back first — to the tried build's
-                // ready row.
                 app.retire_update_installing();
                 assert_eq!(
                     app.live_update_flow().map(|flow| flow.phase),
@@ -2330,9 +1686,6 @@ pub(crate) mod tests {
                         .map(|l| format!("{} — {}", l.msg.title, l.msg.detail.join("; ")))
                 };
                 assert!(told.is_some(), "{case}: the failure is said");
-                // How the new stage installs: its own ready row, with its
-                // own press, where a press is how; nothing where the lane
-                // installs it by itself.
                 let ready = app
                     .live_update_flow()
                     .filter(|flow| flow.phase == FlowPhase::Staged { build: replacement })
@@ -2351,7 +1704,6 @@ pub(crate) mod tests {
                 }
             }
         }
-        // The negative control: the stage IS the attempt — main's words.
         let mut app = App::headless_for_test();
         let running = app.native_updater_service.snapshot().current_build;
         let tried = running + 77_101;
@@ -2445,9 +1797,6 @@ pub(crate) mod tests {
                     app.apply_trouble_for(replacement).is_none(),
                     "new bytes inherit no failure"
                 );
-                // Historical path derived the target from the current stage.
-                // Drive it against the real ledger to prove the distinction is
-                // observable, then require the model to reject that result.
                 app.record_apply_outcome_in_ledger(&UpdateOutcome::Failed {
                     message: "historical inferred target".to_string(),
                 });
@@ -2483,8 +1832,6 @@ pub(crate) mod tests {
                 },
                 false,
             );
-            // A retry the lane has scheduled posts NO row (2026-09-23): the flow
-            // row, where one is up, already says the lane is on it.
             let scheduled = automatic && armed;
             assert_eq!(
                 app.update_row_text().is_some(),
@@ -2507,17 +1854,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// THE STATUS BAR'S POSTURE, IN THE ORDER THE FACTS OUTRANK EACH OTHER: the
-    /// disabled handoff (nothing applies while a terminal is open), then policy
-    /// — config, then the
-    /// environment — then the screenshot seam, then THIS build's own stand-down
-    /// latch (a lapsing latch is the same fact as a `Scheduled` retry row; a
-    /// sticky one waits for a click); what is left is the automatic lane. The
-    /// three answers about the process go in as parameters: the tests in this
-    /// crate assert those variables' ABSENCE, and setting process env would
-    /// poison every one of them. The LIVE reader is pinned on what a headless
-    /// App really is — a process with no seamless lane — because it reads the
-    /// same predicate the apply gate reads.
+    /// Verify `apply_posture_with` precedence: unavailable handoff > policy > screenshot
+    /// seam > per-build stand-down latch > automatic.
     #[test]
     fn apply_posture_names_config_env_latch_and_disabled_handoff_in_that_order() {
         use crate::app_config::AutoApplySetting;
@@ -2544,10 +1882,6 @@ pub(crate) mod tests {
             auto_apply: AutoApplySetting::On,
             nudge_seam: false,
         };
-        // THE LIVE READER, on a headless App: no window and no event loop, so no
-        // seamless lane — and the posture says so, because it reads the ONE
-        // predicate the apply gate reads. (Until 2026-08-30 it folded only the
-        // opt-out and answered `Automatic` here, over a lane the gate refused.)
         assert_eq!(
             app.apply_posture_for(build),
             P::HandoffDisabled {
@@ -2563,7 +1897,6 @@ pub(crate) mod tests {
             "the default policy, with the lane available"
         );
 
-        // THE LANE'S OWN STATE: a lapsing latch, a sticky latch, another build's.
         app.auto_apply_manual_only = Some(latch(build, later));
         assert_eq!(
             app.apply_posture_with(build, clean),
@@ -2587,7 +1920,6 @@ pub(crate) mod tests {
             "another build's latch is not this build's"
         );
 
-        // POLICY OUTRANKS THE LATCH: config first…
         app.auto_apply_manual_only = Some(latch(build, later));
         assert_eq!(
             app.apply_posture_with(
@@ -2599,7 +1931,6 @@ pub(crate) mod tests {
             ),
             P::ManualByConfig
         );
-        // …the screenshot seam (a development build's) names its variable…
         assert_eq!(
             app.apply_posture_with(
                 build,
@@ -2612,12 +1943,6 @@ pub(crate) mod tests {
                 var: "ATERM_DEBUG_RELAUNCH_NUDGE"
             }
         );
-        // …and an unavailable handoff outranks all of it, whatever its reason:
-        // nothing applies while a terminal is open, so neither the automatic
-        // promise nor the manual affordance would be true — but the warning
-        // CARRIES the veto (config here: it outranks the seam, like the arms
-        // above), so the bar's fallback clause cannot promise the
-        // closed-terminals landing a vetoed lane never attempts.
         for why in HandoffUnavailable::ALL {
             assert_eq!(
                 app.apply_posture_with(
@@ -2635,7 +1960,6 @@ pub(crate) mod tests {
                 }
             );
         }
-        // The screenshot seam is a veto of its own when policy is otherwise On…
         assert_eq!(
             app.apply_posture_with(
                 build,
@@ -2653,7 +1977,6 @@ pub(crate) mod tests {
                 image_kept: false,
             }
         );
-        // …and an armed lane carries none.
         assert_eq!(
             app.apply_posture_with(
                 build,
@@ -2669,7 +1992,6 @@ pub(crate) mod tests {
             }
         );
 
-        // THE LIVE READER folds the real config through the same seam…
         app.auto_apply_manual_only = None;
         app.config.update = Some(crate::app_config::UpdateConfig {
             auto_apply: Some(false),
@@ -2687,8 +2009,6 @@ pub(crate) mod tests {
             ),
             P::ManualByConfig
         );
-        // …and, headless, still answers with the lane that is not there — now
-        // carrying the config veto the live reader observed.
         assert_eq!(
             app.apply_posture_for(build),
             P::HandoffDisabled {
@@ -2699,12 +2019,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE BAR CARRIES THE POSTURE THE APP COMPUTED. `Wake::UpdateProgress` lands
-    /// in `note_update_progress`; a `Staged` report paints `apply_posture_for`,
-    /// which for a headless App — no window, no event loop, so no seamless lane
-    /// — is the handoff-off warning: the same fact the apply gate acts on, and
-    /// a stand-down latch the absent lane outranks re-states nothing. (The
-    /// available lane's half is `a_stopped_lane_raises_the_staged_decision_once`.)
+    /// `note_update_progress` records `apply_posture_for` on a `Staged` report.
     #[test]
     fn a_staged_report_paints_the_bar_with_the_posture_the_app_computed() {
         use crate::app_update_handoff::HandoffUnavailable;
@@ -2721,9 +2036,6 @@ pub(crate) mod tests {
             version: "9.9.9".to_string(),
             build,
         };
-        // Ruling 143: a staged build nothing can press, that the lane does not
-        // land within a minute, is a RECORD — the log carries the posture's
-        // words, the glass never shows them.
         let staged_record = |app: &App| {
             app.messages
                 .log()
@@ -2749,8 +2061,6 @@ pub(crate) mod tests {
         assert_eq!(staged_record(&app), staged_detail(headless));
         assert_eq!(app.message_band_rows, 0, "…and no row is reserved");
 
-        // A stand-down latch for this build changes nothing here: the lane that
-        // cannot run outranks the latch, and nothing is re-stated.
         let latch = |retry_at| crate::AutoApplyManualOnly {
             build,
             dmg_sha256: [0xab; 32],
@@ -2764,26 +2074,9 @@ pub(crate) mod tests {
         assert_eq!(app.messages.revision(), before, "the words did not change");
     }
 
-    /// THE WHOLE SHIPPING ASSEMBLY, FROM ONE REAL FAILED APPLY.
-    ///
-    /// Everything else about this work can be asserted through seams — `ApplyTrouble`
-    /// renders in isolation, `UpdateState::with_apply_lane` attaches a reason to a
-    /// fixture — and NONE of those seams is on the path a user's machine takes. This
-    /// test takes that path and only that path: `App::surface_update_apply_outcome`
-    /// with a real `UpdateOutcome::Failed`, the real ledger write (the harness points
-    /// `ATERM_UPDATE_ROOT` at a scratch root), the real reducer, `apply_trouble_for`,
-    /// `apply_retry_for`, `from_service`, and the exact label constructor
-    /// `refresh_version_menu` and the palette both call.
-    ///
-    /// It also pins the FIRST failure, which is the one the machinery could not
-    /// deliver: the ledger write is on the event loop, every path that used to carry
-    /// apply facts back into the reducer is a worker observation gathered BEFORE that
-    /// write, and no reconcile is run anywhere below. If the failure does not reach
-    /// these surfaces at the instant it is recorded, it does not reach them at all.
-    ///
-    /// The ledger guard protects the single standing target slot across writes and
-    /// reads. Unique build numbers alone cannot prevent a sibling failure writer
-    /// from replacing that slot between those operations.
+    /// End-to-end check that `surface_update_apply_outcome` writes the ledger, updates
+    /// the reducer immediately, and projects the failure into the Version menu, palette,
+    /// and Settings page.
     #[cfg(target_os = "macos")]
     #[test]
     fn one_real_failed_apply_reaches_every_standing_surface_at_once() {
@@ -2794,14 +2087,11 @@ pub(crate) mod tests {
         stage_build_with_ledger(&mut app, build);
         arm_intent(&mut app, build);
 
-        // PRECONDITION: a clean stage says nothing about failures, anywhere.
         assert!(
             app.apply_trouble_for(build).is_none(),
             "a stage nothing has attempted carries no trouble"
         );
 
-        // ONE REAL FAILURE, through the door the handoff completion uses. Nothing
-        // else happens: no reconcile, no check, no republish the test performs.
         app.surface_update_apply_outcome(
             "automatic handoff",
             UpdateOutcome::Failed {
@@ -2811,8 +2101,6 @@ pub(crate) mod tests {
         );
         use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
 
-        // THE VERSION MENU — the affordance that read "restart now" for hours on
-        // 2026-08-21 over an engine that had already tried twice.
         let message = "overlap handoff failed safely: handoff proof ended ChildDied";
         let trouble = app
             .apply_trouble_for(build)
@@ -2828,9 +2116,6 @@ pub(crate) mod tests {
             "the menu item carries the trouble"
         );
 
-        // THE PALETTE ROW, gathered by `palette_live` exactly as the real repaint
-        // does — including `relaunch`, which only exists because the ledger write
-        // republished the update state.
         let live = app.palette_live();
         assert_eq!(
             live.staged.as_ref().map(|(b, _)| *b),
@@ -2839,7 +2124,6 @@ pub(crate) mod tests {
         );
         assert_eq!(live.staged_trouble.as_ref(), Some(&trouble));
 
-        // THE SETTINGS PAGE, through `from_service` + `apply_retry_for`.
         assert_eq!(
             app.update_snapshot(false)
                 .projection()
@@ -2849,8 +2133,6 @@ pub(crate) mod tests {
             "the failure reached the page at once"
         );
 
-        // THE OTHER HALF OF THE ANSWER IS EVENT-LOOP STATE, and it has to reach the
-        // page. Same ledger, same count, same cause — only the scheduling changes.
         app.auto_apply_intent = None;
         app.auto_apply_manual_only = None;
         let latched = ApplyTrouble::new(1, message, ApplyRetry::ManualOnly);
@@ -2862,17 +2144,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// A FRESH PROCESS READS THE REASON OUT OF THE LEDGER, NOT ONLY THE COUNT.
-    ///
-    /// The other half of the wiring. `note_apply_failure` covers the failure that
-    /// happens WHILE the window is open; this covers the one that happened before it
-    /// opened — which is the field state exactly (the owner restarted into a build
-    /// whose ledger already carried two dead attempts). The only path to the reason
-    /// there is `app_native::durable_update_status`, which reads
-    /// `aterm_update::apply_lane_report` beside the check lane's status, and nothing
-    /// else in this crate reads it at all: without this test, deleting that read
-    /// leaves every surface saying "it did not finish installing" and the whole suite
-    /// green.
+    /// Verify a fresh `App` imports prior apply failure count and reason from the ledger via `durable_update_status`.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_check_that_lands_on_a_ledger_reads_the_reason_and_not_only_the_count() {
@@ -2881,7 +2153,6 @@ pub(crate) mod tests {
         let current_build = app.native_updater_service.snapshot().current_build;
         let staged = current_build + 6_301;
 
-        // What a previous run left on disk.
         let recorded = aterm_update::record_apply_failure(
             current_build,
             staged,
@@ -2890,8 +2161,6 @@ pub(crate) mod tests {
         .expect("the scratch staging root is resolvable under test");
         assert_eq!(recorded.failures_for_target, 1);
 
-        // This process learns all of it from the check that imports the stage —
-        // nothing was recorded in THIS App.
         stage_build_with_ledger(&mut app, staged);
         app.auto_apply_intent = None;
         app.auto_apply_manual_only = None;
@@ -2914,19 +2183,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// A SUPERSEDED STAGE DOES NOT INHERIT THE FAILURES OF THE ONE IT REPLACED.
-    ///
-    /// The apply streak `failing_applies` carries expires only when the RUNNING build
-    /// changes, so staging a newer artifact resets nothing at all. Before the ledger
-    /// learned to name the artifact, this exact sequence — an artifact fails, a check
-    /// imports a newer one — left the Version menu telling the reader that the FRESH
-    /// download had already been tried and had watched its successor die, while
-    /// `arm_native_auto_apply` had just armed a clean first attempt for it.
-    ///
-    /// Both halves run through the shipping path: `aterm_update::record_apply_failure`
-    /// writes the real ledger, `NativeUpdaterService::finish_check` imports the newer
-    /// stage carrying that ledger forward exactly as `durable_update_status` reads it,
-    /// and `apply_trouble_for` is asked the question the menu asks.
+    /// Staging a newer build does not inherit `apply_trouble_for` from the superseded build.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_newer_stage_starts_clean_even_though_the_running_build_has_not_changed() {
@@ -2936,8 +2193,6 @@ pub(crate) mod tests {
         let superseded = current_build + 5_201;
         let fresh = superseded + 1;
 
-        // The artifact that actually failed, recorded exactly as a returned handoff
-        // records it.
         let recorded = aterm_update::record_apply_failure(
             current_build,
             superseded,
@@ -2951,8 +2206,6 @@ pub(crate) mod tests {
             "PRECONDITION: the artifact that failed wears its own failure"
         );
 
-        // THE CHECK LANE IMPORTS A NEWER ARTIFACT, carrying the ledger forward
-        // verbatim — a stage does not touch the apply streak, by design.
         stage_build_with_ledger(&mut app, fresh);
         arm_intent(&mut app, fresh);
         assert!(
@@ -2974,8 +2227,6 @@ pub(crate) mod tests {
             "…and the page agrees with the menu"
         );
 
-        // …and the fresh artifact's OWN first failure counts from one, not from two,
-        // and carries ITS cause rather than the previous artifact's.
         app.surface_update_apply_outcome(
             "automatic handoff",
             UpdateOutcome::Failed {
@@ -2995,12 +2246,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// A STAGE THAT IS NOT NEWER THAN THE RUNNING BUILD IS NOT AN OFFER.
-    ///
-    /// `aterm-update`'s own boot-trial recovery records failures whose target IS the
-    /// running build (`install.rs`), so a ledger in which the target matches the
-    /// running build is reachable in production — and `apply_trouble_for` must still
-    /// refuse to decorate it, because there is nothing to restart into.
+    /// `apply_trouble_for` returns `None` when the target build is not newer than `current_build`.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_failure_recorded_against_the_running_build_decorates_nothing() {
@@ -3117,18 +2363,7 @@ pub(crate) mod tests {
         assert!(!app.automatic_apply_retry_scheduled(build));
     }
 
-    /// A RETRY THE LANE SCHEDULED POSTS NO ROW; A LANE THAT STOPPED SAYS SO ONCE.
-    ///
-    /// "Update paused — manual retry" named a mechanism, not an action, and it was
-    /// flatly wrong half the time: a physical handoff failure inside its budget
-    /// schedules another automatic attempt. Which answer is true is a question
-    /// about SCHEDULING STATE, so every carrier of it is consulted — a live
-    /// intent, or a latch with a deadline — and each must name THIS staged
-    /// artifact. Since 2026-09-23 the scheduled answer is SILENCE: the flow row
-    /// says the lane is on it, and the owner read every "delayed / waiting /
-    /// postponed" row that day as noise about a retry he could do nothing about.
-    /// Only a PERSON whose own attempt failed is told, because nothing else would
-    /// tell them.
+    /// Scheduled automatic retries post no band row; stopped lanes and manual failures do.
     #[test]
     fn a_scheduled_retry_is_silent_and_a_stopped_lane_names_the_menu() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -3142,19 +2377,14 @@ pub(crate) mod tests {
         let failed = || UpdateOutcome::Failed {
             message: "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
         };
-        // THE ROW, NOT A PILL (2026-09-07): silence is an empty lane.
         let row = |app: &App| app.update_row_text();
 
-        // NOTHING SCHEDULED: no intent, no latch. The honest answer is that the
-        // user has to reach for the control.
         app.auto_apply_intent = None;
         app.auto_apply_manual_only = None;
         app.clear_messages_for_test();
         app.surface_update_apply_outcome("automatic", failed(), false);
         assert!(row(&app).is_some(), "a stopped lane is said");
 
-        // A LIVE INTENT for this artifact: a wake is already folded into the event
-        // loop — nothing to say.
         app.auto_apply_intent = Some(crate::AutoApplyIntent {
             build,
             dmg_sha256: [0xab; 32],
@@ -3165,8 +2395,6 @@ pub(crate) mod tests {
         app.surface_update_apply_outcome("automatic", failed(), false);
         assert_eq!(row(&app), None);
 
-        // A LEFTOVER intent for a SUPERSEDED build schedules nothing for the
-        // artifact on screen, so it must not borrow the silence.
         app.auto_apply_intent = Some(crate::AutoApplyIntent {
             build: build + 7,
             dmg_sha256: [0xab; 32],
@@ -3177,9 +2405,6 @@ pub(crate) mod tests {
         app.surface_update_apply_outcome("automatic", failed(), false);
         assert!(row(&app).is_some(), "a stopped lane is said");
 
-        // A LATCH WITH A DEADLINE is the other carrier: the lane is standing down
-        // but `about_to_wait` will lapse it, so it does come back on its own —
-        // on every physical attempt, the first included.
         app.auto_apply_intent = None;
         let lapsing = crate::AutoApplyManualOnly {
             build,
@@ -3206,9 +2431,6 @@ pub(crate) mod tests {
         }
         app.auto_apply_physical_retry = None;
 
-        // A DEADLINE-LESS latch (the policy-mismatch fail-safe, or a converged
-        // artifact) genuinely does not come back by itself: said once, with the
-        // control.
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
             build,
             dmg_sha256: [0xab; 32],
@@ -3219,12 +2441,6 @@ pub(crate) mod tests {
         app.surface_update_apply_outcome("automatic", failed(), false);
         assert!(row(&app).is_some(), "a stopped lane is said");
 
-        // AND A PERSON IS NEVER SILENCED BY THE AUTOMATIC LANE'S SCHEDULE.
-        //
-        // A person's returned handoff spends nothing (driven, not hand-set: the
-        // real completion path's `(Some(attempt), None)` arm), so the posture —
-        // and the flow row — would not move; whoever just asked for the update is
-        // exactly who must be told it did not happen.
         let manual_ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
             build,
             "0123456789abcdef0123456789abcdef01234567",
@@ -3252,9 +2468,6 @@ pub(crate) mod tests {
              is how three clicks on a bad afternoon converged the background lane"
         );
         app.surface_update_apply_outcome("manual handoff", person, false);
-        // Ruling 143: the lane retries it by itself, so the person's own press
-        // ends in its switch row's Fault echo and a RECORD — never a second row
-        // for a retry nobody can hurry.
         assert_eq!(row(&app), None, "a self-retry takes no row");
         assert!(
             app.update_record_text().is_some(),
@@ -3262,8 +2475,6 @@ pub(crate) mod tests {
         );
         app.auto_apply_physical_retry = None;
 
-        // TURNING THE LANE OFF makes every scheduling carrier moot: a lapse would
-        // only re-arm into a poll that answers `Clear`.
         app.config.update = Some(crate::app_config::UpdateConfig {
             auto_apply: Some(false),
             ..app.config.update.clone().unwrap_or_default()
@@ -3278,24 +2489,15 @@ pub(crate) mod tests {
         assert!(row(&app).is_some(), "the opted-out lane is said");
     }
 
-    /// ONLY WHAT A PERSON CAN ACT ON IS NAMED (2026-09-23): a close preflight that
-    /// refuses the install for unsaved editor or Settings work puts that one
-    /// sentence on the row, whatever the schedule; a blocker that clears by
-    /// itself (a restore landing, a checkpoint running) posts nothing while the
-    /// lane will try again, and a stopped lane points at the Version menu.
+    /// Close preflight names user-actionable blockers (editor/Settings drafts) on the row
+    /// and suppresses self-clearing blockers while retry is scheduled.
     #[test]
     fn only_a_blocker_a_person_can_clear_is_named_on_the_row() {
-        // An automatic `Blocked` books a refusal in the one per-process ledger:
-        // held, so it cannot land between a sibling's booking and its read
-        // (measured 2026-09-25: `a_fork_lane_park_miss_is_booked_as_a_refusal_
-        // not_a_failure` read this test's "Updating after session restore
-        // finishes" as its own last refusal, one full-suite run in one).
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let blocked = |reasons: &[&str]| UpdateOutcome::Blocked {
             reasons: reasons.iter().map(|r| (*r).to_string()).collect(),
         };
-        // Named by the work that holds it: Settings text is no open editor.
         const SETTINGS: &str = "Review Settings Drafts: 1 Settings view(s) have unsaved text";
         for (reasons, said) in [
             (
@@ -3327,9 +2529,6 @@ pub(crate) mod tests {
                 "{reasons:?}"
             );
         }
-        // Clears by itself, and nothing is scheduled here (no stage): the lane
-        // has stopped, and the menu is named — on record, since with no build
-        // staged there is no `Install now` to press (ruling 143).
         app.clear_messages_for_test();
         app.react_to_update_apply_outcome(
             "automatic",
@@ -3344,7 +2543,6 @@ pub(crate) mod tests {
                 crate::update_words::INSTALL_FROM_MENU
             ))
         );
-        // …and while a retry IS scheduled, nothing at all.
         app.clear_messages_for_test();
         app.note_update_blockers(&[App::RESTORE_IN_FLIGHT_BLOCKS_APPLY.to_string()], true);
         assert_eq!(app.update_row_text(), None);
@@ -3356,15 +2554,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// SUBMISSION IS NOT COMPLETION, AND THE LEDGER MUST BE ABLE TO ESCALATE.
-    ///
-    /// The apply streak exists to reach `PERSISTENT_AFTER = 3`. It could not:
-    /// `Accepted` — the worker was merely STARTED, or an in-flight request was
-    /// joined — recorded an apply SUCCESS, which zeroed the streak, so every
-    /// click-then-fail cycle was wipe-then-set, capped at 1. Now a submission is
-    /// silent and only a real failure (a capture refusal included, plan P0-3)
-    /// touches the streak; a refusal records its standing explanation in the
-    /// non-streak slot, and installed-but-needs-relaunch says nothing durable.
+    /// Verify `apply_ledger_verdict` maps `Accepted` and `InstalledNeedsRelaunch` to `Silent`,
+    /// `Failed` and `CaptureRefused` to `Failed`, and `Deferred`/`Blocked` to `Refused`.
     #[test]
     fn a_submitted_then_failed_apply_writes_one_streak_increment_and_never_a_clear() {
         use ApplyLedgerVerdict::{Failed, Refused, Silent};
@@ -3409,12 +2600,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// WHO IS WAITING (design ruling 220): the updater service's live ticket —
-    /// minted only by a person's Check for Updates, Software Update's button or
-    /// the Version menu — and a person's `aterm ctl update check` in flight
-    /// each make the download theirs, with its animated row; the background
-    /// loop's is nobody's, and silent. The check ending while the row is up
-    /// leaves the row to its end.
+    /// Verify `update_awaited` distinguishes user-initiated and `ctl` checks from background checks.
     #[test]
     fn a_download_is_the_persons_while_their_check_runs() {
         let download = |done: u64| aterm_update::Progress::Downloading {
@@ -3422,7 +2608,6 @@ pub(crate) mod tests {
             bytes_done: done,
             bytes_total: 90,
         };
-        // Nobody asked: silent, and Software Update says it.
         let mut app = App::headless_for_test();
         assert!(!app.update_awaited());
         app.note_update_progress(&download(45));
@@ -3432,7 +2617,6 @@ pub(crate) mod tests {
             "the background loop's is silent"
         );
         assert!(app.update_quiet.is_some(), "Software Update says it");
-        // A person's check from the menu: the ticket makes it theirs.
         let CheckStart::Start(_) = app.native_updater_service.request_check() else {
             panic!("a check starts");
         };
@@ -3446,7 +2630,6 @@ pub(crate) mod tests {
             app.update_quiet.is_none(),
             "and the page's quiet line is gone"
         );
-        // `aterm ctl update check`: bracketed by its wakes, nested safely.
         let mut ctl = App::headless_for_test();
         ctl.note_update_check_asked(true);
         ctl.note_update_check_asked(true);
@@ -3464,9 +2647,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE SILENT DOWNLOAD STILL REACHES AN OPEN SOFTWARE UPDATE PAGE (design
-    /// ruling 220): the quiet lane posts no row, but the open Settings view
-    /// repaints with its progress, and the download's end clears the quiet line.
+    /// Quiet background download progress updates an open Software Update Settings view.
     #[test]
     fn the_quiet_download_repaints_an_open_settings_page() {
         let mut app = App::headless_for_test();
@@ -3515,14 +2696,12 @@ pub(crate) mod tests {
         assert_eq!(app.native_updater_service.snapshot().generation, 1);
     }
 
-    /// The staged DECISION is raised once (design §10.5 H2, ruling 119), and
-    /// only under a posture where a press is how the build installs.
+    /// `ensure_staged_decision_in` raises the ready row at most once per `(build, posture)`.
     #[test]
     fn a_stopped_lane_raises_the_staged_decision_once() {
         use crate::update_words::ApplyPosture;
         let mut app = App::headless_for_test();
         let build = stage_one_build(&mut app);
-        // No staged build of that number: nothing to offer.
         app.ensure_staged_decision_in(build + 1, ApplyPosture::ManualByConfig);
         assert_eq!(app.messages.live_rows().count(), 0);
         for posture in [
@@ -3547,9 +2726,6 @@ pub(crate) mod tests {
             row.msg.actions,
             vec![aterm_messages::Intent::ApplyUpdate { build }]
         );
-        // The person lets it lapse (its hold ran out). Every later reconcile
-        // re-states the same posture: the question stays off the glass — the
-        // Version menu and Software Update still offer it (review 2026-09-24).
         let lapsed = std::time::Instant::now() + aterm_messages::HOLD_STAGED_MANUAL * 2;
         app.messages.settle(lapsed, true);
         app.sync_messages();
@@ -3562,8 +2738,6 @@ pub(crate) mod tests {
             None,
             "a reconcile never asks again"
         );
-        // A posture that has just become a decision (the lane stopped under
-        // another one) raises it once more.
         app.ensure_staged_decision_in(build, ApplyPosture::ManualByConfig);
         assert!(
             app.staged_update_row().is_some(),
@@ -3571,12 +2745,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// ONE DECISION PER STOPPED LANE (rulings 119 and 143; review
-    /// 2026-09-24). A stand-down's posture restatement turns the flow row
-    /// into the ready row (`aterm vX is ready`, `Install now`); the stopped
-    /// lane's outcome that follows carries the same press. The outcome is the
-    /// one row: the ready row is withdrawn under it — on the Failed path and
-    /// on the Blocked one.
+    /// Posting a stopped-lane outcome withdraws any live staged ready row.
     #[test]
     fn a_stopped_lane_is_one_decision_row_never_two() {
         use crate::update_words::ApplyPosture;
@@ -3632,11 +2801,7 @@ pub(crate) mod tests {
             assert_eq!(app.message_band_rows, 1, "one row for one fact");
         }
     }
-    /// AN UNATTENDED FAILURE WITH NO STAGE IS A RECORD (audit 2026-09-24,
-    /// design ruling 213): the artifact is gone, nothing can be pressed, and
-    /// the next check re-stages it — so the automatic lane writes one record
-    /// and posts no row; a person's own press still gets `Couldn't finish
-    /// the update` on the glass.
+    /// When no stage remains, an automatic failure is log-only while a manual press posts `UPDATE_DIDNT_FINISH`.
     #[test]
     fn an_automatic_failure_with_no_stage_is_a_record_and_a_press_is_a_row() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -3663,10 +2828,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// NO ✓ BESIDE A FAILURE (ruling 159). The staged row leaves resolved `Ok`
-    /// once the bytes are installed (`InstalledNeedsRelaunch`) — true — and
-    /// WITHDRAWN when the artifact is gone (`Failed` with no staged build),
-    /// with no outcome to claim: only `Couldn't finish the update` speaks.
+    /// `InstalledNeedsRelaunch` resolves the staged row `Ok`, while `Failed` with no stage withdraws it.
     #[test]
     fn a_gone_artifact_never_echoes_installed_beside_its_failure() {
         use aterm_messages::{LogState, Outcome, Retired};

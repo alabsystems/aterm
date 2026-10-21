@@ -3,12 +3,13 @@
 
 # aterm-agent: spec recovery from its 2840 unit tests
 
-> Current scope, 2026-10-19: `harness::spend` retains the price table, per-request pricing and Codex
-> conversation usage fold. The account-wide `Spend`/`SpendStore`, home scanners, persistence,
-> capacity/calibration types and their API-specific tests, plus the `spend_fold` example, were removed
-> after reference closure found no production caller. Pricing/conversation regressions and the CLI's
-> served usage JSON/text coverage remain. These changes do not implement account-wide dollar or
-> remaining-capacity reporting. The recovery counts below describe the older survey.
+> Current scope, 2026-10-21: `harness::spend` holds the price table, per-request pricing, the Codex
+> conversation usage fold, and the account-wide Claude Code `Spend` (the home's transcript fold and
+> the capacity figure) with their tests. Main removed the account-wide half on 2026-10-19 for want of
+> a production caller; the account stats A1 view (`harness::account_stats`, `accounts stats`) calls
+> that fold and figure, so its merge restored them, and only them: the spend file (`SpendStore`,
+> persistence), the Codex home fold and the calibration, which nothing calls yet, stay removed, as
+> does the `spend_fold` example. The recovery counts below describe the older survey.
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 590 tests
 > it deleted and 17 specs whose functions it deleted are gone (among them `acc-merge-join`, whose
@@ -174,7 +175,7 @@ acc-canary-hold-take	contract	accounts::{take_canary,State::canary_holds}	canary
 acc-rotation-breaker	contract	accounts::{rotations_spent,breaker_until,recent}	recent ⇔ 0 ≤ t-x < W; rotations_spent ⇔ empty roster ∨ recent rotations ≥ 2·|roster|; breaker_until = the instant the count drops below the bound.	1,3,7	2/2
 acc-pin-unpin	contract	accounts::{pin,unpin,note_auth}	pin refuses an absent/unenrolled/signed-out row by name (state unchanged), else clears its walls and makes it active, proven and pinned; unpin emits Unpin iff pinned; a SignedOut on the pinned account ends the pin.	1,2,3	0/1
 acc-note-observations	contract	accounts::{note_sample,note_offer,note_auth,note_session,State::sessions_on}	Each note_* records only newer admissible observations (a stamp ahead does not shadow), with its own event rule; note_offer keeps the kind its count is of, through the state file, and a row with no kind or an unknown one reads as none; note_session emits Move on an account change; ran_at survives forget_session; sessions_on is sorted.	1,2,3	1/1
-acc-note-reading-max	contract	accounts::{note_reading,tap_merge,tap_window}	Per window: take the read when the held is void or the read's reset is later; same reset ⇒ max pct; earlier ⇒ keep. Written iff a window changed or the heartbeat elapsed.	1,2,3	1/1
+acc-note-reading-max	contract	accounts::{note_reading,merge_fig,sample_window}	Per window: take the read when the held is void or the read's reset is later; same reset ⇒ the newest epoch cuts every reading served before it, then max pct (a tie keeps the newer); earlier ⇒ keep. Written iff a figure, a reset, an epoch or the key changed or the heartbeat elapsed.	1,2,3	1/1
 acc-reset-claim	contract	accounts::{claim_reset,reset_in_flight}	claim_reset: Attempted for inadmissible/blank input; a claim in flight answers Mine only for the same sid,pid,start and raw window, otherwise Held{until}; a reset timestamp already attempted cannot be retargeted through another window. Otherwise Taken when the wall is newer or the old reset came, retaining the raw window; writes no ledger row.	1,2,3	1/1
 acc-reset-outcome	contract	accounts::{reset_outcome,reset_reason,ResetDone::word}	reset_outcome only on an open matching account/until/sid claim: records done and one event. Used/Lifted mark only its raw-window Wall cleared when until matches and wall.at ≤ claim.at; another/newer wall or an unscoped legacy claim clears nothing. An exact generic session/week key refills only its own warning when that wall stood at claim and neither warning nor sample is newer than claim. Cleared records share the bounded wall map; no automatic global cleared_at write. Whatever the kind spent, only the claimed raw window is cleared. Used{K,Some(n)}'s reason is ResetKind::resets(K,n) + ' left', Walled's that + ', still walled'. Walled (spent, the line saying the wall still stands), Kept and Failed change no wall; reset_reason is the head before ` · `, cut to WORD_MAX on a char boundary, control chars folded.	1,2,3,7	1/1
 acc-reset-allowed	contract	accounts::{reset_allowed,Roster::own}	reset_allowed: not-listed, not-default, active-other, other-login checked in order, else Ok; Roster::own() = [main, dedicated, no dir].	1,3,7	1/1
@@ -229,7 +230,7 @@ disk-target-assess-witness	contract	harness::disk::target::{assess,target_witnes
 disk-target-reclaim-only-incremental	contract	harness::disk::target::{reclaim,reclaim_with,dev_of}	reclaim removes only incremental/ of the selected profiles; everything else byte-identical; nothing through a symlink; never another device; undeletable entries reported while siblings go; bytes = released blocks.	7,8	7/7
 disk-target-reclaim-locking	contract	harness::disk::target::{reclaim_with,locks_held_with,HeldLock}	Every cargo lock of a profile is taken (created only when proceeding, with cargo's mode) and held through the delete, idleness re-checked under them; a held lock skips the profile; locks are close-on-exec.	8,13	7/7
 disk-target-reclaim-lru-whole	contract	harness::disk::target::{reclaim_lru,reclaim_lru_with,reclaim_whole_with}	reclaim_lru takes only the named profile's incremental/ under its locks, refusing one written since the survey or just built; reclaim_whole_with removes the directory only after locking every profile and the owner check, deleting through its handle.	8,13	3/3
-disk-discover-roots	contract	harness::disk::discover::{discover,Origin}	discover returns each marked build directory once by canonical path from exactly the listed root kinds, never hidden, Library or too-deep directories; ownership by checkout over link; Linked when only a scratchpad link names it.	1,7,8	4/4
+disk-discover-roots	contract	harness::disk::discover::{discover,Origin}	discover returns each marked build directory once by canonical path from exactly the listed root kinds, never hidden, Library, another app's data or a file-provider domain (`APP_DATA_ROOTS`, `FILE_PROVIDER_ROOTS`), or too-deep directories; ownership by checkout over link; Linked when only a scratchpad link names it.	1,7,8	5/5
 disk-discover-xpy-rule	table-property	harness::disk::discover (x.py rule)	Under build/<host>/ only stage<N≥1>-<kind> and bootstrap-tools with a signed tag are build directories; stage0, sysroots, llvm and links never; the marker walk never enters an x.py build/.	1,7,8	2/2
 disk-discover-budget-and-confinement	contract	harness::disk::discover::discover	A spent budget keeps what was found and says so (suppressing owner judgement); the search stays on the measured device, out of mount points and privacy folders, and skips unsafe temp roots.	1,7,8	5/5
 disk-session-gone	contract	harness::disk::discover::{gone,claude_census,unused}	A session is gone only when the whole registry names it for no running pid, nothing of it was written in the window, and no possibly-holding Claude process exists; an unreadable process keeps it.	1,8,13	1/1
@@ -253,7 +254,7 @@ footer-project-slug	contract	footer::project_slug	Maps every non-ASCII-alphanume
 footer-launch-facts	contract	footer::{launch_facts,launch_facts_of}, upgrade::{launch_model,launch_resume}	pinned ⇔ a non-empty --model or an ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_<X>_MODEL env; model = model_display of a real id (aliases None); resume = Session(id) / Unnamed / None by the resume flags.	1,3,5,7	2/2
 footer-card-fill	contract	footer::{FooterFacts::filled_from,launch_card}	filled_from fills only open fields (effort only for the same model, nothing from another build's card); launch_card only under a live REPL with no box over the composer.	1,3,12	2/2
 footer-branch-of-head	contract	footer::{branch_of_head,printable}	`ref: refs/heads/x` ↦ printable(x) (non-empty, ≤128 chars, no control); a ≥7-hex head ↦ its first 7; else None.	1,3,7	1/1
-footer-git-head-resolution	contract	footer::{read_git_head,read_git_head_in,resolve_git_dir_of,read_head,is_eperm,under_file_provider_domain}	Climb to the first .git (dir, or `gitdir:` file); Found(branch) when readable; Absent under a file-provider domain, without .git, or on non-EPERM failures; Denied iff EPERM.	1,7,8	4/4
+footer-git-head-resolution	contract	footer::{read_git_head,read_git_head_in,resolve_git_dir_of,read_head,is_eperm,under_file_provider_domain}	Climb to the first .git (dir, or `gitdir:` file); Found(branch) when readable; Absent under a file-provider domain or another app's data (`APP_DATA_ROOTS`), without .git, or on non-EPERM failures; Denied iff EPERM.	1,7,8	4/4
 open-regular-nonblocking	contract	footer::{open_regular,read_small,open_nonblocking,regular}, session_usage cursor open	open_regular opens O_NONBLOCK and keeps the handle only if fstat says regular file; a FIFO is never read or folded.	8	2/2
 footer-home-and-elide-path	contract	footer::{home_path,elide_path}	home_path renders ~ / ~/rest by component prefix (none for a parentless home), else the lossy path, refusing control chars; elide_path = …/last when shorter.	1,3,7	2/2
 footer-segments-order	contract	footer::{segments,fact_segments,text_width}	segments = [UPGRADE?] ++ present of [WALL, MODEL(+effort), ACCOUNT, PATH, BRANCH, USAGE] in that order, absent ones omitted, every mark width 1.	1,3,7	3/3
@@ -552,7 +553,7 @@ approval-one-shot-only	invariant	policy::approval::{decide,once_choice,Role,deci
 approval-level-monotone	contract	policy::approval::{decide,decide_safe,decide_box,rm_breaker_warn}	None escalates every permission box; whatever Safe approves All presses the same way (unproven presses marked); Safe approves an unproven rm breaker with a warning unless rm_breaker_ask; non-default shells and remote boxes are never proven.	1,2,3,4,5,12	8/8
 approval-safe-bash-sound	contract	policy::approval::{bash,read_only_every_reading,plain_under_zsh,shell_models_hold,git_reads_clear}, classify_command_with	Safe approves a Bash box only out of bypass, with no vendor note, local, default shell, every reading read-only, plain under zsh, and every git read clear.	1,3,4,5,7,12	9/9
 approval-rm-breaker-sound	contract	rm_breaker::resolve, resolvable_breaker, classify_except_rm, is_mktemp_guard, decide (rm arm)	RULE_RM_BREAKER approves only in bypass with cwd known and scratch roots, every operand resolving (through links) strictly inside a scratch root or a guarded mktemp dir, the rest of the line read-only, and no rebinding hazard; anything else escalates under Safe.	1,3,4,5,7,8,10	8/8
-approval-read-rule	contract	policy::approval::{read_box,read_readings,default_secrets,vendor_distrusts,forced_read}	A Read box is approved iff it offers its folder grant and every reading (as written and canonical) is under a read root and no secret rule.	1,3,5,7,8	3/3
+approval-read-rule	contract	policy::approval::{read_box,read_readings,default_secrets,vendor_distrusts,forced_read}, probe_live::{never_listed,hidden_twin_within}	A Read box is approved iff it offers its folder grant and every reading (as written and canonical) is under a read root and no secret rule; the hidden-twin directory walk never lists inside another app's data or a file-provider domain (`APP_DATA_ROOTS`, `FILE_PROVIDER_ROOTS`).	1,3,5,7,8	4/4
 approval-trust-dialog	contract	decide (trust arm), RULE_TRUST_DIALOG, RULE_TRUST_ANY	Safe trusts only Claude's dialog (aterm answers no Codex box), for the session's own folder under a trust root (none by default), its options exactly an exit and a trust; full power trusts any folder, unproven.	1,3,4,12	4/5
 approval-roots	contract	roots_from_config, own_claude_tmp, ScratchRoot::{holds,label}, ApprovalCtx::new, abs_components	roots_from_config expands ~ and a final-component glob, maps claude-* to this uid's own, drops unsafe specs; holds = component prefix; ApprovalCtx::new builds the default roots.	1,3,5,7	3/3
 approval-whole-read	invariant	head_unread, tall_box, quoted_invocation, decide	A box not read whole is never pressed, except the tall-box decline for a single quoted removal in bypass; quoted_invocation needs exactly one backtick pair.	1,3,4,5,12	6/6
@@ -999,6 +1000,7 @@ src/harness/disk_discover_tests.rs	a_temp_root_another_user_could_write_in_is_no
 src/harness/disk_discover_tests.rs	above_the_floor_or_switched_off_an_ended_sessions_build_is_any_other	disk-whole-pass	
 src/harness/disk_discover_tests.rs	an_xpy_checkout_gives_its_bootstrap_build_dirs_and_never_a_sysroot	disk-discover-xpy-rule	
 src/harness/disk_discover_tests.rs	every_root_kind_is_found_and_each_build_directory_once	disk-discover-roots	
+src/harness/disk_discover_tests.rs	other_apps_data_is_never_entered_from_any_root	disk-discover-roots	
 src/harness/disk_discover_tests.rs	the_hogs_a_tick_hands_the_window_name_what_the_pass_left	disk-hogs	
 src/harness/disk_discover_tests.rs	the_journal_names_whose_build_directory_went_whole	disk-whole-pass	
 src/harness/disk_discover_tests.rs	the_largest_hogs_are_what_no_row_frees_biggest_first	disk-hogs	
@@ -2049,6 +2051,7 @@ src/supervise/policy/approval_tests.rs	the_press_gate_refuses_each_kept_mcp_answ
 src/supervise/policy/approval_tests.rs	the_reset_rule_takes_only_the_one_reset_on_offer_and_never_a_fable_row	approval-limit-dialog	
 src/supervise/policy/approval_tests.rs	the_rest_of_an_rm_breaker_line_must_read	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	the_session_paused_dialog_switches_to_the_fallback	approval-dialog-rules	
+src/supervise/policy/approval_tests.rs	the_twin_scan_never_lists_inside_another_apps_data	approval-read-rule	
 src/supervise/policy/approval_tests.rs	trust_roots_are_read_from_the_config_spelling	approval-roots	
 src/supervise/policy/approval_tests.rs	under_zsh_only_a_plain_line_is_a_proven_read	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	with_no_trust_root_only_the_system_roots_are_read	approval-read-rule	

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! AN EXIT NOBODY IS HANDED IS STILL READ AS IT IS SEEN (round seventeen):
-//! the agent's exit while the host thread is down after a panic, and while a
-//! park's Commit holds the host.
+//! An exit nobody is handed is still read as it is seen: the agent's exit while the host
+//! thread is down after a panic, and while a park's Commit holds the host.
 
 use super::*;
 
@@ -154,8 +153,8 @@ fn watch_armed(host: &HostHandle) -> bool {
     kept_of(host, |k| k.exit_watch.is_some()).unwrap_or(false)
 }
 
-/// Whether the restored queue keeps tab `sid`'s attempt as A LANDING NO READ
-/// HAS REACHED ([`RestoredAttempt::landed`]): its step landed, and a look at
+/// Whether the restored queue keeps tab `sid`'s attempt as a landing no read
+/// has reached ([`RestoredAttempt::landed`]): its step landed, and a look at
 /// the agent it landed found it holding its tab unread
 /// ([`restored_landing_ends`]). Set only as that look ends, so `true` says it
 /// has: the step being counted, or the tab asked about, says neither.
@@ -185,20 +184,15 @@ fn narrowed() -> SupervisorConfig {
     cfg
 }
 
-/// A HARNESS SWITCHED OFF WHILE THE HOST IS DOWN HANDS NOTHING FROM BEFORE
-/// (round seventeen; the hazard the residual on [`Workers`] named): the host
-/// thread panics, the agent crashes while it is down — its record read as
-/// the exit was seen and kept — and the owner switches the harness off
+/// A harness switched off while the host is down hands nothing from before:
+/// the host thread panics, the agent crashes while it is down — its record
+/// read as the exit was seen and kept — and the owner switches the harness off
 /// before the host is back, then on again. The switch is news that ends the
 /// back-off ([`State::news`]; held here at the gate until the test opens
 /// it), and the restart stands down ([`restart_under_policy`]: the worker
 /// stopped for good, the exit watch ended), as the passes after it do;
 /// switched on again, the host hands no exit from before: nothing is read,
 /// started or relaunched.
-///
-/// THE CONTROL of the panic's reproductions: a mark the panic left on the
-/// session would have outlived the switch (the restart gave up then, and no
-/// pass cleared it), and the next host switched on would hand that exit.
 #[test]
 fn a_harness_switched_off_while_the_host_is_down_hands_nothing_from_before() {
     let p = panicking_host();
@@ -238,16 +232,9 @@ fn a_harness_switched_off_while_the_host_is_down_hands_nothing_from_before() {
     p.host.shutdown_and_join();
 }
 
-/// A HARNESS SWITCHED OFF WHILE THE HOST IS DOWN STOPS WHAT IT CARRIES
-/// ITSELF (round seventeen, the review of its first cut): the host thread
-/// panics and waits out a long back-off, every pass of its restarted run
-/// panicking again before it visits its workers, and the owner switches the
-/// harness off. The switch is news: the back-off ends at once, and the
-/// restart itself stops the worker it carried for good and ends its agent's
-/// exit watch ([`restart_under_policy`]) — no pass gets so far — leaving
-/// nothing to the host. THE CONTROL for the restart's own stand-down: the
-/// control above holds its back-off at a gate and runs whole passes after
-/// it, which do the same stops.
+/// A harness switched off during the host's back-off, with every restarted pass panicking before
+/// it visits its workers, is handled by the restart itself ([`restart_under_policy`]): the
+/// carried worker stopped for good, its exit watch ended, nothing left to the host.
 #[test]
 fn a_harness_switched_off_while_the_host_is_down_stops_what_it_carries_itself() {
     let p = panicking_host_with(Some(Duration::from_secs(3600)));
@@ -263,19 +250,8 @@ fn a_harness_switched_off_while_the_host_is_down_stops_what_it_carries_itself() 
     p.host.shutdown_and_join();
 }
 
-/// A HARNESS SWITCHED ON AGAIN DURING THE HOST'S BACK-OFF IS SUPERVISED AT
-/// ONCE (round seventeen, the review of its first cut): the host thread
-/// panics, the owner switches the harness off — the restart stops what it
-/// carried — and its run panics again with nothing left to carry, so it
-/// waits out its next (long) back-off; then the owner switches the harness
-/// on again. The switch is news: the back-off ends at once, and the tab is
-/// supervised again.
-///
-/// FAILS ON 70537fad5: a switch cut the back-off only while the restart
-/// carried workers to stop, so the switch-on with none waited out the
-/// whole back-off (the wait for the tab's loop runs out). Before that cut
-/// (1afcdade3) the switch-off ended the host thread, and the switch-on
-/// started a fresh one at once.
+/// A harness switched off and on again during the host's (long) back-off, with no workers left
+/// to carry, is news: the back-off ends at once and the tab is supervised again.
 #[test]
 fn a_harness_switched_on_again_during_the_hosts_back_off_is_supervised_at_once() {
     let p = panicking_host_with(Some(Duration::from_secs(3600)));
@@ -296,19 +272,8 @@ fn a_harness_switched_on_again_during_the_hosts_back_off_is_supervised_at_once()
     p.host.shutdown_and_join();
 }
 
-/// A COMMIT THAT FAILS DURING THE HOST'S BACK-OFF IS SUPERVISED AGAIN AT
-/// ONCE (round seventeen, the review of its first cut): the host thread
-/// panics and waits out a long back-off (an hour, as after a few panics), a
-/// park's Commit comes — its stop ends the worker the restart carried,
-/// leaving its agent's exit to the host — and fails. The failed Commit's
-/// resume is news the restart acts on: its run starts again at once, and its
-/// first pass starts the tab's worker again.
-///
-/// FAILS ON 70537fad5: the back-off was cut by a shutdown or a switch-off
-/// alone, so the restart waited out its hour with no worker on the tab —
-/// nobody answered its boxes or ended its turns (the wait for its loop to
-/// run again runs out). Before that cut (1afcdade3) the suspend ended the
-/// host thread, and the resume started a fresh one at once.
+/// A Commit that fails during the host's (long) back-off is news: the restart runs again at once
+/// and its first pass starts the tab's worker again.
 #[test]
 fn a_failed_commit_during_the_hosts_back_off_is_supervised_again_at_once() {
     let p = panicking_host_with(Some(Duration::from_secs(3600)));
@@ -339,21 +304,9 @@ fn a_failed_commit_during_the_hosts_back_off_is_supervised_again_at_once() {
     p.host.shutdown_and_join();
 }
 
-/// A POLICY NARROWED WHILE THE HOST IS DOWN REACHES THE WORKERS IT CARRIES
-/// (round seventeen, the review of its first cut): the host thread panics
-/// and waits out a long back-off, and the owner narrows `[harness]`
-/// (`approve = "none"`) meanwhile. The worker the restart carried, started
-/// under the policy before, is handed over at once — no press, answer or
-/// continuation of its loop's under a policy the owner has since narrowed —
-/// and its successor's loop runs under the new one, the narrowing's news
-/// cutting the back-off short. And when every pass of the restarted host
-/// panics again, the restart hands it over itself: no pass need get so far.
-///
-/// FAILS ON 70537fad5: only a pass hands a worker over on a policy change
-/// ([`visit_workers`]), and the back-off was cut by a shutdown or a
-/// switch-off alone: the carried worker ran on under the old policy until
-/// the host was back — its whole back-off (the wait for its successor's loop
-/// runs out). Before that cut (1afcdade3) the panic stopped every worker.
+/// A policy narrowed during the host's back-off reaches the worker it carries: that worker is
+/// handed over at once and its successor's loop runs under the new policy, the news cutting the
+/// back-off short. When every restarted pass panics, the restart hands it over itself.
 #[test]
 fn a_policy_narrowed_while_the_host_is_down_reaches_the_workers_it_carries() {
     use aterm_agent::supervise::config::Approve;
@@ -370,7 +323,7 @@ fn a_policy_narrowed_while_the_host_is_down_reaches_the_workers_it_carries() {
     );
     p.host.shutdown_and_join();
 
-    // Every pass of the restarted host panics: the restart hands it over.
+    // Every pass of the restarted host panics: the restart hands it over itself.
     let p = panicking_host_with(Some(Duration::from_secs(3600)));
     p.panic_and_back_off();
     p.host.shared.passes_panic.store(true, Ordering::SeqCst);
@@ -382,20 +335,13 @@ fn a_policy_narrowed_while_the_host_is_down_reaches_the_workers_it_carries() {
     p.host.shutdown_and_join();
 }
 
-/// A PASS IN FLIGHT WHEN A COMMIT'S STOP COMES ENDS NO WATCH THAT STOP ARMED
-/// (round seventeen, the review of its first cut): a pass reads the roster
-/// — naming the agent in its tab — and before it ends the watches of the
-/// agents it names, a park's Commit stops the session's worker, which ends
-/// leaving its agent's exit to the host and arms the exit watch. The pass
-/// read nothing since: that watch is not its to end. The agent crashes
-/// during the hold, a Claude Code started then sweeps its record, and the
-/// Commit fails: the crash, read as it was seen, is relaunched.
-///
-/// FAILS ON 70537fad5: the pass ended every watch of a session its roster
-/// named, the one armed after its read too; no pass of a suspended host ends
-/// or arms another, so the crash was read only once handed after the failed
-/// Commit, after the sweep — `removed`, never relaunched (the watch is
-/// asserted still armed right after the pass).
+/// A pass in flight when a Commit's stop comes ends no watch that stop armed:
+/// a pass reads the roster — naming the agent in its tab — and before it ends
+/// the watches of the agents it names, a park's Commit stops the session's
+/// worker, which ends leaving its agent's exit to the host and arms the exit
+/// watch. The pass read nothing since: that watch is not its to end. The agent
+/// crashes during the hold, a Claude Code started then sweeps its record, and
+/// the Commit fails: the crash, read as it was seen, is relaunched.
 #[test]
 fn a_pass_in_flight_at_a_commits_stop_ends_no_watch_that_stop_armed() {
     let a = Arc::new(Acting::default());
@@ -416,8 +362,8 @@ fn a_pass_in_flight_at_a_commits_stop_ends_no_watch_that_stop_armed() {
         }
         named
     });
-    // Counts the host's passes past their look at the watches: its start
-    // of workers asks the claim epoch first.
+    // Counts the host's passes past their look at the watches: its start of workers asks the
+    // claim epoch first.
     let passed = Arc::new(AtomicUsize::new(0));
     let c = Arc::clone(&passed);
     h.claim_epoch = Arc::new(move || {
@@ -479,14 +425,11 @@ pub(super) fn watched_read(host: &HostHandle) -> Option<ExitRecord> {
     kept.exit_watch.as_ref().and_then(|w| w.read.clone())
 }
 
-/// The real host's session `s-a` projected onto `HarnessCommitOwed`'s
-/// state as [`project_commit_owed`] projects it, and — round seventeen —
-/// `down` (the host thread held in its restart's back-off), `swept` (a
-/// Claude Code started since removed the crashed agent's record),
-/// `landed` (an exit watch that hands its exit itself: a landing's,
-/// [`ExitWatched::hands`]) and, while the agent is gone, `seen` (what its
-/// exit left read as it was seen: the exit watch keeps a crash's read, or
-/// a relaunch was handed one).
+/// The real host's session `s-a` projected onto `HarnessCommitOwed`'s state as
+/// [`project_commit_owed`] projects it, plus `down` (the host held in its restart's back-off),
+/// `swept` (the crashed agent's record removed), `landed` (an exit watch that hands its exit
+/// itself, [`ExitWatched::hands`]) and, while the agent is gone, `seen` (its exit read as it was
+/// seen, by the watch or a handed relaunch).
 fn project_unhanded(
     state: &aterm_spec::interp::State,
     host: &HostHandle,
@@ -508,40 +451,21 @@ fn project_unhanded(
     seen
 }
 
-/// TIER-1 for `HarnessCommitOwed`'s round seventeen (aterm-spec): an exit
-/// nobody is handed as it comes, the real host driven and each observed
-/// state projected onto the model's ([`project_unhanded`]) —
+/// Tier-1 for `HarnessCommitOwed` (aterm-spec): an exit nobody is handed as it comes, the real
+/// host driven and each observed state projected onto the model's ([`project_unhanded`]):
 ///
-/// 1. THE HOST DOWN AFTER A PANIC (`Panic`): its worker lives on; the agent
-///    crashes and what it left is read as the exit is seen (`Crash`), a
-///    Claude Code started meanwhile sweeps the record (`Sweep`), and no
-///    exit is handed until the host's first pass back (`Up`) hands it to
-///    the worker (`Hand`), which reads the crash (`Read`) and relaunches it
-///    (`Relaunch`);
-/// 2. A COMMIT'S HOLD: the worker the Commit stopped ends leaving the exit
-///    to the host (`Suspend`, `EndUnhanded`), the agent crashes during the
-///    hold and its record is read then (`Crash`) and swept (`Sweep`); the
-///    Commit fails (`Resume`, `Rollback`) and the host hands the exit to a
-///    worker that reads it alone (`HandUnwatched`, `Read`), which
-///    relaunches it (`Relaunch`);
-/// 3. A LANDING WHILE THE HOST IS DOWN (the review of round seventeen's
-///    first cut): the worker reads its agent's crash and tries its relaunch
-///    on its back-off (`Crash`, `Hand`, `Read`), the host thread panics
-///    (`Panic`), the next try lands — the worker ends, the agent it started
-///    watched (`Relaunch`) — and that agent crashes too (`Crash`) and its
-///    record is swept (`Sweep`); the host's first pass back (`Up`) hands the
-///    exit the watch read to a worker that reads it alone
-///    (`HandUnwatched`, `Read`), which relaunches it (`Relaunch`).
+/// 1. the host down after a panic (`Panic`): its worker lives on, the crash is read as it is
+///    seen (`Crash`) before a sweep (`Sweep`), and the first pass back (`Up`) hands it to the
+///    worker (`Hand`, `Read`, `Relaunch`);
+/// 2. a Commit's hold: the stopped worker leaves the exit to the host (`Suspend`,
+///    `EndUnhanded`), the crash is read during the hold, and after the failed Commit (`Resume`,
+///    `Rollback`) a worker reads it alone (`HandUnwatched`, `Read`, `Relaunch`);
+/// 3. a landing while the host is down: the landed agent is watched (`Relaunch`), crashes
+///    (`Crash`, `Sweep`), and the first pass back hands the watch's read (`Up`,
+///    `HandUnwatched`).
 ///
-/// FAILS WITHOUT THE FIX: in the first the panic stopped the worker, which
-/// ended marking nothing — the host lists no worker while it is down, and
-/// nothing reads the exit (the wait for its read runs out); in the second
-/// nothing reads the exit during the hold, and the worker handed it after
-/// reads the swept record as a graceful exit, relaunching nothing; in the
-/// third nothing watched the landed agent, and its crash was read by nobody.
-///
-/// NEGATIVE CONTROL: those three reads are the dead mutants `PanicStops`,
-/// `CrashUnseen` and `LandedLost`, each breaking `NoOwedRelaunchLost`.
+/// Negative control: the mutants `PanicStops`, `CrashUnseen` and `LandedLost` each break
+/// `NoOwedRelaunchLost`.
 #[test]
 fn an_exit_nobody_is_handed_conforms_to_the_commit_owed_model() {
     let model = aterm_models_harness::harness_commit_owed_model();
@@ -554,7 +478,7 @@ fn an_exit_nobody_is_handed_conforms_to_the_commit_owed_model() {
         }
     };
 
-    // ONE: the host down after a panic.
+    // 1: the host down after a panic.
     let p = panicking_host();
     let mut state = model.init_state();
     assert_eq!(
@@ -609,7 +533,7 @@ fn an_exit_nobody_is_handed_conforms_to_the_commit_owed_model() {
     holds(&state);
     p.host.shutdown_and_join();
 
-    // TWO: a Commit's hold.
+    // 2: a Commit's hold.
     let a = Arc::new(Acting::default());
     a.open.lock().unwrap().insert("s-a".to_string());
     a.set(&[("s-a", Program::Claude)]);
@@ -664,7 +588,7 @@ fn an_exit_nobody_is_handed_conforms_to_the_commit_owed_model() {
     holds(&state);
     host.shutdown_and_join();
 
-    // THREE: a landing while the host is down.
+    // 3: a landing while the host is down.
     let p = panicking_host();
     let mut state = model.init_state();
     *p.a.relaunches.lock().unwrap() = vec!["wait:shell-prompt"; 100_000].into();
@@ -736,8 +660,7 @@ fn an_exit_nobody_is_handed_conforms_to_the_commit_owed_model() {
     holds(&state);
     p.host.shutdown_and_join();
 
-    // NEGATIVE CONTROL: the panic that stopped the workers, and the exit
-    // read only once handed after the hold.
+    // Negative control: each mutant breaks `NoOwedRelaunchLost`.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let replay = |actions: &[&str]| {
         let mut old = buggy.init_state();
@@ -783,26 +706,12 @@ fn an_exit_nobody_is_handed_conforms_to_the_commit_owed_model() {
 }
 
 // ---------------------------------------------------------------------------
-// Round eighteen: the landings and the exits a cold restore's queue, a
-// Commit or a host panic still left to nobody.
+// Landings and exits a cold restore's queue, a Commit or a host panic leaves to nobody.
 // ---------------------------------------------------------------------------
 
-/// A RESTORED AGENT THAT CRASHES BEFORE A PASS NAMES IT IS RELAUNCHED
-/// (round eighteen; the residual round seventeen stated: the cold
-/// restore's queue lands agents on its own thread with no watch). The host
-/// thread panics and is held in its back-off — no pass runs — while the cold
-/// restore's queue, on a thread of its own, relaunches the agent of tab
-/// `s-r`: the step lands (`adopted`), and the agent it started is named and
-/// then crashes, still before the host is back. Watched from its landing,
-/// its exit is read as it was seen and the host's first pass back hands it:
-/// relaunched once, by the relaunch on exit, on what its crash left — the
-/// queue's own step never tried again.
-///
-/// FAILS ON 745d63b36: the queue ended its attempt at the landing and
-/// nothing watched the agent it started — no pass read it back, so no
-/// worker was handed its exit, and nothing marked it the host's: its crash
-/// was read by nobody and never relaunched (the wait for its relaunch runs
-/// out).
+/// A cold restore's landing that crashes before a pass names it (the host down after a panic) is
+/// watched from its landing: its exit is read as it was seen and relaunched once by the
+/// relaunch on exit; the queue's step never runs again.
 #[test]
 fn a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched() {
     let steps = Arc::new(AtomicUsize::new(0));
@@ -821,8 +730,7 @@ fn a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched() {
     until("the restored agent landed, its attempt over", || {
         steps.load(Ordering::SeqCst) == 1 && p.host.pending_restored().is_empty()
     });
-    // The roster names it — nobody reads it, the host is down — and it
-    // crashes, still before the host is back.
+    // The roster names it (nobody reads it, the host is down) and it crashes.
     p.a.set(&[("s-a", Program::Claude), ("s-r", Program::Claude)]);
     p.a.set(&[("s-a", Program::Claude)]);
     p.down.open();
@@ -836,9 +744,8 @@ fn a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched() {
                 .any(|sid| sid == "s-r")
         },
     );
-    // Once: the worker handed that exit ended, the agent its relaunch
-    // landed watched, and two whole passes since with no worker for the tab
-    // — no second worker, and no second relaunch, can follow.
+    // Once: its worker ended, the agent it landed watched, and two passes later no second
+    // worker or relaunch has started.
     let gone = |host: &HostHandle| !host.live().iter().any(|sid| sid == "s-r");
     let landed_watched = || {
         let kept = p.host.shared.kept.lock().unwrap().get("s-r").cloned();
@@ -903,23 +810,9 @@ fn carried_across(parent: &HostHandle, sid: &str) -> Vec<RestoredAgent> {
         .collect()
 }
 
-/// AN ASKED EXIT CARRIED THROUGH A HAND ACROSS A COMMIT IS NEVER A COUNTED
-/// RETRY (round eighteen; ruling 20's (iv), not fixed until now). A person's
-/// own `restart` ends the agent of tab `s-a`, and its exit is read under a
-/// fleet hold: carried through it (ruling 20) — owed, nothing attempted. A
-/// seamless update parks, its layout carries the relaunch, and its Commit
-/// goes ahead while the hold still stands; the successor queues it at its
-/// Commit. Its queue's looks at the tab while the hold stands attempt
-/// nothing and count nothing, as the live worker's do — however many: never
-/// the row the counted budget ends in (`RESTORED_TRIES`, about 91 s) — and
-/// once the hold lifts it is relaunched as the act's.
-///
-/// FAILS ON 745d63b36: the layout carried the snapshot alone, and the
-/// successor's queue stepped it as aterm's own end, its relaunch line's look
-/// answering `wait:held` — a COUNTED retry: the first look under the hold is
-/// a try (the attempt and its count below), and past eight of them the tab
-/// was said not to have come back, the agent the person asked to restart
-/// left at its shell.
+/// The explicit restart's end, read under a fleet hold and carried across a seamless update's
+/// Commit, is relaunched as the act's once the hold lifts. The successor's queue looks at the
+/// held tab without attempting or counting a try (`RESTORED_TRIES`), however many looks.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_asked_exit_carried_through_a_hold_across_a_commit_is_relaunched_once_it_lifts() {
@@ -1029,20 +922,9 @@ fn an_asked_exit_carried_through_a_hold_across_a_commit_is_relaunched_once_it_li
     successor.shutdown_and_join();
 }
 
-/// A PANIC IN THE HOST'S RESTART LOSES NONE OF ITS WORKERS (round
-/// eighteen; the residual round seventeen stated: a panic past the
-/// restart's own `catch_unwind` still dropped the workers, `Workers`' drop
-/// the backstop). The host thread panics in a pass, and its restart panics
-/// too, before the host is back: in its back-off, the one hook the stretch
-/// between a run's catch and the next run calls on the host thread
-/// (`host_restarted` calls none a test can fail). The worker it carries
-/// lives on, its tab still supervised: the agent's crash after it is
-/// relaunched.
-///
-/// FAILS ON 745d63b36: the restart's panic unwound the host thread, and
-/// the workers it held dropped with it — each stopped for good, handing
-/// nothing — and nothing started the host again: the crash was read by
-/// nobody (the wait for its relaunch runs out).
+/// The host's restart panicking in its back-off (the one hook on the host thread between a run's
+/// catch and the next run) loses none of its workers: the one it carries relaunches the crash
+/// after it.
 #[test]
 fn a_panic_in_the_hosts_restart_loses_none_of_its_workers() {
     let (fail, failed) = (
@@ -1084,21 +966,10 @@ fn a_panic_in_the_hosts_restart_loses_none_of_its_workers() {
     p.host.shutdown_and_join();
 }
 
-/// A PANIC INSIDE THE HOST'S RESTART LOSES NONE OF ITS WORKERS (the review
-/// of round eighteen's first cut: the panic above comes from the back-off,
-/// after `host_restarted` has returned, so it pins the catch around the
-/// restart alone). Here the restart itself panics — after it has reset what
-/// the restarted run starts afresh and held the workers to the policy
-/// (`Shared::restart_panics`, the test's seam) — and is caught, made again a
-/// pause later, and the host is back. The worker it carried lives on, the
-/// only loop that ever ran for the tab: the agent's crash after it is read
-/// by that worker and relaunched.
-///
-/// A RESTART THAT MOVED THE WORKERS into a value of its own (round
-/// seventeen's `host_restarted`, which returned the restarted state) dropped
-/// them with that value at such a panic — each stopped for good, handing
-/// nothing — and the next pass started a fresh worker for the tab: a
-/// second run of its loop.
+/// A panic inside `host_restarted` itself (`Shared::restart_panics`, after it reset the run and
+/// held the workers to the policy) is caught and the restart made again: the worker it carried
+/// stays the tab's only loop and relaunches the crash after it. The test above panics in the
+/// back-off, after the restart returned.
 #[test]
 fn a_panic_inside_the_hosts_restart_loses_none_of_its_workers() {
     let p = panicking_host();
@@ -1131,17 +1002,12 @@ fn a_panic_inside_the_hosts_restart_loses_none_of_its_workers() {
     p.host.shutdown_and_join();
 }
 
-/// AN ASKED EXIT CARRIED ACROSS A COMMIT IS NOT REFUSED BY `relaunch =
-/// false` (round eighteen, the review of its first cut): the live worker
-/// relaunches the explicit restart's end whatever `[harness] relaunch`
-/// says (`on_agent_left`'s `allowed`: a person's restart is not refused by
-/// it), and so does the successor's restored queue that carries it: the
-/// tab's agent relaunched as the act's. NEGATIVE CONTROL: a crash's
-/// relaunch carried there is the switch's, and dropped, as always.
-///
-/// FAILS ON 95d62f656: the queue refused every agent under `relaunch =
-/// false` — the asked one dropped with no row, never relaunched (the wait
-/// for its relaunch runs out).
+/// An asked exit carried across a Commit is not refused by `relaunch = false`:
+/// the live worker relaunches the explicit restart's end whatever `[harness]
+/// relaunch` says (`on_agent_left`'s `allowed`: a person's restart is not
+/// refused by it), and so does the successor's restored queue that carries it:
+/// the tab's agent is relaunched as the act's. Negative control: a crash's
+/// relaunch carried there is the switch's, and dropped.
 #[test]
 fn an_asked_exit_carried_across_a_commit_is_relaunched_under_relaunch_false() {
     let mut cfg = on();
@@ -1149,7 +1015,7 @@ fn an_asked_exit_carried_across_a_commit_is_relaunched_under_relaunch_false() {
     let a = Arc::new(Acting::default());
     a.open.lock().unwrap().insert("s-r".to_string());
     let host = HostHandle::start(cfg, false, false, a.hooks());
-    // NEGATIVE CONTROL: a crash's, dropped at once — nothing queued.
+    // Control: a crash's carried relaunch is the switch's, dropped at once.
     host.relaunch_restored(vec![restored("s-c", "in tab 3")]);
     assert!(
         host.pending_restored().is_empty(),
@@ -1176,46 +1042,21 @@ fn an_asked_exit_carried_across_a_commit_is_relaunched_under_relaunch_false() {
     host.shutdown_and_join();
 }
 
-/// TIER-1 for `HarnessCommitOwed`'s round eighteen (aterm-spec): the
-/// landings and the exits a cold restore's queue, a host panic's restart
-/// or a read that fails left to nobody, the real host driven and each
-/// observed state projected onto the model's ([`project_unhanded`]) —
+/// Tier-1 for `HarnessCommitOwed` (aterm-spec): the landings and exits a cold restore's queue, a
+/// panic in the host's restart or a failed read would leave to nobody, the real host driven and
+/// each observed state projected onto the model's ([`project_unhanded`]):
 ///
-/// 1. THE ROLLBACK QUEUE'S LANDING: the agent crashes and its worker owes
-///    its relaunch on its back-off (`Crash`, `Hand`, `Read`); a park's
-///    Commit stops the worker, which decides stranded (`Suspend`,
-///    `Decide`); the Commit fails and the rollback queues the relaunch
-///    (`Resume`, `Rollback`), which the queue's step lands — its agent
-///    watched (`QueueSteps`) — and that agent crashes before a pass names
-///    it (`Crash`): the host hands the exit the watch read to a worker that
-///    reads it alone, and it is relaunched (`HandUnwatched`, `Read`,
-///    `Relaunch`);
-/// 2. A PANIC IN THE HOST'S RESTART: the host thread panics (`Panic`), the
-///    agent crashes while it is down (`Crash`), and its restart panics too
-///    as it ends its back-off — nothing changes in the model, its worker
-///    lives on — then the host is back (`Up`) and hands the exit to that
-///    worker, which relaunches it (`Hand`, `Read`, `Relaunch`);
-/// 3. A LANDING NO READ REACHES while the host is down: the worker's try
-///    lands an agent it cannot read (`RelaunchUnread`), which crashes
-///    (`Crash`) — its own relaunch's again — and the worker's next try
-///    lands an agent it reads, watched (`Relaunch`);
-/// 4. THE ROLLBACK QUEUE'S LANDING NO READ REACHES (the review of round
-///    eighteen's first cut): the queue's step lands an agent that holds its
-///    tab unread, its attempt kept (`QueueStepsUnread`); it crashes unread
-///    — the attempt owed again (`Crash`) — and the next step lands another
-///    no read reaches yet (`QueueStepsUnread`), which a later look reads:
-///    the attempt over, the agent watched (`QueueReadsLanded`).
+/// 1. the rollback queue's landing crashes before a pass names it (`QueueSteps`, `Crash`,
+///    `HandUnwatched`);
+/// 2. the host's restart panics as its back-off ends; its worker lives on and relaunches the
+///    crash (`Panic`, `Crash`, `Up`, `Hand`);
+/// 3. a worker's try lands an agent no read reaches, which crashes and is tried again
+///    (`RelaunchUnread`, `Crash`, `Relaunch`);
+/// 4. the queue's step lands an agent no read reaches, which crashes and is stepped again until
+///    a look reads it (`QueueStepsUnread`, `Crash`, `QueueReadsLanded`).
 ///
-/// FAILS WITHOUT THE FIX: in the first nothing watched the queue's landing
-/// and its crash was read by nobody; in the second the restart's panic
-/// dropped the worker, and the crash was read by nobody; in the third the
-/// unread landing ended the worker, and its crash was read by nobody; in
-/// the fourth the queue's unread landing ended its attempt, and its crash
-/// was held by nobody (each a wait that runs out).
-///
-/// NEGATIVE CONTROL: those four reads are the dead mutants
-/// `QueueLandedLost`, `RestartPanicStops`, `UnreadLandedLost` and
-/// `QueueUnreadLost`, each breaking `NoOwedRelaunchLost`.
+/// Negative control: the mutants `QueueLandedLost`, `RestartPanicStops`, `UnreadLandedLost` and
+/// `QueueUnreadLost` each break `NoOwedRelaunchLost`.
 #[test]
 fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     let model = aterm_models_harness::harness_commit_owed_model();
@@ -1239,7 +1080,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
         .unwrap_or(false)
     };
 
-    // ONE: the rollback queue's landing.
+    // 1: the rollback queue's landing.
     let a = Arc::new(Acting::default());
     a.open.lock().unwrap().insert("s-a".to_string());
     a.set(&[("s-a", Program::Claude)]);
@@ -1316,7 +1157,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     holds(&state);
     host.shutdown_and_join();
 
-    // TWO: a panic in the host's restart.
+    // 2: a panic in the host's restart.
     let fail = Arc::new(AtomicBool::new(false));
     let f = Arc::clone(&fail);
     let p = panicking_host_hooked(None, move |_, h| {
@@ -1362,7 +1203,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     holds(&state);
     p.host.shutdown_and_join();
 
-    // THREE: a landing no read reaches, the host down.
+    // 3: a landing no read reaches, the host down.
     let p = panicking_host();
     let mut state = model.init_state();
     *p.a.relaunches.lock().unwrap() = vec!["wait:shell-prompt"; 100_000].into();
@@ -1406,7 +1247,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     p.down.open();
     p.host.shutdown_and_join();
 
-    // FOUR: the rollback queue's landing no read reaches.
+    // 4: the rollback queue's landing no read reaches.
     let a = Arc::new(Acting::default());
     a.open.lock().unwrap().insert("s-a".to_string());
     a.set(&[("s-a", Program::Claude)]);
@@ -1452,8 +1293,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
         state,
         "landed unread, its attempt the exit's holder"
     );
-    // It crashes unread: owed again, stepped again — and the agent that
-    // step lands holds its tab unread too.
+    // It crashes unread: owed again, and the next step lands unread too.
     *a.holds.lock().unwrap() = None;
     a.set(&[]);
     until("stepped again, landed unread again", || {
@@ -1484,7 +1324,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     holds(&state);
     host.shutdown_and_join();
 
-    // NEGATIVE CONTROL: the reads before round eighteen.
+    // Negative control: each mutant breaks `NoOwedRelaunchLost`.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let replay = |actions: &[&str]| {
         let mut old = buggy.init_state();

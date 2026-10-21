@@ -12,4 +12,4 @@ pass 3600000
 input human
 see busy
 expect open t1 turn
-expect open t2 turn by=human at=3601000
+expect open t2 turn by=human @3601000

@@ -1328,10 +1328,13 @@ fn presented(
         ),
     };
     assert!(ok, "the virtual present refused (see the arm's note)");
-    let shot = gpu
+    let raw = gpu
         .virtual_presented_snapshot_current(win, win.resident_input_epoch(), 1)
-        .and_then(crate::video_tap::RawCapture::convert)
         .expect("the presented destination reads back");
+    // What a capture's admission reserves for it, on either arm: the GL arm's
+    // tightly packed rows, wgpu's padded ones.
+    assert_eq!(win.virtual_snapshot_bytes(), Some(raw.allocation()));
+    let shot = raw.convert().expect("the presented destination converts");
     Frame {
         width: shot.w as usize,
         height: shot.h as usize,

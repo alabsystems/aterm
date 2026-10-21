@@ -16,4 +16,4 @@ see idle
 half
 half
 expect open t1 turn
-expect close t1 turn out=done steps=1 qs=1 at=1500
+expect close t1 turn out=done steps=1 qs=1 @1500

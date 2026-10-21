@@ -223,11 +223,11 @@ fn test_adjust_for_scroll_in_progress_selection() {
 
 #[test]
 fn test_adjust_for_scroll_deep_scrollback_survives_then_evicts() {
-    // Regression (#4056 / SCR-1): a selection made deep in scrollback uses
+    // A selection made deep in scrollback uses
     // live-screen coords where scrollback is negative. With the lower clear
     // bound derived from the visible height (-(max_rows-1) = -23), a single
     // line of background output would scroll the selection past -23 and wipe
-    // it even though SCR-1 view pinning keeps the exact same text on screen.
+    // it even though view pinning keeps the exact same text on screen.
     // The clear bound must instead be the retained-history floor (-floor).
     //
     // Scenario: 24-row screen, 500 lines of scrollback, selection anchored
@@ -252,8 +252,7 @@ fn test_adjust_for_scroll_deep_scrollback_survives_then_evicts() {
 
     // Scrolling the START endpoint below the retained-history floor (its row would
     // drop to -41 - 460 = -501 < -500) evicts that endpoint's content — but NOT the
-    // end's, which is still retained at -499. Destroying the whole selection there
-    // threw away a span the user can still see; it now clamps the head onto the
+    // end's, which is still retained at -499: the head clamps onto the
     // oldest retained row and reports the loss.
     let visible = sel.adjust_for_scroll(460, max_rows, floor);
     assert!(
@@ -570,7 +569,7 @@ fn project_range_projects_every_shape() {
             SelectionType::Simple,
             Some((0, 5, 2, 3, false)),
         ),
-        // #7623: Left at column 0 ends before the row, on the previous one.
+        // Left at column 0 ends before the row, on the previous one.
         (
             "left end at col 0",
             (0, 5, Left),
@@ -839,11 +838,9 @@ fn test_contains_cell_block_continuation_at_col_zero() {
     assert!(sel.contains_cell(1, 0, false, true));
 }
 
-// ── column 0 boundary tests (issue #7623) ──
+// ── column 0 boundary tests ──
 
-/// Regression: selection ending at col 0 with Left side incorrectly included
-/// column 0 because the `ne.col > 0` guard skipped the side adjustment,
-/// leaving end_col = 0 instead of retreating to the previous row.
+/// Selection ending at col 0 with Left side retreats to the previous row.
 #[test]
 fn test_contains_end_left_side_col_zero_multiline() {
     // Selection from (0, 5, Left) to (2, 0, Left).

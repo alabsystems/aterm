@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The front door's windowing grammar and routing policy: `aterm new-tab`,
-//! `aterm new-window`, `aterm split-pane`, and the rule that decides whether a
-//! request starts a process or is handed to a running aterm (via the control
-//! socket's `spawn` verb), in the style of Windows Terminal's `wt`.
+//! The front door's windowing grammar and routing policy: `aterm new-tab`, `aterm new-window`,
+//! `aterm split-pane`, and whether a request starts a process or is handed to a running aterm
+//! over the control socket's `spawn` verb, in the style of Windows Terminal's `wt`.
 //!
-//! This is a configurable policy, not a single-instance mutex: several
-//! instances co-existing is a supported configuration (an agent may run its own
-//! on its own `--control-sock`), so a second instance is never prevented, only
-//! not started when the operator asked for attach behaviour and an instance is
-//! reachable.
-//!
-//! The default is `new_window` (WT's `useNew`), which is the plain launch
-//! behaviour on every platform.
-//!
-//! Everything here is pure (a parse and a three-input decision), unit-testable
-//! without a socket, window or config file.
+//! A policy, not a single-instance mutex: several instances may co-exist (an agent may run its
+//! own on its own `--control-sock`). Everything here is pure, testable without a socket, window
+//! or config file.
 
 /// Where a windowing request should be served; the result of [`route_launch`].
 /// "Forward, else start one" is a fallback the caller applies after a forward
@@ -284,8 +275,7 @@ where
 }
 
 /// The ambient facts the plain-launch gate consults, gathered by the caller so
-/// [`plain_launch_is_policy_eligible`] stays pure. Named fields rather than
-/// bare booleans, one per hazard.
+/// [`plain_launch_is_policy_eligible`] stays pure.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct LaunchEnv {
     /// `$ATERM_UPDATED_FROM` is set — this process is an update successor,
@@ -510,8 +500,8 @@ mod tests {
         };
         assert_eq!(simple.control_request().unwrap(), "spawn cwd=C:\\Windows\n");
 
-        // The whole reason the value CAN be quoted: this is an ordinary Windows
-        // path, and whitespace-splitting would tear it into three tokens.
+        // An ordinary Windows path with spaces: unquoted, whitespace-splitting would tear it
+        // into three tokens.
         let spaced = WindowRequest {
             intent: LaunchIntent::NewTab,
             dir: Some(r"C:\Program Files\Git".to_string()),

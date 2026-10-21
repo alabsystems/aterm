@@ -15,17 +15,13 @@ aterm-core = { path = "../aterm-core", default-features = false }
 aterm-render = { path = "../aterm-render", default-features = false }
 # The cursor-wake + sparkle-words engines the native app runs; wasm32-clean.
 aterm-effects = { path = "../aterm-effects" }
-# The mosh-style predictive-echo state machine the native app runs; clock-injected
-# (predict_api samples aterm-time for it).
+# The mosh-style predictive-echo state machine the native app runs.
 aterm-predict = { workspace = true }
-# The unified message engine (the message band: `notice`, `messages`, the
-# rows the frame reserves above the grid — src/messages_api.rs). Its only
-# dependency is aterm-time: clockless, thread-free, wasm-clean. The renderer's
-# `band` module composes its rows (the same composition the native window runs).
+# The message engine behind the band above the grid (src/messages_api.rs);
+# clockless and thread-free.
 aterm-messages = { workspace = true }
-# Real monotonic clock for the predict_api host seam: std Instant on native,
-# performance.now() on wasm32 — the predictor's echo reconciliation runs on
-# REAL time (the glitch-expiry self-heal), unlike the deterministic effects clock.
+# Real clock: std Instant on native, performance.now() on wasm32. The predictor
+# reconciles echo on real time, unlike the deterministic effects clock.
 aterm-time = { workspace = true }
 # aterm_types::Appearance for the set_color_scheme binding (aterm-core does not
 # re-export it), plus the theme catalog, selector and parser theme_api.rs
@@ -34,30 +30,21 @@ aterm-time = { workspace = true }
 aterm-types = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# The host boundary, with no dependency of its own: `#[export]` marks what JS
-# sees and `verify glue` writes the glue (no wasm-bindgen: wasm-platform
-# WP.7), and the panic hook reports `console.error` with the JS stack, in
-# console_error_panic_hook's format, through the `aterm_host` imports
-# src/host.rs names (docs/AUDIT-third-party-2026-10-15.md, WP.3).
+# The host boundary, with no third-party dependency: `#[export]` marks what JS
+# sees, `verify glue` writes the JS glue, and the panic hook reports to
+# `console.error` through the `aterm_host` imports src/host.rs names.
 aterm-wasm-abi = { workspace = true, features = ["export"] }
-# No getrandom row: nothing needs it. Measured with `cargo tree -p aterm-wasm
-# --target wasm32-unknown-unknown -i getrandom`: aterm's own manifests were its
-# only parents, so a defensive row alone pulled getrandom + js-sys (2 packages /
-# 9,774 lines) into the shipped module. A transitive dep
-# that selects it on wasm32 fails loudly with getrandom's "unsupported target".
-# deny.toml bans it outside ring (`forge check` [OB-18]).
+# No getrandom row: nothing needs entropy, and deny.toml admits getrandom only
+# under ring (`forge check` [OB-18]).
 
-# NOTE: no per-crate [profile.release] — profiles only take effect from the
-# workspace root, which already sets lto/codegen-units=1/strip for release. A wasm
-# size build (opt-level="z") is driven by the build tool's --profile, not here.
+# No per-crate [profile.release]: profiles take effect only from the workspace
+# root, which sets this crate's opt-level = "z".
 
 [dev-dependencies]
-# TEST-ONLY: the control socket's percent-encoder, which `messages_api`'s
-# `pct_encode` copies byte for byte (`aterm-control` takes the engine's disk
-# tier, whose mmap store cannot target wasm32, so the shipped module keeps the
-# copy) — `pct_encode_is_the_control_wires` holds the two together.
-# Dev-dependencies never enter the shipped wasm32 graph (resolver 2), and the
-# wasm census's derived closure excludes them.
+# Test-only: `pct_encode_is_the_control_wires` holds `messages_api::pct_encode`
+# equal to the control socket's encoder, which the shipped module cannot link
+# (aterm-control takes the engine's disk tier, whose mmap store cannot target
+# wasm32). Dev-dependencies never enter the wasm32 graph.
 aterm-control = { workspace = true }
 # TEST-ONLY: `aterm_spec::host::could_not_run`, so a test the host cannot run
 # (no system font, no GPU) ends COULD NOT RUN, never a silent pass.

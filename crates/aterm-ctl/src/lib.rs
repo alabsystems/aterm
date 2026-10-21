@@ -141,6 +141,7 @@ pub use askpass::main_entry as askpass_main_entry;
 pub mod census;
 mod conn;
 pub use conn::conn_main_entry;
+pub use conn::resource_run_main_entry;
 /// `aterm ctl await inbox|agent`: the inbox and agent waits, re-armed past
 /// the server's bound.
 mod await_legs;
@@ -4800,6 +4801,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     // then a leading `@self` / `@env` expands to `@$ATERM_PARENT_SESSION_ID`.
     refuse_empty_selectors(&request_parts)?;
     expand_self_selector(&mut request_parts, env::var(SELF_SID_ENV).ok())?;
+    add_sys_caller(&mut request_parts, env::var(SELF_SID_ENV).ok().as_deref());
 
     // The boundary notice: a bash/zsh pane never sources the integration (see
     // [`MUX_ENV`]), so `aterm ctl` says it once per multiplexer, sharing the
@@ -4829,6 +4831,12 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             return Err(discovery_usage_error(verb));
         }
         return run_discovery(verb, sock.as_deref(), pid, nesting.as_ref());
+    }
+    // `sys … instances=all` folds every instance here (or the one
+    // `--sock`/`--pid` names): each instance's reply in turn
+    // ([`run_sys_instances_all`]).
+    if is_sys_instances_all(&request_parts) {
+        return run_sys_instances_all(&request_parts, sock.as_deref(), pid);
     }
     // `survey` asks every instance here (or the one `--sock`/`--pid` names)
     // for its sessions' records — and with `--fleet`/`--host` the fleet's
@@ -5583,6 +5591,170 @@ fn split_pattern_note(parts: &[String]) -> Option<String> {
         "note: '{arg}' contains whitespace and is split on the wire; \
          write the pattern as ONE token (e.g. esc.to.interrupt)"
     ))
+}
+
+/// `sys` names the session it runs in (`caller=<sid>`, from
+/// [`SELF_SID_ENV`]), which decides whether the reply may print paths: only
+/// for the caller's own tab (design §13.3). Advisory hygiene against an
+/// accidental copy of another tab's folders, not a boundary; an explicit
+/// `caller=` is left alone, and a sid the server's grammar would refuse is not
+/// added.
+fn add_sys_caller(parts: &mut Vec<String>, self_sid: Option<&str>) {
+    if forwarded_verb(parts).as_deref() != Some("sys")
+        || parts.iter().any(|p| p.starts_with("caller="))
+    {
+        return;
+    }
+    let Some(sid) = self_sid.filter(|s| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }) else {
+        return;
+    };
+    parts.push(format!("caller={sid}"));
+}
+
+/// Whether `parts` is `sys … instances=all`.
+fn is_sys_instances_all(parts: &[String]) -> bool {
+    forwarded_verb(parts).as_deref() == Some("sys") && parts.iter().any(|p| p == "instances=all")
+}
+
+/// `sys … instances=all`: the same request, without the fold word or a
+/// selector, to every live instance here (or the one `--sock`/`--pid` names),
+/// each reply in turn under an `instance pid=<pid>` line; under `--json`, one
+/// object `{"schema":1,"kind":"sys.instances","instances":[{"pid":…,"reply":…}]}`.
+/// The machine-wide figures are the same in every reply (one machine); the
+/// aterm and tab figures are each instance's own. An instance that does not
+/// answer reads `unavailable(<cause>)`.
+fn run_sys_instances_all(
+    parts: &[String],
+    sock: Option<&str>,
+    pid: Option<u32>,
+) -> io::Result<ExitCode> {
+    let request: Vec<&str> = parts
+        .iter()
+        .map(String::as_str)
+        .filter(|p| *p != "instances=all" && !p.starts_with('@'))
+        .collect();
+    let line = request.join(" ");
+    let json = request.iter().any(|t| *t == "--json" || *t == "json");
+    let targets = if sock.is_some() || pid.is_some() {
+        match discovery_targets(sock, pid) {
+            Ok(t) => t,
+            Err((report, code)) => {
+                stderr_line(&report)?;
+                return Ok(ExitCode::from(code));
+            }
+        }
+    } else {
+        live_instances()
+    };
+    if targets.is_empty() {
+        stderr_line("no aterm instance is running here")?;
+        return Ok(ExitCode::FAILURE);
+    }
+    let probes: Vec<(u32, String, Probe)> = targets
+        .iter()
+        .map(|(pid, sock)| (*pid, sock.clone(), probe_lines(sock, &line, *pid)))
+        .collect();
+    let fold = fold_sys_instances(&probes, json);
+    for note in &fold.notes {
+        stderr_line(note)?;
+    }
+    let stdout = stdout_handle();
+    let mut out = StdoutSink::new(stdout.lock());
+    for l in &fold.lines {
+        writeln!(out, "{l}")?;
+    }
+    out.flush()?;
+    drop(out);
+    stderr_line(&format!(
+        "OK sys instances={} answered={}",
+        targets.len(),
+        fold.answered
+    ))?;
+    Ok(if fold.answered > 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// What [`run_sys_instances_all`] prints: stdout `lines`, stderr `notes` (each
+/// miss's cause), and how many instances `answered`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SysFold {
+    lines: Vec<String>,
+    notes: Vec<String>,
+    answered: usize,
+}
+
+/// Each instance's probe folded in turn: text puts `instance pid=<pid>` (or
+/// `instance sock=<path>` for a socket that names no pid, a private
+/// `--control-sock`) above that instance's body and reads a miss as its words;
+/// JSON wraps each reply object as `{"pid":…,"sock":…,"reply":…}` in one
+/// `sys.instances` object and leaves a miss to stderr. A socket whose pid is
+/// gone is skipped silently (a stale file, not an instance).
+fn fold_sys_instances(probes: &[(u32, String, Probe)], json: bool) -> SysFold {
+    let mut fold = SysFold::default();
+    let mut objects = Vec::new();
+    for (pid, sock, probe) in probes {
+        let label = if *pid > 0 {
+            format!("instance pid={pid}")
+        } else {
+            format!("instance sock={sock}")
+        };
+        match probe {
+            Probe::Answered(lines) => {
+                fold.answered += 1;
+                if json {
+                    let body = lines.first().map_or("{}", String::as_str);
+                    objects.push(format!(
+                        "{{\"pid\":{pid},\"sock\":\"{}\",\"reply\":{body}}}",
+                        aterm_codec::json::escape(sock)
+                    ));
+                } else {
+                    fold.lines.push(label);
+                    fold.lines.extend(lines.iter().cloned());
+                }
+            }
+            Probe::Refused {
+                pid_running: Some(false),
+            } => {}
+            other => {
+                fold.notes
+                    .push(format!("{label}: {}", probe_cause(*pid, other)));
+                if !json {
+                    fold.lines
+                        .push(format!("{label} {}", sys_instance_miss(other)));
+                }
+            }
+        }
+    }
+    if json {
+        fold.lines.push(format!(
+            "{{\"schema\":1,\"kind\":\"sys.instances\",\"instances\":[{}]}}",
+            objects.join(",")
+        ));
+    }
+    fold
+}
+
+/// One instance's miss in a `sys … instances=all` fold, as a word: the
+/// server's own `ERR` line when it refused, else `unavailable(<why>)`.
+fn sys_instance_miss(probe: &Probe) -> String {
+    let why = match probe {
+        Probe::Replied(line) => return line.clone(),
+        Probe::Answered(_) => "answered",
+        Probe::Busy(_) => "busy",
+        Probe::Timeout => "timeout",
+        Probe::Denied(_) => "denied",
+        Probe::NoToken(..) | Probe::AuthRejected | Probe::Foreign { .. } => "auth",
+        Probe::Refused { .. } | Probe::Other(_) => "unreachable",
+    };
+    format!("unavailable({why})")
 }
 
 /// The verb that determines response framing, skipping an optional proxy
@@ -7044,6 +7216,10 @@ fn exchange_on(
             || verb == "result"
             || verb == "log"
             || verb == "brief"
+            // `sys`'s header carries `as_of= age_ms= window_ms= next=` (the
+            // next `since=`) and `state=`; stdout stays the body (one JSON
+            // object under `--json`).
+            || verb == "sys"
             // `history`'s header carries ` unheld_below=<id>` when an update could
             // not carry the ledger whole.
             || (verb == "history" && tail.split_whitespace().nth(1).is_some())

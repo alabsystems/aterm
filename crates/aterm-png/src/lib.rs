@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-png` — first-party PNG decode and encode, replacing the `png` crate.
+//! `aterm-png` — first-party PNG decode and encode.
 //!
 //! Covers what aterm uses: decode any base PNG to its samples or RGBA, and
 //! encode 8-bit framebuffers. Inflate is `aterm_codec::inflate`; this crate
@@ -24,21 +24,20 @@
 //!
 //! ## Malformed input: render it, do not refuse it
 //!
-//! A file that breaks a pixel-level rule renders as the retired `png` crate
-//! rendered it: one wrong pixel beats a blank emoji glyph. So an index past
+//! A file that breaks a pixel-level rule renders permissively:
+//! one wrong pixel beats a blank emoji glyph. So an index past
 //! `PLTE` renders opaque black, a `tRNS` longer than the palette is ignored, a
 //! `tRNS` colour key is masked to the sample width, a zero-length chunk is
 //! absent, and bytes after the end of the zlib stream inside `IDAT` are not
 //! part of it. Each is pinned by a test naming the case.
 //!
-//! Structure stays strict, as `png` was: a duplicate `PLTE`, a `tRNS` before
+//! Structure stays strict: a duplicate `PLTE`, a `tRNS` before
 //! `PLTE` and `IDAT` chunks interrupted by another chunk are refused.
 //!
 //! One deliberate divergence, a memory bound: image data that decompresses to
 //! more than the header's geometry plus one maximal DEFLATE stored block
 //! (65,535 bytes, the largest single block of padding) is refused with
-//! [`DecodingError::ExcessImageData`] (`png` stopped reading once it had its
-//! rows). The excess is unbounded, so it is treated as a decompression bomb,
+//! [`DecodingError::ExcessImageData`]. The excess is unbounded, so it is treated as a decompression bomb,
 //! with its own error so it is never reported as corruption.
 //!
 //! Encoded input is bounded too: [`Limits`] allows four times its output-byte
@@ -57,7 +56,7 @@
 //!
 //! `tests/decode_encode.rs` pins the decoded output of a synthesized matrix
 //! covering every (colour type x bit depth x interlace x tRNS x palette length)
-//! combination under all four transform settings (byte-identical to `png`'s),
+//! combination under all four transform settings,
 //! and a named case for each malformed-input rule above.
 
 mod checksum;
@@ -247,7 +246,7 @@ impl Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        // The `png` crate's default.
+        // 64 MiB default output ceiling.
         Self {
             bytes: 1024 * 1024 * 64,
         }

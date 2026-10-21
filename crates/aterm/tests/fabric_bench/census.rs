@@ -175,8 +175,8 @@ pub fn covering_commit<'a>(recs: &'a [Rec], group: &str, upto: u64, from: u64) -
 /// ordinary publish under that same key (`store.rs`, `WillRecord`). So a
 /// visible record whose `(producer_id, producer_seq)` an earlier `/a/will`
 /// registered IS that will, fired: no other record can carry the key, because
-/// the broker dedups on it (and aterm-link registers its will at the reserved
-/// low half `WILL_SEQ_LOW`, which no ordinary publish takes).
+/// the broker dedups on it (and aterm-link registers its will at astream's
+/// `will_seq(inc)`, whose low word `WILL_SEQ_LOW` no ordinary publish takes).
 #[must_use]
 pub fn will_firings(recs: &[Rec]) -> BTreeSet<u64> {
     let mut registered: HashSet<(u64, u64)> = HashSet::new();

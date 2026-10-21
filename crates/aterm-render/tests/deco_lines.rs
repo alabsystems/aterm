@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W7 machine-checked invariants for the font-metric line decorations:
-//! resolved-band in-cell clamping, absolute-x pattern phase continuity
-//! (partition invariance), undercurl period exactness + amplitude bounds, and
-//! descender ink-skip coverage-monotonicity.
+//! Invariants for the font-metric line decorations: resolved bands stay inside the cell,
+//! pattern phase depends only on absolute x (partition invariance), undercurl period and
+//! amplitude bounds, and descender ink-skip only erases.
 //!
 //! ## Proof (the `presentation_gate` idiom)
 //!
@@ -51,9 +50,7 @@ fn underline_rects(
     out
 }
 
-// ---------------------------------------------------------------------------
-// (4) clamping — decoration bands always inside the cell, for ALL font tables.
-// ---------------------------------------------------------------------------
+// Clamping: decoration bands stay inside the cell for every font table.
 
 /// Adversarial lattice for the resolver inputs: every combination must yield
 /// bands with `1 <= t <= cell_h` and `y + t <= cell_h`.
@@ -107,8 +104,8 @@ fn resolved_bands_always_inside_the_cell() {
     }
     assert!(checked > 100_000, "lattice must be adversarial ({checked})");
 
-    // Float-to-integer saturation still needs total adjustment/clamping,
-    // including when a public caller's cell height exceeds signed integers.
+    // Non-finite and extreme inputs, including a zero `cell_h` (treated as 1) and one past
+    // the signed range: the casts saturate, and the adjust and clamp arithmetic must be total.
     for cell_h in [0, 1, 27, usize::MAX] {
         for baseline in [i32::MIN, 0, i32::MAX] {
             for px in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY, f32::MAX] {
@@ -162,18 +159,13 @@ fn font_tables_actually_drive_the_bands() {
     );
 }
 
-/// One settled band of the `DecoBandContainment` model's lattice, driven
-/// through the SHIPPING resolver: `(y, t)` for a `cell_h`-tall cell asked for a
-/// raw `(raw_top, raw_t)` band.
+/// One settled band of the `DecoBandContainment` lattice through the shipping resolver:
+/// `(y, t)` for a `cell_h`-tall cell asked for a raw `(raw_top, raw_t)` band.
 ///
-/// Both bands reach the clamp through their own real entry. The UNDERLINE takes
-/// the heuristic path (`baseline = 0`, so its raw band is `(1, 1)` for every
-/// cell of five rows or fewer) and is moved onto the lattice point by the
-/// `adjust_underline_position` / `adjust_underline_thickness` escape hatches —
-/// which is how a user's config reaches it. The STRIKE takes the OS/2 table
-/// path at `px = 1`, which lands exactly on the point for any `raw_t >= 1` (a
-/// zero-thickness table entry is not a table entry, so `raw_t = 0` is the
-/// underline's alone).
+/// The underline takes the heuristic path (`baseline = 0`, raw band `(1, 1)` for cells of
+/// five rows or fewer) and is moved onto the lattice point by the adjust deltas. The strike
+/// takes the OS/2 table path at `px = 1`, which lands exactly on the point for any
+/// `raw_t >= 1`; a zero-thickness table entry is no entry, so `raw_t = 0` is underline-only.
 fn real_bands(cell_h: i64, raw_t: i64, raw_top: i64) -> [Option<(i64, i64)>; 2] {
     let tables = (raw_t >= 1).then_some(DecoTables {
         underline: None,
@@ -280,11 +272,8 @@ fn paint(grid: &mut [Vec<bool>], rects: &[[usize; 4]]) {
     }
 }
 
-/// For EVERY style, every lattice geometry, and every cell partition of a run,
-/// per-cell emission covers the IDENTICAL pixel set as whole-run emission —
-/// the pattern's value at a pixel is a pure function of absolute x, so a cell
-/// seam cannot reset it (the bug caught: restarting dash/dot/wave phase at
-/// every cell).
+/// For every style, lattice geometry and cell partition of a run, per-cell emission covers
+/// the same pixels as whole-run emission: a cell seam cannot reset the pattern phase.
 #[test]
 fn pattern_rects_are_partition_invariant() {
     let styles = [
@@ -294,9 +283,8 @@ fn pattern_rects_are_partition_invariant() {
         UnderlineStyle::Dotted,
         UnderlineStyle::Dashed,
     ];
-    // Odd/even cell advances + heights (the procedural_seams lattice idiom),
-    // including a mask-unsupported height (2049 > DECO_ATLAS_MAX_DIM) so the
-    // Curly SQUARE-WAVE fallback is exercised through the same theorem.
+    // Odd/even advances and heights, including 2049 > DECO_ATLAS_MAX_DIM so the Curly
+    // square-wave fallback is covered too.
     let cws = [2usize, 3, 7, 8, 11];
     let chs = [3usize, 8, 15, 16, 31, 2049];
     let mut nonvacuous_gaps = 0usize;
@@ -347,9 +335,7 @@ fn pattern_rects_are_partition_invariant() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// (2) undercurl — period exactness + amplitude bounds within the cell band.
-// ---------------------------------------------------------------------------
+// Undercurl: exact period, amplitude inside the cell band.
 
 /// The tile sampler is periodic in the cell advance and independent of the
 /// cell index — the wave cannot reset or jump at a seam, by integer `%`.
@@ -555,13 +541,10 @@ fn intersect_rect_spans_is_exact() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// (3, end-to-end) ink-skip through the REAL renderer: monotone at the pixel
-// level, byte-identical for descender-free cells.
-// ---------------------------------------------------------------------------
+// Ink-skip end to end through the real renderer: monotone per pixel, byte-identical for
+// descender-free cells.
 
-/// The tracked fixture face at 18px. The file is in the tree and the build is
-/// the product, so neither failing is a missing precondition: both FAIL.
+/// The tracked fixture face at 18px; a missing file or failed build fails the test.
 fn fixture_renderer() -> Renderer {
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -579,12 +562,9 @@ fn render(r: &mut Renderer, bytes: &[u8]) -> aterm_render::Frame {
     r.render_input(&input)
 }
 
-/// The coverage-monotone theorem at the pixel level: with underline+skip (B),
-/// underline without skip (A), and no underline (C) over the same text, every
-/// pixel of B equals A (underline kept) or C (underline erased) — ink-skip can
-/// only ZERO underline coverage, never invent pixels. Descenders (gy) force a
-/// real erase (non-vacuity); a descender-free cell (--) is BYTE-IDENTICAL with
-/// the knob on or off (the no-ink identity, i.e. the same code path as off).
+/// Pixel-level coverage monotonicity: with underline+skip (B), underline without skip (A)
+/// and no underline (C), every pixel of B equals A or C. Descenders (gy) must erase
+/// something; a descender-free run (--) is byte-identical with the knob on or off.
 #[test]
 fn ink_skip_is_coverage_monotone_end_to_end() {
     let mut r = fixture_renderer();
@@ -631,18 +611,10 @@ fn ink_skip_is_coverage_monotone_end_to_end() {
     );
 }
 
-/// Baseline bottoms are NOT descenders (TYPOGRAPHY R2): at the live desktop
-/// 12px the resolved underline band starts within 1px of the baseline, and the
-/// probe's 1px vertical dilation used to reach the bottom row of EVERY letter
-/// — chopping a continuous underline (and the tab strip's accent rule, which
-/// is drawn as a cell underline) into dashes. The probe is now clamped to
-/// strictly below the baseline row: only true descender ink skips. Strictly,
-/// because round bottoms (a/e/u here — this is why the text is `nnaeuu`, not
-/// just flat-footed letters) OVERSHOOT the baseline by design, and at 12px
-/// that lands one AA row exactly ON the baseline row — sitting on the line,
-/// not descending through it. Guarded HERE at the tight geometry — the 18px
-/// fixture of the test above leaves a row of air under the letters, so it
-/// never caught this.
+/// Baseline bottoms are not descenders: at 12px the underline band starts within 1px of
+/// the baseline, so the ink probe is clamped strictly below the baseline row. Round
+/// bottoms (a/e/u) overshoot onto the baseline row by design and must not chop the line;
+/// the 18px fixture above leaves a row of air and cannot catch this.
 #[test]
 fn baseline_bottoms_keep_the_underline_at_12px() {
     let bytes = embedded_font_bytes();
@@ -697,8 +669,7 @@ fn curly_gates_on_the_shared_mask_predicate() {
         !underline_rects(UnderlineStyle::Curly, 0, 0, 18, 9, 24, dm, false).is_empty(),
         "mask-unsupported curly falls back to square-wave rects"
     );
-    // The shared predicate itself: 8 sprites must fit 2048 texels
-    // (⌊2048/8⌋ = 256 is the widest supported base cell).
+    // The shared predicate: 8 sprites must fit 2048 texels (256 is the widest base cell).
     assert!(undercurl_supported(256, 24), "8·256 ≤ 2048");
     assert!(!undercurl_supported(257, 24), "8·257 > 2048");
     assert!(!undercurl_supported(9, 2049), "height cap");
@@ -739,27 +710,13 @@ fn curly_gates_on_the_shared_mask_predicate() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// CROSS-CUTTING THEOREM (c) — DECORATION NEVER CLIPS.
-//
-// Every rectangle any decoration WRITE PATH emits — the underline emitter
-// (`underline_rects_into`, all six `UnderlineStyle`s incl. the AA-masked and
-// legacy square-wave curl) and the strike/overline emitters (`strike_rect`,
-// `overline_rect`) —
-// stays entirely inside its run's band: horizontally within `[x0, x0+w)` and
-// vertically within `[y0, y0+cell_h)`. No decoration ever bleeds into the row
-// above/below or past the drawn run, for ANY style, ANY (integer) DecoMetrics —
-// including hand-built OUT-OF-RANGE metrics, which the emitters re-clamp.
-//
-// `resolved_bands_always_inside_the_cell` (above) proves the RESOLVER produces
-// in-cell metrics; THIS proves the downstream EMITTERS never escape even if fed
-// a rogue band — the containment the raster/GPU loops rely on to blit without a
-// per-rect bounds check. It is the theorem no single style owns.
-// ---------------------------------------------------------------------------
+// Decoration never clips: every rect `underline_rects_into`, `strike_rect` and
+// `overline_rect` emit stays within `[x0, x0+w) × [y0, y0+cell_h)` for any style and any
+// DecoMetrics, including out-of-range ones the emitters re-clamp. The raster and GPU loops
+// blit without a per-rect bounds check on the strength of this.
 
-/// THE THEOREM: exhaustive over styles × cell geometry × run placement ×
-/// adversarial (incl. out-of-range) DecoMetrics, every emitted rect is contained
-/// in its run band on both axes.
+/// Exhaustive over styles × cell geometry × run placement × adversarial metrics: every
+/// emitted rect is contained in its run band on both axes.
 #[test]
 fn decoration_writes_stay_within_the_run_band() {
     let styles = [
@@ -770,8 +727,7 @@ fn decoration_writes_stay_within_the_run_band() {
         UnderlineStyle::Dotted,
         UnderlineStyle::Dashed,
     ];
-    // Adversarial metrics: legitimate bands AND rogue ones (y/thickness that
-    // WOULD escape the cell) — the emitters must clamp every one back in.
+    // Legitimate bands and rogue ones that would escape the cell.
     let metrics = |cell_h: usize| {
         [
             DecoMetrics {
@@ -786,7 +742,7 @@ fn decoration_writes_stay_within_the_run_band() {
                 strike_y: cell_h / 2,
                 strike_t: 1,
             },
-            // ROGUE: top at/below the floor and a thickness far past the cell.
+            // Rogue: top below the floor and a thickness far past the cell.
             DecoMetrics {
                 underline_y: cell_h + 50,
                 underline_t: cell_h + 99,
@@ -796,7 +752,7 @@ fn decoration_writes_stay_within_the_run_band() {
         ]
     };
 
-    // non-vacuity per style, indexed by `style_idx` (UnderlineStyle isn't Ord/Hash).
+    // Non-vacuity per style, indexed by `style_idx`.
     let mut style_emitted = [false; 6];
     let mut top_reached = false; // Double upper rail / overline hug the top
     let mut bottom_reached = false; // Curly / low underline hug the bottom
@@ -856,10 +812,8 @@ fn decoration_writes_stay_within_the_run_band() {
         }
     }
 
-    // NON-VACUITY: every ink-emitting style genuinely produced rects (so the
-    // containment check was not vacuous for any of them), and rects that hug the
-    // cell TOP and cell BOTTOM were both exercised — the two extremes clipping
-    // would violate first.
+    // Non-vacuity: every ink-emitting style emitted rects, and rects reached the cell top
+    // and bottom.
     for s in [
         UnderlineStyle::Single,
         UnderlineStyle::Double,
@@ -883,8 +837,7 @@ fn decoration_writes_stay_within_the_run_band() {
     assert!(checked > 10_000, "lattice must be dense ({checked})");
 }
 
-/// Dense index for an `UnderlineStyle` (it derives neither `Ord` nor `Hash`),
-/// for the per-style non-vacuity bookkeeping.
+/// Dense index for an `UnderlineStyle`, which derives neither `Ord` nor `Hash`.
 fn style_idx(s: UnderlineStyle) -> usize {
     match s {
         UnderlineStyle::None => 0,
@@ -925,17 +878,11 @@ fn assert_contained(
 // (5) the CJK composition underline — a wide glyph's rule is never carved.
 // ---------------------------------------------------------------------------
 
-/// Render `text` as an IME PREEDIT starting at column 2 of row 0, the way
-/// `RenderInput::overlay_ime_preedit` paints a live composition (every composed
-/// cell gets `UnderlineStyle::Single`).
-///
-/// The `$ ` prefix is not decoration: `overlay_ime_preedit` seeds the composed
-/// cells' colours from the cursor cell, and a pristine `Terminal::new` has
-/// resolved no defaults at all — the overlay then falls back to a
-/// `RenderCell::default()` seed and paints the composition BLACK ON BLACK,
-/// which would make every pixel assertion below vacuously true. Processing a
-/// two-cell prompt first gives the seed real colours, and is what a person
-/// composing at a shell prompt actually has on screen.
+/// Render `text` as an IME preedit at column 2 of row 0, as
+/// `RenderInput::overlay_ime_preedit` paints a live composition. The `$ ` prompt matters:
+/// a pristine `Terminal::new` resolves no default colours, so on an empty row the overlay
+/// seeds from `RenderCell::default()` (black on black) and every pixel assertion would
+/// pass vacuously.
 fn preedit_frame(r: &mut Renderer, text: &str) -> aterm_render::Frame {
     let mut term = Terminal::new(2, 12);
     term.process(b"$ ");
@@ -944,53 +891,17 @@ fn preedit_frame(r: &mut Renderer, text: &str) -> aterm_render::Frame {
     r.render_input(&input)
 }
 
-/// The composition underline under a DENSE WIDE GLYPH must be a continuous
-/// rule, not a row of dashes.
+/// The composition underline under a wide glyph is a continuous rule, not dashes.
 ///
-/// # The defect
-///
-/// `overlay_ime_preedit` marks every composed cell `UnderlineStyle::Single`, so
-/// the preedit rule goes through descender ink-skip like any other underline.
-/// The skip's subject is a Latin descender TAIL — the narrow stroke of g/y/j/p/q
-/// that pierces the rule — which it finds by probing the rows strictly below the
-/// baseline. A Han ideograph puts ink in exactly those rows for an unrelated
-/// reason: its foot rests on the baseline and AA-overshoots it by a pixel or
-/// two. The probe cannot tell a tail from a foot, so it carved the foot out.
-///
-/// Measured on the embedded face BEFORE the fix, the lead cell of a composed
-/// `日` came back chopped into THREE fragments at every size from 13px up — a
-/// short dash at each margin plus a stub between the character's two vertical
-/// strokes:
-///
-/// ```text
-///   px=14  dw=16  spans=[(0, 1), (6, 5), (15, 1)]
-///   px=18  dw=22  spans=[(0, 2), (7, 7), (19, 3)]
-///   px=32  dw=38  spans=[(0, 5), (11, 15), (32, 6)]
-/// ```
-///
-/// Someone composing Japanese saw that under EVERY character, and the
-/// composition rule is the only thing on screen that says the text is still
-/// uncommitted.
-///
-/// # What is asserted
-///
-/// Two independent statements, at two levels:
-///
-/// * **Policy** — the wide lead takes the no-skip path (`false`), so the whole
-///   two-cell span is drawn.
-/// * **Pixels** — the composed frame is BYTE-IDENTICAL with the feature on and
-///   off (the no-ink identity, now extended to wide cells), and the underline
-///   row carries no background gap across the composed span. The gap check is
-///   the one that failed before: the carved columns went back to background.
-///
-/// Host-portable: `cell.wide` is Unicode East Asian Width, decided by
-/// `aterm-grapheme` and not by which fonts the host has, so the policy half
-/// holds even where no CJK face is installed to draw `日`.
+/// Composed cells are `UnderlineStyle::Single`, so the rule goes through descender ink-skip,
+/// whose probe cannot tell a Han ideograph's AA-overshooting foot from a descender tail;
+/// wide cells are therefore exempt. Asserted as policy (the wide lead takes the no-skip
+/// path) and in pixels (byte-identical with skip on and off, no background gap in the rule).
+/// `cell.wide` comes from East Asian Width, so the policy half needs no CJK face.
 #[test]
 fn cjk_composition_underline_is_continuous() {
     let bytes = embedded_font_bytes();
-    // 12px is the live desktop size the Latin ink-skip was tuned at; the rest
-    // span the sizes where the fragmentation was measured.
+    // 12px is the Latin ink-skip's tuning size; the rest cover common text sizes.
     for px in [12.0f32, 13.0, 14.0, 16.0, 18.0, 24.0, 32.0] {
         let mut r = Renderer::from_bytes(&bytes, px, Theme::default())
             .unwrap_or_else(|e| panic!("the embedded font must build a {px}px renderer: {e}"));
@@ -998,7 +909,7 @@ fn cjk_composition_underline_is_continuous() {
         let (cw, _) = r.cell_size();
         let pad = r.pad();
 
-        // --- Policy: the wide LEAD is exempt, so its rule is drawn whole. ---
+        // Policy: the wide lead is exempt, so its rule is drawn whole.
         let mut term = Terminal::new(2, 12);
         term.process(b"$ ");
         let mut input = term.cell_frame(2, 12);
@@ -1020,7 +931,7 @@ fn cjk_composition_underline_is_continuous() {
              — an ideograph's foot is not a descender. Got carved spans {spans:?}"
         );
 
-        // --- Pixels: identical with the feature on and off. ---
+        // Pixels: identical with the feature on and off.
         r.set_underline_skip_descenders(false);
         let off = preedit_frame(&mut r, "日本");
         r.set_underline_skip_descenders(true);
@@ -1031,7 +942,7 @@ fn cjk_composition_underline_is_continuous() {
              descender ink-skip on or off"
         );
 
-        // --- Pixels: no background gap in the rule across the composed span. ---
+        // Pixels: no background gap in the rule across the composed span.
         let dm = r.deco_metrics();
         let w = on.width;
         let bg = on.pixels[0];

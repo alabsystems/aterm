@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typed-word dog cameo, the canine twin of the typed-"kitty" summon.
+//! The typed-word dog cameo. A canine word (`dog`, `perro`, `子犬`, …) past
+//! [`crate::kitty_summon`]'s keystroke gate pops a dog up next to the cursor, rolling a breed
+//! from [`crate::dog_glyphs_gen::DOG_HEADS`] and a coat; a re-summon while a dog is on screen
+//! rolls a different breed.
 //!
-//! Typing a canine word (`dog`, `puppy`, `perro`, `chiot`, `子犬`, …) once the
-//! window has passed the detector's keystroke gate (`aterm-gui`'s
-//! `kitty_summon`) pops a dog up next to the cursor. Unlike the kitty cameo (one
-//! persistent identity), each summon rolls a fresh breed from
-//! [`crate::dog_glyphs_gen::DOG_HEADS`] and a fresh coat; a re-summon while a
-//! dog is on screen always rolls a different breed.
-//!
-//! This module is the pure lifecycle state machine: the envelope (fade in →
-//! hold → fade out), the deterministic breed/coat roll, and the entry bounce.
-//! It draws nothing: the host resolves `alpha`/`bob`/`look` each frame and
-//! hands them to `word_decorations::dog_cameo`, which bakes the breed through
-//! [`crate::dog_baker::DogBaker`]. Every decision derives from the summon seed
-//! and the host's `now`.
+//! Pure lifecycle (envelope, seeded roll, entry bounce): the host reads `alpha`/`bob`/`look`
+//! each frame and hands them to `word_decorations::dog_cameo`, which bakes through
+//! [`crate::dog_baker::DogBaker`].
 
 use std::time::Duration;
 
@@ -31,8 +24,7 @@ const HOLD: Duration = Duration::from_millis(2600);
 /// Exit fade.
 const FADE_OUT: Duration = Duration::from_millis(420);
 
-/// Entry bounce: two hops, each shorter and lower than the last, finished well
-/// inside the hold.
+/// Entry bounce: two equal-length hops, the second half as high, finished inside the hold.
 const HOP_MS: u64 = 420;
 const HOPS: u64 = 2;
 /// First hop's peak lift, as a fraction of a cell (negative = up at draw time).
@@ -58,12 +50,11 @@ pub struct DogLook {
     pub coat: u8,
 }
 
-/// Per-window dog-cameo lifecycle state. `Default` is "never summoned"; driven
-/// by [`on_summon`](Self::on_summon) and read by the per-frame accessors.
+/// Per-window dog-cameo lifecycle state; `Default` is "never summoned".
 #[derive(Default)]
 pub struct DogCameo {
-    /// The current visit's entry instant; `None` once the visit expires (the
-    /// accessors self-expire).
+    /// The current visit's entry instant (`None` before the first summon; the accessors
+    /// self-expire).
     since: Option<Instant>,
     /// The current visit's rolled identity.
     look: Option<DogLook>,
@@ -155,8 +146,7 @@ mod tests {
         Instant::now()
     }
 
-    /// The envelope: invisible before the summon, opaque through the hold,
-    /// gone after the fade — and `active` agrees with `alpha` at every edge.
+    /// The envelope rises, holds and expires, and `active` agrees with `alpha` at every edge.
     #[test]
     fn envelope_rises_holds_and_expires() {
         let mut d = DogCameo::default();
@@ -208,8 +198,7 @@ mod tests {
         );
     }
 
-    /// The bounce: lifts (negative) inside the hop window, settles to exactly
-    /// 0 afterwards, and the second hop is lower than the first.
+    /// The bounce lifts inside the hop window, the second hop lower, then settles to exactly 0.
     #[test]
     fn entry_bounce_hops_then_settles() {
         let mut d = DogCameo::default();

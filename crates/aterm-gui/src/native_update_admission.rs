@@ -3,10 +3,9 @@
 
 //! Pure admission policy for the updater's final process-replacement lane.
 //!
-//! Foreground terminal jobs are safe only after the live-session handoff is fully
-//! prepared.  Keeping this decision separate from the mechanics makes the safety
-//! boundary executable, unit-testable, and available to the derived formal model's
-//! real-code conformance test.
+//! Foreground terminal jobs are safe only once the live-session handoff is prepared. The
+//! decision is kept apart from the mechanics so unit tests and the formal model's conformance
+//! test (`native_updater_conformance`) can drive it.
 
 /// Complete facts at the point immediately before process replacement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,54 +82,29 @@ pub(crate) fn classify(facts: AdmissionFacts) -> AdmissionDecision {
     if !facts.native_state_certified {
         return AdmissionDecision::Block(AdmissionBlock::NativeStateUncertified);
     }
-    // THE UNKNOWN-FOREGROUND PROBE GATES THE COLD LANE ONLY.
+    // The unknown-foreground probe gates only the cold lane: it asks whether replacing the app
+    // would kill what the person is running. The seamless lane signals nothing (the shell keeps
+    // running on the same pty), so an unprobeable foreground must not veto it; `foreground_pgrp`
+    // counts any `tcgetpgrp` error as unknown, so one exited shell in an open tab would
+    // otherwise block every automatic update.
     //
-    // That probe answers exactly one question: would replacing the app KILL
-    // something the user is running? It belongs to the cold lane, which quits the
-    // process and closes every PTY, hanging up whatever was in the foreground. The
-    // seamless lane signals nothing — it parks readers, dups the PTY masters,
-    // spawns the successor, and the shell keeps running undisturbed on the far end
-    // of the same pty throughout. An unprobeable foreground is not a hazard it can
-    // realize.
-    //
-    // Checking it first made one unprobeable PTY veto BOTH lanes. `foreground_pgrp`
-    // is a bare `tcgetpgrp` (quit_safety.rs) and ANY error counts as unknown, so an
-    // exited shell in a still-open tab or an orphaned pty was enough to block every
-    // automatic update — and, because a Block becomes
-    // `UpdateHandoffStartError::failed`, to latch automatic apply off for that
-    // build. "Fail closed" was the right instinct aimed at the wrong lane: refusing
-    // the LOSSLESS path because the DESTRUCTIVE path's precondition is unproven
-    // buys no safety and costs the update.
-    //
-    // This incoherence check deliberately stays ahead of seamless: it is not a
-    // hazard test but a "this fact set is not real" test — more foreground jobs
-    // than PTYs describes no real session state — so it fails closed for every
-    // lane, seamless included. There is also no fallthrough risk — a seamless
-    // attempt that later fails does not re-enter this classifier and pick up the
-    // cold lane; it goes to the manual-only path.
+    // More foreground jobs than PTYs is no real session state, so it fails closed for every
+    // lane. A seamless attempt that fails later goes to the manual-only path, never back here.
     if facts.foreground_jobs > facts.live_ptys {
         return AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless);
     }
     if facts.seamless_capable {
         return AdmissionDecision::Apply(ApplyLane::Seamless);
     }
-    // Everything past this point is destructive. A cold replacement is destructive
-    // even for an idle shell, so it is admitted only when there is literally no
-    // PTY/session to lose; inconsistent job facts fail closed.
-    //
-    // THE LIVE-SESSION BLOCK COMES BEFORE THE PROBE'S (round eight of the update
-    // audit, U26). With the seamless lane gone, every live terminal blocks whatever
-    // its foreground is, so an unreadable foreground decides nothing here: it only
-    // chose the words. Checked first, it named a state nothing the person does can
-    // prove ("could not be proven safe") in place of the refusal that carries why
-    // the handoff is unavailable and what restores it (`--headless`, an unowned
-    // control socket), and the recorded reason flipped between the two across
-    // retries as the probe answered.
+    // Past here only the cold lane remains, and it closes every PTY, even an idle shell's: it
+    // is admitted only when there is no session to lose. The live-session block comes before
+    // the probe's because, without the seamless lane, the foreground decides nothing; the
+    // live-session refusal is the one that says why the handoff is unavailable.
     if facts.live_ptys > 0 || facts.foreground_jobs > 0 {
         return AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless);
     }
-    // A probe failure with no live PTY is no state a desk can be in (the probe runs
-    // once per live PTY): not evidence of an idle shell. Fail closed.
+    // A probe failure with no live PTY is no real state (the probe runs once per live PTY),
+    // so it is not evidence of an idle shell: fail closed.
     if facts.unknown_foregrounds > 0 {
         return AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown);
     }

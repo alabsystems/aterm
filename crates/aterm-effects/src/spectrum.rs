@@ -641,6 +641,20 @@ pub fn spectrum_stop(i: usize) -> u32 {
     SPECTRUM_LUT[SPECTRUM_ANCHOR_AT[i.min(SPECTRUM_STOPS - 1)]]
 }
 
+/// Midpoints between consecutive [`SPECTRUM_ANCHOR_AT`] entries. Because the
+/// anchor table is strictly increasing, `x > SPECTRUM_SNAP_MIDS[k]` is
+/// identical to `(x - at[k + 1]).abs() < (x - at[k]).abs()`, and ties (`x == mid`)
+/// stay with the lower stop `k` just like a strict `<` scan.
+const SPECTRUM_SNAP_MIDS: [f32; SPECTRUM_STOPS - 1] = {
+    let mut mids = [0.0f32; SPECTRUM_STOPS - 1];
+    let mut k = 0;
+    while k < SPECTRUM_STOPS - 1 {
+        mids[k] = 0.5 * (SPECTRUM_ANCHOR_AT[k] + SPECTRUM_ANCHOR_AT[k + 1]) as f32;
+        k += 1;
+    }
+    mids
+};
+
 /// The index of the named stop nearest spectrum position `t`: which committed
 /// anchor index `t` is nearest ([`SPECTRUM_ANCHOR_AT`]). An index rather than a
 /// colour, so a caller can read the matching light-theme ink from a
@@ -650,16 +664,12 @@ pub fn spectrum_stop(i: usize) -> u32 {
 #[must_use]
 pub fn spectrum_snap_index(t: f32) -> usize {
     let x = t.clamp(0.0, 1.0) * (SPECTRUM_LUT_LEN - 1) as f32;
-    let mut best = 0usize;
-    let mut near = f32::INFINITY;
-    for (i, &at) in SPECTRUM_ANCHOR_AT.iter().enumerate() {
-        let d = (x - at as f32).abs();
-        if d < near {
-            near = d;
-            best = i;
-        }
-    }
-    best
+    usize::from(x > SPECTRUM_SNAP_MIDS[0])
+        + usize::from(x > SPECTRUM_SNAP_MIDS[1])
+        + usize::from(x > SPECTRUM_SNAP_MIDS[2])
+        + usize::from(x > SPECTRUM_SNAP_MIDS[3])
+        + usize::from(x > SPECTRUM_SNAP_MIDS[4])
+        + usize::from(x > SPECTRUM_SNAP_MIDS[5])
 }
 
 /// Snap to a name (§2.3.3): the nearest named stop's colour to `t`.
@@ -991,23 +1001,38 @@ mod tests {
         );
     }
 
-    /// Adjacent generated entries stay close enough that the LUT prints no
-    /// visible staircase and [`spectrum`] stays continuous between them. One
+    /// Adjacent entries in [`SPECTRUM_LUT`] stay close enough that the LUT prints
+    /// no visible staircase and [`spectrum`] stays continuous between them. One
     /// ceiling everywhere: the crossing is spent by the same pace as every other
     /// leg, and the pace's byte currency ([`SPECTRUM_PACE_BYTE_SHARE`]) holds it
     /// to the ordinary bound.
     #[test]
     fn spectrum_lut_has_bounded_adjacent_steps() {
-        // The one bound, for every adjacent pair of the table.
+        // The one bound, for every adjacent pair of the shipped table.
         const CEILING: i32 = 5;
-        let fresh = generate_spectrum_lut();
+        const {
+            let mut i = 0;
+            while i < SPECTRUM_LUT_LEN - 1 {
+                let mut shift = 0u32;
+                while shift <= 16 {
+                    let a = ((SPECTRUM_LUT[i] >> shift) & 0xff) as i32;
+                    let b = ((SPECTRUM_LUT[i + 1] >> shift) & 0xff) as i32;
+                    assert!(
+                        (a - b).abs() <= CEILING,
+                        "SPECTRUM_LUT adjacent step exceeds CEILING"
+                    );
+                    shift += 8;
+                }
+                i += 1;
+            }
+        }
         let mut worst = 0i32;
         for i in 0..SPECTRUM_LUT_LEN - 1 {
             let step = [16u32, 8, 0]
                 .into_iter()
                 .map(|shift| {
-                    let a = ((fresh[i] >> shift) & 0xff) as i32;
-                    let b = ((fresh[i + 1] >> shift) & 0xff) as i32;
+                    let a = ((SPECTRUM_LUT[i] >> shift) & 0xff) as i32;
+                    let b = ((SPECTRUM_LUT[i + 1] >> shift) & 0xff) as i32;
                     (a - b).abs()
                 })
                 .max()

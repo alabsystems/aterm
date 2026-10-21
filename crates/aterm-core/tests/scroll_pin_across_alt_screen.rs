@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The reading position (and selection) survives an alt-screen app.
-//!
-//! Scrolling back into history and then running any alt-screen program (`less`,
-//! `man`, `vim`, `fzf`, `git log`) must return the user to the same line. The
-//! batch prologue pins `display_offset` and forces it to 0 for processing;
-//! `enter_alternate_screen_raw` parks the main grid in `alt_grid`, so the
-//! epilogue must re-pin the grid that was pinned, not the fresh alt grid. These
-//! tests pin the observable property: the same content is in view after the
-//! round trip.
+//! The reading position and selection survive an alt-screen app (`less`, `vim`, `fzf`). The
+//! batch prologue pins `display_offset` and forces it to 0 for processing, and
+//! `enter_alternate_screen_raw` parks the main grid in `alt_grid`, so the epilogue re-pins the
+//! grid that was pinned, not the fresh alt grid. The tests pin the observable property: the
+//! same content is in view after the round trip.
 
 use aterm_core::terminal::{TIERED_RING_CAP_DEFAULT, Terminal, TerminalBuilder};
 
@@ -28,12 +24,9 @@ fn scrolled_back(rows: u16, cols: u16, lines: usize) -> Terminal {
     term
 }
 
-/// The top visible row's text (what the user is looking at).
-///
-/// `Grid::cell` is the ring accessor, not the viewport reader
-/// (`visible_row_view`), so this is sound only for ring-only grids with an empty
-/// lazy buffer, as the shallow fixtures here are. The tiered cases use it only at
-/// `display_offset == 0`, where the top visible row is ring-resident.
+/// The top visible row's text. `Grid::cell` is the ring accessor, not the viewport reader
+/// (`visible_row_view`): sound for ring-only grids with an empty lazy buffer, as the shallow
+/// fixtures are, and in the tiered cases only at `display_offset == 0`.
 fn top_row_text(term: &Terminal) -> String {
     let grid = term.grid();
     (0..grid.cols())
@@ -113,20 +106,15 @@ fn a_live_viewport_stays_live_across_the_round_trip() {
     );
 }
 
-/// A rows-only resize keeps the same line in view.
-///
-/// `display_offset` is measured from the live bottom, so keeping the offset
-/// under a different `visible_rows` would slide content by the row delta.
-/// `reflow.rs` re-anchors on `top_visible_absolute_row()` when the width is
-/// unchanged (row identity is intact), and only when `prev_offset > 0`: at
-/// offset 0 the anchor arithmetic `d + (v - t)` would scroll a live viewport
-/// into history on a height shrink.
+/// A rows-only resize keeps the same line in view. `display_offset` counts from the live
+/// bottom, so `reflow.rs` re-anchors on `top_visible_absolute_row()` when the width is
+/// unchanged, and only when `prev_offset > 0`: at offset 0 the anchor would scroll a live
+/// viewport into history on a height shrink.
 #[test]
 fn a_rows_only_resize_keeps_the_same_line_under_the_eye() {
     for (from_rows, to_rows) in [(6u16, 4u16), (4, 6), (10, 3)] {
         let mut term = scrolled_back(from_rows, 24, 64);
-        // Sit somewhere in the middle of history rather than at the very top,
-        // so a clamp cannot accidentally produce the right answer.
+        // Off the very top, so a clamp cannot produce the right answer by accident.
         term.scroll_display(-5);
         let top_before = top_row_text(&term);
 
@@ -154,23 +142,16 @@ fn tiered_terminal(rows: u16, cols: u16, lines: usize) -> Terminal {
     term
 }
 
-/// The same property on tiered history. `tiered_scrollback_defaults()` puts a
-/// [`TIERED_RING_CAP_DEFAULT`]-line hot ring in front of the tiered store, so
-/// most of 20 000 lines leave the ring; the test asserts that first, since a
-/// tiered test that never tiers is vacuous.
-///
-/// The parked row is deeper than the hot ring, so `Grid::cell(0, 0)` reads
-/// `None` (the ring accessor has no row there); that is asserted as a
-/// precondition. The content oracle is `get_line_text`.
+/// The same property on tiered history, parked deeper than the hot ring (where `Grid::cell`
+/// reads `None`); the content oracle is `get_line_text`. The fixture is asserted to tier
+/// first: a tiered test that never tiers is vacuous.
 #[test]
 fn a_rows_only_resize_keeps_the_anchor_through_offloaded_tiered_history() {
     for (from_rows, to_rows) in [(24u16, 12u16), (12, 24), (40, 5)] {
         let mut term = tiered_terminal(from_rows, 80, 20_000);
 
-        // Prove the fixture first: history must have left the hot ring.
-        // `tiered_scrollback_lines()` counts store lines plus the lazy buffer, so
-        // this proves the lines are out of `Grid::cell`'s reach, whichever tier
-        // holds them.
+        // Prove the fixture first: `tiered_scrollback_lines()` counts store lines plus the
+        // lazy buffer, all out of `Grid::cell`'s reach.
         let tiered = term.grid().tiered_scrollback_lines();
         assert!(
             tiered > 0,
@@ -186,7 +167,6 @@ fn a_rows_only_resize_keeps_the_anchor_through_offloaded_tiered_history() {
         );
 
         term.scroll_to_top();
-        // Off the very top, so a clamp cannot accidentally produce the right answer.
         term.scroll_display(-200);
         let offset_before = i32::try_from(term.grid().display_offset()).unwrap();
         assert!(
@@ -229,10 +209,8 @@ fn a_rows_only_resize_keeps_the_anchor_through_offloaded_tiered_history() {
     }
 }
 
-/// The `prev_offset > 0` gate on the tiered fixture: a reader at the live
-/// bottom of a deep tiered session stays live across a rows-only resize. At
-/// offset 0 a height shrink's anchor arithmetic `d + (v - t)` would demand a
-/// positive offset, pushing a tail-following reader into compressed history.
+/// The `prev_offset > 0` gate on the tiered fixture: a reader at the live bottom of a deep
+/// tiered session stays live across a rows-only resize.
 #[test]
 fn a_live_tiered_viewport_stays_live_across_a_rows_only_resize() {
     for (from_rows, to_rows) in [(24u16, 12u16), (12, 24), (40, 5), (5, 40)] {
@@ -330,18 +308,12 @@ fn a_width_resize_still_clears_the_selection() {
     );
 }
 
-// ===========================================================================
-// The selection is screen-scoped too.
-//
-// `post_process` parks the outgoing screen's selection and restores it on the
-// way back, so a pager does not destroy a selection made on the main screen.
-// These tests pin that the same text is still selected afterwards.
-// ===========================================================================
+// The selection is screen-scoped too: `post_process` parks the outgoing screen's selection
+// and restores it on the way back, so a pager does not destroy a selection made on main.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 
-/// A terminal with deep history holding a completed selection anchored in
-/// scrollback — the case an alt-screen app has no business touching.
+/// A terminal with a completed selection anchored in scrollback.
 fn with_scrollback_selection(rows: u16, cols: u16) -> Terminal {
     let mut term = Terminal::new(rows, cols);
     for i in 0..64 {
@@ -465,15 +437,11 @@ fn alt_screen_scrolling_does_not_walk_the_parked_selection() {
     );
 }
 
-/// The splice assert, exit direction: a top-anchored DECSTBM archival scroll on
-/// main leaves a `pending_selection_row_update` on the main grid when the same
-/// batch swaps it out, and the swap-back batch drains it while
-/// `absolute_rows_before` names the alt grid's counter. The debug assert must
-/// exempt that batch.
-///
-/// Also pinned in release builds against an absolute oracle: the splice
-/// archives one more row above the anchor, so the anchor moves by exactly one
-/// row and keeps naming the same characters.
+/// Exit direction of the cross-grid splice assert: a top-anchored DECSTBM archival scroll on
+/// main leaves a `pending_selection_row_update` on the main grid when the same batch swaps it
+/// out, and the swap-back batch drains it while `absolute_rows_before` names the alt grid's
+/// counter; the debug assert exempts that batch. In every profile the splice archives one
+/// more row above the anchor, so the anchor moves by exactly one row and keeps its text.
 #[test]
 fn a_stranded_splice_does_not_trip_the_cross_grid_assert_on_exit() {
     let mut term = with_scrollback_selection(6, 24);
@@ -488,15 +456,14 @@ fn a_stranded_splice_does_not_trip_the_cross_grid_assert_on_exit() {
     term.process(b"pager\r\n");
     term.process(b"\x1b[?1049l");
 
-    // Reaching here in a debug build covers the assert. These run in both
-    // profiles: one row entered history above the anchor, so it moved.
+    // Reaching here in a debug build covers the assert; one row entered history above the
+    // anchor.
     assert_eq!(
         term.text_selection().start().row,
         row_before - 1,
         "the stranded splice must be DRAINED on the batch that swaps the grid back"
     );
-    // …and correctness: moving the anchor is only right if it still names its own
-    // content. Draining against the alt grid's counter moves it off.
+    // Draining against the alt grid's counter would move it off its own text.
     assert_eq!(
         term.selection_to_string().as_deref(),
         Some(text_before.as_str()),
@@ -561,8 +528,8 @@ fn scrollback_evicted_while_parked_does_not_resurrect_a_dangling_anchor() {
     );
 }
 
-/// A width resize while the pager is up rewraps the parked main grid, renumbering
-/// exactly the rows the parked selection is anchored to. It must go.
+/// A width resize while the pager is up rewraps the parked main grid, renumbering the rows
+/// the parked selection is anchored to, so the selection goes.
 #[test]
 fn a_width_resize_while_on_alt_clears_the_parked_selection() {
     let mut term = with_scrollback_selection(6, 24);
@@ -577,8 +544,7 @@ fn a_width_resize_while_on_alt_clears_the_parked_selection() {
     );
 }
 
-/// …and its rows-only twin must not. Nothing rewrapped; a window-height drag or a
-/// font zoom while `vim` is up has no business eating the highlight underneath.
+/// A rows-only resize while on alt rewraps nothing, so the parked selection stays.
 #[test]
 fn a_rows_only_resize_while_on_alt_keeps_the_parked_selection() {
     let mut term = with_scrollback_selection(6, 24);
@@ -655,15 +621,11 @@ fn wholesale_destruction_while_on_alt_takes_the_parked_selection_with_it() {
     );
 }
 
-/// RIS followed by re-entry into alt in one batch leaves no highlight.
-///
-/// `\x1bc\x1b[?1049h` leaves `was_alt` and `modes.alternate_screen` both true at
-/// `post_process`, so park and restore sit out the batch and a stale pre-RIS
-/// selection stays parked for the next `?1049l`. Two things prevent it: the
-/// explicit clears, and RIS's `SelectionDamage::All` on the main grid, drained
-/// right after the restore on exit. No black-box test can separate them, so
-/// this is a property test; the clear itself is pinned in
-/// `terminal::processing::tests::ris_empties_the_parked_selection_slot_in_the_batch_that_resets`.
+/// RIS then re-entry into alt in one batch leaves no highlight: `was_alt` and
+/// `modes.alternate_screen` are both true at `post_process`, so park and restore sit out the
+/// batch, and the RIS clear and RIS's `SelectionDamage::All` on the main grid each dispose
+/// of the parked selection. The clear alone is pinned by
+/// `processing::tests::ris_empties_the_parked_selection_slot_in_the_batch_that_resets`.
 #[test]
 fn ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -688,7 +650,7 @@ fn ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight() {
 
     // RIS and re-enter alt in one batch: neither park nor restore fires.
     term.process(b"\x1bc\x1b[?1049h");
-    // Now leave alt. The slot must be empty — nothing to hand back.
+    // Leave alt: the slot is empty, nothing to hand back.
     term.process(b"\x1b[?1049l");
 
     assert!(
@@ -698,9 +660,7 @@ fn ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight() {
     );
 }
 
-// ===========================================================================
 // Resize, mid-batch exit and re-entry edge cases.
-// ===========================================================================
 
 /// Every visible row's text, top to bottom. Same ring-accessor caveat as
 /// [`top_row_text`].
@@ -729,9 +689,9 @@ fn select_row(term: &mut Terminal, row: i32, cols: u16) -> String {
         .expect("the fixture must select real text")
 }
 
-/// A rows-only shrink moves a scrollback selection with its content:
-/// `adjust_row_count_rows_only` pushes the bottom `old - new` viewport rows onto
-/// history, so every scrollback anchor gains that many lines above it.
+/// A rows-only shrink keeps a scrollback selection over its text: `adjust_row_count_rows_only`
+/// demotes the top `old - new` viewport rows into history, so every anchor moves back that
+/// many lines.
 #[test]
 fn a_rows_only_shrink_keeps_a_scrollback_selection_over_its_own_text() {
     let mut term = Terminal::new(10, 24);
@@ -754,16 +714,15 @@ fn a_rows_only_shrink_keeps_a_scrollback_selection_over_its_own_text() {
     );
 }
 
-/// A selection on a row the shrink demotes follows it into history at
-/// `row - old_rows`, while rows above the cut stay live; no uniform delta
-/// describes both.
+/// A selection on a live row past the new height keeps its text: the demote relabels live
+/// rows and history by the same count.
 #[test]
 fn a_rows_only_shrink_follows_a_demoted_live_row_into_history() {
     let mut term = Terminal::new(10, 24);
     for i in 0..64 {
         term.process(format!("line-{i}\r\n").as_bytes());
     }
-    // Row 7 of 10 is below the cut at 6 — it is demoted to relative -3.
+    // Row 7 of 10 lies past the new height; the demote of rows 0..=3 moves it to row 3.
     let text_before = select_row(&mut term, 7, 6);
     assert_eq!(text_before, "line-62");
 
@@ -812,8 +771,7 @@ fn an_rmcup_mid_batch_writes_to_the_live_screen_not_into_history() {
 
     term.process(b"\x1b[?1049h");
     term.process(b"a pager's screen\r\n");
-    // The rmcup and the bytes that follow it, in one read — the shape every
-    // isolated-`?1049l` test in this file misses.
+    // The rmcup and the bytes after it, in one read.
     term.process(b"\x1b[?1049l\r\x1b[KHELLO\n");
 
     assert_eq!(
@@ -885,12 +843,9 @@ fn an_exit_and_re_entry_in_one_batch_kills_the_previous_alt_selection() {
     );
 }
 
-/// A shrink that only trims moves nothing, so the selection does not move.
-///
-/// The relabel distance is the demote count, not the height delta: trailing
-/// blank rows below the cursor are dropped, not archived (archiving would create
-/// blank history). The two numbers are equal on a full screen, so this uses a
-/// partly empty one.
+/// A shrink absorbed by trailing blanks moves no anchor: the relabel distance is the demote
+/// count, not the height delta (blank rows below the cursor are dropped, not archived). The
+/// two are equal on a full screen, so this uses a partly empty one.
 #[test]
 fn a_shrink_absorbed_entirely_by_trailing_blanks_leaves_the_anchor_alone() {
     let mut term = Terminal::new(10, 24);

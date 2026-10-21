@@ -78,6 +78,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use astream_broker::Event;
 
@@ -280,7 +281,7 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     let caps = cmd.cap_files.join(" ");
     let done = match &cmd.act {
         Act::Halt(reason) => halt(cfg, cmd, &person, reason.as_deref()),
-        Act::Inbox { peek } => inbox(cfg, cmd, &person, *peek, &mut io::stdout()),
+        Act::Inbox { peek } => inbox(cfg, cmd, &person, *peek, &mut io::stdout(), LIVE),
         Act::Post {
             sid,
             node,
@@ -399,10 +400,33 @@ pub fn person_of(cap_files: &[String], fleet: &str) -> Result<String, String> {
 /// A broker connection with the person's caps attached, every exchange
 /// bounded by [`IO_TIMEOUT`].
 fn connect(cfg: &Config, cmd: &PersonCmd) -> io::Result<(Conn, Closer)> {
-    let (mut conn, closer) = transport::connect(&cfg.broker, IO_TIMEOUT)?;
+    connect_within(cfg, cmd, IO_TIMEOUT)
+}
+
+/// [`connect`] with every exchange bounded by `request`.
+fn connect_within(cfg: &Config, cmd: &PersonCmd, request: Duration) -> io::Result<(Conn, Closer)> {
+    let (mut conn, closer) = transport::connect(&cfg.broker, request)?;
     transport::attach_cap_files(&mut conn, &cmd.cap_files)?;
     Ok((conn, closer))
 }
+
+/// What an inbox waits on: each `request` (the dial, every request and reply)
+/// and its `subscription`'s silence (the catch-up's liveness bound).
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    request: Duration,
+    subscription: Duration,
+}
+
+/// The operator's bounds: a request answers within [`IO_TIMEOUT`], and a
+/// catch-up scan, which a broker marks while it reads, may stay silent up to
+/// [`astream_broker::IDLE_MARK_DEADLINE`] — longer than a request may take, so a
+/// long scan is read to its end.
+const LIVE: Bounds = Bounds {
+    request: IO_TIMEOUT,
+    subscription: astream_broker::IDLE_MARK_DEADLINE,
+};
+const _: () = assert!(LIVE.subscription.as_millis() > LIVE.request.as_millis());
 
 /// Publish once, as `person`, under a fresh sequence (the module doc's
 /// rule), and answer the record's offset.
@@ -486,10 +510,10 @@ fn post(
 ///   inbox and is not printed. A progress mark below the captured head is
 ///   never taken for "that was all", and a busy matching tail needs no mark.
 /// * HOW LONG IT MAY WAIT: a catch-up over a long log can scan for longer than
-///   a request's [`IO_TIMEOUT`] before its first matching record, so the
-///   subscription is held to [`astream_broker::IDLE_MARK_DEADLINE`] instead —
-///   a liveness bound, which a broker that marks (checked first) keeps while
-///   it scans; past it the link is gone, and nothing is marked read.
+///   a request's bound before its first matching record, so the subscription
+///   is held to its own (`bounds`; [`LIVE`] for the operator) — a liveness
+///   bound, which a broker that marks (checked first) keeps while it scans;
+///   past it the link is gone, and nothing is marked read.
 /// * WHAT IT MARKS READ: everything below the captured head, not only up to the
 ///   last message printed. One commit record per run, so the next inbox scans
 ///   only what arrived since; an inbox that committed only after mail would
@@ -504,10 +528,11 @@ fn inbox(
     person: &str,
     peek: bool,
     out: &mut dyn io::Write,
+    bounds: Bounds,
 ) -> io::Result<()> {
     let group = crate::subject::person_inbox_group(&cfg.fleet, person);
     let filter = crate::subject::person_mail_filter(&cfg.fleet, person);
-    let (mut conn, closer) = connect(cfg, cmd)?;
+    let (mut conn, closer) = connect_within(cfg, cmd, bounds.request)?;
     // THE END OF THE MAIL IS THE BROKER'S MARK. A broker that sends none
     // cannot say "that was all", and an inbox that waited for silence instead
     // would be a timing guess.
@@ -539,11 +564,14 @@ fn inbox(
     let mut sub = conn.subscribe_group(&group, &filter)?;
     // A broker that already answered and hung up leaves nothing to bound; its mail
     // is still read below, and its close ends the inbox in words.
-    closer.set_read_timeout(Some(astream_broker::IDLE_MARK_DEADLINE))?;
+    closer.set_read_timeout(Some(bounds.subscription))?;
     let cap = cmd.cap_files.join(" --cap-file ");
     let mut count = 0usize;
     loop {
-        match sub.recv_event().map_err(went_silent)? {
+        match sub
+            .recv_event()
+            .map_err(|e| went_silent(e, bounds.subscription))?
+        {
             None => {
                 return Err(io::Error::other(
                     "the broker closed the inbox before it caught up; nothing was marked read",
@@ -625,7 +653,7 @@ fn inbox(
              (use --peek to read without committing)",
         ));
     };
-    let (mut conn, _closer) = connect(cfg, cmd)?;
+    let (mut conn, _closer) = connect_within(cfg, cmd, bounds.request)?;
     if inbox_log_identity(&mut conn)? != Some(read_log) {
         return Err(io::Error::other(
             "the broker log changed or could not be identified after reading the inbox; \
@@ -646,18 +674,18 @@ fn inbox_log_identity(conn: &mut Conn) -> io::Result<Option<astream_broker::LogI
     }
 }
 
-/// A read past the inbox's liveness bound, said in words: the broker marks a
-/// subscription it is reading for at least every [`astream_broker::IDLE_MARK`],
-/// so silence past [`astream_broker::IDLE_MARK_DEADLINE`] is a link that is
+/// A read past the inbox's liveness bound (`bound`), said in words: the broker
+/// marks a subscription it is reading for at least every
+/// [`astream_broker::IDLE_MARK`], so silence past the bound is a link that is
 /// gone, which a bare errno would not say.
-fn went_silent(e: io::Error) -> io::Error {
+fn went_silent(e: io::Error, bound: Duration) -> io::Error {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::Error::new(
             e.kind(),
             format!(
                 "went silent: nothing in {} s on a link it marks every {} s while it reads, so \
                  the link is gone; nothing was marked read",
-                astream_broker::IDLE_MARK_DEADLINE.as_secs(),
+                bound.as_secs(),
                 astream_broker::IDLE_MARK.as_secs()
             ),
         ),
@@ -1212,6 +1240,8 @@ mod tests {
     struct StandInState {
         stopped: bool,
         active: Option<std::sync::Weak<std::os::unix::net::UnixStream>>,
+        /// When the group subscription arrived.
+        subscribed: Option<std::time::Instant>,
     }
 
     #[cfg(unix)]
@@ -1219,6 +1249,15 @@ mod tests {
         _dir: aterm_tempfile::TempDir,
         state: std::sync::Arc<(std::sync::Mutex<StandInState>, std::sync::Condvar)>,
         worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl StandIn {
+        /// When the inbox's group subscription reached the stand-in, if it did.
+        fn subscribed(&self) -> Option<std::time::Instant> {
+            let (state, _) = &*self.state;
+            state.lock().unwrap_or_else(|e| e.into_inner()).subscribed
+        }
     }
 
     #[cfg(unix)]
@@ -1251,31 +1290,33 @@ mod tests {
         }
     }
 
+    /// What an inbox waits on against a stand-in broker: every wait a hang
+    /// detector. The stand-in is a thread of this test binary, which a loaded
+    /// machine can starve for longer than an operator's bounds ([`LIVE`]), so
+    /// no wait on it is held to them.
+    const STAND_IN: Bounds = Bounds {
+        request: aterm_spec::wait::MUST_HAPPEN,
+        subscription: aterm_spec::wait::MUST_HAPPEN,
+    };
+
     /// A stand-in broker for ONE `inbox` over `conns` connections, at astream's
     /// wire: the head query answers `end`, the group subscription is sent
-    /// `tail` after `silence`, and every `Commit` is recorded before its ack,
-    /// so once `inbox` returns the record is final. Its returned guard cancels
-    /// accept or an active connection and joins, including on assertion unwind.
+    /// `tail` (nothing, for an empty one), and every `Commit` is recorded before
+    /// its ack, so once `inbox` returns the record is final. Its returned guard
+    /// cancels accept or an active connection and joins, including on assertion
+    /// unwind.
     #[cfg(unix)]
     fn stand_in(
         end: u64,
-        silence: std::time::Duration,
         tail: Vec<astream_broker::Response>,
         conns: usize,
     ) -> (StandIn, Config, Commits) {
-        scripted_inbox(
-            end,
-            silence,
-            tail,
-            vec![Some(log_identity(1, 0)); conns],
-            false,
-        )
+        scripted_inbox(end, tail, vec![Some(log_identity(1, 0)); conns], false)
     }
 
     #[cfg(unix)]
     fn scripted_inbox(
         end: u64,
-        silence: std::time::Duration,
         tail: Vec<astream_broker::Response>,
         logs: Vec<Option<astream_broker::LogIdentity>>,
         close_after_tail: bool,
@@ -1303,6 +1344,7 @@ mod tests {
                 head,
                 resume: String::new(),
                 durable: None,
+                oldest: None,
             };
             for log in logs {
                 let (state, changed) = &*accepting;
@@ -1338,7 +1380,11 @@ mod tests {
                         Some(Request::IdleMarks) => vec![mark(end, end)],
                         Some(Request::Fetch { max: 0, .. }) => vec![mark(0, end)],
                         Some(Request::SubscribeGroup { .. }) => {
-                            std::thread::sleep(silence);
+                            accepting
+                                .0
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .subscribed = Some(std::time::Instant::now());
                             end_stream = close_after_tail;
                             tail.clone()
                         }
@@ -1385,7 +1431,6 @@ mod tests {
         };
         let (_server, cfg, commits) = scripted_inbox(
             10,
-            std::time::Duration::ZERO,
             vec![mail(7), mail(10), mail(11)],
             vec![Some(log_identity(1, 0)); 2],
             true,
@@ -1395,7 +1440,7 @@ mod tests {
             cap_files: Vec::new(),
         };
         let mut out = Vec::new();
-        inbox(&cfg, &cmd, "h-x", false, &mut out)
+        inbox(&cfg, &cmd, "h-x", false, &mut out, STAND_IN)
             .expect("a delivery at the captured head completes the snapshot without another mark");
         assert_eq!(
             *commits.lock().unwrap(),
@@ -1430,7 +1475,6 @@ mod tests {
         }
         let (_server, cfg, commits) = scripted_inbox(
             10,
-            std::time::Duration::ZERO,
             vec![astream_broker::Response::Delivery {
                 offset: 7,
                 subject: "/f/f/in/p/h-x/n-peer/note".into(),
@@ -1443,7 +1487,7 @@ mod tests {
             act: Act::Inbox { peek: false },
             cap_files: Vec::new(),
         };
-        let e = inbox(&cfg, &cmd, "h-x", false, &mut Gone)
+        let e = inbox(&cfg, &cmd, "h-x", false, &mut Gone, STAND_IN)
             .expect_err("mail nobody read is not an inbox read");
         assert!(
             e.get_ref().is_some_and(|inner| inner.is::<Unprinted>()),
@@ -1461,12 +1505,12 @@ mod tests {
     fn an_inbox_commits_only_through_its_captured_head() {
         let (_server, cfg, commits) = stand_in(
             10,
-            std::time::Duration::ZERO,
             vec![astream_broker::Response::Mark {
                 next: 14,
                 head: 14,
                 resume: String::new(),
                 durable: None,
+                oldest: None,
             }],
             2,
         );
@@ -1474,7 +1518,7 @@ mod tests {
             act: Act::Inbox { peek: false },
             cap_files: Vec::new(),
         };
-        inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).unwrap();
+        inbox(&cfg, &cmd, "h-x", false, &mut Vec::new(), STAND_IN).unwrap();
         assert_eq!(
             *commits.lock().unwrap(),
             [("/f/f/cur/p/h-x/inbox".to_string(), 9)],
@@ -1488,12 +1532,12 @@ mod tests {
         for replacement in [log_identity(2, 0), log_identity(1, 1)] {
             let (_server, cfg, commits) = scripted_inbox(
                 10,
-                std::time::Duration::ZERO,
                 vec![astream_broker::Response::Mark {
                     next: 10,
                     head: 10,
                     resume: String::new(),
                     durable: None,
+                    oldest: None,
                 }],
                 vec![Some(log_identity(1, 0)), Some(replacement)],
                 false,
@@ -1503,7 +1547,7 @@ mod tests {
                 cap_files: Vec::new(),
             };
             assert!(
-                inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).is_err(),
+                inbox(&cfg, &cmd, "h-x", false, &mut Vec::new(), STAND_IN).is_err(),
                 "a replacement log accepted the old snapshot cursor"
             );
             assert!(
@@ -1522,12 +1566,12 @@ mod tests {
         ] {
             let (_server, cfg, commits) = scripted_inbox(
                 10,
-                std::time::Duration::ZERO,
                 vec![astream_broker::Response::Mark {
                     next: 10,
                     head: 10,
                     resume: String::new(),
                     durable: None,
+                    oldest: None,
                 }],
                 logs,
                 false,
@@ -1537,36 +1581,33 @@ mod tests {
                 cap_files: Vec::new(),
             };
             assert!(
-                inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).is_err(),
+                inbox(&cfg, &cmd, "h-x", false, &mut Vec::new(), STAND_IN).is_err(),
                 "unknown log identity was treated as equal"
             );
             assert!(commits.lock().unwrap().is_empty());
         }
     }
 
-    /// **A LONG CATCH-UP IS READ TO ITS END, NOT TO A REQUEST'S BOUND OR TO
-    /// THE FIRST MARK.** The broker scans for longer than [`IO_TIMEOUT`]
-    /// before it sends anything (a long log with no mail near its start),
-    /// then marks part-way (`next=4`, below the head of 10 the inbox started
-    /// at), then delivers the mail at @7 and marks the end. The inbox prints
-    /// the mail and commits through @9 — the end mark's resume point. Under
-    /// the request bound the read failed `TimedOut` on every run; read to the
-    /// first mark it said "no new mail" with mail at @7.
+    /// **A CATCH-UP IS READ TO ITS END, NOT TO THE FIRST MARK.** The broker
+    /// marks part-way (`next=4`, below the head of 10 the inbox started at),
+    /// then delivers the mail at @7 and marks the end. The inbox prints the mail
+    /// and commits through @9 — the end mark's resume point. Read to the first
+    /// mark it said "no new mail" with mail at @7.
     #[cfg(unix)]
     #[test]
-    fn an_inbox_outlasts_a_long_scan_and_reads_past_its_progress_marks() {
+    fn an_inbox_reads_past_its_progress_marks() {
         use astream_broker::Response;
         let mut body = Body::new(1);
         body.text = "is main green?".to_string();
         let (_dir, cfg, commits) = stand_in(
             10,
-            IO_TIMEOUT + std::time::Duration::from_secs(1),
             vec![
                 Response::Mark {
                     next: 4,
                     head: 10,
                     resume: String::new(),
                     durable: None,
+                    oldest: None,
                 },
                 Response::Delivery {
                     offset: 7,
@@ -1578,6 +1619,7 @@ mod tests {
                     head: 10,
                     resume: String::new(),
                     durable: None,
+                    oldest: None,
                 },
             ],
             2,
@@ -1586,12 +1628,52 @@ mod tests {
             act: Act::Inbox { peek: false },
             cap_files: Vec::new(),
         };
-        inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).expect("the inbox reads to its end");
+        let mut out = Vec::new();
+        inbox(&cfg, &cmd, "h-x", false, &mut out, STAND_IN).expect("the inbox reads to its end");
+        assert!(
+            String::from_utf8(out).unwrap().starts_with("@7  "),
+            "the mail past the progress mark is printed"
+        );
         assert_eq!(
             *commits.lock().unwrap(),
             [("/f/f/cur/p/h-x/inbox".to_string(), 9)],
             "committed through the end mark"
         );
+    }
+
+    /// **THE SUBSCRIPTION IS HELD TO ITS OWN BOUND, NOT A REQUEST'S.** A broker
+    /// that takes the subscription and then says nothing: the read ends at the
+    /// subscription's bound, in words, with nothing marked read. Held to the
+    /// request's bound instead (two hang detectors here), the subscription
+    /// outlasts the hang detector, which is timed from the subscription's arrival
+    /// alone. That the operator's subscription bound outlasts a request's, so a
+    /// scan longer than a request is read to its end, is [`LIVE`]'s own assertion.
+    /// NOT COVERED: a subscription bound LONGER than the request's, held to the
+    /// shorter of the two (`min` at the `set_read_timeout`) — the live inbox's
+    /// failure. Run, it would wait out a request's bound, which against a stand-in
+    /// must be a hang detector ([`STAND_IN`]); `inbox`'s one `set_read_timeout`
+    /// line, which sets `bounds.subscription` alone, is what holds it.
+    #[cfg(unix)]
+    #[test]
+    fn an_inbox_subscription_is_held_to_its_own_bound() {
+        let (server, cfg, commits) = stand_in(10, Vec::new(), 1);
+        let cmd = PersonCmd {
+            act: Act::Inbox { peek: false },
+            cap_files: Vec::new(),
+        };
+        let bounds = Bounds {
+            request: aterm_spec::wait::MUST_HAPPEN * 2,
+            subscription: Duration::from_millis(50),
+        };
+        let e = inbox(&cfg, &cmd, "h-x", false, &mut Vec::new(), bounds)
+            .expect_err("a broker that never marks ends no inbox well");
+        let held = server.subscribed().expect("the inbox subscribed").elapsed();
+        assert!(
+            held < aterm_spec::wait::MUST_HAPPEN,
+            "the subscription waited out the request's bound ({held:?}): {e}"
+        );
+        assert!(e.to_string().starts_with("went silent"), "{e}");
+        assert!(commits.lock().unwrap().is_empty(), "nothing marked read");
     }
 
     /// **AN INBOX WITH NO NEW MAIL MARKS READ WHAT IT SCANNED; `--peek` MARKS
@@ -1608,20 +1690,21 @@ mod tests {
                 head: 10,
                 resume: String::new(),
                 durable: None,
+                oldest: None,
             }]
         };
         let cmd = PersonCmd {
             act: Act::Inbox { peek: false },
             cap_files: Vec::new(),
         };
-        let (_dir, cfg, commits) = stand_in(10, std::time::Duration::ZERO, end(), 2);
-        inbox(&cfg, &cmd, "h-x", false, &mut Vec::new()).expect("an inbox with no mail");
+        let (_dir, cfg, commits) = stand_in(10, end(), 2);
+        inbox(&cfg, &cmd, "h-x", false, &mut Vec::new(), STAND_IN).expect("an inbox with no mail");
         assert_eq!(
             *commits.lock().unwrap(),
             [("/f/f/cur/p/h-x/inbox".to_string(), 9)]
         );
-        let (_dir, cfg, commits) = stand_in(10, std::time::Duration::ZERO, end(), 1);
-        inbox(&cfg, &cmd, "h-x", true, &mut Vec::new()).expect("a peek with no mail");
+        let (_dir, cfg, commits) = stand_in(10, end(), 1);
+        inbox(&cfg, &cmd, "h-x", true, &mut Vec::new(), STAND_IN).expect("a peek with no mail");
         assert!(commits.lock().unwrap().is_empty(), "--peek committed");
     }
 

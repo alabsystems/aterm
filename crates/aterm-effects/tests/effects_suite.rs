@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-effects' integration suite: ONE test binary for every file listed
-//! below, instead of one linked and started per file.
+//! aterm-effects' integration suite: one test binary for every file mounted below. Each file keeps
+//! its path and its own `#[test]`s, named `<file>::<test>` here.
 //!
-//! Each file keeps its path (every `tests/<file>.rs` citation still resolves)
-//! and its own `#[test]`s; a test is named `<file>::<test>` here. The shared
-//! helpers are mounted ONCE, first: `common` (the budget knob), `trail_host`
-//! (the host seam, whose `core_deref!` macro the modules below use — hence
-//! `#[macro_use]` and its place before them) and `walk_census`; each file
-//! reaches them as `crate::<helper>`.
+//! The shared helpers mount first: `common`, `trail_host` (the modules below use its
+//! `core_deref!` macro, hence `#[macro_use]` and its place) and `walk_census`; each file reaches
+//! them as `crate::<helper>`. The files share one process, so none sets an environment variable,
+//! installs a hook or re-executes itself, and no process static changes another test's verdict;
+//! the files that install a `#[global_allocator]` to assert allocation counts are their own
+//! `[[test]]`s in `Cargo.toml`.
 //!
 //! Sharing a process was checked, not assumed: no file below sets or removes an
 //! environment variable, installs a hook, re-executes itself or keeps a

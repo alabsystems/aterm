@@ -3,50 +3,24 @@
 
 # aterm: spec recovery from its 195 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 56 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-16: this file is the `aterm` crate's migration worklist. Each spec below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. The 8 tests in §4 marked **delete** sample no spec and can go now. Nothing has been
-> deleted yet.
+> Status: migration worklist for the `aterm` crate. Each spec below is proved through Trust/Clean
+> about the compiled Rust function, and then the tests it subsumes are deleted. The retired embedded
+> operator (`DESIGN-sessions-as-subagents-2026-10-15.md` §7) and its `operator-recovery` rows are
+> struck below.
 >
-> Note 2026-10-16 (merge of origin/main into mesh/subagents): the embedded operator was removed
-> (DESIGN-sessions-as-subagents-2026-10-15.md §7), and with it `tests/operator_live_headless.rs`.
-> Its spec `operator-recovery` and its five test rows are struck below; the counts and the gap
-> histogram still include them.
-> **Blocked: `nests-inside-aterm`** (measured 2026-10-16, Trust seal `150efe4a`). The contract
-> `ensures result == (bare && (!force_session && (aterm_child && stdin_tty)))`, cited to a Clean
-> theorem over `trust_import_aterm__nests_inside_aterm` for all 16 inputs, was written and the seal
-> refused the whole unit before verifying anything: "verified Targo refuses unit aterm ...: in-process
-> proc-macro dependencies [aterm-serde-derive] ... Evidence-grade verification currently enforces a
-> no-proc-macro TCB boundary". This is PM-1: the binary reaches `aterm-serde-derive` transitively
-> (through `aterm-serde`, under `aterm-core`, `aterm-json`, `aterm-agent` and others), so no fn in
-> this crate can be certified until PM-1 frees the whole graph. The code was left unchanged and
-> no test was deleted. When it lands, the fn's `cfg(any(windows, test))` also needs `trust_verify`
-> so the seal compiles it on macOS.
->
-> Re-measured 2026-10-19 (same seal, after PM-1 increment 1): still refused with the same error,
-> before any obligation ran (`report.json` holds only the `<transport>` row, 0 of 1 proved,
-> verdict Inconclusive). The contract, the `trust_verify` cfg and the Clean theorem
-> `∀ bare force_session aterm_child stdin_tty : Bool, trust_import_aterm__nests_inside_aterm …
-> = (bare && (!force_session && (aterm_child && stdin_tty)))` were written again and reverted byte
-> for byte. Increment 1 did not free this unit: `aterm-serde` (and so `aterm-serde-derive`) is
-> still a normal dependency of `aterm-agent`, `aterm-core`, `aterm-effects`, `aterm-gui`,
-> `aterm-json`, `aterm-lexicon`, `aterm-toml`, `aterm-types`, `aterm-update`, `aterm-update-core`
-> and `atpkg` in this binary's graph (`targo tree -p aterm -i aterm-serde -e normal`). Blocker:
-> PM-1 only; gap 3 is not reached.
+> **Blocked: `nests-inside-aterm`** (Trust seal `150efe4a`). The contract
+> `ensures result == (bare && (!force_session && (aterm_child && stdin_tty)))` over
+> `trust_import_aterm__nests_inside_aterm` for all 16 inputs is refused at unit admission by PM-1:
+> `aterm` transitively depends on `aterm-serde` (and thus `aterm-serde-derive`) across its normal
+> dependency graph (`aterm-agent`, `aterm-core`, `aterm-effects`, `aterm-gui`, `aterm-json`,
+> `aterm-lexicon`, `aterm-toml`, `aterm-types`, `aterm-update`, `aterm-update-core`, `atpkg`). Once
+> PM-1 clears the binary's graph, `nests_inside_aterm`'s `cfg(any(windows, test))` also needs
+> `trust_verify` so the seal compiles it on macOS.
 
-Source: `crates/aterm` (source review): `src/compiler_probe.rs`, `src/main.rs`, and the integration
-tests under `tests/`, which `tests/aterm_suite.rs` gathers into one test binary. The recovery
-counts below are historical. Foreground-handback and render-desync stand-ins are private helpers
-dispatched by their real parent tests on child re-entry; they have no separate libtest entries.
-Two tests landed after the recovery pass and were read for this merge:
-`startup_prepare_live_headless::a_headless_boot_reaches_every_preparation_cut_in_order` (new spec
-`startup-prepare-cuts`) and `host_live::autopilot_off_keeps_the_hosts_hands_off_until_the_session_opts_in`
-(folded into `harness-config-reading`). Nothing was compiled or run. The claims come from reading
-the code.
+Source: `crates/aterm` (`src/compiler_probe.rs`, `src/main.rs`, and the integration tests under
+`tests/`, which `tests/aterm_suite.rs` gathers into one test binary). Foreground-handback and
+render-desync stand-ins are private helpers dispatched by their parent tests on child re-entry and
+have no separate libtest entries.
 
 Result: **61 specs**, covering **168 tests**. **19 tests are not spec samples** (§4).
 

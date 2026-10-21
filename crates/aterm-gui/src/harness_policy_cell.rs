@@ -14,16 +14,13 @@
 //! the types say, and `offer` is a join: a stamp no newer than the one in
 //! force changes nothing, wherever its wake lands.
 //!
-//! The fields are private and nothing here is generic, so that a Trust seal
-//! can say the rest (`harness_policy_cell_island.rs`, on the Trust lane): no
-//! other fn changes a field, no other fn builds one of these, and no value
-//! holding the cell is put over another.
+//! The fields are private and nothing is generic so that the Trust seals in
+//! `harness_policy_cell_island.rs` can say the rest.
 
 use crate::app_config::HarnessPolicy;
 
-// The seals on the three types below, which Trust checks against every body
-// of this crate. Mounted on the lane that has `Trust.Protocol.Seal` (a
-// toolchain newer than the installed seal): `--cfg trust_seals`.
+// Trust seals on the three types below, mounted on the seal lane (`--cfg trust_seals`), whose
+// toolchain has `Trust.Protocol.Seal`.
 #[cfg(all(clean_islands, trust_seals))]
 #[path = "harness_policy_cell_island.rs"]
 mod island;

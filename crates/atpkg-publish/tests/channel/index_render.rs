@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The rendered index round-trips through the CLIENT: what the writer decided is what
-//! `quad::verify_dir` (the client's chain and parser) reads back, every field, and the
-//! writer is deterministic. The head it is built over carries only keys it can render.
+//! The rendered index round-trips through the client: `quad::verify_dir` (the client's chain
+//! and parser) reads back every field the writer decided, and the writer is deterministic. The
+//! head it is built over carries only keys it can render.
 
 use std::collections::BTreeMap;
 

@@ -5,8 +5,9 @@
 //!
 //! One list: [`crate::jail::render`] makes a rule of each entry, the isolation
 //! probes walk the same entries (also against a replica home), and the lab's
-//! state directory is kept off it. A secret store that is not here is readable
-//! (the crate docs: what the jail does not do); add an entry to close one.
+//! state directory is kept off it. These extra read/metadata/write denials sit
+//! inside the broader home-content fences; unlisted home files are not readable
+//! unless the lab explicitly selects their source, build or tool path.
 
 /// How a rule matches its path, in the sandbox profile language.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

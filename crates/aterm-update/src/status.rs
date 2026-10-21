@@ -425,8 +425,7 @@ mod tests {
     /// Concurrent writers inside ONE process must not share a scratch file. Keying the
     /// temp on the pid alone handed every thread the same path, so one writer's `write`
     /// could truncate another's bytes in the window before its `rename` — and the
-    /// rename would then publish a half-written record. Threads, not just repeated
-    /// calls, because that is the shape the old name actually collided in.
+    /// rename would then publish a half-written record.
     #[test]
     fn concurrent_writers_never_share_a_temp_path() {
         let staging = Staging::scratch("status-tmp");
@@ -515,7 +514,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Invariant (f): `status.toml` stays schema 1 with `latest_tag` OPTIONAL. An older
+    /// `status.toml` stays schema 1 with `latest_tag` OPTIONAL. An older
     /// ledger (no such key) reads as "no tag"; a record that authorized a tag writes
     /// it; a later writer that set nothing (the apply lane, a deferral) carries the
     /// file's forward; an empty value is "no tag"; and an OLDER reader — one that

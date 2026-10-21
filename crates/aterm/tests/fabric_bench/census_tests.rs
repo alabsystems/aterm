@@ -90,7 +90,7 @@ fn a_window_counts_every_record_and_names_the_commits() {
 
 #[test]
 fn a_fired_will_is_named_by_the_key_its_registration_carried() {
-    // The killed bridge registered its will at (7, 0xFFFF_FFFF) long ago;
+    // The killed bridge registered its will at (7, will_seq(0)) long ago;
     // the kill fires it as its node row; the new bridge registers its own
     // will and publishes its live rows under ordinary sequences.
     let node = "/f/f1/pub/n-1/node/presence";
@@ -102,12 +102,14 @@ fn a_fired_will_is_named_by_the_key_its_registration_carried() {
         rec(12, node, "", None),
         rec(13, "/f/f1/pub/n-1/s-a/presence", "", None),
     ];
-    recs[0].producer = (7, 0xFFFF_FFFF);
-    recs[2].producer = (7, 0xFFFF_FFFF);
-    recs[3].producer = (7, (1 << 32) | 0xFFFF_FFFF);
+    // The will keys are astream's layout, never spelled out here.
+    let will = |inc| astream_broker::will_seq(inc).expect("in the layout");
+    recs[0].producer = (7, will(0));
+    recs[2].producer = (7, will(0));
+    recs[3].producer = (7, will(1));
     assert_eq!(will_firings(&recs), BTreeSet::from([10]));
     // A record under the key BEFORE any registration of it is not one.
-    recs[1].producer = (7, (1 << 32) | 0xFFFF_FFFF);
+    recs[1].producer = (7, will(1));
     assert_eq!(will_firings(&recs), BTreeSet::from([10]));
 }
 

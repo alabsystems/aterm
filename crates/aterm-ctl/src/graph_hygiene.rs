@@ -1,38 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What discovery (`instances` / `ls` / `windows`, and [`crate::fleet_sessions`])
-//! does NOT dial, and the one tidy-up it does on the way.
+//! What discovery (`instances` / `ls` / `windows`, and [`crate::fleet_sessions`]) does not
+//! dial, and the one tidy-up it does on the way. An orphaned private headless instance
+//! mirrors its graph entry into the rendezvous directory while its socket and token live
+//! elsewhere; dialing it every call would only be refused. Two rules, both on the client:
 //!
-//! WHY: an orphaned private headless instance mirrors its graph entry into
-//! the rendezvous directory while its socket and token live elsewhere, so
-//! every `aterm ctl ls` dialed it and was refused (a `DENIED` WARN in its log
-//! per call). Two rules, both on the client:
+//! 1. A graph entry whose hosting pid is dead is skipped without a connect and removed
+//!    ([`prune_dead_entry`], guarded so it never deletes an entry a live instance just
+//!    rewrote). A live pid that names a process younger than the entry ([`writer_gone`]) is
+//!    skipped too, so `instances` never describes a stranger that inherited the pid, but not
+//!    removed: that judgement rests on the wall clock, which can be stepped back under a live
+//!    writer.
+//! 2. An instance whose socket lives outside the rendezvous directory (a private
+//!    `--control-sock`) and has no readable token beside it is foreign
+//!    ([`foreign_token_miss`]): it is reported, never dialed.
 //!
-//! 1. **A graph entry whose hosting pid is dead is skipped without a connect**
-//!    and removed ([`prune_dead_entry`]): nothing can be serving it, and the
-//!    entry would otherwise be re-read on every call. The removal is the ONLY
-//!    act, and it is guarded so it can never delete an entry a live instance
-//!    just rewrote. A pid that is alive but names a process YOUNGER than the
-//!    entry ([`writer_gone`]) is skipped the same way — the writer died and its
-//!    pid was handed on (pids wrap here in about ten minutes), so a stale entry
-//!    would otherwise describe, and `instances` advise killing, a stranger — but
-//!    it is NOT removed: that judgement rests on the wall clock, which can be
-//!    stepped back under a live writer.
-//! 2. **An instance this client cannot authenticate to is FOREIGN**
-//!    ([`foreign_token_miss`]): its socket lives outside the rendezvous
-//!    directory (a private `--control-sock`) AND no token file beside it can be
-//!    read. The request could only be refused, so it is never sent; the
-//!    instance is reported as foreign (`instances` says so in one stderr line,
-//!    and a fleet with nothing else in it names it in the report) instead of
-//!    being dialed on every call.
-//!
-//! NEVER HIDDEN: an instance whose token this client CAN read is probed,
-//! wherever its socket lives, and every socket in the
-//! rendezvous directory itself is probed whatever its token says — a miss
-//! there is a problem with the owner's own instance, and the report names it.
-//! `--sock` / `--pid` still dial what they name: an explicit target is the
-//! caller's decision, not discovery's.
+//! An instance whose token this client can read is probed wherever its socket lives, and
+//! every socket in the rendezvous directory is probed whatever its token says: a miss there
+//! is the owner's own instance failing, and the report names it. `--sock` / `--pid` still
+//! dial what they name: an explicit target is the caller's decision.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -134,8 +121,8 @@ pub(crate) fn place_on_wall(
     })
 }
 
-/// Whether the LIVE process born at `birth` is the one that wrote a graph entry
-/// naming its pid, last written at `written`.
+/// Whether the live process born at `birth` wrote a graph entry naming its pid, last
+/// written at `written`.
 ///
 /// `Some(true)`: born no later than the write (`slack` aside, `WRITE_SLACK` or
 /// `PLACED_SLACK`). Alive now, it held that pid at the write, and no two
@@ -174,11 +161,10 @@ pub(crate) fn writer_gone(pid: u32, written: Option<SystemTime>) -> bool {
     )
 }
 
-/// A graph entry's body and when it was last written, from ONE open. The mtime
-/// is read AFTER the body, so it is never older than the write that produced
-/// the bytes read (a writer truncates and rewrites in place, so a rewrite in
-/// between only makes it newer, which can only keep an entry). `None` for the
-/// mtime where the filesystem keeps none.
+/// A graph entry's body and when it was last written, from one open. The mtime is read
+/// after the body, so it is never older than the write that produced the bytes (a rewrite
+/// in between only makes it newer, which can only keep an entry). `None` for the mtime
+/// where the filesystem keeps none.
 pub(crate) fn read_entry(path: &Path) -> std::io::Result<(String, Option<SystemTime>)> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
@@ -188,9 +174,8 @@ pub(crate) fn read_entry(path: &Path) -> std::io::Result<(String, Option<SystemT
     Ok((body, written))
 }
 
-/// Remove the graph entry at `entry`, whose body read `seen` and named a
-/// hosting pid whose writer is gone ([`writer_gone`]) — but only if it STILL
-/// says exactly that. Returns whether the entry was removed.
+/// Remove the graph entry at `entry`, whose body read `seen` and whose writer is gone
+/// ([`writer_gone`]), but only if it still says exactly that. Returns whether it was removed.
 ///
 /// The entry is renamed aside (atomic within the directory) and read back:
 ///
@@ -199,15 +184,14 @@ pub(crate) fn read_entry(path: &Path) -> std::io::Result<(String, Option<SystemT
 ///   successor republishing its session). It goes back under its name unless
 ///   a newer entry has landed there (`hard_link` refuses to replace one).
 ///
-/// A writer that opened the entry before the rename writes into the renamed
-/// file, so it no longer holds `seen` and is put back. Best-effort: a failed
-/// rename or read leaves everything as it was.
+/// A writer that opened the entry before the rename writes into the renamed file, so it no
+/// longer holds `seen` and is put back. A failed rename or read leaves everything as it was.
 pub(crate) fn prune_dead_entry(entry: &Path, seen: &str) -> bool {
     let (Some(dir), Some(name)) = (entry.parent(), entry.file_name()) else {
         return false;
     };
-    // A dot-name no graph reader takes for a sid (a sid is `s-<hex>`), unique
-    // to this process so two concurrent pruners cannot collide on it.
+    // A dot-name no graph reader takes for a sid (`s-<hex>`), unique to this process so
+    // two concurrent pruners cannot collide on it.
     let mut aside_name = std::ffi::OsString::from(".prune-");
     aside_name.push(name);
     aside_name.push(format!("-{}", std::process::id()));
@@ -236,7 +220,7 @@ pub(crate) fn foreign_token_miss(dir: &Path, sock: &str) -> Option<PathBuf> {
     crate::read_token_at(sock).err().map(|(path, _)| path)
 }
 
-/// Whether `sock`'s parent directory IS `dir`, through any symlinked ancestor
+/// Whether `sock`'s parent directory is `dir`, through any symlinked ancestor
 /// (macOS `/var` → `/private/var`). Canonical when both resolve, else lexical:
 /// a false "inside" only means the socket is probed as it always was.
 fn inside(dir: &Path, sock: &Path) -> bool {
@@ -286,9 +270,8 @@ mod tests {
         );
     }
 
-    /// The identity rule's edges: born before the write is the writer, born
-    /// inside the slack after it still is, a microsecond past the slack is not,
-    /// and a birth `SystemTime` cannot hold claims nothing.
+    /// [`is_entry_writer`]'s edges: before the write, inside the slack, a microsecond past it,
+    /// and a birth `SystemTime` cannot hold.
     #[test]
     fn a_writer_is_born_no_later_than_its_write_give_or_take_the_slack() {
         let written = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
@@ -398,9 +381,7 @@ mod tests {
         assert_eq!(read_birth(own, &kept), first, "one pairing, one instant");
     }
 
-    /// Only a socket OUTSIDE the directory with NO readable token is foreign:
-    /// an in-directory socket is the owner's own (its miss is reported, not
-    /// skipped), and an outside one whose token reads is reachable.
+    /// Only a socket outside the directory with no readable token is foreign.
     #[test]
     fn foreign_is_outside_and_tokenless_only() {
         let s = scratch();

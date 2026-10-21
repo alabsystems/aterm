@@ -1,7 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// THE RUNNING POLICY CHANGES IN ONE FN, AND THE COMPILER CHECKS THAT.
+// Seals on the running harness policy (`harness_policy_cell.rs`), checked by Trust against
+// every body of this crate (`Trust.Protocol.Seal`; trust `docs/USING_TRUST.md`, "A seal"):
+//   * a field of a cell, a stamp or a source changes only in the fn named as its writer, in
+//     that fn's own body, through its `&mut self`;
+//   * each is built only in the fn named as its maker, called only from the fns named after
+//     it (the watcher thread, the window's launch, and the tests that drive the real path);
+//   * no value holding the cell (the `App`) or the source is put over another, by an
+//     assignment in this crate or by a generic fn of another crate run at that type, except
+//     the fns the seal names as trusted;
+//   * no `unsafe impl` of another crate's non-auto trait stands in this crate unless each
+//     seal names the trait as trusted (`retained::ClassType`, which
+//     `aterm_objc::declare_class!` implements for the window's Objective-C classes). A Trust
+//     without that rule reads the entry as nothing.
+// Together: the policy the window runs changes only in `offer`, each change consumes one
+// stamp, and a stamp comes only from the watcher's read. Safe code only; no pointer analysis.
 //
 // harness_policy_cell.rs keeps the supervisor's policy in force in a struct of
 // its own (`HarnessPolicyCell`), changed only by `offer`, which takes a

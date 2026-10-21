@@ -9,9 +9,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use super::api::Api;
+use super::api::{Api, Catalog};
 use super::fetch;
-use super::formula::{Formula, bottle_tags, version_cmp};
+use super::formula::{Formula, Requirement, version_cmp};
+use super::machine::Machine;
 use super::prefix::{Installed, Kind, Prefix, symlink_dir, symlink_file};
 
 /// Homebrew keg versions include the formula revision.
@@ -23,7 +24,14 @@ pub(super) fn keg_version(f: &Formula) -> String {
     }
 }
 
-fn preflight(prefix: &Prefix, f: &Formula, opts: &InstallOpts) -> Result<(), InstallError> {
+/// One plan member's admission on `machine`: Ok(whether to link it), a
+/// PassThrough for a recipe that needs Homebrew, or a refusal.
+fn preflight(
+    prefix: &Prefix,
+    f: &Formula,
+    opts: &InstallOpts,
+    machine: &Machine,
+) -> Result<bool, InstallError> {
     let version = keg_version(f);
     if !super::valid_component(&f.name)
         || !super::valid_cask_version(&version)
@@ -33,6 +41,7 @@ fn preflight(prefix: &Prefix, f: &Formula, opts: &InstallOpts) -> Result<(), Ins
             "unsupported formula name/version".to_string(),
         ));
     }
+    let mut link = !f.keg_only;
     let mut same_keg_reinstall = false;
     if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name) {
         let older = version_cmp(&inst.version, &version) == std::cmp::Ordering::Less;
@@ -49,17 +58,19 @@ fn preflight(prefix: &Prefix, f: &Formula, opts: &InstallOpts) -> Result<(), Ins
             )));
         }
         if !admitted_replacement {
-            return Ok(());
+            return Ok(link);
+        }
+        // Resolve the complete old activation plan before a new bottle can pour.
+        // Keg-only metadata already forbids all activation links.
+        if !f.keg_only {
+            link = keg_was_linked(prefix, &f.name, &inst.version)?;
         }
         // An admitted replacement still needs the NEW bottle to qualify
         // natively; fall through to the checks below.
     }
-    let native = f
-        .bottle_for(&bottle_tags())
-        .is_some_and(|(tag, _, _)| f.native_bottle_tags.contains(tag));
-    if !native {
+    if let Err(needs) = f.native_bottle(&machine.bottle_tags()) {
         return Err(InstallError::PassThrough(format!(
-            "{} needs its Homebrew build/relocation recipe",
+            "{} needs its Homebrew build/relocation recipe ({needs})",
             f.name
         )));
     }
@@ -71,50 +82,39 @@ fn preflight(prefix: &Prefix, f: &Formula, opts: &InstallOpts) -> Result<(), Ins
             f.name
         )));
     }
-    if f.pour_requires_clt && !std::path::Path::new("/Library/Developer/CommandLineTools").is_dir()
-    {
+    if f.pour_requires_clt && !machine.has_clt() {
         return Err(InstallError::PassThrough(format!(
             "{} pours only with the Command Line Tools installed",
             f.name
         )));
     }
+    let at_least = |have: Option<&str>, floor: &Option<String>| {
+        have.is_some_and(|v| {
+            floor
+                .as_deref()
+                .is_none_or(|floor| version_cmp(v, floor) != std::cmp::Ordering::Less)
+        })
+    };
     for requirement in &f.requirements {
         let (met, what) = match requirement {
-            super::formula::Requirement::MacosMin(floor) => {
-                let met = super::formula::macos_version().is_some_and(|v| {
-                    floor
-                        .as_deref()
-                        .is_none_or(|floor| version_cmp(&v, floor) != std::cmp::Ordering::Less)
-                });
-                (met, "a newer macOS")
+            Requirement::MacosMin(floor) => {
+                (at_least(machine.macos_version(), floor), "a newer macOS")
             }
-            super::formula::Requirement::MacosMax(ceiling) => {
-                let met = super::formula::macos_version()
-                    .is_some_and(|v| version_cmp(&v, ceiling) != std::cmp::Ordering::Greater);
-                (met, "an older macOS")
-            }
-            super::formula::Requirement::Arch(want) => {
-                let here = match std::env::consts::ARCH {
-                    "aarch64" => "arm64",
-                    other => other,
-                };
-                (want == here, "another architecture")
-            }
-            super::formula::Requirement::XcodeMin(floor) => {
-                let met = super::formula::xcode_version().is_some_and(|v| {
-                    floor
-                        .as_deref()
-                        .is_none_or(|floor| version_cmp(&v, floor) != std::cmp::Ordering::Less)
-                });
-                (
-                    met,
-                    if floor.is_some() {
-                        "a newer Xcode"
-                    } else {
-                        "Xcode"
-                    },
-                )
-            }
+            Requirement::MacosMax(ceiling) => (
+                machine
+                    .macos_version()
+                    .is_some_and(|v| version_cmp(v, ceiling) != std::cmp::Ordering::Greater),
+                "an older macOS",
+            ),
+            Requirement::Arch(want) => (want == machine.arch(), "another architecture"),
+            Requirement::XcodeMin(floor) => (
+                at_least(machine.xcode_version(), floor),
+                if floor.is_some() {
+                    "a newer Xcode"
+                } else {
+                    "Xcode"
+                },
+            ),
         };
         if !met {
             return Err(InstallError::PassThrough(format!(
@@ -129,7 +129,7 @@ fn preflight(prefix: &Prefix, f: &Formula, opts: &InstallOpts) -> Result<(), Ins
             f.name
         )));
     }
-    Ok(())
+    Ok(link)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,7 +170,7 @@ pub struct InstallOpts {
 /// dependency not already installed, dependencies first. Cycles and
 /// disabled formulae are refusals naming the loop/package.
 pub fn plan(
-    api: &Api,
+    catalog: &dyn Catalog,
     prefix: &Prefix,
     name: &str,
     opts: &InstallOpts,
@@ -178,7 +178,7 @@ pub fn plan(
     dependency_plan(
         name,
         opts.ignore_dependencies,
-        |n| api.formula(n).map_err(InstallError::from),
+        |n| catalog.formula(n).map_err(InstallError::from),
         |n| prefix.installed_one(Kind::Formula, n).is_some(),
     )
 }
@@ -273,16 +273,33 @@ fn dependency_plan(
 /// dispatcher's pre-lock delegation check. A PassThrough here must
 /// delegate before the writer lock or prefix skeleton exists.
 pub(super) fn preflight_plan(
-    api: &Api,
+    catalog: &dyn Catalog,
     prefix: &Prefix,
     name: &str,
     opts: &InstallOpts,
 ) -> Result<(), InstallError> {
-    let planned = plan(api, prefix, name, opts)?;
-    for f in &planned {
-        preflight(prefix, f, opts)?;
+    preflight_refusals(catalog, prefix, name, opts)
+        .into_iter()
+        .next()
+        .map_or(Ok(()), Err)
+}
+
+/// Every refusal [`preflight_plan`] meets, in plan order (it reports the
+/// first): the walk's own, which ends the walk (a cycle, a disabled or
+/// unknown dependency), or each planned member's. Empty: admitted.
+pub(super) fn preflight_refusals(
+    catalog: &dyn Catalog,
+    prefix: &Prefix,
+    name: &str,
+    opts: &InstallOpts,
+) -> Vec<InstallError> {
+    match plan(catalog, prefix, name, opts) {
+        Err(walk) => vec![walk],
+        Ok(planned) => planned
+            .iter()
+            .filter_map(|f| preflight(prefix, f, opts, catalog.machine()).err())
+            .collect(),
     }
-    Ok(())
 }
 
 /// Install one formula (its plan first). Returns the installed version.
@@ -294,9 +311,10 @@ pub fn install(
 ) -> Result<String, InstallError> {
     let planned = plan(api, prefix, name, opts)?;
     // A later fallback must not replay an already installed dependency plan.
-    for f in &planned {
-        preflight(prefix, f, opts)?;
-    }
+    let link_states = planned
+        .iter()
+        .map(|f| preflight(prefix, f, opts, Machine::this()))
+        .collect::<Result<Vec<_>, _>>()?;
     // Capture the standing packages before any pour. Request uncertainty must
     // not become false, and rollback must never uninstall an earlier version.
     let prior = prior_requests(prefix, planned.iter().map(|f| f.name.as_str()))?;
@@ -306,7 +324,7 @@ pub fn install(
     let mut last = String::new();
     let mut installed_now: Vec<String> = Vec::new();
     let mut completed = false;
-    for f in &planned {
+    for (f, link) in planned.iter().zip(link_states) {
         let version = keg_version(f);
         let mut replacing = ReplaceMode::None;
         if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name) {
@@ -326,16 +344,29 @@ pub fn install(
         if opts.dry_run {
             println!("Would install {} {version}", f.name);
         } else {
-            let on_request = (!opts.as_dependency && f.name == Formula::short_name(name))
-                || prior.get(&f.name).copied().unwrap_or(false);
-            match install_one(prefix, f, on_request, replacing) {
+            // brew's upgrade/reinstall preserve the standing tab:
+            // request status and linkedness carry over to the new
+            // keg (a dependency stays a dependency, an unlinked keg
+            // stays unlinked). A plain install of the target is the
+            // only path that claims on-request.
+            let preserve = opts.upgrade || opts.reinstall;
+            let on_request = if preserve {
+                prior.get(&f.name).copied().unwrap_or(false)
+            } else {
+                (!opts.as_dependency && f.name == Formula::short_name(name))
+                    || prior.get(&f.name).copied().unwrap_or(false)
+            };
+            match install_one(prefix, f, on_request, link, replacing) {
                 Ok(()) => {
                     completed = true;
                     if !prior.contains_key(&f.name) {
                         installed_now.push(f.name.clone());
                     }
                     if !opts.quiet {
-                        println!("🍺  {}/{version}: installed", f.name);
+                        match super::install_badge() {
+                            Some(badge) => println!("{badge}  {}/{version}: installed", f.name),
+                            None => println!("{}/{version}: installed", f.name),
+                        }
                     }
                 }
                 Err(e) => {
@@ -365,7 +396,7 @@ pub fn install(
 /// evaluated (found live: an aterm session's PATH carries pkg/bin,
 /// not abrew's prefix bin).
 pub(super) fn note_bin_not_on_path(prefix: &Prefix, quiet: bool) {
-    if quiet {
+    if quiet || super::no_env_hints() {
         return;
     }
     let bin = prefix.bin();
@@ -460,10 +491,36 @@ enum ReplaceMode {
     SameKeg,
 }
 
+/// Read the same six-directory payload plan that activation would use, without
+/// its independent opt pointer. Only uniformly exact links or uniformly absent
+/// matches have a single state. Partial, empty and unreadable plans refuse.
+fn keg_was_linked(prefix: &Prefix, name: &str, version: &str) -> Result<bool, InstallError> {
+    let keg = prefix.keg(name, version);
+    let links = keg_link_plan(prefix, &keg)?;
+    let uncertain = || {
+        InstallError::Failed(format!(
+            "abrew: cannot preserve {name} {version} activation: links are partial or unreadable, or the payload has no activation files"
+        ))
+    };
+    let mut state = None;
+    for link in links {
+        if let Some(parent) = link.destination.parent() {
+            check_directory(parent, &prefix.root)?;
+        }
+        let linked = link_points_to(&link.destination, &link.source).ok_or_else(uncertain)?;
+        if state.is_some_and(|prior| prior != linked) {
+            return Err(uncertain());
+        }
+        state = Some(linked);
+    }
+    state.ok_or_else(uncertain)
+}
+
 fn install_one(
     prefix: &Prefix,
     f: &Formula,
     on_request: bool,
+    link: bool,
     replace: ReplaceMode,
 ) -> Result<(), InstallError> {
     let version = keg_version(f);
@@ -499,7 +556,7 @@ fn install_one(
         ],
     )?;
     let mut links = Vec::new();
-    if !f.keg_only {
+    if !f.keg_only && link {
         plan_links(&poured, &keg, &prefix.root, &mut links)?;
     }
     links.push(InstallLink {
@@ -886,6 +943,28 @@ fn ensure_directory(path: &Path) -> Result<(), InstallError> {
 /// Resolve a link lexically, without following a foreign chain on disk.
 pub(super) fn link_points_into(link: &Path, root: &Path) -> bool {
     std::fs::read_link(link).is_ok_and(|target| link_target_points_into(link, &target, root))
+}
+
+/// Whether a link names exactly the expected payload, without following a
+/// foreign chain. Missing names and non-links are negative; other read failures
+/// are unknown, rather than evidence that a command is unlinked.
+pub(super) fn link_points_to(link: &Path, expected: &Path) -> Option<bool> {
+    match std::fs::read_link(link) {
+        Ok(target) => Some(
+            resolved_link_target(link, &target)
+                .zip(normalize_link_path(expected))
+                .is_some_and(|(target, expected)| target == expected),
+        ),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Some(false)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Classify an already-read link target without a second filesystem lookup.
@@ -1424,13 +1503,13 @@ pub fn remove_dangling_links(prefix: &Prefix, name: &str) -> Result<usize, Strin
 
 /// Download, verify and safely extract a bottle into private staging.
 fn pour_bottle(prefix: &Prefix, f: &Formula, staging: &Path) -> Result<PathBuf, InstallError> {
-    let tags = bottle_tags();
-    let Some((_tag, url, sha)) = f.bottle_for(&tags).cloned() else {
+    let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
         return Err(InstallError::PassThrough(format!(
             "no bottle for {} on this platform",
             f.name
         )));
     };
+    let (url, sha) = (bottle.url, bottle.sha256);
     let version = keg_version(f);
     let dest = prefix
         .cache()
@@ -1562,13 +1641,13 @@ pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<(), InstallError> {
         ));
     }
     prefix.ensure()?;
-    let tags = bottle_tags();
-    let Some((_t, url, sha)) = f.bottle_for(&tags).cloned() else {
+    let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
         return Err(InstallError::PassThrough(format!(
             "no bottle for {} on this platform; fetch -s for source",
             f.name
         )));
     };
+    let (url, sha) = (bottle.url, bottle.sha256);
     let dest = prefix
         .cache()
         .join(format!("{}-{}.bottle.tar.gz", f.name, keg_version(f)));
@@ -1712,6 +1791,142 @@ mod tests {
                 |_| false
             ),
             Err(InstallError::Failed("captured read failure".into()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keg_was_linked_judges_resolving_bin_links() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let p = Prefix::at(&tmp.path().join("prefix"));
+        p.ensure().unwrap();
+        let make = |name: &str, files: &[&str]| {
+            let keg = p.keg(name, "1.0");
+            std::fs::create_dir_all(&keg).unwrap();
+            for file in files {
+                let path = keg.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"owned payload").unwrap();
+            }
+            p.write_receipt(
+                &keg,
+                &[
+                    ("name", name),
+                    ("version", "1.0"),
+                    ("installed_by", "abrew"),
+                ],
+            )
+            .unwrap();
+            // The independent opt pointer is present even when every activation link is absent.
+            symlink_dir(&keg, &p.opt(name)).unwrap();
+            keg
+        };
+        let keg = make("demo", &["bin/tool"]);
+        let dest = p.bin().join("tool");
+        assert_eq!(keg_was_linked(&p, "demo", "1.0"), Ok(false));
+        link_keg(&p, &keg, false).unwrap();
+        assert_eq!(keg_was_linked(&p, "demo", "1.0"), Ok(true));
+        std::fs::remove_file(&dest).unwrap();
+        symlink_file(Path::new("../Cellar/demo/1.0/bin/tool"), &dest).unwrap();
+        assert_eq!(keg_was_linked(&p, "demo", "1.0"), Ok(true));
+        std::fs::remove_file(&dest).unwrap();
+        // Merely pointing somewhere inside the keg is not this payload link.
+        symlink_file(&keg.join("bin/other"), &dest).unwrap();
+        assert_eq!(keg_was_linked(&p, "demo", "1.0"), Ok(false));
+        std::fs::remove_file(&dest).unwrap();
+        std::fs::write(&dest, b"foreign regular").unwrap();
+        assert_eq!(keg_was_linked(&p, "demo", "1.0"), Ok(false));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"foreign regular");
+        std::fs::remove_file(&dest).unwrap();
+        // opt survives unlink; it must not make a uniformly unlinked plan positive.
+        assert!(p.opt("demo").symlink_metadata().is_ok());
+        assert_eq!(keg_was_linked(&p, "demo", "1.0"), Ok(false));
+
+        let library = make("libdemo", &["lib/libdemo.a", "include/libdemo.h"]);
+        assert_eq!(keg_was_linked(&p, "libdemo", "1.0"), Ok(false));
+        link_keg(&p, &library, false).unwrap();
+        assert_eq!(keg_was_linked(&p, "libdemo", "1.0"), Ok(true));
+        std::fs::remove_file(p.root.join("lib/libdemo.a")).unwrap();
+        assert!(matches!(
+            keg_was_linked(&p, "libdemo", "1.0"),
+            Err(InstallError::Failed(_))
+        ));
+        let next = Formula {
+            name: "libdemo".into(),
+            full_name: "libdemo".into(),
+            version: "2.0".into(),
+            ..Formula::default()
+        };
+        // No bottle exists in this captured record: reaching bottle selection would
+        // PassThrough. Partial activation must instead fail in the earlier preflight.
+        assert!(matches!(
+            preflight(
+                &p,
+                &next,
+                &InstallOpts {
+                    upgrade: true,
+                    ..InstallOpts::default()
+                },
+                Machine::this(),
+            ),
+            Err(InstallError::Failed(_))
+        ));
+        assert_eq!(
+            std::fs::read(library.join("lib/libdemo.a")).unwrap(),
+            b"owned payload"
+        );
+        assert!(!p.keg("libdemo", "2.0").exists());
+        unlink_keg(&p, "libdemo").unwrap();
+        assert_eq!(keg_was_linked(&p, "libdemo", "1.0"), Ok(false));
+        assert!(p.opt("libdemo").symlink_metadata().is_ok());
+
+        let layout = make(
+            "layout",
+            &[
+                "bin/layout-tool",
+                "sbin/layout-admin",
+                "lib/layout.a",
+                "include/layout.h",
+                "share/doc/layout/readme",
+                "etc/layout.conf",
+            ],
+        );
+        assert_eq!(keg_was_linked(&p, "layout", "1.0"), Ok(false));
+        link_keg(&p, &layout, false).unwrap();
+        assert_eq!(keg_was_linked(&p, "layout", "1.0"), Ok(true));
+        unlink_keg(&p, "layout").unwrap();
+        assert_eq!(keg_was_linked(&p, "layout", "1.0"), Ok(false));
+
+        // No activation files and a roster that cannot be read are uncertain.
+        make("empty", &[]);
+        assert!(matches!(
+            keg_was_linked(&p, "empty", "1.0"),
+            Err(InstallError::Failed(_))
+        ));
+        let bad = make("bad", &[]);
+        std::fs::write(bad.join("bin"), b"not a directory").unwrap();
+        assert!(matches!(
+            keg_was_linked(&p, "bad", "1.0"),
+            Err(InstallError::Failed(_))
+        ));
+        assert_eq!(std::fs::read(bad.join("bin")).unwrap(), b"not a directory");
+        // A directory alias is not authority to inspect activation through its target.
+        let nested = make("nested", &["share/guarded/file"]);
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file"), b"outside retained").unwrap();
+        symlink_dir(&outside, &p.root.join("share/guarded")).unwrap();
+        assert!(matches!(
+            keg_was_linked(&p, "nested", "1.0"),
+            Err(InstallError::Failed(_))
+        ));
+        assert_eq!(
+            std::fs::read(outside.join("file")).unwrap(),
+            b"outside retained"
+        );
+        assert_eq!(
+            std::fs::read(nested.join("share/guarded/file")).unwrap(),
+            b"owned payload"
         );
     }
 

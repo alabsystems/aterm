@@ -3,15 +3,10 @@
 
 //! Rendering a document back to text.
 //!
-//! For a document that came from a parse and was not modified, this is exactly
-//! `concat` over the stored source fragments — every byte of the input landed
-//! in some node's repr, decor, preamble, or trailing, or is the leading
-//! byte-order mark the document records, so putting them back in order
-//! reproduces the file. That is the property `tests/roundtrip.rs` asserts over
-//! every `.toml` file in the repository.
-//!
-//! Nodes that were BUILT rather than parsed have no stored text, and fall back
-//! to the canonical spacing named in the `DEFAULT_*` constants below.
+//! For a parsed, unmodified document this is `concat` over the stored source fragments:
+//! every input byte landed in some node's repr, decor, preamble or trailing, or is the
+//! byte-order mark the document records. `tests/roundtrip.rs` asserts it over every `.toml`
+//! file in the repository. Built nodes have no stored text and use the `DEFAULT_*` spacing.
 
 use core::fmt::{self, Write as _};
 
@@ -43,9 +38,8 @@ impl fmt::Display for DocumentMut {
 }
 
 impl fmt::Display for Table {
-    /// Renders the table's CONTENTS — its key-value lines and the sub-tables
-    /// beneath it — without a header of its own, because a `Table` on its own
-    /// does not know the path it would be headed by.
+    /// The table's contents (its key-value lines and the sub-tables beneath it), with no
+    /// header: a `Table` does not know its own path.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::new();
         encode_document(&mut out, self, "");
@@ -75,8 +69,8 @@ impl fmt::Display for Item {
 }
 
 impl fmt::Display for Value {
-    /// The value ALONE — its own decor (which, for a top-level assignment,
-    /// carries the line's trailing comment and newline) is not part of it.
+    /// The value alone, without its decor (which, on a key-value line, carries the line's
+    /// trailing comment and newline).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::new();
         encode_value_body(&mut out, self);
@@ -112,9 +106,8 @@ fn encode_document(out: &mut String, root: &Table, trailing: &str) {
         }
         tables.push((last_position, table, path.to_vec(), is_array));
     });
-    // Stable, so tables sharing an inherited position keep their document
-    // order; the sort is what lets `[a.b]` appear before `[a]` in the source
-    // and come back out that way.
+    // Stable, so tables sharing an inherited position keep document order; the sort is
+    // what prints `[a.b]` written before `[a]` back in that order.
     tables.sort_by_key(|(position, ..)| *position);
 
     for (_, table, table_path, is_array) in tables {
@@ -125,13 +118,9 @@ fn encode_document(out: &mut String, root: &Table, trailing: &str) {
 
 /// Depth-first walk over the header-bearing tables under `table`.
 ///
-/// A dotted table is not VISITED — it is printed on its parent's key-value
-/// lines, not under a header of its own — but it is still DESCENDED INTO. The
-/// spec lets a `[header]` add a sub-table beneath a dotted key
-/// (`apple.color = "red"` then `[fruit.apple.texture]`, the spec's own worked
-/// example), so a header-bearing table can hang under a dotted parent. Skipping
-/// the subtree dropped those tables from the rendered document silently, which
-/// is a round-trip that loses data rather than one that reorders it.
+/// A dotted table is not visited (its lines print among its parent's) but is descended
+/// into: a `[header]` may add a sub-table beneath a dotted key (`apple.color = "red"` then
+/// `[fruit.apple.texture]`), and skipping the subtree would drop it.
 fn visit_nested_tables<'t>(
     table: &'t Table,
     path: &mut Vec<&'t Key>,
@@ -197,18 +186,11 @@ fn encode_table(out: &mut String, table: &Table, path: &[&Key], is_array: bool) 
     }
 }
 
-/// Terminate the line `out` ends on, if it is unterminated, so the next header
-/// or key-value line starts a line of its own.
-///
-/// The parser stores each line's terminator in the decor after the line's last
-/// token, so a file's final line, when the file ends without a newline, carries
-/// none: its suffix is `""` or ` # comment`. In a parsed, unmodified document
-/// nothing is printed after that line and this never fires. A line ADDED after
-/// it (a new key in the last table, a new table) would otherwise be glued on:
-/// `a = 1` + `b` printed `a = 1b = 2`, which does not parse, and
-/// `a = 1 # note` + `b` printed `a = 1 # noteb = 2`, which parses with `b`
-/// inside the comment. Only the header-and-key-value lines of a table come
-/// through here: the entries of an inline table share one line by definition.
+/// Terminate the line `out` ends on, if it is unterminated, so the next header or key-value
+/// line starts a line of its own. A file's final line has no terminator when the file ends
+/// without one (its suffix is `""` or ` # comment`), and a line added after it would
+/// otherwise be glued on: `a = 1b = 2`, or `a = 1 # noteb = 2` with `b` inside the comment.
+/// Inline-table entries never come through here; they share one line.
 fn end_line(out: &mut String) {
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');

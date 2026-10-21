@@ -5,7 +5,7 @@
 // under them (crates/aterm-spec-anchor/anchor_rules.rs).
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
-//! Resource sandbox for spawned children (ATERM_DESIGN WS-G).
+//! Resource sandbox for spawned children.
 //!
 //! Confines the child `$SHELL` with POSIX `setrlimit` bounds, applied in the
 //! child after `fork` and before `exec` so the shell and everything it runs
@@ -19,8 +19,6 @@
 //! `src/unix.rs` is the `setrlimit` loop. On Windows [`Limits::apply`] is a
 //! cap-gated no-op and `Limits::apply_to_job` is the Job Object lane, which
 //! `aterm-pty`'s ConPTY seam calls on the suspended child's job.
-//!
-//! STATUS (§0.1): tested (limits are read back); not yet Trust-proven.
 
 use std::io;
 
@@ -59,7 +57,7 @@ pub struct Limits {
     /// hostile child cannot act through the shared window station. `false`
     /// (the daily-driver default) leaves UI access unrestricted.
     pub restrict_ui: bool,
-    /// POSIX: whether each value also becomes the HARD limit, so the program
+    /// POSIX: whether each value also becomes the hard limit, so the program
     /// cannot raise it back (an unprivileged process can lower its hard limit
     /// but never raise it). `false` keeps the inherited hard ceiling, so a soft
     /// limit stays a guardrail the `$SHELL`'s rc can raise (`ulimit -n 65536`).
@@ -73,16 +71,11 @@ impl Limits {
     /// file size stay unbounded (a shell legitimately runs long and writes large
     /// files).
     ///
-    /// On POSIX these are SOFT limits under the inherited hard ceiling: a
-    /// guardrail against a runaway program, which the program, or the person's
-    /// rc, can raise. Decided 2026-10-10 (P1 of the r13 policy hunt): Safety's
-    /// program is not hostile, and a common rc line raises the descriptor limit
-    /// past 8192 (`ulimit -n 10240` or `65536`). Measured on macOS 26.6 under a
-    /// hard ceiling of 8192: zsh prints `ulimit: value exceeds hard limit`,
-    /// bash and sh `cannot modify limit: Operation not permitted`, at every
-    /// shell start, and the shell stays at 8192; under the kept ceiling all
-    /// three raise it. A per-process ceiling would not bound a program that
-    /// forks anyway (POSIX has no process cap here). The hostile mode's set is
+    /// On POSIX these are soft limits under the inherited hard ceiling: a
+    /// guardrail against a runaway program that the program or shell rc can
+    /// raise (`ulimit -n 10240` or `65536`) without `ulimit` errors at shell
+    /// startup. A per-process ceiling would not bound a program that forks
+    /// anyway (POSIX has no process cap here). The hostile mode's set is
     /// [`Self::contained`]. On Windows the Job Object binds them.
     #[must_use]
     // #[inline] so the MIR crosses the crate boundary and callers' Trust gates
@@ -92,11 +85,9 @@ impl Limits {
         Limits {
             cpu_seconds: None,
             // macOS refuses (`EINVAL`) any `RLIMIT_AS` below the process's
-            // CURRENT mapped size, and an arm64 process already maps ~415 GiB
-            // before it runs a line (measured 2026-09-23, macOS 26.6: python3
-            // and zsh alike), so the 16 GiB cap below cannot be expressed
-            // there, and a value large enough to be accepted bounds nothing
-            // real.
+            // current mapped size (~415 GiB on arm64 before running user code),
+            // so a 16 GiB cap cannot be expressed there and a value large
+            // enough to be accepted bounds nothing real.
             address_space: if cfg!(target_os = "macos") {
                 None
             } else {
@@ -114,17 +105,13 @@ impl Limits {
     }
 
     /// The Containment-mode set: [`Self::shell_default`]'s values, installed
-    /// as hard limits too, so the contained program cannot raise them back.
+    /// as hard limits too, so a hostile contained program cannot raise them
+    /// back with `ulimit -n`.
     ///
-    /// RULING 2026-10-10 (P1 of the r13 policy hunt): Containment holds a
-    /// hostile program, so its limits bind. Until this ruling they went in
-    /// soft under the inherited hard ceiling (unlimited for `RLIMIT_NOFILE` on
-    /// macOS), and one `ulimit -n` by the contained program lifted them. The
-    /// cost, accepted: a contained shell whose rc raises the descriptor limit
-    /// past 8192 prints the shell's refusal at every start and keeps 8192
-    /// (measured, see [`Self::shell_default`]). What binds is per process:
-    /// POSIX sets no process cap here, so a program that forks holds 8192
-    /// descriptors in each child.
+    /// What binds on POSIX is per process: there is no process cap here, so a
+    /// program that forks holds 8192 descriptors in each child, and a shell rc
+    /// that tries to raise the descriptor limit past 8192 is refused and keeps
+    /// 8192.
     #[must_use]
     #[inline]
     pub fn contained() -> Self {
@@ -136,7 +123,7 @@ impl Limits {
 
     /// The daily-driver limits (User mode): every limit `None`, so the shell
     /// inherits the login shell's `rlimit`s unchanged. No `RLIMIT_AS` in
-    /// particular: it caps VIRTUAL address space, which CUDA/ML runtimes, the JVM,
+    /// particular: it caps virtual address space, which CUDA/ML runtimes, the JVM,
     /// Go and the sanitizers reserve far beyond resident use, so any finite cap
     /// breaks real programs while bounding nothing. This mode confines through
     /// the capability gate; [`Self::shell_default`] is the hardened opt-in.
@@ -145,7 +132,7 @@ impl Limits {
         Limits::default()
     }
 
-    /// Apply these limits to the CURRENT process. Call in the child, after
+    /// Apply these limits to the current process. Call in the child, after
     /// `fork`, before `exec`. Requires a `Trusted`+ [`Cap<Sandbox>`].
     ///
     /// The cap gate hard-fails; the `setrlimit` calls are best-effort: every
@@ -154,8 +141,7 @@ impl Limits {
     /// after all were tried.
     ///
     /// An `Err` means confinement did not fully install and the caller must fail
-    /// closed: `aterm-pty`'s child `_exit(126)`s before `execve` (ATERM_DESIGN
-    /// §5.6, exit-before-exec).
+    /// closed: `aterm-pty`'s child `_exit(126)`s before `execve`.
     ///
     /// # Errors
     /// `PermissionDenied` if the capability tier is too low; otherwise the first
@@ -166,9 +152,9 @@ impl Limits {
     /// guarantees. No Tier-1 binding: the loop runs post-fork and may not
     /// allocate; `unsupported_limit_does_not_block_the_working_ones` reads the
     /// limit back instead.
-    // PROJECTION (TRUST_VACUITY_GATE §2.2): the L2 obligation needs only the
-    // projection NAME (Trust does not execute it) onto the model's
-    // `<<applied, done>>` in the configuration `<<Req, Sup>>` the host is.
+    // PROJECTION: the L2 obligation needs only the projection name (Trust does
+    // not execute it) onto the model's `<<applied, done>>` in the host's
+    // configuration `<<Req, Sup>>`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -186,7 +172,7 @@ impl Limits {
     /// Apply these limits to the Job Object of a still-suspended ConPTY child, so
     /// the kernel enforces them on it and its descendants: the Windows analog of
     /// [`Self::apply`] (Windows has no pre-exec `fork` seam). Requires a
-    /// `Trusted`+ [`Cap<Sandbox>`] (SEC-2).
+    /// `Trusted`+ [`Cap<Sandbox>`].
     ///
     /// Query-modify-write: `LimitFlags` already on the job (`KILL_ON_JOB_CLOSE`)
     /// are kept. Memory, CPU time, the active-process cap and
@@ -196,7 +182,7 @@ impl Limits {
     /// # Errors
     /// `PermissionDenied` if the capability tier is too low; otherwise the first
     /// Job Object OS error; the caller must fail closed (terminate the
-    /// never-resumed child, ATERM_DESIGN §5.6).
+    /// never-resumed child).
     #[cfg(windows)]
     pub fn apply_to_job(
         &self,
@@ -439,9 +425,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
-    // Windows: `apply` is a capability-gated NO-OP — the fail-closed gate still
-    // denies a weak cap (SEC-2 parity with the Unix child's exit-before-exec), and a
-    // Trusted cap succeeds without installing any limit.
+    // Windows: `apply` is a capability-gated no-op — the fail-closed gate still
+    // denies a weak cap, and a Trusted cap succeeds without installing any limit.
     #[cfg(windows)]
     #[test]
     fn windows_apply_is_a_capgated_noop() {
@@ -595,11 +580,9 @@ mod tests {
         libc::WEXITSTATUS(status)
     }
 
-    /// RULING 2026-10-10 (P1 of the r13 policy hunt): a child that installed
-    /// [`Limits::contained`] cannot raise its descriptor limit back, as
-    /// `ulimit -n` would (soft and hard to one more than the cap); one that
-    /// installed [`Limits::shell_default`] can, which is what makes the first
-    /// refusal mean something.
+    /// A child that installed [`Limits::contained`] cannot raise its descriptor
+    /// limit back (`ulimit -n`), while one that installed [`Limits::shell_default`]
+    /// can.
     #[cfg(unix)]
     #[test]
     fn a_contained_limit_cannot_be_raised_back() {

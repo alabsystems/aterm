@@ -13,22 +13,14 @@
 //! A row without an id is summed (over-count never hides cost), sidechain rows
 //! are real spend, and `usd` is `null`: nothing here knows what a model
 //! costs. A caller that priced a row says so in it ([`SpendView::usd`]: the
-//! Codex path of `harness usage`, priced by `spend`). Bounds:
+//! Codex path of `harness usage`, priced by `spend`).
 //!
-//! | bound | value | why |
-//! |---|---|---|
-//! | [`MAX_LINE_BYTES`] | 16 MiB | a longer row is skipped and counted, never buffered |
-//! | [`SEEN_IDS_MAX`] | 4096 | ids are remembered in arrival order, oldest forgotten past this; repeats arrive within a few rows |
-//! | [`MAX_ID_BYTES`] | 128 | a longer `message.id` is treated as absent (summed, not deduped) so a hostile id cannot fill the set |
-//! | [`MAX_MODELS`] | 64 | further distinct model ids fold into `"(other)"` |
-//!
-//! The per-account rate-limit windows are filled only from the usage tap's
-//! reading for the session's own process ([`AccountView::windows`],
-//! [`super::tap`]), its caller's to read; without one they stay unknown
-//! (`"windows":{}`, `?%` in the HUD), and `harness limits` prints a painted
-//! panel's ([`usage_panel_windows`]). The fold also feeds the window
-//! footer's `Σ` tokens and limit wall ([`LimitNoticeRow`]) through
-//! [`super::session_usage`].
+//! The rate-limit windows come only from the usage tap's reading for the
+//! session's own process ([`AccountView::windows`], [`super::tap`]); without
+//! one they stay unknown (`"windows":{}`, `?%` in the HUD). `harness limits`
+//! prints a painted panel's instead ([`usage_panel_windows`]). The fold also
+//! feeds the window footer's `Σ` tokens and limit wall ([`LimitNoticeRow`])
+//! through [`super::session_usage`].
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -48,7 +40,8 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// summed again. Repeats arrive within a few rows of each other.
 pub const SEEN_IDS_MAX: usize = 4096;
 
-/// A `message.id` longer than this is treated as absent. Real ids are `msg_…`
+/// A `message.id` longer than this is treated as absent (summed, not
+/// deduped), so a hostile id cannot fill the dedupe set. Real ids are `msg_…`
 /// strings of a few dozen bytes.
 pub const MAX_ID_BYTES: usize = 128;
 
@@ -348,31 +341,23 @@ pub struct TranscriptUsage {
     busy: BusySpans,
 }
 
-/// The time Claude was WORKING in one transcript: the union of its main
-/// chain's turns, each `[timestamp − durationMs, timestamp]` of a
-/// `{"type":"system","subtype":"turn_duration"}` row (MEASURED: Claude Code
-/// writes one at every turn's end — 2.1.282, .283, .284 and .286 on this
-/// box). The UNION, not the sum: a turn that waited on a workflow's
-/// subagents is written when they finish, so it can overlap the turns after
-/// it (the sum read 8.04h against a union of 7.88h in one measured session,
-/// 19.27h against 18.77h in another); the first-to-last span is mostly idle
-/// (32.3h and 31.8h for the same two).
+/// The time Claude was working in one transcript: the union of its main
+/// chain's turns, each `[timestamp − durationMs, timestamp]` of the
+/// `{"type":"system","subtype":"turn_duration"}` row Claude Code writes at
+/// every turn's end. The union, not the sum: a turn that waited on a
+/// workflow's subagents is written when they finish, so it can overlap the
+/// turns after it; the first-to-last span is mostly idle.
 ///
 /// Held as disjoint spans in time order with their running sum: a new turn
 /// merges with the spans it overlaps, which are at the back in a transcript
-/// written in time order, so a row costs O(1) amortised. At most
-/// [`BUSY_SPANS_MAX`] spans are kept; past it the oldest leaves the deque
-/// (its time stays in the sum), and a later turn reaching back over a span
-/// that left counts that overlap twice — the stated bound, far past any
-/// measured session (a span per turn; 528 turns in the 150 newest
-/// transcripts here).
+/// written in time order, so a row costs O(1) amortised. Past
+/// [`BUSY_SPANS_MAX`] spans the oldest leaves the deque (its time stays in the
+/// sum), and a later turn reaching back over it counts that overlap twice —
+/// the stated bound, far past a real session's turn count.
 ///
-/// What it does NOT count, MEASURED in the 2.1.286 bundle: a turn the person
-/// interrupts (Esc) writes no row (`if (… && !signal.aborted)` guards the
-/// append), and neither does a turn in flight when the process ends (a
-/// relaunch, a crash) — that time is lost, an undercount. A turn still
-/// running is not counted until it ends: the figure never goes down, and
-/// Claude's own spinner times the turn in flight.
+/// Not counted: a turn the person interrupts (Esc) and one in flight when the
+/// process ends write no row, so that time is lost (an undercount). A running
+/// turn counts once it ends, so the figure never goes down.
 #[derive(Debug, Clone, Default)]
 struct BusySpans {
     /// Disjoint `[start, end)` spans in unix milliseconds, in time order.
@@ -412,7 +397,7 @@ impl BusySpans {
 /// row with `isApiErrorMessage: true` and `error: rate_limit` whose text is
 /// the notice (`You've hit your session limit · resets 3pm (…)`), stamped with
 /// the row's own `timestamp` (the login wall's row shape,
-/// `upgrade::transcript_login_wall`). A rejected rate limit becomes such a row;
+/// `upgrade::transcript_login_wall`). A rejected rate limit writes such a row;
 /// the usage warning is UI-only. The row's time survives re-rendering, so the
 /// reset is placed from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,9 +418,8 @@ pub(crate) fn row_time(obj: &Map) -> Option<i64> {
         .and_then(|t| i64::try_from(t).ok())
 }
 
-/// Unix MILLISECONDS of a transcript row's own `timestamp`: [`row_time`]
-/// plus its fraction's first three digits (Claude Code stamps
-/// `2026-09-29T15:11:53.390Z`).
+/// Unix milliseconds of a transcript row's own `timestamp`: [`row_time`]
+/// plus its fraction's first three digits (`YYYY-MM-DDTHH:MM:SS.sssZ`).
 fn row_time_ms(obj: &Map) -> Option<i64> {
     let stamp = obj.get("timestamp").and_then(Value::as_str)?;
     let secs = row_time(obj)?;
@@ -453,12 +437,11 @@ fn row_time_ms(obj: &Map) -> Option<i64> {
     secs.checked_mul(1000)?.checked_add(millis)
 }
 
-/// The window a limit notice's text NAMES, reached: `session limit` /
-/// `5-hour limit` is `five_hour`, a weekly one `seven_day`; `None` for a
-/// notice that names none (`You've hit your limit` — the vendor prints it
-/// for a weekly wall too, MEASURED in the 2.1.278 bundle), and for any other
-/// wall. Which wall it is at all is `aterm_phase::classify_wall`'s answer,
-/// the screen reader's.
+/// The window a limit notice's text names: `session limit` / `5-hour limit`
+/// is `five_hour`, a weekly one `seven_day`. `None` for a notice that names
+/// none (`You've hit your limit`, which the vendor also prints for a weekly
+/// wall) and for any other wall. Which wall it is at all is
+/// `aterm_phase::classify_wall`'s answer.
 #[must_use]
 pub fn notice_window(message: &str) -> Option<&'static str> {
     let head = message.replace('\u{2019}', "'").to_ascii_lowercase();
@@ -830,7 +813,9 @@ pub struct WindowView {
     pub used_pct: u32,
     /// `resets_at`, Unix seconds.
     pub resets_at: i64,
-    /// Seconds since the tap wrote it, at the view's `as_of`.
+    /// Seconds since its figures were first reported since its process was
+    /// last served ([`super::tap::Reading::at`]), at the view's `as_of`: the
+    /// figure's age, not the file's.
     pub age_s: u64,
 }
 
@@ -1012,7 +997,7 @@ fn reset_after(s: &str) -> Option<String> {
 }
 
 /// Lowercase, non-alphanumeric runs folded to `_`, bounded: the key half of
-/// an UNMEASURED `Current week (<display name>)` title.
+/// an unknown `Current week (<display name>)` title.
 fn panel_key_slug(display: &str) -> Option<String> {
     let mut out = String::new();
     for c in display.chars() {
@@ -1137,18 +1122,13 @@ pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
 }
 
 // ---------------------------------------------------------------------------
-// The accounts probe's read of the panel (`docs/SPEC-claude-accounts-probe-
-// 2026-10-01.md`, P10, P22)
+// The accounts probe's read of the panel (P10, P22)
 // ---------------------------------------------------------------------------
 
-/// The command the accounts probe types to open the panel. READ in the
-/// 2.1.287 bundle: `usage` is a `local-jsx` command and `immediate`, and it
-/// shares its prefix with a second command, `usage-credits`. MEASURED on
-/// 2.1.287, 2026-10-01 (the probe's live check, a private headless aterm):
-/// with these six bytes typed the typeahead lists `/usage` first and
-/// `/usage-credits` under it, and Enter opened the Settings panel on its
-/// Usage tab in every run captured (five grids and the inline renderer).
-/// One build, one login: a later build's typeahead order is its own.
+/// The command the accounts probe types to open the panel. `usage` is an
+/// `immediate` `local-jsx` command sharing its prefix with `usage-credits`; on
+/// 2.1.287 the typeahead lists `/usage` first and Enter opens the Settings
+/// panel on its Usage tab. A later build's typeahead order is its own.
 pub const USAGE_COMMAND: &str = "/usage";
 
 /// What one read of the rows under the Settings panel's header says of the
@@ -1171,9 +1151,9 @@ pub enum PanelRead {
     Settled(Vec<PanelWindow>),
 }
 
-/// THE SETTLED RULE: what `rows` say of the Usage tab, read from the row
-/// under `header` (the Settings panel's header row,
-/// `aterm_phase::settings_panel`) to the end. First match wins:
+/// What `rows` say of the Usage tab, read from the row under `header` (the
+/// Settings panel's header row, `aterm_phase::settings_panel`) to the end.
+/// First match wins:
 ///
 /// 1. no row only the Usage tab draws (`aterm_phase::usage_tab_mark`: the
 ///    session block's `Total cost:`, a `Current session` title, the loading
@@ -1188,30 +1168,19 @@ pub enum PanelRead {
 /// 4. that tail with either window missing → [`PanelRead::Unsettled`];
 /// 5. otherwise → [`PanelRead::Fold`].
 ///
-/// WHY THE TAIL. The tab opens on the home's last-known figures with
-/// `Refreshing…` drawn BELOW the windows — after the credit block, the
-/// "contributing" block and usage credits — and the hint row is drawn last
-/// (READ in the 2.1.287 bundle, and MEASURED on it 2026-10-01: a quarter
-/// second after the Enter the week read 9 % with `Refreshing…` above the
-/// hint, and 10 % a quarter second later). Where the tail is under the fold
-/// the refresh line may be too, and figures read there may be the ones
-/// about to be replaced. So no tail, no sample.
+/// Why the tail: the tab opens on last-known figures with `Refreshing…` drawn
+/// below the windows, and the hint row is drawn last. Where the tail is under
+/// the fold the refresh line may be too, and the visible figures may be about
+/// to be replaced, so no tail, no sample. The cost: the whole tab is on the
+/// grid only until its contributing block (`Scanning local sessions…`) fills
+/// in and pushes the hint under the fold — 1.0–2.4 s at 60x50 to 150x50, never
+/// at 110x32, always at 150x80 — so a caller that waits before its first read
+/// can record nothing.
 ///
-/// WHAT THAT COSTS, MEASURED. On a 150x50 grid the whole tab is on the grid
-/// only while its contributing block still says `Scanning local sessions…`
-/// — for 1.5 s in one run and 2.4 s in another — and then that block fills
-/// in and pushes the hint under the fold (the last row then ends in the
-/// vendor's `↓`): the read is `Settled` for that long and `Fold` from then
-/// on. At 129x47 (1.2 s) and 60x50 (1.0 s) the same; at 110x32 it is `Fold`
-/// from the first read; at 150x80 it stays `Settled`. A caller that waits
-/// before its first read can miss the window on an ordinary pane and
-/// record nothing.
-///
-/// PURE, and one read's verdict only: a caller that records a sample asks
-/// for two consecutive equal `Settled` reads (the spec's P10). The rows are
-/// DATA: nothing in them is obeyed, and a copy of a panel a worker quoted is
-/// refused where the panel is placed (`aterm_phase::settings_panel`), not
-/// here — this function trusts `header` and reads down from it.
+/// Pure, and one read's verdict only: a caller that records a sample asks for
+/// two consecutive equal `Settled` reads (the spec's P10). The rows are data;
+/// a quoted copy of a panel is refused where the panel is placed
+/// (`aterm_phase::settings_panel`), and this trusts `header`.
 #[must_use]
 pub fn usage_panel_read(rows: &[String], header: usize) -> PanelRead {
     let under = rows.get(header.saturating_add(1)..).unwrap_or_default();
@@ -1249,21 +1218,17 @@ const WEEK_WINDOW: &str = "seven_day";
 /// (`by` is `note_sample`'s to stamp). `None` when neither figure was read —
 /// a figure nobody read is never `0`.
 ///
-/// EACH RESET IS PLACED ON THE CLOCK by the supervisor's own grammar, as
-/// `harness limits` places them ([`super::cli::limits_view`]):
-/// `limit::parse_reset` on the text the vendor painted, then
-/// `limit::reset_at_with` with the caller's clock (`now`, unix seconds), its
-/// local offset and its zone table (`zone_offset_at(zone, unix)`, the
-/// offset the zone has AT the instant placed for) — all three injected, so
-/// this reads no clock and no zone file. A reset the grammar cannot read is
-/// `None`, and so is one placed further ahead than its window can be: more
-/// than [`super::accounts::SESSION_WINDOW_S`] plus
-/// [`super::accounts::STAMP_SKEW_S`] for the session's, more than
-/// [`super::accounts::RESET_BELIEVED_S`] for the week's. Its figure is kept:
-/// the roster then counts it for one window length from the sample
-/// (`Sample::session`, `Sample::week`). A reset placed in the PAST is kept
-/// as placed, and voids its figure there: the window the panel showed has
-/// ended.
+/// Each reset is placed as `harness limits` places it
+/// ([`super::cli::limits_view`]): `limit::parse_reset`, then
+/// `limit::reset_at_with` with the injected clock (`now`), local offset and
+/// zone table (`zone_offset_at(zone, unix)`: the zone's offset at that
+/// instant), so this reads no clock or zone file. A reset the grammar cannot
+/// read is `None`, and so is one further ahead than its window can be (past
+/// [`super::accounts::SESSION_WINDOW_S`] + [`super::accounts::STAMP_SKEW_S`]
+/// for the session, [`super::accounts::RESET_BELIEVED_S`] for the week); its
+/// figure is kept, and the roster counts it for one window length from the
+/// sample (`Sample::session`, `Sample::week`). A reset in the past is kept and
+/// voids its figure: that window has ended.
 #[must_use]
 pub fn panel_sample(
     windows: &[PanelWindow],
@@ -1352,8 +1317,8 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// Cut a string to at most `max` bytes on a char boundary (the module-wide
-/// cut, not a copy of it).
+/// Cut a string to at most `max` bytes on a char boundary
+/// (`super::truncate_bytes`).
 fn truncate_to(mut s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
@@ -1366,9 +1331,9 @@ fn truncate_to(mut s: String, max: usize) -> String {
 /// The one-line HUD: `fable ?%/5h · ?%/7d · acct work · resets ? · none`.
 ///
 /// The model is the account's live model family, and `acct` its label
-/// ([`AccountView::label`]). The windows' figures and reset are `?` with
-/// source `none`, since nothing here knows a window (see `harness limits`).
-/// Cut to [`HUD_MAX_BYTES`] on a char boundary.
+/// ([`AccountView::label`]). The figures and reset come from the account's
+/// tap reading (source `tap <age>`); without one they are `?` and the source
+/// `none`. Cut to [`HUD_MAX_BYTES`] on a char boundary.
 pub fn hud_line(view: &UsageView) -> String {
     let Some(acct) = view.shown() else {
         return "no account".to_owned();
@@ -1447,7 +1412,7 @@ fn account_json(a: &AccountView) -> Value {
     o.insert("label".to_owned(), Value::from(a.label.as_str()));
     o.insert("active".to_owned(), Value::from(a.active));
     // The usage tap's windows, by the vendor's name; empty where the session
-    // has no reading (module doc), as every run before the tap printed it.
+    // has no reading (module doc).
     o.insert(
         "windows".to_owned(),
         Value::Object(
@@ -1511,11 +1476,10 @@ mod tests {
 
     // -- fixtures -----------------------------------------------------------
 
-    /// The `/usage` panel exactly as Claude Code 2.1.278 painted it in a
-    /// 120-column session, captured over aterm's control socket 2026-09-22.
-    /// The leading three-space indent is the vendor's, kept verbatim (the
-    /// literal opens on its first row: a `\` continuation there ate that
-    /// row's indent, which the Settings-panel reader places the header by).
+    /// The `/usage` panel as Claude Code 2.1.278 painted it in a 120-column
+    /// session. The literal opens on its first row, so the vendor's
+    /// three-space indent survives (the Settings-panel reader places the
+    /// header by it).
     const PANEL_WIDE: &str = "   Settings  Status   Config   Usage   Stats
 
    Session
@@ -1540,9 +1504,9 @@ mod tests {
    100% of your usage came from subagent-heavy sessions
 ";
 
-    /// The same panel at 56 columns, where the reset WRAPS onto the row under
-    /// the title and the meter, the blank and the figure follow it. Same
-    /// capture, same session, resized.
+    /// The same panel at 56 columns (same session, resized): the reset wraps
+    /// onto the row under the title, and the meter, a blank and the figure
+    /// follow it.
     const PANEL_NARROW: &str = "   Current session · Resets 1:20pm
    (America/Los_Angeles)
    ███▊
@@ -1807,11 +1771,10 @@ mod tests {
         assert_eq!(t.duplicates, 2);
     }
 
-    /// WORKING TIME is the UNION of the main chain's turns, each the
-    /// `[timestamp − durationMs, timestamp]` of the `turn_duration` row
-    /// Claude Code writes at its end (2.1.284's shape): a turn written late
-    /// over the turns after it (a workflow's) counts once, a sidechain's row
-    /// not at all, and a row past the raw-byte cut is still parsed.
+    /// Working time is the union of the main chain's `turn_duration` turns: a
+    /// turn written late over the turns after it (a workflow's) counts once, a
+    /// sidechain's row not at all, and a row past the raw-byte cut is still
+    /// parsed.
     #[test]
     fn working_time_is_the_union_of_the_main_chains_turns() {
         let turn = |at: &str, ms: u64, side: bool| {
@@ -1836,10 +1799,9 @@ mod tests {
         assert_eq!(t.assistant_rows, 0, "no turn row is an answer");
     }
 
-    /// THE MEASURED SUBAGENT SHAPE (2026-09-25, `agent-*.jsonl`): one message
-    /// streamed over three rows — `stop_reason` null with the message_start
-    /// output twice, then the final row. Its output is the final 349, once;
-    /// keeping the first row counted 8.
+    /// A subagent message streamed over three rows (`stop_reason` null with
+    /// the message_start output twice, then the final row) counts its final
+    /// output, 349, once.
     #[test]
     fn a_streamed_subagent_message_counts_its_final_output_once() {
         let row = |stop: &str, output: u64, block: &str| {
@@ -2038,7 +2000,7 @@ mod tests {
         assert_eq!(t.served_at(), Some(minute(5)), "the NEWEST time is kept");
     }
 
-    /// Which window a notice NAMES: the screen's wall classes, narrowed to a
+    /// Which window a notice names: the screen's wall classes, narrowed to a
     /// notice that says its window.
     #[test]
     fn a_notice_names_its_window_or_none() {
@@ -2138,12 +2100,12 @@ mod tests {
         assert_eq!(t.per_model()["model-000"].messages, 2);
     }
 
-    /// THE ONE-HOUR WRITES ARE KEPT APART: 800 of the row's 1000 cache writes
-    /// are one-hour ones (`cache_creation.ephemeral_1h_input_tokens`, the key
-    /// MEASURED by name on Claude Code 2.1.30x transcripts), which list higher
-    /// than five-minute ones. A split larger than the total is held to it, and
-    /// a split with no total sums to one. Negative control: a row with no
-    /// split reads every write as a five-minute one.
+    /// The one-hour writes are kept apart: 800 of the row's 1000 cache writes
+    /// are one-hour ones (`cache_creation.ephemeral_1h_input_tokens`, on Claude
+    /// Code 2.1.30x transcripts), which list higher than five-minute ones. A
+    /// split larger than the total is held to it, and a split with no total sums
+    /// to one. Negative control: a row with no split reads every write as a
+    /// five-minute one.
     #[test]
     fn one_hour_cache_writes_are_kept_apart() {
         let split = r#"{"type":"assistant","message":{"id":"msg_s","model":"m","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":800},"output_tokens":0}}}"#;
@@ -2161,7 +2123,7 @@ mod tests {
         assert_eq!(held(&t, "m"), (1000, 800));
         assert_eq!(held(&t, "o"), (5, 5));
         assert_eq!(held(&t, "p"), (5, 3));
-        // NEGATIVE CONTROL.
+        // Negative control.
         assert_eq!(held(&t, "b"), (1000, 0));
         // A streamed repeat raises the split with the rest.
         t.fold_line(&split.replace("800}", "900}").replace(":1000,", ":1100,"));
@@ -2273,10 +2235,9 @@ mod tests {
         assert_eq!(v.shown().map(|a| a.label.as_str()), Some("alt-1"));
     }
 
-    /// A USAGE TAP'S READING fills the windows: the JSON's `windows` (schema
-    /// 1's own key, empty before) carries each by the vendor's name, with the
-    /// reading's age. NEGATIVE CONTROL: a window the reading has not is
-    /// absent, and no reading leaves `windows` empty.
+    /// A usage tap reading fills the JSON's `windows` (schema 1) by the
+    /// vendor's name, with the reading's age. Negative control: a window the
+    /// reading lacks is absent, and no reading leaves `windows` empty.
     #[test]
     fn a_tap_reading_fills_the_windows_of_the_json() {
         let reading = crate::harness::tap::Reading {
@@ -2290,11 +2251,13 @@ mod tests {
             five_hour: Some(crate::harness::tap::Window {
                 pct: 42,
                 resets_at: 1_000 + 2 * 3_600 + 30 * 60,
+                pct_x10: None,
             }),
             seven_day: None,
             warm: None,
             cache_expires_at: None,
             version: None,
+            model: None,
             dur_us: 0,
         };
         let mut a = live_account();
@@ -2520,11 +2483,10 @@ mod tests {
 
     use aterm_phase::prompt::fixtures as fx;
 
-    /// MEASURED: the one whole-screen capture of the panel on Claude Code
-    /// 2.1.278, 2026-09-22 (the vendor corpus, whose manifest records its
-    /// digest): 46 rows at 56 columns, the `▔` rule
-    /// on row 3, the header on row 4, three windows in the narrow layout,
-    /// and the vendor's `↓` ending row 46 — the tail is under the fold.
+    /// The one whole-screen capture of the panel on Claude Code 2.1.278 (the
+    /// vendor corpus's manifest records its digest): 46 rows at 56 columns,
+    /// the `▔` rule on row 3, the header on row 4, three windows in the narrow
+    /// layout, and the vendor's `↓` ending row 46 — the tail is under the fold.
     const SCREEN_2_1_278: &str =
         include_str!("../../tests/testdata/vendor/2.1.278/screen/usage.txt");
 
@@ -2535,16 +2497,16 @@ mod tests {
     }
 
     /// The retry hint beside the cancel hint, as the 2.1.287 bundle composes
-    /// the row beside an enrich error or a failed load (READ, not measured:
-    /// the `settings:retry` binding's key and word, the byline's ` · `).
+    /// the row beside an enrich error or a failed load (read from the bundle,
+    /// not measured: the `settings:retry` key and word, the byline's ` · `).
     fn retry_hints() -> String {
         format!("   r to retry · {}", aterm_phase::anchor("prompt.cancel"))
     }
 
-    /// MEASURED on 2.1.287 (`aterm_phase::prompt::fixtures::USAGE_SETTLED`,
-    /// 150x50, half a second after the Enter): the Usage tab settled and
-    /// whole on the grid — the session at 1 %, the week at 10 %, the Fable
-    /// window at 0 %, the cancel hint last.
+    /// Measured on 2.1.287 (`aterm_phase::prompt::fixtures::USAGE_SETTLED`,
+    /// 150x50, half a second after the Enter): the Usage tab settled and whole
+    /// on the grid — the session at 1 %, the week at 10 %, the Fable window at
+    /// 0 %, the cancel hint last.
     fn settled() -> Vec<String> {
         fx::screen(fx::USAGE_SETTLED)
     }
@@ -2556,13 +2518,12 @@ mod tests {
             .expect("a drawn row")
     }
 
-    /// COMPOSED, NOT MEASURED, and only for the states no capture holds: the
-    /// MEASURED settled screen ([`settled`]) with `between` drawn right
-    /// above its hint row (each with the blank row the tab's `gap` puts
-    /// under it) and the hint row replaced by `tail`. The place is the READ
-    /// one: the 2.1.287 bundle draws the enrich-error line and `Refreshing…`
-    /// after the usage-credits block and before the hint row, and the
-    /// measured refreshing screen agrees.
+    /// Composed, for the states no capture holds: the measured settled screen
+    /// ([`settled`]) with `between` drawn right above its hint row (each with
+    /// the blank row the tab's `gap` puts under it) and the hint row replaced
+    /// by `tail`. The place is the 2.1.287 bundle's: the enrich-error line and
+    /// `Refreshing…` come after the usage-credits block and before the hint
+    /// row, and the measured refreshing screen agrees.
     fn composed(between: &[&str], tail: &str) -> Vec<String> {
         let mut out = settled();
         let at = last_row(&out);
@@ -2603,16 +2564,12 @@ mod tests {
         ]
     }
 
-    /// THE MEASURED SCREENS WHOSE TAIL IS UNDER THE FOLD — 2.1.278's one
-    /// capture (46 rows), 2.1.287 at 150x50 once the contributing block
-    /// filled in, and 2.1.287 at 110x32 from its first read — are each the
-    /// Settings panel under its `▔` rule, drawn by the fullscreen renderer,
-    /// the header the screen's fourth row; and the settled rule reads `Fold`
-    /// although the windows are on the grid (which `harness limits` prints
-    /// as they are). NEGATIVE CONTROLS for the panel's placement: the two
-    /// older fixtures (a header with no rule over it; no header at all), the
-    /// 2.1.278 capture with a composer's frame under it, and with its header
-    /// one column out or in, are no panel.
+    /// The measured screens whose tail is under the fold (2.1.278's capture;
+    /// 2.1.287 at 150x50 once the contributing block filled in, and at 110x32)
+    /// are the fullscreen Settings panel with the header on row 4, and read
+    /// `Fold` although the windows are on the grid. Negative controls: the
+    /// older fixtures, and the 2.1.278 capture with a composer frame under it
+    /// or its header a column out or in, are no panel.
     #[test]
     fn the_measured_screens_with_the_tail_under_the_fold_are_no_sample() {
         let screen = rows(SCREEN_2_1_278);
@@ -2663,13 +2620,10 @@ mod tests {
         assert_eq!(aterm_phase::settings_panel(&shifted), None);
     }
 
-    /// THE HEADER'S GUARD, compiled by the server's own row matcher
-    /// (`aterm_observe::row_matcher`, what `key if=` and `await gone` test
-    /// every row of the screen with), matches the measured screen's header
-    /// row and no other row of it — on 2.1.278's capture and on every
-    /// 2.1.287 one, both renderers. NEGATIVE CONTROL: a copy of the header
-    /// quoted further in — a tool's output, the worker's words — is not
-    /// matched.
+    /// The header guard, compiled by the server's own row matcher
+    /// (`aterm_observe::row_matcher`, as `key if=` and `await gone` use it),
+    /// matches each measured screen's header row and no other. Negative
+    /// control: a quoted copy of the header is not matched.
     #[test]
     fn the_header_guard_matches_the_measured_header_and_no_copy_of_it() {
         for (what, screen) in [
@@ -2707,15 +2661,10 @@ mod tests {
         }
     }
 
-    /// MEASURED on 2.1.287: the whole tab on the grid, nothing unsettled,
-    /// the hint row last — `Settled`, with the figures the screen shows: at
-    /// 150x50 while the contributing block is still scanning, at 150x80 with
-    /// that block filled in, and at 60x50 in the narrow layout. NEGATIVE
-    /// CONTROL, also MEASURED: the screen the same run showed a quarter
-    /// second EARLIER has `Refreshing…` above the hint and is `Unsettled` —
-    /// and the week it shows (9 %) is not the week the settled one shows
-    /// (10 %): the figures of an unsettled panel are the ones being
-    /// replaced, which is the whole reason for the rule.
+    /// Measured on 2.1.287: the whole tab on the grid, nothing unsettled, the
+    /// hint row last is `Settled` (150x50 while scanning, 150x80, and 60x50
+    /// narrow). Negative control: the same run a quarter second earlier shows
+    /// `Refreshing…` and a stale week (9 % against 10 %) and is `Unsettled`.
     #[test]
     fn a_whole_panel_with_nothing_unsettled_on_it_is_settled() {
         assert_eq!(figures(&read(&settled())), three(1, 10, 0));
@@ -2753,8 +2702,8 @@ mod tests {
             stale,
             [("five_hour".to_string(), 1), ("seven_day".to_string(), 9)]
         );
-        // COMPOSED: the refresh line put on the settled screen is unsettled
-        // too, so the verdict is the row's and not that capture's.
+        // Composed: the refresh line on the settled screen is unsettled too,
+        // so the verdict is the row's, not that capture's.
         assert_eq!(
             read(&composed(&["   Refreshing…"], &hint())),
             PanelRead::Unsettled
@@ -2762,12 +2711,10 @@ mod tests {
         assert_eq!(read(&composed(&[], &hint())), read(&settled()));
     }
 
-    /// COMPOSED (see [`composed`]; no capture holds one): each enrich-error
-    /// line the 2.1.287 bundle draws under the usage-credits block, with the
-    /// retry hint it brings beside the cancel hint — `Unsettled`, whichever
-    /// it is: the figures are last-known, partial or unrefreshed by the
-    /// vendor's own word. NEGATIVE CONTROL: the retry hint alone (no error
-    /// line read) is no tail, so that panel is `Fold`, never `Settled`.
+    /// Composed ([`composed`]): each enrich-error line the 2.1.287 bundle
+    /// draws is `Unsettled`, with the retry hint beside the cancel hint or
+    /// without. Negative control: the retry hint alone is no tail, so that
+    /// panel is `Fold`.
     #[test]
     fn an_enrich_error_under_the_windows_is_unsettled() {
         let hints = retry_hints();
@@ -2794,16 +2741,11 @@ mod tests {
         assert_eq!(read(&composed(&[], &hints)), PanelRead::Fold);
     }
 
-    /// COMPOSED (no capture holds either state): the MEASURED rule, header
-    /// and `Session` block, and — in the plan-limits component's place —
-    /// what the 2.1.287 bundle draws with no figures yet (`Loading usage
-    /// data…` over the cancel hint) and after a failed load (`Error: <why>`
-    /// over a retry hint and the cancel hint). Both are the Usage tab (the
-    /// session block's `Total cost:` is drawn above the component, always —
-    /// READ, and MEASURED on every capture) and both are `Unsettled`.
-    /// NEGATIVE CONTROL: the same rows with the loading line or the error
-    /// taken out are the Usage tab with no window on it — `Unsettled` under
-    /// the hint row by the missing windows, never `Settled`.
+    /// Composed: the measured head of the tab with the bundle's no-figures
+    /// state (`Loading usage data…`) or a failed load (`Error: <why>` over a
+    /// retry hint) in the plan-limits component's place is the Usage tab and
+    /// `Unsettled`. Negative control: with that line taken out it is still
+    /// `Unsettled` (no window), never `Settled`.
     #[test]
     fn a_loading_or_failed_panel_is_unsettled() {
         let measured = settled();
@@ -2847,11 +2789,9 @@ mod tests {
         assert!(usage_panel_windows(&head(&[&cancel])).is_empty());
     }
 
-    /// The fold, beyond the measured screens: the settled screen with the
-    /// vendor's `↓` ending its hint row (COMPOSED), and the settled screen
-    /// cut anywhere above its hint row, are `Fold` — more is below, and what
-    /// is below is where the refresh line is drawn. NEGATIVE CONTROL: the
-    /// same rows whole are `Settled`.
+    /// The settled screen with a `↓` ending its hint row (composed), or cut
+    /// anywhere above its hint row, is `Fold`. Negative control: the same rows
+    /// whole are `Settled`.
     #[test]
     fn a_panel_whose_tail_is_under_the_fold_is_no_sample() {
         let whole = settled();
@@ -2876,13 +2816,10 @@ mod tests {
         assert_eq!(read(&after), PanelRead::Fold);
     }
 
-    /// COMPOSED from the measured settled screen, a window's rows taken out
-    /// (no capture holds a tab with one missing): only `Current session`
-    /// (the reader's own fence then yields no window at all), the session
-    /// with the Fable window but no `Current week (all models)`, and the
-    /// week with no session — each `Unsettled` under its hint row: the whole
-    /// tab is on the grid and the figures a sample needs are not. NEGATIVE
-    /// CONTROL: with both windows and no third, it is `Settled`.
+    /// Composed from the settled screen: the session alone, the session and
+    /// Fable without the week, and the week without the session are each
+    /// `Unsettled` under the hint row. Negative control: both windows and no
+    /// third is `Settled`.
     #[test]
     fn a_whole_panel_missing_the_session_or_the_week_is_unsettled() {
         let whole = settled();
@@ -2919,13 +2856,10 @@ mod tests {
         );
     }
 
-    /// COMPOSED: the MEASURED rule and header with none of the Usage tab's
-    /// rows under them — another tab's (invented rows in the Status and
-    /// Config tabs' shape: this build's other tabs were never captured, and
-    /// never will be committed: the Status tab names the login) — is
-    /// `NotUsage`, hint row or none. NEGATIVE CONTROL: one `Total cost:` row
-    /// under the same header and it is the Usage tab (`Unsettled`: no
-    /// window).
+    /// Composed: the measured rule and header over another tab's rows
+    /// (invented: the Status tab names the login, so no capture is committed)
+    /// is `NotUsage`, hint row or none. Negative control: one `Total cost:`
+    /// row under it makes it the Usage tab (`Unsettled`: no window).
     #[test]
     fn a_settings_panel_on_another_tab_is_not_the_usage_tab() {
         let measured = settled();
@@ -2960,13 +2894,11 @@ mod tests {
         assert_eq!(usage_panel_read(&settled(), 10_000), PanelRead::NotUsage);
     }
 
-    /// MEASURED on 2.1.287 under the INLINE renderer: the panel under its
-    /// `─` rule, two columns in — the phase reader says `Inline`, which is
-    /// what the probe refuses to type under; the settled rule itself reads
-    /// the rows the same. And once that panel grew and the main screen
-    /// scrolled its rule and header away, there is no panel to read at all,
-    /// though its hint row is on the grid. NEGATIVE CONTROL: the fullscreen
-    /// capture of the same tab is `Fullscreen`.
+    /// Measured on 2.1.287 under the inline renderer: the panel under its `─`
+    /// rule reads `Inline` (which the probe refuses to type under) with the
+    /// same figures, and once the main screen scrolled its rule and header
+    /// away there is no panel. Negative control: the fullscreen capture reads
+    /// `Fullscreen`.
     #[test]
     fn the_inline_renderers_panel_is_told_from_the_fullscreen_one() {
         let inline = fx::screen(fx::USAGE_INLINE);
@@ -2988,7 +2920,7 @@ mod tests {
 
     // -- the sample ------------------------------------------------------------
 
-    /// 2026-10-02 04:20:00 UTC, 9:20 PM on Oct 1 in the panel's zone: the
+    /// 9:20 PM on Oct 1 in the panel's zone (04:20 UTC on Oct 2): the
     /// minute the measured 150x50 screens were read (their done row says
     /// `done 9:20 PM`).
     const READ_AT: i64 = 1_790_914_800;
@@ -3007,13 +2939,11 @@ mod tests {
         }
     }
 
-    /// THE SAMPLE OF THE MEASURED SETTLED PANEL: the session's figure and
-    /// the week's, each reset placed on the clock in the zone the panel
-    /// names — a bare clock time (`2am`, four hours forty ahead) and a dated
-    /// one (`Oct 8 at 9am`) — read at the injected `now`. The machine's own
-    /// offset (here nine hours east) is not used where the zone is known.
-    /// NEGATIVE CONTROL: with a zone table that knows nothing, the same text
-    /// is placed at the machine's offset — another instant.
+    /// The settled panel's sample places each reset in the zone the panel
+    /// names, a bare clock time (`2am`) and a dated one (`Oct 8 at 9am`), not
+    /// at the machine's offset (here nine hours east). Negative control: a
+    /// zone table that knows nothing places the same text at the machine's
+    /// offset, another instant.
     #[test]
     fn a_settled_panels_sample_places_each_reset_in_the_panels_zone() {
         let PanelRead::Settled(windows) = read(&settled()) else {
@@ -3049,13 +2979,10 @@ mod tests {
         assert_ne!(nowhere.week_reset, sample.week_reset);
     }
 
-    /// A RESET FURTHER AHEAD THAN ITS WINDOW CAN BE IS NO RESET: the figure
-    /// is kept and the reset is `None` (the roster then counts the figure
-    /// for one window length). The session's bound is its five hours and the
-    /// stamp's skew; the week's is eight days. So is a reset the grammar
-    /// cannot read, and a window that carried none. NEGATIVE CONTROLS: the
-    /// same windows with a reset inside the bound keep it — the week's
-    /// seven days ahead, the session's four hours ahead.
+    /// A reset further ahead than its window can be (the session's five hours
+    /// plus the stamp's skew, the week's eight days), one the grammar cannot
+    /// read, and none at all are `None`, the figure kept. Negative controls:
+    /// resets inside each bound are kept.
     #[test]
     fn a_reset_beyond_its_windows_bound_is_dropped_and_its_figure_kept() {
         let sample = |session: Option<&str>, week: Option<&str>| {
@@ -3105,10 +3032,10 @@ mod tests {
         );
     }
 
-    /// A FIGURE NOBODY READ IS `None`, NEVER `0`: a lone week window gives
-    /// no session figure, a lone session window no week's, and windows that
-    /// are neither (the Fable bucket, the spend limit) — or none at all —
-    /// give no sample. NEGATIVE CONTROL: the two windows together give both.
+    /// A figure nobody read is `None`, never `0`: a lone window gives only its
+    /// own figure, and windows that are neither (the Fable bucket, the spend
+    /// limit), or none, give no sample. Negative control: both windows give
+    /// both.
     #[test]
     fn a_window_that_was_not_read_gives_no_figure_and_none_gives_no_sample() {
         let week = window("seven_day", 10, Some("Oct 8 at 9am (America/Los_Angeles)"));

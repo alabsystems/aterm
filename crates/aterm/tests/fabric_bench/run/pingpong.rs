@@ -10,26 +10,32 @@
 //!
 //! WHAT THE LATENCY PHASE LEAVES OUT, ON PURPOSE, AND THIS MEASURES. The bridge
 //! delivers a record and commits its inbox cursor past it at the top of its
-//! next round, once nothing is queued behind it (`Bridge::round`): on Strict,
-//! one more broker flush after the row is visible. The latency phase waits for
-//! that commit before its next post, so no sample carries the one before it
-//! ([`super::latency`]). A reply is posted exactly in that gap. The bridge has
-//! ONE loop: it usually reads the outbox the reply sits in only once the
-//! commit's answer is back, and it reads every publish's ack on that same loop.
-//! Not always: the roster round at the top of a pass reads the outbox too
-//! (`Bridge::roster_backstop`), before that pass's round commits, so a reply
-//! can be published ahead of the commit it would otherwise wait on. So a reply
-//! usually waits on the delivery it answers, and always on the loop, and three
-//! numbers say how much:
+//! next round, once nothing is queued behind it (`Bridge::settle_owed`): on
+//! Strict, one more broker flush after the row is visible. The latency phase
+//! waits for that commit before its next post, so no sample carries the one
+//! before it ([`super::latency`]). A reply is posted exactly in that gap. The
+//! bridge has ONE loop. Until aterm-0 it parked on that commit's answer, and on
+//! every owed ack at an idle moment, so it usually read the outbox the reply
+//! sat in only once the commit was back (not always: the roster round at the
+//! top of a pass reads the outbox too, `Bridge::roster_backstop`, before that
+//! pass's round commits, so a reply could be published ahead of the commit it
+//! would otherwise wait on). Since, the commit rides the publisher's pipeline
+//! and the loop reads an owed ack only where a reply must be judged, where a
+//! sender waits on it (a post's, at an idle moment), or once it has arrived:
+//! it takes the reply while the commit is in the broker's flush and publishes
+//! it behind it, on the same connection. So a reply waits on the broker's
+//! order rather than the loop's park, and always on the loop's own work, and
+//! three numbers say how much:
 //!
 //! 1. THE ROUND TRIP, A's post to B's reply visible to A: `n`, mean, p50, p95,
 //!    p99, and its legs.
 //! 2. EACH ANSWER'S WAIT FOR THE DELIVERY'S COMMIT. Every message but the first
 //!    answers a delivery — a pong the ping before it, the next ping that pong —
 //!    so for each, from its post `OK` (it is in aterm's outbox) to the moment
-//!    the commit covering the delivery it answers was ACKED (what the bridge's
-//!    loop waits for; on a strict broker that is its full flush, on an ordered
-//!    one its barrier), or zero when that commit landed first; by direction.
+//!    the commit covering the delivery it answers was ACKED (on a strict broker
+//!    its full flush, on an ordered one its barrier: what the bridge's loop
+//!    parked for until aterm-0, and what the answer's record lands behind
+//!    since), or zero when that commit landed first; by direction.
 //!    The commit's offset is read off the log after the run and its moment off
 //!    the acked head's sampler, as every acked time in this bench is. A wait
 //!    is counted only for an answer the
@@ -41,7 +47,8 @@
 //! 3. THE SHARE OF THE WINDOW THE BRIDGE'S LOOP SPENT BLOCKED ON BROKER REPLIES,
 //!    counted INSIDE the bridge where it blocks, by the wait-tally development
 //!    seam ([`aterm_link::wait_tally`]): the requests that read their own reply
-//!    (the group commits among them) and the pipelined acks, in count and time.
+//!    and the pipelined acks, and the group commits among them (requests until
+//!    aterm-0, pipelined acks since), in count and time.
 //!    The bench takes no time of its own for it: it reads two tallies the
 //!    bridge wrote and divides their difference by the window.
 //!
@@ -401,6 +408,14 @@ fn ns_ms(ns: u64) -> f64 {
 /// decimals printed 399 commits over 200 round trips as "2.00"
 /// (`2026-10-17-fabric-36`), which reads as the 2 a round trip that never
 /// folds a commit would have; it is 1.995.
+///
+/// THE GROUP COMMITS ARE A ROW OF THEIR OWN, under both kinds of wait: before
+/// aterm-0 each was a request the loop parked on for the broker's flush
+/// (every entry through `2026-10-20-fabric-15` counts them among the
+/// requests); since, each rides the publisher's pipeline and its ack is read
+/// like a publish's, waited for only where the bridge must (its
+/// `Bridge::settle_owed` lists where) and otherwise once it has arrived — so a
+/// tally says which by where the commits' count sits.
 fn waits_rows(d: &Tally, n: usize) -> Vec<String> {
     let per = |v: f64| {
         if n == 0 {
@@ -428,11 +443,15 @@ fn waits_rows(d: &Tally, n: usize) -> Vec<String> {
             d.request_ns,
         ),
         row(
-            "of which: the inbox group's commits",
+            "pipelined acks (publishes', and since aterm-0 the group commits')",
+            Some(d.acks),
+            d.ack_ns,
+        ),
+        row(
+            "of both: the inbox group's commits",
             Some(d.commits),
             d.commit_ns,
         ),
-        row("pipelined publishes' acks", Some(d.acks), d.ack_ns),
         row("**all: the loop held by the broker**", None, d.blocked_ns()),
     ]
 }
@@ -639,7 +658,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         },
         "window_ms": window_ms.map(stats::round3),
         "bridge_waits": {
-            "what": "the bridge loop's waits on broker replies over the window, counted inside the bridge (aterm_link::wait_tally): requests that read their own reply, of which the inbox group's commits, and pipelined acks",
+            "what": "the bridge loop's waits on broker replies over the window, counted inside the bridge (aterm_link::wait_tally): requests that read their own reply, pipelined acks, and of both the inbox group's commits (a request each before aterm-0, a pipelined ack since)",
             "pid": waits.pid,
             "requests": waits.requests,
             "request_ms": stats::round3(ns_ms(waits.request_ns)),
@@ -964,12 +983,14 @@ mod tests {
         };
         let rows = waits_rows(&folded, 200);
         assert!(
-            rows[3].starts_with("| of which: the inbox group's commits | 399 | 1.995 |"),
+            rows[4].starts_with("| of both: the inbox group's commits | 399 | 1.995 |"),
             "{rows:?}"
         );
         // CONTROL: a count that did not fold, the acks, reads a whole 2.000.
         assert!(
-            rows[4].starts_with("| pipelined publishes' acks | 400 | 2.000 |"),
+            rows[3].starts_with(
+                "| pipelined acks (publishes', and since aterm-0 the group commits') | 400 | 2.000 |"
+            ),
             "{rows:?}"
         );
         assert_eq!(share(2000.0, 4000.0), Some(0.5));

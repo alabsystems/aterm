@@ -105,6 +105,38 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
     assert!(Pin::parse("").is_err());
 }
 
+/// A PIN A POWER CUT CUT SHORT NEVER READS: every pin ends at the newline of
+/// its last line, so a prefix of one is damage — never a pin with a lower
+/// total and no key (ruling Q13's count and Q6's key reset) nor a slot whose
+/// body lost its tail (republished cut). The mirror then stops, keeping the
+/// pin on disk, rather than mint a fresh key.
+#[test]
+fn a_pin_cut_anywhere_short_of_its_last_byte_does_not_read() {
+    let pin = Pin {
+        inc: 7,
+        total: 12345,
+        key: Some([0xab; 16]),
+        slots: vec![slot(640, "s-a", 1), slot(641, "s-b", 1)],
+    };
+    let text = pin.render();
+    let header = Pin {
+        slots: Vec::new(),
+        ..pin.clone()
+    }
+    .render();
+    for whole in [&text, &header] {
+        assert!(Pin::parse(whole).is_ok());
+        for cut in 0..whole.len() {
+            assert!(
+                Pin::parse(&whole[..cut]).is_err(),
+                "a pin cut at {cut} of {}: {:?}",
+                whole.len(),
+                &whole[..cut]
+            );
+        }
+    }
+}
+
 /// RULING Q10: one landing names every session's last cursor once in each
 /// seq space, in the order they first appear, and its answer is one word a
 /// pair. A take holding an uncarried update's old-space `why=reset` cover

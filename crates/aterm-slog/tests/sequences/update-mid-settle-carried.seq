@@ -10,4 +10,4 @@ expect turn=t1
 expect wake=1000
 wait 500
 expect open t1 turn
-expect close t1 turn out=done at=0
+expect close t1 turn out=done @0

@@ -1812,6 +1812,8 @@ pub enum SummaryLevel {
 pub struct DoctorSummary {
     pub level: SummaryLevel,
     pub text: String,
+    /// The observation did not establish health, independently of its display level.
+    pub unmeasured: bool,
 }
 
 /// THE TOP-LEVEL DOCTOR'S FABRIC ROW: whether the broker the `[fabric]
@@ -1845,6 +1847,7 @@ pub fn doctor_summary() -> DoctorSummary {
         Ok(None) => {
             return DoctorSummary {
                 level: SummaryLevel::Note,
+                unmeasured: false,
                 text: "off: no [fabric] command in aterm.toml and no rendezvous file \
                        (`aterm fabric on` turns it on; an instance started while it was on keeps \
                        its bridge until it is relaunched, which `aterm fabric` reports)"
@@ -1854,6 +1857,7 @@ pub fn doctor_summary() -> DoctorSummary {
         Err(e) => {
             return DoctorSummary {
                 level: SummaryLevel::Warn,
+                unmeasured: true,
                 text: format!(
                     "the fabric's config cannot be read ({}) — `aterm fabric` says where",
                     safe(&e, 256)
@@ -1865,6 +1869,7 @@ pub fn doctor_summary() -> DoctorSummary {
         Ok(cfg) => summary_of(&probe_broker(&cfg, &process_table()).0),
         Err(e) => DoctorSummary {
             level: SummaryLevel::Warn,
+            unmeasured: true,
             text: format!(
                 "the [fabric] command does not parse ({}) — `aterm fabric` says where it is",
                 safe(&e, 256)
@@ -1880,32 +1885,42 @@ pub fn doctor_summary() -> DoctorSummary {
 pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     let at = safe(&b.endpoint, 256);
     let fix = "`aterm fabric doctor` names the fix";
-    let warn = |text: String| DoctorSummary {
+    let warn = |text: String, unmeasured| DoctorSummary {
         level: SummaryLevel::Warn,
+        unmeasured,
         text,
     };
     // A BROKER IN ANOTHER ASTREAM PROTOCOL DID ANSWER (`warnings`' own
     // first case): "does not answer" would send its reader to start a broker
     // that runs, when the cure is one release on both sides.
     if let Some(skew) = b.protocol {
-        return warn(format!(
+        return warn(
+            format!(
             "the broker at {at} speaks astream protocol {} and this aterm speaks {}: no record \
              lands and none is delivered — {fix}",
             skew.broker, skew.client
-        ));
+        ),
+            false,
+        );
     }
     if !b.reachable {
-        return warn(format!(
-            "the broker at {at} does not answer ({}) — {fix}",
-            safe(b.error.as_deref().unwrap_or("unknown"), 256)
-        ));
+        return warn(
+            format!(
+                "the broker at {at} does not answer ({}) — {fix}",
+                safe(b.error.as_deref().unwrap_or("unknown"), 256)
+            ),
+            true,
+        );
     }
     if let Some(why) = b.poisoned() {
-        return warn(format!(
-            "the broker at {at} {POISONED_WARNING} ({}): it refuses every write until the log \
+        return warn(
+            format!(
+                "the broker at {at} {POISONED_WARNING} ({}): it refuses every write until the log \
              is reopened — {fix}",
-            safe(why, 256)
-        ));
+                safe(why, 256)
+            ),
+            false,
+        );
     }
     let served = match (b.served, b.tier()) {
         (Some(s), Some(asked))
@@ -1922,14 +1937,18 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
         (None, None) => "does not say what it serves".to_string(),
     };
     if !b.read_ok() {
-        return warn(format!(
+        return warn(
+            format!(
             "the broker at {at} answers and {served}, but the bus could not be read ({}) — {fix}",
             safe(b.error.as_deref().unwrap_or("unknown"), 256)
-        ));
+        ),
+            true,
+        );
     }
     match &b.health {
         Some(_) => DoctorSummary {
             level: SummaryLevel::Ok,
+            unmeasured: false,
             text: format!(
                 "the broker at {at} answers, {served}, and says its log is not poisoned \
                  (`aterm fabric` reads the rest)"
@@ -1937,6 +1956,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
         },
         None => DoctorSummary {
             level: SummaryLevel::Note,
+            unmeasured: true,
             text: format!(
                 "the broker at {at} answers and {served}, and does not say whether its log is \
                  poisoned (it predates the health entry; `aterm fabric` reads the rest)"
@@ -6450,6 +6470,7 @@ mod tests {
         // broker that answered, in another protocol — never "does not answer".
         let summary = summary_of(&r.broker);
         assert_eq!(summary.level, SummaryLevel::Warn);
+        assert!(!summary.unmeasured, "a protocol mismatch was measured");
         assert!(
             summary.text.contains(&format!(
                 "speaks astream protocol {} and this aterm speaks {PROTO_VERSION}",
@@ -6714,6 +6735,7 @@ mod tests {
         let summary = summary_of(&r.broker);
         assert_eq!(summary.level, SummaryLevel::Warn);
         assert!(summary.text.contains(POISONED_WARNING), "{}", summary.text);
+        assert!(!summary.unmeasured, "a poisoned log is a measured failure");
         assert!(
             render_json(&r).contains("\"in_band\":{\"poisoned\":\"a flush failed (EIO)"),
             "{}",
@@ -6726,6 +6748,7 @@ mod tests {
         let health = row(&r, "health").expect("a health row");
         assert!(health.contains("carries no health entry"), "{health}");
         assert_eq!(summary_of(&r.broker).level, SummaryLevel::Note);
+        assert!(summary_of(&r.broker).unmeasured);
 
         // A BROKER THAT DOES NOT ANSWER: no health row, a warning summary.
         r.broker.reachable = false;
@@ -7173,12 +7196,15 @@ mod tests {
     /// `ps` escapes it. Another user's process is `ps`'s alone to read
     /// (setuid root): its pid and parent are compared. The fixture is a
     /// broker-shaped command line whose socket path is not ASCII and whose
-    /// last word holds a newline: both tables find it as the broker.
+    /// last word holds a newline: both tables find it as the broker. The path
+    /// carries this process's pid, so another copy of the suite running at the
+    /// same moment (another checkout's gate) has a broker line of its own.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_process_table_is_the_one_ps_prints() {
         use std::collections::{BTreeMap, BTreeSet};
-        let sock = "/tmp/kproc-s\u{f6}k.sock";
+        let sock = format!("/tmp/kproc-s\u{f6}k-{}.sock", std::process::id());
+        let sock = sock.as_str();
         let mut fixture = aterm_uds::spawnfd::command("/bin/bash");
         fixture
             .arg0("aterm")

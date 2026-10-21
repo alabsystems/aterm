@@ -1,0 +1,14 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x18, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Sonnet bucket limit (seven_day_sonnet, 900 s) under 24 h on 18 rows, after Esc on the countdown and a person's `/model opus` (the switch box answered): the turn's notice scrolled off, the GENERIC countdown row and the choice drawn
+⏺ Usage limit reached · continuing automatically at 2:25am · esc to cancel
+
+✻ Sautéed for 0s · done 2:10 AM
+
+⏺ Automatic continue cancelled · /rate-limit-options to re-arm
+
+❯ /model opus
+  ⎿  Set model to Opus 5.5 and saved as your default for new sessions
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                                      ◐ medium · /effort

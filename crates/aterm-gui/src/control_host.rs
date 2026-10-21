@@ -325,10 +325,8 @@ mod tests {
         }
     }
 
-    /// The full matrix passes against the shipped `GuiHost` (registry and sink
-    /// wired) over a session with real OSC-133 blocks and a live selection. Run
-    /// declared ([`GUI_HOST_PROFILE`]) so a host that stopped advertising its
-    /// roster or sink cannot pass on the easy arms.
+    /// The full matrix passes, run declared ([`GUI_HOST_PROFILE`]), against the shipped
+    /// `GuiHost` (registry and sink wired) over real OSC-133 blocks and a live selection.
     #[test]
     fn the_gui_host_passes_the_verb_matrix() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -523,12 +521,9 @@ mod tests {
         assert!(cmd_selection(&scoped, 0).starts_with("OK "));
     }
 
-    /// A CLOSED TAB ENDS WHAT IS PARKED ON IT. A driver parks `await inbox` and
-    /// `wait` on a tab, and the tab is closed. Both answer `ERR exited` at the
-    /// close; before, they slept to their deadline (up to ten minutes) and then
-    /// answered `OK timeout`, and all that time each lane's `SessionCtx` clone,
-    /// whose sink owns the master, held the closed tab's PTY open. Once they
-    /// answer, the lanes hold nothing of the session.
+    /// Closing a tab answers `await inbox` and `wait` parked on it with `ERR exited` at the
+    /// close, after which the lanes hold no `SessionCtx` clone (whose sink owns the PTY
+    /// master).
     #[test]
     fn closing_a_tab_ends_its_parked_waits_with_err_exited() {
         let mut app = crate::App::headless_for_test();
@@ -556,8 +551,8 @@ mod tests {
                 answered.send(("wait", reply)).unwrap();
             })
         };
-        // `wait` is parked once its subscriber is registered: the close wakes it,
-        // where an entry check would have answered it anyway.
+        // Parked once its subscriber is registered, so the close (not an entry check)
+        // answers it.
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "`wait` parks on the tab",

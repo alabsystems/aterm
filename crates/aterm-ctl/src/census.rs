@@ -1,29 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The unreached-instance census: aterm windows and headless instances running
-//! as this user that no control socket in the rendezvous directory reaches.
-//! `aterm doctor` prints it; nothing is stopped.
+//! The unreached-instance census: aterm windows and headless instances of this user that no
+//! control socket in the rendezvous directory reaches. `aterm doctor` prints it; nothing is
+//! stopped.
 //!
-//! An instance is a process of this user whose program is `aterm` or an
-//! `aterm-…` copy, started in window mode (`--headless` or `--window` before
-//! any `-e` payload, the `aterm-gui` name, or an app bundle's binary with no
-//! arguments), and not a verb (`aterm ctl …`) or a forced `--session`. A bare
-//! `aterm` in a terminal is a session, serves no socket, and is not counted.
+//! An instance is a process named `aterm` or `aterm-…` started in window mode (`--headless` or
+//! `--window` before any `-e` payload, the `aterm-gui` name, or a bare app-bundle launch), and
+//! not a verb (`aterm ctl …`) or a forced `--session`. A bare `aterm` in a terminal is a
+//! session, serves no socket, and is not counted.
 //!
-//! An instance is reached when its pid is published in the rendezvous
-//! directory (an `aterm-<pid>.sock`, or a `graph/` entry naming it), the same
-//! walk `aterm ctl instances`, `ls` and `windows` make
-//! ([`crate::local_instances`]). A published instance that does not reply is
-//! `aterm ctl ls`'s concern; a foreign one (a private `--control-sock` with no
-//! readable token, published through its graph entry) counts as reached and
-//! `aterm ctl instances` names it.
-//!
-//! Each unreached instance is named (pid, age, command line); whether it
-//! should end is its owner's call. When the census cannot look (no process
-//! table, an unreadable rendezvous directory) it says it did not measure,
-//! never "none". The lifeline (`aterm_uds::lifeline`) keeps harnesses from
-//! leaking instances in the first place.
+//! An instance is reached when the rendezvous walk ([`crate::local_instances`]) publishes its
+//! pid: an `aterm-<pid>.sock`, or a `graph/` entry naming it. A foreign instance (a private
+//! `--control-sock`, published through its graph entry) counts as reached. When the census
+//! cannot look (no process table, an unreadable rendezvous directory) it says so, never "none".
 
 use std::collections::BTreeSet;
 
@@ -48,7 +38,7 @@ pub struct ProcRow {
 /// One instance no published socket reaches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unreached {
-    /// The process id — what a person would pass to `kill`, if they decide to.
+    /// The process id.
     pub pid: u32,
     /// How long it has run, in words (`11d 22h`, `3h 05m`, `42s`).
     pub age: String,
@@ -291,7 +281,7 @@ fn ps(columns: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Join the two `ps` reads ([`process_table`]) into rows, PURE.
+/// Join the two `ps` reads ([`process_table`]) into rows; pure.
 #[cfg(any(unix, test))]
 fn join_ps(identity: &str, commands: &str) -> Vec<ProcRow> {
     /// The first whitespace-separated word and the rest, trimmed at the front.
@@ -514,10 +504,8 @@ mod tests {
         published_in(crate::DirOutcome::Unresolvable, Vec::new()).expect_err("not measured");
     }
 
-    /// A foreign instance (private socket outside the rendezvous directory,
-    /// found through its graph entry) is published, so the census counts it as
-    /// reached and never names it; `aterm ctl`'s foreign hint points at its own
-    /// report rows for that reason.
+    /// A foreign instance (private socket, found through its graph entry) is published, so
+    /// the census counts it as reached and never names it.
     #[test]
     fn a_published_foreign_instance_counts_as_reached() {
         use std::path::PathBuf;

@@ -195,41 +195,18 @@ impl aterm_converge::Item for Bound<'_> {
 
 /// The converge journal of the account this process runs as,
 /// `<state_dir>/converge/journal.ndjson` (design §3.3), for `aterm init` and `aterm
-/// machines here`. The state root comes from the account record's home, never `$HOME`:
-/// `sudo aterm machines here apply` may keep the invoking person's HOME, and root must not
-/// write into their tree (a root-owned journal there would refuse every later `aterm init`
-/// change). A private state root (a test binary's, a development build's
-/// `ATERM_STATE_HOME`) is used as it is.
+/// machines here`, under [`aterm_types::dirs::account_state_dir`]: the account record's
+/// home, never `$HOME`. `sudo aterm machines here apply` may keep the invoking person's
+/// HOME, and root must not write into their tree (a root-owned journal there would refuse
+/// every later `aterm init` change). A private state root (a test binary's, a development
+/// build's `ATERM_STATE_HOME`) is used as it is.
 ///
 /// # Errors
 /// The account has no home to keep state under.
 pub fn account_journal() -> Result<FileJournal, String> {
-    let private =
-        aterm_types::dirs::runs_under_private_state_root().then(aterm_types::dirs::state_dir);
-    journal_root(private, aterm_uds::account::home())
+    aterm_types::dirs::account_state_dir()
         .map(|root| FileJournal::under(&root))
         .ok_or_else(|| "this account has no state directory to journal changes in".into())
-}
-
-/// The pure half of [`account_journal`]: the state root its journal lives under.
-/// `private` is `Some` when the process runs under a private state root, holding what
-/// that root resolves to, which is used as it is (and `None` inside it, a relative
-/// `ATERM_STATE_HOME`, resolves no journal rather than the account's). Otherwise the root
-/// is the state directory of `account_home`, the account record's home, never `$HOME`'s.
-fn journal_root(
-    private: Option<Option<std::path::PathBuf>>,
-    account_home: Option<std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
-    match private {
-        Some(root) => root,
-        None => aterm_types::dirs::resolve_state_dir(
-            None,
-            aterm_types::dirs::StatePlatform {
-                home: account_home,
-                ..aterm_types::dirs::StatePlatform::default()
-            },
-        ),
-    }
 }
 
 /// Run a fleet baseline's `items` (`aterm machines here`, the agent's run job), each placed
@@ -484,7 +461,8 @@ mod tests {
         };
         // `sudo aterm machines here apply` with the person's HOME kept: root's journal is
         // under root's own home, never in the tree of the person who typed sudo.
-        let root = journal_root(None, Some("/var/root".into())).unwrap();
+        let root =
+            aterm_types::dirs::account_state_dir_with(None, Some("/var/root".into())).unwrap();
         assert!(root.starts_with("/var/root"), "{}", root.display());
         assert_eq!(Some(root.clone()), state("/var/root"));
         // The negative control: the `$HOME` answer is another folder.
@@ -493,11 +471,17 @@ mod tests {
         // relative override) journals nowhere rather than in the account's state.
         let private = PathBuf::from("/scratch/state");
         assert_eq!(
-            journal_root(Some(Some(private.clone())), Some("/var/root".into())),
+            aterm_types::dirs::account_state_dir_with(
+                Some(Some(private.clone())),
+                Some("/var/root".into())
+            ),
             Some(private)
         );
-        assert_eq!(journal_root(Some(None), Some("/var/root".into())), None);
-        assert_eq!(journal_root(None, None), None);
+        assert_eq!(
+            aterm_types::dirs::account_state_dir_with(Some(None), Some("/var/root".into())),
+            None
+        );
+        assert_eq!(aterm_types::dirs::account_state_dir_with(None, None), None);
     }
 
     #[test]

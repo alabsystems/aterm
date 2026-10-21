@@ -24,10 +24,6 @@
 //! `Cargo.lock`. All roots carry the [`FORK`] edge, so the patch is
 //! live in every cell.
 //!
-//! The specimen was a copy of the real `vendor/indexmap` until that fork, the
-//! repository's last, went back to the registry (docs/AUDIT-third-party-2026-10-15.md,
-//! "The last fork"); the fixture now forks a registry crate the way aterm forked one.
-//!
 //! Two details matter:
 //!
 //!   * `git init`: otherwise the fixture inherits this repository's

@@ -353,6 +353,23 @@ impl Spine {
         }
     }
 
+    /// The grief gate, [`Spine::drive`]'s inverse: zero the raw metric, the
+    /// display follower, the resume memory, the flow run and the hot-resume
+    /// door at `now`, keeping `phase` and `best` intact so the family's colour
+    /// wheel does not jump and the session's high-water mark survives.
+    pub fn hush(&mut self, now: Instant) {
+        self.momentum.set_value(now, 0.0);
+        self.disp = 0.0;
+        self.disp_peak = 0.0;
+        self.slamming = false;
+        self.mark = None;
+        self.run = 0;
+        self.prev_birth = 0.0;
+        self.key_rise = 0.0;
+        self.driven_at = None;
+        self.verdict = None;
+    }
+
     // -- the follower ------------------------------------------------------
 
     /// The one site of the gain: what the follower chases at `now`, the raw

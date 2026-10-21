@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` discovery, and the
-//! `CONNECT` tunnel an `https` request needs to cross a proxy.
+//! `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` discovery. The
+//! `CONNECT` tunnel itself is [`crate::client`]'s.
 //!
 //! The caller decides WHETHER a proxy may be consulted at all
 //! ([`ProxyMode`]); this module only answers "given that it may, which one".
@@ -21,15 +21,11 @@
 //! body and a bearer token around a proxy the network or its policy requires.
 //! The error never echoes the value: a proxy URL can carry a password.
 //!
-//! `user:password@` in the proxy URL, percent-encoded as RFC 3986 requires,
-//! becomes `Proxy-Authorization: Basic` on the `CONNECT` (an `https` target)
-//! or on the absolute-form request (an `http` target). It is never sent inside
-//! a tunnel, where the origin would read it. A user or password whose escapes
-//! decode to bytes that are not UTF-8 is refused like any unusable value.
-//!
-//! An `https://` proxy (TLS to the proxy itself) is refused rather than spoken
-//! to in plaintext. A [`crate::stream::Stream`] carries one TLS layer, and the
-//! origin's handshake inside the tunnel is the one it carries.
+//! Percent-encoded `user:password@` becomes `Proxy-Authorization: Basic` on the
+//! `CONNECT` (`https` target) or the absolute-form request (`http` target),
+//! never inside a tunnel, where the origin would read it. Escapes that decode
+//! to non-UTF-8 are refused. An `https://` proxy is refused: a
+//! [`crate::stream::Stream`] carries one TLS layer, the origin's.
 
 use std::ffi::OsString;
 use std::net::{IpAddr, Ipv6Addr};
@@ -68,12 +64,10 @@ impl EnvSource for ProcessEnv {
 
 /// The value of `name` as text, trimmed; `None` when unset or empty.
 ///
-/// A value that is not valid Unicode converts lossily, each bad sequence
-/// becoming U+FFFD, rather than reading as unset: an unset variable hands the
-/// decision to the next one, and with none left the request goes direct.
-/// [`parse_proxy`] refuses U+FFFD, so such a proxy variable fails the request
-/// naming itself. In `NO_PROXY` the entry holding it matches no host and the
-/// other entries still apply.
+/// A value that is not valid Unicode converts lossily (U+FFFD) rather than
+/// reading as unset, which would hand the decision to the next variable and
+/// possibly a direct connection. [`parse_proxy`] refuses U+FFFD; in `NO_PROXY`
+/// that entry matches no host and the others still apply.
 fn env_text<E: EnvSource>(env: &E, name: &str) -> Option<String> {
     let value = env.var_os(name)?;
     let value = value.to_string_lossy();
@@ -159,9 +153,9 @@ pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
             "{name} is set but is not a usable http:// proxy URL"
         ))
     };
-    // Userinfo never reaches `Uri::parse`, so its screen runs here too.
-    // U+FFFD is what a value that was not valid Unicode reads as (`env_text`),
-    // and a URL is ASCII, so no usable proxy URL holds one.
+    // Userinfo never reaches `Uri::parse`, so its screen runs here too. U+FFFD
+    // is how a value that was not valid Unicode reads (`env_text`); a URL is
+    // ASCII.
     if raw.len() > 8192
         || raw
             .chars()
@@ -179,8 +173,8 @@ pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
         });
     };
     // The authority ends where `Uri::parse` ends it. Userinfo is split off at
-    // its LAST `@`, so a password holding an unencoded `@` still leaves the
-    // host intact.
+    // its last `@`, so a password holding an unencoded `@` leaves the host
+    // intact.
     let (authority, tail) = rest
         .find(['/', '?', '#'])
         .and_then(|end| rest.split_at_checked(end))
@@ -191,12 +185,10 @@ pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
             let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
             let user = aterm_codec::pct::decode(user);
             let password = aterm_codec::pct::decode(password);
-            // An `@` with nothing before it names no credential, and a user-id
-            // with a colon in it makes `user:password` ambiguous (RFC 7617 §2).
-            // The raw value holds no U+FFFD (screened above), so one here is an
-            // escape whose bytes are not UTF-8, which decodes lossily: sending
-            // it would send a credential other than the one configured. An
-            // escaped U+FFFD itself (`%EF%BF%BD`) is refused with it.
+            // An empty userinfo names no credential, and a colon in the user-id
+            // makes `user:password` ambiguous (RFC 7617 §2). The raw value holds
+            // no U+FFFD (screened above), so one here is an escape that is not
+            // UTF-8; an escaped U+FFFD itself is refused with it.
             if userinfo.is_empty()
                 || user.contains(':')
                 || user.contains(char::REPLACEMENT_CHARACTER)
@@ -215,12 +207,10 @@ pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
 
 /// Whether `NO_PROXY` exempts `target`.
 ///
-/// Supports the conventional forms: `*` (everything), a bare host, a
-/// `.suffix`, and a `host:port` restricted entry. Matching is
-/// case-insensitive, and a suffix entry matches only on a LABEL boundary, so
-/// `example.test` never exempts `notexample.test`. An IP literal — IPv4, or
-/// IPv6 bare (`::1`) or bracketed (`[::1]`, `[::1]:8443`) — matches the same
-/// ADDRESS and nothing else: an address has no labels to be a suffix of.
+/// Forms: `*`, a bare host, a `.suffix`, and a port-restricted `host:port`.
+/// Matching is case-insensitive and a suffix matches only on a label boundary
+/// (`example.test` never exempts `notexample.test`). An IP literal (IPv4, bare
+/// or bracketed IPv6) matches the same address and nothing else.
 fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
     let Some(value) = value else {
         return false;
@@ -263,10 +253,9 @@ fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
 
 /// Split one `NO_PROXY` entry into its host and optional port.
 ///
-/// The port is what follows the LAST colon only when the colon is not the
-/// address's own: a bare IPv6 literal (`2001:db8::5`) has no port, and a
-/// bracketed one (`[2001:db8::5]:8443`) ends at its bracket. Splitting a bare
-/// IPv6 literal at its last colon turned it into a host that matches nothing.
+/// The port follows the last colon only when that colon is not the address's
+/// own: a bare IPv6 literal (`2001:db8::5`) has no port, and a bracketed one
+/// (`[2001:db8::5]:8443`) ends at its bracket.
 fn split_no_proxy_entry(entry: &str) -> (&str, Option<u16>) {
     let (host, port) = if let Some((host, tail)) = entry
         .strip_prefix('[')
@@ -449,7 +438,7 @@ mod tests {
             // base64("alice:s3cret")
             ("http://alice:s3cret@p.test:3128", "YWxpY2U6czNjcmV0"),
             // Percent-encoding is decoded, and an unencoded `@` in a password
-            // is split at the LAST `@`: both are base64("alice:p@ss").
+            // is split at the last `@`: both are base64("alice:p@ss").
             ("http://alice:p%40ss@p.test:3128", "YWxpY2U6cEBzcw=="),
             ("http://alice:p@ss@p.test:3128/", "YWxpY2U6cEBzcw=="),
             // A user with no password: base64("alice:").
@@ -475,8 +464,6 @@ mod tests {
 
     #[test]
     fn an_unusable_proxy_setting_is_an_error_naming_the_variable_not_a_direct_connection() {
-        // A set but unusable value must not become a silent direct
-        // connection around the proxy.
         for bad in [
             "evil.test:8080",
             "socks5://evil.test:1080",
@@ -505,9 +492,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn a_value_that_is_not_valid_unicode_fails_closed_naming_its_variable() {
-        // `std::env::var(..).ok()` read such a value as unset: the next
-        // variable decided, or none did and the request went direct. The valid
-        // `all_proxy` below is what an unset reading would fall through to.
+        // Read as unset, the value would fall through to the valid `all_proxy`.
         for name in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY"] {
             for value in [
                 not_unicode("http://p.test", ":3128"),
@@ -534,8 +519,7 @@ mod tests {
 
     #[test]
     fn a_credential_escape_that_is_not_utf8_is_refused_not_altered() {
-        // Lossy decoding turned `%FF` into U+FFFD, and the proxy was sent a
-        // password other than the configured one.
+        // A lossy decode would send a password other than the configured one.
         for bad in [
             "http://alice:%FF@p.test:3128",
             "http://alice:pw%C3@p.test:3128",
@@ -598,7 +582,7 @@ mod tests {
         // Exact host and a true subdomain are exempt...
         assert_eq!(proxy_host(&env, "https://example.test/"), None);
         assert_eq!(proxy_host(&env, "https://api.example.test/"), None);
-        // ...but a host that merely ENDS with the string is not.
+        // ...but a host that merely ends with the string is not.
         assert!(proxy_host(&env, "https://notexample.test/").is_some());
     }
 
@@ -625,8 +609,7 @@ mod tests {
 
     #[test]
     fn no_proxy_matches_ip_literals_as_addresses() {
-        // An IPv6 entry must not be split at its LAST colon as if that were
-        // a port (`2001:db8::5` -> host `2001:db8:` port 5).
+        // An IPv6 entry's last colon is not a port separator.
         for (entry, target) in [
             ("2001:db8::5", "https://[2001:db8::5]/v1"),
             ("[2001:db8::5]", "https://[2001:db8::5]/v1"),

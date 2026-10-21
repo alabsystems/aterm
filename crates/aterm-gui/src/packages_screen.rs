@@ -787,20 +787,26 @@ fn fix_marker(state: &str) -> Option<usize> {
 }
 
 /// Greedy word wrap to `width` average glyphs ([`glyph_advance`]'s estimate, since this
-/// pure projection has no font). Whitespace of every kind is a break (a recorded error may
-/// carry a newline); a token longer than a whole line is broken where its advance fills
-/// the line, so every line fits.
+/// pure projection has no font), at the places the shared rule lets a line break
+/// ([`aterm_grapheme::pieces`]): white space of every kind but a no-break space (a recorded
+/// error may carry a newline), and between CJK characters, kinsoku kept, with nothing put
+/// between them. A token longer than a whole line is broken where its advance fills the
+/// line, so every line fits.
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut used = 0usize;
     let budget = width * ADVANCE_UNIT;
-    for word in text.split_whitespace() {
+    for piece in aterm_grapheme::pieces(text, aterm_grapheme::BreakKind::is_word_boundary) {
+        let word = piece.text;
         let len = advance(word);
-        if used > 0 && used + ADVANCE_UNIT + len <= budget {
-            current.push(' ');
+        let space = if piece.spaced { ADVANCE_UNIT } else { 0 };
+        if used > 0 && used + space + len <= budget {
+            if piece.spaced {
+                current.push(' ');
+            }
             current.push_str(word);
-            used += ADVANCE_UNIT + len;
+            used += space + len;
             continue;
         }
         if used > 0 {
@@ -838,7 +844,7 @@ const ADVANCE_UNIT: usize = 20;
 
 /// An approximate advance for `c` in a proportional UI face, in twentieths of an average
 /// lowercase glyph: capitals, `_`, `—` and `@#%&` 1.2, `m`/`w` 1.5, the narrow glyphs and
-/// most punctuation 0.65, the rest 1. Fitted against the painter's measurements of long
+/// most punctuation 0.65, a wide char 2, the rest 1. Fitted against the painter's measurements of long
 /// reason lines (pt-per-unit spread held to 7%, 0.325–0.35); the row budgets
 /// ([`super::native_settings`]' `packages_reason_wrap_chars`) are set from the widest.
 /// Coarse on purpose: `native_settings`' paint audit measures the result with the real
@@ -849,6 +855,9 @@ fn glyph_advance(c: char) -> usize {
         'm' | 'w' => 30,
         'i' | 'j' | 'l' | 't' | 'f' | 'r' | '\'' | '"' | '`' | '.' | ',' | ':' | ';' | '!'
         | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '/' | '\\' | '-' | ' ' => 13,
+        // A wide char (CJK, a fullwidth form, an emoji) draws about two average glyphs:
+        // charged one, a Japanese reason was wrapped to twice its row and painted past it.
+        _ if aterm_grapheme::char_width(c) > 1 => 2 * ADVANCE_UNIT,
         _ => ADVANCE_UNIT,
     }
 }
@@ -4297,6 +4306,52 @@ mod tests {
         let pieces = wrap_words(&path, 40);
         assert!(pieces.len() > 1 && pieces.iter().all(|line| fits(line, 40)));
         assert_eq!(pieces.concat(), path);
+    }
+
+    /// A CJK REASON WRAPS BETWEEN ITS CHARACTERS, each at two average glyphs: every line
+    /// is inside its budget at that charge, no line starts with a closer or a small kana,
+    /// nothing is put between the characters a break parted, and a Latin word beside them
+    /// keeps its space. NEGATIVE CONTROL: charged one glyph and broken only at white space,
+    /// a line held twice the characters its row paints, chunked wherever the advance ran
+    /// out ("。" starting a line).
+    #[test]
+    fn a_cjk_reason_wraps_between_its_characters() {
+        let reason = format!(
+            "{}。{}、atpkg を確認してください。",
+            "パッケージの状態を読み込めませんでし", "フォルダーの権限がありません"
+        );
+        for width in 12..=48 {
+            let lines = wrap_words(&reason, width);
+            assert!(lines.len() > 1, "{width}: {lines:?}");
+            for line in &lines {
+                assert!(fits(line, width), "{width}: {line:?}");
+                let wide = line
+                    .chars()
+                    .filter(|c| aterm_grapheme::char_width(*c) > 1)
+                    .count();
+                assert!(
+                    2 * wide <= width,
+                    "{width}: {line:?} holds {wide} wide chars"
+                );
+            }
+            for line in &lines[1..] {
+                let first = line.chars().next().expect("a line has a character");
+                assert!(
+                    !['。', '、', 'ッ', 'ー'].contains(&first),
+                    "{width}: {lines:?}"
+                );
+            }
+            assert_eq!(
+                lines.concat().replace(' ', ""),
+                reason.replace(' ', ""),
+                "{width}: {lines:?}"
+            );
+        }
+        assert_eq!(
+            wrap_words("設定 atpkg", 40),
+            ["設定 atpkg"],
+            "a space between a CJK word and a Latin one stays"
+        );
     }
 
     /// The marker is the word `fix:`: a `prefix:` in a path sentence is not a remedy, a

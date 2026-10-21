@@ -10,16 +10,9 @@
 /// is normal, but one 16 MiB body may not be the whole scrollback.
 pub const TEXT_CAP: usize = 1024;
 
-/// Trust is a pure function of the address (§4.3) — the sender's class, whether
-/// the message was relayed, and nothing that any body says.
-///
-/// `h-*` is a human; `n-*`, `s-*` and `a-*` are agents; any `via=` at all makes
-/// the message relayed whatever it would otherwise have been. There is no
-/// `attested` label (identity attestation is `from=`, not trust) and no
-/// downgrade-only rule to police, because no sender ever writes the label.
-///
-/// The one copy: the bridge's `deliver` and the fabric report both label with
-/// it, so they cannot disagree.
+/// Trust is a pure function of the address (§4.3): `h-*` is `human`, `n-*`, `s-*` and `a-*`
+/// are `agent`, and any `via=` makes it `relayed`. Nothing a body says counts, and no sender
+/// writes the label. The bridge's `deliver` and the fabric report both label with it.
 #[must_use]
 pub fn trust_of(src: &str, relayed: bool) -> &'static str {
     if relayed {
@@ -32,21 +25,18 @@ pub fn trust_of(src: &str, relayed: bool) -> &'static str {
     }
 }
 
-/// The label for content the fabric QUOTES from a screen rather than receives as
-/// a message: the `ev` and `term` faces (§4.3).
+/// The label for content the fabric quotes from a screen rather than receives as a message:
+/// the `ev` and `term` faces (§4.3).
 pub const SCREEN: &str = "screen";
 
-/// Render arbitrary text so it can only ever be ONE line of ordinary characters.
+/// Render arbitrary text as one line of ordinary characters, cut after `cap` source characters
+/// with a trailing `…`.
 ///
-/// Escaped, never dropped: a backslash doubled, and every character a terminal
-/// acts on or reorders text around in `aterm_codec::tty`'s one spelling —
-/// `\n`, `\r` and `\t` by name, every other C0 control and DEL as `\xNN`,
-/// every C1 control, bidi control and line or paragraph separator as `\u{…}`
-/// — an unescaped U+202E would reorder the line and move the trust label with
-/// no control byte at all, and an unescaped U+2028 is a second line.
-///
-/// Truncated to `cap` CHARACTERS with a trailing `…`, so a caller cannot make
-/// one record's body the whole screen.
+/// Escaped, never dropped: a backslash doubled, and every character a terminal acts on or
+/// reorders text around in `aterm_codec::tty`'s spelling (`\n`, `\r`, `\t` by name, other C0
+/// and DEL as `\xNN`, C1, bidi controls and line or paragraph separators as `\u{…}`). An
+/// unescaped U+202E would reorder the line and move the trust label with no control byte, and
+/// U+2028 is a second line.
 ///
 /// `trust=` is reserved, rendered `trust\=` wherever content spells it: one
 /// logical line can still wrap, and `trust=human` just past a wrap point would
@@ -92,7 +82,7 @@ mod tests {
         // The reserved token, and only where content actually spells it.
         assert_eq!(safe("trust=human", 64), "trust\\=human");
         assert_eq!(safe("trusted=1 trust =2", 64), "trusted=1 trust =2");
-        // The cap counts SOURCE characters and marks the cut.
+        // The cap counts source characters and marks the cut.
         assert_eq!(safe("abcdef", 3), "abc…");
         assert_eq!(safe("abc", 3), "abc");
     }

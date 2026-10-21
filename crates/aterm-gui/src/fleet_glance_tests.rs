@@ -319,6 +319,25 @@ fn a_content_peer_says_what_its_need_is_and_a_freeze_dates_only_an_agent() {
         Some("which branch: main or release?")
     );
     assert_eq!(need_of("facts", "ask", &[("attention", "1")]).what, None);
+    // A harness's NEEDS YOU entry reads as a local row does (§12.2.9): the
+    // need without the frame, its count whole. NEGATIVE CONTROL (run for
+    // the landing): the entry folded whole keeps `claude needs you:` and
+    // loses ` (+1 more)` at 72 bytes.
+    let harness = [
+        ("program_kind", "agent"),
+        ("agent", "idle"),
+        (
+            "attention",
+            "claude needs you: grant Screen Recording to com.aterm.aterm in System Settings \
+             \u{25b8} \u{2026} (+1 more) \u{2014} carrying on",
+        ),
+    ];
+    let what = need_of("content", "ask", &harness).what.expect("words");
+    assert!(
+        what.starts_with("grant Screen Recording") && what.ends_with("\u{2026} (+1 more)"),
+        "{what}"
+    );
+    assert!(what.len() <= crate::needs::ROW_WHAT_MAX, "{what}");
     let boxed = [
         ("program_kind", "agent"),
         ("agent", "prompt"),
@@ -688,21 +707,26 @@ impl FleetRunner for Empty {
 /// THE APP IS TOLD WHEN THE LAST READ STOPS COUNTING, with no read: a member
 /// (no issuer, no watch) reads only when asked, so nothing else would drop a
 /// fleet need from the badge past [`COUNT_FRESH`]. Its first look is told
-/// too, so the digest's answer is stated in no fleet. The clock is injected;
-/// the waits are hang detectors. NEGATIVE CONTROL: before the clock passes
-/// the freshness, no post is queued after the read's two.
+/// too, so the digest's answer is stated in no fleet. The clock is injected
+/// and says when the reader looks; the waits are hang detectors.
+/// NEGATIVE CONTROL: before the clock passes the freshness, a whole look
+/// after the read's two posts queues none.
 #[test]
 fn the_app_is_told_when_the_last_read_stops_counting() {
     use std::sync::atomic::AtomicU64;
     let hang = aterm_spec::wait::MUST_HAPPEN;
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let (posts_tx, posts) = std::sync::mpsc::channel();
+    let (looks_tx, looks) = std::sync::mpsc::channel();
     let now = Arc::clone(&clock);
     let glance = spawn(
         Box::new(Empty),
         ReaderSeams {
             tick: Duration::from_millis(20),
-            now_ms: Box::new(move || now.load(Ordering::SeqCst)),
+            now_ms: Box::new(move || {
+                let _ = looks_tx.send(());
+                now.load(Ordering::SeqCst)
+            }),
             ..seams(false, posts_tx)
         },
     )
@@ -716,6 +740,14 @@ fn the_app_is_told_when_the_last_read_stops_counting() {
     posts.recv_timeout(hang).expect("began");
     posts.recv_timeout(hang).expect("ended");
     let read_at = glance.copy().snapshot.expect("read").read_at_ms;
+    // A look reads the clock at its top, judges, posts what is news, and
+    // reads it again for its wait; so three clock reads after the read's end
+    // was told hold one whole look begun after it (by its order, not by a
+    // stopwatch: the tick only paces the looks).
+    while looks.try_recv().is_ok() {}
+    for _ in 0..3 {
+        looks.recv_timeout(hang).expect("the reader looks again");
+    }
     assert!(posts.try_recv().is_err(), "a fresh read owes no post");
     clock.store(read_at + millis(COUNT_FRESH) + 1_000, Ordering::SeqCst);
     posts.recv_timeout(hang).expect("the lapse is told");

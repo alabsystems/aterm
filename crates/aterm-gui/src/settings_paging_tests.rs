@@ -373,12 +373,15 @@ fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
 /// bar — with no band of blank over 8pt under it; a screen that ends on a
 /// whole card instead ends on that card's boundary, the gap and less than
 /// [`scroll::PEEK_MIN`] of the next card under it, and the next screen starts
-/// with the next card. Judged from the paint. The hard edge used to cut a
+/// with the next card. A list that ends on whole stops
+/// ([`scroll::ListFoot::Whole`], Themes' chooser beside the demo) cuts no
+/// card and ends on its last whole stop, less than the next stop's height
+/// over the page's bottom. Judged from the paint. The hard edge used to cut a
 /// card that would end whole PEEK_MIN short of its bottom (Packages at 80x24:
 /// a 36pt band) and to land on a caption's top (Software Update at 60x20).
 #[test]
 fn no_screen_ends_on_blank_under_a_card_it_cuts() {
-    let mut cut_screens = 0usize;
+    let (mut cut_screens, mut whole_foot_screens) = (0usize, 0usize);
     let mut faults = Vec::new();
     for source in ["", CHANGED] {
         for route in SettingsRoute::ALL {
@@ -461,7 +464,20 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                             && node.clip.bottom() >= drawn_to - 0.5
                     });
                     let band = page_bottom - drawn_to;
-                    if cut {
+                    if plan.foot() == scroll::ListFoot::Whole {
+                        whole_foot_screens += 1;
+                        // The room the next stop would take on this screen.
+                        let bands = plan.drawn_bands(top);
+                        let (first, next) = (bands[0].stop, bands[bands.len() - 1].stop + 1);
+                        let takes = plan.span(first..next + 1) - plan.span(first..next);
+                        if cut || band + 0.5 >= takes {
+                            faults.push(format!(
+                                "{context}: a list that ends on whole stops {} \
+                                 ({band}pt over the page's bottom, the next stop {takes}pt)",
+                                if cut { "cuts a card" } else { "ends short" }
+                            ));
+                        }
+                    } else if cut {
                         cut_screens += 1;
                         if band > 8.0 {
                             faults.push(format!(
@@ -485,6 +501,10 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
         faults.join("\n")
     );
     assert!(cut_screens > 0, "the sweep holds screens that end on a cut");
+    assert!(
+        whole_foot_screens > 0,
+        "the sweep holds screens of a list that ends on whole stops"
+    );
 }
 
 /// A STATUS BAR NEVER MOVES THE LIST, EVEN UNDER A ROW WHOSE FACTS IT
@@ -655,7 +675,9 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
         anchor,
         PageChrome {
             no_subtitle: true,
-            inset: Some(12.0)
+            inset: Some(12.0),
+            bar_room_given: false,
+            preview_listed: false,
         }
     );
     assert_eq!((need, room), (212.0, 234.0));
@@ -668,7 +690,9 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
         step,
         PageChrome {
             no_subtitle: true,
-            inset: None
+            inset: None,
+            bar_room_given: false,
+            preview_listed: false,
         }
     );
     assert_eq!((need, room), (188.0, 194.0));
@@ -705,6 +729,207 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
     let (packages, (need, room), ..) = chrome(SettingsRoute::Packages, None, (584.0, 348.0), None);
     assert_eq!(packages, PageChrome::FULL, "{need} of {room}");
     assert!(need > room + 32.0, "no chrome holds it: {need} of {room}");
+}
+
+/// THE BAR'S ROOM AND THE CHROME NEVER STARVE THE LIST (#58, [`PageChrome`]):
+/// at 220×12 with 2× text (1564×180) Settings ▸ Themes kept 64pt for a status
+/// bar that was not up and gave its chooser 68pt, so every 72pt row was cut;
+/// the list now takes that room, and every row of the chooser is whole on its
+/// screen. A bar that comes then takes its room from the list, which is laid
+/// out again under it, and the decision, made with no bar up, stands. The
+/// page sheds no more than leaves every stop whole: Top Settings' font rows,
+/// Tab Color's wheel and Packages' rows at 220×12 at 2× text, each whole on
+/// the screen that lets its card's caption go, take the bar's room and keep
+/// the subtitle (counted under their captions, they read as cut and shed it
+/// too). Cursor Styles lists its preview as the list's first stop only where
+/// its leanest chrome still cuts stops under the pinned preview (80x16 at 2×
+/// text: its 92pt style tiles under the pinned preview had an 88pt list);
+/// at 220×16 it once pinned the preview and cut every style row but Off by
+/// 14pt under its group's caption, and at 220×12, 220×16 and from 220×20 it
+/// keeps the preview pinned over whole rows (each whole on the screen that
+/// lets its caption go), as at 849×300 and 150×24 at 1×. CONTROLS: every
+/// shipped size keeps the bar's room, its chrome and the pinned preview.
+#[test]
+fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
+    at_each_text_scale(&[1.0, 2.0], "the bar's room", |scale| {
+        let seated = |route: SettingsRoute, (width, height): (f32, f32), bar: bool| {
+            let cx = view_cx_at(width, height);
+            let (mut runtime, instance, view) = paging_view("", route);
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            if bar {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.show_transient_status_for_test("Saved");
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let state = messages_view_state(&runtime, view);
+            let plan = state.scroll_plan().expect("a list");
+            (
+                state.page_chrome.get(),
+                plan.room(),
+                plan.cut_stops(),
+                compiled,
+            )
+        };
+        let preview = UiKey::new("settings/preview/cursor-styles");
+        if scale > 1.5 {
+            let short = (1_564.0, 180.0);
+            let (chrome, room, cuts, _) = seated(SettingsRoute::Themes, short, false);
+            assert!(
+                chrome.bar_room_given,
+                "Themes gives its chooser the bar's room"
+            );
+            assert_eq!(cuts, 0, "every row of the chooser is whole in {room}pt");
+            let (still, barred, _, compiled) = seated(SettingsRoute::Themes, short, true);
+            assert_eq!(
+                still, chrome,
+                "a bar that comes changes nothing of the chrome"
+            );
+            assert!(
+                compiled
+                    .semantics
+                    .iter()
+                    .any(|node| node.key.as_str() == "settings/status"),
+                "the bar is up"
+            );
+            assert!(barred < room - 0.5, "and takes its room from the list");
+            for route in [
+                SettingsRoute::Home,
+                SettingsRoute::TabColor,
+                SettingsRoute::Packages,
+                SettingsRoute::CursorStyles,
+            ] {
+                let (chrome, room, cuts, _) = seated(route, short, false);
+                assert_eq!(
+                    cuts, 0,
+                    "{route:?} at 1564×180: every stop whole in {room}pt"
+                );
+                assert!(
+                    chrome.bar_room_given,
+                    "{route:?} at 1564×180 sheds for it: {chrome:?}"
+                );
+            }
+        }
+        // Cursor Styles' preview, listed where only listing it leaves every
+        // stop whole, else pinned over whole rows.
+        let windows: &[((f32, f32), bool)] = if scale > 1.5 {
+            &[
+                ((584.0, 236.0), true),
+                ((1_564.0, 180.0), false),
+                ((1_564.0, 240.0), false),
+                ((1_564.0, 280.0), false),
+                ((1_074.0, 348.0), false),
+            ]
+        } else {
+            &[((849.0, 300.0), false), ((1_074.0, 348.0), false)]
+        };
+        for &(window, listed) in windows {
+            let cx = view_cx_at(window.0, window.1);
+            let (runtime, instance, view) = paging_view("", SettingsRoute::CursorStyles);
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            let state = messages_view_state(&runtime, view);
+            let plan = state.scroll_plan().expect("a list");
+            assert_eq!(
+                plan.cut_stops(),
+                0,
+                "{window:?} at {scale}×: every stop whole in {}pt",
+                plan.room()
+            );
+            assert_eq!(
+                plan.stop_of_preview(&preview),
+                listed.then_some(0),
+                "{window:?} at {scale}×: the preview listed first ({listed}) or pinned"
+            );
+            assert_eq!(state.page_chrome.get().preview_listed, listed);
+        }
+        // CONTROLS: the shipped sizes keep the bar's room, the chrome the
+        // lead keeps, and the pinned preview.
+        for route in [
+            SettingsRoute::Themes,
+            SettingsRoute::CursorStyles,
+            SettingsRoute::Sound,
+            SettingsRoute::Home,
+        ] {
+            for window in [
+                (584.0, 348.0),
+                (738.0, 418.0),
+                (1_074.0, 684.0),
+                (1_564.0, 854.0),
+            ] {
+                let (chrome, ..) = seated(route, window, false);
+                assert_eq!(
+                    chrome,
+                    PageChrome::FULL,
+                    "{route:?} {window:?} at {scale}× keeps its chrome and the bar's room"
+                );
+            }
+        }
+    });
+}
+
+/// THE CHROME IS DECIDED ONCE PER LAYOUT INPUT, NOT EVERY FRAME (#64): a
+/// short window sheds its page's chrome by seating the page under each rung
+/// of a ladder, and an animated preview re-rendered the page every frame, so
+/// every frame ran the ladder again. Frames that move only the clock now
+/// take the chrome the last decision chose — the same chrome, every render
+/// the tests make deciding again to prove it ([`page`]) — while a change
+/// of content (an event), of window or of text size decides again.
+#[test]
+fn a_short_windows_chrome_is_decided_once_per_layout_input() {
+    let remembered = || super::CHROME_REMEMBERED.with(std::cell::Cell::get);
+    let short = (1_074.0, 348.0);
+    let at = |phase: u64, (width, height): (f32, f32)| ViewCx {
+        animation_phase_ms: phase,
+        ..view_cx_at(width, height)
+    };
+    // Top Settings, its cursor preview animated, sheds its subtitle and
+    // its insets to 12pt at 1074×348: three rungs a frame.
+    let (mut runtime, instance, view) = paging_view("", SettingsRoute::Home);
+    let first = compile_settings_view(&runtime, instance, view, &at(0, short));
+    let chrome = messages_view_state(&runtime, view).page_chrome.get();
+    assert_ne!(chrome, PageChrome::FULL, "the short window sheds chrome");
+    let before = remembered();
+    for phase in [16, 33, 50, 66] {
+        let frame = compile_settings_view(&runtime, instance, view, &at(phase, short));
+        assert_eq!(
+            messages_view_state(&runtime, view).page_chrome.get(),
+            chrome
+        );
+        assert_eq!(
+            list_paint(&frame),
+            list_paint(&first),
+            "a frame of the clock lays out what the first did"
+        );
+    }
+    assert_eq!(
+        remembered() - before,
+        4,
+        "each frame took the remembered chrome"
+    );
+    // An event, a window and a text size each decide again.
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(1))
+        .unwrap();
+    let before = remembered();
+    let _ = compile_settings_view(&runtime, instance, view, &at(83, short));
+    assert_eq!(remembered(), before, "an event decides again");
+    let _ = compile_settings_view(&runtime, instance, view, &at(100, (1_074.0, 360.0)));
+    assert_eq!(remembered(), before, "a window decides again");
+    crate::native_appearance::install_preferences(
+        crate::native_appearance::AppearancePreferences {
+            text_scale: 1.25,
+            ..crate::native_appearance::current_preferences()
+        },
+    );
+    let _ = compile_settings_view(&runtime, instance, view, &at(116, (1_074.0, 360.0)));
+    crate::native_appearance::install_preferences(
+        crate::native_appearance::AppearancePreferences {
+            text_scale: 1.0,
+            ..crate::native_appearance::current_preferences()
+        },
+    );
+    assert_eq!(remembered(), before, "a text size decides again");
 }
 
 /// Where the compiled page draws its list's controls and words: each node's
@@ -938,9 +1163,9 @@ fn a_status_bar_never_changes_the_page_chrome() {
 }
 
 /// THE LIST'S KEYS NEVER WORK A CONTROL THEY CARRIED THE KEYBOARD TO: Page
-/// Up and Down and Home and End take the keyboard through the list, and a
-/// slider they put it on takes those keys for itself only once the person
-/// works it. A Page Up that took the keyboard to Text & Fonts' Weight slider
+/// Up and Down and Home and End take the keyboard through the list, and
+/// stay the list's on a slider, however the keyboard got there. A Page Up
+/// that took the keyboard to Text & Fonts' Weight slider
 /// (the last control of the first screen) made every Page Up after it a step
 /// down the font's weight, written to aterm.toml, and End from the slider a
 /// list ended on set it to its top. On every route at 80x24, 102x29 and
@@ -948,7 +1173,8 @@ fn a_status_bar_never_changes_the_page_chrome() {
 /// list's first control, every Page Down to the list's end, End, every Page
 /// Up to its top, one more, and Home write nothing; at 102x29, so do Down
 /// and Up through every control of the list (a colour wheel takes them only
-/// once worked). A slider the person works takes them again.
+/// once worked). A slider the person worked or put the keyboard on (Tab, a
+/// click) writes nothing on those keys either; its arrows work it.
 #[test]
 fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
     let end = AppEvent::TextInput(TextInputEvent::End { extend: false });
@@ -1028,7 +1254,8 @@ fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
     );
 
     // A slider the person works, or put the keyboard on themselves (Tab, a
-    // click), takes the page keys and Home and End.
+    // click), takes its arrows; the page keys and Home and End stay the
+    // list's, so they never write there either.
     let cx = view_cx_at(1_074.0, 684.0);
     let weight = UiKey::new(format!("settings/control/{}", prefs::EDIT_FONT_WEIGHT));
     let on_weight = |carried: bool| {
@@ -1045,7 +1272,12 @@ fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
         (runtime, instance, view)
     };
     let (mut runtime, instance, view) = on_weight(true);
-    for key in [AppEvent::ScrollPage(-1), AppEvent::ScrollPage(1), end, home] {
+    for key in [
+        AppEvent::ScrollPage(-1),
+        AppEvent::ScrollPage(1),
+        end.clone(),
+        home.clone(),
+    ] {
         let outcome = runtime.dispatch(instance, view, key.clone()).unwrap();
         assert!(
             !writes(&outcome),
@@ -1066,20 +1298,26 @@ fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
         !messages_view_state(&runtime, view).list_keys_carried(),
         "a worked slider takes its own keys"
     );
+    for key in [AppEvent::ScrollPage(-1), AppEvent::ScrollPage(1), end, home] {
+        let (mut runtime, instance, view) = on_weight(false);
+        let outcome = runtime.dispatch(instance, view, key.clone()).unwrap();
+        assert!(
+            !writes(&outcome),
+            "{key:?}: a slider Tab or a click put the keyboard on writes nothing"
+        );
+    }
     let (mut runtime, instance, view) = on_weight(false);
-    let page_up = runtime
-        .dispatch(instance, view, AppEvent::ScrollPage(-1))
+    let right = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Right { extend: true }),
+        )
         .unwrap();
-    assert!(
-        writes(&page_up),
-        "a slider Tab or a click put the keyboard on takes Page Up"
-    );
-    assert_eq!(
-        messages_view_state(&runtime, view).common.last_focus,
-        Some(weight.clone())
-    );
+    assert!(writes(&right), "its arrows work it");
     // Carried there, then Tab away and Shift-Tab back (the host's focus
-    // changes): the person put the keyboard on it, and it takes Page Up.
+    // changes): the person put the keyboard on it, and Page Up still turns
+    // the list.
     let (mut runtime, instance, view) = on_weight(true);
     let size = UiKey::new(format!("settings/control/{}", prefs::EDIT_FONT_PX));
     for focus in [size, weight.clone()] {
@@ -1092,12 +1330,8 @@ fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
         .dispatch(instance, view, AppEvent::ScrollPage(-1))
         .unwrap();
     assert!(
-        writes(&page_up),
-        "a slider Tab put the keyboard back on takes Page Up"
-    );
-    assert_eq!(
-        messages_view_state(&runtime, view).common.last_focus,
-        Some(weight)
+        !writes(&page_up),
+        "a slider Tab put the keyboard back on writes nothing on Page Up"
     );
 }
 
@@ -1296,4 +1530,836 @@ fn opening_a_message_never_changes_the_page_chrome() {
         }
     }
     assert!(faults.is_empty(), "{faults:#?}");
+}
+
+/// A LIST WALKS ITS CONTROLS IN THE ORDER THE PAGE DRAWS THEM: Tab past a
+/// screen's edge and the list's keys go by the list's order of controls, so
+/// every screen's controls stand in it as the compiled page orders them. A
+/// stacked row listed its control ahead of the Reset its label line draws
+/// over it, and Tab from Appearance's Faint text opacity slider (80x24, 2x
+/// text, the setting changed) went back up to that Reset, and from there
+/// down to the slider again: the keyboard never left the row. Every route
+/// at 80x24, 102x29 and 150x48, 1x and 2x text, each screen of its list.
+#[test]
+fn a_list_walks_its_controls_in_the_order_the_page_draws_them() {
+    let source = format!("{CHANGED}faint_opacity = 0.4\nbackground_opacity = 0.9\n");
+    at_each_text_scale(&[1.0, 2.0], "list order", |scale| {
+        let mut faults = Vec::new();
+        let mut screens = 0usize;
+        for route in SettingsRoute::ALL {
+            for (width, height) in PAGING_SIZES {
+                let cx = view_cx_at(width, height);
+                let (mut runtime, instance, view) = paging_view(&source, route);
+                let mut compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
+                    continue;
+                };
+                for _ in 0..plan.limit() + 2 {
+                    let plan = messages_view_state(&runtime, view)
+                        .scroll_plan()
+                        .expect("the list stays listed");
+                    let listed: Vec<(usize, &UiKey)> = compiled
+                        .focus_order
+                        .iter()
+                        .filter_map(|key| plan.control_index(key).map(|index| (index, key)))
+                        .collect();
+                    screens += 1;
+                    if let Some(pair) = listed.windows(2).find(|pair| pair[1].0 < pair[0].0) {
+                        faults.push(format!(
+                            "{route:?} {width}x{height} {scale}x: {} is drawn before {} but listed after it",
+                            pair[0].1.as_str(),
+                            pair[1].1.as_str()
+                        ));
+                    }
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollPage(1))
+                        .unwrap();
+                    compiled = compile_settings_view(&runtime, instance, view, &cx);
+                }
+            }
+        }
+        assert!(screens > 0, "lists were walked");
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// The short windows the short-window sweep covers: 220x12, 220x13 and
+/// 220x16, 102x12, 102x16 and 80x16 (the narrow windows' 180-240pt), 60x20,
+/// 80x20 and 80x24.
+const SHORT_SIZES: [(f32, f32); 9] = [
+    (1_564.0, 180.0),
+    (1_564.0, 194.0),
+    (1_564.0, 236.0),
+    (738.0, 180.0),
+    (738.0, 236.0),
+    (584.0, 236.0),
+    (444.0, 292.0),
+    (584.0, 292.0),
+    (584.0, 348.0),
+];
+
+/// [`shown_whole`], a list that shows all of itself — drawn with no thumb —
+/// included: every stop it draws whole there.
+fn shown_whole_on(
+    compiled: &crate::native_ui::CompiledUi,
+    plan: &scroll::ScrollPlan,
+    top: usize,
+) -> BTreeSet<usize> {
+    let screen = plan.screen(top.min(plan.limit()));
+    if !screen.whole {
+        return shown_whole(compiled, plan, top);
+    }
+    let Some(list) = compiled.paint.iter().find(|node| {
+        node.key.as_str() != "settings/navigation/list"
+            && matches!(&node.content, UiContent::Group(spec) if spec.role == SemanticRole::List)
+            && (node.rect.height - screen.height).abs() < 0.5
+    }) else {
+        return BTreeSet::new();
+    };
+    let list = list.rect;
+    plan.drawn_bands(top)
+        .into_iter()
+        .filter(|band| {
+            let (from, to) = (list.y + band.at, list.y + band.at + band.height);
+            let nodes: Vec<_> = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    let middle = node.rect.y + node.rect.height / 2.0;
+                    paints_content(node)
+                        && !node.clip.is_empty()
+                        && node.clip.x >= list.x - 0.5
+                        && node.clip.right() <= list.right() + 0.5
+                        && middle >= from - 0.01
+                        && middle < to - 0.01
+                })
+                .collect();
+            !nodes.is_empty()
+                && nodes.iter().all(|node| {
+                    (node.clip.y - node.rect.y).abs() < 0.5
+                        && (node.clip.height - node.rect.height).abs() < 0.5
+                })
+        })
+        .map(|band| band.stop)
+        .collect()
+}
+
+/// What one walk over a list's screens found: the stops it showed whole,
+/// each group caption it drew and whether it drew that whole on some screen,
+/// and what the audit flagged on any screen it drew.
+#[derive(Default)]
+struct Walk {
+    whole: BTreeSet<usize>,
+    captions: BTreeMap<String, bool>,
+    faults: Vec<String>,
+}
+
+/// Each group caption the compiled screen whose first stop is `top` draws on
+/// its list, by key (a caption on several lines as one), and whether it is
+/// drawn whole in the list's room: none of its lines cut by an edge, fading
+/// in the strip under the room, or past it.
+fn captions_drawn(
+    compiled: &crate::native_ui::CompiledUi,
+    plan: &scroll::ScrollPlan,
+    top: usize,
+) -> BTreeMap<String, bool> {
+    let mut captions = BTreeMap::new();
+    let screen = plan.screen(top.min(plan.limit()));
+    let Some(list) = painted_list(compiled, plan, top) else {
+        return captions;
+    };
+    let room = if screen.whole {
+        list.height
+    } else {
+        plan.room()
+    };
+    for node in &compiled.paint {
+        let UiContent::Text(text) = &node.content else {
+            continue;
+        };
+        let middle = node.rect.y + node.rect.height / 2.0;
+        if text.role != SemanticRole::Heading
+            || text.style != StyleRef::Quiet
+            || node.clip.is_empty()
+            || node.rect.x < list.x - 0.5
+            || node.rect.right() > list.right() + 0.5
+            || middle < list.y
+            || middle > list.bottom()
+        {
+            continue;
+        }
+        let key = node.key.as_str();
+        let key = key
+            .rsplit_once("/line-")
+            .map_or(key, |(caption, _)| caption);
+        let whole = node.fade.is_none()
+            && (node.clip.y - node.rect.y).abs() < 0.5
+            && (node.clip.height - node.rect.height).abs() < 0.5
+            && node.rect.y >= list.y - 0.5
+            && node.rect.bottom() <= list.y + room + 0.5;
+        *captions.entry(key.to_string()).or_insert(true) &= whole;
+    }
+    captions
+}
+
+/// Walk the list from where it stands, each `event` drawn as the window draws
+/// between presses, until one moves it no further: every stop each screen
+/// shows whole, judged from its paint, and each screen's audit.
+fn walk_screens(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    event: &AppEvent,
+) -> Walk {
+    let mut walk = Walk::default();
+    let mut before = None;
+    for _ in 0..400 {
+        let compiled = compile_settings_view(runtime, instance, view, cx);
+        let state = messages_view_state(runtime, view);
+        let Some(plan) = state.scroll_plan() else {
+            break;
+        };
+        let top = state.page_scroll.min(plan.limit());
+        let place = (top, (plan.screen(top).offset * 100.0).round() as i64);
+        if before == Some(place) {
+            break;
+        }
+        before = Some(place);
+        walk.whole.extend(shown_whole_on(&compiled, &plan, top));
+        for (caption, whole) in captions_drawn(&compiled, &plan, top) {
+            *walk.captions.entry(caption).or_insert(false) |= whole;
+        }
+        walk.faults.extend(
+            compiled
+                .fit_failures()
+                .into_iter()
+                .chain(compiled.sliced_marks())
+                .map(|fault| format!("screen {top}: {fault}")),
+        );
+        runtime.dispatch(instance, view, event.clone()).unwrap();
+    }
+    walk
+}
+
+/// EVERY STOP OF A SHORT WINDOW'S LIST IS WHOLE ON SOME SCREEN, BY PAGE DOWN
+/// AND BY THE WHEEL, AND NO SCREEN SLICES A WORD OR A PICTOGRAM AT AN EDGE
+/// (#96-#99, and the sweep that followed them): every route, at 220x12,
+/// 220x13, 220x16, 102x12, 102x16, 80x16, 60x20, 80x20 and 80x24, 1× and 2×
+/// text, both themes, from the list's top a stop at a time (the wheel) and a
+/// screen at a time (Page Down), each screen judged from its paint
+/// ([`shown_whole`]): every stop that draws anything is drawn whole on some
+/// screen of each walk, so is every group caption it draws (in the room,
+/// not fading in the strip under it), and no screen overflows, clips by
+/// accident, paints a mark over another, or cuts a line of words or a
+/// pictogram through at either edge of a list
+/// ([`crate::native_ui::CompiledUi::sliced_marks`]). With the strip kept
+/// for a status bar, Sound's 72pt list at 220x12 let TERMINAL BELL go on
+/// the screen of its bell row and drew it only in the strip on the screen
+/// before (Window & Tabs' PRESENCE, TAB STATUS and TABS & PANES, Terminal's
+/// SYSTEM, Security's NOTIFICATIONS, Harness's and Ai's first cards
+/// likewise at 1×; Appearance's EFFECTS, Cursor & Motion's CURSOR and
+/// Software Update's automatic card at 2×).
+/// At 102x12 at 2× text a group's 50pt caption over a 64pt control in a
+/// 100pt list left 21 of Cursor Styles' 37 stops (19 of Appearance's 48, 18
+/// of Window's 54) cut on every screen; Software Update's 218pt workbench in
+/// a 72pt list (220x12, 1×), About's short hero, Tab Color's 120pt wheel,
+/// the theme card's Follow system row and Modified's empty-state line under
+/// its pinned summary (102x12, 2×) were on no screen whole; Top Settings
+/// sliced "COLOR PREVIEW" at the window's bottom and the sidebar a row's
+/// icon under its search field (220x12, 2×); Packages' service line ran
+/// past its column (60x20, 2×).
+#[test]
+fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
+    at_each_text_scale(&[1.0, 2.0], "short windows", |scale| {
+        let mut report = Vec::new();
+        let mut faults = 0usize;
+        for source in ["", "theme = \"GitHub Light\"\n"] {
+            for route in SettingsRoute::ALL {
+                if route == SettingsRoute::Messages {
+                    continue;
+                }
+                for (width, height) in SHORT_SIZES {
+                    let context = format!(
+                        "{route:?} {width}x{height} {scale}x{}",
+                        if source.is_empty() { "" } else { " light" }
+                    );
+                    let cx = view_cx_at(width, height);
+                    // Tab Control with tabs open, as the narrow sweep's fleet
+                    // has them: its rows are listed a line at a time.
+                    let (mut runtime, instance, view) = if route == SettingsRoute::Tabs {
+                        let (mut runtime, instance, view) =
+                            super::narrow::every_page_runtime_over(source);
+                        runtime
+                            .dispatch(
+                                instance,
+                                view,
+                                AppEvent::Action(ActionInvocation {
+                                    id: route_action(route),
+                                    value: None,
+                                }),
+                            )
+                            .unwrap();
+                        (runtime, instance, view)
+                    } else {
+                        paging_view(source, route)
+                    };
+                    let _ = compile_settings_view(&runtime, instance, view, &cx);
+                    let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
+                        continue;
+                    };
+                    let n = plan.len();
+                    let name = |stop: usize| {
+                        plan.identities(stop)
+                            .next()
+                            .map_or_else(|| format!("#{stop}"), |key| key.as_str().to_string())
+                    };
+                    // From the list's top, as a person scrolls down it.
+                    {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        else {
+                            unreachable!();
+                        };
+                        state.page_scroll = 0;
+                        state.page_reveal = None;
+                    }
+                    let wheel =
+                        walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollLines(1));
+                    {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        else {
+                            unreachable!();
+                        };
+                        state.page_scroll = 0;
+                        state.page_reveal = None;
+                    }
+                    let page =
+                        walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollPage(1));
+                    let never = |walk: &Walk| {
+                        (0..n)
+                            .filter(|stop| plan.paints(*stop) && !walk.whole.contains(stop))
+                            .map(name)
+                            .collect::<Vec<_>>()
+                    };
+                    let (by_wheel, by_page) = (never(&wheel), never(&page));
+                    // A group's caption a walk draws, on no screen whole.
+                    let unread = |walk: &Walk| {
+                        walk.captions
+                            .iter()
+                            .filter(|(_, whole)| !**whole)
+                            .map(|(caption, _)| caption.clone())
+                            .collect::<Vec<_>>()
+                    };
+                    let mut captions = unread(&wheel);
+                    captions.extend(unread(&page));
+                    captions.sort();
+                    captions.dedup();
+                    let mut audit = wheel.faults;
+                    audit.extend(page.faults);
+                    audit.sort();
+                    audit.dedup();
+                    if !by_wheel.is_empty()
+                        || !by_page.is_empty()
+                        || !captions.is_empty()
+                        || !audit.is_empty()
+                    {
+                        faults += by_wheel.len() + by_page.len() + captions.len() + audit.len();
+                        report.push(format!(
+                            "{context}: {n} stops; never whole by wheel {}/{n} {by_wheel:?}; \
+                             by Page Down {}/{n} {by_page:?}; captions never whole {captions:?}; \
+                             audit {} {:#?}",
+                            by_wheel.len(),
+                            by_page.len(),
+                            audit.len(),
+                            audit.iter().take(6).collect::<Vec<_>>()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            faults == 0,
+            "{faults} faults at {scale}x:\n{}",
+            report.join("\n")
+        );
+    });
+}
+
+/// A PAGE TURN TAKES THE KEYBOARD ONTO ITS SCREEN (#84): on every route but
+/// Messages and Themes (which move the keyboard through their own rows), at
+/// the short windows and 22x24, 80x24, 102x29 and 150x48, 1× and 2× text,
+/// with no setting changed and with several (rows that carry a Reset), the
+/// keyboard on the first screen's first control, each Page Down to the
+/// list's end and each Page Up back leaves the keyboard on a control of a
+/// stop the new screen shows as a landing on it reveals it (its controls
+/// and words whole, its padding cut or not) — where the turn moved it, the
+/// screen's first such control, by Page Up as by Page Down (Page Up took it
+/// to the screen's last, so the next Down arrow scrolled the list back to
+/// the screen the turn had left): at 80x24 at 2× text
+/// Page Down to Top Settings' Sparkle words passed over Profanity's switch,
+/// whose stop the screen's edge cut only in its padding, to Feline's — or,
+/// where none of those holds a
+/// control, on a control the screen draws live, cut by its edge, the list
+/// where the turn put it — or, on a screen of words that draws no control
+/// at all, where it was. From Appearance's Minimum contrast slider at 80x24
+/// at 2× text the first Page Down showed the slider's note and the next
+/// row's slider 4pt cut, and left the keyboard on the slider off screen.
+/// At 22x24 at 2× text, Page Up onto a screen that draws a stacked row's
+/// name line and Reset over its edge held the keyboard on the row's last
+/// control, its switch under the edge, which the screen did not draw
+/// (Modified's Font size, Lines and Trail rows; Window & Tabs' Lines).
+/// CONTROL: some turn holds the keyboard on a cut control.
+#[test]
+fn a_page_turn_takes_the_keyboard_onto_its_screen() {
+    at_each_text_scale(&[1.0, 2.0], "page focus", |scale| {
+        let mut faults = Vec::new();
+        let (mut turns, mut held) = (0usize, 0usize);
+        for (route, source) in SettingsRoute::ALL
+            .into_iter()
+            .flat_map(|route| [(route, ""), (route, CHANGED)])
+        {
+            if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
+                continue;
+            }
+            for (width, height) in SHORT_SIZES
+                .into_iter()
+                .chain(PAGING_SIZES)
+                .chain([(178.0, 348.0)])
+            {
+                let context = format!(
+                    "{route:?} {width}x{height} {scale}x{}",
+                    if source.is_empty() { "" } else { " changed" }
+                );
+                let cx = view_cx_at(width, height);
+                let (mut runtime, instance, view) = paging_view(source, route);
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
+                    continue;
+                };
+                if plan.limit() == 0 {
+                    continue;
+                }
+                let Some(first) = plan
+                    .controls()
+                    .find(|(stop, _)| plan.shown(0).contains(stop))
+                    .map(|(_, key)| key.clone())
+                else {
+                    continue;
+                };
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.common.last_focus = Some(first);
+                    state.common.focus_visible = true;
+                }
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                for direction in [1, -1] {
+                    let mut before = None;
+                    let mut moved_from = messages_view_state(&runtime, view)
+                        .common
+                        .last_focus
+                        .clone();
+                    for _ in 0..4 * (plan.limit() + 2) {
+                        runtime
+                            .dispatch(instance, view, AppEvent::ScrollPage(direction))
+                            .unwrap();
+                        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                        let state = messages_view_state(&runtime, view);
+                        let plan = state.scroll_plan().expect("a list");
+                        let top = state.page_scroll.min(plan.limit());
+                        let place = (top, (plan.screen(top).offset * 100.0).round() as i64);
+                        if before == Some(place) {
+                            break;
+                        }
+                        before = Some(place);
+                        turns += 1;
+                        let shown = plan.shown(top);
+                        let focus = state.common.last_focus.clone();
+                        let stop = focus.as_ref().and_then(|key| plan.stop_of(key));
+                        let whole_control = plan
+                            .controls()
+                            .any(|(stop, _)| plan.shows_landing(stop, top));
+                        let live_control = plan
+                            .controls()
+                            .any(|(stop, _)| plan.draws_controls_live(stop, top));
+                        let live = focus
+                            .as_ref()
+                            .is_some_and(|key| compiled.semantic(key).is_some());
+                        // Where the keyboard moved, onto the screen's first
+                        // control shown whole with its words, by either key,
+                        // a stop its edge cuts only in its padding among
+                        // them.
+                        let landing = plan
+                            .controls()
+                            .find(|(stop, _)| plan.shows_landing(*stop, top))
+                            .map(|(_, key)| key.clone());
+                        if focus != moved_from
+                            && stop.is_some_and(|stop| plan.shows_landing(stop, top))
+                            && focus != landing
+                        {
+                            faults.push(format!(
+                                "{context}: Page {} to {top} put the keyboard on {:?}, not the \
+                                 screen's first control shown whole, {:?}",
+                                if direction > 0 { "Down" } else { "Up" },
+                                focus.as_ref().map(UiKey::as_str),
+                                landing.as_ref().map(UiKey::as_str)
+                            ));
+                        }
+                        moved_from.clone_from(&focus);
+                        match stop {
+                            Some(stop) if plan.shows_landing(stop, top) => {}
+                            Some(stop)
+                                if !whole_control
+                                    && plan.draws_controls_live(stop, top)
+                                    && live =>
+                            {
+                                held += 1;
+                            }
+                            _ if !whole_control && !live_control => {}
+                            _ => faults.push(format!(
+                                "{context}: Page {} to {top} shows {shown:?}; the keyboard on \
+                                 {:?} (stop {stop:?}, live {live})",
+                                if direction > 0 { "Down" } else { "Up" },
+                                focus.map(|key| key.as_str().to_string())
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            turns > 0 && held > 0,
+            "{scale}x: {turns} turns, {held} held"
+        );
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// A STOP TALLER THAN ANY ROOM THE WINDOW GIVES IS LISTED IN PIECES THE ROOM
+/// HOLDS (#97): what a short window's every screen cut is whole on some
+/// screen Page Down shows — Software Update's automatic-update switch, in
+/// the 218pt workbench beside the status card (the pair stacks where it is
+/// taller than the 72pt and 92pt lists of 220x12 and 220x13 at 1× text);
+/// About's byline, beside the wordmark in a 126pt short hero (the full
+/// hero is listed a row at a time where that row is taller than the 100pt
+/// list of 102x12 at 2×); Tab Color's wheel (its floor no taller than the
+/// list); the theme card's Follow system switch (its 112pt row cut into
+/// pieces); and Modified's empty-state line (the summary pinned over it
+/// listed first where pinning left the list 32pt); and the list's last
+/// stop, measured as the last screen draws it — with no strip under it —
+/// Manual's row for a key only aterm.toml holds (74pt in the 68pt list of
+/// 220x12 at 2× text, its top cut on the only screen that drew it in the
+/// room). Fails without each.
+#[test]
+fn a_stop_taller_than_any_room_is_whole_on_some_screen() {
+    let cases: [(f32, SettingsRoute, f32, f32, &str); 7] = [
+        (
+            1.0,
+            SettingsRoute::SoftwareUpdate,
+            1_564.0,
+            180.0,
+            "settings/control/update.auto_apply",
+        ),
+        (
+            1.0,
+            SettingsRoute::SoftwareUpdate,
+            1_564.0,
+            194.0,
+            "settings/control/update.auto_apply",
+        ),
+        (2.0, SettingsRoute::About, 738.0, 180.0, "about/byline"),
+        (
+            2.0,
+            SettingsRoute::TabColor,
+            738.0,
+            180.0,
+            "settings/color/active_tab_color/wheel",
+        ),
+        (
+            2.0,
+            SettingsRoute::Appearance,
+            738.0,
+            180.0,
+            "settings/theme-mode",
+        ),
+        (2.0, SettingsRoute::Modified, 738.0, 180.0, "settings/empty"),
+        (
+            2.0,
+            SettingsRoute::Manual,
+            1_564.0,
+            180.0,
+            "settings/modified/manual/label/agents-auto-prime",
+        ),
+    ];
+    at_each_text_scale(&[1.0, 2.0], "tall stops", |scale| {
+        for (at, route, width, height, key) in cases {
+            if at != scale {
+                continue;
+            }
+            let context = format!("{route:?} {width}x{height} {scale}x: {key}");
+            let cx = view_cx_at(width, height);
+            // Manual lists a key only aterm.toml holds where the file has one.
+            let source = if route == SettingsRoute::Manual {
+                CHANGED
+            } else {
+                ""
+            };
+            let (mut runtime, instance, view) = paging_view(source, route);
+            let mut whole = false;
+            let mut before = None;
+            for _ in 0..200 {
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                whole |= compiled.paint.iter().any(|node| {
+                    node.key.as_str() == key
+                        && node.fade.is_none()
+                        && (node.clip.y - node.rect.y).abs() < 0.5
+                        && (node.clip.height - node.rect.height).abs() < 0.5
+                });
+                let state = messages_view_state(&runtime, view);
+                let place = state.scroll_plan().map(|plan| {
+                    let top = state.page_scroll.min(plan.limit());
+                    (top, (plan.screen(top).offset * 100.0).round() as i64)
+                });
+                if whole || place == before {
+                    break;
+                }
+                before = place;
+                runtime
+                    .dispatch(instance, view, AppEvent::ScrollPage(1))
+                    .unwrap();
+            }
+            assert!(whole, "{context} is on no screen whole");
+        }
+    });
+}
+
+/// A CONTROL IS NEVER LISTED WITHOUT THE WORDS THAT NAME IT where the two
+/// fit the list's room: on Appearance at 80x16 and 102x16 with 2× text,
+/// every screen the wheel shows that draws a switch or a slider whole draws
+/// its name too. A row cut a part at a time to fit under its card's caption
+/// left Minimum contrast's slider, and every row's control of the page, on
+/// a screen with no name over it; the name and the control now share a
+/// stop, the screen that starts with it letting the caption go. And at
+/// 102x12 the list (100pt) is shorter than any stacked row (a 40pt name
+/// over a 64pt control): there a row goes on one line where its name keeps
+/// its measure beside the control, on every page — every switch and slider
+/// of Appearance, Text & Fonts, Sound, Window & Tabs, Security, Harness and
+/// Ai was on a screen without its name.
+#[test]
+fn a_control_is_listed_with_the_words_that_name_it() {
+    let cases = [
+        ((584.0, 236.0), SettingsRoute::Appearance),
+        ((738.0, 236.0), SettingsRoute::Appearance),
+        ((738.0, 180.0), SettingsRoute::Appearance),
+        ((738.0, 180.0), SettingsRoute::TextFonts),
+        ((738.0, 180.0), SettingsRoute::Sound),
+        ((738.0, 180.0), SettingsRoute::WindowTabs),
+        ((738.0, 180.0), SettingsRoute::Security),
+        ((738.0, 180.0), SettingsRoute::Harness),
+        ((738.0, 180.0), SettingsRoute::Ai),
+    ];
+    at_each_text_scale(&[2.0], "named controls", |_| {
+        let mut faults = Vec::new();
+        let mut seen = 0usize;
+        for ((width, height), route) in cases {
+            let cx = view_cx_at(width, height);
+            let (mut runtime, instance, view) = paging_view("", route);
+            let mut before = None;
+            for _ in 0..200 {
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                for node in &compiled.paint {
+                    let Some(key) = node.key.as_str().strip_prefix("settings/control/") else {
+                        continue;
+                    };
+                    let whole = matches!(node.content, UiContent::Switch(_) | UiContent::Slider(_))
+                        && node.fade.is_none()
+                        && (node.clip.y - node.rect.y).abs() < 0.5
+                        && (node.clip.height - node.rect.height).abs() < 0.5;
+                    if !whole {
+                        continue;
+                    }
+                    seen += 1;
+                    let label = format!("settings/label/{key}");
+                    if !compiled
+                        .paint
+                        .iter()
+                        .any(|named| named.key.as_str() == label && named.clip.height > 1.0)
+                    {
+                        faults.push(format!(
+                            "{route:?} {width}x{height}: {key} drawn with no name"
+                        ));
+                    }
+                }
+                let state = messages_view_state(&runtime, view);
+                let place = state
+                    .scroll_plan()
+                    .map(|plan| plan.limit().min(state.page_scroll));
+                if place == before {
+                    break;
+                }
+                before = place;
+                runtime
+                    .dispatch(instance, view, AppEvent::ScrollLines(1))
+                    .unwrap();
+            }
+        }
+        faults.sort();
+        faults.dedup();
+        assert!(seen > 0, "controls are drawn");
+        assert!(faults.is_empty(), "{faults:#?}");
+    });
+}
+
+/// MESSAGES' LIST HOLDS AN ENTRY WHOLE IN A SHORT WINDOW (the short-window
+/// sweep's Messages): at the short windows and 80x24, 1× and 2× text, every
+/// screen of the Messages page the wheel or Page Down shows audits clean,
+/// and every entry the list holds is whole on some screen of each walk.
+/// At 220x12 at 1× its filters and count line left the list 12pt under
+/// the page's full insets, its 30pt rows clipped on every screen (overflow
+/// 6, clipped 11), because the page took its full chrome wherever its
+/// first screen listed an entry, whole or not. Where the room under the
+/// pinned header is shorter than an entry, the header now scrolls away
+/// with the list, as a compact page's does, and the first screen, holding
+/// no entry then, sheds the page's insets where that brings one under the
+/// header (220x12 at 1×).
+#[test]
+fn messages_list_holds_an_entry_whole_in_a_short_window() {
+    at_each_text_scale(&[1.0, 2.0], "short messages", |scale| {
+        let mut faults = Vec::new();
+        if scale < 1.5 {
+            // The first screen of 220x12 holds the newest entry whole.
+            let cx = view_cx_at(1_564.0, 180.0);
+            let (runtime, instance, view) = setup_with_messages();
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let first_whole = compiled.paint.iter().any(|node| {
+                node.key
+                    .as_str()
+                    .strip_prefix("settings/messages/row/")
+                    .is_some_and(|rest| !rest.contains('/'))
+                    && node.clip == node.rect
+            });
+            if !first_whole {
+                faults.push("220x12 1x: the first screen holds no entry whole".to_string());
+            }
+        }
+        for (width, height) in SHORT_SIZES {
+            let context = format!("{width}x{height} {scale}x");
+            let cx = view_cx_at(width, height);
+            for event in [AppEvent::ScrollLines(1), AppEvent::ScrollPage(1)] {
+                let (mut runtime, instance, view) = setup_with_messages();
+                let mut whole = BTreeSet::new();
+                let mut listed = BTreeSet::new();
+                let mut before = None;
+                for _ in 0..200 {
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    for fault in compiled.fit_failures() {
+                        faults.push(format!("{context} {event:?}: {fault}"));
+                    }
+                    for node in &compiled.paint {
+                        let Some(row) = node
+                            .key
+                            .as_str()
+                            .strip_prefix("settings/messages/row/")
+                            .filter(|rest| !rest.contains('/'))
+                        else {
+                            continue;
+                        };
+                        listed.insert(row.to_string());
+                        if (node.clip.y - node.rect.y).abs() < 0.5
+                            && (node.clip.height - node.rect.height).abs() < 0.5
+                        {
+                            whole.insert(row.to_string());
+                        }
+                    }
+                    let state = messages_view_state(&runtime, view);
+                    let place = (state.page_scroll, state.messages_drawn.get());
+                    if before == Some(place) {
+                        break;
+                    }
+                    before = Some(place);
+                    runtime.dispatch(instance, view, event.clone()).unwrap();
+                }
+                let never: Vec<_> = listed.difference(&whole).collect();
+                if listed.is_empty() || !never.is_empty() {
+                    faults.push(format!(
+                        "{context} {event:?}: {} entries drawn, never whole: {never:?}",
+                        listed.len()
+                    ));
+                }
+            }
+        }
+        faults.sort();
+        faults.dedup();
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// MANUAL'S EXPLANATION IS SET ON LINES OF ITS OWN HEIGHT: where a compact
+/// window shows no subtitle, the aterm.toml card opens with what Manual is,
+/// wrapped on lines as tall as the card's lines — not as tall as the whole
+/// path under it, which it took for its line height (f222a198c4b): once the
+/// path wrapped (a folder outside the home folder, at 2× text in a 102x12
+/// window) each line of the explanation was 144pt, taller than the 100pt
+/// list, and on no screen whole.
+#[test]
+fn manuals_explanation_is_set_on_lines_of_its_own_height() {
+    at_each_text_scale(&[1.0, 2.0], "manual explanation", |scale| {
+        let line = 22.0_f32.max(18.0 * scale);
+        for (width, height) in [(738.0, 180.0), (444.0, 292.0), (584.0, 348.0)] {
+            let cx = view_cx_at(width, height);
+            let (mut runtime, instance, view) = paging_view("", SettingsRoute::Manual);
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.arm_config_file(
+                    Some(std::path::PathBuf::from(
+                        "/Volumes/Shared Drive/Projects/someone/dotfiles/config/aterm/aterm.toml",
+                    )),
+                    Some(std::path::Path::new("/Users//someone")),
+                    ConfigFileArm::inert(),
+                );
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let path_lines = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    node.key
+                        .as_str()
+                        .starts_with("settings/manual/path/visual/")
+                })
+                .count();
+            let lines: Vec<_> = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    node.key.as_str().starts_with("settings/manual/explanation")
+                        && matches!(node.content, UiContent::Text(_))
+                })
+                .map(|node| (node.key.as_str().to_string(), node.rect.height))
+                .collect();
+            assert!(
+                lines.iter().all(|(_, tall)| *tall <= line + 0.5),
+                "{width}x{height} {scale}x: the path on {path_lines} lines, the explanation \
+                 {lines:?} (lines {line}pt)"
+            );
+        }
+    });
 }

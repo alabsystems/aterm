@@ -1,0 +1,26 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the same Sonnet bucket after Esc on Claude Code's own countdown
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.GjTR/proj
+
+
+❯ start the task
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Brewed for 0s · done 6:54 PM
+
+❯ carry on with the task
+  ⎿  You've hit your Sonnet limit · resets 7:09pm (America/Los_Angeles)
+     /upgrade to increase your usage limit.
+
+⏺ Usage limit reached · continuing automatically at 7:09pm · esc to cancel
+
+✻ Cooked for 0s · done 6:54 PM
+
+⏺ Automatic continue cancelled · /rate-limit-options to re-arm
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                            Automatic continue cancelled · /rate-limit-options to re-arm

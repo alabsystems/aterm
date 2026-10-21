@@ -21,6 +21,11 @@
 //! list is `aterm_types::argv0::ALIASES`) onto this binary, a login renewal links
 //! `aterm-open-url` to it, `aterm machines enroll` links `aterm-machines-askpass` to it in its
 //! scratch directory, and main dispatches as whichever tool it was invoked as.
+//!
+//! On an ordinary macOS launch, a single background worker converges first-run
+//! workstation setup while the terminal stays open. It retries incomplete or
+//! blocked passes after at least a minute, reports changed failures, and stops
+//! when the shared setup marker records a verified finish or an explicit restore.
 
 // No `windows_subsystem = "windows"` here: this file is the console image. A Windows shell
 // waits for a console-subsystem child and not a GUI one, so with the attribute no shell would
@@ -75,6 +80,16 @@ fn link_unavailable(verb: &str) -> ExitCode {
 #[cfg(not(target_os = "macos"))]
 fn machines_unavailable() -> ExitCode {
     eprintln!("aterm machines: not available on this platform (macOS only)");
+    ExitCode::FAILURE
+}
+
+/// `aterm secrets` where it cannot exist: the vault keeps its secrets private with POSIX file
+/// modes (0600 files in a 0700 `~/.secrets`), which Windows has no equivalent of, so
+/// `aterm-secrets` is a `cfg(unix)` dependency and the verb stays on the roster and refuses
+/// by name (docs/DESIGN-secrets-2026-10-20.md §12).
+#[cfg(not(unix))]
+fn secrets_unavailable() -> ExitCode {
+    eprintln!("aterm secrets: not available on this platform (Unix only)");
     ExitCode::FAILURE
 }
 
@@ -334,6 +349,7 @@ pub(crate) fn main() -> ExitCode {
             // door for the standing pull/push wiring, presentation over the control-socket
             // verbs `ctl` speaks, hence in aterm-ctl.
             aterm_cli::Verb::Conn => aterm_ctl::conn_main_entry(forwarded),
+            aterm_cli::Verb::ResourceRun => aterm_ctl::resource_run_main_entry(forwarded),
             aterm_cli::Verb::Pkg => {
                 #[cfg(target_os = "macos")]
                 if aterm_machines::cli::pkg_retires(&forwarded) {
@@ -394,12 +410,22 @@ pub(crate) fn main() -> ExitCode {
             #[cfg(not(target_os = "macos"))]
             aterm_cli::Verb::Machines => machines_unavailable(),
             #[cfg(target_os = "macos")]
-            aterm_cli::Verb::Init => aterm_machines::init::main_entry(forwarded),
+            // The base layer's items (the packages' repair items) come from here, the one
+            // crate that links atpkg and aterm-machines together (`doctor::init_base`).
+            aterm_cli::Verb::Init => {
+                aterm_machines::init::main_entry(forwarded, &doctor::init_base)
+            }
             #[cfg(not(target_os = "macos"))]
             aterm_cli::Verb::Init => {
                 eprintln!("aterm init: local macOS setup is available on macOS only");
                 ExitCode::from(2)
             }
+            // One credentials file for every machine (docs/DESIGN-secrets-2026-10-20.md): the
+            // vault's client, its keyless server and the services that keep both running.
+            #[cfg(unix)]
+            aterm_cli::Verb::Secrets => aterm_secrets::cli::main_entry(forwarded),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Secrets => secrets_unavailable(),
             // The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md).
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
@@ -450,6 +476,13 @@ pub(crate) fn main() -> ExitCode {
             &front_door_verbs(),
             COMPLETION_FLAGS,
         );
+    }
+
+    // `aterm doctor [--read-only] [--json] [--only <id,...>]` is composed here (`doctor.rs`):
+    // aterm-cli's items, the packages' repair items and `pkg doctor`'s rows, which no lower
+    // crate links together. `aterm doctor --help` stays the diagnostics' help, below.
+    if routes_to_doctor(&first, rest.get(1..).unwrap_or(&[])) {
+        return doctor::main_entry(rest.get(1..).unwrap_or(&[]));
     }
 
     // Mode-free surface, before the mode fork: `help`, `-h`/`--help`, `-V`/`--version` and the
@@ -578,6 +611,14 @@ pub(crate) fn main() -> ExitCode {
     // call and its first thread.
     aterm_gui::install_session_log();
     atpkg::notice::to_host_log();
+    #[cfg(target_os = "macos")]
+    if first_run_doctor_eligible(
+        &rest,
+        argv0 != "aterm-cli" && stdin_is_terminal(),
+        doctor_startup_env(),
+    ) {
+        apply_first_run_doctor();
+    }
     // One read of aterm.toml's `[packages]` and one layout for the whole lane, so a malformed
     // table is reported once.
     let packages = atpkg::config::cached();
@@ -1178,12 +1219,146 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
             .name("aterm-machines-retire".into())
             .spawn(aterm_machines::cli::retire_lan_agent);
     }
+    #[cfg(target_os = "macos")]
+    let first_run = first_run_doctor_eligible(&args, true, doctor_startup_env())
+        .then_some(apply_first_run_doctor as fn());
+    #[cfg(not(target_os = "macos"))]
+    let first_run = None;
+    aterm_gui::register_resource_runner();
     #[expect(
         clippy::disallowed_methods,
         reason = "the one window door: every window route reaches the GUI here"
     )]
-    aterm_gui::main_entry(args);
+    aterm_gui::main_entry_with_first_run(args, first_run);
     ExitCode::SUCCESS
+}
+
+/// First-run setup belongs to an ordinary interactive launch, never a nested
+/// shell, a laboratory's private state root or an update successor. The window
+/// entry separately validates its arguments and captured handoff before it calls
+/// the action; the transparent route calls it only after its parser returned.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Default)]
+struct DoctorStartupEnv {
+    nested: bool,
+    isolated: bool,
+    updating: bool,
+    outside_person_scope: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn doctor_startup_env() -> DoctorStartupEnv {
+    DoctorStartupEnv {
+        nested: std::env::var_os("ATERM_CHILD").is_some()
+            || std::env::var_os("TERM_PROGRAM").as_deref() == Some(std::ffi::OsStr::new("aterm")),
+        isolated: std::env::var_os("ATERM_STATE_HOME").is_some()
+            || std::env::var_os("CI").is_some(),
+        updating: std::env::var_os("ATERM_UPDATED_FROM").is_some(),
+        outside_person_scope: aterm_cli::macos_doctor::lasting_scope_refusal().is_some(),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn first_run_doctor_eligible(args: &[OsString], interactive: bool, env: DoctorStartupEnv) -> bool {
+    if !interactive || env.nested || env.isolated || env.updating || env.outside_person_scope {
+        return false;
+    }
+    // Fail closed to the ordinary launch grammar. In particular, no command
+    // payload, diagnostic, private socket, headless lab or unknown flag can
+    // turn a read-only or automated invocation into machine setup.
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--window" | "--session" | "--quiet" | "-q" | "--verbose" | "--no-reroute") => {}
+            Some("-d" | "--working-directory") => {
+                if args.next().is_none() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn apply_first_run_doctor() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if let Err(why) = std::thread::Builder::new()
+            .name("aterm-workstation-setup".into())
+            .spawn(run_first_run_doctor)
+        {
+            aterm_log::warn!("first-run macOS doctor worker could not start: {why}");
+            aterm_gui::report_workstation_setup_failure();
+        }
+    });
+}
+
+/// The background setup worker of a window or a session. It reports to the log
+/// and the window's message center only, never stderr: in the session lane that
+/// is the tab, and a thread writing there lands over whatever program owns it.
+#[cfg(target_os = "macos")]
+fn run_first_run_doctor() {
+    // A process that may never change the person's profile (its state root, uid
+    // and HOME are fixed for its life) has nothing to retry, and an idle
+    // session must not wake each minute to learn that again.
+    if let Some(why) = aterm_cli::macos_doctor::lasting_scope_refusal() {
+        aterm_log::info!("first-run macOS doctor: skipped: {why}");
+        return;
+    }
+    let mut last_failure = None;
+    let mut success_reported = false;
+    loop {
+        match aterm_cli::macos_doctor::first_run_finished() {
+            Ok(true) => {
+                aterm_gui::report_workstation_setup_finished();
+                return;
+            }
+            Ok(false) => {}
+            Err(why) => {
+                report_first_run_doctor_failure(&mut last_failure, &why);
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                continue;
+            }
+        }
+        match aterm_cli::macos_doctor::apply_on_first_run() {
+            Ok(Some(report)) => {
+                let text = report.to_text();
+                if report.needs_attention() {
+                    report_first_run_doctor_failure(&mut last_failure, &text);
+                } else if !success_reported {
+                    aterm_log::info!("first-run macOS doctor: {text}");
+                    success_reported = true;
+                }
+            }
+            // Another worker or the engine's cooldown may own this pass. Only
+            // the verified completion/restore marker ends convergence.
+            Ok(None) => {}
+            Err(why) => {
+                report_first_run_doctor_failure(&mut last_failure, &why);
+            }
+        }
+        match aterm_cli::macos_doctor::first_run_finished() {
+            Ok(true) => {
+                aterm_gui::report_workstation_setup_finished();
+                return;
+            }
+            Ok(false) => {}
+            Err(why) => report_first_run_doctor_failure(&mut last_failure, &why),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn report_first_run_doctor_failure(last_failure: &mut Option<String>, text: &str) {
+    if last_failure.as_deref() == Some(text) {
+        return;
+    }
+    aterm_log::warn!("first-run macOS doctor: {text}; automatic setup retries while aterm is open");
+    aterm_gui::report_workstation_setup_failure();
+    *last_failure = Some(text.to_string());
 }
 
 /// The windowed sibling's argv for a window the policy decided to spawn:
@@ -2529,6 +2704,16 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--version", "print the version and exit"),
 ];
 
+/// Whether `aterm <first> <rest>` is the composed doctor ([`doctor::main_entry`]): `doctor`
+/// without `-h`/`--help`, which the diagnostics' parser answers with the verb's usage.
+fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {
+    first == "doctor" && !rest.iter().any(|arg| arg == "-h" || arg == "--help")
+}
+
+// `aterm doctor`, composed (`#[path]`: the windowed image includes this file as a module).
+#[path = "doctor.rs"]
+mod doctor;
+
 /// Compiler-provenance probe: `build.rs` `include!`s it to stamp [`BUILD_STAMP`]'s values; this
 /// test-only mount runs the same code against real `-vV` fixtures.
 #[cfg(test)]
@@ -2536,6 +2721,69 @@ mod compiler_probe;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn first_run_setup_admits_only_ordinary_interactive_launches() {
+        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        for args in [
+            osv(&[]),
+            osv(&["--window"]),
+            osv(&["--session", "--quiet"]),
+            osv(&["--window", "-d", "/tmp", "--no-reroute"]),
+        ] {
+            assert!(first_run_doctor_eligible(
+                &args,
+                true,
+                DoctorStartupEnv::default(),
+            ));
+            assert!(!first_run_doctor_eligible(
+                &args,
+                false,
+                DoctorStartupEnv::default(),
+            ));
+            for env in [
+                DoctorStartupEnv {
+                    nested: true,
+                    ..DoctorStartupEnv::default()
+                },
+                DoctorStartupEnv {
+                    isolated: true,
+                    ..DoctorStartupEnv::default()
+                },
+                DoctorStartupEnv {
+                    updating: true,
+                    ..DoctorStartupEnv::default()
+                },
+                DoctorStartupEnv {
+                    outside_person_scope: true,
+                    ..DoctorStartupEnv::default()
+                },
+            ] {
+                assert!(!first_run_doctor_eligible(&args, true, env));
+            }
+        }
+        for args in [
+            osv(&["doctor"]),
+            osv(&["help"]),
+            osv(&["--help"]),
+            osv(&["--version"]),
+            osv(&["--window", "--headless"]),
+            osv(&["--diagnose"]),
+            osv(&["-e", "zsh"]),
+            osv(&["--command", "zsh"]),
+            osv(&["--", "zsh"]),
+            osv(&["--control-sock", "/tmp/test.sock"]),
+            osv(&["--lifeline-fd", "3"]),
+            osv(&["--ready-fd", "4"]),
+            osv(&["--bogus"]),
+            osv(&["-d"]),
+        ] {
+            assert!(
+                !first_run_doctor_eligible(&args, true, DoctorStartupEnv::default()),
+                "{args:?}",
+            );
+        }
+    }
 
     /// A window started as `aterm --window` from a shell keeps that shell's terminal on stdin,
     /// and this fork routes its update successor, so the successor's argv keeps `--window`.

@@ -157,6 +157,9 @@ impl TypingRate {
     /// exactly 0 once negligible. NaN/garbage in `tau` reads as 0 — inert.
     #[must_use]
     pub fn value(&self, now: Instant, tau: f32) -> f32 {
+        if self.value < SNAP_ZERO {
+            return 0.0;
+        }
         let Some(at) = self.at else {
             return 0.0;
         };
@@ -164,7 +167,11 @@ impl TypingRate {
             return 0.0;
         }
         let dt = now.saturating_duration_since(at).as_secs_f32();
-        let v = self.value * (-dt / tau).exp();
+        let v = if dt == 0.0 {
+            self.value
+        } else {
+            self.value * (-dt / tau).exp()
+        };
         if !v.is_finite() || v < SNAP_ZERO {
             0.0
         } else {
@@ -449,6 +456,7 @@ fn emit_halo(
         return;
     }
     let row_h = ((ch / HALO_ROW_DIV) as i32).max(2);
+    let half_row_h = row_h as f32 * 0.5;
     // Rows on a grid anchored at the caret row's top edge, from the first
     // row reaching the ellipse's top.
     let cell_y0 = i32::from(geom.origin_y) + i32::from(cr) * geom.ch as i32;
@@ -456,29 +464,33 @@ fn emit_halo(
     let bot = (cy + ry).ceil() as i32;
     let mut y = cell_y0 - (cell_y0 - top + row_h - 1).div_euclid(row_h) * row_h;
     while y < bot {
-        let v = (y as f32 + row_h as f32 * 0.5 - cy) / ry;
-        let w2 = 1.0 - v * v;
+        let v = (y as f32 + half_row_h - cy) / ry;
+        let v2 = v * v;
+        let w2 = 1.0 - v2;
         if w2 > 0.0 {
             let half = rx * w2.sqrt();
-            // Knot `k` of the row: its offset from the centre and its ramp end
+            // Knot `k` of the row: its rounded edges and its ramp end
             // (premultiplied light, opacity 0: additive).
             let knot = |k: usize| {
                 let t = k as f32 / HALO_SEGMENTS as f32;
-                let rho2 = v * v + w2 * t * t;
+                let dx = half * t;
+                let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
+                let rho2 = v2 + w2 * t * t;
                 let f = (1.0 - rho2).max(0.0);
                 let cov = (peak * f * f).round().min(HALO_PEAK_COV) as u8;
+                if cov == 0 {
+                    return (rx_i, lx_i, 0, (0, 0));
+                }
                 let colour = halo_colour(tint, a, rho2.sqrt());
-                (half * t, cov, (premul_rgb(colour, cov), 0u8))
+                (rx_i, lx_i, cov, (premul_rgb(colour, cov), 0u8))
             };
             let knots: [_; HALO_SEGMENTS + 1] = std::array::from_fn(knot);
             for pair in knots.windows(2) {
-                let ((d_in, cov_in, inner), (d_out, cov_out, outer)) = (pair[0], pair[1]);
+                let ((r0, l1, cov_in, inner), (r1, l0, cov_out, outer)) = (pair[0], pair[1]);
                 if cov_in == 0 && cov_out == 0 {
                     continue;
                 }
-                let (r0, r1) = ((cx + d_in).round() as i32, (cx + d_out).round() as i32);
                 push_fx_ramp(out, geom, r0, y, r1 - r0, row_h, inner, outer);
-                let (l0, l1) = ((cx - d_out).round() as i32, (cx - d_in).round() as i32);
                 push_fx_ramp(out, geom, l0, y, l1 - l0, row_h, outer, inner);
             }
         }

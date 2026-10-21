@@ -2,16 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! The cursor aurora: pure host-side animation that turns cursor motion into
-//! emitted light: a comet of premultiplied additive quads along the swept
-//! path, a soft bloom crown around the head, and (per style) a particle
-//! system of sparkles or rising embers. The renderer is a deterministic
-//! compositor of [`GlowQuad`]s; the art lives here.
+//! light: a comet of premultiplied additive quads along the swept path, a
+//! bloom crown around the head, and per-style particles. The renderer is a
+//! deterministic compositor of [`GlowQuad`]s; the art lives here.
 //!
 //! Every emitted quad is premultiplied ([`aterm_render::premul_rgb`]),
-//! single-cell-row and clamped to the grid interior, which keeps the additive
+//! single-cell-row and clamped to the effects box ([`Geom`]), which keeps the
 //! light byte-exact across the Metal and CPU backends and the row-scoped damage
-//! gate exact. The clock is an injected [`Instant`], so the effect is testable
-//! without sleeping, and it decays to exactly empty so the event loop idles.
+//! gate exact. The clock is an injected [`Instant`], and the effect decays to
+//! exactly empty so the event loop idles.
 
 use aterm_time::Instant;
 use std::time::Duration;
@@ -23,25 +22,15 @@ use aterm_render::{
     SPARKLE_LAYERS, comet_beam, comet_beam_over, layer_stack_lift, layered_beam_quads_with,
     premul_rgb,
 };
-// The profile is the rasterizer's, and the ribbon reaches it only through
-// [`ribbon_beam`]: one law, evaluated in one place (the smoothness oracle
-// derives its bound from the profile's Lipschitz constant).
-//
-// The jump streak uses it too. `ribbon_beam` is an x-major rasterizer (a
-// [`RibbonVertex`] is an `x` and a `spine`) while a jump runs at any angle, so
-// the streak builds its cross-section from abutting [`comet_beam`] tubes and
-// takes each one's weight from this function.
 
 use crate::rainbow_kitty::{self as rk, CaretSeam, CompanionImpulse};
 
 /// Host row slots for the content witness: the bands' eight rows
-/// ([`rk::witness::WITNESS_ROWS`]), a waiting key's source row and the rows
-/// one above and below it ([`rk::witness::ARMING_ROWS`]), and the caret's
-/// row when it is outside both sets. The latter two are only read when
-/// needed; the usual typing frame samples the band's rows and nothing more.
-/// [`CursorGlow::ribbon_rows`] never names more than [`RIBBON_LIST_ROWS`],
-/// so the caret's row, captured first, always leaves a slot for every row of
-/// the list.
+/// ([`rk::witness::WITNESS_ROWS`]), a waiting key's source row and its
+/// neighbours ([`rk::witness::ARMING_ROWS`]), and the caret's row when it is
+/// outside both sets. [`CursorGlow::ribbon_rows`] never names more than
+/// [`RIBBON_LIST_ROWS`], so the caret's row, captured first, always leaves a
+/// slot for every row of the list.
 pub const CURSOR_WITNESS_ROWS: usize = RIBBON_LIST_ROWS + 1;
 
 /// The most rows [`CursorGlow::ribbon_rows`] names: the bands' and a waiting
@@ -165,7 +154,7 @@ struct Particle {
 #[derive(Clone, Copy)]
 struct Ring {
     cx: f32,
-    cy: f32, // grid-interior pixel center
+    cy: f32, // window-px centre
     born: Instant,
     life: f32,
     /// The jump's impact magnitude (`rainbow_kitty::timing::impact`, `1.0..=3.5`):
@@ -181,7 +170,7 @@ struct Ring {
 #[derive(Clone, Copy)]
 struct Meteor {
     x0: f32,
-    y0: f32, // origin (tail) center, grid-interior pixels
+    y0: f32, // origin (tail) centre, window px
     x1: f32,
     y1: f32, // landing (head) center
     born: Instant,
@@ -229,7 +218,7 @@ enum PoofVoice {
 #[derive(Clone, Copy)]
 struct Vapor {
     x0: f32,
-    y0: f32, // grid-interior pixels at birth
+    y0: f32, // window px at birth
     vx: f32,
     vy: f32, // px/sec
     gy: f32, // px/sec^2 (steam: +drag stalls the rise; smoke/poof: -buoyancy)
@@ -298,10 +287,10 @@ pub struct CursorGlow {
     /// lifecycle events, served by the `trail` control verb. Diagnostic only;
     /// never read by a decision.
     admission_log: AdmissionLog,
-    /// Cumulative count of moves [`Self::spawn`] admitted (a witnessed move that
-    /// laid light). A `confirmed`-heavy [`AdmissionTally`] with `spawns == 0`
-    /// means admission and morphology disagree. Diagnostic only, and it
-    /// survives every transient teardown.
+    /// Cumulative count of moves that laid light ([`Self::spawn`]'s admissions
+    /// and the classic wake's spawns). A `confirmed`-heavy [`AdmissionTally`]
+    /// with `spawns == 0` means admission and morphology disagree. Diagnostic
+    /// only, and it survives every transient teardown.
     spawns: u64,
     /// Resident, bounded swept-cell scratch. Built backward from the landing
     /// point so an outlier cursor jump never walks or allocates the discarded prefix.
@@ -354,13 +343,12 @@ pub struct CursorGlow {
     /// cores work. Dark themes only (Add); a light theme's fire is ink
     /// tongues in the under-ink stream ([`Self::emit_flames_light`]).
     patch_out: Vec<FirePatch>,
-    /// This frame's under-ink light (the flame body), drawn between cell
-    /// backgrounds and glyph ink (`RenderInput.glow_under`) so engulfed letters
-    /// read as silhouettes inside the flame. Tips, embers, beam and crown stay
-    /// in `out`/`halo_out`, above the ink.
+    /// This frame's under-ink quads (`RenderInput.glow_under`), drawn between
+    /// cell backgrounds and glyph ink so letters keep full contrast over them.
+    /// The rest of the light stays in `out`/`halo_out`, above the ink.
     under_out: Vec<GlowQuad>,
-    /// This frame's charred ink: per-cell final-fg overrides for engulfed glyphs
-    /// (`RenderInput.char_fg`), darkest inside the flame, scaled by engulfment.
+    /// This frame's charred ink (`RenderInput.char_fg`): per-cell final-fg
+    /// overrides. No emitter fills it, so it stays empty.
     char_out: Vec<CharFg>,
     /// This frame's contrast-halo strengths: per-cell engulfment weights
     /// (`RenderInput.fire_halo`) driving the dark dilation ring the renderers
@@ -371,11 +359,10 @@ pub struct CursorGlow {
     engulf_scratch: Vec<(u16, u16, f32)>,
     /// Live lightning bolts (Laser style; ≤ [`Self::MAX_BOLTS`]).
     bolts: Vec<Bolt>,
-    /// Host-fed reduced-motion arm for the fresh-ink pop: the pop renders as a
-    /// brightness step-fade only (no scale spring, no birth halo). The GUI's
-    /// motion policy zeroes the whole aurora under Reduced, so this is the
-    /// engine-level contract for hosts running reduced dynamics at nonzero
-    /// intensity, like the sparkle/rain reduced twins.
+    /// Host-fed reduced-motion arm, passed to v2 (`rk::Config::from_glow`): the
+    /// fresh-ink pop becomes a brightness step-fade only (no scale spring, no
+    /// birth halo). The GUI's motion policy zeroes the whole aurora under
+    /// Reduced; this serves hosts running reduced dynamics at nonzero intensity.
     reduced_motion: bool,
     /// Last observed cursor cell (terminal coords), to detect a move.
     last: Option<(u16, u16)>,
@@ -399,6 +386,12 @@ pub struct CursorGlow {
     /// whose repaint leaves the cursor hidden or parked away from the caret
     /// (CUP 1;1 before show). See [`Self::echo_anchor_pass`].
     print_anchor: Option<(u16, u16, u64)>,
+    /// The print sequence sampled at the start of the preceding tick, including
+    /// dark and Classic ticks. Kept independently of the anchored echo consumer.
+    print_anchor_tick_seq: Option<u64>,
+    /// This tick observed a different print sequence. A retained endpoint alone
+    /// cannot hold a later cursor-only jump as a distant footer park.
+    print_in_tick: bool,
     /// The echo anchor's glyph (host-fed, [`Self::observe_print_anchor_glyph`]):
     /// the terminal's content at the print run's last cell, in the row probe's
     /// per-column convention, sampled under the anchor's lock. `None` when the
@@ -441,17 +434,15 @@ pub struct CursorGlow {
     /// When the cursor last moved (drives the bloom-crown fade around the head).
     last_move: Option<Instant>,
     /// Deadline until which the bloom crown is still emitted (cached so
-    /// [`is_active`] needs no clock); keeps the timer armed past comet decay.
+    /// [`Self::is_active`] needs no clock); keeps the timer armed past comet decay.
     crown_until: Option<Instant>,
     /// The crown window of the last move: [`Self::CROWN_TYPING_MS`] for a
     /// single-cell typing advance, [`Self::CROWN_MS`] for a jump. Read by
     /// `emit_crown`.
     crown_window_ms: u64,
-    /// The [`GlowStyle`] of the last tick (`None` before the first). In-flight
-    /// light was forged under the old style's geometry and colours, so when the
-    /// live style changes `tick` moves it into an [`OutgoingFade`], which keeps
-    /// rendering it under its old config behind a ramp-down, while coordinate
-    /// tracking and typing warmth stay live.
+    /// The [`GlowStyle`] of the last tick (`None` before the first); a change
+    /// moves in-flight light into an [`OutgoingFade`] (the style-switch
+    /// contract in [`Self::tick`]).
     last_style: Option<GlowStyle>,
     /// Whether the last tick's classic wake wore its mono face, whose bed and
     /// over-ink account read the rows flanking the caret's
@@ -539,8 +530,9 @@ pub struct CursorGlow {
     /// ([`Self::insert_row_identity`]). A row licensed within the chain window
     /// may spend a partial insert echo; any other row needs the whole width.
     last_licensed_row: Option<(u16, Instant)>,
-    /// The hand's row: where the last licensed typed echo landed (stamp- or
-    /// pool-paired). Line-editing presses and modifier edges keep it
+    /// The hand's row: where the last licensed echo of the hand's input landed
+    /// ([`Self::hand_lands_on`]: a typed key's, stamp- or pool-paired, or a
+    /// delivered insert's). Line-editing presses and modifier edges keep it
     /// ([`Self::clear_typed_keeping_hand`]); every other press drops it
     /// ([`Self::clear_typed`], and [`Self::note_return`]'s Enter into a shell;
     /// an Enter into a composer keeps it, [`Self::note_return_keeping_hand`]),
@@ -554,21 +546,18 @@ pub struct CursorGlow {
     /// The caret row at a generic input boundary, and whether a later sample
     /// proved it parked away from the output. Cold program setup has no such
     /// boundary. A parked, unowned row cannot acquire typing ownership from
-    /// a redisplay's matching glyph; an established hand keeps its lane.
+    /// a redisplay's matching glyph; an established hand keeps its lane, and
+    /// a licensed echo of the hand's input on the row settles the doubt
+    /// ([`Self::hand_lands_on`]).
     unowned_caret: Option<UnownedCaret>,
     /// A fresh composer-newline hint ([`Self::note_newline_break`]: an
     /// alt-screen Shift+Enter, bound by agent composers to a line break without
-    /// submitting).
-    ///
-    /// Geometry cannot carry it. [`Self::retire_abandoned_light`] retires the
-    /// previous row's ribbon on an unexplained typing-classified row change (a
-    /// repaint moved the input line). A composer newline makes the identical
-    /// move, one row down to the box's inset, but the row it leaves still holds
-    /// the user's text.
-    ///
-    /// A licence term ([`Self::one_shot_licensed`], the park refusal) consumed
-    /// once at the spawn seam, like the Return's: the composer's own row change
-    /// takes it (`Licence::Return`). Expires after [`Self::RETURN_HINT_FRESH`].
+    /// submitting). Geometry cannot carry it: [`Self::retire_abandoned_light`]
+    /// retires the previous row's ribbon on an unexplained row change, and a
+    /// composer newline makes the same move while the row it leaves still holds
+    /// the user's text. A licence term ([`Self::one_shot_licensed`], the park
+    /// refusal) consumed once at the spawn seam (`Licence::Return`). Expires
+    /// after [`Self::RETURN_HINT_FRESH`].
     newline_hint: Option<Instant>,
     /// A fresh reflow classifier. Coordinate changes reset both engines, so
     /// reflow is dark and this never admits a movement birth.
@@ -641,14 +630,10 @@ pub struct CursorGlow {
     /// Refreshed in [`Self::tick`]; the `&self` emitter reads it.
     /// `Some((key, None))` memoizes a refusal (a theme with no usable side).
     glyph_palette: Option<GlyphPaletteMemo>,
-    /// Erase momentum: the mirror of the typing metric for deletion. The same
-    /// law (a [`TypingMomentum`], the same rate-normalized accrual and 2 s
-    /// decay), fed only by erase edges ([`Self::note_backspace`],
-    /// [`Self::note_kill`]), so a held Backspace run builds like a typing run
-    /// and a single correction stays a small puff (owner, 2026-08-06).
-    ///
-    /// Independent of [`RainbowState::momentum`]: forward momentum still builds
-    /// only from forward typing and drains on a delete.
+    /// Erase momentum: the typing metric's law ([`TypingMomentum`]) fed only by
+    /// erase edges ([`Self::note_backspace`], [`Self::note_kill`]), so a held
+    /// Backspace run builds like a typing run and a single correction stays a
+    /// small puff. Independent of the forward `momentum`.
     erase_mom: TypingMomentum,
     /// Sound cues recorded at the spawn/poof edges this frame, drained by the
     /// host each tick ([`Self::drain_sound_cues`]) into the trail synth
@@ -674,31 +659,21 @@ pub struct CursorGlow {
     /// credit, right for the first key of a burst.
     key_cue_at: Option<Instant>,
     /// The live style's per-keystroke heat gain and cooling τ, snapshotted
-    /// ([`Self::store_key_timbre`]) by every [`Self::tick`] that may open the
-    /// key seam (every tick past the master switch, including the classic wake
-    /// and degenerate grids). Both are pure functions of the config, so a click
-    /// minted during a load-shed frame reads this tick's timbre.
-    /// [`Self::cue_keystroke`] runs from the host's key handler without a
-    /// [`GlowConfig`], so it needs these to click at the heat the echo is about
-    /// to reach. Read only behind [`Self::sound_live`], which is never set
-    /// without storing these first.
+    /// ([`Self::store_key_timbre`]) by every tick that may open the key seam,
+    /// so [`Self::cue_keystroke`] (run from the host's key handler, with no
+    /// [`GlowConfig`]) clicks at the heat the echo is about to reach. Read only
+    /// behind [`Self::sound_live`], which is never set without storing these.
     heat_gain_live: f32,
     heat_tau_live: f32,
     /// Whether the last [`Self::tick`] left the key seam open: it ran the live
-    /// path, or went dark for any reason other than the master switch (motion
+    /// path, or went dark for a reason other than the master switch (motion
     /// policy, load shed, degenerate grid, classic wake's dark frame) while
-    /// [`GlowConfig::audible`] said the key belongs to this window. One law,
-    /// [`Self::settle_key_seam`], for every style. [`Self::cue_keystroke`]
-    /// records nothing unless set.
-    ///
-    /// Sound is silenced only by gates about sound: the master switch and
-    /// serious mode ([`GlowConfig::enabled`]) and unfocus (`audible = false`);
-    /// the host's sound knobs gate before a cue is minted. False before the
-    /// first tick.
-    ///
-    /// Read out of band by [`Self::sound_seam_open`] (`aterm ctl tone`'s
-    /// `engine_sound=`, `aterm ctl trail status`'s `sound_seam=`), so changing
-    /// either dark return changes a user-visible answer.
+    /// [`GlowConfig::audible`] said the key belongs to this window
+    /// ([`Self::settle_key_seam`]). [`Self::cue_keystroke`] records nothing
+    /// unless set. Only gates about sound silence it: the master switch and
+    /// serious mode (`enabled`) and unfocus (`audible = false`). False before
+    /// the first tick. Read by [`Self::sound_seam_open`] (`tone`'s
+    /// `engine_sound=`, `trail status`'s `sound_seam=`).
     sound_live: bool,
     /// This frame's cursor-row content probe ([`Self::observe_row`]), the newer
     /// half of the poof detector's double buffer. Per-column chars (lead char
@@ -763,10 +738,9 @@ pub struct CursorGlow {
     /// Swept-cell run builder reused each frame by [`Self::emit_comet`];
     /// `comet_run` is the run in progress.
     ///
-    /// Inner buffers are pooled: each emitter clears entries in place and
-    /// publishes a finished run by swapping it with the pooled entry at the
-    /// live watermark, so `comet_run` always returns holding an allocated,
-    /// empty buffer. Entries past `runs_len` are spares, so consumers read
+    /// Inner buffers are pooled: a finished run is published by swapping it
+    /// with the pooled entry at the live watermark, so `comet_run` always
+    /// returns holding an allocated, empty buffer. Consumers read
     /// `&comet_runs[..runs_len]`. Bounded by runs ≤ sparks ≤
     /// [`Self::MAX_SPARKS`]. The emitter clears it on entry.
     comet_runs: Vec<Vec<CometSample>>,
@@ -888,18 +862,16 @@ pub struct CursorGlow {
     last_cfg: Option<GlowConfig>,
     /// Latch: the `!cfg.enabled` teardown has run and nothing has dirtied wiped
     /// state since, so the dark tick skips re-issuing
-    /// [`Self::clear_transient_state`] and [`Self::clear_thermals`] every frame
-    /// (the pipeline gates on `enabled_any()`, not per engine). Dropped by every
-    /// enabled tick, [`Self::reset`], and [`Self::unsettle`] at each entry that
-    /// writes wiped state. Entries that only move state toward the wiped
-    /// fixpoint (`clear_blink`, `clear_typed`, `drop_row_probe`, drains) keep
-    /// it. `cue_keystroke` is inert here because the latch is set only by the
-    /// master-off / degenerate-grid branch when it leaves the seam shut;
-    /// `observe_neighbor_rows` is inert until an `observe_row` (which
-    /// unsettles). Starts false, so the first dark tick runs one wipe.
+    /// [`Self::clear_transient_state`] and [`Self::clear_thermals`] every frame.
+    /// Dropped by every enabled tick, [`Self::reset`], and [`Self::unsettle`]
+    /// at each entry that writes wiped state; entries that only move state
+    /// toward the wiped fixpoint (`clear_blink`, `clear_typed`,
+    /// `drop_row_probe`, drains) keep it. `cue_keystroke` cannot dirty it (the
+    /// latch is set only with the seam shut), nor `observe_neighbor_rows`
+    /// (inert until an `observe_row`, which unsettles). Starts false.
     dark_settled: bool,
     /// The Rainbow Kitty engine (`RAINBOW-KITTY-V2.md` §17.2's seam object),
-    /// which every `if self.v2.engaged()` delegates to (D14). Engaged at the
+    /// which every `if self.v2.engaged()` delegates to. Engaged at the
     /// top of [`Self::tick`] whenever the style is [`GlowStyle::RainbowKitty`];
     /// disengaged, each seam point is one cached-bool branch and the other
     /// styles run their own code.
@@ -948,7 +920,7 @@ pub struct CursorGlow {
     /// host reads it through [`Self::caret_flare_at`] / [`Self::caret_paint`]
     /// when it builds the caret's `RainbowConfig`.
     v2_caret: CaretSeam,
-    /// The caret's seated stop (§7.1, D4): the field `t` the caret block mixes
+    /// The caret's seated stop (§7.1): the field `t` the caret block mixes
     /// toward, and the caret cell it was seated at. Re-seated on an engaged tick
     /// only when the caret cell changed or its own cell owns field light, and
     /// held otherwise, so a cell dying under a parked caret cannot move its
@@ -1206,11 +1178,13 @@ impl FrameFingerprint {
             return;
         }
         self.begin_stream(Self::FIRE_PATCH, patches.len());
+        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
         for p in patches {
             for word in p.damage_words() {
-                self.write(word);
+                hash = fnv_mix_u64(hash, word);
             }
         }
+        self.0 = Some(hash);
     }
 
     fn chars(&mut self, chars: &[CharFg]) {
@@ -1218,9 +1192,14 @@ impl FrameFingerprint {
             return;
         }
         self.begin_stream(Self::CHAR_FG, chars.len());
+        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
         for c in chars {
-            self.write(u64::from(c.row) | (u64::from(c.col) << 16) | (u64::from(c.fg) << 32));
+            hash = fnv_mix_u64(
+                hash,
+                u64::from(c.row) | (u64::from(c.col) << 16) | (u64::from(c.fg) << 32),
+            );
         }
+        self.0 = Some(hash);
     }
 
     fn fire_halos(&mut self, cells: &[FireHaloCell]) {
@@ -1228,9 +1207,14 @@ impl FrameFingerprint {
             return;
         }
         self.begin_stream(Self::FIRE_HALO, cells.len());
+        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
         for c in cells {
-            self.write(u64::from(c.row) | (u64::from(c.col) << 16) | (u64::from(c.strength) << 32));
+            hash = fnv_mix_u64(
+                hash,
+                u64::from(c.row) | (u64::from(c.col) << 16) | (u64::from(c.strength) << 32),
+            );
         }
+        self.0 = Some(hash);
     }
 
     fn rain_halos(&mut self, halos: &[RainHalo]) {
@@ -1238,11 +1222,13 @@ impl FrameFingerprint {
             return;
         }
         self.begin_stream(Self::RAIN_HALO, halos.len());
+        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
         for h in halos {
             for word in h.damage_words() {
-                self.write(word);
+                hash = fnv_mix_u64(hash, word);
             }
         }
+        self.0 = Some(hash);
     }
 
     fn forge_fill(&mut self, fill: u32) {
@@ -1291,11 +1277,6 @@ impl CursorGlow {
     /// delivered insert's row take the full cap.
     const ANCHOR_UNPROVEN_ROW_MAX: usize = 32;
 
-    // ── The zoom streak's shape (see `emit_rainbow_jumps`) ─────────────────
-    //
-    // Four numbers, each an endpoint of a continuous ramp rather than a level
-    // some stretch of the mark is held at, so the streak has no seams.
-
     /// Most simultaneous live lightning bolts, main channels + branch forks
     /// (oldest evicted first). A jump strike spawns 1 main + up to 4 branches,
     /// so this comfortably holds several overlapping strikes plus crackle.
@@ -1318,7 +1299,7 @@ impl CursorGlow {
     /// Typing crown window: a single-cell advance keeps the crown lit this long,
     /// so at human cadence the glow stream stays non-empty across inter-key gaps
     /// (and the renderer's SDR attack envelope does not re-bloom per key). Jumps
-    /// keep [`CROWN_MS`].
+    /// keep [`Self::CROWN_MS`].
     const CROWN_TYPING_MS: u64 = 350;
     /// Heat earned by one keystroke at full cadence (≈7 fast keys to full heat).
     const HEAT_GAIN: f32 = 0.16;
@@ -1341,7 +1322,7 @@ impl CursorGlow {
     const CHAIN_MARGIN: f32 = 0.10;
     /// …capped here so the post-stop tail stays crisp (≤500ms after the last key).
     const CHAIN_LIFE_MAX: f32 = 0.50;
-    // ---- EMBERFORGE thermal model (fire only) --------------------------------
+    // Emberforge thermal model (fire only).
     /// Fire's fast-heat gain per forward keystroke at full cadence, well below
     /// [`Self::HEAT_GAIN`]: full blaze takes ~30-40 sustained keys (fast heat
     /// plus the coal floor).
@@ -1355,7 +1336,7 @@ impl CursorGlow {
     /// τ above, ~60+ sustained keys reach a strong bed — the long momentum arc.
     const COAL_GAIN: f32 = 0.022;
     /// Inter-key gap earning full coal credit — deliberately wider than the
-    /// fast heat's window: HUMAN-cadence typing must charge the bed…
+    /// fast heat's window: human-cadence typing must charge the bed…
     const COAL_GAP_FULL: f32 = 0.35;
     /// …fading to zero credit here (a key every 1.5 s is browsing, not writing).
     const COAL_GAP_ZERO: f32 = 1.50;
@@ -1381,7 +1362,7 @@ impl CursorGlow {
     /// against where it rests ([`TornLay`]): two 60 Hz frames, past the
     /// continuation of a read that tore inside one redisplay.
     pub(crate) const TORN_REST_S: f32 = 0.032;
-    /// Freshness window for the RETURN classifier ([`Self::return_hint`]).
+    /// Freshness window for the Return classifier ([`Self::return_hint`]).
     const RETURN_HINT_FRESH: f32 = 0.25;
     /// Freshness window for the Tab/scripted gesture stamp
     /// ([`Self::user_gesture_hint`]), in the 0.25 s class of the other press
@@ -1396,21 +1377,14 @@ impl CursorGlow {
     /// the unpaid typed credits behind it, on a non-program row, once.
     pub const INSERT_HINT_FRESH: f32 = 2.0;
     /// The same window for the unknown-width class (a bare Tab or ⌃V, whose
-    /// echo is the local program's).
-    ///
-    /// Shorter than [`Self::INSERT_HINT_FRESH`]: the unknown class has no width
-    /// to check (only the row witness and the 32-cell bound), so a long window
-    /// would light any same-row forward advance on the hand's row (a background
-    /// job printing on the prompt row) as the gesture's echo. The floor is
-    /// `a_spinner_row_advancing_after_a_tab_stays_dark`, which needs a Tab's
-    /// completion to still be the Tab's 800 ms later; one second keeps that
-    /// with margin.
-    ///
-    /// A policy, not a bound: a slower completion goes unlit rather than
-    /// leaving the window open for program output. A column witness cannot
-    /// replace the time bound: the first same-row forward move after a Tab
-    /// always starts at the hand's column, so the licence is spent before any
-    /// later hop could be tested.
+    /// echo is the local program's). Shorter than [`Self::INSERT_HINT_FRESH`]:
+    /// with no width to check (only the row witness and the 32-cell bound), a
+    /// long window would light any same-row forward advance on the hand's row
+    /// (a background job printing on the prompt row) as the gesture's echo. A
+    /// Tab's completion must still be the Tab's 800 ms later
+    /// (`a_spinner_row_advancing_after_a_tab_stays_dark`); a slower one goes
+    /// unlit. No column witness can replace the time bound: the first same-row
+    /// forward move after a Tab starts at the hand's column and spends it.
     pub const INSERT_GESTURE_HINT_FRESH: f32 = 1.0;
     /// How long after a delivered insert was laid a keyless same-row retreat
     /// inside its span reads as the program's rewrite of it (Claude Code swaps a
@@ -1471,12 +1445,10 @@ impl CursorGlow {
     const DISP_SLAM_S: f32 = 0.05;
     /// Display-temperature release τ — the fire dies down slower than it leaps.
     const DISP_RELEASE_TAU: f32 = 0.45;
-    /// Bounded ring for `flame_phase` (the fire's churn clock), like
-    /// `rainbow.phase`'s 1024 wrap: unbounded, f32 precision would freeze the
-    /// phase over a long session and the `* 1024.0 as u32` cast would saturate.
-    /// `TAU · 640` keeps both forge sines (`× 1.7`, `× 2.3`) seamless across the
-    /// wrap (1088 and 1472 whole turns); the field's own u32 ring reseats only
-    /// after ~40 min of continuous fire.
+    /// Bounded ring for `flame_phase` (the fire's churn clock): unbounded, f32
+    /// precision would freeze the phase over a long session and the
+    /// `* 1024.0 as u32` cast would saturate. `TAU · 640` keeps both forge sines
+    /// (`× 1.7`, `× 2.3`) seamless across the wrap (1088 and 1472 whole turns).
     const FLAME_PHASE_RING: f32 = std::f32::consts::TAU * 640.0;
     /// Cursor-metal attack τ (heats over ~1.5 s of standing blaze)…
     const TEMP_ATTACK_TAU: f32 = 1.5;
@@ -1847,13 +1819,11 @@ impl CursorGlow {
     }
 
     /// Reduced-motion arm for the fresh-ink pop (see the `reduced_motion`
-    /// field): a pop is a brightness step-fade only. Idempotent; the host sets
-    /// it beside the tick, like the sparkle/rain reduced twins.
+    /// field). Idempotent; the host sets it beside the tick.
     pub fn set_reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
         // Seam point 2 (§17.2, §6.11): the posture change goes to v2, dated to
-        // the last drawn tick (the engine also reads it from `Config` each
-        // tick).
+        // the last drawn tick (the engine also reads it from `Config`).
         if self.v2.engaged()
             && let Some(at) = self.heat_at
         {
@@ -1861,20 +1831,15 @@ impl CursorGlow {
         }
     }
 
-    /// The focus seam (law G1): the window's OS focus changed, forwarded from
+    /// The focus seam: the window's OS focus changed, forwarded from
     /// `App::on_focus` on the event's clock. Rainbow Kitty v2 embers its ribbon
-    /// out over `ribbon::FOCUS_EMBER_S` and puts every star on the same ember
-    /// (`rk::Event::Focus(false)`); a regain inside the ember re-arms from the
-    /// current level through `edge-in` (`Focus(true)`) (`RAINBOW-KITTY-V2.md`
-    /// §8.2).
+    /// and stars out over `ribbon::FOCUS_EMBER_S`; a regain inside the ember
+    /// re-arms from the current level (`RAINBOW-KITTY-V2.md` §8.2).
     ///
     /// Raw focus, not the host's presentability fold (which ORs in the typed
-    /// wake so an agent-driven window keeps drawing). The ribbon keeps the
-    /// wake's promise instead: a key typed during the ember clears it and
-    /// re-lights, so only a window nobody types into goes dark on blur. Sound
-    /// gates on raw focus too (`app_render::trail_sound_gain`).
-    ///
-    /// Inert for other styles and while v2 is not engaged.
+    /// wake): a key typed during the ember clears it and re-lights, so only a
+    /// window nobody types into goes dark on blur. Sound gates on raw focus
+    /// too (`sound_policy::trail_sound_gain`). Inert unless v2 is engaged.
     pub fn note_focus(&mut self, focused: bool, now: Instant) {
         if self.v2.engaged() {
             self.v2.on_event(rk::Event::Focus(focused), now);
@@ -1907,9 +1872,9 @@ impl CursorGlow {
         self.ctx_alt = alt;
     }
 
-    /// Stamp the focused pane's exact columns in the coordinate space handed
-    /// to [`Self::tick`]. This is morphology only: [`Self::move_licensed`]
-    /// remains the sole authority to mint light.
+    /// Stamp the focused pane's rows (`first_row`, `rows`) in the coordinate
+    /// space handed to [`Self::tick`], for v2's band floor. Morphology only:
+    /// [`Self::move_licensed`] remains the sole authority to mint light.
     pub fn note_pane_rows(&mut self, first_row: u16, rows: usize) {
         let pane_rows = u16::try_from(rows)
             .ok()
@@ -1934,18 +1899,16 @@ impl CursorGlow {
     /// Any light still alive keeps the animation timer armed. The cursor metal
     /// is the one non-quad member: the forge fill is visible
     /// (`cursor_fill_override`), so the cursor animates until it has cooled to
-    /// the theme fill, then snaps to 0. A pending kill hint also arms: a
-    /// reflowing TUI's kill is answered by the caret fallback, which runs only
-    /// on a ticked frame after its grace, after the app's redraw burst has gone
-    /// idle. Bounded by [`Self::KILL_HINT_FRESH`] and paced coarsely
-    /// ([`Self::next_change_deadline`]).
+    /// the theme fill. A pending kill hint also arms: a reflowing TUI's kill is
+    /// answered by the caret fallback, which runs only on a ticked frame after
+    /// its grace (bounded by [`Self::KILL_HINT_FRESH`], paced coarsely).
     pub fn is_active(&self) -> bool {
         // The classic wake's light is moving light (`has_live_motion`).
         self.has_live_motion()
             || self.ember_live()
             || self.poof_hint_pending().is_some()
-            // §17.2: `is_active` follows the v2 fingerprint while it owns
-            // the frame — `0` exactly when nothing of v2's is on glass (T6).
+            // While v2 owns the frame, its fingerprint is `0` exactly when
+            // nothing of v2's is on glass.
             || (self.v2.engaged() && self.v2.fingerprint() != 0)
             // A held park is pending work: its verdict is due ≤ 0.25 s after
             // the park, and only a tick can deliver it ([`HeldPark`]).
@@ -2001,13 +1964,9 @@ impl CursorGlow {
     }
 
     /// Whether live geometry changes fast enough to need phase-locked frame
-    /// cadence. Vapor, the forge ember and kill-hint polling are excluded:
-    /// their coarse deadlines are part of the latency budget.
-    ///
-    /// The GUI scheduler uses this exact predicate to choose between its
-    /// phase-locked frame train and [`Self::next_change_deadline`]'s coarse
-    /// path. A live outgoing style crossfade counts, which also keeps the train
-    /// armed across a style switch (via `is_active` → `has_live_motion`).
+    /// cadence: the GUI scheduler's choice between its frame train and
+    /// [`Self::next_change_deadline`]'s coarse path. Vapor, the forge ember and
+    /// kill-hint polling are excluded; a live style crossfade counts.
     #[must_use]
     pub fn needs_frame_cadence(&self) -> bool {
         // The classic wake's comet, crown and ring all move every frame. Each
@@ -2025,58 +1984,43 @@ impl CursorGlow {
             || !self.bolts.is_empty()
             || self.ring.is_some()
             // The crown's window is armed by the move path for every style, so
-            // it is the one v1 term that could hold the frame train while v2
-            // owns the frame (every other Rainbow Kitty pool is laid by the v1
-            // spawn arm seam point 1 returns before). Under v2 the crown neither
-            // paces (here) nor paints (the emit gate)
-            // (`under_v2_the_seam_never_paces_the_frame_train_for_v1s_crown`).
+            // under v2 it must not hold the frame train: v2 owns the head, and
+            // the crown neither paces (here) nor paints (the emit gate).
             || (self.crown_until.is_some() && !self.v2.engaged())
             || !self.fading.is_empty()
-            // A live fresh-ink pop is brisk light (spring and ease-out move
-            // every frame), so it keeps the train armed until the ring drains.
-            // Seam point 8 (§17.2, D14): OR in v2's pools (stars, meteors, a
-            // live ribbon transient), `false` whenever v2 is not engaged.
+            // Seam point 8 (§17.2): v2's pools (stars, meteors, fresh-ink pops,
+            // a live ribbon transient); `false` whenever v2 is not engaged.
             || self.v2.needs_frame_cadence()
     }
 
     /// When the next visible change is due, so the host paces the animation
-    /// wake instead of pinning 60 fps for the effect's lifetime. `None` when
-    /// nothing is live. Moving light gets the full `frame_interval`. A pending
-    /// kill hint with no moving light paces at
-    /// [`Self::KILL_HINT_POLL_INTERVAL`] (the fallback needs only a few frames
-    /// after its grace, and full recomposes would contend the term mutex during
-    /// a repaint burst). The slowly cooling forge ember, whose u8 colour barely
-    /// changes, also polls coarsely, so a keypress never waits on a recompose.
+    /// wake instead of pinning 60 fps; `None` when nothing is live. Moving light
+    /// gets the full `frame_interval`. A pending kill hint alone polls at
+    /// [`Self::KILL_HINT_POLL_INTERVAL`] (full recomposes would contend the term
+    /// mutex during a repaint burst), and the slowly cooling forge ember polls
+    /// coarsely too.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
-        // Seam point 9 (§17.2, D14): v2's next change (earliest star death,
-        // flight end or ribbon transient), `None` when nothing of v2's is live,
-        // so it can only pull a wake earlier.
+        // Seam point 9 (§17.2): v2's next change, `None` when nothing of v2's is
+        // live, so it can only pull a wake earlier.
         let v2_due = if self.v2.engaged() {
             self.v2.next_change_deadline(now)
         } else {
             None
         };
         // Brisk light needs the full frame cadence; the shared predicate keeps
-        // this identical to the host scheduler's phase-lock gate.
-        //
-        // What v1 may still pace under v2: the crown is excluded by the
-        // predicate; the ember (`cursor_temp`) is Fire's and zero elsewhere;
-        // the ring and particles come only from the v1 spawn arm seam point 1
-        // returns before. What remains is the poof hint (the erase detector's
-        // licence, whose tick mints v2's `Kill`) and the kill smoke (§5.6),
-        // both coarse polls.
+        // this identical to the host scheduler's phase-lock gate. Under v2 the
+        // crown is excluded, the ember is Fire's, and the ring and particles
+        // come only from the v1 spawn arm v2 returns before; what remains is the
+        // poof hint (whose tick mints v2's `Kill`) and the kill smoke, both
+        // coarse polls.
         let v1_due = if self.needs_frame_cadence() {
             Some(now + frame_interval)
         } else if let Some(t) = self.poof_hint_pending() {
             // The first wake lands as the fallback's grace opens (`>=` admits a
-            // tick at hint+grace), then the coarse poll takes over, so the poof
-            // fires at the caret's grace-open position. Either licence paces
-            // this ([`Self::poof_hint_pending`]).
-            //
-            // Never `now` itself: a deadline at `now` is a busy re-arm (the
-            // engine's `ARM_MIN` law), which would spin at render cost for the
-            // rest of the hint.
+            // tick at hint+grace), then the coarse poll takes over. Never `now`
+            // itself: a deadline at `now` is a busy re-arm (the `ARM_MIN` law)
+            // that would spin at render cost for the rest of the hint.
             let grace_open = t + Duration::from_secs_f32(Self::POOF_FALLBACK_GRACE);
             let poll = now + Self::KILL_HINT_POLL_INTERVAL;
             Some(if grace_open > now {
@@ -2095,12 +2039,10 @@ impl CursorGlow {
         };
         // A held park schedules the tick that judges it. The flush is strict
         // (`> p.patience()`), so the arm lands one `ARM_MIN` past the park's
-        // own window: 0.25 s for a same-row park, 10 s custody for a proved
-        // foreign-row park (arming the latter at 0.25 s would re-arm a 1 ms
-        // timer every tick). The last unpaid press may expire sooner and end
-        // custody too. Never earlier than `now + ARM_MIN`. v2-gated: the park is
-        // v2 state and the Classic branch returns before the flush, so a park
-        // stranded by a style switch would spin.
+        // window (0.25 s same-row, 10 s for a proved foreign-row park), or when
+        // the last unpaid press expires, never before `now + ARM_MIN`. v2-gated:
+        // the Classic branch returns before the flush, so a park stranded by a
+        // style switch would spin.
         let park_due = self.held_park.filter(|_| self.v2.engaged()).map(|p| {
             let park_expiry = p.at + p.patience() + rk::ARM_MIN;
             let credit_expiry = p.cross_row.then(|| {
@@ -2125,11 +2067,10 @@ impl CursorGlow {
     }
 
     /// Wipe every piece of transient state: in-flight light (sparks, particles,
-    /// streaks, bursts, glide stars, meteors, vapor, bolts, ring, crossfades),
-    /// all input hints, the row probes, and the Rainbow Kitty tail/pop/wake
-    /// machinery. The one teardown all three dark/reset paths compose from, so
-    /// a disabled engine reports idle and no stale hint survives to fire on
-    /// refocus.
+    /// meteors, vapor, bolts, ring, crown, crossfades), held parks and torn
+    /// lays, the press ring, every input hint and the row probes. The one
+    /// teardown the dark and reset paths compose from, so a disabled engine
+    /// reports idle and no stale hint fires on refocus.
     ///
     /// Left to the callers, the four things the paths differ on: `sound_live`,
     /// the sound ledger ([`Self::clear_sound_ledger`]; a load-shed frame is
@@ -2154,24 +2095,14 @@ impl CursorGlow {
         self.carried_key_move = None;
         // A held park is judged before the teardown takes its stamp and
         // its pool: today's verdict, then the wipe.
-        self.flush_held_park();
+        self.retire_all_movement_provenance();
         self.torn_lay = None;
         self.clear_visual_geometry();
-        self.type_press_ring.forget();
-        self.insert.orphans = None;
-        self.last_committed_type = None;
-        // Every licence term goes: a surviving hint would license the first
-        // program move after the lights come back.
-        self.quench_hint = None;
         self.last_erase = None;
-        self.nav_hint = None;
-        self.type_hint.clear();
         self.kill_hint = None;
+        self.kill_retreat_pending = None;
+        self.kill_reported_to_v2 = None;
         self.blink_hint = None;
-        self.reflow_hint = None;
-        self.return_hint = None;
-        self.user_gesture_hint = None;
-        self.newline_hint = None;
         self.insert.teardown();
         self.last_licensed_row = None;
         self.hand_row = None;
@@ -2181,6 +2112,7 @@ impl CursorGlow {
         self.last_poof = None;
         self.row_cur.clear();
         self.row_prev.clear();
+        self.row_shown.clear();
         self.row_cur_meta = None;
         self.row_prev_meta = None;
         self.row_shown_meta = None;
@@ -2208,6 +2140,7 @@ impl CursorGlow {
         self.under_out.clear();
         self.char_out.clear();
         self.fire_halo_out.clear();
+        self.v2_beams.clear();
     }
 
     /// The key seam's one law for every tick past the master switch: open when
@@ -2218,8 +2151,7 @@ impl CursorGlow {
     /// echoes of keys typed during it stay silent.
     ///
     /// Four call sites (degenerate-grid return, classic wake, zero-amplitude
-    /// return, live path), one law, driven for every style by the
-    /// `TrailSoundSeam` model's Tier-1 conformance.
+    /// return, live path), bound by the `TrailSoundSeam` model's conformance.
     fn settle_key_seam(&mut self, cfg: &GlowConfig, drew: bool) {
         let open = drew || cfg.audible;
         if !open {
@@ -2237,21 +2169,17 @@ impl CursorGlow {
         self.dark_settled = false;
     }
 
-    /// The curtain at a coordinate-space seam (laws A2/A4, D-2, D-3):
-    /// [`Self::reset`] for every engine and hint of the ended space, except
-    /// that Rainbow Kitty's ribbon is drawn into the caret it last stood under
-    /// over `rk::ribbon::CURTAIN_S` and spent to zero, with nothing laid until
-    /// it ends ([`rk::Engine::curtain`]). Other v2 marks (flights, stars, in
-    /// old-space px) go with the reset, and the caret is learned from the next
-    /// observed move. Hosts call this for alternate-screen entry, tab or
-    /// terminal switches, resizes and content invalidation; a style switch,
-    /// teardown and serious mode still `reset()`. For other styles it is
-    /// `reset()`.
+    /// The curtain at a coordinate-space seam: [`Self::reset`], except that
+    /// Rainbow Kitty's ribbon is drawn into the caret it last stood under over
+    /// `rk::ribbon::CURTAIN_S` and spent to zero, with nothing laid until it
+    /// ends ([`rk::Engine::curtain`]). Hosts call this for alternate-screen
+    /// entry, tab or terminal switches, resizes and content invalidation; a
+    /// style switch, teardown and serious mode `reset()`.
     pub fn curtain(&mut self, now: Instant) {
         self.reset_space(Some(now));
     }
 
-    /// Hide Rainbow Kitty's next frame (D-4, A4): the viewport shows history.
+    /// Hide Rainbow Kitty's next frame: the viewport shows history.
     /// Returns `true` when v2 owns the frame and will run its clocks but write
     /// nothing next tick, keeping the band for when the live viewport returns;
     /// `false` for other styles, whose caller resets instead.
@@ -2265,7 +2193,7 @@ impl CursorGlow {
 
     /// Whether v2 owns the frame: for a host path deciding between keeping
     /// Rainbow Kitty's band and resetting other styles' marks without arming a
-    /// hide it has no tick for ([`Self::hide_v2`]; `TornBandLaw::Keep`).
+    /// hide it has no tick for ([`Self::hide_v2`]; `TornBand::Keep`).
     #[must_use]
     pub fn v2_owns_frame(&self) -> bool {
         self.v2.engaged()
@@ -2299,10 +2227,9 @@ impl CursorGlow {
         self.v2.hide_armed()
     }
 
-    /// Drop all in-flight light and forget the last cursor position. Used when the
-    /// cursor's coordinate space changes out from under the animator (e.g. a single
-    /// pane ⇄ split-pane layout transition), so the next tick can't spawn a comet
-    /// from a stale cross-space position.
+    /// Drop all in-flight light and forget the last cursor position, when the
+    /// cursor's coordinate space changes out from under the animator (e.g. a
+    /// single pane ⇄ split layout transition).
     pub fn reset(&mut self) {
         self.reset_space(None);
     }
@@ -2311,7 +2238,7 @@ impl CursorGlow {
     /// the curtain instead of the cut ([`Self::curtain`]).
     fn reset_space(&mut self, curtain: Option<Instant>) {
         // A space transition invalidates coordinates wholesale: fade residue,
-        // live light, pops, row probes (a stale probe could witness a phantom
+        // live light, row probes (a stale probe could witness a phantom
         // shrink), hints and thermals. Keyed-click credits go too, or the first
         // echo click in the new space would be muted. `sound_live` stays: a
         // reset is a coordinate event, not darkness.
@@ -2328,23 +2255,27 @@ impl CursorGlow {
         // `print_anchor`/`print_anchor_seen` survive: they mirror the
         // terminal's monotonic sample, so the pass idles until new output.
         self.forget_anchor_rows();
-        self.hand_row = None;
+        // Tick sequence history survives the coordinate reset, as the terminal's
+        // sample does, but an in-progress frame is no longer current evidence.
+        self.print_in_tick = false;
         self.wrap_paid_row = None;
         self.last_move = None;
         self.crown_window_ms = Self::CROWN_MS;
         self.ctx_alt = false;
         self.pane_columns = None;
-        // Seam point 12 (§17.2, D14): a coordinate-space event drops every v2
-        // mark, its spine, its buffered events and the caret's seated stop. v2
-        // lets go of the frame: the next drawing tick engages a fresh engine,
-        // and a key struck before then lays nowhere. Under a curtain
-        // (`Self::curtain`) the engine keeps the frame and its ribbon eases
-        // out; everything else resets the same way.
+        // Seam point 12 (§17.2): a coordinate-space event drops every v2 mark,
+        // its spine, its buffered events and the caret's seated stop, and v2
+        // lets go of the frame (a key struck before the next drawing tick lays
+        // nowhere). Under a curtain the engine keeps the frame and its ribbon
+        // eases out.
         match curtain {
             Some(now) if self.v2.engaged() => self.v2.curtain(now),
             _ => self.v2.set_engaged(false),
         }
+        self.v2_caret = CaretSeam::default();
         self.v2_stop = None;
+        self.flow_open = false;
+        self.scroll_rows = 0;
         // The witness's samples were rows of the space that just died, and
         // so were the rows it asked for.
         self.witness_rows_n = 0;
@@ -2363,6 +2294,12 @@ impl CursorGlow {
         geom: Geom,
         out: &mut Vec<GlowQuad>,
     ) -> u64 {
+        // Sample before every early return: output seen on a dark or Classic
+        // frame is already old when Rainbow Kitty next owns a frame. The echo
+        // lane has its own consumer and must not supply this frame boundary.
+        let print_seq = self.print_anchor.map(|(_, _, seq)| seq);
+        self.print_in_tick = print_seq.is_some() && print_seq != self.print_anchor_tick_seq;
+        self.print_anchor_tick_seq = print_seq;
         self.last_ch = geom.ch.min(u16::MAX as usize) as u16;
         self.last_origin_y = geom.origin_y;
         out.clear();
@@ -2383,19 +2320,14 @@ impl CursorGlow {
         // The momentum pulse is a per-tick signal: clear it up front so the
         // host reads only this tick's correlated advance (set in `spawn`).
         self.momentum_pulse = None;
-        // The witness's samples are this frame's and no other's: taken here,
-        // so a tick that returns dark below cannot leave them for the next.
+        let valid_canvas =
+            cfg.enabled && geom.cw != 0 && geom.ch != 0 && geom.rows != 0 && geom.cols != 0;
+        let v2_active =
+            valid_canvas && matches!(cfg.style, GlowStyle::RainbowKitty) && cfg.intensity > 0.0;
         let park_source = self.last.filter(|&(row, col)| {
             cur.is_some_and(|(next, _)| next != row) && self.park_source_unchanged(row, col)
         });
-        self.carried_key_move = if matches!(cfg.style, GlowStyle::RainbowKitty)
-            && cfg.enabled
-            && cfg.intensity > 0.0
-            && geom.cw != 0
-            && geom.ch != 0
-            && geom.rows != 0
-            && geom.cols != 0
-        {
+        self.carried_key_move = if v2_active {
             park_source
                 .zip(cur)
                 .filter(|&(from, to)| self.key_pushed_text_down(from, Some(to), now))
@@ -2419,6 +2351,9 @@ impl CursorGlow {
                 if old != current {
                     exact = false;
                     replaced |= !current.is_blank();
+                    if replaced {
+                        break;
+                    }
                 }
             }
             self.park_source_confirmed = exact;
@@ -2431,22 +2366,14 @@ impl CursorGlow {
                 self.forget_typed_credits(now);
             }
         }
+        // The witness's samples are this frame's and no other's: taken here,
+        // so a tick that returns dark below cannot leave them for the next.
         let witness_n = std::mem::take(&mut self.witness_rows_n);
         let (asked, asked_n) = self.witness_asked.take();
-        // The seam's gate (`RAINBOW-KITTY-V2.md` §17.2, D14): v2 owns the frame
-        // whenever the resolved style is Rainbow Kitty and this tick draws
-        // (master switch on, non-degenerate grid, live amplitude), so a dark
-        // tick disengages it. `set_engaged` resets only on a transition; for
-        // other styles the `&&` chain ends at its first operand.
-        self.v2.set_engaged(
-            matches!(cfg.style, GlowStyle::RainbowKitty)
-                && cfg.enabled
-                && cfg.intensity > 0.0
-                && geom.cw != 0
-                && geom.ch != 0
-                && geom.rows != 0
-                && geom.cols != 0,
-        );
+        // The seam's gate (`RAINBOW-KITTY-V2.md` §17.2): v2 owns the frame
+        // whenever the style is Rainbow Kitty and this tick draws, so a dark
+        // tick disengages it. `set_engaged` resets only on a transition.
+        self.v2.set_engaged(v2_active);
         if !self.v2.engaged() {
             // The seated caret stop is v2's; a frame v2 does not own has none,
             // so a re-engage seats afresh instead of holding a stale hue.
@@ -2457,32 +2384,24 @@ impl CursorGlow {
         // lazy cooling below, so earned forge momentum merely cools and resumes
         // on refocus. A grid with no rows or columns is degenerate too (an
         // empty effects box would give `clamp_to_glass` `min > max`).
-        if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || geom.rows == 0 || geom.cols == 0 {
-            // Full zero includes any in-flight crossfade: off means dark now.
-            //
-            // The key seam here depends on why the return is taken. The master
-            // switch (and serious mode, via `enabled`) closes it: keypresses
-            // record no cue and banked credits die. A degenerate grid is a fact
-            // about the light's canvas, not sound, so it takes the common law
-            // ([`Self::settle_key_seam`]): dark, and heard when `audible`.
+        if !valid_canvas {
+            // Full zero includes any in-flight crossfade. The master switch (and
+            // serious mode, via `enabled`) closes the key seam; a degenerate
+            // grid is a fact about the canvas, not sound, so it takes the
+            // common law ([`Self::settle_key_seam`]).
             if cfg.enabled {
                 self.store_key_timbre(cfg);
                 self.settle_key_seam(cfg, false);
             } else {
                 self.sound_live = false;
             }
-            // Latched: after one full teardown every store below is already
-            // cleared, and only an enabled tick, [`Self::reset`] or an
-            // [`Self::unsettle`] caller can dirty them (each drops the latch),
-            // so the wipe runs once per darkness. Cursor tracking stays outside
-            // the latch so re-enabling sees the live position and spawns no
-            // spurious comet.
-            //
-            // The latch is set only while the seam is shut: with the seam open
+            // Latched: after one full teardown only an enabled tick,
+            // [`Self::reset`] or an [`Self::unsettle`] caller can dirty the
+            // stores, so the wipe runs once per darkness. Cursor tracking stays
+            // outside the latch so re-enabling spawns no spurious comet. The
+            // latch is set only while the seam is shut: with it open
             // `cue_keystroke` writes the sound ledger without unsettling, so a
-            // degenerate grid runs the teardown every frame instead. The sound
-            // ledger survives it so keys typed meanwhile still find their
-            // credits.
+            // degenerate grid runs the teardown every frame and keeps the ledger.
             if !self.dark_settled {
                 self.clear_transient_state();
                 if !self.sound_live {
@@ -2515,6 +2434,8 @@ impl CursorGlow {
             // armed they would keep `is_active` and the poof poll waking for the
             // rest of the session. Dropped, since this engine cannot draw a poof.
             self.kill_hint = None;
+            self.kill_retreat_pending = None;
+            self.kill_reported_to_v2 = None;
             self.bs_poof_hint = None;
             self.bs_baseline = None;
             // The mirror of the reset below: this engine's light, warmth and
@@ -2643,26 +2564,32 @@ impl CursorGlow {
             if dt > 0.0 {
                 // Fire cools on its own slower τ; other styles use 0.9 s. Shared
                 // with the key-time click's timbre prediction via `heat_tau`.
-                let heat_tau = Self::heat_tau(cfg);
-                self.heat *= (-dt / heat_tau).exp();
-                if self.heat < 0.005 {
-                    self.heat = 0.0;
+                if self.heat > 0.0 {
+                    let heat_tau = Self::heat_tau(cfg);
+                    self.heat *= (-dt / heat_tau).exp();
+                    if self.heat < 0.005 {
+                        self.heat = 0.0;
+                    }
                 }
-                self.flare *= (-dt / Self::FLARE_DECAY_TAU).exp();
-                if self.flare < 0.005 {
-                    self.flare = 0.0;
+                if self.flare > 0.0 {
+                    self.flare *= (-dt / Self::FLARE_DECAY_TAU).exp();
+                    if self.flare < 0.005 {
+                        self.flare = 0.0;
+                    }
                 }
-                // Emberforge thermal evolution (fire only; others' values are
-                // zero). Integrators decay first, then the eased display
-                // temperature chases the new target, so one tick's consumers
-                // read one coherent temperature.
-                self.coal *= (-dt / Self::COAL_TAU).exp();
-                if self.coal < 0.005 {
-                    self.coal = 0.0;
+                // Integrators decay first, then the eased display temperature
+                // chases the new target, so one tick reads one temperature.
+                if self.coal > 0.0 {
+                    self.coal *= (-dt / Self::COAL_TAU).exp();
+                    if self.coal < 0.005 {
+                        self.coal = 0.0;
+                    }
                 }
-                self.quench *= (-dt / Self::QUENCH_TAU).exp();
-                if self.quench < 0.005 {
-                    self.quench = 0.0;
+                if self.quench > 0.0 {
+                    self.quench *= (-dt / Self::QUENCH_TAU).exp();
+                    if self.quench < 0.005 {
+                        self.quench = 0.0;
+                    }
                 }
                 let target = self
                     .heat
@@ -2671,21 +2598,22 @@ impl CursorGlow {
                     .clamp(0.0, 1.0)
                     * (1.0 - Self::QUENCH_DAMP * self.quench);
                 let rise = target - self.disp_t;
-                let ease = if rise > 0.5 {
-                    Self::DISP_SLAM_S // a jump slam: fast whoosh, still no hard pop
-                } else if rise > 0.0 {
-                    Self::DISP_ATTACK_S
-                } else {
-                    // An active quench accelerates the die-down (up to ~3×); a
-                    // natural pause keeps the slower release.
-                    Self::DISP_RELEASE_TAU / (1.0 + 2.0 * self.quench)
-                };
-                self.disp_t += rise * (1.0 - (-dt / ease).exp());
-                if self.disp_t < 0.005 {
-                    self.disp_t = 0.0;
+                if rise != 0.0 {
+                    let ease = if rise > 0.5 {
+                        Self::DISP_SLAM_S // a jump slam: fast whoosh, still no hard pop
+                    } else if rise > 0.0 {
+                        Self::DISP_ATTACK_S
+                    } else {
+                        // An active quench accelerates the die-down (up to ~3×); a
+                        // natural pause keeps the slower release.
+                        Self::DISP_RELEASE_TAU / (1.0 + 2.0 * self.quench)
+                    };
+                    self.disp_t += rise * (1.0 - (-dt / ease).exp());
+                    if self.disp_t < 0.005 {
+                        self.disp_t = 0.0;
+                    }
                 }
-                // The flame field's clock integrates churn-weighted time so its
-                // motion accelerates smoothly with temperature, wrapped on
+                // The flame clock runs faster as the fire heats, wrapped on
                 // `FLAME_PHASE_RING`.
                 self.flame_phase += dt * (1.6 + 2.2 * self.disp_t);
                 if self.flame_phase >= Self::FLAME_PHASE_RING {
@@ -2694,15 +2622,17 @@ impl CursorGlow {
                 if matches!(cfg.style, GlowStyle::Fire) {
                     // Cursor metal chases the display temperature with
                     // hysteresis; a full quench halves the cooling τ.
-                    let temp_tau = if self.disp_t > self.cursor_temp {
-                        Self::TEMP_ATTACK_TAU
-                    } else {
-                        Self::TEMP_RELEASE_TAU / (1.0 + self.quench)
-                    };
-                    self.cursor_temp +=
-                        (self.disp_t - self.cursor_temp) * (1.0 - (-dt / temp_tau).exp());
-                    if self.cursor_temp < 0.005 {
-                        self.cursor_temp = 0.0;
+                    let diff = self.disp_t - self.cursor_temp;
+                    if diff != 0.0 {
+                        let temp_tau = if diff > 0.0 {
+                            Self::TEMP_ATTACK_TAU
+                        } else {
+                            Self::TEMP_RELEASE_TAU / (1.0 + self.quench)
+                        };
+                        self.cursor_temp += diff * (1.0 - (-dt / temp_tau).exp());
+                        if self.cursor_temp < 0.005 {
+                            self.cursor_temp = 0.0;
+                        }
                     }
                 } else {
                     self.cursor_temp = 0.0;
@@ -2723,34 +2653,20 @@ impl CursorGlow {
         // coherent thermal snapshot.
         self.store_key_timbre(cfg);
 
-        // Zero amplitude (unfocused, motion-reduced, or a real 0 intensity):
-        // emit no light and spawn nothing, but keep the long-lived thermal
-        // integrators (coal, cursor_temp, heat, flame_phase) that the lazy
-        // cooling already aged. A focus blip costs only its own duration of
-        // cooling; a long unfocus cools to exactly zero, so `is_active` disarms.
-        // Only `reset()` wipes momentum. Moving light and the transient
-        // candidate/classifier cohort are dropped; cursor position is tracked so
-        // refocus spawns no phantom comet.
+        // Zero amplitude (unfocused, motion-reduced, or a real 0): emit and
+        // spawn nothing but keep the lazily cooled thermals, so a focus blip costs
+        // only its own cooling. Cursor position is tracked so refocus spawns no
+        // phantom comet.
         if cfg.intensity <= 0.0 {
-            // Crossfade residue and pops are moving light, dropped while dark
-            // (the ramp-in floor keeps a genuine switch off this path).
-            //
-            // The key seam does not close with the light: it asks
-            // [`GlowConfig::audible`], so dark for a motion or performance
-            // reason is still heard, while dark because the key belongs to
-            // another window is not. No `clear_thermals` here: the lazy decay
-            // already cooled the integrators. The sound ledger goes only when
-            // the seam goes ([`Self::settle_key_seam`]); wiping credits on every
-            // shed frame would double-click the burst when the frame relit.
+            // Crossfade residue is moving light, dropped while dark (the ramp-in
+            // floor keeps a genuine switch off this path). The key seam follows
+            // `audible`, so the sound ledger survives a shed frame.
             self.settle_key_seam(cfg, false);
             self.clear_transient_state();
             self.track_shown_caret(cur, now);
             return 0;
         }
-        // Past both dark returns this tick draws, so the key seam is open. Only
-        // the master-off return shuts it unconditionally; the degenerate grid,
-        // classic wake and zero amplitude ask `cfg.audible` through
-        // [`Self::settle_key_seam`]. The timbre constants were stored above.
+        // Past both dark returns this tick draws, so the key seam is open.
         self.settle_key_seam(cfg, true);
 
         self.expire_seam_holds(now);
@@ -2847,10 +2763,19 @@ impl CursorGlow {
             self.lift_hand_row(pr, cr);
             self.v2.lift_caret(pr, cr);
         }
+        // The remembered typed run rides its line: with no key behind it, the
+        // caret shown at the run's end on another row, at the same column, over
+        // the run's own glyphs at the run's own columns, is the hand's line
+        // repainted there (a composer's box lifted by agents launched in one
+        // frame, a prompt redrawn under a notice), and the next key's join reads
+        // the run on its new row. This is the evidence the follow pass cannot
+        // give once the run's cells have gone out. It holds at any row distance,
+        // as the follow pass's own carry does: the glyphs, not the length of the
+        // move, say the line is the same.
         if !key_in_flight
             && let (Some((pr, pc)), Some((cr, cc))) = (shown, cur)
             && pc == cc
-            && (1..=2).contains(&pr.abs_diff(cr))
+            && pr != cr
             && self
                 .row_cur_meta
                 .is_some_and(|m| m.row == cr && m.at == now)
@@ -2866,6 +2791,11 @@ impl CursorGlow {
             })
         {
             run.row = cr;
+            if let Some((_, Some((row, col)))) = &mut self.v2_stop
+                && (*row, *col) == (pr, pc)
+            {
+                *row = cr;
+            }
         }
         // The caret goes hidden: keep the last probe that showed it.
         if cur.is_none()
@@ -2884,9 +2814,8 @@ impl CursorGlow {
         self.judge_observed_caret(spawn_from, cur, now, cfg, geom);
         self.carried_key_move = None;
         // The hidden/parked-caret echo lane: when the cursor cannot witness the
-        // echo (hidden across frames, or parked on another row), the host-fed
-        // print anchor is the licensed move's mutation site. Runs after the
-        // move lane so a visible move owns its own tick.
+        // echo, the host-fed print anchor is the mutation site. After the move
+        // lane, so a visible move owns its tick.
         let cursor_move_observed = spawn_from
             .zip(cur)
             .is_some_and(|((pr, pc), (cr, cc))| pr != cr || pc != cc);
@@ -2900,11 +2829,9 @@ impl CursorGlow {
         self.track_shown_caret(cur, now);
         self.settle_torn_lay(cur, now);
 
-        // Erase poof detection: a fresh kill hint paired with a same-row net
-        // shrink of the probed row (stable prefix and suffix) puffs smoke off
-        // the vanished span, before decay/emit so the puffs join this frame.
-        // Runs off the host row probe ([`Self::observe_row`]); hosts that never
-        // probe or arm the hint pay two `Option` reads.
+        // Erase poof: a fresh kill hint plus a same-row net shrink of the probed
+        // row puffs smoke off the vanished span, before decay/emit so it joins
+        // this frame.
         self.poof_scan(now, cfg, geom);
 
         self.sparks.retain(|s| Self::spark_resident_at(now, s));
@@ -2919,9 +2846,7 @@ impl CursorGlow {
             .retain(|m| now.saturating_duration_since(m.born).as_secs_f32() < m.life);
         self.vapor
             .retain(|v| now.saturating_duration_since(v.born).as_secs_f32() < v.life);
-        // A hot cursor smokes: above `SMOKE_TEMP`, wisps shed off its top edge
-        // at a temperature-scaled rate, each with its own drift and life. Stops
-        // as it cools, so vapor drains to idle.
+        // A hot cursor above `SMOKE_TEMP` sheds wisps at a temperature-scaled rate.
         if matches!(cfg.style, GlowStyle::Fire)
             && self.cursor_temp > Self::SMOKE_TEMP
             && let Some((cr, cc)) = cur
@@ -2949,10 +2874,8 @@ impl CursorGlow {
                 self.last_smoke = Some(now);
             }
         }
-        // Arrival-time strike: flare, landing ring and ember fountain fire when
-        // the meteor head lands. The fountain follows the final vector, so a
-        // retargeted meteor strews debris along the coalesced path, never an
-        // intermediate repaint hop.
+        // The meteor head strikes: flare, landing ring and an ember fountain
+        // along the final (possibly retargeted) vector.
         let mut struck: Option<Meteor> = None;
         for m in &mut self.fire_meteors {
             if !m.arrived
@@ -2993,14 +2916,10 @@ impl CursorGlow {
             self.crown_until = None;
         }
 
-        // ---- emit the light layers ----
-        // The radial-halo / under-ink / charred-ink streams ride beside `out`
-        // (the emitters are `&self`; the vecs are taken and restored so no
-        // borrow overlaps).
-        // Refresh the tint palette if (and only if) the theme moved. See
-        // [`Self::glyph_palette`].
+        // The side streams are taken and restored around the emitters so no
+        // borrow overlaps; the tint palette refreshes only when the theme moved.
         let glyph_key = (cfg.theme_fg, cfg.theme_bg);
-        if self.glyph_palette.map(|(k, _)| k) != Some(glyph_key) {
+        if self.glyph_palette.as_ref().map(|&(k, _)| k) != Some(glyph_key) {
             self.glyph_palette = Some((
                 glyph_key,
                 fresh_ink_glyph_palette(cfg.theme_fg, cfg.theme_bg),
@@ -3009,15 +2928,15 @@ impl CursorGlow {
         let mut halos = std::mem::take(&mut self.halo_out);
         let mut patches = std::mem::take(&mut self.patch_out);
         // `under_out` (the glow_under stream, composited beneath glyph ink)
-        // carries the rainbow ribbon body, jump zooms and Water's fluid wake, so
+        // carries the rainbow ribbon body, jump zooms, and Water's wake on dark
+        // themes or the beam family's body and Lumen's crown on light ones, so
         // letters draw over those broad marks at full contrast.
         let mut under = std::mem::take(&mut self.under_out);
         let mut charred = std::mem::take(&mut self.char_out);
         let mut halo_cells = std::mem::take(&mut self.fire_halo_out);
         let mut engulf = std::mem::take(&mut self.engulf_scratch);
         // Bolts first: on a huge jump the beam alone can fill the quad budget,
-        // and truncation must shed beam haze, never a strike. Lightning (Laser
-        // only) reuses the resident bolt scratch via `mem::take`.
+        // and truncation must shed beam haze, never a strike.
         let mut bolt_verts = std::mem::take(&mut self.bolt_verts);
         let mut bolt_channel = std::mem::take(&mut self.bolt_channel);
         // Lightning composites over the ink on a dark ground and paints
@@ -3211,14 +3130,8 @@ impl CursorGlow {
         self.fire_halo_out = halo_cells;
         self.engulf_scratch = engulf;
 
-        // Outgoing crossfades: tick each moved-out animator under its old config
-        // behind the cosine ramp-down and merge its light into this frame's
-        // streams (additive premultiplied light is order-independent). One
-        // `is_empty` test when no switch happened. Runs before the shared
-        // truncation and fp fold, so caps and fingerprints see one merged frame:
-        // the glow stream never goes empty mid-switch (the SDR attack envelope
-        // keeps its sustain) and the changing fade bytes keep the present train
-        // fed.
+        // Merge the outgoing crossfades before the shared truncation and
+        // fingerprint, so both see one frame (additive light is order-independent).
         self.tick_fades(now, geom, out);
 
         // Bound the snapshot identically for both renderers.
@@ -3252,13 +3165,11 @@ impl CursorGlow {
         fp.finish()
     }
 
-    // ----- style crossfade (the style-switch contract in `tick`) -----
+    // Style crossfade (the style-switch contract in `tick`).
 
-    /// Outgoing ramp-down length: long enough to read as a handoff and overlap
-    /// the ramp-in without a trough, short enough that rapid switches stay
-    /// legible under [`Self::FADE_CAP`]. Cosine-eased in `tick_fades`, landing
-    /// at exactly 0, with a zero-slope start that blends into the old style's
-    /// own decays.
+    /// Outgoing ramp-down length: long enough to overlap the ramp-in without a
+    /// trough, short enough for rapid switches under [`Self::FADE_CAP`].
+    /// Cosine-eased in `tick_fades`, landing at exactly 0.
     const FADE_OUT_S: f32 = 0.25;
     /// Incoming ramp-in length: the same attack family as the eased display
     /// temperatures (`DISP_ATTACK_S`), so the new style swells rather than pops.
@@ -3283,42 +3194,58 @@ impl CursorGlow {
         // ramp-in during a rapid switch chain). Read before re-arming the ramp.
         let level0 = self.ramp_in_scale(now);
         self.ramp_in_at = Some(now);
-        // A cue spawned under the old style must not play the new style's
-        // palette (the host maps cues by the current style), so drop the
-        // backlog.
+        // The host maps cues by the current style, so an old-style cue would
+        // play the new palette: drop the backlog.
         self.sound_cues.clear();
         // The credits account for exactly those dropped cues; left standing
         // they would silence echo clicks whose key click never played.
         self.clear_keyed_clicks();
-        let Some(cfg) = self.last_cfg else {
-            // A switch requires a prior tick, which recorded its config; a
-            // missing snapshot means no residue, never a fade under the wrong
-            // config.
+        let Some(mut cfg) = self.last_cfg else {
+            // No snapshot means no prior tick, so no residue to fade.
             return;
         };
+        let crown_until = self.crown_until.take();
+        let last_smoke = self.last_smoke.take();
+        let has_crown = !matches!(cfg.style, GlowStyle::RainbowKitty)
+            && self.last.is_some()
+            && crown_until.is_some_and(|t| now < t);
+        let has_forge = matches!(cfg.style, GlowStyle::Fire)
+            && self.last.is_some()
+            && (self.cursor_temp > Self::FORGE_MIN_TEMP || self.disp_t > Self::FORGE_MIN_TEMP);
+        if self.sparks.is_empty()
+            && self.particles.is_empty()
+            && self.fire_meteors.is_empty()
+            && self.vapor.is_empty()
+            && self.bolts.is_empty()
+            && self.ring.is_none()
+            && !has_crown
+            && !has_forge
+        {
+            self.flame_phase = 0.0;
+            return;
+        }
+        if matches!(cfg.style, GlowStyle::RainbowKitty) {
+            // Only a style-agnostic erase poof (`VaporKind::Poof`) lives in the
+            // v1 pools under Rainbow Kitty; ticking the ghost as Comet avoids
+            // engaging `ghost.v2` and reserving its scratch vectors.
+            cfg.style = GlowStyle::Comet;
+        }
         let mut ghost = Box::<CursorGlow>::default();
-        // Move the forged light: the ghost owns it now; the live engine starts
-        // the incoming style with empty collections (plus carried warmth).
+        // Move the forged light into the ghost; the live engine starts empty.
         ghost.sparks = std::mem::take(&mut self.sparks);
         ghost.particles = std::mem::take(&mut self.particles);
-        // The landing starburst is forged light like the zoom streak and
-        // finishes its bloom in the ghost. A fast glide's streak is a
-        // `rainbow.jumps` entry and moves with the other zooms; only the
-        // velocity spine needs handling here.
         ghost.fire_meteors = std::mem::take(&mut self.fire_meteors);
         ghost.vapor = std::mem::take(&mut self.vapor);
         ghost.bolts = std::mem::take(&mut self.bolts);
         ghost.ring = self.ring.take();
-        ghost.crown_until = self.crown_until.take();
+        ghost.crown_until = crown_until;
         ghost.crown_window_ms = self.crown_window_ms;
         ghost.last_move = self.last_move;
-        ghost.last_smoke = self.last_smoke.take();
-        // Fresh-ink pops finish fading in the ghost under the outgoing config,
-        // like the sparks.
+        ghost.last_smoke = last_smoke;
+        // The ghost keeps the reduced-motion arm its light was forged under.
         ghost.reduced_motion = self.reduced_motion;
-        // Copy the thermal and phase scalars: the residue renders at the warmth
-        // it was forged with, and the live engine keeps its own, so mid-typing
-        // switches arrive already glowing.
+        // Copy the thermal, phase and momentum scalars: the residue renders at
+        // the warmth it was forged with, and the live engine keeps its own.
         ghost.heat = self.heat;
         ghost.heat_at = self.heat_at;
         ghost.flare = self.flare;
@@ -3327,31 +3254,20 @@ impl CursorGlow {
         ghost.disp_t = self.disp_t;
         ghost.cursor_temp = self.cursor_temp;
         ghost.flame_phase = self.flame_phase;
-        // The typing metric is carried warmth like `heat`: the ghost's copy
-        // keeps the residue at its momentum, and the live engine keeps its own
-        // so a switch into Rainbow Kitty re-attacks toward the earned value.
         ghost.momentum = self.momentum;
-        // The living-flow surface carries across the fork and is not restarted
-        // with the style phases: the ghost draws the same light as this frame,
-        // so its swells must stay put. It is a constant-rate surface clock
-        // ([`RainbowState::flow`]) the incoming style inherits.
+        // Hue phase and PRNG carry over, so the ghost continues this frame's
+        // light exactly.
         ghost.hue = self.hue;
         ghost.rng = self.rng;
-        // The ghost's anchor: `tick_fades` feeds this cell as `cur`, so
-        // `cur == last` and no move is ever observed, while positional
-        // emitters keep their footing. Input hints are not copied; they belong
-        // to the live style.
+        // `last` is the fade's anchor ([`OutgoingFade::anchor`]); input hints
+        // stay with the live style.
         ghost.last = self.last;
         // Pin the ghost's own switch guard to its config so its ticks never
         // re-detect a change (and never nest another fade).
         ghost.last_style = Some(cfg.style);
         ghost.last_cfg = Some(cfg);
-        // Style-specific phases restart for the incoming style: a fresh flame
-        // field or ribbon spine attacks from 0 (the built-in half of the ramp).
+        // The flame field restarts for the incoming style.
         self.flame_phase = 0.0;
-        // Classifier state, not forged light: a stale run direction or landing
-        // anchor carried across a switch would mint a landing burst at a
-        // coordinate that no longer exists.
         if self.fading.len() >= Self::FADE_CAP {
             // Chained switches: the oldest fade is the darkest — shed it.
             self.fading.remove(0);
@@ -3365,10 +3281,9 @@ impl CursorGlow {
         });
     }
 
-    /// The incoming style's ramp-in amplitude at `now`: exactly `1.0` in steady
-    /// state (`ramp_in_at == None`), else a cosine ease from
-    /// [`Self::RAMP_IN_FLOOR`] to 1.0 over [`Self::RAMP_IN_S`], clearing itself
-    /// when complete.
+    /// The incoming style's ramp-in amplitude: `1.0` in steady state, else a
+    /// cosine ease from [`Self::RAMP_IN_FLOOR`] to 1.0 over [`Self::RAMP_IN_S`],
+    /// clearing itself when complete.
     fn ramp_in_scale(&mut self, now: Instant) -> f32 {
         let Some(t0) = self.ramp_in_at else {
             return 1.0;
@@ -3382,11 +3297,10 @@ impl CursorGlow {
         Self::RAMP_IN_FLOOR + (1.0 - Self::RAMP_IN_FLOOR) * eased
     }
 
-    /// Tick every live [`OutgoingFade`] under its old config with the cosine
-    /// ramp-down on its intensity, and merge the streams into this frame's
-    /// output. A fade is dropped when its envelope is spent or it contributes
-    /// nothing visible, so a live fade always means visible output. Ghost sound
-    /// cues are always cleared (sound cannot cross styles).
+    /// Tick every live [`OutgoingFade`] under its old config, intensity scaled by
+    /// the cosine ramp-down, and merge its streams into this frame. A fade whose
+    /// envelope is spent or that painted nothing is dropped; ghost sound cues
+    /// are cleared.
     fn tick_fades(&mut self, now: Instant, geom: Geom, out: &mut Vec<GlowQuad>) {
         if self.fading.is_empty() {
             return;
@@ -3406,8 +3320,7 @@ impl CursorGlow {
             if c.intensity <= 0.0 {
                 return false; // inert amplitude — ticking would only wipe
             }
-            // `cur == engine.last` (the frozen anchor) ⇒ never a move ⇒ never a
-            // spawn: the residue decays and drifts only, under its old config.
+            // The frozen anchor is `engine.last`: no move, so no spawn.
             f.engine.tick(f.anchor, now, &c, geom, &mut scratch);
             f.engine.sound_cues.clear();
             let contributed = !(scratch.is_empty()
@@ -3416,13 +3329,15 @@ impl CursorGlow {
                 && f.engine.under_out.is_empty()
                 && f.engine.char_out.is_empty()
                 && f.engine.fire_halo_out.is_empty());
-            out.extend_from_slice(&scratch);
-            self.halo_out.extend_from_slice(&f.engine.halo_out);
-            self.patch_out.extend_from_slice(&f.engine.patch_out);
-            self.under_out.extend_from_slice(&f.engine.under_out);
-            self.char_out.extend_from_slice(&f.engine.char_out);
-            self.fire_halo_out
-                .extend_from_slice(&f.engine.fire_halo_out);
+            if contributed {
+                out.extend_from_slice(&scratch);
+                self.halo_out.extend_from_slice(&f.engine.halo_out);
+                self.patch_out.extend_from_slice(&f.engine.patch_out);
+                self.under_out.extend_from_slice(&f.engine.under_out);
+                self.char_out.extend_from_slice(&f.engine.char_out);
+                self.fire_halo_out
+                    .extend_from_slice(&f.engine.fire_halo_out);
+            }
             // A fade that painted nothing is already invisible — retire it now
             // rather than holding `is_active` armed for dark residue.
             contributed
@@ -3442,9 +3357,8 @@ impl CursorGlow {
     }
 }
 
-/// The first `n` host-sampled witness `rows` lent to the engine as
-/// [`rk::witness::RowSample`]s — a stack array (the steady frame allocates
-/// nothing) and how many of its slots are filled.
+/// The first `n` host-sampled witness `rows` as [`rk::witness::RowSample`]s,
+/// in a stack array (no allocation), and how many slots are filled.
 fn witness_samples(
     rows: &[WitnessRowBuf],
     n: usize,
@@ -3462,9 +3376,6 @@ fn witness_samples(
     }
     (samples, n)
 }
-
-// The family's spectrum at one cell is [`spectrum`], at every cell and every
-// cadence: a cell has one position and every layer reads it (§2.1, §2.3).
 
 #[cfg(test)]
 mod tests;

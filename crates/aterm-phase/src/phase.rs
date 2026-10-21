@@ -1671,7 +1671,40 @@ pub fn survey_open(rows: &[String]) -> bool {
 /// compacted (measured: the row was gone after the compaction).
 pub fn context_left(rows: &[String]) -> Option<u8> {
     let frame = composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    context_above(rows, frame, rule_width(rows, frame))
+}
+
+/// The context left as a screen SHOWS it, for a display of the reading (aterm's footer):
+/// [`context_left`]'s indicator above the composer, or the one Claude Code 2.1.305 draws at
+/// the right end of the row under the composer's bottom rule, after its mode and hints —
+/// `  ⏸ manual mode on · ? for shortcuts      0% until auto-compact`, ending at the rule's
+/// right edge (measured 2026-10-20 in the real-Claude lab at 80 and 144 columns, idle and
+/// busy, where [`context_left`] reads `None`). That row is Claude Code's own, never the
+/// transcript's; it counts only against the right edge, and only its last run after two or
+/// more blanks, the indicator and nothing else (`context_reading`). The supervisor's watch
+/// keeps [`context_left`]'s zone alone; a reading's displays read this
+/// ([`crate::reader::ScreenReader::context_shown`]). `None` says only that no indicator is
+/// read: whether it has gone is the footer's to judge
+/// (`aterm_agent::harness::footer::context_gone`), since Claude Code's other notices take
+/// that slot for a while.
+pub fn context_left_shown(rows: &[String]) -> Option<u8> {
+    let frame = composer_frame(rows)?;
+    let width = rule_width(rows, frame);
+    rows.get(frame.bottom + 1)
+        .map(|row| crate::text::trim_end(row))
+        .filter(|row| row.chars().count() + 3 >= width)
+        .and_then(|row| row.rsplit("  ").next())
+        .and_then(|run| context_reading(crate::text::trim(run)))
+        .or_else(|| context_above(rows, frame, width))
+}
+
+/// The cells of the composer's bottom rule in `frame`, trimmed.
+fn rule_width(rows: &[String], frame: Frame) -> usize {
+    crate::text::trim_end(&rows[frame.bottom]).chars().count()
+}
+
+/// [`context_left`]'s reading in `frame`, its rule `width` cells.
+fn context_above(rows: &[String], frame: Frame, width: usize) -> Option<u8> {
     let from = status_block(rows, frame.top).from;
     rows[from..frame.top]
         .iter()
@@ -6231,6 +6264,70 @@ mod tests {
         assert_eq!(context_left(&narrow(40, "1% until auto-compact")), Some(1));
         assert_eq!(context_left(&narrow(28, "1% until auto-compact")), None);
         assert_eq!(context_left(&narrow(29, "1% until auto-compact")), Some(1));
+    }
+
+    /// Claude Code 2.1.305 draws the indicator at the right end of its mode row under the
+    /// composer (measured 2026-10-20 in the real-Claude lab, idle and busy, at 80 and 144
+    /// columns): `context_left_shown` reads it there, and still reads it above the composer
+    /// where `context_left` does. Not the indicator: a run on that row short of the right edge,
+    /// one with words after it, the row's `◐ medium · /effort`, a copy in the transcript, and
+    /// a screen with no composer.
+    #[test]
+    fn the_context_indicator_on_the_mode_row_is_shown() {
+        let on_mode_row = |width: usize, hints: &str, end: &str| {
+            let mut r = rows(&[
+                "⏺ Hi! I am the local lab stub, not a model. (reply 1)",
+                "",
+                "✻ Churned for 0s · done 7:22 PM",
+                "",
+            ]);
+            r.extend(["─".repeat(width), "❯".to_string(), "─".repeat(width)]);
+            let pad = width - hints.chars().count() - end.chars().count();
+            r.push(format!("{hints}{}{end}", " ".repeat(pad)));
+            r
+        };
+        let idle = "  ⏸ manual mode on · ? for shortcuts";
+        for width in [80, 144] {
+            for hints in [idle, "  ⏸ manual mode on · esc to interrupt"] {
+                for (end, left) in [
+                    ("0% until auto-compact", 0),
+                    ("37% until auto-compact", 37),
+                    ("Context left until auto-compact: 8%", 8),
+                ] {
+                    let r = on_mode_row(width, hints, end);
+                    assert_eq!(context_left_shown(&r), Some(left), "{width} {hints} {end}");
+                }
+            }
+        }
+        assert_eq!(context_left_shown(&saved_screen(CONTEXT_LOW)), Some(1));
+        for (what, r) in [
+            (
+                "short of the edge",
+                on_mode_row(80, idle, "0% until auto-compact      "),
+            ),
+            (
+                "words after it",
+                on_mode_row(80, idle, "0% until auto-compact · /compact"),
+            ),
+            (
+                "the effort",
+                on_mode_row(
+                    80,
+                    "  ⏸ manual mode on · ← for agents",
+                    "◐ medium · /effort",
+                ),
+            ),
+            (
+                "quoted in the transcript",
+                screen(&["⏺ 0% until auto-compact", ""], "  ? for shortcuts"),
+            ),
+            (
+                "no composer",
+                rows(&["⏺ Done.", "", "                0% until auto-compact"]),
+            ),
+        ] {
+            assert_eq!(context_left_shown(&r), None, "{what}");
+        }
     }
 
     /// A long hint in an 80-column window starts at column 8, not past column

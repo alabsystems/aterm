@@ -1,74 +1,55 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Is this shell command line read-only? A pure function a supervisor calls
-//! hundreds of times a session, with the corpus that shaped it pinned as tests.
+//! Is this shell command line read-only? A pure function a supervisor calls hundreds of
+//! times a session. Every tie breaks toward "not read-only": an escalation only asks a
+//! person, a false approval runs the command, so some reads a person would clear at a glance
+//! (`find "$d" -name x`) ask.
 //!
-//! A pre-pass ([`prelex`]) reads the line as the shell does where the segment
-//! readers would not: a `#` comment ends at its newline, a here-document body
-//! is data up to its terminator, `$'…'` and `${…}` are followed or refused,
-//! and an unterminated quote is refused. The segment-head check is a positive
-//! filter (an unknown program is not read-only, and a program named by a path
-//! outside `/bin` and `/usr/bin` is unknown). Quoted strings are dropped before
-//! it runs, so a `>` inside a `git --format` string is not a redirect, except
-//! that awk and sed programs are read back from the raw words (`system(…)`,
-//! `s///w file`). A program word is judged only at a segment head: `grep -rn
-//! open src` is a read, `open src` is not. Wrappers (`xargs`, `env`,
-//! `timeout`) are seen through; `&` ends a segment like `;`; the name behind a
-//! redirect (`2>/dev/null rm x`) or zsh's `-` modifier (`- rm x`) is a head.
-//! Flags by which a read tool runs a program or writes a file (`git -c`, `git
-//! --output`, `rg --pre`, `sort --compress-program`, `printf -v`, `less +…`,
-//! `date -s`) and assignments that change a later program (`PATH=`, `GIT_*=`,
-//! `HOME=`) are refused wherever they sit.
+//! A pre-pass ([`prelex`]) reads the line as the shell does where the segment readers would
+//! not: a `#` comment ends at its newline, a here-document body is data up to its
+//! terminator, `$'…'` and `${…}` are followed or refused, and an unterminated quote is
+//! refused. The segment-head check is a positive filter: an unknown program, or one named by
+//! a path outside [`SYSTEM_BIN_DIRS`], is not read-only. Quoted strings are dropped before it
+//! runs (a `>` inside a `git --format` string is no redirect), but awk and sed programs are
+//! read back from the raw words (`system(…)`, `s///w file`). A program word is judged only at
+//! a segment head: `grep -rn open src` is a read, `open src` is not. Wrappers (`xargs`,
+//! `env`, `timeout`) are seen through; `&` ends a segment like `;`; the name behind a
+//! redirect (`2>/dev/null rm x`) or zsh's `-` modifier (`- rm x`) is a head. Flags by which a
+//! read tool runs a program or writes a file (`git -c`, `rg --pre`, `sort
+//! --compress-program`, `printf -v`, `date -s`, …) and assignments that change a later
+//! program (`PATH=`, `GIT_*=`, `HOME=`) are refused wherever they sit.
 //!
-//! A command substitution is a word of the command around it, never a
-//! boundary, and its body is judged as a command line. A command whose name
-//! this check cannot read cannot be cleared: a head supplied by a substitution
-//! or parameter (`$(printf 'r''m') -rf /`, `$R -rf /`), and likewise a python
-//! script path, awk program, sed script or `export` operand. Nesting deeper
-//! than [`MAX_SUBSTITUTION_DEPTH`] is refused.
+//! A command substitution is a word of the command around it, never a boundary, and its
+//! body is judged as a command line. A name this check cannot read cannot be cleared: a head
+//! supplied by a substitution or parameter (`$(printf 'r''m') -rf /`, `$R -rf /`), a python
+//! script path, an awk program, a sed script or an `export` operand. Nesting deeper than
+//! [`MAX_SUBSTITUTION_DEPTH`] is refused.
 //!
-//! An expansion's value is unknown. Unquoted, it word-splits into any number
-//! of words, any of which may be a flag or verb. Double-quoted
-//! ([`QUOTED_SUBSTITUTION`], [`QUOTED_PARAMETER`]) it is one word, but can
-//! still be a one-word flag (`sort "$(echo -o/f)" x` writes `/f`). So among
+//! An expansion's value is unknown. Unquoted, it word-splits into any number of words;
+//! double-quoted ([`QUOTED_SUBSTITUTION`], [`QUOTED_PARAMETER`]) it is one word, but may
+//! still be a flag (`sort "$(echo -o/f)" x` writes `/f`). So an expansion before `--` among
 //! the arguments of a tool whose write or run form a flag selects
-//! ([`SELECTED_BY_AN_ARGUMENT`]), and of every `git` subcommand, any expansion
-//! before `--` is refused ([`runs_or_writes_by_flag`], the git arm of
-//! [`head_from`]). `test`/`[` go by argument count
-//! ([`test_expansions_are_operands`]): a quoted expansion that is an operand
-//! of a 1-, 2- or 3-argument form stays a read (they do not evaluate numeric
-//! operands as arithmetic); an unquoted one does not (`[ $n ]` with `n='-v
-//! a[$(cmd)]'` is `test -v`, whose subscript bash evaluates). Tools with no
-//! write form (`ls`, `cat`, `grep`, `wc`, `echo`, `cd`) keep expansion
-//! arguments.
+//! ([`SELECTED_BY_AN_ARGUMENT`]), or of any `git` subcommand, is refused. `test`/`[` go by
+//! argument count ([`test_expansions_are_operands`]): a quoted operand of a 1-, 2- or
+//! 3-argument form stays a read; an unquoted one does not (`[ $n ]` with `n='-v a[$(cmd)]'`
+//! is `test -v`, whose subscript bash evaluates). Tools with no write form (`ls`, `cat`,
+//! `grep`, `echo`) keep expansion arguments.
 //!
-//! zsh arithmetic runs a command substitution inside an array subscript from
-//! a quoted word, a variable's value or a globbed file name (`printf %d
-//! 'path[$(cmd)]'`). So a word zsh evaluates as arithmetic (`printf`'s
-//! arguments under a numeric format, `-t`'s operand in `test`/`[`/`[[`, an
-//! `export -i`/`-E`/`-F` value, a value for one of [`ZSH_ARITHMETIC_VARS`])
-//! must be a plain number ([`arithmetic_scan`]), and a `test`/`[` word that
-//! may brace-expand or glob into `-t` is refused.
+//! zsh arithmetic runs a command substitution inside an array subscript taken from a quoted
+//! word, a variable's value or a globbed file name (`printf %d 'path[$(cmd)]'`). So a word
+//! zsh evaluates as arithmetic (`printf`'s arguments under a numeric format, `-t`'s operand,
+//! an `export -i`/`-E`/`-F` value, a value of one of [`ZSH_ARITHMETIC_VARS`]) must be a plain
+//! number ([`arithmetic_scan`]), and a `test`/`[` word that may brace-expand or glob into
+//! `-t` is refused.
 //!
-//! The cost is deliberate: reads a person would clear at a glance (`git diff
-//! $(git merge-base HEAD origin/main)`, `find "$d" -name x`) now ask. An
-//! escalation only asks a person; a false approval runs the command, so every
-//! tie breaks toward "not read-only".
-//!
-//! This judges one reading of a line. A screen-read command whose rows were
-//! joined with spaces differs from the one the shell runs (a newline ends a
-//! segment), so a caller classifies both readings and approves only when both
-//! are read-only (`supervise::policy::approval`).
-//!
-//! It reads the line as zsh 5.9 and bash 3.2 do under their DEFAULT options,
-//! with no user alias or function. Claude Code's Bash tool runs each command
-//! after replaying the person's shell startup (its shell snapshot), so the
-//! approval rule that asks this check also reads that startup
-//! (`supervise::policy::shell_startup`) and approves nothing where it
-//! differs. Where that shell may be zsh, the rule also asks the line to be
-//! PLAIN ([`plain_zsh_line`]), a positive grammar that admits no expansion at
-//! all, since the forms refused here were found one sweep at a time.
+//! This judges one reading of a line. A screen-read command whose rows were joined with
+//! spaces differs from the one the shell runs, so the caller classifies both readings and
+//! approves only when both are read-only (`supervise::policy::approval`). Lines are read as
+//! zsh 5.9 and bash 3.2 read them under default options, with no alias or function. Claude
+//! Code's Bash tool replays the person's shell startup first, so the approval rule also
+//! reads that startup (`supervise::policy::shell_startup`) and, where the shell may be zsh,
+//! requires a plain line ([`plain_zsh_line`]): a positive grammar that admits no expansion.
 
 /// The verdict on one command line: `read_only`, and `reason` naming the rule
 /// (token or segment head) that decided it, so a supervisor's notes say why.
@@ -238,18 +219,12 @@ const KEYWORD_PREFIX: &[&str] = &[
     "do", "then", "else", "if", "elif", "while", "until", "!", "{",
 ];
 
-/// Whether a word closes a `{` group in zsh (the other closing word is `]]`,
-/// [`danger_scan`]). zsh runs a command written after a closing word in the
-/// same list (`{ ls } always { cmd }`, `if [[ -n a ]] cmd`, `while [[ -z $d
-/// ]] cmd`), so a closing word must end its segment or be followed only by
-/// its compound's redirects and closing words (a word after such a redirect
-/// is a parse error). A `}` on a line with no `{` word, or `]]` with no `[[`,
-/// closes nothing.
-///
-/// A `}` closes as itself or glued to a word's end, unless the word's own
-/// braces open it: `{ echo a} always { cmd }` and `{ echo ${HOME}} always {
-/// cmd }` run `cmd` (a quoted `}` reaches this as `""`), while `{a,b}`,
-/// `${HOME}`, `{}` and an escaped `\}` close nothing.
+/// Whether a word closes a `{` group in zsh: as itself or glued to a word's end, unless the
+/// word's own braces open it. `{ echo a} always { cmd }` and `{ echo ${HOME}} always { cmd }`
+/// run `cmd` (a quoted `}` reaches this as `""`); `{a,b}`, `${HOME}`, `{}` and an escaped `\}`
+/// close nothing. zsh runs a command written after a closing word (this, or `]]`) in the same
+/// list (`{ ls } always { cmd }`, `if [[ -n a ]] cmd`), so [`danger_scan`] lets one be followed
+/// only by its compound's redirects and closing words.
 fn closes_a_brace(tok: &str) -> bool {
     let mut depth = 0usize;
     let mut chars = tok.chars().peekable();
@@ -271,13 +246,12 @@ fn closes_a_brace(tok: &str) -> bool {
 /// its basename says: `/bin/ls` is `ls`, `/tmp/evil/ls` is not.
 const SYSTEM_BIN_DIRS: &[&str] = &["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"];
 
-/// Variables whose assignment changes what a later program runs or reads: the
-/// search path, shell startup and splitting, pagers and editors a read tool may
-/// exec, git and rg config roots. `PATH` is allowed when every entry is a
-/// [`SYSTEM_BIN_DIRS`] directory. zsh's own ([`ZSH_RUNS_A_VALUE`]): `NULLCMD`
-/// and `READNULLCMD` name the command a bare redirect runs, `MODULE_PATH` is
-/// where autoloaded modules load from, and `STTY` in a command prefix runs as
-/// code on a terminal. Arrays zsh ties to these count ([`ZSH_TIED`]).
+/// Variables whose assignment changes what a later program runs or reads: the search path,
+/// shell startup and splitting, pagers and editors a read tool may exec, git and rg config
+/// roots. `PATH` is allowed when every entry is a [`SYSTEM_BIN_DIRS`] directory. zsh's own
+/// (`ZSH_RUNS_A_VALUE`): `NULLCMD` and `READNULLCMD` name the command a bare redirect runs,
+/// `MODULE_PATH` is where autoloaded modules load from, and `STTY` in a command prefix runs
+/// as code on a terminal. Arrays zsh ties to these count ([`ZSH_TIED`]).
 const HAZARD_VARS: &[&str] = &[
     "PATH",
     "NULLCMD",
@@ -401,19 +375,18 @@ pub fn classify_command(cmd: &str) -> Verdict {
 /// Classify `cmd`; `python_allow` are the script-path globs `python3 <path>` may
 /// run as a read (`*` matches any run of characters, `?` one).
 pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Verdict {
-    // (0) Comments, here-document bodies, `$'…'` and `${…}`, read as the shell
-    // reads them — or refused.
+    // Comments, here-document bodies, `$'…'` and `${…}`, read as the shell reads them, or
+    // refused.
     let cmd = match prelex(cmd) {
         Ok(cmd) => cmd,
         Err(reason) => return Verdict::no(reason),
     };
-    // (a) The worker's timeout idiom is a wrapper, not a perl program.
+    // The worker's timeout idiom is a wrapper, not a perl program.
     let cmd = strip_alarm_idiom(&cmd);
-    // (b) Quoted strings are opaque to the danger scan; a substitution they
-    // held is marked ([`QUOTE_SUB_MARK`]) as a one-word
-    // [`QUOTED_SUBSTITUTION`].
+    // Quoted strings are opaque to the danger scan; a substitution they held is marked
+    // ([`QUOTE_SUB_MARK`]) as a one-word [`QUOTED_SUBSTITUTION`].
     let stripped = strip_quotes(&cmd);
-    // (c)+(d) Segments of whitespace-split tokens.
+    // Segments of whitespace-split tokens.
     let segments = split_segments(&stripped);
     if segments.is_empty() {
         return Verdict::no("empty command");
@@ -422,7 +395,7 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
     if let Some(reason) = danger_scan(&segments) {
         return Verdict::no(reason);
     }
-    // (e) The programs inside the quotes the scans above cannot see.
+    // The awk and sed programs inside the quotes the scans above cannot see.
     if let Some(reason) = program_scan(&cmd) {
         return Verdict::no(reason);
     }
@@ -431,7 +404,7 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
             return Verdict::no(reason);
         }
     }
-    // (f) The words zsh evaluates as arithmetic.
+    // The words zsh evaluates as arithmetic.
     if let Some(reason) = arithmetic_scan(&cmd) {
         return Verdict::no(reason);
     }
@@ -504,22 +477,19 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
     }
 }
 
-/// `Ok` when `line` is PLAIN: written only in the part of zsh's grammar that
-/// expands nothing, so no zsh form this module has not measured can hide in
-/// it. What `approve = "safe"`'s read-only rule also requires of a line the
-/// Bash tool may run under zsh ([`classify_command_with`] refuses the forms
-/// it knows; this admits only what cannot be one). It is a list of SIMPLE
-/// commands: no reserved word opens one ([`ZSH_RESERVED`]: `for path in …`
-/// assigns zsh's tied `path`, `repeat` evaluates arithmetic), a leading
-/// redirect included
-/// (`2>/dev/null for …` is the loop). Outside single quotes the line
-/// holds no `$`, backtick, backslash, `(`, `)`, `{`, `}` or `[[`; no word
-/// that opens with `=`, and no `=` in a word that is not a flag (an
-/// assignment, `path=` among them); a `~` only as `~` or `~/…`; a `<` only as
-/// a plain input redirect; a `>` only onto `/dev/null` or a descriptor; and
-/// no control character. Inside double quotes: no `$`, backtick or
-/// backslash. A `#` that opens a word comments to the end of its line. `Err`
-/// names the first thing that is not plain.
+/// `Ok` when `line` is plain: written only in the part of zsh's grammar that expands nothing,
+/// so no zsh form this module has not measured can hide in it. `approve = "safe"`'s read-only
+/// rule requires this of a line the Bash tool may run under zsh ([`classify_command_with`]
+/// refuses the forms it knows; this admits only what cannot be one).
+///
+/// A list of simple commands: no reserved word opens one ([`ZSH_RESERVED`]: `for path in …`
+/// assigns zsh's tied `path`, `repeat` evaluates arithmetic), behind a leading redirect too
+/// (`2>/dev/null for …` is the loop). Outside single quotes: no `$`, backtick, backslash,
+/// `(`, `)`, `{`, `}` or `[[`; no word opening with `=`, and no `=` in a word that is not a
+/// flag; a `~` only as `~` or `~/…`; a `<` only as a plain input redirect; a `>` only onto
+/// `/dev/null` or a descriptor; no control character. Inside double quotes: no `$`, backtick
+/// or backslash. A `#` that opens a word comments to the end of its line. `Err` names the
+/// first thing that is not plain.
 pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
     #[derive(PartialEq)]
     enum Quote {
@@ -671,15 +641,12 @@ const ZSH_RESERVED: &[&str] = &[
     "while",
 ];
 
-/// A segment the rm rule's resolver reads as a guard on a `$(mktemp -d)`
-/// (`supervise::policy::rm_breaker`): `exit` or `exit <n>` (`D=$(mktemp -d)
-/// || exit 1`), and `:` with its words (`: "${D:?}"`), which the shell
-/// expands and runs nothing of. Neither writes; a redirect on either, and a
-/// substitution in a word, are still judged ([`danger_scan`],
-/// [`program_scan`], which see every segment). `exit` takes digits only:
-/// zsh evaluates its word as arithmetic, whose array subscript runs a
-/// command substitution from inside quotes (`exit 'a[$(cmd)]'` runs `cmd`,
-/// measured, zsh 5.9), and `exit 1 2` does not exit zsh at all.
+/// A segment the rm rule's resolver (`supervise::policy::rm_breaker`) reads as a guard on a
+/// `$(mktemp -d)`: `exit` or `exit <n>` (`D=$(mktemp -d) || exit 1`), and `:` with its words
+/// (`: "${D:?}"`). Neither writes; a redirect or substitution on either is still judged
+/// ([`danger_scan`], [`program_scan`]). `exit` takes digits only: zsh evaluates its word as
+/// arithmetic, whose subscript runs a substitution from inside quotes (`exit 'a[$(cmd)]'`),
+/// and `exit 1 2` does not exit zsh.
 fn is_mktemp_guard(seg: &[String]) -> bool {
     match seg {
         [head, ..] if head == ":" => true,
@@ -689,20 +656,17 @@ fn is_mktemp_guard(seg: &[String]) -> bool {
     }
 }
 
-/// The shell's reading of the parts the segment readers get wrong, applied
-/// first: `Ok` is the line with `#` comments and here-document bodies removed
-/// (newlines kept), `$"…"` as `"…"` and a backslash-free `$'…'` as `'…'`; `Err`
-/// names a construct this reader will not follow (not read-only).
+/// The shell's reading of the parts the segment readers get wrong, applied first: `Ok` is the
+/// line with `#` comments and here-document bodies removed (newlines kept), `$"…"` as `"…"`
+/// and a backslash-free `$'…'` as `'…'`; `Err` names a construct this reader will not follow.
+/// Substitutions nested deeper than [`MAX_SUBSTITUTION_DEPTH`] are refused here, so later
+/// readers never recurse past it.
 ///
-/// Substitutions nested deeper than [`MAX_SUBSTITUTION_DEPTH`] are refused here,
-/// so later readers never recurse past it.
-///
-/// Why: a comment's apostrophe would open a quote the shell never opened,
-/// hiding later lines (`git log # what's new⏎git push --force`); a quote in a
-/// here-document body does the same; `$'a\'b'` ends where `'…'` would not. A
-/// body under an unquoted terminator still expands `$(…)` and backticks, so it
-/// is refused, as is a `${…}` holding a quote or substitution, and any quote,
-/// substitution or here-document left open.
+/// A comment's apostrophe would open a quote the shell never opened, hiding later lines
+/// (`git log # what's new⏎git push --force`); so would a quote in a here-document body; and
+/// `$'a\'b'` ends where `'…'` would not. A body under an unquoted terminator still expands
+/// `$(…)` and backticks, so it is refused, as is a `${…}` holding a quote or substitution, and
+/// any quote, substitution or here-document left open.
 pub(crate) fn prelex(src: &str) -> Result<String, String> {
     let mut lx = Prelex {
         chars: src.chars().collect(),
@@ -1662,13 +1626,13 @@ fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
     None
 }
 
-/// The negative filter over every token: a file redirect, `find -delete` /
-/// `-exec <writer>`, `sed -i`/`-I`, an inline-code interpreter, a python
-/// heredoc, `xargs` feeding a writer, a git write or a git flag that runs a
-/// program or writes a file, the equivalent flags of `rg`, `sort`, `less` and
-/// `printf`, a clock-setting `date`, a word after a closing `}`
-/// ([`closes_a_brace`]) or `]]`, and an assignment to a [`HAZARD_VARS`]
-/// variable. Program names are the head check's job.
+/// The negative filter over every token: a file redirect, `find -delete` / `-fprint` /
+/// `-exec <writer>`, `sed -i`/`-I`, `sort -o`, `tree -o`, `uniq IN OUT`, an inline-code
+/// interpreter, a python heredoc, `xargs` feeding a writer, a git write or a git flag that
+/// runs a program or writes a file, arithmetic in `[[`/`test`, a word after a closing `}`
+/// ([`closes_a_brace`]) or `]]`, and an assignment to a [`HAZARD_VARS`] variable. Program
+/// names, and the run-or-write flags of `rg`, `printf`, `less` and `date`, are the head
+/// check's job ([`runs_or_writes_by_flag`]).
 fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
     // A `}` or `]]` closes something only on a line with a `{` or `[[`
     // word, before it or not, and a `}` glued to a word's end closes too
@@ -1867,7 +1831,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 let arg = seg.get(sub_idx + 1).map(String::as_str);
                 // Read subcommands' flags that write a file or run a program:
                 // `--output=<file>`, an external diff driver, `grep -O<pager>`.
-                // Read up to the segment's end.
                 for t in &seg[sub_idx + 1..] {
                     let t = t.as_str();
                     if t == "--output"
@@ -2147,12 +2110,11 @@ pub(crate) const TEST_BINARY: &[&str] = &[
     "=", "==", "!=", "<", ">", "-nt", "-ot", "-ef", "-eq", "-ne", "-gt", "-ge", "-lt", "-le",
 ];
 
-/// Flags by which a read tool at a segment head runs a program or writes: `rg
-/// --pre`, `sort --compress-program=`, `printf -v NAME`, `less`/`more` with
-/// `+<command>`, a log or key file, `sysctl name=value`/`-w`, `hostname
-/// <name>`/`-F`, `file -C`, `tree -R`, `test -v`, and `date` setting the clock
-/// (`-s`, or a positional without BSD's `-j`); and for
-/// [`SELECTED_BY_AN_ARGUMENT`] tools, any substitution among the arguments.
+/// Flags by which a read tool at a segment head runs a program or writes: `rg --pre`, `sort
+/// --compress-program=`, `printf -v NAME`, `less`/`more` with `+<command>`, a log or key
+/// file, `sysctl name=value`/`-w`, `hostname <name>`/`-F`, `file -C`, `tree -R`, `test -v`,
+/// and `date` setting the clock (`-s`, or a positional without BSD's `-j`); and for
+/// [`SELECTED_BY_AN_ARGUMENT`] tools, any expansion before `--`.
 fn runs_or_writes_by_flag(head: &str, args: &[String]) -> Option<String> {
     let flag = |t: &str| format!("{head} {t}");
     let unreadable = |t: &str| format!("{head} {t} (a word this check cannot read may be a flag)");
@@ -3553,14 +3515,12 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Lines whose command this check could not name, or whose deciding argument
-/// the split cut off, each with the rule that refuses it; each was once
-/// classified read-only. Shared with `supervise::policy::approval`'s test,
-/// which draws each as a box.
+/// Lines whose command, or whose deciding argument, a substitution supplies, each with the
+/// rule that refuses it. Shared with `supervise::policy::approval`'s test, which draws each as
+/// a box.
 #[cfg(test)]
 pub(crate) const MEASURED_SUBSTITUTION_BYPASSES: &[(&str, &str)] = &[
-    // The substitution names the program; what follows it was read as a
-    // flag-first fragment, or as a command of its own.
+    // The substitution names the program.
     ("$(printf 'r''m') -rf /usr", UNREADABLE_SUBSTITUTION),
     ("`printf %s r m` -rf /usr", UNREADABLE_SUBSTITUTION),
     ("$(printf 'r''m') -- /usr", UNREADABLE_SUBSTITUTION),
@@ -3607,7 +3567,7 @@ pub(crate) const MEASURED_SUBSTITUTION_BYPASSES: &[(&str, &str)] = &[
         "echo \"$( $(printf 'r''m') -rf /usr )\"",
         UNREADABLE_SUBSTITUTION,
     ),
-    // An argument the cut took from the command whose write form it decides.
+    // A substitution where the argument that decides the write form stands.
     (
         "git branch $(git rev-parse --short HEAD)",
         "git branch $(…) (a word this check cannot read may be a flag or a verb)",

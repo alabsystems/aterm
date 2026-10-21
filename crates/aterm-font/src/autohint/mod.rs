@@ -115,6 +115,9 @@ pub(crate) enum DrawError {
     Read,
     /// The fitted points do not make a path.
     ToPath,
+    /// The size is past the scale the hinter fits at
+    /// ([`metrics::MAX_SCALE_26_6`]).
+    ScaleOutOfRange,
 }
 
 /// The rendering a hinting instance fits for: FreeType's smooth targets.
@@ -172,7 +175,10 @@ impl HintingInstance {
     /// lacks are ignored).
     ///
     /// `None` when the face cannot be read, has neither `glyf` nor CFF
-    /// outlines, or `ppem` is not finite and positive.
+    /// outlines, or `ppem` is not finite and positive or is more than 128
+    /// pixels per font unit (`ppem` above 128 times the face's units per em,
+    /// where hinting no longer moves a pixel; the caller draws the outline
+    /// unhinted).
     pub fn new(
         data: &[u8],
         index: u32,
@@ -184,6 +190,9 @@ impl HintingInstance {
             return None;
         }
         let font = font::HintFont::new(data, index)?;
+        if !metrics::scale_fits(ppem, font.units_per_em()) {
+            return None;
+        }
         let coords = font.location(settings);
         let instance = instance::Instance::new(&font, target);
         Some(Self {

@@ -822,8 +822,9 @@ fn need_of(form: &aterm_types::control_verbs::Resolved, verb: &str, rest: &str) 
 ///   * `open menu` / `open palette` and `open update` are Owner-only, like
 ///     their `invoke` twins, and `open overview` (its old `connections`
 ///     keyword too) lists every session, Owner-only like `flows`.
-///   * `spawn connected=…|identity=…`, `brief all` and `log n` (the instance's
-///     node log) are Owner-only.
+///   * `spawn connected=…|identity=…`, `brief all`, `log n` (the instance's
+///     node log), `sys`'s wide forms and `await sys … scope=aterm` are
+///     Owner-only.
 ///
 /// Returns the escalated requirement, else `None` (the table form decides).
 fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
@@ -940,6 +941,24 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
         // arguments), fail-closed: only a request it reads as a target's brief
         // stays a read, so no spelling of the instance-wide form passes as one.
         "brief" if !crate::session_log::BriefQuery::parse(rest).is_ok_and(|q| !q.all) => {
+            Some(Need::OwnerOnly)
+        }
+        // `sys` reads other sessions' processes, folders or the instance's
+        // parts only in these forms (the `aterm` view, `procs`/`jobs` beyond
+        // the target's tab, `disk` of aterm or the machine, `instances=all`,
+        // `name`): Owner-only like `sessions` and `brief all`. Classified by
+        // the verb's own parser, fail-closed: only a request it reads as the
+        // target's aggregates or own rows stays a Scoped read.
+        "sys" if !aterm_vitals::sys::SysQuery::parse(rest).is_ok_and(|q| q.target_rows_only()) => {
+            Some(Need::OwnerOnly)
+        }
+        // `await sys … scope=aterm` counts and names every tab's jobs:
+        // Owner-only like `sys jobs scope=aterm`, by the wait's own parser,
+        // which the verb runs first (a wait it cannot read reads nothing).
+        "await"
+            if rest.split_whitespace().next() == Some("sys")
+                && crate::sys_host::await_reads_every_tab(rest) =>
+        {
             Some(Need::OwnerOnly)
         }
         // `log n` reads the INSTANCE's node log (session log 5J-3): Owner-only
@@ -4716,6 +4735,9 @@ fn dispatch_app_verb(
         // `pressure`: the memory-pressure level and the crash-restore journal's shed; a
         // dev build on macOS can inject a level.
         "pressure" => crate::crash_restore::cmd_pressure(proxy, rest),
+        // `program-check`: the stuck check's board; a dev build can hold its
+        // readings at the kernel's limit.
+        "program-check" => crate::program_check_watch::cmd(rest),
         // `login-notice`: the harness's login notices, listed; a development
         // build raises one for the front tab through the host's own path.
         "login-notice" => crate::login_notice_verb::cmd(proxy, rest),
@@ -4743,6 +4765,7 @@ fn dispatch_app_verb(
         // `@<sid> edit <file-uri>`: a fresh Editor view beside the aimed
         // session's tab, answered once it is installed; unaimed, its usage.
         "edit" => crate::control_edit::cmd_edit(proxy, scope, aim.session(), rest),
+        "doc" => crate::control_doc::cmd_doc(proxy, rest),
         "act" => control_media::cmd_act(proxy, rest),
         "invoke" => control_media::cmd_invoke(
             proxy,
@@ -5023,24 +5046,60 @@ fn word_journaled(store: &Store, reply: String) -> String {
 /// loop captures the word while the verb waits. One door for the dispatch
 /// and a test (`meta_line_for_test`), so the wait the answer takes is the
 /// wait the wire's answer takes (the review's KR-J-2 of ATERM-KI-1016-1:
-/// the arm's wait could be taken out with every test green).
+/// the arm's wait could be taken out with every test green). `prove` is the
+/// kernel's look at a self-claim's holder (the arm's [`prove_self_claim`] on
+/// its PTY master).
 #[allow(clippy::too_many_arguments)]
 fn serve_meta(
     rest: &str,
     term: &Arc<Mutex<Terminal>>,
-    master: i32,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
     session: u64,
     ctx: &SessionCtx,
     store: &Store,
     scope: Scope,
     on_change: impl FnOnce(),
 ) -> String {
-    let prove = |holder: &str| prove_self_claim(holder, master);
+    // A PROVEN SELF-CLAIM'S LANDING, and a point it left to a person
+    // (`harness_task::holds_until_another_turn`), is marked with the session's
+    // counts of turns begun (`session_timeline::LandingMark`) before its face
+    // is posted, so the window reopens it at a turn begun after it
+    // (`App::reopen_self_claim_landing`). The engine's count is read FIRST,
+    // before the act is admitted (the claim read, a kernel look for a
+    // connection the claim is not bound to, the commit under the session's
+    // locks): a turn whose report the PTY reader parses while the act is
+    // admitted began after the holder decided its landing, and must stay past
+    // the mark. Never from the status sweep's last reading, which may not yet
+    // hold the landing turn's own reports. The screen's count is read with it,
+    // so a busy a sweep's read began meanwhile stays past it too. Leaf locks,
+    // each let go before the next: the terminal, then the timeline.
+    let landing_mark = control_session::harness_act_face(rest)
+        .is_some_and(crate::harness_task::holds_until_another_turn)
+        .then(|| {
+            let program_turns = term_lock(term).program_state().turns;
+            let busy_entries = ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent()
+                .busy_entries;
+            crate::session_timeline::LandingMark {
+                program_turns,
+                busy_entries,
+            }
+        });
     let (resp, changed) =
-        control_session::cmd_meta_supervisor(ctx, scope, serving_connection(), &prove, rest)
+        control_session::cmd_meta_supervisor(ctx, scope, serving_connection(), prove, rest)
             .or_else(|| {
                 let by = control_session::log_actor(scope, ctx);
-                control_session::cmd_meta_harness_act(ctx, serving_connection(), by, &prove, rest)
+                control_session::cmd_meta_harness_act(
+                    ctx,
+                    landing_mark,
+                    serving_connection(),
+                    by,
+                    prove,
+                    rest,
+                )
             })
             .or_else(|| control_session::meta_questions_denied(scope, rest))
             .unwrap_or_else(|| {
@@ -5072,14 +5131,14 @@ fn serve_meta(
 fn serve_meta_wired(
     rest: &str,
     term: &Arc<Mutex<Terminal>>,
-    master: i32,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
     session: u64,
     ctx: &SessionCtx,
     store: &Store,
     scope: Scope,
     post: &mut dyn FnMut(Wake),
 ) -> String {
-    serve_meta(rest, term, master, session, ctx, store, scope, || {
+    serve_meta(rest, term, prove, session, ctx, store, scope, || {
         for wake in meta_change_wakes(session, ctx.self_id.as_str(), rest) {
             post(wake);
         }
@@ -5090,8 +5149,8 @@ fn serve_meta_wired(
 /// (sid `sid`, line `rest`), in the order it posts them
 /// ([`serve_meta_wired`]): `Wake::MetaChanged` (the tab's repaint), then, for
 /// a proven self-claim's recorded act, the face that act tells
-/// (`Wake::HarnessFact`, FOREVER LAND §10.4: `landed@v1` lands the task, any
-/// other act reopens it).
+/// (`Wake::HarnessFact`, FOREVER LAND §10.4: `landed@v1` lands the task,
+/// `left-to-person@v1` leaves it to a person, any other act reopens it).
 fn meta_change_wakes(session: u64, sid: &str, rest: &str) -> Vec<Wake> {
     let mut wakes = vec![Wake::MetaChanged { session }];
     if let Some(face) = control_session::harness_act_face(rest) {
@@ -6028,6 +6087,9 @@ fn dispatch_owner(
         // `devtools hand-over [now]`: the window's Developer Tools hand-over (a
         // headless instance says so).
         "devtools" => control_query::cmd_devtools(proxy, rest),
+        // `person look <window>|off` | `person menubar press <at>`: a debug
+        // build's stand-in for the person at the window, armed at launch.
+        "person" => control_media::cmd_person(proxy, rest),
         // `fabric status|attach`: this process's bridge supervisor (a windowless
         // instance is the one that needs it).
         "fabric" => dispatch_fabric_verb(rest, selector, scope, store),
@@ -10658,7 +10720,7 @@ const PASTE_UNREAD: &str =
 /// into a dead peer is `ERR write failed` on every platform. Until 2026-10-19 it was
 /// answered on admission, so on Windows every background key, `send` and paste into a
 /// dead peer answered `OK`.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn background_input(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -10722,16 +10784,16 @@ fn background_input_observed(
 /// delivery. Short, because these verbs run on request lanes.
 const QUEUED_INPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// [`QUEUED_INPUT_WAIT`], or a Unix fixture's own wait for this thread.
+/// [`QUEUED_INPUT_WAIT`], or a test fixture's own wait for this thread.
 fn queued_input_wait() -> std::time::Duration {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     if let Some(wait) = QUEUED_INPUT_WAIT_FOR_TEST.with(std::cell::Cell::get) {
         return wait;
     }
     QUEUED_INPUT_WAIT
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 thread_local! {
     static QUEUED_INPUT_WAIT_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> =
         const { std::cell::Cell::new(None) };
@@ -10741,16 +10803,16 @@ thread_local! {
 /// they handed to the session's ordered writer, until the guard drops. A test that
 /// judges the write's own answer waits `aterm_spec::wait::MUST_HAPPEN`, so a slow
 /// writer is a hang detector, never an `OK` read as "queued".
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn queued_input_waits_for_test(wait: std::time::Duration) -> QueuedInputWait {
     QUEUED_INPUT_WAIT_FOR_TEST.with(|cell| cell.set(Some(wait)));
     QueuedInputWait(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 struct QueuedInputWait(());
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl Drop for QueuedInputWait {
     fn drop(&mut self) {
         QUEUED_INPUT_WAIT_FOR_TEST.with(|cell| cell.set(None));
@@ -11592,6 +11654,16 @@ fn serve_session_verb(
                 "edges" | "grants" => control_session::cmd_edges_json(ctx),
                 // `log --json [<node>] [since= ep=] …`: one object per record.
                 "log" => control_session::cmd_log_json(ctx, &body),
+                // `sys … --json`: schema 1, `kind: sys.<view>`, one shape per figure.
+                // It reads its own flag, so it takes the request whole.
+                "sys" => crate::sys_host::cmd_sys(
+                    store,
+                    session,
+                    term,
+                    master,
+                    scope.is_owner_class(),
+                    rest,
+                ),
                 // A JSON-emitting row this dispatch has no emitter for answers one
                 // `ERR` line, which reads the same under any framing.
                 _ => no_handler(verb),
@@ -11608,6 +11680,7 @@ fn serve_session_verb(
     // (`leading.refusal`) and answered below the halt gate.
     let (leading, rest) = control_input::take_leading_options(class, rest);
     let idem_key = leading.idem;
+    let as_person = leading.as_person;
     // `if-supervisor=<holder>` (the self-claim contract, §2): a verb's whole
     // write is made under it, and each phase of a `turn` ([`under_fence`]).
     let if_supervisor = leading.if_supervisor.as_deref();
@@ -11811,11 +11884,13 @@ fn serve_session_verb(
             let exited = || exited(store);
             crate::control_privacy::cmd_await_consent(proxy, scope, session, ctx, &exited, rest)
         }
-        // `await sys <free…|disk=…>` reads the MACHINE (the disk board the
-        // disk watch publishes), not this terminal: a latched wait that may
-        // register a demand for free space (`control_disk`).
+        // `await sys <predicate>` reads the MACHINE, not this terminal: the
+        // machine terms (cpu, memory, pressure, swap, the tab's load…) park on
+        // the vitals snapshot (`sys_host`); `free…`/`disk=…` alone on the disk
+        // board the disk watch publishes, a latched wait that may register a
+        // demand for free space (`control_disk`).
         "await" if rest.split_whitespace().next() == Some("sys") => {
-            control_disk::cmd_await_sys(term, store, session, scope, rest)
+            crate::sys_host::cmd_await_sys(term, store, session, scope, rest)
         }
         // `await momentum <floor>` reads the typing momentum of the window hosting the
         // session (main-thread App state, like `trail status`), then parks on the
@@ -11929,6 +12004,9 @@ fn serve_session_verb(
         // the same hold, ahead of the screen fences, answering
         // `OK skipped reason=person` (not atomic with the person's own write, which
         // takes no terminal lock; see `crate::human_input`).
+        // `as=person` (a development build's seam, `control_input::PERSON_SEAM`):
+        // the write goes in as a person's gesture, admitted as every input above.
+        "send" | "key" if as_person => control_input::person_input(proxy, session, verb, rest),
         "send" | "key" if fence.is_armed() => {
             if verb == "key" {
                 control_input::cmd_key_fenced_observed(term, ctx, &fence, rest, completion())
@@ -12215,7 +12293,7 @@ fn serve_session_verb(
         "meta" => serve_meta_wired(
             rest,
             term,
-            master,
+            &|holder: &str| prove_self_claim(holder, master),
             session,
             ctx,
             store,
@@ -12232,7 +12310,19 @@ fn serve_session_verb(
         "log" => control_session::cmd_log(ctx, rest),
         // `brief`: the target session's token-budgeted rollup; `brief all` (the
         // instance's) was escalated to Owner-only by `argument_escalation`.
-        "brief" => control_session::cmd_brief(ctx, store, rest),
+        "brief" => control_session::cmd_brief_with_jobs(
+            ctx,
+            store,
+            rest,
+            crate::sys_host::brief_jobs_line(session),
+        ),
+        // `sys [<view>] …`: what the target's tab, aterm and the machine use
+        // now, from the workers' copy of the vitals snapshot (a pull when it is
+        // too old). The Owner-only forms were escalated by `argument_escalation`;
+        // machine-wide rows print for an owner-class caller only.
+        "sys" => {
+            crate::sys_host::cmd_sys(store, session, term, master, scope.is_owner_class(), rest)
+        }
         // `mark`: an attributed, rate-limited CLAIM in the target session's log
         // (design §7.4). Write-class, so an edge needs `WriteInput`; `by=` is the
         // connection's; it never acts ([`dispatch_mark`]).
@@ -12244,6 +12334,13 @@ fn serve_session_verb(
         // `status`: the target session's Subject + classified Status. A main-thread hop,
         // since the classifier is `App` state owned by the event loop.
         "status" => control_media::cmd_session_status(proxy, session, rest),
+        "resources" => {
+            let reply = crate::resource_jobs::command(ctx, scope.is_owner_class(), rest);
+            if reply.starts_with("OK") {
+                let _ = proxy.send_event(Wake::Vitals);
+            }
+            reply
+        }
         // `harness policy`: the target session's `[harness]` policy, the facts a
         // main-thread hop (the policy cell, the host, the session's words), the
         // rules file read and the line made here. An edge reads only `effective=`.
@@ -12469,7 +12566,16 @@ pub(crate) fn meta_line_for_test(
     ctx: &SessionCtx,
     rest: &str,
 ) -> String {
-    serve_meta(rest, term, -1, session, ctx, store, Scope::Owner, || {})
+    serve_meta(
+        rest,
+        term,
+        &|holder: &str| prove_self_claim(holder, -1),
+        session,
+        ctx,
+        store,
+        Scope::Owner,
+        || {},
+    )
 }
 
 /// [`meta_line_for_test`] served on connection `conn`, as the wire serves it
@@ -12485,6 +12591,24 @@ pub(crate) fn meta_wakes_for_test(
     rest: &str,
     conn: Option<u64>,
 ) -> (String, Vec<Wake>) {
+    meta_wakes_proving_for_test(store, term, session, ctx, rest, conn, &|holder: &str| {
+        prove_self_claim(holder, -1)
+    })
+}
+
+/// [`meta_wakes_for_test`] with the kernel's look at a self-claim's holder
+/// answered by `prove` — what a request on a connection the claim is not
+/// bound to is admitted by ([`control_session::cmd_meta_harness_act`]).
+#[cfg(test)]
+pub(crate) fn meta_wakes_proving_for_test(
+    store: &Store,
+    term: &Arc<Mutex<Terminal>>,
+    session: u64,
+    ctx: &SessionCtx,
+    rest: &str,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+) -> (String, Vec<Wake>) {
     struct Restore(Option<u64>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -12496,7 +12620,7 @@ pub(crate) fn meta_wakes_for_test(
     let reply = serve_meta_wired(
         rest,
         term,
-        -1,
+        prove,
         session,
         ctx,
         store,

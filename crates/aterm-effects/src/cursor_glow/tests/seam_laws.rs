@@ -2026,6 +2026,7 @@ fn a_lay_with_no_live_cell_is_not_recalled() {
         seen: Some((3, 5)),
         moved_at: t0,
         hand_before: None,
+        unowned_before: None,
         anchor_seq: Some(1),
         printed_off_row: true,
     };

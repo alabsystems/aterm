@@ -3,61 +3,45 @@
 
 //! The toolchain lane's words: pure builders that return an
 //! [`aterm_messages::Message`] for the message center to hold
-//! (docs/DESIGN-unified-messages-2026-09-21.md). Nothing here keeps state,
-//! reads a clock or paints a cell: the wake arms in `lib.rs` call a builder and
-//! `post`/`restate`; the center ranks, holds, supersedes and logs; the band
-//! paints.
+//! (docs/DESIGN-unified-messages-2026-09-21.md). Nothing here keeps state, reads a
+//! clock or paints: the wake arms in `lib.rs` call a builder and `post`/`restate`.
 //!
 //! # What may be claimed
 //!
-//! * A snapshot renders only what [`crate::PkgProgressSnapshot`] supports (the
-//!   classified read of `<prefix>/progress.json`): a not-running snapshot names
-//!   its terminal outcome, never a live phase; an unknown schema `v` is the
-//!   first-run title alone ("Installing ALab tools"), busy. Program names are
-//!   untrusted until they round-trip [`atpkg::store::ToolName`]; error text is
-//!   control-stripped and capped ([`atpkg::progress::sanitize_for_tty`]), and
-//!   the center's `normalized` re-clips every field at ingress.
-//! * Record titles name the outcome with the lane's one noun: "ALab tools
-//!   update postponed", "ALab tools installed", "ALab tools checked",
-//!   "Couldn't update ALab tools", "Couldn't install any ALab tools", "No ALab
-//!   tools to install", and a first
-//!   run's "Couldn't install ALab tools"; the first-run row is "Installing
-//!   ALab tools".
+//! * A snapshot renders only what [`crate::PkgProgressSnapshot`] supports: a
+//!   not-running read claims no outcome ([`SnapshotWords::Over`]; the markers
+//!   record it); an unknown schema `v` is the first-run title alone, busy.
+//!   Program names are untrusted until they round-trip
+//!   [`atpkg::store::ToolName`]; error text is control-stripped and capped
+//!   ([`atpkg::progress::sanitize_for_tty`]).
+//! * Titles name the outcome with the lane's one noun, "ALab tools" (the
+//!   `PACKAGES_*`, `ALAB_*` and `*_ALAB` constants).
 //!
 //! # Silent by default
 //!
 //! Every row that appears re-grids every window and resizes every running TUI,
-//! so package updates stay off the glass except:
+//! so package work stays off the glass except:
 //!
-//! * the first-run live row, `Installing ALab tools` ([`announced`], the live
-//!   [`snapshot_words`]), while the default set is laid onto a machine whose
-//!   store held none of it (multi-GB; silence would read as a hang). It opens
-//!   once and folds at the child's exit;
-//! * a heavy routine pass (≥ [`HEAVY_PASS_BYTES`]), `Updating ALab tools`
-//!   (the host's `messages_host` decides which pass is heavy);
-//! * a first run that ended short, a failure row ([`first_run_short`]);
-//! * a Settings ▸ Packages verb a person pressed (Check, Install, Remove): its
-//!   pass takes the row whatever it weighs
-//!   (`message_reporters::packages_verb_row`, then this module's live words).
+//! * the first run's live row, `Installing ALab tools` ([`announced`], then
+//!   [`snapshot_words`]), while the default set lands on a machine whose store
+//!   held none of it (multi-GB; silence would read as a hang);
+//! * a heavy routine pass (≥ [`HEAVY_PASS_BYTES`]), `Updating ALab tools`;
+//! * a first run that ended short ([`first_run_short`]);
+//! * a pass a person started from Settings ▸ Packages (Check, Install, Remove):
+//!   `message_reporters::packages_verb_row`, then this module's live words.
 //!
-//! Everything else — a light routine pass's announcement and meter, every
-//! other pass outcome ([`installed`], [`ended`], [`failed`],
-//! [`not_installed`]), [`managed_current`], [`machine_settings`], a
-//! [`deferred`] pass, and every [`appnotice`] text (R34; ruling 147) — is a
-//! `Hold::LogOnly` RECORD: `appstatus` lists it as a finished activity
-//! with the words and outcome the bars' ledger gave it, Settings ▸ Messages
-//! and `messages.log` keep it, and the glass never shows it. A routine
-//! pass's failure is the Settings ▸ Packages badge (`packages_screen`). This
-//! supersedes the design's §6 R25–R33 glass behaviour (the rulings on the
-//! origin/main merge, 2026-09-23, and on the 2026-09-24 merge).
+//! Everything else — a light routine pass, every other outcome ([`installed`],
+//! [`ended`], [`failed`], [`not_installed`]), [`managed_current_for`],
+//! [`machine_settings`], [`deferred`] and every [`appnotice`] — is a
+//! `Hold::LogOnly` record: `appstatus`, Settings ▸ Messages and `messages.log`
+//! keep it, the glass never shows it. A routine pass's failure is the Settings ▸
+//! Packages badge.
 //!
 //! # Keys
 //!
-//! Everything a pass says about itself (announced, the live meter, outcome
-//! records) carries [`KEY_PASS`], so a newer live report supersedes the older
-//! row in its slot; a record is never live, so its key only names it in the
-//! log. The managed-current record and each machine-settings item carry keys
-//! of their own.
+//! Every report about a pass carries [`KEY_PASS`], so a newer live report
+//! supersedes the older row; a record's key only names it in the log. The
+//! managed-current record and each machine-settings item have keys of their own.
 
 use std::time::Duration;
 
@@ -118,9 +102,8 @@ const DOWN: char = '\u{21e3}';
 /// changed): a record wears its outcome's mark, not a moving row's.
 const NOTED: char = '\u{2139}';
 
-/// The pass name and start stamp that identify one `progress.json` writer,
-/// so a live meter is clamped to its OWN pass's high-water mark and never
-/// inherits a different pass's ([`snapshot_words`]).
+/// The pass name and start stamp that identify one `progress.json` writer, so a
+/// live meter is clamped to its own pass's high-water mark ([`snapshot_words`]).
 pub(crate) type PassId = (String, u64);
 
 /// The machine-settings records' capsule: Settings ▸ Security, where the
@@ -143,26 +126,23 @@ fn packages() -> Intent {
     }
 }
 
-/// A glyph from the band's closed set. Every glyph this module names is in
-/// it (a test walks them); the fallback is unreachable here and exists only
-/// because the set is closed by construction.
+/// A glyph from the band's closed set. A test checks every glyph this module
+/// names is in it, so the fallback is unreachable here.
 fn glyph(ch: char) -> Glyph {
     Glyph::or_fallback(ch)
 }
 
-/// A toolchain RECORD's row: tag, severity, title, the `Packages` capsule,
-/// classified a record ([`Message::record`]: `Hold::LogOnly`, never on
-/// glass — every caller is one of the silent lane's records).
+/// A toolchain record's row: the `Packages` capsule, classified a record
+/// ([`Message::record`]: `Hold::LogOnly`, never on glass).
 fn row(severity: Severity, title: impl AsRef<str>) -> Message {
     Message::new(tags::TOOLCHAIN, severity, title)
         .action(packages())
         .record()
 }
 
-/// A RECORD's words as a held row, the way a build before the silent lane
-/// carried them: unclassified, at the default hold. A record's own class keeps
-/// it off the glass whatever hold it is given, so a test that needs these
-/// words on the band rebuilds them unclassified.
+/// A record's words rebuilt unclassified at the default hold, for a test that
+/// needs them on the band: a record's class keeps it off the glass whatever its
+/// hold.
 #[cfg(test)]
 pub(crate) fn held_row(record: &Message) -> Message {
     let mut row = Message::new(record.tag.clone(), record.severity, record.title.clone());
@@ -175,14 +155,12 @@ pub(crate) fn held_row(record: &Message) -> Message {
     row
 }
 
-/// A LIVE toolchain row — the first run's announcement and its meter, a heavy
-/// routine pass: tag, severity, title, and NO capsule. A live row is work in
-/// flight, not a decision: `Details ›` leads, and the eleven cells a
-/// `Packages` chip took keep the title whole at 60 columns beside its load
-/// words and `Details ›` whole at 80 (review round 2, 2026-09-23 — at 80 the
-/// row read `Packages   ›`, at 60 `Installing AL…`).
-/// WORK IN FLIGHT ([`Message::working`]): live under `stale_after`, and every
-/// caller gives it its indicator (a fill, `busy`, or [`Message::in_flight`]).
+/// A live toolchain row (the first run's announcement and meter, a heavy
+/// routine pass) with no capsule: work in flight is not a decision, so
+/// `Details ›` leads, and the cells a `Packages` chip would take keep the title
+/// whole at 60 columns and `Details ›` whole at 80. Live under `stale_after`
+/// ([`Message::working`]); every caller gives it its indicator (a fill, `busy`,
+/// or [`Message::in_flight`]).
 fn live_row(title: impl AsRef<str>, stale_after: Duration) -> Message {
     // The pass IS a download first: its `network busy` says nothing the
     // title does not, so it never shows; the extraction's disk and the
@@ -198,10 +176,9 @@ fn live_row(title: impl AsRef<str>, stale_after: Duration) -> Message {
 /// words, so a phase change never re-lays it.
 pub(crate) const PASS_LOADS: [Load; 3] = [Load::Network, Load::Disk, Load::Cpu];
 
-/// A toolchain RECORD (the silent lane, module doc): a row's words with
-/// `Hold::LogOnly` — recorded in the log and on `appstatus` (a finished
-/// activity, `outcome=warn` ⇔ Warn), never on glass. `detail` is the bars'
-/// ledger detail, byte for byte; an empty one is no line.
+/// A toolchain record (module doc): logged and listed by `appstatus` as a
+/// finished activity (`outcome=warn` ⇔ Warn), never on glass. `detail` is the
+/// bars' ledger detail, byte for byte; an empty one is no line.
 fn record(severity: Severity, title: impl AsRef<str>, detail: String) -> Message {
     row(severity, title).line(detail)
 }
@@ -213,17 +190,14 @@ fn whole_record(severity: Severity, title: &str, detail: &str) -> Message {
 }
 
 /// Which `~/.aterm/shell.d/00-atpkg.*` a frozen tab sources to pick up the
-/// managed programs in place. Not `exec $SHELL`: aterm's zsh integration rides
-/// a `ZDOTDIR` wrapper (bash rides `--rcfile`), so a re-exec'd plain shell
-/// loses its OSC 133/633 marks, cwd/title tracking and live PATH re-assert,
-/// and only picks up PATH through the rc block `atpkg` writes into an existing
-/// rc file. Sourcing the hook (what atpkg's own rc block does) moves
-/// `<prefix>/agents/` to the front of PATH, exports `ATPKG_AGENTS` and appends
-/// `bin/`, idempotently, keeping the tab's integration. The file names follow
-/// `crates/atpkg/src/hooks.rs` (`HOOK_BASENAME`, one file per dialect: POSIX
-/// `.` for zsh and bash, fish's `source`, PowerShell's dot-source). A shell
-/// atpkg has no hook for ([`HookDialect::None`]: nushell, xonsh, cmd) gets no
-/// command; a new tab picks the programs up.
+/// managed programs in place. Not `exec $SHELL`: aterm's zsh integration rides a
+/// `ZDOTDIR` wrapper (bash rides `--rcfile`), so a re-exec'd plain shell loses its
+/// OSC 133/633 marks, cwd/title tracking and live PATH re-assert. Sourcing the
+/// hook (what atpkg's own rc block does) puts `<prefix>/agents/` first on PATH
+/// and appends `bin/`, idempotently, keeping the tab's integration. One file per
+/// dialect (`atpkg::hooks::hook_files`); a shell with no hook
+/// ([`HookDialect::None`]: nushell, xonsh, cmd) gets no command, and a new tab
+/// picks the programs up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HookDialect {
     #[default]
@@ -255,10 +229,9 @@ impl From<aterm_core::shell_integration::ShellType> for HookDialect {
 }
 
 impl HookDialect {
-    /// The backtick-quoted line a person types in the frozen tab, or `None` for
-    /// a shell without a hook. The path is the one `hooks::refresh` writes,
-    /// `~/.aterm/shell.d/<HOOK_BASENAME>.<ext>`. The one spelling: the seed pill
-    /// (`seed_pill_text` in `lib.rs`) reads it from here too.
+    /// The backtick-quoted line a person types in the frozen tab, or `None` for a
+    /// shell without a hook: the path `atpkg::hooks::refresh` writes. The one
+    /// spelling, read by [`seed_pill_text`] and the managed-current record.
     pub(crate) fn remedy(self) -> Option<String> {
         let base = atpkg::hooks::HOOK_BASENAME;
         let (verb, ext) = match self {
@@ -313,15 +286,13 @@ pub(crate) fn fill_permille(done: u64, total: u64) -> Option<u16> {
 // The markers.
 // ---------------------------------------------------------------------------
 
-/// `atpkg` announced a first-run pass (`net-starting:` from a child the lane
-/// tagged first run): the row opens now, before `progress.json` exists, since
-/// the extraction that follows is minutes long and gigabytes wide. Busy (no
-/// fraction yet), with atpkg's computed size as its stats, the network as its
-/// load, and no capsule (work in flight is not a decision). atpkg's size is
-/// the only detail line ("about 3 GB on disk when finished"; none without a
-/// size). A routine pass's announcement is a log line and never reaches here.
-/// Live under the announcement cap ([`STALE_ANNOUNCE`]): the child's exit
-/// normally folds it; if none is reported it folds on its own.
+/// `net-starting:` from a first-run child: the row opens before `progress.json`
+/// exists, since the extraction that follows is minutes long and gigabytes wide.
+/// Busy, with [`announced_stats`] as its stats, the network as its load, no
+/// capsule, and atpkg's size ("about 3 GB on disk when finished") as its only
+/// detail line. Live under [`STALE_ANNOUNCE`]: the child's exit folds it, or it
+/// folds on its own. A routine pass's announcement is a log line and never
+/// reaches here.
 pub(crate) fn announced(detail: &str) -> Message {
     // The size is atpkg's closing ` (…)` clause — spaced, so the `(s)` of
     // `program(s)` is never read as one.
@@ -366,12 +337,11 @@ pub(crate) fn announced_stats(detail: &str, size: Option<&str>) -> String {
     }
 }
 
-/// The wait ran out (atpkg exit 75): the pass is deferred (the loop retries on
-/// its short backoff, or parks an hour when the holder looks wedged) and
-/// `detail` says which. An Info record ("ALab tools update postponed",
-/// atpkg's sentence), never "failed" and never a row on glass. A stand-down
-/// that will not retry is also the Packages badge (the host's
-/// `PkgLockTimedOut { stands_down }` arm). No key.
+/// The store-lock wait ran out (atpkg exit 75): the pass is deferred (retried on a
+/// short backoff, later when the holder looks wedged) and `detail` says which. An
+/// unkeyed Info record, "ALab tools update postponed", never "failed". A
+/// stand-down that will not retry also lights the Packages badge (the host's
+/// `PkgLockTimedOut { stands_down }` arm).
 pub(crate) fn deferred(detail: &str) -> Message {
     whole_record(Severity::Info, PACKAGES_POSTPONED, detail).glyph(glyph(NOTED))
 }
@@ -405,12 +375,10 @@ pub(crate) fn unhooked_clause(
     }
 }
 
-/// The installed pill's sentence. `frozen_tabs` is `App::frozen_path_tabs`:
-/// live tabs adopted from a build whose sessions lack the managed `agents/`;
-/// `hook` is the dialect of the atpkg hook such a tab sources to catch up
-/// (`HookDialect::remedy`, the window's spawn shell). The frozen clause is
-/// joined with ` · ` so the width law ([`shape_detail`], which knows ". " and
-/// " · " as sentence joints) keeps the qualifier together with the command.
+/// The installed pill's sentence. `frozen_tabs` is `App::frozen_path_tabs`: live
+/// tabs adopted from a build whose sessions lack the managed `agents/`; `hook` is
+/// the window's spawn-shell dialect for their remedy. The frozen clause is joined
+/// with ` · ` so the width law ([`shape_detail`]) keeps it with its command.
 pub(crate) fn seed_pill_text(
     installed: &[String],
     shell_integration: Option<&crate::spawn::ShellIntegrationOutcome>,
@@ -428,25 +396,15 @@ pub(crate) fn seed_pill_text(
     if installed.len() > 5 {
         names.push('…');
     }
-    // No pill sends a hooked tab to a new one. The agent programs live in
-    // `<prefix>/agents/`, which the spawn seam puts in front of every session's
-    // PATH (`spawn::managed_agents_dir`), and atpkg re-lays them in place. The
-    // rest of the roster lives in `<prefix>/bin/`, reached through the atpkg
-    // hook in `~/.aterm/shell.d`; the integration's `__aterm_managed_path_live`
-    // runs at every precmd and preexec, sources the hook once it exists and
-    // re-asserts `reroute/` and `agents/` in front, so the tab on glass has the
-    // whole roster at its next prompt.
-    //
-    // Tabs adopted from a build without that live re-assert
-    // (`App::frozen_path_tabs`) narrow the claim to tabs opened since, and are
-    // named with their in-place remedy (`HookDialect::remedy`, never
-    // `exec $SHELL`). An agents-only roster names no remedy: its frozen tabs
-    // are the managed-current record's to count.
-    //
-    // A tab whose integration failed (unknown shell, unwritable loader cache:
-    // the recorded runtime outcome) has neither the re-assert nor `bin/`, since
-    // the user's rc can reorder PATH; nothing is promised there, and the
-    // sentence names the recorded cause ([`unhooked_clause`]).
+    // A hooked tab is never sent to a new one: the spawn seam puts
+    // `<prefix>/agents/` first on every session's PATH (`spawn::managed_agents_dir`),
+    // and the integration's `__aterm_managed_path_live` sources the atpkg hook
+    // (`<prefix>/bin/`) at every precmd and preexec, re-asserting `reroute/` and
+    // `agents/` in front. Tabs adopted from a build without that re-assert
+    // (`frozen_tabs`) narrow the claim to tabs opened since and get the in-place
+    // remedy; an agents-only roster names none (the managed-current record counts
+    // those tabs). A failed integration has neither (the user's rc can reorder
+    // PATH), so nothing is promised and the sentence names the cause.
     if let Some(clause) = unhooked_clause(shell_integration) {
         return format!("✓ ALab toolchain installed: {names} — {clause}");
     }
@@ -478,11 +436,10 @@ pub(crate) fn seed_pill_text(
     pill
 }
 
-/// `net-installed:`: the toolchain is here. `text` is the pill's sentence
-/// (roster plus the readiness clause or the shell-integration caveat), authored
-/// by the caller; the record has its own title, so the pill's opening is not
-/// repeated as the detail. A Success record with no meter, titled "ALab tools
-/// installed"; the first-run row folds at its child's exit.
+/// `net-installed:`: the toolchain is here. `text` is the caller's pill sentence
+/// ([`seed_pill_text`]), whose opening the record's own title replaces: a
+/// Success record with no meter, "ALab tools installed". The first-run row folds
+/// at its child's exit.
 pub(crate) fn installed(text: &str) -> Message {
     let detail = text
         .strip_prefix("\u{2713} ALab toolchain installed: ")
@@ -491,10 +448,9 @@ pub(crate) fn installed(text: &str) -> Message {
 }
 
 /// `seed-done:`: an announced pass that ended well with no install roster to
-/// name. Unlike [`installed`], it claims nothing beyond atpkg's sentence: a
-/// Success record ("ALab tools checked"). `first_run`: the first run's pass,
-/// which was an install, so "ALab tools installed" (as [`install_failed`] is
-/// its failure).
+/// name. It claims nothing beyond atpkg's sentence: a Success record titled
+/// "ALab tools checked", or "ALab tools installed" for a `first_run`, which was
+/// an install.
 pub(crate) fn ended(detail: &str, first_run: bool) -> Message {
     let title = if first_run {
         PACKAGES_INSTALLED
@@ -504,17 +460,14 @@ pub(crate) fn ended(detail: &str, first_run: bool) -> Message {
     whole_record(Severity::Success, title, detail).key(KEY_PASS)
 }
 
-/// A bad terminal outcome for the toolchain lane (`seed-failed:` /
-/// `net-failed:` / `seed-unusable:` / a coherence group's abort / a child that
-/// died after announcing). `what` is the whole sentence the ledger recorded
-/// (atpkg's clipped cause or the host's `failure_cause` verdict); the
-/// `Packages` capsule points at the page, so the sentence does not name it.
-/// Never for a store-lock wait's timeout, which is [`deferred`].
-///
-/// A Warn record, never a row: the failure's surface is the Settings ▸
-/// Packages badge (`PackagesService::note_pass_trouble`), and no meter can be
-/// fused with the verdict. Titled "Couldn't update ALab tools"; the reason is
-/// kept whole ([`whole_reason`]).
+/// A bad terminal outcome for the toolchain lane (`seed-failed:` / `net-failed:`,
+/// a pass that could not launch, a coherence group's abort, a child that died
+/// after announcing); never a lock wait's timeout, which is [`deferred`]. `what`
+/// is the whole sentence the ledger recorded (atpkg's clipped cause or the
+/// host's `failure_cause`), kept whole ([`whole_reason`]); the capsule names the
+/// page, so the sentence does not. A Warn record with no meter, titled "Couldn't
+/// update ALab tools": its surface is the Settings ▸ Packages badge
+/// (`PackagesService::note_pass_trouble`).
 pub(crate) fn failed(what: &str) -> Message {
     bad_outcome(PACKAGES_FAILED, what)
 }
@@ -601,16 +554,14 @@ fn actionable_cause(cause: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// A first run that ended short. The first-run row told the person to wait for
-/// a multi-gigabyte deliverable, so when it does not arrive this is a failure
-/// row they act on (retry from Settings ▸ Packages, free the disk), keyed by
-/// the pass, `Packages` its capsule, the default hold. The cause rides behind
-/// Details unless the person can fix it themselves ([`actionable_cause`]), and
-/// is kept whole ([`whole_reason`]). The record ([`failed`]) and the Packages
-/// badge stay as they are; a heavy routine pass stays a record, since the
-/// installed versions keep working. Tagged `packages`: `appstatus` lists the
-/// toolchain lane's unretired rows as `phase=live` work, and this is an
-/// outcome.
+/// A first run that ended short: the first-run row told the person to wait for a
+/// multi-gigabyte deliverable, so this is a failure row they act on (retry from
+/// Settings ▸ Packages, free the disk), keyed by the pass, at the default hold.
+/// The cause, kept whole ([`whole_reason`]), rides behind Details unless the
+/// person can fix it themselves ([`actionable_cause`]). The record ([`failed`])
+/// and the Packages badge stand beside it. Tagged `packages`, not `toolchain`:
+/// `appstatus` lists the toolchain lane's unretired rows as `phase=live` work,
+/// and this is an outcome.
 pub(crate) fn first_run_short(how: FirstRunShort, cause: &str) -> Message {
     let (severity, title) = match how {
         // One severity for the family: a failed first run left the Mac as it
@@ -637,10 +588,9 @@ pub(crate) fn first_run_short(how: FirstRunShort, cause: &str) -> Message {
 pub(crate) fn appnotice(tag: Tag, text: &str) -> Message {
     let text = sanitize_for_tty(text, 120);
     match installed_words(&text) {
-        // `aterm pkg install claude: 2.1.267 installed` is a command's
-        // transcript line, not a title (ruling 261): the program as a person
-        // knows it and what happened — `Claude Code 2.1.267 installed` — the
-        // line itself behind it.
+        // `aterm pkg install claude: 2.1.267 installed` is a command's transcript
+        // line, not a title: the title is the program as a person knows it and
+        // what happened (`Claude Code 2.1.267 installed`), the line behind it.
         Some(title) => Message::new(tag, Severity::Info, title).line(text).record(),
         None => Message::new(tag, Severity::Info, text).record(),
     }
@@ -671,26 +621,8 @@ fn known_as(program: &str) -> &str {
 // The managed-current and machine-settings records.
 // ---------------------------------------------------------------------------
 
-/// `managed-current:`: every agent program (`atpkg::stub::AGENT_PROGRAMS`)
-/// installed and at its vendor's latest, as atpkg lists it: `claude 2.1.280
-/// (Anthropic latest); codex 0.156.0 (OpenAI latest)` (an older atpkg's `(build
-/// <N>)` still parses). The title names the programs as a person knows them
-/// ("Claude Code 2.1.280 and Codex CLI 0.156.1 are current", [`known_as`]); the
-/// detail says where they are used
-/// ([`managed_current_words`]). A keyed Success record, never a row: the host
-/// records it only when its words change (`App::post_managed_current`).
-///
-/// `frozen_tabs` counts live tabs adopted from a build whose sessions have no
-/// managed `agents/` on PATH (`App::frozen_path_tabs`); for those the detail is
-/// the in-place remedy (sourcing the atpkg hook for `hook`'s dialect).
-/// `this_tab_hooked` is whether the shell integration runs in this window's
-/// tabs (the window passes [`unhooked_clause`]'s cause instead): only its
-/// per-prompt re-assert keeps `agents/` in front after the user's rc, so a
-/// window whose integration failed is not told "every tab".
-///
-/// `None` for an empty body. The window posts through [`managed_current_for`],
-/// which also knows the tabs running an agent and the sessions the live
-/// upgrade is moving; this is its frozen-shells-only form.
+/// [`managed_current_for`] with only frozen shells counted, for tests;
+/// `this_tab_hooked` false stands for an unknown shell.
 #[cfg(test)]
 pub(crate) fn managed_current(
     text: &str,
@@ -718,8 +650,11 @@ fn test_unhooked(this_tab_hooked: bool) -> Option<String> {
         .flatten()
 }
 
-/// [`managed_current`] over the whole of [`TabsBehind`]. `unhooked` is
-/// [`unhooked_clause`] for this window: why its tabs do not get the programs.
+/// `managed-current:`: every agent program (`atpkg::stub::AGENT_PROGRAMS`) as atpkg
+/// lists it (`claude 2.1.280 (Anthropic latest); codex 0.156.0 (OpenAI latest)`) as a
+/// keyed record of [`managed_current_words_for`]'s words: Success when every program
+/// is at its vendor's head, else Info. `unhooked` is [`unhooked_clause`] for this
+/// window. The host records it only when its words change (`App::post_managed_current`).
 pub(crate) fn managed_current_for(
     text: &str,
     tabs: TabsBehind,
@@ -727,8 +662,6 @@ pub(crate) fn managed_current_for(
     hook: HookDialect,
 ) -> Option<Message> {
     let (title, detail) = managed_current_words_for(text, tabs, unhooked, hook)?;
-    // A program the pass could not check, or that is not its vendor's head, is no
-    // success: the title says so, and the mark is a plain record's.
     let severity = if managed_items(text)
         .iter()
         .all(|item| item.standing.is_none())
@@ -872,22 +805,7 @@ pub(crate) fn managed_version(text: &str, name: &str) -> Option<String> {
         .map(|item| item.version)
 }
 
-/// The managed-current entry's words from the wire text, or `None` for an empty
-/// body. The title names the programs as a person knows them and says what the
-/// marker means: "Claude Code 2.1.280 and Codex CLI 0.156.1 are current" (one name:
-/// "… is current"; unknown names verbatim, so `gemini` reads as gemini). The
-/// detail says where they are used: "ready in every aterm tab". Neither the vendor
-/// source nor an older atpkg's `(build <N>)` store id is shown.
-///
-/// The managed `agents/` is in front of every session's PATH from launch
-/// (`spawn::managed_agents_dir`) and atpkg re-lays the twins in place, so the
-/// next invocation in any tab runs the named build. Two exceptions replace the
-/// claim: a window whose shell integration failed (`this_tab_hooked`) gets the
-/// installed record's cause ([`unhooked_clause`]), and `frozen_tabs` tabs adopted from an older build get
-/// the remedy ("1 tab from before this update picks them up with
-/// `. ~/.aterm/shell.d/00-atpkg.zsh`", spelled for `hook`, see [`HookDialect`]),
-/// said last so a cut keeps it ([`shape_detail`]). The frozen-shells-only form
-/// of [`managed_current_words_for`], which the window uses.
+/// [`managed_current_words_for`] with only frozen shells counted, for tests.
 #[cfg(test)]
 pub(crate) fn managed_current_words(
     text: &str,
@@ -906,15 +824,12 @@ pub(crate) fn managed_current_words(
     )
 }
 
-/// The managed-current title over `items`, `None` when there are none. EVERY
-/// MANAGED PROGRAM IS NAMED (audit 2026-10-09: a pass that could not reach
-/// Anthropic said `Codex 0.160.0 is current · ready in every aterm tab`, Claude
-/// Code left out): the ones at their vendor's head first, current or, while an
-/// agent session runs an older build (`lagging`), installed ("current" would
-/// claim the sessions are too); then the others grouped by what is said of them
-/// instead (`Claude Code 2.1.287 and Muse Code 1.4.9-R6297.1 not checked`). The
-/// parenthesis is not shown; the versions are, as `current_versions` and
-/// `other_versions` say.
+/// The managed-current title over `items`, `None` when there are none. Every
+/// program is named: those at their vendor's head first, "current" (or
+/// "installed" while an agent session runs an older build, `lagging`), then the
+/// others grouped by what is said of them (`Claude Code 2.1.287 and Muse Code
+/// 1.4.9-R6297.1 not checked`). Versions are shown as `current_versions` and
+/// `other_versions` say; the parenthesis never is.
 fn managed_title(
     items: &[ManagedItem],
     lagging: bool,
@@ -969,11 +884,16 @@ fn and_list(words: &[String]) -> String {
     }
 }
 
-/// [`managed_current_words`] over the whole of [`TabsBehind`]: the title says
-/// "installed", not "current", while running sessions lag
-/// (`agents_behind`, named in the detail with when they move); an agent tab
-/// is never handed the hook to type (`frozen_agents` are told "once it
-/// exits"); and the hook remedy, for the shells alone, is said last.
+/// The managed-current record's `(title, detail)`, or `None` for an empty body.
+/// The title names every program as a person knows it ([`managed_title`];
+/// "installed", not "current", while running sessions lag), never the vendor
+/// source or an older atpkg's `(build <N>)`. The detail claims "ready in every
+/// aterm tab" (the managed `agents/` leads every session's PATH and atpkg re-lays
+/// the programs in place) unless the integration failed (`unhooked`) or a tab is
+/// frozen or shadowed. Lagging sessions are said with when they move, an agent
+/// tab (`frozen_agents`) is told to source the hook once the agent exits, and the
+/// frozen shells' remedy ([`HookDialect::remedy`]) comes last, where
+/// [`shape_detail`] keeps a command whole.
 pub(crate) fn managed_current_words_for(
     text: &str,
     tabs: TabsBehind,
@@ -1001,19 +921,16 @@ pub(crate) fn managed_current_words_for(
         .reduce(|said, shorter| if fits(&said) { said } else { shorter })?;
     let title = sanitize_for_tty(&title, TITLE_CAP);
     let mut pieces: Vec<String> = Vec::new();
-    // "Every tab" rests on the same evidence as the pill: the user's rc undoes
-    // the seam's front position and only the integration's per-prompt re-assert
-    // restores it, so a window whose integration failed gets the installed
-    // record's cause.
+    // "Every tab" rests on the pill's evidence: the user's rc undoes the seam's
+    // front position and only the integration's per-prompt re-assert restores it.
     if let Some(clause) = unhooked {
         pieces.push(clause.to_string());
     } else if frozen_tabs == 0 && tabs.frozen_agents == 0 && tabs.shadowed == 0 {
         pieces.push(READY_IN_EVERY_TAB.to_string());
     }
-    // Not checked is not "not current": the vendor's channel was not read, so
-    // nothing is known either way, and doctor still shows the row its last
-    // check left (`… — Anthropic latest`). It is said as that fact, with no
-    // pointer at a page that contradicts it (review of 2026-10-09).
+    // Not checked is not "not current": the vendor's channel was not read, and
+    // doctor still shows its last check's row, so it is said as that fact with no
+    // pointer at doctor.
     if unchecked > 0 {
         pieces.push(
             if unchecked == 1 {
@@ -1140,12 +1057,11 @@ pub(crate) fn machine_settings(text: &str) -> Vec<Message> {
 }
 
 /// One machine-settings wire item as its row's words `(title, detail)`:
-/// `universal-control disabled` → "ALab tools turned off Universal Control",
-/// whose detail is the whole undo: the `[machine]` switch set to leave (the
-/// default policy turns it off again at the next window or the day's first
-/// terminal session) and the revert command, byte-identical to
-/// [`atpkg::machine::UNIVERSAL_CONTROL_REVERT`] (atpkg's `doctor_line` says the
-/// same). An unknown item is its own title, verbatim, with no detail.
+/// `universal-control disabled` → "ALab tools turned off Universal Control", whose
+/// detail is the whole undo: the `[machine]` switch set to leave (the default
+/// policy turns it off again) and the revert command,
+/// [`atpkg::machine::UNIVERSAL_CONTROL_REVERT`] byte for byte. An unknown item is
+/// its own title, verbatim, with no detail.
 pub(crate) fn machine_setting_words(item: &str) -> (String, String) {
     let item = sanitize_for_tty(item, 80);
     let (title, detail) = if item == atpkg::machine::UNIVERSAL_CONTROL_ENTRY {
@@ -1183,8 +1099,8 @@ pub(crate) struct Foreign {
 /// A `foreign:` line's body (`seam none`, `path trust /u/bin/trustdoc — type …`) as its
 /// look's scope ([`atpkg::cli::FOREIGN_SEAM`], [`atpkg::cli::FOREIGN_PATH`]) and what
 /// it found; `None` for a scope this build does not know. An item naming no fix is
-/// dropped: with nothing for the owner to do it is no exception (review of 2026-10-09).
-/// atpkg's text is untrusted: each field is control-stripped and capped.
+/// dropped: with nothing for the owner to do it is no exception. atpkg's text is
+/// untrusted: each field is control-stripped and capped.
 pub(crate) fn foreign_report(body: &str) -> Option<(&'static str, Vec<Foreign>)> {
     let (scope, rest) = body.trim().split_once(' ')?;
     let scope = [atpkg::cli::FOREIGN_SEAM, atpkg::cli::FOREIGN_PATH]
@@ -1210,14 +1126,14 @@ pub(crate) fn foreign_report(body: &str) -> Option<(&'static str, Vec<Foreign>)>
     Some((scope, items))
 }
 
-/// The digest entry for what ONE LOOK of a pass named that aterm leaves alone
-/// ([`foreign_report`]): a fact that needs the owner's look but not now — aterm never
-/// changes a link or a copy it did not lay, so only the owner ends it — with atpkg's
-/// own fix for each, one line apiece under Details (the last counting the rest past
-/// [`aterm_messages::exceptions::MORE_LINES`]). One entry per look, keyed by its scope
-/// (`toolchain.seam.foreign`, `toolchain.path.foreign`) whatever it names, so each
-/// look raises, re-words and ends its own (`App::note_foreign_tools`); filed for a
-/// month when dismissed — a link of the owner's own is commonly their choice.
+/// The digest entry for what one look of a pass found that aterm leaves alone
+/// ([`foreign_report`]): a fact for the owner, not now — aterm never changes a link
+/// or a copy it did not lay — with atpkg's fix for each, one line apiece under
+/// Details (the last counting the rest past [`aterm_messages::exceptions::MORE_LINES`]).
+/// One entry per look, keyed by its scope (`toolchain.seam.foreign`,
+/// `toolchain.path.foreign`), so each look raises, re-words and ends its own
+/// (`App::note_foreign_tools`); filed for a month when dismissed, since a link of
+/// the owner's own is commonly their choice.
 pub(crate) fn foreign_tools_entry(
     scope: &str,
     items: &[Foreign],
@@ -1275,17 +1191,13 @@ pub(crate) fn foreign_tools_entry(
 // The tailed snapshot (the terminal readings of the file).
 // ---------------------------------------------------------------------------
 
-/// What one classified `progress.json` read says. The host applies it against
-/// the row that carries [`KEY_PASS`], and only a first run's reads paint (see
-/// the module docs):
+/// What one classified `progress.json` read says. The host applies it to the row
+/// keyed [`KEY_PASS`] and decides which reads paint (`App::apply_toolchain_snapshot`):
 ///
-/// * `Live` restates the first run's live row in place (a `restate` costs no
-///   log line, so the 10 Hz tailer is free) or posts it when none is up; a
-///   routine pass's `Live` paints nothing;
-/// * `Over` and `Vanished` claim no outcome: the markers record the outcome,
-///   and a failure is the Settings ▸ Packages badge. A routine read folds a
-///   live row at once; a first run's ending read folds nothing; the child's
-///   exit does (`App::toolchain_pass_ended`).
+/// * `Live` restates the live row in place (a `restate` costs no log line, so
+///   the 10 Hz tailer is free) or posts it when none is up;
+/// * `Over` and `Vanished` claim no outcome: the markers record it, and a
+///   failure is the Settings ▸ Packages badge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SnapshotWords {
     /// The file vanished at child exit: a live row has nothing honest left to
@@ -1312,20 +1224,17 @@ pub(crate) enum SnapshotWords {
 }
 
 /// The words for one classified read, pure. `peak` is the live row's meter as
-/// the host holds it (its pass and its fill), so a live meter never runs
-/// backwards within one pass: atpkg's `.part` poller reports 0 between curl
-/// promoting the file and the watch stopping, and a program's credit can dip
-/// during its verify phase. A different pass (pass name + start stamp) starts
-/// fresh.
+/// the host holds it (its pass and fill), so a meter never runs backwards within
+/// one pass: atpkg's `.part` poller reports 0 between curl promoting the file and
+/// the watch stopping, and a program's credit can dip during verify. A different
+/// pass (name + start stamp) starts fresh.
 ///
-/// The row paints its title and indicator alone: the current program and
-/// phase (`trust · extracting`) and atpkg's byte rollup (download bytes only,
-/// which disagrees with the bar) ride behind Details. The stats are the count
-/// that agrees with the bar, `3 of 10 programs`. The heaviest active phase is
-/// the declared load ([`pass_load`]). The fill counts programs weighted by
-/// phase ([`overall_fill`]), reaching 100 % only when every program has
-/// finished, and is the row's [`Amount`] too ([`Unit::Steps`], a series per
-/// pass), so the band's ETA is the fill's own rate. `routine` titles a heavy
+/// The row paints its title and indicator alone; the current program and phase
+/// (`trust · extracting`) and atpkg's byte rollup (download bytes only, which
+/// disagree with the bar) ride behind Details. The stats are the count that
+/// agrees with the bar, `3 of 10 programs`; the load is [`pass_load`]. The fill
+/// ([`overall_fill`]) is also the row's [`Amount`] ([`Unit::Steps`], one series
+/// per pass), so the band's ETA is the fill's own rate. `routine` titles a heavy
 /// routine pass (`Updating ALab tools`).
 pub(crate) fn snapshot_words(
     snap: Option<&crate::PkgProgressSnapshot>,
@@ -1355,8 +1264,7 @@ pub(crate) fn snapshot_words(
     }
     let total = f.overall.programs_total;
     let done = f.overall.programs_done;
-    // One title per install: the announcement's row says [`INSTALLING_ALAB`],
-    // and so does the pass it announced (`net`, the one pass atpkg writes). A
+    // A first run's pass shares its announcement's title, whatever its name; a
     // heavy routine pass updates what is already there.
     let title = match f.pass.as_str() {
         _ if routine => UPDATING_ALAB,
@@ -1598,8 +1506,8 @@ mod tests {
     }
 
     /// Every live toolchain row completes in its finished form (`Installed ALab
-    /// tools`, `Updated ALab tools`, `Installed packages`) with nothing else on
-    /// the row moving at 60, 80, 120 and 160 columns.
+    /// tools`, `Updated ALab tools`) with nothing else on the row moving at 60,
+    /// 80, 120 and 160 columns.
     #[test]
     fn every_live_toolchain_row_completes_in_its_finished_form() {
         use crate::message_band::assert_completes_in_place as completes;
@@ -1672,7 +1580,7 @@ mod tests {
             {
                 assert_eq!(m.actions, vec![packages()], "{}", m.title);
             }
-            // The owner's rule: progress with its indicator, or a record.
+            // Progress with its indicator, or a record.
             let class = crate::message_reporters::attention(m)
                 .unwrap_or_else(|why| panic!("{why}: {}", m.title));
             if matches!(m.hold, Hold::Live { .. }) {
@@ -1760,8 +1668,8 @@ mod tests {
         // As the child's stderr carries it, behind atpkg's own head.
         let stderr = format!("atpkg: bootstrap install trust failed: {refusal} (continuing)");
         assert!(first_run_short(FirstRunShort::Failed, &stderr).excerpt);
-        // The reason is kept whole: a long atpkg stderr
-        // keeps every word, split at its joints like the record's.
+        // The reason is kept whole: a long stderr keeps every word, split at
+        // its joints like the record's.
         let long = "net pass could not finish: the index at \
                     https://packages.example.invalid/alab/index.json answered 503 Service \
                     Unavailable three times in a row, and the mirror list had no other \
@@ -1933,7 +1841,7 @@ mod tests {
     /// A `seed-unusable:` stating a fact about the machine (nothing published
     /// for its architecture, every program removed on purpose) claims no failed
     /// attempt: an Info record, "No ALab tools to install", atpkg's sentence
-    /// whole. The bodies are atpkg's words (`seed_unusable_tests`).
+    /// whole. The bodies are atpkg's words (its `cli::seed_unusable_tests`).
     #[test]
     fn an_informational_unusable_is_an_info_record_not_a_failure() {
         for body in [
@@ -2131,8 +2039,8 @@ mod tests {
     }
 
     /// A pass whose byte rollup is silent (no byte total) still fills by
-    /// programs weighted by phase; the title is the announcement's for the
-    /// `net` pass and the generic one for any other name.
+    /// programs weighted by phase; every first-run pass, whatever its name, is
+    /// titled [`INSTALLING_ALAB`].
     #[test]
     fn a_silent_rollup_changes_nothing_the_programs_measure() {
         let mut f = file(Some(7), "net");
@@ -2382,16 +2290,12 @@ mod tests {
         assert_eq!(appnotice(tags::UPDATE, "x").tag, tags::UPDATE);
     }
 
-    /// A PROGRAM THE PASS COULD NOT CHECK IS NAMED, never left out (audit
-    /// 2026-10-09: a pass whose claude check failed on curl 56 recorded `Codex
-    /// 0.160.0 is current · ready in every aterm tab`, a success that named
-    /// one of the two programs): the title says it was not checked, and the
-    /// mark is a plain record's. Not checked is not "not current", so the
-    /// detail says what is known and points nowhere (review of 2026-10-09:
-    /// `aterm pkg doctor` still shows the last check's `Anthropic latest`). A
-    /// failed landing reads as one, and atpkg's other words (`held`) as
-    /// written, with doctor named for why.
-    /// NEGATIVE CONTROL: both at their vendor's head are current, a success.
+    /// A program the pass could not check is named, never left out: the title
+    /// says it was not checked and the mark is a plain record's. Not checked is
+    /// not "not current", so the detail says what is known and points nowhere. A
+    /// failed landing reads as one, and atpkg's other words (`held`) as written,
+    /// with doctor named for why.
+    /// Negative control: both at their vendor's head are current, a success.
     #[test]
     fn a_program_the_pass_could_not_check_is_named_and_no_success() {
         let words = |wire: &str| managed_current(wire, 0, true, HookDialect::Zsh).unwrap();
@@ -2425,10 +2329,9 @@ mod tests {
         assert_eq!(m.severity, Severity::Success);
     }
 
-    /// FOUR AGENTS ARE SAID WHOLE (2026-10-15: four `not checked` ran to 137
-    /// chars and the cap cut `Muse Code 1.4.9-R6…`): programs that share a
-    /// word are grouped, and when the title still runs over, the programs not
-    /// current lose their versions before anything is cut.
+    /// Four agents fit the title whole: programs that share a word are grouped,
+    /// and a title still over the cap drops the versions of the programs not
+    /// current before anything is cut.
     #[test]
     fn four_agents_fit_the_title_whole() {
         let title = |[a, b, c, d]: [&str; 4]| {
@@ -2656,9 +2559,9 @@ mod tests {
     }
 
     /// The remedy is spelled for the shell this window spawns: atpkg writes one
-    /// hook per dialect (`crates/atpkg/src/hooks.rs` `hook_files`: `.zsh`,
-    /// `.bash`, `.fish`, `.ps1`), sourced the way that shell sources, and a
-    /// shell atpkg has no hook for is told a new tab.
+    /// hook per dialect (`atpkg::hooks::hook_files`: `.zsh`, `.bash`, `.fish`,
+    /// `.ps1`), sourced the way that shell sources, and a shell atpkg has no hook
+    /// for is told a new tab.
     #[test]
     fn the_frozen_tab_remedy_is_the_hook_in_the_spawn_shells_dialect() {
         use aterm_core::shell_integration::ShellType;
@@ -2720,7 +2623,7 @@ mod tests {
     }
 
     /// The seed pill over every roster shape × integration outcome × frozen-tab
-    /// count × hook dialect (owner, 2026-09-16):
+    /// count × hook dialect:
     ///
     /// - the marker glyph leads (the renderer tints the first char) and the
     ///   roster is capped at five names;
@@ -2903,10 +2806,7 @@ mod tests {
         );
     }
 
-    /// The declared load is the heaviest active phase (an extraction or link
-    /// loads the disk, else a verification the CPU, else a download the
-    /// network), not the phase the detail line names. A transfer's stats keep
-    /// one width from its first megabyte to its last.
+    /// A transfer's stats keep one width from its first megabyte to its last.
     #[test]
     fn byte_stats_keep_one_width_for_the_life_of_a_transfer() {
         for total in [200_000_000u64, 1_200_000_000, 74_000_000] {

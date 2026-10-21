@@ -1352,7 +1352,13 @@ impl Fold {
                 }
                 _ => {}
             },
-            Kind::MailSeen => self.st.mail_open = self.st.mail_open.saturating_sub(1),
+            // Every `inbox seen` is a mark since 6F-6, and only one that
+            // moved the watermark or decided a verdict closes mail: a
+            // repeat (`moved=0`) folds as nothing. An older writer's mark,
+            // with no `moved=`, was written only on a move.
+            Kind::MailSeen if r.f.get_u(Key::Moved) != Some(0) => {
+                self.st.mail_open = self.st.mail_open.saturating_sub(1);
+            }
             // A carried update (`mark - handoff carried= shed= epoch=`): the
             // successor's epoch, and nothing else changes. Its open runs,
             // turns and steps stay open in every fold, a remote one too (the

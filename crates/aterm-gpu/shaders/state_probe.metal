@@ -36,20 +36,17 @@ struct Probe {
     float2 pad;    // 32 bytes total; every member <=16B and naturally aligned
 };
 
-// Emits `u.color` verbatim, with no dependence on position. What lands in the
-// destination is then purely a function of the fixed-function state under test:
-// the blend factors, the write mask, and whether the fragment was rasterized at
-// all (scissor and viewport).
+// Emits `u.color` regardless of position, so the destination depends only on the
+// state under test: blend, write mask, and whether the fragment rasterized
+// (scissor, viewport).
 fragment float4 fs_probe_const(ProbeOut in [[stage_in]],
                                constant Probe& u [[buffer(2)]]) {
     return u.color;
 }
 
-// Samples texture 0 through sampler 0 at the destination pixel's CENTRE. With a
-// destination larger than the source the sample lands off-centre inside a
-// source texel, which is the only condition under which a linear filter and a
-// nearest filter can disagree — `shimmer` samples at displaced sub-texel
-// positions for exactly this reason.
+// Samples texture 0 at the destination pixel's centre. A destination larger than
+// the source puts that sample off-centre in a source texel, the only case where
+// linear and nearest filters disagree.
 fragment float4 fs_probe_sample(ProbeOut in [[stage_in]],
                                 constant Probe& u [[buffer(2)]],
                                 texture2d<float> src [[texture(0)]],

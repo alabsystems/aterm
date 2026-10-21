@@ -1,10 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SEED PIN at publish time (`channel::seed::publish_refusals`) against a real trust
-//! origin in scratch git: publishing waits until origin main contains this cut's re-pin,
-//! pins this compiler through it (and the generated section byte for byte), its ledger
-//! names the re-pin's archive release, and that release exists.
+//! The seed pin at publish time (`channel::seed::publish_refusals`) against a real trust origin
+//! in scratch git: publishing waits until origin main contains this cut's re-pin, which pins
+//! this compiler (and the generated section byte for byte), its ledger names the re-pin's
+//! archive release, and that release exists.
 
 use std::path::{Path, PathBuf};
 

@@ -1,14 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The one place the engine's RFC 8089 URI-path cwd becomes a NATIVE path.
+//! Converts the engine's RFC 8089 URI-path cwd to a native path.
 //!
-//! `handle_osc_7` in `aterm-core` parses `file:///C:/Users//m6-an` and stores the
-//! bare decoded URI path — `/C:/Users//m6-an`. That is not an oversight: RFC 8089
-//! says the path component of a `file:` URI on a drive-letter system carries a
-//! leading `/` before the drive, and `aterm-core` is deliberately platform-free
-//! (it also targets wasm, where "drive letter" is meaningless). Its comments say
-//! outright that deciding what the path means locally is the consumer's job.
+//! `handle_osc_7` in `aterm-core` stores the decoded URI path of `file:///C:/Users//x`, which is
+//! `/C:/Users//x`: the engine is platform-free (it also targets wasm), and its stored cwd must not
+//! differ by host platform, or a cast recorded on Windows would decode differently on macOS. So
+//! the GUI converts once, at its boundary, through [`ReportedCwd::native_working_directory`].
+//! Unconverted on Windows, `Command::current_dir("/C:/Users//x")` names a `C:` directory under the
+//! current drive's root.
 //!
 //! aterm-gui is that consumer, and it was not doing the job: on Windows the
 //! `/C:/Users//m6-an` string went straight to the tab strip, the tab tooltip,
@@ -60,16 +60,9 @@ use std::borrow::Cow;
 
 use aterm_core::terminal::Terminal;
 
-/// The GUI's view of a terminal's shell-reported working directory: the engine
-/// value, converted to a native path for the host platform.
-///
-/// An extension trait rather than a free function at each call site so the
-/// conversion cannot be forgotten by a reader who sees only
-/// `current_working_directory()` and assumes it is already usable. Returns
-/// [`Cow`] because the overwhelmingly common case — every path on macOS/Linux,
-/// and an already-native `C:\…` on Windows — borrows the engine's own string
-/// with no allocation, which matters: the tab-label refill runs per tab per
-/// repaint-fingerprint recompute and is written to avoid per-frame `String`s.
+/// The GUI's view of a terminal's shell-reported working directory: the engine value as a
+/// native path. An extension trait so a caller reaches the cwd through the conversion. Returns
+/// [`Cow`] so the common untouched path borrows: the tab-label refill avoids per-frame `String`s.
 pub(crate) trait ReportedCwd {
     /// The shell-reported cwd as a native path, or `None` if never reported.
     fn native_working_directory(&self) -> Option<Cow<'_, str>>;
@@ -169,8 +162,10 @@ fn netbios_name() -> Option<&'static str> {
 /// illegible for no gain. A WSL shell reports its drives as `/mnt/c/…`, which
 /// names no drive here.
 ///
-/// No percent-decoding happens here; `parse_file_uri` already did it, and
-/// decoding twice would turn a directory literally named `100%25` into `100%`.
+/// Everything else is returned unchanged: a POSIX path from a WSL or SSH shell, and an
+/// already-native `C:\Users\x` (the cwd also comes from the spawn cwd or a restore manifest),
+/// which makes the function idempotent. No percent-decoding: `parse_file_uri` already did it,
+/// and a second pass would turn `100%25` into `100%`.
 #[must_use]
 pub(crate) fn native_path(path: &str) -> Cow<'_, str> {
     native_path_reported(path, || true)
@@ -250,21 +245,16 @@ fn msys_drive(path: &str) -> Option<(char, &str)> {
 /// The drive letter of a `/C:/…`-shaped URI path, or `None` for any other
 /// string.
 ///
-/// The shape test is strict on purpose. Byte 3 must be a separator or the end
-/// of the string, so `/C:extra` — a POSIX directory whose name merely STARTS
-/// with a drive-looking prefix — is not mistaken for a drive root. The letter
-/// must be ASCII alphabetic: `/1:/x` is not a drive, and a non-ASCII leading
-/// char must not be sliced through mid-codepoint (hence the byte comparisons,
-/// which only ever accept ASCII before indexing at 3).
+/// Byte 3 must be a separator or the end, so the POSIX directory `/C:extra` is not a drive
+/// root. The letter must be ASCII alphabetic; comparing bytes before indexing at 3 never
+/// slices through a multi-byte char.
 #[cfg(windows)]
 fn drive_letter_uri(path: &str) -> Option<char> {
     let bytes = path.as_bytes();
     if bytes.len() < 3 || bytes[0] != b'/' || !bytes[1].is_ascii_alphabetic() {
         return None;
     }
-    // RFC 8089 §F.2 keeps the legacy `|` drive separator alive: pre-RFC-3986
-    // producers wrote `file:///C|/dir` because `:` was not yet allowed in a
-    // path segment. Accepting it costs one byte compare.
+    // RFC 8089 §F.2: pre-RFC-3986 producers wrote the legacy `file:///C|/dir`.
     if bytes[2] != b':' && bytes[2] != b'|' {
         return None;
     }
@@ -281,15 +271,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn drive_letter_uri_path_becomes_a_native_windows_path() {
-        // The reported defect, verbatim: the shell emits `file:///C:/Users//x`,
-        // the engine stores the RFC 8089 path, and the tab strip must show a
-        // path a user could paste into Explorer.
         assert_eq!(native_path("/C:/Users//x"), "C:\\Users\\x");
         assert_eq!(native_path("/c:/Users//x"), "c:\\Users\\x");
         // Legacy `|` separator (RFC 8089 §F.2).
         assert_eq!(native_path("/C|/Users//x"), "C:\\Users\\x");
-        // Drive root, with and without the trailing separator: both are the
-        // root, and a bare `C:` would instead mean "current dir on drive C".
+        // Drive root, with and without the trailing separator.
         assert_eq!(native_path("/C:/"), "C:\\");
         assert_eq!(native_path("/C:"), "C:\\");
     }
@@ -297,26 +283,20 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_already_native_windows_path_passes_through_unchanged() {
-        // cwd does not only come from OSC 7 — the spawn cwd and the restore
-        // manifest hand us native paths — so the conversion must be idempotent
-        // and must not double-convert.
+        // The spawn cwd and restore manifest hand over native paths: idempotent.
         assert_eq!(native_path("C:\\Users\\x"), "C:\\Users\\x");
         assert_eq!(
             native_path(native_path("/C:/Users//x").as_ref()),
             "C:\\Users\\x"
         );
-        // Forward slashes with no leading slash are already usable on Windows
-        // and are not a URI path; leaving them alone keeps the rule "only a
-        // LEADING slash signals RFC 8089" exact.
+        // Only a leading slash marks an RFC 8089 path.
         assert_eq!(native_path("C:/Users//x"), "C:/Users//x");
     }
 
     #[cfg(windows)]
     #[test]
     fn a_unc_payload_keeps_its_leading_double_slash() {
-        // `handle_osc_7` queues a non-local host as `//host/share/dir`. The
-        // double slash IS the network-path marker: strip or halve it and the
-        // path silently becomes a local one. Only the separators change.
+        // The double slash is the network-path marker; only separators change.
         assert_eq!(native_path("//server/share"), "\\\\server\\share");
         assert_eq!(native_path("//server/share/dir"), "\\\\server\\share\\dir");
         assert_eq!(native_path("\\\\server\\share"), "\\\\server\\share");
@@ -325,9 +305,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn non_drive_shaped_paths_are_left_alone_on_windows_too() {
-        // A WSL or SSH shell reporting a POSIX cwd into a Windows aterm: not a
-        // drive, so not our business. `/C:extra` is a directory whose name
-        // merely starts like a drive.
         assert_eq!(native_path("/home/user/proj"), "/home/user/proj");
         assert_eq!(native_path("/C:extra/x"), "/C:extra/x");
         assert_eq!(native_path("/1:/x"), "/1:/x");
@@ -481,10 +458,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_drive_rewrite_never_runs_on_unix() {
-        // THE load-bearing test. `mkdir '/C:'` is legal on macOS and Linux, and
-        // a shell inside it reports exactly this. Rewriting it to `C:\foo`
-        // would point every consumer — spawn-in-cwd, Copy CWD, the restore
-        // manifest — at a directory that does not exist.
+        // `/C:` is a legal directory on unix; rewriting it would point every
+        // consumer at a path that does not exist.
         assert_eq!(native_path("/C:/foo"), "/C:/foo");
         assert_eq!(native_path("/C:/Users//x"), "/C:/Users//x");
         assert_eq!(native_path("/C|/foo"), "/C|/foo");
@@ -498,8 +473,7 @@ mod tests {
 
     #[test]
     fn conversion_is_borrow_only_for_paths_it_does_not_touch() {
-        // The hot tab-label path must not allocate per frame for the ordinary
-        // case; `Cow::Borrowed` is the observable proof.
+        // The tab-label refill must not allocate for an untouched path.
         assert!(matches!(
             native_path("/Users//x"),
             std::borrow::Cow::Borrowed(_)

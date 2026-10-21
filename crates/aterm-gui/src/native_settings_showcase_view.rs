@@ -4,29 +4,52 @@
 //! Settings ▸ Themes' LAYOUT: the chooser, the demo and the strip, in one of
 //! three shapes.
 //!
-//! * **Beside** (a content column of 640pt or more): the chooser panel on
-//!   the left (256pt wide from 900pt, 232pt below), the demo filling the
-//!   rest, and the strip under the demo. The chooser's filter and footer are
-//!   pinned inside the panel; only its list scrolls.
-//! * **Short** (narrower, where stacking would leave the chooser's list
-//!   fewer than [`SHORT_ROWS`] rows and the demo beside the chooser still
-//!   holds [`DEMO_LEAST_WIDTH`]): Beside's columns, the chooser 232pt, its
-//!   list — footer included, as stacked — the one thing that scrolls, and
-//!   the columns' height snapped down to whole rows of that list. (The
-//!   review of Settings at the default window, 2026-10-20: 80×24 stacked the
-//!   demo over a list that showed a row and a half.)
+//! * **Beside** (a content column of 640pt or more, where the list between
+//!   the chooser's pinned filter and footer holds [`SHORT_ROWS`] whole rows):
+//!   the chooser panel on the left (256pt wide from 900pt, 232pt below, as
+//!   wide as the Customize sheet's colour rows on one line where that is
+//!   more and the demo keeps [`DEMO_LEAST_WIDTH`]: [`panel_width`]), the
+//!   demo filling the rest, and the strip under the demo. The chooser's
+//!   filter and footer are pinned inside the panel; only its list scrolls.
+//! * **Short** (Beside's columns where that list would hold fewer rows; or a
+//!   narrower column where stacking would leave the chooser's list fewer
+//!   than [`SHORT_ROWS`] rows and the demo beside a chooser of 232pt, or
+//!   narrower down to where its rows keep their slab ([`short_chooser`]),
+//!   holds [`DEMO_LEAST_WIDTH`]): the chooser beside the demo, its list —
+//!   footer included, as stacked — the one thing that scrolls. (The review
+//!   of Settings at the default window, 2026-10-20: 80×24 stacked the demo
+//!   over a list that showed a row and a half.)
 //! * **Stacked** (narrower still, or tall): the demo pinned at the top (38%
-//!   of the body, at least 180pt and at most ten rows, six on a short
-//!   window, fewer where six would leave the chooser no whole stop), the
-//!   strip under it, and the chooser panel below, whose list — footer
-//!   included — is the one thing that scrolls.
+//!   of the body, at least 180pt and at most ten rows, six where ten would
+//!   leave the chooser's list fewer than [`SHORT_ROWS`] rows, fewer where six
+//!   would leave the chooser no whole stop), the strip under it, and the
+//!   chooser panel below, whose list — footer included — is the one thing
+//!   that scrolls.
+//!
+//! EVERY SHAPE IS WHOLE ROWS TALL: the chooser's panel is snapped down to
+//! whole rows of its list (beside the demo, both columns; stacked, the panel
+//! under it, never under its least), the rest of the body the page's margin
+//! under them, and that list (or the Customize sheet's, in its place) draws
+//! only the stops whole in its room ([`scroll::ListFoot::Whole`]), so no row
+//! stands cut at either edge of the list on any screen — a 40pt Community
+//! disclosure, a NEEDS ATTENTION row or the sheet's 38pt rows included — and
+//! a section's caption stands only over a whole row of its own. (Stacked
+//! lists ended on a peek: at 70x24 the last screen cut "Follow system
+//! light/dark" under the filter, at 80x37 BUILT IN stood over a cut GitHub
+//! Light, and at 80x39 the sheet's PALETTE caption hid its first chips.)
+//! The shape changes once as the window grows taller (Stacked where nothing
+//! fits beside, then Short, then Beside or Stacked) and never shows fewer
+//! whole rows as it grows wider.
 //!
 //! The strip is reserved at one height for every state (two lines of words
 //! beside its buttons, or, where they cannot share a line, over them), so
 //! nothing moves when a trial starts or ends. Every right edge of a scrolling column stops
 //! [`THUMB_GUTTER`] short of the column's edge.
 
-use super::customize::{caption_height, colour_rows_least_column, sheet_blocks, sheet_list_least};
+use super::customize::{
+    caption_height, colour_rows_least_column, colour_rows_on_one_line, sheet_blocks,
+    sheet_list_least,
+};
 use super::*;
 use crate::settings_preview::theme_card::{
     SLAB_HEIGHT, SLAB_NARROW_WIDTH, SLAB_WIDTH, contrast_grade,
@@ -173,7 +196,7 @@ enum Shape {
     /// The chooser `chooser` wide beside the demo.
     Beside { chooser: f32 },
     /// The chooser `chooser` wide beside the demo on a short window, its
-    /// footer its list's last rows, the columns whole rows of that list tall.
+    /// footer its list's last stops.
     Short { chooser: f32 },
     /// The demo and strip over the chooser.
     Stacked,
@@ -199,26 +222,50 @@ impl Shape {
 /// [`Shape::Short`] for a `page_width` column too narrow for
 /// [`Shape::Beside`] whose body is `room` tall, where the demo and strip
 /// stacked over the chooser would leave its list fewer than [`SHORT_ROWS`]
-/// rows, the demo beside the chooser keeps [`DEMO_LEAST_WIDTH`], and both fit
-/// there ([`beside_fits`]); else [`Shape::Stacked`].
+/// rows ([`stacked_demo`]), a chooser beside the demo keeps it
+/// [`DEMO_LEAST_WIDTH`] ([`short_chooser`]), and both fit there
+/// ([`beside_fits`]); else [`Shape::Stacked`].
+///
+/// ONE MEASURE, SO ONE CHANGE: the list is measured under the demo the
+/// Stacked shape would draw, which gives up rows at this same four-row line,
+/// so the list grows with the window and the page is Short below one height
+/// and Stacked above it. (Measured under a demo that dropped to six rows
+/// only below three, the page at 80 columns went Short, Stacked, Short and
+/// Stacked again between 34 and 39 lines, and 37 lines showed nine rows
+/// beside the demo where 39 showed two under it.)
 fn short_or_stacked(
     state: &SettingsViewState,
     page_width: f32,
     room: f32,
     frame: Option<&SettingsPreviewSpec>,
 ) -> Shape {
-    let chooser = CHOOSER_MEDIUM * settings_text_scale().clamp(1.0, 1.25);
+    let Some(chooser) = short_chooser(state, page_width) else {
+        return Shape::Stacked;
+    };
     let (_, strip) = strip_node(state, page_width);
-    let demo = stacked_demo(room, strip, frame);
+    let demo = stacked_demo(state, room, strip, frame);
     let list = stacked_rest(room, demo, strip) - short_head(state);
-    if list < SHORT_ROWS * row_height()
-        && page_width - chooser - COLUMN_GAP >= DEMO_LEAST_WIDTH
+    if list + 0.01 < SHORT_ROWS * row_height()
         && beside_fits(state, chooser, page_width, room, frame)
     {
         Shape::Short { chooser }
     } else {
         Shape::Stacked
     }
+}
+
+/// The chooser's width on a short page `page_width` wide: 232pt, or less
+/// where that would leave the demo beside it narrower than
+/// [`DEMO_LEAST_WIDTH`], so long as its rows keep the narrow slab beside a
+/// name's floor ([`slab_column`]); `None` where they would not. (Where the
+/// sidebar comes, at 106 columns, the page is 522pt: 232pt left the demo
+/// 274pt, and the page stacked a one-line demo over a row and a cut, between
+/// a side-by-side 105 and 108.)
+fn short_chooser(state: &SettingsViewState, page_width: f32) -> Option<f32> {
+    let chooser = (CHOOSER_MEDIUM * settings_text_scale().clamp(1.0, 1.25))
+        .min(page_width - COLUMN_GAP - DEMO_LEAST_WIDTH);
+    let rows = chooser - 2.0 * PANEL_INSET - THUMB_GUTTER;
+    slab_column(state, rows, chooser_is_narrow(chooser)).map(|_| chooser)
 }
 
 /// The chooser's height over its list where its filter (and the Dark | Light
@@ -231,6 +278,26 @@ fn short_head(state: &SettingsViewState) -> f32 {
     2.0 * PANEL_INSET + chooser_pinned_height(state, pins)
 }
 
+/// The whole rows of the chooser's list a panel `height` tall holds under
+/// `pins`, round them its insets and what they pin.
+fn list_rows(state: &SettingsViewState, height: f32, pins: ChooserPins) -> f32 {
+    let around = 2.0 * PANEL_INSET + chooser_pinned_height(state, pins);
+    ((height - around + 0.01) / row_height()).floor().max(0.0)
+}
+
+/// THE COLUMNS BESIDE THE DEMO ARE WHOLE ROWS TALL: the chooser's height in
+/// a body `room` tall, its insets and what `pins` pins round the most whole
+/// rows of its list that fit there (one at the least), so no row stands cut
+/// at the chooser's foot; the rest of the body is the page's margin under
+/// the columns. Measured by the chooser's rows whatever the panel shows, so
+/// opening the Customize sheet in its place moves neither the demo nor the
+/// strip.
+fn whole_rows_height(state: &SettingsViewState, room: f32, pins: ChooserPins) -> f32 {
+    let around = 2.0 * PANEL_INSET + chooser_pinned_height(state, pins);
+    let rows = list_rows(state, room, pins).max(1.0);
+    (around + rows * row_height()).min(room)
+}
+
 /// The room a body `room` tall leaves the chooser under a stacked demo
 /// `demo` tall and the strip, `strip` tall.
 fn stacked_rest(room: f32, demo: f32, strip: f32) -> f32 {
@@ -239,12 +306,19 @@ fn stacked_rest(room: f32, demo: f32, strip: f32) -> f32 {
 
 /// The demo stacked over the chooser in a body `room` tall over a strip
 /// `strip` tall: 38% of the body, at least 180pt and at most ten rows, and
-/// six where fewer than three of the chooser's rows would show under it.
-fn stacked_demo(room: f32, strip: f32, frame: Option<&SettingsPreviewSpec>) -> f32 {
+/// six where those would leave the chooser's list (under its pinned filter)
+/// fewer than [`SHORT_ROWS`] rows — the line [`short_or_stacked`] decides
+/// by.
+fn stacked_demo(
+    state: &SettingsViewState,
+    room: f32,
+    strip: f32,
+    frame: Option<&SettingsPreviewSpec>,
+) -> f32 {
     let ten = frame.map_or(240.0, |frame| frame.demo_height(10));
     let six = frame.map_or(180.0, |frame| frame.demo_height(6));
     let demo = (room * 0.38).max(180.0).min(ten);
-    if stacked_rest(room, demo, strip) < panel_floor() {
+    if stacked_rest(room, demo, strip) - short_head(state) + 0.01 < SHORT_ROWS * row_height() {
         six.min(demo)
     } else {
         demo
@@ -283,45 +357,43 @@ pub(crate) fn themes_page(
     // ([`chooser_floor`]); a window too short for that (220×10 sat a 24pt
     // demo, less than its one row, over the strip) stacks them, where the
     // page gives up the demo's rows and, at the last, is one list.
+    let room = (body - used).max(0.0);
+    let pinned = ChooserPins {
+        head: true,
+        footer: true,
+    };
     let shape = match Shape::for_width(page_width) {
         Shape::Beside { chooser }
-            if !beside_fits(
-                state,
-                chooser,
-                page_width,
-                (body - used).max(0.0),
-                frame.as_ref(),
-            ) =>
+            if !beside_fits(state, chooser, page_width, room, frame.as_ref()) =>
         {
             Shape::Stacked
         }
-        Shape::Stacked => {
-            short_or_stacked(state, page_width, (body - used).max(0.0), frame.as_ref())
+        // FEWER THAN FOUR ROWS BETWEEN THE PINNED FILTER AND FOOTER: the
+        // footer joins the list's stops, in the same columns, so widening
+        // the window past Beside's width never trades whole rows for a
+        // pinned footer (at 24 lines, 123 columns showed one theme row and
+        // a cut one where 122 showed four whole).
+        Shape::Beside { chooser } if list_rows(state, room, pinned) < SHORT_ROWS => {
+            Shape::Short { chooser }
         }
+        Shape::Stacked => short_or_stacked(state, page_width, room, frame.as_ref()),
         shape => shape,
     };
     match shape {
         Shape::Beside { chooser } | Shape::Short { chooser } => {
-            let short = matches!(shape, Shape::Short { .. });
-            let room = (body - used).max(0.0);
-            // The short page's columns are whole rows of its list tall, so
-            // no row stands cut at the chooser's foot; the rest of the body
-            // is the page's margin under them.
-            let room = if short {
-                let head = short_head(state);
-                let rows = ((room - head) / row_height()).floor().max(1.0);
-                (head + rows * row_height()).min(room)
-            } else {
-                room
+            let pins = ChooserPins {
+                head: true,
+                footer: matches!(shape, Shape::Beside { .. }),
             };
-            let chooser = panel_width_beside(state, chooser, room);
+            let room = whole_rows_height(state, room, pins);
+            let chooser = panel_width(chooser, page_width);
             let demo_width = (page_width - chooser - COLUMN_GAP).max(0.0);
             let (strip_box, strip) = strip_node(state, demo_width);
             let demo_height = (room - DEMO_STRIP_GAP - strip).max(0.0);
             let left = if state.showcase.sheet_open {
                 sheet_panel(state, chooser, room, Vec::new())
             } else {
-                chooser_panel(state, chooser, room, short, Vec::new())
+                chooser_panel(state, chooser, room, shape, Vec::new())
             };
             let right = UiNode::new(
                 "settings/showcase/stage-column",
@@ -349,10 +421,9 @@ pub(crate) fn themes_page(
             );
         }
         Shape::Stacked => {
-            let room = (body - used).max(0.0);
             let (strip_box, strip) = strip_node(state, page_width);
             let rest = |room: f32, demo: f32| stacked_rest(room, demo, strip);
-            let mut demo_height = stacked_demo(room, strip, frame.as_ref());
+            let mut demo_height = stacked_demo(state, room, strip, frame.as_ref());
             // Where six rows still leave the chooser short of its filter and
             // one whole stop of its list, the demo gives up whole rows, down
             // to one: a stop taller than the list's room is drawn cut. (At
@@ -416,7 +487,7 @@ pub(crate) fn themes_page(
                     out.push(if state.showcase.sheet_open {
                         sheet_panel(state, page_width, room, lead)
                     } else {
-                        chooser_panel(state, page_width, room, true, lead)
+                        chooser_panel(state, page_width, room, Shape::Stacked, lead)
                     });
                 }
                 (spec, _) => {
@@ -424,10 +495,20 @@ pub(crate) fn themes_page(
                         out.push(demo_node(spec, demo_height));
                     }
                     out.push(strip_box);
+                    // Under the demo too the panel is whole rows of the
+                    // chooser's list tall, never under its least, the rest
+                    // the page's margin.
+                    let pins = ChooserPins {
+                        head: true,
+                        footer: false,
+                    };
+                    let panel_height = whole_rows_height(state, panel_height, pins)
+                        .max(least)
+                        .min(panel_height);
                     out.push(if state.showcase.sheet_open {
                         sheet_panel(state, page_width, panel_height, Vec::new())
                     } else {
-                        chooser_panel(state, page_width, panel_height, true, Vec::new())
+                        chooser_panel(state, page_width, panel_height, Shape::Stacked, Vec::new())
                     });
                 }
             }
@@ -436,14 +517,30 @@ pub(crate) fn themes_page(
     out
 }
 
-/// The panel's width beside the demo, `room` tall: the chooser's, or the
-/// open sheet's in its place, as wide or wider where its colour rows need it
-/// to hold every name whole ([`sheet_panel_width`]).
-fn panel_width_beside(state: &SettingsViewState, chooser: f32, room: f32) -> f32 {
-    if state.showcase.sheet_open {
-        sheet_panel_width(state, chooser, room)
-    } else {
+/// THE PANEL BESIDE THE DEMO, the chooser's or the Customize sheet's in its
+/// place, on a `page_width` page: `chooser` wide, or as wide as the sheet's
+/// colour rows need to hold each on one line with Reset's place
+/// ([`colour_rows_least_column`], with the panel's insets and the thumb's
+/// gutter) where that is more and still leaves the demo
+/// [`DEMO_LEAST_WIDTH`].
+///
+/// ONE WIDTH, WHATEVER THE PANEL SHOWS OR THE SHEET HOLDS: the chooser takes
+/// the sheet's width too, so opening Customize, setting a colour, resetting
+/// the last one or the sheet's list starting to scroll never moves the demo
+/// or the strip. Where the demo cannot spare that width, the sheet keeps the
+/// chooser's and each colour row names its colour over its field
+/// ([`super::customize::customize_row`]), all of it whole. (The short page's
+/// chooser narrows to leave the demo its 40 cells: at 72x24 it is 192pt,
+/// and the sheet that took 224.2pt for its rows on one line left the demo
+/// 255.8pt, moved right, its lines wrapped; a sheet as wide as its rows
+/// needed only once a colour was set moved the demo 18pt at the first set
+/// and back at the last reset.)
+fn panel_width(chooser: f32, page_width: f32) -> f32 {
+    let sheet = colour_rows_least_column() + 2.0 * PANEL_INSET + THUMB_GUTTER;
+    if chooser + 0.01 >= sheet || sheet > page_width - COLUMN_GAP - DEMO_LEAST_WIDTH + 0.01 {
         chooser
+    } else {
+        sheet
     }
 }
 
@@ -459,21 +556,16 @@ fn beside_fits(
     frame: Option<&SettingsPreviewSpec>,
 ) -> bool {
     let demo = frame.map_or(0.0, |frame| frame.demo_height(1));
-    let panel_width = panel_width_beside(state, chooser, room);
+    let panel_width = panel_width(chooser, page_width);
     let (_, strip) = strip_node(state, (page_width - panel_width - COLUMN_GAP).max(0.0));
     let panel = if state.showcase.sheet_open {
         sheet_floor(state, panel_width)
     } else {
-        let inner = (chooser - 2.0 * PANEL_INSET).max(0.0);
-        let rows = chooser_rows_tallest(state, inner, chooser_is_narrow(chooser));
+        let inner = (panel_width - 2.0 * PANEL_INSET).max(0.0);
+        let rows = chooser_rows_tallest(state, inner, chooser_is_narrow(panel_width));
         chooser_floor(state, rows)
     };
     room + 0.5 >= demo + DEMO_STRIP_GAP + strip && room + 0.5 >= panel
-}
-
-/// The least panel that shows its filter and three rows.
-fn panel_floor() -> f32 {
-    2.0 * PANEL_INSET + field_height() + 6.0 + 3.0 * row_height()
 }
 
 /// The least stacked chooser: its filter (and the Dark | Light segment
@@ -859,7 +951,6 @@ fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
     let showcase = &state.showcase;
     let configured = state.configured_theme_id();
     let in_use = showcase.label_of(&configured);
-    let pending = state.config_key_pending(prefs::EDIT_THEME);
     let button_height = strip_button_height();
     // Each button hugs its own words: a button wider than its label reads
     // as a field, its words pushed to one side.
@@ -934,15 +1025,20 @@ fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                 (in_use.clone(), detail, live)
             }
             ShowcaseTrial::Trying { id } | ShowcaseTrial::Keeping { id, .. } => {
+                // A Keep on its way says so; its controls take every press
+                // meanwhile (Revert takes it back, Keep colours only follows).
                 let keeping = matches!(showcase.trial, ShowcaseTrial::Keeping { .. })
                     || showcase.pending_keep.is_some();
                 let label = showcase.label_of(id);
+                // What the trial replaces: under a Keep on its way, what
+                // aterm.toml holds beneath it, not the kept theme it shows.
+                let in_use = showcase.label_of(&state.theme_id_under_trial());
                 let card = showcase.card(id);
                 let typed = card.and_then(|card| card.typography.clone());
                 let community = card.is_some_and(|card| card.section == Section::Community);
                 let trial = state.trial_typography(id);
                 // Keep ▾ only where the colours alone can be kept.
-                let split = !keeping && trial.keeps_colours_only();
+                let split = trial.keeps_colours_only();
                 let mut was = format!("was {in_use}");
                 if following {
                     was = format!("for {} \u{b7} {was}", appearance_label(side));
@@ -963,7 +1059,6 @@ fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                         "Keep colors only",
                         StyleRef::Secondary,
                         ControlState {
-                            enabled: !pending,
                             focused: focused(state, SHOWCASE_KEEP_COLOURS),
                             ..ControlState::default()
                         },
@@ -976,7 +1071,6 @@ fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                     "Revert",
                     StyleRef::Secondary,
                     ControlState {
-                        enabled: !keeping,
                         focused: focused(state, SHOWCASE_REVERT),
                         ..ControlState::default()
                     },
@@ -992,8 +1086,6 @@ fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                     "Keep",
                     StyleRef::Primary,
                     ControlState {
-                        enabled: !keeping && !pending,
-                        busy: keeping,
                         focused: focused(state, SHOWCASE_KEEP),
                         ..ControlState::default()
                     },
@@ -1194,7 +1286,10 @@ fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
     // each no wider than it, its words fitted to the button it draws; the
     // strip keeps as many lines as every trial's buttons take, so a trial
     // starting or the highlight moving never changes its height.
-    let mut button_lines: Vec<Vec<UiNode>> = Vec::new();
+    // A button's words wrap to it where its line is narrower than they are
+    // ([`button_words_in`]), its line as tall as they take — never cut
+    // ("Custo…" at 2× text in a 22-column window).
+    let mut button_lines: Vec<(Vec<UiNode>, f32)> = Vec::new();
     let mut used = f32::INFINITY;
     for mut node in buttons {
         let own = match node.layout.width {
@@ -1202,6 +1297,7 @@ fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
             _ => width,
         };
         node.layout.width = Length::Fixed(own);
+        let mut tall = button_height;
         if let UiContent::Button(control) = &mut node.content
             && let Some(words) = control
                 .spec
@@ -1209,42 +1305,72 @@ fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                 .clone()
                 .filter(|words| !words.is_empty())
         {
-            control.spec.visual_label = Some(crate::native_ui::fit_native_button_label(
-                &words,
-                crate::native_ui::text_button_label_room(&control.spec, own),
-            ));
+            let (words, lines) = button_words_in(&control.spec, &words, &[], own);
+            control.spec.visual_label = Some(words);
+            tall = crate::native_ui::native_button_height_for_lines(lines, button_height);
         }
+        node.layout.height = Length::Fixed(tall);
         match button_lines.last_mut() {
-            Some(line) if used + gap + own <= width + 0.01 => {
+            Some((line, height)) if used + gap + own <= width + 0.01 => {
                 used += gap + own;
+                *height = height.max(tall);
                 line.push(node);
             }
             _ => {
                 used = own;
-                button_lines.push(vec![node]);
+                button_lines.push((vec![node], tall));
             }
         }
     }
-    let lines = button_lines.len().max(flow_lines(
+    // As many lines as every trial's buttons take, so a trial starting or
+    // the highlight moving never changes the strip's height.
+    let drawn = button_lines
+        .iter()
+        .map(|(_, height)| STRIP_LINE_GAP + height)
+        .sum::<f32>();
+    let reserved = flow_lines(
         &[hug_width("Revert"), hug_width("Keep"), button_height],
         width,
         gap,
-    ));
-    let height = words_height + lines as f32 * (STRIP_LINE_GAP + button_height);
+    ) as f32
+        * (STRIP_LINE_GAP + button_height);
+    let height = words_height + drawn.max(reserved);
     let mut children = vec![texts];
-    children.extend(button_lines.into_iter().enumerate().map(|(index, line)| {
-        UiNode::new(
-            format!("settings/showcase/status/actions/line-{index}"),
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(
-            Layout::row()
-                .width(Length::Fill)
-                .height(Length::Fixed(button_height))
-                .gap(gap),
-        )
-        .children(line)
-    }));
+    children.extend(
+        button_lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, (line, tall))| {
+                UiNode::new(
+                    format!("settings/showcase/status/actions/line-{index}"),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(
+                    Layout::row()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(tall))
+                        .gap(gap),
+                )
+                .children(line)
+            }),
+    );
+    // The lines a trial's buttons would take and this state's do not: a
+    // line of their own, so a strip the list sets line by line
+    // ([`lead_item`]) keeps the height too.
+    if reserved > drawn + 0.01 {
+        children.push(
+            UiNode::new(
+                "settings/showcase/status/actions/reserve",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(reserved - drawn - STRIP_LINE_GAP)),
+            )
+            .paint_only(),
+        );
+    }
     (status(height, Layout::column(), children), height)
 }
 
@@ -1280,12 +1406,16 @@ const fn appearance_label(side: aterm_types::Appearance) -> &'static str {
     }
 }
 
-/// THE CHOOSER: the filter, the Dark | Light segment while the theme follows
-/// the system, the list of rows, and the footer — pinned under the list
-/// beside the demo, the list's last rows when `stacked` (under the demo, or
-/// beside it on a short page: [`Shape::Short`]) — with `lead` (the
-/// demo and the strip, on a page too short to pin them) the list's first
-/// stops.
+/// THE CHOOSER in the page's `shape`: the filter, the Dark | Light segment
+/// while the theme follows the system, the list of rows, and the footer —
+/// pinned under the list beside the demo ([`Shape::Beside`]), else the
+/// list's last rows (under the demo, or beside it on a short page:
+/// [`Shape::Short`]) — with `lead` (the demo and the strip, on a page too
+/// short to pin them) the list's first stops. The list draws only its whole
+/// stops ([`scroll::ListFoot::Whole`]): the panel is whole rows tall
+/// ([`whole_rows_height`]), and a stop taller than a row leaves the rest of
+/// the room blank rather than a row cut at its foot, or under the filter
+/// and a caption on the last screen.
 ///
 /// MEASURED, NEVER CUT: the list's room holds its tallest stop whole, or
 /// what is pinned around it joins it — beside the demo the footer first,
@@ -1296,9 +1426,10 @@ fn chooser_panel(
     state: &SettingsViewState,
     panel_width: f32,
     height: f32,
-    stacked: bool,
+    shape: Shape,
     lead: Vec<(UiNode, f32)>,
 ) -> UiNode {
+    let stacked = !matches!(shape, Shape::Beside { .. });
     let inner = (panel_width - 2.0 * PANEL_INSET).max(0.0);
     let narrow = chooser_is_narrow(panel_width);
     let forms: &[ChooserPins] = if !lead.is_empty() {
@@ -1327,6 +1458,8 @@ fn chooser_panel(
     let room_for = |pins: ChooserPins| {
         (height - 2.0 * PANEL_INSET - chooser_pinned_height(state, pins)).max(0.0)
     };
+    // A footer whose words take more than a line each is listed, not pinned.
+    let footer_pins = footer_is_one_line(state, inner, narrow);
     let blocks = list_blocks(state, inner, narrow);
     // The rows a trial can land on, in order: the arrows, Home, End and the
     // page keys walk them.
@@ -1334,7 +1467,14 @@ fn chooser_panel(
         .iter()
         .filter_map(|(_, _, slug)| slug.clone())
         .collect();
-    let rows = chooser_rows_tallest(state, inner, narrow);
+    // The tallest of its rows, the footer's among them where it is listed.
+    let tallest_row = chooser_rows_tallest(state, inner, narrow);
+    let rows = tallest_row.max(
+        footer_rows(state, inner, narrow)
+            .iter()
+            .map(|(_, height)| *height)
+            .fold(0.0, f32::max),
+    );
     // The tallest stop of the lead in a list `room` tall (the strip listed
     // line by line keeps its words with its buttons where they fit).
     let lead_items: Vec<ListItem> = lead
@@ -1346,6 +1486,7 @@ fn chooser_panel(
     let pins = forms
         .iter()
         .copied()
+        .filter(|pins| footer_pins || !pins.footer)
         .find(|&pins| {
             let room = room_for(pins);
             room + 0.5 >= chooser_tallest_stop(state, pins, rows).max(lead_tallest(room))
@@ -1357,10 +1498,13 @@ fn chooser_panel(
         .showcase
         .page_rows
         .set(((room / row_height()).floor() as usize).max(1));
-    // A list whose room cannot hold a caption over a row (the smallest
-    // windows, the demo down to one row) lists its rows alone: a repeated
-    // caption would make every stop taller than the screen.
-    let captions = room + 0.5 >= caption_height() + SECTION_ABOVE + row_height();
+    // A list whose room cannot hold a caption over its tallest row (the
+    // smallest windows, the demo down to one row) lists its rows alone: a
+    // repeated caption would make that row's stop taller than the screen. A
+    // name wrapped to two lines makes a row taller than one line's
+    // (`row_height`), and a caption over it cut "Catppuccin Mocha" on every
+    // screen at 1.5× text in a 30-column window.
+    let captions = room + 0.5 >= caption_height() + SECTION_ABOVE + tallest_row.max(row_height());
     let items_at = |blocks, width: f32| {
         chooser_items(state, blocks, width, narrow, pins, lead.clone(), captions)
     };
@@ -1373,15 +1517,7 @@ fn chooser_panel(
         let width = (inner - THUMB_GUTTER).max(0.0);
         items = items_at(list_blocks(state, width, narrow), width);
     }
-    let mut list = scroll::list_page_whole(
-        state,
-        SHOWCASE_LIST,
-        "Themes",
-        items,
-        room,
-        0.0,
-        scroll::Overhang::NONE,
-    );
+    let mut list = scroll::list_page_whole(state, SHOWCASE_LIST, "Themes", items, room, 0.0);
     set_role(&mut list, SHOWCASE_LIST, SemanticRole::ListBox);
     // A section's card frames its caption and rows for the list's caption
     // rule, and is no node of its own in the tree: the rows stay the list
@@ -1429,47 +1565,28 @@ const FOLLOW_SYSTEM_LABEL: &str = "Follow system light/dark";
 /// The Customize sheet's title, pinned over its list.
 pub(crate) const SHEET_TITLE: &str = "Custom colors for every theme";
 
+/// The title's words in a sheet too narrow for [`SHEET_TITLE`] whole (the
+/// short page's chooser at 72 columns): what the colors do, still whole.
+const SHEET_TITLE_SHORT: &str = "Colors for every theme";
+
+/// The sheet's title as a column `width` wide paints it: whole, else its
+/// shorter words ([`SHEET_TITLE_SHORT`]), else those fitted.
+fn sheet_title_words(width: f32) -> &'static str {
+    let fits = |words: &str| {
+        text_width(words, SemanticRole::Heading, StyleRef::Plain)
+            <= width + crate::native_ui::TEXT_FIT_SLACK
+    };
+    if fits(SHEET_TITLE) {
+        SHEET_TITLE
+    } else {
+        SHEET_TITLE_SHORT
+    }
+}
+
 /// The room the sheet's list has in a panel `height` tall: under its pinned
 /// title ([`sheet_panel`]).
 fn sheet_list_room(height: f32) -> f32 {
     (height - 2.0 * PANEL_INSET - field_height() - PANEL_GAP).max(0.0)
-}
-
-/// Whether the sheet's blocks, laid in an `inner` column, outgrow its list's
-/// `room`, so the list scrolls and its rows stop [`THUMB_GUTTER`] short.
-fn sheet_scrolls(state: &SettingsViewState, inner: f32, room: f32) -> bool {
-    let span: f32 = sheet_blocks(state, inner, room)
-        .iter()
-        .map(|(_, height)| height + PANEL_GAP)
-        .sum::<f32>()
-        - PANEL_GAP;
-    span > room + 0.01
-}
-
-/// The open sheet's width beside the demo, `height` tall: the chooser's, or
-/// what its colour rows hold whole in ([`colour_rows_least_column`]) with
-/// the panel's insets and, while its list scrolls, the thumb's gutter, where
-/// that is more.
-fn sheet_panel_width(state: &SettingsViewState, chooser: f32, height: f32) -> f32 {
-    let room = sheet_list_room(height);
-    let rows = colour_rows_least_column(state);
-    let column = |panel: f32| {
-        let inner = (panel - 2.0 * PANEL_INSET).max(0.0);
-        if sheet_scrolls(state, inner, room) {
-            inner - THUMB_GUTTER
-        } else {
-            inner
-        }
-    };
-    if column(chooser) + 0.01 >= rows {
-        return chooser;
-    }
-    let panel = rows + 2.0 * PANEL_INSET;
-    if column(panel) + 0.01 >= rows {
-        panel
-    } else {
-        panel + THUMB_GUTTER
-    }
 }
 
 /// The chooser's blocks as list items: each captioned section (NEEDS
@@ -1529,10 +1646,14 @@ pub(in crate::native_settings) fn section_items(
 
 /// The Customize sheet in the chooser's place: its title pinned over its
 /// sections as one list, with `lead` (the demo and the strip, on a page too
-/// short to pin them) the list's first stops. Where the pinned title would
-/// leave the list less than its least ([`sheet_list_least`]), the title is
-/// the list's first stop instead, as the chooser's filter is: measured,
-/// never cut.
+/// short to pin them) the list's first stops, its screens ending on whole
+/// stops, as the chooser's do: the panel is whole rows of the chooser tall,
+/// not of the sheet, whose rows are 38pt apart under a caption (at 80×24 the
+/// last colour row on the sheet's first screen showed 20 of its 32pt; at
+/// 80x39, under the demo, the last screen's PALETTE hid its first chips). Where the
+/// pinned title would leave the list less than its least
+/// ([`sheet_list_least`]), the title is the list's first stop instead, as
+/// the chooser's filter is: measured, never cut.
 fn sheet_panel(
     state: &SettingsViewState,
     panel_width: f32,
@@ -1559,7 +1680,7 @@ fn sheet_panel(
     let title = |width: f32| {
         line(
             "settings/showcase/sheet-title",
-            &label,
+            sheet_title_words(width),
             SemanticRole::Heading,
             StyleRef::Plain,
             width,
@@ -1589,13 +1710,17 @@ fn sheet_panel(
         .map(|(_, height)| height + after + gap)
         .sum::<f32>()
         + if pin_title { 0.0 } else { title_height + gap };
+    // The colour rows' form is measured at the width they take while the
+    // list scrolls, whether or not it does: what the sheet holds never
+    // changes it.
+    let one_line = colour_rows_on_one_line((inner - THUMB_GUTTER).max(0.0));
     // An open picker is sized to be one stop of a screen of the list.
-    let probe = sheet_blocks(state, inner, room);
+    let probe = sheet_blocks(state, inner, room, one_line);
     let span: f32 = head_span + probe.iter().map(|(_, height)| height + gap).sum::<f32>() - gap;
     let scrolls = span > room + 0.01;
     let (width, blocks) = if scrolls {
         let width = inner - THUMB_GUTTER;
-        (width, sheet_blocks(state, width, room))
+        (width, sheet_blocks(state, width, room, one_line))
     } else {
         (inner, probe)
     };
@@ -1615,7 +1740,6 @@ fn sheet_panel(
         items,
         room,
         gap,
-        scroll::Overhang::NONE,
     );
     let mut children = Vec::with_capacity(2);
     if pin_title {
@@ -1813,7 +1937,12 @@ fn rule_node(key: &str) -> UiNode {
 }
 
 /// The footer's two rows: Follow system light/dark (Appearance's switch, by
-/// its name there), then Import… and the themes folder.
+/// its name there), then Import… and the themes folder. Each keeps its words
+/// whole in the chooser's column: the switch's label wraps beside it, and
+/// Import… and the folder's button go one under the other where they cannot
+/// share a line, a label wider than it on as many lines as it takes
+/// ([`button_lines`]) — the folder's button ran past the panel at 22
+/// columns, and the label read "Follo…" at 2× text.
 fn footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNode, f32)> {
     let height = field_height();
     let following = prefs::theme_mode(state.raw_value(prefs::EDIT_THEME).as_deref())
@@ -1838,7 +1967,6 @@ fn footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNo
             )
             .value(SemanticValue::Bool(following))
             .state(ControlState {
-                enabled: !state.config_key_pending(prefs::EDIT_THEME),
                 focused: focused(state, FOLLOW_SYSTEM),
                 ..ControlState::default()
             })
@@ -1849,76 +1977,111 @@ fn footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNo
     .layout(
         Layout::default()
             .width(Length::Fixed(switch_width))
-            .height(Length::Fill),
+            .height(Length::Fixed(height)),
     );
+    // THE NAME GOES OVER ITS SWITCH where a word of it would not be whole
+    // beside it, as a setting's row stacks: at 2× text in a 22-column window
+    // the 33pt beside the switch set "Follow system" a few letters a line
+    // ("F-" / "ol-" / "lo-" / "w" / "s-" ...), nine lines that made the
+    // footer 324pt, taller than the chooser's 188pt list, so it was on no
+    // screen whole.
+    let beside = (width - TEXT_INSET - switch_width - 6.0).max(0.0);
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Plain);
+    let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
+    let over = !pieces_fit(visible, beside, &measure);
+    let (label, label_height) = wrapped_words_node(
+        "settings/showcase/footer/follow-label",
+        visible,
+        (SemanticRole::Text, StyleRef::Plain),
+        if over {
+            (width - TEXT_INSET).max(0.0)
+        } else {
+            beside
+        },
+        footer_line_height(),
+    );
+    let (follow_height, layout) = if over {
+        (label_height + 4.0 + height, Layout::column().gap(4.0))
+    } else {
+        (height.max(label_height), Layout::row().gap(6.0))
+    };
+    let label = if !over && label_height < height {
+        label.layout(Layout::default().width(Length::Fill).height(Length::Fill))
+    } else {
+        label
+    };
     let follow = UiNode::new(
         "settings/showcase/footer/follow",
         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
     )
-    .layout(
-        Layout::row()
-            .height(Length::Fixed(height))
-            .gap(6.0)
-            .padding(Insets {
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: TEXT_INSET,
-            }),
-    )
-    .children(vec![
-        line(
-            "settings/showcase/footer/follow-label",
-            visible,
-            SemanticRole::Text,
-            StyleRef::Plain,
-            (width - TEXT_INSET - switch_width - 6.0).max(0.0),
-            height,
-        )
-        .paint_only(),
-        switch,
-    ]);
+    .layout(layout.height(Length::Fixed(follow_height)).padding(Insets {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: TEXT_INSET,
+    }))
+    .children(vec![label.paint_only(), switch]);
     let folder_visual = if narrow { "Folder" } else { "Themes folder" };
-    let links = UiNode::new(
+    // Narrow, the two share one line where their words allow: "Import…" and
+    // "Folder" took 3pt more than a 234pt window's 178pt line at 1.5× text in
+    // the round-7 Linux lane's Noto Sans, so they went on two lines, a stop
+    // 88pt tall in the list's 84pt, whole on no screen. Its ellipsis is the
+    // painted words' only cut; the button's name keeps it.
+    let import_visual = if narrow { "Import" } else { "Import\u{2026}" };
+    let (links, links_height) = button_lines(
         "settings/showcase/footer/links",
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(Layout::row().height(Length::Fixed(height)).gap(4.0))
-    .children(vec![
-        button(
-            IMPORT,
-            "Import\u{2026}",
-            "Import\u{2026}",
-            StyleRef::Quiet,
-            ControlState {
-                enabled: crate::menu::local_file_picker_available(),
-                focused: focused(state, IMPORT),
-                ..ControlState::default()
-            },
-            Some(hug_width("Import\u{2026}")),
-        ),
-        button(
-            OPEN_FOLDER,
-            if narrow {
-                "Folder: open themes folder"
-            } else {
-                "Themes folder: open it"
-            },
-            folder_visual,
-            StyleRef::Quiet,
-            ControlState {
-                focused: focused(state, OPEN_FOLDER),
-                ..ControlState::default()
-            },
-            Some(hug_width(folder_visual)),
-        ),
-        UiNode::new(
-            "settings/showcase/footer/spacer",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-    ]);
-    vec![(follow, height), (links, height)]
+        vec![
+            button(
+                IMPORT,
+                "Import\u{2026}",
+                import_visual,
+                StyleRef::Quiet,
+                ControlState {
+                    enabled: crate::menu::local_file_picker_available(),
+                    focused: focused(state, IMPORT),
+                    ..ControlState::default()
+                },
+                None,
+            ),
+            button(
+                OPEN_FOLDER,
+                if narrow {
+                    "Folder: open themes folder"
+                } else {
+                    "Themes folder: open it"
+                },
+                folder_visual,
+                StyleRef::Quiet,
+                ControlState {
+                    focused: focused(state, OPEN_FOLDER),
+                    ..ControlState::default()
+                },
+                None,
+            ),
+        ],
+        width,
+        ButtonLines {
+            single: height,
+            least: 0.0,
+            slack: 1.0,
+            gap: 4.0,
+        },
+    );
+    vec![(follow, follow_height), (links, links_height)]
+}
+
+/// One line of the footer's wrapped label.
+fn footer_line_height() -> f32 {
+    20.0_f32.max(18.0 * settings_text_scale())
+}
+
+/// Whether the footer's rows are each one line, as a footer pinned under
+/// the list must be ([`footer_height`]): where its words need more, it is
+/// the list's last stops instead, which may be as tall as they take.
+fn footer_is_one_line(state: &SettingsViewState, width: f32, narrow: bool) -> bool {
+    footer_rows(state, width, narrow)
+        .iter()
+        .all(|(_, height)| *height <= field_height() + 0.01)
 }
 
 /// The list's blocks, in order, each with its height and — for a row a
@@ -1990,23 +2153,20 @@ fn list_blocks_for(
         if section != Some(card.section) {
             section = Some(card.section);
             if card.section == Section::Community && query.is_empty() {
-                blocks.push(pack_row(state, community_total, rows_before));
+                blocks.push(pack_row(state, community_total, rows_before, width));
             } else if let Some(caption) = card.section.caption_after_rows(rows_before) {
                 blocks.push(section_heading(card.section, caption, rows_before));
             }
         }
         let in_use = configured.eq_ignore_ascii_case(&card.id);
         let selected = highlighted.as_deref() == Some(card.slug.as_str());
-        blocks.push((
-            row_node(state, card, width, narrow, slab, in_use, selected),
-            row_height(),
-            Some(card.slug.clone()),
-        ));
+        let (row, height) = row_node(state, card, width, narrow, slab, in_use, selected);
+        blocks.push((row, height, Some(card.slug.clone())));
         rows_before = true;
     }
     // The disclosure stays while the section is closed, so it can open.
     if section != Some(Section::Community) && community_total > 0 && query.is_empty() {
-        blocks.push(pack_row(state, community_total, rows_before));
+        blocks.push(pack_row(state, community_total, rows_before, width));
     }
     if visible.is_empty() && !query.is_empty() {
         let height = caption_height();
@@ -2074,10 +2234,11 @@ fn pack_row(
     state: &SettingsViewState,
     count: usize,
     after_rows: bool,
+    width: f32,
 ) -> (UiNode, f32, Option<String>) {
     let above = if after_rows { SECTION_ABOVE } else { 0.0 };
     let open = state.showcase.pack_open;
-    let mut spec = ButtonSpec::new("Community").visual_label("Community");
+    let mut spec = ButtonSpec::new("Community");
     spec.description = Some(format!(
         "{}: tried without a file, added to your themes folder on Keep",
         count_noun(
@@ -2086,22 +2247,28 @@ fn pack_row(
             "themes from the theme pack"
         )
     ));
-    let mut node = UiNode::new(
-        PACK,
-        UiContent::Button(
-            Control::new(spec, ActionId::new(PACK))
-                .state(ControlState {
-                    expanded: Some(open),
-                    focused: focused(state, PACK),
-                    ..ControlState::default()
-                })
-                .style(StyleRef::Plain),
-        ),
-    )
-    .layout(
+    let control = Control::new(spec, ActionId::new(PACK))
+        .state(ControlState {
+            expanded: Some(open),
+            focused: focused(state, PACK),
+            ..ControlState::default()
+        })
+        .style(StyleRef::Plain);
+    // Its words wrap to the room its chevron leaves, never cut ("Com…" at
+    // 2× text in a 22-column window), the row as tall as they take.
+    let lines = wrap_to_box(
+        "Community",
+        crate::native_ui::disclosure_label_room(width),
+        &crate::native_ui::native_button_label_width,
+    );
+    let height = crate::native_ui::native_button_height_for_lines(lines.len(), row_height());
+    let words = lines.join("\n");
+    let mut control = control;
+    control.spec.visual_label = Some(words);
+    let mut node = UiNode::new(PACK, UiContent::Button(control)).layout(
         Layout::default()
             .width(Length::Fill)
-            .height(Length::Fixed(row_height())),
+            .height(Length::Fixed(height)),
     );
     if above > 0.0 {
         node = UiNode::new(
@@ -2110,7 +2277,7 @@ fn pack_row(
         )
         .layout(
             Layout::column()
-                .height(Length::Fixed(row_height() + above))
+                .height(Length::Fixed(height + above))
                 .padding(Insets {
                     top: above,
                     right: 0.0,
@@ -2120,7 +2287,7 @@ fn pack_row(
         )
         .children(vec![node]);
     }
-    (node, row_height() + above, None)
+    (node, height + above, None)
 }
 
 /// One theme's row: the option that tries it (its whole area), its name,
@@ -2134,7 +2301,7 @@ fn row_node(
     slab: Option<f32>,
     in_use: bool,
     selected: bool,
-) -> UiNode {
+) -> (UiNode, f32) {
     let key = format!("{CARD_PREFIX}{}", card.slug);
     let height = row_height();
     let trying = state
@@ -2256,25 +2423,48 @@ fn row_node(
             _ => 0.0,
         })
         .sum();
-    let name_width = (width - TEXT_INSET - ROW_END - trailing_width).max(0.0);
+    let mut name_width = (width - TEXT_INSET - ROW_END - trailing_width).max(0.0);
+    // A theme not in use gives up its empty ✓ slot where a word of its name
+    // would not be whole beside it, as a cursor style's row gives up its
+    // check (`cursor_style_row`): its name broke "Drac-" / "ula" at
+    // 2× text in a 22-column panel beside a slot that paints nothing.
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
+    if !in_use && !pieces_fit(&card.label, name_width, &measure) {
+        trailing.pop();
+        name_width += check_width + 6.0;
+    }
     // The name is the row's words, in the primary ink: the captions over
-    // the rows and the footer's labels are the quieter voice.
-    let mut face_children = vec![
+    // the rows and the footer's labels are the quieter voice. It wraps to
+    // its column, never cut ("Catppuccin L…" at 22 columns), the row as tall
+    // as its lines take ([`row_name_height`]), its lines centred in it.
+    let (name, lines_height) = wrapped_words_node(
+        &format!("{key}/name"),
+        &card.label,
+        (SemanticRole::Text, StyleRef::Primary),
+        name_width,
+        row_name_line_height(),
+    );
+    let one_line = matches!(name.content, UiContent::Text(_));
+    let name = if one_line {
+        name.layout(Layout::default().width(Length::Fill).height(Length::Fill))
+    } else {
         UiNode::new(
-            format!("{key}/name"),
-            UiContent::Text(TextSpec {
-                text: fit_text(
-                    &card.label,
-                    SemanticRole::Text,
-                    StyleRef::Primary,
-                    name_width,
-                ),
-                role: SemanticRole::Text,
-                style: StyleRef::Primary,
-            }),
+            format!("{key}/name-frame"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-    ];
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(Insets {
+                    top: ROW_NAME_PAD,
+                    ..Insets::default()
+                }),
+        )
+        .children(vec![name])
+    };
+    let mut face_children = vec![name];
     face_children.extend(trailing);
     let face = UiNode::new(
         format!("{key}/face"),
@@ -2300,14 +2490,30 @@ fn row_node(
     }
     // The option IS the row, a direct child of the list box: a list's
     // selection (AT-SPI's child index) counts options, never a wrapper.
-    UiNode::new(key.clone(), option)
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        )
-        .children(children)
+    let height = if one_line {
+        height
+    } else {
+        height.max(lines_height + 2.0 * ROW_NAME_PAD)
+    };
+    (
+        UiNode::new(key.clone(), option)
+            .layout(
+                Layout::default()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(height)),
+            )
+            .children(children),
+        height,
+    )
 }
+
+/// One line of a chooser row's name where it wraps.
+fn row_name_line_height() -> f32 {
+    22.0_f32.max(20.0 * settings_text_scale())
+}
+
+/// Over and under a chooser row's name where it wraps.
+const ROW_NAME_PAD: f32 = 6.0;
 
 /// A fixed-width gap in a row.
 fn spacer(key: &str, width: f32) -> UiNode {

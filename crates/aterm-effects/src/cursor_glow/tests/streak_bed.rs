@@ -854,6 +854,30 @@ fn a_leap_over_rows_the_frame_shows_blank_is_light() {
     let g = tall_geom();
     let cells: Vec<Vec<aterm_core::terminal::RenderCell>> =
         vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    // A smaller frame can leave the remembered caret entirely off-grid,
+    // with or without a current caret. Its unread rows stay unknown.
+    let mut probe = CursorGlow {
+        last: Some((10, 3)),
+        ..CursorGlow::default()
+    };
+    let mut at = Instant::now();
+    for cur in [None, Some((10, 3))] {
+        for frame in [&cells[..0], &cells[..2]] {
+            probe.observe_frame_text(Some((0, 3)), &cells, at);
+            assert!(probe.frame_text.pair(0, 3).is_some());
+            assert!(TextView::new(TextSpans::default(), Some(&probe.frame_text)).knows_row(0));
+            at += Duration::from_millis(1);
+            probe.observe_frame_text(cur, frame, at);
+            assert_eq!(probe.frame_text.at, Some(at));
+            assert!(probe.frame_text.rows.is_empty());
+            assert!(probe.frame_text.pairs.is_empty());
+            assert_eq!(probe.frame_text.cols, 0);
+            assert!(probe.frame_text.pair(0, 3).is_none());
+            let text = TextView::new(TextSpans::default(), Some(&probe.frame_text));
+            assert!(!text.knows_row(0));
+            assert!(!text.knows_row(10));
+        }
+    }
     for (style, mono) in [
         (GlowStyle::Lumen, false),
         (GlowStyle::Classic, true),

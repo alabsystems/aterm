@@ -4982,14 +4982,19 @@ fn person_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// Each scenario's matrix, in order: run on the machine's threads (each
+/// How many scenarios of a matrix run side by side. The test binary already runs a test per
+/// core, so a matrix spread over every core only contends with them: the matrix's 23 tests
+/// alone took 7.3 s and 68 CPU-s on 18 workers (35 of them the kernel's), 4.2 s and 38 CPU-s
+/// on 4, 6.2 s on 2.
+const MATRIX_WORKERS: usize = 4;
+
+/// Each scenario's matrix, in order: run on [`MATRIX_WORKERS`] threads (each
 /// cell's loops are its own, on the fixed clock).
 fn run_all(scenarios: &[Scenario], seed: bool) -> Vec<(String, Tally)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let mut out: Vec<(usize, (String, Tally))> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers.min(scenarios.len()))
+        let handles: Vec<_> = (0..MATRIX_WORKERS.min(scenarios.len()))
             .map(|_| {
                 scope.spawn(|| {
                     let mut done = Vec::new();
@@ -5153,6 +5158,148 @@ fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follow
         let episode = crate::supervise::approvals::land_episode(&ledger, Some(SID));
         assert_eq!(episode.is_none(), over, "{mode:?}: {episode:?}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE HOLD'S `since` IS THE INSTRUCTION'S ROW, FOR THIS LOOP AND THE NEXT
+/// (the Autopilot design's §12.3.3, slice 3a): the loop that types Land's
+/// instruction holds it from the stamp its ledger row carries
+/// (`ledger_row` → `TurnEndState::ledgered`), and a loop that follows on
+/// the same books (a restart, a seamless update) seeds that very stamp
+/// (`approvals::LandSeed::hold` → `TurnEndState::seed_land_hold`), its
+/// episode's legs unread until its first yield. The nudge its yield is owed,
+/// typed and ledgered later, counts one and leaves `since` at the
+/// instruction's row, in this loop and the next. NEGATIVE CONTROLS: the
+/// hold before the instruction is none, a loop over books with no episode
+/// holds none, and the nudge's own row is later than the instruction's.
+#[test]
+fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
+    use crate::supervise::config::Autopilot;
+    use crate::supervise::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE};
+    let dir = crate::supervise::test_scratch_path("seed-matrix", "land-since");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let w0 = work0();
+    let progress = cc(
+        &with(
+            &w0,
+            &turn(None, &["⏺ Stage 3 of 5 is in."], 0, T0 + 2 * MIN),
+        ),
+        &[],
+        "",
+    );
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            autopilot: Autopilot::Land,
+            ..land_policy()
+        },
+        ..auto(30)
+    };
+    let ledger = dir.join("land.jsonl");
+    let mut m = Mock::new(vec![Vec::new()]);
+    let mut s = session(&mut m, Some(SID.to_string()));
+    s.set_zone_lookup(test_zones);
+    s.ledger = Ledger::open(Some(&ledger), Some(SID), &mut Vec::new());
+    s.turn_end_seeded = true;
+    s.set_turn_end_timing(TurnEndTiming {
+        take_within: Duration::ZERO,
+        ..TurnEndTiming::default()
+    });
+    s.set_clock(T0 + 2 * MIN, PDT);
+    // Virtual clocks, moved by sleeps alone: each row's stamp is its own.
+    {
+        use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
+        s.set_fx(Fx::over(ClockSource::Virtual(std::sync::Arc::new(
+            VirtualClock::new(std::time::Instant::now(), (T0 + 2 * MIN) * 1000),
+        ))));
+    }
+    assert_eq!(s.turn_end.land_held(), None, "CONTROL: no instruction yet");
+    s.ctl.screens = vec![progress.clone()];
+    s.ctl.served = 0;
+    let p = point_at(&s, progress.clone(), 101);
+    let a = s
+        .turn_end_at_point(&p, Some(Duration::from_secs(120)), &opts)
+        .expect("a decision");
+    assert_eq!(a.rule_id(), Some(RULE_LAND), "{a:?}");
+    s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
+        .expect("decided");
+    let row_of = |rule: &str| {
+        std::fs::read_to_string(&ledger)
+            .expect("the ledger")
+            .lines()
+            .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+            .filter(|v| v.get("rule_id").and_then(aterm_json::Value::as_str) == Some(rule))
+            .filter_map(|v| v.get("ts").and_then(aterm_json::Value::as_i64))
+            .next_back()
+    };
+    let row_ts = row_of(RULE_LAND).expect("the instruction's row");
+    // This loop: the row's own stamp, its yield not read yet.
+    let live = s.turn_end.land_held().expect("the episode");
+    assert_eq!(live.since_ms, Some(row_ts), "{live:?}");
+    assert!(!live.read && live.legs == 0 && live.nudges == 0, "{live:?}");
+    let instructed = dir.join("instructed.jsonl");
+    std::fs::copy(&ledger, &instructed).expect("the books so far");
+    // Its yield, real work that is no landing, and the nudge it is owed.
+    let yielded = cc(
+        &with(
+            &w0,
+            &turn(
+                Some("(land)"),
+                &["⏺ Stage 4 of 5 is in."],
+                3 * MIN,
+                T0 + 6 * MIN,
+            ),
+        ),
+        &[],
+        "",
+    );
+    s.fx.sleep(Duration::from_secs(4 * 60));
+    s.ctl.screens = vec![yielded.clone()];
+    s.ctl.served = 0;
+    let p = point_at(&s, yielded.clone(), 102);
+    let a = s
+        .turn_end_at_point(&p, Some(Duration::from_secs(180)), &opts)
+        .expect("a decision");
+    assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{a:?}");
+    s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
+        .expect("decided");
+    let nudge_ts = row_of(RULE_LAND_NUDGE).expect("the nudge's row");
+    assert_eq!(
+        (row_ts, nudge_ts),
+        ((T0 + 2 * MIN) * 1000, (T0 + 6 * MIN) * 1000),
+        "CONTROL: each row's own stamp"
+    );
+    let nudged = s.turn_end.land_held().expect("the episode");
+    assert_eq!(
+        (nudged.since_ms, nudged.nudges),
+        (Some(row_ts), 1),
+        "{nudged:?}"
+    );
+    drop(s);
+    // The loop that follows, seeded from those books: before the nudge…
+    let mut m = Mock::new(vec![Vec::new()]);
+    let mut next = session(&mut m, Some(SID.to_string()));
+    next.seed_from_ledger(&instructed, row_ts + 60_000, false);
+    let seeded = next.turn_end.land_held().expect("the seeded episode");
+    assert_eq!(seeded, live, "the same hold, from the same row");
+    drop(next);
+    // …and after it.
+    let mut m = Mock::new(vec![Vec::new()]);
+    let mut next = session(&mut m, Some(SID.to_string()));
+    next.seed_from_ledger(&ledger, nudge_ts + 60_000, false);
+    let seeded = next.turn_end.land_held().expect("the seeded episode");
+    assert_eq!(
+        (seeded.since_ms, seeded.nudges, seeded.read),
+        (Some(row_ts), 1, false),
+        "{seeded:?}"
+    );
+    drop(next);
+    // NEGATIVE CONTROL: books with no episode seed none.
+    let mut m = Mock::new(vec![Vec::new()]);
+    let mut bare = session(&mut m, Some(SID.to_string()));
+    bare.seed_from_ledger(&dir.join("none.jsonl"), row_ts + 60_000, false);
+    assert_eq!(bare.turn_end.land_held(), None);
+    drop(bare);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -7706,9 +7853,8 @@ fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_hand
     use std::sync::atomic::{AtomicUsize, Ordering};
     let run = |scenarios: &[Scenario], noted: bool, owed: bool| {
         let next = AtomicUsize::new(0);
-        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         std::thread::scope(|scope| {
-            let hs: Vec<_> = (0..workers.min(scenarios.len()))
+            let hs: Vec<_> = (0..MATRIX_WORKERS.min(scenarios.len()))
                 .map(|_| {
                     scope.spawn(|| {
                         let mut done = (0, Vec::new());

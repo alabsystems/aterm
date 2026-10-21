@@ -1,28 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! WHO RAISED AN UPDATE FLOOR (round seven of the update audit, group H1).
+//! Who raised an update floor.
 //!
 //! Both update lanes keep monotonic floors a signed manifest can raise: the macOS
-//! `floor.toml` (`min_build`, `high_water`) and the Linux state's `min_build`. The
-//! manifest is signed by a rostered MACHINE, and the roster exists for the day one of
-//! those machines is stolen: a thief's release with `min_build = 9_999_999_999` raised
-//! the floor on every client that saw it, and nothing lowered it after the owner revoked
-//! the machine, so every later genuine release was held below it forever. A floor now
-//! records who raised it, and a revocation takes back exactly that machine's part.
-//!
-//! One pure rule ([`FloorSources::step`]) for both lanes, compiled into every macOS and
-//! Linux build and tested here on either.
+//! `floor.toml` (`min_build`, `high_water`) and the Linux state's `min_build`. Manifests
+//! are signed by rostered machines, and a stolen machine's release could raise a floor
+//! past every genuine release. So a floor records who raised it, and revoking a machine
+//! takes back exactly its part. [`FloorSources::step`] is the one rule for both lanes.
 
 use serde::{Deserialize, Serialize};
 
-/// The contributions to ONE floor, by the machine whose signed manifest raised it —
-/// what lets a revocation take back exactly what the revoked machine asked for.
+/// The contributions to one floor, by the machine whose signed manifest raised it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloorSources {
-    /// The part no revocation lowers: every unattributed observation (a channel with
-    /// no roster tier, a caller that names no machine), and the whole value a record
-    /// written without provenance holds.
+    /// The part no revocation lowers: unattributed observations (no roster tier, no
+    /// machine named), and all of a record written without provenance.
     #[serde(default)]
     pub base: u64,
     /// The highest value each machine asked for.
@@ -31,8 +24,8 @@ pub struct FloorSources {
 }
 
 impl FloorSources {
-    /// Nothing recorded — skipped when written, so a floor nobody attributed is
-    /// written exactly as before provenance existed.
+    /// Nothing recorded; skipped when written, so an unattributed floor is written as a
+    /// bare number.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.base == 0 && self.machines.is_empty()
@@ -44,17 +37,14 @@ impl FloorSources {
         self.machines.values().copied().fold(self.base, u64::max)
     }
 
-    /// One step of a floor that is recorded as `recorded` with these sources: the
-    /// machines in `revoked` lose their part, then `raise` is recorded for `machine`
-    /// (unattributed when `None`) unless that machine is itself revoked — a revoked
-    /// machine's word counts for nothing. Returns the new floor and its sources, in
-    /// the one form they are written in.
+    /// One step of a floor recorded as `recorded` with these sources: machines in
+    /// `revoked` lose their part, then `raise` is recorded for `machine` (unattributed
+    /// when `None`) unless that machine is revoked. Returns the new floor and its sources,
+    /// in the form they are written in.
     ///
-    /// FIRST the sources are made to explain `recorded`. A number the sources do not
-    /// reach was raised by a writer that recorded no provenance (a build that predates
-    /// it rewrote the record), so all of it becomes unattributed — exactly the
-    /// pre-provenance floor, never a lower one. A source above the number (a hand
-    /// edit; nothing this code writes) is capped at it.
+    /// First the sources are made to explain `recorded`: a number they do not reach was
+    /// raised by a writer that recorded no provenance, so all of it becomes unattributed
+    /// (never a lower floor); a source above it (a hand edit) is capped at it.
     #[must_use]
     pub fn step(
         &self,
@@ -105,7 +95,6 @@ mod tests {
         ids.iter().map(|id| (*id).to_string()).collect()
     }
 
-    /// A REVOCATION TAKES BACK WHAT ITS MACHINE RAISED, AND NOTHING ELSE.
     #[test]
     fn a_revocation_takes_back_its_machines_part_and_nothing_else() {
         let none = FloorSources::default();
@@ -130,15 +119,12 @@ mod tests {
         assert_eq!(v, 1_000);
     }
 
-    /// A NUMBER WITH NO PROVENANCE IS NEVER LOWERED. What an older build wrote (it
-    /// drops the sources when it rewrites the record) is unattributed: the
-    /// pre-provenance floor, which no revocation can take below.
+    /// A number the sources do not explain is unattributed, so no revocation lowers it.
     #[test]
     fn an_unexplained_floor_is_unattributed_and_a_hand_edit_is_capped() {
         let mut attributed = FloorSources::default();
         attributed.machines.insert("m11".into(), 9_000);
-        // The record says 9_500 but the sources explain only 9_000: an older writer
-        // raised it, so all of it stands.
+        // The record says 9_500 but the sources explain only 9_000: all of it stands.
         let (v, s) = attributed.step(9_500, &revoked(&["m11"]), 0, None);
         assert_eq!(v, 9_500);
         assert!(s.is_empty(), "written as before provenance: {s:?}");
@@ -157,7 +143,7 @@ mod tests {
         let (v, s) = FloorSources::default().step(100, &[], 0, Some("m3"));
         assert_eq!(v, 100);
         assert!(s.is_empty(), "{s:?}");
-        // NEGATIVE CONTROL: explained exactly, the same revocation takes it all back.
+        // Negative control: explained exactly, the same revocation takes it all back.
         let (v, _) = attributed.step(9_000, &revoked(&["m11"]), 0, None);
         assert_eq!(v, 0);
     }

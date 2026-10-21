@@ -256,3 +256,283 @@ fn read_file_names_path_and_line_and_keeps_a_read_error_distinct() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// The secret-file rule: check_private, read_secret_file, SECRET_MIN
+// ---------------------------------------------------------------------------
+
+struct SecretScratch(std::path::PathBuf);
+
+impl SecretScratch {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for SecretScratch {
+    fn drop(&mut self) {
+        // Only a directory this guard exclusively created reaches cleanup.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Allocate a private root without adopting or removing any preexisting entry.
+fn secret_scratch(name: &str) -> SecretScratch {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut private_builder = builder;
+        private_builder.mode(0o700);
+        private_builder
+    };
+    for _ in 0..1024 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("astream-secret-{name}-{}-{n}", std::process::id()));
+        match builder.create(&dir) {
+            Ok(()) => return SecretScratch(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create owned secret scratch: {e}"),
+        }
+    }
+    panic!("could not allocate an exclusive secret scratch name");
+}
+
+#[cfg(unix)]
+fn chmod(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// 0600 or tighter passes; any group/other bit is refused, as `PermissionDenied`
+/// naming the mode and the `chmod`, path first, by EACH of the three functions: the
+/// check and both readers hold the same clause on the same open, so none of them
+/// may answer a mode refusal in its own words. The passing modes are the control:
+/// the same file, the same bytes, only the mode moved, and both readers then return
+/// those bytes.
+#[cfg(unix)]
+#[test]
+fn secret_file_other_users_can_read_is_refused_naming_the_chmod() {
+    let scratch = secret_scratch("priv");
+    let dir = scratch.path();
+    let path = dir.join("k");
+    let shown = path.display().to_string();
+    let bytes = [0x5a; SECRET_MIN];
+    std::fs::write(&path, bytes).unwrap();
+    for (mode, ok) in [
+        (0o600, true),
+        (0o400, true),
+        (0o700, true),
+        (0o640, false),
+        (0o604, false),
+        (0o644, false),
+        (0o660, false),
+    ] {
+        chmod(&path, mode);
+        let checked = check_private(&path);
+        let private = read_private_file(&path);
+        let secret = read_secret_file(&path);
+        if ok {
+            assert!(checked.is_ok(), "{mode:o}: {checked:?}");
+            assert_eq!(private.expect("owner-only"), bytes, "{mode:o}");
+            assert_eq!(secret.expect("owner-only"), bytes, "{mode:o}");
+            continue;
+        }
+        for (door, e) in [
+            ("check_private", checked.expect_err("group/other bit")),
+            ("read_private_file", private.expect_err("group/other bit")),
+            ("read_secret_file", secret.expect_err("group/other bit")),
+        ] {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{door} {mode:o}"
+            );
+            let text = e.to_string();
+            assert!(
+                text.starts_with(&format!("{shown} is mode {mode:04o}: ")),
+                "{door}: {text}"
+            );
+            assert!(
+                text.contains(&format!("chmod 600 {shown}")),
+                "{door}: {text}"
+            );
+        }
+    }
+}
+
+/// `read_private_file` is the owner-only rule WITHOUT the length floor: the bytes
+/// of a file shorter than a secret come back exactly, where `read_secret_file`
+/// refuses the same file. That is the reader for a file whose caller decodes it (a
+/// hex key), and the control that the floor is `read_secret_file`'s alone.
+#[cfg(unix)]
+#[test]
+fn secret_file_private_reader_has_no_length_floor() {
+    let scratch = secret_scratch("plain");
+    let dir = scratch.path();
+    let path = dir.join("k.hex");
+    let hex = format!("{}\n", "ab".repeat(8));
+    std::fs::write(&path, &hex).unwrap();
+    chmod(&path, 0o600);
+    assert_eq!(
+        read_private_file(&path).expect("owner-only"),
+        hex.as_bytes()
+    );
+    assert_eq!(
+        read_secret_file(&path).expect_err("17 bytes").kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    std::fs::write(&path, b"").unwrap();
+    assert_eq!(read_private_file(&path).expect("empty"), b"");
+}
+
+/// A secret is owner-only and at least 32 bytes, or refused with the reason by kind,
+/// and is read byte for byte: a trailing newline is part of it, and so are 32 bytes
+/// of which the last is a space (what `head -c 32 /dev/urandom` writes about one
+/// time in twenty-five). Controls: 31 bytes is refused where 32 is not, and the
+/// newline-terminated secret is NOT its trimmed text.
+#[cfg(unix)]
+#[test]
+fn secret_file_is_owner_only_long_enough_and_read_byte_for_byte() {
+    let scratch = secret_scratch("mint");
+    let dir = scratch.path();
+    let path = dir.join("mint.secret");
+    assert_eq!(
+        read_secret_file(&path).expect_err("absent").kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        check_private(&path).expect_err("absent").kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    let mut bytes = vec![0x5a; 31];
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes).unwrap();
+    chmod(&path, 0o644);
+    let e = read_secret_file(&path).expect_err("0644");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    chmod(&path, 0o600);
+    let got = read_secret_file(&path).expect("0600, 32 bytes");
+    assert_eq!(got, bytes);
+    assert_ne!(got, bytes.trim_ascii());
+
+    let mut spaced = vec![b'k'; 31];
+    spaced.push(b' ');
+    std::fs::write(&path, &spaced).unwrap();
+    assert_eq!(
+        read_secret_file(&path).expect("32, the last a space"),
+        spaced
+    );
+
+    std::fs::write(&path, [0x5a; SECRET_MIN - 1]).unwrap();
+    let e = read_secret_file(&path).expect_err("short");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    let shown = path.display().to_string();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "{shown} holds 31 bytes; a secret file holds at least 32 (a short key mints \
+             capabilities that seal nothing)"
+        )
+    );
+    std::fs::write(&path, b"").unwrap();
+    assert_eq!(
+        read_secret_file(&path).expect_err("empty").kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
+
+/// Every refusal names the path FIRST and an OS error names it ONCE: the OS never
+/// names the path it failed on, so the reader re-wraps the error as `<path>: …`
+/// with its kind kept, and a caller that prefixes only its flag (`--secret-file
+/// {e}`) prints the path exactly once. Negative control: the raw OS error for the
+/// same missing file does NOT name the path, so the wrap is what does.
+#[test]
+fn secret_file_refusals_name_the_path_first_and_keep_the_kind() {
+    let scratch = secret_scratch("path");
+    let dir = scratch.path();
+    let missing = dir.join("absent.secret");
+    let shown = missing.display().to_string();
+    for e in [
+        check_private(&missing).expect_err("absent"),
+        read_private_file(&missing).expect_err("absent"),
+        read_secret_file(&missing).expect_err("absent"),
+    ] {
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        let text = e.to_string();
+        assert!(text.starts_with(&format!("{shown}: ")), "{text}");
+        assert_eq!(text.matches(&shown).count(), 1, "{text}");
+    }
+    let raw = std::fs::File::open(&missing).expect_err("absent");
+    assert!(!raw.to_string().contains(&shown), "{raw}");
+
+    // An owner-only directory opens on Unix and fails at the read (EISDIR): an OS
+    // error from the read, not the open, still path-first, the path once, and of
+    // the kind the raw read of the same directory fails with (the control: the
+    // wrap keeps the OS's kind rather than choosing one of its own).
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        chmod(&sub, 0o700);
+        let sub_shown = sub.display().to_string();
+        let raw_kind = std::fs::File::open(&sub)
+            .expect("a directory opens read-only")
+            .read_to_end(&mut Vec::new())
+            .expect_err("a directory does not read")
+            .kind();
+        assert!(
+            !matches!(
+                raw_kind,
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData
+            ),
+            "{raw_kind:?}"
+        );
+        for e in [
+            read_private_file(&sub).expect_err("a directory is not a secret"),
+            read_secret_file(&sub).expect_err("a directory is not a secret"),
+        ] {
+            assert_eq!(e.kind(), raw_kind, "{e}");
+            let text = e.to_string();
+            assert!(text.starts_with(&format!("{sub_shown}: ")), "{text}");
+            assert_eq!(text.matches(&sub_shown).count(), 1, "{text}");
+            assert!(!text.contains("is mode"), "the mode passed: {text}");
+        }
+        assert!(check_private(&sub).is_ok(), "the mode alone passes");
+    }
+}
+
+/// A read error discards authority, including the prefix read before the failure;
+/// a successful read keeps those exact bytes, including its trailing newline.
+#[test]
+fn a_failed_secret_read_wipes_the_bytes_it_already_collected() {
+    struct PartialError<'a>(&'a [u8]);
+    impl std::io::Read for PartialError<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(std::io::Error::other("captured read failure"));
+            }
+            let n = out.len().min(self.0.len());
+            out[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+    let prefix = [0xa5; SECRET_MIN];
+    let mut secret = Vec::new();
+    let error = read_secret_into(&mut PartialError(&prefix), &mut secret).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(error.to_string(), "captured read failure");
+    assert_eq!(secret, vec![0; prefix.len()]);
+
+    let mut exact = [0x5a; SECRET_MIN];
+    exact[SECRET_MIN - 1] = b'\n';
+    let mut secret = Vec::new();
+    read_secret_into(&mut std::io::Cursor::new(exact), &mut secret).unwrap();
+    assert_eq!(secret, exact);
+}

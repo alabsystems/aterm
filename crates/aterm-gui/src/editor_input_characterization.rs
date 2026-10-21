@@ -659,7 +659,13 @@ fn rows(screen: usize) -> Vec<Row> {
             "M-> is the buffer's end",
             vec![],
             press(Key::Character('.'), Modifiers::ALT | shift),
-            r#"sel=314 top=31 status="Mark set""#,
+            // The last screen's top: the platform's font decides how many
+            // rows a screen holds (31 on macOS, 25 on the Linux lane).
+            format!(
+                r#"sel={} top={} status="Mark set""#,
+                text.len(),
+                lines - screen
+            ),
         ),
         row(
             "C-? redoes",

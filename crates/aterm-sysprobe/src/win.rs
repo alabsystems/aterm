@@ -287,6 +287,20 @@ fn low_memory() -> bool {
     ok != 0 && state != 0
 }
 
+/// One `K32GetPerformanceInfo`, or `None` where it fails.
+fn performance_info() -> Option<PerformanceInformation64> {
+    let cb = u32::try_from(size_of::<PerformanceInformation64>()).ok()?;
+    let mut perf = PerformanceInformation64 {
+        cb,
+        ..PerformanceInformation64::default()
+    };
+    // SAFETY: `perf` is `cb` writable bytes of PERFORMANCE_INFORMATION.
+    if unsafe { K32GetPerformanceInfo(&raw mut perf, cb) } == 0 {
+        return None;
+    }
+    Some(perf)
+}
+
 /// [`crate::memory_detail`] on Windows.
 pub(crate) fn memory_detail() -> Option<MemoryDetail> {
     let mut status = MemoryStatusEx {
@@ -297,16 +311,17 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
     if unsafe { GlobalMemoryStatusEx(&raw mut status) } == 0 {
         return None;
     }
-    let cb = u32::try_from(size_of::<PerformanceInformation64>()).ok()?;
-    let mut perf = PerformanceInformation64 {
-        cb,
-        ..PerformanceInformation64::default()
-    };
-    // SAFETY: `perf` is `cb` writable bytes of PERFORMANCE_INFORMATION.
-    if unsafe { K32GetPerformanceInfo(&raw mut perf, cb) } == 0 {
-        return None;
-    }
+    let perf = performance_info()?;
     memory_detail_of(&status, &perf, page_file_pages(), low_memory())
+}
+
+/// [`crate::pid_counts`] on Windows: the process count of one
+/// `K32GetPerformanceInfo` (a zero is not read); one user's is not read.
+pub(crate) fn pid_counts() -> (Option<u64>, Option<u64>) {
+    let all = performance_info()
+        .map(|p| u64::from(p.process_count))
+        .filter(|n| *n > 0);
+    (all, None)
 }
 
 /// [`crate::processes`] on Windows: one `SystemProcessInformation` pass into
@@ -346,7 +361,13 @@ pub(crate) fn processes() -> Option<Sweep> {
         HINT.store(len, Ordering::Relaxed);
         let n = usize::try_from(got).ok()?.min(buf.len() * 8);
         let base = u64::try_from(buf.as_ptr().addr()).ok()?;
-        return Some(crate::windows::processes(&as_bytes(&buf)[..n], base));
+        // The table is one snapshot: every process's counters are of now.
+        let at = Some(std::time::Instant::now());
+        let mut sweep = crate::windows::processes(&as_bytes(&buf)[..n], base);
+        for p in &mut sweep.procs {
+            p.read_at = at;
+        }
+        return Some(sweep);
     }
     None
 }

@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Kitty graphics `a=d` delete semantics against the real engine
-//! (`handler_actions.rs` `delete_kitty_placements`):
+//! Kitty graphics `a=d` delete semantics (`delete_kitty_placements` in `handler_actions.rs`):
 //!
-//!   * a lowercase selector deletes placements and keeps the transmitted data,
-//!     so the id stays placeable (preview cyclers such as yazi and icat rely on
-//!     it); uppercase also frees the data of every image it named or cleared
-//!     that has no placement left on screen;
-//!   * a selector addresses specific placements (by image id and optional
-//!     placement id, image number, id range, cell, cell + z-index, column, row
-//!     or z-index); it never clears the whole store or erases another
-//!     protocol's image.
+//! * a lowercase selector deletes placements and keeps the transmitted data, so the id stays
+//!   placeable (preview cyclers such as yazi and icat rely on it); uppercase also frees the
+//!   data of every image it named or cleared that has no placement left on screen;
+//! * a selector addresses specific placements; it never clears the whole store or erases
+//!   another protocol's image.
 //!
-//! Placements are observed through `Terminal::images_row`, the surface the
-//! renderer reads. Whether the store still holds an image is observed through
-//! a Unicode placeholder (`placeable`), which reads the store and moves nothing.
+//! Placements are observed through `Terminal::images_row`, the surface the renderer reads;
+//! whether the store still holds an image, through a Unicode placeholder (`placeable`).
 
 use aterm_core::terminal::Terminal;
 

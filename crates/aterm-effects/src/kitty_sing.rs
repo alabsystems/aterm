@@ -1,42 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Sing-along: the held-key celebration. Holding the same key makes the
-//! cursor cat dance and sing with music notes. Style-gated to
-//! `GlowStyle::RainbowKitty` by the host.
-//!
-//! Three pure units:
+//! Sing-along: holding the same key makes the cursor cat dance and sing with
+//! music notes. Style-gated to `GlowStyle::RainbowKitty` by the host.
 //!
 //! * [`KittySing`], the detector: the same printable character repeating at
-//!   key-repeat cadence through the typed-provenance input seam (committed key
-//!   presses only; PTY output, `cat` and pastes cannot arm it).
-//!   [`SING_ARM_REPEATS`] consecutive repeats arm it; a backspace, a break key,
-//!   a session switch, or letting go (no repeat within [`SING_REPEAT_GAP`])
-//!   starts a [`SING_WIND_DOWN`] crossfade (drive eases 1 → 0). A different
-//!   character that itself starts repeating is a key switch
-//!   ([`KEY_SWITCH_REPS`]): the singer stays at full drive and the song
-//!   modulates onto the new key's verse at the next bar boundary, on the same
-//!   bar grid. Bounded per-window state, like `kitty_summon::TypedKittySummon`.
-//! * The beat clock: [`sing_beat`]/[`sing_bar`] derive a deterministic beat
-//!   phase from the arm instant at [`SING_BPM`]. The audio riff runs on the
-//!   synth's sample clock (`trail_sound`, one `CelebrationGesture::RiffBar` per
-//!   visual bar), same tempo and anchor; the two can skew by one host audio
-//!   buffer plus event latency (about ±60 ms), under a sixth of a 400 ms beat.
-//! * [`MusicNotes`], the ♪/♫ sprite field: a ring-capped ([`MAX_NOTES`] = 16)
-//!   pool of notes spawned on half-beats from the singing cat, bobbing upward
-//!   and fading. [`NoteSprite`] carries cell-relative offsets; emission lives in
-//!   `word_decorations::kitty_cursor`, so notes are cat-only and load-shed with
-//!   the sparkle branch. [`bake_note`] bakes authored paths white, tinted per
-//!   sprite via `FreeSprite::tint`, so the rainbow costs two atlas tiles.
+//!   key-repeat cadence through the typed-provenance input seam (PTY output,
+//!   `cat` and pastes cannot arm it). [`SING_ARM_REPEATS`] repeats arm it; a
+//!   backspace, a break key, a session switch or letting go (no repeat within
+//!   [`SING_REPEAT_GAP`]) starts a [`SING_WIND_DOWN`] crossfade. A different
+//!   character that itself starts repeating is a key switch ([`KEY_SWITCH_REPS`]):
+//!   the song modulates onto the new key's verse at the next bar boundary.
+//! * The beat clock: [`KittySing::beat`]/[`KittySing::bar`] count from the arm
+//!   instant at [`SING_BPM`]. The audio riff runs on the synth's sample clock
+//!   (`trail_sound`, one `CelebrationGesture::RiffBar` per visual bar); the two
+//!   skew by about ±60 ms (one host audio buffer plus event latency), under a
+//!   sixth of a beat.
+//! * [`MusicNotes`], the ♪/♫ sprite field: a ring-capped ([`MAX_NOTES`]) pool
+//!   spawned on half-beats from the singing cat. Emission lives in
+//!   `WordDecorations::kitty_cursor_at_placement`, so notes are cat-only and
+//!   load-shed with the sparkle branch. [`bake_note`] bakes the glyphs white,
+//!   tinted per sprite via `FreeSprite::tint`.
 //!
-//! ## Host arms
-//!
-//! * Reduced motion: the detector still arms, the cat shows a still singing
-//!   pose (`kitty_cursor::static_frame`), and [`MusicNotes::frames`] pins notes
-//!   to fixed offsets (fade only). The riff still plays if sound is on.
-//! * Muted / unfocused: visuals only; the host resolves the riff gain to `None`
-//!   like the trail-sound rule.
-//! * Load-shed: notes ride the sparkle emission branch and shed with it.
+//! Reduced motion: the detector still arms, the cat holds a still singing pose,
+//! notes keep fixed offsets (fade only) and the riff still plays. Muted or
+//! unfocused: visuals only.
 
 use std::fmt;
 use std::time::Duration;
@@ -68,12 +56,10 @@ pub const SING_BAR_SECONDS: f32 = SING_BEAT_SECONDS * SING_BAR_BEATS;
 // Song signature
 // ---------------------------------------------------------------------------
 
-/// A fixed bijective signature mixer over a character's code point
-/// (lowbias32-style: two xorshift + odd-multiply rounds). Each round is
-/// invertible, so distinct characters never share a song
-/// (`song_signature_mixer_is_bijective_over_all_chars`), and nearby code points
-/// scatter far apart (`a` vs `b` is a different verse). Not an RNG draw: a
-/// key's song is the same on every machine and session.
+/// A fixed bijective mixer over a character's code point (lowbias32-style: two
+/// xorshift + odd-multiply rounds), so distinct characters never share a song and
+/// nearby code points scatter far apart. Not an RNG draw: a key's song is the same on
+/// every machine and session.
 #[must_use]
 pub fn song_signature(ch: char) -> u32 {
     let mut x = ch as u32;
@@ -84,14 +70,13 @@ pub fn song_signature(ch: char) -> u32 {
     x ^ (x >> 16)
 }
 
-/// The signature of "nothing held": decodes in the synth to the untransposed
-/// reference voicing (root 0, since `12 % 5 == 2` gives degree offset 0, in the
-/// home mode, `12 % 3 == 0`). Pinned by `trail_sound`'s
+/// The signature of "nothing held": the synth's untransposed reference voicing
+/// (root `12 % 5 - 2 == 0`, home mode `12 % 3 == 0`). Pinned by `trail_sound`'s
 /// `neutral_signature_is_the_reference_voicing`.
 pub const NEUTRAL_SIGNATURE: u32 = 12;
 
 // ---------------------------------------------------------------------------
-// The armed celebration (RAINBOW-KITTY-V2.md §27)
+// The armed celebration (`fx celebrate`)
 // ---------------------------------------------------------------------------
 
 /// The most bars an armed celebration may run: four bars (6.4 s), one phrase of
@@ -99,16 +84,16 @@ pub const NEUTRAL_SIGNATURE: u32 = 12;
 pub const CELEBRATE_MAX_BARS: u8 = 4;
 
 /// The cooldown between two arms of one window's detector, measured from the
-/// ARM (not the fire): an agent may schedule one celebration, then wait.
+/// arm (not the fire): an agent may schedule one celebration, then wait.
 pub const CELEBRATE_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// Fan stars on the FIRST bar of any sing-along (armed or held).
+/// Fan stars on the first bar of any sing-along (armed or held).
 pub const BAR_FAN_BASE: u8 = 5;
 
 /// Fan stars added per bar: 5, 7, 9, 11, …
 pub const BAR_FAN_STEP: u8 = 2;
 
-/// The bar fan's ceiling — half the sky's `STAR_CAP`, so a fan on a busy
+/// The bar fan's ceiling, under half the sky's `STAR_CAP`, so a fan on a busy
 /// sky lands on the eviction finish and never on a pop.
 pub const BAR_FAN_CAP: u8 = 18;
 
@@ -210,10 +195,12 @@ pub struct BarFan {
 }
 
 /// The fan a bar earns: `5 + 2·bar` stars under [`BAR_FAN_CAP`], the ring
-/// on every [`BAR_RING_EVERY`]th bar. A pure function, so the host and the
-/// tests read one law.
+/// on every [`BAR_RING_EVERY`]th bar.
 #[must_use]
 pub fn bar_fan(bar: u64) -> BarFan {
+    const {
+        assert!(BAR_RING_EVERY > 0);
+    }
     let steps = u8::try_from(bar.min(u64::from(u8::MAX))).unwrap_or(u8::MAX);
     let n = BAR_FAN_BASE
         .saturating_add(BAR_FAN_STEP.saturating_mul(steps))
@@ -221,7 +208,7 @@ pub fn bar_fan(bar: u64) -> BarFan {
     BarFan {
         bar,
         n,
-        ring: (bar + 1).is_multiple_of(BAR_RING_EVERY),
+        ring: bar % BAR_RING_EVERY == BAR_RING_EVERY - 1,
     }
 }
 
@@ -256,14 +243,10 @@ struct ExternalRun {
 /// taps never trigger, while a held key blooms while the finger is down.
 pub const SING_ARM_REPEATS: u32 = 16;
 
-/// Repeats that commit a key switch. A distinct character on a live
-/// celebration is provisional (it may be typing); once it repeats this many
-/// times at cadence it is held, and the song modulates onto the new key at the
-/// next bar boundary. The same count recovers a celebration whose glow is still
-/// fading (see [`KittySing::note_char`]), so a switch whose first auto-repeat
-/// arrives late (initial repeat delay 250–500 ms) costs a breath. Three repeats
-/// is ~60–160 ms of holding, which doubled letters cannot counterfeit. Cold
-/// arms still cost [`SING_ARM_REPEATS`].
+/// Repeats that commit a key switch: a distinct character on a live celebration is
+/// provisional (it may be typing) until it repeats this many times at cadence. The same
+/// count recovers a celebration whose glow is still fading ([`KittySing::note_char`]).
+/// Three repeats is ~60–160 ms of holding, which doubled letters cannot counterfeit.
 pub const KEY_SWITCH_REPS: u32 = 3;
 
 /// Maximum gap between two presses of the same character for the run to count
@@ -290,24 +273,18 @@ pub struct KittySing {
     last: Option<Instant>,
     /// The session the run was typed into (session switch clears).
     session: Option<u64>,
-    /// Arm instant, the beat-clock anchor. Persists through a wind-down (an
-    /// uninterrupted release never rewinds mid-crossfade) and is cleared once the
-    /// drive reaches 0. A run that re-earns the threshold during a wind-down
-    /// re-anchors it (see [`Self::note_char`]) so the celebration snaps back.
+    /// Arm instant, the beat-clock anchor. Persists through a wind-down and clears once
+    /// the drive reaches 0; a run that re-earns the threshold during a wind-down
+    /// re-anchors it ([`Self::note_char`]) so the celebration snaps back.
     armed_at: Option<Instant>,
-    /// An EAGER wind-down start (key change / backspace / break / session
-    /// switch). The lazy release path needs no stamp — it is derived.
+    /// An eager wind-down start (key change / backspace / break / session
+    /// switch). The lazy release needs no stamp: it is derived.
     wind_from: Option<Instant>,
-    /// A provisional key hand-over: when a live celebration changed which
-    /// character it rides, held until the new key proves it is held with
-    /// [`KEY_SWITCH_REPS`] at-cadence repeats.
-    ///
-    /// The hand-over carries the run: its identity changes (so
-    /// [`Self::signature`] follows the current key) while the arm anchor, bar
-    /// grid and beat phase do not, so the tune keeps playing and changes key at
-    /// the next bar. If another distinct character arrives before the commit,
-    /// that was typing, and the crossfade is anchored at the departure stored
-    /// here.
+    /// When a live celebration began a provisional key hand-over, held until the new key
+    /// repeats [`KEY_SWITCH_REPS`] times at cadence. The run's character (and so
+    /// [`Self::signature`]) follows the new key; the arm anchor, bar grid and beat phase do
+    /// not. Another distinct character before the commit was typing: the crossfade
+    /// anchors here.
     handover_from: Option<Instant>,
     /// An armed, not-yet-fired celebration (`fx celebrate`), spent by the first
     /// edge it names (§27): a keystroke-caused one (`on=green`, `on=enter`) or the
@@ -317,7 +294,7 @@ pub struct KittySing {
     /// The fired run, while it plays and winds down; cleared by `settle`, or
     /// by a human hold that re-earns the stage inside the wind-down.
     external: Option<ExternalRun>,
-    /// The last ARM instant — the cooldown's anchor. Survives `settle`.
+    /// The last arm instant, the cooldown's anchor. Survives `settle`.
     last_external_arm: Option<Instant>,
     /// The bar-fan latch: the last bar a fan was thrown for (one per bar).
     fan_bar: Option<u64>,
@@ -365,15 +342,9 @@ impl KittySing {
         self.handover_from = None;
     }
 
-    /// The song signature the held character sings from: the single `u32` from
-    /// which the synth derives every per-key axis (verse melody walk, root
-    /// transpose, mode rotation; `trail_sound::design_celebration`).
-    ///
-    /// [`song_signature`] is a bijective mixer, so every distinct character has
-    /// a distinct signature and the synth turns it into a different verse.
-    /// [`NEUTRAL_SIGNATURE`] when nothing is held. Identity follows the current
-    /// run char per bar, so a mid-hold key change modulates at the next bar
-    /// boundary on the same bar grid.
+    /// The song signature the held character sings from: the one `u32` the synth derives
+    /// every per-key axis from (verse melody walk, root transpose, mode rotation;
+    /// `trail_sound::design_celebration`), or [`NEUTRAL_SIGNATURE`] when nothing is held.
     #[must_use]
     pub fn signature(&self) -> u32 {
         if let Some(ext) = self.external {
@@ -437,10 +408,8 @@ impl KittySing {
             && self.run.is_some()
             && self.handover_from.is_none()
         {
-            // Key hand-over on a live celebration: swap the character it rides
-            // and keep the arm anchor, bar grid and beat phase, so the tune
-            // changes key without stopping. Provisional until the new key repeats
-            // [`KEY_SWITCH_REPS`] times; the count restarts at 1.
+            // Key hand-over on a live celebration: swap the character, keep the arm
+            // anchor, bar grid and beat phase. Provisional until `KEY_SWITCH_REPS`.
             self.run = Some(ch);
             self.count = 1;
             self.handover_from = Some(now);
@@ -448,17 +417,13 @@ impl KittySing {
             return;
         }
         if self.run == Some(ch) {
-            // Key repeat is wall time: a batched IME commit of a repeated string
-            // hands every char one `now`, and counting those zero-gap duplicates
-            // would arm off a single commit. Advance the count only when real
-            // time has elapsed since the last press.
+            // Key repeat is wall time: a batched IME commit of a repeated string hands
+            // every char one `now`, so count only when real time has elapsed, or a
+            // single commit could arm.
             if self.last.is_none_or(|l| now > l) {
                 self.count = self.count.saturating_add(1);
             }
-            // Key switch committed: the handed-over key repeated to
-            // [`KEY_SWITCH_REPS`], so it is held. Not a release: the drive stays
-            // at 1.0 and no re-earn is owed. The signature already follows the
-            // current run char, so the next bar sings the new key.
+            // Key switch committed: not a release, so the drive stays at 1.0.
             if self.handover_from.is_some() && self.count >= KEY_SWITCH_REPS {
                 self.handover_from = None;
             }
@@ -472,17 +437,11 @@ impl KittySing {
             self.count = 1;
         }
         self.last = Some(now);
-        // Arm, or recover. A run that re-earns its threshold while a prior arm
-        // is still winding down re-anchors here: `settle` clears the arm only at
-        // drive 0, so otherwise a held key whose run merely restarted (a repeat
-        // hiccup, a stray key, a brief pause) would keep decaying the stale
-        // crossfade mid-hold.
-        //
-        // Forgiveness: while the glow is live (drive > 0), recovery costs only
-        // [`KEY_SWITCH_REPS`] repeats, so a key switch whose initial repeat delay
-        // outran [`SING_REPEAT_GAP`] recovers before the drive falls through the
-        // host's face gate. Cold arms still cost the full hold.
-        let threshold = if self.wind_from.is_some() && self.drive(now) > 0.0 {
+        // Arm, or recover: a run that re-earns its threshold while a prior arm is
+        // still winding down re-anchors here (`settle` clears the arm only at drive
+        // 0), else a restarted run would keep decaying the stale crossfade mid-hold.
+        // While the glow is live, recovery costs only `KEY_SWITCH_REPS` repeats.
+        let threshold = if self.wind_from.is_some() && self.has_drive(now) {
             KEY_SWITCH_REPS
         } else {
             SING_ARM_REPEATS
@@ -497,7 +456,7 @@ impl KittySing {
         }
     }
 
-    /// A backspace NEVER arms (deleting is the opposite of jubilant holding)
+    /// A backspace never arms (deleting is the opposite of jubilant holding)
     /// and releases any armed run into its crossfade.
     pub fn note_backspace(&mut self, now: Instant) {
         self.release(now);
@@ -507,6 +466,14 @@ impl KittySing {
     /// the same release as backspace.
     pub fn note_break(&mut self, now: Instant) {
         self.release(now);
+    }
+
+    /// True while any celebration drive remains at `now` (`drive(now) > 0.0`).
+    fn has_drive(&self, now: Instant) -> bool {
+        self.armed_at.is_some()
+            && self.wind_start(now).is_none_or(|start| {
+                now.saturating_duration_since(start).as_secs_f32() < SING_WIND_DOWN
+            })
     }
 
     /// The celebration drive 0..=1 at `now`: 1.0 while armed and held, a
@@ -524,7 +491,7 @@ impl KittySing {
         if t >= 1.0 {
             return 0.0;
         }
-        // Smoothstep DOWN: C¹ at both ends — the crossfade contract.
+        // Smoothstep down: C¹ at both ends, the crossfade contract.
         let u = 1.0 - t;
         u * u * (3.0 - 2.0 * u)
     }
@@ -541,7 +508,7 @@ impl KittySing {
     #[must_use]
     pub fn beat(&self, now: Instant) -> Option<f32> {
         let t0 = self.armed_at?;
-        if self.drive(now) <= 0.0 {
+        if !self.has_drive(now) {
             return None;
         }
         Some(now.saturating_duration_since(t0).as_secs_f32() / SING_BEAT_SECONDS)
@@ -556,10 +523,9 @@ impl KittySing {
             return None;
         }
         let bar = self.raw_bar(now)?;
-        // A fired run plays exactly `bars` bars: `ends_at` is `bars ×
-        // SING_BAR_SECONDS` in f32, and a frame inside that rounding epsilon
-        // could still read "armed" with the raw index at `bars`, pushing one bar
-        // and one fan too many.
+        // A fired run plays exactly `bars` bars: `ends_at` is computed in f32, and a
+        // frame inside that rounding epsilon could still read "armed" with the raw
+        // index at `bars`, pushing one bar and one fan too many.
         if let Some(ext) = self.external
             && bar >= u64::from(ext.bars)
         {
@@ -571,7 +537,7 @@ impl KittySing {
     /// A drained detector at rest is byte-identical off — the idle contract.
     /// Called by the host once the drive reads 0 (or on hard resets).
     pub fn settle(&mut self, now: Instant) {
-        if self.armed_at.is_some() && self.drive(now) <= 0.0 {
+        if self.armed_at.is_some() && !self.has_drive(now) {
             self.armed_at = None;
             self.wind_from = None;
             self.handover_from = None;
@@ -580,15 +546,13 @@ impl KittySing {
         }
     }
 
-    // -- the armed celebration (§27) ------------------------------------------
+    // -- the armed celebration (`fx celebrate`) -------------------------------
 
     /// Arm a one-shot celebration (`fx celebrate`): latched, fired on the next
     /// edge `on` names (a keystroke-caused one, or the program's `done`), in
     /// `session`. Refused outside
     /// `1..=CELEBRATE_MAX_BARS`, while an arm is pending, or within
-    /// [`CELEBRATE_COOLDOWN`] of the last arm. The cooldown is stamped on the
-    /// arm, so a refused arm costs nothing and an admitted one costs thirty
-    /// seconds whether or not its edge comes.
+    /// [`CELEBRATE_COOLDOWN`] of the last admitted arm, whether or not its edge came.
     pub fn arm_external(
         &mut self,
         now: Instant,
@@ -756,6 +720,16 @@ impl KittySing {
             drop: DROP_FAN_N,
         })
     }
+
+    /// Serious Mode's drain: clear any held-key run, pending celebration arm,
+    /// or live celebration while keeping the external-arm cooldown
+    /// (`last_external_arm`) intact. Idempotent.
+    pub fn drain_serious(&mut self) {
+        *self = Self {
+            last_external_arm: self.last_external_arm,
+            ..Self::default()
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -803,10 +777,10 @@ struct Note {
     seed: u32,
 }
 
-/// One frame's resolved note sprite, in CELL units relative to the singing
+/// One frame's resolved note sprite, in cell units relative to the singing
 /// cat's mouth anchor (+x ahead of the cat, −y upward). The emitter
-/// (`word_decorations::kitty_cursor`) maps cells → pixels and multiplies
-/// `alpha` by the cat's own presentation alpha.
+/// (`WordDecorations::kitty_cursor_at_placement`) maps cells → pixels and
+/// multiplies `alpha` by the cat's own presentation alpha.
 #[derive(Clone, Copy, Debug)]
 pub struct NoteSprite {
     pub dx: f32,
@@ -851,10 +825,9 @@ impl MusicNotes {
         x
     }
 
-    /// Advance the field one frame: cull dead notes, and while armed spawn one
-    /// note per new half-beat (on the riff's clock). A wind-down spawns nothing;
-    /// live notes finish their rise and fade. `streaming` is the detector's
-    /// `is_armed`, so spawning stops the instant the wind-down begins.
+    /// Advance the field one frame: cull dead notes and, while `streaming` (the
+    /// detector's `is_armed`), spawn one note per new half-beat. A wind-down spawns
+    /// nothing; live notes finish their rise and fade.
     pub fn update(&mut self, now: Instant, streaming: bool, beat: Option<f32>) {
         for slot in &mut self.ring {
             if slot
@@ -868,6 +841,7 @@ impl MusicNotes {
             return;
         };
         if !streaming {
+            self.spawned_half_beat = None;
             return;
         }
         let half_beat = (beat * 2.0).floor() as i64;
@@ -1216,8 +1190,6 @@ mod tests {
         t
     }
 
-    /// One press below the threshold arms nothing; the threshold press arms at
-    /// drive 1.0 and anchors the beat clock.
     #[test]
     fn threshold_at_cadence_arms_full_sing() {
         let mut d = KittySing::default();
@@ -1236,10 +1208,8 @@ mod tests {
         );
     }
 
-    /// A batched commit is not a hold: one IME commit of a repeated string
-    /// delivers every character at one timestamp, counting as at most one repeat
-    /// step, so sixteen `w`s in one event never arm, while the same characters
-    /// spread over repeat cadence do.
+    /// One IME commit delivers every character at one timestamp, which counts as at most one
+    /// repeat step.
     #[test]
     fn a_batched_ime_commit_of_repeats_does_not_arm() {
         let mut d = KittySing::default();
@@ -1253,8 +1223,7 @@ mod tests {
             "a single batched commit of repeats is one step, not a hold"
         );
         assert_eq!(d.drive(t0), 0.0);
-        // Genuine held-key repeats of the same char over wall time DO arm at
-        // the threshold press — the mechanism the batch must not counterfeit.
+        // The same characters spread over repeat cadence do arm.
         let mut held = KittySing::default();
         let armed_at = hold(&mut held, t0, 'w', SING_ARM_REPEATS, 30);
         assert!(
@@ -1263,8 +1232,6 @@ mod tests {
         );
     }
 
-    /// Interleaved characters never arm (the run is same-character), and real
-    /// typing with short repeated tails stays dark too.
     #[test]
     fn interleaved_chars_never_arm() {
         let mut d = KittySing::default();
@@ -1276,8 +1243,6 @@ mod tests {
         }
     }
 
-    /// Backspace never arms: `note_backspace` only releases, and it cuts a live
-    /// run short of arming.
     #[test]
     fn backspace_never_arms_and_breaks_a_run() {
         let mut d = KittySing::default();
@@ -1303,8 +1268,6 @@ mod tests {
         );
     }
 
-    /// Slower-than-cadence re-striking of the SAME key is typing, not
-    /// holding: gaps beyond [`SING_REPEAT_GAP`] never accumulate a run.
     #[test]
     fn slow_same_key_striking_never_arms() {
         let mut d = KittySing::default();
@@ -1326,10 +1289,9 @@ mod tests {
         let t = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         assert_eq!(d.drive(t), 1.0);
         let change = t + Duration::from_millis(30);
-        d.note_char(change, S, 'b'); // key change → PROVISIONAL hand-over
-        // The hand-over holds the song at full for one cadence window: one
-        // different character cannot yet be told from a new hold. The wind-down
-        // begins when the new key fails to repeat.
+        d.note_char(change, S, 'b'); // key change: a provisional hand-over
+        // One different character cannot yet be told from a new hold, so the song stays at
+        // full until the new key fails to repeat.
         assert!(
             d.is_armed(change),
             "a key change hands the song over rather than cutting it"
@@ -1355,8 +1317,7 @@ mod tests {
         assert_eq!(d.beat(done), None, "settled = byte-identical rest");
     }
 
-    /// Lazy release: letting go (no further events) starts the same crossfade
-    /// one repeat gap after the last press, with no release event.
+    /// The lazy release starts the crossfade one repeat gap after the last press.
     #[test]
     fn letting_go_winds_down_without_an_event() {
         let mut d = KittySing::default();
@@ -1374,8 +1335,7 @@ mod tests {
         assert_eq!(d.drive(gone), 0.0);
     }
 
-    /// A session switch mid-hold releases the run, and the new session must
-    /// re-earn the full arm count.
+    /// The new session must re-earn the full arm count.
     #[test]
     fn session_switch_releases_the_hold() {
         let mut d = KittySing::default();
@@ -1383,14 +1343,13 @@ mod tests {
         let t = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         assert!(d.is_armed(t));
         let t1 = t + Duration::from_millis(30);
-        d.note_char(t1, 99, 'a'); // same key, OTHER session
+        d.note_char(t1, 99, 'a'); // same key, other session
         assert!(!d.is_armed(t1), "the switch released the hold");
     }
 
-    /// Re-earning during a live wind-down re-arms, and inside a live glow the
-    /// recovery costs only [`KEY_SWITCH_REPS`] repeats (sixteen at repeat cadence
-    /// can outlast [`SING_WIND_DOWN`]). Covers three restart paths: a gap
-    /// hiccup, a stray other key, and a brief pause then resume.
+    /// Inside a live glow, recovery costs only [`KEY_SWITCH_REPS`] repeats (sixteen at repeat
+    /// cadence can outlast [`SING_WIND_DOWN`]). Three restart paths: a gap hiccup, a stray
+    /// other key, and a brief pause then resume.
     #[test]
     fn re_earning_the_threshold_during_wind_down_re_arms() {
         // Path 1 — one auto-repeat hiccup (a single gap > SING_REPEAT_GAP).
@@ -1405,8 +1364,7 @@ mod tests {
             d.drive(after_gap) < 1.0 && d.drive(after_gap) > 0.0,
             "the hiccup started a real wind-down"
         );
-        // The user keeps holding at cadence; KEY_SWITCH_REPS total presses
-        // recover the celebration — a breath, not a re-earn.
+        // Holding on at cadence, KEY_SWITCH_REPS presses in all recover the celebration.
         let mut t = after_gap;
         for _ in 1..KEY_SWITCH_REPS {
             t += Duration::from_millis(30);
@@ -1429,9 +1387,8 @@ mod tests {
              same finger"
         );
 
-        // Path 2: a stray other key mid-hold, then the hold resumes. The resume
-        // breaks the stray's provisional hand-over, so the wind anchors at the
-        // stray; three at-cadence resumes recover.
+        // Path 2: a stray other key mid-hold, then the hold resumes. The resume breaks the
+        // stray's provisional hand-over, so the wind anchors at the stray.
         let mut d = KittySing::default();
         let armed = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         let stray = armed + Duration::from_millis(30);
@@ -1466,9 +1423,7 @@ mod tests {
         assert_eq!(d.drive(last), 1.0);
     }
 
-    /// A live hold (armed, never wound down) does not re-anchor its beat clock
-    /// on every press; re-arming is only for a run that lapsed into a wind-down
-    /// and re-earned it.
+    /// Re-anchoring is only for a run that lapsed into a wind-down and re-earned it.
     #[test]
     fn a_continuous_hold_does_not_rewind_its_beat_clock() {
         let mut d = KittySing::default();
@@ -1481,7 +1436,6 @@ mod tests {
             t += Duration::from_millis(30);
             d.note_char(t, S, 'a');
         }
-        // The beat clock kept advancing from the ORIGINAL anchor — no reset.
         let expected = t.saturating_duration_since(armed).as_secs_f32() / SING_BEAT_SECONDS;
         let got = d.beat(t).expect("still armed");
         assert!(
@@ -1490,8 +1444,6 @@ mod tests {
         );
     }
 
-    /// Wind-down spawns NOTHING new and the field drains to empty — the
-    /// visual crossfade: live notes finish, no hard cut, then exact rest.
     #[test]
     fn wind_down_drains_the_note_field() {
         let mut notes = MusicNotes::default();
@@ -1519,9 +1471,27 @@ mod tests {
         );
     }
 
-    /// Reduced motion: the same field resolves to static offsets (repeated
-    /// samples of one note move zero cells) while full motion rises between the
-    /// same two samples.
+    #[test]
+    fn wind_down_clears_spawned_half_beat_so_reanchored_song_spawns_on_downbeat() {
+        let mut notes = MusicNotes::default();
+        let t0 = Instant::now();
+        notes.update(t0, true, Some(0.1));
+        assert_eq!(notes.ring.iter().flatten().count(), 1);
+        // Wind-down while beat is still Some(_) during half-beat 0:
+        let t1 = t0 + Duration::from_millis(50);
+        notes.update(t1, false, Some(0.2));
+        assert_eq!(notes.ring.iter().flatten().count(), 1);
+        // A recovered or newly fired song re-anchors beat to 0.0 (half-beat 0)
+        // before the wind-down finished; it must spawn the new song's downbeat note.
+        let t2 = t1 + Duration::from_millis(50);
+        notes.update(t2, true, Some(0.0));
+        assert_eq!(
+            notes.ring.iter().flatten().count(),
+            2,
+            "re-anchored song after wind-down frame must spawn half-beat 0 note"
+        );
+    }
+
     #[test]
     fn reduced_motion_notes_hold_still() {
         let mut notes = MusicNotes::default();
@@ -1566,11 +1536,8 @@ mod tests {
         }
     }
 
-    /// The mixer is a bijection: each stage of [`song_signature`] is invertible
-    /// (xorshifts by 16/15 and two odd multiplies), so this test builds the
-    /// exact inverse (Newton–Hensel for the modular inverses, standard xorshift
-    /// unwinding) and walks every valid `char`. Any shared signature would break
-    /// the round trip.
+    /// Each stage of [`song_signature`] is invertible, so the test builds the exact inverse
+    /// and round-trips every valid `char`.
     #[test]
     fn song_signature_mixer_is_bijective_over_all_chars() {
         /// Multiplicative inverse of odd `m` mod 2^32 (Newton–Hensel: each
@@ -1686,9 +1653,8 @@ mod tests {
         assert_eq!(host.d.signature(), song_signature('r'));
     }
 
-    /// A six-key medley, each key held a bar or more: the drive never dips,
-    /// every key's verse is heard in order, and pushed bar indices stay strictly
-    /// monotone on the one grid.
+    /// Each key held over a bar: the drive never dips, every verse is heard in order, and bar
+    /// indices stay strictly monotone.
     #[test]
     fn a_six_key_medley_holds_the_stage_end_to_end() {
         let t0 = Instant::now();
@@ -1721,9 +1687,6 @@ mod tests {
         );
     }
 
-    /// Genuine typing still winds the song down: distinct non-repeating
-    /// characters lose the celebration, wind-down anchored at the departure,
-    /// drive to 0, settle to rest.
     #[test]
     fn genuine_typing_still_winds_the_song_down() {
         let mut d = KittySing::default();
@@ -1733,7 +1696,7 @@ mod tests {
         let a = armed + Duration::from_millis(30);
         d.note_char(a, S, 'a'); // provisional — could still be a switch
         let r = a + Duration::from_millis(30);
-        d.note_char(r, S, 'r'); // a second distinct char: this is TYPING
+        d.note_char(r, S, 'r'); // a second distinct char: typing
         assert!(
             d.drive(r) < 1.0,
             "typing proves itself and the wind-down is already running"
@@ -1744,10 +1707,8 @@ mod tests {
         assert_eq!(d.beat(gone), None, "settled = byte-identical rest");
     }
 
-    /// Forgiveness: a pause a beat too long mid-switch (the new key's initial
-    /// repeat delay passes [`SING_REPEAT_GAP`]) starts the wind-down; while the
-    /// glow fades, three repeats of the new key recover it, and the drive never
-    /// falls through the host's 0.33 face gate.
+    /// The new key's initial repeat delay outruns [`SING_REPEAT_GAP`]: three repeats inside
+    /// the fading glow recover it before the drive crosses the host's 0.33 face gate.
     #[test]
     fn a_missed_gap_recovers_with_three_reps_inside_the_glow() {
         let t0 = Instant::now();
@@ -1780,9 +1741,7 @@ mod tests {
         );
     }
 
-    /// Cold arms still cost sixteen: the three-repeat forgiveness applies only
-    /// inside a live glow; from rest or after a settled wind-down the full hold
-    /// is required.
+    /// The three-repeat forgiveness applies only inside a live glow.
     #[test]
     fn cold_arms_still_cost_sixteen() {
         let mut d = KittySing::default();
@@ -1797,7 +1756,7 @@ mod tests {
             30,
         );
         assert!(d.is_armed(t), "sixteen still arm");
-        // Wind fully down, settle, and the forgiveness window is CLOSED.
+        // Wind fully down, settle, and the forgiveness window is closed.
         d.note_break(t + Duration::from_millis(30));
         let drained = t + Duration::from_secs_f32(SING_WIND_DOWN + 0.1);
         assert_eq!(d.drive(drained), 0.0);
@@ -1815,10 +1774,9 @@ mod tests {
         );
     }
 
-    // -- the armed celebration (§27) ------------------------------------------
+    // -- the armed celebration ------------------------------------------------
 
-    /// Drive the detector at ~60 Hz as the host does. A green block is the OSC
-    /// 133/633 `D` (status 0) the host reports for a keyed Enter.
+    /// Drive the detector at ~60 Hz, as the host does.
     fn frames(
         d: &mut KittySing,
         from: Instant,
@@ -1832,11 +1790,8 @@ mod tests {
         }
     }
 
-    /// An armed celebration fires on the next green block, once: the arm lights
-    /// nothing by itself; a green block in another session leaves it waiting;
-    /// this session's green block fires it at full drive with the chosen key's
-    /// signature; a second green block while it plays re-anchors nothing, and
-    /// one after it settles starts nothing.
+    /// Another session's green block leaves the arm waiting; a second green block while the
+    /// run plays re-anchors nothing.
     #[test]
     fn an_armed_celebration_fires_on_the_next_green_block_and_only_once() {
         let mut d = KittySing::default();
@@ -1892,11 +1847,9 @@ mod tests {
         );
     }
 
-    /// A celebration's fans ride the bars and the outro ends on do: a four-bar
-    /// run hands the host one fan per bar on the first frame that sees it (5, 7,
-    /// 9, 11 stars, the ring on the fourth), then once, at or after the last bar
-    /// line, the outro in the run's signature with its drop fan. The synth's half
-    /// is `trail_sound`'s `the_outro_s_lead_is_do_and_holds_the_sing_duck`.
+    /// A four-bar run hands one fan per bar (5, 7, 9, 11 stars, the ring on the fourth), then
+    /// one outro at the last bar line. The synth's half is `trail_sound`'s
+    /// `the_outro_s_lead_is_do_and_holds_the_sing_duck`.
     #[test]
     fn a_celebration_s_fans_ride_the_bars_and_the_outro_ends_on_do() {
         let mut d = KittySing::default();
@@ -1927,9 +1880,8 @@ mod tests {
         );
         for (t, f) in &fans {
             let line = t0 + Duration::from_secs_f32(f.bar as f32 * SING_BAR_SECONDS);
-            // `line` is `bar × 1.6` in f32 (a few ns off the frame clock), so
-            // the early side gets 1 ms tolerance and the late side the frame's
-            // 16 ms.
+            // `line` is `bar × 1.6` in f32, a few ns off the frame clock: 1 ms early, one
+            // 16 ms frame late.
             assert!(
                 line.saturating_duration_since(*t) <= Duration::from_millis(1)
                     && t.saturating_duration_since(line) < Duration::from_millis(17),
@@ -1953,8 +1905,8 @@ mod tests {
             "the fan count caps at {BAR_FAN_CAP}"
         );
         assert!(
-            bar_fan(7).ring && !bar_fan(4).ring,
-            "the ring rides every fourth bar"
+            bar_fan(7).ring && !bar_fan(4).ring && bar_fan(u64::MAX).ring,
+            "the ring rides every fourth bar without overflowing at u64::MAX"
         );
     }
 
@@ -2028,8 +1980,8 @@ mod tests {
         assert_eq!(d.take_bar_fan(t), None);
         assert_eq!(d.take_outro(t), None);
         assert!(!d.external_live());
-        // A HELD KEY still sings — the human path is untouched — and its bars
-        // now carry fans too, while the outro stays the armed run's alone.
+        // A held key still sings (the human path is untouched), its bars carry
+        // fans too, and the outro stays the armed run's alone.
         let armed = hold(&mut d, t, 'a', SING_ARM_REPEATS, 30);
         assert!(d.is_armed(armed));
         assert_eq!(d.take_bar_fan(armed).map(|f| f.n), Some(BAR_FAN_BASE));
@@ -2047,10 +1999,8 @@ mod tests {
         );
     }
 
-    /// The cooldown: a second arm straight after the first is `AlreadyArmed`;
-    /// after the first fires and settles, a new arm within thirty seconds of the
-    /// first arm is `Cooldown` with the remainder; at thirty seconds it is
-    /// admitted. Out-of-range bars are refused before either check.
+    /// Out-of-range bars are refused before the pending-arm and cooldown checks; the cooldown
+    /// runs from the arm, not the fire.
     #[test]
     fn the_cooldown_refuses_a_second_arm_for_thirty_seconds() {
         let mut d = KittySing::default();

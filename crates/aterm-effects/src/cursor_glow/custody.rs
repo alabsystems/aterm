@@ -158,7 +158,7 @@ pub(super) struct HandRow {
 /// A generic input boundary may move input away from the drawn caret. Only
 /// an observed park on that boundary's source row displaces its ownership;
 /// initial program output alone establishes no such claim.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct UnownedCaret {
     pub(super) row: u16,
     pub(super) parked: bool,
@@ -224,7 +224,7 @@ impl TypedStamps {
         let mut kept = Self::default();
         let mut later = Self::default();
         let (mut nk, mut nl) = (0, 0);
-        for t in self.slots.into_iter().flatten() {
+        for t in self.slots.into_iter().map_while(|s| s) {
             if t <= at {
                 kept.slots[nk] = Some(t);
                 nk += 1;
@@ -268,7 +268,7 @@ impl TypedStamps {
     pub(super) fn retain(&mut self, keep: impl Fn(Instant) -> bool) {
         let mut kept = [None; TYPED_STAMP_DEPTH];
         let mut n = 0;
-        for t in self.slots.into_iter().flatten() {
+        for t in self.slots.into_iter().map_while(|s| s) {
             if keep(t) {
                 kept[n] = Some(t);
                 n += 1;
@@ -294,8 +294,8 @@ impl TypedStamps {
     pub(crate) fn any_fresh(&self, now: Instant, window: f32) -> bool {
         self.slots
             .iter()
-            .flatten()
-            .any(|t| now.saturating_duration_since(*t).as_secs_f32() <= window)
+            .map_while(|s| *s)
+            .any(|t| now.saturating_duration_since(t).as_secs_f32() <= window)
     }
 
     /// Drop only stamps older than `window`: the hidden→visible boundary
@@ -314,17 +314,18 @@ impl TypedStamps {
     pub(crate) fn peek_fresh(&self, now: Instant, window: f32) -> Option<Instant> {
         self.slots
             .iter()
-            .flatten()
-            .copied()
+            .map_while(|s| *s)
             .find(|t| now.saturating_duration_since(*t).as_secs_f32() <= window)
     }
 
     /// Consume the oldest still-fresh stamp (one stamp, one echo sweep —
     /// keys license echoes in press order). Stale stamps are left in place.
     pub(crate) fn take_fresh(&mut self, now: Instant, window: f32) -> Option<Instant> {
-        let idx = self.slots.iter().position(|slot| {
-            slot.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() <= window)
-        })?;
+        let idx = self
+            .slots
+            .iter()
+            .map_while(|s| *s)
+            .position(|t| now.saturating_duration_since(t).as_secs_f32() <= window)?;
         let taken = self.slots[idx];
         self.slots.copy_within(idx + 1.., idx);
         self.slots[TYPED_STAMP_DEPTH - 1] = None;
@@ -457,19 +458,23 @@ impl PressCredits {
         self.within(now).count()
     }
 
+    /// Whether any unpaid press is live at `now`.
+    pub(super) fn any_within(&self, now: Instant) -> bool {
+        self.within(now).next().is_some()
+    }
+
     /// The oldest unpaid press, or `None`: the typed licence of last resort for
     /// a same-row forward echo that landed after every stamp went stale
     /// (`classify_move`). Oldest, because presses license echoes in order.
     pub(super) fn oldest_unpaid(&self, now: Instant) -> Option<Instant> {
         // The free presses are paid before the held ones
         // ([`Self::spend_counting`]), so the oldest of them is the next.
-        let oldest = |held: bool| {
-            self.within(now)
-                .filter(|&(t, _, _)| self.held(t) == held)
-                .map(|(t, _, _)| t)
-                .min()
-        };
-        oldest(false).or_else(|| oldest(true))
+        let (mut free, mut held) = (None::<Instant>, None::<Instant>);
+        for (t, _, _) in self.within(now) {
+            let slot = if self.held(t) { &mut held } else { &mut free };
+            *slot = Some(slot.map_or(t, |prev| prev.min(t)));
+        }
+        free.or(held)
     }
 
     /// The last press still funding a foreign-row park; once it ages out the
@@ -988,6 +993,9 @@ pub(super) struct TornLay {
     pub(super) moved_at: Instant,
     /// The hand's row before the lay put the hand on `row`.
     pub(super) hand_before: Option<HandRow>,
+    /// The generic boundary's doubt before the lay settled it
+    /// ([`CursorGlow::hand_lands_on`]); a recall restores it with the hand.
+    pub(super) unowned_before: Option<UnownedCaret>,
     /// The print anchor's `seq` at the lay.
     pub(super) anchor_seq: Option<u64>,
     /// A print since the lay ended on another row: the program wrote
@@ -2161,8 +2169,9 @@ impl CursorGlow {
             self.user_gesture_hint = None;
         }
         self.last_licensed_row = Some((cr, now));
-        self.hand_row = Some(HandRow::at(cr));
-        self.unowned_caret = None;
+        // The insert's bytes landed at the caret: the hand's own input, as a
+        // typed key's echo is.
+        self.hand_lands_on(cr);
         if self.v2.engaged() {
             // Born on the delivery clock (the echoing frame shows the run lit,
             // no edge-in), floored like a key's sweep.
@@ -2409,7 +2418,7 @@ impl CursorGlow {
         if self.type_press_ring.is_empty() {
             return;
         }
-        let live = self.type_press_ring.presses_within(now) > 0;
+        let live = self.type_press_ring.any_within(now);
         self.type_press_ring.forget();
         if live {
             self.in_flight_tally.forgotten += 1;
@@ -2795,6 +2804,20 @@ impl CursorGlow {
         self.unowned_caret = self
             .last
             .map(|(row, _)| UnownedCaret { row, parked: false });
+    }
+
+    /// A licensed echo of the hand's own input landed on `row`: a typed key's
+    /// ([`Self::spawn_judged`]) or a delivered insert's ([`Self::lay_insert`]).
+    /// The hand types there now ([`Self::hand_row`]), and a generic boundary's
+    /// doubt about that row ([`Self::unowned_caret`]) is settled: the row took
+    /// the hand's input, so a park observed after the hand moves on to another
+    /// row (a composer's next line, then Backspace back) cannot disown it. A
+    /// doubt about another row stands.
+    pub(super) fn hand_lands_on(&mut self, row: u16) {
+        self.hand_row = Some(HandRow::at(row));
+        if self.unowned_caret.is_some_and(|caret| caret.row == row) {
+            self.unowned_caret = None;
+        }
     }
 
     /// [`Self::clear_typed`] for a press that cannot take the hand off its

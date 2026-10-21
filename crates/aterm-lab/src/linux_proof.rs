@@ -100,10 +100,18 @@ pub struct ProofArgs {
     /// ([`crate::linux_baseline::deck_row`]), one per display family, no
     /// tests, other sessions, display-gone rows or baseline.
     pub deck_only: bool,
+    /// `edges`: only the untested edges' rows ([`crate::linux_edges`]), no
+    /// other tests, sessions, display-gone rows or baseline.
+    pub edges_only: bool,
+    /// `edges --edge E`: the edge rows to run; every one when empty.
+    pub edges: Vec<crate::linux_edges::Edge>,
     /// `gone --wgpu-oracle`: aterm-gui built with aterm-gpu's `wgpu-oracle`,
     /// so its windows attach on wgpu (Vulkan, lavapipe), the Linux renderer
     /// before GW.4's GL arm, instead of the GL arm.
     pub wgpu_oracle: bool,
+    /// `--weston-renderer pixman`: every weston the run starts draws with
+    /// its pixman renderer (the VM and kiosk case) instead of GL.
+    pub weston_renderer: &'static str,
 }
 
 /// `proof [--arch A]... [--display D]... [--keep-build] [--keep-up]`: every
@@ -163,6 +171,17 @@ pub fn parse_deck(args: &[String]) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
+/// `edges [--arch A]... [--edge E]... [--keep-build] [--keep-up]`: every
+/// arch and every edge row when none is named.
+///
+/// # Errors
+/// A usage error.
+pub fn parse_edges(args: &[String]) -> Result<ProofArgs, Fail> {
+    let mut p = parse_args(args, "edges")?;
+    p.edges_only = true;
+    Ok(p)
+}
+
 /// `a11y [--arch A]... [--keep-build] [--keep-up]`: every arch when none is
 /// named; its aterm-gui rows run under Xvfb.
 ///
@@ -186,7 +205,10 @@ fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
         cpu_only: false,
         a11y_only: false,
         deck_only: false,
+        edges_only: false,
+        edges: Vec::new(),
         wgpu_oracle: false,
+        weston_renderer: "gl",
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -200,7 +222,23 @@ fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
                     p.arches.push(arch);
                 }
             }
-            "--display" if verb != "a11y" => {
+            "--edge" if verb == "edges" => {
+                let w = it.next().map_or("", String::as_str);
+                let e = crate::linux_edges::Edge::parse(w).ok_or_else(|| {
+                    let all: Vec<&str> = crate::linux_edges::Edge::ALL
+                        .iter()
+                        .map(|e| e.slug())
+                        .collect();
+                    Fail::usage(format!(
+                        "linux {verb}: --edge {w}: one of {}",
+                        all.join(", ")
+                    ))
+                })?;
+                if !p.edges.contains(&e) {
+                    p.edges.push(e);
+                }
+            }
+            "--display" if verb != "a11y" && verb != "edges" => {
                 let w = it.next().map_or("", String::as_str);
                 let d = Display::parse(w)
                     .filter(|d| Display::PROOF.contains(d))
@@ -216,6 +254,20 @@ fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
             "--keep-build" => p.keep_build = true,
             "--keep-up" => p.keep_up = true,
             "--wgpu-oracle" if verb == "gone" => p.wgpu_oracle = true,
+            // a11y starts no weston, and the edges' one weston row is pixman's
+            // whatever a run names: the switch would change nothing there.
+            "--weston-renderer" if verb != "a11y" && verb != "edges" => {
+                p.weston_renderer = match it.next().map(String::as_str) {
+                    Some("gl") => "gl",
+                    Some("pixman") => "pixman",
+                    w => {
+                        return Err(Fail::usage(format!(
+                            "linux {verb}: --weston-renderer {}: gl or pixman",
+                            w.unwrap_or("")
+                        )));
+                    }
+                };
+            }
             other => {
                 return Err(Fail::usage(format!(
                     "linux {verb}: unknown argument '{other}' ({LAB} linux help)"
@@ -634,6 +686,21 @@ pub fn reply(text: &str) -> &str {
     text.trim_end()
 }
 
+/// Why a control verb's run was not taken: the verb, what it answered and
+/// how it ended ([`Out::status`]). An empty reply alone cannot tell a signal
+/// that ended the guest's `aterm-ctl` from one that ended this Mac's
+/// `limactl`; LWI-LAND's stats Deck row once failed so
+/// (`docs/measured/linux-x11-gone-2026-10-21.md`).
+#[must_use]
+pub(crate) fn refused(verb: &[&str], out: &Out) -> String {
+    format!(
+        "`{}` answered {:?} ({})",
+        verb.join(" "),
+        crate::util::one_line(reply(&out.text), 200),
+        out.status()
+    )
+}
+
 /// The screen row (0-based, as `select line` takes it) that holds [`ECHO`]
 /// alone: the output of [`TYPED`], never the typed line.
 #[must_use]
@@ -902,6 +969,38 @@ impl Gui<'_> {
         )
     }
 
+    /// [`Gui::start_logged_on`] with `extra` added to its environment.
+    ///
+    /// # Errors
+    /// `systemd-run` refused it.
+    pub(crate) fn start_logged_with(
+        &self,
+        client: &[(String, String)],
+        extra: &[(String, String)],
+        stderr: &str,
+    ) -> Result<String, String> {
+        self.start_unit(Some(client), extra, Some(stderr), false)
+    }
+
+    /// [`Gui::start_watched`] on a display that is not one of the lane's
+    /// [`Display`]s: `client` is what aterm-gui is told to reach it by.
+    ///
+    /// # Errors
+    /// `systemd-run` refused it.
+    pub(crate) fn start_watched_on(
+        &self,
+        client: &[(String, String)],
+        stderr: &str,
+        status: &str,
+    ) -> Result<String, String> {
+        self.start_unit(
+            Some(client),
+            &[("ATERM_LANE_STATUS".into(), status.into())],
+            Some(stderr),
+            true,
+        )
+    }
+
     fn start_with(
         &self,
         display: Option<Display>,
@@ -1019,26 +1118,25 @@ impl Gui<'_> {
         }
     }
 
-    /// Send `verb`; its reply when `ok` accepts it.
-    fn expect(&self, verb: &[&str], ok: &dyn Fn(&str) -> bool) -> Result<String, String> {
+    /// Send `verb`; its reply when it exited 0 and `ok` accepts it, else
+    /// [`refused`].
+    pub(crate) fn expect(
+        &self,
+        verb: &[&str],
+        ok: &dyn Fn(&str) -> bool,
+    ) -> Result<String, String> {
         let out = self.ctl(verb);
         let reply = reply(&out.text).to_string();
         if out.ok() && ok(&reply) {
             Ok(reply)
         } else {
-            Err(format!(
-                "`{}` answered {:?}",
-                verb.join(" "),
-                crate::util::one_line(&reply, 200)
-            ))
+            Err(refused(verb, &out))
         }
     }
 
     /// The CPU presenter's row (LW.6): typed, echoed, resized (new buffers),
-    /// `render=ok`, and the frame aterm presented (`image`). On X11 the
-    /// window's pixels as the server holds them (`lane-bus xgrab`, a second
-    /// client reading with GetImage) must equal that frame exactly; a Wayland
-    /// compositor's composited pixels are not read back here.
+    /// `render=ok`, and the frame aterm presented (`image`), held to the
+    /// display server's own pixels ([`Gui::held_to_server`]).
     fn judge_cpu(&self, display: Display, results: &Path) -> Result<String, String> {
         if !self.up.sh(&guest::wait_socket(&self.sock(), 60)).ok() {
             return Err("the control socket never listened (60 s)".into());
@@ -1076,8 +1174,9 @@ impl Gui<'_> {
     /// the X window's (`lane-bus xgrab`) or weston's output
     /// (`weston-screenshooter`, which needs weston's `--debug`: headless
     /// weston's through [`linux::start_weston_capturing`], weston's x11
-    /// backend's always). Mutter's pixels are not read back. What the row's
-    /// detail says of it.
+    /// backend's always) or Mutter's primary monitor (`lane-bus cast`, a
+    /// ScreenCast frame, which needs the user's pipewire before Mutter). What
+    /// the row's detail says of it.
     pub(crate) fn held_to_server(
         &self,
         display: Display,
@@ -1236,10 +1335,114 @@ impl Gui<'_> {
                     output.1, output.2, view.width, view.height, view.format, view.x, view.y
                 ))
             }
-            Display::Mutter => Ok(format!(
-                "presented {w}x{h} (frame {frame}; Mutter's pixels are not read back)"
-            )),
+            Display::Mutter => {
+                let shot = self.mutter_cast(results, suffix)?;
+                let output = std::fs::read(&shot)
+                    .ok()
+                    .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
+                    .ok_or_else(|| format!("{}: not a PNG this lab decodes", shot.display()))?;
+                // Mutter names no window's place, so the frame is found: the
+                // one place on the monitor that shows it whole and exactly.
+                let (fx, fy) = match frame_places(&output, &presented, live.clone()).as_slice() {
+                    [one] => *one,
+                    [] => {
+                        // Where Mutter centres a new window, for the record.
+                        let centred = held_at(
+                            &output,
+                            &presented,
+                            (output.1 as i64 - w as i64) / 2,
+                            (output.2 as i64 - h as i64) / 2,
+                            live,
+                        )
+                        .err()
+                        .unwrap_or_default();
+                        return Err(format!(
+                            "Mutter's {}x{} monitor (lane-bus cast) shows the presented {w}x{h} \
+                             frame {frame} nowhere exactly; centred: {centred} (monitor {})",
+                            output.1,
+                            output.2,
+                            shot.display()
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Mutter's monitor shows the presented {w}x{h} frame {frame} in more \
+                             than one place (monitor {})",
+                            shot.display()
+                        ));
+                    }
+                };
+                let d = self.expect(&["dims"], &|r| r.starts_with("OK "))?;
+                let num = |k: &str| field(&d, k).and_then(|v| v.parse::<i64>().ok());
+                let surface = (
+                    num("surface_w").and_then(|v| usize::try_from(v).ok()),
+                    num("surface_h").and_then(|v| usize::try_from(v).ok()),
+                );
+                let bands = match surface {
+                    (Some(sw), Some(sh)) if (sw, sh) != (w, h) => {
+                        // A size the compositor chose (a maximized window's):
+                        // the surface sits `dims`' offset up and left of the
+                        // frame, and its bands continue the frame's edge.
+                        let (ox, oy) = (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0));
+                        let view = WestonView {
+                            x: fx as i64 - ox,
+                            y: fy as i64 - oy,
+                            width: sw,
+                            height: sh,
+                            format: "XRGB8888".into(),
+                        };
+                        let n =
+                            bands_held(&output, &presented, &view, (ox, oy)).map_err(|why| {
+                                format!("{why} (frame {frame}, monitor {})", shot.display())
+                            })?;
+                        format!(
+                            ", {ox},{oy} into its {sw}x{sh} surface, whose {n} band pixels are \
+                             each the frame's nearest pixel"
+                        )
+                    }
+                    _ => String::new(),
+                };
+                Ok(format!(
+                    "Mutter's {}x{} monitor (lane-bus cast, a ScreenCast frame through PipeWire) \
+                     shows the presented {w}x{h} frame exactly at ({fx},{fy}){bands}",
+                    output.1, output.2
+                ))
+            }
         }
+    }
+
+    /// The whole primary monitor of the lane's Mutter, as `lane-bus cast`
+    /// writes it (a ScreenCast frame read through PipeWire), copied out as
+    /// `<name><suffix>-monitor.png`.
+    fn mutter_cast(&self, results: &Path, suffix: &str) -> Result<PathBuf, String> {
+        let pid = unit_pid(self.up, &format!("{}mutter", guest::UNIT_PREFIX))
+            .ok_or_else(|| "Mutter's unit has no main pid".to_string())?;
+        let guest_png = format!("{}/{}{suffix}-monitor.png", self.dir, self.name);
+        let env = [
+            (
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                format!("unix:path={}/bus", self.up.runtime),
+            ),
+            ("XDG_RUNTIME_DIR".to_string(), self.up.runtime.clone()),
+        ];
+        let cast = self.up.sh(&guest::with_env(
+            &env,
+            &[
+                format!("{}/lane-bus", self.bin),
+                "cast".into(),
+                pid,
+                guest_png.clone(),
+            ],
+        ));
+        if !cast.ok() {
+            return Err(format!("lane-bus cast: {}", cast.tail(3)));
+        }
+        let local = results.join(format!("{}{suffix}-monitor.png", self.name));
+        let copied = self.up.lima.copy_out(&guest_png, &local);
+        if !copied.ok() {
+            return Err(format!("{guest_png} not copied out: {}", copied.tail(2)));
+        }
+        Ok(local)
     }
 
     /// The X window's pixels (`lane-bus xgrab` of the window aterm-gui's
@@ -1368,37 +1571,24 @@ impl Gui<'_> {
         if !listening.ok() {
             return Err("the control socket never listened (60 s)".into());
         }
-        let expect = |verb: &[&str], ok: &dyn Fn(&str) -> bool| -> Result<String, String> {
-            let out = self.ctl(verb);
-            let reply = reply(&out.text).to_string();
-            if out.ok() && ok(&reply) {
-                Ok(reply)
-            } else {
-                Err(format!(
-                    "`{}` answered {:?}",
-                    verb.join(" "),
-                    crate::util::one_line(&reply, 200)
-                ))
-            }
-        };
-        expect(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
-        let before = expect(&["dims"], &|r| r.starts_with("OK "))?;
-        expect(&["send", TYPED], &|r| r.starts_with("OK"))?;
-        expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
-        expect(&["await", "match", ECHO, "timeout=60000"], &|r| {
+        self.expect(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
+        let before = self.expect(&["dims"], &|r| r.starts_with("OK "))?;
+        self.expect(&["send", TYPED], &|r| r.starts_with("OK"))?;
+        self.expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
+        self.expect(&["await", "match", ECHO, "timeout=60000"], &|r| {
             r.starts_with("OK match")
         })?;
-        expect(&["resize", "30", "100"], &|r| r.starts_with("OK"))?;
-        expect(&["dims"], &|r| dims_are(r, 30, 100))?;
+        self.expect(&["resize", "30", "100"], &|r| r.starts_with("OK"))?;
+        self.expect(&["dims"], &|r| dims_are(r, 30, 100))?;
         let clipboard = match display {
             Some(d) if d.clipboard_scriptable() => {
                 let (_, x) = d.client_env(&self.up.runtime);
                 // The echoed line, selected by its row and copied: exactly its bytes.
-                let screen = expect(&["text"], &|r| echo_row(r).is_some())?;
+                let screen = self.expect(&["text"], &|r| echo_row(r).is_some())?;
                 let row = echo_row(&screen).unwrap_or_default().to_string();
-                expect(&["select", "line", &row], &|r| r.starts_with("OK"))?;
+                self.expect(&["select", "line", &row], &|r| r.starts_with("OK"))?;
                 let copied = format!("OK {}", ECHO.len());
-                expect(&["copy"], &|r| r == copied)?;
+                self.expect(&["copy"], &|r| r == copied)?;
                 // Out: another X client reads it, so aterm served the selection.
                 let read = self
                     .up
@@ -1430,11 +1620,11 @@ impl Gui<'_> {
                 {
                     return Err(format!("xclip never owned CLIPBOARD with {FOREIGN} (60 s)"));
                 }
-                expect(&["send", PASTE_BEFORE], &|r| r.starts_with("OK"))?;
-                expect(&["invoke", "unread=ok", "Paste"], &|r| r.starts_with("OK"))?;
-                expect(&["send", PASTE_AFTER], &|r| r.starts_with("OK"))?;
-                expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
-                expect(&["await", "match", PASTED, "timeout=60000"], &|r| {
+                self.expect(&["send", PASTE_BEFORE], &|r| r.starts_with("OK"))?;
+                self.expect(&["invoke", "unread=ok", "Paste"], &|r| r.starts_with("OK"))?;
+                self.expect(&["send", PASTE_AFTER], &|r| r.starts_with("OK"))?;
+                self.expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
+                self.expect(&["await", "match", PASTED, "timeout=60000"], &|r| {
                     r.starts_with("OK match")
                 })?;
                 format!(", clipboard {ECHO} copied and read by xclip, xclip's {FOREIGN} pasted")
@@ -1442,10 +1632,10 @@ impl Gui<'_> {
             Some(_) => ", clipboard not driven (a Wayland selection needs an input seat)".into(),
             None => String::new(),
         };
-        let status = expect(&["status"], &|r| field(r, "render") == Some("ok"))?;
-        let metrics = expect(&["metrics", "percentiles"], &|r| r.starts_with("OK"))?;
+        let status = self.expect(&["status"], &|r| field(r, "render") == Some("ok"))?;
+        let metrics = self.expect(&["metrics", "percentiles"], &|r| r.starts_with("OK"))?;
         let frame = format!("{}.png", self.name);
-        let image = expect(&["image", &frame], &|r| r.starts_with("OK "))?;
+        let image = self.expect(&["image", &frame], &|r| r.starts_with("OK "))?;
         let kept = image
             .split_whitespace()
             .nth(3)
@@ -1456,7 +1646,7 @@ impl Gui<'_> {
             .unwrap_or(false);
         // After the frame: a headless session builds its device at its first
         // pixel demand, the `image`.
-        let summary = expect(&["metrics"], &|r| r.starts_with("OK "))?;
+        let summary = self.expect(&["metrics"], &|r| r.starts_with("OK "))?;
         let size = |r: &str| {
             let w: Vec<&str> = r.split_whitespace().collect();
             format!("{}x{}", w.get(1).unwrap_or(&"?"), w.get(2).unwrap_or(&"?"))
@@ -1644,6 +1834,60 @@ pub(crate) fn held_at(
         .map_err(|why| format!("at {x},{y}, {vw}x{vh} of the frame on the output: {why}"))
 }
 
+/// Where on `screen` (RGBA) the whole of `frame` (RGBA) shows exactly, by
+/// RGB, its rows in `live` aside: the top-left corners it shows at, at most
+/// two (a frame shown in two places is not placed). A frame larger than the
+/// screen, or with no row to hold, shows nowhere.
+pub(crate) fn frame_places(
+    screen: &(Vec<u8>, usize, usize),
+    frame: &(Vec<u8>, usize, usize),
+    live: std::ops::Range<usize>,
+) -> Vec<(usize, usize)> {
+    let (s, sw, sh) = (&screen.0, screen.1, screen.2);
+    let (f, w, h) = (&frame.0, frame.1, frame.2);
+    let rows: Vec<usize> = (0..h).filter(|r| !live.contains(r)).collect();
+    if w == 0 || w > sw || h > sh || s.len() < sw * sh * 4 || f.len() < w * h * 4 {
+        return Vec::new();
+    }
+    let (Some(&top), Some(&bottom)) = (rows.first(), rows.last()) else {
+        return Vec::new();
+    };
+    let middle = rows[rows.len() / 2];
+    // Three pixels first, so most places are passed over at once.
+    let probes = [(0, top), (w - 1, bottom), (w / 2, middle)];
+    let rgb = |buf: &[u8], stride: usize, x: usize, y: usize| {
+        let at = (y * stride + x) * 4;
+        [buf[at], buf[at + 1], buf[at + 2]]
+    };
+    let mut found = Vec::new();
+    for y in 0..=sh - h {
+        for x in 0..=sw - w {
+            if probes
+                .iter()
+                .any(|&(px, py)| rgb(s, sw, x + px, y + py) != rgb(f, w, px, py))
+            {
+                continue;
+            }
+            let whole = rows.iter().all(|&r| {
+                let (a, b) = (((y + r) * sw + x) * 4, r * w * 4);
+                s[a..a + w * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(f[b..b + w * 4].as_chunks::<4>().0)
+                    .all(|(p, q)| p[..3] == q[..3])
+            });
+            if whole {
+                found.push((x, y));
+                if found.len() == 2 {
+                    return found;
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Whether the bands of a window's buffer that a frame smaller than it
 /// leaves (`frame` at `offset` in the buffer weston shows as `view`) are on
 /// `screen` (RGBA, weston's whole output) as the CPU presenter fills them:
@@ -1735,6 +1979,15 @@ pub fn cmd_deck(args: &[String]) -> Res {
     run(&parse_deck(args)?, "deck")
 }
 
+/// `linux edges …`: the proof's untested-edge rows alone
+/// ([`crate::linux_edges`]).
+///
+/// # Errors
+/// A usage error, or the lane could not be brought up (NOT RUN).
+pub fn cmd_edges(args: &[String]) -> Res {
+    run(&parse_edges(args)?, "edges")
+}
+
 /// `linux a11y …`: the proof's accessibility runtime rows alone
 /// ([`crate::linux_a11y`]).
 ///
@@ -1754,7 +2007,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
     std::fs::create_dir_all(&results)
         .map_err(|e| Fail::die(format!("{}: {e}", results.display())))?;
     let t0 = Instant::now();
-    let up = match linux::bring_up() {
+    let mut up = match linux::bring_up() {
         Ok(up) => up,
         Err(f) => {
             // Nothing ran, so nothing is kept: an empty directory says nothing.
@@ -1762,6 +2015,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             return Err(f);
         }
     };
+    up.weston_renderer = ask.weston_renderer;
     let mut rows: Vec<Row> = up
         .timings
         .iter()
@@ -1782,17 +2036,18 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
     // The baseline's replay (LW.4): every screen of a display this proof
     // runs (weston's take weston-x11's too), against the recordings
     // committed in `linux_baseline::DIR`.
-    let baseline = if ask.gone_only || ask.cpu_only || ask.a11y_only || ask.deck_only {
-        None
-    } else {
-        match crate::linux_baseline::Baseline::begin(&up, &results, false) {
-            Ok(b) => Some(b),
-            Err(row) => {
-                rows.push(row);
-                None
+    let baseline =
+        if ask.gone_only || ask.cpu_only || ask.a11y_only || ask.deck_only || ask.edges_only {
+            None
+        } else {
+            match crate::linux_baseline::Baseline::begin(&up, &results, false) {
+                Ok(b) => Some(b),
+                Err(row) => {
+                    rows.push(row);
+                    None
+                }
             }
-        }
-    };
+        };
     'arches: for &arch in &ask.arches {
         let tag = format!("{} ({})", arch.name(), arch.runs());
         if arch == Arch::X86_64 {
@@ -1839,7 +2094,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         };
         // The tests, a proof's alone: `gone` runs only its display-gone rows,
         // `cpu` only its CPU rows, `a11y` and `deck` only their own.
-        if !ask.gone_only && !ask.cpu_only && !ask.a11y_only && !ask.deck_only {
+        if !ask.gone_only && !ask.cpu_only && !ask.a11y_only && !ask.deck_only && !ask.edges_only {
             let mut tests = vec!["--no-fail-fast", "--tests"];
             for p in TESTED {
                 tests.extend(["-p", p]);
@@ -1954,7 +2209,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 break 'arches;
             }
         }
-        if let Some(cell) = &a11y
+        if let Some(cell) = a11y.as_ref().filter(|_| !ask.edges_only)
             && let Err(s) = crate::linux_a11y::test_rows(cell, &mut rows)
         {
             stopped = Some(s);
@@ -2002,19 +2257,25 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 tally(&out.text).error.unwrap_or_else(|| out.tail(5))
             },
         });
-        let sessions: Vec<Option<Display>> = if ask.gone_only || ask.a11y_only || ask.deck_only {
-            Vec::new()
-        } else if ask.cpu_only {
-            ask.displays.iter().copied().map(Some).collect()
-        } else {
-            std::iter::once(None)
-                .chain(ask.displays.iter().copied().map(Some))
-                .collect()
-        };
+        let sessions: Vec<Option<Display>> =
+            if ask.gone_only || ask.a11y_only || ask.deck_only || ask.edges_only {
+                Vec::new()
+            } else if ask.cpu_only {
+                ask.displays.iter().copied().map(Some).collect()
+            } else {
+                std::iter::once(None)
+                    .chain(ask.displays.iter().copied().map(Some))
+                    .collect()
+            };
         for display in sessions {
+            // A weston drawing with another renderer than GL says so.
             let where_ = display.map_or_else(
                 || "--headless".to_string(),
-                |d| format!("{} ({})", d.name(), d.protocol()),
+                |d| match up.weston_renderer {
+                    "gl" => format!("{} ({})", d.name(), d.protocol()),
+                    _ if !d.runs_weston() => format!("{} ({})", d.name(), d.protocol()),
+                    r => format!("{} --renderer={r} ({})", d.name(), d.protocol()),
+                },
             );
             let gui = Gui {
                 up: &up,
@@ -2152,9 +2413,15 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             !ask.cpu_only
                 && !ask.a11y_only
                 && !ask.deck_only
+                && !ask.edges_only
                 && (ask.gone_only || crate::linux_gone::GONE.contains(d))
         });
-        let gone = gone.flat_map(|d| crate::linux_gone::End::ALL.map(|m| (d, m)));
+        let gone = gone.flat_map(|d| {
+            crate::linux_gone::End::ALL
+                .into_iter()
+                .filter(move |m| m.applies(d))
+                .map(move |m| (d, m))
+        });
         for (display, end) in gone {
             let name = format!(
                 "{tag} {} under aterm-gui{oracle}: {} ({})",
@@ -2211,8 +2478,15 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 break 'arches;
             }
         }
-        if let Some(cell) = &a11y
+        if let Some(cell) = a11y.as_ref().filter(|_| !ask.edges_only)
             && let Err(s) = crate::linux_a11y::gui_rows(cell, built, &mut rows)
+        {
+            stopped = Some(s);
+            break 'arches;
+        }
+        // The edges LW.5-LW.7 left untested: `edges`'s rows, and a proof's.
+        if let Some(cell) = a11y.as_ref().filter(|_| !ask.a11y_only)
+            && let Err(s) = crate::linux_edges::rows(cell, built, &ask.edges, &mut rows)
         {
             stopped = Some(s);
             break 'arches;
@@ -2222,7 +2496,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         let decks = guest::Screen::DECK
             .into_iter()
             .filter(|s| ask.displays.contains(&s.display.proof_display()))
-            .filter(|_| !ask.gone_only && !ask.cpu_only && !ask.a11y_only);
+            .filter(|_| !ask.gone_only && !ask.cpu_only && !ask.a11y_only && !ask.edges_only);
         for screen in decks {
             if !built {
                 rows.push(Row {
@@ -2401,6 +2675,32 @@ mod tests {
         assert!(!lists_extension(&without, "MIT-SHM"), "{without}");
     }
 
+    /// A refused verb says how it ended, so the stats Deck's empty reply
+    /// would tell a guest-side signal (a silent exit 255) from this Mac's
+    /// `limactl` ended on one (no exit status).
+    #[test]
+    fn a_refused_verb_says_how_it_ended() {
+        let out = |code: Option<i32>, text: &str| Out {
+            code,
+            text: text.into(),
+            secs: 0.0,
+        };
+        let verb = ["image", "plain", "deck-gpu-off"];
+        assert_eq!(
+            refused(&verb, &out(Some(255), "")),
+            "`image plain deck-gpu-off` answered \"\" (exit 255, nothing said: a guest command \
+             that a signal ended, or one that exited 255)"
+        );
+        assert_eq!(
+            refused(&verb, &out(None, "\n(limactl ended on signal 15)\n")),
+            "`image plain deck-gpu-off` answered \"(limactl ended on signal 15)\" (no exit status)"
+        );
+        assert_eq!(
+            refused(&["ready", "60000"], &out(Some(0), "OK timeout\n")),
+            "`ready 60000` answered \"OK timeout\" (exit 0)"
+        );
+    }
+
     #[test]
     fn a_partial_lane_never_passes() {
         assert_eq!(exit_code(&[row(Verdict::Pass), row(Verdict::Pass)]), 0);
@@ -2476,7 +2776,11 @@ mod tests {
         let one = parse_a11y(&s(&["--arch", "aarch64", "--keep-build"])).expect("parses");
         assert_eq!(one.arches, [Arch::Aarch64]);
         assert!(one.keep_build);
-        for refused in [&["--display", "xvfb"][..], &["--wgpu-oracle"][..]] {
+        for refused in [
+            &["--display", "xvfb"][..],
+            &["--wgpu-oracle"][..],
+            &["--weston-renderer", "pixman"][..],
+        ] {
             assert_eq!(
                 parse_a11y(&s(refused)).map_err(|f| f.code).err(),
                 Some(2),
@@ -2484,6 +2788,25 @@ mod tests {
             );
         }
         assert!(!parse_proof(&[]).expect("parses").a11y_only);
+    }
+
+    /// `--weston-renderer` is taken where it chooses a weston's renderer
+    /// (proof, gone, cpu, deck), and refused by `edges`, whose one weston row
+    /// is pixman's whatever a run names.
+    #[test]
+    fn the_weston_renderer_is_taken_where_it_starts_a_weston() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let pixman = s(&["--weston-renderer", "pixman"]);
+        for parse in [parse_proof, parse_gone, parse_cpu, parse_deck] {
+            assert_eq!(parse(&pixman).expect("parses").weston_renderer, "pixman");
+            assert_eq!(parse(&[]).expect("parses").weston_renderer, "gl");
+        }
+        assert_eq!(parse_edges(&pixman).map_err(|f| f.code).err(), Some(2));
+        assert!(
+            parse_edges(&s(&["--edge", "weston-pixman"]))
+                .expect("parses")
+                .edges_only
+        );
     }
 
     /// The shape of a `text` reply measured under Xvfb on 2026-10-16: only the
@@ -2749,6 +3072,41 @@ error: 1 target failed:
         let why = held_at(&output, &frame, 9, 7, 0..0).unwrap_err();
         assert!(why.starts_with("only 3x3 of the 4x5 frame at 9,7"), "{why}");
         assert!(held_at(&output, &frame, -1, 3, 0..0).is_err());
+    }
+
+    /// The frame found where it shows whole; negative controls: one pixel
+    /// off (nowhere), a live row's pixel off (still there), shown twice (not
+    /// placed), larger than the screen.
+    #[test]
+    fn a_frame_is_found_where_it_shows_whole() {
+        let pixel = |x: usize, y: usize| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7];
+        let frame = rgba(4, 5, pixel);
+        let place = |fx: usize, fy: usize, (x, y): (usize, usize)| {
+            if (fx..fx + 4).contains(&x) && (fy..fy + 5).contains(&y) {
+                pixel(x - fx, y - fy)
+            } else {
+                [40, 50, 60]
+            }
+        };
+        let output = rgba(12, 10, |x, y| place(5, 3, (x, y)));
+        assert_eq!(frame_places(&output, &frame, 0..0), [(5, 3)]);
+        let mut off = output.clone();
+        off.0[((3 + 4) * 12 + 5 + 2) * 4] ^= 1;
+        assert_eq!(frame_places(&off, &frame, 0..0), []);
+        let mut live = output.clone();
+        live.0[((3 + 2) * 12 + 5 + 1) * 4] ^= 1;
+        assert_eq!(frame_places(&live, &frame, 0..0), []);
+        assert_eq!(frame_places(&live, &frame, 2..3), [(5, 3)]);
+        let twice = rgba(12, 10, |x, y| {
+            if x < 6 {
+                place(1, 2, (x, y))
+            } else {
+                place(7, 4, (x, y))
+            }
+        });
+        assert_eq!(frame_places(&twice, &frame, 0..0), [(1, 2), (7, 4)]);
+        let small = rgba(3, 5, |_, _| [40, 50, 60]);
+        assert_eq!(frame_places(&small, &frame, 0..0), []);
     }
 
     /// A window's buffer wider and taller than its frame: the frame at its

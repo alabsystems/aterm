@@ -4,10 +4,10 @@ seq v=1 rig=screen program=claude build=2.1.0
 ctl
 wait 300
 see busy
-expect open t1 turn ledger=1 by=harness at=300
+expect open t1 turn ledger=1 by=harness @300
 see -
 input human
 wait 6000
 see busy
-expect open t2 turn par=r1 src=screen conf=strong at=6300
+expect open t2 turn par=r1 src=screen conf=strong @6300
 expect close t1 turn out=gone

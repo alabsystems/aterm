@@ -35,8 +35,8 @@
 //! dispatched parameters. A `Wildcard` matches any single parameter (but
 //! must be present). A `Literal` matches by string equality. When the
 //! selector's parameter list is shorter than the dispatched list, the
-//! selector only matches the prefix — this gives `"OSC 4"` (no params) the
-//! "match any OSC 4" semantics from §3.3.
+//! selector only matches the prefix — this gives `"OSC 4"` (no params)
+//! "match any OSC 4" semantics.
 //!
 //! `*` is the universal matcher. `response any` parses to the same selector;
 //! the distinction is documentation only (see the alias table).
@@ -94,8 +94,7 @@ impl fmt::Display for FunctionKind {
 
 /// One parameter position in a [`SequenceSelector`].
 ///
-/// Kept small so matching stays trivially total; the §3.3 table is the full
-/// grammar (no regex or range matchers).
+/// Kept small so matching stays trivially total (no regex or range matchers).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SelectorParam {
     /// Match any non-empty parameter at this position.

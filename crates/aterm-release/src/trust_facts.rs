@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FACTS, NOT VERDICTS (Trust P0 — `$HOME/trust`
-//! `docs/design/2026-09-29-incremental-deterministic-trust-results.md` §4.8 and
-//! §5; no flag bypasses a check).
+//! Facts, not verdicts (no flag bypasses a check).
 //!
 //! The whole-tree Trust lane ([`crate::trust_lane`]) records what it
-//! MEASURED — per library, the Summary, the exit status, what trustd refused,
+//! measured — per library, the Summary, the exit status, what trustd refused,
 //! what lapsed, what ran out of memory ([`Measured`]) — and every verdict is
-//! JUDGED AT ASSEMBLY ([`judge`]) from those facts and the ratchet of the tree
+//! judged at assembly ([`judge`]) from those facts and the ratchet of the tree
 //! being judged. A filed verdict would key on the floors too, so a floors-only
 //! commit would need a whole new run. One judge: the lane prints its own
 //! verdict with it ([`conclude`]), `ship trust run --remeasure` reads the stored
 //! work it leaves undecided ([`pending_for`]), and `targo --unverified ship
 //! trust judge` prints its whole report.
 //!
-//! THE KEY ([`facts_key`]). A facts record is filed under a key over
+//! The key ([`facts_key`]). A facts record is filed under a key over
 //! everything that determines what the lane measured, except the files
 //! `--update-ratchet` rewrites, which no verification reads:
 //!
@@ -23,7 +21,7 @@
 //!   cost-history seed ([`COSTS`], which only orders a run) removed
 //!   ([`tree_sans_floors`]) — the code, the lane, its queued forks, the
 //!   gate-list derivation and this judge are all in it. The
-//!   memory record ([`MEMORY`]) IS an input to the run: it
+//!   memory record ([`MEMORY`]) is an input to the run: it
 //!   decides which libraries a host refuses up front. So the facts carry, per
 //!   library, the memory row the run used ([`Crate::memory`]) and the decision
 //!   it made, and the judge reads those rows, never the judged commit's: a
@@ -36,15 +34,15 @@
 //!   sysroot rlib, not one trustc commit-hash;
 //! * the lane: the whole-tree mode.
 //!
-//! THE ENVIRONMENT IS THE LANE'S, NOT THE CALLER'S. The
+//! The environment is the lane's, not the caller's. The
 //! lane runs every compile — the judge, the graph, each check — in an
-//! environment it BUILDS from a list (the script's "THE LANE'S ENVIRONMENT"):
+//! environment it builds from a list:
 //! its pins (`CARGO_INCREMENTAL`, `TRUST_NO_MIGRATE_WARN`), which are in the
 //! tree the key covers, and a few variables it passes from the host (`HOME`,
 //! `TMPDIR`, …), whose values no key covers. Nothing else the caller exported
 //! reaches a compile: not `TRUSTFLAGS` (targo-trust's per-run `-Ztrust-*`
 //! overrides), not a `TARGO_*` twin of a cargo setting, not a value an
-//! `option_env!` compiles into a verified library. What is left is CHECKED
+//! `option_env!` compiles into a verified library. What is left is checked
 //! from what the compiles themselves recorded ([`conclude`]): no dep-info may
 //! name the ratchet, and no `# env-dep:` line may carry a value the key does
 //! not determine — a passed variable read at all, or a value neither cargo, a
@@ -59,32 +57,29 @@
 //! measured on ([`floors_lowered`]): reused facts never judge a floor lowered,
 //! or re-labelled to another prover, that the rule would refuse.
 //!
-//! NO FLOOR EXCUSES (the owner's ruling: no report-only path). A
+//! No floor excuses (no report-only path). A
 //! library below its floor is a finding or it is undecided — never a pass:
 //!
-//! * a floor ANOTHER prover recorded is held like any other: a new prover
+//! * a floor another prover recorded is held like any other: a new prover
 //!   meets the floors it inherits, or the row is lowered onto it with a reason
 //!   in its fifth column (`ship trust judge --update-ratchet --reason`), which
 //!   the up-only rule then admits. `--update-ratchet` raises floors and
 //!   corrects totals; it never lowers a floor without that reason;
 //! * a shortfall the run's lapsed wall-clock budgets (`timed_out=`) could
-//!   cover is UNDECIDED — `NOT-VERIFIED(clock)`, COULD NOT RUN, no pass — as a
+//!   cover is undecided — `NOT-VERIFIED(clock)`, COULD NOT RUN, no pass — as a
 //!   shortfall trustd's refusals could cover is. It is resolved by measuring
 //!   again, not by an excuse: `ship trust run --remeasure` runs only
 //!   the libraries the stored facts leave undecided, on the same key, and
 //!   [`remeasured`] folds their new facts into the record ([`conclude`]). The
 //!   proof checks ay's caller cancelled ([`CHECK_CANCELLED`]) are credited the
-//!   same way ONCE per library and key — in a filed record's first
+//!   same way once per library and key — in a filed record's first
 //!   measurement, never in a re-measure or a run that files nothing — because
 //!   a passing run prints them too, so only a measurement made again can tell
 //!   their clock from the code ([`clock_credit`]).
 //!
-//! A CHECK THAT DID NOT FINISH IS NOT VERIFIED. targo-trust prints a Summary
-//! of whatever its compiler reported so far: an aterm-census check whose trustc
-//! was SIGTERMed after 91 CPU-minutes left a parseable `Summary: 207 proved …
-//! (2037 total)` and exit 101, as a finished advisory run can, and the stage
-//! printed `ok`.
-//! So a check is FINISHED only when its log carries targo-trust's own word that
+//! A check that did not finish is not verified. targo-trust prints a Summary
+//! of whatever its compiler reported so far.
+//! So a check is finished only when its log carries targo-trust's own word that
 //! the compiler covered the whole crate — `Coverage: <n>/<n> eligible function
 //! bodies verified (complete)`, which targo-trust prints only from the
 //! compiler's end-of-walk `coverage_summary` row ([`COVERAGE_COMPLETE`]) — and
@@ -96,15 +91,14 @@
 //! that fails the run: never scored, in neither total, never a floor written,
 //! re-based or corrected from it.
 //!
-//! A PATH TARGO REFUSED IS THE HOST'S. `targo trust` will not execute through a
+//! A path targo refused is the host's. `targo trust` will not execute through a
 //! path another principal could swap: a group- or world-writable component
 //! (a sticky bit exempts nothing), one owned by neither root nor the caller, a
 //! symlink on the way that another owns, one another owns that an ACL still
 //! lets the caller write, or a path trustd will not serve from (a foreign-owned
 //! or cross-user writable ancestor, or a runtime directory or executable that is
 //! not what it demands). The check then verifies
-//! nothing, and on 2026-10-16 a whole 22-library run under umask 0002 failed
-//! with nothing but `NOT-VERIFIED(rc=2)` rows to show for it. The log names the
+//! nothing. The log names the
 //! path in targo's own words ([`Measured::path_refused`]); each row keeps its
 //! status, and the report adds one `REFUSED PATH:` line per path, naming every
 //! library it failed and what to do. The refusal says nothing about the code,
@@ -181,26 +175,15 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 // WHAT ONE CHECK MEASURED, read from its log
 // ---------------------------------------------------------------------------
 
-/// A PROOF CHECK ITS CALLER CANCELLED: ay's words when the
+/// A proof check its caller cancelled: ay's words when the
 /// caller's stop signal ends a strict proof check ("interrupt, deadline, or
 /// memory limit"; Trust's `trust-router` reads it as a wall-clock stop). The
-/// line names no function and no obligation, and it is ROUTINE: aterm-codec at
-/// 6673f6a31 (seal 321aaeda7, the lane's profile, source unchanged since
-/// 0.100.0) printed 91-121 of them in runs that proved its full 383/551 at load
-/// 13-30, and 125-144 in the five that proved 310/553 at load 41-84 (the
-/// release lane's among them). Those 73 proofs were all lost in one function,
-/// `base64::encode_padded` (73 of 81 proved, then 0 of 83 — every row the
-/// full verifier's at 0 ms, its interval and kernel proofs gone), and the log
-/// says nothing else about it: no `timed_out=`, no budget row. So a shortfall
-/// these lines could cover may be the clock's, and one run cannot say — but
-/// neither can any number of runs that count them, since a run that proves
-/// everything prints as many: credited without end, they would leave a real
-/// drop in aterm-alloc, aterm-json or aterm-http (17, 64 and 47 proved
-/// against 29, 72 and 49 such lines in 0.101.0's lane) undecided forever.
-/// They are therefore credited once ([`clock_credit`]): a filed record's first
+/// line names no function and no obligation, and it is routine: a passing run
+/// prints them too, while a loaded run can lose proofs in a function with no
+/// `timed_out=` or budget row. So a shortfall these lines could cover may be
+/// the clock's, and they are credited once ([`clock_credit`]): a filed record's first
 /// measurement may be undecided by them, and the `--remeasure` that resolves it
-/// is judged on `timed_out=` alone. Trust counting a deadline's give-up as
-/// `timed_out` is the exact fix; this is the trace the log leaves until then.
+/// is judged on `timed_out=` alone.
 pub const CHECK_CANCELLED: &str = "proof validation cancelled by the caller";
 
 /// What one `targo trust check` left in its log, and nothing that depends on a
@@ -230,9 +213,8 @@ pub struct Measured {
     pub budget_rows: u64,
     /// Bodies the memory census says were "skipped at the memory ceiling",
     /// summed over the census lines ([`census_skipped`]); `None` when no line
-    /// names a count. The census and its ceiling are the 321aaeda7 seal's:
-    /// trust main has no in-run memory ceiling (5aa81ac1683) and prints no such
-    /// line, so a seal from main leaves this ABSENT — never a zero, which would
+    /// names a count. Trust main has no in-run memory ceiling and prints no such
+    /// line, so a seal from main leaves this absent — never a zero, which would
     /// say no body was skipped.
     pub skipped: Option<u64>,
     /// The ceiling the log names, as it names it: the last census line's
@@ -246,7 +228,7 @@ pub struct Measured {
     /// seal from trust main: its opt-in `-Ztrust-memory-notes` census (which the
     /// lane does not ask for) names no peak in these words.
     pub peak: String,
-    /// A CHECK TARGO WOULD NOT START: its log has no Summary and
+    /// A check targo would not start: its log has no Summary and
     /// names targo's refusal to start without a trustd it can prove its own
     /// build's ([`TRUSTD_REFUSED`]), said by what the log adds — `dirty` (a
     /// crash epoch left DIRTY), `owned` (another trustd held the socket),
@@ -609,16 +591,15 @@ fn path_refusals(line: &str) -> Vec<PathRefusal> {
 
 /// targo-trust's words, on its `Coverage:` line, when the compiler's end-of-walk
 /// `coverage_summary` row came in and every eligible body reached an outcome
-/// (targo-trust `report.rs` `coverage_line`, on seal 321aaeda7 and on 6606d3bdf
-/// alike): the one positive sign that a check covered its whole crate. The row
+/// (targo-trust `report.rs` `coverage_line`):
+/// the one positive sign that a check covered its whole crate. The row
 /// is sent once, after the eager whole-crate walk, so a compiler ended partway
 /// never sends it, and targo-trust then prints `Coverage: unknown (compiler
-/// emitted no coverage_summary transport row; …)` (measured 2026-09-29: the
-/// killed aterm-census log). A body skipped at the verifier's memory ceiling is
+/// emitted no coverage_summary transport row; …)`.
+/// A body skipped at the verifier's memory ceiling is
 /// still credited as processed (trustc credits a body before it is verified), so
-/// a CAP-BOUND run keeps this line. A later targo-trust (trust main, CB4
-/// 712ca0fff4) words a complete test-harness compile, some of whose bodies were
-/// excluded rather than verified, `Coverage: <n>/<n> eligible function bodies
+/// a CAP-BOUND run keeps this line. A complete test-harness compile, some of whose bodies were
+/// excluded rather than verified, is worded `Coverage: <n>/<n> eligible function bodies
 /// accounted for (<v> verified, <x> excluded: <tag>) (complete)`
 /// ([`COVERAGE_ACCOUNTED`]): just as whole, so it is read as this line is.
 pub const COVERAGE_COMPLETE: &str = "eligible function bodies verified (complete)";
@@ -629,7 +610,7 @@ pub const COVERAGE_COMPLETE: &str = "eligible function bodies verified (complete
 pub const COVERAGE_ACCOUNTED: &str = "eligible function bodies accounted for (";
 
 /// targo's words when it will not start a check beside a trustd it cannot
-/// prove its own build's (seal 321aaeda7; the lane's `TRUSTD_REFUSED`).
+/// prove its own build's (the lane's `TRUSTD_REFUSED`).
 pub const TRUSTD_REFUSED: &str =
     "could not establish the selected same-sysroot trustd memory authority";
 
@@ -688,8 +669,8 @@ pub fn parse_summary(line: &str) -> (Option<u64>, Option<u64>) {
 }
 
 /// `.*memory census:.*[^0-9]([0-9]+) bodies skipped at the memory ceiling.*`
-/// over one line: the rightmost count with a census marker before it. Only the
-/// 321aaeda7 seal prints one; trust main's `-Ztrust-memory-notes` census counts
+/// over one line: the rightmost count with a census marker before it. Trust
+/// main's `-Ztrust-memory-notes` census counts
 /// compacted slots, not skipped bodies, so a line of its gives `None`.
 fn census_skipped(line: &str) -> Option<u64> {
     let census = line.find("memory census:")? + "memory census:".len();
@@ -975,7 +956,7 @@ impl Measured {
                     m.peak = p;
                 }
             }
-            // The 321aaeda7 seal's flag; trust main has none (5aa81ac1683), so a
+            // Trust main has no ceiling flag, so a
             // log of a seal from main names no ceiling here either.
             for i in find_all(line, "trust-verify-memory-ceiling-bytes") {
                 let at = i + "trust-verify-memory-ceiling-bytes".len();
@@ -1142,7 +1123,7 @@ impl Measured {
 //
 // `targo trust` gives each verified library a memory ceiling of one eighth of
 // the host's RAM and takes no other value, so a floor recorded under a larger
-// ceiling can read as a regression on a smaller host (the owner's rule: a
+// ceiling can read as a regression on a smaller host (a
 // machine too small to verify something gets a warning and a refusal, never a
 // failure). The memory record
 // ([`MEMORY`]) holds, per library, the ceiling its floor
@@ -1304,11 +1285,11 @@ impl Host {
 /// more) and when. `-` each when the record has no row; a row that records no
 /// need has `-` for all four of its measurement's fields.
 ///
-/// THE NEED IS THE HOST'S. The census's peak is a RESIDENT size,
-/// and memory pressure lowers it: aterm-cli's 2026-09-29 tree peaked at 2.1 GiB
-/// with room on the 8 GiB A18 Pro Mac and at 3.0 GiB on m101 (24 GiB), where
-/// aterm-verify also peaked at 3.2 GiB against the 8 GiB Mac's 1.6, and
-/// aterm-census at 6.4 against 1.3. A need is therefore recorded with the RAM
+/// The need is the host's. The census's peak is a resident size,
+/// and memory pressure lowers it (for example, aterm-cli peaked at 2.1 GiB
+/// with room on an 8 GiB Mac and at 3.0 GiB on 24 GiB, where
+/// aterm-verify peaked at 3.2 GiB against 1.6 and
+/// aterm-census at 6.4 against 1.3). A need is therefore recorded with the RAM
 /// it was measured on, a library may have one row per RAM, and a host reads the
 /// row that bounds its own need ([`row_for`], [`Reading`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1402,11 +1383,11 @@ impl Reading {
     }
 }
 
-/// THE ROW A HOST READS of a library's rows: the one measured on its own RAM;
+/// The row a host reads of a library's rows: the one measured on its own RAM;
 /// else the one measured on the most RAM below it, a lower bound — what it
 /// refuses surely does not fit, and it never says the library fits; else the
-/// one measured on the least RAM above it, an upper bound — read as every host
-/// read the record before rows had a RAM; else the row with no need. On a
+/// one measured on the least RAM above it, an upper bound;
+/// else the row with no need. On a
 /// host whose RAM is unknown (which refuses nothing up front), the row measured
 /// on the most RAM. `None` for a library the record has no row for.
 ///
@@ -1429,23 +1410,19 @@ fn row_for<'a>(rows: &'a [MemRow], host: &Host) -> Option<&'a MemRow> {
         .or_else(|| rows.first())
 }
 
-/// Does the record say the library FITS a verifier ceiling of `c` GiB on this
+/// Does the record say the library fits a verifier ceiling of `c` GiB on this
 /// host — rule 2 of [`memory_refusal`], and after a run what makes a drop that
 /// ran out the code's rather than the host's? Only a need measured with room
 /// (`=`), read as [`Reading`] says:
-/// * measured on this host's RAM: when printed BELOW `c`, or measured with room
+/// * measured on this host's RAM: when printed below `c`, or measured with room
 ///   at a ceiling no larger than `c`. trustc's census prints both figures to one
-///   decimal, so a need printed AT the ceiling may be just over it, and on seal
-///   321aaeda7 a verifier whose peak reaches its ceiling turns every later
-///   function UNKNOWN: m101 (24 GiB), 2026-10-01, aterm-cli's need measured with
-///   room at a 4.0 GiB ceiling printed 3.0, and at its real 3.0 GiB ceiling it
-///   proved 0 of 443 against a floor of 75 (92 of 558 with room);
+///   decimal, so a need printed at the ceiling may be just over it, and
+///   a verifier whose peak reaches its ceiling turns every later
+///   function UNKNOWN;
 /// * measured on more RAM (or this host's is unknown): no larger than `c`, a
-///   tie included, as every host read the record before rows had a RAM — a
-///   need from a host with more free memory is at least this host's, and
-///   aterm-regex's 1.0, measured on 24 GiB, is gated at an 8 GiB host's 1.0 GiB
-///   ceiling as it always was;
-/// * measured on less RAM: never. A lower bound cannot say a library fits — the
+///   tie included — a
+///   need from a host with more free memory is at least this host's;
+/// * measured on less RAM: never. A lower bound cannot say a library fits — an
 ///   8 GiB Mac's 1.3 GiB for aterm-census was 6.4 on 24 GiB.
 fn fits(row: &MemRow, host: &Host, c: &str) -> bool {
     row.bound == "="
@@ -2431,11 +2408,8 @@ impl Update<'_> {
     };
 }
 
-/// JUDGE a run's facts against a ratchet — the lane's verdict, as it printed
-/// it before the judge moved here, less the excuses the owner ruled out (NO
-/// FLOOR EXCUSES in the module docs), plus a row the shell could not say: a
-/// floor that is not a count fails as `FLOOR-UNPARSED` (the shell died on it,
-/// `set -u`, with no verdict).
+/// Judge a run's facts against a ratchet; a
+/// floor that is not a count fails as `FLOOR-UNPARSED`.
 ///
 /// `ratchet` is the floors file's text (`None` when there is none);
 /// `ratchet_name` and `memory_name` are how the notes name the floors file and
@@ -2683,7 +2657,7 @@ pub fn judge(
             continue;
         };
         let row = floor_of(ratchet_now.as_deref(), name);
-        // A FLOOR THAT IS NOT A COUNT decides nothing (the shell died on it).
+        // A FLOOR THAT IS NOT A COUNT decides nothing.
         let floor: Option<u64> = match &row {
             None => None,
             Some(r) if r.proved.is_empty() => None,
@@ -2823,10 +2797,10 @@ pub fn judge(
                 _ => None,
             },
         ));
-        // A BUDGET THAT LAPSED decides nothing (no floor excuses). The
+        // A BUDGET THAT LAPSED decides nothing. The
         // per-function budget is wall-clock (`Function budget: 120000ms` in the
-        // report header), and a lapse stamps its whole batch `timed_out=N`
-        // (measured 2026-09-27 at load ~100). A drop the run's own lapses could
+        // report header), and a lapse stamps its whole batch `timed_out=N`.
+        // A drop the run's own lapses could
         // cover is the machine's or the code's, and this run cannot say which: it
         // is UNDECIDED — in neither total, COULD NOT RUN, never a pass — until the
         // library is measured again on the same key (`--remeasure`). A drop
@@ -5029,14 +5003,12 @@ mod tests {
         assert!(log("targo trust: error: verification did not run\n").transport);
     }
 
-    /// The tail of a check that FINISHED, as a real one prints it (aterm-bits,
-    /// 2026-09-30, targo 6606d3bdf): the Summary and targo-trust's Coverage line.
+    /// The tail of a check that finished: the Summary and targo-trust's Coverage line.
     const DONE: &str = "Summary: 5 proved, 3 failed, 8 runtime-checked, 0 assumed, 0 mandated, 0 contract-panic, 5 inconclusive (21 total)\n\
                         Coverage: 9/9 eligible function bodies verified (complete)\n\
                         \x20 Gate: FAIL [advisory lane, exit 1] (5 proved / 21 total)\n";
 
-    /// The killed aterm-census check of 2026-09-29, in the shape its log gave it
-    /// (lines 2970, 5011, 5016, 5072): cargo naming the compiler's signal,
+    /// A killed check: cargo naming the compiler's signal,
     /// targo-trust's missing-crate-summary row, a parseable Summary of what ran,
     /// `Coverage: unknown`, and the advisory exit 101.
     const KILLED: &str = "error: could not compile `aterm-census` (lib); 216 warnings emitted\n\nCaused by:\n\
@@ -5162,8 +5134,7 @@ mod tests {
         );
     }
 
-    /// …and it is NEVER SCORED (2026-09-29: the killed census check's partial
-    /// Summary was scored, and the stage printed `ok`): a red row, exit 1, in
+    /// …and it is never scored: a red row, exit 1, in
     /// neither total, not counted as gated, and never a floor — not a first one,
     /// not a high-water mark, not a re-base, not one lowered with a reason. The
     /// same for a check the lane ended at its per-crate wall budget, which names
@@ -6183,10 +6154,8 @@ mod tests {
         assert_eq!(v.word, "PASS");
     }
 
-    /// A PROOF CHECK ITS CALLER CANCELLED is the clock's credit ONCE (aterm-codec,
-    /// 0.101.0's lane: 310 proved against a floor of 383 at load ~50, with 131 of
-    /// these lines and no `timed_out=`; 383 at load ~15 with 91-121 of them). In a
-    /// filed record's first measurement a shortfall they could cover is UNDECIDED
+    /// A proof check its caller cancelled is the clock's credit once. In a
+    /// filed record's first measurement a shortfall they could cover is undecided
     /// and named for a re-measure; one they cannot cover is still the code's; a
     /// floor met is untouched; an invalid derivation counts for nothing. The
     /// re-measure, and a run that files nothing, are judged on `timed_out=` alone:
@@ -6349,7 +6318,7 @@ mod tests {
                     })
             };
             // First establish that the real actor has its unique process
-            // name; the old options then demonstrate the omission.
+            // name; `-lx` without `-a` omits ancestors.
             assert!(matches_self(&probe("-alx")), "owned ancestor is observable");
             let old = probe("-lx");
             assert_eq!(old.status.code(), Some(1));
@@ -6470,16 +6439,12 @@ mod tests {
         }
     }
 
-    /// THE NEED IS THE HOST'S (2026-10-01). aterm-cli's need measured with room
-    /// on m101 (24 GiB, the ceiling faked to 4.0) printed 3.0, and at m101's
-    /// real 3.0 GiB ceiling it proved 0 of 443 against a floor of 75 — the
-    /// record said ~2.1, measured under the 8 GiB Mac's memory pressure, so the
-    /// lane gated it and called the 0 a regression. Each host now reads the row
+    /// The need is the host's. Each host reads the row
     /// measured on its own RAM, else the nearest below (a lower bound, which
-    /// never says it fits), else the nearest above (an upper bound, read as
-    /// before): a 24 GiB host refuses it up front, naming the 32 GiB its need
+    /// never says it fits), else the nearest above (an upper bound):
+    /// a 24 GiB host refuses it up front, naming the 32 GiB its need
     /// was measured to fit; a 32 GiB host gates it; the 8 GiB and 16 GiB hosts
-    /// refuse it as they always did.
+    /// refuse it.
     #[test]
     fn a_need_printed_at_its_own_hosts_ceiling_is_refused_and_names_what_fits() {
         let cli = [mem("8", "4.0", "2.1", "="), mem("24", "4.0", "3.0", "=")];
@@ -6497,7 +6462,7 @@ mod tests {
         let (at32, row) = on(32);
         assert_eq!((at32, row.ram.as_str()), (None, "24"));
         assert!(!fits(&row, &host(32), "4.0"));
-        // 16 GiB reads the 8 GiB row (a lower bound above its 2.0): refused, as before.
+        // 16 GiB reads the 8 GiB row (a lower bound above its 2.0): refused.
         let (at16, row) = on(16);
         assert_eq!(row.ram, "8");
         assert!(at16.is_some());
@@ -6505,11 +6470,11 @@ mod tests {
         assert!(at8.is_some());
     }
 
-    /// NO HOST LOSES WHAT IT GATED (2026-10-01): a single row read on another
-    /// RAM gates and refuses what it did before rows had a RAM. A need measured
-    /// on MORE RAM is an upper bound, so one printed at this host's ceiling still
+    /// No host loses what it gated: a single row read on another
+    /// RAM gates and refuses by bound. A need measured
+    /// on more RAM is an upper bound, so one printed at this host's ceiling still
     /// fits — aterm-regex's 1.0, measured on 24 GiB, at an 8 GiB host's 1.0 —
-    /// and one measured on LESS RAM is a lower bound: it refuses only what is
+    /// and one measured on less RAM is a lower bound: it refuses only what is
     /// above the ceiling, gates the rest, and never says it fits (aterm-census's
     /// 1.3 from the 8 GiB Mac was 6.4 on 24 GiB). On its own RAM a need fits
     /// when printed below the ceiling, or measured with room at no more than it.
@@ -6552,7 +6517,7 @@ mod tests {
         );
     }
 
-    /// THE RECORD'S SHAPE (2026-10-01): one floor ceiling per library, one row
+    /// The record's shape: one floor ceiling per library, one row
     /// per RAM, a need with its bound and the RAM it was measured on, and a row
     /// with no need only alone — each a COULD NOT RUN naming the row.
     #[test]
@@ -6602,7 +6567,7 @@ mod tests {
         }
     }
 
-    /// WHAT A RUN LEARNS IS ITS OWN RAM'S (2026-10-01): `--update-ratchet` on a
+    /// What a run learns is its own RAM's: `--update-ratchet` on a
     /// 24 GiB host writes a row measured on 24 GiB — a new one beside the 8 GiB
     /// row it read, never over it — or rewrites its own; the floor ceiling it
     /// writes is every row's; a host whose RAM is unknown files no need.
@@ -6711,7 +6676,7 @@ mod tests {
         assert_eq!(v.word, "NARROWED");
     }
 
-    /// A REAL REFUSAL (2026-10-17, seal 41d79979, umask 0002): the whole log of
+    /// A real refusal (umask 0002): the whole log of
     /// `targo trust check -p aterm-dirfd --lib --allow-l0-gaps`, exit 2, run with
     /// `CARGO_TARGET_DIR` under a 0775 directory of the caller's (the home renamed
     /// `/home/u`). Its two `verified tool launcher … carries CALLER-OWNED

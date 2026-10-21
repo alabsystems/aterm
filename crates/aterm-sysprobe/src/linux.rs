@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Linux arm (design `docs/DESIGN-system-awareness-2026-10-16.md` §5.4,
-//! §9.6, §16): PARSERS — pure functions over `&str` and `&[u8]` — and the
-//! READERS of [`Root`], which read `/proc` and `/sys` under a configurable
-//! root directory through std alone. Both compile and are tested on every
-//! platform: the tests build fixture trees of captured files and read them
-//! with the same code a Linux build runs on `/`.
+//! Linux `/proc` and `/sys` parsers (pure functions over `&str` and `&[u8]`)
+//! and [`Root`] readers (std I/O under a configurable root directory). Both
+//! compile and run on every platform so fixture trees test the same code a
+//! Linux build runs on `/`.
 //!
 //! Every file is read through [`crate::with_bounded`] (one 4 KiB stack
 //! buffer), so every parser tolerates a text cut at 4 KiB — a torn last
@@ -15,7 +13,7 @@
 //! | file | parser | into |
 //! |---|---|---|
 //! | `/proc/meminfo` | [`meminfo`] | [`crate::physical_memory_mib`], [`crate::machine_memory`] |
-//! | `/proc/meminfo` | [`memory_detail`] | [`crate::memory_detail`] (§9.6's classes, commit) |
+//! | `/proc/meminfo` | [`memory_detail`] | [`crate::memory_detail`] (classes, commit) |
 //! | `/proc/pressure/memory` | [`psi`], [`psi_level`] | the pressure level |
 //! | `/proc/vmstat` | [`swap_pages`] | [`crate::swapped_kib`] |
 //! | `/proc/self/auxv` | [`auxv_value`] | the page size |
@@ -28,15 +26,17 @@
 //! | `/proc/self/cgroup`, `cpu.max`, `memory.max` | [`cgroup_v2_path`], [`cpu_max_millicores`], [`memory_max`] | [`crate::capacity`] |
 //! | `/sys/class/thermal/thermal_zone*`, `thermal_throttle/*_count` | [`trip_kind`], [`throttle_level`] | [`crate::Probe::throttle`] |
 //! | `/sys/class/drm/card*/device/*` | [`Root::gpu`] | [`crate::gpu`] |
-//! | `/proc/net/dev` | [`net_dev`] through [`links_under`] | [`crate::net_links`] |
-//! | `/sys/class/net/<if>/{flags,operstate,speed}` | [`hex_flags`], [`link_up`], [`speed_bps`] | [`crate::net_links`] |
+//! | `/proc/net/dev` | [`net_dev`] through [`links_under_into`] | [`crate::net_links_into`] |
+//! | `/sys/class/net/<if>/{flags,operstate,speed}` | [`hex_flags`], [`link_up`], [`speed_bps`] | [`crate::net_links_into`] |
+//! | `/proc/loadavg` | [`loadavg_tasks`] through [`Root::tasks`] | [`crate::pid_counts`] |
 //!
 //! `/proc/stat` and `/proc/net/dev` are the files read past 4 KiB:
 //! `/proc/stat`'s per-core lines take about 80 bytes each, so
 //! [`StatReader`] reads it into a [`STAT_CAP`]-byte buffer it keeps, and
 //! [`proc_stat_cores`] refuses a text cut inside them; `/proc/net/dev`
-//! takes about 130 bytes an interface, so [`links_under`] reads it into a
-//! [`NET_DEV_CAP`]-byte buffer and reads the interfaces before the cut.
+//! takes about 130 bytes an interface, so [`links_under_into`] reads it
+//! into a [`NET_DEV_CAP`]-byte buffer and reads the interfaces before the
+//! cut.
 //!
 //! Every directory listed is bounded: at most [`MAX_CPUS`] cores, at most
 //! [`MAX_ZONES`] thermal zones of at most [`MAX_TRIPS`] trip points, at most
@@ -122,7 +122,7 @@ pub fn auxv_value(bytes: &[u8], key: u64) -> Option<u64> {
 
 /// The process group (`pgrp`, the fifth field) of a `/proc/<pid>/stat`
 /// line. The second field, the command name in parentheses, may itself hold
-/// spaces and `)`, so the fields are counted from the LAST `)`. `None` for a
+/// spaces and `)`, so the fields are counted from the last `)`. `None` for a
 /// line that is cut or malformed.
 #[must_use]
 pub fn stat_pgrp(stat: &str) -> Option<u32> {
@@ -135,7 +135,7 @@ pub fn stat_pgrp(stat: &str) -> Option<u32> {
 /// The pids of a `/proc/<pid>/task/<tid>/children` text: the kernel writes
 /// each child as its pid and one space (`"812 9001 "`), so only a number
 /// its space closes is read, and a text cut at the cap loses its torn last
-/// pid rather than naming a shorter one. Anything else is skipped. PURE.
+/// pid rather than naming a shorter one. Anything else is skipped.
 #[must_use]
 pub fn children(text: &str) -> Vec<u32> {
     text.split_inclusive(' ')
@@ -161,7 +161,7 @@ pub const STAT_CAP: usize = 64 * 1024;
 ///
 /// `cut`: the read stopped at its cap. A cut text whose core lines might go
 /// on past it is `None`, as is a text with no core line, a malformed core
-/// line, or an id at or past [`MAX_CPUS`]. PURE.
+/// line, or an id at or past [`MAX_CPUS`].
 #[must_use]
 pub fn proc_stat_cores(text: &str, cut: bool) -> Option<Vec<CoreTicks>> {
     let end = if text.ends_with('\n') {
@@ -217,8 +217,7 @@ pub fn proc_stat_cores(text: &str, cut: bool) -> Option<Vec<CoreTicks>> {
 /// The reader behind [`crate::Probe::core_ticks`] on Linux: `<root>/proc/stat`
 /// read into a [`STAT_CAP`]-byte buffer it keeps (one allocation, when it is
 /// built), parsed by [`proc_stat_cores`], and padded with zeroed cores up to
-/// the present count it was given. Compiled everywhere, so a fixture root
-/// tests it on any host.
+/// the present count it was given.
 #[derive(Debug)]
 pub struct StatReader {
     path: PathBuf,
@@ -251,7 +250,7 @@ impl StatReader {
 
 /// A kernel CPU list (`0-3,5,8-11`, as `/sys/devices/system/cpu/present`
 /// holds it) as ascending, distinct ids. `None` for an empty or malformed
-/// list, a range that runs backwards, or an id at or past [`MAX_CPUS`]. PURE.
+/// list, a range that runs backwards, or an id at or past [`MAX_CPUS`].
 #[must_use]
 pub fn cpulist(text: &str) -> Option<Vec<u16>> {
     let mut ids = Vec::new();
@@ -268,10 +267,9 @@ pub fn cpulist(text: &str) -> Option<Vec<u16>> {
     (!ids.is_empty()).then_some(ids)
 }
 
-/// [`MemoryDetail`] from `/proc/meminfo` (KiB × 1024), in design §9.6's
-/// classes. Linux has no exact partition of physical memory like macOS's,
-/// so [`MemoryDetail::exact`] is false and `total` less the classes is
-/// memory no class names:
+/// [`MemoryDetail`] from `/proc/meminfo` (KiB × 1024). Linux has no exact
+/// partition of physical memory like macOS's, so [`MemoryDetail::exact`] is
+/// false and `total` less the classes is memory no class names:
 ///
 /// | field | from |
 /// |---|---|
@@ -288,7 +286,7 @@ pub fn cpulist(text: &str) -> Option<Vec<u16>> {
 /// | `pressure` | `None` here; [`Root::memory_detail`] reads PSI |
 ///
 /// A missing optional key reads `None` where the field is optional and 0
-/// where it is summed. PURE.
+/// where it is summed.
 #[must_use]
 pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
     let bytes = |key: &str| keyed(text, key).map(|k| k.saturating_mul(1024));
@@ -336,12 +334,36 @@ pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
         swap_total,
         commit,
         pressure: None,
+        counters: None,
+        kernel_available_pct: None,
         exact: false,
     })
 }
 
-/// The most bytes of `/proc/net/dev` one [`links_under`] takes: room for
-/// about 500 interfaces.
+/// `/proc/cpuinfo`'s first `model name` (x86) or `Model` (ARM boards). PURE.
+#[must_use]
+pub fn cpu_model(cpuinfo: &str) -> Option<String> {
+    cpuinfo.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        let key = key.trim();
+        (key == "model name" || key == "Model")
+            .then(|| value.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// `/etc/os-release`'s `PRETTY_NAME`, unquoted. PURE.
+#[must_use]
+pub fn os_pretty_name(os_release: &str) -> Option<String> {
+    os_release.lines().find_map(|line| {
+        let value = line.strip_prefix("PRETTY_NAME=")?;
+        let value = value.trim().trim_matches('"').trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+/// The most bytes of `/proc/net/dev` one [`links_under_into`] takes: room
+/// for about 500 interfaces.
 pub const NET_DEV_CAP: usize = 64 * 1024;
 
 /// One interface's row of `/proc/net/dev`.
@@ -361,7 +383,7 @@ pub struct NetDev {
 /// multicast`) and the next eight sent (`bytes packets errs drop fifo colls
 /// carrier compressed`). A line with fewer than twelve counters, a counter
 /// that does not parse, or a name that is empty or holds `/` (which no
-/// kernel name does) is left out, as is a torn last line. PURE.
+/// kernel name does) is left out, as is a torn last line.
 #[must_use]
 pub fn net_dev(text: &str) -> Vec<NetDev> {
     whole_lines(text)
@@ -403,7 +425,7 @@ const IFF_UP: u32 = 0x1;
 const IFF_LOOPBACK: u32 = 0x8;
 
 /// `/sys/class/net/<if>/flags` (`0x1003`) as its bits; `None` where it
-/// does not parse. PURE.
+/// does not parse.
 #[must_use]
 pub fn hex_flags(text: &str) -> Option<u32> {
     let t = text.trim();
@@ -414,7 +436,7 @@ pub fn hex_flags(text: &str) -> Option<u32> {
 /// Up and running: `IFF_UP` set (the flags file holds the administrative
 /// flags only; the kernel never stores `IFF_RUNNING` there) and an
 /// `operstate` of `up`, or `unknown` for a driver that keeps none (the
-/// loopback, many tunnels). PURE.
+/// loopback, many tunnels).
 #[must_use]
 pub fn link_up(flags: u32, operstate: &str) -> bool {
     flags & IFF_UP != 0 && matches!(operstate.trim(), "up" | "unknown")
@@ -422,7 +444,7 @@ pub fn link_up(flags: u32, operstate: &str) -> bool {
 
 /// `/sys/class/net/<if>/speed` (Mb/s) as bits per second; `None` for
 /// `-1`, zero, or what does not parse (the kernel answers `-1` or refuses
-/// the read for a link that is down and for Wi-Fi). PURE.
+/// the read for a link that is down and for Wi-Fi).
 #[must_use]
 pub fn speed_bps(text: &str) -> Option<u64> {
     let mbps: i64 = text.trim().parse().ok()?;
@@ -436,7 +458,7 @@ pub fn speed_bps(text: &str) -> Option<u64> {
 /// ([`crate::machine::never_the_machines`]) is other whatever sysfs says, as
 /// on macOS; `wireless` present is Wi-Fi; a cellular name ([`kind_by_name`])
 /// is cellular; a link with a device is wired; anything else (a bridge, a
-/// tunnel, a `veth`) is other. PURE.
+/// tunnel, a `veth`) is other.
 #[must_use]
 pub fn sys_kind(name: &str, wireless: bool, physical: bool) -> LinkKind {
     if crate::machine::never_the_machines(name) {
@@ -452,20 +474,25 @@ pub fn sys_kind(name: &str, wireless: bool, physical: bool) -> LinkKind {
     }
 }
 
-/// Every interface under `root` ([`crate::net_links`] on Linux, with root
-/// `/`): `<root>/proc/net/dev` read into a [`NET_DEV_CAP`]-byte buffer and
-/// parsed by [`net_dev`], at most [`MAX_LINKS`] interfaces, then per
-/// interface its `<root>/sys/class/net/<if>/` `ifindex`, `flags` and
-/// `operstate` (each read into one [`crate::READ_CAP`]-byte stack buffer,
-/// no heap copy), whether `device` and `wireless` exist, and `speed` where
-/// a device backs it. One path buffer names every interface's files. A
-/// fact that cannot be read reads as nothing: index 0, not up, no device.
-/// `None` where `/proc/net/dev` cannot be read. Compiled everywhere, so a
-/// fixture root tests it on any host.
+/// Every interface under `root` ([`crate::net_links_into`] on Linux, with
+/// root `/`): `<root>/proc/net/dev` read into the first [`NET_DEV_CAP`]
+/// bytes of `scratch` (made that long where it is shorter, and kept by the
+/// caller between readings) and parsed by [`net_dev`], at most
+/// [`MAX_LINKS`] interfaces, then per interface its
+/// `<root>/sys/class/net/<if>/` `ifindex`, `flags` and `operstate` (each
+/// read into one [`crate::READ_CAP`]-byte stack buffer, no heap copy),
+/// whether `device` and `wireless` exist, and `speed` where a device backs
+/// it. One path buffer names every interface's files. A fact that cannot
+/// be read reads as nothing: index 0, not up, no device. `None` where
+/// `/proc/net/dev` cannot be read. Compiled everywhere, so a fixture root
+/// tests it on any host.
 #[must_use]
-pub fn links_under(root: &Path) -> Option<Vec<LinkReading>> {
-    let mut buf = vec![0u8; NET_DEV_CAP];
-    let (n, _) = crate::read_into(&root.join("proc/net/dev"), &mut buf).ok()?;
+pub fn links_under_into(root: &Path, scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> {
+    if scratch.len() < NET_DEV_CAP {
+        scratch.resize(NET_DEV_CAP, 0);
+    }
+    let buf = &mut scratch[..NET_DEV_CAP];
+    let (n, _) = crate::read_into(&root.join("proc/net/dev"), buf).ok()?;
     let mut dir = root.join("sys/class/net");
     Some(
         net_dev(crate::utf8_prefix(&buf[..n]))
@@ -490,7 +517,7 @@ fn in_dir<T>(dir: &mut PathBuf, file: &str, f: impl FnOnce(&Path) -> T) -> T {
 }
 
 /// `row` joined to the sysfs facts in `dir`, its `/sys/class/net/<if>`
-/// ([`links_under`]); `dir` is given back as it came.
+/// ([`links_under_into`]); `dir` is given back as it came.
 fn sys_link(dir: &mut PathBuf, row: NetDev) -> LinkReading {
     let flags = in_dir(dir, "flags", |p| crate::with_bounded(p, hex_flags))
         .flatten()
@@ -521,6 +548,19 @@ fn sys_link(dir: &mut PathBuf, row: NetDev) -> LinkReading {
     }
 }
 
+/// The kernel's count of every thread on the machine, kernel threads
+/// included: the total of `/proc/loadavg`'s fourth field (`running/total`),
+/// from the file's first whole line. `None` for a torn line, a field that
+/// is not two counts, or a total of zero (the reading thread is one).
+/// PURE.
+#[must_use]
+pub fn loadavg_tasks(text: &str) -> Option<u64> {
+    let line = whole_lines(text).next()?;
+    let (running, total) = line.split_whitespace().nth(3)?.split_once('/')?;
+    let total: u64 = total.parse().ok()?;
+    (running.parse::<u64>().is_ok() && total > 0).then_some(total)
+}
+
 /// One PSI file's ten-second averages (`/proc/pressure/memory`): the share
 /// of wall time some task, and every task, stalled on memory.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -541,7 +581,6 @@ pub const PSI_CRITICAL_FULL_AVG10: f32 = 60.0;
 
 /// A PSI file's `some` and `full` ten-second averages (`some avg10=1.25
 /// avg60=… total=…`). `None` without both lines or with a malformed average.
-/// PURE.
 #[must_use]
 pub fn psi(text: &str) -> Option<Psi> {
     let avg10 = |kind: &str| {
@@ -563,7 +602,7 @@ pub fn psi(text: &str) -> Option<Psi> {
 }
 
 /// The pressure level PSI reads: critical at [`PSI_CRITICAL_FULL_AVG10`],
-/// warn at [`PSI_WARN_SOME_AVG10`], else normal. PURE.
+/// warn at [`PSI_WARN_SOME_AVG10`], else normal.
 #[must_use]
 pub fn psi_level(p: &Psi) -> MemoryLevel {
     if p.full_avg10 >= PSI_CRITICAL_FULL_AVG10 {
@@ -578,7 +617,7 @@ pub fn psi_level(p: &Psi) -> MemoryLevel {
 /// The layout from the present cores, the online ones (`online`; the
 /// present ones where unread), the hybrid PMUs' core lists (`name`, ids:
 /// `/sys/devices/cpu_core/cpus` and its kin) and each core's
-/// `cpu_capacity`, fastest first. PURE.
+/// `cpu_capacity`, fastest first.
 ///
 /// 1. The PMUs, when there are at least two and they partition the online
 ///    cores exactly (a PMU lists only online cores): `cpu_core` is
@@ -715,7 +754,7 @@ pub const MAX_CGROUP_DEPTH: usize = 64;
 
 /// The process's cgroup v2 path, from `/proc/self/cgroup`'s `0::<path>`
 /// line. `None` on a cgroup v1 machine (no such line) or for a path that is
-/// not absolute or that walks up through `..`. PURE.
+/// not absolute or that walks up through `..`.
 #[must_use]
 pub fn cgroup_v2_path(text: &str) -> Option<&str> {
     let path = whole_lines(text).find_map(|l| l.strip_prefix("0::"))?;
@@ -724,7 +763,7 @@ pub fn cgroup_v2_path(text: &str) -> Option<&str> {
 
 /// `cpu.max` (`<quota> <period>` in µs, or `max <period>`) as thousandths
 /// of a core: `Some(None)` for no limit, `None` for a malformed text or a
-/// zero period. PURE.
+/// zero period.
 #[must_use]
 pub fn cpu_max_millicores(text: &str) -> Option<Option<u32>> {
     let mut it = text.split_whitespace();
@@ -739,7 +778,7 @@ pub fn cpu_max_millicores(text: &str) -> Option<Option<u32>> {
 }
 
 /// `memory.max` (bytes, or `max`): `Some(None)` for no limit, `None` for a
-/// malformed text. PURE.
+/// malformed text.
 #[must_use]
 pub fn memory_max(text: &str) -> Option<Option<u64>> {
     let word = text.split_whitespace().next()?;
@@ -767,7 +806,7 @@ pub enum TripKind {
 }
 
 /// A `trip_point_N_type` text as a [`TripKind`]; `None` for `active` and
-/// anything else. PURE.
+/// anything else.
 #[must_use]
 pub fn trip_kind(text: &str) -> Option<TripKind> {
     match text.trim() {
@@ -788,9 +827,9 @@ pub struct Zone {
     pub trips: Vec<(TripKind, i64)>,
 }
 
-/// The HEURISTIC throttle level from the thermal zones and whether the CPUs'
+/// The heuristic throttle level from the thermal zones and whether the CPUs'
 /// thermal throttle counters rose since the last reading (`None`: the
-/// machine has no such counters). PURE.
+/// machine has no such counters).
 ///
 /// * `severe`: a zone at or past its critical trip;
 /// * `heavy`: a zone at or past its hot trip, or past a passive trip while
@@ -823,10 +862,10 @@ pub fn throttle_level(zones: &[Zone], counters_rose: Option<bool>) -> Result<Thr
     })
 }
 
-/// A process's memory from `/proc/<pid>/status`: `RssAnon + VmSwap` (design
-/// §16: its anonymous memory, resident or swapped out — the nearest Linux
-/// has to macOS's footprint), bytes. `None` without `RssAnon` (a kernel
-/// thread, or a kernel older than 4.5); a missing `VmSwap` reads 0. PURE.
+/// A process's memory from `/proc/<pid>/status`: `RssAnon + VmSwap` (its
+/// anonymous memory, resident or swapped out — the nearest Linux has to
+/// macOS's footprint), in bytes. `None` without `RssAnon` (a kernel
+/// thread, or a kernel older than 4.5); a missing `VmSwap` reads 0.
 #[must_use]
 pub fn status_footprint(text: &str) -> Option<u64> {
     let anon = keyed(text, "RssAnon")?;
@@ -938,6 +977,16 @@ impl Root {
         out
     }
 
+    /// [`crate::machine_words`]: `/proc/cpuinfo`'s first model (its first
+    /// 4 KiB hold the first CPU's) and `/etc/os-release`'s `PRETTY_NAME`.
+    #[must_use]
+    pub fn machine_words(&self) -> crate::MachineWords {
+        crate::MachineWords {
+            cpu: self.read("proc/cpuinfo", cpu_model).flatten(),
+            os: self.read("etc/os-release", os_pretty_name).flatten(),
+        }
+    }
+
     /// The present cores (`/sys/devices/system/cpu/present`).
     #[must_use]
     pub fn present(&self) -> Option<Vec<u16>> {
@@ -957,6 +1006,15 @@ impl Root {
     pub fn present_or_parallelism(&self) -> Vec<u16> {
         self.present()
             .unwrap_or_else(|| (0..crate::machine::parallelism()).collect())
+    }
+
+    /// Every thread on the machine (`/proc/loadavg`, [`loadavg_tasks`]),
+    /// the count `kernel/pid_max` and `threads-max` bound. The kernel keeps
+    /// one count for the whole machine, not one per namespace. `None` where
+    /// unreadable.
+    #[must_use]
+    pub fn tasks(&self) -> Option<u64> {
+        self.read("proc/loadavg", loadavg_tasks).flatten()
     }
 
     /// The cores the OS took away: present but not online. `None` where
@@ -1305,6 +1363,7 @@ impl Root {
             let Some(stat) = self.read(&format!("proc/{pid}/stat"), parse_stat).flatten() else {
                 continue;
             };
+            let read_at = Some(std::time::Instant::now());
             let footprint = self.status_footprint(pid).unwrap_or_else(|| {
                 self.read(&format!("proc/{pid}/statm"), parse_statm_resident)
                     .flatten()
@@ -1312,8 +1371,15 @@ impl Root {
             });
             let ticks = stat.utime.saturating_add(stat.stime);
             let ns = u128::from(ticks) * 1_000_000_000 / u128::from(hz);
+            let Some(confirm) = self.read(&format!("proc/{pid}/stat"), parse_stat).flatten() else {
+                continue;
+            };
+            if confirm.start != stat.start {
+                continue;
+            }
             procs.push(ProcessReading {
                 pid,
+                start: u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok(),
                 ppid: stat.ppid,
                 cpu_ns: Some(u64::try_from(ns).unwrap_or(u64::MAX)),
                 footprint,
@@ -1325,6 +1391,9 @@ impl Root {
                 state: RunState::from_linux(stat.state),
                 session_leader: Some(stat.session == pid),
                 has_tty: Some(stat.tty_nr != 0),
+                runnable_ns: None,
+                peak_footprint: None,
+                read_at,
             });
         }
         Some(Sweep { procs, truncated })
@@ -1391,8 +1460,7 @@ impl Root {
 
 /// The reader behind [`crate::Probe::throttle`] on Linux: a [`Root`] and
 /// the last throttle count it read, so a reading can say whether the
-/// counters rose. Compiled everywhere, so a fixture root tests it on any
-/// host.
+/// counters rose.
 #[derive(Debug)]
 pub struct ThrottleReader {
     root: Root,

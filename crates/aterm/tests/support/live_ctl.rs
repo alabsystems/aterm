@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ONE persistent control connection to a live headless instance
-//! (`aterm_agent::RelayClient`, authenticated with the token beside the
-//! socket), and the typed readings the live lanes assert on.
+//! One persistent control connection to a live headless instance (`aterm_agent::RelayClient`,
+//! authenticated with the token beside the socket), and the typed readings the live lanes
+//! assert on.
 //!
 //! A request is one round trip on the open connection, so a poll costs no
 //! process launch and two requests reach the server in the order written.
@@ -22,8 +22,8 @@ use aterm_uds::CtlStream;
 /// wait any request here asks for ([`AWAIT_MS`]).
 const READ_HANG: Duration = Duration::from_secs(120);
 
-/// The server-side bound on every `await` here, in ms: a minute, a hang
-/// detector (`aterm_spec::wait::MUST_HAPPEN`), never a latency budget.
+/// The server-side bound on every `await` here, in ms: a minute, a hang detector
+/// (`aterm_spec::wait::MUST_HAPPEN`).
 pub const AWAIT_MS: u128 = aterm_spec::wait::MUST_HAPPEN.as_millis();
 
 /// `key=value` tokens of one reply line, by key; a repeated key keeps its
@@ -59,7 +59,7 @@ impl Ctl {
         Self { client }
     }
 
-    /// `req`, whose reply is ONE line (`OK …` or `ERR …`), returned verbatim.
+    /// `req`, whose reply is one line (`OK …` or `ERR …`), returned verbatim.
     pub fn line(&mut self, req: &str) -> String {
         self.client
             .request_line(req)

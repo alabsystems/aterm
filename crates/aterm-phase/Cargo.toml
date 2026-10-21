@@ -3,8 +3,8 @@
 
 [package]
 name = "aterm-phase"
-# Integration tests are declared below, not discovered. With autotests off a
-# `tests/*.rs` file listed nowhere never compiles.
+# Integration tests are declared below, not discovered: a `tests/*.rs` file listed nowhere
+# never compiles.
 autotests = false
 version.workspace = true
 edition.workspace = true
@@ -16,11 +16,9 @@ description = "aterm — the worker-phase reader: busy | prompt | limited | idle
 [lints]
 workspace = true
 
-# NO DEPENDENCIES, and that is the point of the crate. The reader is pure
-# functions over `&[String]` rows, linked by `aterm-agent` (the supervisor,
-# `aterm drive`) and `aterm-gui` (the server, whose agent verdict the fabric
-# relays as `phase=`); `aterm-link`, the fabric, links no screen reader. See
-# src/lib.rs.
+# No dependencies, by design: the reader is pure functions over `&[String]` rows, linked by
+# `aterm-agent` (`aterm drive`) and `aterm-gui` (the server's agent verdict, relayed by the
+# fabric as `phase=`).
 [dependencies]
 
 [dev-dependencies]

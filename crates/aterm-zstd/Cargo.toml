@@ -24,15 +24,13 @@ name = "aterm_zstd"
 path = "src/lib.rs"
 
 [dependencies]
-# None, on purpose: this crate is where the zstd / zstd-safe / zstd-sys family
-# (43,005 lines of C behind one cc build script) leaves the graph
-# (docs/AUDIT-third-party-2026-10-15.md, ZC.3-ZC.6).
+# None, on purpose: first-party replacement for the zstd / zstd-safe / zstd-sys
+# C dependency family.
 
 [dev-dependencies]
 # SHA-256 of the frames the zstd CLI wrote (tests/cli_frames.rs) and of what
 # the recorded frames decode to (tests/cli_decode.rs, tests/sweep.rs). Those
-# recorded answers are the decoder's oracle: libzstd, the `zstd` dev-dependency
-# until ZC.6, held the recordings to itself before it left the graph.
+# recorded answers are the decoder's oracle.
 aterm-digest = { workspace = true }
 
 [[test]]

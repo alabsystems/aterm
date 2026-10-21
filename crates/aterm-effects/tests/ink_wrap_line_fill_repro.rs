@@ -1,39 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The Claude Code / Ink input-box wrap must not fill the new line with
-//! cursor-trail art: with the typed re-anchor classifier, the landing row stays
-//! confined to the typed cells for every style, and the mid-band (cells only a
+//! The Claude Code / Ink input-box wrap must not fill the new line with cursor-trail art: the
+//! landing row stays confined to the typed cells for every style, and the mid-band (cells only a
 //! phantom jump vector could reach) stays dark.
 //!
-//! Method: byte-for-byte Ink repaint bursts are fed through a real
-//! `aterm_core::terminal::Terminal` on the alt screen; after each burst the
-//! cursor is sampled as `aterm-gui/src/app_render.rs`'s frame hold does:
-//!     let cur = cursor_visible.then_some((cpos.row, cpos.col));
-//! the repaint blink is derived from the same terminal as the host does per
-//! frame (`repaint_blink_epoch()` diffed against a last-seen value →
-//! `note_repaint_blink`, plus `note_context(is_alternate_screen())`), and all of
-//! it is fed to `CursorGlow::tick` (the seam `EffectsPipeline::cursor_step`
-//! drives). Each keypress first arms `note_typed`, as app_input does for a plain
-//! character key.
+//! Byte-for-byte Ink repaint bursts run through a real `Terminal` on the alt screen; each frame
+//! samples the cursor and the repaint blink as `aterm-gui/src/app_render.rs`'s frame hold does
+//! (`sample`, `feed_blink`) and feeds `CursorGlow::tick`; each keypress first arms the typed hint,
+//! as `app_input` does for a character key. Ink's burst per keystroke: begin synchronized update,
+//! hide, CUP to the input region, `CSI 2K` and a rewrite per line, CUP to the caret, show, end
+//! synchronized update. The hide inside the sync advances `repaint_blink_epoch`, which lets the
+//! alt-screen re-anchor engage while plain vim (hide, no sync) keeps its jumps.
 //!
-//! The Ink burst per keystroke (Claude Code's repaint choreography):
-//!     CSI ?2026h                    begin synchronized update
-//!     CSI ?25l                      hide
-//!     CUP(region_top, 1)            jump to the input region
-//!     per line: CSI 2K + line       erase + rewrite (CRLF between lines)
-//!     CUP(caret)                    reposition to the caret
-//!     CSI ?25h                      show
-//!     CSI ?2026l                    end synchronized update
-//! The hide inside the sync is what advances `repaint_blink_epoch`, letting the
-//! alt-screen re-anchor engage here while plain vim (hide, no sync) keeps its
-//! jumps.
-//!
-//! The control echoes each typed char with no repaint (main screen, no sync, no
-//! blink) and lets the terminal's deferred wrap move the cursor (last col → next
-//! row col 0/1); the shape wrap detector already handles it. That is the
-//! kernel's cooked-mode echo (`cat`, `read` without `-e`); zsh and bash readline
-//! fold differently (`tests/walk_census`'s `Fold` models all three). The
-//! control keeps the name "zsh".
+//! The control (`run_zsh`) echoes each char with no repaint and lets the terminal's deferred wrap
+//! move the cursor, as the kernel's cooked-mode echo does (`cat`, `read` without `-e`); the shape
+//! wrap detector handles it. zsh and bash readline fold differently (`walk_census`'s `Fold`).
 
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
@@ -77,8 +58,8 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         ribbon_flat: false,
         enabled: true,
         dark_theme: true,
-        // The documented default dark palette — a COHERENT pair, never 0/0
-        // (`fg == bg` reads as a conceal-shaped theme and suppresses the tint).
+        // The default dark palette: a coherent pair, never 0/0 (`fg == bg` reads as a
+        // conceal-shaped theme and suppresses the tint).
         theme_fg: 0x00C8_D3F5,
         theme_bg: 0x001A_1B26,
         style,
@@ -98,16 +79,15 @@ fn cfg(style: GlowStyle) -> GlowConfig {
 /// A cursor sample `(row, col)` as the frame hold reports it (`None` = hidden).
 type Cur = Option<(u16, u16)>;
 
-/// EXACTLY app_render's frame hold — the per-frame cursor sample.
+/// The per-frame cursor sample, as `app_render.rs`'s frame hold takes it.
 fn sample(term: &Terminal) -> Cur {
     let c = term.cursor();
     term.cursor_visible().then_some((c.row, c.col))
 }
 
-/// app_render's frame-hold repaint-blink derivation, run once per frame just
-/// before the tick: diff the terminal's monotonic `repaint_blink_epoch` against
-/// the last-seen value (an advance is the hide-inside-DEC-2026 bracket, so note
-/// the blink) and stamp the per-frame alt-screen context.
+/// The frame hold's repaint-blink derivation, once per frame before the tick: an advance of the
+/// terminal's monotonic `repaint_blink_epoch` (the hide-inside-DEC-2026 bracket) notes the blink,
+/// then the per-frame alt-screen context is stamped.
 fn feed_blink(term: &Terminal, glow: &mut CursorGlow, seen: &mut u64, now: Instant) {
     let epoch = term.repaint_blink_epoch();
     if epoch != *seen {
@@ -141,7 +121,7 @@ fn ink_burst(text: &str) -> Vec<u8> {
     let (crow, ccol) = caret(n);
     let mut s = String::new();
     s.push_str("\x1b[?2026h"); // begin synchronized update (ground truth)
-    s.push_str("\x1b[?25l"); // hide — INSIDE sync: the repaint blink
+    s.push_str("\x1b[?25l"); // hide inside the sync: the repaint blink
     s.push_str(&format!("\x1b[{BOX_TOP};1H")); // CUP region start
     s.push_str(&format!(
         "\x1b[2K\u{256d}{}\u{256e}\r\n",
@@ -168,13 +148,11 @@ fn ink_burst_split(text: &str) -> (Vec<u8>, Vec<u8>) {
     (head, tail)
 }
 
-/// Per-row sets of grid columns covered by this frame's emissions. `rows` gets
-/// everything (streak/zoom/ember quads, halos, fire patches); `rows_patches`
-/// only FirePatches (spark-rooted flame cells); `rows_body` everything except
-/// 4-point-star geometry (1-px vertical arms, and 1-px horizontal arms/streak
-/// slabs ≤ 6 px), since the rainbow kitty starfield streams off its own row band
-/// and its pluses dust neighbouring rows, while the zoom-bar pins count body
-/// coverage.
+/// Per-row sets of grid columns covered by this frame's emissions. `rows` gets everything (streak,
+/// zoom and ember quads, halos, fire patches); `rows_patches` only fire patches (spark-rooted
+/// flame cells); `rows_body` everything but 4-point-star geometry (1-px vertical arms, 1-px
+/// horizontal arms and streak slabs ≤ 6 px), since the rainbow kitty starfield's pluses dust
+/// neighbouring rows while the zoom-bar pins count body coverage.
 fn cover(
     glow: &CursorGlow,
     out: &[aterm_core::render::GlowQuad],
@@ -221,14 +199,15 @@ struct Run {
     rows_patches: Vec<BTreeSet<u16>>,
     /// Same accumulation window, minus 4-point-star geometry (see `cover`).
     rows_body: Vec<BTreeSet<u16>>,
-    /// Emissions on the frame IMMEDIATELY after the wrap tick.
+    /// Emissions on the frame right after the wrap tick.
     quads_on_wrap_frame: usize,
 }
 
 /// Drive an Ink session: `total` chars at ~112 ms cadence, 6 idle 16 ms frames
-/// between keys (the 60 fps loop). Every key arms `note_typed` before its burst.
-/// With `split_wrap_burst`, the wrap keystroke's repaint is split across a frame
-/// so one frame samples the hidden mid-repaint state.
+/// between keys (the 60 fps loop). Every key arms the typed hint
+/// (`note_synthetic_typed`) before its burst. With `split_wrap_burst`, the wrap
+/// keystroke's repaint is split across a frame so one frame samples the hidden
+/// mid-repaint state.
 fn run_ink(style: GlowStyle, total: usize, split_wrap_burst: bool) -> Run {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     let mut glow = CursorGlow::default();
@@ -244,8 +223,8 @@ fn run_ink(style: GlowStyle, total: usize, split_wrap_burst: bool) -> Run {
     let chars: Vec<char> = text.chars().collect();
     assert!(chars.len() >= total && total > WRAP_W + 2);
 
-    // Claude Code owns the ALT SCREEN (live-verified) — the surface whose
-    // re-anchor is blink-gated. Then the initial frame: empty prompt.
+    // Claude Code runs on the alt screen, whose re-anchor is blink-gated; then the initial frame:
+    // an empty prompt.
     term.process(b"\x1b[?1049h");
     term.process(&ink_burst(""));
     feed_blink(&term, &mut glow, &mut blink_seen, t);
@@ -266,16 +245,14 @@ fn run_ink(style: GlowStyle, total: usize, split_wrap_burst: bool) -> Run {
         let is_wrap_key = n == WRAP_W;
         let pre = sample(&term);
         t += Duration::from_millis(16);
-        // The app_input seam: a plain Character keypress arms the typed hint
-        // BEFORE its echo/repaint reaches the terminal.
+        // The app_input seam: a plain character key arms the typed hint before its echo reaches
+        // the terminal.
         glow.note_synthetic_typed(t, 1);
         if split_wrap_burst && is_wrap_key {
             let (head, tail) = ink_burst_split(&typed);
             term.process(&head);
-            // A frame lands mid-repaint: the cursor is hidden and the hide was
-            // processed inside the still-open sync, so the blink derivation
-            // notes it on this frame (the host's tick runs before the sync-hold
-            // early return).
+            // A frame lands mid-repaint: the cursor is hidden and the hide was processed inside
+            // the still-open sync, so this frame notes the blink.
             let mid = sample(&term);
             assert_eq!(mid, None, "mid-repaint frame must sample a hidden cursor");
             feed_blink(&term, &mut glow, &mut blink_seen, t);
@@ -318,11 +295,9 @@ fn run_ink(style: GlowStyle, total: usize, split_wrap_burst: bool) -> Run {
     }
 }
 
-/// Control: each keystroke echoes one char and the terminal's deferred autowrap
-/// moves the cursor, with no repaint choreography. The typed hint is armed per
-/// key as in the Ink run (the GUI cannot know the program) and must change
-/// nothing: the shape detector classifies the wrap, and other advances are
-/// dist ≤ 1.
+/// The control: one char echoed per key, the cursor moved by the terminal's deferred autowrap.
+/// The typed hint is armed per key as in the Ink run (the GUI cannot know the program) and
+/// changes nothing: the shape detector classifies the wrap, other advances are dist ≤ 1.
 fn run_zsh(style: GlowStyle, total: usize) -> Run {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     let mut glow = CursorGlow::default();
@@ -358,9 +333,8 @@ fn run_zsh(style: GlowStyle, total: usize) -> Run {
             collecting = true;
             collect_until = t + Duration::from_millis(600);
         }
-        // The host feeds the blink derivation every frame; an echoing shell never
-        // advances the epoch (no hide, no sync): the no-blink half of the
-        // discriminator.
+        // An echoing shell never advances the blink epoch (no hide, no sync): the no-blink half
+        // of the discriminator.
         feed_blink(&term, &mut glow, &mut blink_seen, t);
         glow.tick(post, t, &c, g, &mut out);
         if collecting && t <= collect_until {
@@ -430,9 +404,7 @@ fn ink_wrap_fire_stays_confined_to_typed_cells() {
          cursor never visited lit up"
     );
 
-    // Control: the echo-only autowrap stays healthy under the per-key typed hint
-    // (the shape wrap handles it; other advances are dist <= 1, outside the
-    // re-anchor window).
+    // Control: the echo-only autowrap stays a typing wake under the per-key typed hint.
     let z_landing = zsh.rows[(TEXT1 - 1) as usize].len();
     assert!(
         z_landing <= 12,
@@ -444,23 +416,22 @@ fn ink_wrap_fire_stays_confined_to_typed_cells() {
         "control: no mid-band fire on the wrapped-onto row"
     );
 
-    // Spark-rooted flames stay confined to the typed cells too (the original
-    // arm discriminator, now a plain bound).
+    // Spark-rooted flames stay confined to the typed cells too.
     let landing_patch_cells = ink.rows_patches[(TEXT1 - 1) as usize].len();
     assert!(
         landing_patch_cells <= 12,
         "landing-row FirePatch cells confined to typed cells: {landing_patch_cells}"
     );
-    // And the wake CONTINUES at the wrap (the visible->visible re-anchor keeps
-    // emitting — contrast the hidden-frame case below, which lays nothing).
+    // The wake continues through the wrap (the visible->visible re-anchor keeps emitting; the
+    // hidden-frame case below lays nothing).
     assert!(
         ink.quads_on_wrap_frame > 0,
         "the typing wake continues through the wrap frame"
     );
 }
 
-/// FIXED, rainbow kitty: no full-width ZOOM streak — the ribbon continues at the
-/// landing cell and the landing row stays a ribbon head, like the control.
+/// Rainbow kitty: no full-width zoom streak; the ribbon continues at the landing cell and the
+/// landing row stays a ribbon head, like the control.
 #[test]
 fn ink_wrap_rainbow_keeps_the_ribbon_no_zoom() {
     let ink = run_ink(GlowStyle::RainbowKitty, WRAP_W + 5, false);
@@ -510,10 +481,9 @@ fn ink_wrap_laser_lays_no_full_vector_sweep() {
     );
 }
 
-/// Hide path: if a frame catches the repaint mid-burst (cursor hidden),
-/// `self.last` resets to None and the hide bridge (chebyshev ≤ 2) refuses the
-/// wrap-sized move, with or without the typed hint (the `raw_dist > 2` guard).
-/// The mid-band stays dark because nothing spawns.
+/// Hide path: a frame that catches the repaint mid-burst (cursor hidden) resets `last`, and the
+/// hide bridge's reach (`HIDE_BRIDGE_MAX_DIST`, `HIDE_BRIDGE_TYPED_MAX_DIST` with the typed hint)
+/// refuses the wrap-sized move, so nothing spawns and the mid-band stays dark.
 #[test]
 fn hidden_mid_repaint_frame_suppresses_the_spawn_entirely() {
     let ink = run_ink(GlowStyle::Fire, WRAP_W + 5, true);

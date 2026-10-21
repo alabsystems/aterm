@@ -53,7 +53,7 @@ pub mod selector;
 mod tests;
 
 /// Policy schema version shipped by this crate. The reader rejects any value
-/// other than this constant (§5.1 of the design).
+/// other than this constant.
 pub const SCHEMA_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ impl OriginTag {
     /// Returns `true` iff `self` dominates `required` — i.e. `self` is as
     /// trusted as or more trusted than `required`.
     ///
-    /// This is the origin-gate check from design §4.2:
+    /// This is the origin-gate check:
     ///
     /// ```text
     /// if selector_matches(rule.sequence, seq):
@@ -235,7 +235,7 @@ impl Response {
 // Defaults
 // ---------------------------------------------------------------------------
 
-/// Policy defaults: fallthrough behavior when no rule matches (§4.1).
+/// Policy defaults: fallthrough behavior when no rule matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "toml", serde(deny_unknown_fields))]
@@ -244,7 +244,7 @@ pub struct Defaults {
     pub unmatched: Response,
     /// Whether OSC 133 / OSC 633 shell-integration sequences require a
     /// 64-hex-digit nonce. Mirrors
-    /// `TerminalModes::require_shell_integration_nonce` (§6.4).
+    /// `TerminalModes::require_shell_integration_nonce`.
     #[cfg_attr(feature = "toml", serde(default))]
     pub shell_integration_require_nonce: bool,
 }
@@ -258,8 +258,8 @@ pub struct Defaults {
 /// Rules are evaluated top-to-bottom; the first rule whose `sequence` matches
 /// the dispatched escape sequence AND whose `origin_min` is dominated by the
 /// byte's origin wins. A rule that matches by selector but fails the origin
-/// test does **not** short-circuit — evaluation continues with the next rule
-/// (§4.2). This lets operators write fallback rules for the same selector.
+/// test does **not** short-circuit — evaluation continues with the next rule.
+/// This lets operators write fallback rules for the same selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "toml", serde(deny_unknown_fields))]
@@ -291,7 +291,7 @@ pub struct Rule {
 // RateLimit
 // ---------------------------------------------------------------------------
 
-/// Named token-bucket configuration (§3.1).
+/// Named token-bucket configuration.
 ///
 /// Schema only; bucket state lives in the engine's [`limits::RateLimiterSet`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,7 +368,7 @@ impl RateLimit {
 // Policy
 // ---------------------------------------------------------------------------
 
-/// Root policy document (§3.1 + Appendix A).
+/// Root policy document.
 ///
 /// The TOML document a policy file parses into (`Policy::to_toml`, behind the
 /// `toml` feature, writes it back). Checkpoints deliberately omit it; the host
@@ -378,7 +378,7 @@ impl RateLimit {
 #[cfg_attr(feature = "toml", serde(deny_unknown_fields))]
 pub struct Policy {
     /// Schema version. Must equal [`SCHEMA_VERSION`]; the reader rejects any
-    /// other value (§5.1).
+    /// other value.
     pub schema_version: u32,
     /// Profile tag. Informational; the effective behavior is the rule set.
     pub profile: Profile,
@@ -394,7 +394,7 @@ pub struct Policy {
 
 #[cfg(feature = "toml")]
 impl Policy {
-    /// Serialize this policy as a TOML string (§5.1).
+    /// Serialize this policy as a TOML string.
     ///
     /// # Errors
     ///

@@ -905,6 +905,9 @@ impl Gen {
             hold: self.pick(&[None, None, Some(HoldWord::Local), Some(HoldWord::Bridge)]),
             reset_unix: self.pick(&[None, Some(NOW - 60), Some(NOW + 60)]),
             now_unix: NOW,
+            // No set told: the verdict reads the entry (slice 2c stores the
+            // words; nothing reads them into a verdict before 2d).
+            told: crate::needs::ToldNeeds::default(),
         }
     }
 }
@@ -1635,8 +1638,9 @@ fn a_writers_wait_carries_its_words() {
 /// loop raises `owner=needs kind=ask "<program> needs you: … — carrying on"`
 /// for a report's `NEEDS YOU:` lines, and the classifier reads it as the ask
 /// it is — the border, the pill, `◇`, `❯N` and the menu bar's "needs you" —
-/// with no reader of its own. Its words are the entry's. NEGATIVE CONTROL: the
-/// same owner's entry written `kind=wait` is a wait, never an ask.
+/// with no reader of its own. Its words are the worker's, without aterm's
+/// frame (§12.2.3), and its key is the entry's. NEGATIVE CONTROL: the same
+/// owner's entry written `kind=wait` is a wait, never an ask.
 #[test]
 fn a_workers_needs_you_entry_is_an_ask() {
     let owner = crate::harness_host::NEEDS_ATTENTION_OWNER;
@@ -1646,7 +1650,10 @@ fn a_workers_needs_you_entry_is_an_ask() {
         ..facts()
     });
     assert_eq!(words(&v), (Some(NeedWord::Ask), None));
-    assert_eq!(v.need.as_ref().map(|n| n.what.as_str()), Some(text));
+    assert_eq!(
+        v.need.as_ref().map(|n| (n.what.as_str(), n.key)),
+        Some(("approval to publish", ask_key(text)))
+    );
     let waited = of(&NeedFacts {
         attention: vec![entry(owner, text, Some(AttentionKind::Wait))],
         ..facts()
@@ -1655,5 +1662,297 @@ fn a_workers_needs_you_entry_is_an_ask() {
         words(&waited),
         (None, Some(WaitWord::Entry)),
         "CONTROL: kind=wait"
+    );
+}
+
+/// Need (a) of design §12.2.1, whole: longer than the 64 cells the entry's
+/// writer keeps.
+const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings \u{25b8} \
+                      Privacy & Security \u{25b8} Screen Recording, so the windowed check \
+                      can capture the menu";
+
+/// `need` cut as the entry's writer cuts it (`escalate::clip_to`, 64 cells,
+/// `…` the last), for a need of one-cell characters.
+fn cut64(need: &str) -> String {
+    if need.chars().count() <= 64 {
+        return need.to_string();
+    }
+    let mut out: String = need.chars().take(63).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// The harness's entry as its writer words it
+/// (`escalate::needs_attention_text`).
+fn harness_entry(program: &str, first: &str, more: u16) -> String {
+    let more = if more == 0 {
+        String::new()
+    } else {
+        format!(" (+{more} more)")
+    };
+    format!("{program} needs you: {first}{more} \u{2014} carrying on")
+}
+
+/// The verdict a lone `owner=needs` ask of `text` gives.
+fn harness_verdict(text: &str) -> Verdict {
+    of(&NeedFacts {
+        attention: vec![entry(
+            crate::harness_host::NEEDS_ATTENTION_OWNER,
+            text,
+            Some(AttentionKind::Ask),
+        )],
+        ..facts()
+    })
+}
+
+/// THE NEED WITHOUT ATERM'S FRAME (Autopilot v5 §12.2.3, §12.2.6): a whole
+/// entry gives its need and program; one a byte cap cut inside ` — carrying
+/// on` gives the same need; `(+3 more)` is counted and comes off; a text that
+/// names no program, and another owner's ask, are not read (they stay
+/// whole). NEGATIVE CONTROL (run for the landing): `need_words` returning
+/// the text as it came (`first: text`, `more: 0`) fails the first assertion.
+#[test]
+fn need_words_takes_the_frame_off_a_harness_entry() {
+    use aterm_phase::Program;
+    let whole = harness_entry("claude", "the release credential to sign 0.48.0", 0);
+    assert_eq!(
+        need_words(&whole),
+        Some(NeedWords {
+            first: "the release credential to sign 0.48.0",
+            more: 0,
+            program: Program::Claude,
+        })
+    );
+    // A cap that fell inside the carry-on, at each of its characters from the
+    // dash on: the need is the same.
+    let tail = " \u{2014} carrying on";
+    for (at, _) in tail.char_indices().skip(1) {
+        let cut = format!("agy needs you: sign it (+1 more){}", &tail[..at]);
+        assert_eq!(
+            need_words(&cut).map(|w| (w.first, w.more, w.program)),
+            Some(("sign it", 1, Program::Agy)),
+            "{cut:?}"
+        );
+    }
+    let three = harness_entry("muse", &cut64(NEED_A), 3);
+    let read = need_words(&three).expect("a counted entry");
+    assert_eq!(
+        (read.first, read.more, read.program),
+        (cut64(NEED_A).as_str(), 3, Program::Muse)
+    );
+    // No program, a cut inside the count, and someone's own words: not read.
+    for text in [
+        "the build needs you: look \u{2014} carrying on",
+        "claude needs you: sign it (+1 mo",
+        "please look at the release",
+    ] {
+        assert_eq!(need_words(text), None, "{text:?}");
+    }
+    // Another owner's ask is not the harness's, whatever its words.
+    let other = of(&NeedFacts {
+        attention: vec![entry("lab", &whole, Some(AttentionKind::Ask))],
+        ..facts()
+    });
+    let need = other.need.expect("an ask");
+    assert_eq!(
+        (need.harness, need.what.as_str()),
+        (None, whole.as_str()),
+        "another owner's ask stays whole"
+    );
+}
+
+/// A HARNESS'S ASK KEEPS ITS LINE WITHIN ITS BYTES (§12.2.3, §12.2.6): need
+/// (a), and a need of `▸`s and CJK text, each cut at 64 cells by the entry's
+/// writer and counted `(+1 more)`: `what` is at most [`ROW_WHAT_MAX`] bytes
+/// with ` (+1 more)` whole at its end, and `harness.first` holds the need
+/// as the entry carried it. NEGATIVE CONTROL (run for the landing): `what`
+/// built from `first` as the writer cut it (64 cells, not the bytes the tail
+/// leaves) overflows 72 bytes on the second.
+#[test]
+fn a_harness_ask_keeps_its_line_within_its_bytes() {
+    let wide = format!(
+        "{}\u{2026}",
+        "\u{25b8}\u{4e0a}\u{7ebf}"
+            .repeat(13)
+            .chars()
+            .take(38)
+            .collect::<String>()
+    );
+    for need in [cut64(NEED_A), wide] {
+        let text = harness_entry("claude", &need, 1);
+        let got = harness_verdict(&text).need.expect("the ask");
+        let ask = got.harness.as_ref().expect("the harness's own words");
+        assert_eq!(
+            (ask.first.as_str(), ask.more, ask.program),
+            (need.as_str(), 1, aterm_phase::Program::Claude)
+        );
+        assert!(
+            got.what.len() <= ROW_WHAT_MAX && got.what.ends_with(" (+1 more)"),
+            "{} bytes: {:?}",
+            got.what.len(),
+            got.what
+        );
+        assert!(!got.what.contains("needs you"), "{:?}", got.what);
+        assert_eq!(got.key, ask_key(&text), "the key stays the entry's");
+    }
+}
+
+/// Need (b) of design §12.2.1.
+const NEED_B: &str = "the release credential (~/.aterm/release-credentials.toml) to sign 0.48.0";
+
+/// The facts of a lone needs owner's entry `entry`, with `needs` told to
+/// the window with `told_with` (slice 2c's store: the set told last).
+fn told_with(entry: &str, needs: &[&str], told_with: &str) -> NeedFacts {
+    let set: Vec<String> = needs.iter().map(|need| (*need).to_string()).collect();
+    let mut told = ToldNeeds::default();
+    told.tell(
+        HarnessNeeds::told(&set, told_with).map(std::sync::Arc::new),
+        Some(entry),
+    );
+    NeedFacts {
+        attention: vec![entry_of(entry)],
+        told,
+        ..facts()
+    }
+}
+
+/// The needs owner's ask of `text`.
+fn entry_of(text: &str) -> AttentionFact {
+    entry(
+        crate::harness_host::NEEDS_ATTENTION_OWNER,
+        text,
+        Some(AttentionKind::Ask),
+    )
+}
+
+/// A HARNESS'S NEED READS IN ITS OWN WORDS (Autopilot v5 §12.2.3 item 4,
+/// §12.2.6; slice 2d): where the loop told the window the whole set with
+/// the very entry that stands, the verdict's `harness.first` is need (a)
+/// whole — longer than the 64 cells the entry carries — with `more = 1`
+/// and need (b) among its `others`; `what` stays within [`ROW_WHAT_MAX`]
+/// with ` (+1 more)` whole, `needs_n=` counts 2, and the key stays the
+/// entry's. A set told with ANOTHER entry (a request the connection lost,
+/// one a cap cut) is not read: the entry's own parse stands, (a) cut, no
+/// others. A set of 3 told under the same entry reads all three: a set
+/// that moves under one entry moves the verdict, never its key. NEGATIVE
+/// CONTROL (run as a mutant for the landing): `harness_ask` ignoring the
+/// told set (2a's parse alone) gives (a) cut at 64 cells and no others.
+#[test]
+fn a_harness_need_reads_in_its_own_words() {
+    let entry = harness_entry("claude", &cut64(NEED_A), 1);
+    let v = of(&told_with(&entry, &[NEED_A, NEED_B], &entry));
+    let need = v.need.as_ref().expect("the ask");
+    let ask = v.harness_ask().expect("the harness's own words");
+    assert_eq!(
+        (
+            ask.first.as_str(),
+            ask.more,
+            ask.others.as_slice(),
+            ask.program
+        ),
+        (
+            NEED_A,
+            1,
+            [NEED_B.to_string()].as_slice(),
+            aterm_phase::Program::Claude
+        ),
+        "need (a) whole, (b) beside it"
+    );
+    assert_eq!(ask.count(), 2);
+    assert!(
+        need.what.len() <= ROW_WHAT_MAX && need.what.ends_with(" (+1 more)"),
+        "{:?}",
+        need.what
+    );
+    assert_eq!(need.key, ask_key(&entry), "the key stays the entry's");
+
+    // Told with another entry: not read beside this one.
+    let other = harness_entry("claude", "something else", 0);
+    let parsed = of(&told_with(&entry, &[NEED_A, NEED_B], &other));
+    let ask = parsed.harness_ask().expect("the entry's own parse");
+    assert_eq!(
+        (ask.first.as_str(), ask.more, ask.others.len()),
+        (cut64(NEED_A).as_str(), 1, 0),
+        "words told with another entry fall back to the parse"
+    );
+
+    // The set moves under the same entry: the verdict moves, its key does not.
+    let moved = of(&told_with(&entry, &[NEED_A, "a third thing"], &entry));
+    assert_ne!(moved, v, "the set moved under one entry");
+    assert_eq!(moved.need.as_ref().map(|n| n.key), Some(need.key));
+    assert_eq!(
+        moved.harness_ask().map(|a| a.others.clone()),
+        Some(vec!["a third thing".to_string()])
+    );
+}
+
+/// THE PROGRAM IS THE ENTRY'S, AND A NEED THAT FOLDS TO NOTHING IS NO
+/// NEED (slice 2d): the told set is said under the program the entry names
+/// (`agy needs you:` reads as agy), even where a cap cut the entry past its
+/// count, so its parse reads nothing; a told need that folds to nothing is
+/// passed over, and a set of none such falls back to the parse. An entry
+/// whose head names no program this build knows is read as main reads it.
+/// NEGATIVE CONTROL (run as a mutant for the landing): the program read
+/// only through the entry's whole parse leaves the cut entry with no
+/// harness words at all.
+#[test]
+fn a_told_set_reads_under_its_entrys_program() {
+    // A cap that fell inside the count: the parse reads nothing.
+    let cut = "agy needs you: sign the release (+1 mo";
+    assert_eq!(need_words(cut), None);
+    let v = of(&told_with(
+        cut,
+        &["sign the release", "rotate the key"],
+        cut,
+    ));
+    let ask = v.harness_ask().expect("the told set, under agy");
+    assert_eq!(
+        (ask.first.as_str(), ask.more, ask.program),
+        ("sign the release", 1, aterm_phase::Program::Agy)
+    );
+    // A blank need is passed over.
+    let entry = harness_entry("claude", "sign it", 0);
+    let v = of(&told_with(&entry, &["\u{200b} ", "sign it"], &entry));
+    assert_eq!(
+        v.harness_ask().map(|a| (a.first.as_str(), a.more)),
+        Some(("sign it", 0))
+    );
+    // No program this build knows: the text stays whole, as main reads it.
+    let alien = "nobody needs you: sign it \u{2014} carrying on";
+    let v = of(&told_with(alien, &["sign it"], alien));
+    assert_eq!(v.harness_ask(), None);
+}
+
+/// A NEED IN ANY SCRIPT READS WHOLE (§12.2.1's hover, "each need whole, up
+/// to the policy's 160 characters"; the review of 2d): two needs of the
+/// policy's full 160 characters in letters of three bytes each (480 bytes,
+/// twice the banner's [`NEED_WHAT_MAX`]) told with the entry that stands
+/// read whole in the verdict and say themselves whole on the tab's hover,
+/// a line each; the banner's body still clips the first to its own
+/// [`NEED_WHAT_MAX`]. NEGATIVE CONTROL (run as a mutant for the landing):
+/// `HarnessAsk::told` folding each need within [`NEED_WHAT_MAX`] (the
+/// banner's budget) cuts both at 80 letters with `…`.
+#[test]
+fn a_told_need_in_any_script_reads_whole() {
+    let long: String = "\u{9700}".repeat(aterm_agent::supervise::policy::needs::NEED_CHARS);
+    assert_eq!(long.len(), 480, "PRECONDITION: three bytes a letter");
+    let entry = harness_entry("claude", &cut64(&long), 1);
+    let v = of(&told_with(&entry, &[&long, &long], &entry));
+    let ask = v.harness_ask().expect("the told set");
+    assert_eq!(
+        (ask.first.as_str(), ask.others.as_slice()),
+        (long.as_str(), [long.clone()].as_slice()),
+        "each need whole"
+    );
+    let hover = crate::app_presence::harness_need_hover(ask);
+    assert_eq!(
+        hover.get(..2),
+        Some([format!("Needs you: {long}"), format!("Needs you: {long}")].as_slice()),
+        "{hover:#?}"
+    );
+    let body = ask.line(NEED_WHAT_MAX + ask.more_words().len());
+    assert!(
+        body.len() <= NEED_WHAT_MAX + " (+1 more)".len() && body.ends_with("\u{2026} (+1 more)"),
+        "{body}"
     );
 }

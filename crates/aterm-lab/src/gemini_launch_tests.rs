@@ -13,7 +13,8 @@ use crate::run::Run;
 use crate::util::shell_quote;
 
 // Each outer test owns a whole child process group and its scratch directory.
-// The child runs only our scripts: no installed agent or aterm is launched.
+// The child runs our scripts and the system's cat in place: no installed
+// agent or aterm is launched.
 fn check_launch(agent: Agent, test: &str) {
     const CHILD: &str = "ATERM_LAB_LAUNCH_FIXTURE";
     if let Some(root) = std::env::var_os(CHILD) {
@@ -70,6 +71,24 @@ fn launch_fixture(agent: Agent, root: &Path) {
     let calls = root.join("calls");
     let refuse = root.join("refuse-enter");
     let executed = root.join("agent-executed");
+    let denied = root.join("account-canary");
+    let profile = root.join("jail.sb");
+    std::fs::write(&denied, b"owned-account-canary").unwrap();
+    let mut control = aterm_uds::spawnfd::command("/bin/cat");
+    control.arg(&denied);
+    let outside =
+        aterm_uds::deadline::output_until(&mut control, Instant::now() + Duration::from_secs(60))
+            .expect("the in-place cat reads the owned canary outside the jail");
+    assert!(outside.status.success(), "{outside:?}");
+    assert_eq!(outside.stdout, b"owned-account-canary");
+    std::fs::write(
+        &profile,
+        format!(
+            "(version 1)\n(allow default)\n(deny file-read-data (literal {:?}))\n",
+            denied.to_str().unwrap()
+        ),
+    )
+    .unwrap();
     let sampler = bin.join("aterm-lab");
     put_text(&sampler, 0o700, "#!/bin/sh\nprintf R\nIFS= read -r line\n").unwrap();
     let mut witness = Witness(
@@ -107,8 +126,9 @@ fn launch_fixture(agent: Agent, root: &Path) {
         &fake_ctl,
         0o700,
         &format!(
-            "#!/bin/sh\n[ \"$1\" = ctl ] && [ \"$2\" = --sock ] && [ \"$3\" = {socket} ] && [ \"$4\" = -- ] || exit 90\nshift 4\ncase \"$1\" in\n  send) [ \"$#\" = 2 ] || exit 91; printf 'send\\n' >> {calls};;\n  key) [ \"$#\" = 2 ] && [ \"$2\" = enter ] || exit 92; printf 'key enter\\n' >> {calls}; if [ -f {refuse} ]; then printf 'ERR fixture-enter-refused\\n' >&2; exit 17; fi;;\n  *) exit 93;;\nesac\nprintf 'OK\\n'\n",
+            "#!/bin/sh\n[ \"$1\" = ctl ] && [ \"$2\" = --sock ] && [ \"$3\" = {socket} ] && [ \"$4\" = -- ] || exit 90\nshift 4\nif /bin/cat {denied} >/dev/null 2>&1; then exit 94; fi\ncase \"$1\" in\n  send) [ \"$#\" = 2 ] || exit 91; printf 'send\\n' >> {calls};;\n  key) [ \"$#\" = 2 ] && [ \"$2\" = enter ] || exit 92; printf 'key enter\\n' >> {calls}; if [ -f {refuse} ]; then printf 'ERR fixture-enter-refused\\n' >&2; exit 17; fi;;\n  *) exit 93;;\nesac\nprintf 'OK\\n'\n",
             socket = shell_quote(&socket.to_string_lossy()),
+            denied = shell_quote(&denied.to_string_lossy()),
             calls = shell_quote(&calls.to_string_lossy()),
             refuse = shell_quote(&refuse.to_string_lossy()),
         ),
@@ -146,6 +166,17 @@ fn launch_fixture(agent: Agent, root: &Path) {
         "the refused Enter must actually reach the transport"
     );
     assert!(!executed.exists());
+    std::fs::remove_file(&refuse).unwrap();
+    std::fs::remove_file(&profile).unwrap();
+    assert!(
+        launch(&run, agent, &Launch::default()).is_err(),
+        "a missing recorded jail must not launch an uncontained client"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "send\nkey enter\nsend\nkey enter\n",
+        "the client must not run without its profile"
+    );
     let pid = witness.0.id();
     witness.0.kill().unwrap();
     let status = witness.0.wait().unwrap();

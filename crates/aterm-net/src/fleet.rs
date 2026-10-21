@@ -121,7 +121,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_codec::hex;
-use aterm_digest::HmacSha256;
+use aterm_digest::{hkdf_expand_32, hkdf_extract, hmac_sha256_parts};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection, StreamOwned};
@@ -1899,31 +1899,20 @@ fn dialer_proves<S: Read + Write>(
     Ok((scope, peer))
 }
 
-/// HKDF-Extract (RFC 5869 §2.2): `PRK = HMAC-SHA256(salt, IKM)`. An empty
-/// salt is RFC 5869's string of 32 zeros: HMAC zero-pads both to one block.
-fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    mac(salt, &[ikm])
-}
-
-/// HKDF-Expand (RFC 5869 §2.3) for 32 bytes, its first block alone:
-/// `T(1) = HMAC-SHA256(PRK, info ‖ 0x01)`.
-fn hkdf_expand_32(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
-    mac(prk, &[info, &[1]])
-}
-
-/// HMAC-SHA256 under `key` of the concatenation of `parts`.
-fn mac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
-    for part in parts {
-        mac.update(part);
-    }
-    mac.finalize()
-}
+// THE KEYS AND TAGS ARE astream-digest's HMAC-SHA256 AND HKDF-SHA256, through
+// aterm-digest: `hkdf_extract` (RFC 5869 §2.2, an empty salt being its string of
+// 32 zeros) and `hkdf_expand_32` (§2.3, the first block alone, all a role key
+// takes) wipe the key blocks they key with, and `hmac_sha256_parts` MACs the
+// concatenation of its parts without joining them. This file kept a private
+// HKDF over the HMAC until astream-digest held the one construction (claim
+// `digest.hmac-one-construction`, with RFC 5869's vectors); the role keys and a
+// tag recorded through that private copy pin the move
+// (`the_role_keys_and_a_tag_are_the_answers_recorded_before_the_hkdf_moved`).
 
 /// The tag a role's `key` makes for `word` on the channel whose exporter is
 /// `exporter`.
 fn tag(key: &[u8; 32], exporter: &[u8], word: &str) -> [u8; TAG_LEN] {
-    mac(key, &[exporter, word.as_bytes()])
+    hmac_sha256_parts(key, &[exporter, word.as_bytes()])
 }
 
 /// Whether `presented` is `key`'s tag for `word` on this channel, compared in
@@ -2087,31 +2076,46 @@ mod tests {
         got
     }
 
-    /// RFC 5869 appendix A, test cases 1 and 3 (SHA-256): the extract step,
-    /// and the expand step's first block, which is all a role key takes.
+    /// **THE ROLE KEYS AND A TAG ARE THE ANSWERS RECORDED BEFORE THE HKDF
+    /// MOVED.** The fleet's keys are a wire contract: every member derives the
+    /// same `Ks`, `Kc` and `Kj` from the one secret, so an aterm whose
+    /// derivation changed by a bit proves nothing to an older peer. These hex
+    /// strings were recorded through this file's own private HKDF
+    /// (`hkdf_extract`/`hkdf_expand_32` over aterm-digest's HMAC), just before
+    /// it gave way to astream-digest's, for RFC 5869 case 1's IKM as the
+    /// secret; RFC 5869's own vectors are astream-digest's to hold now.
+    ///
+    /// Negative control: one bit of the secret flipped moves every key and
+    /// the tag, so the agreement is the derivation's, not a constant's.
     #[test]
-    fn hkdf_matches_rfc_5869() {
-        let ikm = [0x0b; 22];
-        let salt: Vec<u8> = (0x00..=0x0c).collect();
-        let info: Vec<u8> = (0xf0..=0xf9).collect();
-        let prk = hkdf_extract(&salt, &ikm);
+    fn the_role_keys_and_a_tag_are_the_answers_recorded_before_the_hkdf_moved() {
+        let keys = FleetSecret::new(&[0x0b; 22]).unwrap();
+        let recorded = |hex: &str| <[u8; 32]>::try_from(hex32(hex)).unwrap();
         assert_eq!(
-            prk.to_vec(),
-            hex32("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+            keys.server,
+            recorded("4372c139d6e12dd79a1067058c17bc0b80c23ec04408767788a0c3564a3a8105")
         );
         assert_eq!(
-            hkdf_expand_32(&prk, &info).to_vec(),
-            hex32("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf")
-        );
-        let prk = hkdf_extract(&[], &ikm);
-        assert_eq!(
-            prk.to_vec(),
-            hex32("19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04")
+            keys.client,
+            recorded("58c9589b9c8d82c98a1d00fd0e05a0bed3586ec685ce363c6c46f61623b822ef")
         );
         assert_eq!(
-            hkdf_expand_32(&prk, &[]).to_vec(),
-            hex32("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d")
+            keys.join,
+            recorded("45abb3624f933b8d0104508a3cd486edf83a358c4beec2d326b0d73e8a21e066")
         );
+        let survey = tag(&keys.client, &[0xa5; 32], "survey");
+        assert_eq!(
+            survey,
+            recorded("f92e33cf27fc4091ec8577e69a3afae1985bfca7b81d9d98738e89272125c732")
+        );
+
+        let mut flipped = [0x0b; 22];
+        flipped[21] ^= 0x01;
+        let other = FleetSecret::new(&flipped).unwrap();
+        assert_ne!(other.server, keys.server);
+        assert_ne!(other.client, keys.client);
+        assert_ne!(other.join, keys.join);
+        assert_ne!(tag(&other.client, &[0xa5; 32], "survey"), survey);
     }
 
     #[test]

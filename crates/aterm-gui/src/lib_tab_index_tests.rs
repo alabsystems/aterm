@@ -14,7 +14,7 @@ fn switch_to_clamps_to_range() {
     assert_eq!(t.active, 1);
 }
 
-/// Cmd-Shift-]/[ cycles with WRAP; single/zero tab is a no-op.
+/// Cmd-Shift-]/[ cycles with wrap; one tab is a no-op.
 #[test]
 fn cycle_wraps_both_directions() {
     let mut t = TabIndex::new(0, 3);
@@ -80,10 +80,7 @@ fn assert_invariants(m: &Model, s: &BTreeMap<&'static str, i64>, ctx: &str) {
     );
 }
 
-/// Assert the real `prev -> next` step is one the model's `action` admits (the
-/// real next-state is in the action's existential fan-out). This is the
-/// transition-level conformance: the real code only ever moves the way the
-/// ty-proven model says it may.
+/// Assert the real `prev -> next` step is one of the model `action`'s successors.
 fn assert_admissible(
     m: &Model,
     action: &str,
@@ -111,12 +108,10 @@ fn real_tab_index_conforms_to_ty_proven_model() {
     );
     assert_invariants(&m, &project(&t), "at init");
 
-    // A scripted run touching every action: NewTab x3, SelectTab, Cycle, and
-    // Close in the worst-case (active-is-last) shape that stresses the re-clamp.
-    // After each real mutator: invariants hold and the step is admissible.
+    // A scripted run through every action, Close in the active-is-last shape that needs
+    // the re-clamp; after each mutator the invariants hold and the step is admissible.
 
-    // NewTab x3 -> 4 tabs (Cap), active follows to the new last each time
-    // (open-and-switch: `add` returns the new tab's index and makes it active).
+    // NewTab x3 -> 4 tabs (Cap); `add` makes each new last tab active.
     for _ in 0..3 {
         let prev = project(&t);
         let opened = t.add();
@@ -153,9 +148,8 @@ fn real_tab_index_conforms_to_ty_proven_model() {
         assert_admissible(&m, "Cycle", &prev, &next);
         assert_invariants(&m, &next, "after Cycle");
     }
-    // Cycle BACKWARD (Cmd-Shift-[) wraps the other way. The model has no
-    // backward action; a backward step is an in-range jump, so it must be an
-    // admissible `SelectTab` — and it must land exactly one tab back.
+    // Cycle backward (Cmd-Shift-[): the model has no backward action, so each step must
+    // be an admissible `SelectTab` landing exactly one tab back.
     for _ in 0..5 {
         let prev = project(&t);
         let back = (t.active + t.count - 1) % t.count;
@@ -235,7 +229,7 @@ fn real_tab_index_conforms_to_ty_proven_model() {
     assert_admissible(&m, "Close", &prev, &project(&t));
     assert_invariants(&m, &project(&t), "after Close(active middle)");
 
-    // Negative controls: `ActiveInRange` rejects an out-of-range state, so the asserts
+    // Negative control: `ActiveInRange` rejects an out-of-range state, so the asserts
     // above are not vacuous.
     let mut bad = project(&t);
     bad.insert("active", bad["count"]); // active == count: one past the last tab
@@ -244,11 +238,9 @@ fn real_tab_index_conforms_to_ty_proven_model() {
         "ActiveInRange must REJECT active==count (else the conformance is vacuous)"
     );
 
-    // 2. The defect the model catches IS the defect the real `close` avoids:
-    //    reproduce the buggy "forgot to re-clamp" Close by hand (decrement count
-    //    but leave active at the old last index) and show it lands exactly on
-    //    the state the model's invariant rejects — and is not an admissible
-    //    `Close` of the correct model (so the real clamp is load-bearing).
+    // The forgot-to-re-clamp Close (count decremented, active left at the old last index)
+    // lands on a state `ActiveInRange` rejects and is no admissible `Close`: the real
+    // clamp is load-bearing.
     let last_focused = TabIndex {
         active: 2,
         count: 3,
@@ -269,7 +261,7 @@ fn real_tab_index_conforms_to_ty_proven_model() {
             .any(|s| s == &buggy_next),
         "the buggy unclamped Close is NOT an admissible transition of the correct model"
     );
-    // The real close on the same state re-clamps and DOES conform.
+    // The real close on the same state re-clamps and conforms.
     let mut real = last_focused;
     assert!(!real.close(2));
     let real_next = project(&real);

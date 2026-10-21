@@ -1,27 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE AUDIBILITY ORACLE** — one table that decides whether a keypress
-//! right now makes a sound, and names the gate when it does not.
+//! The audibility oracle: one table that decides whether a keypress makes a sound now, and
+//! names the gate when it does not (`tone`'s `seam=` field).
 //!
-//! `aterm ctl tone` used to be structurally incapable of refuting "sound is
-//! broken": its `audio=` field came only from `TrailAudio::is_live()` and
-//! `wedged_for()`, and there was NO field for the engine's own key seam, the
-//! motion stage, or the load-shed envelope. So a shed frame and a
-//! `Reduce Motion` session both printed `audio=live sounds=on volume=0.40
-//! active=true dropped=0` while the user heard silence — the same
-//! false-reassurance shape as the recorded 2026-08 "silent for hours while
-//! tone said live" incident.
+//! Precedence, pinned by a test: what the user set, then where the user is, then whether
+//! the host can sound, then transients, then the engine. The answer is an AND over every
+//! term, so `open` never disagrees with the key path; precedence only chooses which closed
+//! gate is reported when several are.
 //!
-//! PRECEDENCE, fixed and enforced by a test rather than merely written down:
-//! what the user SET, then where the user IS, then whether the host CAN
-//! sound, then transients, then the engine. The boolean answer is an AND over
-//! every term, so `open` can never disagree with the key path whatever
-//! precedence names; precedence only chooses WHICH closed gate gets reported
-//! when several are closed at once.
-//!
-//! Pure: no `App`, no window, no clock. Headless-constructible, exactly as
-//! `tone_infer` is.
+//! Pure: no `App`, window or clock.
 
 use crate::trail_audio::HostState;
 
@@ -36,14 +24,9 @@ mod conformance;
 // (`aterm_effects::sound_policy`), shared by every host; this oracle reads them.
 pub(crate) use aterm_effects::sound_policy::{fold_window_audibility, user_lit};
 
-/// `SeamInputs::trail_on` for a resolved (pre-fold) config: the master knob
-/// and serious mode (`enabled`) AND a nonzero brightness knob.
-///
-/// Before this, the verb read `enabled` alone, so a person who dimmed the
-/// aurora to zero — silent, correctly, by decision C — got
-/// `closed:engine-silent`: the one reason reserved for a gate with NO name,
-/// raised as a false regression alarm. The `TrailSoundSeam` model's
-/// `EngineSilentIsUnreachable` and its conformance are what found it.
+/// `SeamInputs::trail_on` for a resolved (pre-fold) config: `enabled` and a nonzero
+/// brightness knob. An aurora dimmed to zero is silent by design and reads `trail-off`,
+/// never `engine-silent` (the reason reserved for a gate with no name).
 pub(crate) fn trail_on(resolved: &aterm_effects::cursor_glow::GlowConfig) -> bool {
     resolved.enabled && user_lit(resolved)
 }
@@ -56,9 +39,8 @@ pub(crate) struct SeamInputs {
     pub(crate) sounds_on: bool,
     /// `trail_sound_volume`, already clamped to 0..1.
     pub(crate) volume: f32,
-    /// [`trail_on`] of the resolved config — the master knob AND serious
-    /// mode AND a style that resolves to something (`GlowConfig::enabled`,
-    /// the gate the ENGINE reads) AND a nonzero brightness knob.
+    /// [`trail_on`] of the resolved config: the master knob, serious mode and a style that
+    /// resolves (`GlowConfig::enabled`, the engine's gate), and a nonzero brightness knob.
     pub(crate) trail_on: bool,
     /// `SeriousEffect::TerminalSound`.
     pub(crate) serious_allows: bool,
@@ -69,14 +51,13 @@ pub(crate) struct SeamInputs {
     pub(crate) resize_quiet: bool,
     /// The audio worker's honest state.
     pub(crate) host: HostState,
-    /// `CursorGlow::sound_seam_open()` — whether the last tick left the
-    /// engine's key seam open.
+    /// `CursorGlow::sound_seam_open()`: whether the last tick left the engine's key seam
+    /// open.
     pub(crate) engine_sound_live: bool,
 }
 
-/// The host's own sound terms the verb reads beside the aurora config and
-/// the engine: every [`SeamInputs`] term that is neither derived from the
-/// resolved `GlowConfig` nor read off the `CursorGlow`.
+/// The host's own [`SeamInputs`] terms: those neither derived from the resolved
+/// `GlowConfig` nor read off the `CursorGlow`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct HostSoundTerms {
     pub(crate) sounds_on: bool,
@@ -87,14 +68,10 @@ pub(crate) struct HostSoundTerms {
     pub(crate) host: HostState,
 }
 
-/// THE VERB'S INPUTS. `App::tone_status` builds its [`SeamInputs`] here and
-/// nowhere else, and so does the `TrailSoundSeam` conformance's verb reader.
-/// A regression in how the verb reads the aurora config or the engine is
-/// therefore a regression the conformance runs.
-///
-/// `resolved` is the RESOLVED config (`App::glow_config`), never the one
-/// `cursor_frame` folds: a dark trail under Reduce Motion or load shed is
-/// still `trail_on`, and only the person's own knobs may say otherwise.
+/// The verb's inputs: `App::tone_status` and the `TrailSoundSeam` conformance's verb reader
+/// both build [`SeamInputs`] here, so the conformance covers how the verb reads the config
+/// and the engine. `resolved` is the resolved config (`App::glow_config`), never the one
+/// `cursor_frame` folds: a dark trail under Reduce Motion or load shed is still `trail_on`.
 pub(crate) fn verb_seam_inputs(
     resolved: &aterm_effects::cursor_glow::GlowConfig,
     engine: &aterm_effects::cursor_glow::CursorGlow,
@@ -103,9 +80,7 @@ pub(crate) fn verb_seam_inputs(
     SeamInputs {
         sounds_on: host.sounds_on,
         volume: host.volume,
-        // NOT `resolved.enabled` alone: a person who dimmed the aurora to
-        // zero is silent by decision C, and must read `trail-off`, never
-        // `engine-silent` (the `TrailSoundSeam` model found this).
+        // Not `resolved.enabled` alone: see `trail_on`.
         trail_on: trail_on(resolved),
         serious_allows: host.serious_allows,
         focused: host.focused,
@@ -115,8 +90,7 @@ pub(crate) fn verb_seam_inputs(
     }
 }
 
-/// WHY a keypress would make no sound. One variant per gate, so the verb can
-/// name the gate instead of leaving a human to bisect six settings.
+/// Why a keypress would make no sound: one variant per gate, so the verb names the gate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SeamReason {
     SoundsOff,
@@ -128,15 +102,9 @@ pub(crate) enum SeamReason {
     #[cfg(any(target_os = "macos", test))]
     HostWedged,
     ResizeQuiet,
-    /// The engine refuses for a reason the config gates do not explain.
-    ///
-    /// THE SENSOR THAT MATTERS. Before 2026-09-22 this was the shipping
-    /// state under load shed and under macOS `Reduce Motion`, and nothing on
-    /// the tone row could see it. After the decoupling it should be
-    /// UNREACHABLE — and if a future performance or accessibility policy
-    /// re-closes the key seam, `tone` prints `seam=closed:engine-silent`
-    /// instead of `audio=live`. That is the eleven-months-later regression
-    /// made visible.
+    /// The engine refuses for a reason the config gates do not explain. Should be
+    /// unreachable: if a performance or accessibility policy re-closes the key seam, `tone`
+    /// prints `seam=closed:engine-silent` rather than `audio=live`.
     EngineSilent,
 }
 
@@ -174,7 +142,7 @@ impl SeamReason {
 
 /// `None` ⇒ a keypress right now produces a sound.
 pub(crate) fn sound_seam(i: &SeamInputs) -> Option<SeamReason> {
-    // What the user SET.
+    // What the user set.
     if !i.sounds_on {
         return Some(SeamReason::SoundsOff);
     }
@@ -187,11 +155,11 @@ pub(crate) fn sound_seam(i: &SeamInputs) -> Option<SeamReason> {
     if !i.serious_allows {
         return Some(SeamReason::SeriousMode);
     }
-    // Where the user IS.
+    // Where the user is.
     if !i.focused {
         return Some(SeamReason::Unfocused);
     }
-    // Whether the host CAN sound.
+    // Whether the host can sound.
     if matches!(i.host, HostState::Inert) {
         return Some(SeamReason::HostInert);
     }
@@ -203,16 +171,15 @@ pub(crate) fn sound_seam(i: &SeamInputs) -> Option<SeamReason> {
     if i.resize_quiet {
         return Some(SeamReason::ResizeQuiet);
     }
-    // And the engine, last, so a gate with a NAME always outranks it.
+    // The engine, last, so a named gate always outranks it.
     if !i.engine_sound_live {
         return Some(SeamReason::EngineSilent);
     }
     None
 }
 
-/// `"open"` or `"closed:<token>"` — the one field on the row that answers the
-/// question the verb exists for. ONE renderer, so the wire spelling the tests
-/// assert on and the one `ToneStatus::line` emits cannot diverge.
+/// `"open"` or `"closed:<token>"`. One renderer, so the spelling the tests assert and the
+/// one `ToneStatus::line` emits cannot diverge.
 pub(crate) fn seam_field(verdict: Option<SeamReason>) -> String {
     match verdict {
         None => "open".to_string(),
@@ -254,11 +221,10 @@ mod tests {
         i
     }
 
-    /// THE ANSWER FIELD IS EXACT, and every reason is reachable.
+    /// The answer field is exact, and every reason is reachable.
     #[test]
     fn the_seam_names_the_gate_that_would_silence_the_key() {
-        // NEGATIVE CONTROL first: without it a `sound_seam` that returned
-        // `Some` unconditionally would pass the whole table below.
+        // Negative control: a `sound_seam` that always returned `Some` would pass the table.
         assert_eq!(seam_field(sound_seam(&open())), "open");
 
         for reason in SeamReason::ALL {
@@ -270,15 +236,14 @@ mod tests {
             );
         }
 
-        // PRECEDENCE is enforced, not merely documented: what the user SET
-        // outranks where the user IS.
+        // Precedence: what the user set outranks where the user is.
         let mut both = open();
         both.sounds_on = false;
         both.focused = false;
         assert_eq!(seam_field(sound_seam(&both)), "closed:sounds-off");
 
-        // …and a gate with a NAME outranks the engine's bare refusal, so a
-        // human is never sent hunting the engine for a knob they turned off.
+        // A named gate outranks the engine's bare refusal, so nobody hunts the engine for a
+        // knob they turned off.
         let mut engine_and_knob = open();
         engine_and_knob.engine_sound_live = false;
         engine_and_knob.trail_on = false;

@@ -4,10 +4,9 @@
 
 //! Page-backed `Row` lifetime safety.
 //!
-//! `Row::new(cols, &mut PageStore)` and `Row::resize` are `pub unsafe fn`: the
-//! backing `PageStore` must outlive every row allocated from it.
-//! `GridStorage.rows` is `pub(crate)`, so external code cannot extract owned
-//! rows that outlive their store.
+//! `Row::new(cols, &mut PageStore)` and `Row::resize` are `pub unsafe fn`: the backing
+//! `PageStore` must outlive every row allocated from it. `Grid::storage` is `pub(crate)`, so
+//! external code cannot extract a grid's rows to outlive their store.
 //!
 //! These tests check the correct `unsafe` pattern at runtime (Miri-exercisable),
 //! and the items at the bottom of this file pin at compile time that both
@@ -17,12 +16,6 @@
 //! // COMPILE ERROR: call to unsafe function requires unsafe block
 //! let mut pages = aterm_grid::PageStore::new();
 //! let row = aterm_grid::Row::new(8, &mut pages);  // ERROR
-//! ```
-//!
-//! ```text
-//! // COMPILE ERROR: field `rows` of `GridStorage` is private
-//! let grid_storage: aterm_grid::state::GridStorage = /* ... */;
-//! let owned_row = grid_storage.rows.remove(0);  // ERROR
 //! ```
 
 use aterm_grid::{CellFlags, PackedColor, PageStore, Row};
@@ -46,7 +39,6 @@ fn row_resize_shrink_valid_unsafe_usage() {
     unsafe { row.resize(40, &mut pages) };
     assert_eq!(row.cols(), 40);
 
-    // Content within the new bounds survived
     for col in 0..40u16 {
         assert_eq!(row.get(col).unwrap().char(), 'B', "col {col} content lost");
     }
@@ -62,21 +54,19 @@ fn resize_one_row_doesnt_corrupt_others() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // SAFETY: All rows and `pages` live in the same scope.
+    // SAFETY: `pages` is declared first, so it outlives both rows.
     let mut row_a = unsafe { Row::new(40, &mut pages) };
     let mut row_b = unsafe { Row::new(40, &mut pages) };
 
-    // Write distinct content
     for col in 0..40u16 {
         row_a.write_char_styled(col, 'X', fg, bg, CellFlags::empty());
         row_b.write_char_styled(col, 'Y', fg, bg, CellFlags::empty());
     }
 
-    // Resize row_a — allocates new PageSlice, abandons old one
+    // Resizing row_a allocates a new PageSlice and abandons the old one.
     // SAFETY: `pages` outlives both rows.
     unsafe { row_a.resize(120, &mut pages) };
 
-    // row_b must be unaffected
     for col in 0..40u16 {
         assert_eq!(
             row_b.get(col).unwrap().char(),
@@ -85,7 +75,6 @@ fn resize_one_row_doesnt_corrupt_others() {
         );
     }
 
-    // row_a original content survived resize
     for col in 0..40u16 {
         assert_eq!(
             row_a.get(col).unwrap().char(),
@@ -95,8 +84,7 @@ fn resize_one_row_doesnt_corrupt_others() {
     }
 }
 
-// Compile-time pins, checked by rustc when this test target builds against
-// the real `aterm_grid`: a regression is a build failure.
+// Compile-time pins: a regression is a build failure of this test target.
 
 /// Positive control and signature pin: `Row::new` and `Row::resize` coerce to
 /// `unsafe fn` pointers of exactly these signatures, so the negative pins below

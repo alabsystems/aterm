@@ -6,5 +6,5 @@ expect mark - mail dir=in kind=note off=3 by=bridge
 at 1000 ctl
 wait 300
 see busy
-expect open t1 turn ledger=1 by=harness at=1300
+expect open t1 turn ledger=1 by=harness @1300
 expect link=none

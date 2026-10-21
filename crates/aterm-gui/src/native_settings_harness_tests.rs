@@ -58,6 +58,8 @@ pub(super) fn fixture() -> HarnessState {
             glass: crate::claude_lights::ChipGlass::default(),
             armed_at_ms: None,
             set_by: None,
+            need: None,
+            hold: None,
         }],
         stats: HarnessStatsSlot {
             report: Some(std::sync::Arc::new(HarnessStatsReport::new(
@@ -190,7 +192,8 @@ fn harness_route_over(
 }
 
 /// Every page of the route at `cx`, compiled: page 0, then each page to the
-/// bound the render recorded.
+/// bound the render recorded — each as a scroll seats it, which lets go of
+/// the control a press kept in view.
 fn every_page(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -205,6 +208,7 @@ fn every_page(
                 unreachable!()
             };
             state.page_scroll = page;
+            state.page_reveal = None;
         }
         pages.push(compile_settings_view(runtime, instance, view, cx));
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
@@ -233,8 +237,8 @@ fn node<'a>(
 }
 
 /// THE ROUTE IS ITS SPECIAL PAGE (§4): the heading, the rail's own word; the
-/// STATUS card with the policy's words (no second version string: About
-/// owns the build's), and the Refresh and Open aterm.toml
+/// STATUS card with the policy's words, the UPDATES card's running harness
+/// version and links to the existing update pages, and the Refresh and Open aterm.toml
 /// actions; the five registry rows as their ordinary `settings/control/<key>`
 /// controls; the session's row with its three buttons, the mode it runs
 /// under selected; the WHAT THE HARNESS DID card from the fixture's counts,
@@ -268,6 +272,34 @@ fn the_harness_route_renders_its_cards_and_controls() {
         assert_eq!(
             node(&pages, key).action.as_ref().map(ActionId::as_str),
             Some(key)
+        );
+    }
+    let harness_build = node(&pages, "harness/updates/row/claude-harness");
+    assert!(harness_build.label.contains(crate::build_info::version()));
+    assert!(
+        harness_build
+            .label
+            .contains(crate::build_info::git_commit())
+    );
+    for cli in ["claude", "codex"] {
+        assert!(
+            node(&pages, &format!("harness/updates/row/{cli}-cli"))
+                .label
+                .contains("not looked at"),
+            "a product name alone cannot imply an installed or observed CLI"
+        );
+    }
+    for (key, route) in [
+        ("software", SettingsRoute::SoftwareUpdate),
+        ("packages", SettingsRoute::Packages),
+        ("versions", SettingsRoute::Ai),
+    ] {
+        assert_eq!(
+            node(&pages, &format!("harness/updates/{key}"))
+                .action
+                .as_ref(),
+            Some(&route_action(route)),
+            "update links must open the existing page without an install action"
         );
     }
     for key in harness_page_rows() {
@@ -434,6 +466,72 @@ fn the_harness_route_renders_its_cards_and_controls() {
             assert_all_hits_material_and_contained(compiled, &context);
         }
     }
+
+    // The same card renders captured observations, including a missing CLI,
+    // without turning their product names into installation claims.
+    let mut observed = fixture();
+    observed.ai.enabled = true;
+    let version = "captured-claude-build";
+    let cli = |id, product, state, version, fact: &str| crate::ai_screen::AiCli {
+        id,
+        product,
+        claude: id == "claude",
+        wanted: true,
+        state,
+        mark: aterm_agent::ai::state::Mark::Note,
+        fact: fact.to_string(),
+        path: None,
+        version,
+    };
+    observed.ai.reading = Some(crate::ai_screen::AiReading {
+        as_of: 1_000_000,
+        offset_s: Some(0),
+        preferred: "claude",
+        clis: vec![
+            cli(
+                "claude",
+                "Claude Code",
+                aterm_agent::ai::state::State::Ok,
+                Some(version.to_string()),
+                "captured login",
+            ),
+            cli(
+                "codex",
+                "Codex CLI",
+                aterm_agent::ai::state::State::NotInstalled,
+                None,
+                "not installed",
+            ),
+        ],
+        store_note: None,
+        held: None,
+    });
+    assert!(runtime.replace_settings_harness(observed.clone(), 2));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        node(&pages, "harness/updates/row/claude-cli")
+            .label
+            .contains(version)
+    );
+    assert!(
+        node(&pages, "harness/updates/row/codex-cli")
+            .label
+            .contains("not installed")
+    );
+    observed.ai.reading = None;
+    observed.ai.unavailable = Some("captured collector refusal".to_string());
+    assert!(runtime.replace_settings_harness(observed, 3));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        node(&pages, "harness/updates/row/cli-observations")
+            .label
+            .contains("captured collector refusal")
+    );
+    assert!(
+        !node(&pages, "harness/updates/row/claude-cli")
+            .label
+            .contains(version)
+    );
 }
 
 /// THE QUIET STATES: no agent session open says so, once (the SESSIONS
@@ -1858,8 +1956,21 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
                     .iter()
                     .map(|child| match &child.content {
                         UiContent::Text(text) => (text.style, text.text.clone()),
-                        UiContent::Group(group) => (
-                            group.style,
+                        // A wrapped line's group paints nothing of its own:
+                        // its lines carry the style they paint in.
+                        UiContent::Group(_) => (
+                            child
+                                .children
+                                .iter()
+                                .map(|line| match &line.content {
+                                    UiContent::Text(text) => text.style,
+                                    other => panic!("a line: {other:?}"),
+                                })
+                                .reduce(|one, other| {
+                                    assert_eq!(one, other, "one style for every line");
+                                    one
+                                })
+                                .unwrap_or(StyleRef::Plain),
                             child
                                 .children
                                 .iter()
@@ -2164,6 +2275,21 @@ fn a_rows_day_its_show_and_its_landing() {
             crate::harness_screen::HARNESS_LAND,
             words.map(|w| SemanticInput::Text(w.to_string())),
         );
+        // The window draws the landed screen and the next event lets the
+        // landing go (`settle_page_scroll`); a focus that stays put lets no
+        // selection go. Until then each render seats the landing again, so
+        // `every_page` would read the landed screen once per page, not the
+        // page: a row above the landed card would be on no page.
+        let _ = compile_settings_view(runtime, instance, view, &view_cx());
+        let focus = {
+            let Some(AppViewState::Settings(settings)) = runtime.view_state(view) else {
+                unreachable!()
+            };
+            settings.common.last_focus.clone()
+        };
+        runtime
+            .dispatch(instance, view, AppEvent::FocusChanged(focus))
+            .unwrap();
         let pages = every_page(runtime, instance, view, &view_cx());
         let selected = node(&pages, "harness/session/7/show")
             .state
@@ -2354,7 +2480,7 @@ fn a_landed_rows_card_holds_its_whole_block_clear_of_its_words() {
 /// text, its timer closed and open. Its words stand clear of the outline by
 /// half the card's padding at least: 8 px, 4 px where a short page's card
 /// takes its tight padding. NEGATIVE CONTROL: a landing that stops once the
-/// row's buttons are whole in the room (`reveal_controls`, the fix's
+/// row's buttons are whole in the room (`reveal_span`, the fix's
 /// absence) leaves the 744 × 480 page's block at 1× with its state and day
 /// lines in the fading strip under the room, and at 2× cut by the list's
 /// edge.
@@ -2423,10 +2549,25 @@ fn a_landing_draws_all_of_the_block_it_selects() {
                     );
                     *tall.lock().unwrap() += 1;
                 }
-                let b = block.rect;
+                // The block's outline, its parts' with it where the list
+                // lists it a part at a time: one card, open where they meet
+                // ([`crate::native_ui::Joins`]).
+                let b = page
+                    .paint
+                    .iter()
+                    .filter(|n| {
+                        n.key
+                            .as_str()
+                            .strip_prefix("harness/session/7/block")
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with("/part-"))
+                    })
+                    .map(|n| n.rect)
+                    .fold(block.rect, |outline, part| outline.union(part));
                 for node in page.paint.iter().filter(|n| {
                     let key = n.key.as_str();
-                    key.starts_with("harness/session/7/") && !key.ends_with("/block")
+                    key.starts_with("harness/session/7/")
+                        && !key.ends_with("/block")
+                        && !key.contains("/block/part-")
                 }) {
                     let r = node.rect;
                     assert!(
@@ -3519,8 +3660,12 @@ fn semantic_keys(pages: &[crate::native_ui::CompiledUi]) -> Vec<String> {
 /// AUTOPILOT comes right after the page's actions, ahead of SUPERVISION and
 /// WHAT THE HARNESS DID, after SESSIONS and DECIDED FOR YOU; nothing above
 /// SESSIONS moves (`sessions_stays_on_the_first_screen_under_todays_lines`
-/// holds it, unchanged). NEGATIVE CONTROL: the old order (EFFECT last but
-/// for the table) fails the first comparison.
+/// holds it, unchanged). A card the page gains later goes after them all:
+/// the HARNESS UPDATES card and its links (docs/DESIGN-harness-updates-
+/// 2026-10-21.md, "What the person sees") follow the aterm.toml table.
+/// NEGATIVE CONTROL: the old order (EFFECT last but for the table) fails
+/// the first comparison; UPDATES between the actions and EFFECT (as it
+/// first landed, 6b6cd5f516) fails the second.
 #[test]
 fn effect_comes_right_after_the_pages_actions() {
     let (mut runtime, instance, view) = harness_route(fixture_deciding(5, 5));
@@ -3539,9 +3684,25 @@ fn effect_comes_right_after_the_pages_actions() {
         "harness/switches",
         "harness/did",
         "harness/config",
+        "harness/updates",
+        "harness/update-actions",
     ]
     .map(at);
     assert!(order.is_sorted(), "{order:?}: {all:#?}");
+    // RIGHT after: of the list's cards, in the order the pages first show
+    // them, the one after the page's actions is EFFECT's.
+    let list = node(&pages, "harness/actions").parent.clone();
+    let mut cards: Vec<&str> = Vec::new();
+    for node in pages.iter().flat_map(|page| page.semantics.iter()) {
+        if node.parent == list && !cards.contains(&node.key.as_str()) {
+            cards.push(node.key.as_str());
+        }
+    }
+    let next = cards
+        .iter()
+        .position(|key| *key == "harness/actions")
+        .and_then(|at| cards.get(at + 1));
+    assert_eq!(next, Some(&"harness/ab"), "{cards:#?}");
 }
 
 /// THE LEAD SAYS WHAT IT MEASURES (§11.6.1, §11.6.5 "The caption"): with
@@ -3884,4 +4045,123 @@ fn a_background_landing_moves_no_switch() {
             assert_eq!(was, now, "{host:?}");
         }
     });
+}
+
+/// [`fixture`] with landings (design §12.4, slice 4c): three sessions under
+/// Land — one landing, one landed, one through a person's own exchange —
+/// and a reading whose day and week landed, typed land prompts, checked done
+/// claims and pressed boxes no safe rule proved. The landing one is held
+/// (slice 3c, `hold_tests::held_session`): every leg, each count and
+/// nudges, so its state line is as tall as a hold makes it.
+pub(super) fn fixture_landings() -> HarnessState {
+    use aterm_agent::harness::acts::TaskFace;
+    use aterm_agent::supervise::policy::turn_end::RULE_DONE_CHECK;
+    let mut state = fixture();
+    let first = state.sessions[0].clone();
+    let with = |id: u64, task: TaskFace| {
+        let mut session = first.clone();
+        session.local_id = id;
+        session.sid = format!("s-{id}");
+        session.title = format!("task {id}");
+        session.place = format!("in tab {}", id - 5);
+        session.glass.task = Some(task);
+        session
+    };
+    state.sessions = vec![
+        first.clone(),
+        with(8, TaskFace::Landed),
+        with(9, TaskFace::Theirs),
+    ];
+    crate::harness_glass::hold_tests::held_session(&mut state.sessions[0]);
+    let mut today = HarnessStats::per_session(0);
+    today.landed = 2;
+    today.approved = 31;
+    today.unproven = 1;
+    today.continued = 4;
+    today.land_prompts = 3;
+    today.by_rule.insert(RULE_DONE_CHECK.to_string(), 1);
+    today.rows = 41;
+    today.by_session.as_mut().expect("per session").insert(
+        "s-8".to_string(),
+        aterm_agent::harness::stats::Tally {
+            landed: 1,
+            land_prompts: 2,
+            approved: 31,
+            ..aterm_agent::harness::stats::Tally::default()
+        },
+    );
+    let mut week = HarnessStats::new(0);
+    week.landed = 9;
+    week.approved = 120;
+    week.unproven = 2;
+    week.continued = 30;
+    week.land_prompts = 11;
+    week.by_rule.insert(RULE_DONE_CHECK.to_string(), 12);
+    week.rows = 180;
+    state.stats = HarnessStatsSlot {
+        report: Some(std::sync::Arc::new(HarnessStatsReport::new(
+            today,
+            week,
+            1_000_000_000,
+            Some(0),
+            &|_| Some(0),
+        ))),
+        collecting: false,
+        unavailable: None,
+        stale: false,
+    };
+    state
+}
+
+/// THE PAGE COUNTS LANDINGS, AS DRAWN (design §12.4.1, slice 4c): read back
+/// from the compiled page, the Every row says `1 landing, 1 landed, 1
+/// quiet`, and so does its Cruise button; WHAT THE HARNESS DID draws
+/// `Landed` over `Land prompts` and, under Kept going, `of them  a done
+/// claim checked`, keyed apart from the `of those` row under Approved
+/// (each fact is keyed by its label, and a compile refuses two of one
+/// key); STATUS's today line and the landed session's day line lead with
+/// landings. NEGATIVE CONTROL: [`fixture`], with no landing and no done
+/// claim checked, draws neither row.
+#[test]
+fn the_page_draws_its_landings_and_the_done_claims_checked() {
+    let (mut runtime, instance, view) = harness_route(fixture_landings());
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    // Each drawn as the projection says it, by the slice's own parts: the
+    // rest of each line is other features' words.
+    let says =
+        |words: &str, part: &str| words.split([':', ',', ';']).any(|said| said.trim() == part);
+    let every = node(&pages, "harness/session/all").label.clone();
+    let cruise = node(&pages, "harness/session/all/autopilot/cruise")
+        .description
+        .clone()
+        .unwrap_or_default();
+    for part in ["1 landing", "1 landed", "1 quiet"] {
+        assert!(says(&every, part), "{part}: {every}");
+        assert!(says(&cruise, part), "{part}: {cruise}");
+    }
+    let landed = node(&pages, "harness/did/row/landed").label.clone();
+    assert!(says(&landed, "2 today \u{b7} 9 in 7 days"), "{landed}");
+    let checked = node(&pages, "harness/did/row/of-them").label.clone();
+    assert!(
+        checked.contains("a done claim checked 1 today \u{b7} 12 in 7 days"),
+        "{checked}"
+    );
+    // Both parts stand, each under its own key, and the prompts stay.
+    node(&pages, "harness/did/row/of-those");
+    node(&pages, "harness/did/row/land-prompts");
+    let today = node(&pages, "harness/status/today").label.clone();
+    assert!(today.starts_with("2 landed today \u{b7} "), "{today}");
+    let day = node(&pages, "harness/session/8/today").label.clone();
+    assert!(day.starts_with("today: 1 landed \u{b7} "), "{day}");
+    // NEGATIVE CONTROL.
+    let (mut runtime, instance, view) = harness_route(fixture());
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    for key in ["harness/did/row/landed", "harness/did/row/of-them"] {
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.semantic(&UiKey::new(key)).is_none()),
+            "{key}"
+        );
+    }
 }

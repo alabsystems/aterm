@@ -1,36 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TEST-ONLY, DELIBERATELY LEAKY SPAWNS: the CONTROL arm of every inheritance
-//! test in this crate. NEVER call these from shipped code: each child inherits
-//! every descriptor this process holds without close-on-exec, which is the
-//! whole point. The module is `#[cfg(test)]`.
+//! Test-only raw spawns for descriptor-inheritance tests (`#[cfg(test)]`).
 //!
-//! A test that shows a child does NOT inherit an unflagged descriptor means
-//! something only beside a CONTROL that shows a child started with no
-//! protection DOES inherit it: the descriptor really is unflagged, the probe
-//! really sees it, and the staging (a racing thread, a number above the old
-//! cap) really puts one in the window. That control cannot be a
-//! `std::process::Command`: Trust's std (SP-1, trust 6eb03c9a18) hands a
-//! `Command` child its stdio and nothing else. MEASURED on a stage1 of that
-//! std: 7 `std`-built controls failed (the pair race went from 18/200 to 0/200
-//! leaky children, the soft-limit race from 84/100 to 0/100).
-//! The controls are therefore raw spawns that owe nothing to whichever std
-//! this binary links:
+//! Because Trust's `std::process::Command` strips non-stdio descriptors by
+//! default, tests use these helpers so the negative control and strip-only paths
+//! do not depend on `std::process::Command`:
 //!
-//! * [`leaky_status`] and [`leaky_output`]: on Darwin, one `posix_spawn` with
-//!   no attributes (so no `POSIX_SPAWN_CLOEXEC_DEFAULT`) and no file action
-//!   but [`leaky_output`]'s stdout and stderr. That is the spawn upstream std
-//!   makes, less its signal attributes, so the rates measured with it carry
-//!   over. Elsewhere, `fork` and `execve` with no strip.
-//! * [`stripped_status`]: `fork`, then [`InheritStrip::apply`], then `execve`.
-//!   This tests the strip alone, with nothing of std's in front of it. Under
-//!   SP-1 a `std` command with the strip in `pre_exec` keeps the descriptor
-//!   out with or without the strip, because std strips first.
-//!
-//! The probes these run are `/bin/sh -c` reads of the child's own descriptor
-//! table ([`crate::host::sh_held_any`]), which no signal mask or disposition changes. So the child keeps this process's signal mask
-//! and dispositions, with no reset.
+//! * [`leaky_status`] and [`leaky_output`]: on Darwin, `posix_spawn` with no
+//!   attributes (no `POSIX_SPAWN_CLOEXEC_DEFAULT`); elsewhere, `fork` + `execve`
+//!   with no strip.
+//! * [`stripped_status`]: `fork`, [`InheritStrip::apply`], then `execve`.
 
 use super::{InheritStrip, pass_libnotify_gate, waitpid};
 /// Every crate's shell probe of a descriptor, which this crate's tests call from here.
@@ -151,18 +131,9 @@ pub(crate) fn bound_read(near: &UnixStream) -> io::Result<()> {
     near.set_read_timeout(Some(Duration::from_secs(60)))
 }
 
-/// Call `round` over and over while another thread looks `/dev/fd/{number}` up without
-/// pause, until the path `stat`s `round` makes of `number` (through the [`Looker`] it is
-/// handed, while it holds `number` open) have failed `races` times; return how many rounds
-/// ran. Those failures are the NEGATIVE CONTROL of a test that reads a descriptor while its
-/// number is contended: Darwin's `/dev/fd/N` is one vnode every lookup shares, and a path
-/// `stat` racing another lookup answers `EBADF` for an open descriptor
-/// ([`super::descriptor_metadata`]). A host that never interleaves the two lookups within
-/// the one-minute hang detector ends the test COULD NOT RUN. Darwin only: Linux's
-/// `/proc/self/fd` is per process, with nothing shared to race.
-// `#[cfg(test)]` repeats the gate on this module's `mod` line in spawnfd.rs for the
-// wasm-process census, which reads this file on its own and would take the thread
-// below for one in the shipped wasm closure (OB-12).
+/// Run `round` while a background thread repeatedly stats `/dev/fd/{number}`
+/// until [`Looker::probe`] observes `races` `EBADF` races (Darwin's `/dev/fd/N`
+/// shares a single vnode across lookups; see [`super::descriptor_metadata`]).
 #[cfg(test)]
 #[cfg(target_vendor = "apple")]
 #[track_caller]

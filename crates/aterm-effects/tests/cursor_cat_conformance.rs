@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding for the collectible cursor-cat lifecycle.
+//! Conformance binding for the collectible cursor-cat lifecycle.
 //!
-//! The derived model is exhaustive over its bounded clock. This test drives the
-//! real `CursorCat` with an injected `Instant`, projects public frame state onto
-//! that clock, and asks both the in-process interpreter and `ty trace validate`
-//! to admit every shipping transition.
+//! Drives the real `CursorCat` with an injected `Instant`, projects public frame state onto the
+//! derived model's bounded clock, and asks the in-process interpreter (and `ty trace validate`
+//! where `ty` is installed) to admit every shipping transition.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -60,9 +59,8 @@ fn real_cursor_cat_long_presentable_gap_settles_without_a_deferred_fade() {
     let look = KittyLook::default();
     let t0 = Instant::now();
 
-    // The Collect transition is bound to the first ordinary present rather
-    // than the alpha-zero event timestamp: at least one discovery frame was
-    // genuinely visible before the host experienced a long drawable gap.
+    // Collect binds to the first ordinary present, not the alpha-zero event timestamp: at least
+    // one discovery frame was visible before the long drawable gap.
     cat.on_collect(t0, look);
     let early_frame = cat.frame(t0 + Duration::from_millis(16));
     assert!(early_frame.alpha > 0);
@@ -75,9 +73,8 @@ fn real_cursor_cat_long_presentable_gap_settles_without_a_deferred_fade() {
     assert!(model.fire("Collect", &mut spec));
     assert_eq!(early, spec);
 
-    // Negative control: the old callback-relative fade begins a brand-new,
-    // fully visible Fade at the delayed callback. Buggy=1 must admit exactly
-    // that state; the healthy model must reject it before production is bound.
+    // Negative control: a callback-relative fade begins a new, fully visible Fade at the delayed
+    // callback. Buggy=1 admits exactly that state; the healthy model rejects it.
     let mut deferred_fade = project(&early_frame, true, 5, 1, 0, true);
     deferred_fade.insert("phase", 2);
     deferred_fade.insert("visible", 1);
@@ -108,9 +105,8 @@ fn real_cursor_cat_long_presentable_gap_settles_without_a_deferred_fade() {
         "Buggy=0 accepted the deferred-fade negative control: {healthy_why}"
     );
 
-    // Ten seconds is beyond the complete discovery hold plus fade. A single
-    // presentable callback consumes that elapsed tail directly: no opaque snap,
-    // no newly started fade timer, and no additional 60 Hz animation wakeups.
+    // Ten seconds is past the whole discovery hold plus fade. One presentable callback consumes
+    // the elapsed tail: no opaque snap, no new fade timer, no further 60 Hz wakeups.
     let settled_frame = cat.frame(t0 + Duration::from_secs(10));
     assert_eq!(settled_frame.alpha, 0);
     assert!(!settled_frame.discovery);
@@ -167,8 +163,8 @@ fn real_cursor_cat_winces_only_for_complete_cues_and_repeats_build_force() {
     cat.on_collect(t0, KittyLook::default());
     let _ = cat.frame(t0 + Duration::from_millis(16));
 
-    // `fuc` produces no shipping cue, so the real cat remains in its existing
-    // discovery expression while the model records an inert prefix.
+    // `fuc` produces no cue: the cat keeps its discovery expression and the model records an
+    // inert prefix.
     let mut spec = model.init_state();
     let prev = spec.clone();
     assert!(model.fire("TypeFuc", &mut spec));
@@ -189,8 +185,7 @@ fn real_cursor_cat_winces_only_for_complete_cues_and_repeats_build_force() {
     assert!(model.fire("Complete", &mut spec));
     assert_eq!(real, spec);
 
-    // A second complete word inside the phrase window is a distinct, stronger
-    // beat rather than a hold extension.
+    // A second complete word inside the phrase window is a stronger beat, not a hold extension.
     let second_at = t0 + Duration::from_millis(320);
     assert!(cat.on_curse(second_at, 1));
     let second = cat.frame(second_at + Duration::from_millis(90));
@@ -234,8 +229,8 @@ fn real_cursor_cat_collectible_lifecycle_conforms_and_hidden_expiry_is_caught() 
     let mut spec = model.init_state();
     assert!(!cat.is_active(), "a fresh cursor cat is fully idle");
 
-    // Collect -> Discovery. Fade-in starts at alpha zero at the exact event
-    // timestamp, so bind visibility at the first ordinary 60 Hz present.
+    // Collect -> Discovery. Fade-in starts at alpha zero at the event timestamp, so visibility
+    // binds at the first ordinary 60 Hz present.
     let prev = spec.clone();
     cat.on_collect(t0, look);
     let collected = cat.frame(t0 + Duration::from_millis(16));
@@ -259,9 +254,8 @@ fn real_cursor_cat_collectible_lifecycle_conforms_and_hidden_expiry_is_caught() 
     assert!(model.fire("Collect", &mut spec));
     assert_eq!(real, spec);
 
-    // The first two abstract ticks remain strictly inside the 2.8 s hold.
-    // Momentum has decayed below the ordinary survival threshold by the second
-    // sample; discovery alone is therefore what keeps this shipping cat live.
+    // The first two abstract ticks stay inside the 2.8 s hold. Momentum is below the ordinary
+    // survival threshold by the second sample, so discovery alone keeps the cat live.
     for (elapsed, millis) in [(1, 1_000), (2, 2_799)] {
         let prev = real;
         let frame = cat.frame(t0 + Duration::from_millis(millis));
@@ -272,9 +266,9 @@ fn real_cursor_cat_collectible_lifecycle_conforms_and_hidden_expiry_is_caught() 
         assert_eq!(real, spec);
     }
 
-    // Negative control: after two real presented samples, a hidden wall-clock
-    // sample consumes the remaining hold only under Buggy=1. Production must
-    // preserve elapsed/presented/forced while making the host draw nothing.
+    // Negative control: after two presented samples, a hidden wall-clock sample consumes the
+    // remaining hold only under Buggy=1. Production keeps elapsed/presented/forced and draws
+    // nothing.
     let before_hidden = real.clone();
     let mut expired_while_hidden = before_hidden.clone();
     expired_while_hidden.insert("elapsed", 3);
@@ -322,8 +316,7 @@ fn real_cursor_cat_collectible_lifecycle_conforms_and_hidden_expiry_is_caught() 
     let resumed_at = hidden_at;
     cat.set_collection_presentable(resumed_at, true);
 
-    // At the exact hold deadline the real machine may begin fading, remains
-    // drawable during that fade, then returns all the way to zero-idle.
+    // From the hold deadline the cat fades, drawable throughout, then returns to zero-idle.
     for (elapsed, millis, should_be_active) in [(3, 1, true), (4, 401, true), (5, 801, false)] {
         let prev = real;
         let frame = cat.frame(resumed_at + Duration::from_millis(millis));

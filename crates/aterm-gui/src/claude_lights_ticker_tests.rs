@@ -726,26 +726,28 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
     // Merely switching to Settings intentionally leaves the edit uncommitted.
     rename(&mut app, "left open");
     assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
+    let (_, _, settings, _) = app
+        .native_settings_route_view_target(SettingsRoute::Harness)
+        .expect("the control's Settings tab");
     assert!(app.inline_rename_edit(wid).is_some());
     app.end_session_rename_editor(wid);
     assert_eq!(pinned(&app), None);
     app.switch_tab_in(wid, 0);
-    // The master switch off: the reader's click on `⊘ off` opens Settings.
+    // The master switch off: the reader's click on `⊘ off` turns it on and
+    // raises nothing (owner, 2026-10-20: "remove the harness settings button
+    // in the UX").
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
     frame(&mut app, wid);
     rename(&mut app, "reader off chip");
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Autopilot);
-    let (at, _, view, _) = app
-        .native_settings_route_view_target(SettingsRoute::Harness)
-        .expect("the reader opened Settings");
-    assert_eq!(at, wid);
-    assert_eq!(
+    assert_ne!(
         app.windows[&wid].tab_set.active().map(|tab| tab.focus),
-        Some(view),
-        "the reader actually focused Settings"
+        Some(settings),
+        "the reader's click raised no Settings"
     );
+    assert_eq!(app.focused_session_id(wid), Some(session));
     assert!(app.inline_rename_edit(wid).is_none());
     assert_eq!(pinned(&app).as_deref(), Some("reader off chip"));
 }

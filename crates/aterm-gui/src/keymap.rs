@@ -1,31 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure keyboard-event → PTY-bytes decision (K-1).
+//! Keyboard event → engine key input: the pure decisions behind a key press.
 //!
-//! The GUI used to hand-roll character encoding in `on_key`: `(c.to_uppercase()
-//! as u8) & 0x1f` for Ctrl and a raw `ev.text` write otherwise. That bypassed
-//! the engine's protocol, so Alt/Option lost its ESC prefix, Ctrl on non-alpha
-//! keys and the Kitty char encoding (CSI-u, alternate/base-layout keys) all
-//! diverged from `aterm_types::keyboard::encode_key`. This module routes EVERY
-//! key through the engine encoder and exposes the decision as a PURE function so
-//! it is unit-testable without a window or event loop.
-//!
-//! The winit→engine key map (Character / Named / numpad / base-layout) lives in
-//! the `aterm-winit-keymap` crate (K-2) so the future native shell reuses the
-//! same table. It is a CRATE and not a feature of `aterm-types` because a
-//! workspace resolve unifies optional features: as a feature it linked AppKit
-//! into every consumer of `aterm-types`, including the dependency-free
-//! `aterm-ctl`.
+//! Every key goes through the engine encoder (`aterm_types::keyboard`); this module
+//! builds the encoder's input (`build_key_input`) and answers the IME and lock-key
+//! questions, testable without a window or event loop. The winit→engine key table
+//! is the `aterm-winit-keymap` crate (a crate, not an `aterm-types` feature, because
+//! workspace feature unification would link AppKit into every `aterm-types` user).
 
 use aterm_types::keyboard::{self, KeyboardMode, Modifiers};
 use aterm_window::event::KeyEvent;
 use aterm_window::keyboard::{Key as WinitKey, ModifiersState};
 
-/// Translate winit's [`ModifiersState`] into the engine's [`Modifiers`].
-///
-/// Super/Cmd is carried through (the old inline path dropped it); the engine's
-/// encoder uses it for the Kitty/xterm modifier value and for `modifyOtherKeys`.
+/// Translate winit's [`ModifiersState`] into the engine's [`Modifiers`], Super/Cmd
+/// included (the encoder uses it for the kitty/xterm modifier value and
+/// `modifyOtherKeys`).
 #[must_use]
 pub(crate) fn modifiers_from_winit(mods: ModifiersState) -> Modifiers {
     let mut out = Modifiers::empty();
@@ -44,28 +34,21 @@ pub(crate) fn modifiers_from_winit(mods: ModifiersState) -> Modifiers {
     out
 }
 
-/// The lock-key modifiers (Caps Lock / Num Lock) for the Kitty modifier byte.
+/// The lock-key modifiers (Caps Lock / Num Lock) for the kitty modifier byte.
 ///
-/// winit's portable [`ModifiersState`] carries only Shift/Ctrl/Alt/Super, so the
-/// Kitty `CAPS_LOCK`/`NUM_LOCK` bits (which `Modifiers::kitty_encoded` folds into
-/// the reported value) must come from a platform query. On macOS we ask the
-/// kernel's HID system directly (`IOHIDGetModifierLockState` on the IOHIDSystem
-/// user client — see [`hid_lock_state`]); macOS hardware has no Num Lock, so only
-/// Caps Lock is reported. Off macOS this is empty until a platform lock-state
-/// source is wired (winit exposes none).
+/// winit's [`ModifiersState`] carries only Shift/Ctrl/Alt/Super, so the kitty
+/// `CAPS_LOCK`/`NUM_LOCK` bits (folded in by `Modifiers::kitty_encoded`) come from a
+/// platform query: on macOS the kernel's HID system ([`hid_lock_state`]). Mac
+/// hardware has no Num Lock, so only Caps Lock is reported.
 ///
-/// LAW (the 2026-08-17 WindowServer watchdog incident): this query MUST NOT go
-/// through WindowServer. It used to read AppKit's global modifier flags, whose
-/// first call lazily opens a SkyLight connection and asks WindowServer for the
-/// event shmem; WindowServer's MAIN THREAD then runs a synchronous TCC
-/// Input-Monitoring preflight for the caller's code identity, and tccd's
-/// identify step `readdir`s the executable's parent directory. From a unit test
-/// binary in a 1.1-million-entry `target/debug/deps` that scan outran the 40 s
-/// watchdog: WindowServer was killed and every GUI session on the machine died.
-/// A kernel round-trip has no such path; and no test's or headless instance's
-/// `App` reaches even that — they get [`no_lock_modifiers`] through the injected
-/// `App::lock_modifiers` field. (This module's own test does call it once,
-/// deliberately: a real, kernel-only round-trip.)
+/// The query must not go through WindowServer. AppKit's global modifier flags open
+/// a SkyLight connection on first use, and WindowServer's main thread then runs a
+/// synchronous TCC Input-Monitoring preflight that `readdir`s the caller's
+/// executable directory; from a test binary in a huge `target/debug/deps` that
+/// outran the WindowServer watchdog, which killed every GUI session on the machine.
+/// Tests and headless instances do not even make this kernel read: they get
+/// [`no_lock_modifiers`] through the injected `App::lock_modifiers` field (this
+/// module's own test calls it once, deliberately).
 #[cfg(target_os = "macos")]
 #[must_use]
 fn lock_modifiers() -> Modifiers {
@@ -86,32 +69,23 @@ pub(crate) fn lock_modifier_source(headless: bool) -> fn() -> Modifiers {
     }
 }
 
-/// The lock-state source for HEADLESS instances and unit tests: always empty.
-///
-/// A headless `App` has no window and therefore no live keyboard whose LEDs
-/// could matter, and a unit test must encode the same bytes on every machine
-/// regardless of the operator's Caps Lock — so neither may consult the platform.
-/// This is also the guarantee that keeps a test binary from ever reaching
-/// WindowServer through the lock-key path (see [`lock_modifiers`]).
+/// The lock-state source for headless instances and unit tests: always empty. A
+/// headless `App` has no live keyboard, and a test must encode the same bytes
+/// whatever the machine's Caps Lock; it also keeps a test binary off the platform
+/// lock-key path (see [`lock_modifiers`]).
 #[must_use]
 pub(crate) fn no_lock_modifiers() -> Modifiers {
     Modifiers::empty()
 }
 
-/// Caps Lock straight from the kernel's HID system — the one lock-key source
-/// on macOS that never involves WindowServer.
+/// Caps Lock from the kernel's HID system, the macOS lock-key source that never
+/// involves WindowServer.
 ///
-/// Tiny-FFI posture, same as the Windows `GetKeyState` path below: IOKit is a
-/// system framework (no crate on the dependency surface), five functions, all
-/// declared against the SDK's `IOKitLib.h`/`hidsystem/IOHIDLib.h`. The user
-/// client is opened ONCE per process and cached (`io_connect_t` is a mach port,
-/// valid process-wide, and `IOHIDGetModifierLockState` is a plain synchronous
-/// call on it); if the open fails the failure is cached too and every read is
-/// `None` — Caps Lock then simply isn't reported in the Kitty modifier byte,
-/// which is the same degraded truth the non-macOS/non-Windows fallback ships.
-/// Measured on macOS 26.5.1: `IOServiceOpen(kIOHIDParamConnectType)` and the
-/// read both return `KERN_SUCCESS` unentitled, and the value tracks the LED
-/// (set via `IOHIDSetModifierLockState`, read back 1, restored, read back 0).
+/// IOKit is a system framework (no crate on the dependency surface); five functions,
+/// declared against `IOKitLib.h`/`hidsystem/IOHIDLib.h`. The user client is opened
+/// once per process and cached (`io_connect_t` is a process-wide mach port); a failed
+/// open is cached too and every read is `None`, so Caps Lock goes unreported. The
+/// open (`kIOHIDParamConnectType`) and the read both succeed unentitled.
 #[cfg(target_os = "macos")]
 mod hid_lock_state {
     use std::ffi::{c_char, c_int, c_void};
@@ -164,12 +138,11 @@ mod hid_lock_state {
         *CONN.get_or_init(|| {
             // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and
             // returns an owned dictionary that `IOServiceGetMatchingService`
-            // consumes (its documented contract), so nothing leaks on either
-            // path; a NULL dictionary makes the lookup return 0. `IOServiceOpen`
-            // writes the connect port only on success; `mach_task_self()` is
-            // our own task. The service ref is released after the open, which
-            // holds its own reference. `mach_task_self_` is libSystem's cached
-            // task port. All calls are thread-safe kernel RPCs.
+            // consumes, so nothing leaks on either path; a NULL dictionary makes the
+            // lookup return 0. `IOServiceOpen` writes the connect port only on
+            // success; `mach_task_self_` is libSystem's cached task port. The
+            // service ref is released after the open, which holds its own. All are
+            // thread-safe kernel RPCs.
             unsafe {
                 let matching = IOServiceMatching(IOHID_SYSTEM_CLASS.as_ptr().cast::<c_char>());
                 if matching.is_null() {
@@ -206,10 +179,9 @@ mod hid_lock_state {
     }
 }
 
-/// Windows: the live toggle state via user32 `GetKeyState` — the low-order bit
-/// of the returned SHORT is the toggled (LED) state for `VK_CAPITAL` /
-/// `VK_NUMLOCK`. Same tiny-FFI posture as `clipboard_win` (user32 is on the
-/// approved list; there is no std alternative).
+/// Windows: the live toggle state from user32 `GetKeyState` (the low bit is the
+/// toggled LED state for `VK_CAPITAL` / `VK_NUMLOCK`). Tiny FFI, as in
+/// `clipboard_win`: user32 is on the approved list and std has no alternative.
 #[cfg(windows)]
 #[must_use]
 fn lock_modifiers() -> Modifiers {
@@ -241,21 +213,17 @@ fn lock_modifiers() -> Modifiers {
     Modifiers::empty()
 }
 
-/// SELECTION CUSTODY (R1): whether this winit press is a bare MODIFIER or LOCK
-/// key — Shift, Control, Alt/Option, Super/Command, Hyper, Meta, Caps/Num/Scroll
-/// Lock — and so expresses no typing intent.
+/// Whether this press is a bare modifier or lock key (Shift, Control, Alt/Option,
+/// Super/Command, Hyper, Meta, Caps/Num/Scroll Lock), which expresses no typing
+/// intent.
 ///
 /// The window half of the press-path snap (`cancel_press_scroll_motion`) is
-/// deliberately lock-free and therefore lives OUTSIDE the seam, so it needs its
-/// own call site answering the question the seam answers with
-/// `PressClass::inert_modifier`. Both resolve to the same authority —
-/// `aterm_types::keyboard::is_modifier_or_lock_key` — so a key cannot be inert
-/// on one side of the seam and disturbing on the other.
-///
-/// Reads `logical_key`, NOT `key_without_modifiers()`: the modifier identity is
-/// what `logical_key` carries, and the answer must not depend on the platform's
-/// modifier-state snapshot (on macOS that snapshot is still stale when the bare
-/// modifier's `KeyboardInput` is delivered).
+/// lock-free and so lives outside the seam; it shares
+/// `aterm_types::keyboard::is_modifier_or_lock_key` with the seam's
+/// `PressClass::inert_modifier`, so a key cannot be inert on one side and disturbing
+/// on the other. Reads `logical_key`, not `key_without_modifiers()`: on macOS the
+/// modifier-state snapshot is still stale when the bare modifier's `KeyboardInput`
+/// arrives.
 #[must_use]
 pub(crate) fn press_is_inert(ev: &KeyEvent) -> bool {
     if aterm_winit_keymap::map_logical_key(&ev.logical_key)
@@ -264,19 +232,11 @@ pub(crate) fn press_is_inert(ev: &KeyEvent) -> bool {
     {
         return true;
     }
-    // The modifier and lock keys winit reports that the ENGINE has no `NamedKey`
-    // variant for, so `map_logical_key` returns `None` for them: `AltGraph` (the
-    // AltGr of every European layout), macOS/laptop `Fn`/`FnLock`, and
-    // `Symbol`/`SymbolLock`. They are modifiers by any honest reading — you hold
-    // them to reach another key — and they produce no PTY bytes.
-    //
-    // The TERMINAL half is already safe for them without this arm: unmapped keys
-    // return `None` from `build_key_input`, fall to `on_key`'s un-encodable tail,
-    // and never reach the seam at all. The WINDOW half is not, and that is the
-    // whole reason this arm exists — without it, resting a finger on AltGr kills
-    // an in-flight momentum scroll while Shift (which IS engine-mapped) leaves it
-    // running. Same key class, opposite behaviour, for no reason a user could
-    // ever infer.
+    // Modifier and lock keys the engine has no `NamedKey` for, so `map_logical_key`
+    // returns `None`: `AltGraph`, `Fn`/`FnLock` and `Symbol`/`SymbolLock`. They send
+    // no PTY bytes and never reach the seam (`build_key_input` returns `None`), but
+    // without this arm resting a finger on AltGr would stop a momentum scroll that
+    // Shift leaves running.
     matches!(
         &ev.logical_key,
         WinitKey::Named(
@@ -289,48 +249,36 @@ pub(crate) fn press_is_inert(ev: &KeyEvent) -> bool {
     )
 }
 
-/// IME-1: whether a direct key send must be SUPPRESSED because an IME
-/// composition (CJK / dead key) is currently active.
-///
-/// `preedit` is the marked text being composed; a non-empty preedit means the
-/// keystrokes belong to the composer and the resulting text will arrive via
-/// `Ime::Commit` — sending them directly too would double-input. When the
-/// preedit is empty (no composition), ASCII typing proceeds normally.
+/// Whether a direct key send must be suppressed because an IME composition (CJK,
+/// dead key) is active: a non-empty `preedit` means the keystrokes belong to the
+/// composer and the text arrives via `Ime::Commit`, so sending them too would
+/// double the input.
 #[must_use]
 pub(crate) fn suppress_direct_send(preedit: &str) -> bool {
     !preedit.is_empty()
 }
 
 /// Whether an input method's committed text (`Ime::Commit`) reaches the PTY as a
-/// paste rather than as typed keys: when it holds a control character, C0, DEL
-/// or C1 (Unicode's `Cc`, so a line break, CR, ESC, TAB or ETX), unless the
-/// whole commit is one C0 or DEL character, which is one key's worth.
+/// paste rather than as typed keys: when it holds a control character (C0, DEL or
+/// C1, Unicode's `Cc`), unless the whole commit is one C0 or DEL character.
 ///
-/// RULING (boundaries hunt L2, 2026-10-10, `docs/AUDIT-boundaries-2026-10-09.md`):
-/// fail closed. A commit is text the person did not type key by key: an input
-/// method with clipboard history (fcitx5's Clipboard addon) commits the chosen
-/// entry, which a program's OSC 52 write can plant, and macOS dictation commits a
-/// whole phrase. Typed, its line break submitted the line and its ESC ended a
-/// bracketed paste early, past the multi-line guard and the paste sanitizer. As
-/// a paste (`App::deliver_paste`) it is sanitized, bracketed when the program
-/// asked, and asked about by the guard where the guard's own rule asks
-/// (unbracketed and holding a line break). Dictation's "new line" inside a
-/// phrase goes the same way on purpose: a dictated newline that silently runs a
-/// misheard line is the same hazard, so under bracketed paste it inserts a line
-/// break, and at a bare prompt the guard asks first. Printable commits, the
-/// common case (CJK, accents, emoji), keep the typed-key path byte for byte.
+/// Fail closed (`docs/AUDIT-boundaries-2026-10-09.md`, L2): a commit is text the
+/// person did not type key by key. A clipboard-history input method (fcitx5's
+/// Clipboard addon) commits an entry a program's OSC 52 write can plant, and
+/// dictation commits a whole phrase; typed, a line break would run the line and an
+/// ESC end a bracketed paste early. As a paste (`App::deliver_paste`) it is
+/// sanitized, bracketed when the program asked, and checked by the multi-line guard
+/// under the guard's own rule. A dictated "new line" pastes too, on purpose: a
+/// misheard line must not run silently. Printable commits (CJK, accents, emoji)
+/// keep the typed-key path byte for byte.
 ///
-/// AMENDED 2026-10-10 (lane review): a commit that is exactly one C0 or DEL
-/// character keeps the typed-key path. X11 commits a KEY that way: winit sends
-/// a key event only for `keycode != 0 && !is_composing`, so while an XIM
-/// preedit is open an unfiltered Return arrives as the commit `"\r"`, Tab as
-/// `"\t"` and BackSpace as `"\x08"` (`lookup_utf8`), and Wayland's
-/// `commit_string` is unfiltered too. Pasted, that Return would insert a line
-/// break under bracketed paste instead of running the line, Tab a literal tab
-/// instead of completing, and the sanitizer would drop BackSpace and DEL
-/// outright. One character carries no planted text, and neither threat fits in
-/// one: planted text and its line break need two, `ESC [ 201 ~` six. A lone C1
-/// character still pastes: no key types one.
+/// A lone C0 or DEL is one key: X11 commits a key that way while an XIM preedit is
+/// open (winit sends a key event only for `keycode != 0 && !is_composing`, so Return
+/// arrives as the commit `"\r"`, Tab `"\t"`, BackSpace `"\x08"`), and Wayland's
+/// `commit_string` is unfiltered too. Pasted, Return would not run the line, Tab
+/// would not complete and the sanitizer would drop BackSpace. One character cannot
+/// carry planted text plus a line break (two) or `ESC [ 201 ~` (six). A lone C1
+/// still pastes: no key types one.
 #[must_use]
 pub(crate) fn committed_text_is_paste(text: &str) -> bool {
     let mut chars = text.chars();
@@ -340,35 +288,22 @@ pub(crate) fn committed_text_is_paste(text: &str) -> bool {
     }
 }
 
-/// IME-1: encode committed composition text (`Ime::Commit`) for the PTY.
+/// Encode committed composition text (`Ime::Commit`) for the PTY. An input method
+/// brings only commits with no control character here ([`committed_text_is_paste`]
+/// routes the rest to the paste path), but the encoder takes whatever it is handed
+/// (the on-key text fallback, a controller's typed turn).
 ///
-/// A person's input method brings only commits holding no control character
-/// here ([`committed_text_is_paste`] sends the rest through the paste path); the
-/// encoder still takes whatever text it is handed (the on-key text fallback, a
-/// controller's typed turn).
-///
-/// Legacy / non-report-all modes: each character is encoded as a `Character` key
-/// through the engine (NOT a raw `& 0x1f` byte), so committed CJK/dead-key text
-/// goes out exactly as typed text (plain UTF-8). Returns the concatenated bytes
-/// (empty for empty input).
-///
-/// Kitty `REPORT_ALL_KEYS_AS_ESC` + `REPORT_ASSOCIATED_TEXT`: the whole commit is
-/// ONE key-0 event with every codepoint colon-joined in the text field —
-/// `ESC[0;1;cp1:cp2:…u` (mods subfield 1 = none) — the spec's canonical
-/// keyless-text form: "If no known key is associated with the text the key number
-/// 0 must be used." The old per-char `encode_key(Character(c))` FABRICATED a key
-/// NUMBER per codepoint ("日本" arrived as `ESC[26085u ESC[26412u`), and under
-/// `REPORT_EVENT_TYPES` no release ever followed — an orphan press per character.
-/// Control-code codepoints are dropped (kitty suppresses text that begins with a
-/// control character); a commit of only control codes emits nothing.
-///
-/// Kitty `REPORT_ALL_KEYS_AS_ESC` without `REPORT_ASSOCIATED_TEXT`: the commit is
-/// represented by one keyless event (`ESC[0u`). There is no protocol field in
-/// which to carry the committed text when the application opted out of associated
-/// text. Inventing one key event per Unicode codepoint is incorrect: an IME commit
-/// has no corresponding physical key, and those fabricated numeric CSI-u packets
-/// can be exposed as literal bracket-number text by a client that falls back while
-/// decoding input.
+/// - Legacy and non-report-all modes: each character is a `Character` key through
+///   the engine, so the commit goes out as plain UTF-8.
+/// - Kitty `REPORT_ALL_KEYS_AS_ESC` + `REPORT_ASSOCIATED_TEXT`: one key-0 event with
+///   the codepoints colon-joined in the text field, `ESC[0;1;cp1:cp2:…u`, the spec's
+///   keyless-text form ("If no known key is associated with the text the key number
+///   0 must be used"). Control codepoints are dropped (kitty suppresses text that
+///   begins with one); an all-control commit emits nothing.
+/// - `REPORT_ALL_KEYS_AS_ESC` alone: one keyless event (`ESC[0u`), since no field
+///   can carry the text and an IME commit has no physical key. A fabricated key per
+///   codepoint would pair with no release and can surface as literal bracket-number
+///   text in a client's fallback decoder.
 #[must_use]
 pub(crate) fn encode_committed_text(text: &str, mode: KeyboardMode) -> Vec<u8> {
     if mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC) {
@@ -401,48 +336,28 @@ pub(crate) fn encode_committed_text(text: &str, mode: KeyboardMode) -> Vec<u8> {
     out
 }
 
-/// Phase 0.5 (A.2 divergence f/h): the keymap demoted to a BUILDER. Instead of
-/// returning PTY bytes (which made `on_key` a second encoder caller), it yields
-/// the engine-neutral `(Key, Modifiers, base_layout, layout_text)` fields of an
-/// [`InputEvent::Key`](crate::input::InputEvent::Key), the last the layout's
-/// own character for a text press ([`layout_text`]). The SEAM (`App::input`)
-/// is the sole caller of the key encoder (`encode_key_with_text`), so a human
-/// key and a `key`/`ctrl` verb that build the SAME fields produce
-/// byte-identical output — including the
-/// Kitty `REPORT_ALTERNATE_KEYS` 3rd field carried by `base_layout`. Bare
-/// modifiers DO map (the winit-keymap table canonicalizes winit's sideless
-/// `Shift`/`Control`/… to the engine's `ShiftLeft`/`ControlLeft`/… variants); the
-/// ENCODER decides what they produce — reported only under kitty
-/// `REPORT_ALL_KEYS_AS_ESC`, encoded to nothing otherwise. `None` only for keys
-/// with no engine mapping at all (a dead key / `Key::Unidentified`).
+/// The engine-neutral fields of an [`InputEvent::Key`](crate::input::InputEvent::Key)
+/// for a press: `(Key, Modifiers, base_layout, layout_text)`, the last the layout's
+/// own character for a text press ([`layout_text`]). The seam (`App::input`) is the
+/// only caller of the encoder (`encode_key_with_text`), so a human key and a
+/// `key`/`ctrl` verb that build the same fields send the same bytes, including the
+/// kitty `REPORT_ALTERNATE_KEYS` field `base_layout` carries. Bare modifiers map
+/// (winit's sideless `Shift`/`Control`/… become `ShiftLeft`/`ControlLeft`/…) and the
+/// encoder decides what they produce. `None` only for keys with no engine mapping (a
+/// dead key, `Key::Unidentified`).
 ///
-/// THE KEYPAD IS ASKED FIRST, on every platform. winit has no keypad key: KP_5
-/// is `Character("5")` and KP_Enter is `Named(Enter)`, the same logical keys
-/// the main block produces, with the keypad in `location` alone — which nothing
-/// here read, so the engine's `Numpad*` keys (DECKPAM's SS3 forms, kitty's
-/// `CSI 57399..57427 u`) were unreachable from a keyboard and an application
-/// could not tell KP_1 from 1 or KP_Enter from Return.
-/// [`aterm_winit_keymap::map_numpad_key`] resolves the keypad identity from
-/// `location` and `logical_key` (which carries NumLock). On the Linux backends
-/// that also repairs the digits themselves: `key_without_modifiers()` there is
-/// xkb's level-0 keysym, and the KEYPAD type keeps the NumLock-OFF symbol at
-/// level 0, so a NumLock-on KP_1 built `End` and typed End's bytes.
+/// The keypad is asked first, on every platform. winit has no keypad key (KP_5 is
+/// `Character("5")`, KP_Enter `Named(Enter)`; only `location` says keypad), so
+/// [`aterm_winit_keymap::map_numpad_key`] resolves it from `location` and
+/// `logical_key` (which carries NumLock). On Linux that also fixes the digits:
+/// `key_without_modifiers()` there is xkb's level-0 keysym, the NumLock-off symbol.
 ///
-/// WHAT CHANGES ON THE WIRE, stated plainly rather than as "legacy bytes are
-/// unchanged": with NO mode set a keypad key still types what it always typed
-/// (`5`, CR, and End's bytes for a NumLock-off KP_1). Under DECKPAM — which
-/// `smkx` sets, so vim, less and tmux all do — the keypad digits now send
-/// xterm's `SS3 p..y` and KP_Enter `SS3 M`, where before the keypad was
-/// indistinguishable from the main row and typed `5` and CR. That is the
-/// point of the fix and it is what xterm sends for the same key; it is also
-/// the one thing a user will notice. vim translates unmapped `<k0>`..`<k9>`
-/// back to digits and is unaffected; `less` does not, so a line number typed
-/// on the keypad no longer reaches it. NumLock does NOT override the mode:
-/// see `encode_numpad_named_legacy`, where the alternative would put DECKPAM's
-/// keypad forms permanently out of a keyboard's reach. Under kitty
-/// disambiguate the keypad reports its own `CSI 57399..57427 u` codes; under a
-/// kitty mode WITHOUT disambiguate the engine folds it to the main-block twin,
-/// unless DECKPAM is also set.
+/// With no mode set a keypad key types what the main block would. Under DECKPAM
+/// (set by `smkx`, so vim, less and tmux) the digits send xterm's `SS3 p..y` and
+/// KP_Enter `SS3 M`; vim maps unmapped `<k0>`..`<k9>` back to digits, `less` does
+/// not. NumLock does not override the mode (see `encode_numpad_named_legacy`).
+/// Kitty disambiguate reports the keypad's own `CSI 57399..57427 u`; a kitty mode
+/// without it folds to the main-block twin unless DECKPAM is also set.
 ///
 /// The keybinding lookup, the tab-menu chord and every overlay read the
 /// MAIN-BLOCK key a keypad press stands for, so a binding on Enter still fires
@@ -835,50 +750,29 @@ fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
     ev.key_without_modifiers()
 }
 
-/// `VkKeyScanExW`'s shift-state bits for "this character needs Ctrl AND Alt" —
-/// i.e. AltGr. (`winuser.h`: 1 = Shift, 2 = Ctrl, 4 = Alt.)
-///
-/// Compiled for Windows and for every test build, like the two pure functions
-/// below it — see [`windows_key_input`]. It is a number out of a Windows header,
-/// not a Windows API.
+/// `VkKeyScanExW`'s shift-state bits for Ctrl+Alt, i.e. AltGr (`winuser.h`: 1 =
+/// Shift, 2 = Ctrl, 4 = Alt). A header constant, so compiled for tests too.
 #[cfg(any(windows, test))]
 const SHIFT_STATE_CTRL_ALT: u8 = 0b0000_0110;
 
-/// The Windows half of [`build_key_input`], as a PURE decision so the layout
-/// cases below are unit-testable without a window, an event loop, or a German
-/// keyboard. `logical_key` is the layout-COMPOSED key, `base_key` is
-/// `key_without_modifiers()`, `base_layout` the US-QWERTY identity of the
-/// physical key, and `layout_shift_state` answers `VkKeyScanExW`'s question
-/// "which modifiers does this character need on the CURRENT layout?".
+/// The Windows half of [`build_key_input`], pure so the layout cases are testable
+/// without a window: `logical_key` is the layout-composed key, `base_key`
+/// `key_without_modifiers()`, `base_layout` the physical key's US-QWERTY identity,
+/// and `layout_shift_state` answers `VkKeyScanExW`'s "which modifiers does this
+/// character need on the current layout?".
 ///
-/// Two Windows-only layout facts drive it, both flowing from ONE winit
-/// behaviour: `WindowsModifiers::remove_only_ctrl` keeps CONTROL in the layout
-/// lookup whenever ALT is also down, so a Ctrl+Alt press is resolved against
-/// the layout's AltGr table (`keyboard.rs:506`).
+/// winit's `remove_only_ctrl` keeps CONTROL in the layout lookup whenever ALT is
+/// also down, so a Ctrl+Alt press resolves against the layout's AltGr table:
 ///
-/// 1. ALTGR COMPOSED AS LEFTCTRL+LEFTALT ENCODES A CONTROL BYTE. winit clears
-///    Ctrl/Alt from `ModifiersState` only while the RIGHT Alt is physically down
-///    (`keyboard_layout.rs:277`), but Windows equally accepts LCtrl+LAlt as
-///    AltGr — that is in fact how winit DETECTS AltGr. So on de-DE, LCtrl+LAlt+8
-///    arrives as `Character('[')` with CTRL|ALT still set and the engine emits
-///    ESC ESC (`ctrl_character('[')` = 0x1B) instead of a `[`; LCtrl+LAlt+Q
-///    ('@') emits ESC NUL. Measured against the shipped layout DLLs with
-///    `ToUnicodeEx`: de-DE Ctrl+Alt+{7,8,Q} → `{ [ @`, US-QWERTY Ctrl+Alt+
-///    {7,8,A,Q} → nothing at all. So the strip below asks the LAYOUT (one
-///    `VkKeyScanExW`, no cache, no 256-key scan) whether the character the user
-///    actually got is one that needs Ctrl+Alt: on US-QWERTY no character ever
-///    answers yes, which is what makes US unreachable by this path. The RAlt
-///    path is untouched — winit already delivered it with no modifiers.
-///
-/// 2. A GENUINE Ctrl+Alt CHORD RESOLVES TO NOTHING. The same AltGr-first lookup
-///    means Ctrl+Alt+A is resolved against a shift state that no layout defines
-///    for letters (measured: `ToUnicodeEx` returns 0 on both US and de-DE), so
-///    winit reports `Key::Unidentified` and the chord encoded to ZERO bytes on
-///    Windows while macOS/Linux emit ESC ^A. When the composed key maps to
-///    nothing and both Ctrl and Alt are held, fall back to the base key — the
-///    same key macOS/Linux encode from — so the chord keeps its control
-///    sequence. Nothing else can reach this arm: without ALT, winit already
-///    drops CONTROL from the lookup and hands back the base key itself.
+/// 1. AltGr as LCtrl+LAlt. winit clears Ctrl/Alt only while the right Alt is down,
+///    but Windows accepts LCtrl+LAlt as AltGr too, so de-DE LCtrl+LAlt+8 arrives as
+///    `Character('[')` with CTRL|ALT set and would encode ESC ESC. When the layout
+///    says the character needs Ctrl+Alt, the bits are stripped; no US-QWERTY
+///    character does, so US never takes this path.
+/// 2. A genuine Ctrl+Alt chord. Ctrl+Alt+A resolves to a shift state no layout
+///    defines for letters, so winit reports `Unidentified`; falling back to the
+///    base key gives the ESC ^A macOS and Linux send. Without ALT, winit already
+///    drops CONTROL and hands back the base key.
 ///
 /// COMPILED FOR WINDOWS AND FOR EVERY TEST BUILD, and that is deliberate. This
 /// function is named for the platform whose behaviour it encodes, not for a
@@ -915,15 +809,11 @@ fn windows_key_input(
     }
 }
 
-/// Whether `logical_key` is a character the CURRENT layout composes with AltGr —
-/// the proof that the live Ctrl+Alt bits are AltGr's spelling and not a chord.
-///
-/// Deliberately narrow: a single-codepoint, non-control character that is NOT
-/// merely the key's own base identity, and that `VkKeyScanExW` says is reachable
-/// only with Ctrl+Alt held on this layout. A control codepoint is exactly what a
-/// real chord would produce, so it can never launder itself through here.
-///
-/// Pure, and so compiled for every test build too — see [`windows_key_input`].
+/// Whether `logical_key` is a character the current layout composes with AltGr,
+/// proving the live Ctrl+Alt bits are AltGr's spelling rather than a chord: one
+/// non-control codepoint, not the key's own base identity, that `VkKeyScanExW` says
+/// needs Ctrl+Alt. A control codepoint is what a real chord produces, so it never
+/// qualifies.
 #[cfg(any(windows, test))]
 fn altgr_composed(
     logical_key: &WinitKey,
@@ -941,14 +831,10 @@ fn altgr_composed(
     layout_shift_state(c).is_some_and(|state| state & SHIFT_STATE_CTRL_ALT == SHIFT_STATE_CTRL_ALT)
 }
 
-/// `VkKeyScanExW`'s shift state for `c` on the CALLING THREAD's keyboard layout
-/// (`GetKeyboardLayout(0)`), or `None` when the layout cannot type it at all
-/// (the documented -1 return) — which is also the answer for every non-BMP
-/// character, since the API takes one UTF-16 unit.
-///
-/// Same tiny-FFI posture as [`lock_modifiers`] above: user32 is on the approved
-/// list, both calls are pure per-thread queries, and there is no std
-/// alternative. One call per Ctrl+Alt press, so no cache is warranted.
+/// `VkKeyScanExW`'s shift state for `c` on the calling thread's layout
+/// (`GetKeyboardLayout(0)`), or `None` when the layout cannot type it (the -1
+/// return), as for every non-BMP character (the API takes one UTF-16 unit). One
+/// call per Ctrl+Alt press, so no cache.
 #[cfg(windows)]
 fn layout_shift_state(c: char) -> Option<u8> {
     #[cfg(test)]
@@ -1014,9 +900,8 @@ mod tests {
         WinitKey::Character(SmolStr::new(c))
     }
 
-    /// The bytes the SHIPPING encode path writes for one standard-location
-    /// press: [`build_key_input`] (the seam's key triple) into the engine's
-    /// encoder. `None` when the press maps to no terminal sequence.
+    /// The bytes the shipping encode path writes for one standard-location press:
+    /// [`build_key_input`] into the engine's encoder. `None` when nothing is sent.
     fn encode_press(
         logical: WinitKey,
         code: KeyCode,
@@ -1127,17 +1012,10 @@ mod tests {
         }
     }
 
-    /// Regression (the "Shift doesn't work" report): Shift+<symbol> must encode
-    /// the SHIFTED glyph. On macOS the GUI hands the engine the UNSHIFTED base key
-    /// (`key_without_modifiers()` → '2') plus the SHIFT modifier, and the engine's
-    /// legacy encoder used to `to_ascii_uppercase` it, which no-ops on
-    /// digits/symbols, so every shifted symbol was lost. Letters masked the gap
-    /// (they DO uppercase), which is why it slipped past the unit tests twice.
-    ///
-    /// The event is the one AppKit builds (base '2', text '@'); on a US layout
-    /// the engine's own derivation agrees with it, so no layout text is carried
-    /// and the press stays the same event a controller's `key 2 mods=shift`
-    /// builds.
+    /// Shift+<symbol> encodes the shifted glyph: AppKit hands over the unshifted base
+    /// key ('2') plus SHIFT and the engine derives '@'. On a US layout that agrees
+    /// with the text, so no layout text rides and the press equals a controller's
+    /// `key 2 mods=shift`.
     #[test]
     fn shift_symbol_encodes_shifted_glyph() {
         let ev = mac_press(KeyCode::Digit2, "@", "2", "@");
@@ -1171,18 +1049,9 @@ mod tests {
         );
     }
 
-    /// The two layouts the Windows arm below is pinned against, as
-    /// `VkKeyScanExW` actually answers on the shipped layout DLLs (measured
-    /// 2026-08-22 against `00000407`/`00000409`; 1 = Shift, 2 = Ctrl, 4 = Alt,
-    /// `None` = the layout cannot type this character at all).
-    ///
-    /// These two tables and the four laws under them carry NO platform `cfg`,
-    /// which is the 2026-09-16 fix: they are the whole reason
-    /// [`windows_key_input`] takes its layout query as a parameter, and under a
-    /// `not(any(macos, linux))` gate they ran on no machine anyone here owns
-    /// and were compiled by nothing in this repository. The law they keep — a
-    /// German user's AltGr brace must be a brace and not a control byte — is
-    /// decided by pure logic, so it is pinned from every host instead.
+    /// `VkKeyScanExW`'s answers on the shipped de-DE (`00000407`) and US
+    /// (`00000409`) layout DLLs (1 = Shift, 2 = Ctrl, 4 = Alt, `None` = untypeable).
+    /// No platform `cfg`, so the AltGr tests below run on every host.
     fn de_de_shift_state(c: char) -> Option<u8> {
         match c {
             // AltGr characters: 0x0637 '{', 0x0638 '[', 0x0651 '@', 0x0645 '€'.
@@ -1203,11 +1072,9 @@ mod tests {
         }
     }
 
-    /// AltGr spelled the way Windows equally accepts and compact/RDP keyboards
-    /// force — LEFT Ctrl + LEFT Alt — must type the composed character, not a
-    /// control byte. winit only clears Ctrl/Alt for the RIGHT Alt, so before the
-    /// strip de-DE AltGr+8 ('[') encoded ESC ESC and AltGr+Q ('@') encoded
-    /// ESC NUL: a German user typing a brace got a control code.
+    /// AltGr spelled LCtrl+LAlt (which Windows accepts and compact/RDP keyboards
+    /// force) types the composed character, not a control byte: winit clears
+    /// Ctrl/Alt only for the right Alt.
     #[test]
     fn de_de_altgr_as_left_ctrl_alt_types_the_character() {
         for (composed, base, want) in [
@@ -1244,9 +1111,8 @@ mod tests {
         }
     }
 
-    /// The RIGHT-Alt spelling is winit's own path: it already cleared Ctrl/Alt
-    /// from `ModifiersState`, so the strip has nothing to do and must not
-    /// disturb the character.
+    /// The right-Alt spelling is winit's own path: it already cleared Ctrl/Alt
+    /// from `ModifiersState`, so the strip leaves the character alone.
     #[test]
     fn de_de_right_alt_altgr_is_unchanged() {
         let (key, mods, _) = windows_key_input(
@@ -1261,13 +1127,10 @@ mod tests {
         assert_eq!(mods, Modifiers::empty());
     }
 
-    /// The guard on the strip: a GENUINE Ctrl+Alt+letter chord keeps its
-    /// modifiers and still encodes as a control sequence (ESC ^A). Both shapes
-    /// are covered — the layout that composes nothing for the chord (measured:
-    /// `ToUnicodeEx` returns 0 for Ctrl+Alt+A on US AND de-DE, so winit reports
-    /// `Unidentified` and the chord used to encode NO bytes at all on Windows),
-    /// and a layout that hands back a plain letter, which `VkKeyScanExW` reports
-    /// as needing no modifiers and so can never look like AltGr.
+    /// A genuine Ctrl+Alt+letter chord keeps its modifiers and encodes ESC ^A, both
+    /// when the layout composes nothing (`ToUnicodeEx` returns 0 for Ctrl+Alt+A on US
+    /// and de-DE, so winit reports `Unidentified`) and when it hands back a plain
+    /// letter, which needs no modifiers and so never looks like AltGr.
     #[test]
     fn genuine_ctrl_alt_letter_still_encodes_a_control_sequence() {
         let unidentified = WinitKey::Unidentified(aterm_window::keyboard::NativeKey::Unidentified);
@@ -1302,8 +1165,7 @@ mod tests {
     /// stripped — including the '{' that US types with plain Shift.
     #[test]
     fn us_qwerty_is_unaffected() {
-        // The same composed '{' a de-DE AltGr press produces, on a layout that
-        // reaches it with Shift: the modifiers must survive untouched.
+        // The '{' a de-DE AltGr press composes, on a layout that reaches it with Shift.
         let (_, mods, _) = windows_key_input(
             &ch("{"),
             &ch("["),
@@ -1317,7 +1179,7 @@ mod tests {
             Modifiers::CTRL | Modifiers::ALT,
             "US-QWERTY has no AltGr; nothing may be stripped"
         );
-        // And the ordinary shifted press stays exactly as it was.
+        // The ordinary Shift+[ is untouched.
         let (key, mods, base_layout) = windows_key_input(
             &ch("{"),
             &ch("["),
@@ -1642,16 +1504,14 @@ mod tests {
             Modifiers::CAPS_LOCK.contains(locks),
             "lock_modifiers must set nothing beyond CAPS_LOCK, got {locks:?}"
         );
-        // Both reads agree with each other (the connection is cached, the value
-        // is the same LED) — a second call is not a second open.
+        // A second read, through the cached connection, agrees.
         assert_eq!(locks, lock_modifiers());
         if let Some(on) = hid_lock_state::caps_lock() {
             assert_eq!(on, locks.contains(Modifiers::CAPS_LOCK));
         }
     }
 
-    /// winit ModifiersState → engine Modifiers carries Super/Cmd through
-    /// (the old inline path dropped it).
+    /// `modifiers_from_winit` carries Super/Cmd through.
     #[test]
     fn super_modifier_carried_through() {
         let m = modifiers_from_winit(ModifiersState::SUPER);
@@ -1677,12 +1537,10 @@ mod tests {
         assert!(encode_committed_text("", KeyboardMode::empty()).is_empty());
     }
 
-    /// The L2 rule itself (ruling 2026-10-10, amended the same day): C0, DEL
-    /// and C1 (Unicode's `Cc`) make a commit a paste, except a commit that is
-    /// one C0 or DEL character, which is the key X11 commits while an XIM
-    /// preedit is open (Return, Tab, BackSpace, Escape, Ctrl+C). Printable
-    /// text, joiners, the no-break space and the Unicode line separator (`Zl`,
-    /// which no shell reads as a line end) are typed text.
+    /// C0, DEL and C1 (Unicode `Cc`) make a commit a paste, except a lone C0 or DEL
+    /// character (the key X11 commits while an XIM preedit is open). Printable text,
+    /// joiners, the no-break space and the line separator (`Zl`, which no shell reads
+    /// as a line end) are typed.
     #[test]
     fn a_commit_is_a_paste_when_a_control_character_is_not_a_lone_key() {
         for paste in [
@@ -1712,12 +1570,9 @@ mod tests {
         }
     }
 
-    /// Under kitty REPORT_ALL_KEYS_AS_ESC + REPORT_ASSOCIATED_TEXT (+ event types,
-    /// the mode a full-protocol app negotiates) an IME commit is ONE key-0 event
-    /// carrying every codepoint colon-joined in the text field — the spec's
-    /// keyless-text form. The old per-char path fabricated a key NUMBER per
-    /// codepoint (`ESC[26085u ESC[26412u`), and under REPORT_EVENT_TYPES no
-    /// release ever paired with those fabricated presses.
+    /// Under kitty report-all + associated text (+ event types, the mode a
+    /// full-protocol app negotiates) an IME commit is one key-0 event with every
+    /// codepoint colon-joined in the text field.
     #[test]
     fn commit_under_report_all_with_text_is_one_key0_event() {
         let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC
@@ -1736,9 +1591,8 @@ mod tests {
         );
     }
 
-    /// Key-0 commits FILTER control-code codepoints (kitty suppresses text that
-    /// begins with a control character); a commit of only control codes emits
-    /// nothing at all — never a payload-less `ESC[0;1;u`.
+    /// Key-0 commits drop control-code codepoints; an all-control commit emits
+    /// nothing, never a payload-less `ESC[0;1;u`.
     #[test]
     fn commit_key0_filters_control_codepoints() {
         let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::REPORT_ASSOCIATED_TEXT;
@@ -1799,11 +1653,8 @@ mod tests {
         keyboard::encode_key_with_text(&key, mods, mode, KeyEventType::Press, base, text)
     }
 
-    /// THE KEYPAD DEFECT: a physical KP_5 built `Character('5')` — the main
-    /// row's key — so DECKPAM's `SS3 u` and kitty's `CSI 57404 u` were
-    /// unreachable from a keyboard. The seam asks the keypad first: the
-    /// legacy byte is the same `5`, and the two modes that exist to tell the
-    /// keypad apart now do.
+    /// A physical KP_5 resolves to `Numpad5`: `5` in legacy mode, DECKPAM's `SS3 u`
+    /// and kitty's `CSI 57404 u` where those modes ask.
     #[test]
     fn numpad_digit_reaches_the_numpad_encoder() {
         use aterm_types::keyboard::NamedKey;
@@ -1819,15 +1670,10 @@ mod tests {
         );
     }
 
-    /// NUMLOCK OFF AND SHIFT HELD — the press the kitty legacy fold got wrong.
-    /// xkb's KEYPAD type holds the DIGIT at level 2 (`map[Shift] = Level2`), so
-    /// this arrives as `Character("5")` at `KeyLocation::Numpad` with SHIFT in
-    /// the modifier state, and the seam resolves it to `Numpad5`. It must type
-    /// `5`: on the keypad SHIFT picks a level, it never composes, and xterm's
-    /// rule is that SHIFT does nothing to a keypad key but cancel DECKPAM.
-    /// Handing the fold's main-block twin to the legacy encoder ran the main
-    /// row's shift table over it and typed `%` — but only when a kitty
-    /// REPORTING flag happened to be set, which is not the keypad's business.
+    /// NumLock off with Shift held, xkb's keypad type yields the digit
+    /// (`Character("5")` at `Numpad`, SHIFT set), and it types `5`: on the keypad Shift
+    /// picks a level and, as in xterm, only cancels DECKPAM. A kitty reporting flag
+    /// must not run the main row's shift table over it (`%`).
     #[test]
     fn shifted_keypad_digit_types_its_digit_never_the_main_rows_glyph() {
         use aterm_types::keyboard::NamedKey;
@@ -1883,11 +1729,8 @@ mod tests {
         );
     }
 
-    /// NumLock off, the keypad 1 is KP_End: the main block's End bytes in
-    /// legacy mode (kitty's legacy fold) and its own `CSI 57424 u` under
-    /// disambiguate. On the Linux backends this `Named(End)` is also what a
-    /// NumLock-ON keypad 1 used to build, from `key_without_modifiers()`'
-    /// level-0 keysym; the seam reads `logical_key`, which says `5`.
+    /// NumLock off, keypad 1 is KP_End: the main block's End bytes in legacy mode
+    /// (kitty's legacy fold) and its own `CSI 57424 u` under disambiguate.
     #[test]
     fn numlock_off_keypad_navigation_keeps_its_keypad_identity() {
         use aterm_types::keyboard::NamedKey;
@@ -1932,9 +1775,8 @@ mod tests {
         assert_eq!(seam_bytes(&enter, KeyboardMode::APP_KEYPAD), b"\r");
     }
 
-    /// A winit press whose modifier-supplement BASE key differs from
-    /// `logical_key` — which is what EVERY X11/Wayland keypad press looks like,
-    /// and what the plain constructor cannot express (it sets the two equal).
+    /// A winit press whose modifier-supplement base key differs from `logical_key`,
+    /// as on every X11/Wayland keypad press.
     fn press_at_with_base(
         code: KeyCode,
         logical: WinitKey,
@@ -1956,19 +1798,11 @@ mod tests {
         )
     }
 
-    /// THE HEADLINE X11/WAYLAND DEFECT, pinned instead of argued. The builder
-    /// encoded from `key_without_modifiers()`, which those backends compute as
-    /// xkb's LEVEL-0 keysym, and the KEYPAD key type holds the NumLock-OFF
-    /// symbol at level 0 (`types/numpad`: `map[None] = Level1`;
-    /// `symbols/keypad(x11)`: `<KP1> { [ KP_End, KP_1 ] }`). So a NumLock-ON
-    /// keypad 1 arrives with `logical_key = Character("1")` and a level-0
-    /// `Named(End)`, and the old builder read the second one: the key TYPED
-    /// `ESC [ F` into the shell instead of `1`, and `.` typed Delete.
-    ///
-    /// `map_numpad_key` is asked first and reads `logical_key`, which carries
-    /// NumLock — so the digit types its digit, and DECKPAM/disambiguate can
-    /// still tell it from the main row. `base_logical_key` reads the same key,
-    /// so the binding table and the encoder agree on what was pressed.
+    /// On X11/Wayland `key_without_modifiers()` is xkb's level-0 keysym, and the
+    /// keypad type holds the NumLock-off symbol there (`<KP1> { [ KP_End, KP_1 ] }`),
+    /// so a NumLock-on KP_1 has a level-0 `Named(End)`. `map_numpad_key` reads
+    /// `logical_key`, which carries NumLock, so the digit types its digit; and
+    /// `base_logical_key` reads the same key, so bindings and encoder agree.
     #[test]
     fn numlock_on_keypad_digit_is_not_the_level_zero_keysym() {
         use aterm_types::keyboard::NamedKey;
@@ -1996,7 +1830,7 @@ mod tests {
             "a NumLock-ON keypad 1 types 1, not End's ESC [ F"
         );
         assert_eq!(seam_bytes(&ev, KeyboardMode::APP_KEYPAD), b"\x1bOq");
-        // The decimal key is the same bug: level 0 is KP_Delete.
+        // Level 0 of the decimal key is KP_Delete.
         let dot = press_at_with_base(
             KeyCode::NumpadDecimal,
             ch("."),
@@ -2004,8 +1838,7 @@ mod tests {
             KeyLocation::Numpad,
         );
         assert_eq!(seam_bytes(&dot, KeyboardMode::empty()), b".");
-        // The binding lookup reads the SAME key the encoder did — before, a
-        // user's `ctrl+pagedown` claimed Ctrl+keypad-3 with NumLock on.
+        // The binding lookup reads the same key the encoder does.
         assert_eq!(crate::app_input::base_logical_key(&ev), ch("1"));
         let kp3 = press_at_with_base(
             KeyCode::Numpad3,
@@ -2014,8 +1847,7 @@ mod tests {
             KeyLocation::Numpad,
         );
         assert_eq!(crate::app_input::base_logical_key(&kp3), ch("3"));
-        // NumLock OFF, the level-0 symbol IS the key: it stays End, for the
-        // encoder and the binding table alike.
+        // NumLock off, the level-0 symbol is the key: End, for encoder and bindings.
         let off = press_at_with_base(
             KeyCode::Numpad1,
             WinitKey::Named(WinitNamed::End),
@@ -2027,20 +1859,14 @@ mod tests {
             crate::app_input::base_logical_key(&off),
             WinitKey::Named(WinitNamed::End)
         );
-        // The main block never took this road: its base key is the layout base
-        // and stays so.
+        // The main block's base key stays the layout base.
         let shifted = press_at_with_base(KeyCode::Digit1, ch("!"), ch("1"), KeyLocation::Standard);
         assert_eq!(crate::app_input::base_logical_key(&shifted), ch("1"));
     }
 
-    /// THE NumLock-OFF CENTRE KEY. It is the one keypad key no platform names —
-    /// xkb reports `KP_Begin` as `Unidentified`, Windows as `Clear` — so it is
-    /// settled by its physical code, and the engine's legacy arm for it is
-    /// xterm's `CSI E` (`SS3 E` under DECKPAM), which the kitty encoder has
-    /// always agreed with. Never a `5`: nothing could reach this arm before the
-    /// seam, and shipping the road together with the digit it used to emit
-    /// would have started typing a stray `5` at a shell prompt where this key
-    /// wrote nothing at all.
+    /// The NumLock-off centre key, which no platform names (xkb's `KP_Begin` is
+    /// `Unidentified`, Windows says `Clear`), is settled by its physical code and
+    /// sends xterm's `CSI E` (`SS3 E` under DECKPAM), never a digit.
     #[test]
     fn numlock_off_keypad_centre_is_the_letter_form_never_a_digit() {
         use aterm_types::keyboard::NamedKey;
@@ -2204,11 +2030,9 @@ mod tests {
         }
     }
 
-    /// Bug hunt 8, the window half: Caps Lock + A, and Shift on a non-US
-    /// layout, type the layout's character — in legacy mode and in every kitty
-    /// mode that keeps text as text — and kitty's report-all forms keep the
-    /// layout's unshifted key as the key code. They wrote 'a', '@', '&', 'é'
-    /// and 'ф' (the US table applied to the unshifted key).
+    /// Caps Lock + A and Shift on a non-US layout type the layout's character, in
+    /// legacy mode and every kitty mode that keeps text as text; kitty's report-all
+    /// forms keep the layout's unshifted key as the key code.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn caps_lock_and_non_us_shift_type_the_layouts_character() {

@@ -67,6 +67,16 @@ impl Fixed {
     }
 }
 
+/// What a [`Display::try_flush`] that did not fail left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flushed {
+    /// Every queued request is on the socket.
+    All,
+    /// The socket is full: the rest stays queued for a later flush, once the
+    /// socket polls writable.
+    Queued,
+}
+
 /// A `struct wl_display *`, not owned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Display(NonNull<c_void>);
@@ -115,6 +125,25 @@ impl Display {
         Ok(())
     }
 
+    /// Write queued requests as a client that never blocks on the socket
+    /// does: a full socket is [`Flushed::Queued`], not an error, while the
+    /// display itself has not failed. Once libwayland's own buffer is full
+    /// too it ends the connection with the write's `EAGAIN` as the display's
+    /// error (1.22), and that `EAGAIN` is fatal like any other.
+    pub fn try_flush(self) -> Result<Flushed, Error> {
+        match self.flush() {
+            Ok(()) => Ok(Flushed::All),
+            Err(Error::Display(errno))
+                if self.error().is_none()
+                    && std::io::Error::from_raw_os_error(errno).kind()
+                        == std::io::ErrorKind::WouldBlock =>
+            {
+                Ok(Flushed::Queued)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// The display's fatal error, if it has one.
     pub fn error(self) -> Option<Error> {
         let c = client().ok()?;
@@ -147,6 +176,19 @@ impl OwnedDisplay {
         let name = name.map_or(std::ptr::null(), CStr::as_ptr);
         // SAFETY: a NUL-terminated name or null.
         let raw = unsafe { (c.display_connect)(name) };
+        NonNull::new(raw)
+            .map(|p| OwnedDisplay(Display(p)))
+            .ok_or(Error::NoObject)
+    }
+
+    /// Connect over `fd`, a socket already connected to a compositor (what
+    /// `WAYLAND_SOCKET` hands a client). libwayland owns it from here: it is
+    /// closed when the display is, or at once when the connection fails.
+    pub fn connect_to_fd(fd: std::os::fd::OwnedFd) -> Result<OwnedDisplay, Error> {
+        use std::os::fd::IntoRawFd as _;
+        let c = client()?;
+        // SAFETY: a connected socket whose ownership passes to libwayland.
+        let raw = unsafe { (c.display_connect_to_fd)(fd.into_raw_fd()) };
         NonNull::new(raw)
             .map(|p| OwnedDisplay(Display(p)))
             .ok_or(Error::NoObject)

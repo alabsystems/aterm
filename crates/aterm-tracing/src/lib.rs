@@ -6,7 +6,7 @@
 //!
 //! Published under the package name `tracing` so `[patch.crates-io]` redirects
 //! its upstream consumers — the absorbed winit (`crates/aterm-window`),
-//! `softbuffer`; `zbus` until A11Y.4 and `tiny-xlib` until LW.6 — here. It replaces `tracing`, `tracing-core` and
+//! `softbuffer`, and `tiny-xlib` — here. It replaces `tracing`, `tracing-core` and
 //! `tracing-attributes` (and `pin-project-lite` on mac and windows).
 //!
 //! # Why a no-op is behaviourally identical
@@ -70,9 +70,8 @@
 //!   `error_span!`
 //! * types — [`Span`], [`EnteredSpan`]
 //!
-//! Deliberately absent, because no consumer names them: `Instrument` and
-//! `Instrumented` (zbus's, deleted at A11Y.6 of
-//! docs/AUDIT-third-party-2026-10-15.md once zbus had left), `Level`,
+//! Deliberately absent, because no consumer names them: `Instrument`,
+//! `Instrumented`, `Level`,
 //! `LevelFilter`, `Metadata`, `Event`, `Id`, `Dispatch`, `Subscriber`,
 //! `field::*`, `Value`, `WithSubscriber`, `tracing::log`,
 //! `level_filters::STATIC_MAX_LEVEL`, the `Level`-taking `event!` / `span!` /

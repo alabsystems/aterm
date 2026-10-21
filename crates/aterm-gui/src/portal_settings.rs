@@ -15,7 +15,10 @@
 //!
 //! ONLY A RUNNING PORTAL IS ASKED (`NO_AUTO_START`). Its reads run on a
 //! window's main thread, the appearance read before session 0 and the event
-//! loop and the motion read at the first window's attach. A call that starts
+//! loop, the motion read at the first window's attach, and on Wayland the
+//! header's `button-layout` read (`client_frame::ButtonLayout::desktop`,
+//! once a process) at the first client-decorated window's first `Resized`,
+//! each within its own 200 ms bound. A call that starts
 //! the portal waits for its start, and xdg-desktop-portal installed with no
 //! backend for the desktop never finishes starting: each read waited out its
 //! 200 ms bound, about 400 ms before a Linux window's first frame (the lane's
@@ -42,6 +45,12 @@ const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 /// `false` is the person's reduced motion.
 pub(crate) const GNOME_INTERFACE: &str = "org.gnome.desktop.interface";
 pub(crate) const ENABLE_ANIMATIONS: &str = "enable-animations";
+
+/// GNOME's window-manager schema and its key for where a window's header
+/// puts its buttons (`appmenu:close`), which sctk-adwaita read before LW.5
+/// ([`crate::client_frame::ButtonLayout`]).
+pub(crate) const GNOME_WM_PREFERENCES: &str = "org.gnome.desktop.wm.preferences";
+pub(crate) const BUTTON_LAYOUT: &str = "button-layout";
 
 /// `namespace`'s `key` as the portal on the session bus answers it, the
 /// handshake and the call within `bound`: `None` for no session bus, no
@@ -429,6 +438,53 @@ mod tests {
             .collect();
         eprintln!("warm Settings portal reads took {took:?}");
         gsettings(&["set", GNOME_INTERFACE, ENABLE_ANIMATIONS, &was]);
+    }
+
+    /// The desktop's own portal answers the header's button layout
+    /// (`client_frame::ButtonLayout::desktop`'s read): GNOME's
+    /// `button-layout` set with `gsettings` reads back as the portal's string,
+    /// which lays the buttons out where it says, then put back. Run by name
+    /// in the Linux lane, beside the motion read (`--ignored`).
+    #[test]
+    #[ignore = "needs a session bus with xdg-desktop-portal and dconf: the Linux lane runs it"]
+    fn the_desktop_s_portal_answers_the_button_layout() {
+        use crate::client_frame::{ButtonLayout, LayoutButton, Side};
+        let gsettings = |args: &[&str]| {
+            let out = aterm_uds::spawnfd::command("gsettings")
+                .args(args)
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .output()
+                .expect("gsettings");
+            assert!(out.status.success(), "gsettings {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let was = gsettings(&["get", GNOME_WM_PREFERENCES, BUTTON_LAYOUT]);
+        for (value, left, right) in [
+            (
+                "close,minimize:maximize",
+                &[LayoutButton::Close, LayoutButton::Minimize][..],
+                &[LayoutButton::Maximize][..],
+            ),
+            ("appmenu:close", &[][..], &[LayoutButton::Close][..]),
+        ] {
+            gsettings(&["set", GNOME_WM_PREFERENCES, BUTTON_LAYOUT, value]);
+            // The backend hears dconf when it will: a hang detector.
+            let started = Instant::now();
+            let answer = loop {
+                let answer = read(GNOME_WM_PREFERENCES, BUTTON_LAYOUT, HANG);
+                if answer == Some(Value::Str(value.into())) || started.elapsed() > HANG {
+                    break answer;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let Some(Value::Str(answer)) = answer else {
+                panic!("button-layout {value}: the portal answered {answer:?}");
+            };
+            let layout = ButtonLayout::parse(&answer).expect("a layout");
+            assert_eq!(layout.on(Side::Left).collect::<Vec<_>>(), left, "{value}");
+            assert_eq!(layout.on(Side::Right).collect::<Vec<_>>(), right, "{value}");
+        }
+        gsettings(&["set", GNOME_WM_PREFERENCES, BUTTON_LAYOUT, &was]);
     }
 
     /// The desktop's own portal answers the appearance launch read

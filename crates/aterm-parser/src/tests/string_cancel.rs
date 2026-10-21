@@ -3,10 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! CAN (0x18) and SUB (0x1A) cancel a control string: an OSC, SOS, PM or APC
-//! string they interrupt ends undelivered, as xterm ends it (its string table
-//! sends both to the ground state without dispatching) and as a DCS here
-//! already ends (`dcs_unhook(canceled = true)`). A truncated OSC 52 clipboard
-//! write, OSC 8 link or title is never dispatched.
+//! string they interrupt ends undelivered, as in xterm and as a DCS ends here
+//! (`dcs_unhook(canceled = true)`), so no truncated OSC 52 write, OSC 8 link or
+//! title dispatches.
 
 use super::*;
 
@@ -83,9 +82,9 @@ fn a_terminated_osc_still_dispatches() {
     );
 }
 
-/// An APC (a kitty graphics command) interrupted by CAN or SUB is not ended
-/// as complete; an SOS or PM string, which has no consumer, is swallowed the
-/// same way. Negative control: ST still ends the APC.
+/// An APC (a kitty graphics command) that CAN or SUB interrupts ends canceled
+/// (`apc_end(true)`); an SOS or PM string, with no consumer, is swallowed.
+/// Negative control: ST still ends the APC as complete.
 #[test]
 fn can_and_sub_cancel_an_apc_string() {
     for cancel in [0x18u8, 0x1A] {

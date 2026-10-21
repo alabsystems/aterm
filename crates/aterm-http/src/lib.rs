@@ -31,8 +31,8 @@
 //!   [`Trust::PlatformVerifier`].
 //! * [`pem`] — the Linux/BSD CA-store parser the verifier reads.
 //! * [`proxy`] — `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, failing
-//!   closed on a setting it cannot use; a caller keeps a loopback endpoint off
-//!   every proxy with [`ProxyMode::Direct`].
+//!   closed on a setting it cannot use; [`ProxyMode::Direct`] keeps a loopback
+//!   endpoint off every proxy.
 //! * [`stream`] — TCP/TLS bytes, one global deadline, and the revocable
 //!   authority re-checked at every read and write.
 //! * [`client`] — request rendering and response parsing.

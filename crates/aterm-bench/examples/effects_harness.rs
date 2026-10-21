@@ -26,9 +26,13 @@
 //   typing   the shipped cursor glow (Rainbow Kitty) ticked at 120 Hz while 12 keys a second
 //            land at a shell prompt, then its run-out; a tick whose fingerprint did not move
 //            presents nothing, as in the app;
-//   scroll   inline streaming under a settled card: a line a frame scrolls the screen and the
-//            card with it (since lane B3 the settled frame replayed at its new origin: the
-//            same two fx contents, a new layer offset).
+//   scroll   inline streaming under a settled card: a reply's lines, each its own, a line a
+//            frame, scroll the screen and the card with it (since lane B3 the settled frame
+//            replayed at its new origin: the same two fx contents, a new layer offset).
+// Every card scene carries the card's line in the box's last row, as the app writes it under
+// a card (`claude_card::make_line`): its text, and its ink and its `✦` laid on the frame by
+// the host (`claude_card::ink_lines`), the ink re-made only where the line moved or the card
+// is not still.
 // and, reported but not gated, the other producers the B5 rule names, each a shorter typing run:
 //   bolt     the Laser style's lightning bolts;
 //   comet    the Comet style's slabs;
@@ -39,10 +43,11 @@
 //            a hot line wrapped over three rows, the frame the budget caps.
 //
 // Per frame, each on its own clock:
-//   emit     the producer: the card's replay or draw, or the glow's witness feed and tick;
+//   emit     the producer: the card's replay or draw and its line's ink, or the glow's
+//            witness feed and tick;
 //   splice   the host's put: the card's two fx layers (taken back by id, laid at its origin,
-//            clipped to the pane), or the glow's quads into the frame's streams, and the
-//            effect-damage refresh;
+//            clipped to the pane) and its line's ink and `✦`, or the glow's quads into the
+//            frame's streams, and the effect-damage refresh;
 //   raster   the CPU presenter: `Renderer::render_input_cached` on the frame;
 //   encode   the GPU presenter's present work up to its last commit
 //            (`WindowGpu::last_present_encode_ns`), with its `build` (instances and atlas) and
@@ -97,7 +102,7 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use aterm_core::render::{FxSlot, PxRect};
+use aterm_core::render::{DecoBlend, DecoGlyph, FxSlot, InkCell, PxRect, WordDecoration};
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::harness_card::{
@@ -159,6 +164,12 @@ const BOX_ROWS: u16 = 4;
 const BOX_COLS: u16 = 62;
 const TRAIL: (u16, u16) = (33, 41);
 const KITTY_COL: u16 = 41;
+/// The card's line, in the box's last row: its `✦` in the card's text column and its words
+/// two columns on (`claude_card::LINE_LEAD`), as the app writes it under the card.
+const LINE_ROW: u16 = 3;
+const LINE_STAR_COL: u16 = 12;
+const LINE_COL: u16 = LINE_STAR_COL + 2;
+const LINE_TEXT: &str = "Cruise: the kitty keeps watch while the reply streams";
 
 /// Where the card sits for the episode and settled scenes, and where a scroll launch starts it.
 const CARD_TOP: u16 = 2;
@@ -875,13 +886,74 @@ impl Rig {
 const CARD_ID: u64 = 1;
 
 /// The card's host: the app's replay-or-draw (`claude_card.rs`): the card's frames (its kept
-/// settled frame, the ring its episode frames are built in, its arts) and the frame the last
-/// emit made, which the splice lays as the card's two fx layers.
+/// settled frame, the ring its episode frames are built in, its arts), the frame the last
+/// emit made, which the splice lays as the card's two fx layers, and the card's line.
 #[derive(Default)]
 struct CardHost {
     card: HarnessCard,
     frames: CardFrames,
     frame: Option<CardFrame>,
+    line: LineHost,
+}
+
+/// The card's line on the glass (`claude_card::make_line` and `ink_lines`): its ink, re-made
+/// only where the line moved or the card is not still (the app keys the line by its row and
+/// keeps a still card's settled gradient), and its `✦`, which the splice lays on the frame in
+/// place of the last splice's.
+#[derive(Default)]
+struct LineHost {
+    row: Option<u16>,
+    settled: bool,
+    ink: Vec<InkCell>,
+    star: Option<WordDecoration>,
+}
+
+impl LineHost {
+    /// Make the line of the card at `scene` for this frame, as the app does in the card's pass.
+    fn make(&mut self, card: &HarnessCard, scene: &CardScene, now: Instant) {
+        let row = scene.top + LINE_ROW;
+        let still = card.is_still();
+        if self.row == Some(row) && self.settled && still {
+            return;
+        }
+        self.row = Some(row);
+        self.ink.clear();
+        card.line_ink_into(
+            (!still).then_some(now),
+            row,
+            LINE_COL,
+            LINE_TEXT.chars().count() as u16,
+            scene.ground,
+            true,
+            &mut self.ink,
+        );
+        self.settled = still;
+        // The `✦` leads the line in its first letter's ink: light added on dark, opaque ink on
+        // light.
+        let [r, g, b] = self.ink.first().map_or([0xFF; 3], |c| c.color);
+        self.star = Some(WordDecoration {
+            row,
+            col: LINE_STAR_COL,
+            dx: 0,
+            dy: 0,
+            glyph: DecoGlyph::Star4,
+            blend: if scene.dark {
+                DecoBlend::Add
+            } else {
+                DecoBlend::Over
+            },
+            color: u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+            alpha: u8::MAX,
+        });
+    }
+
+    /// Lay the line's ink and `✦` on the frame. The bench's frames carry no other producer's,
+    /// so the last splice's are taken back by clearing the two streams.
+    fn lay(&self, input: &mut RenderInput) {
+        input.ink.clone_from(&self.ink);
+        input.word_decorations.clear();
+        input.word_decorations.extend(self.star);
+    }
 }
 
 impl CardHost {
@@ -894,6 +966,7 @@ impl CardHost {
             None => (self.card.draw(now, scene, true, &mut self.frames), false),
         };
         self.frame = Some(frame);
+        self.line.make(&self.card, scene, now);
         (replayed, watch.stop())
     }
 
@@ -914,6 +987,7 @@ impl CardHost {
                 .fx_layers
                 .extend(frame.layers(CARD_ID, PxRect::new(x0, y0, x1, y1), grid));
         }
+        self.line.lay(input);
         input.refresh_cursor_effect_damage();
         elapsed_ns(started)
     }
@@ -1010,11 +1084,12 @@ fn cup(row: u16, col: u16) -> String {
 }
 
 /// The card's three rows from `top`, with a blank row over and two under (the line's row in the
-/// box, then the air).
+/// box, its words as the app writes them there, then the air).
 fn print_card(term: &mut Terminal, top: u16) {
     for (i, line) in CARD.iter().enumerate() {
         term.process(format!("{}{line}", cup(top + i as u16, 0)).as_bytes());
     }
+    term.process(format!("{}{LINE_TEXT}", cup(top + LINE_ROW, LINE_COL)).as_bytes());
 }
 
 /// Whether grid row `row` of `term` shows the card's banner.
@@ -1198,8 +1273,12 @@ fn scroll_scene(rig: &mut Rig) -> Run {
         let _ = host.splice(&scene, rig.grid(), &mut input);
         let _ = rig.present(&mut win, &input, Spent::default(), 0);
         let mut top = SCROLL_TOP;
+        let mut line = 0usize;
         while top > 1 {
-            term.process(format!("{STREAMED}\r\n").as_bytes());
+            // A reply's lines are each their own: a screen of one line repeated would diff
+            // row for row against itself, a frame no stream makes.
+            line += 1;
+            term.process(format!("{STREAMED} {line}\r\n").as_bytes());
             top -= 1;
             Rig::extract(&mut term, &mut input);
             if !banner_at(&term, top, &mut row) {

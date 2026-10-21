@@ -315,30 +315,34 @@ pub(crate) enum Asked {
     Failed,
 }
 
-/// A kernel answer of unknown size read by `ask`: `ask(Some(buf))` fills
-/// `buf`, `ask(None)` names the size the answer needs now. First into
-/// `first` bytes; where that is too small, into what the kernel then asks
-/// for and a quarter more (the answer can grow between the two asks), at
-/// least twice the last size, three tries at most and never past `cap`.
-/// `None` on any other failure. The buffer is made per call (see
-/// [`crate::net_links`]). PURE but for `ask`.
+/// A kernel answer of unknown size read by `ask` into `buf`, the caller's
+/// scratch: `ask(Some(buf))` fills `buf`, `ask(None)` names the size the
+/// answer needs now. First into the whole of `buf`, made at least `first`
+/// bytes (a scratch an earlier read grew is offered whole, up to `cap`);
+/// where that is too small, into what the kernel then asks for and a
+/// quarter more (the answer can grow between the two asks), at least twice
+/// the last size, three tries at most and never past `cap`. The answer is
+/// `buf[..n]` for the `n` returned, and `buf` keeps the size it was last
+/// offered at, so a caller that keeps it reads again without allocating
+/// (see [`crate::net_links_into`]). `None` on any other failure. PURE but
+/// for `ask`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn read_growing(
     first: usize,
     cap: usize,
+    buf: &mut Vec<u8>,
     mut ask: impl FnMut(Option<&mut [u8]>) -> Asked,
-) -> Option<Vec<u8>> {
+) -> Option<usize> {
     if first > cap {
         return None;
     }
-    let mut size = first;
+    let mut size = buf.len().clamp(first, cap);
     for _ in 0..3 {
-        let mut buf = vec![0u8; size];
-        match ask(Some(&mut buf)) {
-            Asked::Bytes(n) => {
-                buf.truncate(n);
-                return Some(buf);
-            }
+        if buf.len() < size {
+            buf.resize(size, 0);
+        }
+        match ask(Some(&mut buf[..size])) {
+            Asked::Bytes(n) => return Some(n.min(size)),
             Asked::TooSmall => {}
             Asked::Failed => return None,
         }
@@ -718,13 +722,16 @@ mod tests {
     #[test]
     fn the_interface_lists_buffer_grows_to_what_the_kernel_asks_for() {
         assert_eq!(
-            read_growing(65, 64, |_| panic!(
+            read_growing(65, 64, &mut Vec::new(), |_| panic!(
                 "an oversized first buffer is never asked"
             )),
             None,
             "the initial buffer obeys the cap too"
         );
-        let read = |k: &mut Kernel, cap| read_growing(64, cap, |b| k.ask(b));
+        let read = |k: &mut Kernel, cap| {
+            let mut buf = Vec::new();
+            read_growing(64, cap, &mut buf, |b| k.ask(b)).map(|n| buf[..n].to_vec())
+        };
 
         let mut fits = Kernel::new(40, 0);
         assert_eq!(read(&mut fits, 1024).as_deref(), Some(&fits.answer[..]));
@@ -758,11 +765,49 @@ mod tests {
         assert_eq!(read(&mut huge, 1024), None, "past the cap");
         assert_eq!(huge.asks, [Some(64), None], "nothing past the cap is made");
 
-        assert_eq!(read_growing(64, 1024, |_| Asked::Failed), None);
-        let size_fails = read_growing(64, 1024, |b| match b {
+        assert_eq!(
+            read_growing(64, 1024, &mut Vec::new(), |_| Asked::Failed),
+            None
+        );
+        let size_fails = read_growing(64, 1024, &mut Vec::new(), |b| match b {
             Some(_) => Asked::TooSmall,
             None => Asked::Failed,
         });
         assert_eq!(size_fails, None);
+    }
+
+    /// A scratch the caller keeps is offered whole: the read after one that
+    /// grew it asks no size and allocates nothing, and the answer is what
+    /// the kernel wrote, inside a scratch that keeps the size it was
+    /// offered at. A scratch longer than the cap is offered the cap.
+    #[test]
+    fn a_kept_scratch_is_offered_whole_and_read_again_in_place() {
+        let mut scratch = Vec::new();
+        let mut first = Kernel::new(200, 0);
+        let n = read_growing(64, 1024, &mut scratch, |b| first.ask(b));
+        assert_eq!(n, Some(200));
+        assert_eq!(first.asks, [Some(64), None, Some(250)]);
+        assert_eq!(&scratch[..200], &first.answer[..]);
+        assert_eq!(scratch.len(), 250, "the scratch keeps the size it grew to");
+
+        let at = scratch.as_ptr();
+        let mut again = Kernel::new(120, 0);
+        let n = read_growing(64, 1024, &mut scratch, |b| again.ask(b));
+        assert_eq!(n, Some(120));
+        assert_eq!(again.asks, [Some(250)], "offered whole, no size asked");
+        assert_eq!(&scratch[..120], &again.answer[..]);
+        assert_eq!(
+            (scratch.as_ptr(), scratch.len()),
+            (at, 250),
+            "read in place"
+        );
+
+        let mut long = vec![0u8; 2048];
+        let mut capped = Kernel::new(40, 0);
+        assert_eq!(
+            read_growing(64, 1024, &mut long, |b| capped.ask(b)),
+            Some(40)
+        );
+        assert_eq!(capped.asks, [Some(1024)], "never past the cap");
     }
 }

@@ -1,45 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SELF-UPDATE INTERCEPT at the REAL process edge (`atpkg::selfupdate`):
-//! the dev `atpkg` binary driven as `__selfupdate claude <prefix> -- <args…>`, the way
-//! the `agents/claude` twin execs it, over a temp prefix with a fake `bin/claude` that
-//! echoes its argv and exits 7.
+//! Process-edge tests for `atpkg __selfupdate claude <prefix> -- <args…>`
+//! (`atpkg::selfupdate`) over a temporary prefix and local `dir:` registry.
 //!
-//! What is pinned here and nowhere else: the CHILD — the standard `update claude
-//! --wait-lock 1800` this verb spawns through the real dispatch edge — and the verb's
-//! relay of its status. A store lock held by THIS process (a `Layout` over the temp
-//! prefix, exactly what a sibling process presents to `flock`) for the first seconds of
-//! the run makes the child WAIT — the default wait, thirty minutes, the window's own
-//! bound, with no environment knob to shorten it — and, on STDOUT, print the
-//! `--wait-lock` lane's two markers a typed `aterm pkg update` never prints
-//! (`lock-waiting:` after the 2 s grace, `lock-acquired:` when the holder lets go: the
-//! child IS a `--wait-lock` caller, so a person's terminal sees them); then, the holder
-//! gone, the child runs its verb — claude's vendor-direct lane, which a `dir:` registry
-//! cannot reach — and fails on its own line, so the verb answers with the incomplete
-//! line, exit 1 — never 75 while a pass is merely busy. The 75 ending itself (the whole
-//! bound elapsing) is not drivable here without a knob, and there is none: the binary's
-//! 75 is pinned by `tests/store_lock_wait.rs` (`a_waiting_seed_times_out_with_exit_75`,
-//! at a short `--wait-lock`), and the verb's relay of it in-process by `cli.rs`'s own
-//! test, where `selfupdate_check` takes the child and the bound as parameters. The
-//! other endings driven here — help, an unrostered program, the prefix cross-check, the
-//! tool-name gate and a `bin/` shim that cannot be exec'd (126) — check the exec and the
-//! exit code are the binary's, not the plan's; a declined shape's refusal is driven on
-//! the binary by `tests/run_is_the_managed_name.rs`.
-//!
-//! WHAT CANNOT BE DRIVEN HERE: an up-to-date child (`atpkg: claude already current
-//! (build N)`, exit 0). The binary verifies a `dir:` registry under the COMMITTED paper
-//! master (`atpkg::PKG_TRUST_ANCHORS`, `Anchor::pinned`), whose secret half is on paper
-//! and on no computer; the crate's registry fixtures sign with `sig::testkit`'s synthetic
-//! master, which only an in-process `Anchor::of` accepts, and there is deliberately no
-//! environment seam to swap the anchor (`cli.rs` asserts `ATPKG_ROOTKEY_OVERRIDE` is
-//! gone). So the exit-0 arm is pinned as a literal arm by the registry scan in `lock.rs`
-//! and reached live only against the real index.
-//!
-//! NEVER THE REAL STORE. The child's HOME is a temp directory and its XDG_CONFIG_HOME an
-//! absent one, so `store::resolve_configured` lands on the DEFAULT prefix under that
-//! temp HOME — the very prefix the twin operand names, so the cross-check agrees — and
-//! the registry is a local directory (no network).
+//! Covers the `update claude --wait-lock 1800` child under a contended store
+//! lock (`lock-waiting:` and `lock-acquired:` markers, followed by the
+//! incomplete-check fallback when the registry is unreachable), `--help`
+//! forwarding and re-entry through `bin/claude`, unrostered tools, prefix
+//! mismatch refusal, tool-name validation, and non-executable shims (exit 126).
 
 #![cfg(unix)]
 
@@ -322,19 +291,9 @@ fn wait_markers(stdout: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// THE DEFAULT WAIT REALLY WAITS (no environment knob — the bound is
-/// the window's own thirty minutes, `selfupdate::WAIT_LOCK_SECS`): the store lock held
-/// here for the first seconds of the run, and the child — the standard `update claude
-/// --wait-lock 1800` — does not exit 75 while a pass is merely busy. It announces the
-/// wait on STDOUT once the 2 s grace has passed (`lock-waiting:`, naming THIS fixture's
-/// lock and the 1800 s bound), stands there until the holder lets go, answers
-/// `lock-acquired:`, and only then runs its verb — claude's vendor-direct lane, which the
-/// fixture's `dir:` registry cannot reach, so it fails on its own line — and the verb
-/// answers with the incomplete line and exit 1, the announce line FIRST on stderr, the
-/// active build named as the one that stays, nothing of the vendor's on stdout. Exactly
-/// those two markers and no `seed-busy:` — that is the terminal of a wait that ran OUT,
-/// pinned in-process by `cli.rs`'s test with a one-second bound, since no knob exists
-/// to shorten this one (and none may).
+/// When the store lock is held at start, the `update claude --wait-lock 1800`
+/// child prints `lock-waiting:` on stdout after the 2 s grace, waits until the
+/// lock is released, prints `lock-acquired:`, and then runs the check.
 #[test]
 fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {

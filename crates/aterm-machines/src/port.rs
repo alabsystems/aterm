@@ -637,6 +637,15 @@ pub trait System: Sync {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
+    /// Resolve a local filesystem target, including app-bundle aliases. Test
+    /// backends may leave this unsupported and compare their injected paths.
+    ///
+    /// # Errors
+    /// The path cannot be resolved or this backend cannot inspect the filesystem.
+    fn canonicalize(&self, _path: &Path) -> io::Result<PathBuf> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Write everything `from` yields to `path` atomically with `mode`, like
     /// [`System::write_file`], without holding it all in memory (an artifact runs to
     /// hundreds of megabytes). Returns the byte count.
@@ -956,6 +965,9 @@ impl Default for Live {
 }
 
 impl System for Live {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(path)
+    }
     fn natural_scrolling(&self) -> Result<bool, String> {
         scroll_direction::get()
     }

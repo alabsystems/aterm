@@ -417,10 +417,7 @@ impl<T, const N: usize> Extend<T> for SmallVec<T, N> {
 /// The representation is private, as upstream `smallvec`'s is. `next`,
 /// `next_back` and `Drop` read `buf[start..end]` as initialized, so safe code
 /// that could name the fields could forge an iterator over an uninitialized
-/// buffer or rewind the cursor and move one element out twice. A `pub enum`'s
-/// variant fields are as public as the enum, which is how this type used to
-/// leak that invariant (ruling 2026-10-10: opaque struct, private enum; the
-/// public API is unchanged, since no caller named a variant). Neither form
+/// buffer or rewind the cursor and move one element out twice. Neither form
 /// compiles:
 ///
 /// ```compile_fail,E0223
@@ -555,9 +552,9 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
             // SAFETY: the elements `s..bound` were initialized and have not
             // been yielded, and this `Drop` runs once, so nothing reads or
             // drops them again. A panicking destructor still lets the rest
-            // drop, as the heap arm's `vec::IntoIter` does (ruling
-            // 2026-10-10: upstream smallvec's `for _ in self {}` leaks the
-            // rest; whether the vec had spilled must not change that).
+            // drop, as the heap arm's `vec::IntoIter` does (upstream
+            // smallvec's `for _ in self {}` leaks the rest; whether the vec
+            // had spilled must not change that).
             unsafe { crate::drop_initialized(&mut buf[s..bound]) }
         }
         // Heap variant: `alloc::vec::IntoIter` drops its own remaining elements.

@@ -20,17 +20,14 @@ mod icon;
 mod input;
 pub mod keys;
 pub(crate) mod memory;
-mod mouse;
 mod randr;
 mod window_property;
 mod wm;
 mod xmodmap;
 
-pub use self::cursor::*;
 pub use self::geometry::*;
 pub use self::hint::*;
 pub use self::input::*;
-pub use self::mouse::*;
 pub use self::window_property::*;
 pub use self::wm::*;
 pub use self::xmodmap::ModifierKeymap;

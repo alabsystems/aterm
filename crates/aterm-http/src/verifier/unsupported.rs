@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Targets with no operating-system trust store: construction fails.
+//! Targets with no operating-system trust store (wasm32, Android, anything that
+//! is neither Windows nor a non-Android Unix): construction fails.
 //!
-//! wasm32, Android, and anything that is neither Windows nor a non-Android
-//! Unix. aterm builds for none of them, so this arm never runs — but it is the
-//! arm that keeps the `#[cfg]` set total, and what it does when it does not
-//! exist matters.
-//!
-//! Falling back to a root set BUNDLED into the binary (as
-//! `rustls-platform-verifier`'s wasm32 arm does) would contradict the trust
-//! model [`crate::tls`] documents, so this arm refuses to produce a verifier.
-//!
-//! Failing in the CONSTRUCTOR rather than in `verify` is deliberate: a caller on
-//! such a target finds out when it builds its `ClientConfig`, not part-way
-//! through a handshake.
+//! aterm builds for none of them; this arm keeps the `#[cfg]` set total. It
+//! refuses rather than fall back to a bundled root set (as
+//! `rustls-platform-verifier`'s wasm32 arm does), and in the constructor, so a
+//! caller finds out when it builds its `ClientConfig`, not mid-handshake.
 
 use std::sync::Arc;
 
@@ -46,9 +39,7 @@ impl Verifier {
         _ocsp_response: Option<&[u8]>,
         _now: UnixTime,
     ) -> Result<(), rustls::Error> {
-        // Unreachable today, because `new` never yields a value. Written as a
-        // rejection anyway so that a future change which DID make this type
-        // constructible would still fail closed.
+        // Unreachable (`new` never yields a value), but fails closed regardless.
         Err(rustls::Error::General(
             "no certificate verification is available on this target".to_owned(),
         ))

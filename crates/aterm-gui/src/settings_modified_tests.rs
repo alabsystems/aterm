@@ -82,7 +82,7 @@ impl Lab {
             )
             .unwrap();
         outcome.effects.iter().find_map(|effect| match effect {
-            AppEffect::ConfigPatch { patch, reply } => Some((patch.clone(), reply.operation)),
+            AppEffect::ConfigPatch { patch, reply, .. } => Some((patch.clone(), reply.operation)),
             _ => None,
         })
     }
@@ -105,7 +105,7 @@ impl Lab {
 
     /// Carry `patch` through the real service, as the host does: the
     /// result, then the new snapshot.
-    fn carry(&mut self, patch: ConfigPatch, operation: OperationId) -> ConfigPatch {
+    pub(super) fn carry(&mut self, patch: ConfigPatch, operation: OperationId) -> ConfigPatch {
         let (snapshot, undo) = apply_real_config_patch(&mut self.service, &patch);
         self.runtime
             .dispatch(
@@ -137,7 +137,9 @@ impl Lab {
             .effects
             .iter()
             .find_map(|effect| match effect {
-                AppEffect::ConfigPatch { patch, reply } => Some((patch.clone(), reply.operation)),
+                AppEffect::ConfigPatch { patch, reply, .. } => {
+                    Some((patch.clone(), reply.operation))
+                }
                 _ => None,
             })
             .expect("the event writes aterm.toml");
@@ -192,7 +194,10 @@ impl Lab {
             .dispatch(self.instance, self.view, event)
             .unwrap();
         let (token, operation) = outcome.effects.iter().find_map(|effect| match effect {
-            AppEffect::ConfigUndo { token, reply } => Some((*token, reply.operation)),
+            AppEffect::ConfigUndo {
+                target: crate::native_app::UndoTarget::Token(token),
+                reply,
+            } => Some((*token, reply.operation)),
             _ => None,
         })?;
         let result = self

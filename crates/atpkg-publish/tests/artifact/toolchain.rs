@@ -1,10 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The pack's toolchain: an explicit bin dir wins and is refused rather than set aside when it is wrong; the store's `current`
-//! resolves to its PHYSICAL build dir, which a later flip cannot move; no store is a
-//! refusal naming the product's fix first; the lease is taken once on the physical build;
-//! and the compiler is admitted by the client's own checker before anything is built.
+//! The pack's toolchain: an explicit bin dir wins, and a wrong one is refused rather than set
+//! aside; the store's `current` resolves to its physical build dir, which a later flip cannot
+//! move; no store is a refusal naming the product's fix first; the lease is taken once on the
+//! physical build; the client's own checker admits the compiler before anything is built.
 
 use std::path::Path;
 use std::sync::Arc;

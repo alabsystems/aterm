@@ -31,12 +31,12 @@
 //! input pipe as the win32 key-record pair `CSI 13;28;Uc;Kd;Cs;1 _` conhost
 //! asked for — UnicodeChar CR for Shift+Enter and LF whenever Ctrl is held,
 //! the chars a physical chord carries under Windows Terminal — because legacy
-//! VT has no byte for those chords and conhost read the legacy Shift+Enter LF
-//! as Ctrl+Enter (measured 2026-09-22). The record outranks a kitty push the
+//! VT has no byte for those chords and conhost reads the legacy Shift+Enter LF
+//! as Ctrl+Enter. The record outranks a kitty push the
 //! application made through conhost, which drops a CSI u written back. The
 //! keys whose legacy bytes conhost holds once its parser has switched (a lone or
 //! dangling ESC: Escape, Ctrl+[, Alt+[, Alt+O, Alt+Backspace ...) and Ctrl+H
-//! (whose bare BS conhost reads as Ctrl+Backspace, measured 2026-10-16) go out as
+//! (whose bare BS conhost reads as Ctrl+Backspace) go out as
 //! records too; `KeyboardMode::WIN32_INPUT` lists them. Every other key still
 //! flows as plain xterm VT input; conhost accepts the mixed stream. (3) conhost
 //! issues DSR/CPR queries; the existing reader-thread `take_response()` reply path
@@ -200,6 +200,9 @@ struct WinSession {
     /// Set by [`release_input_writes`]: the session's input is severed, every
     /// input write in flight was cancelled, and every later one writes nothing.
     input_severed: AtomicBool,
+    /// The input `WriteFile` calls begun on the session ([`input_writes_for_test`]).
+    #[cfg(any(test, debug_assertions))]
+    input_writes: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for WinSession {
@@ -236,6 +239,25 @@ static SESSIONS: LazyLock<Mutex<HashMap<i32, Arc<WinSession>>>> =
 /// Keys start positive (the gui asserts `master >= 0`) and are never reused.
 static NEXT_KEY: AtomicI32 = AtomicI32::new(0x4000_0000);
 
+#[cfg(test)]
+thread_local! {
+    /// How many sessions [`register`] put in [`SESSIONS`] from this thread.
+    /// The registry's length is shared by every test of the binary, which
+    /// register in parallel, so "this call registered nothing" is asked of
+    /// this count: [`spawn_shell`] and [`adopt_handoff`] register on the
+    /// thread that called them.
+    static REGISTERED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Put `session` in the registry under a new key, and return the key.
+fn register(session: &Arc<WinSession>) -> i32 {
+    let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+    SESSIONS.lock_or_recover().insert(key, Arc::clone(session));
+    #[cfg(test)]
+    REGISTERED_HERE.with(|n| n.set(n.get() + 1));
+    key
+}
+
 /// Clone the session for `master` out under a brief map lock (`None` for a
 /// fabricated/closed key — every caller maps that to the documented
 /// error/no-op registry-miss semantics).
@@ -243,35 +265,24 @@ fn session(master: i32) -> Option<Arc<WinSession>> {
     SESSIONS.lock_or_recover().get(&master).cloned()
 }
 
-/// Find THE session whose child has this pid (linear scan — session counts are
+/// Find the session whose child has this pid (linear scan — session counts are
 /// tiny). `None` when no session matches **or when more than one does**.
 ///
-/// AMBIGUITY IS REFUSED, deliberately. The pid-keyed public ops ([`hangup`],
+/// Ambiguity is refused deliberately. The pid-keyed public ops ([`hangup`],
 /// [`reap`], [`exit_code`]) carry the Unix `killpg`/`waitpid` signatures, so a
-/// pid is all they get — but a pid is NOT a guaranteed unique key over this
+/// pid is all they get — but a pid is not a guaranteed unique key over this
 /// registry:
 ///
-/// * A session we SPAWNED pins its pid: the entry holds an open process handle,
-///   so the number cannot be recycled while the entry lives. Those never
-///   collide with each other.
-/// * An ADOPTED session ([`adopt_handoff`]) takes whatever client conhost hands
-///   it, and the SAME client can be handed off more than once. A console
-///   program that calls `FreeConsole` and then `AllocConsole` (or is
-///   re-`AttachConsole`d) gets a fresh pseudoconsole and a fresh handoff under
-///   its ORIGINAL pid, while the previous entry is still registered — that one
-///   is removed only when the frontend's EOF path reaches [`close_master`],
-///   which is asynchronous. Two live entries, one pid.
+/// * A session we spawned pins its pid: the entry holds an open process handle,
+///   so the number cannot be recycled while the entry lives.
+/// * An adopted session ([`adopt_handoff`]) takes whatever client conhost hands
+///   it, and the same client can be handed off more than once (`FreeConsole`
+///   then `AllocConsole` or `AttachConsole`) under its original pid while the
+///   previous entry is still registered awaiting asynchronous [`close_master`].
 ///
-/// A first-match scan resolved that window to an ARBITRARY entry (`HashMap`
-/// iteration order, which Rust randomizes per process), so closing one tab
-/// could hang up or reap the OTHER console. For an adopted session that console
-/// is somebody else's program — an installer mid-write is the case this whole
-/// lane is built to protect — so acting on the wrong one is the worst outcome
-/// available. Refusing lands instead on the miss semantics every caller already
-/// documents (`hangup`/`reap` no-op, `exit_code` → `None`): doing nothing to a
-/// console we cannot uniquely identify beats doing something to the wrong one,
-/// and the tab still tears down through its reader EOF / `close_master` path,
-/// which is master-keyed and never ambiguous.
+/// Refusing an ambiguous pid lands on the miss semantics every caller documents
+/// (`hangup`/`reap` no-op, `exit_code` → `None`), while the tab still tears down
+/// through its master-keyed reader EOF / `close_master` path.
 ///
 /// `pid <= 1` is refused for the same reason: an adopted session whose process
 /// handle carried no query rights records pid 0 (see [`adopt_handoff`]), and
@@ -355,10 +366,9 @@ fn conhost_children() -> Vec<u32> {
 /// be strictly worse than the console going away under it.
 ///
 /// OpenConsole sessions take the same branch — winconpty's own
-/// `ClosePseudoConsole` is exactly these handle closes — plus the `\Reference`
-/// handle after the signal pipe. The 2026-09-29 snapshot recorded (measured
-/// 2026-09-28) that the close does not block, the shell exits `0xC000013A`
-/// within 2 ms, and the host and the shell are gone within 10 ms, so the
+/// `ClosePseudoConsole` is these handle closes — plus the `\Reference` handle
+/// after the signal pipe. The close does not block, the shell exits
+/// `0xC000013A` within 2 ms, and the host and shell exit within 10 ms, so the
 /// reader's EOF follows as it does for conhost.
 fn close_pseudoconsole(s: &WinSession) {
     let hpc = std::mem::replace(&mut *s.hpc.lock_or_recover(), 0);
@@ -504,6 +514,10 @@ impl AttrList {
     }
 }
 
+/// Each pipe's buffer, which is also its quota: the most it holds before a
+/// write to it waits for the reader ([`Pipes`], [`INPUT_WRITE_MAX`]).
+const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+
 /// The four ends of a pseudoconsole's two pipes. The HOST reads `in_read` and
 /// writes `out_write` (it gets duplicates of both, and ours are closed once it
 /// has them); the session keeps `in_write` (keystrokes in) and `out_read` (VT
@@ -521,7 +535,6 @@ struct Pipes {
 
 impl Pipes {
     fn new() -> io::Result<Self> {
-        const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
         let pipe = || -> io::Result<(ffi::Handle, ffi::Handle)> {
             let (mut read, mut write): (isize, isize) = (0, 0);
             // SAFETY: valid out-params, NULL security attributes.
@@ -983,15 +996,10 @@ fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<S
     // duplication, so the child's console init binds its stdio to the fresh
     // pseudoconsole in every launch environment.
     si.StartupInfo.dwFlags = ffi::STARTF_USESTDHANDLES;
-    // CTRL+C INHERITANCE — LOAD-BEARING (audit 2026-09-22, reproduced): an
-    // aterm launched by a harness that used CREATE_NEW_PROCESS_GROUP had Ctrl+C
-    // dead in EVERY tab (0x03 reached the shell as text; a running loop never
-    // stopped), while Explorer/shell-launched instances were fine. That flag
-    // sets the launched process's "ignore CTRL+C" state, Windows copies that
-    // state into each child at CreateProcess, and the ConPTY child inherits it
-    // from US — so the shell in the new tab starts deaf to Ctrl+C no matter
-    // what the terminal writes. Restore normal processing before every spawn so
-    // the child's state is the same regardless of who launched aterm.
+    // A parent launched with CREATE_NEW_PROCESS_GROUP sets the "ignore CTRL+C"
+    // attribute, which Windows copies into each child at CreateProcess. Restore
+    // normal processing before every spawn so the child shell is not deaf to
+    // Ctrl+C regardless of who launched aterm.
     restore_ctrl_c_processing();
     // SAFETY: PROCESS_INFORMATION is POD out-memory.
     let mut pi: ffi::PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1163,9 +1171,10 @@ fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<S
             ResizeGuard::new(Some((size.y, size.x)), host)
         },
         input_severed: AtomicBool::new(false),
+        #[cfg(any(test, debug_assertions))]
+        input_writes: std::sync::atomic::AtomicU64::new(0),
     });
-    let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-    SESSIONS.lock_or_recover().insert(key, Arc::clone(&session));
+    let key = register(&session);
     let waiter_session = Arc::clone(&session);
     let spawned = std::thread::Builder::new()
         .name("aterm-pty-waiter".into())
@@ -1328,9 +1337,10 @@ pub fn adopt_handoff(
         // to what, so the first resize counts as a change.
         resize_guard: ResizeGuard::new(None, ConsoleHostKind::Inbox),
         input_severed: AtomicBool::new(false),
+        #[cfg(any(test, debug_assertions))]
+        input_writes: std::sync::atomic::AtomicU64::new(0),
     });
-    let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-    SESSIONS.lock_or_recover().insert(key, Arc::clone(&session));
+    let key = register(&session);
     let waiter_session = Arc::clone(&session);
     let spawned = std::thread::Builder::new()
         .name("aterm-pty-waiter".into())
@@ -1483,10 +1493,9 @@ pub fn exit_code(pid: i32) -> Option<i32> {
     code.map(|c| c as i32)
 }
 
-/// The Unix start-time reader's twin (2026-09-26, backlog item 5). Windows
-/// needs none: every pid-addressed teardown here resolves the pid through
-/// THIS process's own session registry ([`session_by_pid`]), which holds the
-/// process handle — and a held handle keeps the kernel from reissuing the pid.
+/// The Unix start-time reader's twin. Windows needs none: every pid-addressed
+/// teardown resolves the pid through this process's own session registry
+/// ([`session_by_pid`]), which holds the process handle and prevents pid reuse.
 #[must_use]
 pub fn process_birth(_pid: i32) -> Option<u64> {
     None
@@ -1669,8 +1678,7 @@ pub enum ReadOutcome {
 
 /// Windows has no orphaned-different-pgroup reader-pin problem (ConPTY teardown flows
 /// through `ClosePseudoConsole`, which breaks the output pipe and EOFs the reader), so
-/// there is no wake pipe: return `None` and let the reader use a plain blocking read —
-/// exactly the pre-MEM-L2 behavior, no regression.
+/// there is no wake pipe: return `None` and let the reader use a plain blocking read.
 pub fn make_wake_pipe() -> Option<(i32, i32)> {
     None
 }
@@ -1896,8 +1904,9 @@ fn guarded_write(s: &WinSession, bytes: &[u8], stop: Option<&AtomicBool>) -> io:
     )
 }
 
-/// Write `bytes` with a single `WriteFile`, returning the count the kernel
-/// ACCEPTED (the true count the routing-fabric `SinkWriter` is built on).
+/// Write `bytes` with a single `WriteFile` of at most the input pipe's 64 KiB
+/// ([`INPUT_WRITE_MAX`]), returning the count the kernel ACCEPTED (the true
+/// count the routing-fabric `SinkWriter` is built on).
 /// Blocking — identical to the sink's documented Phase-0 posture. The first
 /// writes after a resize also carry the [`resize_guard`] record, which the
 /// count leaves out: it reports the CALLER's bytes.
@@ -1914,8 +1923,9 @@ pub fn write_some(master: i32, bytes: &[u8]) -> io::Result<usize> {
 /// begins bars it, and one set while it is blocked in `WriteFile`
 /// ([`release_stopped_writes`]) cancels it. Either way it answers what it
 /// wrote, `Ok(0)` when nothing (a cancelled `WriteFile` reports nothing
-/// written). A sever of the session ([`release_input_writes`]) does the same
-/// to every write, with or without a flag.
+/// written, and wrote nothing: [`INPUT_WRITE_MAX`]). A sever of the session
+/// ([`release_input_writes`]) does the same to every write, with or without a
+/// flag.
 ///
 /// # Errors
 /// Exactly those of [`write_some`].
@@ -2054,10 +2064,28 @@ pub fn release_stopped_writes(stop: &AtomicBool) {
     release_soon(WRITERS.stopped(stop));
 }
 
-/// One `WriteFile` of `bytes` to the session's input pipe: the count the
-/// kernel accepted, or the OS error. Made through [`WRITERS`], so a sever or
-/// `stop` releases it ([`write_some_stoppable`]); a released write answers the
-/// count `WriteFile` gave back.
+/// The most one input `WriteFile` hands the pipe: its quota. A write no larger
+/// is taken whole or not at all. The pipe completes a pending write once its
+/// rest fits, and the reader reaches it only after everything queued ahead,
+/// so no byte of one still pending has been read, and a cancelled one
+/// ([`input_release`]) wrote nothing, which is what `WriteFile` reports. A
+/// larger write is read while it is pending (the console host's input thread
+/// reads 4 KiB at a time), and a cancel of it withdraws only the unread rest,
+/// yet `WriteFile` still reports nothing written (`ERROR_OPERATION_ABORTED`,
+/// 0 bytes; measured on Windows 11 on arm64, 2026-10-21): the caller's count
+/// would leave out what the program got. A write handed more answers the
+/// shorter count, as a pipe or tty write may, and the caller writes the rest.
+/// The [`resize_guard`] cuts every input write here, its record included, and
+/// between characters when it rewrites them as records (an emoji is 72 bytes
+/// of records, so a 4 KiB paste slice of them is a 72 KiB wire): a record
+/// write, too, is one `WriteFile`, and a released one took no character.
+const INPUT_WRITE_MAX: usize = PIPE_BUFFER_BYTES as usize;
+
+/// One `WriteFile` of `bytes`, at most [`INPUT_WRITE_MAX`] of them, to the
+/// session's input pipe: the count the kernel accepted, or the OS error. Made
+/// through [`WRITERS`], so a sever or `stop` releases it
+/// ([`write_some_stoppable`]); a released write answers the count `WriteFile`
+/// gave back, which is exact for a write that size.
 fn write_input(s: &WinSession, bytes: &[u8], stop: Option<&AtomicBool>) -> io::Result<usize> {
     WRITERS.write(
         session_tag(s),
@@ -2065,8 +2093,10 @@ fn write_input(s: &WinSession, bytes: &[u8], stop: Option<&AtomicBool>) -> io::R
         stop,
         this_writer(),
         || {
+            #[cfg(any(test, debug_assertions))]
+            s.input_writes.fetch_add(1, Ordering::AcqRel);
             let mut written: u32 = 0;
-            let want = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            let want = u32::try_from(bytes.len().min(INPUT_WRITE_MAX)).unwrap_or(PIPE_BUFFER_BYTES);
             // SAFETY: `bytes` is a valid slice of >= `want` bytes; the input handle
             // stays open for the call because the caller holds the session Arc.
             let ok = unsafe {
@@ -2088,6 +2118,44 @@ fn write_input(s: &WinSession, bytes: &[u8], stop: Option<&AtomicBool>) -> io::R
             Ok(written as usize)
         },
     )
+}
+
+/// Test-only: the bytes of the program's output waiting in the session's
+/// output pipe for the terminal to read (`PeekNamedPipe`); `None` for an
+/// unknown key or a failed peek. At the pipe's 64 KiB the console host's next
+/// output write blocks, and with it the host's reading of input. Only while
+/// nothing reads the output: the pipe end is a synchronous handle, so the peek
+/// waits behind a pending read of it.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn output_waiting_for_test(master: i32) -> Option<u32> {
+    let s = session(master)?;
+    let mut avail: u32 = 0;
+    // SAFETY: a peek of the session's own live output pipe end (the Arc keeps
+    // it open) that reads no bytes, as `drain_available` peeks.
+    let peeked = unsafe {
+        ffi::PeekNamedPipe(
+            s.output,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut avail,
+            std::ptr::null_mut(),
+        )
+    };
+    (peeked != 0).then_some(avail)
+}
+
+/// Test-only: how many input `WriteFile` calls the session has begun, counted
+/// as each begins (a write a stop or sever barred makes none); `None` for an
+/// unknown key. With the writer's thread waiting on I/O
+/// (`GetThreadIOPendingFlag`), a count that moved says which write is the
+/// blocked one. (The input pipe's own queues cannot say it: the end is a
+/// synchronous handle, so a query of it waits behind the blocked write.)
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn input_writes_for_test(master: i32) -> Option<u64> {
+    session(master).map(|s| s.input_writes.load(Ordering::Acquire))
 }
 
 /// [`write_some`] twin of the Unix blocking-emulation wrapper. A ConPTY input
@@ -2168,15 +2236,14 @@ pub fn resize(master: i32, rows: u16, cols: u16) {
     resize_with_cell_px(master, rows, cols, None);
 }
 
-/// Whether `master` is a LIVE ConPTY session — one this process spawned
+/// Whether `master` is a live ConPTY session — one this process spawned
 /// through `CreatePseudoConsole` or adopted through the DefTerm handoff. Both
 /// are conhost-backed, and conhost repaints the whole viewport after every
-/// `ResizePseudoConsole` (row-0-anchored, from its own buffer — measured
-/// 2026-09-22, see `aterm_grid::grid::reflow::ResizePolicy`), so the frontend
-/// picks its resize seam policy from THIS answer rather than from
-/// `cfg(windows)`: a stub or replay session on Windows (a fabricated key, a
-/// closed one) has no conhost behind it and keeps the native accounting.
-/// A closed session answers `false` — nothing resizes it afterwards.
+/// `ResizePseudoConsole` (row-0-anchored, from its own buffer; see
+/// `aterm_grid::grid::reflow::ResizePolicy`), so the frontend picks its resize
+/// seam policy from this answer rather than from `cfg(windows)`: a stub or
+/// replay session on Windows (a fabricated key, a closed one) has no conhost
+/// behind it and keeps the native accounting. A closed session answers `false`.
 #[must_use]
 pub fn backend_is_conpty(master: i32) -> bool {
     session(master).is_some()
@@ -2203,10 +2270,9 @@ pub fn size(_master: i32) -> Option<(u16, u16)> {
 /// The client is `aterm.exe --conpty-leave-alt-screen` ([`console_guard`]),
 /// which writes to the console's screen and nothing else: the console's input
 /// mode is shared by every client of the tab, and the program the user still
-/// runs there (an ssh session, wsl.exe, PSReadLine) set it. `cmd.exe /c set
-/// /p`, the first client, turned processed, line and echo input back
-/// on as it started (a raw 0x288 read 0x28f after it), so Ctrl+C at an ssh
-/// prompt became a CTRL_C_EVENT that ended ssh.
+/// runs there (an ssh session, wsl.exe, PSReadLine) set it, so the helper must
+/// not alter console input modes (e.g. enabling processed/line/echo input,
+/// which would turn Ctrl+C at an ssh prompt into a `CTRL_C_EVENT`).
 ///
 /// # Errors
 /// `NotFound` for a key no live session has; `Unsupported` for an inbox
@@ -2475,7 +2541,7 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let weak_sandbox = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Untrusted);
-        let sessions_before = SESSIONS.lock_or_recover().len();
+        let sessions_before = registered_here();
         let err = spawn_shell(
             24,
             80,
@@ -2500,7 +2566,7 @@ mod tests {
             "error must describe the fail-closed refusal: {err}"
         );
         assert_eq!(
-            SESSIONS.lock_or_recover().len(),
+            registered_here(),
             sessions_before,
             "no session may be registered for a denied spawn"
         );
@@ -2589,19 +2655,10 @@ mod tests {
     /// `CREATE_NO_WINDOW` — the helper below must not flash a console.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    /// A REAL, DISTINCT client process for the adopted-session tests.
-    ///
-    /// Why not our own process (which is what these tests used to open): every
-    /// such session records the TEST PROCESS's pid, so two of them collide on
-    /// the one key `hangup`/`reap`/`exit_code` have — and the suite really did
-    /// go red about half the time because one test's `hangup` reached the other
-    /// test's session. A test whose subject is a pid-keyed operation needs a pid
-    /// of its own; anything else is testing the scheduler.
-    ///
-    /// `sort.exe` (System32, present on every Windows) blocks in `ReadFile` on
-    /// stdin until EOF. We hand it a pipe and never write to it, so its lifetime
-    /// is EXACTLY ours: it cannot exit early and make a teardown assertion pass
-    /// for the wrong reason, and it dies on `Drop`.
+    /// A real, distinct client process for the adopted-session tests so each
+    /// session has its own pid for pid-keyed operations (`hangup`, `reap`,
+    /// `exit_code`). `sort.exe` (System32) blocks in `ReadFile` on stdin until
+    /// EOF; holding its stdin pipe open keeps it alive until `Drop`.
     struct TestClient(std::process::Child);
 
     impl TestClient {
@@ -2997,20 +3054,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The sessions this test's thread registered: what a call made here put
+    /// in [`SESSIONS`], whatever the binary's other tests register meanwhile.
+    fn registered_here() -> u64 {
+        REGISTERED_HERE.with(std::cell::Cell::get)
+    }
+
     // adopt_handoff must REFUSE a handoff with no client process handle rather
     // than registering a session whose EOF can never fire (the waiter keys on
-    // exactly that handle) — a tab that could never close.
+    // exactly that handle) — a tab that could never close. Counted on this
+    // thread, not by the registry's length, which the binary's other tests
+    // change in parallel (the Windows lane read "4 sessions registered where
+    // it read 2 before" once, 2026-10-20). NEGATIVE CONTROL: an accepted
+    // handoff, counted the same way, is one registration.
     #[test]
     fn adopt_handoff_without_a_client_process_is_refused_and_registers_nothing() {
-        let before = SESSIONS.lock_or_recover().len();
+        let before = registered_here();
         let err = adopt_handoff(0, 0, 0, 0)
             .expect_err("a handoff with no client process handle must be refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
-            SESSIONS.lock_or_recover().len(),
+            registered_here(),
             before,
             "a refused handoff must not register a session"
         );
+
+        // SAFETY: OpenProcess on our own pid yields a real, closable handle.
+        let me = unsafe {
+            ffi::OpenProcess(
+                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                ffi::GetCurrentProcessId(),
+            )
+        };
+        assert_ne!(me, 0, "OpenProcess on self must succeed");
+        let (mut rd, mut wr): (isize, isize) = (0, 0);
+        // SAFETY: two out-params, default attrs, default buffer size.
+        assert_ne!(
+            unsafe { ffi::CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0) },
+            0,
+            "CreatePipe must succeed"
+        );
+        let sh = adopt_handoff(0, 0, wr, me).expect("a handoff with a client process is adopted");
+        assert_eq!(
+            registered_here(),
+            before + 1,
+            "the count sees an accepted handoff's registration"
+        );
+        close_master(sh.master);
+        // SAFETY: the read end is still ours (the session never owned it).
+        unsafe { ffi::CloseHandle(rd) };
     }
 
     // ---- backend_is_conpty: the frontend's resize-policy gate ----
@@ -3165,11 +3258,8 @@ mod tests {
         unsafe { ffi::CloseHandle(rd) };
     }
 
-    // `hangup` must actually tear an adopted session down. It signals the close
-    // event, which the waiter is blocked on; the waiter then runs the adopted
-    // teardown, which closes the SIGNAL PIPE (there is no HPCON). Before this
-    // lane carried a real close event, `hangup` set an invalid handle and did
-    // nothing at all — so this test guards the lever, not just its plumbing.
+    // `hangup` signals the close event that the waiter is blocked on; the
+    // waiter then runs the adopted teardown, which closes the signal pipe.
     #[test]
     fn hangup_tears_down_an_adopted_session_through_the_signal_pipe() {
         // A client process of OUR OWN, so `sh.pid` names this session and only
@@ -3299,14 +3389,11 @@ mod tests {
         }
     }
 
-    // THE DUPLICATE-PID GUARD. A pid is not a unique key over the session
-    // registry: the same console client can be handed off twice (FreeConsole →
-    // AllocConsole) while the first entry is still registered, so two live
-    // sessions can carry one pid. `session_by_pid`'s old first-match scan
-    // resolved that to an ARBITRARY entry — HashMap order, randomized per
-    // process — so closing one tab could hang up somebody ELSE's console. The
-    // contract is now: an ambiguous pid resolves to NOTHING, and every pid-keyed
-    // op falls back to its documented miss behavior.
+    // Duplicate-pid guard: the same console client can be handed off twice
+    // (`FreeConsole` -> `AllocConsole`) while the first entry is still
+    // registered, so two live sessions can carry one pid. An ambiguous pid
+    // resolves to `None`, and every pid-keyed op falls back to its documented
+    // miss behavior.
     #[test]
     fn a_pid_claimed_by_two_live_sessions_resolves_to_neither() {
         // One client, adopted TWICE — exactly the production shape.
@@ -3430,13 +3517,10 @@ mod tests {
         }
     }
 
-    // A process handle WITHOUT query rights must still yield a usable session.
-    // Found the hard way: `GetProcessId` needs PROCESS_QUERY_LIMITED_INFORMATION
-    // and returns 0 without it — and we do not control the access mask conhost
-    // duplicated into us. Refusing such a handoff (or, worse, panicking) would
-    // drop the user's console on the floor for a purely cosmetic missing pid, so
-    // the pid is optional and only the PID-KEYED lookups degrade to their
-    // documented no-op-on-miss behavior. The master-keyed ops must all still work.
+    // A process handle without `PROCESS_QUERY_LIMITED_INFORMATION` (`GetProcessId`
+    // returns 0) must still yield a usable session: the pid is optional and
+    // only pid-keyed lookups degrade to their no-op-on-miss behavior while
+    // master-keyed ops still work.
     #[test]
     fn adopted_session_tolerates_a_process_handle_with_no_query_rights() {
         // SAFETY: SYNCHRONIZE-only handle to our own process — enough for the

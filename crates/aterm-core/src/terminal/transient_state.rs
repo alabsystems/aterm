@@ -35,6 +35,16 @@ pub(super) enum Vt52CursorState {
     WaitingCol(u8),
 }
 
+/// The cell at the latest ordered synchronized-output close. Session-only:
+/// a restore starts without one, and a timeout does not manufacture one.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SyncEndCaret {
+    pub(super) seq: u64,
+    pub(super) screen: u64,
+    pub(super) grid: (u16, u16),
+    pub(super) caret: (u16, u16),
+}
+
 /// Grouped transient terminal state. [`reset`](Self::reset) bumps `reset_generation` and
 /// `screen_replaced` and clears the rest, except the replies and reports already owed to
 /// the PTY peer (`response_buffer`, `report_buffer`) and the replies' rate limiter; the
@@ -85,6 +95,9 @@ pub(super) struct TransientState {
     /// still open, which the mode level cannot under back-to-back brackets.
     /// Never reset to 0; resets bump it.
     pub(super) sync_end_seq: u64,
+    /// Cursor cell at the latest ordered close, qualified by its count, screen
+    /// and grid. A later cursor move does not change where that frame ended.
+    pub(super) sync_end_caret: Option<SyncEndCaret>,
     /// Monotonic count of full resets (RIS and [`Terminal::reset`], both via
     /// `reset_common_fields`), never zeroed. The alt-screen archive compares it
     /// at every commit point to learn a reset wiped the screen, without the
@@ -336,6 +349,7 @@ impl TransientState {
             vt52_cursor_state: Vt52CursorState::None,
             sync_start: None,
             sync_end_seq: 0,
+            sync_end_caret: None,
             reset_generation: 0,
             full_clears: 0,
             screen_replaced: 0,
@@ -437,6 +451,7 @@ impl TransientState {
         self.screen_replaced = self.screen_replaced.wrapping_add(1);
         self.render_debt = super::RenderDebt::default();
         self.sync_start = None;
+        self.sync_end_caret = None;
         self.sync_open_dirty = false;
         self.app_sync_open = false;
         self.app_sync_dirty = false;

@@ -4,57 +4,37 @@
 
 //! Window-operations capability: a structural gate on XTWINOPS dispatch.
 //!
-//! XTWINOPS (`CSI t`) dispatches attacker-chosen window geometry/state
-//! operations to a host callback
-//! ([`super::handler::TerminalHandler::invoke_window_callback`]). That function
-//! takes a `&WindowOpsCapability`, so a handler that forgets the policy check
-//! has no token to pass and does not compile.
+//! XTWINOPS (`CSI t`) hands attacker-chosen window operations to a host callback
+//! ([`super::handler::TerminalHandler::invoke_window_callback`]) that takes a
+//! `&WindowOpsCapability`, so a handler that skips the policy check has no token to pass
+//! and does not compile. The only constructor is
+//! [`WindowMintAuthority::try_mint_with_engine`], which the parser's `ActionSink` path
+//! cannot reach. The title-stack sub-operations (22/23) do not invoke the callback and
+//! always run.
 //!
-//! [`WindowOpsCapability`] is a zero-sized token whose only constructor is
-//! [`WindowMintAuthority::try_mint_with_engine`] (`pub(super)`). It mints iff the
-//! policy gate for the dispatched `Ps`
-//! ([`super::policy_gates::PolicyState::xtwinops_gate`]) resolves open: a
-//! sequence-specific `Execute` rule mints even with `allow_window_ops` false, a
-//! rule with any other response refuses even with it true, and
-//! [`TerminalModes::allow_window_ops`] decides when no rule matched, only a
-//! universal wildcard `Execute` rule did, or no policy is installed (the
-//! default). The parser's `ActionSink` path cannot reach the mint.
-//!
-//! Without the capability the callback call sites are unreachable; the
-//! title-stack sub-operations (22/23) do not invoke the callback and always run.
-//! Two consumers mint: the XTWINOPS dispatch (`handler_window.rs`) and the
-//! XTSMGRAPHICS sixel-geometry read (`Pi=2, Pa=1`, `handler_xtsmgraphics.rs`),
-//! which reports the same pixel size as `CSI 14 t` and rides the `Ps = 14` gate.
-//!
-//! `response_capability` is orthogonal: it proves a caller is inside a
-//! parser-originated sequence that may respond, and XTWINOPS reports usually
-//! need both tokens.
+//! Two consumers mint: the XTWINOPS dispatch (`handler_window.rs`) and the XTSMGRAPHICS
+//! sixel-geometry read (`Pi=2, Pa=1`, `handler_xtsmgraphics.rs`), which reports the same
+//! pixel size as `CSI 14 t` and rides the `Ps = 14` gate. XTWINOPS reports usually also
+//! need a `response_capability` token.
 
-/// Zero-sized proof that the calling context may invoke the window callback
-/// for an XTWINOPS dispatch.
-///
-/// Minted only by [`WindowMintAuthority::try_mint_with_engine`]; the private
-/// field prevents construction elsewhere. Passed by reference so several
-/// callback calls in one dispatch share one token.
+/// Zero-sized proof that the calling context may invoke the window callback for an
+/// XTWINOPS dispatch. Passed by reference, so several callback calls in one dispatch
+/// share one token.
 #[derive(Debug)]
 pub(super) struct WindowOpsCapability {
-    /// Private seal: prevents construction outside this module.
+    /// Private seal: no construction outside this module.
     _seal: super::Seal,
 }
 
-/// Zero-sized minting authority for [`WindowOpsCapability`].
-///
-/// Holds no policy; [`Self::try_mint_with_engine`] consults the gate and the
-/// `allow_window_ops` fallback passed in, and is the one place a capability
-/// comes into existence.
+/// Zero-sized minting authority for [`WindowOpsCapability`]: holds no policy, and
+/// [`Self::try_mint_with_engine`] is the one place a capability comes into existence.
 #[derive(Debug, Default)]
 pub(super) struct WindowMintAuthority {
     _seal: (),
 }
 
 impl WindowMintAuthority {
-    /// Construct the authority (`pub(super)`: terminal module only). It is a
-    /// namespace for the mint, not shared state.
+    /// Construct the authority: a namespace for the mint, not shared state.
     #[inline]
     #[must_use]
     pub(super) const fn new() -> Self {
@@ -64,19 +44,15 @@ impl WindowMintAuthority {
     /// Mint a [`WindowOpsCapability`] from the resolved policy gate:
     ///
     /// * a sequence-specific rule with response `Execute` mints;
-    /// * only a universal wildcard `Execute` rule (`response any`) falls back
-    ///   to `allow_window_ops`, so broad profiles cannot reopen this
-    ///   deny-by-default sink;
     /// * a rule with any other response refuses, whatever `allow_window_ops` says;
-    /// * no matching rule (or no policy installed:
-    ///   [`super::policy_bridge::BridgeDecision::Fallback`]) falls back to
-    ///   `allow_window_ops`.
+    /// * only a universal wildcard `Execute` rule (`response any`), no matching rule, or
+    ///   no policy ([`super::policy_bridge::BridgeDecision::Fallback`]) falls back to
+    ///   `allow_window_ops`, so broad profiles cannot reopen this deny-by-default sink.
     ///
-    /// The caller passes a decision rather than an engine because the probe
-    /// ([`probe_xtwinops`]) varies only in `ps` and the origin is always
-    /// `OriginTag::Pty`, so [`super::policy_gates::PolicyState::xtwinops_gate`]
-    /// resolves every `ps` once per installed policy and no dispatch allocates
-    /// or walks rule buckets. `terminal/policy_bridge.rs` has the decision tree.
+    /// The caller passes a decision, not an engine: the probe ([`probe_xtwinops`]) varies
+    /// only in `ps` and the origin is always `OriginTag::Pty`, so
+    /// [`super::policy_gates::PolicyState::xtwinops_gate`] resolves every `ps` once per
+    /// installed policy and no dispatch allocates or walks rule buckets.
     #[inline]
     #[must_use]
     pub(super) fn try_mint_with_engine(
@@ -93,11 +69,9 @@ impl WindowMintAuthority {
     }
 }
 
-/// Probe sequence used by the XTWINOPS (`CSI Ps t`) policy lookup.
-///
-/// The single definition, shared by the compiled gate table in
-/// [`super::policy_gates`] and by its out-of-range live fallback, so the two
-/// cannot disagree about which rule bucket a `Ps` lands in.
+/// The XTWINOPS (`CSI Ps t`) policy probe, shared by the compiled gate table in
+/// [`super::policy_gates`] and its out-of-range live fallback so the two cannot disagree
+/// about which rule bucket a `Ps` lands in.
 #[must_use]
 pub(super) fn probe_xtwinops(ps: u16) -> aterm_policy::selector::DispatchedSequence {
     aterm_policy::selector::DispatchedSequence::csi(Some(u32::from(ps)), 't', [])

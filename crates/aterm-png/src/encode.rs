@@ -542,8 +542,7 @@ fn apply_filter(kind: u8, cur: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) {
 mod tests {
     use super::*;
 
-    /// The whole-image filter pass this row filter replaced, kept verbatim as
-    /// the oracle for the heuristic.
+    /// Reference whole-image filter pass used as an oracle for `RowFilter`.
     fn whole_image_filter(data: &[u8], stride: usize, bpp: usize) -> Vec<u8> {
         let rows = data.len() / stride.max(1);
         let mut out = Vec::with_capacity(rows * (stride + 1));
@@ -590,13 +589,9 @@ mod tests {
         out
     }
 
-    /// THE STREAMED FILE CARRIES THE WHOLE-IMAGE ENCODER'S ZLIB STREAM. Each
-    /// row is filtered by the same heuristic as the whole-image pass, and the
-    /// `IDAT` payloads, concatenated, are the one-shot compression of that
-    /// filtered image (which `deflate`'s tests hold byte-identical to the
-    /// whole-buffer compressor). An image whose stream is shorter than a chunk
-    /// is one `IDAT`; a longer one is split into full chunks and a remainder.
-    /// Gradient, noise and flat images at 1, 3 and 4 bytes a pixel.
+    /// Verify streamed `IDAT` payloads match the one-shot compression of
+    /// `whole_image_filter` across gradient, noise, and flat images at 1, 3,
+    /// and 4 bytes per pixel.
     #[test]
     fn the_streamed_idat_is_the_whole_image_encoders_stream() {
         let mut state = 0x1234_5678u32;

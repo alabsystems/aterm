@@ -1,0 +1,15 @@
+# claude-code 2.1.302 · MEASURED 2026-10-17, `aterm ctl text` of a private headless aterm (144x15, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · that Sonnet bucket past its reset on 15 rows: Claude Code went on by itself (Usage limit reset · continuing automatically); the turn's notice scrolled off, the GENERIC countdown row still drawn
+⏺ Usage limit reached · continuing automatically at 1:56am · esc to cancel
+
+✻ Worked for 0s · done 1:54 AM
+
+⏺ Usage limit reset · continuing automatically
+
+⏺ Hi! I am the local lab stub, not a model. (reply 3)
+
+✻ Cogitated for 0s · done 1:57 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

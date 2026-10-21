@@ -39,8 +39,8 @@ pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 pub type FxHashSet<V> = HashSet<V, FxBuildHasher>;
 
 /// A hash map whose hash carries a per-process secret: std's [`HashMap`] under
-/// [`std::hash::RandomState`] (SipHash-1-3, keyed from the OS once per thread
-/// and stepped for every map).
+/// [`KeyedState`] (std's SipHash-1-3, keyed from the OS once per thread and
+/// stepped for every map).
 ///
 /// Use it for a map keyed by TEXT that an untrusted party chooses and that
 /// holds many such keys at once: a render memo keyed by what a pane's program
@@ -50,7 +50,7 @@ pub type FxHashSet<V> = HashSet<V, FxBuildHasher>;
 /// an unkeyed hash of such text (a context fingerprint): mixing it well does
 /// not stop a search for colliding inputs.
 ///
-/// Ruling 2026-10-10 (hashclock-1): through the real renderer, a 32x128
+/// Through the real renderer, a 32x128
 /// screen of such cluster keys took a frame from 1.9 ms to 16 ms. Seeding
 /// [`FxHasher`]'s state would not have helped: its byte compression
 /// (`hash_bytes`) takes no seed, so keys whose compressed words collide still
@@ -62,7 +62,55 @@ pub type FxHashSet<V> = HashSet<V, FxBuildHasher>;
 /// an integer compare, so a hot path need not pay for SipHash. On a target
 /// with no OS entropy (wasm32-unknown-unknown), std derives the keys from
 /// addresses, which is no weaker than Fx.
-pub type KeyedHashMap<K, V> = HashMap<K, V, std::hash::RandomState>;
+pub type KeyedHashMap<K, V> = HashMap<K, V, KeyedState>;
+
+/// [`KeyedHashMap`]'s hasher builder: std's [`std::hash::RandomState`], its
+/// SipHash compiled in THIS crate.
+///
+/// SipHash is generic code, so std's hasher is compiled into whichever crate
+/// hashes with it, at that crate's opt-level: a debug `aterm-gui` (opt-level
+/// 0) spent 59% of its Settings text measures hashing its measure memo's
+/// keys. Under `debug_assertions` [`KeyedHasher`]'s two methods are kept out
+/// of line, so the hashing is this crate's code, which a debug build compiles
+/// optimized (the root `Cargo.toml`'s `[profile.dev.package.aterm-hash]`); a
+/// release build inlines them as it did std's. The keys and the hash are
+/// std's.
+///
+/// ```
+/// use std::hash::BuildHasher;
+/// use aterm_hash::KeyedState;
+/// let state = KeyedState::default();
+/// assert_eq!(state.hash_one("same"), state.hash_one("same"));
+/// // Each map's state carries a key of its own.
+/// assert_ne!(state.hash_one("same"), KeyedState::default().hash_one("same"));
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct KeyedState(std::hash::RandomState);
+
+impl BuildHasher for KeyedState {
+    type Hasher = KeyedHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> KeyedHasher {
+        KeyedHasher(self.0.build_hasher())
+    }
+}
+
+/// [`KeyedState`]'s hasher: std's keyed SipHash-1-3.
+#[derive(Clone, Debug)]
+pub struct KeyedHasher(std::hash::DefaultHasher);
+
+impl Hasher for KeyedHasher {
+    #[cfg_attr(debug_assertions, inline(never))]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    #[cfg_attr(debug_assertions, inline(never))]
+    fn finish(&self) -> u64 {
+        self.0.finish()
+    }
+}
 
 // Multiplicative constant chosen for good distribution properties.
 // From "Computationally Easy, Spectrally Good Multipliers for Congruential

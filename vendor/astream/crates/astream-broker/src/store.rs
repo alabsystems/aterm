@@ -383,7 +383,7 @@ pub const MAX_SUBJECTS_PER_PRODUCER: usize = 4096;
 /// `/`. A wildcard-free filter yields the filter itself — a longer subject that
 /// starts with it is still rejected by `Filter::matches`, so the prefix is only ever
 /// a range BOUND, never the match.
-fn literal_prefix(filter: &Filter) -> &str {
+pub(crate) fn literal_prefix(filter: &Filter) -> &str {
     let s = filter.as_str();
     let Some(tail) = s.get(1..) else {
         return s;
@@ -502,6 +502,11 @@ pub struct LogStats {
     pub is_replica: bool,
     /// True when an unrecoverable I/O error has poisoned the log until reopen.
     pub poisoned: bool,
+    /// Records below the base the retention rules still hold (`<log>.held`; `0` without
+    /// rules or the `retention` feature).
+    pub held_records: usize,
+    /// Their bytes, as retention counts them (`retention::record_bytes`).
+    pub held_bytes: u64,
 }
 
 /// A durable, single-writer message log with exactly-once ingest and durable
@@ -757,6 +762,12 @@ pub struct BrokerLog {
     /// The compaction's I/O seam (`compact.rs`): inert unless a unit test arms it.
     #[cfg(feature = "retention")]
     compact_seam: crate::compact::Seam,
+    /// THE HELD STORE (`held.rs`): the records below the base a hold rule still wants, the
+    /// floors of what the rules gave up, the rules themselves and the retention tick's
+    /// stamps. Empty and inert until rules are set ([`set_retention`](Self::set_retention))
+    /// or an earlier open's `<log>.held` is read.
+    #[cfg(feature = "retention")]
+    hold: crate::held::HeldStore,
     /// Encrypt-at-rest key. `Some` seals every record's payload on disk under
     /// XChaCha20-Poly1305 (bound to its log index as AAD); `None` writes plaintext
     /// frames. Set only by the `open_encrypted*` constructors. The key is never
@@ -859,19 +870,74 @@ pub(crate) struct Compaction {
     /// its records is created with them (`create_like`).
     perms: std::fs::Permissions,
     copy: crate::compact::KeptCopy,
+    /// What the retention rules carry into the held store and give up there (`held.rs`):
+    /// written in the unlocked half before the copy, applied in memory at the finish.
+    /// `None` for a log no rules retain.
+    held: Option<crate::held::HeldJob>,
+    /// The seam crashed the unlocked half: nothing more is done or undone.
+    crashed: bool,
 }
 
 #[cfg(feature = "retention")]
 impl Compaction {
-    /// THE UNLOCKED COPY (`compact.rs`): the log from the cut to the durable length the
-    /// compaction began at. The broker runs it with no lock held.
+    /// THE UNLOCKED HALF (`compact.rs`): the held store's frames, appended and flushed
+    /// ([`Step::Held`](crate::compact::Step::Held)), then the copy of the log from the cut to
+    /// the durable length the compaction began at. The broker runs it with no lock held.
     pub(crate) fn copy(&mut self) -> io::Result<()> {
+        if let Some(h) = self.held.as_mut() {
+            h.run()?;
+            if let Err(e) = self.copy.seam().crash(crate::compact::Step::Held) {
+                self.crashed = true;
+                return Err(e);
+            }
+        }
         self.copy.run()
     }
+}
 
-    /// Give it up without its log (the broker's copy failed): the copy is removed.
-    pub(crate) fn abandon(self) {
-        self.copy.abandon();
+/// WHAT A RETENTION TICK DID ([`BrokerLog::retain_by_rules`],
+/// [`Broker::retention_tick_at`](crate::Broker::retention_tick_at)).
+#[cfg(feature = "retention")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionTick {
+    /// The base before the tick.
+    pub base_before: u64,
+    /// The base after it: the cut the rules took.
+    pub base: u64,
+    /// Records the cut dropped from the log, carried or not.
+    pub dropped: u64,
+    /// Records the tick newly carried into the held store.
+    pub carried: usize,
+    /// Held records the tick gave up: read by every reader their rule names, past their
+    /// rule's age, or past their class's bytes.
+    pub released: usize,
+    /// Unread records given up (past their age or their class's bytes), by subject: what
+    /// the broker logs, one line each, and what a read below them is told
+    /// (`retained-from=`).
+    pub lost: Vec<(String, u64)>,
+}
+
+/// A retention by the rules, begun under the log lock: the compaction its cut takes, or,
+/// when the cut stays where it is, the held store's own changes. Unboxed: one is made a tick
+/// and moved twice, and the verified lane failed the boxes' allocation and deref rows.
+#[cfg(feature = "retention")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one job a tick, moved twice; the verified lane fails a box's deref"
+)]
+pub(crate) enum RetentionJob {
+    Compact(Compaction),
+    Held(crate::held::HeldJob),
+}
+
+#[cfg(feature = "retention")]
+impl RetentionJob {
+    /// The unlocked half: the held store's frames, and the compaction's copy.
+    pub(crate) fn run(&mut self) -> io::Result<()> {
+        match self {
+            RetentionJob::Compact(c) => c.copy(),
+            RetentionJob::Held(h) => h.run(),
+        }
     }
 }
 
@@ -1299,20 +1365,32 @@ fn write_state_at(
 /// Absence is returned only by the initial entry lookup; later open/read failures refuse.
 #[cfg(feature = "retention")]
 fn open_state_file(path: &Path) -> io::Result<Option<File>> {
+    let cap =
+        (astream_wire::HEADER_SIZE as u64).saturating_add(astream_wire::MAX_PAYLOAD_LEN as u64);
+    open_sidecar(path, cap, false, "state sidecar")
+}
+
+/// Open the sidecar at `path` — `what` names it in a refusal — for reading (and, `write`,
+/// writing) only if it is a regular file of at most `cap` bytes, never following a link
+/// planted at its name; `None` when there is none. Absence is returned only by this
+/// initial entry lookup; an entry changed or removed after it refuses
+/// ([`admit_sidecar`]).
+#[cfg(feature = "retention")]
+pub(crate) fn open_sidecar(
+    path: &Path,
+    cap: u64,
+    write: bool,
+    what: &str,
+) -> io::Result<Option<File>> {
     let entry = match std::fs::symlink_metadata(path) {
         Ok(entry) => entry,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     if !entry.is_file() || entry.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "retention: state sidecar is not a bounded regular file",
-        ));
+        return Err(not_a_bounded_sidecar(what));
     }
-    let cap =
-        (astream_wire::HEADER_SIZE as u64).saturating_add(astream_wire::MAX_PAYLOAD_LEN as u64);
-    open_regular_sidecar(path, cap).map(Some)
+    admit_sidecar(path, cap, write, what).map(Some)
 }
 
 /// Open an already-looked-up sidecar without following its final entry, and validate
@@ -1321,6 +1399,24 @@ fn open_state_file(path: &Path) -> io::Result<Option<File>> {
 /// entry changed or removed since that lookup is an error, never absence.
 #[cfg(feature = "retention")]
 pub(crate) fn open_regular_sidecar(path: &Path, cap: u64) -> io::Result<File> {
+    admit_sidecar(path, cap, false, "sidecar")
+}
+
+/// The refusal of a sidecar that is not a regular file of at most its cap.
+#[cfg(feature = "retention")]
+fn not_a_bounded_sidecar(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("retention: {what} is not a bounded regular file"),
+    )
+}
+
+/// The admission [`open_sidecar`] and [`open_regular_sidecar`] share: open `path` for
+/// reading (and, `write`, writing) without following its final entry, nonblocking (so a
+/// substituted FIFO is refused without waiting for its peer), and validate the opened
+/// handle — a regular file of at most `cap` bytes — before any read.
+#[cfg(feature = "retention")]
+fn admit_sidecar(path: &Path, cap: u64, write: bool, what: &str) -> io::Result<File> {
     #[cfg(not(any(
         target_os = "macos",
         windows,
@@ -1331,7 +1427,7 @@ pub(crate) fn open_regular_sidecar(path: &Path, cap: u64) -> io::Result<File> {
     )))]
     return Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "retention: safe sidecar admission is unavailable on this platform",
+        format!("retention: safe {what} admission is unavailable on this platform"),
     ));
     #[cfg(any(
         target_os = "macos",
@@ -1343,7 +1439,7 @@ pub(crate) fn open_regular_sidecar(path: &Path, cap: u64) -> io::Result<File> {
     ))]
     {
         let mut opts = FsOpenOptions::new();
-        opts.read(true);
+        opts.read(true).write(write);
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -1367,10 +1463,7 @@ pub(crate) fn open_regular_sidecar(path: &Path, cap: u64) -> io::Result<File> {
         let file = open_with_options(&opts, path)?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > cap {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "retention: sidecar is not a bounded regular file",
-            ));
+            return Err(not_a_bounded_sidecar(what));
         }
         Ok(file)
     }
@@ -1734,7 +1827,11 @@ pub enum Durability {
     /// p95 52–671 µs over three passes of 2,000 (alone 3–5 µs and 5–18 µs; beside a
     /// full-flush loop 169–214 µs and 4.2–5.2 ms). The full flushes this tier still issues
     /// — one per escalated batch, and about one per horizon under traffic — carry a full
-    /// flush's whole tax.
+    /// flush's whole tax. That includes this tier's own acks. On that Mac (2026-10-21,
+    /// aterm `docs/measured/flush-wait-2026-10-21.md`), every barrier begun with more
+    /// than 2 ms of a full flush from another thread still to run waited for that flush
+    /// to end, 992 of 992. Under continuous traffic, up to one ack per horizon therefore
+    /// takes a full flush's time.
     ///
     /// After a power loss the log is a prefix of whole acked batches. It holds every batch
     /// a full flush covered:
@@ -3398,6 +3495,14 @@ impl BrokerLog {
         } else {
             (Offset::ZERO, CompactedState::default())
         };
+        // The held store at the base just read (`held.rs`): frames of a compaction that
+        // never landed are cut away here, as its intent was judged above.
+        #[cfg(feature = "retention")]
+        let mut hold = if dir.is_os() {
+            crate::held::HeldStore::load(&path, at_rest_key.as_ref(), base.0, created)?
+        } else {
+            crate::held::HeldStore::default()
+        };
         let prior = if created {
             Prior::Absent
         } else {
@@ -3519,6 +3624,10 @@ impl BrokerLog {
             next.0,
         )?;
         drop(existing);
+        // The retention stamps read back cut to the head recovered, once nothing refuses the
+        // open: a crash lost the records past it a tick had stamped (`held.rs`, `S`).
+        #[cfg(feature = "retention")]
+        hold.opened_at(&path, at_rest_key.as_ref(), base.0, next.0)?;
         let (
             records,
             dedup,
@@ -3595,6 +3704,8 @@ impl BrokerLog {
             faults: InjectedFaults::default(),
             #[cfg(feature = "retention")]
             compact_seam: crate::compact::Seam::default(),
+            #[cfg(feature = "retention")]
+            hold,
             at_rest_key,
             head_watermark,
             replication_epoch: 0,
@@ -3823,7 +3934,9 @@ impl BrokerLog {
             );
         }
         for (subj, rec) in &carried_last {
-            let owner = pending_carried_charges.remove(subj).unwrap_or(rec.producer_id);
+            let owner = pending_carried_charges
+                .remove(subj)
+                .unwrap_or(rec.producer_id);
             if last.insert(subj.clone(), rec.seq).is_none() {
                 subject_charges.insert(subj.clone(), owner);
                 let c = subjects_per_producer.entry(owner).or_insert(0);
@@ -4646,7 +4759,8 @@ impl BrokerLog {
     }
 
     /// Record an epoch-tagged follower acknowledgement (`req_epoch`, `ack_upto`) via
-    /// the 5-parameter Clean-origin [`crate::proto::fenced_replica_watermark`] kernel:
+    /// the 5-parameter [`crate::proto::fenced_replica_watermark`] kernel (hand-written Rust
+    /// that calls the Clean-Origin (`I5`) functions its doc names):
     /// if `req_epoch < self.replication_epoch`, `ack_upto` is fenced and ignored;
     /// otherwise `replica_ack_upto` advances monotonically and the clamped
     /// `min(head, replica_ack_upto)` watermark is returned.
@@ -4802,6 +4916,14 @@ impl BrokerLog {
             durability: self.durability,
             is_replica: self.replica,
             poisoned: self.vitals.poisoned().is_some(),
+            #[cfg(feature = "retention")]
+            held_records: self.hold.len(),
+            #[cfg(not(feature = "retention"))]
+            held_records: 0,
+            #[cfg(feature = "retention")]
+            held_bytes: self.hold.held_bytes,
+            #[cfg(not(feature = "retention"))]
+            held_bytes: 0,
         }
     }
 
@@ -6103,6 +6225,8 @@ impl BrokerLog {
                 ));
             };
             self.next = next_seq;
+            #[cfg(feature = "retention")]
+            self.hold.note(&rec);
             self.records.push(Arc::new(rec));
         }
         // The visible head is HELD at the batch's first escalated record until a full
@@ -6593,6 +6717,8 @@ impl BrokerLog {
             }
         }
         self.next = next;
+        #[cfg(feature = "retention")]
+        self.hold.note(&rec);
         self.records.push(Arc::new(rec));
         if durable {
             self.durable_head = self.next.0;
@@ -6812,6 +6938,12 @@ impl BrokerLog {
     /// `max == 0` scans nothing and returns `(empty, from)`: the head query, whose
     /// only answer is the `Mark`. Hidden subjects are skipped exactly as on the tail
     /// path, and they are still SCANNED (they consume offsets, so `next` counts them).
+    ///
+    /// RETENTION (`retention.rs`): the records the rules hold below the base are read
+    /// first, in offset order, each scanned like a retained one, then the retained
+    /// suffix. A `from` below what the filter can still reach ([`oldest`](Self::oldest))
+    /// starts there: this read CLAMPS, as it always clamped to the base. The wire's
+    /// `Fetch` refuses instead ([`fetch_checked`](Self::fetch_checked)).
     pub fn fetch(
         &self,
         from: u64,
@@ -6820,14 +6952,75 @@ impl BrokerLog {
         scan_max: usize,
         visible: u64,
     ) -> (Vec<Arc<BrokerRecord>>, u64) {
-        let mut out = Vec::new();
         if max == 0 {
-            return (out, from);
+            return (Vec::new(), from);
         }
-        // Nothing below the retained base exists to scan: start at the earliest
+        self.fetch_from(
+            from.max(self.oldest(filter).0),
+            filter,
+            max,
+            scan_max,
+            visible,
+        )
+    }
+
+    /// [`fetch`](Self::fetch), REFUSING a read below what `filter` can still reach:
+    /// `Err(oldest)` when `from` is below [`oldest`](Self::oldest) (the wire answers it
+    /// `ERR retained-from=<oldest>`), so a reader is told what it missed instead of
+    /// handed a page that silently starts later. The head query (`max == 0`) is never
+    /// refused.
+    pub fn fetch_checked(
+        &self,
+        from: u64,
+        filter: &Filter,
+        max: usize,
+        scan_max: usize,
+        visible: u64,
+    ) -> Result<(Vec<Arc<BrokerRecord>>, u64), Offset> {
+        if max == 0 {
+            return Ok((Vec::new(), from));
+        }
+        let oldest = self.oldest(filter);
+        if from < oldest.0 {
+            return Err(oldest);
+        }
+        Ok(self.fetch_from(from, filter, max, scan_max, visible))
+    }
+
+    /// The scan both reads share, from `from` (at or above the filter's oldest).
+    fn fetch_from(
+        &self,
+        from: u64,
+        filter: &Filter,
+        max: usize,
+        scan_max: usize,
+        visible: u64,
+    ) -> (Vec<Arc<BrokerRecord>>, u64) {
+        let mut out = Vec::new();
+        #[cfg_attr(not(feature = "retention"), allow(unused_mut))]
+        let mut budget = scan_max;
+        #[cfg_attr(not(feature = "retention"), allow(unused_mut))]
+        let mut start = from;
+        #[cfg(feature = "retention")]
+        if from < self.base.0 {
+            for (&off, h) in self.hold.range(from, self.base.0) {
+                if budget == 0 {
+                    return (out, start);
+                }
+                budget = budget.saturating_sub(1);
+                start = off.saturating_add(1);
+                if filter.matches_str(&h.rec.subject) {
+                    out.push(Arc::clone(&h.rec));
+                    if out.len() >= max {
+                        return (out, start);
+                    }
+                }
+            }
+        }
+        // Nothing below the retained base is left to scan: start at the earliest
         // retained record, as `read_from` does, so a pruned range costs no budget.
-        let start = from.max(self.base.0);
-        let limit = start.saturating_add(scan_max as u64).min(visible);
+        let start = start.max(self.base.0);
+        let limit = start.saturating_add(budget as u64).min(visible);
         let mut next = start;
         let mut off = start;
         while off < limit {
@@ -6843,6 +7036,59 @@ impl BrokerLog {
             off = next;
         }
         (out, next)
+    }
+
+    /// THE OLDEST offset a read of `filter` can reach: from it, every record of the filter
+    /// the retention rules still want is readable, retained or held. The base, without
+    /// rules (or the `retention` feature) and for what the prefix rule or a last-value rule
+    /// can match; for what a hold rule keeps records of, where the rules took effect and
+    /// the floor of every matching subject that gave records up (`retention::oldest`).
+    pub fn oldest(&self, filter: &Filter) -> Offset {
+        #[cfg(feature = "retention")]
+        {
+            Offset(self.hold.oldest(self.base.0, filter))
+        }
+        #[cfg(not(feature = "retention"))]
+        {
+            let _ = filter;
+            self.base
+        }
+    }
+
+    /// The lowest offset a subscriber can still be delivered from: the oldest record the
+    /// rules hold below the base, or the base.
+    pub fn read_floor(&self) -> Offset {
+        #[cfg(feature = "retention")]
+        {
+            Offset(self.hold.read_floor(self.base.0))
+        }
+        #[cfg(not(feature = "retention"))]
+        {
+            self.base
+        }
+    }
+
+    /// THE TAIL'S READ: up to `max` records from `*cursor` up to (not including) `head` —
+    /// the held records below the base first, in offset order, then the retained suffix
+    /// (the cursor moves up to the base once no held record is left below it). Hidden
+    /// subjects are the caller's to skip, as from [`read_range`](Self::read_range).
+    pub fn read_chunk(&self, cursor: &mut u64, head: u64, max: usize) -> Vec<Arc<BrokerRecord>> {
+        #[cfg(feature = "retention")]
+        if *cursor < self.base.0 {
+            let mut out = Vec::new();
+            for (_, h) in self.hold.range(*cursor, self.base.0.min(head)) {
+                if out.len() >= max {
+                    break;
+                }
+                out.push(Arc::clone(&h.rec));
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        *cursor = (*cursor).max(self.base.0);
+        let behind = usize::try_from(head.saturating_sub(*cursor)).unwrap_or(usize::MAX);
+        self.read_range(Offset(*cursor), behind.min(max))
     }
 
     /// The retained record at ABSOLUTE offset `off` (records are held base-relative),
@@ -6956,7 +7202,39 @@ impl BrokerLog {
         if min <= self.base.0 {
             return Ok(None);
         }
-        if !carry_state {
+        // A log its rules retain carries, at any cut, what they hold below it, and its
+        // state: the planning at that cut, its clock the tick's last stamp.
+        let held = if self.hold.active {
+            let now = match self.hold.stamps.last() {
+                Some(&(_, ms)) => ms,
+                None => 0,
+            };
+            let plan = self.retention_plan(now, min, Some(min));
+            let perms = self.file.os()?.metadata()?.permissions();
+            Some(self.hold.job(
+                &self.path,
+                self.at_rest_key.as_ref(),
+                &perms,
+                self.base.0,
+                plan,
+            )?)
+        } else {
+            None
+        };
+        self.compact_open(min, carry_state, held).map(Some)
+    }
+
+    #[cfg(feature = "retention")]
+    /// Open the copy of a compaction to `min` (above the base), carrying state when
+    /// `carry` or when the rules retain the log (`held`).
+    fn compact_open(
+        &mut self,
+        min: u64,
+        carry: bool,
+        held: Option<crate::held::HeldJob>,
+    ) -> io::Result<Compaction> {
+        let carry = carry || held.is_some();
+        if !carry {
             self.refuse_retention_blocker(min)?;
         }
         let drop_count = min.saturating_sub(self.base.0);
@@ -6968,14 +7246,259 @@ impl BrokerLog {
             self.durable_len,
             self.compact_seam.clone(),
         )?;
-        Ok(Some(Compaction {
+        Ok(Compaction {
             min,
-            carry: carry_state,
+            carry,
             base: self.base.0,
             drop_count,
             perms,
             copy,
-        }))
+            held,
+            crashed: false,
+        })
+    }
+
+    #[cfg(feature = "retention")]
+    /// THE RETENTION PLANNING at `now` (ms), the cut never above `ceiling`, or at `forced`
+    /// (`retention::plan`). Stamps what the tick has not seen yet first.
+    fn retention_plan(
+        &mut self,
+        now: u64,
+        ceiling: u64,
+        forced: Option<u64>,
+    ) -> crate::retention::Plan {
+        crate::retention::stamp(&mut self.hold.stamps, self.next.0, now);
+        let Some(rules) = self.hold.rules.as_ref() else {
+            return crate::retention::Plan {
+                cut: self.base.0,
+                ..crate::retention::Plan::default()
+            };
+        };
+        let view = crate::retention::View {
+            base: self.base.0,
+            ceiling: ceiling.min(self.next.0),
+            records: &self.records,
+            stamps: &self.hold.stamps,
+            groups: &self.group_commits,
+            held: &self.hold.entries,
+            now,
+        };
+        let mut plan = crate::retention::plan(rules, &view, forced);
+        self.hold.planned(std::mem::take(&mut plan.room));
+        plan
+    }
+
+    #[cfg(feature = "retention")]
+    /// SET THE RETENTION RULES this open retains the log by (`retention.rs`): from here
+    /// every compaction carries what they hold into `<log>.held`, and
+    /// [`retain_by_rules`](Self::retain_by_rules) (a broker's retention tick) takes the cut
+    /// they say. Durable before it returns. The rules the held store was last held under
+    /// keep it whole from where it was; different rules start it at the base, since below
+    /// it no record they want was carried. A log no rules retain never compacts by itself
+    /// and behaves as before.
+    pub fn set_retention(&mut self, rules: crate::retention::Retention) -> io::Result<()> {
+        self.check_poisoned()?;
+        if !self.dir.is_os() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "retention: a simulated log keeps no held store",
+            ));
+        }
+        let perms = self.file.os()?.metadata()?.permissions();
+        self.hold.set_rules(
+            &self.path,
+            self.at_rest_key.as_ref(),
+            &perms,
+            self.base.0,
+            rules,
+        )
+    }
+
+    #[cfg(feature = "retention")]
+    /// The rules reads answer by: set by this open, or the ones the held store was last
+    /// held under (`None`: no rules, and every read's oldest is the base).
+    pub fn retention(&self) -> Option<&crate::retention::Retention> {
+        self.hold.rules.as_ref()
+    }
+
+    #[cfg(feature = "retention")]
+    /// The rules this open RETAINS BY: the ones [`set_retention`](Self::set_retention) set
+    /// since the open, `None` before. Only these compact the log, so only these are what a
+    /// broker advertises; rules read back from the held store answer reads
+    /// ([`retention`](Self::retention)) and compact nothing until they are set again.
+    pub fn retention_active(&self) -> Option<&crate::retention::Retention> {
+        if self.hold.active {
+            self.hold.rules.as_ref()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "retention")]
+    /// Whether the log is DUE a retention tick now rather than at the next interval: some
+    /// class of the rules this open set has taken more of its own records' bytes
+    /// ([`record_bytes`](crate::record_bytes)) since the last planning than the room that
+    /// planning left it, so it is past its bytes; or, before this open's first planning, any
+    /// record at all. Never for a log no rules of this open retain. The held store changes
+    /// only at a tick, so what a class takes is counted by the records the log takes.
+    pub(crate) fn retention_due(&self) -> bool {
+        self.hold.active && self.hold.due
+    }
+
+    #[cfg(all(test, feature = "retention"))]
+    /// The held store itself, for a test that sets its state by hand.
+    pub(crate) fn held_store_mut(&mut self) -> &mut crate::held::HeldStore {
+        &mut self.hold
+    }
+
+    #[cfg(feature = "retention")]
+    /// RETAIN BY THE RULES at `now_ms` (the caller's clock, unix ms; a test's hand clock):
+    /// the whole tick on this thread — plan, write the held store, compact to the cut,
+    /// apply. The cut never rises above the visible head. Nothing without rules. A broker
+    /// runs the same tick with its copy off the ack path
+    /// ([`Broker::retention_tick_at`](crate::Broker::retention_tick_at)).
+    pub fn retain_by_rules(&mut self, now_ms: u64) -> io::Result<RetentionTick> {
+        let ceiling = self.visible_head().0;
+        let Some(mut job) = self.retention_begin(now_ms, ceiling, 0)? else {
+            return Ok(RetentionTick {
+                base_before: self.base.0,
+                base: self.base.0,
+                ..RetentionTick::default()
+            });
+        };
+        if let Err(e) = job.run() {
+            self.retention_abandon(job);
+            return Err(e);
+        }
+        self.retention_finish(job)
+    }
+
+    #[cfg(feature = "retention")]
+    /// BEGIN a retention by the rules at `now` (ms), the cut never above `ceiling` and at
+    /// least `at_least` (the writer's caps; `0`: none): stamp, plan, and open what the plan
+    /// takes — the compaction to its cut, or, the cut where it stands, the held store's own
+    /// changes. A log no rules retain compacts only to `at_least`, carrying its state, as
+    /// [`retain_before_carrying_state`](Self::retain_before_carrying_state) does. `None`
+    /// when nothing changes. Between batches, under the log lock.
+    pub(crate) fn retention_begin(
+        &mut self,
+        now: u64,
+        ceiling: u64,
+        at_least: u64,
+    ) -> io::Result<Option<RetentionJob>> {
+        self.check_poisoned()?;
+        let at_least = crate::proto::compact_floor_monotone(
+            at_least.min(ceiling).min(self.next.0),
+            self.base.0,
+        );
+        if !self.hold.active && at_least <= self.base.0 {
+            return Ok(None);
+        }
+        if !self.staged.is_empty() {
+            return Err(io::Error::other(
+                "retention: a batch is staged; compact when idle",
+            ));
+        }
+        if !self.hold.active {
+            return Ok(Some(RetentionJob::Compact(
+                self.compact_open(at_least, true, None)?,
+            )));
+        }
+        let mut plan = self.retention_plan(now, ceiling, None);
+        if plan.cut < at_least {
+            plan = self.retention_plan(now, ceiling, Some(at_least));
+        }
+        let base = self.base.0;
+        // A tick that took stamps writes them even when nothing else changes, so a record's
+        // age survives a restart (`retention.rs`, "Record times").
+        if plan.is_empty(base) && !self.hold.rewrite_due() && !self.hold.stamps_due() {
+            return Ok(None);
+        }
+        let cut = plan.cut;
+        let perms = self.file.os()?.metadata()?.permissions();
+        let job = self
+            .hold
+            .job(&self.path, self.at_rest_key.as_ref(), &perms, base, plan)?;
+        if cut > base {
+            return Ok(Some(RetentionJob::Compact(self.compact_open(
+                cut,
+                true,
+                Some(job),
+            )?)));
+        }
+        Ok(Some(RetentionJob::Held(job)))
+    }
+
+    #[cfg(feature = "retention")]
+    /// FINISH a retention whose unlocked half ran: the compaction's finish, or the held
+    /// store's changes applied. Between batches, under the log lock (the batch lock too,
+    /// for a compaction).
+    pub(crate) fn retention_finish(&mut self, job: RetentionJob) -> io::Result<RetentionTick> {
+        match job {
+            RetentionJob::Compact(c) => self.compact_finish_tick(c),
+            RetentionJob::Held(h) => {
+                let base = self.base.0;
+                let mut tick = RetentionTick {
+                    base_before: base,
+                    base,
+                    ..RetentionTick::default()
+                };
+                self.held_finish(h, &mut tick);
+                Ok(tick)
+            }
+        }
+    }
+
+    #[cfg(feature = "retention")]
+    /// Give a retention up before its finish (its unlocked half failed).
+    pub(crate) fn retention_abandon(&mut self, job: RetentionJob) {
+        match job {
+            RetentionJob::Compact(c) => self.compact_abandon(c),
+            RetentionJob::Held(h) => self.held_abandon(h),
+        }
+    }
+
+    #[cfg(feature = "retention")]
+    /// The held store's changes, in memory, and the log's word on what was lost.
+    fn held_finish(&mut self, job: crate::held::HeldJob, tick: &mut RetentionTick) {
+        tick.carried = job.carry.len();
+        tick.released = job.remove.len();
+        let mut lost: BTreeMap<String, u64> = BTreeMap::new();
+        for ((subject, why), n) in &job.lost {
+            let floor = job.floors.get(subject).copied().unwrap_or(0);
+            eprintln!(
+                "astream-broker: {}: retention gave up {n} unread record(s) of {subject} \
+                 ({}); a read of {subject} below offset {floor} answers retained-from={floor}",
+                self.path.display(),
+                match why {
+                    crate::retention::Why::Aged => "past the age its rule keeps",
+                    crate::retention::Why::Bytes => "past the bytes its class keeps",
+                    crate::retention::Why::Read => "read",
+                },
+            );
+            let e = lost.entry(subject.clone()).or_insert(0);
+            *e = e.saturating_add(*n);
+        }
+        tick.lost = lost.into_iter().collect();
+        self.hold.finish(job);
+        self.hold.prune_stamps(self.base.0);
+    }
+
+    #[cfg(feature = "retention")]
+    /// The held store's job given up: its frames are cut away, or the log is poisoned.
+    fn held_abandon(&mut self, job: crate::held::HeldJob) {
+        // The planning's room assumed the job: the next batch asks again.
+        self.hold.due = true;
+        if let Err(e) = self.hold.abandon(job) {
+            // The first reason stands (`publish_poison`).
+            self.publish_poison(
+                format!(
+                    "retention: the held store could not be cut back after a failed \
+                     compaction: {e}"
+                ),
+                None,
+            );
+        }
     }
 
     /// A plain compaction to `min` refused, naming the record it may not drop.
@@ -7000,7 +7523,13 @@ impl BrokerLog {
     /// memory. Each durable step is a crash point of the seam; see `compact.rs` for the
     /// order and for what an open does after a crash at each.
     #[cfg(feature = "retention")]
-    pub(crate) fn compact_finish(&mut self, mut c: Compaction) -> io::Result<u64> {
+    pub(crate) fn compact_finish(&mut self, c: Compaction) -> io::Result<u64> {
+        Ok(self.compact_finish_tick(c)?.dropped)
+    }
+
+    /// [`compact_finish`](Self::compact_finish), saying what the retention rules did.
+    #[cfg(feature = "retention")]
+    fn compact_finish_tick(&mut self, mut c: Compaction) -> io::Result<RetentionTick> {
         use crate::compact::{staged_state_path, write_intent, Intent, Step};
         if let Err(e) = self.compact_ready(&c) {
             self.compact_abandon(c);
@@ -7121,7 +7650,16 @@ impl BrokerLog {
             None => [0u8; 16],
         };
         self.base = Offset(c.min);
-        Ok(c.drop_count)
+        let mut tick = RetentionTick {
+            base_before: c.base,
+            base: c.min,
+            dropped: c.drop_count,
+            ..RetentionTick::default()
+        };
+        if let Some(job) = c.held.take() {
+            self.held_finish(job, &mut tick);
+        }
+        Ok(tick)
     }
 
     /// Whether the log is still the one `c` began on, between batches.
@@ -7252,11 +7790,24 @@ impl BrokerLog {
     /// Give a compaction up before its switch: the intent, the staged state and the copy
     /// are removed (best-effort: an open discards or clears any of them it finds), and the
     /// log, its base, its state and its watermark were never touched.
+    ///
+    /// A compaction the seam CRASHED is left exactly as the crash left it, and the log
+    /// poisoned: that is what a process that died there leaves for the next open.
     #[cfg(feature = "retention")]
-    fn compact_abandon(&self, c: Compaction) {
+    pub(crate) fn compact_abandon(&mut self, mut c: Compaction) {
+        if c.crashed {
+            self.publish_poison(
+                "injected crash in the compaction's unlocked half".into(),
+                None,
+            );
+            return;
+        }
         let _ = crate::compact::remove_intent(&self.path);
         let _ = remove_file_path(&crate::compact::staged_state_path(&self.path));
-        c.abandon();
+        if let Some(job) = c.held.take() {
+            self.held_abandon(job);
+        }
+        c.copy.abandon();
     }
 
     /// Arm the compaction's seam (`compact.rs`).

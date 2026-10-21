@@ -1,33 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The handshake's `ERR auth` audit line, THINNED WITHIN A RUN: every refusal
-//! is answered and counted, and its `DENIED:` WARN is written on the 1st, 2nd,
-//! 4th, 8th … refusal of a RUN of one kind. Each line carries the run's count,
-//! the kind's total since this instance started, and the peer's pid and
-//! program.
+//! Thinning of the handshake's `ERR auth` audit line. Every refusal is answered and counted;
+//! its `DENIED:` WARN is written on the 1st, 2nd, 4th, 8th … refusal of a run, with the run's
+//! count, the kind's total since launch, and the peer's pid and program. Nothing is blocked
+//! or delayed, and there is no fixed window or cap.
 //!
-//! WHY (measured 2026-09-29): an orphaned private headless instance wrote a
-//! `DENIED: control_socket::auth …` WARN for every `aterm ctl ls` the owner
-//! ran, because discovery dialed it with no token it could present. The client
-//! no longer does (`aterm-ctl`'s `graph_hygiene`), but an older client, or any
-//! same-user process that dials blind, still can — and the audit trail should
-//! say "this keeps happening, N times now", not repeat itself N times.
+//! A run is one repeating dialer: refusals of one kind from one peer program (each
+//! `aterm ctl` is a fresh pid, so the program is compared). Each program keeps its own run
+//! within a kind, and its first refusal of a kind is written at once. A run's second refusal
+//! always joins it; after that, a refusal starts a new run, written at once, when the quiet
+//! since the program's previous refusal exceeds twice the longer of the run's span and the
+//! quiet that started the run. The second term lets a dialer refusing in bursts start one new
+//! run on its first quiet and fold its later, no quieter, bursts into it.
 //!
-//! WHAT A RUN IS. A run is one repeating dialer: refusals of one kind from one
-//! peer program (each `aterm ctl` run is a fresh pid, so the program is
-//! compared, not the pid). Each program keeps its own run within a kind, so
-//! two dialers taking turns are each thinned on their own spacing, and a
-//! program's first refusal of a kind is written at once. A refusal STARTS A
-//! NEW RUN for its program, and is written at once, when the quiet since that
-//! program's previous refusal is more than TWICE the longer of
-//! - the run's span so far (its first refusal to its latest), once it has at
-//!   least two refusals — a run's second always joins it, which gives it a
-//!   measured span; and
-//! - the quiet that started the run: a dialer that refuses in bursts (a poller
-//!   running `aterm ctl windows` then `aterm ctl ls` every few seconds) starts
-//!   one new run on its first quiet, and its later bursts, no quieter than
-//!   that, join the run instead of each writing two lines.
+//! Twice, not once: a steady dialer's next gap exceeds its last about half the time, and
+//! jitter must not restart a run. A kind keeps runs for its [`PROGRAMS_PER_KIND`] most recent
+//! programs; once it has dropped one, a program with no run is not called a first.
 //!
 //! Why twice, not once: at a run's 2nd refusal its span is a single gap, and a
 //! steady dialer's next gap is longer than its last about half the time — a
@@ -185,9 +174,8 @@ impl AuthDenials {
         }
     }
 
-    /// Count one refusal for `reason` from `peer` at `now`, and return the
-    /// text its audit line should carry when THIS one is to be written, or
-    /// `None` when it is only counted (module doc: what a run is).
+    /// Count one refusal for `reason` from `peer` at `now`, and return its audit-line text
+    /// when this one is to be written, or `None` when it is only counted.
     pub(crate) fn record(&self, reason: &str, peer: &Peer, now: Instant) -> Option<String> {
         let slot = KINDS
             .iter()
@@ -200,8 +188,7 @@ impl AuthDenials {
             Written::Peer { first: true } => {
                 format!("{reason} (first from this program; {total} since launch; {peer})")
             }
-            // A program whose run was dropped, or one never seen: runs are
-            // kept for the most recent programs by count, not age.
+            // A dropped program, or one never seen: only the most recent programs keep runs.
             Written::Peer { first: false } => format!(
                 "{reason} (not among the last {PROGRAMS_PER_KIND} programs refused; {total} since \
                  launch; {peer})"
@@ -209,9 +196,7 @@ impl AuthDenials {
             Written::Quiet(quiet) => {
                 format!("{reason} (again after {quiet:.1?} quiet; {total} since launch; {peer})")
             }
-            // The spacing rule is this module's doc, never the line's. Never
-            // "in a row": other programs' refusals, and quiet too short to
-            // restart it, fall inside a run.
+            // Never "in a row": other programs' refusals and short quiets fall inside a run.
             Written::Nth { count, span } => format!(
                 "{reason} ({count} from this program in {span:.1?}, {total} since launch; {peer})"
             ),
@@ -223,13 +208,8 @@ impl AuthDenials {
     /// when THIS one is to be written, with the run's count past the first, or
     /// `None` when it is only counted.
     ///
-    /// Every peer's refusals are ONE run, thinned by the rule the local
-    /// socket's are: a run per program works where the programs are this
-    /// user's, but an address is no identity a remote dialer cannot change
-    /// (one IPv6 /64 holds 2^64), and a run per address would write every new
-    /// one at once. So a flood writes its 1st, 2nd, 4th … refusal, from
-    /// whatever addresses, and a refusal after a quiet longer than twice the
-    /// run's span is written at once and starts a new run.
+    /// Every peer's refusals are one run: a remote dialer can change its address at will (one
+    /// IPv6 /64 holds 2^64), so a run per address would write every new one at once.
     pub(crate) fn record_network(&self, line: &str, now: Instant) -> Option<String> {
         let (written, total) = self.count(KINDS.len(), None, now)?;
         Some(match written {
@@ -244,9 +224,9 @@ impl AuthDenials {
         })
     }
 
-    /// THE RUN RULE (module doc): count one refusal in `slot` from the
-    /// dialer whose run is keyed `who` at `now`, and say why it is written —
-    /// with the slot's total since launch — or `None` when it is only counted.
+    /// The run rule (module doc): count one refusal in `slot` from the dialer keyed `who` at
+    /// `now`, and return why it is written with the slot's total, or `None` when it is only
+    /// counted.
     fn count(&self, slot: usize, who: Option<&str>, now: Instant) -> Option<(Written, u64)> {
         let mut kinds = self.kinds.lock().unwrap_or_else(|p| p.into_inner());
         let k = &mut kinds[slot];
@@ -328,11 +308,8 @@ mod tests {
         }
     }
 
-    /// A steady stream of blind dials from one program — thirteen, one a
-    /// second, the count the owner's orphan logged — writes four lines, the
-    /// 1st, 2nd, 4th and 8th, and the later ones carry the run's count. A
-    /// different kind keeps its own run: its first refusal is written at once,
-    /// however many of the other kind came before it.
+    /// A steady stream of blind dials from one program writes its 1st, 2nd, 4th and 8th,
+    /// the later ones with the run's count; another kind's first refusal is written at once.
     #[test]
     fn a_steady_stream_is_written_at_powers_of_two_per_kind() {
         let t0 = Instant::now();
@@ -347,9 +324,8 @@ mod tests {
             .collect();
         assert_eq!(written, [1, 2, 4, 8]);
 
-        // A JITTERY steady stream stays one run: the 3rd gap a tenth longer
-        // than the 2nd (the live instance measured 517 ms after 516 ms) is not
-        // quiet, so the 3rd is only counted, not written as a new run.
+        // A jittery steady stream stays one run: a 3rd gap a tenth longer than the 2nd is
+        // not quiet.
         let ms = |m: u64| t0 + Duration::from_millis(m);
         let d = AuthDenials::new();
         let p = peer(7, "aterm");
@@ -385,11 +361,8 @@ mod tests {
         assert!(d.record("something new", &p, at(5)).is_some());
     }
 
-    /// The measured case: three blind dials a second apart, then — 50 s later,
-    /// far more than twice as long as that run lasted — two more. Before the restart the 4th was
-    /// written only as a power of two and the 5th not at all. Now the quiet
-    /// starts a new run: the 4th is written and says so, and the 5th is its
-    /// run's 2nd, written too.
+    /// Three dials a second apart, then two more 50 s later: the quiet starts a new run, so
+    /// the 4th is written and says so, and the 5th is the new run's 2nd.
     #[test]
     fn quiet_longer_than_the_run_restarts_the_spacing() {
         let t0 = Instant::now();
@@ -412,8 +385,7 @@ mod tests {
         assert!(d.record(NO_TOKEN, &p, at(55)).is_none());
     }
 
-    /// A different peer PROGRAM is never folded into another's run: python3
-    /// dialing after four `aterm` dials a second apart is written at once,
+    /// A different peer program is never folded into another's run: it is written at once,
     /// though its quiet (1 s) is no longer than the run.
     #[test]
     fn a_different_peer_program_starts_a_new_run() {
@@ -429,11 +401,8 @@ mod tests {
         );
     }
 
-    /// A dialer that refuses in BURSTS — two refusals 150 ms apart every 5 s,
-    /// an old client's `aterm ctl windows` + `aterm ctl ls` in a loop — starts
-    /// one new run on its first quiet and is then thinned: 60 refusals write
-    /// a handful of lines, not 60 (the review measured 60 of 60 when the quiet
-    /// was judged against the burst alone).
+    /// A dialer refusing in bursts (two 150 ms apart every 5 s) starts one new run on its
+    /// first quiet and is then thinned: 60 refusals write a handful of lines.
     #[test]
     fn a_periodic_burst_is_thinned_after_its_first_quiet() {
         let t0 = Instant::now();
@@ -446,9 +415,8 @@ mod tests {
             .count();
         assert!(written <= 10, "60 refusals in bursts wrote {written} lines");
         assert_eq!(d.total(NO_TOKEN), 60, "every refusal counted");
-        // The run spans 5.0 s..145.15 s; a refusal 11 s on joins it (span
-        // 151.15 s). A quiet more than twice that span is a new incident,
-        // written at once.
+        // The run spans 5.0 s..145.15 s; a refusal 11 s on joins it (span 151.15 s), and a
+        // quiet more than twice that span is written at once.
         let last = 29 * 5000 + 150;
         assert!(d.record(NO_TOKEN, &p, ms(last + 11_000)).is_none());
         assert!(

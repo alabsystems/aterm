@@ -8,21 +8,18 @@ use aterm_types::{ColorPalette, CursorStyle, ParagraphDirection, Rgb};
 
 pub use aterm_types::BiDiMode;
 
-// ============================================================================
-// BiDi Configuration
-// ============================================================================
-
 /// BiDi configuration for terminal display.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BiDiConfig {
-    /// BiDi display mode (Disabled, Implicit, or Explicit).
+    /// BiDi display mode.
     pub mode: BiDiMode,
     /// Default paragraph direction for auto-detection.
     pub direction: ParagraphDirection,
-    /// Whether to reorder non-spacing marks according to UBA rule L3.
+    /// Whether to reorder non-spacing marks per UBA rule L3. Stored only: the engine's
+    /// reorder does not read it.
     pub reorder_nsm: bool,
-    /// Whether to apply BiDi reordering on the alternate screen (vim, less, …).
-    /// Default: true.
+    /// Whether to apply BiDi reordering on the alternate screen. Stored only: the engine's
+    /// reorder does not read it.
     pub alternate_screen: bool,
 }
 
@@ -37,12 +34,8 @@ impl Default for BiDiConfig {
     }
 }
 
-/// Terminal configuration that can change at runtime without recreating the
-/// terminal: display (cursor style, color, visibility), colors and palette,
-/// behavior (scrollback, auto-wrap, focus reporting), performance (memory
-/// budget, sync timeout) and BiDi.
-///
-/// `Send + Sync`; applying it to a terminal needs `&mut Terminal`.
+/// Terminal configuration a host changes at runtime without recreating the terminal;
+/// [`Terminal::apply_config`](crate::terminal::Terminal::apply_config) applies it.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -53,15 +46,12 @@ pub struct TerminalConfig {
     /// Cursor style (block, underline, bar).
     pub cursor_style: CursorStyle,
 
-    /// Whether the cursor should blink.
-    ///
-    /// A mirror, not the authority: the renderer and DEC mode 12 use the blink
-    /// bit of [`Self::cursor_style`], and `apply_config` sets this to match.
-    /// Setting this alone changes nothing; [`CursorStyle::with_blink`] folds a
-    /// blink preference into a shape.
+    /// Whether the cursor should blink. `apply_config` ignores it: the blink bit of
+    /// [`Self::cursor_style`] is the authority (renderer, DEC mode 12), and
+    /// [`CursorStyle::with_blink`] folds a blink preference into a shape.
     pub cursor_blink: bool,
 
-    /// Cursor color override (None uses default from color scheme).
+    /// Cursor color override (`None`: the color scheme's default).
     pub cursor_color: Option<Rgb>,
 
     /// Whether cursor is visible (DECTCEM mode 25).
@@ -74,16 +64,15 @@ pub struct TerminalConfig {
     /// Default background color.
     pub default_background: Rgb,
 
-    /// Selection background color override (None uses renderer default).
-    /// Can be queried/modified via OSC 21 selection_background.
+    /// Selection background override (`None`: renderer default); OSC 17 / OSC 21 query and
+    /// set the live value.
     pub selection_background: Option<Rgb>,
 
-    /// Selection foreground color override (None uses renderer contrast logic).
-    /// Can be queried/modified via OSC 19 or OSC 21 `selection_foreground`.
+    /// Selection foreground override (`None`: renderer contrast logic); OSC 19 / OSC 21
+    /// query and set the live value.
     pub selection_foreground: Option<Rgb>,
 
-    /// Custom color palette (if any).
-    /// When `None`, uses the default xterm 256-color palette.
+    /// Custom color palette; `None` uses the default xterm 256-color palette.
     pub custom_palette: Option<ColorPalette>,
 
     /// The host's baseline colour scheme: the appearance of
@@ -95,75 +84,52 @@ pub struct TerminalConfig {
     pub color_scheme: Option<aterm_types::Appearance>,
 
     // === Behavior Settings ===
-    /// Maximum number of scrollback lines to retain.
-    ///
-    /// `None` means unlimited (bounded only by `memory_budget`). Older lines
-    /// are discarded, or moved to cold storage if configured. Default:
-    /// `Some(100_000)` ([`aterm_scrollback::DEFAULT_LINE_LIMIT`]).
+    /// Maximum scrollback lines to retain; `None` is unlimited (bounded only by
+    /// `memory_budget`). Default: [`aterm_scrollback::DEFAULT_LINE_LIMIT`].
     pub scrollback_limit: Option<usize>,
 
-    /// Auto-wrap mode (DECAWM mode 7).
-    /// When enabled, lines wrap at the right margin.
+    /// Auto-wrap mode (DECAWM, mode 7): lines wrap at the right margin.
     pub auto_wrap: bool,
 
-    /// Focus reporting mode (mode 1004).
-    /// When enabled, terminal sends focus/blur notifications.
+    /// Focus reporting mode (mode 1004): the terminal reports focus in/out.
     pub focus_reporting: bool,
 
-    /// Bracketed paste mode (mode 2004).
-    /// When enabled, pasted text is wrapped in escape sequences.
+    /// Bracketed paste mode (mode 2004): pasted text is wrapped in escape sequences.
     pub bracketed_paste: bool,
 
-    /// Allow OSC 52 clipboard queries (Pd = "?").
-    ///
-    /// When disabled (default), aterm-core ignores OSC 52 query requests and
-    /// does not invoke the clipboard callback or emit a response.
+    /// Allow OSC 52 clipboard queries (Pd = "?"). When disabled (default), a query invokes no
+    /// callback and gets no response.
     pub allow_osc52_query: bool,
 
-    /// Allow CSI t window operations 1 through 21.
-    ///
-    /// When disabled (default), the gated manipulation and report operations
-    /// are silently ignored. Title-stack operations 22 and 23 remain available;
-    /// hosts still need a window callback for operations that require the OS.
+    /// Allow CSI t window operations 1 through 21; when disabled (default) they are ignored.
+    /// Title-stack operations 22 and 23 stay available; an operation that needs the OS still
+    /// needs a window callback.
     pub allow_window_ops: bool,
 
-    /// Allow desktop notification OSC sequences.
-    ///
-    /// Gates OSC 9, OSC 99 (kitty) and OSC 777 notifications; when disabled the
-    /// callback is not invoked and the OSC 99 `p=?` response is not written.
-    ///
-    /// Default: `false` (fail-closed). Hosts opt in after wiring a notification
-    /// callback, since notifications reach a user-visible surface.
+    /// Allow desktop notifications (OSC 9, OSC 99 kitty, OSC 777); when disabled the callback
+    /// is not invoked and the OSC 99 `p=?` response is not written. Default: `false`
+    /// (fail-closed): a host opts in after wiring a notification callback.
     pub allow_notifications: bool,
 
-    /// Allow OSC 4 / OSC 21 indexed palette set operations.
-    ///
-    /// Gates numeric-index sets (`OSC 4;N;spec`, `OSC 21;N=spec`). Queries are
-    /// always allowed; OSC 21 named-slot sets (`foreground`, `background`,
-    /// `cursor`, `selection_*`) go through dynamic-color callbacks and are
-    /// unaffected. Default: `false` (fail-closed).
+    /// Allow OSC 4 / OSC 21 indexed palette sets (`OSC 4;N;spec`, `OSC 21;N=spec`). Queries are
+    /// always allowed, and OSC 21 named-slot sets (`foreground`, `cursor`, `selection_*`, …)
+    /// go through dynamic-color callbacks unaffected. Default: `false` (fail-closed).
     pub allow_palette_reconfigure: bool,
 
     // === Performance Settings ===
-    /// Memory budget for scrollback (in bytes).
-    /// This controls when lines are moved from hot to warm to cold storage.
+    /// Scrollback memory budget in bytes: when lines move from hot to warm to cold storage.
     pub memory_budget: usize,
 
-    /// Synchronized output timeout in milliseconds.
-    /// How long to wait before forcing sync mode off.
+    /// Synchronized output (mode 2026) timeout in milliseconds before sync is forced off.
     pub sync_timeout_ms: u64,
 
     // === Text Settings ===
-    /// Ambiguous-width characters treated as double-width (CJK mode).
-    ///
-    /// When enabled, characters with Unicode East Asian Width property "Ambiguous"
-    /// (e.g., `°`, `§`, `×`, box-drawing) occupy 2 cells instead of 1.
-    /// This matches the behavior of CJK locale terminal emulators.
+    /// Ambiguous-width characters (East Asian Width "Ambiguous": `°`, `§`, `×`, box drawing)
+    /// occupy 2 cells instead of 1, as in CJK-locale terminals.
     pub ambiguous_width_double: bool,
 
-    /// SGR 1 (bold) promotes indexed colors 0–7 to their bright 8–15 siblings
-    /// (the classic xterm behavior). Default `true`; `false` keeps bold a pure
-    /// weight change (config `bold_is_bright`).
+    /// SGR 1 (bold) promotes indexed colors 0–7 to bright 8–15 (xterm). Default `true`; `false`
+    /// keeps bold a pure weight change.
     pub bold_is_bright: bool,
 
     /// SGR 2 (dim/faint): the fraction of the foreground retained, `0.0..=1.0`.
@@ -258,7 +224,7 @@ pub enum ConfigChange {
     MemoryBudget,
     /// Sync timeout changed.
     SyncTimeout,
-    /// BiDi configuration changed (mode, direction, security).
+    /// BiDi configuration changed.
     BiDi,
     /// CSI t window manipulation policy changed.
     WindowOps,

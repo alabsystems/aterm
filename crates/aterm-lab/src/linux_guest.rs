@@ -14,6 +14,65 @@
 
 use std::fmt::Write as _;
 
+/// A configuration namespace reserved by one `Up` with guest `mktemp -d`.
+/// Only the exact successful command's path is admitted; it is retained when
+/// the run ends, rather than recursively removing files a server may still read.
+#[derive(Debug)]
+pub struct Config {
+    root: String,
+}
+
+impl Config {
+    /// The command that reserves the run's private directory in the guest.
+    #[must_use]
+    pub fn reserve() -> Vec<String> {
+        strings(&["mktemp", "-d", "--", "/tmp/aterm-lane-config.XXXXXXXXXX"])
+    }
+
+    /// Read the successful reservation's single path, without shell expansion.
+    #[must_use]
+    pub fn from_created(text: &str) -> Option<Config> {
+        let root = text.strip_suffix('\n').unwrap_or(text);
+        let suffix = root.strip_prefix("/tmp/aterm-lane-config.")?;
+        (suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .then(|| Config { root: root.into() })
+    }
+
+    /// Whether a file is strictly inside this run's namespace, without a
+    /// parent component or an empty component that obscures its spelling.
+    #[must_use]
+    pub fn contains(&self, path: &str) -> bool {
+        path.strip_prefix(&self.root)
+            .and_then(|s| s.strip_prefix('/'))
+            .is_some_and(|s| {
+                s.split('/')
+                    .all(|p| !p.is_empty() && p != "." && p != ".." && !p.contains('\0'))
+            })
+    }
+
+    #[must_use]
+    pub fn weston_ini(&self) -> String {
+        format!("{}/weston/weston.ini", self.root)
+    }
+
+    #[must_use]
+    fn mutter(&self) -> String {
+        format!("{}/mutter", self.root)
+    }
+
+    #[must_use]
+    fn mutter_plain(&self) -> String {
+        format!("{}/mutter-plain", self.root)
+    }
+
+    /// IBus's daemon, XIM server and engine command share this run's settings
+    /// and bus-address directory.
+    #[must_use]
+    pub fn ibus(&self) -> String {
+        format!("{}/ibus", self.root)
+    }
+}
+
 /// STOCK EXCEPTION: no Linux build of the Trust toolchain is published (the
 /// atpkg `trust` releases carry the aarch64-apple-darwin asset alone, checked
 /// 2026-10-16), and Trust ships only its host's std, so the guest compiles
@@ -168,9 +227,16 @@ pub const MESA: &[&str] = &["libgl1-mesa-dri", "libegl-mesa0", "mesa-vulkan-driv
 /// aterm-render's script and emoji tests need, and without them those answer
 /// COULD NOT RUN), the x86_64 cross toolchain with its libc, zsh and fish,
 /// the shells aterm integrates beside bash, whose integration tests run each
-/// one and cannot run without it (pwsh, the fourth, is [`PWSH`]), and unzip,
+/// one and cannot run without it (pwsh, the fourth, is [`PWSH`]), unzip,
 /// which `verify fetch-browser` unpacks the browser lane's pinned browsers
-/// with.
+/// with, sway (headless wlroots: the one lane compositor that grants
+/// server-side decorations and offers cursor-shape-v1 and a virtual pointer,
+/// for `linux edges`), grim (its screenshot, for the shadow margin's
+/// pixels), GStreamer's pipewire source and PNG encoder (a frame of
+/// Mutter's screencast, the pixels a Mutter CPU row is held to),
+/// ibus-libpinyin (a CJK engine with a preedit, for XIM), and xtrace (a
+/// proxy display that logs an X11 client's requests, for the baseline's
+/// `x11.wire.*` lines, [`crate::linux_xwire`]).
 pub const TOOLS: &[&str] = &[
     "build-essential",
     "pkg-config",
@@ -212,6 +278,13 @@ pub const TOOLS: &[&str] = &[
     "libc6-dev-amd64-cross",
     "zsh",
     "fish",
+    "sway",
+    "grim",
+    "gstreamer1.0-tools",
+    "gstreamer1.0-pipewire",
+    "gstreamer1.0-plugins-good",
+    "ibus-libpinyin",
+    "xtrace",
 ];
 
 /// x86_64 packages beyond the shared lists: the loader and libc the
@@ -655,7 +728,7 @@ impl Display {
         matches!(self, Display::Xvfb | Display::Xwayland)
     }
 
-    /// Whether its servers include a weston, which reads [`WESTON_INI`].
+    /// Whether its servers include a weston, which reads [`Config::weston_ini`].
     #[must_use]
     pub const fn runs_weston(self) -> bool {
         matches!(
@@ -667,7 +740,8 @@ impl Display {
     /// The servers it needs, in start order. `runtime` is the guest user's
     /// `XDG_RUNTIME_DIR`, where a Wayland socket is made.
     #[must_use]
-    pub fn units(self, runtime: &str) -> Vec<Unit> {
+    pub fn units(self, runtime: &str, config: &Config) -> Vec<Unit> {
+        let weston_ini = config.weston_ini();
         // GL (Mesa's llvmpipe through surfaceless EGL), not pixman. Weston 13's
         // pixman renderer wraps a client's shm buffer in a pixman image at attach
         // (`pixman_renderer_attach_shm`, `wl_shm_buffer_get_data`) and reads it at
@@ -690,7 +764,7 @@ impl Display {
                 &format!("--width={WIDTH}"),
                 &format!("--height={HEIGHT}"),
                 "--idle-time=0",
-                &format!("--config={WESTON_INI}"),
+                &format!("--config={weston_ini}"),
             ]),
             socket: format!("{runtime}/{UNIT_PREFIX}weston"),
         };
@@ -732,7 +806,7 @@ impl Display {
                         &format!("--width={WIDTH}"),
                         &format!("--height={HEIGHT}"),
                         "--idle-time=0",
-                        &format!("--config={WESTON_INI}"),
+                        &format!("--config={weston_ini}"),
                         "--debug",
                     ]),
                     socket: format!("{runtime}/{UNIT_PREFIX}weston-x11"),
@@ -810,15 +884,11 @@ pub enum Scale {
     /// sent to the client through `wp_fractional_scale_v1`. Mutter offers a
     /// fractional scale only with its `scale-monitor-framebuffer`
     /// experimental feature, read here from a GSettings keyfile, and takes the
-    /// scale from a `monitors.xml`; both live in [`MUTTER_CONFIG`].
+    /// scale from a `monitors.xml`; both live in its run's [`Config`].
     OneAndHalf,
 }
 
-/// The `weston.ini` every lane weston reads (`--config`), written before it
-/// starts ([`Screen::files`]) in a directory of its own.
-pub const WESTON_INI: &str = "/tmp/aterm-lane-weston-config/weston.ini";
-
-/// [`WESTON_INI`]'s text: desktop-shell's startup fade off. By default the
+/// [`Config::weston_ini`]'s text: desktop-shell's startup fade off. By default the
 /// shell starts behind a black curtain that fades out over about a second
 /// once its panel is up. A CPU row that photographed the output inside that
 /// second read every pixel `round(p * 254 / 255)` of the frame aterm
@@ -831,15 +901,6 @@ pub const WESTON_INI: &str = "/tmp/aterm-lane-weston-config/weston.ini";
 /// 2026-10-20).
 pub const WESTON_INI_TEXT: &str = "[shell]\nstartup-animation=none\n";
 
-/// The scratch `XDG_CONFIG_HOME` of the fractional Mutter.
-pub const MUTTER_CONFIG: &str = "/tmp/aterm-lane-mutter-config";
-
-/// The scratch `XDG_CONFIG_HOME` of the baseline's ibus: its daemon, the XIM
-/// server the daemon starts and the `ibus` command that picks the engine share
-/// it (the daemon's bus address is written under it), and it holds
-/// [`IBUS_KEYFILE`].
-pub const IBUS_CONFIG: &str = "/tmp/aterm-lane-ibus-config";
-
 /// The GSettings keyfile that keeps ibus off the X keymap. Unless
 /// `use-system-keyboard-layout` is set, `ibus engine` runs `setxkbmap -layout`
 /// with the engine's layout (`us` for `xkb:us::eng`), which drops the
@@ -850,11 +911,6 @@ pub const IBUS_KEYFILE: &str = "[desktop/ibus/general]\nuse-system-keyboard-layo
 /// The GSettings keyfile that turns on Mutter's fractional scaling.
 pub const MUTTER_KEYFILE: &str =
     "[org/gnome/mutter]\nexperimental-features=['scale-monitor-framebuffer']\n";
-
-/// The scratch `XDG_CONFIG_HOME` of the baseline's Mutter at scale 1 (the
-/// fractional one's is [`MUTTER_CONFIG`]): its keyboard data
-/// ([`MUTTER_XKB_US`]) and GNOME Shell's settings ([`SHELL_KEYFILE`]).
-pub const MUTTER_PLAIN_CONFIG: &str = "/tmp/aterm-lane-mutter-plain-config";
 
 /// `xkb/symbols/us` under a baseline Mutter's `XDG_CONFIG_HOME`: the default
 /// layout, `us`, made `us(intl)`. Mutter reads `$XDG_CONFIG_HOME/xkb` ahead of
@@ -976,8 +1032,8 @@ impl Screen {
 
     /// Its servers, in start order.
     #[must_use]
-    pub fn units(self, runtime: &str) -> Vec<Unit> {
-        let mut units = self.display.units(runtime);
+    pub fn units(self, runtime: &str, config: &Config) -> Vec<Unit> {
+        let mut units = self.display.units(runtime, config);
         match self.scale {
             Scale::One | Scale::XftDpi144 => {}
             Scale::Two => {
@@ -993,7 +1049,7 @@ impl Screen {
                         }
                     }
                     u.env.push(("GSETTINGS_BACKEND".into(), "keyfile".into()));
-                    u.env.push(("XDG_CONFIG_HOME".into(), MUTTER_CONFIG.into()));
+                    u.env.push(("XDG_CONFIG_HOME".into(), config.mutter()));
                 }
             }
         }
@@ -1002,22 +1058,22 @@ impl Screen {
 
     /// The files its servers read, written before they start: `(path, text)`.
     #[must_use]
-    pub fn files(self) -> Vec<(String, String)> {
+    pub fn files(self, config: &Config) -> Vec<(String, String)> {
         let mut files = match self.scale {
             Scale::OneAndHalf => vec![
                 (
-                    format!("{MUTTER_CONFIG}/glib-2.0/settings/keyfile"),
+                    format!("{}/glib-2.0/settings/keyfile", config.mutter()),
                     MUTTER_KEYFILE.into(),
                 ),
                 (
-                    format!("{MUTTER_CONFIG}/monitors.xml"),
+                    format!("{}/monitors.xml", config.mutter()),
                     MUTTER_MONITORS.into(),
                 ),
             ],
             _ => Vec::new(),
         };
         if self.display.runs_weston() {
-            files.push((WESTON_INI.into(), WESTON_INI_TEXT.into()));
+            files.push((config.weston_ini(), WESTON_INI_TEXT.into()));
         }
         files
     }
@@ -1039,10 +1095,10 @@ impl Screen {
     /// The scratch `XDG_CONFIG_HOME` of the screen's Mutter in the baseline
     /// (`None`: the screen runs no Mutter).
     #[must_use]
-    pub const fn baseline_config(self) -> Option<&'static str> {
+    pub fn baseline_config(self, config: &Config) -> Option<String> {
         match (self.display, self.scale) {
-            (Display::Mutter, Scale::OneAndHalf) => Some(MUTTER_CONFIG),
-            (Display::Mutter, _) => Some(MUTTER_PLAIN_CONFIG),
+            (Display::Mutter, Scale::OneAndHalf) => Some(config.mutter()),
+            (Display::Mutter, _) => Some(config.mutter_plain()),
             _ => None,
         }
     }
@@ -1052,12 +1108,12 @@ impl Screen {
     /// dead key ([`MUTTER_XKB_US`]). The proof's rows and `exec` keep the
     /// server's own `us`, as on X11.
     #[must_use]
-    pub fn baseline_units(self, runtime: &str) -> Vec<Unit> {
-        let mut units = self.units(runtime);
-        if let Some(config) = self.baseline_config() {
+    pub fn baseline_units(self, runtime: &str, config: &Config) -> Vec<Unit> {
+        let mut units = self.units(runtime, config);
+        if let Some(config) = self.baseline_config(config) {
             for u in &mut units {
                 u.env.retain(|(k, _)| k != "XDG_CONFIG_HOME");
-                u.env.push(("XDG_CONFIG_HOME".into(), config.into()));
+                u.env.push(("XDG_CONFIG_HOME".into(), config.clone()));
             }
         }
         units
@@ -1068,13 +1124,13 @@ impl Screen {
     /// its keyboard data and GNOME Shell's settings (one keyfile with the
     /// fractional scale's).
     #[must_use]
-    pub fn baseline_files(self) -> Vec<(String, String)> {
-        let Some(config) = self.baseline_config() else {
-            return self.files();
+    pub fn baseline_files(self, config: &Config) -> Vec<(String, String)> {
+        let Some(mutter_config) = self.baseline_config(config) else {
+            return self.files(config);
         };
-        let keyfile = format!("{config}/glib-2.0/settings/keyfile");
+        let keyfile = format!("{mutter_config}/glib-2.0/settings/keyfile");
         let mut files: Vec<(String, String)> = self
-            .files()
+            .files(config)
             .into_iter()
             .filter(|(path, _)| path != &keyfile)
             .collect();
@@ -1084,7 +1140,10 @@ impl Screen {
             ""
         };
         files.push((keyfile, format!("{scaled}{SHELL_KEYFILE}")));
-        files.push((format!("{config}/xkb/symbols/us"), MUTTER_XKB_US.into()));
+        files.push((
+            format!("{mutter_config}/xkb/symbols/us"),
+            MUTTER_XKB_US.into(),
+        ));
         files
     }
 
@@ -1093,9 +1152,9 @@ impl Screen {
     /// of its own: the compositor of the baseline's input-method item. `None`
     /// on a screen without a Mutter.
     #[must_use]
-    pub fn gnome_shell(self, runtime: &str) -> Option<Unit> {
-        self.baseline_config()?;
-        let mut unit = self.baseline_units(runtime).into_iter().next()?;
+    pub fn gnome_shell(self, runtime: &str, config: &Config) -> Option<Unit> {
+        self.baseline_config(config)?;
+        let mut unit = self.baseline_units(runtime, config).into_iter().next()?;
         let name = format!("{UNIT_PREFIX}gnome-shell");
         unit.argv[0] = "gnome-shell".into();
         for a in &mut unit.argv {
@@ -1147,7 +1206,8 @@ fn strings(words: &[&str]) -> Vec<String> {
     words.iter().map(|s| (*s).to_string()).collect()
 }
 
-fn x_socket(display: &str) -> String {
+#[must_use]
+pub fn x_socket(display: &str) -> String {
     format!("/tmp/.X11-unix/X{}", display.trim_start_matches(':'))
 }
 
@@ -1268,6 +1328,21 @@ pub fn wait_unread(name: &str, secs: u32) -> Vec<String> {
          do sleep 0.1; done"
             .into(),
         "wait-unread".into(),
+        name.into(),
+    ]
+}
+
+/// Print, in the guest, the bytes the user unit `name`'s main process holds
+/// unread on its sockets (`ss`'s Recv-Q, summed), as `<n> bytes`.
+#[must_use]
+pub fn unread_bytes(name: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "pid=$(systemctl --user show --property=MainPID --value \"$1\") && \
+         ss -xpnH | grep -F \"pid=$pid,\" | awk '{ n += $3 } END { print n + 0 \" bytes\" }'"
+            .into(),
+        "unread-bytes".into(),
         name.into(),
     ]
 }
@@ -1597,20 +1672,21 @@ mod tests {
     #[test]
     fn displays_start_their_servers_and_point_clients_at_them() {
         let rt = "/run/user/501";
-        let x = Display::Xvfb.units(rt);
+        let config = Config::from_created("/tmp/aterm-lane-config.ABCdef1234\n").unwrap();
+        let x = Display::Xvfb.units(rt, &config);
         assert_eq!(x.len(), 1);
         assert_eq!(x[0].socket, "/tmp/.X11-unix/X91");
         assert_eq!(
             Display::Xvfb.client_env(rt),
             ("DISPLAY".into(), ":91".into())
         );
-        let w = Display::Weston.units(rt);
+        let w = Display::Weston.units(rt, &config);
         assert_eq!(w[0].socket, "/run/user/501/aterm-lane-weston");
         assert_eq!(
             Display::Weston.client_env(rt).1,
             "/run/user/501/aterm-lane-weston"
         );
-        let xw = Display::Xwayland.units(rt);
+        let xw = Display::Xwayland.units(rt, &config);
         assert_eq!(xw.len(), 2, "weston first, then Xwayland inside it");
         assert_eq!(xw[0], w[0]);
         assert_eq!(xw[1].socket, "/tmp/.X11-unix/X92");
@@ -1620,7 +1696,7 @@ mod tests {
         )));
         assert_eq!(Display::Mutter.protocol(), "Wayland");
         // weston's x11 backend: Xvfb, then weston as one of its X clients.
-        let wx = Display::WestonX11.units(rt);
+        let wx = Display::WestonX11.units(rt, &config);
         assert_eq!(wx.len(), 2, "Xvfb first, then weston inside it");
         assert_eq!(wx[0], x[0]);
         assert!(wx[1].argv.contains(&"--backend=x11".to_string()));
@@ -1643,7 +1719,7 @@ mod tests {
         assert_eq!(Display::WestonX11.proof_display(), Display::Weston);
         for d in Display::ALL {
             assert_eq!(Display::parse(d.name()), Some(d));
-            for u in d.units(rt) {
+            for u in d.units(rt, &config) {
                 assert!(u.name.starts_with(UNIT_PREFIX));
             }
         }
@@ -1652,11 +1728,14 @@ mod tests {
     /// Every weston the lane starts reads a `weston.ini` its screen writes
     /// first, in the proof and in the baseline, so none starts with its
     /// shell's fade over the pixels a row holds; a screen with no weston
-    /// writes none.
+    /// writes none. Mutter and IBus also stay in that run's reserved namespace;
+    /// another run's files and the former shared paths are not write targets.
     #[test]
     fn every_weston_reads_the_ini_its_screen_writes() {
         let rt = "/run/user/501";
-        let config = format!("--config={WESTON_INI}");
+        let config = Config::from_created("/tmp/aterm-lane-config.ABCdef1234\n").unwrap();
+        let ini_path = config.weston_ini();
+        let config_arg = format!("--config={ini_path}");
         let screens = Screen::BASELINE.into_iter().chain(Screen::DECK);
         for screen in screens {
             let westons = |units: Vec<Unit>| {
@@ -1665,22 +1744,73 @@ mod tests {
                     .filter(|u| u.argv.first().is_some_and(|a| a == "weston"))
                     .count()
             };
-            let reads =
-                |units: Vec<Unit>| units.iter().filter(|u| u.argv.contains(&config)).count();
+            let reads = |units: Vec<Unit>| {
+                units
+                    .iter()
+                    .filter(|u| u.argv.contains(&config_arg))
+                    .count()
+            };
             let ini = |files: Vec<(String, String)>| {
                 files
                     .into_iter()
-                    .filter(|(path, _)| path == WESTON_INI)
+                    .filter(|(path, _)| path == &ini_path)
                     .map(|(_, text)| text)
                     .collect::<Vec<_>>()
             };
-            let n = westons(screen.units(rt));
+            let n = westons(screen.units(rt, &config));
             assert_eq!(n, usize::from(screen.display.runs_weston()), "{screen:?}");
-            assert_eq!(reads(screen.units(rt)), n, "{screen:?}");
-            assert_eq!(reads(screen.baseline_units(rt)), n, "{screen:?}");
+            assert_eq!(reads(screen.units(rt, &config)), n, "{screen:?}");
+            assert_eq!(reads(screen.baseline_units(rt, &config)), n, "{screen:?}");
             let written = vec![WESTON_INI_TEXT.to_string(); n];
-            assert_eq!(ini(screen.files()), written, "{screen:?}");
-            assert_eq!(ini(screen.baseline_files()), written, "{screen:?}");
+            assert_eq!(ini(screen.files(&config)), written, "{screen:?}");
+            assert_eq!(ini(screen.baseline_files(&config)), written, "{screen:?}");
+        }
+        let other = Config::from_created("/tmp/aterm-lane-config.9876ZYXwvu\n").unwrap();
+        for screen in Screen::BASELINE.into_iter().chain(Screen::DECK) {
+            for (run, foreign) in [(&config, &other), (&other, &config)] {
+                for (path, _) in screen
+                    .files(run)
+                    .into_iter()
+                    .chain(screen.baseline_files(run))
+                {
+                    assert!(run.contains(&path), "{screen:?}: {path}");
+                    assert!(!foreign.contains(&path), "another run owns {path}");
+                }
+                if let Some(mutter) = screen.baseline_config(run) {
+                    let keyfile = format!("{mutter}/glib-2.0/settings/keyfile");
+                    let files = screen.baseline_files(run);
+                    assert!(files.iter().any(|(path, _)| path == &keyfile));
+                    for unit in screen
+                        .baseline_units(rt, run)
+                        .into_iter()
+                        .chain(screen.gnome_shell(rt, run))
+                    {
+                        assert!(
+                            unit.env
+                                .contains(&("XDG_CONFIG_HOME".into(), mutter.clone()))
+                        );
+                    }
+                }
+                assert!(run.contains(&format!("{}/glib-2.0/settings/keyfile", run.ibus())));
+            }
+        }
+        for unbound in [
+            "/tmp/aterm-lane-weston-config/weston.ini".into(),
+            format!("{}-sibling/weston.ini", config.root),
+            format!("{}/../foreign", config.root),
+            format!("{}//weston.ini", config.root),
+            config.root.clone(),
+        ] {
+            assert!(!config.contains(&unbound), "{unbound}");
+        }
+        for invalid in [
+            "",
+            "/tmp/aterm-lane-config.123",
+            "/tmp/aterm-lane-config.ABCdef1234/child\n",
+            "/tmp/aterm-lane-config.ABCdef1234\nwarning\n",
+            "/tmp/aterm-lane-config.ABCdef1234\n\n",
+        ] {
+            assert!(Config::from_created(invalid).is_none(), "{invalid:?}");
         }
     }
 
@@ -1690,13 +1820,14 @@ mod tests {
     #[test]
     fn the_baseline_keymap_follows_the_x_server_it_sets() {
         let rt = "/run/user/501";
+        let config = Config::from_created("/tmp/aterm-lane-config.ABCdef1234\n").unwrap();
         for (screen, server) in [
             (Screen::plain(Display::Xvfb), 0),
             (Screen::plain(Display::Xwayland), 1),
             (Screen::plain(Display::WestonX11), 0),
         ] {
             let (socket, step) = screen.baseline_keymap().expect("an X display");
-            let units = screen.baseline_units(rt);
+            let units = screen.baseline_units(rt, &config);
             let at = units.iter().position(|u| u.socket == socket);
             assert_eq!(at, Some(server), "{}", screen.name());
             assert!(step.argv.contains(&"intl".to_string()));

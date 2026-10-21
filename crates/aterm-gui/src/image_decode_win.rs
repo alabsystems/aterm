@@ -21,7 +21,8 @@
 //!
 //! **FFI style**: hand-rolled by-hand-vtable COM against the system's
 //! `windowscodecs` component, the house style of [`super::file_picker_win`]
-//! (no `windows`-crate feature for four interfaces). The vtables are
+//! (no `windows`-crate feature for four interfaces; the owned pointer and the
+//! apartment are aterm-win32's). The vtables are
 //! transcribed from `wincodec.h` in COM inheritance order; every slot before a
 //! called one is declared, so offsets are load-bearing, and each table is
 //! truncated after the last slot this module calls.
@@ -269,30 +270,25 @@ struct CodecInfoVtbl {
 /// `object` must be a live interface pointer whose vtable begins with `V`'s
 /// slots, in order.
 unsafe fn vtable<'a, V>(object: &'a Com) -> &'a V {
-    // SAFETY: every COM object begins with its vtable pointer; the caller
-    // vouches that the vtable starts with `V`'s slots.
-    unsafe { &**object.0.cast::<*const V>() }
+    // SAFETY: the caller vouches that the vtable starts with `V`'s slots.
+    unsafe { object.vtable::<V>() }
 }
 
 /// Call a factory method that hands back one interface pointer, owned.
 fn created(hr: i32, out: *mut c_void, step: &'static str) -> Result<Com, StepError> {
     check(hr, step)?;
-    if out.is_null() {
-        return Err((step, 0));
-    }
-    Ok(Com(out))
+    // SAFETY: every caller passes the out pointer of the factory method whose
+    // result is `hr`, which on success hands over one reference.
+    unsafe { Com::from_raw(out) }.ok_or((step, 0))
 }
 
 /// The imaging factory, in process.
 fn factory() -> Result<Com, StepError> {
-    // SAFETY: standard COM object creation of a registered system class.
-    unsafe {
-        co_create(
-            &CLSID_WIC_IMAGING_FACTORY,
-            &IID_IWIC_IMAGING_FACTORY,
-            "create WICImagingFactory",
-        )
-    }
+    co_create(
+        &CLSID_WIC_IMAGING_FACTORY,
+        &IID_IWIC_IMAGING_FACTORY,
+        "create WICImagingFactory",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +334,7 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
     let mut out = std::ptr::null_mut();
     // SAFETY: a factory method with a valid out pointer.
     let stream = created(
-        unsafe { (fv.create_stream)(factory.0, &mut out) },
+        unsafe { (fv.create_stream)(factory.as_raw(), &mut out) },
         out,
         "CreateStream",
     )?;
@@ -346,7 +342,7 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
     // bytes that outlive it.
     let sv = unsafe { vtable::<StreamVtbl>(&stream) };
     check(
-        unsafe { (sv.initialize_from_memory)(stream.0, bytes.as_ptr(), len) },
+        unsafe { (sv.initialize_from_memory)(stream.as_raw(), bytes.as_ptr(), len) },
         "InitializeFromMemory",
     )?;
 
@@ -355,8 +351,8 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
     let decoder = created(
         unsafe {
             (fv.create_decoder_from_stream)(
-                factory.0,
-                stream.0,
+                factory.as_raw(),
+                stream.as_raw(),
                 std::ptr::null(),
                 DECODE_METADATA_ON_DEMAND,
                 &mut out,
@@ -370,7 +366,7 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
     let mut out = std::ptr::null_mut();
     // SAFETY: frame 0 exists for every decodable file; a valid out pointer.
     let frame = created(
-        unsafe { (dv.get_frame)(decoder.0, 0, &mut out) },
+        unsafe { (dv.get_frame)(decoder.as_raw(), 0, &mut out) },
         out,
         "GetFrame",
     )?;
@@ -379,7 +375,7 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
 
     let (mut width, mut height) = (0u32, 0u32);
     check(
-        unsafe { (frv.source.get_size)(frame.0, &mut width, &mut height) },
+        unsafe { (frv.source.get_size)(frame.as_raw(), &mut width, &mut height) },
         "GetSize",
     )?;
     let (w, h) = (width as usize, height as usize);
@@ -408,7 +404,7 @@ fn copy_rgba(factory: &Com, source: &Com, w: usize, h: usize) -> Result<Decoded,
     let mut out = std::ptr::null_mut();
     // SAFETY: a factory method with a valid out pointer.
     let converter = created(
-        unsafe { (fv.create_format_converter)(factory.0, &mut out) },
+        unsafe { (fv.create_format_converter)(factory.as_raw(), &mut out) },
         out,
         "CreateFormatConverter",
     )?;
@@ -418,8 +414,8 @@ fn copy_rgba(factory: &Com, source: &Com, w: usize, h: usize) -> Result<Decoded,
     check(
         unsafe {
             (cv.initialize)(
-                converter.0,
-                source.0,
+                converter.as_raw(),
+                source.as_raw(),
                 &PIXEL_FORMAT_32BPP_BGRA,
                 DITHER_NONE,
                 std::ptr::null_mut(),
@@ -441,7 +437,7 @@ fn copy_rgba(factory: &Com, source: &Com, w: usize, h: usize) -> Result<Decoded,
     check(
         unsafe {
             (cv.source.copy_pixels)(
-                converter.0,
+                converter.as_raw(),
                 std::ptr::null(),
                 stride32,
                 size32,
@@ -470,7 +466,8 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
     let frv = unsafe { vtable::<FrameVtbl>(frame) };
     let mut count = 0u32;
     // SAFETY: a count query (no array) with a valid out pointer.
-    let hr = unsafe { (frv.get_color_contexts)(frame.0, 0, std::ptr::null_mut(), &mut count) };
+    let hr =
+        unsafe { (frv.get_color_contexts)(frame.as_raw(), 0, std::ptr::null_mut(), &mut count) };
     if hr < 0 || count == 0 {
         return None;
     }
@@ -481,38 +478,39 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
             let mut out = std::ptr::null_mut();
             // SAFETY: a factory method with a valid out pointer.
             created(
-                unsafe { (fv.create_color_context)(factory.0, &mut out) },
+                unsafe { (fv.create_color_context)(factory.as_raw(), &mut out) },
                 out,
                 "CreateColorContext",
             )
             .ok()
         })
         .collect::<Option<Vec<Com>>>()?;
-    let mut raw: Vec<*mut c_void> = contexts.iter().map(|context| context.0).collect();
+    let mut raw: Vec<*mut c_void> = contexts.iter().map(|context| context.as_raw()).collect();
     let mut filled = 0u32;
     // SAFETY: `raw` holds `count` live, uninitialised colour contexts that WIC
     // initialises in place; it does not take ownership of them.
-    let hr = unsafe { (frv.get_color_contexts)(frame.0, count, raw.as_mut_ptr(), &mut filled) };
+    let hr =
+        unsafe { (frv.get_color_contexts)(frame.as_raw(), count, raw.as_mut_ptr(), &mut filled) };
     if hr < 0 || filled == 0 {
         return None;
     }
     let mut out = std::ptr::null_mut();
     // SAFETY: a factory method with a valid out pointer.
     let srgb = created(
-        unsafe { (fv.create_color_context)(factory.0, &mut out) },
+        unsafe { (fv.create_color_context)(factory.as_raw(), &mut out) },
         out,
         "CreateColorContext",
     )
     .ok()?;
     // SAFETY: `srgb` is a live, uninitialised IWICColorContext.
     let ccv = unsafe { vtable::<ColorContextVtbl>(&srgb) };
-    if unsafe { (ccv.initialize_from_exif_color_space)(srgb.0, EXIF_COLOR_SPACE_SRGB) } < 0 {
+    if unsafe { (ccv.initialize_from_exif_color_space)(srgb.as_raw(), EXIF_COLOR_SPACE_SRGB) } < 0 {
         return None;
     }
     let mut out = std::ptr::null_mut();
     // SAFETY: a factory method with a valid out pointer.
     let transform = created(
-        unsafe { (fv.create_color_transformer)(factory.0, &mut out) },
+        unsafe { (fv.create_color_transformer)(factory.as_raw(), &mut out) },
         out,
         "CreateColorTransformer",
     )
@@ -523,10 +521,10 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
     let tv = unsafe { vtable::<ColorTransformVtbl>(&transform) };
     let hr = unsafe {
         (tv.initialize)(
-            transform.0,
-            frame.0,
-            contexts[0].0,
-            srgb.0,
+            transform.as_raw(),
+            frame.as_raw(),
+            contexts[0].as_raw(),
+            srgb.as_raw(),
             &PIXEL_FORMAT_32BPP_BGRA,
         )
     };
@@ -563,7 +561,7 @@ fn enumerate_extensions() -> Result<Vec<String>, StepError> {
     let decoders = created(
         unsafe {
             (fv.create_component_enumerator)(
-                factory.0,
+                factory.as_raw(),
                 COMPONENT_DECODER,
                 ENUMERATE_DEFAULT,
                 &mut out,
@@ -580,17 +578,15 @@ fn enumerate_extensions() -> Result<Vec<String>, StepError> {
         let mut fetched = 0u32;
         // SAFETY: one element into a valid out pointer; S_FALSE (1) with none
         // fetched ends the enumeration.
-        let hr = unsafe { (ev.next)(decoders.0, 1, &mut item, &mut fetched) };
+        let hr = unsafe { (ev.next)(decoders.as_raw(), 1, &mut item, &mut fetched) };
         if hr < 0 || fetched == 0 || item.is_null() {
             break;
         }
-        let item = Com(item);
-        // SAFETY: `item` is a live IUnknown; every vtable begins with
-        // QueryInterface.
-        let uv = unsafe { vtable::<crate::win_ffi::IUnknownVtbl>(&item) };
-        let mut info = std::ptr::null_mut();
-        let hr = unsafe { (uv.query_interface)(item.0, &IID_IWIC_BITMAP_CODEC_INFO, &mut info) };
-        let Ok(info) = created(hr, info, "QueryInterface") else {
+        // SAFETY: a fetched element is one reference handed over.
+        let Some(item) = (unsafe { Com::from_raw(item) }) else {
+            break;
+        };
+        let Ok(info) = item.query(&IID_IWIC_BITMAP_CODEC_INFO) else {
             continue;
         };
         for extension in file_extensions(&info) {
@@ -608,14 +604,17 @@ fn file_extensions(info: &Com) -> Vec<String> {
     let iv = unsafe { vtable::<CodecInfoVtbl>(info) };
     let mut needed = 0u32;
     // SAFETY: a length query (no buffer) with a valid out pointer.
-    let hr = unsafe { (iv.get_file_extensions)(info.0, 0, std::ptr::null_mut(), &mut needed) };
+    let hr =
+        unsafe { (iv.get_file_extensions)(info.as_raw(), 0, std::ptr::null_mut(), &mut needed) };
     if hr < 0 || needed == 0 || needed > 4096 {
         return Vec::new();
     }
     let mut buffer = vec![0u16; needed as usize];
     let mut actual = 0u32;
     // SAFETY: `buffer` holds `needed` u16s, the length WIC asked for.
-    let hr = unsafe { (iv.get_file_extensions)(info.0, needed, buffer.as_mut_ptr(), &mut actual) };
+    let hr = unsafe {
+        (iv.get_file_extensions)(info.as_raw(), needed, buffer.as_mut_ptr(), &mut actual)
+    };
     if hr < 0 {
         return Vec::new();
     }

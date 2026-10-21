@@ -285,7 +285,7 @@ fn tier1_the_policy_text_goes_only_where_the_model_allows() {
 fn hosted_run(m: &mut Mock, opts: &SuperviseOpts, ledger: Option<&Path>) -> Vec<String> {
     let mut out: Vec<u8> = Vec::new();
     {
-        let mut s = session(m, None);
+        let mut s = virtual_session(m, None);
         s.set_approval_env(owner_env());
         s.set_approval_ledger(ledger.map(Path::to_path_buf));
         s.set_clock(TEST_NOW, PDT);

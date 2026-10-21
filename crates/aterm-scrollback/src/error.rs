@@ -19,24 +19,19 @@ pub enum ScrollbackError {
     /// Display: `scrollback I/O error: {0}`
     Io(std::io::Error),
     /// Decompression failure (corrupted or invalid compressed data).
-    ///
-    /// Display: `scrollback decompression error: {0}`
     Decompression(String),
     /// Block permanently quarantined after repeated decompression failures.
-    ///
-    /// Display: `scrollback block quarantined: {0} lines inaccessible`
     Quarantined(usize),
     /// Memory budget enforcement failed after eviction attempts.
-    ///
-    /// Display: `memory budget enforcement failed: {over_bytes} bytes over budget`
     EnforcementFailed {
         /// Bytes exceeding the budget after all eviction attempts.
         over_bytes: usize,
     },
 }
 
-/// Render `v` as decimal into a fresh `String` without going through
-/// `format_args!`.
+/// Render `v` as decimal, exactly as `usize`'s `Display` would, without
+/// `format_args!` (its unsafe `fmt::Arguments` construction is unlowerable to
+/// TrustIr, so the strict Trust gate fails closed on the caller).
 ///
 /// The `format!`/`write!` expansion places `std::fmt::Arguments` construction
 /// (an unsafe, unlowerable-to-TrustIr construct) into the calling function's

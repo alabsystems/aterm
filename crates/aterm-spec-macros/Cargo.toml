@@ -16,10 +16,9 @@ proc-macro = true
 test = false
 
 [dependencies]
-# docs/AUDIT-third-party-2026-10-15.md, SP.8: the token cursor, string and integer
-# literals and `compile_error!` the macros read and write with, on std `proc_macro`.
-# No syn, proc-macro2 or quote: `ty_model!` takes five expression shapes, and the
-# anchors pass their item through, rebuilding only a probed fn's body.
+# The token cursor, string and integer literals, and `compile_error!` the
+# macros read and write with on std `proc_macro` (no `syn`, `proc-macro2`, or
+# `quote`).
 aterm-macro-support = { workspace = true }
 
 [dev-dependencies]

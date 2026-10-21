@@ -7,14 +7,13 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
-//! **aterm-net** — how one aterm reaches another over the network: the fleet
-//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5), whose members read
-//! each other's survey, and drive a member only where its person lets them
-//! (§5.1, the step-in).
+//! **aterm-net** — how one aterm reaches another over the network: the fleet,
+//! whose members read each other's survey and drive a member only where its
+//! person lets them.
 //!
 //! The listener is `aterm-gui`'s `fleet_listen`, off by default: it binds only
 //! when aterm.toml sets `[fleet] listen` and the machine holds a fleet key.
-//! What it admits is a fleet peer, never the Owner, but for a drive: a node
+//! What it admits is a fleet peer, never the Owner, except for a drive: a node
 //! that `[fleet] drive_from` grants, proved by the key it was granted under,
 //! whose admitted lines the drive gate dispatches as the Owner's. The reader
 //! is `aterm ctl survey --fleet`, the driver `aterm ctl --host`. The pieces:
@@ -30,19 +29,15 @@
 //!    bridges a proved stream to the control server that answers it (TLS has no
 //!    `UnixStream::try_clone`, so it owns both halves).
 //! 3. `slots` — the listener's slots and the handshake's wall-clock deadline:
-//!    a connection that has proved nothing gives its slot up to a newcomer
-//!    (r13 NET-1), and a peer that dribbles bytes is still cut off at its
-//!    deadline. Modelled as `NetSlotDisplacement` (`aterm-models-core`).
+//!    a connection that has proved nothing gives its slot up to a newcomer,
+//!    and a peer that dribbles bytes is still cut off at its deadline.
+//!    Modelled as `NetSlotDisplacement` (`aterm-models-core`).
 //! 4. [`fleet_member`] — membership (`aterm fleet init|join|peers|allow|leave`):
 //!    the join code, this machine's node id and node key, the issuer's book of
 //!    peers and the node keys it binds, the registration a member makes with
 //!    it and the member's read of that book, and the fleet client `aterm ctl
 //!    survey --fleet` reads every peer through and `aterm ctl --host` drives
 //!    one through ([`fleet_member::drive`]).
-//!
-//! The network drive that stood here before the fleet (`[net]`, `dial`, an
-//! edge token presented to an operator-certified listener that relayed it to
-//! the Owner) was removed on 2026-10-15; design §7 says what replaced it.
 
 use aterm_codec::hex;
 
@@ -83,10 +78,6 @@ const MAX_HEX: usize = 4096;
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let b = s.as_bytes();
     let len = b.len();
-    // Every string that reaches us is a fleet proof's tag or a key file's
-    // digits, each read under a bound far below `MAX_HEX`, so a longer input
-    // can never occur; rejecting it is a no-op that also bounds the
-    // allocation below.
     if len > MAX_HEX {
         return None;
     }

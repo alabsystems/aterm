@@ -220,8 +220,7 @@ fn every_atpkg_marker_constant_has_a_wake_arm() {
              with no answer leaves its notice on screen forever"
         );
     }
-    // The network lane's arrival renders as an install, because to the user that
-    // is exactly what it is.
+    // The network lane's arrival renders as an install.
     match parse_seed_line(&format!(
         "atpkg: {}ay, clean",
         atpkg::cli::NET_INSTALLED_MARKER
@@ -326,8 +325,8 @@ fn a_lock_wait_marker_is_neither_a_start_nor_an_answer() {
         PassVerdict::Busy,
         "waited, then timed out: deferred, never failed"
     );
-    // …and a timed-out wait that says so (0.82.0's `seed-busy:` terminal rides
-    // the same exit 75) is still deferred, never a pass that ran.
+    // …and a timed-out wait that says so (`seed-busy:`, the same exit 75) is still
+    // deferred, never a pass that ran.
     let busy = read(&format!(
         "{line}\natpkg: {}another atpkg process holds the store lock\n",
         atpkg::cli::SEED_BUSY_MARKER

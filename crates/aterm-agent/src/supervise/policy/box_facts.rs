@@ -61,6 +61,10 @@ pub struct BoxFacts {
     pub bypass: bool,
     /// A limit reset was passed over at this dialog's mount.
     pub limit_reset_passed: bool,
+    /// Gemini CLI's usage-limit dialog is due its `Keep trying`: its named
+    /// reset, the grace and the loop's back-off have passed
+    /// ([`ApprovalCtx::limit_retry`]).
+    pub limit_retry: bool,
     /// The worker, where it was read (a box that may run git, a Bash box, a
     /// box an ask rule may have sent), or why it could not be; `None`: not
     /// read.
@@ -118,6 +122,7 @@ pub const FIELDS: &[&str] = &[
     "trusted_cwd",
     "bypass",
     "limit_reset_passed",
+    "limit_retry",
     "worker",
     "shell_cwds",
     "shell",
@@ -180,6 +185,9 @@ impl ApprovalCtx {
         // again at a dialog mount the reset was passed over for.
         ctx.limit_reset = config.limit_reset && !facts.limit_reset_passed;
         ctx.reset_kinds.clone_from(&config.limit_reset_kinds);
+        // Gemini CLI's `Keep trying`, past the reset its dialog names: the
+        // loop's clock, a fact of the box.
+        ctx.limit_retry = facts.limit_retry;
         // A credits consent, under `[harness] usage_credits` alone: policy,
         // no fact of the box.
         ctx.usage_credits = config.usage_credits;
@@ -224,6 +232,7 @@ struct Wire {
     trusted_cwd: Option<String>,
     bypass: bool,
     limit_reset_passed: bool,
+    limit_retry: bool,
     worker: Option<Answer<WorkerWire>>,
     shell_cwds: Vec<String>,
     shell: Option<Answer<ShellWire>>,
@@ -268,6 +277,7 @@ impl BoxFacts {
             trusted_cwd: self.trusted_cwd.as_deref().map(text),
             bypass: self.bypass,
             limit_reset_passed: self.limit_reset_passed,
+            limit_retry: self.limit_retry,
             worker: self.worker.as_ref().map(|w| match w {
                 Ok(w) => Answer::Ok(WorkerWire {
                     digest: format!("{:016x}", w.digest(seed)),
@@ -339,6 +349,7 @@ impl BoxFacts {
             trusted_cwd: wire.trusted_cwd.as_deref().map(path).transpose()?,
             bypass: wire.bypass,
             limit_reset_passed: wire.limit_reset_passed,
+            limit_retry: wire.limit_retry,
             worker: wire
                 .worker
                 .map(|w| match w {

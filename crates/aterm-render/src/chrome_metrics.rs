@@ -4,19 +4,15 @@
 //! Fixed-point typography math for the GUI CHROME (the tray/overlay text the
 //! `aterm-gui` `tray_raster` draws: Settings, About, the command palette).
 //!
-//! Two laws live here as PURE integer functions so they can be checked
-//! exhaustively (the lattice tests below cover every residue the laws depend
-//! on) and then CONSUMED verbatim by the shipping rasterizer — the check is
-//! about the exact arithmetic that places pixels:
+//! Two pure integer laws, checked exhaustively by the lattice tests below and used verbatim
+//! by the rasterizer:
 //!
-//! 1. **Cap-height centering (leading-trim)** — a text run is vertically
-//!    centred in its row by placing the BASELINE at
-//!    `row_center + cap_height/2`, so the gap above the cap box equals the gap
-//!    below the baseline. The historical chrome placed the baseline at
-//!    `y + font_px` (fontdue's em box bottom), which sits ~0.135 em low.
-//!    [`baseline_in_row_q`] encodes the rule in 26.6 fixed point;
-//!    `|top_gap − bottom_gap| <= 1` subunit before device rounding, and
-//!    `<= 1px + 1` subunit after (`cap_centering_lattice`).
+//! 1. Cap-height centring (leading-trim): the baseline sits at `row_center + cap_height/2`,
+//!    so the gap above the cap box equals the gap below the baseline
+//!    ([`baseline_in_row_q`]).
+//! 2. Drift-free pen advance: advances accumulate exactly in 26.6 ([`px_to_q`] plus `i64`
+//!    addition) and each glyph lands at [`q_round_to_px`] of the running pen, so every
+//!    placement is within 0.5px and the error does not accumulate along the run.
 //!
 //! 2. **Drift-free pen advance** — glyph advances accumulate in 26.6 fixed
 //!    point ([`px_to_q`] + plain `i64` addition, which is EXACT), and each
@@ -36,9 +32,8 @@
 /// One device pixel in 26.6 fixed point (Q = 64 subunits per px).
 pub const Q: i64 = 64;
 
-/// Quantize a fractional px length/coordinate to 26.6 fixed point (nearest
-/// subunit, ties away from zero — `f32::round` semantics). Non-finite input
-/// maps to 0 (a degenerate prim, drawn nowhere).
+/// Quantize px to 26.6 fixed point (nearest subunit, ties away from zero). Non-finite input
+/// maps to 0.
 #[must_use]
 pub fn px_to_q(px: f32) -> i64 {
     let q = (f64::from(px) * Q as f64).round();
@@ -65,30 +60,20 @@ pub fn q_round_to_px(q: i64) -> i64 {
     (q + Q / 2).div_euclid(Q)
 }
 
-/// The cap-height-centred BASELINE for a text run in the row box
-/// `[row_top, row_top + row_h)`, all in 26.6 fixed point:
-/// `baseline = row_top + (row_h + cap_h) / 2` — i.e. `row_center + cap_h/2`,
-/// the leading-trim rule. `row_h = 0` degenerates to "centre the cap box on
-/// `row_top`" (used for anchor-centred labels like ring values).
+/// The cap-height-centred baseline for a run in the row `[row_top, row_top + row_h)`, in
+/// 26.6: `row_top + (row_h + cap_h) / 2`. `row_h = 0` centres the cap box on `row_top`
+/// (anchor-centred labels such as ring values).
 ///
-/// # Invariant (checked)
-/// For `0 <= cap_h <= row_h`: with `top_gap = (baseline − cap_h) − row_top`
-/// (space above the cap box) and `bottom_gap = (row_top + row_h) − baseline`
-/// (space below the baseline), `|top_gap − bottom_gap| <= 1` subunit (1/64 px)
-/// — and `<= 1px` on the integer-px lattice — for ALL inputs: the difference
-/// depends only on the parity of `row_h + cap_h`, and `cap_centering_lattice`
-/// sweeps both.
+/// For `0 <= cap_h <= row_h`, the gap above the cap box and the gap below the baseline
+/// differ by at most 1 subunit (`cap_centering_lattice`).
 #[must_use]
 pub fn baseline_in_row_q(row_top_q: i64, row_h_q: i64, cap_h_q: i64) -> i64 {
     row_top_q + (row_h_q + cap_h_q) / 2
 }
 
-/// Cap height of face `index` inside `bytes`, as a RATIO of the em size:
-/// OS/2 `sCapHeight` (via aterm-font) over `units_per_em` when the table
-/// carries it, else the measured height of an actual `'H'` (rasterized at a
-/// reference size by the caller-supplied face). Falls back to `0.7`
-/// (the Latin norm) only when both probes fail, so the centring rule is always
-/// defined.
+/// Cap height of face `index` in `bytes` as a ratio of the em: OS/2 `sCapHeight` over
+/// `units_per_em` when present (OS/2 version 2+), else the ink height of `'H'` rasterized
+/// by `font`, else `0.7`.
 #[must_use]
 pub fn cap_height_ratio(bytes: &[u8], index: u32, font: &crate::font::Font) -> f32 {
     if let Ok(face) = aterm_font::Face::parse(bytes, index)
@@ -111,16 +96,9 @@ pub fn cap_height_ratio(bytes: &[u8], index: u32, font: &crate::font::Font) -> f
 mod tests {
     use super::*;
 
-    /// L0 exhaustive lattice proof of the cap-height centering law.
-    ///
-    /// Integer-px lattice (`q = 64k` — the raster's observable grid): for every
-    /// `(row_h, cap_h)` with `cap_h <= row_h`, `|top_gap − bottom_gap| <= 1px`.
-    /// Sub-px lattice (every subunit): `|top_gap − bottom_gap| <= 1` subunit
-    /// before device rounding, and `<= Q + 1` subunits (1px + 1/64) after the
-    /// baseline snaps to the device grid, which moves both gaps oppositely by
-    /// one rounding delta. Deliberately sweeps odd AND even sizes so the `/2`
-    /// truncation is exercised on both parities, and every residue of the
-    /// baseline mod `Q`, which is all the rounding depends on.
+    /// Cap-height centring: `<= 1px` imbalance on the integer-px lattice; on the subunit
+    /// lattice `<= 1` subunit before device rounding and `<= Q + 1` after. Sweeps both
+    /// parities of `row_h + cap_h` and every baseline residue mod `Q`.
     #[test]
     fn cap_centering_lattice() {
         // Integer-pixel lattice, the law as stated: <= 1px.
@@ -169,9 +147,8 @@ mod tests {
         }
     }
 
-    /// Cap-ratio extraction: the embedded DejaVu Sans Mono carries OS/2
-    /// sCapHeight (729/2048 em ≈ 0.7115); the measured-'H' fallback lands within
-    /// a few percent of it, and both stay in the sane (0.4, 1.0) band.
+    /// The embedded DejaVu's OS/2 table is version 1 (no `sCapHeight`), so both calls take
+    /// the measured-'H' path; the ratio stays in (0.4, 1.0) and the two agree.
     #[cfg(feature = "embedded-font")]
     #[test]
     fn cap_ratio_from_os2_and_measured_h_agree() {

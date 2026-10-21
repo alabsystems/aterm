@@ -19,17 +19,6 @@ use aterm_wayland::protocols::cursor_shape_v1::wp_cursor_shape_device_v1::shape;
 
 use crate::window::CursorIcon;
 
-#[derive(Debug)]
-pub enum SelectedCursor {
-    Named(CursorIcon),
-}
-
-impl Default for SelectedCursor {
-    fn default() -> Self {
-        Self::Named(Default::default())
-    }
-}
-
 /// The icon's cursor-shape-v1 shape (sctk 0.19.2's `cursor_icon_to_shape`).
 pub(crate) fn shape(icon: CursorIcon) -> u32 {
     match icon {

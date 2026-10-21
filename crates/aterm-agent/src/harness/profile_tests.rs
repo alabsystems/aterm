@@ -184,6 +184,261 @@ fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
     assert!(read(&second_env, Some(&lone)).is_some());
 }
 
+/// The footer's display of one profile's bytes at `now`, by the selection's own parse.
+fn parse_subscription(bytes: &[u8], now: i64) -> Result<SubscriptionDisplay, NoProfile> {
+    parse_selected(bytes).map(|selected| selected.subscription(now))
+}
+
+/// The plan usage is read by the footer's own selection and currency rule (Stats Deck v2
+/// T-A1): a reading fetched over fifteen minutes ago or in the future, windows that reset
+/// at or before now, another account's cache, a shared default home whose roster lists
+/// several logins, and an address the roster does not bind each give none. The binding
+/// window is the most used of the five-hour, the seven-day and the model's own, and none
+/// is named while one of them has a share that did not read.
+#[test]
+fn plan_usage_selection() {
+    use super::super::accounts::{Roster, Row};
+
+    let root = tmp_dir("plan-usage");
+    let records = root.path().join(".claude");
+    std::fs::create_dir(&records).unwrap();
+    let profile = root.path().join(".claude.json");
+    let env = vec![format!("HOME={}", root.path().display())];
+    // 2026-10-15T07:40:00Z.
+    let now = 1_792_050_000;
+    let weekly_reset = instant("2026-10-18T20:50:00Z").unwrap();
+    let row = |email: Option<&str>| Row {
+        label: "owner".into(),
+        email: email.map(str::to_owned),
+        ..Row::default()
+    };
+    let owner = Roster {
+        rows: vec![row(Some("owner@example.com"))],
+    };
+    let owned = with(
+        composed(),
+        &["oauthAccount", "emailAddress"],
+        json!("owner@example.com"),
+    );
+    let reading = |fetched: i64, account: &str, body: Value| {
+        with(
+            owned.clone(),
+            &["cachedUsageUtilization"],
+            json!({"fetchedAtMs": fetched * 1000, "accountUuid": account, "utilization": body}),
+        )
+    };
+    let write = |value: &Value| {
+        std::fs::write(&profile, aterm_json::to_string(value).unwrap()).unwrap();
+    };
+    let read = |roster: Option<&Roster>, at: i64, model: Option<&str>| {
+        plan_usage_for(&env, root.path(), &records, roster, at, model)
+    };
+    let binding = |at: i64, model: Option<&str>| {
+        read(Some(&owner), at, model).map(|plan| (plan.window, plan.used_x10))
+    };
+    let window = |pct: f64, resets: &str| json!({"utilization": pct, "resets_at": resets});
+    let scoped = |name: &str, pct: f64| {
+        json!({"kind": "weekly_scoped", "percent": pct, "resets_at": "2026-10-18T20:50:00Z",
+               "scope": {"model": {"display_name": name}}})
+    };
+    let body = |five_hour: Value| {
+        json!({
+            "five_hour": five_hour,
+            "seven_day": window(71.0, "2026-10-18T20:50:00Z"),
+            "seven_day_opus": window(80.0, "2026-10-18T20:50:00Z"),
+            // No reset: it cannot say what remains, so it never binds.
+            "seven_day_sonnet": {"utilization": 99, "resets_at": null},
+            "limits": [scoped("Fable 5.1", 90.0), scoped("Haiku", 99.0)]
+        })
+    };
+    let calm = body(window(62.5, "2026-10-15T12:00:00Z"));
+
+    write(&reading(now, UUID, calm.clone()));
+    assert_eq!(
+        read(Some(&owner), now, None),
+        Some(PlanUsage {
+            account: AccountKey::claude(UUID).unwrap(),
+            window: Bucket::SevenDay,
+            used_x10: 710,
+            resets_at: weekly_reset,
+            read_at: now,
+        })
+    );
+    // The model's own weekly bucket gates it; another model's does not.
+    for (model, expected) in [
+        ("claude-opus-5-5", (Bucket::SevenDayOpus, 800)),
+        ("Opus 5.5", (Bucket::SevenDayOpus, 800)),
+        ("opus", (Bucket::SevenDayOpus, 800)),
+        ("claude-fable-5-1[1m]", (Bucket::Fable, 900)),
+        ("claude-sonnet-5", (Bucket::SevenDay, 710)),
+        ("claude-haiku-4-5-20251001", (Bucket::SevenDay, 710)),
+    ] {
+        assert_eq!(binding(now, Some(model)), Some(expected), "{model}");
+    }
+    // The fifteen minutes include their last second.
+    assert_eq!(binding(now + 15 * 60, None), Some((Bucket::SevenDay, 710)));
+    // A reading kept past its read goes stale by the same rule.
+    let kept = read(Some(&owner), now, None).expect("a current reading");
+    assert!(kept.current_at(now + 15 * 60));
+    assert!(!kept.current_at(now + 15 * 60 + 1));
+    assert!(
+        !kept.current_at(now - 1),
+        "a reading from after now is not current"
+    );
+    let ending = PlanUsage {
+        resets_at: now + 60,
+        ..kept
+    };
+    assert!(ending.current_at(now + 59));
+    assert!(
+        !ending.current_at(now + 60),
+        "a window that resets at now is over"
+    );
+    // The footer's one read answers both as the two readers do.
+    assert_eq!(
+        subscription_and_plan_for(&env, root.path(), &records, Some(&owner), now, Some("opus")),
+        subscription_for(&env, root.path(), &records, Some(&owner), now).zip(Some(read(
+            Some(&owner),
+            now,
+            Some("opus")
+        )))
+    );
+
+    write(&reading(
+        now,
+        UUID,
+        body(window(95.0, "2026-10-15T12:00:00Z")),
+    ));
+    assert_eq!(
+        binding(now, Some("claude-fable-5-1")),
+        Some((Bucket::FiveHour, 950))
+    );
+    // A window that resets at now is over: the next most used binds.
+    write(&reading(
+        now,
+        UUID,
+        body(window(95.0, "2026-10-15T07:40:00Z")),
+    ));
+    assert_eq!(
+        binding(now, Some("claude-fable-5-1")),
+        Some((Bucket::Fable, 900))
+    );
+    write(&reading(
+        now,
+        UUID,
+        json!({"five_hour": window(95.0, "2026-10-15T07:40:00Z"),
+               "seven_day": window(71.0, "2026-10-15T07:00:00Z")}),
+    ));
+    assert_eq!(
+        binding(now, None),
+        None,
+        "every window reset at or before now"
+    );
+
+    // Sonnet's own bucket binds a Sonnet model, by id, display name or alias.
+    write(&reading(
+        now,
+        UUID,
+        json!({"five_hour": window(62.5, "2026-10-15T12:00:00Z"),
+               "seven_day": window(71.0, "2026-10-18T20:50:00Z"),
+               "seven_day_sonnet": window(85.0, "2026-10-18T20:50:00Z")}),
+    ));
+    for model in ["claude-sonnet-5", "Sonnet 5", "sonnet[1m]"] {
+        assert_eq!(
+            binding(now, Some(model)),
+            Some((Bucket::SevenDaySonnet, 850)),
+            "{model}"
+        );
+    }
+    assert_eq!(binding(now, Some("opus")), Some((Bucket::SevenDay, 710)));
+
+    // Of Fable's per-version rows, the one named for the model is its own; a model
+    // named by no row's version (the bare alias) is gated by every Fable row.
+    write(&reading(
+        now,
+        UUID,
+        json!({"five_hour": window(62.5, "2026-10-15T12:00:00Z"),
+               "seven_day": window(71.0, "2026-10-18T20:50:00Z"),
+               "limits": [scoped("Fable 5", 95.0), scoped("Fable 5.1", 75.0)]}),
+    ));
+    for (model, used) in [
+        ("claude-fable-5-1[1m]", 750),
+        ("Fable 5.1", 750),
+        ("claude-fable-5", 950),
+        ("fable", 950),
+    ] {
+        assert_eq!(
+            binding(now, Some(model)),
+            Some((Bucket::Fable, used)),
+            "{model}"
+        );
+    }
+
+    // A window that gates the model but whose share did not read could be the one that
+    // binds, so none is named; a model it does not gate still reads.
+    for share in [json!(null), json!("high")] {
+        write(&reading(
+            now,
+            UUID,
+            json!({"five_hour": window(30.0, "2026-10-15T12:00:00Z"),
+                   "seven_day": window(71.0, "2026-10-18T20:50:00Z"),
+                   "seven_day_opus": {"utilization": share, "resets_at": "2026-10-18T20:50:00Z"}}),
+        ));
+        assert_eq!(binding(now, Some("claude-opus-5-5")), None, "{share:?}");
+        assert_eq!(
+            binding(now, Some("claude-sonnet-5")),
+            Some((Bucket::SevenDay, 710)),
+            "{share:?}"
+        );
+    }
+
+    // The currency rule: stale or future readings say nothing.
+    write(&reading(now, UUID, calm.clone()));
+    assert_eq!(
+        binding(now + 15 * 60 + 1, None),
+        None,
+        "fetched over 15 min ago"
+    );
+    assert_eq!(binding(now - 1, None), None, "fetched in the future");
+    write(&reading(now, "another-account", calm.clone()));
+    assert_eq!(binding(now, None), None, "another account's cache");
+
+    // The selection is the footer's: where it refuses the profile, both say nothing.
+    write(&reading(now, UUID, calm));
+    let several = Roster {
+        rows: vec![
+            row(None),
+            Row {
+                label: "second".into(),
+                dir: Some("/logins/second".into()),
+                email: Some("second@example.com".into()),
+                ..Row::default()
+            },
+        ],
+    };
+    let stranger = Roster {
+        rows: vec![row(Some("someone-else@example.com"))],
+    };
+    for (roster, why) in [
+        (Some(&several), "a shared default home with several logins"),
+        (Some(&stranger), "an address the roster does not bind"),
+        (None, "an unread roster"),
+    ] {
+        assert_eq!(read(roster, now, None), None, "{why}");
+        assert_eq!(
+            subscription_for(&env, root.path(), &records, roster, now),
+            None,
+            "{why}"
+        );
+        assert_eq!(
+            subscription_and_plan_for(&env, root.path(), &records, roster, now, None),
+            None,
+            "{why}"
+        );
+    }
+    assert!(read(Some(&Roster::default()), now, None).is_some());
+}
+
 /// A whole composed profile: every allowlisted field, and a sentinel in
 /// every credential and identity field the real file can hold.
 fn composed() -> Value {
@@ -469,6 +724,30 @@ fn no_credential_identity_or_id_reaches_what_is_answered() {
     assert!(whole.contains(UUID), "the control reader holds the id");
 }
 
+/// A KEY READS BACK FROM ITS TEXT ([`AccountKey::parse`]), as the accounts
+/// state keeps it, Claude's and Codex's alike. NEGATIVE CONTROLS: another
+/// prefix, another length, an uppercase digit and a non-hex digit are no key.
+#[test]
+fn a_key_reads_back_from_its_text_and_nothing_else_does() {
+    let claude = AccountKey::claude(UUID).expect("a key");
+    let codex = AccountKey::codex("acct-1", "user-1").expect("a key");
+    for key in [claude, codex] {
+        assert_eq!(AccountKey::parse(&key.to_string()), Some(key));
+    }
+    let text = claude.to_string();
+    for bad in [
+        text.replacen("c-", "y-", 1),
+        text[..text.len() - 1].to_owned(),
+        format!("{text}0"),
+        format!("c-{}", text[2..].to_uppercase()),
+        format!("c-g{}", &text[3..]),
+        String::new(),
+    ] {
+        assert_ne!(bad, text, "each control changes the key");
+        assert_eq!(AccountKey::parse(&bad), None, "{bad}");
+    }
+}
+
 /// A file that is not one JSON object is the one word `unreadable` — its
 /// sentinels with it, never the parser's message.
 #[test]
@@ -640,7 +919,11 @@ fn the_credits_word_follows_the_cached_reason() {
 }
 
 /// The cached body is kept only where it names the profile's own account,
-/// as Claude Code itself drops it; and only with its fetch time.
+/// as Claude Code itself drops it; and only with its fetch time. One that
+/// names ANOTHER account keeps only when it was fetched: that account was
+/// signed in to the home then (`usage_of_another_at`, the stats'
+/// attribution). NEGATIVE CONTROLS: the body of the profile's own account,
+/// or one that names no account, says no other was seen.
 #[test]
 fn a_cached_body_of_another_account_is_dropped() {
     let other = with(
@@ -649,14 +932,17 @@ fn a_cached_body_of_another_account_is_dropped() {
         json!("7a1e0c3b-5d2f-4e6a-8c9b-1f3e5a7c9d0b"),
     );
     assert_eq!(parsed(&other).usage, None);
+    assert_eq!(parsed(&other).usage_of_another_at, Some(1_792_050_000));
     let unnamed = without(composed(), &["cachedUsageUtilization", "accountUuid"]);
     assert_eq!(parsed(&unnamed).usage, None);
+    assert_eq!(parsed(&unnamed).usage_of_another_at, None);
     let undated = without(composed(), &["cachedUsageUtilization", "fetchedAtMs"]);
     assert_eq!(parsed(&undated).usage, None);
     assert!(
         parsed(&composed()).usage.is_some(),
         "control: the same body, its own account"
     );
+    assert_eq!(parsed(&composed()).usage_of_another_at, None);
 }
 
 // ---------------------------------------------------------------------------

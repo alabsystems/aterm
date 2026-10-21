@@ -519,11 +519,11 @@ pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<Sh
     cards.extend(yours);
     // Then every pack theme the folder has no file for at all: a file that
     // did not load keeps its Needs-attention row instead of a card here.
-    for theme in aterm_theme_pack::themes() {
+    for (theme, parsed) in aterm_theme_pack::themes().iter().zip(parsed_pack()) {
         if themes.lists(theme.id) {
             continue;
         }
-        let Ok(parsed) = aterm_types::scheme::parse_theme_str(theme.text) else {
+        let Some(parsed) = parsed else {
             continue;
         };
         cards.push(
@@ -550,6 +550,21 @@ pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<Sh
         card.slug = slug;
     }
     cards
+}
+
+/// Every pack theme parsed, in [`aterm_theme_pack::themes`]'s order, once per
+/// process: the pack is embedded, so every Settings view built over it
+/// ([`showcase_cards`]) would parse the same text into the same themes. `None`
+/// for a pack file that does not parse.
+fn parsed_pack() -> &'static [Option<aterm_types::scheme::ParsedTheme>] {
+    static PARSED: std::sync::OnceLock<Box<[Option<aterm_types::scheme::ParsedTheme>]>> =
+        std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
+        aterm_theme_pack::themes()
+            .iter()
+            .map(|theme| aterm_types::scheme::parse_theme_str(theme.text).ok())
+            .collect()
+    })
 }
 
 /// The slab's size: wide ("Aa" and four hues), and narrow ("Aa" and two;

@@ -1,24 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REVIEW OF 2026-09-29, ONE TEST PER FINDING (`integration_notice`).
-//!
-//! Each drives the shipping path — the status sweep
-//! (`App::observe_session_statuses`), a session's close
-//! (`App::retire_session_status`), the handoff carry
-//! (`App::carried_messages` / `App::seed_carried_messages`) — and reads only
-//! the message center, so each ran unchanged against the branch's first cut,
-//! where each FAILED:
-//!
-//! * design (a): the row named the tab `tab s-<hex>`;
-//! * design (b): two degraded tabs were two rows;
-//! * design (c): a remedy change resolved the old row `Ok` — a `✓` for a tab
-//!   still degraded — and the heal read no fix words;
-//! * defect 1: a carried row stood for good (a healed tab, a closed tab), and
-//!   a still-degraded tab's carried row was posted again (`×2`);
-//! * defect 2: the harness ending its agent to move it flipped the row to
-//!   `a new tab` and back — a false row and an intermediate `✓`;
-//! * defect 3: the harness's move was promised with no harness to make it.
+//! App-level tests of `integration_notice` through the shipping path: the status sweep
+//! (`App::observe_session_statuses`), a session's close (`App::retire_session_status`) and the
+//! handoff carry (`App::carried_messages` / `App::seed_carried_messages`), reading only the
+//! message center.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,7 +50,7 @@ fn sid(app: &App, id: u64) -> String {
         .to_string()
 }
 
-/// The live rows under the key (the branch keyed one per tab beneath it).
+/// The live rows under the key or beneath it.
 fn live(app: &App) -> Vec<(aterm_messages::MessageId, String, Vec<String>, u32)> {
     app.messages
         .live_rows()
@@ -119,9 +105,7 @@ fn sweep(app: &mut App, t: &mut Instant, by: Duration) {
 
 const STEP: Duration = Duration::from_millis(300);
 
-/// DESIGN (a), rulings 270 and 300: the row names the tab by its PLACE — `in
-/// tab 1` — and never by the raw session id a person never sees, in its title
-/// or in the lines a person reads. The id rides the technical line only.
+/// The row names the tab by its place; the session id rides only the technical line.
 #[test]
 fn the_row_names_the_tab_by_its_place_never_its_session_id() {
     let mut app = App::headless_for_test();
@@ -143,10 +127,8 @@ fn the_row_names_the_tab_by_its_place_never_its_session_id() {
     assert!(detail[0].contains(&place), "named by place: {detail:?}");
 }
 
-/// DESIGN (b), the owner of 2026-09-28 and ruling 374: an update that took
-/// every adopted tab's key is ONE row that counts and names them, never a row
-/// per tab; a tab that heals restates it in place, and the last one's heal
-/// ends it.
+/// Two degraded tabs are one row that counts them; a heal restates it in place, and the last
+/// heal ends it.
 #[test]
 fn two_degraded_tabs_are_one_row_that_counts_them() {
     let mut app = App::headless_for_test();
@@ -180,11 +162,9 @@ fn two_degraded_tabs_are_one_row_that_counts_them() {
     assert!(live(&app).is_empty());
 }
 
-/// DESIGN (c), rulings 265, 266 and 367: a remedy that changed (the agent
-/// left for good) is RESTATED under the key — the same row, never a `✓` for a
-/// tab still degraded — and only the heal resolves it, under its declared
-/// fix words, so the record reads fixed. NEGATIVE CONTROL for the grace: past
-/// [`super::AGENT_MOVE_GRACE`] the flip IS said.
+/// A changed remedy restates the row (never a `✓` for a tab still degraded); only the heal
+/// resolves it fixed. Negative control for the grace: past [`super::AGENT_MOVE_GRACE`] the
+/// flip is said.
 #[test]
 fn a_remedy_change_is_restated_and_only_the_heal_reads_fixed() {
     let mut app = App::headless_for_test();
@@ -256,10 +236,7 @@ fn hand_over(app: &mut App) {
     app.seed_carried_messages(&carry, None);
 }
 
-/// DEFECT 1: rows carry across a seamless update and the readings did not, so
-/// a carried row stood for good. A successor whose first reading of the tab
-/// is HEALED (the typed re-key taken between the parent's last sweep and the
-/// park) ends the carried row, fixed.
+/// A carried row whose tab healed between the parent's last sweep and the park ends fixed.
 #[test]
 fn a_carried_row_whose_tab_healed_meanwhile_ends_fixed() {
     let mut app = App::headless_for_test();
@@ -275,8 +252,7 @@ fn a_carried_row_whose_tab_healed_meanwhile_ends_fixed() {
     assert!(records(&app).iter().any(resolved_ok), "{:?}", records(&app));
 }
 
-/// DEFECT 1, the tab still degraded: the carried row is ADOPTED — the same
-/// row, restated in this build's words, never posted again (no `×2`).
+/// A carried row whose tab is still degraded is adopted: restated, never posted again.
 #[test]
 fn a_carried_row_whose_tab_is_still_degraded_is_adopted_once() {
     let mut app = App::headless_for_test();
@@ -293,8 +269,7 @@ fn a_carried_row_whose_tab_is_still_degraded_is_adopted_once() {
     assert_eq!(after[0].3, 1, "no repeat bumped: {after:?}");
 }
 
-/// DEFECT 1, the tab gone (closed during the handoff): the successor has no
-/// such session, only a healthy one, and withdraws the carried row — no `✓`.
+/// A carried row whose tab closed during the handoff is withdrawn, never a `✓`.
 #[test]
 fn a_carried_row_whose_tab_is_gone_is_withdrawn() {
     let mut parent = App::headless_for_test();
@@ -316,10 +291,8 @@ fn a_carried_row_whose_tab_is_gone_is_withdrawn() {
     );
 }
 
-/// DEFECT 2: to move its agent the harness ENDS it, the shell is in front for
-/// the seconds before the relaunch line re-keys it. That is not a remedy
-/// change: the row never says `a new tab`, and the heal that follows is the
-/// row's one `✓`.
+/// The harness ending its agent to move it is not a remedy change: the row never says
+/// `a new tab`, and the heal that follows is its one `✓`.
 #[test]
 fn the_harness_moving_the_agent_is_not_a_remedy_change() {
     let mut app = App::headless_for_test();
@@ -358,9 +331,8 @@ fn the_harness_moving_the_agent_is_not_a_remedy_change() {
     host.shutdown_and_join();
 }
 
-/// DEFECT 3: the harness's move is the remedy only when the harness will type
-/// its line — on, and moving agents (`[harness] upgrade` or `relaunch`).
-/// With no harness, or one that moves nothing, a new tab is.
+/// The harness's move is the remedy only when the harness will type its line: on, with
+/// `[harness] upgrade` or `relaunch`. Otherwise a new tab is.
 #[test]
 fn the_move_is_offered_only_when_the_harness_will_type_it() {
     let remedy = |app: &App| live(app)[0].2[1].clone();
@@ -452,14 +424,8 @@ fn a_node_hosted_agent_the_harness_moves_heals_with_its_move() {
     }
 }
 
-/// THE SUCCESSOR BEFORE ITS COMMIT (verifier, 2026-09-29): the update that
-/// takes the tabs' keys is when the successor first reads them, and its
-/// harness host starts SUSPENDED until the Commit resumes it — so a word said
-/// then offered `a new tab` for the Claude Code the harness was about to move,
-/// on the glass until the Commit restated it. Nothing is said before Commit;
-/// the first word after it offers the harness's move, and no word under the
-/// key ever said `a new tab`. NEGATIVE CONTROL: the same reading after Commit
-/// is said (the row stands).
+/// A successor says nothing before its Commit (its harness host is suspended, so a word then
+/// would offer `a new tab` for an agent about to be moved); after it, the row offers the move.
 #[test]
 fn the_successor_says_nothing_before_its_commit() {
     let mut app = App::headless_for_test();

@@ -62,9 +62,25 @@ pub const FLEET: &str = "f1";
 pub const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD. Every path here is built
-/// short enough with margin, and this is the check that says so out loud rather
-/// than failing deep inside `bind`.
+/// short enough with margin, and [`assert_sock_fits`] is the check that says so
+/// out loud rather than failing deep inside `bind` or `connect`.
 const MAX_SOCK_PATH: usize = 100;
+
+/// Assert that a socket at `sock` fits `sun_path` as a client that resolves it
+/// dials it: its directory (which exists) canonicalized, as `/tmp` is
+/// `/private/tmp` on macOS.
+fn assert_sock_fits(sock: &str) {
+    let p = Path::new(sock);
+    let dialled = match (p.parent().map(std::fs::canonicalize), p.file_name()) {
+        (Some(Ok(dir)), Some(name)) => dir.join(name),
+        _ => p.to_path_buf(),
+    };
+    assert!(
+        dialled.as_os_str().len() < MAX_SOCK_PATH,
+        "socket path too long for sun_path as dialled: {}",
+        dialled.display()
+    );
+}
 
 /// Wait until `f` answers `Some`, or fail with `what`.
 ///
@@ -804,10 +820,7 @@ impl World {
             .to_string_lossy()
             .into_owned();
         for p in [&broker_sock, &ctl_sock] {
-            assert!(
-                p.len() < MAX_SOCK_PATH,
-                "socket path too long for sun_path: {p}"
-            );
+            assert_sock_fits(p);
         }
 
         let (broker, handle) = if broker_at.is_some() {
@@ -1759,10 +1772,7 @@ impl Fleet {
         let tmp = scratch.path().to_path_buf();
         let broker = open_broker(tmp.join("b.log"), &opts);
         let sock = tmp.join("b.sock").to_string_lossy().into_owned();
-        assert!(
-            sock.len() < MAX_SOCK_PATH,
-            "socket path too long for sun_path: {sock}"
-        );
+        assert_sock_fits(&sock);
         let handle = broker.serve(&sock).expect("serve the broker's socket");
         Self {
             tmp,
@@ -1934,10 +1944,7 @@ impl Node {
             .join("run/aterm/aterm.sock")
             .to_string_lossy()
             .into_owned();
-        assert!(
-            ctl_sock.len() < MAX_SOCK_PATH,
-            "socket path too long for sun_path: {ctl_sock}"
-        );
+        assert_sock_fits(&ctl_sock);
 
         let cap_file = tmp.join("node.cap");
         let caps: String = node_grants(&node).iter().map(|g| cap_line(g)).collect();

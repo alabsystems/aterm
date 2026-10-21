@@ -1705,21 +1705,30 @@ pub fn harness_login_wall_model() -> Model {
 /// `pid`) carries the tap only where its gate holds (`tapped`; `NoChainLook` ignores the owner's
 /// line). The process serves a request (`Reply`: `api` rises, a turn is `served`), moves its
 /// figure on the refresh timer (`BgUsage`), or re-reports (`IdleReport`); each run of a tapped
-/// process leaves a `file`. The host reads it (`Read`), fresh only as §3.2 says (another process
-/// than the last admitted, `lpid`; more API time, `lapi`; another figure, `lfigs`; `NoFresh`
-/// takes every reading), and records the figure (`noted`, the max rule) only for the machine's
-/// account (`NoAttrib`: any). A decided point 30 s on (`Tick30`) ages the file and strikes a
-/// tapped process whose file is stale; two strikes mark it `silent`, only for one that served a
-/// turn (`NoServeGate`: any), and the window is told (`said`) until the mark ends: the process
-/// heard again, or another launched in its place (`NoEndAtRelaunch`: the mark outlives its
-/// process). Ghosts: `stale` (a reading recorded that was no news), `displaced` (a tap put over
-/// the owner's line), `unattrib` (a reading recorded for a process not on the machine's account).
+/// process leaves a `file`. A limit reset used inside the window (`RefillReply`, once: `refill`)
+/// refills it and keeps its reset, and the next reply served shows the figure dropped (the
+/// account-stats design §3.5). The host reads it (`Read`), fresh only as §3.2 says (another
+/// process than the last admitted, `lpid`; more API time, `lapi`; another figure, `lfigs`;
+/// `NoFresh` takes every reading), and records the figure (`noted`, the max rule) only for the
+/// machine's account (`NoAttrib`: any). A drop in the same process's figure, served since, is the
+/// refill seen: the record opens an EPOCH (`epoch`) and takes the lower figure, and a process's
+/// first reading under it says nothing (`NoEpoch`: the max rule across the refill). One process
+/// runs at a time and the window is refilled once, so a drop another session already showed (no
+/// second epoch, by `accounts::note_reading`'s rule) is not modelled; the unit tests hold it. A
+/// decided point 30 s on (`Tick30`) ages the file and strikes a tapped process whose file is
+/// stale; two strikes mark it `silent`, only for one that served a turn (`NoServeGate`: any), and
+/// the window is told (`said`) until the mark ends: the process heard again, or another launched
+/// in its place (`NoEndAtRelaunch`: the mark outlives its process). Ghosts: `stale` (a reading
+/// recorded that was no news), `prior` (a figure kept on record past the refill a reading showed,
+/// one served before it), `displaced` (a tap put over the owner's line), `unattrib` (a reading
+/// recorded for a process not on the machine's account).
 ///
-/// Properties: `NeverNotesStale`, `NeverArmsOverTheOwnersLine`, `NoTapOnlyAfterServe`,
-/// `NothingNotedUnattributed`, `NoMarkOutlivesItsProcess`; one knob per defect, `Buggy = 1` all
-/// five. Tier-1: aterm-agent's `conformance_usage_tap`, over the real `tap::gate`,
-/// `tap::Fresh::admit`, `tap::Silence::step`, `tap::Silence::untapped` and
-/// `accounts::note_reading` on every reachable state.
+/// Properties: `NeverNotesStale` (no idle repeat, and nothing from before the newest reset
+/// epoch), `NeverArmsOverTheOwnersLine`, `NoTapOnlyAfterServe`, `NothingNotedUnattributed`,
+/// `NoMarkOutlivesItsProcess`; one knob per defect, `Buggy = 1` all six. Tier-1: aterm-agent's
+/// `conformance_usage_tap`, over the real `tap::gate`, `tap::Fresh::admit`, `tap::Fresh::beside`,
+/// `tap::Silence::step`, `tap::Silence::untapped` and `accounts::note_reading` on every reachable
+/// state.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_usage_tap_model() -> Model {
@@ -1731,7 +1740,9 @@ pub fn harness_usage_tap_model() -> Model {
             const NoServeGate = 0;
             const NoAttrib = 0;
             const NoEndAtRelaunch = 0;
+            const NoEpoch = 0;
             const MaxPid = 2;
+            const MaxApi = 2;
             var armed = 1;
             var userline = 0;
             var cred = 1;
@@ -1744,11 +1755,14 @@ pub fn harness_usage_tap_model() -> Model {
             var lapi = 0;
             var lfigs = 0;
             var noted = 0;
+            var refill = 0;
+            var epoch = 0;
             var served = 0;
             var strike = 0;
             var silent = 0;
             var said = 0;
             var stale = 0;
+            var prior = 0;
             var displaced = 0;
             var unattrib = 0;
 
@@ -1784,9 +1798,18 @@ pub fn harness_usage_tap_model() -> Model {
 
             // The process: a request served, a figure moved on the timer, a
             // re-report of what it holds. A tapped one writes each time.
-            action Reply when (pid > 0 && 1 > api) {
+            action Reply when (pid > 0 && MaxApi > api) {
                 api = api + 1;
                 served = 1;
+                file = tapped;
+            }
+            // A limit reset used inside the window: the vendor refills it
+            // and keeps its reset, and the next reply shows the drop.
+            action RefillReply when (pid > 0 && MaxApi > api && figs > 0 && refill == 0) {
+                api = api + 1;
+                served = 1;
+                figs = 0;
+                refill = 1;
                 file = tapped;
             }
             action BgUsage when (pid > 0 && 1 > figs) {
@@ -1798,12 +1821,38 @@ pub fn harness_usage_tap_model() -> Model {
             }
 
             // The host at a decided turn end: the file, fresh or not, and
-            // the record of a fresh one for the machine's own login.
+            // the record of a fresh one for the machine's own login. A drop
+            // in the same process's figure, served since, opens the epoch
+            // and is taken; a new process's first reading under the epoch
+            // says nothing; else the larger figure stands.
             action Read when (pid > 0 && file == 1) {
+                prior = if (
+                    (pid > lpid || lpid > pid || api > lapi || figs > lfigs || lfigs > figs ||
+                        Buggy == 1 || NoFresh == 1) &&
+                    (cred == 1 || Buggy == 1 || NoAttrib == 1) &&
+                    pid == lpid && api > lapi && lfigs > figs &&
+                    (Buggy == 1 || NoEpoch == 1) && noted > figs
+                ) { 1 } else { prior };
+                epoch = if (
+                    (pid > lpid || lpid > pid || api > lapi || figs > lfigs || lfigs > figs ||
+                        Buggy == 1 || NoFresh == 1) &&
+                    (cred == 1 || Buggy == 1 || NoAttrib == 1) &&
+                    pid == lpid && api > lapi && lfigs > figs &&
+                    Buggy == 0 && NoEpoch == 0
+                ) { 1 } else { epoch };
                 noted = if (
                     (pid > lpid || lpid > pid || api > lapi || figs > lfigs || lfigs > figs ||
                         Buggy == 1 || NoFresh == 1) &&
                     (cred == 1 || Buggy == 1 || NoAttrib == 1) &&
+                    pid == lpid && api > lapi && lfigs > figs &&
+                    Buggy == 0 && NoEpoch == 0
+                ) {
+                    figs
+                } else if (
+                    (pid > lpid || lpid > pid || api > lapi || figs > lfigs || lfigs > figs ||
+                        Buggy == 1 || NoFresh == 1) &&
+                    (cred == 1 || Buggy == 1 || NoAttrib == 1) &&
+                    (pid == lpid || epoch == 0 || Buggy == 1 || NoEpoch == 1) &&
                     figs > noted
                 ) { figs } else { noted };
                 stale = if (
@@ -1863,7 +1912,7 @@ pub fn harness_usage_tap_model() -> Model {
                 file = 0;
             }
 
-            invariant NeverNotesStale: stale == 0;
+            invariant NeverNotesStale: stale == 0 && prior == 0;
             invariant NeverArmsOverTheOwnersLine: displaced == 0;
             invariant NoTapOnlyAfterServe: silent == 0 || served == 1;
             invariant NothingNotedUnattributed: unattrib == 0;

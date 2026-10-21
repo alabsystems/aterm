@@ -261,10 +261,9 @@ fn backtrack_match(
 ///
 // Not inlined: measured rarely better, often much worse.
 // Skip: the hot loop's offsets and match lengths need loop-invariant
-// synthesis. Without the skip (seal 321aaeda7, `targo trust check -p
-// aterm-lz4 --lib --allow-l0-gaps`) it reads 8 of 21 proved; rewrites
-// measured net-negative. Round-trip tests and the decode fuzz cover it.
-// Re-measure after each `aterm pkg update trust`.
+// synthesis (8 of 21 proved under `targo trust check -p aterm-lz4 --lib
+// --allow-l0-gaps`; rewrites measured net-negative). Round-trip tests and
+// the decode fuzz cover it.
 #[cfg_attr(trust_verify, trust::skip)]
 #[inline(never)]
 pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(

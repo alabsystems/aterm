@@ -183,11 +183,10 @@ fn grapheme_indices_agree_with_graphemes() {
 }
 
 /// winit's Windows backend asks one question of a key event's text, "is it
-/// more than one grapheme cluster?", and until 2026-10-15 asked it of
-/// unicode-segmentation 1.13.3 (`grapheme_indices(true).count() > 1`, Unicode
-/// 17 tables). It asks this crate now (`graphemes().count() > 1`, Unicode 16).
+/// more than one grapheme cluster?" (`graphemes().count() > 1`, Unicode 16;
+/// `unicode-segmentation` 1.13.3 used Unicode 17 tables).
 ///
-/// Recorded once with both crates, before the switch: the answers agree on
+/// Recorded against `unicode-segmentation`: the answers agree on
 /// 1,092 of the 1,093 cases in GraphemeBreakTest-16.0.0.txt, on every scalar
 /// value alone (1,112,064 strings), and on every scalar followed by each of
 /// sixteen probes (U+0301, ZWJ, U+0903, a regional indicator, Hangul L, V, T and

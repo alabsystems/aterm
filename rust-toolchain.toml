@@ -1,14 +1,11 @@
-# The Trust toolchain, always (owner directive 2026-09-28: every ALab system
-# builds with Trust). targo chooses the lane (`targo --unverified <verb>` or
-# `targo trust <verb>`), not this file; `aterm pkg which targo` shows which
-# store build answers, and the release cutter refuses a binary that does not
-# self-report a Trust compiler.
+# Pin the Trust toolchain (`targo --unverified <verb>` or `targo trust <verb>`).
+# `aterm pkg which targo` shows which store build answers, and `ship release`
+# requires a Trust compiler.
 #
 # Stock Rust remains only where Trust lacks a capability: cross targets with no
 # Trust std (the x86_64-apple-darwin compat slice, `verify cells`, the wasm32
 # lanes, the Windows cfg build, the cross cells of `aterm-libc-oracle regen`).
 # Each is labelled `STOCK EXCEPTION` where it runs:
-# `git grep -n 'STOCK EXCEPTION'`. The public snapshot keeps this pin
-# (2026-09-29: a public user installs aterm, and atpkg installs Trust).
+# `git grep -n 'STOCK EXCEPTION'`. The public snapshot keeps this pin.
 [toolchain]
 channel = "trust"

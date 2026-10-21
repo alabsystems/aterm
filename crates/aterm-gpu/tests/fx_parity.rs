@@ -1399,7 +1399,7 @@ fn bloom_fx_layers_feed_the_gpu_bloom() {
             &input.fx_layers,
             &input.fx_occluders,
             &mut aterm_render::FxSlicer::default(),
-            &mut Vec::new(),
+            &mut aterm_render::SpriteCols::default(),
             &mut quads,
         );
         assert!(!quads.is_empty(), "the layer is bloom light");

@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A wall the turn ENDED on is a wall whatever the
-//! agent left running in the background; a `/goal` echo is read through only
-//! to the row its reason can come from; the vendor's going-on notices stay with
-//! the wall they belong to. The measured screen is the owner's tab 1 at 12:19
-//! PDT (`claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt`); the
-//! others are the same frame with one thing changed, each with its control.
+//! A wall the turn ended on is a wall whatever the agent left running in the background;
+//! a `/goal` echo is read through only to the row its reason can come from; the vendor's
+//! going-on notices stay with their wall. The measured screen is
+//! `claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt`; the others vary it.
 
 use crate::prompt::fixtures::screen;
 use crate::{Phase, read};
@@ -86,10 +84,8 @@ fn limited(l: &Look) -> bool {
     matches!(l.phase, Phase::Limited { .. })
 }
 
-/// The measured 2026-09-28 stall: the turn ended on the weekly limit, the tab
-/// counted `1 shell`, and the screen read BUSY for four hours 44 minutes with
-/// nothing typed. A wall the turn ended on now outranks work the agent left
-/// running; a live turn anywhere on the screen still wins.
+/// The turn ended on the weekly limit with `1 shell` counted: a wall the turn ended on
+/// outranks work the agent left running, and a live turn anywhere still wins.
 #[test]
 fn a_wall_the_turn_ended_on_outranks_the_agents_own_background_work() {
     let mut weekly_paused: Vec<&str> = WEEKLY.to_vec();
@@ -140,8 +136,8 @@ fn a_wall_the_turn_ended_on_outranks_the_agents_own_background_work() {
             "{name}"
         );
     }
-    // Other kinds behind a shell: an API error and a login are IDLE with the
-    // wall named; a bucket is a limit.
+    // Other kinds behind a shell: an API error and a login are idle with the wall named;
+    // a bucket is a limit.
     let l = look(&screen(WALL_529_SHELL));
     assert_eq!((l.phase, l.kind), (Phase::Idle, Some("overloaded")));
     let l = look(&frame(
@@ -155,8 +151,8 @@ fn a_wall_the_turn_ended_on_outranks_the_agents_own_background_work() {
     assert!(limited(&l));
     assert_eq!(l.kind, Some("model-bucket"));
     assert_eq!(l.reset, None);
-    // CONTROLS: a live turn anywhere wins — a spinner, `esc to interrupt` in
-    // the footer, a prose reply after the wall, a shell with no wall at all.
+    // Controls: a live turn anywhere wins (a spinner, `esc to interrupt` in the footer),
+    // and a shell under the worker's prose, no wall, is busy.
     for (name, rows) in [
         ("a spinner under the wall", screen(WALL_SPINNER)),
         (
@@ -180,7 +176,7 @@ fn a_wall_the_turn_ended_on_outranks_the_agents_own_background_work() {
         let l = look(&rows);
         assert_eq!((l.phase, l.kind), (Phase::Busy, None), "{name}");
     }
-    // The critical-memory banner over a shell is still BUSY, its wall named.
+    // The critical-memory banner over a shell is still busy, its wall named.
     let banner = format!(
         "{}Critical memory usage (140.4GB) — restart and resume with claude --continue",
         " ".repeat(74)
@@ -189,14 +185,11 @@ fn a_wall_the_turn_ended_on_outranks_the_agents_own_background_work() {
     assert_eq!((l.phase, l.kind), (Phase::Busy, Some("memory")));
 }
 
-/// A WALL THE TURN ENDED ON IS A WALL WHATEVER LIST OF BACKGROUND WORK THE
-/// FOOTER COUNTS: the vendor joins the list with `, ` (`· 1 shell, 1 monitor ·`,
-/// measured 2026-09-28), and a monitor alone is soft busy. An API error, a login
-/// or a full context behind them reads IDLE with the wall named, as behind a
-/// plain shell — read BUSY, the retry ladder, the login escalation and the
-/// `/compact` would never run. CONTROLS: a live turn anywhere still wins, the
-/// worker's prose after the wall is not a wall, and a screen with no wall at all
-/// stays busy under the same footers.
+/// A wall the turn ended on is a wall whatever background work the footer counts (the
+/// vendor joins the list with `, `; a monitor alone is soft busy): an API error, a login
+/// or a full context behind it reads idle with the wall named, so the retry, the login
+/// escalation and `/compact` run. Controls: a spinner still wins, and the worker's prose
+/// with no wall stays busy under the same footers.
 #[test]
 fn a_non_limit_wall_behind_a_monitor_or_a_joined_list_reads_as_behind_a_shell() {
     let walls: [(&str, &[&str], &str); 3] = [
@@ -256,13 +249,13 @@ fn a_non_limit_wall_behind_a_monitor_or_a_joined_list_reads_as_behind_a_shell() 
             );
         }
     }
-    // A LIMIT wall behind the same lists is still a limit.
+    // A limit wall behind the same lists is still a limit.
     for (name, done, footer) in footers {
         let l = look(&frame(WEEKLY, done, "", &[footer]));
         assert!(limited(&l), "a weekly limit behind {name}: {:?}", l.phase);
         assert_eq!(l.kind, Some("usage-weekly"), "{name}");
     }
-    // CONTROLS.
+    // Controls.
     for (name, done, footer) in footers {
         let live = look(&frame(
             &walls[0].1[..1],
@@ -276,14 +269,11 @@ fn a_non_limit_wall_behind_a_monitor_or_a_joined_list_reads_as_behind_a_shell() 
     }
 }
 
-/// Claude Code echoes a wall as a `/goal` notice under the row that caused it,
-/// and the echo is NOT the wall: it read as a session limit with the reset
-/// `to continue`, the real time above it lost. It is read through — but only to
-/// a row its own reason can come from: a rate
-/// limit follows a limit or a 429, an API rejection an API error, and a
-/// `Goal cleared … (<label>)` names its cause's kind. The worker's PROSE that
-/// happens to open with a login's or a full context's words is not a cause: read
-/// through to it, a rate-limited goal check was answered with `/login`.
+/// Claude Code echoes a wall as a `/goal` notice under the row that caused it, and the
+/// echo is not the wall (its `to continue` is no reset). It is read through only to a row
+/// its reason can come from: a rate limit follows a limit or a 429, an API rejection an
+/// API error, and `Goal cleared … (<label>)` names its cause's kind. The worker's prose
+/// opening with a login's or a full context's words is no cause.
 #[test]
 fn a_goal_echo_is_read_through_only_to_the_wall_its_reason_can_come_from() {
     // The measured shape: the limit in a gutter block, the echo under it.
@@ -359,11 +349,9 @@ fn a_goal_echo_is_read_through_only_to_the_wall_its_reason_can_come_from() {
     ));
     assert_eq!(l.kind, Some("auth"));
     assert!(l.message.contains("Goal cleared"), "{}", l.message);
-    // CONTROLS. The echo alone is a 429. The worker's prose about a login, or a
-    // full context, above a rate-limit echo is not its cause. A label that
-    // names another kind than the row above, a reason no wall row can cause
-    // (a hook, a goal check), and a limit above a hook's echo read through to
-    // nothing.
+    // Controls. The echo alone is a 429. The worker's prose about a login or a full
+    // context above a rate-limit echo is not its cause. A label naming another kind than
+    // the row above, and a reason no wall row can cause (a hook), read through to nothing.
     let l = look(&frame(
         &["⏺ Some prose the worker said.", "", ECHO_RATE, ""],
         DONE,
@@ -440,14 +428,11 @@ fn a_reset_is_a_time_or_nothing() {
     assert_eq!(span.reset.as_deref(), Some("in 5s"));
 }
 
-/// The vendor's going-on notices stay with the wall they belong to, where the
-/// supervisor reads them as "Claude Code continues by itself": the armed
-/// countdown (2.1.284's own notification, 2.1.283's banner), and the moment it
-/// FIRES (`Usage limit reset · continuing
-/// automatically`, `Usage limit available again · continuing now`), when the
-/// old wall's reset has passed and typing a `keep going` behind the vendor's
-/// own resume would be a duplicate. NEGATIVE CONTROL: the stale banner
-/// (`… has reset · press enter to continue`) says nothing goes on by itself.
+/// The vendor's going-on notices stay with the wall they belong to, where the supervisor
+/// reads them as "Claude Code continues by itself": the armed countdown, and the moment
+/// it fires (`Usage limit reset · continuing automatically`), when a `keep going` would
+/// duplicate the vendor's own resume. Negative control: the stale banner (`… has reset ·
+/// press enter to continue`) says nothing goes on by itself.
 #[test]
 fn an_armed_countdown_and_the_moment_it_fires_stay_with_the_wall() {
     let under = |toast: &str| {
@@ -471,8 +456,8 @@ fn an_armed_countdown_and_the_moment_it_fires_stay_with_the_wall() {
     ] {
         let l = under(toast);
         assert_eq!(l.kind, Some("usage-session"), "{toast}");
-        // The banner (2.1.283's armed form) is a wall of its own and names the
-        // time; the toasts stand under the gutter row, whose reset is the wall's.
+        // The banner (2.1.283's armed form) is a wall of its own and names the time; the
+        // toasts stand under the gutter row, whose reset is the wall's.
         assert!(
             l.reset.as_deref().is_some_and(|r| r.starts_with("3pm")),
             "{toast}: {:?}",
@@ -507,11 +492,8 @@ fn an_armed_countdown_and_the_moment_it_fires_stay_with_the_wall() {
         "{}",
         l.message
     );
-    // WHERE 2.1.284 draws the two
-    // notifications is unmeasured, so the countdown is found by its wording
-    // wherever it stands outside the composer — a hint above it, a
-    // notification row under it, next to a footer wall — and never in the
-    // composer itself (a person's draft that says it is no countdown).
+    // Where 2.1.284 draws the two notifications is not measured, so the countdown is
+    // found by its wording anywhere outside the composer, never in it (a person's draft).
     let toast = "Continuing automatically at 3pm \u{b7} esc to cancel";
     let wall = "Usage limit reached \u{b7} limit resets 3pm";
     let gutter = [
@@ -564,7 +546,7 @@ fn an_armed_countdown_and_the_moment_it_fires_stay_with_the_wall() {
             l.message
         );
     }
-    // CONTROLS: no notification, no countdown; a draft that says it is none.
+    // Controls: no notification, no countdown; a draft that says it is none.
     let plain = look(&frame(&gutter, DONE, "", &[FOOT_PLAIN]));
     assert!(
         !plain.message.to_lowercase().contains("continuing"),
@@ -584,10 +566,9 @@ fn an_armed_countdown_and_the_moment_it_fires_stay_with_the_wall() {
     );
 }
 
-/// The render incident of 2026-09-28 leaves every row one higher than Claude
-/// drew it, a footer row twice, a hint row fused: none of it hides the wall from
-/// the reader, and a duplicated footer whose copy carries a live signal is
-/// still a live turn (every footer row is scanned).
+/// A screen displaced by a render fault (every row one higher, a footer row twice, a
+/// hint row fused) still shows the wall, and a duplicated footer whose copy carries a
+/// live signal is still a live turn: every footer row is scanned.
 #[test]
 fn a_wall_behind_a_displaced_screen_still_reads_and_a_live_turn_in_a_copy_still_wins() {
     let base = screen(WALL_SHELL);
@@ -626,16 +607,13 @@ fn a_wall_behind_a_displaced_screen_still_reads_and_a_live_turn_in_a_copy_still_
     );
 }
 
-/// The vendor draws its session-limit
-/// banner in the FOOTER while the turn is still WRAPPING UP: tab 1 wore it for
-/// 41 minutes over `✻ Waiting for 1 dynamic workflow to finish` before the
-/// turn ended. That is not the wall the turn ended on: a banner or footer
-/// notice behind background work counts once the status row is a DONE row, and
-/// not before. The vendor's `⎿` block and `⏺` error row are the turn's own
-/// last words and need no done row.
+/// The vendor draws its session-limit banner in the footer while the turn is still
+/// wrapping up (`✻ Waiting for 1 dynamic workflow to finish`): a banner or footer notice
+/// behind background work counts once the status row is a done row, not before. The
+/// `⎿` block and `⏺` error row are the turn's own last words and need no done row.
 #[test]
 fn a_wall_drawn_while_the_turn_wraps_up_is_not_yet_the_end_of_it() {
-    // Measured, 20:41: the banner over `Waiting for …`. The agent works on.
+    // Measured: the banner over `Waiting for …`. The agent works on.
     let l = look(&screen(WRAPUP_WAITING));
     assert_eq!(
         (l.phase.clone(), l.kind),
@@ -643,8 +621,8 @@ fn a_wall_drawn_while_the_turn_wraps_up_is_not_yet_the_end_of_it() {
         "{:?}",
         l.phase
     );
-    // Measured, 21:22: the turn ended (`done 9:22 PM · 1 shell still running`),
-    // the banner and the gutter blocks both on the screen.
+    // Measured: the turn ended (`done 9:22 PM · 1 shell still running`), the banner and
+    // the gutter blocks both on the screen.
     let l = look(&screen(CHECKIN_SHELL));
     assert!(limited(&l), "{:?}", l.phase);
     assert_eq!(l.kind, Some("usage-session"));
@@ -690,8 +668,8 @@ fn a_wall_drawn_while_the_turn_wraps_up_is_not_yet_the_end_of_it() {
         Phase::Busy,
         "no status row: nothing says the turn ended"
     );
-    // CONTROLS. The gutter block is the turn's last word: over a `Waiting for …`
-    // row it is still read ...
+    // Controls. The gutter block is the turn's last word: over a `Waiting for …` row it
+    // is still read ...
     let gutter_waiting: Vec<String> = rows
         .iter()
         .filter(|r| !r.trim_start().starts_with('⚠'))
@@ -705,8 +683,8 @@ fn a_wall_drawn_while_the_turn_wraps_up_is_not_yet_the_end_of_it() {
     let l = look(&gutter_waiting);
     assert!(limited(&l), "{:?}", l.phase);
     assert_eq!(l.kind, Some("usage-session"));
-    // ... and the same screen with the banner cut away and the turn over is
-    // the session window the gutter block NAMES.
+    // ... and with the banner cut away and the turn over, the wall is the session window
+    // the gutter block names.
     let gutter_only: Vec<String> = rows
         .iter()
         .filter(|r| !r.trim_start().starts_with('⚠'))
@@ -719,8 +697,7 @@ fn a_wall_drawn_while_the_turn_wraps_up_is_not_yet_the_end_of_it() {
         l.phase
     );
     assert_eq!(l.reset.as_deref(), Some("9:50pm (America/Los_Angeles)"));
-    // A tab with no background work at all reads the banner at once, as it
-    // always did (RP1 is not asked): a done row, no shell.
+    // A tab with no background work reads the banner at once: a done row, no shell.
     let no_shell: Vec<String> = banner_only
         .iter()
         .map(|r| {
@@ -732,12 +709,8 @@ fn a_wall_drawn_while_the_turn_wraps_up_is_not_yet_the_end_of_it() {
     assert!(limited(&l), "{:?}", l.phase);
 }
 
-/// A message SUBMITTED under the status
-/// row (`❯ …` between the status row and the composer) is drawn a frame before
-/// the spinner of the turn it began. Until that spinner comes the wall above it
-/// is history: `background_wait` already said `None` for it, and the wall's
-/// reading now agrees, a flicker of `agent=wall` and at worst a second
-/// `keep going` fewer.
+/// A message submitted under the status row is drawn a frame before its turn's spinner;
+/// until then the wall above it is history, as `background_wait` already says.
 #[test]
 fn a_message_just_submitted_under_the_status_row_is_a_turn_beginning_not_a_wall() {
     let rows = screen(WALL_SHELL);
@@ -758,11 +731,9 @@ fn a_message_just_submitted_under_the_status_row_is_a_turn_beginning_not_a_wall(
     assert!(!crate::background_only(&queued));
 }
 
-/// The screen is busy ONLY with the agent's own background
-/// work — the question the loop asks to keep waiting on a wall whose rows
-/// have left the screen (a scroll back through the transcript, a local
-/// command's output under it). `/model` and `/usage` were the owner's first
-/// act at the last two walls.
+/// A screen busy only with the agent's own background work is told from a live turn,
+/// so the loop keeps waiting on a wall whose rows have left the screen (scrolled away,
+/// or under a local command's output).
 #[test]
 fn a_screen_busy_only_with_background_work_is_told_from_a_live_turn() {
     let measured = screen(WALL_SHELL);
@@ -829,8 +800,8 @@ fn a_screen_busy_only_with_background_work_is_told_from_a_live_turn() {
         &["  ⏵⏵ bypass permissions on · 1 monitor"],
     );
     assert!(crate::background_only(&monitor));
-    // CONTROLS: a spinner, `esc to interrupt`, a message just submitted, a
-    // shell-less idle screen and a screen with no composer frame are not.
+    // Controls: a spinner, `esc to interrupt`, a shell-less idle screen and a screen with
+    // no composer frame are not.
     let mut live = measured.clone();
     let foot = live
         .iter()
@@ -855,12 +826,9 @@ fn a_screen_busy_only_with_background_work_is_told_from_a_live_turn() {
     );
 }
 
-/// A wall behind background work is ONE reading, whole: the phase is the
-/// limit (with its reset), the wall is there, and the phase is evidence the
-/// cursor vouches for, so what acts on a
-/// reading of a live screen (the server's verdict, the loop's point) sees the
-/// wall and not a busy tab. NEGATIVE CONTROL: the same frame with a spinner
-/// under it reads busy with no wall.
+/// A wall behind background work is one reading: the limit phase with its reset, the
+/// wall, and the phase authoritative with the cursor. Negative control: the same frame
+/// with a spinner under it reads busy with no wall.
 #[test]
 fn a_wall_behind_background_work_is_one_reading() {
     let rows = screen(WALL_SHELL);
@@ -871,8 +839,7 @@ fn a_wall_behind_background_work_is_one_reading() {
     let wall = r.wall.expect("the wall is part of the reading");
     assert_eq!(wall.kind.name(), "usage-weekly");
     assert_eq!(wall.reset.as_deref(), Some("4pm (America/Los_Angeles)"));
-    // A wall stands as read wherever the cursor is (only an `idle` needs the
-    // cursor's vouching).
+    // A wall stands wherever the cursor is: only an `idle` needs the cursor.
     let away = crate::read_at(Some("claude"), &rows, Some(0), Some(2));
     assert!(away.phase_authoritative, "a wall needs no cursor");
 

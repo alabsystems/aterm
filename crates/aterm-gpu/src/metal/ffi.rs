@@ -6,12 +6,9 @@
 //! An offscreen render-and-compute FFI: device, command queue, MSL libraries,
 //! render and compute pipeline states, buffers, textures, samplers, the
 //! pipeline and encoder state the renderer sets, and one-shot encoders that
-//! render into a texture and copy it back. Metal is an OS framework, so only
-//! entry points are declared.
-//!
-//! There is no swapchain here: every destination is a texture this file
-//! allocated or a drawable texture [`super::swapchain`] hands over, and the
-//! QuartzCore link lives in that module.
+//! render into a texture and copy it back. There is no swapchain here: every
+//! destination is a texture this file allocated or a drawable texture
+//! [`super::swapchain`] hands over (the QuartzCore link lives there).
 //!
 //! # Conventions
 //!
@@ -32,18 +29,17 @@
 //! * Autoreleased returns (`colorAttachments`, `objectAtIndexedSubscript:`,
 //!   vertex-descriptor accessors) are borrowed as bare [`Id`] and live until
 //!   the enclosing [`AutoreleasePool`] pops. Every entry point that can
-//!   produce one takes a pool, including ones returning +1, because the
-//!   framework autoreleases privately (device creation, library compile,
-//!   pipeline creation, queue and function lookup). The `error:` entry points
-//!   also need it because the `NSError` out-param is autoreleased into the
-//!   caller's frame.
-//! * Releasing a Metal object also autoreleases (see [`Obj::drop`]); a caller
-//!   holding one [`AutoreleasePool`] across its scope, as a render loop must,
-//!   leaves no unpooled autoreleases.
+//!   produce one pushes a pool, including ones returning +1: the framework
+//!   autoreleases privately (device creation, library compile, pipeline
+//!   creation, queue and function lookup), and `error:` out-params are
+//!   autoreleased into the caller's frame.
+//! * Releasing a Metal object also autoreleases (see [`Obj::drop`]), so a
+//!   caller holds one [`AutoreleasePool`] across its scope, as a render loop
+//!   must.
 //!
 //! # Selector safety
 //!
-//! [`sel`] takes a NUL-terminated byte literal, so a missing NUL is a compile
+//! [`sel`] takes a C-string literal (`c"…"`), so a missing NUL is a compile
 //! error. An unknown selector raises "unrecognized selector" on send, which
 //! aborts; the tests in `super` cover every selector sent here.
 
@@ -58,12 +54,9 @@ pub(crate) use aterm_objc::{ClassPtr, Encode, Id, Sel, checked_msg};
 
 /// The Objective-C `BOOL` for this target, used for every `BOOL` in a send
 /// prototype: `aterm_objc::Bool`, `bool` on arm64 and `i8` (`signed char`) on
-/// x86_64, read as `!= 0`.
-///
-/// Rust's `bool` is wrong on x86_64: it may assume the byte is 0 or 1, and
-/// some `BOOL` getters return a stored non-0/1 byte after it was set, which
-/// would be undefined behaviour through a `bool` slot. On arm64 this is `bool`,
-/// so codegen is unchanged there.
+/// x86_64, read as `!= 0`. Rust's `bool` is wrong on x86_64: some `BOOL`
+/// getters return a stored byte other than 0 or 1, undefined behaviour through
+/// a `bool` slot.
 use aterm_objc::Bool as ObjcBool;
 
 #[link(name = "objc")]
@@ -107,7 +100,7 @@ impl Obj {
         if id.is_null() { None } else { Some(Self(id)) }
     }
 
-    /// Retain a BORROWED reference (an autoreleased or +0 return) to +1.
+    /// Retain a borrowed reference (an autoreleased or +0 return) to +1.
     ///
     /// # Safety
     /// `id` must be a live object pointer, or null.
@@ -233,10 +226,10 @@ pub(crate) fn ns_error_string(err: Id) -> String {
 pub(crate) enum PixelFormat {
     R8Unorm = 10,
     Rgba8Unorm = 70,
-    /// The sRGB-typed VIEW of an `Rgba8Unorm` texture — see [`super::shaders`].
+    /// The sRGB-typed view of an `Rgba8Unorm` texture; see [`super::shaders`].
     Rgba8UnormSrgb = 71,
     Bgra8Unorm = 80,
-    /// The sRGB-typed VIEW of a `Bgra8Unorm` texture.
+    /// The sRGB-typed view of a `Bgra8Unorm` texture.
     Bgra8UnormSrgb = 81,
     Rgba16Float = 115,
 }
@@ -329,10 +322,8 @@ pub(crate) struct BlendState {
 /// The bit order is not the channel order (alpha is bit 0, red bit 3), so each
 /// value is spelled from the header, and
 /// [`super::tests::color_write_mask_gates_each_channel_on_the_gpu`] pins all
-/// four on the GPU. Metal's default is [`Self::ALL`], so every table row states
-/// its mask (`crate::metal::pipelines::metal_write_mask` is the only mapping).
-/// Under the default, an additive effect quad emitting alpha 1.0 would drive a
-/// translucent window's alpha opaque.
+/// four on the GPU. `crate::metal::pipelines::metal_write_mask` is the only
+/// mapping from the table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ColorWriteMask(usize);
 
@@ -501,7 +492,7 @@ impl CompileOptions {
         }
     }
 
-    /// Read back, so a wrong setter PROTOTYPE (the failure mode `msg` exists to
+    /// Read back, so a wrong setter prototype (the failure mode `msg` exists to
     /// prevent) is a test failure rather than a silently ignored write.
     #[cfg(test)]
     pub(crate) fn preserve_invariance(&self) -> bool {
@@ -572,13 +563,12 @@ pub(crate) fn choose_listed(
     sole(display().map(|(i, _)| i)).map(|i| (i, "the only display GPU"))
 }
 
-/// THE METAL DOOR: `MTLCreateSystemDefaultDevice`, the one Metal call that
-/// makes this process a WindowServer client (WindowServer then runs a
-/// synchronous TCC preflight of the binary on its main thread; a unit test that
-/// made that call outran WindowServer's watchdog on 2026-09-01). It is declared
-/// inside [`Device::system_default_asks_window_server`], which is private to
-/// this module, so [`Device::preferred`] is its only caller: no other code in
-/// the crate, test code included, can name either.
+/// The Metal door: `MTLCreateSystemDefaultDevice`, the one Metal call that makes
+/// this process a WindowServer client. WindowServer then runs a synchronous TCC
+/// preflight of the binary on its main thread, long enough for a test binary's
+/// call to trip WindowServer's watchdog. It is declared inside the private
+/// [`Device::system_default_asks_window_server`], so [`Device::preferred`] is its
+/// only caller: no other code in the crate, tests included, can name either.
 mod window_server_door {
     use super::{AutoreleasePool, Device, Id, Obj};
 
@@ -587,23 +577,16 @@ mod window_server_door {
         ///
         /// A terminal needs no discrete GPU, and on a dual-GPU MacBook Pro the
         /// system default is the discrete one. Like the wgpu arm's
-        /// `PowerPreference::LowPower`, this picks the first low-power, non-headless
-        /// device `MTLCopyAllDevices` lists, unless the development seam
-        /// `ATERM_GPU_POWER=high` asks otherwise. Per `MTLDevice.h`,
-        /// `MTLCreateSystemDefaultDevice` switches an automatic-switching Mac to the
-        /// high-power GPU while `MTLCopyAllDevices` does not, so the system default
-        /// is not created when a low-power device exists.
-        ///
-        /// `MTLCreateSystemDefaultDevice` also makes the process a WindowServer
-        /// client (WindowServer runs a tccd preflight on it); `MTLCopyAllDevices`
-        /// does not. When the listing has exactly one display GPU, that GPU is the
-        /// system default, so it is returned from the listing and headless
-        /// processes (and test binaries) never touch WindowServer.
+        /// `PowerPreference::LowPower`, this picks the first low-power display GPU
+        /// `MTLCopyAllDevices` lists, unless the `ATERM_GPU_POWER=high` seam asks
+        /// otherwise. `MTLCreateSystemDefaultDevice` switches an
+        /// automatic-switching Mac to the high-power GPU (`MTLDevice.h`) and makes
+        /// the process a WindowServer client; `MTLCopyAllDevices` does neither.
+        /// With exactly one display GPU, that GPU is the system default, so
+        /// headless processes and test binaries never touch WindowServer.
         ///
         /// The system default is created only when the listing cannot decide
-        /// ([`choose_listed`](super::choose_listed)): several non-low-power
-        /// display GPUs, none at all, or the `high` seam with two or more
-        /// display GPUs.
+        /// ([`choose_listed`](super::choose_listed)).
         pub(crate) fn preferred() -> Option<Self> {
             let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
                 .is_some_and(|v| v.eq_ignore_ascii_case("high"));
@@ -851,7 +834,7 @@ impl Device {
     }
 
     /// An `MTLSamplerState` with `desc`'s filters and address modes. Every
-    /// field is written, including default values (see [`SamplerFilter`]).
+    /// field is written, defaults included.
     pub(crate) fn new_sampler(&self, desc: SamplerDesc) -> Option<Obj> {
         let _pool = AutoreleasePool::new();
         // SAFETY: `MTLSamplerDescriptor` is alloc/init (+1, released by `Obj`);
@@ -937,7 +920,7 @@ impl RenderPipelineDescriptor {
     }
 
     pub(crate) fn set_vertex_function(&self, f: &Obj) {
-        // SAFETY: the descriptor RETAINS the function; both outlive the call.
+        // SAFETY: the descriptor retains the function; both outlive the call.
         unsafe {
             let s: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             s(self.0.id(), sel(c"setVertexFunction:"), f.id());
@@ -1050,7 +1033,7 @@ impl VertexDescriptor {
         buffer: usize,
     ) {
         let _pool = AutoreleasePool::new();
-        // SAFETY: `attributes` and its subscript return BORROWED autoreleased
+        // SAFETY: `attributes` and its subscript return borrowed autoreleased
         // objects owned by the pool above.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
@@ -1090,7 +1073,7 @@ impl VertexDescriptor {
 // against the CPU (`super::tests::fire_field_matches_the_cpu_bit_for_bit`).
 // ---------------------------------------------------------------------------
 
-/// `MTLSize`, passed BY VALUE to the dispatch selectors.
+/// `MTLSize`, passed by value to the dispatch selectors.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MtlSize {
@@ -1194,8 +1177,8 @@ pub(crate) fn dispatch_compute(
         for (i, b) in buffers.iter().enumerate() {
             set_buf(enc, sel(c"setBuffer:offset:atIndex:"), b.id(), 0, i);
         }
-        // A 8x8 threadgroup is safely under the 1024-thread minimum every Metal
-        // device guarantees, so no per-device query is needed.
+        // An 8x8 threadgroup is under the 1024-thread minimum every Metal device
+        // guarantees, so no per-device query is needed.
         let tg = MtlSize {
             width: 8,
             height: 8,
@@ -1333,8 +1316,8 @@ unsafe impl Encode for MtlViewport {
 }
 
 impl MtlViewport {
-    /// The whole of a `width` x `height` attachment, depth `0..1` — what
-    /// `renderer.rs:8846` sets before every scissored pass.
+    /// The whole of a `width` x `height` attachment, depth `0..1`, as the wgpu
+    /// `present_to_view` sets before its blit.
     pub(crate) fn full_2d(width: usize, height: usize) -> Self {
         Self {
             origin_x: 0.0,
@@ -1565,7 +1548,7 @@ pub(crate) struct DrawCall<'a> {
 }
 
 /// Run the pass (the fullscreen triangle, or [`Pass::draw`]'s geometry) and
-/// copy the result into `readback`.
+/// copy the result into `readback`, which must be Shared storage.
 ///
 /// One command buffer holds the render pass and the texture -> buffer blit, so
 /// encoder order sequences them; `waitUntilCompleted` makes the bytes visible.
@@ -1574,11 +1557,10 @@ pub(crate) struct DrawCall<'a> {
 /// Binding indices are caller-spelled, from the table's `BindSpec` for a table
 /// row.
 ///
-/// Safe and checked, unlike `texture_upload`, `buffer_write`, `buffer_u32s`
-/// and `buffer_bytes`, whose preconditions depend on GPU/CPU ordering. This
-/// function owns its ordering (creates, commits and waits the command buffer)
-/// and validates the destination format and extent and the readback length
-/// against the live objects, returning `Err` on a mismatch.
+/// Safe, unlike `texture_upload`, `buffer_write`, `buffer_u32s` and
+/// `buffer_bytes`: this function owns its GPU/CPU ordering and validates the
+/// destination format and extent and the readback length against the live
+/// objects, returning `Err` on a mismatch.
 #[cfg(test)]
 pub(crate) fn draw_and_read(
     queue: &Obj,
@@ -1743,7 +1725,7 @@ pub(crate) fn draw_and_read(
         let void_msg: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
         void_msg(enc, sel(c"endEncoding"));
 
-        // Texture -> buffer, in the SAME command buffer, so it is ordered after
+        // Texture -> buffer in the same command buffer, so it is ordered after
         // the pass above without an explicit barrier.
         let blit = get(cb, sel(c"blitCommandEncoder"));
         let copy: unsafe extern "C-unwind" fn(

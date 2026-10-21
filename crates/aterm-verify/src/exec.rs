@@ -138,6 +138,16 @@ impl Cmd {
     /// paint probe's timers late and goes red. So the test run, the measuring
     /// tests, the GUI smoke, the drives and every other child that RUNS code keep
     /// the inherited tier. That is why this is opt-in per child, not a default.
+    ///
+    /// WHAT IT COSTS, AND WHY NOT `nice`. The clamp also puts the child on the
+    /// efficiency cores, so a compile whose tail is one long serial pass runs that
+    /// tail about half again as slow. `nice -n 15` keeps the full speed and loses
+    /// what the clamp is for: a raw-mode child beside CPU-bound processes echoes
+    /// on time only while they are demoted, not while they are niced or at the
+    /// inherited tier. Both measured on a named trustc build:
+    /// `docs/measured/test-compile-tail-2026-10-21.md`. The serial tail is the
+    /// compiler's to shorten (`[profile.test]` in the root manifest says where it
+    /// goes).
     #[must_use]
     pub fn demoted(mut self) -> Self {
         self.demoted = true;
@@ -230,8 +240,8 @@ impl Run {
             return Some(format!("the child ran out of disk ({ENOSPC_SENTENCE})"));
         }
         // The row names what the machine lacks and its provider's fix (no fish here:
-        // `targo --unverified verify provision` builds …), where its reader looks, not
-        // only in the log.
+        // ATERM_TEST_FISH=<path> names one; …), where its reader looks, not only in the
+        // log.
         crate::libtest::environment_refusals(&self.output)
             .map(|names| crate::libtest::refusal_reason("every failing test", &names, &self.output))
     }

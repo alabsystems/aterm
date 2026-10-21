@@ -1,59 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `libm`: a first-party facade for the crates.io package of the same name
-//! (the directory is `crates/aterm-libm`; the manifest says why the names
-//! differ). It is wired in through `[patch.crates-io]` and replaces the
-//! vendored fork that lived at `vendor/libm` (19,867 lines and a build script,
-//! forked only because upstream's `i64::abs` at `MIN` is an overflow Trust
-//! refuses to compile).
-//!
-//! # Scope: the 68 functions the graph names
-//!
-//! Upstream is a pure-Rust port of musl's libm, written for `#![no_std]`
-//! code. This crate is not a port: each function forwards to the `std`
-//! method that computes the same thing, and only the functions a consumer in
-//! aterm's graph names exist. Two consumers name 68 between them:
-//!
-//! * **num-traits 0.2.19**, `float.rs` `float_impl_libm!` and the `FloatCore`
-//!   rounding methods: 33 functions per float width (66). They are compiled
-//!   under `cfg(all(not(feature = "std"), feature = "libm"))`, and that is the
-//!   live arm on every cell that has naga: naga and `half` take num-traits with
-//!   `default-features = false`, and `half` turns on `libm`. So
-//!   `num_traits::Float` for `f32`/`f64` IS this crate wherever wgpu ships.
-//! * **naga 29**, `proc/constant_evaluator.rs`: `asinh`, `rint` and `rintf`
-//!   (two new names) when it folds a constant expression.
-//!
-//! A new consumer that names another function fails to COMPILE, loudly; add
-//! the forward here (or drop the patch row), never a silent fallback.
+//! First-party `libm` facade wired via `[patch.crates-io]`, forwarding the
+//! 68 `f32`/`f64` math functions used by `num-traits` (66 functions in
+//! `float_impl_libm!` / `FloatCore`) and `naga` (`asinh`, `rint`, `rintf`)
+//! to `std`.
 //!
 //! # Fidelity
 //!
-//! * Bit-identical, exactly specified IEEE operations: `floor`, `ceil`,
-//!   `round`, `trunc`, `fabs`, `copysign`, `sqrt`, `fma` (one rounding), `rint`
-//!   (round half to even, upstream's answer in the default rounding mode),
-//!   and `fdim`, whose body is upstream's `generic::fdim` reproduced.
-//! * Implementation-defined, the transcendentals: std calls the platform's
-//!   libm, which may differ from musl's by an ulp. On `wasm32-unknown-unknown`
-//!   std's own math symbols come from compiler-builtins, which IS this
-//!   upstream, so there the answers are upstream's. The exception is `atanh`
-//!   / `atanhf`: std computes those itself on every target, as
-//!   `0.5 * ((2x) / (1 - x)).ln_1p()`, not through the platform's libm. The
-//!   facade evaluates their magnitude and restores the sign: evaluating that
-//!   formula directly near `-1` loses precision when its ratio approaches `-1`.
+//! * **Exact IEEE operations**: `floor`, `ceil`, `round`, `trunc`, `fabs`,
+//!   `copysign`, `sqrt`, `fma`, `rint`, and `fdim`.
+//! * **Transcendentals**: forwarded to `std` (platform libm on native,
+//!   `compiler-builtins` musl libm on `wasm32-unknown-unknown`). `atanh` and
+//!   `atanhf` evaluate `std`'s `ln_1p` formula on `x.abs()` and restore the
+//!   sign to avoid cancellation near `-1`. Verified against recorded musl
+//!   outputs in `tests/recorded.rs`.
 //!
-//! `tests/recorded.rs` holds both halves against answers recorded from the
-//! retired fork before the switch; its ulp tolerance has been measured on
-//! aarch64-apple-darwin only.
-//!
-//! # Not equivalent
-//!
-//! **Upstream is `#![no_std]`; this needs `std`.** Every aterm cell has it,
-//! `wasm32-unknown-unknown` included. The features (`arch`,
-//! `force-soft-floats`, `unstable*`) are accepted and ignored.
-//!
-//! The crate retires with naga: when no WGSL ships (the gpu-wgpu unit of
-//! docs/AUDIT-third-party-2026-10-15.md), delete it and its patch row.
+//! Requires `std` (present on all aterm targets, including
+//! `wasm32-unknown-unknown`); upstream feature flags (`arch`,
+//! `force-soft-floats`, `unstable*`) are accepted as no-ops.
 
 #![warn(missing_docs)]
 

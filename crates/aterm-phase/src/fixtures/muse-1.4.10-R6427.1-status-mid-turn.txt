@@ -1,0 +1,39 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.108.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · after one ended turn, `a slow turn` in the stub's `slow` mode, then `/status` typed (the menu's only row) and Enter 5 s into it: where the card goes while the turn runs · the lab's random project dir is spelled /private/tmp/at.lab0 here, the session id is spelled 00000000-0000-0000-0000-000000000000 here
+
+  Muse Code 1.4.10
+
+❯ carry on with the task
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+❯ a slow turn
+
+◆ tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  MUSE CODE 1.4.10 / sea-pasiphae                                            RUNNING │
+│                                                                                     │
+│  MODEL          lab-stub · high                                                     │
+│                 meta · native-basic                                                 │
+│                                                                                     │
+│  WORKSPACE      /private/tmp/at.lab0/proj                                           │
+│                 trusted · not found                                                 │
+│  ACCESS         Auto-review                                                         │
+│                 META_API_KEY environment                                            │
+│                                                                                     │
+│  USAGE          33,454 tokens · 1 turn · 0 subagents                                │
+│  CONTEXT        91% left · 18.9K used / 200K · normal                               │
+│                 Usage: cumulative session tokens; context: current prompt estimate. │
+│                                                                                     │
+│  SESSION        00000000-0000-0000-0000-000000000000                                │
+│  ACTIVITY       no tasks                                                            │
+│                 0 terminals · inbox clear                                           │
+│  SUBMISSION     turn.submit pending                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+◆ Thinking (15s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

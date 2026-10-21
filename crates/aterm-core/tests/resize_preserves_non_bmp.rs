@@ -1,18 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Resizing must not turn on-screen non-BMP cells (emoji, CJK-SMP) into
-//! U+FFFD, including bases stored apart from their cluster tails.
-//!
-//! The hot write path stores a non-BMP codepoint in a per-viewport
-//! ComplexCharRing; every resize path, including rows-only and no-reflow ones,
-//! migrates it into the persistent extras before invalidating the rings. A
-//! rows-only resize is what a host does after a lazy font injection changes
-//! cell metrics.
+//! Resizing keeps on-screen non-BMP cells (emoji, CJK-SMP) instead of turning them into
+//! U+FFFD, including bases stored apart from their cluster tails. The write path stores a
+//! non-BMP codepoint in a per-viewport `ComplexCharRing`; every resize path, rows-only and
+//! no-reflow included, migrates it into the persistent extras before invalidating the rings.
+//! A host resizes rows-only when a font change alters cell metrics.
 
 use aterm_core::terminal::Terminal;
 
-/// Q😀Z written through the real hot path (process) lands 😀 in the complex ring.
+/// Written through `process`, its 😀 lands in the complex ring.
 const EMOJI_LINE: &[u8] = b"Q\xf0\x9f\x98\x80Z"; // Q😀Z
 
 fn emoji_row(t: &Terminal, max_rows: u16) -> Option<String> {
@@ -86,8 +83,7 @@ fn column_reflow_preserves_parser_clusters_and_render_payloads() {
         assert_eq!(before.clusters[0].len(), 4);
         assert_eq!(before.combining[0].len(), 1);
 
-        // No-wrap shrink, actual split, merge, and restoration all use the
-        // real parser/grid path; no manufactured full-string extras mask it.
+        // No-wrap shrink, split, merge and restore, all through the real parser and grid.
         for cols in [52, 7, 128, 80] {
             terminal.resize(28, cols);
             let text: String = (0..28)

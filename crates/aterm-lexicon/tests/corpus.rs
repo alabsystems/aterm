@@ -1,11 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Positive / negative corpus and the lexicon validator.
-//!
-//! These are the correctness contract for the matcher: every listed surface form
-//! must classify as itself, every Scunthorpe / code-context decoy must NOT match,
-//! and CJK incidental compounds must be suppressed.
+//! Positive / negative corpus and the lexicon validator: every listed surface classifies as
+//! itself, Scunthorpe and code-context decoys do not match, and CJK incidental compounds are
+//! suppressed.
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions, primary_lang};
 
@@ -179,11 +177,8 @@ fn code_and_path_context_suppressed() {
     }
 }
 
-/// THE SAME LAW, ON THE NO-SPACE ARM. `code_and_path_context_suppressed` above
-/// walks the SPACED arm of the scanner. A maximal no-space run is that arm's
-/// whole token — delimited by a script change exactly as a spaced token is
-/// delimited by a non-token character — so the same paths, flags and URLs must
-/// be just as quiet around Han, Hangul and Thai.
+/// The code/path/URL guard on the no-space arm: a maximal no-space run is that arm's whole token,
+/// so paths, flags and URLs are as quiet around Han, Hangul and Thai as around spaced text.
 #[test]
 fn code_and_path_context_suppressed_in_no_space_scripts_too() {
     let o = opts_allow_cat();
@@ -205,8 +200,7 @@ fn code_and_path_context_suppressed_in_no_space_scripts_too() {
             "false positive in a no-space code context {code:?}"
         );
     }
-    // …and the CONTROL, or the assertion above would also pass on a scanner
-    // that had simply stopped reading no-space scripts at all.
+    // Control: the no-space arm still decorates prose.
     for prose in ["子猫 が かわいい", "고양이 귀엽다", "แมว น่ารัก"]
     {
         assert!(
@@ -216,13 +210,9 @@ fn code_and_path_context_suppressed_in_no_space_scripts_too() {
     }
 }
 
-/// A MARKS-REQUIRED FELINE KEY IS NOT THE SHELL COMMAND. `allow_bare_cat`
-/// exists because "`cat` is also the ubiquitous shell command", and the guard
-/// it drives suppressed every feline surface of <= 3 folded chars. Vietnamese
-/// `mèo` folds to `meo` — three — but is marks-required, so no bare-ASCII
-/// typing can ever reach it, and it is the only single-token cat word vi has:
-/// the short-feline guard must not silence it. Two-sided: bare `cat` must stay
-/// opt-in.
+/// `allow_bare_cat` gates feline surfaces of ≤ 3 folded chars because `cat` is the shell command.
+/// vi `mèo` folds to `meo` but is marks-required, so bare ASCII never reaches it, and it is vi's
+/// only single-token cat word: the guard must not silence it. Bare `cat` stays opt-in.
 #[test]
 fn a_marks_required_short_feline_is_not_the_bare_cat_command() {
     let vi = Lexicon::with_languages(&["vi"]);
@@ -231,8 +221,7 @@ fn a_marks_required_short_feline_is_not_the_bare_cat_command() {
     let got: Vec<Class> = vi.scan("mèo", &o).into_iter().map(|m| m.class).collect();
     assert_eq!(got, vec![Class::Feline], "vi lost its only cat word");
     assert_eq!(chars.len(), 3, "fixture: the surface really is three chars");
-    // The bare spelling still matches NOTHING — that is what marks-required
-    // means, and it is why this surface was never in the knob's blast radius.
+    // The bare spelling matches nothing, with or without the knob.
     assert!(
         vi.scan("meo", &o).is_empty() && vi.scan("meo", &opts_allow_cat()).is_empty(),
         "bare ASCII must never reach a marks-required key"
@@ -244,12 +233,9 @@ fn a_marks_required_short_feline_is_not_the_bare_cat_command() {
     );
 }
 
-/// MARKS-REQUIRED IS A PROPERTY OF THE KEY, NOT OF THE CLASS. hu `cicák`
-/// (kitties, feline, marked) and id `cicak` (the house gecko, animal, bare)
-/// fold to one key. Feline outranks animal, but the precedence replacement
-/// must keep the bare claimant's testimony: otherwise the bare spelling the
-/// data authored matches NOTHING, and ADDING a language switches off a word
-/// that worked without it.
+/// Marks-required belongs to the key, not the class: hu `cicák` (feline, marked) and id `cicak`
+/// (gecko, animal, bare) fold to one key, and the feline replacement keeps the bare claimant's
+/// testimony, so adding a language never silences a working word.
 #[test]
 fn a_bare_claimant_keeps_its_key_matchable_across_a_precedence_replacement() {
     let o = opts_allow_cat();
@@ -277,13 +263,8 @@ fn a_bare_claimant_keeps_its_key_matchable_across_a_precedence_replacement() {
         assert_eq!(got, vec![Class::Feline], "{langs:?}: hu lost cicák");
     }
 
-    // BOTH ARMS, which the shipped data cannot reach on its own. `cicak`'s
-    // two claimants arrive in one fixed file order, so exactly ONE of
-    // `insert_class`'s precedence arms — the DROP — decides it, and the
-    // mirror arm (the bare claimant arriving FIRST and being replaced) would
-    // sit unexercised and rot. A synthetic document puts the same two rows in
-    // both orders: the key must be matchable either way, or the rule is an
-    // accident of file order rather than a law.
+    // Synthetic rows in both orders reach both precedence arms of `insert_class` (replace and
+    // drop), which the shipped data's one file order cannot: the key matches either way.
     let rows =
         |first: &str, second: &str| format!("{first}\n{second}\n", first = first, second = second);
     let feline = "[[entry]]\nclass=\"feline\"\nlang=\"hu\"\nmode=\"forms\"\ncjk=false\nambiguous=false\nforms=[\"zzcicák\"]\n";
@@ -337,8 +318,8 @@ fn cjk_single_char_is_opt_in() {
 
 #[test]
 fn cjk_incidental_compounds_suppressed() {
-    // Even with single-char matching ON, exception compounds must not fire.
-    // (熊猫 is a panda: `animal_multilingual::panda_compounds_are_pandas_...`.)
+    // Exception compounds stay silent even with single-char matching on (熊猫 is a panda: see
+    // `animal_multilingual`).
     let on = ScanOptions {
         cjk_single_char: true,
         ..ScanOptions::default()
@@ -354,11 +335,8 @@ fn cjk_incidental_compounds_suppressed() {
 
 // ------------------------------------------------------------------ validator
 
-/// For a marks-required key (every claiming surface folded diacritics into
-/// bare ASCII — `đm` → `dm`), the bare key itself must NOT scan; a token that
-/// carries any folded-away mark still reaches it. Synthesize that witness by
-/// riding a combining acute on the first letter: `fold` strips it back to the
-/// exact key, and `has_foldable_marks` sees it.
+/// A token that reaches a marks-required key (whose bare form must not scan): the key with a
+/// combining acute on its first letter, which `fold` strips and `has_foldable_marks` sees.
 fn marked_witness(folded_key: &str) -> String {
     let mut chars = folded_key.chars();
     let mut out = String::with_capacity(folded_key.len() + 2);
@@ -378,9 +356,8 @@ fn every_surface_round_trips() {
         cjk_single_char: true,
         ..ScanOptions::default()
     };
-    // Spaced surfaces: each folded form, scanned alone, classifies as itself.
-    // A marks-required key (the `dmg` fix) inverts: bare stays silent, and
-    // the marked witness is what round-trips.
+    // Each folded spaced surface, scanned alone, classifies as itself. A marks-required key
+    // inverts: the bare key stays silent and the marked witness round-trips.
     for (surface, class) in lx.iter_spaced() {
         if lx.surface_requires_marks(surface) {
             assert!(
@@ -402,7 +379,7 @@ fn every_surface_round_trips() {
             "surface {surface:?} ({class:?}) did not round-trip; got {got:?}"
         );
     }
-    // CJK surfaces likewise (unless it is itself an exception substring — none are).
+    // CJK surfaces likewise (none is itself an exception).
     for (surface, class) in lx.iter_cjk() {
         let got = lx.scan(surface, &o);
         assert!(
@@ -464,12 +441,8 @@ fn user_override_extends_coverage() {
     assert_eq!(lx.scan("fucking", &o).len(), 1);
 }
 
-/// v3 §6: USER surfaces that can never scan as written — a single-char CJK
-/// form (dropped at scan unless `cjk_single_char = true`) and a mixed-script
-/// form (dropped at insert) — surface on the `conflicts` channel. Builtin data stays conflict-free (the
-/// embedded single-char 操/草/干 and multi-word "con mèo" entries are
-/// deliberate and quiet) — pinned by `animal_multilingual.rs`'s
-/// `expanded_builtin_stays_conflict_free`.
+/// User surfaces that can never scan as written are reported on `conflicts`: a single-char CJK
+/// form (scans only with `cjk_single_char = true`) and a mixed-script form (dropped at insert).
 #[test]
 fn user_unscannable_surfaces_surface_as_conflicts() {
     let extra = concat!(
@@ -504,10 +477,8 @@ fn user_unscannable_surfaces_surface_as_conflicts() {
 
 // ------------------------------------------------- marks-required gate ----
 
-/// THE RULE: a surface that loses diacritics into a bare-ASCII
-/// key (`đm` → `dm`, `coño` → `cono`) matches only tokens that themselves
-/// carry folded-away marks. The bare skeleton is ordinary text — `dm` is how
-/// one types `dmg`, `cono` sits inside `conoid` — and stays silent.
+/// A surface that loses diacritics into a bare-ASCII key (`đm` → `dm`, `coño` → `cono`) matches
+/// only tokens that carry folded-away marks; the bare skeleton is ordinary text (`dmg`, `conoid`).
 #[test]
 fn lossy_folded_surfaces_do_not_match_their_bare_skeleton() {
     let o = default_opts();
@@ -523,14 +494,13 @@ fn lossy_folded_surfaces_do_not_match_their_bare_skeleton() {
             "bare skeleton {bare:?} must not match {marked:?}"
         );
     }
-    // The consent counter-example: German lists `scheisse` EXPLICITLY beside
-    // `scheiße`, so the merged key matches bare text (same-class AND-merge).
+    // German lists `scheisse` beside `scheiße`, so the merged key matches bare text (same-class
+    // AND-merge).
     assert_eq!(classes("scheisse", &o), vec![Class::Profanity]);
 }
 
-/// Explicit config is consent (the same law as v3 §6): a USER override that
-/// lists the bare skeleton as its own surface compiles it unflagged, so it
-/// matches — the gate only binds surfaces that never spelled the skeleton.
+/// Explicit config is consent: a user override listing the bare skeleton as its own surface
+/// compiles it unflagged, so it matches.
 #[test]
 fn user_override_opts_a_bare_skeleton_in() {
     let over = "[[entry]]\nclass=\"profanity\"\nlang=\"vi\"\nmode=\"forms\"\nforms=[\"dm\"]\n";
@@ -725,8 +695,8 @@ fn cjk_homograph_neko_unions_ja_zh() {
     assert_eq!(langs_of(&lx, "猫咪", &default_opts()), vec!["zh"]);
 }
 
-/// Primary = lowest interned id = FIRST TOML appearance, pinned on a synthetic
-/// two-language lexicon so the ordering claim is independent of builtin data.
+/// Primary = lowest interned id = first TOML appearance, pinned on a synthetic two-language
+/// lexicon independent of builtin data.
 #[test]
 fn primary_lang_is_first_toml_appearance() {
     let toml = r#"
@@ -750,9 +720,8 @@ forms = ["zzpurr", "zzmrrp"]
     assert_eq!(langs_of(&lx, "zzmrrp", &o), vec!["bb"]);
 }
 
-/// Lang ids are interned BEFORE the ambiguous gating, so a code resolves to
-/// the same id whether or not its entries loaded — attribution ids are
-/// config-independent, while the gating itself keeps its meaning.
+/// Lang ids are interned before the `ambiguous` gating, so a code has the same id whether or not
+/// its entries loaded.
 #[test]
 fn ambiguous_gating_keeps_semantics_and_ids_stay_config_independent() {
     let toml = r#"
@@ -785,9 +754,8 @@ forms = ["zzmiaou"]
     assert!(g.len() == 1 && u.len() == 2);
 }
 
-/// Cross-class precedence is unchanged AND the winning class keeps ONLY its
-/// own languages: "poes" (nl feline, af profanity) resolves to profanity and
-/// must not attribute nl.
+/// The cross-class winner keeps only its own languages: "poes" (nl feline, af profanity) is
+/// profanity and does not attribute nl.
 #[test]
 fn cross_class_winner_keeps_only_its_own_langs() {
     let lx = lex();
@@ -817,9 +785,8 @@ fn every_surface_has_langs() {
         ..ScanOptions::default()
     };
     for (surface, class) in lx.iter_spaced().chain(lx.iter_cjk()) {
-        // A marks-required key needs its marked witness to scan at all
-        // (see `every_surface_round_trips`); language attribution must be
-        // intact on that same match.
+        // A marks-required key scans only through its marked witness (see
+        // `every_surface_round_trips`).
         let text = if lx.surface_requires_marks(surface) {
             marked_witness(surface)
         } else {
@@ -852,11 +819,10 @@ fn form_hash_populated_on_cjk_path() {
     );
 }
 
-// --------------------------------------------------- v3 §6 user-surface set
+// ------------------------------------------------------ user-surface set ----
 
-/// v3 §6: user-supplied (override) emphasis surfaces are EXEMPT from the
-/// unconditional ≤3-folded-chars guard — explicit config is consent. The
-/// 2-char custom word pin.
+/// User (override) emphasis surfaces are exempt from the ≤ 3-folded-chars guard: explicit config
+/// is consent.
 #[test]
 fn user_short_emphasis_surface_matches() {
     let over = "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"gg\"]\n";
@@ -871,9 +837,7 @@ fn user_short_emphasis_surface_matches() {
     );
 }
 
-/// Negative control: the SAME short surface loaded as builtin-shaped data
-/// (`from_sources`, no user marking) stays suppressed — the guard itself is
-/// unchanged for non-user surfaces.
+/// Control: the same short surface loaded as non-user data (`from_sources`) stays suppressed.
 #[test]
 fn non_user_short_emphasis_surface_stays_suppressed() {
     let toml = "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"gg\"]\n";
@@ -884,9 +848,8 @@ fn non_user_short_emphasis_surface_stays_suppressed() {
     );
 }
 
-/// v3 §6 helpers: `is_no_space_surface` classifies exactly like the scanner's
-/// script split, and possessive scans report the FULL-token fold hash (the
-/// resolver must insert the four possessive-variant hashes).
+/// `is_no_space_surface` classifies like the scanner's script split, and a possessive hit
+/// reports the full-token fold hash.
 #[test]
 fn form_hash_helpers_match_scan_semantics() {
     assert!(aterm_lexicon::is_no_space_surface("猫"));
@@ -916,17 +879,11 @@ fn form_hash_helpers_match_scan_semantics() {
     assert_eq!(m[0].form_hash, aterm_lexicon::form_hash("超考"));
 }
 
-// ------------------------------------------------- refusals, never silent ----
-//
-// Every load law is recorded on `conflicts`, never silent: a person who
-// trips one must not just see a vocabulary that does not arrive.
+// ------------------------------------------- refusals, reported on conflicts() ----
 
-/// A configured `[sparkle_words] languages` code the DATA names nowhere
-/// un-gates nothing — `"DA"`, `"da-DK"`, `"dk"`, `"ALL"` are all silently
-/// inert, because the gate is an exact-match set probe over the bare
-/// lowercase codes the file uses. That is not a bug to fix by guessing at the
-/// user's intent (a fuzzy match would un-gate the wrong language); it is a
-/// refusal to REPORT.
+/// A configured `[sparkle_words] languages` code the data never names (`"DA"`, `"da-DK"`, `"dk"`,
+/// `"ALL"`) un-gates nothing: the gate matches the bare lowercase codes exactly, and guessing
+/// would un-gate the wrong language. It is reported instead.
 #[test]
 fn a_configured_language_the_data_never_names_is_reported_not_swallowed() {
     for bad in ["DA", "da-DK", "dk", "ALL", "ger", "english"] {
@@ -937,9 +894,7 @@ fn a_configured_language_the_data_never_names_is_reported_not_swallowed() {
             lx.conflicts()
         );
     }
-    // Two-sided, or the assertion above would pass on a loader that shouted
-    // about every configuration: the real codes, and the reserved `all`, are
-    // quiet.
+    // Control: real codes, the reserved `all` and an empty list are quiet.
     for good in [&["da"][..], &["en", "de"][..], &["all"][..], &[][..]] {
         let lx = Lexicon::with_languages(good);
         assert_eq!(
@@ -950,9 +905,8 @@ fn a_configured_language_the_data_never_names_is_reported_not_swallowed() {
     }
 }
 
-/// `mode` has exactly two spellings. Any other value falls through to the
-/// explicit-`forms` path and DISCARDS every stem, so the entry compiles to
-/// its `forms` alone — to nothing, for the 12 entries that are all stems.
+/// An unknown `mode` falls through to the `forms` path and discards every stem, so it is
+/// reported.
 #[test]
 fn an_unknown_entry_mode_is_reported_and_its_stems_are_not_lost_in_silence() {
     let src = "[[entry]]\nclass=\"feline\"\nlang=\"en\"\nmode=\"form\"\ncjk=false\n\
@@ -971,9 +925,8 @@ fn an_unknown_entry_mode_is_reported_and_its_stems_are_not_lost_in_silence() {
     }
 }
 
-/// A typo'd KEY is a parse error, not a list that silently never loads (the
-/// same law as `tricks.rs`): `form = [...]` for `forms` must not yield an
-/// entry with zero surfaces and an empty `conflicts()`.
+/// A typo'd key (`form` for `forms`) is a parse error, not an entry with zero surfaces and an
+/// empty `conflicts()`.
 #[test]
 fn a_typod_key_in_lexicon_data_is_a_parse_error_not_an_empty_entry() {
     for (bad, good) in [
@@ -1005,12 +958,10 @@ fn a_typod_key_in_lexicon_data_is_a_parse_error_not_an_empty_entry() {
     );
 }
 
-/// THE BUILTIN IS THE DATA FILES. The build script decodes `data/lexicon.toml`
-/// and `data/exceptions.toml` (`build.rs`) so a launch parses no TOML; the
-/// lexicon it yields must be the one the run-time decoder makes of the same two
-/// files — every key, hit, language and species id and every conflict, in
-/// order — with nothing ungated, everything, English, and each data language
-/// alone.
+/// The build script decodes `data/lexicon.toml` and `data/exceptions.toml` (`build.rs`) so a
+/// launch parses no TOML; the lexicon it yields must match what the run-time decoder makes of the
+/// same two files — every key, hit, language, species id and conflict, in order — with nothing
+/// ungated, everything, English, and each data language alone.
 #[test]
 fn the_builtin_decoded_at_build_time_is_the_lexicon_of_the_data_files() {
     const LEXICON: &str = include_str!("../data/lexicon.toml");
@@ -1052,12 +1003,10 @@ fn the_builtin_decoded_at_build_time_is_the_lexicon_of_the_data_files() {
     }
 }
 
-/// AN ENTRY THAT COMPILES TO NOTHING. A surface with a space can never match
-/// whole-word, and 34 such surfaces sit in the shipped file on purpose, as
-/// documentation of a word whose head noun is listed separately ("anak
-/// kucing" beside "kucing"). An entry where EVERY surface goes that way is a
-/// different animal: it contributes no key, so its class is unreachable in
-/// that language, and that must be reported.
+/// A surface with a space can never match whole-word, and 34 such surfaces sit in the shipped file
+/// as documentation beside a separately listed head noun ("anak kucing" beside "kucing"). An entry
+/// where every surface goes that way contributes no key, so its class is unreachable in that
+/// language and must be reported.
 #[test]
 fn an_entry_whose_every_surface_is_unmatchable_is_reported() {
     let head =
@@ -1071,8 +1020,7 @@ fn an_entry_whose_every_surface_is_unmatchable_is_reported() {
         "an entry that compiled to nothing said nothing: {:?}",
         dead.conflicts()
     );
-    // Two-sided: ONE matchable surface beside the documentation is enough,
-    // or the law would shout about every entry that carries a phrase.
+    // One matchable surface beside a phrase is enough.
     let live = Lexicon::from_sources(
         &format!("{head}forms=[\"guguk\", \"anak anjing\"]\n"),
         "",

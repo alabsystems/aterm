@@ -165,21 +165,30 @@ impl Companions {
         fired
     }
 
-    /// Serious Mode's drain, the companions' half: the flying head, the
-    /// sing-along with its notes and riff latch, and the summon detector return
-    /// to rest. Idempotent: it runs every frame while Serious Mode holds.
+    /// Serious Mode's drain, the companions' half: the flying head, the dog
+    /// cameo, the sing-along with its notes and riff latch, the summon
+    /// detector, and the tone tracker's partial window return to rest while
+    /// keeping warmed-up buffers and cooldowns intact. Idempotent: it runs
+    /// every frame while Serious Mode holds.
     pub fn drain_serious(&mut self) {
         self.cursor_cat = CursorCat::default();
-        self.kitty_sing = KittySing::default();
-        self.music_notes = MusicNotes::default();
+        self.dog_cameo = DogCameo::default();
+        self.dog_cameo_session = None;
+        self.kitty_sing.drain_serious();
+        self.music_notes.clear();
         self.sing_riff_bar = None;
-        self.kitty_summon = TypedKittySummon::default();
+        self.kitty_summon.drain_serious();
+        self.tone_tracker.drain_serious();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::kitty_sing::CelebrateOn;
+    use crate::kitty_summon::DOG_SUMMON_KEYS;
 
     fn glyph(c: char) -> TypedPress<'static> {
         TypedPress {
@@ -262,5 +271,63 @@ mod tests {
         );
         assert_eq!(c.tone_tracker.window_chars(), 7, "the tone window is kept");
         assert!(feed_line(&mut c, " kitty", words, now).feline);
+    }
+
+    #[test]
+    fn drain_serious_clears_dog_cameo_and_live_runs_while_keeping_cooldowns_and_odometer() {
+        let now = Instant::now();
+        let lexicon = Lexicon::builtin().clone();
+        let opts = ScanOptions::default();
+        let words = Some((&lexicon, &opts));
+        let mut c = Companions::default();
+
+        // Warm up the canine odometer and fire the Kitty Log cooldown.
+        for _ in 0..DOG_SUMMON_KEYS {
+            feed_line(&mut c, "a", words, now);
+        }
+        let first = feed_line(&mut c, " kitty", words, now);
+        assert!(first.feline && first.records, "first summon records");
+
+        // Summon a dog cameo, arm an external celebration, and start typing `kitt`.
+        c.dog_cameo.on_summon(now, 42);
+        c.dog_cameo_session = Some(7);
+        assert!(c.dog_cameo.active(now));
+        c.kitty_sing
+            .arm_external(now, 7, 1, 2, CelebrateOn::Enter)
+            .expect("initial arm succeeds");
+        feed_line(&mut c, " kitt", words, now);
+
+        c.drain_serious();
+
+        // Active dog cameo, pending celebration arm, and partial typing window are gone.
+        assert!(!c.dog_cameo.active(now));
+        assert_eq!(c.dog_cameo_session, None);
+        assert_eq!(c.kitty_sing.armed_external(), None);
+        assert_eq!(
+            c.tone_tracker.window_chars(),
+            0,
+            "drain_serious clears the tone tracker's partial typing window"
+        );
+        assert!(
+            !feed_line(&mut c, "y", words, now + Duration::from_secs(1)).feline,
+            "partial word before drain_serious does not complete after unmute"
+        );
+
+        // Cooldowns and the canine keystroke odometer survive across Serious Mode.
+        assert!(
+            !c.kitty_sing
+                .cooldown_remaining(now + Duration::from_secs(1))
+                .is_zero(),
+            "celebration arm cooldown survives drain_serious"
+        );
+        let second = feed_line(&mut c, " kitty", words, now + Duration::from_secs(1));
+        assert!(
+            second.feline && !second.records,
+            "Kitty Log 30s cooldown survives drain_serious"
+        );
+        assert!(
+            feed_line(&mut c, " puppy", words, now + Duration::from_secs(1)).canine,
+            "canine keystroke odometer survives drain_serious"
+        );
     }
 }

@@ -32,15 +32,13 @@
 //!   daemon outside the sandbox works for it: nothing it does reaches Launch
 //!   Services (`open`), Apple Events (`osascript`), login items, the preferences
 //!   or keychain daemons or the pasteboard ([`crate::sbpl`] rule 2);
-//! - confines WRITES to the temp roots (`/private/tmp`, `/private/var/tmp`, the
+//! - confines writes to the temp roots (`/private/tmp`, `/private/var/tmp`, the
 //!   user's own `$TMPDIR`) and `/dev`, plus the shell's own history files, so
 //!   nothing it does can plant code that a later unsandboxed shell runs
 //!   (`~/.zshrc`, a `~/Library/LaunchAgents` plist, a git hook, a `$PATH`
 //!   binary, a precompiled module in the user cache directory). Its working
-//!   directory and `$HOME` are read-only to it: decided 2026-09-26 under the
-//!   owner's standing direction, `TmpOnly` means what its name says
-//!   ([`crate::sbpl`] rule 3);
-//! - denies READ and write of the credential stores (`~/.ssh`, `~/.aws`,
+//!   directory and `$HOME` are read-only to it ([`crate::sbpl`] rule 3);
+//! - denies read and write of the credential stores (`~/.ssh`, `~/.aws`,
 //!   `~/.gnupg`, `~/.config/gh`, `~/.config/aterm`, `~/.netrc`, …) and of the
 //!   private-data stores (`~/Documents`, `~/Desktop`, `~/Downloads`, media, and the
 //!   local Mail / Messages / keychain / cookies / browser-profile databases).
@@ -55,7 +53,7 @@
 //! nothing for a Containment tab, so its OSC 52 neither sets nor reads the
 //! pasteboard, a Kitty file or shared-memory image is not read, and an OSC
 //! 9/99/777 posts no desktop notification, whatever the config allows
-//! (`aterm-gui`'s `host_reach`, ruling 2026-10-10). What the person does (a
+//! (`aterm-gui`'s `host_reach`). What the person does (a
 //! link click, a paste) is theirs and is not refused. The transparent session
 //! (`aterm --sandbox` at a TTY) parses nothing, so the terminal around it
 //! decides the program's escape sequences by its own policy.
@@ -63,8 +61,7 @@
 //! Fail closed: `Containment` never degrades. Where [`os_sandbox_actuated`] is
 //! false (every non-macOS target), [`decide`] returns [`SpawnDecision::Deny`]
 //! naming the gap and both launchers exit without a shell. Containment is
-//! macOS-only by scope (`docs/ATERM_DESIGN.md` §5.6)
-//! (owner, 2026-09-25; 2026-09-27).
+//! macOS-only by scope (`docs/ATERM_DESIGN.md` §5.6).
 
 use crate::audit::{log_denial, log_posture};
 use crate::capability::{NetworkCapability, ProcessCapability};
@@ -171,7 +168,7 @@ pub fn decide(mode: ContainmentMode) -> SpawnDecision {
 fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>) -> SpawnDecision {
     let process_cap = ContainmentPolicy::process(mode);
     let denies_network = ContainmentPolicy::network(mode) == NetworkCapability::None;
-    // Containment demands the OS sandbox; without one, refuse the spawn (owner, 2026-09-25).
+    // Containment demands the OS sandbox; without one, refuse the spawn.
     if denies_network && !sandbox_available {
         log_denial(SUBSYSTEM, "spawn initial shell", mode, NO_OS_SANDBOX_REASON);
         return SpawnDecision::Deny {
@@ -294,8 +291,6 @@ mod tests {
 
     #[test]
     fn containment_fails_closed_without_an_os_sandbox() {
-        // On a platform with no OS sandbox the Containment spawn is refused,
-        // naming the gap (owner, 2026-09-25).
         assert_eq!(
             decide_on(ContainmentMode::Containment, false, None),
             SpawnDecision::Deny {
@@ -734,8 +729,8 @@ mod tests {
             .success()
     }
 
-    /// PROOF 5 (WRITE CONFINEMENT, FULL generated Containment profile) — a
-    /// contained shell cannot plant anything that later runs OUTSIDE the sandbox:
+    /// Proof 5 (write confinement, full generated Containment profile): a
+    /// contained shell cannot plant anything that later runs outside the sandbox:
     /// creating a file in `$HOME`, appending to `~/.zshrc`, or dropping a file in
     /// `~/Library/LaunchAgents` (creating that directory, where it does not exist
     /// yet) or into the user cache directory beside `$TMPDIR` all fail, while
@@ -743,7 +738,7 @@ mod tests {
     /// has its own proof, 5b, over a scratch `$HOME`, since whether the real
     /// one's history file gets it depends on what that file is). Each probe
     /// opens for append without writing a byte, and anything a failed deny
-    /// would have created is removed. CONTROL: under the base profile alone the
+    /// would have created is removed. Control: under the base profile alone the
     /// same `$HOME` probe is writable, so its denial is the write confinement's.
     #[cfg(target_os = "macos")]
     #[test]
@@ -1062,21 +1057,15 @@ mod tests {
         );
     }
 
-    /// PROOF 7 (TASK PORTS, FULL generated Containment profile) — a contained
-    /// process cannot take any task port — control, read, inspect or name — of a
-    /// process outside the sandbox (the `lldb`/`debugserver` escape, silent once
-    /// macOS developer mode is on), and keeps its own. The target is an ad-hoc copy
-    /// of `/bin/cat` signed with `get-task-allow`, the one kind of target an
-    /// unentitled requester is granted with no prompt; its echo of a line is the
-    /// proof it runs, past macOS's assessment of the new file's first exec, and
-    /// until then its directory stays (`aterm_uds::deadline::KeptUntilRan`). The
-    /// requester is this test binary, which carries no
-    /// debugger entitlement, so no path here is meant to raise the administrator
-    /// dialog — but one did: on 2026-09-30, on a machine with developer mode off,
-    /// the probe sat under an open SecurityAgent prompt until it was killed. So
-    /// the probe is bounded, and a prompt fails this proof by name.
-    /// CONTROL: under `(allow default)` alone the same probe IS granted the
-    /// target's port, so the denial is the profile's.
+    /// Proof 7 (task ports, full generated Containment profile): a contained
+    /// process cannot take any task port (control, read, inspect, or name) of a
+    /// process outside the sandbox, while keeping its own. The target is an ad-hoc
+    /// copy of `/bin/cat` signed with `get-task-allow` (granted to an unentitled
+    /// requester without a prompt); its directory is kept until it echoes a line
+    /// (`aterm_uds::deadline::KeptUntilRan`). The probe is bounded so a blocked
+    /// SecurityAgent prompt when developer mode is off fails the test rather than
+    /// hanging. Control: under `(allow default)` the probe is granted the target's
+    /// port.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_task_ports_stay_outside() {
@@ -1219,14 +1208,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     const REFUSED: &str = "1100";
 
-    /// The launch brokers: Launch Services' daemon and its open/open-URL
-    /// endpoints, the Apple Events daemon, and the `ServiceManagement` daemon
-    /// behind `SMAppService`/`SMJobBless`. Each starts, drives or registers a
-    /// process that does not inherit the sandbox (`open` of a `.command` file, a
-    /// scripted app, a login item). Until 2026-10-09 the profile denied exactly
-    /// these names; now they are refused because
-    /// [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] does not name them, and PROOF 8
-    /// keeps asking for them as the negative control.
+    /// Launch Services' daemon and its open/open-URL endpoints, the Apple Events
+    /// daemon, and the `ServiceManagement` daemon behind `SMAppService`/`SMJobBless`.
+    /// Each starts, drives, or registers a process that does not inherit the sandbox;
+    /// refused because [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] does not name them.
     #[cfg(target_os = "macos")]
     const LAUNCH_BROKERS: &[&str] = &[
         "com.apple.coreservices.launchservicesd",
@@ -1236,10 +1221,7 @@ mod tests {
         "com.apple.xpc.smd",
     ];
 
-    /// Daemons outside the sandbox that act for whoever looks them up, sampled
-    /// from what the tool set asked for under a profile refusing every lookup
-    /// (2026-10-09, `docs/HARDCORE_BACKLOG.md` P1), each reachable under the
-    /// launch-broker denylist the profile had before.
+    /// Daemons outside the sandbox that act on behalf of whoever looks them up.
     #[cfg(target_os = "macos")]
     const CALLER_ACTING_DAEMONS: &[&str] = &[
         // Writes preference domains into ~/Library/Preferences for its caller.
@@ -1346,12 +1328,10 @@ mod tests {
             .collect()
     }
 
-    /// PROOF 8 (LAUNCH BROKERS, FULL generated Containment profile) — the
-    /// negative control of the deny-by-default `mach-lookup`: a contained
-    /// process gets no port to Launch Services, the Apple Events daemon or the
-    /// `ServiceManagement` daemon, because the allowlist does not name them.
-    /// CONTROL: under `(allow default)` alone every lookup succeeds, so the
-    /// refusal is the profile's.
+    /// Proof 8 (launch brokers): under the full Containment profile, a contained
+    /// process gets no port to Launch Services, the Apple Events daemon, or the
+    /// `ServiceManagement` daemon because the allowlist does not name them.
+    /// Control: under `(allow default)` every lookup succeeds.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_launch_brokers_denied() {
@@ -1374,14 +1354,10 @@ mod tests {
         );
     }
 
-    /// PROOF 10 (DENY-BY-DEFAULT MACH-LOOKUP, FULL generated Containment
-    /// profile) — no daemon outside the sandbox works for a contained process:
-    /// a sample of daemons that act for their caller ([`CALLER_ACTING_DAEMONS`])
-    /// is refused (`kr` 1100), though no rule names them, while every
-    /// [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] name is still reached (`kr` 0), so
-    /// the probe can succeed under this very profile. CONTROL: under
-    /// `(allow default)` alone every name is reached, so each refusal is the
-    /// profile's and each name is one some daemon serves.
+    /// Proof 10 (deny-by-default mach-lookup): a sample of daemons that act for
+    /// their caller ([`CALLER_ACTING_DAEMONS`]) is refused (`kr` 1100) while every
+    /// [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] name remains reachable (`kr` 0).
+    /// Control: under `(allow default)` every name is reached.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_mach_lookup_denied_by_default() {
@@ -1449,13 +1425,10 @@ mod tests {
         println!("PREFERENCE_WRITE {rc}");
     }
 
-    /// PROOF 9 (PREFERENCE WRITES, FULL generated Containment profile) — the
-    /// preferences daemon writes `~/Library/Preferences` outside the sandbox for
-    /// whoever asks, so the file-write confinement alone left every preference
-    /// domain writable from inside. Under the profile the sandbox must refuse
-    /// `user-preference-write`. CONTROL: under the base profile alone (no write
-    /// confinement) the same question is answered "allowed", so the refusal is
-    /// the confinement's.
+    /// Proof 9 (preference writes): `cfprefsd` writes `~/Library/Preferences`
+    /// outside the sandbox on behalf of callers, so under the Containment profile
+    /// the sandbox must refuse `user-preference-write`. Control: under the base
+    /// profile alone the same check returns allowed.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_preference_writes_denied() {
@@ -1541,29 +1514,12 @@ mod tests {
             })
     }
 
-    /// PROOF 11 (TOOL SET, FULL generated Containment profile) — what a
-    /// contained shell is for still works with every mach service but
-    /// [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] refused: a `/bin/sh` pipeline, an
-    /// interactive and a login zsh reading copies of the user's rc files from a
-    /// scratch `$HOME`, bash, the user's and group's names (the allowlist's
-    /// reason: `whoami`, zsh's `$USERNAME`, python's `pwd`, `dsmemberutil`),
-    /// `ls -l`, `date`, `dscacheutil`, git (init, commit, log, diff, status and a
-    /// `file://` clone), python3 (`ssl`, `json`, `socket.getaddrinfo` of
-    /// localhost), make, xcrun, clang (compile and run), ad-hoc `codesign`
-    /// then `codesign -v` and exec, targo and trustc, and a `targo --unverified
-    /// build`. Each runs in a scratch directory under `$TMPDIR`, the one place a
-    /// contained build may write. Every case this machine can run runs and must
-    /// hold; then, if any case needs a tool this machine lacks, the test ends
-    /// COULD NOT RUN naming each one, never a pass over a skipped tool. Three
-    /// cases run a new Mach-O they made there (a copy of `ls`, a clang build, a
-    /// targo build), which macOS assesses at its first exec: a case its hang
-    /// detector killed leaves the directory in place
-    /// (`aterm_uds::deadline::KeptUntilRan`).
-    ///
-    /// Not here, by decision (`docs/HARDCORE_BACKLOG.md` P1): `security`'s
-    /// keychain listing (the security daemon is refused), `curl` to a loopback
-    /// server (`(deny network*)`), `ps` (setuid, which the sandbox will not
-    /// exec on `origin/main` either), and `open`/`osascript` (PROOF 12).
+    /// Proof 11 (tool set): common development tools work under the full
+    /// Containment profile with only [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`]
+    /// allowed, running in a scratch directory under `$TMPDIR`. If any case needs
+    /// a tool this host lacks, the test ends COULD NOT RUN after verifying all
+    /// available tools. Cases that execute a newly created Mach-O keep their
+    /// directory in place if cut short (`aterm_uds::deadline::KeptUntilRan`).
     #[cfg(target_os = "macos")]
     #[test]
     fn shell_compat_tool_set_runs_under_containment() {
@@ -1810,20 +1766,11 @@ mod tests {
         }
     }
 
-    /// PROOF 12 (`open` AND `osascript`, FULL generated Containment profile) —
-    /// the two commands the launch brokers exist for stay refused when run for
-    /// real, not only looked up: `open -W` of a background-only scratch app
-    /// whose executable would leave a marker OUTSIDE the writable roots (where
-    /// only a process outside the sandbox could put it) fails and leaves none,
-    /// and `osascript` sending Finder an Apple Event gets no answer. The event is
-    /// written in raw codes (`«class pnam» of «class sdsk»`, the startup disk's
-    /// name) so it compiles without Finder's dictionary, which a contained
-    /// `osascript` cannot load: the failure is the send's, not a syntax error.
-    /// Both run only after PROOF 8's lookup finds every broker refused under
-    /// this profile, so a regressed profile fails here before anything could
-    /// act outside. No unsandboxed control: it would launch the scratch app and
-    /// register it with Launch Services; PROOF 8's control carries the
-    /// attribution.
+    /// Proof 12 (`open` and `osascript`): `open -W` of a background-only scratch
+    /// app whose executable writes a marker outside the writable roots fails and
+    /// writes nothing, and `osascript` sending Finder an Apple Event in raw four-char
+    /// codes (`«class pnam» of «class sdsk»`, compiled without Finder's dictionary)
+    /// gets no answer.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_open_and_osascript_stay_refused() {

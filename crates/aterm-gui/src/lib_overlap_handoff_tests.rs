@@ -38,10 +38,9 @@ fn overlap_model_at_proof_ready() -> (aterm_spec::derive::Model, aterm_spec::int
     (model, state)
 }
 
-/// A rolled-back park re-attaches no reader to a pane whose shell already
-/// exited (round eight, finding 17): its reader saw EOF, so a new one
-/// would replay the exit. NEGATIVE CONTROL: the same pane before its EOF
-/// is matched (a test App has no proxy, so the scan reports it unattached).
+/// A rolled-back park re-attaches no reader to a pane whose shell already exited: its
+/// reader saw EOF, so a new one would replay the exit. Negative control: the same pane
+/// before its EOF is matched (a test App has no proxy, so the scan reports it unattached).
 #[test]
 fn a_rollback_resume_never_reattaches_an_exited_pane() {
     let mut app = App::headless_for_test();
@@ -579,8 +578,7 @@ fn typing_buffers_through_a_pending_overlap_but_paste_still_revokes() {
     let cancelled = arm_outgoing_handoff(&mut app);
     let epoch = app.update_handoff_activity_epoch;
 
-    // One keystroke's text: exactly one pass through the seam (the seam
-    // itself is the proven single-delivery path), zero revocations.
+    // One keystroke's text through the seam: no revocation.
     let _ = app.input(
         WindowId(0),
         crate::input::InputEvent::Text("hi".to_string()),
@@ -651,22 +649,20 @@ fn typing_buffers_through_a_pending_overlap_but_paste_still_revokes() {
         "paste must poke the worker cancel channel"
     );
 
-    // With NO pending overlap, the tolerated stamp degrades to the full
-    // epoch bump so automatic admission pacing observes every event.
+    // With no pending overlap, the tolerated stamp is a full epoch bump, so automatic
+    // admission pacing observes every event.
     app.pending_update_handoff = None;
     let epoch = app.update_handoff_activity_epoch;
     app.note_update_handoff_tolerated_activity();
     assert!(app.update_handoff_activity_epoch > epoch);
 }
 
-/// Round eight of the update audit, findings 724 and 752: once this successor
-/// has COMMITTED (the Commit waiter released the reader gate, and the control
-/// server serves), a wake that arrives before the Commit wake runs is HELD for
-/// it, in arrival order, never dropped. A control client's verb keeps its reply
-/// sender, so it is answered when the Commit wake runs it, not with `main-thread
-/// reply dropped`; a reader's `Exit` leaves its pane open for the keystrokes
-/// queued for it. Before the Commit every such wake is still swallowed, and the
-/// readers' screen-moving wakes still run at once.
+/// Once this successor has committed (the Commit waiter released the reader gate and the
+/// control server serves), a wake arriving before the Commit wake runs is held for it in
+/// arrival order, never dropped: a control verb keeps its reply sender and is answered
+/// when the Commit wake runs it, and a reader's `Exit` leaves its pane open for the keys
+/// queued for it. Before the Commit such wakes are swallowed; the readers' screen-moving
+/// wakes run at once.
 #[test]
 fn a_wake_after_the_commit_waits_for_the_commit_wake() {
     use std::sync::mpsc::TryRecvError;
@@ -827,7 +823,7 @@ fn pre_commit_input_is_bounded_counted_and_cannot_strand_a_chord() {
          cumulative, never consumed by the settle"
     );
 
-    // …and a COHERENT queue leaves a genuinely-held modifier alone.
+    // …and a coherent queue leaves a held modifier alone.
     app.windows
         .get_mut(&WindowId(0))
         .expect("headless window")
@@ -958,23 +954,21 @@ fn the_keystroke_gate_holds_an_automatic_apply_until_the_typing_pauses() {
         "an inter-keystroke pause shorter than the gap is still typing"
     );
 
-    // A pause opens it, and the update lands invisibly as it always did.
+    // A pause opens it.
     assert!(hands_off_keys(
         true,
         Some(now),
         now + AUTOMATIC_UPDATE_KEYSTROKE_GAP
     ));
 
-    // The INVERSION leg: the user is typing somewhere ELSE. Their keystrokes
-    // are not ours to interrupt, so the lane proceeds — this is the leg that
-    // would silently rot into "aterm never updates while any app is in use".
+    // Typing in another app is not ours to interrupt: the lane proceeds.
     assert!(
         hands_off_keys(false, Some(now), now),
         "no aterm window has focus, so no keystroke of ours is being interrupted"
     );
 
-    // The SURFACELESS leg: a headless window seeds `focused: true` with no
-    // OS surface; the App's gate does not count it as focus.
+    // A headless window seeds `focused: true` with no OS surface; the App's gate does
+    // not count it as focus.
     let mut app = App::headless_for_test();
     assert!(
         app.windows.values().any(|ws| ws.focused) && !app.any_os_window_focused(),
@@ -1074,10 +1068,9 @@ fn a_live_consent_warm_up_holds_the_automatic_apply_but_only_to_its_cap() {
         "an explicit apply is never held"
     );
 
-    // The ordering leg. A system consent dialog takes focus away from every
-    // aterm window, which is exactly the case the keystroke gate answers
-    // `true` for — so the hold is its own fact, not a part of that gate, or
-    // it would evaporate the instant the dialog it exists for appeared.
+    // A system consent dialog takes focus from every aterm window, which the keystroke
+    // gate answers `true` for; the hold is its own fact, or it would end the moment its
+    // dialog appeared.
     for ws in app.windows.values_mut() {
         ws.focused = false;
     }
@@ -1159,10 +1152,8 @@ fn a_headless_instance_never_offers_the_macos_access_card() {
     assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
 }
 
-/// A windowed-looking `App` for the access card's lifecycle, without a
-/// window: headless-constructed — inert probe and gesture arms, so no
-/// `tccd` and no `NSWorkspace` (the live Settings arm refuses off the
-/// main thread, which is where a test runs) — with `headless` flipped so
+/// A windowed-looking `App` for the access card's lifecycle: headless-constructed (inert
+/// probe and gesture arms, so no `tccd` and no `NSWorkspace`), with `headless` flipped so
 /// the tick runs its real branches, and the cached probe reading denied.
 fn access_card_windowed() -> App {
     let mut app = App::headless_for_test();
@@ -1210,9 +1201,9 @@ fn the_launch_reassert_keeps_an_open_entrys_words() {
     assert_eq!(entries[0].title, FDA_WHAT_DENIED);
 }
 
-/// Drive a due card through the park's tick at `now`: the question is an
-/// ENTRY of the digest ("To look at"), never a band row, and the card
-/// watches the probe for the grant. Returns the entry's id.
+/// Drive a due card through the park's tick at `now`: the question is a digest entry
+/// ("To look at"), never a band row, and the card watches the probe for the grant.
+/// Returns the entry's id.
 fn access_card_posted(app: &mut App, now: std::time::Instant) -> aterm_messages::MessageId {
     use super::consent_card::{CardPhase, FDA_WHAT_DENIED, Verdict};
     assert!(app.consent_card.begin_deciding(now));
@@ -1244,15 +1235,11 @@ fn access_card_posted(app: &mut App, now: std::time::Instant) -> aterm_messages:
     entry.id
 }
 
-/// THE ACCESS QUESTION'S LIFECYCLE (design §3.10, R15; design-exceptions
-/// §8.2): the verdict and the grant — the two paths with no platform gate
-/// — hold on every host; on macOS the park raises the question ONCE, as
-/// ONE ENTRY of the digest keyed `privacy.fda.needed` — never a band row,
-/// so it costs the terminal nothing — and the owner's one dismissal
-/// (`Dismiss all`) files it in the log, where it stays quiet for its span
-/// however often the card asks again. It has no patience to run out (an
-/// hour on it still stands; a row folded on its ten minutes and settled
-/// the card), so the unanswered path is the owner's dismissal alone.
+/// The access question's lifecycle. The verdict and the grant (the two paths with no
+/// platform gate) hold on every host. On macOS the park raises the question once, as one
+/// digest entry keyed `privacy.fda.needed` (never a band row), and the owner's one
+/// dismissal (`Dismiss all`) files it in the log, where it stays quiet however often the
+/// card asks again; it never folds, so the dismissal is the only unanswered ending.
 ///
 /// THE PARK POINT IS macOS-ONLY: `tick_macos_access_card` returns at its
 /// FIRST line on every other target, because Full Disk Access is a TCC
@@ -1266,10 +1253,9 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
 
     let t0 = Instant::now();
 
-    // EVERY HOST: a verdict in DECIDING against the inert arm. The cached
-    // probe reads the planted denial, but the signing identity is cold, so
-    // a grant would be keyed to `dr=unknown` and would not survive a
-    // rebuild — quiet, nothing raised.
+    // Every host: a verdict in `Deciding` against the inert arm. The cached probe reads
+    // the planted denial, but the signing identity is cold, so a grant would key to
+    // `dr=unknown` and not survive a rebuild: quiet, nothing raised.
     let mut app = access_card_windowed();
     let panel = app.consent_panel_facts();
     assert_eq!(panel.fda, aterm_containment::consent::FdaState::Denied);
@@ -1314,8 +1300,7 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
     app.tick_macos_access_card(t0 + Duration::from_secs(1));
     assert_eq!(fda_entries(&app).len(), 1, "raised once");
 
-    // IT DOES NOT FOLD: an hour past the row's old ten minutes it stands,
-    // and the card is still watching for the grant.
+    // It does not fold: an hour on it stands, and the card still watches for the grant.
     let hour = Instant::now() + Duration::from_secs(3_600);
     app.settle_messages(hour);
     assert_eq!(fda_entries(&app).len(), 1, "no patience to run out");
@@ -1328,9 +1313,8 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
         "raising the question recorded that it was asked"
     );
 
-    // THE OWNER'S ONE DISMISSAL files it in the log; the card's asking
-    // again (a fresh need, an update's launch check) raises nothing while
-    // the filing holds.
+    // The owner's one dismissal files it in the log; the card asking again (a fresh
+    // need, an update's launch check) raises nothing while the filing holds.
     assert_eq!(app.dismiss_exceptions(), 1);
     assert!(fda_entries(&app).is_empty());
     assert!(matches!(
@@ -1352,8 +1336,7 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
         "a fact the owner filed stays filed"
     );
 
-    // …but a REGRESSION (a verified grant later reads off) is another
-    // fact: news once.
+    // …but a regression (a verified grant later reads off) is another fact: news once.
     app.raise_fda_need(
         &NeedWords {
             regressed: true,
@@ -1386,13 +1369,11 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
     );
 }
 
-/// OPEN SETTINGS (R16), ON THE ENTRY (design-exceptions §8.2): the button
-/// opens the pane through the instance's gesture arm (it refuses off the
-/// main thread, so the press reports the refusal) and the press is the
-/// owner's ANSWER — `Answered`, in the log, "Open Settings" — not the end
-/// of the question: a pane opened is not a switch turned on. The `opened`
-/// marker and `opened_at` are recorded, the card keeps watching, a fresh
-/// need is not raised while the answer holds, and ONLY the verified grant
+/// Open Settings on the entry opens the pane through the instance's gesture arm (which
+/// refuses off the main thread, so the press reports the refusal) and is the owner's
+/// answer (`Answered`, "Open Settings", in the log), not the end of the question: a pane
+/// opened is not a switch turned on. `opened` and `opened_at` are recorded, the card keeps
+/// watching, a fresh need is quiet while the answer holds, and only the verified grant
 /// ends it (`Resolved`, and a `Full Disk Access granted` record).
 #[test]
 #[cfg(target_os = "macos")]
@@ -1413,7 +1394,7 @@ fn open_settings_answers_the_entry_and_only_a_verified_grant_ends_it() {
         ),
         "the arm refuses off the main thread"
     );
-    // ANSWERED, not cleared: filed with the button's label.
+    // Answered, not cleared: filed with the button's label.
     assert!(fda_entries(&app).is_empty(), "the answer files the entry");
     assert!(
         matches!(
@@ -1460,11 +1441,9 @@ fn open_settings_answers_the_entry_and_only_a_verified_grant_ends_it() {
     );
 }
 
-/// THE GRANT ENDS THE ENTRY (R17): whichever cause it wears — the need or
-/// a regression — the observed grant takes it out of the digest
-/// (`resolved`, in the log), and the grant itself is a RECORD: Settings ▸
-/// Messages and messages.log keep it, the glass does not (the owner's
-/// attention rule). The card settles.
+/// The grant ends the entry, whichever cause it wears (the need or a regression): it
+/// leaves the digest (`resolved`, in the log), the grant itself is a record (Settings ▸
+/// Messages and messages.log keep it, the glass does not), and the card settles.
 #[test]
 #[cfg(target_os = "macos")]
 fn a_grant_ends_the_entry_and_is_a_record() {
@@ -1504,7 +1483,7 @@ fn a_grant_ends_the_entry_and_is_a_record() {
     assert_eq!(granted.key.as_deref(), Some(KEY_FILE_ACCESS));
     assert_eq!(app.next_macos_access_card_deadline(t0), None);
 
-    // A REGRESSION is news, and a grant ends that entry too.
+    // A regression is news, and a grant ends that entry too.
     app.raise_fda_need(
         &super::consent_card::NeedWords {
             cause: super::consent_card::NeedCause::ProtectedRead { session: None },
@@ -1518,20 +1497,12 @@ fn a_grant_ends_the_entry_and_is_a_record() {
     assert!(fda_entries(&app).is_empty());
 }
 
-/// Disabling the notice from any tab retracts the access question — the
-/// entry of the digest (or a row an older parent carried, or its route
-/// words), `resolve_key_prefix("privacy.")` — and settles the card;
-/// OTHER messages keep their rows (design §7.2, the retired :34162 in
-/// spirit).
+/// Disabling the notice from any tab retracts the access question (the digest entry, or a
+/// row or route words an older parent carried: `resolve_key_prefix("privacy.")`) and
+/// settles the card; other messages keep their rows.
 ///
-/// macOS ONLY — and NOT so this box stops seeing a red.
-/// `tick_macos_access_card` returns on its first statement off macOS, so
-/// every assertion below would be measuring that early return instead of
-/// the retraction, and the retraction — the thing the test is named for
-/// — would be proved on no platform at all. What the early return owes
-/// every other host is asserted next door, in
-/// `macos_access_card_stays_inert_off_macos`; neither platform is left
-/// with an empty claim.
+/// macOS only: off macOS `tick_macos_access_card` returns first, so these assertions would
+/// measure that early return; `macos_access_card_stays_inert_off_macos` covers the rest.
 #[test]
 #[cfg(target_os = "macos")]
 fn macos_access_card_honors_live_policy_without_dismissing_other_messages() {
@@ -1587,8 +1558,8 @@ fn macos_access_card_honors_live_policy_without_dismissing_other_messages() {
 
 /// Off macOS the tick returns before reading switches, spawning or touching the band: a
 /// Linux build never posts a macOS-permission row or resolves another reporter's row.
-/// The third row forces the card past any reachable phase with a planted question row;
-/// both must be left exactly as found.
+/// The third case plants a question row on a card already watching; the card and the row
+/// must be left exactly as found.
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn macos_access_card_stays_inert_off_macos() {
@@ -1634,9 +1605,8 @@ fn macos_access_card_stays_inert_off_macos() {
             assert_eq!(app.consent_card.phase(), CardPhase::Idle, "({switches})");
             assert!(app.messages.live(other).is_some(), "({switches})");
 
-            // The MUTANT. Even an opted-out card whose row is already on
-            // the band stays exactly where it stands: retracting it is the
-            // macOS arm's claim, and this platform never gets that far.
+            // Even an opted-out card whose row is already on the band stays put:
+            // retracting it is the macOS arm's claim, never reached here.
             let mut app = app_with(enabled, notice);
             assert!(app.consent_card.begin_deciding(now));
             assert!(app.consent_card.on_decided(&Verdict::Offer, now));
@@ -1688,10 +1658,9 @@ fn an_observed_dialog_banner_names_the_asking_tab() {
     assert_eq!(app.consent_prompt_notice(&prompt(777)).body, bare);
 }
 
-/// The PER-SESSION producer (the Claude Code footer's repository read,
-/// `Wake::ProtectedRead`): a refused read under a protected root raises the
-/// attention for exactly that session's tab; the same refusal outside every
-/// protected root is an ordinary permission error and raises nothing.
+/// The per-session producer (the Claude Code footer's repository read,
+/// `Wake::ProtectedRead`): a refused read under a protected root marks that session's
+/// tab; outside every protected root it is an ordinary permission error.
 #[test]
 fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
     let session = |app: &App| {
@@ -1723,10 +1692,8 @@ fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
     );
     assert!(!app.consent_attention.is_spent());
 
-    // Under a protected root: the gate spends its notice either way, but
-    // the TAB MARK is the FULL observer's (`observer = true`); the default
-    // sentinel leaves the tab alone — the access card's one question
-    // carries the action.
+    // Under a protected root the gate spends its notice either way, but the tab mark is
+    // the Full observer's (`observer = true`); the default sentinel leaves the tab alone.
     let Some(root) = roots(&app).first().cloned() else {
         aterm_spec::host::could_not_run("no $HOME resolves here, so nothing is protected");
     };
@@ -2360,14 +2327,11 @@ fn a_restarted_stream_announces_nothing_the_stopped_one_was_correlating() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE LINK FROM THE SENTINEL TO THE CARD. A dialog the observer saw for
-/// this app's bundle id, for the app-data service, becomes one need of the
-/// access card; a dialog for another service (its Allow is durable) or
-/// another subject becomes none. Every step of the mapping is on the path
-/// this drives: `feed` (the worker's message), `poll_consent_observer` (the
-/// drain, which takes nothing until the bundle identity is warm) and
-/// `note_observed_prompts` (service mapping, tab resolution,
-/// `note_fda_need`).
+/// From the sentinel to the card: a dialog the observer saw for this app's bundle id and
+/// the app-data service is one need of the access card; one for another service (its
+/// Allow is durable) or another subject is none. Driven through `feed`,
+/// `poll_consent_observer` (which takes nothing until the bundle identity is warm) and
+/// `note_observed_prompts`.
 #[test]
 #[cfg(target_os = "macos")]
 fn an_observed_app_data_dialog_for_this_bundle_is_a_need_and_nothing_else_is() {
@@ -2388,9 +2352,8 @@ fn an_observed_app_data_dialog_for_this_bundle_is_a_need_and_nothing_else_is() {
     app.headless = false;
     let now = Instant::now();
 
-    // (a) The app-data dialog for the running bundle id, with the accessing
-    // pid UNRESOLVED (no shell of this instance is its ancestor): (c) it
-    // still counts, with no tab in the words.
+    // The app-data dialog for the running bundle id, its accessing pid unresolved (no
+    // shell of this instance is its ancestor): it still counts, with no tab in the words.
     app.consent_observer
         .feed_for_test(prompt("1.1", app_data, bundle, Some(i32::MAX - 1)), now);
     // The identity is not warm in a test binary, so the poll takes nothing
@@ -2409,8 +2372,8 @@ fn an_observed_app_data_dialog_for_this_bundle_is_a_need_and_nothing_else_is() {
         "the app-data dialog is a need"
     );
 
-    // (b) A Documents dialog, and an app-data dialog for another subject,
-    // are not this card's need.
+    // A Documents dialog, and an app-data dialog for another subject, are not this
+    // card's need.
     app.consent_observer.feed_for_test(
         prompt(
             "1.2",
@@ -2526,11 +2489,9 @@ fn an_observed_dialog_the_card_is_not_about_is_one_record_per_service() {
     );
 }
 
-/// AN EPERM UNDER A PROTECTED ROOT IS A NEED AND POSTS NO BANNER OUTSIDE
-/// FULL MODE: the once-per-process gate is spent (the status item
-/// refreshes) but the card, not a notification, carries it. Headless
-/// instances have no card, so the need is not even counted there; a
-/// windowed one counts it and hands it to the card.
+/// An EPERM under a protected root is a need and, outside Full mode, posts no banner: the
+/// once-per-process gate is spent (the status item refreshes) and the card carries it. A
+/// headless instance has no card, so the need is not counted there.
 #[test]
 fn an_eperm_under_a_protected_root_is_a_need_and_posts_no_banner_outside_full_mode() {
     use super::consent_card::CardPhase;
@@ -2557,10 +2518,9 @@ fn an_eperm_under_a_protected_root_is_a_need_and_posts_no_banner_outside_full_mo
     );
 }
 
-/// NEEDS ARE COALESCED AND LOGGED SPARINGLY: a burst inside
-/// `NEED_DEBOUNCE` is one need for the card (all are counted), the
-/// `aterm.log` line is due once per `NEED_LOG_EVERY`, and a need that
-/// arrives while an incoming handoff is uncommitted is kept, not lost.
+/// Needs coalesce: a burst inside `NEED_DEBOUNCE` is one need for the card (all are
+/// counted), the `aterm.log` line is due once per `NEED_LOG_EVERY`, and a need that
+/// arrives while an incoming handoff is uncommitted is kept.
 #[test]
 #[cfg(target_os = "macos")]
 fn note_fda_need_coalesces_and_logs_at_most_every_six_hours() {
@@ -2593,8 +2553,8 @@ fn note_fda_need_coalesces_and_logs_at_most_every_six_hours() {
     app.note_fda_need(cause, later);
     assert_eq!(app.consent_card_host.need_logged, Some(later));
 
-    // While an incoming handoff is uncommitted the need is KEPT for the
-    // moment the card is idle again.
+    // While an incoming handoff is uncommitted the need is kept for when the card is
+    // idle again.
     let mut app = App::headless_for_test();
     app.headless = false;
     app.incoming_handoff_pending = true;
@@ -2608,9 +2568,7 @@ fn note_fda_need_coalesces_and_logs_at_most_every_six_hours() {
     assert!(app.consent_card.take_pending_need(), "kept, not dropped");
 }
 
-/// A DENIED PROBE ALONE RAISES NOTHING: no need, no question — however many
-/// parks tick, whatever the cached probe reads. The old card asked at every
-/// launch on `denied` alone.
+/// A denied probe alone raises nothing: no need and no question, however many parks tick.
 #[test]
 #[cfg(target_os = "macos")]
 fn a_denied_probe_alone_raises_nothing() {
@@ -2667,7 +2625,7 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
         DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
     };
 
-    // Paint stays exempt: the frozen frame keeps presenting (seam 5).
+    // Paint stays exempt: the frozen frame keeps presenting.
     for paint in [
         WindowEvent::RedrawRequested,
         WindowEvent::Occluded(true),
@@ -2703,9 +2661,9 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
             "{tolerated:?} must buffer through the overlap"
         );
     }
-    // Only events that genuinely invalidate the committed identity revoke:
-    // grid geometry, destructive intent, a real byte-writing drop, and a
-    // mid-composition preedit that cannot survive `_exit`.
+    // Only events that invalidate the committed identity revoke: grid geometry,
+    // destructive intent, a byte-writing drop, and a mid-composition preedit that cannot
+    // survive `_exit`.
     for revoking in [
         WindowEvent::Resized(PhysicalSize::new(800, 600)),
         WindowEvent::CloseRequested,
@@ -2758,10 +2716,9 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
         );
     }
 
-    // Wake side: output/bells/controller-input batches buffer through
-    // (per-event policy applies downstream), session exit and structural
-    // wakes revoke, and the paint/bookkeeping wakes — including the
-    // effect-frame pump — never touch the overlap.
+    // Wake side: output, bells and controller-input batches buffer through (per-event
+    // policy applies downstream), session exit and structural wakes revoke, and
+    // bookkeeping wakes are exempt.
     for tolerated in [
         Wake::Output {
             session: 1,

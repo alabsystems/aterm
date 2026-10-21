@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Dev/CI main-thread STALL watchdog (L0 hazard guard).
+//! Main-thread stall watchdog.
 //!
-//! Standing guard against the "main thread does unbounded work under a contended
-//! lock → whole-Mac freeze" hazard class. The archetype was a width change that
-//! rewrapped the ENTIRE scrollback synchronously on the UI thread under the
-//! per-session `term` `Arc<Mutex<Terminal>>` — a 42-second freeze. That specific
-//! site is fixed by `resize_offloading_scrollback`, but sixteen sibling triggers
-//! all funnel into `Grid::resize`'s width-reflow sink, so the CLASS needs a
-//! standing tripwire that pins any FUTURE regression to a named main-loop root
-//! *without symbols* — exactly what the stripped-release spindump lacked.
+//! Guards against the main thread doing unbounded work, or parking forever, under a
+//! contended lock (the whole-Mac freeze hazard), and pins any such stall to a named
+//! main-loop root without symbols, so a stripped release's `aterm.log` names it.
 //!
-//! ## How it works
+//! Each winit `ApplicationHandler` root is entered through [`enter`] / [`beat`] with a
+//! [`Breadcrumb`]: the beat bumps [`HEARTBEAT`] and stamps [`BREADCRUMB`]. A sampler
+//! thread ([`start`]) wakes every [`sample_interval`]; a heartbeat frozen past this build's
+//! bar at a work root is a stall, logged at error level with the root's name. Park points
+//! ([`Breadcrumb::is_park_point`]: startup, the OS event wait, a modal dialog, the update
+//! handoff) freeze the heartbeat by design and never report, unless the main thread is
+//! on-CPU in the event wait for a whole threshold ([`Breadcrumb::spin_is_a_stall`]).
+//! `about_to_wait`'s body is a work root ([`Breadcrumb::AboutToWaitWork`]); only the wait
+//! after it is the park. A stall that persists is re-reported every
+//! [`STALL_REPEAT_INTERVAL`], and its end gets a line of its own.
 //!
 //! Each winit `ApplicationHandler` root calls [`beat`] on entry with a
 //! [`Breadcrumb`] naming where the main thread is. `beat` bumps a monotonic
@@ -24,210 +28,60 @@
 //! inside bounded event handling — it logs (and optionally aborts) with the last
 //! breadcrumb NAME.
 //!
-//! ## The second word: phases
+//! A stall line says more than the root:
 //!
-//! A root is a coarse address — `UserEvent` is every control verb, every
-//! config reload, every update step. Work that is known to be long, or that a
-//! stall was once traced to, announces itself with [`phase`] for the length of
-//! an RAII guard, and the stall line carries that [`Phase`] after the root
-//! (`while inside \`UserEvent\`, in the headless pixel-backend redemption …`).
-//! [`beat`] clears it, so a phase never outlives the root entry it was
-//! announced in. The 2026-09-06 first-launch stall is the case that named
-//! the first two phases; see [`Phase::PixelBackendRedeem`] for where that
-//! line's window fell and what it could not be traced to without the word.
-//!
-//! ## Why the park-point exemption matters
-//!
-//! Between events the winit loop parks in the OS event wait (after
-//! `about_to_wait`), so the heartbeat legitimately freezes while idle. Firing on
-//! that would be pure noise. The fix: [`Breadcrumb::AboutToWait`] (and the
-//! pre-loop [`Breadcrumb::Startup`]) are marked [`Breadcrumb::is_park_point`], and
-//! the sampler NEVER reports a stall while the last breadcrumb is a park point. A
-//! real freeze happens *inside* `window_event` / `user_event` / the resize-settle
-//! flush — a WORK breadcrumb that never advances to `AboutToWait` — so it trips.
-//! `about_to_wait`'s own body is such a root too ([`Breadcrumb::AboutToWaitWork`]);
-//! only the wait after it is the park.
-//!
-//! ## ON IN RELEASE, at a coarser threshold
-//!
-//! It used to be off in release: [`enabled`] was `cfg!(debug_assertions) ||
-//! $ATERM_WATCHDOG`, so a shipped binary spawned no sampler and reported
-//! nothing. On 2026-08-30 that cost five hours. A self-recursive `OnceLock`
-//! (`app_update_screen::debug_seamless_reexec_armed`, shipped in v0.65.0 and
-//! v0.66.0) parked the main thread inside `user_event` on the first automatic
-//! update apply. The window stayed up, the process stayed alive, and
-//! `aterm.log` recorded nothing at all from the main thread from that second
-//! on — the only evidence was a macOS hang report, which had to be
-//! hand-symbolicated against the stripped release binary to name the frame.
-//! That is the exact scenario this module's own header says it exists for
-//! ("*without symbols* — exactly what the stripped-release spindump lacked"),
-//! and it was compiled out of the build that needed it.
-//!
-//! So the sampler now runs in EVERY build. What changes with the build is the
-//! threshold, not the existence of the guard:
-//!
-//! * debug builds (and a `dev-seams` build with `$ATERM_WATCHDOG` set) —
-//!   [`STALL_THRESHOLD`] (500 ms). Tight, for catching a regression while
-//!   developing it.
-//! * a shipped release binary — [`RELEASE_STALL_THRESHOLD`] (5 s). A main
-//!   thread frozen at a WORK root for five seconds is never normal, so the
-//!   coarser bar keeps a slow-but-progressing frame, a huge paste or a cold
-//!   font scan from ever writing an alarming line, while still turning a
-//!   PERMANENT wedge into a named log line within seconds instead of never.
-//!
-//! `$ATERM_WATCHDOG` is a DEVELOPMENT seam ([`aterm_types::dev_seam!`]): in a
-//! build that compiles seams, `=off` disables the sampler and `=abort`
-//! `process::abort()`s on a detected stall (CI / repro). A shipped binary reads
-//! none of it — the guard is on, at the coarse bar, and it logs; nothing in the
-//! environment can switch the user's freeze guard off. Everything else logs at
-//! error level and keeps going. [`beat`] is one monotonic clock read and
-//! a handful of atomic writes (all relaxed but one release) in every build
-//! either way (negligible on the hot event path, and the clock read is what
-//! buys the turn census below), and the sampler is one thread asleep 99.99% of
-//! the time.
-//!
-//! A stall that PERSISTS is re-reported every [`STALL_REPEAT_INTERVAL`] with
-//! the accumulated frozen duration, so the log distinguishes "wedged for a
-//! moment" from "wedged for an hour and never recovered" — the distinction the
-//! 0.65.0 log could not make, because it said nothing at all.
-//!
-//! ## The TURN CENSUS: the band between a slow frame and a wedge
-//!
-//! The sampler above reports a park that is STILL going after 5 s in a shipped
-//! build, and `metrics` publishes `max_redraw_total_ms` for a park INSIDE a
-//! redraw. Between those two bars lay a band no instrument in the process could
-//! name: a main thread parked 100–600 ms inside a NON-redraw handler — the
-//! `Wake::Output` arm runs status observation, bulk-scrollback routing, title
-//! drift and search refresh before the redraw fan-out — recovers long before
-//! the watchdog's threshold and never enters the redraw timer, so it left no
-//! attributable trace at all. The user still waited for it, and so did
-//! `present_latency` and `input_present`: that is how a live line came to read
-//! `max_present_latency_ms=560.54` beside `max_redraw_total_ms=13.84` with
-//! `present_drops=0`, a reading whose producer nothing published could name and
-//! which was duly read as a GPU problem.
-//!
-//! [`beat`] already knows WHERE the main thread is and WHEN it got there, so it
-//! is the one place that can close that band for free. Each beat stamps the
-//! clock; the NEXT beat prices the span that just ended and books it to the root
-//! that owned it ([`TurnLedger`]), published on the same `metrics` line as
-//! `max_turn_ms` / `max_turn_owner` / `max_turn_at_ms`, `last_turn_ms`,
-//! `turns`, and `long_turns` over [`LONG_TURN_THRESHOLD_NS`]. A
-//! `max_turn_ms=312 max_turn_owner=user_event` beside `max_redraw_total_ms=13.84`
-//! says the park was in the Output arm's bookkeeping rather than the GPU, and
-//! says it on the line the reader was already looking at.
-//!
-//! The census and the sampler are complements, and neither replaces the other:
-//! the census prices parks that END (it is closed by the next beat), the sampler
-//! names parks that do NOT (nothing closes those, which is the point). A park
-//! point's span is never booked — an idle wait, a modal dialog and the
-//! update-handoff park are designed freezes, and pricing them would be the same
-//! noise the sampler's park-point exemption exists to avoid.
-//!
-//! ## Where the thread IS, not which root ran last (2026-09-26)
-//!
-//! 0.93.0 froze after the process had been stopped for 26.6 hours: on resume,
-//! CoreFoundation walked winit's 0.1 µs waker timer forward one interval at a
-//! time (`aterm_objc::wake_timer` has the mechanism and its fix). The sampler
-//! caught it within five seconds — and wrote `while inside \`NewEvents\``,
-//! because that was the last root entered. `new_events` had returned; no aterm
-//! frame was on the stack. Three things close that gap:
-//!
-//! * **Locus.** Every root is entered through [`enter`], whose guard marks it
-//!   RETURNED when the handler ends, so a stall after the handler reads
-//!   "since \`NewEvents\` returned — outside every aterm handler".
+//! * **Phase.** Work known to be long announces itself with [`phase`] for an RAII guard's
+//!   lifetime, and the line carries that [`Phase`] after the root; [`beat`] clears it.
+//! * **Locus.** [`enter`]'s guard marks the root returned when its handler ends, so a
+//!   stall in AppKit or CoreFoundation after the handler reads "since `NewEvents`
+//!   returned", not "inside" it.
 //! * **CPU.** Each sample reads the main thread's CPU time
-//!   ([`crate::main_thread_probe::cpu_time`]). A thread parked in the OS event
-//!   wait uses none, so a frozen heartbeat on a thread that is ON-CPU for a
-//!   whole threshold is a spin even at the idle park point `AboutToWait`,
-//!   which the heartbeat rule alone must exempt ([`Breadcrumb::spin_is_a_stall`]).
+//!   ([`crate::main_thread_probe::cpu_time`]), telling a spin from a park.
 //! * **Stack.** Each report is followed by the main thread's stack
-//!   ([`crate::main_thread_probe::stack`]): `image + offset` frames with the
-//!   executable's load address and UUID, the same facts a hang report gives,
-//!   in `aterm.log` of a stripped release — in as many numbered lines as keep
-//!   every frame ([`stack_lines`]).
+//!   ([`crate::main_thread_probe::stack`]): `image + offset` frames with the executable's
+//!   load address and UUID, in numbered parts each under the logger's body cap
+//!   ([`stack_lines`]).
 //!
-//! And the trigger itself gets a line: a sampler wake more than
-//! [`PROCESS_GAP`] late on a clock that stops while the Mac sleeps means the
-//! whole process was not running ([`process_gap`]); that is logged and the
-//! sampler starts over, so the gap is never charged to the main thread.
+//! A sampler wake more than [`PROCESS_GAP`] late means the whole process was not running
+//! (App Nap, CPU starvation, SIGSTOP, a debugger). Every wake is timed from the wake before
+//! it ([`Clocks`]), so a gap anywhere in the loop, the report pass included, is seen; it is
+//! read on both clocks ([`classify_gap`]) to tell an unscheduled process from a sleeping
+//! Mac, logged, and resynced over, never charged to the main thread.
 //!
-//! ## A gap inside the report pass (2026-09-28)
+//! [`beat`] also prices each turn (the span to the next beat) and books it to the root that
+//! owned it ([`TurnLedger`]), published on the `metrics` line as `max_turn_ms`,
+//! `max_turn_owner`, `max_turn_at_ms`, `last_turn_ms`, `turns`, `long_turns` and
+//! `main_busy_ms_per_s`. The census prices parks that end, such as 100–600 ms inside a
+//! non-redraw handler that no other instrument sees; the sampler names parks that do not.
+//! Park points are never booked.
 //!
-//! On 2026-09-28 (0.98.0) the whole process went unscheduled for 3 h 22 m on a
-//! Mac at load 45-151 with its swap full. App Nap is the likely cause (the thaw
-//! came 5 ms after the window server took an App Nap `AppDrawing` assertion on
-//! the process), CPU starvation the other one; neither is proven. The sampler
-//! had just reported a stall — the main thread was in AppKit's
-//! `-[NSSceneStatusItem _setupScene:]`, waiting on a synchronous FrontBoard
-//! scene activation — and its log went wrong three ways:
-//!
-//! * the stack was ONE record, and the logger's 1 KiB cap on an ERROR body
-//!   ([`aterm_log::MAX_ALERT_RECORD_BYTES`]) cut it at frame #11;
-//! * only the sampler's SLEEP was timed, and no gap line was written, so the
-//!   gap fell in the rest of the loop: the report pass that writes the stall
-//!   line, captures the stack and writes it;
-//! * so the `STALL ENDED` line at the thaw charged all 12138 s to the main
-//!   thread.
-//!
-//! So the stack is logged in parts, each under the cap and each stamped with
-//! when it was captured ([`stack_lines`]); every wake is timed from the wake
-//! before it ([`Clocks`]), so a gap anywhere in the loop — the report pass,
-//! the stack capture included — is seen, logged and resynced; and the gap is
-//! read on both clocks ([`classify_gap`]), so its line says whether this
-//! process was not scheduled or the Mac slept.
-//!
-//! ## A verb the main thread cannot take
-//!
-//! In the same incident the main thread was stuck in AppKit before the whole
-//! process stopped running. A control verb that needs the main thread could
-//! only post its hop and wait out the whole reply deadline (30 s, holding a
-//! worker lane) for a thread that could not answer, though the heartbeat
-//! already showed it stuck. [`main_stall`] reads the time [`beat_into`]
-//! stamps, the root, and how long a hop has waited for the main thread to
-//! take it, at the shipped bar in every build. While it finds the thread
-//! stalled, such a verb is refused before anything is posted, with
-//! `ERR main thread stalled <N>s; retry` (`control_media`).
+//! [`main_stall`] reads the beat's timestamp, the root, and how long a hop has waited for
+//! the main thread, at the shipped bar in every build, so a control verb that needs a
+//! stalled main thread is refused before anything is posted, with
+//! `ERR main thread stalled <N>s; retry` (`control_media`), instead of holding a worker
+//! lane for its whole reply deadline.
 
 use crate::label_enum::label_enum;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// How often the sampler thread wakes to inspect the heartbeat: HALF the bar
-/// this build judges a stall against ([`threshold`]), so two consecutive
-/// samples always straddle it.
-///
-/// DERIVED, NOT CONSTANT (2026-09-22 efficiency audit). It was a flat 250 ms
-/// while the bar it serves is 500 ms in a debug build and
-/// [`RELEASE_STALL_THRESHOLD`] (5 s) in a shipped one — so a release binary woke
-/// 4 times a second, twenty samples per threshold window, to answer a question
-/// that needs two. Measured on the owner's idle machine: the watchdog was the
-/// single largest source of aterm's kernel wakeups at rest (4.0 of ~6.3 raw
-/// wakes/s, before macOS coalescing), on a fanless laptop where deep-idle
-/// residency is the whole battery story. Halving the threshold keeps the
-/// detection property exactly — a wedge is still caught within 1.5 thresholds —
-/// and the DEBUG lane is byte-identical at 250 ms, so nothing a developer
-/// watches changes.
+/// How often the sampler wakes: half the bar this build judges a stall against
+/// ([`threshold`]), so two consecutive samples always straddle it and a wedge is caught
+/// within 1.5 thresholds. Derived rather than fixed: a flat 250 ms made the release
+/// sampler (5 s bar) aterm's largest source of idle kernel wakeups (4.0 of ~6.3 wakes/s).
 fn sample_interval() -> Duration {
     threshold() / 2
 }
 
-/// How long the heartbeat may stay frozen at a WORK breadcrumb before it counts
-/// as a stall, in a DEBUG build or under the `$ATERM_WATCHDOG` seam. The
-/// sampler wakes at half this ([`sample_interval`]), so a genuine wedge is
-/// caught within ~750 ms while a single slow-but-progressing frame never trips.
+/// How long the heartbeat may stay frozen at a work breadcrumb before it counts as a
+/// stall, in a debug build or under the `$ATERM_WATCHDOG` seam: a wedge is caught within
+/// ~750 ms, while a single slow-but-progressing frame never trips.
 const STALL_THRESHOLD: Duration = Duration::from_millis(500);
 
-/// The same bar for a SHIPPED release binary, where the reader is a user's
-/// `aterm.log` rather than a developer's terminal.
-///
-/// The trade is deliberate and one-directional: 500 ms of
-/// main-thread work is unusual but not impossible in the field (a cold font
-/// catalog, a very large paste, a first-frame pipeline build), and an error line
-/// for one of those is noise that teaches a reader to ignore the guard. Five
-/// seconds is not survivable UI latency under any reading — nothing in this
-/// program is allowed to hold the main thread that long — so a line at 5 s is
-/// always a real finding. It still converts a PERMANENT park from silence into
-/// a named log line within seconds, which is the whole point.
+/// The same bar for a shipped release binary, where the reader is a user's `aterm.log`.
+/// 500 ms of main-thread work happens in the field (a cold font catalog, a huge paste, a
+/// first-frame pipeline build), and a line for it would teach readers to ignore the guard;
+/// 5 s is never acceptable UI latency, so a line at 5 s is always a real finding.
 const RELEASE_STALL_THRESHOLD: Duration = Duration::from_secs(5);
 
 /// How often a still-frozen main thread is re-reported after its first line.
@@ -307,14 +161,11 @@ impl MainWatch {
 /// The process's main-thread watch ([`MainWatch`]).
 static MAIN: MainWatch = MainWatch::new();
 
-/// The work the main thread last ANNOUNCED inside the current root, as a
-/// [`Phase`] `u8` — the second word of a stall line, where the root alone is
-/// not enough. [`beat`] clears it: a phase is scoped to the work inside ONE
-/// root entry and never carried into the next, and a guard restores its outer
-/// phase only over its OWN announcement (a compare-exchange on drop), so a
-/// stale announcement can never name the wrong work — not even a nested
-/// guard's outer phase, dropped after a beat cleared the cell for a root
-/// that never announced it. Written through [`phase`], read by the sampler.
+/// The work the main thread last announced inside the current root, as a [`Phase`] `u8`:
+/// the second word of a stall line. [`beat`] clears it, so a phase never outlives its root
+/// entry, and a guard restores its outer phase only over its own announcement (a
+/// compare-exchange on drop), so a stale announcement never names the wrong work. Written
+/// through [`phase`], read by the sampler.
 static PHASE: AtomicU8 = AtomicU8::new(Phase::None as u8);
 
 label_enum! {
@@ -384,14 +235,11 @@ impl Breadcrumb {
         Self::from_index(usize::from(v)).unwrap_or(Self::Startup)
     }
 
-    /// Whether a main thread that is ON-CPU with a frozen heartbeat at this
-    /// root is a stall. True everywhere except the designed freezes that do
-    /// real work — startup (GPU, shaders, fonts), a modal dialog's AppKit
-    /// loop and the update handoff — and in particular true at the idle park,
-    /// [`Breadcrumb::AboutToWait`]: a thread parked in the OS event wait uses
-    /// no CPU, so one that burns it there is spinning somewhere aterm's
-    /// heartbeat cannot see (the 2026-09-26 timer catch-up could have landed
-    /// there as easily as after `NewEvents`).
+    /// Whether a main thread on-CPU with a frozen heartbeat at this root is a stall: true
+    /// everywhere except the designed freezes that do real work (startup, a modal dialog's
+    /// AppKit loop, the update handoff), and in particular true at the idle park
+    /// [`Breadcrumb::AboutToWait`]: a thread parked in the OS event wait uses no CPU, so one
+    /// that burns it there is spinning where the heartbeat cannot see.
     fn spin_is_a_stall(self) -> bool {
         !matches!(
             self,
@@ -399,8 +247,8 @@ impl Breadcrumb {
         )
     }
 
-    /// A root where a frozen heartbeat is EXPECTED (idle park / pre-loop startup),
-    /// so the sampler must not report a stall while parked here.
+    /// A root where a frozen heartbeat is expected (startup, idle, a modal dialog, the
+    /// update handoff), so the sampler does not report a stall while parked here.
     fn is_park_point(self) -> bool {
         matches!(
             self,
@@ -412,31 +260,22 @@ impl Breadcrumb {
     }
 }
 
-/// The pure stall decision, factored out of the sampler loop so it is
-/// deterministically testable: a frozen heartbeat is a STALL iff the main thread
-/// is sitting in a WORK root (not a park point) and has been frozen at least
-/// `threshold` — [`STALL_THRESHOLD`] for the dev lane,
-/// [`RELEASE_STALL_THRESHOLD`] for a shipped binary. This is the exact
-/// predicate that FLAGS the L0 hazard — a wedge in the `ResizeSettle` reflow
-/// that never reaches `AboutToWait`, or a main thread parked forever inside
-/// `user_event` on a lazy-init cycle.
+/// The pure stall decision: a frozen heartbeat is a stall iff the main thread sits at a
+/// work root (not a park point) and has been frozen at least `threshold`.
 fn is_stall_at(bc: Breadcrumb, frozen: Duration, threshold: Duration) -> bool {
     !bc.is_park_point() && frozen >= threshold
 }
 
-/// The bar a main-thread control verb is refused at ([`main_stall`]): the
-/// shipped stall bar, in EVERY build. Not [`threshold`]: a debug build's
-/// 500 ms is a developer's tripwire, and turning verbs away at it would fail a
-/// slow-but-live debug turn (a cold first raster) that the reply deadline was
-/// written to wait for. No setting and no environment switch changes it.
+/// The bar a main-thread control verb is refused at ([`main_stall`]): the shipped stall
+/// bar, in every build, with no setting or environment switch. Not [`threshold`]: refusing
+/// at a debug build's 500 ms would fail a slow-but-live debug turn (a cold first raster)
+/// that the reply deadline was written to wait for.
 const MAIN_STALL_BAR: Duration = RELEASE_STALL_THRESHOLD;
 
-/// A main thread that cannot take a verb now, as [`main_stall`] reads it. Its
-/// `Display` is the reason a refused verb answers with:
-/// `main thread stalled <N>s; retry`. The root stays out of it: past the idle
-/// park `<N>` counts from the waiting hop, not from that root, and a winit
-/// handler name is nothing a client can act on. The refusal's log line names
-/// it.
+/// A main thread that cannot take a verb now, as [`main_stall`] reads it. Its `Display` is
+/// the refused verb's reason, `main thread stalled <N>s; retry`, without the root: past
+/// the idle park `<N>` counts from the waiting hop, and a winit handler name is nothing a
+/// client can act on. The refusal's log line names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MainStall {
     /// How long the main thread has gone without a beat while it had work:
@@ -445,9 +284,8 @@ pub(crate) struct MainStall {
     pub(crate) stalled: Duration,
     /// The root the heartbeat last named.
     pub(crate) root: Breadcrumb,
-    /// That root's handler had returned: the thread is in AppKit or
-    /// CoreFoundation, outside every aterm handler (the 2026-09-28 incident's
-    /// `-[NSSceneStatusItem _setupScene:]`, after `NewEvents` returned).
+    /// That root's handler had returned: the thread is in AppKit or CoreFoundation,
+    /// outside every aterm handler.
     pub(crate) returned: bool,
 }
 
@@ -457,34 +295,26 @@ impl std::fmt::Display for MainStall {
     }
 }
 
-/// Whether a verb that needs the main thread should be refused NOW rather than
-/// posted, and why: the READER half of the heartbeat contract whose writer is
-/// [`beat_into`] (the derived `MainThreadStallRefusal` machine states both
-/// halves). Pure, so the rule is testable with no thread and no clock.
+/// Whether a verb that needs the main thread should be refused now rather than posted: the
+/// reader half of the heartbeat contract whose writer is [`beat_into`] (the derived
+/// `MainThreadStallRefusal` machine states both). Pure, so testable with no thread or
+/// clock.
 ///
-/// `last_beat_ns` is the heartbeat's timestamp (0: no beat yet, so no
-/// evidence and no refusal), `root`/`returned` are where the thread last was,
-/// and `hop_since_ns` is when the oldest run of main-thread hops the main
-/// thread has not yet taken began (`None` when none is). A hop it has taken
-/// and whose reply it queued (`settings set`, answered by the config worker)
-/// waits on that worker, not on this thread, and is not in the run
-/// (`control_media::Hops`). Two ways to be stalled, at [`MAIN_STALL_BAR`]:
+/// `last_beat_ns` is the heartbeat's timestamp (0: no beat yet, no refusal),
+/// `root`/`returned` where the thread last was, and `hop_since_ns` when the oldest run of
+/// hops the main thread has not yet taken began. A hop it took and whose reply it queued
+/// (`settings set`, answered by the config worker) is not in the run
+/// (`control_media::Hops`). Stalled, at [`MAIN_STALL_BAR`], is either:
 ///
-/// * the thread sits at a WORK root with no beat for the bar — the sampler's
-///   own verdict ([`is_stall_at`]), whether its handler is still on the stack
-///   or has returned into AppKit;
-/// * or it is past a park point that is not a designed freeze (the idle park,
-///   `AboutToWait`) and a hop it has not taken has waited the bar with no beat
-///   since it was posted: the thread left its event wait for something that is
-///   not aterm's and never came back. The heartbeat alone cannot say this,
-///   because an idle thread's heartbeat is old too. Judged on the heartbeat
-///   alone, the first verb after ten idle minutes would make every verb that
-///   arrives while it is being answered look stalled, so the hop's own wait
-///   is the other half of the test.
+/// * at a work root with no beat for the bar (the sampler's [`is_stall_at`]), handler on
+///   the stack or returned; or
+/// * past the idle park (`AboutToWait`) with a hop that has waited the bar and no beat
+///   since it was posted: the thread left its wait for something that is not aterm's. An
+///   idle thread's heartbeat is old too, so the hop's own wait is the other half of the
+///   test.
 ///
-/// A dialog, the update handoff and startup are designed freezes and never
-/// read as stalled here: the dialog has its own refusal, and the other two end
-/// by themselves.
+/// Startup, a dialog and the update handoff are designed freezes and never stalled here:
+/// the dialog has its own refusal, and the other two end by themselves.
 fn main_stall(
     now_ns: u64,
     last_beat_ns: u64,
@@ -514,15 +344,11 @@ fn main_stall(
     })
 }
 
-/// [`main_stall`] now, for a control worker about to post a main-thread hop:
-/// the heartbeat as [`beat`] last stamped it and `hop_since_ns` from the
-/// caller's own hop count (`control_media`).
-///
-/// The root is read FIRST and with `Acquire`: [`beat_into`] stamps the time
-/// before it publishes the root (`Release`), so the time read after a root is
-/// never older than that root's beat. The other order could pair the root a
-/// beat just entered with the stamp of the long idle before it, and refuse a
-/// verb on a thread that had just woken.
+/// [`main_stall`] now, for a control worker about to post a main-thread hop, with
+/// `hop_since_ns` from the caller's own hop count (`control_media`). The root is read first,
+/// with `Acquire`: [`beat_into`] stamps the time before it publishes the root (`Release`),
+/// so the time read after it is never older than that root's beat. The other order could
+/// pair a just-entered root with the stamp of the idle before it and refuse a woken thread.
 pub(crate) fn main_stall_now(hop_since_ns: Option<u64>) -> Option<MainStall> {
     let root = Breadcrumb::from_u8(MAIN.breadcrumb.load(Ordering::Acquire));
     let last_beat_ns = TURNS.last_beat_ns.load(Ordering::Relaxed);
@@ -553,10 +379,9 @@ struct Hit {
 /// interval to count as busy. A parked thread uses ~0; a spinning one ~100.
 const BUSY_PERCENT: u128 = 80;
 
-/// The sampler's detection state machine, split out of the background thread so
-/// its behaviour (fire once per contiguous stall, re-arm on progress, never fire
-/// at a park point) is testable against a SYNTHETIC clock — no real sleeps, no
-/// global logger. The live thread just feeds it real samples.
+/// The sampler's detection state machine, apart from the background thread so its
+/// behaviour (fire once per contiguous stall, re-arm on progress, never fire at a park
+/// point) is testable on a synthetic clock. The live thread feeds it real samples.
 struct Sampler {
     /// The heartbeat value last observed to advance.
     last_beat: u64,
@@ -567,10 +392,8 @@ struct Sampler {
     /// When the current contiguous stall was last reported, for the repeat
     /// cadence. `None` until the first report.
     last_report: Option<Instant>,
-    /// How many times THIS contiguous stall has been reported. Lives here, with
-    /// the rest of the per-stall state, so it re-arms on recovery: kept in the
-    /// sampler loop instead, a second stall hours after the first was announced
-    /// as "STALL CONTINUES" and two distinct incidents read as one wedge.
+    /// How many times this contiguous stall has been reported. Per-stall state, so it
+    /// re-arms on recovery and a later stall reports as a first.
     reports: u32,
     /// The bar this sampler judges against — [`STALL_THRESHOLD`] for the dev
     /// lane, [`RELEASE_STALL_THRESHOLD`] for a shipped binary.
@@ -580,17 +403,12 @@ struct Sampler {
     /// Since when every sample found the main thread on-CPU for at least
     /// [`BUSY_PERCENT`] of the interval with no heartbeat in between.
     busy_since: Option<Instant>,
-    /// The REPORTED stall that has not ended yet: the root it was first reported
-    /// at and when it began, until the main thread moves again — a heartbeat, or
-    /// a reported spin at a park point that a CPU reading finds quiet. It
-    /// survives a [`Sampler::resync`]: a stall the process was stopped inside is
-    /// still open when the process runs again.
+    /// The reported stall that has not ended yet, until the main thread moves (a heartbeat,
+    /// or a CPU reading that finds a spin reported at a park point quiet). It survives a
+    /// [`Sampler::resync`]: a stall the process was stopped inside is still open after.
     open: Option<OpenStall>,
-    /// A reported stall that has since ENDED, waiting for [`Sampler::take_ended`].
-    /// Without its line, a stall that recovered and one that lasted until the
-    /// process died read the same in `aterm.log`, and the recovery census
-    /// (`recovery_census`) could not tell a wedged death from a run that merely
-    /// had a slow moment.
+    /// A reported stall that has since ended, waiting for [`Sampler::take_ended`]. Its line
+    /// lets the recovery census tell a stall the run survived from one it died in.
     ended: Option<Ended>,
 }
 
@@ -642,14 +460,11 @@ impl Sampler {
         }
     }
 
-    /// Start over at `now`: the process was not running for `gap` (see
-    /// [`process_gap`]), and nothing measured across that gap is about the
-    /// main thread — except a stall REPORTED before it, which is carried
-    /// across. Dropped here, its end would never be logged, and the recovery
-    /// census would read a stall the run survived as the run's last word
-    /// ("stalled at its end"). If the heartbeat moved across the gap the stall
-    /// ended inside it and is handed to [`Sampler::take_ended`] now; if not,
-    /// it is still open and ends — with its line — when the main thread moves.
+    /// Start over at `now`: the process was not running for `gap` ([`process_gap`]), so
+    /// nothing measured across it is about the main thread, except a stall reported before
+    /// it, carried across (its start moved later by the gap) so its end is still logged. If
+    /// the heartbeat moved across the gap the stall ended inside it and goes to
+    /// [`Sampler::take_ended`] now; if not, it ends when the main thread moves.
     fn resync(&mut self, now: Instant, beat: u64, gap: Duration) {
         let moved = beat != self.last_beat;
         let open = self.open.take().map(|stall| OpenStall {
@@ -706,27 +521,21 @@ impl Sampler {
         }
     }
 
-    /// The heartbeat rule alone, with no CPU reading — what every sample was
-    /// before 2026-09-26, and what a platform without the probe still gets.
+    /// The heartbeat rule alone, with no CPU reading (as on a platform without the probe).
     #[cfg(test)]
     fn poll(&mut self, now: Instant, cur_beat: u64, bc: Breadcrumb) -> Option<Breadcrumb> {
         self.poll_with(now, cur_beat, bc, None).map(|hit| hit.root)
     }
 
-    /// Fold one sample. Returns a [`Hit`] when this sample should be REPORTED:
-    /// once when a contiguous stall crosses the threshold, and then once per
-    /// [`STALL_REPEAT_INTERVAL`] for as long as it lasts. A main thread that
-    /// never comes back is the case this guard exists for, and one line an hour
-    /// ago is not the same evidence as a line saying it is still frozen now.
+    /// Fold one sample. Returns a [`Hit`] when this sample should be reported: once when a
+    /// contiguous stall crosses the threshold, then once per [`STALL_REPEAT_INTERVAL`] while
+    /// it lasts.
     ///
-    /// Two rules. A frozen heartbeat at a WORK root past the threshold is a
-    /// stall whatever the thread is doing (parked on a lock, or spinning). A
-    /// frozen heartbeat at a park point is expected — unless `cpu` shows the
-    /// main thread ON-CPU for a whole threshold there, which a parked thread
-    /// never is ([`Breadcrumb::spin_is_a_stall`]).
-    ///
-    /// A reported stall stays [`Sampler::open`] until the main thread moves;
-    /// its end is handed to [`Sampler::take_ended`].
+    /// A frozen heartbeat at a work root past the threshold is a stall whether the thread
+    /// is parked or spinning. At a park point it is expected, unless `cpu` shows the main
+    /// thread on-CPU for a whole threshold there, which a parked thread never is
+    /// ([`Breadcrumb::spin_is_a_stall`]). A reported stall stays [`Sampler::open`] until the
+    /// main thread moves; its end goes to [`Sampler::take_ended`].
     fn poll_with(
         &mut self,
         now: Instant,
@@ -736,8 +545,7 @@ impl Sampler {
     ) -> Option<Hit> {
         let judged = self.fold_cpu(now, cpu);
         if cur_beat != self.last_beat {
-            // Progress: the main thread is alive. Reset the stall clock + re-arm —
-            // and when a stall was REPORTED, say that it ended.
+            // Progress: reset the stall clock, re-arm, and end a reported stall.
             self.end_open(now, EndedBy::Beat);
             self.last_beat = cur_beat;
             self.last_advance = now;
@@ -762,15 +570,11 @@ impl Sampler {
                     ));
                 }
                 None => {
-                    // Idle / startup park: a frozen heartbeat is expected here.
-                    // Keep the clock reset so leaving idle starts a fresh span.
-                    // A spin reported here has ended once a reading finds the
-                    // thread quiet; with no reading to go by it stays open
-                    // until the heartbeat moves. A stall reported at a WORK
-                    // root is not ended here: a park point under its unmoved
-                    // heartbeat is the next root's breadcrumb read before its
-                    // beat (the breadcrumb is stamped first), and that beat
-                    // ends it — it was never a spin.
+                    // Idle / startup park: a frozen heartbeat is expected, so keep the
+                    // clock reset. A spin reported here ends once a reading finds the thread
+                    // quiet (with no reading, at the next beat). A stall reported at a work
+                    // root is not ended here: a park point under its unmoved heartbeat is the
+                    // next root's breadcrumb read before its beat, and that beat ends it.
                     if judged == Some(false)
                         && self.open.is_some_and(|stall| stall.root.is_park_point())
                     {
@@ -922,12 +726,11 @@ impl SamplerWake {
     }
 }
 
-/// How late a sampler wake must be before it means the whole PROCESS was not
-/// running. `Instant` does not advance while the Mac sleeps, so lateness on it
-/// is time the system was awake and this process was not scheduled: napped
-/// (App Nap), starved of CPU, stopped (SIGSTOP), paused under a debugger, or
-/// suspended. The wall clock running this much further than `Instant` is the
-/// Mac asleep instead ([`Wall::Slept`]).
+/// How late a sampler wake must be before it means the whole process was not running.
+/// `Instant` does not advance while the Mac sleeps, so lateness on it is time the system was
+/// awake and this process was not scheduled: App Nap, CPU starvation, SIGSTOP, a debugger,
+/// or suspension. The wall clock running this much further than `Instant` is the Mac asleep
+/// instead ([`Wall::Slept`]).
 const PROCESS_GAP: Duration = Duration::from_secs(30);
 
 /// The lateness of a sampler wake that asked to sleep `requested` and was gone
@@ -954,11 +757,10 @@ struct Elapsed {
     pass: Duration,
 }
 
-/// Both clocks, read together at one sampler wake. The sampler thread keeps
-/// the previous wake's reading and measures the next wake from it, never from
-/// the start of that wake's own sleep: timed from the sleep alone, the
-/// 2026-09-28 gap — after a stall line, in the pass that captures and writes
-/// the stack — left every wake on time and was charged to the main thread.
+/// Both clocks, read together at one sampler wake. The sampler keeps the previous wake's
+/// reading and measures the next wake from it, never from the start of that wake's own
+/// sleep, so a gap in the report pass (the stall line, the stack capture) is seen rather
+/// than charged to the main thread.
 #[derive(Clone, Copy)]
 struct Clocks {
     mono: Instant,
@@ -1087,34 +889,23 @@ fn slept_message(slept: Duration) -> String {
     )
 }
 
-/// A main-loop turn at or over this is COUNTED as long. One 30 fps frame budget
-/// — the same bar [`crate::metrics::SLOW_FRAME_THRESHOLD_NS`] applies to a
-/// frame's render, so "long" means one thing across the whole `metrics` line:
-/// this turn cannot have been part of a frame delivered on time.
+/// A main-loop turn at or over this counts as long: one 30 fps frame budget, the bar
+/// [`crate::metrics::SLOW_FRAME_THRESHOLD_NS`] applies to a frame's render, so "long" means
+/// one thing across the `metrics` line.
 const LONG_TURN_THRESHOLD_NS: u64 = crate::metrics::SLOW_FRAME_THRESHOLD_NS;
 
-/// The main-loop TURN census: how long the main thread spent in each work root,
-/// attributed to that root. See the module header for the band it closes.
+/// The main-loop turn census: how long the main thread spent in each work root.
 ///
-/// A "turn" is the span from one [`beat`] to the next, charged to the root that
-/// was current when it opened. That is the span the USER waited, which is why it
-/// is the span booked: the handler body PLUS whatever the winit loop did after
-/// the handler returned and before the next root opened. It is deliberately not
-/// a handler-body timer — a park between two handlers is still a main thread
-/// that is not painting, and a census with a hole in it invites exactly the
-/// "this outlier has no producer" reading it exists to end.
+/// A turn is the span from one [`beat`] to the next, charged to the root current when it
+/// opened: the handler body plus whatever the winit loop did before the next root, i.e.
+/// the span the user waited. A `WindowEvent` turn contains the redraw when the event was
+/// `RedrawRequested`, so read `max_turn_ms` against `max_redraw_total_ms`: both large is a
+/// slow frame; a large turn with a small redraw is a park outside the redraw.
 ///
-/// A `WindowEvent` turn therefore CONTAINS the redraw when the event was
-/// `RedrawRequested`, so `max_turn_ms` is read AGAINST `max_redraw_total_ms`:
-/// both large is a slow frame (already attributable, already published), a large
-/// `max_turn_ms` with a small `max_redraw_total_ms` is a park no other
-/// instrument in the process reaches — the finding this census answers.
-///
-/// Every field is written by the main thread alone (the only caller of [`beat`]),
-/// so a max and its owner cannot tear against each other. A concurrent
-/// [`reset_turn_census`] from the control socket can at worst clear a max between
-/// its two writes, leaving a fresh window with a stale owner label on a zero —
-/// the same benign race every `max_`/owner pair on that line already accepts.
+/// Every field is written by the main thread alone (the only caller of [`beat`]), so a max
+/// and its owner cannot tear. A concurrent [`reset_turn_census`] can at worst clear a max
+/// between its two writes, leaving a stale owner on a zero: the benign race every
+/// `max_`/owner pair on the `metrics` line accepts.
 struct TurnLedger {
     /// When the CURRENT root was entered (`crate::metrics::now_ns` clock), for
     /// the window stats. 0 = disarmed: no turn is open, so the next beat books
@@ -1122,33 +913,25 @@ struct TurnLedger {
     /// immediately after a reset, both of which would otherwise book a span
     /// that began outside the window.
     open_ns: AtomicU64,
-    /// When the main thread last entered a root, on the same clock: the
-    /// heartbeat's timestamp, which [`main_stall`] reads. Not `open_ns`, which
-    /// [`TurnLedger::reset`] zeroes: a `metrics reset` sent while the main
-    /// thread is stuck would make a reader of that stamp see a thread that
-    /// never beat, and let every verb through to wait out its deadline (the
-    /// defect the `MainThreadStallRefusal` machine replays). `reset` leaves
-    /// this one alone. 0 = no beat yet.
+    /// When the main thread last entered a root, on the same clock: the heartbeat's
+    /// timestamp [`main_stall`] reads. Not `open_ns`, which [`TurnLedger::reset`] zeroes: a
+    /// `metrics reset` during a stall would then read as a thread that never beat and let
+    /// every verb through. 0 = no beat yet.
     last_beat_ns: AtomicU64,
     /// The most recently booked turn.
     last_ns: AtomicU64,
-    /// The worst booked turn since reset, the root that owned it, and when it
-    /// ended. A max with no owner and no instant cannot end an investigation —
-    /// the lesson `max_present_latency_ms=560.54` already taught this line.
+    /// The worst booked turn since reset, the root that owned it, and when it ended.
     max_ns: AtomicU64,
     max_owner: AtomicU8,
     max_at_ns: AtomicU64,
-    /// How many turns were booked, and how many were at or over
-    /// [`LONG_TURN_THRESHOLD_NS`]. READ THE MAX WITH THESE: one 600 ms turn in a
-    /// window of 40,000 is a hitch; the same max with `long_turns=3000` is a main
-    /// thread that is late all the time.
+    /// How many turns were booked, and how many at or over [`LONG_TURN_THRESHOLD_NS`].
+    /// Read the max with these: one 600 ms turn in 40,000 is a hitch; the same max with
+    /// `long_turns=3000` is a main thread that is late all the time.
     turns: AtomicU64,
     long_turns: AtomicU64,
-    /// The sum of the booked turns since reset, and when the window began
-    /// (0: process start), on the same clock: `main_busy_ms_per_s`, the
-    /// share of the window the main thread spent in aterm's work. A main
-    /// thread late everywhere by a little (death by a thousand cuts) shows
-    /// here, where no max can show it.
+    /// The booked turns' sum since reset, and when that window began (0: process start), on
+    /// the same clock: `main_busy_ms_per_s`, the share of the window the main thread spent in
+    /// aterm's work. A main thread a little late everywhere shows here, where no max can.
     busy_ns: AtomicU64,
     window_from_ns: AtomicU64,
     /// Each root's booked turns since reset, indexed by [`Breadcrumb::index`]:
@@ -1174,13 +957,9 @@ impl TurnLedger {
         }
     }
 
-    /// The span a turn that just ended is ATTRIBUTABLE for, or `None` when it is
-    /// not this census's to price: a park point (idle, startup, a modal dialog,
-    /// the update-handoff wait — all designed freezes), or a disarmed stamp (no
-    /// turn was open, so the span began outside this window).
-    ///
-    /// Pure, so the attribution rule is testable without the process-global
-    /// ledger that every other test in this binary also writes.
+    /// The span a turn that just ended is attributable for, or `None` when it is not this
+    /// census's to price: a park point (all designed freezes), or a disarmed stamp (the
+    /// span began outside this window). Pure, so testable without the global ledger.
     fn attributable_span(previous: Breadcrumb, open_ns: u64, now_ns: u64) -> Option<u64> {
         if open_ns == 0 || previous.is_park_point() {
             return None;
@@ -1282,17 +1061,16 @@ pub(crate) struct TurnCensus {
     /// [`LONG_TURN_THRESHOLD_NS`].
     pub turns: u64,
     pub long_turns: u64,
-    /// The booked turns' sum since the last reset, and when that window
-    /// began (0: process start), on the `crate::metrics::now_ns` clock.
+    /// The booked turns' sum since the last reset, and when that window began (0: process
+    /// start), on the `crate::metrics::now_ns` clock.
     pub busy_ns: u64,
     pub window_from_ns: u64,
 }
 
 impl TurnCensus {
-    /// `main_busy_ms_per_s` read at `now_ns`: the booked turns' sum over the
-    /// window's length, as milliseconds per second — 1000 is a main thread
-    /// that never parked. An empty window (a read in the reset's own
-    /// nanosecond) is 0.
+    /// `main_busy_ms_per_s` at `now_ns`: the booked turns' sum over the window's length, in
+    /// milliseconds per second (1000: a main thread that never parked). An empty window (a
+    /// read in the reset's own nanosecond) is 0.
     fn busy_ms_per_s(&self, now_ns: u64) -> f64 {
         let window_ns = now_ns.saturating_sub(self.window_from_ns);
         if window_ns == 0 {
@@ -1309,33 +1087,28 @@ pub(crate) fn main_busy_ms_per_s(now_ns: u64) -> f64 {
     turn_census().busy_ms_per_s(now_ns)
 }
 
-/// Record that the main thread just entered `bc`, and price the turn that ended.
-/// A monotonic clock read and a handful of atomic writes, all relaxed but the
-/// breadcrumb's release (see [`main_stall_now`]) — cheap enough to sit on the
-/// hot event path in every build, and the only place in the process that can
-/// price a park OUTSIDE the redraw (see the module header). The
-/// breadcrumb is stamped BEFORE the heartbeat bumps so the sampler never reads a
-/// fresh count against a stale location, and any announced [`Phase`] is cleared
-/// with it: the work a phase names belongs to the root that announced it.
+/// Record that the main thread just entered `bc`, and price the turn that ended: a clock
+/// read and a handful of atomic writes (relaxed but the breadcrumb's release, see
+/// [`main_stall_now`]), cheap enough for the hot event path in every build. The breadcrumb
+/// is stamped before the heartbeat bumps so the sampler never reads a fresh count against a
+/// stale location, and any announced [`Phase`] is cleared with it.
 #[inline]
 pub(crate) fn beat(bc: Breadcrumb) {
     beat_at(bc, crate::metrics::now_ns());
 }
 
-/// [`beat`] with the clock passed IN, returning the span it booked — a real clock
-/// would make any assertion about a span a race.
+/// [`beat`] with the clock passed in, returning the span it booked (a real clock would make
+/// any assertion about a span a race).
 #[inline]
 fn beat_at(bc: Breadcrumb, now_ns: u64) -> Option<u64> {
     beat_into(&MAIN, &TURNS, &PHASE, bc, now_ns)
 }
 
-/// The beat path with its LEDGER and its PHASE cell passed in too, on the
-/// [`Sampler`] precedent: factored out so the stamp-close-clear-bump sequence is
-/// testable against cells no other test in this binary can write, and no
-/// `metrics reset` can clear mid-assertion. The phase cell needs that as much as
-/// the ledger does: every lib.rs test that arms a deferral before
-/// `ensure_pixel_backend` holds [`Phase::PixelBackendRedeem`] on [`PHASE`] for
-/// the length of a font seal, and none of them takes this module's beat lock.
+/// The beat path with its ledger and phase cell passed in, so the stamp-close-clear-bump
+/// sequence is testable on cells no other test writes and no `metrics reset` clears
+/// mid-assertion. The phase cell needs that too: lib.rs tests that arm a deferral before
+/// `ensure_pixel_backend` hold [`Phase::PixelBackendRedeem`] on [`PHASE`] through a font
+/// seal without this module's beat lock.
 #[inline]
 fn beat_into(
     main: &MainWatch,
@@ -1352,22 +1125,17 @@ fn beat_into(
     turns.last_beat_ns.store(now_ns.max(1), Ordering::Relaxed);
     let previous = Breadcrumb::from_u8(main.breadcrumb.swap(bc as u8, Ordering::Release));
     let booked = turns.close(previous, now_ns);
-    // A root entry starts with NO announced phase (see `PHASE`): one more
-    // relaxed store on the hot path, the only way a phase ever ends besides its
-    // guard dropping, and stamped BEFORE the heartbeat bumps for the same
-    // reason the breadcrumb is — the sampler must never read a fresh count
-    // against a stale word.
+    // A root entry starts with no announced phase (see `PHASE`), stamped before the
+    // heartbeat bumps for the same reason as the breadcrumb.
     phase.store(Phase::None as u8, Ordering::Relaxed);
     main.returned.store(false, Ordering::Relaxed);
     main.heartbeat.fetch_add(1, Ordering::Relaxed);
     booked
 }
 
-/// Enter a winit root: [`beat`] now, and mark the root RETURNED when the
-/// guard drops at the end of the handler, so a stall that happens after the
-/// handler is gone — in AppKit or CoreFoundation, between aterm's handlers —
-/// is not reported as being inside it. Every `ApplicationHandler` root holds
-/// one for its whole body.
+/// Enter a winit root: [`beat`] now, and mark the root returned when the guard drops at the
+/// end of the handler, so a stall after it (in AppKit or CoreFoundation) is not reported as
+/// inside it. Every `ApplicationHandler` root holds one for its whole body.
 #[must_use = "the root lasts only as long as the guard lives"]
 pub(crate) fn enter(bc: Breadcrumb) -> RootGuard {
     enter_in(&MAIN, bc)
@@ -1384,10 +1152,9 @@ fn beat_on(main: &MainWatch, bc: Breadcrumb) {
     beat_into(main, &TURNS, &PHASE, bc, crate::metrics::now_ns());
 }
 
-/// Enter `about_to_wait`: its body is the WORK root
-/// [`Breadcrumb::AboutToWaitWork`], booked and watched like any other, and the
-/// guard's drop beats [`Breadcrumb::AboutToWait`] as the handler returns, so
-/// only the OS event wait after it is the park.
+/// Enter `about_to_wait`: its body is the work root [`Breadcrumb::AboutToWaitWork`], booked
+/// and watched like any other, and the guard's drop beats [`Breadcrumb::AboutToWait`] as the
+/// handler returns, so only the OS event wait after it is the park.
 #[must_use = "the root lasts only as long as the guard lives"]
 pub(crate) fn enter_about_to_wait() -> RootGuard {
     enter_about_to_wait_in(&MAIN)
@@ -1534,14 +1301,11 @@ pub(crate) fn current() -> Breadcrumb {
     MAIN.current()
 }
 
-/// Park the watchdog for the duration of a nested modal run loop.
-///
-/// Stamps [`Breadcrumb::Modal`] on entry and, on drop, restores the breadcrumb
-/// that was current when the modal opened WITH a fresh beat — the outer work
-/// root resumes from a heartbeat that says "now", not from one frozen since
-/// before the dialog. Must be held on the main thread across the `runModal`
-/// send and nothing else; a guard that outlives its dialog is a park that
-/// never ends, which is exactly the wedge the sampler exists to name.
+/// Park the watchdog for a nested modal run loop: stamps [`Breadcrumb::Modal`] and, on
+/// drop, restores the breadcrumb that was current with a fresh beat, so the outer root
+/// resumes from a heartbeat that says "now". Hold it on the main thread across the
+/// `runModal` send and nothing else: a guard that outlives its dialog is a park that never
+/// ends.
 #[must_use = "the park lasts only as long as the guard lives"]
 #[cfg(target_os = "macos")]
 pub(crate) fn park_modal() -> ModalPark {
@@ -1570,133 +1334,33 @@ impl Drop for ModalPark {
     }
 }
 
-/// The work a stall line can name INSIDE a root — the answer to "which of the
-/// many things `user_event` does was it doing?", which the root alone cannot
-/// give. `#[repr(u8)]` for the same reason [`Breadcrumb`] is: the NAME must
-/// survive into a stripped-release log line with no allocation and no symbols.
-///
-/// Added after the 2026-09-06 first-launch stall on an Intel MacBook Pro:
-/// `MAIN-THREAD STALL: no heartbeat for 5.045556453s while inside
-/// \`UserEvent\`` was recorded 14 s into the first headless launch on the
-/// machine, and `UserEvent` covers every control verb. Which verb had to be
-/// inferred from the instance's stderr and its socket-open time, and what
-/// that verb was doing on the main thread had to be re-measured with a
-/// probe afterwards — the one extra word this carries. A phase is announced
-/// with [`phase`] and lasts as long as its guard; the sampler prints the
-/// phase that is current when it reports.
+/// The work a stall line can name inside a root: which of the many things `user_event`
+/// does it was doing. `#[repr(u8)]` like [`Breadcrumb`], so the name survives into a
+/// stripped-release log line with no allocation and no symbols. Announced with [`phase`];
+/// the sampler prints the phase current when it reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum Phase {
     /// Nothing announced: the root is all the line says.
     None = 0,
-    /// `App::ensure_pixel_backend` — a headless run's FIRST pixel demand
-    /// redeeming, on the main thread, what the launch deferred: the font seal
-    /// (three font files read and parsed; Apple Color Emoji is 190 MB of it
-    /// on macOS), the chrome re-sync that follows it (`sync_chrome_fonts`:
-    /// the chrome rasterizer's faces handed over again and its semantic
-    /// surface re-forked from the sealed generation — not those three files,
-    /// so the redemption's line times it as a leg of its own), the CPU face
-    /// fork, and `GpuRenderer::new_with_family`. That last leg is NOT just
-    /// the device: `new_with_family` spawns a font thread
-    /// (`Renderer::from_system_with_family` — font resolution, file read,
-    /// parse — then `prewarm_ascii`), builds the GPU context on the
-    /// calling thread, JOINS the font thread, and only then calls
-    /// `from_parts`, so the leg costs max(context, font thread) plus
-    /// `from_parts`. On the wgpu arms the context is the instance, the
-    /// adapter, the device and the context's tail (`GpuContextTail`), and
-    /// `from_parts`, after the join, compiles the shader and builds the
-    /// pipelines. On the macOS Metal arm `GpuContext::new` only NAMES the
-    /// preferred device and keeps nothing of it but the name — on the
-    /// system-default pick that naming IS `MTLCreateSystemDefaultDevice`.
-    /// That pick is taken only where `MTLCopyAllDevices`' listing cannot
-    /// decide (`aterm_gpu`'s `choose_listed`, since 2026-09-26): two or more
-    /// display GPUs listed and `ATERM_GPU_POWER=high` (a dual-GPU Mac under
-    /// that seam), two or more and none low-power, or none; everywhere else
-    /// — an Apple-silicon Mac's one GPU, a dual-GPU Mac's low-power one by
-    /// default — the device is read out of the listing, which (measured on
-    /// Apple silicon) asks the display server nothing and (per the SDK
-    /// header `Device::preferred` quotes) switches no mux. Meanwhile
-    /// `MetalArmLive` mints the device (calling `Device::preferred` again:
-    /// on that pick, a second `MTLCreateSystemDefaultDevice`), its queue and
-    /// `cell.metal` at the first armed frame — inside [`Phase::ImageCapture`]
-    /// when the first pixel demand is an `image` capture (a `snapshot`'s or
-    /// `video`'s first frame mints under no phase) — and `from_parts`' shader
-    /// and pipeline legs are `cfg(wgpu_arm)`; so there the leg is max(device
-    /// name, font discovery + parse + prewarm) plus a struct-assembly tail.
-    /// The redemption's own log line splits the max (font thread, join wait).
-    ///
-    /// This is where the 2026-09-06 stall's reported window fell. The line
-    /// (`no heartbeat for 5.045556453s while inside \`UserEvent\``) was
-    /// written at 14:29:36.4, on a headless instance whose stderr did not
-    /// name its device ("GPU rendering on AMD Radeon Pro 560") until
-    /// 14:29:40.7 (the file's last write; that line is written AFTER
-    /// `new_with_family` returns) and whose capture PNG was created at
-    /// 14:29:41.7. So the last heartbeat (14:29:31.4) and the whole reported
-    /// window lie BEFORE that device line: in the seal, the chrome re-sync,
-    /// the fork and the `new_with_family` legs, ~9 s in all, of a ~10 s
-    /// capture. Which of them, and inside the last whether the device name
-    /// or the font thread, is what the log line's legs exist to say next
-    /// time. That instance predates `Device::preferred`: its
-    /// `GpuContext::new` and its `MetalArmLive::new` both took
-    /// `MTLCreateSystemDefaultDevice`, the call Apple documents as switching
-    /// a dual-GPU Mac to the discrete GPU.
-    /// So aterm's first call that could set off a switch to the Radeon was
-    /// here, in the device leg; the first-frame mint made a second one, in
-    /// the 945 ms tail (see [`Phase::ImageCapture`]), after `GpuContext::new`
-    /// had released its reference to the device it named; nothing observed
-    /// the mux or timed either call. The aterm.log the line sits in
-    /// holds no other `UserEvent` stall line (checked 2026-09-10; every
-    /// other one is inside `NewEvents`). The surviving re-measurements
-    /// (that evening, debug build, on the Intel HD Graphics
-    /// 630, with a test build running alongside) put the redemption at
-    /// 509-533 ms: 488-510 ms in the seal and the chrome re-sync together
-    /// (that build's line timed the two as one `font seal` leg, so how the
-    /// figure divides between them is not known), fork 0, `new_with_family`
-    /// 21-22 ms, install 0.
+    /// `App::ensure_pixel_backend`: a headless run's first pixel demand redeeming, on the
+    /// main thread, what the launch deferred: the font seal (three font files read and
+    /// parsed; Apple Color Emoji alone is ~190 MB on macOS), the chrome re-sync
+    /// (`sync_chrome_fonts`), the CPU face fork, and `GpuRenderer::new_with_family`. That
+    /// last leg builds the GPU context while a font thread resolves, parses and prewarms
+    /// the face, joins it, then runs `from_parts` (shader and pipelines on the wgpu arms).
+    /// On the macOS Metal arm `GpuContext::new` only names the preferred device
+    /// (`Device::preferred`, whose fallback `MTLCreateSystemDefaultDevice` can switch a
+    /// dual-GPU Mac to the discrete GPU) and `MetalArmLive` mints it at the first armed
+    /// frame. The redemption's own log line times each leg (`pixel_backend_redemption_line`).
     PixelBackendRedeem = 1,
-    /// `App::render_image` — the `image` verb's capture on the main thread,
-    /// the control verb the 2026-09-06 stall was inside. Not the only verb
-    /// that does renderer work there — the offscreen present-real `video`
-    /// loop and the SIGUSR1 `snapshot` path render on the main thread too,
-    /// and announce nothing but the redemption they nest — but the one that
-    /// finding named. Headless, when a capture is the run's first pixel
-    /// demand, the redemption above is nested in it, and on macOS, when the
-    /// run has a GPU intent (not `--cpu`), that capture also mints the Metal
-    /// device, its command queue and `cell.metal`, then demand-builds the
-    /// three pipelines the first frame binds — the shader-cache-sensitive
-    /// work. The device is
-    /// `Device::preferred`'s pick: the low-power GPU of a dual-GPU Mac,
-    /// unless `ATERM_GPU_POWER=high` asks for the system default, which on
-    /// such a Mac is the discrete GPU (its listing shows two display GPUs,
-    /// so under `high` `Device::preferred` does not answer from the listing
-    /// — it does that only for a single display GPU — and makes the call
-    /// below). On that pick the naming in
-    /// [`Phase::PixelBackendRedeem`]'s device leg is aterm's FIRST call that
-    /// can set off the switch — `MTLCreateSystemDefaultDevice`, the call
-    /// Apple documents as switching a dual-GPU Mac to the discrete GPU — and,
-    /// `GpuContext::new` keeping only the name, this mint makes a SECOND.
-    /// Whether that second call switches again, and in which of the two the
-    /// power-up's latency is paid, was not measured (nothing observed the
-    /// mux), so neither phase is ruled out for a mux stall.
-    ///
-    /// In the 2026-09-06 stall that mint was the TAIL, not the window: the
-    /// instance's stderr named its device (the Radeon Pro 560; the pick
-    /// predates `Device::preferred`) at 14:29:40.7, after the stall line had
-    /// been written, and its PNG was created at 14:29:41.7 — so the
-    /// first-frame mint on the discrete GPU (that build's second
-    /// `MTLCreateSystemDefaultDevice`) sits in the 945 ms between those
-    /// two file-system timestamps, with the install, the frame, the encode
-    /// and the write, after the redemption's ~9 s of a ~10 s capture. Nothing
-    /// timed the mint alone, and the stall line's wording cites no figure.
-    /// The surviving in-situ line from this phase is the debug watchdog's
-    /// 504 ms `in an \`image\` capture` on the Intel GPU that evening — a
-    /// 509 ms redemption (488 ms of it the seal and the chrome re-sync, timed
-    /// as one) with the capture around it,
-    /// under a concurrent test build, named as the capture because the
-    /// phase is read at the report and the redemption had logged its own
-    /// line 166 ms earlier. Nothing was building at 14:29 (the release
-    /// build's log last wrote 22 s before the instance's first log line; the
-    /// next test build's log was created 7 s after the stall line).
+    /// `App::render_image`: the `image` verb's capture on the main thread. As a headless
+    /// run's first pixel demand it nests [`Phase::PixelBackendRedeem`], and on macOS with a
+    /// GPU intent (not `--cpu`) it also mints the Metal device, its queue and `cell.metal`
+    /// and demand-builds the three pipelines the first frame binds (on the system-default
+    /// device pick, a second `MTLCreateSystemDefaultDevice`). The `video` loop and the
+    /// SIGUSR1 `snapshot` path also render on the main thread and announce only the
+    /// redemption they nest.
     ImageCapture = 2,
 }
 
@@ -1736,25 +1400,19 @@ impl Phase {
     }
 }
 
-/// Announce the work the main thread is about to do inside the current root.
-///
-/// Stamps `p` now and, on drop, restores the phase that was current when the
-/// guard was made — but only over `p` itself, so a phase nested inside
-/// another (the redemption inside a capture) reads correctly at every
-/// instant, the outer phase comes back when the inner one ends, and a guard
-/// a [`beat`] outlived (the beat cleared the cell for the next root) restores
-/// nothing: the inner guard of a nested pair must not re-announce the OUTER
-/// phase into a root that never announced it. Never a beat: the heartbeat is
-/// the root's, and a phase that beat would hide the very stall it exists to
-/// name.
+/// Announce the work the main thread is about to do inside the current root, for the
+/// guard's lifetime. On drop the guard restores the phase that stood before, but only over
+/// its own announcement: nested phases (the redemption inside a capture) read correctly at
+/// every instant, and a guard a [`beat`] outlived restores nothing, so it cannot
+/// re-announce an outer phase into a root that never announced it. Never a beat: a phase
+/// that beat would hide the stall it exists to name.
 #[must_use = "the announcement lasts only as long as the guard lives"]
 pub(crate) fn phase(p: Phase) -> PhaseGuard {
     announce(&PHASE, p)
 }
 
-/// The announcement itself, over an EXPLICIT cell — [`phase`] is this on the
-/// process-global [`PHASE`], and the phase test runs it on a cell of its own
-/// (see [`beat_into`] for why). The guard carries the cell it wrote so its
+/// The announcement over an explicit cell: [`phase`] is this on [`PHASE`], and the phase
+/// test runs it on a cell of its own (see [`beat_into`]). The guard carries the cell so its
 /// drop restores the right one.
 fn announce(cell: &'static AtomicU8, p: Phase) -> PhaseGuard {
     let previous = phase_in(cell);
@@ -1813,13 +1471,11 @@ enum Locus {
     Returned,
 }
 
-/// The stall line, assembled from the sampler's facts alone so its wording is
-/// testable without a thread or a logger: the FIRST report of a contiguous
-/// stall names the root and the announced phase and says what the class of
-/// hazard is; every later one says the same stall is still there. A stall
-/// after the root RETURNED says so instead of naming the root as the place
-/// (the 2026-09-26 line named `NewEvents` for a spin in CoreFoundation), and
-/// `busy` says the main thread was on-CPU — a spin, not a park.
+/// The stall line, from the sampler's facts alone so its wording is testable without a
+/// thread or a logger. The first report of a contiguous stall names the root and phase and
+/// the hazard class; later ones say the same stall is still there. After the root returned
+/// it says so instead of naming the root as the place, and `busy` says the main thread was
+/// on-CPU (a spin, not a park).
 fn stall_message(
     reports: u32,
     frozen: Duration,
@@ -1865,12 +1521,9 @@ fn stall_message(
     }
 }
 
-/// The line when a REPORTED stall ends: how long it lasted, the root it was
-/// reported at, and what showed it over. It is what lets the next launch's
-/// recovery census tell a stall the run survived from one it died in
-/// (`recovery_census::STALL_ENDED_LINE` is its prefix). The root is where the
-/// stall was reported, not a claim that its handler was still on the stack: the
-/// report line already said which (`Locus`).
+/// The line when a reported stall ends: how long it lasted, the root it was reported at,
+/// and what showed it over. It lets the next launch's recovery census tell a stall the run
+/// survived from one it died in (`recovery_census::STALL_ENDED_LINE` is its prefix).
 fn stall_ended_message(ended: Ended) -> String {
     let Ended { frozen, root, by } = ended;
     match by {
@@ -1895,17 +1548,14 @@ const STACK_LINE: &str = "MAIN-THREAD STALL stack:";
 /// Between two frames of a stack line.
 const FRAME_SEPARATOR: &str = " | ";
 
-/// The main thread's stack as log lines, as many as it takes to keep each one
-/// within `cap`, the logger's body cap for the level they are logged at
-/// ([`aterm_log::record_cap`]): the logger cuts a longer body short, and on
-/// 2026-09-28 that cut the stack's one line at frame #11.
+/// The main thread's stack as log lines, as many as keep each within `cap`, the logger's
+/// body cap for their level ([`aterm_log::record_cap`]), past which it cuts a body short.
 ///
-/// Each line is `MAIN-THREAD STALL stack: (part i/n, captured at <stamp>)`
-/// and then its frames in order, ` | ` between them. The stamp is `captured`
-/// in the log's own `<epoch seconds>.<millis>` form, so it reads against each
-/// line's leading timestamp: a part written long after its capture — the
-/// process stopped running in between — says so. A frame too long for a line
-/// of its own is clipped with `…`. No frames, no lines.
+/// Each line is `MAIN-THREAD STALL stack: (part i/n, captured at <stamp>)` then its frames
+/// in order, ` | ` between them. The stamp is `captured` in the log's own
+/// `<epoch seconds>.<millis>` form, so a part written long after its capture (the process
+/// stopped in between) says so against the line's own timestamp. A frame too long for a
+/// line of its own is clipped with `…`. No frames, no lines.
 fn stack_lines(frames: &[String], captured: SystemTime, cap: usize) -> Vec<String> {
     let captured = epoch_stamp(captured);
     let header = |part: usize, parts: usize| {
@@ -1995,9 +1645,8 @@ fn seam() -> Option<String> {
     aterm_types::dev_seam!("ATERM_WATCHDOG").map(|v| v.to_string_lossy().trim().to_string())
 }
 
-/// Whether the watchdog sampler should run. EVERY build, unless a development
-/// build switches it off with `ATERM_WATCHDOG=off` — see the module header for
-/// why a release binary is the build that needs this most.
+/// Whether the sampler runs: in every build, unless a development build sets
+/// `ATERM_WATCHDOG` to `off`, `0` or empty.
 fn enabled() -> bool {
     !seam().is_some_and(|v| {
         v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("0") || v.is_empty()
@@ -2015,8 +1664,8 @@ fn threshold() -> Duration {
     }
 }
 
-/// Whether a detected stall should `process::abort()` (repro / CI) rather than
-/// just log. A development build's `ATERM_WATCHDOG=abort`.
+/// Whether a detected stall ends the process with a crash report (repro / CI) rather than
+/// only logging: a development build's `ATERM_WATCHDOG=abort`.
 fn abort_on_stall() -> bool {
     seam().is_some_and(|v| v.eq_ignore_ascii_case("abort"))
 }
@@ -2055,12 +1704,9 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
             "main-thread stall watchdog armed (sample {sample:?}, threshold \
              {threshold:?}, repeat {STALL_REPEAT_INTERVAL:?}, abort={abort})"
         );
-        // The previous wake on both clocks: each wake is measured from it, not
-        // from the start of its own sleep, so the report pass in between —
-        // the stall line, the stack capture that suspends the main thread,
-        // the stack lines — is inside the span a gap is judged on ([`Clocks`]).
-        // The start of the sleep still marks where the pass ended, so the gap
-        // line can say how much of a gap fell in it.
+        // Each wake is measured from the previous one, not from its own sleep, so the report
+        // pass is inside the span a gap is judged on (`Clocks`); `asleep` marks where the
+        // pass ended.
         let mut last = Clocks::now();
         let mut sampler =
             Sampler::with_threshold(last.mono, MAIN.heartbeat.load(Ordering::Relaxed), threshold);
@@ -2068,12 +1714,8 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
             let asleep = Instant::now();
             std::thread::sleep(sample);
             let here = Clocks::now();
-            // A wake far later than asked, on a clock that stops while the
-            // Mac sleeps, is the whole process not running: `wake` says so —
-            // it is the trigger no other line records — and starts over, since
-            // none of the gap was the main thread's doing. A stall reported
-            // before the gap stays open across it, and its end is still said.
-            // The wall clock tells that apart from the Mac asleep.
+            // A wake far later than asked is the process not running: `wake` logs it and
+            // resyncs, carrying a reported stall across (see `Sampler::wake`).
             let wake = sampler.wake(
                 here.mono,
                 sample,
@@ -2115,12 +1757,9 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
                         hit.busy
                     )
                 );
-                // Where the thread IS, not just which root ran last: the frame
-                // a hang report would have named, in the log, in every build —
-                // every frame of it, in parts under the ERROR body cap. Stamped
-                // just BEFORE the capture: `stack` suspends the thread first
-                // and symbolizes after, and symbolizing (dladdr, Mach-O reads
-                // that can page in under swap pressure) is the slower half.
+                // The main thread's stack, in parts under the ERROR body cap. Stamped just
+                // before the capture: `stack` suspends the thread first and symbolizes after
+                // (dladdr, Mach-O reads that can page in under swap pressure), the slower half.
                 let captured = SystemTime::now();
                 if let Some(frames) = crate::main_thread_probe::stack() {
                     let cap = aterm_log::record_cap(aterm_log::Level::Error);
@@ -2181,9 +1820,8 @@ mod tests {
         assert_eq!(WATCH.heartbeat.load(Ordering::Relaxed), before + 2);
     }
 
-    /// A phase is the SECOND word of a stall line: announced by a guard,
-    /// nested correctly, restored when the guard drops, and cleared by the
-    /// next root's beat — never carried into work it does not describe, not
+    /// A phase is scoped to its guard: nested correctly, restored when the guard drops, and
+    /// cleared by the next root's beat, never carried into work it does not describe, not
     /// even by a nested guard the beat outlived.
     ///
     /// The phase cell and the ledger are this test's OWN, on the same grounds
@@ -2238,11 +1876,6 @@ mod tests {
             "the next root's beat clears a phase whose guard is still alive"
         );
         // The stale guard finds its announcement gone and restores nothing.
-        // (That it does not BEAT either is structural rather than asserted:
-        // `announce` and `PhaseGuard::drop` are handed the phase cell and
-        // nothing else, so neither can reach the heartbeat — the property a
-        // phase needs, since a phase that beat would hide the very stall it
-        // exists to name.)
         drop(held);
         assert_eq!(phase_in(&PH), Phase::None);
         // The wrong-work case the `PHASE` doc rules out: a beat between a
@@ -2284,16 +1917,9 @@ mod tests {
         assert_eq!(phase_in(&PH), Phase::None);
     }
 
-    /// THE ATTRIBUTION RULE (2026-09-15 responsiveness audit). A turn that ended
-    /// inside a WORK root is the span this census exists to name — the 100–600 ms
-    /// band that is too short for the release sampler's 5 s bar and never enters
-    /// the redraw timer, so before this it left no attributable trace while still
-    /// being charged to `present_latency` and `input_present`.
-    ///
-    /// A PARK POINT's span is never booked, however long it lasts: idling in the
-    /// OS event wait, a modal dialog the user is reading, and the update-handoff
-    /// wait are designed freezes, and pricing them would be exactly the noise the
-    /// sampler's park-point exemption exists to avoid.
+    /// A turn that ended inside a work root is attributable; a park point's span (idle, a
+    /// modal dialog, the update handoff, startup) is never booked, however long, and
+    /// neither is a turn from a disarmed stamp.
     #[test]
     fn a_work_root_turn_is_attributable_and_a_designed_park_is_never_booked() {
         const OPEN: u64 = 1_000_000;
@@ -2355,7 +1981,7 @@ mod tests {
         const SHORT: u64 = 2_000_000;
         let ledger = TurnLedger::new();
 
-        // The first beat only OPENS a turn; there is nothing to close yet.
+        // The first beat only opens a turn; there is nothing to close yet.
         assert_eq!(ledger.close(Breadcrumb::AboutToWait, T0), None);
         let c = ledger.snapshot();
         assert_eq!(c.turns, 0);
@@ -2416,7 +2042,7 @@ mod tests {
         assert_eq!(ledger.snapshot().turns, 2);
         assert_eq!(roots(&ledger), [("window_event", 1), ("user_event", 1)]);
 
-        // A reset clears the window AND disarms the open stamp, so the turn
+        // A reset clears the window and disarms the open stamp, so the turn
         // straddling it is not charged to the fresh window.
         ledger.reset();
         let c = ledger.snapshot();
@@ -2534,8 +2160,7 @@ mod tests {
         const T0: u64 = 7_000 * MS;
         let ledger = TurnLedger::new();
         assert_eq!(ledger.close(Breadcrumb::AboutToWait, T0), None, "arms only");
-        // A key's turn, then the body, then the park until a timer ten
-        // minutes on.
+        // A key's turn, then the body, then the park until a timer ten minutes on.
         assert_eq!(ledger.close(Breadcrumb::WindowEvent, T0 + MS), Some(MS));
         assert_eq!(
             ledger.close(Breadcrumb::AboutToWaitWork, T0 + 3 * MS),
@@ -2647,10 +2272,8 @@ mod tests {
         assert_eq!(WATCH.heartbeat.load(Ordering::Relaxed), before + 2);
     }
 
-    /// A block inside `about_to_wait`'s body that takes no CPU (a lock, a
-    /// wait on a thread) is a MAIN-THREAD STALL named for it — while the body
-    /// was the park point it was exempt, and only a spin was ever caught. The
-    /// wait after the body stays exempt however long it lasts.
+    /// A block inside `about_to_wait`'s body that takes no CPU (a lock, a wait on a thread)
+    /// is a stall named for it; the wait after the body stays exempt however long it lasts.
     #[test]
     fn an_off_cpu_block_in_the_about_to_wait_body_is_a_named_stall() {
         let t0 = Instant::now();
@@ -2673,8 +2296,8 @@ mod tests {
         assert_eq!((hit.root, hit.busy), (Breadcrumb::AboutToWaitWork, false));
         let line = stall_message(1, hit.frozen, hit.root, Phase::None, Locus::Inside, false);
         assert!(line.contains("`AboutToWaitWork`"), "{line}");
-        // A normal-length body never makes a verb wait: the refusal reads a
-        // beat 3 ms old under a hop posted a second before it.
+        // A normal-length body never makes a verb wait: the refusal reads a beat 3 ms old
+        // under a hop posted a second before it.
         let beat_ns = REFUSAL_T0;
         assert_eq!(
             main_stall(
@@ -2760,7 +2383,7 @@ mod tests {
     #[test]
     fn the_watchdog_is_armed_unless_explicitly_switched_off() {
         // `enabled()` reads the environment, which is process-global and shared
-        // with every other test in this binary — so assert the DECISION, not by
+        // with every other test in this binary, so assert the decision, not by
         // mutating the env. With nothing set, it must be on.
         if seam().is_none() {
             assert!(
@@ -2771,9 +2394,7 @@ mod tests {
         }
     }
 
-    /// A stall that never ends is re-reported on a cadence. One line at the
-    /// start proves a wedge happened; the repeats prove it never ended — the
-    /// distinction the 0.65.0 log could not make, because it said nothing.
+    /// A stall that never ends is re-reported on a cadence, and progress re-arms it.
     #[test]
     fn a_persisting_stall_is_reported_again_on_the_repeat_cadence() {
         let t0 = Instant::now();
@@ -2824,7 +2445,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(s.reports, 0, "recovery re-arms the report count");
-        // …and wedges again, hours later. That is a NEW incident.
+        // …and wedges again, hours later: a new stall.
         assert_eq!(
             s.poll(t0 + Duration::from_secs(9000), 2, Breadcrumb::WindowEvent),
             Some(Breadcrumb::WindowEvent)
@@ -2835,11 +2456,8 @@ mod tests {
         );
     }
 
-    /// THE 2026-09-26 FREEZE, AS THE SAMPLER SEES IT NOW. The last root entered
-    /// was `NewEvents`; it returned; the main thread then spun in
-    /// CoreFoundation's timer catch-up, on-CPU, for minutes. The heartbeat rule
-    /// already fired at the threshold; the line must now say the thread is
-    /// OUTSIDE aterm and spinning, not "inside `NewEvents`".
+    /// A spin in CoreFoundation after `NewEvents` returned is named as outside aterm and
+    /// on-CPU, not "inside `NewEvents`".
     #[test]
     fn the_2026_09_26_spin_is_named_as_outside_aterm_and_on_cpu() {
         static WATCH: MainWatch = MainWatch::new();
@@ -2890,7 +2508,7 @@ mod tests {
         }
     }
 
-    /// A spin at the IDLE park point is a stall; a quiet park is not, however
+    /// A spin at the idle park point is a stall; a quiet park is not, however
     /// long; and the designed freezes that do real work (startup, a modal, the
     /// handoff) stay exempt even on-CPU.
     #[test]
@@ -2935,7 +2553,7 @@ mod tests {
                 "{designed:?} does real work by design"
             );
         }
-        // With no CPU reading at all, the park point keeps its old exemption.
+        // With no CPU reading at all, the park point keeps its exemption.
         let mut s = Sampler::with_threshold(t0, 3, STALL_THRESHOLD);
         for tick in 1..=12u32 {
             assert!(
@@ -2945,10 +2563,9 @@ mod tests {
         }
     }
 
-    /// The trigger gets a line, and is not charged to the main thread: a
-    /// 26.6 h gap in the sampler's own sleep reads as the process not running,
-    /// ordinary scheduling jitter does not, and after a resync a work root
-    /// needs a full threshold of its own before it is a stall.
+    /// A 26.6 h gap in the sampler's sleep reads as the process not running (scheduling
+    /// jitter does not), and after the resync a work root needs a full threshold of its
+    /// own before it is a stall.
     #[test]
     fn a_process_gap_is_named_and_restarts_the_stall_clock() {
         let sample = RELEASE_STALL_THRESHOLD / 2;
@@ -3040,16 +2657,11 @@ mod tests {
         })
     }
 
-    /// THE 2026-09-28 GAP. A stall reported after `NewEvents` returned, and then
-    /// the whole process not running for 12130 s in the report pass that
-    /// followed — after the sleep had been timed. Timed from the wake before it,
-    /// as the sampler thread now times it, the next wake is 12130 s late: the
-    /// gap line is written, and the ENDED line gives the main thread its own
-    /// 7.5 s. Timed from its sleep alone, as the thread used to time it, the
-    /// same wake is on time and the ENDED line charges the main thread with all
-    /// of it: the incident's line read 12138 s. The Mac asleep in the same
-    /// place is noted at info and changes nothing: the monotonic clock the
-    /// accounting runs on stopped.
+    /// A gap inside the report pass after a stall line is seen because each wake is timed
+    /// from the wake before it: the gap line is written and the ENDED line gives the main
+    /// thread its own 7.5 s. The negative control times the sleep alone and charges the
+    /// main thread with all of it. The Mac asleep in the same place is noted at info and
+    /// changes nothing: the monotonic clock the accounting runs on stopped.
     #[test]
     fn the_2026_09_28_gap_inside_a_report_pass_is_not_charged_to_the_main_thread() {
         let step = RELEASE_STALL_THRESHOLD / 2;
@@ -3229,7 +2841,7 @@ mod tests {
             None
         );
         // A clock set back says nothing, and hides nothing the monotonic clock saw;
-        // a wall clock BEHIND the monotonic one is no sleep.
+        // a wall clock behind the monotonic one is no sleep.
         assert_eq!(on(step, None), None);
         assert_eq!(on(step + hour, None), gap(Some(hour), Wall::Unknown));
         assert_eq!(on(step + hour, Some(step)), gap(Some(hour), Wall::Awake));
@@ -3289,12 +2901,9 @@ mod tests {
         assert!(!asleep.contains("MAIN-THREAD STALL"), "{asleep}");
     }
 
-    /// THE 2026-09-28 STACK, WHOLE. Written as one line, a deep stack runs past
-    /// the logger's 1 KiB ERROR body cap and is cut short — that day at frame
-    /// #11. In parts, every frame reaches the log in order, every part passes
-    /// the logger untouched, and every part is numbered and says when the stack
-    /// was captured. (A synthetic stack: 64 frames sized so one line is cut
-    /// where that day's was.)
+    /// A deep stack is logged whole, in order, in numbered and stamped parts, each under
+    /// the 1 KiB ERROR body cap and passed by the logger untouched. (Synthetic: 64 frames
+    /// sized so one unsplit line is cut at frame #11.)
     #[test]
     fn the_stack_is_logged_whole_in_numbered_parts_under_the_error_cap() {
         let cap = aterm_log::record_cap(aterm_log::Level::Error);
@@ -3310,8 +2919,7 @@ mod tests {
         }));
         let captured = UNIX_EPOCH + Duration::from_millis(1_790_191_963_664);
 
-        // The negative control: the one line the watchdog used to write keeps
-        // frame #10 and loses #11 and everything deeper, as that day's did.
+        // The negative control: one unsplit line keeps frame #10 and loses #11 onward.
         let old = format!("{STACK_LINE} {}", frames.join(FRAME_SEPARATOR));
         let logged = aterm_log::sanitize_record_for(aterm_log::Level::Error, &old);
         assert!(
@@ -3385,13 +2993,10 @@ mod tests {
         assert!(epoch_stamp(UNIX_EPOCH - Duration::from_secs(1)).starts_with("an unknown time"));
     }
 
-    /// THE PORT (keeper P0 onto the 2026-09-26 gap rule). A stall REPORTED
-    /// before a process gap is still open after the resync, so its end is still
-    /// said — and the recovery census, folding the lines the sampler thread
-    /// logs, reads the run as having recovered, not as "stalled at its end".
-    /// Both ways it can end: after the gap, when the heartbeat moves; and
-    /// inside it, when the main thread beat before the sampler woke. The time
-    /// the ENDED line gives is the main thread's own, never the gap's.
+    /// A stall reported before a process gap stays open across the resync, so its end is
+    /// still said and the recovery census reads the run as recovered, not "stalled at its
+    /// end". It ends after the gap when the heartbeat moves, or at the wake that finds the
+    /// gap when the main thread beat first; the ENDED time is the main thread's own.
     #[test]
     fn a_stall_reported_before_a_process_gap_is_still_ended_after_it() {
         let step = RELEASE_STALL_THRESHOLD / 2;
@@ -3505,7 +3110,7 @@ mod tests {
             "ended once, not again at the next beat"
         );
 
-        // And the control: a stall that has NOT ended across the gap is still
+        // And the control: a stall that has not ended across the gap is still
         // the run's last word, as it must be.
         let mut lines = Vec::new();
         let mut s = reported(&mut lines);
@@ -3525,7 +3130,7 @@ mod tests {
         );
     }
 
-    /// A process gap never INVENTS a stall: a freeze under the bar before the
+    /// A process gap never invents a stall: a freeze under the bar before the
     /// gap is not reported across it, nothing that was not reported is ended
     /// after it, a stall that already ended is not ended twice, and the census
     /// reads the run as unstalled.
@@ -3588,7 +3193,7 @@ mod tests {
             "{lines:#?}"
         );
 
-        // A stall that was reported AND ended before the gap is not ended again
+        // A stall that was reported and ended before the gap is not ended again
         // by it, whether or not the heartbeat moves across it.
         for beat_after in [8, 9] {
             let mut lines = Vec::new();
@@ -3628,11 +3233,10 @@ mod tests {
         }
     }
 
-    /// The ported hand-off on the spin rule: a spin REPORTED at the idle park
-    /// has ended once a CPU reading finds the main thread quiet again — its
-    /// heartbeat never moves, so waiting for one would leave a run that went
-    /// idle and was later killed reading as "stalled at its end". With no
-    /// reading to go by it stays open until the heartbeat moves.
+    /// A spin reported at the idle park ends once a CPU reading finds the main thread
+    /// quiet: its heartbeat never moves, so waiting for one would leave a run that went
+    /// idle and was later killed reading as "stalled at its end". With no reading it stays
+    /// open until the heartbeat moves.
     #[test]
     fn a_spin_reported_at_the_idle_park_ends_when_a_reading_finds_it_quiet() {
         let t0 = Instant::now();
@@ -3690,13 +3294,10 @@ mod tests {
         );
     }
 
-    /// The quiet rule ends only a SPIN reported at a park point. A stall
-    /// reported at a WORK root while the main thread was parked on a lock
-    /// (quiet readings, `busy` false) can meet a park point under an unmoved
-    /// heartbeat only when a sample reads the next root's breadcrumb before
-    /// its beat — two relaxed atomics, the breadcrumb stamped first — and that
-    /// beat is what ends it. Ended as "quiet", its ENDED line would say the
-    /// thread "stopped spinning … on-CPU" when it never was.
+    /// The quiet rule ends only a spin reported at a park point. A work-root stall (parked
+    /// on a lock, `busy` false) meets a park point under an unmoved heartbeat only when a
+    /// sample reads the next root's breadcrumb before its beat, and that beat ends it.
+    /// Ended as quiet, its line would claim an on-CPU spin that never was.
     #[test]
     fn a_work_root_stall_ends_by_its_beat_never_as_a_quiet_spin() {
         let t0 = Instant::now();
@@ -3746,11 +3347,9 @@ mod tests {
         n * 1_000_000_000
     }
 
-    /// THE 2026-09-28 INCIDENT, as the refusal reads it: `NewEvents` returned
-    /// and the main thread went into AppKit's scene setup and did not come
-    /// back. Past the bar every main-thread verb is refused, and the reason
-    /// names the root and says its handler had returned; under the bar it is
-    /// a slow turn and the verb is posted.
+    /// A work root with no beat for the bar is refused, whether its handler returned (the
+    /// main thread stuck in AppKit after `NewEvents`) or is still on the stack; under the
+    /// bar it is a slow turn and the verb is posted.
     #[test]
     fn a_work_root_with_no_beat_for_the_bar_is_refused_and_says_where() {
         let beat = REFUSAL_T0;
@@ -3767,13 +3366,10 @@ mod tests {
         assert_eq!(inside.stalled, Duration::from_secs(7));
     }
 
-    /// The idle park is no stall by itself: a thread asleep in its event wait
-    /// has an old heartbeat by design. Nor is a hop that was only just posted
-    /// to it, which is what a verb arriving while the first verb after ten
-    /// idle minutes is answered sees. A hop that has waited the bar with no
-    /// beat since it was posted IS a stall: the thread left its wait for
-    /// something that is not aterm's and did not come back. The negative
-    /// control judges on the heartbeat alone and refuses the fresh hop.
+    /// The idle park is no stall by itself (an idle thread's heartbeat is old by design),
+    /// nor is a hop just posted to it; a hop that has waited the bar with no beat since it
+    /// was posted is. The negative control judges on the heartbeat alone and refuses the
+    /// fresh hop.
     #[test]
     fn the_idle_park_is_refused_only_once_a_hop_has_waited_the_bar() {
         let beat = REFUSAL_T0;
@@ -3941,13 +3537,12 @@ mod tests {
         }
     }
 
-    /// One schedule taken on `model` and on the real code in lockstep, with
-    /// `mutation` (a `Buggy = 1` defect) fired on the model first and replayed
-    /// on the real reader. After every action the worker's live guard projects
-    /// onto `waiting`, the hop count onto `hop` and the reader's stamp onto
-    /// `stamp`; at every `Probe` the real verdict must be the model's
-    /// `refused`. Returns `(refused, stalled, real verdict)` per probe. The
-    /// caller holds [`beat_serial`].
+    /// One schedule taken on `model` and on the real code in lockstep, with `mutation` (a
+    /// `Buggy = 1` defect) fired on the model first and replayed on the real reader. After
+    /// every action the worker's live guard, the hop count and the reader's stamp project
+    /// onto `waiting`, `hop` and `stamp`; at every `Probe` the real verdict must be the
+    /// model's `refused`. Returns `(refused, stalled, real verdict)` per probe. The caller
+    /// holds [`beat_serial`].
     fn refusal_lockstep(
         model: &aterm_spec::derive::Model,
         mutation: Option<&'static str>,
@@ -4012,16 +3607,11 @@ mod tests {
         probes
     }
 
-    /// TIER-1 for `MainThreadStallRefusal`. Each schedule is taken on the
-    /// model and on the genuine writer, reset, hop count, take and reader in
-    /// lockstep ([`refusal_lockstep`]), and at every probe the model proves
-    /// the refusal was exactly the stall (`refused == stalled`). The three
-    /// defects its `Buggy` replays are replayed on the real reader too and
-    /// each is caught: a `metrics reset` under a stall read through the census
-    /// stamp lets the stalled thread's verbs through, a heartbeat-only rule
-    /// refuses a fresh hop after idleness, and a hop counted until its reply
-    /// makes a healthy idle thread behind a queued `settings set` read as
-    /// stuck.
+    /// `main_stall` conforms to the derived `MainThreadStallRefusal` machine: each schedule
+    /// runs on the model and on the real writer, reset, hop count, take and reader in
+    /// lockstep ([`refusal_lockstep`]), and at every probe the refusal is exactly the stall
+    /// (`refused == stalled`). Each of the model's three `Buggy` defects, replayed on the
+    /// real reader, is caught.
     #[test]
     fn main_stall_conforms_to_the_stall_refusal_model() {
         let model = aterm_models_gui::main_thread_stall_refusal_model();
@@ -4030,7 +3620,7 @@ mod tests {
 
         let _serial = beat_serial();
         let schedules: &[&[&'static str]] = &[
-            // The incident: a work root, then no beat.
+            // A work root, then no beat.
             &[
                 "BeatWork", "Probe", "Tick", "Probe", "Tick", "Probe", "Post", "Tick", "Probe",
             ],

@@ -11,4 +11,4 @@ pass 100
 tx result c1 error dated=3200
 tx tool c2 dated=3250
 wait 1000
-expect close t1 turn at=3250
+expect close t1 turn @3250

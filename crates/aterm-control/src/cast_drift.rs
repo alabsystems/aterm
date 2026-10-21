@@ -1941,7 +1941,7 @@ mod tests {
         assert!(report.undo_dropped);
     }
 
-    /// S2R-F4's flap in a recording: a primary screen with history and a blank
+    /// A primary screen with history and a blank
     /// row under the cursor, flapped a row with nothing between. This engine
     /// hands the trimmed blank back, so its recording (law 2) replays faithfully
     /// and nothing moved: `clean`. A recording from an aterm before the
@@ -1983,18 +1983,17 @@ mod tests {
         assert_eq!(report.culprit_word(), fmt_t(flap));
     }
 
-    /// ATERM-KI-1015-1: a recording replays under the resize law its aterm laid
-    /// the rows out under, which its header names (`aterm_resize_undo`), so the
-    /// rows a law moved are attributed to the flap that moved them, never to
-    /// the replay. A full screen with the cursor homed flapped a row (the
-    /// bottom-push corner), and a zoom in then out over a line that wraps at
-    /// the narrower width (the rewrap corner): the aterm that wrote 2 until
-    /// 2026-10-17 rotated the pushed row to the top, both that wrote 2 moved
-    /// the rows the rewrap moved, and the current law (3) moves neither. Each
-    /// recording, with the header its aterm wrote, replays faithfully, 2 under
-    /// whichever of its two laws reproduces the screen, and a flap that moved
-    /// rows is named. Replayed under the current law instead, as every
-    /// recording was while 2 named it too, the older ones read `unfaithful`.
+    /// A recording replays under the resize law its aterm laid the rows out
+    /// under, which its header names (`aterm_resize_undo`), so the rows a law
+    /// moved are attributed to the flap that moved them, never to the replay. A
+    /// full screen with the cursor homed flapped a row (the bottom-push corner),
+    /// and a zoom in then out over a line that wraps at the narrower width (the
+    /// rewrap corner): the first law that wrote 2 rotated the pushed row to the
+    /// top, both that wrote 2 moved the rows the rewrap moved, and the current
+    /// law (3) moves neither. Each recording, with the header its aterm wrote,
+    /// replays faithfully, 2 under whichever of its two laws reproduces the
+    /// screen, and a flap that moved rows is named. Replayed under the current
+    /// law instead, the older ones read `unfaithful`.
     #[test]
     fn a_recording_replays_under_the_resize_law_its_header_names() {
         /// A corner's name, what paints it, and the flap's sizes (cols, rows).
@@ -2144,9 +2143,8 @@ mod tests {
     }
 
     /// The same screen flapped by a font zoom in then out, a zoom out then in, and
-    /// a corner drag brought back: the rows and the columns move together. This
-    /// engine's recording replays faithfully and nothing moved; the width change
-    /// once trimmed then revealed, every row a row lower, and only the replay saw it.
+    /// a corner drag brought back: the rows and the columns move together, the
+    /// recording replays faithfully, and nothing moved.
     #[test]
     fn a_primary_zoom_flap_replays_clean() {
         let paths: [&[(u16, u16)]; 3] = [

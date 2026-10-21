@@ -1,0 +1,10 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm-lab text` of a private headless aterm (144x14, aterm 0.105.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Sonnet bucket limit (seven_day_sonnet, 200000 s) whose reset is over 24 h away, the usage-limit dialog answered by the harness (r21lebk5) · after Esc on the countdown, `/model opus` (the switch box answered): `⎿  Set model to Opus 5.5 …` under the cancel, no notice of the bucket drawn
+⏺ Automatic continue cancelled · /rate-limit-options to re-arm
+
+❯ /model opus
+  ⎿  Set model to Opus 5.5 and saved as your default for new sessions
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                                      ◐ medium · /effort

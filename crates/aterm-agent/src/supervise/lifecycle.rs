@@ -1,39 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! How a supervisor lives with a session it does not own: a refusal is waited
-//! out rather than ending the watch, a badge a previous watcher left is
-//! settled at the start, the badges this one raised go with it, and the
-//! in-GUI host runs the same loop under a stop flag.
+//! How a supervisor lives with a session it does not own: a refusal is waited out rather than
+//! ending the watch, a badge a previous watcher left is settled at the start, the badges this
+//! one raised go with it, and the in-GUI host runs the same loop under a stop flag.
 //!
-//! * `ERR halted …` (an owner or fleet `hold`) parks the loop
-//!   ([`Session::park_on_hold`]) on the server's `await inbox … kinds=hold`;
-//!   no press is re-sent after it: the loop reads and decides again.
-//! * The session's Autopilot `off` (its `autopilot` word, else `[harness]
-//!   autopilot`) parks the loop the same way ([`Session::park_while_off`]):
-//!   nothing pressed, typed or escalated — nor on the busy reads of a turn
-//!   it waits out before it parks ([`Session::await_turn_from`]) — the word
-//!   read again at each step, and the screen read and decided afresh once it
-//!   is not `off`. The session looks unsupervised meanwhile: the loop's
-//!   badges are taken down as the park starts ([`Session::lower_badges`],
-//!   each journaled `CLEARED`; the turn-end policy's set again at its end
-//!   from the text the park kept), the claim is given back for the park
-//!   ([`Session::give_back_claim`]) and taken again at its end, so its
-//!   boxes are raised to the menu bar again, once; a Land episode in hand is
-//!   over, and the task is carried no more: the person drives meanwhile
-//!   ([`TurnEndState::park_off`]).
-//! * `ERR busy …` and `ERR rate` back the loop off ([`Session::back_off`]):
-//!   it waits for the refused point to leave the screen, bounded by a pause
-//!   that doubles from 250 ms to 8 s.
-//! * Either is journaled when it is news ([`Session::refusal_news`]): a
-//!   refusal that persists is retried, and said once, again when it changes.
-//! * At the start ([`Session::take_claim`]) the claim is taken, and
-//!   ([`Session::reconcile`]) a keyed attention entry a previous supervisor
-//!   left is adopted when the screen still shows its point, else unset. A loop
-//!   behind another supervisor's claim settles nothing.
-//! * At the end ([`Session::release_attention`]) this loop's badges are
-//!   cleared, if still its own, each journaled `CLEARED`, and the claim is
-//!   released.
+//! * `ERR halted …` (an owner or fleet `hold`) parks the loop ([`Session::park_on_hold`]); no
+//!   press is re-sent after it: the loop reads and decides again.
+//! * Autopilot `off` (the session's `autopilot` word, else `[harness] autopilot`) parks the
+//!   loop the same way ([`Session::park_while_off`]): nothing is pressed, typed or escalated,
+//!   nor on the busy reads of a turn it waits out first ([`Session::await_turn_from`]); the
+//!   word is read again at each step, and the screen decided afresh once it is not `off`. The
+//!   session looks unsupervised meanwhile: the loop's badges come down, each journaled
+//!   `CLEARED` ([`Session::lower_badges`]; the turn-end policy's is set again at the end), the
+//!   claim is given back and retaken at the end ([`Session::give_back_claim`]), and a Land
+//!   episode in hand and the carried task end: the person drives ([`TurnEndState::park_off`]).
+//! * `ERR busy …` and `ERR rate` back the loop off ([`Session::back_off`]) until the refused
+//!   point leaves the screen, bounded by a pause doubling from 250 ms to 8 s.
+//! * Either refusal is journaled only when it is news ([`Session::refusal_news`]).
+//! * At the start the claim is taken ([`Session::take_claim`]) and a previous supervisor's
+//!   keyed attention is adopted or unset ([`Session::reconcile`]). A loop behind another
+//!   supervisor's claim settles nothing.
+//! * At the end this loop's badges are cleared, if still its own (each journaled `CLEARED`),
+//!   and the claim released ([`Session::release_attention`]).
 
 use super::super::journal::{
     ADOPTED, AGAIN_UNPARKED, ATTENTION_SKIPPED, CLEARED_HIDDEN, CLEARED_STALE, ESCALATED_BEHIND,
@@ -127,9 +116,8 @@ impl<C: Ctl> Session<'_, C> {
         self.trusted_cwd = field("trusted_cwd=");
     }
 
-    /// A press or a dismissal the server did not take: parked on the hold
-    /// (`halted`), else backed off; `anchor` is the pattern whose leaving
-    /// ends the back-off early (the refused box's row, the survey's).
+    /// A press or a dismissal the server did not take: parked on the hold (`halted`), else
+    /// backed off.
     pub(super) fn refused(
         &mut self,
         halted: bool,
@@ -144,16 +132,12 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Whether the refusal `said` (`REFUSED <why>`, `HALTED <why>`), met at
-    /// `now`, is NEWS for the journal: not the one it last said
-    /// ([`refusal_key`]: its measures dropped), or that one met again after
-    /// [`REFUSAL_QUIET`] unmet. A refusal that persists — another driver's
-    /// lease, a person typing, a hold on a host whose `status` names none —
-    /// meets every retry of the act it refused (decided again a moment
-    /// later, `turn_end_loop.rs`'s `write_refused`), and is said when it
-    /// first appears and when it changes, never at every retry. The episode
-    /// also ends at the first write the server does not refuse
-    /// ([`Self::call`]) and at a hold seen lifted.
+    /// Whether the refusal `said` (`REFUSED <why>`, `HALTED <why>`), met at `now`, is news for
+    /// the journal: not the one it last said ([`refusal_key`]), or that one met again after
+    /// [`REFUSAL_QUIET`] unmet. A persisting refusal (another driver's lease, a person typing)
+    /// meets every retry of the act it refused (`turn_end_loop.rs`'s `write_refused`), so it is
+    /// said when it first appears and when it changes. The episode also ends at the first write
+    /// the server takes ([`Self::call`]) and at a hold seen lifted.
     pub(super) fn refusal_news(&mut self, said: &str, now: Instant) -> bool {
         let key = refusal_key(said);
         let news = !self.refusal_said.as_ref().is_some_and(|(last, met)| {
@@ -163,14 +147,11 @@ impl<C: Ctl> Session<'_, C> {
         news
     }
 
-    /// `ERR halted`: wait for the hold to lift. `status hold=1` is waited
-    /// out with `await inbox since=0 kinds=hold` (the hold's transition
-    /// latches it), a step at most, then read again; `hold=0` returns. A
-    /// host whose `status` names no hold, or that refuses the wait, gets one
-    /// step (`await seq`) and the loop looks again — the next press says
-    /// whether the halt stands. Journaled `HALTED seq=<n> <why>` when the
-    /// refusal is news ([`Self::refusal_news`]) and `UNHALTED seq=<n> after
-    /// <ms> ms`.
+    /// `ERR halted`: wait for the hold to lift. While `status` says `hold=1`, wait a step at most
+    /// on `await inbox since=0 kinds=hold` (the hold's transition latches it) and read again;
+    /// `hold=0` returns. A host whose `status` names no hold, or that refuses the wait, gets one
+    /// step (`await seq`) and the loop looks again. Journaled `HALTED seq=<n> <why>` when the
+    /// refusal is news ([`Self::refusal_news`]) and `UNHALTED seq=<n> after <ms> ms`.
     pub(super) fn park_on_hold(
         &mut self,
         why: &str,
@@ -217,7 +198,7 @@ impl<C: Ctl> Session<'_, C> {
                     if r.ok() || r.timed_out() {
                         continue;
                     }
-                    // The wait is refused on this host: a step, then look.
+                    // This host refuses the wait: a step, then look.
                     self.wait(&["seq", &seq.to_string()], WAIT_STEP)?;
                     return Ok(());
                 }
@@ -229,20 +210,17 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// AUTOPILOT OFF (the session's `autopilot` word `off`, else `[harness]
-    /// autopilot = "off"`; [`Session::autopilot`]): the loop parks as on a
-    /// hold ([`Self::park_on_hold`]) — nothing pressed, typed or escalated, no
-    /// host step, no probe, no point reported — until the word changes. Each
-    /// step waits for the screen to move past `seq` (at most [`OFF_STEP`]) and,
-    /// where it moved, to hold still ([`IDLE_MS`], so a worker that streams is
-    /// read at its pauses, never at every frame), then reads the word again
-    /// (one bare `meta`, [`Self::autopilot_read`]; on a host that keeps no
-    /// word nothing is asked, and the table's `off` stands until the loop is
-    /// stopped). Returns once the word is not `off`, at the stop flag, or at
-    /// `deadline` (the budget's TIMEOUT is the next look's). Journaled
-    /// `PARKED seq=<n> autopilot=off …` as it parks and `UNPARKED seq=<n>
-    /// autopilot=<word> after <ms> ms` as it ends on a word; the caller reads
-    /// the screen afresh after it.
+    /// Autopilot `off` (the session's `autopilot` word, else `[harness] autopilot = "off"`;
+    /// [`Session::autopilot`]): park as on a hold ([`Self::park_on_hold`]), with nothing
+    /// pressed, typed or escalated, no host step, no probe and no point reported, until the
+    /// word changes. Each step waits for the screen to move past `seq` (at most [`OFF_STEP`])
+    /// and, where it moved, to hold still ([`IDLE_MS`], so a streaming worker is read at its
+    /// pauses), then reads the word again ([`Self::autopilot_read`]; a host that keeps no word
+    /// is asked nothing, and the table's `off` stands until the loop stops). Returns once the
+    /// word is not `off`, at the stop flag, or at `deadline` (the budget's TIMEOUT is the next
+    /// look's). Journaled `PARKED seq=<n> autopilot=off …` as it parks and `UNPARKED seq=<n>
+    /// autopilot=<word> after <ms> ms` as it ends on a word; the caller then reads the screen
+    /// afresh.
     ///
     /// OFF LOOKS UNSUPERVISED. The loop's badges are taken down as it parks
     /// ([`Self::lower_badges`], each journaled `CLEARED`, as at the loop's
@@ -269,16 +247,13 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`TurnEndState::park_off`]): a Land chosen after the park is a new
     /// one, its instruction typed again — and the task is CARRIED NO MORE: a
     /// person's own exchange a busy read sees after the park (answered within
-    /// `EXCHANGE_WORK`) is theirs, never a check-in on a run the harness
-    /// drives. The point the park ends on, its turn never seen run, is
-    /// decided as before it.
+    /// `EXCHANGE_WORK`) is theirs, never a check-in on a run the harness drives. The point the
+    /// park ends on, its turn never seen run, is decided as before it.
     ///
-    /// The harness's own state is cleaned up BEFORE a park, never stranded by
-    /// one: a `/usage` panel owed its close gets its one plain close first at
-    /// the top of each look ([`Self::look`], [`Self::usage_panel_look`]; one
-    /// taken up from the ledger after its grace). What a park leaves
-    /// standing is the design's §7
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md`).
+    /// The harness's own state is cleaned up before a park, never stranded by one: a `/usage`
+    /// panel owed its close gets its one plain close at the top of each look
+    /// ([`Self::usage_panel_look`]; a ledger panel's after its grace). What a park leaves
+    /// standing is `docs/DESIGN-harness-autopilot-2026-10-15.md` §7.
     pub(super) fn park_while_off(
         &mut self,
         seq: u64,
@@ -304,9 +279,8 @@ impl<C: Ctl> Session<'_, C> {
                     self.wait(&["idle", IDLE_MS], step)?;
                     let screen = self.screen()?;
                     match self.reader(&screen.rows).phase(&screen.rows) {
-                        // The worker read working: the turn-end policy's
-                        // badge the park took down is over (its end outside
-                        // a park too), and is not set again.
+                        // The worker read working ends the turn-end policy's badge, as
+                        // outside a park: it is not set again.
                         Phase::Busy => self.badge_parked = None,
                         // The notice still up: the limit's episode is kept.
                         Phase::Limited { .. } => {}
@@ -337,8 +311,8 @@ impl<C: Ctl> Session<'_, C> {
                     now.word(),
                     self.fx.since(since).as_millis()
                 ));
-                // The session is supervised again: the claim the park gave
-                // back is taken before anything is pressed, typed or raised.
+                // Supervised again: the claim is retaken before anything is pressed, typed
+                // or raised.
                 self.retake_claim(review);
                 // A point handed before the park is decided again under the
                 // word now standing.
@@ -356,6 +330,9 @@ impl<C: Ctl> Session<'_, C> {
     /// (`Session::seed_from_ledger`).
     pub(super) fn off_stood(&mut self, seq: u64) {
         self.turn_end.park_off();
+        // The park ends the Land episode, and its hold with it (design
+        // §12.3.3): told here, as no point is folded in under the park.
+        self.tell_hold();
         self.ledger_row(
             approvals::RULE_OFF_STOOD,
             approvals::Outcome::Waiting,
@@ -379,9 +356,8 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<(), Fail> {
         let pause = self.refusal_pause;
         self.refusal_pause = pause.saturating_mul(2).min(REFUSAL_PAUSE_MAX);
-        // The server refused it behind input the worker has not read — a
-        // published stall or a stopped job: the next look reads `status`
-        // before it presses (`stall.rs`).
+        // Refused behind input the worker has not read (a published stall or a stopped job):
+        // the next look reads `status` before it presses (`stall.rs`).
         if why.contains("ERR busy input-unread") {
             self.stall_suspect = true;
         }
@@ -451,9 +427,8 @@ impl<C: Ctl> Session<'_, C> {
         let shown_owner =
             status_field(&read.stdout, "attention_owner").map(super::super::report::pct_decode);
         if shown_owner.as_deref() != Some(ATTENTION_OWNER) {
-            // Only the most recent entry is shown: an entry of ours under a
-            // person's cannot be read, so it is cleared unread (its point,
-            // if it still shows, is escalated afresh).
+            // Only the most recent entry is shown, so one of ours under a person's is cleared
+            // unread (its point, if still showing, is escalated afresh).
             let hidden = status_field(&read.stdout, "attention_owners")
                 .and_then(|n| n.parse::<usize>().ok())
                 .is_some_and(|n| n > 1);
@@ -540,8 +515,10 @@ impl<C: Ctl> Session<'_, C> {
                 "CLEARED seq={seq} {CLEARED_TURN_END} attention={said}"
             ));
         }
-        // The worker's NEEDS YOU goes with the loop that put it up.
+        // The worker's NEEDS YOU goes with the loop that put it up, and so
+        // does the hold the window was told (design §12.3.3).
         let _ = self.needs_down(seq, "the loop ended", review);
+        self.tell_hold_ended();
         self.release_claim();
     }
 

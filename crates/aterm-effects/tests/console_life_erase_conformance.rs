@@ -222,12 +222,10 @@ fn ed3_discards_history_without_relocating_live_cells_the_running_block_or_pet()
 fn erases_and_selection_release_cannot_replay_old_ink_as_contact() {
     for (erase, removes_live_ink) in [(b"\x1b[2J".as_slice(), true), (b"\x1b[3J", false)] {
         let mut s = Scene::new(true);
-        // The reading perch is the escort's own stand, inside the caret's
-        // keep-off ring (`pet_escort_primacy`), so beside a visible caret the
-        // halo is always within the body's contact margin. Hiding the caret
-        // after seating (as `work()` does) and moving the selection leaves the
-        // body at its last home with clear ground around it, so what follows
-        // measures ink contact rather than cursor proximity.
+        // The reading perch sits inside the caret's keep-off ring (`pet_escort_primacy`), so
+        // beside a visible caret the halo is always within the body's contact margin. Hiding the
+        // caret and moving the selection leaves the body at its last home on clear ground, so
+        // what follows measures ink contact, not cursor proximity.
         s.select(9, 12);
         s.warm();
         s.term.process(b"\x1b[?25l");
@@ -262,9 +260,8 @@ fn erases_and_selection_release_cannot_replay_old_ink_as_contact() {
         assert_eq!(s.brain.console_attention(), PetAttention::Typing);
         assert_eq!(s.brain.console_input_seq(), seq);
 
-        // Positive control: genuinely NEW displayed ink at the same body edge
-        // must react under that same input episode. ED3 preserved the old X,
-        // so use the adjacent, previously blank cell instead of repainting it.
+        // Positive control: new displayed ink at the same body edge reacts under the same input
+        // episode. ED3 kept the old X, so it writes the adjacent blank cell instead.
         let new_col = if removes_live_ink { col } else { col + 1 };
         assert_eq!(s.world().ink_at(row, new_col), Some(false));
         s.write_at(row, new_col, 'Y');

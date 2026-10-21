@@ -134,7 +134,7 @@ impl<'a> BitReader<'a> {
             self.refill();
         }
         // `n <= 32`, so `1u64 << n` is in range; for `n == 0` the mask is 0 and
-        // nothing is consumed (matching the original empty-loop behaviour).
+        // nothing is consumed.
         let mask = (1u64 << n) - 1;
         let v = (self.bit_buffer & mask) as u32;
         self.bit_buffer >>= n;

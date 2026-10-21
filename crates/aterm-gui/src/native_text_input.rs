@@ -413,16 +413,9 @@ fn previous_word_boundary(text: &str, position: usize) -> usize {
     nearest_boundary(text, start)
 }
 
-/// The forward twin of [`previous_word_boundary`]: skip any whitespace at the
-/// caret, then the run of non-whitespace after it — i.e. land at the END of the
-/// next word.
-///
-/// END, not start: that is what readline's `forward-word`, emacs, Terminal.app
-/// and iTerm2 all do, and it is the half of the pair that makes ⌥→ then ⌥←
-/// return you to where you began. (zsh's own `forward-word` lands on the START
-/// of the next word instead, which is the asymmetry the 2026-07-24 audit was
-/// asked about — but that is the shell's rule for the terminal, not this
-/// field's.) Clamped to a grapheme boundary so a cluster is never split.
+/// Forward word boundary (⌥→ / ⌥F): skip leading whitespace and the following
+/// non-whitespace run to land at the end of the next word, clamped to a grapheme
+/// boundary.
 fn next_word_boundary(text: &str, position: usize) -> usize {
     let start = nearest_boundary(text, position);
     let after = &text[start..];
@@ -590,12 +583,7 @@ mod tests {
         assert!(!input.value().ends_with('e'));
     }
 
-    /// WORD MOTION in Settings fields (2026-07-24 audit: there was none). ⌥→
-    /// lands at the END of the next word — readline / emacs / Terminal.app /
-    /// iTerm2 semantics — which is precisely what makes ⌥→ then ⌥← a
-    /// round-trip. (zsh's own `forward-word` goes to the START of the next
-    /// word; that asymmetry is the shell's rule for the TERMINAL, and is not
-    /// what a Cocoa text field should do.)
+    /// Verify ⌥→ lands at the end of the next word and ⌥← round-trips to the start.
     #[test]
     fn alt_word_motion_walks_whole_words_and_round_trips() {
         let mut input = TextInputState::new("hello brave world".into());

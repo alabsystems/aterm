@@ -1,43 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Every invocation form the four third-party consumers of `arrayvec` write,
-//! reproduced verbatim against this crate. (A fifth, `tiny-skia` 0.11.4 on
-//! Linux, left the graph with sctk-adwaita at linux-windowing LW.5,
-//! 2026-10-17, and its forms with it.)
+//! Compile-and-run coverage for every `ArrayVec` invocation form used by
+//! `naga`, `wgpu`, `wgpu-core`, and `wgpu-hal`.
 //!
-//! # Why this file is the deliverable and not a formality
-//!
-//! Most of the consumers cannot be compiled on the macOS box this crate was
-//! written on. `naga` resolves here with `default,msl-out,wgsl-in`, so its
-//! entire SPIR-V writer — where a third of the `ArrayVec` uses live — is
-//! `cfg`'d off; `wgpu-hal` resolves with `metal,portable-atomic`, and the Metal
-//! backend contains no `ArrayVec` at all, so `dx12`, `gles` and `vulkan` are
-//! dark. A macOS `cargo check -p aterm-gui` therefore
-//! exercises `Hash`, `Extend`, by-value `IntoIterator` and `into_inner` — and
-//! misses `drain`, by-`&`/`&mut` `IntoIterator`, `new_const` and `clone_from`
-//! entirely.
-//!
-//! So the shapes are brought here instead. Each block below is a transcription
-//! of real consumer source, commented with the crate, file and line it came
-//! from, with the consumers' own types replaced by local stand-ins of the same
-//! shape (`Arc<TextureView>` becomes `Arc<StandIn>`, `PCWSTR` becomes a
-//! `*const u16`, and so on) because it is the *form* — the turbofish, the const
-//! block, the derive list, the loop over a reference — that decides whether the
-//! surface accepts it. Compiling this file on any cell is the proof.
-//!
-//! It is a compile-time proof first; the `#[test]` functions additionally run
-//! the forms so that a shape which compiles but computes the wrong thing is
-//! caught too. Behaviour against a `Vec`-backed model of upstream's contract
-//! is checked separately and more aggressively by
+//! Because host builds `cfg` out non-native backends (e.g. `naga`'s SPIR-V
+//! writer and `wgpu-hal`'s DX12, GLES, and Vulkan backends on macOS), this
+//! test transcribes each consumer's `ArrayVec` type, const-generic, derive,
+//! iterator, and `Deref` forms with local stand-in types so every cell
+//! compiles and exercises the full consumer surface. Behavioral equivalence
+//! against a `Vec`-backed model is tested in
 //! `crates/aterm-alloc/tests/arrayvec_differential.rs`.
-
-// The consumers' shapes are reproduced whole, including fields and variants
-// this file never reads. `dead_code` fires on exactly those and says nothing
-// about whether the surface compiles, which is the question being asked.
 #![allow(dead_code)]
-
-// ── naga 29.0.3 ─────────────────────────────────────────────────────────────
 
 mod naga {
     // naga-29.0.3/src/proc/constant_evaluator.rs:14
@@ -194,8 +168,6 @@ fn naga_forms() {
     assert_eq!(sum_by_value(comps, idxs), 3.5);
 }
 
-// ── wgpu 29.0.3 ─────────────────────────────────────────────────────────────
-
 mod wgpu {
     use arrayvec::ArrayVec;
 
@@ -231,8 +203,6 @@ fn wgpu_forms() {
     assert_eq!(wgpu::bind_group_layouts(&[1, 2, 3, 4]).len(), 4);
     assert_eq!(wgpu::vertex_buffers(&[1, 2]).len(), 2);
 }
-
-// ── wgpu-core 29.0.3 ────────────────────────────────────────────────────────
 
 mod wgpu_core {
     use arrayvec::ArrayVec;
@@ -363,13 +333,8 @@ mod wgpu_core {
         }
     }
 
-    // wgpu-core-29.0.3/src/track/texture.rs:1383 — the SHARED half of the pair
-    // above, `get_unchecked` with a `usize` index, through `Deref`. It is a
-    // different `SliceIndex` impl and a different inherent method from the one
-    // on the previous line, and it is the only place either shape appears
-    // outside `track/texture.rs`: re-derive with
-    // `grep -rn 'get_unchecked' <registry>/{naga,wgpu,wgpu-core,wgpu-hal}-29.0.3
-    //  --include='*.rs'`.
+    // wgpu-core-29.0.3/src/track/texture.rs:1383 — shared `get_unchecked`
+    // with a `usize` index through `Deref`.
     pub fn read_mip(complex: &ComplexTextureState, mip_id: usize) -> u32 {
         // SAFETY: the caller has already bounds-checked `mip_id`, exactly as
         // wgpu-core does one line above its own call
@@ -444,8 +409,6 @@ fn wgpu_core_forms() {
     let cts = color_target_states(2);
     assert_eq!(describe(&cts), (false, &[0u32, 1][..]));
 }
-
-// ── wgpu-hal 29.0.3 ─────────────────────────────────────────────────────────
 
 mod wgpu_hal {
     use arrayvec::ArrayVec;
@@ -729,8 +692,6 @@ fn wgpu_hal_forms() {
     assert_eq!(queue_families(&[1, 2, 3]), 6);
 }
 
-// ── Deref coercion sites ────────────────────────────────────────────────────
-
 /// Every `&ArrayVec<T, N>` that the consumers hand to something expecting
 /// `&[T]`, plus the slice inherent methods they reach through `Deref`. None of
 /// these compiles without `Deref<Target = [T]>`, and none of them is visible in
@@ -815,8 +776,6 @@ fn deref_sites_forms() {
     let args: arrayvec::ArrayVec<u32, 13> = [1, 2, 3].into_iter().collect();
     assert_eq!(deref_sites::some_slice(&args), Some(&[1u32, 2, 3][..]));
 }
-
-// ── The two exported iterator types, by name ────────────────────────────────
 
 /// Upstream exports `arrayvec::IntoIter` and `arrayvec::Drain` as nameable
 /// types. Nothing in aterm's graph writes either name today, but a consumer

@@ -116,7 +116,23 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// A folder on the way cannot be listed, or holds too many entries.
-    fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String>;
+    fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String> {
+        self.hidden_twin_in(comps, None)
+    }
+
+    /// [`Self::hidden_twin`] with `home` supplied so the live walk never lists
+    /// inside a root macOS guards with `kTCCServiceSystemPolicyAppData` or a
+    /// file-provider domain (`~/Library/Containers`, `~/Library/Group Containers`,
+    /// `~/Library/CloudStorage`, `~/Library/Mobile Documents`).
+    ///
+    /// # Errors
+    ///
+    /// A folder on the way cannot be listed, or holds too many entries.
+    fn hidden_twin_in(
+        &self,
+        comps: &[String],
+        home: Option<&Path>,
+    ) -> Result<Option<String>, String>;
 
     /// `comps` with every symbolic link resolved (the Read rule's resolver);
     /// `None` for a dangling link or a refused look.
@@ -326,7 +342,7 @@ const NO_LOOK: &str =
     "a replay never looks at the machine: its door answers every probe from the tape";
 
 impl PolicyProbe for NoLook {
-    fn hidden_twin(&self, _: &[String]) -> Result<Option<String>, String> {
+    fn hidden_twin_in(&self, _: &[String], _: Option<&Path>) -> Result<Option<String>, String> {
         unreachable!("{NO_LOOK}")
     }
 
@@ -459,11 +475,15 @@ enum Field<'a> {
 }
 
 impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
-    fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String> {
+    fn hidden_twin_in(
+        &self,
+        comps: &[String],
+        home: Option<&Path>,
+    ) -> Result<Option<String>, String> {
         self.fx.exchange(
             doors::PROBE_HIDDEN_TWIN,
             || self.request(|r| r.comps(comps)),
-            || self.live.hidden_twin(comps),
+            || self.live.hidden_twin_in(comps, home),
         )
     }
 
@@ -643,7 +663,7 @@ impl KeyedProbe {
 }
 
 impl PolicyProbe for KeyedProbe {
-    fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String> {
+    fn hidden_twin_in(&self, comps: &[String], _: Option<&Path>) -> Result<Option<String>, String> {
         self.answer(doors::PROBE_HIDDEN_TWIN, |r| r.comps(comps), Err)
     }
 

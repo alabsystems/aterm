@@ -120,6 +120,201 @@ pub(crate) struct NeedFacts {
     pub(crate) reset_unix: Option<i64>,
     /// Now, unix seconds.
     pub(crate) now_unix: i64,
+    /// The worker's NEEDS YOU sets as its loop told the window's host, whole,
+    /// each with the entry's text it was told with
+    /// ([`crate::session_timeline::SessionTimeline::harness_needs`], slice
+    /// 2c): copied under the timeline's leaf lock the facts already take
+    /// (two reference counts). Read through [`Self::told_needs`], which
+    /// reads a set only beside the entry it was told with.
+    pub(crate) told: ToldNeeds,
+}
+
+impl NeedFacts {
+    /// THE TOLD NEEDS, WHILE THEIR ENTRY STANDS
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 4): the
+    /// whole set [`Self::told`] holds for the needs owner's entry among
+    /// [`Self::attention`] ([`ToldNeeds::words_for`]): the set told last
+    /// where that entry is the text it was told with, else the outgoing set
+    /// where the entry is still its own (its replacement's request not
+    /// landed yet); `None` where none was told, none stands, or the one
+    /// standing is another's. A set told before a request the connection
+    /// lost — a take-down whose `unset` never landed, a set whose `meta set`
+    /// never did — is never read beside an entry it does not describe. Where
+    /// it reads a set, [`attention_outcome`] says the need in it, whole
+    /// ([`HarnessAsk::told`], slice 2d); where it reads none, the entry's own
+    /// parse stands ([`HarnessAsk::of`]).
+    #[must_use]
+    pub(crate) fn told_needs(&self) -> Option<&[String]> {
+        let entry = self
+            .attention
+            .iter()
+            .find(|entry| entry.owner == crate::harness_host::NEEDS_ATTENTION_OWNER)
+            .map(|entry| entry.text.as_str());
+        self.told.words_for(entry)
+    }
+}
+
+/// THE WORKER'S NEEDS YOU AS THE WINDOW HOLDS THEM
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 items 3-4, §12.2.11;
+/// slice 2c): the set the loop told last, and beside it the OUTGOING set —
+/// the one that described the needs entry standing as that tell arrived.
+/// Each tell comes just before its request (the entry's `meta set`, or its
+/// `unset`), so until that request lands the entry standing is still the
+/// outgoing set's: kept, it keeps its words until the request that replaces
+/// or removes it lands, and a publication in between (the needs wake's own,
+/// or any other) reads the old entry whole, never cut and then whole again.
+/// A set is read only beside the entry text it was told with
+/// ([`HarnessNeeds::words_for`]), so a request the connection lost or a
+/// cap refused leaves the old entry read with its own words, and the new
+/// set is read from the moment its entry lands. Kept on the session's
+/// timeline ([`crate::session_timeline::SessionTimeline::harness_needs`]);
+/// each set an `Arc`, so a copy is two reference counts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToldNeeds {
+    /// The set told last; `None`: none told, or the take-down.
+    current: Option<std::sync::Arc<HarnessNeeds>>,
+    /// The set that described the needs entry standing when
+    /// [`Self::current`] was told, kept until the next tell; `None` where
+    /// nothing held described it, or `current` does itself.
+    outgoing: Option<std::sync::Arc<HarnessNeeds>>,
+}
+
+impl ToldNeeds {
+    /// THE TELL ([`aterm_agent::supervise::IdleHost::needs_standing`]): `told`
+    /// (`None`, the take-down) becomes the set told last, and the held set
+    /// that describes `standing` — the needs owner's entry as the server
+    /// holds it as the tell arrives, `None` where none stands — becomes the
+    /// outgoing one (none where `told` describes it itself). Whether what a
+    /// reader reads beside `standing` moved: only then is the window woken.
+    /// A tell whose entry is not the one standing moves nothing a reader
+    /// reads until its request lands, and that write wakes the window
+    /// itself (`Wake::MetaChanged`); a set that moves under the entry that
+    /// stands (`[a, b]` to `[a, c]`, one entry text) moves no server and is
+    /// woken for here alone. The same set told again moves nothing.
+    pub(crate) fn tell(
+        &mut self,
+        told: Option<std::sync::Arc<HarnessNeeds>>,
+        standing: Option<&str>,
+    ) -> bool {
+        if self.current == told {
+            return false;
+        }
+        let before = self.reading(standing).cloned();
+        let describes = |held: &std::sync::Arc<HarnessNeeds>| held.words_for(standing).is_some();
+        let outgoing = if told.as_ref().is_some_and(describes) {
+            None
+        } else {
+            [self.current.take(), self.outgoing.take()]
+                .into_iter()
+                .flatten()
+                .find(describes)
+        };
+        self.current = told;
+        self.outgoing = outgoing;
+        before.as_deref().map(HarnessNeeds::needs)
+            != self.reading(standing).map(|held| held.needs())
+    }
+
+    /// The held set a reader reads beside `standing`: the one told last
+    /// where it describes that entry, else the outgoing one where it does.
+    fn reading(&self, standing: Option<&str>) -> Option<&std::sync::Arc<HarnessNeeds>> {
+        [&self.current, &self.outgoing]
+            .into_iter()
+            .flatten()
+            .find(|held| held.words_for(standing).is_some())
+    }
+
+    /// The needs a reader reads beside `standing`, the needs owner's entry
+    /// as stored (`None` where none stands): the set told last where it was
+    /// told with that text, else the outgoing set where it was; else `None`.
+    #[must_use]
+    pub(crate) fn words_for(&self, standing: Option<&str>) -> Option<&[String]> {
+        self.reading(standing).map(|held| held.needs())
+    }
+
+    /// The set told last, whatever entry stands (`None`: none told, or the
+    /// take-down): what the debug `status needs_told=` calls `stale` where
+    /// no entry it describes stands.
+    #[must_use]
+    #[cfg_attr(
+        not(any(test, debug_assertions)),
+        expect(dead_code, reason = "read by the debug `status needs_told=` and tests")
+    )]
+    pub(crate) fn current(&self) -> Option<&HarnessNeeds> {
+        self.current.as_deref()
+    }
+}
+
+/// THE WORKER'S NEEDS YOU, WHOLE, AS ITS LOOP TOLD THEM
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 items 3-4; slice
+/// 2c): the set the turn-end policy holds standing — each need the worker's
+/// own line, sanitized and held to the policy's 160 characters, never cut to
+/// the entry's 64 cells — and the needs owner's entry text the loop was about
+/// to set for it ([`aterm_agent::supervise::IdleHost::needs_standing`]).
+/// Stored on the session's timeline by the window's host
+/// ([`crate::session_timeline::SessionTimeline::set_harness_needs`], into
+/// [`ToldNeeds`]) on the loop's own thread before the entry's `meta set` is
+/// sent, so the first publication that sees the entry can read the words
+/// with it. Read only while that entry stands ([`Self::words_for`]).
+/// In-process only: no wire, file, setting or stamp carries it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HarnessNeeds {
+    /// Every need standing, in the worker's order.
+    needs: Vec<String>,
+    /// The entry's text they were told with, through the server's
+    /// presentation sanitizer (what `meta set attention` stores).
+    entry: String,
+}
+
+impl HarnessNeeds {
+    /// What a tell leaves standing: `needs` under `entry`, or `None` for the
+    /// take-down `(&[], "")` — and for any set or entry that is empty, which
+    /// puts nothing up. The entry goes through the presentation sanitizer
+    /// with no cap: the server refuses a keyed entry over its cap rather than
+    /// cut it, so a text over it never lands and never matches.
+    #[must_use]
+    pub(crate) fn told(needs: &[String], entry: &str) -> Option<Self> {
+        let entry = crate::session_timeline::sanitize_presentation_line(entry, usize::MAX);
+        (!needs.is_empty() && !entry.is_empty()).then(|| Self {
+            needs: needs.to_vec(),
+            entry,
+        })
+    }
+
+    /// Every need told, whole, in the worker's order.
+    #[must_use]
+    pub(crate) fn needs(&self) -> &[String] {
+        &self.needs
+    }
+
+    /// The entry's text the set was told with, sanitized.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by tests; slice 2d compares through `words_for`"
+        )
+    )]
+    pub(crate) fn entry(&self) -> &str {
+        &self.entry
+    }
+
+    /// The needs, where `standing` — the needs owner's entry as the server
+    /// stored it, `None` where none stands — is the text they were told
+    /// with, both through the presentation sanitizer; else `None`. A stored
+    /// text is already the sanitizer's fixpoint (the server and a restore
+    /// both write it through it), so it is sanitized again only where it
+    /// holds what the sanitizer removes: the common read allocates nothing.
+    #[must_use]
+    pub(crate) fn words_for(&self, standing: Option<&str>) -> Option<&[String]> {
+        let standing = standing?.trim();
+        let same = standing == self.entry
+            || (crate::session_timeline::metadata_has_forbidden_formatting(standing)
+                && crate::session_timeline::sanitize_presentation_line(standing, usize::MAX)
+                    == self.entry);
+        same.then_some(self.needs.as_slice())
+    }
 }
 
 /// What a session needs of its owner now.
@@ -130,8 +325,213 @@ pub(crate) struct Need {
     /// The transition's identity within the word: the stall's episode, the
     /// task's entry rev, the agent's rev, the attention text's hash.
     pub(crate) key: u64,
-    /// The row's words, one clipped line, without the tab's label.
+    /// The row's words, one clipped line, without the tab's label. A
+    /// harness's own ask's is its first need without aterm's frame, then
+    /// ` (+N more)` whole ([`HarnessAsk::line`]).
     pub(crate) what: String,
+    /// The harness's own NEEDS YOU entry, read without aterm's frame
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3): `Some` only
+    /// for an ask of the needs owner
+    /// ([`crate::harness_host::NEEDS_ATTENTION_OWNER`]) whose text
+    /// [`need_words`] reads. What a reader with room of its own says: the
+    /// menu row, the pill, the tab's hover, the banner, Settings ▸ Harness
+    /// and `status needs_n=`. Every other reader keeps [`Self::what`].
+    pub(crate) harness: Option<HarnessAsk>,
+}
+
+/// A harness's NEEDS YOU, in the worker's own words ([`Need::harness`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HarnessAsk {
+    /// The first need without the frame, folded to one line: whole as the
+    /// loop told it, within [`NEED_TOLD_MAX`] bytes ([`Self::told`], slice
+    /// 2d), else read from the entry, whose writer cut it at 64 cells, within
+    /// [`NEED_WHAT_MAX`] ([`Self::of`]).
+    pub(crate) first: String,
+    /// How many further needs stand (the told set's others, else the
+    /// entry's ` (+N more)`).
+    pub(crate) more: u16,
+    /// The further needs, whole, in the worker's order, each folded to one
+    /// line within [`NEED_TOLD_MAX`] bytes: the menu bar's rows one level
+    /// in and the tab's hover say them (§12.2.1). Empty where the entry's
+    /// parse is all the window holds ([`Self::of`]), which counts them in
+    /// [`Self::more`] but carries none of their words.
+    pub(crate) others: Vec<String>,
+    /// The program whose entry it is.
+    pub(crate) program: aterm_phase::Program,
+}
+
+impl HarnessAsk {
+    /// The entry's words held: `first` folded to one line within
+    /// [`NEED_WHAT_MAX`] bytes; no further need's words.
+    pub(crate) fn of(words: NeedWords<'_>) -> Self {
+        Self {
+            first: fold_clip(words.first, NEED_WHAT_MAX),
+            more: words.more,
+            others: Vec::new(),
+            program: words.program,
+        }
+    }
+
+    /// THE WHOLE SET, AS THE LOOP TOLD IT (§12.2.3 item 4, slice 2d): the
+    /// first need and every further one, each whole up to the policy's 160
+    /// characters, folded to one line within [`NEED_TOLD_MAX`] bytes (so no
+    /// need the policy kept is cut here, in any script), under `program`,
+    /// the program the entry they were told with names. A need that folds to
+    /// nothing is passed over; `None` where none is left.
+    #[must_use]
+    pub(crate) fn told(needs: &[String], program: aterm_phase::Program) -> Option<Self> {
+        let mut held = needs
+            .iter()
+            .map(|need| fold_clip(need, NEED_TOLD_MAX))
+            .filter(|need| !need.is_empty());
+        let first = held.next()?;
+        let others: Vec<String> = held.collect();
+        Some(Self {
+            first,
+            more: u16::try_from(others.len()).unwrap_or(u16::MAX),
+            others,
+            program,
+        })
+    }
+
+    /// ` (+N more)`, empty where no further need stands.
+    #[must_use]
+    pub(crate) fn more_words(&self) -> String {
+        self.more_past(0)
+    }
+
+    /// ` (+N more)` for the further needs a surface does not say on a line
+    /// of its own: [`Self::more`] less the `shown` it does (the menu's rows
+    /// one level in, the hover's lines); empty where none is left.
+    #[must_use]
+    pub(crate) fn more_past(&self, shown: usize) -> String {
+        let left = usize::from(self.more).saturating_sub(shown);
+        if left == 0 {
+            String::new()
+        } else {
+            format!(" (+{left} more)")
+        }
+    }
+
+    /// The need on one line within `max` bytes: [`Self::first`] clipped at a
+    /// character boundary to the bytes [`Self::more_words`] leaves, then
+    /// that tail whole, so a cut never falls inside the count.
+    #[must_use]
+    pub(crate) fn line(&self, max: usize) -> String {
+        let tail = self.more_words();
+        format!(
+            "{}{tail}",
+            fold_clip(&self.first, max.saturating_sub(tail.len()))
+        )
+    }
+
+    /// How many needs stand: the first and the further ones
+    /// (`status needs_n=`).
+    #[must_use]
+    pub(crate) fn count(&self) -> u32 {
+        1 + u32::from(self.more)
+    }
+
+    /// The need where nothing around it says it is one (the Overview's
+    /// doing column, painted and spoken): [`NEEDS_YOU_LEAD`], then
+    /// [`Self::line`] within the bytes the lead leaves of `max`, so the
+    /// line keeps main's budget and its ` (+N more)` whole.
+    #[must_use]
+    pub(crate) fn cued_line(&self, max: usize) -> String {
+        format!(
+            "{NEEDS_YOU_LEAD}{}",
+            self.line(max.saturating_sub(NEEDS_YOU_LEAD.len()))
+        )
+    }
+}
+
+/// The words a harness's need leads with where no section header says it
+/// is a need: the pill ([`crate::presence::pill_need_words`]) and the
+/// Overview's line ([`HarnessAsk::cued_line`]). Without the program, which
+/// the label beside it names.
+pub(crate) const NEEDS_YOU_LEAD: &str = "needs you: ";
+
+/// A harness's entry read without aterm's frame ([`need_words`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NeedWords<'a> {
+    /// The first need, as the entry carries it.
+    pub(crate) first: &'a str,
+    /// The further needs the entry counts (` (+N more)`), 0 for none.
+    pub(crate) more: u16,
+    /// The program the entry names.
+    pub(crate) program: aterm_phase::Program,
+}
+
+/// Between the program's word and the need in a harness's entry.
+const NEEDS_YOU: &str = " needs you: ";
+/// The tail a harness's entry ends with
+/// (`aterm_agent::supervise::escalate::needs_attention_text`).
+const CARRYING_ON: &str = " \u{2014} carrying on";
+
+/// THE NEED WITHOUT ATERM'S FRAME (§12.2.3): a harness's entry
+/// `<program> needs you: <first need>[ (+N more)] — carrying on` read back
+/// into its first need, the count of further needs and the program it
+/// names. The trailing ` — carrying on` comes off whole, or as much of it as
+/// a byte cap left (from its dash on). `None` where the text does not parse
+/// (another program word, no `needs you: `, a cut that fell inside the
+/// count or the need itself, so the count is unknown): such a text stays
+/// whole, as main reads it.
+#[must_use]
+pub(crate) fn need_words(text: &str) -> Option<NeedWords<'_>> {
+    let text = text.trim();
+    let (head, rest) = text.split_once(NEEDS_YOU)?;
+    let program = aterm_phase::Program::ALL
+        .into_iter()
+        .find(|program| program.name().eq_ignore_ascii_case(head))?;
+    let (rest, tail_seen) = without_carrying_on(rest);
+    let rest = rest.trim_end();
+    let (first, more) = match more_count(rest) {
+        Some(read) => read,
+        None if tail_seen => (rest, 0),
+        None => return None,
+    };
+    let first = first.trim();
+    (!first.is_empty()).then_some(NeedWords {
+        first,
+        more,
+        program,
+    })
+}
+
+/// `rest` without its ` — carrying on`, whole or cut from its dash on, and
+/// whether any of it stood.
+fn without_carrying_on(rest: &str) -> (&str, bool) {
+    let dash = " \u{2014}".len();
+    let cuts = CARRYING_ON
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(CARRYING_ON.len()))
+        .filter(|&at| at >= dash);
+    let mut best = None;
+    for at in cuts {
+        if rest.ends_with(&CARRYING_ON[..at]) {
+            best = Some(at);
+        }
+    }
+    match best {
+        Some(at) => (&rest[..rest.len() - at], true),
+        None => (rest, false),
+    }
+}
+
+/// `<first> (+N more)` read into the first need and `N`; `None` where the
+/// text does not end with a whole count.
+fn more_count(rest: &str) -> Option<(&str, u16)> {
+    let body = rest.strip_suffix(" more)")?;
+    let at = body.rfind(" (+")?;
+    let digits = &body[at + " (+".len()..];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let more = digits
+        .parse::<u64>()
+        .map_or(u16::MAX, |n| u16::try_from(n).unwrap_or(u16::MAX));
+    Some((&body[..at], more))
 }
 
 /// What aterm is waiting out for a session.
@@ -220,10 +620,28 @@ impl Verdict {
     pub(crate) fn hold_word(&self) -> &'static str {
         self.held.map_or("-", HoldWord::word)
     }
+
+    /// The need in the worker's words where the published need is a
+    /// harness's own ask ([`Need::harness`]).
+    #[must_use]
+    pub(crate) fn harness_ask(&self) -> Option<&HarnessAsk> {
+        self.need.as_ref().and_then(|need| need.harness.as_ref())
+    }
 }
 
 /// Byte budget for a row's words.
 pub(crate) const ROW_WHAT_MAX: usize = 72;
+/// Byte budget for a harness's need in its own words ([`HarnessAsk::first`]):
+/// what a surface with room of its own (the banner's body, the hover, the
+/// menu row) may carry before it clips to its own room.
+pub(crate) const NEED_WHAT_MAX: usize = 240;
+/// Byte budget for each need a harness's loop told the window whole
+/// ([`HarnessAsk::told`], slice 2d): every need its policy keeps — at most
+/// `NEED_CHARS` (160) characters, each of up to four bytes — so a need in
+/// letters of three bytes is as whole as one in ASCII. A surface with less
+/// room clips to its own: the banner's body to [`NEED_WHAT_MAX`], a menu
+/// row to its line.
+pub(crate) const NEED_TOLD_MAX: usize = aterm_agent::supervise::policy::needs::NEED_CHARS * 4;
 /// Byte budget for the words that carry a remedy: the server's keyed
 /// attention cap, so a row carries every word its entry does.
 pub(crate) const REMEDY_TEXT_MAX: usize = crate::session_timeline::META_ATTENTION_KEYED_MAX;
@@ -305,6 +723,7 @@ fn stall_need(facts: &NeedFacts) -> Option<Need> {
         },
         key: stall.key,
         what,
+        harness: None,
     })
 }
 
@@ -362,6 +781,7 @@ fn task_need(facts: &NeedFacts) -> Option<Need> {
         word: NeedWord::Stalled,
         key: task.entered,
         what: fold_clip(&what, REMEDY_TEXT_MAX),
+        harness: None,
     })
 }
 
@@ -397,6 +817,7 @@ fn wall_outcome(
             word,
             key: agent.rev,
             what,
+            harness: None,
         })
     };
     let wait = |word: WaitWord| {
@@ -552,10 +973,24 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
             }
             AttentionKind::Ask if ask.is_none() => {
                 let text = entry.text.trim();
+                // A harness's own entry is read without aterm's frame
+                // (§12.2.3): in the words its loop told the window, whole,
+                // while they were told with this very entry (slice 2d),
+                // else the entry's own parse (2a). Its key stays the
+                // entry's hash, so the survey still finds the entry the
+                // published ask names.
+                let harness = (entry.owner == crate::harness_host::NEEDS_ATTENTION_OWNER)
+                    .then(|| harness_ask(text, facts.told_needs()))
+                    .flatten();
+                let what = harness.as_ref().map_or_else(
+                    || fold_clip(text.trim_start_matches('⚠').trim_start(), ROW_WHAT_MAX),
+                    |ask| ask.line(ROW_WHAT_MAX),
+                );
                 ask = Some(Need {
                     word: NeedWord::Ask,
                     key: ask_key(text),
-                    what: fold_clip(text.trim_start_matches('⚠').trim_start(), ROW_WHAT_MAX),
+                    what,
+                    harness,
                 });
             }
             AttentionKind::Ask => {}
@@ -568,6 +1003,24 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
         entry: Some(entry),
     });
     (ask, wait, supervisor_waits)
+}
+
+/// THE NEEDS OWNER'S ASK IN THE WORKER'S WORDS: the set `told` beside this
+/// entry ([`NeedFacts::told_needs`], which reads a set only beside the
+/// entry text it was told with) under the program the entry names, whole
+/// (slice 2d); else, or where the entry names no program this build knows,
+/// the entry's own parse ([`need_words`], 2a); `None` where neither reads.
+fn harness_ask(text: &str, told: Option<&[String]>) -> Option<HarnessAsk> {
+    let parsed = need_words(text);
+    let program = parsed.map(|words| words.program).or_else(|| {
+        let (head, _) = text.split_once(NEEDS_YOU)?;
+        aterm_phase::Program::ALL
+            .into_iter()
+            .find(|program| program.name().eq_ignore_ascii_case(head.trim()))
+    });
+    told.zip(program)
+        .and_then(|(needs, program)| HarnessAsk::told(needs, program))
+        .or_else(|| parsed.map(HarnessAsk::of))
 }
 
 /// An entry's words without a leading `kind=` an older server stored as
@@ -631,12 +1084,14 @@ fn box_need(facts: &NeedFacts) -> Option<Need> {
                 },
                 key: agent.rev,
                 what: fold_clip(&what, ROW_WHAT_MAX),
+                harness: None,
             })
         }
         "question" => Some(Need {
             word: NeedWord::Question,
             key: agent.rev,
             what: "question".to_string(),
+            harness: None,
         }),
         _ => None,
     }

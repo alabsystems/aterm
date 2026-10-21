@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Windows Explorer "Open aterm here" context-menu registration.
-//!
-//! Right-clicking a folder, a folder's empty background, or a drive gains an
-//! **Open aterm here** verb that launches `aterm-gui -d <that path>` — so a new
-//! terminal opens already `cd`'d into the location. Registered PER-USER under
-//! `HKCU\Software\Classes` (no admin, no MSIX identity needed) and trivially
-//! reversible (`--uninstall-context-menu`).
-//!
-//! Hand-rolled `advapi32` FFI (flat C, the house style — mirrors the extern blocks
-//! in `aterm-pty/src/windows/ffi.rs` and `notify.rs`); no `windows`-crate dependency.
+//! Windows Explorer "Open aterm here" context-menu verb: right-clicking a folder, a folder's
+//! background or a drive launches `aterm-gui -d <that path>`. Registered per user under
+//! `HKCU\Software\Classes` (no admin, no MSIX identity); `--uninstall-context-menu` removes it.
 #![cfg(windows)]
 
 use core::ptr;
@@ -73,35 +66,24 @@ fn set_string(hk: Hkey, name: Option<&str>, value: &str) -> io::Result<()> {
 
 /// Build the verb's registry command line: `"<exe>" -d "<token>."`.
 ///
-/// The trailing dot is load-bearing. Explorer substitutes `%1`/`%V` textually,
-/// and for a drive root that text is `C:\` — so the naive `-d "%V"` expands to
-/// `-d "C:\"`, where the backslash escapes the closing quote under the MSVCRT
-/// argv rules and the operand parses as `C:"` (reproduced: `rustc "C:\"` →
-/// ``couldn't read `C:"``). `Path::is_dir()` then fails and the GUI-subsystem
-/// exe exits 2 into a null stderr — right-clicking a drive was a *silent*
-/// no-op. With the dot the expansion is `-d "C:\."`: the quote survives, and
-/// `C:\.` resolves to the root. Ordinary folders expand to e.g. `C:\src.`,
-/// which Win32 path normalization treats as `C:\src` (trailing dots on a final
-/// component are stripped), so they are unaffected. This is the workaround Git
-/// for Windows ships in its own shell verb (`git_shell\command` = `"--cd=%v."`).
-/// Rejected alternatives: dropping the quotes breaks any path with spaces, and
-/// special-casing drive roots is impossible — the substitution happens in
-/// Explorer long after this one static template is written.
+/// The trailing dot is load-bearing. Explorer substitutes `%1`/`%V` textually, and a drive root
+/// is `C:\`, so `-d "%V"` would expand to `-d "C:\"`: under the MSVCRT argv rules the backslash
+/// escapes the closing quote, the operand parses as `C:"`, and the GUI exe exits silently. With
+/// the dot it is `C:\.`, which resolves to the root; `C:\src.` normalizes to `C:\src` (Win32
+/// strips trailing dots on a final component). Git for Windows does the same (`"--cd=%v."`).
+/// Dropping the quotes would break paths with spaces, and drive roots cannot be special-cased:
+/// Explorer substitutes into this one static template.
 fn verb_command(exe: &str, token: &str) -> String {
     format!("\"{exe}\" -d \"{token}.\"")
 }
 
-/// Install the "Open aterm here" verb on directories, directory backgrounds, and
-/// drives, pointing at THIS install's windowed image with `-d <path>`.
+/// Install the "Open aterm here" verb on directories, directory backgrounds and drives,
+/// pointing at this install's windowed image with `-d <path>`.
 ///
-/// The windowed image, not `current_exe()`: `aterm --install-context-menu` typed
-/// at a prompt runs in the CONSOLE image `aterm.exe`, and a verb registered on
-/// it made Explorer start a console-subsystem exe — a new console window
-/// running the transparent session, not an aterm window (review 2026-09-27).
-/// [`crate::win32::windowed_front_door_beside`] is the one rule the console
-/// image's window handoff and the jump list use too (`aterm-gui.exe` in an
-/// install, `aterm-windowed.exe` in a build tree). No such image beside this
-/// one: refused, and nothing is written.
+/// The windowed image, not `current_exe()`: `aterm --install-context-menu` runs in the console
+/// image, and a verb on that would open a console window instead of an aterm window.
+/// [`crate::win32::windowed_front_door_beside`] picks it, as for the console handoff and the
+/// jump list. No windowed image beside this one: refused, nothing written.
 pub(crate) fn install() -> io::Result<()> {
     let current = std::env::current_exe()?;
     let Some(exe) = crate::win32::windowed_front_door_beside(&current) else {
@@ -143,9 +125,7 @@ pub(crate) fn uninstall() -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A drive root's `%1`/`%V` expands to `C:\`, and a backslash directly
-    /// before the closing quote escapes it (see [`verb_command`]'s doc). Guard
-    /// both the raw template and its worst-case expansion, for every verb root.
+    /// A drive root's expansion must not end in backslash-quote (see [`verb_command`]).
     #[test]
     fn drive_root_expansion_does_not_escape_the_closing_quote() {
         for (_, token) in VERBS {
@@ -154,8 +134,7 @@ mod tests {
                 !template.ends_with("\\\""),
                 "template ends in backslash-quote: {template}"
             );
-            // Simulate Explorer's textual substitution on a drive root — the
-            // one path that ends in a backslash and cannot be spelled otherwise.
+            // Explorer's textual substitution on a drive root, the one path ending in `\`.
             let expanded = template.replace(token, r"C:\");
             assert!(
                 !expanded.ends_with("\\\""),

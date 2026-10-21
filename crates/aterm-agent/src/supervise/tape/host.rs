@@ -56,7 +56,7 @@ use super::codec::CodecError;
 use super::core::TapeValue;
 use super::frame::Hint;
 use crate::harness::accounts::Sample;
-use crate::harness::acts::{Act, TaskFace};
+use crate::harness::acts::{Act, LandHeld, TaskFace};
 use crate::harness::repo_work::RepoWork;
 use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
@@ -186,6 +186,9 @@ impl<T: TapeArg + ?Sized> TapeArg for &T {}
 impl<T: TapeArg> TapeArg for Option<T> {}
 impl<T: TapeArg, E: TapeArg> TapeArg for Result<T, E> {}
 impl<A: TapeArg, B: TapeArg> TapeArg for (A, B) {}
+/// A slice of arguments (`needs_standing`'s set): its `Debug` is each
+/// element's in order, so a set told otherwise compares otherwise.
+impl<T: TapeArg> TapeArg for [T] {}
 
 /// Each type an argument of the host's may be, opted in by name: its `Debug`
 /// is the text a tape compares, and holds no `Instant`.
@@ -197,6 +200,7 @@ macro_rules! tape_arg_debug {
 
 tape_arg_debug!(
     str,
+    String,
     bool,
     u32,
     u64,
@@ -206,6 +210,9 @@ tape_arg_debug!(
     WaitPlan,
     Act,
     TaskFace,
+    // `land_held`'s hold: `Copy`, no `Instant`, its open words printed as
+    // the strict reading spelled them (`OpenWord`'s `Debug`).
+    LandHeld,
     Guard,
     StuckSurvey,
     StallSeen,

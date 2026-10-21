@@ -1,53 +1,28 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The TRUST-ANCHOR WRITER: a surgical, verified, idempotent edit of one
-//! `pub const NAME: &[&str] = &[…];` constant in
-//! `crates/aterm-update-core/src/pins.rs`.
+//! The trust-anchor writer: a surgical, verified, idempotent edit of one
+//! `pub const NAME: &[&str] = &[…];` constant in `crates/aterm-update-core/src/pins.rs`, the
+//! file that decides what every shipped binary trusts. A mangled anchor either bricks the
+//! channel or arms it with a key nobody holds, so the writer obeys five rules:
 //!
-//! # Why this exists at all, given what it touches
+//! 1. Narrow: only the `&[ … ]` block of the one named constant changes, by a byte-splice at a
+//!    located offset, never a parse-and-re-emit; the surrounding doc comments hold the
+//!    rotation rules.
+//! 2. Anchored: the constant is found by a line that is exactly its declaration at column 0,
+//!    never by a pattern that could match its name inside its own doc comment.
+//! 3. Idempotent: a key already present is a no-op ([`Edit::AlreadyPresent`]), so re-running
+//!    `setup` or an interrupted `join` converges. A duplicate member would fail
+//!    `pins::tests::the_master_keyset_has_no_empty_members_and_no_duplicates`.
+//! 4. Additive: existing members keep their order and the new key goes at the tail. Index 0
+//!    is the head, the master a build names as current, which only a deliberate rotation
+//!    changes.
+//! 5. Refuse rather than guess: a missing or doubled constant, an unterminated block, an entry
+//!    that is not a plain quoted literal with its trailing comma, or an empty member is an
+//!    error naming the line.
 //!
-//! `pins.rs` is the file that decides what every shipped binary trusts. Hand-pasting 44
-//! base64 characters into it is a transcription step in the one place a transcription
-//! error is unrecoverable — a mangled anchor either bricks the channel or arms it with a
-//! key nobody holds. Replacing the human is only an improvement if the writer is *more*
-//! careful than a human, not less.
-//!
-//! # The five rules this writer obeys, and what each one is defending
-//!
-//! 1. **NARROW.** Nothing outside the `&[ … ]` bracket block of the ONE named constant is
-//!    ever touched. The surrounding doc comments are long, load-bearing, and the only
-//!    place the rotation rules are written down; a writer that reflowed them would destroy
-//!    more value than it added. The edit is a byte-splice at a located offset, never a
-//!    parse-and-re-emit of the file.
-//! 2. **ANCHORED, never a regex sweep.** The constant is found by scanning for a line that
-//!    is EXACTLY its declaration at column 0. A pattern loose enough to also match the
-//!    constant's *name inside its own doc comment* — which appears there repeatedly — is a
-//!    pattern that will one day edit a comment instead of a value.
-//! 3. **IDEMPOTENT.** A key that is already a member is a no-op ([`Edit::AlreadyPresent`]),
-//!    not a second entry. Running `setup` twice, or re-running `join` after an interrupted
-//!    run, must converge rather than accumulate: a duplicate member fails
-//!    `pins::tests::the_master_keyset_has_no_empty_members_and_no_duplicates` and,
-//!    semantically, records a rotation that never happened.
-//! 4. **ADDITIVE.** Existing members survive, in order, with the new key appended at the
-//!    TAIL. Index 0 is the head a rotation promotes deliberately; reordering it silently
-//!    would change which master a build names as current.
-//! 5. **REFUSE RATHER THAN GUESS.** Every shape this module does not recognise exactly —
-//!    a missing constant, two declarations of it, an unterminated block, an entry line
-//!    that is not a plain quoted literal with its trailing comma, a member that is already
-//!    the empty string — is an error naming the line, not a best-effort edit. A silently
-//!    mangled anchor file is worse than any manual step, which is the whole reason this
-//!    module is written this way and not with a regex.
-//!
-//! And then, because none of the above proves the bytes actually landed:
-//! [`verify_members`] re-reads what was written and checks the value it intended is the
-//! value now present. The caller runs it against the file on disk, not against the string
-//! it just built, so a truncated or racing write is caught rather than assumed away.
-//!
-//! # What this module deliberately does NOT do
-//!
-//! It does not commit, does not stage, and does not know what git is. Arming a trust
-//! anchor is a reviewed act: the tool edits the working tree and prints the diff to read.
+//! [`verify_members`] then re-reads the result, both the planned text and the file on disk.
+//! The writer never commits or stages: arming a trust anchor is a reviewed act.
 
 use crate::fsio::concat;
 
@@ -58,21 +33,16 @@ pub const MASTER_ANCHOR: &str = "PAPER_MASTER_PUBKEYS";
 /// enforces: a master rotation window holds at most two.
 pub const MAX_MASTER_MEMBERS: usize = 2;
 
-/// The exact number of base64 characters an Ed25519 public key encodes to (32 bytes → 44
-/// with one `=` of padding). `pins::tests::the_master_is_a_well_formed_base64_ed25519_key` asserts
-/// it; catching a wrong-length value HERE means it never reaches the file.
+/// Base64 characters in an Ed25519 public key (32 bytes, one `=` of padding), checked here so
+/// a wrong length never reaches the file.
 const KEY_B64_LEN: usize = 44;
 
-/// The default indent for a freshly opened block: four spaces, matching every other
-/// entry in `pins.rs`.
+/// The indent for a freshly opened block, matching `pins.rs`.
 const DEFAULT_INDENT: &str = "    ";
 
-/// Which of the two declaration spellings the constant currently uses.
-///
-/// Both are legal rustfmt output for the same type and both occur in `pins.rs` today, so
-/// both are handled — and NOTHING ELSE is. A third spelling (a `&[&str; N]` array, a
-/// single-line non-empty list, a `concat!`) is a shape this writer does not understand,
-/// and understanding-by-approximation is exactly the failure mode it exists to avoid.
+/// The two declaration spellings this writer edits, both legal rustfmt output and both in
+/// `pins.rs`. Any other (a `&[&str; N]` array, a one-line non-empty list, a `concat!`) is
+/// refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Form {
     /// `pub const NAME: &[&str] = &[];` — the empty, unpinned, single-line form.
@@ -98,28 +68,16 @@ pub struct Anchor {
     /// The `];` terminator line, including its newline. `None` for [`Form::EmptyInline`],
     /// which has no separate terminator.
     terminator: Option<Span>,
-    /// The indent existing entries use, reproduced for the appended one so the edit is
-    /// invisible in `git diff` except for the line it adds.
-    ///
-    /// Computed with [`str::trim_start`] and NOT as "length minus the length of the
-    /// two-ended trim". That arithmetic looks equivalent and is not: it adds the TRAILING
-    /// whitespace to the slice length while slicing from the START, so one stray space at
-    /// the end of a neighbouring line silently moved the cut into the line's content. The
-    /// consequence was not cosmetic — the indent became `    "cw` and every appended line
-    /// was emitted with those bytes as its prefix, producing a `pins.rs` that is not Rust,
-    /// on top of an anchor that had just been armed. On a line with a multibyte character
-    /// in the right place it panicked outright, mid-run, on a char boundary.
+    /// The indent existing entries use (by `leading_ws`), reproduced for the appended one so
+    /// `git diff` shows only the added lines.
     indent: String,
-    /// The line ending this file uses, reproduced by the appended lines. A file written
-    /// with CRLF gets CRLF back; splicing LF lines into it would leave mixed endings in a
-    /// trust anchor's diff for no reason.
+    /// The file's line ending, reproduced by the appended lines so a CRLF file stays CRLF.
     newline: &'static str,
 }
 
 impl std::fmt::Debug for Anchor {
-    /// Hand-written for the same reason as [`Edit`]'s: the members are the interesting
-    /// part, and a derived impl would carry byte offsets into a file nobody reading a
-    /// panic message has in front of them.
+    /// The members only: a derived impl would add byte offsets no reader of a panic message
+    /// can use.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Anchor(")?;
         f.write_str(&self.members.join(", "))?;
@@ -136,11 +94,9 @@ impl Anchor {
     }
 }
 
-/// Refuse a value that is not a base64 Ed25519 public key, BEFORE it can reach the file.
-///
-/// This is the same check `pins::tests::the_master_is_a_well_formed_base64_ed25519_key` runs, done
-/// early: a truncated paste that lands in the file fails closed at runtime with no hint
-/// that the VALUE, not the state, is wrong — and by then it is committed.
+/// Refuse a value that is not a base64 Ed25519 public key before it can reach the file: the
+/// check `pins::tests::the_master_is_a_well_formed_base64_ed25519_key` runs, done early, since
+/// a malformed key in the file fails closed at runtime with no hint that the value is wrong.
 pub fn vet_key(key: &str) -> Result<(), String> {
     if key.len() != KEY_B64_LEN {
         return Err(concat(&[
@@ -183,13 +139,9 @@ enum Entry {
 
 /// Classify one entry line, or `None` for a shape this writer will not edit around.
 ///
-/// The TRAILING COMMA is required rather than tolerated. Rust allows the last element to
-/// omit it, but an appended entry after a comma-less last member would have to modify that
-/// member's line too — and "the edit touches only the line it adds" is a property worth
-/// more than accepting a spelling rustfmt never produces here.
-///
-/// Escapes and inner quotes are refused outright: a base64 key contains neither, so their
-/// presence means this is not the literal list this writer thinks it is.
+/// The trailing comma is required: appending after a comma-less last member would edit that
+/// member's line too, and rustfmt never produces one here. Escapes and inner quotes are
+/// refused: a base64 key has neither.
 fn classify(trimmed: &str) -> Option<Entry> {
     if trimmed.is_empty() {
         return Some(Entry::Blank);
@@ -205,14 +157,9 @@ fn classify(trimmed: &str) -> Option<Entry> {
     Some(Entry::Member(inner.to_string()))
 }
 
-/// The leading whitespace of `text`, as a slice of it.
-///
-/// One line, its own function, because the obvious inline spelling of it
-/// (`&text[..text.len() - text.trim().len()]`) is wrong in a way that reads as right — see
-/// [`Anchor::indent`] for what that cost. Trimming one end and measuring from that same end
-/// is the only arithmetic that holds, and `trim_start` returns a suffix of `text`, so the
-/// difference of the lengths is exactly the leading run and always lands on a character
-/// boundary.
+/// The leading whitespace of `text`. `trim_start` returns a suffix, so the length difference
+/// is exactly the leading run and lands on a char boundary. `text.len() - text.trim().len()`
+/// would also count trailing whitespace, cutting into the content or off a char boundary.
 fn leading_ws(text: &str) -> &str {
     let n = text.len() - text.trim_start().len();
     &text[..n]
@@ -241,16 +188,14 @@ fn lines_with_spans(src: &str) -> Vec<(&str, Span)> {
 ///
 /// # Errors
 ///
-/// Every recognisable failure is named: absent, declared twice, declared in a spelling
-/// this writer does not understand, unterminated, or containing an entry line that is not
-/// a plain quoted literal. None of them is recoverable by guessing, which is why none of
-/// them is guessed at.
+/// Absent, declared twice, spelled in a form this writer does not know, unterminated, or
+/// holding an entry line that is not a plain quoted literal. None is guessed at.
 pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
     let lines = lines_with_spans(src);
     let decl_prefix = concat(&["pub const ", name, ":"]);
 
-    // A top-level item starts at column 0. Requiring that is what keeps this from ever
-    // matching the constant's own name inside its (very long) doc comment.
+    // A top-level item starts at column 0, which keeps this from matching the constant's
+    // name inside its doc comment.
     let mut found: Option<usize> = None;
     let mut count = 0usize;
     for (i, (text, _)) in lines.iter().enumerate() {
@@ -363,11 +308,8 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
     ]))
 }
 
-/// The result of planning an append. Nothing is written by planning.
-///
-/// `Debug` is hand-written rather than derived, and prints the OUTCOME plus the member
-/// list — never the file text. A derived one would dump an entire `pins.rs` into any panic
-/// message that formatted a `Result<Edit, _>`, which is noise no failure needs.
+/// Prints the outcome and members, never the file text: a derived impl would dump all of
+/// `pins.rs` into any panic message that formatted a `Result<Edit, _>`.
 impl std::fmt::Debug for Edit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -385,19 +327,19 @@ impl std::fmt::Debug for Edit {
     }
 }
 
+/// The result of planning an append. Nothing is written by planning.
 pub enum Edit {
-    /// The key is ALREADY a member — the idempotent outcome. Re-running `setup`, or
-    /// finishing an interrupted `join`, lands here rather than adding a second entry.
+    /// The key is already a member: the idempotent outcome of re-running `setup` or
+    /// finishing an interrupted `join`.
     AlreadyPresent { members: Vec<String> },
     /// The edit to write, and the members the file must hold afterwards.
     Changed { text: String, members: Vec<String> },
 }
 
-/// Plan an APPEND of `key` to the named anchor, with `comment` lines above it.
+/// Plan an append of `key` to the named anchor, with `comment` lines above it.
 ///
-/// Append, never insert and never replace: see rule 4 in the module doc. The head slot is
-/// a contract and this function cannot reach it — the only way `key` becomes the head is
-/// if the anchor was empty, which is the one case where there is no incumbent to strand.
+/// Append only (rule 4): `key` becomes the head only when the anchor was empty, with no
+/// incumbent to strand.
 pub fn append_member(
     src: &str,
     name: &str,
@@ -408,10 +350,8 @@ pub fn append_member(
     vet_key(key)?;
     let anchor = read_anchor(src, name)?;
 
-    // An anchor that is ALREADY in an illegal state is not one to append to. An empty
-    // member reads as "armed" to `roster_tier_armed()` / the client's keyset gate while
-    // authorizing nobody, so the file is a brick already and adding a good key beside the
-    // bad one would hide that rather than fix it.
+    // An empty member reads as armed to `roster_tier_armed()` while authorizing nobody: the
+    // file is already a brick, and a good key beside it would hide that.
     for (i, m) in anchor.members.iter().enumerate() {
         if m.is_empty() {
             return Err(concat(&[
@@ -458,10 +398,8 @@ pub fn append_member(
     let mut text = String::new();
     match anchor.form {
         Form::EmptyInline => {
-            // The one case where a line is REPLACED rather than added to: `= &[];` has no
-            // body to insert into, so it becomes the open form carrying one entry. The
-            // replacement reproduces the declaration verbatim, so the diff is this line
-            // plus the entry and nothing else.
+            // The one case where a line is replaced: `= &[];` has no body, so it becomes the
+            // open form carrying one entry, the declaration reproduced verbatim.
             let raw = &src[anchor.decl.start..anchor.decl.end];
             let nl = if raw.ends_with('\n') {
                 anchor.newline
@@ -491,13 +429,9 @@ pub fn append_member(
     let mut members = anchor.members;
     members.push(key.to_string());
 
-    // READ BACK WHAT WAS JUST BUILT, BEFORE OFFERING IT TO A CALLER THAT WILL WRITE IT.
-    //
-    // [`verify_members`] already checks the file after the write, which is the check that
-    // catches a short write or a racing editor. It is the WRONG place to catch a bad plan:
-    // by the time it fires, the damaged bytes are on disk and the anchor may already be
-    // armed. This is the same parse run against the string while it is still in memory, so
-    // a plan this module cannot read back is refused with the working tree untouched.
+    // Read the plan back before offering it to a caller that will write it: the post-write
+    // `verify_members` check fires only once damaged bytes are on disk, while this refuses an
+    // unreadable plan with the working tree untouched.
     verify_members(&text, name, &members).map_err(|e| {
         concat(&[
             "the edit this writer planned for `",
@@ -513,17 +447,13 @@ pub fn append_member(
     Ok(Edit::Changed { text, members })
 }
 
-/// THE PROOF THE VALUE IS THE VALUE: parse `src` and check the named anchor holds exactly
-/// `expected`, in order.
+/// Parse `src` and check the named anchor holds exactly `expected`, in order.
 ///
-/// Building a correct string and then writing it are two different claims, and this
-/// function is used to check BOTH — by [`append_member`] against the text it has just
-/// built (so a plan that cannot be read back never reaches the file at all) and by the
-/// caller against the bytes it has just read back from disk (so a short write, a full
-/// filesystem or a concurrent editor is caught rather than assumed away). The messages are
-/// therefore phase-neutral: each caller says which of the two it was doing, because
-/// "nothing has been written" and "the file on disk may be damaged" are opposite
-/// instructions and printing the wrong one is worse than printing neither.
+/// Used twice: by [`append_member`] on the text it built, so an unreadable plan never reaches
+/// the file, and by the caller on the bytes read back from disk, catching a short write, a full
+/// filesystem or a concurrent editor. The messages are phase-neutral and each caller says
+/// which phase failed: "nothing has been written" and "the file on disk may be damaged" are
+/// opposite instructions.
 pub fn verify_members(src: &str, name: &str, expected: &[String]) -> Result<(), String> {
     let anchor = read_anchor(src, name)
         .map_err(|e| concat(&["`", name, "` could not be read back: ", &e]))?;
@@ -560,22 +490,18 @@ pub fn verify_members(src: &str, name: &str, expected: &[String]) -> Result<(), 
 mod tests {
     use super::*;
 
-    /// The generic writer is exercised over a fixture constant (the real anchor is the
-    /// master, whose two-member ceiling would cramp these shape tests).
+    /// A fixture constant: the master's two-member ceiling would cramp these shape tests.
     const FIXTURE: &str = "FIXTURE_KEYS";
     const FIXTURE_MAX: usize = 4;
 
-    /// Obviously synthetic 44-character base64 keys. They are shaped like real anchors
-    /// (that is the point — the writer's shape checks must pass) and are used nowhere but
-    /// here.
+    /// Synthetic 44-character base64 keys, shaped like real anchors so the shape checks pass.
     const K1: &str = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=";
     const K2: &str = "bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=";
     const NEW: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const NEW2: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
 
-    /// A miniature `pins.rs` with the two real shapes: an empty master anchor and a
-    /// populated, comment-annotated channel keyset. Doc comments included, because
-    /// preserving them is a property under test.
+    /// A miniature `pins.rs` with both real shapes: an empty master anchor and a populated,
+    /// commented keyset. Its doc comments are there because preserving them is under test.
     fn fixture() -> String {
         String::from(
             "// Copyright 2026 Andrew Yates\n\
@@ -605,7 +531,6 @@ mod tests {
         }
     }
 
-    /// The two shapes in the real file are both read correctly, and the head is the head.
     #[test]
     fn both_declaration_shapes_are_read_and_the_head_is_index_zero() {
         let src = fixture();
@@ -618,8 +543,6 @@ mod tests {
         assert_eq!(channel.head(), Some(K1), "index 0 is the head");
     }
 
-    /// IDEMPOTENT. Appending the same key twice produces one entry, not two — and the
-    /// second call reports `AlreadyPresent` rather than silently rewriting the file.
     #[test]
     fn appending_the_same_key_twice_produces_one_entry() {
         let src = fixture();
@@ -644,15 +567,12 @@ mod tests {
             }
             Edit::Changed { .. } => panic!("a re-append must be a no-op, not a second entry"),
         }
-        // ...and re-reading the once-written text still sees exactly one.
+        // Re-reading the once-written text still sees exactly one.
         let after = read_anchor(&once, FIXTURE).unwrap();
         assert_eq!(after.members.iter().filter(|m| *m == NEW).count(), 1);
         assert_eq!(once.matches(NEW).count(), 1);
     }
 
-    /// ADDITIVE, AND THE HEAD SURVIVES IN THE HEAD SLOT. This is the property whose
-    /// violation wedges the fleet permanently, so it is asserted directly rather than
-    /// inferred from the member count.
     #[test]
     fn the_existing_keys_survive_and_the_head_stays_at_index_zero() {
         let src = fixture();
@@ -673,8 +593,6 @@ mod tests {
         assert_eq!(after2.members.len(), 4);
     }
 
-    /// The doc comments — the load-bearing part of this file — come through byte-identical,
-    /// and so does every line outside the one block that was edited.
     #[test]
     fn nothing_outside_the_edited_block_is_disturbed() {
         let src = fixture();
@@ -699,7 +617,7 @@ mod tests {
         assert!(text.contains("/// The paper master. Empty here, and therefore INERT."));
         assert!(text.contains("/// The channel keyset. ORDER IS A CONTRACT: index 0 is the head."));
         assert!(text.contains("pub const PKG_ROOT_PUBKEY: &str = \"whatever\";"));
-        // The OTHER anchor is untouched.
+        // The other anchor is untouched.
         assert!(
             read_anchor(&text, MASTER_ANCHOR)
                 .unwrap()
@@ -708,9 +626,8 @@ mod tests {
         );
     }
 
-    /// The empty single-line form becomes the open form carrying exactly one key, and its
-    /// doc comment — which mentions the constant's own name twice — is untouched. That
-    /// mention is why the locator anchors on a column-0 declaration.
+    /// The doc comment names the constant twice, which is why the locator anchors on a
+    /// column-0 declaration.
     #[test]
     fn the_empty_form_opens_into_a_one_member_list_without_touching_its_doc() {
         let src = fixture();
@@ -746,11 +663,8 @@ mod tests {
         assert!(text.ends_with("];"), "{text:?}");
     }
 
-    /// TRAILING WHITESPACE ON A NEIGHBOURING LINE DOES NOT REACH THE APPENDED ONE.
-    ///
-    /// An indent measured as `text.len() - text.trim().len()` from the START of the line
-    /// would count trailing whitespace and slice into the line's CONTENT, emitting a
-    /// `pins.rs` that is not Rust over a trust anchor.
+    /// An indent measured as `text.len() - text.trim().len()` from the start of the line
+    /// would count trailing whitespace and slice into the line's content.
     #[test]
     fn trailing_whitespace_on_a_neighbouring_line_does_not_poison_the_indent() {
         // Trailing whitespace after the comment, after the key, and after the declaration.
@@ -777,7 +691,7 @@ mod tests {
             members,
             vec![K1.to_string(), K2.to_string(), NEW.to_string()]
         );
-        // The appended lines carry the indent and NOTHING else.
+        // The appended lines carry the indent and nothing else.
         assert!(text.contains("\n    // m3\n"), "{text}");
         let mut entry = String::from("\n    \"");
         entry.push_str(NEW);
@@ -787,15 +701,12 @@ mod tests {
             !text.contains("\"cw//"),
             "no key bytes leaked into the comment: {text}"
         );
-        // And it reads back — which is what the writer's own pre-write check now enforces.
+        // And it reads back (the writer's pre-write check enforces this too).
         assert_eq!(read_anchor(&text, FIXTURE).unwrap().members, members);
     }
 
-    /// A MULTIBYTE CHARACTER PLUS TRAILING WHITESPACE DOES NOT PANIC.
-    ///
-    /// Same arithmetic, worse symptom: when the miscomputed offset landed inside a UTF-8
-    /// character the slice panicked mid-run, on a trust-anchor file, with a master live in
-    /// memory. `pins.rs`'s own keyset comments are full of em-dashes.
+    /// A miscomputed indent offset inside a UTF-8 character would panic, and `pins.rs`
+    /// comments are full of em-dashes.
     #[test]
     fn a_multibyte_comment_with_trailing_whitespace_does_not_panic() {
         let src = "pub const FIXTURE_KEYS: &[&str] = &[\n\
@@ -816,9 +727,8 @@ mod tests {
         assert_eq!(read_anchor(&text, FIXTURE).unwrap().members.len(), 2);
     }
 
-    /// A CRLF FILE KEEPS ITS CRLF ENDINGS. Cosmetic, but a trust anchor's diff is read by a
-    /// human deciding whether to arm a fleet, and mixed line endings in it are noise that
-    /// costs attention exactly where attention is scarce.
+    /// A trust anchor's diff is read by a human deciding whether to arm a fleet; mixed line
+    /// endings are noise there.
     #[test]
     fn a_crlf_file_keeps_its_line_endings() {
         let src = "pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\r\n\
@@ -848,7 +758,6 @@ mod tests {
         );
     }
 
-    /// REFUSE RATHER THAN GUESS: every unrecognised shape is an error naming what it saw.
     #[test]
     fn unrecognised_shapes_are_refused_not_guessed_at() {
         // Absent.
@@ -887,8 +796,7 @@ mod tests {
         assert!(err.contains("does not recognise"), "{err}");
         assert!(err.contains("SOME_OTHER_CONST"), "{err}");
 
-        // A member with no trailing comma: legal Rust, but not a line this writer will
-        // silently edit around.
+        // No trailing comma: legal Rust, but not a line to edit around.
         let no_comma = fixture().replace(
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\",",
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\"",
@@ -923,30 +831,25 @@ mod tests {
         let err = read_anchor(unterminated, FIXTURE).unwrap_err();
         assert!(err.contains("never closed"), "{err}");
 
-        // ...and NONE of these produced an edit. The negative control: the same file
-        // WITHOUT the damage plans successfully, so the refusals are about the damage.
+        // Negative control: the undamaged file plans, so the refusals are about the damage.
         assert!(append_member(&computed, FIXTURE, NEW, &[], 4).is_err());
         assert!(append_member(&fixture(), FIXTURE, NEW, &[], 4).is_ok());
     }
 
-    /// An anchor already holding an empty member is a brick; the writer refuses to append
-    /// beside it rather than hiding the damage under a good key.
     #[test]
     fn an_anchor_holding_an_empty_member_is_refused() {
         let bricked = fixture().replace(
             "    \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",",
             "    \"\",",
         );
-        // The read still succeeds — the shape is legal — so the refusal is a real decision
-        // and not a parse accident.
+        // The read succeeds (the shape is legal), so the refusal is a decision, not a parse
+        // accident.
         assert_eq!(read_anchor(&bricked, FIXTURE).unwrap().members[0], "");
         let err = append_member(&bricked, FIXTURE, NEW, &[], 4).unwrap_err();
         assert!(err.contains("empty string"), "{err}");
         assert!(err.contains("brick"), "{err}");
     }
 
-    /// A malformed key never reaches the file: the length, the padding and the alphabet
-    /// are all checked before any edit is planned.
     #[test]
     fn a_malformed_key_is_refused_before_any_edit_is_planned() {
         let src = fixture();
@@ -967,8 +870,7 @@ mod tests {
         assert!(append_member(&src, FIXTURE, "", &[], 4).is_err());
     }
 
-    /// The ceiling the pins tests enforce is enforced HERE, so the writer never produces
-    /// a file its own test suite rejects.
+    /// The writer enforces the pins tests' ceiling, so it never produces a file they reject.
     #[test]
     fn the_keyset_ceiling_is_enforced_by_the_writer() {
         let src = fixture();
@@ -983,8 +885,7 @@ mod tests {
         assert!(err.contains("rotation window"), "{err}");
     }
 
-    /// VERIFY-AFTER-WRITE actually verifies: it passes on the text that was intended, and
-    /// FAILS on text where the value is absent, altered, or reordered.
+    /// Passes on the intended text, fails where the value is absent, altered or reordered.
     #[test]
     fn verification_catches_a_write_that_did_not_land() {
         let src = fixture();
@@ -1020,10 +921,8 @@ mod tests {
         assert!(append_member(&src, FIXTURE, NEW, &["two\nlines"], FIXTURE_MAX).is_err());
     }
 
-    /// The REAL `pins.rs` — not a fixture — is a shape this writer understands, and the
-    /// keys it reads out of it are the keys the compiled constant holds. If this fails,
-    /// the file moved and the writer must be taught the new shape rather than left to
-    /// guess at it.
+    /// The real `pins.rs` reads back as what the compiler compiled in; if it changes shape,
+    /// teach the writer the new shape rather than let it guess.
     #[test]
     fn the_shipped_pins_file_is_a_shape_this_writer_understands() {
         let path = concat!(

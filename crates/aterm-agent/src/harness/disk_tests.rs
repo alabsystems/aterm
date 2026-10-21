@@ -1672,6 +1672,7 @@ fn the_claude_census_passes_over_its_own_process() {
             argv: vec!["claude".to_owned()],
             config: None,
             home: None,
+            stored_login: true,
         }),
         cwd: Some(PathBuf::from("/proj")),
         started: None,
@@ -1969,6 +1970,7 @@ fn a_session_cwd_on_a_share_or_an_automount_is_never_opened() {
         fstype: "nfs".to_owned(),
         local: false,
         automounted: false,
+        removable: false,
         read_only: false,
         container: None,
     });

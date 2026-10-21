@@ -1,89 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE APPLY LANE'S REFUSAL, IN WORDS A PERSON CAN ACT ON.
+//! The apply lane's refusal, in words a person can act on.
 //!
-//! The updater already knew everything in this module. `aterm ctl update status`
-//! prints `failing_applies=2 apply_failure="overlap handoff failed safely: handoff
-//! proof ended ChildDied"`, and the health ledger has carried both since the apply
-//! class was added. The WINDOW carried neither. Measured on the owner's own machine
-//! (2026-08-21): build 1787699398 sat staged for hours behind a plain "Update to
-//! v0.56.0" menu item while the engine had privately tried twice and watched
-//! the successor die both times — the machine was 8x-oversubscribed at the time, so
-//! the child was STARVED, not broken (fork-to-execve p99 goes from 6 ms to 206 ms
-//! under that load; `aterm-pty/src/unix.rs`). When the load stopped the same builds
-//! applied with no intervention at all.
+//! One value ([`ApplyTrouble`]) and one wording law. Every standing "an update is available"
+//! affordance (the macOS Version menu, the command palette's Version row, the native Settings
+//! `/updates` route, the update card) reads the same value and renders it at its own width, so
+//! no surface can claim a stage is merely waiting when the engine has already tried and failed.
 //!
-//! Nothing about that state was a mystery to the program, and nothing about it
-//! reached the person looking at it. A surface that says "Update ready" while the
-//! engine is on its second failed attempt is not merely incomplete — it is telling
-//! the user the opposite of what it knows.
+//! The wording obeys three rules:
 //!
-//! # What this module is
-//!
-//! One value ([`ApplyTrouble`]) and one wording law. Every standing "an update is
-//! available" affordance — the macOS Version menu, the command palette's Version
-//! row, the native Settings `/updates` route, the update card — reads the same value
-//! and renders it at its own width, so no surface can drift into claiming a stage is
-//! merely waiting when the engine has already tried and failed.
-//!
-//! # Three rules the wording obeys
-//!
-//! 1. **No internal text ever reaches the user.** Not the enum name — `ChildDied` is
-//!    a proof outcome, and "the new version did not finish starting" is the same
-//!    fact addressed to the person who has to decide what to do about it — and not
-//!    the ledger's own sentence either. THAT half is the one that is easy to get
-//!    backwards: an unrecognised reason must degrade to a bounded generic clause,
-//!    never fall through to its own prose, because the prose in that slot is
-//!    engineering text ("overlap handoff failed safely: a handed-off PTY session
-//!    closed before Commit") and a menu item that reads *the handoff failed safely*
-//!    is worse than the plain "Update ready" it replaced. [`CAUSES`] is keyed on
-//!    strings this program provably writes; everything else takes [`GENERIC`], and
-//!    [`ApplyTrouble::cause_is_named`] tells a surface with room to spare that it
-//!    should point at the log, where the untranslated text still is.
-//! 2. **A stage waiting for a QUIET WINDOW is not this.** That state is a REFUSAL
-//!    (`Deferred`/`Blocked` → `record_apply_refusal`), it deliberately advances no
-//!    streak, and it must keep reading as "ready". [`ApplyTrouble::new`] returns
-//!    `None` for zero attempts precisely so a patient updater cannot be painted as a
-//!    broken one.
-//! 3. **"It will retry" and "it will not" are different situations for the reader.**
-//!    One of them needs them to act and the other explicitly does not, so
-//!    [`ApplyRetry`] is carried, never inferred, and every rendering states it.
+//! 1. **No internal text reaches the user**: neither the enum name (`ChildDied`) nor the
+//!    ledger's own sentence, which is engineering prose ("overlap handoff failed safely: …").
+//!    [`CAUSES`] is keyed on strings this program writes; everything else takes [`GENERIC`],
+//!    and [`ApplyTrouble::cause_is_named`] tells a surface with room to point at the log.
+//! 2. **A stage waiting for a quiet window is not trouble.** That is a refusal
+//!    (`Deferred`/`Blocked` → `record_apply_refusal`) that advances no streak and keeps
+//!    reading as "ready": [`ApplyTrouble::new`] returns `None` for zero attempts.
+//! 3. **"It will retry" and "it will not" differ for the reader**, so [`ApplyRetry`] is
+//!    carried, never inferred, and every rendering states it.
 
-/// Whether the automatic apply lane is still going to try this exact staged build by
-/// itself, or whether it has stopped and is waiting to be asked.
-///
-/// This is the half of the state a person cannot guess and MUST know: one of these
-/// resolves itself while they keep working, and the other never will. The decision
-/// belongs to the event loop (a live `AutoApplyIntent`, or an `AutoApplyManualOnly`
-/// latch still carrying a lapse deadline, with automatic apply enabled in config), so
-/// it is passed in rather than re-derived here — the same facts
-/// `App::react_to_update_apply_outcome` already consults before deciding whether a
-/// failure is even worth a pill.
+/// Whether the automatic apply lane will still try this exact staged build by itself, or has
+/// stopped and waits to be asked. The event loop decides (a live `AutoApplyIntent`, or an
+/// `AutoApplyManualOnly` latch with a lapse deadline, with automatic apply enabled), so it is
+/// passed in, from the facts `App::react_to_update_apply_outcome` consults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ApplyRetry {
-    /// The cause is a PERSON's to change — the copy in /Applications is not the
-    /// signed release, so no lane can install over it (2026-09-14), or its
-    /// folder cannot be written by this user (round eight, finding 14) — and no
-    /// retry will succeed until they do. The surfaces say the remedy instead of
-    /// a promise, and the remedy is the one the standing block names
-    /// ([`PersonRemedy`]): never re-derived from whatever reason the ledger
-    /// booked last, which an attempt that failed for another reason before it
-    /// reached the refusal rewrites while the block stands.
+    /// The cause is a person's to change (the installed copy cannot be the swap's rollback
+    /// source, or its folder is not writable by this user) and no retry succeeds until they
+    /// do. Surfaces say the remedy the standing block names ([`PersonRemedy`]), never one
+    /// re-derived from the ledger's latest reason.
     NeedsPerson(PersonRemedy),
-    /// The lane still intends this artifact: a live intent, or a latch with a lapse
-    /// deadline, both of which `about_to_wait` comes back to. The honest advice is
-    /// "nothing to do".
-    ///
-    /// The two carriers reach the loop differently and the wording is chosen to be
-    /// true of BOTH. An intent's `retry_at` is folded into the event loop's own
-    /// deadline (`fold_auto_apply_deadline`), so that one is genuinely armed to
-    /// the second; a manual-only latch is released by
-    /// `lapse_expired_auto_apply_manual_only`, which runs at the top of
-    /// `arm_native_auto_apply` — i.e. the next time the lane is asked about this
-    /// artifact at all, which on a perfectly idle machine is the next background
-    /// check rather than the latch's own deadline. "By itself" covers both; "a wake
-    /// is armed for this instant" would have been a promise only one of them keeps.
+    /// The lane still intends this artifact: a live intent or a latch with a lapse deadline,
+    /// both of which `about_to_wait` comes back to ("nothing to do"). The wording is true of
+    /// both: an intent's `retry_at` is folded into the loop's deadline
+    /// (`fold_auto_apply_deadline`), while a manual-only latch is released by
+    /// `lapse_expired_auto_apply_manual_only` at the top of `arm_native_auto_apply`, the next
+    /// time the lane is asked (on an idle machine, the next background check). "By itself"
+    /// covers both; a promised wake instant would not.
     Scheduled,
     /// The manual-only latch holds with no lapse deadline (or automatic apply is
     /// switched off): this build moves only when the person asks it to.
@@ -95,18 +49,12 @@ pub(crate) enum ApplyRetry {
     NewerRelease,
 }
 
-/// WHAT A PERSON DOES about a refusal only a person can clear, carried by
-/// [`ApplyRetry::NeedsPerson`] from the block that answered it (round eight,
-/// finding 14's review).
-///
-/// It used to be read off the ledger's latest reason at render time. While a
-/// folder's block stands, the person's own retry can fail for an ordinary
-/// reason before the folder is asked (the apply lock's wait or the staged
-/// copy's `codesign` running past its budget, a capture refusal): the ledger
-/// then books that reason, the block rightly holds, and every surface sent
-/// the person to "install the signed release" — for a copy that is fine, into
-/// a folder they cannot write. The remedy is the block's; the CAUSE clause
-/// still says how the last attempt ended.
+/// What a person does about a refusal only a person can clear, carried by
+/// [`ApplyRetry::NeedsPerson`] from the block that answered it. Not read off the ledger's
+/// latest reason: while a folder's block stands, the person's own retry can fail for an
+/// ordinary reason first (the apply lock's wait, `codesign` past its budget, a capture
+/// refusal), and the remedy stays the block's; the cause clause still says how the last
+/// attempt ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PersonRemedy {
     /// The install location's folder cannot be written by this user
@@ -158,39 +106,30 @@ impl PersonRemedy {
     }
 }
 
-/// A STANDING apply-lane failure for the build a surface is currently offering.
-///
-/// Constructed only through [`ApplyTrouble::new`], which enforces the "at least one
-/// real attempt" rule. The three fields are exactly the three things the field report
-/// says were missing from the window: how many times, why, and whether it will happen
-/// again without the user.
+/// A standing apply-lane failure for the build a surface is offering: how many times, why, and
+/// whether it will happen again without the user. Constructed only through
+/// [`ApplyTrouble::new`], which enforces the at-least-one-attempt rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApplyTrouble {
-    /// Consecutive failed applies OF THE ARTIFACT ON OFFER — the ledger's
-    /// `apply_failures_for_target`, not the running-build-scoped escalation streak.
-    /// Always `>= 1`.
+    /// Consecutive failed applies of the artifact on offer (the ledger's
+    /// `apply_failures_for_target`, not the running-build-scoped escalation streak). Always
+    /// `>= 1`.
     attempts: u32,
-    /// The ledger's own `last_apply_error` prose — the raw `apply_failure=` value.
-    /// Kept verbatim so the mapping to human words happens at render time and the
-    /// untranslated text stays available to the log and the control verb; no
-    /// rendering here ever prints it.
+    /// The ledger's own `last_apply_error` prose, the raw `apply_failure=` value, kept verbatim
+    /// for the log and the control verb; no rendering here prints it.
     reason: String,
     /// Whether the automatic lane will try again unaided.
     retry: ApplyRetry,
-    /// HOW LONG until the scheduled retry, when the lane can say (2026-09-14, audit
-    /// OBS-5): a six-hour stand-down used to read exactly like a two-minute one —
-    /// "It will try again by itself." — and the horizon lived only in the log.
-    /// `None` keeps the bare promise (a latch the next background check releases).
+    /// How long until the scheduled retry, when the lane can say, so a six-hour stand-down does
+    /// not read like a two-minute one. `None` keeps the bare promise (a latch the next
+    /// background check releases).
     retry_in: Option<std::time::Duration>,
 }
 
-/// `(full clause, short clause)` for a reason this program does not recognise.
-///
-/// TRUE OF EVERY MEMBER OF THE SET, which is what makes it safe to say when the
-/// specific answer is unavailable: every string that reaches this slot is an apply
-/// that was attempted and did not complete. It is deliberately not a guess at a
-/// mechanism — "it did not start" would be wrong for an adoption mismatch and for a
-/// preflight that went stale before anything was spawned.
+/// `(full clause, short clause)` for a reason this program does not recognise: true of every
+/// string that reaches this slot (an apply attempted that did not complete) and no guess at a
+/// mechanism ("it did not start" would be wrong for an adoption mismatch or a stale
+/// preflight).
 const GENERIC: (&str, &str) = ("it did not finish installing", "didn\u{2019}t finish");
 
 /// The open tabs' records over what one handover carries, in a person's
@@ -199,39 +138,22 @@ const GENERIC: (&str, &str) = ("it did not finish installing", "didn\u{2019}t fi
 pub(crate) const TABS_OVER_HANDOVER: &str =
     "too many tabs were open to move to the new version at once";
 
-/// The apply outcomes this program can actually name, as
-/// `(a substring of a real ledger reason, full clause, short clause)`.
+/// The apply outcomes this program can name, as `(a substring of a real ledger reason, full
+/// clause, short clause)`.
 ///
-/// # Keyed on the DATA, because the type never gets here
+/// Keyed on the data, not on `UpdateHandoffOutcome`: only the readiness wait
+/// (`app_update_handoff.rs`, `format!("handoff proof ended {outcome:?}")`) stamps a variant
+/// name, and every other failure is free-form prose under `"overlap handoff failed safely:
+/// {detail}"`. The rows are substrings from the producers, named above each group, and the
+/// tests replay each literal (`REAL_LEDGER_REASONS`) through [`clauses`]. An unlisted reason
+/// takes [`GENERIC`], so the apply lane can grow new prose without this table in lockstep.
 ///
-/// The obvious table — one row per `UpdateHandoffOutcome` variant, matched on its
-/// `Debug` spelling — is wrong, and wrong in the direction that ships a regression.
-/// Exactly ONE producer stamps a variant name into the string that reaches the
-/// ledger (`app_update_handoff.rs`, the readiness wait: `format!("handoff proof
-/// ended {outcome:?}")`). Every other failure arrives as free-form prose wrapped in
-/// `format!("overlap handoff failed safely: {detail}")`, so a `contains("Rejected")`
-/// row is dead code while the four commonest rejections — the ones spelled "final
-/// handoff admission rejected before Commit" and friends — fall through to whatever
-/// the fallback does. When that fallback was "show the reason verbatim", the Version
-/// menu read "⬆️ Update to v0.56.0 — tried twice, overlap handoff failed safely: a
-/// handed-off PTY session closed before Commit; retrying on its own" (the tail has
-/// since become "will try again").
-///
-/// So the rows below are keyed on substrings taken from the producers themselves,
-/// each named in the comment above its group, and this module's tests replay every
-/// one of those literals (`REAL_LEDGER_REASONS`) through [`clauses`]. An unlisted
-/// reason is not a bug — it takes [`GENERIC`] and the surface points at the log —
-/// which is what makes it safe for the apply lane to grow new failure prose without
-/// this table being updated in lockstep.
-///
-/// FIRST MATCH WINS, and the order encodes one real overlap: "structural activity
-/// revoked handoff before Commit" contains both `activity revoked` and `before
-/// Commit`, and its typed outcome is `ActivityRevoked`, so the activity rows come
-/// first.
+/// First match wins. "structural activity revoked handoff before Commit" contains both
+/// `activity revoked` and `before Commit` and is typed `ActivityRevoked`, so the activity rows
+/// come first.
 const CAUSES: &[(&str, &str, &str)] = &[
-    // ── The successor's own verdict. `wait_handoff_ready` returns one of five
-    // variants and `run_handoff_decision` stamps its Debug name; these are the only
-    // reasons in the whole set that carry a type name at all.
+    // ── The successor's own verdict: `wait_handoff_ready` returns one of five variants and
+    // `run_handoff_decision` stamps its Debug name, the only reasons that carry a type name.
     (
         "handoff proof ended ChildDied",
         "the new version did not finish starting",
@@ -292,12 +214,11 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "the handover was called off before it finished",
         "handover called off",
     ),
-    // ── The park's capture REFUSED the desk (the 2026-09-22/23 update audit,
-    // plan P0-3): `CaptureRefusal`'s Display, "the park's capture refused session
-    // 3: …" or "the park's capture refused: handoff layout could not be committed
-    // canonically; …", on both lanes. Ahead of the preparation rows on purpose —
-    // the layout refusal also contains "handoff layout", and it is not a set-up
-    // failure: the lane is waiting for the desk to change.
+    // ── The park's capture refused the desk: `CaptureRefusal`'s Display ("the park's capture
+    // refused session 3: …" or "the park's capture refused: handoff layout could not be
+    // committed canonically; …"), on both lanes. Ahead of the preparation rows: the layout
+    // refusal also contains "handoff layout" and is no set-up failure (the lane waits for the
+    // desk to change).
     (
         "the park's capture refused session",
         "a session\u{2019}s screen could not be captured for the handover",
@@ -316,9 +237,9 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "the open tabs could not be captured for the handover",
         "couldn\u{2019}t capture the tabs",
     ),
-    // ── THIS process could not hold the park long enough: the fork lane's
-    // worker gave up waiting for it ("the outgoing process did not park within
-    // 240 s"), typed TimedOut since plan P1-2. The terminal never went quiet.
+    // ── This process could not hold the park long enough: the fork lane's worker gave up
+    // waiting ("the outgoing process did not park within N s"), typed `TimedOut`. The terminal
+    // never went quiet.
     (
         "did not park within",
         "the terminal was too busy to hand over",
@@ -331,49 +252,42 @@ const CAUSES: &[(&str, &str, &str)] = &[
         TABS_OVER_HANDOVER,
         "too many tabs",
     ),
-    // The same fact since the park reads the dialled claim's own limit (round
-    // six of the update audit): one message or the chunked grant.
+    // The same fact where the park reads the dialled claim's own limit (one message or the
+    // chunked grant).
     (
         "descriptor grant carries",
         TABS_OVER_HANDOVER,
         "too many tabs",
     ),
-    // The open tabs' records over the manifest's cap with every optional part
-    // shed (`WriteOutgoingFailure::ManifestOverCap`, round seven, item 108):
-    // ahead of the "authenticated handoff manifest" row it also contains, as
-    // closing tabs is what moves it.
+    // The open tabs' records over the manifest's cap with every optional part shed
+    // (`WriteOutgoingFailure::ManifestOverCap`): ahead of the "authenticated handoff manifest"
+    // row it also contains, as closing tabs is what moves it.
     ("records are over the", TABS_OVER_HANDOVER, "too many tabs"),
-    // ── Preparation, all of it BEFORE any successor existed
-    // (`send_handoff_preparation_failure` for the candidate's pre-park
-    // verification; `send_handoff_producer_failure` and the park's own
-    // `ProducerFailed` stand-downs for this process's writes and descriptors,
-    // each carrying its `io::ErrorKind` since plan P1-2; plus the descriptor
-    // transfer on the out-of-band lane). Nothing was started, so nothing
-    // "failed to start".
-    // ── A check that did not FINISH (round four of the 2026-09 update
-    // robustness work, plan item 2): `aterm_update::PASSING_REFUSAL_KEY`, which
-    // `aterm-update`'s verifier appends to a helper past its budget or ceiling,
-    // a helper the kernel would not start just then, and the apply lock held
-    // past its wait. Ahead of every preparation row, the installed-copy one
-    // included: such a reason says nothing about either bundle, and the lane
-    // retries it by itself.
+    // ── Preparation, all of it before any successor existed
+    // (`send_handoff_preparation_failure` for the candidate's pre-park verification;
+    // `send_handoff_producer_failure` and the park's `ProducerFailed` stand-downs for this
+    // process's writes and descriptors, each with its `io::ErrorKind`; the descriptor transfer
+    // on the out-of-band lane). Nothing was started, so nothing "failed to start".
+    // ── A check that did not finish: `aterm_update::PASSING_REFUSAL_KEY`, which the verifier
+    // appends for a helper past its budget or ceiling, a helper the kernel would not start
+    // just then, and the apply lock held past its wait. Ahead of every preparation row, the
+    // installed-copy one included: it says nothing about either bundle, and the lane retries
+    // it by itself.
     (
         aterm_update::PASSING_REFUSAL_KEY,
         "the new version could not be checked just then",
         "couldn\u{2019}t check it just then",
     ),
-    // ── The INSTALLED copy cannot be the swap's rollback source (2026-09-14):
-    // `install::rollback_source_refusal`, both lanes. This is the historical
-    // failure, not evidence that the source is still broken. Only the current
-    // NeedsPerson policy carries repair advice in the next-step clause.
+    // ── The installed copy cannot be the swap's rollback source:
+    // `install::rollback_source_refusal`, both lanes. The clause states the failure, not that
+    // the source is still broken; only a current `NeedsPerson` policy carries repair advice.
     (
         "cannot be the rollback source",
         "the installed copy could not be verified for replacement",
         "installed copy did not verify",
     ),
-    // ── The install's FOLDER cannot be written (round seven, #3):
-    // `install::install_location_refusal`, asked before the park. An admin-owned
-    // or MDM-managed /Applications run by a standard user.
+    // ── The install's folder cannot be written: `install::install_location_refusal`, asked
+    // before the park (an admin-owned or MDM-managed /Applications run by a standard user).
     (
         aterm_update::INSTALL_LOCATION_REFUSAL_KEY,
         "aterm could not write to the folder it is installed in",
@@ -424,8 +338,8 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "the handover could not be set up",
         "couldn\u{2019}t be set up",
     ),
-    // The proof deadline ran out in THIS process before the grant was sent —
-    // after the successor dialed (round six of the update audit, item 48).
+    // The proof deadline ran out in this process before the grant was sent, after the
+    // successor dialed.
     (
         "proof deadline passed before the grant was sent",
         "the terminal was too busy to hand over",
@@ -462,20 +376,18 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "couldn\u{2019}t be set up",
     ),
     // ── The outgoing process's own capture refused itself: `screen_digest_refs`
-    // (`seamless.rs`) names the session, the field and the bound — "visible
-    // checkpoint set could not be committed canonically: session 0: meta out of
-    // bounds at 55x149 with 0 carried line(s): …" — and the park stands the held
-    // successor down. Twice now (the alt blob, 2026-08-24; the DECSC slot,
-    // 2026-09-22) this class sat under GENERIC with no next step.
+    // (`seamless.rs`) names the session, field and bound ("visible checkpoint set could not be
+    // committed canonically: session 0: meta out of bounds at 55x149 with 0 carried line(s):
+    // …"), and the park stands the held successor down.
     (
         "could not be committed canonically",
         "a session\u{2019}s screen could not be captured for the handover",
         "couldn\u{2019}t capture a session",
     ),
-    // ── Not the GUI's lane at all: `aterm-update`'s own boot-trial recovery writes
-    // this slot too (`install.rs`, both arms end "disarmed the boot sentinel to keep
-    // updates possible"). The update was installed, would not prove itself across
-    // three launches, and the machine is back on this build.
+    // ── Not the GUI's lane: `aterm-update`'s boot-trial recovery writes this slot too
+    // (`install.rs`, both arms end "disarmed the boot sentinel to keep updates possible"). The
+    // update installed, would not prove itself across three launches, and the machine is back
+    // on this build.
     (
         "disarmed the boot sentinel",
         "the new version would not run and aterm went back to this one",
@@ -483,21 +395,16 @@ const CAUSES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// `(full clause, short clause)` for a ledger reason.
-///
-/// An unrecognised reason takes [`GENERIC`]. It does NOT fall through to its own
-/// text: this slot holds engineering prose written for a log ("overlap handoff failed
-/// safely: …", "updater apply preflight became stale"), and the surfaces that render
-/// it are a macOS menu item, a palette row and a one-line Settings detail. See
-/// [`CAUSES`].
+/// `(full clause, short clause)` for a ledger reason; an unrecognised one takes [`GENERIC`],
+/// never its own log prose (see [`CAUSES`]).
 fn clauses(reason: &str) -> (String, String) {
     let (full, short) = named_cause(reason).unwrap_or(GENERIC);
     (full.to_string(), short.to_string())
 }
 
-/// The full clause for a reason this program can NAME, or `None` — for a
-/// record that already says the attempt did not finish, where [`GENERIC`]
-/// would only repeat its title. The raw reason stays in aterm.log.
+/// The full clause for a reason this program can name, or `None`, for a record that already
+/// says the attempt did not finish, where [`GENERIC`] would only repeat its title. The raw
+/// reason stays in aterm.log.
 pub(crate) fn named_clause(reason: &str) -> Option<&'static str> {
     named_cause(reason).map(|(full, _)| full)
 }
@@ -526,10 +433,7 @@ fn about(wait: std::time::Duration) -> String {
     }
 }
 
-/// "once" / "twice" / "3 times" — a count a sentence can contain.
-///
-/// The first two have words in English and the rest do not; writing "1 times" in a
-/// line the user reads is the kind of thing that makes a program feel unattended.
+/// "once" / "twice" / "3 times": a count a sentence can contain.
 fn times(attempts: u32) -> String {
     match attempts {
         1 => "once".to_string(),
@@ -539,15 +443,10 @@ fn times(attempts: u32) -> String {
 }
 
 impl ApplyTrouble {
-    /// The standing trouble for a staged build, or `None` when there is none.
-    ///
-    /// `None` for zero attempts is the whole of rule 2 in the module docs: a stage
-    /// that has been DEFERRED (waiting for a quiet window) or BLOCKED advances no
-    /// streak — those are recorded as refusals — so zero attempts really does mean
-    /// "nothing has gone wrong yet", and that state must keep reading as ready.
-    ///
-    /// The caller supplies current retry policy. A historical installed-source
-    /// failure cannot override a later verified repair that restored scheduling.
+    /// The standing trouble for a staged build, or `None` when there is none. Zero attempts is
+    /// `None` (rule 2 of the module docs): a deferred or blocked stage advances no streak. The
+    /// caller supplies the current retry policy, so a historical installed-source failure
+    /// cannot override a later repair that restored scheduling.
     #[must_use]
     pub(crate) fn new(attempts: u32, reason: &str, retry: ApplyRetry) -> Option<Self> {
         (attempts > 0).then(|| Self {
@@ -567,18 +466,14 @@ impl ApplyTrouble {
         self
     }
 
-    /// Whether this program could name the cause, or fell back to [`GENERIC`].
-    ///
-    /// A surface with a line to spend uses it to point at the log — which is where
-    /// the untranslated reason still is — so degrading safely never means silently
-    /// dropping the only explanation the machine has.
+    /// Whether this program could name the cause, or fell back to [`GENERIC`]; a surface with a
+    /// line to spend then points at the log, where the untranslated reason is.
     #[must_use]
     pub(crate) fn cause_is_named(&self) -> bool {
         named_cause(&self.reason).is_some()
     }
 
-    /// The clause that says what happens NEXT — the half that decides whether the
-    /// reader has to do anything.
+    /// The clause that says what happens next: whether the reader has to do anything.
     fn next_step(&self) -> String {
         match (self.retry, self.retry_in) {
             (ApplyRetry::Scheduled, Some(wait)) => {
@@ -594,20 +489,16 @@ impl ApplyTrouble {
         }
     }
 
-    /// Whether the standing reason is one only a person can clear (the installed
-    /// copy is not the signed release): the surfaces stop promising a retry and
-    /// the auto-apply lane stops scheduling one.
+    /// Whether the standing reason is one only a person can clear
+    /// (`aterm_update::refusal_needs_person`): the surfaces stop promising a retry and the
+    /// auto-apply lane stops scheduling one.
     #[must_use]
     pub(crate) fn needs_person(reason: &str) -> bool {
         aterm_update::refusal_needs_person(reason)
     }
 
-    /// The full sentence, for a detail row that has a line to spend: attempts, cause,
-    /// and what happens next.
-    ///
-    /// This is the string the field report was missing. Reading it, the owner would
-    /// have known at a glance that the two invisible attempts had happened and that
-    /// the successor was dying rather than being refused.
+    /// The full sentence, for a detail row with a line to spend: attempts, cause, and what
+    /// happens next.
     #[must_use]
     pub(crate) fn sentence(&self) -> String {
         let (full, _) = clauses(&self.reason);
@@ -618,11 +509,10 @@ impl ApplyTrouble {
         )
     }
 
-    /// The one-line tail for a MENU ROW ("Install aterm vX — tried twice, didn't
-    /// start; will try again"): a Version-menu item and the palette row that mirrors
-    /// it are single lines with no room for a sentence, and both are the control that
-    /// retries (a build on hold's row opens the details instead), so the tail ends on
-    /// what happens next, in the update row's words (2026-09-23), never "apply".
+    /// The one-line tail for a menu row ("Install aterm vX — tried twice, didn't start; will
+    /// try again"). The Version-menu item and its palette mirror are single lines and are the
+    /// control that retries (a held build's row opens the details instead), so the tail ends
+    /// on what happens next, in the update row's words, never "apply".
     #[must_use]
     pub(crate) fn row_tail(&self) -> String {
         let (_, short) = clauses(&self.reason);
@@ -649,10 +539,9 @@ impl ApplyTrouble {
         format!("Tried {}, {short} \u{b7} {next}.", times(self.attempts))
     }
 
-    /// The tersest truthful rung, for a status card that has ~16 characters (a
-    /// compact host at 2x Dynamic Type). The COUNT survives to the last rung: it is
-    /// the single fact that separates "downloaded, waiting for you" from "tried and
-    /// failed", which is the whole point of this module.
+    /// The tersest truthful rung, for a status card with ~16 characters (a compact host at 2x
+    /// Dynamic Type). The count survives: it separates "downloaded, waiting for you" from
+    /// "tried and failed".
     #[must_use]
     pub(crate) fn micro(&self) -> String {
         if self.attempts == 1 {
@@ -667,19 +556,11 @@ impl ApplyTrouble {
 mod tests {
     use super::{ApplyRetry, ApplyTrouble, GENERIC, PersonRemedy, clauses};
 
-    /// EVERY REASON THIS PROGRAM CAN ACTUALLY WRITE INTO `last_apply_error`, copied
-    /// from the producers.
-    ///
-    /// The list is the point of the test below, so it is worth saying where each
-    /// line comes from: everything up to the boot-trial pair is a
-    /// `UpdateHandoffCompletion` `detail` from `app_update_handoff.rs`, which
-    /// `App::finish_update_handoff` wraps in `"overlap handoff failed safely: "`
-    /// before it reaches `record_apply_failure`; the last two are written by
-    /// `aterm-update`'s own `install.rs` when a boot trial cannot be recovered.
-    ///
-    /// A table written from the TYPE instead of from this data had six rows, two of
-    /// which (`PreparationFailed`, `Rejected`) could never match anything, and let
-    /// nine of these strings through verbatim into a menu item.
+    /// Every reason this program can write into `last_apply_error`, copied from the producers.
+    /// Up to the boot-trial pair, each is a `UpdateHandoffCompletion` `detail` from
+    /// `app_update_handoff.rs`, which `App::finish_update_handoff` wraps in
+    /// `"overlap handoff failed safely: "` before `record_apply_failure`; the last two come from
+    /// `aterm-update`'s `install.rs` when a boot trial cannot be recovered.
     const REAL_LEDGER_REASONS: &[&str] = &[
         // `run_handoff_decision`: format!("handoff proof ended {proof_outcome:?}")
         // over the five variants `wait_handoff_ready` can return.
@@ -723,12 +604,11 @@ mod tests {
         "overlap handoff failed safely: could not create the handoff-commit channel",
         "overlap handoff failed safely: handoff process could not start: \
          Resource temporarily unavailable (os error 35)",
-        // `ProducerFailed` (plan P1-2): this process's own writes, pipes and
-        // descriptors, each carrying its `io::ErrorKind`, and the park's own
-        // stand-downs.
+        // `ProducerFailed`: this process's own writes, pipes and descriptors, each carrying
+        // its `io::ErrorKind`, and the park's own stand-downs.
         "overlap handoff failed safely: could not write the authenticated handoff manifest \
          (storage full)",
-        // `ManifestOverCap`, filed `CaptureRefused` (round seven, item 108).
+        // `ManifestOverCap`, filed `CaptureRefused`.
         "overlap handoff failed safely: could not write the authenticated handoff manifest \
          (the open tabs' records are over the 4194304-byte limit one handover carries)",
         "overlap handoff failed safely: could not write the attempt-bound handoff layout \
@@ -746,11 +626,10 @@ mod tests {
          manifest into",
         "overlap handoff failed safely: event loop closed before the park",
         "overlap handoff failed safely: the attempt record was dropped before the park",
-        // The fork lane's hold deadline, `TimedOut` since plan P1-2.
+        // The fork lane's hold deadline, typed `TimedOut`.
         "overlap handoff failed safely: the outgoing process did not park within 120 s",
-        // `CaptureRefused` (plan P0-3): the launched lane's stand-down detail,
-        // and the fork lane's synchronous message (no prefix), both from
-        // `CaptureRefusal`'s Display.
+        // `CaptureRefused`: the launched lane's stand-down detail and the fork lane's
+        // synchronous message (no prefix), both `CaptureRefusal`'s Display.
         "overlap handoff failed safely: the park's capture refused session 3: visible \
          checkpoint set could not be committed canonically: too many sessions; update \
          handoff stayed in place; the lane retries once the desk changes",
@@ -765,13 +644,12 @@ mod tests {
          tab an update can carry",
         "the park's capture refused session 7: visible checkpoint set could not be committed \
          canonically: duplicate local id 7; update handoff stayed in place",
-        // `screen_digest_refs`, via the park: the refusal names the session, the
-        // field and the bound (measured 2026-09-22).
+        // `screen_digest_refs`, via the park: the refusal names the session, field and bound.
         "overlap handoff failed safely: visible checkpoint set could not be committed \
          canonically: session 0: meta out of bounds at 55x149 with 0 carried line(s): \
          saved_cursor_main.cursor_row=55 must be below rows=55",
-        // A pre-park check that did not finish (round four, plan item 2): the
-        // verifier's budget, and the apply lock a sibling held.
+        // A pre-park check that did not finish: the verifier's budget, and the apply lock a
+        // sibling held.
         "overlap handoff failed safely: staged update failed pre-park verification: bundle \
          policy: codesign --verify (team-pinned) ran past this apply's verification budget; \
          treating as a rejection (a passing condition, not a verdict on the update)",
@@ -789,13 +667,8 @@ mod tests {
          sentinel to keep updates possible",
     ];
 
-    /// THE REGRESSION THIS TABLE EXISTS TO PREVENT: internal prose in a menu item.
-    ///
-    /// Every string above is one this program provably writes. None of them may
-    /// survive into any rendering, and the two that a reader would find most
-    /// alarming — "failed safely" (a sentence that tells you the failure succeeded)
-    /// and "Commit" — are named explicitly because they are what the verbatim
-    /// fallback actually put on screen.
+    /// No reason this program writes survives into any rendering, nor its most alarming words
+    /// ("failed safely", "Commit").
     #[test]
     fn no_reason_this_program_writes_can_reach_a_surface_verbatim() {
         for reason in REAL_LEDGER_REASONS {
@@ -834,11 +707,8 @@ mod tests {
         }
     }
 
-    /// …and each of them maps to the RIGHT cause, not merely to a safe one.
-    ///
-    /// Degrading to the generic clause is the safety net, so a table that matched
-    /// nothing at all would still pass the test above. This is the one that says the
-    /// net is not carrying the whole load.
+    /// Each real reason maps to the right cause, not merely a safe one (a table that matched
+    /// nothing would still pass the test above).
     #[test]
     fn apply_lane_reasons_this_program_can_actually_write_map_to_the_right_cause() {
         let full = |reason: &str| clauses(reason).0;
@@ -852,8 +722,8 @@ mod tests {
             short("overlap handoff failed safely: handoff proof ended ChildDied"),
             "didn\u{2019}t start"
         );
-        // A TIMEOUT AND A DEATH ARE DIFFERENT ADVICE: one says "the machine was
-        // loaded", the other says "the successor could not run at all".
+        // A timeout ("the machine was loaded") and a death ("the successor could not run")
+        // are different advice.
         assert_eq!(
             full("overlap handoff failed safely: handoff proof ended TimedOut"),
             "the new version did not finish starting in time"
@@ -869,10 +739,9 @@ mod tests {
             full("overlap handoff failed safely: handoff proof ended AdoptionMismatch"),
             "the new version did not take over the open sessions"
         );
-        // ACTIVITY WINS OVER "before Commit". "structural activity revoked handoff
-        // before Commit" contains both markers and its typed outcome is
-        // ActivityRevoked — the reader's situation is "your terminal was busy",
-        // which is self-correcting, not "something refused the handover".
+        // Activity wins over "before Commit": "structural activity revoked handoff before
+        // Commit" carries both markers and is typed ActivityRevoked, and "your terminal was
+        // busy" corrects itself.
         assert_eq!(
             full(
                 "overlap handoff failed safely: structural activity revoked handoff before Commit"
@@ -894,8 +763,8 @@ mod tests {
             full("overlap handoff failed safely: main-thread final handoff decision timed out"),
             "the handover was called off before it finished"
         );
-        // NOTHING WAS EVER STARTED on the preparation lane, so none of these may
-        // borrow the "did not start" wording.
+        // Nothing was started on the preparation lane, so none of these borrows the "did not
+        // start" wording.
         for prepared in [
             "overlap handoff failed safely: could not persist the bounded handoff layout",
             "overlap handoff failed safely: could not create the adoption-proof channel",
@@ -915,8 +784,8 @@ mod tests {
             ),
             "the new version would not run and aterm went back to this one"
         );
-        // THIS PROCESS'S OWN FAILURES (plan P1-2) are set-up failures, not a
-        // candidate that did not start…
+        // This process's own failures are set-up failures, not a candidate that did not
+        // start…
         for producer in [
             "overlap handoff failed safely: could not write the authenticated handoff manifest \
              (storage full)",
@@ -971,9 +840,8 @@ mod tests {
             ),
             "the terminal was too busy to hand over"
         );
-        // A CAPTURE REFUSAL (plan P0-3) says it could not capture — never "could
-        // not be set up", which is what its layout half used to match — and
-        // never "too busy", which is what v0.91 told the user about it.
+        // A capture refusal says it could not capture: never "could not be set up" (which its
+        // layout half matches) nor "too busy".
         assert_eq!(
             full(
                 "overlap handoff failed safely: the park's capture refused session 3: visible \
@@ -998,14 +866,10 @@ mod tests {
         );
     }
 
-    /// AN UNRECOGNISED REASON DEGRADES; IT DOES NOT LEAK.
-    ///
-    /// The submission lane alone has dozens of free-form messages
-    /// (`UpdateHandoffStartError::failed`, the preflight's own verdicts), and it is
-    /// deliberately not enumerated here — new ones will be written by people who
-    /// have never read this module. So the contract is the fallback: whatever
-    /// arrives, the surfaces say one bounded generic thing, and
-    /// `cause_is_named` reports that the specific answer is only in the log.
+    /// An unrecognised reason degrades to one bounded generic clause and does not leak. The
+    /// submission lane's free-form messages (`UpdateHandoffStartError::failed`, the
+    /// preflight's verdicts) are deliberately not enumerated, so the contract is the fallback,
+    /// and `cause_is_named` reports that the specific answer is only in the log.
     #[test]
     fn an_unrecognised_reason_degrades_to_a_safe_generic_clause() {
         for stranger in [
@@ -1033,8 +897,7 @@ mod tests {
                 );
             }
         }
-        // An EMPTY reason is the same situation with even less to go on, and takes
-        // the same clause rather than a second, differently-worded one.
+        // An empty reason takes the same clause, not a second, differently worded one.
         assert_eq!(
             clauses("   "),
             (GENERIC.0.to_string(), GENERIC.1.to_string())
@@ -1075,8 +938,8 @@ mod tests {
         }
     }
 
-    /// The two retry regimes are DIFFERENT SENTENCES, because one of them requires
-    /// the reader to act and the other requires them to do nothing.
+    /// The two retry regimes are different sentences: one asks the reader to act, the other to
+    /// do nothing.
     #[test]
     fn the_manual_only_latch_changes_what_the_reader_is_told_to_do() {
         let auto = ApplyTrouble::new(2, "handoff proof ended TimedOut", ApplyRetry::Scheduled)
@@ -1228,13 +1091,9 @@ mod tests {
         assert!(trouble.compact().contains("move aterm or ask an admin"));
     }
 
-    /// ROUND EIGHT, FINDING 14'S REVIEW — THE REMEDY IS THE STANDING BLOCK'S, NOT
-    /// THE LATEST REASON'S. While a folder's block stands, the person's retry can
-    /// fail for an ordinary reason before the folder is asked, and the ledger
-    /// books that reason: read off it, the remedy became "install the signed
-    /// release", for a copy that is fine and a folder this user cannot write. The
-    /// cause clause still says how the last attempt ended; the next step is the
-    /// remedy the block carried in. CONTROL: the installed copy's block over the
+    /// The remedy is the standing block's, not the latest reason's: a person's retry can fail
+    /// for an ordinary reason before the folder is asked, and the cause clause says so while
+    /// the next step stays the block's remedy. Control: the installed copy's block over the
     /// same booking still says the signed release.
     #[test]
     fn a_standing_block_names_its_own_remedy_over_a_later_reason() {
@@ -1282,14 +1141,8 @@ mod tests {
         }
     }
 
-    /// A CHECK THAT DID NOT FINISH IS SAID AS A MOMENT, NEVER AS THE PERSON'S
-    /// (round four of the 2026-09 update robustness work, plan item 2). Before
-    /// the passing key, a `codesign` that ran out of the apply budget was wrapped
-    /// as the installed-source refusal: this surface said "the installed copy
-    /// could not be verified for replacement", `needs_person` suspended the lane,
-    /// and the owner was told to reinstall an app that was fine. The same shape
-    /// an older build wrote into the ledger — the installed-source key AROUND a
-    /// passing error — reads as the moment too.
+    /// A check that did not finish is named as a moment, never as the person's to clear, also
+    /// in the older shape that wraps a passing error in the installed-source key.
     #[test]
     fn a_check_that_did_not_finish_is_named_as_a_moment_and_never_a_person_s() {
         let passing = "overlap handoff failed safely: installed bundle failed pre-park \

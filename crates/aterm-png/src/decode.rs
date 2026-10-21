@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PNG decoding: chunk structure, filters, Adam7 de-interlacing, and the two
-//! output transforms.
+//! PNG decoding: chunk framing, scanline unfiltering, Adam7 de-interlacing,
+//! and `EXPAND` / `STRIP_16` output transforms.
 //!
-//! The pipeline is per-scanline from the inflate on: one row of source samples
-//! is decompressed, unfiltered, transformed, and written into the caller's
-//! buffer before the next is touched. A 4096x4096 RGBA image is 64 MiB of
-//! output, and holding the whole decompressed stream beside it (twice the
-//! output for 16-bit samples) would double that for no gain — and make a fixed
-//! cap on that intermediate, not the caller's own budget, decide which images
-//! load. So the caller's output buffer is the only decoded allocation that
-//! scales with the image; the buffered encoded source has its own ceiling.
-//!
-//! Adam7 is the one place that shape bends: an interlaced pass row's pixels land
-//! at scattered (x, y) positions, so each pixel is written individually — which
-//! is also why [`write_pixel`] has to know how to place a sub-byte sample at an
-//! arbitrary pixel index.
+//! Decompresses, unfilters, and transforms one scanline at a time directly
+//! into the caller's output buffer so decoded memory scales only with the
+//! output buffer size bounded by [`Limits`]. Interlaced Adam7 passes scatter
+//! pixels to their target `(x, y)` coordinates via [`write_pixel`].
 
 use std::io::Read;
 
@@ -131,13 +122,8 @@ fn read_chunk(bytes: &[u8], offset: usize) -> Result<Chunk<'_>, DecodingError> {
     })
 }
 
-/// Every output pixel an indexed image can produce, resolved once per decode.
-///
-/// PNG allows an indexed image a bit depth of 1, 2, 4 or 8, so an index is at
-/// most 255 and there are at most 256 distinct answers — for the whole image,
-/// because PLTE and tRNS are fixed once the header is read. Resolving them up
-/// front turns the inner loop from a range-checked palette slice, three
-/// widenings, an `Option` and a second bounds check into one indexed load.
+/// Pre-resolved `(R, G, B, A)` lookup table for all 256 possible 1/2/4/8-bit
+/// palette indices of an indexed image.
 type PaletteLut = [[u16; 4]; 256];
 
 /// Resolve the palette (and tRNS, when present) into [`PaletteLut`]: an index
@@ -290,12 +276,8 @@ impl Reader {
                     info.trns = Some(if color_type == ColorType::Indexed {
                         let entries = info.palette.as_ref().map_or(0, |p| p.len() / 3);
                         if chunk.data.len() > entries {
-                            // "The tRNS chunk shall not contain more alpha
-                            // values than there are palette entries"
-                            // (specification 11.3.2.1). One that does is
-                            // IGNORED, as in `png`: the output is still RGBA,
-                            // but every entry reads back opaque, so a malformed
-                            // strike is never made translucent.
+                            // Per PNG spec §11.3.2.1, ignore a `tRNS` chunk
+                            // with more entries than `PLTE` (leaving entries opaque).
                             Vec::new()
                         } else {
                             chunk.data.to_vec()
@@ -443,12 +425,8 @@ impl Reader {
             }
         }
 
-        // A well-formed stream ends with the last scanline. The slack admits an
-        // encoder that padded the zlib stream without letting a decompression
-        // bomb through: one maximal DEFLATE stored block, the largest single
-        // block of padding an encoder can emit (RFC 1951 caps LEN at 65535).
-        // Past that the excess is not padding, and it gets its own error rather
-        // than being reported as corruption.
+        // Allow up to one maximal stored DEFLATE block (65,535 bytes) of
+        // trailing padding after the last scanline before rejecting as `ExcessImageData`.
         const TRAILING_SLACK: usize = 65_535;
         let mut excess = 0usize;
         let mut sink = [0u8; 4096];
@@ -620,12 +598,8 @@ impl Reader {
     }
 }
 
-/// A `tRNS` colour key, reduced to the width the samples actually have.
-///
-/// PNG stores the key as 16 bits at every depth; below 16 only the low byte is
-/// the sample and the high byte must be zero. A malformed key is masked, as
-/// `png` did, so `0x012A` at depth 8 matches the sample `0x2A` rather than
-/// nothing.
+/// Mask a 16-bit `tRNS` color key to the low `depth` bits for sub-16-bit
+/// samples so keys with stray high-byte bits still match.
 fn mask_trns_key(key: u16, depth: u32) -> u16 {
     if depth < 16 { key & 0x00FF } else { key }
 }

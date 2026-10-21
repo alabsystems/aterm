@@ -355,13 +355,6 @@ impl Terminal {
     /// `Terminal::grid_mut().scroll_display(..)` bypasses it, used by test
     /// fixtures and bench support, not by shipping input paths.
     ///
-    /// One handle still reaches past it: `Terminal::grid_mut().scroll_display(..)`,
-    /// the raw grid. Every caller of that form in the workspace is a test fixture or a
-    /// bench harness (`aterm-bench`'s scroll-scrub example, and unit tests in `content.rs` / `state.rs` / `search_index.rs`); no
-    /// shipping input path uses it, and a fixture that sets up an offset without
-    /// claiming a user gesture is the honest use of it. Said out loud rather than
-    /// left as an implied "no route exists".
-    ///
     /// The model moves the offset by one while real gestures move rows or
     /// pages; the record says the user took the viewport, not how far.
     /// Conformance drives one-row forms, and a real wheel notch for the record.

@@ -26,7 +26,7 @@ use aterm_window::dpi::{
 };
 use aterm_window::keyboard::ModifiersState;
 use aterm_window::window::CursorIcon;
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 use aterm_window::window::WindowButtons;
 
 /// One recorded conversion: `(input, scale factor, output)`, both as `(x, y)`.
@@ -310,9 +310,9 @@ fn flag_types_answer_as_recorded() {
     assert!(mods.intersects(ModifiersState::ALT | ModifiersState::SHIFT));
 }
 
-/// `WindowButtons` left macOS with `set_enabled_buttons` (winit-core step 5, 2026-10-16); the
-/// Windows and Linux backends still read it.
-#[cfg(not(target_os = "macos"))]
+/// `WindowButtons` left macOS with `set_enabled_buttons` (winit-core step 5, 2026-10-16) and
+/// Linux (WC.8, 2026-10-21); the Windows backend still reads it.
+#[cfg(windows)]
 #[test]
 fn window_buttons_answer_as_recorded() {
     assert_eq!(WindowButtons::all().bits(), 0b111);

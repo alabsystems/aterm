@@ -2,13 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Basic parser tests: plain text, control characters, ESC, OSC, DCS sequences,
-//! and state transition behavior.
+//! Plain text, controls, ESC, OSC and DCS sequences, and state transitions.
 
 use super::super::*;
 use super::RecordingSink;
-
-// ============== Basic Tests ==============
 
 #[test]
 fn parse_plain_text() {
@@ -30,8 +27,6 @@ fn parse_control_character() {
 
     assert_eq!(sink.executes, vec![b'\n', b'\r', b'\t']);
 }
-
-// ============== ESC Tests ==============
 
 #[test]
 fn parse_esc_sequence() {
@@ -56,8 +51,6 @@ fn parse_esc_with_intermediate() {
     assert_eq!(sink.esc_dispatches.len(), 1);
     assert_eq!(sink.esc_dispatches[0], (vec![b'('], b'B'));
 }
-
-// ============== OSC Tests ==============
 
 #[test]
 fn parse_osc_with_bel() {
@@ -90,8 +83,6 @@ fn parse_osc_with_esc_backslash() {
     );
 }
 
-// ============== DCS Tests ==============
-
 #[test]
 fn parse_dcs_passthrough() {
     let mut parser = Parser::new();
@@ -105,8 +96,6 @@ fn parse_dcs_passthrough() {
     assert_eq!(sink.dcs_unhooks, 1);
 }
 
-// ============== State Transition Tests ==============
-
 #[test]
 fn cancel_aborts_sequence() {
     let mut parser = Parser::new();
@@ -115,11 +104,8 @@ fn cancel_aborts_sequence() {
     // Start CSI sequence, then CAN (0x18) aborts it
     parser.advance_fast(b"\x1b[31\x18Hello", &mut sink);
 
-    // CAN should be executed
     assert!(sink.executes.contains(&0x18));
-    // No CSI dispatch
     assert_eq!(sink.csi_dispatches.len(), 0);
-    // "Hello" should be printed
     assert_eq!(sink.prints.len(), 5);
 }
 
@@ -131,7 +117,6 @@ fn esc_interrupts_sequence() {
     // Start CSI sequence, then ESC starts new sequence
     parser.advance_fast(b"\x1b[31\x1b[32m", &mut sink);
 
-    // Only the second CSI should complete
     assert_eq!(sink.csi_dispatches.len(), 1);
     assert_eq!(sink.csi_dispatches[0].0, vec![32]);
 }

@@ -1,124 +1,81 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The **paper master**: generate it, read it back from a human, and mint machine keys
-//! from it — without the master ever touching a disk, an argv, an environment variable,
-//! a log line or a `Debug` impl.
+//! The paper master: generate it, read it back from a human, and derive its signing key,
+//! without the master touching a disk, an argv, an environment variable, a log line or a
+//! `Debug` impl.
 //!
-//! # The one invariant everything else rests on
+//! # Invariant
 //!
-//! THE MASTER SECRET IS NEVER WRITTEN ANYWHERE. Not to `~/.aterm`, not to a temp file,
-//! not to a shell history, not to the terminal after it has been read back. It exists on
-//! paper, and inside this process for the few milliseconds between the last character
-//! being read and the roster signature being produced. Everything below is in service of
-//! that sentence, and a test asserts the mint path writes no bytes derived from it.
+//! The master secret is never written anywhere: not to `~/.aterm`, a temp file, shell history,
+//! or the terminal after it has been read back. It exists on paper, and in this process from
+//! the last character read until the roster signature is produced
+//! (`no_file_written_by_a_run_contains_the_phrase_or_its_seed` pins the mint path).
 //!
-//! # The encoding: 52 base32 characters (owner's ruling)
+//! # Encoding
 //!
-//! Thirty-two bytes, written as 52 characters of lowercase Crockford base32 — `0-9` and
-//! `a-z` minus `i l o u`, the characters hands confuse; the shortest spelling that stays
-//! lowercase alphanumeric. Shown in groups of four. The reader strips spaces and
-//! hyphens, folds case, and maps `o→0`, `i→1`, `l→1`, so the classic misreads parse as
-//! what they resemble instead of failing. The final character carries four padding bits
-//! the reader masks off — the IDENTITY (checked by fingerprint) is canonical, not the
-//! spelling. Hand-copied characters WILL still eventually be typed back wrong, so
-//! [`fingerprint`] prints a short digest of the derived PUBLIC key at generation and
-//! after every type-back, and `setup` refuses to arm until the retyped phrase matches.
+//! 32 bytes as 52 characters of lowercase Crockford base32 (`0-9a-z` minus `i l o u`), shown in
+//! groups of four. The reader strips spaces and hyphens, folds case, and maps `o→0`, `i→1`,
+//! `l→1`. The last character's low four bits are padding the reader masks off, so the identity
+//! is canonical, not the spelling. [`fingerprint`] prints a short digest of the derived public
+//! key at generation and after every type-back, and `setup` refuses to arm until the retyped
+//! phrase matches.
 //!
-//! # Why the phrase is generated, never chosen
+//! The 32 bytes are the Ed25519 seed ([`ring::signature::Ed25519KeyPair::from_seed_unchecked`])
+//! with no KDF: the phrase is the master, not a password, and the same paper always yields the
+//! same identity. So it comes from a CSPRNG and is never human-chosen: a memorable phrase here
+//! is a directly attackable private key.
 //!
-//! The 32 bytes ARE the Ed25519 seed ([`ring::signature::Ed25519KeyPair::from_seed_unchecked`],
-//! the in-tree idiom `atpkg::sig` already uses in its fixtures). There is no KDF and no
-//! stretching, deliberately — that is what makes the phrase itself the master rather than
-//! a password to something else, and what makes the derivation deterministic, so the same
-//! paper always yields the same identity. The direct consequence is that the phrase must
-//! come from a CSPRNG and must never be human-chosen: a memorable "phrase" here is not a
-//! password guarding a key, it is a directly attackable private key.
+//! # Leak vectors
 //!
-//! # Leak vectors, each named and each answered
-//!
-//! 1. **argv** — world-readable via `ps` on macOS. There is no `--master <hex>` flag and
-//!    there must never be one. The only flags this tool takes are non-secret. A future
-//!    "convenience" flag here would be a security regression, and this sentence exists
-//!    because that is precisely how such a flag gets added.
-//! 2. **environment** — `ps -E`. No environment variable is read for the master.
-//! 3. **shell history** — falls out of (1). Nothing secret is ever typed on a command
-//!    line, so nothing secret can land in history.
-//! 4. **terminal scrollback** — ECHO is off while reading, and the termios state is
-//!    restored on every ORDINARY path by a `Drop` guard ([`TtyEcho`]), including errors
-//!    and unwinds. The exception is process death with no unwind — Ctrl-C's default
-//!    SIGINT disposition — which skips Drop and leaves the terminal echo-less until the
-//!    shell resets it (nothing secret is emitted; the cost is a confused owner). A
-//!    crash that left the terminal echo-less would otherwise be both a usability bug
-//!    and a security one, because the next thing the owner types would be invisible.
-//! 5. **stdin redirection** — `mint < phrase.txt` would put the master in a file. The
-//!    phrase is read from `/dev/tty` explicitly and refused if that is not a terminal, so
-//!    such an invocation fails loudly rather than silently succeeding.
-//! 6. **swap / hibernation image** — THE ONE THAT CANNOT BE FULLY CLOSED. [`MasterSeed`]
-//!    and [`MasterPhrase`] `mlock(2)` their buffers, but `mlock` is best-effort under
-//!    `RLIMIT_MEMLOCK` and is NOT claimed as a guarantee. Modern macOS encrypts swap by
-//!    default, which mitigates without eliminating. The honest mitigation is the short
-//!    residency window: from the last character read to the signature produced there is no
-//!    user interaction, no network and no await point.
-//! 7. **core dump** — [`forbid_core_dumps`] sets `RLIMIT_CORE` to 0 before the prompt.
-//! 8. **logs / journal / `Debug`** — both secret types have hand-written `Debug` impls
-//!    printing `<redacted>`, no `Serialize`, and no `Display`. Only [`fingerprint`] and
-//!    the derived PUBLIC key are ever printable. This copies the discipline
-//!    `aterm-release`'s `ReleaseCredentials` already established.
-//! 9. **memory scrub** — hand-rolled, because there is no `zeroize` in this workspace. The
-//!    SHAPE matters: both secrets are fixed arrays, never `String`/`Vec`. A growing
-//!    `String` reallocates, and reallocation leaves copies of the phrase in freed heap
-//!    that cannot be found and cannot be scrubbed. The scrub itself is `write_volatile`
-//!    plus a `compiler_fence` so dead-store elimination cannot remove it.
-//!    RESIDUAL, stated rather than hidden: `ring::Ed25519KeyPair` copies the seed
-//!    internally and exposes no scrubbing hook. That copy outlives our scrub until the
-//!    keypair drops, and we cannot reach it. ALSO RESIDUAL: Rust moves. Returning a
-//!    `MasterPhrase`/`MasterSeed` by value (through `Result`, into a caller's frame) may
-//!    memcpy the secret bytes to a new stack address; the `mlock` stays on the
-//!    construction address and the moved-out bytes are not scrubbed. Drop runs at the
-//!    final resting address only. Mitigations: copy elision usually avoids the move,
-//!    adjacent frames usually share the locked page, and macOS encrypts swap — but this
-//!    is a residual of the same kind as ring's copy, not a closed vector. Closing it
-//!    would mean heap-pinning the secrets (Box::pin + one lock) — noted, not done.
-//! 10. **the clipboard** — if the owner PASTES the phrase instead of typing it, it sits in
-//!     the pasteboard afterwards. Nothing inside this tool can prevent that; the docs say
-//!     so and recommend typing.
-//! 11. **stdout redirection** — the output side of vector 5. On fd 1, `setup > log`,
-//!     `| tee` or any capturing wrapper would put the phrase in a file, and one that
-//!     discards it would destroy the master while the tool reported success. The phrase
-//!     is written to the [`Tty`] handle (`/dev/tty`, proved with `isatty`), and a run
-//!     with no terminal is REFUSED before a master is generated.
-//! 12. **the terminal emulator's own persistence** — some terminals (aterm's
-//!     seamless-update grid snapshots, iTerm2 session restore) write their grid to DISK.
-//!     The ceremony docs therefore say: run `setup`/`join` in a terminal that does not
-//!     persist its contents (macOS Terminal.app with session restore off is fine; aterm
-//!     is NOT, while a seamless update can snapshot the grid), and clear scrollback after.
-//!     This tool cannot close a vector that lives in whatever renders it.
+//! 1. argv (world-readable via `ps`): no flag takes the master, and none may ever be added.
+//! 2. environment (`ps -E`): no environment variable is read for the master.
+//! 3. shell history: follows from (1).
+//! 4. terminal scrollback: echo is off while reading, restored by a `Drop` guard ([`TtyEcho`])
+//!    on every return, error or unwind. Death without unwinding (default SIGINT) leaves the
+//!    terminal echo-less until the shell resets it; nothing secret is emitted.
+//! 5. stdin redirection: the phrase is read from `/dev/tty`, refused if that is not a
+//!    terminal, so `join < phrase.txt` fails loudly.
+//! 6. swap / hibernation: not fully closable. [`MasterSeed`] and [`MasterPhrase`] `mlock(2)`
+//!    their buffers, best-effort under `RLIMIT_MEMLOCK`; macOS encrypts swap by default. The
+//!    residency window (last character read to signature) has no user interaction, network or
+//!    await point.
+//! 7. core dump: [`forbid_core_dumps`] sets `RLIMIT_CORE` to 0 before the prompt.
+//! 8. logs / `Debug`: both secret types have hand-written `Debug` impls printing `<redacted>`,
+//!    and no `Serialize` or `Display`; only [`fingerprint`] and the public key are printable.
+//! 9. memory scrub: hand-rolled (the workspace has no `zeroize`). Both secrets are fixed
+//!    arrays, never `String`/`Vec`, whose reallocation leaves unscrubbable copies in freed
+//!    heap. The scrub is `write_volatile` plus a `compiler_fence`. Residuals:
+//!    `ring::Ed25519KeyPair` copies the seed internally with no scrub hook, and returning a
+//!    secret by value may memcpy it to a new, unlocked stack address, leaving the old bytes
+//!    unscrubbed (`Drop` runs only at the final address; closing this would mean heap-pinning
+//!    the secrets).
+//! 10. clipboard: a pasted phrase stays in the pasteboard, which this tool cannot prevent.
+//! 11. stdout redirection: the phrase is written to the [`Tty`] handle (`/dev/tty`, checked
+//!     with `isatty`), never fd 1, and a run with no terminal is refused before a master is
+//!     generated.
+//! 12. the terminal's own persistence: terminals that write their grid to disk (aterm's
+//!     seamless-update snapshots, iTerm2 session restore) are beyond this tool's reach. Run
+//!     the ceremony in one that does not persist; `setup` reminds the owner to clear scrollback.
 
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
-/// Exactly how many characters the written master is: 32 bytes in base32, spelled the
-/// way it goes on paper.
+/// Characters in the written master: 32 bytes in base32.
 pub const MASTER_PHRASE_LEN: usize = 52;
 
-/// The 32 phrase characters: Crockford base32, lowercase — `0-9` and `a-z` minus
-/// `i l o u`. Chosen for hands, not machines: nothing in it reads as anything else in it.
+/// The phrase alphabet: lowercase Crockford base32, `0-9a-z` minus the easily confused
+/// `i l o u`.
 const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-/// Overwrite `buf` with zeroes in a way the optimizer may not delete.
-///
-/// A plain loop writing zeroes into a buffer that is never read again is textbook
-/// dead-store elimination — the compiler is entitled to remove it, and at `-O2` it will.
-/// `write_volatile` is not removable, and the fence stops the writes being sunk past the
-/// point the buffer dies. This is the hand-rolled stand-in for `zeroize`, which this
-/// workspace does not carry; if that ever changes, replace this and delete the comment,
-/// but do NOT "simplify" it back into `buf.fill(0)`.
+/// Overwrite `buf` with zeroes the optimizer may not delete. A zeroing loop on a buffer never
+/// read again is dead-store elimination's textbook case; `write_volatile` cannot be removed
+/// and the fence stops the writes sinking past the buffer's death. Do not "simplify" this to
+/// `buf.fill(0)`; replace it only with `zeroize`, which the workspace does not carry.
 fn scrub(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        // SAFETY: `b` is a live, uniquely borrowed, correctly aligned `u8` obtained from
-        // a mutable slice, so a one-byte volatile write to it is always in bounds and
-        // never aliased.
+        // SAFETY: `b` is a live, uniquely borrowed, aligned `u8` from a mutable slice, so a
+        // one-byte volatile write is in bounds and unaliased.
         unsafe { std::ptr::write_volatile(b, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
@@ -132,11 +89,9 @@ fn scrub_u32(v: &mut u32) {
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Ask the kernel to keep `buf` out of swap. Best-effort by design and by necessity:
-/// `mlock` is bounded by `RLIMIT_MEMLOCK` and can simply fail, so the return value is
-/// deliberately ignored — a machine with a tight limit must still be able to mint a key.
-/// This REDUCES the swap exposure in vector 6; it does not close it, and no caller should
-/// read it as a guarantee.
+/// Ask the kernel to keep `buf` out of swap. Best-effort: `mlock` is bounded by
+/// `RLIMIT_MEMLOCK` and its failure is ignored, so a machine with a tight limit can still
+/// mint. It narrows leak vector 6; it does not close it.
 fn try_lock(buf: &[u8]) {
     // SAFETY: `buf` is a live borrow, so its pointer and length describe mapped, readable
     // memory for the duration of the call. `mlock` neither reads nor writes the contents.
@@ -146,7 +101,7 @@ fn try_lock(buf: &[u8]) {
 }
 
 /// Undo [`try_lock`] before the memory is freed, so a long-running process does not leak
-/// locked pages. Also best-effort, for the same reason.
+/// locked pages. Best-effort too.
 fn try_unlock(buf: &[u8]) {
     // SAFETY: same live-borrow argument as `try_lock`; `munlock` on a range that was
     // never successfully locked is a harmless error return.
@@ -155,12 +110,8 @@ fn try_unlock(buf: &[u8]) {
     }
 }
 
-/// Set `RLIMIT_CORE` to zero, so a crash anywhere in the mint path cannot write the
-/// master into a core file (leak vector 7). Called before the prompt, never after.
-///
-/// Best-effort and non-fatal: a hardened environment that already forbids raising it will
-/// simply keep the stricter value, and there is no state where refusing to mint because
-/// the limit could not be lowered would be the better outcome.
+/// Set `RLIMIT_CORE` to zero so a crash in the mint path cannot write the master into a core
+/// file (leak vector 7). Call it before the prompt. Best-effort and non-fatal.
 pub fn forbid_core_dumps() {
     let zero = libc::rlimit {
         rlim_cur: 0,
@@ -173,21 +124,18 @@ pub fn forbid_core_dumps() {
     }
 }
 
-/// The 32 raw bytes of the paper master, held in a fixed array that is `mlock`ed on
-/// construction and volatile-scrubbed on drop.
+/// The 32 raw bytes of the paper master, in a fixed array `mlock`ed on construction and
+/// volatile-scrubbed on drop.
 ///
-/// There is no `Clone`, no `Serialize`, no `Display`, and no accessor returning the
-/// bytes: everything a caller can do with a master is derive its keypair, its public key,
-/// or its fingerprint. That is the whole API surface on purpose — a `fn bytes(&self)`
-/// here would immediately become a `write(path, seed.bytes())` somewhere else.
+/// No `Clone`, `Serialize`, `Display` or byte accessor: a caller can only derive the keypair,
+/// public key or fingerprint. A `fn bytes(&self)` would soon become a `write(path, ..)`.
 pub struct MasterSeed {
     bytes: [u8; 32],
 }
 
 impl std::fmt::Debug for MasterSeed {
-    /// Hand-written so a derive can never print the master. The `ReleaseCredentials`
-    /// treatment in `aterm-release/src/sign.rs`, copied deliberately rather than
-    /// re-invented.
+    /// Hand-written so a derive can never print the master (as `ReleaseCredentials` in
+    /// `aterm-release/src/sign.rs`).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MasterSeed(<redacted>)")
     }
@@ -208,21 +156,17 @@ impl MasterSeed {
         seed
     }
 
-    /// The Ed25519 keypair this master IS. Deterministic: the same paper phrase always
-    /// yields the same identity, which is what makes the phrase the master rather than a
-    /// password to something stored elsewhere.
+    /// The Ed25519 keypair this master is. Deterministic: the same phrase always yields the
+    /// same identity.
     ///
-    /// `from_seed_unchecked` is the right call here and its name deserves a word: the
-    /// "unchecked" part is that it does not verify the seed came from a CSPRNG. Ours did
-    /// — [`generate_master`] is the only way one is created — and a seed read back from
-    /// paper is by construction one that was generated that way.
+    /// `from_seed_unchecked` is unchecked in that no public key is given to detect a corrupt
+    /// seed; the fingerprint and the committed anchor are that check here.
     pub fn keypair(&self) -> Result<Ed25519KeyPair, String> {
         Ed25519KeyPair::from_seed_unchecked(&self.bytes)
             .map_err(|_| "master seed rejected by the Ed25519 implementation".to_string())
     }
 
-    /// The master's base64 PUBLIC key — the value that goes into
-    /// `pins::PAPER_MASTER_PUBKEYS`. Public identity only; safe to print, commit and log.
+    /// The master's base64 public key, the value in `pins::PAPER_MASTER_PUBKEYS`.
     pub fn pubkey_b64(&self) -> Result<String, String> {
         aterm_codec::base64::encode(self.keypair()?.public_key().as_ref())
             .map_err(|_| "public key too large to encode".to_string())
@@ -233,17 +177,15 @@ impl MasterSeed {
         Ok(fingerprint(self.keypair()?.public_key().as_ref()))
     }
 
-    /// Detached-sign `msg`'s exact bytes with the master. The ONLY thing a master signs is
-    /// a roster; nothing here enforces that, but nothing else in the tree calls it either.
+    /// Detached-sign `msg`'s exact bytes with the master. Only rosters are signed with it;
+    /// nothing enforces that, but nothing else calls it.
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
         Ok(self.keypair()?.sign(msg).as_ref().to_vec())
     }
 }
 
-/// The written master, as the 52 base32 characters that go on paper.
-///
-/// Fixed `[u8; 52]`, never a `String`: see the module doc's leak vector 9 — a growing
-/// `String` reallocates and strews unreachable copies of the phrase through freed heap.
+/// The written master, the 52 base32 characters that go on paper, in a fixed array (leak
+/// vector 9).
 pub struct MasterPhrase {
     chars: [u8; MASTER_PHRASE_LEN],
 }
@@ -262,22 +204,17 @@ impl Drop for MasterPhrase {
 }
 
 impl MasterPhrase {
-    /// The phrase as text. Test-only: no shipped path prints a phrase, and this is the
-    /// single most dangerous method here, so it does not exist outside the tests that
-    /// read a generated phrase back.
+    /// The phrase as text. Test-only: no shipped path prints a phrase.
     #[cfg(test)]
     fn as_str(&self) -> &str {
         std::str::from_utf8(&self.chars).unwrap_or("")
     }
 
-    /// Decode the phrase into the 32-byte seed. Infallible: the phrase can only have been
-    /// built by [`generate_master`] or [`parse_master`], both of which have already
-    /// proved every character is in the alphabet.
+    /// Decode the phrase into the 32-byte seed. Infallible: [`generate_master`] and
+    /// [`parse_master`] have already proved every character is in the alphabet.
     ///
-    /// 52 characters carry 260 bits; the final four are padding and are dropped here.
-    /// That makes the last character's LOW bits non-canonical spelling — two spellings
-    /// can name one master — while the identity itself stays exact, which is the property
-    /// the fingerprint checks and the only one that matters.
+    /// 52 characters carry 260 bits; the last four are padding and dropped, so two spellings
+    /// can name one master while the identity stays exact.
     pub fn seed(&self) -> MasterSeed {
         let mut bytes = [0u8; 32];
         let mut acc: u32 = 0;
@@ -294,18 +231,15 @@ impl MasterPhrase {
         }
         debug_assert_eq!(out, 32);
         let seed = MasterSeed::new(bytes);
-        // `bytes` is a copy the `MasterSeed` now owns; scrub this stack copy too, and the
-        // accumulator the master's bits streamed through. Without this the seed would
-        // live in places only one of which gets cleaned.
+        // The `MasterSeed` owns its own copy: scrub this stack copy and the accumulator.
         scrub(&mut bytes);
         scrub_u32(&mut acc);
         seed
     }
 }
 
-/// The 5-bit value of one phrase character. Only ever called on bytes already proved to
-/// be in [`ALPHABET`], so the fallback is unreachable and returns 0 rather than panicking
-/// — a panic here would abort mid-mint with the master live in memory.
+/// The 5-bit value of one phrase character. Called only on alphabet bytes; the unreachable
+/// fallback returns 0 rather than panicking with the master live in memory.
 fn b32_val(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
@@ -318,23 +252,19 @@ fn b32_val(c: u8) -> u8 {
     }
 }
 
-/// Why a typed-back master phrase was refused. Neither variant carries any part of the
-/// input — a position is safe to print, a character is not, because printing it puts a
-/// byte of the master into the terminal scrollback.
+/// Why a typed-back phrase was refused. No variant carries any input: a position is safe to
+/// print, a character is a byte of the master.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhraseError {
-    /// A character outside the alphabet, at this **1-based position** among the
-    /// significant (non-whitespace, non-hyphen) characters — i.e. counting the way the
-    /// owner counts the characters they wrote down, not the separators they typed.
+    /// A character outside the alphabet, at this 1-based position among the significant
+    /// (non-whitespace, non-hyphen) characters, counting as the owner counts what they wrote.
     BadChar { position: usize },
-    /// The right characters, the wrong number of them. `got` is the count of significant
-    /// characters, so "51" and "53" are both immediately diagnosable.
+    /// The wrong number of significant characters; `got` is the count.
     Length { got: usize },
 }
 
 impl PhraseError {
-    /// The exact message the tool prints. Deliberately names the position and NEVER the
-    /// character or its neighbours.
+    /// The message the tool prints: the position, never the character or its neighbours.
     #[must_use]
     pub fn message(&self) -> String {
         match self {
@@ -357,22 +287,13 @@ impl PhraseError {
     }
 }
 
-/// Parse a typed-back master phrase, fail-closed, forgiving, and diagnostic-first.
+/// Parse a typed-back master phrase, fail-closed and forgiving.
 ///
-/// Forgiveness first, because the phrase is copied by hand twice: ASCII whitespace and
-/// hyphens are stripped (the owner grouped the characters), case is folded, and the
-/// misread trio maps to what it resembles — `o→0`, `i→1`, `l→1`. The alphabet excludes
-/// those letters precisely so this mapping is unambiguous. After that the rules are
-/// exact:
-///
-/// * every remaining character must be in [`ALPHABET`] — the FIRST that is not names its
-///   1-based position, and nothing about its value;
-/// * there must be exactly [`MASTER_PHRASE_LEN`] of them.
-///
-/// The character check runs BEFORE the length check on purpose. A phrase with one wrong
-/// character AND one missing one is far more useful diagnosed as "character 37 is not a
-/// phrase character" than as "51 characters", because the former points at the line to
-/// re-read.
+/// ASCII whitespace and hyphens are stripped, case is folded, and `o→0`, `i→1`, `l→1` (the
+/// alphabet excludes those letters, so the mapping is unambiguous). Then every character must
+/// be in [`ALPHABET`], the first that is not reported by 1-based position only, and there must
+/// be exactly [`MASTER_PHRASE_LEN`]. The character check runs first: "character 37" points at
+/// the line to re-read, where "51 characters" does not.
 pub fn parse_master(input: &str) -> Result<MasterPhrase, PhraseError> {
     let mut chars = [0u8; MASTER_PHRASE_LEN];
     let mut n = 0usize;
@@ -386,14 +307,12 @@ pub fn parse_master(input: &str) -> Result<MasterPhrase, PhraseError> {
             other => other,
         };
         if !ALPHABET.contains(&c) {
-            // Scrub before returning: a partially filled buffer holds a prefix of the
-            // master, and an error path is exactly where that is easiest to forget.
+            // A partial buffer holds a prefix of the master.
             scrub(&mut chars);
             return Err(PhraseError::BadChar { position: n + 1 });
         }
         if n < MASTER_PHRASE_LEN {
-            // Count past the end so the length error reports the true count, but never
-            // write past the array.
+            // Count past the end so the length error reports the true count.
             chars[n] = c;
         }
         n += 1;
@@ -407,8 +326,7 @@ pub fn parse_master(input: &str) -> Result<MasterPhrase, PhraseError> {
     Ok(phrase)
 }
 
-/// Generate a fresh master from the system CSPRNG. The ONLY way a master is created —
-/// there is deliberately no "choose your own phrase" path (see the module doc).
+/// Generate a fresh master from the system CSPRNG: the only way a master is created.
 pub fn generate_master() -> Result<MasterPhrase, String> {
     let mut raw = [0u8; 32];
     SystemRandom::new()
@@ -448,22 +366,13 @@ fn encode_phrase(raw: &[u8; 32]) -> MasterPhrase {
     phrase
 }
 
-/// The short verification fingerprint: the first 8 hex characters of SHA-256 over the
-/// **public** key, hyphenated as `a3f2-9c1b`.
+/// The short verification fingerprint: the first 8 hex characters of SHA-256 over the public
+/// key, as `a3f2-9c1b`.
 ///
-/// # Why the public key and never the secret
-///
-/// A fingerprint of secret material is a slow oracle against it — publish one and you
-/// have handed an attacker a cheap check for candidate guesses. Fingerprinting the public
-/// key gives the owner exactly the property they asked for (does what I typed back match
-/// what I wrote down?) and gives an attacker nothing they could not compute anyway from a
-/// public key that is committed in `pins.rs`.
-///
-/// Eight hex characters is 32 bits. That is not collision resistance and is not meant to
-/// be: this defends against a HAND TRANSCRIPTION ERROR, an accidental adversary that
-/// produces a uniformly random unrelated key, not against someone grinding for a match.
-/// Short enough to compare at a glance is the property that matters, because a
-/// fingerprint nobody actually reads defends nothing.
+/// Over the public key, never the secret: a fingerprint of the secret is an offline check for
+/// guesses, while the public key is committed in `pins.rs` anyway. 32 bits is not collision
+/// resistance and need not be: it catches a hand-transcription error, which yields an
+/// unrelated key, not an adversary grinding for a match.
 #[must_use]
 pub fn fingerprint(pubkey_raw: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, pubkey_raw);
@@ -479,13 +388,9 @@ pub fn fingerprint(pubkey_raw: &[u8]) -> String {
     out
 }
 
-/// The termios ECHO guard: turns terminal echo OFF for the life of the value and restores
-/// the ORIGINAL settings on drop — success, error, or unwind alike.
-///
-/// The `Drop` placement is the point. Restoring only on the happy path leaves a terminal
-/// with no echo after any failure, which is a usability bug and a security one: the next
-/// thing the owner types is invisible to them, so they cannot see that they are typing
-/// into the wrong place.
+/// Turns terminal echo off for the life of the value and restores the original settings on
+/// drop, on success, error or unwind alike: a terminal left without echo hides the owner's
+/// next keystrokes from them.
 pub struct TtyEcho {
     fd: std::os::unix::io::RawFd,
     saved: libc::termios,
@@ -516,48 +421,37 @@ impl TtyEcho {
 
 impl Drop for TtyEcho {
     fn drop(&mut self) {
-        // SAFETY: `self.fd` is still open (this value borrows the caller's live `File`)
-        // and `self.saved` is the initialized snapshot taken in `disable`.
+        // SAFETY: `self.fd` is still open: the caller declares this guard after the `File`
+        // that owns the descriptor, so the guard drops first. `self.saved` is the initialized
+        // snapshot taken in `disable`.
         unsafe {
             let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &raw const self.saved);
         }
     }
 }
 
-/// The longest line the phrase prompt will read: 52 characters plus generous room for
-/// the separators the owner groups them with, plus the newline. Anything longer is a
-/// paste of the wrong thing, and truncating it produces a clean length error rather than
-/// an unbounded read from a terminal.
+/// The longest line the phrase prompt reads: 52 characters plus room for separators and the
+/// newline. A longer paste truncates into a clean length error.
 const PROMPT_CAP: usize = 256;
 
-/// THE TERMINAL, opened explicitly — the only place a master is ever read from and the
-/// only place one is ever written to.
-///
-/// `/dev/tty` is the process's CONTROLLING TERMINAL, resolved by the kernel. It is not fd
-/// 0 or 1, so no shell redirection can point it at a file (leak vectors 5 and 11), and a
-/// process with no controlling terminal cannot open it at all. Reading and writing both go
-/// through this one handle.
+/// The controlling terminal, opened explicitly: the only place a master is read from or
+/// written to. `/dev/tty` is resolved by the kernel, not fd 0 or 1, so no shell redirection
+/// can point it at a file (leak vectors 5 and 11), and a process without one cannot open it.
 pub struct Tty {
     file: std::fs::File,
     fd: std::os::unix::io::RawFd,
 }
 
 impl std::fmt::Debug for Tty {
-    /// Hand-written and content-free. This value is the sink a master is written to; a
-    /// derived impl would print a descriptor number, which is noise, and it sets the wrong
-    /// precedent in a module where every other `Debug` is deliberately mute.
+    /// Content-free, like every other `Debug` in this module.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Tty(/dev/tty)")
     }
 }
 
 impl Tty {
-    /// Open the controlling terminal, or refuse.
-    ///
-    /// Refusing is the point. A caller that is about to generate a master must know FIRST
-    /// that it has somewhere to deliver it, because a master generated with nowhere to go
-    /// is a master that never existed for anyone — and if the anchor has been armed by
-    /// then, that is unrecoverable.
+    /// Open the controlling terminal, or refuse. A caller must know it can deliver a master
+    /// before generating one: a master with nowhere to go never existed for anyone.
     pub fn open() -> Result<Self, String> {
         use std::os::unix::io::AsRawFd as _;
         let file = std::fs::OpenOptions::new()
@@ -581,23 +475,11 @@ impl Tty {
         Ok(Self { file, fd })
     }
 
-    /// WRITE THE PHRASE TO THE TERMINAL — the one deliberate emission of a secret in this
-    /// tree, and the only one there will ever be.
+    /// Write the phrase to the terminal: the one deliberate emission of a secret in this tree.
     ///
-    /// Two properties beyond "it prints":
-    ///
-    /// * It goes to the TERMINAL, so a redirect cannot capture it and a discarded stream
-    ///   cannot swallow it (leak vector 11).
-    /// * It is assembled in a fixed array that is `mlock`ed and volatile-scrubbed,
-    ///   never a `String`, whose growth would free a copy of the phrase unscrubbed
-    ///   (leak vector 9).
-    ///
-    /// The phrase is written in GROUPS OF FOUR — thirteen blocks the hand can copy
-    /// without losing its place. The parser strips the spaces, so the grouping costs the
-    /// owner nothing to type back.
-    ///
-    /// The flush is checked and its failure is returned, because "the phrase was printed"
-    /// is a claim the caller acts on: `setup` arms a trust anchor on the strength of it.
+    /// It goes to the terminal (leak vector 11), is assembled in an `mlock`ed, volatile-scrubbed
+    /// fixed array (leak vector 9), and is grouped in fours, which the parser strips. The flush is
+    /// checked and its failure returned: `setup` arms a trust anchor on the strength of it.
     pub fn write_phrase(&mut self, phrase: &MasterPhrase) -> Result<(), String> {
         use std::io::Write as _;
         // 52 characters + 12 group spaces + newline.
@@ -627,13 +509,9 @@ impl Tty {
         })
     }
 
-    /// Write one non-secret line to the terminal — the warning that frames the phrase, and
-    /// the fingerprint beside it.
-    ///
-    /// These go to the terminal too, and not because they are secret. A warning that says
-    /// WRITE THE NEXT LINE DOWN is only true if it lands on the same surface as the line it
-    /// is about; split across two streams, one of them redirected, it is an instruction
-    /// pointing at nothing.
+    /// Write one non-secret line to the terminal: the heading and fingerprint that frame the
+    /// phrase. They share its surface so "write the next line down" cannot point at a line sent
+    /// elsewhere.
     pub fn write_line(&mut self, line: &str) -> Result<(), String> {
         use std::io::Write as _;
         self.file
@@ -648,27 +526,20 @@ impl Tty {
     }
 }
 
-/// Prompt for the master phrase on `/dev/tty` with echo off, and parse it — one attempt.
+/// Prompt for the master phrase on `/dev/tty` with echo off and parse it: one attempt.
 ///
-/// The DOUBLE `Result` is the point of this variant: the outer error is the TERMINAL
-/// failing (no tty, read error), the inner is the TYPED TEXT failing to parse. A caller
-/// that retries — `setup`'s transcription gate — needs the distinction, because a dead
-/// terminal must abort while a typo must not. An empty attempt (`Length` with `got: 0`)
-/// is how EOF presents, so a retrying caller treats that as abort too, or a closed tty
-/// would loop forever.
-///
-/// `/dev/tty` is opened EXPLICITLY rather than reading fd 0: that is what makes
-/// `join < phrase.txt` fail loudly instead of quietly succeeding and leaving the
-/// master in a file (leak vector 5). If the process has no controlling terminal, this
-/// refuses — there is no non-interactive path to a master by design.
+/// The outer error is the terminal failing, the inner the typed text failing to parse: a
+/// retrying caller (`setup`'s transcription gate) aborts on the first and retries the second.
+/// EOF presents as an empty attempt (`Length { got: 0 }`), which a retrying caller must also
+/// treat as an abort. `/dev/tty` is opened explicitly, never fd 0, so `join < phrase.txt`
+/// fails (leak vector 5); with no controlling terminal this refuses.
 pub fn prompt_master_attempt(prompt: &str) -> Result<Result<MasterPhrase, PhraseError>, String> {
     use std::io::{Read as _, Write as _};
 
     let handle = Tty::open()?;
     let fd = handle.fd;
     let mut tty = handle.file;
-    // Echo goes off BEFORE the prompt is written, so there is no window in which a fast
-    // typist's first characters are echoed.
+    // Echo goes off before the prompt is written, so no early keystroke is echoed.
     let _echo = TtyEcho::disable(fd)?;
     let _ = tty.write_all(prompt.as_bytes());
     let _ = tty.flush();
@@ -701,10 +572,9 @@ pub fn prompt_master_attempt(prompt: &str) -> Result<Result<MasterPhrase, Phrase
     // next output does not land on the prompt line.
     let _ = tty.write_all(b"\n");
 
-    // `from_utf8_lossy` would ALLOCATE A COPY of the phrase on any non-ASCII byte, and
-    // that copy is a `Cow` we could not reliably scrub. Parse the bytes we have: the
-    // phrase is ASCII by definition, so a non-ASCII byte is simply not a phrase character
-    // and `parse_master` will name its position — which is the right diagnosis anyway.
+    // Not `from_utf8_lossy`: it would allocate an unscrubbable copy on a non-ASCII byte.
+    // `parse_master` names the position of a non-ASCII character; invalid UTF-8 parses as
+    // empty.
     let text = std::str::from_utf8(&buf[..used]).unwrap_or("");
     let parsed = parse_master(text);
     scrub(&mut buf);
@@ -725,22 +595,17 @@ pub fn prompt_for_master(prompt: &str) -> Result<MasterPhrase, String> {
 mod tests {
     use super::*;
 
-    // An obviously synthetic phrase: the alphabet in order, then filler, ending on the
-    // canonical '0' tail. It never appears outside this test module.
+    // A synthetic phrase: the alphabet in order, then filler, ending on the canonical '0'.
     const SYNTHETIC: &str = "0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0";
 
-    /// The refusal for an input that must not parse. A helper rather than `assert_eq!`
-    /// over the `Result`, because [`MasterPhrase`] deliberately has no `PartialEq`: an
-    /// equality operator on secret material is both an invitation to compare it and a
-    /// timing side channel waiting to be written.
+    /// The refusal for an input that must not parse. [`MasterPhrase`] has no `PartialEq` on
+    /// purpose: equality on secret material invites comparison and timing side channels.
     fn refused(input: &str) -> PhraseError {
-        // `expect_err` (not `.err().expect()`) — it needs `Debug` on the Ok type, which
-        // `MasterPhrase` has and which prints `<redacted>`, so a failure here still
+        // `expect_err` needs `Debug` on the Ok type, which prints `<redacted>`, so a failure
         // cannot spill phrase bytes into the panic message.
         parse_master(input).expect_err("this input must be refused")
     }
 
-    /// EXACTLY 52 alphabet characters is accepted, and case folds.
     #[test]
     fn exactly_fifty_two_characters_is_accepted_and_case_folds() {
         assert_eq!(SYNTHETIC.len(), MASTER_PHRASE_LEN, "fixture length");
@@ -753,8 +618,6 @@ mod tests {
         );
     }
 
-    /// THE MISREAD TRIO IS FORGIVEN: `o` reads as `0`, `i` and `l` read as `1` — the
-    /// alphabet excludes those letters precisely so the mapping is unambiguous.
     #[test]
     fn o_i_and_l_are_read_as_the_characters_they_resemble() {
         let mut misread = String::from(SYNTHETIC);
@@ -773,8 +636,6 @@ mod tests {
         );
     }
 
-    /// 51 and 53 are both refused, and the message reports the true count so the owner
-    /// knows which direction they are out.
     #[test]
     fn fifty_one_and_fifty_three_characters_are_refused_with_the_count() {
         let short = &SYNTHETIC[..51];
@@ -796,12 +657,10 @@ mod tests {
         assert_eq!(refused(""), PhraseError::Length { got: 0 });
     }
 
-    /// A BAD CHARACTER names its 1-based position — and the message never contains the
-    /// character itself, which would put a byte of the master in the scrollback.
     #[test]
     fn a_bad_character_is_refused_by_position_and_never_echoed() {
         let mut bad = String::from(SYNTHETIC);
-        // `u` is deliberately outside the alphabet and is NOT mapped to anything.
+        // `u` is outside the alphabet and is not mapped to anything.
         bad.replace_range(36..37, "u");
         assert_eq!(
             refused(&bad),
@@ -810,8 +669,7 @@ mod tests {
         );
         let msg = refused(&bad).message();
         assert!(msg.contains("character 37"), "{msg}");
-        // The neighbouring GOOD characters must not leak either — the message may only
-        // discuss the position.
+        // Nor does it carry the neighbouring characters.
         assert!(!msg.contains(&bad[30..40]), "{msg}");
 
         // First and last positions, so the 1-based arithmetic is pinned at both ends.
@@ -823,8 +681,6 @@ mod tests {
         assert_eq!(refused(&last), PhraseError::BadChar { position: 52 });
     }
 
-    /// The character check runs BEFORE the length check: a phrase that is both wrong and
-    /// short is diagnosed by the character, which is what points at the line to re-read.
     #[test]
     fn a_bad_character_is_reported_even_when_the_length_is_also_wrong() {
         let mut bad = String::from(&SYNTHETIC[..40]);
@@ -832,9 +688,6 @@ mod tests {
         assert_eq!(refused(&bad), PhraseError::BadChar { position: 10 });
     }
 
-    /// Whitespace and hyphens are stripped, because the owner writes the phrase in
-    /// groups — and the position it reports counts the SIGNIFICANT characters, the way
-    /// the owner counts the ones they wrote, not the separators they typed between them.
     #[test]
     fn separators_are_stripped_and_positions_count_significant_characters() {
         let grouped = "0123 4567 89ab cdef ghjk mnpq rstv-wxyz\n\
@@ -851,8 +704,7 @@ mod tests {
         assert_eq!(refused(&bad), PhraseError::BadChar { position: 5 });
     }
 
-    /// A generated master is 52 lowercase alphabet characters, and two generations
-    /// differ — the CSPRNG is actually being consulted, not a constant returned.
+    /// Two generations differ, so the CSPRNG is consulted.
     #[test]
     fn generate_produces_a_fresh_fifty_two_character_phrase() {
         let a = generate_master().unwrap();
@@ -864,7 +716,7 @@ mod tests {
             "generated phrases are lowercase so the paper has one canonical spelling"
         );
         assert_ne!(a.as_str(), b.as_str(), "two masters must not be the same");
-        // ...and a generated phrase round-trips through the reader the owner will use.
+        // A generated phrase round-trips through the reader.
         assert_eq!(parse_master(a.as_str()).unwrap().as_str(), a.as_str());
     }
 
@@ -927,8 +779,6 @@ mod tests {
         );
     }
 
-    /// THE FINGERPRINT'S JOB: same key ⇒ same fingerprint, different key ⇒ different, and
-    /// the shape is the short hyphenated form a human can compare at a glance.
     #[test]
     fn the_fingerprint_matches_on_a_correct_transcription_and_differs_otherwise() {
         let phrase = parse_master(SYNTHETIC).unwrap();
@@ -942,8 +792,7 @@ mod tests {
                 .unwrap();
         assert_eq!(typed_back.seed().fingerprint().unwrap(), fp);
 
-        // A ONE-CHARACTER mistranscription changes it. This is the whole reason the
-        // fingerprint exists, so it is asserted rather than assumed.
+        // A one-character mistranscription changes it.
         let mut slip = String::from(SYNTHETIC);
         slip.replace_range(17..18, "7");
         assert_ne!(&slip, SYNTHETIC, "the fixture must actually differ");
@@ -954,9 +803,7 @@ mod tests {
         );
     }
 
-    /// The fingerprint is over the PUBLIC key. Fingerprinting the secret would be a slow
-    /// oracle against it, so this pins which input is used: `fingerprint(pubkey)` must
-    /// equal what `MasterSeed::fingerprint` returns.
+    /// Pins the input: the fingerprint is taken over the public key, never the secret.
     #[test]
     fn the_fingerprint_is_taken_over_the_public_key() {
         let seed = parse_master(SYNTHETIC).unwrap().seed();
@@ -965,8 +812,7 @@ mod tests {
             seed.fingerprint().unwrap(),
             fingerprint(kp.public_key().as_ref())
         );
-        // And the SEED's own bytes produce a different value, proving the public key is
-        // what was hashed rather than the secret happening to agree.
+        // Control: other 32 bytes fingerprint differently.
         let raw_seed_fp = fingerprint(&[0x01u8; 32]);
         assert_ne!(seed.fingerprint().unwrap(), raw_seed_fp);
     }
@@ -986,9 +832,8 @@ mod tests {
         assert!(!s.contains("0123"), "{s}");
     }
 
-    /// The scrub is not a no-op: a buffer holding the phrase is all zeroes afterwards.
-    /// (This tests the primitive, which is the only part of vector 9 that is testable —
-    /// whether the optimizer honours `write_volatile` is the compiler's contract.)
+    /// Tests the primitive, the only testable part of vector 9: whether the optimizer honours
+    /// `write_volatile` is the compiler's contract.
     #[test]
     fn scrub_zeroes_the_buffer() {
         let mut buf = *b"0123456789abcdef";

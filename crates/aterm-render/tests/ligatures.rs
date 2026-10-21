@@ -13,12 +13,9 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
-// The ligature test font: $ATERM_LIGATURE_TEST_FONT if set and readable, else the
-// committed JetBrains Mono fixture (compiled in, so it cannot go missing).
-//
-// The override is a dedicated test var, never a general font setting a
-// developer might export: several tests here assert fixture-specific shapes
-// (`=>` ligates, `zero` is present) and go red on any other face.
+// The ligature test font: $ATERM_LIGATURE_TEST_FONT if set and readable, else the committed
+// JetBrains Mono fixture. The override is a dedicated test var, not a general font setting,
+// because several tests assert fixture-specific shapes (`=>` ligates, `zero` is present).
 fn ligature_test_font() -> Vec<u8> {
     if let Ok(path) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         && let Ok(bytes) = std::fs::read(&path)
@@ -71,9 +68,8 @@ fn ligated_render_differs_from_unligated() {
     );
 }
 
-/// Control: "a = > b" has the operators separated by spaces, so NO ligature run
-/// forms (spaces break the run). The frame must be byte-IDENTICAL with ligatures
-/// on or off — the run coalescing must not perturb ordinary spaced text.
+/// Control: in "a = > b" spaces break every run, so the frame is byte-identical with
+/// ligatures on or off.
 #[test]
 fn spaced_operators_render_identically() {
     let text = b"a = > b";
@@ -87,10 +83,8 @@ fn spaced_operators_render_identically() {
     );
 }
 
-/// Render `text` under ligature `mode`, after applying a Simple selection over
-/// columns `[sel_start, sel_end]` inclusive on the (only) live row. The selection is driven
-/// through the public selection API the way the GUI does, then snapshotted via
-/// `cell_frame` so it lands in `RenderInput.selection`.
+/// Render `text` under `mode` with a Simple selection over columns `[sel_start, sel_end]`
+/// (inclusive) on the only row, driven through the public selection API.
 fn render_with_selection(
     mode: LigatureMode,
     text: &[u8],
@@ -102,8 +96,7 @@ fn render_with_selection(
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     term.process(text);
-    // Cover exactly columns [sel_start, sel_end]: a Left-sided start at sel_start
-    // and a Right-sided end at sel_end include both endpoints (see side adjustment).
+    // A Left-sided start and a Right-sided end include both endpoints.
     let sel = term.text_selection_mut();
     sel.start_selection(0, sel_start, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(0, sel_end, SelectionSide::Right);
@@ -112,8 +105,7 @@ fn render_with_selection(
     r.render_input(&input)
 }
 
-/// The pixels of column `c`'s vertical band (the whole cell height) in a 1-row,
-/// `cols`-column frame. Used to inspect a single cell's background/ink.
+/// Column `c`'s full-height pixel band in a 1-row, `cols`-column frame.
 fn column_band(frame: &aterm_render::Frame, c: usize, cols: usize) -> Vec<u32> {
     let cw = frame.width / cols;
     let x0 = c * cw;
@@ -125,12 +117,8 @@ fn column_band(frame: &aterm_render::Frame, c: usize, cols: usize) -> Vec<u32> {
     out
 }
 
-/// BLOCKER regression: a ligature spanning a SELECTION boundary must render
-/// per-cell, not as one glyph painted across the boundary. With a selection
-/// covering only the FIRST cell of a `=>` run, the frame must (a) differ from the
-/// no-selection ligated render, and (b) show the selection background in that
-/// selected cell — proving the ligature did NOT paint across the boundary and the
-/// selected cell kept its per-cell highlight.
+/// A ligature spanning a selection boundary renders per cell: with only the first cell of
+/// `=>` selected, that cell shows the selection background and the per-cell glyph.
 #[test]
 fn ligature_breaks_on_selection_boundary() {
     // "a=>b": '=' at col 1, '>' at col 2 form the arrow run; select only col 1.
@@ -145,26 +133,21 @@ fn ligature_breaks_on_selection_boundary() {
         (sel_on.width, sel_on.height),
         "a selection must not change frame dimensions"
     );
-    // (a) The selection-broken render must differ from the fully-ligated render:
-    // breaking the run on the selection boundary changes the ink (and the bg).
+    // (a) Breaking the run on the selection boundary changes the render.
     assert_ne!(
         no_sel.pixels, sel_on.pixels,
         "selecting half of '=>' must change the render — the ligature spanned the \
          selection boundary instead of breaking on it"
     );
-    // (b) The selected cell (col 1) must carry the theme selection background,
-    // proving the highlight is painted there per-cell.
+    // (b) The selected cell carries the theme selection background.
     let theme_sel = Theme::default().selection;
     let band = column_band(&sel_on, 1, 16);
     assert!(
         band.contains(&theme_sel),
         "selected cell of '=>' must show the selection background (0x{theme_sel:06X})"
     );
-    // (c) The discriminating gate: with the selection breaking the run, the
-    // selected cell (col 1) must render the PER-CELL '=' glyph — byte-identical to
-    // the SAME selected render with ligatures OFF (which also draws a per-cell
-    // '='). If the ligature had spanned the boundary, col 1 would instead show the
-    // ligature's empty PLACEHOLDER glyph, differing from the ligatures-off render.
+    // (c) The selected cell renders the per-cell '=', byte-identical to the ligatures-off
+    // render; a ligature spanning the boundary would show its empty placeholder there.
     assert_eq!(
         column_band(&sel_on, 1, 16),
         column_band(&sel_off, 1, 16),
@@ -193,7 +176,7 @@ fn selection_before_ligature_preserves_unselected_ligature() {
 /// boundary — so that render differs from the uniform-bold one too.
 #[test]
 fn ligature_breaks_on_style_change() {
-    // Uniform plain "=>", uniform bold "=>", and a SPLIT "=>" ('=' plain, '>' bold).
+    // Uniform plain "=>", uniform bold "=>", and a split "=>" ('=' plain, '>' bold).
     let (plain, bold, split) = (
         render(LigatureMode::Enabled, b"a\x1b[0m=>"),
         render(LigatureMode::Enabled, b"a\x1b[1m=>\x1b[0m"),
@@ -204,10 +187,8 @@ fn ligature_breaks_on_style_change() {
         plain.pixels, bold.pixels,
         "bold '=>' must ink differently than plain '=>'"
     );
-    // The mid-operator style change splits the run into two single shapeable
-    // cells, neither of which can ligate alone — so '=' renders as a plain '='
-    // glyph (plain weight) and '>' as a plain bold '>' glyph, NOT the arrow.
-    // That cannot equal either uniform-style ligated render.
+    // A mid-operator style change leaves two cells that cannot ligate alone, so it matches
+    // neither uniform-style arrow.
     assert_ne!(
         split.pixels, plain.pixels,
         "a style change mid-'=>' must prevent the all-plain arrow ligature"
@@ -218,14 +199,8 @@ fn ligature_breaks_on_style_change() {
     );
 }
 
-/// ITEM B — STYLED ligature cache (italic): a synthetic-italic `=>` must render
-/// DIFFERENTLY from a regular `=>`. The arrow draws as a single `mono_gid`
-/// ligature glyph; for the slant to reach the pixels the ITALIC style bit must
-/// survive (a) the shaped-run cache key `(run, style)` — so the italic run shapes
-/// independently of the regular one — and (b) the per-column ligature glyph key
-/// `mono_gid(gid, style)` — so the italic ligature glyph rasterizes with the
-/// synthetic slant. A pixel difference proves both. (Bold is already covered by
-/// `ligature_breaks_on_style_change`; this adds the italic axis.)
+/// A synthetic-italic `=>` inks differently from a regular one: the italic bit survives the
+/// shaped-run cache key `(run, style)` and the `mono_gid(gid, style)` ligature glyph key.
 #[test]
 fn italic_ligature_differs_from_regular() {
     let (regular, italic) = (
@@ -254,10 +229,8 @@ fn italic_ligature_differs_from_regular() {
 
 use aterm_types::text_shaping::{FontFeature, FontFeatureSet};
 
-/// The embedded last-resort face (DejaVu Sans Mono). Always available, so these
-/// tests never SKIP. DejaVu's GSUB advertises `liga`, `rlig`, `dlig`, … — we use
-/// the discretionary-ligature `dlig` feature as a concrete user feature whose
-/// effect on the shaper is observable (it ligates "fi" -> one glyph).
+/// The embedded last-resort face (DejaVu Sans Mono). Its GSUB has the discretionary `dlig`
+/// feature, which ligates "fi" into one glyph: an observable user feature.
 const DEJAVU: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
 
 /// `s` shaped on face 0 of `bytes` under `features`, each over the whole run
@@ -283,8 +256,7 @@ fn shape_gids(bytes: &[u8], s: &str, features: &[FontFeature]) -> Vec<u32> {
 /// changes what the renderer shapes.
 #[test]
 fn renderer_applies_config_font_features() {
-    // Build the resolved array the way the renderer does, from a config that
-    // carries a primary-font 'dlig' feature.
+    // A config carrying a primary-font 'dlig' feature.
     let cfg = TextShapingConfig {
         font_features: vec![FontFeatureSet {
             font_id: 0,
@@ -303,8 +275,7 @@ fn renderer_applies_config_font_features() {
 
     let mut r = Renderer::from_bytes(DEJAVU, 18.0, Theme::default()).unwrap();
 
-    // Apply the dlig config and confirm the renderer's resolved feature array
-    // changes shaping output for "fi" versus the empty-features default.
+    // The dlig config changes the resolved array's shaping of "fi".
     r.set_text_shaping(cfg);
     let dlig_gids = shape_gids(DEJAVU, "fi", r.resolved_features_for_test());
 
@@ -316,8 +287,7 @@ fn renderer_applies_config_font_features() {
          resolved shaping (base={base_gids:?}, dlig={dlig_gids:?})"
     );
 
-    // A feature scoped to a DIFFERENT font_id must not affect the primary face:
-    // its resolved array equals the empty/default one.
+    // A feature scoped to another font_id leaves the primary face's array at the default.
     r.set_text_shaping(cfg_other_font);
     let other_gids = shape_gids(DEJAVU, "fi", r.resolved_features_for_test());
     assert_eq!(
@@ -326,16 +296,9 @@ fn renderer_applies_config_font_features() {
     );
 }
 
-/// GATE regression for the "font_features silently dropped" bug. `row_glyph_plan`
-/// used to short-circuit to all-`PerCell` whenever ligatures were globally OFF (or
-/// the font advertised no liga/calt — the DEFAULT macOS fonts), swallowing the
-/// user's OpenType `font_features` before the feature array was ever read. With a
-/// user feature configured the planner must now RUN shaping regardless. We prove it
-/// at the PLAN seam (not just `resolved_features_for_test`, which the disabled path
-/// never read) via the test font's known "=>" ligation: an explicit user `calt=1`
-/// (last-writer-wins over the zeroed base) re-forms the ligature even with
-/// `LigatureMode::Disabled`, so a `Ligated` column appears — impossible under the
-/// old short-circuit.
+/// With a user font feature configured, `row_glyph_plan` shapes even when ligatures are
+/// off or the font has no liga/calt, so the feature is not swallowed: an explicit user
+/// `calt=1` re-forms the test font's `=>` under `LigatureMode::Disabled`.
 #[test]
 fn user_feature_reaches_plan_with_ligatures_off() {
     use aterm_render::ColumnGlyph;
@@ -345,8 +308,7 @@ fn user_feature_reaches_plan_with_ligatures_off() {
     let input = term.cell_frame(2, 8);
     let mut r = Renderer::from_bytes(&bytes, 18.0, Theme::default()).unwrap();
 
-    // Baseline: ligatures OFF, no user features -> the short-circuit keeps every
-    // column PerCell (the pre-fix behaviour, which must stay byte-identical).
+    // Ligatures off, no user features: every column stays PerCell.
     r.set_text_shaping(TextShapingConfig {
         ligature_mode: LigatureMode::Disabled,
         ..Default::default()
@@ -358,8 +320,8 @@ fn user_feature_reaches_plan_with_ligatures_off() {
         "ligatures off + no features must stay all-PerCell, got {off:?}"
     );
 
-    // Ligatures OFF but an explicit user liga/calt=1: `has_user_features` makes the
-    // planner shape, and last-writer-wins re-forms "=>", so a Ligated column appears.
+    // Ligatures off with an explicit user liga/calt=1: the planner shapes, and the user
+    // value wins over the zeroed base, so a Ligated column appears.
     r.set_text_shaping(TextShapingConfig {
         ligature_mode: LigatureMode::Disabled,
         font_features: vec![FontFeatureSet {
@@ -376,11 +338,9 @@ fn user_feature_reaches_plan_with_ligatures_off() {
     );
 }
 
-/// `unsupported_user_feature_tags` underpins the GUI's "font_features had no effect"
-/// diagnostic: a configured tag the font's GSUB advertises is supported (absent from
-/// the list), while an unsupported/typo'd tag is reported so the GUI can warn instead
-/// of leaving a silent no-op. DejaVu Sans Mono advertises `dlig` (proven elsewhere)
-/// but not `ss99`.
+/// `unsupported_user_feature_tags` (behind the GUI's "font_features had no effect"
+/// warning) reports a configured tag the font's GSUB lacks and omits one it advertises:
+/// DejaVu Sans Mono has `dlig` but not `ss99`.
 #[test]
 fn unsupported_user_feature_tags_reports_only_missing() {
     let mut r = Renderer::from_bytes(DEJAVU, 18.0, Theme::default()).unwrap();
@@ -403,11 +363,9 @@ fn unsupported_user_feature_tags_reports_only_missing() {
     assert!(r.unsupported_user_feature_tags().is_empty());
 }
 
-/// Regression for the deep-audit finding: an EFFECTIVE font feature must not drag an
-/// adjacent PROCEDURAL (box-drawing) cell onto the primary-by-glyph-id path. With
-/// `zero` enabled, the `0`s must shape (slashed) while the box-drawing `│` (U+2502)
-/// stays `PerCell` so it keeps its seamless FaceId::Procedural rendering — proving the
-/// per-column plan + procedural run-break, not the old run-wide acceptance.
+/// An effective font feature does not drag an adjacent procedural (box-drawing) cell onto
+/// the primary-by-glyph-id path: with `zero` on, the `0`s shape while `│` stays `PerCell`
+/// and keeps its `FaceId::Procedural` rendering.
 #[test]
 fn feature_does_not_drag_box_drawing_into_primary_face() {
     use aterm_render::ColumnGlyph;
@@ -445,19 +403,13 @@ fn feature_does_not_drag_box_drawing_into_primary_face() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// M4 — Cascadia N:1 MERGED ligatures (`admit_collapsed` / config
-// `merged_ligatures`): a run whose OpenType shaping COLLAPSES several cells into
-// ONE wide glyph is sliced into per-cell tiles.
-//
-// Any face with the classic Latin `f_i`/`f_l` ligatures collapses `fi`/`fl` to a
-// single glyph under `liga` — exactly the N:1 shape the Cascadia path handles.
-// The checked-in Luckiest Guy (Apache-2.0, `assets/game`) is such a face.
-// ---------------------------------------------------------------------------
+// Merged N:1 ligatures (`admit_collapsed`, config `merged_ligatures`): a run whose shaping
+// collapses several cells into one wide glyph is sliced into per-cell tiles. Any face with
+// Latin `fi`/`fl` ligatures collapses them under `liga`; the checked-in Luckiest Guy
+// (`assets/game`) is one.
 
-/// The checked-in face whose `fi` collapses N:1, plus the collapse it produces
-/// for `fi` (the wide gid and the cell count), read off a standalone shape with
-/// the renderer's base feature list.
+/// Luckiest Guy's bytes, plus the wide gid and cell count its `fi` collapses to under the
+/// renderer's base feature list.
 fn merged_ligature_font() -> (Vec<u8>, u16, u16) {
     let bytes = include_bytes!("../assets/game/LuckiestGuy-Regular.ttf").to_vec();
     let feats = aterm_render::ligature_shaping::build_feature_list(&[], true);
@@ -524,18 +476,16 @@ fn merged_ligature_slices_reach_pixels() {
     );
 }
 
-/// M4 — the wide glyph's per-cell slice TILES reassemble it byte-exactly through
-/// the RENDERER (`rasterize_ligature_slice` via `glyph_image`), on real font
-/// bytes. Rasterize the whole wide gid once, then every slice, and confirm each
-/// slice column reproduces the wide raster's corresponding column (folding the
-/// wide glyph's own `xmin`) — the tile-locality the blitter relies on.
+/// The per-cell slice tiles (`rasterize_ligature_slice` via `glyph_image`) reassemble the
+/// wide glyph byte-exactly on real font bytes: each slice column reproduces the wide
+/// raster's column, folding its `xmin`.
 #[test]
 fn merged_ligature_slice_tiles_reassemble_wide_glyph() {
     use aterm_render::{GlyphImage, StyleBits};
     let (bytes, gid, _n) = merged_ligature_font();
     let mut r = merged_renderer(&bytes, true);
     let (cell_w, _cell_h) = r.cell_size();
-    // The wide glyph, rasterized once (its real width/xmin from the font).
+    // The wide glyph, rasterized once.
     let parent = r.ligature_key(gid, StyleBits::REGULAR);
     let (pw, ph, pxmin, pbytes) = match r.glyph_image(parent).clone() {
         GlyphImage::Mono {
@@ -548,8 +498,7 @@ fn merged_ligature_slice_tiles_reassemble_wide_glyph() {
         GlyphImage::Rgba { .. } => panic!("the wide `fi` ligature must be Mono coverage"),
     };
     assert!(pw > 0 && ph > 0, "wide glyph must have ink");
-    // Slices span every cell the wide glyph's ink touches (run-origin space
-    // [xmin, xmin+pw)). Verify each source column round-trips through its slice.
+    // Slices span every cell the wide glyph's ink touches (run-origin [xmin, xmin+pw)).
     for s in 0..pw {
         let dest = s as i64 + pxmin as i64; // run-origin column
         if dest < 0 {
@@ -574,11 +523,8 @@ fn merged_ligature_slice_tiles_reassemble_wide_glyph() {
     }
 }
 
-/// M4 — the block cursor over a merged ligature recolours ONLY its own cell: with
-/// the cursor on cell 0 the frame differs from the cursorless frame ONLY within
-/// cell 0's pixel band, and cell 1's band is byte-identical (and vice-versa).
-/// Because each slice tile is cell-local, the W4 cut-out (clipped to the cursor
-/// rect) never bleeds a neighbour — the Cascadia analogue of the 1:1 cursor pin.
+/// A block cursor over a merged ligature changes only its own cell: each slice tile is
+/// cell-local, so the cut-out (clipped to the cursor rect) never touches the neighbour.
 #[test]
 fn merged_ligature_block_cursor_recolours_only_its_cell() {
     let (bytes, _gid, _n) = merged_ligature_font();
@@ -589,7 +535,7 @@ fn merged_ligature_block_cursor_recolours_only_its_cell() {
     let base = frame(&mut r, b"fi", 1, 4);
     let w = base.width;
 
-    // Render "fi" with a BLOCK cursor parked on a given column (steady block).
+    // "fi" with a steady block cursor on `col`.
     let cursor_frame = |r: &mut Renderer, col: u16| -> aterm_render::Frame {
         let mut term = Terminal::new(1, 4);
         term.process(b"\x1b[2 q"); // steady block cursor
@@ -599,7 +545,7 @@ fn merged_ligature_block_cursor_recolours_only_its_cell() {
         r.render_input(&input)
     };
 
-    // Columns of a cell's pixel band [pad + c*cell_w, pad + (c+1)*cell_w).
+    // A cell's pixel band is columns [pad + c*cell_w, pad + (c+1)*cell_w).
     let differs_in_band = |a: &aterm_render::Frame, b: &aterm_render::Frame, c: usize| -> bool {
         let (x0, x1) = (pad + c * cell_w, pad + (c + 1) * cell_w);
         for y in 0..a.height {
@@ -647,10 +593,8 @@ fn merged_ligature_block_cursor_recolours_only_its_cell() {
     );
 }
 
-/// M4 — the 1:1 spacer-convention path is BYTE-IDENTICAL whether or not
-/// `admit_collapsed` is set: on JetBrains Mono (which never collapses) rendering
-/// `a => b != c` with the flag on equals the flag off, frame for frame. The flag
-/// only ever ADDS the Cascadia branch; it cannot perturb a 1:1 font.
+/// `admit_collapsed` only adds the N:1 branch: on JetBrains Mono (which never collapses)
+/// the frame is byte-identical with the flag on or off.
 #[test]
 fn admit_collapsed_is_byte_identical_on_one_to_one_font() {
     let bytes = ligature_test_font();

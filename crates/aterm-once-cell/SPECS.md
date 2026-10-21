@@ -3,18 +3,11 @@
 
 # aterm-once-cell: spec recovery from its 23 unit tests
 
-> Status 2026-10-17: seven of the eight §4 checks are deleted (the racy-cell negative control and
-> the six `consumers.rs` dependency-graph guards), and their rows are gone. Counts elsewhere in this
-> file were taken before.
+> Status: migration worklist. Each of the 8 specs below is proved through Trust/Clean, and then the
+> tests it subsumes are deleted. Seven of the eight §4 non-spec checks (the racy-cell negative
+> control and the six `consumers.rs` dependency-graph guards) are deleted; one remains in §4.
 
-> Status 2026-10-16: spec recovery only, and no test has been deleted yet. This file is
-> the crate's migration worklist. Each of the 8 specs below is proved through Trust/Clean,
-> and then the tests it subsumes are deleted. The 8 checks in §4 sample no spec. Two of them
-> are deleted, and the other six move out of the unit suite (see §4).
-
-Source: `crates/aterm-once-cell` (read only). I read every `#[test]`
-(`tests/behaviour.rs` 17, `tests/consumers.rs` 6 = 23) and all of `src/lib.rs`.
-Nothing was compiled or run. The claims below come from reading the code.
+Source: `crates/aterm-once-cell` (`src/lib.rs` and `tests/behaviour.rs`).
 
 Result: **8 specs**, covering **15 tests**. **8 tests are not spec samples** (§4).
 
@@ -133,11 +126,6 @@ tests/behaviour.rs	a_panicking_initialiser_leaves_the_cell_usable	sync-panic-lea
   and the `sync::Lazy` half of `lazy-refines-lazymodel` are compositions over it.
 
 ## 4. Tests that are not spec samples
-
-> Status 2026-10-16: `the_exactly_once_test_catches_a_racy_cell` (and its test-only `RacyCell`) is deleted; the contention test it guarded stays until the `sync-init-exactly-once-concurrent` proof lands.
->
-> Status 2026-10-17: the six `consumers.rs` guards are deleted too, and their rows and the racy
-> cell's are gone. One row is left.
 
 | test | why | action |
 |---|---|---|

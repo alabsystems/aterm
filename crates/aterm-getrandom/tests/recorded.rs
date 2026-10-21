@@ -322,7 +322,19 @@ fn check(rows: &[Row]) {
         assert_eq!(err.to_string(), display, "{code}");
         assert_eq!(format!("{err:?}"), debug, "{code}");
         let io = std::io::Error::from(err);
-        assert_eq!(format!("{:?}", io.kind()), io_kind, "{code}");
+        // An OS code converts as upstream converts it, through
+        // `io::Error::from_raw_os_error`, whose kind is the standard
+        // library's to name: a newer one names EIO `InputOutputError` where
+        // the recording's named it `Uncategorized` (stock 1.99.1 on the
+        // Linux lane). The recorded kind is the one any other code takes.
+        match io_raw {
+            Some(errno) => assert_eq!(
+                io.kind(),
+                std::io::Error::from_raw_os_error(errno).kind(),
+                "{code}"
+            ),
+            None => assert_eq!(format!("{:?}", io.kind()), io_kind, "{code}"),
+        }
         assert_eq!(io.raw_os_error(), io_raw, "{code}");
         if !io_display.is_empty() {
             assert_eq!(io.to_string(), io_display, "{code}");

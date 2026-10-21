@@ -26,16 +26,9 @@
 //!    after the yank starts at `cp `'s walk at column 22, `walk_t(20)`, not one
 //!    step past `cp `'s end. [`a_wake_keeps_the_colours_of_the_band_it_covers`].
 //!
-//! The host seam is `tests/midline_insert_band.rs`'s: a real
-//! `aterm_core::terminal::Terminal` driven byte for byte, the frame hold's rows
-//! fed to `CursorGlow`, ticked on a 16 ms train, keys stamped as the host
-//! stamps them (`note_typed_glyph`; a navigation key `clear_typed_keeping_hand`
-//! then `note_motion`; a yank nothing, since `app_input.rs` stamps no hint for a
-//! chord that is not a navigation, typed, Tab, paste or kill key). The landing
-//! is read as `Engine::tick` reads it on the jump's own tick
-//! (`field_at(landing)` and `walk_origin_at(landing)` after the tick that
-//! replayed the move), and the band as the owner the geometry draws from,
-//! folded through `meteor::tri` as the ribbon and landing fold it.
+//! The seam is `midline_insert_band.rs`'s: a real `Terminal` fed byte for byte, the frame
+//! hold's rows fed to `CursorGlow` every 16 ms, keys stamped as `app_input.rs` stamps them (a
+//! yank stamps nothing), the landing read as `Engine::tick` reads it on the jump's tick.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, coverage, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -53,15 +46,14 @@ const CW: usize = 8;
 const CH: usize = 16;
 const ROWS: usize = 60;
 const COLS: usize = 140;
-/// 12 cps, the owner's pace.
+/// 12 cps.
 const KEY_MS: u64 = 83;
 /// A word motion's cadence.
 const HOP_MS: u64 = 150;
 const FRAME_MS: u64 = 16;
 /// Two readings of one colour agree to this (folded arc units).
 const SAME: f32 = 1e-4;
-/// The widest step the walk ever takes between neighbouring cells: one
-/// cell of the fast leg, `1/16`.
+/// The widest step the walk takes between neighbouring cells: one cell of the fast leg.
 const WALK_STEP_MAX: f32 = 1.0 / WALK_FAST_CELLS;
 
 fn geom() -> Geom {
@@ -71,7 +63,7 @@ fn geom() -> Geom {
 /// How the program repaints its line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// A shell at a visible caret (readline): the edit column on reprinted,
+    /// A shell at a visible caret (readline): the edit column onward reprinted,
     /// then `CUB` back to the caret; a motion is a bare `CUB`/`CUF`.
     Shell,
     /// Claude Code's bottom-pinned composer: the diff frame inside a DEC 2026
@@ -97,7 +89,7 @@ struct Landing {
     /// Meteors live after the jump's tick.
     meteors: u32,
     /// Once every corridor cell is born: `(dx, the band's folded t)` for
-    /// every LIT column `dx` cells right of the landing, `|dx| <= 3`.
+    /// every lit column `dx` cells right of the landing, `|dx| <= 3`.
     drawn: Vec<(i32, f32)>,
 }
 
@@ -138,7 +130,7 @@ struct Frame {
 }
 
 impl Frame {
-    /// The widest colour step between two LIT neighbouring columns:
+    /// The widest colour step between two lit neighbouring columns:
     /// `(left col, left t, right t)`.
     fn widest_step(&self) -> Option<(u16, f32, f32)> {
         self.lit
@@ -403,8 +395,8 @@ impl Host {
         self.nav(i, ms)
     }
 
-    /// The PROGRAM writes `s` at the caret and leaves the caret after it — no
-    /// key behind it (a shell at a visible caret; `Shape::Shell` only).
+    /// The program writes `s` at the caret and leaves the caret after it, no key behind it
+    /// (`Shape::Shell` only).
     fn program_writes(&mut self, s: &str, ms: u64) {
         assert_eq!(self.shape, Shape::Shell);
         self.schedule(ms);
@@ -414,8 +406,8 @@ impl Host {
         self.frame();
     }
 
-    /// The PROGRAM writes `s` after the caret and parks the caret back where
-    /// it was — a suggestion shown ahead of the hand (`Shape::Shell` only).
+    /// The program writes `s` after the caret and parks the caret back: a suggestion shown
+    /// ahead of the hand (`Shape::Shell` only).
     fn program_suggests(&mut self, s: &str, ms: u64) {
         assert_eq!(self.shape, Shape::Shell);
         self.schedule(ms);
@@ -483,25 +475,20 @@ impl Host {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The takes
-// ---------------------------------------------------------------------------
 
 /// How the middle of the line reached the glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Middle {
-    /// The take: the shell yanks the word (Alt-. `insert-last-word`, or Ctrl-Y),
-    /// writing it and leaving the caret after it. Neither chord is a
-    /// navigation, typed, Tab or paste key, so no key licenses the echo and
-    /// nothing is laid under it; the next key mints a second run on the row on
+    /// The take: the shell yanks the word (Alt-. or Ctrl-Y) and leaves the caret after it. No
+    /// key licenses the echo, so nothing is laid under it; the next key mints a second run on
     /// the first run's walk at its own column.
     Yanked,
-    /// CONTROL: every glyph typed — one run.
+    /// Control: every glyph typed, one run.
     Typed,
-    /// Control: the program suggests the word ahead of the caret (a zsh
-    /// autosuggestion) and the hand takes it with Ctrl-E, a keyed jump whose
-    /// corridor bridges the word on the first run's walk and which the next key
-    /// joins.
+    /// Control: the program suggests the word ahead of the caret (a zsh autosuggestion) and
+    /// the hand takes it with Ctrl-E, a keyed jump whose corridor bridges the word on the first
+    /// run's walk.
     Suggested,
 }
 
@@ -575,22 +562,12 @@ fn describe(l: &Landing) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // (1) The landing's walk and the band under it
-// ---------------------------------------------------------------------------
 
-/// (1) Every mark of a jump's landing wears the band it lands on. Read once the
-/// flight is over, pin and train (`tri(t_land)`) are the band's colour at the
-/// landing, and burst, jets and fan (`LandingWalk::at(dx)`) the band's colour
-/// `dx` cells along, wherever the band is lit within three cells.
-///
-/// * Ctrl-A across a yanked word ([`cp_then_home`]): on the jump's tick the
-///   field index takes the first run's `Base` under the unborn corridor cell
-///   while `walk_origin_at` takes the corridor's cohort; with one walk per row
-///   they agree. The typed control makes the same two picks on one walk.
-/// * ⌥F over a word an insert pushed ([`midline`]): a scrub, both readers take
-///   the same `Base` cell, and the pushed cells sit on their cohort's walk, so
-///   burst, jets and fan match the band at every column.
+/// Once the flight is over, pin and train (`tri(t_land)`) wear the band's colour at the landing
+/// and burst, jets and fan (`LandingWalk::at(dx)`) its colour `dx` cells along, within three
+/// cells. Takes: Ctrl-A across a yanked word ([`cp_then_home`]); ⌥F over a pushed word
+/// ([`midline`]).
 #[test]
 fn a_jump_s_landing_marks_wear_the_band_they_land_on() {
     let mut fails = Vec::new();
@@ -658,13 +635,10 @@ fn a_jump_s_landing_marks_wear_the_band_they_land_on() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // (2) The corridor over a band
-// ---------------------------------------------------------------------------
 
-/// What a corridor did to the light it covered, from the frame before the jump
-/// to the last frame read: the widest recolour of a column lit before and after
-/// `(col, before, after)`, and the widest step between lit neighbours on any
+/// What a corridor did to the light it covered: the widest recolour of a column lit before
+/// and after the jump `(col, before, after)`, and the widest step between lit neighbours on any
 /// frame from the jump on `(frame ms, left col, left t, right t)`.
 struct Corridor {
     recolour: Option<(u16, f32, f32)>,
@@ -707,20 +681,10 @@ fn corridor(h: &Host, jump_frame: usize, lo: u16, hi: u16) -> Corridor {
     }
 }
 
-/// (2) A wake keeps the colours of the band it covers (`Ribbon::wake`: the wake
-/// shares the band's walk origin, so an overlay over a draining band reads as
-/// one corridor). From the jump to the last frame read, no column lit before
-/// and after changes colour, and no two lit neighbours step wider than the
-/// walk's widest step (`1/16`).
-///
-/// On the yanked line ([`cp_line`]):
-///
-/// * Ctrl-A across the line ([`cp_then_home`]) must not repaint `cp ` on
-///   another walk;
-/// * ⌥B ⌥B back onto the word (a hop to `tmp`, then a jump across ` /`) lands
-///   the corridor beside `cp `'s last cell on the same walk.
-///
-/// Both controls lay every corridor on the row's one walk.
+/// `Ribbon::wake` shares the band's walk origin: from the jump on, no column lit before and
+/// after changes colour and no lit neighbours step wider than [`WALK_STEP_MAX`]. Gestures on
+/// [`cp_line`]: Ctrl-A across the line; ⌥B ⌥B back onto the word (a hop to `tmp`, then a jump
+/// across ` /`).
 #[test]
 fn a_wake_keeps_the_colours_of_the_band_it_covers() {
     let mut fails = Vec::new();
@@ -729,8 +693,6 @@ fn a_wake_keeps_the_colours_of_the_band_it_covers() {
             let (h, l, jump_at) = if gesture == "Ctrl-A" {
                 cp_then_home(middle)
             } else {
-                // Straight back onto the word to edit it: the first ⌥B a hop
-                // to `tmp`, the second a jump across ` /` onto the word.
                 let mut h = cp_line(middle);
                 h.word_left(HOP_MS);
                 let l = h.word_left(HOP_MS);

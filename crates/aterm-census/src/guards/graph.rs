@@ -6,8 +6,7 @@
 //! test's, and what a function reaches through calls of its own file.
 //!
 //! Lexical and per file, by name: a call through another file's function, a
-//! function pointer or selector dispatch is not followed. Each rule says what
-//! that leaves to the runtime censuses.
+//! function pointer or selector dispatch is not followed.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -255,7 +254,7 @@ fn appkit_door_findings(file: &SourceFile) -> Vec<Finding> {
 }
 
 // ---------------------------------------------------------------------------
-// shared-application: +[NSApplication sharedApplication] CREATES the
+// shared-application: +[NSApplication sharedApplication] creates the
 // application object, and with it a WindowServer connection.
 // ---------------------------------------------------------------------------
 

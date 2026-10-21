@@ -2,13 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests for the accounts core (`docs/DESIGN-claude-accounts-2026-10-01.md`
-//! §4, §5, §6): the roster's admission, the state's reader and its bounds,
-//! the condition table at its edges, the advice rule by rule, the
-//! transactions, the ledger row and the store.
-//!
-//! Every clock is the fixed [`NOW`]; every label is invented (`main`,
-//! `work-2`, `pool-a`); every path is under a temp dir or a root that does
-//! not exist. Nothing here reads a login, a keychain or a Claude home.
+//! §4–§7). Every clock is the fixed [`NOW`], every label invented, every path
+//! under a temp dir or a root that does not exist; nothing here reads a login,
+//! a keychain or a Claude home.
 
 use std::collections::BTreeSet;
 
@@ -438,8 +434,7 @@ fn a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins() {
         assert_eq!(login_env(row), (LOGIN_ENV, dir.to_string()));
         assert_eq!(parsed.row_for_login(Some(dir)), Some(row));
     }
-    // NEGATIVE CONTROL: nothing was canonicalized, so the slash and the
-    // space still tell two rows apart.
+    // Nothing is canonicalized: the trailing slash still tells two rows apart.
     assert_ne!(parsed.rows[0].dir, parsed.rows[1].dir);
 
     // The default login rides as the variable SET AND EMPTY, and is read
@@ -569,8 +564,8 @@ fn enrolled_is_the_rows_in_whose_login_directory_a_login_was_made() {
     assert_eq!(labels(&r), ["check-2", "main", "work-2"]);
     assert_eq!(cond("check-2", &here), Condition::Unseen);
 
-    // NEGATIVE CONTROL: a directory nobody may read is not enrolled, whatever
-    // it holds. (Skipped for a user no mode stops.)
+    // An unreadable directory is not enrolled, whatever it holds (skipped for
+    // a user no mode stops).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -647,6 +642,19 @@ fn full_state() -> State {
         start: "1790000000.250000".to_string(),
         done: Some("kept".to_string()),
     });
+    let main = s.accounts.entry("main".into()).or_default();
+    main.key = crate::harness::profile::AccountKey::claude("6f1c2b0e-0000-4000-8000-00000000c0de");
+    main.windows.insert(
+        SESSION_LIMIT.to_string(),
+        WindowFig {
+            pct_x10: 425,
+            reset: NOW + HOUR,
+            at: NOW - 6,
+            by: "00112233aabbccdd".to_string(),
+            source: SOURCE_TAP.to_string(),
+            epoch_at: Some(NOW - 8),
+        },
+    );
     s
 }
 
@@ -758,7 +766,7 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
         ..s.reset.clone().expect("the claim")
     });
     assert_eq!(read, want);
-    // NEGATIVE CONTROL: the keys were what differed.
+    // The keys were what differed.
     assert_ne!(read, s);
 
     // The empty state round-trips too.
@@ -797,8 +805,7 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
     let read = |doc: &Value| {
         State::from_json(&aterm_json::to_string(doc).expect("text"), NOW).expect("reads")
     };
-    // A file written before the undo was kept: nothing to take back, and
-    // the schema is the same one.
+    // A file with no `undo`: nothing to take back.
     let mut doc: Value = aterm_json::from_str(&text).expect("JSON");
     let top = doc.as_object_mut().expect("object");
     assert!(top.remove("undo").is_some());
@@ -809,9 +816,8 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
             ..mid.clone()
         }
     );
-    // A file written before those keys existed reads them as the weaker
-    // word: the account left was NOT proven, and no session holds the
-    // canary's place.
+    // Missing, those keys read as the weaker word: the account left was not
+    // proven, and no session holds the canary's place.
     let top = doc.as_object_mut().expect("object");
     assert!(top.remove("previous_proven").is_some() && top.remove("canary").is_some());
     assert_eq!(
@@ -876,13 +882,10 @@ fn unknown_keys_are_tolerated_and_a_file_this_build_must_not_guess_at_is_refused
     // tests', through `Store::load`.
 }
 
-/// A STAMP AHEAD OF THE CLOCK IS NOT NEWER THAN EVERYTHING. A state written
-/// while the clock ran a day fast (or merged from a machine whose clock
-/// does) is read with every observation's `at` — and the auth word's and
-/// the pin's — brought back to the reader's clock: `now` plus the skew
-/// allowed for another machine's observation, `now` for this machine's own.
-/// The instants that are MEANT to be ahead (a wall's reset, a window's, an
-/// offer's deadline) are left alone.
+/// A stamp ahead of the clock (the clock ran fast, or another machine's does)
+/// reads back as `now` plus the skew for another machine's observation, `now`
+/// for this machine's own (the auth word's, the pin's). Instants meant to be
+/// ahead (a reset, an offer's deadline) are left alone.
 #[test]
 fn a_stamp_ahead_of_the_clock_is_read_as_made_no_later_than_now_plus_the_skew() {
     let ahead = NOW + DAY;
@@ -952,7 +955,7 @@ fn a_stamp_ahead_of_the_clock_is_read_as_made_no_later_than_now_plus_the_skew() 
         main.sample.as_ref().and_then(|x| x.session_reset),
         Some(NOW + 3 * HOUR)
     );
-    // NEGATIVE CONTROL: read once the clock has caught up, nothing moves.
+    // Read once the clock has caught up, nothing moves.
     assert_eq!(State::from_json(&text, ahead), Ok(s));
 }
 
@@ -1265,8 +1268,8 @@ fn the_signed_out_labels_are_the_enrolled_ones_in_roster_order() {
     assert_eq!(signed_out(&r, &s, &here, NOW), ["main", "work-2"]);
     assert_eq!(signed_out(&r, &s, &BTreeSet::new(), NOW), ["main"]);
 
-    // NEGATIVE CONTROL: a limited row is not a signed-out one, and a label
-    // the roster does not list is nobody's.
+    // A limited row is not a signed-out one, and a label the roster does not
+    // list is nobody's.
     let mut s = state();
     limited(&mut s, "work-2", NOW + HOUR);
     low(&mut s, "pool-a");
@@ -1332,7 +1335,7 @@ fn a_wall_stands_until_its_instant_and_not_a_second_longer() {
         // Named, observed before its reset: the reset plus the grace.
         (wall(Some(reset), NOW, 0), reset + 150),
         (wall(Some(reset), reset, 0), reset + 150),
-        // Observed AFTER its own reset: 10 minutes, then 30, from the look.
+        // Observed after its own reset: 10 minutes, then 30, from the look.
         (wall(Some(reset), reset + 1, 1), reset + 1 + 10 * MIN),
         (wall(Some(reset), reset + 200, 1), reset + 200 + 10 * MIN),
         (wall(Some(reset), reset + 200, 2), reset + 200 + 30 * MIN),
@@ -1398,10 +1401,9 @@ fn low_is_a_running_window_at_its_threshold_however_near_its_reset() {
     assert_eq!(at(sample(0, 97), NOW), Condition::Low);
     assert_eq!(at(sample(100, 100), NOW), Condition::Low);
 
-    // LOW IS ABOUT THE ACCOUNT: at its threshold it is low until that
-    // window ends, however near the reset — what is left of the window is
-    // still all there is. (That it is about to be replaced is a reason not
-    // to LEAVE it early, which is `leave_early`'s and rule 4's.)
+    // At its threshold a window is low until it ends, however near its reset:
+    // what is left of it is all there is. Nearness is a reason not to leave
+    // early (`leave_early`, rule 4), not to call it fresh.
     let session = |reset: i64| Sample {
         session_reset: Some(reset),
         ..sample(95, 0)
@@ -1422,7 +1424,7 @@ fn low_is_a_running_window_at_its_threshold_however_near_its_reset() {
     assert!(week(NOW + 901).leave_early(NOW));
     assert!(!week(NOW + 900).leave_early(NOW));
     assert!(!sample(89, 96).leave_early(NOW), "not low at all");
-    // Two low windows: the account is low until the LAST of them ends, and
+    // Two low windows: the account is low until the last of them ends, and
     // the one far from its reset is reason enough to leave.
     let two = Sample {
         session_reset: Some(NOW + 5 * MIN),
@@ -1563,7 +1565,7 @@ fn one_wall_is_one_observation_until_it_is_found_standing_again() {
         Some(look3 + 30 * MIN)
     );
 
-    // A NEW wall (another reset) starts over; first seen late, it is on the
+    // A new wall (another reset) starts over; first seen late, it is on the
     // first rung.
     let next = reset + 5 * HOUR;
     assert_eq!(
@@ -1902,10 +1904,9 @@ fn every_non_candidate_has_its_reason_by_name() {
     );
 }
 
-/// AN ACCOUNT AT ITS THRESHOLD IS NEVER A FRESH CANDIDATE, however near its
-/// reset. The 15-minute guard is not part of `low`: otherwise an account with
-/// NOTHING left, ten minutes from its reset, reads as `usable` and the best
-/// fresh candidate, and a session spends a rotation to walk into a wall.
+/// An account at its threshold is never a fresh candidate, however near its
+/// reset: the 15-minute guard is not part of `low`, or a spent account would
+/// be the best fresh candidate and a rotation would walk into a wall.
 #[test]
 fn a_spent_account_about_to_reset_is_low_and_never_a_fresh_candidate() {
     let r = three();
@@ -1952,8 +1953,8 @@ fn a_spent_account_about_to_reset_is_low_and_never_a_fresh_candidate() {
     );
     assert_eq!(ask(&walled, &wall(), NOW), to("pool-a", false));
 
-    // With nowhere else to go the wall WAITS for that reset — the instant
-    // the account is fresh again — and takes it then.
+    // With nowhere else to go the wall waits for that reset, when the account
+    // is fresh again, and takes it then.
     note_auth(&mut walled, "pool-a", Auth::SignedOut, NOW);
     assert_eq!(
         next_usable(&r, &walled, &enrolled, NOW),
@@ -1967,8 +1968,8 @@ fn a_spent_account_about_to_reset_is_low_and_never_a_fresh_candidate() {
     );
     assert_eq!(ask(&walled, &wall(), NOW + 10 * MIN), to("work-2", false));
 
-    // NEGATIVE CONTROL: the same account one percent under its threshold is
-    // fresh, and — dedicated — the first candidate.
+    // One percent under its threshold the same account is fresh and, being
+    // dedicated, the first candidate.
     assert_eq!(ask(&world(89), &Point::TurnEnd, NOW), to("work-2", true));
 }
 
@@ -1995,7 +1996,7 @@ fn the_wait_is_for_the_earliest_instant_and_prefers_a_dedicated_one_minutes_late
         until(3 * HOUR, HOUR + DEDICATED_WAIT_S, HOUR),
         Some(HOUR + DEDICATED_WAIT_S)
     );
-    // NEGATIVE CONTROL: one second past the 15 minutes, the earliest wins.
+    // One second past the 15 minutes, the earliest wins.
     assert_eq!(
         until(3 * HOUR, HOUR + DEDICATED_WAIT_S + 1, HOUR),
         Some(HOUR)
@@ -2006,9 +2007,9 @@ fn the_wait_is_for_the_earliest_instant_and_prefers_a_dedicated_one_minutes_late
         Some(HOUR + 5 * MIN)
     );
 
-    // What has no instant: signed out, not enrolled. Fresh is `now`. A LOW
-    // account's is the end of the window that makes it low, when it is
-    // fresh again — here its session window, three hours off.
+    // What has no instant: signed out, not enrolled. Fresh is `now`. A low
+    // account's is the end of the window that makes it low, here its session
+    // window, three hours off.
     let mut s = state();
     limited(&mut s, "main", NOW + HOUR);
     note_auth(&mut s, "work-2", Auth::SignedOut, NOW);
@@ -2152,8 +2153,8 @@ fn rule_4_probes_when_the_sample_is_due_and_only_then() {
     // Never sampled: due at once.
     let s = on_main();
     assert_eq!(ask(&r, &s, Mode::Early, NOW), Advice::Probe);
-    // NEGATIVE CONTROLS: the probe is `early`'s alone; it is never typed at
-    // a wall; and a roster with nowhere to move to probes nothing.
+    // The probe is `early`'s alone; it is never typed at a wall; and a roster
+    // with nowhere to move to probes nothing.
     assert_eq!(
         ask(&r, &s, Mode::Wall, NOW),
         Advice::Stay(StayWhy::NothingDue)
@@ -2229,7 +2230,7 @@ fn no_account_is_probed_within_ninety_seconds_of_any_accounts_claim() {
     };
     // The floor through another account's claim: `work-2` at t, `main` at
     // t+90 (it writes over the one field), and `work-2` again is held off by
-    // THAT claim until t+180 — its own floor, to the second.
+    // that claim until t+180, its own floor.
     let mut s = claimed();
     assert!(claim_probe(&mut s, "main", "s-one", t + 90).is_some());
     assert_eq!(claim_probe(&mut s, "work-2", "s-two", t + 179), None);
@@ -2247,12 +2248,9 @@ fn no_account_is_probed_within_ninety_seconds_of_any_accounts_claim() {
     assert!(!probe_held(&on_main(), "main", t));
 }
 
-/// `advise` AND THE CLAIM SHARE ONE TEST: under another account's fresh
-/// claim the probe is not advised — the claim would be refused — and the
-/// rule goes on to the leave check, which moves a session off a low account
-/// ahead of its wall. NEGATIVE CONTROL: with no claim the same state is
-/// advised the probe (the low account's sample is stale: read again first),
-/// and so it is once the other account's claim is ninety seconds old.
+/// `advise` and the claim share one test ([`probe_held`]): under another
+/// account's fresh claim the probe is not advised, and the rule goes on to the
+/// leave check.
 #[test]
 fn under_another_accounts_fresh_claim_the_leave_check_answers() {
     let r = three();
@@ -2301,12 +2299,9 @@ fn under_another_accounts_fresh_claim_the_leave_check_answers() {
     assert_eq!(ask(&fresh_main, NOW), Advice::Stay(StayWhy::NothingDue));
 }
 
-/// THE UNPROVEN ACTIVE ACCOUNT IS NEVER PROBED: the session on the account
-/// a rotation chose, before that account has served a response, is the
-/// canary (or stands where one stood) — what a `/usage` read shows there is
-/// not known to be that account's, and the rotation's model reads no sample
-/// of it. NEGATIVE CONTROL: proven, the same account in the same state is
-/// probed.
+/// The unproven active account is never probed: what a `/usage` read shows
+/// there is not known to be that account's. Proven, the same account in the
+/// same state is probed.
 #[test]
 fn the_unproven_active_account_is_not_probed() {
     let r = three();
@@ -2357,8 +2352,8 @@ fn the_unproven_active_account_is_not_probed() {
         ask(&unproven(&low_two), "work-2", stale),
         Advice::Stay(StayWhy::Canary)
     );
-    // The hold lapsed changes nothing for the session ON the account: it
-    // has still not answered.
+    // The hold lapsed changes nothing for the session on the account: it has
+    // still not answered.
     let lapsed = State {
         canary: None,
         ..unproven(&bare)
@@ -2584,13 +2579,13 @@ fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
     assert!(committed.is_ok(), "{committed:?}");
     assert_eq!(ask(&again, &wall_at(written)), rotate);
 
-    // THE CLEARING IS WHAT IS ASKED, not the pin: `use --auto` after it
+    // The clearing is what is asked, not the pin: `use --auto` after it
     // leaves the wall lifted.
     let mut auto = s.clone();
     unpin(&mut auto, "use --auto", NOW).expect("a pin held");
     assert_eq!(ask(&auto, &wall_at(written)), resume);
 
-    // RULE 2 COMES FIRST. The owner's later word for another account is
+    // Rule 2 comes first: the owner's later word for another account is
     // followed…
     let mut moved_on = s.clone();
     pin(&mut moved_on, &r, &enrolled, "work-2", NOW - 30).expect("pins");
@@ -2625,8 +2620,8 @@ fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
     note_auth(&mut out, "main", Auth::SignedOut, NOW);
     assert_eq!(ask(&out, &wall_at(written)), rotate);
 
-    // A CLEARING STAMPED AHEAD OF THE CLOCK is read as made now, and its
-    // key with it (stated on `advise`: such a key moves with the clock).
+    // A clearing stamped ahead of the clock is read as made now, and its key
+    // with it (stated on `advise`: such a key moves with the clock).
     let mut ahead = s.clone();
     ahead.accounts.get_mut("main").expect("cleared").cleared_at = Some(NOW + DAY);
     assert_eq!(
@@ -2648,17 +2643,17 @@ fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first()
     let enrolled = all(&r);
     let opening = |s: &State| next_opening(&r, s, &enrolled, NOW);
 
-    // THE NEXT OPENING is an instant AHEAD: an account usable now has none.
+    // The next opening is an instant ahead: an account usable now has none.
     let mut s = on_main();
     fresh(&mut s, "main");
     assert_eq!(opening(&s), None, "nothing is due to open");
     limited(&mut s, "pool-a", NOW + 20 * MIN);
     limited(&mut s, "work-2", NOW + 2 * HOUR);
     assert_eq!(opening(&s), Some(NOW + 20 * MIN));
-    // NEGATIVE CONTROL: the report's question counts the account usable now.
+    // `next_usable` (the report's question) counts the account usable now.
     assert_eq!(next_usable(&r, &s, &enrolled, NOW), Some(NOW));
 
-    // THE CANARY'S HOLD: its end, cut at an opening before it.
+    // The canary's hold: its end, cut at an opening before it.
     let held = State {
         active: Some("work-2".into()),
         proven: false,
@@ -2678,7 +2673,7 @@ fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first()
     for not_ahead in [NOW, NOW - MIN] {
         assert_eq!(canary(Some(not_ahead)), Some(end), "{not_ahead}");
     }
-    // NEGATIVE CONTROLS: no hold stands — lapsed, or the account answered.
+    // No hold stands once it has lapsed or the account has answered.
     let lapsed = State {
         canary: Some(Canary {
             sid: "s-two".into(),
@@ -2699,7 +2694,7 @@ fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first()
         );
     }
 
-    // THE ROTATION BOUND: the hour's end, cut the same way.
+    // The rotation bound: the hour's end, cut the same way.
     let bound = StayWhy::Breaker {
         until: NOW + 50 * MIN,
     };
@@ -2815,8 +2810,8 @@ fn the_compare_and_set_refuses_by_name_and_changes_nothing() {
         );
     }
 
-    // A MOVER WITH NO SESSION ID could be no canary: nobody could answer
-    // for the account it chose, take its place by name or be forgotten.
+    // A mover with no session id could be no canary: nobody could answer for
+    // the account it chose, take its place by name or forget it.
     for sid in ["", " \n\t"] {
         let nobody = Mover {
             sid,
@@ -2931,8 +2926,8 @@ fn a_struck_candidate_puts_active_back_and_nobody_else_was_moved() {
     let not_moved = Strike::NotMoved("wait:changed".into());
     assert!(strike(&mut s, "pool-a", "s-one", &not_moved, NOW).is_empty());
 
-    // NEGATIVE CONTROL: an account that is not the unproven active one is
-    // marked, and `active` does not move.
+    // An account that is not the unproven active one is marked, and `active`
+    // does not move.
     let mut s = start();
     prove(&mut s, "work-2", NOW + 10).expect("proven");
     strike(&mut s, "work-2", "s-one", &Strike::SignedOut, NOW + 20);
@@ -3095,9 +3090,9 @@ fn a_refused_relaunch_takes_the_rotation_back_exactly() {
     );
     assert_eq!(s, before_either);
 
-    // THE CANARY OF THE ACCOUNT ROTATED PAST ENDS (its agent did) before
-    // the later rotation is taken back: its record is not put back to hold
-    // anyone, and the rotation it made is nobody's to undo.
+    // The canary of the account rotated past ends (its agent did) before the
+    // later rotation is taken back: its record is not put back to hold anyone,
+    // and the rotation it made is nobody's to undo.
     let mut s = second.clone();
     assert!(forget_session(&mut s, "s-one"));
     assert_eq!(s.undo.len(), 1, "its own rotation's undo went with it");
@@ -3112,8 +3107,8 @@ fn a_refused_relaunch_takes_the_rotation_back_exactly() {
     );
     assert!(!s.canary_holds(seen + 35));
 
-    // WHAT IS NOT PUT BACK: a pin the rotation ended. It was left on an
-    // account that cannot be run on, and is the owner's to give again.
+    // Not put back: a pin the rotation ended. It was left on an account that
+    // cannot be run on, and is the owner's to give again.
     let here: BTreeSet<String> = ["main", "work-2"].map(str::to_string).into();
     let pinned = State {
         active: Some("pool-a".into()),
@@ -3154,17 +3149,11 @@ fn a_refused_relaunch_takes_the_rotation_back_exactly() {
     }
 }
 
-/// A CANDIDATE THAT ANSWERS BADLY, CHOSEN PAST AN ACCOUNT THAT HAD NOT
-/// ANSWERED EITHER, LEAVES THAT ACCOUNT AS THE ROTATION FOUND IT. `s-one`
-/// rotates main -> work-2 and hits work-2's wall before any response (a wall
-/// recorded with no strike); `s-two` rotates past it to pool-a, which
-/// answers with a wall of its own. `active` is work-2 again WITH ITS OWN
-/// `previous` (main, proven) AND ITS OWN CANARY (`s-one`'s record), so a
-/// later strike of work-2 goes back to main, proven.
-///
-/// Were the strike to drop what the rotation wrote over, the second strike
-/// would go back to NOTHING — no active account, with a proven one
-/// standing — and the session still alone on work-2 would hold nobody.
+/// `s-one` rotates main -> work-2 and hits work-2's wall before any response
+/// (recorded with no strike); `s-two` rotates past it to pool-a, which answers
+/// with a wall of its own. `active` is work-2 again with its own `previous`
+/// (main, proven) and its own canary (`s-one`'s record), so a later strike of
+/// work-2 goes back to main, proven, and not to nothing.
 #[test]
 fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was() {
     let r = three();
@@ -3227,7 +3216,7 @@ fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was()
             "the session on it holds for the rest of ITS ten minutes: {word:?}"
         );
         assert!(!s.canary_holds(NOW + CANARY_HOLD_S), "…and no longer");
-        // THE ROTATION STAYS COUNTED, and the word stays on record.
+        // The rotation stays counted, and the word stays on record.
         assert_eq!(s.rotations.len(), 2, "{word:?}");
         assert!(
             !cond(&r, &s, "pool-a", at).runs(),
@@ -3245,9 +3234,9 @@ fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was()
             "{word:?}"
         );
 
-        // THE RELAUNCH OF THE SESSION ON work-2 REFUSED, heard now, takes
-        // ITS OWN rotation back — and its own time out of the bound, which
-        // is no longer the newest: the struck rotation's stays counted.
+        // The relaunch of the session on work-2 refused, heard now, takes its
+        // own rotation back and its own time out of the bound; the struck
+        // rotation's stays counted.
         let mut refused = s.clone();
         let not_moved = Strike::NotMoved("wait:changed".into());
         let events = strike(&mut refused, "work-2", "s-one", &not_moved, at + 5);
@@ -3266,7 +3255,7 @@ fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was()
         assert_eq!(s.rotations, [NOW, seen + 30], "{word:?}");
         assert_eq!(refused.rotations, [seen + 30], "{word:?}");
 
-        // A LATER STRIKE OF work-2 GOES BACK TO main, PROVEN.
+        // A later strike of work-2 goes back to main, proven.
         let events = strike(&mut s, "work-2", "s-one", &Strike::SignedOut, at + 5);
         assert_eq!(events[0].to.as_deref(), Some("main"), "{word:?}");
         assert_eq!(
@@ -3282,10 +3271,8 @@ fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was()
         );
     }
 
-    // NEGATIVE CONTROL: the same strike with nothing kept of what the
-    // rotation wrote over (a state written before the undo was) goes back to
-    // work-2 with no `previous` and no canary — and the strike after it to
-    // no account at all.
+    // With no undo kept, the same strike goes back to work-2 with no
+    // `previous` and no canary, and the strike after it to no account at all.
     let mut older = State {
         undo: Vec::new(),
         ..second.clone()
@@ -3304,12 +3291,10 @@ fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was()
     assert_eq!((older.active.as_deref(), older.proven), (None, false));
 }
 
-/// AT A WALL `me` IS LIMITED, WHETHER OR NOT ITS WALL IS ON RECORD YET. The
-/// host records the wall in the same transaction as the move, and `advise`
-/// gives the same answer asked before that or after.
-///
-/// Read as usable before its wall is recorded, `me` would turn "every other
-/// account limited" into `Stay(NoCandidate)` instead of the wait.
+/// The host records the wall in the same transaction as the move, and `advise`
+/// gives the same answer before or after: read as usable before its wall is
+/// recorded, `me` would turn "every other account limited" into
+/// `Stay(NoCandidate)` instead of the wait.
 #[test]
 fn at_a_wall_the_session_is_limited_whether_or_not_its_wall_is_recorded_yet() {
     let r = three();
@@ -3329,8 +3314,8 @@ fn at_a_wall_the_session_is_limited_whether_or_not_its_wall_is_recorded_yet() {
         out
     };
 
-    // Every other account is limited: the wait is for the first of THEM,
-    // not for the session's own account "usable now".
+    // Every other account is limited: the wait is for the first of them, not
+    // for the session's own account "usable now".
     let mut s = on_main();
     fresh(&mut s, "main");
     limited(&mut s, "work-2", NOW + 2 * HOUR);
@@ -3373,31 +3358,15 @@ fn at_a_wall_the_session_is_limited_whether_or_not_its_wall_is_recorded_yet() {
             until: NOW + 4 * HOUR + RESET_GRACE_S
         }
     );
-    // NEGATIVE CONTROL: the report asks for no session, and to it a fresh
-    // account is usable now.
+    // The report asks for no session, and to it a fresh account is usable now.
     assert_eq!(next_usable(&r, &s, &enrolled, NOW), Some(NOW));
 }
 
-/// THE LOST LOGIN SIGNED BACK IN ([`Point::LostLogin`]): a session moved
-/// from `main`'s wall onto `work-2` finds `work-2`'s login lost (met at
-/// `seen`); the host strikes it signed out, and with every other account
-/// limited the session waits for the first of them. Once the owner signs
-/// `work-2` in again (`accounts login`: its word `ok`, written after `seen`)
-/// the same point is advised the session's OWN account, as a follow — at
-/// both of the advice's arms. NEGATIVE CONTROLS: still signed out it is the
-/// wait; so it is with the strike not on record and nothing said of the
-/// login (`unseen` is not a login that came back), and with the strike not
-/// on record and the login's `ok` from before the lost login (its
-/// enrolment's check) or of its very second — while the same state with an
-/// `ok` written after it is the login back; at a usage wall the session's
-/// own account is never advised, whatever its login says; and an account
-/// the owner pinned since is followed instead (rule 2 comes first).
-///
-/// THE CANARY'S HOLD: another session rotates onto the login signed back
-/// in, and the lost login is then that canary's to wait behind
-/// ([`StayWhy::Canary`]) — NEGATIVE CONTROLS: the account proven, it is
-/// the plain follow; the hold lapsed, the move takes the canary's place,
-/// and that commits.
+/// [`Point::LostLogin`]: once the lost login is signed in again (an `ok`
+/// written after `seen`), the same point is advised the session's own account
+/// as a follow, at both of the advice's arms. An `ok` of `seen` or before is no
+/// sign-in; a usage wall never advises the session's own account; a pin since,
+/// or another session's canary on that login, comes first.
 #[test]
 fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
     let r = three();
@@ -3425,15 +3394,15 @@ fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
     };
     // The strike not on record: nothing says the login works.
     assert_eq!(at(&moved, &lost), wait);
-    // …nor does the word it had before it was lost (R1): its enrolment's
-    // check, or one of the very second the lost login was met.
+    // …nor does the word it had before it was lost: its enrolment's check,
+    // or one of the very second the lost login was met.
     for before in [NOW - DAY, NOW + 10] {
         let mut old = moved.clone();
         note_auth(&mut old, "work-2", Auth::Ok, before);
         assert_eq!(at(&old, &lost), wait, "an ok of {before}");
     }
-    // NEGATIVE CONTROL: the same state with the sign-in after it is the
-    // login back — behind this rotation's own canary, whose hold stands.
+    // With the sign-in after it the same state is the login back, behind this
+    // rotation's own canary, whose hold stands.
     let mut since = moved.clone();
     note_auth(&mut since, "work-2", Auth::Ok, NOW + 50);
     assert_eq!(at(&since, &lost), Advice::Stay(StayWhy::Canary));
@@ -3441,21 +3410,21 @@ fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
     let mut struck = moved.clone();
     strike(&mut struck, "work-2", "s-one", &Strike::SignedOut, NOW + 30);
     assert_eq!(struck.active.as_deref(), Some("main"), "put back");
-    // NEGATIVE CONTROL: still signed out.
+    // Still signed out: the wait.
     assert_eq!(at(&struck, &lost), wait);
 
     let mut back = struck.clone();
     note_auth(&mut back, "work-2", Auth::Ok, NOW + 50);
     assert_eq!(at(&back, &lost), follow("work-2", false));
-    // NEGATIVE CONTROL: a usage wall says the account is limited.
+    // A usage wall says the account is limited.
     assert_eq!(at(&back, &wall()), wait);
-    // NEGATIVE CONTROL: the owner pinned another account since.
+    // The owner pinned another account since: that is followed.
     let mut pinned = back.clone();
     pin(&mut pinned, &r, &enrolled, "main", NOW + 55).expect("pinned");
     assert_eq!(at(&pinned, &lost), follow("main", false));
 
     // Another session at `main`'s wall rotates onto the login signed back
-    // in first (R2): this one waits behind its canary.
+    // in first: this one waits behind its canary.
     let mut canary = back.clone();
     let other = Mover {
         sid: "s-two",
@@ -3472,11 +3441,11 @@ fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
     )
     .expect("rotates");
     assert_eq!(at(&canary, &lost), Advice::Stay(StayWhy::Canary));
-    // NEGATIVE CONTROL: proven, the plain follow.
+    // Proven: the plain follow.
     let mut proven = canary.clone();
     prove(&mut proven, "work-2", NOW + 58);
     assert_eq!(at(&proven, &lost), follow("work-2", false));
-    // NEGATIVE CONTROL: the hold lapsed, the canary's place is taken.
+    // The hold lapsed: the canary's place is taken.
     let lapsed = NOW + 55 + CANARY_HOLD_S + 1;
     assert_eq!(at_when(&canary, &lost, lapsed), follow("work-2", true));
     let expect = canary.canary.clone();
@@ -3485,19 +3454,10 @@ fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
     assert_eq!(taken.canary.map(|c| c.sid), Some("s-one".to_string()));
 }
 
-/// EVERY ROTATION THE ADVICE GIVES COMMITS, over every small state: three
-/// accounts each never seen, fresh, low or limited; `active` nothing or any
-/// of them — proven, pinned, or not answered yet with its canary's hold
-/// standing, lapsed or on no record; the hour's rotations spent or not; each
-/// session, at a wall recorded or not yet, and at a plain turn end.
-///
-/// At a wall the commit is on the state WITH THE WALL RECORDED (the host's
-/// one transaction), and the advice is the same asked before it is recorded
-/// or after. The pin never refuses an advised rotation: a wall on the pinned
-/// account has ended it. And every commit, refused its relaunch, is taken
-/// back to exactly the state it was made on (less a pin the rotation ended:
-/// one left on an account that cannot be run on, which no transaction here
-/// leaves).
+/// Over every small state, at a wall (recorded or not) and at a turn end:
+/// every rotation the advice gives commits on the state with the wall
+/// recorded, and refused its relaunch is taken back to exactly the state it
+/// was made on, less a pin the rotation ended.
 #[test]
 fn every_rotation_the_advice_gives_commits_once_the_wall_is_recorded() {
     let r = three();
@@ -3596,8 +3556,8 @@ fn every_rotation_the_advice_gives_commits_once_the_wall_is_recorded() {
                             if unrecorded {
                                 ahead_of_a_record += 1;
                                 pins_ended += usize::from(s.pinned && !recorded.pinned);
-                                // NEGATIVE CONTROL: before the wall is
-                                // recorded the compare-and-set may refuse.
+                                // Before the wall is recorded the
+                                // compare-and-set may refuse.
                                 match commit(&mut s.clone()) {
                                     Err(Lost::Pinned) => pinned_before += 1,
                                     Err(Lost::Held { .. }) => held_before += 1,
@@ -3657,7 +3617,7 @@ fn the_machine_rotates_at_most_twice_the_roster_size_an_hour() {
     // wall out — a wait, not a move.
     let mut s = with(times(bound));
     limited(&mut s, "main", NOW + HOUR);
-    // The breaker NAMES ITS INSTANT: the oldest rotation it counts plus the
+    // The breaker names its instant: the oldest rotation it counts plus the
     // hour, when the bound has room again and a waiting tab decides again.
     let lapses = NOW - 10 * (i64::try_from(bound).expect("fits") - 1) + ROTATION_WINDOW_S;
     assert_eq!(breaker_until(&s, &r, NOW), Some(lapses));
@@ -3905,18 +3865,17 @@ fn samples_offers_auth_and_sessions_are_recorded_newest_first() {
     assert_eq!(cond(&three(), &only_ran, "pool-a", NOW), Condition::Unseen);
 }
 
-/// A STAMP IN THE FUTURE IS NOT "RECENT". An age read as `now - t < WINDOW`
-/// with no lower bound makes a time stamped ahead of the clock (a clock set
-/// back) recent for as long as the clock is behind it: rotation times trip
-/// the breaker, a probe claim blocks the probe, and a held sample or wall
-/// shadows every real one.
+/// An age read as `now - t < WINDOW` with no lower bound makes a stamp ahead of
+/// the clock recent for as long as the clock is behind it: rotation times
+/// would trip the breaker, a probe claim block the probe, and a held sample or
+/// wall shadow every real one.
 #[test]
 fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
     let r = three();
     let enrolled = all(&r);
     let ahead = NOW + DAY;
 
-    // THE BREAKER: six rotations stamped tomorrow are not this hour's.
+    // The breaker: six rotations stamped tomorrow are not this hour's.
     let mut s = State {
         rotations: vec![ahead; 6],
         ..on_main()
@@ -3933,7 +3892,7 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
             takes_canary: false
         }
     );
-    // NEGATIVE CONTROL: the same six stamped a minute ago are.
+    // The same six stamped a minute ago are.
     let recent = State {
         rotations: vec![NOW - MIN; 6],
         ..s.clone()
@@ -3969,10 +3928,9 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
     assert!(note_sample(&mut s, "main", real, NOW + HOUR).is_empty());
     assert!(note_sample(&mut s, "main", sample(50, 50), NOW + HOUR).is_empty());
 
-    // AN OFFER seen while the clock ran a day fast does not shadow the next
-    // one — as it is held, and as it is read back from the file (stamped
-    // `now` plus the skew, at every read: a stamp no real offer was newer
-    // than, so a spent offer stayed "expiring" until the clock caught up).
+    // An offer seen while the clock ran a day fast does not shadow the next
+    // one, as held or as read back from the file (stamped `now` plus the skew
+    // at every read).
     let mut s = state();
     assert!(note_offer(
         &mut s,
@@ -4062,21 +4020,10 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
 /// A process's kernel start, as a host would hand it over. Invented.
 const START: &str = "1790000000.250000";
 
-/// ONE RESET ATTEMPT A WALL, MACHINE-WIDE. The claim is taken once; it is
-/// `Mine` only for the same session AND process while in flight; every other
-/// asker is held while it is in flight, whichever wall or account they ask
-/// for; and once it has an outcome, or is ten minutes old, the wall is
-/// attempted for everyone, the claimer included. A later wall is taken over
-/// the record; a wall that ends before an attempted one still standing is
-/// not. The wall is the same wall under ANY LABEL: the slot is the machine's
-/// own login's, and a roster written or a row renamed since the attempt
-/// gives that login another label, under which the wall is attempted still.
-///
-/// NEGATIVE CONTROLS: an outcome told by a session that does not hold the
-/// claim (another session, another wall, another account) changes nothing;
-/// another account's claim is not in flight on this one; a later wall is
-/// taken under the new label as under the old; and a claim nobody could hold
-/// writes nothing.
+/// One reset attempt a wall, machine-wide: the claim is `Mine` only for the
+/// same session and process while in flight, and holds every other asker; once
+/// it has an outcome or is [`RESET_CLAIM_S`] old, the wall is attempted for
+/// everyone. The slot is the machine's own login's, whatever its label.
 #[test]
 fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     let until = NOW + 30 * HOUR;
@@ -4158,11 +4105,11 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
         reset_in_flight(&s, "main", NOW + 5),
         Some(NOW + RESET_CLAIM_S)
     );
-    // NEGATIVE CONTROL: it is in flight on its own account alone.
+    // It is in flight on its own account alone.
     assert_eq!(reset_in_flight(&s, "work-2", NOW + 5), None);
 
-    // TEN MINUTES, and not a second less: then it is an attempt nobody
-    // finished — for the claimer too — and it holds nobody.
+    // Ten minutes, and not a second less: then it is an attempt nobody
+    // finished, for the claimer too, and it holds nobody.
     let last = NOW + RESET_CLAIM_S - 1;
     assert_eq!(take(&mut s, "s-one", 41, until, last), ResetClaimed::Mine);
     assert_eq!(take(&mut s, "s-two", 42, until, last), held);
@@ -4177,7 +4124,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     assert_eq!(reset_in_flight(&s, "main", lapsed), None);
     assert_eq!(s, claimed, "still nothing written");
 
-    // AN OUTCOME ends it at once, whatever it was: kept is final.
+    // An outcome ends it at once, whatever it was: kept is final.
     let mut done = claimed.clone();
     assert_eq!(
         reset_outcome(
@@ -4199,7 +4146,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     }
     assert_eq!(reset_in_flight(&done, "main", NOW + 10), None);
 
-    // A NEW WALL — a later reset — is taken, over the record of the old one,
+    // A new wall (a later reset) is taken over the record of the old one,
     // from a claim that is done and from one that lapsed.
     for (name, from, now) in [("done", &done, NOW + 10), ("lapsed", &claimed, lapsed)] {
         let mut next = from.clone();
@@ -4224,7 +4171,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
             "{name}"
         );
     }
-    // A wall of this account that ends BEFORE the attempted one, while that
+    // A wall of this account that ends before the attempted one, while that
     // one still stands, does not take the record's place…
     let before = done.clone();
     assert_eq!(
@@ -4232,18 +4179,16 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
         ResetClaimed::Attempted
     );
     assert_eq!(done, before);
-    // …NEGATIVE CONTROL: once the attempted wall's own reset has come it
-    // does.
+    // …once the attempted wall's own reset has come, it does.
     assert_eq!(
         take(&mut done.clone(), "s-two", 42, until - HOUR, until),
         ResetClaimed::Taken
     );
 
-    // UNDER ANOTHER LABEL IT IS THE SAME WALL. The attempt was made as
-    // `main` — the row of a machine with no roster — and the owner has since
-    // written a roster that calls this login `personal`: the wall, and one
-    // that ends before it, are attempted still, from a claim that is done
-    // and from one that lapsed, for a new process of the claimer's as for
+    // Under another label it is the same wall: the attempt was made as `main`
+    // (a machine with no roster), and a roster since calls this login
+    // `personal`. The wall, and one that ends before it, are attempted still,
+    // from a claim done or lapsed, for a new process of the claimer's as for
     // anyone.
     let renamed = |s: &State, sid: &str, pid: u32, until: i64, now: i64| {
         let mut s = s.clone();
@@ -4268,7 +4213,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
             assert_eq!(said, ResetClaimed::Attempted, "{name} {sid} {wall}");
             assert_eq!(&after, from, "{name}: nothing written");
         }
-        // NEGATIVE CONTROL: a later wall is taken under the new label.
+        // A later wall is taken under the new label.
         let (said, after) = renamed(from, "s-two", 42, until + 7 * DAY, now);
         assert_eq!(said, ResetClaimed::Taken, "{name}");
         assert_eq!(
@@ -4289,9 +4234,9 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
         ResetClaimed::Mine
     );
 
-    // NEGATIVE CONTROL: an outcome from a session that does not hold the
-    // claim changes nothing — another session, another wall, another
-    // account — and neither does a second outcome for a claim that has one.
+    // An outcome from a session that does not hold the claim (another
+    // session, another wall, another account) changes nothing, and neither
+    // does a second outcome for a claim that has one.
     let mut told = claimed.clone();
     let used = ResetDone::Used {
         kind: aterm_phase::ResetKind::Weekly,
@@ -4314,8 +4259,8 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     // …and with no claim at all.
     assert!(reset_outcome(&mut state(), "main", until, "s-one", &used, NOW).is_empty());
 
-    // A CLAIM NOBODY COULD HOLD is not taken: no session, no process, a
-    // label no roster carries.
+    // A claim nobody could hold is not taken: no session, no process, a label
+    // no roster carries.
     let mut empty = state();
     for (account, sid, pid, start) in [
         ("main", "", 41, START),
@@ -4340,8 +4285,8 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     }
     assert_eq!(empty, state());
 
-    // A CLAIM STAMPED AHEAD OF THE CLOCK (a clock set back) is not in
-    // flight: it holds nobody, and its wall is not tried again.
+    // A claim stamped ahead of the clock (a clock set back) is not in flight:
+    // it holds nobody, and its wall is not tried again.
     let ahead = State {
         reset: Some(ResetClaim {
             at: NOW + DAY,
@@ -4355,8 +4300,8 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
         ResetClaimed::Attempted
     );
 
-    // A claim an older build left, of no process's: held while in flight,
-    // never `Mine`.
+    // A claim of no process's (no pid, no start): held while in flight, never
+    // `Mine`.
     let mut older = claimed.clone();
     let claim = older.reset.as_mut().expect("the claim");
     (claim.pid, claim.start) = (0, String::new());
@@ -4431,8 +4376,8 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
         ),
         ResetClaimed::Taken
     );
-    // NEGATIVE CONTROL: with the reset only claimed, the wall stands and the
-    // session at its row is rotated.
+    // With the reset only claimed, the wall stands and the session at its
+    // row is rotated.
     assert!(limited_now(&walled));
     assert_eq!(ask(&walled), rotate);
 
@@ -4649,7 +4594,7 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
         );
     }
 
-    // A REASON IS ONE BOUNDED WORD: whatever it is handed, no path, no
+    // A reason is one bounded word: whatever it is handed, no path, no
     // address and no second line reaches the ledger.
     let long = "é".repeat(400);
     for (given, kept) in [
@@ -4669,15 +4614,10 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
     }
 }
 
-/// A RESET IS ALLOWED ONLY ON THIS MACHINE'S OWN LOGIN, with the machine on
-/// that account or on none, and no other login on record as run within 25
-/// hours before the process started: the vendor posts the claim to the home
-/// profile's organization, which another login's process may have moved.
-///
-/// NEGATIVE CONTROLS: a row with a `dir`, a label nobody listed and another
-/// `active` each refuse by their own word; another row's run 24 h before
-/// the start refuses where 26 h passes; and the account's OWN run refuses
-/// nothing.
+/// A reset is allowed only on this machine's own login, with the machine on
+/// that account or on none, and no other login on record as run within
+/// [`RESET_PROFILE_S`] before the process started. Each refusal has its own
+/// word; the account's own run refuses nothing.
 #[test]
 fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_record() {
     let r = three();
@@ -4715,7 +4655,7 @@ fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_reco
     };
     assert_eq!(ok(&moved, "main"), Err("active-other"));
 
-    // ANOTHER LOGIN RAN. Its session is gone; its stamp is what is asked.
+    // Another login ran: its session is gone, and its stamp is what is asked.
     let ran = |label: &str, at: i64| {
         let mut s = state();
         note_session(&mut s, "s-x", label, None, at);
@@ -4736,7 +4676,7 @@ fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_reco
         ok(&ran("work-2", started - RESET_PROFILE_S + 1), "main"),
         Err("other-login")
     );
-    // One that ran AFTER this process started counts too.
+    // One that ran after this process started counts too.
     assert_eq!(
         ok(&ran("pool-a", started + MIN), "main"),
         Err("other-login")
@@ -4746,11 +4686,11 @@ fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_reco
         ok(&ran("gone-9", started - HOUR), "main"),
         Err("other-login")
     );
-    // NEGATIVE CONTROL: the account's own run refuses nothing.
+    // The account's own run refuses nothing.
     assert_eq!(ok(&ran("main", started - HOUR), "main"), Ok(()));
 
-    // A session STILL ON RECORD on another account says the same with no
-    // stamp at all (a state an older build wrote).
+    // A session still on record on another account says the same with no
+    // stamp at all.
     let on_record = |at: i64| {
         let mut s = state();
         s.sessions.insert(
@@ -4814,7 +4754,9 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
             "warned",
             "renewed",
             "login-ended",
-            "wrong-account"
+            "wrong-account",
+            "reset",
+            "epoch"
         ]
     );
 
@@ -4925,7 +4867,7 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
         assert!(wakes(kind, "lifted"), "{}", kind.as_str());
     }
     assert!(wakes(Kind::Auth, "ok"));
-    // NEGATIVE CONTROLS.
+    // What wakes nobody.
     assert!(!wakes(Kind::Auth, "signed-out"));
     let quiet = [
         Kind::Wall,
@@ -4938,6 +4880,8 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
         Kind::Warned,
         Kind::LoginEnded,
         Kind::WrongAccount,
+        Kind::Reset,
+        Kind::Epoch,
     ];
     for kind in quiet {
         assert!(!wakes(kind, "ok"), "{}", kind.as_str());
@@ -4974,7 +4918,7 @@ fn the_store_keeps_the_state_private_and_reads_back_what_it_wrote() {
     }
 
     // Nothing there: the empty state, no note, nothing written by a read —
-    // and a machine id, minted.
+    // and a machine id, minted for that read.
     let (first, note) = store.load(NOW).expect("no file is ours");
     assert_eq!(note, None);
     assert!(!store.dir.exists(), "a read makes nothing");
@@ -5012,6 +4956,168 @@ fn the_store_keeps_the_state_private_and_reads_back_what_it_wrote() {
     );
 }
 
+/// THE MACHINE ID IS MINTED ONCE AND KEPT (the account-stats design §6.3,
+/// F16): a transaction keeps it before its edit stamps anything — 0600 in
+/// `<dir>/machine` — and every load after, by this store or another
+/// instance's over the same directory, names that machine, as do the
+/// observations the transaction made; eight instances keeping one at once
+/// into an empty directory keep one; the id a `state.json` an older build
+/// wrote holds is the one kept, and the kept one then outranks a state that
+/// says another. A load alone writes nothing. NEGATIVE CONTROLS: with no id
+/// kept, two loads mint two ids — the per-load id every read-only answer
+/// carried before; and a file that holds no id is never written over.
+#[test]
+fn the_machine_id_is_minted_once_and_kept() {
+    let dir = tmp("machine-id");
+    let store = Store::at(dir.path());
+    // NEGATIVE CONTROL first: nothing kept, a load writes nothing and two
+    // loads name two machines.
+    let (a, b) = (
+        store.load(NOW).expect("ours").0.machine,
+        store.load(NOW).expect("ours").0.machine,
+    );
+    assert_ne!(a, b, "minted per load with none kept");
+    assert!(!store.dir.exists(), "a load makes nothing");
+    let mut note = None;
+    store
+        .transact(NOW, &mut note, |state| {
+            Ok(note_wall(
+                state,
+                "main",
+                WEEK_LIMIT,
+                Some(NOW + HOUR),
+                NOW,
+                NOW,
+            ))
+        })
+        .expect("recorded");
+    let id = std::fs::read_to_string(store.machine_file())
+        .expect("kept")
+        .trim()
+        .to_owned();
+    #[cfg(unix)]
+    assert_eq!(mode(&store.machine_file()), 0o600);
+    let held = store.load(NOW).expect("ours").0;
+    assert_eq!(held.machine, id, "a load after");
+    assert_eq!(
+        held.accounts["main"].walls[WEEK_LIMIT].by, id,
+        "its observation"
+    );
+    assert_eq!(
+        Store::at(dir.path()).load(NOW).expect("ours").0.machine,
+        id,
+        "another instance"
+    );
+    assert_eq!(store.machine_id("").expect("kept"), id, "kept once");
+    // Eight instances keeping one into an empty directory at once: one id.
+    let race = tmp("machine-race");
+    let ids: BTreeSet<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| Store::at(race.path()).machine_id("").expect("kept")))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a keep"))
+            .collect()
+    });
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    // A candidate is borrowed until exclusive creation succeeds: collisions
+    // leave its bytes and name alone, and never wait for a FIFO reader.
+    let collisions = tmp("machine-collisions");
+    let collision_store = Store::at(collisions.path());
+    collision_store.ensure().expect("dir");
+    let occupied = collision_store.dir.join("occupied");
+    std::fs::write(&occupied, "borrowed sentinel").expect("sentinel");
+    assert_eq!(
+        collision_store
+            .keep_machine_at("00112233aabbccdd", &occupied)
+            .expect_err("occupied")
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        std::fs::read_to_string(&occupied).expect("preserved"),
+        "borrowed sentinel"
+    );
+    assert!(!collision_store.machine_file().exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+        let fifo = collision_store.dir.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("path");
+        // SAFETY: `name` is a live terminated path in this test's directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            collision_store
+                .keep_machine_at("00112233aabbccdd", &fifo)
+                .expect_err("occupied FIFO")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .expect("preserved FIFO")
+                .file_type()
+                .is_fifo()
+        );
+    }
+    // A fresh candidate publishes and is removed; a later candidate loses
+    // the final hard link without replacing the machine another call kept.
+    let fresh = collision_store.dir.join("fresh");
+    collision_store
+        .keep_machine_at("00112233aabbccdd", &fresh)
+        .expect("published");
+    assert!(!fresh.exists());
+    assert_eq!(
+        collision_store.machine_id("").expect("kept"),
+        "00112233aabbccdd"
+    );
+    collision_store
+        .keep_machine_at("ffffeeeeddddcccc", &fresh)
+        .expect("the earlier machine wins");
+    assert!(!fresh.exists());
+    assert_eq!(
+        collision_store.machine_id("").expect("still kept"),
+        "00112233aabbccdd"
+    );
+    // An older build's state.json: its id is the one kept.
+    let older = tmp("machine-older");
+    let older_store = Store::at(older.path());
+    older_store.ensure().expect("dir");
+    let mut old = state();
+    old.machine = "00112233aabbccdd".to_string();
+    std::fs::write(older_store.state_file(), old.to_json()).expect("write");
+    let mut note = None;
+    older_store
+        .transact(NOW, &mut note, |_| Ok(Vec::new()))
+        .expect("a transaction");
+    assert_eq!(
+        older_store.machine_id("").expect("kept"),
+        "00112233aabbccdd"
+    );
+    // The kept id outranks a state.json that says another.
+    std::fs::write(older_store.state_file(), {
+        old.machine = "ffffeeeeddddcccc".to_string();
+        old.to_json()
+    })
+    .expect("write");
+    assert_eq!(
+        older_store.load(NOW).expect("ours").0.machine,
+        "00112233aabbccdd"
+    );
+    // NEGATIVE CONTROL: a file that holds no id: no id, a note, kept as is.
+    std::fs::write(store.machine_file(), "not an id\n").expect("write");
+    let (state, note) = store.load(NOW).expect("ours");
+    assert_eq!(state.machine, "");
+    assert!(note.is_some_and(|n| n.contains("no machine id could be read")));
+    assert!(store.machine_id("").is_err());
+    assert_eq!(
+        std::fs::read_to_string(store.machine_file()).expect("kept as is"),
+        "not an id\n"
+    );
+}
+
 #[test]
 fn a_torn_state_file_is_an_empty_state_and_a_note_never_a_panic() {
     let dir = tmp("torn");
@@ -5046,13 +5152,10 @@ fn a_torn_state_file_is_an_empty_state_and_a_note_never_a_panic() {
     assert_eq!(store.load(NOW), Ok((s, None)));
 }
 
-/// A STATE FILE THAT IS NOT OURS IS NEVER SAVED OVER. One of another schema
-/// (a newer build's, read here by an older one), one that cannot be read,
-/// one too large: `load` REFUSES, by name, instead of handing back an empty
-/// state for the next save to write over the pin, the walls and the
-/// signed-out words that file may hold.
-///
-/// NEGATIVE CONTROL: the same directory with this build's own file loads.
+/// A state file that is not ours is never saved over: one of another schema,
+/// one that cannot be read, or one too large is refused by name, not read as
+/// an empty state the next save would write over the pin, walls and
+/// signed-out words it may hold.
 #[test]
 fn a_state_file_that_is_not_ours_is_a_refusal_and_never_an_empty_state() {
     let dir = tmp("not-ours");
@@ -5110,7 +5213,7 @@ fn a_state_file_that_is_not_ours_is_a_refusal_and_never_an_empty_state() {
         std::fs::set_permissions(store.state_file(), readable).expect("chmod");
     }
 
-    // NEGATIVE CONTROL.
+    // This build's own file loads.
     std::fs::write(store.state_file(), &good).expect("write");
     assert_eq!(store.load(NOW), Ok((ours, None)));
 }
@@ -5223,7 +5326,7 @@ fn the_ledger_appends_whole_rows_and_is_cut_to_its_newest() {
     );
     assert_eq!(kept.first().map(|e| e.t), Some(NOW + 10 + 6000 - 1024));
     assert!(std::fs::metadata(store.ledger_path()).expect("stat").len() <= LEDGER_MAX_BYTES);
-    // NEGATIVE CONTROL: a small append after the cut cuts nothing more.
+    // A small append after the cut cuts nothing more.
     store
         .append(&[Event::new(NOW + 9999, Kind::Use, "main")])
         .expect("appends");
@@ -5300,7 +5403,7 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
     ];
     assert_eq!(env_of(&unrelated), stored());
 
-    // THE LOGIN, VERBATIM: a space and a trailing slash survive, and no
+    // The login, verbatim: a space and a trailing slash survive, and no
     // spelling is folded onto another. Empty is the default login.
     for dir in [
         "/logins/work-2",
@@ -5320,7 +5423,7 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
     }
     assert_eq!(env_of(&[(LOGIN_ENV, "")]), stored());
 
-    // THE HOME: any value moves it; empty does not.
+    // The home: any value moves it; empty does not.
     assert_eq!(
         env_of(&[(HOME_ENV, "/elsewhere")]),
         ProcessLogin {
@@ -5330,9 +5433,9 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
     );
     assert_eq!(env_of(&[(HOME_ENV, "")]), stored());
 
-    // NOT A STORED LOGIN: each variable that gives the process a credential,
-    // a provider or a route of its own — the seven the design's rule 1
-    // stands on by name, then every one of both lists.
+    // Not a stored login: each variable that gives the process a credential,
+    // a provider or a route of its own (the seven design rule 1 names, then
+    // every one of both lists).
     let named = [
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -5358,7 +5461,7 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
             .any(|p| prefixed.starts_with(p))
     );
     for name in named.iter().chain(listed).chain([&prefixed]) {
-        // SET MEANS NOT EMPTY: a zero and a space are set.
+        // Set means not empty: a zero and a space are set.
         for value in ["sk-not-a-key", "1", "0", " ", "false"] {
             assert_eq!(
                 env_of(&[(name, value)]),
@@ -5369,7 +5472,7 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
                 "{name}={value:?}"
             );
         }
-        // NEGATIVE CONTROL: set and empty is not set.
+        // Set and empty is not set.
         assert_eq!(env_of(&[(name, "")]), stored(), "{name}=");
     }
 
@@ -5388,7 +5491,7 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
         }
     );
 
-    // A NAME GIVEN TWICE. The home and a credential: either one counts.
+    // A name given twice: for the home and a credential, either one counts.
     assert!(!env_of(&[(HOME_ENV, ""), (HOME_ENV, "/elsewhere")]).default_home);
     assert!(!env_of(&[("ANTHROPIC_API_KEY", "k"), ("ANTHROPIC_API_KEY", "")]).stored_login);
     // The login, with two values: it cannot be told, so it is the first and
@@ -5410,7 +5513,7 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
             "{a:?} then {b:?}"
         );
     }
-    // NEGATIVE CONTROL: the same value twice is one login.
+    // The same value twice is one login.
     assert_eq!(
         env_of(&[(LOGIN_ENV, "/logins/work-2"), (LOGIN_ENV, "/logins/work-2")]),
         ProcessLogin {
@@ -5457,11 +5560,10 @@ fn a_process_login_names_its_row_byte_for_byte() {
     );
 }
 
-/// [`judged_label`]: the row a process's login names, only for a stored
-/// login in the default home. NEGATIVE CONTROLS: a login no row names (a
-/// trailing slash is another login), a home of its own, a credential in the
-/// environment, and the login variable given twice with two values each name
-/// no account — where the row alone ([`ProcessLogin::me`]) still would.
+/// [`judged_label`]: the row a process's login names, only for a stored login
+/// in the default home. A home of its own, a credential, or the login variable
+/// given twice with two values name no account, though [`ProcessLogin::me`]
+/// still finds the row.
 #[test]
 fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
     let r = three();
@@ -5478,7 +5580,7 @@ fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
         "what is not the login's says nothing"
     );
 
-    // NEGATIVE CONTROL: a login no row names.
+    // A login no row names.
     for unlisted in ["/logins/work-2/", "/logins/WORK-2", "/logins/nobody"] {
         assert_eq!(judged(&[(LOGIN_ENV, unlisted)]), None, "{unlisted:?}");
     }
@@ -5490,7 +5592,7 @@ fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
         "the default login, where no row is without a `dir`"
     );
 
-    // NEGATIVE CONTROLS: each names a row, and is judged as no account.
+    // Each names a row, and is judged as no account.
     let not_judged: [&[(&str, &str)]; 6] = [
         // A home of its own.
         &[(HOME_ENV, "/elsewhere")],
@@ -5523,10 +5625,9 @@ fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
     assert_eq!(judged_label(&r, &stored().with_profile_store(true)), None);
 }
 
-/// [`ProcessLogin::of_exec_env`]: an environment that reads EMPTY was not
-/// read, and names no login — never the default one. NEGATIVE CONTROL: one
-/// that holds entries and none of the login's IS the default login. An
-/// entry is cut at its first `=`, the rest being the value's.
+/// [`ProcessLogin::of_exec_env`]: an environment that reads empty was not read
+/// and names no login, never the default one; one with entries but none of the
+/// login's is the default login. An entry is cut at its first `=`.
 #[test]
 fn an_exec_environment_that_reads_empty_names_no_login() {
     let of = |entries: &[&str]| {
@@ -5544,9 +5645,8 @@ fn an_exec_environment_that_reads_empty_names_no_login() {
     assert_eq!(of(&[&home]).map(|who| who.default_home), Some(false));
 }
 
-/// [`footer_label`]: [`judged_label`], where the roster lists two or more.
-/// NEGATIVE CONTROL: the same login under a roster of one row is judged, and
-/// no surface names it; what is not judged is never shown.
+/// [`footer_label`]: [`judged_label`], where the roster lists two or more
+/// rows; under a roster of one the same login is judged and named nowhere.
 #[test]
 fn the_footer_names_an_account_only_where_two_are_listed() {
     let two = roster(&[
@@ -5558,7 +5658,7 @@ fn the_footer_names_an_account_only_where_two_are_listed() {
     assert_eq!(footer_label(&two, &on_work), Some("work-2"));
     assert_eq!(footer_label(&three(), &on_work), Some("work-2"));
 
-    // NEGATIVE CONTROL: one row is one login, whichever row it is.
+    // One row is one login, whichever row it is.
     for one in [
         roster(&[("main", Class::Dedicated, None)]),
         roster(&[("work-2", Class::Dedicated, Some("/logins/work-2"))]),
@@ -5604,7 +5704,7 @@ fn the_roster_is_beside_the_config_by_one_rule() {
         roster_beside(Path::new("aterm.toml")),
         Some(PathBuf::from("accounts.toml"))
     );
-    // NEGATIVE CONTROL: a path with no directory to be beside has none.
+    // A path with no directory to be beside has none.
     assert_eq!(roster_beside(Path::new("/")), None);
     assert_eq!(roster_beside(Path::new("")), None);
 }
@@ -5688,8 +5788,8 @@ fn the_recorder_records_this_process_wall_for_its_account_once() {
     #[cfg(unix)]
     assert_eq!(mode(&store.state_file()), 0o600);
 
-    // A SECOND CALL IS UNCHANGED: nothing is written, at this look or at
-    // one an hour of looks later.
+    // A second call is unchanged: nothing is written, at this look or at one
+    // an hour of looks later.
     let bytes = std::fs::read(store.state_file()).expect("reads");
     #[cfg(unix)]
     let file = inode(&store.state_file());
@@ -5706,7 +5806,7 @@ fn the_recorder_records_this_process_wall_for_its_account_once() {
     );
     assert_eq!(store.tail(10).expect("reads").len(), 1);
 
-    // A SECOND SESSION AT THE SAME WALL writes its own session row and no
+    // A second session at the same wall writes its own session row and no
     // second `wall` row.
     let second = record_wall(&store, &r, "s-two", &stored(), &weekly(), STARTED, NOW + 5);
     assert_eq!(
@@ -5723,8 +5823,8 @@ fn the_recorder_records_this_process_wall_for_its_account_once() {
     assert_eq!(state.accounts["main"].walls.len(), 1);
     assert_eq!(store.tail(10).expect("reads").len(), 1);
 
-    // ANOTHER LOGIN'S PROCESS: the wall is that account's, by its own
-    // environment — and the session, last read on `main`, is a `move`.
+    // Another login's process: the wall is that account's, by its own
+    // environment, and the session, last read on `main`, is a `move`.
     let work = env_of(&[(LOGIN_ENV, "/logins/work-2")]);
     let session = StandingWall {
         at: (NOW + 30).unsigned_abs(),
@@ -5773,7 +5873,7 @@ fn the_recorder_records_nothing_for_a_session_the_roster_does_not_govern() {
         record_wall(&store, r, "s-one", who, &weekly(), STARTED, NOW)
     };
 
-    // NO ROSTER, and a login no row names.
+    // No roster, and a login no row names.
     assert_eq!(record(&Roster::default(), &stored()), Recorded::NotListed);
     for login in ["/logins/nobody", "/logins/work-2/"] {
         assert_eq!(
@@ -5801,7 +5901,7 @@ fn the_recorder_records_nothing_for_a_session_the_roster_does_not_govern() {
     let unlisted_elsewhere = env_of(&[(LOGIN_ENV, "/logins/nobody"), (HOME_ENV, "/elsewhere")]);
     assert_eq!(record(&r, &unlisted_elsewhere), Recorded::NotListed);
 
-    // NOTHING WAS READ, MADE OR LOCKED for any of them: with no roster the
+    // Nothing was read, made or locked for any of them: with no roster the
     // feature leaves no trace on the machine.
     assert!(!store.dir.exists(), "no directory, no lock, no state");
 
@@ -5810,11 +5910,10 @@ fn the_recorder_records_nothing_for_a_session_the_roster_does_not_govern() {
     assert!(store.state_file().exists());
 }
 
-/// THE ROW OLDER THAN THE PROCESS IS RECORDED FOR NOBODY (design §5). After
-/// a relaunch under another login the transcript's last limit row is still
-/// the PREVIOUS process's: read as this process's, the wall of the account
-/// that was left would be recorded on the account moved to — the fresh one,
-/// which would then be skipped as limited.
+/// A row older than the process is recorded for nobody (design §5): after a
+/// relaunch under another login the transcript's last limit row is the
+/// previous process's, and read as this one's it would mark the account moved
+/// to limited.
 #[test]
 fn a_wall_row_older_than_the_process_is_the_previous_accounts_and_is_recorded_for_nobody() {
     let dir = tmp("recorder-older");
@@ -5830,9 +5929,9 @@ fn a_wall_row_older_than_the_process_is_the_previous_accounts_and_is_recorded_fo
     }
     assert!(!store.dir.exists(), "nothing was read, made or locked");
 
-    // NEGATIVE CONTROL: the same row, the process older than it, IS
-    // recorded — and so is a row written in the process's first second: a
-    // process cannot write a row before it starts.
+    // The same row with the process older than it is recorded, and so is one
+    // written in the process's first second: no process writes a row before it
+    // starts.
     for (sid, started) in [
         ("s-one", written - 1),
         ("s-two", written),
@@ -5850,11 +5949,10 @@ fn a_wall_row_older_than_the_process_is_the_previous_accounts_and_is_recorded_fo
     assert!(!state.accounts.contains_key("main"));
 }
 
-/// THE WALL IS THE ACCOUNT'S OF THE PROCESS'S OWN LOGIN, WHATEVER ACCOUNT IS
-/// ACTIVE (design §5) — a session not moved yet, or started by hand, runs on
-/// the login of its own environment — AND THE RECORDER RECORDS, IT DOES NOT
-/// STRIKE: a wall on the account that has not answered yet leaves `active`,
-/// its proof, the canary and what the rotation wrote over where they were.
+/// The wall is the account's of the process's own login, whatever account is
+/// active (design §5), and the recorder records, it does not strike: a wall on
+/// the account that has not answered yet leaves `active`, its proof, the
+/// canary and the undo where they were.
 #[test]
 fn a_wall_is_recorded_for_the_process_login_whatever_is_active_and_strikes_nothing() {
     let r = three();
@@ -5920,7 +6018,7 @@ fn a_wall_is_recorded_for_the_process_login_whatever_is_active_and_strikes_nothi
     );
     assert_eq!(store.tail(10).expect("reads").len(), 1, "one `wall` row");
     assert!(!store.wake_path().exists(), "and nobody is woken");
-    // NEGATIVE CONTROL: the strike is what puts `active` back.
+    // The strike is what puts `active` back.
     let mut struck = after.clone();
     let word = Strike::Wall {
         window: "seven_day".into(),
@@ -5948,7 +6046,7 @@ fn the_recorder_reads_a_row_of_any_shape_into_a_wall_the_state_can_hold() {
         (recorded, state, rows)
     };
 
-    // NO LIMIT TYPE: recorded under the one unnamed window, and so is one
+    // No limit type: recorded under the one unnamed window, and so is one
     // that is empty once it is folded onto a line.
     for window in [None, Some(String::new()), Some(" \n\t".to_string())] {
         let unnamed = StandingWall {
@@ -5968,7 +6066,7 @@ fn the_recorder_reads_a_row_of_any_shape_into_a_wall_the_state_can_hold() {
         );
         assert!(state.accounts["main"].walls.contains_key("limit"));
     }
-    // NO RESET: the wall stands on the ladder of one that names none.
+    // No reset: the wall stands on the ladder of one that names none.
     let no_reset = StandingWall {
         until: None,
         ..weekly()
@@ -5998,7 +6096,7 @@ fn the_recorder_reads_a_row_of_any_shape_into_a_wall_the_state_can_hold() {
     );
     assert_eq!(state.accounts["main"].walls["seven_day"].until, None);
 
-    // A ROW STAMPED AHEAD OF THE CLOCK is recorded as written now: a wall
+    // A row stamped ahead of the clock is recorded as written now: a wall
     // observed "later" than now would stand past its own reset's grace for
     // as long as the clock is behind it.
     for ahead in [(NOW + 3 * DAY).unsigned_abs(), u64::MAX] {
@@ -6019,7 +6117,7 @@ fn the_recorder_reads_a_row_of_any_shape_into_a_wall_the_state_can_hold() {
         );
     }
 
-    // A SESSION WITH NO ID is still a process on that account: the wall is
+    // A session with no id is still a process on that account: the wall is
     // recorded, and no session row is.
     let (recorded, state, rows) = record("recorder-no-sid", " \n", &weekly(), NOW);
     assert!(matches!(recorded, Recorded::Wall { .. }));
@@ -6052,8 +6150,8 @@ fn the_recorder_keeps_what_is_on_record_and_ends_a_pin_at_its_wall() {
     low(&mut seeded, "main");
     store.save(&seeded).expect("saves");
 
-    // A WALL ON THE PINNED ACCOUNT ENDS THE PIN: both rows carry the
-    // session, and the wake marker is replaced (a waiting tab decides again).
+    // A wall on the pinned account ends the pin: both rows carry the session,
+    // and the wake marker is replaced (a waiting tab decides again).
     let recorded = record_wall(&store, &r, "s-one", &stored(), &weekly(), STARTED, NOW);
     assert_eq!(
         recorded,
@@ -6074,8 +6172,8 @@ fn the_recorder_keeps_what_is_on_record_and_ends_a_pin_at_its_wall() {
     assert!(store.wake_path().exists(), "the pin's end wakes");
     let (after, _) = store.load(NOW).expect("ours");
     assert!(!after.pinned);
-    // EVERYTHING ELSE ON RECORD IS KEPT: the machine's id, the sample, the
-    // active account and its proof — and the session's row as it was, its
+    // Everything else on record is kept: the machine's id, the sample, the
+    // active account and its proof, and the session's row as it was, its
     // `held` word included (the recorder says nothing of a refused move).
     assert_eq!(after.sessions["s-one"], seeded.sessions["s-one"]);
     assert_eq!(
@@ -6092,7 +6190,7 @@ fn the_recorder_keeps_what_is_on_record_and_ends_a_pin_at_its_wall() {
     );
     assert_eq!(after.accounts["main"].walls.len(), 1);
 
-    // NEGATIVE CONTROL: with no pin the same wall is one row and no wake.
+    // With no pin the same wall is one row and no wake.
     let dir = tmp("recorder-no-pin");
     let store = Store::at(dir.path());
     let recorded = record_wall(&store, &r, "s-one", &stored(), &weekly(), STARTED, NOW);
@@ -6101,15 +6199,10 @@ fn the_recorder_keeps_what_is_on_record_and_ends_a_pin_at_its_wall() {
     assert!(!store.wake_path().exists());
 }
 
-/// THE OWNER'S CLEARING STANDS AGAINST A ROW STILL IN A TRANSCRIPT (design
-/// §6, "The owner's word"). `accounts use` clears the account's walls and
-/// pins it; a session left standing at that wall has taken no turn, so its
-/// transcript's last limit row is still the wall the owner cleared, and the
-/// host hands it to the recorder at every look.
-///
-/// Read as a wall met now, the first look after the owner's word put the
-/// wall back and ended the pin (`unpin: wall`): the owner's word lasted
-/// until the next look.
+/// The owner's clearing stands against a row still in a transcript (design §6,
+/// "The owner's word"): a session left standing at the cleared wall has taken
+/// no turn, so the host hands the recorder that same row at every look, and
+/// read as a wall met now it would put the wall back and end the pin.
 #[test]
 fn a_wall_the_owner_cleared_is_not_put_back_by_its_row_and_ends_no_pin() {
     let r = three();
@@ -6131,9 +6224,8 @@ fn a_wall_the_owner_cleared_is_not_put_back_by_its_row_and_ends_no_pin() {
     assert!(pinned.pinned && pinned.accounts["main"].walls.is_empty());
     let rows = store.tail(10).expect("reads").len();
 
-    // THE SAME ROW, at the next look and at every later one, from that
-    // session and from one not on record yet: no wall, no row, and the pin
-    // holds.
+    // The same row, at the next look and every later one, from that session
+    // and from one not on record yet: no wall, no row, and the pin holds.
     for (sid, later) in [
         ("s-one", used + 5),
         ("s-two", used + 10),
@@ -6151,8 +6243,8 @@ fn a_wall_the_owner_cleared_is_not_put_back_by_its_row_and_ends_no_pin() {
     let (after, _) = store.load(used + HOUR).expect("ours");
     assert_eq!(after.sessions_on("main"), ["s-one", "s-two"]);
 
-    // NEGATIVE CONTROL: a wall the session meets AFTER the owner's word is a
-    // new row, and it is recorded and ends the pin.
+    // A wall the session meets after the owner's word is a new row: it is
+    // recorded, and it ends the pin.
     let met = StandingWall {
         at: (used + 2 * HOUR).unsigned_abs(),
         until: Some((NOW + DAY).unsigned_abs()),
@@ -6183,7 +6275,7 @@ fn a_wall_the_owner_cleared_is_not_put_back_by_its_row_and_ends_no_pin() {
         used + 2 * HOUR
     );
 
-    // THE RULE IS `note_wall`'s OWN, whoever hands it an old observation.
+    // The rule is `note_wall`'s own, whoever hands it an old observation.
     let mut s = on_main();
     pin(&mut s, &r, &enrolled, "main", NOW).expect("pins");
     let until = Some(NOW + HOUR);
@@ -6260,8 +6352,8 @@ fn the_recorder_refuses_a_state_that_is_not_ours_and_leaves_it_byte_for_byte() {
     assert!(gone.is_err(), "{gone:?}");
     assert_eq!(unchanged(), not_ours);
 
-    // NEGATIVE CONTROL: a TORN file holds nothing to lose, and is replaced
-    // by the state with the wall.
+    // A torn file holds nothing to lose, and is replaced by the state with
+    // the wall.
     let dir = tmp("recorder-torn");
     let store = Store::at(dir.path());
     store.ensure().expect("dir");
@@ -6273,11 +6365,9 @@ fn the_recorder_refuses_a_state_that_is_not_ours_and_leaves_it_byte_for_byte() {
     assert!(state.accounts["main"].walls.contains_key("seven_day"));
 }
 
-/// A STORE WHOSE DIRECTORY CANNOT BE MADE (a file stands where its parent
-/// should be) is said as `refused`, by the directory's name: no panic, and
-/// nothing written anywhere else. A session's end has nothing to forget
-/// there. NEGATIVE CONTROL: the same call where the directory can be made
-/// records.
+/// A store whose directory cannot be made (a file stands where its parent
+/// should be) is `refused`, by the directory's name, with nothing written
+/// anywhere else; a session's end has nothing to forget there.
 #[test]
 fn the_recorder_says_refused_where_its_directory_cannot_be_made() {
     let dir = tmp("recorder-no-dir");
@@ -6303,7 +6393,7 @@ fn the_recorder_says_refused_where_its_directory_cannot_be_made() {
 fn a_session_that_ended_is_forgotten_and_a_canarys_end_wakes_the_others() {
     let r = three();
 
-    // A MACHINE WITH NO STATE has nothing to forget, and nothing is made.
+    // A machine with no state has nothing to forget, and nothing is made.
     let dir = tmp("gone-none");
     let store = Store::at(dir.path());
     assert_eq!(record_gone(&store, "s-one", NOW), Ok(false));
@@ -6338,7 +6428,7 @@ fn a_session_that_ended_is_forgotten_and_a_canarys_end_wakes_the_others() {
     assert!(!store.wake_path().exists(), "no hold ended");
     assert_eq!(store.tail(10).expect("reads").len(), 1, "no ledger row");
 
-    // THE CANARY'S AGENT ENDS: its hold ends at once and the wake marker is
+    // The canary's agent ends: its hold ends at once and the wake marker is
     // replaced, so a session waiting for the hold decides again.
     let dir = tmp("gone-canary");
     let store = Store::at(dir.path());
@@ -6349,8 +6439,7 @@ fn a_session_that_ended_is_forgotten_and_a_canarys_end_wakes_the_others() {
     note_session(&mut s, "s-one", "work-2", None, NOW);
     assert!(s.canary_holds(NOW + 5));
     store.save(&s).expect("saves");
-    // NEGATIVE CONTROL: another session's end leaves the hold and the
-    // marker alone.
+    // Another session's end leaves the hold and the marker alone.
     assert_eq!(record_gone(&store, "s-two", NOW + 5), Ok(true));
     assert!(!store.wake_path().exists());
     assert!(store.load(NOW + 5).expect("ours").0.canary_holds(NOW + 5));
@@ -6366,10 +6455,8 @@ fn a_session_that_ended_is_forgotten_and_a_canarys_end_wakes_the_others() {
     assert!(after.sessions.is_empty());
 }
 
-/// [`several_listed`]: two or more rows in the roster's file, and only then.
-/// NEGATIVE CONTROLS: no path, no file, one row, and a roster that does not
-/// admit (two rows and a key nobody knows) list none — everything is read as
-/// it was before accounts existed.
+/// [`several_listed`]: two or more rows in a roster file that admits, and only
+/// then.
 #[test]
 fn several_accounts_are_listed_only_by_a_roster_that_admits_two() {
     let dir = tmp("several");
@@ -6394,14 +6481,9 @@ fn several_accounts_are_listed_only_by_a_roster_that_admits_two() {
 // 9. The recorder's hardening
 // ---------------------------------------------------------------------------
 
-/// A RESET MORE THAN EIGHT DAYS PAST ITS ROW IS NOT BELIEVED: the longest
-/// window is a week, so such a row names no reset this module can stand a
-/// wall on. It is recorded as a wall naming none — the ladder of thirty
-/// minutes, two hours, six — whoever hands it over: the recorder, the host's
-/// commit (`note_wall`) and a strike.
-///
-/// Believed, the account read `limited` until that instant: one bad row and
-/// it was out of the rotation for as long as the row said.
+/// A reset more than [`RESET_BELIEVED_S`] past its row is not believed: it is
+/// recorded as a wall naming none (the no-reset ladder), whoever hands it
+/// over: the recorder, the host's commit (`note_wall`) and a strike.
 #[test]
 fn a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none() {
     let r = three();
@@ -6447,7 +6529,7 @@ fn a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none() {
     let again = record_wall(&store, &r, "s-one", &stored(), &far, STARTED, NOW + 5);
     assert_eq!(again, Recorded::Unchanged);
 
-    // NEGATIVE CONTROL: eight days to the second is a reset, and stands.
+    // Eight days to the second is a reset, and stands.
     let dir = tmp("recorder-week");
     let store = Store::at(dir.path());
     let recorded = record_wall(&store, &r, "s-one", &stored(), &row(8 * DAY), STARTED, NOW);
@@ -6461,7 +6543,7 @@ fn a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none() {
         }
     );
 
-    // THE RULE IS `note_wall`'s OWN: the host's commit and a strike hand it
+    // The rule is `note_wall`'s own: the host's commit and a strike hand it
     // the same row, and must not put the instant back.
     let mut s = on_main();
     note_wall(&mut s, "main", "seven_day", Some(NOW + 9 * DAY), NOW, NOW);
@@ -6480,11 +6562,10 @@ fn a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none() {
     );
 }
 
-/// A SESSION'S ROW OLDER THAN THIRTY DAYS IS DROPPED WHEN THE STATE IS SAVED:
-/// a tab closed with no word (a crash, a machine switched off) leaves its
-/// row, and the report's `on:` would name it for ever. A transaction that
-/// changes nothing saves nothing, so it drops nothing either; a row stamped
-/// ahead of the clock is not old.
+/// A tab closed with no word (a crash, a machine switched off) leaves its row,
+/// which the report's `on:` would name for ever. A transaction that changes
+/// nothing saves nothing, so it drops nothing either; a row stamped ahead of
+/// the clock is not old.
 #[test]
 fn a_session_row_older_than_thirty_days_is_dropped_when_the_state_is_saved() {
     let dir = tmp("sessions-old");
@@ -6506,7 +6587,7 @@ fn a_session_row_older_than_thirty_days_is_dropped_when_the_state_is_saved() {
         state.sessions.keys().cloned().collect::<Vec<_>>()
     };
 
-    // NEGATIVE CONTROL: nothing changed, nothing saved, nothing dropped.
+    // Nothing changed: nothing saved, nothing dropped.
     let mut note = None;
     let rows = store.transact(NOW, &mut note, |_| Ok(Vec::new()));
     assert_eq!(rows, Ok(Vec::new()));
@@ -6527,7 +6608,7 @@ fn a_session_row_older_than_thirty_days_is_dropped_when_the_state_is_saved() {
     );
 }
 
-/// THE VENDOR'S `profile` SOURCE comes ahead of the stored login: a process
+/// The vendor's `profile` source comes ahead of the stored login: a process
 /// whose environment names it does not authenticate by a stored login, and
 /// neither does one on a machine whose profile store holds a config.
 #[test]
@@ -6544,13 +6625,13 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
         "ANTHROPIC_CONFIG_DIR",
     ] {
         assert!(!env_of(&[(name, "x")]).stored_login, "{name}");
-        // NEGATIVE CONTROL: set and empty is not set.
+        // Set and empty is not set.
         assert_eq!(env_of(&[(name, "")]), stored(), "{name}=");
     }
 
-    // THE STORE'S PLACE, in the vendor's order: the variable that names it,
-    // else the XDG config home, else the home's `.config`. A value of
-    // spaces is unset; with none of the three there is no store.
+    // The store's place, in the vendor's order: the variable that names it,
+    // else the XDG config home, else the home's `.config`. A value of spaces
+    // is unset; with none of the three there is no store.
     let dir = |pairs: &[(&str, &str)]| profile_configs_dir(pairs.iter().copied());
     assert_eq!(
         dir(&[("HOME", "/h")]),
@@ -6578,7 +6659,7 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
     );
     assert_eq!(dir(&[("PATH", "/usr/bin"), ("HOME", "")]), None);
 
-    // WHETHER IT HOLDS A CONFIG: a `.json` entry, by name alone.
+    // Whether it holds a config: a `.json` entry, by name alone.
     let store = tmp("profile-store");
     let configs = store.path().join("configs");
     assert!(!profile_configured(&configs), "no such directory");
@@ -6591,7 +6672,7 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
     // A store that cannot be listed may hold one.
     assert!(profile_configured(&configs.join("notes.txt")));
 
-    // THE BUILDER only ever takes the stored login away.
+    // The builder only ever takes the stored login away.
     assert_eq!(stored().with_profile_store(false), stored());
     assert!(!stored().with_profile_store(true).stored_login);
     let keyed = env_of(&[("ANTHROPIC_API_KEY", "k")]);
@@ -6607,15 +6688,10 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
     );
 }
 
-/// THE SETTINGS FILES' HALF (`ProcessLogin::with_settings`, over what the
-/// host's gatherer read): a credential, a profile or a route named in an
-/// `env` block, a login or a home set there, an `apiKeyHelper`, and a source
-/// nobody could read each make it no stored login — so the recorder records
-/// its wall for nobody and the advice is to stay.
-///
-/// Read from the environment alone, a session given another subscription's
-/// token by its settings read as on its stored login, and its wall was
-/// recorded on that account.
+/// [`ProcessLogin::with_settings`]: a credential, profile or route in a settings
+/// `env` block, a login or home set there, an `apiKeyHelper`, or a source nobody
+/// could read makes the process no stored login, so its wall is recorded for
+/// nobody and the advice is to stay.
 #[test]
 fn a_settings_file_can_take_a_stored_login_away_and_never_gives_one() {
     use crate::harness::netwatch::Source;
@@ -6629,8 +6705,8 @@ fn a_settings_file_can_take_a_stored_login_away_and_never_gives_one() {
     let block =
         |name: &str, value: &str| Source::Text(format!("{{\"env\":{{\"{name}\":\"{value}\"}}}}"));
 
-    // NEGATIVE CONTROLS: nothing gathered, nothing there, and files that
-    // name none of it leave a stored login one.
+    // Nothing gathered, nothing there, and files that name none of it leave a
+    // stored login one.
     assert_eq!(with(&[]), stored());
     assert_eq!(with(&[Source::Missing]), stored());
     let quiet = [
@@ -7206,7 +7282,8 @@ fn the_week_nearly_used_with_credits_off_is_a_line_and_nothing_else_is() {
 /// your weekly limit` and `91% of your session limit`, credits are off, and
 /// the week's line stands ([`windows_full`]). A reset used at the weekly wall
 /// — or lifted, the limit had reset on its own — refills the week: the newest
-/// word on it ([`WindowSaid`], no figure), so the line ends, and the weekly
+/// word on it ([`WindowSaid`], no figure; lifted, it names the reset that
+/// came, which a reset used does not), so the line ends, and the weekly
 /// warning drawn before the reset and said again says nothing; one drawn
 /// after it is the newest, and a week that still fills is a line again. A
 /// reset at the SESSION wall refills the session window alone: the week is
@@ -7224,10 +7301,19 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
     let week_end = NOW + 3 * DAY;
     let session_end = NOW + 2 * HOUR;
     let line = [(OWN.to_string(), "org_level_disabled".to_string())];
-    let refilled = |at: i64| {
+    // The refill's word: no figure, and the reset that came where the limit
+    // lifted by itself.
+    let refilled = |done: &ResetDone<'_>, until: i64, at: i64| {
+        let reset = match done {
+            ResetDone::Lifted => Some(until),
+            ResetDone::Used { .. }
+            | ResetDone::Walled { .. }
+            | ResetDone::Kept(_)
+            | ResetDone::Failed(_) => None,
+        };
         Some(WindowSaid {
             pct: None,
-            reset: None,
+            reset,
             at,
         })
     };
@@ -7292,7 +7378,11 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
     ] {
         let (_dir, store, lines, account) = run("reset-week", WEEK_LIMIT, &done, NOW + 40);
         assert!(lines.is_empty(), "{done:?}: {lines:?}");
-        assert_eq!(account.warned_week, refilled(NOW + 40), "{done:?}");
+        assert_eq!(
+            account.warned_week,
+            refilled(&done, week_end, NOW + 40),
+            "{done:?}"
+        );
         assert_eq!(
             account.warned_session.and_then(|w| w.pct),
             Some(91),
@@ -7315,7 +7405,11 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
         // The session's wall, last week's beside it: the week's line stands.
         let (_dir, _store, lines, account) = run("reset-session", SESSION_LIMIT, &done, NOW + 40);
         assert_eq!(lines, line, "{done:?}: the week is as used as it was");
-        assert_eq!(account.warned_session, refilled(NOW + 40), "{done:?}");
+        assert_eq!(
+            account.warned_session,
+            refilled(&done, session_end, NOW + 40),
+            "{done:?}"
+        );
         assert_eq!(account.warned_week.and_then(|w| w.pct), Some(96));
     }
     // Its outcome read once the session's wall had lapsed: still the wall
@@ -7323,7 +7417,10 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
     let end = session_end + RESET_GRACE_S + MIN;
     let (_dir, _store, lines, account) =
         run("reset-session-late", SESSION_LIMIT, &ResetDone::Lifted, end);
-    assert_eq!(account.warned_session, refilled(end));
+    assert_eq!(
+        account.warned_session,
+        refilled(&ResetDone::Lifted, session_end, end)
+    );
     assert_eq!(lines, line, "the week is as used as it was");
     // NEGATIVE CONTROL: nothing refilled.
     for done in [ResetDone::Kept("early"), ResetDone::Failed("unread")] {
@@ -7627,11 +7724,13 @@ fn each_window_keeps_its_own_word() {
 /// THE LINE'S WEEK IS THE WARNING'S WORD, NEVER A SAMPLE'S ([`windows_full`];
 /// S5 beside S3a's usage tap): on the one-account machine the vendor warned
 /// `92% of your weekly limit`, credits are off, and the tap reads the week at
-/// 96%. A reset at the weekly wall refills the week: the line ends. The tap's
-/// sample keeps its largest figure within the reset ([`note_reading`]), and
-/// an idle tab's 96%, read afresh after the reset (a loop started again
-/// admits its first reading), is recorded with the reading's own time —
-/// ranked beside the warning's word, the week refilled was `nearly used`
+/// 96%. A reset at the weekly wall refills the week: the line ends, and the
+/// tap's figure from before it no longer counts ([`note_reading`]: the
+/// reset opens an epoch in the walled window). An idle tab's 96%, read
+/// afresh after the reset (a loop started again admits its first reading),
+/// says nothing of the refilled week — the sample holds no week — and the
+/// next served reading's 3% is the week's. Neither makes the line: ranked
+/// beside the warning's word, a week refilled would read `nearly used`
 /// again. NEGATIVE CONTROLS: a sample, however new and however full, makes no
 /// line; a weekly warning drawn after the refill does.
 #[test]
@@ -7650,14 +7749,19 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
             .transact_within(&LOCK_LADDER, now, &mut note, |state| Ok(f(state)))
             .expect("written");
     };
-    let tap = |pct: u32| Sample {
-        week_pct: Some(pct),
-        week_reset: Some(week_end),
-        ..Sample::default()
+    let tap = |pct: u32, at: i64, seen_before: bool| TapRead {
+        seven_day: Some(WindowRead {
+            pct_x10: pct * 10,
+            reset: week_end,
+            refilled: None,
+        }),
+        at,
+        seen_before,
+        ..TapRead::default()
     };
     usage(warned(NOW, true, 92, Some(week_end)));
     edit(NOW + MIN, &|state| {
-        note_reading(state, OWN, tap(96), NOW + MIN)
+        note_reading(state, OWN, &tap(96, NOW + MIN, true), NOW + MIN)
     });
     assert_eq!(full(NOW + MIN), line);
     edit(NOW + 10 * MIN, &|state| {
@@ -7689,22 +7793,30 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
     });
     assert!(full(NOW + 12 * MIN).is_empty(), "refilled");
     let later = NOW + 2 * HOUR;
-    edit(later, &|state| note_reading(state, OWN, tap(96), later));
-    let sample = held(&store, OWN, later).sample.expect("the tap's");
+    edit(later, &|state| {
+        note_reading(state, OWN, &tap(96, later, false), later)
+    });
+    let account = held(&store, OWN, later);
+    let sample = account.sample.expect("the tap's");
+    assert_eq!(sample.week_pct, None, "{sample:?}");
     assert_eq!(
-        (sample.week_pct, sample.at),
-        (Some(96), later),
-        "{sample:?}"
+        account.windows[WEEK_LIMIT].epoch_at,
+        Some(NOW + 11 * MIN),
+        "the reset's epoch"
     );
-    assert!(
-        full(later).is_empty(),
-        "the tap's figure, carried past the refill"
-    );
+    edit(later + 30, &|state| {
+        note_reading(state, OWN, &tap(3, later + 30, true), later + 30)
+    });
+    let sample = held(&store, OWN, later + 30).sample.expect("the tap's");
+    assert_eq!(sample.week_pct, Some(3), "{sample:?}");
+    assert!(full(later + 30).is_empty(), "no word of the line's");
     // NEGATIVE CONTROLS: a full sample; a warning after the refill.
     edit(later + MIN, &|state| {
         let read = Sample {
+            week_pct: Some(99),
+            week_reset: Some(week_end),
             at: later + MIN,
-            ..tap(99)
+            ..Sample::default()
         };
         note_sample(state, OWN, read, later + MIN)
     });
@@ -7720,9 +7832,650 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
 // The usage tap's readings (design v2 §3.2)
 // ---------------------------------------------------------------------------
 
-/// A tap reading of the session window at `pct` resetting at `reset`, and
-/// the week at `week`.
-fn tapped(pct: u32, reset: i64, week: u32) -> Sample {
+/// A tap reading's window, `pct_x10` tenths under `reset`, refilled from
+/// the figure `refilled` where one is given.
+fn win(pct_x10: u32, reset: i64, refilled: Option<u32>) -> Option<WindowRead> {
+    Some(WindowRead {
+        pct_x10,
+        reset,
+        refilled,
+    })
+}
+
+/// A reading of the session window alone, written at `at`.
+fn five(w: Option<WindowRead>, at: i64, seen_before: bool) -> TapRead {
+    TapRead {
+        five_hour: w,
+        at,
+        seen_before,
+        ..TapRead::default()
+    }
+}
+
+/// THE PER-WINDOW RECORD (the account-stats design §3.2): a reading's figure
+/// is kept in TENTHS with its own `as_of` (the reading's time, not the
+/// record's), source and machine, and its whole-percent copy goes to the
+/// sample, rounded half up. A reading's stamp from ahead of the clock is
+/// brought back to it. NEGATIVE CONTROL: the sample alone, as before, holds
+/// 43 — the tenths are only in the window's record.
+#[test]
+fn a_tap_reading_is_kept_in_tenths_with_its_own_as_of() {
+    let mut s = state();
+    let reset = NOW + 2 * HOUR;
+    let events = note_reading(
+        &mut s,
+        "main",
+        &five(win(425, reset, None), NOW - 30, true),
+        NOW,
+    );
+    assert_eq!(events.len(), 1);
+    let fig = &s.accounts["main"].windows[SESSION_LIMIT];
+    assert_eq!(
+        fig,
+        &WindowFig {
+            pct_x10: 425,
+            reset,
+            at: NOW - 30,
+            by: "0a0b".to_string(),
+            source: SOURCE_TAP.to_string(),
+            epoch_at: None,
+        }
+    );
+    assert_eq!(
+        s.accounts["main"]
+            .sample
+            .as_ref()
+            .and_then(|x| x.session_pct),
+        Some(43)
+    );
+    assert_eq!(s.accounts["main"].sample.as_ref().map(|x| x.at), Some(NOW));
+    // A tenth more is news; a stamp from the future is now.
+    note_reading(
+        &mut s,
+        "main",
+        &five(win(426, reset, None), NOW + HOUR, true),
+        NOW + 60,
+    );
+    let fig = &s.accounts["main"].windows[SESSION_LIMIT];
+    assert_eq!((fig.pct_x10, fig.at), (426, NOW + 60));
+    // The record round-trips through the state file.
+    let back = State::from_json(&s.to_json(), NOW + 60).expect("ours");
+    assert_eq!(back.accounts["main"].windows, s.accounts["main"].windows);
+}
+
+/// A LIMIT RESET USED INSIDE THE WINDOW OPENS AN EPOCH (the account-stats
+/// design §3.5): 100% and then, from the same process served since, 5%
+/// under the same reset — the record holds 5%, the epoch at the reading,
+/// one `reset` row, and the sample says 5. A later 7% within the epoch is
+/// taken by the max rule; a stale 100% from a process's FIRST reading under
+/// the epoch says nothing. NEGATIVE CONTROLS: the same 5% not marked a
+/// refill (the max rule alone, as before this record) keeps 100%; and a
+/// process read before takes its figure under the epoch.
+#[test]
+fn a_reset_used_inside_a_window_opens_an_epoch_and_the_refill_stands() {
+    let reset = NOW + 3 * HOUR;
+    let run = |refilled: bool| {
+        let mut s = state();
+        note_reading(
+            &mut s,
+            "main",
+            &five(win(1000, reset, None), NOW, true),
+            NOW,
+        );
+        let events = note_reading(
+            &mut s,
+            "main",
+            &five(win(50, reset, refilled.then_some(1000)), NOW + MIN, true),
+            NOW + MIN,
+        );
+        (s, events)
+    };
+    let (mut s, events) = run(true);
+    let fig = s.accounts["main"].windows[SESSION_LIMIT].clone();
+    assert_eq!((fig.pct_x10, fig.epoch_at), (50, Some(NOW + MIN)));
+    let kinds: Vec<Kind> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [Kind::Reset, Kind::Sample]);
+    assert!(
+        events[0]
+            .why
+            .starts_with("five_hour refilled inside its window"),
+        "{}",
+        events[0].why
+    );
+    assert_eq!(
+        s.accounts["main"]
+            .sample
+            .as_ref()
+            .and_then(|x| x.session_pct),
+        Some(5)
+    );
+    // Within the epoch the max rule again.
+    note_reading(
+        &mut s,
+        "main",
+        &five(win(70, reset, None), NOW + 2 * MIN, true),
+        NOW + 2 * MIN,
+    );
+    assert_eq!(s.accounts["main"].windows[SESSION_LIMIT].pct_x10, 70);
+    // A first reading under the epoch: nothing of it is taken.
+    let before = s.clone();
+    let stale = five(win(1000, reset, None), NOW + 3 * MIN, false);
+    assert!(note_reading(&mut s, "main", &stale, NOW + 3 * MIN).is_empty());
+    assert_eq!(s, before);
+    // NEGATIVE CONTROLS: unmarked, the max rule keeps the 100%; read before,
+    // the same 100% is taken (it was served after the reset).
+    let (plain, events) = run(false);
+    assert_eq!(plain.accounts["main"].windows[SESSION_LIMIT].pct_x10, 1000);
+    assert!(events.iter().all(|e| e.kind != Kind::Reset));
+    let seen = TapRead {
+        seen_before: true,
+        ..stale
+    };
+    note_reading(&mut s, "main", &seen, NOW + 3 * MIN);
+    assert_eq!(s.accounts["main"].windows[SESSION_LIMIT].pct_x10, 1000);
+}
+
+/// ONE REFILL, HOWEVER MANY SESSIONS SEE IT (the account-stats design
+/// §3.5): tabs A and B on one account were both last read at 100%; a limit
+/// reset is used. A reads 3% and opens the epoch, one `reset` row, then 8%.
+/// B, served since its own 100%, reads 6%, stamped after A's 8%: refilled
+/// from 100% beside its own reading — but 100% stood above everything the
+/// account read since the epoch, so B's reading before was of the spend
+/// refilled, and the drop is the refill held. No second row, the epoch stays
+/// at A's reading, and the max rule keeps A's 8%. A figure the reset's
+/// outcome cut, nothing read since, holds that refill alone: a drop seen
+/// after it opens no epoch of its own. NEGATIVE CONTROL: a drop from no
+/// higher than the account's figure since the epoch — the window at 50%,
+/// then 2% — is a second refill, with its row.
+#[test]
+fn every_session_that_sees_one_refill_records_it_once() {
+    let reset = NOW + 3 * HOUR;
+    let resets = |events: &[Event]| events.iter().filter(|e| e.kind == Kind::Reset).count();
+    let mut s = state();
+    note_reading(
+        &mut s,
+        "main",
+        &five(win(1000, reset, None), NOW, true),
+        NOW,
+    );
+    let a = note_reading(
+        &mut s,
+        "main",
+        &five(win(30, reset, Some(1000)), NOW + MIN, true),
+        NOW + MIN,
+    );
+    assert_eq!(resets(&a), 1, "{a:?}");
+    note_reading(
+        &mut s,
+        "main",
+        &five(win(80, reset, None), NOW + 2 * MIN, true),
+        NOW + 2 * MIN,
+    );
+    let b = note_reading(
+        &mut s,
+        "main",
+        &five(win(60, reset, Some(1000)), NOW + 3 * MIN, true),
+        NOW + 3 * MIN,
+    );
+    assert_eq!(resets(&b), 0, "the refill A recorded: {b:?}");
+    let fig = &s.accounts["main"].windows[SESSION_LIMIT];
+    assert_eq!(
+        (fig.pct_x10, fig.at, fig.epoch_at),
+        (80, NOW + 2 * MIN, Some(NOW + MIN))
+    );
+    // The outcome's epoch, no reading since: refilled already.
+    let mut cut = state();
+    note_reading(
+        &mut cut,
+        "main",
+        &five(win(1000, reset, None), NOW, true),
+        NOW,
+    );
+    let held = cut
+        .accounts
+        .get_mut("main")
+        .and_then(|a| a.windows.get_mut(SESSION_LIMIT))
+        .expect("held");
+    held.epoch_at = Some(NOW + 30);
+    let read = note_reading(
+        &mut cut,
+        "main",
+        &five(win(30, reset, Some(1000)), NOW + MIN, true),
+        NOW + MIN,
+    );
+    assert_eq!(resets(&read), 0, "{read:?}");
+    let fig = &cut.accounts["main"].windows[SESSION_LIMIT];
+    assert_eq!((fig.pct_x10, fig.epoch_at), (30, Some(NOW + 30)));
+    // NEGATIVE CONTROL: a drop below the held figure is a second refill.
+    note_reading(
+        &mut s,
+        "main",
+        &five(win(500, reset, None), NOW + 10 * MIN, true),
+        NOW + 10 * MIN,
+    );
+    let again = note_reading(
+        &mut s,
+        "main",
+        &five(win(20, reset, Some(500)), NOW + 11 * MIN, true),
+        NOW + 11 * MIN,
+    );
+    assert_eq!(resets(&again), 1, "{again:?}");
+    let fig = &s.accounts["main"].windows[SESSION_LIMIT];
+    assert_eq!((fig.pct_x10, fig.epoch_at), (20, Some(NOW + 11 * MIN)));
+}
+
+/// ANOTHER ACCOUNT SIGNED IN TO THE HOME (the account-stats design §3.1):
+/// the key is kept from the first reading that names one; a reading under
+/// another key drops everything observed of the old account, with one
+/// `epoch` row and the instant kept (`keyed_at`): its figures and sample,
+/// its wall (until AFTER the new account's reset, so by the newest anchor it
+/// would outrank the new reading in the view), its warning, its credits word
+/// and its reset offer; the login's word stays, and the wall's row read
+/// again does not put it back. That reading's own figure is not taken (it
+/// may be the old login's: [`KEY_ADOPT_S`]); the next one served after the
+/// bound is, and the view holds it — a lower figure than the old account's.
+/// NEGATIVE CONTROL: under the same key the max rule keeps the larger
+/// figure, and the wall stands — 100% in the view.
+#[test]
+fn a_reading_under_another_key_starts_the_figures_again() {
+    use crate::harness::account_stats::{Tap, held_windows};
+    use crate::harness::profile::AccountKey;
+    let reset = NOW + 3 * HOUR;
+    let walled = reset + HOUR;
+    let (a, b) = (
+        AccountKey::claude("11111111-1111-4111-8111-111111111111"),
+        AccountKey::claude("22222222-2222-4222-8222-222222222222"),
+    );
+    let keyed = |pct_x10: u32, at: i64, key| TapRead {
+        key,
+        ..five(win(pct_x10, reset, None), at, true)
+    };
+    let mut s = state();
+    note_reading(&mut s, "main", &keyed(800, NOW, a), NOW);
+    assert_eq!(s.accounts["main"].key, a);
+    // The old account's own facts: a wall, a warning, credits, an offer.
+    let _ = note_wall(&mut s, "main", SESSION_LIMIT, Some(walled), NOW, NOW);
+    assert!(note_offer(
+        &mut s,
+        "main",
+        None,
+        1,
+        Some(NOW + DAY),
+        NOW,
+        NOW
+    ));
+    note_auth(&mut s, "main", Auth::Ok, NOW);
+    let old = s.accounts.get_mut("main").expect("held");
+    old.warned_session = Some(WindowSaid {
+        pct: Some(92),
+        reset: Some(walled),
+        at: NOW,
+    });
+    old.credits = Some(Credits::Off(CreditsOff {
+        reason: "out_of_credits".to_string(),
+        at: NOW,
+        until: None,
+    }));
+    let session_in = |s: &State, key, at: i64| {
+        held_windows(&s.accounts["main"], key, Some("0a0b"), Tap::On, at).windows[0]
+            .current(at)
+            .map(|f| (f.pct_x10, f.source.clone()))
+    };
+    // NEGATIVE CONTROL first: the same key, a lower figure, the max rule;
+    // the wall stands, and is the window's figure in the view.
+    let mut same = s.clone();
+    note_reading(&mut same, "main", &keyed(100, NOW + MIN, a), NOW + MIN);
+    assert_eq!(same.accounts["main"].windows[SESSION_LIMIT].pct_x10, 800);
+    assert!(same.accounts["main"].walls.contains_key(SESSION_LIMIT));
+    assert_eq!(
+        session_in(&same, a, NOW + MIN),
+        Some((1000, "wall".to_string()))
+    );
+    let events = note_reading(&mut s, "main", &keyed(100, NOW + MIN, b), NOW + MIN);
+    let account = &s.accounts["main"];
+    assert_eq!(account.key, b);
+    assert_eq!(account.keyed_at, Some(NOW + MIN));
+    assert!(account.windows.is_empty(), "{account:?}");
+    assert_eq!(
+        (&account.sample, &account.before),
+        (&None, &None),
+        "the samples were the other account's, and this reading's is not taken"
+    );
+    assert!(account.walls.is_empty(), "{account:?}");
+    assert_eq!(
+        (&account.warned_session, &account.credits, &account.offer),
+        (&None, &None, &None)
+    );
+    assert_eq!(
+        (account.auth, account.cleared_at),
+        (Auth::Ok, Some(NOW + MIN))
+    );
+    assert_eq!(
+        events.iter().filter(|e| e.kind == Kind::Epoch).count(),
+        1,
+        "{events:?}"
+    );
+    assert_eq!(session_in(&s, b, NOW + MIN), None);
+    // The next reading served after the bound is taken.
+    let after = NOW + MIN + KEY_ADOPT_S;
+    note_reading(&mut s, "main", &keyed(100, after, b), after);
+    assert_eq!(
+        session_in(&s, b, after),
+        Some((100, SOURCE_TAP.to_string()))
+    );
+    assert_eq!(
+        s.accounts["main"]
+            .sample
+            .as_ref()
+            .and_then(|x| x.session_pct),
+        Some(10)
+    );
+    // The old account's wall row, read again, is no wall of the new one's.
+    let _ = note_wall(&mut s, "main", SESSION_LIMIT, Some(walled), NOW, after);
+    assert!(s.accounts["main"].walls.is_empty());
+}
+
+/// A FIGURE SERVED BEFORE THE NEW LOGIN WAS ADOPTED IS NOT TAKEN UNDER IT
+/// (the account-stats design §3.1, [`KEY_ADOPT_S`]): a reading is keyed by
+/// the profile the host reads, and a running Claude Code keeps serving on
+/// the login it holds for up to about 30 s after another signs in. `/login`
+/// B in one tab while another tab's process still serves on A, whose
+/// five-hour window resets LATER than B's: the reading that reveals the
+/// change (A's 60%, keyed B) drops A's record and takes nothing, nor does
+/// A's next figure, served inside the bound and read after it; B's own
+/// reading served after the bound is taken and stands. NEGATIVE CONTROL:
+/// A's figure served at the bound's last second is not taken, B's at the
+/// bound is — the gate is the bound, not the order of the reads.
+#[test]
+fn a_figure_served_before_the_new_login_was_adopted_is_not_taken() {
+    use crate::harness::profile::AccountKey;
+    let (a, b) = (
+        AccountKey::claude("11111111-1111-4111-8111-111111111111"),
+        AccountKey::claude("22222222-2222-4222-8222-222222222222"),
+    );
+    let (a_reset, b_reset) = (NOW + 4 * HOUR, NOW + 2 * HOUR);
+    let read = |pct_x10: u32, reset: i64, at: i64, key| TapRead {
+        key,
+        ..five(win(pct_x10, reset, None), at, true)
+    };
+    let figure = |s: &State| {
+        s.accounts["main"]
+            .windows
+            .get(SESSION_LIMIT)
+            .map(|f| (f.pct_x10, f.reset))
+    };
+    let mut s = state();
+    note_reading(
+        &mut s,
+        "main",
+        &read(500, a_reset, NOW - HOUR, a),
+        NOW - HOUR,
+    );
+    // A's figure, served before the change, read after it: keyed B.
+    let events = note_reading(&mut s, "main", &read(600, a_reset, NOW - 5, b), NOW);
+    assert_eq!(
+        events.iter().filter(|e| e.kind == Kind::Epoch).count(),
+        1,
+        "{events:?}"
+    );
+    assert_eq!(figure(&s), None);
+    // A's next figure, served inside the bound, read after it.
+    let edge = NOW + KEY_ADOPT_S - 1;
+    note_reading(&mut s, "main", &read(610, a_reset, edge, b), NOW + 2 * MIN);
+    assert_eq!(figure(&s), None, "served on the old login");
+    // B's own, served at the bound: taken.
+    let adopted = NOW + KEY_ADOPT_S;
+    note_reading(
+        &mut s,
+        "main",
+        &read(100, b_reset, adopted, b),
+        NOW + 3 * MIN,
+    );
+    assert_eq!(figure(&s), Some((100, b_reset)));
+    // A's straggler read later still plants no later anchor over it.
+    note_reading(&mut s, "main", &read(620, a_reset, edge, b), NOW + 4 * MIN);
+    assert_eq!(figure(&s), Some((100, b_reset)));
+}
+
+/// THE ADOPTION'S BOUND, AS ITS TAKERS ASK IT ([`Account::adopting`], the
+/// gate [`note_reading`] keeps and the host's tap reads to try a held-back
+/// reading again): a reading served before the key changed, or up to the
+/// bound's last second after it, is adopting; one served at
+/// [`KEY_ADOPT_S`] after it is not. NEGATIVE CONTROL: an account whose key
+/// never changed is never adopting.
+#[test]
+fn an_account_is_adopting_its_new_login_until_the_bound() {
+    let changed = Account {
+        keyed_at: Some(NOW),
+        ..Account::default()
+    };
+    assert!(changed.adopting(NOW - 5), "served before the change");
+    assert!(
+        changed.adopting(NOW + KEY_ADOPT_S - 1),
+        "the bound's last second"
+    );
+    assert!(!changed.adopting(NOW + KEY_ADOPT_S), "at the bound");
+    // NEGATIVE CONTROL.
+    assert!(!Account::default().adopting(NOW - 5));
+}
+
+/// A DROP BESIDE ANOTHER ACCOUNT'S READING IS NO REFILL ([`note_reading`],
+/// the account-stats design §3.5): the process's reading before was A's 80%
+/// under B's key (held back while B's login was adopted, so the record holds
+/// nothing of it), and its next, served after the bound, is B's 20% under
+/// the same reset — lower, but no reset was used: B's figure is taken with
+/// no epoch and no `reset` row. NEGATIVE CONTROL: the same drop beside the
+/// account's own 80% on record is the refill, its epoch opened once.
+#[test]
+fn a_drop_beside_another_accounts_reading_is_no_refill() {
+    use crate::harness::profile::AccountKey;
+    let (a, b) = (
+        AccountKey::claude("11111111-1111-4111-8111-111111111111"),
+        AccountKey::claude("22222222-2222-4222-8222-222222222222"),
+    );
+    let reset = NOW + 2 * HOUR;
+    let read = |pct_x10: u32, refilled: Option<u32>, at: i64, key| TapRead {
+        key,
+        ..five(win(pct_x10, reset, refilled), at, true)
+    };
+    let resets = |events: &[Event]| events.iter().filter(|e| e.kind == Kind::Reset).count();
+    let mut s = state();
+    note_reading(&mut s, "main", &read(500, None, NOW - HOUR, a), NOW - HOUR);
+    // B signs in; A's 80%, served on the old login, is held back.
+    note_reading(&mut s, "main", &read(800, None, NOW, b), NOW);
+    assert_eq!(s.accounts["main"].windows.get(SESSION_LIMIT), None);
+    // B's 20%, served after the bound, beside the process's 80% before.
+    let after = NOW + KEY_ADOPT_S;
+    let events = note_reading(&mut s, "main", &read(200, Some(800), after, b), after);
+    let fig = &s.accounts["main"].windows[SESSION_LIMIT];
+    assert_eq!((fig.pct_x10, fig.epoch_at), (200, None));
+    assert_eq!(resets(&events), 0, "{events:?}");
+    // NEGATIVE CONTROL: the account's own 80% on record.
+    let mut own = state();
+    note_reading(&mut own, "main", &read(800, None, NOW, a), NOW);
+    let events = note_reading(&mut own, "main", &read(200, Some(800), after, a), after);
+    assert_eq!(
+        own.accounts["main"].windows[SESSION_LIMIT].epoch_at,
+        Some(after)
+    );
+    assert_eq!(resets(&events), 1, "{events:?}");
+}
+
+/// A PROCESS BEGUN AFTER A RESET USED INSIDE A WINDOW HOLDS NO REPLY FROM
+/// BEFORE IT ([`TapRead::born`], the review of A1): under the five hours'
+/// epoch, a first reading (`seen_before` false) of a process that began at
+/// or after it — a new tab, a one-turn worker — is taken; one of a process
+/// begun before it, or whose start nobody read, says nothing of the window
+/// and is held back ([`note_reading_held`]).
+#[test]
+fn a_first_reading_of_a_process_begun_after_the_epoch_is_taken() {
+    let reset = NOW + 2 * HOUR;
+    let epoch = NOW - 30 * MIN;
+    let mut s = state();
+    note_reading(
+        &mut s,
+        "main",
+        &five(win(1000, reset, None), NOW - HOUR, true),
+        NOW - HOUR,
+    );
+    note_reading(
+        &mut s,
+        "main",
+        &five(win(50, reset, Some(1000)), epoch, true),
+        epoch,
+    );
+    assert_eq!(
+        s.accounts["main"].windows[SESSION_LIMIT].epoch_at,
+        Some(epoch)
+    );
+    let first = |born| TapRead {
+        born,
+        ..five(win(80, reset, None), NOW, false)
+    };
+    let pct = |s: &State| s.accounts["main"].windows[SESSION_LIMIT].pct_x10;
+    // NEGATIVE CONTROLS: begun before the epoch; begun when nobody read.
+    for born in [Some(epoch - 1), None] {
+        let mut before = s.clone();
+        let (_, held) = note_reading_held(&mut before, "main", &first(born), NOW);
+        assert_eq!((pct(&before), held), (50, true), "{born:?}");
+    }
+    let (_, held) = note_reading_held(&mut s, "main", &first(Some(epoch)), NOW);
+    assert_eq!((pct(&s), held), (80, false));
+}
+
+/// A WINDOW WHOSE RESET PASSED KEEPS ITS VOID FIGURE while readings name
+/// only the other window, for the stats to say `window reset …, no reading
+/// since` ([`WindowFig::current`]).
+#[test]
+fn a_void_window_keeps_its_figure_for_the_stats() {
+    let mut s = state();
+    let reset = NOW + HOUR;
+    note_reading(&mut s, "main", &five(win(600, reset, None), NOW, true), NOW);
+    let later = reset + HOUR;
+    let week = TapRead {
+        seven_day: win(300, NOW + 3 * DAY, None),
+        at: later,
+        seen_before: true,
+        ..TapRead::default()
+    };
+    note_reading(&mut s, "main", &week, later);
+    let fig = &s.accounts["main"].windows[SESSION_LIMIT];
+    assert_eq!((fig.pct_x10, fig.reset), (600, reset));
+    assert!(!fig.current(later));
+    assert!(
+        s.accounts["main"]
+            .sample
+            .as_ref()
+            .is_some_and(|x| x.session(later).is_none())
+    );
+}
+
+/// THE ONE MERGE OF A WINDOW'S FIGURES ([`merge_fig`]): a void held figure
+/// gives way; the newest anchor wins; within one anchor the newest epoch
+/// cuts what was served before it and the largest of the rest stands; with
+/// both cut the newer is kept; the figure, its reset and its epoch are the
+/// same from either side. NEGATIVE CONTROL: with the epoch taken off, the
+/// figure served before it wins again.
+#[test]
+fn a_windows_figures_merge_by_anchor_then_epoch_then_size() {
+    let fig = |pct_x10: u32, reset: i64, at: i64, epoch_at: Option<i64>| WindowFig {
+        pct_x10,
+        reset,
+        at,
+        by: "m".to_string(),
+        source: SOURCE_TAP.to_string(),
+        epoch_at,
+    };
+    let reset = NOW + HOUR;
+    let both = |a: &WindowFig, b: &WindowFig| {
+        let ab = merge_fig(Some(a), Some(b), NOW).expect("one");
+        let ba = merge_fig(Some(b), Some(a), NOW).expect("one");
+        assert_eq!(
+            (ab.pct_x10, ab.reset, ab.epoch_at),
+            (ba.pct_x10, ba.reset, ba.epoch_at),
+            "either side"
+        );
+        ab
+    };
+    let old = fig(900, reset - 5 * HOUR, NOW - 2 * HOUR, None);
+    assert_eq!(
+        merge_fig(Some(&old), Some(&fig(10, reset, NOW, None)), NOW).map(|f| f.pct_x10),
+        Some(10)
+    );
+    assert_eq!(
+        both(
+            &fig(900, reset, NOW - 9, None),
+            &fig(10, reset + HOUR, NOW, None)
+        )
+        .pct_x10,
+        10
+    );
+    assert_eq!(
+        both(&fig(900, reset, NOW - 9, None), &fig(10, reset, NOW, None)).pct_x10,
+        900
+    );
+    let refilled = fig(20, reset, NOW, Some(NOW));
+    assert_eq!(both(&fig(900, reset, NOW - 9, None), &refilled).pct_x10, 20);
+    let reopened = both(
+        &fig(900, reset, NOW - 9, Some(NOW - 5)),
+        &fig(950, reset, NOW - 7, None),
+    );
+    assert_eq!((reopened.pct_x10, reopened.epoch_at), (950, Some(NOW - 5)));
+    assert!(reopened.cut());
+    // NEGATIVE CONTROL: the refill's epoch off, the 900 stands.
+    let plain = WindowFig {
+        epoch_at: None,
+        ..refilled
+    };
+    assert_eq!(both(&fig(900, reset, NOW - 9, None), &plain).pct_x10, 900);
+}
+
+/// A RESET USED REFILLS THE WALLED WINDOW'S FIGURE ([`reset_outcome`]): the
+/// tap's 100% from before it is cut — an epoch at the outcome — and the
+/// sample written after it holds no figure of that window until a reading
+/// of it comes. NEGATIVE CONTROL: a limit that LIFTED by itself opens no
+/// epoch (the figure after it is the window's own next one).
+#[test]
+fn a_reset_used_cuts_the_walled_windows_tap_figure() {
+    let week_end = NOW + 4 * DAY;
+    let run = |done: &ResetDone<'_>| {
+        let mut s = state();
+        let read = TapRead {
+            seven_day: win(1000, week_end, None),
+            at: NOW,
+            seen_before: true,
+            ..TapRead::default()
+        };
+        note_reading(&mut s, "main", &read, NOW);
+        let _ = note_wall(&mut s, "main", WEEK_LIMIT, Some(week_end), NOW, NOW);
+        assert_eq!(
+            claim_reset(
+                &mut s,
+                "main",
+                (WEEK_LIMIT, week_end),
+                "s-1",
+                41,
+                START,
+                NOW + MIN
+            ),
+            ResetClaimed::Taken
+        );
+        let _ = reset_outcome(&mut s, "main", week_end, "s-1", done, NOW + 2 * MIN);
+        s.accounts["main"].windows[WEEK_LIMIT].clone()
+    };
+    let used = run(&ResetDone::Used {
+        kind: aterm_phase::ResetKind::Weekly,
+        left: Some(0),
+    });
+    assert_eq!(used.epoch_at, Some(NOW + 2 * MIN));
+    assert!(used.cut());
+    let lifted = run(&ResetDone::Lifted);
+    assert_eq!(lifted.epoch_at, None);
+}
+
+/// The probe's sample of the session window at `pct` resetting at `reset`,
+/// and the week at `week`.
+fn sampled(pct: u32, reset: i64, week: u32) -> Sample {
     Sample {
         session_pct: Some(pct),
         session_reset: Some(reset),
@@ -7733,19 +8486,38 @@ fn tapped(pct: u32, reset: i64, week: u32) -> Sample {
     }
 }
 
-/// THE MAX RULE AND THE HEARTBEAT: within one reset the larger figure
-/// stands (60 over a later 58, a stale process's); a newer reset takes the
-/// newer window whatever its figure; a reading for an OLDER window than the
-/// one held is never taken; a held window whose reset passed is void. A
-/// reading that changes nothing writes nothing until the heartbeat, which
-/// writes the same figures again with a row. NEGATIVE CONTROLS: the probe's
-/// `note_sample`, which takes the newer sample whole, does take the 58 — the
-/// rule is this function's — and a reading with no window writes nothing.
+/// A tap reading of the session window at `pct` resetting at `reset`, and
+/// the week at `week`, written at `at` by a process the host read before.
+fn tapped(pct: u32, reset: i64, week: u32, at: i64) -> TapRead {
+    TapRead {
+        five_hour: Some(WindowRead {
+            pct_x10: pct * 10,
+            reset,
+            refilled: None,
+        }),
+        seven_day: Some(WindowRead {
+            pct_x10: week * 10,
+            reset: NOW + 3 * DAY,
+            refilled: None,
+        }),
+        at,
+        seen_before: true,
+        born: None,
+        key: None,
+    }
+}
+
+/// [`note_reading`]: within one reset the larger figure stands (60 over a
+/// stale process's later 58), a newer reset takes the newer window, an older
+/// window is never taken, a held window whose reset passed is void, and an
+/// unchanged reading writes nothing until the heartbeat, which writes the same
+/// figures again. The probe's `note_sample` does take the 58, and a reading
+/// with no window writes nothing.
 #[test]
 fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news() {
     let mut s = state();
     let reset = NOW + 2 * HOUR;
-    let events = note_reading(&mut s, "main", tapped(60, reset, 30), NOW);
+    let events = note_reading(&mut s, "main", &tapped(60, reset, 30, NOW), NOW);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind, Kind::Sample);
     let held = |s: &State| s.accounts["main"].sample.clone().expect("a sample");
@@ -7754,28 +8526,42 @@ fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news()
     assert_eq!(held(&s).by, "0a0b");
     // 58 in the same window: no change, no write.
     let before = s.clone();
-    assert!(note_reading(&mut s, "main", tapped(58, reset, 30), NOW + MIN).is_empty());
+    assert!(note_reading(&mut s, "main", &tapped(58, reset, 30, NOW + MIN), NOW + MIN).is_empty());
     assert_eq!(s, before, "nothing written");
     // The same figures past the heartbeat: written again, the same figures.
     let beat = NOW + READING_HEARTBEAT_S;
     assert_eq!(
-        note_reading(&mut s, "main", tapped(58, reset, 30), beat).len(),
+        note_reading(&mut s, "main", &tapped(58, reset, 30, beat), beat).len(),
         1
     );
     assert_eq!(held(&s).session_pct, Some(60));
     assert_eq!(held(&s).at, beat);
     // A rise in the window is news at once.
     assert_eq!(
-        note_reading(&mut s, "main", tapped(61, reset, 30), beat + 1).len(),
+        note_reading(&mut s, "main", &tapped(61, reset, 30, beat + 1), beat + 1).len(),
         1
     );
     assert_eq!(held(&s).session_pct, Some(61));
     // An older window is never taken; a newer one is, whatever its figure.
     let before = s.clone();
-    assert!(note_reading(&mut s, "main", tapped(90, reset - HOUR, 30), beat + 2).is_empty());
+    assert!(
+        note_reading(
+            &mut s,
+            "main",
+            &tapped(90, reset - HOUR, 30, beat + 2),
+            beat + 2
+        )
+        .is_empty()
+    );
     assert_eq!(s, before);
     assert_eq!(
-        note_reading(&mut s, "main", tapped(3, reset + 5 * HOUR, 30), beat + 3).len(),
+        note_reading(
+            &mut s,
+            "main",
+            &tapped(3, reset + 5 * HOUR, 30, beat + 3),
+            beat + 3
+        )
+        .len(),
         1
     );
     assert_eq!(held(&s).session_pct, Some(3));
@@ -7783,7 +8569,7 @@ fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news()
     // A held window whose reset passed is void: the reading's stands.
     let late = reset + 5 * HOUR + 1;
     assert_eq!(
-        note_reading(&mut s, "main", tapped(1, reset - HOUR, 30), late).len(),
+        note_reading(&mut s, "main", &tapped(1, reset - HOUR, 30, late), late).len(),
         1
     );
     assert_eq!(held(&s).session_pct, Some(1));
@@ -7791,14 +8577,14 @@ fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news()
     assert_eq!(held(&s).week_pct, Some(30));
     // No window: nothing.
     let before = s.clone();
-    let empty = Sample {
-        session_pct: None,
-        week_pct: None,
-        ..tapped(0, reset, 0)
+    let empty = TapRead {
+        five_hour: None,
+        seven_day: None,
+        ..tapped(0, reset, 0, late + DAY)
     };
-    assert!(note_reading(&mut s, "main", empty, late + DAY).is_empty());
+    assert!(note_reading(&mut s, "main", &empty, late + DAY).is_empty());
     assert_eq!(s, before);
-    // Negative control: the probe's recorder takes the 58 whole.
+    // The probe's recorder takes the 58 whole.
     let mut probe = state();
     assert_eq!(
         note_sample(
@@ -7806,7 +8592,7 @@ fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news()
             "main",
             Sample {
                 at: NOW,
-                ..tapped(60, reset, 30)
+                ..sampled(60, reset, 30)
             },
             NOW
         )
@@ -7819,7 +8605,7 @@ fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news()
             "main",
             Sample {
                 at: NOW + MIN,
-                ..tapped(58, reset, 30)
+                ..sampled(58, reset, 30)
             },
             NOW + MIN
         )

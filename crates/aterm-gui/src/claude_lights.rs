@@ -34,8 +34,9 @@
 //!   on it steps the session's own word (Cruise → Land → Off → Cruise,
 //!   [`App::cycle_session_autopilot`]): written in-process, nothing sent to
 //!   the PTY, never a person's keystroke, the chip `◐` until a frame reads
-//!   the word back. With the master switch off a click on it opens Settings
-//!   ▸ Harness in that window, where the switch is. NO SETTINGS BUTTON
+//!   the word back. With the master switch (or the agent's own) off a click
+//!   on it turns that switch on, as the top rule's harness switch does
+//!   ([`App::press_harness_switch`]), and opens nothing. NO SETTINGS BUTTON
 //!   (owner, 2026-10-20: "remove the harness settings button in the UX"):
 //!   the `⚙` chip that stood beside it from 2026-10-15 is gone, its hit, its
 //!   title and its accessibility node with it; Settings ▸ Harness stays one
@@ -141,6 +142,11 @@ use aterm_window::keyboard::{Key, ModifiersState, NamedKey};
 use crate::autopilot::{AutopilotView, ChipTone, PENDING_GLYPH};
 use crate::{App, WindowId};
 
+/// `chrome`'s `autopilot` lines: the chip's face, and its cells as the last
+/// frame drew them (§12.5.3).
+#[path = "claude_lights_drawn.rs"]
+mod drawn;
+
 /// How long a toggle that did not take keeps saying so.
 const REFUSAL_SHOWN: Duration = Duration::from_secs(4);
 
@@ -151,12 +157,12 @@ const REFUSAL_SHOWN: Duration = Duration::from_secs(4);
 /// the keyboard selection and a block's columns are kept per chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Chip {
-    /// A light of Claude Code's (today the permission mode): drawn as a
-    /// deviation only; a click toggles it with Claude's own input.
+    /// A light of Claude Code's (the permission mode): drawn only as a deviation; a click
+    /// toggles it with Claude's own input.
     Light(Light),
     /// The session's Autopilot ([`AutopilotView`]): drawn always while a
-    /// harness host exists; a click steps its word, or opens Settings ▸
-    /// Harness with the master switch off. The harness's one chip: no
+    /// harness host exists; a click steps its word, or turns on the switch
+    /// of aterm.toml that holds the harness off. The harness's one chip: no
     /// settings button stands beside it (owner, 2026-10-20).
     Autopilot,
     /// Who drives ([`TeamFace`]): drawn wherever the session is a worker, a
@@ -380,7 +386,7 @@ pub(crate) enum Weekday {
     allow(
         dead_code,
         reason = "the whole name is the accessibility tree's, built only under the `a11y_tree` \
-                  cfg (Linux)"
+                  cfg (Linux, macOS and Windows)"
     )
 )]
 impl Weekday {
@@ -431,9 +437,9 @@ impl Weekday {
     }
 }
 
-/// AN ARMED TIMER as the chip shows it (§9.3.2): the local time a timed
-/// Cruise lands, formatted when the timer was indexed, and its weekday where
-/// that instant falls on another local date than the one it was set on.
+/// An armed timer as the chip shows it (§9.3.2): the local time a timed Cruise lands,
+/// formatted when the timer was indexed, and its weekday where that falls on another local
+/// date than the one it was set on.
 #[cfg_attr(
     not(test),
     allow(
@@ -521,14 +527,11 @@ pub(crate) enum ChipFace {
     Unhosted,
 }
 
-/// How a block gives way in a rule short of room: what
-/// [`WindowLights::fitted`] gives up, rung by rung, until the chips fit.
-/// Each rung keeps a part of the one before it, so a chip leaves only as
-/// the rule narrows: never given up at one width and drawn again at a
-/// narrower one. Past [`Keep::Drawn`] the block HOLDS all the room it was
-/// fitted to ([`Block::holds`]): the room a given-up chip leaves stays the
-/// rule's, and no fact the facts gave up before the chips comes back
-/// beside fewer of them.
+/// How a block gives way in a rule short of room: what [`WindowLights::fitted`] gives up,
+/// rung by rung, until the chips fit. Each rung keeps a part of the one before it, so a
+/// chip given up at one width is never drawn at a narrower one. Past [`Keep::Drawn`] the
+/// block holds all the room it was fitted to ([`Block::holds`]): the room a given-up chip
+/// leaves stays the rule's, and no fact the facts gave up comes back beside fewer chips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Keep {
     /// Every chip, the keyboard's reveal of the lights at rest included.
@@ -556,7 +559,7 @@ enum Keep {
 
 impl Keep {
     /// Every rung, in the order a rule short of room tries them.
-    /// [`Keep::GlyphOnly`] is tried only for a standing face of v2's.
+    /// [`Keep::GlyphOnly`] is tried only for a standing face.
     const LADDER: [Keep; 5] = [
         Keep::Revealed,
         Keep::Drawn,
@@ -581,16 +584,14 @@ impl Keep {
 enum Refusal {
     /// The light is not on Claude's screen right now.
     NotShown,
-    /// A mode return stopped short of bypass or auto — a press went
-    /// unanswered past its own deadline, a box covered the composer, or the
-    /// input seam took no next press — in this mode, which the light names:
-    /// the session DID switch, just not all the way.
+    /// A mode return stopped short of bypass or auto in this mode, which the
+    /// light names (a press unanswered past its deadline, a box over the
+    /// composer, or the input seam took no next press): the session did switch,
+    /// just not all the way.
     StoppedIn(Mode),
     /// A mode return stopped in this mode because Claude stayed mid-turn past
     /// the last press's deadline: aterm's own next press waits for a turn to
-    /// end (a box opens only mid-turn, and a shift+tab that lands in one is
-    /// its answer — in the edit prompt, "allow edits for this session"). The
-    /// person's own click presses at once, so a click again goes on.
+    /// end ([`WindowLights::advance`]). A click again goes on.
     StoppedMidTurn(Mode),
     /// The mode cycle came back round without an expected mode: this
     /// session's shift+tab cycle holds neither bypass nor auto. Stopped in
@@ -644,9 +645,9 @@ struct Pending {
     seen: Vec<Mode>,
     presses: u8,
     /// Past this, the toggle is given up. Refreshed on every press: it is the
-    /// time for ONE shift+tab's answer.
+    /// time for one shift+tab's answer.
     deadline: Instant,
-    /// The loop's next look at the engine while one is armed: ONE timer per
+    /// The loop's next look at the engine while one is armed: one timer per
     /// toggle, however many wakes arrive meanwhile.
     next_poll: Option<Instant>,
     /// A mode return's: Claude answered the last press but was mid-turn, so
@@ -679,8 +680,8 @@ enum Advance {
 /// One session's lights in one window.
 #[derive(Debug, Clone, Default)]
 struct SessionLights {
-    /// The last state each light was SEEN in — kept while a box covers the
-    /// composer, so the row does not flicker grey under every dialog.
+    /// The last state each light was seen in, kept while a box covers the
+    /// composer so the row does not flicker grey under every dialog.
     shown: Reading,
     pending: Option<Pending>,
     refused: Option<(Light, Refusal, Instant)>,
@@ -696,6 +697,18 @@ struct SessionLights {
     /// let go if no frame has read that word back by then. The chip shows
     /// `◐` meanwhile.
     autopilot_pending: Option<(Autopilot, Instant)>,
+    /// A press of the harness switch's `on` that wrote a switch of
+    /// aterm.toml, and the instant it is let go if the policy in force has
+    /// not read it back by then (`autopilot::SWITCH_SETTLE`): the switch says
+    /// `◐ turning on` meanwhile, and a press of it does nothing.
+    switch_turning: Option<Instant>,
+    /// When a press last flipped the harness switch (either way): a press
+    /// within a double click's interval of it (`crate::multi_click_ms`) is
+    /// the same gesture's second click and does nothing, so a double click
+    /// on `on` never turns back what its first click did, whatever frame
+    /// painted between them. Read only at the next press: no wake, no
+    /// repaint term.
+    switch_pressed: Option<Instant>,
     /// What the Team chip says, as the last frame that drew the footer read
     /// it ([`App::note_claude_team`]); `None`: no chip.
     team: Option<TeamFace>,
@@ -713,11 +726,10 @@ impl SessionLights {
             .is_some_and(|view| view != AutopilotView::Unhosted)
     }
 
-    /// Whether a rule short of room for the Autopilot chip's face may keep
-    /// its glyph alone ([`Keep::GlyphOnly`]): only while it wears a standing
-    /// face of v2's ([`ChipFace::standing`]) and no click of it is in flight
-    /// (whose `◐` is a glyph alone already). v1's faces give the chip up
-    /// whole, as v1 did.
+    /// Whether a rule short of room for the Autopilot chip's face may keep its glyph alone
+    /// ([`Keep::GlyphOnly`]): only while it wears a standing face ([`ChipFace::standing`])
+    /// and no click of it is in flight (whose `◐` is a glyph alone already). Other faces
+    /// give the chip up whole.
     fn glyph_rung(&self) -> bool {
         self.autopilot_pending.is_none()
             && self
@@ -772,12 +784,11 @@ impl OverChips {
 /// The lights' state for one window (`WindowState::claude_lights`).
 #[derive(Debug, Default)]
 pub(crate) struct WindowLights {
-    /// One per painted CELL of every drawn chip: the whole chip is the target.
+    /// One per painted cell of every drawn chip: the whole chip is the target.
     hits: Vec<LightHit>,
-    /// The sessions whose composer rule this frame found on the glass —
-    /// chip or none — with the cells its chips may take there. The
-    /// keyboard's way to a light at rest needs the rule on the glass AND room
-    /// in it for the chip it selects.
+    /// The sessions whose composer rule this frame found on the glass (chip or none),
+    /// with the cells its chips may take there. The keyboard's way to a light at rest
+    /// needs the rule on the glass and room in it for the chip it selects.
     footers: Vec<(u64, usize)>,
     hover: Option<(u64, Chip)>,
     selected: Option<(u64, Chip)>,
@@ -809,8 +820,42 @@ pub(crate) struct WindowLights {
     /// title. Let go with the reading, so a reading that starts again on
     /// another day lists the weekday afresh.
     readings: Vec<TitleReading>,
-    /// Top-rule harness border toggle pill spans `(frame_row, term_row, cols, session)`.
-    pub(crate) border_toggles: Vec<(usize, usize, std::ops::Range<usize>, u64)>,
+    /// THE HARNESS SWITCHES the last paint put on composer top rules
+    /// ([`BorderSwitch`], `crate::claude_footer`): the only ones a press, a
+    /// hover or a screen reader reaches.
+    pub(crate) border_toggles: Vec<BorderSwitch>,
+    /// The session whose harness switch the pointer is over
+    /// ([`App::track_claude_light_hover`]): its `on` button, or the lit
+    /// switch, is drawn as what a press acts on.
+    pub(crate) switch_hover: Option<u64>,
+}
+
+/// One harness switch on a composer top rule as the paint drew it
+/// (`autopilot::HarnessSwitch`, `claude_footer`'s `switch_face`), in frame
+/// cells — recorded by the painter, read by the pointer and the
+/// accessibility tree, so a press acts only on a switch the glass shows and
+/// does what the person saw it offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BorderSwitch {
+    pub(crate) frame_row: usize,
+    /// The same row as a window grid row, for the chrome register.
+    pub(crate) term_row: usize,
+    /// Every cell a press acts on: the whole face, its wordmark included.
+    pub(crate) cols: std::ops::Range<usize>,
+    /// The switch's own cells, its label and its state (`claude harness ○
+    /// off`): the accessibility tree's switch node.
+    pub(crate) switch: std::ops::Range<usize>,
+    /// The `on` button's cells, on an off switch.
+    pub(crate) button: Option<std::ops::Range<usize>>,
+    pub(crate) session: u64,
+    /// What the switch said.
+    pub(crate) face: crate::autopilot::HarnessSwitch,
+    /// The harness's branding stood with it (the wordmark).
+    pub(crate) branded: bool,
+    /// Its form, widest first (`claude_footer::switch_words` rebuilds its
+    /// words from it).
+    pub(crate) tier: usize,
+    pub(crate) program: aterm_phase::Program,
 }
 
 /// One Autopilot title someone is reading ([`WindowLights::readings`]).
@@ -992,15 +1037,12 @@ pub(crate) fn lights_now() -> Instant {
 }
 
 impl WindowLights {
-    /// Everything about the lights that is GUI state rather than grid
-    /// content, for the repaint key: a hover, a selection, a toggle in flight
-    /// or a refusal on show changes the row with no grid damage at all. The
-    /// harness chips' own state — the session's Autopilot, a click of it in
-    /// flight — is keyed per pane by the footer
-    /// ([`Self::autopilot_term`]), so this stays 0 at rest. `now` is read
-    /// once, and only where a refusal or a notice is held — whose showing it
-    /// bounds — so a window with neither, every window at rest, reads no
-    /// clock for it.
+    /// Everything about the lights that is GUI state rather than grid content, for the
+    /// repaint key: a hover, a selection, a toggle in flight, or a refusal or notice on
+    /// show changes the row with no grid damage at all. The harness chips' own state (the
+    /// session's Autopilot, a click of it in flight) is keyed per pane by the footer
+    /// ([`Self::autopilot_term`]), so this stays 0 at rest. `now` is called at most once,
+    /// and only while a refusal or notice is held, so a window at rest reads no clock.
     pub(crate) fn fingerprint(&self, now: impl Fn() -> Instant) -> u64 {
         let read = std::cell::Cell::new(None);
         let shows = |until: Instant| {
@@ -1011,9 +1053,9 @@ impl WindowLights {
             });
             until > now
         };
-        // Among session entries, only a pending toggle or a refusal still on
-        // screen can change the row. `sessions` also remembers light states for
-        // hidden panes, so a long-lived window can hold many inert entries.
+        // Among session entries, only a pending toggle, or a refusal or notice still on
+        // show, can change the row. `sessions` also remembers light states for hidden
+        // panes, so a long-lived window can hold many inert entries.
         let mut active: Vec<_> = self
             .sessions
             .iter()
@@ -1049,7 +1091,7 @@ impl WindowLights {
         h.finish() | 1
     }
 
-    /// Keep ONE poll armed for `session`'s toggle in flight: the loop reads
+    /// Keep one poll armed for `session`'s toggle in flight: the loop reads
     /// the engine again after `every`, however many wakes arrive meanwhile.
     fn arm_poll(&mut self, session: u64, now: Instant, every: Duration) {
         if let Some(p) = self
@@ -1123,12 +1165,11 @@ impl WindowLights {
         self.selection_painted = false;
     }
 
-    /// Fold in `session`'s Autopilot as this frame's footer read it — its
-    /// own `word`, its `view` ([`App::session_autopilot`]) and its harness
-    /// glass ([`App::chip_glass`]) — and let an Autopilot click in flight go
-    /// once the word reads back as the one it wrote, or once its time is up.
-    /// The clock (`now`) is read only for a click in flight that has not read
-    /// back: a frame at rest reads none.
+    /// Fold in `session`'s Autopilot as this frame's footer read it (its own `word`, its
+    /// `view` from [`App::session_autopilot`] and its harness glass from
+    /// [`App::chip_glass`]), and let an Autopilot click in flight go once the word reads
+    /// back as the one it wrote or its time is up. `now` is called only for a click in
+    /// flight that has not read back: a frame at rest reads no clock.
     fn note_autopilot_at(
         &mut self,
         session: u64,
@@ -1140,6 +1181,16 @@ impl WindowLights {
         let s = self.sessions.entry(session).or_default();
         s.autopilot = Some(view);
         s.glass = glass;
+        // The switch's `on` read back: the harness carries the session (or
+        // the host is gone, and with it the switch).
+        if s.switch_turning.is_some()
+            && !matches!(
+                crate::autopilot::HarnessSwitch::of(view),
+                Some(crate::autopilot::HarnessSwitch::Off(_))
+            )
+        {
+            s.switch_turning = None;
+        }
         if s.autopilot_pending
             .is_some_and(|(want, until)| word == Some(want) || until <= now())
         {
@@ -1159,19 +1210,19 @@ impl WindowLights {
         self.note_autopilot_at(session, word, view, ChipGlass::default(), || now);
     }
 
-    /// The harness chips' repaint term for `session`'s footer in this
-    /// window: its own Autopilot `word` and its `view`, as the footer's key
-    /// read them (once a frame, [`App::session_autopilot`]), an Autopilot
-    /// click of it in flight here, and its harness `glass`
-    /// ([`App::chip_glass`]) — glass that moves with no grid damage. Folded
-    /// into the footer's key (`App::claude_footer_fp`) for every pane whose
-    /// footer shows, never into [`Self::fingerprint`], which stays 0 at rest.
-    /// A packing of small fields, distinct for every combination the chip
-    /// draws differently (§9.2.3's bit table): no hasher, no lock, no clock.
+    /// The harness chips' repaint term for `session`'s footer in this window: its own
+    /// Autopilot `word` and `view` as the footer's key read them (once a frame,
+    /// [`App::session_autopilot`]), an Autopilot click of it in flight here, and its harness
+    /// `glass` ([`App::chip_glass`]), which moves with no grid damage. Folded into the
+    /// footer's key (`App::claude_footer_fp`) for every pane whose footer shows, never into
+    /// [`Self::fingerprint`], which stays 0 at rest. A packing of small fields, distinct for
+    /// every combination the chip draws differently (§9.2.3): no hasher, no lock, no clock.
     ///
     /// | Bits | Term |
     /// |---|---|
-    /// | 0–23 | v1's word, view and click in flight |
+    /// | 0–7 | the word (0: none) |
+    /// | 8–15 | the view |
+    /// | 16–23 | the word of a click in flight (0: none) |
     /// | 24–31 | the lit act (0: none) |
     /// | 32–34 | the task's face (0: open or unknown) |
     /// | 35 | spare (the retired Codex goal hold) |
@@ -1180,7 +1231,7 @@ impl WindowLights {
     /// | 48–55 | the trail's generation, ONLY while this chip is hovered or selected: an act that lights nothing repaints nothing unless someone is reading the title |
     /// | 56–58 | the timer's displayed weekday + 1 (0: none) |
     ///
-    /// With the default glass it is v1's term, bit for bit.
+    /// The default glass leaves bits 24–55 at 0.
     pub(crate) fn autopilot_term(
         &self,
         session: u64,
@@ -1198,6 +1249,74 @@ impl WindowLights {
         word_bits(word) | view.code() << 8 | word_bits(pending) << 16 | glass_bits(glass, reading)
     }
 
+    /// The harness switch `session`'s top rule shows over `face`, its
+    /// reading (`autopilot::HarnessSwitch::of`): [`HarnessSwitch::Turning`]
+    /// while a press's write turns an off switch on, and whether the pointer
+    /// is over it. No clock: a write's deadline is its wake's to keep
+    /// ([`Self::expire`]).
+    ///
+    /// [`HarnessSwitch::Turning`]: crate::autopilot::HarnessSwitch::Turning
+    pub(crate) fn switch_shown(
+        &self,
+        session: u64,
+        face: crate::autopilot::HarnessSwitch,
+    ) -> (crate::autopilot::HarnessSwitch, bool) {
+        let turning = !face.is_on()
+            && self
+                .sessions
+                .get(&session)
+                .is_some_and(|s| s.switch_turning.is_some());
+        let face = if turning {
+            crate::autopilot::HarnessSwitch::Turning
+        } else {
+            face
+        };
+        (face, self.switch_hover == Some(session))
+    }
+
+    /// Whether this press still belongs to the last harness-switch gesture.
+    /// Mode-only chip cycles do not stamp this marker, so they remain repeatable.
+    fn switch_just_pressed(&self, session: u64, now: Instant) -> bool {
+        self.sessions
+            .get(&session)
+            .and_then(|s| s.switch_pressed)
+            .is_some_and(|at| {
+                now.saturating_duration_since(at).as_millis() <= crate::multi_click_ms()
+            })
+    }
+
+    /// The harness switch's repaint term for `session`'s footer in this
+    /// window, beside the Autopilot's (whose view the switch reads,
+    /// [`Self::autopilot_term`]): whether this window's host holds the
+    /// session (`supervised`: the branding), a press's write turning it on,
+    /// and the pointer over it — each a change of the top rule with no grid
+    /// damage. Folded into the footer's key (`App::claude_footer_fp`); no
+    /// clock, no lock.
+    pub(crate) fn switch_term(&self, session: u64, supervised: bool) -> u64 {
+        let turning = self
+            .sessions
+            .get(&session)
+            .is_some_and(|s| s.switch_turning.is_some());
+        u64::from(supervised)
+            | u64::from(turning) << 1
+            | u64::from(self.switch_hover == Some(session)) << 2
+    }
+
+    /// Let every switch turning on go — its write was refused, so nothing
+    /// it waits for will come. Whether any was.
+    pub(crate) fn let_switches_go(&mut self) -> bool {
+        let mut any = false;
+        for s in self.sessions.values_mut() {
+            let went = s.switch_turning.take().is_some();
+            #[cfg(test)]
+            if went {
+                SWITCHES_LET_GO.with(|n| n.set(n.get() + 1));
+            }
+            any |= went;
+        }
+        any
+    }
+
     /// Read `rows` (`read`, inside the reader's panic fence) and fold the
     /// reading in ([`Self::observe_read`]).
     #[cfg(test)]
@@ -1212,11 +1331,10 @@ impl WindowLights {
         self.observe_read(session, read)
     }
 
-    /// Fold a frame's reading of `session`'s rows in ([`Self::observe`]),
-    /// as its reader's panic fence left it (`crate::claude_footer`'s
-    /// readings, kept with the rows). A reader panic (`None`) folds NOTHING
-    /// in: the lights keep what they last showed, a toggle in flight takes no
-    /// step (its deadline still expires it), and nothing to send or show.
+    /// Fold a frame's reading of `session`'s rows in ([`Self::observe`]), as its reader's
+    /// panic fence left it (`crate::claude_footer`'s readings, kept with the rows). A reader
+    /// panic (`None`) folds nothing in: the lights keep what they last showed, and a toggle
+    /// in flight takes no step (its deadline still expires it).
     fn observe_read(&mut self, session: u64, read: crate::claude_footer::LightsRead) -> Step {
         match read {
             Some(reading) => self.observe(session, reading),
@@ -1224,13 +1342,11 @@ impl WindowLights {
         }
     }
 
-    /// Fold one frame's reading of `session`'s screen in (`lights::read_lights`:
-    /// `None` without a composer): remember what each light shows. A toggle
-    /// is NEVER stepped here: a frame that shows Claude's answer — the pill
-    /// moved on — only wakes the loop, which reads the ENGINE and decides
-    /// ([`App::advance_claude_mode_returns`]) — the same decision whether or
-    /// not a frame is painted, and the turn is read there, never here. What
-    /// the caller must do: wake the loop.
+    /// Fold one frame's reading of `session`'s screen in (`lights::read_lights`: `None`
+    /// without a composer): remember what each light shows. A toggle is never stepped here:
+    /// a frame that shows Claude's answer (the pill moved on) only asks the caller to wake
+    /// the loop, which reads the engine, the turn included, and decides
+    /// ([`App::advance_claude_mode_returns`]), the same whether or not a frame is painted.
     fn observe(&mut self, session: u64, reading: Option<Reading>) -> Step {
         let s = self.sessions.entry(session).or_default();
         s.shown.fold(&reading.unwrap_or(Reading::UNKNOWN));
@@ -1244,17 +1360,13 @@ impl WindowLights {
         }
     }
 
-    /// Move `session`'s mode return along from the ENGINE's `screen` (`None`
-    /// without a composer on it): done at bypass or auto; the next press
-    /// once Claude has answered the last with another mode AND is not
-    /// mid-turn — its own deadline set now; or a lap refused, naming the mode
-    /// it stopped in. Anything else waits: an unanswered press, a box, a
-    /// scrolled view — and a turn in flight, because a box opens only
-    /// mid-turn and a shift+tab that lands in one is its ANSWER (the 2.1.283
-    /// edit prompt binds it, `confirm:cycleMode`, to "yes, allow edits for
-    /// this session"): a read shows no box, but one may open between that
-    /// read and Claude reading the key. An idle Claude opens none. Deadlines
-    /// are [`Self::expire`]'s.
+    /// Move `session`'s mode return along from the engine's `screen` (`None` without a
+    /// composer): done at bypass or auto; the next press once Claude answered the last with
+    /// another mode and is not mid-turn; or a lap refused, naming the mode. Anything else
+    /// waits (an unanswered press, a box, a scrolled view, a turn). No press goes mid-turn: a
+    /// box opens only then, possibly between the read and Claude reading the key, and a
+    /// shift+tab landing in one answers it (2.1.283's edit prompt takes it as "yes, allow
+    /// edits for this session"). Deadlines are [`Self::expire`]'s.
     fn advance(&mut self, session: u64, screen: Option<&Screen>, now: Instant) -> Advance {
         let Some(s) = self.sessions.get_mut(&session) else {
             return Advance::Wait;
@@ -1278,9 +1390,9 @@ impl WindowLights {
         if p.deadline <= now || mode == p.mode_at_press {
             return Advance::Wait;
         }
-        // A mode shown before is a LAP — this session's cycle holds neither
+        // A mode shown before is a lap: this session's cycle holds neither
         // bypass nor auto (it has three to five modes,
-        // `lights::MAX_MODE_PRESSES`): stop, and say where.
+        // `lights::MAX_MODE_PRESSES`). Stop, and say where.
         if mode == p.started || p.seen.contains(&mode) || p.presses >= lights::MAX_MODE_PRESSES {
             s.pending = None;
             s.refused = Some((Light::Mode, Refusal::NotInCycle(mode), now + REFUSAL_SHOWN));
@@ -1296,18 +1408,16 @@ impl WindowLights {
         p.seen.push(mode);
         p.mode_at_press = mode;
         p.held_mid_turn = false;
-        // Each press gets its own deadline: the time for ONE answer.
+        // Each press gets its own deadline: the time for one answer.
         p.deadline = now + Duration::from_millis(lights::SETTLE_MS);
         Advance::Press { expect: mode }
     }
 
-    /// Give up on every toggle past its deadline — a mode return past its
-    /// LAST press's, naming the mode it stopped in (the session did switch,
-    /// just not all the way) — and end every refusal and notice past its
-    /// time, and let go of every Autopilot click no frame read back in its
-    /// time (the chip then says the word as it reads): whether anything
-    /// changed, and the sessions whose refusal starts now (the caller times
-    /// its end — a refusal no frame ends would stay on an idle screen).
+    /// Give up on every toggle past its deadline (a mode return past its last press's names
+    /// the mode it stopped in), end every refusal and notice past its time, and let go of
+    /// every Autopilot click no frame read back in time. Returns whether anything changed
+    /// and the sessions whose refusal starts now: the caller times its end, since a refusal
+    /// no frame ends would stay on an idle screen.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1356,6 +1466,10 @@ impl WindowLights {
             }
             if s.autopilot_pending.is_some_and(|(_, until)| until <= now) {
                 s.autopilot_pending = None;
+                any = true;
+            }
+            if s.switch_turning.is_some_and(|until| until <= now) {
+                s.switch_turning = None;
                 any = true;
             }
         }
@@ -1614,23 +1728,18 @@ impl WindowLights {
         block
     }
 
-    /// `session`'s chip block: its TITLE (when a chip is selected or hovered,
-    /// or a light is switching, refused or just switched — empty otherwise)
-    /// and its CHIPS, then one cell of margin, with the columns each chip
-    /// spans. Apart, because only the chips must fit: a pane too narrow for
-    /// the title keeps its chips and drops the title. `accent` is the
-    /// footer's mark ink, which Cruise's `∞` wears; `selected` and `hover`
-    /// the keyboard's and the pointer's chips in this session.
+    /// `session`'s chip block at `keep`: its title (empty unless a chip is selected or
+    /// hovered, or a light is switching, refused or just switched), its chips, and the
+    /// columns each chip spans. Title and chips are apart because only the chips must fit.
+    /// `accent` is the footer's mark ink, which Cruise's `∞` wears; `selected` and `hover`
+    /// are the keyboard's and the pointer's chips in this session.
     ///
-    /// THE LIGHT, DEVIATION ONLY (owner, 2026-09-27: "I don't want to show
-    /// the state of parameters that I always expect to be on"). Its chip is
-    /// drawn only while it shows what the owner does not expect
-    /// (`lights::deviates`), while a toggle of it is in flight, while a
-    /// refusal or a just-switched notice for it is on show, while the pointer
-    /// or the keyboard selection is on it, and — the keyboard's way to a
-    /// light at rest — for every known light while a selection lasts
-    /// (`ctrl+shift+tab`, [`App::on_key_claude_lights`]): the reveal, which a
-    /// rule short of room gives up first ([`Keep`]).
+    /// The light is drawn only as a deviation, in flight, refused, just switched, in focus,
+    /// or as the reveal (every known light while a selection lasts,
+    /// [`App::on_key_claude_lights`]), which a rule short of room gives up first. The
+    /// harness's two are drawn wherever the session's footer read a harness host, until
+    /// `keep` gives them up ([`Keep::keeps`]). With no host and everything as expected the
+    /// block is empty.
     ///
     /// THE HARNESS'S MARK, ALWAYS (owner, 2026-10-15, for this mark alone:
     /// the module header): Autopilot, left of the light, wherever the
@@ -1675,7 +1784,7 @@ impl WindowLights {
         let at_rest = SessionLights::default();
         let s = self.sessions.get(&session).unwrap_or(&at_rest);
         // The keyboard selection outranks a resting pointer: Return acts on
-        // the SELECTED chip, so the row must mark that one.
+        // the selected chip, so the row must mark that one.
         let focus = selected.or(hover);
         let refused = s.refused.filter(|(_, _, until)| *until > now);
         let noticed = s
@@ -1866,9 +1975,8 @@ fn drawn_at(
     }
 }
 
-/// The cells `chips` take in the row at `keep`, one blank apart, each its
-/// face ([`face_of`]: the glyph, and a space and the word where it has one)
-/// — what [`WindowLights::block_into`] lays out, counted without laying it.
+/// The cells `chips` take in the row at `keep`, one blank apart, each its face
+/// ([`face_of`]): what [`WindowLights::block_into`] lays out, counted without laying it.
 fn chips_width_at(
     s: &SessionLights,
     chips: impl Iterator<Item = Chip>,
@@ -1884,10 +1992,10 @@ fn chips_width_at(
 }
 
 /// What `light`'s title says after its name: the refusal on show, the toggle
-/// in flight, else its state — and, under the pointer or the selection, what
-/// a click does. And whether it says WHY (the refusal — where a mode return
-/// stopped is one): a reason outranks the branch and the path in the rule,
-/// and the rest gives way before any fact (`footer::fit_rule`).
+/// in flight, else its state and, under the pointer or the selection, what a
+/// click does. And whether it says why (a refusal): a reason outranks the
+/// branch and the path in the rule, and the rest gives way before any fact
+/// (`footer::fit_rule`).
 fn what_of(
     s: &SessionLights,
     light: Light,
@@ -2152,7 +2260,7 @@ fn light_face(
 }
 
 // ---------------------------------------------------------------------------
-// THE FACE TABLE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §§9.2–9.5)
+// The face table (`docs/DESIGN-harness-autopilot-2026-10-15.md` §§9.2–9.5)
 // ---------------------------------------------------------------------------
 
 impl ChipFace {
@@ -2271,7 +2379,7 @@ impl ChipFace {
         }
     }
 
-    /// The MODE PHRASE: the title's head and the whole short title, written
+    /// The mode phrase: the title's head and the whole short title, written
     /// with neither of [`short_title`]'s cut marks (` — `, ` · `), so a
     /// narrow rule shows it whole. The timer's names its time, and its
     /// weekday where it lands on another local date; a landing names when
@@ -2332,8 +2440,9 @@ impl ChipFace {
     }
 
     /// What a click does (`click: …`): the next mode, `land now` from a
-    /// timed Cruise (which also drops the timer), and Settings ▸ Harness
-    /// where no harness runs.
+    /// timed Cruise (which also drops the timer), the harness on where a
+    /// switch of aterm.toml holds it off (`App::press_harness_switch`), and
+    /// Settings ▸ Harness where no host runs one.
     #[must_use]
     pub(crate) const fn click(self, _glass: &ChipGlass) -> &'static str {
         match self {
@@ -2341,25 +2450,17 @@ impl ChipFace {
             ChipFace::CruiseUntil => "land now",
             ChipFace::Land | ChipFace::Landed | ChipFace::Theirs => "off",
             ChipFace::Off => "cruise",
-            ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted => {
-                "open Settings \u{25b8} Harness"
-            }
+            ChipFace::MasterOff | ChipFace::AgentOff(_) => "turn the harness on",
+            ChipFace::Unhosted => "open Settings \u{25b8} Harness",
         }
     }
 
-    /// The chip's ACCESSIBILITY LABEL (§9.2.1): the mode and its state in
+    /// The chip's accessibility label (§9.2.1): the mode and its state in
     /// words, never a glyph — letters, digits, spaces and `.:,` alone, so a
     /// screen reader says nothing it cannot pronounce (`Autopilot: cruise.
     /// Lands at 18:00.`, `Autopilot: land. Landed at 17:42.`, from another
-    /// local day than `today` `Landed on Friday at 17:42.`).
-    #[cfg_attr(
-        not(any(test, a11y_tree)),
-        allow(
-            dead_code,
-            reason = "the chips' accessibility nodes speak it; the tree is built only under the \
-                      `a11y_tree` cfg (Linux)"
-        )
-    )]
+    /// local day than `today` `Landed on Friday at 17:42.`). `chrome` prints
+    /// it too, on every platform (`spoken=`, [`drawn`]).
     #[must_use]
     pub(crate) fn spoken(self, glass: &ChipGlass, today: Option<i64>) -> String {
         // An armed timer, said after the face (`Lands Saturday at 16:00.`).
@@ -2582,7 +2683,7 @@ pub(crate) const fn act_label(
     allow(
         dead_code,
         reason = "the chips' accessibility nodes describe it; the tree is built only under the \
-                  `a11y_tree` cfg (Linux)"
+                  `a11y_tree` cfg (Linux, macOS and Windows)"
     )
 )]
 #[must_use]
@@ -2668,10 +2769,16 @@ thread_local! {
     /// on this thread: a headless test's window has no OS window to ask.
     pub(crate) static TITLE_READERS_ASKED: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
+    /// The harness switches a refused write let go of `◐ turning on` on this
+    /// thread ([`WindowLights::let_switches_go`]): a headless test's config
+    /// lane refuses every write at once, so this is where a press that
+    /// armed `turning on` shows it did.
+    pub(crate) static SWITCHES_LET_GO: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Ask `ws`'s window, where it has one, for a frame.
-fn redraw(ws: &crate::WindowState) {
+pub(crate) fn redraw(ws: &crate::WindowState) {
     if let Some(w) = ws.os_window.as_ref() {
         w.request_redraw();
     }
@@ -2704,17 +2811,15 @@ pub(crate) struct Block {
     pub(crate) lean: [Vec<RenderCell>; LEAN_FORMS],
     /// `what` alone, for a pane with no room for the whole title.
     pub(crate) short_title: Vec<RenderCell>,
-    /// The title is a REASON ([`what_of`]), which outranks the branch and
+    /// The title is a reason ([`what_of`]), which outranks the branch and
     /// the path in the rule; any other title gives way before every fact.
     pub(crate) reason: bool,
     /// The chips, one blank apart (the rule's layout pads the block).
     pub(crate) lights: Vec<RenderCell>,
-    /// The cells the block holds in the rule (`footer::LightsWidth`'s
-    /// chips): its chips' — or, where a rule short of room gave up a drawn
-    /// chip ([`Keep`] past [`Keep::Drawn`]), all the room it was fitted to.
-    /// The facts give way before the chips (`footer::fit_rule`), so the
-    /// room a given-up chip leaves stays the rule's: no fact a wider rule
-    /// gave up comes back beside fewer chips.
+    /// The cells the block holds in the rule (`footer::LightsWidth`'s chips): its chips', or
+    /// all the room it was fitted to where a rule short of room gave up a drawn chip
+    /// ([`Keep`] past [`Keep::Drawn`]). The facts give way before the chips
+    /// (`footer::fit_rule`), so no fact a wider rule gave up comes back beside fewer chips.
     pub(crate) holds: usize,
     cols: Vec<(std::ops::Range<usize>, Chip)>,
     /// The fit that laid it ([`WindowLights::fitted`]), unique in its
@@ -2772,12 +2877,11 @@ impl Block {
 }
 
 impl App {
-    /// Fold one Claude Code pane's reading of its screen into its lights
-    /// (`read`: `lights::read_lights` behind its panic fence, taken with the
-    /// pane's rows and kept with them — `crate::claude_footer`'s readings):
-    /// remember what each shows, and wake the loop when a toggle in flight
-    /// was answered. Called for EVERY Claude Code pane each frame, painted
-    /// footer or not.
+    /// Fold one Claude Code pane's reading of its screen into its lights (`read`:
+    /// `lights::read_lights` behind its panic fence, kept with the pane's rows in
+    /// `crate::claude_footer`): remember what each shows, and wake the loop when a toggle in
+    /// flight was answered. Called for every Claude Code pane each frame, painted footer or
+    /// not.
     pub(crate) fn observe_claude_lights(
         &mut self,
         wid: WindowId,
@@ -3029,10 +3133,10 @@ impl App {
         }
     }
 
-    /// Record where `block`'s chips landed: frame row `frame_row` (window
-    /// grid row `term_row`), the CHIPS starting at frame column `col` — one
-    /// hit per cell, so the whole chip is the target — and the blank between
-    /// each two, theirs too: a target that does nothing.
+    /// Record where `block`'s chips landed: frame row `frame_row` (window grid row
+    /// `term_row`), the chips starting at frame column `col`, one hit per cell, so the
+    /// whole chip is the target; and the blank between each two, theirs too: a target that
+    /// does nothing.
     pub(crate) fn note_claude_light_hits(
         &mut self,
         wid: WindowId,
@@ -3065,10 +3169,9 @@ impl App {
         }
     }
 
-    /// What of the chips' glass is under window pixel `(x, y)`: a chip, or
-    /// `None` for the blank between two — never what a later band painted
-    /// over (the link caption yields to no chip: it claims the row in the
-    /// chrome register, and the chip under it is gone from the glass).
+    /// What of the chips' glass is under window pixel `(x, y)`: a chip, or `None` for the
+    /// blank between two. Never what a later band painted over: the link caption claims the
+    /// row in the chrome register, and the chip under it is gone from the glass.
     pub(crate) fn claude_chips_at(
         &self,
         wid: WindowId,
@@ -3091,7 +3194,8 @@ impl App {
     /// The pointer left the window: no chip is hovered any more.
     pub(crate) fn clear_claude_light_hover(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.claude_lights.hover.take().is_some()
+            && (ws.claude_lights.hover.take().is_some()
+                | ws.claude_lights.switch_hover.take().is_some())
         {
             redraw(ws);
         }
@@ -3126,17 +3230,118 @@ impl App {
     pub(crate) fn track_claude_light_hover(&mut self, wid: WindowId, x: f64, y: f64) -> OverChips {
         let at = self.claude_chips_at(wid, x, y);
         let over = at.and_then(|(session, chip)| Some((session, chip?)));
+        // The harness switch on a top rule is a chip of its own: the hand,
+        // and its face drawn hovered.
+        let switch = at
+            .is_none()
+            .then(|| self.harness_switch_at(wid, x, y))
+            .flatten()
+            .map(|b| b.session);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return OverChips::No;
         };
         if ws.selecting {
             return OverChips::No;
         }
-        if ws.claude_lights.hover != over {
+        if ws.claude_lights.hover != over || ws.claude_lights.switch_hover != switch {
             ws.claude_lights.hover = over;
+            ws.claude_lights.switch_hover = switch;
             redraw(ws);
         }
+        if switch.is_some() {
+            return OverChips::Chip;
+        }
         OverChips::of(at)
+    }
+
+    /// The harness switch under the pointer at `(x, y)` in window `wid`, as
+    /// the last paint drew it and no band covers it.
+    pub(crate) fn harness_switch_at(&self, wid: WindowId, x: f64, y: f64) -> Option<BorderSwitch> {
+        let ws = self.windows.get(&wid)?;
+        if ws.claude_lights.border_toggles.is_empty() {
+            return None;
+        }
+        let (row, col) = self.frame_cell_at(wid, x, y)?;
+        ws.claude_lights
+            .border_toggles
+            .iter()
+            .find(|b| {
+                b.frame_row == row
+                    && b.cols.contains(&col)
+                    && !self.chrome_owns_terminal_row(wid, b.term_row)
+            })
+            .cloned()
+    }
+
+    /// A press of session `session`'s harness switch in window `wid`, which
+    /// the paint drew as `shown`: what it offered, if it still holds —
+    /// a lit switch turns the session Off, an off one turns the harness on
+    /// from whichever switch holds it off ([`App::switch_harness_on`]); a
+    /// press on a switch turning on, or on one whose state moved since the
+    /// paint, does nothing. A press within a double click's interval of the
+    /// last press that flipped it (`SessionLights::switch_pressed`) is that
+    /// gesture's second click and does nothing either: a frame paints
+    /// between a double click's two clicks in a real window, so the second
+    /// would find the face the first lit and turn it back (review of
+    /// k2/harnesson, finding 1). A write of aterm.toml's shows `◐ turning
+    /// on` until the policy reads it back or
+    /// [`crate::autopilot::SWITCH_SETTLE`] passes. Nothing is sent to the
+    /// PTY, and nothing opens.
+    pub(crate) fn press_harness_switch(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        shown: crate::autopilot::HarnessSwitch,
+    ) {
+        use crate::autopilot::HarnessSwitch;
+        let now = Instant::now();
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.claude_lights.switch_just_pressed(session, now))
+        {
+            return;
+        }
+        let (word, view, _) = self.session_autopilot(session);
+        let flipped = match (shown, HarnessSwitch::of(view)) {
+            (HarnessSwitch::On, Some(HarnessSwitch::On)) => {
+                self.toggle_session_harness(session);
+                true
+            }
+            (HarnessSwitch::Off(_), Some(HarnessSwitch::Off(_))) => {
+                // The write's wait first: a lane that refuses it at once lets
+                // it go again.
+                let writes = !crate::autopilot::switch_on_plan(
+                    &self.harness_policy.get().policy,
+                    self.headless,
+                    self.session_agent(session),
+                    word,
+                )
+                .keys
+                .is_empty();
+                if writes && let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.claude_lights
+                        .sessions
+                        .entry(session)
+                        .or_default()
+                        .switch_turning = Some(now + crate::autopilot::SWITCH_SETTLE);
+                    wake_after(session, crate::autopilot::SWITCH_SETTLE);
+                }
+                self.switch_harness_on(session);
+                true
+            }
+            _ => false,
+        };
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            if flipped {
+                ws.claude_lights
+                    .sessions
+                    .entry(session)
+                    .or_default()
+                    .switch_pressed = Some(now);
+            }
+            redraw(ws);
+        }
     }
 
     /// A left press on a chip acts on it ([`Self::press_claude_chip`]), and
@@ -3153,39 +3358,15 @@ impl App {
             .get(&wid)
             .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
         let Some((session, chip)) = self.claude_chips_at(wid, x, y) else {
-            if let Some((row, col)) = self.frame_cell_at(wid, x, y)
-                && let Some(session) = self.windows.get(&wid).and_then(|ws| {
-                    ws.claude_lights
-                        .border_toggles
-                        .iter()
-                        .find(|(fr, tr, cols, _)| {
-                            *fr == row
-                                && cols.contains(&col)
-                                && !self.chrome_owns_terminal_row(wid, *tr)
-                        })
-                        .map(|(_, _, _, s)| *s)
-                })
-            {
+            // The harness switch on a top rule: what it offered
+            // ([`Self::press_harness_switch`]) — never Settings (owner,
+            // 2026-10-20: "remove the harness settings button in the UX").
+            if let Some(switch) = self.harness_switch_at(wid, x, y) {
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);
                 }
-                let (_, view, _) = self.session_autopilot(session);
-                if matches!(
-                    view,
-                    crate::autopilot::AutopilotView::MasterOff
-                        | crate::autopilot::AutopilotView::AgentOff(_)
-                ) {
-                    self.open_harness_settings(
-                        wid,
-                        crate::harness_screen::HarnessFocus::Supervision,
-                    );
-                    return true;
-                }
-                self.toggle_session_harness(session);
-                if let Some(ws) = self.windows.get(&wid) {
-                    redraw(ws);
-                }
+                self.press_harness_switch(wid, switch.session, switch.face);
                 return true;
             }
             return false;
@@ -3257,10 +3438,21 @@ impl App {
     /// shows `◐` until a frame reads it ([`WindowLights::note_autopilot`]),
     /// let go at its deadline (one like a mode press's, `lights::SETTLE_MS`)
     /// if none does; a click meanwhile does nothing. Where the harness runs
-    /// no mode — the master switch off — nothing is written and Settings ▸
-    /// Harness opens in `wid` instead.
+    /// no mode because a switch of aterm.toml holds it off — the master
+    /// switch, the agent's own — no word is stepped: the click turns that
+    /// switch on, as the top rule's `on` does ([`Self::press_harness_switch`]),
+    /// and opens nothing.
     fn press_autopilot_chip(&mut self, wid: WindowId, session: u64) {
         let now = Instant::now();
+        // Readback can turn the off chip into Cruise between two clicks of
+        // its enable gesture. Keep that second click out of the mode cycle.
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.claude_lights.switch_just_pressed(session, now))
+        {
+            return;
+        }
         let in_flight = self
             .windows
             .get(&wid)
@@ -3271,9 +3463,29 @@ impl App {
             return;
         }
         let (_, view, _) = self.session_autopilot(session);
-        // The switch that turned it off is SUPERVISION's (§10.3.3, item 8).
         let Some(want) = view.next() else {
-            self.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Supervision);
+            // `⊘ off`: the master switch or the agent's own holds the harness
+            // off, and the chip turns it on as the top rule's `on` does
+            // ([`Self::press_harness_switch`], its `◐ turning on` and its
+            // double click's guard with it) — never Settings (owner,
+            // 2026-10-20: "remove the harness settings button in the UX").
+            // With no host there is no chip, and no switch a click could
+            // turn: the page says why.
+            match crate::autopilot::HarnessSwitch::of(view) {
+                Some(face) => {
+                    let shown = self
+                        .windows
+                        .get(&wid)
+                        .map_or(face, |ws| ws.claude_lights.switch_shown(session, face).0);
+                    self.press_harness_switch(wid, session, shown);
+                }
+                None => {
+                    self.open_harness_settings(
+                        wid,
+                        crate::harness_screen::HarnessFocus::Supervision,
+                    );
+                }
+            }
             return;
         };
         let shown = self.cycle_session_autopilot(session);
@@ -3295,13 +3507,10 @@ impl App {
         wake_after(session, settle);
     }
 
-    /// Flip `light` of `session` with Claude's own input (see the module
-    /// header): refused, with the reason on the light, when its state is not
-    /// on screen or the input seam takes no press. A light already as
-    /// expected (the mode light in bypass or auto) does nothing at all.
-    /// Decided from the ENGINE's screen as it is now, not from the last
-    /// painted frame: a mode that changed since is the one the toggle starts
-    /// from.
+    /// Flip `light` of `session` with Claude's own input (see the module header): refused,
+    /// with the reason on the light, when its state is not on screen or the input seam
+    /// takes no press. A light already as expected (the mode light in bypass or auto) does
+    /// nothing. Decided from the engine's screen as it is now, not the last painted frame.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3312,9 +3521,9 @@ impl App {
     )]
     pub(crate) fn toggle_claude_light(&mut self, wid: WindowId, session: u64, light: Light) {
         let now = Instant::now();
-        // One toggle per SESSION, whichever window started it: the same
-        // session shown in two windows must not run two mode cycles at once,
-        // each pressing on the other's answers.
+        // One toggle per session, whichever window started it: the same session shown in
+        // two windows must not run two mode cycles at once, each pressing on the other's
+        // answers.
         if self.windows.values().any(|w| {
             w.claude_lights
                 .sessions
@@ -3337,9 +3546,8 @@ impl App {
             return;
         };
         let reading = lights::read(screen.as_ref());
-        // The mode light in a mode the owner expects: nothing to do — its one
-        // action is back to bypass or auto, and the session is there. Never a
-        // press away from it (owner, 2026-09-27).
+        // The mode light in a mode the owner expects: nothing to do. Its one action is
+        // back to bypass or auto, and the session is there; never a press away from it.
         if reading.state(light) == LightState::On {
             return;
         }
@@ -3393,14 +3601,12 @@ impl App {
         fenced_screen_now(session, &rows, || lights::read_screen(&rows))
     }
 
-    /// `session`'s screen and whether its composer is EMPTY, read straight
-    /// from its engine behind the reader's panic fence — by the rule the
-    /// upgrade's gate reads it with ([`upgrade::composer_is_empty`]: a dim
-    /// suggestion on the caret row is no draft). `None` without a composer
-    /// on screen or on a reader panic. The engine's lock is held only to copy
-    /// the rows, the cursor and each row's column-2 DIM flag out. Read by the
-    /// footer for a live upgrade's note (`crate::claude_footer`: which words,
-    /// and none while a turn runs), every frame while one stands.
+    /// `session`'s screen and whether its composer is empty, read straight from its engine
+    /// behind the reader's panic fence, by the rule the upgrade's gate uses
+    /// ([`upgrade::composer_is_empty`]: a dim suggestion on the caret row is no draft).
+    /// `None` without a composer on screen or on a reader panic. The engine's lock is held
+    /// only to copy the rows, the cursor and each row's column-2 dim flag out. The footer
+    /// reads it every frame while a live upgrade's note stands (`crate::claude_footer`).
     ///
     /// [`upgrade::composer_is_empty`]: aterm_agent::harness::upgrade::composer_is_empty
     pub(crate) fn claude_composer_now(&self, session: u64) -> Option<(Screen, bool)> {
@@ -3450,9 +3656,9 @@ impl App {
         )
     }
 
-    /// The footer wake's lights half: move every mode return along from the
-    /// ENGINE ([`Self::advance_claude_mode_returns`]), then give up on toggles
-    /// past their deadline (and time the end of the refusal that says so).
+    /// The footer wake's lights half: move every mode return along from the engine
+    /// ([`Self::advance_claude_mode_returns`]), then give up on toggles past their deadline
+    /// (and time the end of the refusal that says so).
     pub(crate) fn drain_claude_lights(&mut self) {
         let now = Instant::now();
         self.advance_claude_mode_returns(now);
@@ -3467,18 +3673,13 @@ impl App {
         }
     }
 
-    /// Every mode return in flight, one step from the ENGINE's screen as it
-    /// is now (`claude_screen_now`, not a painted frame — a pane in a
-    /// background tab or an occluded window has no frames, and its return
-    /// must still finish): the next shift+tab the moment Claude has answered
-    /// the last with a mode the owner does not expect either and is not
-    /// mid-turn ([`WindowLights::advance`]), sent at once against the reading
-    /// that decided it; done at bypass or auto; a lap refused, and a press
-    /// the input seam did not take stopped — each naming the mode. A press
-    /// still unanswered, or held for a turn to end, keeps ONE poll armed
-    /// until its deadline, which [`WindowLights::expire`] keeps. The next
-    /// presses are aterm's own, not the person's: `Source::Controller`
-    /// (module header).
+    /// Every mode return in flight, one step from the engine's screen as it is now
+    /// (`claude_screen_now`, not a painted frame: a pane in a background tab or an occluded
+    /// window has no frames, and its return must still finish), as
+    /// [`WindowLights::advance`] decides. A press goes at once, against the reading that
+    /// decided it, as `Source::Controller`; one the input seam did not take stops the
+    /// return, naming the mode. A press still unanswered, or held for a turn to end, keeps
+    /// one poll armed until its deadline ([`WindowLights::expire`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3579,10 +3780,10 @@ impl App {
         wake_after(session, REFUSAL_SHOWN);
     }
 
-    /// The keyboard half (see the module header): `ctrl+shift+tab` selects
-    /// the focused pane's next chip; with one selected, Return/Space act as
-    /// its click ([`Self::press_claude_chip`]) and Escape lets go. Any other
-    /// key lets go and is NOT consumed. Whether the key was the lights'.
+    /// The keyboard half (see the module header): `ctrl+shift+tab` selects the focused
+    /// pane's next chip; with one selected, Return/Space act as its click
+    /// ([`Self::press_claude_chip`]) and Escape lets go. Any other key lets go and is not
+    /// consumed. Returns whether the key was the lights'.
     pub(crate) fn on_key_claude_lights(
         &mut self,
         wid: WindowId,
@@ -3809,11 +4010,25 @@ impl App {
                     chip,
                     label: String::new(),
                     description: None,
+                    toggled: None,
                     row,
                     col: hit.col,
                     width: 1,
                 }),
             }
+        }
+        // The harness switch on each top rule the paint drew: a switch named
+        // by the words it paints and told its state, and an off switch's
+        // `on` button (`claude_footer::switch_words`, WCAG 2.5.3).
+        let mut switches = Vec::new();
+        for b in &ws.claude_lights.border_toggles {
+            let Some(row) = b.frame_row.checked_sub(strip) else {
+                continue;
+            };
+            if self.chrome_owns_terminal_row(wid, b.term_row) {
+                continue;
+            }
+            switches.extend(harness_switch_nodes(b, row));
         }
         for node in &mut chips {
             match node.chip {
@@ -3849,11 +4064,14 @@ impl App {
                         (node.label, node.description) = team_spoken(face);
                     }
                 }
+                // The switches are named where they are made, below.
+                HarnessChip::Switch | HarnessChip::SwitchOn => {}
             }
         }
         // A Team chip painted for a face the rule no longer holds names
         // nothing: no node.
         chips.retain(|node| !node.label.is_empty());
+        chips.extend(switches);
         chips
     }
 
@@ -3870,6 +4088,35 @@ impl App {
         let chip = match chip {
             crate::a11y_tree::HarnessChip::Autopilot => Chip::Autopilot,
             crate::a11y_tree::HarnessChip::Team => Chip::Team,
+            reader @ (crate::a11y_tree::HarnessChip::Switch
+            | crate::a11y_tree::HarnessChip::SwitchOn) => {
+                // The switch the glass shows for the session: what a press of
+                // its cells does. The `on` button stands only on an off
+                // switch, so a press of it is one only there: a stale or
+                // repeated request for `on` once the switch is lit never
+                // turns the harness off (review of k2/harnesson, finding 3).
+                let shown = self.windows.get(&wid).and_then(|ws| {
+                    ws.claude_lights
+                        .border_toggles
+                        .iter()
+                        .find(|b| {
+                            b.session == session && !self.chrome_owns_terminal_row(wid, b.term_row)
+                        })
+                        .map(|b| b.face)
+                        .filter(|face| {
+                            reader == crate::a11y_tree::HarnessChip::Switch
+                                || matches!(face, crate::autopilot::HarnessSwitch::Off(_))
+                        })
+                });
+                if let Some(face) = shown {
+                    if self.inline_rename_edit(wid).is_some() {
+                        self.clear_strip_press(wid);
+                        self.settle_rename_edit(wid);
+                    }
+                    self.press_harness_switch(wid, session, face);
+                }
+                return;
+            }
         };
         self.press_visible_claude_chip(wid, session, Some(chip));
     }
@@ -3899,6 +4146,58 @@ impl App {
         self.open_autopilot_menu(wid, session, anchor, true);
         true
     }
+}
+
+/// HARNESS SWITCH `b`'s accessibility nodes on grid row `row`
+/// (`a11y_tree::HarnessChip::Switch`, `SwitchOn`): the switch over its own
+/// cells — named by the words it paints (`claude harness off`), the program's
+/// product after them where the form left the harness's name out, toggled
+/// on, off or mixed while it turns on, what holds it off and what a click
+/// does its description — and an off switch's `on` button, named `on: turn
+/// the <product> harness on`. Each name holds the words its cells paint,
+/// whole and in order (WCAG 2.5.3, `native_ui::visible_label_in_name`).
+#[cfg(a11y_tree)]
+pub(crate) fn harness_switch_nodes(
+    b: &BorderSwitch,
+    row: usize,
+) -> Vec<crate::a11y_tree::GridChip> {
+    use crate::a11y_tree::{GridChip, HarnessChip};
+    let product = b.program.product();
+    let (switch_words, button_words) = crate::claude_footer::switch_words(b);
+    let mut nodes = Vec::with_capacity(2);
+    if !b.switch.is_empty() {
+        let label = if switch_words.contains("harness") {
+            switch_words
+        } else {
+            format!("{switch_words}: {product} harness")
+        };
+        nodes.push(GridChip {
+            session: b.session,
+            chip: HarnessChip::Switch,
+            label,
+            description: Some(b.face.described(product)),
+            toggled: Some(match b.face.toggled() {
+                Some(on) => on.into(),
+                None => aterm_a11y::model::Toggled::Mixed,
+            }),
+            row,
+            col: b.switch.start,
+            width: b.switch.len(),
+        });
+    }
+    if let (Some(cols), Some(words)) = (b.button.as_ref(), button_words) {
+        nodes.push(GridChip {
+            session: b.session,
+            chip: HarnessChip::SwitchOn,
+            label: format!("{words}: turn the {product} harness {words}"),
+            description: Some(b.face.described(product)),
+            toggled: None,
+            row,
+            col: cols.start,
+            width: cols.len(),
+        });
+    }
+    nodes
 }
 
 /// The Team chip as a screen reader names it: its face in words, never a
@@ -3988,12 +4287,9 @@ mod tests {
         w.observe_rows(7, rows, lights::read_lights)
     }
 
-    /// The lights read behind the reader's panic fence: a panicking reader
-    /// folds NOTHING in — the lights keep what they showed, a mode cycle in
-    /// flight takes no step (no shift+tab queued, its press count and mode
-    /// untouched) — and a toggle's own reading is refused (`None`: nothing is
-    /// pressed). Controls: the same screen through the real readers DOES step
-    /// the cycle, and a toggle's reading of it is a composer.
+    /// A panicking reader folds nothing in (the lights keep what they showed; a cycle in
+    /// flight takes no step) and a toggle's own reading is refused, so nothing is pressed.
+    /// Controls: the real readers step the cycle and read a composer on the same screen.
     #[test]
     fn a_reader_panic_folds_nothing_in_and_types_nothing() {
         let now = Instant::now();
@@ -4154,8 +4450,7 @@ mod tests {
                 AutopilotView::MasterOff,
                 "\u{2298} off",
                 dim,
-                "harness off in Settings \u{b7} click: open Settings \u{25b8} Harness \u{b7} \
-                 right-click: more",
+                "harness off in Settings \u{b7} click: turn the harness on \u{b7} right-click: more",
                 "harness off in Settings",
             ),
         ];
@@ -4187,7 +4482,7 @@ mod tests {
         );
 
         // A click in flight: `◐` alone, held until the word it wrote reads
-        // back — not by a frame that still reads the old one.
+        // back, not by a frame that still reads the old one.
         w.hover = None;
         w.note_autopilot(7, None, AutopilotView::Cruise, now);
         w.sessions.get_mut(&7).unwrap().autopilot_pending =
@@ -4492,15 +4787,11 @@ mod tests {
     }
 }
 
-/// THE LIGHTS' GESTURES, END TO END, IN PROCESS. The control socket cannot
-/// drive them: `pointer move` reaches `App::on_cursor_moved` only, and `key` /
-/// `mouse` enter the input seam BELOW `App::on_key` and `App::on_mouse_input`.
-/// So these drive the winit-level handlers of a headless App: a real engine
-/// drawing Claude Code's bottom block, one frame through the capture route's
-/// splices (the same `splice_claude_footer` the window runs, which observes
-/// the pane, paints the row and records where each light landed), the
-/// pointer moved to the pixel of the light the painter RECORDED, a real
-/// press — and the bytes the session's PTY sink received, read back off a
+/// The lights' gestures, end to end, in process. The control socket cannot drive them
+/// (`pointer move` reaches `App::on_cursor_moved` only; `key`/`mouse` enter below `App::on_key`
+/// and `App::on_mouse_input`), so these drive a headless App's winit-level handlers: a real
+/// engine drawing Claude Code's bottom block, one frame through the capture route's splices,
+/// the pointer at the painted chip's pixel, a real press, and the PTY bytes read back off a
 /// private socket.
 #[cfg(all(test, unix))]
 mod gesture_tests {
@@ -4554,22 +4845,13 @@ mod gesture_tests {
     const ACCEPT: &str = "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)";
     const MANUAL: &str = "  \u{23F8} manual mode on \u{00B7} ? for shortcuts";
     /// Claude Code's foreground process group, as the resolver names it.
-    const PGID: i32 = 4242;
+    pub(super) const PGID: i32 = 4242;
 
-    /// Close the private PTY observer FOR REAL, so the next write through the
-    /// session's sink genuinely fails. Dropping `reader` closes only this
-    /// process's descriptor: while another test is forking, the child holds a
-    /// copy until it execs — longer on a loaded machine — and meanwhile a
-    /// write to the socket still succeeds (on a loaded machine with sibling
-    /// tests running, `FollowRejected` read a failed-write fixture's Enter as
-    /// accepted). So wait for the sink's own end
-    /// to see the hang-up, which it reports only once every copy is gone
-    /// (`POLLHUP`; a `shutdown` does not help — a send to a shut-down Unix
-    /// socket peer still succeeds on macOS). Bounded, so a copy that never
-    /// closes fails here by name instead of as a model mismatch — by a hang
-    /// detector, not a timing claim: a sibling's child reaches its exec when
-    /// the machine schedules it, and at a landing run's load (100-240) that
-    /// is not within any few seconds.
+    /// Close the private PTY observer for real, so the next write through the session's sink
+    /// fails. Dropping `reader` is not enough: a child another test is forking holds a copy
+    /// until it execs, so wait for `POLLHUP` on the sink's end, reported once every copy is
+    /// gone (`shutdown` does not help: a send to a shut-down Unix peer succeeds on macOS).
+    /// The bound is a hang detector.
     fn hang_up(app: &App, session: u64, reader: UnixStream) {
         let sink = app.pool.get(session).expect("session").ctx.sink.clone();
         drop(reader);
@@ -4787,7 +5069,7 @@ mod gesture_tests {
     /// The window pixel at the centre of frame cell `(row, col)` — the
     /// inverse of `App::frame_cell_at`, which the hit test reads, and checked
     /// against it so a geometry slip fails here rather than as a missed click.
-    fn px_of(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
+    pub(super) fn px_of(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
         let (cw, ch) = app.win_cell_size(wid);
         let (ox, oy) = app.frame_origin(wid);
         let x = ox as f64 + (app.win_pad(wid) + col * cw + cw / 2) as f64;
@@ -4804,7 +5086,7 @@ mod gesture_tests {
     /// every byte already written past them. The app writes a press on the
     /// calling thread, so one that should NOT have come is in the socket by
     /// now: no linger waits for it.
-    fn pty(reader: &mut UnixStream, want: usize) -> Vec<u8> {
+    pub(super) fn pty(reader: &mut UnixStream, want: usize) -> Vec<u8> {
         let mut got = Vec::new();
         let mut buf = [0u8; 256];
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -4895,15 +5177,11 @@ mod gesture_tests {
         }
     }
 
-    /// A CLICK ON THE MODE LIGHT in manual mode: exactly one shift+tab
-    /// reaches the PTY; the light shows `◐` until Claude's screen answers; an
-    /// answer that is not yet an expected mode is pressed through from the
-    /// WAKE (never from the frame); and the bypass pill resolves it — and no
-    /// press ever goes on from there. Run with the mouse untracked and
-    /// tracked (SGR 1000/1006): a press the light takes is not a mouse
-    /// report, and neither is its release. Controls: the blank before the
-    /// light is not a light, and a second click while one toggle is in
-    /// flight types nothing.
+    /// A click on the mode light in manual mode sends exactly one shift+tab; the light shows
+    /// `◐` until Claude answers, each non-expected answer is pressed through from the wake
+    /// (never the frame), and bypass resolves it. With the mouse untracked and tracked (SGR
+    /// 1000/1006) the light's press and release are no mouse report. Controls: the blank
+    /// before the light is not a light; a second click mid-toggle types nothing.
     #[test]
     fn a_click_on_the_mode_light_presses_forward_to_bypass_and_reads_each_answer_back() {
         for tracking in [false, true] {
@@ -5024,11 +5302,9 @@ mod gesture_tests {
         }
     }
 
-    /// AUTO IS AS EXPECTED AS BYPASS (owner, 2026-09-27: "when I toggle
-    /// auto-approve, it turns off auto mode (what?!)"): in auto mode no mode
-    /// chip is drawn at all, and a toggle of the mode light (the keyboard's
-    /// Return on a revealed chip) presses NOTHING. Control: in plan mode the
-    /// chip is drawn and its click presses.
+    /// Auto is as expected as bypass: in auto mode no mode chip is drawn at all, and a
+    /// toggle of the mode light (the keyboard's Return on a revealed chip) presses nothing.
+    /// Control: in plan mode the chip is drawn and its click presses.
     #[test]
     fn auto_mode_draws_no_mode_chip_and_is_never_left() {
         let (mut app, wid, session, mut reader) = app();
@@ -5214,11 +5490,9 @@ mod gesture_tests {
         }
     }
 
-    /// THE KEYBOARD ROUTE (macOS: elsewhere `ctrl+shift+tab` is `prev_tab`):
-    /// the chord selects the focused pane's light and types nothing (again,
-    /// it stays on the one light); Return toggles it — one
-    /// shift+tab, and NOT the Return; the selection lets go. Control: with
-    /// nothing selected, Return is Claude's again.
+    /// The keyboard route (macOS): the chord selects the focused pane's light and types
+    /// nothing; Return toggles it with one shift+tab, not the Return, and lets go. Control:
+    /// with nothing selected, Return is Claude's.
     #[cfg(target_os = "macos")]
     #[test]
     fn ctrl_shift_tab_selects_a_light_and_return_toggles_it() {
@@ -5317,14 +5591,8 @@ mod gesture_tests {
         assert_eq!(pty(&mut reader, 1), b"\r");
     }
 
-    /// REGRESSION (review 2026-09-25): in the default 80-column pane a
-    /// PENDING mode toggle's title (`Permission mode: switching…  `) never
-    /// pushes the lights out of the rule — and never the facts either: the
-    /// transient title gives way FIRST (`footer::fit_rule`), so the facts
-    /// stay whole; set as a line of type (`footer::set_facts`) they leave
-    /// the whole title room beside them in 80 columns, and a pane too narrow
-    /// for it gets it short (`footer::fit_rule`'s own tests); the chip it
-    /// names does not move.
+    /// In the default 80-column pane a pending toggle's transient title gives way first
+    /// (`footer::fit_rule`), never pushing the lights or the facts out; its chip does not move.
     #[test]
     fn a_pending_mode_toggle_keeps_its_lights_in_an_80_column_pane() {
         let (mut app, wid, session, mut reader) = app();
@@ -5359,12 +5627,9 @@ mod gesture_tests {
         );
     }
 
-    /// A title too long for the pane comes as the reason alone, the chip
-    /// beside it: a return stopped in accept edits, in the default 80-column
-    /// pane, says where it stopped without its light's name. The REASON
-    /// outranks the branch and the path (`footer::fit_rule`): it takes their
-    /// room, never the model's or the effort's. In a 120-column pane it
-    /// comes whole, beside the whole facts. Control: the chip is there.
+    /// In the default 80-column pane a stop's title too long to show whole comes as the
+    /// reason alone beside the chip, taking the branch's and path's room, never the model's
+    /// or effort's (`footer::fit_rule`); at 120 columns it comes whole beside the facts.
     #[test]
     fn a_stop_too_long_to_title_in_full_says_the_reason_alone() {
         for cols in [80_u16, 120] {
@@ -5491,17 +5756,9 @@ mod gesture_tests {
             .deadline = Instant::now() - Duration::from_millis(1);
     }
 
-    /// Hold `session`'s mode-return press well BEFORE its deadline, however
-    /// slowly the test reaches the next drain — once the drive just done
-    /// (`since` taken before it) is seen to have given the press its own
-    /// full `SETTLE_MS`. The conformance tests fire the tiered checks between
-    /// a press and the drain of Claude's answer, and on a loaded machine (a
-    /// landing run at load 100-170, the checks' `ty` spawns among it) those
-    /// alone can spend the whole 2.5 s: the drain then read the press as
-    /// overdue and sent nothing, and the test failed on the empty PTY
-    /// (`left: []`, `right: [27, 91, 90]`) — the deadline's case, not the
-    /// answer's the test is about. The deadline's own cases stay with
-    /// [`past_deadline`] and the tests that time it.
+    /// Check the drive just done (`since` taken before it) gave the press its own full
+    /// `SETTLE_MS`, then push the deadline a minute out, so a slow machine tests the answer
+    /// and not the deadline ([`past_deadline`] covers that).
     fn press_not_due(app: &mut App, wid: WindowId, session: u64, since: Instant) {
         let p = app
             .windows
@@ -5519,15 +5776,10 @@ mod gesture_tests {
         p.deadline = Instant::now() + Duration::from_secs(60);
     }
 
-    /// THE RETURN RUNS WITHOUT FRAMES (the review of 2026-09-27): a pane that
-    /// leaves the screen — a background tab, an occluded window — gets no
-    /// frames, and a return decided from painted frames stranded there. Each
-    /// press here is decided from the ENGINE by the wake alone, no frame after
-    /// the click: manual → accept edits → plan → bypass, then nothing. And
-    /// only the click is the person's: the follow-up presses leave the person
-    /// clock as the click left it, so the supervisor's grace is the click's
-    /// alone. Controls: the click itself stamps it, and a wake before Claude
-    /// answers presses nothing.
+    /// The return runs without frames (a background tab, an occluded window): each press is
+    /// decided from the engine by the wake alone, manual → accept edits → plan → bypass, and
+    /// only the click stamps the person clock. Control: a wake before Claude answers presses
+    /// nothing.
     #[test]
     fn a_mode_return_finishes_from_the_engine_with_no_frames() {
         let (mut app, wid, session, mut reader) = app();
@@ -5574,12 +5826,11 @@ mod gesture_tests {
         }
     }
 
-    /// The mode return's model state, read off the genuine App: the pill,
-    /// the turn in flight and the covering box from the ENGINE; the phase,
-    /// the start, the press count, whether the last press is unanswered and
-    /// whether a stop is named from the session's lights. `auto`, `fresh`,
-    /// `ring`, `overshoot` and `boxed` are the driven action's facts — the
-    /// bytes each step sent are asserted against the PTY beside it.
+    /// The mode return's model state, read off the genuine App: the pill, the turn in
+    /// flight and the covering box from the engine; the phase, the start, the press count,
+    /// whether the last press is unanswered and whether a stop is named from the session's
+    /// lights. `auto`, `fresh`, `ring`, `overshoot` and `boxed` are the driven action's
+    /// facts; the bytes each step sent are asserted against the PTY beside it.
     pub(super) fn project_mode_return(
         app: &App,
         wid: WindowId,
@@ -5651,10 +5902,9 @@ mod gesture_tests {
         result
     }
 
-    /// Fire `action` on the model, then check the App's projected state is a
-    /// transition the model allows — and that `historical` (the retired
-    /// behaviour's post-state, where given) is one it does NOT: the negative
-    /// control, so a pass is never vacuous.
+    /// Fire `action` on the model, then check the App's projected state is a transition the
+    /// model allows, and that `historical` (a buggy post-state, where given) is one it does
+    /// not: the negative control, so a pass is never vacuous.
     fn check_mode_return_transition(
         app: &App,
         wid: WindowId,
@@ -5696,12 +5946,9 @@ mod gesture_tests {
         }
     }
 
-    /// TIER-1: the genuine click, drain and expiry against
-    /// `claude_mode_return_model`. From manual (and from don't ask): the
-    /// click's one press (never armed for later), each next press decided
-    /// from the engine, the arrival at bypass. Negative controls: a click
-    /// that arms instead of pressing, and the old toggle that pressed on
-    /// from an expected mode, are each rejected by the model.
+    /// Tier-1: the genuine click, drain and expiry against `claude_mode_return_model`, from
+    /// manual and from don't ask to bypass. Negative controls: a click that arms instead of
+    /// pressing, and a press on from an expected mode, are rejected by the model.
     #[test]
     fn the_mode_return_conforms_to_its_model() {
         const DONT_ASK: &str = "  \u{23F5}\u{23F5} don't ask on (shift+tab to cycle)";
@@ -5764,9 +6011,9 @@ mod gesture_tests {
         }
     }
 
-    /// TIER-1: Claude answered before a stalled loop next drained the
-    /// footer, but that press's deadline had elapsed. The engine reading
-    /// can name the mode it reached; it cannot authorize another key.
+    /// Tier-1: Claude answered before a stalled loop next drained the footer, but that
+    /// press's deadline had elapsed. The engine reading can name the mode it reached; it
+    /// cannot authorize another key.
     #[test]
     fn an_overdue_mode_answer_sends_no_late_follow_up_key() {
         let (mut app, wid, session, mut reader) = app();
@@ -5802,7 +6049,7 @@ mod gesture_tests {
             Some((Light::Mode, super::Refusal::StoppedIn(Mode::AcceptEdits)))
         );
 
-        // Historical behavior rearmed the deadline and sent a second key.
+        // Negative control: the buggy model rearms the deadline and sends a second key.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let mut late = buggy.init_state();
         for action in ["Click", "Timeout", "Answer", "Press"] {
@@ -5816,16 +6063,10 @@ mod gesture_tests {
     /// A turn in flight before Claude answered: accept edits, busy.
     const BUSY_ACCEPT_ROW: &str = "  \u{23F5}\u{23F5} accept edits on \u{00B7} esc to interrupt";
 
-    /// TIER-1, THE STOPS: every way a started return ends short of bypass or
-    /// auto, driven on the genuine App against `claude_mode_return_model` —
-    /// and each NAMES the mode it stopped in. (a) A turn in flight: Claude
-    /// answers mid-turn, aterm's own next press is HELD (nothing sent), a box
-    /// opens over the session and takes nothing, and the deadline stops the
-    /// return naming the mode. (b) A cycle without bypass or auto laps back
-    /// to its start. (c) The input seam takes no next press. Negative
-    /// controls: each stop with its name dropped (the retired "Claude did
-    /// not switch" and "input was not accepted"), and a press sent mid-turn,
-    /// are rejected by the model.
+    /// Tier-1, the stops: every way a started return ends short of bypass or auto names its
+    /// mode. (a) A turn in flight holds the next press, a box takes nothing, the deadline
+    /// stops it; (b) a cycle without bypass or auto laps; (c) the input seam takes no press.
+    /// Negative controls: each stop unnamed, and a press sent mid-turn, are rejected.
     #[test]
     fn the_mode_returns_stops_conform_to_its_model_and_are_named() {
         let model = aterm_models_gui::claude_mode_return_model();
@@ -5881,7 +6122,7 @@ mod gesture_tests {
                 refusal(&app, wid, session),
                 Some((Light::Mode, super::Refusal::StoppedMidTurn(Mode::Plan)))
             );
-            // Negative control: the retired press mid-turn is a boxed key.
+            // Negative control: a press sent mid-turn is a boxed key.
             let buggy = aterm_spec::interp::with_buggy(&model, 1);
             let mut raced = buggy.init_state();
             for action in ["TurnStarts", "Click", "Answer", "Press", "Cover"] {
@@ -6090,16 +6331,13 @@ mod gesture_tests {
         app.claude_footer_fp(wid, &plan)
     }
 
-    /// THE AUTOPILOT CHIP, CLICKED (design §2.3): cruise → land → off →
-    /// cruise, each click writing the session's own word in-process — the
-    /// word `meta set autopilot` writes — and the next frame's chip saying
-    /// it, read back (no `◐` left standing): `∞` in the footer's accent,
-    /// `⤓ land` amber, `○ off` dim — an Off session's chip drawn like any
-    /// other. A click sends NOTHING to the PTY — no key, and no mouse report
-    /// though the pane tracks the mouse — and is not a person's keystroke
-    /// (`status human_seq=` holds). The hover's title says what a click
-    /// does, and the footer's repaint key follows the word. CONTROL: the
-    /// light beside it, clicked, does press — the click was a click.
+    /// The Autopilot chip, clicked (design §2.3): cruise → land → off → cruise, each click
+    /// writing the session's own word in-process (the word `meta set autopilot` writes) and
+    /// the next frame's chip saying it, read back with no `◐` left: `∞` in the footer's
+    /// accent, `⤓ land` amber, `○ off` dim. A click sends nothing to the PTY (no key, and no
+    /// mouse report though the pane tracks the mouse) and is not a person's keystroke
+    /// (`status human_seq=` holds). The hover's title says what a click does, and the
+    /// footer's repaint key follows the word. Control: the light beside it, clicked, presses.
     #[test]
     fn a_click_on_autopilot_cycles_its_word_and_types_nothing() {
         let (mut app, wid, session, mut reader) = wider_app();
@@ -6175,11 +6413,10 @@ mod gesture_tests {
         assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "the light presses");
     }
 
-    /// QUICK CLICKS COUNT: the window's own write reads back at once, so a
-    /// second click before any frame has drawn the first steps again — a
-    /// person clicking Cruise → Land → Off gets Off. FAILS when a click's
-    /// read-back waits for a frame (the second click was dropped while `◐`
-    /// stood, seen on a real aterm, 2026-10-15).
+    /// Quick clicks count: the window's own write reads back at once, so a second click
+    /// before any frame has drawn the first steps again, and Cruise → Land → Off gets Off.
+    /// Fails if a click's read-back waits for a frame (the second click is dropped while
+    /// `◐` stands).
     #[test]
     fn two_quick_clicks_on_the_autopilot_chip_each_step() {
         let (mut app, wid, session, mut reader) = app();
@@ -6267,13 +6504,11 @@ mod gesture_tests {
         );
     }
 
-    /// THE HAND ONLY WHERE A PRESS ACTS (the review of 2026-10-15): over a
-    /// chip the pointer is a hand; over the blank between two — the chips'
-    /// own glass, where a press does nothing — the arrow, never the hand
-    /// that promised a click, nor the grid's I-beam; on the motion path and
-    /// on the re-resolve a modifier asks for (`App::update_hover_cursor`)
-    /// alike. CONTROL: the pane's own cell beside the chips is the grid's,
-    /// an I-beam.
+    /// The hand only where a press acts: over a chip the pointer is a hand; over the blank
+    /// between two (the chips' own glass, where a press does nothing) the arrow, never the
+    /// hand nor the grid's I-beam, on the motion path and on the re-resolve a modifier asks
+    /// for (`App::update_hover_cursor`) alike. Control: the pane's own cell beside the chips
+    /// is the grid's, an I-beam.
     #[test]
     fn the_pointer_is_a_hand_over_a_chip_and_the_arrow_between_two() {
         let (mut app, wid, session, mut reader) = app();
@@ -6308,13 +6543,12 @@ mod gesture_tests {
         assert!(pty(&mut reader, 0).is_empty(), "the motion types nothing");
     }
 
-    /// EVERY BUTTON ON THE CHIPS' GLASS IS THEIRS (the review of 2026-10-15):
-    /// a middle or a right press on a chip, or on the blank between two,
-    /// reaches no program — in a pane that tracks the mouse no press or
-    /// release report, and under `right_click = "copy_paste"` with nothing
-    /// tracking no paste — and acts on no chip: a left press is the chips'
-    /// click. CONTROL: the same presses on the pane's own cell beside the
-    /// chips are the program's — each reported, and the right one pasted.
+    /// Every button on the chips' glass is theirs: a middle or right press on a chip, or on
+    /// the blank between two, reaches no program (no press or release report in a pane that
+    /// tracks the mouse, no paste under `right_click = "copy_paste"` with nothing tracking)
+    /// and acts on no chip: a left press is the chips' click. Control: the same presses on
+    /// the pane's own cell beside the chips are the program's, each reported and the right
+    /// one pasted.
     #[test]
     fn a_middle_or_right_press_on_the_chips_reaches_no_program() {
         use crate::native_settings::SettingsRoute;
@@ -6382,11 +6616,11 @@ mod gesture_tests {
     /// A CLICK ON THE CHIPS IS A CLICK AWAY FROM AN OPEN RENAME (the review
     /// of 2026-10-15): with the in-grid strip's rename field open on
     /// Claude's tab and a name typed into it, a click on `⊘ off` (Autopilot
-    /// under the master switch off) commits the name — as View ▸ Coding
-    /// Agent Harness… and a click on the grid do — before Settings ▸ Harness
-    /// comes to the front, so the keys meant for the page never land in the
-    /// tab's name. So does a click on Autopilot with the switch on, which
-    /// still steps its word, and one on the blank between two chips.
+    /// under the master switch off, which turns the switch on and opens
+    /// nothing) commits the name — as View ▸ Coding Agent Harness… and a
+    /// click on the grid do — so no key meant for something else lands in
+    /// the tab's name. So does a click on Autopilot with the switch on,
+    /// which still steps its word, and one on the blank between two chips.
     /// NEGATIVE CONTROL: Settings ▸ Harness brought to the front by no click
     /// — a tab switch, which settles nothing by design — leaves the field
     /// open, taking keys.
@@ -6394,7 +6628,6 @@ mod gesture_tests {
     fn a_click_on_the_chips_commits_an_open_in_grid_rename() {
         use crate::app_rename::RenameSurface;
         use crate::app_search::SearchEdit;
-        use crate::native_settings::SettingsRoute;
         use crate::session_timeline::MetaField;
         let (mut app, wid, session, mut reader) = app();
         let _host = host(&mut app);
@@ -6434,7 +6667,8 @@ mod gesture_tests {
         assert_eq!(pinned(&app), None, "control: nothing committed");
         app.switch_tab_in(wid, 0);
         frame(&mut app, wid);
-        // `⊘ off`: the master switch off, a click opens Settings ▸ Harness.
+        // `⊘ off`: the master switch off, a click turns it on and opens
+        // nothing: Claude's tab stays in front.
         let policy = |text: &str| {
             crate::harness_policy_cell::HarnessPolicyCell::new(
                 crate::app_config::HarnessPolicy::read(text),
@@ -6446,15 +6680,17 @@ mod gesture_tests {
         click(&mut app, wid, Chip::Autopilot);
         assert!(app.inline_rename_edit(wid).is_none(), "`⊘ off`: closed");
         assert_eq!(pinned(&app).as_deref(), Some("off chip"), "and committed");
-        let (at, ..) = app
-            .native_settings_route_view_target(SettingsRoute::Harness)
-            .expect("Settings ▸ Harness is open");
-        assert_eq!(at, wid);
+        assert_eq!(
+            app.focused_session_id(wid),
+            Some(session),
+            "`⊘ off`: nothing came to the front"
+        );
         assert_eq!(autopilot(&app, session).0, None, "`⊘ off`: no word written");
         app.harness_policy = policy("[harness]\n");
         app.switch_tab_in(wid, 0);
         frame(&mut app, wid);
-        // Autopilot.
+        // Autopilot, a separate click after the enable gesture.
+        super::switch_tests::later(&mut app, wid, session);
         rename(&mut app, "autopilot");
         click(&mut app, wid, Chip::Autopilot);
         assert!(app.inline_rename_edit(wid).is_none(), "Autopilot: closed");
@@ -6613,14 +6849,32 @@ mod gesture_tests {
         );
     }
 
+    /// The record the harness switch's refused write posted for `key`
+    /// (`message_reporters::harness_switch_not_saved`): a headless test's
+    /// config lane refuses every write at once, so this is the write made.
+    fn switch_write_said(app: &App, key: &str) -> Option<String> {
+        let want = format!("harness.switch-save.{key}");
+        app.messages
+            .log()
+            .records()
+            .rfind(|r| r.key.as_deref() == Some(want.as_str()))
+            .map(|r| r.detail.join(" "))
+    }
+
     /// THE MASTER SWITCH OFF (`[harness] enabled = false`, design §2.1): the
     /// chip says `⊘ off`, dim, titled with where it is switched, and a click
-    /// opens Settings ▸ Harness instead of cycling — no word is written (a
-    /// session ON never lifts a global off), nothing reaches the PTY. No
-    /// gear stands beside it. NEGATIVE CONTROL: with the switch on again the
-    /// same click writes the word.
+    /// turns the master switch on instead of cycling, as the top rule's `on`
+    /// does (owner, 2026-10-20: "remove the harness settings button in the
+    /// UX"; review of k2/harnesson, finding 2): `harness.enabled = true` is
+    /// written on the config lane, the switch says `◐ turning on` until the
+    /// write lands or is refused (here, at once: it was armed and let go),
+    /// no word is written (a session ON never lifts a global off), nothing
+    /// reaches the PTY, and nothing opens. No gear stands beside it.
+    /// NEGATIVE CONTROL: with the switch on again the same click writes the
+    /// word. (On main the click opened Settings ▸ Harness and wrote
+    /// nothing.)
     #[test]
-    fn under_the_master_switch_off_the_autopilot_chip_opens_settings() {
+    fn under_the_master_switch_off_the_autopilot_chip_turns_it_on() {
         use crate::native_settings::SettingsRoute;
         let (mut app, wid, session, mut reader) = wider_app();
         let _host = host(&mut app);
@@ -6647,29 +6901,43 @@ mod gesture_tests {
             text.contains("\u{2298} off")
                 && !text.contains('\u{2699}')
                 && text.contains(
-                    "harness off in Settings \u{b7} click: open Settings \u{25b8} Harness \
-                     \u{b7} right-click: more"
+                    "harness off in Settings \u{b7} click: turn the harness on \u{b7} \
+                     right-click: more"
                 ),
             "{text:?}"
         );
+        assert_eq!(
+            switch_write_said(&app, "harness.enabled"),
+            None,
+            "control: no write yet"
+        );
+        let tabs = app.windows[&wid].tab_set.len();
+        super::SWITCHES_LET_GO.with(|n| n.set(0));
         click(&mut app, wid, Chip::Autopilot);
+        let said =
+            switch_write_said(&app, "harness.enabled").expect("the master switch's write was made");
+        assert!(said.contains("harness.enabled = true"), "{said:?}");
+        assert_eq!(
+            super::SWITCHES_LET_GO.with(std::cell::Cell::get),
+            1,
+            "`◐ turning on` was armed, and the refusal let it go"
+        );
         assert!(
             app.native_settings_route_view_target(SettingsRoute::Harness)
-                .is_some(),
-            "Settings ▸ Harness is open"
+                .is_none(),
+            "Settings ▸ Harness stays shut"
         );
+        assert_eq!(app.windows[&wid].tab_set.len(), tabs, "no tab opened");
         assert_eq!(
             autopilot(&app, session),
             (None, AutopilotView::MasterOff),
-            "nothing written"
+            "no word written"
         );
         assert!(pty(&mut reader, 0).is_empty());
-        // Negative control: the switch on, the same click — the press path,
-        // back on Claude's tab — cycles, and opens nothing.
+        // Negative control: the switch on, a separate click cycles.
         app.harness_policy = policy("[harness]\n");
-        app.switch_tab_in(wid, 0);
         frame(&mut app, wid);
-        let tabs = app.windows[&wid].tab_set.len();
+        super::switch_tests::later(&mut app, wid, session);
         click(&mut app, wid, Chip::Autopilot);
         assert_eq!(
             autopilot(&app, session),
@@ -6685,21 +6953,22 @@ mod gesture_tests {
         assert!(pty(&mut reader, 0).is_empty());
     }
 
-    /// THE OFF CHIP LANDS THE PAGE WHERE IT POINTS (§10.3.3 item 8; the
-    /// review of v3/stats-fold, finding 2): under the master switch off, a
-    /// click on `⊘ off` opens Settings ▸ Harness landed on SUPERVISION, whose
-    /// switch turned it off, no row drawn selected. (The Autopilot menu's
-    /// `Harness settings…` lands on the session's row:
-    /// `autopilot_menu_tests`.) NEGATIVE CONTROL: opened at its top (View ▸
-    /// Coding Agent Harness…'s door), the page is landed nowhere.
+    /// THE OFF CHIP TURNS THE AGENT'S SWITCH ON (§10.2.1; owner, 2026-10-20:
+    /// "remove the harness settings button in the UX"; review of
+    /// k2/harnesson, finding 2): under Claude Code's own switch off, a click
+    /// on `⊘ off` writes `harness.claude.enabled = true` — not the master's,
+    /// no word — and lands no page: with Settings ▸ Harness open in another
+    /// tab at its top, the page stays there and Claude's tab stays in front
+    /// (on main the click raised the page and landed it on SUPERVISION). The
+    /// second click of a double click, a frame painted between them, writes
+    /// nothing more. NEGATIVE CONTROL: the page's top door, opened by hand,
+    /// is landed at its top.
     #[test]
-    fn the_off_chip_lands_the_page_on_supervision() {
-        use crate::app_introspect::AuxTarget;
+    fn under_the_agents_switch_off_the_autopilot_chip_turns_it_on() {
         use crate::harness_screen::HarnessFocus;
         use crate::native_settings::SettingsRoute;
         let (mut app, wid, session, _reader) = wider_app();
         let _host = host(&mut app);
-        // The page lists the session as Claude Code's: its program read.
         publish_facts(&app, session);
         app.pool
             .get(session)
@@ -6713,29 +6982,57 @@ mod gesture_tests {
             app.native_settings_route_view_target(SettingsRoute::Harness)
                 .map(|(_, _, _, state)| state.harness_focus)
         };
-        let show = format!("ui key=\"harness/session/{session}/show\" ");
-        let drawn_selected = |app: &App| {
-            app.read_aux_controls(AuxTarget::Prefs)
-                .iter()
-                .any(|l| l.starts_with(&show) && l.contains("selected:true"))
-        };
         let front = |app: &mut App| {
             app.switch_tab_in(wid, 0);
             draw_claude(app, session, BYPASS);
             frame(app, wid);
         };
-        // CONTROL: the page's top door lands nowhere.
+        // CONTROL: the page's top door lands at its top.
         assert!(app.open_harness_settings(wid, HarnessFocus::Top));
         assert_eq!(landed(&app), Some(HarnessFocus::Top));
-        assert!(!drawn_selected(&app), "control: no row selected");
-        // The off chip, under the master switch off.
+        // The off chip, under Claude Code's own switch off.
         app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-            crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+            crate::app_config::HarnessPolicy::read("[harness.claude]\nenabled = false\n"),
         );
         front(&mut app);
+        assert_eq!(
+            autopilot(&app, session),
+            (None, AutopilotView::AgentOff(aterm_phase::Program::Claude))
+        );
+        super::SWITCHES_LET_GO.with(|n| n.set(0));
         click(&mut app, wid, Chip::Autopilot);
-        assert_eq!(landed(&app), Some(HarnessFocus::Supervision), "⊘ off");
-        assert!(!drawn_selected(&app), "⊘ off: SUPERVISION, no row");
+        assert!(
+            switch_write_said(&app, "harness.claude.enabled").is_some(),
+            "Claude Code's own switch was written"
+        );
+        assert_eq!(
+            switch_write_said(&app, "harness.enabled"),
+            None,
+            "not the master's"
+        );
+        assert_eq!(autopilot(&app, session).0, None, "no word written");
+        assert_eq!(landed(&app), None, "⊘ off: no page raised");
+        assert_eq!(
+            app.focused_session_id(wid),
+            Some(session),
+            "⊘ off: Claude's tab stays in front"
+        );
+        // The double click's second click, a frame between.
+        frame(&mut app, wid);
+        click(&mut app, wid, Chip::Autopilot);
+        assert_eq!(
+            super::SWITCHES_LET_GO.with(std::cell::Cell::get),
+            1,
+            "one write for a double click"
+        );
+        // The page, brought to the front by hand, is where its door left it.
+        let last = app.windows[&wid].tab_set.len() - 1;
+        app.switch_tab_in(wid, last);
+        assert_eq!(
+            landed(&app),
+            Some(HarnessFocus::Top),
+            "⊘ off: no page landed"
+        );
     }
 
     /// AN OFF SESSION STILL SAYS SO (design §2.3): Off is the harness's
@@ -7044,3 +7341,7 @@ fn mode_return_environment_waivers() {}
 #[cfg(all(test, unix))]
 #[path = "claude_lights_fit_tests.rs"]
 mod fit_tests;
+
+#[cfg(all(test, unix))]
+#[path = "claude_lights_switch_tests.rs"]
+mod switch_tests;

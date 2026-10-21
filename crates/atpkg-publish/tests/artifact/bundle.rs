@@ -214,22 +214,31 @@ fn a_trust_bundle_ships_its_frozen_closure_and_one_inode_per_alias() {
 fn relative_output_paths_keep_the_staged_toolchain_reachable_from_the_hello_crate() {
     crate::shared::need_compressor();
     let w = world("bundle-relative-out");
-    let local = aterm_tempfile::Builder::new()
+    // A path relative to this process's folder that reaches a private scratch
+    // folder (`..` up to the root, then the scratch's whole path): relative, as the
+    // packer must take it, and outside the checkout, which the Linux lane mounts
+    // read-only (a scratch made in "." was refused there).
+    let scratch = aterm_tempfile::Builder::new()
         .prefix(".atpkg-relative-out-")
-        .tempdir_in(".")
-        .expect("relative scratch");
-    assert!(local.path().is_relative());
-    let source = local.path().join("src");
+        .tempdir()
+        .expect("scratch");
+    let here = std::env::current_dir().expect("this process's folder");
+    let up: PathBuf = here.components().skip(1).map(|_| "..").collect();
+    let local = up.join(
+        scratch
+            .path()
+            .strip_prefix("/")
+            .expect("the scratch is absolute"),
+    );
+    assert!(local.is_relative());
+    let source = local.join("src");
     put(&source.join("README"), b"trust\n");
     git(&source, &["init", "-q", "."]);
     git(&source, &["add", "-A"]);
     git(&source, &["commit", "-q", "-m", "one"]);
 
     for extra in [
-        vec![
-            "--out".to_string(),
-            local.path().join("out").display().to_string(),
-        ],
+        vec!["--out".to_string(), local.join("out").display().to_string()],
         Vec::new(),
     ] {
         let mut args: Vec<String> = vec![

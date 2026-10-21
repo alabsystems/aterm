@@ -1,0 +1,50 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.108.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · a usage_limit_reached 429 that names no resets_at (a custom mode: limit_window_minutes 300, no resets_at, no headers), Muse Code's default retries · the lab's random project dir is spelled /private/tmp/at.lab0 here, the session id is spelled 00000000-0000-0000-0000-000000000000 here
+│  MODEL          lab-stub · high                                                     │
+│                 meta · native-basic                                                 │
+│                                                                                     │
+│  WORKSPACE      /private/tmp/at.lab0/proj                                           │
+│                 trusted · not found                                                 │
+│  ACCESS         Auto-review                                                         │
+│                 META_API_KEY environment                                            │
+│                                                                                     │
+│  USAGE          0 tokens · 0 turns · 0 subagents                                    │
+│  CONTEXT        91% left · 18.8K used / 200K · normal                               │
+│                 Usage: cumulative session tokens; context: current prompt estimate. │
+│                                                                                     │
+│  SESSION        00000000-0000-0000-0000-000000000000                                │
+│  ACTIVITY       no tasks                                                            │
+│                 0 terminals · inbox clear                                           │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  MUSE CODE 1.4.10 / radiant-carina                                        CANCELLED │
+│                                                                                     │
+│  MODEL          lab-stub · high                                                     │
+│                 meta · native-basic                                                 │
+│                                                                                     │
+│  WORKSPACE      /private/tmp/at.lab0/proj                                           │
+│                 trusted · not found                                                 │
+│  ACCESS         Auto-review                                                         │
+│                 META_API_KEY environment                                            │
+│                                                                                     │
+│  USAGE          0 tokens · 0 turns · 0 subagents                                    │
+│  CONTEXT        91% left · 18.8K used / 200K · normal                               │
+│                 Usage: cumulative session tokens; context: current prompt estimate. │
+│                                                                                     │
+│  SESSION        00000000-0000-0000-0000-000000000000                                │
+│  ACTIVITY       no tasks                                                            │
+│                 0 terminals · inbox clear                                           │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+❯ carry on with the task
+
+◆ Hi! I am the local lab stub, not a model. (reply 2)
+
+❯ carry on with the task
+
+◆ model failed: API error 429: The usage limit has been reached (usage_limit_reached) (after 10 provider attempts)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

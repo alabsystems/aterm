@@ -3,9 +3,8 @@
 
 //! Input-injection verbs + their parsers — the control protocol's "drive the
 //! shell" surface: key/ctrl/send/feed/signal/mouse/paste/focus/resize/scroll/tab.
-//! Moved verbatim from `control.rs` (behavior-preserving). The seam plumbing
-//! (`post_input_reply`) and the cross-session `apply_scroll_intent` cluster stay
-//! in `control.rs`; this module reaches them via `super::`.
+//! The seam plumbing (`post_input_reply`) and the cross-session `apply_scroll_intent`
+//! cluster live in `control.rs`; this module reaches them via `super::`.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +15,7 @@ use aterm_types::control_verbs::Input;
 use aterm_window::event_loop::EventLoopProxy;
 
 use super::post_input_reply;
-use crate::input::{Delivery, InputEvent, InputOutcome, ScrollIntent};
+use crate::input::{Delivery, InputEvent, InputOutcome, ScrollIntent, Source};
 use crate::{SessionCtx, TabAction, Wake, term_lock};
 
 /// `scroll <up|down|top|bottom|prev-prompt|next-prompt|N>` -> move the viewport and report
@@ -89,16 +88,9 @@ pub(crate) fn send_bytes(rest: &str) -> Vec<u8> {
 
 /// Parse the optional trailing `mods=<list>` token (e.g. `mods=ctrl+shift`),
 /// returning the modifier mask and the rest of the line with the token removed.
-/// Additive: a verb line WITHOUT `mods=` parses to `Modifiers::empty()` and the
-/// untouched line, so every existing caller stays byte-compatible.
-/// A NAME THIS TABLE DOES NOT KNOW IS A REFUSAL (`None`), never a silent drop —
-/// `hwkey::take_tokens`' own rule, "any unparsable token value is an error
-/// rather than a silent default". Dropping it made `key a mods=CTRL` answer
-/// `OK` and deliver a BARE `a`, while the inline spelling of the same intent
-/// (`key CTRL+a`) answered the usage line and the `type=` / `base=` tokens
-/// beside it refused their own bad values. The verb that carries the
-/// controller half of the modifier convergence cannot report success for a
-/// chord it did not send.
+/// Additive: a verb line without `mods=` parses to `Modifiers::empty()` and the
+/// untouched line. Unknown modifier names return `None` rather than silently
+/// dropping the modifier.
 pub(crate) fn take_mods(rest: &str) -> Option<(aterm_types::keyboard::Modifiers, String)> {
     use aterm_types::keyboard::Modifiers;
     let mut m = Modifiers::empty();
@@ -179,14 +171,12 @@ fn take_base_layout(rest: &str) -> Option<(Option<char>, String)> {
 
 /// Map a `key` verb wire token to a [`NamedKey`](aterm_types::keyboard::NamedKey),
 /// or `None` if it is not a named key (the caller then tries a single character).
-/// Covers the FULL `NamedKey` vocabulary the engine models — navigation, editing,
-/// locks/system, F1–F35, numpad, modifier-side keys, and media/audio — so every
-/// physical key a human can press is reachable by a controller. The original 25
-/// tokens keep their exact spelling for byte-compatibility.
+/// Covers the full `NamedKey` vocabulary the engine models — navigation, editing,
+/// locks/system, F1–F35, numpad, modifier-side keys, and media/audio.
 fn named_key_from_token(body: &str) -> Option<aterm_types::keyboard::NamedKey> {
     use aterm_types::keyboard::NamedKey as Nk;
     Some(match body {
-        // --- original 25 (byte-identical spellings) ---
+        // --- navigation / F1..F12 ---
         "enter" => Nk::Enter,
         "tab" => Nk::Tab,
         "esc" | "escape" => Nk::Escape,
@@ -396,28 +386,21 @@ pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
     }
 }
 
-/// THE CONTROL SOCKET'S LICENCE FENCE for one authorized attempt of a verb
-/// whose input class is `class`: `None` is no fence; `Some(keep_hand)` closes
-/// the move-licence cohort ahead of the verb, keeping the glow's hand on its row
-/// or taking it off.
+/// Licence fence for one authorized attempt of a verb whose input class is `class`:
+/// `None` is no fence; `Some(keep_hand)` closes the move-licence cohort ahead of
+/// the verb, keeping the glow's hand on its row or taking it off.
 ///
 /// Every attempt whose `class` has [`Input::FENCES`] is a newer input boundary —
 /// even a malformed one, which fences before its refusal so a swallowed key's
-/// licence cannot survive an ignored attempt, and takes the hand off its row (it
-/// delivers nothing a fence could keep the hand for). A body its verb's own
-/// parser reads ([`control_press`]) is fenced exactly as
-/// [`crate::app_input::press_fence`] fences that event at the seam's entry and
-/// ahead of a physical key: `ctrl w` and `key ctrl+w` are one Ctrl-W, a line
-/// edit that keeps the hand; a release and a bare modifier are not fenced at
-/// all, as a physical one never is; a plain
-/// typed glyph, plain Enter, a Tab and a bare ⌃V arm their own licence class
-/// at the seam, where pre-clearing them wiped the banked stamps of keys
-/// whose echoes were still in flight — every control-driven `key enter`
-/// manufactured a no-fresh-hint decline — so they pass unfenced; a paste
-/// keeps the hand. A FENCED write (`if=`, `if-gen=`, `if-fp=`, `if-human=`)
-/// is delivered on the control thread, past the seam that would arm its
-/// class (see [`input_if_fenced_observed`]), so it always fences, keeping the hand
-/// only for what keeps it.
+/// licence cannot survive an ignored attempt, and takes the hand off its row.
+/// A body its verb's own parser reads ([`control_press`]) is fenced via
+/// [`crate::app_input::press_fence`]: `ctrl w` and `key ctrl+w` keep the hand;
+/// a release and a bare modifier are not fenced; a plain typed glyph, plain
+/// Enter, Tab, and bare ⌃V arm their own licence class at the seam and pass
+/// unfenced; a paste keeps the hand. A fenced write (`if=`, `if-gen=`, `if-fp=`,
+/// `if-human=`) is delivered on the control thread past the seam
+/// ([`input_if_fenced_observed`]), so it always fences, keeping the hand only for
+/// events that keep it.
 pub(crate) fn control_fence(
     class: Input,
     verb: &str,
@@ -482,29 +465,55 @@ pub(crate) struct LeadingInputOptions {
     /// lands after a proven self-claim replaced it. Taken on the verbs whose
     /// input class has [`Input::SUPERVISED`] (`send`, `key`, `paste`, `turn`).
     pub if_supervisor: Option<String>,
-    /// `cause=@<off>|<seq>` (phase 3A, design §2.6): the mail or record this
-    /// input acted on, which the turn it opens names. Taken on the verbs whose
-    /// input class has [`Input::CAUSE`] (`send`, `turn`); checked against what the session holds before any
-    /// byte moves (`session_log::validate_cause`).
+    /// `cause=@<off>|<seq>`: the mail or record this input acted on, which the
+    /// turn it opens names. Taken on the verbs whose input class has
+    /// [`Input::CAUSE`] (`send`, `turn`); checked against what the session holds
+    /// before any byte moves (`session_log::validate_cause`).
     pub cause: Option<crate::session_log::CauseRef>,
-    /// `act=approve|deny|answer` (phase 5, ruling T1): what this input means
-    /// for the approval box or question it dismisses. Taken on the
-    /// [`Input::GUARDED`] verbs (`send`, `key`); the box's close reads it only from
-    /// a proven author ([`aterm_slog::Actor::is_proven`]).
+    /// `act=approve|deny|answer`: what this input means for the approval box or
+    /// question it dismisses. Taken on the [`Input::GUARDED`] verbs (`send`,
+    /// `key`); the box's close reads it only from a proven author
+    /// ([`aterm_slog::Actor::is_proven`]).
     pub act: Option<aterm_slog::ActWord>,
     /// A leading option that was recognized but malformed (a guard with no
     /// pattern, an option given twice). Carried rather than answered here so the
     /// dispatch answers it AFTER the halt gate: a halted session must say
     /// `ERR halted` whatever the rest of the line looks like.
     pub refusal: Option<String>,
+    /// `as=person` (a development seam, [`PERSON_SEAM`]): the write goes in as
+    /// a PERSON's gesture, [`Source::Human`] through the App input seam
+    /// ([`person_input`]), so it stamps `status human_ms=` as a window
+    /// keystroke does. A headless lab has no window to key, and the harness's
+    /// rule for a person's own exchange is read off that stamp. Taken on the
+    /// [`Input::GUARDED`] verbs (`send`, `key`), with no fence: a person's own
+    /// keys are held to none.
+    pub as_person: bool,
 }
 
-/// The App lane's `unread=ok` (round 18, day four, D9): `hwkey`, `pointer`
-/// and `invoke` (the `Input::APP_UNREAD` rows) take it as their FIRST token, lifting the unread-input gate
-/// for that one gesture — the way a person's own key reaches the window's
-/// paste queue, whose refusal row says what the gate would have. `ok` is the
-/// only value; any other token, or none, leaves the line as it was (the arm
-/// refuses what it cannot parse). Returns whether it was given and the rest.
+/// Whether this build takes `as=person` ([`LeadingInputOptions::as_person`]):
+/// a development build only. The release cutter never enables `dev-seams`,
+/// so a shipped aterm refuses it, and no control client can pose as a person.
+pub(crate) const PERSON_SEAM: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
+
+/// What a build without the seam answers `as=person` with: nothing is written.
+pub(crate) const PERSON_SEAM_REFUSED: &str = "ERR usage: as=person is a development seam (a debug \
+     or dev-seams build's); a shipped aterm writes every control verb as a controller\n";
+
+/// `as=person` read once on `opts` ([`LeadingInputOptions::as_person`]),
+/// refused where `seam` is off and when given twice.
+fn take_as_person(opts: &mut LeadingInputOptions, seam: bool) {
+    if !seam {
+        opts.refusal = Some(PERSON_SEAM_REFUSED.to_string());
+    } else if std::mem::replace(&mut opts.as_person, true) {
+        opts.refusal = Some("ERR usage: as=person given twice\n".to_string());
+    }
+}
+
+/// The App lane's `unread=ok`: `hwkey`, `pointer` and `invoke` (the
+/// `Input::APP_UNREAD` rows) take it as their first token, lifting the
+/// unread-input gate for that one gesture. `ok` is the only value; any other
+/// token, or none, leaves the line as it was (the arm refuses what it cannot
+/// parse). Returns whether it was given and the rest.
 pub(crate) fn take_app_unread_ok(class: Input, rest: &str) -> (bool, &str) {
     if !class.contains(Input::APP_UNREAD) {
         return (false, rest);
@@ -653,9 +662,8 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
             consumed = true;
             continue;
         }
-        // `unread=ok` (2026-09-24): queue behind input the program has not
-        // read. `ok` is the only value, so a typo is refused rather than typed
-        // into the program as text.
+        // `unread=ok`: queue behind input the program has not read. `ok` is the
+        // only value, so a typo is refused rather than typed into the program as text.
         if guarded && let Some(value) = head.strip_prefix("unread=") {
             if value != "ok" {
                 opts.refusal = Some("ERR usage: unread=ok is the only value\n".to_string());
@@ -690,8 +698,7 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
             consumed = true;
             continue;
         }
-        // `act=` (phase 5, ruling T1): a closed word, once, or the line is
-        // refused before a byte moves.
+        // `act=`: a closed word, once, or the line is refused before a byte moves.
         if guarded && let Some(value) = head.strip_prefix("act=") {
             match aterm_slog::ActWord::from_word(value) {
                 Some(act) if opts.act.replace(act).is_none() => {}
@@ -706,6 +713,13 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
                 Some(cause) if opts.cause.replace(cause).is_none() => {}
                 _ => opts.refusal = Some(crate::session_log::CAUSE_USAGE.to_string()),
             }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
+        // `as=person` only, spelled whole: any other `as=` word is the text's.
+        if guarded && head == "as=person" {
+            take_as_person(&mut opts, PERSON_SEAM);
             cur = tail;
             consumed = true;
             continue;
@@ -730,7 +744,59 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
         }
         break;
     }
+    if opts.as_person
+        && (opts.idem.is_some()
+            || opts.guard.is_some()
+            || opts.if_gen.is_some()
+            || opts.if_fp.is_some()
+            || opts.if_human.is_some()
+            || opts.if_supervisor.is_some()
+            || opts.act.is_some()
+            || opts.cause.is_some())
+    {
+        opts.refusal = Some(
+            "ERR usage: as=person takes no fence, id=, act= or cause=: a person's own keys \
+             are held to none\n"
+                .to_string(),
+        );
+    }
     (opts, if consumed { cur } else { rest })
+}
+
+/// `key|send as=person <body>` (the [`PERSON_SEAM`]): the verb's own event
+/// ([`parse_key`], [`send_bytes`]) posted as ONE [`Source::Human`] batch to
+/// `session` through the App input seam (`Wake::Input`), which routes it to
+/// the session's view, or its hidden path when it is not on screen, and
+/// stamps the person's clock as a window keystroke would. Every admission
+/// before it (halt, edit hold, turn arbitration, the unread gate) has run.
+/// Pinned to `session`, the write passes every card and overlay as any scoped
+/// control write does, so it reaches the session's program and never a
+/// palette's or a gateway card's rows (Take Over among them).
+pub(crate) fn person_input(
+    proxy: &EventLoopProxy<Wake>,
+    session: u64,
+    verb: &str,
+    rest: &str,
+) -> String {
+    let ev = if verb == "key" {
+        match parse_key(rest) {
+            Some(ev) => ev,
+            None => return KEY_USAGE.to_string(),
+        }
+    } else {
+        InputEvent::KeySequence(send_bytes(rest))
+    };
+    input_reply_to_str(
+        crate::control::control_media::call_main(proxy, |tx| Wake::Input {
+            batch: vec![ev],
+            mark: None,
+            src: Source::Human,
+            reply: Some(tx),
+            session: Some(session),
+            fence: None,
+        })
+        .map_err(|error| format!("ERR input dispatch failed: {error}\n")),
+    )
 }
 
 /// An `if-fp=` value: 1..=16 hex digits, the spelling `status hash=` prints
@@ -777,14 +843,13 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
 ///   `guard_at_cursor`, the row holding the cursor does (`turn …
 ///   submit=guarded:<re>`, where the row that matters is the one a submit
 ///   lands in).
-/// * `human` (`if-human=<n>`): no PERSON has given the session input since
+/// * `human` (`if-human=<n>`): no person has given the session input since
 ///   the read that returned `n` ([`crate::human_input::HumanInputStamp::seq`])
 ///   — the one thing the screen fences cannot see: a person's key already
 ///   written to the PTY and not yet read by the program moves no screen.
-///   Refused `OK skipped reason=person` (2026-09-27, R3b of the question
-///   answer's critique). Not atomic with the person's own write, which takes
-///   no terminal lock: a gesture counted after this check and written before
-///   this write, inside the one lock hold, still lands first (the module
+///   Refused `OK skipped reason=person`. Not atomic with the person's own write,
+///   which takes no terminal lock: a gesture counted after this check and written
+///   before this write, inside the one lock hold, still lands first (the module
 ///   header of [`crate::human_input`] says why). A controller's own write —
 ///   this one included — never counts.
 ///
@@ -890,47 +955,37 @@ pub(crate) enum GuardedInput {
     Pressed(Delivery),
 }
 
-/// THE ATOMIC CHECK-AND-PRESS. Decide `fence` ([`InputFence`]: the screen
+/// Atomic check-and-press: decide `fence` ([`InputFence`]: the screen
 /// generation, the screen hash, the row guard) and, if every armed condition
-/// holds, deliver `ev` — both under the SAME hold of the terminal lock.
+/// holds, deliver `ev` — both under the same hold of the terminal lock.
 ///
-/// WHY THE SAME LOCK. Measured: a supervisor answering a Claude Code permission
-/// prompt read the screen, saw the box, and sent `key 1`; an auto-mode rule
-/// resolved the prompt between the read and the press, and the digit landed in
-/// the composer as text. A read-then-press is two requests with a window between
-/// them, and no shorter window on the client's side closes it. The PTY reader
-/// applies output to the engine under `term` for the whole of `process(&buf)`,
-/// so a check made under `term` and a write made before it is released cannot
-/// have an output batch land between them: what the guard saw is the screen the
-/// keystroke answers.
+/// The PTY reader applies output to the engine under `term` for the whole of
+/// `process(&buf)`, so a check made under `term` and a write made before it is
+/// released cannot have an output batch land between them: what the guard saw is
+/// the screen the keystroke answers.
 ///
-/// WHY THE GUARDED WRITE. The bytes go through the sink's bounded, non-parking
-/// guarded write (`try_write_frame_whole_with_receipt`), not the spilling
-/// non-parking egress the App seam uses: a frame the kernel cannot BEGIN taking
-/// now would otherwise be queued behind the spill and delivered later, to
-/// whatever screen is up by then — the exact race the guard exists to close. So
-/// a busy sink (a spill ahead of it, another writer on the fd, a full tty
+/// The bytes go through the sink's bounded, non-parking guarded write
+/// (`try_write_frame_whole_with_receipt`), not the spilling non-parking egress
+/// the App seam uses: a frame the kernel cannot begin taking now would otherwise
+/// be queued behind the spill and delivered later, to whatever screen is up by
+/// then. A busy sink (a spill ahead of it, another writer on the fd, a full tty
 /// buffer, or a master the spawn could not make non-blocking) answers zero
 /// bytes, which the caller reports as a transient `ERR busy`, and the driver
 /// retries against the live screen. A frame the kernel began taking is
-/// delivered WHOLE: a pty's input queue holds about 1 KB (1022 bytes on
+/// delivered whole: a pty's input queue holds about 1 KB (1022 bytes on
 /// Darwin), so a longer text comes back short, and its rest is queued in order
-/// right behind the prefix (the sink's spill, ahead of every later write) — the
-/// guard decided the whole frame, and the program reads it as one. Until
-/// 2026-10-16 that rest was dropped and the write answered `ERR write failed
-/// partial accepted=1022`, in doubt and never retried, so the harness's 1.1 KB
-/// instruction to save the work never reached Codex whole. The reply is in
-/// doubt now only where bytes are lost: a rest no drainer can be arranged for.
-/// The lock hold is bounded by the same non-parking property: nothing here
-/// waits, and the drainer's spawn is deferred to the session's reply writer.
+/// right behind the prefix (the sink's spill, ahead of every later write). The
+/// reply is in doubt only where bytes are lost (a rest no drainer can be
+/// arranged for). The lock hold is bounded by the same non-parking property:
+/// nothing here waits, and the drainer's spawn is deferred to the session's
+/// reply writer.
 ///
-/// WHAT IT BYPASSES, said out loud. This runs on the CONTROL thread against the
-/// resolved target's `(term, sink)`, like every cross-session input verb, so for
-/// the tab on screen it skips the App input seam's side effects (blink reset,
-/// viewport snap, the typing-momentum hints, the `video … keys` ledger — counted
-/// as unseamed, never silently zero) and does not arm a cursor licence of its
-/// own; the dispatch keeps the licence fence for it. A press that must ride the
-/// seam is a plain `key`.
+/// Runs on the control thread against the resolved target's `(term, sink)`, like
+/// every cross-session input verb, so for the tab on screen it skips the App
+/// input seam's side effects (blink reset, viewport snap, typing-momentum hints,
+/// the `video … keys` ledger — counted as unseamed, never silently zero) and
+/// does not arm a cursor licence of its own; the dispatch keeps the licence
+/// fence for it. A press that must ride the seam is a plain `key`.
 pub(crate) fn input_if_fenced_observed(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -1248,22 +1303,17 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
 /// Claude Code this way; an older server answers the `pid=` form with
 /// `ERR unknown signal`, having sent nothing).
 ///
-/// `quiet=<s>` makes the signal wait for the tab to be LEFT ALONE, in the
+/// `quiet=<s>` makes the signal wait for the tab to be left alone, in the
 /// same decision: it is refused `ERR busy person human_ms=<ms>` when a person
 /// gave the session input within `s` seconds (`human_ms`, the stamp `status`
 /// reads), and `ERR busy input-unread bytes=<n>` while input someone wrote is
 /// queued unread — a first prompt on its way, which a `term` would drop and the
-/// shell after it run — and nothing is sent or discarded. The live upgrade's
-/// restart signals so (`quiet=` its `human_grace_s`): its last look and the
-/// signal were two requests, and a keystroke between them was ended with the
-/// agent (ND1 of the live re-test of 2026-09-26, the review of its fix). An
-/// older server answers `ERR bad signal argument: quiet=…`, having sent
-/// nothing.
+/// shell after it run — and nothing is sent or discarded.
 ///
-/// `term`, `kill`, `hup` and `quit`, in either form, first DISCARD the input
+/// `term`, `kill`, `hup` and `quit`, in either form, first discard the input
 /// a raw-mode (or stopped) program left unread and say so (`discarded=<n>`):
 /// the shell that takes the tty back would otherwise run it
-/// ([`crate::input_stall::discard_before_signal`], 2026-09-25). A `pid=` the
+/// ([`crate::input_stall::discard_before_signal`]). A `pid=` the
 /// verb refuses discards nothing. The reply does not wait to see the program
 /// end: a published stall whose program lives through the signal stays
 /// published, and names `signal kill` once it has for five seconds
@@ -1304,9 +1354,9 @@ pub(crate) fn cmd_signal(
             return format!("ERR busy input-unread bytes={unread}\n");
         }
     }
-    // A signal that ENDS the program first drops the input it left unread,
+    // A signal that ends the program first drops the input it left unread,
     // so the shell that inherits the tty never runs it
-    // (`input_stall::discard_before_signal`, 2026-09-25).
+    // (`input_stall::discard_before_signal`).
     let discarded = crate::input_stall::discard_before_signal(master, sink, sig);
     let tail = discarded.map_or_else(String::new, |n| format!(" discarded={n}"));
     // A signal is just a signal: the harness reads the exit it causes as the
@@ -1326,16 +1376,15 @@ pub(crate) fn cmd_signal(
         (None, 0) => format!("OK signalled pgrp {pgrp}{tail}\n"),
         (None, _) => format!("ERR killpg failed{tail}\n"),
     };
-    // A program that lives through it keeps its stall (2026-09-25, third
-    // round): the watch looks now (`input_stall::after_signal`).
+    // A program that lives through it keeps its stall: the watch looks now
+    // (`input_stall::after_signal`).
     crate::input_stall::after_signal(sink, sig);
     reply
 }
 
-/// THE `signal` VERB AS THE CONTROL DISPATCH RUNS IT
+/// The `signal` verb as the control dispatch runs it
 /// ([`super::serve_session_verb`]'s arm): [`cmd_signal`] on the session's own person stamp (`human_ms`, read
-/// now). One function for the dispatch and for the tests that drive the real
-/// verb.
+/// now).
 pub(crate) fn signal_verb(master: i32, rest: &str, ctx: &SessionCtx) -> String {
     cmd_signal(
         master,
@@ -1345,10 +1394,9 @@ pub(crate) fn signal_verb(master: i32, rest: &str, ctx: &SessionCtx) -> String {
     )
 }
 
-/// THE `restart` VERB AS THE CONTROL DISPATCH RUNS IT
-/// ([`super::serve_session_verb`]'s arm): the explicit restart of the tab's agent in place
-/// ([`crate::restart_act`]). One wiring function, as [`signal_verb`] is, so
-/// the act the dispatch makes is the one its tests drive.
+/// The `restart` verb as the control dispatch runs it
+/// ([`super::serve_session_verb`]'s arm): explicit restart of the tab's agent in place
+/// ([`crate::restart_act`]).
 pub(crate) fn restart_verb(master: i32, rest: &str, ctx: &std::sync::Arc<SessionCtx>) -> String {
     crate::restart_act::restart(master, rest, ctx)
 }
@@ -1417,44 +1465,29 @@ pub(crate) const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheel
 /// bounded by `lines` alone), and the two ceilings must not drift apart.
 const MAX_WHEEL_LINES: i32 = crate::input::MAX_WHEEL_BURST;
 
-/// PURE parser for the `mouse` verb -> an engine-neutral mouse [`InputEvent`], the
-/// event the verb delivers by its route, so the additive
-/// `mods=`/`count=`/`side=`/`block=` grammar is unit-testable without an
-/// `EventLoopProxy`. Returns `Err(usage/err string)` for a malformed line,
-/// `Ok(event)` otherwise.
+/// Pure parser for the `mouse` verb -> an engine-neutral mouse [`InputEvent`].
+/// Returns `Err(usage/err string)` for a malformed line, `Ok(event)` otherwise.
 ///
-/// Phase 0.5 CONTRACT CHANGE (divergences a/b/d/i): the old `OK (mouse off)`
-/// short-circuit is GONE — a tracking-OFF press/release now runs the SAME
-/// selection machinery as the human (not a no-op), and `mods`/`count`/`side`/
-/// `block` are carried as data instead of hard-coded. The verb is reply-bearing:
-/// `OK` once the seam has APPLIED the batch on the main thread, `ERR input
-/// dispatch failed: …` when there is no frontmost window (never a false OK).
+/// A tracking-OFF press/release runs the same selection machinery as a human
+/// gesture, and `mods`/`count`/`side`/`block` are carried as data. The verb is
+/// reply-bearing: `OK` once the seam has applied the batch on the main thread,
+/// `ERR input dispatch failed: …` when there is no frontmost window.
 ///
-/// DRAG CONVERGENCE (divergence c) — SCOPE: one `mouse move` verb line posts ONE
-/// `MouseMove`, so a controller that wants intermediate motion reports under a
-/// tracking app issues a `press` then N `move`s then a `release` as separate verb
-/// lines (the seam reports each, identical to the human's per-pixel `MouseMove`s).
-/// A single-line `press→N×move→release` BATCH grammar is deliberately deferred —
-/// the seam already supports a batched `Wake::Input` (A.2.3), so it is additive.
+/// One `mouse move` verb line posts one `MouseMove`, so a controller that wants
+/// intermediate motion reports under a tracking app issues a `press` then N
+/// `move`s then a `release` as separate verb lines.
 ///
 /// Grammar: `mouse <action> <button> <row> <col> [mods=..] [count=N]
 /// [side=left|right] [block=0|1] [lines=N]`. `action` is `press|release|move|
 /// wheelup|wheeldown|wheelleft|wheelright`; `button` is
 /// `left|middle|right|back|forward` (ignored for the wheel actions); `row`/`col`
-/// are 0-based. The horizontal wheel pair and the thumb buttons (audits I7/I8)
-/// exist here for the same reason the rest do: a controller must be able to
-/// drive every gesture a hand can, or the seam's source-blindness is only a
-/// claim.
+/// are 0-based.
 ///
-/// The additive tokens carry the data that closes the human/controller
-/// divergences: `mods=` the real modifier mask (kills a), `count=` the click
-/// depth 1..=3 (kills b), `side=` the cell-half (kills i), `block=1` the
-/// rectangular-selection intent for a single-click press (the same intent a human
-/// encodes from a held Alt, carried as DATA so the seam never reads ambient
-/// modifier state), `lines=N` the wheel-notch count for the wheel actions
-/// (default 1, clamped to `1..=MAX_WHEEL_LINES`) so one verb line scrolls N lines
-/// the way a human's single trackpad flick banks N — instead of one socket round
-/// trip per notch. `lines=` is ignored by the non-wheel actions.
+/// The additive tokens carry `mods=` (modifier mask), `count=` (click depth
+/// 1..=3), `side=` (cell-half), `block=1` (rectangular-selection intent for a
+/// single-click press, carried as data so the seam never reads ambient modifier
+/// state), and `lines=N` (wheel-notch count for wheel actions, default 1,
+/// clamped to `1..=MAX_WHEEL_LINES`, ignored by non-wheel actions).
 pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
     use aterm_core::selection::SelectionSide;
     use aterm_types::mouse::{ALT_MASK, CTRL_MASK, MouseButton, SHIFT_MASK, WheelDir};
@@ -1464,22 +1497,16 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
     let mut side = SelectionSide::Left;
     let mut block = false;
     let mut wheel_lines: i32 = 1;
-    // POSITIONAL tokens (in order), interpreted per-action below: this keeps
-    // press/release/wheel as `<button> <row> <col>` (byte-compatible with the
-    // pre-Phase-0.5 grammar) AND lets `move` be EITHER `<row> <col>` (no-button
-    // hover, code 3) OR `<button> <row> <col>` (held-button drag).
+    // Positional tokens (in order), interpreted per-action below: press/release/wheel
+    // take `<button> <row> <col>`, and `move` takes either `<row> <col>` (no-button
+    // hover, code 3) or `<button> <row> <col>` (held-button drag).
     let mut positional: Vec<&str> = Vec::new();
     for tok in rest.split_whitespace() {
         if let Some(list) = tok.strip_prefix("mods=") {
             for name in list.split(['+', ',']) {
-                // A NAME THIS TABLE DOES NOT KNOW IS A REFUSAL, never a
-                // silent drop — the same rule as `take_mods` above. The
-                // legacy/SGR mouse report has bits for SHIFT/META/CTRL and
-                // for nothing else, so `super` / `cmd` / `hyper` — spellings
-                // `key`'s `take_mods` DOES accept — cannot be encoded here.
-                // Say so, instead of reporting a press the program will read
-                // as unmodified: one advertised `mods=` grammar must not be
-                // honoured two ways across two input verbs.
+                // Unknown modifiers are refused (`take_mods` rule). Legacy/SGR
+                // mouse reports only have bits for SHIFT/META/CTRL, so `super`,
+                // `cmd`, and `hyper` are rejected here rather than silently dropped.
                 mods |= match name {
                     "shift" => SHIFT_MASK,
                     "alt" | "option" | "meta" => ALT_MASK,
@@ -1767,16 +1794,11 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
 }
 
 /// The refusal `tab <N>` / `tab close <N>` / `tab move <from> <to>` answer for
-/// an index no tab holds. PURE (the main-thread arm `App::apply_tab_cmd_in`
-/// formats through it), so the wording is pinned without an event loop.
+/// an index no tab holds. Pure (`App::apply_tab_cmd_in` formats through it).
 ///
-/// It names the BASE. The wire's `<N>` is 0-based (the documented contract, and
-/// what `inspect app/v1 tabs` prints as `index=`), while the strip paints
-/// 1-based ordinals — so `no tab at index 3: this window has 3` read as a
-/// contradiction to anyone who had just counted three chips (measured, audit
-/// 2026-09-22). The reply now says which numbers WOULD have been accepted
-/// (`indexes 0..2`), the one sentence that resolves it for a reader who does
-/// not already know the base.
+/// The wire's `<N>` is 0-based (matching `inspect app/v1 tabs`'s `index=`),
+/// while the strip paints 1-based ordinals, so the reply states the valid
+/// 0-based index range (`indexes 0..2`).
 #[must_use]
 pub(crate) fn no_such_tab(index: usize, count: usize) -> String {
     match count {
@@ -2273,21 +2295,18 @@ pub(crate) fn parse_resize(rest: &str) -> Result<(u16, u16), String> {
     Ok((r, c))
 }
 
-/// `resize <r> <c>` -> resize the engine grid, the PTY, AND the GUI (RES-1).
+/// `resize <r> <c>` -> resize the engine grid, the PTY, and the GUI (RES-1).
 ///
-/// The main thread is the SOLE geometry owner (`App.rows/cols`, the framebuffer,
-/// the window). Resizing the term + PTY here directly — as the verb used to —
-/// left `App` stale and sent no repaint, so a follow-up `image`/`dims` (which
-/// read `App`/the framebuffer) disagreed with the engine. So the verb now ONLY
-/// validates and forwards an `InputEvent::Resize` (in a `Wake::Input`) to the main
-/// thread, which applies the term + PTY + window resize and requests a redraw in
-/// one owner. A dropped proxy (event loop gone) means the GUI is shutting down:
-/// report it.
+/// The main thread is the sole geometry owner (`App.rows/cols`, the framebuffer,
+/// the window). The verb validates and forwards an `InputEvent::Resize` (in a
+/// `Wake::Input`) to the main thread, which applies the term + PTY + window
+/// resize and requests a redraw in one owner. A dropped proxy (event loop gone)
+/// means the GUI is shutting down: report it.
 ///
-/// RES-1: the verb sets `echo_to_window: true` so the seam ALSO asks the window to
+/// RES-1: the verb sets `echo_to_window: true` so the seam also asks the window to
 /// match the new grid pixel size (the verb has no window event of its own). The
 /// interactive winit `Resized` path uses `echo_to_window: false` (the window is
-/// already that size). `echo_to_window` is a transport flag, NOT a `Source` branch.
+/// already that size). `echo_to_window` is a transport flag, not a `Source` branch.
 pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     // `resize px <w> <h>` — resize the WINDOW, in physical pixels, and let the grid
     // follow from the platform's `Resized` exactly as an edge drag does.
@@ -2352,20 +2371,11 @@ pub(crate) fn parse_resize_px(rest: &str) -> Option<Result<InputEvent, String>> 
     Some(Ok(InputEvent::ResizeWindowPx { width, height }))
 }
 
-/// The one refusal the px form has that the cell form does not: it names a
-/// WINDOW, and the only window a driven px resize reaches is the front one
-/// ([`crate::App`]'s `input_resize_window_px` follows `frontmost_window`, the
-/// same rule as `apply_grid_resize`). A session that is not the focused pane
-/// of the front window's active tab therefore has no honest px target: a
-/// sibling pane shares the window (resizing it would be the same request,
-/// aimed by the wrong name), a background tab or another window is not the
-/// window that would move, and the cell form is the one that reaches a
-/// background session's engine + PTY. Measured 2026-09-22: `@<sid> resize px
-/// 1400 900` on any such target answered `ERR bad args` — the CELL parser's
-/// verdict on the word `px` — with nothing in `help resize` saying why. The
-/// refusal names the FRONT window too: the focused pane of another window's
-/// active tab is refused by the same rule, and "the active tab" alone reads as
-/// a contradiction to the agent driving that window.
+/// The refusal when the px form targets a session that is not the focused pane
+/// of the front window's active tab: `resize px` resizes the front window
+/// (`App::input_resize_window_px`), whereas a sibling pane, background tab, or
+/// another window has no independent px target (use the cell form to resize a
+/// background session's engine + PTY).
 pub(crate) const RESIZE_PX_FRONT_ONLY: &str =
     "ERR resize px: only the focused pane of the front window's active tab\n";
 
@@ -2426,10 +2436,7 @@ mod tests {
     }
 
     /// The px form on a target that is not the focused pane of the active tab
-    /// is refused BY NAME, and the cell form is untouched. Before 2026-09-22
-    /// the background arm handed `px …` to the cell parser, whose `ERR bad
-    /// args` said nothing about the target — and `help resize` said nothing
-    /// about the restriction at all.
+    /// is refused by name, and the cell form is untouched.
     #[test]
     fn a_cross_session_px_resize_is_refused_by_name_and_the_cell_form_is_not() {
         for px in [
@@ -2458,24 +2465,14 @@ mod tests {
         }
     }
 
-    /// GATE (the control fence, 2026-09-29): a verb body is fenced exactly as
-    /// the event its own parser reads is fenced at the seam and ahead of a
-    /// physical key (`app_input::press_fence`). No fence for a body that arms
-    /// its own licence class at the seam — plain glyphs, plain Enter, any Tab
-    /// (lane-license, deliverable 2: pre-clearing a `key enter` wiped the
-    /// bank and declined its response), a bare ⌃V — nor for a release or a
-    /// bare modifier, as a physical one gets none; a fence keeping the
-    /// glow's hand on its row for a line edit — Backspace, the arrows,
-    /// Home/End, Delete, the emacs motions, the kills — and a paste; a fence
-    /// taking it off for everything else, a malformed body included. `ctrl
-    /// <c>` is `key ctrl+<c>`. A fenced write always fences, keeping the hand
-    /// only for what keeps it; a read verb never does.
-    ///
-    /// RED-PROOF (the fence as it was — `key` alone parsed, every other verb
-    /// fenced taking the hand off): `ctrl w` fenced `Some(false)` against
-    /// `key ctrl+w`'s `Some(true)`, `ctrl v` fenced against `key ctrl+v`'s
-    /// none, `key shiftleft` and `key left type=release` fenced `Some(false)`,
-    /// and `paste hello` fenced `Some(false)`.
+    /// A verb body is fenced via `app_input::press_fence`: no fence for a body
+    /// that arms its own licence class at the seam (plain glyphs, plain Enter,
+    /// Tab, bare ⌃V) or for a release or bare modifier; a fence keeping the
+    /// glow's hand on its row for a line edit (Backspace, arrows, Home/End,
+    /// Delete, emacs motions/kills) and a paste; a fence taking it off for
+    /// everything else, malformed bodies included. `ctrl <c>` matches `key
+    /// ctrl+<c>`. A fenced write always fences, keeping the hand only for line
+    /// edits; a read verb never does.
     #[test]
     fn the_control_fence_is_the_seam_s_fence_of_the_parsed_body() {
         let key = |body: &str| control_fence(input_of("key"), "key", body, false);
@@ -2597,13 +2594,10 @@ mod tests {
         }
     }
 
-    /// OPTIONS LEAD, and the two leading options compose in either order. The
-    /// `id=` cases are the A6 contract verbatim (they used to be pinned beside
-    /// `pty_idem::take_key`, which this parser replaced): a body `id=` is body,
-    /// `--` ends options, an unkeyed verb is never scanned. The `if=` cases are
-    /// this rung's: recognized on `send`/`key` only, in either order beside
-    /// `id=`, and a guard with no pattern or given twice is carried as a refusal
-    /// rather than answered here, so the halt gate still speaks first.
+    /// Options lead, and `id=` and `if=` compose in either order: a body `id=`
+    /// is body, `--` ends options, an unkeyed verb is never scanned, `if=` is
+    /// recognized on `send`/`key` only, and a guard with no pattern or given
+    /// twice is carried as a refusal so the halt gate still speaks first.
     #[test]
     fn leading_options_compose_in_either_order_and_a_body_option_is_body() {
         let opts = |idem: Option<&str>, guard: Option<&str>| LeadingInputOptions {
@@ -2683,9 +2677,9 @@ mod tests {
         assert_eq!(o.refusal.as_deref(), Some("ERR usage: id= given twice\n"));
     }
 
-    /// `signal cont` (2026-09-24) is a known signal — the remedy the
-    /// unread-input gate names for a stopped job — so it reaches the
-    /// process-group lookup rather than `ERR unknown signal`.
+    /// `signal cont` is a known signal — the remedy the unread-input gate names
+    /// for a stopped job — so it reaches the process-group lookup rather than
+    /// `ERR unknown signal`.
     #[test]
     #[cfg(unix)]
     fn signal_cont_is_a_known_signal() {
@@ -2702,16 +2696,12 @@ mod tests {
         );
     }
 
-    /// THE RESTART TYPEAHEAD HAZARD, end to end (whole-branch review,
-    /// 2026-09-25). A real interactive shell (`zsh -f -i`, its own session,
-    /// the pty its controlling tty) runs a job that puts the tty in raw mode
-    /// and never reads it — the frozen program. A line is typed into it and
-    /// sits unread. The published remedy, `signal term`, ends the job, and the
-    /// shell takes the terminal back: the line must NOT run. The negative
-    /// control sends the bare `killpg` today's remedy was, and the line runs
-    /// — the typed command prints `TYPE''AHEAD` as it was typed and
-    /// `TYPEAHEAD` only when the shell executes it. A marker typed after the
-    /// signal runs in both, so a pass is never a dead shell.
+    /// Restart typeahead hazard, end to end: an interactive shell (`zsh -f -i`,
+    /// its own session, the pty its controlling tty) runs a job that puts the
+    /// tty in raw mode and never reads it. A line is typed into it and sits
+    /// unread. `signal term` ends the job and drops the unread input before the
+    /// shell takes the terminal back, whereas a bare `killpg` negative control
+    /// lets the shell execute the line.
     #[test]
     #[cfg(target_os = "macos")]
     fn signal_term_drops_a_frozen_programs_keys_before_the_shell_can_run_them() {
@@ -2728,9 +2718,7 @@ mod tests {
             reply.starts_with("OK signalled pgrp ") && reply.ends_with(" discarded=17\n"),
             "{reply}"
         );
-        // The exact-pid form (origin/main's `signal term pid=<n>`, the
-        // harness's live upgrade ending a Claude Code) ends the program just
-        // the same, so it drops the same keys (merged 2026-09-25).
+        // The exact-pid form (`signal term pid=<n>`) drops the same keys.
         let (ran, reply) = typeahead_after_restart(Remedy::VerbPid, Typed::Direct);
         assert!(!ran, "signal term pid= dropped the line too");
         let reply = reply.expect("the verb's reply");
@@ -2740,21 +2728,12 @@ mod tests {
         );
     }
 
-    /// THE SPILL BEHIND A FULL QUEUE, through the same remedy (whole-branch
-    /// review, second round, 2026-09-25). A paste into a frozen raw program
-    /// fills its input queue (1022 bytes on Darwin) and the sink SPILLS the
-    /// rest; the spill's drainer parks in `poll(POLLOUT)` holding the fd lock.
-    /// The first cut of the remedy flushed the kernel queue and left the
-    /// spill: a flush does not wake a parked `poll` on Darwin, the emptied
-    /// queue gives the shell nothing to read, so the drainer slept for good
-    /// and every later key — the resume command included — queued behind it.
-    /// The session was deaf, and `signal term` had made it so. Measured on
-    /// that cut: `discarded=1022 left=96`, then the marker below never
-    /// reached the shell (this test timed out waiting for it). Now the
-    /// remedy drops the spill with the queue — the reply counts both, 1118 —
-    /// the line inside the spill never runs, and the marker, written through
-    /// the SAME sink, does. The bare-killpg control shows the spilled line is
-    /// a live command once the shell has the tty.
+    /// Spill behind a full queue: a paste into a frozen raw program fills its
+    /// input queue (1022 bytes on Darwin) and the sink spills the rest; the
+    /// spill's drainer parks in `poll(POLLOUT)` holding the fd lock. `signal
+    /// term` drops the spill along with the kernel queue (counting both, 1118)
+    /// so the spilled line never runs and the drainer releases the sink for
+    /// subsequent input.
     #[test]
     #[cfg(target_os = "macos")]
     fn signal_term_drops_a_spill_behind_a_full_queue_and_the_session_still_hears() {
@@ -3005,9 +2984,9 @@ mod tests {
         (ran, reply)
     }
 
-    /// The App lane's `unread=ok` (round 18, D9): a LEADING token on `hwkey`,
-    /// `pointer` and `invoke` only, `ok` its only value; anything else leaves
-    /// the line untouched for the arm to parse.
+    /// The App lane's `unread=ok`: a leading token on `hwkey`, `pointer` and
+    /// `invoke` only, `ok` its only value; anything else leaves the line
+    /// untouched for the arm to parse.
     #[test]
     fn the_app_lane_takes_a_leading_unread_ok_on_its_gesture_verbs() {
         use super::take_app_unread_ok;
@@ -3038,10 +3017,10 @@ mod tests {
         );
     }
 
-    /// `unread=ok` (2026-09-24) is the one override of the unread-input gate:
-    /// taken off `send`/`key` only, in any order beside the other options; `ok`
-    /// is its only value; a bad value or a second one is a CARRIED refusal (the
-    /// halt gate still speaks first); and `send -- unread=ok` types the text.
+    /// `unread=ok` is the one override of the unread-input gate: taken off
+    /// `send`/`key` only, in any order beside the other options; `ok` is its
+    /// only value; a bad value or a second one is a carried refusal (the halt
+    /// gate still speaks first); and `send -- unread=ok` types the text.
     #[test]
     fn take_leading_options_takes_unread_ok_on_send_and_key_only() {
         let (o, tail) = take_leading_options(input_of("key"), "unread=ok down");
@@ -3147,6 +3126,70 @@ mod tests {
         );
     }
 
+    /// `as=person` (the development seam) is read on `key` and `send` only,
+    /// spelled whole; it takes no fence, `id=`, `act=` or `cause=`; given twice
+    /// it is refused; and a build without the seam refuses it outright, so a
+    /// shipped aterm never takes a controller's write for a person's.
+    #[test]
+    fn as_person_is_the_seam_on_key_and_send_and_takes_no_fence() {
+        for verb in ["key", "send"] {
+            let (o, tail) = take_leading_options(input_of(verb), "as=person enter");
+            assert!(o.as_person, "{verb}");
+            assert_eq!(o.refusal, None, "{verb}");
+            assert_eq!(tail, "enter", "{verb}");
+        }
+        let (o, _) = take_leading_options(input_of("key"), "as=person as=person 1");
+        assert_eq!(
+            o.refusal.as_deref(),
+            Some("ERR usage: as=person given twice\n")
+        );
+        for fenced in [
+            "as=person if=x 1",
+            "if-gen=3.15 as=person 1",
+            "as=person if-fp=ab 1",
+            "as=person if-human=2 1",
+            "id=a:b:c as=person 1",
+            "as=person act=answer 1",
+            "as=person if-supervisor=h 1",
+        ] {
+            let (o, tail) = take_leading_options(input_of("key"), fenced);
+            assert!(
+                o.refusal
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("ERR usage: as=person takes no fence")),
+                "{fenced:?} must be refused: {:?}",
+                o.refusal
+            );
+            assert_eq!(tail, "1", "{fenced:?}");
+        }
+        let (o, _) = take_leading_options(input_of("send"), "as=person cause=@1 hi");
+        assert!(o.refusal.is_some(), "a person's write names no cause");
+        // A build without the seam refuses it, and says why.
+        let mut off = LeadingInputOptions::default();
+        take_as_person(&mut off, false);
+        assert!(!off.as_person);
+        assert_eq!(off.refusal.as_deref(), Some(PERSON_SEAM_REFUSED));
+        // NEGATIVE CONTROL: any other `as=` word is the text's, an unguarded verb
+        // keeps it as body, and a body token spelled like it is still body.
+        let (o, tail) = take_leading_options(input_of("send"), "as=persona hi");
+        assert!(!o.as_person);
+        assert_eq!(o.refusal, None);
+        assert_eq!(tail, "as=persona hi");
+        assert_eq!(
+            take_leading_options(input_of("paste"), "as=person x").1,
+            "as=person x"
+        );
+        assert_eq!(
+            take_leading_options(input_of("send"), "hello as=person").1,
+            "hello as=person"
+        );
+        assert!(
+            !take_leading_options(input_of("send"), "hello as=person")
+                .0
+                .as_person
+        );
+    }
+
     /// `if-human=<n>` parses to the person count `status human_seq=` prints,
     /// composes with the other fences on `key` and `send`, and refuses any
     /// other shape — never typed into the program as text.
@@ -3249,11 +3292,8 @@ mod tests {
         assert_eq!(compile_guard(Some("(")).unwrap_err(), "ERR badregex\n");
     }
 
-    /// The whole point of the reply's `-`: with no current match there is no row,
-    /// column or length, and the formatter has no way to print one — the fields come
-    /// from `Option`s. A previous drivable-surface attempt answered a live-looking
-    /// `row=5 col=3` for a position that did not exist, which is the failure this
-    /// pins shut.
+    /// With no current match there is no row, column or length, and the
+    /// formatter prints `-` (the fields come from `Option`s).
     #[test]
     fn a_find_reply_names_no_match_position_when_there_is_no_match() {
         let status = crate::app_search::FindStatus {
@@ -3444,8 +3484,8 @@ mod tests {
             matches!(link, Ok(PointerAction::Mods(m)) if crate::app_mouse::link_modifier_held(m)),
             "{link:?}"
         );
-        // DAY NINE, D5: a negative row names a chrome row above the grid (the
-        // message band), and `click` presses where the pointer is.
+        // A negative row names a chrome row above the grid (the message band),
+        // and `click` presses where the pointer is.
         assert_eq!(
             parse_pointer("move -1 5"),
             Ok(PointerAction::MoveChrome { up: 1, col: 5 })
@@ -3561,8 +3601,7 @@ mod tests {
     }
 
     /// The four wheel actions each parse to their own [`WheelDir`], and the thumb
-    /// buttons name themselves (audits I7/I8). Without the horizontal pair a
-    /// controller could not drive — or regression-test — buttons 66/67 at all.
+    /// buttons name themselves.
     #[test]
     fn parse_mouse_covers_every_wheel_direction_and_button() {
         use aterm_types::mouse::{MouseButton, WheelDir};
@@ -3593,28 +3632,17 @@ mod tests {
 
 #[cfg(test)]
 mod video_keys_ledger_tests {
-    //! The documented key→photon recipe, pinned at the VERB boundary: what the
-    //! active-tab `send`/`feed`/`key` verbs build must reach the opt-in
+    //! What the active-tab `send`/`feed`/`key` verbs build must reach the opt-in
     //! `video … keys` ledger, and the one path that structurally cannot be
-    //! logged must be COUNTED instead of silently dropped.
-    //!
-    //! These live beside the verb parsers (rather than beside the recording) so
-    //! the assertions are driven by the REAL `send_bytes`/`feed_bytes`/`parse_key`
-    //! a socket request goes through — the only untested link left between a
-    //! verb and the ledger is the single `control.rs` dispatch arm, which the
-    //! on-glass recording in this change's report exercises end to end.
+    //! logged must be counted instead of silently dropped.
 
     use super::{feed_bytes, parse_key, send_bytes};
     use crate::input::InputEvent;
     use crate::{VideoInputSample, record_controller_video_attempts, video_sample_for_key};
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
-    /// `video … keys` claims to log "socket input driven through the ACTIVE-TAB
-    /// verbs", and flagless `send`/`feed` ARE active-tab verbs: `control.rs`
-    /// delivers both through the App seam as an `InputEvent::KeySequence`.
-    /// The ledger's classifier had no `KeySequence` arm, so every take driven
-    /// the documented way produced an EMPTY `inputs[]` — a measuring instrument
-    /// reporting zero indistinguishably from one that measured zero.
+    /// Flagless `send` and `feed` are active-tab verbs delivered through the App
+    /// seam as `InputEvent::KeySequence`, so `video … keys` logs them.
     #[test]
     fn video_keys_ledger_logs_the_send_and_feed_verbs() {
         // `send 'ls\n'` — the submit form the recipe documents. The trailing
@@ -3687,12 +3715,9 @@ mod video_keys_ledger_tests {
         assert_eq!(dropped, 5, "and counts the five attempts it could not take");
     }
 
-    /// A terminal take is driven with `esc`, the arrows and the F-keys, and the
-    /// old `char`-only ledger dropped every one of them: `video 3 keys` +
-    /// `ctl key up` five times produced `inputs: []`. Named keys are now
-    /// SAMPLES, and the three named keys with an unambiguous character keep
-    /// their character representation. Bare modifiers stay out (they express no
-    /// intent and would only add noise to the correlation).
+    /// Named keys (`esc`, arrows, F-keys) are recorded as samples, the three
+    /// named keys with an unambiguous character keep their character
+    /// representation, and bare modifiers are excluded.
     #[test]
     fn video_keys_ledger_names_keys_that_have_no_character() {
         for (verb, expect) in [

@@ -1,29 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 //
-// Web CPU↔GPU parity: the two web renderers must agree on pixels.
+// Web CPU/GPU parity: aterm-wasm (`aterm_render::Renderer`) and aterm-gpu-web
+// (`aterm_gpu::GpuRenderer`) render one grid to RGBA8 that agrees within
+// antialiasing rounding.
 //
-// `aterm-wasm` rasterizes the grid on the CPU (`aterm_render::Renderer`) and
-// `aterm-gpu-web` rasterizes it on the GPU (`aterm_gpu::GpuRenderer`, WebGL2 in
-// the browser). Both feed the SAME engine grid and BOTH hand JS an RGBA8 buffer
-// for `putImageData` — so a divergence between them is a visible rendering bug in
-// one of the two web paths.
-//
-// The browser GPU path needs a real `<canvas>`/WebGL surface (wasm-only), so it
-// can't run here. Instead this test reproduces aterm-gpu-web's EXACT native
-// construction — `GpuContext::new()` + a `Renderer::from_bytes` face handed to
-// `GpuRenderer::from_parts` (lib.rs `init()`), the same shape as the wasm path —
-// and compares it to aterm-wasm's CPU renderer (`Renderer::from_bytes`) at the
-// same px/theme. The comparison is on the EXPANDED RGBA8 each web crate emits
-// (`render()` packs `0x00RRGGBB` -> `r,g,b,0xff`), not the internal packed frame,
-// so it gates the actual bytes that reach the canvas.
-//
-// Both sides inject the SAME bundled font, exactly as the web crates inject a
-// host-fetched font, so the test is deterministic and never skips for a missing
-// system face. Gated: no GPU -> the test no-ops (like aterm-gpu's own parity
-// tests). The message band's frame is held the same way from inside the crate,
-// where the module's own frame build is reachable
-// (`messages_api::tests::the_band_frame_is_one_picture_on_both_web_renderers`).
+// WebGL needs a browser, so this builds the GPU side natively the way `init` does
+// (`GpuRenderer::from_parts` over a `Renderer::from_bytes` face, on
+// `GpuContext::new()` instead of a canvas surface) and compares the expanded RGBA8
+// each crate hands the canvas. Both inject the bundled font, so nothing depends on
+// system faces; without a GPU it skips. The band frame's parity is
+// `messages_api::tests::the_band_frame_is_one_picture_on_both_web_renderers`.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{GpuContext, GpuRenderer, WindowGpu};
@@ -55,8 +42,8 @@ fn bb(p: u32) -> i32 {
     (p & 0xff) as i32
 }
 
-/// Expand a packed-`0x00RRGGBB` frame to RGBA8 EXACTLY as the web crates' `render`
-/// does (`r,g,b,0xff`) — this is the buffer handed to canvas `putImageData`.
+/// Expand a packed-`0x00RRGGBB` frame to the RGBA8 the web crates hand
+/// `putImageData` (`r,g,b,0xff`).
 fn to_rgba8(f: &Frame) -> Vec<u8> {
     let mut v = Vec::with_capacity(f.pixels.len() * 4);
     for &p in &f.pixels {
@@ -106,15 +93,14 @@ fn web_cpu_gpu_rgba8_parity() {
         Err(e) => aterm_spec::host::could_not_run(format!("gpu renderer unavailable: {e}")),
     };
 
-    // CPU side, built as aterm-wasm does: from_bytes at the same px/theme.
+    // CPU side, as aterm-wasm builds it.
     let mut cpu = Renderer::from_bytes(FONT, PX, theme).expect("bundled font loads (cpu face)");
 
     let mut win = WindowGpu::new();
     let (mut term, rows, cols) = demo_term();
     let input = term.cell_frame(rows, cols);
     let cpu_frame = cpu.render_input(&input);
-    // `None`: no settings-card tray in this CPU/GPU parity test (P3 `render_input`
-    // gained the `tray: Option<TrayQuad>` arg; the parity check renders bare frames).
+    // `None`: no settings-card tray.
     let gpu_frame = gpu.render_input(&mut win, &input, None);
 
     assert_eq!(
@@ -136,8 +122,7 @@ fn web_cpu_gpu_rgba8_parity() {
         "RGBA8 buffer is not width*height*4"
     );
 
-    // The whole frame matches within the established CPU/GPU antialiasing tolerance
-    // (only round-vs-floor coverage rounding differs); alpha is 0xff on both.
+    // CPU/GPU antialiasing tolerance: only round-vs-floor coverage differs.
     let delta = max_byte_delta(&cpu_rgba, &gpu_rgba);
     eprintln!("web CPU/GPU RGBA8 max byte delta = {delta}");
     assert!(
@@ -145,8 +130,7 @@ fn web_cpu_gpu_rgba8_parity() {
         "web CPU/GPU RGBA8 diverge: max byte delta {delta} > 8"
     );
 
-    // Non-empty sanity: the red 'R' glyph actually rendered on the GPU path, so we
-    // didn't just compare two background frames.
+    // Non-empty: the red 'R' rendered on the GPU path, so this is not two backgrounds.
     let red_seen = gpu_frame
         .pixels
         .iter()

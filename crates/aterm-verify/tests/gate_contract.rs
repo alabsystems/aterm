@@ -366,12 +366,12 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
     );
 }
 
-/// Every driven stage LOOKS AT its driver's exit code — the regressions these
+/// Every driven stage looks at its driver's exit code — the regressions these
 /// drivers exist for (a dropped `EventLoopProxy`, a retyped objc argument)
 /// leave `cargo build` at 0 — and nothing that decided nothing is green: the
 /// redraw harness's `0` passes, `1` is a finding, `2` (no event loop) could not
 /// run; and on macOS the event drive's untrapped signal death is the finding it
-/// exists to make (v0.72.0 died by `SIGABRT` on the first mouse move). The
+/// exists to make. The
 /// stand-in dies by `SIGKILL`: the ladder reads every signal death alike, and
 /// a `SIGABRT` makes macOS write a crash report on every run. The exit-code
 /// tables themselves are `stages`' unit tests.
@@ -407,7 +407,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     }
 }
 
-/// THE OBJC DRIVES STAGE RUNS EVERY ROW, WHATEVER ONE ROW DID. A driver whose
+/// The objc drives stage runs every row, whatever one row did. A driver whose
 /// build failed and a driver that found a defect each leave their own rows,
 /// and every other driver still runs and says so.
 #[test]
@@ -461,11 +461,11 @@ const COMPILE_RED: &str = "echo 'error[E0425]: cannot find value `gone` in this 
 /// `bins` are `(package, target flag, name)`; each binary's body is
 /// `bodies(name)`.
 ///
-/// The `targo` bakes in the repo's paths, so it goes in as DATA behind the one
-/// shared stand-in text ([`FakeRepo::with_stage2_body`]): as text it was a fresh
-/// inode per repo, and each fresh inode's first exec waits on the machine's
-/// assessment. Calling it again replaces the `targo` (a case that bends the
-/// recording pass differently), so one repo serves every case.
+/// The `targo` bakes in the repo's paths, so it goes in as data behind the one
+/// shared stand-in text ([`FakeRepo::with_stage2_body`]) so each repo does not
+/// create a fresh executable inode waiting on macOS assessment. Calling it
+/// again replaces the `targo` (a case that bends the recording pass
+/// differently), so one repo serves every case.
 fn with_recording_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)], extra: &str) {
     let deps = repo.root.join("target/debug/deps");
     fs::create_dir_all(&deps).expect("mkdir");
@@ -535,7 +535,7 @@ exit 0"#
     ));
 }
 
-/// THE TEST BINARIES, SEVERAL AT A TIME, END TO END, through the real recorder
+/// The test binaries run several at a time, end to end, through the real recorder
 /// (`aterm-verify --record-test-binary`, the binary this package builds) and a
 /// stand-in cargo that runs it the way cargo runs a runner.
 ///
@@ -578,8 +578,8 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
              args=$*\"\ntouch '{m}/running/{name}'\n{rest}\nrm -f '{m}/running/{name}'\n"
         )
     };
-    // Each binary bakes in the marks' path, so as text each was a fresh inode
-    // and a first exec of its own: they are data behind the shared stand-in.
+    // Each binary bakes in the marks' path, so they are data behind the shared
+    // stand-in rather than fresh executable inodes.
     let write = |name: &str, text: String| {
         common::standin_body(&deps.join(format!("{name}-1")), &text);
     };
@@ -666,11 +666,11 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     assert!(t.could_not_run.is_empty(), "{t:?}");
 }
 
-/// NEVER LESS THAN CARGO: a recording that does not add up runs
+/// A recording that does not add up runs
 /// the serial `--tests` child instead, and says why — cargo announcing a
 /// binary the recorder never saw, or the recorder failing — and a pass in
 /// which the recorder never ran (a runner the caller's config names outranks
-/// ours) is judged as the serial run it was. In every case the tests RAN and
+/// ours) is judged as the serial run it was. In every case the tests ran and
 /// the one failure is decided exactly once.
 #[test]
 fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
@@ -682,7 +682,7 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
         "if [ -n \"$cfg\" ]; then cfg=$(printf '%s' \"$cfg\" | sed 's#\",\"/#\",\"/nonexistent/#'); fi",
         "cfg=''",
     ];
-    // ONE REPO FOR THE THREE CASES. What differs between them is only `extra`,
+    // One repo for the three cases. What differs between them is only `extra`,
     // which bends the recording pass and is the stand-in cargo's own body
     // ([`with_recording_cargo`] replaces it): the two binaries are the same text
     // in every case, each run reads a record directory of its own and removes
@@ -738,7 +738,7 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
     }
 }
 
-/// A RUNNER THAT RUNS NO TEST IS NO PASS. A runner for the host named in a
+/// A runner that runs no test is no pass. A runner for the host named in a
 /// cargo config or the environment (`CARGO_TARGET_<TRIPLE>_RUNNER`) outranks
 /// the run's `cfg(all())` recording runner, so the recording pass is judged as
 /// the serial run it was — or, when it printed no result, the serial child

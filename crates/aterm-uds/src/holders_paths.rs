@@ -500,6 +500,78 @@ mod mac {
         Ok(path_at(&buf, ffi::VNODE_PATH, ffi::MAXPATHLEN))
     }
 
+    /// `offsetof(struct vnode_fdinfowithpath, pfi.fi_openflags)`: the open's `FREAD`/`FWRITE`.
+    const FI_OPENFLAGS: usize = 0;
+    /// `FWRITE` (`<sys/fcntl.h>`): the descriptor was opened for writing.
+    const FWRITE: u32 = 0x0002;
+    /// `offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_mode)`: after the
+    /// 24-byte `proc_fileinfo`, `vinfo_stat`'s `uint32_t vst_dev`.
+    const VST_MODE: usize = 28;
+    /// `S_IFMT` and `S_IFREG` of a `mode_t`.
+    const S_IFMT: u16 = 0o170_000;
+    const S_IFREG: u16 = 0o100_000;
+
+    /// The regular files `pid` holds open for writing, as the kernel names them: one
+    /// `PROC_PIDFDVNODEPATHINFO` per vnode descriptor, whose `fi_openflags` and `vst_mode`
+    /// come with the path in the same structure (no path call). A process that exited holds
+    /// none; a descriptor closed since the listing, on a dead vnode, or whose metadata the
+    /// kernel refuses (`EPERM`: a file in a protected folder, which no walk may measure)
+    /// names no file.
+    pub(super) fn writes(pid: u32) -> Result<Vec<PathBuf>, Failed> {
+        let n = i32::try_from(pid).map_err(|_| Failed::Other)?;
+        let fds = match list_fds(n) {
+            Ok(fds) => fds,
+            Err(Failed::Exited) => return Ok(Vec::new()),
+            Err(other) => return Err(other),
+        };
+        let mut out = Vec::new();
+        for (fd, kind) in fds {
+            if kind != ffi::PROX_FDTYPE_VNODE {
+                continue;
+            }
+            let mut buf = [0u8; ffi::VNODE_PATH_SIZE];
+            let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
+            clear_errno();
+            // SAFETY: `buf` is exactly the structure this flavor fills.
+            let got = unsafe {
+                ffi::proc_pidfdinfo(
+                    n,
+                    fd,
+                    ffi::PROC_PIDFDVNODEPATHINFO,
+                    buf.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if got <= 0 {
+                match Failed::last() {
+                    Failed::Exited => return Ok(Vec::new()),
+                    Failed::Closed | Failed::Dead | Failed::Refused => continue,
+                    Failed::Other => return Err(Failed::Other),
+                }
+            }
+            if got != size {
+                return Err(Failed::Other);
+            }
+            let flags = buf
+                .get(FI_OPENFLAGS..FI_OPENFLAGS + 4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_ne_bytes)
+                .ok_or(Failed::Other)?;
+            let mode = buf
+                .get(VST_MODE..VST_MODE + 2)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .map(u16::from_ne_bytes)
+                .ok_or(Failed::Other)?;
+            if flags & FWRITE == 0 || mode & S_IFMT != S_IFREG {
+                continue;
+            }
+            if let Some(path) = path_at(&buf, ffi::VNODE_PATH, ffi::MAXPATHLEN) {
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+
     /// The first use `pid` makes of a path under `dirs`: `Ok(None)` when
     /// none; `Err(Exited)` when it exited (it uses nothing); any other
     /// failure with the executable, when that much was read.
@@ -1655,7 +1727,6 @@ mod win {
 
     impl Helper {
         /// A helper thread waiting for jobs, or `None` when none could start.
-        #[cfg(not(target_arch = "wasm32"))]
         fn start() -> Option<Self> {
             let (jobs, job_rx) = mpsc::channel::<Job>();
             let (answer_tx, answers) = mpsc::channel();
@@ -1933,6 +2004,141 @@ pub fn scan_path_users_of(_pids: &[u32], _dirs: &[PathBuf], _skip: &[u32]) -> io
         io::ErrorKind::Unsupported,
         "the path-user scan reads libproc (macOS) or /proc (Linux)",
     ))
+}
+
+/// The regular files `pid` holds open for writing, each as the kernel names it (canonical, a
+/// data-volume file possibly under its `/System/Volumes/Data` form), in descriptor order: where
+/// a process is writing now (design `docs/DESIGN-system-awareness-2026-10-16.md` §10.4,
+/// `writes`). Nothing is opened, `stat`ed or looked up by path: the kernel answers from the
+/// descriptor table, so a file in a privacy-protected folder or on a hung mount is named
+/// without being touched, and a caller path-tests each before it touches anything near it.
+/// A process that exited holds none.
+///
+/// macOS: `proc_pidinfo(PROC_PIDLISTFDS)`, then per vnode descriptor
+/// `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`, kept when its `fi_openflags` has `FWRITE` and
+/// its `vst_mode` is a regular file.
+///
+/// # Errors
+///
+/// The table could not be read (another uid's process, a platform agent that refuses a
+/// same-uid reader).
+#[cfg(target_vendor = "apple")]
+// Skip: bottoms out at the libproc FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
+    mac::writes(pid)
+        .map_err(|_| io::Error::other(format!("pid {pid}'s descriptor table is unreadable")))
+}
+
+/// See the macOS twin: `/proc/<pid>/fd/*` whose `/proc/<pid>/fdinfo/<n>` `flags` open it
+/// write-only or read-write, each named by its link. Linux's link says nothing of the file's
+/// type and a `stat` through it could wait on a hung mount, so a regular file is told by its
+/// name: an absolute path outside `/dev`, `/proc` and `/sys` (a pipe, socket or anonymous
+/// inode reads `pipe:[…]` and the like) that was not deleted (` (deleted)`).
+///
+/// # Errors
+///
+/// The table could not be read and the process has not exited.
+#[cfg(target_os = "linux")]
+pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
+    const O_ACCMODE: u32 = 0o3;
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let rd = match std::fs::read_dir(proc_dir.join("fd")) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Ok(info) = std::fs::read_to_string(proc_dir.join("fdinfo").join(&name)) else {
+            continue; // closed since the listing
+        };
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .and_then(|v| u32::from_str_radix(v.trim(), 8).ok());
+        if !flags.is_some_and(|f| matches!(f & O_ACCMODE, 1 | 2)) {
+            continue;
+        }
+        let Ok(path) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let deleted = path.as_os_str().as_encoded_bytes().ends_with(b" (deleted)");
+        if path.is_absolute()
+            && !deleted
+            && !["/dev", "/proc", "/sys"]
+                .iter()
+                .any(|d| path.starts_with(d))
+        {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+/// See the macOS twin.
+///
+/// # Errors
+///
+/// Always `Unsupported`.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub fn write_open_files(_pid: u32) -> io::Result<Vec<PathBuf>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a process's open files are read through libproc (macOS) or /proc (Linux)",
+    ))
+}
+
+/// The writes reader against files this test opens, in this process.
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
+mod writes_tests {
+    use super::write_open_files;
+
+    #[test]
+    fn the_writes_reader_names_the_regular_files_open_for_writing_and_nothing_else() {
+        let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().canonicalize().expect("canonical scratch dir");
+        let wo = dir.join("write-only.log");
+        let rw = dir.join("read-write.db");
+        let ro = dir.join("read-only.txt");
+        std::fs::write(&ro, b"x").expect("seed the read-only file");
+        let _w = std::fs::File::create(&wo).expect("open write-only");
+        let _rw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&rw)
+            .expect("open read-write");
+        let _r = std::fs::File::open(&ro).expect("open read-only");
+        let _null = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null for writing");
+        let got = write_open_files(std::process::id()).expect("own table");
+        let named = |p: &std::path::Path| {
+            got.iter().any(|g| {
+                g == p
+                    || g.strip_prefix("/System/Volumes/Data")
+                        .is_ok_and(|rel| std::path::Path::new("/").join(rel) == p)
+            })
+        };
+        assert!(named(&wo), "{wo:?} not in {got:?}");
+        assert!(named(&rw), "{rw:?} not in {got:?}");
+        assert!(!named(&ro), "a read-only open is no write: {got:?}");
+        assert!(
+            !got.iter().any(|g| g.starts_with("/dev")),
+            "a device is no regular file: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_process_that_does_not_exist_holds_no_file() {
+        // Past any pid the kernel hands out (`PID_MAX` 99,998 on macOS, 2^22 on Linux).
+        const NO_SUCH_PID: u32 = 2_147_483_647;
+        assert_eq!(write_open_files(NO_SUCH_PID).ok(), Some(Vec::new()));
+    }
 }
 
 /// A child's pid once the kernel shows it running `exe`.
@@ -2806,6 +3012,7 @@ mod win_tests {
             fstype: String::new(),
             local: true,
             automounted: false,
+            removable: false,
             read_only: false,
             container: Some(format!("Volume{{{guid}}}")),
         };
@@ -2817,6 +3024,7 @@ mod win_tests {
                     fstype: String::new(),
                     local: false,
                     automounted: false,
+                    removable: false,
                     read_only: false,
                     container: None,
                 },
@@ -3690,6 +3898,7 @@ mod win_tests {
             fstype: String::new(),
             local: true,
             automounted: false,
+            removable: false,
             read_only: false,
             container: Some("Volume{11111111-2222-4333-8444-555555555555}".to_owned()),
         });
@@ -3699,6 +3908,7 @@ mod win_tests {
             fstype: aterm_sysprobe::volumes::SUBST.to_owned(),
             local: true,
             automounted: false,
+            removable: false,
             read_only: false,
             container: None,
         });

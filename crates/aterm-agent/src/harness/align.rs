@@ -27,17 +27,17 @@ const READER_CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// spinning, and never wait beyond the caller's absolute deadline.
 const REAP_CHECK: Duration = Duration::from_millis(20);
 
-/// Per-invocation witness for the Tier-1 lifecycle bind. It records the real
-/// worker exit and child reap, rather than inferring them from a successful
-/// return. Compiled only into Unix tests; production carries a zero-sized marker.
+/// Per-invocation witness for the Tier-1 lifecycle bind: it records the real
+/// worker exit and child reap rather than inferring them from a successful
+/// return. Unix tests only; elsewhere the observer is a zero-sized marker.
 #[cfg(all(test, unix))]
 #[derive(Default)]
 struct CaptureLifecycleObservation {
     child_reaped: AtomicBool,
     reader_done: AtomicBool,
-    /// Run once the child is spawned and before the deadline is taken: what a
-    /// test's child must have done by then (an escape test's holder, gone to
-    /// a session of its own) happens before the deadline whatever the load.
+    /// Run after spawn and before the deadline is taken, so what a test's child
+    /// must have done by then (an escape test's holder leaving for its own
+    /// session) happens before the deadline under any load.
     after_spawn: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 

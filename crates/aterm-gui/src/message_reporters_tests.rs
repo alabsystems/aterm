@@ -16,6 +16,46 @@ fn a_volume_short_while_cleanup_is_off_is_not_the_passes_line() {
     assert_eq!(off.mover(), settings.mover());
 }
 
+#[test]
+fn blocked_account_automation_permission_remains_an_owner_step_in_the_digest() {
+    let entry = super::workstation_accounts_entry();
+    let message = entry
+        .message()
+        .expect("the account step passes the digest rule");
+    assert_eq!(
+        entry.family().mode(),
+        aterm_messages::exceptions::Mode::Event
+    );
+    assert!(
+        message.actions.is_empty(),
+        "the permission is controlled by macOS"
+    );
+    let aterm_messages::need::Need::Later(ask) = message.need() else {
+        panic!("an account automation permission block belongs in the digest");
+    };
+    assert_eq!(ask.resurface(), aterm_messages::need::Resurface::CHOICE);
+    assert!(entry.mover().is_none());
+}
+
+#[test]
+fn incomplete_workstation_setup_is_a_separate_manual_digest_step() {
+    let entry = super::workstation_setup_failure_entry();
+    let message = entry
+        .message()
+        .expect("the setup failure passes the digest rule");
+    assert_ne!(entry.key(), super::workstation_accounts_entry().key());
+    assert_eq!(
+        entry.family().mode(),
+        aterm_messages::exceptions::Mode::Event
+    );
+    assert!(message.actions.is_empty());
+    let aterm_messages::need::Need::Later(ask) = message.need() else {
+        panic!("incomplete workstation setup belongs in the digest");
+    };
+    assert_eq!(ask.resurface(), aterm_messages::need::Resurface::CHOICE);
+    assert!(entry.mover().is_none());
+}
+
 /// What the digest reads of `entry`: its title, its reason, its action and
 /// the detail lines behind them.
 fn entry_words(entry: &Entry) -> (String, String, String, Vec<String>) {
@@ -987,6 +1027,8 @@ fn every_reporter_message() -> Vec<Message> {
         "this display stack refused the DirectComposition backdrop swapchain",
     ));
     all.push(gpu_lost());
+    all.push(program_check_stuck(95, Some(90)));
+    all.push(program_check_stuck(512, None));
     all.extend(integration_lost_fixtures());
     all.push(integration_rekey_waits("in tab 2", "s-0123456789abcdef"));
     for place in ["in tab 2", "in window 12, tab 10", "in its tab"] {
@@ -3301,6 +3343,53 @@ fn the_disk_full_alert_says_what_ends_it() {
         );
         assert!(!moved.detail[2].contains(&figure), "{cause:?}");
     }
+}
+
+/// THE PROGRAM-CHECK ALERT STANDS, LEADS WITH THE RESTART AND READS AS THE
+/// DISK-FULL ALERT DOES (2026-10-20: a stuck `syspolicyd` closed every window
+/// 4.5 days after it stuck): an interrupt the owner alone can answer, keyed
+/// so the watch's end resolves it, never under `privacy.` (the [privacy]
+/// switch retracts those); the step first, its cut the restart alone, then
+/// the cause and what it does as the owner's sentence, the pool's figures
+/// after. NEGATIVE CONTROL: the figures follow the reading.
+#[test]
+fn the_program_check_alert_leads_with_the_restart() {
+    let msg = super::program_check_stuck(95, Some(90));
+    assert_eq!(msg.key.as_deref(), Some(super::PROGRAM_CHECK_STUCK_KEY));
+    assert!(!super::PROGRAM_CHECK_STUCK_KEY.starts_with("privacy."));
+    assert_eq!(msg.detail[0], "Restart the Mac once your work is saved");
+    let aterm_messages::need::Need::Now(ask) = msg.need() else {
+        panic!("the program-check alert is a Now");
+    };
+    assert!(ask.is_standing());
+    assert_eq!(ask.then().short(), Some("Restart the Mac"));
+    assert!(
+        msg.detail[1].contains("only a restart"),
+        "{}",
+        msg.detail[1]
+    );
+    assert!(
+        msg.detail[2].contains("No new program can start"),
+        "{}",
+        msg.detail[2]
+    );
+    assert_eq!(
+        super::sentence_lines(msg.key.as_deref(), &msg.detail),
+        3,
+        "the step, the cause and what it does"
+    );
+    assert!(
+        msg.detail[3].contains("(95 pool threads against a limit of 90)"),
+        "{}",
+        msg.detail[3]
+    );
+    let other = super::program_check_stuck(512, None);
+    assert!(
+        other.detail[3].contains("(512 pool threads against its limit)"),
+        "{}",
+        other.detail[3]
+    );
+    assert!(!other.detail[3].contains("95"));
 }
 
 /// THE DISK-FULL ALERT SHOWS ITS STEP AND STATES ITS CAUSE ONCE (review

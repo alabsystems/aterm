@@ -1468,6 +1468,20 @@ impl App {
         if !editor_event {
             return Ok(None);
         }
+        // A buffer read from a file whose every line break is CRLF holds LF,
+        // and its save writes each LF back as CRLF: text typed or pasted into
+        // it with CRLF line ends joins it as LF, or the save would write
+        // CR CR LF (design §4.7).
+        let held_line_ends = self
+            .native_documents
+            .persistence
+            .observed(document)
+            .is_some_and(|observed| {
+                observed.encoding().eol == crate::native_document_io::LineEnding::CrLf
+            })
+            .then(|| crlf_held_insertion(event))
+            .flatten();
+        let event = held_line_ends.as_ref().unwrap_or(event);
 
         let config_diagnostic_navigation = match event {
             AppEvent::EditorConfigDiagnosticNavigate { previous } => {
@@ -1756,6 +1770,7 @@ impl App {
         source_view: crate::tab_model::ViewId,
     ) {
         if let Some((seq, deltas)) = self.editor_workspace.take_last_commit(document) {
+            self.edit_document_committed(document, source_view, seq);
             let other_views = self
                 .view_store
                 .iter()
@@ -1869,7 +1884,7 @@ impl App {
 
     /// Whether a save of `document` is in flight or owed: an older save still
     /// landing could put other bytes on disk after the buffer read clean.
-    fn document_save_owed(&self, document: DocumentId) -> bool {
+    pub(crate) fn document_save_owed(&self, document: DocumentId) -> bool {
         self.native_documents.persistence.save_in_flight(document)
             || self.native_documents.inflight.contains(&document)
             || self.native_documents.pending_saves.contains_key(&document)
@@ -1877,7 +1892,12 @@ impl App {
 
     /// Whether `snapshot`'s text is exactly the version of the file aterm
     /// admitted (loaded, saved, or accepted from disk): a buffer that is
-    /// holds no local edits, conflict or not.
+    /// holds no local edits, conflict or not. The text is compared as the
+    /// bytes a save of it writes (`encode_for_disk` with the document's
+    /// mapping), so a file read with a byte order mark or CRLF line ends taken
+    /// off is clean again once an Undo returns its text. Every commit of a
+    /// dirty buffer asks, so the length a save would write is checked first,
+    /// and only a text of the file's length is encoded and fingerprinted.
     fn buffer_is_admitted_baseline(
         &self,
         snapshot: &crate::document_store::DocumentSnapshot,
@@ -1886,10 +1906,12 @@ impl App {
         let Some(observed) = self.native_documents.persistence.observed(document) else {
             return false;
         };
-        let bytes = snapshot.text.as_bytes();
-        observed.exists
-            && observed.len == bytes.len() as u64
-            && observed.content == crate::native_document_io::ContentFingerprint::of(bytes)
+        let text = snapshot.text.as_ref();
+        if !observed.exists || !encodes_to_len(text, observed.encoding(), observed.len) {
+            return false;
+        }
+        let bytes = crate::native_document_host::encode_for_disk(text, observed.encoding());
+        observed.content == crate::native_document_io::ContentFingerprint::of(&bytes)
             && self
                 .native_documents
                 .persistence
@@ -2296,15 +2318,27 @@ impl App {
                 );
             }
         };
-        let Some(observed) = self
+        if !self
             .native_documents
             .persistence
             .observed(document)
-            .filter(|observed| observed.exists)
-        else {
+            .is_some_and(|observed| observed.exists)
+        {
             return DraftCarry::Refused("its file is not on disk".to_string());
+        }
+        // The journal's base is the text the file was admitted as, a byte
+        // order mark or CRLF line ends taken off: the successor's open
+        // compares the same reading (`inspect_open` with the admitted text).
+        let Some(base) = self
+            .native_documents
+            .persistence
+            .observed_text_fingerprint(document)
+        else {
+            return DraftCarry::Refused(
+                "the file's admitted text is not known to this process".to_string(),
+            );
         };
-        match verify_carried_draft(&candidate, &head.text, observed.content) {
+        match verify_carried_draft(&candidate, &head.text, base) {
             Ok(()) => DraftCarry::Carried {
                 bytes: head.text.len(),
             },
@@ -2729,13 +2763,14 @@ impl App {
                     self.set_editor_view_status(source_view, &status);
                 }
             }
-            // An edit ticket's answer: until a waiting client's ticket is
-            // wired to its view (slice N3), no view has one to answer.
+            // An edit ticket's answer (`app_edit`): done saves, then closes
+            // once the save is durable; abort discards, then closes.
             EditorEffect::CloseView {
-                why: CloseWhy::Finish | CloseWhy::Abort,
-            } => {
-                self.set_editor_view_status(source_view, NO_EDIT_WAITING);
-            }
+                why: CloseWhy::Finish,
+            } => self.finish_edit_view(source_view),
+            EditorEffect::CloseView {
+                why: CloseWhy::Abort,
+            } => self.abort_edit_view(source_view),
             EditorEffect::KillBuffer { query } => {
                 self.kill_open_editor_buffer(source_view, &query);
             }
@@ -2795,7 +2830,10 @@ impl App {
     /// of a split or the whole tab, through the same document barrier (a
     /// changed draft is saved before the view goes; the close finishes when
     /// the save lands). The reason when it did not close.
-    fn close_editor_view(&mut self, view: crate::tab_model::ViewId) -> Result<(), String> {
+    pub(crate) fn close_editor_view(
+        &mut self,
+        view: crate::tab_model::ViewId,
+    ) -> Result<(), String> {
         let (wid, tab) = self
             .windows
             .iter()
@@ -2838,7 +2876,7 @@ impl App {
     /// a split's leaf then closes by itself once the save lands, while a
     /// whole tab stays for the person to close again. Any other `why` is a
     /// refusal, said as it is.
-    fn editor_close_status(
+    pub(crate) fn editor_close_status(
         &self,
         view: crate::tab_model::ViewId,
         title: Option<&str>,
@@ -3031,7 +3069,7 @@ impl App {
         Ok((wid, *index, *instance, *target_view, title.clone()))
     }
 
-    fn set_editor_view_status(&mut self, view: crate::tab_model::ViewId, message: &str) {
+    pub(crate) fn set_editor_view_status(&mut self, view: crate::tab_model::ViewId, message: &str) {
         if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) {
             state.status = Some(message.to_string());
         }
@@ -3044,17 +3082,37 @@ impl App {
         &mut self,
         document: DocumentId,
     ) -> Result<crate::native_document_io::FileWatchReduction, String> {
+        let observed = self
+            .refresh_document_file(document)
+            .map_err(|error| format!("document refresh failed: {error}"))?;
+        self.reduce_document_observation(document, &observed.text, observed.observed)
+    }
+
+    /// Read `document`'s file again through its grant. A document never saved
+    /// whose file does not exist yet (an `edit … create=1`) reads "still
+    /// missing" as no change rather than as a failure; once it has been saved,
+    /// a missing file fails as for any document.
+    fn refresh_document_file(
+        &self,
+        document: DocumentId,
+    ) -> Result<crate::native_document_host::GrantedDocument, String> {
         let grant = self
             .native_documents
             .persistence
             .grant(document)
             .ok_or_else(|| "document persistence grant disappeared".to_string())?;
-        let observed = self
+        let never_saved = self
             .native_documents
-            .grants
-            .refresh_local(grant, DEFAULT_DOCUMENT_LIMIT)
-            .map_err(|error| format!("document refresh failed: {error}"))?;
-        self.reduce_document_observation(document, &observed.text, observed.observed)
+            .persistence
+            .observed(document)
+            .is_some_and(|observed| !observed.exists);
+        let grants = &self.native_documents.grants;
+        if never_saved {
+            grants.refresh_local_allowing_missing(grant, DEFAULT_DOCUMENT_LIMIT)
+        } else {
+            grants.refresh_local(grant, DEFAULT_DOCUMENT_LIMIT)
+        }
+        .map_err(|error| error.to_string())
     }
 
     fn reduce_document_observation(
@@ -3195,7 +3253,7 @@ impl App {
         Ok(reduction)
     }
 
-    fn discard_document_changes(
+    pub(crate) fn discard_document_changes(
         &mut self,
         document: DocumentId,
         source_view: crate::tab_model::ViewId,
@@ -3203,15 +3261,8 @@ impl App {
         if self.native_documents.persistence.save_in_flight(document) {
             return Err("cannot discard while a save is in flight".to_string());
         }
-        let grant = self
-            .native_documents
-            .persistence
-            .grant(document)
-            .ok_or_else(|| "document persistence grant disappeared".to_string())?;
         let observed = self
-            .native_documents
-            .grants
-            .refresh_local(grant, DEFAULT_DOCUMENT_LIMIT)
+            .refresh_document_file(document)
             .map_err(|error| format!("could not reload document for discard: {error}"))?;
         if matches!(
             self.document_store.phase(document),
@@ -3273,9 +3324,12 @@ impl App {
                 }
             }
         };
+        // The fresh read is the buffer's text now, so its mapping is too
+        // (unless it is exactly the old reading): a discard of a buffer held
+        // as it was writes the file's own line ends back.
         self.native_documents
             .persistence
-            .accept_observation(document, observed, observed_text)
+            .accept_reloaded_observation(document, observed, observed_text)
             .map_err(|error| format!("could not accept refreshed file version: {error:?}"))?;
         self.document_store
             .checkpoint_ack(document, seq)
@@ -3324,6 +3378,30 @@ impl App {
         Ok(())
     }
 
+    /// "Save failed: " and why, in the save words
+    /// ([`crate::save_words`]), for a save of `document`'s file.
+    fn document_save_words(
+        &self,
+        document: DocumentId,
+        failure: &crate::save_words::Failure<'_>,
+    ) -> String {
+        let path = self
+            .native_documents
+            .persistence
+            .grant(document)
+            .and_then(|grant| self.native_documents.grants.get(grant))
+            .map(|grant| grant.target().logical_path().to_path_buf());
+        format!(
+            "Save failed: {}",
+            crate::save_words::words(
+                crate::save_words::Speaker::Aterm,
+                path.as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("the file")),
+                failure,
+            )
+        )
+    }
+
     pub(crate) fn save_document_checkpoint(
         &mut self,
         document: DocumentId,
@@ -3367,7 +3445,9 @@ impl App {
                 .native_documents
                 .persistence
                 .begin(&snapshot)
-                .map_err(|error| format!("could not begin document save: {error:?}"))?;
+                .map_err(|error| {
+                    self.document_save_words(document, &crate::save_words::Failure::Begin(&error))
+                })?;
             let grant = self
                 .native_documents
                 .grants
@@ -3409,7 +3489,9 @@ impl App {
             .native_documents
             .persistence
             .begin(&snapshot)
-            .map_err(|error| format!("could not begin document save: {error:?}"))?;
+            .map_err(|error| {
+                self.document_save_words(document, &crate::save_words::Failure::Begin(&error))
+            })?;
         let grant = self
             .native_documents
             .grants
@@ -3433,6 +3515,10 @@ impl App {
         )
     }
 
+    /// A save's completion, from its worker (`Wake::NativeDocumentSaved`) or
+    /// inline: land it ([`Self::land_native_document_save`]), then let every
+    /// `edit` view finishing on the document close once its done is durable,
+    /// or stop finishing when the save did not land (`app_edit`).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3442,6 +3528,29 @@ impl App {
         )
     )]
     pub(crate) fn finish_native_document_save(
+        &mut self,
+        document: DocumentId,
+        source_view: crate::tab_model::ViewId,
+        generation: crate::native_document_io::SaveGeneration,
+        saved_bytes: std::sync::Arc<[u8]>,
+        result: crate::native_document_io::AtomicSaveResult,
+        config_observation: Option<
+            Result<crate::native_config_service::PreparedConfigObservation, String>,
+        >,
+    ) -> Result<(), String> {
+        let landed = self.land_native_document_save(
+            document,
+            source_view,
+            generation,
+            saved_bytes,
+            result,
+            config_observation,
+        );
+        self.edit_document_saved(document, landed.as_ref().err().map(String::as_str));
+        landed
+    }
+
+    fn land_native_document_save(
         &mut self,
         document: DocumentId,
         source_view: crate::tab_model::ViewId,
@@ -3528,10 +3637,20 @@ impl App {
                 self.set_document_recovery_status(document, Some(message.clone()));
                 Err(message)
             }
-            crate::native_document_io::SaveReduction::Failed { stage, message } => {
+            // The log keeps the step's own account; the person reads why
+            // in the words a failed save of aterm.toml gives
+            // ([`crate::save_words`]).
+            crate::native_document_io::SaveReduction::Failed {
+                stage,
+                message,
+                cause,
+            } => {
                 let _ = self.document_store.checkpoint_fail(document);
                 aterm_log::warn!("document save failed at {stage:?}: {message}");
-                Err(format!("Save failed: {message}"))
+                Err(self.document_save_words(
+                    document,
+                    &crate::save_words::Failure::Write { stage, cause },
+                ))
             }
             crate::native_document_io::SaveReduction::ReconcileRequired {
                 stage,
@@ -3544,10 +3663,23 @@ impl App {
                 aterm_log::warn!(
                     "document save indeterminate at {stage:?}: {message} (observed: {observed:?})"
                 );
+                // The file holds the save's bytes, the buffer's text encoded
+                // as the document maps it, not the text itself.
+                let encoding = self
+                    .native_documents
+                    .persistence
+                    .observed(document)
+                    .map_or(crate::native_document_io::DiskEncoding::PLAIN, |current| {
+                        current.encoding()
+                    });
+                let written = std::str::from_utf8(&saved_bytes).map_or_else(
+                    |_| saved_bytes.to_vec(),
+                    |text| crate::native_document_host::encode_for_disk(text, encoding),
+                );
                 let landed = observed.is_some_and(|observed| {
                     observed.exists
                         && observed.content
-                            == crate::native_document_io::ContentFingerprint::of(&saved_bytes)
+                            == crate::native_document_io::ContentFingerprint::of(&written)
                 });
                 let recovery = if landed {
                     "Saved, but the disk did not confirm it; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’"
@@ -4252,7 +4384,10 @@ impl App {
     /// is due — a document view closed or a Suspended document's write landed
     /// since the last one, or the recently-closed record that alone kept a
     /// document has expired. A `bool` and an `Option` test on every other park.
+    /// The `edit` tickets' orphan clocks are read here too
+    /// (`App::sweep_orphaned_edits_at_park`).
     pub(crate) fn release_documents_at_park(&mut self) {
+        self.sweep_orphaned_edits_at_park();
         let host = &self.native_documents;
         if host.release_due || host.release_deadline_ms.is_some() {
             let now_ms = self.lat_epoch.elapsed().as_millis() as u64;
@@ -4576,7 +4711,7 @@ impl App {
     /// same call). User gestures (`drop_file`, `choose_and_open_document`) go
     /// through [`Self::request_document_tab_in_window`] instead. On the main
     /// thread a dataless file fails fast as `NotDownloaded` (materialization is
-    /// off there; [`crate::dataless_files`]), but a network volume's timeout is
+    /// off there; `aterm_diskwalk::iopol`), but a network volume's timeout is
     /// waited out.
     pub(crate) fn open_document_tab_in_window(
         &mut self,
@@ -4619,12 +4754,39 @@ impl App {
         uri: &str,
         allow_config_symlinks: bool,
     ) -> Result<AdmittedDocument, DocumentOpenFailure> {
-        crate::native_document_host::admit_local_file(
+        Self::admit_document_with(
             uri,
-            DEFAULT_DOCUMENT_LIMIT,
-            allow_config_symlinks,
+            crate::native_document_host::AdmitOptions {
+                allow_config_symlinks,
+                ..crate::native_document_host::AdmitOptions::DOCUMENT
+            },
         )
-        .map_err(DocumentOpenFailure)
+    }
+
+    /// [`Self::admit_document_now`] with every admission option: an `edit …
+    /// create=1` admits a file that does not exist yet as an empty text, and
+    /// its first save creates it (`AdmitOptions::allow_missing`).
+    fn admit_document_with(
+        uri: &str,
+        options: crate::native_document_host::AdmitOptions,
+    ) -> Result<AdmittedDocument, DocumentOpenFailure> {
+        crate::native_document_host::admit_local_file_opts(uri, options)
+            .map_err(DocumentOpenFailure)
+    }
+
+    /// The admission options of an open under `key`: an ordinary document's,
+    /// or, for an `edit` ticket that asked for `create=1`, one that admits a
+    /// missing file.
+    fn admission_options(
+        &self,
+        key: &DocumentAdmissionKey,
+    ) -> crate::native_document_host::AdmitOptions {
+        crate::native_document_host::AdmitOptions {
+            allow_missing: key
+                .edit
+                .is_some_and(|ticket| self.edit_admits_missing(ticket)),
+            ..crate::native_document_host::AdmitOptions::DOCUMENT
+        }
     }
 
     /// Phase one of the two-phase open. The caller has validated `wid` and the
@@ -4642,11 +4804,12 @@ impl App {
         {
             return Ok(DocumentAdmission::Coalesced(pending.ticket));
         }
+        let options = self.admission_options(&key);
         let Some(proxy) = self.proxy.clone() else {
             // No event loop to report back to (headless tests): admit inline so
             // tests that read the tab straight back stay synchronous;
             // `complete_document_admission` has its own tests.
-            let admitted = Self::admit_document_now(&key.uri, false);
+            let admitted = Self::admit_document_with(&key.uri, options);
             if key.edit.is_some() {
                 let reply = self.finish_edit_admission(wid, key, admitted.map(Box::new));
                 return Ok(DocumentAdmission::Opened(reply.unwrap_or_else(|why| why)));
@@ -4669,8 +4832,8 @@ impl App {
                 // This thread may wait for a download: the user asked for the
                 // file and this is nobody's event loop. The policy is
                 // thread-scoped; the main thread's stays off.
-                if let Err(errno) = crate::dataless_files::set_thread_materialize_policy(
-                    crate::dataless_files::MaterializePolicy::On,
+                if let Err(errno) = aterm_diskwalk::set_thread_materialize_policy(
+                    aterm_diskwalk::MaterializePolicy::On,
                 ) {
                     crate::logging::stderr_line!(
                         "aterm-gui: document admission worker could not enable \
@@ -4678,7 +4841,7 @@ impl App {
                          file will be reported as not downloaded"
                     );
                 }
-                let result = Self::admit_document_now(&worker_key.uri, false).map(Box::new);
+                let result = Self::admit_document_with(&worker_key.uri, options).map(Box::new);
                 let _ = proxy.send_event(crate::Wake::DocumentAdmitted(Box::new(
                     DocumentAdmissionOutcome {
                         ticket,
@@ -5113,6 +5276,22 @@ impl App {
     }
 }
 
+/// Why aterm.toml could not be read to open it, in the save words for a
+/// refused open ([`crate::save_words`]: a folder that is not there does not
+/// exist, it did not go missing while saving); the reader's own account
+/// goes to the log.
+fn refused_config_read(
+    path: &std::path::Path,
+    error: &crate::native_document_host::DocumentHostError,
+) -> String {
+    aterm_log::warn!("could not validate {}: {error}", path.display());
+    crate::save_words::words(
+        crate::save_words::Speaker::Aterm,
+        path,
+        &crate::save_words::Failure::Open(error),
+    )
+}
+
 /// Create a missing config file without truncating an existing one, and return
 /// the logical path the document-grant boundary uses.
 ///
@@ -5130,7 +5309,7 @@ fn ensure_config_file(path: &std::path::Path) -> Result<std::path::PathBuf, Stri
         crate::native_document_host::DEFAULT_DOCUMENT_LIMIT,
         true,
     )
-    .map_err(|error| format!("could not validate {}: {error}", path.display()))?;
+    .map_err(|error| refused_config_read(path, &error))?;
     if !contents.baseline.observed.exists {
         // Ordered: an empty file; a lost one makes the next open repeat the same
         // missing-file compare-and-swap.
@@ -5146,27 +5325,42 @@ fn ensure_config_file(path: &std::path::Path) -> Result<std::path::PathBuf, Stri
                     crate::native_document_host::DEFAULT_DOCUMENT_LIMIT,
                     false,
                 )
-                .map_err(|error| {
-                    format!(
-                        "could not validate concurrently created {}: {error}",
-                        path.display()
-                    )
-                })?;
+                .map_err(|error| refused_config_read(path, &error))?;
             }
-            crate::native_document_host::AtomicCommitResult::Failed { stage, message } => {
-                return Err(format!(
+            crate::native_document_host::AtomicCommitResult::Failed {
+                stage,
+                message,
+                cause,
+            } => {
+                aterm_log::warn!(
                     "could not create {} at {stage:?}: {message}",
                     path.display()
+                );
+                // Said after "Couldn't open aterm.toml: " (Settings) or the
+                // menu's own lead: why it could not be made.
+                return Err(crate::save_words::words(
+                    crate::save_words::Speaker::Aterm,
+                    path,
+                    &crate::save_words::Failure::Write { stage, cause },
                 ));
             }
             crate::native_document_host::AtomicCommitResult::PublishedUnverified {
                 stage,
                 message,
+                cause,
                 ..
             } => {
-                return Err(format!(
-                    "{} may have been created but could not be verified at {stage:?}: {message}; reopen Manual to reconcile",
+                aterm_log::warn!(
+                    "{} may have been created but could not be verified at {stage:?}: {message}",
                     path.display()
+                );
+                return Err(format!(
+                    "{}; open it again to check it",
+                    crate::save_words::words(
+                        crate::save_words::Speaker::Aterm,
+                        path,
+                        &crate::save_words::Failure::Unconfirmed { stage, cause },
+                    )
                 ));
             }
         }
@@ -5174,9 +5368,48 @@ fn ensure_config_file(path: &std::path::Path) -> Result<std::path::PathBuf, Stri
     Ok(path.to_path_buf())
 }
 
-/// What `finish-edit` and `abort-edit` say while no client waits on the
-/// view's file.
-const NO_EDIT_WAITING: &str = "nothing is waiting on this file; C-x C-s saves";
+/// `event`'s inserted text with each CRLF as LF, for a buffer that holds a
+/// CRLF file's text with LF ([`App::dispatch_editor_event`]); `None` when it
+/// inserts no CRLF.
+fn crlf_held_insertion(event: &AppEvent) -> Option<AppEvent> {
+    let as_lf = |text: &str| text.contains("\r\n").then(|| text.replace("\r\n", "\n"));
+    match event {
+        AppEvent::EditorInput(EditorInput::Text(text)) => {
+            as_lf(text).map(|text| AppEvent::EditorInput(EditorInput::Text(text)))
+        }
+        AppEvent::EditorInput(EditorInput::Paste(text)) => {
+            as_lf(text).map(|text| AppEvent::EditorInput(EditorInput::Paste(text)))
+        }
+        AppEvent::TextInput(TextInputEvent::Commit(text)) => {
+            as_lf(text).map(|text| AppEvent::TextInput(TextInputEvent::Commit(text)))
+        }
+        #[cfg(any(a11y_tree, test))]
+        AppEvent::InsertText(text) => as_lf(text).map(AppEvent::InsertText),
+        _ => None,
+    }
+}
+
+/// Whether the bytes a save of `text` writes for a file held with
+/// `encoding` (`encode_for_disk`) are `len` long, worked out without making
+/// them: the text, the byte order mark, and one carriage return more per line
+/// feed when every line break of the file was CRLF. Only a CRLF text whose
+/// length could still match has its line feeds counted.
+fn encodes_to_len(text: &str, encoding: crate::native_document_io::DiskEncoding, len: u64) -> bool {
+    let mark = if encoding.bom {
+        crate::native_document_io::UTF8_BOM.len()
+    } else {
+        0
+    };
+    let least = (text.len() as u64).saturating_add(mark as u64);
+    match encoding.eol {
+        crate::native_document_io::LineEnding::Lf => least == len,
+        crate::native_document_io::LineEnding::CrLf => {
+            least <= len
+                && least.saturating_add(text.bytes().filter(|&byte| byte == b'\n').count() as u64)
+                    == len
+        }
+    }
+}
 
 fn editor_error_message(error: &crate::native_editor::EditorError) -> String {
     use crate::native_editor::EditorError;
@@ -5219,6 +5452,32 @@ mod tests {
     /// failure blocks forever, so this is a one-minute hang detector, never a
     /// latency budget.
     const REFUSES_WITHOUT_BLOCKING: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+
+    /// The length a save would write is told without making the bytes, and
+    /// agrees with the bytes `encode_for_disk` makes for every mapping, a
+    /// text one byte off either way included.
+    #[test]
+    fn encodes_to_len_agrees_with_encode_for_disk() {
+        use crate::native_document_io::{DiskEncoding, LineEnding};
+        for text in ["", "one", "one\ntwo\n", "\n\n\n", "a\r\nb\n"] {
+            for bom in [false, true] {
+                for eol in [LineEnding::Lf, LineEnding::CrLf] {
+                    let encoding = DiskEncoding { bom, eol };
+                    let len =
+                        crate::native_document_host::encode_for_disk(text, encoding).len() as u64;
+                    assert!(encodes_to_len(text, encoding, len), "{text:?} {encoding:?}");
+                    assert!(
+                        !encodes_to_len(text, encoding, len + 1),
+                        "{text:?} {encoding:?}"
+                    );
+                    assert!(
+                        len == 0 || !encodes_to_len(text, encoding, len - 1),
+                        "{text:?} {encoding:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The running App's journal store opens on a worker: the slot is built
     /// while its opener is still held, and the first look takes the store that
@@ -5728,6 +5987,7 @@ mod tests {
             key: key.clone(),
             result: Err(DocumentOpenFailure(DocumentHostError::Io {
                 stage: crate::native_document_io::AtomicSaveStage::Preflight,
+                kind: None,
                 message:
                     "dropped.md is evicted from iCloud Drive and must be downloaded in Finder first"
                         .to_string(),
@@ -6316,7 +6576,25 @@ mod tests {
         let started = std::time::Instant::now();
         let error = app.save_document_checkpoint(document, view).unwrap_err();
         assert!(started.elapsed() < REFUSES_WITHOUT_BLOCKING);
-        assert!(error.contains("busy"), "{error}");
+        // In the words a lock another writer holds gets, never the writer's
+        // account of it.
+        assert_eq!(
+            error,
+            format!(
+                "Save failed: {}",
+                crate::save_words::words(
+                    crate::save_words::Speaker::Aterm,
+                    &path,
+                    &crate::save_words::Failure::Write {
+                        stage: crate::native_document_io::AtomicSaveStage::Preflight,
+                        cause: Some(crate::native_document_io::SaveCause {
+                            kind: std::io::ErrorKind::WouldBlock,
+                            touch: crate::native_document_io::SaveTouch::Lock,
+                        }),
+                    },
+                )
+            )
+        );
         assert_eq!(fs::read(&path).unwrap(), b"");
         assert_eq!(app.document_store.dirty(document), Some(true));
         let save = app

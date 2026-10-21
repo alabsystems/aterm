@@ -2967,7 +2967,11 @@ impl App {
     /// notifications say what `status needs=` and the survey say. Its
     /// supervised agent's task END (`docs/DESIGN-harness-autopilot-2026-10-15.md`
     /// §11.4.3, item 1) is read off the harness's glass, an App field, and
-    /// its instant off the timeline under the lock already taken.
+    /// its instant off the timeline under the lock already taken. Whether its
+    /// Autopilot chip's face is LANDED (§12.4.3, item 1) is the chip's own
+    /// fold of the same glass ([`Self::chip_face_landed`]), so This Mac
+    /// counts a landed tab that is no worker. Its place is the glance's to
+    /// fill ([`Self::status_glance`]), only where two rows share a label.
     pub(crate) fn status_session_row(
         &self,
         h: &crate::session_store::SessionHandle,
@@ -2976,6 +2980,14 @@ impl App {
             .harness_glass
             .get(&h.local_id)
             .and_then(crate::harness_glass::SessionGlass::end);
+        let landed = self.chip_face_landed(h.local_id);
+        // LANDING (§12.4.3 item 1, slice 3c): Land's instruction typed to it
+        // and a hold standing, under `⤓ land` ([`Self::shown_hold`]); its
+        // tip what holds it, with no clock.
+        let hold = self.shown_hold(h.local_id);
+        let landing_tip = hold.and_then(|hold| {
+            crate::harness_glass::hold_words(&hold, None, crate::harness_glass::HoldForm::Tip, None)
+        });
         let (verdict, agent, task, told) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -3018,6 +3030,57 @@ impl App {
             person_refusals: h.ctx.fabric.person_refusals(),
             held_by_host: h.ctx.fabric.holds().remote().map(|r| r.host.clone()),
             end,
+            landed,
+            landing: hold.is_some(),
+            landing_tip,
+            place: None,
+        }
+    }
+
+    /// Whether session `session`'s Autopilot chip wears `✓ landed`
+    /// ([`crate::claude_lights::ChipFace::of`] over its view and its glass,
+    /// the fold the frame draws): Land, its task's face landed. The glass's
+    /// face is read first, one map lookup, so only a landed session reads
+    /// its Autopilot (leaf locks).
+    pub(crate) fn chip_face_landed(&self, session: u64) -> bool {
+        let glass = self.chip_glass(session);
+        glass.task == Some(aterm_agent::harness::acts::TaskFace::Landed)
+            && crate::claude_lights::ChipFace::of(self.session_autopilot(session).1, &glass)
+                == crate::claude_lights::ChipFace::Landed
+    }
+
+    /// ROWS THAT SHARE A LABEL SAY WHERE THEY ARE (§12.4.1): each row whose
+    /// label another row of `rows` also carries is given its place
+    /// ([`Self::session_place`]: `in tab 2`, `in tab 3, left pane`), and
+    /// where two of them still read alike (an agent and a shell in one tab,
+    /// which `session_place` does not tell apart) the pane every pane counts
+    /// in ([`Self::pane_place`]). A unique label names no place, so a glance
+    /// with none alike walks no window.
+    fn place_alike_rows(&self, rows: &mut [crate::status_item::SessionRow]) {
+        // Compared in place: a glance whose labels are all unique allocates
+        // nothing here.
+        let shared: Vec<usize> = (0..rows.len())
+            .filter(|&i| {
+                rows.iter()
+                    .enumerate()
+                    .any(|(j, other)| j != i && other.title == rows[i].title)
+            })
+            .collect();
+        if shared.is_empty() {
+            return;
+        }
+        for &i in &shared {
+            rows[i].place = Some(self.session_place(&rows[i].sid));
+        }
+        let named: Vec<String> = shared.iter().map(|&i| rows[i].named()).collect();
+        for (k, &i) in shared.iter().enumerate() {
+            if named
+                .iter()
+                .enumerate()
+                .any(|(l, other)| l != k && *other == named[k])
+            {
+                rows[i].place = Some(self.pane_place(&rows[i].sid).0);
+            }
         }
     }
 
@@ -3378,11 +3441,12 @@ impl App {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .snapshot();
-        let rows: Vec<crate::status_item::SessionRow> = handles
+        let mut rows: Vec<crate::status_item::SessionRow> = handles
             .iter()
             .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
             .map(|h| self.status_session_row(h))
             .collect();
+        self.place_alike_rows(&mut rows);
         let api_since = self.api_outage.values().min().copied();
         let fleet = self
             .fleet_glance
@@ -3778,6 +3842,73 @@ impl App {
         }
         if let Some(fleet) = &self.fleet_glance {
             fleet.kick(crate::fleet_glance::Kick::MenuOpening);
+        }
+    }
+
+    /// A DEVELOPMENT BUILD'S STAND-IN FOR THE PERSON CLICKS THE MENU-BAR ROW
+    /// AT `at` (`aterm ctl person menubar press <at>`,
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2): the menu
+    /// composed as `chrome` composes it ([`Self::status_item_chrome_lines`]),
+    /// from a glance stamped with the next generation and kept as the one
+    /// the menu was painted from ([`Self::note_status_painted`], what a
+    /// menu's open keeps); the row at that path ([`crate::status_item::row_at`],
+    /// the path `chrome` prints) taken, its action round-tripped through its
+    /// tag as an `NSMenuItem` carries it, and posted as the AppKit relay
+    /// posts a click (`post`, `Wake::StatusAction`), so
+    /// [`Self::dispatch_status_action`] runs for it as for a click, on the
+    /// loop's next turn. The reply names the row's label. Refused: no row
+    /// there, a row that does not act (an information line, a separator, a
+    /// submenu's row), a disabled one, and off macOS, where there is no
+    /// menu-bar item. A menu open's other work (a sibling scan, a fleet
+    /// read, the notice voice) is not a click's, and is not done.
+    #[cfg(any(test, debug_assertions))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(unused_variables, reason = "the menu-bar status item is macOS's")
+    )]
+    pub(crate) fn person_menubar_press(
+        &mut self,
+        at: &crate::status_item::MenuAt,
+        post: &mut dyn FnMut(crate::Wake) -> bool,
+    ) -> Result<String, String> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("no menu-bar item off macOS".to_string())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::status_item::{StatusAction, StatusRow};
+            let now_unix = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
+            let mut glance = self.status_glance();
+            self.status_gen = self.status_gen.wrapping_add(1);
+            glance.generation = self.status_gen;
+            let fleet = self.fleet_glance.as_ref().map_or_else(Vec::new, |fleet| {
+                crate::status_item::compose_fleet_menu(&fleet.copy(), now_unix)
+            });
+            let rows = crate::status_item::compose_status_menu(&glance, now_unix);
+            let (label, action) = match crate::status_item::row_at(&rows, &fleet, at) {
+                None => return Err(format!("no row at {at}")),
+                Some(StatusRow::Action {
+                    label,
+                    enabled: false,
+                    ..
+                }) => return Err(format!("disabled {label:?}")),
+                Some(StatusRow::Action { label, action, .. }) => (label.clone(), *action),
+                Some(
+                    StatusRow::Info(_)
+                    | StatusRow::Separator
+                    | StatusRow::Submenu { .. }
+                    | StatusRow::FleetSubmenu { .. },
+                ) => return Err("not an action".to_string()),
+            };
+            let Some(action) = StatusAction::from_tag(action.tag()) else {
+                return Err("not an action".to_string());
+            };
+            self.note_status_painted(Some(glance));
+            if !post(crate::Wake::StatusAction { action }) {
+                return Err("event loop gone".to_string());
+            }
+            Ok(format!("pressed {label:?}"))
         }
     }
 
@@ -4857,6 +4988,8 @@ impl App {
             chrome_titles = std::borrow::Cow::Owned(marked);
         }
         let tooltips = self.tab_tooltips(wid);
+        #[cfg(test)]
+        crate::work_counts::tooltips_pushed(wid, &tooltips);
         let active = self
             .windows
             .get(&wid)
@@ -4930,6 +5063,11 @@ impl App {
                     pill: pill.as_ref(),
                 },
             );
+        }
+        // What was pushed, for a headless `chrome` to print (dev builds).
+        #[cfg(any(test, debug_assertions))]
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.tooltips_pushed = tooltips;
         }
         // Title drift funnels through here (every structural change + each
         // prompt relabel), so this is where the menu-bar status item's window
@@ -5443,7 +5581,7 @@ impl App {
     /// the tab menu and `ctl tab close` on a Settings tab behind moved the selection,
     /// and a looked-at window saw the neighbour's unseen end (the final check of
     /// 2026-10-20, W2).
-    fn close_active_native_tab_keeping(
+    pub(crate) fn close_active_native_tab_keeping(
         &mut self,
         wid: WindowId,
         keep: Option<crate::tab_model::TabId>,

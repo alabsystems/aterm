@@ -13,6 +13,6 @@ pass 100
 see busy
 pass 500
 tx prompt v2
-expect close t1 turn out=superseded at=400
+expect close t1 turn out=superseded @400
 expect open t1 turn src=screen
 expect open t2 turn vref=v2

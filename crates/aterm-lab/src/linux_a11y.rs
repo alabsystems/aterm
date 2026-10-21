@@ -129,7 +129,7 @@ pub const PORTALS_CONF: &str = "[preferred]\ndefault=gtk\n";
 
 /// The scratch `XDG_CONFIG_HOME` the lane's portal reads [`PORTALS_CONF`]
 /// from.
-const PORTAL_CONFIG: &str = "/tmp/aterm-lane-portal-config";
+pub(crate) const PORTAL_CONFIG: &str = "/tmp/aterm-lane-portal-config";
 
 /// One wait for something that must happen: a hang detector, never a budget.
 const HANG_SECS: u32 = 60;
@@ -442,7 +442,12 @@ pub(crate) struct Cell<'a> {
 
 impl Cell<'_> {
     /// `cargo <verb> --locked` on the checkout for this arch, with `env`.
-    fn cargo(&self, env: &[(String, String)], verb: &str, extra: &[&str]) -> Vec<String> {
+    pub(crate) fn cargo(
+        &self,
+        env: &[(String, String)],
+        verb: &str,
+        extra: &[&str],
+    ) -> Vec<String> {
         let mut argv = vec![
             "cargo".to_string(),
             verb.into(),
@@ -664,7 +669,7 @@ pub(crate) fn test_rows(cell: &Cell<'_>, rows: &mut Vec<Row>) -> Result<(), Stop
 /// backend has no display and the portal no configuration, and the portal
 /// then serves no Settings at all (measured 2026-10-19). Returns once the
 /// portal owns its name.
-fn portal_up(up: &Up) -> Result<(), String> {
+pub(crate) fn portal_up(up: &Up) -> Result<(), String> {
     linux::start_display(up, Display::Xvfb)?;
     let dir = format!("{PORTAL_CONFIG}/xdg-desktop-portal");
     let _ = up.sh(&["install".into(), "-d".into(), dir.clone()]);
@@ -825,26 +830,11 @@ fn log_path(gui: &Gui<'_>) -> String {
     format!("{}/home/.local/state/aterm/logs/aterm.log", gui.dir)
 }
 
-/// Send `verb`; its reply when `ok` accepts it.
-fn expect(gui: &Gui<'_>, verb: &[&str], ok: &dyn Fn(&str) -> bool) -> Result<String, String> {
-    let out = gui.ctl(verb);
-    let r = proof::reply(&out.text).to_string();
-    if out.ok() && ok(&r) {
-        Ok(r)
-    } else {
-        Err(format!(
-            "`{}` answered {:?}",
-            verb.join(" "),
-            crate::util::one_line(&r, 200)
-        ))
-    }
-}
-
 /// Type `line`, Enter, and wait for `echo` on the screen.
 fn run_line(gui: &Gui<'_>, line: &str, echo: &str) -> Result<(), String> {
-    expect(gui, &["send", line], &|r| r.starts_with("OK"))?;
-    expect(gui, &["key", "enter"], &|r| r.starts_with("OK"))?;
-    expect(gui, &["await", "match", echo, "timeout=60000"], &|r| {
+    gui.expect(&["send", line], &|r| r.starts_with("OK"))?;
+    gui.expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
+    gui.expect(&["await", "match", echo, "timeout=60000"], &|r| {
         r.starts_with("OK match")
     })
     .map(|_| ())
@@ -1023,7 +1013,7 @@ fn ordeal_run(gui: &Gui<'_>, ordeal: Ordeal, stderr: &str) -> Result<Evidence, S
     if !gui.up.sh(&guest::wait_socket(&gui.sock(), 60)).ok() {
         return Err("the control socket never listened (60 s)".into());
     }
-    expect(gui, &["ready", "60000"], &|r| r.starts_with("OK ready"))?;
+    gui.expect(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
     let log = log_path(gui);
     wait_lines(
         gui,
@@ -1083,8 +1073,8 @@ fn ordeal_run(gui: &Gui<'_>, ordeal: Ordeal, stderr: &str) -> Result<Evidence, S
 /// the bus stopped reading, then end the flood and see its last line drawn
 /// while the daemon is still frozen.
 fn frozen(gui: &Gui<'_>, log: &str) -> Result<(), String> {
-    expect(gui, &["send", FLOOD], &|r| r.starts_with("OK"))?;
-    expect(gui, &["key", "enter"], &|r| r.starts_with("OK"))?;
+    gui.expect(&["send", FLOOD], &|r| r.starts_with("OK"))?;
+    gui.expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
     let said = wait_lines(
         gui,
         log,
@@ -1096,11 +1086,9 @@ fn frozen(gui: &Gui<'_>, log: &str) -> Result<(), String> {
         .up
         .sh(&["touch".into(), format!("{}/home/{FLOOD_STOP}", gui.dir)]);
     said?;
-    expect(
-        gui,
-        &["await", "match", FLOOD_ECHO, "timeout=60000"],
-        &|r| r.starts_with("OK match"),
-    )
+    gui.expect(&["await", "match", FLOOD_ECHO, "timeout=60000"], &|r| {
+        r.starts_with("OK match")
+    })
     .map_err(|why| format!("aterm-gui stopped drawing with the bus frozen: {why}"))?;
     Ok(())
 }
@@ -1495,7 +1483,7 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
     if !up.sh(&guest::wait_socket(&gui.sock(), 60)).ok() {
         return Err("the control socket never listened (60 s)".into());
     }
-    expect(gui, &["ready", "60000"], &|r| r.starts_with("OK ready"))?;
+    gui.expect(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
     wait_lines(
         gui,
         &log_path(gui),
@@ -1622,7 +1610,7 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
             }
         }
     }
-    expect(gui, &["await", "match", ORCA_ECHO, "timeout=60000"], &|r| {
+    gui.expect(&["await", "match", ORCA_ECHO, "timeout=60000"], &|r| {
         r.starts_with("OK match")
     })?;
     if matches!(on, On::MutterWayland(_)) {

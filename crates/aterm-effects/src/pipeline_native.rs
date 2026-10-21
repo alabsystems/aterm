@@ -4,14 +4,12 @@
 //! The native window's side of the effects driver
 //! (`docs/DESIGN-host-boundary-2026-08-30.md`).
 //!
-//! A native window owns one [`EffectsPipeline`] and drives its engines only
-//! through it: the constructor below, the readers and feeds its input path
-//! and status verbs use, and the frame steps its present, composed present
-//! and headless capture run. What stays with the host is what only the host
-//! can know or do — the resolved policy (motion, focus, config, Serious
-//! Mode), the extraction under its terminal lock, the audio sink and the
-//! Kitty Log ledger. The companions are the pipeline's too (Phase 5): the
-//! host feeds them and draws them through the `draw_*` doors.
+//! A native window owns one [`EffectsPipeline`] and drives its engines only through it: the
+//! constructor, the readers and feeds its input path and status verbs use, and the frame steps
+//! its present, composed present and headless capture run. The host keeps what only it can
+//! know or do: the resolved policy (motion, focus, config, Serious Mode), extraction under its
+//! terminal lock, the audio sink and the Kitty Log ledger. The companions are the pipeline's:
+//! the host feeds them and draws them through the `draw_*` doors.
 
 use super::{
     CompanionOwner, ContentScrollDelta, ContentScrollState, CursorFx, CursorFxInput,
@@ -240,7 +238,7 @@ pub struct WordPanes<'a> {
     pub word_focus: bool,
     /// The window's focus, which gates the idle-life one-shots.
     pub window_focused: bool,
-    /// The frame's one companion, in the FOCUSED pane's pixel space.
+    /// The frame's one companion, in the focused pane's pixel space.
     pub companion_at: Option<CompanionOnGlass>,
 }
 
@@ -390,19 +388,18 @@ impl EffectsPipeline {
         (&mut self.companions, &mut self.cursor)
     }
 
-    /// SERIOUS MODE'S DRAIN, the engines' half: the cursor family's light,
-    /// bodies, comet and cadence, the pet's every charge (its identity and
-    /// session latches survive), the flying head, the sing-along and the
-    /// summon detector, every word episode, the rain engine, and
-    /// every channel the frame could still publish. Idempotent — the host
-    /// runs it on every frame while Serious Mode holds, so nothing a hint
-    /// stamped between frames can replay on unmute.
+    /// Serious Mode's drain, the engines' half: the cursor family's light, bodies, comet and
+    /// cadence, the pet's every charge (its identity and session latches survive), the flying
+    /// head, sing-along and summon detector, every word episode, the rain engine, and every
+    /// channel the frame could still publish. Idempotent: the host runs it every frame while
+    /// Serious Mode holds, so nothing stamped between frames replays on unmute.
     pub fn drain_serious(&mut self) {
         self.cursor.glow.reset();
         self.cursor.retire_bodies();
         self.companion.drain();
         self.companions.drain_serious();
         self.decos.hard_reset();
+        self.flying_sky_row = None;
         self.rain = None;
         self.cursor.glow_scratch.clear();
         self.cursor.trail_scratch.clear();
@@ -473,6 +470,9 @@ impl EffectsPipeline {
             ContentScrollDelta::Baseline | ContentScrollDelta::Unchanged => ScrollChange::default(),
             ContentScrollDelta::Translate(translated_rows) => {
                 self.cursor.scroll_translate(translated_rows);
+                self.flying_sky_row = self
+                    .flying_sky_row
+                    .and_then(|r| r.checked_sub(translated_rows));
                 ScrollChange {
                     translated_rows,
                     ..ScrollChange::default()
@@ -480,6 +480,12 @@ impl EffectsPipeline {
             }
             ContentScrollDelta::Bands { first_seq, count } => {
                 self.cursor.scroll_bands(&current, first_seq, count);
+                for i in 0..u64::from(count) {
+                    let m = current.band(first_seq + i);
+                    self.flying_sky_row = self
+                        .flying_sky_row
+                        .and_then(|r| crate::cursor_glow::band_row(r, m.top, m.bottom, m.delta));
+                }
                 ScrollChange {
                     band_moves: count,
                     ..ScrollChange::default()
@@ -487,6 +493,7 @@ impl EffectsPipeline {
             }
             ContentScrollDelta::Invalidate => {
                 self.cursor.scroll_invalidate(now);
+                self.flying_sky_row = None;
                 ScrollChange {
                     invalidated: true,
                     ..ScrollChange::default()
@@ -508,27 +515,22 @@ impl EffectsPipeline {
         self.cursor_scroll_state = state;
     }
 
-    /// THE FRONT TERMINAL WAS REPLACED under this surface — a tab switch, a
-    /// pane-focus move, a session migration: every coordinate, probe and
-    /// stream baseline the engines hold belongs to the OLD grid. The row probe
-    /// and its pending kill hint drop (two terminals never diff into a phantom
-    /// poof) and so does the repaint-blink state; the glow's anchor takes
-    /// Rainbow Kitty's 0.24 s curtain (D-3) and the comet resets, so the new
-    /// caret never reads as a move from the old one; the pet's coordinates
-    /// retire behind its re-sighting crossfade
-    /// ([`CompanionOwner::resight_owner`]) and its probes re-baseline
-    /// silently; the scroll and owner
-    /// baselines are forgotten, so the next frame seeds them without inventing
-    /// a transition; the rain re-baselines its grid-derived state (weather
-    /// and field survive) and PRISM WAKE forgets its arrival token, so the
-    /// switch itself does not answer with a comet. A same-front sync is
-    /// ordinary bookkeeping and does not call this.
+    /// The front terminal was replaced under this surface (tab switch, pane-focus move, session
+    /// migration), so every coordinate, probe and stream baseline belongs to the old grid. The
+    /// row probe, its pending kill hint and the repaint-blink state drop (two terminals never
+    /// diff into a phantom poof); the glow takes Rainbow Kitty's curtain and the comet resets,
+    /// so the new caret never reads as a move; the pet retires behind its re-sighting crossfade
+    /// ([`CompanionOwner::resight_owner`]); the scroll and owner baselines are forgotten; the
+    /// rain re-baselines its grid-derived state and prism wake its arrival token, so the switch
+    /// does not answer with a comet. A same-front sync does not call this.
     pub fn front_replaced(&mut self, now: Instant) {
         self.cursor.glow.drop_row_probe();
         self.cursor.glow.clear_blink();
         self.cursor.trail.clear_blink();
         self.cursor.glow.curtain(now);
         self.cursor.trail.reset();
+        self.decos.rebase_kitty_cursor_placement();
+        self.flying_sky_row = None;
         self.companion.resight_owner();
         self.cursor_scroll_state = None;
         self.cursor_owner_space = None;
@@ -551,21 +553,18 @@ impl EffectsPipeline {
         self.companion.retire_coordinate_space();
     }
 
-    /// [`Self::retire_torn`] for a surface REPLACED under the resident — a
-    /// different focused view: the marks retire alike, and the pet leaves
-    /// through its re-sighting crossfade
+    /// [`Self::retire_torn`] for a surface replaced under the resident (a different focused
+    /// view): the marks retire alike, and the pet leaves through its re-sighting crossfade
     /// ([`CompanionOwner::resight_coordinate_space`]) instead of a cut.
     pub fn resight_torn(&mut self, now: Instant) {
         self.retire_torn_marks(TornBand::Curtain, now);
         self.companion.resight_coordinate_space();
     }
 
-    /// [`Self::retire_torn`] for the SAME surface re-gridded — a resize, a
-    /// font step, a DPI change, a divider drag or a zoom of the view that
-    /// keeps focus: the marks retire alike, but the resident is the same
-    /// terminal's and keeps its body ([`CompanionOwner::rebase_geometry`]).
-    /// Retiring it here blinked the cat on every font step and kept it off
-    /// glass for the whole of a live window drag.
+    /// [`Self::retire_torn`] for the same surface re-gridded (resize, font step, DPI change,
+    /// divider drag, zoom that keeps focus): the marks retire alike, but the resident keeps its
+    /// body ([`CompanionOwner::rebase_geometry`]); retiring it would blink the cat on every
+    /// font step and keep it off glass through a live window drag.
     pub fn regrid_torn(&mut self, now: Instant) {
         self.retire_torn_marks(TornBand::Curtain, now);
         self.companion.rebase_geometry();
@@ -584,18 +583,16 @@ impl EffectsPipeline {
         }
         self.cursor.retire_body_geometry();
         self.decos.rebase_kitty_cursor_placement();
+        self.flying_sky_row = None;
         self.free_scratch.clear();
     }
 
-    /// THE OWNER FENCE, keyed `(terminal identity, alternate screen)`: the
-    /// first observation baselines silently; a change curtains the retained
-    /// light ([`Self::resight_torn`]), forgets the scroll baseline and
-    /// re-baselines the pet's command/content probes so the old stream's
-    /// last completion cannot replay as the new one's news. The resident
-    /// leaves through its re-sighting crossfade
-    /// ([`CompanionOwner::resight_owner`]): launching or quitting a
-    /// full-screen program no longer blinks the cat out for 0.3 s and back
-    /// at another station. Returns whether the owner changed.
+    /// The owner fence, keyed `(terminal identity, alternate screen)`: the first observation
+    /// baselines silently; a change curtains the retained light ([`Self::resight_torn`]),
+    /// forgets the scroll baseline and re-baselines the pet's command/content probes so the old
+    /// stream's last completion cannot replay as the new one's. The resident leaves through its
+    /// re-sighting crossfade ([`CompanionOwner::resight_owner`]) rather than a cut. Returns
+    /// whether the owner changed.
     pub fn fence_owner(&mut self, current: (u64, bool), now: Instant) -> bool {
         let changed = self
             .cursor_owner_space
@@ -735,14 +732,12 @@ impl EffectsPipeline {
             .note_peeks(now, self.decos.drain_peek_cues(), cell);
     }
 
-    /// A composed (split) frame's word pass: one engine over every visible
-    /// pane, so the flash limiter, supernova mutex and sprite atlas stay the
-    /// window's. Each pane binds its parked episodes, takes its presentability,
-    /// freezes or thaws, rescans its snapshot when damaged, and ticks
-    /// pane-local; `drained` receives the engine after each pane's tick (Kitty
-    /// Log sightings, curse cues); the focused pane's peek cues reach the pet;
-    /// then the pane's channels are placed into the window grid and clipped at
-    /// its dividers (owner, 2026-07-28).
+    /// A composed (split) frame's word pass: one engine over every visible pane, so the flash
+    /// limiter, supernova mutex and sprite atlas stay the window's. Each pane binds its parked
+    /// episodes, takes its presentability, freezes or thaws, rescans when damaged and ticks
+    /// pane-local; `drained` receives the engine after each pane's tick (Kitty Log sightings,
+    /// curse cues); the focused pane's peek cues reach the pet; then the pane's channels are
+    /// placed into the window grid and clipped at its dividers.
     pub fn word_panes<'p>(
         &mut self,
         f: &WordPanes<'_>,
@@ -870,11 +865,11 @@ impl EffectsPipeline {
     // doors into the frame's sprite channel, baked by the one word engine's
     // atlas; each route that draws them resolves their policy first.
 
-    /// The resident pet's emission ([`CompanionOwner::emit_on`]), the palette
-    /// sampled over `cells` (the snapshot the pet stands on). A ghost on its
-    /// own glass (`CompanionFrame::glass`) goes straight into the WINDOW's
-    /// channel, in window-grid pixels at its own pane: the pane staging
-    /// channel is placed into the FOCUSED pane, which would crop it away.
+    /// The resident pet's emission ([`CompanionOwner::emit_on`]), the palette sampled over
+    /// `cells` (the snapshot the pet stands on). A ghost on its own glass
+    /// (`CompanionFrame::glass`) goes straight into the window's channel, in window-grid pixels
+    /// at its own pane: the pane staging channel is placed into the focused pane and would crop
+    /// it away.
     pub fn draw_pet(
         &mut self,
         ink: CanvasInk,
@@ -890,16 +885,13 @@ impl EffectsPipeline {
             .emit_on(pet, cells, fallback, &mut self.decos, free, window)
     }
 
-    /// THE FLYING HEAD'S ROUTE (`RAINBOW-KITTY-V2.md` §7.2, D13): the one
-    /// call both render arms make before either companion body is drawn,
-    /// so an impulse minted for a frame reaches the body that frame draws.
-    /// Inert unless Rainbow Kitty v2 owns the frame. When it does:
+    /// The flying head's route (`RAINBOW-KITTY-V2.md` §7.2, D13): the one call both render arms
+    /// make before either companion body is drawn, so an impulse minted for a frame reaches the
+    /// body that frame draws. Inert unless Rainbow Kitty v2 owns the frame. When it does:
     ///
-    /// 1. **The body** ([`companion::body_for`]) restates the host's
-    ///    [`CompanionDuty`]; `body_claimed` is `false` because the
-    ///    animators' own claim still gates the draw one call later.
-    /// 2. **The impulse** is taken EVERY frame whatever the body (a frame
-    ///    with no body drops it, so a meteor minted while nobody was on
+    /// 1. The body ([`companion::body_for`]) restates the host's [`CompanionDuty`];
+    ///    `body_claimed` is `false` because the animators' own claim gates the draw later.
+    /// 2. The impulse is taken every frame whatever the body (so a meteor minted with nobody on
     ///    glass never replays onto the next body) and read for that body
     ///    ([`companion::impulse_for`]):
     ///    * the flying head's horizontal `Fly`: the TELEPORT (the placement
@@ -938,6 +930,7 @@ impl EffectsPipeline {
             self as companion, Body, BodyImpulse, CompanionAdmission, Reaction, SeatQuery,
         };
         if self.cursor.glow.v2_status().is_none() {
+            self.flying_sky_row = None;
             return 0.0;
         }
         let body = companion::body_for(CompanionAdmission {
@@ -955,12 +948,19 @@ impl EffectsPipeline {
         match impulse {
             BodyImpulse::Fly(flight) if !flight.dir.is_vertical() => {
                 self.decos.rebase_kitty_cursor_placement();
+                self.flying_sky_row = None;
                 if animate {
                     cat.on_meteor(flight, now, cat_frame);
                 }
             }
+            BodyImpulse::React(Reaction::Land) if matches!(body, Body::Flying { .. }) => {
+                self.decos.rebase_kitty_cursor_placement();
+                self.flying_sky_row = None;
+            }
             BodyImpulse::React(Reaction::Delight) if matches!(body, Body::Flying { .. }) => {
-                cat.on_delight(now, 1);
+                if cat.on_delight(now, 1) && animate {
+                    cat.refresh_reaction_frame(now, cat_frame);
+                }
             }
             BodyImpulse::Fly(_)
             | BodyImpulse::Perk { .. }
@@ -981,6 +981,7 @@ impl EffectsPipeline {
                     lift: 0.0,
                 })
         else {
+            self.flying_sky_row = None;
             return 0.0;
         };
         let ink = |row: u16, col: u16| -> Option<bool> {
@@ -1094,13 +1095,19 @@ impl EffectsPipeline {
         pane_off: (u16, u16),
         now: Instant,
     ) {
-        let on_glass = self.cursor.glow.v2_status().is_some().then(|| {
-            let mut frame = *pet_frame;
-            frame.row += f32::from(pane_off.0);
-            frame.col += f32::from(pane_off.1);
-            crate::rainbow_kitty::companion::PetOnGlass::of(&frame, geom)
-        });
-        let offer = self.cursor.glow.pet_offer(geom, on_glass.flatten());
+        let on_glass = if self.cursor.glow.v2_status().is_some() && pet_frame.alpha > 0 {
+            if pane_off == (0, 0) {
+                crate::rainbow_kitty::companion::PetOnGlass::of(pet_frame, geom)
+            } else {
+                let mut frame = *pet_frame;
+                frame.row += f32::from(pane_off.0);
+                frame.col += f32::from(pane_off.1);
+                crate::rainbow_kitty::companion::PetOnGlass::of(&frame, geom)
+            }
+        } else {
+            None
+        };
+        let offer = self.cursor.glow.pet_offer(geom, on_glass);
         // Latch, don't act: the brain hands back at most one star, on the paw's
         // landing frame; `catch_star` spends its remaining life and draws
         // nothing.
@@ -1531,17 +1538,11 @@ mod flying_head_tests {
         vec![vec![RenderCell::default(); 120]; 24]
     }
 
-    /// **THE FLYING HEAD IS AT THE LANDING ON FRAME ZERO, AND SQUASHES ON
-    /// ARRIVAL** (§7.2(a)): on the frame the caret teleported the placement
-    /// SNAPS to the landing (no glide from the launch), the spine is floored
-    /// at `disp ≥ 0.97` from a head that had cooled below it, the whip reads
-    /// `lead == −0.30` at `t₀`, the eyes squint through the flight and
-    /// 200 ms past the arrival edge, the squash is booked for `t₀ + T` and
-    /// nothing lands before it, and the frame after the arrival edge is
-    /// squashed. The controls: the same meteor for a head that does not
-    /// animate (the motion policy's still) takes the teleport and none of
-    /// the beats — which is also every frame the router drew before the
-    /// animator had a receiver — and a vertical meteor takes no beat.
+    /// §7.2(a): on the teleport frame the placement snaps to the landing, the spine is floored
+    /// at `disp ≥ 0.97` from a cooled head, the whip reads `lead == −0.30` at `t₀`, the eyes
+    /// squint through the flight and 200 ms past arrival, and the squash lands on `t₀ + T`.
+    /// Controls: a head that does not animate takes the teleport and no beat; a vertical meteor
+    /// takes no beat.
     #[test]
     fn the_flying_head_is_at_the_landing_on_frame_zero_and_squashes_on_arrival() {
         let t0 = Instant::now();
@@ -1653,6 +1654,63 @@ mod flying_head_tests {
             "no squash booked"
         );
 
+        // Under reduced motion (`glow.set_reduced_motion(true)`), `glow` mints
+        // `CompanionImpulse::Land` (`BodyImpulse::React(Reaction::Land)`)
+        // instead of `CompanionImpulse::Meteor`; `route_flying_head` must still
+        // rebase the placement follower and clear sky hysteresis so the head
+        // snaps to the landing rather than gliding across 40 cells.
+        let mut reduced = EffectsPipeline::for_window();
+        let cfg = rainbow_kitty();
+        let mut out = Vec::new();
+        reduced.cursor_mut().glow.set_reduced_motion(true);
+        reduced
+            .cursor_mut()
+            .glow
+            .tick(Some(FROM), t0, &cfg, glow_geom(), &mut out);
+        reduced
+            .companions_mut()
+            .cursor_cat
+            .on_collect(t0, KittyLook::for_app("claude"));
+        reduced
+            .companions_mut()
+            .cursor_cat
+            .set_collection_presentable(t0, true);
+        let launch_frame = reduced.companions_mut().cursor_cat.frame(t0);
+        let launch_pf = reduced.companions().cursor_cat.placement_frame(t0);
+        reduced
+            .decos_mut()
+            .resolve_kitty_cursor_placement(layout(FROM, &launch_frame), launch_pf)
+            .expect("the head is placed at its launch under reduced motion");
+        reduced.flying_sky_row = Some(FROM.0);
+        reduced.cursor_mut().glow.note_navigation(t1);
+        reduced
+            .cursor_mut()
+            .glow
+            .tick(Some(LANDING), t1, &cfg, glow_geom(), &mut out);
+        let mut land_frame = reduced.companions_mut().cursor_cat.frame(t1);
+        reduced.route_flying_head(
+            CompanionDuty::FlyingHead { cell: LANDING },
+            &blank(),
+            t1,
+            GEOM,
+            &mut land_frame,
+            false,
+        );
+        assert_eq!(
+            reduced.flying_sky_row, None,
+            "reduced-motion Land impulse must clear sky hysteresis"
+        );
+        let land_pf = reduced.companions().cursor_cat.placement_frame(t1);
+        let placed_reduced = reduced
+            .decos_mut()
+            .resolve_kitty_cursor_placement(layout(LANDING, &land_frame), land_pf)
+            .expect("the head is placed at its landing under reduced motion");
+        assert_eq!(
+            (placed_reduced.sample.x, placed_reduced.sample.y),
+            (rest.x, rest.y),
+            "reduced-motion Land impulse must teleport to the landing on frame zero"
+        );
+
         // A vertical meteor: no beat either (§7.2(a)'s teleport and whip are
         // along x).
         let down = (FROM.0 + 12, FROM.1);
@@ -1675,5 +1733,62 @@ mod flying_head_tests {
         );
         assert_eq!(frame.pose, unmoved, "no beat for a vertical flight");
         assert_eq!(vertical.companions().cursor_cat.land_at(), None);
+
+        // Sky-seat hysteresis (`flying_sky_row`) clears on a horizontal meteor
+        // teleport, on `sync_scroll` translation/invalidation, and on coordinate fences.
+        let mut sky_fx = fly(t0, t1, (5, 78));
+        sky_fx.flying_sky_row = Some(5);
+        let mut frame = sky_fx.companions_mut().cursor_cat.frame(t1);
+        sky_fx.route_flying_head(
+            CompanionDuty::FlyingHead { cell: (5, 20) },
+            &blank(),
+            t1,
+            GEOM,
+            &mut frame,
+            true,
+        );
+        assert_eq!(
+            sky_fx.flying_sky_row, None,
+            "a horizontal meteor teleport must clear stale same-row sky hysteresis"
+        );
+        sky_fx.flying_sky_row = Some(5);
+        sky_fx.front_replaced(t1);
+        assert_eq!(sky_fx.flying_sky_row, None);
+
+        // `React(Reaction::Delight)` (`CompanionImpulse::Delight`) refreshes
+        // `cat_frame` on frame 0 so the flying head shows `CatReaction::Delight`
+        // and happy eyes immediately rather than lagging by one frame.
+        let t_post_hold = t0 + Duration::from_millis(2_900);
+        sky_fx
+            .companions_mut()
+            .cursor_cat
+            .on_key(t_post_hold - Duration::from_millis(20), true);
+        let mut delight_frame = sky_fx.companions_mut().cursor_cat.frame(t_post_hold);
+        assert_eq!(
+            delight_frame.reaction,
+            crate::kitty_cursor::CatReaction::Cruise
+        );
+        sky_fx
+            .cursor_mut()
+            .glow
+            .earn_hero(t_post_hold, FROM.0, FROM.1);
+        sky_fx.route_flying_head(
+            CompanionDuty::FlyingHead { cell: FROM },
+            &blank(),
+            t_post_hold,
+            GEOM,
+            &mut delight_frame,
+            true,
+        );
+        assert_eq!(
+            delight_frame.reaction,
+            crate::kitty_cursor::CatReaction::Delight,
+            "route_flying_head must refresh cat_frame.reaction on frame 0 of Delight"
+        );
+        assert_eq!(
+            delight_frame.pose.eyes,
+            EyesFrame::Happy,
+            "route_flying_head must refresh cat_frame.pose.eyes on frame 0 of Delight"
+        );
     }
 }

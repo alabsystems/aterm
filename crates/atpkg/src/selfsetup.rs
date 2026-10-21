@@ -86,16 +86,10 @@ const CARRIED_MAN_PAGES: [(&str, &str, &[u8]); 1] =
     [("1", "aterm.1", include_bytes!("../../../man/aterm.1"))];
 /// An aterm bundle's identifier.
 const BUNDLE_ID: &str = "com.aterm.aterm";
-/// How long a binary this did not place gets to answer `--version`, as install.sh's
-/// `VERSION_PROBE_SECS`: one that blocks cannot hang the sweep.
-#[cfg(not(test))]
-const VERSION_PROBE: Duration = Duration::from_secs(5);
-/// Under test the stand-in MUST answer, so the bound is the hang detector, never a
-/// seconds budget a loaded machine can miss.
-#[cfg(test)]
-const VERSION_PROBE: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// A hang detector on a child run to completion (this binary for its completions,
-/// `update-desktop-database`), never a budget.
+/// `update-desktop-database`, a binary this did not place for its `--version`, as
+/// install.sh's `VERIFY_WAIT_SECS`), never a budget: a loaded machine only slows the
+/// answer, and a child of these that never finishes is cut off.
 const CHILD_HANG: Duration = Duration::from_secs(60);
 
 /// Where install.sh lays things for this account: its defaults, or the overrides it was
@@ -330,7 +324,7 @@ fn dir_within(a: &Path, b: &Path) -> bool {
     same_file(&ah, &bh) && at.starts_with(&bt)
 }
 
-/// The first line `exe args…` prints within [`VERSION_PROBE`], or nothing — stdin closed,
+/// The first line `exe args…` prints within `within`, or nothing — stdin closed,
 /// so a binary this did not place cannot swallow anything, nor hang the sweep.
 fn first_line_bounded(exe: &Path, args: &[&str], within: Duration) -> String {
     let mut cmd = aterm_uds::spawnfd::command(exe);
@@ -350,7 +344,7 @@ fn first_line_bounded(exe: &Path, args: &[&str], within: Duration) -> String {
 fn answers_as_aterm(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        && first_line_bounded(path, &["--version"], VERSION_PROBE).starts_with("aterm ")
+        && first_line_bounded(path, &["--version"], CHILD_HANG).starts_with("aterm ")
 }
 
 /// Whether an entry of the store directory is one the store lanes place, judged by what it

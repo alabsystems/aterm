@@ -197,6 +197,9 @@ struct Host {
     row: usize,
     /// How many agent rows stand under the box.
     agents: usize,
+    /// Blank rows under the agent list once it is full: a relayout that lifts
+    /// the box further than the list can grow.
+    tail: usize,
     label: String,
     census: Vec<Census>,
     /// The frame train is stalled: time passes and keys echo, and no tick
@@ -225,6 +228,7 @@ impl Host {
             text: String::new(),
             row: TEXT_ROW,
             agents: AGENTS.len() - 1,
+            tail: 0,
             label: "start".into(),
             census: Vec::new(),
             stalled: false,
@@ -253,6 +257,7 @@ impl Host {
         rows.push("  ⏵⏵ bypass permissions on · 8 shells".to_string());
         rows.push(String::new());
         rows.extend(AGENTS[..self.agents].iter().map(|s| (*s).to_string()));
+        rows.extend(std::iter::repeat_n(String::new(), self.tail));
         let top = self.row - text_i;
         assert!(top >= 1 && top + rows.len() - 1 <= ROWS, "the screen fits");
         let mut s = format!("{SYNC_BEGIN}\x1b[?25l\x1b[H");
@@ -436,9 +441,27 @@ impl Host {
         self.term.process(&bytes);
     }
 
-    fn keyless_relay(&mut self) {
-        self.agents += 1;
-        self.row -= 1;
+    /// A keyless relayout moving the box `rows` rows: up for agents launched together, down
+    /// (`rows` negative) for agents that finished together.
+    fn keyless_relay_rows(&mut self, rows: isize) {
+        for _ in 0..rows {
+            if self.agents < AGENTS.len() {
+                self.agents += 1;
+            } else {
+                self.tail += 1;
+            }
+        }
+        for _ in rows..0 {
+            if self.tail > 0 {
+                self.tail -= 1;
+            } else {
+                self.agents -= 1;
+            }
+        }
+        self.row = self
+            .row
+            .checked_add_signed(-rows)
+            .expect("the box stays on the screen");
         let bytes = self.screen();
         self.term.process(&bytes);
         self.label = "keyless relayout".into();
@@ -662,7 +685,8 @@ fn revived_prefix_survives_backspace_and_keyless_relayout_without_holes_or_drift
     for post_relay_idle_ms in [34, 350, 600] {
         let mut h = Host::new();
         h.type_str(" gaps ");
-        // Pause past `SWOOSH_TOTAL_S` (920 ms) while still inside `RECENT_TYPED_RUN_TTL` (3.2 s).
+        // Pause past the phrase rest (0.9 s) into the swoosh, well inside the chain window
+        // (`CHAIN_GAP_MAX`, 5 s).
         h.idle(1_300);
         h.last_key = h.now;
         // Typo key revives `" gaps "` via `recent_typed_run` in the same frame as `Event::Typed`.
@@ -670,7 +694,7 @@ fn revived_prefix_survives_backspace_and_keyless_relayout_without_holes_or_drift
         h.backspace();
         h.idle(34);
         // Keyless 1-row composer relayout while `key_in_flight` is false (`pc == cc`).
-        h.keyless_relay();
+        h.keyless_relay_rows(1);
         h.idle(post_relay_idle_ms);
         h.last_key = h.now;
         h.type_str("and ");
@@ -690,6 +714,47 @@ fn revived_prefix_survives_backspace_and_keyless_relayout_without_holes_or_drift
         assert!(
             last.holes.is_empty(),
             "idle={post_relay_idle_ms}ms: band after backspace + keyless relayout carries a hole\n{}",
+            h.dump(h.census.len() - 1)
+        );
+    }
+}
+
+/// A prefix a keyless relayout carried revives when the hand resumes. ` gaps` is typed, the hand
+/// pauses past the swoosh so the prefix's cells are gone, a keyless relayout moves the box with
+/// the caret after the text (up one row; up two, three or six, agents launched in one frame; down
+/// two, agents that finished together; none, the control), and ` and ` follows. The remembered
+/// typed run rode its line (`CursorGlow::tick`'s keyless carry of `recent_typed_run`; no lit cell
+/// is left for the follow pass to carry), so the first key joins it and the prefix comes back
+/// with the suffix. RED without the carry (one row), with the carry held to one row (two), and
+/// with it held to the follow pass's two-row offsets (three, six): ` gaps` stays dark beside a
+/// lit ` and `.
+#[test]
+fn a_prefix_a_keyless_relayout_carried_revives_when_the_hand_resumes() {
+    for lift in [0, 1, 2, 3, 6, -2] {
+        let mut h = Host::new();
+        h.type_str(" gaps");
+        // Past the whole swoosh (`SWOOSH_TOTAL_S`, 1.69 s): the prefix's cells are gone.
+        h.idle(2_200);
+        h.keyless_relay_rows(lift);
+        h.idle(100);
+        h.last_key = h.now;
+        h.type_str(" and ");
+        h.idle(17);
+        let last = h.census.last().expect("frames ran");
+        let total = h.text.chars().count();
+        let lit = last.lit.as_bytes()[COL0..COL0 + total]
+            .iter()
+            .filter(|&&b| b == b'#')
+            .count();
+        assert_eq!(
+            lit,
+            total,
+            "lift={lift}: the carried prefix stayed dark beside the new keys\n{}",
+            h.dump(h.census.len() - 1)
+        );
+        assert!(
+            last.holes.is_empty(),
+            "lift={lift}: the revived line carries a hole\n{}",
             h.dump(h.census.len() - 1)
         );
     }

@@ -3,24 +3,20 @@
 
 //! The one-line progress meter a person sees under a typed `aterm pkg` verb.
 //!
-//! A typed install or update printed its first line and then nothing for the minutes a
-//! multi-gigabyte download took. The meter is ONE line on stderr, redrawn about eight
-//! times a second: from the live pass ([`crate::progress::live_snapshot`]) — which
-//! program, what it is doing, the bytes, the rate and a rough time left — or, with no
-//! pass live, a spinner and a sentence ([`Show::Busy`]). [`render_line`] builds the line
-//! and is pure; [`TtyMeter`] owns the thread that draws it.
+//! One line on stderr, redrawn about eight times a second: from the live pass
+//! ([`crate::progress::live_snapshot`]) — which program, what it is doing, the bytes, the rate
+//! and a rough time left — or, with no pass live, a spinner and a sentence ([`Show::Busy`]).
+//! [`render_line`] builds the line and is pure; [`TtyMeter`] owns the thread that draws it.
 //!
-//! It draws only for a person ([`wanted`]): stderr a terminal, `TERM` not `dumb`, on
-//! Unix. A process the window spawns has pipes for stdout and stderr and carries
-//! `--progress-file`, so nothing here ever reaches it, and the meter never writes to
-//! stdout at all.
+//! It draws only for a person ([`wanted`]): stderr a terminal, `TERM` not `dumb`, on Unix. A
+//! process the window spawns has piped stdout and stderr, so nothing here reaches it, and the
+//! meter never writes to stdout.
 //!
-//! Output and meter never share a line. atpkg's `println!` and `eprintln!` are this
-//! module's [`println`] and [`eprintln`] (the macros in `lib.rs`): with no meter live each
-//! is the standard macro, byte for byte and panic for panic; with one live the meter's
-//! line is cleared first and the next tick draws it again below. The line is cleared when
-//! the meter stops — on every return, and on Ctrl-C, whose default action is kept: the
-//! line is cleared, then the signal is raised again.
+//! Output and meter never share a line: atpkg's `println!` and `eprintln!` (the macros in
+//! `lib.rs`) are this module's [`println`] and [`eprintln`] — the standard macro when no meter
+//! is live, else the meter's line is cleared first and the next tick redraws it. The line is
+//! also cleared when the meter stops, on every return and on Ctrl-C, whose default action is
+//! kept (clear, then re-raise).
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -65,10 +61,9 @@ pub(crate) struct Look {
     pub utf8: bool,
 }
 
-/// The program the line features: `focus` if the pass has a row for it, else the one in
-/// a working phase — downloading, checking or unpacking before one only being set up, and
-/// any of those before a download that is in and waits for the pass to reach it
-/// ([`ProgramProgress::downloaded`]).
+/// The program the line features: `focus` if the pass has a row for it, else one that is
+/// moving (downloading, checking or unpacking before setting up), and only then a download
+/// that is in and waits for the pass ([`ProgramProgress::downloaded`]).
 fn featured<'a>(
     file: &'a ProgressFile,
     focus: Option<&str>,
@@ -156,10 +151,10 @@ fn time_left(secs: u64) -> String {
     }
 }
 
-/// The meter's line for `show` — PURE, so every shape is pinned by a test. `rate` is the
-/// download rate in bytes per second, `None` until it has settled ([`Rate`]). The line is
-/// cut to one short of `look.cols`, so it never wraps (a wrapped line is not redrawn in
-/// place). Empty for [`Show::Nothing`].
+/// The meter's line for `show`, pure so every shape is pinned by a test. `rate` is the
+/// download rate in bytes per second, `None` until it has settled ([`Rate`]). The line is cut
+/// to one short of `look.cols`, so it never wraps (a wrapped line is not redrawn in place).
+/// Empty for [`Show::Nothing`].
 pub(crate) fn render_line(show: &Show, rate: Option<f64>, look: &Look) -> String {
     let body = match show {
         Show::Nothing => return String::new(),
@@ -255,10 +250,8 @@ fn pass_body(
             None => (amount, String::new(), String::new()),
         }
     };
-    // THE TIME LEFT SURVIVES A NARROW TERMINAL. What does not fit goes in this order —
-    // the rate, then the pass position — and the bar takes the room the words leave (up
-    // to 16 cells, left out under 4): at 80 columns the cut used to land on "about 2 min
-    // left", the one figure a person waiting reads.
+    // The time left survives a narrow terminal: the rate is dropped first, then the pass
+    // position, and the bar takes the room the words leave (up to 16 cells, none under 4).
     let room = look.cols.max(20) - 1 - 2;
     let words = |position: &str, per_second: &str| {
         [
@@ -312,8 +305,8 @@ pub(crate) struct Rate {
 
 impl Rate {
     /// Record `bytes` (the pass's overall download count) at `now`; the rate in bytes per
-    /// second once bytes have moved for [`RATE_SETTLE`], else `None`. A count that went
-    /// DOWN is a new pass: the window starts again.
+    /// second once bytes have moved for [`RATE_SETTLE`], else `None`. A count that went down is
+    /// a new pass: the window starts again.
     pub(crate) fn note(&mut self, now: Instant, bytes: u64) -> Option<f64> {
         if self.samples.back().is_some_and(|(_, b)| bytes < *b) {
             self.reset();
@@ -706,9 +699,9 @@ mod tests {
         );
     }
 
-    /// A FOCUS names the program a pending stub waits for, whatever else is in flight —
-    /// and never the pass's position or its whole download's time left, which are not
-    /// that program's.
+    /// A focus names the program a pending stub waits for, whatever else is in flight, and
+    /// never shows the pass's position or its whole download's time left, which are not that
+    /// program's.
     #[test]
     fn a_focus_features_its_own_program() {
         let overall = Overall {

@@ -942,7 +942,7 @@ mod tests {
     /// terminal: no character a terminal acts on or reorders text around
     /// (C0, DEL, C1, bidi, U+2028/9) reaches the reply's bytes — each is a
     /// `\uXXXX` escape — and a JSON reader still decodes both fields to exactly
-    /// what the program sent (round fifteen, OUT-2).
+    /// what the program sent.
     #[test]
     fn blocks_json_escapes_what_a_terminal_acts_on_and_decodes_back() {
         let host = MemoryHost::new(0);

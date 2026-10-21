@@ -11,69 +11,38 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
+use super::api::Catalog;
 use super::fetch;
-use super::formula::{Artifact, Cask};
+use super::formula::{Artifact, Cask, version_cmp};
 use super::install::{
     InstallError, InstallLink, check_directory, link_target_points_into, publish_payload,
     same_path_identity,
 };
+use super::machine::Machine;
 use super::prefix::{Kind, Prefix, owned_receipt};
 
-/// The running macOS version, probed with sw_vers. None off macOS or on
-/// any probe failure (callers delegate rather than guess).
-fn macos_version() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = aterm_uds::spawnfd::command("/usr/bin/sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let version = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        super::formula::numeric_macos_version(&version).then_some(version)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-fn arch_name() -> &'static str {
-    match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        other => other,
-    }
-}
-
-/// Whether the running macOS meets a `depends_on macos: ">= X"` floor.
-fn macos_floor_met(floor: &str) -> bool {
-    macos_version()
-        .is_some_and(|v| super::formula::version_cmp(&v, floor) != std::cmp::Ordering::Less)
-}
-
-/// Apply the variation for this machine, when the cask carries any.
+/// Apply the variation for `machine`, when the cask carries any.
 /// The resolved clone drops `variations` so re-resolving is a no-op.
-pub(super) fn resolve(cask: &Cask) -> Result<std::borrow::Cow<'_, Cask>, InstallError> {
-    if cask.unsupported_constraints {
+pub(super) fn resolve<'c>(
+    cask: &'c Cask,
+    machine: &Machine,
+) -> Result<std::borrow::Cow<'c, Cask>, InstallError> {
+    if let Some(what) = cask.unsupported_constraints {
         return Err(InstallError::PassThrough(format!(
-            "cask {} has unsupported constraints",
+            "cask {} has unsupported constraints ({what})",
             cask.token
         )));
     }
     if cask.variations.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(cask));
     }
-    let major = macos_version()
-        .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u64>().ok()))
-        .ok_or_else(|| {
-            InstallError::PassThrough(format!(
-                "cask {} needs Homebrew variation selection",
-                cask.token
-            ))
-        })?;
-    let Some(variation) = cask.variation_for(major, arch_name()) else {
+    if machine.macos_major().is_none() {
+        return Err(InstallError::PassThrough(format!(
+            "cask {} needs Homebrew variation selection",
+            cask.token
+        )));
+    }
+    let Some(variation) = cask.variation_for(machine) else {
         return Ok(std::borrow::Cow::Borrowed(cask));
     };
     if variation.unsupported {
@@ -99,13 +68,19 @@ pub(super) fn resolve(cask: &Cask) -> Result<std::borrow::Cow<'_, Cask>, Install
     Ok(std::borrow::Cow::Owned(resolved))
 }
 
-/// The pre-lock delegation check for one cask: every PassThrough the
-/// install itself would raise before downloading.
-pub(super) fn preflight(prefix: &Prefix, cask: &Cask) -> Result<(), InstallError> {
-    let resolved = resolve(cask)?;
+/// The pre-lock delegation check for one cask on `machine`: every
+/// PassThrough the install itself would raise before downloading.
+pub(super) fn preflight(
+    prefix: &Prefix,
+    cask: &Cask,
+    machine: &Machine,
+) -> Result<(), InstallError> {
+    let resolved = resolve(cask, machine)?;
     let cask: &Cask = &resolved;
     if let Some(floor) = &cask.macos_min
-        && !macos_floor_met(floor)
+        && !machine
+            .macos_version()
+            .is_some_and(|v| version_cmp(v, floor) != std::cmp::Ordering::Less)
     {
         return Err(InstallError::PassThrough(format!(
             "cask {} needs macOS >= {floor}",
@@ -113,7 +88,7 @@ pub(super) fn preflight(prefix: &Prefix, cask: &Cask) -> Result<(), InstallError
         )));
     }
     if let Some(exact) = &cask.macos_exact {
-        let met = macos_version().is_some_and(|v| {
+        let met = machine.macos_version().is_some_and(|v| {
             let bound: Vec<&str> = exact.split('.').collect();
             let here: Vec<&str> = v.split('.').collect();
             here.len() >= bound.len() && here[..bound.len()] == bound[..]
@@ -126,7 +101,7 @@ pub(super) fn preflight(prefix: &Prefix, cask: &Cask) -> Result<(), InstallError
         }
     }
     if let Some(arch) = &cask.arch {
-        let here = arch_name();
+        let here = machine.arch();
         if arch != here {
             return Err(InstallError::PassThrough(format!(
                 "cask {} needs {arch} (this machine is {here})",
@@ -168,22 +143,22 @@ pub(super) fn preflight(prefix: &Prefix, cask: &Cask) -> Result<(), InstallError
 /// (cask deps recursively), so delegation still happens before any
 /// effect — a cask never half-lands and then delegates its dep.
 pub(super) fn preflight_deps(
-    api: &super::api::Api,
+    catalog: &dyn Catalog,
     prefix: &Prefix,
     cask: &Cask,
 ) -> Result<(), InstallError> {
     let mut seen = BTreeSet::new();
-    preflight_deps_inner(api, prefix, cask, &mut seen, 0)
+    preflight_deps_inner(catalog, prefix, cask, &mut seen, 0)
 }
 
 fn preflight_deps_inner(
-    api: &super::api::Api,
+    catalog: &dyn Catalog,
     prefix: &Prefix,
     cask: &Cask,
     seen: &mut BTreeSet<String>,
     depth: usize,
 ) -> Result<(), InstallError> {
-    let resolved = resolve(cask)?;
+    let resolved = resolve(cask, catalog.machine())?;
     let cask: &Cask = &resolved;
     if depth > 8 {
         return Err(InstallError::PassThrough(format!(
@@ -198,16 +173,16 @@ fn preflight_deps_inner(
     };
     for dep in &cask.depends_formula {
         if prefix.installed_one(Kind::Formula, dep).is_none() {
-            super::install::preflight_plan(api, prefix, dep, &dep_opts)?;
+            super::install::preflight_plan(catalog, prefix, dep, &dep_opts)?;
         }
     }
     for dep in &cask.depends_cask {
         if prefix.installed_one(Kind::Cask, dep).is_some() || !seen.insert(dep.clone()) {
             continue;
         }
-        let dc = api.cask(dep).map_err(InstallError::Failed)?;
-        preflight(prefix, &dc)?;
-        preflight_deps_inner(api, prefix, &dc, seen, depth + 1)?;
+        let dc = catalog.cask(dep).map_err(InstallError::Failed)?;
+        preflight(prefix, &dc, catalog.machine())?;
+        preflight_deps_inner(catalog, prefix, &dc, seen, depth + 1)?;
     }
     Ok(())
 }
@@ -227,8 +202,20 @@ pub(super) fn install_with_deps(
     reinstall: bool,
 ) -> Result<String, InstallError> {
     let mut seen = BTreeSet::new();
-    install_deps_inner(api, prefix, cask, dry_run, &mut seen, 0)?;
-    install(prefix, cask, dry_run, force, upgrade, reinstall)
+    let mut possible_progress = false;
+    if let Err(error) = install_deps_inner(
+        api,
+        prefix,
+        cask,
+        dry_run,
+        &mut seen,
+        0,
+        &mut possible_progress,
+    ) {
+        return super::after_native_attempt(&mut possible_progress, Err(error));
+    }
+    let result = install(prefix, cask, dry_run, force, upgrade, reinstall);
+    super::after_native_attempt(&mut possible_progress, result)
 }
 
 fn install_deps_inner(
@@ -238,8 +225,9 @@ fn install_deps_inner(
     dry_run: bool,
     seen: &mut BTreeSet<String>,
     depth: usize,
+    possible_progress: &mut bool,
 ) -> Result<(), InstallError> {
-    let resolved = resolve(cask)?;
+    let resolved = resolve(cask, Machine::this())?;
     let cask: &Cask = &resolved;
     if depth > 8 {
         return Err(InstallError::PassThrough(format!(
@@ -254,7 +242,8 @@ fn install_deps_inner(
     };
     for dep in &cask.depends_formula {
         if prefix.installed_one(Kind::Formula, dep).is_none() {
-            super::install::install(api, prefix, dep, &dep_opts)?;
+            let result = super::install::install(api, prefix, dep, &dep_opts);
+            super::after_native_attempt(possible_progress, result)?;
         }
     }
     for dep in &cask.depends_cask {
@@ -262,8 +251,17 @@ fn install_deps_inner(
             continue;
         }
         let dc = api.cask(dep).map_err(InstallError::Failed)?;
-        install_deps_inner(api, prefix, &dc, dry_run, seen, depth + 1)?;
-        install(prefix, &dc, dry_run, false, false, false)?;
+        install_deps_inner(
+            api,
+            prefix,
+            &dc,
+            dry_run,
+            seen,
+            depth + 1,
+            possible_progress,
+        )?;
+        let result = install(prefix, &dc, dry_run, false, false, false);
+        super::after_native_attempt(possible_progress, result)?;
     }
     Ok(())
 }
@@ -284,9 +282,9 @@ pub fn install(
             cask.token
         )));
     }
-    let resolved = resolve(cask)?;
+    let resolved = resolve(cask, Machine::this())?;
     let cask: &Cask = &resolved;
-    preflight(prefix, cask)?;
+    preflight(prefix, cask, Machine::this())?;
     if cask.deprecated {
         eprintln!("abrew: warning: cask {} is deprecated upstream", cask.token);
     }
@@ -664,27 +662,13 @@ fn wrapper_program(
         }
         return Ok(None);
     }
-    let generic_bases: Vec<(&str, &str)> = cask
-        .artifacts
-        .iter()
-        .filter_map(|artifact| match artifact {
-            Artifact::Generic(source, Some(target)) => Some((target.as_str(), source.as_str())),
-            _ => None,
-        })
-        .collect();
     let relative = if executable.starts_with("$HOMEBREW_PREFIX/") {
-        // A wrapper may exec from inside its own staged Caskroom
-        // tree (`$HOMEBREW_PREFIX/Caskroom/<token>/<version>/...`,
-        // prince): that tree is this cask's payload, so the tail is
-        // payload-relative. Anything else under the prefix must
-        // rebase onto a generic artifact's install tree.
-        rebase_caskroom_source(cask, executable)
-            .or_else(|| rebase_source(&generic_bases, executable))
-            .ok_or_else(|| {
-                InstallError::PassThrough(
-                    "wrapper executable is outside the admitted payload mapping".to_string(),
-                )
-            })?
+        // prince's wrapper execs from its own staged Caskroom tree.
+        rebase_prefix_source(cask, executable).ok_or_else(|| {
+            InstallError::PassThrough(
+                "wrapper executable is outside the admitted payload mapping".to_string(),
+            )
+        })?
     } else {
         executable.to_string()
     };
@@ -856,15 +840,6 @@ fn stage_wrappers(
     Ok(())
 }
 
-/// Rebase a `$HOMEBREW_PREFIX/Caskroom/<token>/<version>/...`
-/// source onto this cask's payload: brew stages the payload in
-/// exactly that tree, and so does abrew.
-fn rebase_caskroom_source(cask: &Cask, name: &str) -> Option<String> {
-    let rest = name.strip_prefix("$HOMEBREW_PREFIX/Caskroom/")?;
-    let own = format!("{}/{}/", cask.token, cask.version);
-    rest.strip_prefix(&own).map(str::to_string)
-}
-
 /// Rebase an `/Applications/<installed>/...` source onto the app
 /// artifact's payload path, when this cask installs that app.
 fn rebase_app_source(app_bases: &[(String, String)], name: &str) -> Option<String> {
@@ -874,20 +849,29 @@ fn rebase_app_source(app_bases: &[(String, String)], name: &str) -> Option<Strin
     Some(format!("{src}/{tail}"))
 }
 
-/// Rebase a `$HOMEBREW_PREFIX/...` source onto the generic artifact
-/// payload tree it names, when one matches.
-fn rebase_source(generic_bases: &[(&str, &str)], name: &str) -> Option<String> {
+/// Rebase a `$HOMEBREW_PREFIX/...` artifact source onto this cask's
+/// payload: its own staged Caskroom tree
+/// (`$HOMEBREW_PREFIX/Caskroom/<token>/<version>/...`: brew stages the
+/// payload in exactly that tree, and so does abrew), or the install tree
+/// of one of its generic artifacts (`$HOMEBREW_PREFIX/share/<x>/.../bin/tool`
+/// sources from that artifact's payload path). Another cask's or version's
+/// tree, and any other prefix path, has no payload mapping.
+fn rebase_prefix_source(cask: &Cask, name: &str) -> Option<String> {
     let rest = name.strip_prefix("$HOMEBREW_PREFIX/")?;
-    for (target, src) in generic_bases {
-        if let Some(tail) = target
+    let own = format!("Caskroom/{}/{}/", cask.token, cask.version);
+    if let Some(tail) = rest.strip_prefix(&own) {
+        return Some(tail.to_string());
+    }
+    cask.artifacts.iter().find_map(|artifact| {
+        let Artifact::Generic(src, Some(target)) = artifact else {
+            return None;
+        };
+        let tail = target
             .strip_prefix("$HOMEBREW_PREFIX/")
             .and_then(|t| rest.strip_prefix(t))
-            .and_then(|t| t.strip_prefix('/'))
-        {
-            return Some(format!("{src}/{tail}"));
-        }
-    }
-    None
+            .and_then(|t| t.strip_prefix('/'))?;
+        Some(format!("{src}/{tail}"))
+    })
 }
 
 /// One single-quoted POSIX shell word.
@@ -914,18 +898,6 @@ fn artifact_paths(
 ) -> Result<Vec<(PathBuf, PathBuf, bool, bool)>, InstallError> {
     let mut paths = Vec::new();
     let mut destinations = BTreeSet::new();
-    // A later artifact may source from inside a generic artifact's
-    // install tree (`$HOMEBREW_PREFIX/share/<x>/.../bin/tool`); rebase
-    // such sources onto that artifact's payload path.
-    let generic_bases: Vec<(&str, &str)> = cask
-        .artifacts
-        .iter()
-        .filter_map(|a| match a {
-            Artifact::Generic(src, Some(target)) => Some((target.as_str(), src.as_str())),
-            _ => None,
-        })
-        .collect();
-    let rebase = |name: &str| rebase_source(&generic_bases, name);
     // A later artifact may also source from inside this cask's own
     // installed app (`/Applications/<App>.app/Contents/...` — brew
     // links such binaries into the installed app; abrew links into
@@ -1091,8 +1063,11 @@ fn artifact_paths(
             }
         };
         let rebased;
+        // An artifact may source from inside the prefix: its own staged
+        // Caskroom tree (android-platform-tools' binaries) or a generic
+        // artifact's install tree.
         let name: &str = if name.starts_with("$HOMEBREW_PREFIX/") {
-            let Some(r) = rebase(name) else {
+            let Some(r) = rebase_prefix_source(cask, name) else {
                 return Err(InstallError::PassThrough(format!(
                     "cask {} artifact sources from an unmapped install tree",
                     cask.token
@@ -1895,6 +1870,45 @@ mod tests {
     }
 
     #[test]
+    fn caskroom_sourced_binary_rebases_onto_own_payload() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        // android-platform-tools' shape: each binary sources from the
+        // cask's own staged Caskroom tree.
+        let mut c = cask("unused.zip".to_string());
+        c.artifacts = vec![Artifact::Binary(
+            "$HOMEBREW_PREFIX/Caskroom/demo/1/platform-tools/adb".to_string(),
+            None,
+        )];
+        let paths = artifact_paths(&prefix, &c).unwrap();
+        assert_eq!(
+            paths,
+            [(
+                PathBuf::from("platform-tools/adb"),
+                prefix.bin().join("adb"),
+                false,
+                true
+            )]
+        );
+        // Another cask's tree, another version's, or an escape from
+        // its own still delegates.
+        for source in [
+            "$HOMEBREW_PREFIX/Caskroom/other/1/platform-tools/adb",
+            "$HOMEBREW_PREFIX/Caskroom/demo/2/platform-tools/adb",
+            "$HOMEBREW_PREFIX/Caskroom/demo/1/../../other/1/adb",
+        ] {
+            c.artifacts = vec![Artifact::Binary(source.to_string(), None)];
+            assert!(
+                matches!(
+                    artifact_paths(&prefix, &c),
+                    Err(InstallError::PassThrough(_))
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn applications_sourced_binary_rebases_onto_the_app_payload() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(&tmp.path().join("prefix"));
@@ -1989,7 +2003,7 @@ mod tests {
         )
         .unwrap();
         let with_deps = Cask::from_api(&with_deps).unwrap();
-        assert!(!with_deps.unsupported_constraints);
+        assert_eq!(with_deps.unsupported_constraints, None);
         assert_eq!(with_deps.depends_formula, ["other"]);
         assert_eq!(with_deps.depends_cask, ["helper"]);
         // Selecting artifacts must not erase an unsupported top-level constraint.
@@ -2000,7 +2014,7 @@ mod tests {
         ] {
             let constrained = aterm_json::from_str(&format!(r#"{{"token":"demo","version":"1","url":"unused.zip","sha256":"no_check",{constraint},"artifacts":[{{"app":["Demo.app"]}}],"variations":{{"arm64_tahoe":{{"artifacts":[{{"app":["Demo.app"]}}]}}}}}}"#)).unwrap();
             let constrained = Cask::from_api(&constrained).unwrap();
-            assert!(constrained.unsupported_constraints);
+            assert!(constrained.unsupported_constraints.is_some());
             assert!(matches!(
                 install(&prefix, &constrained, false, false, false, false),
                 Err(InstallError::PassThrough(_))
@@ -2013,7 +2027,7 @@ mod tests {
         std::fs::write(prefix.cellar(), b"unknown census").unwrap();
         let mut conflicting = self::cask("unused.zip".to_string());
         conflicting.conflicts = vec!["other".to_string()];
-        assert!(preflight(&prefix, &conflicting).is_err());
+        assert!(preflight(&prefix, &conflicting, Machine::this()).is_err());
         assert_eq!(std::fs::read(prefix.cellar()).unwrap(), b"unknown census");
     }
 

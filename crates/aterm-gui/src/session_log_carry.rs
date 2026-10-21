@@ -202,6 +202,9 @@ impl SessionLog {
     #[cfg(any(unix, test))]
     pub(crate) fn carry_source(&mut self) -> SlogCarrySource {
         let now = self.now();
+        // The program's newest state its bucket held is written before the
+        // fence: the successor's bucket starts full and holds none of it.
+        self.flush_program(now);
         // The bus mirror's state first (`session_log_mirror::sync`): a
         // replaced bus log's cursor never crosses, and while the node mirrors
         // the carry numbers the bus class even of a log no take reached.
@@ -315,12 +318,14 @@ impl SessionLog {
     /// THE CARRIED ADOPTION: continue the predecessor's log from its carry
     /// at the next epoch, its seqs above the manifest's count, and its
     /// producers' state as far as each line reads; then [`Self::reconcile`].
-    /// The caller has the uncarried path for an `Err`.
+    /// The handoff mark names the predecessor's `build` when the update said
+    /// it (phase 6, 6F-7). The caller has the uncarried path for an `Err`.
     pub(crate) fn adopt_carried(
         &mut self,
         lines: &[String],
         ids: LogCarry,
         seq: u64,
+        build: Option<u64>,
         at: Stamp,
     ) -> Result<CarryStats, CarryError> {
         let a = CarryAdopt {
@@ -330,7 +335,7 @@ impl SessionLog {
             limits: super::ring_limits(),
             at,
         };
-        let (log, host, stats) = Log::from_carry(lines, a)?;
+        let (log, host, stats) = Log::from_carry_built(lines, a, build)?;
         // A carried successor's epoch is its predecessor's plus one (ruling
         // U1), held without being issued: every later issue is above it.
         self.epochs.note(log.ep());
@@ -519,7 +524,7 @@ impl SessionLog {
         let open: Vec<Node> = self.log.open_nodes().iter().map(|e| e.node).collect();
         for n in open.into_iter().rev() {
             if self.log.is_open(n) && !holds(&self.log, n) {
-                let _ = self.log.close(
+                let _ = self.close_node(
                     n,
                     Close::new(Out::gone(n.lvl), Src::Aterm, Conf::Exact).by(Actor::Aterm),
                     at,

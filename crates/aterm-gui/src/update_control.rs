@@ -162,8 +162,8 @@ impl Snapshot {
     }
 }
 
-/// The worker observes source AND policy together; this also services the final
-/// pre-replacement recheck after a potentially long download/probe.
+/// The worker reads source and policy together; this also serves the final pre-replacement
+/// recheck after a long download or probe.
 pub(crate) fn check_settings_provider(
     proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 ) -> aterm_update::CheckSettingsProvider {
@@ -203,10 +203,9 @@ fn admit_check_settings(
     Some(live)
 }
 
-/// Every completion refreshes the GUI, including errors, retirement and an
-/// installed-only activation. A newer downloaded stage uses the background
-/// check's existing hint. The reducer re-reads and validates durable facts before
-/// arming anything; these notifications carry no apply authority.
+/// Every completion refreshes the GUI, including errors, retirement and an installed-only
+/// activation. The reducer re-reads and validates durable facts before arming anything; these
+/// wakes carry no apply authority.
 pub(crate) fn announce_stage(status: &aterm_update::UpdateStatus, send: impl FnOnce(Wake)) {
     if status.enabled
         && let Some(build) = status.staged_build.filter(|b| *b > status.current_build)
@@ -268,8 +267,7 @@ mod tests {
     use super::*;
 
     fn status() -> aterm_update::UpdateStatus {
-        // No filesystem/global environment mutation: this value is the updater's
-        // public wire input, with all unrelated fields at their test defaults.
+        // The updater's wire input; no filesystem or environment mutation.
         aterm_update::UpdateStatus {
             enabled: true,
             installable: true,

@@ -1,35 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A BUILD THAT FAILED TO START, AS A FACT ABOUT THE BUILD (handoff §4, round
-//! eighteen's upgradebuild lane). A Claude Code relaunch onto a build that
-//! never registered the conversation (`no-resume`, [`St::failed_start`]) was
-//! the CONVERSATION's failure alone ([`St::keep_stop`]): an agent of any
-//! other conversation — a person's hand resume as ANOTHER conversation
-//! (`claude` with no `--resume`, a new session id), any other tab's agent —
-//! was moved onto that very build at its next quiet moment, ended, and left
-//! stopped; and the conversation's own round, its rest run out, was moved
-//! onto it again: "a build that still crashes is tried once per rest and
-//! each try stops again". Each such move kills a working agent.
+//! A build that failed to start, noted against the build.
 //!
-//! So the failure is noted against the BUILD too — its version, in its
-//! install — by the one writer of every record ([`save_at`]: every stop of
-//! either lane is saved through it, so no step can forget it), in
-//! `<state>/upgrade/build-starts/<install>-<version>.json` ([`Note`]). Before
-//! any agent is moved onto a build with a failure noted ([`starts`]: the
-//! upgrade's own move, at its act — announce, restart, fresh restart — and a
-//! relaunch on exit, as a target it may take), the build is PROVED TO START
-//! WITHOUT AN AGENT: `<build> --help` ([`probe`]), bounded as a
-//! `--version` read is ([`VERSION_WAIT`]) and run through
-//! `aterm_uds::spawnfd::command`. `--version` is no proof: Claude Code
-//! answers it before it loads its program (the lab's crashing stand-in, and
-//! a build broken past its entry point, answer it and exit at any other
-//! launch), while `--help` builds its whole command line; MEASURED on 2.1.300
-//! (2026-10-15): exit 0 in 0.09 s, no file written in a scratch `HOME` or
-//! the directory it ran in, with the network denied. Until a probe run since
-//! the build's latest failure passes, no agent is moved onto it (the move
-//! waits `wait:build-fails`, [`BUILD_FAILS`]); a failing probe is run again
-//! no sooner than [`PROBE_GAP_S`] after the last.
+//! A relaunch onto a build that never registered the conversation (`no-resume`,
+//! [`St::failed_start`]) is a failure of the build, not only of that conversation: without the
+//! note, every other agent would be moved onto it at its next quiet moment and left stopped. The
+//! one writer of every record (`save_at`) notes it in
+//! `<state>/upgrade/build-starts/<install>-<version>.json` ([`Note`]).
 //!
 //! A PROBE THAT PASSED AND A MOVE THAT STILL FAILED: the probe does not see
 //! what fails (a crash in the interface, a resume the build refuses), so it
@@ -46,11 +24,10 @@
 //! relaunched once on that line, in the same shell, resuming the same
 //! conversation on the build it ran.
 //!
-//! A STOP TAKEN BACK IS NO FAILURE ([`note`]): a relaunch stopped
-//! `no-resume` whose agent came up after all (a start slower than the stale
-//! bound, a start-up screen a person answered) is reopened as landed
-//! ([`St::reopen_landed`]), and its failure is taken back from its build —
-//! the blindness it caused with it.
+//! A move that fails after a passing probe makes the build [`Note::blind`]: the probe does not
+//! see what fails, so no agent is moved onto it again, except one the owner names with `--now`,
+//! which is probed once more ([`starts_with`]). The owner is told once per build
+//! (`upgrade_status`'s `build-fails` fault).
 //!
 //! A CRASHED AGENT IS MOVED ONLY ONTO A BUILD PROVED TO START ([`proved`],
 //! LC-5 of ATERM-KI-1015-1): the relaunch on exit — a crash is also an
@@ -98,27 +75,23 @@ use aterm_json::{Map, Value};
 use super::{FailedStart, Opts, Report, St, VERSION_WAIT, ledger, said, state_dir};
 use crate::harness::upgrade::{Candidate, Phase};
 
-/// The wait a move onto a build that failed to start, not proved to start
-/// since, records (`wait:build-fails`): the reducer's own word
+/// The wait of a move onto a build that failed to start and is not proved since
 /// ([`crate::harness::upgrade::build_hold`]).
 pub use crate::harness::upgrade::BUILD_FAILS;
 
-/// How long after a probe that did not pass the same build is probed again.
-/// The build is a file that does not change, so this is for a failure of the
-/// moment (a probe out of time on a loaded machine), never a retry into an
-/// agent.
+/// How long after a failed probe the same build is probed again: the build does not change, so
+/// this covers a failure of the moment (a probe out of time on a loaded machine).
 pub const PROBE_GAP_S: u64 = 15 * 60;
 
 /// How many failures one note remembers by their record ([`Note::stops`]),
 /// newest last: enough to tell a record saved again from a new failure.
 const STOPS_KEPT: usize = 16;
 
-/// The argument a start probe passes: what loads the build's program
-/// without starting a session (the module's docs).
+/// What loads the build's program without starting a session (see the module docs).
 const PROBE_ARG: &str = "--help";
 
-/// WHAT IS KNOWN OF ONE BUILD'S START: the failures noted against it, the
-/// probes run since, and whether a probe can still prove anything of it.
+/// What is known of one build's start: the failures noted against it, the probes run since, and
+/// whether a probe can still prove anything of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Note {
     /// The build's version, as its stop's record names it.
@@ -132,14 +105,13 @@ pub struct Note {
     /// The failures noted, as `<conversation> <its stop's failed_at>`,
     /// newest last: a record saved again is no new failure.
     pub stops: Vec<String>,
-    /// [`Note::failures`] when a probe last ran, and when (`0`: none).
+    /// [`Note::failures`] when a probe last ran (`0`: none).
     pub probed_for: u32,
     /// When the last probe ran (unix seconds; `0`: none).
     pub probed_at: u64,
     /// What it found ([`Probe::word`]).
     pub probe: String,
-    /// [`Note::failures`] when a probe last passed (`0`: none passed), and
-    /// when.
+    /// [`Note::failures`] when a probe last passed (`0`: none passed).
     pub proved_for: u32,
     /// When a probe last passed (unix seconds; `0`: never).
     pub proved_at: u64,
@@ -276,10 +248,9 @@ fn write(opts: &Opts, note: &Note) {
     }
 }
 
-/// WHAT `session`'s RECORD, SAVED AT `now` OVER `before` (the record on
-/// disk), SAYS OF ITS BUILD'S START — by [`save_at`], the one writer every
-/// stop and every reopening is saved through: the failure it carries
-/// ([`note_failure`]), or a stop it takes back ([`taken_back`]).
+/// What `session`'s record, saved at `now` over `before` (the record on disk), says of its build's
+/// start: a failure it carries ([`note_failure`]) or a stop it takes back ([`taken_back`]). Called
+/// by `save_at`, the one writer of every record.
 pub fn note(opts: &Opts, session: &str, before: Option<&St>, st: &St, now: u64) {
     if let Some(failed) = before.and_then(|before| taken_back(before, st)) {
         retract(opts, session, &failed, st);
@@ -287,23 +258,19 @@ pub fn note(opts: &Opts, session: &str, before: Option<&St>, st: &St, now: u64) 
     note_failure(opts, session, st, now);
 }
 
-/// The failure `before` noted that `st` TAKES BACK: a stop `no-resume` of
-/// its own ([`St::failed_start`], not one it keeps) reopened as the relaunch
-/// that landed after all ([`St::reopen_landed`]: the one step from that stop
-/// to [`Phase::Relaunched`]) — the new process held the conversation, so the
-/// build did start. A re-armed round (pending) still carries the failure:
-/// it rested on it.
+/// The failure `before` noted that `st` takes back: its own `no-resume` stop
+/// ([`St::failed_start`], not a kept one) reopened as a relaunch that landed after all
+/// ([`St::reopen_landed`], to [`Phase::Relaunched`]), so the build did start. A re-armed round
+/// still carries the failure.
 fn taken_back(before: &St, st: &St) -> Option<FailedStart> {
     let failed = before.failed_start()?;
     let own = matches!(&before.phase, Phase::Failed(why) if why == "no-resume");
     (own && matches!(st.phase, Phase::Relaunched { .. }) && st.to == failed.to).then_some(failed)
 }
 
-/// [`taken_back`]'s failure, `session`'s, retracted from its build's note
-/// as `st` saves it: no longer counted, and the blindness it caused lifted
-/// ([`Note::blinded_by`]); a probe that proved the build since every failure
-/// noted proves it since every one left. Said once on the ledger
-/// (`build-probe:taken-back`).
+/// Withdraws [`taken_back`]'s failure from its build's note: no longer counted, the blindness it
+/// caused lifted ([`Note::blinded_by`]), and a probe that covered every failure still covers every
+/// one left. Said once on the ledger (`build-probe:taken-back`).
 fn retract(opts: &Opts, session: &str, failed: &FailedStart, st: &St) {
     let Some(mut note) = load(opts, &failed.source, &failed.to) else {
         return;
@@ -349,13 +316,10 @@ fn retract(opts: &Opts, session: &str, failed: &FailedStart, st: &St) {
     );
 }
 
-/// THE FAILURE A RECORD SAVED AT `now` CARRIES, NOTED AGAINST ITS BUILD
-/// ([`St::failed_start`]): `session`'s record, saved by [`save_at`], the one
-/// writer. Once per failure ([`Note::stops`]): a record saved again, a new
-/// process of the conversation that keeps the stop ([`St::keep_stop`]) and a
-/// restart's record that carries it ([`St::kept_by_restart`]) are the same
-/// failure. A failure of a move made after a probe had proved the build to
-/// start ([`St::relaunched_at`] at or past [`Note::proved_at`]) makes the
+/// Notes the failure `session`'s record carries ([`St::failed_start`]) against its build, once
+/// per failure ([`Note::stops`]): a record saved again, a new process that keeps the stop
+/// ([`St::keep_stop`]) and a restart's record carrying it ([`St::kept_by_restart`]) are the same
+/// failure. A failure of a move made at or after a passing probe ([`Note::proved_at`]) makes the
 /// note [`Note::blind`].
 fn note_failure(opts: &Opts, session: &str, st: &St, now: u64) {
     let Some(failed) = st.failed_start() else {
@@ -697,10 +661,8 @@ impl Probe {
     }
 }
 
-/// `<exe> --help` ([`PROBE_ARG`]), bounded by [`VERSION_WAIT`] — the child
-/// in its own process group, killed whole at the bound, its output
-/// discarded — through `aterm_uds::spawnfd::command`, which strips inherited
-/// descriptors and keeps a console window off screen on Windows.
+/// `<exe> --help` ([`PROBE_ARG`]), bounded by [`VERSION_WAIT`], output discarded, in its own
+/// process group, killed whole at the bound.
 #[must_use]
 pub fn probe(exe: &Path) -> Probe {
     probe_within(exe, VERSION_WAIT)
@@ -736,9 +698,8 @@ pub(super) fn probe_within(exe: &Path, limit: Duration) -> Probe {
             _ => {
                 #[cfg(unix)]
                 if let Some(group) = group {
-                    // SAFETY: a signal to the process group this spawn made
-                    // (`process_group(0)`: its pgid is the child's pid), sent
-                    // before the child is reaped, so the id is still its.
+                    // SAFETY: the group this spawn made (`process_group(0)`: pgid is the child's
+                    // pid), signalled before the child is reaped, so the id is still its.
                     unsafe { libc::kill(-group, libc::SIGKILL) };
                 }
                 let _ = child.kill();

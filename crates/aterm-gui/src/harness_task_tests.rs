@@ -766,6 +766,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         said_cut: false,
         turn_said: None,
         opened_by: None,
+        message_drawn: true,
         worked,
         rules: None,
         pending_input: false,
@@ -781,6 +782,8 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         auto_continue: None,
         since_limit: None,
         served_in_transcript: false,
+        chosen_in_transcript: None,
+        conversation: aterm_agent::supervise::policy::turn_end::Conversation::Hostless,
         reset_clock: None,
         program: aterm_phase::Program::Claude,
         account: None,
@@ -901,26 +904,49 @@ fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs()
 }
 
 /// THE FACE A PROVEN SELF-CLAIM'S ACT TELLS (FOREVER LAND §10.4): its landing
-/// `landed@v1` is `landed`, recorded by `meta set harness_act` alone; every
-/// other act it records — a continuation, a land act, an older build's
-/// `finished@v1` token act — reopens the work. NEGATIVE CONTROLS: an unset, a
-/// set with no act or two acts, and every other meta line tell no face.
+/// `landed@v1` is `landed`, recorded by `meta set harness_act` alone; a point
+/// it left to a person's own exchange (`left-to-person@v1`, aterm's own
+/// loop's `LEFT` rule, recorded and never typed) is `theirs`; its re-exec
+/// onto a new build (`upgrade@v1`, which carries a landing across) tells
+/// none; every other act it records — a continuation, a land act, a resume
+/// after a wall, an older build's `finished@v1` token act — reopens the work.
+/// NEGATIVE CONTROLS: an unset, a set with no act or two acts, and every
+/// other meta line tell no face; the person's rule at another version or
+/// unversioned is an act like any other.
 #[test]
 fn a_self_claims_landing_act_is_landed_and_every_other_act_is_open() {
     use crate::harness_task::{SELF_CLAIM_LANDED, self_claim_act_face};
-    assert_eq!(self_claim_act_face(SELF_CLAIM_LANDED), TaskFace::Landed);
+    assert_eq!(
+        self_claim_act_face(SELF_CLAIM_LANDED),
+        Some(TaskFace::Landed)
+    );
+    assert_eq!(
+        self_claim_act_face("left-to-person@v1"),
+        Some(TaskFace::Theirs)
+    );
+    assert_eq!(self_claim_act_face("upgrade@v1"), None);
     for act in [
         "continue@v1",
         "land@v1",
+        "usage-resume@v1",
+        "approve-all@v1",
         "finished@v1",
         "landed@v2",
         "landed",
+        "upgrade@v2",
+        "left-to-person@v2",
+        "left-to-person",
     ] {
-        assert_eq!(self_claim_act_face(act), TaskFace::Open, "{act}");
+        assert_eq!(self_claim_act_face(act), Some(TaskFace::Open), "{act}");
     }
     let face = crate::control::harness_act_face;
     assert_eq!(face("set harness_act landed@v1"), Some(TaskFace::Landed));
+    assert_eq!(
+        face("set harness_act left-to-person@v1"),
+        Some(TaskFace::Theirs)
+    );
     assert_eq!(face("set  harness_act   continue@v1"), Some(TaskFace::Open));
+    assert_eq!(face("set harness_act upgrade@v1"), None);
     for rest in [
         "unset harness_act",
         "set harness_act",
@@ -1011,6 +1037,10 @@ fn the_status_sweep_reopens_a_proven_self_claims_landing_at_a_later_turn() {
         }
     };
     sweep(&mut app, false);
+    ctx.timeline
+        .lock()
+        .unwrap()
+        .queue_self_task(TaskFace::Landed);
     app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
     assert_eq!(face(&app), Some(TaskFace::Landed));
     // NEGATIVE CONTROL: nobody's turn — Claude Code idle at its prompt.
@@ -1124,6 +1154,10 @@ fn a_proven_self_claims_landing_shows_and_anyones_later_turn_reopens_it() {
     let ctx = app.pool.get(0).unwrap().ctx.clone();
     let face = |app: &App| app.chip_glass(0).task;
     // NEGATIVE CONTROL: no proven claim — the act tells nothing.
+    ctx.timeline
+        .lock()
+        .unwrap()
+        .queue_self_task(TaskFace::Landed);
     app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
     assert_eq!(face(&app), None, "no proven self-claim, no face");
     crate::session_timeline::claim_supervisor_as(
@@ -1139,8 +1173,16 @@ fn a_proven_self_claims_landing_shows_and_anyones_later_turn_reopens_it() {
     assert!(app.beside_proven_self_claim(0));
     tell(&mut app, &sid, Some(TaskFace::Theirs));
     assert_eq!(face(&app), None, "the hosted loop tells no face beside it");
+    ctx.timeline
+        .lock()
+        .unwrap()
+        .queue_self_task(TaskFace::Landed);
     app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
     assert_eq!(face(&app), Some(TaskFace::Landed));
+    ctx.timeline
+        .lock()
+        .unwrap()
+        .queue_self_task(TaskFace::Landed);
     app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
     assert_eq!(
         landing_records(&app, &sid).len(),
@@ -1209,7 +1251,12 @@ fn a_proven_self_claims_landing_counts_only_under_land() {
         )
         .expect("a proof takes a free session");
         assert!(app.beside_proven_self_claim(0));
+        ctx.timeline.lock().unwrap().queue_self_task(TaskFace::Open);
         app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Open));
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .queue_self_task(TaskFace::Landed);
         app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
         let face = app.chip_glass(0).task;
         let records = landing_records(&app, &sid).len();

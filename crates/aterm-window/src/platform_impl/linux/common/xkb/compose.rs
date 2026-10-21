@@ -98,13 +98,6 @@ impl XkbComposeState {
     }
 
     #[inline]
-    pub fn reset(&mut self) {
-        unsafe {
-            (xkbch().state_reset)(self.state.as_ptr());
-        }
-    }
-
-    #[inline]
     pub fn status(&mut self) -> ComposeStatusCode {
         unsafe { (xkbch().state_get_status)(self.state.as_ptr()) }
     }

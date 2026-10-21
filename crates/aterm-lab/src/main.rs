@@ -230,23 +230,45 @@
 //!   [`input_sources`]) and presses Option chords in it as key presses,
 //!   judging the bytes its program reads against what each layout types
 //!   ([`meta_keys`]);
+//! * `predict-live --window` opens ONE window at a time and types the
+//!   predictive-editing corpus into a zsh or bash behind `link` (a real
+//!   round trip), in the single pane and then a split pane, holding every
+//!   frame that painted a prediction to the screen the far end's own output
+//!   settles to ([`predict_live`]); `--headless` runs the press path alone;
 //! * `codex-alab-proof` proves the codex-alab native harness end to end on
 //!   the real package ([`codex_alab_proof`], its jail, fake model and
-//!   stand-ins in [`codex_rig`]): the proven claim and the parked lane,
-//!   continue and the done stop, an approval, the question overlay, a usage
-//!   wait, two crash relaunches, the re-exec upgrade, a hold, and Autopilot
-//!   Off (the claim given back, a manager's `post kind=task` alone over the
-//!   lab's own bus, the claim again once On); about four minutes.
+//!   stand-ins in [`codex_rig`], its scripted model in [`codex_alab_model`]):
+//!   the proven claim and the parked lane, FOREVER CRUISE (a done claim, the
+//!   retired token's included, gets the defend prompt and work goes on),
+//!   FOREVER LAND (the instruction, unbounded nudges, a landing only at a
+//!   clean defense over a clean folder, then quiet, reopened by a person's
+//!   turn; a dirty repository not landed until pushed), NEEDS YOU (raised at
+//!   once, never blocking), an approval, the question overlay and Land's
+//!   answer, a usage wait, two crash relaunches and a carry-on, the re-exec
+//!   upgrade, a hold, Autopilot Off (the claim given back, a manager's
+//!   `post kind=task` alone over the lab's own bus, the claim again once On),
+//!   and a person's own exchange (typed through aterm's development seam
+//!   `send|key as=person`) left to them beside a control write's turn that is
+//!   continued; about eleven minutes.
 //!
 //! One verb runs aterm on Linux: `linux` ([`linux`]) is the Linux
 //! runtime lane, a lima VM on this Mac with Xvfb, weston, Mutter, Xwayland,
 //! a session bus and at-spi2-core, in which [`linux_proof`] runs this
 //! checkout's Linux tests on aarch64 and on x86_64 under Rosetta and drives
 //! a Linux aterm over its control socket (`docs/LINUX-RUNTIME-LANE.md`).
+//! And `windows` ([`windows`]) is the Windows runtime lane, a QEMU VM on this
+//! Mac running Windows 11 on arm64, in which this checkout builds and tests
+//! with MSVC on aarch64 and on x86_64 under Prism
+//! (`docs/WINDOWS-RUNTIME-LANE.md`).
+//!
+//! `abrew-admission` starts none either: it runs abrew's own admission over
+//! Homebrew's full formula and cask indexes ([`abrew_admission`]), the dated
+//! totals of `docs/DESIGN-abrew-2026-10-19.md` §3.
 //!
 //! And `ptyrec` starts none: it runs a program behind a PTY in the caller's
 //! own terminal and keeps a take of every byte both ways, the recordings
-//! aterm-effects replays ([`relay`], whose loop it is).
+//! aterm-effects replays ([`relay`], whose loop it is). `link` is that relay
+//! with a round trip, each chunk held half of it each way ([`link`]).
 //!
 //! Verified by: `targo --unverified test -p aterm-lab` (the stub served on
 //! loopback, the jail renderer, the readers, the judges, on typed data; the
@@ -265,11 +287,15 @@
 #![deny(unsafe_code)]
 
 #[cfg(target_os = "macos")]
+mod abrew_admission;
+#[cfg(target_os = "macos")]
 mod band;
 #[cfg(target_os = "macos")]
 mod clock;
 #[cfg(target_os = "macos")]
 mod codex;
+#[cfg(target_os = "macos")]
+mod codex_alab_model;
 #[cfg(target_os = "macos")]
 mod codex_alab_proof;
 #[cfg(target_os = "macos")]
@@ -311,6 +337,8 @@ mod jail;
 #[cfg(target_os = "macos")]
 mod lab;
 #[cfg(target_os = "macos")]
+mod link;
+#[cfg(target_os = "macos")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod linux_a11y;
@@ -319,11 +347,15 @@ mod linux_baseline;
 #[cfg(target_os = "macos")]
 mod linux_browser;
 #[cfg(target_os = "macos")]
+mod linux_edges;
+#[cfg(target_os = "macos")]
 mod linux_gone;
 #[cfg(target_os = "macos")]
 mod linux_guest;
 #[cfg(target_os = "macos")]
 mod linux_proof;
+#[cfg(target_os = "macos")]
+mod linux_xwire;
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "macos")]
@@ -338,6 +370,8 @@ mod muse_proof;
 mod nudge;
 #[cfg(target_os = "macos")]
 mod paths;
+#[cfg(target_os = "macos")]
+mod predict_live;
 #[cfg(target_os = "macos")]
 mod presence;
 #[cfg(target_os = "macos")]
@@ -366,6 +400,8 @@ mod relaunch_gemini;
 mod relaunch_muse;
 #[cfg(target_os = "macos")]
 mod relay;
+#[cfg(target_os = "macos")]
+mod resource_attribution;
 #[cfg(target_os = "macos")]
 mod restore;
 #[cfg(target_os = "macos")]
@@ -407,6 +443,16 @@ mod upgrade_muse;
 mod util;
 #[cfg(target_os = "macos")]
 mod verbs;
+#[cfg(target_os = "macos")]
+mod windows;
+#[cfg(target_os = "macos")]
+mod windows_desk;
+#[cfg(target_os = "macos")]
+mod windows_guest;
+#[cfg(target_os = "macos")]
+mod windows_smoke;
+#[cfg(target_os = "macos")]
+mod windows_window;
 #[cfg(target_os = "macos")]
 mod workers;
 
@@ -521,7 +567,9 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  unified-limit headers, CLAIM five_hour|seven_day|...) that resets SECONDS from now, then
                                  lifts; Claude Code draws the wall only when launched with `claude TAG --subscriber`; Codex
                                  gets its own usage_limit_reached body (PLAN: its plan_type) with the claim's window at 100%
-                                 in its x-codex-* headers
+                                 in its x-codex-* headers; Gemini CLI and agy get a 429 RESOURCE_EXHAUSTED, the key's spent
+                                 per-day quota, or under CLAIM code_assist a Google account's spent quota (QUOTA_EXHAUSTED,
+                                 its reset in RetryInfo), on which Gemini CLI draws its usage-limit dialog
   tool [tag] '<json>'            the stub's tool mode, scripted: {\"name\":\"Bash\",\"input\":{\"command\":\"touch x\"}} or a list of
                                  calls (\"@PROJ@\" = the project dir, \"@PORT@\" = the stub's); then `turn TAG toolstart` calls it
                                  (Gemini CLI and agy: the input is the call's args, {\"name\":\"run_shell_command\",...};
@@ -556,6 +604,11 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  table-only / build-only per model id; exit 1 when a row differs. Then its OpenAI rows
                                  against the Codex build's model catalog, by id (a Codex build carries no price): priced /
                                  unpriced / table-only. A check: the table is never filled from either
+  abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
+                                 abrew's own admission (the pre-lock check of every native install) over formulae.brew.sh's
+                                 formula.json and cask.json (fetched now, or DIR's) for the newest Mac abrew can name, or the
+                                 one modelled or this one: formulae admitted solo and with their runtime closure, casks
+                                 admitted, and the ten most common refusals of each (--json: the whole census)
   wait [tag] <egrep> [secs]      until a row of the screen matches (60 s by default; `await match`); exit 1 when none did
   ps [tag]                       the lab's pids; with no tag, EVERY lab that has a run directory (a forgotten one too)
   journal [tag]                  the harness journal+ledger
@@ -600,7 +653,7 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  step=done:landing past the waits and busy:another-sweep). A hold or Land the live
                                  instance's journal never carries on the tab within 30 s fails the run before aterm ends
                                  (1); a tab under Land before --land or --land-open sets it cannot run (3).
-  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both] [tag] [--keep]   FOREVER LAND and FOREVER
+  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid] [--chains a,b] [--no-surfaces] [tag] [--keep]   FOREVER LAND and FOREVER
                                  CRUISE live on a supervised harness: the real TUI on a lab of its own (all: one after
                                  another, <tag>-<harness>), a tab per scenario chain, each in a scratch git repository
                                  pushed to a local bare origin and left as the chain says, its Autopilot set, the stub
@@ -613,10 +666,42 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  through its next step; L6 a reply taller than the window, NEEDS YOU on top, the defense
                                  at the bottom: not landed, carried on; L7 a worker's task landed: its record done
                                  why=landed), Cruise (C1 a done claim: continue-done-check@v1; C2 its defense read: never
-                                 DONE, the next point continues) and the Off control (no supervisor, nothing typed 270 s
-                                 after a done reply), each judged from the journal, ledger, status, meta, task record and
-                                 the stub's dumps (~15-30 min a harness); exit 0 every scenario PASS, 1 one FAIL or
-                                 UNOBSERVED, 2 usage, 3 could not run
+                                 DONE, the next point continues), P4 (every reply sent at once, over before any read sees
+                                 the worker busy: P4L under Land each turn judged, landed, no act typed twice; P4C under
+                                 Cruise the check's defense judged as it shows, the next point continuing; P4P a prompt
+                                 typed mid-chain, answered at once, judged and decided as it shows), the end past the
+                                 floor (L16, L17 a land reply busy past 30 s: end=<t> end_seen=0, its • and Done for you
+                                 row; a look sees land-j's, a press on its row land-k's), the needs moving (N1-N4,
+                                 cruise-n: needs_n 2, -, 1, 2) and the Off control (no supervisor, nothing typed 270 s
+                                 after a done reply), --chains naming only some (land-a … off, instant-land,
+                                 instant-cruise, land-j, land-k, cruise-n), each judged from the journal, ledger,
+                                 status, meta, task record and the stub's dumps (~15-30 min a harness) AND THE WINDOW:
+                                 Settings > Harness in a window of its own, the chains' window in front, cruise-n (else
+                                 the Off control, which joins a --chains run that has no Cruise chain) its front tab;
+                                 at each look chrome (each tab's autopilot line, toolbar-tabs states, the statusmenu
+                                 rows, This Mac, presence) and the page's text; at END a 20 s idle window
+                                 (timer_wakes=0, n_render=0, nothing armed but presence; where a program writes at
+                                 idle, the status sweep alone, at most 3 fires a write), This Mac and the page's
+                                 counts at rest (today N landed, Every session), each chain in front (drawn= its
+                                 face=), the look begun on the front tab, then land-j under it, and the press on
+                                 land-k's row; --no-surfaces makes the window's wants named skips. --mode cover: L12
+                                 a question in prose at the land act's yield: land-answer@v1, its defense lands; L13 a
+                                 person's own exchange (the draft standing, then Enter): LEFT, task=theirs, nothing typed
+                                 270 s, Land's act only after an orchestrator's turn, judged only where status human_ms=
+                                 stamps a person's hand (no control verb does: headless, UNOBSERVED); L14, C3 replies
+                                 opening `Wrote the …` read (P2 live); P5 a worker's record working past its startup
+                                 deadline; L15 (Claude Code) a worker spawned from a manager tab's Claude Code: working
+                                 from=<mgr>, landed, await task and result. --mode cap (continue_per_hour = 1, ~72 min):
+                                 the land act the hour's one act, the next point escalated, nothing typed until an
+                                 orchestrator's turn after the hour, that turn acted on. --mode wall (every harness, each
+                                 drawing its own usage wall, Claude Code on its subscriber path; ~6-12 min): W1 the stub's
+                                 usage wall met by the land act, nothing typed into it, gone on past its reset (nothing
+                                 typed on top of Claude Code's own continuation), landed.
+                                 --mode wall-hid (Muse Code, agy; ~15 min): W2 the remembered wall, W1's wall whose notice a
+                                 local command's output (Muse Code /rules, agy /title) scrolls out of sight while the wait
+                                 stands: a screen without the wall read, nothing typed into it, the resume typed there past
+                                 the reset, landed.
+                                 Exit 0 every scenario PASS, 1 one FAIL or UNOBSERVED, 2 usage, 3 could not run
   crash [tag] [--gap SECS] [--keep-tree]   aterm crashes under a lab that is up: its OWN instance (the pid env.sh records,
                                  refused unless that pid is still the lab's) SIGKILLed, and once it ended, the instance started
                                  again after SECS (0) with no instance, by restore's relaunch on the same state, socket and
@@ -766,6 +851,7 @@ Outside any lab (no jail, no stub):
                                  the WCAG contrast of a frame's cells as JSON (ink and ground from its clean twin), its
                                  caret against the page and the pixels the effects changed outside it; reads the
                                  sidecars trail-gallery writes; exit 1 when a threshold fails, 2 usage or file; --help
+  resource-attribution [--aterm PATH]  private two-tab delegated resource check
   presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases \"A H B D T X\"] [--trials N] [--keep]
                                  OPENS A WINDOW: one private windowed aterm running a Claude-Code-shaped stand-in, driven
                                  through fenced and harness-shaped turns, a foreign lease and cross-source chrome pairs
@@ -785,14 +871,33 @@ Outside any lab (no jail, no stub):
                                  row failed or the input sources did not come back, 3 not run or not measured;
                                  --plan prints each layout's derived rows and changes nothing; --restore puts back what a
                                  run's record names
+  predict-live --window|--headless [--aterm PATH] [--shell zsh|bash]... [--rtt MS]... [--mode on|off]...
+               [--rounds N] [--no-split] [--out DIR]
+                                 predictive editing on a REAL aterm: a private instance (a debug build, its
+                                 $ATERM_TRACE_PREDICT trace on) whose zsh or bash runs behind `link` (a real round trip,
+                                 default 100 ms) with aterm's shell integration, the plan's editing corpus pressed through
+                                 hwkey (typing, a typo and Backspace, arrows, mid-line inserts and erases, Ctrl-D, Delete,
+                                 Home/End, Ctrl-A/E), in the single pane and then a split pane (the composed path); every
+                                 painted frame held to the screen its newest key settles to (the far end's own take,
+                                 replayed through aterm-core and checked against the instance's text), the keys shown
+                                 before their echo, and `metrics percentiles` with prediction on and off. --window opens
+                                 a window and presses keys only at an idle desk; --headless runs the press path alone
+                                 (`key`); out DIR keeps the logs, takes and a mid-line image; exit 0 held, 1 a wrong
+                                 frame or a failed check, 3 not run or not measured
   codex-alab-proof [--package DIR] [--aterm PATH] [--keep]
                                  the codex-alab native harness end to end on the REAL package (--package, $LAB_CODEX, else
                                  the managed codex when it is an ALab build), linked as the owner links it in a sandboxed
                                  private headless aterm (network denied but a loopback fake model): the proven claim and the
-                                 parked lane, continue and the done stop, an approval, the question overlay, a usage wait,
-                                 a crash relaunch and a second, the re-exec upgrade, a hold, six claims at once, Autopilot
-                                 Off (the claim given back; a manager's `post kind=task` alone over the lab's own bus) and On; ~4 min;
-                                 exit 0 pass, 1 a check failed, 3 not run (no codex-alab package)
+                                 parked lane, FOREVER CRUISE (a done claim, the retired token too, gets the defend prompt and
+                                 goes on), FOREVER LAND (land@v1, unbounded nudges, landed@v1 only at a clean defense over a
+                                 clean folder, then nothing, task=landed, reopened by a person's turn; a dirty repository not
+                                 landed until pushed), NEEDS YOU (attention owner=needs at once, never blocking), an approval,
+                                 the question overlay and Land's answer, a usage wait, a crash relaunch and a second, a
+                                 carry-on, the re-exec upgrade, a hold, fourteen claims at once, Autopilot Off (the claim
+                                 given back; a manager's `post kind=task` alone over the lab's own bus) and On, and a
+                                 person's own exchange (typed through the debug seam `send|key as=person`: nothing typed
+                                 after it, the rule in codex-alab's journal, task=theirs) beside a control write's turn
+                                 (continued); ~11 min; exit 0 pass, 1 a check failed, 3 not run (no codex-alab package)
   reduce <transcript|rollout> --program claude|codex [--out FILE]
                                  a KEY-ONLY reduction (session log 5H-1, P11 as ruling T7 amends it): keys, row order,
                                  numbers and the closed words a reader reads kept (ruling U7: a word no reading reads
@@ -806,6 +911,12 @@ Outside any lab (no jail, no stub):
                                  every chunk to <log>: `<t_ns> O <hex>` (its output), `<t_ns> I <hex>` (input passed to
                                  it); its window follows this terminal's (at start and on SIGWINCH): the takes aterm-effects
                                  replays; exit: the program's
+  link [--rtt MS] [--take FILE] -- <cmd> [args...]
+                                 run <cmd> behind a PTY whose link holds every chunk RTT/2 each way (default 100 ms),
+                                 raw on this side as ssh is; FILE gets the far end's own take (ptyrec's lines: `I` when
+                                 <cmd> is handed input, `O` when it writes). Copied under a shell's name (zsh, bash) it is
+                                 that shell over the link, for an aterm whose `shell` names the copy (LAB_LINK_RTT_MS,
+                                 LAB_LINK_TAKE=<dir>, LAB_LINK_EXEC); `predict-live` runs it so
   mac dmg [--image REF] [--fda] [--keep]
                                  the macOS guest lane: atpkg's, aterm-containment's, aterm-uds' and aterm-update's
                                  real disk-image acceptance (dmg_acceptance benches built here with --no-run) run in a
@@ -816,6 +927,12 @@ Outside any lab (no jail, no stub):
                                  this checkout read-only; `exec` runs a command in it per arch under Xvfb, weston, Mutter
                                  or Xwayland; `proof` runs aterm-uds/pty/libc and the libc oracle's cells on both arches
                                  and drives a Linux aterm-gui under each display (`linux help`; exit 3 NOT RUN without lima)
+  windows up|down|status|exec|smoke|window|destroy
+                                 the Windows runtime lane: a QEMU VM (hvf, Windows 11 arm64, Prism for x86_64) made from
+                                 Microsoft's ISO, installed unattended and provisioned with MSVC and stock Rust; `exec`
+                                 copies this checkout in and runs a command per arch; `window` drives a windowed aterm-gui
+                                 with the VM's keyboard and tablet (`windows help`; exit 3 NOT RUN without QEMU, swtpm or
+                                 the image)
 
 The operator guide is the crate's documentation: `targo --unverified doc -p aterm-lab --open`, or crates/aterm-lab/src/.
 ";
@@ -934,6 +1051,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "sid" => verbs::cmd_sid(args),
         "phase" => verbs::cmd_phase(args),
         "prices" => prices::cmd_prices(args),
+        "abrew-admission" => abrew_admission::cmd_abrew_admission(args),
         "stublog" => verbs::cmd_stublog(args),
         "security" => verbs::cmd_security(args),
         "egress" => verbs::cmd_egress(args),
@@ -958,13 +1076,16 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "footers" => footers::cmd_footers(args),
         "paths" => verbs::cmd_paths(),
         "instance" => instance::cmd_instance(args),
+        "resource-attribution" => resource_attribution::cmd(args),
         "disk-lane" => disk_lane::cmd_disk_lane(args),
         "trail-gallery" => trail_gallery::cmd_trail_gallery(args),
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "presence-flap" => presence::cmd_presence_flap(args),
         "meta-keys" => meta_keys::cmd_meta_keys(args),
+        "predict-live" => predict_live::cmd_predict_live(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
         "linux" => linux::cmd_linux(args),
+        "windows" => windows::cmd_windows(args),
         "mac" => mac::cmd_mac(args),
         "reduce" => reduce::cmd_reduce(args),
         "protected" => match (args.first(), args.get(1)) {
@@ -1014,6 +1135,9 @@ fn main() -> std::process::ExitCode {
         .and_then(|n| n.to_str())
     {
         Some("node") => relay::main(&args),
+        // The link relay under a shell's name, so aterm integrates the shell behind it
+        // ([`link`]): no env scrubbing, the shell gets aterm's environment as given.
+        Some(name @ ("zsh" | "-zsh" | "bash" | "-bash")) => link::as_shell(name, &args),
         Some("security") => tripwire::main(&args),
         Some("open") => recorder::main(&args),
         // The fleet-sim fixtures, run under their own names by a session's
@@ -1033,6 +1157,8 @@ fn main() -> std::process::ExitCode {
                 // a recorder run by hand: the program it records gets the
                 // caller's environment as given, as the take's reader expects
                 "ptyrec" => relay::ptyrec(rest),
+                // the link relay run by hand: its program gets the caller's environment
+                "link" => link::main(rest),
                 "probe-inside" => probe::inside_main(rest),
                 "probe-tiocsti" => probe::tiocsti_child(),
                 "hold" => recorder::hold(rest),
@@ -1060,6 +1186,7 @@ fn main() -> std::process::ExitCode {
                             | "fleet-sim"
                             | "reduce"
                             | "trail-contrast"
+                            | "abrew-admission"
                     ) {
                         dispatch(&cmd, rest)
                     } else {

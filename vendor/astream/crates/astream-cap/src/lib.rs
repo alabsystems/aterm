@@ -52,12 +52,14 @@
 //! so a face that presents a ring reads it by these rules instead of its own.
 //!
 //! Crypto honesty: the MAC is **HMAC-SHA256 per RFC 2104** — a standard
-//! construction, not an invented MAC — over the workspace's own SHA-256,
-//! `astream-digest`: FIPS 180-4 transcribed line by line, pinned to the FIPS
-//! vectors, and held byte-for-byte to the `sha2` crate it replaced over every
-//! length 0..=1024. The MAC is pinned to all seven RFC 4231 cases, and the tags,
-//! attach proof and producer ids this crate answered over `sha2` are pinned as
-//! recorded answers. No cipher is built here: encrypting the wire is
+//! construction, not an invented MAC — and it is not this crate's:
+//! `astream-digest` owns the workspace's one HMAC (`hmac_sha256_parts`, the const
+//! core this crate wrote and gave it) over its own SHA-256, FIPS 180-4 transcribed
+//! line by line, pinned to the FIPS vectors, and held byte-for-byte to the `sha2`
+//! crate it replaced over every length 0..=1024. The MAC is pinned there to all
+//! seven RFC 4231 cases; the tags, attach proof and producer ids this crate
+//! answered over `sha2` are pinned here as recorded answers. No cipher is built
+//! here: encrypting the wire is
 //! `astream-aead`'s job (ring's ChaCha20-Poly1305 under an in-crate HChaCha20
 //! subkey: XChaCha20-Poly1305), wired into the broker
 //! as `serve_tcp_sealed`; a guarded broker (`open_guarded`) composes the two.
@@ -78,10 +80,9 @@ pub mod capfile;
 #[cfg(test)]
 mod capfile_tests;
 
-use astream_digest::Sha256;
+use astream_digest::{hmac_sha256_parts, Sha256};
 use astream_wire::{Filter, Subject};
 
-const BLOCK: usize = 64; // SHA-256 block size
 const TAG: usize = 32; // SHA-256 output size
 
 /// Domain separator for producer-id derivation, so the id of a principal is never
@@ -609,8 +610,12 @@ pub fn effective_expiry_ms(grant: &str) -> Option<u64> {
 /// collapses to `0` (immediately expired) if `min(parent_exp, child_exp) <= now_ms`,
 /// and otherwise returns `min(parent_exp, child_exp)`.
 ///
-/// Matches the composition of the 3-parameter Clean-origin [`live_expiry_or_zero`] and
-/// 2-parameter [`attenuate_expiry_min`] transitions (`TlaCapabilityProtocol::attenuate_bounded_expiry_le_parent`).
+/// Hand-written plain Rust, not compiled from Clean: it restates
+/// `TlaCapabilityProtocol::attenuate_bounded_expiry_isl`, the island's composition of the
+/// 3-parameter Clean-origin [`live_expiry_or_zero`] and 2-parameter [`attenuate_expiry_min`]
+/// transitions (bounded by `attenuate_bounded_expiry_le_parent`), and astream-broker's
+/// `clean_tla_protocol_surface` suite holds it to that composition over a grid of boundary
+/// operands.
 #[must_use]
 pub const fn attenuate_bounded_expiry(now_ms: u64, parent_exp: u64, child_exp: u64) -> u64 {
     let min_exp = if parent_exp < child_exp {
@@ -756,189 +761,19 @@ pub const fn producer_id_of(principal: &str) -> u64 {
     decode_producer_id_bytes(&digest)
 }
 
-/// HMAC-SHA256(key, msg) per RFC 2104, over `astream-digest`'s SHA-256.
+/// HMAC-SHA256(key, msg) per RFC 2104: `astream-digest`'s one HMAC
+/// ([`hmac_sha256_parts`]) over a single part.
+///
+/// This crate held its own copy of that core until astream-digest took it, in
+/// place of astream-aead's wiping copy and beside a port of aterm-digest's
+/// streaming API: four copies of the same RFC (aterm's two have since gone too),
+/// which nothing held to each other. The tags, attach proofs and
+/// producer ids below are still pinned here as recorded answers
+/// (`tags_proofs_and_producer_ids_are_the_recorded_answers`), because they are
+/// this crate's wire contract; the RFC 4231 vectors are the MAC's, and moved with
+/// it.
 const fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; TAG] {
     hmac_sha256_parts(key, &[msg])
-}
-
-const fn hmac_ipad(k: &[u8; BLOCK]) -> [u8; BLOCK] {
-    [
-        k[0] ^ 0x36,
-        k[1] ^ 0x36,
-        k[2] ^ 0x36,
-        k[3] ^ 0x36,
-        k[4] ^ 0x36,
-        k[5] ^ 0x36,
-        k[6] ^ 0x36,
-        k[7] ^ 0x36,
-        k[8] ^ 0x36,
-        k[9] ^ 0x36,
-        k[10] ^ 0x36,
-        k[11] ^ 0x36,
-        k[12] ^ 0x36,
-        k[13] ^ 0x36,
-        k[14] ^ 0x36,
-        k[15] ^ 0x36,
-        k[16] ^ 0x36,
-        k[17] ^ 0x36,
-        k[18] ^ 0x36,
-        k[19] ^ 0x36,
-        k[20] ^ 0x36,
-        k[21] ^ 0x36,
-        k[22] ^ 0x36,
-        k[23] ^ 0x36,
-        k[24] ^ 0x36,
-        k[25] ^ 0x36,
-        k[26] ^ 0x36,
-        k[27] ^ 0x36,
-        k[28] ^ 0x36,
-        k[29] ^ 0x36,
-        k[30] ^ 0x36,
-        k[31] ^ 0x36,
-        k[32] ^ 0x36,
-        k[33] ^ 0x36,
-        k[34] ^ 0x36,
-        k[35] ^ 0x36,
-        k[36] ^ 0x36,
-        k[37] ^ 0x36,
-        k[38] ^ 0x36,
-        k[39] ^ 0x36,
-        k[40] ^ 0x36,
-        k[41] ^ 0x36,
-        k[42] ^ 0x36,
-        k[43] ^ 0x36,
-        k[44] ^ 0x36,
-        k[45] ^ 0x36,
-        k[46] ^ 0x36,
-        k[47] ^ 0x36,
-        k[48] ^ 0x36,
-        k[49] ^ 0x36,
-        k[50] ^ 0x36,
-        k[51] ^ 0x36,
-        k[52] ^ 0x36,
-        k[53] ^ 0x36,
-        k[54] ^ 0x36,
-        k[55] ^ 0x36,
-        k[56] ^ 0x36,
-        k[57] ^ 0x36,
-        k[58] ^ 0x36,
-        k[59] ^ 0x36,
-        k[60] ^ 0x36,
-        k[61] ^ 0x36,
-        k[62] ^ 0x36,
-        k[63] ^ 0x36,
-    ]
-}
-
-const fn hmac_opad(k: &[u8; BLOCK]) -> [u8; BLOCK] {
-    [
-        k[0] ^ 0x5c,
-        k[1] ^ 0x5c,
-        k[2] ^ 0x5c,
-        k[3] ^ 0x5c,
-        k[4] ^ 0x5c,
-        k[5] ^ 0x5c,
-        k[6] ^ 0x5c,
-        k[7] ^ 0x5c,
-        k[8] ^ 0x5c,
-        k[9] ^ 0x5c,
-        k[10] ^ 0x5c,
-        k[11] ^ 0x5c,
-        k[12] ^ 0x5c,
-        k[13] ^ 0x5c,
-        k[14] ^ 0x5c,
-        k[15] ^ 0x5c,
-        k[16] ^ 0x5c,
-        k[17] ^ 0x5c,
-        k[18] ^ 0x5c,
-        k[19] ^ 0x5c,
-        k[20] ^ 0x5c,
-        k[21] ^ 0x5c,
-        k[22] ^ 0x5c,
-        k[23] ^ 0x5c,
-        k[24] ^ 0x5c,
-        k[25] ^ 0x5c,
-        k[26] ^ 0x5c,
-        k[27] ^ 0x5c,
-        k[28] ^ 0x5c,
-        k[29] ^ 0x5c,
-        k[30] ^ 0x5c,
-        k[31] ^ 0x5c,
-        k[32] ^ 0x5c,
-        k[33] ^ 0x5c,
-        k[34] ^ 0x5c,
-        k[35] ^ 0x5c,
-        k[36] ^ 0x5c,
-        k[37] ^ 0x5c,
-        k[38] ^ 0x5c,
-        k[39] ^ 0x5c,
-        k[40] ^ 0x5c,
-        k[41] ^ 0x5c,
-        k[42] ^ 0x5c,
-        k[43] ^ 0x5c,
-        k[44] ^ 0x5c,
-        k[45] ^ 0x5c,
-        k[46] ^ 0x5c,
-        k[47] ^ 0x5c,
-        k[48] ^ 0x5c,
-        k[49] ^ 0x5c,
-        k[50] ^ 0x5c,
-        k[51] ^ 0x5c,
-        k[52] ^ 0x5c,
-        k[53] ^ 0x5c,
-        k[54] ^ 0x5c,
-        k[55] ^ 0x5c,
-        k[56] ^ 0x5c,
-        k[57] ^ 0x5c,
-        k[58] ^ 0x5c,
-        k[59] ^ 0x5c,
-        k[60] ^ 0x5c,
-        k[61] ^ 0x5c,
-        k[62] ^ 0x5c,
-        k[63] ^ 0x5c,
-    ]
-}
-
-const fn pad_digest_key(d: [u8; TAG]) -> [u8; BLOCK] {
-    [
-        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13],
-        d[14], d[15], d[16], d[17], d[18], d[19], d[20], d[21], d[22], d[23], d[24], d[25], d[26],
-        d[27], d[28], d[29], d[30], d[31], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]
-}
-
-/// HMAC-SHA256 of the CONCATENATION of `parts`, streamed into the inner hash one
-/// part at a time — the same tag as [`hmac_sha256`] over the joined bytes, without
-/// materialising the join.
-const fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; TAG] {
-    let k = if key.len() > BLOCK {
-        pad_digest_key(Sha256::digest_slice(key))
-    } else {
-        let mut k = [0u8; BLOCK];
-        let mut i = 0usize;
-        let mut rem = key;
-        while let &[b, ref tail @ ..] = rem {
-            k[i & 63] = b;
-            i = (i & 63) + 1;
-            rem = tail;
-        }
-        k
-    };
-    let ipad = hmac_ipad(&k);
-    let opad = hmac_opad(&k);
-    let mut inner = Sha256::new();
-    inner.update_slice(&ipad);
-    let mut rem_parts = parts;
-    while let &[part, ref tail @ ..] = rem_parts {
-        inner.update_slice(part);
-        rem_parts = tail;
-    }
-    let ih = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update_slice(&opad);
-    outer.update_slice(&ih);
-    outer.finalize()
 }
 
 /// The offline tag message has an explicit binary context before any grant.
@@ -1649,70 +1484,12 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// RFC 4231 §4.2–4.8, every HMAC-SHA-256 case: `(case, key, data, tag)`. Case 5
-    /// is published truncated to 128 bits; cases 6 and 7 carry a 131-byte key, so
-    /// they pin the hash-the-key-first path a short key never reaches.
-    #[test]
-    fn rfc4231_test_vectors() {
-        let case4_key: Vec<u8> = (0x01u8..=0x19).collect();
-        let case7_data: &[u8] = b"This is a test using a larger than block-size key and a \
-            larger than block-size data. The key needs to be hashed before being used by the \
-            HMAC algorithm.";
-        assert_eq!(case7_data.len(), 152);
-        for (case, key, data, tag) in [
-            (
-                1,
-                &[0x0b; 20][..],
-                &b"Hi There"[..],
-                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
-            ),
-            (
-                2,
-                b"Jefe",
-                b"what do ya want for nothing?",
-                "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
-            ),
-            (
-                3,
-                &[0xaa; 20],
-                &[0xdd; 50],
-                "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
-            ),
-            (
-                4,
-                &case4_key,
-                &[0xcd; 50],
-                "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
-            ),
-            (
-                5,
-                &[0x0c; 20],
-                b"Test With Truncation",
-                "a3b6167473100ee06e0c796c2955552b",
-            ),
-            (
-                6,
-                &[0xaa; 131],
-                b"Test Using Larger Than Block-Size Key - Hash Key First",
-                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
-            ),
-            (
-                7,
-                &[0xaa; 131],
-                case7_data,
-                "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
-            ),
-        ] {
-            let mac = hmac_sha256(key, data);
-            assert_eq!(hex(&mac[..tag.len() / 2]), tag, "RFC 4231 case {case}");
-        }
-    }
-
     /// Recorded answers: the tags, the attach proof and the producer ids below were
     /// computed by this crate over the `sha2` crate (0.10.9) on 2026-10-15, before
-    /// it moved to `astream-digest`, and pass unchanged over it. They are the wire contract a broker and every
-    /// bridge must keep agreeing on, so the hash under them can change only if they
-    /// do not. The secrets straddle the 64-byte HMAC block (shorter, exactly 64 —
+    /// it moved to `astream-digest`, and pass unchanged over it, and over the HMAC
+    /// that moved there after it. They are the wire contract a broker and every
+    /// bridge must keep agreeing on, so the hash and the MAC under them can change
+    /// only if they do not. The secrets straddle the 64-byte HMAC block (shorter, exactly 64 —
     /// padded, never hashed — 65, and RFC 4231's 131); the principals put
     /// `"astream-pid\0" ‖ principal` on each side of SHA-256's 55/56-byte padding
     /// split and its 64-byte block.

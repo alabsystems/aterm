@@ -12,9 +12,9 @@ use crate::{MAX_INTERMEDIATES, MAX_PARAMS};
 impl Parser {
     /// Assert that every TypeInvariant property holds.
     ///
-    /// The invariant is written below in TLA+ notation; no TLA+ spec is
-    /// checked. The exhaustive tests in `src/tests/` hold representative
-    /// states at every bound to it through every two-byte tail
+    /// The invariant is written in TLA+ notation; no TLA+ spec is checked. The
+    /// exhaustive tests hold representative states at every bound to it
+    /// through every two-byte tail
     /// (`tests::invariants::every_state_every_byte_keeps_the_type_invariant`).
     ///
     /// # TypeInvariant
@@ -44,8 +44,7 @@ impl Parser {
     pub fn assert_invariants(&self) {
         #[cfg(test)]
         {
-            // Invariant: StateValid
-            // state must be a valid State enum value (0..13)
+            // StateValid
             assert!(
                 (self.state as usize) < State::COUNT,
                 "TLA+ TypeInvariant violated: state {} >= COUNT {}",
@@ -53,8 +52,7 @@ impl Parser {
                 State::COUNT
             );
 
-            // Invariant: ParamsBounded
-            // Len(params) <= MAX_PARAMS
+            // ParamsBounded
             assert!(
                 self.params.len() <= MAX_PARAMS,
                 "TLA+ TypeInvariant violated: params.len() {} > MAX_PARAMS {}",
@@ -62,8 +60,7 @@ impl Parser {
                 MAX_PARAMS
             );
 
-            // Invariant: IntermediatesBounded
-            // Len(intermediates) <= MAX_INTERMEDIATES
+            // IntermediatesBounded
             assert!(
                 self.intermediates.len() <= MAX_INTERMEDIATES,
                 "TLA+ TypeInvariant violated: intermediates.len() {} > MAX_INTERMEDIATES {}",
@@ -71,32 +68,25 @@ impl Parser {
                 MAX_INTERMEDIATES
             );
 
-            // Invariant: CurrentParamBounded
-            // currentParam is bounded during accumulation
-            // Note: current_param is u32 during accumulation and uses saturating arithmetic
-            // The actual bound is checked when finalized (converted to u16), but we verify
-            // the accumulator isn't in an invalid state
-            // (This assertion always passes for u32 but documents the invariant)
-            let _ = self.current_param; // Acknowledge the field is part of invariant checking
+            // CurrentParamBounded: `current_param` saturates as a u32 and is
+            // clamped to u16 when finalized, so there is nothing to assert.
+            let _ = self.current_param;
 
-            // Invariant: Utf8BufferValid
-            // utf8_len <= 4 (max UTF-8 sequence length)
+            // Utf8BufferValid: at most 4 bytes, the longest UTF-8 sequence.
             assert!(
                 self.utf8_len <= 4,
                 "TLA+ Utf8BufferValid violated: utf8_len {} > 4",
                 self.utf8_len
             );
 
-            // Invariant: Utf8ExpectedValid
-            // utf8_expected <= 4
+            // Utf8ExpectedValid
             assert!(
                 self.utf8_expected <= 4,
                 "TLA+ Utf8ExpectedValid violated: utf8_expected {} > 4",
                 self.utf8_expected
             );
 
-            // Invariant: Utf8ProgressValid
-            // utf8_len <= utf8_expected (can't have more bytes than expected)
+            // Utf8ProgressValid: no more bytes than the character expects.
             assert!(
                 self.utf8_len <= self.utf8_expected,
                 "TLA+ Utf8ProgressValid violated: utf8_len {} > utf8_expected {}",
@@ -104,12 +94,10 @@ impl Parser {
                 self.utf8_expected
             );
 
-            // Invariant: SubparamMaskValid
-            // Subparam mask bits only set for indices < params.len()
-            // Bit i indicates param[i] is a subparam of param[i-1]
+            // SubparamMaskValid: bits only below `params.len()`.
             if self.params.len() < 32 {
                 let valid_bits = (1u32 << self.params.len()) - 1;
-                // Bit 0 is never meaningful (no param before param[0])
+                // Bit 0 is never meaningful (no param before param[0]).
                 let meaningful_mask = self.subparam_mask & !1;
                 assert_eq!(
                     meaningful_mask & !valid_bits,
@@ -120,16 +108,15 @@ impl Parser {
                 );
             }
 
-            // Invariant: DcsApcExclusive
-            // Cannot be in both DCS and APC sequence at the same time
+            // DcsApcExclusive: never in a DCS and an APC string at once.
             assert!(
                 !(self.dcs_active && self.apc_active),
                 "TLA+ DcsApcExclusive violated: both dcs_active and apc_active are true"
             );
 
-            // Invariant: FlagStateConsistent. `dcs_active` is a biconditional
-            // with `DcsPassthrough`: it is set only by `DcsHook` (the sole action
-            // into that state) and cleared whenever the machine leaves it.
+            // FlagStateConsistent: `dcs_active` is a biconditional with
+            // `DcsPassthrough`: it is set only by `DcsHook` (the sole action into
+            // that state) and cleared whenever the machine leaves it.
             // `apc_active` only implies `SosPmApcString`: SOS and PM enter that
             // state without the flag.
             assert_eq!(

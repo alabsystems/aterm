@@ -116,7 +116,7 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<Fixture>) {
 /// drawn into that box (hand-built around the recorded command on the 2.1.280
 /// Bash box's geometry), the default presses its `1`, and the safe rules alone
 /// (`approve = "safe"`) press nothing full power would not. Non-vacuity: at
-/// least one box is pressed that the safe rules hand over (owner, 2026-09-24).
+/// least one box is pressed that the safe rules hand over.
 #[test]
 fn every_captured_permission_request_is_pressed_at_full_power() {
     use aterm_agent::supervise::config::Approve;

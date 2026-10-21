@@ -53,10 +53,8 @@ fn loss_rows(app: &App) -> Vec<aterm_messages::Message> {
         .collect()
 }
 
-/// Two Settings views, each losing a draft (a row the new build does not
-/// have): ONE row names both, with their text. The first cut posted a row
-/// per leaf under the update's one key, so the second view's row REPLACED
-/// the first on glass and the first text was left only in the history.
+/// Two Settings views, each losing a draft (a row the new build does not have): one row names
+/// both, with their text, rather than the second replacing the first under the update's key.
 #[test]
 fn every_lost_draft_of_the_update_is_said_in_one_row() {
     let mut app = App::headless_for_test();
@@ -87,11 +85,9 @@ fn every_lost_draft_of_the_update_is_said_in_one_row() {
     assert_eq!(loss_rows(&app).len(), 1, "a second settle says nothing new");
 }
 
-/// Round eight of the update audit, lead U61 (r8d #760): the loss row was the
-/// only copy of the carried text, and it cannot hold it — each line is cut to
-/// the band's 240 characters with its newlines and tabs gone, and the drafts
-/// past the 16th were only counted, while aterm.log kept the keys alone. Every
-/// lost draft is now saved WHOLE, beside messages.log, and the row says where.
+/// The loss row cannot hold the carried text (each line is cut to the band's width with
+/// newlines and tabs gone, and drafts past the 16th are only counted), so every lost draft is
+/// saved whole beside messages.log, and the row says where.
 #[test]
 fn every_lost_draft_is_saved_whole_and_the_row_says_where() {
     let folder = std::env::temp_dir().join(format!(
@@ -147,15 +143,10 @@ fn every_lost_draft_is_saved_whole_and_the_row_says_where() {
     let _ = std::fs::remove_dir_all(&folder);
 }
 
-/// The review of round eight's lead U61 (r8d #760): A SEAMLESS SUCCESSOR
-/// LOSES NOTHING BEFORE COMMIT. Its restore pass settles the carried drafts
-/// before the proof and the Commit, while the parent still runs and still
-/// holds every one of them; the first cut wrote the person's text to a file
-/// saying it "could not be put back" right then, so a successor stood down
-/// after the park (and each retried attempt) left a copy behind. Before Commit
-/// nothing is written and nothing said; at Commit the file and the row come
-/// together. CONTROL: a restore that settles with no handoff pending says it
-/// at once (the test above).
+/// A seamless successor loses nothing before Commit: its restore settles the carried drafts
+/// while the parent still holds them, so nothing is written or said until Commit, and then the
+/// file and the row come together. Control: a restore with no handoff pending says it at once
+/// (the test above).
 #[cfg(unix)]
 #[test]
 fn a_successor_saves_and_says_its_lost_drafts_only_at_commit() {
@@ -213,13 +204,9 @@ fn a_successor_saves_and_says_its_lost_drafts_only_at_commit() {
     let _ = std::fs::remove_dir_all(&folder);
 }
 
-/// A draft that LANDED in a view the restore then closed — the native-only
-/// window arm's answer to a window the OS would not attach
-/// (`apply_restore_manifest`: `close_window_logical`) — is lost with the
-/// view, and said with its text. The first cut counted it safe the moment
-/// it landed, so the Commit went ahead and the text was gone unsaid. The
-/// control: the same view left standing holds its draft, and nothing is
-/// said.
+/// A draft that landed in a view the restore then closed (the native-only window arm's answer
+/// to a window the OS would not attach: `close_window_logical`) is lost with the view and said
+/// with its text. Control: the same view left standing holds its draft, and nothing is said.
 #[test]
 fn a_draft_whose_view_the_restore_closed_is_said_with_its_text() {
     let field = crate::prefs::EDIT_FONT_FAMILY;
@@ -253,11 +240,9 @@ fn a_draft_whose_view_the_restore_closed_is_said_with_its_text() {
     }
 }
 
-/// A draft for a row the new build shows as a SLIDER is said, not taken:
-/// the slider row can neither show nor edit free text, and the next config
-/// snapshot would discard it (`replace_snapshot` keeps only drafts
-/// `field_accepts_text_input` admits). The first cut took it — the view
-/// read it back as landed and nothing was said.
+/// A draft for a row the new build shows as a slider is said, not taken: the slider can neither
+/// show nor edit free text, and the next config snapshot would discard it (`replace_snapshot`
+/// keeps only drafts `field_accepts_text_input` admits).
 #[test]
 fn a_draft_for_a_slider_row_is_said_not_taken() {
     let mut app = App::headless_for_test();
@@ -289,8 +274,8 @@ fn a_draft_for_a_slider_row_is_said_not_taken() {
     );
 }
 
-/// The drafts of a layout the successor could not PLACE ride the ledger it
-/// starts with, and are said — never dropped with the layout.
+/// The drafts of a layout the successor could not place ride the ledger it starts with, and
+/// are said, never dropped with the layout.
 #[test]
 fn an_unplaced_layouts_drafts_are_said_with_their_text() {
     let mut app = App::headless_for_test();

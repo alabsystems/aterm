@@ -3,11 +3,9 @@
 
 //! Bounded, generation-local font discovery and admission.
 //!
-//! A config generation may name several related faces.  Scanning the system
-//! tree separately for every name makes one typo multiply directory I/O and
-//! `name`-table parsing on the caller.  [`resolve_and_admit`] walks once,
-//! resolves every request against that immutable catalogue, and reads each
-//! selected file once.  Every source of work has an explicit cap.
+//! A config generation may name several faces. [`resolve_and_admit`] walks the system tree
+//! once, resolves every request against that catalogue, and reads each selected file once, so a
+//! typo cannot multiply directory I/O and `name`-table parsing. Every source of work is capped.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -145,13 +143,10 @@ struct Catalog {
     /// Bytes already read for a name-table probe. Reused as the immutable
     /// admitted asset if that path wins, closing a second-read TOCTOU window.
     bytes: HashMap<PathBuf, Arc<Vec<u8>>>,
-    /// Every directory the walk asked `read_dir` of — roots included, absent
-    /// or unreadable ones too — with the mtime observed at that moment. This
-    /// is the validity key of the [`system_font_files`] memo: a directory's
-    /// mtime moves when an entry is added, removed or renamed in it, so a font
-    /// installed anywhere in the tree, a vendor directory appearing under a
-    /// nested Linux root, or a root coming into existence all show up in a
-    /// stat of one of these, without walking the tree again.
+    /// Every directory the walk asked `read_dir` of (roots, absent and unreadable ones
+    /// included) with the mtime seen then: the validity key of the [`system_font_files`] memo.
+    /// An entry added, removed or renamed anywhere in the tree, or a root appearing, moves one
+    /// of these mtimes.
     visited: Vec<(PathBuf, Option<std::time::SystemTime>)>,
 }
 
@@ -652,10 +647,8 @@ impl FontFilesMemo {
     }
 }
 
-/// The walks this process remembers, keyed by their root list. In production
-/// there is exactly one root list (`font_search_dirs()`), so this is one
-/// entry; tests walk private fixture roots and must not evict each other's
-/// entries or the real one. Bounded so a pathological caller cannot grow it.
+/// Remembered walks, keyed by root list: one in production (`font_search_dirs()`); tests walk
+/// private fixture roots and must not evict each other's or the real one. Bounded.
 static FONT_FILES_MEMOS: std::sync::Mutex<Vec<Arc<FontFilesMemo>>> =
     std::sync::Mutex::new(Vec::new());
 const MAX_FONT_FILES_MEMOS: usize = 8;
@@ -684,37 +677,26 @@ fn walk_gate(roots: &[PathBuf]) -> WalkGate {
 
 /// [`system_font_files`] over an explicit root list, remembered per process.
 ///
-/// A hit costs one `stat` per directory the last walk visited (a few dozen on
-/// a Linux tree, a handful on macOS) instead of that many `read_dir`s plus a
-/// `stat`/`file_type` per entry (~660 on a Mac) and a sort per directory. The
-/// key is exact for the tree's SHAPE: adding, removing or renaming an entry in
-/// any visited directory moves that directory's mtime. What it does not see is
-/// a file rewritten in place under the same name — which changes no path in
-/// the list anyway, and the list is all this function returns. The walk's
-/// bounded-work caps apply to the walk, exactly as before; a capped walk is
-/// remembered as what it found, like an uncapped one.
-///
-/// The backend worker resolves the configured family through this on every
-/// launch, and `list-fonts` / a config reload / the coverage index used to
-/// re-walk the same tree from scratch; now they share the worker's walk until
-/// the tree changes.
+/// A hit costs one `stat` per directory the last walk visited instead of a `read_dir` per
+/// directory, a `stat` per entry (~660 on a Mac) and a sort. The key is exact for the tree's
+/// shape: adding, removing or renaming an entry moves its directory's mtime. A file rewritten
+/// in place under the same name is not seen, and changes no path in the list. A capped walk is
+/// remembered as what it found.
 fn memoized_font_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     memoized_font_files_walked(roots).0
 }
 
-/// [`memoized_font_files`] plus whether THIS call walked the tree (`false` =
-/// answered from the memo). The proof observable is per call, not a
-/// process-global counter: the lib tests run in parallel and any of them may
-/// take the real tree's first walk inside another test's window, so a global
-/// count is a flake, while this answer is exact for the root list asked about.
+/// [`memoized_font_files`] plus whether this call walked (`false`: answered from the memo).
+/// Per call, not a process-global counter, which parallel lib tests would race.
 fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
     let (inventory, walked) = memoized_font_inventory_walked(roots);
     (inventory.files.clone(), walked)
 }
 
-/// The actual walk generation, shared with derived catalogues. A replacement
-/// under an unchanged pathname still produces a new generation when its
-/// directory observation changes.
+/// [`memoized_font_files_walked`] returning the memo itself. Every walk is a
+/// new `Arc`, so an answer keyed on it ([`monospace_families`]) also sees a
+/// file renamed over one of the same name, which moves its directory's mtime
+/// but not the file list.
 fn memoized_font_inventory_walked(roots: &[PathBuf]) -> (Arc<FontFilesMemo>, bool) {
     let remembered = || {
         let memos = FONT_FILES_MEMOS
@@ -729,12 +711,9 @@ fn memoized_font_inventory_walked(roots: &[PathBuf]) -> (Arc<FontFilesMemo>, boo
     if let Some(inventory) = remembered() {
         return (inventory, false);
     }
-    // SINGLE-FLIGHT per root list: the broad and symbol chain builders run on
-    // two threads at once at every launch; the second caller waits on the
-    // first walk's gate and is answered from its memo instead of walking the
-    // same tree again. The walk itself still runs OUTSIDE the memo lock, so a
-    // caller asking for a DIFFERENT root list (tests walk private fixture
-    // roots) never waits behind it.
+    // Single-flight per root list: the broad and symbol chain builders ask at once at every
+    // launch, so the second waits on the gate and is answered from the first walk's memo. The
+    // walk runs outside the memo lock, so a different root list never waits behind it.
     let gate = walk_gate(roots);
     let _in_flight = gate
         .lock()
@@ -759,11 +738,9 @@ fn memoized_font_inventory_walked(roots: &[PathBuf]) -> (Arc<FontFilesMemo>, boo
     (inventory, true)
 }
 
-/// Bounded file list used by renderer diagnostics and runtime discovery. This
-/// preserves the stable directory/lexical ordering while removing their former
-/// unbounded recursion, entry collection, and file accumulation. Remembered
-/// per process and revalidated by directory mtimes ([`memoized_font_files`]),
-/// so the second and every later caller pays a few `stat`s, not a walk.
+/// Bounded font-file list, in directory/lexical order, for renderer diagnostics and runtime
+/// discovery. Memoized per process and revalidated by directory mtimes
+/// ([`memoized_font_files`]).
 pub(crate) fn system_font_files() -> Vec<PathBuf> {
     memoized_font_files(&crate::font_search_dirs())
 }
@@ -1119,12 +1096,8 @@ pub fn ttc_of(faces: &[&[u8]]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// The walk is recursive and keeps no seen-set, so a search root that lies
-    /// inside another root is walked twice and every font under it is listed
-    /// (and, by every full-read consumer, read) twice. `FONT_DIRS` carried
-    /// `/System/Library/Fonts/Supplemental` beside its parent for exactly that
-    /// cost — 290 faces / 131 MB twice per walk on a Mac. Structural, so it is
-    /// red on that list on every host, not only where the directory exists.
+    /// The walk keeps no seen-set, so a search root nested inside another would list (and every
+    /// full-read consumer read) its fonts twice. Structural, so it checks the list on every host.
     #[test]
     fn search_dirs_are_never_nested_so_the_walk_visits_a_file_once() {
         let dirs = crate::font_search_dirs();
@@ -1396,9 +1369,8 @@ mod tests {
         let replacement = root.join(".replacement");
         std::fs::write(&path, JETBRAINS).unwrap();
         std::fs::write(&replacement, with_weight(700)).unwrap();
-        // Force a distinct directory observation before the first real walk:
-        // atomic rename moves it from this old epoch to now, even on a
-        // coarse filesystem. This is not a wait for a timestamp tick.
+        // Backdate the directory so the rename below moves its mtime even on a
+        // coarse filesystem.
         std::fs::File::open(&root)
             .unwrap()
             .set_times(
@@ -1673,19 +1645,16 @@ mod tests {
         root
     }
 
-    /// The memo: a second ask over an unchanged tree is answered without a
-    /// walk; a font installed anywhere in the tree — here in a NESTED vendor
-    /// directory, the Linux layout, so a root-mtime key would miss it — is a
-    /// miss, and the answer includes it; a root that did not exist when the
-    /// memo was taken invalidates it by appearing. Private fixture roots, so
-    /// no concurrent caller of the real `system_font_files()` shares this key.
+    /// An unchanged tree is answered from the memo; a font added in a nested vendor directory
+    /// (the Linux layout, which a root-mtime key would miss) or an absent root appearing is a
+    /// miss. Private fixture roots, so no concurrent caller shares this key.
     #[test]
     fn the_font_files_memo_is_revalidated_by_the_visited_directories_mtimes() {
         let root = fixture("memo");
         let vendor = root.join("truetype").join("vendor");
         std::fs::create_dir_all(&vendor).unwrap();
         std::fs::write(vendor.join("a.ttf"), b"a").unwrap();
-        // A SIBLING of `root`, not a child: the walk is recursive and the
+        // A sibling of `root`, not a child: the walk is recursive and the
         // search dirs are never nested (`search_dirs_are_never_nested_...`).
         let absent_root = fixture("memo-later");
         std::fs::remove_dir_all(&absent_root).unwrap();
@@ -1699,9 +1668,7 @@ mod tests {
         assert_eq!(again, first);
         assert!(!walked, "an unchanged tree is answered from the memo");
 
-        // A font lands in the NESTED directory: only `vendor/`'s mtime moves.
-        // (A same-instant write can share the directory's mtime tick on a
-        // coarse filesystem; nudge the clock past it before writing.)
+        // Only `vendor/`'s mtime moves; the sleep clears a coarse filesystem's mtime tick.
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(vendor.join("b.ttf"), b"b").unwrap();
         let (grown, walked) = memoized_font_files_walked(&roots);
@@ -1730,11 +1697,7 @@ mod tests {
         std::fs::remove_dir_all(absent_root).unwrap();
     }
 
-    /// SINGLE-FLIGHT: the broad and symbol chain builders ask for the same
-    /// tree on two threads at the same instant at every launch. Before the
-    /// walk gate both missed the memo and both walked (measured with `strace`:
-    /// every font directory opened twice). Now exactly one concurrent caller
-    /// walks and the rest are answered from its memo, with the same list.
+    /// Concurrent asks for one root list: exactly one caller walks and the rest get its list.
     #[test]
     fn concurrent_asks_for_one_tree_walk_it_once() {
         let root = fixture("single-flight");
@@ -1782,10 +1745,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A bundled family NAME yields to an INSTALLED face of that name (so a
-    /// variable `JetBrainsMono[wght].ttf` keeps its weight axis), and falls back
-    /// to the compiled-in face only when nothing installed answers; the
-    /// `bundled:` IDENTITY always means the compiled-in face.
+    /// A bundled family name yields to an installed face of that name (so a variable
+    /// `JetBrainsMono[wght].ttf` keeps its weight axis) and falls back to the compiled-in face
+    /// only when nothing installed answers; the `bundled:` identity always means the
+    /// compiled-in face.
     #[test]
     fn an_installed_face_wins_a_bundled_family_name_and_the_identity_never_yields() {
         if !crate::bundled::ACTIVE {
@@ -1809,7 +1772,7 @@ mod tests {
         let by_id = batch.get(1).unwrap().as_ref().unwrap();
         assert_eq!(by_id.path, crate::bundled::JETBRAINS_ID);
 
-        // Nothing installed: the NAME resolves to the compiled-in face, with its
+        // Nothing installed: the name resolves to the compiled-in face, with its
         // bytes, under its identity (so its Bold/Italic siblings are found).
         std::fs::remove_file(&installed).unwrap();
         let batch =

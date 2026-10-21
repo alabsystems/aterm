@@ -1,47 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LINUX SUBPIXEL-RGB TEXT, stage 1 of `docs/RFC-linux-subpixel-text.md`:
-//! per-channel (LCD) glyph coverage for the CPU compositor path only.
+//! Linux subpixel-RGB text, stage 1 of `docs/RFC-linux-subpixel-text.md`: per-channel
+//! (LCD) glyph coverage for the CPU compositor path only.
 //!
-//! The desktop reference this chases (GNOME Terminal / foot with fontconfig
-//! `rgba=rgb`) encodes 3× horizontal resolution into the R/G/B subpixels of an
-//! LCD: each output pixel carries THREE coverage samples, one per channel, and
-//! the panel's physical subpixel geometry turns the chroma fringes back into
-//! sharpness. This module produces exactly that coverage: the same hinted
-//! outline the [`crate::hinted`] seam draws (LCD hint target, FreeType's
-//! `FT_LOAD_TARGET_LCD` twin) — or, with hinting off or on a face the LCD
-//! hinter declines, the unhinted outline the sfnt reader hands every unhinted
-//! raster in this crate — rasterized at 3× horizontal resolution by the same
-//! [`crate::raster`] coverage fill, then run through FreeType's default FIR5
-//! LCD filter and folded into 3-bytes-per-texel per-channel coverage.
+//! As with GNOME Terminal or foot under fontconfig `rgba=rgb`, each output pixel
+//! carries three coverage samples, one per subpixel, at 3× horizontal resolution. The
+//! outline is the [`crate::hinted`] seam's (LCD hint target, FreeType's
+//! `FT_LOAD_TARGET_LCD` twin), or the unhinted one when hinting is off or the LCD
+//! hinter declines the face; [`crate::raster`] fills it at 3×, then FreeType's default
+//! FIR5 LCD filter runs and the samples fold into 3 bytes per texel.
 //!
-//! STAGE-1 SCOPE (the RFC's §4 step 1, deliberately narrow so every state
-//! ships): CPU compositor only (the GPU backend keeps its R8 grayscale atlas
-//! untouched — stage 2 is the dual-source blend), primary-family text glyphs
-//! only, opaque frames only (translucency/wallpaper fall back to grayscale per
-//! frame), 1× cell scale only (DECDWL/DECDHL rows stay grayscale). Everything
-//! outside the gate renders through the unchanged grayscale path — the
-//! shared [`crate::GlyphImage`] store, the goldens, and macOS/Windows are
-//! byte-identical whether the flag is on or off.
+//! Stage 1 is deliberately narrow: CPU compositor only (the GPU keeps its R8 grayscale
+//! atlas; stage 2 is the dual-source blend), primary-family text glyphs, opaque frames
+//! (translucency and wallpaper fall back to grayscale per frame), 1× cell scale
+//! (DECDWL/DECDHL rows stay grayscale). Everything outside the gate takes the grayscale
+//! path, so the shared [`crate::GlyphImage`] store, the goldens, and macOS/Windows are
+//! byte-identical with the flag on or off.
 //!
-//! Production builds gate this to `cfg(all(unix, not(target_os = "macos")))` at the module
-//! declaration, exactly like [`crate::hinted`]: subpixel is the LINUX gap
-//! (macOS removed subpixel OS-wide; Windows has no aterm LCD story yet).
-//! macOS unit tests also compile this pure raster with embedded fonts.
+//! Built for `cfg(all(unix, not(target_os = "macos")))`, and for macOS unit tests,
+//! which call the raster directly with the embedded font: macOS removed subpixel
+//! rendering OS-wide and Windows has no aterm LCD path yet.
 
 use aterm_font::autohint::{HintingInstance, Target};
 
 use crate::hinted::PathPen;
 
-/// How per-channel coverage maps onto the panel's subpixel order. [`Off`](Self::Off)
-/// at renderer construction and set live from the `font_subpixel` config key like
-/// `font_hinting`; DEFAULT [`SubpixelMode::Off`] — this whole path is opt-in while
-/// stage 1 is judged on real screens (the RFC's kill criterion).
+/// How per-channel coverage maps onto the panel's subpixel order. Off at renderer
+/// construction and set live from the `font_subpixel` config key: opt-in while stage 1
+/// is judged on real screens (the RFC's kill criterion).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SubpixelMode {
-    /// Grayscale coverage everywhere — the shipped default, byte-identical to
-    /// the pre-subpixel renderer.
+    /// Grayscale coverage everywhere: the default.
     #[default]
     Off,
     /// Horizontal RGB stripes (the overwhelmingly common LCD geometry, and
@@ -53,11 +43,8 @@ pub(crate) enum SubpixelMode {
 }
 
 impl SubpixelMode {
-    /// Parse one mode spelling of the `font_subpixel` config key (via
-    /// `Renderer::set_font_subpixel`).
-    /// Unrecognized = [`SubpixelMode::Off`] (the default — forgiving in the
-    /// same direction as `font_hinting`, whose unrecognized spellings resolve
-    /// to ITS default).
+    /// Parse one `font_subpixel` spelling (via `Renderer::set_font_subpixel`); anything
+    /// unrecognized is [`SubpixelMode::Off`], as `font_hinting` falls back to its default.
     pub(crate) fn parse(s: &str) -> Self {
         match s.trim() {
             "rgb" | "on" | "1" | "true" => Self::Rgb,
@@ -82,27 +69,23 @@ impl SubpixelMode {
     }
 }
 
-/// The hinter target for the subpixel raster: the autohinter with the
-/// LCD smooth target — FreeType's `FT_LOAD_TARGET_LCD` pairing, which keeps
-/// vertical grid fit while leaving horizontal stem phases for the 3× subpixel
-/// resolution to resolve (snapping them, as the grayscale `full` mode does, is
-/// exactly what subpixel rendering exists to avoid). One fixed target on
-/// purpose: the desktop reference pairs `rgba=rgb` with one hint discipline,
-/// not a matrix. `font_hinting = "off"` disables hinting for the subpixel
-/// raster too (the caller passes no instance).
+/// The hinter target for the subpixel raster: the autohinter's LCD target (FreeType's
+/// `FT_LOAD_TARGET_LCD`), which grid-fits vertically and leaves horizontal stem phases
+/// to the 3× resolution; snapping them, as grayscale `full` does, is what subpixel
+/// rendering exists to avoid. `font_hinting = "off"` disables hinting here too (the
+/// caller passes no instance).
 pub(crate) fn lcd_hint_options() -> Target {
     Target::Lcd
 }
 
-/// FreeType's default FIR5 LCD filter (`FT_LCD_FILTER_DEFAULT`), fixed-point
-/// over 256: spreads each subpixel sample across its neighbours so the chroma
-/// fringes stay below the visibility threshold while the luminance keeps the
-/// 3× resolution. Sums to 256, so solid ink stays solid (255 → 255).
+/// FreeType's default FIR5 LCD filter (`FT_LCD_FILTER_DEFAULT`), fixed-point over 256:
+/// spreads each subpixel sample across its neighbours so chroma fringes stay below
+/// visibility while luminance keeps the 3× resolution. Sums to 256, so solid ink stays
+/// solid.
 const FIR5: [u32; 5] = [8, 77, 86, 77, 8];
 
-/// An aterm-font outline (design units, y up) recorded into a [`PathPen`] in
-/// pixels (y up): every coordinate times `scale` (`px / units_per_em`), the
-/// scale the grayscale unhinted raster draws with.
+/// Records an aterm-font outline (design units) into a [`PathPen`] in pixels, both
+/// y up, at `px / units_per_em`: the scale the grayscale unhinted raster draws with.
 struct Scaled<'a> {
     pen: &'a mut PathPen,
     scale: f32,
@@ -131,24 +114,18 @@ impl aterm_font::OutlineSink for Scaled<'_> {
     }
 }
 
-/// Rasterize glyph `gid` of the face at `px` as PER-CHANNEL (subpixel)
-/// coverage: `(width, height, xmin, ymin, bytes)` with **3 bytes per texel**
-/// in FRAMEBUFFER channel order (byte 0 → the `0x00RR0000` channel, 1 → GG,
-/// 2 → BB; `bgr` swaps which SUBPIXEL feeds R and B). Placement follows the
-/// [`crate::hinted::hinted_glyph_raster`] metric convention exactly — the
-/// blit anchor is `(cell_x + xmin, baseline - height - ymin)` — except the
-/// ink box is widened by 1 px on each side for the FIR5 filter spread (the
-/// filter reaches 2 subpixels past the ink, which is why `xmin` is one less
-/// than the grayscale raster's).
+/// Rasterize glyph `gid` of the face at `px` as per-channel (subpixel) coverage:
+/// `(width, height, xmin, ymin, bytes)` with 3 bytes per texel in framebuffer channel
+/// order (byte 0 → the `0x00RR0000` channel, 1 → GG, 2 → BB; `bgr` swaps which subpixel
+/// feeds R and B). Placement follows [`crate::hinted::hinted_glyph_raster`] (blit anchor
+/// `(cell_x + xmin, baseline - height - ymin)`), except the ink box is widened by 1 px
+/// each side for the FIR5 spread, so `xmin` is one less than the grayscale raster's.
 ///
-/// `hint`, when present, must be an LCD-target instance built from
-/// [`lcd_hint_options`]; `None` draws the unhinted outline at `px` (with
-/// `font_hinting = "off"`, and for a face the LCD instance builder declines),
-/// read through aterm-font at the face's default instance like the grayscale
-/// unhinted raster, not through the hinter (TF.2 of
-/// docs/AUDIT-third-party-2026-10-15.md). `None` return = no outline (space)
-/// or a parse/draw failure — the caller falls back to the grayscale blit, so
-/// this is always a safe enhancement, exactly the hint seam's contract.
+/// `hint`, when present, must be an LCD-target instance from [`lcd_hint_options`].
+/// `None` draws the unhinted outline (with `font_hinting = "off"`, or for a face the
+/// LCD instance builder declines), read through aterm-font at the face's default
+/// instance like the grayscale unhinted raster. Returns `None` for no outline (space)
+/// or a parse/draw failure, and the caller falls back to the grayscale blit.
 pub(crate) fn subpixel_glyph_raster(
     bytes: &[u8],
     index: u32,
@@ -168,8 +145,8 @@ pub(crate) fn subpixel_glyph_raster(
         None => {
             let face = aterm_font::Face::parse(bytes, index).ok()?;
             let scale = px / f32::from(face.units_per_em());
-            // `None` = no outline at all (space and friends) or a glyph id
-            // past the face: nothing to blit either way.
+            // `None`: no outline (space and friends), or a glyph id past the face
+            // or malformed; nothing to blit either way.
             face.outline_glyph(
                 aterm_font::GlyphId(gid),
                 &mut Scaled {
@@ -184,12 +161,10 @@ pub(crate) fn subpixel_glyph_raster(
         // path draws nothing for these either, so `None` is exact.
         return None;
     }
-    // 1 px of filter padding each side: the FIR5 spread reaches 2 subpixels
-    // (2/3 px) past the ink box. That pad also happens to be this path's
-    // [`crate::variation::RASTER_PAD`] — 3 subpixel samples of slack at 3×
-    // horizontal resolution — so the fitted outline can never sit ON the
-    // rasterizer's boundary and the accumulator-smear that ate the grayscale
-    // '2' at ppem 19 has no way in here. Do not narrow it back to the ink box.
+    // 1 px of filter padding each side: the FIR5 spread reaches 2 subpixels (2/3 px)
+    // past the ink box. The pad is also this path's [`crate::variation::RASTER_PAD`]
+    // (3 samples of slack at 3×), keeping the outline off the rasterizer's boundary;
+    // do not narrow it to the ink box.
     let x_min = pen.min_x.floor() - 1.0;
     let x_max = pen.max_x.ceil() + 1.0;
     let y_min = pen.min_y.floor();
@@ -278,9 +253,8 @@ mod tests {
         assert!(subpixel_glyph_raster(dejavu(), 0, gid, 12.0, Some(&hint), false).is_none());
     }
 
-    /// THE POINT of the module: stem edges carry per-channel structure — some
-    /// texel has R != B (the chroma-encoded fractional position gnome-terminal
-    /// shows) — while a grayscale raster is R == G == B by construction.
+    /// Stem edges carry per-channel structure (some texel has R != B), where a grayscale
+    /// raster is R == G == B by construction.
     #[test]
     fn stem_edges_carry_channel_structure() {
         let hint = lcd_instance(15.0);
@@ -299,13 +273,9 @@ mod tests {
         );
     }
 
-    /// Solid ink interior stays solid: FIR5 sums to 256, so a texel deep
-    /// inside a stem is (255, 255, 255) — subpixel must not thin solid
-    /// strokes, only re-encode their edges. Judged at 32px, where a DejaVu
-    /// '0' stem is ~3 px wide and MUST contain texels whose whole 5-subpixel
-    /// filter window is inside the ink (at body sizes a 1–1.5 px stem has no
-    /// such texel — every sample sees an edge, which is precisely the
-    /// resolution subpixel encodes).
+    /// Solid ink stays solid (FIR5 sums to 256): subpixel re-encodes edges and never
+    /// thins strokes. Judged at 32px, where a DejaVu '0' stem (~3 px) has texels whose
+    /// whole 5-subpixel window is ink; at body sizes every sample sees an edge.
     #[test]
     fn solid_interior_is_full_in_every_channel() {
         let hint = lcd_instance(32.0);

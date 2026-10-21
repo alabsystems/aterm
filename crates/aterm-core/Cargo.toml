@@ -8,9 +8,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm — lean, headless VT terminal engine core"
-# Integration tests are declared at the end of this file, not discovered: every
-# tests/*.rs is a `mod` of a suite root or its own [[test]] with the hazard that
-# needs a process of its own. With autotests off a file listed nowhere never
+# Integration tests are declared at the end of this file: every tests/*.rs is a `mod` of a suite
+# root, or its own [[test]] when it needs a process of its own. A file listed nowhere never
 # compiles.
 autotests = false
 
@@ -30,15 +29,18 @@ aterm-spec-anchor = { workspace = true }
 aterm-log = { workspace = true }
 aterm-hash = { workspace = true }
 aterm-codec = { workspace = true }
-# The one hardened PNG → RGBA8 decode (`aterm_png::decode_rgba8`): the engine
-# stores images as delivered, and decodes a PNG only to compose Kitty animation
-# frames, which composes pixels.
+# The workspace's one constant-time compare (`aterm_digest::ct_eq`, astream-digest's
+# re-exported): the shell-integration nonce check (terminal/shell_integration_auth.rs).
+# std-only and dependency-free, so it stays wasm-clean.
+aterm-digest = { workspace = true }
+# The one hardened PNG → RGBA8 decode (`aterm_png::decode_rgba8`): the engine stores images as
+# delivered and decodes a PNG only to compose Kitty animation frames.
 aterm-png = { workspace = true }
 aterm-types = { workspace = true }
 # The one dark/light classifier (`aterm_messages::ink::bg_is_light`), which the
 # reported colour scheme (DSR 996 / mode 2031) shares with the chrome.
-# aterm-messages depends only on aterm-time, so this adds no cycle and stays
-# wasm-clean.
+# aterm-messages depends only on aterm-time, aterm-types and aterm-grapheme,
+# so this adds no cycle and stays wasm-clean.
 aterm-messages = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 aterm-provenance = { workspace = true }

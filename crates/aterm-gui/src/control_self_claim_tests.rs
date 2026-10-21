@@ -368,17 +368,25 @@ fn only_a_proven_claims_holder_records_an_act() {
     let ok = Some(("OK\n".to_string(), true));
     // Not this form: falls through to `meta`.
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(1), aterm_slog::Actor::Ctl, &proof, "set title x"),
+        cmd_meta_harness_act(
+            ctx,
+            None,
+            Some(1),
+            aterm_slog::Actor::Ctl,
+            &proof,
+            "set title x"
+        ),
         None
     );
     assert_eq!(
-        cmd_meta_harness_act(ctx, Some(1), aterm_slog::Actor::Ctl, &proof, ""),
+        cmd_meta_harness_act(ctx, None, Some(1), aterm_slog::Actor::Ctl, &proof, ""),
         None
     );
     // No claim.
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(1),
             aterm_slog::Actor::Ctl,
             &proof,
@@ -394,6 +402,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(1),
             aterm_slog::Actor::Ctl,
             &proof,
@@ -419,6 +428,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(2),
             aterm_slog::Actor::Ctl,
             &no_proof,
@@ -430,6 +440,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(3),
             aterm_slog::Actor::Ctl,
             &no_proof,
@@ -440,6 +451,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(3),
             aterm_slog::Actor::Ctl,
             &proof,
@@ -464,6 +476,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(3),
             aterm_slog::Actor::Ctl,
             &reused,
@@ -492,6 +505,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(3),
             aterm_slog::Actor::Ctl,
             &moved,
@@ -509,11 +523,74 @@ fn only_a_proven_claims_holder_records_an_act() {
         "unset harness_act",
     ] {
         assert_eq!(
-            cmd_meta_harness_act(ctx, Some(2), aterm_slog::Actor::Ctl, &proof, rest),
+            cmd_meta_harness_act(ctx, None, Some(2), aterm_slog::Actor::Ctl, &proof, rest),
             usage,
             "{rest}"
         );
     }
+    // A landing's pre-admission reading belongs to the admitted act's
+    // commit, not a later caller-side write. Two admitted landings replace
+    // the mark in their commit order, including one reproved on another
+    // connection. Neither an ordinary act nor a refused landing replaces it.
+    let landing = |program_turns, busy_entries| crate::session_timeline::LandingMark {
+        program_turns,
+        busy_entries,
+    };
+    let mark = || {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .landing_mark()
+    };
+    for (conn, next) in [(2, landing(3, 5)), (3, landing(4, 6))] {
+        assert_eq!(
+            cmd_meta_harness_act(
+                ctx,
+                Some(next),
+                Some(conn),
+                aterm_slog::Actor::Ctl,
+                &proof,
+                "set harness_act landed@v1"
+            ),
+            ok
+        );
+        assert_eq!(acts(ctx).1.as_deref(), Some("landed@v1"));
+        assert_eq!(mark(), Some(next), "the admitted act committed its mark");
+    }
+    assert_eq!(
+        cmd_meta_harness_act(
+            ctx,
+            Some(landing(8, 9)),
+            Some(2),
+            aterm_slog::Actor::Ctl,
+            &proof,
+            "set harness_act continue"
+        ),
+        ok
+    );
+    assert_eq!(
+        mark(),
+        Some(landing(4, 6)),
+        "an ordinary act marks no landing"
+    );
+    let before = acts(ctx);
+    assert_eq!(
+        cmd_meta_harness_act(
+            ctx,
+            Some(landing(8, 9)),
+            Some(3),
+            aterm_slog::Actor::Ctl,
+            &no_proof,
+            "set harness_act landed@v1"
+        ),
+        denied
+    );
+    assert_eq!(acts(ctx), before, "a refused landing records nothing");
+    assert_eq!(
+        mark(),
+        Some(landing(4, 6)),
+        "nor replaces the admitted mark"
+    );
 }
 
 /// A PROVEN HOLDER'S ACT IS ONE ACT MARK (plan 5C-2; rulings T21, T24): in
@@ -523,8 +600,9 @@ fn only_a_proven_claims_holder_records_an_act() {
 /// hold (the caller's change wake notifies). The mark lands on the deepest
 /// open node, as `aterm help` teaches (`mark <node> act`): the session (`-`)
 /// while nothing is open, the approval's step while one is. An act with no
-/// word (`finished@v1`) is its row alone. NEGATIVE CONTROL: a denied act
-/// writes neither row nor mark.
+/// word (`finished@v1`) is a record too, `word=unknown` with no `rule=` (the
+/// review of 6F-7), its act whole at `harness_act=`. NEGATIVE CONTROL: a
+/// denied act writes neither row nor mark.
 #[test]
 fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
     use super::control_session::cmd_meta_harness_act;
@@ -540,7 +618,7 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
             .since(None)
             .filter(|e| e.kind == crate::session_timeline::HARNESS_ACT)
             .count();
-        let acts: Vec<(String, String, Actor, Src, Conf, Node)> = timeline
+        let acts: Vec<(String, String, String, Actor, Src, Conf, Node)> = timeline
             .slog()
             .log()
             .window()
@@ -549,6 +627,7 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
                 (
                     r.f.get_word(Key::Word).unwrap_or("-").to_string(),
                     r.f.get_str(Key::Rule).unwrap_or("-").to_string(),
+                    r.f.get_str(Key::HarnessAct).unwrap_or("-").to_string(),
                     r.by,
                     r.src,
                     r.conf,
@@ -564,6 +643,7 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(2),
             Actor::Ctl,
             &proof,
@@ -583,6 +663,7 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(2),
             Actor::Harness,
             &proof,
@@ -593,6 +674,7 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(2),
             Actor::Ctl,
             &proof,
@@ -605,6 +687,7 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
         (
             "approve".to_string(),
             "approve-all.v1".to_string(),
+            "approve-all@v1".to_string(),
             Actor::Ctl,
             claim.0,
             claim.1,
@@ -613,7 +696,17 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
         (
             "relaunch".to_string(),
             "upgrade.v1".to_string(),
+            "upgrade@v1".to_string(),
             Actor::Harness,
+            claim.0,
+            claim.1,
+            step,
+        ),
+        (
+            "unknown".to_string(),
+            "-".to_string(),
+            "finished@v1".to_string(),
+            Actor::Ctl,
             claim.0,
             claim.1,
             step,
@@ -625,6 +718,7 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
+            None,
             Some(3),
             Actor::Ctl,
             &no_proof,

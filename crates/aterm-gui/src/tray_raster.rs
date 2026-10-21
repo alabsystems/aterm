@@ -12,11 +12,10 @@
 //! overlay texture — so the tray looks IDENTICAL on both paths and stays WYSIWYG
 //! for the `image` introspection. Pure pixels; no window/GPU state.
 //!
-//! TYPOGRAPHY (grid standard): text prims are positioned by BASELINE; row-centred
-//! sites derive it from the cap-height centering rule ([`row_baseline`], backed by
-//! the machine-checked `aterm_render::chrome_metrics::baseline_in_row_q`), and the
-//! pen accumulates glyph advances in 26.6 fixed point with per-glyph rounding —
-//! placement error ≤ 0.5 px, drift-free (proven in `chrome_metrics`).
+//! Text prims are positioned by baseline: row-centred sites use the cap-height rule
+//! ([`row_baseline`], backed by `aterm_render::chrome_metrics::baseline_in_row_q`), and the pen
+//! accumulates advances in 26.6 fixed point with per-glyph rounding (placement error ≤ 0.5 px,
+//! no drift; proven in `chrome_metrics`).
 
 use std::collections::HashMap;
 use std::f32::consts::TAU;
@@ -24,17 +23,14 @@ use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use aterm_grapheme::GraphemeClusters;
-// THE chrome's face type. `aterm_render::font::Font` is the workspace's
-// first-party face — the one that retired `fontdue` — and the tray draws
-// through the SAME parsed faces the terminal renderer does, so it takes no
-// font dependency of its own. Aliased because the chrome names it in ~15
-// signatures and the full path buries them.
+// The chrome's face type: the same first-party parsed faces the terminal renderer draws with, so
+// the tray takes no font dependency of its own.
 use aterm_render::font::{Font as ChromeFont, Metrics as ChromeMetrics};
 
-/// Serialize the rare heavyweight Unicode-font warmups. Hot reload can replace
-/// a pending semantic fork; its dropped receiver prevents stale installation,
-/// while this gate prevents the old/new workers from concurrently parsing two
-/// temporary 100–370 MB copies before the process-wide Arc interner converges.
+/// Serializes the rare heavyweight Unicode-font warmups. A hot reload can replace a pending
+/// semantic fork (its dropped receiver prevents stale installation); this gate keeps old and new
+/// workers from parsing two temporary 100–370 MB copies at once before the process-wide `Arc`
+/// interner converges.
 static SEMANTIC_PREWARM_GATE: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,11 +275,9 @@ impl SemanticPrewarmWorker {
             .semantic_job
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // If the worker has not taken the generation-install job yet, a rapid
-        // candidate replacement must carry that one non-cloneable base forward.
-        // If it has taken it, the worker already owns the base and `pending` is
-        // empty. This closes the A→B-before-first-poll wedge without ever cloning
-        // a Renderer or falling back to UI-thread construction.
+        // If the worker has not yet taken the generation-install job, a replacement carries
+        // its non-cloneable base forward (otherwise the worker owns it and `pending` is empty),
+        // so a Renderer is never cloned or built on the UI thread.
         if let Some(previous) = pending.take() {
             let carries_base = crate::semantic_prewarm_replacement_carries_base(
                 job.base.is_some(),
@@ -331,9 +325,9 @@ fn resolve_candidate_face(
     resolved
 }
 
-/// Worker-only candidate construction. Family resolution, file reads, fontdue
-/// parsing, styled-face injection, and specimen warmup all happen here; the UI
-/// thread only swaps the finished renderer into its bounded cache.
+/// Worker-only candidate construction: family resolution, file reads, face parsing,
+/// styled-face injection and specimen warmup all happen here; the UI thread only swaps the
+/// finished renderer into its bounded cache.
 fn build_semantic_candidate(
     base: &Renderer,
     candidate: &crate::widget::SemanticFontCandidate,
@@ -453,6 +447,9 @@ pub(crate) trait UnicodeChars {
     fn char_metrics(&self, ch: char, px: f32) -> ChromeMetrics;
     /// The metrics and coverage mask of the glyph `ch` maps to, at `px`.
     fn char_raster(&self, ch: char, px: f32) -> (ChromeMetrics, Vec<u8>);
+    /// [`Self::char_raster`] with the pen `dx` px (`0.0..1.0`) right of a
+    /// whole pixel; `xmin` counts from that whole pixel.
+    fn char_raster_at(&self, ch: char, px: f32, dx: f32) -> (ChromeMetrics, Vec<u8>);
     /// The `kern` adjustment between the glyphs `left` and `right` map to.
     fn char_kern(&self, left: char, right: char, px: f32) -> Option<f32>;
 }
@@ -470,6 +467,10 @@ impl UnicodeChars for ChromeFont {
         self.rasterize_indexed(self.unicode_glyph_index(ch), px)
     }
 
+    fn char_raster_at(&self, ch: char, px: f32, dx: f32) -> (ChromeMetrics, Vec<u8>) {
+        self.rasterize_indexed_at(self.unicode_glyph_index(ch), px, dx)
+    }
+
     fn char_kern(&self, left: char, right: char, px: f32) -> Option<f32> {
         self.horizontal_kern_indexed(
             self.unicode_glyph_index(left),
@@ -483,12 +484,9 @@ impl UnicodeChars for ChromeFont {
 /// (OS/2 `sCapHeight`, measured-'H' fallback) and a per-char em-advance memo
 /// for [`measure_text`].
 struct ChromeFace {
-    /// Shared with the TERMINAL renderer's parse of the same bytes: the chrome
-    /// draws Settings/About/tabs in the user's terminal face
-    /// (`Renderer::chrome_primary_face`) and falls back to the same bundled
-    /// DejaVu the default renderer parses, so every chrome face here was a
-    /// byte-identical second copy of a face the process already held
-    /// (~6.9 MB of live heap each). See `aterm_render::shared_parsed_face`.
+    /// Shared with the terminal renderer's parse of the same bytes
+    /// (`aterm_render::shared_parsed_face`), so the chrome holds no second copy of a face it
+    /// already has (~6.9 MB of heap each).
     font: std::sync::Arc<ChromeFont>,
     /// Cap height as a fraction of the em (drives [`row_baseline`]).
     cap_ratio: f32,
@@ -496,8 +494,8 @@ struct ChromeFace {
     advances: std::collections::HashMap<char, f32>,
 }
 
-/// Reference size for the em-advance memo (large enough that fontdue's f32
-/// metric quantization is negligible).
+/// Reference size for the em-advance memo (large enough that f32 metric quantization is
+/// negligible).
 const ADVANCE_REF_PX: f32 = 64.0;
 
 impl ChromeFace {
@@ -511,11 +509,10 @@ impl ChromeFace {
         })
     }
 
-    /// A COVERAGE face — one the renderer's broad chain has already parsed
-    /// ([`ChromeFonts::coverage`]). It draws only a char the primary, the bold
-    /// sibling and the embedded DejaVu all lack, and it never sets a baseline
-    /// ([`chrome_cap_ratio`] reads the primary, else DejaVu), so its cap ratio
-    /// is never read; the Latin norm stands in.
+    /// A coverage face, one the renderer's broad chain already parsed
+    /// ([`ChromeFonts::coverage`]). It draws only chars the primary, the bold sibling and the
+    /// embedded DejaVu all lack, and never sets a baseline ([`chrome_cap_ratio`] reads the
+    /// primary, else DejaVu), so its cap ratio is never read; the Latin norm stands in.
     fn from_font(font: std::sync::Arc<ChromeFont>) -> Self {
         Self {
             font,
@@ -540,19 +537,12 @@ impl ChromeFace {
     }
 }
 
-/// The chrome's OWN ink for the admitted message glyphs no face it holds cold
-/// carries — `ℹ` (U+2139) and `⏸` (U+23F8). DejaVu Sans Mono (the embedded
-/// fallback), Menlo and SF Pro all lack both, so Settings ▸ Messages drew every
-/// Info row's severity cell blank while the band, on the terminal renderer's
-/// broad chain, drew it fine (Phase 2 review, 2026-09-22): the chain face that
-/// covers them is parsed lazily by the live terminal, so whether the page's
-/// coverage rung held it was luck. These two are drawn analytically at the
-/// pen's size — a ring with a dotted stem; two bars — placed on the cap box
-/// like any glyph, UNDER [`ChromeFonts::face_for`]'s last rung and only once
-/// every loaded face has missed, so no char a face covers changes face and the
-/// same ink lands on every host. Measured by the arithmetic the pen advances
-/// by ([`synthesized::advance`]), so a run that carries one is fitted to what
-/// is drawn.
+/// The chrome's own ink for the admitted message glyphs no cold face carries: `ℹ` (U+2139)
+/// and `⏸` (U+23F8), which DejaVu Sans Mono, Menlo and SF Pro all lack (the chain face that has
+/// them is parsed lazily by the live terminal). They are drawn analytically at the pen's size
+/// (a ring with a dotted stem; two bars) on the cap box, below [`ChromeFonts::face_for`]'s
+/// last rung, so no char a face covers changes face and every host gets the same ink.
+/// [`synthesized::advance`] is the pen's own advance, so a run carrying one measures as drawn.
 mod synthesized {
     use super::ChromeMetrics;
 
@@ -574,12 +564,10 @@ mod synthesized {
         inside: fn(f32, f32, f32) -> bool,
     }
 
-    /// `ℹ`: a ring 0.66 em across, its centre 0.36 em up (the cap box's
-    /// middle, where [`super::row_baseline`] centres a run), a dotted stem
-    /// inside it. Its strokes floor at one device pixel and the stem snaps
-    /// to the pixel grid — what hinting does for an outline at small sizes —
-    /// so an 11 px glyph keeps a legible ring and a solid spine instead of
-    /// two hairlines no pixel of which is ever fully lit.
+    /// `ℹ`: a ring 0.66 em across centred 0.36 em up (the cap box's middle, where
+    /// [`super::row_baseline`] centres a run), with a dotted stem. Strokes floor at one device
+    /// pixel and the stem snaps to the pixel grid, as hinting would, so an 11 px glyph keeps a
+    /// legible ring and a solid spine.
     const INFO: Design = Design {
         left: 0.05,
         right: 0.71,
@@ -716,6 +704,12 @@ impl UiCjkWeight {
 enum UiCjkScript {
     Han,
     Hangul,
+}
+
+/// Whether `ch` is in one of the East Asian blocks ([`ui_cjk_script`]): text
+/// of them breaks between its characters, with no hyphen.
+pub(crate) fn is_east_asian(ch: char) -> bool {
+    ui_cjk_script(ch).is_some()
 }
 
 /// The [`UiCjkScript`] of `ch`, or `None` for a char outside the East Asian
@@ -1054,13 +1048,20 @@ struct ChromeFonts {
 /// cannot reuse its address), while a string that reaches a fallback or
 /// coverage face — which land lazily — is measured afresh every time.
 /// Bounded: past [`MEASURE_MEMO_ENTRIES`] it starts over.
+///
+/// A hit is a hash of the string: the texts are keyed
+/// ([`aterm_hash::KeyedHashMap`], a peer's message or a session's title is
+/// among them), the face and size, which aterm makes, are not.
 #[derive(Default)]
 struct MeasureMemo {
     /// Per face and size: the font measured in, and each string's width.
-    widths: HashMap<(u16, u32), HeldMeasures<f32>>,
+    widths: aterm_hash::FxHashMap<(u16, u32), HeldMeasures<f32>>,
     /// Per size and line width: the UI font, and each text's line ranges
     /// and its scan count.
-    wraps: HashMap<(u32, u32), HeldMeasures<WrapLines>>,
+    wraps: aterm_hash::FxHashMap<(u32, u32), HeldMeasures<WrapLines>>,
+    /// Per rule, face, size and box width: the font, and each text's lines
+    /// ([`kept_lines`]).
+    lines: aterm_hash::FxHashMap<(LinesRule, u16, u32, u32), HeldMeasures<Vec<String>>>,
     entries: usize,
 }
 
@@ -1069,7 +1070,7 @@ struct MeasureMemo {
 type WrapLines = (Vec<std::ops::Range<usize>>, usize);
 
 /// The font some measures were taken in (held), and the measures.
-type HeldMeasures<T> = (Arc<ChromeFont>, HashMap<Box<str>, T>);
+type HeldMeasures<T> = (Arc<ChromeFont>, aterm_hash::KeyedHashMap<Box<str>, T>);
 
 /// How many measures [`MeasureMemo`] keeps before it starts over.
 const MEASURE_MEMO_ENTRIES: usize = 16_384;
@@ -1097,7 +1098,7 @@ impl MeasureMemo {
         let (held, widths) = self
             .widths
             .entry((face_code(face), px.to_bits()))
-            .or_insert_with(|| (Arc::clone(font), HashMap::new()));
+            .or_insert_with(|| (Arc::clone(font), aterm_hash::KeyedHashMap::default()));
         if !Arc::ptr_eq(held, font) {
             *held = Arc::clone(font);
             self.entries = self.entries.saturating_sub(widths.len());
@@ -1127,7 +1128,7 @@ impl MeasureMemo {
         let (held, wraps) = self
             .wraps
             .entry((px.to_bits(), width.to_bits()))
-            .or_insert_with(|| (Arc::clone(font), HashMap::new()));
+            .or_insert_with(|| (Arc::clone(font), aterm_hash::KeyedHashMap::default()));
         if !Arc::ptr_eq(held, font) {
             *held = Arc::clone(font);
             self.entries = self.entries.saturating_sub(wraps.len());
@@ -1138,11 +1139,81 @@ impl MeasureMemo {
         }
     }
 
+    fn lines(&self, at: LinesAt, font: &Arc<ChromeFont>, text: &str) -> Option<Vec<String>> {
+        let (held, kept) = self.lines.get(&at)?;
+        Arc::ptr_eq(held, font)
+            .then(|| kept.get(text).cloned())
+            .flatten()
+    }
+
+    fn keep_lines(&mut self, at: LinesAt, font: &Arc<ChromeFont>, text: &str, lines: &[String]) {
+        self.make_room();
+        let (held, kept) = self
+            .lines
+            .entry(at)
+            .or_insert_with(|| (Arc::clone(font), aterm_hash::KeyedHashMap::default()));
+        if !Arc::ptr_eq(held, font) {
+            *held = Arc::clone(font);
+            self.entries = self.entries.saturating_sub(kept.len());
+            kept.clear();
+        }
+        if kept.insert(text.into(), lines.to_vec()).is_none() {
+            self.entries += 1;
+        }
+    }
+
     fn make_room(&mut self) {
         if self.entries >= MEASURE_MEMO_ENTRIES {
             *self = Self::default();
         }
     }
+}
+
+/// The rule a text's kept lines were laid by ([`kept_lines`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LinesRule {
+    /// A paragraph of Settings copy (`native_settings::copy_paragraph_lines`).
+    Copy,
+    /// A setting's name on its row's label lines
+    /// (`native_settings::row_name_lines`).
+    RowName,
+}
+
+/// Where a text's kept lines were laid: by which rule, in which face, at
+/// which size, in a box how wide.
+type LinesAt = (LinesRule, u16, u32, u32);
+
+/// THE LINES `rule` LAYS `text` ON in `face` at `px` in a box `width` wide,
+/// as [`MeasureMemo`] keeps a measure: what `lay_out` lays out — which must
+/// measure only in `face` at `px` — kept only where the face maps every char
+/// of `text`, so the lines depend on that font, `px` and `width` alone. A
+/// page laid out again (every screen of a scrolled list, every redraw) finds
+/// its lines here instead of measuring every word again.
+pub(crate) fn kept_lines(
+    rule: LinesRule,
+    face: TextFace,
+    text: &str,
+    px: f32,
+    width: f32,
+    lay_out: impl FnOnce() -> Vec<String>,
+) -> Vec<String> {
+    let at = (rule, face_code(face), px.to_bits(), width.to_bits());
+    let font = {
+        let fonts = lock_fonts();
+        let Some(font) = fonts.ui_font(face) else {
+            drop(fonts);
+            return lay_out();
+        };
+        if let Some(lines) = fonts.measures.lines(at, font, text) {
+            return lines;
+        }
+        Arc::clone(font)
+    };
+    let lines = lay_out();
+    if text.chars().all(|character| font.maps(character)) {
+        lock_fonts().measures.keep_lines(at, &font, text, &lines);
+    }
+    lines
 }
 
 // TEST-ONLY WORK CENSUS: how many strings THIS thread has measured glyph by
@@ -1165,10 +1236,8 @@ fn note_measure_walk() {
 }
 
 fn default_chrome_fonts() -> ChromeFonts {
-    // Keep the cold store identical in production and tests. Backend
-    // construction is the one boundary that installs immutable UI assets via
-    // `set_chrome_fonts`; direct-view tests must exercise that transition
-    // explicitly instead of receiving a test-only prepared store.
+    // The cold store is identical in production and tests: backend construction installs UI
+    // assets through `set_chrome_fonts`, and direct-view tests cross that transition explicitly.
     ChromeFonts {
         primary: None,
         bold: None,
@@ -1307,11 +1376,9 @@ fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-// TEST-ONLY WORK CENSUS: how many times THIS thread has entered the font store.
-// Every text measure — `ui_text_width_for`, `measure_text`, a wrap — enters it
-// once, so the count a view's render adds is its text work in a unit that a
-// loaded machine cannot stretch, as a stopwatch's (wall or thread CPU) reading
-// of the same render is stretched. Read through `font_store_visits`.
+// Test-only work census: how many times this thread has entered the font store. Every text
+// measure enters it once, so the count a render adds is its text work in a unit a loaded
+// machine cannot stretch. Read through `font_store_visits`.
 #[cfg(test)]
 thread_local! {
     static FONT_STORE_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1425,11 +1492,10 @@ pub(crate) fn set_prepared_chrome_fonts(prepared: PreparedChromeFonts) {
     );
 }
 
-/// One chrome-font reload on the locked context — the body [`set_chrome_fonts`]
-/// and [`set_prepared_chrome_fonts`] share, and `SemanticPrewarmGeneration`'s
-/// `Reload`. Installing the faces bumps the semantic generation; the job still
-/// queued for the superseded one is dropped in the same critical section, so
-/// the worker never parses a fork of a renderer that is gone.
+/// One chrome-font reload on the locked context, shared by [`set_chrome_fonts`] and
+/// [`set_prepared_chrome_fonts`] (`SemanticPrewarmGeneration`'s `Reload`). Installing the
+/// faces bumps the semantic generation and drops the job queued for the superseded one in the
+/// same critical section, so the worker never forks a renderer that is gone.
 fn reload_chrome_fonts_locked(
     fonts: &mut ChromeFonts,
     primary: Option<ChromeFace>,
@@ -1448,19 +1514,32 @@ fn reload_chrome_fonts_locked(
     }
     // The UI faces' own CJK and Hangul faces and the new generation's chain
     // faces, parsed off this thread before a title needs them
-    // ([`warm_chrome_coverage`]).
-    #[cfg(all(not(test), any(windows, target_os = "linux")))]
-    {
-        let chain = fonts.semantic.as_ref().map(Renderer::fallback_coverage);
-        let ui = fonts.ui_cjk.clone();
-        if chain.is_some() || ui.is_some() {
-            let _ = crate::qos::spawn_lane_thread(
-                "aterm-chrome-coverage-warm",
-                crate::qos::Role::Background,
-                move || warm_chrome_coverage(chain.as_ref(), ui.as_deref()),
-            );
-        }
+    // ([`chrome_coverage_warm`]).
+    #[cfg(not(test))]
+    if let Some(warm) = chrome_coverage_warm(fonts) {
+        let _ = crate::qos::spawn_lane_thread(
+            "aterm-chrome-coverage-warm",
+            crate::qos::Role::Background,
+            warm,
+        );
     }
+}
+
+/// THE WARM A CHROME-FONT INSTALL SPAWNS ([`warm_chrome_coverage`]): the
+/// installed generation's chain faces and the UI faces' own East Asian faces
+/// ([`UiCjkFaces`]), or `None` with neither to warm. Every platform's: the
+/// chrome draws a char its UI face lacks only from a face it holds parsed
+/// ([`ChromeFonts::face_for`]), and on macOS the terminal's chain faces draw
+/// through CoreText and are never parsed for the grid, so nothing else ever
+/// parsed one there. Warmed on Windows and Linux only, a macOS Settings or
+/// Manual label drew a CJK title as blank advances (a windowed capture of
+/// Settings > Messages, 2026-10-21: "…" where a Japanese title stood, the
+/// band above drawing the same title through the grid).
+fn chrome_coverage_warm(fonts: &ChromeFonts) -> Option<impl FnOnce() -> usize + Send + 'static> {
+    let chain = fonts.semantic.as_ref().map(Renderer::fallback_coverage);
+    let ui = fonts.ui_cjk.clone();
+    (chain.is_some() || ui.is_some())
+        .then_some(move || warm_chrome_coverage(chain.as_ref(), ui.as_deref()))
 }
 
 /// What the startup warm asks the faces for: Han, kana and Hangul. Their
@@ -1469,7 +1548,6 @@ fn reload_chrome_fonts_locked(
 /// commonest titles the UI faces cannot draw. Every other script's chain face
 /// costs a few ms at most (`Nirmala.ttc` ~5 ms, `LeelawUI.ttf` under 1 ms),
 /// cheap enough for the frame that first needs it.
-#[cfg(any(windows, target_os = "linux"))]
 const CHROME_COVERAGE_WARM: &str = "日の한";
 
 /// Parse, on the calling thread, the faces a Han, kana or Hangul label draws
@@ -1484,10 +1562,10 @@ const CHROME_COVERAGE_WARM: &str = "日の한";
 /// UI thread holds, and a UI thread that needs a face before it lands parses
 /// it itself (neither store blocks one holder behind another). The chain's
 /// parse lands in cells the live terminal shares; the UI faces' store lives
-/// for the process, so a reload parses none of them again. Windows and Linux
-/// only, where the pixel tab band draws titles; a macOS chain face draws
-/// through CoreText and is never parsed for the grid. Answers how many faces
-/// it parsed.
+/// for the process, so a reload parses none of them again. Every platform:
+/// a macOS chain face draws through CoreText for the grid and is parsed by
+/// nothing else, so this is what lets a Settings or Manual label draw one
+/// there ([`chrome_coverage_warm`]). Answers how many faces it parsed.
 ///
 /// COST, MEASURED 2026-10-18 on Windows 11 26200 (the default chain:
 /// `msyhbd.ttc`, `malgunbd.ttf`): the two chain parses take 55 ms of one
@@ -1502,7 +1580,6 @@ const CHROME_COVERAGE_WARM: &str = "日の한";
 /// `YuGothB.ttc` face 2 39-43 ms, `malgunbd.ttf` 23-31 ms, about 125 ms of the
 /// same background core, and 1.70 MB more private commit
 /// (`K32GetProcessMemoryInfo`, before and after the warm of a cold store).
-#[cfg(any(windows, target_os = "linux"))]
 fn warm_chrome_coverage(
     chain: Option<&aterm_render::FallbackCoverage>,
     ui: Option<&UiCjkFaces>,
@@ -1536,8 +1613,8 @@ fn install_chrome_faces_locked(
     fonts.set_ui_cjk(ui_cjk_store_for_install());
     fonts.semantic_generation = fonts.semantic_generation.wrapping_add(1);
     fonts.semantic = semantic;
-    // The rung is a memo over the OLD renderer's chain; `sync_coverage` refills
-    // it from the new one on the first miss that asks.
+    // The rung is a memo over the old renderer's chain; `sync_coverage` refills it from the
+    // new one on the first miss that asks.
     fonts.coverage.clear();
     fonts.semantic_identity = fonts
         .semantic
@@ -1553,17 +1630,9 @@ fn install_chrome_faces_locked(
     fonts.semantic_prewarm_ms = None;
 }
 
-/// Test-only fixture seam: install `renderer` as this test thread's SETTLED
-/// semantic chrome font.
-///
-/// Preview unit tests paint one spec several times and assert pixel identity.
-/// Production installs a dormant seed and lets the parked worker's warmup
-/// LAND asynchronously; in a parallel test run that landing can fall between
-/// two of those paints, swapping the active cascade mid-test (the pass-
-/// isolated/fail-parallel flake in `settings_preview::tests`). Here the
-/// worker's exact install-generation warmup runs INLINE instead, and no
-/// worker is parked on this thread's context, so nothing can land later:
-/// every paint on this thread sees one settled cascade.
+/// Test-only: install `renderer` as this test thread's settled semantic chrome font. The
+/// worker's install-generation warmup runs inline and no worker is parked, so nothing lands
+/// between two paints of a pixel-identity test (production's warmup lands asynchronously).
 #[cfg(test)]
 pub(crate) fn install_settled_chrome_fonts_for_test(mut renderer: Renderer) -> u64 {
     // The same warmup `SemanticPrewarmWorker` runs when a job installs a new
@@ -1574,8 +1643,8 @@ pub(crate) fn install_settled_chrome_fonts_for_test(mut renderer: Renderer) -> u
     );
     let mut fonts = lock_fonts();
     install_chrome_faces_locked(&mut fonts, None, None, Some(renderer));
-    // SETTLED, not dormant: the warmup already ran inline above, and no
-    // parked worker exists to replace the cascade asynchronously.
+    // Settled, not dormant: the warmup ran inline above and no parked worker can replace the
+    // cascade.
     fonts.semantic_prewarm_ms = Some(0);
     fonts.semantic_worker = None;
     fonts.semantic_ready_epoch
@@ -1658,12 +1727,11 @@ impl Drop for PendingChromeFontsForTest {
     }
 }
 
-/// Test-only twin of [`install_settled_chrome_fonts_for_test`] that installs
-/// `renderer` exactly as production's [`set_chrome_fonts`] does — DORMANT, no
-/// warm-up — but parks no worker, so nothing can land through this store
-/// later. The seam for a test whose subject is a chain face landing OUTSIDE
-/// the store: the live terminal parsing a cell the seed shares.
-#[cfg(all(test, not(target_os = "macos")))]
+/// Test-only twin of [`install_settled_chrome_fonts_for_test`] that installs `renderer` as
+/// production's [`set_chrome_fonts`] does (dormant, no warmup) but parks no worker, so nothing
+/// lands through this store later: for a test whose subject is a chain face landing outside the
+/// store (the live terminal parsing a cell the seed shares).
+#[cfg(test)]
 pub(crate) fn install_dormant_chrome_fonts_for_test(renderer: Renderer) -> u64 {
     let mut fonts = lock_fonts();
     install_chrome_faces_locked(&mut fonts, None, None, Some(renderer));
@@ -1742,7 +1810,7 @@ pub(crate) fn install_chrome_fonts_with_cjk_chain_for_test() -> bool {
 /// between the sealed generation and the seed — plus the host UI faces.
 /// Answers the sealed generation, which keeps the cells alive beside the seed;
 /// `None` when the host has no such face (the caller ends COULD NOT RUN).
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 pub(crate) fn install_unparsed_cjk_chain_for_test() -> Option<Renderer> {
     let path = cjk_chain_face_path_for_test()?;
     let theme = aterm_render::Theme::default();
@@ -1759,7 +1827,7 @@ pub(crate) fn install_unparsed_cjk_chain_for_test() -> Option<Renderer> {
 /// Whether THIS test thread's chrome cascade draws `ch` from a face it holds
 /// parsed (the terminal stack and the coverage rung, [`ChromeFonts::face_for`]),
 /// read without parsing anything.
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 pub(crate) fn chrome_cascade_reaches_for_test(ch: char) -> bool {
     lock_fonts().face_for(TextWeight::Regular, ch).is_some()
 }
@@ -1786,11 +1854,9 @@ pub(crate) fn chrome_font_epoch_for_test() -> u64 {
     lock_fonts().semantic_ready_epoch
 }
 
-/// Direct semantic-view tests do not construct a renderer backend, so they
-/// explicitly install the same immutable proportional faces that backend
-/// startup would install. This keeps [`default_chrome_fonts`] production-cold
-/// while letting view-layout fixtures opt into production typography without
-/// replacing an already-installed semantic renderer.
+/// Direct semantic-view tests build no renderer backend, so they install the immutable
+/// proportional faces backend startup would, keeping [`default_chrome_fonts`] cold without
+/// replacing an installed semantic renderer.
 #[cfg(test)]
 pub(crate) fn prepare_ui_fonts_for_direct_view_test() {
     let ui = prepared_ui_font_assets();
@@ -1817,11 +1883,8 @@ pub(crate) fn host_ui_cjk_faces_for_test() -> Option<Arc<UiCjkFaces>> {
     UiCjkFaces::host().map(Arc::new)
 }
 
-/// The inverse seam: return THIS test thread's chrome stack to the cold,
-/// UI-face-less store. Libtest reuses worker threads, so a test that asserts
-/// the "no UI face installed" branch (the strip band's decline path) cannot
-/// assume a cold thread — an earlier test on the same worker may have prepared
-/// the faces.
+/// The inverse seam: return this test thread's chrome stack to the cold, UI-face-less store.
+/// Libtest reuses worker threads, so a test of the no-UI-face branch cannot assume a cold one.
 #[cfg(test)]
 pub(crate) fn clear_ui_fonts_for_test() {
     let mut fonts = lock_fonts();
@@ -1873,10 +1936,9 @@ pub(crate) fn prepared_semantic_font_for_direct_view_test(
     }
 }
 
-/// Which face of the chrome stack draws a glyph — the PURE policy (the proof
-/// target; no font I/O). A bold run whose real bold face covers the char takes
-/// the BOLD face; else a char the user's primary covers takes the PRIMARY; the
-/// embedded DejaVu is STRICTLY a coverage fallback.
+/// Which face of the chrome stack draws a glyph: the pure policy (no font I/O). A bold run
+/// whose real bold face covers the char takes the bold face, else a char the primary covers
+/// takes the primary; the embedded DejaVu is only a coverage fallback.
 ///
 /// # Invariant (proven)
 /// `Fallback` is returned ONLY when neither user face applies
@@ -2200,12 +2262,10 @@ impl ChromeFonts {
             self.semantic_resolution.clone(),
             elapsed_ms,
         );
-        // Parking the active renderer IS a change of what a fork would contain:
-        // `semantic` and `semantic_identity` both just went to `None`. The
-        // install/cache-hit callers bump the epoch immediately afterwards, but
-        // the pre-request park in `ensure_semantic_candidate` did not — which
-        // left `semantic_ready_epoch` briefly unable to witness the removal.
-        // Bumping here makes the epoch a TOTAL key over the fork's inputs.
+        // Parking the active renderer changes what a fork would contain (`semantic` and
+        // `semantic_identity` are now `None`), so the epoch moves here too, keeping it a total
+        // key over the fork's inputs (the pre-request park in `ensure_semantic_candidate`
+        // bumps nothing itself).
         self.semantic_ready_epoch = self.semantic_ready_epoch.wrapping_add(1);
     }
 
@@ -2390,10 +2450,8 @@ pub(crate) fn semantic_font_snapshot_for_test(
     semantic_font_snapshot_locked(&lock_fonts(), candidate)
 }
 
-/// One captured semantic fork: `(candidate, ready_epoch, fork)` — the memo key
-/// followed by the renderer it produced (`None` when that key resolved to "no
-/// semantic font"). Named because the inline spelling trips
-/// `clippy::type_complexity` under the workspace's `-D warnings`.
+/// One captured semantic fork, `(candidate, ready_epoch, fork)`: the memo key and the renderer
+/// it produced (`None` when that key resolved to no semantic font).
 type SemanticForkMemo = (
     crate::widget::SemanticFontCandidate,
     u64,
@@ -2401,29 +2459,15 @@ type SemanticForkMemo = (
 );
 
 thread_local! {
-    /// The last semantic fork this thread captured, keyed by
-    /// `(candidate, snapshot.ready_epoch)`.
-    ///
-    /// A fork is NOT cheap: `Renderer::fork_semantic_surface` re-parses the
-    /// whole primary face ([`ChromeFont::from_bytes`], again for the real bold
-    /// sibling) plus its metric/feature tables. [`prepare_semantic_font`] runs
-    /// on EVERY native compile and every preview tick while a Settings page is
-    /// front, so an animating preview paid two full font parses per frame for a
-    /// value that never differs between them.
-    ///
-    /// Reusing the `Rc` is byte-identical to handing each compilation its own
-    /// copy: the captured renderer is immutable by construction —
-    /// [`PreparedSemanticFont::fork`] takes `&self` and every consumer forks its
-    /// own private mutable renderer off it — so nothing can observe the sharing
-    /// (identity is never compared; `PartialEq`/`Debug` see only
-    /// `renderer.is_some()`).
-    ///
-    /// `snapshot.ready_epoch` folds `semantic_ready_epoch` with the
-    /// identity-match and pending bits, so it moves on every transition that can
-    /// change what a fork contains; the candidate is part of the key because
-    /// those two bits are computed against it. Thread-local because `Renderer`
-    /// is deliberately thread-bound (`Rc`, `!Send`) — and because it then
-    /// matches the per-thread test font store's isolation exactly.
+    /// The last semantic fork this thread captured, keyed by `(candidate,
+    /// snapshot.ready_epoch)`. A fork re-parses the primary face (and its bold sibling), and
+    /// [`prepare_semantic_font`] runs on every native compile and preview tick, so it is
+    /// memoized. Sharing the `Rc` is unobservable: the captured renderer is immutable
+    /// ([`PreparedSemanticFont::fork`] takes `&self` and each consumer forks its own) and its
+    /// identity is never compared. `ready_epoch` folds `semantic_ready_epoch` with the
+    /// identity-match and pending bits, so it moves on every change to what a fork contains;
+    /// the candidate is in the key because those bits are computed against it. Thread-local
+    /// because `Renderer` is thread-bound.
     static SEMANTIC_FORK_MEMO: std::cell::RefCell<Option<SemanticForkMemo>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -2434,9 +2478,9 @@ pub(crate) fn prepare_semantic_font(
     candidate: &crate::widget::SemanticFontCandidate,
 ) -> PreparedSemanticFont {
     let mut fonts = lock_fonts();
-    // The request/poll transition and the snapshot run on EVERY call, memo hit
-    // or not: the former drives the worker convergence and the latter is paint
-    // identity. Only the fork itself is memoized.
+    // The request/poll transition and the snapshot run on every call, memo hit or not: the
+    // former drives worker convergence and the latter is paint identity. Only the fork is
+    // memoized.
     let _ = fonts.ensure_semantic_candidate(candidate);
     let snapshot = semantic_font_snapshot_locked(&fonts, candidate);
     let memoized = SEMANTIC_FORK_MEMO.with(|slot| {
@@ -2473,9 +2517,8 @@ pub(crate) fn prepare_semantic_font(
     }
 }
 
-/// The width of `s` at `px` in the chrome stack — REAL advances (per-char face
-/// pick + fixed-point accumulation, the same arithmetic the raster pen uses),
-/// replacing the old `0.6 em × chars` estimate.
+/// The width of `s` at `px` in the chrome stack: real advances (per-char face pick and
+/// fixed-point accumulation, the arithmetic the raster pen uses).
 pub(crate) fn measure_text(s: &str, px: f32, weight: TextWeight) -> f32 {
     let mut fonts = lock_fonts();
     let mut pen_q: i64 = 0;
@@ -2500,12 +2543,11 @@ fn chrome_cap_ratio() -> f32 {
         .map_or(0.7, |f| f.cap_ratio)
 }
 
-/// The cap-height-centred BASELINE for a `size`-px run in the row
-/// `[y0, y0 + row_h)`: `row_center + cap_height/2` (the leading-trim rule),
-/// via the machine-checked fixed-point law
-/// [`aterm_render::chrome_metrics::baseline_in_row_q`] — top and bottom gaps
-/// balance within 1px for any `(row_h, cap)` with `cap <= row_h`. Mixed-size
-/// runs on one visual row share the baseline computed from the DOMINANT size.
+/// The cap-height-centred baseline for a `size`-px run in the row `[y0, y0 + row_h)`:
+/// `row_center + cap_height/2` (the leading-trim rule), via the machine-checked fixed-point law
+/// [`aterm_render::chrome_metrics::baseline_in_row_q`]; top and bottom gaps balance within 1px
+/// for any `(row_h, cap)` with `cap <= row_h`. Mixed-size runs on one visual row share the
+/// baseline of the dominant size.
 pub(crate) fn row_baseline(y0: f32, row_h: f32, size: f32) -> f32 {
     let cap_q = px_to_q(size * chrome_cap_ratio());
     q_to_px(baseline_in_row_q(px_to_q(y0), px_to_q(row_h), cap_q))
@@ -2518,23 +2560,19 @@ pub(crate) fn row_baseline(y0: f32, row_h: f32, size: f32) -> f32 {
 struct UiFontAssets {
     regular: Option<Arc<ChromeFont>>,
     semibold: Option<Arc<ChromeFont>>,
-    /// T3, the FULL cut for one caller: when the regular is a VARIABLE face
-    /// with a `wght` axis (Segoe UI Variable on Win11), its raw bytes and the
-    /// resolved semibold coords, so a pixel-space painter can instance the
-    /// real wght-600 cut through `aterm_render::variation::varied_glyph_raster`
-    /// instead of the static sibling. `None` for a static regular — and the
-    /// bytes are retained ONLY in the variable case, and never on macOS, whose
-    /// chrome has no strip band to read them.
+    /// When the regular is a variable face with a `wght` axis (Segoe UI Variable on Win11),
+    /// its bytes and the resolved semibold coords, so a pixel-space painter can instance the
+    /// real wght-600 cut through `aterm_render::variation::varied_glyph_raster`. `None` for a
+    /// static regular; never kept on macOS, which has no strip band to read it.
     #[cfg(not(target_os = "macos"))]
     variable_semibold: Option<UiVariableSemibold>,
 }
 
-/// The variable UI face instanced at SEMIBOLD, for the one painter that draws
-/// outside fontdue (the Windows strip band's active label —
-/// [`crate::tab_bar::pixel_band`]). fontdue has no variation API, so
-/// `ChromeFonts::ui_semibold` above stays the static `seguisb.ttf`; this is the
-/// honest way to the Win11 "Segoe UI Variable Semibold" without pairing the
-/// variable file with itself (two wght-400 faces and no contrast).
+/// The variable UI face instanced at semibold, for the one painter that instances a variation
+/// itself (the Windows strip band's active label, [`crate::tab_bar::pixel_band`]). `ChromeFont`
+/// draws only a variable face's default instance, so `ChromeFonts::ui_semibold` stays the
+/// static `seguisb.ttf`; this reaches Win11's "Segoe UI Variable Semibold" without pairing the
+/// variable file with itself (two wght-400 faces, no contrast).
 #[derive(Clone)]
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct UiVariableSemibold {
@@ -2561,11 +2599,9 @@ pub(crate) struct UiVariableSemibold {
 #[cfg(not(target_os = "macos"))]
 const UI_SEMIBOLD_WGHT: f32 = 600.0;
 
-/// Resolve [`UiVariableSemibold`] for a just-parsed regular, or `None` when the
-/// face is static, has no `wght` axis, or its axis cannot reach a weight that
-/// is visibly heavier than the regular (a face whose `wght` tops out near 400
-/// would hand `UiBold` a look-alike — the exact contrast loss the "never pair
-/// SegUIVar with itself" rule guards against, in another coat).
+/// Resolve [`UiVariableSemibold`] for a just-parsed regular, or `None` when the face is static,
+/// has no `wght` axis, or cannot reach a weight visibly heavier than the regular (a `wght` that
+/// tops out near 400 would give `UiBold` a look-alike).
 #[cfg(not(target_os = "macos"))]
 fn variable_semibold_of(
     bytes: aterm_render::font::FaceBytes,
@@ -2597,30 +2633,12 @@ struct UiFontCandidate {
 #[cfg(target_os = "macos")]
 fn ui_font_candidates() -> Vec<UiFontCandidate> {
     vec![
-        // NO SF ENTRY, and the reason is a property of the file rather than a
-        // preference. `/System/Library/Fonts/SFNS.ttf` is NOT a TrueType
-        // collection — its magic is `0001 0000` (a plain sfnt), not `ttcf` — so
-        // it has exactly ONE face and no face index above 0 can ever resolve.
-        // SF's weights live on an `fvar` WEIGHT AXIS (the file carries fvar/gvar/
-        // avar/HVAR/MVAR/STAT), i.e. they are variable-font instances, and
-        // fontdue parses only the default instance. There is no static SF
-        // semibold on disk to point at either.
-        //
-        // This list previously led with `SFNS.ttf` face 0 + face 6 described as
-        // "a TrueType collection whose normal-width semibold is face 6". Both
-        // clauses were false, so `resolve_ui_font_assets` parsed face 0 (~81 ms),
-        // failed face 6 (~26 ms), discarded BOTH because it requires a candidate
-        // to supply regular AND semibold, and fell through to Helvetica Neue —
-        // which is therefore what has always shipped. Removing the entry changes
-        // no pixel; it stops paying ~107 ms per launch for a result that was
-        // always thrown away.
-        //
-        // Helvetica Neue IS the macOS chrome UI face (decided 2026-09-25 under
-        // the owner's standing direction; docs/INTROSPECTABLE_SURFACES_DESIGN.md
-        // §9 now says so). SF Pro would be a deliberate appearance change, not a
-        // candidate entry: `SFNS.ttf` is one variable face, which the UI path
-        // could draw through `aterm_render::variation` (`VariedFace` at a resolved
-        // wght) if that change is ever wanted.
+        // No SF entry: `/System/Library/Fonts/SFNS.ttf` is one variable face (a plain sfnt, not
+        // a `ttcf` collection) whose weights are `fvar` instances, and no static SF semibold
+        // exists on disk, so it cannot supply the regular + semibold pair a candidate needs.
+        // Helvetica Neue is the macOS chrome UI face (docs/INTROSPECTABLE_SURFACES_DESIGN.md
+        // §9); SF Pro would be a deliberate appearance change, drawn through
+        // `aterm_render::variation` at a resolved wght.
         UiFontCandidate {
             regular_path: "/System/Library/Fonts/HelveticaNeue.ttc".into(),
             regular_index: 0,
@@ -2637,25 +2655,15 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
         .join("Fonts");
     vec![
-        // T3 — the Win11 UI cut. `SegUIVar.ttf` is a variable font whose `fvar`
-        // DEFAULT instance (wght 400, opsz 10.5) carries name id 17 "Regular" and
-        // IS "Segoe UI Variable Text" — the exact face Win11 sets its own chrome
-        // in at 12–23 px. fontdue parses only a variable font's default-instance
-        // outlines, which here is precisely the instance we want, so pointing
-        // `regular_path` at the file lands the Fluent regular with no variation
-        // machinery at all.
+        // The Win11 UI cut. `SegUIVar.ttf`'s default `fvar` instance (wght 400, opsz 10.5) is
+        // "Segoe UI Variable Text", the face Win11 sets its own chrome in at 12–23 px, and the
+        // default instance is what `ChromeFont` draws, so the regular needs no variation work.
         //
-        // The fontdue SEMIBOLD deliberately stays the STATIC `seguisb.ttf`.
-        // Pairing SegUIVar with itself would silently install TWO wght-400 faces
-        // (`resolve_ui_font_assets` accepts any pair that parses — it cannot see
-        // weights), and every `UiBold` heading would lose its contrast with no
-        // error anywhere. fontdue has no variation API, so instancing wght 600
-        // out of SegUIVar happens OUTSIDE it: the resolver also keeps the
-        // variable file's bytes + the semibold coords (`UiVariableSemibold`),
-        // and the one painter that draws through the portable varied rasterizer
-        // — the strip band's active label — takes the real "Segoe UI Variable
-        // Semibold". Every fontdue-drawn `UiBold` (Settings/About headings)
-        // keeps the static Win10 semibold: the same weight, a sibling cut.
+        // The semibold stays the static `seguisb.ttf`: pairing SegUIVar with itself would
+        // install two wght-400 faces (`resolve_ui_font_assets` cannot see weights) and every
+        // `UiBold` heading would silently lose its contrast. The resolver also keeps the
+        // variable file and semibold coords (`UiVariableSemibold`) for the one painter that
+        // instances wght 600 itself, the strip band's active label.
         UiFontCandidate {
             regular_path: root.join("SegUIVar.ttf"),
             regular_index: 0,
@@ -2741,17 +2749,12 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
         .collect()
 }
 
-/// Install, as THIS test thread's UI faces, the first pair of the Linux ladder
-/// ([`LINUX_UI_FONT_PAIRS`]) whose two files parse — the faces a Linux window measures
-/// and paints its chrome with — so a test can judge a layout's fit with Linux metrics
-/// on any host. With `root`, each file is looked up by its FILE NAME in that directory
-/// instead (a folder holding `NotoSans-Regular.ttf` and `NotoSans-Bold.ttf`, say), so a
-/// host without Linux's font tree can still measure with the ladder's faces. Answers
-/// the regular face's path, or `None` when no pair is readable — the faces installed
-/// before are then left alone.
-///
-/// Call it AFTER building the test's `ViewCx`: that fixture installs the host's own
-/// faces ([`prepare_ui_fonts_for_direct_view_test`]).
+/// Install, as this test thread's UI faces, the first pair of the Linux ladder
+/// ([`LINUX_UI_FONT_PAIRS`]) whose files both parse, so a test can judge a layout's fit with
+/// Linux metrics on any host. With `root`, each file is looked up by file name in that
+/// directory instead. Answers the regular face's path, or `None` when no pair is readable (the
+/// installed faces are then left alone). Call it after building the test's `ViewCx`, which
+/// installs the host's own faces ([`prepare_ui_fonts_for_direct_view_test`]).
 #[cfg(test)]
 pub(crate) fn install_linux_ui_fonts_for_test(
     root: Option<&std::path::Path>,
@@ -2785,19 +2788,11 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
     Vec::new()
 }
 
-/// The UI face FILES one `resolve_ui_font_assets` admitted, each DISTINCT
-/// path once, plus how many admissions that took.
-///
-/// The macOS candidate names `/System/Library/Fonts/HelveticaNeue.ttc` for
-/// BOTH its faces (regular = index 0, semibold = index 10), and the resolver
-/// used to `std::fs::read` the 4.47 MB collection once per face — unbounded,
-/// and two independent heap copies retained for the process's life by the two
-/// parsed faces. One admission per path, and through
-/// `font_file::admit_font_file`: the same bounded admission the terminal
-/// faces get, which MAPS a file on the system font volume, so the
-/// collection is file-backed pages shared with every other process, not
-/// 8.9 MB of anonymous heap per window. `reads` lives on the value rather than
-/// in a process-global counter so the proof of "once" is this resolve's alone.
+/// The UI face files one `resolve_ui_font_assets` admitted, each distinct path once, plus how
+/// many admissions that took. The macOS candidate names `HelveticaNeue.ttc` for both faces, so
+/// it is admitted once, through `font_file::admit_font_file`, which maps a file on the system
+/// font volume (pages shared with other processes, not 8.9 MB of heap per window). `reads`
+/// lives on the value so a test's count is this resolve's alone.
 #[derive(Default)]
 struct UiFontFiles {
     admitted: std::collections::HashMap<std::path::PathBuf, Option<aterm_render::font::FaceBytes>>,
@@ -2848,9 +2843,9 @@ fn parse_ui_font(
 static UI_FONT_RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Cold host-preparation path. This is called only from `set_chrome_fonts`
-/// after backend construction/reload, never from semantic compile, measure, or
-/// raster. The parsed faces then remain immutable and Arc-shared.
+/// Cold host-preparation path, reached through [`prepared_ui_font_assets`] at backend install
+/// or the startup warm, never from semantic compile, measure or raster. The parsed faces then
+/// stay immutable and `Arc`-shared.
 fn resolve_ui_font_assets() -> UiFontAssets {
     #[cfg(test)]
     UI_FONT_RESOLVE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2877,9 +2872,8 @@ fn resolve_ui_font_assets_with(files: &mut UiFontFiles) -> UiFontAssets {
     }
     match first_regular {
         Some((regular, bytes, index)) => {
-            // No static semibold anywhere: a variable regular can still
-            // instance its own — the band's active label keeps its weight even
-            // where `UiBold`'s fontdue slot falls back to the regular.
+            // No static semibold anywhere: a variable regular can still instance its own, so
+            // the band's active label keeps its weight where `UiBold` falls back to the regular.
             ui_font_assets(regular, None, bytes, index)
         }
         None => UiFontAssets::default(),
@@ -2922,38 +2916,27 @@ fn prepared_ui_font_assets() -> &'static UiFontAssets {
     ASSETS.get_or_init(resolve_ui_font_assets)
 }
 
-/// Populate the two process-global font `OnceLock`s that [`set_chrome_fonts`]
-/// would otherwise initialise on whichever thread calls it first.
-///
-/// Both are pure, self-contained and idempotent — the system UI face parse
-/// ([`prepared_ui_font_assets`]) and the embedded default chrome generation
-/// ([`chrome_fonts`]) — so warming them costs the caller only its own time and
-/// changes nothing about what is installed. Called on a dedicated startup thread
-/// so the first `sync_chrome_fonts` (which runs on the first-present hook, on the
-/// event loop) pays only the per-backend face handoff instead of a measured
-/// ~300 ms debug / ~30 ms release stall with the event loop blocked.
+/// Populate the two process-global font `OnceLock`s [`set_chrome_fonts`] would otherwise
+/// initialise on whichever thread calls it first: the system UI face parse
+/// ([`prepared_ui_font_assets`]) and the embedded default store ([`chrome_fonts`]). Both are
+/// idempotent and change nothing installed. Run on a startup thread so the first
+/// `sync_chrome_fonts` (on the event loop) pays only the face handoff, not a ~300 ms debug /
+/// ~30 ms release stall.
 #[cfg(not(test))]
 pub(crate) fn warm_chrome_font_assets() {
     let _ = prepared_ui_font_assets();
     drop(lock_fonts());
 }
 
-/// Tests keep chrome fonts per-thread (see the test [`lock_fonts`]), so a
-/// process-global warm would be meaningless there — and the production warm is a
-/// pure startup optimisation with no observable effect to test.
+/// Tests keep chrome fonts per thread, so a process-global warm means nothing there.
 #[cfg(test)]
 pub(crate) fn warm_chrome_font_assets() {}
 
-/// The pixel tab strip's font-readiness fingerprint (the Windows + Linux band —
-/// [`crate::tab_bar::pixel_band`]): the chrome-face install epoch with the
-/// coverage rung's size and the UI regular's presence folded in. The strip band
-/// raster is cached on the GUI side keyed on everything the pixels are a
-/// function of; the fonts are one of those inputs, and they LAND ASYNCHRONOUSLY
-/// (backend construction installs them via [`set_chrome_fonts`] after the first
-/// frames may already have painted). Folding this value into the band's cache
-/// key makes the landing a cache miss, so the frame that replaces the tofu-free
-/// mono fallback with real Segoe is the same frame every other chrome surface
-/// re-rasters on — no bespoke invalidation hook.
+/// The pixel tab strip's font-readiness fingerprint (the Windows + Linux band,
+/// [`crate::tab_bar::pixel_band`]): the chrome-face install epoch with the coverage rung's
+/// size and the UI regular's presence folded in. Fonts land asynchronously, after the first
+/// frames may have painted, so folding this into the band's cache key makes a landing a cache
+/// miss with no bespoke invalidation hook.
 ///
 /// `semantic_ready_epoch` moves on every [`install_chrome_faces_locked`] (and on
 /// semantic-cascade landings, which merely cost one harmless band rebuild); the
@@ -2984,25 +2967,19 @@ pub(crate) fn strip_band_font_epoch() -> u64 {
         .wrapping_add(u64::from(fonts.ui_regular.is_some()))
 }
 
-/// Is a real proportional UI face installed at all? The Windows strip band
-/// declines wholesale ([`crate::tab_bar::pixel_band::raster_band`] → `None`)
-/// until it is — the first frames before `set_chrome_fonts` lands (and every
-/// unit test that never installs faces) keep the byte-identical cell strip
-/// instead of a half-pixel band whose labels would be mono anyway.
+/// Whether a real proportional UI face is installed. The Windows strip band declines
+/// ([`crate::tab_bar::pixel_band::raster_band`] returns `None`) until it is, so frames before
+/// `set_chrome_fonts` lands keep the cell strip rather than a band with mono labels.
 #[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn strip_band_ui_ready() -> bool {
     lock_fonts().ui_regular.is_some()
 }
 
-/// The variable semibold instance for the strip band's ACTIVE label, or `None`
-/// when the host's UI regular is static (Win10 Segoe UI, Helvetica, Noto) —
-/// the caller then draws `TextFace::UiBold` through the fontdue path (the
-/// static `seguisb.ttf` sibling, or the regular where even that is absent).
-///
-/// Guarded on IDENTITY: handed out only while the INSTALLED regular is the very
-/// face these bytes were parsed from (`Arc::ptr_eq` against the prepared
-/// asset), so a test seam or a future per-window face swap can never pair
-/// one file's cmap with another file's outlines.
+/// The variable semibold instance for the strip band's active label, or `None` when the host's
+/// UI regular is static (the caller then draws `TextFace::UiBold` through the `ChromeFont`
+/// path: the static `seguisb.ttf` sibling, or the regular). Handed out only while the installed
+/// regular is the face these bytes were parsed from (`Arc::ptr_eq`), so one file's cmap is
+/// never paired with another's outlines.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
     let installed = lock_fonts().ui_regular.clone()?;
@@ -3178,19 +3155,30 @@ pub(crate) fn chrome_colour_emoji(cluster: &str, px: f32) -> Option<Arc<ChromeEm
     })
 }
 
-/// Slight negative tracking (em) applied per glyph advance of the UI face — SF reads a
-/// touch loose at panel sizes when advanced naively. Applied IDENTICALLY by the raster
-/// pen ([`Canvas::text`]) and the measure ([`ui_text_width`]), so they cannot drift —
-/// and by the strip band's variable-instance pen (`tab_bar::pixel_band`), so an
-/// active label's tracking matches its inactive neighbours'.
+/// Slight negative tracking (em) per glyph advance of the UI face, which reads a touch loose at
+/// panel sizes. Applied identically by the raster pen ([`Canvas::text`]), the measure
+/// ([`ui_text_width`]) and the strip band's variable-instance pen (`tab_bar::pixel_band`), so
+/// none of them drift.
 pub(crate) const UI_TRACKING_EM: f32 = -0.008;
 
-/// Width of `s` at size `px` in the UI face: real per-glyph advances plus
-/// `horizontal_kern` plus the same [`UI_TRACKING_EM`] the raster pen applies. Falls
-/// back to the mono approximation (0.6 em per char — [`crate::settings::text_w`]) when
-/// the UI face is absent, exactly the face [`Canvas::text`] falls back to — the
-/// settings painter measures with THIS function for every UI-face string, so painter
-/// and rasterizer can never disagree about proportional widths.
+/// The fractions of a pixel the UI pen places a glyph at: quarters, so a
+/// glyph sits within an eighth of a pixel of its true place.
+const PEN_PHASES: f32 = 4.0;
+
+/// The whole pixel at or left of `pen` and the quarter of a pixel past it
+/// (`0..4`), rounded to the nearest quarter: where the UI pen draws a glyph
+/// whose true place is `pen`.
+fn pen_phase(pen: f32) -> (i32, u8) {
+    let quarters = (pen * PEN_PHASES).round();
+    let whole = (quarters / PEN_PHASES).floor();
+    let phase = (quarters - whole * PEN_PHASES).clamp(0.0, PEN_PHASES - 1.0);
+    (whole as i32, phase as u8)
+}
+
+/// Width of `s` at `px` in the UI face: real advances plus `horizontal_kern` plus the
+/// [`UI_TRACKING_EM`] the raster pen applies. Without a UI face it falls back to the mono
+/// approximation (0.6 em per char, [`crate::settings::text_w`]), as [`Canvas::text`] does. The
+/// settings painter measures every UI-face string with this, so painter and rasterizer agree.
 pub(crate) fn ui_text_width(s: &str, px: f32) -> f32 {
     ui_text_width_for(TextFace::Ui, s, px)
 }
@@ -3227,29 +3215,27 @@ fn ui_text_wrap_walk(
     maximum_width: f32,
 ) -> (WrapLines, Option<Arc<ChromeFont>>) {
     note_measure_walk();
+    // White space a line may break after: not a no-break space, which the
+    // shared rule keeps as glue ([`aterm_grapheme::is_break_space`]).
     let graphemes = text
         .grapheme_indices()
-        .map(|(byte, grapheme)| (byte, grapheme, grapheme.chars().all(char::is_whitespace)))
+        .map(|(byte, grapheme)| {
+            (
+                byte,
+                grapheme,
+                grapheme.chars().all(aterm_grapheme::is_break_space),
+            )
+        })
         .collect::<Vec<_>>();
     if graphemes.is_empty() {
         return ((std::iter::once(0..0).collect(), 0), None);
     }
 
-    // MEASURE EACH CHAR AT THE ADVANCE THE PEN WILL DRAW IT, which for a char
-    // the UI face lacks is the CASCADE face's, not the UI face's `.notdef`.
-    //
-    // This is the same correction [`ui_text_width_for`] already carries, and it
-    // had to be made here too: that one fixes the measure used to CENTER and
-    // FIT a label, this one fixes the measure used to WRAP a paragraph. An
-    // ideograph charged at the UI face's ~0.6 em placeholder while the pen
-    // draws it at ~1 em packs about one and a half times too many characters
-    // onto a line, so a wrapped CJK paragraph overruns its box no matter how
-    // correct the break logic is — measured on the Update page's release notes
-    // at required 1092 against an available 896.
-    //
-    // Charged exactly as `ui_text_width_for` charges it: tracking is added only
-    // for a char the UI face covers, and a fallback char takes no kern into or
-    // out of it (a kern pair across two different faces is meaningless).
+    // Measure each char at the advance the pen draws it with: for a char the UI face lacks,
+    // the cascade face's, not the UI face's `.notdef` (an ideograph is ~1 em, not ~0.6, and a
+    // wrap charged the placeholder overruns its box). Charged as `ui_text_width_for` charges
+    // it: tracking only for a char the UI face covers, and no kern into or out of a fallback
+    // char.
     let mut fonts = lock_fonts();
     let font = fonts.ui_font(TextFace::Ui).cloned();
     // A MAP, not a scan: this function's doc promises a LINEAR operation count,
@@ -3331,50 +3317,90 @@ fn ui_text_wrap_walk(
             .get(index)
             .map_or(text.len(), |(byte, _, _)| *byte)
     };
+    // Where else a line may break than after white space: between CJK
+    // characters, kinsoku kept ([`aterm_grapheme::line_breaks`], the rule
+    // every wrap of the chrome reads), the bytes the next line would start
+    // at. ASCII text has none, and wraps exactly as it always did.
+    let ideographic: Vec<usize> = if text.is_ascii() {
+        Vec::new()
+    } else {
+        aterm_grapheme::line_breaks(text)
+            .into_iter()
+            .filter(|brk| brk.kind == aterm_grapheme::BreakKind::Ideographic)
+            .map(|brk| brk.at)
+            .collect()
+    };
+    let breaks_before = |index: usize| {
+        !ideographic.is_empty() && ideographic.binary_search(&byte_at(index)).is_ok()
+    };
     let mut ranges = Vec::new();
     let mut line_start = 0usize;
     let mut index = 0usize;
     let mut width = 0.0;
     let mut previous = None;
-    let mut whitespace_break = None;
+    let mut soft_break = None;
     let mut scans = 0usize;
     while index < graphemes.len() {
         let (_, grapheme, whitespace) = graphemes[index];
         let (advance, next) = piece_width(grapheme, previous);
         scans += 1;
         if index > line_start && width + advance > maximum_width {
-            let split = whitespace_break
-                .filter(|split| *split > line_start)
-                .unwrap_or(index);
+            // A SPACE THAT RUNS PAST THE BOX ENDS THE LINE: it paints nothing
+            // (callers trim a line's trailing space), so the word before it
+            // is whole on this line, the spaces after it go with it, and the
+            // next line starts at the next word. Charging it against the box
+            // broke a line a word early wherever its last word ended within
+            // a space's width of the edge: a setting's note wrapped 4pt short
+            // of its box ("Safe says yes only" / "to requests…" in 122pt,
+            // where "…only to" is 120.6). A no-break space is glue, no space
+            // a line ends at ([`aterm_grapheme::is_break_space`]).
+            let split = if whitespace {
+                let mut split = index + 1;
+                while graphemes.get(split).is_some_and(|(_, _, space)| *space) {
+                    split += 1;
+                }
+                split
+            } else {
+                soft_break
+                    .filter(|split| *split > line_start)
+                    .unwrap_or(index)
+            };
             let range = byte_at(line_start)..byte_at(split);
             debug_assert!(
-                exact_width(&text[range.clone()]) <= maximum_width + 0.5 || split == line_start + 1
+                exact_width(text[range.clone()].trim_end()) <= maximum_width + 0.5
+                    || split == line_start + 1
             );
             ranges.push(range);
             line_start = split;
             index = split;
             width = 0.0;
             previous = None;
-            whitespace_break = None;
+            soft_break = None;
             continue;
         }
         width += advance;
         previous = next;
         index += 1;
-        if whitespace {
-            whitespace_break = Some(index);
+        if whitespace || breaks_before(index) {
+            soft_break = Some(index);
         }
     }
-    let range = byte_at(line_start)..text.len();
-    debug_assert!(
-        exact_width(&text[range.clone()]) <= maximum_width + 0.5
-            || line_start + 1 == graphemes.len()
-    );
-    ranges.push(range);
+    // The rest is the last line — none where the spaces a line ended at ran
+    // to the text's end, which would be an empty line under it.
+    if line_start < graphemes.len() || ranges.is_empty() {
+        let range = byte_at(line_start)..text.len();
+        debug_assert!(
+            exact_width(text[range.clone()].trim_end()) <= maximum_width + 0.5
+                || line_start + 1 == graphemes.len()
+        );
+        ranges.push(range);
+    }
     ((ranges, scans), whole_font)
 }
 
-/// Exact, whitespace-preserving UI-face line breaks. The returned ranges are
+/// Exact, whitespace-preserving UI-face line breaks: after white space, or
+/// between CJK characters with kinsoku kept ([`aterm_grapheme::line_breaks`]),
+/// else inside a token too long for the line. The returned ranges are
 /// contiguous and cover `text` byte-for-byte; callers add visual newlines but
 /// never normalize the source. A single font lock and bounded suffix rescan
 /// keep the operation count linear for a near-cap unbroken token.
@@ -3403,12 +3429,12 @@ pub(crate) fn ui_text_wrap_ranges(
 /// glyph where it has one ([`synthesized`]), else its 0.6 em placeholder.
 pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
     let mut fonts = lock_fonts();
-    let font = fonts.ui_font(face).cloned();
-    if let Some(font) = font.as_ref()
+    if let Some(font) = fonts.ui_font(face)
         && let Some(width) = fonts.measures.width(face, font, px, s)
     {
         return width;
     }
+    let font = fonts.ui_font(face).cloned();
     let (width, _, whole) = ui_text_width_walk(&mut fonts, face, s, px, 0.0);
     if whole && let Some(font) = font.as_ref() {
         fonts.measures.keep_width(face, font, px, s, width);
@@ -3582,9 +3608,9 @@ pub(crate) fn ui_text_widths_at(
         .collect()
 }
 
-/// sRGB EOTF lookup: a gamma-encoded byte (0..=255) → linear-light (0..1), built
-/// once. Mirrors the main renderer's `srgb_to_linear` (lib.rs) so the tray's
-/// anti-aliasing composites in the SAME space as the terminal glyph path.
+/// sRGB EOTF lookup: a gamma-encoded byte (0..=255) → linear-light (0..1), built once. Mirrors
+/// `aterm_render::srgb_to_linear` so the tray composites in the same space as the terminal
+/// glyph path.
 fn srgb_to_linear_lut() -> &'static [f32; 256] {
     static LUT: OnceLock<[f32; 256]> = OnceLock::new();
     LUT.get_or_init(|| {
@@ -3611,14 +3637,11 @@ fn linear_to_srgb_u8_direct(l: f32) -> u8 {
 
 /// Inverse sRGB OETF: linear-light (0..1) → a gamma-encoded byte (0..=255).
 ///
-/// Raster fills call this for every channel of every covered pixel. Evaluating
-/// `powf` there made a large translucent palette card take seconds in debug
-/// builds. Quantization to an 8-bit result is exactly a monotonic threshold
-/// search: output `n + 1` once linear light crosses the EOTF of the halfway
-/// sRGB value `(n + 0.5) / 255`. Build those 255 thresholds once. A coarse
-/// linear-light index supplies the answer or its immediate neighbour, then the
-/// exact thresholds correct it; this preserves the rounded byte without doing
-/// either a transcendental operation or an eight-step binary search per pixel.
+/// Raster fills call this per channel of every covered pixel, so it avoids `powf`: the 8-bit
+/// result is a monotonic threshold search (output `n + 1` once linear light crosses the EOTF
+/// of `(n + 0.5) / 255`). The 255 thresholds are built once; a coarse linear-light index gives
+/// the answer or its neighbour and the exact thresholds correct it, preserving the rounded
+/// byte.
 fn linear_to_srgb_u8(l: f32) -> u8 {
     const BUCKETS: usize = 8_192;
     struct Quantizer {
@@ -3629,10 +3652,10 @@ fn linear_to_srgb_u8(l: f32) -> u8 {
     let l = l.clamp(0.0, 1.0);
     static QUANTIZER: OnceLock<Quantizer> = OnceLock::new();
     let quantizer = QUANTIZER.get_or_init(|| {
-        // Find the first representable non-negative f32 that the original OETF
-        // rounds upward at each byte boundary. Searching float bit patterns is
-        // monotonic on [0, 1] and preserves even the last-bit behaviour around
-        // a halfway value; a closed-form inverse can differ there by one ulp.
+        // Find the first representable non-negative f32 the direct OETF rounds upward at each
+        // byte boundary. Searching float bit patterns is monotonic on [0, 1] and keeps the
+        // last-bit behaviour around a halfway value, where a closed-form inverse can be off by
+        // one ulp.
         let thresholds = std::array::from_fn(|n| {
             let mut low = 0.0_f32.to_bits();
             let mut high = 1.0_f32.to_bits();
@@ -3663,9 +3686,10 @@ fn linear_to_srgb_u8(l: f32) -> u8 {
     encoded as u8
 }
 
-/// A straight-alpha RGBA8 canvas with src-over compositing in LINEAR LIGHT (the
-/// gamma-correct blend the main glyph path uses), plus a device-px clip stack.
-type GlyphCacheKey = (usize, u32, char);
+/// A glyph memo key: the face's address (0 for the pen's own glyphs), `px` bits, the
+/// char, and the pen's quarter of a pixel ([`pen_phase`], 0 wherever it draws on whole
+/// pixels).
+type GlyphCacheKey = (usize, u32, char, u8);
 type GlyphCacheEntry = (ChromeMetrics, std::sync::Arc<[u8]>);
 
 /// The last few composites of one rounded box, so of one colour
@@ -3706,15 +3730,13 @@ struct Canvas {
     w: u32,
     h: u32,
     px: Vec<u8>,
-    /// Per-raster glyph memo. A native page repeats a small alphabet across many
-    /// semantic text runs; fontdue intentionally does not cache rasterization.
-    /// Keeping the bitmap for this one retained surface avoids re-walking the
-    /// font's character map and outline for every repeated letter, while the
-    /// cache drops with the canvas (no cross-font or unbounded process state).
+    /// Per-raster glyph memo: a native page repeats a small alphabet across many text runs,
+    /// and `ChromeFont` does not cache rasters. It drops with the canvas (no cross-font or
+    /// unbounded process state).
     glyphs: std::collections::HashMap<GlyphCacheKey, GlyphCacheEntry>,
-    /// Device-px clip stack; each entry is the running INTERSECTION as `(x0, y0,
-    /// x1, y1)` exclusive. `blend` rejects pixels outside the top entry. Empty ⇒
-    /// unclipped. Driven by `DrawPrim::ClipPush`/`ClipPop`.
+    /// Device-px clip stack; each entry is the running intersection as `(x0, y0, x1, y1)`
+    /// exclusive. `blend` rejects pixels outside the top entry. Empty ⇒ unclipped. Driven by
+    /// `DrawPrim::ClipPush`/`ClipPop`.
     clip: Vec<(i32, i32, i32, i32)>,
     /// Memo for [`Self::blend_glyph_texel`]'s coverage remap: the `(ink, ground)`
     /// pair it was filled for and the corrected coverage per coverage byte
@@ -3733,10 +3755,8 @@ impl Canvas {
 
     fn with_origin(origin_x: i32, origin_y: i32, w: u32, h: u32, backdrop: [u8; 4]) -> Self {
         let mut px = vec![0u8; (w * h * 4) as usize];
-        // Native retained surfaces deliberately start transparent. `vec![0]`
-        // already produced that exact canvas; walking every pixel again was a
-        // pure O(width × height) tax before the first primitive and dominated
-        // debug WYSIWYG captures of a full-window native app.
+        // Native retained surfaces start transparent, which `vec![0]` already is; only a
+        // non-transparent backdrop pays the O(width × height) fill.
         if backdrop != [0, 0, 0, 0] {
             for chunk in px.as_chunks_mut::<4>().0 {
                 chunk.copy_from_slice(&backdrop);
@@ -3793,11 +3813,32 @@ impl Canvas {
         character: char,
         px: f32,
     ) -> (ChromeMetrics, std::sync::Arc<[u8]>) {
-        let key = (font as *const ChromeFont as usize, px.to_bits(), character);
+        self.raster_glyph_at(font, character, px, 0)
+    }
+
+    /// [`Self::raster_glyph`] with the pen `phase` quarters of a pixel right
+    /// of a whole pixel ([`pen_phase`]); each phase is memoized on its own.
+    fn raster_glyph_at(
+        &mut self,
+        font: &ChromeFont,
+        character: char,
+        px: f32,
+        phase: u8,
+    ) -> (ChromeMetrics, std::sync::Arc<[u8]>) {
+        let key = (
+            font as *const ChromeFont as usize,
+            px.to_bits(),
+            character,
+            phase,
+        );
         if let Some((metrics, bitmap)) = self.glyphs.get(&key) {
             return (*metrics, std::sync::Arc::clone(bitmap));
         }
-        let (metrics, bitmap) = font.char_raster(character, px);
+        let (metrics, bitmap) = if phase == 0 {
+            font.char_raster(character, px)
+        } else {
+            font.char_raster_at(character, px, f32::from(phase) / PEN_PHASES)
+        };
         let bitmap: std::sync::Arc<[u8]> = bitmap.into();
         self.glyphs
             .insert(key, (metrics, std::sync::Arc::clone(&bitmap)));
@@ -3812,7 +3853,7 @@ impl Canvas {
         character: char,
         px: f32,
     ) -> Option<(ChromeMetrics, std::sync::Arc<[u8]>)> {
-        let key = (0, px.to_bits(), character);
+        let key = (0, px.to_bits(), character, 0);
         if let Some((metrics, bitmap)) = self.glyphs.get(&key) {
             return Some((*metrics, std::sync::Arc::clone(bitmap)));
         }
@@ -3867,9 +3908,8 @@ impl Canvas {
         clip_x1 > tile_x0 && clip_y1 > tile_y0 && clip_x0 < tile_x1 && clip_y0 < tile_y1
     }
 
-    /// Composite `c` (straight alpha) over pixel `(x, y)` with extra `cov` (0..1) AA,
-    /// in LINEAR-LIGHT space (the gamma-correct blend the main glyph path uses), and
-    /// honoring the clip stack.
+    /// Composite `c` (straight alpha) over pixel `(x, y)` with extra `cov` (0..1) AA, in
+    /// linear light (as the main glyph path blends), honoring the clip stack.
     fn blend(&mut self, x: i32, y: i32, c: [u8; 4], cov: f32) {
         let local_x = x.saturating_sub(self.origin_x);
         let local_y = y.saturating_sub(self.origin_y);
@@ -4118,10 +4158,9 @@ const SPECIMEN_FRAME_CACHE_ENTRIES: usize = 2;
 struct SpecimenFrameEntry {
     /// Fingerprint of every renderer input except the fork source.
     key: u64,
-    /// The exact `Rc` the frame was forked from, held WEAKLY on purpose: a weak
-    /// handle keeps the `Rc` allocation reserved — so no later fork can be
-    /// handed the same address and silently alias this entry — without keeping
-    /// the forked `Renderer` (and its parsed faces) alive.
+    /// The exact `Rc` the frame was forked from, held weakly: the weak handle keeps the `Rc`
+    /// allocation reserved, so no later fork can reuse the address and alias this entry,
+    /// without keeping the forked `Renderer` and its faces alive.
     source: std::rc::Weak<Renderer>,
     frame: Rc<aterm_render::Frame>,
 }
@@ -4471,11 +4510,9 @@ impl Canvas {
         let mut y1 = (y + h + 1.0).ceil() as i32;
         (x0, y0, x1, y1) = self.clipped_bounds(x0, y0, x1, y1);
 
-        // A rounded box inset by one pixel is conservatively inside the region
-        // whose analytic coverage is exactly 1. Fill that wide scanline span
-        // without evaluating an SDF/sqrt for every interior pixel; retain the
-        // original SDF on the complete edge and corner fringe, so antialiasing
-        // and byte output stay unchanged.
+        // A rounded box inset by one pixel lies inside the region whose analytic coverage is
+        // exactly 1: fill that span without an SDF per interior pixel and keep the SDF on the
+        // edge and corner fringe, so the output bytes are unchanged.
         let inset = 1.0_f32;
         let inner_w = w - inset * 2.0;
         let inner_h = h - inset * 2.0;
@@ -4604,10 +4641,9 @@ impl Canvas {
         }
     }
 
-    /// Raster a round-capped anti-aliased segment from the signed distance to
-    /// its finite center line. This is deliberately a small shared primitive,
-    /// not an icon bitmap: regional and full native rasters therefore produce
-    /// identical arrows at every display scale.
+    /// Raster a round-capped anti-aliased segment from the signed distance to its centre line.
+    /// A shared primitive, not an icon bitmap, so regional and full rasters draw identical
+    /// arrows at every display scale.
     fn line_segment(&mut self, start: (f32, f32), end: (f32, f32), width: f32, c: [u8; 4]) {
         let radius = width.max(0.0) / 2.0;
         if radius <= 0.0 {
@@ -4719,19 +4755,14 @@ impl Canvas {
         }
     }
 
-    /// Draw `s` with its BASELINE at `baseline` (device px). `face` selects the
-    /// render font. `Mono` draws in the chrome terminal stack: per-char face pick
-    /// (bold sibling / user primary / DejaVu coverage fallback —
-    /// [`select_chrome_face`], then the renderer's already-parsed chain faces —
-    /// [`ChromeFonts::coverage`], then the pen's own two glyphs —
-    /// [`synthesized`]), a 26.6 fixed-point pen with per-glyph rounding
-    /// (placement error ≤ 0.5 px, drift-free — `chrome_metrics` proofs). `Ui`/
-    /// `UiBold` draw in real regular/semibold native system faces (SF Pro, Segoe UI,
-    /// Noto Sans, or DejaVu Sans; the terminal stack is the final fallback) with
-    /// real kerning + [`UI_TRACKING_EM`] tracking. Both paths place glyphs by their
-    /// bearings relative to the caller-supplied baseline — a coverage face's
-    /// ideograph included, so its own ascent never moves the run: it sits on the
-    /// Latin baseline with its body centred on the cap box.
+    /// Draw `s` with its baseline at `baseline` (device px). `Mono` draws in the chrome
+    /// terminal stack: a per-char face pick ([`select_chrome_face`], then
+    /// [`ChromeFonts::coverage`], then [`synthesized`]) on a 26.6 fixed-point pen with
+    /// per-glyph rounding (placement error ≤ 0.5 px, no drift). `Ui`/`UiBold` draw in real
+    /// regular/semibold system faces (Helvetica Neue, Segoe UI, Noto Sans or DejaVu Sans; the
+    /// terminal stack is the final fallback) with real kerning and [`UI_TRACKING_EM`]. Both
+    /// place glyphs by their bearings on the caller's baseline, so a coverage face's ideograph
+    /// sits on the Latin baseline too.
     #[allow(
         clippy::too_many_arguments,
         reason = "primitive text blit: font stack + pen origin/baseline + run + size + \
@@ -4794,19 +4825,18 @@ impl Canvas {
                 if let Some(previous) = prev_ui {
                     pen += font.char_kern(previous, ch, px).unwrap_or(0.0);
                 }
-                let (m, bitmap) = self.raster_glyph(font, ch, px);
-                self.blit_fontdue_glyph(pen, baseline_i, &m, &bitmap, c);
-                pen += m.advance_width + UI_TRACKING_EM * px;
+                let advance = self.pen_glyph(font, ch, px, pen, baseline_i, c);
+                pen += advance + UI_TRACKING_EM * px;
                 prev_ui = Some(ch);
                 continue;
             }
             prev_ui = None;
 
-            let glyph = match fonts.ui_miss_face(face, weight, ch) {
-                Some(cface) => Some(self.raster_glyph(&cface.font, ch, px)),
-                None => self.raster_synthesized(ch, px),
-            };
-            if let Some((m, bitmap)) = glyph {
+            if let Some(cface) = fonts.ui_miss_face(face, weight, ch) {
+                pen += self.pen_glyph(&cface.font, ch, px, pen, baseline_i, c);
+                continue;
+            }
+            if let Some((m, bitmap)) = self.raster_synthesized(ch, px) {
                 self.blit_fontdue_glyph(pen, baseline_i, &m, &bitmap, c);
                 pen += m.advance_width;
                 continue;
@@ -4867,6 +4897,25 @@ impl Canvas {
         }
     }
 
+    /// Draw `ch` of `font` with its pen at `pen` (device px, fractional) on
+    /// `baseline`, at the pen's quarter pixel ([`pen_phase`]): each glyph
+    /// keeps its true place in the run, so small text's letter gaps stay
+    /// even rather than each glyph snapping to a whole pixel. Its advance.
+    fn pen_glyph(
+        &mut self,
+        font: &ChromeFont,
+        ch: char,
+        px: f32,
+        pen: f32,
+        baseline: f32,
+        color: [u8; 4],
+    ) -> f32 {
+        let (whole, phase) = pen_phase(pen);
+        let (m, bitmap) = self.raster_glyph_at(font, ch, px, phase);
+        self.blit_fontdue_glyph(whole as f32, baseline, &m, &bitmap, color);
+        m.advance_width
+    }
+
     fn blit_fontdue_glyph(
         &mut self,
         pen: f32,
@@ -4890,10 +4939,9 @@ impl Canvas {
         }
     }
 
-    /// A crisp, fully-covered axis-aligned device-px rectangle, SNAPPED to the
-    /// integer grid — the building block for hairline rules and the text caret,
-    /// which must NOT route through the rounded SDF (it would smear them across two
-    /// device rows).
+    /// A crisp, fully covered axis-aligned device-px rectangle snapped to the integer grid: the
+    /// building block for hairline rules and the text caret, which the rounded SDF would smear
+    /// across two device rows.
     fn fill_px_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: [u8; 4]) {
         let (x0, y0, x1, y1) = self.clipped_bounds(
             x.round() as i32,
@@ -4908,11 +4956,10 @@ impl Canvas {
         }
     }
 
-    /// Stroke (outline) a rounded rect with line `width`, centered on the rect edge.
-    /// A near-square-cornered outline (`radius <= 0.5`, or one too small/thin to
-    /// round) is drawn as four DEVICE-PX-SNAPPED spans so 1px frames / carets /
-    /// hairlines stay crisp; a genuinely rounded outline uses the analytic SDF
-    /// (`cov(|sd| − width/2)`), whose corner AA is wanted. All inputs are device px.
+    /// Stroke (outline) a rounded rect with line `width`, centered on the rect edge. A
+    /// near-square outline (`radius <= 0.5`, or too small or thin to round) is four
+    /// device-px-snapped spans, so 1px frames, carets and hairlines stay crisp; a rounded one
+    /// uses the analytic SDF (`cov(|sd| − width/2)`) for its corner AA. All inputs are device px.
     #[allow(
         clippy::too_many_arguments,
         reason = "primitive rect-stroke blit: rect (x,y,w,h) + radius + line width + \
@@ -4929,8 +4976,8 @@ impl Canvas {
                 self.fill_px_rect(x, y, w.max(t), h.max(t), c);
                 return;
             }
-            // A crisp frame: top + bottom spans, then the left/right sides BETWEEN
-            // them (so translucent strokes never double-blend the corners).
+            // A crisp frame: top and bottom spans, then the sides between them, so translucent
+            // strokes never double-blend the corners.
             self.fill_px_rect(x, y, w, t, c);
             self.fill_px_rect(x, y + h - t, w, t, c);
             let mid_h = (h - 2.0 * t).max(0.0);
@@ -5911,10 +5958,8 @@ mod tests {
         .expect("cold-to-prepared font transition exits cleanly");
     }
 
-    /// T3: the Win11 variable cut LEADS the Windows UI-face candidates and is
-    /// paired with the STATIC semibold — never with itself (two wght-400 faces
-    /// would erase every `UiBold` heading's contrast with no error anywhere).
-    /// The static Segoe UI pair stays behind it for Win10 hosts.
+    /// The Win11 variable cut leads the Windows UI-face candidates, paired with the static
+    /// semibold (never itself); the static Segoe UI pair follows for Win10.
     #[cfg(windows)]
     #[test]
     fn windows_ui_face_candidates_lead_with_segoe_ui_variable_over_a_static_semibold() {
@@ -5938,12 +5983,8 @@ mod tests {
         }
     }
 
-    /// The Linux ladder must reach Noto Sans on a host that ships only the
-    /// fonts-noto-core cuts (Regular/Bold — Debian and Ubuntu never install a
-    /// NotoSans-SemiBold.ttf). Pairing Regular exclusively with SemiBold made
-    /// every stock Debian box fall through to DejaVu Sans, ~8% wider, which the
-    /// 2026-08 settings audit measured as systemic truncation across the
-    /// chrome. SemiBold keeps priority where a distro does carry it.
+    /// The Linux ladder reaches Noto Sans on a host with only fonts-noto-core's Regular/Bold
+    /// cuts (no NotoSans-SemiBold.ttf), and SemiBold keeps priority where a distro ships it.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_ui_face_ladder_reaches_noto_on_bold_only_hosts() {
@@ -5994,9 +6035,8 @@ mod tests {
                 "a candidate must never pair a face with itself"
             );
         }
-        // Host-conditional leg: with the Debian core cuts on disk the resolver
-        // must land Noto Sans — regular AND a real bold companion — never the
-        // DejaVu fallback.
+        // Host-conditional leg: with the Debian core cuts on disk the resolver lands Noto Sans,
+        // regular and a real bold companion, never the DejaVu fallback.
         let debian_regular =
             std::path::Path::new("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf");
         let debian_bold = std::path::Path::new("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf");
@@ -6010,12 +6050,9 @@ mod tests {
                 assets.semibold.is_some(),
                 "a heavier companion resolves beside the regular"
             );
-            // WHICH family those two faces came from is asserted through the
-            // CANDIDATE LADDER above, not through the loaded faces: a parsed
-            // face is addressed by glyph id and metrics here, and the crate
-            // deliberately exposes no family name to interrogate it by. The
-            // ladder is the thing that decides Noto over DejaVu, so it is also
-            // the honest place to pin that decision.
+            // Which family loaded is asserted through the candidate ladder, not the faces: a
+            // parsed face exposes no family name, and the ladder is what decides Noto over
+            // DejaVu.
             let first_complete = candidates
                 .iter()
                 .find(|candidate| {
@@ -6030,12 +6067,9 @@ mod tests {
         }
     }
 
-    /// One admission per distinct UI face FILE, whatever the candidate ladder
-    /// pairs: the macOS candidate names HelveticaNeue.ttc for both its faces
-    /// and used to read the 4.47 MB collection twice (two heap copies, kept).
-    /// And the admission is the bounded terminal-face one, which MAPS a file
-    /// on the system font volume (`font_file::maps_in_place`, the one
-    /// definition of the rule) rather than copying it.
+    /// One admission per distinct UI face file, whatever the ladder pairs (the macOS candidate
+    /// names HelveticaNeue.ttc for both faces), and a face on the system font volume is a
+    /// mapping (`font_file::maps_in_place`), not a copy.
     #[test]
     fn ui_font_assets_admit_each_distinct_file_once() {
         let mut files = UiFontFiles::default();
@@ -6218,8 +6252,8 @@ mod tests {
             let b = |i: u32| (bits >> i) & 1 == 1;
             let (bold_run, bold_has, primary_has) = (b(0), b(1), b(2));
             let pick = select_chrome_face(bold_run, bold_has, primary_has);
-            // EmbeddedOnlyAsCoverageFallback: the embedded DejaVu is chosen
-            // ONLY when neither user face applies.
+            // EmbeddedOnlyAsCoverageFallback: the embedded DejaVu is chosen only when neither
+            // user face applies.
             if pick == ChromeFacePick::Fallback {
                 fallback_seen = true;
                 assert!(
@@ -6243,7 +6277,7 @@ mod tests {
                 assert!(primary_has, "primary chosen without coverage");
             }
         }
-        // NON-VACUOUS: every face of the stack is reachable.
+        // Non-vacuous: every face of the stack is reachable.
         assert!(
             fallback_seen && bold_seen && primary_seen,
             "gate must reach all three faces (fallback={fallback_seen}, \
@@ -6251,9 +6285,8 @@ mod tests {
         );
     }
 
-    /// The cap-height centering law bound to the SHIPPING [`row_baseline`]
-    /// (the fn every chrome painter calls): over a lattice of `(row, size)`,
-    /// the gap above the cap box and the gap below the baseline balance within
+    /// The cap-height centering law bound to the shipping [`row_baseline`]: over a lattice of
+    /// `(row, size)`, the gap above the cap box and the gap below the baseline balance within
     /// 1px + one 26.6 subunit (the `chrome_metrics` proofs' device bound).
     #[test]
     fn row_baseline_balances_gaps_on_the_shipping_path() {
@@ -6276,8 +6309,8 @@ mod tests {
                 }
             }
         }
-        // And the old em-bottom placement (baseline = y + px) fails the law for
-        // the same inputs — the pre-fix ~0.135em-low sit (negative control).
+        // Negative control: em-bottom placement (baseline = y + px) fails the law for the same
+        // inputs, sitting ~0.135 em low.
         let (row_h, size) = (20.0_f32, 14.0_f32);
         let old_b = (row_h - size) * 0.5 + size;
         let cap = size * ratio;
@@ -6497,13 +6530,10 @@ mod tests {
         clusters
     }
 
-    /// A CHAIN-FACE CHAR SITS ON THE RUN'S BASELINE. The chrome's three faces
-    /// carry no CJK, so `日` used to leave the chrome altogether (the gate's
-    /// `Fallback` pick, DejaVu, lacks it — the negative control below); the
-    /// coverage rung now draws it, blitted by its bearings under the SAME
-    /// baseline `row_baseline` derives from the primary's cap ratio. So the
-    /// ideograph's own ascent never moves the run: its body centres on the
-    /// Latin cap box, bottom at the baseline, top within an em above it.
+    /// A chain-face char sits on the run's baseline: the gate's `Fallback` pick (DejaVu) lacks
+    /// `日` (the negative control), and the coverage rung draws it by its bearings under the
+    /// baseline `row_baseline` derives from the primary's cap ratio, so its body centres on the
+    /// Latin cap box, bottom at the baseline, top within an em above.
     #[test]
     fn a_chain_face_char_draws_on_the_run_baseline_not_its_own_ascent() {
         if !install_chrome_fonts_with_cjk_chain_for_test() {
@@ -6565,11 +6595,9 @@ mod tests {
         clear_ui_fonts_for_test();
     }
 
-    /// THE MEASURE AND THE PEN AGREE ON A CHAIN-FACE CHAR. `A日B` in the UI
-    /// face: the ideograph is a cascade glyph, so [`ui_text_width_for`] must
-    /// charge the coverage face's real advance — the pen's — not the UI face's
-    /// `.notdef` advance, which under-measured the run by the difference (the
-    /// negative control: ~0.4 em at 13 px).
+    /// The measure and the pen agree on a chain-face char: for `A日B` in the UI face,
+    /// [`ui_text_width_for`] charges the coverage face's advance, not the UI face's `.notdef`
+    /// (the negative control under-measures by ~0.4 em at 13 px).
     #[test]
     fn ui_measure_agrees_with_the_pen_for_a_chain_face_char() {
         if !install_chrome_fonts_with_cjk_chain_for_test() || !strip_band_ui_ready() {
@@ -6579,7 +6607,7 @@ mod tests {
         let s = "A日B";
         let px = 13.0_f32;
         let measured = ui_text_width_for(TextFace::Ui, s, px);
-        // The pre-fix measure: every char at the UI face's own advance.
+        // Negative control: every char at the UI face's own advance.
         let notdef_measure = {
             let fonts = lock_fonts();
             let f = fonts.ui_regular.clone().expect("UI regular");
@@ -6629,12 +6657,9 @@ mod tests {
         clear_ui_fonts_for_test();
     }
 
-    /// THE RUNG IS LAST. With a coverage face installed, a char the embedded
-    /// DejaVu covers still resolves to DejaVu (the gate's `Fallback` pick, by
-    /// identity), a char only the chain covers resolves to the chain face at
-    /// either weight, and a char nothing covers resolves to no face — the
-    /// proven [`select_chrome_face`] gate (`chrome_face_gate_exhaustive`) is
-    /// consulted first and unchanged.
+    /// The rung is last: with a coverage face installed, a char DejaVu covers still resolves to
+    /// DejaVu, a char only the chain covers resolves to the chain face at either weight, and a
+    /// char nothing covers resolves to no face.
     #[test]
     fn coverage_rung_is_consulted_only_after_the_embedded_fallback_misses() {
         if !install_chrome_fonts_with_cjk_chain_for_test() {
@@ -6682,28 +6707,16 @@ mod tests {
         clear_ui_fonts_for_test();
     }
 
-    /// THE BAND KEY MOVES ON A LANDING NO INSTALL ANNOUNCES. Production's seed
-    /// is a fork of the live renderer over the SAME chain cells; the first
-    /// time the terminal draws an ideograph its parse lands in a cell the seed
-    /// shares. Nothing passes through the chrome store — so
-    /// [`strip_band_font_epoch`] reads the rung itself: before, the ideograph
-    /// resolves to no face and a re-read is not a landing; after the live
-    /// renderer's draw, the epoch differs and the rung reaches the char.
+    /// The band key moves on a landing no install announces: the seed is a fork of the live
+    /// renderer over the same chain cells, so the terminal's first ideograph parse lands in a
+    /// cell the seed shares without passing through the chrome store, and
+    /// [`strip_band_font_epoch`] reads the rung itself.
     ///
-    /// WINDOWS AND LINUX ONLY, and the gate is a `cfg`, not a runtime `return`,
-    /// so this reports as absent on macOS instead of as a pass. Two measured
-    /// reasons, 2026-09-15: (a) the subject does not exist there —
-    /// [`crate::tab_bar::pixel_band`] is itself `cfg(any(windows, linux))`, and
-    /// both production callers of [`strip_band_run_coverable`] are inside it;
-    /// (b) the LANDING this test watches for does not happen there — after
-    /// `set_config_fallback_fonts` + `prepare_semantic_text("日")` on macOS the
-    /// live renderer reports `ready_fallback_faces().count() == 0`, so the
-    /// coverage rung stays empty and the band key cannot move. That is not a
-    /// tofu bug: 日 still rasters to a real 13x15 box (`.notdef` is 8x13) —
-    /// macOS resolves it through CoreText, which materialises no fontdue cell.
-    /// The sibling tests above are NOT gated, because
-    /// [`install_chrome_fonts_with_cjk_chain_for_test`] parses the face itself
-    /// through `add_fallback_bytes` and so populates the rung on every host.
+    /// Windows and Linux only (a `cfg`, so macOS reports it absent rather than passing):
+    /// [`crate::tab_bar::pixel_band`] exists only there, and on macOS the live renderer
+    /// resolves CJK through CoreText, so `ready_fallback_faces()` stays empty and the key cannot
+    /// move. The sibling tests are not gated: [`install_chrome_fonts_with_cjk_chain_for_test`]
+    /// parses the face itself.
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn strip_band_font_epoch_moves_when_a_chain_face_lands() {
@@ -6772,7 +6785,6 @@ mod tests {
     }
 
     /// How many chain faces THIS thread's installed seed holds parsed.
-    #[cfg(not(target_os = "macos"))]
     fn ready_chain_faces() -> usize {
         lock_fonts()
             .semantic
@@ -6822,7 +6834,6 @@ mod tests {
     /// faces that map Han, kana and Hangul — every face it parses maps one of
     /// them — so the cascade reaches 日 with no label having asked; a second
     /// warm parses nothing. NEGATIVE CONTROL: before it, nothing is parsed.
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_startup_warm_parses_the_cjk_and_hangul_faces_only() {
         let Some(live) = install_unparsed_cjk_chain_for_test() else {
@@ -6847,6 +6858,36 @@ mod tests {
             warm_chrome_coverage(Some(&live.fallback_coverage()), None),
             0,
             "a second warm parses nothing"
+        );
+        clear_ui_fonts_for_test();
+    }
+
+    /// EVERY CHROME-FONT INSTALL WARMS THE FACES A CJK LABEL DRAWS WITH, on
+    /// every platform ([`chrome_coverage_warm`]): over a seed whose chain is
+    /// unparsed (a fresh window), the install's warm parses the chain's CJK
+    /// face, so a Settings or Manual label draws `設定を開く` in ink with no
+    /// label having asked. NEGATIVE CONTROL: before the warm, the label's
+    /// ideographs have no face (blank advances). With the warm gated to
+    /// Windows and Linux, a macOS install warmed nothing and its labels drew
+    /// a CJK title as blank advances forever (the live terminal draws CJK
+    /// through CoreText there and parses no chain face).
+    #[test]
+    fn every_install_warms_the_faces_a_cjk_label_draws_with() {
+        let Some(_live) = install_unparsed_cjk_chain_for_test() else {
+            aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
+        };
+        let label = "設定を開く";
+        assert!(
+            !chrome_cascade_reaches_for_test('設'),
+            "CONTROL: nothing has parsed the CJK face"
+        );
+        let warm = chrome_coverage_warm(&lock_fonts()).expect("an install warms its faces");
+        assert!(warm() >= 1, "the warm parses the chain's CJK face");
+        assert!(chrome_cascade_reaches_for_test('設'));
+        assert_eq!(
+            lock_fonts().label_misses(TextFace::Ui, label),
+            Vec::<char>::new(),
+            "{label} draws in ink"
         );
         clear_ui_fonts_for_test();
     }
@@ -7204,19 +7245,16 @@ mod tests {
         }
     }
 
-    /// [`set_chrome_fonts`] robustness: unparseable bytes leave the slot on the
-    /// DejaVu fallback (text still renders), and clearing restores the default
-    /// stack. Serialized with the other font-injecting assertions by running in
-    /// one test (the store is process-global).
+    /// [`set_chrome_fonts`] robustness: unparseable bytes leave the slot on the DejaVu fallback
+    /// (text still renders), and clearing restores the default stack.
     #[test]
     fn set_chrome_fonts_bad_bytes_keep_fallback_rendering() {
         let garbage: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"not a font"[..]);
         set_chrome_fonts(Some((garbage.clone(), 0)), Some((garbage, 3)), None);
         let w = measure_text("abc", 12.0, TextWeight::Regular);
         assert!(w > 0.0, "fallback still measures after a bad injection");
-        // And an injected REAL face (the embedded bytes stand in for the user's
-        // font) takes the primary slot: bold runs downgrade honestly (no bold
-        // face), regular runs measure identically to the same face as fallback.
+        // An injected real face (the embedded bytes stand in for the user's font) takes the
+        // primary slot; with no bold face, a bold run downgrades to it and measures the same.
         let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(aterm_render::embedded_font());
         set_chrome_fonts(Some((bytes, 0)), None, None);
         let w2 = measure_text("abc", 12.0, TextWeight::Bold);
@@ -7258,10 +7296,9 @@ mod tests {
         input
     }
 
-    /// Bind one exact renderer + engine frame into the spec
-    /// [`Canvas::terminal_specimen`] consumes, mirroring the migrated
-    /// `settings_preview` call sites (production defaults for every knob a
-    /// test does not exercise).
+    /// Bind one renderer and engine frame into the spec [`Canvas::terminal_specimen`]
+    /// consumes, as `settings_preview` does (production defaults for every knob a test does not
+    /// exercise).
     fn specimen_spec(
         renderer: Renderer,
         identity: crate::widget::SemanticFontCandidate,
@@ -7302,14 +7339,9 @@ mod tests {
         }
     }
 
-    /// An unsupported scalar on the shipping specimen path occupies exactly
-    /// one terminal cell and cannot collapse the grid: every pixel outside
-    /// that cell — including the following glyph's placement — is
-    /// byte-identical to the same frame with a space there. (The specimen IS
-    /// the shipping terminal renderer, so the honest in-cell miss signal —
-    /// `.notdef`, plus its `missing_font_classes` report — replaced the
-    /// retired `Canvas::terminal_text` per-glyph skip; confinement to the one
-    /// column is the invariant that survives the migration.)
+    /// An unsupported scalar on the shipping specimen path occupies exactly one terminal cell:
+    /// every pixel outside it, including the next glyph's, is byte-identical to the same frame
+    /// with a space there.
     #[test]
     fn semantic_terminal_text_skips_notdef_without_collapsing_the_grid() {
         let raster = |unsupported: bool| -> Vec<u8> {
@@ -7320,9 +7352,8 @@ mod tests {
             )
             .expect("embedded renderer");
             renderer.set_runtime_font_discovery(false);
-            // Both frames are the exact same engine snapshot of "A B"; the
-            // probe swaps the middle cell for a scalar no face can cover, so
-            // it occupies that one terminal column BY CONSTRUCTION.
+            // Both frames are the same engine snapshot of "A B"; the probe swaps the middle
+            // cell for a scalar no face covers, so it occupies that one column by construction.
             let mut input = specimen_input("A B", 1, 8);
             if unsupported {
                 input.cells[0][1].ch = '\u{10FFFF}';
@@ -7548,10 +7579,8 @@ mod tests {
             renderer.set_runtime_font_discovery(false);
             renderer
         };
-        // A PRIVATE serialization gate: the staged coalescing window and the
-        // bounded landing wait below must never queue behind (or stall)
-        // another test's warmup on the process-wide gate. The worker protocol
-        // is byte-identical to production's `spawn`.
+        // A private serialization gate, so the staged coalescing window and the landing wait
+        // never queue behind another test's warmup; the worker protocol is production's.
         let gate: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
         let serial = gate
             .lock()
@@ -7589,9 +7618,7 @@ mod tests {
         );
         drop(serial);
 
-        // Debug builds can spend several seconds settling the complete Unicode
-        // specimen on a cold font cache. This is a completion wait, not a
-        // timing assertion; correctness is the landed generation below.
+        // A completion wait, not a timing assertion: correctness is the landed generation.
         await_semantic_landing(&mut fonts);
         assert_eq!(fonts.semantic_generation, 2);
         assert!(fonts.semantic_pending.is_none(), "land disarms");
@@ -7599,12 +7626,10 @@ mod tests {
         assert!(fonts.semantic_prewarm_ms.is_some());
     }
 
-    /// TIER-1 (`SemanticPrewarmGeneration`, `Reload`): the shipping reload body
-    /// on a local font context whose stub worker queue still holds a job for the
-    /// generation the reload supersedes. The queue is read back off the worker:
-    /// `queued` is the queued job's generation, `current` the context's. The
-    /// same reload without its `cancel_queued` — the model's
-    /// `BuggyReloadKeepsQueued` — leaves the obsolete fork queued and is refused.
+    /// Tier-1 (`SemanticPrewarmGeneration`, `Reload`): the shipping reload body on a local font
+    /// context whose stub worker queue still holds a job for the superseded generation, read
+    /// back off the worker (`queued` the job's generation, `current` the context's). The same
+    /// reload without its `cancel_queued` (the model's `BuggyReloadKeepsQueued`) is refused.
     #[test]
     fn chrome_font_reload_conforms_to_the_generation_queue_reset() {
         let model = aterm_models_misc::semantic_prewarm_generation_model();
@@ -7666,20 +7691,16 @@ mod tests {
         assert!(!model.check_invariant("QueueContainsOnlyCurrent", &kept));
     }
 
-    /// TIER-1 (`SemanticPrewarmHandshake`, the slot half of `DecideResult`).
-    /// The pure bind (`src/semantic_prewarm_conformance.rs`) holds the
-    /// pure `semantic_prewarm_result_decision`; this one holds what
-    /// `poll_semantic_renderer` DOES with it. Every point of the identity ×
-    /// readiness × active-slot lattice lands one result through the real poll,
-    /// fed from a stub worker channel, and the active slot is read back off
-    /// `ChromeFonts`: `active_after` is whether a renderer paints,
-    /// `active_after_latest` whether it is the requested candidate's. Remove
-    /// `self.semantic = None` from the `FailClosedCurrent` arm — the model's
-    /// `BuggyFailClosedKeepsPrevious` — and the exact-current failure rows with
-    /// an active renderer fail; drop the `semantic_identity` line from the
-    /// `InstallCurrent` arm (`BuggyInstallKeepsStaleIdentity`), or open the
-    /// `CacheSuperseded` arm with `cache_active_semantic()`
-    /// (`BuggyCacheParksActive`), and the install or superseded rows fail.
+    /// Tier-1 (`SemanticPrewarmHandshake`, the slot half of `DecideResult`). The pure bind
+    /// (`src/semantic_prewarm_conformance.rs`) holds `semantic_prewarm_result_decision`; this
+    /// holds what `poll_semantic_renderer` does with it. Every point of the identity ×
+    /// readiness × active-slot lattice lands one result through the real poll from a stub
+    /// worker channel, and the active slot is read back off `ChromeFonts`: `active_after` is
+    /// whether a renderer paints, `active_after_latest` whether it is the requested
+    /// candidate's. Negative controls: removing `self.semantic = None` from the
+    /// `FailClosedCurrent` arm (`BuggyFailClosedKeepsPrevious`), dropping the `semantic_identity`
+    /// line from `InstallCurrent` (`BuggyInstallKeepsStaleIdentity`), or opening
+    /// `CacheSuperseded` with `cache_active_semantic()` (`BuggyCacheParksActive`) fails rows.
     #[test]
     fn semantic_prewarm_poll_conforms_to_the_handshake_slot_effects() {
         let model = aterm_models_misc::semantic_prewarm_handshake_model();
@@ -7799,7 +7820,7 @@ mod tests {
         )
         .expect("embedded renderer");
         renderer.set_runtime_font_discovery(false);
-        // A PRIVATE serialization gate — see
+        // A private serialization gate, as in
         // `semantic_prewarm_coalesces_and_installs_only_latest_generation`.
         let gate: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
         let mut fonts = default_chrome_fonts();
@@ -8129,6 +8150,43 @@ mod tests {
         );
     }
 
+    /// A LINE'S TRAILING SPACE NEVER ENDS IT A WORD EARLY: a line whose last
+    /// word ends within a space's width of the box keeps that word; the
+    /// space after it, which paints nothing, goes with the line. The wrap
+    /// charged that space against the box and broke before the word, so
+    /// settings notes wrapped about 4pt short of their boxes. CONTROL: a word
+    /// that does not fit still goes to the next line.
+    #[test]
+    fn a_lines_trailing_space_never_ends_it_a_word_early() {
+        let px = 13.0;
+        let text = "alpha beta gamma";
+        let space = ui_text_width(" ", px);
+        assert!(space > 1.0, "premise: a space has width");
+        let width = ui_text_width("alpha beta", px) + space * 0.5;
+        let lines: Vec<&str> = ui_text_wrap_ranges(text, px, width)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(lines.concat(), text, "the ranges cover the text");
+        assert_eq!(lines[0].trim_end(), "alpha beta", "{lines:?}");
+        assert_eq!(lines[1], "gamma", "{lines:?}");
+        // CONTROL: a box short of the word sends it on.
+        let short = ui_text_width("alpha bet", px);
+        let lines: Vec<&str> = ui_text_wrap_ranges(text, px, short)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(lines[0].trim_end(), "alpha", "{lines:?}");
+        // A text that ends in the spaces its last line ends at has no empty
+        // line after them.
+        let ended = "alpha beta ";
+        assert_eq!(
+            ui_text_wrap_ranges(ended, px, width),
+            vec![0..ended.len()],
+            "one line, its trailing space with it"
+        );
+    }
+
     #[test]
     fn ui_text_wrap_preserves_repeated_and_unicode_whitespace_exactly() {
         let source = "\t  alpha\u{2003}\u{2003}beta  終\t tail";
@@ -8141,6 +8199,30 @@ mod tests {
                 .collect::<String>(),
             source
         );
+    }
+
+    /// A NO-BREAK SPACE KEEPS ITS NEIGHBOURS ON ONE LINE, as the shared rule
+    /// keeps it ([`aterm_grapheme::is_break_space`]): where the line would
+    /// end after it, it ends at the space before instead. NEGATIVE CONTROL:
+    /// with every white space a break, "50\u{a0}" ended the line and "%"
+    /// started the next.
+    #[test]
+    fn ui_text_wrap_keeps_a_no_break_space_as_glue() {
+        for glue in ['\u{a0}', '\u{202f}', '\u{2007}'] {
+            let source = format!("aaa 50{glue}% bbb");
+            let maximum_width = ui_text_width(&format!("aaa 50{glue}"), 13.0) + 0.1;
+            assert!(ui_text_width(&format!("aaa 50{glue}%"), 13.0) > maximum_width);
+            let lines: Vec<&str> = ui_text_wrap_ranges(&source, 13.0, maximum_width)
+                .into_iter()
+                .map(|range| &source[range])
+                .collect();
+            assert_eq!(lines.concat(), source);
+            assert!(
+                lines.iter().all(|line| !line.starts_with('%')),
+                "{glue:?}: {lines:?}"
+            );
+            assert_eq!(lines.first().copied(), Some("aaa "), "{glue:?}: {lines:?}");
+        }
     }
 
     #[test]
@@ -8174,13 +8256,12 @@ mod tests {
         assert_eq!(source[overflow.start..overflow.end].graphemes().count(), 1);
     }
 
-    /// The UI faces rasterize SOMETHING even when the system stack is absent, and a
-    /// real semibold face covers more ink than regular on supported desktops.
+    /// The UI faces rasterize something even when the system stack is absent, and a real
+    /// semibold face covers more ink than regular on supported desktops.
     #[test]
     fn ui_faces_rasterize_and_bold_is_no_lighter() {
-        // UI faces are HOST-PREPARED state now: `set_chrome_fonts` installs the
-        // prepared assets into this context exactly like backend startup does
-        // (raster itself never resolves fonts).
+        // UI faces are host-prepared: `set_chrome_fonts` installs them into this context as
+        // backend startup does (raster never resolves fonts).
         set_chrome_fonts(None, None, None);
         let text = |face: TextFace| {
             // Route through the funnel (text_prim), baseline-positioned in a 28px
@@ -8264,9 +8345,8 @@ mod tests {
 
     #[test]
     fn blend_composites_in_linear_light() {
-        // 50%-coverage opaque WHITE over opaque BLACK must land near the linear-light
-        // midpoint (sRGB ~188 / 0xBC), NOT the gamma-space 128 — matching the main
-        // glyph path, so thin tray text/edges don't smear.
+        // 50%-coverage opaque white over opaque black lands near the linear-light midpoint
+        // (sRGB ~188 / 0xBC), not the gamma-space 128, as the main glyph path does.
         let mut cv = Canvas::new(1, 1, [0, 0, 0, 255]);
         cv.blend(0, 0, [255, 255, 255, 255], 0.5);
         assert!(
@@ -8361,6 +8441,50 @@ mod tests {
         assert!(
             worst <= 2,
             "dark-on-light departs from the mirror by {worst}"
+        );
+    }
+
+    /// The UI pen places each glyph at the quarter pixel nearest its true
+    /// place, the ink moved by that quarter: at 1× an 11 px word's gaps are
+    /// even, where snapping each glyph to a whole pixel split "To kens".
+    #[test]
+    fn the_ui_pen_places_glyphs_at_quarter_pixels() {
+        assert_eq!(pen_phase(10.0), (10, 0));
+        assert_eq!(pen_phase(10.2), (10, 1));
+        assert_eq!(pen_phase(10.5), (10, 2));
+        assert_eq!(pen_phase(10.74), (10, 3));
+        assert_eq!(pen_phase(10.9), (11, 0));
+        assert_eq!(pen_phase(-0.3), (-1, 3));
+        let font = ChromeFont::from_bytes(
+            aterm_render::embedded_font(),
+            aterm_render::font::FontSettings::default(),
+        )
+        .expect("embedded font parses");
+        // The stem's left edge, in px from the pen's whole pixel: the first
+        // inked texel of a row through the stem, less what it leaves bare.
+        let edge = |dx: f32| {
+            let (m, cov) = font.char_raster_at('l', 13.0, dx);
+            let row = &cov[(m.height / 2) * m.width..][..m.width];
+            let first = row.iter().position(|&c| c > 0).expect("the stem is inked");
+            f64::from(m.xmin) + first as f64 + 1.0 - f64::from(row[first]) / 255.0
+        };
+        let at0 = edge(0.0);
+        for phase in 1..4u8 {
+            let dx = f32::from(phase) / PEN_PHASES;
+            let moved = edge(dx) - at0;
+            assert!(
+                (moved - f64::from(dx)).abs() < 0.01,
+                "phase {phase}: the stem moved {moved}, not {dx}"
+            );
+        }
+        // A whole pixel on is the same mask one pixel on.
+        let (m0, c0) = font.char_raster('l', 13.0);
+        let (m1, c1) = font.char_raster_at('l', 13.0, 1.0);
+        assert_eq!((m1.xmin, m1.width, &c1), (m0.xmin + 1, m0.width, &c0));
+        // Phase 0 is the whole-pixel raster.
+        assert_eq!(
+            font.char_raster_at('l', 13.0, 0.0),
+            font.char_raster('l', 13.0)
         );
     }
 
@@ -8581,8 +8705,8 @@ mod tests {
     /// untouched backdrop.
     #[test]
     fn hsv_disk_center_edge_and_outside() {
-        // Centre the disk on a pixel SAMPLE point (x+0.5, y+0.5) so pixel (10,10)
-        // reads the exact centre (saturation 0).
+        // Centre the disk on a pixel sample point (x+0.5, y+0.5) so pixel (10,10) reads the
+        // exact centre (saturation 0).
         let disk = |value: f32| DrawPrim::HsvDisk {
             cx: 10.5,
             cy: 10.5,
@@ -8621,7 +8745,7 @@ mod tests {
 
     #[test]
     fn hairline_stroke_snaps_to_one_device_row() {
-        // A 1px-tall horizontal Stroke fully covers EXACTLY one device row (no smear).
+        // A 1px-tall horizontal Stroke fully covers exactly one device row (no smear).
         let prims = vec![DrawPrim::Stroke {
             x: 0.0,
             y: 4.0,
@@ -8772,14 +8896,10 @@ mod tests {
         );
     }
 
-    /// REVIEW PIN (Phase 2, 2026-09-22): EVERY ADMITTED MESSAGE GLYPH INKS in
-    /// the cold chrome store — the embedded DejaVu alone, which is what unit
-    /// tests hold and what a host whose faces lack a symbol holds. `ℹ` and
-    /// `⏸` are DejaVu Sans Mono's two misses (Menlo's and SF Pro's too) and
-    /// the pen's own; the rest are the face's. So Settings ▸ Messages can
-    /// never draw a severity cell blank, whatever the host's chain has
-    /// parsed — and the next glyph the vocabulary admits cannot go blank
-    /// silently.
+    /// Every admitted message glyph inks in the cold chrome store (the embedded DejaVu alone,
+    /// what unit tests and a host whose faces lack a symbol hold): `ℹ` and `⏸` are the pen's
+    /// own and the rest are DejaVu's, so no Settings ▸ Messages severity cell draws blank and a
+    /// newly admitted glyph cannot go blank silently.
     #[test]
     fn every_admitted_message_glyph_inks_in_the_cold_store() {
         let mut fonts = default_chrome_fonts();
@@ -8830,9 +8950,8 @@ mod tests {
         }
     }
 
-    /// The pen INKS `ℹ` on both its arms — the mono stack and the
-    /// proportional UI arm — in the cold store, inside the glyph's own box
-    /// on the baseline it was given, and nothing else on the canvas.
+    /// The pen inks `ℹ` on both arms (the mono stack and the proportional UI arm) in the cold
+    /// store, inside the glyph's own box on the given baseline, and nothing else on the canvas.
     #[test]
     fn the_pen_inks_the_info_glyph_no_face_carries() {
         let px = 28.0_f32;

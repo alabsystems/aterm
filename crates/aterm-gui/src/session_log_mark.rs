@@ -773,21 +773,38 @@ impl SessionLog {
 
     /// A SELF-SUPERVISED AGENT'S ACT (plan 5C-2; rulings T21, T24): what a
     /// proven self-claim's holder told with `meta set harness_act <act>`, as
-    /// the log's `mark <node> act word=<w> rule=<act> by=<a> src=mark
-    /// conf=claim` — the word [`aterm_agent::harness::acts::self_claim_act`]
-    /// gives, on the deepest open node (the approval's step while one is
-    /// open; `-` only when nothing is), as the loop's own act marks land.
-    /// `by` is the connection's actor (`log_actor`), never a parameter of the
-    /// request. A claim like any mark: the act is the holder's word, spent
-    /// from `by`'s mark bucket and held to the log's mark quota. An act with
-    /// no word writes nothing. Returns the seq, if one was written.
-    pub(crate) fn self_claim_act(&mut self, act: &str, by: Actor, at: Stamp) -> Option<u64> {
-        let (word, rule) = aterm_agent::harness::acts::self_claim_act(act)?;
+    /// the log's `mark <node> act word=<w> rule=<act> holder=<h>
+    /// harness_act=<act> by=<a> src=mark conf=claim` — the word
+    /// [`aterm_agent::harness::acts::self_claim_act`] gives, on the deepest
+    /// open node (the approval's step while one is open; `-` only when
+    /// nothing is), as the loop's own act marks land. `by` is the
+    /// connection's actor (`log_actor`), never a parameter of the request;
+    /// `holder` the proven claim's holder the server read from the session's
+    /// meta (host tier: an id the server sets, never caller text; phase 6,
+    /// 6F-7), left out when it is no id; and the act as the holder told it
+    /// (`harness_act=`, host tier, the `harness-act` row's whole, which a
+    /// wire `rule=` cannot hold). A claim like any mark: the act is the
+    /// holder's word, spent from `by`'s mark bucket and held to the log's
+    /// mark quota. EVERY ACT IS A RECORD (the review of 6F-7): an act with no
+    /// word is `word=unknown`, with no `rule=`, so no `harness-act` row stands
+    /// alone. Returns the seq, if one was written.
+    pub(crate) fn self_claim_act(
+        &mut self,
+        act: &str,
+        holder: &str,
+        by: Actor,
+        at: Stamp,
+    ) -> Option<u64> {
         self.consumers.limiter.peek(&by, at.mono_ms).ok()?;
-        let f = Fields::new()
-            .word(Key::Word, word)
-            .and_then(|f| f.id(Key::Rule, &rule))
-            .ok()?;
+        let worded = aterm_agent::harness::acts::self_claim_act(act);
+        let word = worded.as_ref().map_or("unknown", |(w, _)| *w);
+        let f = Fields::new().word(Key::Word, word).ok()?;
+        let f = match &worded {
+            Some((_, rule)) => f.clone().id(Key::Rule, rule).unwrap_or(f),
+            None => f,
+        };
+        let f = f.clone().id(Key::Holder, holder).unwrap_or(f);
+        let f = f.clone().text(Key::HarnessAct, act).unwrap_or(f);
         let seq = self
             .log
             .mark(

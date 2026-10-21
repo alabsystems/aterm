@@ -1,28 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS arm.
+//! macOS system probes:
 //!
-//! * **Another process** — `PROC_PIDVNODEPATHINFO` (its working directory),
-//!   `proc_pidpath` (its executable), `PROC_PIDT_SHORTBSDINFO` (its process
-//!   group) and `proc_listpids(PROC_PGRP_ONLY)` with
-//!   `proc_pid_rusage(RUSAGE_INFO_V4)` per member (the group's
-//!   `ri_phys_footprint`), and the same listing for whether a group's leader
-//!   is alone in it and for which members read the leader's own input device
-//!   (`proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` on descriptor 0).
-//! * **Memory** — `kern.memorystatus_vm_pressure_level`;
-//!   `host_statistics64(HOST_VM_INFO64)` for memory available and in use
-//!   ([`available_mib_of`](crate::available_mib_of),
-//!   [`used_mib_of`](crate::used_mib_of)) and
-//!   swapins plus swapouts in `vm.pagesize` pages; `hw.memsize` once.
-//! * **The machine now** ([`crate::machine`]) —
-//!   `host_processor_info(PROCESSOR_CPU_LOAD_INFO)` per core;
-//!   `hw.perflevelN.*` and the IORegistry's `IODeviceTree:/cpus` for the
-//!   clusters; the same `HOST_VM_INFO64` read by page class with
-//!   `vm.swapusage`; the first `IOAccelerator`'s `PerformanceStatistics`;
-//!   `statfs` of a path; the routing socket's `NET_RT_IFLIST2` list (decoded
-//!   by [`crate::iflist`]) with each interface's `SIOCGIFFUNCTIONALTYPE`;
-//!   `kern.maxproc`, `kern.maxprocperuid` and `RLIMIT_NPROC`.
+//! * **Per-process / group**: `PROC_PIDVNODEPATHINFO` (cwd), `proc_pidpath`
+//!   (executable), `PROC_PIDT_SHORTBSDINFO` (pgid), `proc_listpids(PROC_PGRP_ONLY)`
+//!   with `proc_pid_rusage(RUSAGE_INFO_V4)` (`ri_phys_footprint`), and
+//!   `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` on fd 0 (`stdin_sharers`).
+//! * **Memory**: `kern.memorystatus_vm_pressure_level`,
+//!   `host_statistics64(HOST_VM_INFO64)`, `vm.pagesize`, `vm.swapusage`,
+//!   and `hw.memsize`.
+//! * **Machine**: `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`,
+//!   `hw.perflevelN.*` + `IODeviceTree:/cpus`, `IOAccelerator`
+//!   `PerformanceStatistics`, `statfs`, `NET_RT_IFLIST2` + `SIOCGIFFUNCTIONALTYPE`,
+//!   `kern.maxproc` / `kern.maxprocperuid` / `RLIMIT_NPROC`, and the process
+//!   counts by `proc_listallpids` and `proc_listpids(PROC_RUID_ONLY)`.
 
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::OnceLock;
@@ -37,11 +29,8 @@ use crate::{
     VolumeReading, pressure_of,
 };
 
-/// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`). Declared here rather than in
-/// the first-party `libc` because the reference `libc` 0.2.186 does not export
-/// it, so the oracle has nothing to check it against; the layout is pinned by
-/// the size assertion below (64 bytes, measured against the SDK) and by the
-/// live test that reads this process's own group back.
+/// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`, 64-byte `proc_bsdshortinfo`),
+/// declared locally because `libc` 0.2.186 does not export it.
 const PROC_PIDT_SHORTBSDINFO: c_int = 13;
 
 /// `struct proc_bsdshortinfo`.
@@ -63,12 +52,8 @@ struct ProcBsdShortInfo {
     pbsi_rfu: u32,
 }
 
-/// `PROC_PIDVNODEPATHINFO` (`sys/proc_info.h`): a process's current and
-/// root directory vnodes with their paths. Declared here for the same reason
-/// as [`PROC_PIDT_SHORTBSDINFO`]; the layout is pinned by the size
-/// assertion below (2352 bytes: two `vnode_info_path`s of a 152-byte
-/// `vnode_info` and a `MAXPATHLEN` path) and by the live test that reads
-/// this process's own directory back.
+/// `PROC_PIDVNODEPATHINFO` (`sys/proc_info.h`, 2352-byte `proc_vnodepathinfo`),
+/// declared locally for the same reason as [`PROC_PIDT_SHORTBSDINFO`].
 const PROC_PIDVNODEPATHINFO: c_int = 9;
 
 /// `struct vnode_info_path`: the vnode's `vnode_info` (read as opaque bytes
@@ -202,6 +187,9 @@ fn path_into(pid: i32, buf: &mut [u8; PATH_CAP]) -> Option<usize> {
 /// `PROC_PGRP_ONLY` (`sys/proc_info.h`): `proc_listpids`' filter for the
 /// members of one process group.
 const PROC_PGRP_ONLY: u32 = 2;
+/// `PROC_RUID_ONLY` (`sys/proc_info.h`): `proc_listpids`' filter for the
+/// processes whose real user is one uid.
+const PROC_RUID_ONLY: u32 = 5;
 
 unsafe extern "C" {
     /// libproc's `proc_listpids` (`libproc.h`): the pids `kind`/`typeinfo`
@@ -444,17 +432,9 @@ pub(crate) fn swapped_kib() -> Option<u64> {
     )
 }
 
-// ---------------------------------------------------------------------------
-// The machine now: per-core ticks, the cluster layout, memory by page class,
-// the GPU and a volume.
-// ---------------------------------------------------------------------------
-
 unsafe extern "C" {
-    /// libSystem's cached send right to this task (`mach_task_self()` is a
-    /// C macro reading it). Declared here because the reference `libc`
-    /// exposes it only as a `static mut` the oracle's generator does not
-    /// emit; the same declaration is in `aterm-containment`'s actuator and
-    /// `aterm-gui`'s keymap.
+    /// libSystem's cached send right to this task (`mach_task_self()`), declared
+    /// locally as an immutable extern.
     static mach_task_self_: libc::mach_port_t;
 }
 
@@ -519,6 +499,15 @@ pub(crate) fn core_ticks() -> Option<Vec<CoreTicks>> {
         );
     }
     cores
+}
+
+/// [`crate::machine_words`] on macOS: `machdep.cpu.brand_string` and
+/// `kern.osproductversion`.
+pub(crate) fn machine_words() -> crate::MachineWords {
+    crate::MachineWords {
+        cpu: sysctl_text(c"machdep.cpu.brand_string"),
+        os: sysctl_text(c"kern.osproductversion").map(|v| format!("macOS {v}")),
+    }
 }
 
 /// A string sysctl (at most 63 bytes), NUL-trimmed; `None` where unreadable
@@ -833,14 +822,23 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
         purgeable: u64::from(vm.purgeable_count),
         external: u64::from(vm.external_page_count),
         internal: u64::from(vm.internal_page_count),
+        swapins: vm.swapins,
+        swapouts: vm.swapouts,
+        decompressions: vm.decompressions,
+        compressions: vm.compressions,
+        pageins: vm.pageins,
     };
-    Some(crate::machine::memory_detail_of(
+    let mut detail = crate::machine::memory_detail_of(
         &pages,
         page_bytes,
         total,
         swap_usage(),
         memory_pressure(),
-    ))
+    );
+    detail.kernel_available_pct = sysctl_int(c"kern.memorystatus_level")
+        .and_then(|v| u8::try_from(v).ok())
+        .filter(|v| *v <= 100);
+    Some(detail)
 }
 
 /// The keys of `PerformanceStatistics`, made once.
@@ -991,18 +989,19 @@ pub(crate) fn volume(path: &std::path::Path) -> Option<VolumeReading> {
     ))
 }
 
-/// The first buffer [`net_links`] offers the interface list: room for
-/// about 140 interfaces with their addresses (24 took 10.9 KB on the M5
-/// Max). Made per call and freed before [`net_links`] returns.
+/// Initial `NET_RT_IFLIST2` buffer size (64 KiB, ~140 interfaces); the
+/// caller's scratch keeps it between reads.
 const IFLIST_FIRST: usize = 64 * 1024;
 /// The most it grows to.
 const IFLIST_CAP: usize = 4 * 1024 * 1024;
 
-/// The routing socket's `NET_RT_IFLIST2` answer: into [`IFLIST_FIRST`]
-/// bytes, and where the kernel says that is too small (`ENOMEM`), grown as
-/// [`iflist::read_growing`] says, never past [`IFLIST_CAP`].
-fn iflist_bytes() -> Option<Vec<u8>> {
-    iflist::read_growing(IFLIST_FIRST, IFLIST_CAP, iflist_sysctl)
+/// The routing socket's `NET_RT_IFLIST2` answer, read into `scratch`: into
+/// all of it, at least [`IFLIST_FIRST`] bytes, and where the kernel says
+/// that is too small (`ENOMEM`), grown as [`iflist::read_growing`] says,
+/// never past [`IFLIST_CAP`].
+fn iflist_bytes(scratch: &mut Vec<u8>) -> Option<&[u8]> {
+    let n = iflist::read_growing(IFLIST_FIRST, IFLIST_CAP, scratch, iflist_sysctl)?;
+    Some(&scratch[..n])
 }
 
 /// One `sysctl` of the interface list into `buf`, or, with no buffer, of
@@ -1094,13 +1093,13 @@ fn index_name(index: u32) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// [`crate::net_links`] on macOS: the interface list decoded, a missing
-/// name asked of `if_indextoname`, and each interface's kind by
-/// [`iflist::link_kind`]: other for a name the machine filter refuses,
-/// else its functional type asked on one socket (the name's kind where
-/// that fails).
-pub(crate) fn net_links() -> Option<Vec<LinkReading>> {
-    let mut links = iflist::links_of(&iflist_bytes()?);
+/// [`crate::net_links_into`] on macOS: the interface list read into
+/// `scratch` and decoded, a missing name asked of `if_indextoname`, and
+/// each interface's kind by [`iflist::link_kind`]: other for a name the
+/// machine filter refuses, else its functional type asked on one socket
+/// (the name's kind where that fails).
+pub(crate) fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> {
+    let mut links = iflist::links_of(iflist_bytes(scratch)?);
     let sock = ioctl_socket();
     for link in &mut links {
         if link.name.is_empty()
@@ -1113,6 +1112,20 @@ pub(crate) fn net_links() -> Option<Vec<LinkReading>> {
         });
     }
     Some(links)
+}
+
+/// [`crate::workqueue_limits`] on macOS: `kern.wq_max_constrained_threads`
+/// and `kern.wq_max_threads`.
+pub(crate) fn workqueue_limits() -> crate::machine::WorkqueueLimits {
+    let int = |name: &CStr| {
+        sysctl_int(name)
+            .and_then(|v| u64::try_from(v).ok())
+            .filter(|v| *v > 0)
+    };
+    crate::machine::WorkqueueLimits {
+        constrained: int(c"kern.wq_max_constrained_threads"),
+        total: int(c"kern.wq_max_threads"),
+    }
 }
 
 /// [`crate::process_limits`] on macOS: `kern.maxproc`, and the smaller of
@@ -1130,6 +1143,42 @@ pub(crate) fn process_limits() -> ProcessLimits {
             crate::machine::nproc_rlimit(),
         ),
     }
+}
+
+/// [`crate::pid_counts`] on macOS: the room a size ask of
+/// `proc_listallpids` names ([`crate::machine::pid_room`]), then into one
+/// buffer of that room every pid (`proc_listallpids`, which answers a
+/// count) and the pids whose real user is `uid`
+/// (`proc_listpids(PROC_RUID_ONLY)`, which answers bytes), counted by
+/// [`crate::machine::listed_count`] and [`crate::machine::owned_count`]
+/// (which reads the `errno` this clears before the call).
+pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
+    // SAFETY: a null buffer asks for the room only.
+    let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let Some(room) = crate::machine::pid_room(i64::from(estimate)) else {
+        return (None, None);
+    };
+    let mut pids = vec![0 as c_int; room];
+    let Ok(bytes) = c_int::try_from(std::mem::size_of_val(pids.as_slice())) else {
+        return (None, None);
+    };
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the
+    // call returns how many pids it wrote.
+    let all = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    // SAFETY: as above; this call returns how many bytes it wrote.
+    // `errno` is this thread's, cleared first: libproc answers zero for a
+    // uid that owns no process and for a failure, and only a failure sets
+    // it.
+    let (own, errno) = unsafe {
+        *libc::__error() = 0;
+        let own = proc_listpids(PROC_RUID_ONLY, uid, pids.as_mut_ptr().cast(), bytes);
+        (own, *libc::__error())
+    };
+    let width = std::mem::size_of::<c_int>() as c_int;
+    (
+        crate::machine::listed_count(i64::from(all), room),
+        crate::machine::owned_count(i64::from(own / width), errno, room),
+    )
 }
 
 /// [`crate::caps`] on macOS: the public baseline of design §5.2 as this
@@ -1163,9 +1212,8 @@ pub(crate) fn caps() -> crate::Caps {
 mod tests {
     use super::*;
 
-    /// A registry property an entry lacks comes back NULL (a paravirtual
-    /// GPU's `model`): it adopts as `None` and nothing releases it — a
-    /// `CFRelease(NULL)` traps the whole process, as it did the vitals thread.
+    /// Missing registry properties return NULL and adopt as `None` without
+    /// calling `CFRelease(NULL)`.
     #[test]
     fn an_absent_property_adopts_as_none_without_a_release() {
         assert!(Cf::adopt(std::ptr::null()).is_none());

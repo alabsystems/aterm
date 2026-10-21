@@ -43,7 +43,12 @@ All of it was measured on 2026-10-20 with the prover the lane uses on this host:
 | L1's language table (§6) merged with that line (`amacs/L1` f7e865eee3, origin/main 90f10d9fc6) | 639 / 1717 | 13 | 7 | 520 | 537 |
 | that tree merged with origin/main 2cf0ec1c81, whose f31b5d99fb rejects misplaced patch EOF markers in `protocol::script` (`amacs/L1` 978fa5518f) | 639 / 1727 | 13 | 7 | 527 | 540 |
 | S5's P0 commands (§7) on their own branch from origin/main 623a1a840f (`amacs/S5` 5ac0f6237c) | 336 / 1144 | not recorded | not recorded | not recorded | not recorded |
-| S5 merged with that line (origin/main ce903e0d35), and `record_kill` without `insert_str` (§7; the floor in `floors.tsv`) | **704 / 1943** | 13 | 4 | 614 | 606 |
+| S5 merged with that line (origin/main ce903e0d35), and `record_kill` without `insert_str` (§7) | 704 / 1943 | 13 | 4 | 614 | 606 |
+| A1's first run on its base 90f10d9fc6 (the `doc` grammar, `protocol::doc`, with `impl Fn` item parsers) | 453 / 1363 | 14 | 7 | 457 | 425 |
+| A1 on that base (`protocol::doc`'s parsers without `impl Fn`) | 453 / 1358 | 13 | 7 | 454 | 428 |
+| A1 merged with origin/main 1109343ba8, plus `disk_same` with a second theorem the kernel rejected (01feea1b55; not committed as a floor) | 645 / 1820 | 13 | 7 | 549 | 575 |
+| A1 merged with origin/main 1109343ba8, plus the `doc-disk-same` contract (58d84d7ba6) | 679 / 1844 | 13 | 7 | 539 | 575 |
+| A1 merged with origin/main 0d94a2126e, S5's line (0958bbbaff; the floor in `floors.tsv`) | **744 / 2060** | 13 | 4 | 626 | 641 |
 
 The floor committed before this work was `amacs 191 691`, measured under
 `edbb3f300`. `--update-ratchet` re-bases the row onto `41d799797` at the
@@ -97,6 +102,54 @@ were `not-reproducible` the same way (`wall-backstop=17`). A later run that
 lands below the floor with more timeouts is the clock, not the code; rerun
 it on a quieter host before reading it as a regression.
 
+Slice A1 added `protocol::doc`, the `doc` verb's requests and its `doc ls`
+row (§7c of the design). Its first run measured `TOTAL: 453/1363 proved`,
+gate line `453 proved, 14 failed, 425 runtime-checked, 371 assumed, 1
+mandated, 0 contract-panic, 99 unknown / 1363 total`. The extra failed row
+was an `instance-hypothesis:discharge` in `doc.rs`: the row parser handed a
+closure to a list parser generic over `impl Fn(&str) -> Option<T>`, the same
+refusal as `repeat_line_motion`'s (§4). With the list parser taking decimal
+ids directly and the optional fields read inline, the `--update-ratchet` run
+measured `TOTAL: 453/1358 proved`, gate line `453 proved, 13 failed, 428
+runtime-checked, 368 assumed, 1 mandated, 0 contract-panic, 95 unknown /
+1358 total`, `not-reproducible` the same way (`wall-backstop=17`). That run
+has no failed, timed-out or assumed row in `doc.rs`: 35 proved, 35
+runtime-checked and 42 unknown. The 13 failed rows are the ones §4 lists, at
+the same sites. In the four A1 rows, the timeout and unknown columns
+count the log's `[TIMEOUT]` and `[UNKNOWN]` rows.
+
+A1 was then merged with origin/main 1109343ba8, which carries L1's language
+table (§6), and its review moved `disk=`'s decision into
+`protocol::doc::DiskState::by_content` with one contract, `disk_same` (§2).
+The first run of that tree printed `TOTAL: 645/1820 proved` with `rc=0`, but
+it is not a measurement of the contracts: a second theorem,
+`disk_same_needs_the_file`, closed under `simp only` alone, so its `cases`
+found no goal and the kernel rejected it (`InTactic { tactic: "cases", …
+TacticFailed(NoGoals) }`). The rejected island tainted the crate's Clean
+environment, and all 29 citations reported `cannot be validated because an
+earlier Clean island was rejected`. Its ratchet was not committed. With that
+theorem removed (it restated the first theorem's `now = false` rows), the
+`--update-ratchet` run on 58d84d7ba6 printed `TOTAL: 679/1844 proved`, gate
+line `679 proved, 13 failed, 575 runtime-checked, 469 assumed, 1 mandated,
+0 contract-panic, 107 inconclusive (1844 total)`, `not-reproducible` the same
+way (`wall-backstop=17`). No island was rejected, and all 29 citations
+kernel-discharge (`citation … kernel-discharges this postcondition
+statement`): the 28 of §2 and §6 and `disk_same_is_all_four`. The 48 fn
+rows under `protocol::doc` in that log sum to 108 obligations: 36 proved, 30
+runtime-checked, 0 failed and 42 unknown (`disk_same` is 5 of 5 proved). The
+13 failed and 7 timeout rows are the ones §4 lists.
+
+Merged once more with origin/main 0d94a2126e, which carries S5's P0
+commands (§7, the 704/1943 line), the `--update-ratchet` run on 0958bbbaff
+printed `TOTAL: 744/2060 proved`, gate line `744 proved, 13 failed, 641
+runtime-checked, 510 assumed, 2 mandated, 0 contract-panic, 150
+inconclusive (2060 total)`, `not-reproducible` (`wall-backstop=17`). The
+two lines add up exactly, as L1's did: A1 adds 117 rows and 40 proofs on
+either line (1844 − 1727 and 679 − 639; 2060 − 1943 and 744 − 704). No
+island was rejected, all 30 citations kernel-discharge, `disk_same` is
+again 5 of 5 proved, and the 48 `protocol::doc` fn rows again sum to 108
+obligations (36 proved, 30 runtime-checked, 0 failed, 42 unknown).
+
 ## 2. Proved specs
 
 Each contract is written through `trust_contract_fn!`. It emits the native
@@ -128,6 +181,12 @@ things:
 | `h6-fits` | `protocol::anchor::fits_h6(value: u32) -> bool` | `result ⇔ value ≤ 0xff_ffff` (24 bits); `Hash6::from_value` admits exactly these values | `fits_h6_is_24_bits` | `[VERIFIED]`, 2 of 2 obligations proved | Body `value < H6_MAX`. The island is rejected (`simp` leaves `decide (value < 16777215) = decide (value <= 16777215)` unsolved), the citation fails, and one postcondition is `FAILED … verified_counterexample = true`. |
 | `h6-hex-digit` | `protocol::anchor::is_hex_digit(byte: u8) -> bool` | `result ⇔ byte ∈ 0x30..=0x39 ∪ 0x61..=0x66 ∪ 0x41..=0x46` (0-9, a-f, A-F); `Hash6::from_str` reads 6 such bytes and nothing else | `is_hex_digit_is_the_class` | `[VERIFIED]`, 12 of 12 obligations proved | Body `byte < b'f'` for the lower-case range. The island is rejected (`simp` leaves the goal unsolved), the citation fails, and one postcondition is `FAILED … verified_counterexample = true`. |
 | `for-word-byte-set` | `protocol::edit::for_word_byte(byte: u8) -> bool` | `result ⇔ byte ∈ [0-9A-Za-z] ∪ {. _ -}`; neither space nor `=` is in the set, so a `for=` word stays one `key=value` field | `for_word_byte_is_exactly_the_word_set` | `[VERIFIED]`, 10 of 10 obligations proved | `b'-'` → `b'='`. The island is rejected: `InTactic { tactic: "simp", … UnsolvedGoals …`. The fn row is `[VIOLATIONS] (10 obligations: 6 proved, 2 failed, 2 unknown)`, with two `verified_counterexample = true`. |
+| `doc-disk-same` | `protocol::doc::disk_same(now_exists: bool, base_exists: bool, same_len: bool, same_content: bool) -> bool` | `result ⇔ now_exists ∧ base_exists ∧ same_len ∧ same_content`: `doc ls` prints `disk=same` only when the file is there, the buffer's version was a file, and both length and content agree; in particular never of a missing file, and never of a rewrite of the same length | `disk_same_is_all_four` | `[VERIFIED] (5 obligations: 5 proved …)` on 58d84d7ba6 | Body `now_exists && base_exists && (same_len || same_content)` (either agreement counts; run from 58d84d7ba6). The island is rejected: `InTactic { tactic: "rfl", … TypeMismatch { expected: "Bool.and Bool.true (Bool.and Bool.true (Bool.or Bool.false Bool.true)) = and (and (and Bool.true Bool.true) Bool.false) Bool.true", actual: "const mismatch: Bool.true vs Bool.false" }`. The fn row is `[VIOLATIONS] (4 obligations: 2 proved, 0 runtime-checked, 2 failed, 0 unknown …)`, both postconditions `FAILED … verified_counterexample = true`; the crate check ended `could not compile `amacs` (lib) due to 30 previous errors` (the theorem and the 29 citations), and the lane `VERDICT: FAIL — amacs RATCHET-REGRESSION(<679) 644/1821`, `rc=1`. The file was restored with `git checkout --`. |
+
+On the A1 tree merged with origin/main 1109343ba8 (58d84d7ba6) all ten
+contracts of this table are `[VERIFIED]`, and its fourteen citations
+kernel-discharge with §6's fifteen; merged with 0d94a2126e (0958bbbaff),
+they do again, beside §7's.
 
 On 3a9c7b2a0c the seven contracts other than the two `h6-*` ones were
 `[VERIFIED]` again, with the counts in the table, and all eleven of their
@@ -150,11 +209,22 @@ Where each spec is used:
 - `fits_h6` is `Hash6::from_value`'s admission.
 - `is_hex_digit` is the byte test in `Hash6::from_str`, which reads 6 such
   bytes and nothing else.
+- `disk_same` is the `same` row of `DiskState::by_content`, the table
+  aterm-gui's `doc ls` lane reads `disk=` from (`control_doc::disk_state`).
+  `by_content` asks `!now_exists` first; the theorem's `now = false` rows
+  show the order does not matter. `protocol::doc::tests::disk_state_by_content_is_its_table`
+  checks the wrapper's arms over all 16 inputs; the contract states only
+  `disk_same`.
 
 How the theorems are written:
 
 - The two `u8` set specs close with `simp only [<import>]`, because the clause
   and the compiled `bool` tree elaborate to the same `decide` disjunction.
+- `disk_same_is_all_four` is over four `Bool`s: `simp only [<import>]`, then
+  `cases` on each argument and `rfl`, as amacs-term's `decide` rows are. A
+  theorem `simp only` already closes must stop there: a `cases` after it
+  fails with `NoGoals`, and the rejected island taints every citation in
+  the crate (§1).
 - The selects are term-mode `@Decidable.casesOn` proofs over the comparison
   the body makes, with an explicit motive.
 - Trust reads an `i64` as a `BitVec 64`. The `repeat_count` proofs order it
@@ -264,7 +334,15 @@ timeouts, 317 unknown and 280 runtime-checked. Every row is listed below by
 status and kind, with its site where the rows are few. The merged tree leaves
 828 of 1246 unproved: the same 13 failed and 7 timeout rows in the same fns
 (some have moved down a few lines, `AwaitKey`'s derive to `edit.rs:296`), plus the unknown and runtime-checked rows of S6's edit-script planner
-(`protocol::{anchor,read,script}`), which are not itemised here. None of them
+(`protocol::{anchor,read,script}`), which are not itemised here. A1's
+`protocol::doc` adds 42 unknown and 30 runtime-checked rows of the same
+kinds (58d84d7ba6), also not itemised: allocating bodies (`String`, `Vec`;
+Gap 1), `collect` counts the solver cannot derive, and
+`str::parse::<u64>().ok()`'s discarded error, which the digits-only check
+before it makes unreachable. Its two scalar-looking helpers carry no
+contract because neither is scalar: `digits` reads a `&str` into an
+`Option<u64>` and `column` counts the characters of a `&str` slice, and
+Gap 1 gives `&str` and `Option` no clause type. None of them
 was found to be a reachable hazard in amacs's own code: each is a fact the
 solver cannot see or an obligation on code Trust has no model for. With the
 language table merged the crate leaves 1078 of 1717 unproved; the language
@@ -394,12 +472,8 @@ Where each spec is used:
 
 - `line_space` is every lexer's blank, and the cursor's.
 - `tab_stop` is the divisor of `IndentStyle::render` and
-  `IndentStyle::next_stop`. Both call it directly, in straight-line code.
-  Through the uncontracted method that used to wrap it, the lane refuted the
-  remainder (a probe crate got a counterexample with the divisor 0), and
-  with the call inside `columns_through`'s loop it left the remainder
-  unknown ("depends on the unmodeled return of same-crate `tab_stop`"). As
-  called now, the division and both remainders are proved.
+  `IndentStyle::next_stop`. Both call it directly in straight-line code so the
+  division and both remainders are proved.
 - `indent_columns_cap` caps what `IndentStyle::render` repeats.
 - `decimal_room` and `decimal_append` are `decimal_push`, which reads the
   diff lexer's hunk counts and Markdown's list numbers: below the bound it

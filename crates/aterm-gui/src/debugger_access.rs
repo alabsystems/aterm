@@ -2041,9 +2041,9 @@ fn parse_asked(text: &str) -> Option<Vec<(&str, u64)>> {
     (lines.len() <= MAX_ASKED_LINES).then_some(lines)
 }
 
-/// Where the asked record lives beside `config_path`.
-fn asked_path(config_path: &Path) -> std::io::Result<PathBuf> {
-    marker_path(config_path, ASKED_RECORD).ok_or_else(|| {
+/// Where the host record `record` lives beside `config_path`.
+fn record_path(config_path: &Path, record: &str) -> std::io::Result<PathBuf> {
+    marker_path(config_path, record).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no config directory to record in",
@@ -2064,7 +2064,7 @@ fn read_asked_text(path: &Path) -> std::io::Result<Option<String>> {
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "the asked record is not a bounded regular UTF-8 record",
+                    "the record is not a bounded regular UTF-8 record",
                 )
             }),
     }
@@ -2076,10 +2076,19 @@ fn read_asked_text(path: &Path) -> std::io::Result<Option<String>> {
 /// all read as asked. Only an absent record, or a whole one naming other Macs
 /// only, is not asked.
 pub(crate) fn read_asked(config_path: &Path, host: &str) -> bool {
+    read_host_record(config_path, ASKED_RECORD, host)
+}
+
+/// Whether the once-per-Mac record `record` beside `config_path` names `host`,
+/// read as [`read_asked`] reads [`ASKED_RECORD`]: anything but an absent record
+/// or a whole one naming other Macs only reads as named. The secrets vault's
+/// declined record (`secrets_join::DECLINED_RECORD`) is the other one; its owed
+/// record is read the other way ([`host_record_lists`]).
+pub(crate) fn read_host_record(config_path: &Path, record: &str, host: &str) -> bool {
     if !host_key_ok(host) {
         return true;
     }
-    match asked_path(config_path).and_then(|path| read_asked_text(&path)) {
+    match record_path(config_path, record).and_then(|path| read_asked_text(&path)) {
         Ok(None) => false,
         Ok(Some(text)) => {
             parse_asked(&text).is_none_or(|lines| lines.iter().any(|&(named, _)| named == host))
@@ -2098,14 +2107,27 @@ pub(crate) fn read_asked(config_path: &Path, host: &str) -> bool {
 ///
 /// [`Flush::Durable`]: crate::durable::Flush::Durable
 pub(crate) fn note_asked(config_path: &Path, host: &str, now: u64) -> std::io::Result<()> {
+    note_host_record(config_path, ASKED_RECORD, host, now)
+}
+
+/// Write `host` into the once-per-Mac record `record` beside `config_path`, as
+/// [`note_asked`] writes [`ASKED_RECORD`]: durably, never over a record that
+/// cannot be read whole, never through a link, keeping at most
+/// [`MAX_ASKED_LINES`] Macs.
+pub(crate) fn note_host_record(
+    config_path: &Path,
+    record: &str,
+    host: &str,
+    now: u64,
+) -> std::io::Result<()> {
     use std::fmt::Write as _;
     if !host_key_ok(host) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "not a host key the asked record can hold",
+            "not a host key the record can hold",
         ));
     }
-    let path = asked_path(config_path)?;
+    let path = record_path(config_path, record)?;
     let _serial = DEBUGGER_MARKS.lock().unwrap_or_else(|p| p.into_inner());
     let text = read_asked_text(&path)?;
     let mut lines = match text.as_deref() {
@@ -2113,7 +2135,7 @@ pub(crate) fn note_asked(config_path: &Path, host: &str, now: u64) -> std::io::R
         Some(text) => parse_asked(text).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "the asked record is malformed and is left as found",
+                "the record is malformed and is left as found",
             )
         })?,
     };
@@ -2129,6 +2151,75 @@ pub(crate) fn note_asked(config_path: &Path, host: &str, now: u64) -> std::io::R
     crate::config_marker::write_marker(
         &path,
         &record,
+        MAX_ASKED_BYTES,
+        crate::durable::Flush::Durable,
+    )
+}
+
+/// Whether the once-per-Mac record `record` beside `config_path` names `host`,
+/// read the other way from [`read_host_record`]: `Ok(false)` for an absent
+/// record or a whole one naming other Macs only, and an error for a record that
+/// cannot be read whole or a host key no record could hold. For a record whose
+/// line starts work rather than holding it back (`secrets_join::OWED_RECORD`),
+/// where a record that cannot be read must start nothing.
+pub(crate) fn host_record_lists(
+    config_path: &Path,
+    record: &str,
+    host: &str,
+) -> std::io::Result<bool> {
+    if !host_key_ok(host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a host key the record can hold",
+        ));
+    }
+    let Some(text) = read_asked_text(&record_path(config_path, record)?)? else {
+        return Ok(false);
+    };
+    parse_asked(&text)
+        .map(|lines| lines.iter().any(|&(named, _)| named == host))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "the record is malformed")
+        })
+}
+
+/// Take `host` out of the record `record` beside `config_path`, written as
+/// [`note_host_record`] writes it: durably, never through a link, never over a
+/// record that cannot be read whole (`InvalidData`). A record left naming no Mac
+/// is removed; an absent one, or one not naming `host`, is left as it is.
+pub(crate) fn forget_host_record(
+    config_path: &Path,
+    record: &str,
+    host: &str,
+) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    let path = record_path(config_path, record)?;
+    let _serial = DEBUGGER_MARKS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(text) = read_asked_text(&path)? else {
+        return Ok(());
+    };
+    let lines = parse_asked(&text).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the record is malformed and is left as found",
+        )
+    })?;
+    if !lines.iter().any(|&(named, _)| named == host) {
+        return Ok(());
+    }
+    let mut kept = String::new();
+    for (named, secs) in lines.iter().filter(|&&(named, _)| named != host) {
+        let _ = writeln!(kept, "{named} {secs}");
+    }
+    if kept.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    crate::config_marker::write_marker(
+        &path,
+        &kept,
         MAX_ASKED_BYTES,
         crate::durable::Flush::Durable,
     )

@@ -22,18 +22,13 @@ const CERTIFICATE: &str = "CERTIFICATE";
 /// For the system trust store on Linux and the BSDs (`crate::verifier`). It
 /// never errors:
 ///
-/// * a block whose label is not `CERTIFICATE` is skipped, INCLUDING `TRUSTED
-///   CERTIFICATE` — that label wraps a `Certificate` in OpenSSL's auxiliary
-///   structure, so its body is not a certificate and decoding it as one would
-///   put garbage into a root store;
+/// * any other label is skipped, including `TRUSTED CERTIFICATE` (OpenSSL's
+///   aux-info wrapper, whose body is not a bare certificate);
 /// * a block whose base64 will not decode, or decodes to nothing, is skipped;
-/// * a block with no matching end line stops the scan, because from that point
-///   on the file cannot be read as a sequence of blocks.
+/// * a block with no matching end line stops the scan.
 ///
-/// Skipping is safe HERE and only here: a root that is silently dropped can
-/// only cause a connection to be REFUSED, never accepted. The caller is
-/// responsible for treating an empty result as a failure — `crate::verifier`'s
-/// Unix arm does.
+/// Skipping is safe only here: a dropped root can only refuse a connection.
+/// The caller treats an empty result as a failure.
 #[must_use]
 pub fn decode_certificates_lossy(text: &str) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
@@ -60,8 +55,7 @@ pub fn decode_certificates_lossy(text: &str) -> Vec<Vec<u8>> {
                 out.push(der);
             }
         }
-        // Always advances past this block's end line, so `rest` strictly shrinks
-        // and the loop terminates on any input.
+        // Always advances past this block's end line, so the loop terminates.
         rest = &body[body_end + end_marker.len()..];
     }
     out
@@ -71,8 +65,8 @@ pub fn decode_certificates_lossy(text: &str) -> Vec<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Two syntactically valid CERTIFICATE blocks (the DER is arbitrary bytes —
-    /// this module decodes, it does not parse X.509).
+    /// CERTIFICATE blocks around arbitrary bodies: this module decodes, it does
+    /// not parse X.509.
     fn bundle(bodies: &[&str]) -> String {
         bodies
             .iter()
@@ -106,8 +100,6 @@ mod tests {
 
     #[test]
     fn the_lossy_parser_terminates_on_every_malformed_input() {
-        // Each of these could loop forever or panic in a parser that failed to
-        // advance; the contract is that it returns.
         assert!(decode_certificates_lossy("").is_empty());
         assert!(decode_certificates_lossy("-----BEGIN ").is_empty());
         assert!(decode_certificates_lossy("-----BEGIN CERTIFICATE-----\naaaa\n").is_empty());

@@ -302,8 +302,21 @@ pub enum Durability {
 /// second against one: 3-4 over a 500-message burst against none, 0.02-0.035
 /// a message in the latency phase against 0-0.005, 0.035-0.06 a ping-pong
 /// round trip against 0.005 — each outside the log's lock, after the batch's
-/// acks. A sparse burst pays one full flush at either horizon (it runs from
-/// the first uncovered ack), and a strict broker pays one per batch. ON TOP of
+/// acks. While one runs, an ordered ack waits for it to end: the writer is in
+/// it, and were the flush on a thread of its own, the ack's barrier would wait
+/// it out instead. On one Mac, every `F_BARRIERFSYNC` a probe caught during a
+/// full flush from another thread waited for it to end, 992 of 992; a real
+/// broker whose log a separate thread full-flushed acked each of the 89
+/// publishes that began with more than 2 ms of a flush left no earlier than
+/// 1 ms before that flush ended (`docs/measured/flush-wait-2026-10-21.md`).
+/// So under continuous traffic up to one round trip a horizon carries a full
+/// flush: 10-66 ms a round on a busy machine in the fabric bench
+/// (`docs/measured/fabric`, 2026-10-21, series 2 and 3). Moving the flush to
+/// another thread does not remove that wait; a longer horizon would make it
+/// rarer, and lengthen the loss bound.
+///
+/// A sparse burst pays one full flush at either horizon (it runs from the
+/// first uncovered ack), and a strict broker pays one per batch. ON TOP of
 /// the horizon's, every batch that carries a record [`escalation`] names pays
 /// its own full flush before its ack, at either horizon: a person posting, a
 /// halt, mail to a person, an inbox read mark. The bench's messages are agent
@@ -742,37 +755,6 @@ pub fn mark_path(log: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// astream's identity sidecar for `log`, `<log>.id`
-/// ([`astream_broker::LogIdentity`]'s module docs).
-#[cfg(test)]
-fn identity_sidecar(log: &Path) -> PathBuf {
-    let mut s = log.as_os_str().to_os_string();
-    s.push(".id");
-    PathBuf::from(s)
-}
-
-/// Tests that stand in a POWER LOSS by cutting a log: an unclean stop must come first.
-/// astream's broker closes its log cleanly at shutdown — a full flush, then `Closed`
-/// with the head in `<log>.id` — and no power loss can cut a log after that. A run
-/// that did not stop cleanly leaves the sidecar its OPEN wrote, so a test captures it
-/// right after the open ([`UncleanStop::capture`]) and puts it back after the broker
-/// is gone, before it cuts the file ([`UncleanStop::leave`]).
-#[cfg(test)]
-pub(crate) struct UncleanStop(Vec<u8>);
-
-#[cfg(test)]
-impl UncleanStop {
-    /// The sidecar as the open just wrote it.
-    pub(crate) fn capture(log: &Path) -> UncleanStop {
-        UncleanStop(std::fs::read(identity_sidecar(log)).expect("the open wrote <log>.id"))
-    }
-
-    /// Put it back: the log now stands as a run that never closed cleanly left it.
-    pub(crate) fn leave(&self, log: &Path) {
-        std::fs::write(identity_sidecar(log), &self.0).expect("rewrite <log>.id");
-    }
-}
-
 /// A boot id for a test that stands in a reboot, distinct for each `n` (never
 /// the all-zero id, which astream reads as unknown): the 16 bytes of the UUID
 /// `00000000-0000-0000-0000-0000000001nn`.
@@ -782,42 +764,6 @@ pub(crate) fn test_boot(n: u8) -> [u8; 16] {
     boot[14] = 0x01;
     boot[15] = n;
     boot
-}
-
-/// A [`astream_broker::Lineage`] of these `(generation, common)` steps, oldest
-/// first, for a test that needs one no real reboot made. astream builds one
-/// only inside the crate (an unclean open's own decision); OUTSIDE it the one
-/// door is the `Hello` answer a client parses. So this encodes a real `Nonce`
-/// answer with an identity, appends the extension block's lineage entry in its
-/// documented layout (tag 0x02, `len u16 LE`, `n u8`, `n × (generation u64 LE,
-/// common u64 LE)`), and lets astream's own decoder read it back — the bytes a
-/// broker would send, through the parser every client runs. `None` for steps
-/// that parser refuses (generations that do not rise, more than
-/// [`astream_broker::Lineage::MAX`]).
-#[cfg(test)]
-pub(crate) fn lineage_of(steps: &[(u64, u64)]) -> Option<astream_broker::Lineage> {
-    use astream_broker::proto::{decode_response, encode_response};
-    use astream_broker::{NonceExt, Response};
-    let mut frame = encode_response(&Response::Nonce {
-        nonce: vec![0; 32],
-        log: Some(astream_broker::LogIdentity {
-            id: [0; 16],
-            generation: 0,
-        }),
-        ext: NonceExt::default(),
-    });
-    let mut body = vec![u8::try_from(steps.len()).ok()?];
-    for (generation, common) in steps {
-        body.extend_from_slice(&generation.to_le_bytes());
-        body.extend_from_slice(&common.to_le_bytes());
-    }
-    frame.push(0x02);
-    frame.extend_from_slice(&u16::try_from(body.len()).ok()?.to_le_bytes());
-    frame.extend_from_slice(&body);
-    match decode_response(&frame)? {
-        Response::Nonce { ext, .. } => ext.lineage,
-        _ => None,
-    }
 }
 
 /// The bytes a build before lineage wrote at a relaxed log's mark for boot
@@ -1688,10 +1634,12 @@ mod tests {
         let dir = scratch();
         let log = dir.path().join("bus.log");
         let sock = dir.path().join("bus.sock");
-        let unclean;
         let (before, witnessed, at4) = {
             let opened = open(&log, None, Durability::Relaxed, Some(test_boot(1))).expect("open");
-            unclean = UncleanStop::capture(&log);
+            // A stop that never reaches the clean close (astream's seam): the
+            // log stands as a killed run left it, and the cut below is the power
+            // loss that follows.
+            opened.broker.arm_unclean_stop();
             assert_eq!(opened.renewed, None, "a fresh log has nothing to judge");
             assert_eq!(read_mark(&log), Mark::Absent, "no mark is written");
             let mut h = opened.broker.serve(&sock).expect("serve");
@@ -1706,13 +1654,17 @@ mod tests {
             h.shutdown();
             (opened.broker.log_identity(), witnessed, at4)
         };
-        unclean.leave(&log);
         cut(&log, at4);
 
-        // NEGATIVE CONTROL: the same cut files, opened in the same boot.
+        // NEGATIVE CONTROL: the same cut files, opened in the same boot. A copy
+        // of a log WITH its sidecar, under astream's public name for it.
         let control = dir.path().join("control.log");
         std::fs::copy(&log, &control).unwrap();
-        std::fs::copy(identity_sidecar(&log), identity_sidecar(&control)).unwrap();
+        std::fs::copy(
+            astream_broker::identity_path(&log),
+            astream_broker::identity_path(&control),
+        )
+        .unwrap();
         {
             let b = open(&control, None, Durability::Relaxed, Some(test_boot(1))).unwrap();
             assert_eq!(b.broker.head(), 4, "the cut log is a clean prefix");
@@ -1771,11 +1723,10 @@ mod tests {
         let sock = dir.path().join("bus.sock");
         let first = {
             let opened = open(&log, None, Durability::Relaxed, Some(test_boot(1))).unwrap();
-            let unclean = UncleanStop::capture(&log);
+            opened.broker.arm_unclean_stop();
             let mut h = opened.broker.serve(&sock).unwrap();
             publish(&sock, 7, 1, 3);
             h.shutdown();
-            unclean.leave(&log);
             opened.broker.log_identity()
         };
         // A same-boot reopen after the unclean stop: a process crash.
@@ -1790,9 +1741,9 @@ mod tests {
             first,
             "a clean stop's reboot moves nothing"
         );
-        let unclean = UncleanStop::capture(&log);
+        // Dropped unserved with the seam armed: an unclean stop.
+        rebooted.broker.arm_unclean_stop();
         drop(rebooted);
-        unclean.leave(&log);
         // A strict open in another boot after an unclean RELAXED stop moves it;
         // a strict run's own unclean stop, reopened in another boot, does not.
         let strict = open(&log, None, Durability::Strict, Some(test_boot(3))).unwrap();
@@ -1801,9 +1752,8 @@ mod tests {
             (moved.id, moved.generation),
             (first.id, first.generation + 1)
         );
-        let unclean = UncleanStop::capture(&log);
+        strict.broker.arm_unclean_stop();
         drop(strict);
-        unclean.leave(&log);
         let after_strict = open(&log, None, Durability::Strict, Some(test_boot(4))).unwrap();
         assert_eq!(
             after_strict.broker.log_identity(),
@@ -1829,11 +1779,10 @@ mod tests {
         let (b1, b2, b3, b4) = (test_boot(1), test_boot(2), test_boot(3), test_boot(4));
         let first = {
             let opened = open(&log, None, Durability::Relaxed, Some(b1)).unwrap();
-            let unclean = UncleanStop::capture(&log);
+            opened.broker.arm_unclean_stop();
             let mut h = opened.broker.serve(&sock).unwrap();
             publish(&sock, 7, 1, 3);
             h.shutdown();
-            unclean.leave(&log);
             opened.broker.log_identity()
         };
         std::fs::write(mark_path(&log), legacy_mark_text(&b1)).unwrap();
@@ -1861,9 +1810,8 @@ mod tests {
             "clean stop, reboot: nothing"
         );
         assert_eq!(read_mark(&log), Mark::Absent, "and no mark written");
-        let unclean = UncleanStop::capture(&log);
+        clean.broker.arm_unclean_stop();
         drop(clean);
-        unclean.leave(&log);
         let again = open(&log, None, Durability::Relaxed, Some(b4)).unwrap();
         let third = again.broker.log_identity();
         assert_eq!(generations(third), (first.id, second.generation + 1));
@@ -1910,11 +1858,10 @@ mod tests {
         let sock = dir.path().join("bus.sock");
         let first = {
             let opened = open(&log, None, Durability::Relaxed, Some(test_boot(1))).unwrap();
-            let unclean = UncleanStop::capture(&log);
+            opened.broker.arm_unclean_stop();
             let mut h = opened.broker.serve(&sock).unwrap();
             publish(&sock, 7, 1, 3);
             h.shutdown();
-            unclean.leave(&log);
             opened.broker.log_identity()
         };
         let moves = u64::try_from(astream_broker::Lineage::MAX).unwrap() + 1;
@@ -1930,7 +1877,7 @@ mod tests {
             .unwrap();
             now = opened.broker.log_identity();
             assert_eq!(now.generation, first.generation + n + 1, "one move a boot");
-            let unclean = UncleanStop::capture(&log);
+            opened.broker.arm_unclean_stop();
             let mut h = opened.broker.serve(&sock).unwrap();
             {
                 let mut c = astream_broker::Client::connect(&sock).unwrap();
@@ -1938,7 +1885,6 @@ mod tests {
                 lineage = c.log_lineage().cloned();
             }
             h.shutdown();
-            unclean.leave(&log);
         }
         let lineage = lineage.expect("the Hello carries lineage");
         assert_eq!(lineage.steps().len(), astream_broker::Lineage::MAX);
@@ -2040,11 +1986,10 @@ mod tests {
         let sock = dir.path().join("bus.sock");
         let first = {
             let opened = open(&log, None, Durability::Relaxed, None).expect("runs, unknown boot");
-            let unclean = UncleanStop::capture(&log);
+            opened.broker.arm_unclean_stop();
             let mut h = opened.broker.serve(&sock).unwrap();
             publish(&sock, 7, 1, 2);
             h.shutdown();
-            unclean.leave(&log);
             opened.broker.log_identity()
         };
         let crashed = open(&log, None, Durability::Relaxed, None).unwrap();
@@ -2071,7 +2016,7 @@ mod tests {
 
         let held = open(&log, None, Durability::Strict, Some(test_boot(1))).unwrap();
         std::fs::write(mark_path(&log), legacy_mark_text(&test_boot(9))).unwrap();
-        let sidecar = std::fs::read(identity_sidecar(&log)).unwrap();
+        let sidecar = std::fs::read(astream_broker::identity_path(&log)).unwrap();
         let err = open(&log, None, Durability::Relaxed, Some(test_boot(1)))
             .err()
             .expect("a second broker on one log");
@@ -2081,7 +2026,10 @@ mod tests {
             Mark::Boot(test_boot(9)),
             "the mark is the holder's"
         );
-        assert_eq!(std::fs::read(identity_sidecar(&log)).unwrap(), sidecar);
+        assert_eq!(
+            std::fs::read(astream_broker::identity_path(&log)).unwrap(),
+            sidecar
+        );
         drop(held);
     }
 

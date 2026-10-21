@@ -2303,11 +2303,12 @@ fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
 /// Re-value one ramp to match another's per-level luminance (≤ 8 correction
 /// steps per tint) — the bell ALERT swap changes hue, not brightness.
 fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
+    let table = crate::color_math::relative_luminance_table();
     for (slot, target) in ramp.iter_mut().zip(reference.iter()) {
-        let lt = relative_luminance(*target);
+        let lt = crate::color_math::relative_luminance_with(table, *target);
         let (h, s, mut v) = rgb2hsv(*slot);
         for _ in 0..8 {
-            let l = relative_luminance(*slot);
+            let l = crate::color_math::relative_luminance_with(table, *slot);
             if (l - lt).abs() < 0.01 {
                 break;
             }
@@ -2357,18 +2358,29 @@ fn faint_ink(fg: u32, bg: u32) -> u32 {
 /// as conservative as the plain blend always was. One faint resolve per
 /// theme change.
 fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
+    let table = crate::color_math::relative_luminance_table();
     let bg = cfg.default_bg;
-    let lb = relative_luminance(bg);
-    let plain = (0.5 * (relative_luminance(cfg.theme_fg) - lb)).abs();
-    let faint = (relative_luminance(faint_ink(cfg.theme_fg, bg)) - lb).abs();
+    let lb = crate::color_math::relative_luminance_with(table, bg);
+    let plain =
+        (0.5 * (crate::color_math::relative_luminance_with(table, cfg.theme_fg) - lb)).abs();
+    let faint =
+        (crate::color_math::relative_luminance_with(table, faint_ink(cfg.theme_fg, bg)) - lb).abs();
     let bound = plain.min(faint);
     let level_ok = |body: u8| {
         (0..=15u32).all(|lvl| {
             let a = ((u32::from(body) * (lvl + 1)) / 16).max(1) as u8;
-            (relative_luminance(srgb_over(ramp[lvl as usize], a, bg)) - lb).abs() < bound
+            (crate::color_math::relative_luminance_with(
+                table,
+                srgb_over(ramp[lvl as usize], a, bg),
+            ) - lb)
+                .abs()
+                < bound
         })
     };
-    let head_ok = |a: u8| (relative_luminance(srgb_over(ramp[15], a, bg)) - lb).abs() < bound;
+    let head_ok = |a: u8| {
+        (crate::color_math::relative_luminance_with(table, srgb_over(ramp[15], a, bg)) - lb).abs()
+            < bound
+    };
     let derive = |ok: &dyn Fn(u8) -> bool| {
         (RAIN_ALPHA_FLOOR..=RAIN_ALPHA_CAP)
             .rev()

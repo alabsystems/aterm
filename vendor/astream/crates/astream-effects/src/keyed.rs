@@ -10,8 +10,8 @@
 //! report — needs "what had the door `probe.git_view` answered to THIS request
 //! once the program had read N records?" without disturbing the replay that
 //! drives the program, and without depending on the order in which it asks. [`KeyedView`] is that
-//! reader: it indexes every [`Exchange`](crate::EffectRecord::Exchange) by
-//! (door, request) once, and each [`lookup`](KeyedView::lookup) is a pure
+//! reader: it makes every [`Exchange`](crate::EffectRecord::Exchange) available by
+//! (door, request), and each [`lookup`](KeyedView::lookup) is a pure
 //! function of the tape and its arguments.
 //!
 //! [`KeyedIndex`] is the same index over records it HOLDS — a `Vec`, a `Box`
@@ -85,21 +85,37 @@ fn partition(len: usize, before: impl Fn(usize) -> bool) -> usize {
 /// Every [`Exchange`](crate::EffectRecord::Exchange) of a record slice as
 /// positions into it, ordered by (door, request) and, within one (door,
 /// request), by ascending position: the index a [`KeyedView`] and a
-/// [`KeyedIndex`] both answer from. It holds no record, so it costs one word
-/// per exchange whatever the requests and replies weigh.
+/// [`KeyedIndex`] both answer from. It holds no record, so an indexed tape
+/// costs one word per exchange whatever the requests and replies weigh.
+/// Longer tapes use a backwards scan instead of allocating an unbounded index.
 ///
 /// It is built through a `BTreeMap` rather than a hash map so the crate stays
 /// free of randomness anywhere a replay can reach: no answer depends on the
 /// map's order, but a reviewer should not have to check that.
-#[derive(Clone, Default)]
-struct Order {
-    positions: Vec<usize>,
+#[derive(Clone)]
+enum Order {
+    Indexed(Vec<usize>),
+    Scanned(usize),
+}
+
+// Bound all eager index construction, including its temporary BTreeMap. This
+// is an optimization budget, never a limit on which tape records can answer.
+const MAX_INDEX_RECORDS: usize = 1 << 20;
+
+impl Default for Order {
+    fn default() -> Self {
+        Self::Indexed(Vec::new())
+    }
 }
 
 impl Order {
     /// Index `records`.
     fn of(records: &[EffectRecord]) -> Order {
+        if records.len() > MAX_INDEX_RECORDS {
+            return Order::Scanned(records.iter().filter(|r| exchange_key(r).is_some()).count());
+        }
         let mut runs: BTreeMap<(&str, &[u8]), Vec<usize>> = BTreeMap::new();
+        let mut total = 0usize;
         let mut position = 0usize;
         let mut rest = records;
         while let [record, tail @ ..] = rest {
@@ -107,15 +123,18 @@ impl Order {
                 // The slice is walked front to back, so each run is pushed in
                 // ascending position.
                 runs.entry(key).or_default().push(position);
+                total = total.saturating_add(1);
             }
             position = position.saturating_add(1);
             rest = tail;
         }
-        let mut positions = Vec::new();
+        // The input bound above also bounds every run and their combined
+        // length. Keep the allocation's bound explicit for the verifier.
+        let mut positions = Vec::with_capacity(total.min(MAX_INDEX_RECORDS));
         for run in runs.into_values() {
             positions.extend(run);
         }
-        Order { positions }
+        Order::Indexed(positions)
     }
 
     /// The LATEST exchange through `door` with exactly `request` among the
@@ -131,7 +150,29 @@ impl Order {
         seen: usize,
     ) -> Option<KeyedReply<'r>> {
         let asked = Some((door, request));
-        let positions = self.positions.as_slice();
+        let positions = match self {
+            Self::Indexed(positions) => positions.as_slice(),
+            Self::Scanned(_) => {
+                let mut end = seen.min(records.len());
+                while let Some(position) = end.checked_sub(1) {
+                    if let Some(EffectRecord::Exchange {
+                        door: d,
+                        request: r,
+                        reply,
+                    }) = records.get(position)
+                    {
+                        if d == door && r.as_slice() == request {
+                            return Some(KeyedReply {
+                                position,
+                                reply: reply.as_slice(),
+                            });
+                        }
+                    }
+                    end = position;
+                }
+                return None;
+            }
+        };
         let key_at = |i: usize| -> Option<(&str, &[u8])> {
             positions
                 .get(i)
@@ -164,7 +205,10 @@ impl Order {
     }
 
     fn len(&self) -> usize {
-        self.positions.len()
+        match self {
+            Self::Indexed(positions) => positions.len(),
+            Self::Scanned(exchanges) => *exchanges,
+        }
     }
 }
 
@@ -200,6 +244,9 @@ impl std::fmt::Debug for KeyedView<'_> {
 
 impl<'a> KeyedView<'a> {
     /// Index `records` — typically the whole tape, decoded once.
+    ///
+    /// Up to 1,048,576 records are indexed eagerly. Longer tapes retain every
+    /// answer and use an allocation-free backwards scan for each lookup.
     pub fn new(records: &'a [EffectRecord]) -> KeyedView<'a> {
         KeyedView {
             records,
@@ -278,7 +325,8 @@ impl<R: AsRef<[EffectRecord]>> std::fmt::Debug for KeyedIndex<R> {
 }
 
 impl<R: AsRef<[EffectRecord]>> KeyedIndex<R> {
-    /// Index `records`, and keep them.
+    /// Index `records`, and keep them. As with [`KeyedView::new`], tapes longer
+    /// than 1,048,576 records use a backwards scan instead of an eager index.
     pub fn new(records: R) -> KeyedIndex<R> {
         let order = Order::of(records.as_ref());
         KeyedIndex { records, order }
@@ -311,5 +359,87 @@ impl<R: AsRef<[EffectRecord]>> KeyedIndex<R> {
     /// Whether the records held no exchange at all.
     pub fn is_empty(&self) -> bool {
         self.order.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn exchange(reply: &[u8]) -> EffectRecord {
+        EffectRecord::Exchange {
+            door: "probe".into(),
+            request: b"request".to_vec(),
+            reply: reply.to_vec(),
+        }
+    }
+
+    #[test]
+    fn eager_index_budget_preserves_every_lookup() {
+        let mut records = vec![EffectRecord::Mono(0); MAX_INDEX_RECORDS];
+        let middle = MAX_INDEX_RECORDS / 2;
+        records[0] = exchange(b"first");
+        records[middle] = exchange(b"middle");
+        records[MAX_INDEX_RECORDS - 1] = exchange(b"last indexed");
+        {
+            let view = KeyedView::new(&records);
+            assert!(matches!(&view.order, Order::Indexed(positions) if positions.len() == 3));
+            assert_eq!(
+                view.lookup("probe", b"request", usize::MAX),
+                Ok(KeyedReply {
+                    position: MAX_INDEX_RECORDS - 1,
+                    reply: b"last indexed",
+                })
+            );
+        }
+        records.push(exchange(b"beyond the index budget"));
+        records.push(EffectRecord::Emit {
+            door: "probe".into(),
+            bytes: b"request".to_vec(),
+        });
+        let records: Arc<[EffectRecord]> = records.into();
+        let view = KeyedView::new(&records);
+        let index = KeyedIndex::new(Arc::clone(&records));
+        assert!(matches!(view.order, Order::Scanned(4)));
+        assert!(matches!(index.order, Order::Scanned(4)));
+        assert_eq!(view.len(), 4);
+        assert_eq!(index.len(), 4);
+        assert!(!view.is_empty());
+        assert!(!index.is_empty());
+        type LookupCase = (usize, Option<(usize, &'static [u8])>);
+        let cases: &[LookupCase] = &[
+            (0, None),
+            (1, Some((0, b"first"))),
+            (middle, Some((0, b"first"))),
+            (middle + 1, Some((middle, b"middle"))),
+            (MAX_INDEX_RECORDS - 1, Some((middle, b"middle"))),
+            (
+                MAX_INDEX_RECORDS,
+                Some((MAX_INDEX_RECORDS - 1, b"last indexed")),
+            ),
+            (
+                MAX_INDEX_RECORDS + 1,
+                Some((MAX_INDEX_RECORDS, b"beyond the index budget")),
+            ),
+            (
+                usize::MAX,
+                Some((MAX_INDEX_RECORDS, b"beyond the index budget")),
+            ),
+        ];
+        for &(seen, expected) in cases.iter().rev().chain(cases) {
+            let wanted = expected.map(|(position, reply)| KeyedReply { position, reply });
+            assert_eq!(view.lookup("probe", b"request", seen).ok(), wanted);
+            assert_eq!(index.lookup("probe", b"request", seen).ok(), wanted);
+        }
+        assert!(matches!(
+            view.lookup("another door", b"request", usize::MAX),
+            Err(ReplayDivergence::Unrecorded { .. })
+        ));
+        assert!(matches!(
+            index.lookup("probe", b"another request", usize::MAX),
+            Err(ReplayDivergence::Unrecorded { .. })
+        ));
+        assert!(Arc::ptr_eq(&records, &index.records));
     }
 }

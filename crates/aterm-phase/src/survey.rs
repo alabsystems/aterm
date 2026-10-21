@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's rating cards and the block they are parked in.
+//! Claude Code's rating cards and the other blocks parked above the composer.
 //!
 //! Every card of the family (the session survey, the post-compact and long-context
-//! surveys, the plugin survey, the memory survey) is drawn by ONE component (`VM` in
-//! 2.1.284) above the composer's top rule:
+//! surveys, the plugin survey, the memory survey) is drawn by one component above the
+//! composer's top rule:
 //!
 //! ```text
 //! ● <question> (optional)            <- `●` in column 0, then the message at column 2
@@ -13,9 +13,9 @@
 //!   1: Bad    2: Fine   3: Good   0: Dismiss     <- the options, two columns in
 //! ```
 //!
-//! The options row is the contract: `0: Dismiss` is the key that closes the card and is
-//! the same in every kind. The question row is the vendor's copy and differs by kind, so
-//! the block is found from the options row up, never from a question text.
+//! The options row is the contract: `0: Dismiss` closes the card in every kind. The
+//! question row is the vendor's copy and differs by kind, so the block is found from the
+//! options row up, never from a question text.
 //!
 //! **IN A NARROW PANE** (MEASURED on 2.1.300, the harness sweep of 2026-10-15,
 //! ATERM-KI-1015-1 S2R-F2; the fixtures `claude-2.1.300-survey-session-NNcol.txt`): below
@@ -44,8 +44,8 @@ use crate::phase::{
 
 /// Which card a block is, by its question row. `Unknown` is a structurally valid card
 /// whose question this crate has no words for: read through like any other, dismissed
-/// when it carries the vendor's `(optional)` mark ([`SurveyBlock::dismissable`]), and
-/// said (`kind=unknown`) either way.
+/// only with the vendor's `(optional)` mark ([`SurveyBlock::dismissable`]), and reported
+/// as `kind=unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurveyKind {
     /// `How is Claude doing this session?` — also the post-compact and the generic
@@ -88,18 +88,16 @@ pub struct SurveyBlock {
     /// spaces as `.`, every metacharacter escaped. Empty when the row holds anything a
     /// wire token cannot carry — the caller then has no guard and presses nothing.
     pub guard: String,
-    /// Whether the loop may press its `0`: a card of a KNOWN kind, or a card of a shape
-    /// this crate has no words for that carries the vendor's `(optional)` mark. The
-    /// readers step over ANY card of the shape (a worker must never read idle under one);
-    /// only a press needs to be sure it is one.
+    /// Whether the loop may press its `0`: a known kind, or an unknown one that carries
+    /// the vendor's `(optional)` mark. The readers step over any card of the shape; only
+    /// a press needs to be sure.
     pub dismissable: bool,
 }
 
 impl SurveyBlock {
-    /// Why a loop must NOT press this card's `0`, or `None` when it may: the readers step
-    /// over any card of the shape, but a press wants to be sure — a card of a kind this
-    /// crate has no words for that carries no `(optional)` mark, or a question row no
-    /// guard can fence, is said and left to a person or a manager.
+    /// Why a loop must not press this card's `0`, or `None` when it may: an unknown kind
+    /// without the `(optional)` mark, or a question row no guard can fence, is said and
+    /// left to a person or a manager.
     #[must_use]
     pub fn withheld(&self) -> Option<&'static str> {
         if !self.dismissable {
@@ -114,7 +112,7 @@ impl SurveyBlock {
 
 /// How far above the options row the question row may sit: the memory card is the
 /// tallest (`●` row, a blank, up to four rows of the cited sentence, a blank, the
-/// recollection row) and its sentence runs on when Claude is verbose.
+/// recollection row), and its sentence runs on when Claude is verbose.
 const MAX_ABOVE_OPTIONS: usize = 10;
 
 /// The options row: two columns in, `1: <label>` first, `0: Dismiss` on it (a banner
@@ -126,9 +124,8 @@ fn is_options_row(row: &str) -> bool {
     !rest.starts_with(' ') && rest.contains("0: Dismiss")
 }
 
-/// The most rows the options' boxes are read across (module header, "IN A NARROW
-/// PANE"): two measured, from 26 to 40 columns; room for a narrower pane's third and
-/// fourth.
+/// The most rows the options' boxes are read across: two measured, from 26 to 40
+/// columns, with room for a narrower pane's third and fourth.
 const OPTION_ROWS: usize = 4;
 
 /// The cells the options' keys start at on the options' first row — `1:` at column 2
@@ -153,12 +150,12 @@ fn option_keys(row: &str) -> Option<Vec<usize>> {
     (starts.first() == Some(&2)).then_some(starts)
 }
 
-/// The options read from row `first` of `rows`, `until` excluded, in a pane `width`
-/// cells wide: its last row. One row ([`is_options_row`]), as every wide pane draws it;
-/// else the row of boxes Ink wrapped (module header, "IN A NARROW PANE"), read across
-/// the rows under it that are its boxes' own ([`crate::wrap::rejoined_cells`]) and whole
-/// only when its first box is `1: <label>` and its last exactly `0: Dismiss` — the most
-/// such rows, at most [`OPTION_ROWS`]. `None` when neither reads.
+/// The last row of the options that start at row `first` (`until` excluded) in a pane
+/// `width` cells wide: `first` itself when it is an options row ([`is_options_row`]);
+/// else the row of boxes a narrow pane wraps, read across the rows under it
+/// ([`crate::wrap::rejoined_cells`]) and whole only when its first box is `1: <label>`
+/// and its last exactly `0: Dismiss`, the most such rows up to [`OPTION_ROWS`]. `None`
+/// when neither reads.
 fn options_line(rows: &[String], first: usize, until: usize, width: usize) -> Option<usize> {
     if is_options_row(&rows[first]) {
         return Some(first);
@@ -186,12 +183,11 @@ fn is_parked(row: &str, width: usize) -> bool {
             .is_some_and(|g| crate::text::trim_start(g).starts_with("Tip:"))
 }
 
-/// The open rating card above the composer, if there is one: its options ([`options_line`],
-/// one row or the row of boxes a narrow pane wraps) with nothing between them and the
-/// composer's top rule but parked rows, a `●` question row in column 0 within
-/// [`MAX_ABOVE_OPTIONS`] rows above them, and only blank or indented rows between the
-/// two. Anything else — a copy quoted in a tool's output (`⎿`), in the worker's message,
-/// a question with no options, the options with words after them — is not open.
+/// The open rating card above the composer: its options ([`options_line`]) with only
+/// parked rows between them and the composer's top rule, a `●` question row in column 0
+/// within [`MAX_ABOVE_OPTIONS`] rows above them, and only blank or column-2 rows between
+/// the two. A copy quoted in a tool's output or the worker's message, a question with no
+/// options, or options with words after them is not open.
 #[must_use]
 pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
     let frame = composer_frame(rows)?;
@@ -235,17 +231,16 @@ pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
                 Some(None)
             }
         })??;
-    // The question is one line, which a narrow pane wraps onto the rows under it at
-    // column 2 ([`crate::wrap`]): its kind is read whole, its guard from the row the
-    // guard is matched on.
+    // A narrow pane wraps the question onto rows at column 2 ([`crate::wrap`]): its kind
+    // is read from the whole line, its guard from the head row the guard is matched on.
     let row = rows[head].trim_start_matches('●');
     let col = 1 + crate::phase::leading_spaces(row);
     let end = crate::wrap::line_end(rows, head, crate::text::trim(row), col, width, first);
     let line = crate::wrap::rejoined(&rows[head..=end]);
     let kind = kind_of(line.trim_start_matches('●').trim());
     let question = row.trim();
-    // A future card's words are not known; its shape is — and `(optional)` is the
-    // vendor's mark on every one of them: what a PRESS wants before it writes a `0`.
+    // A future card's words are not known, but `(optional)` is the vendor's mark on every
+    // card: a press wants it before it writes a `0`.
     let dismissable = kind != SurveyKind::Unknown
         || rows[head..=options]
             .iter()
@@ -289,8 +284,8 @@ fn guard_of(question: &str) -> String {
                     .all(|c| c.is_alphanumeric() || matches!(c, '’' | ',' | ':' | '?' | '-'))
         })
         .collect();
-    // Under three words a prefix is too loose to fence a press (and an ASCII `'` ends the
-    // guard: the printed command is single-quoted for the manager's shell).
+    // Under three words a prefix is too loose to fence a press. An ASCII `'` ends the
+    // guard: the printed command is single-quoted for the manager's shell.
     if words.len() < 3 {
         return String::new();
     }
@@ -298,17 +293,15 @@ fn guard_of(question: &str) -> String {
 }
 
 /// The Claude-drafted-feedback card (`✻ Bug report drafted: <title>` over its preview and
-/// `1 to review · 2 to send · 0 to dismiss`): parked in the same slot, NOT a survey — its
-/// `0` leads to a "turn off" question whose second `0` writes a setting — so it is only
-/// ever SKIPPED by the readers, never pressed. `(first, last)` rows.
+/// `1 to review · 2 to send · 0 to dismiss`), parked in the same slot. It is not a survey:
+/// its `0` leads to a "turn off" question whose second `0` writes a setting, so the
+/// readers only skip it, never press it. `(first, last)` rows.
 ///
-/// The card is drawn at column 0 (`Cle`: a column box with `marginTop: 1`, its head, its
-/// preview and its hint as children, no indent of its own), and so is what tells it from
-/// a quote of it: the worker's messages continue at column 2, so a copy in one — the hint
-/// row, the `✻` head row — never starts where the card's rows do. The head is the nearest
-/// `✻ … drafted:` row above the hint within [`MAX_DRAFTS_ROWS`], with only blank rows and
-/// rows that are not the start of a block of the transcript or the live zone between
-/// (the preview may hold blank rows of its own).
+/// The card is drawn at column 0 and the worker's messages continue at column 2, so a
+/// quote of its rows in a message never starts where the card's do. The head is the
+/// nearest `✻ … drafted:` row above the hint within [`MAX_DRAFTS_ROWS`], with only blank
+/// rows and rows that start no transcript or live-zone block between (the preview may
+/// hold blank rows).
 #[must_use]
 pub fn drafts_card(rows: &[String]) -> Option<(usize, usize)> {
     let frame = composer_frame(rows)?;
@@ -359,23 +352,20 @@ fn is_drafts_hint(row: &str) -> bool {
         })
 }
 
-/// The prompts drawn in the rating card's slot that are NOT ratings, with the same
+/// The prompts drawn in the rating card's slot that are not ratings, with the same
 /// `<key>: <label>` cells and a `Don't ask again` choice: the transcript-share ask that
 /// follows a rating (`⏺ Can Anthropic look at your session transcript …?`, the docs URL
-/// at column 2, `  y: Yes    n: No     d: Don't ask again`; `Ele` in 2.1.284) and the
-/// web-setup offer (`⏺ Pushed to GitHub. Connect GitHub to claude.ai …?` over `  1: Yes,
-/// run /web-setup   2: Not now   3: Don't ask again`). Like the drafts card they are only
-/// ever SKIPPED by the readers — a busy worker must not read idle under one, and nothing
-/// presses a key on them (a `0` there is text, and a digit is a real answer). `(first,
+/// at column 2, `  y: Yes    n: No     d: Don't ask again`) and the web-setup offer
+/// (`⏺ Pushed to GitHub. Connect GitHub to claude.ai …?` over `  1: Yes, run /web-setup
+/// 2: Not now   3: Don't ask again`). Like the drafts card they are only skipped by the
+/// readers, never pressed (a `0` there is text, and a digit is a real answer). `(first,
 /// last)` rows.
 ///
 /// Found from the options row up, as [`survey_block`]: the row two columns in, `<key>: `
-/// first and the `Don't ask again` label on it, with only parked rows between it and the
-/// composer's rule; then a `⏺` (`●` where the platform draws that) head in column 0 within
-/// [`MAX_ASK_ROWS`], only column-2 rows between, and a question mark ending a row of the
-/// block. The question's words are not matched, so a reworded ask is still stepped over;
-/// the shape is what tells it from the worker's own message, whose lead-in to a quote of
-/// the options row (`⏺ The ask reads:`) asks nothing.
+/// first and `Don't ask again` on it, only parked rows between it and the composer's
+/// rule; then a `⏺` (or `●`) head in column 0 within [`MAX_ASK_ROWS`], only column-2 rows
+/// between, and a row of the block ending in `?`. The question's words are not matched,
+/// so a reworded ask is still stepped over.
 #[must_use]
 pub fn ask_card(rows: &[String]) -> Option<(usize, usize)> {
     let frame = composer_frame(rows)?;
@@ -399,17 +389,15 @@ pub fn ask_card(rows: &[String]) -> Option<(usize, usize)> {
                 && !row.starts_with("   ")
                 && !crate::text::trim(row).is_empty()
             {
-                // The docs URL, or the row a long question wraps to: column 2. (No blank
-                // row lies inside the card — it is a stack of rows — so a message, a
-                // blank, and a row that only looks like the options is not an ask.)
+                // The docs URL, or the row a long question wraps to: column 2. The card
+                // holds no blank row, so a blank above the options ends the walk: no ask.
                 None
             } else {
                 Some(None)
             }
         })??;
-    // Both prompts are QUESTIONS (`… Claude Code?`, `… offline?`; a narrow terminal wraps
-    // the question, so any row of the block will do): the worker's own lead-in to a quote
-    // of the options row (`⏺ The ask reads:`) is no head of one.
+    // Both prompts are questions, and a narrow terminal wraps them, so any row of the block
+    // may end in `?`: the worker's own lead-in to a quote (`⏺ The ask reads:`) does not.
     rows[head..options]
         .iter()
         .any(|r| crate::text::trim_end(r).ends_with('?'))
@@ -432,8 +420,8 @@ fn is_ask_options_row(row: &str) -> bool {
     ) && rest.contains(const { crate::anchors::anchor_text("card.dont_ask") })
 }
 
-/// The labels a rating names itself by (`QVe` in 2.1.286): the card's buttons, and the
-/// word the pending step echoes.
+/// The labels a rating names itself by: the card's buttons, and the word the pending
+/// step echoes.
 const RATING_LABELS: [&str; 4] = ["Bad", "Fine", "Good", "Unsure"];
 
 /// `Feedback: <label> · Esc to undo`, in column 0: the rating's pending step, drawn for
@@ -466,12 +454,11 @@ fn is_thanks_second_row(row: &str) -> bool {
 }
 
 /// The rating's own aftermath, parked in the card's slot above the composer: the pending
-/// step (`Feedback: Bad · Esc to undo`, 3 s) and then the thanks (`Thanks for the
-/// feedback!`, with the row of the follow-up offer under it, 5 s). Not a card — nothing
-/// presses a key on it — but not what the worker said either: read as the last words
-/// they stood in the journal's `EVENT idle` (measured on Claude Code 2.1.286, 3 of 3).
-/// Found from the composer's rule up like the cards, only parked rows between; drawn at
-/// column 0, where the worker's own messages never are. `(first, last)` rows.
+/// step (`Feedback: Bad · Esc to undo`, 3 s), then the thanks (`Thanks for the
+/// feedback!` over the follow-up offer, 5 s). Nothing presses a key on it, but it is not
+/// what the worker said either. Found from the composer's rule up like the cards, only
+/// parked rows between; drawn at column 0, where the worker's messages never are.
+/// `(first, last)` rows.
 #[must_use]
 pub(crate) fn rating_aftermath(rows: &[String]) -> Option<(usize, usize)> {
     let frame = composer_frame(rows)?;
@@ -489,7 +476,7 @@ pub(crate) fn rating_aftermath(rows: &[String]) -> Option<(usize, usize)> {
     }
 }
 
-/// The rows the readers step over as ONE parked block: the open rating card
+/// The rows the readers step over as one parked block: the open rating card
 /// ([`survey_block`]), the drafts card ([`drafts_card`]), an ask card
 /// ([`ask_card`]) or the rating's own aftermath ([`rating_aftermath`]).
 /// `(first, last)`, inclusive.
@@ -564,7 +551,7 @@ mod tests {
         "",
     ];
 
-    /// The transcript-share ask and the web-setup offer (`Ele`, `kde` in 2.1.284).
+    /// The transcript-share ask and the web-setup offer.
     const ASK: [&str; 4] = [
         "",
         "⏺ Can Anthropic look at your session transcript to help us improve Claude Code?",
@@ -619,8 +606,7 @@ mod tests {
             assert_eq!(last_said_row(&idle), Some("⏺ Merged and pushed."));
             assert_eq!(transcript_end(&idle), 3, "{card:?}");
         }
-        // The drafts card and the ask cards, which are no survey, are read through the
-        // same way.
+        // The drafts card and the ask cards, which are no survey, are read through alike.
         for card in [&DRAFTS[..], &ASK[..], &WEB[..]] {
             for body in [&WAITING[..], &SPINNER[..]] {
                 let rows = with(body, card);
@@ -638,9 +624,8 @@ mod tests {
         }
     }
 
-    /// The hand-built 2.1.284 screens, one per kind (the card's rows from the render
-    /// code, the framing from the real captures): each is read whole — the card's kind
-    /// and guard, the worker's phase UNDER it, what it last said, where the transcript ends.
+    /// The hand-built 2.1.284 screens, one per kind, are read whole: the card's kind and
+    /// guard, the worker's phase under it, what it last said, where the transcript ends.
     #[test]
     fn every_kind_of_fixture_is_read_whole() {
         use crate::prompt::fixtures::screen;
@@ -737,14 +722,9 @@ mod tests {
         }
     }
 
-    /// A person's `1`/`2`/`3` replaces the card with its aftermath — `Feedback: Bad · Esc to
-    /// undo` for 3 s, then `Thanks for the feedback!` over the follow-up offer for 5 s
-    /// (MEASURED on 2.1.286) — which is parked like the card, never what the worker last
-    /// said: with a done row above the walk stops at that, but after an Esc the row above
-    /// is the `Interrupted` notice, so the aftermath must not become the last words in
-    /// the journal's `EVENT idle`. The Esc'd frames are the measured ones with the done row
-    /// replaced by the notice (the vendor's own, as `survey-card-after-esc` shows it).
-    /// CONTROLS: the same words indented under the worker's message are its words; a
+    /// A person's `1`/`2`/`3` replaces the card with its aftermath, parked like the card and
+    /// never what the worker last said, also under the `Interrupted` notice an Esc leaves.
+    /// Controls: the same words indented under the worker's message are its words; a
     /// column-0 row that only starts alike is no aftermath.
     #[test]
     fn the_ratings_aftermath_is_parked_and_never_what_the_worker_said() {
@@ -771,7 +751,7 @@ mod tests {
             assert_eq!(rating_aftermath(&esc), Some(span));
             assert_eq!(last_said_row(&esc), Some(INTERRUPTED), "{text:.90}");
             assert!(transcript_end(&esc) <= span.0, "{text:.90}");
-            // CONTROLS.
+            // Controls.
             let quoted: Vec<String> = esc
                 .iter()
                 .enumerate()
@@ -809,7 +789,7 @@ mod tests {
         assert_eq!(b.kind, SurveyKind::Unknown);
         assert_eq!(b.guard, "^●.How.likely.are.you");
         assert!(b.dismissable);
-        // Without the vendor's `(optional)` an unknown card is still READ through (a worker
+        // Without the vendor's `(optional)` an unknown card is still read through (a worker
         // must never read idle under one) but is not pressed.
         let plain = with(
             &DONE,
@@ -827,7 +807,7 @@ mod tests {
     #[test]
     fn a_question_the_wire_cannot_carry_gets_no_guard() {
         // An ASCII apostrophe ends the guard (the printed command is single-quoted); under
-        // three plain words there is none, and the loop then SAYS the card instead.
+        // three plain words there is none, and the loop says the card instead.
         let rows = with(
             &DONE,
             &[
@@ -1030,10 +1010,8 @@ mod tests {
         assert!(survey_block(&said_under).is_none());
     }
 
-    /// A worker QUOTING the drafts card (or an ask) in its message — its rows continue at
-    /// column 2, the card's do not — is not the card: it must not park the worker's own
-    /// last words away from the report views. (This repo's agents quote these strings
-    /// routinely.)
+    /// A worker quoting the drafts card (or an ask) in its message, its rows at column 2, is
+    /// not the card: the worker's last words are not parked away.
     #[test]
     fn a_quote_of_the_drafts_or_an_ask_card_in_a_message_is_not_the_card() {
         let quoted_drafts = with(
@@ -1067,9 +1045,8 @@ mod tests {
             last_said_row(&quoted_ask),
             Some("    y: Yes    n: No     d: Don't ask again")
         );
-        // The plainest quote — a short message whose last row is the options row, as the
-        // worker's text continues at column 2 like the card's own — asks nothing: no row
-        // of it is a question.
+        // A short message whose last row is the options row asks nothing: no row of it is
+        // a question.
         let plain = with(
             &DONE[..0],
             &[
@@ -1083,8 +1060,7 @@ mod tests {
             Some("  y: Yes    n: No     d: Don't ask again")
         );
         assert_eq!(transcript_end(&plain), 2);
-        // …and the same rows drawn as the card draws them (column 0 head and hint) are the
-        // card: the two differ by the indent alone.
+        // The same rows drawn at column 0, as the card draws them, are the card.
         let card = with(
             &DONE[..0],
             &[
@@ -1156,15 +1132,8 @@ mod tests {
         assert!(drafts_card(&other).is_none());
     }
 
-    /// ATERM-KI-1015-1 S2R-F2 (the harness sweep of 2026-10-15, Claude Code
-    /// 2.1.300): in a pane narrower than 41 columns Ink wraps the session
-    /// survey's question onto a row at column two and draws its options as
-    /// four columns whose words wrap inside each column (`  1: Bad  2: Fine
-    /// 3: Good 0:` over `Dismiss` at 34; `  1: Bad2:    3:    0: Dis` over
-    /// `        Fine  Good  miss` at 26). Read a row at a time no row was the
-    /// options row: the card was never dismissed, its rows were read as the
-    /// worker's last words, and the continue policy typed `keep going` into
-    /// the standing card. The card is read as one block across those rows.
+    /// Below 41 columns (2.1.300 at 26, 34 and 40) the Ink-wrapped card is one session
+    /// card: guarded, dismissable, and not the worker's last words.
     #[test]
     fn a_survey_card_ink_wrapped_into_columns_is_one_card() {
         use crate::prompt::fixtures::{
@@ -1194,7 +1163,7 @@ mod tests {
                 "{said:?}"
             );
         }
-        // CONTROLS: the boxes' first row alone (its `Dismiss` gone), and a
+        // Controls: the boxes' first row alone (its `Dismiss` gone), and a
         // `Dismiss` drawn a column off its box, are no card.
         let r = fixture(SURVEY_SESSION_34_2_1_300);
         let cut: Vec<String> = r

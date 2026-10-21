@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for semantic-font prewarm generation acceptance.
-//!
-//! Reload may leave an older worker running. This exhausts the bounded current /
-//! completed-generation lattice and binds the exact shipping install guard to the
-//! derived worker model; a stale-always-installs mutant is rejected independently.
+//! Conformance of the semantic-font prewarm guards to their derived models: generation
+//! acceptance (reload may leave an older worker running), base carry on replacement, the
+//! result decision and the request swap, each exhausted over its bounded lattice and
+//! paired with a rejected mutant.
 
 use crate::{
     SemanticPrewarmResultDecision, semantic_prewarm_cache_active_before_request,
@@ -282,8 +281,8 @@ fn shipping_result_policy_conforms_over_identity_and_failure_lattice() {
 fn dropped_base_mixed_candidate_and_fail_open_mutants_are_rejected() {
     let model = semantic_prewarm_handshake_model();
 
-    // Historical replacement bug: a base-less new job drops the displaced
-    // not-yet-started job's unique committed base.
+    // A base-less new job drops the displaced not-yet-started job's unique
+    // committed base.
     let before = replacement_before(&model, false, true);
     let dropped = replacement_after(&before, false);
     assert_eq!(admits(&model, &before, &dropped), None);
@@ -312,9 +311,8 @@ fn dropped_base_mixed_candidate_and_fail_open_mutants_are_rejected() {
     assert_eq!(admits(&model, &mixed_before, &mixed_install), None);
     assert!(!model.check_invariant("DecisionMatchesIdentity", &mixed_install));
 
-    // Exact-current construction failure must clear an older active renderer.
-    // This only checks the law refuses the fail-open slot; the poll that
-    // performs the clear is driven, over the whole lattice, by `tray_raster`'s
+    // Exact-current construction failure must clear an older active renderer; the
+    // poll that clears it is driven by `tray_raster`'s
     // `semantic_prewarm_poll_conforms_to_the_handshake_slot_effects`.
     let failed_input = ResultInputs {
         generation_matches: true,
@@ -334,8 +332,8 @@ fn dropped_base_mixed_candidate_and_fail_open_mutants_are_rejected() {
     assert_eq!(admits(&model, &failed_before, &fail_open), None);
     assert!(!model.check_invariant("CurrentFailureFailsClosed", &fail_open));
 
-    // Readiness tested before generation: a ready renderer forked from an
-    // obsolete generation's base filed in the candidate cache.
+    // Testing readiness before generation would cache a ready renderer forked
+    // from an obsolete generation's base.
     let stale_input = ResultInputs {
         generation_matches: false,
         request_matches: false,

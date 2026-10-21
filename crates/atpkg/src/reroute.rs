@@ -2007,6 +2007,57 @@ pub(crate) fn lay_with(
     Ok(())
 }
 
+/// What [`lay_with`] would write or sweep now, by name — the directory's marker, each stub
+/// absent or ours with other bytes, each ours no row wants (`<name> (swept)`), and abrew's
+/// `brew` — changing nothing: what `aterm pkg repair`'s `base.pkg.stubs` item reads. A
+/// foreign file is never named, since no lay touches it.
+pub(crate) fn lay_pending(
+    layout: &Layout,
+    embedder: &crate::stub::Embedder,
+    strict: bool,
+) -> Vec<String> {
+    if cfg!(windows) || layout.declined().is_file() {
+        return Vec::new();
+    }
+    let dir = dir(layout);
+    let mut pending = Vec::new();
+    if marker_needs_lay(std::fs::read(dir.join(DIR_MARKER_FILE)).ok().as_deref()) {
+        pending.push(DIR_MARKER_FILE.to_owned());
+    }
+    let wanted = wanted_stubs(layout, embedder, strict);
+    for (name, body) in &wanted {
+        let path = dir.join(name);
+        let lays = match std::fs::symlink_metadata(&path) {
+            Err(_) => true,
+            Ok(_) if is_reroute_stub(&path) => {
+                !std::fs::read(&path).is_ok_and(|have| have == body.as_bytes())
+            }
+            Ok(_) => false,
+        };
+        if lays {
+            pending.push((*name).to_owned());
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if !name.starts_with('.')
+                && !wanted.iter().any(|(w, _)| *w == name)
+                && is_reroute_stub(&path)
+            {
+                pending.push(format!("{name} (swept)"));
+            }
+        }
+    }
+    if crate::abrew::stub::lay_pending(layout, embedder) {
+        pending.push("brew".to_owned());
+    }
+    pending
+}
+
 /// The marker file's bytes.
 fn marker_body() -> String {
     let mut body = String::from(STUB_MARKER);

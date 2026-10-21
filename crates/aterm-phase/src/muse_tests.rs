@@ -1029,6 +1029,111 @@ fn the_usage_wall_is_limited_until_its_reset() {
     );
 }
 
+/// A LOCAL COMMAND'S ROWS UNDER A WALL ARE NO PART OF ITS NOTICE (1.4.10,
+/// measured in the W2 lab, `forever --harness muse --mode wall-hid`, the
+/// harness's own 40-row read): `/rules` entered at the empty composer under
+/// the usage wall prints `Rules loaded this session (in precedence order):`,
+/// `user: none` and `project: none`, two in, a block of their own under a
+/// blank row. The wall still reads limited until the time it names, its
+/// message the notice's own words, no last words of the worker's; and so
+/// with three such blocks (the lab's third point) and under the refused
+/// key's wall, whose message must be the vendor's whole. Read before as the
+/// turn's last block whole, the rows were folded into the message
+/// (`reset=3:34 AM Rules loaded …`): the reset named no time, so the wait
+/// fell back to 30 min from the wall's first read, and the key's wall was no
+/// wall at all, its words the worker's. NEGATIVE CONTROLS: a notice that
+/// really wraps is read whole — the measured `3:34` over `  AM` is `3:34
+/// AM`, and a break before the time (`reset at` over `  3:34 AM`) names it
+/// too; a reply's paragraphs stay its words.
+#[test]
+fn a_local_commands_rows_under_a_wall_are_no_part_of_its_notice() {
+    const NOTICE: &str = "Usage limit reached · /upgrade (https://accountscenter.meta.com/muse_code/?ep=xgrade) for increased limits, or wait for usage to reset at 3:34 AM";
+    const RULES: [&str; 4] = [
+        "  Rules loaded this session (in precedence order):",
+        "  user: none",
+        "  project: none",
+        "",
+    ];
+    let rows = screen(USAGE_WALL_RULES_UNDER);
+    let thrice = inserted(
+        &inserted(&rows, "── Voice input", &RULES),
+        "── Voice input",
+        &RULES,
+    );
+    for (name, rows) in [("one /rules", &rows), ("three", &thrice)] {
+        let w = wall(rows).unwrap_or_else(|| panic!("{name}: the wall"));
+        assert_eq!(
+            (w.kind, w.message.as_str(), w.reset.as_deref()),
+            (WallKind::UsageSession, NOTICE, Some("3:34 AM")),
+            "{name}"
+        );
+        let r = read(Some("muse"), rows, None);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (
+                Phase::Limited {
+                    message: NOTICE.to_string(),
+                    reset: Some("3:34 AM".to_string())
+                },
+                true
+            ),
+            "{name}"
+        );
+        assert_eq!(r.said_tail, None, "{name}");
+    }
+    let mut key = edited(
+        &rows,
+        "◆ Usage limit",
+        "◆ your API key from META_API_KEY was rejected — update or unset it",
+    );
+    key.retain(|r| r != "  AM");
+    let w = wall(&key).expect("the key's wall");
+    assert_eq!(
+        (w.kind, w.message.as_str()),
+        (
+            WallKind::Auth,
+            "your API key from META_API_KEY was rejected — update or unset it"
+        )
+    );
+    assert_eq!(
+        remedy(&w.message).as_deref(),
+        Some("update or unset META_API_KEY")
+    );
+    assert_eq!(said_tail(&key), None);
+    // The controls: a notice wrapped onto the row under it, no blank
+    // between, is one notice.
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("◆ Usage limit"))
+        .expect("the wall");
+    let mut early = rows.clone();
+    early[at] = rows[at]
+        .strip_suffix(" 3:34")
+        .expect("the measured row ends on the hour")
+        .to_string();
+    early[at + 1] = "  3:34 AM".to_string();
+    assert_eq!(
+        wall(&early).map(|w| (w.message, w.reset)),
+        Some((NOTICE.to_string(), Some("3:34 AM".to_string()))),
+        "the control: the time on the row under the notice"
+    );
+    let mut reply = edited(
+        &edited(
+            &key,
+            "◆ your API key",
+            "◆ The parser is in and its tests pass.",
+        ),
+        "  Rules loaded",
+        "  Its docs follow next.",
+    );
+    reply.retain(|r| !["  user: none", "  project: none"].contains(&r.as_str()));
+    assert_eq!(
+        said_tail(&reply).as_deref(),
+        Some("The parser is in and its tests pass.\nIts docs follow next."),
+        "the control: a reply's paragraphs are its words"
+    );
+}
+
 /// A RETRIED REQUEST IS A RUNNING TURN, AND NO WALL (1.4.10): under the
 /// status row, `└ Meta Model API rate limited (HTTP 429) · retrying in 5s ·
 /// attempt 2/3` (a 500's `server error (HTTP 500)` the same) — busy as
@@ -1129,6 +1234,285 @@ fn a_card_under_a_turns_end_is_no_part_of_it() {
         .filter(|r| !r.starts_with("◆ Hi!"))
         .collect();
     assert_eq!(phase(&replyless), (Phase::Idle, false), "the control");
+}
+
+/// CARDS ALONE ABOVE THE OPEN COMPOSER ARE A SESSION AT REST (1.4.10, the lab
+/// of 2026-10-21): `/status` entered three times under the usage wall pushed
+/// the notice out of sight, the composer open and empty under the cards,
+/// each card saying the run `FAILED`. Idle as evidence, with no words, wall,
+/// question or box read: the screen a remembered limit resumes at. Read
+/// before as a screen nothing measured says (idle, no evidence), where the
+/// turn-end policy decided nothing for good. A card entered while a turn
+/// runs is drawn ABOVE the turn's status row, which stays over the composer
+/// (the card says `RUNNING`), and once the turn ends its reply is drawn
+/// whole under the card. NEGATIVE CONTROLS: that screen is busy and its end
+/// idle on its reply; the cards with a status row under them are busy; the
+/// newest card saying `RUNNING` with no status row under it, which nothing
+/// measured draws, is no evidence (a `/usage` card under it, naming no
+/// state, changes nothing); cards under a message with no reply are none
+/// either; the footer saying `interrupting run` is busy, no evidence; and
+/// blank rows alone say nothing.
+#[test]
+fn cards_alone_above_the_open_composer_are_a_session_at_rest() {
+    let r = muse(USAGE_WALL_STATUS_CARDS);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert_eq!(
+        (r.wall.clone(), r.said_tail.clone(), r.prompt.clone()),
+        (None, None, None)
+    );
+    assert!(!r.interrupted && !r.fresh);
+    let rows = screen(USAGE_WALL_STATUS_CARDS);
+    assert_eq!(card_state(&rows), Some("FAILED"));
+    assert_eq!(
+        composer_draft(&rows).map(|(_, d)| d),
+        Some(vec![String::new()]),
+        "the composer open and empty under the cards"
+    );
+    assert_eq!(background_wait(&rows), None);
+    // The controls. A card entered while a turn runs: above the status row.
+    let r = muse(STATUS_MID_TURN);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Busy, true)
+    );
+    assert_eq!(card_state(&screen(STATUS_MID_TURN)), Some("RUNNING"));
+    let r = muse(STATUS_MID_TURN_ENDED);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert!(
+        r.said_tail
+            .as_deref()
+            .is_some_and(|t| t.starts_with("tick 1 tick 2") && t.ends_with("tick 30")),
+        "{:?}",
+        r.said_tail
+    );
+    assert_eq!(card_state(&screen(STATUS_CARD)), Some("COMPLETED"));
+    let status = inserted(
+        &rows,
+        "── Voice input",
+        &["◇ Thinking (3s · esc to interrupt)", ""],
+    );
+    assert_eq!(
+        phase(&status),
+        (Phase::Busy, true),
+        "a status row under them"
+    );
+    let running: Vec<String> = rows
+        .iter()
+        .map(|r| r.replace("        FAILED │", "       RUNNING │"))
+        .collect();
+    assert_eq!(card_state(&running), Some("RUNNING"));
+    assert_eq!(
+        phase(&running),
+        (Phase::Idle, false),
+        "RUNNING, no status row"
+    );
+    let usage_after = inserted(
+        &running,
+        "── Voice input",
+        &[
+            "┌───────────────────────┐",
+            "│  Session usage        │",
+            "└───────────────────────┘",
+            "",
+        ],
+    );
+    assert_eq!(
+        phase(&usage_after),
+        (Phase::Idle, false),
+        "a /usage card names no state"
+    );
+    let sent = inserted(&rows, "┌", &["❯ carry on with the task", ""]);
+    assert_eq!(phase(&sent), (Phase::Idle, false), "cards under a message");
+    let footer = rows.len() - 1;
+    let mut stopping = rows.clone();
+    stopping[footer].push_str("                    interrupting run");
+    assert_eq!(phase(&stopping), (Phase::Busy, false), "still stopping");
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("── Voice"))
+        .expect("the frame");
+    let bare: Vec<String> = std::iter::repeat_n(String::new(), at)
+        .chain(rows[at..].iter().cloned())
+        .collect();
+    assert_eq!(phase(&bare), (Phase::Idle, false), "blank rows alone");
+}
+
+/// A SESSION WITH NO TURN YET IS ONE UNDER ITS CARDS TOO (1.4.10, the lab of
+/// 2026-10-21): `/status`, `/usage` and `/status` twice more at a fresh
+/// session's empty composer pushed its banner out of sight, each `/status`
+/// card saying `IDLE`, the `/usage` card counting `Turns 0`. No turn yet,
+/// idle as evidence: nobody has asked it anything, and the screen is all
+/// the evidence there is (no transcript of Muse Code's is read). So too in a
+/// 24-row window of it, its last card alone. Read before as a session at
+/// rest after a turn (`Carded`, not fresh), where the turn-end policy typed
+/// a continuation into the session nobody had given a task. The cards name
+/// the run the session rests on: `COMPLETED` and `FAILED` are a turn's end
+/// at rest (the `FAILED` one hiding the wall its notice was: [`end_hidden`]),
+/// `CANCELLED` a person's Esc ([`interrupted`]; measured: Esc on a first
+/// turn, then `/status` three times). NEGATIVE CONTROLS: `RUNNING` and a
+/// state nothing measured are no evidence, and so is `IDLE` over a count of
+/// tokens spent (nothing measured draws it); a `/usage` card alone is at rest
+/// where it counts a turn, and no evidence at `Turns 0`, which a session
+/// whose first turn a person stopped counts too (its `/status` card says
+/// `0 turns`).
+#[test]
+fn a_fresh_sessions_cards_alone_are_no_turn_yet() {
+    let rows = screen(FRESH_STATUS_CARDS);
+    let window = rows[rows.len() - 24..].to_vec();
+    for (what, rows) in [("the measured screen", &rows), ("its 24 rows", &window)] {
+        let r = read(Some("muse"), rows, None);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative, r.fresh),
+            (Phase::Idle, true, true),
+            "{what}: no turn yet"
+        );
+        assert_eq!(
+            (r.wall, r.said_tail, r.prompt),
+            (None, None, None),
+            "{what}"
+        );
+        assert!(!r.interrupted && !end_hidden(rows), "{what}");
+        assert_eq!(card_state(rows), Some("IDLE"), "{what}");
+    }
+    assert_eq!(usage_turns(&rows), Some(0));
+    assert_eq!(
+        composer_draft(&rows).map(|(_, d)| d),
+        Some(vec![String::new()])
+    );
+    // The runs a turn was taken on.
+    for (name, text, hidden, stopped) in [
+        ("completed", COMPLETED_STATUS_CARDS, false, false),
+        ("failed", LIMIT_UNNAMED_STATUS_CARDS, true, false),
+        (
+            "failed at the usage wall",
+            USAGE_WALL_STATUS_CARDS,
+            true,
+            false,
+        ),
+        ("cancelled", INTERRUPTED_STATUS_CARDS, false, true),
+    ] {
+        let r = muse(text);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative, r.fresh),
+            (Phase::Idle, true, false),
+            "{name}: at rest after a turn"
+        );
+        assert_eq!(
+            (r.wall, r.said_tail, r.prompt),
+            (None, None, None),
+            "{name}"
+        );
+        let rows = screen(text);
+        assert_eq!(
+            (end_hidden(&rows), r.interrupted),
+            (hidden, stopped),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        usage_turns(&screen(INTERRUPTED_STATUS_CARDS)),
+        None,
+        "no /usage card in sight"
+    );
+    // The controls.
+    let state = |word: &str| -> Vec<String> {
+        rows.iter()
+            .map(|r| r.replace(" IDLE │", &format!(" {word} │")))
+            .collect()
+    };
+    for word in ["RUNNING", "PAUSED"] {
+        let other = state(word);
+        assert_eq!(card_state(&other), Some(word));
+        assert_eq!(
+            (phase(&other), fresh(&other), end_hidden(&other)),
+            ((Phase::Idle, false), false, false),
+            "{word}: no evidence"
+        );
+    }
+    // `IDLE` is no turn yet only over no token spent, as measured: over a
+    // count of tokens, which nothing measured draws, it is no evidence.
+    assert!(status_spent_none(&rows) && status_spent_none(&screen(INTERRUPTED_STATUS_CARDS)));
+    assert!(!status_spent_none(&screen(COMPLETED_STATUS_CARDS)));
+    let spent: Vec<String> = rows
+        .iter()
+        .map(|r| r.replace("0 tokens · 0 turns ·", "33,412 tokens · 1 turn ·"))
+        .collect();
+    assert_eq!(card_state(&spent), Some("IDLE"));
+    assert_eq!(
+        (phase(&spent), fresh(&spent), end_hidden(&spent)),
+        ((Phase::Idle, false), false, false),
+        "IDLE over tokens spent: no evidence"
+    );
+    // A /usage card alone: its count says whether a turn was taken.
+    let at = rows
+        .iter()
+        .position(|r| r.is_empty())
+        .expect("the blank row under the /usage card");
+    let usage_alone: Vec<String> = rows[..=at]
+        .iter()
+        .chain(&rows[rows.len() - 4..])
+        .cloned()
+        .collect();
+    assert_eq!(card_state(&usage_alone), None);
+    assert_eq!(usage_turns(&usage_alone), Some(0));
+    assert_eq!(
+        (phase(&usage_alone), fresh(&usage_alone)),
+        ((Phase::Idle, false), false),
+        "Turns 0: no evidence"
+    );
+    let one: Vec<String> = usage_alone
+        .iter()
+        .map(|r| r.replace("Turns         0 │", "Turns         1 │"))
+        .collect();
+    assert_eq!(usage_turns(&one), Some(1));
+    assert_eq!(
+        (
+            phase(&one),
+            fresh(&one),
+            end_hidden(&one),
+            interrupted(&one)
+        ),
+        ((Phase::Idle, true), false, true, false),
+        "a turn taken: at rest, its end out of sight"
+    );
+    // An unreadable newest /status head blocks both older status states
+    // and an older /usage count. A partial redraw says nothing of the end.
+    for (name, older) in [
+        ("idle", rows),
+        ("failed", screen(USAGE_WALL_STATUS_CARDS)),
+        ("completed", screen(COMPLETED_STATUS_CARDS)),
+        ("cancelled", screen(INTERRUPTED_STATUS_CARDS)),
+        ("usage", one),
+    ] {
+        for newest in [
+            "│  MUSE CODE 1.4.10 / partial RUNNING",
+            "│  MUSE CODE 1.4.10 / partial running │",
+            "│  MUSE CODE 1.4.10 / partial │",
+        ] {
+            let other = inserted(
+                &older,
+                "── Voice input",
+                &["┌─────────┐", newest, "└─────────┘", ""],
+            );
+            assert_eq!(card_state(&other), None, "{name}: {newest}");
+            assert_eq!(
+                (
+                    phase(&other),
+                    fresh(&other),
+                    end_hidden(&other),
+                    interrupted(&other)
+                ),
+                ((Phase::Idle, false), false, false, false),
+                "{name}: {newest} cannot lend evidence from an older card"
+            );
+        }
+    }
 }
 
 /// NO SCREEN WITH A BOX ON IT READS IDLE: every capture of a box or a

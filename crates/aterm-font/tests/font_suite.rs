@@ -31,6 +31,8 @@ mod raster;
 mod bounded_work;
 mod gvar_tuples;
 #[cfg(any(feature = "hint", debug_assertions))]
+mod hint_extremes;
+#[cfg(any(feature = "hint", debug_assertions))]
 mod hint_oracle;
 mod never_panic;
 mod reader_oracle;

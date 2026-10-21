@@ -1199,17 +1199,24 @@ mod tests {
                 .last_park_ms
                 .store(u64::try_from(slice.as_millis()).unwrap(), Ordering::SeqCst);
             self.0.parks.fetch_add(1, Ordering::SeqCst);
-            let backstop = Instant::now() + HANG;
-            while watch.has_pending()
-                && watch.ready_notices.is_empty()
-                && watch.deferred_moved.is_empty()
-                && Instant::now() < backstop
-            {
-                watch.park_for_hint(backstop.saturating_duration_since(Instant::now()));
-            }
+            await_round(watch);
             self.0.advance(slice);
             let nap = self.0.nap_ms.swap(0, Ordering::SeqCst);
             self.0.wall_ms.fetch_add(nap, Ordering::SeqCst);
+        }
+    }
+
+    /// Wait on the real clock until `watch`'s head in flight has its worker's completion
+    /// notice in ([`HANG`] is only a backstop): its check has read and written the shared
+    /// per-vendor state and let its lock go.
+    fn await_round(watch: &mut HeadWatch) {
+        let backstop = Instant::now() + HANG;
+        while watch.has_pending()
+            && watch.ready_notices.is_empty()
+            && watch.deferred_moved.is_empty()
+            && Instant::now() < backstop
+        {
+            watch.park_for_hint(backstop.saturating_duration_since(Instant::now()));
         }
     }
 
@@ -1383,6 +1390,12 @@ mod tests {
             let session_before = vendors.count("session");
             for _ in 0..(5 * 60 / SLICE.as_secs()) {
                 runner.step();
+                // Ahead is an order, not a race: a round the session started has its answer
+                // before the window slices. Each round's check runs on its own worker, and
+                // the first worker to take the shared per-vendor lock asks and makes the
+                // other's head not due, so under load the window's later worker could win
+                // every minute and the negative control would see no ask at all.
+                await_round(&mut runner.watch);
                 window_slice(&mut window, &l, &time, &window_get);
             }
             if !hosted {

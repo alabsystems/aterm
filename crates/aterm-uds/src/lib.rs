@@ -113,6 +113,10 @@ pub mod process;
 /// and the `exec`s and exits of its children and of the terminal's holder.
 #[cfg(unix)]
 pub mod procwatch;
+/// macOS's program check (`syspolicyd`) read from outside: its thread pool, by one bounded
+/// setuid `ps` of its pid, for the wedge judge. See [`program_check`].
+#[cfg(not(target_arch = "wasm32"))]
+pub mod program_check;
 /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: a child that inherits
 /// nothing but a `/dev/null` stdio (the PTY keeper's one spawn).
 pub mod pspawn;

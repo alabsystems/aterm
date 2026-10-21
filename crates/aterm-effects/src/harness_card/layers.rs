@@ -401,13 +401,15 @@ impl RimArt {
             mids.push((q.x0 + q.x1, q.y0 + q.y1));
             for y in q.y0..q.y1 {
                 let row = (y + rim) as usize * wu;
-                for x in q.x0..q.x1 {
-                    let t = &mut data[row + (x + rim) as usize];
-                    // One strip a texel: the strips never overlap, so the
-                    // rim's light is never doubled.
-                    debug_assert_eq!(*t, 0, "rim strips overlap at ({x}, {y})");
-                    *t = k;
-                }
+                let x0 = row + (q.x0 + rim) as usize;
+                let x1 = row + (q.x1 + rim) as usize;
+                // One strip a texel: the strips never overlap, so the
+                // rim's light is never doubled.
+                debug_assert!(
+                    data[x0..x1].iter().all(|&t| t == 0),
+                    "rim strips overlap on row {y}"
+                );
+                data[x0..x1].fill(k);
             }
         });
         if !ok {
@@ -658,9 +660,8 @@ impl Ramps for UnderItems<'_> {
         // Each row its two ends, flat: the stack's palette runs on at the
         // end, nothing laid since the stack opened.
         let ink = fx_ink(p);
-        for _ in c.y0..c.y1 {
-            self.palette.extend([ink, ink]);
-        }
+        let rows = (c.y1 - c.y0) as usize;
+        self.palette.resize(self.palette.len() + 2 * rows, ink);
         self.side = Some(i);
     }
 }

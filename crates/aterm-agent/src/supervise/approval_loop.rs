@@ -271,8 +271,8 @@ use super::super::policy::WorkerEnv;
 use super::super::policy::approval::RULE_RM_BREAKER_WARN;
 use super::super::policy::approval::{
     AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_AUTOCOMPACT_OFFER,
-    RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG, decide, proof_would_lift,
-    unvoiced_tools,
+    RULE_LIMIT_RESET, RULE_LIMIT_RETRY, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG, decide,
+    keeps_trying_its_limit, proof_would_lift, unvoiced_tools,
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
@@ -770,6 +770,12 @@ impl AutopilotWord {
     /// Whether a bare `meta` reply was ever read ([`Self::read`]).
     pub(super) fn read(&self) -> bool {
         self.read
+    }
+
+    /// The session's own word as the last reply read named it
+    /// ([`Self::word`]): `None` is the table's.
+    pub(super) fn word(&self) -> Option<Autopilot> {
+        self.word
     }
 
     /// Whether the host ever answered a bare `meta`, read or refused
@@ -1487,6 +1493,13 @@ impl<C: Ctl> Session<'_, C> {
         facts.login_carry = login_carry;
         facts.login_back = login_back;
         facts.login_renewed = login_renewed;
+        // Gemini CLI's usage-limit dialog past the reset it names, the grace
+        // and the back-off: its `Keep trying` is due ([`RULE_LIMIT_RETRY`]).
+        facts.limit_retry = reading
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.kind == PromptKind::UsageLimit)
+            && self.limit_retry_due(rows, opts) == RetryDue::Due;
         if login_carry {
             facts.login_method = opts.idle_host.as_deref().and_then(|h| h.login_method());
         }
@@ -1934,19 +1947,65 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             (None, None)
         };
-        let row = self.ledger.write_counted_with_boot_text(
-            self.fx.stamp_ms(),
-            &approvals::Row {
+        let entry = approvals::Row {
+            rule_id,
+            outcome,
+            command,
+            reason,
+            box_seq,
+        };
+        let named_track = self.turn_end.has_limit_track();
+        let scoped_wait = outcome == approvals::Outcome::Waiting
+            && matches!(
                 rule_id,
-                outcome,
-                command,
-                reason,
-                box_seq,
-            },
-            count.as_ref(),
-            captured_boot.as_deref(),
-            &mut std::io::stderr(),
-        );
+                approvals::RULE_WALL_WAIT | approvals::RULE_POINT | approvals::RULE_TRY_ANSWERED
+            );
+        let conversation = if outcome == approvals::Outcome::Typed && named_track {
+            // An ordinary continue/done act in known A is A's, even while
+            // the remembered limit track belongs to B.
+            Some(
+                self.wall_verdict
+                    .as_ref()
+                    .filter(|v| v.seq == box_seq)
+                    .and_then(|v| v.conversation.clone())
+                    .unwrap_or(super::super::policy::turn_end::Conversation::Unknown),
+            )
+        } else if scoped_wait {
+            self.wall_memory
+                .as_ref()
+                .map(|m| m.conversation.clone())
+                .or_else(|| self.turn_end.limit_conversation().cloned())
+        } else {
+            None
+        };
+        // A wall's row names the program it was met under
+        // ([`approvals::PROGRAM`]), for a loop that follows: only a limit
+        // met under an agent whose screen is all its evidence is released to
+        // the hostless lane's ([`Self::scope_limit_conversation`]).
+        let program = (scoped_wait && rule_id == approvals::RULE_WALL_WAIT)
+            .then(|| self.limit_met_under())
+            .flatten();
+        // The row's own stamp: Land's instruction is the hold's `since`
+        // ([`TurnEndState::ledgered`] below), one tape crossing as before.
+        let at_ms = self.fx.stamp_ms();
+        let row = match conversation {
+            Some(c) => self.ledger.write_scoped_counted(
+                at_ms,
+                &entry,
+                count.as_ref(),
+                captured_boot.as_deref(),
+                &c,
+                program,
+                &mut std::io::stderr(),
+            ),
+            None => self.ledger.write_counted_with_boot_text(
+                at_ms,
+                &entry,
+                count.as_ref(),
+                captured_boot.as_deref(),
+                &mut std::io::stderr(),
+            ),
+        };
         if let Some(row) = row {
             self.fx
                 .emit(super::super::tape::doors::LEDGER, || row.into_bytes());
@@ -1956,11 +2015,26 @@ impl<C: Ctl> Session<'_, C> {
         // (`Self::wall_closed_by_act`).
         if outcome == approvals::Outcome::Typed {
             self.wall_closed_by_act();
+            // The land act that began the hold, ledgered: the hold's `since`
+            // is this row's own stamp, which a loop that follows seeds from
+            // it ([`approvals::LandSeed::hold`]).
+            self.turn_end.ledgered(rule_id, at_ms);
         }
         if let Some(host) = &self.stall_host
             && let Some(act) = crate::harness::acts::sort(rule_id, outcome, command).act
         {
             host.act_taken(act);
+        }
+        // AN ACT TYPED moves the hold (design §12.3.3, item 2), told now, as
+        // it is typed, not at the yield's point a turn later
+        // (`TurnEndState::acted` moved the episode before this row was
+        // written): Land's instruction begins it (its `since` this row's
+        // stamp, set just above), each nudge counts in it, the first land
+        // act after a landing begins it again, and an act decided in another
+        // mode — Cruise chosen at a held point — ends it. Any other row is
+        // no move ([`TurnEndState::held_moved`]).
+        if outcome == approvals::Outcome::Typed {
+            self.tell_hold();
         }
         if let Some(mark) = crate::harness::acts::log_mark(rule_id, outcome, command) {
             self.act_marks.queue(mark);
@@ -2271,6 +2345,11 @@ impl<C: Ctl> Session<'_, C> {
         // as the loop's text "gone" from it.
         if self.asked_again(&turn.screen, &p) {
             self.question_done(seq, review)?;
+        }
+        // Gemini CLI's usage-limit dialog before the reset it names: waited
+        // on, never pressed or handed over for it ([`Self::limit_retry_hold`]).
+        if self.limit_retry_hold(&turn, &p, opts, review)? {
+            return Ok(Step::Review(turn));
         }
         self.autopilot.begin();
         let decision = self.decide_box(&turn.screen, opts, allow)?;
@@ -2845,6 +2924,9 @@ impl<C: Ctl> Session<'_, C> {
                 ) {
                     self.stepper_pressed();
                 }
+                if rule_id == RULE_LIMIT_RETRY {
+                    self.limit_retry_pressed();
+                }
                 approved.push(this);
                 self.answered(&act, rule_id, &what, &over, (at, seq), review)?;
                 note_unproven(review, at, rule_id, unproven.as_deref());
@@ -2940,6 +3022,56 @@ const PRESS_RETRY_MAX: Duration = Duration::from_secs(60);
 /// badged — the tries going on behind the badge.
 pub(super) const PRESS_BADGE_AFTER: Duration = Duration::from_secs(120);
 
+/// GEMINI CLI'S USAGE-LIMIT DIALOG ([`RULE_LIMIT_RETRY`]): the absolute reset
+/// placed when this program and reset were first read, and its `Keep trying`
+/// presses since the worker last answered on another point. The occurrence
+/// stays placed across retries and a machine's sleep; re-placing the same
+/// bare clock an hour past it would turn it into tomorrow's reset. A dialog
+/// drawn again after one press waits out its own
+/// reset and, past it, the back-off ([`LIMIT_RETRY_BACKOFF_S`] doubling to
+/// [`LIMIT_RETRY_BACKOFF_MAX_S`]), so a quota that still stands at its named
+/// reset is tried again ever more slowly, never in a burst and never handed
+/// to a person for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LimitRetry {
+    program: Program,
+    reset: String,
+    at_unix: i64,
+    tries: u32,
+    last_unix: Option<i64>,
+}
+
+/// The first back-off after a `Keep trying` the dialog came back on
+/// ([`LimitRetry`]), doubled at each further one.
+pub(super) const LIMIT_RETRY_BACKOFF_S: i64 = 120;
+
+/// The back-off's ceiling ([`LimitRetry`]).
+pub(super) const LIMIT_RETRY_BACKOFF_MAX_S: i64 = 1800;
+
+/// How far ahead a bare clock the dialog names may be placed: its next
+/// occurrence, unless that is this far off or more — a reset passed within
+/// the last hour (a loop that met the dialog standing) is passed, not
+/// tomorrow's. The CLI names `now + retryDelayMs`, always ahead when drawn.
+const LIMIT_RETRY_AHEAD_MAX_S: i64 = 23 * 3600;
+
+/// The minute the dialog's clock names (`Access resets at 5:06 AM`: the
+/// quota's reset falls within it, its seconds cut): the reset is taken at the
+/// minute's end, so the grace is counted from a time the reset is past.
+const LIMIT_RETRY_MINUTE_S: i64 = 60;
+
+/// When Gemini CLI's usage-limit dialog is due its `Keep trying`
+/// ([`Session::limit_retry_due`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RetryDue {
+    /// No such dialog, or none the rule waits on (`limit_wait` off, no reset
+    /// named or read): the policy decides it as it stands.
+    Not,
+    /// Its reset, the grace and the back-off have passed: pressed now.
+    Due,
+    /// Not before `until_unix`, the reset it names being `reset`.
+    Hold { until_unix: i64, reset: String },
+}
+
 /// A box whose press did not land, being tried again at full power
 /// ([`Session::press_missed`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2963,6 +3095,7 @@ impl<C: Ctl> Session<'_, C> {
             && (opts.policy.approve == Approve::All
                 || is_question_rule(rule_id)
                 || rule_id == RULE_LIMIT_WAIT
+                || rule_id == RULE_LIMIT_RETRY
                 || rule_id == RULE_LIMIT_RESET
                 || rule_id == RULE_AUTOCOMPACT_OFFER
                 || rule_id == super::super::policy::login::RULE_LOGIN_METHOD)
@@ -3035,6 +3168,128 @@ impl<C: Ctl> Session<'_, C> {
         ));
         self.wait(&["seq", &seq.to_string()], pause)?;
         Ok(Step::Again { settle: false })
+    }
+
+    /// WHEN GEMINI CLI'S USAGE-LIMIT DIALOG ON `rows` IS DUE ITS `Keep
+    /// trying` ([`RULE_LIMIT_RETRY`]): the reset its `Access resets at
+    /// <time>.` row names ([`aterm_phase::gemini::limit_reset`], a bare clock
+    /// in the machine's zone, placed by [`LIMIT_RETRY_AHEAD_MAX_S`]'s rule, at
+    /// the end of its minute: [`LIMIT_RETRY_MINUTE_S`]), the program's grace
+    /// after it (the turn-end policy's, which a wall's resume waits too), and
+    /// the back-off from the last press the dialog
+    /// came back on ([`LimitRetry`]). [`RetryDue::Not`] for any other screen,
+    /// a dialog naming no reset, and with `limit_wait` off.
+    pub(super) fn limit_retry_due(&mut self, rows: &[String], opts: &SuperviseOpts) -> RetryDue {
+        let program = self.reader(rows).program();
+        if !opts.policy.limit_wait || !keeps_trying_its_limit(program) {
+            self.limit_retry = None;
+            return RetryDue::Not;
+        }
+        let Some(reset) = aterm_phase::gemini::limit_reset(rows) else {
+            self.limit_retry = None;
+            return RetryDue::Not;
+        };
+        let now = self.now_unix();
+        if self
+            .limit_retry
+            .as_ref()
+            .is_none_or(|r| r.program != program || r.reset != reset)
+        {
+            self.limit_retry = None;
+            let Some(spec) = limit::parse_reset(&reset) else {
+                return RetryDue::Not;
+            };
+            let local = self.local_offset_s();
+            let Some(at_unix) =
+                limit::reset_in_zone(&spec, now, LIMIT_RETRY_AHEAD_MAX_S, &|_| Some(local))
+            else {
+                return RetryDue::Not;
+            };
+            self.limit_retry = Some(LimitRetry {
+                program,
+                reset: reset.clone(),
+                at_unix,
+                tries: 0,
+                last_unix: None,
+            });
+        }
+        let Some(retry) = self.limit_retry.as_ref() else {
+            return RetryDue::Not;
+        };
+        let grace = i64::try_from(self.turn_end.timing.grace_for(Program::Gemini).as_secs())
+            .unwrap_or(i64::MAX);
+        let backed_off = retry.last_unix.map_or(i64::MIN, |last| {
+            let doubled = LIMIT_RETRY_BACKOFF_S
+                .saturating_mul(1_i64 << retry.tries.saturating_sub(1).min(16))
+                .min(LIMIT_RETRY_BACKOFF_MAX_S);
+            last.saturating_add(doubled)
+        });
+        let until_unix = retry
+            .at_unix
+            .saturating_add(LIMIT_RETRY_MINUTE_S)
+            .saturating_add(grace)
+            .max(backed_off);
+        if now >= until_unix {
+            RetryDue::Due
+        } else {
+            RetryDue::Hold { until_unix, reset }
+        }
+    }
+
+    /// THE WAIT ON GEMINI CLI'S USAGE-LIMIT DIALOG `p` ON `turn` BEFORE ITS
+    /// `Keep trying` ([`Self::limit_retry_due`]): not due yet, the box is
+    /// held as a person's grace holds an answer ([`Self::held_for_person`]) —
+    /// neither pressed nor escalated, the point reported as it stands (its
+    /// `EVENT prompt` line), the policy's deadline set to the due, then
+    /// judged again — and `WAITING seq=<n> until=<UTC> rule=limit-retry@v1
+    /// …` said once for that due. `true`: held. A dialog due now, or none,
+    /// is decided as it stands (the rule presses it).
+    fn limit_retry_hold(
+        &mut self,
+        turn: &Turn,
+        p: &aterm_phase::PromptV2,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
+        if p.kind != PromptKind::UsageLimit || !review.unattended() {
+            return Ok(false);
+        }
+        let RetryDue::Hold { until_unix, reset } = self.limit_retry_due(&turn.screen.rows, opts)
+        else {
+            return Ok(false);
+        };
+        let now = self.now_unix();
+        let wait = Duration::from_secs(u64::try_from(until_unix - now).unwrap_or(0));
+        let until = self.fx.mono() + wait;
+        // Said once for a due: the dialog judged again under the same due
+        // (a redraw, the wait's own wake) is the same wait.
+        let why = format!("Gemini CLI's usage limit resets at {reset}");
+        let told = self
+            .turn_end_due
+            .as_ref()
+            .is_some_and(|d| d.why == why && (d.unix_ms.div_euclid(1000) - until_unix).abs() <= 1);
+        if !told {
+            review.note(&format!(
+                "WAITING seq={} until={} rule={RULE_LIMIT_RETRY} Gemini CLI's usage limit resets at \
+                 {reset}: {} is pressed past it",
+                turn.screen.seq,
+                utc_stamp(u64::try_from(until_unix).unwrap_or(0)),
+                aterm_phase::anchor("gemini.usage.retry"),
+            ));
+        }
+        self.set_due(until, why);
+        self.held = true;
+        Ok(true)
+    }
+
+    /// A `Keep trying` of Gemini CLI's usage-limit dialog landed: counted for
+    /// the back-off the dialog drawn again waits ([`LimitRetry`]).
+    fn limit_retry_pressed(&mut self) {
+        let now = self.now_unix();
+        if let Some(retry) = self.limit_retry.as_mut() {
+            retry.tries = retry.tries.saturating_add(1);
+            retry.last_unix = Some(now);
+        }
     }
 
     /// The press back-off, for a box nobody else is there to answer (a press

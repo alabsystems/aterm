@@ -20,8 +20,10 @@ pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {
 /// [`sync_all`] under this crate's unit tests on Apple targets: a plain `fsync(2)`
 /// ([`aterm_durable::seam::durable_fsync`], which the counting seam records as durable). It
 /// flushes at the same point and in the same order and drops only the drive-cache barrier,
-/// which no test can observe and which stalls the whole volume for every test binary running
-/// beside this one (beside three other unit-test runs: 0.60 s instead of ~0.9 s). Integration
+/// which no test can observe and which holds up most flushes, growing writes, creates and
+/// renames on the volume while it runs, so a test binary running beside this one waits
+/// behind it (`docs/measured/flush-wait-2026-10-21.md`; beside three other unit-test runs:
+/// 0.60 s instead of ~0.9 s). Integration
 /// tests, shipped builds and dependent crates keep `F_FULLFSYNC`.
 #[cfg(all(test, target_vendor = "apple"))]
 pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {

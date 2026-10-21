@@ -27,8 +27,9 @@ getrandom = "0.2"
 # its own RNG, never from bytes, and the handshake seeds its ephemeral from getrandom's
 # bytes (handshake.rs `ephemeral`). Nothing in aterm can enable this feature or
 # `identity`. We OWN the
-# protocol, the transcript binding, and HMAC/HKDF-SHA256 (composed here over the
-# workspace's own SHA-256, astream-digest, like astream-cap owns its HMAC). The ONE
+# protocol, the transcript binding and the key schedule; HMAC/HKDF-SHA256 are the
+# workspace's own, astream-digest's (the one HMAC astream-cap tags with; this
+# crate's copy moved there, its zeroization with it). The ONE
 # thing we delegate is
 # the raw X25519 scalar multiplication -- hand-rolling constant-time curve25519
 # field arithmetic is where DIY crypto breaks -- to the vetted x25519-dalek. Its

@@ -273,17 +273,18 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     audit_policy(ctx, r, &policy, &cells);
 }
 
-/// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1 and WB.3 of
-/// docs/AUDIT-third-party-2026-10-15.md), each with what it holds to the
-/// registry crate of its version: the declarations' types, layouts, values and
-/// signatures, the DLL each import resolves from, and every planted mismatch
+/// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1, WB.2 and
+/// WB.3 of docs/AUDIT-third-party-2026-10-15.md), each with what it holds to
+/// the registry crates of its version: the declarations' types, layouts, values
+/// and signatures (and, for aterm-win32's hand-written COM and DXGI, each
+/// vtable slot), the DLL each import resolves from, and every planted mismatch
 /// caught. Each verb compiles both Windows triples, so a run that checks
 /// either Windows cell runs each once. The same STOCK EXCEPTION as the cells:
 /// stock stable compiles Windows std, and no Windows program runs.
 pub const WIN32_ORACLES: [(&str, &str); 2] = [
     (
         "oracle",
-        "the windows-sys 0.61 facade and aterm-win32's closure against registry windows-sys 0.61.2",
+        "the windows-sys 0.61 facade and aterm-win32's closure against registry windows-sys 0.61.2, its COM and DXGI against windows 0.62.2",
     ),
     (
         "oracle-052",

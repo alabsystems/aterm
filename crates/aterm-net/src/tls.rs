@@ -34,10 +34,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme, StreamOwned};
 /// The exporter length: what every proof over a channel is taken over.
 pub const EXPORTER_LEN: usize = 32;
 
-/// THE crypto provider: the one place this crate names a rustls
-/// `CryptoProvider` implementation. Today it is rustls's `ring` provider, and
-/// ring is the bridge half of the KEEP pair (docs/AUDIT-third-party-2026-10-15.md):
-/// replacing it is a change to this function, not to its callers.
+/// The single place this crate names a rustls `CryptoProvider` implementation.
 fn provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::ring::default_provider()
 }
@@ -751,16 +748,10 @@ where
     // the uploader hung it up.
     let mut local_failed = false;
 
-    // DRAIN BEFORE THE FIRST BLOCK. A peer's first application record routinely
-    // rides in the SAME TCP segment as the handshake's final flight, so
-    // `accept`/`connect`'s `complete_io` consumes both and leaves that first
-    // request already DECRYPTED in rustls' plaintext buffer. Going straight to
-    // `tcp_down.read()` deadlocks the whole exchange: the local service never
-    // receives the request it is supposed to answer, and the peer — waiting for
-    // that answer — sends nothing further, so the blocking read never returns.
-    // Whether the segments coalesce is load-dependent, which is why this
-    // surfaced as an intermittent hang (and, wherever the local end had a read
-    // timeout, a WouldBlock failure ~10 s in) rather than a constant one.
+    // Drain before the first blocking read: a peer's first application record
+    // can ride in the same TCP segment as the handshake's final flight, leaving
+    // the first request already decrypted in rustls' plaintext buffer after
+    // `complete_io`.
     let mut drained_eof = false;
     {
         let mut g = shared.lock();
@@ -817,18 +808,11 @@ where
                 break;
             }
             let mut cursor: &[u8] = &tls_in[..n];
-            // FEED, DECRYPT, DRAIN — per feed, never per socket read. rustls
-            // holds at most 16 KiB of decrypted plaintext and `read_tls` refuses
-            // input once past it, while one socket read can complete more than
-            // that (the tail of a full record the last read left buffered, plus
-            // every small record behind it). Draining only after the whole read
-            // was fed let that refusal land mid-read and tore a healthy relay
-            // down. Draining after every `process_new_packets` keeps the buffer
-            // empty before each feed, so the refusal cannot happen; `plain`
-            // takes what the drains collect, at most a few records' worth.
-            //
-            // A clean close ends the feed: `read_tls` reads nothing after a
-            // `close_notify`, and nothing a peer sends past one is data.
+            // Drain after every `process_new_packets`: rustls holds at most
+            // 16 KiB of decrypted plaintext and `read_tls` refuses input once
+            // past it, while one socket read can complete more than 16 KiB.
+            // A clean close ends the feed (`read_tls` reads nothing after a
+            // `close_notify`).
             while !cursor.is_empty() && !clean_eof {
                 match g.conn.read_tls(&mut cursor) {
                     Ok(1..) => {}
@@ -1329,19 +1313,10 @@ mod tests {
         assert!(matches!(srv.join().unwrap(), Ok(())));
     }
 
-    /// [`relay_answers`]' ORDER, pinned: nothing of the connection's end
-    /// reaches the wire while the guard is held. A local end answers more than
-    /// any socket buffer holds and hangs up; the guard's drop says it has
-    /// begun and then holds the relay at a gate. The peer reads every answer
-    /// byte, waits for the drop to begin, and peeks its raw socket: nothing —
-    /// no `close_notify`, no FIN — may be there. Only once the gate opens does
-    /// the end arrive, a clean `close_notify`; and the relay returns while the
-    /// peer still holds its end open and says nothing.
-    ///
-    /// NEGATIVE CONTROL (by mutation, 2026-10-16): with the guard dropped
-    /// after the `close_notify` and the FIN — the order before that day, which
-    /// the live lane caught as a flake — the peek finds the end on the wire.
-    /// Every wait here is the hang detector, never a latency budget.
+    /// [`relay_answers`] ordering: nothing of the connection's end reaches the
+    /// wire while the guard is held. Only once the gate opens does the end
+    /// arrive (`close_notify`), and the relay returns while the peer holds its
+    /// end open and silent.
     #[test]
     fn an_answering_relay_says_nothing_of_the_end_while_its_guard_is_held() {
         use std::sync::mpsc;
@@ -1410,21 +1385,9 @@ mod tests {
         drop(ct);
     }
 
-    /// [`relay_answers`] LETS ITS GUARD GO ONLY ONCE NEITHER END CAN HOLD IT:
-    /// a peer that never reads pipelines more than the local socket holds,
-    /// and a local end that never reads answers without end, so the
-    /// downloader is blocked writing to the local end and the uploader
-    /// pushing an answer the peer does not take. The connection is then cut
-    /// as the fleet listener cuts one, its socket hung up: the relay
-    /// returns, its guard gone, and the local end's write fails — a relay
-    /// that has freed the fleet listener's slot holds no thread on either
-    /// end's account.
-    ///
-    /// NEGATIVE CONTROL (by mutation, run 2026-10-16): with the uploader
-    /// leaving at the cut without shutting the local socket, the guard goes
-    /// while the downloader and the local end block on each other for good,
-    /// and the relay's return is the hang detector's to report. Every wait
-    /// here is the hang detector, never a latency budget.
+    /// [`relay_answers`] lets its guard go only once neither end can hold it:
+    /// when a connection with blocked downloader and uploader is cut, the relay
+    /// returns with its guard dropped and the local end's write fails.
     #[cfg(unix)]
     #[test]
     fn a_cut_answering_relay_ends_though_neither_end_reads() {
@@ -1496,20 +1459,10 @@ mod tests {
         pipelining.join().unwrap();
     }
 
-    /// [`relay_answers`] HANGS ITS LOCAL END UP, EACH HALF ON ITS OWN, after
-    /// the local end hung up as the control server does (its write half,
-    /// then its read half) while a copy of it lives on, as a forked child's
-    /// can for seconds. A peer pipelines more than the local socket holds and
-    /// never reads, so the downloader is blocked writing to a local end that
-    /// never reads; the local end answers one line and hangs up. The relay
-    /// returns, its guard gone, with the copy still open: the hang-up woke
-    /// the downloader.
-    ///
-    /// NEGATIVE CONTROL (by mutation, run 2026-10-16): with the local socket
-    /// shut both ways — which Darwin refuses once the local end has hung up,
-    /// shutting nothing — the downloader stays blocked until the copy
-    /// closes, and the relay's return is the hang detector's to report.
-    /// Every wait here is the hang detector, never a latency budget.
+    /// [`relay_answers`] hangs its local end up one half at a time: when the
+    /// local end answers and hangs up while a cloned descriptor of it remains
+    /// open and the downloader is blocked writing to it, the hang-up wakes the
+    /// downloader and the relay returns with its guard dropped.
     #[cfg(unix)]
     #[test]
     fn an_answering_relay_ends_though_a_copy_of_its_hung_up_local_end_lives_on() {
@@ -1584,18 +1537,10 @@ mod tests {
         }
     }
 
-    /// [`relay_answers`] HOLDS ITS GUARD THROUGH THE LINE ITS LOCAL END
-    /// SERVES, though the peer's side fails. A peer asks one line and, once
-    /// the local end has read it, sends a record that does not decrypt. The
-    /// local end reads an EOF after its line, and the relay still reads it
-    /// (its socket still takes a write): only its answer lets the guard go.
-    /// So a member that fails each connection after its request keeps no
-    /// survey running past its slot and share.
-    ///
-    /// NEGATIVE CONTROL (by mutation, run 2026-10-16): with the local end
-    /// hung up on the peer's fatal error, as before that day, the relay stops
-    /// reading it at once and the guard goes while it still serves its line.
-    /// Every wait here is the hang detector, never a latency budget.
+    /// [`relay_answers`] holds its guard through the line its local end serves
+    /// even when the peer sends an undecryptable record after the request: the
+    /// local end reads EOF after its line and only its answer releases the
+    /// guard.
     #[cfg(unix)]
     #[test]
     fn an_answering_relay_whose_peer_fails_holds_its_guard_through_the_line() {
@@ -1962,20 +1907,9 @@ mod tests {
     /// which takes milliseconds.
     const NET_TEST_LIVENESS_BOUND: Duration = Duration::from_secs(60);
 
-    /// THE DOWNLOAD DIRECTION MUST NOT LET RUSTLS' PLAINTEXT BUFFER FILL WHILE
-    /// IT FEEDS A SOCKET READ IN. rustls holds at most 16 KiB of decrypted
-    /// plaintext and `read_tls` REFUSES more input once past it ("received
-    /// plaintext buffer full"). One socket read can complete far more than
-    /// that: the tail of a full 16 KiB record that the previous read left
-    /// half-buffered, plus every small record behind it. Draining only after the
-    /// WHOLE read was fed lands that refusal mid-feed ("TLS ingest made no
-    /// progress") and tears down a healthy peer's ordinary output: one full
-    /// record, then small ones.
-    ///
-    /// Deterministic, not timing-dependent: the dialer waits until every byte
-    /// the listener sent is in its socket before the relay's first read, so
-    /// that read takes the first 16 KiB (the full record minus its tail) and
-    /// the next one carries the tail plus the small records.
+    /// The download direction drains rustls' 16 KiB plaintext buffer after each
+    /// packet batch so a socket read carrying a full record's tail followed by
+    /// small records never overflows the buffer mid-feed.
     #[test]
     fn relay_ingests_a_full_record_followed_by_small_ones_without_tearing_down() {
         let _serial = serialize_loopback();

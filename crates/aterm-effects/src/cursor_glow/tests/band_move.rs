@@ -5,12 +5,10 @@
 
 use super::*;
 
-/// The row-band law on the classifier anchors (`band_row`): a band above the
-/// caret's row (the transcript archiving) or below it leaves `last` and
-/// `last_visible` alone; Codex's viewport `[11..56]` riding down carries both
-/// one row with their instants; a band the row leaves drops both, so the next
-/// tick starts cold from its observed cursor. Degenerate bands are no-ops and
-/// are not counted.
+/// `band_row` on the classifier anchors: a band above or below the caret's row
+/// leaves `last` and `last_visible` alone, one containing it carries both (the
+/// instant kept), and one the row leaves drops both. Degenerate bands are not
+/// counted.
 #[test]
 fn translate_band_moves_last_and_last_visible_only_inside_the_band_and_drops_what_leaves() {
     let g = geom_codex();
@@ -24,15 +22,15 @@ fn translate_band_moves_last_and_last_visible_only_inside_the_band_and_drops_wha
         .last_visible
         .expect("a visible caret is remembered with its instant");
     assert_eq!(seen.0, (13, 2));
-    // ABOVE: the transcript archiving under a pinned composer.
+    // Above: the transcript archiving under a pinned composer.
     glow.note_band_move(0, 11, -1);
     assert_eq!(glow.last, Some((13, 2)));
     assert_eq!(glow.last_visible, Some(seen));
-    // BELOW: a region scroll under the caret.
+    // Below: a region scroll under the caret.
     glow.note_band_move(20, 56, 1);
     assert_eq!(glow.last, Some((13, 2)));
     assert_eq!(glow.last_visible, Some(seen));
-    // INSIDE: Codex phase A, the viewport riding down one row.
+    // Inside: Codex's viewport riding down one row.
     glow.note_band_move(11, 56, 1);
     assert_eq!(glow.last, Some((14, 2)), "the anchor rides its band");
     assert_eq!(
@@ -41,7 +39,7 @@ fn translate_band_moves_last_and_last_visible_only_inside_the_band_and_drops_wha
         "with the instant it was seen at"
     );
     assert_eq!(glow.band_moves(), 3);
-    // LEAVES: the band ends on the caret's row and slides down.
+    // Leaves: the band ends on the caret's row and slides down.
     glow.note_band_move(10, 14, 1);
     assert_eq!(glow.last, None, "no honest source cell past the edge");
     assert_eq!(glow.last_visible, None);
@@ -51,12 +49,9 @@ fn translate_band_moves_last_and_last_visible_only_inside_the_band_and_drops_wha
     assert_eq!(glow.band_moves(), 4);
 }
 
-/// The Backspace's key-time licence survives a band move. Under Codex the
-/// erase's echo often lands after a streamed line has slid the composer down a
-/// row. `quench_hint` (the licence) is kept across the band move (a scroll
-/// retires it); the row-content classifiers (`bs_poof_hint`, `bs_baseline`)
-/// describe the pre-move row and are retired as on a scroll. The echo is
-/// licensed and the deletion speaks.
+/// Under Codex a Backspace's echo often lands after a streamed line slid the
+/// composer: `quench_hint` survives the band move (the row-content classifiers
+/// retire), so the echo is licensed and the deletion speaks.
 #[test]
 fn a_backspace_echo_that_lands_after_a_band_move_is_still_licensed() {
     use crate::trail_sound::SoundKind;
@@ -113,10 +108,8 @@ fn a_backspace_echo_that_lands_after_a_band_move_is_still_licensed() {
     );
 }
 
-/// T1, program output mints nothing: a band move is a coordinate transform,
-/// never a licence. Codex streaming six lines under a resting caret (the
-/// composer riding down one row per line) judges nothing, licenses and
-/// declines nothing, spawns nothing and draws nothing.
+/// A band move is a coordinate transform, never a licence: Codex streaming
+/// under a resting caret judges, spawns and draws nothing.
 #[test]
 fn a_cold_band_move_under_a_resting_caret_spawns_nothing() {
     let g = geom_codex();
@@ -146,14 +139,10 @@ fn a_cold_band_move_under_a_resting_caret_spawns_nothing() {
     assert_eq!(glow.last, Some((19, 2)), "the anchor followed the composer");
 }
 
-/// A Codex session: eight keys at ~8 cps into the composer on row 13, then
-/// Codex streams 28 lines 40 ms apart while typing continues (a key every third
-/// line). Phase A, the inline viewport `[vt..56]` slides down one row per line:
-/// on every line the ribbon is lit, all its light is on the caret's row, no
-/// meteor flew, nothing was declined, and every key lit exactly one echo.
-/// Phase B, hand at rest: the transcript `[0..row−2]` archives up five lines
-/// under the pinned composer; the composer's light stays, nothing is judged,
-/// and typing momentum reads exactly its natural decay.
+/// Codex streams lines while typing continues: as the inline viewport slides
+/// down, the ribbon stays lit on the caret's row with no meteor or decline; at
+/// rest, transcript archiving above the composer judges nothing and momentum
+/// decays naturally.
 #[test]
 fn codex_streaming_keeps_the_ribbon_glued_to_the_sliding_composer() {
     let g = geom_codex();
@@ -173,7 +162,7 @@ fn codex_streaming_keeps_the_ribbon_glued_to_the_sliding_composer() {
     let spawns0 = glow.spawns();
     let tally0 = glow.admission_tally();
 
-    // PHASE A.
+    // Phase A: the viewport slides down one row per line while typing continues.
     let mut row = 13u16;
     let mut t = 8 * 120 + 10;
     let mut keys = 0u64;
@@ -219,7 +208,7 @@ fn codex_streaming_keeps_the_ribbon_glued_to_the_sliding_composer() {
     );
     assert_eq!(glow.band_moves(), 28);
 
-    // PHASE B.
+    // Phase B: hand at rest, the transcript archives under the pinned composer.
     let rest_end = t + 5 * 40;
     let predicted = glow.typing_momentum(at(rest_end));
     let spawns1 = glow.spawns();
@@ -246,12 +235,9 @@ fn codex_streaming_keeps_the_ribbon_glued_to_the_sliding_composer() {
     assert_eq!(glow.band_moves(), 33);
 }
 
-/// Codex's heartbeat excursion: every streamed line begins with a CUP to the
-/// viewport's top-left (`ESC[{vt};1H`) before the RI and text, so the print
-/// anchor samples `(vt−1, 1)` with a fresh sequence each tick while the echo
-/// lands on the composer row below. The echo-anchor lane stays inert: no
-/// sweep on the excursion row, zero `program-row` declines, and every key
-/// lights exactly its own echo.
+/// Codex begins every streamed line with a CUP to the viewport's top-left, so
+/// the print anchor samples `(vt−1, 1)` with a fresh sequence each tick: the
+/// echo-anchor lane stays inert there and every key lights only its own echo.
 #[test]
 fn the_codex_excursion_print_anchor_stays_inert() {
     let g = geom_codex();

@@ -1022,7 +1022,7 @@ mod tests {
     fn assert_native_sibling_geometry(scale: f64, axis: crate::tab_model::SplitAxis) {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // The win_pad negative control below is provable only with a REAL
+        // The win_pad negative control below is provable only with a real
         // compositor pad: seal the scale-derived boot pad into the headless
         // record exactly like an attach would (never-attached records carry 0).
         app.backend.set_pad((12.0 * scale).round() as usize);

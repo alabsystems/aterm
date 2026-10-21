@@ -188,17 +188,14 @@ impl ChromeColors {
 /// `#33415E`). A scheme that leaves `selection` as `None` does not get it:
 /// it gets [`derived_selection`], which follows its own background.
 ///
-/// Darker, lower-saturation than the old `#264F78`: selected COLOURED text keeps its
-/// own fg, and over `#264F78` mid-tone syntax colours dropped below ~2:1 (magenta,
-/// comment-gray, blue) — unreadable while selecting git/ls/log output. `#33415E`
-/// darkens the highlight so it recedes behind the text (>~3:1) yet still clearly
-/// reads as a selection against the `#111318` background. (LLM-judge finding V3.)
+/// Selected coloured text keeps its own fg, so `#33415E` keeps mid-tone syntax
+/// colours (magenta, comment-gray, blue) readable (>~3:1) while still reading
+/// clearly as a selection against the `#111318` background.
 const SELECTION_DEFAULT: Rgb = Rgb::new(0x33, 0x41, 0x5E);
 
 impl Default for ColorScheme {
-    /// Byte-identical to aterm's historical look: fg `#D0D0D0`, bg `#111318`, cursor
-    /// `#50FA7B`, selection `SELECTION_DEFAULT` (`#33415E`), and `ansi[i] == ColorPalette::default_color(i)`
-    /// (so an empty config resolves to exactly today's colors).
+    /// Default color scheme: fg `#D0D0D0`, bg `#111318`, cursor
+    /// `#50FA7B`, selection `SELECTION_DEFAULT` (`#33415E`), and `ansi[i] == ColorPalette::default_color(i)`.
     fn default() -> Self {
         let mut ansi = [Rgb::new(0, 0, 0); 16];
         for (i, slot) in ansi.iter_mut().enumerate() {
@@ -1481,7 +1478,7 @@ impl core::fmt::Display for ThemeWarning {
     }
 }
 
-/// The colour-identity half of a theme (DTP §3.1): what a listing, the picker
+/// The colour-identity half of a theme: what a listing, the picker
 /// and the split resolver show and pair by, separate from the colours.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeMeta {
@@ -1562,7 +1559,7 @@ impl ThemeMeta {
     }
 }
 
-/// A whole admitted theme (DTP §3.1): its identity, its colours, its
+/// A whole admitted theme: its identity, its colours, its
 /// typography and its `bold_is_bright`. What the catalog holds for a theme
 /// file and what a theme switch applies; [`ColorScheme`] stays the colours
 /// alone.
@@ -3918,7 +3915,7 @@ mod tests {
 
     /// A theme file that leaves `selection` out gets a band on its own
     /// background's side: a light theme a light band, a dark theme a dark
-    /// one. Negative control: the fixed dark default it used to get sits on
+    /// one. Negative control: the fixed dark default (`SELECTION_DEFAULT`) sits on
     /// the light theme's text side.
     #[test]
     fn an_unset_selection_follows_the_theme() {
@@ -4626,8 +4623,8 @@ color15 = #c0caf5
         );
     }
 
-    /// A scheme with no chrome serializes exactly as before the field
-    /// existed (no `chrome` key), and one with chrome round-trips. NEGATIVE
+    /// A scheme with no chrome omits the `chrome` key when serialized,
+    /// and one with chrome round-trips. NEGATIVE
     /// CONTROL: the authored scheme's text does carry the key.
     #[cfg(feature = "serde")]
     #[test]

@@ -12,8 +12,7 @@ description = "aterm's portable clock: `std::time` where it exists, a performanc
 # No dependencies on any target. Natively the crate is `pub use
 # std::time::…`. On wasm32-unknown-unknown the two browser clocks are link-time
 # symbols that the wasm module defines from its own JS bindings with
-# `aterm_time::wasm_clock_host!` (src/lib.rs). The wasm-bindgen row this table
-# held left with that seam (docs/AUDIT-third-party-2026-10-15.md, WP.4).
+# `aterm_time::wasm_clock_host!` (src/lib.rs).
 [dependencies]
 
 [lints]

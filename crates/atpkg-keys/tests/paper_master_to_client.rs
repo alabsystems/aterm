@@ -1,23 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE ROUND TRIP: a written master phrase → a machine key → a roster → a release the
-//! **actual client verifier** accepts, attributed to the machine that signed it.
+//! The round trip: a written master phrase, a machine key, a roster, and a release the
+//! actual client verifier accepts, attributed to the machine that signed it. Both sides use
+//! the shipping types (`atpkg_keys::master` and `roster_ops`, `aterm_update_core::roster`),
+//! so a change that breaks the contract breaks this file.
 //!
-//! Every step here uses the shipping types on both sides — `atpkg_keys::master` and
-//! `atpkg_keys::roster_ops` on the owner side, `aterm_update_core::roster` on the client
-//! side. Nothing is re-implemented for the test, so a change that breaks the contract
-//! breaks this file rather than passing a parallel implementation of itself.
-//!
-//! The CLI's `/dev/tty` prompt is deliberately NOT exercised here: a test harness has no
-//! controlling terminal, and a prompt that could be satisfied without one would defeat its
-//! own purpose (leak vector 5 — `join < phrase.txt` must fail). What the prompt
-//! feeds into — `parse_master` — is tested exhaustively in `master.rs`.
-//!
-//! The refusals (wrong master, key off the roster, relabelled identity, revocation,
-//! replay, an unpinned anchor) are proved over the client's own bytes in
-//! `aterm_update_core::roster`'s tests and through a real install in
-//! `owner_to_client.rs`; this file keeps the two acceptance paths.
+//! The `/dev/tty` prompt is not exercised here (`provision_cli` drives it on a pty); what it
+//! feeds, `parse_master`, is tested in `master.rs`. The refusals are proved in
+//! `aterm_update_core::roster`'s tests and through a real install in `owner_to_client.rs`;
+//! this file keeps the two acceptance paths.
 
 #![cfg(unix)]
 
@@ -25,8 +17,7 @@ use aterm_update_core::roster::{Roster, RosterReject, verify_roster};
 use atpkg_keys::master::parse_master;
 use atpkg_keys::roster_ops::{add, empty};
 
-/// An obviously synthetic master. Sixty-four characters of a visible repeating pattern —
-/// it could not be mistaken for a generated key, and it appears nowhere outside tests.
+/// A synthetic master: 52 characters of a visible pattern, used nowhere outside tests.
 const PAPER: &str = "0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0";
 
 /// 2026-08-04T00:00:00Z.
@@ -46,8 +37,8 @@ fn appcast(machine_id: &str, roster_seq: u64) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// Publish a roster the way the tool does — emit, master-sign — and take it back through
-/// the client's own verify + parse. Returns the parsed roster and the master's pubkey.
+/// Emit and master-sign a roster the way the tool does. Returns the bytes, the signature and
+/// the master's pubkey.
 fn publish(roster: &Roster, paper: &str) -> (Vec<u8>, Vec<u8>, String) {
     let seed = parse_master(paper).expect("synthetic phrase").seed();
     let bytes = roster.to_toml().expect("a valid roster emits").into_bytes();
@@ -55,8 +46,6 @@ fn publish(roster: &Roster, paper: &str) -> (Vec<u8>, Vec<u8>, String) {
     (bytes, sig, seed.pubkey_b64().expect("public identity"))
 }
 
-/// THE WHOLE CHAIN, end to end: paper master → machine key → roster → a release the
-/// client accepts and attributes correctly.
 #[test]
 fn a_master_phrase_mints_a_machine_whose_release_the_client_accepts() {
     // Owner side: mint m3's key on m3, and put it on a roster signed by the paper master.
@@ -64,8 +53,7 @@ fn a_master_phrase_mints_a_machine_whose_release_the_client_accepts() {
     let roster = add(empty(NOW), "m3", &m3_pub, NOW).expect("m3 joins");
     let (roster_bytes, roster_sig, master_pub) = publish(&roster, PAPER);
 
-    // The machine signs a release with its OWN key. The master is not present for this —
-    // that is what makes "touch the paper only to mint" true.
+    // The machine signs a release with its own key; the master is needed only to mint.
     let bytes = appcast("m3", roster.roster_seq);
     let sig = atpkg_keys::sign(&m3_key, &bytes).expect("the machine signs its release");
 
@@ -81,7 +69,7 @@ fn a_master_phrase_mints_a_machine_whose_release_the_client_accepts() {
         .authorize_appcast(&bytes, &sig, NOW as i64)
         .expect("m3 is live and signed this");
 
-    // ATTRIBUTION: the verifier can say WHICH machine signed.
+    // Attribution: the verifier says which machine signed.
     assert_eq!(who.machine_id, "m3");
     assert_eq!(who.pubkey_b64, m3_pub);
     assert_eq!(who.roster_seq, parsed.roster_seq);
@@ -89,17 +77,11 @@ fn a_master_phrase_mints_a_machine_whose_release_the_client_accepts() {
         .expect("the manifest's own claim agrees with the key that signed");
 }
 
-/// THE SAME ROUND TRIP, BUT NOBODY TYPES A KEY — driven end to end by `setup` and `join`.
-///
-/// The chain above proves the cryptography. This proves the OPERATION: the two verbs
-/// produce, with no hand transcription anywhere, a `pins.rs` and a roster that the real
-/// client verifier accepts, and a machine key that signs a release attributed to the
-/// machine that holds it.
-///
-/// **AND IT PROVES THE POINT OF THE WHOLE TIER: a machine is ROSTER-ONLY.** No minted key
-/// appears in the anchor file; the roster alone authorizes
-/// (`aterm_update::github::fetch_authoritative_release`), which is what makes adding a
-/// machine a LOCAL act: run `join`, copy the roster out, publish.
+/// The same round trip driven by `setup` and `join`, with no hand transcription: their
+/// `pins.rs` and roster pass the real client verifier, and a minted key signs a release
+/// attributed to its machine. No minted key appears in the anchor file: the roster alone
+/// authorizes (`aterm_update::github::fetch_authoritative_release`), so adding a machine is
+/// a local act.
 #[test]
 fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     use atpkg_keys::pins_edit::{MASTER_ANCHOR, read_anchor};
@@ -134,8 +116,7 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     };
 
     // --- setup, on the first machine ------------------------------------------------
-    // The seed stands in for `generate_master()` + the paper the owner writes; everything
-    // downstream of it is exactly what the verb does.
+    // The seed stands in for `generate_master()` and the owner's paper.
     let seed = parse_master(PAPER).expect("synthetic phrase").seed();
     let m3_paths = paths("m3.key", "m3.toml");
     let pre = preflight(Verb::Setup, "m3", &m3_paths).expect("a fresh tree accepts setup");
@@ -169,7 +150,7 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     let m11_key = std::fs::read(at("m11.key")).expect("the 0600 machine key");
     let sig = atpkg_keys::sign(&m11_key, &bytes).expect("the machine signs its own release");
 
-    // --- the client's ONLY gate under an armed master: the master-signed roster -------
+    // --- the client's only gate under an armed master: the master-signed roster ------
     let roster_bytes = std::fs::read(at("aterm-machines.toml")).expect("the roster");
     let roster_sig = std::fs::read(at("aterm-machines.toml.sig")).expect("its signature");
     let verified = verify_roster(&[master_anchor[0].as_str()], roster_bytes, &roster_sig)
@@ -187,7 +168,7 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     who.bind(Some("m11"), Some(parsed.roster_seq))
         .expect("the manifest's claim agrees with the key that signed");
 
-    // m3, minted by the OTHER verb, is equally live on the same roster.
+    // m3, minted by the other verb, is equally live on the same roster.
     let m3_bytes = appcast("m3", m11.roster_seq);
     let m3_key = std::fs::read(at("m3.key")).unwrap();
     let m3_sig = atpkg_keys::sign(&m3_key, &m3_bytes).unwrap();
@@ -199,8 +180,7 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
         "m3"
     );
 
-    // NEGATIVE CONTROL: a key that neither verb minted is refused, so the acceptance
-    // above is about the roster and not about the verifier waving anything through.
+    // Negative control: a key neither verb minted is refused.
     let (thief_key, _) = atpkg_keys::generate().unwrap();
     let forged = atpkg_keys::sign(&thief_key, &bytes).unwrap();
     assert_eq!(

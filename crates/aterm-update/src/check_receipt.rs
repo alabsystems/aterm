@@ -1,11 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Completed network checks have their own receipt. Apply/status writers never
-//! refresh this clock or its deferral, and another source cannot reuse it.
+//! The receipt of completed network checks. Apply and status writers never refresh its
+//! clock or deferral, and another source cannot reuse it.
 //!
 //! It also counts, machine-wide, how many completed checks in a row have found the
-//! channel head's APP BUILD IN FLIGHT (a release published source-first:
+//! channel head's app build in flight (a release published source-first:
 //! `github::app_build_in_flight`) — the count the check loop's quick re-checks
 //! (`cadence::IN_FLIGHT_RETRY`, for `cadence::IN_FLIGHT_CHECKS` of them) and every
 //! sibling's dedup window (`checker_skip_for`) key on, so whichever process checks
@@ -33,22 +33,19 @@ struct Receipt {
     current_build: u64,
     source: String,
     outcome: &'static str,
-    /// The channel head whose app build this check found IN FLIGHT (a release
-    /// published source-first, above the last tag the machine authorized —
-    /// `github::app_build_in_flight`), and how many consecutive completed checks of
-    /// this source, machine-wide and WHATEVER BUILD made them, have found that same
-    /// head so. Absent otherwise. Not keyed on the build: after an update the old
-    /// build's session processes and the new build's window both check, and a
-    /// per-build count would keep both on the 2-minute rung.
+    /// The channel head this check found with its app build in flight, and how many
+    /// consecutive completed checks of this source found it so. Not keyed on the build:
+    /// after an update the old build's sessions and the new build's window both check,
+    /// and a per-build count would keep both on the first rung.
     #[serde(skip_serializing_if = "Option::is_none")]
     head_in_flight: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     head_in_flight_checks: Option<u32>,
 }
 
-/// Stamp a completed check. Returns how many consecutive completed checks — this one
-/// included — have found `head_in_flight` in flight (`0` when it is `None`, or when the
-/// receipt could not be written: a count nothing records is no count).
+/// Stamp a completed check. Returns how many consecutive completed checks, this one
+/// included, found `head_in_flight` in flight (`0` when `None` or when the write failed:
+/// a count nothing records is no count).
 pub(crate) fn record(
     staging: &Staging,
     current_build: u64,
@@ -74,10 +71,8 @@ fn record_at(
     head_in_flight: Option<&str>,
     now: u64,
 ) -> u32 {
-    // The run continues only across receipts of this source, of any build, naming
-    // the SAME head: a different head is a different release in flight, and any
-    // completed check that found none ended the run. A failed check writes no
-    // receipt, so it neither counts nor ends the run.
+    // The run continues only across receipts of this source, any build, naming the same
+    // head; a completed check that found none ends it. A failed check writes no receipt.
     let checks = head_in_flight.map(|head| {
         crate::read_ledger_text(&path(staging))
             .and_then(|text| text.parse::<aterm_toml::Value>().ok())
@@ -143,7 +138,7 @@ fn same_source(text: &aterm_toml::Value, source: &Source) -> bool {
             .is_some_and(|recorded| recorded.eq_ignore_ascii_case(&source_key(source)))
 }
 
-/// Operator-facing projection only; authorization uses `matches` plus the receipt.
+/// For display only; authorization uses `matches` and the receipt.
 pub(crate) fn completed_at(staging: &Staging) -> Option<String> {
     let text = crate::read_ledger_text(&path(staging))?;
     let value: aterm_toml::Value = text.parse().ok()?;
@@ -181,8 +176,7 @@ mod tests {
                 for same_build in [false, true] {
                     record_at(&staging, 42, &source("one"), false, None, now - age);
                     let bytes = std::fs::read(path(&staging)).unwrap();
-                    // This is the genuine writer used during AND after a check by
-                    // the apply lane. It must not acquire the check's provenance.
+                    // The apply lane's real status writer must not touch the receipt.
                     crate::status::record(
                         &staging,
                         42,
@@ -223,7 +217,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// THE DEDUP WINDOW MAY NOT OUTLAST THE QUICK WAIT. At the shipped two-minute base
+    /// The dedup window may not outlast the quick wait. At the shipped two-minute base
     /// a completed check 60 s ago skips every checker (the 84 s window). The same
     /// receipt carrying a head in flight sizes the window on the one-minute wait (42 s,
     /// over at 60 s; the negative control: sized on the base, the checker's own
@@ -284,7 +278,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// TWO BUILDS CHECKING WALK ONE LADDER. The count is the source's and the
+    /// The count is the source's and the
     /// head's: interleaved checks of builds 42 and 41 count 1, 2, 3, …, and the one
     /// past `cadence::IN_FLIGHT_CHECKS` has spent the quick waits. Negative controls: a
     /// different source, a different head, and a completed check that found none each

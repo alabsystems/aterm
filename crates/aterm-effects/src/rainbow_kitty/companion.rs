@@ -1,37 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE COMPANION SEAM** — *which* cat, *where* the flying head sits, and
-//! *what* one impulse does to each body.
+//! The companion router: which cat owns the frame, where the flying head sits, and what one
+//! impulse does to each body. Design of record: `RAINBOW-KITTY-V2.md` §7.2 (D13), §6.5 layer
+//! 13, §6.7 (the arrival edge) and §20.1; section references are to that document.
 //!
-//! Design of record: `RAINBOW-KITTY-V2.md` §7.2 ("Kitty — two bodies, one
-//! impulse", **D13**), §6.5 layer 13, §6.7 (the arrival edge), §20.1's two
-//! kitty rows, and the [`CompanionImpulse`] doc on this module's parent.
-//! Section references are to that document.
+//! `rainbow kitty` and bare `kitty` mean the resident pet ([`crate::kitty_pet`]); `… flying` is
+//! the flying head ([`crate::kitty_cursor`]). The pet is the default companion, so it is
+//! first-class in every function here.
 //!
-//! ## Why the companion gets its own file
+//! This module routes and returns values; it does not animate. Nothing here reimplements or
+//! retimes a pose, gait, arc or frame of art: the head's meteor beats are its own receiver
+//! (`CursorCat::on_meteor`), fed the [`Flight`] returned here, and the pet's only coupling is an
+//! offer ([`BodyImpulse::Perk`]).
 //!
-//! The spelling ruling (`GlowStyle::style_names_kitty_pet`, `cursor_glow/style.rs`) is that **`rainbow kitty`
-//! and the bare `kitty` mean the RESIDENT PET** ([`crate::kitty_pet`]);
-//! `… flying` is the rare, earned flying head ([`crate::kitty_cursor`]). The
-//! pet is therefore the DEFAULT companion of the very style v2 replaces, and a
-//! v2 that only drove the flying head would silently delete the cat most users
-//! actually see. Owner, today: *"make sure that we also have the kitty pet,
-//! too."* So the routing lives here, in one small pure module, and the PET is
-//! first-class in every function below.
+//! Both render arms (single pane and split, each with its own geometry and ink probe) reach it
+//! through `EffectsPipeline::route_flying_head`, which runs [`body_for`], [`impulse_for`] and
+//! [`placement`] in `duty`'s order. On a horizontal [`BodyImpulse::Fly`] it rebases the
+//! placement follower so the next placement snaps to [`Flight::land`] and, when the head
+//! animates, hands it the meteor. The resident pet is fed by `CompanionOwner::prepare`, never by
+//! this module, and takes the perk edge through `Engine::pet_offer` → `PetBrain::note_v2_offer`
+//! (`EffectsPipeline::offer_pet_v2`).
 //!
-//! ## What this module is, and is not
+//! The four laws:
 //!
-//! It is the **router**. It decides the body, the flying head's seat and the
-//! impulse, and it returns values. It is **not** the animator:
-//! [`crate::kitty_pet`] and [`crate::kitty_cursor`] are owner-tuned, and the
-//! meteor's beats are the head's own receiver (`CursorCat::on_meteor`), fed
-//! the [`Flight`] this module returns. Nothing here reimplements a pose, a
-//! gait, an arc or a frame of art, and nothing here retimes one. D13 is explicit that the pet's
-//! crouch/coil/pounce is untouched, and this file's only coupling to it is an
-//! **offer** ([`BodyImpulse::Perk`]).
+//! * L-A, one body per frame: [`body_for`] returns exactly one [`Body`], and [`Body::None`]
+//!   when [`CompanionAdmission::body_claimed`] (`WordDecorations::claim_companion_body`) says
+//!   the frame's body is taken, so exclusivity holds before either animator draws.
+//! * L-B, the host's [`CompanionDuty`] (from `cursor_companion_duty`) decides the body; v2
+//!   re-derives none of it, so a body the host is not drawing is never routed an impulse.
+//! * L-C, one impulse, two readings: the flying head takes the meteor whole (teleport, spine
+//!   impulse, whip, squash on the arrival edge); the pet is offered the arrival edge as a perk
+//!   and never teleports (§22).
+//! * L-D, the flying head never covers the cell being typed into whenever the grid is wide
+//!   enough for the footprint on either side ([`placement`]). The pet seats itself
+//!   (`PetBrain::tick`); a v2 meteor does not relocate it (§7.2(b)).
 //!
-//! ## WIRING
+//! The shipped seat (`kitty_cursor_footprint`) is a fixed lead, the body's left edge ¾ cell
+//! past the caret cell's right edge, ~6 cells wide and drawn `OverText`: right at the end of a
+//! line, an eraser mid-line. [`placement`] takes that footprint as handed in as step 1 and adds
+//! the yields.
 //!
 //! Both host render arms reach this router through ONE seam,
 //! [`crate::pipeline::EffectsPipeline::route_flying_head`] — the single-pane
@@ -115,35 +123,19 @@ use crate::word_decorations::CatFootprint;
 use super::timing;
 use super::{CompanionImpulse, Dir};
 
-// ===========================================================================
-// 1. The constants (§7.2's beat table)
-// ===========================================================================
-
-/// **`disp = max(disp, 0.97)`** — the flying head's frame-0 spine impulse
-/// (§7.2, row "Spine impulse"), applied DIRECTLY and bypassing the head's own
-/// `DISP_TAU 0.13` follower.
-///
-/// Why 0.97 and not 1.0: the head's bank runs `BANK_LO 0.32 / HI 0.96`, so
-/// 0.97 is the first value that puts the bank fully on with a hair of headroom
-/// left, and a value at the rail would make a subsequent earned peak invisible.
-/// Why bypass the follower at all: T2. A follower that eases to 0.97 over
-/// 130 ms banks the cat two frames after the meteor has already landed, which
-/// is exactly the lag tell v2 exists to delete.
+/// `disp = max(disp, 0.97)`: the flying head's frame-0 spine impulse (§7.2, row "Spine
+/// impulse"), applied directly, bypassing the head's `DISP_TAU 0.13` follower, which would bank
+/// the cat two frames after the meteor landed. 0.97 puts the bank (`BANK_LO 0.32 / HI 0.96`)
+/// fully on with headroom, so a later earned peak still shows.
 pub const FLYING_DISP_FLOOR: f32 = 0.97;
 
-/// **`lead = −0.30` cell at `t = 0`** (§7.2, row "Whip") — the flying head is
-/// yanked backwards on the frame the caret teleports.
-///
-/// Negative because it is measured AGAINST travel: the cat did not choose to
-/// go, it was pulled, and the body arrives before the pose does. This is the
-/// one place in the theme where a mark starts behind where it will settle, and
-/// it is legal under T3 because the mark is already at full brightness — only
-/// its offset moves.
+/// `lead = −0.30` cell at `t = 0` (§7.2, row "Whip"): the flying head is yanked back against
+/// travel on the frame the caret teleports. Legal under T3 because the mark is already at full
+/// brightness; only its offset moves.
 pub const FLYING_LEAD_0: f32 = -0.30;
 
-/// **`LEAD_MAX = +0.22`** cell — the flying head's resting lead once the whip
-/// has settled (§7.2). The head leans into travel at rest, which is what makes
-/// a stationary cat still read as "going that way".
+/// `LEAD_MAX = +0.22` cell: the flying head's resting lead once the whip has settled (§7.2),
+/// so a stationary cat still reads as going that way.
 pub const FLYING_LEAD_MAX: f32 = 0.22;
 
 /// The 1-px look-back toward the launch lasts **250 ms** after arrival (§7.2,
@@ -154,13 +146,8 @@ pub const FLYING_LEAD_MAX: f32 = 0.22;
 /// hold the frame open for a clock it does not own.
 pub const FLYING_LOOKBACK_MS: f32 = 250.0;
 
-/// The squint holds **200 ms** past the arrival edge (§7.2, row "Eyes":
-/// "squint during flight + 200 ms").
+/// The squint holds 200 ms past the arrival edge (§7.2, row "Eyes").
 pub const FLYING_SQUINT_TAIL_MS: f32 = 200.0;
-
-// ===========================================================================
-// 2. Which body (§7.2, D13; the host's CompanionDuty)
-// ===========================================================================
 
 /// Which body owns this frame. L-A's exclusivity is the enum itself: no
 /// variant means "both".
@@ -169,45 +156,33 @@ pub enum Body {
     /// The resident pet ([`crate::kitty_pet`]): the default, and what
     /// `rainbow kitty` / `kitty` / `rainbow kitty pet` mean. It seats itself.
     Pet,
-    /// The flying head ([`crate::kitty_cursor`]): `rainbow kitty flying`, the
-    /// bare `nyan` / `rainbow` aliases, and the pet-mode sing-along's singing
-    /// face.
+    /// The flying head ([`crate::kitty_cursor`]): `rainbow kitty flying` and the bare
+    /// `nyan` / `rainbow` aliases.
     Flying {
-        /// The caret cell the head escorts this frame (the host's
-        /// `CompanionDuty::FlyingHead { cell }`), so seat and snap-to resolve
-        /// against one cell.
+        /// The caret cell the head escorts this frame (`CompanionDuty::FlyingHead { cell }`),
+        /// so seat and snap-to resolve against one cell.
         cell: (u16, u16),
     },
-    /// No companion this frame: not an error or a fade; the previous body keeps
-    /// whatever exit its own animator gives it.
+    /// No companion this frame; the previous body keeps whatever exit its own animator gives it.
     None,
 }
 
-/// What the host already decided about companions.
-///
-/// `duty` is the host's custody rule (`cursor_companion_duty`), which folds
-/// the opt-in, presentability, serious mode, the spelling
-/// (`GlowStyle::style_names_any_pet`: pet mode admits the pet, never the
-/// flying head), the sing-along drive, the shed envelope and caret visibility
-/// into one value. Taking that value rather than its inputs keeps this file
-/// from redefining it.
+/// What the host already decided about companions. `duty` is the host's resolved custody
+/// (`cursor_companion_duty`); taking it rather than its inputs keeps this file from redefining
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompanionAdmission {
     /// The host's resolved companion custody for this frame.
     pub duty: CompanionDuty,
     /// Another producer already claimed this frame's single companion body
-    /// (`WordDecorations::claim_companion_body`, `word_decorations.rs:4002`).
+    /// (`WordDecorations::claim_companion_body`).
     pub body_claimed: bool,
 }
 
-/// Which body: the host's [`CompanionDuty`] with the claim applied (L-A, L-B).
-///
-/// 1. The claim: a frame whose single body is taken gets nothing.
-/// 2. The duty: `Idle` ⇒ nothing; `Pet` ⇒ the pet; `FlyingHead { cell }` ⇒ the
-///    head, escorting `cell`.
-///
-/// No taste knob (intensity, duration, theme, reduced motion) may delete a
-/// companion; this function has no [`super::Config`] input.
+/// Which body: nothing when the frame's body is claimed, else the host's [`CompanionDuty`]
+/// (`Idle` ⇒ none, `Pet` ⇒ the pet, `FlyingHead { cell }` ⇒ the head escorting `cell`). No
+/// taste knob (intensity, duration, theme, reduced motion) may delete a companion, so this
+/// takes no [`super::Config`].
 #[must_use]
 pub fn body_for(admitted: CompanionAdmission) -> Body {
     if admitted.body_claimed {
@@ -219,10 +194,6 @@ pub fn body_for(admitted: CompanionAdmission) -> Body {
         CompanionDuty::FlyingHead { cell } => Body::Flying { cell },
     }
 }
-
-// ===========================================================================
-// 3. What the impulse means to that body (§7.2, D13; §6.7's arrival edge)
-// ===========================================================================
 
 /// The two poses both bodies already own, unchanged by v2 (§7.2: "Delight /
 /// Wince / Oops are unchanged"), plus the bare landing.
@@ -236,12 +207,10 @@ pub enum Reaction {
     Delight,
 }
 
-/// THE FLYING HEAD'S MOVE, resolved — §7.2(a)'s beat table (Teleport, Spine
-/// impulse, Whip, Facing, Eyes, Landing squash) **as data**. The route applies
-/// the teleport ([`Flight::land`], via the placement follower's rebase); the
-/// facing is the animator's own existing bank, which nothing reads from here;
-/// the spine floor, the whip, the squint and the landing squash are the
-/// animator's (`CursorCat::on_meteor`), read off this value (see WIRING).
+/// The flying head's move: §7.2(a)'s beat table as data. The route applies the teleport
+/// ([`Flight::land`], via the placement follower's rebase); facing is the animator's existing
+/// bank; the spine floor, whip, squint and landing squash are read off this value by
+/// `CursorCat::on_meteor`.
 ///
 /// Minted for every credited spawn: a same-row jump at or past
 /// `timing::JUMP_MIN_CELLS` (8 cells), and the Return-licensed vertical
@@ -255,9 +224,8 @@ pub struct Flight {
     pub dir: Dir,
     /// The spawn edge. `t = 0` of every curve below.
     pub t0: Instant,
-    /// The arrival edge `t₀ + T` (§6.7), read by the pin, ring, fan, flash and
-    /// audio bell; the landing squash lands on it too. Derived once by
-    /// [`arrival`].
+    /// The arrival edge `t₀ + T` (§6.7), from [`arrival`]: read by the pin, ring, fan, flash,
+    /// audio bell and landing squash.
     pub land_at: Instant,
     /// The snap-to: the landing cell, i.e. the caret the head escorts on the
     /// frame the impulse was minted (the frame the caret was first observed
@@ -275,10 +243,9 @@ impl Flight {
         FLYING_DISP_FLOOR
     }
 
-    /// The whip in cells at `now`: [`FLYING_LEAD_0`] springing to
-    /// [`FLYING_LEAD_MAX`] on [`timing::spring_whip`] (ω 24 rad/s, ζ 0.6, so it
-    /// overshoots before settling ≈ 180 ms in). A pure function of `now − t₀`,
-    /// so every refresh rate shows the same lean at the same wall time.
+    /// The whip in cells at `now`: [`FLYING_LEAD_0`] springing to [`FLYING_LEAD_MAX`] on
+    /// [`timing::spring_whip`] (overshoots, settled ≈ 180 ms in). A pure function of
+    /// `now − t₀`, so every refresh rate shows the same lean at the same wall time.
     #[must_use]
     pub fn lead_at(&self, now: Instant) -> f32 {
         let age = now.saturating_duration_since(self.t0).as_secs_f32();
@@ -305,30 +272,21 @@ impl Flight {
 /// [`CompanionImpulse`] into for the body that owns the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyImpulse {
-    /// The FLYING head's meteor, whole: teleport, spine impulse, whip, squash
-    /// on [`Flight::land_at`].
+    /// The flying head's meteor, whole: teleport, spine impulse, whip, squash on
+    /// [`Flight::land_at`].
     Fly(Flight),
-    /// The pet's offer, and all of it (§7.2(b), D13): `at` is the meteor's
-    /// arrival edge `t₀ + T`, offered as its `PERK_HOLD` edge. An offer, not a
-    /// command, carrying nothing else:
-    ///
-    /// * no placement: a meteor does not relocate the pet;
-    /// * no spine impulse: the pet's chase runs on its own `vhat` estimator,
-    ///   and a second integrator would retime `RHYTHM_MOVES`/`LEAD_TIME`;
-    /// * no retiming: `POUNCE_JUMP 6` → `PERK_HOLD 0.30` → `CROUCH_DUR 0.10` →
-    ///   scaled coil → `clamp(0.021·cells, 0.16, 0.42)` flight, and the
-    ///   big-jump show at `BIG_JUMP_COLS 24`, are unchanged.
-    ///
-    /// The receiver is `PetBrain::note_v2_offer`, via `Engine::pet_offer`'s
-    /// `perk_at`. The pet never teleports on a long jump; it keeps its pounce.
+    /// The pet's whole share (§7.2(b), D13): the meteor's arrival edge `t₀ + T`, offered as its
+    /// `PERK_HOLD` edge. No placement (a meteor does not relocate the pet), no spine impulse
+    /// (the chase runs on its own `vhat` estimator; a second would retime `RHYTHM_MOVES` and
+    /// `LEAD_TIME`), and no retiming of the pounce. The receiver is `PetBrain::note_v2_offer`,
+    /// via `Engine::pet_offer`'s `perk_at`.
     Perk {
         /// The arrival edge `t₀ + T`, offered.
         at: Instant,
     },
-    /// A pose both bodies already own, handed over as an EDGE.
+    /// A pose both bodies already own, handed over as an edge.
     React(Reaction),
-    /// This impulse means nothing to this body — including every impulse when
-    /// no body owns the frame.
+    /// This impulse means nothing to this body (every impulse, when no body owns the frame).
     Ignore,
 }
 
@@ -367,8 +325,7 @@ pub fn impulse_for(body: Body, impulse: CompanionImpulse) -> BodyImpulse {
     }
 }
 
-/// The arrival edge `t₀ + T` (§6.7), derived once here so the squash and the
-/// perk offer agree on the landing frame.
+/// The arrival edge `t₀ + T` (§6.7), derived once so the squash and the perk offer agree.
 fn arrival(t0: Instant, t_flight: std::time::Duration) -> Instant {
     t0.checked_add(t_flight).unwrap_or(t0)
 }
@@ -386,10 +343,6 @@ pub fn heroes_earned(impulse: CompanionImpulse) -> u8 {
     }
 }
 
-// ===========================================================================
-// 4. Where the flying head sits (§6.5 layer 13), and the occlusion fix
-// ===========================================================================
-
 /// Which side of the caret the body took, by the body's centre against the
 /// caret cell's centre.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,7 +358,7 @@ pub enum Side {
 /// and `FreeSprite` use them, not window-absolute; the host adds the pad.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Seat {
-    /// Sprite LEFT edge, grid-interior px.
+    /// Sprite left edge, grid-interior px.
     pub x: i32,
     /// Sprite top edge, grid-interior px: the shipped footprint's `y` (bob and
     /// boundary rise included) moved by whole rows, so a row-1 sky seat may hang
@@ -415,8 +368,7 @@ pub struct Seat {
     pub w: u16,
     /// Sprite height in px, as the baker sized it.
     pub h: u16,
-    /// [`Self::x`] read in fractional grid columns — DERIVED from `x` after
-    /// every clamp, never a second position.
+    /// [`Self::x`] in fractional grid columns, derived after every clamp.
     pub col: f32,
     /// The grid row the body sits on, already lifted.
     pub row: u16,
@@ -450,10 +402,8 @@ pub struct SeatQuery {
     pub held_sky: bool,
 }
 
-/// The seat rule (§6.5 layer 13): where the flying head sits so it never
-/// covers the cell being typed into and never covers ink it could avoid (L-D).
-///
-/// Steps, in order:
+/// The seat rule (§6.5 layer 13): whenever the grid is wide enough for either side, the flying
+/// head never covers the cell being typed into, nor ink it could avoid (L-D). In order:
 ///
 /// 1. Ahead: [`SeatQuery::rest`], the shipped footprint, when every cell it
 ///    spans is blank (the usual end-of-line case).
@@ -470,21 +420,14 @@ pub struct SeatQuery {
 ///    glided back to it at the line's end and up into the sky at the next key,
 ///    40 px back, 40 px on and a row up within 400 ms (2026-10-20).
 /// 4. Over: no yield cleared the ink, so the body draws over the words with
-///    [`Seat::over_ink`] set: the sky seat on rows ≥ 1; on row 0 the ahead or
-///    behind seat, whichever leaves the caret cell clear; and when the grid is
-///    too narrow for either side, the shipped footprint. The head never
-///    disappears to avoid an occlusion, and there is no under-ink mode (the
-///    head is an `OverText` `FreeSprite`).
+///    [`Seat::over_ink`] set: the sky seat on rows ≥ 1; on row 0 whichever side leaves the
+///    caret clear; the shipped footprint when the grid is too narrow for either. The head
+///    never disappears to avoid an occlusion.
 ///
-/// `ink(row, col)` answers `Some(true)` inked, `Some(false)` blank, `None`
-/// unprobeable. A `None` among probed cells counts as inked. A probe that
-/// answers `None` for every cell of the shipped span is a blind host, which
-/// gets no ink yield: no sky and no over-ink verdict.
-///
-/// Whether the caret cell is covered is arithmetic, not a probe, so that half
-/// of L-D holds for a blind host too: where the margin clamp pushes the
-/// shipped seat onto the caret, it takes the mirror; where neither side clears
-/// it (grid too narrow), it keeps the shipped footprint.
+/// `ink(row, col)` answers `Some(true)` inked, `Some(false)` blank, `None` unprobeable. A
+/// `None` among probed cells counts as inked; `None` for every cell of the shipped span is a
+/// blind host, which gets no ink yield (no sky, no over-ink). Covering the caret cell is
+/// arithmetic, not a probe, so that half of L-D holds for a blind host too.
 #[must_use]
 pub fn placement<F>(caret: (u16, u16), query: &SeatQuery, ink: F) -> Seat
 where
@@ -508,14 +451,17 @@ where
 
     // Step 3 first, where the sky is held or the margin clamp put the shipped
     // seat on the caret, and the sky is clear.
-    let written = (caret_col.saturating_sub(WRITTEN_REACH)..caret_col)
-        .any(|c| ink(caret_row, c) == Some(true));
+    let mut sky_census = None;
     if caret_row > 0
         && ahead.probe != Probe::Blind
-        && (query.held_sky || (ahead.covers_caret && written))
+        && (query.held_sky
+            || (ahead.covers_caret
+                && (caret_col.saturating_sub(WRITTEN_REACH)..caret_col)
+                    .any(|c| ink(caret_row, c) == Some(true))))
     {
         let sky_row = caret_row - 1;
-        if census(rest.x, w, sky_row, caret, cols, cw, &ink).clear() {
+        let sky = census(rest.x, w, sky_row, caret, cols, cw, &ink);
+        if sky.clear() {
             return seat(
                 query,
                 rest.x,
@@ -526,6 +472,7 @@ where
                 false,
             );
         }
+        sky_census = Some(sky);
     }
 
     // Step 2 — the mirror: the body's RIGHT edge `lead_px` before the caret
@@ -534,19 +481,22 @@ where
         .saturating_sub(query.lead_px)
         .saturating_sub(w)
         .clamp(0, (grid_w - w).max(0));
-    let behind = census(behind_x, w, caret_row, caret, cols, cw, &ink);
 
-    // A blind host: the ink yield is off, the caret yield (arithmetic) is on.
-    // Shipped seat where it clears the caret, the mirror where the margin clamp
-    // pushed it onto the caret, the shipped seat when neither clears. Never the
-    // sky, never over-ink.
+    // A blind host keeps the caret yield (arithmetic) but gets no ink yield: never the sky,
+    // never over-ink.
     if ahead.probe == Probe::Blind {
-        return if ahead.covers_caret && !behind.covers_caret {
+        let behind_covers_caret = cols == 0 || {
+            let (b_first, b_last) = cell_span(behind_x, w, cw, cols);
+            (b_first..=b_last).contains(&caret_col)
+        };
+        return if ahead.covers_caret && !behind_covers_caret {
             seat(query, behind_x, rest.y, caret_row, caret_left, 0, false)
         } else {
             seat(query, rest.x, rest.y, caret_row, caret_left, 0, false)
         };
     }
+
+    let behind = census(behind_x, w, caret_row, caret, cols, cw, &ink);
     if behind.clear() {
         return seat(query, behind_x, rest.y, caret_row, caret_left, 0, false);
     }
@@ -556,7 +506,7 @@ where
     if caret_row > 0 {
         let sky_row = caret_row - 1;
         let sky_y = rest.y.saturating_sub(ch);
-        let sky = census(rest.x, w, sky_row, caret, cols, cw, &ink);
+        let sky = sky_census.unwrap_or_else(|| census(rest.x, w, sky_row, caret, cols, cw, &ink));
         return seat(query, rest.x, sky_y, sky_row, caret_left, 1, !sky.clear());
     }
 
@@ -617,22 +567,28 @@ where
         };
     }
     let (first, last) = cell_span(x, w, cw, cols);
-    let mut covers_caret = false;
+    let covers_caret = row == caret.0 && (first..=last).contains(&caret.1);
     let mut inked = false;
     let mut blank = 0_u32;
     let mut unknown = 0_u32;
     for c in first..=last {
         if (row, c) == caret {
-            covers_caret = true;
             continue;
         }
         match ink(row, c) {
-            Some(true) => inked = true,
+            Some(true) => {
+                inked = true;
+                break;
+            }
             Some(false) => blank += 1,
             None => unknown += 1,
         }
+        if unknown > 0 && blank > 0 {
+            inked = true;
+            break;
+        }
     }
-    let probe = if inked || (unknown > 0 && blank > 0) {
+    let probe = if inked {
         Probe::Inked
     } else if unknown > 0 {
         Probe::Blind
@@ -691,64 +647,45 @@ fn seat(
     }
 }
 
-// ===========================================================================
-// 5. The pet and the sky: the resident's receiving end
-// ===========================================================================
-//
-// The pet's coupling stays one-way: three offers riding one per-frame value:
-//
-//   (a) the perk        - `t₀ + T`, the landing pin's instant (D13);
-//   (b) the catch       - a gold m1 born within reach of a settled, contented
-//                         cat; the paw's landing shortens that star's life to
-//                         `stardust::CATCH_FINISH_MS`;
-//   (c) the purr's hue  - the ribbon's field under the cat, so a contented
-//                         resident's ♪/♥ wear the rainbow at its position.
-//
-// Every one is an offer, not light: v2 mints, moves and holds nothing for the
-// pet. A [`PetOffer`] is a pure read of state other producers already own (the
-// impulse slot, the sky's pool, the ribbon's field index), costing one scan of
-// a ≤ 48-slot pool and no wake. The catch spends a star a keystroke made (about
-// one key in 80); if the pet never looks, the star lives out its life.
+// The pet's receiving end. The coupling is one-way: three offers in one per-frame value
+// ([`PetOffer`]): the perk at `t₀ + T` (D13); the catch, a gold m1 born within reach of a
+// settled, contented cat, whose life the paw's landing shortens to `stardust::CATCH_FINISH_MS`;
+// and the purr's hue, the ribbon's field under the cat. v2 mints, moves and holds nothing for
+// the pet: an offer is a pure read of state other producers own, one scan of the ≤ 48-slot
+// star pool and no wake. If the pet never looks, the star lives out its life.
 
-/// The catch's reach, ten columns: how far along its own line a settled cat is
-/// offered a star, from the nearest edge of its body ([`PetOnGlass::span`]).
-/// Vertically, the star must be in the sky of the pet's own row
-/// ([`super::stardust::Star::in_sky_of`]), the strip of glass directly over
-/// the cat.
+/// The catch's reach: how many columns along its line, from the nearest edge of its body
+/// ([`PetOnGlass::span`]), a settled cat is offered a star. Vertically the star must be in the
+/// sky of the pet's own row ([`super::stardust::Star::in_sky_of`]).
 pub const CATCH_REACH_CELLS: f32 = 10.0;
 
-/// The pet as the sky sees it: the facts an offer is resolved against.
-///
-/// Filled from the pet's own last [`PetFrame`] ([`PetOnGlass::of`]), so the sky
-/// reads the cat one frame stale. That keeps it downstream of the pet's brain:
-/// nothing here can retime a pounce.
+/// The pet as the sky sees it, read off its last [`PetFrame`] ([`PetOnGlass::of`]): one frame
+/// stale, which keeps the sky downstream of the pet's brain so nothing here can retime a pounce.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PetOnGlass {
-    /// The body's LEFT edge in fractional grid columns ([`PetFrame::col`],
+    /// The body's left edge in fractional grid columns ([`PetFrame::col`],
     /// after the emitter's own clamps).
     pub col: f32,
     /// The body's width in fractional grid columns.
     pub width: f32,
     /// The grid row the pet's feet are on.
     pub row: u16,
-    /// [`crate::kitty_pet::PetAction::settled`]: at rest on the ground. A cat
-    /// mid-pounce is not offered a star.
+    /// [`crate::kitty_pet::PetAction::settled`]: at rest on the ground. A cat mid-pounce is
+    /// not offered a star.
     pub settled: bool,
-    /// [`PetFrame::purr`]: the purr's intensity, which the pet publishes while
-    /// its tell is up and `0.0` otherwise. Contentment is the pet's verdict
-    /// (its `PURR_GATE`); no second threshold here.
+    /// [`PetFrame::purr`]: the purr's intensity while its tell is up, else `0.0`. Contentment
+    /// is the pet's verdict (its `PURR_GATE`); no second threshold here.
     pub purr: f32,
-    /// [`PetFrame::contented`]: the same ledger over `PURR_GATE`, whatever the
-    /// pose. A key resets the seat on the very frame it mints a star, so the
-    /// tell alone would never see a key-born star.
+    /// [`PetFrame::contented`]: the same ledger over `PURR_GATE`, whatever the pose. A key
+    /// resets the seat on the frame it mints a star, so the tell alone would never see a
+    /// key-born star.
     pub contented: bool,
 }
 
 impl PetOnGlass {
-    /// Read the facts off the pet's published frame. `None` when the pet is not
-    /// on glass (`alpha == 0`) or the cell metrics are degenerate. The body span
-    /// is [`PetFrame::body_px`], the dest rect actually drawn (squash, lift and
-    /// clamps folded in).
+    /// Read off the pet's published frame; `None` when the pet is not on glass (`alpha == 0`)
+    /// or the cell metrics are degenerate. The span is [`PetFrame::body_px`], the dest rect
+    /// actually drawn.
     #[must_use]
     pub fn of(frame: &PetFrame, geom: Geom) -> Option<Self> {
         let cell_w = u16::try_from(geom.cw).ok()?;
@@ -776,18 +713,16 @@ impl PetOnGlass {
         (self.col, self.col + self.width.max(0.0))
     }
 
-    /// The offer gate: a cat is offered a star only while settled and
-    /// contented (the purr tell, or the ledger over the pet's own gate
-    /// whatever the pose; see [`Self::contented`]). Both halves are the pet's
-    /// own verdicts. On the ledger the catch fires for the first slow key after
-    /// any run of thirteen cells.
+    /// The offer gate: settled and contented (the purr tell, or the ledger over the pet's own
+    /// gate whatever the pose), both the pet's own verdicts. On the ledger the catch fires for
+    /// the first slow key after any run of thirteen cells.
     #[must_use]
     pub fn contented(&self) -> bool {
         self.settled && (self.purr > 0.0 || self.contented)
     }
 
-    /// Distance in COLUMNS from the body's nearest edge to grid column `col`
-    /// — `0` for a column the body is standing on.
+    /// Distance in columns from the body's nearest edge to grid column `col`; `0` under the
+    /// body.
     #[must_use]
     pub fn columns_to(&self, col: i32) -> f32 {
         let (lo, hi) = self.span();
@@ -796,10 +731,9 @@ impl PetOnGlass {
     }
 }
 
-/// One star, offered (panel #10(b)): the gold m1 within reach of a contented
-/// cat, named by the triple that identifies it in the sky's pool. The receiver
-/// hands this value back on the paw's landing frame (`Engine::catch_star`), so
-/// no index into a reordering pool is ever published.
+/// One star offered to a contented cat, named by the triple that identifies it in the sky's
+/// pool. The receiver hands it back on the paw's landing frame (`Engine::catch_star`), so no
+/// index into a reordering pool is published.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StarCatch {
     /// The star's home pixel, window-absolute — pinned at birth (§5.4).
@@ -813,32 +747,26 @@ pub struct StarCatch {
 }
 
 /// What v2 offers the resident pet this frame, minted by `Engine::pet_offer`.
-/// Every field is `Option`, and `PetOffer::default()` (all `None`) is what a
-/// frame with no meteor, star or ribbon under the cat produces.
+/// `PetOffer::default()` (all `None`) is a frame with no meteor, star or ribbon under the cat.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PetOffer {
-    /// (a) The perk edge `t₀ + T` (D13), the same `Instant` the landing pin,
-    /// arrival flash, caret flare and audio bell read (§6.7). A settled pet
-    /// perks exactly there, with no relocation. This is [`BodyImpulse::Perk`]'s
-    /// `at`, routed through [`impulse_for`] with [`Body::Pet`]. `None` under
-    /// reduced motion (the impulse is then a [`CompanionImpulse::Land`]) and on
-    /// frames with no live meteor impulse.
+    /// (a) The perk edge `t₀ + T` (D13), the same `Instant` the landing pin, arrival flash,
+    /// caret flare and audio bell read (§6.7): [`BodyImpulse::Perk`]'s `at`. A settled pet perks
+    /// there without relocating. `None` under reduced motion (the impulse is then a
+    /// [`CompanionImpulse::Land`]) and on frames with no live meteor.
     pub perk_at: Option<Instant>,
-    /// **(b) THE STAR** — a gold m1 within [`CATCH_REACH_CELLS`] of a
-    /// contented cat. `None` unless the cat is settled and purring.
+    /// (b) The star: a gold m1 within [`CATCH_REACH_CELLS`] of a contented, settled cat.
     pub catch: Option<StarCatch>,
-    /// (c) The purr's hue: the ribbon's field `t` at the cell under the pet, or
-    /// `None` where no ribbon light is laid, so the cat's ♪/♥ share the colour
-    /// of the caret, ribbon head and star halos there.
+    /// (c) The purr's hue: the ribbon's field `t` at the cell under the pet, `None` where no
+    /// ribbon light is laid, so the cat's ♪/♥ share the colour of the light there.
     pub mote_t: Option<f32>,
-    /// [`Self::mote_t`] resolved to RGB. A mote is a point mark, so it snaps to
-    /// one of the seven stops (`spectrum_snap`) like every other point mark.
+    /// [`Self::mote_t`] resolved to RGB, snapped to one of the seven stops (`spectrum_snap`)
+    /// like every point mark.
     pub mote_rgb: Option<u32>,
 }
 
 impl PetOffer {
-    /// True when this frame offers the pet nothing — the common case, and the
-    /// one-branch early-out a receiver keys on.
+    /// True when this frame offers the pet nothing, the common case.
     #[must_use]
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
@@ -1062,8 +990,7 @@ mod tests {
         assert_eq!(flight.land, (7, 80), "the snap-to is the escorted cell");
         assert!(flight.disp_floor() >= 0.97, "§7.2: disp = max(disp, 0.97)");
 
-        // The pet: an OFFER of the same edge, carrying nothing else. The
-        // variant has exactly one field, which is the law made structural.
+        // The pet: an offer of the same edge and nothing else (the variant's one field).
         let pet = impulse_for(Body::Pet, imp);
         assert_eq!(
             pet,
@@ -1253,11 +1180,9 @@ mod tests {
         assert!(narrow.over_ink);
     }
 
-    /// A blind host (every probe `None`) gets the shipped seat wherever it
-    /// clears the caret, mid-line included, and never the sky or an over-ink
-    /// verdict. The caret half of L-D is arithmetic: at the right margin, where
-    /// the clamp pushes the body over the caret, a blind host takes the mirror
-    /// seat; where neither side clears, the shipped footprint.
+    /// A blind host (every probe `None`) keeps the shipped seat wherever it clears the caret and
+    /// never gets the sky or an over-ink verdict; at the right margin it takes the mirror seat,
+    /// and where neither side clears, the shipped footprint.
     #[test]
     fn an_ink_blind_host_keeps_the_shipped_seat_but_never_the_caret_cell() {
         let blind_probe = |_r: u16, _c: u16| -> Option<bool> { None };
@@ -1323,7 +1248,7 @@ mod tests {
             "too narrow for either side: today's footprint, no over-ink verdict"
         );
 
-        // …but ONE unknowable cell beside probeable ones still counts as inked.
+        // …but one unknowable cell beside probeable ones still counts as inked.
         let mixed = placement((7, 5), &seat_query((7, 5), 120), |r, c| {
             (r != 7 || c != 8).then_some(false)
         });

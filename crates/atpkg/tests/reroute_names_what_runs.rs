@@ -1,23 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE REROUTE NAMES WHAT IT RUNS, end to end through the real `atpkg __reroute` a stub
-//! execs.
+//! End-to-end tests for `atpkg __reroute`: verifies that the signpost names
+//! the resolved compiler (Trust vs. stock) and refuses stock `rustc` inside a
+//! Trust source checkout.
 //!
-//! Replays a recorded bug: after `rustup default trust`, a bare `rustc -vV` in an unpinned
-//! directory ran the Trust seal 7d5533b2 (its `-vV` prints `trust: 0.1.0`), yet the
-//! signpost said "running upstream 'rustc'" — the words it printed over stock 1.97.1. And
-//! inside a Trust source checkout a stock resolution must not run at all: there a stock
-//! compiler would build part of Trust.
-//!
-//! Each case puts ONE fake `rustc` on PATH — a script that answers `-vV` like a Trust or a
-//! stock rustc and prints its arguments otherwise, exiting 3 (not 0, not the reroute's 2 or
-//! 127) — and runs `atpkg __reroute rustc main.rs` from a clean environment under a temp
-//! `HOME`, so the store, the settings and the identity cache are the fixture's.
-//!
-//! The fakes are content-addressed beside the test binary and run once before `atpkg` is,
-//! so a first exec's `syspolicyd` assessment of a freshly written file (seconds under load,
-//! `atpkg::reroute`'s test notes) is paid here, never inside the resolution's probe bound.
+//! Each case places a fake `rustc` (and optionally `cargo`) on `PATH` under a
+//! temporary `HOME`. Fakes are content-addressed beside the test binary and
+//! warmed once with `-vV` so `syspolicyd`'s first-exec assessment happens
+//! outside the reroute's probe timeout.
 
 #![cfg(unix)]
 #![allow(
@@ -402,12 +393,9 @@ fn a_process_the_copy_leaves_behind_never_holds_the_command() {
     assert_eq!(status.code(), Some(RAN_EXIT), "{stderr}");
 }
 
-/// A STOCK COMPILER SPAWNED BY NAME BENEATH AN ALLOWED TRUST CARGO IS JUDGED. Replays a
-/// recorded bug: inside a Trust checkout the `rustc +1.97.1` an allowed Trust cargo's
-/// subcommand spawned by name ran stock with no line, because the reroute handed the
-/// allowed cargo the ESCAPE marker; typed alone, it was refused. End to end through the
-/// real stubs and the real `atpkg`: the child is refused there (and cargo fails with its
-/// exit), runs unannounced anywhere else, and the escape still runs everything.
+/// A stock `rustc` spawned by name beneath an allowed Trust `cargo` is still
+/// judged and refused inside a Trust checkout, runs unannounced outside one,
+/// and is bypassed under `PASSTHROUGH_ENV`.
 #[test]
 fn a_stock_rustc_a_trust_cargo_spawns_by_name_is_judged_in_a_trust_checkout() {
     let fx = Fixture::new("child", "rustc-wrapper", WRAPPER_RUSTC);
@@ -476,10 +464,9 @@ fn a_stock_rustc_a_trust_cargo_spawns_by_name_is_judged_in_a_trust_checkout() {
     assert_eq!(code, Some(RAN_EXIT));
 }
 
-/// NO STORE IS NO WAY ROUND THE CHECKOUT (a recorded bug): with `HOME` unset
-/// — an `env -i` wrapper — no package store resolves, and a stock `rustc` two levels inside
-/// a Trust checkout ran under "running upstream 'rustc'". It is resolved and judged as with
-/// a store: refused there, named STOCK elsewhere, and Trust runs in the checkout.
+/// With `HOME` unset (and `PASSWD_FILE_SEAM` empty so no store resolves), a
+/// stock `rustc` inside a Trust checkout is still refused, named STOCK outside
+/// one, and Trust runs in the checkout.
 #[test]
 fn with_no_store_a_stock_rustc_in_a_trust_checkout_is_refused() {
     // `HOME` unset leaves no home only for an account the passwd file does not list

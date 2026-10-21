@@ -5,12 +5,10 @@
 //! (the menu bar badges it). Nothing is mailed: a manager waits on the
 //! worker's task record, whose `attention=` this entry raises (`await task`).
 //!
-//! The attention text says what the person is asked: `<program> <kind>:
-//! <command, path or question, cut at 64 cells> (<why no rule answered it>)`,
-//! within the server's 200 bytes for a keyed entry, the reason cut with its
-//! closing `)` kept. A box with no command, path or question is named by its
-//! own first row ([`prompt_box_first_row`]). Every part is on one line and cut
-//! by terminal cells ([`cut_cells`]). A limit keeps `limited: <message>`.
+//! The attention reads `<program> <kind>: <subject, cut at 64 cells> (<why no rule answered>)`
+//! on one line, cut by terminal cells ([`cut_cells`]) to the server's 200 bytes for a keyed
+//! entry with the reason's closing `)` kept; a box with no command, path or question is named
+//! by its own first row ([`prompt_box_first_row`]). A limit's reads `limited: <message>`.
 //!
 //! The attention is keyed: this loop writes and clears only its own entry
 //! (`meta set|unset attention owner=supervisor`), never the bare form, which
@@ -53,12 +51,10 @@ fn trust_path(rows: &[String]) -> Option<&str> {
         .find(|r| !r.is_empty())
 }
 
-/// The question a dialog asks above the rows the box parser reads as the box
-/// (the parser starts at the rule over `4. Chat about this`). A fallback for a
-/// dialog aterm-phase did not read whole (form `Unknown`;
-/// [`aterm_phase::QuestionDialog::question`] otherwise): the nearest row ending
-/// in `?` above `first`, over rules and option rows, stopping at the
-/// transcript (a `⏺` row or a user's `❯` row that is not an option's cursor).
+/// The question above the rows the box parser reads as the box, for a dialog aterm-phase did not
+/// read whole (form `Unknown`; else [`aterm_phase::QuestionDialog::question`]): the nearest row
+/// ending in `?` above `first`, stopping at the transcript (a `⏺` row, or a `❯` row that is not
+/// an option's cursor).
 fn question_above(rows: &[String], first: usize) -> Option<&str> {
     for r in rows[first.saturating_sub(30)..first].iter().rev() {
         let t = r.trim();
@@ -195,9 +191,8 @@ fn kind_and_subject_read(reader: &dyn ScreenReader, point: &Turn) -> (String, St
     }
 }
 
-/// `<program> <kind>: <subject>`, the subject cut at 64 cells: what names a
-/// point in its attention, whatever the reason — the program its reader's
-/// (`claude`, `codex`).
+/// `<program> <kind>: <subject>`, the subject cut at 64 cells: how an attention names its
+/// point. The program is the reader's (`claude`, `codex`).
 pub(crate) fn point_label(reader: &dyn ScreenReader, point: &Turn) -> String {
     let (kind, subject) = kind_and_subject(reader, point);
     format!(
@@ -207,15 +202,12 @@ pub(crate) fn point_label(reader: &dyn ScreenReader, point: &Turn) -> String {
     )
 }
 
-/// `<program> <kind>: <subject> (<reason>)` ([`point_label`]), the reason
-/// cut at 120 cells and then to what the label leaves of the server's
-/// [`ATTENTION_BYTES`], `…` where it was cut and its `)` kept, so the whole
-/// is always one entry the server takes.
+/// `<program> <kind>: <subject> (<reason>)` ([`point_label`]), the reason cut at 120 cells and
+/// then to what the label leaves of [`ATTENTION_BYTES`], `…` where it was cut and its `)` kept.
 ///
-/// A resume line the reason names (`…, then resume with claude … --resume
-/// <id>`) is never cut: kept whole, else in its bare form, else dropped with
-/// its clause ([`crate::harness::resume::never_cut`]); a cut id names no
-/// conversation.
+/// A resume line in the reason (`…, then resume with claude … --resume <id>`) is never cut: kept
+/// whole, else in its bare form, else dropped with its clause
+/// ([`crate::harness::resume::never_cut`]); a cut id names no conversation.
 pub(crate) fn attention_text(reader: &dyn ScreenReader, point: &Turn, reason: &str) -> String {
     let label = point_label(reader, point);
     crate::harness::resume::never_cut(reason, |reason| fit_reason(&label, reason))
@@ -223,17 +215,22 @@ pub(crate) fn attention_text(reader: &dyn ScreenReader, point: &Turn, reason: &s
 
 /// `<label> (<reason>)`, the reason cut to fit ([`attention_text`]).
 fn fit_reason(label: &str, reason: &str) -> String {
-    let reason = clip_to(reason, REASON_CELLS);
     let room = ATTENTION_BYTES.saturating_sub(label.len() + " ()".len());
-    let reason = if reason.len() <= room {
-        reason
-    } else {
-        let mut cut = fit_bytes(&reason, room.saturating_sub('…'.len_utf8()));
-        cut.truncate(cut.trim_end_matches('…').len());
-        cut.push('…');
-        cut
-    };
+    let reason = clip_bytes(clip_to(reason, REASON_CELLS), room);
     fit_bytes(&format!("{label} ({reason})"), ATTENTION_BYTES)
+}
+
+/// `s` within `room` bytes, cut at a character boundary with `…` (one `…`,
+/// never two) where it did not fit: what aterm's own words around it leave
+/// of [`ATTENTION_BYTES`], so the cap never falls in those words.
+fn clip_bytes(s: String, room: usize) -> String {
+    if s.len() <= room {
+        return s;
+    }
+    let mut cut = fit_bytes(&s, room.saturating_sub('…'.len_utf8()));
+    cut.truncate(cut.trim_end_matches('…').len());
+    cut.push('…');
+    cut
 }
 
 /// The cap a refusal names (`ERR attention too long (max <n> bytes)`), when
@@ -412,12 +409,10 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// This loop's own attention entry unset (`meta unset attention
-    /// owner=supervisor`) when `ours` says its text is the kind being
-    /// closed: the unset's reply word, `kept` when the entry holds another
-    /// kind (a box badge over a limit's), `none` when the loop holds no entry.
-    /// Another writer's entry is never touched. (`meta set attention ''` is a
-    /// usage error, so the clear is `meta unset`.)
+    /// Unset this loop's own attention entry (`meta unset attention owner=supervisor`) when
+    /// `ours` says its text is the kind being closed. Returns the unset's reply word, `kept` when
+    /// the entry holds another kind (a box badge over a limit's), `none` when the loop holds no
+    /// entry. `meta set attention ''` is a usage error, so the clear is `meta unset`.
     pub(super) fn unset_if_ours(&mut self, ours: fn(&str) -> bool) -> Result<String, Fail> {
         Ok(match self.attention_ours.as_deref() {
             Some(text) if ours(text) => {
@@ -466,11 +461,10 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// A limit's badge adopted from a previous loop ([`Session::adopted_limit`])
-    /// is taken down while it is still this loop's entry, its marker
-    /// untouched: journaled as an episode's close is, `CLEARED seq=<n>
-    /// attention=<said> <why>`. Nothing while the entry is no `limited:` badge
-    /// of the loop's (an episode's close took it down already).
+    /// Take down a limit's badge adopted from a previous loop ([`Session::adopted_limit`]) while it
+    /// is still this loop's entry, leaving the marker set; journaled as an episode's close is,
+    /// `CLEARED seq=<n> attention=<said> <why>`. Nothing when the entry holds no `limited:` badge
+    /// (an episode's close took it down already).
     pub(super) fn lower_adopted_limit(
         &mut self,
         seq: u64,
@@ -536,20 +530,22 @@ pub(super) fn kinds_name_owner(kinds: &str, owner: &str) -> bool {
 /// <first need, cut at 64 cells>[ (+N more)] — carrying on`, on one line and
 /// within the server's keyed cap ([`ATTENTION_BYTES`]). aterm's own words
 /// around the worker's; the need itself is the worker's line, sanitized and
-/// cut by the policy (`policy::needs::needs_you`) and here by cells.
+/// cut by the policy (`policy::needs::needs_you`) and here by cells, then
+/// to the bytes the frame leaves of the cap ([`clip_bytes`]): 64 cells of a
+/// script whose letters take three bytes (Devanagari, Thai) outrun it, and
+/// the cap then falls in the need, never in the count or ` — carrying on`,
+/// which the window reads the need back by (`aterm-gui`'s `need_words`).
 pub(super) fn needs_attention_text(program: &str, needs: &[String]) -> String {
     let first = needs.first().map_or("", String::as_str);
     let more = match needs.len() {
         0 | 1 => String::new(),
         n => format!(" (+{} more)", n - 1),
     };
-    fit_bytes(
-        &format!(
-            "{program} needs you: {}{more} — carrying on",
-            clip_to(first, SUBJECT_CELLS)
-        ),
-        ATTENTION_BYTES,
-    )
+    let head = format!("{program} needs you: ");
+    let tail = format!("{more} — carrying on");
+    let room = ATTENTION_BYTES.saturating_sub(head.len() + tail.len());
+    let need = clip_bytes(clip_to(first, SUBJECT_CELLS), room);
+    fit_bytes(&format!("{head}{need}{tail}"), ATTENTION_BYTES)
 }
 
 impl<C: Ctl> Session<'_, C> {
@@ -573,6 +569,16 @@ impl<C: Ctl> Session<'_, C> {
     /// this loop neither writes nor unsets that owner's entry there. A
     /// request the connection lost is asked again at the next point; any
     /// other reply is the set told.
+    ///
+    /// THE WINDOW HEARS THE WHOLE SET FIRST (§12.2.3): before each `meta
+    /// set` — the first and the one a cap's refusal sends cut — the host is
+    /// told the set and that request's exact text ([`Self::tell_needs`]), so
+    /// the words are stored where the entry lands before it lands. Where the
+    /// set standing is the one this loop holds up and a request the
+    /// connection lost since left the window told otherwise (an `unset`'s
+    /// take-down, another set's words, each told before its request), the
+    /// window is told that set again with the text it was put up with, and
+    /// no request is sent ([`Self::retell_standing`]).
     pub(super) fn sync_needs(
         &mut self,
         screen: &Screen,
@@ -592,7 +598,11 @@ impl<C: Ctl> Session<'_, C> {
             };
             return self.needs_down(seq, why, review);
         }
-        if self.needs_told == Some(key) || self.autopilot(opts) == Autopilot::Off {
+        if self.needs_told == Some(key) {
+            self.retell_standing(key);
+            return Ok(());
+        }
+        if self.autopilot(opts) == Autopilot::Off {
             return Ok(());
         }
         let needs = self.turn_end.standing_needs().to_vec();
@@ -600,15 +610,18 @@ impl<C: Ctl> Session<'_, C> {
         let mut text = needs_attention_text(program, &needs);
         let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
         let kind = format!("kind={}", aterm_types::needs::AttentionKind::Ask.word());
+        self.tell_needs(key, &needs, &text);
         let mut r = self.call(&["meta", "set", "attention", &owner, &kind, &text])?;
         if let Some(cap) = refused_cap(&r, &text) {
             text = fit_bytes(&text, cap);
+            self.tell_needs(key, &needs, &text);
             r = self.call(&["meta", "set", "attention", &owner, &kind, &text])?;
         }
         if r.lost() {
             return Ok(());
         }
         self.needs_told = Some(key);
+        self.needs_told_text = text;
         let first = needs.first().map_or("", String::as_str);
         review.note(&format!(
             "{NEEDS} seq={seq} count={} attention={} {}",
@@ -627,7 +640,10 @@ impl<C: Ctl> Session<'_, C> {
     /// supervisor's claim nothing is unset ([`Session::needs_not_ours`]:
     /// that owner's entry may be the self-claim's own, an Off park's
     /// given-back claim and the loop's end included): the loop only forgets
-    /// its set.
+    /// its set, and the window forgets with it — told `(&[], "")` where it
+    /// was told any of this loop's words, with no request sent, so it keeps
+    /// none for an entry this loop no longer holds. Else the window hears
+    /// `(&[], "")` before the unset ([`Self::tell_needs`]).
     pub(super) fn needs_down(
         &mut self,
         seq: u64,
@@ -639,19 +655,70 @@ impl<C: Ctl> Session<'_, C> {
         }
         if self.needs_not_ours() {
             self.needs_told = None;
+            self.needs_told_text.clear();
+            if self.needs_heard.is_some() {
+                self.tell_needs(0, &[], "");
+            }
             return Ok(());
         }
+        self.tell_needs(0, &[], "");
         let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
         let r = self.call(&["meta", "unset", "attention", &owner])?;
         if r.lost() {
             return Ok(());
         }
         self.needs_told = None;
+        self.needs_told_text.clear();
         review.note(&format!(
             "CLEARED seq={seq} {CLEARED_NEEDS} attention={} {why}",
             reply_word(&r)
         ));
         Ok(())
+    }
+
+    /// THE WINDOW TOLD THE NEEDS SET (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+    /// §12.2.3, [`IdleHost::needs_standing`]): `needs` and `entry`, the text
+    /// of the request about to be sent (`(&[], "")` before an unset), under
+    /// the set's `key` — where the key or the text differs from what the
+    /// host was last told ([`Session::needs_heard`]), and only there, so a
+    /// request the connection lost and the next point sends again tells
+    /// nothing twice. Called just before that request, so the host hears
+    /// first. With no host (a CLI `watch`), nothing.
+    fn tell_needs(&mut self, key: u64, needs: &[String], entry: &str) {
+        let Some(host) = &self.stall_host else {
+            return;
+        };
+        if self.needs_heard_as(key, entry) {
+            return;
+        }
+        host.needs_standing(needs, entry);
+        self.needs_heard = Some((key, entry.to_string()));
+    }
+
+    /// Whether the window's host was last told `key`'s set with `entry`
+    /// ([`Session::needs_heard`]).
+    fn needs_heard_as(&self, key: u64, entry: &str) -> bool {
+        self.needs_heard
+            .as_ref()
+            .is_some_and(|(k, told)| *k == key && told == entry)
+    }
+
+    /// THE WINDOW TOLD AGAIN WHAT STANDS ([`Self::sync_needs`]): the set
+    /// standing is `key`'s, the one this loop holds up ([`Session::needs_told`]),
+    /// so no request is sent — yet a request the connection lost since may
+    /// have left the window told otherwise, each told before its request: an
+    /// `unset`'s take-down whose entry still stands, or another set's words
+    /// whose `meta set` never landed. There, and only there, the window is
+    /// told the standing set again with the text it was put up with
+    /// ([`Session::needs_told_text`], cut where a cap's refusal cut it).
+    /// Where it heard just that, nothing.
+    fn retell_standing(&mut self, key: u64) {
+        if self.stall_host.is_none() || self.needs_heard_as(key, &self.needs_told_text) {
+            return;
+        }
+        let needs = self.turn_end.standing_needs().to_vec();
+        let entry = self.needs_told_text.clone();
+        self.tell_needs(key, &needs, &entry);
     }
 }
 
@@ -717,10 +784,8 @@ mod tests {
         assert!(t.starts_with("claude rm-breaker: "), "{t}");
     }
 
-    /// Claude Code's question tool (AskUserQuestion) as drawn: the question,
-    /// its options, a rule, `4. Chat about this` and the footer. The badge
-    /// names the question, not `4. Chat about this`. Negative control: a `?`
-    /// row in the transcript above a user's message is never taken.
+    /// A question dialog's badge names its question, never `4. Chat about this`. Control: a `?`
+    /// row in the transcript above it is never taken.
     #[test]
     fn a_question_dialogs_badge_names_its_question() {
         let rule = "─".repeat(120);
@@ -786,14 +851,35 @@ mod tests {
         assert!(t.contains('…'));
     }
 
-    /// The memory wall's escalation never cuts its resume line. Built the way
-    /// the loop builds it (a long flag set, a 64-cell subject, and again
-    /// behind a failed restart's prefix), the stored attention names the
-    /// conversation whole or names no command; every `--resume` in it is
-    /// followed by the whole id.
-    ///
-    /// Negative control: the cutting renderer alone ([`fit_reason`]) names the
-    /// command and cuts its conversation away.
+    /// THE NEEDS ENTRY KEEPS ITS FRAME WHATEVER THE NEED'S SCRIPT (§12.2.9):
+    /// 64 cells of Devanagari or Thai are up to 192 bytes, which with the
+    /// frame outrun the cap; the need gives way, so the entry still ends
+    /// with its count and ` — carrying on` (the window reads it back by
+    /// them) and stays within [`ATTENTION_BYTES`]. A need that fits is
+    /// untouched. NEGATIVE CONTROL (run for the landing): main's form, the
+    /// whole text cut at the cap, drops the count and the tail.
+    #[test]
+    fn the_needs_entry_keeps_its_frame_for_a_long_need_in_any_script() {
+        for letter in ["\u{915}", "\u{e01}", "\u{9a8}", "\u{25b8}"] {
+            let needs = vec![letter.repeat(80), "sign 0.48.0".to_string()];
+            let t = needs_attention_text("Gemini CLI", &needs);
+            assert!(t.len() <= ATTENTION_BYTES, "{letter}: {}", t.len());
+            assert!(
+                t.starts_with(&format!("Gemini CLI needs you: {letter}"))
+                    && t.ends_with("\u{2026} (+1 more) \u{2014} carrying on"),
+                "{letter}: {t}"
+            );
+        }
+        let need = "grant Screen Recording to com.aterm.aterm".to_string();
+        assert_eq!(
+            needs_attention_text("claude", &[need]),
+            "claude needs you: grant Screen Recording to com.aterm.aterm \u{2014} carrying on"
+        );
+    }
+
+    /// The memory wall's escalation never cuts its resume line: each `--resume` in the
+    /// attention is followed by the whole id, or no command is named. Control: [`fit_reason`]
+    /// alone cuts the id away.
     #[test]
     fn the_memory_escalation_names_its_conversation_whole_or_not_at_all() {
         const ID: &str = "5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
@@ -847,8 +933,7 @@ mod tests {
             t.contains(&format!("then resume with claude --resume {ID}")),
             "{t}"
         );
-        // Negative control: the cutting renderer alone cuts the command; it
-        // is named, and its conversation is not.
+        // Control: the cutting renderer alone names the command and cuts its id away.
         let label = point_label(CLAUDE, &point);
         let old = fit_reason(&label, &reason(&flagged));
         assert!(
@@ -866,10 +951,8 @@ mod tests {
         assert_eq!(status_field(st, "nope"), None);
     }
 
-    /// The rm breaker's statically-unresolvable form from a workflow subagent
-    /// is badged `rm-breaker`, like the possibly-empty-variable form: the
-    /// family, not one note's prefix. Control: a plain Bash box is badged
-    /// `bash`.
+    /// Every rm-breaker form, a workflow subagent's unresolvable one included, is badged
+    /// `rm-breaker`. Control: a plain Bash box is `bash`.
     #[test]
     fn every_rm_breaker_kind_is_badged_rm_breaker() {
         use aterm_phase::prompt::fixtures as f;

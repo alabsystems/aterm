@@ -648,23 +648,58 @@ const BED_PARTIALS: [u32; 4] = [1, 2, 3, 4];
 /// and [`BED_LEVEL`] means what it says.
 const BED_PARTIAL_NORM: f32 = 0.838_1;
 
+const fn compute_sky_bed_degrees(chord: usize) -> [i32; 3] {
+    let lit = CHORD_LOOP[chord % SKY_BED_CHORDS].lit;
+    let mut out = [0i32; 3];
+    let mut n = 0;
+    let mut d = 0;
+    while d < 5 {
+        if lit & (1 << d) != 0 && n < 3 {
+            out[n] = d;
+            n += 1;
+        }
+        d += 1;
+    }
+    debug_assert!(n == 3, "every chord lights exactly three degrees");
+    out
+}
+
+const SKY_BED_DEGREES_TABLE: [[i32; 3]; SKY_BED_CHORDS] = {
+    let mut table = [[0i32; 3]; SKY_BED_CHORDS];
+    let mut c = 0;
+    while c < SKY_BED_CHORDS {
+        table[c] = compute_sky_bed_degrees(c);
+        c += 1;
+    }
+    table
+};
+
+/// Precomputed `penta(BED_BASE_HZ, d)` targets per chord in [`CHORD_LOOP`].
+/// Every lit degree `d` lies in `0..5`, so `d.div_euclid(5) == 0` and
+/// `BED_BASE_HZ * PENTA[d]` is bit-for-bit identical to `penta(BED_BASE_HZ, d)`.
+const SKY_BED_TARGETS: [[f32; 3]; SKY_BED_CHORDS] = {
+    let mut table = [[0.0f32; 3]; SKY_BED_CHORDS];
+    let mut c = 0;
+    while c < SKY_BED_CHORDS {
+        let degs = SKY_BED_DEGREES_TABLE[c];
+        table[c] = [
+            BED_BASE_HZ * super::PENTA[degs[0] as usize],
+            BED_BASE_HZ * super::PENTA[degs[1] as usize],
+            BED_BASE_HZ * super::PENTA[degs[2] as usize],
+        ];
+        c += 1;
+    }
+    table
+};
+
 /// The sky's voicing for one chord of [`CHORD_LOOP`]: the chord's three lit
 /// verse degrees (`Chord::lit`, bits 0..5 = C D E G A), ascending, on the
 /// untransposed lattice. Voiced from the lit set rather than a root triad,
 /// which on G or A would put an out-of-key B, C♯ or F♯ under the melody:
 /// C E G on I, C E A on vi and IV, D G A on V.
+#[inline]
 pub(super) fn sky_bed_degrees(chord: usize) -> [i32; 3] {
-    let lit = CHORD_LOOP[chord % SKY_BED_CHORDS].lit;
-    let mut out = [0i32; 3];
-    let mut n = 0;
-    for d in 0..5 {
-        if lit & (1 << d) != 0 && n < 3 {
-            out[n] = d;
-            n += 1;
-        }
-    }
-    debug_assert_eq!(n, 3, "every chord lights exactly three degrees");
-    out
+    SKY_BED_DEGREES_TABLE[chord % SKY_BED_CHORDS]
 }
 
 #[inline]
@@ -4993,11 +5028,7 @@ impl TrailSynth {
     /// arc (`bed.hue_s`) drives the tilt and the top tone's twin detune, never a
     /// pitch, so it stays in key. No rng: a render replays from (events, seed).
     pub(super) fn bed_rainbow_sky(&mut self, dt: f32, lvl: f32) -> (f32, f32) {
-        let degs = sky_bed_degrees(usize::from(self.v2.text.chord));
-        let mut tgt = [0.0f32; 3];
-        for (t, d) in tgt.iter_mut().zip(degs) {
-            *t = penta(BED_BASE_HZ, d);
-        }
+        let tgt = SKY_BED_TARGETS[usize::from(self.v2.text.chord) % SKY_BED_CHORDS];
         let b = &mut self.bed;
         let glide = 1.0 - (-dt / BED_GLIDE_TAU_S).exp();
         let arc = b.hue_s.clamp(0.0, 1.0);

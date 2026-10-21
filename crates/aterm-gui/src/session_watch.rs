@@ -32,6 +32,7 @@
 //!   `closing`), so an exit or a close wakes every park on the session, and a
 //!   delivered row wakes a `mail` watch;
 //! - [`crate::turn_ledger::TurnLedger::record`]: a landed turn;
+//! - a resize path's booked row ([`crate::session_timeline::SessionTimeline::ingest_resizes`]);
 //! - the store's roster journal, which rings the instance list
 //!   ([`crate::session_store::SessionStore::instance_watchers`]) a `sessions`
 //!   or `@*` subscription watches;
@@ -48,6 +49,16 @@
 //!   guard keeps every raw lock of a session's terminal to reading;
 //! - the peer watch ([`crate::peer_watch`]), which rings a push stream's own
 //!   list when its client hangs up.
+//!
+//! WHICH KIND OF WRITE RANG. The timeline, the turn ledger and a booked resize
+//! row ring as RECORDS ([`Watchers::ring_record`]): the list's record count
+//! steps before the ring, so a watcher can tell a ring that brought a record
+//! from the PTY reader's, which brings output. A record is written by aterm's
+//! own code, one per thing that happened (a post, a delivery, a status move, a
+//! turn), never one per burst of a program's output. So a push loop reads the
+//! `events` digest at once for a moved count, and paces it only for the
+//! reader's rings (`subscribe::EVENTS_PACE`), which an output flood makes by
+//! the thousand.
 //!
 //! LOCKS. `slots` is a strict leaf: held only to push, remove or `try_send`,
 //! never while another lock is taken. It is taken under the lock that guards
@@ -99,6 +110,8 @@ pub(crate) struct Watchers {
     /// The rings the standing holds owe ([`OWED_ALL`], [`OWED_FRAME`]), rung
     /// once by the last hold's release.
     owed: AtomicU8,
+    /// How many records this list was rung for ([`Self::ring_record`]).
+    records_rung: AtomicU64,
 }
 
 /// [`Watchers::owed`]: a ring of every watcher is owed.
@@ -127,6 +140,26 @@ impl Watchers {
             return;
         }
         self.ring_slots(false);
+    }
+
+    /// [`Self::ring_watchers`] for a RECORD the session wrote: a timeline row,
+    /// a booked resize row or a landed turn, which the `events` digest reads
+    /// besides the engine. The record count ([`Self::records_rung`]) steps first,
+    /// even when nobody watches or a hold owes the ring, so a watcher this ring
+    /// reaches finds the count moved (see WHICH KIND OF WRITE RANG in the
+    /// module doc). The caller holds the lock its record was written under,
+    /// as for every ring here.
+    pub(crate) fn ring_record(&self) {
+        self.records_rung.fetch_add(1, Ordering::Release);
+        self.ring_watchers();
+    }
+
+    /// How many records this list was rung for ([`Self::ring_record`]). A
+    /// watcher loads it after it swaps its dirty flag, so a record whose ring
+    /// set the flag is counted in what it loads.
+    #[must_use]
+    pub(crate) fn records_rung(&self) -> u64 {
+        self.records_rung.load(Ordering::Acquire)
     }
 
     /// Wake this list's frame watchers only: the screen moved and nothing else
@@ -535,8 +568,10 @@ mod tests {
         assert!(!sub.wait(Duration::ZERO));
     }
 
-    /// A RECORD WAKES ITS SESSION'S WATCHERS AND NO OTHER'S: the timeline and
-    /// the turn ledger of one [`Observed`] ring the list it names.
+    /// A RECORD WAKES ITS SESSION'S WATCHERS AND NO OTHER'S, AND IS COUNTED:
+    /// the timeline and the turn ledger of one [`Observed`] ring the list it
+    /// names as records, each stepping its record count once, and a plain ring
+    /// (the PTY reader's) steps no count.
     #[test]
     fn a_record_wakes_its_sessions_watchers_and_no_others() {
         let (one, two) = (Observed::default(), Observed::default());
@@ -548,11 +583,19 @@ mod tests {
             .record("cwd-change", "cwd=/tmp".to_string());
         assert!(on_one.wait(Duration::ZERO), "a timeline record wakes it");
         assert!(!on_two.wait(Duration::ZERO), "another session's does not");
+        assert_eq!(
+            (one.watchers.records_rung(), two.watchers.records_rung()),
+            (1, 0)
+        );
         one.turns
             .lock()
             .unwrap()
             .record(crate::subscribe::digest_fixture::turn_record(1), || 2);
         assert!(on_one.wait(Duration::ZERO), "a turn record wakes it");
         assert!(!on_two.wait(Duration::ZERO));
+        assert_eq!(one.watchers.records_rung(), 2, "a turn record is counted");
+        one.watchers.ring_watchers();
+        assert!(on_one.wait(Duration::ZERO), "an output ring wakes it");
+        assert_eq!(one.watchers.records_rung(), 2, "and is no record");
     }
 }

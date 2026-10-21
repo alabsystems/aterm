@@ -39,14 +39,9 @@ pub struct RegexRowMatch {
 impl RowMatch for RegexRowMatch {
     #[inline]
     fn verdict(&self, row: &str) -> RowVerdict {
-        // A refused scan (the engine's budget ran out) is UNDECIDED, never a
-        // non-match. Either guess would latch some watcher on evidence that was
-        // never gathered. A match would fire an agent's `await match <re>` early.
-        // A non-match, which is what this used to answer, fires the inverse
-        // predicate (`await gone`, `turn … settle=gone:`, the supervisor's busy
-        // test) while the row is still on the screen. Undecided keeps both kinds
-        // of wait pending, which stays correct if the budget was the only thing
-        // in the way (see `RowMatch`, ruling 2026-10-10).
+        // A scan that exhausts its step budget is `Undecided`, keeping both
+        // `await match` and `await gone` pending rather than falsely latching
+        // the inverse predicate while the row is still on screen.
         match self.re.try_is_match(row) {
             Ok(matched) => matched.into(),
             Err(_) => RowVerdict::Undecided,
@@ -54,84 +49,50 @@ impl RowMatch for RegexRowMatch {
     }
 }
 
-/// Maximum regex pattern length (bytes). A watcher pattern is untrusted input
-/// (an `await`/agent control argument), so it is rejected before compilation to
-/// bound parse/compile cost. Mirrors the search verb's `MAX_REGEX_PATTERN_LEN`
-/// (`aterm-search`) so both regex entry points enforce the same ceiling.
+/// Maximum regex pattern length (bytes). Watcher patterns are untrusted control
+/// input and are rejected before compilation to bound parse/compile cost,
+/// matching `aterm-search`'s `MAX_REGEX_PATTERN_LEN`.
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Compiled-regex size limit (bytes) for
-/// [`aterm_regex::RegexBuilder::size_limit`]. Caps the NFA at 128 KiB — 2,048
-/// instructions at `aterm-regex`'s 64-byte-per-instruction charge — well below
-/// the engine's 10 MiB default. Matches `aterm-search`.
+/// [`aterm_regex::RegexBuilder::size_limit`]. Caps the NFA at 128 KiB (2,048
+/// instructions at 64 bytes/instruction), matching `aterm-search`.
 ///
-/// This bounds **both** axes, which is the reason it is not just a compile-time
-/// guard. A Pike VM's scan is linear in the haystack, but the constant of that
-/// linearity *is* the program size, so an untrusted pattern that compiles large
-/// is also a pattern that scans slowly on every row of live PTY output.
-/// Measured on the m21 box over one 4,096-column row: `(?:x?){2000}z` —
-/// thirteen bytes, 4,002 instructions — took 37 ms under the old 1 MiB ceiling
-/// and is refused outright under this one; the largest program that still fits
-/// here costs ~18 ms on such a row, against ~150 ms at 1 MiB.
-///
-/// 128 KiB is the smallest ceiling that leaves a usable pattern space under
-/// [`MAX_REGEX_PATTERN_LEN`]: 1,024 literal bytes compile to 1,025
-/// instructions (65,600 bytes), so any ceiling at or below 64 KiB would reject
-/// a plain 1,024-character literal — which
-/// `row_matcher_rejects_overlong_pattern` requires to compile. The largest
-/// built-in selection rule (IPv6) is 407 instructions, so real patterns keep
-/// 5x headroom.
+/// Because a Pike VM's scan cost is linear in the haystack with program size as
+/// the constant factor, bounding compiled size also bounds per-row scan cost:
+/// on a 4,096-column row, `(?:x?){2000}z` (4,002 instructions, 37 ms) is
+/// refused, and the largest admitted program takes ~18 ms. 1,024 literal bytes
+/// compile to 1,025 instructions (65,600 bytes), so 128 KiB is the smallest
+/// power-of-two ceiling that admits a max-length literal; the largest built-in
+/// selection rule (IPv6) is 407 instructions.
 const REGEX_SIZE_LIMIT: usize = 128 * 1024; // 128 KiB
 
 /// Lazy-DFA cache limit (bytes) for
-/// [`aterm_regex::RegexBuilder::dfa_size_limit`]. Retained for source
-/// compatibility and still passed: `aterm-regex` is a pure Pike VM, so there is
-/// no lazy DFA for it to bound today, and the builder documents it as inert
-/// rather than repurposing it silently. Per-match memory is already bounded by
-/// [`REGEX_SIZE_LIMIT`] — the VM's thread set is capped by the program size.
-/// Matches `aterm-search`.
+/// [`aterm_regex::RegexBuilder::dfa_size_limit`]. Passed for builder
+/// compatibility (`aterm-regex` is a pure Pike VM whose per-match thread set is
+/// bounded by [`REGEX_SIZE_LIMIT`]).
 const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 
 /// Scan budget (work units) for one row, passed to
-/// [`aterm_regex::RegexBuilder::step_limit`]. Roughly 4.8 ms of matching per
-/// row on the m21 box in release.
+/// [`aterm_regex::RegexBuilder::step_limit`] (~4.8 ms per row in release).
 ///
-/// [`REGEX_SIZE_LIMIT`] bounds the *program*; this bounds the *scan*, and only
-/// together do they bound the cost of a watcher. A Pike VM's search is linear
-/// in the row with the program size as its constant, so the product of the two
-/// is what a pattern actually costs — and both factors are chosen by whoever
-/// typed the `await match <re>`. Measured: the heaviest program the 128 KiB
-/// ceiling still admits costs ~16.7M units (19 ms) on a single 4,096-column
-/// row, and a watcher is evaluated against every visible row on every content
-/// change, so admitting that per row is admitting a live-output stall. This
-/// ceiling refuses it after ~4.2M.
-///
-/// Nothing real comes near: the most expensive rule aterm itself ships (the
-/// IPv6 selection pattern) needs ~3,100 units for one search over a full row,
-/// so a working pattern keeps three orders of magnitude of headroom. Mirrors
-/// `aterm-search`, which passes the same number for the same reason.
+/// The heaviest program admitted by [`REGEX_SIZE_LIMIT`] can still spend ~16.7M
+/// units (19 ms) on a 4,096-column row; this ceiling cuts it off at ~4.2M units
+/// while leaving three orders of magnitude of headroom over the most expensive
+/// built-in rule (IPv6 selection, ~3,100 units).
 const REGEX_STEP_LIMIT: u64 = 1 << 22;
 
-/// Compile a regex row matcher. The returned `Arc<dyn RowMatch>` is what
-/// [`Terminal::watch_rows`](aterm_core::terminal::Terminal::watch_rows) and its
-/// inverse [`Terminal::watch_rows_gone`](aterm_core::terminal::Terminal::watch_rows_gone)
-/// take — the core receives only the opaque handle.
+/// Compile a bounded regex row matcher for
+/// [`Terminal::watch_rows`](aterm_core::terminal::Terminal::watch_rows) and
+/// [`Terminal::watch_rows_gone`](aterm_core::terminal::Terminal::watch_rows_gone).
 ///
-/// The pattern is untrusted, so this bounds it on every axis it has. Patterns
-/// longer than [`MAX_REGEX_PATTERN_LEN`] are rejected up front; the compiler is
-/// held to [`REGEX_SIZE_LIMIT`]/[`REGEX_DFA_SIZE_LIMIT`] (vs. the engine's 10 MiB
-/// default) so a crafted pattern cannot amplify a small string into a
-/// multi-megabyte NFA; and the matcher carries [`REGEX_STEP_LIMIT`], which
-/// bounds the *scan* — the cost of running the admitted program over a row,
-/// which the size ceiling alone does not bound. A row that exhausts it is
-/// [`RowVerdict::Undecided`]: neither a match nor shown clear, so `await match`
-/// and `await gone` both keep waiting. This mirrors the search verb
-/// (`aterm-search`); the live PTY-driven watcher path shares the same choke
-/// point.
+/// Enforces [`MAX_REGEX_PATTERN_LEN`], [`REGEX_SIZE_LIMIT`],
+/// [`REGEX_DFA_SIZE_LIMIT`], and [`REGEX_STEP_LIMIT`]. A row scan that exhausts
+/// the step budget returns [`RowVerdict::Undecided`].
 ///
 /// # Errors
-/// Returns an [`aterm_regex::Error`] if `pattern` exceeds the length ceiling,
-/// exceeds the compiled-size limits, or is not a valid regular expression.
+/// Returns an [`aterm_regex::Error`] if `pattern` exceeds the length or
+/// compiled-size limits or is not a valid regular expression.
 pub fn row_matcher(pattern: &str) -> Result<Arc<dyn RowMatch>, aterm_regex::Error> {
     Ok(Arc::new(RegexRowMatch {
         re: bounded_regex(pattern)?,
@@ -386,14 +347,9 @@ mod tests {
         assert!(sat.seq > 0);
     }
 
-    /// `gone` WAITS ON A ROW THE SCAN BUDGET COULD NOT READ (ruling 2026-10-10).
-    ///
-    /// A 4,001-character row that really ends in the match exhausts
-    /// [`REGEX_STEP_LIMIT`] under `(?:x?){1020}z`. The refusal used to read as
-    /// "no match", so `await gone` latched with the row still on screen, and
-    /// `turn … settle=gone:` and the supervisor's busy test went with it. Now
-    /// both predicates keep waiting. `await match` is unchanged: it never
-    /// latched on the refused row, and it latches once the row can be read.
+    /// Both `watch_rows` and `watch_rows_gone` stay pending when a visible row
+    /// exhausts [`REGEX_STEP_LIMIT`], and latch once the row becomes readable
+    /// or leaves the screen.
     #[test]
     fn row_gone_waits_while_a_visible_row_exhausts_the_scan_budget() {
         let base = Instant::now();

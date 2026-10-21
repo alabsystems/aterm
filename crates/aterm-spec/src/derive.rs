@@ -16,25 +16,22 @@
 //! (constants, variables, guarded actions, invariants) over a small
 //! expression language [`Expr`]. From that ONE source we generate BOTH:
 //!
-//!   - [`Model::to_tla`] / [`Model::to_cfg`] — a complete, `ty`-checkable TLA+
-//!     module + config (the embedded spec), and
-//!   - [`Model::fire`] / [`Model::successors`] — the executable transition
-//!     semantics (a real interpreter, using TLA+ primed semantics: every
-//!     right-hand side is evaluated against the pre-state, then applied).
-//!     `successors` enumerates the existential fan-out of a nondeterministic
-//!     ([`Expr::InRange`]) action; `fire` applies its canonical representative.
+//! A [`Model`] is a Rust value describing a bounded state machine (constants, variables,
+//! guarded actions, invariants) over a small expression language [`Expr`]. A person writes it
+//! (directly or through `ty_model!`), so it can drift from the code it describes; Tier 1 below
+//! ties them. From that one source come both:
 //!
-//! Because both backends consume the same `Expr` trees, a change to the model
-//! changes the spec AND the executable semantics together — they cannot drift.
-//! The generated spec is exhaustively checked by `ty` (Tier 0); the same model
-//! drives conformance against real code (Tier 1, see
-//! `aterm-buffer/tests/conformance_eventlog.rs`).
+//! - [`Model::to_tla`] / [`Model::to_cfg`]: a complete, `ty`-checkable TLA+ module and config;
+//! - [`Model::fire`] / [`Model::successors`]: the executable transition semantics (TLA+ primed
+//!   semantics: every right-hand side is evaluated against the pre-state, then applied).
+//!   `successors` enumerates a nondeterministic ([`Expr::InRange`]) action's fan-out; `fire`
+//!   applies its canonical representative.
 //!
-//! The expression language is intentionally small (what the bounded-ring model
-//! needs); it grows as real models demand. The translation is mechanical:
-//! `<=` ⇒ `=<`, `if/else` ⇒ `IF/THEN/ELSE`, `&&`/`||` ⇒ `/\`/`\/`.
+//! A change to the model changes the spec and the executable semantics together, which the
+//! hand-written `.tla` files in `aterm-spec-models/specs/` cannot promise. The translation is
+//! mechanical: `<=` ⇒ `=<`, `if/else` ⇒ `IF/THEN/ELSE`, `&&`/`||` ⇒ `/\`/`\/`.
 //!
-//! # The workflow, and what each tier proves
+//! # Workflow
 //!
 //! For a new or changed bounded state machine:
 //!
@@ -73,7 +70,7 @@
 //! `NativeUpdateFailedMarkSuppression` (`aterm-models-update/src/models_update.rs`), whose negative
 //! control replays the bug it was written for.
 //!
-//! What each step's result means (every result says which tier it reached):
+//! # What each tier proves
 //!
 //! - **Tier 0 — the model.** `ty check` (or the in-process interpreter) explores
 //!   the generated spec exhaustively within its bounds. It proves a property *of
@@ -111,16 +108,11 @@ pub enum Value {
 }
 
 impl Value {
-    // `as_int`/`as_bool` are the interpreter's type-punning accessors. `as_int` is
-    // only ever applied to the result of evaluating an INTEGER-typed `Expr`
-    // (`Int`/`Var`/`ConstRef`/`Add`/`Sub`, and the integer bounds of `InRange`/
-    // `Forall`/`Exists`); `as_bool` only to a BOOLEAN-typed `Expr` (comparisons,
-    // `Or`/`And`/`If`-cond/`Iff`, action guards, invariant bodies). Every `Model`
-    // in this crate is built by the well-typed constructors below, so the crossed
-    // arm (`Bool` for `as_int`, `Int` for `as_bool`) is unreachable on every real
-    // evaluation. It still PANICS: like `eval`'s unbound-identifier arm, a default
-    // value would silently mask an ill-typed model, so the crossed arm fails
-    // closed, reclassified into the T9 contract-panic ledger column (below).
+    // The interpreter's typed accessors. `as_int` is applied only to an integer-typed `Expr`
+    // (`Int`/`Var`/`ConstRef`/`Add`/`Sub`, the bounds of `InRange`/`Forall`), `as_bool` only to
+    // a boolean-typed one (comparisons, `Or`/`And`/`Iff`, an `If` condition, guards, invariant
+    // bodies), so the crossed arm is unreachable for a well-typed model. It still panics: a
+    // default value would mask an ill-typed model (a contract panic, like `eval`'s).
     #[cfg_attr(
         trust_verify,
         trust::contract_panic(message_contains = "expected Int, got Bool")
@@ -128,7 +120,7 @@ impl Value {
     pub(crate) fn as_int(self) -> i64 {
         match self {
             Value::Int(i) => i,
-            // Unreachable for well-typed models (see above): fail closed.
+            // Unreachable for well-typed models: fail closed.
             Value::Bool(_) => panic!("expected Int, got Bool — model type error"),
         }
     }
@@ -139,7 +131,6 @@ impl Value {
     pub(crate) fn as_bool(self) -> bool {
         match self {
             Value::Bool(b) => b,
-            // Unreachable for well-typed models (see above): fail closed.
             Value::Int(_) => panic!("expected Bool, got Int — model type error"),
         }
     }
@@ -164,13 +155,11 @@ pub enum Expr {
     Le(Box<Expr>, Box<Expr>),
     /// `a = b` (boolean, integer operands) — emits TLA+ `=`.
     Eq(Box<Expr>, Box<Expr>),
-    /// `a \/ b` (boolean disjunction) — emits parenthesized TLA+ `(a \/ b)` so it
-    /// composes correctly when used as an action guard (which is conjoined with
-    /// the update conjuncts, and `/\` binds tighter than `\/`).
+    /// `a \/ b`; emits `(a \/ b)`, parenthesized because a guard is conjoined with the
+    /// update conjuncts and `/\` binds tighter.
     Or(Box<Expr>, Box<Expr>),
-    /// `a /\ b` (boolean conjunction) — emits TLA+ `a /\ b` (unparenthesized; `/\`
-    /// is associative with the action-level conjunction it joins, so a guard built
-    /// from `And` composes correctly without parens).
+    /// `a /\ b`; emits `a /\ b` unparenthesized, which composes with the action-level
+    /// conjunction it joins.
     And(Box<Expr>, Box<Expr>),
     /// `IF cond THEN a ELSE b` (cond boolean; arms integer).
     If(Box<Expr>, Box<Expr>, Box<Expr>),
@@ -179,7 +168,7 @@ pub enum Expr {
     /// `\A n \in lo..hi : body` (universal quantifier; `body` boolean, may
     /// reference the bound index by name). Scalar bodies are interpreter-evaluable.
     Forall(&'static str, Box<Expr>, Box<Expr>, Box<Expr>),
-    // ---- function-valued (TLA+ generation only; see eval note) ----
+    // Function-valued: TLA+ generation only (see `eval`).
     /// `fn[index]` — access a function-valued (`[1..N -> BOOLEAN]`) state variable.
     FnAccess(&'static str, Box<Expr>),
     /// `[fn EXCEPT ![index] = value]` — a point update of a function variable.
@@ -191,14 +180,12 @@ pub enum Expr {
     Bool(bool),
     /// `a # b` (integer inequality).
     Neq(Box<Expr>, Box<Expr>),
-    /// `lo..hi` — a bounded integer SET, the only NONDETERMINISTIC construct. As an
-    /// action update RHS it renders `var' \in lo..hi` (not `var' = ...`): the action
-    /// admits ANY value in `lo..=hi` for that variable. `ty` checks the full
-    /// existential fan-out exhaustively at Tier-0; the executable twin enumerates it
-    /// via [`Model::successors`]. It is set-valued, so it has no scalar [`Expr::eval`]
-    /// — it is meaningful ONLY as a top-level update RHS. Used where the scalar
-    /// projection cannot pin a single next value (e.g. closing the frontmost window
-    /// re-points `frontmost` to *some* surviving allocated id, not a computable one).
+    /// `lo..hi`, a bounded integer set and the only nondeterministic construct. As an update
+    /// RHS it renders `var' \in lo..hi`: the action admits any value in `lo..=hi`, which `ty`
+    /// checks exhaustively and [`Model::successors`] enumerates. It has no scalar
+    /// [`Expr::eval`], so it is meaningful only as a top-level update RHS, for a next value
+    /// the projection cannot pin (closing the frontmost window re-points `frontmost` to some
+    /// surviving id).
     InRange(Box<Expr>, Box<Expr>),
 }
 
@@ -257,21 +244,16 @@ pub fn bool_lit(b: bool) -> Expr {
 pub fn neq(a: Expr, b: Expr) -> Expr {
     Expr::Neq(Box::new(a), Box::new(b))
 }
-/// `lo..hi` — a bounded integer set, the nondeterministic update RHS. See
-/// [`Expr::InRange`]: as an action update it admits any `lo..=hi` for the variable.
+/// `lo..hi`, the nondeterministic update RHS ([`Expr::InRange`]).
 pub fn in_range(lo: Expr, hi: Expr) -> Expr {
     Expr::InRange(Box::new(lo), Box::new(hi))
 }
 
 impl Expr {
     /// Evaluate against an environment (state variables + constants).
-    // AUDITED CONTRACT PANIC (T9): all three panics below are intentional
-    // fail-closed contracts, not reachable bugs. An unbound identifier is a
-    // spec-linkage typo (same contract as `action_enabled`: a default value
-    // would silently mask it), and the function-valued / set-valued arms are
-    // TLA+-generation-only Exprs that a scalar model never contains (see the
-    // arm comments). The declarations reclassify the refuted panic-freedom
-    // obligations into the always-visible contract-panic gate column.
+    // Contract panics, fail-closed: an unbound identifier is a spec-linkage typo (a default
+    // would mask it, as in `action_enabled`), and the function- and set-valued arms are
+    // TLA+-generation-only Exprs a scalar model never contains.
     #[cfg_attr(
         trust_verify,
         trust::contract_panic(message_contains = "unbound identifier `")
@@ -296,16 +278,13 @@ impl Expr {
     pub fn eval(&self, env: &BTreeMap<&'static str, i64>) -> Value {
         match self {
             Expr::Int(i) => Value::Int(*i),
-            // Inline `match` (not an `unwrap_or_else` closure) so the intentional
-            // model-type-error panic is attributed to `eval` itself rather than a
-            // standalone always-panicking closure; same panic, same message.
+            // Inline `match`, not an `unwrap_or_else` closure, so the panic is `eval`'s own.
             Expr::Var(n) | Expr::ConstRef(n) => Value::Int(match env.get(n) {
                 Some(v) => *v,
                 None => panic!("unbound identifier `{n}` in model evaluation"),
             }),
-            // Wrapping: the interpreter must be TOTAL on every valid Expr (an
-            // overflow is a modelling fact to observe, not an abort), as in
-            // `Model::successors`; this keeps `eval` panic-free without a skip.
+            // Wrapping: the interpreter is total on every valid Expr (an overflow is a
+            // modelling fact to observe), as in `Model::successors`.
             Expr::Add(a, b) => Value::Int(a.eval(env).as_int().wrapping_add(b.eval(env).as_int())),
             Expr::Sub(a, b) => Value::Int(a.eval(env).as_int().wrapping_sub(b.eval(env).as_int())),
             Expr::Gt(a, b) => Value::Bool(a.eval(env).as_int() > b.eval(env).as_int()),
@@ -334,19 +313,14 @@ impl Expr {
                 }
                 Value::Bool(true)
             }
-            // Function-valued exprs are TLA+-generation only: the faithful models
-            // that use them are Tier-0 ty-checked, not run through this scalar
-            // interpreter (whose env is integer-valued). A scalar model never
-            // contains these, so these arms are unreachable in practice.
+            // Function-valued exprs are TLA+-generation only (Tier 0): this interpreter's
+            // env is integer-valued, and a scalar model never contains them.
             Expr::FnAccess(..) | Expr::Except(..) | Expr::Comprehension(..) => {
                 panic!(
                     "function-valued Expr is TLA+-generation only (Tier-0 ty-checked, not interpreter-evaluable)"
                 )
             }
-            // `lo..hi` is a SET, not a scalar — there is no single value to return.
-            // The interpreter consumes it only as an update RHS, where
-            // `Model::successors` matches it and enumerates `lo..=hi` directly
-            // (evaluating its bounds), so this arm is never reached in practice.
+            // A set, not a scalar: `Model::successors` consumes it as an update RHS.
             Expr::InRange(..) => panic!(
                 "InRange (`lo..hi`) is set-valued; it is meaningful only as a nondeterministic \
                  update RHS — fire the action via `Model::successors`, not scalar `eval`"
@@ -355,24 +329,16 @@ impl Expr {
     }
 
     /// Render as a TLA+ expression.
-    // Skip: recursive TLA+ rendering — String allocs + the `Extend`/format
-    // absent-body class. Spec-model machinery, same tier as `eval`.
+    // Skip: recursive String rendering.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn to_tla(&self) -> String {
         match self {
             Expr::Int(i) => i.to_string(),
             Expr::Var(n) | Expr::ConstRef(n) => (*n).to_string(),
             Expr::Add(a, b) => format!("{} + {}", a.to_tla(), b.to_tla()),
-            // TLA+ `+`/`-` are LEFT-associative, so a bare `a - b` renders correctly
-            // for a scalar or left-nested `b`, but a compound ADDITIVE right operand
-            // regroups: `Sub(x, Add(y,z))` -> `x - y + z` = (x-y)+z, and
-            // `Sub(x, Sub(y,z))` -> `x - y - z` = (x-y)-z — both DIVERGE from the
-            // interpreter, which evaluates the actual tree `x-(y+z)` / `x-(y-z)`. That
-            // would let the ty-checked spec encode different arithmetic than its
-            // executable twin (the exact drift this module promises cannot happen). So
-            // parenthesize the RHS of a subtraction when it is itself an Add/Sub. Only
-            // this position needs it: `+`'s operands and `-`'s LEFT operand are all
-            // associativity-safe, and comparisons bind looser.
+            // TLA+ `+`/`-` are left-associative: a bare `Sub(x, Add(y, z))` reads back as
+            // `(x - y) + z`, not the interpreter's `x - (y + z)`, so an additive right operand
+            // of `-` is parenthesized. No other position regroups.
             Expr::Sub(a, b) => {
                 let rhs = b.to_tla();
                 let rhs = if matches!(**b, Expr::Add(..) | Expr::Sub(..)) {
@@ -390,9 +356,8 @@ impl Expr {
             // Parenthesized: `\/` binds looser than the `/\` it is conjoined with.
             Expr::Or(a, b) => format!("({} \\/ {})", a.to_tla(), b.to_tla()),
             Expr::And(a, b) => format!("{} /\\ {}", a.to_tla(), b.to_tla()),
-            // Parenthesized: an `IF`'s `ELSE` extends as far right as possible, so an
-            // IF-valued update that is NOT the last action conjunct would otherwise
-            // swallow the following `/\ ...`.
+            // Parenthesized: `ELSE` extends as far right as possible, so an IF-valued update
+            // that is not the last conjunct would swallow the following `/\ ...`.
             Expr::If(c, a, b) => {
                 format!(
                     "(IF {} THEN {} ELSE {})",
@@ -422,9 +387,7 @@ impl Expr {
                     body.to_tla()
                 )
             }
-            // A bounded set `lo..hi`. The action renderer special-cases an InRange
-            // update RHS to emit `var' \in lo..hi`; this standalone form is the set
-            // itself, for completeness of rendering.
+            // The set itself; an update RHS renders as `var' \in lo..hi` (see `render`).
             Expr::InRange(lo, hi) => format!("{}..{}", lo.to_tla(), hi.to_tla()),
         }
     }
@@ -466,15 +429,12 @@ pub enum InvariantKind {
     Bound,
 }
 
-/// A named LIVENESS obligation over a derived [`Model`]: `[]<>goal` — on every
-/// fair behaviour the goal keeps being reached, so no fair run leaves it for
-/// good — under the fairness it states.
+/// A named liveness obligation over a [`Model`]: `[]<>goal` under the fairness it states, so
+/// no fair run leaves the goal for good.
 ///
-/// Why it exists: an invariant says a bad state is never reached and a deadlock
-/// check says no state is stuck, and a machine can pass both while it never does
-/// the one thing it is for. A lane that retries forever has only legal states,
-/// and each has a successor. That is a livelock, and only a property about
-/// whole behaviours can name it.
+/// An invariant says no bad state is reachable and a deadlock check says no state is stuck; a
+/// lane that retries forever passes both. Only a property of whole behaviours names that
+/// livelock.
 ///
 /// Why a companion value rather than a [`Model`] field: a model is one
 /// literal written in more than a hundred places, and a liveness obligation is
@@ -497,10 +457,9 @@ pub struct Liveness {
     pub weak: Vec<&'static str>,
     /// Strongly fair actions (`SF_vars`): taken once they keep coming enabled.
     pub strong: Vec<&'static str>,
-    /// The `Buggy` mutants — actions dead at the committed config — each of
-    /// which, added ALONE to the `Buggy = 1` baseline, must break the property.
-    /// An obligation no mutant can break is a ghost: it would pass whatever the
-    /// lane did (`verify::audit_liveness` refuses one).
+    /// The `Buggy` mutants (actions dead at the committed config), each of which, added alone
+    /// to the `Buggy = 1` baseline, must break the property. An obligation no mutant can break
+    /// would pass whatever the lane did (`verify::audit_liveness` refuses one).
     pub mutants: Vec<&'static str>,
 }
 
@@ -511,8 +470,7 @@ impl Liveness {
     ///
     /// If the goal is not boolean-typed — a model type error, failed closed like
     /// every other ill-typed evaluation in this module.
-    // Skip: BTreeMap env build + the deliberate model-type-error panic (the
-    // `eval` contract class). Spec-model machinery.
+    // Skip: BTreeMap env build and the model-type-error panic (`eval`'s contract class).
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
     pub fn goal_holds(&self, m: &Model, state: &BTreeMap<&'static str, i64>) -> bool {
@@ -535,8 +493,7 @@ impl Liveness {
     /// `<name>Spec == Spec /\ WF_vars(A) /\ … /\ SF_vars(B) …` and
     /// `<name> == []<>(goal)`. `m` is the model to emit — the committed one, or a
     /// mutant-isolated copy — so the fairness names must be actions it declares.
-    // Skip: String assembly over the model's rendering (the format/alloc class),
-    // same tier as `Model::to_tla`.
+    // Skip: String assembly over the model's rendering, as in `Model::to_tla`.
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
     pub fn to_tla(&self, m: &Model) -> String {
@@ -557,7 +514,7 @@ impl Liveness {
     /// The `.cfg` that checks the property alone: constants (with `overrides`),
     /// the fair specification, the `PROPERTY`, and no invariant — so a failure
     /// can only be the property's, never an invariant a mutant also breaks.
-    // Skip: format/alloc, same tier as `Model::to_cfg_with`.
+    // Skip: format/alloc, as in `Model::to_cfg_with`.
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
     pub fn to_cfg_with(&self, m: &Model, overrides: &[(&'static str, i64)]) -> String {
@@ -585,10 +542,9 @@ pub struct StateVar {
     pub init: i64,
 }
 
-/// A function-valued state variable `[1..range -> BOOLEAN]`, initialized all-FALSE.
-/// Used for per-element models (e.g. a ring's live-set) that the scalar projection
-/// cannot express. Such models are Tier-0 `ty`-checked (TLA+ generation), not run
-/// through the integer interpreter.
+/// A function-valued state variable `[1..range -> BOOLEAN]`, initialized all-FALSE, for
+/// per-element models (a ring's live-set) the scalar projection cannot express. Such models
+/// are `ty`-checked (Tier 0), not run through the integer interpreter.
 #[derive(Debug, Clone)]
 pub struct FnVar {
     pub name: &'static str,
@@ -613,8 +569,7 @@ pub struct Model {
 impl Model {
     /// All state-variable names, scalar then function-valued (the order used in
     /// `VARIABLES`, `vars`, and `UNCHANGED`).
-    // Skip: `Extend::extend` over a mapped iterator — the alloc + absent-body
-    // class. Model-derivation machinery, same tier as `eval`/`successors`.
+    // Skip: `Extend::extend` over a mapped iterator (alloc class).
     #[cfg_attr(trust_verify, trust::skip)]
     fn all_var_names(&self) -> Vec<&'static str> {
         let mut v: Vec<&'static str> = self.vars.iter().map(|x| x.name).collect();
@@ -622,24 +577,17 @@ impl Model {
         v
     }
 
-    /// The evaluation environment for `state`: the model's constants, then the
-    /// state's variables on top (a state variable SHADOWS a same-named constant).
-    ///
-    /// Public because the env is a pure function of `(consts, pre-state)`, so it
-    /// is IDENTICAL across every action and invariant evaluated at one state. The
-    /// BFS in [`crate::interp`] builds it once per state and passes it to
-    /// [`Model::successors_in`] / `Invariant::expr.eval`; per-(state, action)
-    /// rebuilding cost a full-registry BMC sweep 2.54 s against 0.75 s (release).
-    // Skip: the audited `BTreeMap` clone/entry alloc class of `init_state`.
-    // Model-derivation machinery, same tier as `successors`.
+    /// The evaluation environment for `state`: the model's constants with the state's variables
+    /// on top (a variable shadows a same-named constant). It is the same for every action and
+    /// invariant at one state, so [`crate::interp`] builds it once per state for
+    /// [`Model::successors_in`] (per-action rebuilding cost a full-registry BMC sweep 2.54 s
+    /// against 0.75 s).
+    // Skip: `BTreeMap` clone/entry allocs, as in `init_state`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn eval_env(&self, state: &BTreeMap<&'static str, i64>) -> BTreeMap<&'static str, i64> {
-        // The state's map cloned whole (a structural clone compares no keys),
-        // then each constant the state does not bind. A state variable shadows a
-        // same-named constant, and of two same-named constants the LAST wins
-        // (hence the reverse walk with `or_insert`). Inserting the state into the
-        // constants instead string-compares every variable, and that `memcmp`
-        // led the profile of every by-name walk.
+        // Clone the state whole (a structural clone compares no keys), then add each constant
+        // it does not bind; the reverse walk makes the last of two same-named constants win.
+        // Inserting the state into the constants instead string-compares every variable.
         let mut env = state.clone();
         for (k, v) in self.consts.iter().rev() {
             env.entry(*k).or_insert(*v);
@@ -664,26 +612,18 @@ impl Model {
         self.render(&const_names, &init)
     }
 
-    /// Generate the module with an OPEN `Init` (`Init == TRUE`): any state may be
-    /// the start. Used for strict per-transition conformance against real code
-    /// (Tier 1): a two-step trace `[prev, next]` starts wherever its step 0 says,
-    /// so validating it strictly checks that `Next` admits the real
-    /// `prev -> next` transition.
-    ///
-    /// Open rather than pinned to `prev`: the trace's step 0 already fixes the
-    /// pre-state, and an open `Init` needs one cfg per `(model, overrides)`
-    /// instead of one per `prev` (aterm-agent's footer suite needed 2,688).
+    /// The module with an open `Init` (`Init == TRUE`), for strict per-transition conformance
+    /// (Tier 1): a two-step trace `[prev, next]` starts wherever its step 0 says, so validating
+    /// it checks that `Next` admits the real `prev -> next`. Open rather than pinned to `prev`,
+    /// so one cfg serves every `prev` of a `(model, overrides)`.
     pub fn transition_spec(&self) -> String {
         let const_names: Vec<String> = self.consts.iter().map(|(n, _)| (*n).to_string()).collect();
         self.render(&const_names, "TRUE")
     }
 
-    /// Shared renderer: emit the module given the CONSTANT names and the `Init`
-    /// body. Actions, `Next`, `Spec`, and invariants are identical across the
-    /// concrete and open-`Init` forms — one source for both.
-    // Skip: the `filter(..).collect()` chain drives closure bodies that are
-    // absent callees, plus String/Vec allocs. Spec-model TLA+ rendering,
-    // same tier as `eval`/`to_tla`.
+    /// Emit the module from the CONSTANT names and the `Init` body; the rest is shared by the
+    /// concrete and open-`Init` forms.
+    // Skip: a closure-driven `filter(..).collect()` and String/Vec allocs.
     #[cfg_attr(trust_verify, trust::skip)]
     fn render(&self, const_names: &[String], init_line: &str) -> String {
         let vars = self.all_var_names();
@@ -697,7 +637,6 @@ impl Model {
         s.push_str(&format!("vars == << {} >>\n", vars.join(", ")));
         s.push_str(&format!("Init == {init_line}\n"));
 
-        // Actions
         for a in &self.actions {
             let mut conj: Vec<String> = Vec::new();
             if let Some(g) = &a.guard {
@@ -705,9 +644,7 @@ impl Model {
             }
             for u in &a.updates {
                 match &u.expr {
-                    // A nondeterministic update: `var' \in lo..hi` (membership), not
-                    // `var' = ...` (equality). ty checks every value in the bounded
-                    // range as a separate `Next` successor — the existential fan-out.
+                    // `var' \in lo..hi`: `ty` checks each value in the range as a successor.
                     Expr::InRange(lo, hi) => {
                         conj.push(format!("{}' \\in {}..{}", u.var, lo.to_tla(), hi.to_tla()))
                     }
@@ -744,10 +681,8 @@ impl Model {
         self.to_cfg_with(&[])
     }
 
-    /// Like [`to_cfg`](Self::to_cfg) but with constant `overrides` — e.g. flip a
-    /// `Buggy` flag to 1 to check that an invariant is non-trivial (the buggy
-    /// variant must yield a counterexample), the in-spec analogue of the
-    /// `Buggy`-constant convention used by the hand-written specs.
+    /// Like [`to_cfg`](Self::to_cfg) with constant `overrides`, e.g. `Buggy = 1` to check that
+    /// an invariant is non-trivial (the buggy variant must yield a counterexample).
     pub fn to_cfg_with(&self, overrides: &[(&'static str, i64)]) -> String {
         let mut s = String::new();
         for (n, default) in &self.consts {
@@ -766,37 +701,25 @@ impl Model {
         s
     }
 
-    /// Like [`to_cfg_with`](Self::to_cfg_with) but with `ty` DEADLOCK / LIVENESS
-    /// detection ON (`CHECK_DEADLOCK TRUE`) — the liveness twin of the safety
-    /// configs, for request/reply "wedge" models (e.g. the forward handshake).
+    /// Like [`to_cfg_with`](Self::to_cfg_with) with `CHECK_DEADLOCK TRUE`, for request/reply
+    /// models whose failure is a two-party wedge (each side parked on the other) that only
+    /// deadlock detection catches. The default keeps it off: most models stop at a bounded
+    /// terminal.
     ///
-    /// Safety models check reachable bad STATES, but a blocking-call deadlock (the
-    /// `drain_buffered` `fill_buf` hang — server parked reading more input while
-    /// the client is parked awaiting the reply) is a two-party all-blocked wedge
-    /// that only `CHECK_DEADLOCK` catches. The default `to_cfg`/`to_cfg_with` keep
-    /// `CHECK_DEADLOCK FALSE`, since most models legitimately stop at bounded
-    /// `MaxSeq`/`MaxN` terminals.
-    ///
-    /// DISCIPLINE (empirically enforced by `ty`): a model checked this way MUST
-    /// give every legitimate work-complete terminal an explicit guarded
-    /// zero-update `Done` self-loop, because TLA+ `[Next]_vars` stuttering does
-    /// NOT count as an enabled step for deadlock purposes — without it `ty`
-    /// flags the clean terminal as a deadlock. With it, the only reported
-    /// deadlock is a genuine all-parties-parked wedge.
+    /// A model checked this way gives every legitimate terminal an explicit guarded zero-update
+    /// `Done` self-loop: `[Next]_vars` stuttering is not an enabled step for deadlock purposes,
+    /// so without one `ty` flags the clean terminal.
     #[must_use]
     pub fn to_cfg_deadlock_with(&self, overrides: &[(&'static str, i64)]) -> String {
         self.to_cfg_with(overrides)
             .replace("CHECK_DEADLOCK FALSE\n", "CHECK_DEADLOCK TRUE\n")
     }
 
-    /// Config for [`transition_spec`](Self::transition_spec): binds each model
-    /// constant (with optional `overrides`, e.g. the real ring capacity instead of
-    /// the small exhaustive-check bound). Used for per-transition conformance —
-    /// `ty trace validate --spec` then strictly checks the real `prev -> next`
-    /// step against the derived `Next`. It names no state: the spec's `Init` is
-    /// open, so one cfg serves every transition of a `(model, overrides)`.
-    // Skip: `Extend`/format (absent std bodies). Spec-model cfg emission, same
-    // tier as `to_tla`.
+    /// Config for [`transition_spec`](Self::transition_spec): each constant bound (with
+    /// `overrides`, e.g. the real ring capacity in place of the exhaustive-check bound) and no
+    /// state, since the spec's `Init` is open; one cfg serves every transition of a
+    /// `(model, overrides)` under `ty trace validate --spec`.
+    // Skip: `Extend`/format (absent std bodies).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn transition_cfg(&self, overrides: &[(&'static str, i64)]) -> String {
         let mut s = String::new();
@@ -813,49 +736,35 @@ impl Model {
     }
 
     /// The initial concrete state (variable -> value).
-    // Skip: `collect::<BTreeMap>` bottoms out at tree-node allocation (abort,
-    // not panic, on OOM — but the toolchain cannot yet see through the
-    // generic collect) and `&'static str` Ord (total). Audited-alloc class;
-    // verify-only. Re-measured 2026-09-27 on seal 321aaeda7 with this skip
-    // removed: INCONCLUSIVE (its 1 obligation unknown). Needed from $HOME/trust,
-    // in a promoted seal: totality for generic `collect` (TRUST_100PCT_PLAN
-    // T3); then drop this.
+    // Skip: `collect::<BTreeMap>` allocates, and the toolchain cannot yet see through the
+    // generic `collect`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn init_state(&self) -> BTreeMap<&'static str, i64> {
         self.vars.iter().map(|v| (v.name, v.init)).collect()
     }
 
-    /// The `(machine, action)` anchor targets this model declares — the spec→source
-    /// half of the cross-reference (TRUST_NATIVE_TLA §2.1). The closure gate
-    /// (`crate::xref::check_closure`) resolves each `#[refines(machine, action)]`
-    /// against this set: obligation 1 (the action exists in the model) and the
-    /// coverage obligation (every action is bound-or-waived). `machine` is the
-    /// model's own `name` for every action.
+    /// The `(machine, action)` anchor targets this model declares (`machine` is the model's
+    /// `name`). `crate::xref::check_closure` resolves each `#[refines(machine, action)]`
+    /// against this set: the action must exist, and every action is bound or waived.
     pub fn anchors(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
         self.actions.iter().map(move |a| (self.name, a.name))
     }
 
-    /// Every next-state reachable by firing `action` from `state` — the executable
-    /// twin of the generated TLA+ action's existential fan-out. TLA+ primed
-    /// semantics: every right-hand side is evaluated against the PRE-state, then
-    /// applied atomically. A purely deterministic action yields exactly ONE
-    /// successor; an action with a nondeterministic [`Expr::InRange`] update yields
-    /// one successor per value in its bounded `lo..=hi` range (the cartesian product
-    /// when several updates are nondeterministic). Returns an EMPTY vector if the
-    /// guard is unsatisfied OR any range is empty (`lo > hi`) — exactly the states
-    /// where the generated `var' \in {}` makes the TLA+ action disabled.
-    // Skip: the residual row is the `vec![..]` macro's idiomatic allocation
-    // panic (the lz4 vec!-wrapper precedent); the product arithmetic above is
-    // clamped and proven. Model-derivation machinery, same tier as `eval`.
+    /// Every next state reachable by firing `action` from `state`: the executable twin of the
+    /// TLA+ action's fan-out. Every right-hand side is evaluated against the pre-state, then
+    /// applied. A deterministic action yields one successor; [`Expr::InRange`] updates yield one
+    /// per value in `lo..=hi` (the cartesian product for several). Empty when the guard fails or
+    /// a range is empty (`lo > hi`), exactly where the TLA+ action is disabled.
+    // Skip: the residual row is the `vec![..]` allocation panic; the product arithmetic is
+    // clamped and proven.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn successors(
         &self,
         action: &str,
         state: &BTreeMap<&'static str, i64>,
     ) -> Vec<BTreeMap<&'static str, i64>> {
-        // `let-else` (not an `unwrap_or_else` closure) so the intentional
-        // unknown-action panic is attributed to `successors` itself rather than a
-        // standalone always-panicking closure; same panic, same message.
+        // `let-else`, not an `unwrap_or_else` closure, so the unknown-action panic is
+        // `successors`' own.
         let Some(act) = self.actions.iter().find(|a| a.name == action) else {
             panic!("no action `{action}` in model `{}`", self.name)
         };
@@ -863,13 +772,10 @@ impl Model {
         self.successors_in(act, &env, state)
     }
 
-    /// [`Model::successors`] with the action ALREADY resolved and the evaluation
-    /// environment ALREADY built — the form the BFS drivers in [`crate::interp`]
-    /// use, where both are loop-invariant across one popped state. `successors`
-    /// is the by-name wrapper over this; the semantics are identical.
+    /// [`Model::successors`] with the action resolved and the environment built, as
+    /// [`crate::interp`]'s BFS calls it (both are loop-invariant across one state).
     ///
-    /// `env` must be [`Model::eval_env`] of `state` (consts, then state on top);
-    /// passing any other map changes what the guard and update expressions see.
+    /// `env` must be [`Model::eval_env`] of `state`.
     // Skip: same class as `successors`, whose body this is.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn successors_in(
@@ -881,28 +787,21 @@ impl Model {
         if act.guard.as_ref().is_some_and(|g| !g.eval(env).as_bool()) {
             return Vec::new();
         }
-        // Evaluate each update against the PRE-state into a list of candidate values
-        // (one for a deterministic `=`, many for a nondeterministic `\in lo..hi`).
+        // Each update's candidates against the pre-state: one for `=`, the range for `\in`.
         let choices: Vec<(&'static str, Vec<i64>)> = act
             .updates
             .iter()
             .map(|u| match &u.expr {
                 Expr::InRange(lo, hi) => {
-                    // Function-path `Deref::deref` (not autoderef): the coercion
-                    // spelling INLINES std's Box-deref unsafe block into this
-                    // frame, where the L0 gate refutes it for lacking a local
-                    // SAFETY comment; the fn-path call stays an opaque callee
-                    // (total via the std-wrapper deref sentinel). Same `eval`
-                    // calls in the same order — behavior-identical.
+                    // Function-path `Deref::deref`, not autoderef: the coercion inlines std's
+                    // Box-deref `unsafe` block here, which the L0 gate refutes for lacking a
+                    // local safety comment.
                     let lo: &Expr = std::ops::Deref::deref(lo);
                     let hi: &Expr = std::ops::Deref::deref(hi);
                     let (l, h) = (lo.eval(env).as_int(), hi.eval(env).as_int());
-                    // Bounded push loop (not `(l..=h).collect()`, whose
-                    // `RangeInclusive` iterator internals the Trust L0 gate cannot
-                    // bound): pushes exactly the values `l..=h` ascending — empty
-                    // when `l > h`, and the pre-increment `v == h` break makes the
-                    // `h == i64::MAX` endpoint wrap-free, exactly like the
-                    // range's own exhaustion check. Behavior-identical.
+                    // A bounded push loop, not `(l..=h).collect()`, whose `RangeInclusive`
+                    // internals the Trust L0 gate cannot bound: `l..=h` ascending, empty when
+                    // `l > h`, and the `v == h` break keeps an `i64::MAX` endpoint wrap-free.
                     let mut vals = Vec::new();
                     let mut v = l;
                     while v <= h {
@@ -910,10 +809,7 @@ impl Model {
                         if v == h {
                             break;
                         }
-                        // Wrapping: unreachable at `i64::MAX` (the `v == h` break
-                        // above fired first, since `v <= h` held), so `v < h` here
-                        // and the increment can never wrap — a no-op discharge of
-                        // the overflow obligation (Trust L0).
+                        // Cannot wrap: the `v == h` break fired first, so `v < h` here.
                         v = v.wrapping_add(1);
                     }
                     (u.var, vals)
@@ -921,29 +817,22 @@ impl Model {
                 e => (u.var, vec![e.eval(env).as_int()]),
             })
             .collect();
-        // Cartesian product over the per-update choice lists. Starts from the
-        // unchanged pre-state (so variables no action touches stay put), then
-        // branches each successor over every choice — ascending, so the FIRST
-        // successor takes every range's lower bound (the canonical representative
-        // `fire` selects). An empty choice list collapses the product to none.
+        // Cartesian product from the unchanged pre-state, ascending: the first successor takes
+        // every range's lower bound (the representative `fire` selects). An empty choice list
+        // leaves no successor.
         let mut acc: Vec<BTreeMap<&'static str, i64>> = vec![state.clone()];
         for (var, vals) in choices {
-            // Deterministic update (`var' = expr`, the overwhelming majority):
-            // exactly one candidate, so write it into every accumulated state IN
-            // PLACE instead of cloning the accumulator (-20% on a full-registry
-            // BMC sweep). Accumulator order is preserved, so the successor `fire`
-            // reads as the canonical representative is unchanged.
+            // Deterministic update (the common case): write the one candidate in place instead
+            // of cloning the accumulator (-20% on a full-registry BMC sweep). Order is kept, so
+            // `fire`'s canonical successor is unchanged.
             if let [only] = vals[..] {
                 for s in &mut acc {
                     s.insert(var, only);
                 }
                 continue;
             }
-            // Capacity is a pure pre-size HINT: saturating_mul kills the Mul
-            // overflow obligation and the clamp bounds the up-front
-            // allocation below the L0 unbounded-allocation gate; `push` grows
-            // past the hint as needed, so contents are identical for every
-            // input (successor counts are model-bounded in practice).
+            // A pre-size hint only: `saturating_mul` and the clamp keep the allocation
+            // bounded for the L0 gate; `push` grows past it.
             let cap = acc.len().saturating_mul(vals.len()).min(4096);
             let mut next = Vec::with_capacity(cap);
             for base in &acc {
@@ -958,12 +847,10 @@ impl Model {
         acc
     }
 
-    /// Fire a named action against `state`, applying the CANONICAL successor (TLA+
-    /// primed semantics). Returns `false` without mutating if the action is disabled
-    /// (guard unsatisfied or an empty nondeterministic range). For a deterministic
-    /// action this is the unique successor; for a nondeterministic one it is the
-    /// lower-bound representative — drive [`Model::successors`] directly to explore
-    /// the full fan-out. This is the executable twin of the generated TLA+ action.
+    /// Fire a named action against `state`, applying its canonical successor: the unique one
+    /// for a deterministic action, the lower-bound representative for a nondeterministic one
+    /// ([`Model::successors`] explores the fan-out). Returns `false`, leaving `state` alone,
+    /// when the action is disabled (guard unsatisfied or an empty range).
     pub fn fire(&self, action: &str, state: &mut BTreeMap<&'static str, i64>) -> bool {
         match self.successors(action, state).into_iter().next() {
             Some(next) => {
@@ -974,16 +861,12 @@ impl Model {
         }
     }
 
-    /// Whether `action`'s guard is satisfied in `state` (no guard ⇒ always
-    /// enabled). This lets real code be checked against the model's ACTUAL guard
-    /// expression — e.g. a conformance test can assert the real subscriber gaps
-    /// exactly when `PollGap` is enabled — rather than re-stating the predicate.
-    // AUDITED CONTRACT PANIC (T9): an unknown action name is a spec-linkage
-    // typo; failing closed here is the documented contract (a default bool
-    // would silently mask it).
+    /// Whether `action`'s guard holds in `state` (no guard ⇒ enabled), so a conformance test
+    /// checks real code against the model's own guard (the real subscriber gaps exactly when
+    /// `PollGap` is enabled) instead of restating it.
+    // Contract panic: an unknown action name is a spec-linkage typo a default bool would mask.
     #[cfg_attr(trust_verify, trust::contract_panic(message_contains = "no action `"))]
-    // Skip: BTreeMap keyed reads + the annotated model-type-error contract
-    // panics it drives (same tier as `check_invariant`/`eval`).
+    // Skip: BTreeMap keyed reads and `eval`'s contract panics.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn action_enabled(&self, action: &str, state: &BTreeMap<&'static str, i64>) -> bool {
         // `let-else` (not an `unwrap_or_else` closure): see `successors`.
@@ -998,14 +881,12 @@ impl Model {
     }
 
     /// Evaluate a named invariant against a concrete state.
-    // AUDITED CONTRACT PANIC (T9): same fail-closed contract as
-    // `action_enabled`, for invariant names.
+    // Contract panic: an unknown invariant name fails closed, as in `action_enabled`.
     #[cfg_attr(
         trust_verify,
         trust::contract_panic(message_contains = "no invariant `")
     )]
-    // Skip: BTreeMap keyed reads + the deliberate model-type-error contract
-    // panics (annotated on `eval`, which this drives). Spec-model machinery.
+    // Skip: BTreeMap keyed reads and `eval`'s contract panics.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn check_invariant(&self, name: &str, state: &BTreeMap<&'static str, i64>) -> bool {
         // `let-else` (not an `unwrap_or_else` closure): see `successors`.
@@ -1016,14 +897,11 @@ impl Model {
         self.check_invariant_in(inv, &env)
     }
 
-    /// [`Model::check_invariant`] with the invariant ALREADY resolved and the
-    /// evaluation environment ALREADY built — the [`Model::successors_in`] twin,
-    /// for the BFS in [`crate::interp`] where both are loop-invariant across one
-    /// popped state. `check_invariant` is the by-name wrapper over this.
+    /// [`Model::check_invariant`] with the invariant resolved and the environment built: the
+    /// [`Model::successors_in`] twin for [`crate::interp`]'s BFS.
     ///
     /// `env` must be [`Model::eval_env`] of the state under test.
-    // Skip: same class as `check_invariant`, whose body this is (the deliberate
-    // model-type-error contract panics are annotated on `eval`, which it drives).
+    // Skip: same class as `check_invariant`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn check_invariant_in(&self, inv: &Invariant, env: &BTreeMap<&'static str, i64>) -> bool {
         inv.expr.eval(env).as_bool()
@@ -1213,16 +1091,16 @@ fn not_range_bounds(e: &Expr, consts: &[(&str, i64)]) -> Vec<String> {
 pub mod props {
     use super::*;
 
-    /// LOOSEN the buggy case: `(Buggy = 1 \/ cond)` — Buggy admits MORE (ordering).
+    /// Loosen the buggy case: `(Buggy = 1 \/ cond)`, so Buggy admits more (ordering).
     fn or_buggy(cond: Expr) -> Expr {
         or_(eq(cst("Buggy"), int(1)), cond)
     }
-    /// RESTRICT to `cond` when buggy; correct admits freely: `(Buggy = 0 \/ cond)`.
+    /// Restrict to `cond` only when buggy: `(Buggy = 0 \/ cond)`.
     fn or_correct(cond: Expr) -> Expr {
         or_(eq(cst("Buggy"), int(0)), cond)
     }
 
-    // ---- CLASS 1: lifecycle / no-leak ----
+    // Lifecycle / no-leak.
     pub struct Lifecycle {
         pub name: &'static str,
         pub live: &'static str,
@@ -1233,15 +1111,13 @@ pub mod props {
         pub release: &'static str,
         pub inv: &'static str,
     }
-    /// `acquire` bumps both counters (bounded by `max`); `release` decrements `live`
-    /// always and `reg` UNLESS Buggy (forgot to deregister). Invariant `reg =< live`.
+    /// `acquire` bumps both counters (bounded by `max`); `release` decrements `live` always and
+    /// `reg` unless Buggy (forgot to deregister). Invariant `reg =< live`.
     ///
-    /// The mutant forgets only from a sound table (`reg =< live`): one slip is all
-    /// the invariant needs to catch, and a mutant free to repeat it would strand one
-    /// more entry per spawn/close cycle, so the `Buggy = 1` space `live` bounds
-    /// would not be finite and the interpreter could not walk it.
-    // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
-    // constructor — same class as the zero-arg `*_model()` builders.
+    /// The mutant forgets only from a sound table (`reg =< live`): one slip is all the
+    /// invariant needs, and a mutant free to repeat it would strand one more entry per cycle,
+    /// leaving the `Buggy = 1` space infinite.
+    // Skip: a parameterized spec-model data constructor, like the `*_model()` builders below.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn lifecycle_no_leak(p: Lifecycle) -> Model {
         Model {
@@ -1300,7 +1176,7 @@ pub mod props {
         }
     }
 
-    // ---- CLASS 2: gated completeness ----
+    // Gated completeness.
     pub struct Gated {
         pub name: &'static str,
         pub item: &'static str,
@@ -1316,10 +1192,8 @@ pub mod props {
         pub inv: &'static str,
     }
     /// `pick` fans `item' \in 0..domain_max`; `route` sets `decided := good` iff
-    /// `item =< fwd_hi` AND (correct OR `item # drop`), else `bad`. Buggy drops the
-    /// `drop` element. Invariant: `decided=0 \/ item>fwd_hi \/ decided=good`.
-    // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
-    // constructor — same class as the zero-arg `*_model()` builders.
+    /// `item =< fwd_hi` and (correct or `item # drop`), else `bad`, so Buggy drops the `drop`
+    /// element. Invariant: `decided=0 \/ item>fwd_hi \/ decided=good`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn gated_completeness(p: Gated) -> Model {
         Model {
@@ -1375,7 +1249,7 @@ pub mod props {
         }
     }
 
-    // ---- CLASS 3: happens-before (latch-pair ordering) ----
+    // Happens-before (latch-pair ordering).
     pub struct Ordering {
         pub name: &'static str,
         pub a: &'static str,
@@ -1386,8 +1260,6 @@ pub mod props {
     }
     /// `a_act` sets `a:=1`; `b_act` (guard `b=0 /\ (Buggy=1 \/ a=1)`) sets `b:=1`.
     /// Buggy lets `b` race ahead of `a`. Invariant: `b=0 \/ a=1`.
-    // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
-    // constructor — same class as the zero-arg `*_model()` builders.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn happens_before(p: Ordering) -> Model {
         Model {
@@ -1424,7 +1296,7 @@ pub mod props {
         }
     }
 
-    // ---- CLASS 4: teardown clears N flags ----
+    // Teardown clears N flags.
     pub struct Teardown {
         pub name: &'static str,
         pub flags: Vec<&'static str>,
@@ -1434,8 +1306,6 @@ pub mod props {
     }
     /// `act` (guard `gate=0`) drops every flag to 0 (Buggy leaves them 1) and sets
     /// `gate:=1`. Invariant: `gate=0 \/ AND(flag=0)`. Flags init 1.
-    // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
-    // constructor — same class as the zero-arg `*_model()` builders.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn teardown_clears(p: Teardown) -> Model {
         let mut vars: Vec<StateVar> = p
@@ -1459,9 +1329,8 @@ pub mod props {
             var: p.gate,
             expr: int(1),
         });
-        // Conjoin `flag = 0` over every flag. `reduce` yields `None` only for an
-        // empty flag list, whose conjunction is TRUE, so the total completion is
-        // exact and carries no panic obligation (Trust L0), unlike `expect`.
+        // `reduce` yields `None` only for an empty flag list, whose conjunction is TRUE: total,
+        // with no panic obligation (unlike `expect`).
         let closed = p
             .flags
             .iter()
@@ -1486,7 +1355,7 @@ pub mod props {
         }
     }
 
-    // ---- CLASS 5: two-stage leak (info-flow) ----
+    // Two-stage leak (info-flow).
     pub struct TwoStage {
         pub name: &'static str,
         pub stage: &'static str,
@@ -1499,11 +1368,8 @@ pub mod props {
         pub inv: &'static str,
         pub inv_expr: Expr,
     }
-    /// `stage_act` (guard `stage=0`) sets `stage := stage_rhs`; `leak_act` (guard
-    /// caller-supplied) sets `leak := leak_rhs`. The RHS exprs let the leak fire on a
-    /// stage VALUE (secrecy) or on `Buggy` directly.
-    // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
-    // constructor — same class as the zero-arg `*_model()` builders.
+    /// `stage_act` (guard `stage=0`) sets `stage := stage_rhs`; `leak_act` (caller's guard)
+    /// sets `leak := leak_rhs`, so the leak can fire on a stage value (secrecy) or on `Buggy`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn two_stage_leak(p: TwoStage) -> Model {
         Model {
@@ -1546,7 +1412,7 @@ pub mod props {
         }
     }
 
-    // ---- CLASS 6: liveness / no-wedge ----
+    // Liveness / no-wedge.
     pub struct Wedge {
         pub name: &'static str,
         pub buffered: &'static str,
@@ -1558,13 +1424,10 @@ pub mod props {
         pub done: &'static str,
         pub inv: &'static str,
     }
-    /// Two-party request→relay→reply. `relay` guard `(Buggy=0 \/ relayed>0) /\
-    /// buffered>0` (Buggy demands a fresh read before the first relay → wedge);
-    /// `recv` serves the client; `done` is the MANDATORY guarded zero-update
-    /// self-loop on the served terminal (else `ty` flags it as a false deadlock).
-    /// Pair with [`Model::to_cfg_deadlock_with`].
-    // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
-    // constructor — same class as the zero-arg `*_model()` builders.
+    /// Two-party request→relay→reply. `relay` is guarded by `(Buggy=0 \/ relayed>0) /\
+    /// buffered>0` (Buggy demands a fresh read before the first relay: a wedge); `recv` serves
+    /// the client; `done` is the guarded zero-update self-loop the served terminal needs under
+    /// [`Model::to_cfg_deadlock_with`].
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn no_wedge(p: Wedge) -> Model {
         Model {
@@ -1627,7 +1490,7 @@ pub mod props {
         }
     }
 
-    // ---- CLASS 7: conjunctive authorization soundness ----
+    // Conjunctive authorization soundness.
     pub struct ConjunctiveAuthz {
         pub name: &'static str,
         pub guards: Vec<&'static str>,
@@ -1637,13 +1500,11 @@ pub mod props {
         pub drop: &'static str,
         pub inv: &'static str,
     }
-    /// `pick` sets each guard nondeterministically in `{0,1}`; `decide` PERMITS (2)
-    /// iff EVERY guard holds, else DENIES (1) — except Buggy IGNORES the `drop` guard.
-    /// Which conjunct is dropped is the bug class: dst → confused-deputy, op → op
-    /// confusion, nonce → replay, token → forgery. Invariant: a permit implies EVERY
-    /// guard truly held (authorization SOUNDNESS — the `decide_edge` predicate).
-    // Skip (T2 vcgen-budget lane): a PARAMETERIZED spec-model data
-    // constructor — same class as the zero-arg `*_model()` builders.
+    /// `pick` sets each guard nondeterministically in `{0,1}`; `decide` permits (2) iff every
+    /// guard holds, else denies (1), except that Buggy ignores the `drop` guard. Which conjunct
+    /// is dropped is the bug class: dst → confused deputy, op → op confusion, nonce → replay,
+    /// token → forgery. Invariant: a permit implies every guard held (`decide_edge`'s
+    /// soundness).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn conjunctive_authz(p: ConjunctiveAuthz) -> Model {
         let mut vars: Vec<StateVar> = p
@@ -1663,9 +1524,8 @@ pub mod props {
                 expr: in_range(int(0), int(1)),
             })
             .collect();
-        // Permit condition: AND of all guards; the `drop` conjunct is WAIVED when Buggy.
-        // The empty conjunction is TRUE — the same total completion (and rationale)
-        // as `teardown_clears` above; every real caller passes non-empty guards.
+        // Permit: every guard, with the `drop` conjunct waived when Buggy (the empty
+        // conjunction is TRUE, as in `teardown_clears`).
         let permit_when = p
             .guards
             .iter()
@@ -1678,7 +1538,7 @@ pub mod props {
             })
             .reduce(and_)
             .unwrap_or_else(|| bool_lit(true));
-        // Soundness: a permit must imply EVERY guard actually held (no Buggy waiver).
+        // Soundness: a permit implies every guard held (no waiver).
         let all_hold = p
             .guards
             .iter()
@@ -1716,11 +1576,10 @@ pub mod props {
 
 /// Three-slot GPU frame ring (`slot0_in_flight..slot2_in_flight`, `cursor` in `0..2`).
 ///
-/// * At `Buggy = 0`, staging the next frame waits only if the target ring slot
-///   `cursor` is still in flight on the GPU, then marks `cursor` in flight and
-///   advances `cursor = (cursor + 1) % 3`, proving `NoOverwriteInFlight`.
-/// * At `Buggy = 1`, staging into `cursor` without awaiting that slot's prior
-///   GPU completion overwrites an in-flight buffer.
+/// * At `Buggy = 0`, staging waits while slot `cursor` is in flight on the GPU, then marks it
+///   in flight and advances `cursor`, proving `NoOverwriteInFlight`.
+/// * At `Buggy = 1`, staging into `cursor` without awaiting its prior GPU completion
+///   overwrites an in-flight buffer.
 #[must_use]
 #[cfg(feature = "anchors")]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1773,16 +1632,15 @@ pub fn gpu_frame_ring_model() -> Model {
     }
 }
 
-/// Single-hold predictive echo reconciliation across `ExtractSnapshot`,
-/// `PtyEchoArrives`, `Reconcile`, and `PaintFrame`.
+/// Single-hold predictive echo reconciliation across `ExtractSnapshot`, `PtyEchoArrives`,
+/// `Reconcile` and `PaintFrame`.
 ///
-/// * At `Buggy = 0`, `Reconcile` reads from the already-extracted snapshot
-///   (`snap_echoed`), proving `NoBlankEchoFrame` (`snap_echoed == 1 || ghost_visible == 1`
-///   whenever a predicted char is in flight).
-/// * At `Buggy = 1`, `Reconcile` re-locks the session mutex and reads `live_echoed`
-///   after `PtyEchoArrives` interleaved between `ExtractSnapshot` (`snap_echoed == 0`)
-///   and `Reconcile` (`live_echoed == 1`), retiring the ghost (`ghost_visible = 0`)
-///   while `snap_echoed == 0` — catching the 1-frame blank-cell flicker.
+/// * At `Buggy = 0`, `Reconcile` reads the extracted snapshot (`snap_echoed`), proving
+///   `NoBlankEchoFrame` (`snap_echoed == 1 || ghost_visible == 1` while a predicted char is in
+///   flight).
+/// * At `Buggy = 1`, `Reconcile` re-locks the session and reads `live_echoed` after an echo
+///   arrived between `ExtractSnapshot` and `Reconcile`, retiring the ghost while
+///   `snap_echoed == 0`: a one-frame blank cell.
 #[must_use]
 #[cfg(feature = "anchors")]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -2074,10 +1932,7 @@ mod tests {
 
     #[test]
     fn sub_with_additive_rhs_parenthesizes_to_match_the_interpreter() {
-        // Soundness regression: TLA+ +/- are left-associative, so a subtraction with a
-        // compound additive RIGHT operand must be parenthesized or the rendered spec
-        // encodes different arithmetic than Expr::eval. Assert to_tla() and eval()
-        // agree for both shapes.
+        // An additive right operand of `-` is parenthesized, so `to_tla` and `eval` agree.
         let env = BTreeMap::new();
 
         // 5 - (2 - 1): eval = 4; bare `5 - 2 - 1` would be (5-2)-1 = 2.
@@ -2094,16 +1949,14 @@ mod tests {
         );
         assert_eq!(e2.eval(&env).as_int(), 2);
 
-        // Left operand and non-additive RHS stay bare (no needless parens, so no
-        // golden-string test regresses): (5 - 2) - 1 renders `5 - 2 - 1`.
+        // A left operand and a non-additive RHS stay bare: (5 - 2) - 1 renders `5 - 2 - 1`.
         let e3 = sub(sub(int(5), int(2)), int(1));
         assert_eq!(e3.to_tla(), "5 - 2 - 1", "left-nested Sub needs no parens");
         assert_eq!(e3.eval(&env).as_int(), 2);
     }
 
-    /// Pin the fail-closed policy of the crossed `Value` accessor arms: an
-    /// ill-typed model Expr must PANIC (same contract class as eval's
-    /// unbound-identifier arm), never quietly evaluate to a default.
+    /// An ill-typed Expr panics, as `eval`'s unbound-identifier arm does, never evaluating to a
+    /// default.
     #[test]
     #[should_panic(expected = "expected Int, got Bool")]
     fn ill_typed_int_position_fails_closed() {

@@ -77,9 +77,8 @@ fn an_unknown_verbs_help_still_needs_the_server() {
     );
 }
 
-/// An explicit `help <protocol verb>` is the server's question (its `cmd_help`
-/// answers for its own build), so it dials and fails on a dead socket; only
-/// `<verb> --help` is answered from the client's table.
+/// An explicit `help <protocol verb>` is the server's question (it answers for its own
+/// build), so it dials; only `<verb> --help` is answered from the client's table.
 #[test]
 fn an_explicit_help_verb_still_asks_the_server() {
     let out = ctl(&["help", "text"]);

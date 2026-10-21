@@ -11,9 +11,9 @@
 //!
 //! | Site | Records |
 //! |---|---|
-//! | `SessionStore::register` | `open - spawn\|adopt\|restore parent=<sid> epoch=<ep>`, a restore's with `prev=<sid> lineage=<sid>` |
+//! | `SessionStore::register` | `open - spawn\|adopt\|restore parent=<sid> epoch=<ep> state=<w>`, a restore's with `prev=<sid> lineage=<sid>`; `mark - state state=<w> carried=1` for a carried session already open (phase 6, 6F-7) |
 //! | `App::carry_restored_lineage` | `amend - restore prev= lineage=` when a window's already-open bootstrap fills a restored leaf |
-//! | `SessionStore::deregister_local_as` | `close - out=<reason> by= code=` |
+//! | `SessionStore::deregister_local_as` | `close - out=<reason> by= code= closer=<raw actor>` (the closer at the content tier, ruling U12) |
 //! | the status sweep's block read | `open r<n> cmd blk= detail=` at OSC 133 C; `close r<n> out= code= dur_ms=` at D (the program and agent runs under it first, at the same instant); both, `dur=wall`, for a block the sweep saw only finished; `gap why=evicted` for blocks the terminal dropped unread |
 //! | `note_foreground_group`, `set_program` | `open`/`close r<n> prog\|agent prog=`; `amend r<n> agent prog=` when a group's name confirms the agent the screen named |
 //! | `settle_agent_word` | `mark agent word= rev= gen= fp=`, and the [`TurnTracker`]'s turns and steps |
@@ -51,7 +51,9 @@
 //! (`handoff_carry`, its `log` member: at most 128 KiB of carry lines cut in
 //! the eviction order, with the producers' own state, `session_log_carry`),
 //! for a successor that reads it. The successor continues it at the next
-//! epoch with `mark - handoff carried=<n> shed=<m>`, every run, turn and step
+//! epoch with `mark - handoff carried=<n> shed=<m> build=<n>` (the
+//! predecessor's build, phase 6, 6F-7; the uncarried gap names it too),
+//! every run, turn and step
 //! still open (an agent mid-turn stays in that turn, a command running
 //! across the update closes with its real code when its D comes), and the
 //! outgoing process's readers are fenced at what it carried until it exits
@@ -714,6 +716,9 @@ pub(crate) struct SessionLog {
     person_seen: u64,
     reached_seen: u64,
     marked_through: u64,
+    /// What the codex-alab rollout tap answered for this session
+    /// (`status rollout= rollout_asks=`, [`transcript::TapAnswers`]).
+    rollout: transcript::TapAnswers,
 }
 
 /// A person's gesture as [`SessionLog::person_input`] takes it from the
@@ -806,6 +811,7 @@ impl SessionLog {
             person_seen: 0,
             reached_seen: 0,
             marked_through: 0,
+            rollout: transcript::TapAnswers::default(),
         }
     }
 }
@@ -1058,15 +1064,17 @@ impl SessionLog {
     /// takes one this log's allocator issues ([`Epochs::issue`], a crash
     /// recovery's above its keeper tag's, [`Epochs::crash`]), so no cursor of
     /// the predecessor's reads on past the loss. Called before anything else
-    /// is written.
-    pub(crate) fn adopt(&mut self, carry: LogAdopt, keeper: bool, at: Stamp) {
+    /// is written. The record that says the loss names `build`, the
+    /// predecessor's build when the update said it (`build=`, the
+    /// timeline's `handoff from_build=`; phase 6, 6F-7).
+    pub(crate) fn adopt(&mut self, carry: LogAdopt, keeper: bool, build: Option<u64>, at: Stamp) {
         // A seq count no log reaches (`aterm_slog::SEQ_LIMIT`: a manifest
         // that is corrupt or another program's) is none: `Log::from_carry`
         // refuses it, and `Log::after_handoff` starts a new seq space for it,
         // so this process's ceiling is always above its own head.
         // A carry that reads continues the predecessor's log as it stood.
         if !keeper && let (Some(lines), Some(ids)) = (carry.lines.as_deref(), carry.ids) {
-            match self.adopt_carried(lines, ids, carry.seq, at) {
+            match self.adopt_carried(lines, ids, carry.seq, build, at) {
                 Ok(_) => return,
                 Err(why) => aterm_log::warn!(
                     "update adopt: a session's carried log did not read ({}); it starts over \
@@ -1081,19 +1089,20 @@ impl SessionLog {
             (true, _) => {
                 let ep = self.epochs.crash(carry.keeper_ep, at);
                 let mut log = Log::with_limits(ep, ring_limits());
-                log.gap(GapWhy::Crash, 0, at);
+                log.gap_built(GapWhy::Crash, 0, build, at);
                 log
             }
             (false, Some(c)) => {
                 let ep = c.ep.saturating_add(1);
                 self.epochs.note(ep);
-                Log::after_handoff(ep, ring_limits(), c.ids, next_seq, at)
+                Log::after_handoff_built(ep, ring_limits(), c.ids, next_seq, build, at)
             }
-            (false, None) => Log::after_handoff(
+            (false, None) => Log::after_handoff_built(
                 self.epochs.issue(at, 0),
                 ring_limits(),
                 IdCounters::default(),
                 next_seq,
+                build,
                 at,
             ),
         };
@@ -1205,9 +1214,14 @@ impl SessionLog {
         self.lineage
     }
 
-    /// `open - spawn|adopt|restore parent=<sid> epoch=<ep>`: the registry took
-    /// the session in.
-    pub(crate) fn open_session(&mut self, parent: Option<&str>, at: Stamp) {
+    /// `open - spawn|adopt|restore parent=<sid> epoch=<ep> state=<w>`: the
+    /// registry took the session in, in lifecycle state `state` (the
+    /// timeline's `spawned state=` row, in its hold; phase 6, 6F-7). A
+    /// session whose carried log holds its open already (a seamless
+    /// update's successor) says the registration as `mark - state
+    /// state=<w> carried=1`: local, as the row is, where an amend of the
+    /// session would be the bus class's.
+    pub(crate) fn open_session(&mut self, parent: Option<&str>, state: Option<&str>, at: Stamp) {
         let f = with(
             Fields::new(),
             Key::Parent,
@@ -1223,27 +1237,60 @@ impl SessionLog {
                 .flatten()
                 .map(Val::Id),
         );
-        if self
-            .log
-            .open_session(self.origin, Src::Aterm, Conf::Exact, Actor::Nobody, f, at)
-            .is_ok()
-        {
-            self.opened_wall = Some(at.wall_ms);
+        let said = |f: Fields| match state {
+            Some(w) => f.clone().word(Key::State, w).unwrap_or(f),
+            None => f,
+        };
+        match self.log.open_session(
+            self.origin,
+            Src::Aterm,
+            Conf::Exact,
+            Actor::Nobody,
+            said(f),
+            at,
+        ) {
+            Ok(_) => self.opened_wall = Some(at.wall_ms),
+            Err(aterm_slog::Refused::AlreadyOpen) if state.is_some() => {
+                let f = said(Fields::new());
+                let f = f.clone().u(Key::Carried, 1).unwrap_or(f);
+                let _ = self.log.mark(
+                    Mark::new(Kind::State, Src::Aterm, Conf::Exact)
+                        .at(Node::SESSION)
+                        .fields(f),
+                    at,
+                );
+            }
+            Err(_) => {}
         }
     }
 
-    /// `close - out=<reason> by=<actor> code=<n>`: the registry let it go.
-    /// Everything still open closes under it, innermost first, `out=gone`.
+    /// `close - out=<reason> by=<actor> code=<n> closer=<raw>`: the registry
+    /// let it go. Everything still open closes under it, innermost first,
+    /// `out=gone`. `closer` is the raw actor that closed it (the timeline's
+    /// `closing by=`, `-` for none): CONTENT tier, RAM only, beside `by=`,
+    /// which says `-` for a sid no one minted (3A's R1; phase 6, 6F-7,
+    /// ruling U12).
     pub(crate) fn close_session(
         &mut self,
         out: SessionOut,
         by: Actor,
+        closer: &str,
         code: Option<i32>,
         at: Stamp,
     ) {
         // A name still waiting ran too: it opens, and closes with the rest.
         self.name_pending(self.cmd, None);
+        // The program's newest state its bucket held is written, never lost.
+        self.flush_program(at);
         let f = with(Fields::new(), Key::Code, code.map(|c| Val::I(i64::from(c))));
+        let f = with(
+            f,
+            Key::Closer,
+            (closer != "-")
+                .then(|| aterm_slog::BoundedText::new(Key::Closer, closer))
+                .flatten()
+                .map(Val::Text),
+        );
         let close = Close::new(Out::Session(out), Src::Aterm, Conf::Exact)
             .by(by)
             .fields(f);
@@ -1574,9 +1621,25 @@ impl SessionLog {
         if let Some(ms) = wall_ms {
             close = close.dur_wall(ms);
         }
-        if self.log.close(node, close, at).is_ok() {
+        if self.close_node(node, close, at).is_ok() {
             self.cmd_end = Some(self.cmd_end.map_or(at, |e| later(e, at)));
         }
+    }
+
+    /// EVERY RUN THIS LOG CLOSES CLOSES HERE (the session's own close is
+    /// [`Self::close_session`]): the program state the program marks'
+    /// bucket still holds for the run `node` closes (it is that run or holds
+    /// it) is written on that run first ([`Self::settle_program`]; 6F-4,
+    /// U44), so a run's newest state is its own, never the next run's in
+    /// front nor the deepest node left open.
+    fn close_node(
+        &mut self,
+        node: Node,
+        close: Close,
+        at: Stamp,
+    ) -> Result<u64, aterm_slog::Refused> {
+        self.settle_program(node, at);
+        self.log.close(node, close, at)
     }
 
     /// Whether the open node `node` lies under the open node `root`.
@@ -1995,7 +2058,7 @@ impl SessionLog {
     /// `cmd` run is remembered there, so the command never closes before it.
     fn close_run(&mut self, node: Node, out: RunOut, at: Stamp) {
         let under_cmd = self.cmd.is_some_and(|c| self.descends(node, c.node));
-        let closed = self.log.close(
+        let closed = self.close_node(
             node,
             Close::new(Out::Run(out), Src::Status, Conf::Strong),
             at,

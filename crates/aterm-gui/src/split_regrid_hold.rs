@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SPLIT'S TAKE-BACK HOLD: a pane a split shrank does not grow back to its
+//! The split's take-back hold: a pane a split shrank does not grow back to its
 //! pre-split grid until the shrink has stood [`SPLIT_REGRID_QUIET`].
 //!
 //! The incident (2026-09-29, two independent skeptics): an agent runs
@@ -30,31 +30,9 @@
 //! from it is no shrink worth holding: closing the ORIGINAL pane at once grows
 //! the newborn to the full rect straight away.
 //!
-//! What it never delays: every target but the collapse's take-back. A live
-//! window drag, a scale or font re-grid, the control `resize` verb, a divider
-//! drag, a pane ZOOM or a second split re-lays the pane without a collapse,
-//! and that resize applies at once — and ends the hold, whether or not it
-//! happens to land on the pre-split grid (a zoom inside the quiet does). Once a
-//! collapse has withheld the take-back, a later re-lay to that same grid (a
-//! redraw's pass) keeps withholding it until the quiet ends; any other target
-//! applies and ends it. A split that stands past the quiet leaves a hold
-//! nothing consults, dropped the next time it is read. A hold that actually
-//! withheld a grow arms ONE wake at its end
-//! ([`App::split_regrid_hold_deadline`], under its own `split_regrid_hold`
-//! deadline owner), and [`App::service_split_regrid_holds`] pays the grow then
-//! in every window that shows the session THEN — not the window it was split
-//! in, which a tab move may have changed.
-//!
-//! The quiet is 250 ms, not the band's 1.5 s: it has to outlast ONE read of a
-//! `SIGWINCH` by the program's event loop (the measured flap was 8 ms), and
-//! every split takes it, a person's Cmd-D then Cmd-W included — a mistaken
-//! split, closed at once, shows its sibling at the split height with blank
-//! space below for at most this long.
-//!
-//! What a reader sees meanwhile: a control `close` answers, and a `size`,
-//! `screen` or `status` read straight after it reports, the SPLIT grid until
-//! the quiet ends; the take-back lands within [`SPLIT_REGRID_QUIET`]. An agent
-//! that needs the grown grid waits that long (or `await`s the resize).
+//! Meanwhile a control `close` answers, and a `size`, `screen` or `status` read
+//! reports, the split grid; an agent that needs the grown grid waits
+//! [`SPLIT_REGRID_QUIET`] (or `await`s the resize).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -243,7 +221,7 @@ impl App {
     }
 
     /// Pay every withheld take-back whose quiet has ended by `now`: re-grid
-    /// every window that shows its session NOW, and ask for its repaint.
+    /// every window that shows its session now, and ask for its repaint.
     pub(crate) fn service_split_regrid_holds(&mut self, now: Instant) {
         let sessions = self.split_regrid_holds.take_due(now);
         if sessions.is_empty() {

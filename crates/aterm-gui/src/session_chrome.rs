@@ -801,6 +801,7 @@ fn event_words(kind: &str) -> &str {
         "post" => "mail sent",
         "in-doubt" => "input unconfirmed",
         "task-change" => "task changed",
+        "job-change" => "job verdict changed",
         other => other,
     }
 }
@@ -839,6 +840,11 @@ pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
 /// The tooltip line that names why a tab's attention mark stands starts with
 /// this; the native hover ([`crate::toolbar`]) reads it to say the reason once.
 pub(crate) const NEEDS_ATTENTION_PREFIX: &str = "Needs attention: ";
+
+/// The hover's line for a harness's need in the worker's own words
+/// (`App::presence_hover`, design §12.2.1) starts with this in place of
+/// [`NEEDS_ATTENTION_PREFIX`]: the reason told, as that line is.
+pub(crate) const NEEDS_YOU_PREFIX: &str = "Needs you: ";
 
 /// The tooltip's `Needs attention: <reason>` line: the reason the tab's mark
 /// stands, sanitized and capped at the `attention` field's own rules and then

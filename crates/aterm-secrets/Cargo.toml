@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's credentials vault (`aterm secrets`, docs/DESIGN-secrets-2026-10-20.md): one text file of secrets, encrypted per audience to every machine's age X25519 key, signed by the vault's Ed25519 key, served from a URL (or read from a path) by a keyless long-poll server, and kept in sync into ~/.secrets on every machine. The age v1 codec and a first-party X25519 (TweetNaCl's verified ladder) compile everywhere; the files, the server, the subscriber and the services are Unix."
+
+[dependencies]
+# ChaCha20-Poly1305, HKDF-SHA256, HMAC-SHA256 and Ed25519 sign/verify. No features:
+# none of these is behind `alloc`, and randomness is aterm_uds::rand, not ring's RNG.
+ring = { workspace = true }
+# Wipes every key, file key and plaintext buffer on drop. Already in the KEEP closure
+# through rustls, so no new package.
+zeroize = { version = "1", default-features = false }
+# Padded base64 (armor, envelope fields); the unpadded canonical form age needs is a
+# wrapper over its strict decoder (`b64`).
+aterm-codec = { workspace = true }
+# SHA-256 (join codes, fingerprints, the manifest's digests).
+aterm-digest = { workspace = true }
+# `rand::fill` (keys, nonces), `spawnfd::command` (dns-sd, caffeinate, launchctl,
+# systemctl, $EDITOR, scutil), `atomic_file::write`, `peer::our_uid`.
+aterm-uds = { workspace = true }
+# `dirs::home_dir`, `fs_restricted` (0700 directories).
+aterm-types = { workspace = true }
+# The workspace clock.
+aterm-time = { workspace = true }
+# The flush a wiped file gets before it is removed (`durable_data`).
+aterm-durable = { workspace = true }
+# HTTP(S) GET/PUT/POST to the vault's URL: plain HTTP on the LAN (the payload is
+# end-to-end encrypted and signed), OS-verified TLS elsewhere.
+aterm-http = { workspace = true }
+# source.toml and state.toml, read as a value tree (no derive in this library).
+aterm-toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW / O_NONBLOCK for admitted reads.
+libc = { workspace = true }
+# Exclusive private edit directories; unfinished drafts are explicitly kept.
+aterm-tempfile = { workspace = true }
+
+[dev-dependencies]
+# The differential oracle for x25519.rs: ring's own X25519 (ephemeral keys from its
+# RNG) must agree with the first-party ladder in both directions.
+ring = { workspace = true, features = ["default"] }
+# The C2SP CCTV vectors that ship zlib-compressed.
+aterm-codec = { workspace = true }
+
+[lints]
+workspace = true

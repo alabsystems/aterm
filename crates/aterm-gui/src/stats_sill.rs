@@ -158,11 +158,11 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
                 true,
             );
         }
-        hits.push(Hit {
-            rect: (x, band_y, well_w, band_h),
-            instrument: Instrument::Jobs,
-            bar: Bar::Aterm,
-        });
+        hits.push(Hit::row(
+            (x, band_y, well_w, band_h),
+            Instrument::Processes,
+            Bar::Aterm,
+        ));
     }
     x += well_w + p.px(8.0);
 
@@ -234,11 +234,11 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
             }
             None => groove(&mut p, x, ly, cpu_w, lh),
         }
-        hits.push(Hit {
-            rect: (x, ly - rows[0].0.min(1.0), cpu_w + bracket_room, lh + 2.0),
-            instrument: Instrument::Cores,
-            bar: *bar,
-        });
+        hits.push(Hit::row(
+            (x, ly - rows[0].0.min(1.0), cpu_w + bracket_room, lh + 2.0),
+            Instrument::Cpu,
+            *bar,
+        ));
     }
     // The column's end bracket, 1 × 10 px at 2×, fills when the machine is
     // pinned so a full lane never reads as merely long.
@@ -257,11 +257,11 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
                 let cw = (2.0 * s).round();
                 p.prims
                     .push(panel(x, rows[0].0, cw, rows[0].1, 0.0, rgba(c, 0xFF)));
-                hits.push(Hit {
-                    rect: (x, 0.0, cw + 2.0, band_h),
-                    instrument: Instrument::Memory,
-                    bar: Bar::Global,
-                });
+                hits.push(Hit::row(
+                    (x, 0.0, cw + 2.0, band_h),
+                    Instrument::Memory,
+                    Bar::Global,
+                ));
                 x += cw + gap;
             }
         }
@@ -292,18 +292,18 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
             if low {
                 filling_mark(&mut p, x + disk_w + 1.0, ly, lh, inks.warn);
             }
-            hits.push(Hit {
-                rect: (x, 0.0, disk_w + p.px(4.0), band_h),
-                instrument: Instrument::Disk,
-                bar: Bar::Global,
-            });
+            hits.push(Hit::row(
+                (x, 0.0, disk_w + p.px(4.0), band_h),
+                Instrument::Disk,
+                Bar::Global,
+            ));
         } else if low && !fold.minimal {
             filling_mark(&mut p, x, rows[0].0, rows[0].1, inks.warn);
-            hits.push(Hit {
-                rect: (x, 0.0, p.px(6.0), band_h),
-                instrument: Instrument::Disk,
-                bar: Bar::Global,
-            });
+            hits.push(Hit::row(
+                (x, 0.0, p.px(6.0), band_h),
+                Instrument::Disk,
+                Bar::Global,
+            ));
         }
     }
     (p.prims, hits)
@@ -416,11 +416,11 @@ fn memory_lanes(
             a(inks.warn, 0.9),
         );
     }
-    hits.push(Hit {
-        rect: (x, 0.0, w, lh + ly + 1.0),
-        instrument: Instrument::Memory,
-        bar: Bar::Global,
-    });
+    hits.push(Hit::row(
+        (x, 0.0, w, lh + ly + 1.0),
+        Instrument::Memory,
+        Bar::Global,
+    ));
     let cap = aterm_vitals::model::gib(m.sample.total).max(f32::EPSILON);
     let scopes = [
         (Bar::Aterm, snap.aterm.as_ref(), inks.aterm, rows[1]),
@@ -442,11 +442,11 @@ fn memory_lanes(
             }
             None => groove(p, x, sy, w, sh),
         }
-        hits.push(Hit {
-            rect: (x, sy - 1.0, w, sh + 2.0),
-            instrument: Instrument::Memory,
+        hits.push(Hit::row(
+            (x, sy - 1.0, w, sh + 2.0),
+            Instrument::Memory,
             bar,
-        });
+        ));
     }
 }
 
@@ -519,21 +519,21 @@ fn core_row(
         }
         x += cols as f32 * (tile + gutter) - gutter;
     }
-    hits.push(Hit {
-        rect: (start, 0.0, x - start, band_h),
-        instrument: Instrument::Cores,
-        bar: Bar::Global,
-    });
+    hits.push(Hit::row(
+        (start, 0.0, x - start, band_h),
+        Instrument::Cpu,
+        Bar::Global,
+    ));
     if let Some(gpu) = snap.gpu.as_ref() {
         x += cluster_gap;
         let tw = (6.0 * s).round().max(4.0);
         let m = Mark::of(&gpu.load, 1.0, words::LOAD_GATE);
         p.tank((x, top, tw, big), m, None, gutter);
-        hits.push(Hit {
-            rect: (x - 1.0, 0.0, tw + 2.0, band_h),
-            instrument: Instrument::Gpu,
-            bar: Bar::Global,
-        });
+        hits.push(Hit::row(
+            (x - 1.0, 0.0, tw + 2.0, band_h),
+            Instrument::Gpu,
+            Bar::Global,
+        ));
         x += tw;
     }
     x
@@ -626,8 +626,8 @@ mod tests {
         two.tab_count = 2;
         let (_, h1) = sill_paint(&GEOM, &one);
         let (_, h2) = sill_paint(&GEOM, &two);
-        assert!(!h1.iter().any(|h| h.bar == Bar::Tab));
-        assert!(h2.iter().any(|h| h.bar == Bar::Tab));
+        assert!(!h1.iter().any(|h| h.bar() == Bar::Tab));
+        assert!(h2.iter().any(|h| h.bar() == Bar::Tab));
         for h in &h1 {
             assert!(h2.contains(h), "{h:?} moved");
         }
@@ -656,14 +656,14 @@ mod tests {
                 ..GEOM
             };
             let (_, hits) = sill_paint(&g, &i);
-            hits.iter().map(|h| h.instrument).collect::<Vec<_>>()
+            hits.iter().map(|h| h.instrument()).collect::<Vec<_>>()
         };
         let wide = instruments(1095.0);
         assert!(wide.contains(&Instrument::Disk) && wide.contains(&Instrument::Memory));
         let mid = instruments(700.0);
         assert!(!mid.contains(&Instrument::Disk) && mid.contains(&Instrument::Memory));
         let narrow = instruments(500.0);
-        assert!(!narrow.contains(&Instrument::Memory) && narrow.contains(&Instrument::Cores));
+        assert!(!narrow.contains(&Instrument::Memory) && narrow.contains(&Instrument::Cpu));
     }
 
     /// One 16 px square a core at 2×, clusters apart: ten squares here.

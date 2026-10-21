@@ -12,8 +12,8 @@ fn only_a_headless_launch_that_may_use_a_gpu_defers_the_device() {
     assert!(!super::defer_gpu_build(false, false), "windowed --cpu");
 }
 
-/// A headless boot's warm claims no first-frame Metal warm: no warm thread
-/// exists, and its first pixel demand mints without waiting on one.
+/// A headless boot's `warm_config` claims no first-frame Metal warm, so its first pixel
+/// demand mints without waiting on a warm thread.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_headless_boot_claims_no_first_frame_warm() {
@@ -28,9 +28,8 @@ fn a_headless_boot_claims_no_first_frame_warm() {
     );
 }
 
-/// A pixel demand with no deferred intent constructs nothing: a CPU run stays a
-/// CPU run however many captures it serves, and the repeat shows the no-op comes
-/// from the absent intent, not a once-only latch.
+/// A pixel demand with no deferred intent builds nothing, however often it repeats: the no-op
+/// is the absent intent, not a once-only latch.
 #[test]
 fn a_pixel_demand_without_a_deferred_intent_builds_nothing() {
     let mut app = super::App::headless_for_test();
@@ -73,10 +72,9 @@ fn the_settings_capability_read_follows_the_intent_the_app_holds() {
     );
 }
 
-/// A failed pixel-backend redemption stays on CPU, so the render config is
-/// re-pinned and the "no CPU consumer" warn-onces stop being suppressed. The
-/// failure is simulated with an unsealed font generation, which
-/// `cpu_renderer_from_admitted` refuses without touching a device.
+/// A failed redemption stays on CPU, so the render config is re-pinned and the CPU-only
+/// warnings are no longer withheld. An unsealed font generation, which
+/// `cpu_renderer_from_admitted` refuses, fails it without touching a device.
 #[test]
 fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
     let _lane = crate::message_inbox::lane_test_guard();
@@ -93,8 +91,7 @@ fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
         backend_background_opacity(&app),
     );
 
-    // Every pin write is idempotent, so move the knob without pinning it: only
-    // a second pin can carry it to the renderer.
+    // Pin writes are idempotent: move the knob unpinned, so only a second pin carries it.
     app.render_knobs.background_opacity = 0.25;
     // A generation the redemption cannot fork => the first `Err` arm.
     app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
@@ -107,8 +104,7 @@ fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
         app.backend.is_gpu(),
         backend_background_opacity(&app),
     );
-    // Whatever the process-wide `Once` did with it, this test does not leave
-    // a message behind for the inbox-drain tests to find.
+    // Leave no message for the inbox-drain tests, whatever the process-wide `Once` did.
     let _ = crate::message_inbox::take_queued();
 
     assert_eq!(

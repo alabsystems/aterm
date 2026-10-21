@@ -43,8 +43,8 @@ use crate::perf::{LaneRun, Status};
 /// The wasm-bindgen the goldens are held to, crate and CLI: the version both
 /// web modules left (aterm-wasm at WP.7, aterm-gpu-web at WP.8). This row is
 /// the only user of the CLI: no module aterm ships is bound with it. The pin is
-/// the `wasm-bindgen` row of `aterm_uds::host::TOOLS` (a `--record` row of
-/// `verify provision`), which the resolver reads too.
+/// the `wasm-bindgen` row of `aterm_uds::host::TOOLS` (a `When::Record` row,
+/// which S7's provisioning verb will provide), which the resolver reads too.
 pub const BINDGEN: &str = aterm_uds::host::pinned_version("wasm-bindgen");
 
 /// The machine-wide tooling directory's name in aterm's user cache.

@@ -7,50 +7,32 @@
 //! and never creates the `NSApplication` whose initialisation opens a
 //! WindowServer connection.
 //!
-//! `harness = false` (see `Cargo.toml`): the loop runs the MAIN thread's run
+//! `harness = false` (see `Cargo.toml`): the loop runs the main thread's run
 //! loop, and libtest runs every test on a worker (`pthread_main_np()` is 0 there,
 //! `--test-threads=1` included), so this is a `main` that fails on the first
 //! broken promise. One process, one loop: winit refuses a second.
 //!
-//! IT STILL SPEAKS LIBTEST'S COMMAND LINE, for its one test,
-//! `headless_event_loop` (the [`libtest`] module below). cargo hands every test
-//! binary the same arguments, and so does `verify`'s test run. A `main` that
-//! ignored its arguments (this file's first cut) ran under any filter, and
-//! `-- --list` ran the loop instead of naming it. So positional filters and
-//! `--skip` select as libtest's do (substring; whole name under `--exact`),
-//! `--ignored` filters it out (it is not an ignored test), `--list` names it,
-//! and a run prints libtest's
-//! `running N tests` / `test <name> ... ok|FAILED` / `test result:` lines,
-//! which `aterm_verify::libtest` reads a log by. A failure exits 101, libtest's
-//! code. An option it does not handle is an error, never a silent run or a
-//! silent skip.
+//! It speaks libtest's command line for its one test, `headless_event_loop`
+//! (the [`libtest`] module below). Positional filters and `--skip` select as
+//! libtest's do (substring; whole name under `--exact`), `--ignored` filters it
+//! out, `--list` names it, and a run prints libtest's `running N tests` /
+//! `test <name> ... ok|FAILED` / `test result:` lines for `aterm_verify::libtest`.
+//! A failure exits 101. Unrecognized options return an error.
 //!
-//! WHAT EACH CHECK CATCHES, as measured on 2026-09-26:
+//! Checks:
 //!
-//! * `NSApp` stays nil. AppKit's global is only ever set by `+[NSApplication
-//!   sharedApplication]`, and reading it creates nothing. Before the display-free
-//!   loop existed, every `--headless` launch built the AppKit loop and made
-//!   WindowServer preflight the binary (AGENTS.md); `aterm`'s
-//!   `window_server_census_live_headless.rs` reads that from tccd's log, and
-//!   this is the in-process half.
-//! * Every CLONE of a proxy wakes the loop. The first cut of the backend gave
-//!   every proxy its own run-loop source, and CoreFoundation treats sources with
-//!   equal order, callbacks and `info` as ONE set member, so only the first
-//!   proxy's source was ever in the run loop: a clone's event waited for some
-//!   unrelated wake — control verbs stalled 10 s and more — or forever. The
-//!   posting thread waits for each event's acknowledgement before it sends the
-//!   next, so no later wake can rescue an earlier lost one (without that, the
-//!   main-queue round trip below did, and the plant passed): a lost wake is a
-//!   HANG, reported by the clone that lost it. Every wait here is a one-minute
-//!   hang detector, never a latency budget (AGENTS.md); the worst delivery is
-//!   printed, not judged.
-//! * A worker's `aterm_objc::run_on_main` returns while the loop waits: it is a
-//!   `dispatch_sync_f` onto the main queue, which only a running main run loop
-//!   drains. A `poll(2)`-based loop (the free-unix twin's design) would deadlock it.
+//! * `NSApp` stays nil. AppKit's global is set only by `+[NSApplication
+//!   sharedApplication]`, and reading it creates nothing.
+//! * Every clone of a proxy wakes the loop. CoreFoundation treats run-loop
+//!   sources with equal order, callbacks, and `info` as one set member, so
+//!   clones must share or distinguish their wake mechanism. The posting thread
+//!   waits for each event's acknowledgement before sending the next so no later
+//!   wake can rescue an earlier lost one.
+//! * A worker's `aterm_objc::run_on_main` (`dispatch_sync_f` onto the main
+//!   queue) returns while the loop waits.
 //! * A `WaitUntil` deadline is slept, not spun, and reports `ResumeTimeReached`.
 //! * No monitor, no primary monitor, no system theme, and `create_window` is an
-//!   error: each of those would otherwise be a CoreGraphics display query or an
-//!   AppKit object — a WindowServer connection.
+//!   error (each would otherwise open a WindowServer connection).
 
 fn main() {
     let cli = match libtest::Cli::parse(std::env::args().skip(1)) {

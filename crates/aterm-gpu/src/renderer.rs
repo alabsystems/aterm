@@ -2,47 +2,40 @@
 // Copyright 2026 Andrew Yates
 //
 // GPU terminal renderer: glyph atlas + instanced cell quads, drawn offscreen and
-// read back into an `aterm_render::Frame`. The output matches the CPU
-// `aterm_render::Renderer`: same cell geometry, background fill, glyph placement
-// and coverage blend (`out = fg*cov + bg*(1-cov)`, with text coverage remapped by
-// the linear-corrected compensation when `text_blending` is the default; see
-// `fs_glyph`). Base OVER/REPLACE streams attach an `Rgba8UnormSrgb` view of the
-// offscreen, so fixed-function blending composites in linear light like the CPU
-// `blend`. Additive streams (glow aurora, sparkle `deco_add`) emit raw colour into
-// a `One`/`One` add on the plain `Rgba8Unorm` view, byte-exact with the CPU
-// `add_sat` on native. Storage is sRGB-encoded bytes either way.
+// read back into an `aterm_render::Frame` that matches the CPU
+// `aterm_render::Renderer` (same geometry, fill, glyph placement and coverage
+// blend; see `fs_glyph`). Base OVER/REPLACE streams draw through an
+// `Rgba8UnormSrgb` view of the offscreen, so fixed-function blending composites in
+// linear light like the CPU `blend`. Additive streams (glow, sparkle `deco_add`)
+// add raw colour (`One`/`One`) on the plain `Rgba8Unorm` view, byte-exact with the
+// CPU `add_sat`.
 //
-// Downlevel (GLES/WebGL2, no `DownlevelFlags::VIEW_FORMATS`, see `srgb_offscreen`
-// in `lib.rs`): the offscreen is itself `Rgba8UnormSrgb`. The base still
-// composites in linear and matches native; the additive streams (glow,
-// sparkle-add, bloom) then add in linear rather than on raw sRGB bytes, a
-// cosmetic approximation never asserted byte-exact (`additive_is_byte_exact`).
+// Without `DownlevelFlags::VIEW_FORMATS` (GLES/WebGL2, `srgb_offscreen` in
+// `lib.rs`) the offscreen is itself `Rgba8UnormSrgb`: the base still matches
+// native, the additive streams add in linear, a cosmetic approximation never
+// asserted byte-exact (`additive_is_byte_exact`).
 //
-// On-glass present: the offscreen texture is the single source of truth (the
-// buffer parity tests and `image` introspection read). The window path blits it
-// into a swapchain texture with a fullscreen-triangle pass, so on-screen pixels
-// are byte-identical to introspection. The blit can invert RGB for the visual bell.
+// The offscreen texture is the single source of truth for readback and `image`
+// introspection; the window path blits it into the swapchain with a
+// fullscreen-triangle pass (optionally RGB-inverted for the visual bell), so the
+// glass is byte-identical to introspection.
 //
 // A frame is one fused render pass on the sRGB view, in CPU draw order:
 // bg/underlayers -> z<0 inline image -> glyph -> colour emoji -> z>=0 inline
-// image -> line deco -> undercurl -> sparkle-paw -> cursor. It splits only when an
-// additive stream is non-empty: sRGB(base) | view(glow) | sRGB(sparkle-paw) |
+// image -> line deco -> undercurl -> sparkle-paw -> cursor. A non-empty additive
+// stream splits it: sRGB(base) | view(glow) | sRGB(sparkle-paw) |
 // view(sparkle-add) | sRGB(cursor). A live `glow_under` (flame body under the
-// glyph ink) also splits the base: sRGB(bg..trail) | view(glow_under) |
+// glyph ink) splits the base: sRGB(bg..trail) | view(glow_under) |
 // sRGB(glyph..curl). Bloom and the settings-card tray composite afterward on the
-// Unorm view. Cursor shapes use the CPU's `aterm_render::for_each_cursor_rect`; a
-// block cursor is a cursor-colour bg quad plus a cut-out glyph, as on the CPU.
+// Unorm view. A block cursor is a cursor-colour bg quad plus a cut-out glyph, as
+// on the CPU (`aterm_render::for_each_cursor_rect`).
 
 #[cfg(wgpu_arm)]
 use std::collections::HashMap;
-// The sprite-atlas texture cache holds the exact published `SceneAtlas`
-// snapshot it uploaded and skips on `Arc::ptr_eq` (see `SpriteTex::src`).
 use std::sync::{Arc, Weak};
 
-// FxHashMap for the per-cell glyph atlas lookups on the encode hot path.
 use aterm_hash::{FxHashMap, FxHashSet};
 
-// `Terminal` is used only by the test modules; the renderer consumes `RenderInput`.
 use aterm_core::terminal::{CursorStyle, UnderlineStyle};
 use aterm_render::{
     DirtyDecision, Frame, GlyphImage, GlyphKey, Rasterizer, RenderInput, RenderView, Renderer,
@@ -137,12 +130,9 @@ trust_island! {
 ///   so the list cannot describe a struct other than the real one;
 /// * `size_of::<T>()` equals the sum of the field sizes, so there is no padding.
 ///
-/// The sum alone cannot prove the list exact: on origin/main before 2026-10-10
-/// `Padded { a: u32, a: u32 }` for `struct Padded { a: u32, b: u16, flag: bool }`
-/// summed to its 8 bytes and made a padded struct holding a `bool` `Pod`
-/// (miri: uninitialized read through `bytes_of`). Ruling 2026-10-10: the
-/// pattern proves the list, the sum proves the padding; `$t` is an `ident`
-/// because a pattern needs a path, and every row names a local struct.
+/// The sum alone cannot prove the list exact: a repeated field can sum to a
+/// padded struct's size. The pattern proves the list, the sum the padding; `$t`
+/// is an `ident` because a pattern needs a path.
 ///
 /// `#[repr(C)]` is the caller's responsibility; the WGSL/MSL layouts depend on it.
 macro_rules! impl_pod_zeroable {
@@ -220,9 +210,9 @@ impl_pod_zeroable!(BgInstance {
 struct GlowInstance {
     /// x, y, w, h in pixels (top-left origin, y down) — non-negative integers.
     rect: [u16; 4],
-    /// The LEFT edge: premultiplied r, g, b and the quad's alpha (the mode).
+    /// The left edge: premultiplied r, g, b and the quad's alpha (the mode).
     color: [u8; 4],
-    /// The RIGHT edge, same packing.
+    /// The right edge, same packing.
     color2: [u8; 4],
 }
 impl_pod_zeroable!(GlowInstance {
@@ -244,7 +234,7 @@ impl GlowInstance {
     }
 }
 
-/// One background RUN under construction by a row's emission walk: `(x, w,
+/// One background run under construction by a row's emission walk: `(x, w,
 /// colour)` in framebuffer pixels. The row band (`y`, `h`) is the same for every
 /// quad in a run, so it is supplied at flush time rather than carried here.
 type BgRun = (u16, u16, [u8; 4]);
@@ -367,7 +357,7 @@ impl RasterEdit for Result<(), String> {
 struct RainGlowInstance {
     /// x, y, w, h in pixels (top-left origin, y down) — the covered rect.
     rect: [u16; 4],
-    /// r, g, b, a bytes (a == 255) — the PEAK premultiplied light.
+    /// r, g, b, a bytes (a == 255) — the peak premultiplied light.
     color: [u8; 4],
     /// cx, cy (window-pixel halo centre), rx, ry (falloff half-extents).
     falloff: [u16; 4],
@@ -1404,9 +1394,10 @@ impl_pod_zeroable!(HdrGlowUniform {
 });
 
 /// Settings-card tray overlay: one device-px, alpha-blended quad drawn over the
-/// blit in the same pass (own module so its bindings do not collide with the
-/// blit's). `rect` is device px (top-left origin, y down), `fb` the framebuffer
-/// size. The card RGBA is straight alpha, matching the CPU `composite_tray`.
+/// present copy or the offscreen (own module so its bindings do not collide
+/// with the blit's). `rect` is device px (top-left origin, y down), `fb` the
+/// framebuffer size. The card RGBA is straight alpha, matching the CPU
+/// `composite_tray`.
 #[cfg(wgpu_arm)]
 const TRAY_SHADER: &str = r#"
 struct TrayOut {
@@ -1451,9 +1442,8 @@ fn fs_tray(in: TrayOut) -> @location(0) vec4<f32> {
 "#;
 
 /// Cursor-comet bloom (GPU only): the comet is drawn into a half-res texture,
-/// blurred, and composited over the offscreen through the bounded
-/// `pipeline_table::Blend::SCREEN`. Runs only when `enable_bloom` is set, so the
-/// CPU/GPU differential tests stay byte-exact.
+/// blurred, and composited over the frame through the bounded
+/// `pipeline_table::Blend::SCREEN`. Runs only when `enable_bloom` is set.
 ///
 /// `vs_fs` is the fullscreen triangle; `fs_bloom` is a 5×5 gaussian over the
 /// half-res texture scaled by `strength`.
@@ -1783,7 +1773,7 @@ impl BlitUniform {
             sdr_white_scale: 1.0, // 1.0 = no scaling (SDR / macOS); set on the Windows EDR present
             visible_y: 0.0,
             visible_h: 0.0,
-            premult: 0.0,   // set by the present path on the DComp visual swapchain (H1)
+            premult: 0.0,   // set by the present path on the DComp visual swapchain
             chrome_y0: 0.0, // set by the present path from the chrome extent
             chrome_pad: [0.0; 3],
         }
@@ -1851,7 +1841,7 @@ impl_pod_zeroable!(TrayUniform {
     _pad: [f32; 2]
 });
 
-/// Drop-target highlight parameters, passed to [`Renderer::present_input`].
+/// Drop-target highlight parameters, passed to [`GpuRenderer::present_input`].
 /// Alphas are 0..=255; border thickness derives from the framebuffer size
 /// (`drop_border_px_gpu`, in sync with the GUI's `app_render::drop_border_px`).
 #[derive(Clone, Copy)]
@@ -1940,7 +1930,7 @@ pub(crate) struct TrayOverlay {
     /// The bytes resident in `texture`; an identical incoming card skips the
     /// upload. Empty after a (re)create, so a fresh texture is always uploaded.
     pixels: Vec<u8>,
-    /// Bind group on `tray_bgl`: card view (0) + LINEAR sampler (1) + the resident
+    /// Bind group on `tray_bgl`: card view (0) + linear sampler (1) + the resident
     /// `tray_uniform_buf` (2).
     #[cfg(wgpu_arm)]
     bind: wgpu::BindGroup,
@@ -2184,12 +2174,10 @@ fn coalesce_frame_passes<const N: usize>(
     (pass_of, pass_srgb, passes)
 }
 
-// ======================================================================
 // Frame plan: `encode_frame` builds an ordered [`DrawItem`] list (one item per
-// non-empty stream, in the fixed group order) and [`run_frame_plan`] drives
-// whichever backend's [`crate::device_layer::FrameEncoder`] it is given. The
-// coalescer is fed the `enabled` array derived from the plan.
-// ======================================================================
+// non-empty stream, in group order) and [`run_frame_plan`] drives the given
+// backend's [`crate::device_layer::FrameEncoder`]; the coalescer's `enabled`
+// array derives from the plan.
 
 /// The staged band move's copy plan: shift `[y0, y1)` by signed `delta` device
 /// pixels (positive = up) as two whole-width copies through a scratch, leaving
@@ -2657,8 +2645,7 @@ pub(crate) struct DrawItem {
     pub(crate) count: u32,
 }
 
-/// The presence flags [`build_frame_plan`] gates on — each mirrors one of the
-/// pre-plan ladder's `if let Some(..)` / `enabled[..]` guards, spelled once.
+/// The presence flags [`build_frame_plan`] gates on.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FramePlanCtx {
     /// `win.image_plane.is_some()` — gates the three image streams.
@@ -2671,12 +2658,12 @@ pub(crate) struct FramePlanCtx {
     /// `cat_bind.is_some()` — as `has_rain`, for the cat sprites.
     pub(crate) has_cat: bool,
     /// `free_bind.is_some()` — atlas tag for `free_under`; for `free_over`
-    /// it is a hard gate (the pre-plan `enabled[G_FREE_OVER]` term).
+    /// it is a hard gate.
     pub(crate) has_free: bool,
     /// `wallpaper_bind.is_some()` — as `has_rain`, for the wallpaper quads.
     pub(crate) has_wallpaper: bool,
-    /// `cursor_opaque` — picks the cursor FILL pipe (REPLACE bg vs the
-    /// translucent `CursorBlend`), exactly the pre-plan `cursor_fill_pipe`.
+    /// `cursor_opaque` — picks the cursor fill pipe (REPLACE bg vs the
+    /// translucent `CursorBlend`).
     pub(crate) cursor_opaque: bool,
     /// The pass-economy ablation ([`GpuRenderer::unorm_ablation`], a dev
     /// seam): what the plan does with the groups that draw on the Unorm view.
@@ -2850,8 +2837,8 @@ pub(crate) fn build_frame_plan(
         );
     }
 
-    // G_FREE_OVER — over-text free sprites. `has_free` is a HARD gate here
-    // (the pre-plan `enabled[G_FREE_OVER]` conjunction), not just an atlas tag.
+    // G_FREE_OVER — over-text free sprites. `has_free` gates the draw, not just
+    // the atlas tag.
     if ctx.has_free {
         push(
             G_FREE_OVER,
@@ -2900,8 +2887,7 @@ pub(crate) fn build_frame_plan(
     }
 }
 
-/// The wgpu arm's resolution set: the live objects each plan key maps to —
-/// EXACTLY the objects the pre-plan macro call sites named, captured once.
+/// The wgpu arm's resolution set: the live objects each plan key maps to.
 #[cfg(wgpu_arm)]
 pub(crate) struct WgpuFrameRes<'a> {
     pub(crate) bg_pipeline: &'a wgpu::RenderPipeline,
@@ -3181,7 +3167,7 @@ impl GlFrameRig<'_> {
 pub(crate) struct MetalFrameRig {
     /// The offscreen's base (Unorm) face — additive passes and readback.
     pub(crate) offscreen: crate::metal::resources::SealedTexture,
-    /// The sRGB alias view of the SAME storage — base/cursor passes.
+    /// The sRGB alias view of the same storage: base/cursor passes.
     pub(crate) offscreen_srgb: crate::metal::resources::SealedTexture,
     /// PSOs by [`Pipeline`] row discriminant; `None` == the plan never draws
     /// that row (resolving it is a rig-construction bug, panics by name).
@@ -3232,8 +3218,7 @@ impl MetalFrameRig {
         )
     }
 
-    /// The row's `BindSpec` names the fragment texture/sampler slots — the
-    /// "indices from BindSpec" requirement, consumed here rather than assumed.
+    /// The fragment texture/sampler slots come from the row's `BindSpec`.
     fn atlas(&self, atlas: DrawAtlas, pipe: DrawPipe) -> crate::device_layer::FrameAtlas<'_> {
         if atlas == DrawAtlas::Fx {
             let fx = self
@@ -3308,31 +3293,31 @@ fn metal_arm_note(what: &str) {
     }
 }
 
-/// One armed-arm resident atlas: the Metal texture plus the structural key
-/// `(width, tex_h, epoch)` and monotonic shelf write state (`write_gen`,
-/// `uploaded_py`) its texels were uploaded under. Re-minted only when the
-/// structural key moves; in-place glyph appends upload only the dirty row band
+/// One armed-arm resident atlas: the Metal texture, the key it was minted
+/// under, and the shelf write state of its last upload. Re-minted only when the
+/// key moves; a glyph append uploads only the dirty row band
 /// `[uploaded_py, occupied_rows)`.
 #[cfg(target_os = "macos")]
 struct ArmAtlas {
-    /// Minted and uploaded through the device layer's Metal arm.
     tex: crate::device_layer::LayerTexture,
-    /// `(width, height, salt)`; for glyph atlases `salt` is `atlas_epoch`
-    /// (never `map.len()`), so appending glyphs updates in place instead of
-    /// re-minting the `MTLTexture`.
+    /// `(width, height, salt)`; salt is the per-class change signal: the
+    /// full-repack `atlas_epoch` for the packed glyph atlases (so an append
+    /// updates in place), `Arc::as_ptr` for sprite snapshots, the curl band for
+    /// the deco bake, the rebuild epoch for the image plane.
     key: (u32, u32, u64),
-    /// Monotonic write generation of the CPU [`Atlas`] (`0` for immutable
-    /// sprite/deco/image atlases).
+    /// The CPU [`Atlas`]'s `write_gen` at the last upload (`0` for the
+    /// immutable sprite, deco and image atlases).
     write_gen: u64,
-    /// Shelf baseline `atlas.py` at the time of the last upload. Since the
-    /// shelf packer never places a glyph above `atlas.py`, any subsequent append
-    /// touches only rows `>= uploaded_py`.
+    /// The shelf baseline `atlas.py` at the last upload. The shelf packer never
+    /// places a glyph above `atlas.py`, so a later append touches only rows
+    /// `>= uploaded_py`.
     uploaded_py: u32,
 }
 
 /// One armed-arm instance stream: a shared-storage `MTLBuffer` grown
-/// geometrically, rewritten from offset 0. Race-free because each frame slot in
-/// `MetalArmLive::frame_slots` is awaited before its buffers are rewritten.
+/// geometrically, rewritten from offset 0. Race-free because its ring slot is
+/// idle before a rewrite: `MetalArmLive::await_frame_slot` for Submit A, the
+/// `drain_pending` bound for Submit B.
 #[cfg(target_os = "macos")]
 struct ArmStream {
     buf: crate::device_layer::LayerBuffer,
@@ -3360,9 +3345,9 @@ struct ArmFrameSlot {
 }
 
 /// One ring slot for Submit B's per-present uniform and glow-instance buffers.
-/// Bounded by `drain_pending` (`<= 3` prior Submit Bs in flight < `ARM_SUBMIT_B_SLOTS`),
-/// so advancing `submit_b_idx` each Submit B reuses settled `MTLBuffer`s with
-/// zero per-frame buffer allocations.
+/// `drain_pending` leaves at most 3 earlier Submit Bs in flight, fewer than
+/// `ARM_SUBMIT_B_SLOTS`, so the slot `submit_b_idx` advances to is settled and
+/// its buffers are reused without allocating.
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct ArmSubmitBSlot {
@@ -3376,9 +3361,8 @@ struct ArmSubmitBSlot {
 }
 
 /// The Metal arm's resident state, minted lazily on the render thread at the
-/// first armed frame: thread-pinned device, queue, library, PSOs and sampler,
-/// plus multi-slot per-frame rings (uniform blocks, streams, Submit-B scratch)
-/// and resident atlases.
+/// first armed frame: thread-pinned device, queue, library, PSOs and samplers,
+/// the Submit A and Submit B buffer rings, and the resident atlases.
 #[cfg(target_os = "macos")]
 struct MetalArmLive {
     mint: crate::metal::resources::MetalResourceDevice,
@@ -3389,18 +3373,17 @@ struct MetalArmLive {
     /// Demand-built PSOs by table row (frame rows resolve their target off
     /// their own `TargetRole`, so the present-format argument is inert).
     psos: [Option<crate::metal::ffi::Obj>; pipeline_table::PIPELINE_COUNT],
-    /// The one NEAREST clamp sampler every frame atlas bind uses.
+    /// The one nearest clamp sampler every frame atlas bind uses.
     nearest: crate::metal::ffi::Obj,
-    /// The one LINEAR clamp sampler the present/post passes (bloom, shimmer,
-    /// tray, crown) use — sampler states are immutable, so it stays resident.
+    /// The one linear clamp sampler the present/post passes (bloom, shimmer,
+    /// tray, crown) use; sampler states are immutable, so it stays resident.
     linear: crate::metal::ffi::Obj,
-    /// Multi-slot ring for Submit A's uniform block, instance streams, and
-    /// in-flight command buffer handle. Rotating across `ARM_FRAME_SLOTS` lets
-    /// the CPU stage frame `N` into a fresh slot while frame `N - 1` is still
-    /// executing on the GPU.
+    /// Submit A's ring (uniform block, instance streams, in-flight handle):
+    /// frame `N` stages into its own slot while frame `N - 1` still executes on
+    /// the GPU.
     frame_slots: [ArmFrameSlot; ARM_FRAME_SLOTS],
     cur_slot: usize,
-    /// Multi-slot ring for Submit B's per-present uniforms and glow stream.
+    /// Submit B's ring of per-present uniforms and glow streams.
     submit_b_slots: [ArmSubmitBSlot; ARM_SUBMIT_B_SLOTS],
     submit_b_idx: usize,
     /// Shared glyph/decorative coverage only. Sprite and image textures live
@@ -3427,10 +3410,11 @@ struct MetalArmLive {
     /// Diagnostic: how many times `await_frame_slot` actually consumed a
     /// prior in-flight Submit A (the pipelining differential's probe).
     awaited_frames: u64,
-    /// Time parked in `await_frame_slot` and `drain_pending`, both of which call
-    /// the timeout-less `waitUntilCompleted`. These are GPU execution, not
-    /// compose work, so they are drained per present by [`Self::take_park_ns`],
-    /// subtracted from the present's work timer and published as `gpu_park`.
+    /// Time parked in `await_frame_slot`, atlas-append settles and
+    /// `drain_pending`, which call the timeout-less `waitUntilCompleted`. These
+    /// are GPU execution, not compose work, so they are drained per present by
+    /// [`Self::take_park_ns`], subtracted from the present's work timer and
+    /// published as `gpu_park`.
     frame_slot_wait_ns: u64,
     pending_ring_wait_ns: u64,
     /// Count of unpipelined inline parks: waits on a command buffer committed
@@ -3637,7 +3621,7 @@ impl MetalArmLive {
             .expect("inserted above"))
     }
 
-    /// Demand-build a PRESENT-side PSO for `(row, present format)` and hand
+    /// Demand-build a present-side PSO for `(row, present format)` and hand
     /// back an owned +1 handle.
     fn present_pso(
         &mut self,
@@ -3665,10 +3649,10 @@ impl MetalArmLive {
         Ok(pso)
     }
 
-    /// Rotate to the next Submit-A ring slot, non-blockingly reaping any other
-    /// slot whose command buffer has already reached a terminal state, and
-    /// waiting only if the target `cur_slot` itself (from `ARM_FRAME_SLOTS`
-    /// frames ago) is still in flight.
+    /// Rotate to the next Submit A ring slot before its shared buffers are
+    /// rewritten. Other slots already terminal are reaped without blocking; the
+    /// new `cur_slot` (staged `ARM_FRAME_SLOTS` frames ago) is waited only if
+    /// still in flight. A terminal error is routed by the loss latch.
     fn await_frame_slot(&mut self) {
         self.cur_slot = (self.cur_slot + 1) % ARM_FRAME_SLOTS;
         for s in 0..ARM_FRAME_SLOTS {
@@ -4339,7 +4323,7 @@ impl MetalArmCell {
         &mut self.live
     }
 
-    /// Shared read access under the SAME thread pin (`live_mut`'s contract;
+    /// Shared read access under the same thread pin (`live_mut`'s contract;
     /// the tap constructors only need `&MetalResourceDevice`).
     fn live_ref(&self) -> &MetalArmLive {
         assert!(
@@ -4418,7 +4402,7 @@ pub(crate) fn run_frame_plan(
 #[cfg(wgpu_arm)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlitTestTarget {
-    /// The readable stand-in the differential started with.
+    /// The readable 8-bit stand-in.
     Rgba8Unorm,
     /// What `pick_surface_format` chooses first on a real macOS surface.
     #[cfg(all(test, target_os = "macos"))]
@@ -4485,8 +4469,7 @@ pub(crate) struct BlitTestEffects {
 
 #[cfg(wgpu_arm)]
 impl BlitTestEffects {
-    /// Every effect off — the plain present. The three geometry/effect arms the
-    /// original differential covered are set on top of this.
+    /// Every effect off: the plain present.
     pub(crate) const PLAIN: Self = Self {
         invert: false,
         overlay: None,
@@ -4499,7 +4482,7 @@ impl BlitTestEffects {
     };
 }
 
-/// The LIVE terminal background: the host's default bg (OSC 11) wins over
+/// The live terminal background: the host's default bg (OSC 11) wins over
 /// the theme's `theme_bg`; `COLOR_UNSET` (non-windowed paths) → theme.
 fn frame_live_bg(input: &RenderInput, theme_bg: u32) -> u32 {
     if input.default_bg == aterm_core::render::COLOR_UNSET {
@@ -4562,11 +4545,9 @@ fn visible_source_scissor(
     (x1 > x0 && y1 > y0).then_some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
-/// Destination scissor for the crown pass when `band_shift` translates the
-/// present copy's grid band: restricts the visible source interval to the
-/// moved destination rows `[shift.dst_y, shift.dst_y + shift.moved)` so a
-/// shifted crown never bleeds onto pinned chrome rows or the incoming apron
-/// strip.
+/// The crown pass's destination scissor. Under a `band_shift` it narrows the
+/// visible interval to the moved rows `[dst_y, dst_y + moved)`, so a shifted
+/// crown never bleeds onto pinned chrome rows or the incoming apron strip.
 fn crown_band_scissor(
     uniform: &BlitUniform,
     band_shift: Option<BandShift>,
@@ -4633,10 +4614,8 @@ fn present_blit_uniform(
     .with_source_crop(source_crop)
 }
 
-/// An on-screen presentation target. Opaque: the frontend holds it and passes
-/// it back to [`GpuRenderer::present_input`] / `resize_surface`. In the
-/// wgpu-free build it retains the axes that persist between presents (dims,
-/// format pick); alpha and usage are derived per present.
+/// The wgpu-free build's retained surface axes (dims, format pick); alpha and
+/// usage are derived per present.
 #[cfg(not(wgpu_arm))]
 #[derive(Clone, Copy)]
 struct NeutralSurfaceConfig {
@@ -5000,6 +4979,10 @@ struct GlyphSlot {
     gh: u32,
     xmin: i32,
     ymin: i32,
+    /// The top of the glyph's ink in source rows above the baseline
+    /// ([`aterm_render::glyph_ink_box`]), `None` for a blank or zero slot: what
+    /// [`Self::ink_reach`] places.
+    ink_rise: Option<i32>,
 }
 
 impl GlyphSlot {
@@ -5018,6 +5001,17 @@ impl GlyphSlot {
             x, anchor_y, baseline, scale, self.ax, self.ay, self.gw, self.gh, self.xmin, self.ymin,
             aw, ah,
         )
+    }
+
+    /// The highest device-pixel row this glyph's ink reaches when drawn at
+    /// `anchor_y` under `scale`'s top clip, `i32::MAX` for an inkless glyph: the
+    /// overshoot fact the CPU blit records, which the glyph pass checks with
+    /// [`Renderer::catch_unpredicted_overshoot`].
+    #[inline]
+    fn ink_reach(&self, anchor_y: i32, baseline: i32, scale: aterm_render::Scale) -> i32 {
+        self.ink_rise.map_or(i32::MAX, |rise| {
+            (anchor_y + scale.ys.max(1) as i32 * (baseline - rise)).max(scale.clip_y0)
+        })
     }
 }
 
@@ -5060,8 +5054,8 @@ struct Atlas {
     px: u32,
     py: u32,
     shelf_h: u32,
-    /// Monotonic generation incremented on every real-slot append (`grow_atlas`),
-    /// reset to `0` on full repack (`build_kind`).
+    /// Bumped by every `grow_atlas` append that places a real slot; `0` after a
+    /// full repack (`build_kind`).
     write_gen: u64,
 }
 
@@ -5096,6 +5090,7 @@ impl Atlas {
                         gh: 0,
                         xmin: img.xmin(),
                         ymin: img.ymin(),
+                        ink_rise: None,
                     },
                 );
             }
@@ -5117,6 +5112,7 @@ impl Atlas {
                         gh: 0,
                         xmin: img.xmin(),
                         ymin: img.ymin(),
+                        ink_rise: None,
                     },
                 );
             }
@@ -5137,6 +5133,8 @@ impl Atlas {
                 gh,
                 xmin: img.xmin(),
                 ymin: img.ymin(),
+                ink_rise: aterm_render::glyph_ink_box(img)
+                    .map(|(ink_h, ink_ymin)| ink_ymin + ink_h as i32),
             },
         );
         self.px += gw + pad;
@@ -5468,8 +5466,8 @@ impl SpriteTex {
 /// its resident texture and bind group, and the texture's dims.
 struct ResidentAtlas {
     atlas: Atlas,
-    /// The resident texture (wgpu arm only; the armed Metal encode re-mints its
-    /// own `ArmAtlas` from `atlas.data`).
+    /// The resident texture (wgpu arm only; the armed Metal encode keeps its
+    /// own `ArmAtlas`, uploaded from `atlas.data`).
     #[cfg(wgpu_arm)]
     tex: crate::device_layer::LayerTexture,
     #[cfg(wgpu_arm)]
@@ -5550,16 +5548,14 @@ pub struct WindowGpu {
     // group. Rebuilt when the visible set changes; `None` on an image-free frame.
     pub(crate) image_plane: Option<ImagePlane>,
     // The settings-card overlay: reused at the same size, recreated on a size
-    // change, `None` on a card-free present. Composited after the main blit
-    // with alpha blending, matching the CPU `composite_tray`.
+    // change, `None` on a card-free present. Alpha-blended over the present copy
+    // (or the offscreen on readback), matching the CPU `composite_tray`.
     #[cfg(wgpu_arm)]
     pub(crate) tray_overlay: Option<TrayOverlay>,
-    // Scissored dirty-row repaint: the previous presented frame's input and
-    // cursor state, so `encode_present_frame` re-encodes only dirty rows
-    // (`compute_dirty_rows`, LoadOp::Load plus a scissor) into this window's
-    // persistent offscreen. `None` until the first present and after any
-    // geometry change (forces a full repaint). Per window, never diffed across
-    // windows. See `encode_frame` / `RepaintScope`.
+    // Scissored dirty-row repaint state for the previous presented frame (its
+    // input lives in `prev_input`), so `encode_present_frame` re-encodes only
+    // dirty rows into this window's persistent offscreen. `None` until the first
+    // present and after any geometry change (forces a full repaint). Per window.
     pub(crate) present_prev: Option<PresentPrev>,
     /// Attack-smoothed SDR crown level for this window, so one window's
     /// glow-free present does not reset another's envelope.
@@ -5635,10 +5631,10 @@ pub struct WindowGpu {
     // The `apron_rgba_gen` `metal_apron_bytes` last matched (`apron_tex_gen`'s twin).
     #[cfg(target_os = "macos")]
     pub(crate) metal_apron_gen: u64,
-    // Present compositing target for the bloom halo. `offscreen` stays the clean
-    // scissor base; each present copies it here and composites the halo over
-    // this copy, which the blit samples. `None` until the first bloom present,
-    // recreated on resize. See `ensure_present_offscreen` / `encode_bloom_halo`.
+    // Present compositing target. `offscreen` stays the clean scissor base; a
+    // present that draws over the frame (halo, haze, band shift, card) copies it
+    // here and draws over this copy, which the blit samples. `None` until the
+    // first such present, recreated on resize. See `compose_present_offscreen`.
     #[cfg(wgpu_arm)]
     pub(crate) present_offscreen: Option<PresentOffscreen>,
     // The half-open region of `offscreen` changed since `present_offscreen` was
@@ -5847,8 +5843,8 @@ impl WindowGpu {
         }
         #[cfg(not(wgpu_arm))]
         {
-            // The armed arm's bloom half-target is a fresh per-call mint —
-            // nothing persistent to report.
+            // Reports `false`: the armed arm's resident `metal_bloom_half` is
+            // not consulted.
             false
         }
     }
@@ -6372,9 +6368,9 @@ pub struct GpuRenderer {
     /// unseen formats.
     #[cfg(wgpu_arm)]
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-    /// Settings-card tray resources: pipelines keyed by swapchain format (lazy,
-    /// `ensure_tray_pipeline`), a linear sampler and the placement uniform.
-    /// Shared across windows.
+    /// Settings-card tray resources: pipelines keyed by target format (lazy,
+    /// `ensure_tray_pipeline`; in practice the offscreen format), a linear
+    /// sampler and the placement uniform. Shared across windows.
     #[cfg(wgpu_arm)]
     tray_shader: wgpu::ShaderModule,
     #[cfg(wgpu_arm)]
@@ -6402,8 +6398,7 @@ pub struct GpuRenderer {
     /// subset skips atlas work. Membership only (packing order comes from the
     /// sorted key slice), so FxHash.
     resident_keys: FxHashSet<GlyphKey>,
-    /// Count of atlas textures created (full (re)builds, not reuses). The
-    /// persistence test asserts this does NOT advance across an unchanged frame.
+    /// Count of atlas textures created (full (re)builds, not reuses).
     atlas_tex_creations: u64,
     // Persistent per-frame vertex streams, reused across frames and grown only
     // when a frame's bytes exceed capacity.
@@ -6497,7 +6492,8 @@ pub struct GpuRenderer {
     dirty_scratch: Vec<bool>,
     // Persistent per-row ligature-plan scratch for `encode_frame` (taken across
     // the encode). `row_glyph_plan` clears each inner Vec; readers are guarded
-    // by `row_active`, so stale rows are never observed.
+    // by the rows the frame draws glyphs on (`glyph_windows`) or `row_active`, a
+    // subset, so stale rows are never observed.
     row_plans: Vec<Vec<aterm_render::ColumnGlyph>>,
     // Persistent decoration-rect scratch for `encode_frame`; `underline_rects_into`
     // clears it before refilling.
@@ -6524,6 +6520,13 @@ pub struct GpuRenderer {
     // `r * cols + c`, `None` for skipped cells), read back by the emission loop
     // instead of re-deriving them.
     key_scratch: Vec<Option<GlyphKey>>,
+    // Persistent per-row glyph-window scratch for `encode_frame` (`glyph_windows`),
+    // taken across the glyph passes.
+    glyph_win_scratch: Vec<Option<(i32, i32)>>,
+    // The last `encode_frame` drew a row whose ink rose above its band where
+    // `Renderer::row_may_ink_above` said it could not
+    // (`Renderer::catch_unpredicted_overshoot`): a Dirty present re-encodes Full.
+    overshoot_surprise: bool,
     // Persistent scratch for `build_image_plane`, which runs every present:
     // distinct-image order, dedup map and placement map, cleared and refilled in
     // the same order each call. `image_order_scratch` holds `Arc<ImageData>`
@@ -6583,7 +6586,6 @@ pub struct GpuRenderer {
     last_frame_load: crate::device_layer::FrameLoad,
     /// The most recent frame's dirty-band scissor (`None` = full).
     last_frame_scissor: Option<(u32, u32, u32, u32)>,
-    // Per-window image state (`image_cache`, `image_plane`) lives on `WindowGpu`.
 }
 
 /// The previous presented frame's overlay state, for the scissored dirty-row
@@ -6716,28 +6718,28 @@ pub(crate) struct Offscreen {
     /// readback (via `view`) keep byte parity.
     #[cfg(wgpu_arm)]
     view_srgb: wgpu::TextureView,
-    /// The blit-source bind group (samples `tex` into the swapchain). Built ONCE
+    /// The blit-source bind group (samples `tex` into the swapchain). Built once
     /// when the offscreen is (re)created and reused every present.
     #[cfg(wgpu_arm)]
     blit_bind: wgpu::BindGroup,
     w: u32,
     h: u32,
     /// Half-res bloom target: the comet glow is rendered into it, blurred and
-    /// composited back over `view`. Built on demand by
+    /// composited over the frame. Built on demand by
     /// `GpuRenderer::ensure_bloom_target` on the first glow frame; dropped on
     /// resize.
     bloom: Option<BloomTarget>,
 }
 
-/// The bloom present target (see [`WindowGpu::present_offscreen`]): a copy of the
-/// clean `offscreen` with the comet halo composited over it, sampled by the
-/// blit and readback helpers on a bloom present. Keeps the halo off the scissor
-/// base. `blit_bind` is a drop-in blit source. Recreated on resize.
+/// The present copy (see [`WindowGpu::present_offscreen`]): the clean
+/// `offscreen` copied, with the halo, haze, band shift and card drawn over it,
+/// sampled by the blit and readback helpers. Keeps those off the scissor base.
+/// `blit_bind` is a drop-in blit source. Recreated on resize.
 #[cfg(wgpu_arm)]
 pub(crate) struct PresentOffscreen {
     #[cfg(wgpu_arm)]
     tex: wgpu::Texture,
-    /// The default-format view, the halo composite's One/One target.
+    /// The default-format view the halo, haze and card draw into.
     #[cfg(wgpu_arm)]
     view: wgpu::TextureView,
     /// The blit-source bind group (samples `tex` into the swapchain). Built when the
@@ -6776,9 +6778,6 @@ pub(crate) struct VirtualTarget {
     h: u32,
 }
 
-/// The format the virtual present target uses: `pick_surface_format`'s first
-/// choice, so it exercises the same blit bytes as a real swapchain. HDR virtual
-/// targets are unsupported (the recording's `format` field says so).
 /// The capture path's offscreen texture handle: the wgpu texture, or an
 /// uninhabited type on the wgpu-free build.
 #[cfg(wgpu_arm)]
@@ -6914,8 +6913,8 @@ struct Instances {
     /// Sparkle-word sparkle quads (coverage, One/One) with the paw, under the
     /// cursor; GPU twin of the CPU `Add` branch.
     wdeco_add: Vec<GlyphInstance>,
-    /// Rain glyph sprites (`rain_quads`), drawn under the text in `emit_base_pre`
-    /// before `cat_over`, nearest-sampled 1:1. Built without a `row_active`
+    /// Rain glyph sprites (`rain_quads`), drawn under the text in the base-bg
+    /// group before `cat_over`, nearest-sampled 1:1. Built without a `row_active`
     /// filter: the scissor clips, and `compute_dirty_rows`' band fill ensures
     /// every admitted pixel lands on a rebuilt row.
     rain_under: Vec<GlyphInstance>,
@@ -7728,10 +7727,9 @@ type CellPipelines = (
 );
 
 /// Build the three offscreen pipelines every frame draws with: background fill,
-/// linear-light coverage-blended mono glyphs, and straight-RGBA colour emoji.
-/// All target the sRGB view when `srgb` (see the header for downlevel).
-///
-/// The effect-only pipelines are built on demand; see [`EffectPipelines`].
+/// linear-light coverage-blended mono glyphs, and straight-RGBA colour emoji,
+/// all on the sRGB view (see the file header for downlevel). The effect-only
+/// pipelines are built on demand; see [`EffectPipelines`].
 #[cfg(wgpu_arm)]
 fn build_cell_pipelines(
     device: &wgpu::Device,
@@ -7778,16 +7776,16 @@ fn build_cell_pipelines(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum EffectPipeline {
-    /// The bg quad shader with ALPHA_BLENDING instead of REPLACE, for the
-    /// TRANSLUCENT cursor fill (`cursor_opacity < 1`).
+    /// The bg quad shader with alpha blending instead of REPLACE, for the
+    /// translucent cursor fill (`cursor_opacity < 1`).
     CursorBlend = 0,
     /// Premultiplied additive (One/One) for the cursor aurora, nova and
     /// under-glyph flame light.
     GlowAdd = 1,
-    /// PHOSPHOR rain bright-head halos + the glow-halo cursor embers: the
-    /// glow-add pipeline's radial twin.
+    /// Rain bright-head halos and the glow-halo cursor embers: the glow-add
+    /// pipeline's radial twin.
     RainGlow = 2,
-    /// `HaloMode::Over` radial VEILS: the rain-glow pipeline with the deco
+    /// `HaloMode::Over` radial veils: the rain-glow pipeline with the deco
     /// source-over blend state.
     RainGlowOver = 3,
     /// EMBERFORGE FirePatch, One/One half.
@@ -7848,14 +7846,9 @@ pub const EFFECT_PIPELINES: [EffectPipeline; EFFECT_PIPELINE_COUNT] = [
 ///
 /// The default config draws none of them and building them eagerly is a large
 /// share of GPU cold start, so each is built the first time a frame carries the
-/// stream that binds it ([`GpuRenderer::ensure_effect_pipelines`]).
-///
-/// The gate is the draw stream, never the config, so hot reloads, Settings
-/// toggles, undercurls and pets all work: it asks every frame whether there is
-/// something to draw with the pipeline.
-///
-/// The first frame that uses an effect pays its build inline; the fire pair is
-/// slow enough to hitch, so the frontend calls
+/// stream that binds it ([`ensure_effect_pipelines`]). The gate is the draw
+/// stream, never the config, so hot reloads and Settings toggles need no hook.
+/// The fire pair is slow enough to hitch, so the frontend calls
 /// [`GpuRenderer::warm_effect_pipelines`] off the frame path on config reload.
 #[cfg(wgpu_arm)]
 pub(crate) struct EffectPipelines {
@@ -7967,7 +7960,7 @@ impl EffectPipelines {
     }
 
     /// The pipeline for `which`. Panics if it was never ensured: that is a
-    /// coverage bug in [`GpuRenderer::ensure_effect_pipelines`].
+    /// coverage bug in [`ensure_effect_pipelines`].
     fn get(&self, which: EffectPipeline) -> &wgpu::RenderPipeline {
         self.built[which as usize].as_ref().unwrap_or_else(|| {
             panic!(
@@ -7984,14 +7977,10 @@ impl EffectPipelines {
     }
 }
 
-/// Build every effect pipeline this frame will bind, and no others.
-///
-/// Called once per `encode_frame` after the instance streams are complete and
-/// before the first upload. The demand set comes from
-/// [`frame_effect_pipelines`], which reads the vectors the draws bind.
-///
-/// A free function over disjoint fields because `encode_frame` holds a shared
-/// borrow of `self.mono_res` here.
+/// Build every effect pipeline this frame will bind, and no others: the demand
+/// set from [`frame_effect_pipelines`], once per `encode_frame` after the
+/// instance streams are complete. A free function over disjoint fields because
+/// `encode_frame` holds a shared borrow of `self.mono_res` here.
 #[cfg(wgpu_arm)]
 fn ensure_effect_pipelines(
     effects: &mut EffectPipelines,
@@ -8026,9 +8015,6 @@ fn frame_effect_pipelines(
     cursor_opaque: bool,
 ) -> [bool; EFFECT_PIPELINE_COUNT] {
     let mut want = [false; EFFECT_PIPELINE_COUNT];
-    // Keyed on the cursor mode alone, as a pre-warm: a translucent cursor that
-    // draws nothing this frame (blink-off, hidden, scrolled out) still needs
-    // the pipeline ready for the first frame that draws a cursor quad.
     want[EffectPipeline::CursorBlend as usize] = !cursor_opaque;
     want[EffectPipeline::GlowAdd as usize] = !inst.glow_under.is_empty()
         || !inst.glow_add.is_empty()
@@ -8107,7 +8093,7 @@ fn build_effect_pipeline(
 
 /// Build the format-independent present blit resources: shader, bind-group
 /// layout (texture, sampler, uniform), pipeline layout, nearest sampler and
-/// uniform buffer. Per-format pipelines are built lazily in `present_input`.
+/// uniform buffer. Per-format pipelines are built by `ensure_blit_pipeline`.
 #[cfg(wgpu_arm)]
 fn build_blit_resources(
     handle: crate::device_layer::DeviceHandle<'_>,
@@ -8562,6 +8548,8 @@ impl GpuRenderer {
             bloom_glow_scratch: Vec::new(),
             bloom_quad_scratch: Vec::new(),
             key_scratch: Vec::new(),
+            glyph_win_scratch: Vec::new(),
+            overshoot_surprise: false,
             image_order_scratch: Vec::new(),
             image_seen_scratch: FxHashMap::default(),
             image_placements_scratch: FxHashMap::default(),
@@ -8841,7 +8829,7 @@ impl GpuRenderer {
         self.cpu.band_room()
     }
 
-    /// PURE per-window decoration bands at `px`, delegated like
+    /// Pure per-window decoration bands at `px`, delegated like
     /// [`Self::cell_geometry`]. See [`aterm_render::Renderer::deco_metrics_for`].
     pub fn deco_metrics_for(&self, px: f32) -> aterm_render::deco::DecoMetrics {
         self.cpu.deco_metrics_for(px)
@@ -8853,7 +8841,7 @@ impl GpuRenderer {
         self.raster_changed(|cpu| cpu.set_fallback_bytes(bytes))
     }
 
-    /// Append a broad-coverage fallback face (like [`set_fallback_font_bytes`],
+    /// Append a broad-coverage fallback face (like [`Self::set_fallback_font_bytes`],
     /// but adds rather than resets), so several scripts can find coverage.
     /// Invalidates the atlas.
     pub fn add_fallback_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -8878,7 +8866,7 @@ impl GpuRenderer {
     }
 
     /// Set a symbol fallback face (config `symbol_font`) from font bytes and
-    /// invalidate the atlas; byte-injection sibling of [`set_config_symbol_font`].
+    /// invalidate the atlas; byte-injection sibling of [`Self::set_config_symbol_font`].
     pub fn set_symbol_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.raster_changed(|cpu| cpu.set_symbol_fallback_bytes(bytes))
     }
@@ -9027,18 +9015,15 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Fail-soft rebuild: build a second renderer on a fresh [`GpuContext`] (new
-    /// instance, adapter and device, presentation latch re-read) with this
-    /// renderer's sealed font generation at `px`. `self` is untouched, so a
-    /// failure leaves the current renderer for the next fallback (CPU).
-    ///
-    /// Called after [`Self::create_window_surface`] failed on a DirectComposition
-    /// visual instance: the presentation system is instance-level, so falling
-    /// back to the opaque swapchain means a new instance and every device-bound
-    /// resource ([`Self::from_parts`]). The face is rebuilt from sealed sources
-    /// (`Renderer::rebuild_from_admitted`), so no font I/O runs on the event-loop
-    /// thread. Frontend-owned knobs start at construction defaults; the caller
-    /// re-applies them. Native only.
+    /// Fail-soft rebuild: a second renderer on a fresh [`GpuContext`] (new
+    /// instance, adapter and device) with this renderer's sealed font generation
+    /// at `px`; `self` is untouched, so a failure leaves it for the next fallback
+    /// (CPU). Called after [`Self::create_window_surface`] failed on a
+    /// DirectComposition visual instance: the presentation system is
+    /// instance-level, so the opaque swapchain needs a new instance. The face is
+    /// rebuilt from sealed sources, so no font I/O runs on the event-loop thread.
+    /// Frontend-owned knobs start at construction defaults; the caller re-applies
+    /// them. Native only.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn rebuild_on_fresh_context(&self, px: f32) -> Result<Self, String> {
         let cpu = self.cpu.rebuild_from_admitted(px, self.theme)?;
@@ -9085,7 +9070,7 @@ impl GpuRenderer {
     }
 
     /// Drop the resident atlases and key set so the next present rebuilds them
-    /// (mirrors [`set_face`]). Window-owned artwork stays identity-keyed.
+    /// (mirrors [`Self::set_face`]). Window-owned artwork stays identity-keyed.
     fn invalidate_atlas(&mut self) {
         self.resident_keys.clear();
         self.mono_res = None;
@@ -9224,6 +9209,15 @@ impl GpuRenderer {
     #[must_use]
     pub fn full_repaints(&self) -> u64 {
         self.full_repaints
+    }
+
+    /// Test/diagnostic: whether a raster caught the overshoot rule wrong
+    /// ([`Renderer::overshoot_rule_widened`]), so it takes less on trust than its
+    /// default (printable ASCII and the procedural cells in their cell).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn overshoot_rule_widened(&self) -> bool {
+        self.cpu.overshoot_rule_widened()
     }
 
     /// Project the exact `PresentPrev` and `GpuGateCache` origin stamps used by
@@ -9420,7 +9414,7 @@ impl GpuRenderer {
         self.cpu.set_head(head_px);
     }
 
-    /// Effective TOP interior pad (px), delegated to the inner CPU renderer.
+    /// Effective top interior pad (px), delegated to the inner CPU renderer.
     pub fn pad_top(&self) -> usize {
         self.cpu.pad_top()
     }
@@ -9616,12 +9610,10 @@ impl GpuRenderer {
     }
 
     /// Clamp a framebuffer/surface pixel dimension to `1..=max_texture_dimension_2d`.
-    ///
     /// Every swapchain and offscreen pixel size goes through this, so blit source
     /// and destination cannot drift. Exceeding the limit panics in wgpu's default
-    /// error handler, and the `resize` verb does not clamp to pixels, so an
-    /// oversized grid renders a clipped view instead. Grid dimensions are
-    /// untouched. Same idiom as the atlas and image clamps.
+    /// error handler; the `resize` verb does not clamp to pixels, so an oversized
+    /// grid renders a clipped view instead.
     #[inline]
     fn clamp_fb_dim(&self, d: u32) -> u32 {
         #[cfg(wgpu_arm)]
@@ -9746,7 +9738,6 @@ impl GpuRenderer {
         // bounds `atlas.height` to it).
         #[cfg(wgpu_arm)]
         let max_tex_dim = handle.max_texture_dim();
-        // The wgpu-free build uses the Metal arm's `max_texture_dim`.
         #[cfg(not(wgpu_arm))]
         let max_tex_dim = self.first_party_max_texture_dim();
         let tex_h = (atlas.height + ATLAS_GROW_HEADROOM).min(max_tex_dim);
@@ -9893,8 +9884,8 @@ impl GpuRenderer {
 
     /// Re-upload the changed row band `[y0, y1)` of a resident atlas. Writes full
     /// rows so `bytes_per_row` stays a multiple of 256. No-op for an empty band.
-    // On the wgpu-free build an append re-uploads through the armed atlas key
-    // (`map.len()` moved), so there is no row-ranged write to mirror.
+    // On the wgpu-free build the armed `ensure_atlas` uploads an append's dirty
+    // band (its `write_gen` moved), so there is nothing to mirror here.
     fn upload_atlas_rows(&self, res: &ResidentAtlas, y0: u32, y1: u32) {
         #[cfg(not(wgpu_arm))]
         let _ = (res, y0, y1);
@@ -9996,12 +9987,10 @@ impl GpuRenderer {
     }
 
     /// Pack each placed footprint's RGBA rows into a stacked `tw`×`th` plane
-    /// buffer. `items` is `(y0, dw, dh, rgba)` per footprint. When a footprint
-    /// spans the full plane width (`dw == tw`) its rows are contiguous in both
-    /// source and destination, so the whole footprint copies in ONE memcpy;
-    /// otherwise rows are copied individually (right padding stays transparent).
-    /// Byte-identical either way — factored out of [`build_image_plane`] so the
-    /// copy can be unit-tested in isolation from GPU upload.
+    /// buffer. `items` is `(y0, dw, dh, rgba)` per footprint. A full-width
+    /// footprint (`dw == tw`) copies in one memcpy; narrower ones row by row (right
+    /// padding stays transparent). Separate from [`Self::build_image_plane`] so the
+    /// copy is unit-testable without a GPU.
     #[must_use]
     fn pack_image_plane(items: &[(u32, u32, u32, &[u8])], tw: u32, th: u32) -> Vec<u8> {
         let mut data = vec![0u8; (tw * th * 4) as usize];
@@ -10111,11 +10100,8 @@ impl GpuRenderer {
         let mut max_w: u32 = 0;
         for (image, fp_w, fp_h, _) in &order {
             let key = (std::sync::Arc::as_ptr(image) as usize, *fp_w, *fp_h);
-            // One lookup; a miss decodes straight from the live `Arc` we
-            // already hold (no grid re-scan) with the same
+            // A miss decodes from the live `Arc` with the same
             // `aterm_render::decode_placement_within` the CPU blit draws from.
-            // A failed decode is cached empty, so it is not re-decoded every
-            // frame.
             let d = win.image_cache.get_or_decode(image, *fp_w, *fp_h);
             // A raster side is at most `MAX_PLACEMENT_RASTER_SIDE`, so it fits.
             let side = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
@@ -10158,17 +10144,14 @@ impl GpuRenderer {
             && p.h == th
             && p.placements == placements
         {
-            // Exit 3 of 4 — the hot path on any frame keeping a steady image on
-            // screen, and now the one that keeps every container's capacity.
+            // Exit 3 of 4: the steady-image hot path.
             order.clear();
             self.image_order_scratch = order;
             self.image_seen_scratch = seen;
             self.image_placements_scratch = placements;
             return;
         }
-        // Gather each placed footprint's source rows, then pack them in one pass
-        // (extracted to `pack_image_plane` so the copy is unit-tested in
-        // isolation from GPU upload).
+        // Gather each placed footprint's source rows, then pack them in one pass.
         let mut items: Vec<(u32, u32, u32, &[u8])> = Vec::with_capacity(order.len());
         // Pin every placed image for the plane's lifetime, including ones the
         // decode cache has evicted, so the pointer keys stay sound.
@@ -10270,8 +10253,8 @@ impl GpuRenderer {
         self.image_placements_scratch = placements;
     }
 
-    /// Enable/disable the cursor-comet bloom (default on). Set before the first
-    /// frame; a toggle fully applies at the next offscreen (re)create. The
+    /// Enable/disable the cursor-comet bloom (default on), read each present; a
+    /// built half-res target is freed at the next offscreen (re)create. The
     /// CPU/GPU differential tests pass `false`.
     pub fn set_bloom(&mut self, on: bool) {
         self.enable_bloom = on;
@@ -10554,8 +10537,8 @@ impl GpuRenderer {
         }
     }
 
-    /// VIDEO introspection: finalize the recording (blocking drain — off the
-    /// hot path by definition) and hand the frames out. `None` if not recording.
+    /// Finalize the `video` recording (a blocking drain, off the hot path) and
+    /// hand the frames out. `None` if not recording.
     pub fn video_finish(&self, win: &mut WindowGpu) -> Option<crate::video_tap::VideoTake> {
         win.video.take().map(|t| {
             #[cfg(target_os = "macos")]
@@ -10575,7 +10558,7 @@ impl GpuRenderer {
         })
     }
 
-    /// VIDEO introspection status: `(frames_so_far, resized_early_stop)`.
+    /// The `video` recording's status: `(frames_so_far, resized_early_stop)`.
     #[must_use]
     pub fn video_status(&self, win: &WindowGpu) -> Option<(usize, bool)> {
         win.video.as_ref().map(|t| (t.frames_so_far(), t.resized()))
@@ -11463,8 +11446,8 @@ impl GpuRenderer {
                 pass.draw_fullscreen_triangle()?;
                 Some([sx0, sy0, sx1, sy1])
             }
-            // An empty PANE intersection paints nothing — the empty
-            // footprint, exactly the wgpu arm's encoding.
+            // An empty pane intersection paints nothing: the empty footprint,
+            // as on the wgpu arm.
             (Some(_), Some(_)) => Some([0, 0, 0, 0]),
             // Collapse fallback: unscissored draw covers the whole target.
             (Some(_), None) | (None, _) => {
@@ -11747,7 +11730,6 @@ impl GpuRenderer {
     ) -> Option<BandShift> {
         let shift = band_shift_ops(y0, y1, delta)?;
         let (w, h) = win.metal_offscreen.as_ref().map(|o| (o.w, o.h))?;
-        // The resident scratch.
         if let Err(e) = self.metal_ensure_shift_scratch(win, w, h) {
             metal_arm_note(&format!(
                 "armed scroll shift: no scratch ({e}); band unshifted"
@@ -12012,7 +11994,7 @@ impl GpuRenderer {
             metal_arm_note("armed present refused: window has no armed swapchain (re-attach it)");
             return Err(SurfacePresentFailure::Validation);
         }
-        // The same alpha/usage reconcile as the wgpu arm, recorded on the ONE
+        // The same alpha/usage reconcile as the wgpu arm, recorded on the one
         // config both swapchains derive from.
         #[cfg(wgpu_arm)]
         let (translucent, premult, want) = {
@@ -12073,10 +12055,10 @@ impl GpuRenderer {
                 }
             }
         }
-        // Acquire BEFORE compose, exactly like the wgpu arm: a refused
-        // acquire leaves the offscreen state untouched for the retry.
+        // Acquire before compose, as the wgpu arm does: a refused acquire leaves
+        // the offscreen state untouched for the retry.
         let hint = win.occluded_hint();
-        // The swapchain facts, taken BEFORE the acquire borrows the surface.
+        // The swapchain facts, taken before the acquire borrows the surface.
         let (dest_w, dest_h, dest_texel) = surf.neutral_config();
         let ms = surf.metal.as_mut().expect("checked above");
         let acquired = if ms.async_acquire() {
@@ -12417,8 +12399,8 @@ impl GpuRenderer {
             // wrote it is terminal (checked just above).
             unsafe { mtl::buffer_bytes(&rb, row * h as usize) }
         };
-        // Transport into the wgpu virtual target, then let the UNCHANGED tap
-        // ring copy it — `write_texture` is ordered before the submit below.
+        // Transport into the wgpu virtual target, then let the tap ring copy it
+        // (`write_texture` is ordered before the submit below).
         #[cfg(wgpu_arm)]
         let tex = win
             .virtual_target
@@ -12673,12 +12655,11 @@ impl GpuRenderer {
                 .clone_handle()
         });
         let dest_mpix = dest_format.metal();
-        // Advance the Submit-B ring slot so uniforms and glow streams reuse
-        // pre-allocated shared buffers across up to `ARM_SUBMIT_B_SLOTS` in-flight
-        // presents without per-frame `newBufferWithLength:` allocations.
+        // This present's uniforms and glow streams go in the next, settled,
+        // Submit B ring slot (see `ArmSubmitBSlot`).
         live.advance_submit_b_slot();
 
-        // Bloom (rows 4 + 12) — the replay's derivation, verbatim.
+        // Bloom (`GlowAdd` extract, `Bloom` composite): the replay's derivation.
         let (bw, bh) = (
             (fw / BLOOM_DOWNSCALE).max(1) as usize,
             (fh / BLOOM_DOWNSCALE).max(1) as usize,
@@ -13122,7 +13103,7 @@ impl GpuRenderer {
         }
         let submitted = cb.commit();
         if use_present_off {
-            // APPEND, never replace: an older compose still in flight keeps
+            // Append, never replace: an older compose still in flight keeps
             // its probe until it resolves.
             win.metal_present_off_pending
                 .push(crate::metal::encoder::CbProbe::of(&submitted));
@@ -13233,8 +13214,8 @@ impl GpuRenderer {
         if !self.last_frame_arm_metal {
             return Err("the armed encode degraded to wgpu".to_owned());
         }
-        // (The sub-row shift is Submit B's own step now — over the copy, so
-        // this hook presents exactly what the on-glass arm presents.)
+        // The sub-row shift is a Submit B step over the copy, so this hook
+        // presents exactly what the on-glass arm presents.
         let (device, latch) = {
             let live = self
                 .metal_arm
@@ -13378,12 +13359,9 @@ impl GpuRenderer {
     /// grid band `[grid_top_row, grid_bot_row)` of the offscreen by the signed
     /// `input.scroll_frac_px` (up for a glide, down for an overscroll bounce), so
     /// blit and readback see the same shifted frame. Chrome rows outside the band
-    /// are untouched.
-    ///
-    /// Same integer row move as the CPU; the exposed strip keeps the band's own
-    /// pixels as placeholder. A resident scratch stages the move because an
-    /// overlapping same-texture copy is undefined. `frac == 0`, an empty band or a
-    /// fully exposed band is a no-op.
+    /// are untouched; the exposed strip keeps the band's own pixels as
+    /// placeholder. A resident scratch stages the move because an overlapping
+    /// same-texture copy is undefined.
     ///
     /// Oracle path only (`render_input_target`); present paths translate the
     /// present copy instead (`shift_present_copy_band` / `BandShiftPass`).
@@ -13424,8 +13402,8 @@ impl GpuRenderer {
                 return;
             };
             let h = off.h;
-            // The renderer's own row→px mapping, clamped to the framebuffer — the
-            // SAME helper the CPU present path calls, so the two bands cannot drift.
+            // The renderer's own row→px mapping, clamped to the framebuffer: the
+            // same helper the CPU present path calls, so the two bands cannot drift.
             let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
                 self.cpu.grid_top(),
                 self.cell_size().1,
@@ -13556,8 +13534,8 @@ impl GpuRenderer {
         );
         let off_copy = crate::device_layer::FrameCopyTexture::Wgpu(&off_tex);
         let scratch_copy = crate::device_layer::FrameCopyTexture::Wgpu(scratch.wgpu());
-        // 1. Stage the SOURCE band `[src_y, src_y+moved)` into the scratch (a
-        //    distinct texture => no overlap UB).
+        // 1. Stage the source band `[src_y, src_y+moved)` into the scratch (a
+        //    distinct texture, so no overlap).
         enc.copy_texture_rect(
             off_copy,
             (0, shift.src_y),
@@ -13757,9 +13735,9 @@ impl GpuRenderer {
                         "aterm-gpu: f16 requested but scRGB unsupported (Windows HDR off?) — SDR swapchain"
                     );
                 }
-                // fall through to the SDR pick below (reconfigures this surface 8-bit)
             }
-            // No f16 on this surface: fall through to the SDR pick.
+            // No usable f16: fall through to the SDR pick, which reconfigures
+            // this surface 8-bit.
         }
         // Query capabilities once (the present-mode pick needs them); the
         // non-sRGB format choice is cached across windows. `caps` also carries
@@ -13784,8 +13762,8 @@ impl GpuRenderer {
                 f
             }
         };
-        // Compile the blit pipeline for this format NOW (off the first-FRAME path);
-        // `present_input` then only looks it up. Idempotent if already built.
+        // Compile the blit pipeline for this format now, off the first-frame
+        // path; `present_input` then only looks it up.
         self.ensure_blit_pipeline(format);
         // Whether the surface offers the non-opaque composite, captured on the
         // `GpuSurface` so the per-frame reconcile never re-queries.
@@ -14379,18 +14357,15 @@ impl GpuRenderer {
 
     /// Re-pick the swapchain format for the screen the window now sits on (macOS
     /// Metal arm). The attach narrows f16 by screen, so a window born on an
-    /// SDR-only screen (or with `hdr_glow` off) holds an 8-bit swapchain. The
+    /// SDR-only screen (or with `hdr_glow` off) holds an 8-bit swapchain; the
     /// frontend calls this on monitor changes and from its throttled headroom
-    /// re-query (which catches `hdr_glow` hot-reloads and display-setting
-    /// changes). When the screen reports EDR potential above 1.0
+    /// re-query. When the screen reports EDR potential above 1.0
     /// (`format_plan::hdr_screen_upgrade_wants_f16`), this moves the retained
-    /// format to `Rgba16Float`, flips the live layer, then promotes capture
-    /// metadata (`WindowGpu::apply_hdr_surface_upgrade`).
-    ///
-    /// The flip is the armed present's reconcile run early (`metal_present_want`
-    /// off the moved format), and it is synchronous because the frontend tags
-    /// the layer scRGB as soon as this returns `true`; an 8-bit drawable under an
-    /// scRGB tag would be misread.
+    /// format to `Rgba16Float`, flips the live layer through the armed present's
+    /// reconcile (`metal_present_want`), then promotes capture metadata
+    /// (`WindowGpu::apply_hdr_surface_upgrade`). The flip is synchronous because
+    /// the frontend tags the layer scRGB as soon as this returns `true`, and an
+    /// 8-bit drawable under that tag is misread.
     ///
     /// A refused flip (arm not live, no swapchain, `reconcile` error, or the
     /// layer not moving because an acquisition is in flight) reverts the
@@ -14643,29 +14618,55 @@ impl GpuRenderer {
         false
     }
 
+    /// The DX12 surface's swap chain as an owned aterm-win32 interface
+    /// pointer, viewed through `IDXGISwapChain3`'s vtable; `None` on a non-DX12
+    /// backend or before the swap chain exists.
+    #[cfg(windows)]
+    #[cfg(wgpu_arm)]
+    fn dx12_swap_chain(surface: &wgpu::Surface) -> Option<aterm_win32::com::Com> {
+        // SAFETY: the hal-surface guard borrows the live surface only for this
+        // scope. `swap_chain()` returns wgpu-hal's `windows` `IDXGISwapChain3`
+        // by value, an AddRef'd clone: one non-null interface pointer,
+        // `#[repr(transparent)]`, released once on drop, which `Com` takes over
+        // and releases instead. The surface keeps its own reference.
+        unsafe {
+            let hal_surf = surface.as_hal::<wgpu::hal::api::Dx12>()?;
+            Some(aterm_win32::com::Com::from_interface(
+                hal_surf.swap_chain()?,
+            ))
+        }
+    }
+
     #[cfg(windows)]
     #[cfg(wgpu_arm)]
     fn surface_output_hdr_enabled(surface: &wgpu::Surface) -> bool {
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-        use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
-        use windows::core::Interface as _;
+        use aterm_win32::com::Com;
+        use aterm_win32::dxgi::{
+            DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_OUTPUT_DESC1, IDXGIOutput6_Vtbl,
+            IDXGISwapChain3_Vtbl, IID_IDXGIOutput6,
+        };
 
-        // SAFETY: the hal-surface guard borrows the live surface only for this
-        // scope; COM handles are result-checked and reference-counted and none
-        // escape. A non-DX12 backend returns `None`.
-        unsafe {
-            let Some(hal_surf) = surface.as_hal::<wgpu::hal::api::Dx12>() else {
-                return false;
-            };
-            let Some(sc) = hal_surf.swap_chain() else {
-                return false;
-            };
-            sc.GetContainingOutput()
-                .ok()
-                .and_then(|output| output.cast::<IDXGIOutput6>().ok())
-                .and_then(|output| output.GetDesc1().ok())
-                .is_some_and(|desc| desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
-        }
+        let Some(sc) = Self::dx12_swap_chain(surface) else {
+            return false;
+        };
+        let mut out = core::ptr::null_mut();
+        // SAFETY: `sc` is an IDXGISwapChain3; GetContainingOutput writes one
+        // owned IDXGIOutput on success, which `Com` releases.
+        let hr = unsafe {
+            (sc.vtable::<IDXGISwapChain3_Vtbl>().GetContainingOutput)(sc.as_raw(), &mut out)
+        };
+        // SAFETY: as above.
+        let Some(output) = (hr >= 0).then(|| unsafe { Com::from_raw(out) }).flatten() else {
+            return false;
+        };
+        let Ok(output) = output.query(&IID_IDXGIOutput6) else {
+            return false;
+        };
+        let mut desc = DXGI_OUTPUT_DESC1::default();
+        // SAFETY: `output` is an IDXGIOutput6; GetDesc1 fills `desc`.
+        let hr =
+            unsafe { (output.vtable::<IDXGIOutput6_Vtbl>().GetDesc1)(output.as_raw(), &mut desc) };
+        hr >= 0 && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
     }
 
     /// Tag the swapchain scRGB (`DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`) on
@@ -14691,31 +14692,29 @@ impl GpuRenderer {
     #[cfg(windows)]
     #[cfg(wgpu_arm)]
     fn tag_swapchain_scrgb(surface: &wgpu::Surface) -> bool {
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-        use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+        use aterm_win32::dxgi::{
+            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+            DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, IDXGISwapChain3_Vtbl,
+        };
         if !Self::surface_output_hdr_enabled(surface) {
             return false;
         }
-        // SAFETY: the hal-surface guard borrows the live surface for this scope
-        // only; result-checked COM calls on its `IDXGISwapChain3`. `None` on
-        // non-DX12 backends.
-        unsafe {
-            let Some(hal_surf) = surface.as_hal::<wgpu::hal::api::Dx12>() else {
-                return false;
-            };
-            let Some(sc) = hal_surf.swap_chain() else {
-                return false;
-            };
-            // `surface_output_hdr_enabled` already checked the output's current HDR10
-            // colour space; `CheckColorSpaceSupport` alone can report support while
-            // the desktop is SDR.
-            let cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-            let supported = matches!(
-                sc.CheckColorSpaceSupport(cs),
-                Ok(flags) if (flags & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) != 0
-            );
-            supported && sc.SetColorSpace1(cs).is_ok()
-        }
+        let Some(sc) = Self::dx12_swap_chain(surface) else {
+            return false;
+        };
+        // SAFETY: `sc` is an IDXGISwapChain3, held for this scope.
+        let vt = unsafe { sc.vtable::<IDXGISwapChain3_Vtbl>() };
+        // `surface_output_hdr_enabled` already checked the output's current HDR10
+        // colour space; `CheckColorSpaceSupport` alone can report support while
+        // the desktop is SDR.
+        let cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        let mut flags = 0u32;
+        // SAFETY: result-checked calls on the live swap chain; `flags` is
+        // written only on success.
+        let supported = unsafe { (vt.CheckColorSpaceSupport)(sc.as_raw(), cs, &mut flags) } >= 0
+            && flags & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT as u32 != 0;
+        // SAFETY: as above.
+        supported && unsafe { (vt.SetColorSpace1)(sc.as_raw(), cs) } >= 0
     }
 
     /// Render the frame offscreen and present it by blitting that texture into
@@ -14732,8 +14731,7 @@ impl GpuRenderer {
         input: &RenderInput,
         invert: bool,
         overlay: Option<DropOverlay>,
-        // Settings-card overlay (P3). `None` (the default) draws nothing — the
-        // feature is OFF unless the caller passes a card.
+        // Settings-card overlay; `None` draws nothing.
         tray: Option<TrayQuad<'_>>,
     ) -> Result<(), SurfacePresentFailure> {
         self.present_input_with_crop(win, surf, input, invert, overlay, tray, None, 0)
@@ -14953,23 +14951,14 @@ impl GpuRenderer {
         dest: PresentDest<'_>,
     ) {
         // 1. Offscreen render (submits): a scissored dirty-row repaint when the
-        //    offscreen holds the prior frame, else a full repaint. The target and
-        //    blit bind group are resident on `win.offscreen`.
+        //    offscreen holds the prior frame, else a full repaint.
         //
-        // The tray does not disable the scissor: like the bloom halo and shimmer,
-        // it is drawn over the throwaway `present_offscreen` copy, never into
-        // the scissor base. `compose_present_offscreen` re-copies (offscreen
-        // writes since sync) ∪ (last sync's effect footprint), so anything drawn
-        // over the copy is erased and redrawn exactly; the card's footprint is its
-        // exact rect.
-        //
-        // Z-order: the card is recorded after the halo and haze over the copy,
-        // so it sits on top. The sub-row band shift also translates the copy
-        // (after halo/haze, before the card), so the offscreen stays the clean
-        // base for every frame class.
-        //
-        // A resident card always rides the copy route, so `present_prev`
-        // survives it on every frame.
+        // The bloom halo, shimmer, sub-row band shift and tray all draw over the
+        // throwaway `present_offscreen` copy (halo and haze, then the shift, then
+        // the card on top), never into the scissor base.
+        // `compose_present_offscreen` re-copies (offscreen writes since sync) ∪
+        // (last sync's effect footprint), so whatever was drawn over the copy is
+        // erased and redrawn exactly, and `present_prev` survives a resident card.
         let tray_over_copy = tray.is_some() || win.tray_overlay.is_some();
         let frac = input.scroll_frac_px;
         // GPU time: every timed pass from the offscreen encode to the blit.
@@ -14983,10 +14972,8 @@ impl GpuRenderer {
         // frame.
         let shimmer_present = self.shimmer_live(input);
         let fx_present = bloom_glow_present || shimmer_present;
-        // Every effect composites over the `present_offscreen` copy: halo and
-        // haze first, then the band translate, so the offscreen is never diffed
-        // against a haloed or translated frame. When the bloom builds the ungated
-        // glow instances, remember the count so the crown passes reuse them.
+        // When the bloom builds the ungated glow instances, remember the count
+        // so the crown passes reuse them.
         let mut ungated_built: Option<u32> = None;
 
         // Frontend chrome is drawn later by `draw_tray_over_present_copy`. A
@@ -15001,13 +14988,9 @@ impl GpuRenderer {
             }
         }
 
-        // The offscreen stays a clean scissor base; the comet halo composites
-        // over a throwaway copy (`present_offscreen`) that the blit samples, so
-        // the dirty set tracks real content change. It runs on keystroke-echo
-        // frames too, so the halo never blinks. The copy is also the card's
-        // target and the sub-row translate's target, so card or sub-row frames
-        // compose one even with every effect off. The sync copies only the
-        // encode's scissor rect.
+        // Compose the copy whenever anything draws over it (an effect, the card
+        // or a sub-row shift), keystroke-echo frames included so the halo never
+        // blinks.
         let use_present_off = fx_present || tray_over_copy || frac != 0;
         // One command buffer for the rest of the present (composite plus blit).
         // `encode_frame` submits its own first, and tray/shift encoders created
@@ -15076,7 +15059,7 @@ impl GpuRenderer {
         };
         let pipeline = &self.blit_pipelines[&format];
 
-        // 4. Upload the blit uniform only when it differs from the shared
+        // 3. Upload the blit uniform only when it differs from the shared
         //    buffer's contents (renderer-level memo). The offscreen is already
         //    bound via the resident `blit_bind`.
         if self.blit_uniform_written != Some(want) {
@@ -15108,12 +15091,12 @@ impl GpuRenderer {
                 .blit_bind
         };
 
-        // 3. Letterbox blit (on an HDR present the aurora boost draws in the
+        // 4. Letterbox blit (on an HDR present the aurora boost draws in the
         //    same pass). The swapchain is the window's client size, rarely a cell
         //    multiple, while the offscreen is the integer-cell grid. The shader
         //    places the offscreen 1:1 at the content offset and fills the
         //    remainder with the terminal background, so the WSI never stretches
-        //    glyphs. The legacy virtual target is grid-sized; its cropped sibling
+        //    glyphs. `present_virtual`'s target is grid-sized; its cropped sibling
         //    uses the frontend's visible destination.
         let (sw, sh) = (dest.w, dest.h);
         // Band colour is the live terminal background (OSC 11 / DECSCNM, else
@@ -15340,9 +15323,9 @@ impl GpuRenderer {
     /// (the CPU's `incoming_row_applies` + `incoming_strip`), then the CPU face
     /// rasters the row into `win.apron_scratch` and this packs it into
     /// `win.apron_rgba` in the offscreen's byte order (top byte
-    /// `255 - transmittance`, the inverse of `frame_from_padded_rgba`). `h` is the
-    /// target height the band is clamped to. The upload is skipped while the
-    /// bytes are unchanged.
+    /// `255 - transmittance`, the inverse of `frame_from_padded_rgba`), repacking
+    /// only when the raster's generation moves. `h` is the target height the
+    /// band is clamped to.
     fn apron_strip_plan(
         &mut self,
         win: &mut WindowGpu,
@@ -15798,13 +15781,11 @@ impl GpuRenderer {
         VirtualTarget { tex, w, h }
     }
 
-    /// Build every effect pipeline not yet resident, off the frame path.
-    ///
-    /// The frontend calls this at config apply, so the first frame drawing a
-    /// newly enabled effect (the fire pair is slow to compile) finds its pipeline
-    /// built. Not called at launch, so a launch that never touches config builds
-    /// none. Idempotent. Correctness does not depend on it: [`Self::encode_frame`]
-    /// ensures whatever a frame binds.
+    /// Build every effect pipeline not yet resident, off the frame path. The
+    /// frontend calls this at config apply (not at launch), so the first frame
+    /// drawing a newly enabled effect finds its pipeline built. Idempotent;
+    /// correctness does not depend on it ([`Self::encode_frame`] ensures what a
+    /// frame binds).
     #[cfg(wgpu_arm)]
     pub fn warm_effect_pipelines(&mut self) {
         for which in EFFECT_PIPELINES {
@@ -15848,7 +15829,7 @@ impl GpuRenderer {
 
     /// Build and cache the HDR aurora resources if absent: shader module
     /// (`HDR_GLOW_SHADER`), uniform buffer and bind group, and a One/One pipeline
-    /// over the `BgInstance` stream targeting `Rgba16Float` (the only format
+    /// over the `GlowInstance` stream targeting `Rgba16Float` (the only format
     /// `format_plan::hdr_present_plan` enables). Colour-only write mask. Lazy.
     #[cfg(wgpu_arm)]
     fn ensure_hdr_glow_pipeline(&mut self) {
@@ -16064,8 +16045,13 @@ impl GpuRenderer {
                 // Reusable: scissor the dirty band. The bloom halo does not widen
                 // the dirty set, since it composites at present time over a copy,
                 // never into the scissor base. Zero dirty rows means Load preserves
-                // the frame and nothing draws.
-                DirtyDecision::Rows(_) => RepaintScope::Dirty(&dirty),
+                // the frame and nothing draws. Upward overshoot (ATERM-KI-1020-1):
+                // the row above a marked row whose ink there may have changed is
+                // rebuilt too (the scroll plan marks its own apron rows).
+                DirtyDecision::Rows(_) => {
+                    self.cpu.mark_overshoot_rows(&prev_input, input, &mut dirty);
+                    RepaintScope::Dirty(&dirty)
+                }
                 // Not reusable by the row diff, but ordinary scrollback navigation
                 // (the grid slid by an integer row delta) can be rescued by the
                 // CPU's shared planner (`scroll_blit_plan`): on `Some(delta)` the
@@ -16106,7 +16092,6 @@ impl GpuRenderer {
             self.scroll_rescues += 1;
             self.shift_offscreen_rows(win, delta, input.rows);
         }
-        #[cfg(any(target_os = "macos", gl_arm))]
         let was_dirty = matches!(scope, RepaintScope::Dirty(_));
         let dims = self.encode_frame(win, input, &scope);
         // Done with the borrowed scope; restore the scratch (capacity retained).
@@ -16132,6 +16117,16 @@ impl GpuRenderer {
                 "armed present: mid-frame degrade under a Dirty scope; re-encoded FULL for \
                  coherence",
             );
+            self.full_repaints += 1;
+            self.encode_frame(win, input, &RepaintScope::Full)
+        } else {
+            dims
+        };
+        // A Dirty encode drew a row whose ink rose above its band where
+        // `row_may_ink_above` said it could not: the rows above it were not
+        // rebuilt for that ink, so re-encode Full (the rule has narrowed what
+        // it takes on trust, `Renderer::catch_unpredicted_overshoot`).
+        let dims = if was_dirty && self.overshoot_surprise {
             self.full_repaints += 1;
             self.encode_frame(win, input, &RepaintScope::Full)
         } else {
@@ -16321,7 +16316,7 @@ impl GpuRenderer {
             // one (`extract_first > 0`), else the exact set.
             pass.draw(0..6, extract_first..extract_first + glow_count);
         }
-        // 2) Blur + composite: additively add the blurred glow over the frame.
+        // 2) Blur and composite the glow over the frame (`Blend::SCREEN`).
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("aterm-gpu bloom composite pass"),
@@ -16397,23 +16392,17 @@ impl GpuRenderer {
         }
     }
 
-    /// Produce this window's [`PresentOffscreen`] for a bloom/shimmer present:
-    /// copy the clean `offscreen` into it, composite the halo over the copy (when
-    /// bloom is on), then refract above the hot region (when the shimmer derives
+    /// Produce this window's [`PresentOffscreen`] for a present that draws over
+    /// the copy: copy the clean `offscreen` into it, composite the halo (bloom on,
+    /// live glow), then refract above the hot region (when the shimmer derives
     /// one). The blit and readback helpers sample this copy, so the presented
     /// frame is base + aurora + halo + haze while the offscreen stays a clean
-    /// scissor base. Precondition: bloom or shimmer enabled, live glow, offscreen
-    /// resident. Returns the ungated glow count when the bloom uploaded
-    /// `vbufs.bloom_glow` (the crowns reuse it), else `None`.
+    /// scissor base. Returns the ungated glow count when bloom is on (the crowns
+    /// reuse the `vbufs.bloom_glow` upload), else `None`.
     ///
-    /// The copy is incremental: the persistent copy can only differ from the
-    /// offscreen where the offscreen was written since the last sync
-    /// (`offscreen_dirty_since_sync`) or where the last sync's effects wrote
-    /// (`present_offscreen_fx`), so only that union is copied. Unknown writers
-    /// degrade to `None`, a full copy.
-    ///
-    /// `enc` is the caller's encoder (the one recording the blit), so the
-    /// composite adds no commit of its own.
+    /// Copies only `present_copy_rect` (offscreen writes since the last sync
+    /// plus the last sync's effect footprint; unknown writers force a full
+    /// copy). `enc` is the caller's encoder, so the composite adds no commit.
     #[cfg(wgpu_arm)]
     fn compose_present_offscreen(
         &mut self,
@@ -16677,7 +16666,7 @@ impl GpuRenderer {
             fh: h,
             hot_top: hot_top as f32,
             rise,
-            // Band anchoring stays on the PRE-CLIP x-range (see the fx-clip
+            // Band anchoring stays on the pre-clip x-range (see the fx-clip
             // note above): clipping the rect must not re-bin the heat.
             band_x0: x0 as f32,
             band_w,
@@ -16869,7 +16858,7 @@ impl GpuRenderer {
             .queue
             .write_buffer(&sr.uniform_buf, 0, aterm_bits::bytes_of(&su));
         // 3) The refraction pass, scissored to the region rect: every pixel
-        //    outside it is untouched (the no-op / outside-the-bound law).
+        //    outside it is untouched.
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("aterm-gpu shimmer pass"),
@@ -17281,12 +17270,10 @@ impl GpuRenderer {
     /// readable target of `target`'s format, with every uniform-driven arm of
     /// `fs_blit` under the caller's control, and return the destination texture.
     ///
-    /// `hdr`, `translucent`, `premult`, `sdr_white_scale` and `encode_srgb`
-    /// derive from platform state a headless test cannot create (`encode_srgb` is
-    /// always `0.0` on macOS), so they are forced here. That is valid for a
-    /// differential, which asks whether the wgpu and Metal `fs_blit` twins agree
-    /// on the same bytes. The uniform still comes from [`present_blit_uniform`]
-    /// and its builders. Leaves `win.offscreen` and `present_prev` untouched.
+    /// `hdr`, `translucent`, `premult`, `sdr_white_scale` and `encode_srgb` come
+    /// from platform state a headless test cannot create, so they are forced
+    /// here; the uniform still comes from [`present_blit_uniform`]. Leaves
+    /// `win.offscreen` and `present_prev` untouched.
     #[cfg(wgpu_arm)]
     fn blit_effect_target_for_test(
         &mut self,
@@ -17329,7 +17316,7 @@ impl GpuRenderer {
         });
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Write the production crop/invert/overlay/band uniform through the REAL
+        // Write the production crop/invert/overlay/band uniform through the real
         // shared buffer and keep its memo coherent for the next present.
         let mut want =
             present_blit_uniform(invert, overlay, source_crop, fw, fh, w, h, self.theme.bg);
@@ -17355,7 +17342,7 @@ impl GpuRenderer {
             .write_buffer(&self.blit_uniform_buf, 0, aterm_bits::bytes_of(&want));
         self.blit_uniform_written = Some(want);
 
-        // The real blit bind group: source view, `blit_sampler` (NEAREST) and
+        // The real blit bind group: source view, `blit_sampler` (nearest) and
         // `blit_uniform_buf` under `blit_bgl`.
         let bind = self
             .ctx
@@ -17379,7 +17366,7 @@ impl GpuRenderer {
                 ],
             });
 
-        // The REAL blit pipeline (vs_blit + fs_blit) for this format.
+        // The real blit pipeline (vs_blit + fs_blit) for this format.
         self.ensure_blit_pipeline(format);
         let pipeline = &self.blit_pipelines[&format];
 
@@ -17545,7 +17532,7 @@ impl GpuRenderer {
         let glow_present = fx_gpu::crown_glow_present(input);
         let plan = crate::format_plan::hdr_present_plan(
             self.hdr_glow,
-            true, // the stand-in target IS Rgba16Float
+            true, // the stand-in target is Rgba16Float
             glow_present,
         );
         let headroom = aterm_render::hdr::additive_headroom(win.edr_max);
@@ -17952,12 +17939,12 @@ impl GpuRenderer {
         // format; compositing there matches the CPU `composite_tray`.
         let format = self.ctx.offscreen_format();
 
-        // (1) ALL `&mut self` / `&mut win` work FIRST — before any immutable borrow
-        //     of `win.offscreen` / `win.tray_overlay` is taken below.
+        // (1) All `&mut self` / `&mut win` work first, before the immutable
+        //     borrows of `win.offscreen` / `win.tray_overlay` below.
         self.ensure_tray_pipeline(format);
         self.ensure_tray_overlay(win, tray.rgba, tray.pw, tray.ph);
 
-        // (2) Placement uniform. `fb` is the OFFSCREEN's padded dims.
+        // (2) Placement uniform. `fb` is the offscreen's padded dims.
         let (fw, fh) = {
             let off = win.offscreen.as_ref().expect("encode_frame sets offscreen");
             (off.w, off.h)
@@ -18049,7 +18036,7 @@ impl GpuRenderer {
         // `present_offscreen` comes from `offscreen_texture`, so the tray
         // pipeline attaches it unchanged.
         let format = self.ctx.offscreen_format();
-        // (1) ALL `&mut self` / `&mut win` work FIRST, before the immutable borrows.
+        // (1) All `&mut self` / `&mut win` work first, before the immutable borrows.
         self.ensure_tray_pipeline(format);
         self.ensure_tray_overlay(win, tray.rgba, tray.pw, tray.ph);
         let Some((fw, fh)) = win.present_offscreen.as_ref().map(|p| (p.w, p.h)) else {
@@ -18171,7 +18158,7 @@ impl GpuRenderer {
             self.clamp_fb_dim(raw_h as u32) as usize,
         );
 
-        // GATE-HIT: a prior frame exists, it is pixel-identical to this input,
+        // Gate hit: a prior frame exists, it is pixel-identical to this input,
         // and its cached pixels are the right size (implied by
         // `is_unchanged_frame`'s equal rows/cols; checked defensively). A
         // prefetch list the last encode did not admit misses: the hint draws
@@ -18206,7 +18193,7 @@ impl GpuRenderer {
             };
         }
 
-        // MISS: full GPU render + readback, then refresh the gate cache to THIS
+        // Miss: full GPU render + readback, then refresh the gate cache to this
         // frame's pixels + state so the next unchanged frame can take the gate.
         self.gate_misses += 1;
         let mut damage_input = win
@@ -18426,16 +18413,16 @@ impl GpuRenderer {
     /// offscreen (`win.offscreen`, rebuilt only on resize) and submit. Returns
     /// the frame's `(w, h)`.
     ///
-    /// `scope` selects a full repaint or `RepaintScope::Dirty`: the prior frame
-    /// is kept with `LoadOp::Load`, instances are built only for dirty rows, and
-    /// the pass is scissored to their band. A dirty row gets the same instances
-    /// as in a full render and rows are disjoint bands (double-height forces
-    /// Full), so the result is bit-identical.
+    /// Under `RepaintScope::Dirty` the prior frame is kept (`LoadOp::Load`),
+    /// only dirty rows get instances, and the pass is scissored to their band.
+    /// A dirty row gets the same instances as in a full render and rows are
+    /// disjoint bands (double-height forces Full), so the result is
+    /// bit-identical.
     ///
-    /// Spec: the bg-instance path refines the `gpu_encode` machine. Pushing a
-    /// `BgInstance` is `Append`; uploading and slicing `bg_buf` is `Encode`,
-    /// gated by [`should_slice`]. `tests/conformance_gpuencode.rs` drives that
-    /// decision; the `project_bg_encode` projection is named, not executed.
+    /// Spec: the bg-instance path refines `gpu_encode`: pushing a `BgInstance`
+    /// is `Append`, uploading and slicing its stream is `Encode`, gated by
+    /// [`should_slice`] (driven by `tests/conformance_gpuencode.rs`). The
+    /// `project_bg_encode` projection is named, not executed.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -18461,6 +18448,7 @@ impl GpuRenderer {
         // The frame shape's CPU split: instance building runs from here to the
         // arm's tail (`FrameShape::build_ns`).
         let build_started = aterm_time::Instant::now();
+        self.overshoot_surprise = false;
         // Take the deferred band shift unconditionally so a plan never outlives
         // its present: the armed tail records it into Submit A, any other tail
         // drops it (a degrade re-encodes Full).
@@ -18541,14 +18529,11 @@ impl GpuRenderer {
         // Deco sprite atlas, refreshed for this cell size and underline band
         // before the pass borrows `self`; a no-op once it matches.
         self.ensure_deco_atlas(cw, ch);
-        // Sprite uploads (version-cached) need `&mut self`, so they happen before
-        // the `&self` borrows below.
+        // Sprite uploads (identity-cached) need `&mut self`, so they happen
+        // before the `&self` borrows below.
         self.ensure_cat_atlas(win, input);
-        // FREE-sprite atlas upload, the same version-keyed pattern.
         self.ensure_free_atlas(win, input);
-        // PHOSPHOR rain atlas upload, the same version-keyed pattern.
         self.ensure_rain_atlas(win, input);
-        // WALLPAPER texture upload, identity-keyed like the free atlas.
         self.ensure_wallpaper_tex(win, input);
 
         // Rows to build instances for: every row under Full, the dirty rows under
@@ -18593,7 +18578,7 @@ impl GpuRenderer {
             // fs_sprite_over blends un-remapped: bg unused.
             bg: [0, 0, 0, 0],
         };
-        // Visible rows, already resolved by `extract` under the lock.
+        // Visible rows, already resolved under the terminal lock (`cell_frame_into`).
         let rendered: &[Vec<aterm_core::terminal::RenderCell>] = &input.cells;
 
         let (cr, cc) = (input.cursor_row, input.cursor_col);
@@ -18624,6 +18609,21 @@ impl GpuRenderer {
         // CPU. Built before the atlas/key loops because the planner needs
         // `&mut self.cpu`. Uses the persistent plan scratch, restored after the
         // glyph loop.
+        //
+        // Which rows draw glyphs, and the pixel rows their quads keep
+        // (`glyph_windows`): every row under Full; under Dirty the dirty rows, a
+        // kept row above clipping them at their band top, and the lower-apron rows.
+        // Taken across the glyph passes and restored after the marks.
+        let mut glyph_win = std::mem::take(&mut self.glyph_win_scratch);
+        glyph_windows(
+            &mut self.cpu,
+            input,
+            scope,
+            grid_top,
+            ch,
+            vis_rows,
+            &mut glyph_win,
+        );
         let mut row_plans = std::mem::take(&mut self.row_plans);
         row_plans.resize_with(rendered.len(), Vec::new);
         // One persistent break-column scratch for all rows, restored after the
@@ -18632,7 +18632,7 @@ impl GpuRenderer {
         // Bounded by `vis_rows` like the emission loops: rows past the clamped
         // framebuffer emit nothing. All readers are bounded the same way.
         for (r, plan) in row_plans.iter_mut().enumerate().take(vis_rows) {
-            if !row_active(r) {
+            if glyph_win[r].is_none() {
                 continue;
             }
             self.cpu
@@ -18659,7 +18659,7 @@ impl GpuRenderer {
         } else {
             (cc * cw, cw, None)
         };
-        // A block cursor on a WIDE lead (CJK/emoji) covers the glyph's whole
+        // A block cursor on a wide lead (CJK/emoji) covers the glyph's whole
         // 2-cell footprint (the CPU's `cur_w`), so the ideograph inverts as one.
         let cursor_wide_lead = block_cursor
             && rendered
@@ -18694,7 +18694,7 @@ impl GpuRenderer {
         } else {
             (0, 0)
         };
-        // The cut-out recolours in the CURSOR cell's bg over the cursor fill —
+        // The cut-out recolours in the cursor cell's bg over the cursor fill,
         // the CPU's `cut_color`/`cursor_fill` operand pair.
         let cutout_color = cursor_cell.map_or([0, 0, 0, 0], |cell| rgb4(cell.bg));
 
@@ -18707,15 +18707,15 @@ impl GpuRenderer {
         key_scratch.resize(vis_rows * cols, None);
         // Bounded by `vis_rows`, as are the emission loop's reads.
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
-            // A Dirty repaint needs keys only for its dirty rows; resident
-            // atlases hold the rest.
-            if !row_active(r) {
+            // A Dirty repaint needs keys only for the rows it draws glyphs on;
+            // resident atlases hold the rest.
+            if glyph_win[r].is_none() {
                 continue;
             }
             let plan = &row_plans[r];
-            // The row's chrome raster, for its drawn icons (ruling 251).
+            // The row's chrome raster, for its drawn icons.
             let row_raster = input.chrome_raster(r);
-            // Cell advance for THIS row (DECDWL doubles it) — the shade-phase
+            // Cell advance for this row (DECDWL doubles it); the shade-phase
             // fold below needs the row's true pixel origins.
             let rcw = aterm_render::row_cell_w(
                 input
@@ -18869,17 +18869,11 @@ impl GpuRenderer {
         #[cfg(wgpu_arm)]
         let deco_bind = self.deco_atlas.as_ref().map(|d| &d.bind);
 
-        // Selection highlight follows the CPU rule
-        // (`RenderInput::selection_contains_cell`).
-        //
-        // Instances: one opaque bg quad per cell run and one alpha quad per
-        // drawable glyph (including the block-cursor cell's). The opaque cursor
-        // fill draws after the glyph passes, and each cut-out source glyph adds a
-        // bg-coloured slice clipped to the cursor rect, so everything outside the
-        // rect matches the no-cursor frame, as on the CPU.
-        //
-        // The backdrop-margin policy is read here, before the `self.inst`
-        // borrows, since it is a `&self` call.
+        // Selection follows the CPU rule (`RenderInput::selection_contains_cell`).
+        // The opaque cursor fill draws after the glyph passes, and each cut-out
+        // source glyph adds a bg-coloured slice clipped to the cursor rect, so
+        // everything outside the rect matches the no-cursor frame, as on the CPU.
+        // The backdrop-margin policy is read before the `self.inst` borrows.
         let backdrop_margins_active = self.backdrop_margins_active();
         let backdrop_margin_alpha_byte = (self.backdrop_margin_alpha() * 255.0).round() as u8;
         let bg_inst = &mut self.inst.bg;
@@ -19002,8 +18996,8 @@ impl GpuRenderer {
         {
             if f == 0 && grid_top > 0 {
                 if wallpaper_on {
-                    // Re-establish the strip from the BACKDROP texels, exactly
-                    // the bytes FULL's whole-frame wallpaper quad gives it.
+                    // Re-establish the strip from the wallpaper texels, the
+                    // bytes the Full scope's whole-frame quad gives it.
                     self.inst
                         .wallpaper
                         .push(wallpaper_quad(0.0, 0.0, w as f32, grid_top as f32));
@@ -19064,6 +19058,10 @@ impl GpuRenderer {
                 });
             }
         }
+        // Materialized wide halves can remain selected after their logical span is
+        // clipped out; only an empty frame selection skips the hit.
+        let may_have_sel = input.any_selection();
+        // The background pass: each dirty row's band, gutters and chrome ground.
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
             if !row_active(r) {
                 continue;
@@ -19073,37 +19071,13 @@ impl GpuRenderer {
             let y0u = sat_pos_u16(grid_top + r * ch);
             // DEC line size: advance, glyph enlargement and row clip come from
             // the CPU blit's helpers.
-            let line_size = input.line_sizes[r];
-            let rcw = aterm_render::row_cell_w(line_size, cw);
-            // A lifted chrome row places glyphs higher, clear of its rail
-            // (`chrome_lifted`, the CPU `row_ctx` rule).
-            let (scale, anchor_y) = aterm_render::chrome_lifted(
-                input,
-                r,
-                grid_top + r * ch,
-                ch,
-                chrome_room,
-                aterm_render::row_scale(line_size, grid_top + r * ch, ch, r + 1 == input.rows),
-            );
+            let rcw = aterm_render::row_cell_w(input.line_sizes[r], cw);
             // `line_sizes[r]` is one value per row, but split panes on one
             // composite row can carry different DEC line sizes. Uniform rows
             // (`row_is_uniform`) keep the hoisted `c · rcw` origins; a mixed row
             // places each cell through `cell_x_run` (as the CPU does) and clips
             // quads to the run's box, so a double-width pane stays inside itself.
             let row_uniform = aterm_render::row_is_uniform(input, r);
-            // Animated-ink and charred-glyph fg overrides for this row, walked
-            // in lockstep as in the CPU `render_row` (`sparse_row_slice` /
-            // `InkWalk`). Ink replaces `cell.fg` first, then the fg floors apply
-            // (min-contrast unselected, selection floor selected). Ink wins over
-            // char_fg. Rows beyond u16 carry no ink.
-            let (mut ink_walk, mut char_fg_walk) = fg_walks(input, r);
-            // The `fire_halo` walk for the contrast-halo gate: engulfment
-            // strength only, shared with the CPU (`fire_halo_row_slice` /
-            // `FireHaloWalk`).
-            let mut halo_walk =
-                aterm_render::FireHaloWalk::new(u16::try_from(r).map_or(&[][..], |row| {
-                    aterm_render::fire_halo_row_slice(&input.fire_halo, row)
-                }));
             // This row's in-flight bg run (see `push_bg_run`), flushed after the
             // tail loop before any other stream pushes. The full-row band quad
             // below bypasses it.
@@ -19205,7 +19179,7 @@ impl GpuRenderer {
                 }
                 // The seam's gutter segments, at exactly the underline geometry the
                 // cells of this row draw theirs at, so the rule is continuous to both
-                // window edges. Emitted in the BACKGROUND stream rather than the
+                // window edges. Emitted in the background stream rather than the
                 // decoration stream: nothing else ever paints in the padding, and a
                 // bg-stream rect is the one primitive both backends place identically.
                 if let Some(seam) = bleed.seam.filter(|_| {
@@ -19228,9 +19202,6 @@ impl GpuRenderer {
                     });
                 }
             }
-            // Materialized wide halves can remain selected after their logical
-            // span is clipped out; only an empty frame selection skips the hit.
-            let may_have_sel = input.any_selection();
             let has_pane_defaults = input
                 .default_bg_spans
                 .get(r)
@@ -19356,7 +19327,7 @@ impl GpuRenderer {
                         // wallpaper it shows the backdrop.
                         continue;
                     } else if default_bg != frame_bg {
-                        // This cell's bg IS its pane default, so it carries the
+                        // This cell's bg is its pane default, so it carries the
                         // background-opacity alpha under pass-1's default-bg rule.
                         let mut color = rgb4_u32(default_bg);
                         color[3] = bg_alpha;
@@ -19436,13 +19407,53 @@ impl GpuRenderer {
                     });
                 }
             }
-            let raster_split = raster.and_then(|m| m.split);
+        }
+        // The glyph pass, after every row's background (each instance stream keeps
+        // its row order), over the rows `glyph_win` names: the dirty rows and the
+        // lower-apron rows, whose glyphs alone draw, into the dirty band above.
+        for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
+            let Some(win) = glyph_win[r] else {
+                continue;
+            };
+            let line_size = input.line_sizes[r];
+            let rcw = aterm_render::row_cell_w(line_size, cw);
+            // A lifted chrome row places glyphs higher, clear of its rail
+            // (`chrome_lifted`, the CPU `row_ctx` rule).
+            let (row_own, row_anchor) = aterm_render::chrome_lifted(
+                input,
+                r,
+                grid_top + r * ch,
+                ch,
+                chrome_room,
+                aterm_render::row_scale(line_size, grid_top + r * ch, ch, r + 1 == input.rows),
+            );
+            let row_uniform = aterm_render::row_is_uniform(input, r);
+            // Animated-ink and charred-glyph fg overrides for this row, walked
+            // in lockstep as in the CPU `render_row_fg` (`sparse_row_slice` /
+            // `InkWalk`). Ink replaces `cell.fg` first, then the fg floors apply
+            // (min-contrast unselected, selection floor selected). Ink wins over
+            // char_fg. Rows beyond u16 carry no ink.
+            let (mut ink_walk, mut char_fg_walk) = fg_walks(input, r);
+            // The `fire_halo` walk for the contrast-halo gate: engulfment
+            // strength only, shared with the CPU (`fire_halo_row_slice` /
+            // `FireHaloWalk`).
+            let mut halo_walk =
+                aterm_render::FireHaloWalk::new(u16::try_from(r).map_or(&[][..], |row| {
+                    aterm_render::fire_halo_row_slice(&input.fire_halo, row)
+                }));
+            let raster_split = input.chrome_raster(r).and_then(|m| m.split);
+            // Whether a glyph window bounds this row (either apron), which the
+            // halo stamps take where they land.
+            let windowed = win != (i32::MIN, i32::MAX);
+            // The highest pixel row this row's glyph ink reaches under its own
+            // clip, the overshoot fact checked after the row.
+            let mut ink_top = i32::MAX;
             // The last cell's (fg, bg-under, run) key and the glyph colours it resolved to.
             type FgMemo = ((u32, [u8; 3], Option<usize>), ([u8; 4], [u8; 4]));
             let mut fg_memo: Option<FgMemo> = None;
             for (c, cell) in cells.iter().take(cols).enumerate() {
-                // Same per-column placement as the bg loop above (uniform rows keep
-                // `c · rcw`), so a cell's glyph lands on its own fill.
+                // Same per-column placement as the background pass (uniform rows
+                // keep `c · rcw`), so a cell's glyph lands on its own fill.
                 let (cx, ccw, run) = place(r, c, row_uniform, rcw);
                 if off_right(cx, ccw) {
                     if row_uniform {
@@ -19462,10 +19473,12 @@ impl GpuRenderer {
                 // from the column's own run (`line_size_run_at`, not the row summary
                 // `line_sizes[r]`), then the x-clip narrowed to the run's box, the
                 // same `clip_x0`/`clip_x1` window the CPU blit uses.
-                let (scale, anchor_y) = match run {
-                    None => (scale, anchor_y),
+                let (own, anchor_y) = match run {
+                    None => (row_own, row_anchor),
                     Some(run_box) => run_scale(r, c, run_box),
                 };
+                // The quads keep the row's glyph window; `own` is its own clip.
+                let scale = clip_rows(own, win);
                 // Whether this column contributes a cut-out slice: the cursor cell
                 // or a member of its ligated run. The full quad stays in the fg
                 // pass under the opaque fill; only the in-rect slice is redrawn
@@ -19487,6 +19500,7 @@ impl GpuRenderer {
                     if slot.gw == 0 || slot.gh == 0 {
                         continue;
                     }
+                    ink_top = ink_top.min(slot.ink_reach(anchor_y, baseline, own));
                     let Some((rect, uv)) =
                         slot.quad((pad + cx) as f32, anchor_y, baseline, scale, (caw, cah))
                     else {
@@ -19518,6 +19532,7 @@ impl GpuRenderer {
                 if slot.gw == 0 || slot.gh == 0 {
                     continue;
                 };
+                ink_top = ink_top.min(slot.ink_reach(anchor_y, baseline, own));
                 // Normal fg through the shared ink policy (`effective_glyph_fg`,
                 // as the CPU blit): the ink override, then char_fg (ink wins),
                 // then the selection and min-contrast floors. Emoji cells never
@@ -19570,18 +19585,28 @@ impl GpuRenderer {
                         // Uniform row: shift the base quad (no x-clip, so this is
                         // the CPU's offset copy). Mixed row: re-derive the stamp at
                         // the shifted origin, because the CPU clips each copy after
-                        // the offset. The `dy` shift stays post-hoc.
+                        // the offset. The `dy` shift stays post-hoc, so a windowed
+                        // row re-derives it too, under the window shifted back by
+                        // `dy`: the CPU clips the copy to the window where it lands.
                         let (hrect, huv) = match run {
-                            None => (
+                            None if !windowed => (
                                 [rect[0] + dx as f32, rect[1] + dy as f32, rect[2], rect[3]],
                                 uv,
                             ),
-                            Some(_) => {
+                            _ => {
+                                let stamp = if windowed {
+                                    clip_rows(
+                                        own,
+                                        (win.0.saturating_sub(dy), win.1.saturating_sub(dy)),
+                                    )
+                                } else {
+                                    scale
+                                };
                                 let Some((hr, hu)) = slot.quad(
                                     (pad + cx) as f32 + dx as f32,
                                     anchor_y,
                                     baseline,
-                                    scale,
+                                    stamp,
                                     (aw, ah),
                                 ) else {
                                     continue;
@@ -19664,6 +19689,15 @@ impl GpuRenderer {
                     });
                 }
             }
+            // The overshoot fact, checked against the raster as the CPU
+            // `render_row_fg` checks it: a surprise re-encodes a Dirty present Full.
+            let band_top = i32::try_from(grid_top + r * ch).unwrap_or(i32::MAX);
+            if self
+                .cpu
+                .catch_unpredicted_overshoot(input, r, ink_top, band_top)
+            {
+                self.overshoot_surprise = true;
+            }
         }
         // The glyph loop was the last reader of `key_scratch` and `row_plans`;
         // restore both so capacities persist and the decoration loop can read
@@ -19673,7 +19707,10 @@ impl GpuRenderer {
         // Combining marks over their base cells in the cell foreground, appended
         // after the bases, matching the CPU's mark-after-base order.
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
-            if !row_active(r) || input.combining[r].is_empty() {
+            let Some(win) = glyph_win[r] else {
+                continue;
+            };
+            if input.combining[r].is_empty() {
                 continue;
             }
             let line_size = input.line_sizes[r];
@@ -19727,11 +19764,13 @@ impl GpuRenderer {
                     continue;
                 };
                 // Per-run enlargement as in the base-glyph loop; `scale.xs` feeds
-                // the mark's centring, so it must be the run's.
+                // the mark's centring, so it must be the run's. The quads keep the
+                // row's glyph window.
                 let (scale, anchor_y) = match run {
                     None => (scale, anchor_y),
                     Some(run_box) => run_scale(r, c, run_box),
                 };
+                let scale = clip_rows(scale, win);
                 // The fill under this cell for the remap, as in the base-glyph
                 // loop.
                 let base_fg = cell_base_fg(&mut ink_walk, &mut char_fg_walk, c, cell);
@@ -19806,6 +19845,8 @@ impl GpuRenderer {
                 }
             }
         }
+        // The marks were the glyph windows' last reader.
+        self.glyph_win_scratch = glyph_win;
         // Inline images: one quad per image layer covering a cell, sampling that
         // cell's tile of the image texture, in list order (bottom layer first,
         // as the CPU blits). Partitioned by Kitty z tier:
@@ -19813,18 +19854,18 @@ impl GpuRenderer {
         //   INT32_MIN/2..=-1 -> `image_under`
         //   z >= 0           -> `image`
         // `image_bg_cover` covers the first on selected and non-default-bg
-        // cells. Geometry mirrors CPU `render_row_fg` pass 1b (`blit_image_cell`): a natural-size
-        // `cell_w × cell_h` tile at the pane-local cell advance (spaced by
-        // `2*cell_w` on DEC double-width rows), UV the cell's tile in the
-        // footprint, nearest-sampled.
+        // cells. Geometry mirrors CPU `render_row_fg` pass 1b
+        // (`blit_image_cell`): a natural-size `cell_w × cell_h` tile at the
+        // pane-local cell advance (spaced by `2*cell_w` on DEC double-width
+        // rows), UV the cell's tile in the footprint, nearest-sampled.
         if let Some(plane) = win.image_plane.as_ref() {
             let (pw, ph) = (plane.w as f32, plane.h as f32);
             for (r, row_images) in input.images.iter().enumerate().take(vis_rows) {
                 if !row_active(r) || row_images.is_empty() {
                     continue;
                 }
-                // Row cell advance, doubled on a DEC double-size line — exactly the
-                // `cw` the CPU Pass 1b passes as the per-cell x stride.
+                // Row cell advance, doubled on a DEC double-size line: the `cw`
+                // the CPU pass 1b passes as the per-cell x stride.
                 let rcw = aterm_render::row_cell_w(input.line_sizes[r], cw);
                 // Per-column DEC line-size handling: each tile is spaced by its
                 // own run's line size and stops at its pane box.
@@ -20148,12 +20189,10 @@ impl GpuRenderer {
         self.curl_ink_scratch = curl_ink;
         self.curl_spans_scratch = curl_spans;
         // Cursor motion trail (the comet ember bed): one solid quad per swept
-        // cell, pre-blended over the cell's bg with the shared
-        // `aterm_render::blend_rgb` (so it equals the CPU `draw_trail` fill),
-        // drawn through the bg pipeline at the end of the base-bg half, under
-        // the interpose light and the glyph ink (CPU phase B2b). Row-gated by
-        // `row_active`; `compute_dirty_rows` marks every prev/cur trail row
-        // dirty on a change.
+        // cell, pre-blended over the cell bg with `aterm_render::blend_rgb` (the
+        // CPU `draw_trail` fill), drawn through the bg pipeline under the glyph
+        // ink (CPU phase B2b). Row-gated; `compute_dirty_rows` marks every
+        // prev/cur trail row dirty on a change.
         if !input.cursor_trail.is_empty() {
             let trail_color = input.cursor_trail_color;
             for t in &input.cursor_trail {
@@ -20206,12 +20245,10 @@ impl GpuRenderer {
                 });
             }
         }
-        // EMBERFORGE under-glyph light (`glow_under`): the flame body, emitted
-        // like the aurora (host-premultiplied `q.color`, single-row
-        // window-absolute quads, row-gated by `row_active` so light is never
-        // re-added onto a Load-preserved row) through `EffectPipeline::GlowAdd`, in
-        // its own Unorm pass between the base pass's bg/sprite and glyph draws
-        // (CPU phase B3 `draw_glow_under`). Not fed into bloom.
+        // EMBERFORGE under-glyph light (`glow_under`): the flame body, emitted like
+        // the aurora (premultiplied, window-absolute, row-gated so light is never
+        // re-added onto a Load-preserved row), in its own Unorm pass between the
+        // bg and glyph draws (CPU phase B3 `draw_glow_under`). Not fed into bloom.
         if !input.glow_under.is_empty() {
             for q in &input.glow_under {
                 if (q.row as usize) >= rows || !row_active(q.row as usize) {
@@ -20223,13 +20260,12 @@ impl GpuRenderer {
             }
         }
 
-        // EMBERFORGE per-pixel fire patches (`fire_patch`): every covered
-        // fragment recomputes the pure-integer field (`fs_fire_add` /
-        // `fs_fire_over`, the WGSL twin of `aterm_render::fire_field`), so the
-        // instance carries the CPU `draw_fire_patch` operands: window-absolute
-        // rect and root (flames may rise into the head band) and the raw patch
-        // parameters. Drawn after `glow_under`, split per mode (Add then Over,
-        // the CPU order), row-gated by `row_active`.
+        // EMBERFORGE fire patches (`fire_patch`): `fs_fire_add`/`fs_fire_over`
+        // recompute the integer field per fragment (WGSL twin of
+        // `aterm_render::fire_field`), so the instance carries the CPU
+        // `draw_fire_patch` operands: window-absolute rect and root (flames may
+        // rise into the head band) and the raw parameters. Split per mode, Add
+        // then Over (the CPU order); row-gated.
         if !input.fire_patch.is_empty() {
             let pad16 = pad as u16;
             for q in &input.fire_patch {
@@ -20288,13 +20324,10 @@ impl GpuRenderer {
             }
         }
 
-        // Glow-halo radial light (`glow_halo`), emitted like `rain_add`
-        // (RainGlowInstance through `EffectPipeline::RainGlow`; host-premultiplied
-        // peak; single-row window-absolute quads; row-gated by `row_active`).
-        // Drawn after the aurora and before the nova/rain, as the CPU's
-        // `draw_glow_halo`-after-`draw_glow`. Not fed into bloom. Split per
-        // mode: Add quads keep the One/One vec, `HaloMode::Over` veils go to
-        // their own vec drawn right after (the CPU's Add-then-Over sweep).
+        // Glow-halo radial light (`glow_halo`), emitted like `rain_add`, after the
+        // aurora and before nova/rain (the CPU's `draw_glow_halo` after
+        // `draw_glow`). Not fed into bloom. `HaloMode::Over` veils go to their own
+        // stream, drawn right after the Add quads (the CPU's Add-then-Over sweep).
         if !input.glow_halo.is_empty() {
             for q in &input.glow_halo {
                 if (q.row as usize) >= rows || !row_active(q.row as usize) {
@@ -20303,7 +20336,7 @@ impl GpuRenderer {
                 let inst = RainGlowInstance {
                     rect: [q.x, q.y, q.w, q.h],
                     color: rgb4_u32(q.color),
-                    // Falloff basis in WINDOW pixels (window-absolute centre),
+                    // Falloff basis in window pixels (window-absolute centre),
                     // the exact operands the CPU `draw_radial_add` uses.
                     falloff: [q.cx, q.cy, q.rx, q.ry],
                 };
@@ -20346,7 +20379,7 @@ impl GpuRenderer {
         // Drawn after the nova, the CPU's order, and split per mode like
         // `glow_halo` since both share the CPU RainHalo rasterizer.
         if !input.rain_add.is_empty() {
-            // Rain is a GRID stream (it falls over the grid interior): x keeps
+            // Rain is a grid stream (it falls over the grid interior): x keeps
             // the `pad` inset, y moves with the grid to `grid_top`.
             let pad16 = pad as u16;
             let grid_top16 = grid_top as u16;
@@ -20362,7 +20395,7 @@ impl GpuRenderer {
                         q.h,
                     ],
                     color: rgb4_u32(q.color),
-                    // Falloff basis in WINDOW pixels (grid-interior-offset
+                    // Falloff basis in window pixels (grid-interior-offset
                     // centre), the exact operands the CPU `draw_rain_add` uses.
                     falloff: [
                         pad16.saturating_add(q.cx),
@@ -20428,7 +20461,7 @@ impl GpuRenderer {
                 ];
                 // Mixed row: crop the sprite to the run's pixel box so a
                 // double-width pane's decoration cannot paint its neighbour;
-                // `clip_textured_quad_x` carries the uv (the CPU's NEAREST crop).
+                // `clip_textured_quad_x` carries the uv (the CPU's nearest crop).
                 if !clip_textured_quad_x(&mut rect, &mut uv, run) {
                     continue;
                 }
@@ -20458,8 +20491,8 @@ impl GpuRenderer {
         // stream.
         if cursor_drawn && !block_cursor && row_active(cr) {
             // Same (possibly floored) fill as the block path, with the
-            // cursor-opacity coverage in alpha (translucent draws through the
-            // ALPHA_BLENDING pipeline).
+            // cursor-opacity coverage in alpha (translucent draws through
+            // `EffectPipeline::CursorBlend`).
             let cursor_color = {
                 let mut c = rgb4_u32(cursor_fill);
                 c[3] = cursor_cov;
@@ -20511,11 +20544,6 @@ impl GpuRenderer {
                 self.uniform_written = Some((w, h, text_blend));
             }
         }
-        // Per-frame vertex streams reuse grow-only persistent buffers (only a
-        // `write_buffer` copy). `upload` returns `None` for an empty stream, so
-        // an empty `bg` stream draws nothing while the bg pass still clears
-        // (the CPU's all-background frame). Each buffer is sliced to this
-        // frame's byte length so stale tail bytes are never drawn.
 
         // One sprite quad as a GlyphInstance, shared by the cat/rain builder and
         // the free-sprite loop. `(x, y)` is the dest origin in window px; UVs
@@ -20582,7 +20610,7 @@ impl GpuRenderer {
             dst: &mut Vec<GlyphInstance>,
             quads: &[aterm_core::render::SpriteQuad],
             rows: usize,
-            // The UPLOADED atlas's texel dims — the bound the source rects are
+            // The uploaded atlas's texel dims: the bound the source rects are
             // checked against and the basis the uv normalizes over.
             atlas: (u32, u32),
             padf: f32,
@@ -20619,11 +20647,10 @@ impl GpuRenderer {
         let padf = pad as f32;
         let grid_topf = grid_top as f32;
         // PHOSPHOR rain sprites (`rain_quads`): the same SpriteQuad →
-        // GlyphInstance build against the rain atlas (NEAREST, 1:1). Filtered
+        // GlyphInstance build against the rain atlas (nearest, 1:1). Filtered
         // by `row_active`: every rain quad is single-row, and the scissor-band
         // fill marks every row a quad overlaps dirty, so a quad the scissor
-        // admits is always kept and a dropped one is fully clipped. A
-        // sparse-damage frame thus uploads only the dirty rows' instances.
+        // admits is always kept and a dropped one is fully clipped.
         if let Some((raw, rah)) = win.rain_atlas.as_ref().map(|s| (s.w, s.h)) {
             build_sprites(
                 &mut self.inst.rain_under,
@@ -20637,7 +20664,7 @@ impl GpuRenderer {
         }
         // Peeking-cat sprites: the same SpriteQuad → GlyphInstance build
         // against the cat atlas, drawn through the src-over scene pipeline with
-        // the cat atlas group's NEAREST sampler (bake == dest size, 1:1).
+        // the cat atlas group's nearest sampler (bake == dest size, 1:1).
         if let Some((caw, cah)) = win.cat_atlas.as_ref().map(|s| (s.w, s.h)) {
             build_sprites(
                 &mut self.inst.cat_over,
@@ -20658,8 +20685,8 @@ impl GpuRenderer {
         // sprite pixel re-blends over its own Load-preserved pixels.
         if let Some(atlas) = win.free_atlas.as_ref().map(|s| (s.w, s.h)) {
             for s in &input.free_sprites {
-                // v1 is NEAREST-only (`FreeSampler::Linear` deferred): debug-assert
-                // it off, ignore it in release.
+                // Free sprites are nearest-only (`FreeSampler::Linear` is not
+                // implemented): debug-assert it off, skip it in release.
                 debug_assert!(
                     matches!(s.sampler, aterm_core::render::FreeSampler::Nearest),
                     "FreeSampler::Linear is deferred — v1 free sprites are NEAREST-only"
@@ -20882,8 +20909,8 @@ impl GpuRenderer {
                     };
                 }
 
-                // 3. The offscreen pair (Rgba8Unorm + the sRGB alias — THE
-                //    FORMAT LAW's two faces), reused at the same dims.
+                // 3. The offscreen pair (Rgba8Unorm plus its sRGB alias), reused
+                //    at the same dims.
                 let recreate = win
                     .metal_offscreen
                     .as_ref()
@@ -20986,11 +21013,10 @@ impl GpuRenderer {
                     }
 
                     // The atlases the plan samples, keyed so every mutation the
-                    // wgpu upload reacts to re-uploads here too: full-repack
-                    // epoch + resident texture dims + `write_gen` for the
-                    // packed pair (reusing the resident `MTLTexture` on append),
-                    // the published `Arc` identity for sprites, the bake key
-                    // for deco.
+                    // wgpu upload reacts to re-uploads here too: dims and
+                    // full-repack epoch (plus `write_gen` for an in-place
+                    // append) for the packed pair, the published `Arc` identity
+                    // for sprites, the bake key for deco.
                     let mut atlases: [Option<(
                         crate::metal::resources::SealedTexture,
                         crate::metal::ffi::Obj,
@@ -21185,7 +21211,7 @@ impl GpuRenderer {
                     }
                 };
 
-                // 6. Run the shared ladder on the Metal encoder and submit.
+                // 6. Run the shared walker on the Metal encoder and submit.
                 //    Submit A stays in flight; the next frame's staging waits
                 //    its ring slot (`await_frame_slot`) before rewriting shared
                 //    storage.
@@ -21199,14 +21225,13 @@ impl GpuRenderer {
                         "encoder refused",
                         crate::device_layer::FrameEncoder::metal(&live.session)
                     );
-                    // The scroll-rescue band copies ride Submit A, encoded
-                    // before the scissored pass, so its `LoadOp::Load` reads the
-                    // translated band. No wait is needed: encoders in one command
-                    // buffer run in order over hazard-tracked textures, the
-                    // previous Submit A precedes on the one queue, and the
-                    // scratch is used only by command buffers on that queue. A
-                    // failure degrades the frame by name, and the fall-through
-                    // re-encodes Full.
+                    // The scroll-rescue band copies ride Submit A before the
+                    // scissored pass, so its `LoadOp::Load` reads the translated
+                    // band. No wait: encoders in one command buffer run in order
+                    // over hazard-tracked textures, and the scratch is used only on
+                    // the one queue, behind the previous Submit A. A failure
+                    // degrades the frame by name and the fall-through re-encodes
+                    // Full.
                     if let Some(shift) = pending_band_shift {
                         let scratch = armed_try!(
                             "band shift lacks its resident scratch",
@@ -21344,7 +21369,7 @@ impl GpuRenderer {
                     ..Default::default()
                 });
                 // The blit-source bind group sampling `tex`, built once here and
-                // reused every present; `present_input` writes only the invert flag.
+                // reused every present.
                 let src_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
                 let blit_bind = self
                     .ctx
@@ -21381,16 +21406,12 @@ impl GpuRenderer {
                 });
             }
 
-            // Load op + scissor band. Full clears the target (== CPU
-            // `vec![theme.bg]`); scissored loads the prior frame and clips the
-            // pass to the dirty rows' bounding band. The dirty-row instances are
-            // the only draws and rows are disjoint bands, so the result equals a
-            // full render.
-            //
-            // Load on a just-(re)created texture would read undefined tiles;
-            // `encode_present_frame` only picks the scissor when the offscreen
-            // already holds the prior frame at these dims, which is asserted
-            // with a Clear fallback.
+            // Load op + scissor band: Full clears the target (the CPU
+            // `vec![theme.bg]`); a scissored frame loads the prior frame and clips
+            // the pass to the dirty rows' band. `encode_present_frame` picks the
+            // scissor only when the offscreen already holds the prior frame at
+            // these dims; a recreate falls back to Clear, since Load on a fresh
+            // texture reads undefined tiles.
             let (load_op, scissor) = frame_load_and_scissor(
                 scope,
                 recreate,
@@ -21424,13 +21445,8 @@ impl GpuRenderer {
             let wallpaper_bind = win.wallpaper_tex.as_ref().map(|s| &s.bind);
 
             let off = win.offscreen.as_ref().expect("offscreen set above");
-            // Base OVER/REPLACE passes attach `view_srgb` so blending runs in
-            // linear light (matching the CPU `blend`). The additive streams
-            // (glow_add, wdeco_add; One/One) attach the default `view`: plain
-            // Unorm on native, so the 8-bit add matches the CPU `add_sat`; sRGB
-            // on downlevel, where the add lands in linear (see the header). Both
-            // views alias one texture, so blit and readback through `view` see
-            // the same bytes.
+            // Base passes attach `view_srgb`, additive passes the plain `view`
+            // (see the file header); both alias one texture.
             let view = &off.view;
             let view_srgb = &off.view_srgb;
 
@@ -21495,13 +21511,11 @@ impl GpuRenderer {
             let passes = run_frame_plan(&mut fenc, &res, &plan, load0, scissor)
                 .expect("the wgpu frame-plan arm has no fallible verb");
 
-            // Bloom is not composited here: an additive halo in this
-            // scissor-preserved offscreen would re-add over Load-preserved rows
-            // and force every aurora tick to rebuild the halo band. The
-            // offscreen stays the clean base+aurora; the halo composites at
-            // present time over a copy (`compose_present_offscreen`), or in
-            // place on a `present_prev`-invalidated readback / tray / scroll
-            // frame (`composite_bloom_in_place`).
+            // Bloom is not composited here: a halo in this scissor-preserved
+            // offscreen would re-apply over Load-preserved rows and force every
+            // aurora tick to rebuild the halo band. The halo composites at present
+            // time over a copy (`compose_present_offscreen`), or in place on a
+            // `present_prev`-invalidated readback frame (`composite_bloom_in_place`).
             match fenc.submit() {
                 crate::device_layer::SubmittedFrame::Wgpu => {}
                 #[cfg(target_os = "macos")]
@@ -21563,7 +21577,7 @@ fn clip_x_span(x: usize, w: usize, x0: usize, x1: usize) -> Option<(usize, usize
 /// [`clip_x_span`] for a textured quad: intersect with an optional horizontal
 /// pane clip while carrying the source mapping; returns whether anything
 /// survives. For non-glyph sprite streams (word decorations); integer pane
-/// edges keep the crop texel-stable under their NEAREST samplers. `None` (a
+/// edges keep the crop texel-stable under their nearest samplers. `None` (a
 /// uniform row) leaves the quad untouched.
 #[inline]
 fn clip_textured_quad_x(
@@ -21612,7 +21626,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 }
 
 /// Row `r`'s lockstep ink and EMBERFORGE char_fg override walks (the CPU
-/// `render_row`'s per-row slices). Rows beyond u16 get empty slices.
+/// `render_row_fg`'s per-row slices). Rows beyond u16 get empty slices.
 fn fg_walks(
     input: &RenderInput,
     r: usize,
@@ -21683,6 +21697,61 @@ fn with_over_cap(mut inst: RainGlowInstance, color: u32) -> RainGlowInstance {
     inst
 }
 
+/// Which rows of `input` draw glyphs under `scope`, and the device-pixel rows
+/// `[y0, y1)` each one's glyph quads keep on top of the row's own clip
+/// (ATERM-KI-1020-1), written to `out` for rows `0..rows`: `None` for a row that
+/// draws none. The CPU damaged path's aprons (`Renderer::composite_free`,
+/// `Renderer::draw_lower_apron`), for glyphs that ink above their own band.
+///
+/// Full: every row, unbounded. Dirty: a dirty row draws, bounded at its band top
+/// when the row above it is kept (the upper apron: that band holds the row's
+/// overshoot already, or `Renderer::mark_overshoot_rows` marked it); and a kept
+/// row under a dirty row whose glyphs may ink above it
+/// (`Renderer::row_may_ink_above`) draws its glyphs alone, into that dirty band
+/// (the lower apron: the overshoot the band's reset erased).
+fn glyph_windows(
+    cpu: &mut Renderer,
+    input: &RenderInput,
+    scope: &RepaintScope,
+    grid_top: usize,
+    ch: usize,
+    rows: usize,
+    out: &mut Vec<Option<(i32, i32)>>,
+) {
+    const OPEN: (i32, i32) = (i32::MIN, i32::MAX);
+    out.clear();
+    let RepaintScope::Dirty(dirty) = scope else {
+        out.resize(rows, Some(OPEN));
+        return;
+    };
+    let top = |r: usize| i32::try_from(grid_top + r * ch).unwrap_or(i32::MAX);
+    let dirty_at = |r: usize| dirty.get(r).copied().unwrap_or(false);
+    out.extend((0..rows).map(|r| {
+        let above = r > 0 && dirty_at(r - 1);
+        if dirty_at(r) {
+            Some(if r == 0 || above {
+                OPEN
+            } else {
+                (top(r), i32::MAX)
+            })
+        } else if above && cpu.row_may_ink_above(input, r) {
+            Some((top(r - 1), top(r)))
+        } else {
+            None
+        }
+    }));
+}
+
+/// `scale` with its row clip narrowed to the glyph window `[y0, y1)`
+/// ([`glyph_windows`]).
+fn clip_rows(scale: aterm_render::Scale, (y0, y1): (i32, i32)) -> aterm_render::Scale {
+    aterm_render::Scale {
+        clip_y0: scale.clip_y0.max(y0),
+        clip_y1: scale.clip_y1.min(y1),
+        ..scale
+    }
+}
+
 /// One frame's pass-0 decision: the load op plus the optional scissor band.
 /// Backend-neutral (`FrameLoad` carries `ClearColor4`) so it compiles on the
 /// wgpu-free macOS build.
@@ -21738,7 +21807,7 @@ fn frame_load_and_scissor(
                 None => (crate::device_layer::FrameLoad::Load, Some((0, 0, 0, 0))),
             }
         }
-        // FULL (or the can't-happen Dirty-after-recreate): clear everything.
+        // Full (or the can't-happen Dirty-after-recreate): clear everything.
         _ => {
             debug_assert!(
                 matches!(scope, RepaintScope::Full),
@@ -21794,7 +21863,7 @@ impl GpuRenderer {
             .collect()
     }
 
-    /// The recorded pass-0 load op — so a fixture can PROVE it exercised the
+    /// The recorded pass-0 load op, so a fixture can prove it exercised the
     /// scissored `Load` path rather than assuming the dirty diff engaged.
     #[cfg(wgpu_arm)]
     pub(crate) fn last_frame_load_for_test(&self) -> crate::device_layer::FrameLoad {
@@ -21880,7 +21949,7 @@ impl GpuRenderer {
         let mut apron_win = WindowGpu::default();
         let apron_plan = self.apron_strip_plan(&mut apron_win, input, h as usize);
 
-        // --- the Metal arm's resolution set, minted on ONE loss domain -----
+        // --- the Metal arm's resolution set, minted on one loss domain -----
         let latch = Arc::new(LossLatch::new());
         let session = crate::metal::encoder::EncodeSession::new(&mdev, Arc::clone(&latch))?;
         let mint = MetalResourceDevice::new(&mdev, Arc::clone(&latch));
@@ -21994,7 +22063,7 @@ impl GpuRenderer {
             );
         }
 
-        // The instance streams: the SAME bytes the wgpu arm uploaded.
+        // The instance streams: the same bytes the wgpu arm uploaded.
         let mut streams: [Option<SharedBuffer>; STREAM_COUNT] = std::array::from_fn(|_| None);
         for item in &plan {
             let idx = item.stream as usize;
@@ -22094,7 +22163,7 @@ impl GpuRenderer {
             let LayerTexture::Metal(tex) = tex else {
                 unreachable!("the Metal handle mints Metal textures")
             };
-            // Every frame atlas bind samples NEAREST clamp-to-edge (exact CPU
+            // Every frame atlas bind samples nearest clamp-to-edge (exact CPU
             // coverage/texel bytes at 1:1).
             let sampler = mint.sampler(SamplerDesc::NEAREST_CLAMP)?;
             atlases[a as usize] = Some((tex, sampler));
@@ -22137,7 +22206,7 @@ impl GpuRenderer {
             fx,
         };
 
-        // --- the replay: ONE walker, the Metal arm ------------------------
+        // --- the replay: one walker, the Metal arm ------------------------
         let mut enc = FrameEncoder::metal(&session)?;
         let res = FrameRes::Metal(&rig);
         let passes = run_frame_plan(&mut enc, &res, &plan, load0, scissor)?;
@@ -22327,7 +22396,7 @@ impl GpuRenderer {
             destination,
             "the tap captured the whole virtual destination"
         );
-        // The CLEAN offscreen (base + aurora, no effects — they composite over
+        // The clean offscreen (base + aurora, no effects: they composite over
         // the throwaway copy) seeds the Metal arm's offscreen byte-for-byte.
         let (fw, fh) = {
             let off = win.offscreen.as_ref().expect("the present set it");
@@ -22548,7 +22617,7 @@ impl GpuRenderer {
             None
         };
 
-        // --- shimmer (row 13), rederived + the pinned phase ----------------
+        // --- shimmer, rederived, at the pinned phase -----------------------
         let shimmer_parts = if self.shimmer_live(input) {
             self.shimmer_region(input, fw, fh)
         } else {
@@ -22601,7 +22670,7 @@ impl GpuRenderer {
         })
         .transpose()?;
 
-        // --- tray (row 17) -------------------------------------------------
+        // --- tray --------------------------------------------------------
         let tray_parts = tray
             .map(|t| -> Result<_, String> {
                 let card = mint.texture_2d(
@@ -23021,7 +23090,7 @@ mod tests {
     #[test]
     fn band_shift_ops_states_the_staged_move_law() {
         use super::{BandShift, band_shift_ops};
-        // UP by 3 inside [10, 30): stage [13, 30) (17 rows), land at [10, 27),
+        // Up by 3 inside [10, 30): stage [13, 30) (17 rows), land at [10, 27),
         // bottom 3-row strip exposed.
         assert_eq!(
             band_shift_ops(10, 30, 3),
@@ -23031,7 +23100,7 @@ mod tests {
                 moved: 17
             })
         );
-        // DOWN by 3: stage [10, 27), land at [13, 30), top strip exposed.
+        // Down by 3: stage [10, 27), land at [13, 30), top strip exposed.
         assert_eq!(
             band_shift_ops(10, 30, -3),
             Some(BandShift {
@@ -23117,7 +23186,7 @@ mod tests {
             w: 4,
             h: 4,
             color: 0x0020_2020,
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: 0x0020_2020,
             alpha2: 0,
@@ -23158,11 +23227,8 @@ mod tests {
         );
     }
 
-    /// The coalescer is maximal and order-preserving for every set of live
-    /// streams: passes are numbered in draw order, a pass holds only groups
-    /// sharing its view, and consecutive enabled groups split only when their
-    /// views differ. That is the per-group sequence with same-view neighbours
-    /// merged, which is byte-identical. Exhaustive over all 256 patterns.
+    /// The coalescer is maximal and order-preserving: consecutive live groups
+    /// split only when their views differ. Exhaustive over all 256 patterns.
     #[test]
     fn frame_passes_coalesce_maximally_without_reordering() {
         for bits in 0u32..(1 << FRAME_GROUPS) {
@@ -23547,7 +23613,7 @@ mod tests {
             0,
         );
         if cfg!(target_os = "linux") {
-            // Top-pinned: source row 0 IS the on-screen row, so the crown's
+            // Top-pinned: source row 0 is the on-screen row, so the crown's
             // scissor legitimately covers the single destination pixel.
             assert_eq!(
                 visible_source_scissor(&wholly_above, 1, 1),
@@ -23887,11 +23953,9 @@ mod tests {
         );
     }
 
-    /// The shelf packer bounds width as well as height: a glyph wider than the
-    /// atlas (`gw + pad > width`) has no shelf to wrap onto, so `place` degrades
-    /// it like the empty branch (Mono records a zero slot so the cell still
-    /// paints its background, Color skips, cursor untouched) instead of letting
-    /// `blit` write past the row stride. Pure CPU.
+    /// A glyph wider than the atlas degrades like an empty one (Mono records a
+    /// zero slot, Color skips, cursor untouched) instead of `blit` overrunning
+    /// the row stride. Pure CPU.
     #[test]
     fn atlas_place_degrades_glyph_wider_than_atlas() {
         let px_q = GlyphKey::quantize_px(18.0);
@@ -23936,7 +24000,7 @@ mod tests {
             (0, 0, 0),
             "cursor unmoved"
         );
-        // Mono records a ZERO slot so lookups still resolve, preserving the font's
+        // Mono records a zero slot so lookups still resolve, preserving the font's
         // placement offsets so the cell paints its background correctly.
         let slot = *mono.map.get(&key).expect("Mono records every key");
         assert_eq!((slot.gw, slot.gh), (0, 0), "degraded slot is zero-sized");
@@ -24048,7 +24112,7 @@ mod tests {
     fn deco_atlas_drops_on_oversized_cell_height_no_abort() {
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         let (cw, ch) = gpu.cell_size();
-        // A realistic cell BUILDS the atlas — the guard must NOT over-trigger (parity).
+        // A realistic cell builds the atlas: the guard must not over-trigger.
         gpu.ensure_deco_atlas(cw, ch);
         assert!(
             gpu.deco_atlas.is_some(),
@@ -24136,8 +24200,8 @@ mod tests {
         let mut win_a = WindowGpu::new();
         let mut win_b = WindowGpu::new();
 
-        // Drive the two windows interleaved through the SCISSORED present path on
-        // the ONE shared renderer: A0, B0, A1, B1, A2, B2.
+        // Drive the two windows interleaved through the scissored present path on
+        // the one shared renderer: A0, B0, A1, B1, A2, B2.
         let mut last_a = None;
         let mut last_b = None;
         for i in 0..a_frames.len() {
@@ -24330,8 +24394,7 @@ mod tests {
         // Pin the heat shimmer's wall-clock phase so the scissored present and
         // the fresh reference compose the same refraction.
         gpu.set_shimmer_phase_for_test(Some(0.33));
-        // The GUI regime: nonzero interior pad (a scissor gate sized to the
-        // unpadded frame never fires here, so every present went Full).
+        // The GUI regime: a nonzero interior pad.
         gpu.set_pad(14);
         let pad = gpu.pad();
         let (cw, ch) = gpu.cell_size();
@@ -24575,11 +24638,9 @@ mod tests {
         );
     }
 
-    /// A sub-row scroll over unchanged content, and the frame that lands the
-    /// glide (frac back to 0), both take the gate/scissor path: the translate
-    /// lives on the present copy, never on the offscreen the diff compares
-    /// against. Drives `present_to_view` through the swapchain stand-in, which
-    /// (unlike the readback helpers) does not reset `present_prev`.
+    /// Sub-row glide frames and the landing frame stay on the gate/scissor path:
+    /// the translate lives on the present copy, never on the diffed offscreen.
+    /// Uses the swapchain stand-in, which keeps `present_prev`.
     #[test]
     #[cfg(wgpu_arm)]
     fn fractional_scroll_frames_keep_the_scissor_path() {
@@ -24884,7 +24945,7 @@ mod tests {
             "a frac 3 present must move terminal pixels on glass"
         );
 
-        // One cell changes INSIDE the band (row 2), same frac: a scissored armed
+        // One cell changes inside the band (row 2), same frac: a scissored armed
         // encode (one dirty row) plus the band shift over the resident copy.
         term.process(b"\x1b[3;1HX");
         let changed = glide_input(&mut term);
@@ -24964,7 +25025,7 @@ mod tests {
         // Translucent + supported → PostMultiplied (blend over the vibrancy view).
         assert_eq!(GpuRenderer::present_alpha_mode(0.85, true), PostMultiplied);
         assert_eq!(GpuRenderer::present_alpha_mode(0.0, true), PostMultiplied);
-        // Translucent but the surface has NO non-opaque composite → honestly solid.
+        // Translucent but the surface has no non-opaque composite → solid.
         assert_eq!(GpuRenderer::present_alpha_mode(0.85, false), Opaque);
         assert_eq!(GpuRenderer::present_alpha_mode(0.0, false), Opaque);
     }
@@ -25199,7 +25260,7 @@ mod tests {
             "exactly the failed f16 re-tag must select SDR fallback"
         );
 
-        // stage 0 -> 1: the same failed-retag apply, read as the ENTRY to the
+        // stage 0 -> 1: the same failed-retag apply, read as the entry to the
         // retained eligible SDR surface the live HDR-on path starts from.
         let fallback_plan = hdr_reconfigure_plan(true, false);
         assert_eq!(fallback_plan, HdrReconfigurePlan::FallbackToSdr);
@@ -25382,7 +25443,7 @@ impl Rasterizer for GpuRenderer {
 /// first-party Metal arm attaches under its layer and reads its screen, and the
 /// wgpu-oracle arm hands wgpu the same view (`AppKitSurfaceTarget`). Naming no
 /// handle crate keeps raw-window-handle out of the shipped macOS graph
-/// (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6).
+/// (docs/AUDIT-third-party-2026-10-15.md).
 #[cfg(target_os = "macos")]
 pub trait WindowTarget: aterm_objc::HasNsView + Send + Sync + 'static {}
 
@@ -25849,8 +25910,8 @@ mod atlas_upload_sync_tests {
         let texture_id = atlas.as_ref().unwrap().tex.metal().obj().id();
 
         // Two genuine GPU readers in different ring slots. Their handles stay
-        // registered even if this small blit already completed: the lifecycle
-        // assertion therefore never depends on GPU scheduling or a latency bound.
+        // registered even if this small blit already completed, so the
+        // assertion never depends on GPU scheduling or a latency bound.
         let dest = live
             .mint
             .texture_2d(PixelFormat::Rgba8Unorm, 4, 3, TEXTURE_USAGE_SHADER_READ)

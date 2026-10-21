@@ -2,13 +2,13 @@ seq v=1 rig=screen program=claude build=2.1.0
 # §2.4: busy with no open turn opens one (src=screen conf=strong); idle
 # held for 1 s closes it done, dated when it came to rest.
 see busy fixture=claude-2.1.283-footer-busy
-expect open t1 turn par=r1 src=screen conf=strong at=0
+expect open t1 turn par=r1 src=screen conf=strong @0
 expect turn=t1
 see idle fixture=claude-2.1.283-footer-after-turn
 expect wake=1000
 expect clause=working · 0s
 wait 1000
-expect close t1 turn out=done dur_ms=0 src=screen conf=strong at=0
+expect close t1 turn out=done dur_ms=0 src=screen conf=strong @0
 expect turn=none
 expect wake=none
 expect clause=idle

@@ -428,8 +428,9 @@ impl App {
     /// the status glance already takes, each released before the next: the
     /// meta's (the attention entries with their kinds, the live claim), the
     /// timeline's (the agent publication, the stall's words, the task record,
-    /// the resume line), the fabric's (the holds); the sweep's reading, the
-    /// host's word and `hosting` outside any lock. Called with NO store lock
+    /// the resume line, the worker's told NEEDS YOU set), the fabric's (the
+    /// holds); the sweep's reading, the host's word and `hosting` outside any
+    /// lock. Called with NO store lock
     /// held ([`Self::publish_need`] copies the handle out first): the host's
     /// wall answer takes the host's state lock, which is never nested under
     /// the registry's (`harness_reach`'s order). No `Terminal` lock.
@@ -488,7 +489,7 @@ impl App {
         };
         let restarts = relaunching.contains(h.ctx.self_id.as_str())
             && crate::input_stall::host_hand_refusal(ctx, now_us).is_none();
-        let (agent, admit, stall, task, resume, age_ms) = {
+        let (agent, admit, stall, task, resume, age_ms, told) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let a = tl.agent();
             let agent = (a.word != "-").then(|| crate::needs::AgentFact {
@@ -510,7 +511,12 @@ impl App {
             });
             let resume = tl.claude_footer().and_then(|facts| facts.resume.clone());
             let admit = (crate::harness_host::agent_of(a), a.program_pgid);
-            (agent, admit, stall, task, resume, a.age_ms())
+            // The worker's NEEDS YOU sets as its loop told the host (§12.2.3,
+            // slice 2c): two `Arc`s, copied under this lock; a set is read
+            // only beside its own entry (`NeedFacts::told_needs`), where the
+            // verdict says every need in it whole (slice 2d).
+            let told = tl.harness_needs();
+            (agent, admit, stall, task, resume, a.age_ms(), told)
         };
         // The host's hand as it admits the agent ([`crate::harness_host::admitted`]:
         // never a vendor `codex`), read after the timeline's leaf lock.
@@ -576,6 +582,7 @@ impl App {
             hold,
             reset_unix,
             now_unix,
+            told,
         }
     }
 
@@ -820,10 +827,19 @@ impl App {
         match fact {
             crate::HarnessFact::Act(act) => crate::harness_glass::on_act(self, session, act),
             crate::HarnessFact::Task(face) => {
+                // Beside a PROVEN self-claim the hosted loop's hold is not
+                // the session's either (§12.3.3 item 3): one standing goes.
                 if self.beside_proven_self_claim(session) {
+                    self.clear_land_held(session);
                     return;
                 }
                 self.apply_task_face(session, face, None, None);
+                // A person's own exchange ends the hold at that move: the
+                // loop tells it gone at the same point, but the face and the
+                // hold are two facts, and the face may come first (§12.3.5).
+                if face == Some(aterm_agent::harness::acts::TaskFace::Theirs) {
+                    self.clear_land_held(session);
+                }
             }
             crate::HarnessFact::TaskNoted(face, noted_ms) => {
                 if self.beside_proven_self_claim(session) {
@@ -831,28 +847,52 @@ impl App {
                 }
                 self.apply_task_face(session, Some(face), None, Some(noted_ms));
             }
-            crate::HarnessFact::SelfTask(face) => {
-                if !self.beside_proven_self_claim(session) {
-                    return;
+            crate::HarnessFact::SelfTask(_) => {
+                // RPC lanes may post their wakes in a different order from
+                // their commits. The wake is only a bell: take the finite
+                // batch of admitted faces in commit order under the current
+                // proven claim, so neither a late face nor a lost landing
+                // record replaces the newer act's result.
+                let faces = {
+                    let Some(entry) = self.pool.get(session) else {
+                        return;
+                    };
+                    let meta = entry.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    let faces = timeline.take_self_tasks();
+                    if !meta.supervisor_proven(crate::metrics::now_us()) {
+                        return;
+                    }
+                    faces
+                };
+                let mut holds = false;
+                for face in faces {
+                    // Nothing ends a Cruise or Off task. Open acts still
+                    // apply, including one after a skipped landing.
+                    if face == aterm_agent::harness::acts::TaskFace::Landed
+                        && !self.self_claim_may_land(session)
+                    {
+                        continue;
+                    }
+                    self.apply_task_face(
+                        session,
+                        Some(face),
+                        Some(aterm_agent::harness::acts::TaskFace::Open),
+                        None,
+                    );
+                    holds = crate::harness_task::holds_until_another_turn(face);
                 }
-                // A LANDING ONLY UNDER LAND: nothing ends a Cruise task (nor
-                // an Off one), whatever the self-claim's act says — a
-                // codex-alab that recorded `landed@v1` under Cruise would
-                // read `task=landed`, the glass's end mark with it.
-                if face == aterm_agent::harness::acts::TaskFace::Landed
-                    && !self.self_claim_may_land(session)
-                {
-                    return;
+                // Only the final face is current; earlier ones have had their
+                // ordinary records and face moves applied above. A turn begun
+                // between the act and this wake, which a sweep has already
+                // counted, reopens the landing (or the point left to a
+                // person) now: no later sweep sees that count move again.
+                if holds {
+                    self.reopen_self_claim_landing(session);
                 }
-                // A self-claim's act is its own news, never a landing a loop
-                // before restated: a landing told over "unknown" is a move
-                // from open, and is recorded.
-                self.apply_task_face(
-                    session,
-                    Some(face),
-                    Some(aterm_agent::harness::acts::TaskFace::Open),
-                    None,
-                );
+                // A self-claim proven while the hosted loop's hold stands
+                // (§12.3.3 item 3): that hold is not the session's.
+                self.clear_land_held(session);
             }
             // THE LOOP'S PAUSE AFTER SHORT TURNS (§10.5.3, item 4): on the
             // timeline (`status pause=`, under the lock it already takes)
@@ -882,7 +922,106 @@ impl App {
                 }
                 self.harness_screen_moved();
             }
+            // THE WORKER'S NEEDS YOU, WHOLE (§12.2.3 item 3, §12.2.11, slice
+            // 2c): the window's host already wrote the set on the session's
+            // timeline, on the loop's thread, before the entry's `meta set`
+            // went out, so the publication that first sees the entry has its
+            // words. The host wakes the window only where what a reader reads
+            // beside the entry standing moved: a set that moves under an
+            // unchanged entry (`[A, B]` to `[A, C]`: the server sees no
+            // write, so no other wake comes). This republishes the need, the
+            // one place the words are read (its herald, chrome and menu; the
+            // herald republishes Settings ▸ Harness where the verdict moved,
+            // so the page is published once). No face, footer or chip moves.
+            // The tab's hover says every need (slice 2d) and is composed only
+            // where a strip is stamped, which the refresh does only where the
+            // pill's words moved: a set moving under one entry (`[a, b]` to
+            // `[a, c]`) or a first tell beside a standing entry leaves them,
+            // so the strips showing the session are stamped here where it
+            // stamped none (`App::restamp_for_hover`, at change rate).
+            crate::HarnessFact::Needs => {
+                let was = self
+                    .presence
+                    .slot(session)
+                    .and_then(|slot| slot.need.clone());
+                self.refresh_presence_session(session);
+                let now = self
+                    .presence
+                    .slot(session)
+                    .and_then(|slot| slot.need.as_ref());
+                if now == was.as_ref() {
+                    self.restamp_for_hover(session);
+                }
+            }
+            // WHY LAND STILL HOLDS (§12.3.3 item 3, slice 3c): the window's
+            // host already wrote the hold on the session's timeline, on the
+            // loop's thread, where `status` reads it; it is read back here
+            // under that leaf lock alone and kept on the glass. Beside a
+            // PROVEN self-claim the hosted loop's hold is not the session's:
+            // any standing on the glass and the timeline goes, and none is
+            // shown.
+            crate::HarnessFact::LandHeld => {
+                if self.beside_proven_self_claim(session) {
+                    self.clear_land_held(session);
+                    return;
+                }
+                let Some(entry) = self.pool.get(session) else {
+                    return;
+                };
+                let held = entry
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .land_held();
+                self.show_land_held(session, held);
+            }
         }
+    }
+
+    /// LAND'S HOLD OF SESSION `session` MOVED TO `held` on its glass
+    /// (§12.3.3 item 3, [`crate::harness_glass::on_land_held`]): where the
+    /// glass moved, what reads it follows — a chip's title someone is
+    /// reading is built again (`redraw_autopilot_title_readers`: the trail's
+    /// generation moved), Settings ▸ Harness is republished where shown (the
+    /// SESSIONS state line), the menu bar's glance is dirtied (a worker's
+    /// `landing` and its tip), and where the words `driven by aterm (…)`
+    /// moved, the windows that show the session are stamped again
+    /// ([`Self::restamp_for_hover`]): the tab's hover is composed only at a
+    /// strip's refresh, so without it a hover kept the old hold. No face
+    /// moved, so no footer is posted: a frame at rest keys nothing new. At
+    /// change rate, never per frame.
+    pub(crate) fn show_land_held(
+        &mut self,
+        session: u64,
+        held: Option<aterm_agent::harness::acts::LandHeld>,
+    ) {
+        let hover_was = self.driven_by_aterm(session);
+        if !crate::harness_glass::on_land_held(self, session, held) {
+            return;
+        }
+        self.redraw_autopilot_title_readers(session);
+        self.harness_screen_moved();
+        if self.driven_by_aterm(session) == hover_was {
+            self.mark_status_dirty();
+        } else {
+            self.restamp_for_hover(session);
+        }
+    }
+
+    /// A STALE HOLD GOES (§12.3.3 item 3): beside a proven self-claim, and at
+    /// a person's own exchange — from the timeline (`status land_held=`) and
+    /// the glass alike. Nothing where none stands.
+    pub(crate) fn clear_land_held(&mut self, session: u64) {
+        if let Some(entry) = self.pool.get(session) {
+            entry
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_land_held(None);
+        }
+        self.show_land_held(session, None);
     }
 
     /// Whether a proven self-claim's `landed@v1` may land session
@@ -1188,8 +1327,83 @@ impl App {
 
     /// Whether someone can look at window `wid` now: the frontmost window,
     /// on screen (not occluded or minimized; a headless window never is).
+    /// In a debug build, a development build's stand-in for the person
+    /// (`aterm ctl person look <window>`, [`Self::person_look`]) supplies
+    /// the one fact a headless window lacks, that it is on screen, for the
+    /// headless window it names; that window must still be the frontmost,
+    /// since nobody looks at a window behind another. Only
+    /// [`Self::see_front`] reads this; the band's, the card's and the pill's
+    /// own readers of "on screen" (`messages_host::band_on_screen`,
+    /// `Desk::pill_visible`) never see the stand-in, so it arms no timer.
     fn window_looked_at(&self, wid: WindowId) -> bool {
-        self.frontmost_window == Some(wid) && Desk::pill_visible(self, wid)
+        #[cfg(any(test, debug_assertions))]
+        let stood_in = self.person_look == Some(wid)
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.os_window.is_none());
+        #[cfg(not(any(test, debug_assertions)))]
+        let stood_in = false;
+        self.frontmost_window == Some(wid) && (stood_in || Desk::pill_visible(self, wid))
+    }
+
+    /// `aterm ctl person …` on the main thread
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2): a look
+    /// ([`Self::person_look`]) or a press on a menu-bar row
+    /// ([`Self::person_menubar_press`]), each the reply's words; a release
+    /// build refuses (the verb refuses before it hops there).
+    pub(crate) fn person_stand_in(
+        &mut self,
+        asked: crate::control::control_media::PersonAsked,
+    ) -> Result<String, String> {
+        use crate::control::control_media::PersonAsked;
+        #[cfg(any(test, debug_assertions))]
+        {
+            match asked {
+                PersonAsked::Look(window) => self.person_look(window.map(WindowId)),
+                PersonAsked::Press(at) => {
+                    let proxy = self.proxy.clone();
+                    self.person_menubar_press(&at, &mut |wake| {
+                        proxy.as_ref().is_some_and(|p| p.send_event(wake).is_ok())
+                    })
+                }
+            }
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            match asked {
+                PersonAsked::Look(_) | PersonAsked::Press(_) => {
+                    Err(crate::control::control_media::PERSON_NEEDS_DEBUG.to_string())
+                }
+            }
+        }
+    }
+
+    /// A DEVELOPMENT BUILD'S STAND-IN FOR THE PERSON LOOKS AT `window`
+    /// (`aterm ctl person look <window>|off`, §12.5.2): that headless window
+    /// is on screen now ([`Self::window_looked_at`]), so someone looks at it
+    /// while it is the frontmost window, or, `None`, at none. A look begins
+    /// there, so the one rule runs at once ([`Self::note_done_seen`]): the
+    /// front tab's finished task and end are seen, the strips and the menu
+    /// bar told as for any look; a tab behind, or the window while another
+    /// is in front, stays unseen until it comes to the front. A window with
+    /// an OS window looks for itself, and is refused. The look is this
+    /// process's memory: a seamless update's successor starts with none.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn person_look(&mut self, window: Option<WindowId>) -> Result<String, String> {
+        let Some(wid) = window else {
+            self.person_look = None;
+            return Ok("person look off".to_string());
+        };
+        let Some(ws) = self.windows.get(&wid) else {
+            return Err(format!("no window {}", wid.0));
+        };
+        if ws.os_window.is_some() {
+            return Err("a window looks for itself".to_string());
+        }
+        self.person_look = Some(wid);
+        self.note_done_seen(wid);
+        Ok(format!("person look window={}", wid.0))
     }
 
     /// `wid`'s front tab is looked at — where someone can (§3: the owner
@@ -1288,6 +1502,59 @@ impl App {
             Desk::request_redraw(self, *wid);
         }
         self.refresh_tab_chrome_windows(windows);
+    }
+
+    /// THE TAB'S HOVER NAMES WHO DRIVES IN WORDS THAT MOVED for session
+    /// `session` (§12.3.3 item 3, §12.4.3 item 1): its chip's face (`driven
+    /// by aterm (land)` to `(land, landed)`) or its timer — or its harness's
+    /// needs, a line each, where they moved and the pill's words did not
+    /// (§12.2.1, slice 2d: `HarnessFact::Needs`). The hover is
+    /// composed only at a strip's refresh (`App::tab_tooltips`), so the
+    /// windows whose tabs show the session are stamped again — those alone —
+    /// and the menu bar's glance, which reads the same face, is dirtied. At
+    /// change rate, never per frame. A hover is drawn by no frame (the
+    /// toolbar's tooltip), so a window is asked to redraw only where the
+    /// stamp moved its strip's own fingerprint, as a meta move asks
+    /// (`App::refresh_meta_dependent_chrome`), but not for being focused:
+    /// the face's own repaint is the footer's (`claude_footer::post_changed`).
+    pub(crate) fn restamp_for_hover(&mut self, session: u64) {
+        for wid in self.windows_with_focused_session(session) {
+            let (titles, metadata) = self.refresh_window_tabs(wid);
+            let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
+            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, active);
+            let Some(ws) = self.windows.get(&wid) else {
+                continue;
+            };
+            if ws.last_present.as_ref().is_none_or(|k| k.tab_strip != fp) {
+                #[cfg(test)]
+                crate::work_counts::hover_redraw_asked();
+                if let Some(window) = ws.os_window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+        }
+        self.mark_status_dirty();
+    }
+
+    /// What the tab's hover says after `driven by aterm` for session
+    /// `session` ([`driven_words`]): where this host's harness holds the
+    /// session's claim and its Autopilot moves the work, else `None`. Leaf
+    /// locks only (the session's Autopilot), and one map lookup (its glass).
+    pub(crate) fn driven_by_aterm(&self, session: u64) -> Option<String> {
+        let (_, view, supervised) = self.session_autopilot(session);
+        if !supervised {
+            return None;
+        }
+        let glass = self.chip_glass(session);
+        let hold = self
+            .harness_glass
+            .get(&session)
+            .and_then(crate::harness_glass::SessionGlass::hold);
+        driven_words(
+            crate::claude_lights::ChipFace::of(view, &glass),
+            &glass,
+            hold.as_ref(),
+        )
     }
 
     /// WHO DRIVES (owner surfaces §5, S9): build the team table
@@ -1405,7 +1672,9 @@ impl App {
     /// (identity, description, connections) keeps every line but its
     /// `Needs attention:` one, which says the session's PUBLISHED need — and
     /// is gone where none stands, so a wait the harness settles is no reason
-    /// on the hover either — then who drives it, then, for an identified
+    /// on the hover either; a harness's needs say themselves in the worker's
+    /// words instead, a line each, and who carries on meanwhile
+    /// ([`harness_need_hover`], §12.2.1) — then who drives it, then, for an identified
     /// agent, the state line (`claude · busy · ctx 61% left`, the engine's
     /// `state_line`: no age, since the hover is composed with the strip's
     /// push and shown long after), then who last typed into it and at what
@@ -1423,14 +1692,23 @@ impl App {
             })
             .unwrap_or_default();
         let slot = self.presence.slot(session);
-        if let Some(need) = slot.and_then(|slot| slot.need.as_ref()) {
-            lines.push(format!("{prefix}{}", need.what));
-        }
-        // The program's name and the published hold, under one leaf lock.
-        let (program, held) = self.pool.get(session).map_or((None, None), |s| {
+        // The program's name, the published hold and a harness's need in its
+        // own words, under one leaf lock.
+        let (program, held, ask) = self.pool.get(session).map_or((None, None, None), |s| {
             let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            (tl.agent().program.clone(), tl.need().held)
+            let verdict = tl.need();
+            (
+                tl.agent().program.clone(),
+                verdict.held,
+                verdict.harness_ask().cloned(),
+            )
         });
+        if let Some(need) = slot.and_then(|slot| slot.need.as_ref()) {
+            match &ask {
+                Some(ask) => lines.extend(harness_need_hover(ask)),
+                None => lines.push(format!("{prefix}{}", need.what)),
+            }
+        }
         if let Some(line) = self.who_drives_line(session, held) {
             lines.push(line);
         }
@@ -1458,8 +1736,9 @@ impl App {
     /// remote node's, `held over the message bus` for the bridge's (§7: a
     /// hold is a record, hover only, no mark tone) — then
     /// `worker of lab-sweep` and `manages 3` from the team table, and
-    /// `driven by aterm (cruise)` where this host's harness holds the
-    /// session's claim and its Autopilot moves the work — joined ` · `;
+    /// `driven by aterm (cruise)` — `(land, landed)`, in the chip's own
+    /// words ([`Self::driven_by_aterm`]) — where this host's harness holds
+    /// the session's claim and its Autopilot moves the work — joined ` · `;
     /// `None` with none of them. A record, composed with the hover.
     fn who_drives_line(
         &self,
@@ -1494,14 +1773,8 @@ impl App {
                 parts.push(format!("manages {}", team.workers));
             }
         }
-        let (_, view, supervised) = self.session_autopilot(session);
-        if supervised
-            && matches!(
-                view,
-                crate::autopilot::AutopilotView::Cruise | crate::autopilot::AutopilotView::Land
-            )
-        {
-            parts.push(format!("driven by aterm ({})", view.wire()));
+        if let Some(words) = self.driven_by_aterm(session) {
+            parts.push(format!("driven by aterm ({words})"));
         }
         (!parts.is_empty()).then(|| parts.join(crate::native_ui::FACT_SEPARATOR))
     }
@@ -2095,7 +2368,12 @@ impl Desk for App {
     /// human channel dedups by transition itself, so a refresh that moved
     /// nothing costs a few leaf-lock reads and no AppKit call.
     fn herald(&mut self, session: u64) {
-        self.publish_need(session);
+        if self.publish_need(session) {
+            // Settings ▸ Harness counts the sessions a harness's need stands
+            // on and leads a row's state line with it (§12.2.1): republished
+            // where the verdict moved, while a view shows the page.
+            self.harness_screen_moved();
+        }
         self.herald_session(session);
     }
 
@@ -2133,6 +2411,81 @@ impl Desk for App {
         // The count the looking rule saw was the retired slot's.
         self.turn_end_seen.remove(&session);
     }
+}
+
+/// A HARNESS'S NEED ON THE TAB'S HOVER (§12.2.1, slice 2d): one `Needs
+/// you: <the need in the worker's words>` line for every need the window
+/// holds the words of, each whole (up to the policy's 160 characters), the
+/// first need first — then `Claude Code carries on meanwhile` in the
+/// program's product words. No `Needs attention:` line, whose `claude needs
+/// you:` said aterm's frame. Where the window holds only the entry's parse,
+/// the one line ends with the count it carries (` (+1 more)`). Each need's
+/// line starts [`crate::session_chrome::NEEDS_YOU_PREFIX`], which the
+/// strip's help reads as the reason told.
+pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> {
+    let prefix = crate::session_chrome::NEEDS_YOU_PREFIX;
+    let mut lines: Vec<String> = std::iter::once(&ask.first)
+        .chain(&ask.others)
+        .map(|need| format!("{prefix}{need}"))
+        .collect();
+    if let Some(last) = lines.last_mut() {
+        last.push_str(&ask.more_past(ask.others.len()));
+    }
+    lines.push(format!("{} carries on meanwhile", ask.program.product()));
+    lines
+}
+
+/// WHO DRIVES, IN THE CHIP'S OWN WORDS (§12.4.1; §12.4.3, item 1): what the
+/// tab's hover and the Overview say after `driven by aterm`, from the face
+/// the chip wears ([`crate::claude_lights::ChipFace::of`]) without its
+/// `autopilot: ` head — `cruise`, `cruise, lands at 18:00` (`lands Sat
+/// 16:00` where it lands on another day, as the SESSIONS row's state line
+/// says it), `land`, `land, landed`, `land, quiet` — and no clock but the
+/// timer's own: both are composed at a push and read long after (the
+/// hover's own rule, [`App::presence_hover`]), so a `landed 17:42` there
+/// would read as today's after midnight. Under `⤓ land`, where a land act's
+/// yield did not land, why it holds (§12.3.1, `hold`, the hold on the
+/// session's glass): `land: not landed yet, needs you; 2 unpushed commits;
+/// open work in its report: follow-up` ([`crate::harness_glass::hold_words`]'s
+/// hover form, no clock either); `land` before a yield is read. The hover
+/// passes the hold; the Overview passes `None` and says the hold on a line
+/// of its own under the chip's (`overview::OverviewChip::held`), where the
+/// card's width would cut it. The face is the gate: a hold beside any other
+/// face says nothing. `None` for a face under which aterm drives nothing
+/// (off, a switch off, no host).
+#[must_use]
+pub(crate) fn driven_words(
+    face: crate::claude_lights::ChipFace,
+    glass: &crate::claude_lights::ChipGlass,
+    hold: Option<&crate::harness_glass::HeldGlass>,
+) -> Option<String> {
+    use crate::claude_lights::ChipFace;
+    let words = match face {
+        ChipFace::Cruise => "cruise".to_owned(),
+        ChipFace::CruiseUntil => match glass.land_at {
+            Some(at) => match at.other_day {
+                Some(day) => format!("cruise, lands {} {}", day.short(), at.clock.as_str()),
+                None => format!("cruise, lands at {}", at.clock.as_str()),
+            },
+            None => "cruise".to_owned(),
+        },
+        ChipFace::Land => match hold.and_then(|hold| {
+            crate::harness_glass::hold_words(
+                hold,
+                None,
+                crate::harness_glass::HoldForm::Hover,
+                None,
+            )
+        }) {
+            Some(why) => format!("land: {why}"),
+            None => "land".to_owned(),
+        },
+        ChipFace::Landed | ChipFace::Theirs => format!("land, {}", face.word()?),
+        ChipFace::Off | ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted => {
+            return None;
+        }
+    };
+    Some(words)
 }
 
 fn pack(c: [u8; 3]) -> u32 {
@@ -2873,6 +3226,51 @@ mod tests {
         let local = held(&mut app, "local");
         let bridge = held(&mut app, "fleet");
         assert_ne!(local, bridge, "each origin says its own");
+    }
+
+    /// A HARNESS'S NEED READS IN ITS OWN WORDS ON THE TAB'S HOVER (Autopilot
+    /// v5 §12.2.1): the harness's NEEDS YOU entry gives `Needs you: <the
+    /// need> (+1 more)` and `Claude Code carries on meanwhile`, never
+    /// `Needs attention: claude needs you: …`. NEGATIVE CONTROL: a person's
+    /// own ask keeps its `Needs attention:` line and no carries-on line.
+    #[test]
+    fn the_hover_says_a_harness_need_in_its_own_words() {
+        let (mut app, _wid, sid, ctx) = app_with_stub();
+        ctx.meta
+            .lock()
+            .unwrap()
+            .set_attention_kind(
+                crate::harness_host::NEEDS_ATTENTION_OWNER,
+                Some("claude needs you: sign 0.48.0 (+1 more) \u{2014} carrying on".into()),
+                Some(aterm_types::needs::AttentionKind::Ask),
+            )
+            .expect("a slot");
+        app.refresh_presence_session(sid);
+        let hover = app.presence_hover(sid, None).expect("the need is said");
+        let lines: Vec<&str> = hover.lines().collect();
+        assert_eq!(
+            lines[..2],
+            [
+                "Needs you: sign 0.48.0 (+1 more)",
+                "Claude Code carries on meanwhile"
+            ],
+            "{hover}"
+        );
+        assert!(!hover.contains("Needs attention"), "{hover}");
+        ctx.meta
+            .lock()
+            .unwrap()
+            .set_attention_kind(crate::harness_host::NEEDS_ATTENTION_OWNER, None, None)
+            .expect("cleared");
+        ask(&ctx, Some("please look"));
+        app.refresh_presence_session(sid);
+        let hover = app.presence_hover(sid, None).expect("the ask is said");
+        assert_eq!(
+            hover.lines().next(),
+            Some("Needs attention: please look"),
+            "{hover}"
+        );
+        assert!(!hover.contains("carries on"), "CONTROL: {hover}");
     }
 
     /// THE TAB'S OWN NOTE IS NO NEED (§5): a failed last command (the status
@@ -3899,3 +4297,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "person_stand_in_tests.rs"]
+mod person_stand_in_tests;

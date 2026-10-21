@@ -3,12 +3,10 @@
 
 //! `libc` — aterm's first-party replacement for the crates.io `libc` package.
 //!
-//! The package is named `libc` (the directory is `crates/aterm-libc`) so
-//! `[patch.crates-io]` redirects every consumer, ours and third-party, here.
-//!
-//! It DECLARES the platform ABI — constants, `extern "C"` signatures, struct
-//! layouts, type aliases — per (OS, arch) cell; the symbols still resolve to the
-//! system C library at link time.
+//! Named `libc` (in `crates/aterm-libc`) so `[patch.crates-io]` redirects every
+//! consumer, ours and third-party, here. It declares the platform ABI —
+//! constants, `extern "C"` signatures, struct layouts, type aliases — per (OS,
+//! arch) cell; the symbols resolve to the system C library at link time.
 //!
 //! ## The cells are generated: never hand-edit them
 //!
@@ -21,16 +19,14 @@
 //!   enum discriminants;
 //! * const-eval probes compiled for that triple (an array-length mismatch
 //!   prints the number): sizes, alignments, public-field offsets and the bytes
-//!   of struct-valued initializers — measured, even on cells this machine
-//!   cannot run.
+//!   of struct-valued initializers, measured even on cells this machine cannot
+//!   run.
 //!
-//! The conformance oracle then asserts each cell against the pinned registry
-//! crate: constant values, `size_of`, `align_of`, `offset_of!` and type of every
-//! public field, whole-signature function-pointer coercions, two-way alias
-//! identity, and the exact public inherent method set. The hand-written C-macro
-//! bodies and `siginfo_t` accessors have differential behavior coverage: status
-//! helpers over `-1..=0xFFFF` plus signed/high-bit extremes, pointer-writing
-//! helpers on the native cell.
+//! The conformance oracle asserts each cell against the pinned registry crate:
+//! constant values, every type's size and alignment, every public field's offset
+//! and type, whole function signatures, alias identity and the exact public
+//! inherent method set. The hand-written C-macro bodies and `siginfo_t`
+//! accessors are tested differentially against it.
 //!
 //! Shim and oracle are emitted from ONE name set: the harvested items
 //! (`libc-oracle/union.json`) plus the transitive closure of the types they
@@ -52,13 +48,13 @@
 //!   reasoning is on the struct in the Darwin cells (from
 //!   `crates/aterm-libc-oracle/src/regen/handwritten.rs`).
 //! * `std`, `align`, `const-extern-fn`, `use_std` and `rustc-dep-of-std` are
-//!   accepted and ignored; nothing in aterm's graph varies on them.
+//!   accepted and ignored.
 
 #![no_std]
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
-// `core::ffi`'s C primitive aliases are the same on every cell, so they are
-// re-exported unconditionally, including on cells with no other declarations.
+// `core::ffi` defines the C primitive aliases correctly for every target, so they are
+// re-exported unconditionally, including on the Windows and wasm32 rows that have no cell.
 pub use core::ffi::{
     c_char, c_double, c_float, c_int, c_long, c_longlong, c_schar, c_short, c_uchar, c_uint,
     c_ulong, c_ulonglong, c_ushort, c_void,
@@ -84,12 +80,10 @@ mod linux_gnu_aarch64;
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))]
 pub use crate::linux_gnu_aarch64::*;
 
-// THE TARGET GATE. The Windows and wasm32 rows have no `mod`: those targets
-// have no POSIX libc, every consumer's `libc::` use is `cfg`-gated away there,
-// and the `core::ffi` aliases above are all they need (`libc-oracle`'s
-// `cell_zero` checks that much). A row without a `mod` claims the target needs
-// no ABI declarations, which is false for any Unix triple: a new Unix triple
-// brings a generated cell.
+// The target gate. Windows and wasm32 rows have no `mod`: those targets have no
+// POSIX libc, every consumer's `libc::` use is `cfg`-gated away there, and the
+// `core::ffi` aliases above are all they need (`libc-oracle`'s `cell_zero`
+// checks that). A new Unix triple needs a generated cell, not a bare row.
 //
 // Rows are per (os, env, arch): each Windows arch and env is listed on its own.
 // A missing row kills a lane before any aterm code is type-checked: `verify

@@ -3,20 +3,16 @@
 
 //! Accessibility projection (`aterm_a11y::model`) for first-party native tab applications.
 //!
-//! The input is the already-compiled [`CompiledUi`] semantic snapshot. This adapter never
-//! walks [`crate::native_ui::UiTree`], performs layout, or consults app model side tables.
-//! Consequently pixels, hit testing, introspection, and accessibility share the exact same
-//! stable keys, clipped bounds, values, and state.
+//! The input is the compiled [`CompiledUi`] semantic snapshot. This adapter never walks
+//! [`crate::native_ui::UiTree`], lays out, or reads app side tables, so pixels, hit
+//! testing, introspection and accessibility share the same keys, clipped bounds, values
+//! and state.
 
 use std::ops::Range;
 
-// FxHash, not SipHash, for the per-frame projection side tables below. They are
-// keyed by internal `UiKey`s and by ids this module derived itself — never by
-// untrusted input — and they are rebuilt from scratch on every presented native
-// frame, so the HashDoS resistance was pure per-lookup cost. No map here is ever
-// iterated (every use is `insert`/`get`/`contains_key`), so published node ids
-// and tree order — which come from `stable_node_id` and the `compiled.semantics`
-// walk — are unchanged.
+// FxHash: the per-frame side tables below are keyed by internal `UiKey`s and self-derived
+// ids, never untrusted input, and rebuilt every frame. No map is iterated, so node ids and
+// tree order do not depend on the hasher.
 use aterm_hash::{FxHashMap, FxHashSet};
 
 use aterm_a11y::model::{
@@ -43,15 +39,16 @@ pub(crate) fn stable_node_id(key: &UiKey) -> NodeId {
     let mut hash = aterm_hash::Fnv1a64::new();
     hash.write(b"aterm/native-a11y/v1\0");
     hash.write(key.as_str().as_bytes());
-    // Keep zero available to legacy root trees and ensure every native key has a concrete id.
+    // NodeId(0) is the root id of the non-native trees (`accesskit_tree`, palette, conn
+    // card); no native key maps to it.
     NodeId(hash.finish().max(1))
 }
 
 /// Deterministically namespace a semantic identity by its stable native view.
 ///
-/// Native split siblings are allowed to render the same app (and therefore the
-/// same `UiKey`s).  A view-qualified id keeps those independently actionable
-/// trees stable without making sibling order or focus part of identity.
+/// Native split siblings may render the same app (and so the same `UiKey`s). A
+/// view-qualified id keeps those trees independently actionable without making sibling
+/// order or focus part of identity.
 pub(crate) fn stable_node_id_for_view(view: ViewId, key: &UiKey) -> NodeId {
     let mut hash = aterm_hash::Fnv1a64::new();
     hash.write(b"aterm/native-a11y/view/v1\0");
@@ -303,8 +300,8 @@ fn normalized_window_title(title: &str) -> &str {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PublishedNativeAccessibility {
-    /// Primary owner retained for compatibility with single-native callers.
-    /// Composite routing always consults the node-qualified owner below.
+    /// Primary owner: the fallback for an unqualified route when there is a single owner.
+    /// Composite routing consults each route's own owner.
     pub(crate) view: ViewId,
     pub(crate) generation: u64,
     owners: Vec<AccessibilityOwner>,
@@ -738,9 +735,8 @@ fn materialize_visible_text(
         }
     }
 
-    // The editor modeline is a real status surface, including live config
-    // diagnostics. Project it as a polite live region instead of leaving the
-    // information available only to sighted users in painted footer pixels.
+    // The editor modeline, including live config diagnostics, is a polite live region,
+    // not only footer pixels.
     if let Some(status) = spec
         .semantic_status
         .as_deref()
@@ -756,10 +752,7 @@ fn materialize_visible_text(
             });
         }
         let mut status_node = Node::new(Role::Status);
-        // The CONTEXT is the description; the announced string is the status itself
-        // ([`announce_live`] — the name is what AT-SPI and UIA speak, so a constant
-        // "Editor status" name would be the only thing a Linux/Windows reader ever heard,
-        // once, and never the diagnostic that changed).
+        // The status itself is the name ([`announce_live`]); the caption is the description.
         status_node.set_description("Editor status");
         announce_live(&mut status_node, Live::Polite, status);
         status_node.set_bounds(Rect {
@@ -1235,8 +1228,7 @@ fn lower_node(
         node.set_label(semantic.label.clone());
     }
 
-    // A control's description (ruling 267): what a reader says after the
-    // name, never folded into it.
+    // A control's description is what a reader says after the name, never folded into it.
     if let Some(description) = &semantic.description {
         node.set_description(description.clone());
     }
@@ -1251,10 +1243,9 @@ fn lower_node(
         node.set_read_only();
     }
     if semantic.role == SemanticRole::Status {
-        // A `Status` semantic carries its sentence in the LABEL (`UiContent::Text` and
-        // `UiContent::Group` both project their text there) and usually has no value at
-        // all, which is silent on macOS. `announce_live` mirrors whichever one is present
-        // onto the other so every platform speaks the same words.
+        // A `Status` semantic carries its sentence in the label (`UiContent::Text` and
+        // `UiContent::Group` both project it there) and usually has no value, which is
+        // silent on macOS.
         let announced = node
             .value()
             .map(str::to_string)
@@ -1273,11 +1264,9 @@ fn lower_node(
     Ok(node)
 }
 
-/// Mark `node` a LIVE REGION whose spoken text is `announced`, on every platform.
+/// Mark `node` a live region that speaks `announced` on every platform.
 ///
-/// THE NAME AND THE VALUE ARE BOTH LOAD-BEARING, and each platform reads a different
-/// one — a node that carries only one of them is announced on some platforms and silent
-/// on the rest:
+/// Platforms read different halves, so the string goes in both the name and the value:
 ///
 /// * AT-SPI (`aterm_a11y::atspi`, after accesskit_atspi_common) emits an `Announcement`
 ///   carrying the node's NAME, and only when the name CHANGES (or the node is newly
@@ -1288,10 +1277,8 @@ fn lower_node(
 /// * NSAccessibility (as AccessKit's accesskit_macos did) does the opposite: it
 ///   announces the node's VALUE, and raises nothing at all when the node has no value.
 ///
-/// So the announced string goes in BOTH, and any fixed caption belongs in the
-/// `description` — which is a property change on every platform and never an
-/// announcement. Keeping this in one function is what stops a new live surface from
-/// re-deriving half the rule.
+/// A fixed caption belongs in the `description`: a property change on every platform,
+/// never an announcement.
 fn announce_live(node: &mut Node, politeness: Live, announced: &str) {
     node.set_label(announced.to_string());
     node.set_value(announced.to_string());
@@ -1660,9 +1647,8 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].live(), Some(Live::Polite));
         assert_eq!(statuses[0].label(), Some(COMPLETE));
-        // The COMPLETE sentence, never the responsive visual truncation — and in the
-        // value as well as the name, because NSAccessibility announces a live region by
-        // its value and says nothing at all for a node that has none.
+        // The complete sentence, not the visual truncation, in the value as well as the
+        // name ([`announce_live`]).
         assert_eq!(statuses[0].value(), Some(COMPLETE));
         assert!(statuses[0].children().is_empty());
         assert!(
@@ -2107,9 +2093,7 @@ mod tests {
             .find(|(id, _)| *id == window_root)
             .unwrap();
         assert_eq!(window.1.role(), Role::Window);
-        // The accessible window is named what the titlebar names it, on the native
-        // branch exactly as on the terminal one — a user with several windows open has
-        // nothing else to tell them apart by ear.
+        // Named what the titlebar names it, as on the terminal branch.
         assert_eq!(window.1.label(), Some("Settings \u{2014} aterm"));
         assert_eq!(window.1.children(), [first_root, second_root]);
         assert_eq!(
@@ -2276,10 +2260,8 @@ mod tests {
             status.value(),
             Some("Config error · Ln 7, Col 3 · complete diagnostic message")
         );
-        // AT-SPI and UIA announce a live region by its NAME and only when the name
-        // moves, so the diagnostic has to be the name too; "Editor status" is the fixed
-        // caption and belongs in the description, where it is a property change and
-        // never an announcement.
+        // The diagnostic is the name too (AT-SPI and UIA announce the name); the fixed
+        // caption is the description.
         assert_eq!(
             status.label(),
             Some("Config error · Ln 7, Col 3 · complete diagnostic message")

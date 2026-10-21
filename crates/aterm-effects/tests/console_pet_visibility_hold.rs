@@ -23,10 +23,9 @@ const COLS: u16 = 80;
 const CELL_W: u16 = 8;
 const CELL_H: u16 = 16;
 
-/// The sprite rectangle the emitter would project for these feet — the same
-/// arithmetic as `PetBrain::console_body`, restated here so the oracle does
-/// not borrow the code under test. Independent of `alpha`, unlike
-/// `PetFrame::body_px`, so a blanked frame still has a measurable footprint.
+/// The sprite rectangle the emitter projects for these feet: `PetBrain::console_body`'s
+/// arithmetic, restated so the oracle does not borrow the code under test. Unlike
+/// `PetFrame::body_px` it ignores `alpha`, so a blanked frame still has a footprint.
 fn body(col: f32, row: f32) -> PetRect {
     let cw = f32::from(CELL_W);
     let ch = f32::from(CELL_H);
@@ -42,8 +41,7 @@ fn body(col: f32, row: f32) -> PetRect {
 
 struct Fixture {
     brain: PetBrain,
-    /// A SECOND, independent world, so the oracle reads occupancy without
-    /// asking the brain what it decided.
+    /// A second, independent world, so the oracle reads occupancy without asking the brain.
     world: PetWorld,
     term: Terminal,
     now: Instant,
@@ -115,11 +113,10 @@ struct Strobe {
     blackouts: usize,
     /// Transitions from visible to blank.
     cuts: usize,
-    /// The largest single-frame drop in opacity. A FADE steps by
-    /// `255 * dt / VETO_FADE` ~ 21 at 16 ms; a CUT steps by up to 255.
+    /// The largest single-frame drop in opacity. A fade steps by `255 * dt / VETO_FADE` ~ 21 at
+    /// 16 ms; a cut by up to 255.
     worst_drop: i32,
-    /// Blank frames with NO glyph anywhere under the sprite — a veto that
-    /// invented ink.
+    /// Blank frames with no glyph anywhere under the sprite: a veto that invented ink.
     blank_over_nothing: usize,
 }
 
@@ -139,8 +136,8 @@ impl Strobe {
     }
 }
 
-/// The pangram typed one key at a time at 125 ms/key, with the prompt already
-/// on screen so the pet starts from a settled station.
+/// The pangram typed one key per 128 ms (eight frames), with the prompt already on screen so the
+/// pet starts from a settled station.
 #[test]
 fn typing_never_blanks_the_pet() {
     let mut f = Fixture::new();
@@ -188,9 +185,9 @@ fn the_caret_alone_never_blanks_its_escort() {
     );
 }
 
-/// 10 lines/s of output for 1.44 s at 16 ms (90 frames). The pet's station is
-/// one cell right of the caret, where output lands, so a real obstruction is
-/// legitimate; reaching it by a cut, or blanking over blank cells, is not.
+/// A line of output every 112 ms for 1.44 s at 16 ms (90 frames). The pet's station is one cell
+/// right of the caret, where output lands, so a real obstruction is legitimate; reaching it by a
+/// cut, or blanking over blank cells, is not.
 #[test]
 fn an_output_burst_yields_by_fading_never_by_cutting() {
     let mut f = Fixture::new();
@@ -210,8 +207,8 @@ fn an_output_burst_yields_by_fading_never_by_cutting() {
         prev = frame.alpha;
     }
     println!("output burst: {strobe:?}");
-    // One fade step at 16 ms is 255 * 0.016 / VETO_FADE(0.20) ~ 21; the
-    // pet's own ramps can compound with it. Anything past this is a CUT.
+    // One fade step is ~21 (see `Strobe::worst_drop`) and the pet's own ramps can compound with
+    // it; anything past this is a cut.
     assert!(
         strobe.worst_drop <= 40,
         "the pet is cut, not faded: {strobe:?}"

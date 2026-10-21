@@ -13,10 +13,14 @@
 //! * [`gpu`] — the GPU's device-wide use;
 //! * [`volume`] — the size and free space of the volume a path lives on;
 //! * [`net_links`] — every network interface's kind, state, link rate and
-//!   cumulative counters, with [`counts_toward_machine`] naming the links
-//!   whose traffic is the machine's own;
+//!   cumulative counters ([`net_links_into`] reads into a buffer the caller
+//!   keeps), with [`counts_toward_machine`] naming the links whose traffic
+//!   is the machine's own;
 //! * [`process_limits`] — how many processes the machine, and one user, may
 //!   run;
+//! * [`pid_counts`] — how many processes the machine, and one user, run;
+//! * [`workqueue_limits`] — how many pool threads the kernel gives one
+//!   process;
 //! * [`load_average`] — the kernel's 1, 5 and 15 minute load averages;
 //! * [`capacity`] — what this process may use (a Linux cgroup's limits);
 //! * [`caps`] — what of all this the running machine can say.
@@ -37,15 +41,18 @@
 //! macOS 27) on 2026-10-19 at load average 30–32 (every core busy), release
 //! build, by `examples/live.rs`: the median of 2,000 back-to-back calls each,
 //! quoted in each reader's doc. No reader allocates beyond what it returns,
-//! except the kernel's and the IORegistry's own and [`net_links`]' scratch:
+//! except the kernel's and the IORegistry's own and two buffers:
 //! `host_processor_info` maps its answer into this task (released before
-//! [`Probe::core_ticks`] returns), [`gpu`] copies one CoreFoundation
-//! dictionary per call, and [`net_links`] reads into a 64 KiB heap buffer
-//! it frees before it returns (macOS: the interface list, grown up to 4 MiB
-//! where the kernel asks for more; Linux: `/proc/net/dev`, then one path
-//! buffer for every interface's sysfs files, and the rows it parsed). The
-//! buffer is made per call, not kept, because one that had grown would hold
-//! up to 4 MiB for the life of the process.
+//! [`Probe::core_ticks`] returns) and [`gpu`] copies one CoreFoundation
+//! dictionary per call; [`pid_counts`] lists the pids into a buffer it
+//! frees before it returns (macOS: room for the machine's processes and a
+//! quarter more, 4 bytes a pid); [`net_links_into`] reads into the caller's
+//! buffer, made at least 64 KiB (macOS: the interface list, grown up to
+//! 4 MiB where the kernel asks for more; Linux: `/proc/net/dev`, then one
+//! path buffer for every interface's sysfs files, and the rows it parsed).
+//! [`net_links`] makes that buffer per call and frees it before it returns;
+//! a caller that reads every second keeps one, and holds what it grew to,
+//! up to 4 MiB, for as long as it keeps it.
 
 use std::path::{Path, PathBuf};
 
@@ -652,6 +659,29 @@ pub struct MemoryDetail {
     /// The classes partition physical memory exactly (macOS), or leave a
     /// remainder no class names (Linux, Windows).
     pub exact: bool,
+    /// The VM's cumulative event counters from the same read, where the OS
+    /// gives them (macOS `HOST_VM_INFO64`; not read on Linux).
+    pub counters: Option<VmCounters>,
+    /// The percent of memory the kernel counts available before it acts
+    /// (macOS `kern.memorystatus_level`, the figure jetsam reads; not read on
+    /// Linux).
+    pub kernel_available_pct: Option<u8>,
+}
+
+/// The VM's cumulative event counters since boot, from the same read as the
+/// page classes. Two readings give rates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmCounters {
+    /// Bytes swapped in (`swapins` × page size).
+    pub swapin_bytes: u64,
+    /// Bytes swapped out (`swapouts` × page size).
+    pub swapout_bytes: u64,
+    /// Pages the compressor decompressed (`decompressions`).
+    pub decompressions: u64,
+    /// Pages the compressor compressed (`compressions`).
+    pub compressions: u64,
+    /// Pages read in from files (`pageins`).
+    pub pageins: u64,
 }
 
 /// The `HOST_VM_INFO64` page counts [`memory_detail_of`] reads.
@@ -668,6 +698,11 @@ pub(crate) struct VmPages {
     pub purgeable: u64,
     pub external: u64,
     pub internal: u64,
+    pub swapins: u64,
+    pub swapouts: u64,
+    pub decompressions: u64,
+    pub compressions: u64,
+    pub pageins: u64,
 }
 
 /// [`MemoryDetail`] from one read's page counts, the page size, physical
@@ -701,6 +736,42 @@ pub(crate) fn memory_detail_of(
         commit: None,
         pressure,
         exact: true,
+        counters: Some(VmCounters {
+            swapin_bytes: b(p.swapins),
+            swapout_bytes: b(p.swapouts),
+            decompressions: p.decompressions,
+            compressions: p.compressions,
+            pageins: p.pageins,
+        }),
+        kernel_available_pct: None,
+    }
+}
+
+/// What the machine is called and what it runs, read once for `sys global`
+/// and `aterm help sys`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MachineWords {
+    /// The CPU's brand (`Apple M5`; macOS `machdep.cpu.brand_string`, Linux
+    /// `/proc/cpuinfo`'s `model name`).
+    pub cpu: Option<String>,
+    /// The OS and its version (`macOS 27.0.1`; Linux `PRETTY_NAME`).
+    pub os: Option<String>,
+}
+
+/// The machine's brand and OS words; empty fields where unreadable.
+#[must_use]
+pub fn machine_words() -> MachineWords {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::machine_words()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::Root::system().machine_words()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        MachineWords::default()
     }
 }
 
@@ -1164,41 +1235,58 @@ pub(crate) fn kind_by_name(name: &str) -> LinkKind {
 }
 
 /// Every network interface's kind, state, link rate and cumulative
-/// counters now, at most [`MAX_LINKS`]; `None` where unreadable. The links
-/// whose traffic is the machine's own are the ones
-/// [`counts_toward_machine`] admits.
-///
-/// * **macOS**: one `sysctl {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}`
-///   into a 64 KiB buffer (grown to what the kernel asks for, up to 4 MiB,
-///   where that is too small), decoded by [`crate::iflist::links_of`]: the
-///   64-bit `if_data64` counters and the name the message carries. One
-///   datagram socket then asks the functional type
-///   (`SIOCGIFFUNCTIONALTYPE`: wired, Wi-Fi, cellular), which names Wi-Fi
-///   apart from Ethernet where the name cannot, of every interface whose
-///   name [`counts_toward_machine`] does not refuse; where the ask fails
-///   the name decides ([`crate::iflist::link_kind`]). A refused name is
-///   [`LinkKind::Other`] unasked: macOS gives `utun`, `bridge` and `anpi`
-///   links the wired type and `llw` and `ap` links the Wi-Fi one. 44 µs
-///   median on the owner's M5 Max (24 interfaces, 8 of them asked,
-///   2026-10-20), of which the list's `sysctl` is 33 µs.
-/// * **Linux**: `/proc/net/dev` (this process's network namespace) read
-///   into a [`crate::linux::NET_DEV_CAP`]-byte buffer, then per interface
-///   its `/sys/class/net/<if>/` `ifindex`, `flags`, `operstate`, `speed`
-///   (a link with a device only), each read into one stack buffer, and
-///   whether `device` and `wireless` exist ([`crate::linux::links_under`]).
-/// * Elsewhere: `None`.
+/// counters now, at most [`MAX_LINKS`]; `None` where unreadable: what
+/// [`net_links_into`] reads, into a buffer made for this call and freed
+/// before it returns.
 #[must_use]
 pub fn net_links() -> Option<Vec<LinkReading>> {
+    net_links_into(&mut Vec::new())
+}
+
+/// Every network interface's kind, state, link rate and cumulative
+/// counters now, at most [`MAX_LINKS`], read into `scratch`, which the
+/// caller keeps from one reading to the next so a reading allocates no
+/// buffer (only its answer); `None` where unreadable. The links whose
+/// traffic is the machine's own are the ones [`counts_toward_machine`]
+/// admits. `scratch` is made at least 64 KiB and keeps the size it was
+/// last read at (on macOS up to 4 MiB, where the list outgrew it); its
+/// bytes are of no use to the caller.
+///
+/// * **macOS**: one `sysctl {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}`
+///   into the whole of `scratch` (grown to what the kernel asks for, up to
+///   4 MiB, where that is too small), decoded by
+///   [`crate::iflist::links_of`]: the 64-bit `if_data64` counters and the
+///   name the message carries. One datagram socket then asks the
+///   functional type (`SIOCGIFFUNCTIONALTYPE`: wired, Wi-Fi, cellular),
+///   which names Wi-Fi apart from Ethernet where the name cannot, of every
+///   interface whose name [`counts_toward_machine`] does not refuse; where
+///   the ask fails the name decides ([`crate::iflist::link_kind`]). A
+///   refused name is [`LinkKind::Other`] unasked: macOS gives `utun`,
+///   `bridge` and `anpi` links the wired type and `llw` and `ap` links the
+///   Wi-Fi one. 44 µs median on the owner's M5 Max (24 interfaces, 8 of
+///   them asked, 2026-10-20), of which the list's `sysctl` is 33 µs; a
+///   kept `scratch` saves little of it (44.7 µs median against
+///   [`net_links`]' 45.3 µs, the same Mac at load 13, later that day).
+/// * **Linux**: `/proc/net/dev` (this process's network namespace) read
+///   into the first [`crate::linux::NET_DEV_CAP`] bytes of `scratch`, then
+///   per interface its `/sys/class/net/<if>/` `ifindex`, `flags`,
+///   `operstate`, `speed` (a link with a device only), each read into one
+///   stack buffer, and whether `device` and `wireless` exist
+///   ([`crate::linux::links_under_into`]).
+/// * Elsewhere: `None`, and `scratch` is left as it came.
+#[must_use]
+pub fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> {
     #[cfg(target_os = "macos")]
     {
-        crate::macos::net_links()
+        crate::macos::net_links_into(scratch)
     }
     #[cfg(target_os = "linux")]
     {
-        crate::linux::links_under(Path::new("/"))
+        crate::linux::links_under_into(Path::new("/"), scratch)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        let _ = scratch;
         None
     }
 }
@@ -1292,6 +1380,36 @@ pub fn process_limits() -> ProcessLimits {
     }
 }
 
+/// How many threads the kernel's thread pool (the workqueue) gives one
+/// process ([`workqueue_limits`]): the pool every macOS daemon serves its
+/// requests from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkqueueLimits {
+    /// The most constrained (not overcommit) workqueue threads one process
+    /// may have scheduled at once (macOS `kern.wq_max_constrained_threads`:
+    /// the larger of 64 and five per core; 90 on an 18-core Mac). A daemon
+    /// whose every such thread is blocked can start no request that would
+    /// unblock them.
+    pub constrained: Option<u64>,
+    /// The most workqueue threads of any kind one process may have (macOS
+    /// `kern.wq_max_threads`).
+    pub total: Option<u64>,
+}
+
+/// The kernel's workqueue ceilings, read now: two `sysctl`s on macOS (they
+/// are fixed per boot), every field `None` elsewhere.
+#[must_use]
+pub fn workqueue_limits() -> WorkqueueLimits {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::workqueue_limits()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        WorkqueueLimits::default()
+    }
+}
+
 /// The kernel's load averages over 1, 5 and 15 minutes: the mean count of
 /// threads running or waiting to run (Linux also counts a thread waiting on
 /// a disk). One `getloadavg` (a `sysctl` on macOS, 0.3 µs median on the M5
@@ -1316,5 +1434,99 @@ pub fn load_average() -> Option<[f64; 3]> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
+    }
+}
+
+/// How many processes the machine runs, and how many of them `uid` owns,
+/// read now: `(all, uid's)`, the counts [`process_limits`]' two ceilings
+/// bound. Each is `None` where unread, never a zero for unknown.
+///
+/// * **macOS**: a `proc_listallpids` that asks the room, then, into one
+///   buffer of that room and a quarter more, `proc_listallpids` (every
+///   process, a zombie included) and `proc_listpids(PROC_RUID_ONLY, uid)`
+///   (the processes whose real user is `uid`, which `kern.maxprocperuid`
+///   and `RLIMIT_NPROC` count). libproc answers zero both for a failure
+///   and for a listing that matched nothing, so an empty listing of every
+///   process is `None`, and one user's is a count of zero only where the
+///   call left `errno`, cleared before it, clear (a uid that owns no
+///   process). A listing that fills the buffer is `None` too (it may have
+///   been cut). 17 µs median on the owner's M5 Max (894 processes,
+///   2026-10-20).
+/// * **Linux**: `/proc/loadavg`'s count of every thread on the machine,
+///   the unit [`process_limits`] counts in there
+///   ([`crate::linux::Root::tasks`]); one user's is `None`, since counting
+///   it walks `/proc`.
+/// * **Windows**: the process count of the `K32GetPerformanceInfo` that
+///   [`memory_detail`] reads too; one user's is `None`.
+/// * Elsewhere: `(None, None)`.
+#[must_use]
+pub fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::pid_counts(uid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = uid;
+        (crate::linux::Root::system().tasks(), None)
+    }
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        let _ = uid;
+        crate::win::pid_counts()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
+    {
+        let _ = uid;
+        (None, None)
+    }
+}
+
+/// The most pids one [`pid_counts`] listing is offered room for: past the
+/// whole of xnu's pid space (pids run below `PID_MAX`, 99,999), so no
+/// listing needs more; 512 KiB of pids.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const MAX_PIDS: usize = 1 << 17;
+
+/// The room, in pids, a [`pid_counts`] listing is offered: what the size
+/// ask answered (xnu's process count and 20) and a quarter more, for the
+/// processes started between the two asks, at most [`MAX_PIDS`]; `None`
+/// where the ask failed (it answered no room). PURE.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn pid_room(estimate: i64) -> Option<usize> {
+    let pids = usize::try_from(estimate).ok().filter(|n| *n > 0)?;
+    Some(pids.saturating_add(pids / 4).min(MAX_PIDS))
+}
+
+/// The count of a listing of `listed` pids into a buffer of `room`; `None`
+/// where it listed none (libproc answers zero for a failure too, so a zero
+/// is never read as a count) or filled the buffer (the listing may have
+/// been cut). PURE.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn listed_count(listed: i64, room: usize) -> Option<u64> {
+    let n = usize::try_from(listed)
+        .ok()
+        .filter(|n| *n > 0 && *n < room)?;
+    u64::try_from(n).ok()
+}
+
+/// The count of a listing of the pids one uid owns, `listed` of them into
+/// a buffer of `room`, where `errno` is the thread's `errno` after the
+/// call and was cleared before it: zero with `errno` still clear is a uid
+/// that owns no process, a count of zero (a failure sets `errno`); any
+/// other answer is [`listed_count`]'s. PURE.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn owned_count(listed: i64, errno: i32, room: usize) -> Option<u64> {
+    if listed == 0 && errno == 0 {
+        Some(0)
+    } else {
+        listed_count(listed, room)
     }
 }

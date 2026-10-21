@@ -573,6 +573,17 @@ pub(crate) struct HarnessSession {
     /// (`its own setting, set 14:05 over aterm ctl`,
     /// [`HarnessSessionRow::setting`]).
     pub(crate) set_by: Option<crate::autopilot::SetByWords>,
+    /// A harness's need standing on it, in the worker's own words: its
+    /// published need where that is a harness's ask
+    /// ([`crate::needs::Need::harness`], design §12.2.3). STATUS counts the
+    /// sessions it stands on (`· 2 need you`); its row's state line leads
+    /// with it.
+    pub(crate) need: Option<crate::needs::HarnessAsk>,
+    /// WHY LAND STILL HOLDS (§12.3.3 item 4, slice 3c): the hold on its
+    /// glass, with its `since` stamped where it arrived, where this host's
+    /// live claim is on it and its chip wears `⤓ land` (`App::shown_hold`);
+    /// its row's state line says it ([`HarnessSessionRow::state_line`]).
+    pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
 }
 
 /// One `[harness]` key of the effective table.
@@ -1045,7 +1056,7 @@ impl HarnessState {
             return vec![("Supervision".to_string(), self.words.clone())];
         }
         let supervised = self.sessions.iter().filter(|s| s.supervised).count();
-        let sessions = match self.posture {
+        let mut sessions = match self.posture {
             HarnessPosture::On(_)
             | HarnessPosture::Restricted(_, _)
             | HarnessPosture::AgentOff(_) => {
@@ -1056,6 +1067,15 @@ impl HarnessState {
                 format!("{open} open \u{b7} no harness: this aterm has no control socket")
             }
         };
+        // The listed sessions a harness's ask stands on (§12.2.1): its own
+        // need, never an approval, a question or another owner's ask.
+        let need_you = self.sessions.iter().filter(|s| s.need.is_some()).count();
+        if need_you > 0 {
+            sessions.push_str(&format!(
+                "{}{need_you} need you",
+                crate::native_ui::FACT_SEPARATOR
+            ));
+        }
         vec![
             ("Supervision".to_string(), self.words.clone()),
             ("Sessions".to_string(), sessions),
@@ -1064,7 +1084,9 @@ impl HarnessState {
 
     /// TODAY'S NUMBERS under STATUS's facts (§10.3.1): the first three
     /// nonzero families (`37 approved today · 12 kept going · 4 answered`,
-    /// drawn in Hero type where it fits), then the rest and the person's wait
+    /// drawn in Hero type where it fits; landings lead where there are any,
+    /// `2 landed today · 31 approved · 4 kept going`, §12.4.1, by
+    /// [`Families`]' order), then the rest and the person's wait
     /// (`2 resumed · 1 land prompt · waited on you 4m`, plain; empty where
     /// there is none). Only nonzero counts: `nothing yet today` for an empty
     /// day, `reading…` before the first reading. `None` before the host
@@ -1161,6 +1183,8 @@ impl HarnessState {
                     armed_at_ms: session.armed_at_ms,
                     today: self.today,
                     setting: setting_line(session, self.today),
+                    need: session.need.clone(),
+                    hold: session.hold,
                 }
             })
             .collect()
@@ -1206,25 +1230,29 @@ impl HarnessState {
             }
             _ => "the harness steers none of them",
         };
+        // A session under Land by the face its chip wears (§12.4.3, item 3):
+        // `⤓ land` landing, `✓ landed`, or `⤓ quiet` (a person's own
+        // exchange) — the three faces Land's view folds to, so the parts sum
+        // to the sessions under Land, as the presses count them.
+        let wears =
+            |face: ChipFace| move |s: &&HarnessSession| ChipFace::of(s.view, &s.glass) == face;
         Some(EveryRow {
             sessions: self.sessions.len(),
             steered: steered().count(),
             cruising: cruising.clone().count(),
             timed: cruising.filter(|s| s.armed_at_ms.is_some()).count(),
-            landing: self
-                .sessions
-                .iter()
-                .filter(|s| mode(s) == Some(Autopilot::Land))
-                .count(),
+            landing: self.sessions.iter().filter(wears(ChipFace::Land)).count(),
+            landed: self.sessions.iter().filter(wears(ChipFace::Landed)).count(),
+            quiet: self.sessions.iter().filter(wears(ChipFace::Theirs)).count(),
             off: self.sessions.iter().filter(|s| !s.view.carries()).count(),
             pinned_off: steered().filter(|s| s.word == Some(Autopilot::Off)).count(),
             cruise: count(EveryPress::Mode(Autopilot::Cruise)),
             land: count(EveryPress::Mode(Autopilot::Land)),
             timer: count(EveryPress::Timer(TimerChoice::In(60))),
             follow: count(EveryPress::Follow),
-            cruise_landing: steered()
-                .filter(|s| mode(s) == Some(Autopilot::Land))
-                .count(),
+            cruise_landing: steered().filter(wears(ChipFace::Land)).count(),
+            cruise_landed: steered().filter(wears(ChipFace::Landed)).count(),
+            cruise_quiet: steered().filter(wears(ChipFace::Theirs)).count(),
             cruise_timed: steered()
                 .filter(|s| mode(s) == Some(Autopilot::Cruise) && s.armed_at_ms.is_some())
                 .count(),
@@ -1294,6 +1322,26 @@ impl HarnessState {
                 row(DECLINED.label, both(today.declined, week.declined)),
                 row(ANSWERED.label, both(today.answered, week.answered)),
                 row(KEPT_GOING.label, both(today.continued, week.continued)),
+            ]);
+            // Of those, the done claims the harness checked (§12.4.1): the
+            // row under Kept going, labelled as part of it, made as the one
+            // under Approved is — both windows, only where the week had one.
+            // Read from the reading's acts by rule, so no count is added.
+            let (checked_today, checked_week) =
+                (done_claims_checked(today), done_claims_checked(week));
+            if checked_week > 0 {
+                rows.push(row(
+                    DONE_CHECKED_OF_KEPT_GOING,
+                    format!("{DONE_CLAIM_CHECKED} {}", both(checked_today, checked_week)),
+                ));
+            }
+            // Land's landings, over the prompts that led to them (§12.4.1):
+            // wherever the week had either, so a landing moves a count and
+            // never brings a row of its own between two readings.
+            if week.landed > 0 || week.land_prompts > 0 {
+                rows.push(row(LANDED.label, both(today.landed, week.landed)));
+            }
+            rows.extend([
                 // Land's prompts typed, never the landings they led to.
                 row(
                     LAND_PROMPTS.label,
@@ -1397,17 +1445,19 @@ pub(crate) fn today_counts(line: &str) -> bool {
     line != TODAY_NOTHING_YET && line != TODAY_READING
 }
 
-/// The families of acts a day says, in the order it says them: approved,
-/// kept going, answered, resumed, land prompts, declined, relaunched,
-/// upgraded.
+/// The families of acts a day says, in the order it says them: landed,
+/// approved, kept going, answered, resumed, land prompts, declined,
+/// relaunched, upgraded. Landings lead (§12.4.1): a day that landed work
+/// says so first, ahead of the acts that led to it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Families([u64; 8]);
+pub(crate) struct Families([u64; 9]);
 
 impl Families {
     /// A window's totals.
     #[must_use]
     pub(crate) const fn of_stats(s: &HarnessStats) -> Self {
         Self([
+            s.landed,
             s.approved,
             s.continued,
             s.answered,
@@ -1423,6 +1473,7 @@ impl Families {
     #[must_use]
     pub(crate) const fn of_tally(t: &aterm_agent::harness::stats::Tally) -> Self {
         Self([
+            t.landed,
             t.approved,
             t.continued,
             t.answered,
@@ -1487,6 +1538,39 @@ pub(crate) const UNPROVEN_OF_APPROVED: &str = "of those";
 /// Turns the harness continued (`Counter::Continued`).
 pub(crate) const KEPT_GOING: CountWords =
     CountWords::act("Kept going", aterm_agent::harness::acts::Act::Continued);
+/// THE DONE CLAIMS THE HARNESS CHECKED (§12.4.1): of the turns it kept
+/// going, those that claimed done and were answered with Cruise's
+/// defend-and-find-more prompt. WHAT THE HARNESS DID's row under Kept going,
+/// labelled as a part of it ([`DONE_CHECKED_OF_KEPT_GOING`]: `of them  a
+/// done claim checked 4 today · 12 in 7 days`), so no one adds it to the
+/// turns kept going. The chip's trail keeps `↻ kept going` for them.
+pub(crate) const DONE_CLAIM_CHECKED: &str = "a done claim checked";
+/// WHAT THE HARNESS DID's label for [`DONE_CLAIM_CHECKED`]'s row: a part of
+/// the Kept going row over it. Not [`UNPROVEN_OF_APPROVED`]'s words: each
+/// fact of a card is keyed by its label.
+pub(crate) const DONE_CHECKED_OF_KEPT_GOING: &str = "of them";
+/// The ledger's rules a done claim was checked under: Cruise's done check
+/// (`continue-done-check@v1`), and the two challenges older builds typed at
+/// a done report instead (`continue-open-items@v1`,
+/// `continue-uncommitted@v1`; retired with Forever Cruise, whose done check
+/// carries their words), which a 7-day window still reads. Each is one of
+/// the turns kept going (`acts::sort`).
+const DONE_CLAIM_RULES: [&str; 3] = {
+    use aterm_agent::supervise::policy::turn_end::{
+        RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED,
+    };
+    [RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED]
+};
+
+/// How many done claims the harness checked in `window`: its acts under
+/// [`DONE_CLAIM_RULES`], read from the reading's `by_rule`.
+fn done_claims_checked(window: &HarnessStats) -> u64 {
+    DONE_CLAIM_RULES
+        .iter()
+        .filter_map(|rule| window.by_rule.get(*rule))
+        .fold(0, |sum, n| sum.saturating_add(*n))
+}
+
 /// Questions the harness answered.
 pub(crate) const ANSWERED: CountWords =
     CountWords::act("Answered", aterm_agent::harness::acts::Act::Answered);
@@ -1499,6 +1583,15 @@ pub(crate) const LAND_PROMPTS: CountWords = CountWords {
     label: "Land prompts",
     one: "land prompt",
     many: "land prompts",
+};
+/// Land's landings: all of the work on the remote main branch, defended
+/// clean at a land act's yield, each counted once at its first note
+/// ([`HarnessStats::landed`], §12.4.3 item 2) — the word the chip's `✓
+/// landed` says.
+pub(crate) const LANDED: CountWords = CountWords {
+    label: "Landed",
+    one: "landed",
+    many: "landed",
 };
 /// Boxes the harness declined.
 pub(crate) const DECLINED: CountWords =
@@ -1533,7 +1626,8 @@ pub(crate) const NEEDS_TOLD: CountWords = CountWords {
 };
 
 /// [`Families`]' words, in its order.
-pub(crate) const FAMILY_WORDS: [CountWords; 8] = [
+pub(crate) const FAMILY_WORDS: [CountWords; 9] = [
+    LANDED,
     APPROVED,
     KEPT_GOING,
     ANSWERED,
@@ -1572,9 +1666,11 @@ fn day_line_at(
 /// A SESSIONS ROW'S DAY (§10.3.1) from its share of today's reading:
 /// `today:`, then `needed you N times, <wait> at <the last escalation's
 /// clock>` where it needed the person, then `N needs told` where its worker's
-/// NEEDS YOU went on screen, then at most three nonzero counts, then
-/// `partial` where its own ledgers' cut may have shortened the day —
-/// `today: needed you once, 1m at 18:29 · 31 approved · 1 kept going`.
+/// NEEDS YOU went on screen, then at most three nonzero counts, its landings
+/// first ([`Families`]' order, §12.4.1), then `partial` where its own
+/// ledgers' cut may have shortened the day — `today: needed you once, 1m at
+/// 18:29 · 31 approved · 1 kept going`, `today: 1 landed · 31 approved · 3
+/// land prompts`.
 /// `None` for a day with nothing to say. Pure.
 #[must_use]
 pub(crate) fn day_line(
@@ -1831,6 +1927,12 @@ pub(crate) struct HarnessSessionRow {
     /// ctl`, or `follows the default`. Every row has the line, so a press
     /// that moves its word changes these words and no row's height.
     pub(crate) setting: String,
+    /// A harness's need standing on its session ([`HarnessSession::need`]):
+    /// its state line's head.
+    pub(crate) need: Option<crate::needs::HarnessAsk>,
+    /// Land's hold on its session ([`HarnessSession::hold`]): its state
+    /// line's Land arm.
+    pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
 }
 
 impl HarnessSessionRow {
@@ -1845,8 +1947,10 @@ impl HarnessSessionRow {
             .map_or(self.detail.as_str(), |(lead, _)| lead)
     }
 
-    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), formatted from its
-    /// glass under its view as the chip's face reads it ([`ChipFace::of`]):
+    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by a harness's need
+    /// where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1),
+    /// formatted from its glass under its view as the chip's face reads it
+    /// ([`ChipFace::of`]):
     /// `lands at 18:00` (`lands Sat 16:00` on another day), under Land
     /// `landed 17:42` and `quiet: a person's own exchange`; else the
     /// loop's pause after short turns (`pausing until 18:41 (3 short turns
@@ -1855,14 +1959,18 @@ impl HarnessSessionRow {
     /// an age (§9.0), each from another local day than the publish's
     /// ([`Self::today`]) with its weekday (`landed Fri 18:11`, `last: ✓
     /// approved Fri 17:58`, §10.2.3 item 3). `None` at rest — v1's row.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the SESSIONS card draws it with the timer's disclosure (design §9.6.2); \
-                      until then the face table's tests read it"
-        )
-    )]
+    /// The SESSIONS card draws it under the row's head
+    /// (`native_settings_harness`'s `session_row`).
+    ///
+    /// UNDER `⤓ land`, WHERE A HOLD STANDS (§12.3.1, slice 3c): why Land
+    /// still holds, then the pause — `not landed yet: needs you: rotate the
+    /// deploy key; 2 unpushed commits; open work in its report: follow-up ·
+    /// landing since 14:02 · 3 nudges · pausing until 14:40 (3 short turns
+    /// in a row)`, or, once the instruction is typed and before its yield,
+    /// `landing since 14:02` and the pause
+    /// ([`crate::harness_glass::hold_words`]' line form). Where the hold
+    /// names the need it leads with, the need is not said twice. Before the
+    /// instruction, main's line.
     #[must_use]
     pub(crate) fn state_line(&self) -> Option<String> {
         let glass = &self.glass;
@@ -1875,18 +1983,44 @@ impl HarnessSessionRow {
             Some(day) => format!("lands {} {}", day.short(), land.clock.as_str()),
             None => format!("lands at {}", land.clock.as_str()),
         };
-        let line = match ChipFace::of(self.view, glass) {
+        let face = ChipFace::of(self.view, glass);
+        let hold = self.hold.filter(|_| face == ChipFace::Land);
+        let line = match face {
             ChipFace::CruiseUntil => glass.land_at.map(lands),
             ChipFace::Landed => Some(at("landed")),
             ChipFace::Theirs => Some("quiet: a person's own exchange".to_owned()),
+            // Why Land still holds, and the pause it waits out beside it.
+            ChipFace::Land => hold
+                .and_then(|hold| {
+                    crate::harness_glass::hold_words(
+                        &hold,
+                        self.need.as_ref(),
+                        crate::harness_glass::HoldForm::Line,
+                        today,
+                    )
+                })
+                .map(|held| match glass.pause {
+                    Some(pause) => format!(
+                        "{held}{}{}",
+                        crate::native_ui::FACT_SEPARATOR,
+                        pause.state_words(today)
+                    ),
+                    None => held,
+                }),
             ChipFace::Cruise
-            | ChipFace::Land
             | ChipFace::Off
             | ChipFace::MasterOff
             | ChipFace::AgentOff(_)
             | ChipFace::Unhosted => None,
         };
-        line.or_else(|| glass.pause.map(|p| p.state_words(today)))
+        // A hold whose words name the need standing says it once.
+        let need = self.need.as_ref().filter(|_| {
+            !hold.is_some_and(|hold| {
+                hold.read() && hold.held.holds(aterm_agent::harness::acts::HoldLeg::Needs)
+            })
+        });
+        let rest = line
+            .or_else(|| glass.pause.map(|p| p.state_words(today)))
             .or_else(|| {
                 glass.last.map(|(act, stamp)| {
                     format!(
@@ -1896,8 +2030,22 @@ impl HarnessSessionRow {
                         stamp.words(today)
                     )
                 })
-            })
+            });
+        // A harness's need leads (§12.2.1), in the worker's words, whole:
+        // the line wraps, never cuts.
+        match (need.map(need_head), rest) {
+            (Some(need), Some(rest)) => {
+                Some(format!("{need}{}{rest}", crate::native_ui::FACT_SEPARATOR))
+            }
+            (need, rest) => need.or(rest),
+        }
     }
+}
+
+/// A state line's head where a harness's need stands (§12.2.1): `needs you:
+/// <the need> (+1 more); carrying on`.
+fn need_head(ask: &crate::needs::HarnessAsk) -> String {
+    format!("needs you: {}{}; carrying on", ask.first, ask.more_words())
 }
 
 /// THE LANDING (§10.3.3, item 8): the host opens Settings ▸ Harness with this
@@ -2155,8 +2303,13 @@ pub(crate) struct EveryRow {
     pub(crate) cruising: usize,
     /// Of those, with a timer armed.
     pub(crate) timed: usize,
-    /// Running under Land.
+    /// Running under Land, its task open or unknown: the chip's `⤓ land`.
     pub(crate) landing: usize,
+    /// Under Land and landed: the chip's `✓ landed` (§12.4.1). Never counted
+    /// `landing`, whose word says the work is still going.
+    pub(crate) landed: usize,
+    /// Under Land through a person's own exchange: the chip's `⤓ quiet`.
+    pub(crate) quiet: usize,
     /// Under no carrying mode: Off by its own word or the default's, or
     /// under a switch that takes the harness off it.
     pub(crate) off: usize,
@@ -2167,9 +2320,12 @@ pub(crate) struct EveryRow {
     pub(crate) land: usize,
     pub(crate) timer: usize,
     pub(crate) follow: usize,
-    /// Of Cruise's, how many are landing and how many timed — the timed
-    /// ones are the timers Land cancels, as it moves every Cruise.
+    /// Of Cruise's, how many are under Land — landing, landed and quiet, by
+    /// their chips' faces, as the row says them — and how many timed: the
+    /// timed ones are the timers Land cancels, as it moves every Cruise.
     pub(crate) cruise_landing: usize,
+    pub(crate) cruise_landed: usize,
+    pub(crate) cruise_quiet: usize,
     pub(crate) cruise_timed: usize,
     /// Of Follow's, how many have a timer it cancels, and how many it hands
     /// to a default of Off (the window's one default, so none or all): the
@@ -2193,6 +2349,17 @@ pub(crate) fn sessions_words(n: usize) -> String {
     }
 }
 
+/// Sessions under Land in the chip's words, its nonzero parts only: `1
+/// landing`, `2 landed`, `1 quiet` (§12.4.1: a landed session is never
+/// said to be landing).
+fn under_land(landing: usize, landed: usize, quiet: usize) -> Vec<String> {
+    [(landing, "landing"), (landed, "landed"), (quiet, "quiet")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, word)| format!("{n} {word}"))
+        .collect()
+}
+
 impl EveryRow {
     /// How many `press` moves.
     #[must_use]
@@ -2207,11 +2374,12 @@ impl EveryRow {
         }
     }
 
-    /// What is there now, beside the buttons: `5 sessions: 3 cruising, 1
-    /// landing, 1 off` (`3 cruising (2 timed)` where timers are armed);
-    /// where the harness steers none of them, why, in the rows' own short
-    /// words (`3 sessions · harness off in Settings`), which fit where a
-    /// row's detail fits.
+    /// What is there now, beside the buttons: `6 sessions: 3 cruising, 1
+    /// landing, 1 landed, 1 off` (`3 cruising (2 timed)` where timers are
+    /// armed; a session under Land by its chip's face, `landing`, `landed`
+    /// or `quiet`, §12.4.1; a zero part is not said); where the harness
+    /// steers none of them, why, in the rows' own short words (`3 sessions
+    /// · harness off in Settings`), which fit where a row's detail fits.
     #[must_use]
     pub(crate) fn line(&self) -> String {
         let all = sessions_words(self.sessions);
@@ -2226,9 +2394,7 @@ impl EveryRow {
                 format!("{} cruising", self.cruising)
             });
         }
-        if self.landing > 0 {
-            parts.push(format!("{} landing", self.landing));
-        }
+        parts.extend(under_land(self.landing, self.landed, self.quiet));
         if self.off > 0 {
             parts.push(format!("{} off", self.off));
         }
@@ -2290,9 +2456,10 @@ impl EveryRow {
     /// What a press does, for its button's description (design §11.5.1):
     /// the count it moves, the timers it cancels and what stays — `Land 3
     /// sessions and cancel 2 timers; the 1 off stays off`, `Cruise 4
-    /// sessions: 2 landing, 2 timed` — where Follow hands sessions to a
-    /// default of Off, that the harness lets go of them; or, where it moves
-    /// nothing, that it writes nothing.
+    /// sessions: 1 landing, 1 landed, 2 timed` (its sessions under Land told
+    /// apart as the row tells them, §12.4.1) — where Follow hands sessions
+    /// to a default of Off, that the harness lets go of them; or, where it
+    /// moves nothing, that it writes nothing.
     #[must_use]
     pub(crate) fn description(&self, press: EveryPress) -> String {
         use crate::autopilot_timers::TimerChoice;
@@ -2307,13 +2474,11 @@ impl EveryRow {
                 format!("Land {}{cancel}{stays}", sessions_words(n))
             }
             EveryPress::Mode(Autopilot::Cruise) if n == 0 => {
-                "No session is landing or timed, so this changes nothing".to_string()
+                "No session is under Land or timed, so this changes nothing".to_string()
             }
             EveryPress::Mode(Autopilot::Cruise) => {
-                let mut how = Vec::new();
-                if self.cruise_landing > 0 {
-                    how.push(format!("{} landing", self.cruise_landing));
-                }
+                let mut how =
+                    under_land(self.cruise_landing, self.cruise_landed, self.cruise_quiet);
                 if self.cruise_timed > 0 {
                     how.push(format!("{} timed", self.cruise_timed));
                 }
@@ -2924,6 +3089,19 @@ impl App {
                 crate::autopilot::SetByWords::of(set_by, true, |sid| self.autopilot_setter_tab(sid))
             });
             let resolved = self.harness_session_name(handle.local_id, person, &handle.title);
+            // A harness's need standing on it (§12.2.3), from its published
+            // verdict under the timeline's leaf lock, the meta guard released.
+            let need = handle
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .need()
+                .harness_ask()
+                .cloned();
+            // Why Land still holds (§12.3.3 item 4), where this host's claim
+            // is on it and its chip wears `⤓ land` (`App::shown_hold`).
+            let hold = self.shown_hold(handle.local_id).filter(|_| supervised);
             sessions.push(HarnessSession {
                 local_id: handle.local_id,
                 sid: handle.sid.as_str().to_string(),
@@ -2937,6 +3115,8 @@ impl App {
                 glass: self.chip_glass(handle.local_id),
                 armed_at_ms,
                 set_by,
+                need,
+                hold,
             });
         }
         sessions.sort_by_key(|s| s.local_id);
@@ -3389,7 +3569,7 @@ impl App {
     /// (`Wake::ActivateCommittedHandoff`) a reading's wake is dropped
     /// (`drops_wake_before_commit`), so a restored Settings ▸ Harness read
     /// nothing (`App::restore_native_leaf`) and drew this process's book
-    /// alone — `Ends: none yet` over the predecessor's done — until a
+    /// alone — `Ends: none yet` over the predecessor's landing — until a
     /// Refresh. At the Commit a reading begun before it is let go (its wake
     /// was dropped, or is held to run after the Commit's and then finds it
     /// let go), so no later reading waits on it, and the page, where one is
@@ -3418,7 +3598,10 @@ impl App {
 }
 
 /// Format live AI CLI status for a tab row (`"working: thinking (14s)"`,
-/// `"waiting on permission: Bash (5s)"`, `"idle at prompt · done"`). Pure.
+/// `"waiting on permission: Bash (5s)"`, `"idle at prompt · landed"`). Pure.
+/// `task` is the task's FACE as `status task=` prints it (`open`, `landed`,
+/// `theirs`; a sibling of an older build may print its own `done|spent`),
+/// never the worker's record: a landing reads `· landed` (§12.4.1).
 #[must_use]
 pub(crate) fn format_ai_cli_live_status(
     word: Option<&str>,

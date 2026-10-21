@@ -1,213 +1,97 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seamless handoff's OUT-OF-BAND transport: a single-use `AF_UNIX`
-//! rendezvous the outgoing process binds BEFORE it launches its successor, and
-//! that the successor dials back on.
+//! The seamless handoff's out-of-band transport: a single-use `AF_UNIX` rendezvous the outgoing
+//! process binds before it launches its successor, and that the successor dials back on.
 //!
-//! # Why this exists at all
+//! On macOS the overlap successor must be a launchd application job of its own, or the process
+//! that applied an update can never apply the next (`tests/handoff_launchd_job.rs`). A
+//! LaunchServices launch inherits no descriptors, so what the fork lane hands over by inheritance
+//! travels here: the PTY masters, the readiness pipe's write end and the Commit pipe's read end.
+//! The control socket cannot carry them, since every name in its address space is a server
+//! already bound and here the parent must move first. So the parent binds, the launch
+//! environment carries the path ([`ENV_RENDEZVOUS`]) and a fresh claim secret ([`ENV_CLAIM`]),
+//! and the successor dials back, which also gives this process a kernel-attested pid
+//! (`LOCAL_PEERPID`) for a process it did not fork, as `signal_handoff_candidate` requires.
 //!
-//! On macOS the overlap successor has to be a launchd APPLICATION job of its
-//! own, or the process that just applied an update can never apply the next one
-//! (`app_launch_successor` states the defect). A LaunchServices launch mints
-//! that job — and inherits no descriptors.
-//! Everything the fork lane hands over by inheritance therefore has to travel
-//! some other way: the PTY masters (`ATERM_SEAMLESS_FDS`), the readiness/proof
-//! pipe (`ATERM_HANDOFF_READY_FD`) and the Commit pipe
-//! (`ATERM_HANDOFF_COMMIT_FD`).
+//! `<dir>/seamless-<pid>-<16 hex of the attempt nonce>.sock`. Darwin's `sun_path` holds 103
+//! bytes, which under the control directory (`$HOME/Library/Application Support/aterm`) leaves
+//! too little room for many a `$HOME`, so the socket lives in [`rendezvous_dir`]: `$TMPDIR/aterm`,
+//! where `$TMPDIR` is launchd's per-user `/var/folders/…/T/`. The base is admitted only if `lstat`
+//! says it is a real directory owned by this uid, not group/other-writable and not `/tmp`-rooted
+//! (in sticky `/tmp` another uid could pre-plant the directory as a symlink); the control
+//! directory is the fallback. After the bind the node is re-proved to be our socket in our
+//! directory, and the dialer checks that the listener is this uid's and the attested parent's
+//! before it writes the secret ([`listener_may_receive_claim`]). The composed path is checked
+//! with `control_auth::sun_path_ok` before the bind ([`RendezvousError::PathTooLong`] sends the
+//! attempt to the fork lane), and [`rendezvous_path_fits`] asks the same before any nonce exists.
+//! [`Rendezvous`] unlinks its node on drop, and each bind sweeps nodes whose owner pid is dead.
 //!
-//! # Why a fresh listener and not the control socket
+//! # Single use
 //!
-//! The per-user control socket cannot address a process that does not exist yet
-//! — every name in that address space (`aterm-<pid>.sock`, the `latest` link,
-//! `graph/<sid>`) identifies an already-BOUND server, and here the parent is the
-//! side that must move first. So the direction is inverted: the parent binds,
-//! the launch carries the path plus a fresh claim secret in the environment, and
-//! the successor dials back. That also hands this process the first
-//! kernel-attested identity it can get for something it did not fork
-//! (`LOCAL_PEERPID` at accept), which is what `signal_handoff_candidate` needs
-//! before it may aim anything at a candidate launchd owns.
+//! One connection is served, one grant carrying every descriptor is sent (one message, or the
+//! chunked grant's few), and the socket is gone: no retry and no verb, unlike the long-lived
+//! control socket, where a handoff verb would outlive the attempt. The successor dials as soon as
+//! it has booted and waits, under its own grant budget, until the parent parks and sends the
+//! grant or closes the connection (the attempt stood down). A connection that presents the wrong
+//! secret is refused but the wait goes on until the deadline, so one `connect(2)` cannot deny an
+//! update ([`Rendezvous::accept_claim_observed`] has the bounds).
 //!
-//! # The name, and the 16 bytes of headroom it has
+//! # The three gates on the peer
 //!
-//! The socket is `<control dir>/seamless-<pid>-<32 hex nonce>.sock`. The prefix
-//! is load-bearing twice over: `seamless::discard_outgoing` already sweeps every
-//! entry beginning `seamless-<pid>-<nonce>`, so every rollback path unlinks this
-//! socket for free, and the nonce makes the path unguessable and unique per
-//! attempt so a bind can never collide with a concurrent one.
+//! * **The claim secret** — 32 CSPRNG bytes, published only in the successor's launch
+//!   environment, compared in constant time. It binds the connection to this attempt, not to the
+//!   successor: a process's initial environment stays readable to every same-uid process for its
+//!   whole life (`KERN_PROCARGS2`), and a successor that boot-applies and re-execs carries the
+//!   claim into its new image too.
+//! * **The kernel-attested peer pid** — `LOCAL_PEERPID`, compared with the pid LaunchServices
+//!   reports for the instance it started. Because a successor dials before its `NSApplication`
+//!   checks in, on the launched lane the pid corroborates after the dial, and a mismatch or an
+//!   exited launched process refuses before Commit.
+//! * **The dialer's code** ([`DialerCode`]) — the kernel's audit token (`LOCAL_PEERTOKEN`) names
+//!   the dialing process, and Security.framework checks its code against the successor's
+//!   requirement before any descriptor leaves, keeping out a same-uid process that copied the
+//!   secret. A check `trustd` does not answer holds the connection until `trustd` answers or the
+//!   dial deadline ([`Rendezvous::accept_claim_observed`]), and a refusal reaches the caller typed
+//!   ([`CodeRefusal`]).
 //!
-//! Darwin's `MAX_SUN_PATH` is 103 and that name is 87 bytes before its
-//! directory. Under the per-user control directory (`$HOME/Library/Application
-//! Support/aterm`) that left 16 bytes for `$HOME`: a six-letter short name
-//! (`/Users//abcdef`) fit with three to spare and a first and last name run
-//! together (`/Users//firstlastname`) — i.e. macOS's default short name for most
-//! people — did not, so most Macs silently took the fork lane the whole lane was
-//! built to replace (2026-08-19 review). The socket therefore lives in a SHORT
-//! per-uid private directory, [`rendezvous_dir`]: `$TMPDIR/aterm`, where `$TMPDIR`
-//! is the per-user temporary directory launchd hands every process
-//! (`/var/folders/…/T/`, owned by this uid, mode 0700 — a place no OTHER uid can
-//! plant an entry in, unlike sticky `/tmp`, which is exactly why `/tmp` is never
-//! used: a foreign uid could pre-create `/tmp/aterm-<uid>` as a symlink and either
-//! capture our chmod or redirect the bind into a directory it can read). The base
-//! is admitted only if `lstat` says it is a real directory owned by this uid and
-//! not group/other-writable and it is not `/tmp`-rooted; the `aterm` child is
-//! established with the lstat-hardened `aterm_update_core::ensure_private_dir`;
-//! after the bind the node is re-proved to be our socket inside our directory; and
-//! the DIALER proves the listener is same-uid (`getpeereid`) before it writes the
-//! claim secret. The control directory remains the fallback if `$TMPDIR` cannot be
-//! admitted, so the short-`$HOME` machines that always worked keep working. The
-//! name carries 16 hex of the attempt nonce (unique, unguessable; the CLAIM secret
-//! is separate and never on disk) so `<TMPDIR>/aterm/seamless-<pid>-<16 hex>.sock`
-//! fits `sun_path` with room to spare. The composed path is still checked with
-//! `control_auth::sun_path_ok` BEFORE the bind, and a refusal falls back to the
-//! fork lane rather than proceeding — [`Rendezvous::bind`] answers
-//! [`RendezvousError::PathTooLong`], and [`rendezvous_path_fits`] lets the lane
-//! choice ask the same question before any nonce exists (without creating
-//! anything). The prefix sweep in `seamless::discard_outgoing` runs over the
-//! control directory, not this one, so [`Rendezvous::bind`] sweeps this
-//! directory's leftovers itself: a socket whose embedded pid is dead is an attempt
-//! that can never be claimed.
+//! On Darwin the audit token and `LOCAL_PEERPID` name whichever process last used the connection
+//! and change at each use (`aterm_uds::peer`'s `the_peer_is_the_connections_last_user_read_live`),
+//! and an `exec` at the pid moves the token's pid version. So the gate reads the token once, right
+//! after the claim, requires it to name the attested pid, and judges that one token at every
+//! check; just before the `sendmsg` carrying the first descriptor it reads it again and sends
+//! nothing unless the kernel answers the same token ([`ClaimedPeer::transfer`]). The pid the
+//! parent registers, watches and kills as its candidate is the one that token names.
 //!
-//! # What "single-use" means here
+//! What the code gate leaves open:
 //!
-//! Exactly one connection is SERVED, exactly one grant carrying every
-//! descriptor is sent (one message, or for more than 62 sessions the chunked
-//! grant's few — see below), and then the socket is gone. There is no retry, no
-//! second grant, and no verb. The one served connection may be HELD between the
-//! claim and the grant (2026-09-19, the late park): the successor dials as soon
-//! as it has booted, holding nothing, and waits — under its own grant budget —
-//! for the outgoing process to park and send the grant, or for EOF, which is the
-//! parent standing the attempt down.
+//! - A same-uid process running genuine aterm code with the copied secret passes, and then holds
+//!   the sessions inside an aterm, which the PTY keeper's floor (its design §5.7) accepts: same-uid
+//!   code can already drive every session through the control socket. The pid corroboration still
+//!   refuses it before Commit when LaunchServices answers in time.
+//! - The token says who used the connection last, not who will read the grant. A same-uid process
+//!   can claim, keep a copy of the connection in a second process that never uses it, and exec a
+//!   genuine aterm (held still with `SIGSTOP` if need be) before the gate reads the token; the
+//!   copy then reads every descriptor. This is derived from the measured semantics, not run end to
+//!   end. The pid corroboration refuses such a dialer before Commit, but after the descriptors
+//!   left ([`RendezvousError::TransferPartial`]). Closing it needs a binding to the process that
+//!   presented the claim that later use cannot move (a Mach audit trailer, or a per-attempt secret
+//!   only signed aterm code can read); that design decision is open, and `aterm_keeper::identity`
+//!   has the same gap.
 //!
-//! A peer that presents the wrong secret is refused — but refusing a CONNECTION
-//! is not refusing the ATTEMPT, and an earlier shape here conflated the two:
-//! whoever connected first got the single accept, so any same-uid process could
-//! end an update by dialing before the successor did, for the price of one
-//! `connect(2)`. The wait now resumes after a refusal and only the deadline ends
-//! it, under the two bounds [`Rendezvous::accept_claim_observed`] documents.
+//! # The adoption proof's term
 //!
-//! This is still deliberately the opposite posture from the control socket,
-//! which is a long-lived token-authenticated verb dispatcher — a handoff verb
-//! there would outlive the attempt and be reachable by every same-uid process
-//! for as long as the terminal ran.
-//!
-//! # Three gates on the peer, and which one keeps a stranger out
-//!
-//! * THE CLAIM SECRET — 32 CSPRNG bytes, published only in the successor's
-//!   launch environment, compared in constant time. It binds the connection to
-//!   THIS attempt. It is NOT secret from this uid: a process's initial
-//!   environment stays readable to every same-uid process for the process's
-//!   whole life (`KERN_PROCARGS2`, what `ps eww` prints; clearing `environ`
-//!   does not touch that copy), and a successor an older build launched, which
-//!   boot-applies and re-execs, carries the claim into its new image's too. So the secret proves a dialer is about this
-//!   attempt, never that it is the successor.
-//! * THE KERNEL-ATTESTED PEER PID — `LOCAL_PEERPID`, compared with the pid
-//!   LaunchServices reports for the instance it started. A peer cannot assert
-//!   it, but LaunchServices answers only when the launched app checks in, and a
-//!   successor checks in after its grant (it dials before its `NSApplication`
-//!   exists), so on the launched lane the pid cannot gate the grant: it
-//!   corroborates after the dial, and a mismatch — or LaunchServices' word that
-//!   the process it launched has exited while the dialer lives — refuses before
-//!   Commit.
-//! * THE DIALER'S CODE ([`DialerCode`], round eight of the update audit, U36) —
-//!   the kernel's audit token for the connection (`LOCAL_PEERTOKEN`) names the
-//!   dialing process, and Security.framework checks the code it runs against
-//!   the requirement the successor's code meets: for every successor that runs
-//!   an update candidate under a pinned team — a fresh cached pass, a worker
-//!   that verifies again, an installed activation — an aterm release's own
-//!   requirement (identifier `com.aterm.aterm` and a Developer ID of the team
-//!   every candidate was verified against); only for a same-image handoff (the QA
-//!   seam, a launch-record renewal), or with no team pinned, the designated
-//!   requirement of the code the launch named. It is checked BEFORE any descriptor leaves, and it is what keeps
-//!   out a same-uid process that copied the secret and dials with its own code.
-//!   Until 2026-10-02 the launched lane had only the secret before the grant,
-//!   and any same-uid process that read it could take every PTY master and both
-//!   pipes. A check macOS's code-signing service (`trustd`) does not answer is
-//!   neither a pass nor a refusal: the connection is held until `trustd`
-//!   answers or the dial deadline ([`Rendezvous::accept_claim_observed`]), and a
-//!   refusal reaches the caller typed ([`CodeRefusal`]), so the attempt is
-//!   filed by its cause.
-//!
-//! WHOM THE CODE GATE JUDGES (U36's second review). The audit token is the
-//! kernel's answer AT THE MOMENT IT IS READ, for the process on the other end
-//! as it is then — and on Darwin that is the process that last USED the
-//! connection, not the one that `connect(2)`ed. Measured 2026-10-03 (round
-//! eight's U0 review): `LOCAL_PEERTOKEN` and `LOCAL_PEERPID` both name whichever
-//! process last wrote on the connection, and change at each use, and
-//! an `exec` at that pid moves the token's pid version while the pid stays
-//! (`a_grant_is_not_sent_once_the_dialers_image_changed`). So the gate never
-//! reads it twice as if it were one fact: it reads it ONCE, right after the
-//! claim; requires it to name the kernel-attested dialer pid; checks the code of
-//! exactly that token at the first check and at every recheck of a held dialer
-//! (a later image at the pid carries another pid version, and its lookup fails,
-//! `Unchecked`); and, just before the `sendmsg` that carries the first
-//! descriptor, reads it again and sends nothing unless the kernel still answers
-//! that same token, word for word ([`ClaimedPeer::transfer`], both grants). The
-//! pid the parent registers, watches and kills as its candidate is the pid that
-//! token names.
-//!
-//! What the code gate leaves, stated plainly:
-//!
-//! * A same-uid process that runs GENUINE aterm code with the copied secret
-//!   passes it — and then holds the sessions inside an aterm, as the PTY
-//!   keeper's floor (its design §5.7) accepts, since same-uid code can already
-//!   drive every session through the control socket's token and the hardened
-//!   runtime keeps it out of aterm's process. The pid corroboration still
-//!   refuses that dialer before Commit when LaunchServices answers in time.
-//! * The token names who used the connection LAST when it was read; it does not
-//!   say who will READ the grant, and it does not say who presented the claim.
-//!   A connection whose descriptor another process also holds, and which that
-//!   process does not use between the checks, reads the same before the
-//!   `sendmsg` as at the gate, and the grant goes to whichever process reads it.
-//!   Reaching that state takes NO cooperation from code that passed the gate
-//!   (an earlier version of this paragraph said it did): a same-uid process
-//!   can dial and claim, keep a copy of the connection in a second process that
-//!   never touches it, and replace its own image with a genuine aterm (any
-//!   invocation that stays up) before the gate reads the token — and it can
-//!   hold this process still across that `exec` (`SIGSTOP`, which any process
-//!   of the uid may send). The gate then judges a genuine aterm at the attested
-//!   pid, the check before the send finds it unchanged, and the copy reads every
-//!   descriptor. Derived from the measured semantics above, not run end to
-//!   end. The pid corroboration still refuses such a dialer before Commit when
-//!   LaunchServices answers in time, but after the descriptors left
-//!   (`TransferPartial`: the attested candidate is killed and proven dead, and
-//!   the copy keeps what it read). Closing it needs a binding to the process
-//!   that PRESENTED the claim that no later use of the connection can move —
-//!   a sender credential captured when the claim is sent (a Mach message's
-//!   audit trailer), or a per-attempt secret only aterm's signed code can read
-//!   — which is a change of this transport, left to a design decision (round
-//!   eight of the update audit, U36: fixed in part).
-//! * The PTY keeper's check of its peers is the same machinery, reading the
-//!   same token ONCE, at accept, and serving the connection after — orphaned
-//!   masters included — so it is open the same way (`aterm_keeper::identity`'s
-//!   module docs record it). The pending decision covers both consumers.
-//!
-//! # Why the adoption proof's fd-number term cannot come along
-//!
-//! `SCM_RIGHTS` hands the receiver the same OPEN FILE DESCRIPTIONS at whatever
-//! descriptor NUMBERS it happens to have free — measured on this machine: three
-//! masters sent, three different numbers received, the same PTY device minors.
-//! The fd-number term in `seamless::adoption_proof` is a property of one
-//! process's descriptor table, so under this transport the two sides would hash
-//! different values and every handoff would end in `AdoptionMismatch`. The
-//! replacement is [`pty_device_term`] — the PTY's own device number, which
-//! `dup`/`SCM_RIGHTS` preserve because it is a property of the open file
-//! description, and which a same-uid process cannot forge (minting a character
-//! device with a chosen `st_rdev` needs `mknod(2)`, i.e. root).
-//!
-//! THE TRANSPORT SELECTS THE TERM, WITH NO NEGOTIATION. A parent can only put
-//! descriptors out of band if it has out-of-band transport code, and a parent
-//! already in the field does not — it sends `ATERM_SEAMLESS_FDS` and is answered
-//! in v1 exactly as today. Presence of the transport IS the version, which makes
-//! "no parent in the field can ever be shown v2" a structural fact rather than an
-//! argument about gating. The other direction — a NEW parent handing off to an
-//! OLD successor — is closed by the lane choice in `app_update_handoff`, which
-//! refuses this lane unless the authorized `target_build` is at least this build.
+//! `SCM_RIGHTS` hands the receiver the same open file descriptions at whatever descriptor
+//! numbers it has free, so the fd-number term in `seamless::adoption_proof` would hash different
+//! values on the two sides. The replacement is [`pty_device_term`], the PTY's device number,
+//! which `dup`/`SCM_RIGHTS` preserve and a same-uid process cannot forge (`mknod(2)` needs root).
+//! The transport selects the term with no negotiation: presence of the transport is the version,
+//! and `app_update_handoff` refuses this lane unless the authorized `target_build` is at least
+//! this build.
 //!
 //! # The wire
 //!
-//! Two fixed-magic frames, both length-determined before any variable byte is
-//! read, so neither side ever waits on a length a peer chose freely:
+//! Fixed-magic frames whose length is known before any variable byte is read:
 //!
 //! ```text
 //! successor -> parent   "ATRZ1C" + 64 hex claim chars           (70 bytes, fixed)
@@ -215,26 +99,19 @@
 //!                       + body: "<nonce>\n<lid>:<pid>,<lid>:<pid>\n[park_us=<µs>\n]"
 //! ```
 //!
-//! The body's optional last line is THE PARK STAMP: elapsed time from the parent's
-//! park to its sample before encoding and sending the grant, on the parent's clock.
-//! The successor subtracts it from its recorded claim time to project a `park` point.
-//! Thus `proof - park` sums parent park→sample and successor claim→proof; the
-//! sample→claim interval is excluded. This is an observation, not clock alignment. A
-//! grant without it (a parent from before it) reads as no stamp; a successor from
-//! before it never receives one, because this lane hands off only to a target build
-//! at least as new as the parent's (the lane choice above).
+//! The body's optional last line is the park stamp: elapsed time from the parent's park to its
+//! sample before encoding and sending the grant, on the parent's clock. The successor subtracts
+//! it from its recorded claim time to project a `park` point, so `proof - park` sums parent
+//! park→sample and successor claim→proof (an observation, not clock alignment). A grant without
+//! it reads as no stamp.
 //!
-//! The DESCRIPTORS ride the 8-byte header message — one `sendmsg`, so they are
-//! all present the instant the receiver dequeues its first byte — in this order:
-//! every PTY master in the body's order, then the readiness pipe's write end,
-//! then the Commit pipe's read end.
+//! The descriptors ride the 8-byte header message in one `sendmsg`, so they are all present the
+//! instant the receiver dequeues its first byte, in this order: every PTY master in the body's
+//! order, then the readiness pipe's write end, then the Commit pipe's read end.
 //!
-//! # The chunked grant (more than 62 sessions)
-//!
-//! One message carries at most [`fdpass::MAX_FDS`] descriptors, and two of them
-//! are the pipes, so the grant above tops out at 62 sessions. A successor that
-//! can take MORE says so in its claim, and only a parent that offered it the
-//! capability hears that:
+//! One message carries at most [`fdpass::MAX_FDS`] descriptors, two of them the pipes, so that
+//! grant tops out at 62 sessions. A successor that can take more says so in its claim, and only
+//! when the parent offered it the capability:
 //!
 //! ```text
 //! parent env            ATERM_HANDOFF_GRANT_CAPS=chunks1   (only to a candidate whose
@@ -245,41 +122,25 @@
 //!                       + chunks-1 × "ATRZ2K" + u8 chunk index    (7 bytes each)
 //! ```
 //!
-//! The header message carries the first descriptors, each continuation message
-//! the next, at most [`fdpass::MAX_FDS`] per message and in the same order as the
-//! one-message grant; the readiness and Commit ends always travel in the last one
-//! ([`grant_chunk_sizes`] is the one layout both sides compute). The parent sends
-//! `ATRZ2G` only after an `ATRZ2C` claim and only for more than 62 sessions: up to
-//! 62 the grant is `ATRZ1G`, byte for byte, whatever the claim said, and an
-//! `ATRZ1C` claimant is never sent `ATRZ2G` (it would refuse the magic) — a pool
-//! it cannot take is refused before any descriptor leaves. The receiver takes
-//! every message under the one grant deadline, requires exactly the layout for
-//! the body's session count (so the total is sessions + 2, at most 258), and on
-//! any refusal drops — closes — every descriptor it received. Position is ADDRESSING only (which received
-//! descriptor is which `local_id`); it proves nothing, which is precisely why
-//! the proof term is the device number and not the ordinal — an ordinal names a
-//! slot, so it detects a permutation and never a substitution. The body carries
-//! no descriptor numbers at all: a launched process inherits none, so any number
-//! written here would name whatever LaunchServices left in the successor's table.
+//! Each message carries at most [`fdpass::MAX_FDS`] descriptors in the one-message order, the pipe
+//! ends always in the last ([`grant_chunk_sizes`] is the layout both sides compute). Up to 62
+//! sessions the grant is `ATRZ1G` whatever the claim said, and a pool an `ATRZ1C` claimant cannot
+//! take is refused before any descriptor leaves ([`grant_shape`]). The receiver takes every message
+//! under one deadline, requires exactly the layout for the body's session count, and on any
+//! refusal closes every descriptor it received. Position is addressing only (which descriptor is
+//! which `local_id`) and proves nothing, which is why the proof term is the device number. The
+//! body carries no descriptor numbers: a launched process inherits none.
 //!
-//! # Every failure is a refusal
+//! # Failures
 //!
-//! Nothing here half-transfers a session. Before the send, no descriptor of ours
-//! has left the process and the parent may roll back with no candidate to prove
-//! anything about. After it, the successor holds copies and the ordinary
-//! reject/reap path owns the outcome. There is no state in between, because the
-//! descriptors and the header are one `sendmsg`. The chunked grant keeps that
-//! line at its FIRST `sendmsg`: from there every failure, a continuation's
-//! included, is the partial transfer the parent owes a proof for, and a
-//! successor holding only some chunks refuses the grant and closes them all.
+//! Nothing here half-transfers a session. Before the descriptor-carrying `sendmsg` nothing of ours
+//! has left and the parent may roll back; after it the successor holds copies and the ordinary
+//! reject/reap path owns the outcome. The chunked grant draws that line at its first `sendmsg`:
+//! every later failure is a partial transfer, and a successor holding only some chunks refuses
+//! the grant and closes them all.
 //!
-//! # Platform
-//!
-//! macOS only, and gated as such at the `mod` declaration rather than by a
-//! runtime check, for two independent reasons: the lane exists to mint a launchd
-//! application job, and [`pty_device_term`] is a Darwin reading (see its docs).
-//! Building it elsewhere would compile a transport nothing can take and a proof
-//! term that would not distinguish.
+//! macOS only, gated at the `mod` declaration: the lane exists to mint a launchd application job,
+//! and [`pty_device_term`] reads a Darwin fact.
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, BorrowedFd, IntoRawFd as _, OwnedFd};
@@ -290,24 +151,21 @@ use aterm_uds::{CtlListener, CtlStream, fdpass};
 
 use crate::handoff_env::HandoffName;
 
-/// The rendezvous socket path published to the successor. Its absence is what
-/// makes the fork lane the fork lane, with no version byte anywhere.
+/// The rendezvous socket path published to the successor. Its absence selects the fork lane;
+/// there is no version byte.
 pub(crate) const ENV_RENDEZVOUS: HandoffName = crate::seamless::ENV_RENDEZVOUS;
 /// The claim secret published to the successor.
 pub(crate) const ENV_CLAIM: HandoffName = crate::seamless::ENV_CLAIM;
 
-/// Random bytes in the claim secret, and so half its hex length. The same width
-/// `control_auth` mints capability tokens at: the secret only has to survive one
-/// attempt, but there is no reason to spend less entropy on it than on a token
-/// that lives for a whole session.
+/// Random bytes in the claim secret (half its hex length): the width `control_auth` mints
+/// capability tokens at.
 const CLAIM_SECRET_BYTES: usize = 32;
 const CLAIM_HEX_LEN: usize = CLAIM_SECRET_BYTES * 2;
 const CLAIM_MAGIC: &[u8; 6] = b"ATRZ1C";
 const CLAIM_FRAME_LEN: usize = CLAIM_MAGIC.len() + CLAIM_HEX_LEN;
 const GRANT_MAGIC: &[u8; 6] = b"ATRZ1G";
-/// The claim of a successor that reads the CHUNKED grant: the same secret,
-/// under a magic that says so. Presented only when the parent published
-/// [`GRANT_CAPS_CHUNKS`] in [`ENV_GRANT_CAPS`].
+/// The claim of a successor that reads the chunked grant: the same secret under its own magic,
+/// presented only when the parent published [`GRANT_CAPS_CHUNKS`] in [`ENV_GRANT_CAPS`].
 const CLAIM_CHUNKS_MAGIC: &[u8; 6] = b"ATRZ2C";
 /// The chunked grant's header: magic, `u16` big-endian body length, `u8` count
 /// of descriptor-bearing messages (this one included).
@@ -323,59 +181,45 @@ const GRANT_CONTINUATION_LEN: usize = GRANT_CONTINUATION_MAGIC.len() + 1;
 /// verified bundle declares them (`ATermHandoffGrantChunks`); consumed by
 /// [`claim_incoming`].
 pub(crate) const ENV_GRANT_CAPS: HandoffName = HandoffName::new("ATERM_HANDOFF_GRANT_CAPS");
-/// The capability token for the chunked grant — also the value of the bundle's
+/// The capability token for the chunked grant, also the value of the bundle's
 /// `ATermHandoffGrantChunks` key (`aterm_update::HANDOFF_GRANT_CHUNKS_TOKEN`).
 pub(crate) const GRANT_CAPS_CHUNKS: &str = "chunks1";
 
-/// The most sessions a CHUNKED grant carries: the protocol's own ceiling.
+/// The most sessions a chunked grant carries: the protocol's own ceiling.
 pub(crate) const MAX_CHUNKED_SESSIONS: usize = crate::seamless::MAX_HANDOFF_SESSIONS;
 /// The most descriptors one grant carries: every session plus the two pipes.
 const MAX_GRANT_FDS: usize = MAX_CHUNKED_SESSIONS + RENDEZVOUS_CHANNEL_FDS;
 /// The most messages one chunked grant spans ([`grant_chunk_sizes`] of
 /// [`MAX_CHUNKED_SESSIONS`]); a header naming more is refused before its body.
 const MAX_GRANT_CHUNKS: usize = MAX_GRANT_FDS.div_ceil(fdpass::MAX_FDS);
-/// Magic plus a `u16` big-endian body length. FIXED, and read before the body,
-/// so the receiver never sizes a buffer from a number it has not yet framed.
+/// Magic plus a `u16` big-endian body length, fixed and read before the body, so the receiver
+/// never sizes a buffer from a number it has not framed.
 const GRANT_HEADER_LEN: usize = GRANT_MAGIC.len() + 2;
-/// Ceiling on the grant body. The protocol's own 256-session limit cannot
-/// approach it; it exists so a malformed length is refused before an allocation,
-/// not to express a real budget.
+/// Ceiling on the grant body, far above what 256 sessions need: a malformed length is refused
+/// before an allocation.
 const MAX_GRANT_BODY_BYTES: usize = 32 * 1024;
 
 /// Descriptors this transport carries beyond the PTY masters: the readiness
 /// pipe's write end and the Commit pipe's read end.
 pub(crate) const RENDEZVOUS_CHANNEL_FDS: usize = 2;
 
-/// The most sessions ONE-MESSAGE grant (`ATRZ1G`) hands over this lane.
-///
-/// `fdpass` carries at most [`fdpass::MAX_FDS`] descriptors in one message, and
-/// this transport spends two of them on the readiness and Commit pipes. The
-/// protocol's own ceiling (`seamless`'s `MAX_HANDOFF_SESSIONS`, 256) is four
-/// times larger, so for a successor that did not declare the chunked grant THIS
-/// is the binding constraint and the lane check has to test it
-/// ([`grant_session_limit`]): a parent with 63 panes must fall back to the fork
-/// lane rather than discover at `sendmsg` time that its handoff does not fit,
-/// with the terminal already parked. A successor that declared it takes up to
-/// [`MAX_CHUNKED_SESSIONS`].
+/// The most sessions the one-message grant (`ATRZ1G`) carries: [`fdpass::MAX_FDS`] less the
+/// two pipes. For a successor without the chunked grant this, not the protocol's 256, is the
+/// bound the lane check tests ([`grant_session_limit`]), so a parent with more panes takes the
+/// fork lane instead of failing at `sendmsg` with the terminal parked.
 pub(crate) const MAX_RENDEZVOUS_SESSIONS: usize = fdpass::MAX_FDS - RENDEZVOUS_CHANNEL_FDS;
 
-/// Which of the two ceilings actually binds, asserted at COMPILE time because a
-/// build where it flipped would be one where the lane check tests the wrong
-/// number — and that failure surfaces at `sendmsg`, with the user's terminal
-/// already parked, rather than as a fallback.
-///
-/// 256 is `seamless`'s `MAX_HANDOFF_SESSIONS`, restated rather than imported
-/// because it is private there. If it ever drops below this transport's ceiling,
-/// this stops compiling and the lane check has to start consulting both.
+/// The transport, not the protocol, bounds the one-message grant (256 is
+/// `seamless::MAX_HANDOFF_SESSIONS`). Checked at compile time because a flip would surface at
+/// `sendmsg` with the terminal parked instead of as a fallback.
 const _: () = assert!(
     MAX_RENDEZVOUS_SESSIONS < 256,
     "the transport, not the protocol, is what bounds this lane"
 );
 
-/// How many sessions ONE grant may carry: [`MAX_CHUNKED_SESSIONS`] when the
-/// successor declared the chunked grant, [`MAX_RENDEZVOUS_SESSIONS`] otherwise.
-/// The one number the lane choice, the park and [`ClaimedPeer::transfer`] all
-/// bound the pool by.
+/// How many sessions one grant may carry: [`MAX_CHUNKED_SESSIONS`] when the successor declared
+/// the chunked grant, else [`MAX_RENDEZVOUS_SESSIONS`]. The lane choice, the park and
+/// [`ClaimedPeer::transfer`] all bound the pool by it.
 #[must_use]
 pub(crate) const fn grant_session_limit(chunks: bool) -> usize {
     if chunks {
@@ -394,12 +238,11 @@ enum GrantShape {
     Chunked,
 }
 
-/// THE PARENT'S GRANT DECISION for a dialer that claimed the chunked grant
-/// (`chunks`, an `ATRZ2C` claim) or not, with `sessions` to hand over: the
-/// one-message grant whenever one message carries them — whatever the claim —
-/// the chunked grant only past that and only to an `ATRZ2C` claim, and a refusal
-/// before any descriptor leaves otherwise. The `NativeUpdateRendezvousGrant`
-/// model's `GrantOne` / `GrantChunks` / `RefuseTooMany`, and its Tier-1 bind.
+/// The parent's grant for a dialer that claimed the chunked grant (`chunks`, an `ATRZ2C` claim)
+/// or not, with `sessions` to hand over: the one-message grant whenever one message carries
+/// them, whatever the claim; past that the chunked grant, only to an `ATRZ2C` claim; otherwise a
+/// refusal before any descriptor leaves. The `NativeUpdateRendezvousGrant` model's `GrantOne`,
+/// `GrantChunks` and `RefuseTooMany`.
 fn grant_shape(chunks: bool, sessions: usize) -> Result<GrantShape, RendezvousError> {
     let limit = grant_session_limit(chunks);
     if sessions == 0 || sessions > limit {
@@ -412,12 +255,10 @@ fn grant_shape(chunks: bool, sessions: usize) -> Result<GrantShape, RendezvousEr
     })
 }
 
-/// THE CHUNKED GRANT'S LAYOUT for `sessions` sessions: how many descriptors each
-/// message carries, in order. Every message but the last carries
-/// [`fdpass::MAX_FDS`] masters; the last carries the rest of the masters and then
-/// the readiness and Commit ends, and it stands alone when the masters left no
-/// room for both. Both sides compute it — the parent to send, the successor to
-/// require exactly what arrives — so there is no count on the wire to believe.
+/// The chunked grant's layout for `sessions` sessions: how many descriptors each message
+/// carries, in order. Masters fill messages of [`fdpass::MAX_FDS`]; the readiness and Commit ends
+/// close the last, in a message of their own when the masters leave no room for both. Both
+/// sides compute it, so there is no count on the wire to believe.
 #[must_use]
 fn grant_chunk_sizes(sessions: usize) -> Vec<usize> {
     let mut sizes = Vec::new();
@@ -443,59 +284,35 @@ fn grant_chunk_sizes(sessions: usize) -> Vec<usize> {
 /// instead, never asked again ([`admit_code`]).
 const CODE_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long one `poll` slice waits before the accept loop re-checks the caller's
-/// abort predicate and the deadline. Short enough that a cancel poke during a
-/// long successor boot is noticed promptly, long enough that the loop is not a
-/// spin.
+/// How long one `poll` slice waits before the accept loop re-checks the abort predicate and the
+/// deadline: a cancel is noticed promptly without spinning.
 const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(10);
 
-/// The most of the attempt's budget ONE connection may spend presenting its
-/// claim frame.
-///
-/// The attempt deadline cannot be the only bound on that read: until the frame
-/// is checked the peer is an unknown same-uid process, and an unknown peer that
-/// connects and then says nothing would otherwise hold the whole handoff — the
-/// user's terminal parked — for as long as it cared to. A real successor has
-/// composed all 70 bytes before it dials and writes them in a single call, so
-/// seconds is generous by orders of magnitude; the cost of being wrong is a
-/// refused connection on a lane that keeps accepting, and the cost of having no
-/// inner bound at all is the whole update.
+/// The most of the attempt's budget one connection may spend presenting its claim frame. Until
+/// the frame is checked the peer is an unknown same-uid process, which could otherwise hold the
+/// parked terminal for the whole deadline by saying nothing; a real successor writes all 70
+/// bytes in one call.
 const CLAIM_FRAME_BUDGET: Duration = Duration::from_secs(2);
 
-/// How many connections may be refused before the attempt gives up.
-///
-/// Refusing and continuing is what stops one wrong dialer from denying the
-/// update (see [`Rendezvous::accept_claim_observed`]), but "keep accepting" must not
-/// become "can be kept busy for free": a peer that connects and resets in a
-/// tight loop would otherwise spin this thread for the rest of the deadline.
-/// The cap is far above anything a real machine produces — the path is
-/// unguessable, so the expected number of wrong dialers is zero — and it turns
-/// a free denial into one an attacker has to sustain.
+/// How many connections may be refused before the attempt gives up, so a peer that connects and
+/// resets in a loop cannot spin this thread for the rest of the deadline. The path is
+/// unguessable, so a real machine sees no wrong dialers at all.
 const MAX_REFUSED_DIALS: usize = 32;
 
-/// The floor on a socket read/write timeout. `set_read_timeout(Some(ZERO))` is
-/// an error in std ("cannot set a 0 duration timeout") and a deadline that has
-/// just expired computes exactly that — so every remaining-time computation is
-/// clamped here, and expiry is reported by the deadline check rather than by a
-/// confusing `InvalidInput` from a socket option.
+/// The floor on a socket read/write timeout: std refuses a zero timeout, which a deadline that
+/// has just expired computes, so every remaining-time computation is clamped here and expiry is
+/// reported by the deadline check instead of an `InvalidInput` from a socket option.
 const MIN_IO_TIMEOUT: Duration = Duration::from_millis(1);
 
-/// Why a rendezvous did not produce a transferred handoff.
-///
-/// Every variant is the caller's cue to keep the user's windows. The split is
-/// finer than a string because the two sides want different things from it: the
-/// parent maps some of these onto "fall back to the fork lane" and the rest onto
-/// "roll this attempt back", while the successor treats every one of them as
-/// "exit before starting a window" — a successor that cannot claim its handoff
-/// must never present itself as a fresh terminal, because the parent still owns
-/// every session it was going to adopt.
+/// Why a rendezvous did not produce a transferred handoff. Every variant means keep the user's
+/// windows: the parent maps each onto a fork-lane fallback or a rollback, and the successor exits
+/// before starting a window, since the parent still owns every session it was to adopt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RendezvousError {
     /// No per-user control directory: there is nowhere private to bind.
     NoControlDir,
-    /// The composed path does not fit `sockaddr_un` on this platform. Both
-    /// `bind` and `connect` would fail `EINVAL`, and a fail-safe liveness probe
-    /// would misread that as "maybe live" — so it is named here instead.
+    /// The composed path does not fit `sockaddr_un` on this platform. `bind` and `connect` would
+    /// fail `EINVAL`, which a fail-safe liveness probe would misread as "maybe live".
     PathTooLong { path: String, limit: usize },
     /// More sessions than the successor's claim lets one grant carry: one
     /// `SCM_RIGHTS` message ([`MAX_RENDEZVOUS_SESSIONS`]) for an `ATRZ1C` claim,
@@ -506,88 +323,65 @@ pub(crate) enum RendezvousError {
     Secret(String),
     /// `bind`, the permission tightening, or the non-blocking switch failed.
     Bind(String),
-    /// The caller's abort predicate fired. For the handoff worker that is a
-    /// cancel poke — structural activity — and it is classified as such.
+    /// The caller's abort predicate fired (for the handoff worker, a cancel poke).
     Cancelled,
-    /// The deadline expired with no usable dial. NOT proof that no successor
-    /// exists; it IS proof that no descriptor of ours ever left this process.
+    /// The deadline expired with no usable dial: not proof that no successor exists, but proof that
+    /// no descriptor of ours left this process.
     Deadline,
     /// `accept`, or reading the claim frame off the accepted connection, failed.
     Accept(String),
-    /// A connection arrived and did not present this attempt's secret. Refused
-    /// without a second chance: this socket serves one attempt.
+    /// A connection did not present this attempt's secret.
     Claim,
     /// The kernel says the dialer is not the process LaunchServices started.
     PeerPid { expected: i32, actual: i32 },
     /// The kernel would not attest the peer at all.
     PeerUnattested(String),
-    /// The dialer (the kernel-attested `pid`) presented the secret and its code
-    /// was not admitted ([`DialerCode`]): refused, or not checked, and which,
-    /// typed ([`CodeRefusal`]), so the attempt is filed by its cause. Either way
-    /// no descriptor goes to it.
+    /// The dialer (the kernel-attested `pid`) presented the secret and its code was not admitted
+    /// ([`DialerCode`]); [`CodeRefusal`] says whether it was refused or not checked. No descriptor
+    /// goes to it.
     PeerCode { pid: i32, refusal: CodeRefusal },
-    /// The transfer failed BEFORE the one descriptor-carrying `sendmsg`
-    /// succeeded — an unencodable grant, a socket the write timeout would not
-    /// take, or the `sendmsg` itself. No descriptor of ours left this process,
-    /// which is the whole of what `NeverTransferred` rests on.
+    /// The transfer failed before the descriptor-carrying `sendmsg` succeeded (an unencodable
+    /// grant, a socket the write timeout would not take, or the `sendmsg` itself). No descriptor
+    /// of ours left this process, which is all `NeverTransferred` rests on.
     TransferNotSent(String),
-    /// The grant's own deadline (the parent's proof deadline) had passed when
-    /// the grant was about to be sent: a successor DID dial and was held, and
-    /// this process's preparation after the park outran the budget (round six
-    /// of the update audit, item 48). Like [`Self::TransferNotSent`], no
-    /// descriptor of ours left — but it is a deadline that ran out here, not a
-    /// refusal, and it used to read as [`Self::Deadline`]'s "no successor
-    /// dialed".
+    /// The grant's own deadline (the parent's proof deadline) passed before the grant was sent: a
+    /// successor dialed and was held, and the preparation after the park outran the budget. As
+    /// with [`Self::TransferNotSent`] no descriptor left, but it is not [`Self::Deadline`]'s "no
+    /// successor dialed".
     GrantDeadline,
-    /// The descriptors LEFT (the `sendmsg` succeeded) and a write after it — the
-    /// tail of a short header send, the body, the flush — failed (2026-09-14).
-    /// The peer holds duplicates of every master and both pipes; a successor
-    /// that receives descriptors and no body refuses the grant and exits, but
-    /// the parent may not ASSUME that: this is the ordinary kill-and-prove
-    /// disposition, never `NeverTransferred`. Before this both shapes were one
-    /// variant and the warrant's stated proof was not what the code established.
+    /// The descriptors left (the `sendmsg` succeeded) and a write after it (the tail of a short
+    /// header send, the body, the flush) failed. The peer holds duplicates of every master and
+    /// both pipes; a successor that receives descriptors and no body refuses the grant and exits,
+    /// but the parent may not assume so: this is the ordinary kill-and-prove disposition, never
+    /// `NeverTransferred`.
     TransferPartial(String),
 
-    /// SUCCESSOR SIDE: this successor's own dial or grant budget
-    /// ([`ClaimDeadlines`]) ran out before the grant arrived — what
-    /// [`Self::Deadline`] means from THIS side, whose "no successor dialed"
-    /// would be said by the successor that did (round six of the update
-    /// audit, item 48).
+    /// Successor side: this successor's own dial or grant budget ([`ClaimDeadlines`]) ran out
+    /// before the grant arrived, which is [`Self::Deadline`] seen from this side.
     ClaimDeadline,
-    /// SUCCESSOR SIDE: the launch environment carries no rendezvous.
+    /// Successor side: the launch environment carries no rendezvous.
     NoRendezvous,
-    /// SUCCESSOR SIDE: exactly ONE of the two rendezvous variables is set.
-    ///
-    /// [`rendezvous_present`] deliberately answers yes to half an environment —
-    /// half a rendezvous is corruption, not absence, and degrading it into "no
-    /// handoff" would start a fresh window over a parent's live sessions. But it
-    /// is not [`RendezvousError::NoRendezvous`] either, and the difference is not
-    /// cosmetic: the caller wraps whatever comes back in "this launch carries a
-    /// rendezvous but could not claim it (...)", so answering the absence error
-    /// made the one line a failed update leaves behind contradict itself at
-    /// exactly the moment someone is reading it to find out what happened. This
-    /// variant says which half arrived and which did not.
+    /// Successor side: exactly one of the two rendezvous variables is set. Half a rendezvous is
+    /// corruption, not absence ([`rendezvous_present`] answers yes to it), and naming which half
+    /// arrived keeps the caller's "carries a rendezvous but could not claim it" line from
+    /// contradicting itself.
     HalfRendezvous {
         present: HandoffName,
         missing: HandoffName,
     },
-    /// SUCCESSOR SIDE: a rendezvous variable is present but unusable. Present
-    /// and malformed is corruption, not absence, so it must not degrade into
-    /// "no handoff" and start a fresh window over a parent's live sessions.
+    /// Successor side: a rendezvous variable is present but malformed: corruption, not absence,
+    /// so it must not degrade into "no handoff" and start a fresh window over a parent's live
+    /// sessions.
     Env(HandoffName),
-    /// SUCCESSOR SIDE: `connect` failed — most often because the parent already
-    /// gave up and unlinked the socket, which is exactly how a late dial is
-    /// meant to fail.
+    /// Successor side: `connect` failed, most often because the parent already gave up and unlinked
+    /// the socket, which is how a late dial is meant to fail.
     Dial(String),
-    /// SUCCESSOR SIDE: the grant frame was absent, short, mis-magicked, or its
-    /// body did not parse.
+    /// Successor side: the grant frame was absent, short, mis-magicked, or its body did not parse.
     Grant(String),
-    /// SUCCESSOR SIDE: the grant is for a different attempt than the manifest
-    /// environment names.
+    /// Successor side: the grant is for a different attempt than the manifest environment names.
     NonceMismatch,
-    /// SUCCESSOR SIDE: the descriptor count does not match the body. Fatal
-    /// rather than truncating — adopting a subset would hand the parent a proof
-    /// over a session set it never authorized.
+    /// Successor side: the descriptor count does not match the body. Fatal rather than truncating:
+    /// adopting a subset would hand the parent a proof over a session set it never authorized.
     DescriptorCount { expected: usize, received: usize },
 }
 
@@ -661,31 +455,17 @@ impl std::fmt::Display for RendezvousError {
     }
 }
 
-/// The PTY's own identity — the term the adoption proof hashes once the masters
-/// travel out of band.
+/// The PTY's own identity, the term the adoption proof hashes when the masters travel out of
+/// band: `fstat(2)`'s `st_rdev` on a PTY master. `/dev/ptmx` is a cloning device, so each open
+/// takes its own minor (its slave's `/dev/ttysNNN`), and `dup`/`SCM_RIGHTS` keep the open file
+/// description and so the value. `st_ino`/`st_dev` would not do: every master shares the one
+/// `/dev/ptmx` node. A same-uid process cannot make `fstat` lie, and to answer a given device
+/// number it must hold that very PTY, where an fd number is whatever `dup2` makes it.
 ///
-/// `fstat(2)`'s `st_rdev` on a PTY master. `/dev/ptmx` is a CLONING device, so
-/// every open takes its own minor — that minor is the `/dev/ttysNNN` its slave
-/// gets — and `dup`/`SCM_RIGHTS` hand over the same open file description and
-/// therefore the same value. `st_ino`/`st_dev` are NOT usable in its place:
-/// every master shares the single `/dev/ptmx` devfs node, so they are equal
-/// across unrelated PTYs and a substitution would be invisible.
-///
-/// STRICTLY STRONGER THAN THE FD NUMBER IT REPLACES. A same-uid process cannot
-/// make `fstat` lie about a descriptor the caller already holds, and to ANSWER a
-/// given device number it has to hold that very PTY; the fd number, by contrast,
-/// is an integer any process may put on any descriptor with `dup2`.
-///
-/// PLATFORM: this reading is a Darwin fact, and it is why this module is macOS
-/// only. Linux exposes the same distinction as `ioctl(fd, TIOCGPTN)` while its
-/// `st_rdev` is the one `/dev/ptmx` node for every master — the value would not
-/// distinguish there. If this lane ever reaches another Unix, this function is
-/// the thing that has to change first, and the lane must not be enabled there
-/// until it has.
-///
-/// `dev_t` is `i32` on Darwin and `u64` on Linux, so the value is widened
-/// through `i128` before narrowing: the same expression is then honest on both,
-/// and neither can wrap into a plausible-looking wrong answer.
+/// A Darwin fact, and why this module is macOS only: on Linux every master's `st_rdev` is the
+/// one `/dev/ptmx` node (the minor is `ioctl(TIOCGPTN)`), so this must change before the lane
+/// runs on another Unix. `dev_t` is `i32` on Darwin and `u64` on Linux; widening through `i128`
+/// keeps either from wrapping into a plausible wrong value.
 #[must_use]
 pub(crate) fn pty_device_term(master: i32) -> Option<i32> {
     if master < 0 {
@@ -703,18 +483,11 @@ pub(crate) fn pty_device_term(master: i32) -> Option<i32> {
     i32::try_from(i128::from(info.st_rdev)).ok()
 }
 
-/// Re-express one attempt's adoption identities in the term THIS transport can
-/// prove, leaving the identities themselves untouched.
-///
-/// The middle field of a `SessionIdentity` is a TRANSPORT COORDINATE: on the
-/// fork lane it is the descriptor number both sides agree on because `execve`
-/// copies the table verbatim, and here it is the PTY that descriptor names.
-/// `local_id` and `pid` mean the same thing in any process and pass through
-/// unchanged.
-///
-/// `None` when any master will not answer `fstat` — a refusal, not a degrade: a
-/// proof missing one term would be a proof over a different session set than the
-/// one being handed over.
+/// Re-express an attempt's adoption identities in this transport's term. The middle field of a
+/// `SessionIdentity` is a transport coordinate: on the fork lane the descriptor number `execve`
+/// preserves, here [`pty_device_term`] of that descriptor; `local_id` and `pid` pass through.
+/// `None` when any master will not answer `fstat`: a proof missing a term would cover a
+/// different session set.
 #[must_use]
 pub(crate) fn proof_identities_in_device_terms(
     identities: &[crate::seamless::SessionIdentity],
@@ -725,11 +498,10 @@ pub(crate) fn proof_identities_in_device_terms(
         .collect()
 }
 
-/// The rendezvous path one attempt binds, composed from the SAME pieces
-/// `seamless::write_outgoing` names its manifest with — this process's pid and
-/// the attempt nonce (its first 16 hex: unique and unguessable; the claim secret
-/// is the authority and never touches the filesystem) — so the name is unique per
-/// attempt and names its owner.
+/// The rendezvous path one attempt binds: this process's pid and the first
+/// [`RENDEZVOUS_NONCE_HEX`] hex of the attempt nonce, the pieces `seamless::write_outgoing` names
+/// its manifest with, so the name is unique per attempt and names its owner. The claim secret,
+/// never on disk, is the authority.
 fn rendezvous_path(dir: &Path, nonce: &str) -> PathBuf {
     let short = &nonce[..nonce.len().min(RENDEZVOUS_NONCE_HEX)];
     dir.join(format!("seamless-{}-{short}.sock", std::process::id()))
@@ -738,24 +510,20 @@ fn rendezvous_path(dir: &Path, nonce: &str) -> PathBuf {
 /// How much of the attempt nonce the socket name carries.
 const RENDEZVOUS_NONCE_HEX: usize = 16;
 
-/// The per-user temporary base the rendezvous directory hangs off, ADMITTED only
-/// when it is a place no other uid can plant an entry in: `lstat` says a real
-/// directory (not a symlink), owned by this uid, not group/other-writable, and not
-/// `/tmp`-rooted (sticky, world-writable — the one base that must never be used).
-/// `std::env::temp_dir` is `$TMPDIR` with a `/tmp` fallback; launchd sets `$TMPDIR`
-/// to the per-user `/var/folders/…/T/` for everything it starts, and anyone who can
-/// set this process's environment is already inside its trust boundary. (Not
-/// `confstr(_CS_DARWIN_USER_TEMP_DIR)`: see `aterm_pty::unix` for why that call is
-/// unsafe in a process that forks.)
+/// The per-user temporary base the rendezvous directory hangs off, admitted only where no other
+/// uid can plant an entry: `lstat` says a real directory owned by this uid, not
+/// group/other-writable, and not `/tmp`-rooted. `std::env::temp_dir` reads `$TMPDIR`, which
+/// launchd sets to the per-user `/var/folders/…/T/` for everything it starts, and whoever sets
+/// this process's environment is already inside its trust boundary. With `$TMPDIR` unset, std
+/// falls back to `confstr(_CS_DARWIN_USER_TEMP_DIR)`, whose fork hazard `aterm_pty::unix`
+/// describes.
 #[cfg(unix)]
 fn admitted_temp_base() -> Option<PathBuf> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let base = std::env::temp_dir();
-    // ABSOLUTE ONLY. `$TMPDIR` is whatever the environment says; a relative value
-    // (`TMPDIR=tmp`) composes a relative socket path that binds fine against THIS
-    // process's cwd and then cannot be dialed by a LaunchServices successor, whose
-    // cwd is `/` — the parent parks its terminal for the full readiness deadline and
-    // the fork fallback is never taken, on every attempt (2026-08-19 round-4 audit).
+    // Absolute only: a relative `$TMPDIR` binds against this process's cwd, which a LaunchServices
+    // successor (cwd `/`) cannot dial, so every attempt would park for the whole readiness deadline
+    // and never fall back to the fork lane.
     if !base.is_absolute() {
         return None;
     }
@@ -772,9 +540,9 @@ fn admitted_temp_base() -> Option<PathBuf> {
     Some(base)
 }
 
-/// The directory the rendezvous socket lives in, WITHOUT creating anything — the
-/// lane-choice probe asks this every check and must not mutate the filesystem.
-/// `None` means the control directory (the fallback).
+/// The directory the rendezvous socket lives in, without creating anything: the lane-choice
+/// probe asks on every check and must not touch the filesystem. `None` means the control
+/// directory (the fallback).
 #[must_use]
 fn rendezvous_dir_candidate() -> Option<PathBuf> {
     #[cfg(unix)]
@@ -787,12 +555,9 @@ fn rendezvous_dir_candidate() -> Option<PathBuf> {
     }
 }
 
-/// The SHORT per-uid private directory the rendezvous socket lives in, established
-/// (lstat-hardened: a symlink at the target is refused before anything touches it,
-/// the final component must be a real directory owned by this uid and not
-/// group/other-writable). Falls back to the control directory when `$TMPDIR`
-/// cannot be admitted or the child cannot be established, so the short-`$HOME`
-/// machines that always worked keep working.
+/// The short per-uid private directory the rendezvous socket lives in, established with
+/// `aterm_update_core::ensure_private_dir` (a symlink at the target is refused). Falls back to
+/// the control directory when `$TMPDIR` cannot be admitted or the child cannot be established.
 #[must_use]
 pub(crate) fn rendezvous_dir() -> Option<PathBuf> {
     if let Some(dir) = rendezvous_dir_candidate()
@@ -800,16 +565,14 @@ pub(crate) fn rendezvous_dir() -> Option<PathBuf> {
     {
         return Some(dir);
     }
-    // The fallback carries the same requirement: a relative path binds against THIS
-    // process's cwd and cannot be dialed by a LaunchServices successor (cwd `/`).
+    // Absolute for the same reason as `admitted_temp_base`'s base.
     crate::control_auth::socket_dir().filter(|dir| dir.is_absolute())
 }
 
-/// After the bind: prove the node really is OUR socket inside OUR real directory —
-/// the directory opened with `O_NOFOLLOW` (a symlink swapped in between the check
-/// and the bind fails here), owned by this uid and not group/other-writable, and
-/// the entry a socket owned by this uid. Cheap, and it is what turns the pre-bind
-/// check from a race into a proof.
+/// After the bind, prove the node is our socket inside our real directory: the directory opened
+/// `O_NOFOLLOW` (a symlink swapped in after the check fails here), owned by this uid and not
+/// group/other-writable, and the entry a socket this uid owns. This turns the pre-bind check
+/// from a race into a proof.
 #[cfg(unix)]
 fn prove_bound_socket_is_ours(dir: &Path, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{
@@ -875,14 +638,9 @@ fn sweep_dead_rendezvous(dir: &Path) {
     }
 }
 
-/// Whether a rendezvous path composed for THIS process fits `sun_path`, without
-/// binding anything or minting a nonce.
-///
-/// The lane choice needs this answer before the worker exists, and the nonce is
-/// not minted until the worker writes the manifest — so the probe runs against a
-/// nonce-shaped placeholder. That is EXACT, not approximate: `seamless`'s nonce
-/// is always 32 hex characters, so every path this process can compose has the
-/// same length.
+/// Whether a rendezvous path composed for this process fits `sun_path`, without binding
+/// anything. The lane choice asks before the worker mints its nonce, so this composes a
+/// placeholder; the answer is exact, since every nonce `seamless` mints is 32 hex characters.
 #[must_use]
 pub(crate) fn rendezvous_path_fits() -> bool {
     let Some(dir) = rendezvous_dir_candidate()
@@ -896,31 +654,19 @@ pub(crate) fn rendezvous_path_fits() -> bool {
         .is_some_and(crate::control_auth::sun_path_ok)
 }
 
-/// The signing identifier every aterm release is cut with: the bundle's
-/// `CFBundleIdentifier` (`apps/aterm-mac/Info.plist`; `aterm-release`'s cut
-/// stamps `com.aterm.aterm`), which `codesign` gives the main executable, and
-/// the identifier the installed app's own designated requirement names (the PTY
-/// keeper's floor checks its peers against exactly that requirement,
-/// `DESIGN-pty-keeper` §11.1).
+/// The signing identifier every aterm release is cut with: the bundle's `CFBundleIdentifier`
+/// (`apps/aterm-mac/Info.plist`), which `codesign` gives the main executable and which the
+/// installed app's designated requirement names (the PTY keeper checks its peers against that
+/// requirement, `DESIGN-pty-keeper` §11.1).
 pub(crate) const RELEASE_SIGNING_IDENTIFIER: &str = "com.aterm.aterm";
 
-/// THE CODE A DIALER MUST RUN TO TAKE THE GRANT — the gate on the launched
-/// lane that a same-uid process cannot assert for itself (round eight of the
-/// update audit, U36; see the module docs' "Three gates").
-///
-/// Checked by [`Rendezvous::accept_claim_observed`] on every connection that presented
-/// the secret, through the connection's audit token, read once at the claim and
-/// required to name the attested pid (never a pid that may have been recycled,
-/// and never a second read; the module docs' "Whom the code gate judges" says
-/// what that leaves): `aterm_keeper::identity`, the same Security.framework check
-/// the PTY keeper makes of its peers. A connection whose code is refused is
-/// closed, and the wait goes on for the successor, exactly as for a wrong
-/// secret. A connection whose check `trustd` has not answered is HELD
-/// ([`CodeRefusal::TrustdSilent`]) until it does: never a pass, and never a
-/// refusal of a successor for the machine's moment.
-///
-/// Which code that is, is the launch's to say ([`Self::release`],
-/// [`Self::code_at`]); this type only checks it.
+/// The code a dialer must run to take the grant. [`Rendezvous::accept_claim_observed`] checks it
+/// on every connection that presented the secret, through `aterm_keeper::identity` (the check
+/// the PTY keeper makes of its peers), against the audit token read once at the claim and
+/// required to name the attested pid. A refused connection is closed and the wait goes on; one
+/// whose check `trustd` did not answer is held and checked again ([`CodeRefusal::TrustdSilent`]),
+/// never passed. The launch says which code ([`Self::release`], [`Self::code_at`]); this type
+/// only checks it.
 pub(crate) struct DialerCode {
     rule: DialerCodeRule,
 }
@@ -942,10 +688,8 @@ enum DialerCodeRule {
     },
 }
 
-/// Why [`DialerCode`] did not admit a dialer that presented this attempt's
-/// secret — typed, because the three are filed differently (round eight of
-/// the update audit, U36's review): only the first is a verdict on the code
-/// that dialled.
+/// Why [`DialerCode`] did not admit a dialer that presented this attempt's secret, typed because
+/// each is filed differently: only [`Self::Refused`] is a verdict on the code that dialled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodeRefusal {
     /// Checked and refused: the code the dialer runs does not meet the rule.
@@ -957,10 +701,9 @@ pub(crate) enum CodeRefusal {
     /// may pass once `trustd` answers, so the gate holds it, waiting for that
     /// answer, rather than closing it.
     TrustdSilent(String),
-    /// Not checked for another reason: the kernel would not name the dialer, its
-    /// code could not be looked up (it exited, or the file it was started from
-    /// was replaced under it — a sibling launch's swap of the same build, round
-    /// eight #75), or the code at the launched bundle had no requirement to read.
+    /// Not checked for another reason: the kernel would not name the dialer, its code could not be
+    /// looked up (it exited, or the file it was started from was replaced under it, as by a sibling
+    /// launch's swap of the same build), or the code at the launched bundle had no requirement.
     Unchecked(String),
 }
 
@@ -989,20 +732,12 @@ impl std::fmt::Display for CodeRefusal {
 }
 
 impl DialerCode {
-    /// Code signed as an aterm release: identifier
-    /// [`RELEASE_SIGNING_IDENTIFIER`] and a Developer ID of `team` — the
-    /// installed app's own designated requirement (measured 2026-10-02 on the
-    /// owner's Mac: the running installed v0.100.0 window met it as a PROCESS,
-    /// `codesign --verify -R <requirement> <pid>`, in 0.5 s, and the same
-    /// requirement naming `com.aterm.aterm.dev`, or another team's OU, did not).
-    /// Every update candidate passed the Developer ID half before this lane was
-    /// chosen for it (`codesign --verify -R`, `aterm_update_core::codesign`), and
-    /// the launching worker reads the candidate's identifier before it launches
-    /// anything: a candidate signed otherwise takes the fork lane, whose gate
-    /// does not ask (`app_update_handoff::launched_dialer_code`). So every
-    /// successor this rule gates was cut with it, whatever its build — and so
-    /// is one whose boot swap was deferred and which still runs the outgoing
-    /// image, when that image is a release too.
+    /// Code signed as an aterm release: identifier [`RELEASE_SIGNING_IDENTIFIER`] and a Developer
+    /// ID of `team`, the installed app's own designated requirement. Every update candidate passed
+    /// the Developer ID half before this lane was chosen for it (`aterm_update_core::codesign`),
+    /// and a candidate signed with another identifier takes the fork lane, whose gate does not ask
+    /// (`app_update_handoff::launched_dialer_code`). So every successor this rule gates meets it,
+    /// including one whose deferred boot swap still runs the outgoing release image.
     ///
     /// # Errors
     /// A team that is no team, or a requirement Security.framework refuses.
@@ -1042,9 +777,8 @@ impl DialerCode {
         }
     }
 
-    /// No code requirement at all — the same-uid floor, which every dialer of
-    /// the `0600` socket already meets. The launched lane's gate before
-    /// 2026-10-02, kept only as the Tier-1's negative control.
+    /// No code requirement: the same-uid floor every dialer of the `0600` socket already meets. The
+    /// Tier-1's negative control.
     #[cfg(test)]
     pub(crate) fn same_uid_floor_for_test() -> Self {
         Self {
@@ -1423,19 +1157,13 @@ fn dialer_left(stream: &CtlStream, wait: Duration) -> bool {
     false
 }
 
-/// A bound, single-use rendezvous listener plus the secret that admits exactly
-/// one dialer to it.
+/// A bound, single-use rendezvous listener plus the secret that admits exactly one dialer to it.
 ///
-/// UNLINKS ON DROP. Every rollback path in the worker drops this, so the socket
-/// is retired the moment the attempt stops needing it and a late dial fails
-/// `ENOENT` — which is precisely how a successor that boots slower than the
-/// parent's patience is meant to discover it has no handoff.
-/// `seamless::discard_outgoing`'s prefix sweep covers the same ground for the
-/// paths that route through `HandoffWorkerCleanup`, and the successor unlinks it
-/// too after a successful claim. The redundancy is deliberate, and each copy
-/// covers a gap the others cannot: on the SUCCESS path this process `_exit`s
-/// inside `seamless::commit_and_exit` and runs no destructor at all — and the
-/// cleanup funnel does not run there either.
+/// Unlinks on drop: every rollback path in the worker drops it, so a late dial fails `ENOENT`,
+/// which is how a successor slower than the parent's patience learns it has no handoff. On the
+/// success path this process `_exit`s inside `seamless::commit_and_exit` and runs no destructor,
+/// so the successor unlinks the socket after its claim; a node whose owner died is swept at the
+/// next bind (`sweep_dead_rendezvous`).
 pub(crate) struct Rendezvous {
     path: PathBuf,
     listener: CtlListener,
@@ -1483,15 +1211,12 @@ impl Rendezvous {
         };
         #[cfg(unix)]
         prove_bound_socket_is_ours(dir, &bound.path).map_err(RendezvousError::Bind)?;
-        // The 0700 directory is already the access boundary; 0600 on the node
-        // itself is the same defence in depth the control socket takes, and it
-        // buys a refusal here rather than a surprise at connect time. From this
-        // point the value owns the path, so a refusal unlinks by dropping.
+        // The 0700 directory is the access boundary; 0600 on the node is the control socket's
+        // defence in depth. From here the value owns the path, so a refusal unlinks by dropping.
         std::fs::set_permissions(&bound.path, std::fs::Permissions::from_mode(0o600))
             .map_err(|error| RendezvousError::Bind(error.to_string()))?;
-        // The accept is deadline- and cancel-bounded, which a blocking `accept`
-        // cannot be: it would park the worker thread past the point at which the
-        // user's terminal has to be given back.
+        // The accept is deadline- and cancel-bounded, which a blocking `accept` cannot be: it
+        // would hold the worker past the point the user's terminal must be given back.
         bound
             .listener
             .set_nonblocking(true)
@@ -1514,73 +1239,27 @@ impl Rendezvous {
 
     /// Wait for the successor, check the gates, and hand back the connection.
     ///
-    /// `expected_pid` is what LaunchServices reported for the instance it
-    /// started, and `code` the code the successor runs ([`DialerCode`]). `abort`
-    /// is polled between slices so a cancel poke does not have to wait out the
-    /// whole deadline. `refused` hears of every dialer that presented the secret
-    /// and was not admitted by its code, the moment its connection ends and
-    /// before it is closed, so the caller can witness the dialer while it is
-    /// still alive: the launched lane's wait files a successor that then exits
-    /// by that refusal's cause, never as a death it cannot explain (round eight
-    /// of the update audit, U36's review).
+    /// `expected_pid` is the pid LaunchServices reported for the instance it started, `None`
+    /// while that answer has not arrived (a bundle's first launch can outlast the budget while its
+    /// successor dials). `code` is the code the successor runs ([`DialerCode`]), what keeps a
+    /// same-uid stranger out. `abort` is polled between slices. `refused` hears of every dialer
+    /// that presented the secret and was not admitted by its code, before its connection is
+    /// closed, so the caller can witness it alive and file its exit by that cause.
     ///
-    /// A CONNECTION THAT FAILS ANY GATE IS REFUSED; THE ATTEMPT IS NOT. Only
-    /// the deadline, the abort predicate and a successful claim end the wait.
-    /// The earlier shape ended it on the first bad connection, which read as
-    /// prudence and was not: the socket is `0600` inside a `0700` directory, so a
-    /// wrong dialer is already known to be same-uid, and the gates are what stop
-    /// it TAKING the handoff. Letting it also END the handoff handed every
-    /// same-uid process a denial of UPDATE costing one `connect(2)` — a strictly
-    /// worse trade than closing that connection and going back to waiting. "This
-    /// connection is not our successor" and "this attempt is over" are different
-    /// statements, and the deadline is what may make the second one.
+    /// A connection that fails a gate is refused; the attempt is not, or one `connect(2)` from any
+    /// same-uid process would deny the update. The wait ends at the deadline, `abort`, a
+    /// successful claim, or the [`MAX_REFUSED_DIALS`]th refusal, and each connection gets
+    /// [`CLAIM_FRAME_BUDGET`] to present its frame. At the deadline the answer is the last refusal
+    /// if there was one, else [`RendezvousError::Deadline`].
     ///
-    /// The work a stranger can extract is bounded twice, because "keep accepting"
-    /// must not become "can be kept busy for free": one connection may spend at
-    /// most [`CLAIM_FRAME_BUDGET`] presenting its frame, and at most
-    /// [`MAX_REFUSED_DIALS`] refusals are served before the attempt gives up on
-    /// the last of them. Past that cap a denial is possible again, but it costs a
-    /// sustained flood rather than a single connect, and the parent keeps every
-    /// session either way.
-    ///
-    /// WHEN THE WAIT RUNS OUT the answer is the LAST REFUSAL if there was one and
-    /// [`RendezvousError::Deadline`] otherwise. "No successor dialed" is simply
-    /// false on a machine where three did and none knew the secret, and which of
-    /// those two happened is the first thing an investigation needs.
-    ///
-    /// `expected_pid` is `None` when the LAUNCH ANSWER NEVER ARRIVED — which is a
-    /// real state, not a hypothetical: LaunchServices answering slowly is not
-    /// evidence that it launched nothing, and it was measured taking longer than
-    /// its budget on a bundle's first launch while the successor it started went
-    /// on to dial. Refusing that dial for want of a pid to compare it against
-    /// would throw away a live, correct successor.
-    ///
-    /// What keeps a stranger out is then `code`, not the secret (round eight of
-    /// the update audit, U36). This doc used to call the secret the
-    /// authenticator, "32 bytes a stranger cannot guess" — but no same-uid
-    /// stranger has to guess it: the successor's launch environment is readable
-    /// to every process of this uid (`KERN_PROCARGS2`) for as long as it runs,
-    /// and with `None` here nothing else stood between such a process and every
-    /// master. The code check runs after the secret (an unknown dialer costs
-    /// one compare, not a code lookup) and after the pid, on every connection
-    /// that presents the secret; when the pid is available it is still compared,
-    /// and the attested pid is returned to the caller either way.
-    ///
-    /// A CODE CHECK `trustd` DID NOT ANSWER HOLDS ITS CONNECTION (U36's review).
-    /// The check waits on macOS's code-signing service, which can stop answering
-    /// (measured 2026-10-01: an installed build's check parked for as long as
-    /// anyone waited), and closing the successor's connection then would end the
-    /// attempt for the machine's moment — the successor reads end of file and
-    /// exits. So the connection is kept, its dialer watched for a hangup, and
-    /// the answer to its code check waited for (the check asked again every
-    /// [`CODE_RECHECK_INTERVAL`] while the process's `trustd` gate refuses it at
-    /// once) until it is admitted, refused, gone, or the wait itself ends (the
-    /// abort, or the deadline, which then answers with that refusal): a check
-    /// `trustd` answers slowly is never cut short and asked again, so the
-    /// deadline is the hold's one bound on `trustd`. The successor holds its
-    /// claim far longer than any dial deadline, so a `trustd` blip becomes a
-    /// delay, never a failure; other dialers wait in the backlog meanwhile,
-    /// which costs nothing, since `trustd` would answer none of them either.
+    /// A code check `trustd` did not answer holds its connection: closing the successor's
+    /// connection when macOS's code-signing service stalls would make the successor read end of
+    /// file and exit. Instead the connection is kept, its dialer watched for a hangup, and the
+    /// answer to its code check waited for (asked again every [`CODE_RECHECK_INTERVAL`] while the
+    /// process's `trustd` gate refuses it at once) until it is admitted, refused, gone, or the
+    /// wait itself ends (the abort, or the deadline, which then answers with that refusal): a
+    /// check `trustd` answers slowly is never cut short and asked again. Other dialers wait in
+    /// the backlog meanwhile.
     pub(crate) fn accept_claim_observed(
         &self,
         expected_pid: Option<i32>,
@@ -1629,9 +1308,8 @@ impl Rendezvous {
                 return Err(refusal);
             }
             last_refusal = Some(refusal);
-            // Dropping `stream` here — before the next accept — is what tells the
-            // refused dialer it was refused, and it is why a flood cannot
-            // accumulate connections we are still holding.
+            // Dropping `stream` before the next accept tells the refused dialer it was refused,
+            // so a flood cannot accumulate held connections.
         }
     }
 
@@ -1648,9 +1326,9 @@ impl Rendezvous {
         self.accept_claim_observed(expected_pid, code, deadline, abort, &|_| {})
     }
 
-    /// The gates over ONE accepted connection, answering the attested peer pid.
+    /// The gates over one accepted connection, answering the attested peer pid.
     ///
-    /// Every [`Gated::Refused`] is a refusal of THIS CONNECTION, and nothing
+    /// Every [`Gated::Refused`] is a refusal of this connection, and nothing
     /// else here ends the attempt, which is why the frame read is bounded by its
     /// own slice as well as by the attempt deadline: an expiry inside this
     /// function must mean "that peer took too long", not "the handoff is over".
@@ -1678,10 +1356,9 @@ impl Rendezvous {
         abort: &dyn Fn() -> bool,
         refused: &dyn Fn(&CodeRefusedDialer),
     ) -> Result<Admitted, Gated> {
-        // The TIGHTER of the two bounds wins. A peer that has not yet presented
-        // the secret is an unknown same-uid process, and one of those must not be
-        // able to spend the attempt's whole budget by connecting and saying
-        // nothing — while a real successor writes this frame in one call.
+        // The tighter of the two bounds: an unknown same-uid peer must not spend the attempt's
+        // whole budget by connecting and saying nothing, and a real successor writes this frame
+        // in one call.
         let frame_deadline = deadline.min(Instant::now() + CLAIM_FRAME_BUDGET);
         let mut frame = [0u8; CLAIM_FRAME_LEN];
         read_frame_by_deadline(stream, &mut frame, frame_deadline, &|error| {
@@ -1691,10 +1368,8 @@ impl Rendezvous {
         let Some(chunks) = claim_frame_kind(&frame, &self.claim) else {
             return Err(Gated::Refused(RendezvousError::Claim));
         };
-        // Identity SECOND, and only once the secret has proven this is our
-        // attempt's dialer. `peer_pid` is a cheap `getsockopt`, but ordering the
-        // unforgeable check after the unguessable one means a stranger learns
-        // nothing about which pid we were expecting.
+        // Identity second, only once the secret has proven this is our attempt's dialer, so a
+        // stranger learns nothing about which pid was expected.
         let attested = fdpass::peer_pid(stream)
             .map_err(|error| Gated::Refused(RendezvousError::PeerUnattested(error.to_string())))?;
         let attested = i32::try_from(attested).map_err(|_| {
@@ -1711,18 +1386,15 @@ impl Rendezvous {
                 actual: attested,
             }));
         }
-        // Code LAST, and only for a dialer that presented the secret (U36). The
-        // audit token is read ONCE, here, and that one token is what every check
-        // of this dialer judges and what the grant is sent against
-        // ([`ClaimedPeer::transfer`]): the kernel answers it at each read, for
-        // the process on the other end as it is then, so a second read is a
-        // second question (U36's second review). It must name the attested pid.
+        // Code last, and only for a dialer that presented the secret. The audit token is read
+        // once, here: the kernel answers it for whoever is on the other end at each read, so
+        // this one token is what every check judges and what the grant is sent against
+        // ([`ClaimedPeer::transfer`]). It must name the attested pid.
         let token = aterm_uds::peer::peer_audit_token(stream);
         admit_code(stream, attested, token, code, deadline, abort, refused)?;
-        // The claimed connection leaves here with a write bound already on it.
-        // `transfer` refreshes it against the same deadline immediately before
-        // the one `sendmsg`; this is the belt that makes "a socket this module
-        // hands out can never block forever on a write" true by construction.
+        // The claimed connection leaves with a write bound already on it; `transfer` refreshes
+        // it against the same deadline before the `sendmsg`, so no socket this module hands out
+        // can block forever on a write.
         stream
             .set_write_timeout(Some(remaining_io_budget(deadline).map_err(Gated::Refused)?))
             .map_err(|error| Gated::Refused(RendezvousError::Accept(error.to_string())))?;
@@ -1797,12 +1469,9 @@ impl Rendezvous {
                     // signal. Neither is this attempt's dialer arriving.
                     continue;
                 }
-                // Anything else ends the wait — including an accept short of a
-                // descriptor, which is NOT worth waiting out (round eight of the
-                // update audit, #3): Darwin has already dequeued that dial and
-                // closed it rather than put it back, so the dialer is told at
-                // once and nothing queued is left for a retry to find. Room is
-                // made before the rendezvous instead
+                // Anything else ends the wait, an accept short of a descriptor included: Darwin
+                // has already dequeued that dial and closed it, so the dialer is told at once and
+                // nothing is left for a retry. Room is made before the rendezvous instead
                 // ([`raise_descriptor_limit_for_park`]).
                 Err(error) => return Err(RendezvousError::Accept(error.to_string())),
             }
@@ -1812,10 +1481,9 @@ impl Rendezvous {
 
 impl Drop for Rendezvous {
     fn drop(&mut self) {
-        // Closing the listener is what makes an IN-FLIGHT dial fail closed; the
-        // unlink is what makes a dial that has not happened yet fail closed. The
-        // path is prefix-bound to this process's pid and this attempt's nonce,
-        // so this can never remove anything another attempt owns.
+        // Closing the listener fails an in-flight dial closed; the unlink fails a later dial.
+        // The path carries this process's pid and this attempt's nonce, so this never removes
+        // another attempt's node.
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_file(launch_stamp_path(&self.path));
     }
@@ -1834,17 +1502,14 @@ pub(crate) fn launch_stamp_path(rendezvous: &Path) -> PathBuf {
     PathBuf::from(stamp)
 }
 
-/// THE LAUNCHED SUCCESSOR NAMES ITSELF BEFORE ITS BOOT APPLY CAN COUNT A TRIAL
-/// LAUNCH (2026-09-30, round four). LaunchServices reports a successor that dies
-/// before it checks in with no pid (`PreDialDeath::TerminatedBeforeCheckIn`), and
-/// every successor dials before it checks in, so for that death its parent has no
-/// name to give the counted launch back by. So this launch writes its own —
-/// the name the sentinel counts it under — beside the rendezvous its launch
-/// names ([`aterm_update::stamp_trial_launch`]), and the parent gives back exactly
-/// that launch ([`aterm_update::forgive_stamped_trial_launch`]). Nothing on the
-/// fork lane, whose parent names its child. Best effort: a stamp not written
-/// leaves any launch this process counts on the trial, which keeps the crash
-/// signal.
+/// The launched successor names its own launch before its boot apply can count a trial launch.
+/// LaunchServices reports a successor that dies before it checks in with no pid
+/// (`PreDialDeath::TerminatedBeforeCheckIn`), and every successor dials before it checks in, so
+/// its parent has no name to give that counted launch back by. So this launch stamps the name
+/// the sentinel counts it under beside the rendezvous ([`aterm_update::stamp_trial_launch`]),
+/// and the parent forgives exactly that launch ([`aterm_update::forgive_stamped_trial_launch`]).
+/// Not on the fork lane, whose parent names its child. Best effort: an unwritten stamp leaves
+/// the launch counted, which keeps the crash signal.
 pub(crate) fn stamp_this_launch(env: &crate::handoff_env::HandoffEnv) {
     let Some(rendezvous) = env.os(ENV_RENDEZVOUS) else {
         return;
@@ -1876,7 +1541,7 @@ pub(crate) struct ClaimedPeer {
 
 impl ClaimedPeer {
     /// Whether the held dialer has gone: one zero-timeout `poll` for HUP/ERR/NVAL
-    /// on the served stream. The parent's witness, while it HOLDS a claim between
+    /// on the served stream. The parent's witness, while it holds a claim between
     /// accept and transfer, that the successor died before any descriptor left —
     /// so the attempt is stood down without a park rather than granted to a
     /// corpse. Never `true` for a merely idle peer (readable data is not a hangup).
@@ -1912,15 +1577,12 @@ impl ClaimedPeer {
         self.pid
     }
 
-    /// Whether the kernel still names, on this connection, the very process
-    /// the gate checked: a fresh audit token, compared word for word with the
-    /// one the gate read and judged ([`Rendezvous::gate_one`]). Asked
-    /// immediately before the `sendmsg` that carries the first descriptor, so a
-    /// connection whose other end is no longer that process (another process
-    /// using it, or a new image at the pid, whose pid version differs) gets
-    /// [`RendezvousError::TransferNotSent`] and nothing (U36's second review).
-    /// What it cannot see is stated in the module docs ("Whom the code gate
-    /// judges", and what the code gate leaves).
+    /// Whether the kernel still names, on this connection, the very process the gate checked: a
+    /// fresh audit token, compared word for word with the one the gate read and judged
+    /// ([`Rendezvous::gate_one`]). Asked just before the `sendmsg` that carries the first
+    /// descriptor, so a connection whose other end is no longer that process (another process
+    /// using it, or a new image at the pid) gets [`RendezvousError::TransferNotSent`]. The module
+    /// docs state what it cannot see.
     fn dialer_unchanged(&self) -> Result<(), RendezvousError> {
         let now = aterm_uds::peer::peer_audit_token(&self.stream);
         if now == self.token {
@@ -1934,37 +1596,29 @@ impl ClaimedPeer {
         )))
     }
 
-    /// The most sessions [`Self::transfer`] can hand THIS dialer: what its
-    /// claim (`ATRZ2C` or `ATRZ1C`) says it reads, never what the parent hoped
-    /// to offer it. The park compares its pool against this BEFORE it freezes
-    /// anything, so a claim that cannot carry the desk stands the attempt down
-    /// with every reader live instead of after the capture.
+    /// The most sessions [`Self::transfer`] can hand this dialer: what its claim (`ATRZ2C` or
+    /// `ATRZ1C`) says it reads. The park compares its pool against this before it freezes
+    /// anything, so a claim that cannot carry the desk stands the attempt down with every reader
+    /// live.
     #[must_use]
     pub(crate) fn grant_session_limit(&self) -> usize {
         grant_session_limit(self.chunks)
     }
 
-    /// Send every descriptor of the handoff in ONE message, then the body that
-    /// says which is which.
+    /// Send every descriptor of the handoff in one message, then the body that says which is
+    /// which. `sessions` is `(local_id, shell pid, master)` in transfer order, and that order is
+    /// the addressing: the successor pairs its Nth received descriptor with the Nth body entry;
+    /// the readiness and Commit descriptors follow the masters.
     ///
-    /// `sessions` is `(local_id, shell pid, master)` in TRANSFER ORDER, and that
-    /// order is the addressing: the successor pairs its Nth received descriptor
-    /// with the Nth body entry. The readiness and Commit descriptors follow the
-    /// masters, in that order.
+    /// One `sendmsg` for all descriptors makes this all-or-nothing: the parent's only two
+    /// dispositions are "no descriptor of ours left" and "the successor has everything". A
+    /// successor that received descriptors but no body refuses the grant and exits, which this
+    /// process learns as proof EOF.
     ///
-    /// ONE `sendmsg` FOR ALL DESCRIPTORS is what makes this all-or-nothing.
-    /// There is no state in which the successor holds some masters and not
-    /// others, so the parent's two dispositions — "no descriptor of ours ever
-    /// left" and "the successor has everything" — are the only two that exist.
-    /// The body that follows is ordinary stream bytes; a successor that received
-    /// descriptors but no body cannot use them (it refuses the grant and exits),
-    /// and this process learns that as proof EOF exactly as it would for any
-    /// other refusal.
-    ///
-    /// MORE THAN 62 SESSIONS take the CHUNKED grant, and only for a dialer that
+    /// More than 62 sessions take the chunked grant, and only for a dialer that
     /// claimed it (`ATRZ2C`); an `ATRZ1C` dialer is refused
     /// [`RendezvousError::TooManySessions`] before anything is sent. The chunked
-    /// grant keeps both dispositions: its FIRST `sendmsg` is still the line
+    /// grant keeps both dispositions: its first `sendmsg` is still the line
     /// before which no descriptor has left ([`RendezvousError::TransferNotSent`]),
     /// and every failure after it — a continuation included — is
     /// [`RendezvousError::TransferPartial`], the kill-and-prove disposition. A
@@ -2004,13 +1658,10 @@ impl ClaimedPeer {
         self.dialer_unchanged()?;
         let sent = fdpass::send_with_fds(&self.stream, &header, &descriptors)
             .map_err(|error| RendezvousError::TransferNotSent(error.to_string()))?;
-        // FROM HERE THE DESCRIPTORS ARE THE PEER'S TOO: every failure below is a
-        // partial transfer, and the caller owes the candidate a proof of death
-        // before it resumes its readers.
-        //
-        // A short send is possible in principle on a stream socket, and the
-        // descriptors went with the first byte — so the remainder is finished
-        // with an ordinary write rather than resent.
+        // From here the descriptors are the peer's too: every failure below is a partial
+        // transfer, and the caller owes the candidate a proof of death before it resumes its
+        // readers. A short send went with its descriptors on the first byte, so the rest of
+        // the header is finished with an ordinary write, never resent.
         if sent < header.len() {
             (&self.stream)
                 .write_all(&header[sent..])
@@ -2023,7 +1674,7 @@ impl ClaimedPeer {
         Ok(())
     }
 
-    /// The CHUNKED grant (see [`Self::transfer`] and the module docs): the
+    /// The chunked grant (see [`Self::transfer`] and the module docs): the
     /// `ATRZ2G` header carrying the first chunk of descriptors, the body, then
     /// one `ATRZ2K` continuation per further chunk, laid out by
     /// [`grant_chunk_sizes`].
@@ -2058,8 +1709,8 @@ impl ClaimedPeer {
         self.dialer_unchanged()?;
         let sent = fdpass::send_with_fds(&self.stream, &header, chunks[0])
             .map_err(|error| RendezvousError::TransferNotSent(error.to_string()))?;
-        // FROM HERE THE FIRST CHUNK IS THE PEER'S: every failure below, in a
-        // continuation too, is a partial transfer the caller owes a proof for.
+        // From here the first chunk is the peer's: every failure below, a continuation's too,
+        // is a partial transfer the caller owes a proof for.
         let partial = |error: std::io::Error| RendezvousError::TransferPartial(error.to_string());
         if sent < header.len() {
             (&self.stream).write_all(&header[sent..]).map_err(partial)?;
@@ -2087,15 +1738,11 @@ impl ClaimedPeer {
     }
 }
 
-/// [`Rendezvous::bind`] under `nonce` for a test, so that the test RUNS: where
-/// production binds it, or, on the two refusals production takes the fork lane
-/// on (no usable control directory; a socket path too long for `sun_path`, as
-/// under a long `$TMPDIR` or `$HOME`), in a fresh private directory under
-/// `/tmp`, through the same [`Rendezvous::bind_in`], returned beside it for the
-/// caller to hold as long as the rendezvous. A test that cannot bind there
-/// either fails, naming both reasons. Before 2026-10-14 the tests returned
-/// instead, and 20 reported `ok` having asserted nothing under a 65-byte
-/// `$TMPDIR`.
+/// [`Rendezvous::bind`] under `nonce` for a test: where production binds it, or, on the two
+/// refusals production takes the fork lane on (no usable control directory; a socket path too
+/// long for `sun_path`, as under a long `$TMPDIR` or `$HOME`), in a fresh private directory under
+/// `/tmp` through [`Rendezvous::bind_in`], returned beside it for the caller to hold as long as
+/// the rendezvous. A test that cannot bind there either fails, naming both reasons.
 #[cfg(test)]
 pub(crate) fn bind_anywhere_for_test(nonce: &str) -> (Rendezvous, Option<aterm_tempfile::TempDir>) {
     let refused = match Rendezvous::bind(nonce) {
@@ -2130,7 +1777,7 @@ pub(crate) fn short_dir_for_test(for_what: &str) -> aterm_tempfile::TempDir {
 }
 
 /// A test's dialer: connect to `path` and present `secret`, keeping the stream
-/// so the accepted claim can be HELD by the listener (the late park's shape)
+/// so the accepted claim can be held by the listener (the late park's shape)
 /// and closed from that side. The production dialer is `dial_and_claim`. The
 /// frame is built first, so the connect and the write run back to back: the
 /// listener's read of it is bounded from its accept ([`CLAIM_FRAME_BUDGET`]).
@@ -2186,12 +1833,10 @@ pub(crate) fn admitted<T>(accepted: Result<T, RendezvousError>, what: &str) -> T
     }
 }
 
-/// The cross-version guard's door onto this build's SUCCESSOR side
-/// (`seamless::fixture_tests`): dial `path`, present `secret` as this build
-/// presents it to a parent that published no grant capabilities (every shipped
-/// parent), and answer the `ATERM_SEAMLESS_FDS` wire it would publish together
-/// with the descriptors it received — masters in wire order, then the readiness
-/// and Commit ends.
+/// The cross-version guard's door onto this build's successor side (`seamless::fixture_tests`):
+/// dial `path`, present `secret` as this build presents it to a parent that published no grant
+/// capabilities, and answer the `ATERM_SEAMLESS_FDS` wire it would publish with the descriptors
+/// it received (masters in wire order, then the readiness and Commit ends).
 #[cfg(test)]
 pub(crate) fn dial_and_claim_for_fixture(
     path: &Path,
@@ -2199,7 +1844,7 @@ pub(crate) fn dial_and_claim_for_fixture(
     expected_nonce: &str,
     deadlines: ClaimDeadlines,
 ) -> Result<(String, Vec<OwnedFd>, OwnedFd, OwnedFd), RendezvousError> {
-    // The stub parent listens in THIS process, so this process is the attested
+    // The stub parent listens in this process, so this process is the attested
     // parent the listener must be (`listener_may_receive_claim`).
     let parent = libc::pid_t::try_from(std::process::id())
         .ok()
@@ -2238,12 +1883,12 @@ fn claim_frame_with(secret: &str, chunks: bool) -> [u8; CLAIM_FRAME_LEN] {
 }
 
 /// Whether a received claim frame carries this attempt's secret, and if it does,
-/// whether its dialer claimed the CHUNKED grant: `Some(false)` for `ATRZ1C`,
+/// whether its dialer claimed the chunked grant: `Some(false)` for `ATRZ1C`,
 /// `Some(true)` for `ATRZ2C`, `None` for anything else.
 ///
 /// The magic is compared ordinarily — it is a constant, and leaking that a peer
 /// got a fixed prefix wrong tells nobody anything they did not already choose.
-/// The SECRET is compared in constant time, because that comparison's timing is
+/// The secret is compared in constant time, because that comparison's timing is
 /// the only thing that could otherwise be walked one byte at a time.
 fn claim_frame_kind(frame: &[u8; CLAIM_FRAME_LEN], secret: &str) -> Option<bool> {
     let magic = &frame[..CLAIM_MAGIC.len()];
@@ -2254,8 +1899,7 @@ fn claim_frame_kind(frame: &[u8; CLAIM_FRAME_LEN], secret: &str) -> Option<bool>
     } else {
         return None;
     };
-    crate::control_auth::constant_time_eq(&frame[CLAIM_MAGIC.len()..], secret.as_bytes())
-        .then_some(chunks)
+    aterm_digest::ct_eq(&frame[CLAIM_MAGIC.len()..], secret.as_bytes()).then_some(chunks)
 }
 
 /// Whether a received claim frame carries this attempt's secret, under either
@@ -2402,16 +2046,11 @@ fn parse_grant_body(body: &str, expected_nonce: &str) -> Result<GrantBody, Rende
 }
 
 /// What a successor holds after a successful claim: the descriptors, and the
-/// `ATERM_SEAMLESS_FDS` wire that names them by the numbers THIS process
-/// received them at.
-///
-/// The wire is built here rather than by the caller because this is the only
-/// place that knows both halves — the body's `(local_id, pid)` order and the
-/// descriptor numbers the kernel chose. Installing it in the handoff snapshot
-/// ([`ClaimedIntake::install`]) lets the unchanged `seamless::take_incoming_from`
-/// perform every authentication it already performs: the manifest join, the
-/// bijection check, the tty backstop, the screen-carry digest. The TRANSPORT
-/// changed; nothing that decides whether a handoff is legitimate did.
+/// `ATERM_SEAMLESS_FDS` wire that names them by the numbers this process received them at.
+/// Built here because only this place knows both the body's `(local_id, pid)` order and the
+/// numbers the kernel chose. Installed in the snapshot ([`ClaimedIntake::install`]), it lets
+/// the unchanged `seamless::take_incoming_from` run every authentication: the manifest join,
+/// the bijection check, the tty backstop, the screen-carry digest.
 pub(crate) struct ClaimedHandoff {
     fds_wire: String,
     masters: Vec<OwnedFd>,
@@ -2435,10 +2074,8 @@ impl ClaimedHandoff {
         self.parked_for
     }
 
-    /// The claim as an intake: the wire and the owned descriptors, in memory.
-    /// Until the warm-successor P1 this was `publish`, which wrote the three
-    /// names into the PROCESS environment — sound only while no other thread
-    /// could exist (docs/DESIGN-warm-successor-2026-09-29.md §1).
+    /// The claim as an intake: the wire and the owned descriptors, in memory, so no process
+    /// environment is mutated while other threads run.
     #[must_use]
     pub(crate) fn into_intake(self) -> ClaimedIntake {
         let Self {
@@ -2467,20 +2104,14 @@ pub(crate) struct ClaimedIntake {
 }
 
 impl ClaimedIntake {
-    /// Land the claimed descriptors in the handoff snapshot, where the fork
-    /// lane's arrived: the same three names (`ATERM_SEAMLESS_FDS`,
-    /// `ATERM_HANDOFF_READY_FD`, `ATERM_HANDOFF_COMMIT_FD`) with the same
-    /// strings `publish` wrote into `environ` — so `seamless::take_incoming_from`,
-    /// `take_ready_fd_from` and `take_commit_fd_from` run the unchanged
-    /// authentication over them.
+    /// Land the claimed descriptors in the handoff snapshot under the fork lane's three names
+    /// (`ATERM_SEAMLESS_FDS`, `ATERM_HANDOFF_READY_FD`, `ATERM_HANDOFF_COMMIT_FD`), so
+    /// `seamless::take_incoming_from`, `take_ready_fd_from` and `take_commit_fd_from` run the
+    /// unchanged authentication over them.
     ///
-    /// The descriptors are RELEASED here: `seamless`'s consumers take ownership
-    /// exactly as they do on the fork lane, where the numbers arrived through
-    /// `execve` with no Rust owner at all. That is why this consumes `self` —
-    /// afterwards the only owners are the ones those intakes construct, and each
-    /// of them closes what it refuses. No thread can observe `env` (it is this
-    /// process's own memory), so unlike the `set_var` it replaces this is sound
-    /// wherever the claim sits.
+    /// The descriptors are released here: `seamless`'s consumers take ownership as on the fork
+    /// lane, where the numbers arrive through `execve` with no Rust owner, and each closes what
+    /// it refuses. `env` is this process's own memory, so this is sound on any thread.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2512,34 +2143,25 @@ impl ClaimedIntake {
     }
 }
 
-/// Whether this launch carries a rendezvous at all — the successor's one test
-/// for which lane it arrived on.
-///
-/// AN OR, DELIBERATELY, while [`claim_incoming`] needs BOTH names. Half an
-/// environment is corruption rather than absence: something published one of the
-/// two, so this process may be a successor, and a successor that starts a fresh
-/// window has put an empty terminal on top of a parent's live sessions. So half
-/// counts as present, this function sends the launch down the claim path, and the
-/// claim path refuses it with [`RendezvousError::HalfRendezvous`] — which SAYS
-/// half rather than reporting the absence that `claim_incoming` used to answer,
-/// because the caller's log line quotes that error inside "this launch carries a
-/// rendezvous but could not claim it", and "carries no rendezvous" contradicted
-/// the sentence it was quoted into.
+/// Whether this launch carries a rendezvous at all: the successor's one test for which lane it
+/// arrived on. Either name alone counts, while [`claim_incoming`] needs both: half an
+/// environment is corruption, not absence, and a successor that started a fresh window would
+/// put an empty terminal over a parent's live sessions. The claim path refuses it with
+/// [`RendezvousError::HalfRendezvous`].
 #[must_use]
 pub(crate) fn rendezvous_present(env: &crate::handoff_env::HandoffEnv) -> bool {
     env.present(ENV_RENDEZVOUS) || env.present(ENV_CLAIM)
 }
 
-/// The parent's explicit statement of which PROOF TERM its expected adoption
+/// The parent's explicit statement of which proof term its expected adoption
 /// proof was hashed over: `device` (PTY `st_rdev`, the launched lane's term) or
 /// `fd` (descriptor numbers, the fork lane's). Consumed once at boot. A launched
 /// attempt that falls back to the fork lane keeps its device-term proof, so the
 /// successor must not infer the term from how the descriptors arrived.
 pub(crate) const ENV_PROOF_TERM: HandoffName = HandoffName::new("ATERM_HANDOFF_PROOF_TERM");
 
-/// Consume [`ENV_PROOF_TERM`]: `Some(true)` for device terms, `Some(false)` for fd
-/// numbers, `None` when the parent said nothing (an older parent — infer from the
-/// lane as before).
+/// Consume [`ENV_PROOF_TERM`]: `Some(true)` for device terms, `Some(false)` for fd numbers,
+/// `None` when the parent said nothing (an older parent: infer from the lane).
 #[must_use]
 pub(crate) fn take_device_proof_term(env: &mut crate::handoff_env::HandoffEnv) -> Option<bool> {
     let value = env.take(ENV_PROOF_TERM)?;
@@ -2566,15 +2188,10 @@ pub(crate) enum DebugDeathBeforeDial {
     Exit,
     /// `SIGKILL` itself, as the machine ends a starved candidate (jetsam).
     Kill,
-    /// CHECK IN WITH LAUNCHSERVICES FIRST (create `NSApplication`), then
-    /// `_exit` as [`Self::Exit`] does: the shape of a successor that
-    /// LaunchServices has already answered with a pid and that dies before
-    /// its dial — today only after LaunchServices' own ~30 s check-in
-    /// timeout, and the normal order once the successor checks in before it
-    /// dials (warm successor P4). Measured on stand-in bundles (2026-09-29):
-    /// LaunchServices answers a checked-in process with its pid, not
-    /// terminated, during `+sharedApplication` itself, and answers nothing
-    /// more when it dies afterwards.
+    /// Check in with LaunchServices first (create `NSApplication`), then `_exit` as
+    /// [`Self::Exit`] does: a successor LaunchServices has already answered with a pid that dies
+    /// before its dial. LaunchServices answers a checked-in process with its pid during
+    /// `+sharedApplication` itself, and says nothing more when it dies afterwards.
     ExitAfterCheckIn,
     /// [`Self::ExitAfterCheckIn`]'s check-in, then `SIGKILL` as [`Self::Kill`].
     KillAfterCheckIn,
@@ -2599,25 +2216,18 @@ impl DebugDeathBeforeDial {
 /// (75), which a successor uses to say its refusal was a passing moment.
 pub(crate) const DEBUG_DEATH_EXIT_CODE: i32 = 70;
 
-/// A DEVELOPMENT SEAM (`aterm_types::dev_seam!`, 2026-09-29): a launched
-/// successor that DIES BEFORE ITS DIAL, on demand — the shape of a
-/// containment-deny fatal inside the warm prologue, a boot crash, or a boot
-/// apply whose re-exec was refused. `main_entry` reads it on the launched lane
-/// only (a launch that carries a rendezvous), immediately before the dial, so
-/// the parent's side of it — how soon the outgoing process stops waiting for a
-/// dial that will never come (`app_update_handoff::await_launched_dial`) — can
-/// be driven on a private instance. The launching process's environment MERGES
-/// into the successor's (`app_launch_successor`'s module docs), so an instance
-/// started with it set launches successors that die; the instance itself, a
-/// cold launch, never reads it. It stops at the hop to a child shell
-/// (`aterm_types::domain::ENV_DENY_VARS`), so an aterm launched from one
-/// of the instance's shells applies its own updates unharmed.
+/// A development seam (`aterm_types::dev_seam!`): a launched successor that dies before its dial,
+/// on demand, in the shape of a containment-deny fatal in the warm prologue, a boot crash, or a
+/// refused boot-apply re-exec. `main_entry` reads it on the launched lane only, just before the
+/// dial, so the parent's side (`app_update_handoff::await_launched_dial`) can be driven on a
+/// private instance. The launching process's environment merges into the successor's
+/// (`app_launch_successor`'s module docs), so an instance started with it launches successors
+/// that die; the instance itself, a cold launch, never reads it, and it stops at the hop to a
+/// child shell (`aterm_types::domain::ENV_DENY_VARS`).
 ///
-/// `kill` SIGKILLs; `checked-in` checks in with LaunchServices first and then
-/// exits, `checked-in-kill` checks in and then SIGKILLs
-/// ([`DebugDeathBeforeDial::ExitAfterCheckIn`]); any other engaged value (not
-/// unset, empty or `0`) exits with [`DEBUG_DEATH_EXIT_CODE`]. A shipped
-/// binary reads `None`.
+/// `kill` SIGKILLs; `checked-in` checks in with LaunchServices first and then exits;
+/// `checked-in-kill` checks in and then SIGKILLs; any other engaged value (not unset, empty or
+/// `0`) exits with [`DEBUG_DEATH_EXIT_CODE`]. A shipped binary reads `None`.
 #[must_use]
 pub(crate) fn debug_die_before_dial() -> Option<DebugDeathBeforeDial> {
     parse_debug_die_before_dial(aterm_types::dev_seam!("ATERM_DEBUG_DIE_BEFORE_DIAL").as_deref())
@@ -2658,24 +2268,17 @@ pub(crate) fn debug_check_in_with_launch_services(_windowed: crate::platform::Wi
     !app.is_null()
 }
 
-/// Dial the rendezvous named in this launch's handoff snapshot, present the
-/// claim, and take delivery of every descriptor.
+/// Dial the rendezvous named in this launch's handoff snapshot, present the claim, and take
+/// delivery of every descriptor.
 ///
-/// CONSUMES both names — and the parent's grant capabilities
-/// ([`ENV_GRANT_CAPS`]) — out of `env` whether or not it succeeds, so no second
-/// attempt can observe them (they left the process environment at
-/// `HandoffEnv::capture`, so no helper or user shell ever could). On success it also
-/// unlinks the socket: the parent `_exit`s inside `seamless::commit_and_exit`
-/// and runs no destructor, so on the one path that matters this is the only
-/// thing that retires the node.
+/// Consumes both names and [`ENV_GRANT_CAPS`] from `env` whether or not it succeeds. On success
+/// it unlinks the socket: the parent `_exit`s inside `seamless::commit_and_exit` and runs no
+/// destructor, so on that path this is what retires the node.
 ///
-/// `expected_nonce` is the attempt nonce this process was told about in
-/// `ATERM_SEAMLESS_NONCE`; a grant naming any other attempt is refused.
-/// `parent` is the outgoing process `seamless::prearm_incoming_fds` attested;
-/// the claim is presented only to a listener the kernel says IS that process
-/// (see [`listener_may_receive_claim`]), and `None` refuses.
-///
-/// No process-environment access: callable from any thread.
+/// A grant naming any attempt but `expected_nonce` (`ATERM_SEAMLESS_NONCE`) is refused. `parent`
+/// is the outgoing process `seamless::prearm_incoming_fds` attested; the claim goes only to a
+/// listener the kernel says is that process ([`listener_may_receive_claim`]), and `None`
+/// refuses. No process-environment access: callable from any thread.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2700,9 +2303,7 @@ pub(crate) fn claim_incoming(
 ) -> Result<ClaimedHandoff, RendezvousError> {
     let chunks = offers_chunked_grant(env.take(ENV_GRANT_CAPS).as_deref());
     let (path, secret) = rendezvous_env(env.take(ENV_RENDEZVOUS), env.take(ENV_CLAIM))?;
-    // ROOM FOR THE GRANT, BEFORE THE DIAL (round six of the update audit,
-    // item 39): made before this is called, by the one settle every lane runs
-    // (`settle_incoming_descriptor_limit`).
+    // Room for the grant is made before this is called, by `settle_incoming_descriptor_limit`.
     let claimed = dial_and_claim(&path, &secret, expected_nonce, deadlines, parent, chunks)
         .map_err(claim_side);
     if claimed.is_ok() {
@@ -2711,10 +2312,9 @@ pub(crate) fn claim_incoming(
     claimed
 }
 
-/// A dial's error as the SUCCESSOR says it: [`RendezvousError::Deadline`]'s
-/// "no successor dialed" is the parent's sentence, and from this side the
-/// same expiry is this successor's own budget running out before the grant
-/// ([`RendezvousError::ClaimDeadline`], round six item 48).
+/// A dial's error as the successor says it: [`RendezvousError::Deadline`]'s "no successor
+/// dialed" is the parent's sentence; from this side the same expiry is this successor's own
+/// budget running out before the grant ([`RendezvousError::ClaimDeadline`]).
 fn claim_side(error: RendezvousError) -> RendezvousError {
     match error {
         RendezvousError::Deadline => RendezvousError::ClaimDeadline,
@@ -2731,14 +2331,9 @@ fn offers_chunked_grant(caps: Option<&std::ffi::OsStr>) -> bool {
         .is_some_and(|caps| caps.split(',').any(|cap| cap.trim() == GRANT_CAPS_CHUNKS))
 }
 
-/// Decide what a launch environment IS, from the two values already taken out of
-/// it: a dialable rendezvous, no rendezvous, or half of one.
-///
-/// Split out of [`claim_incoming`] so this decision — the one a failed update's
-/// log line quotes — can be exercised over its exact inputs. Reaching it through
-/// the process environment instead would mean mutating two process-global names
-/// inside a test binary that runs hundreds of tests on parallel threads, where
-/// `seamless`'s own env tests read these very names.
+/// Decide what a launch environment is, from the two values already taken out of it: a
+/// dialable rendezvous, none, or half of one. Split out of [`claim_incoming`] so tests drive it
+/// without mutating process-global names that other tests read.
 fn rendezvous_env(
     path: Option<std::ffi::OsString>,
     secret: Option<std::ffi::OsString>,
@@ -2746,9 +2341,8 @@ fn rendezvous_env(
     let (path, secret) = match (path, secret) {
         (Some(path), Some(secret)) => (path, secret),
         (None, None) => return Err(RendezvousError::NoRendezvous),
-        // Half is not absence, and must not be reported as it. Whatever produced
-        // one name may well have produced this process, so the launch is refused
-        // — loudly, and in the words of what actually happened.
+        // Half is not absence: whatever produced one name may have produced this process, so
+        // the launch is refused, saying which half arrived.
         (Some(_), None) => {
             return Err(RendezvousError::HalfRendezvous {
                 present: ENV_RENDEZVOUS,
@@ -2771,40 +2365,32 @@ fn rendezvous_env(
     Ok((PathBuf::from(path), secret))
 }
 
-/// The two budgets of a dial (2026-09-19, the late park). `dial` bounds the
-/// connect, the uid check and the claim write — the parent is holding the
-/// listener open and answers at once, or it has given up and the connect fails
-/// at once, so this is short. `grant` bounds the wait for the one descriptor
-/// message: long, because the outgoing process parks only at a quiet moment
-/// AFTER the successor has dialled, and holds the claim meanwhile; EOF ends it
-/// at once either way.
+/// The two budgets of a dial. `dial` bounds the connect, the uid check and the claim write: the
+/// parent holds the listener open and answers at once, or has given up and the connect fails at
+/// once. `grant` bounds the wait for the descriptors: long, because the outgoing process parks
+/// only at a quiet moment after the successor has dialled, holding the claim meanwhile; EOF ends
+/// it at once either way.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClaimDeadlines {
     pub dial: Instant,
     pub grant: Instant,
 }
 
-/// THE LISTENER MUST BE THE ATTESTED PARENT before the claim secret leaves this
-/// process. The environment named a PATH, and a path is not an identity; the
-/// parental attestation named a PROCESS. So the kernel is asked both halves about
-/// the listener this dial reached, and both must answer for that process:
+/// The listener must be the attested parent before the claim secret leaves this process: the
+/// environment named a path, and the parental attestation named a process. The kernel is asked
+/// both halves about the listener this dial reached:
 ///
-/// * its uid (`getpeereid`) is ours — a listener of any other uid, whatever put
-///   it there, gets nothing;
-/// * its pid (`LOCAL_PEERPID`, read on the DIALING end: XNU copies it from the
-///   listening socket at `connect(2)`, before any `accept`, and no peer can
-///   assert it for itself) is the attested parent's, and that parent is still
-///   the process attested ([`crate::seamless::AttestedParent::owns_live_listener`]:
-///   the birth witness must still match, so a recycled pid fails).
+/// * its uid (`getpeereid`) is ours;
+/// * its pid (`LOCAL_PEERPID` on the dialing end: XNU copies it from the listening socket at
+///   `connect(2)`, before any `accept`, and no peer can assert it) is the attested parent's,
+///   and that parent is still the process attested
+///   ([`crate::seamless::AttestedParent::owns_live_listener`]: a recycled pid fails).
 ///
-/// Before 2026-09-27 only the uid half ran, so any same-uid process listening at
-/// the published path received the claim: the birth record that attests the
-/// parent is copyable (`ps`), and the listener was never compared with it. The
-/// refusal is fail-closed and cheap — the successor exits before any window
-/// (its caller's "could not be claimed" arm) and the outgoing process, which
-/// never saw a claim, keeps every session. `NativeUpdateRendezvousClaim`
-/// (aterm-spec) is the model; `claim_presentation_conformance` below binds this
-/// function to it.
+/// The uid alone would hand the claim to any same-uid process listening at the published path
+/// (the birth record that attests the parent is copyable with `ps`). A refusal is fail-closed:
+/// the successor exits before any window and the outgoing process keeps every session.
+/// `NativeUpdateRendezvousClaim` (aterm-spec) is the model; `claim_presentation_conformance`
+/// binds it.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2874,25 +2460,13 @@ fn dial_and_claim(
         .map_err(|error| RendezvousError::Dial(error.to_string()))?;
 
     let grant_failed = |error: std::io::Error| RendezvousError::Grant(error.to_string());
-    // The header is read by the descriptor-bearing receive. `fdpass` documents
-    // that ALL of a message's descriptors arrive on the call that dequeues its
-    // first byte, so a short read here could cost bytes and never descriptors —
-    // and the buffer is the one-message header, which is also the chunked
-    // header's first eight bytes. `max_fds` is the message ceiling because the
-    // exact count is in the body, which has not been read yet; the exact check
-    // happens below, and an over-count is `fdpass`'s own fatal `InvalidData`.
-    //
-    // The read bound is RECOMPUTED here rather than inherited from the one set
-    // above: a socket timeout is spent per syscall, so the write and this receive
-    // would otherwise be allowed the full budget each.
-    //
-    // And it is the GRANT DEADLINE that ends this wait, never the socket
-    // timeout (round eight of the update audit, #80): this is the successor's
-    // long wait — up to the parent's hold budget — and a bare receive handed
-    // its expiry back as `WouldBlock`, which read as a malformed grant rather
-    // than as the deadline `claim_incoming` says as `ClaimDeadline`. The same
-    // loop the continuations use re-arms after a timeout or a signal and lets
-    // only the deadline decide.
+    // The header is read by the descriptor-bearing receive: `fdpass` delivers all of a message's
+    // descriptors on the call that dequeues its first byte, so a short read costs bytes, never
+    // descriptors. The buffer is the one-message header, also the chunked header's first eight
+    // bytes; `max_fds` is the message ceiling because the exact count is in the body (checked
+    // below; an over-count is `fdpass`'s fatal `InvalidData`). The grant deadline, not a socket
+    // timeout, ends this long wait: a bare receive's expiry would read as a malformed grant
+    // rather than as `ClaimDeadline`.
     let mut header = [0u8; GRANT_HEADER_LEN];
     let received = recv_fds_by_deadline(&stream, &mut header, deadlines.grant)?;
     let mut fds = received.fds;
@@ -2909,9 +2483,8 @@ fn dial_and_claim(
             &grant_failed,
         )?;
     }
-    // WHICH GRANT. The chunked one only after this process claimed it: a
-    // successor that claimed `ATRZ1C` refuses `ATRZ2G` as a wrong magic, exactly
-    // as every successor before the chunked grant does.
+    // Which grant: the chunked one only after this process claimed it; an `ATRZ1C` claimant
+    // refuses `ATRZ2G` as a wrong magic.
     let magic = &header[..GRANT_MAGIC.len()];
     let chunk_count = if magic == GRANT_MAGIC {
         None
@@ -2946,10 +2519,9 @@ fn dial_and_claim(
 
     let expected = sessions.len() + RENDEZVOUS_CHANNEL_FDS;
     if let Some(count) = chunk_count {
-        // THE LAYOUT IS COMPUTED, NOT BELIEVED: the body's session count fixes
-        // how many messages there are and what each carries. Every message is
-        // required to be exactly that, under the one grant deadline, and the
-        // first refusal drops — closes — everything received so far.
+        // The layout is computed, not believed: the body's session count fixes how many
+        // messages there are and what each carries, every message must be exactly that under the
+        // one grant deadline, and the first refusal drops (closes) everything received so far.
         if sessions.len() > MAX_CHUNKED_SESSIONS {
             return Err(RendezvousError::DescriptorCount {
                 expected,
@@ -3043,11 +2615,10 @@ fn dial_and_claim(
     })
 }
 
-/// One descriptor-bearing receive of a fixed frame, under ONE deadline: a
-/// receive that times out or is interrupted before anything was dequeued is
-/// tried again with the budget re-derived from the deadline, and the deadline
-/// itself is the only thing that ends the wait. `fdpass` makes the retry safe —
-/// an interrupted or timed-out `recvmsg` dequeued nothing, descriptors included.
+/// One descriptor-bearing receive of a fixed frame under one deadline: a receive that times out
+/// or is interrupted is tried again with the budget re-derived, and only the deadline ends the
+/// wait. Safe because an interrupted or timed-out `recvmsg` dequeued nothing, descriptors
+/// included (`fdpass`).
 fn recv_fds_by_deadline(
     stream: &CtlStream,
     buf: &mut [u8],
@@ -3070,13 +2641,10 @@ fn recv_fds_by_deadline(
     }
 }
 
-/// Arm `stream`'s read timeout for the next receive. A socket whose BOTH
-/// directions are already shut — the peer sent its last bytes and closed, as
-/// the outgoing process does the instant its grant is sent — makes Darwin's
-/// `setsockopt(SO_RCVTIMEO)` fail with EINVAL. Such a socket cannot block a
-/// read (it returns what is queued, then 0), so the timeout is not needed and
-/// the refusal is not a failure of the exchange: the read goes ahead and says
-/// what is really there. Any other error is returned.
+/// Arm `stream`'s read timeout for the next receive. On a socket shut both ways (the peer sent
+/// its last bytes and closed, as the outgoing process does once its grant is sent) Darwin's
+/// `setsockopt(SO_RCVTIMEO)` fails `EINVAL`; such a socket cannot block a read (it returns what
+/// is queued, then 0), so that refusal is ignored. Any other error is returned.
 fn arm_read_timeout(stream: &CtlStream, timeout: Duration) -> std::io::Result<()> {
     match stream.set_read_timeout(Some(timeout)) {
         Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
@@ -3084,20 +2652,13 @@ fn arm_read_timeout(stream: &CtlStream, timeout: Duration) -> std::io::Result<()
     }
 }
 
-/// Read exactly `buf.len()` bytes, with ONE deadline over the WHOLE frame.
+/// Read exactly `buf.len()` bytes under one deadline over the whole frame. `set_read_timeout`
+/// bounds a syscall and `read_exact` under it restarts that clock on every short read, so a peer
+/// dribbling a byte before each expiry could stretch the 70-byte claim frame to about 70
+/// budgets, before either gate runs. The remaining budget is re-derived before every read.
 ///
-/// `set_read_timeout` bounds a SYSCALL, not an operation, and `read_exact` under
-/// it restarts that clock on every short read. A peer that dribbles one byte just
-/// before each expiry therefore stretched a fixed 70-byte claim frame to about 70
-/// times the budget it was supposed to fit in — with the user's terminal parked
-/// for all of it, and BEFORE either gate has run, since the claim frame is read
-/// before the pid check. A timeout is not a deadline; this is the deadline. The
-/// remaining budget is recomputed before every read, so the frame costs what the
-/// deadline allows no matter how the peer chops it up.
-///
-/// `wrap` names the side: the same expiry is an `Accept` refusal for the parent
-/// and a `Grant` refusal for the successor, while [`RendezvousError::Deadline`]
-/// comes straight from the budget and means the same thing on both.
+/// `wrap` names the side: the same expiry is an `Accept` refusal for the parent and a `Grant`
+/// refusal for the successor; [`RendezvousError::Deadline`] comes from the budget on both.
 fn read_frame_by_deadline(
     stream: &CtlStream,
     buf: &mut [u8],
@@ -3107,8 +2668,8 @@ fn read_frame_by_deadline(
     let mut source = stream;
     let mut filled = 0usize;
     while filled < buf.len() {
-        // The budget is re-derived from the deadline HERE, so the loop cannot
-        // hand the peer a fresh full timeout for the next byte.
+        // The budget is re-derived from the deadline here, so the loop cannot hand the peer a
+        // fresh full timeout for the next byte.
         let remaining = remaining_io_budget(deadline)?;
         arm_read_timeout(source, remaining).map_err(wrap)?;
         match source.read(&mut buf[filled..]) {
@@ -3137,7 +2698,7 @@ fn read_frame_by_deadline(
 }
 
 /// [`remaining_io_budget`] for the parent's grant, before its first `sendmsg`:
-/// the deadline running out THERE is this process's own lateness after a dial,
+/// the deadline running out there is this process's own lateness after a dial,
 /// never "no successor dialed" ([`RendezvousError::GrantDeadline`]).
 fn grant_budget(deadline: Instant) -> Result<Duration, RendezvousError> {
     remaining_io_budget(deadline).map_err(|_| RendezvousError::GrantDeadline)
@@ -3226,7 +2787,7 @@ mod tests {
         );
     }
 
-    /// THE PARK STAMP RIDES THE GRANT. A parent that sampled 1.5 ms after parking
+    /// The park stamp rides the grant: a parent that sampled 1.5 ms after parking
     /// says so on the body's last line, to the microsecond, and the
     /// successor reads it back beside the unchanged session list. A body without it —
     /// a parent from before the stamp — still parses, with no stamp (the negative
@@ -3379,15 +2940,14 @@ mod tests {
         assert!(remaining_io_budget(live).expect("live budget") >= MIN_IO_TIMEOUT);
     }
 
-    /// THE CODE CHECK JUDGES THE TOKEN THE GATE READ, AND ONLY IF IT NAMES THE
-    /// ATTESTED DIALER (round eight of the update audit, U36's second review).
-    /// The token read from the connection, naming the attested pid, is checked
-    /// and passes. NEGATIVE CONTROLS: the same token against another attested
-    /// pid is not checked at all, and a token for a later image at the same pid
-    /// (its pid version moved on) fails the lookup, where a fresh read at a
-    /// recheck would have judged whatever ran there then. Neither is a verdict,
-    /// and neither is a pass. Each check goes through the gate's own hold, with
-    /// the one-minute hang detector as its deadline.
+    /// The code check judges the token the gate read, and only if it names the
+    /// attested dialer: the token read from the connection, naming the attested
+    /// pid, is checked and passes. Negative controls: the same token against
+    /// another attested pid is not checked at all, and a token for a later
+    /// image at the same pid (its pid version moved on) fails the lookup, where
+    /// a fresh read at a recheck would have judged whatever ran there then.
+    /// Neither is a verdict, and neither is a pass. Each check goes through the
+    /// gate's own hold, with the one-minute hang detector as its deadline.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_code_check_judges_the_token_read_at_the_claim_and_only_for_its_pid() {
@@ -3425,18 +2985,17 @@ mod tests {
         );
     }
 
-    /// A CHECK THE GATE LET THROUGH, ANSWERED ONLY AFTER ITS IN-LINE WAIT, IS
-    /// THE HOLD'S ANSWER. The dialer is held, that same check is waited for past
+    /// A check the gate let through, answered only after its in-line wait, is
+    /// the hold's answer: the dialer is held, that same check is waited for past
     /// two recheck intervals, and the connection is admitted on its answer with
-    /// no second check asked: a slow `trustd` is a delay, never a refusal. A
+    /// no second check asked, so a slow `trustd` is a delay, never a refusal. A
     /// scripted check stands in for `trustd` through the process's one `trustd`
     /// gate (`aterm_uds::deadline::TRUST`), so this runs alone in a child, and
     /// it answers in the hold's own slices, never after a sleep.
     ///
-    /// NEGATIVE CONTROL: the shape the hold had before it waited for its check —
-    /// each check cut at its in-line wait, called unanswered and asked again —
-    /// through the same seam asks again once `trustd` has answered the first
-    /// check, and has not admitted the dialer by then.
+    /// Negative control: each check cut at its in-line wait, called unanswered
+    /// and asked again through the same seam asks again once `trustd` has
+    /// answered the first check, and has not admitted the dialer by then.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_check_answered_after_its_in_line_wait_is_waited_for_and_never_asked_again() {
@@ -3581,7 +3140,7 @@ mod tests {
     }
 
     /// A dialer that claims — under `ATRZ2C` when `chunks` — and then only
-    /// COUNTS: every descriptor any frame brings it until the parent's close,
+    /// counts: every descriptor any frame brings it until the parent's close,
     /// one message or chunked, so a test reads what really reached the other
     /// end rather than whether a well-formed grant did.
     fn dial_and_count(
@@ -3611,15 +3170,11 @@ mod tests {
         })
     }
 
-    /// THE CHUNKED GRANT LEAVES ONLY WHILE THE KERNEL STILL NAMES THE PROCESS
-    /// THE GATE CHECKED (U36's second review). The one-message grant's check
-    /// is measured on a real `exec` by
-    /// `a_grant_is_not_sent_once_the_dialers_image_changed`; the chunked
-    /// grant's own check before its first `sendmsg` is driven here (round
-    /// eight's U0 review: with it deleted, every test still passed). The
-    /// token the gate checked is replaced by one for a later image at the
-    /// same pid, and `transfer` sends nothing: `TransferNotSent`, naming the
-    /// change, and the dialer receives no descriptor before the end of file.
+    /// The chunked grant leaves only while the kernel still names the process
+    /// the gate checked: the token the gate checked is replaced by one for a
+    /// later image at the same pid, and `transfer` sends nothing
+    /// (`TransferNotSent`, naming the change), so the dialer receives no
+    /// descriptor before the end of file.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_grant_is_not_sent_when_the_dialers_token_is_not_the_one_checked() {
@@ -3723,23 +3278,18 @@ mod tests {
         received
     }
 
-    /// STAND-IN: a successor-shaped dialer of THIS test binary's code — it
-    /// dials, presents the claim, and waits for the parent's go. Then, unless
-    /// told to stay, it REPLACES ITS IMAGE with this binary again, keeping the
-    /// claimed connection open across the `exec` (its close-on-exec flag
-    /// cleared), and the new image counts what reaches it on that connection.
-    /// A no-op in the ordinary run.
+    /// Stand-in: a successor-shaped dialer of this test binary's code. It dials, claims and waits
+    /// for the parent's go; then, unless told to stay, it `exec`s this binary again with the
+    /// claimed connection kept open, and the new image counts what reaches it. A no-op in the
+    /// ordinary run.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn exec_dialer_stand_in() {
         use std::os::unix::process::CommandExt as _;
         if std::env::var_os(EXEC_DIALER_FD).is_some() {
-            // The image before this one handed over exactly this descriptor,
-            // its claimed connection, and exec'd. CHECKED, not assumed
-            // (`test_alone::handed`): a number that held nothing, or something
-            // this image opened since, would read to its end with nothing
-            // received — "0 DESCRIPTORS", the very count the test expects of
-            // an image the gate refused.
+            // The image before this one handed over exactly this descriptor and exec'd. Checked
+            // (`test_alone::handed`): a number holding nothing, or something opened since, would
+            // read "0 DESCRIPTORS", the count expected of an image the gate refused.
             let stream = CtlStream::from(crate::test_alone::handed(EXEC_DIALER_FD));
             let execd = std::env::var_os(EXEC_DIALER_EXECD).expect("the marker's path");
             std::fs::write(execd, b"").expect("say the new image runs");
@@ -3782,24 +3332,11 @@ mod tests {
         panic!("exec the new image: {error}");
     }
 
-    /// A GRANT IS NOT SENT ONCE THE DIALER'S IMAGE CHANGED (round eight's U0
-    /// review), on the real kernel. The stand-in — another process, running this
-    /// binary's code, so it passes the code gate as the attested dialer — claims,
-    /// and once the gate has read and checked its audit token it `exec`s a new
-    /// image at the same pid, the claimed connection kept open across it. The
-    /// grant is then refused before any descriptor leaves (`TransferNotSent`,
-    /// "audit token changed"), and the new image, reading that connection,
-    /// receives nothing before the end of file.
-    ///
-    /// WHAT IT MEASURES: the kernel answers `LOCAL_PEERTOKEN` live, and an
-    /// `exec` moves the token's pid version while the pid stays — so the check
-    /// before the send can fire on a live connection, not only on the synthetic
-    /// token of `a_grant_is_not_sent_when_the_dialers_token_is_not_the_one_checked`.
-    /// Were the token fixed at `connect(2)`, the grant would go out here.
-    ///
-    /// POSITIVE CONTROL: the same stand-in told to stay in the image that
-    /// claimed is granted, and receives every descriptor — so the refusal is the
-    /// exec's, not a cross-process comparison that never matches.
+    /// A grant is not sent once the dialer's image changed: a stand-in running this binary's code
+    /// claims and passes the gate, then `exec`s at the same pid with the connection kept open;
+    /// the grant is refused (`TransferNotSent`, "audit token changed") and the new image receives
+    /// nothing. This measures that `LOCAL_PEERTOKEN` is answered live and an `exec` moves its pid
+    /// version. Positive control: the stand-in told to stay is granted every descriptor.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_grant_is_not_sent_once_the_dialers_image_changed() {
@@ -3878,24 +3415,17 @@ mod tests {
         }
     }
 
-    /// THE PARENT HANGS UP RIGHT AFTER THE GRANT, AND THE CLAIM STILL LANDS
-    /// (2026-09-29, found by the warm-successor P1 A/B). The outgoing process
-    /// drops the connection the instant `transfer` returns
-    /// (`app_update_handoff`, "From here the successor holds copies of
-    /// everything"), while the successor may still be between the header's
-    /// receive and the body's read. Darwin answers `setsockopt(SO_RCVTIMEO)` on
-    /// a socket whose both directions are shut with EINVAL, and the successor
-    /// used to take that for a broken grant: it dropped every descriptor it had
-    /// been given, the parent read EOF on the readiness pipe and killed it —
-    /// "candidate died before proving adoption", 2 of ~45 same-image applies on
-    /// a loaded machine. The bytes and descriptors were already queued; a
-    /// fully shut socket cannot block a read, so the timeout is not needed to
-    /// read them. Repeated because the window is a race; before the fix the
-    /// first iteration failed every time it was run.
+    /// The parent hangs up right after the grant, and the claim still lands:
+    /// the outgoing process drops the connection the instant `transfer` returns
+    /// while the successor may still be between the header's receive and the
+    /// body's read. Darwin answers `setsockopt(SO_RCVTIMEO)` on a socket whose
+    /// both directions are shut with `EINVAL`, and a fully shut socket cannot
+    /// block a read of bytes and descriptors already queued, so the timeout is
+    /// not needed to read them. Repeated because the window is a race.
     ///
-    /// And the transport's own fact, asserted rather than recalled: the
-    /// successor holds the SAME open file description at a DIFFERENT number,
-    /// which is why the proof term is the PTY's device and not the fd.
+    /// Also asserts that the successor holds the same open file description at a
+    /// different number, which is why the proof term is the PTY's device and not
+    /// the fd.
     #[test]
     fn a_grant_whose_connection_closes_at_once_is_still_claimed() {
         for _ in 0..20 {
@@ -3963,12 +3493,12 @@ mod tests {
         }
     }
 
-    /// THE LAUNCHED LANE'S SHAPE ACROSS TWO REAL PROCESSES (2026-09-27): the
-    /// production code at both ends, with the successor a SEPARATE process — not a
-    /// thread of the listener, and not a listener forked for the test. This
-    /// process is the outgoing parent: it binds with [`Rendezvous::bind`], accepts
-    /// with [`Rendezvous::accept_claim`] and grants with `transfer`. The successor
-    /// is this test binary re-run as a child that attests this process the way a
+    /// The launched lane's shape across two real processes: the production code
+    /// at both ends, with the successor a separate process — not a thread of the
+    /// listener, and not a listener forked for the test. This process is the
+    /// outgoing parent: it binds with [`Rendezvous::bind`], accepts with
+    /// [`Rendezvous::accept_claim`] and grants with `transfer`. The successor is
+    /// this test binary re-run as a child that attests this process the way a
     /// LaunchServices successor does (no live parent link, so by its birth
     /// record) and dials with [`dial_and_claim`] — so its identity gate reads
     /// `LOCAL_PEERPID` against a listener that the real bind created in another
@@ -3979,7 +3509,7 @@ mod tests {
     fn a_successor_process_claims_from_the_real_outgoing_listener() {
         const CHILD: &str = "RZ_CROSS_PROCESS_SUCCESSOR";
         if let Some(spec) = std::env::var_os(CHILD) {
-            // THE SUCCESSOR: `<path>\n<claim>\n<parent pid>\n<device term>`.
+            // The successor: `<path>\n<claim>\n<parent pid>\n<device term>`.
             let spec = spec.into_string().expect("the child spec is UTF-8");
             let mut fields = spec.split('\n');
             let mut field = || fields.next().expect("a complete child spec");
@@ -4021,11 +3551,8 @@ mod tests {
         let child = std::cell::RefCell::new(child.spawn());
         let successor = i32::try_from(child.borrow().id()).expect("a pid fits pid_t");
 
-        // A hang detector for a process start, cut short by the successor's
-        // own end: one that ended first is judged by its run. The successor's
-        // claim deadline is past this one, so this is the one hang detector,
-        // and a successor HELD for `trustd` (the held refusal, or one that
-        // left while held) is the machine's, named before the child's run is.
+        // A hang detector for a process start, cut short by the successor's own end. A successor
+        // held for `trustd` is the machine's, named before the child's run is.
         let turned_away = std::cell::RefCell::new(Vec::new());
         let claimed = rendezvous.accept_claim_observed(
             Some(successor),
@@ -4072,15 +3599,10 @@ mod tests {
         aterm_pty::close_fd(slave);
     }
 
-    /// WHICH SIDE OF THE `sendmsg` A TRANSFER FAILURE FELL ON (2026-09-14, audit
-    /// AH-6). A peer that has closed BEFORE the parent transfers makes the
-    /// descriptor-carrying `sendmsg` itself fail: `TransferNotSent`, the one shape
-    /// `NeverTransferred` may rest on. A peer that dequeues the header — and with it
-    /// every descriptor — and then closes can only produce `Ok` (the body was
-    /// buffered before the close) or `TransferPartial`: never `TransferNotSent`,
-    /// because the descriptors are already the peer's. The second half is a race
-    /// the kernel decides, so it is pinned as the invariant rather than as one
-    /// outcome.
+    /// Which side of the `sendmsg` a transfer failure fell on: a peer closed before the transfer
+    /// makes the descriptor-carrying `sendmsg` fail (`TransferNotSent`); a peer that dequeues the
+    /// header and then closes yields `Ok` or `TransferPartial`, never `TransferNotSent`. The
+    /// second half is a kernel race, so it is pinned as the invariant.
     #[test]
     fn a_transfer_failure_says_whether_the_descriptors_left() {
         let rendezvous = bind_for_test();
@@ -4189,7 +3711,7 @@ mod tests {
     }
 
     /// A dialer that does not know the secret is refused, and when nobody better
-    /// arrives the wait ends on THAT refusal rather than on a bare deadline —
+    /// arrives the wait ends on that refusal rather than on a bare deadline —
     /// "no successor dialed" would be false, and which of the two happened is
     /// what a field investigation reads first.
     #[test]
@@ -4215,12 +3737,8 @@ mod tests {
         drop(stream);
     }
 
-    /// A WRONG DIALER COSTS ITS OWN CONNECTION, NOT THE UPDATE. The path is
-    /// `0600` inside a `0700` directory, so a wrong dialer is same-uid — and
-    /// while the secret is what stops it taking the handoff, an earlier shape let
-    /// it END the handoff by connecting first, which made any same-uid process a
-    /// denial of update for the price of one `connect(2)`. The refusal must be of
-    /// the CONNECTION: the real successor, dialing second, still gets everything.
+    /// A wrong dialer costs its own connection, not the update: it is refused and closed, and the
+    /// real successor dialing second still claims everything.
     #[test]
     fn a_wrong_dialer_does_not_end_the_attempt_and_the_successor_still_claims() {
         let rendezvous = bind_for_test();
@@ -4230,8 +3748,8 @@ mod tests {
         let path = rendezvous.path().to_path_buf();
         let claim = rendezvous.claim().to_string();
 
-        // FIRST in the accept queue, and inline rather than on a thread so it is
-        // provably first: connected and fully spoken before the real dial exists.
+        // First in the accept queue: connected and fully spoken inline, before the real dial
+        // exists.
         let bogus = CtlStream::connect(&path).expect("the wrong dialer connects");
         (&bogus)
             .write_all(&claim_frame(&"f".repeat(CLAIM_HEX_LEN)))
@@ -4342,28 +3860,20 @@ mod tests {
         drop(flood);
     }
 
-    /// A PEER THAT DRIBBLES CANNOT STRETCH THE DEADLINE. `set_read_timeout` is a
-    /// PER-SYSCALL bound, so a `read_exact` under it restarts the clock on every
-    /// byte: one byte delivered just inside each expiry turned a fixed 70-byte
-    /// claim frame into roughly 70 budgets' worth of parked terminal — and this
-    /// is pre-authentication, since the frame is read before the pid check. What
-    /// bounds the frame now is the deadline, so a dribbler is refused AT it.
+    /// A dribbling dialer is refused at the deadline: `set_read_timeout` bounds one syscall, so
+    /// the frame read re-derives its budget from the deadline before every read.
     #[test]
     fn a_dribbling_dialer_is_refused_at_the_deadline_rather_than_stretching_it() {
         let rendezvous = bind_for_test();
         let path = rendezvous.path().to_path_buf();
-        // The RIGHT secret, delivered too slowly: what is being tested is the
-        // budget, so the frame must be one that would otherwise be accepted.
+        // The right secret, delivered too slowly: the budget is under test, so the frame must be
+        // one that would otherwise be accepted.
         let claim = rendezvous.claim().to_string();
-        // This binary's code requirement is read BEFORE the dribble starts and
-        // the clock runs: it asks Security.framework, which no deadline under
-        // test bounds. Read inside the timed window, the full suite at load 40
-        // (2026-10-02) measured 21 s there, the frame long arrived whole.
+        // Read before the dribble and the clock start: it asks Security.framework, which no
+        // deadline under test bounds.
         let code = crate::handoff_rendezvous::DialerCode::this_process();
-        // Connected inline, before the wait starts, so the accept finds it at
-        // once and the refusal is always the frame read's: a dial left to a
-        // thread that a loaded machine starts late would end the wait on the
-        // bare deadline with no frame read at all, and pass saying nothing.
+        // Connected inline, before the wait starts, so the refusal is always the frame read's,
+        // never a bare deadline with no frame read.
         let stream = CtlStream::connect(&path).expect("connect");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dribbler = {
@@ -4394,15 +3904,11 @@ mod tests {
             refused.is_err(),
             "a frame that does not arrive inside the deadline is refused, not awaited"
         );
-        // The refusal alone cannot tell the reads apart: `gate_one` checks the
-        // deadline again after the frame, so a read that ignored it is refused
-        // too, with the same error. How much of the frame was CONSUMED can: 70
-        // bytes 10 ms apart take at least 690 ms, past the attempt's 300 ms
-        // deadline and inside the frame's own `CLAIM_FRAME_BUDGET` (2 s). A read
-        // bounded by the deadline gives up at about 30 bytes and drops the
-        // stream; one bounded only by the frame budget, or restarting a per-read
-        // timeout, returns only after all 70. Load only slows the dribbler, so
-        // it cannot fail a correct tree.
+        // The refusal alone cannot tell the reads apart (`gate_one` checks the deadline again
+        // after the frame); how much of the frame was consumed can. 70 bytes 10 ms apart take at
+        // least 690 ms, past the 300 ms deadline and inside `CLAIM_FRAME_BUDGET` (2 s): a read
+        // bounded by the deadline gives up near 30 bytes, while one bounded only by the frame
+        // budget, or restarting a per-read timeout, reads all 70. Load only slows the dribbler.
         let wrote = dribbler.join().expect("dribbler thread");
         assert!(
             wrote < CLAIM_FRAME_LEN,
@@ -4411,12 +3917,9 @@ mod tests {
         );
     }
 
-    /// HALF A RENDEZVOUS REPORTS ITSELF AS HALF. `rendezvous_present` answers yes
-    /// to either name alone (fail-closed: a successor that starts a fresh window
-    /// over a parent's live sessions is the one unacceptable outcome), and the
-    /// claim path used to answer "this launch carries no rendezvous" — which the
-    /// caller wraps in "this launch carries a rendezvous but could not claim it
-    /// (...)", so the one line a failed update leaves behind contradicted itself.
+    /// Half a rendezvous environment says so: `rendezvous_present` answers yes to either name
+    /// alone, and the claim path's error names both halves, never "carries no rendezvous", which
+    /// the caller's "carries a rendezvous but could not claim it" line would contradict.
     #[test]
     fn half_a_rendezvous_environment_says_so_instead_of_claiming_to_be_neither() {
         let some = |value: &str| Some(std::ffi::OsString::from(value));
@@ -4505,11 +4008,8 @@ mod tests {
         }
     }
 
-    /// THE HELD CLAIM (2026-09-19, the late park): the parent accepts the dial,
-    /// HOLDS the served stream while it does other work, and the one descriptor
-    /// message still arrives whole — and the hold is bounded by the dialer's
-    /// GRANT budget, not its dial budget, so a dial budget already spent by the
-    /// time the parent parks does not end a legitimate wait.
+    /// A held claim: the parent holds the served stream and the grant still arrives whole,
+    /// bounded by the dialer's grant budget, not its already spent dial budget.
     #[test]
     fn a_held_claim_is_granted_after_the_hold_under_the_grant_budget() {
         let rendezvous = bind_for_test();
@@ -4518,16 +4018,10 @@ mod tests {
         let (commit_rd, commit_wr) = pipe_for_test();
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
-        // THE HOLD WAITS OUT THE DIAL BUDGET IT WAS HANDED, NOT A GUESS AT IT (the
-        // load-sensitive test audit of 2026-09-27). The dial budget used to be
-        // 150 ms stamped inside the dialer against a fixed 400 ms hold, so a
-        // dialer kept off the CPU for 150 ms between its connect and its claim
-        // write failed `Deadline` on a correct tree. The budget is now fixed here,
-        // before the dialer exists, and generous for a connect, a getsockopt and
-        // a 70-byte write; the hold sleeps until that same instant has passed,
-        // plus `PAST_THE_DIAL` for a receive a regressed dialer bounded by it to
-        // expire. The grant therefore still arrives only after the dial budget is
-        // spent — which is the property — and only the grant budget can govern it.
+        // The dial budget is fixed here, before the dialer exists, and generous for a connect, a
+        // getsockopt and a 70-byte write; the hold sleeps past that instant plus `PAST_THE_DIAL`,
+        // so the grant arrives only after the dial budget is spent and only the grant budget can
+        // govern it.
         const PAST_THE_DIAL: Duration = Duration::from_millis(250);
         let dial = Instant::now() + Duration::from_secs(2);
         // The grant budget is a hang detector, never a latency budget.
@@ -4576,10 +4070,9 @@ mod tests {
         aterm_pty::close_fd(slave);
     }
 
-    /// AN ACCEPT SHORT OF A DESCRIPTOR HAS ALREADY LOST ITS DIAL (round eight
-    /// of the update audit, #3's accept half). Pinned because it is why
+    /// An accept short of a descriptor has already lost its dial, which is why
     /// `accept_one` ends the wait on such an error instead of waiting for room:
-    /// Darwin dequeues the connection BEFORE it allocates the descriptor, and
+    /// Darwin dequeues the connection before it allocates the descriptor, and
     /// when the allocation fails it closes the connection rather than putting
     /// it back. So the dialer this process could not accept is told at once —
     /// its claim reads the end of the rendezvous and it exits before any
@@ -4610,11 +4103,9 @@ mod tests {
             }
         }
         drop(filler.pop());
-        // Both sides' budgets are THREE MINUTES, and both "at once" checks below a
-        // minute's hang detector: an end that waited for its budget instead
-        // cannot pass on a loaded machine's luck, nor fail a correct tree on it.
-        // Three, not more: this body runs in `test_alone`'s child, which is
-        // SIGKILLed at five, and a regression here must fail with its own message.
+        // Both budgets are three minutes and both "at once" checks a minute's hang detector, so
+        // an end that waited for its budget fails with its own message before `test_alone`
+        // SIGKILLs this child at five.
         let dialer = std::thread::spawn(move || {
             let started = Instant::now();
             let outcome =
@@ -4678,16 +4169,9 @@ mod tests {
         drop(rendezvous);
     }
 
-    /// A GRANT THAT NEVER COMES ENDS AS THE SUCCESSOR'S OWN DEADLINE (round
-    /// eight of the update audit, #80). The parent accepts the dial and then
-    /// neither grants nor closes — stopped, in a debugger, its worker stuck on
-    /// a hung disk — for the whole of the successor's grant budget. The one
-    /// line the successor leaves behind must say its deadline passed
-    /// (`ClaimDeadline`, round six item 48), not that the grant was malformed.
-    ///
-    /// RED before the fix: the header was a bare receive under one socket
-    /// timeout, so its expiry came back as `Grant("Resource temporarily
-    /// unavailable (os error 35)")` — "the rendezvous grant is malformed".
+    /// A grant that never comes, the parent accepting and then neither granting nor closing,
+    /// ends as the successor's own deadline (`Deadline`, said as `ClaimDeadline`), never as a
+    /// malformed grant.
     #[test]
     fn a_grant_that_never_arrives_ends_as_the_claim_deadline() {
         let rendezvous = bind_for_test();
@@ -4700,21 +4184,11 @@ mod tests {
         let dialer = std::thread::spawn(move || {
             dial_and_claim(&path, &claim, TEST_NONCE, deadlines, own_parent(), false)
         });
-        // Held, never granted, never dropped, until the dialer has answered.
-        //
-        // HELD BY THE BARE ACCEPT, NOT THE GATED CLAIM (the load-sensitive
-        // test audit of 2026-09-27, applied by round eight's review of this
-        // test). The grant budget above is stamped before the dialer exists
-        // and is short on purpose, so on a loaded machine the dialer may end —
-        // correctly, `Deadline` — and close its socket before this thread is
-        // scheduled. `accept_claim`'s gate would then ask the closed
-        // connection for its peer (`LOCAL_PEERPID`), Darwin answers
-        // `ENOTCONN`, the dial is refused `PeerUnattested`, and the claim
-        // waits out its minute and fails a correct tree. The property is the
-        // DIALER's: its own grant budget ends its wait as `Deadline`. That
-        // needs the connection held open and unanswered, which `accept_one`
-        // does whether or not the dialer is still connected, and nothing from
-        // the parent's gates. The minute is a hang detector.
+        // Held, never granted, never dropped, until the dialer has answered, by the bare accept
+        // rather than the gated claim: on a loaded machine the dialer may end (correctly,
+        // `Deadline`) and close before this thread runs, and the gate would then refuse it
+        // `PeerUnattested` (`LOCAL_PEERPID` answers `ENOTCONN`). The property is the dialer's.
+        // The minute is a hang detector.
         let held = rendezvous
             .accept_one(Instant::now() + Duration::from_secs(60), &|| false)
             .expect("accepted");
@@ -4742,10 +4216,8 @@ mod tests {
     /// is: a child another test in this binary is forking holds one until it
     /// execs, longer on a loaded machine, and a descriptor made close-on-exec
     /// non-atomically (macOS `socket` + `FIOCLEX`) can ride through the exec
-    /// itself. So a hang-up is waited for, not expected at once: a hang
-    /// detector's minute, where it was ~0.5 s of polls, or none — the fd-copy
-    /// sweep of 2026-09-27, the class `claude_lights`' gesture tests failed a
-    /// gate on.
+    /// itself. So a hang-up is waited for up to the one-minute hang detector,
+    /// not expected at once.
     fn wait_for_hangup(hung_up: impl Fn() -> bool) {
         let seen = aterm_spec::wait::within(
             aterm_spec::wait::MUST_HAPPEN,
@@ -4860,10 +4332,9 @@ mod tests {
         format!("{TEST_NONCE}\n{entries}\n")
     }
 
-    /// THE LAYOUT BOTH SIDES COMPUTE: every descriptor placed once, no message
-    /// over the `SCM_RIGHTS` ceiling, the two pipes always in the last message,
-    /// never more messages than the header can name — and up to 62 sessions,
-    /// exactly one message, which is the one-message grant's shape.
+    /// The layout both sides compute: every descriptor placed once, no message over the
+    /// `SCM_RIGHTS` ceiling, the pipes always last, no more messages than the header can name,
+    /// and exactly one message up to 62 sessions.
     #[test]
     fn the_chunk_layout_places_every_descriptor_and_the_pipes_last() {
         for sessions in 1..=MAX_CHUNKED_SESSIONS {
@@ -4933,15 +4404,11 @@ mod tests {
         assert!(!offers_chunked_grant(None));
     }
 
-    /// A LAUNCHED SUCCESSOR MAKES ROOM FOR ITS GRANT BEFORE IT DIALS (round six
-    /// of the update audit, item 39). Run in a child of the test binary whose
-    /// soft descriptor limit leaves 64 to spare — launchd's 256 in miniature —
-    /// the claim's raise lifts it to the floor (or the hard limit), and then a
-    /// 100-session chunked grant crosses whole in that very process.
-    ///
-    /// RED without the raise: in a process that low the 100-session grant
-    /// runs out of descriptors (here already while the test stages its pipes;
-    /// in a launched successor, while it receives the later chunks).
+    /// A launched successor makes room for its grant before it dials: run in a
+    /// child of the test binary whose soft descriptor limit leaves 64 to spare —
+    /// launchd's 256 in miniature — the claim's raise lifts it to the floor (or
+    /// the hard limit), and then a 100-session chunked grant crosses whole in
+    /// that very process.
     #[test]
     fn a_successor_raises_its_descriptor_limit_before_claiming() {
         use crate::descriptor_limit::{raise_descriptor_limit_for_claim, raised_soft_limit};
@@ -4971,16 +4438,8 @@ mod tests {
         );
     }
 
-    /// A PROOF DEADLINE THAT RAN OUT BEFORE THE SEND IS THIS PROCESS'S LATENESS
-    /// (round six of the update audit, item 48). A successor dialed and was
-    /// held; the grant's deadline had passed by the time it was sent (the
-    /// artifacts took longer than the budget). No descriptor leaves — in the
-    /// one-message grant and the chunked one — and the error says the deadline
-    /// passed after a dial, never "no successor dialed".
-    ///
-    /// RED before the fix: `transfer` returned `Deadline`, whose only words are
-    /// "no successor dialed the rendezvous before the handoff deadline", and
-    /// the caller filed it `Rejected`.
+    /// A grant whose deadline passed before the send is this process's lateness after a dial:
+    /// `GrantDeadline` with nothing sent (one-message and chunked), never "no successor dialed".
     #[test]
     fn a_grant_past_its_deadline_says_the_successor_dialed_and_sends_nothing() {
         for (sessions, chunks) in [(3_usize, false), (100, true)] {
@@ -5038,11 +4497,8 @@ mod tests {
         }
     }
 
-    /// FAILS WITHOUT THE CHUNKED GRANT: a hundred sessions — more than one
-    /// `SCM_RIGHTS` message carries — cross the real rendezvous to a successor
-    /// that claimed `ATRZ2C`, each descriptor paired with the session it was
-    /// sent for and the two pipes last. Before, `transfer` refused them
-    /// (`TooManySessions`), and the update stood down as a producer failure.
+    /// A hundred sessions, more than one `SCM_RIGHTS` message carries, cross to an `ATRZ2C`
+    /// claimant, each descriptor paired with its session and the two pipes last.
     #[test]
     fn a_grant_of_100_sessions_crosses_in_chunks() {
         let rendezvous = bind_for_test();
@@ -5118,19 +4574,9 @@ mod tests {
         drop(reads);
     }
 
-    /// AN `ATRZ1C` CLAIMANT NEVER RECEIVES A CHUNKED GRANT, and an `ATRZ2C`
-    /// claimant of 62 or fewer sessions receives the one-message grant byte for
-    /// byte:
-    ///
-    /// - a hundred sessions for a successor that claimed `ATRZ1C` (every build
-    ///   before the chunked grant) are refused before a descriptor leaves, and
-    ///   that successor reads the close and refuses its grant;
-    /// - three sessions for a successor that claimed `ATRZ2C` go as `ATRZ1G`,
-    ///   the header and body exactly the one-message grant's;
-    /// - a successor that claimed `ATRZ1C` refuses an `ATRZ2G` header as the
-    ///   wrong magic, whatever a parent sends it.
-    ///
-    /// FAILS WITHOUT THE CHUNKED GRANT: an `ATRZ2C` claim was no claim at all.
+    /// An `ATRZ1C` claimant never receives a chunked grant: a hundred sessions for it are
+    /// refused before a descriptor leaves, and it refuses an `ATRZ2G` header as the wrong magic.
+    /// An `ATRZ2C` claimant of three sessions receives `ATRZ1G`, byte for byte.
     #[test]
     fn an_atrz1c_claim_never_receives_a_chunked_grant() {
         use std::io::Read as _;
@@ -5298,11 +4744,10 @@ mod tests {
                     .map(|fd| unsafe { BorrowedFd::borrow_raw(*fd) })
                     .collect::<Vec<_>>();
                 let _ = send(&stream, &borrowed);
-                // HELD until the dialer has answered, as a real parent holds it
-                // through the proof wait: Darwin refuses a socket option on a
-                // stream whose peer has gone (`EINVAL`), so a stub that closed
-                // at once would be refused for that and not for its grant. A
-                // grant cut short says so with a write shutdown instead.
+                // Held until the dialer has answered, as a real parent holds it through the
+                // proof wait: Darwin refuses a socket option on a stream whose peer has gone
+                // (`EINVAL`), so a stub that closed at once would be refused for that and not for
+                // its grant. A grant cut short says so with a write shutdown.
                 stream
             });
             let outcome = dial_and_claim(
@@ -5321,12 +4766,9 @@ mod tests {
         outcome
     }
 
-    /// FAILS WITHOUT THE CHUNKED GRANT: A SHORT CHUNK IS REFUSED, AND EVERY
-    /// DESCRIPTOR THE SUCCESSOR RECEIVED IS CLOSED. A hundred-session grant
-    /// whose second message carries 30 descriptors where its layout names 38,
-    /// and one whose second message never comes: both are refused, and once
-    /// the stub parent closes its own copies every one of the hundred and two
-    /// reads EOF — nothing the successor received was kept.
+    /// A hundred-session grant whose second message carries 30 descriptors where its layout
+    /// names 38, or never comes, is refused, and every descriptor the successor received is
+    /// closed.
     #[test]
     fn a_short_chunk_is_refused_and_closes_every_fd() {
         for (what, second) in [
@@ -5420,9 +4862,8 @@ mod tests {
                             step_grant(&model, &mut state, "Offer");
                         }
                         step_grant(&model, &mut state, "Launch");
-                        // THE SUCCESSOR'S CLAIM: this build's code reads the
-                        // chunked grant (`capable`); an older build's never
-                        // does, whatever it is offered.
+                        // The successor's claim: this build reads the chunked grant
+                        // (`capable`); an older build never does, whatever it is offered.
                         let caps = offered.then(|| std::ffi::OsString::from(GRANT_CAPS_CHUNKS));
                         let claims_chunks = capable && offers_chunked_grant(caps.as_deref());
                         if model.action_enabled("ClaimChunks", &state) != claims_chunks
@@ -5472,16 +4913,11 @@ mod tests {
         None
     }
 
-    /// TIER-1 FOR `NativeUpdateRendezvousGrant`: the shipping decisions —
-    /// `offers_chunked_grant` and the claim frames on the successor's side,
-    /// `grant_shape` on the parent's — are the model's guards at every
-    /// combination of successor, declaration, offer, claim and pool. The
-    /// negative control is a parent that ignores the claim (it would send
-    /// `ATRZ2G` to a build that cannot read it): the same walk must catch it.
-    /// Adoption is bound by the real transfers above:
-    /// `a_grant_of_100_sessions_crosses_in_chunks` (the whole grant adopted) and
-    /// `a_short_chunk_is_refused_and_closes_every_fd` (a grant cut short is
-    /// refused with nothing held).
+    /// Tier-1 for `NativeUpdateRendezvousGrant`: `offers_chunked_grant` and the claim frames
+    /// (the successor's side) and `grant_shape` (the parent's) are the model's guards at every
+    /// combination of successor, declaration, offer, claim and pool. Negative control: a parent
+    /// that ignores the claim. Adoption is bound by `a_grant_of_100_sessions_crosses_in_chunks`
+    /// and `a_short_chunk_is_refused_and_closes_every_fd`.
     #[test]
     fn rendezvous_grant_conformance() {
         assert_eq!(grant_disagreement(&grant_shape), None);
@@ -5492,15 +4928,11 @@ mod tests {
     }
 }
 
-/// Tier-1 for `NativeUpdateRendezvousClaim` (aterm-spec's
-/// `native_update_rendezvous_claim_model`): the real dial gate,
-/// [`listener_may_receive_claim`], against the model's `PresentClaim` guard over
-/// every combination of the three listener facts, with REAL attestations (this
-/// live process, and an attestation of it whose birth witness no longer
-/// matches); then the whole [`dial_and_claim`] against a real listener in a
-/// FORKED process, which is also the measurement the gate rests on — that
-/// `LOCAL_PEERPID`, read on the dialing end before any `accept`, names the
-/// listening process.
+/// Tier-1 for `NativeUpdateRendezvousClaim` (`native_update_rendezvous_claim_model`): the real
+/// dial gate, [`listener_may_receive_claim`], against the model's `PresentClaim` guard at every
+/// combination of the three listener facts, with real attestations; then the whole
+/// [`dial_and_claim`] against a listener in a forked process, which also measures what the gate
+/// rests on: `LOCAL_PEERPID`, read on the dialing end before any `accept`, names the listener.
 #[cfg(test)]
 mod claim_presentation_conformance {
     use super::{
@@ -5545,11 +4977,10 @@ mod claim_presentation_conformance {
         libc::pid_t::try_from(std::process::id()).expect("a pid fits pid_t")
     }
 
-    /// Drive the REAL gate with kernel-shaped inputs realizing `facts`. The uid is
-    /// the one input a test cannot realize (a foreign-uid listener needs root), so
-    /// it is the kernel's ANSWER that varies; the pid is a real live process
-    /// either way (this one, or the process that launched this test); the parent
-    /// is a real attestation, live or with a stale birth witness.
+    /// Drive the real gate with kernel-shaped inputs realizing `facts`. A foreign-uid listener
+    /// needs root, so the kernel's uid answer is what varies; the pid is a real live process
+    /// (this one, or the one that launched this test); the parent is a real attestation, live or
+    /// with a stale birth witness.
     fn real_gate(facts: ListenerFacts) -> Result<(), RendezvousError> {
         // SAFETY: getuid/getppid have no preconditions.
         let (own_uid, launcher) = unsafe { (libc::getuid(), libc::getppid()) };
@@ -5596,21 +5027,18 @@ mod claim_presentation_conformance {
         );
     }
 
-    /// NEGATIVE CONTROL, on the SHIPPING gate: the gate that shipped before
-    /// 2026-09-27 — the uid half alone — is the model's `Buggy` presentation
-    /// (`PresentClaimUidOnly`). The real [`listener_may_receive_claim`] must
-    /// refuse exactly where that mutant presents to the wrong listener — a
-    /// same-uid impostor, a gone parent, or both — and agree everywhere else. A
-    /// gate reverted to the uid half alone agrees with the mutant at all eight
-    /// combinations, and this test fails.
+    /// Negative control on the shipping gate: the uid-only gate is the model's `Buggy`
+    /// presentation (`PresentClaimUidOnly`). The real gate must refuse exactly where that mutant
+    /// presents to the wrong listener (a same-uid impostor, a gone parent, or both) and agree
+    /// everywhere else.
     #[test]
     fn the_real_gate_refuses_where_the_uid_only_mutant_presents() {
         let buggy = with_buggy(&native_update_rendezvous_claim_model(), 1);
         let mut told_apart = Vec::new();
         for facts in every_combination() {
             let mutant = buggy.action_enabled("PresentClaimUidOnly", &project(&buggy, facts));
-            // The model's mutant IS the uid-only gate, so this compares the real
-            // gate with the shape that shipped, not with a copy of itself.
+            // The mutant is the uid-only gate, so this compares the real gate with that shape,
+            // not with a copy of itself.
             assert_eq!(
                 mutant, facts.same_uid,
                 "the Buggy guard is the uid half at {facts:?}"
@@ -5653,11 +5081,10 @@ mod claim_presentation_conformance {
         ));
     }
 
-    /// A same-uid rendezvous listener in a FORKED process. The child runs
-    /// async-signal-safe calls only (libtest's thread pool makes this process
-    /// multi-threaded at fork time): it closes every inherited descriptor but its
-    /// own, binds and listens, reports readiness, serves ONE connection, reports
-    /// how many claim bytes it received (then closes it — EOF to the dialer), and
+    /// A same-uid rendezvous listener in a forked process. The child makes async-signal-safe
+    /// calls only (libtest's threads make this process multi-threaded at fork time): it closes
+    /// every inherited descriptor but its own, binds and listens, reports readiness, serves one
+    /// connection, reports how many claim bytes it received, closes it (EOF to the dialer), and
     /// `_exit`s.
     struct ForkedListener {
         pid: libc::pid_t,
@@ -5688,9 +5115,8 @@ mod claim_presentation_conformance {
             let mut report = [0i32; 2];
             // SAFETY: `pipe` fills two descriptor numbers into the array.
             assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0, "report pipe");
-            // The descriptor table's bound, read BEFORE the fork (the child only
-            // closes up to it): the kernel's per-process maximum, which no
-            // thread can raise in between.
+            // The table's bound (the kernel's per-process maximum), read before the fork: the
+            // child closes up to it.
             let table = aterm_uds::spawnfd::descriptor_bound();
 
             // SAFETY: fork from a multi-threaded harness, with a child that
@@ -5698,10 +5124,9 @@ mod claim_presentation_conformance {
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "fork failed");
             if pid == 0 {
-                // SAFETY (whole block): async-signal-safe syscalls on stack
-                // memory and descriptors this child owns; nothing allocates,
-                // locks, or unwinds, and the child leaves through its one
-                // `_exit` (the forked-child site `crash_signal`'s exit gate
+                // SAFETY (whole block): async-signal-safe syscalls on stack memory and
+                // descriptors this child owns; nothing allocates, locks or unwinds, and the
+                // child leaves through its one `_exit` (the site `crash_signal`'s exit gate
                 // allows this file).
                 unsafe {
                     for fd in 3..table {
@@ -5823,12 +5248,8 @@ mod claim_presentation_conformance {
     const SECRET: &str = "abababababababababababababababababababababababababababababababab";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
 
-    /// THE IMPOSTOR: a same-uid process listening at the published path while
-    /// the attestation names a DIFFERENT live process (this one). Before the
-    /// identity bind the uid gate passed it and the claim secret left; now the
-    /// dial is refused before a byte is written — and the refusal names the
-    /// forked child's pid, which is the measurement: the dialing end's
-    /// `LOCAL_PEERPID` names the process that LISTENS.
+    /// A same-uid listener that is not the attested parent gets no claim byte, and the refusal
+    /// names the forked listener's pid: the dialing end's `LOCAL_PEERPID` names the listener.
     #[test]
     fn a_same_uid_listener_that_is_not_the_attested_parent_gets_no_claim() {
         let listener = ForkedListener::start();
@@ -5856,13 +5277,10 @@ mod claim_presentation_conformance {
         );
     }
 
-    /// THE PARENT: the same forked listener, now the process the attestation
-    /// names. The gate passes (so `LOCAL_PEERPID` on the dialing end equalled
-    /// its pid) and the whole claim frame reaches it — the positive half of the
-    /// bind. The fixture then closes without a grant, so the dial ends in a
-    /// `Grant` error: the EOF, or — when the close lands before the grant-budget
-    /// `setsockopt`, which Darwin answers `EINVAL` on a disconnected socket —
-    /// that. Either way it is past both gates, never the identity refusal.
+    /// The attested parent's listener receives the whole claim frame (so the dialing end's
+    /// `LOCAL_PEERPID` named it). The fixture closes without a grant, so the dial ends in a
+    /// `Grant` error: EOF, or Darwin's `EINVAL` on the grant-budget `setsockopt` of a
+    /// disconnected socket.
     #[test]
     fn the_attested_parent_listener_receives_the_claim() {
         let listener = ForkedListener::start();

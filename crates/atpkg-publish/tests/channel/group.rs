@@ -618,7 +618,7 @@ fn a_staging_repo_this_identity_cannot_see_is_refused_when_the_compiler_moved() 
     ok(&c, &forced);
 }
 
-/// STEP 2 RE-CHECKS THE JUDGMENT, before ANY sibling packs and again before each.
+/// Step 2 re-checks the judgment before any sibling packs, and again before each.
 #[test]
 fn a_sibling_that_moves_while_the_bundle_packs_stops_the_cut() {
     let c = cut("group-moved-checkout", &FLOOR, &[]);

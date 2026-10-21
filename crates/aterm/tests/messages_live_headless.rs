@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for the unified message system's two verbs,
-//! `messages` (the log's text face) and `notice` (the outside world's voice
-//! on the band), driven over a real headless instance's control socket
-//! (design §5, rulings 163-198; the Phase 5 spec's live scenario).
+//! Live-headless conformance for the message verbs `messages` (the log's text face) and
+//! `notice` (the outside world's voice on the band) over a real headless instance's control
+//! socket: the control thread's refusals (never a wake), the owner token, the main thread's
+//! `wire::apply` replies, `OK recorded` for a note, one id across progress restates, `done`
+//! then `how=gone`, `dismiss` then `act` finding nothing, and `appstatus` never listing a
+//! script's rows.
 //!
 //! The socket round trip is what the engine and host unit tests cannot see:
 //! the control thread's refusals (never a wake), the owner token, the main
@@ -46,8 +48,7 @@ fn boot(tag: &str) -> Instance {
     )
 }
 
-/// How long a reply may take before it is read as a hang (AGENTS.md: a hang
-/// detector is a minute, never a latency budget).
+/// How long a reply may take before it is read as a hang.
 const REPLY_DEADLINE: Duration = Duration::from_secs(60);
 
 fn token_path(inst: &Instance) -> PathBuf {
@@ -131,8 +132,8 @@ fn minted(reply: &str) -> u64 {
         .unwrap_or_else(|| panic!("no minted id in {reply:?}"))
 }
 
-/// The rows above `after` (ids start at 1 and `since=0` is a usage error,
-/// ruling 187: a reader that has seen nothing reads bare).
+/// The rows above `after` (ids start at 1 and `since=0` is a usage error, so a reader that
+/// has seen nothing reads bare).
 fn rows_after(inst: &Instance, after: u64) -> Vec<String> {
     let line = if after == 0 {
         "messages 512".to_string()
@@ -162,7 +163,7 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     assert_eq!(st, format!("OK {}", rows.len()), "{st}");
     let b = rows.last().map_or(0, |r| row_id(r));
 
-    // 2. A note from a script is a RECORD, never a row.
+    // 2. A note from a script is a record, never a row.
     let a = status(&inst, "notice post script hello from a script");
     assert!(a.starts_with("OK recorded message="), "{a}");
     let a = minted(&a);

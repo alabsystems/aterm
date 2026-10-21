@@ -7,6 +7,9 @@ use crate::update_words::LiveHealth as _;
 #[path = "app_native_settings_keep_tests.rs"]
 mod settings_keep_tests;
 
+#[path = "app_native_settings_press_tests.rs"]
+mod settings_press_tests;
+
 #[test]
 fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     use crate::native_app::AppViewState;
@@ -546,6 +549,86 @@ fn a_failed_reconciliation_with_nothing_queued_leaves_the_true_row_standing() {
     );
 }
 
+/// A SAVE AN UNREADABLE aterm.toml REFUSES IS SAID IN WORDS THROUGH THE READ
+/// AFTER IT: the worker's save is refused ("aterm.toml isn't readable ·
+/// check its permissions"), and the read it makes for the lane to
+/// resynchronize, refused the same way, carries the same words, never the
+/// host's account; the `settings set` reply says the cause once. Before,
+/// that read said "could not open …/aterm.toml: Permission denied (os error
+/// 13)", which the reply appended ("; reconciliation required: …") and the
+/// Messages entry "Couldn't save a settings change" painted as its detail.
+#[cfg(unix)]
+#[test]
+fn a_save_an_unreadable_file_refuses_is_worded_through_the_read_after_it() {
+    use crate::native_config_service::{
+        ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ExpectedValue, VersionedConfigService,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let scratch = aterm_tempfile::tempdir().expect("private unreadable config");
+    let path = scratch.path().join("aterm.toml");
+    std::fs::write(&path, "theme = \"Default\"\n").unwrap();
+    let mut service = VersionedConfigService::load_path(&path).unwrap();
+    let ConfigPatchResult::Applied { snapshot, .. } = service.patch(ConfigPatchRequest {
+        base_revision: service.snapshot().revision,
+        edits: vec![ConfigKeyEdit {
+            key: "theme".into(),
+            expected: ExpectedValue::Exact(Some("Default".to_string())),
+            value: Some("Nord".to_string()),
+        }],
+    }) else {
+        panic!("the patch reduces before it is written");
+    };
+    let plan = service.persistence_plan(snapshot);
+    let mode = |mode: u32| {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(0o200);
+    let completion = execute_native_config_persistence(&plan, None);
+    mode(0o600);
+    let words = crate::save_words::words(
+        crate::save_words::Speaker::Aterm,
+        &path,
+        &crate::save_words::Failure::Read(&crate::native_document_host::DocumentHostError::Io {
+            stage: crate::native_document_io::AtomicSaveStage::Preflight,
+            message: String::new(),
+            kind: Some(std::io::ErrorKind::PermissionDenied),
+        }),
+    );
+    assert_eq!(
+        completion.outcome,
+        ConfigPatchOutcome::Rejected {
+            message: words.clone()
+        }
+    );
+    let Err(read) = &completion.observation else {
+        panic!("the read after the save is refused too");
+    };
+    assert_eq!(read, &words);
+    let reply = control_settings_completion_reply(
+        "theme",
+        Some("Nord"),
+        None,
+        &completion.outcome,
+        Some(read),
+    )
+    .unwrap_err();
+    assert_eq!(reply, format!("save failed: {words}"));
+    assert!(!reply.contains("os error"), "{reply}");
+    // A read that met something else still says it after the cause.
+    let other = control_settings_completion_reply(
+        "theme",
+        Some("Nord"),
+        None,
+        &completion.outcome,
+        Some("aterm.toml is too large for aterm to read"),
+    )
+    .unwrap_err();
+    assert!(
+        other.ends_with("; reconciliation required: aterm.toml is too large for aterm to read")
+    );
+}
+
 #[test]
 fn legacy_control_completion_never_translates_conflict_or_unverified_publication_to_ok() {
     let conflict = control_settings_completion_reply(
@@ -932,7 +1015,9 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
             | NativeConfigOrigin::Control { .. }
             | NativeConfigOrigin::Presence { .. }
             | NativeConfigOrigin::ThemeChoice { .. }
-            | NativeConfigOrigin::StatsBars { .. } => {
+            | NativeConfigOrigin::StatsBars { .. }
+            | NativeConfigOrigin::DeckSize { .. }
+            | NativeConfigOrigin::HarnessSwitch { .. } => {
                 panic!("unexpected non-Serious-Mode request")
             }
         };
@@ -1002,7 +1087,9 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
                 | NativeConfigOrigin::Control { .. }
                 | NativeConfigOrigin::Presence { .. }
                 | NativeConfigOrigin::ThemeChoice { .. }
-                | NativeConfigOrigin::StatsBars { .. } => {
+                | NativeConfigOrigin::StatsBars { .. }
+                | NativeConfigOrigin::DeckSize { .. }
+                | NativeConfigOrigin::HarnessSwitch { .. } => {
                     panic!("unexpected non-Serious-Mode request")
                 }
             })
@@ -9353,14 +9440,16 @@ fn a_segmented_control_is_one_tab_stop_and_one_arrow_model() {
     assert_eq!(focus(&app).as_ref(), Some(&asked), "it stops at its end");
     assert!(app.native_input_event(wid, &press(NamedKey::ArrowLeft)));
     assert_eq!(focus(&app).as_ref(), Some(&off));
-    let busy = |app: &App, segment: &UiKey| {
+    let label = |app: &App, segment: &UiKey| {
         app.compiled_native_ui(wid)
             .unwrap()
             .semantic(segment)
-            .and_then(|node| node.state)
-            .is_some_and(|state| state.busy)
+            .map(|node| node.label.clone())
     };
-    assert!(!busy(&app, &off), "an arrow chooses nothing");
+    assert!(
+        app.native_config_pending.is_empty(),
+        "an arrow chooses nothing"
+    );
 
     // Down from a segment not chosen steps to the next row; Up back.
     let after = key(&format!(
@@ -9399,11 +9488,23 @@ fn a_segmented_control_is_one_tab_stop_and_one_arrow_model() {
         "Shift-Tab: the control before"
     );
 
-    // Space chooses the one the keyboard is on.
+    // Space chooses the one the keyboard is on: it is the chosen segment at
+    // once, carrying the setting's own key, and the keyboard goes with it.
     app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(off.clone())))
         .unwrap();
+    let off_label = label(&app, &off).expect("Off is drawn");
     assert!(app.native_input_event(wid, &press(NamedKey::Space)));
-    assert!(busy(&app, &off) || busy(&app, &saved), "Space saves Off");
+    assert_eq!(app.native_config_pending.len(), 1, "Space saves Off");
+    assert_eq!(
+        label(&app, &saved),
+        Some(off_label),
+        "Off is the chosen one"
+    );
+    assert_eq!(
+        focus(&app).as_ref(),
+        Some(&saved),
+        "the keyboard follows it"
+    );
 
     // Messages' severity filter: the same control.
     {
@@ -9687,4 +9788,222 @@ fn closing_keys_close_the_editor_view() {
     assert_eq!(tabs(&app), opened - 2);
     assert!(app.view_store.get(second_view).is_none());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE HARNESS SWITCH'S WRITES ARE ONES THE LANE APPLIES (owner,
+/// 2026-10-20: "there needs to be an \"on\" button drawn for the claude
+/// harness"): for each aterm.toml switch that can hold a Claude Code
+/// session off — the master switch, the headless gate, Claude Code's own
+/// switch, and all three — the writes the top rule's `on` button queues
+/// (`autopilot::switch_on_plan`, each `true`), reduced in order on a config
+/// holding it off, give a policy under which the session is supervised, and
+/// none writes the session's word (the table's default carries it).
+/// NEGATIVE CONTROL: the config before the writes holds the session off.
+#[test]
+fn the_harness_switch_writes_turn_every_switch_on() {
+    use crate::autopilot::{HarnessPosture, switch_on_plan};
+    use aterm_phase::Program;
+    let policy = |text: &str| crate::app_config::HarnessPolicy::read(text).policy;
+    let carried = |text: &str, headless: bool| {
+        matches!(
+            HarnessPosture::of(true, &policy(text), headless).for_agent(Some(Program::Claude)),
+            HarnessPosture::On(_)
+        )
+    };
+    for (text, headless, writes) in [
+        ("[harness]\nenabled = false\n", false, 1),
+        ("[harness]\nheadless = false\n", true, 1),
+        ("[harness.claude]\nenabled = false\n", false, 1),
+        (
+            "[harness]\nenabled = false\nheadless = false\n\n[harness.claude]\nenabled = false\n",
+            true,
+            3,
+        ),
+    ] {
+        assert!(!carried(text, headless), "control: {text:?} holds it off");
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::new(text.to_string()).unwrap();
+        let plan = switch_on_plan(&policy(text), headless, Some(Program::Claude), None);
+        assert_eq!(plan.keys.len(), writes, "{text:?}: {plan:?}");
+        assert!(!plan.cruise, "{text:?}: the default carries the session");
+        for key in plan.keys {
+            let result = app
+                .reduce_native_config_work(NativeConfigWork::ControlField {
+                    key: key.to_string(),
+                    value: Some("true".to_string()),
+                })
+                .unwrap_or_else(|e| panic!("{text:?}: {key}: {e}"));
+            assert!(
+                matches!(&result, ConfigPatchResult::Applied { .. }),
+                "{text:?}: {key} applies: {result:?}"
+            );
+            let ConfigPatchResult::Applied { snapshot, undo } = result else {
+                unreachable!("asserted applied above")
+            };
+            app.publish_native_config_origin(
+                NativeConfigOrigin::HarnessSwitch { key },
+                ConfigPatchOutcome::Applied {
+                    revision: snapshot.revision,
+                    undo: Some(undo.get()),
+                },
+                Some(snapshot),
+                false,
+                None,
+            );
+        }
+        let after = app.native_config_service.snapshot().text.to_string();
+        assert!(carried(&after, headless), "{text:?} became {after:?}");
+        assert!(
+            app.messages.log().records().all(|r| {
+                !r.key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("harness.switch-save."))
+            }),
+            "ordinary writes confirm each effective switch, including intermediate multi-key completions"
+        );
+    }
+
+    // A valid but misplaced limit is intentionally effective. A root write
+    // preserves it, and completion must report inability rather than saying
+    // nothing while the harness stays off. Cover each On-plan key family.
+    for (text, headless, key) in [
+        (
+            "[project.harness]\nenabled = false\n",
+            false,
+            crate::prefs::EDIT_HARNESS_ENABLED,
+        ),
+        (
+            "[project.harness]\nheadless = false\n",
+            true,
+            crate::autopilot::HARNESS_HEADLESS_KEY,
+        ),
+        (
+            "[project.harness.claude]\nenabled = false\n",
+            false,
+            crate::prefs::EDIT_HARNESS_CLAUDE_ENABLED,
+        ),
+    ] {
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::new(text.to_string()).unwrap();
+        let plan = switch_on_plan(&policy(text), headless, Some(Program::Claude), None);
+        assert_eq!(plan.keys, [key]);
+        assert!(
+            !carried(text, headless),
+            "the admitted misplaced limit is effective"
+        );
+        let result = app
+            .reduce_native_config_work(NativeConfigWork::ControlField {
+                key: key.to_string(),
+                value: Some("true".to_string()),
+            })
+            .unwrap();
+        let (snapshot, undo) = match result {
+            ConfigPatchResult::Applied { snapshot, undo } => (snapshot, Some(undo.get())),
+            ConfigPatchResult::Unchanged { snapshot } => (snapshot, None),
+            other => panic!("the root write is valid: {other:?}"),
+        };
+        assert!(
+            snapshot.text.contains("[project.harness"),
+            "unrelated table retained"
+        );
+        assert!(
+            !carried(&snapshot.text, headless),
+            "the limit must remain effective"
+        );
+        app.publish_native_config_origin(
+            NativeConfigOrigin::HarnessSwitch { key },
+            ConfigPatchOutcome::Applied {
+                revision: snapshot.revision,
+                undo,
+            },
+            Some(snapshot),
+            false,
+            None,
+        );
+        let message_key = format!("harness.switch-save.{key}");
+        let record = app
+            .messages
+            .log()
+            .records()
+            .find(|r| r.key.as_deref() == Some(message_key.as_str()))
+            .expect("an ineffective enable is reported");
+        assert_eq!(record.severity, aterm_messages::Severity::Error);
+    }
+
+    // An Applied outcome without an admitted observation is not confirmation
+    // that the switch reads on, even if some bytes were published.
+    let mut app = App::headless_for_test();
+    app.publish_native_config_origin(
+        NativeConfigOrigin::HarnessSwitch {
+            key: crate::prefs::EDIT_HARNESS_ENABLED,
+        },
+        ConfigPatchOutcome::Applied {
+            revision: 1,
+            undo: None,
+        },
+        None,
+        false,
+        None,
+    );
+    assert!(app.messages.log().records().any(|r| {
+        r.key.as_deref() == Some("harness.switch-save.harness.enabled")
+            && r.severity == aterm_messages::Severity::Warn
+    }));
+}
+
+/// TAB ENTERS A LIST WHOSE SCREEN SHOWS NONE OF ITS CONTROLS: Software
+/// Update at 220x12 with 2× text opens on its status hero, words only, so
+/// the list's screen held no control Tab could land on, and Tab from the
+/// search field went round the sidebar and back — the keyboard never got
+/// into the list (the lab found 13 such pages at 220x12, 17 at 102x12).
+/// Tab now goes to the list's first control, which the list scrolls into
+/// view.
+#[test]
+fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
+    let preferences = crate::native_appearance::current_preferences();
+    crate::native_appearance::install_preferences(
+        crate::native_appearance::AppearancePreferences {
+            text_scale: 2.0,
+            ..preferences
+        },
+    );
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    if let Some(ws) = app.windows.get_mut(&wid) {
+        ws.cols = 220;
+        ws.rows = 12;
+    }
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate));
+    let (_, view) = app.active_native_view(wid).expect("active Settings view");
+    // The window's chrome: the sidebar and the search field.
+    let chrome = |key: &crate::native_ui::UiKey| {
+        key.as_str().starts_with("settings/nav/") || key.as_str() == "settings/search"
+    };
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    assert!(
+        compiled.focus_order.iter().all(chrome),
+        "PREMISE: the opening screen shows no control of the page: {:?}",
+        compiled.focus_order
+    );
+    let focus = |app: &App| {
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().last_focus.clone())
+    };
+    let mut entered = None;
+    for _ in 0..6 {
+        app.move_native_focus(wid, false).unwrap();
+        if let Some(key) = focus(&app).filter(|key| !chrome(key)) {
+            entered = Some(key);
+            break;
+        }
+    }
+    let shown = entered
+        .as_ref()
+        .is_some_and(|key| app.compiled_native_ui(wid).unwrap().semantic(key).is_some());
+    crate::native_appearance::install_preferences(preferences);
+    let entered = entered.expect("Tab enters the list");
+    assert!(shown, "{entered:?} is on screen");
 }

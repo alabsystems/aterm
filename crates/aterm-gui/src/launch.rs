@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LAUNCH FLAGS: what this process's command line pins, read by the code that
-//! used to read an `ATERM_*` twin of each flag.
+//! Launch flags: what this process's command line pins.
 //!
-//! No environment variable changes what a shipped aterm does (owner, 2026-09-22:
-//! *"NOT ENV VARS those are for development"*). The flags parsed here used to be
-//! carried to their readers by writing the matching variable (`--cpu` exported
-//! `ATERM_CPU=1`), which made every flag an environment knob too and leaked the
-//! value into every child shell. They are carried here instead: parsed once by
-//! `cli::parse_cli`, installed once, read everywhere. A launch with no flags —
-//! every Finder/.app launch, and every unit test — reads [`Launch::NONE`].
+//! No environment variable changes what a shipped aterm does, so a flag is never
+//! carried to its reader as an `ATERM_*` variable (that would also leak it into
+//! every child shell). `cli::parse_cli` parses the flags once and installs them
+//! here; a launch with no flags (every Finder/.app launch, every unit test) reads
+//! [`Launch::NONE`].
 
 use std::sync::OnceLock;
 

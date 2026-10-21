@@ -16,12 +16,8 @@ pub fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Every `.toml` file tracked in the repository.
-///
-/// This corpus IS the specification for the purposes of these tests: real
-/// manifests, real vendored manifests, real art assets, the real config files.
-/// [`corpus_skips`] names what is skipped: build output, gate state, `.git/`
-/// and recorded wire captures.
+/// Every `.toml` file under the repository root (manifests, vendored manifests, art
+/// assets, config files), minus what [`corpus_skips`] names.
 pub fn corpus() -> Vec<PathBuf> {
     let out = corpus_under(&repo_root());
     assert!(
@@ -56,13 +52,9 @@ fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
         || is_handoff_fixture_dir(parent, name)
 }
 
-/// `crates/aterm-gui/tests/fixtures/handoff/`: byte-exact RECORDINGS of what a
-/// shipped release's seamless-update producer wrote, kept so the current consumer
-/// is proven against them. The handoff manifest keeps the producer's own
-/// `seamless-<pid>-<nonce>.toml` name, but on the wire it is a nonce line
-/// followed by TOML — not a TOML document — and no file in there may ever be
-/// reformatted, because the recorded digests are over those exact bytes. They are
-/// wire captures, not config, so this gate does not claim them.
+/// `crates/aterm-gui/tests/fixtures/handoff/`: byte-exact recordings of what a shipped
+/// release's seamless-update producer wrote. A `seamless-*.toml` there is a nonce line
+/// followed by TOML, not a TOML document, and the recorded digests cover its exact bytes.
 fn is_handoff_fixture_dir(parent: &Path, name: &str) -> bool {
     name == "handoff" && parent.ends_with(Path::new("tests").join("fixtures"))
 }

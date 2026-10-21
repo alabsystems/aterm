@@ -7,10 +7,8 @@ use crate::restore::{
     WindowLayout,
 };
 
-/// EXACTLY what `layout_digest` does, but keyed on the WIRE the parent
-/// wrote rather than on a struct. `layout_digest(m) == wire_digest(m.to_toml())`
-/// by construction (see `seamless::layout_digest`), so this lets a test stand in
-/// for "build A's parent-side digest" using only build A's bytes.
+/// `layout_digest` keyed on the wire rather than a struct (`seamless::layout_wire_digest`), so a
+/// test can stand in for an older parent's digest using only that build's bytes.
 fn wire_digest(wire: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(LAYOUT_PROOF_DOMAIN);
@@ -19,8 +17,8 @@ fn wire_digest(wire: &str) -> [u8; 32] {
     hasher.finalize()
 }
 
-/// Exactly what the child USED TO do: re-derive the digest from the PARSED
-/// layout. Retained here as the counterfactual the fence measures against.
+/// The digest of a re-serialization of the parsed layout: the counterfactual the child must not
+/// compute.
 fn child_digest_of_wire(wire: &str) -> Option<[u8; 32]> {
     layout_digest(&RestoreManifest::from_toml(wire)?)
 }
@@ -105,8 +103,7 @@ fn realistic_layout() -> RestoreManifest {
     }])
 }
 
-/// CONTROL. Same binary on both ends: the parent's live digest and the
-/// child's reparsed digest agree. So F4 is NOT an unconditional break.
+/// Control: with the same build on both ends the parent's digest and the reparsed one agree.
 #[test]
 fn same_build_parent_and_child_layout_digests_agree() {
     let layout = realistic_layout();
@@ -168,13 +165,10 @@ fn live_checkpoint() -> aterm_core::terminal::TerminalCheckpoint {
     t.checkpoint_visible().expect("parser is Ground")
 }
 
-/// THE DEGRADE ARM'S PREMISE, pinned at the seam the producer uses.
-///
-/// The producer's rescue is "re-carry at 0 and the shape refusal goes away".
-/// That is only true if a visible-only carry is canonical BY CONSTRUCTION for a
-/// terminal whose inactive grid holds a scrollback-bearing saved primary —
-/// exactly the state that stranded the update. Pin both halves: the carried
-/// capture is refused, and the visible-only capture of the SAME terminal is not.
+/// The degrade arm's premise: re-carrying at 0 cures a shape refusal, because a visible-only carry
+/// is canonical by construction even when the inactive grid holds a scrollback-bearing saved
+/// primary. Both halves: the carried capture is refused, the visible-only capture of the same
+/// terminal is not.
 #[test]
 fn lowering_the_carry_to_zero_cures_a_shape_refusal() {
     let mut t = aterm_core::terminal::Terminal::new(49, 131);
@@ -187,16 +181,14 @@ fn lowering_the_carry_to_zero_cures_a_shape_refusal() {
         .grid
         .clone();
 
-    // DECSET 1049 — the primary, scrollback and all, is parked in `alt_grid`,
-    // which is the slot the wire allows exactly `rows` records.
+    // DECSET 1049: the primary, scrollback and all, is parked in `alt_grid`, the slot the wire
+    // allows exactly `rows` records.
     t.process(b"\x1b[?1049h");
     t.process(b"a full-screen app draws here");
 
-    // The blob the OLD producer put in the inactive slot: the SAVED PRIMARY
-    // projected at the carry bound, which is `rows + min(scrollback, 256)`
-    // records. Taken from the same terminal before it switched, so this is the
-    // real shape rather than a synthetic one — and building it here keeps the
-    // test meaningful now that the producer no longer emits it.
+    // The blob an older producer put in the inactive slot: the saved primary projected at the
+    // carry bound (`rows + min(scrollback, 256)` records), taken from this terminal before it
+    // switched so the shape is real.
     let mut carried = t.checkpoint_carry(256).expect("parser is Ground");
     carried.alt_grid = Some(parked_primary);
 
@@ -219,14 +211,9 @@ fn lowering_the_carry_to_zero_cures_a_shape_refusal() {
     screen_digest(&[(0, visible_only)]).expect("and the digest commits it");
 }
 
-/// The refusal NAMES ITSELF. Three separate multi-day investigations into a
-/// stuck update were spent recovering information this assertion now pins:
-/// which check refused, which session, and which of its two grids.
-///
-/// The blob shape here is exactly what a saved primary with scrollback used
-/// to produce — more records than the wire allows the INACTIVE grid, whose
-/// history is unrepresentable because the single `history_lines` beside it
-/// describes the MAIN blob.
+/// The refusal names which check refused, which session, and which of its two grids. The blob
+/// here has more records than the wire allows the inactive grid, whose history is unrepresentable
+/// because the single `history_lines` beside it describes the main blob.
 #[test]
 fn an_over_long_inactive_grid_blob_names_itself() {
     let mut cp = live_checkpoint();
@@ -283,16 +270,10 @@ fn same_build_parent_and_child_screen_digests_agree() {
     );
 }
 
-/// The colour and shell-integration carry crosses the REAL wire: the meta
-/// JSON the parent writes, parsed by the strict child parser, reassembled,
-/// and adopted. A session with neither writes no `color` or `shell` key;
-/// it does write `absolute_row_counter` — a live grid's counter is never
-/// 0 (it is at least its rows), so every session carries it, and an older
-/// child ignores the key (no `deny_unknown_fields`). So is `output_state`
-/// written by every session that has printed anything: its REP character
-/// (round eight of the update audit, finding 502). The untouched session's
-/// key set is pinned exactly below. A session with both carries them
-/// intact, and the screen digest stays a fixed point.
+/// The colour and shell-integration carry crosses the real wire: parsed by the strict child
+/// parser, reassembled and adopted intact, with the screen digest a fixed point. An untouched
+/// session's key set is pinned exactly: no `color` or `shell` key, `absolute_row_counter` always
+/// (a live grid's counter is at least its rows), `output_state` once it has printed.
 #[test]
 fn colour_and_shell_state_cross_the_meta_wire() {
     let plain = live_checkpoint();
@@ -535,17 +516,12 @@ fn a_partial_parser_crosses_the_meta_wire_inside_the_digest() {
     assert!(screen_digest_refs(vec![(0, &old)]).is_ok());
 }
 
-/// A DCS HEADER CROSSES THE META WIRE BOTH WAYS (round fifteen,
-/// R15-PARSER-P1; ruling 2026-10-10). A session parked inside `ESC P $` (a
-/// DECRQSS whose `qm ESC \` is still queued) carries the header as itself
-/// under the parser key's `exact`, beside the `DcsIgnore` a build before it
-/// wrote for every header: this build's child reads `exact`, the screen digest
-/// is a fixed point over it and covers it, and the adopted engine answers the
-/// query. The same meta as a build before the key reads it — its parser repr
-/// has no `exact`, and serde drops a key it does not know — is that build's
-/// own `DcsIgnore`, which its restore accepts and which swallows the string
-/// as it always did, so the payload never prints; an older producer's meta,
-/// which is exactly that, adopts here the same way.
+/// A DCS header crosses the meta wire both ways. A session parked inside `ESC P $` (a DECRQSS
+/// whose `qm ESC \` is still queued) carries the header under the parser key's `exact`, beside
+/// the `DcsIgnore` an older build writes for every header: this build reads `exact`, the screen
+/// digest covers it, and the adopted engine answers the query. An older build drops `exact` and
+/// restores its own `DcsIgnore`, which swallows the string so the payload never prints; an older
+/// producer's meta adopts here the same way.
 #[test]
 fn a_dcs_header_crosses_the_meta_wire_both_ways() {
     let mut t = aterm_core::terminal::Terminal::new(24, 80);
@@ -619,16 +595,12 @@ fn a_dcs_header_crosses_the_meta_wire_both_ways() {
     );
 }
 
-/// The engine's in-flight output state (round eight of the update audit,
-/// finding 502) crosses the REAL wire: each of the REP character, an open
-/// OSC 8 link, an SGR 58 underline colour, a VT52 address in progress, a
-/// ZWJ waiting for its emoji, the XTPUSHSGR stack (whole and selective)
-/// and an XTSAVE'd mode, carried at the Full rung in the meta's additive `output_state` key,
-/// parsed by the strict child parser and adopted, finishes the queued tail
-/// exactly as one engine fed the whole stream does. The screen digest is a
-/// fixed point over it and covers it. A producer from before the key — the
-/// same meta without it — still parses and adopts with none of it, which is
-/// what every adoption did before.
+/// The engine's in-flight output state crosses the real wire: the REP character, an open OSC 8
+/// link, an SGR 58 underline colour, a VT52 address in progress, a ZWJ waiting for its emoji, the
+/// XTPUSHSGR stack (whole and selective) and an XTSAVE'd mode, carried at the Full rung in the
+/// meta's additive `output_state` key, each finish the queued tail as one engine fed the whole
+/// stream does. The screen digest is a fixed point over it and covers it. A meta without the key
+/// still parses and adopts with none of it.
 #[test]
 fn the_in_flight_output_state_crosses_the_meta_wire_inside_the_digest() {
     use aterm_core::terminal::Terminal;
@@ -838,15 +810,11 @@ fn cross_version_missing_required_meta_key_costs_the_screen_not_the_adoption() {
     assert_eq!(used_cells, 0, "a screen that is not decoded is not charged");
 }
 
-/// THE REQUIRED KEY LIST IS FROZEN, and this pins it VERBATIM. It may only
-/// ever SHRINK — delete a line here and in [`CHECKPOINT_META_REQUIRED_KEYS`]
-/// together, never add one. The producer of every handoff is the OLDER
-/// build, so a key added to the list is one every producer in the field
-/// fails to send, and each of its sessions would arrive without a parseable
-/// meta: since the 2026-09-22/23 audit (plan P0-2) that repaints every tab
-/// on every hop instead of refusing the update, but it is still a break. A
-/// new meta field is additive — `#[serde(default)]` on `CheckpointMeta` —
-/// and never required.
+/// The required key list is frozen, pinned verbatim: it may only shrink (delete a line here and in
+/// [`CHECKPOINT_META_REQUIRED_KEYS`] together). The producer of every handoff is the older build,
+/// so a key added to the list is one no producer in the field sends, and every tab would arrive
+/// without a parseable meta and repaint on every hop. A new meta field is additive
+/// (`#[serde(default)]` on `CheckpointMeta`), never required.
 #[test]
 fn the_required_meta_keys_are_frozen() {
     assert_eq!(
@@ -876,10 +844,9 @@ fn the_required_meta_keys_are_frozen() {
 
 // ---- build / commit identity -------------------------------------------
 
-/// F4(b). The child proves with ITS OWN `build_info::build_number()` /
-/// `GIT_COMMIT`; the parent expects the apply ticket's
-/// `target_build`/`target_commit`. Any disagreement is a silent
-/// `AdoptionMismatch`.
+/// The child proves with its own `build_info::build_number()` and `build_info::git_commit()`; the
+/// parent expects the apply ticket's `target_build`/`target_commit`. Any disagreement breaks the
+/// proof.
 #[test]
 fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     let ids = [(0u64, 7i32, 4242i32)];
@@ -887,7 +854,7 @@ fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     let (ld, sd) = ([1u8; 32], [2u8; 32]);
     let base = adoption_proof(nonce, 1_784_869_524, "7bf23bbe1234", &ld, &sd, &ids).unwrap();
 
-    // (i) the swap did not take: the child is still the OLD binary.
+    // (i) the swap did not take: the child is the old binary.
     let stale_build = adoption_proof(nonce, 1_784_825_157, "7bf23bbe1234", &ld, &sd, &ids).unwrap();
     assert_ne!(base, stale_build, "build number mismatch breaks the proof");
 
@@ -895,7 +862,7 @@ fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     let dirty = adoption_proof(nonce, 1_784_869_524, "7bf23bbe1234-dirty", &ld, &sd, &ids).unwrap();
     assert_ne!(base, dirty, "`-dirty` breaks the proof");
 
-    // (iii) SAFE: 40-hex vs 12-hex vs mixed case all normalize together.
+    // (iii) 40-hex, 12-hex and mixed case all normalize together.
     let long = adoption_proof(
         nonce,
         1_784_869_524,
@@ -907,22 +874,16 @@ fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     .unwrap();
     assert_eq!(base, long, "commit length/case normalization is symmetric");
 
-    // (iv) an un-stamped build cannot prove at all in a RELEASE binary:
-    // `unknown` is admitted ONLY under debug_assertions — a property of the
-    // binary. No environment variable can widen this; the
-    // `|| ATERM_DEBUG_SEAMLESS_REEXEC` that used to sit in this predicate
-    // let an exported value switch the identity gate off in a shipped build.
+    // (iv) an unstamped build cannot prove in a release binary: `unknown` is admitted only
+    // under debug_assertions, a property of the binary that no environment variable widens.
     let unknown = adoption_proof(nonce, 1_784_869_524, "unknown", &ld, &sd, &ids);
     assert_eq!(
         unknown.is_ok(),
         cfg!(debug_assertions),
         "`unknown` commit is release-fatal (no proof is ever emitted)"
     );
-    // …and the refusal NAMES the commit (warm successor P6, finding 2):
-    // it was a bare `None`, which the outgoing process reported as the
-    // session set exceeding the proof format. `unknown-dirty` is refused
-    // by every build, this debug test binary included; the start asks the
-    // same gate before it launches or parks anything.
+    // The refusal names the commit, never the session set. `unknown-dirty` is refused by every
+    // build, this debug test binary included; the start asks the same gate before it launches.
     let unstamped = adoption_proof(nonce, 1_784_869_524, "unknown-dirty", &ld, &sd, &ids);
     assert_eq!(
         unstamped,
@@ -936,26 +897,14 @@ fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     );
 }
 
-/// THE TRIPWIRE for the frozen cross-version wire, and the only test in this
-/// file that does not compare [`adoption_proof`] against itself. Every other
-/// one stays green while a changed domain string, a reordered field, a
-/// dropped length prefix or a different [`normalize_commit`] quietly makes
-/// the outgoing build and the incoming build compute different digests — and
-/// that disagreement is `AdoptionMismatch`, which `finish_update_handoff`
-/// latches manual-only for every parent already in the field. A self-
-/// consistent suite cannot see it, because both sides of every comparison
-/// move together.
+/// The tripwire for the frozen cross-version wire, and the one test here that does not compare
+/// [`adoption_proof`] against itself: a changed domain string, a reordered field, a dropped length
+/// prefix or a different [`normalize_commit`] keeps every self-consistent test green while the two
+/// builds compute different digests (an `AdoptionMismatch`; see [`adoption_proof`]).
 ///
-/// So this compares against a constant derived once from the wire as
-/// specified, and the input is chosen to hold down the parts that are easiest
-/// to change by accident: an unsorted identity set (the sort is hashed
-/// membership, not presentation) and a 40-hex uppercase commit (the
-/// fold-and-truncate to 12 is hashed too).
-///
-/// If this fails, the question is never "what is the digest now". It is
-/// whether the edit was meant to be a wire break at all — and if it was,
-/// nothing in the protocol tells the parents in the field why their update
-/// lane stopped working.
+/// The input holds down what is easiest to change by accident: an unsorted identity set (the sort
+/// is hashed) and a 40-hex uppercase commit (the fold-and-truncate to 12 is hashed too). If this
+/// fails, ask whether the edit was meant to break the wire at all.
 #[test]
 fn the_v1_adoption_digest_is_frozen_to_this_exact_vector() {
     const FROZEN: &str = "9f32e4a273bbb14fb95b80b90788b41fce5cbfbc9fff94051934eb9b7d78ccbd";

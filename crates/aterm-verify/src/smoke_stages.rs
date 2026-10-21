@@ -67,7 +67,7 @@ pub const SMOKE_CONFIG: &str = "cursor_trail_style = \"rainbow kitty pet\"\ncurs
 
 /// Late (`past`) `cursor_effect` arms the burst may book: healthy effects-on
 /// bursts arm ~430 deadlines and book 0-2 late, so four leaves two of headroom.
-/// It catches a SUSTAINED regression; a 0.8 % late rate is about 3 a burst,
+/// It catches a sustained regression; a 0.8 % late rate is about 3 a burst,
 /// which one burst cannot tell from healthy.
 const CURSOR_EFFECT_LATE_MAX: u64 = 4;
 /// …and as a share of the owner's arms, so a burst that armed little cannot pass
@@ -153,53 +153,43 @@ const INPUT_PRESENT_CEILING_MS: u64 = 250;
 /// Half the quietest healthy burst.
 const FRAMES_FLOOR: u64 = 15;
 /// Hardware keys that must reach the `KeyboardInput` arm (`n_key_write`) before
-/// any hardware slice verdict means anything: half the burst, the frames floor's
-/// ratio. Below it the burst measured nothing, and that is a FAIL, not a pass.
+/// any hardware slice verdict means anything: half the burst, the frames
+/// floor's ratio. Below it the burst measured nothing, which is a failure.
 const HW_KEY_WRITE_FLOOR: u64 = 15;
 /// Input→present samples the burst must book (`n_input`, one per presented key)
 /// before the input→present ceilings mean anything, at the same ratio: a burst
 /// that booked none would pass both on a maximum of 0 ms. A healthy burst books
 /// all 30.
 const HW_INPUT_FLOOR: u64 = 15;
-/// `key->write` p99 ceiling, OS queue residence included. The release build wrote
-/// each key at p99 6.29 ms while a whole run compiled beside it; 40 ms is more than
-/// two 60 Hz frames, so a change that adds 40 ms of UI-thread work to every key
-/// fails here whatever the healthy baseline, where the 250 ms input->present
-/// ceiling let it through.
+/// `key->write` p99 ceiling, OS queue residence included. A healthy release
+/// build reads p99 6.29 ms with a whole run compiling beside it; 40 ms, over
+/// two 60 Hz frames, catches UI-thread work added to every key that the 250 ms
+/// input->present ceiling lets through.
 const KEY_WRITE_P99_CEILING_MS: u64 = 40;
-/// Worst wait for the terminal mutex at the key-press site (presses AND releases,
-/// which `key->write` does not sample). The P63 handoff gives a waiting press the
-/// lock at the reader's next slice boundary, and the smoke's shell echoes one byte
-/// per key; a 25 ms wait means some holder stopped honouring the handoff.
+/// Worst wait for the terminal mutex at the key-press site (presses and
+/// releases, which `key->write` does not sample). The reader hands a waiting
+/// press the lock at its next slice boundary (P63) and the smoke's shell echoes
+/// one byte per key, so a 25 ms wait means some holder stopped honouring the
+/// handoff.
 const TERM_WAIT_PRESS_MAX_CEILING_MS: u64 = 25;
-/// Drawable-acquire p99 ceiling: three 60 Hz frames. Live windows read 3.4-5.24 ms
-/// p99 (max 15.32 ms on a loaded machine). Gated only when acquires happened (a
-/// CPU backend books none).
+/// Drawable-acquire p99 ceiling: three 60 Hz frames. Live windows read
+/// 3.4-5.24 ms p99 (max 15.32 ms on a loaded machine). Gated only when acquires
+/// happened (a CPU backend books none).
 const ACQUIRE_P99_CEILING_MS: u64 = 50;
-/// Present->glass p99 ceiling: the COMPOSITOR leg, `presentDrawable:` registration
-/// -> the drawable's `presentedTime`. EVERY other ceiling on this list stops at
-/// application present-return, so until this row a change that made the window
-/// server hold frames -- re-enabling `displaySyncEnabled`, a deeper compositor
-/// queue -- moved no gated number at all: the present call still returned at once
-/// and `key->write`, the press lock, acquire and `input->present` all stayed green
-/// while the owner waited longer for every keystroke to appear.
+/// Present->glass p99 ceiling: the compositor leg, `presentDrawable:`
+/// registration to the drawable's `presentedTime`. Every other ceiling stops at
+/// present-return, so only this one sees a window server holding frames
+/// (`displaySyncEnabled`, a deeper compositor queue). Three 60 Hz refreshes, as
+/// [`ACQUIRE_P99_CEILING_MS`]: WindowServer composites at the display refresh
+/// even for the shipped `Immediate` present, so one refresh of wait is healthy.
 ///
-/// Three 60 Hz refreshes, the budget `ACQUIRE_P99_CEILING_MS` already spends. The
-/// shipped macOS present is `Immediate` and WindowServer still composites at the
-/// display refresh, so ONE refresh of wait is healthy here; this is therefore a bar
-/// on a compositor holding frames for 3+ refreshes, not on a single added frame.
-/// Pinning it tighter needs a measured per-refresh-rate baseline the idle-only
-/// smoke cannot supply.
+/// On an Intel iGPU at 60 Hz a healthy p99 is ~50 ms (median 27 ms), so there the
+/// bar cannot tell a regression from the host's floor. Widening a latency bar is
+/// a product decision, not a constant to move here.
 ///
-/// ON AN INTEL iGPU AT 60 Hz THE BAR IS THE BASELINE: a running app there reads
-/// a healthy p99 of ~50 ms (median 27 ms, 1.6 refreshes after present-return),
-/// so the row cannot separate a compositor regression from that host's floor
-/// until the ceiling is decided per refresh rate and GPU class. Widening a
-/// latency bar is the owner's product statement, not a constant to move here.
-///
-/// Gated only when the leg was SAMPLED (`n_present_glass > 0`):
-/// a CPU backend, a non-macOS present and a process that installs no sink register
-/// no presented handler at all, and an absent slice is not a slow one.
+/// Gated only when the leg was sampled (`n_present_glass > 0`): a CPU backend, a
+/// non-macOS present and a process that installs no sink register no presented
+/// handler, and an absent slice is not a slow one.
 const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
 /// The socket-listen budget: how many times the smoke looks at its instance's
 /// control socket, [`POLL_GAP`] apart, before `control socket never started
@@ -282,8 +272,8 @@ impl Sandbox {
     }
 
     /// Reap the child and remove the sandbox. A teardown that could not retire
-    /// exactly the process it launched is itself a FAIL: the smoke's conclusions
-    /// are about that process.
+    /// exactly the process it launched is itself a failure: the smoke's
+    /// conclusions are about that process.
     fn teardown(&mut self, r: &mut Report) {
         if let Some(mut child) = self.child.take() {
             let (ok, _) = retire_smoke_child(&mut child);
@@ -339,9 +329,8 @@ fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::Measure
     // SHELL forced to a quiet, always-present /bin/sh so the engine's PTY child
     // cannot drag a developer's rc files into a run.
     let mut cmd = Command::new(&gui);
-    // A fixture has no inherited session, capability, handoff, fabric or
-    // update authority. Apply its explicit private bindings only after this
-    // removal, just as the shared Fabric harness does.
+    // The instance inherits no `ATERM_*` session, capability, handoff, fabric or
+    // update authority; its own bindings are set after this removal.
     for (name, _) in std::env::vars_os() {
         if name.to_string_lossy().starts_with("ATERM_") {
             cmd.env_remove(name);
@@ -367,7 +356,7 @@ fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::Measure
     }
 
     let sock = sb.sock();
-    // Up means LISTENING, not bound: the file appears at bind(2), before
+    // Up means listening, not bound: the file appears at bind(2), before
     // listen(2), and a first ctl call in that gap is refused.
     let up = || is_socket_or_symlink(&sock) && socket_listening(&sock);
     match wait_to_listen(POLL_GAP, || child_exited(sb), up) {
@@ -390,10 +379,9 @@ enum Listen {
     Never,
 }
 
-/// THE LISTEN WAIT: [`SOCKET_POLLS`] looks at `exited` and then `up`, `gap`
-/// apart ([`POLL_GAP`] in a real run), and one last look at `up` after them.
-/// However long a look takes, every one is taken: the wait is never shorter
-/// than its sleeps.
+/// [`SOCKET_POLLS`] looks at `exited` and then `up`, `gap` apart ([`POLL_GAP`]
+/// in a real run), and one last look at `up` after them. Every look is taken
+/// however long each takes, so the wait is never shorter than its sleeps.
 fn wait_to_listen(
     gap: Duration,
     mut exited: impl FnMut() -> bool,
@@ -417,8 +405,7 @@ fn child_exited(sb: &mut Sandbox) -> bool {
         .is_none_or(|c| matches!(c.try_wait(), Ok(Some(_)) | Err(_)))
 }
 
-/// One `aterm-ctl` round trip inside the sandbox, stdout and stderr merged the
-/// way `$(… 2>&1)` merged them.
+/// One `aterm-ctl` round trip inside the sandbox, stdout and stderr merged.
 fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
     // `--sock` pins this exact socket; ctl reads its token beside it (there is
     // no token/token-file/cap environment override).
@@ -477,9 +464,8 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
         r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
         return;
     }
-    // Prove one real present happened while frontmost BEFORE resetting counters:
-    // this distinguishes a product present failure from a measurement window that
-    // opened while backend initialization was still in flight.
+    // One real present while frontmost before the counters reset tells a product
+    // present failure from a window measured while the backend still initialized.
     let mut got = String::new();
     let mut presented = false;
     for _ in 0..150 {
@@ -503,7 +489,7 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
         r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
         return;
     }
-    // Posted keys go to the KEY window: re-assert frontmost after the wait.
+    // Posted keys go to the key window: re-assert frontmost after the wait.
     if !crate::smoke::activate_macos_gui_pid(pid) {
         r.skip("gui smoke (could not keep the test window frontmost)");
         return;
@@ -616,8 +602,8 @@ fn settings_hardware_key_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_b
     }
 }
 
-/// Every honest reason this stage cannot measure anything, in the script's order.
-/// Each is a SKIP: the machine cannot present, which says nothing about the code.
+/// Every reason this stage cannot measure anything. Each is a skip: the machine
+/// cannot present, which says nothing about the code.
 fn gui_smoke_unavailable(ctx: &Ctx) -> Option<String> {
     if std::env::consts::OS != "macos" {
         return Some("gui smoke (macOS only)".into());
@@ -660,7 +646,7 @@ pub fn hwkey_burst_args() -> Vec<String> {
     ]
 }
 
-/// The text of `<name>=<value>` in a metrics reply (the LAST occurrence, as the
+/// The text of `<name>=<value>` in a metrics reply (the last occurrence, as the
 /// numeric helpers read it), for a verdict line; `?` when absent.
 fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
     let needle = format!(" {name}=");
@@ -687,13 +673,18 @@ fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
 /// The hardware burst's verdict, over both replies read after it: the `metrics`
 /// `summary` (frames, the true input→present maximum, present retries and
 /// drops, sync timeout-releases) and the `metrics percentiles` `reply`, slice by
-/// slice. `Ok` is the pass line, `Err` the failure. Extracted so the thresholds
-/// are testable.
+/// slice. `Ok` is the pass line. The floors come first, so no ceiling passes on
+/// a burst that measured nothing: the keys must reach the `KeyboardInput` arm
+/// (`n_key_write`) and book input→present samples (`n_input`), and the window
+/// must present ([`FRAMES_FLOOR`]).
 ///
-/// THE FLOORS COME FIRST, so no ceiling can pass on a burst that measured
-/// nothing: the keys must reach the `KeyboardInput` arm (`n_key_write`) and
-/// book input→present samples (`n_input`), and the window must present
-/// ([`FRAMES_FLOOR`]).
+/// The four p99 bars read `>`, not `>=`: aterm-gui's percentiles report the
+/// containing histogram bucket's exclusive upper edge (`Histogram::percentile`
+/// in its `metrics.rs`), so a reported `p99 = 50.00` against a 50 ms bar says
+/// every sample was under it, and a p99 can sit above the observed maximum.
+/// Where a slice also publishes a true maximum (acquire, present→glass), the
+/// max must confirm the bar too, and a sampled slice whose maximum is missing
+/// fails.
 ///
 /// # Errors
 /// A reply that cannot be parsed, a sampled slice without its maximum, a burst
@@ -740,7 +731,7 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         ));
     };
     let f = |name: &str| reply_field(reply, name);
-    // A sampled slice's TRUE maximum, as a number — present, or the verdict fails.
+    // A sampled slice's true maximum, as a number: present, or the verdict fails.
     let max_ms = |name: &str| {
         reply_field(reply, name).parse::<f64>().map_err(|_| {
             format!(
@@ -908,9 +899,9 @@ mod tests {
         )
     }
 
-    /// The same reply with one `max_*_ms` field replaced: the bucketed p99 above is
-    /// an exclusive bucket edge, so a case that means "a sample really did cross the
-    /// bar" has to move the MAX too, which is what the verdict now requires.
+    /// The same reply with one `max_*_ms` field replaced: the bucketed p99 is an
+    /// exclusive bucket edge, so a case meaning "a sample really crossed the bar"
+    /// has to move the max too, as the verdict requires.
     fn with_max(reply: &str, field: &str, value: &str) -> String {
         let at = reply
             .find(&format!("{field}="))
@@ -978,17 +969,17 @@ mod tests {
 
     #[test]
     fn a_40ms_press_path_regression_fails_the_hardware_gate() {
-        // The finding's scenario: 40 ms of new UI-thread work on every keystroke.
-        // The echo still presents in ~58 ms, under the 250 ms input→present
-        // ceilings; the burst books every key's key→write, and that fails.
+        // 40 ms of new UI-thread work on every keystroke: the echo still
+        // presents in ~58 ms, under the 250 ms input→present ceilings, and
+        // key→write fails.
         let hw = percentiles(30, "46.13", "0.10", "5.24", "58.00");
         assert!(hv(&hw).is_err());
     }
 
     #[test]
     fn a_healthy_hardware_burst_passes_and_the_childs_echo_is_never_gated() {
-        // echo p99 150.04 ms is the run-load measurement of a child waiting behind
-        // compiles: reported, and not aterm's to fail on.
+        // An echo p99 of 150.04 ms is a child waiting behind compiles: reported,
+        // and not aterm's to fail on.
         let hw = percentiles(30, "6.29", "0.10", "5.24", "14.20");
         hv(&hw).expect("a pass");
         // A lost-wake build: ~5 frames/s and 190-530 ms input→present, with
@@ -1018,7 +1009,7 @@ mod tests {
         assert!(hv(&controller_shaped).is_err());
     }
 
-    /// THE INPUT CEILINGS CANNOT PASS VACUOUSLY: a burst that booked no
+    /// The input ceilings cannot pass vacuously: a burst that booked no
     /// input→present sample reads `max 0 ms` and `p99 0 ms`, under both bars.
     #[test]
     fn a_burst_that_booked_no_input_samples_is_a_failure_not_a_pass() {
@@ -1030,10 +1021,9 @@ mod tests {
         assert!(hv(&hw(30)).is_ok(), "the control");
     }
 
-    /// AN ABSENT MAXIMUM FAILS CLOSED. A sampled acquire or compositor slice
-    /// must publish its true maximum: it used to read as 0 ms, which confirmed
-    /// no bar, so a p99 far over its ceiling PASSED when the max field was
-    /// renamed or dropped. An unsampled slice still needs none.
+    /// A sampled acquire or compositor slice must publish its true maximum, or a
+    /// p99 far over its ceiling would pass once the max field was renamed or
+    /// dropped. An unsampled slice needs none.
     #[test]
     fn a_sampled_slice_without_its_maximum_fails_closed() {
         let without = |reply: &str, field: &str| {
@@ -1047,7 +1037,7 @@ mod tests {
         for field in ["max_acquire_wait_ms", "max_present_glass_ms"] {
             assert!(hv(&without(&healthy, field)).is_err(), "{field}");
         }
-        // The fail-open this closes: an acquire p99 over the bar, max missing.
+        // An acquire p99 over the bar with its max missing fails.
         let slow = percentiles(30, "6.00", "0.10", "56.00", "10.00");
         assert!(hv(&without(&slow, "max_acquire_wait_ms")).is_err());
         // Unsampled slices publish no maximum worth reading, and pass.
@@ -1062,13 +1052,10 @@ mod tests {
 
     #[test]
     fn a_compositor_that_holds_frames_fails_while_every_present_return_slice_stays_green() {
-        // THE FINDING'S SCENARIO: a change adds a frame of compositor queue --
-        // `displaySyncEnabled` re-enabled, a deeper queue. `presentDrawable:` still
-        // RETURNS at once, so key->write, the press lock, acquire and input->present
-        // are all healthy, and until the present->glass row EVERY published number
-        // stayed green while the owner waited an extra frame for each keystroke.
-        // 92 ms is four refreshes of queue, and the max confirms it — without that
-        // the number could be a bucket edge brushed by a sample well under the bar.
+        // A frame of compositor queue (`displaySyncEnabled`, a deeper queue):
+        // `presentDrawable:` still returns at once, so every present-return slice
+        // stays healthy. 92 ms is four refreshes of queue, and the max confirms
+        // it, so it is no bucket edge brushed by a sample under the bar.
         let held = with_max(&with_glass(31, "92.00"), "max_present_glass_ms", "91.50");
         assert!(
             hv(&with_glass(31, "8.90")).is_ok(),
@@ -1152,7 +1139,7 @@ mod tests {
     fn a_teardown_that_loses_its_child_is_a_failure() {
         let mut sb = Sandbox::with_config("atl", "").expect("sandbox");
         // A child that exits on its own is not one this smoke retired, and the
-        // measurements were about THAT process.
+        // measurements were about that process.
         sb.child = Some(
             Command::new("/bin/sh")
                 .args(["-c", "exit 7"])
@@ -1161,8 +1148,7 @@ mod tests {
                 .spawn()
                 .expect("spawn"),
         );
-        // Its own exit, witnessed before teardown's TERM — a 50 ms nap let a
-        // starved `sh` be killed first, a death teardown DID cause.
+        // Its exit witnessed before teardown's TERM, so teardown cannot have caused it.
         let pid = sb.child.as_ref().expect("child").id();
         assert!(
             crate::smoke::exited_on_its_own(pid),

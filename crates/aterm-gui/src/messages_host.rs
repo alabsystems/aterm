@@ -253,9 +253,9 @@ pub(crate) fn wall_stamp_now() -> WallStamp {
     WallStamp { unix_ms }
 }
 
-/// A live row re-worded to `msg`'s words: title, detail, meter, actions, hold,
-/// severity, glyph, the excerpt flag and the finished words — every field a
-/// builder authored,
+/// A live row re-worded to `msg`'s words: title and its short form, detail,
+/// meter, actions, hold, severity, glyph, the excerpt flag and the finished
+/// words — every field a builder authored,
 /// applied in place
 /// (no log line; the center bumps the row's revision). The reporters that
 /// speak through ONE row (a tailed meter, the handoff bracket, the standing
@@ -272,6 +272,9 @@ pub(crate) fn restatement_of(msg: &Message) -> Restatement {
         glyph: Some(msg.glyph),
         excerpt: Some(msg.excerpt),
         finished: Some(msg.finished.clone()),
+        // The short form goes with the title: left unset, a new title would
+        // drop it, and the band would cut the whole title in its place.
+        short_title: Some(msg.short_title.clone()),
     }
 }
 
@@ -1235,14 +1238,22 @@ impl App {
         .min()
     }
 
-    /// Post what the pre-App inbox holds (every park; one atomic load when
-    /// empty), each with the stamp it was queued under — and the folders
-    /// fresh shells could not start in ([`Self::fold_folder_faults`]).
+    /// Post what the pre-App inbox holds at each park, each with the stamp it
+    /// was queued under, raise the exceptions queued there
+    /// ([`crate::message_inbox::queue_exception`]), and settle verified
+    /// workstation setup and the folders fresh shells could not start in
+    /// ([`Self::fold_folder_faults`]).
     pub(crate) fn drain_message_inbox(&mut self) {
+        let workstation_finished = crate::message_inbox::take_workstation_setup_finished();
         let queued = crate::message_inbox::take_queued();
+        let exceptions = crate::message_inbox::take_queued_exceptions();
         let folders = crate::spawn_folder::take_noted();
-        if queued.is_empty() && folders.is_empty() {
+        if queued.is_empty() && exceptions.is_empty() && folders.is_empty() && !workstation_finished
+        {
             return;
+        }
+        for entry in &exceptions {
+            self.except(entry);
         }
         for m in queued {
             match m.restored {
@@ -1251,6 +1262,10 @@ impl App {
                     self.post_unsynced(m.message, m.stamp);
                 }
             }
+        }
+        if workstation_finished {
+            self.except_clear(&crate::message_reporters::workstation_accounts_entry().key());
+            self.except_clear(&crate::message_reporters::workstation_setup_failure_entry().key());
         }
         // The launch's config problems meet what is on screen now: with Settings
         // restored in front, one it says on its own row is its record.

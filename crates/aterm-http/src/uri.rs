@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Absolute `http`/`https` URL parsing — the slice of RFC 3986 an HTTP client
-//! actually needs, and no more.
+//! needs, and no more.
 //!
 //! This is deliberately NOT a general URI type. It accepts exactly what a
 //! configured endpoint may be (an absolute `http://` or `https://` URL with an
@@ -149,7 +149,7 @@ pub const fn decode_http_endpoint_le(bytes: [u8; 16]) -> (u64, u16, u16, u32) {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Uri {
     scheme: Scheme,
-    /// Host WITHOUT brackets for an IPv6 literal (`::1`, not `[::1]`) — the
+    /// Host without brackets for an IPv6 literal (`::1`, not `[::1]`): the
     /// form both `ServerName` and `SocketAddr` want.
     host: String,
     port: u16,
@@ -157,10 +157,8 @@ pub struct Uri {
     path_and_query: String,
     /// True when the authority named a port explicitly.
     explicit_port: bool,
-    /// The authority EXACTLY as it appeared in the input, brackets and all.
-    /// Kept so a caller can prove the parse agrees with a naive textual split
-    /// of the same string — an endpoint the two disagree about is ambiguous,
-    /// and an ambiguous endpoint should be refused rather than guessed at.
+    /// The authority exactly as written, brackets and all
+    /// ([`Uri::authority_as_written`]).
     authority_raw: String,
 }
 
@@ -246,10 +244,9 @@ impl Uri {
             .unwrap_or(&self.path_and_query)
     }
 
-    /// The authority EXACTLY as written in the source string.
-    ///
-    /// For agreement checks against a naive `split("://")` of the same input:
-    /// if this differs from the textual split, the endpoint is ambiguous.
+    /// The authority exactly as written, for agreement checks against a naive
+    /// textual split of the same input: if they differ, the endpoint is
+    /// ambiguous.
     #[must_use]
     pub fn authority_as_written(&self) -> &str {
         &self.authority_raw
@@ -401,16 +398,13 @@ mod tests {
 
     #[test]
     fn percent_encoding_is_carried_through_verbatim() {
-        // Re-encoding a target is how one request becomes two. The bytes the
-        // caller configured are the bytes on the wire.
+        // Re-encoding a target is how one request becomes two.
         let u = Uri::parse("http://h/a%2Fb%20c?q=%41").unwrap();
         assert_eq!(u.path_and_query(), "/a%2Fb%20c?q=%41");
     }
 
     #[test]
     fn userinfo_is_rejected_rather_than_stripped() {
-        // Silently dropping credentials would make the endpoint policy's
-        // credential-free check vacuous.
         assert!(Uri::parse("http://user:pass@host/p").is_none());
         assert!(Uri::parse("https://token@host/p").is_none());
     }
@@ -442,7 +436,7 @@ mod tests {
     #[test]
     fn ipv6_literals_round_trip_through_brackets() {
         let u = Uri::parse("http://[::1]:8080/p").unwrap();
-        // Host is stored UNBRACKETED (what ServerName and SocketAddr want)...
+        // Host is stored unbracketed (what ServerName and SocketAddr want)...
         assert_eq!(u.host(), "::1");
         assert_eq!(u.port(), 8080);
         // ...and re-bracketed for the Host header and the CONNECT target.
@@ -482,8 +476,7 @@ mod tests {
         assert_eq!(u.path(), "/v1/x");
         assert_eq!(u.path_and_query(), "/v1/x?a=1");
 
-        // Brackets are preserved verbatim, because the check compares against
-        // the caller's own textual split of the same input.
+        // Brackets are kept: the caller compares against its own textual split.
         let u = Uri::parse("http://[::1]:8080/p").unwrap();
         assert_eq!(u.authority_as_written(), "[::1]:8080");
     }

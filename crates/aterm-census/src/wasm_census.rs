@@ -6,17 +6,12 @@
 //! renderer modules (`crates/aterm-wasm` CPU, `crates/aterm-gpu-web`
 //! GPU/WebGL2) that load into the Electron renderer page.
 //!
-//! * The process is single-threaded by target: the modules build only for
-//!   `wasm32-unknown-unknown` with no `+atomics` and no shared memory, so a
-//!   `std::sync::Mutex` is uncontended and ABBA deadlock is impossible. The
-//!   lock-order obligation is vacuous here; that posture is printed every run
-//!   and kept honest by the OB-12 tripwire.
-//! * L0 freeze does transfer: the JS event loop hosting the module (page main
-//!   thread or the engine's Web Worker) is liveness-critical, and a long
-//!   synchronous export blocks it. The closure shares `aterm-grid`, so the same
-//!   `// COST: UNBOUNDED(<dim>)` sinks apply, with no worker thread to offload
-//!   to. `resize` exports detach via `resize_offloading_scrollback` and the
-//!   rewrap runs in a later host task (`pump_reflow`).
+//! The modules are single-threaded by target ([`WASM_THREADING_POSTURE`],
+//! held by the OB-12 tripwire), so lock order is vacuous here. L0 freeze does
+//! transfer: a long synchronous export blocks the hosting JS event loop, and the
+//! closure shares `aterm-grid`'s `// COST: UNBOUNDED(<dim>)` sinks with no
+//! worker thread to offload to (`resize` exports detach via
+//! `resize_offloading_scrollback`; `pump_reflow` rewraps in a later host task).
 //!
 //! Obligations (fail-closed; `[OB-n]` tags in the diagnostics):
 //!
@@ -32,22 +27,32 @@
 //!   engine `term` field (`self.term.resize(..)`) or a direct sink call.
 //! * OB-12 single-threaded tripwire: the shipped closure contains no
 //!   thread-spawn vocabulary (`thread::spawn(`, `thread::Builder`,
-//!   `Worker::new(`) outside test and native-only items. Shipping wasm
-//!   threads fails the census until lock order is extended to this process.
+//!   `Worker::new(`) outside test items and items no wasm32 build compiles.
+//!   Shipping wasm threads fails the census until lock order is extended to
+//!   this process.
 //!
-//! The closure over-approximates the browser bundle: the derivation does not
-//! evaluate cfg predicates, so a `[target.'cfg(..)'.dependencies]` edge counts
-//! on every platform (missing linked source is unsafe, scanning unlinked
-//! source is not). `aterm-uds` (via aterm-shell-integration's `cfg(any(unix,
-//! windows))` edge) and `aterm-objc` (via aterm-gpu's `cfg(target_os =
-//! "macos")` edge) are scanned though wasm32 never links them, which is why
-//! aterm-gpu's Metal `AcquireWorker` spawn carries a
-//! `#[cfg(not(target_arch = "wasm32"))]` gate that only OB-12 needs.
+//! The closure is what a wasm32-unknown-unknown build links: a
+//! `[target.<key>.dependencies]` edge is followed unless its key is false on
+//! that target (`crate::wasm_cfg`), so `aterm-uds` (aterm-shell-integration's
+//! `cfg(any(unix, windows))` edge) and `aterm-objc` (aterm-gpu's
+//! `cfg(target_os = "macos")` edge) are not scanned, and every edge left out
+//! is printed. Within the scanned source an item is masked only where its
+//! one-line `#[cfg(..)]` is false on that target (a `#[cfg(windows)]` item,
+//! a `#[cfg(not(target_arch = "wasm32"))]` one) or it is a `#[test]`; an
+//! unknown predicate (a feature, `debug_assertions`) keeps it. A file is left
+//! out only where every `mod` declaration or `include!` that could load it is
+//! false there or sits in such a file (aterm-gpu's `#[cfg(target_os =
+//! "macos")] mod metal;` and the files under it), the cuts printed; a module
+//! tree whose loaders the reader cannot place (an `include!` of a computed
+//! path, a live `mod` inside an inline module) is swept whole, and says so.
+//! Unsure is scanned: scanning unlinked source is safe, missing linked source
+//! is not.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::lock_order::{mask_gated_items, mask_literals};
+use crate::lock_order::{mask_items_where, mask_literals};
 use crate::{
     CensusOutcome, Floor, GuiFn, UNBOUNDED_REGISTRY, UNBOUNDED_TERM_METHODS, callee_names,
     collect_closure_markers, collect_rs_files, ident_ending_at, is_test_file, parse_source_fns,
@@ -59,14 +64,13 @@ use crate::{
 /// in any module freezes the same event loop.
 pub const WASM_ROOT_CRATES: &[&str] = &["crates/aterm-gpu-web", "crates/aterm-wasm"];
 
-/// Item gates whose code never compiles into the shipped wasm32 module
-/// (test and native-only items), masked before the walk and the OB-12
-/// sweep. Exact-match: an unrecognized cfg spelling is not masked.
-const WASM_UNSHIPPED_GATES: &[&str] = &[
-    "#[cfg(test)]",
-    "#[test]",
-    "#[cfg(not(target_arch = \"wasm32\"))]",
-];
+/// `text` with every item no shipped wasm32 module compiles blanked (test
+/// items, and items whose one-line `#[cfg(..)]` is false on
+/// wasm32-unknown-unknown: [`crate::wasm_cfg::attr_never_on_wasm32`]), line
+/// count kept: what the walk and the OB-12 sweep read.
+fn mask_unshipped(text: &str) -> String {
+    mask_items_where(text, &crate::wasm_cfg::attr_never_on_wasm32)
+}
 
 /// Thread-spawn vocabulary that breaks the single-threaded posture (OB-12).
 /// `thread::spawn(` also matches `std::`/`wasm_thread::` forms;
@@ -74,7 +78,7 @@ const WASM_UNSHIPPED_GATES: &[&str] = &[
 /// from JS is a separate instance).
 const SPAWN_TOKENS: &[&str] = &["thread::spawn(", "thread::Builder", "Worker::new("];
 
-/// The honest limits of this census, printed verbatim in every RED diagnostic.
+/// The honest limits of this census, printed with every OB-10 violation.
 pub const WASM_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL, name-based: the same fn segmenter and `<ident>(` call matching
         as the main-loop census; no type information. ENTRY POINTS are the root
@@ -87,11 +91,14 @@ pub const WASM_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         a direct `term` field — there is no lock here to key on). A field
         renamed out of this vocabulary hides the hop from the walk.
       - SCOPE: the call graph covers the root crates' non-test src ONLY (masked
-        to the shipped wasm32 surface: #[cfg(test)]/#[test]/
-        #[cfg(not(target_arch = \"wasm32\"))] items blanked); deeper reaches are
-        pinned by the shared `// COST: UNBOUNDED(<dim>)` markers swept over the
-        DERIVED wasm-process closure. The OB-12 spawn sweep covers the whole
-        derived closure the same masked way.
+        to the shipped wasm32 surface: #[test] items and items whose one-line
+        #[cfg(..)] is false on wasm32-unknown-unknown blanked; an unknown
+        predicate, a feature or debug_assertions, keeps its item; a file every
+        `mod` or `include!` that could load it is false there, or sits in such
+        a file, is left out); deeper reaches are pinned by the shared
+        `// COST: UNBOUNDED(<dim>)` markers swept over the DERIVED wasm-process
+        closure. The OB-12 spawn sweep covers the whole derived closure the
+        same masked way.
 ";
 
 /// The thread/lock posture of the wasm process, printed every run: lock order
@@ -180,15 +187,98 @@ struct SpawnSite {
     line: String,
 }
 
+/// The files of the closure's `src` dirs no shipped wasm32 build loads
+/// ([`crate::wasm_cfg::unloaded_on_wasm32`] over each crate's tree, its
+/// roots `src/lib.rs`, `src/main.rs` and every `.rs` its manifest names as a
+/// `path`), and the log lines that say so: how many, the loaders that cut
+/// them off (a test-only one counted, any other named), and any tree not
+/// placed.
+fn unloaded_files(root: &Path, scan_dirs: &[String]) -> (BTreeSet<PathBuf>, Vec<String>) {
+    let mut out = BTreeSet::new();
+    let mut notes = Vec::new();
+    let (mut crates, mut test_cuts, mut named) = (0usize, 0usize, Vec::new());
+    let rel = |p: &Path| p.strip_prefix(root).unwrap_or(p).display().to_string();
+    for dir in scan_dirs {
+        let src = root.join(dir);
+        let mut paths = Vec::new();
+        let _ = collect_rs_files(&src, &mut paths);
+        let files: BTreeMap<PathBuf, String> = paths
+            .into_iter()
+            .filter_map(|p| crate::tree::read_to_string(&p).ok().map(|t| (p, t)))
+            .collect();
+        let mut roots: BTreeSet<PathBuf> = [src.join("lib.rs"), src.join("main.rs")].into();
+        if let Some(crate_dir) = src.parent()
+            && let Ok(manifest) = crate::tree::read_to_string(&crate_dir.join("Cargo.toml"))
+        {
+            for line in manifest.lines() {
+                let named_root = line
+                    .trim()
+                    .strip_prefix("path")
+                    .map(str::trim_start)
+                    .and_then(|r| r.strip_prefix('='))
+                    .map(|r| r.trim().trim_matches('"'))
+                    .filter(|p| p.ends_with(".rs"));
+                if let Some(p) = named_root {
+                    roots.insert(crate_dir.join(p));
+                }
+            }
+        }
+        let unloaded = crate::wasm_cfg::unloaded_on_wasm32(&files, &roots);
+        if let Some(why) = unloaded.unplaced {
+            notes.push(format!(
+                "module tree of {dir} not placed ({}): every file in it is swept",
+                why.strip_prefix(&format!("{}/", root.display()))
+                    .unwrap_or(&why)
+            ));
+        }
+        if unloaded.files.is_empty() {
+            continue;
+        }
+        crates += 1;
+        for cut in &unloaded.cuts {
+            if cut.gate == "#[test]" || crate::cfg_attr_never_ships(&cut.gate) {
+                test_cuts += 1;
+            } else {
+                named.push(format!(
+                    "{}:{} `{}` under {}",
+                    rel(&cut.file),
+                    cut.line,
+                    cut.loader,
+                    cut.gate
+                ));
+            }
+        }
+        out.extend(unloaded.files);
+    }
+    if !out.is_empty() {
+        let by = if named.is_empty() {
+            String::new()
+        } else {
+            format!(" and by: {}", named.join(", "))
+        };
+        notes.insert(
+            0,
+            format!(
+                "{} file(s) in {crates} crate(s) no wasm32-unknown-unknown build loads (every \
+                 `mod` or `include!` that loads them is false there), not swept: cut off by \
+                 {test_cuts} test-only loader(s){by}",
+                out.len()
+            ),
+        );
+    }
+    (out, notes)
+}
+
 /// Sweep the derived wasm closure for thread-spawn vocabulary surviving the
-/// shipped-surface masking (comments stripped, string/char literals masked).
-fn spawn_sites(root: &Path, scan_dirs: &[String]) -> Vec<SpawnSite> {
+/// shipped-surface masking (comments stripped, string/char literals masked),
+/// skipping the files no wasm32 build loads (`unloaded`).
+fn spawn_sites(root: &Path, scan_dirs: &[String], unloaded: &BTreeSet<PathBuf>) -> Vec<SpawnSite> {
     let mut hits = Vec::new();
     let mut files = Vec::new();
     for dir in scan_dirs {
         let _ = collect_rs_files(&root.join(dir), &mut files);
     }
-    files.retain(|p| !is_test_file(p));
+    files.retain(|p| !is_test_file(p) && !unloaded.contains(p));
     files.sort();
     for file in files {
         let Ok(text) = crate::tree::read_to_string(&file) else {
@@ -199,7 +289,7 @@ fn spawn_sites(root: &Path, scan_dirs: &[String]) -> Vec<SpawnSite> {
             .unwrap_or(&file)
             .to_string_lossy()
             .into_owned();
-        let masked = mask_gated_items(&text, WASM_UNSHIPPED_GATES);
+        let masked = mask_unshipped(&text);
         for (i, raw) in masked.lines().enumerate() {
             let line = mask_literals(strip_line_comment(raw));
             for token in SPAWN_TOKENS {
@@ -256,7 +346,11 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
 
     // [OB-8] Derive the wasm-process closure (fail-closed, same machinery and
     // rules as the GUI closure of OB-1/OB-7).
-    let scan = match scan_set::derive_process_scan_set(root, WASM_ROOT_CRATES) {
+    let scan = match scan_set::derive_linked_scan_set(
+        root,
+        WASM_ROOT_CRATES,
+        &crate::wasm_cfg::target_links_on_wasm32,
+    ) {
         Ok(s) => s,
         Err(e) => {
             let _ = writeln!(
@@ -273,12 +367,26 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         log,
         "    scan set: DERIVED from the workspace manifests — the union Cargo.toml \
          path-dependency closure of {} ({} workspace crates, src/ only; the same \
-         derivation rules as the GUI-process censuses: normal deps only, cfg-target \
-         deps in, optional deps feature-resolved — here with the web modules' \
-         default-features = false engine edges, which drop the disk tier).",
+         derivation rules as the GUI-process censuses — normal deps only, optional \
+         deps feature-resolved, here with the web modules' default-features = false \
+         engine edges, which drop the disk tier — except that a target table false \
+         on wasm32-unknown-unknown links nothing).",
         WASM_ROOT_CRATES.join(" + "),
         scan.scan_dirs.len()
     );
+    if !scan.unlinked.is_empty() {
+        let listed: Vec<String> = scan
+            .unlinked
+            .iter()
+            .map(|(dir, dep, target)| format!("{dir} -> {dep} [target.{target}]"))
+            .collect();
+        let _ = writeln!(
+            log,
+            "      target-gated edge(s) no wasm32-unknown-unknown build links, not \
+             followed: {}",
+            listed.join(", ")
+        );
+    }
     if !scan.proc_macros.is_empty() {
         let listed: Vec<String> = scan
             .proc_macros
@@ -291,6 +399,10 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
              the wasm module): {}",
             listed.join(", ")
         );
+    }
+    let (unloaded, unloaded_notes) = unloaded_files(root, &scan.scan_dirs);
+    for note in &unloaded_notes {
+        let _ = writeln!(log, "      {note}");
     }
 
     // [OB-8] Marker <-> registry coherence over the derived closure. The
@@ -330,12 +442,15 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         }
     }
 
-    // Build the ROOT-crate call graph over the shipped wasm32 surface.
+    // The root crates' call graph over the shipped wasm32 surface.
     let mut fns: Vec<GuiFn> = Vec::new();
     let mut pub_count: std::collections::BTreeMap<&str, usize> = Default::default();
     for rc in WASM_ROOT_CRATES {
         pub_count.insert(rc, 0);
         for file in crate_source_files(root, rc) {
+            if unloaded.contains(&file) {
+                continue;
+            }
             let Ok(text) = crate::tree::read_to_string(&file) else {
                 continue;
             };
@@ -344,7 +459,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
                 .unwrap_or(&file)
                 .to_string_lossy()
                 .into_owned();
-            let masked = mask_gated_items(&text, WASM_UNSHIPPED_GATES);
+            let masked = mask_unshipped(&text);
             parse_source_fns(&masked, &rel, &mut fns);
         }
     }
@@ -484,7 +599,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
     }
 
     // [OB-12] The single-threaded posture tripwire over the whole closure.
-    let spawns = spawn_sites(root, &scan.scan_dirs);
+    let spawns = spawn_sites(root, &scan.scan_dirs, &unloaded);
     for s in &spawns {
         let _ = writeln!(
             log,
@@ -494,13 +609,13 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
              \x20   SITE:  {}\n\
              \x20   TOKEN: `{}`\n\
              \x20   LINE:  {}\n\
-             \x20   REPAIR: if this code never ships to wasm32, gate it with one of the \
-             recognized markers ({}); if aterm is really adding wasm threads, the \
-             lock-order census must be EXTENDED to this process (there is no waiver).",
-            s.span,
-            s.token,
-            s.line,
-            WASM_UNSHIPPED_GATES.join(" / ")
+             \x20   REPAIR: if this code never ships to wasm32, gate it, or the `mod` \
+             that loads its file, with a one-line `#[cfg(..)]` false on \
+             wasm32-unknown-unknown (e.g. `#[cfg(not(target_arch = \"wasm32\"))]`), or \
+             reach its crate only through a target table false there; if aterm is \
+             really adding wasm threads, the lock-order census must be EXTENDED to \
+             this process (there is no waiver).",
+            s.span, s.token, s.line,
         );
         failures += 1;
     }
@@ -594,8 +709,7 @@ mod tests {
             ))
             .is_empty()
         );
-        // `subterm.` has an identifier boundary before `term`? No — the ident
-        // ending at the dot is `subterm`, not `term`.
+        // The ident ending at the dot is `subterm`, not `term`.
         assert!(wasm_term_hops(&body("        subterm.resize(r, c);")).is_empty());
         // Inside a string literal: masked.
         assert!(wasm_term_hops(&body("        log(\"term.resize(1,2)\");")).is_empty());
@@ -611,7 +725,7 @@ mod tests {
                    }\n    \
                    sync_fallback();\n\
                    }\n";
-        let masked = mask_gated_items(src, WASM_UNSHIPPED_GATES);
+        let masked = mask_unshipped(src);
         assert!(
             !masked.contains("thread::spawn"),
             "the native-only block must be blanked:\n{masked}"
@@ -623,9 +737,21 @@ mod tests {
         // A #[test] fn (the page_tests shape, attrs after the gate honored).
         let src = "#[test]\n#[timeout(10_000)]\nfn t() {\n    \
                    let h = std::thread::spawn(move || {});\n}\nfn shipped() {}\n";
-        let masked = mask_gated_items(src, WASM_UNSHIPPED_GATES);
+        let masked = mask_unshipped(src);
         assert!(!masked.contains("thread::spawn"), "masked:\n{masked}");
         assert!(masked.contains("fn shipped"), "masked:\n{masked}");
+        // A platform no wasm32 build is: blanked. A gate the target does not
+        // settle (a feature, debug_assertions) or one true there: kept.
+        let src = "#[cfg(windows)]\nfn native() {\n    \
+                   let h = std::thread::Builder::new();\n}\n\
+                   #[cfg(debug_assertions)]\nfn dev() {\n    \
+                   let h = std::thread::spawn(move || {});\n}\n\
+                   #[cfg(not(windows))]\nfn web() {\n    \
+                   let w = Worker::new(url);\n}\n";
+        let masked = mask_unshipped(src);
+        assert!(!masked.contains("thread::Builder"), "masked:\n{masked}");
+        assert!(masked.contains("thread::spawn"), "masked:\n{masked}");
+        assert!(masked.contains("Worker::new"), "masked:\n{masked}");
     }
 
     // Synthetic-tree tests: end-to-end runs against a fabricated wasm
@@ -752,8 +878,7 @@ mod tests {
     fn synthetic_new_unregistered_reach_is_red_ob10_with_path() {
         let mut files = synth_wasm_base();
         files.extend(synth_fixed_roots());
-        // A NEW public export whose helper synchronously resizes: RED with
-        // the path.
+        // A new public export whose helper resizes synchronously.
         files.push((
             "crates/aterm-gpu-web/src/extra.rs".to_string(),
             "pub fn set_columns(&mut self, cols: u16) {\n    apply_cols(self, cols);\n}\n\
@@ -829,6 +954,128 @@ mod tests {
             "a cfg(not(wasm32))-gated spawn must not trip OB-12; log:\n{}",
             out.log
         );
+    }
+
+    /// A crate the closure reaches only through a target table false on
+    /// wasm32 (aterm-uds's place: aterm-shell-integration's `cfg(any(unix,
+    /// windows))` edge) is no part of the wasm closure: its spawn trips
+    /// nothing, and the log names the edge left out. CONTROLS: the same crate
+    /// reached through a plain `[dependencies]` table, a table true on wasm32,
+    /// or one the target does not settle (a feature) trips OB-12 at its spawn.
+    #[test]
+    fn synthetic_spawn_behind_a_native_target_table_is_not_in_the_closure() {
+        let tree = |grid_table: &str| {
+            let mut files = synth_wasm_base();
+            files.extend(synth_fixed_roots());
+            for (rel, text) in &mut files {
+                if rel == "Cargo.toml" {
+                    *text = text.replace(
+                        "[workspace.dependencies]\n",
+                        "[workspace.dependencies]\n\
+                         aterm-native = { path = \"crates/aterm-native\" }\n",
+                    );
+                } else if rel == "crates/aterm-grid/Cargo.toml" {
+                    text.push_str(&format!(
+                        "{grid_table}\naterm-native = {{ workspace = true }}\n"
+                    ));
+                }
+            }
+            files.push((
+                "crates/aterm-native/Cargo.toml".to_string(),
+                "[package]\nname = \"aterm-native\"\n".to_string(),
+            ));
+            files.push((
+                "crates/aterm-native/src/lib.rs".to_string(),
+                "pub fn watch() {\n    std::thread::spawn(|| {});\n}\n".to_string(),
+            ));
+            files
+        };
+        let gated = tree("[target.'cfg(any(unix, windows))'.dependencies]");
+        let out = run_wasm_census(&synth_tree("aterm-wasm-census", "native-table", &gated));
+        assert!(
+            out.ok,
+            "a crate only a native target links is out of the closure; log:\n{}",
+            out.log
+        );
+        assert!(
+            out.log
+                .contains("crates/aterm-grid -> aterm-native [target.cfg(any(unix, windows))]"),
+            "the edge left out is named; log:\n{}",
+            out.log
+        );
+        for (name, table) in [
+            ("plain-table", "[dependencies]"),
+            (
+                "wasm-table",
+                "[target.'cfg(target_arch = \"wasm32\")'.dependencies]",
+            ),
+            (
+                "feature-table",
+                "[target.'cfg(feature = \"x\")'.dependencies]",
+            ),
+        ] {
+            let out = run_wasm_census(&synth_tree("aterm-wasm-census", name, &tree(table)));
+            assert!(!out.ok, "CONTROL {name}: expected RED, got:\n{}", out.log);
+            assert!(
+                out.log.contains("[OB-12]") && out.log.contains("crates/aterm-native/src/lib.rs"),
+                "CONTROL {name}: log:\n{}",
+                out.log
+            );
+        }
+    }
+
+    /// A file only a `mod` false on wasm32 loads (aterm-gpu's place: its
+    /// `#[cfg(target_os = "macos")] mod metal;`) is no part of the swept
+    /// closure: its spawn trips nothing, without a gate of its own, and the
+    /// log names the cut. CONTROLS: the same `mod` under a gate the target
+    /// does not settle (a feature), or in a tree whose loaders the reader
+    /// cannot place (a live `include!` of a computed path), trips OB-12 at
+    /// the spawn.
+    #[test]
+    fn synthetic_spawn_in_a_file_only_a_false_mod_loads_is_not_swept() {
+        let tree = |lib: &str| {
+            let mut files = synth_wasm_base();
+            files.extend(synth_fixed_roots());
+            for (rel, text) in &mut files {
+                if rel == "crates/aterm-grid/src/lib.rs" {
+                    *text = lib.to_string();
+                }
+            }
+            files.push((
+                "crates/aterm-grid/src/metal.rs".to_string(),
+                "pub fn acquire() {\n    std::thread::Builder::new();\n}\n".to_string(),
+            ));
+            files
+        };
+        let gated = tree("// The Metal arm.\n#[cfg(target_os = \"macos\")]\nmod metal;\n");
+        let out = run_wasm_census(&synth_tree("aterm-wasm-census", "false-mod", &gated));
+        assert!(
+            out.ok,
+            "a file only a macOS `mod` loads is out of the sweep; log:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains(
+                "crates/aterm-grid/src/lib.rs:3 `mod metal;` under #[cfg(target_os = \"macos\")]"
+            ),
+            "the cut is named; log:\n{}",
+            out.log
+        );
+        for (name, lib) in [
+            ("feature-mod", "#[cfg(feature = \"metal\")]\nmod metal;\n"),
+            (
+                "unplaced-tree",
+                "#[cfg(target_os = \"macos\")]\nmod metal;\ninclude!(concat!(\"gen\", \".rs\"));\n",
+            ),
+        ] {
+            let out = run_wasm_census(&synth_tree("aterm-wasm-census", name, &tree(lib)));
+            assert!(!out.ok, "CONTROL {name}: expected RED, got:\n{}", out.log);
+            assert!(
+                out.log.contains("[OB-12]") && out.log.contains("crates/aterm-grid/src/metal.rs:2"),
+                "CONTROL {name}: log:\n{}",
+                out.log
+            );
+        }
     }
 
     #[test]

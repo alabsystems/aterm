@@ -41,6 +41,7 @@
 mod emoji_presentation;
 mod grapheme_iter;
 mod grid;
+mod line_break;
 mod position;
 mod props;
 pub mod tables;
@@ -54,6 +55,9 @@ pub use grapheme_iter::{GraphemeClusters, GraphemeIndices, Graphemes};
 pub use grid::{
     GridColumns, GridGrapheme, GridGraphemes, GridStep, grid_graphemes, grid_graphemes_with,
     str_grid_columns, str_grid_columns_with,
+};
+pub use line_break::{
+    BreakKind, LineBreak, Piece, is_break_space, line_breaks, pieces, word_breaks,
 };
 pub use position::{byte_to_column, byte_to_column_with, column_to_char_index};
 pub use props::{

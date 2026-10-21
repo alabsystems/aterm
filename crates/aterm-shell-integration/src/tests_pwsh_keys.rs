@@ -65,6 +65,11 @@ impl PowerShellWorld {
             ("XDG_STATE_HOME".to_owned(), value("state")),
             ("TEMP".to_owned(), value("tmp")),
             ("TMP".to_owned(), value("tmp")),
+            // MSYS2's `/tmp` (Git Bash's) is the TEMP of the first MSYS process
+            // of the user's session still running, shared by every later one:
+            // another test's, whose world may be gone mid-test. bash 5.3 makes
+            // its `${ ...; }` and here-document files in `$TMPDIR` before `/tmp`.
+            ("TMPDIR".to_owned(), value("tmp")),
         ];
         // A managed store inherited from a real tab must not be re-fronted by
         // the LIVE hook. The fixture's own hook remains fully exercised.
@@ -915,7 +920,18 @@ struct ConptyShell {
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
     /// Everything the console has drawn so far.
     seen: Vec<u8>,
+    /// A Git Bash's hold on [`GIT_BASH`], let go after the shell is reaped.
+    _git_bash: Option<std::sync::MutexGuard<'static, ()>>,
 }
+
+/// Every Git Bash a test runs, one at a time. MSYS2's `/tmp` is the TEMP of the
+/// session's first MSYS2 process still running, for every later one: a Git Bash
+/// started beside another has the other's folder for its `/tmp`, so a test that takes
+/// its shell's `/tmp` away (`test_git_bash_whose_tmp_went_away_runs_every_line_as_typed`)
+/// must run the only one. A test holds one Git Bash at a time: a second would wait on
+/// the first.
+#[cfg(windows)]
+static GIT_BASH: Mutex<()> = Mutex::new(());
 
 // `include!`d into a `#[cfg(test)]` module already; the gate is spelled here too for the
 // source censuses, which read this file on its own (the root-authority mint and a thread
@@ -931,6 +947,11 @@ impl ConptyShell {
         argv: &[std::ffi::OsString],
         env_add: &[(String, String)],
     ) -> Self {
+        let git_bash = argv
+            .first()
+            .and_then(|exe| Path::new(exe).file_stem())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("bash"))
+            .then(|| GIT_BASH.lock().unwrap_or_else(PoisonError::into_inner));
         let mut env_add = env_add.to_vec();
         env_add.extend(world.env());
         let cwd = world.root.path().to_str().expect("UTF-8 fixture cwd");
@@ -972,6 +993,7 @@ impl ConptyShell {
             pid: shell.pid,
             rx,
             seen: Vec::new(),
+            _git_bash: git_bash,
         }
     }
 

@@ -22,12 +22,12 @@ Config/packages	ok	enabled auto_update auto_install seed_install account exclude
 Config/reroute	ok	announce strict
 Config/privacy	ok	enabled check notice report_attribution warmup warmup_folders warmup_hold_ms probe_interval_ms observer protected_roots auto_accept
 Config/machine	ok	universal_control
-Config/sys	ok	stats_bars
+Config/sys	ok	stats_bars stats_deck_size disk_roots
 Config/keeper	ok	enabled
 Config/session_log	ok	journal clause
 RestoreManifest/(root)	ok	schema fold windows
 RestoreManifest/fold	ok	windows tabs front
-SessionHandoff/(root)	ok	schema sessions window connections next_turn_id outgoing_build held roster_seq fabric_attached fleet_told mirror_dropped mirror_served machine_names
+SessionHandoff/(root)	ok	schema resources sessions window connections next_turn_id outgoing_build held roster_seq fabric_attached fleet_told mirror_dropped mirror_served machine_names
 SessionHandoff/window	ok	rows cols outer_x outer_y inner_px presence_row status_bar_rows messages next_message_id update_verified_unix_ms font_px_milli font_reset_px_milli font_size_milli font_reset_size_milli update_health_said messages_captured_unix_ms
 CheckpointMeta/(root)	ok	rows cols history_lines cursor alt_cursor saved_cursor_main saved_cursor_alt modes style_fg_bits style_bg_bits style_flag_bits style_protected charset kitty_keyboard xterm_keyboard taskbar_progress secure_keyboard_entry current_working_directory shell_integration_nonce absolute_row_counter alt_absolute_row_counter color shell shell_integration_rev title parser output_state holder
 CheckpointMeta/cursor	ok	cursor_row cursor_col pending_wrap scroll_top scroll_bottom margin_left margin_right tab_stops tab_defaults_suppressed handback_rows handback_above

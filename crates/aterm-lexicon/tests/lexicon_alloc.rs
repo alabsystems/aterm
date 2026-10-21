@@ -1,26 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE EXACT-ALLOCATION PINS, in one binary with one counting allocator.
+//! The exact-allocation pins (`scan_scratch_alloc`, `tricks_alloc`): a warmed call on a typing-path
+//! hot spot allocates nothing.
 //!
-//! `scan_scratch_alloc` and `tricks_alloc` each assert that a warmed call on a
-//! typing-path hot spot allocates NOTHING.
-//!
-//! The count is THREAD-LOCAL: [`allocations_during`] arms a flag on
-//! the calling thread and the allocator counts only allocations made on a
-//! thread whose flag is armed, into that thread's own counter. Neither pin
-//! spawns a thread inside the counted closure, so each sees exactly its own
-//! allocations and the two share a process without bleeding into each other —
-//! nor into libtest's main thread, which formats a finished test's result while
-//! the other may be counting.
-//!
-//! Both flags are `const`-initialised thread-locals read with `try_with`, so
-//! reading them inside the allocator can never itself allocate, and an
-//! allocation during thread teardown (TLS gone) is simply not counted.
-//!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here or in `lexicon_suite.rs`, nor a `[[test]]` of its own, NEVER
-//! COMPILES.
+//! The count is per thread: [`allocations_during`] arms a flag on the calling thread and the
+//! allocator counts only on armed threads, so the pins share a process without counting each other
+//! or libtest's main thread. Neither spawns a thread inside the counted closure. The flags are
+//! `const`-initialised thread-locals read with `try_with`, so reading them never allocates and an
+//! allocation during thread teardown is not counted.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -84,7 +72,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-/// The allocations `f` makes ON THIS THREAD.
+/// The allocations `f` makes on this thread.
 fn allocations_during(f: impl FnOnce()) -> usize {
     ALLOCATIONS.with(|n| n.set(0));
     COUNTING.with(|c| c.set(true));
@@ -93,9 +81,7 @@ fn allocations_during(f: impl FnOnce()) -> usize {
     ALLOCATIONS.with(Cell::get)
 }
 
-/// The counter is not vacuous: an allocation on the counting thread is seen,
-/// and one on another thread is not. Without the first half a counter stuck at
-/// zero would pass both pins; without the second the pins could bleed.
+/// The counter is not vacuous: it sees an allocation on the counting thread and none on another.
 #[test]
 fn the_counter_sees_this_threads_allocations_and_no_other_threads() {
     let mine = allocations_during(|| {

@@ -294,7 +294,6 @@ impl TempDir {
     ///
     /// Returns an error if the directory cannot be created.
     pub fn new() -> io::Result<Self> {
-        // `env::temp_dir` via `call0` (see there).
         Self::new_in(call0(std::env::temp_dir))
     }
 
@@ -421,7 +420,6 @@ impl Builder {
     /// Returns an error if the directory cannot be created.
     pub fn tempdir(&self) -> io::Result<TempDir> {
         let prefix = self.prefix_str();
-        // `env::temp_dir` via `call0` (see there).
         TempDir::with_prefix_in(prefix, call0(std::env::temp_dir))
     }
 
@@ -449,20 +447,18 @@ pub fn tempdir() -> io::Result<TempDir> {
 /// whatever is there by rename.
 ///
 /// macOS assesses every new executable at its first exec and caches the verdict
-/// per inode. With syspolicyd backed up by concurrent builds, a freshly written
-/// two-line script has sat at its first exec for minutes, failing the tests that
-/// waited on it. So on macOS the body is kept once per user under the temp
-/// directory, named by its contents, and every later call hard-links that inode
-/// into place: only the first run on a machine pays the check (measured
-/// 2026-10-07: a new script's first exec 278 ms; a hard link to one already run,
-/// 3 ms; a fresh copy, 121 ms).
+/// per inode. On macOS the body is cached once per user under the temp
+/// directory (keyed by content hash) and hard-linked into place so only the
+/// first run on a machine pays the `syspolicyd` check (278 ms for a new
+/// script's first exec vs. 3 ms for a hard link to an already-assessed inode
+/// and 121 ms for a fresh copy).
 ///
-/// Every caller with the same body shares one inode, hence read-only: a write
-/// through `path` fails instead of changing every test's stand-in. Not for a
-/// stand-in a test chmods or rewrites in place, judges by inode or link count, or
-/// whose body names a per-test path (it would never be reused). Where the shared
-/// copy cannot be used (another volume, a copy not owned by the owner of `path`'s
-/// directory) the stand-in is written fresh.
+/// Every caller with the same body shares one read-only inode, so writes
+/// through `path` fail instead of mutating other tests' stand-ins. Do not use
+/// for stand-ins that a test chmods or rewrites in place, inspects by inode or
+/// link count, or parameterizes with per-test paths. Falls back to a fresh
+/// write when hard-linking is unavailable (cross-volume or mismatched directory
+/// owner).
 ///
 /// # Errors
 ///

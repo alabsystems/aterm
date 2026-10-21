@@ -131,7 +131,7 @@ fn a_fenced_press_on_a_moved_screen_is_decided_again_from_a_fresh_read() {
         idle_screen(),
     ]);
     m.tick_at_key = 1;
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     let (out, code) = s.supervise(&auto(30)).expect("supervise");
     assert_eq!(code, 0);
     assert!(out.starts_with("idle\n"), "{out}");
@@ -161,7 +161,7 @@ fn a_fenced_press_on_a_moved_screen_is_decided_again_from_a_fresh_read() {
     // is the manager's — no press without the fence.
     let mut m = fenced(vec![bash_one_row(); 8]);
     m.tick_at_key = 10;
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     let (out, _) = s.supervise(&auto(30)).expect("supervise");
     assert!(out.starts_with("prompt\n"), "handed over: {out}");
     let presses = m.presses();
@@ -4147,8 +4147,36 @@ fn a_limit_episode_is_told_to_the_host_and_waited_out_over_its_turn_ends() {
 /// again keeps it open.
 #[test]
 fn a_limit_episode_closes_at_a_reply_no_read_saw_busy() {
-    let run = |tag: &str, after: Vec<String>| {
+    // CONSTRUCTED from the measured notice rows, keeping their session identity.
+    // The quick screen answer must be judged in the same known conversation.
+    let stamp = crate::harness::usage::rfc3339_utc(WEEKLY_RESET_AT - 600);
+    let notice = include_str!("fixtures/claude-2.1.294-transcript-session-limit.jsonl")
+        .lines()
+        .skip(1)
+        .filter(|line| !line.contains("\"subtype\":\"informational\""))
+        .map(|line| {
+            let mut row = line
+                .replace(
+                    "You've hit your session limit · resets 11:33am (America/Los_Angeles)",
+                    WEEKLY_TEXT,
+                )
+                .replace("\"five_hour\"", "\"seven_day\"")
+                .replace("1791484405", &WEEKLY_RESET_AT.to_string());
+            for ms in ["921", "951", "952", "953"] {
+                row = row.replace(
+                    &format!("\"2026-10-08T16:34:58.{ms}Z\""),
+                    &format!("\"{stamp}\""),
+                );
+            }
+            row
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let run = |tag: &str, after: Vec<String>, known: bool| {
         let host = Arc::new(TestHost::default());
+        if known {
+            *host.tails.lock().unwrap() = Some((notice.clone(), notice.clone()));
+        }
         let (dir, path) = journal_file(tag);
         let mut m = Mock::new(vec![busy_screen(), weekly_limited(), after]);
         m.vanish_after = Some(3);
@@ -4174,7 +4202,7 @@ fn a_limit_episode_closes_at_a_reply_no_read_saw_busy() {
         lines.extend(records.into_iter().map(|r| r.line));
         (lines, told)
     };
-    let (lines, told) = run("limit-quick", answered("keep going"));
+    let (lines, told) = run("limit-quick", answered("keep going"), true);
     assert!(
         lines
             .iter()
@@ -4189,8 +4217,21 @@ fn a_limit_episode_closes_at_a_reply_no_read_saw_busy() {
         "the episode's close: {lines:#?}"
     );
     // NEGATIVE CONTROL: the limit answers the continuation again.
-    let (lines, told) = run("limit-again", weekly_retried());
+    let (lines, told) = run("limit-again", weekly_retried(), true);
     assert_eq!(told, [true], "{lines:#?}");
+    // The original host with no readable identity cannot clear a scoped limit.
+    let (lines, told) = run("limit-quick-unread", answered("keep going"), false);
+    assert_eq!(
+        told,
+        [true],
+        "the unread conversation stays limited: {lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("CLEARED seq=103 attention=")),
+        "no screen-only clear while the conversation is unread: {lines:#?}"
+    );
 }
 
 /// A host owed a relaunched agent's last step, as the window's host is after
@@ -5585,8 +5626,8 @@ enum Stop {
     After(Duration),
     /// Once the host shows `reached` (handed the run's clock now), then `tail` more of the
     /// run's clock for the steps it cannot see (a journal line, a typed turn). A loop that
-    /// never gets there ends at its `--max`, or at a minute of real time (a hang
-    /// detector), and fails on what it did.
+    /// never gets there ends at its `--max` and fails on what it did; one still running
+    /// after a minute of real time panics (a hang detector).
     Reached(Reach, Duration),
 }
 
@@ -5607,7 +5648,9 @@ impl Stop {
     }
 
     /// The judge [`hosted_with_host_at`] runs after every request: it raises `halt` once
-    /// this stop is due on `clock` (or a minute of real time has passed).
+    /// this stop is due on `clock`, and panics once a minute of real time has passed
+    /// with the stop never due (a hang detector: raising `halt` there would end a wedged
+    /// run as a clean one).
     fn judge(
         self,
         host: Arc<TestHost>,
@@ -5632,7 +5675,12 @@ impl Stop {
                     since.is_some_and(|at| now.saturating_duration_since(at) >= *tail)
                 }
             };
-            if due || Instant::now() >= hang {
+            assert!(
+                due || Instant::now() < hang,
+                "timed out after {:?} waiting for the run's stop to come due",
+                aterm_spec::wait::MUST_HAPPEN
+            );
+            if due {
                 halt.store(true, Ordering::SeqCst);
             }
         })
@@ -7955,7 +8003,7 @@ fn a_box_is_pressed_only_once_it_has_shown_the_settle() {
         // A wait on the sitting box sleeps what it asks, as a real one does.
         m.stall_sleep = Some(settle);
         m.vanish_after = Some(u32::from(!settle.is_zero()));
-        let mut s = session(&mut m, None);
+        let mut s = virtual_session(&mut m, None);
         s.set_box_settle(settle);
         let _ = s.supervise(&auto(30));
         drop(s);
@@ -8646,7 +8694,7 @@ fn a_question_key_is_sent_again_only_after_the_screen_held_still_and_counted_whe
     use aterm_phase::prompt::fixtures as f;
     let mut m = questioned(vec![q(f::QUESTION_TABS_INCIDENT)]);
     m.idle_never = true;
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     s.set_approval_env(owner_env());
     s.supervise(&answering(30)).expect("supervise");
     assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
@@ -8656,7 +8704,7 @@ fn a_question_key_is_sent_again_only_after_the_screen_held_still_and_counted_whe
     m.key_replies.push_back(ok("OK seq=101\n"));
     m.key_replies
         .push_back(ok("OK skipped reason=changed seq=101\n"));
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     s.set_approval_env(owner_env());
     s.supervise(&answering(30)).expect("supervise");
     assert_eq!(
@@ -11561,7 +11609,7 @@ fn tier1_the_cards_0_goes_only_where_the_model_allows() {
     m.vanish_after = Some(3);
     m.stall_sleep = Some(Duration::from_millis(400));
     let mut out: Vec<u8> = Vec::new();
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     s.set_survey_settle(Duration::ZERO);
     let _ = s.watch(&dismissing(), &mut out);
     assert_eq!(m.early_zeroes, 1);

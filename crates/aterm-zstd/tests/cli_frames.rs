@@ -6,12 +6,6 @@
 //! xxhsum's sanity buffer `zstd -q -19 -c <file>` (and with `--no-check`)
 //! writes byte for byte what `write_raw` does, at every Frame_Content_Size
 //! width and across the 128 KiB block boundary.
-//!
-//! Recorded 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md ZC.3): a scratch
-//! crate outside the workspace wrote each prefix to `<len>.bin`, Homebrew's
-//! zstd CLI v1.5.7 compressed it, and `shasum -a 256` hashed the output. The
-//! same run checked 17 lengths up to 4 MiB with `zstd -t` and `zstd -d | cmp`
-//! on `write_raw`'s own frames, and found every CLI frame identical to them.
 
 use crate::support::sanity;
 use aterm_digest::Sha256;

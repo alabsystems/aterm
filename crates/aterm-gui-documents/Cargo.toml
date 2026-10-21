@@ -14,6 +14,10 @@ description = "aterm-gui's document models, below the window: the Markdown reade
 # crate re-exports them under their old module names
 # (docs/DESIGN-amacs-2026-10-19.md §3).
 amacs = { workspace = true }
+# The width of a char (`char_width`): the reader's wrap and its estimate of a
+# block's rows count a wide char (CJK, a fullwidth form, an emoji) as two of
+# a face's average advances.
+aterm-grapheme = { workspace = true }
 
 [dev-dependencies]
 # The Markdown reader's Tier-1 binds to its derived models.

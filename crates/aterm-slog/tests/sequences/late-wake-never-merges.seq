@@ -9,6 +9,6 @@ elapse
 expect turn=t1
 see busy
 expect open t1 turn
-expect close t1 turn out=done at=0
-expect open t2 turn at=1500
+expect close t1 turn out=done @0
+expect open t2 turn @1500
 expect turn=t2

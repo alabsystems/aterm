@@ -461,6 +461,34 @@ pub enum AtomicSaveStage {
     VerifyProof,
 }
 
+/// What a step of a save was doing when the I/O error behind its failure
+/// came: the one thing besides the error's kind a caller needs to say what
+/// went wrong in a person's words (the folder is not writable, the file is
+/// not readable, another user's save lock is in the way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveTouch {
+    /// Making the save lock or the new file in the document's folder,
+    /// writing or syncing that new file, or syncing the folder.
+    Folder,
+    /// Opening, or taking, the save lock already beside the document.
+    Lock,
+    /// Reading the document itself.
+    Read,
+    /// Replacing the document with the new file.
+    Replace,
+}
+
+/// The I/O error behind a failed save step, for a caller to word: its kind
+/// and what the step was doing ([`SaveTouch`]). A step that refused on its
+/// own account (a hostile lock entry, an observation that moved) has none.
+/// `WouldBlock` is a save lock another writer kept past the retry budget,
+/// `FileTooLarge` new bytes over the document limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveCause {
+    pub kind: std::io::ErrorKind,
+    pub touch: SaveTouch,
+}
+
 /// Host assertion supplied only after the atomic replacement protocol completes.
 ///
 /// The booleans intentionally make partial implementations fail closed in the reducer.
@@ -484,7 +512,10 @@ pub enum AtomicSaveResult {
     },
     Failed {
         stage: AtomicSaveStage,
+        /// The step's own account, for a log; never words for a person.
         message: String,
+        /// What the step met, for a caller to word ([`SaveCause`]).
+        cause: Option<SaveCause>,
     },
     /// Replacement may already be visible, but the host could not complete its
     /// durability/content proof. The reducer must retain the old baseline and
@@ -493,6 +524,8 @@ pub enum AtomicSaveResult {
         stage: AtomicSaveStage,
         observed: Option<ObservedFileVersion>,
         message: String,
+        /// What the step met, for a caller to word ([`SaveCause`]).
+        cause: Option<SaveCause>,
     },
     Cancelled,
 }
@@ -558,13 +591,19 @@ pub enum SaveReduction {
     Conflict(VersionConflict),
     Failed {
         stage: AtomicSaveStage,
+        /// The step's own account, for a log; never words for a person.
         message: String,
+        /// What the step met, for a caller to word ([`SaveCause`]).
+        cause: Option<SaveCause>,
     },
     ReconcileRequired {
         expected: ObservedFileVersion,
         observed: Option<ObservedFileVersion>,
         stage: AtomicSaveStage,
+        /// The step's own account, for a log; never words for a person.
         message: String,
+        /// What the step met, for a caller to word ([`SaveCause`]).
+        cause: Option<SaveCause>,
     },
     Cancelled,
     Stale,
@@ -681,6 +720,7 @@ impl SaveReducer {
                     return self.fail(
                         AtomicSaveStage::VerifyProof,
                         "atomic save proof did not match the pending bytes".to_string(),
+                        None,
                     );
                 }
                 // The proof read bytes, not text. The buffer keeps the mapping
@@ -712,6 +752,7 @@ impl SaveReducer {
                     return self.fail(
                         AtomicSaveStage::Preflight,
                         "host reported a conflict for an unchanged target".to_string(),
+                        None,
                     );
                 };
                 if content_is_equivalent(plan.expected, observed) {
@@ -727,11 +768,16 @@ impl SaveReducer {
                 };
                 SaveReduction::Conflict(kind)
             }
-            AtomicSaveResult::Failed { stage, message } => self.fail(stage, message),
+            AtomicSaveResult::Failed {
+                stage,
+                message,
+                cause,
+            } => self.fail(stage, message, cause),
             AtomicSaveResult::PublishedUnverified {
                 stage,
                 observed,
                 message,
+                cause,
             } => {
                 self.phase = SavePhase::ReconcileRequired {
                     expected: plan.expected,
@@ -744,6 +790,7 @@ impl SaveReducer {
                     observed,
                     stage,
                     message,
+                    cause,
                 }
             }
             AtomicSaveResult::Cancelled => {
@@ -762,12 +809,21 @@ impl SaveReducer {
         Ok(generation)
     }
 
-    fn fail(&mut self, stage: AtomicSaveStage, message: String) -> SaveReduction {
+    fn fail(
+        &mut self,
+        stage: AtomicSaveStage,
+        message: String,
+        cause: Option<SaveCause>,
+    ) -> SaveReduction {
         self.phase = SavePhase::Failed {
             stage,
             message: message.clone(),
         };
-        SaveReduction::Failed { stage, message }
+        SaveReduction::Failed {
+            stage,
+            message,
+            cause,
+        }
     }
 }
 
@@ -2046,6 +2102,7 @@ mod tests {
                 stage: AtomicSaveStage::SyncDirectory,
                 observed: Some(visible),
                 message: "directory sync failed".to_string(),
+                cause: None,
             },
         );
         assert!(matches!(

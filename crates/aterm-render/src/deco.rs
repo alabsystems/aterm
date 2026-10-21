@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Font-metric line decorations (W7): the PURE policy layer behind underline /
-//! strikethrough / overline / undercurl geometry.
+//! Underline, strikethrough, overline and undercurl geometry: the pure policy both
+//! renderers share.
 //!
 //! Four shared policies live here:
 //!
@@ -43,32 +43,23 @@
 
 use aterm_core::terminal::UnderlineStyle;
 
-/// Decoration metrics read from a font at face build, as PER-EM fractions
-/// (scaled by the live `px` at every derivation, like the renderer's
-/// `TypoLineMetrics`). `None` fields mean the face lacks that table entry —
-/// the resolver then uses the historical heuristic.
+/// Decoration metrics read at face build, as per-em fractions scaled by the live `px`.
+/// `None` means the face lacks that entry and the heuristic applies.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct DecoTables {
-    /// `post` table underline as `(position_em, thickness_em)`. Position
-    /// follows the FreeType convention: the CENTER of the stroke relative to
-    /// the baseline, negative below it.
+    /// `post` underline as `(position_em, thickness_em)`: the centre of the stroke relative
+    /// to the baseline, negative below (the FreeType convention).
     pub underline: Option<(f32, f32)>,
-    /// OS/2 `yStrikeoutPosition`/`ySize` as `(position_em, thickness_em)`.
-    /// Position is the TOP of the stroke relative to the baseline, positive
-    /// above it (the OpenType OS/2 definition).
+    /// OS/2 `yStrikeoutPosition`/`ySize` as `(position_em, thickness_em)`: the top of the
+    /// stroke relative to the baseline, positive above.
     pub strikeout: Option<(f32, f32)>,
 }
 
-/// The RESOLVED per-cell decoration bands, in cell-relative pixel rows.
+/// Resolved per-cell decoration bands, in cell-relative pixel rows.
 ///
-/// # Invariant (proven)
-///
-/// For every input to [`resolve_deco_metrics`] (any `cell_h >= 1`, any
-/// baseline, any table values, any adjust deltas):
-/// `1 <= underline_t <= cell_h`, `underline_y + underline_t <= cell_h`, and
-/// the same for the strike band — decorations can NEVER leave their cell.
-/// Machine-checked over an adversarial lattice by
-/// `tests/deco_lines.rs::resolved_bands_always_inside_the_cell`.
+/// For every input to [`resolve_deco_metrics`]: `1 <= underline_t <= cell_h`,
+/// `underline_y + underline_t <= cell_h`, and the same for the strike band
+/// (`tests/deco_lines.rs::resolved_bands_always_inside_the_cell`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecoMetrics {
     /// Top row of the single underline, relative to the cell top.
@@ -81,14 +72,11 @@ pub struct DecoMetrics {
     pub strike_t: usize,
 }
 
-/// Resolve the pixel decoration bands for a `cell_h`-tall cell with `baseline`
-/// px of ascent, from the font's tables (when present) or the historical
-/// heuristic (when absent — byte-identical to the pre-W7 hardcoded bands).
-/// `adjust_pos` shifts the underline down (+) / up (−) and `adjust_thick`
-/// fattens/thins it — the `adjust_underline_position` /
-/// `adjust_underline_thickness` config escape hatches. Everything is clamped
-/// in-cell LAST, so no input can push a band out of the cell (see
-/// [`DecoMetrics`]).
+/// Resolve the decoration bands for a `cell_h`-tall cell with `baseline` px of ascent, from
+/// the font's tables or, without them, the `cell_h/15` heuristic. `adjust_pos` moves the
+/// underline down (+) or up (−) and `adjust_thick` changes its thickness (the
+/// `adjust_underline_position` / `adjust_underline_thickness` config keys). Clamping
+/// in-cell comes last, so no input can push a band out of the cell.
 #[must_use]
 pub fn resolve_deco_metrics(
     cell_h: usize,
@@ -98,17 +86,15 @@ pub fn resolve_deco_metrics(
     adjust_pos: i32,
     adjust_thick: i32,
 ) -> DecoMetrics {
-    // The renderer guarantees cell_h >= 1 (`cell_h_baseline` floors at 1);
-    // guard anyway so the in-cell invariant is total.
+    // `cell_h_baseline` floors at 1; guard anyway so the in-cell invariant is total.
     let ch = cell_h.max(1);
     let base = baseline.max(0) as usize;
     let legacy_t = (ch / 15).max(1);
-    // Scale a per-em thickness to px: round to nearest, floor at 1 so a thin
-    // face never yields an invisible line. `as i64` saturates on non-finite /
-    // huge floats, keeping the arithmetic total.
+    // Per-em thickness to px, floored at 1 so a thin face never yields an invisible line;
+    // `as i64` saturates on non-finite input.
     let thick_px = |em: f32| ((em * px).round() as i64).max(1);
-    // Underline: table position is the stroke CENTER relative to the baseline
-    // (negative below); heuristic is "a hair below the baseline" (legacy).
+    // Underline: the table gives the stroke centre (negative below the baseline); the
+    // fallback sits just below the baseline.
     let (uy, ut) = match tables.and_then(|t| t.underline) {
         Some((pos_em, th_em)) if th_em > 0.0 => {
             let t = thick_px(th_em);
@@ -122,8 +108,8 @@ pub fn resolve_deco_metrics(
         ut.saturating_add(i64::from(adjust_thick)),
         ch,
     );
-    // Strikethrough: table position is the stroke TOP relative to the baseline
-    // (positive above); heuristic is a third of the ascent above the baseline.
+    // Strikethrough: the table gives the stroke top above the baseline; the fallback is a
+    // third of the ascent above it.
     let (sy, st) = match tables.and_then(|t| t.strikeout) {
         Some((pos_em, th_em)) if th_em > 0.0 => {
             let t = thick_px(th_em);
@@ -143,9 +129,8 @@ pub fn resolve_deco_metrics(
     }
 }
 
-/// Clamp a `(top, thickness)` band into a `cell_h`-tall cell: thickness into
-/// `[1, cell_h]` first, then the top into `[0, cell_h - thickness]` — the
-/// order that guarantees `top + thickness <= cell_h` for ALL inputs.
+/// Clamp a `(top, thickness)` band into the cell: thickness into `[1, cell_h]` first, then
+/// top into `[0, cell_h - thickness]`, which guarantees `top + thickness <= cell_h`.
 fn clamp_band(top: i64, thickness: i64, cell_h: usize) -> (usize, usize) {
     let nonnegative = |value: i64| usize::try_from(value.max(0)).unwrap_or(usize::MAX);
     let t = nonnegative(thickness).clamp(1, cell_h);
@@ -153,19 +138,16 @@ fn clamp_band(top: i64, thickness: i64, cell_h: usize) -> (usize, usize) {
     (y, t)
 }
 
-/// Whether the DOTTED underline pattern is ON at absolute column `x`: square
-/// dots of side `thickness` separated by equal gaps, phased from `x == 0` —
-/// a pure function of `x`, so the pattern never resets at a cell seam.
+/// Whether the dotted underline is on at absolute column `x`: square dots of side
+/// `thickness` with equal gaps, phased from `x == 0`.
 #[must_use]
 pub fn dotted_on(x: usize, thickness: usize) -> bool {
     let t = thickness.max(1);
     (x / t).is_multiple_of(2)
 }
 
-/// Whether the DASHED underline pattern is ON at absolute column `x`: dashes
-/// of ~2/3 duty over a `max(cell_w/2, 2)` period, phased from `x == 0` — a
-/// pure function of `x` (given the row's cell advance), so a dash crosses
-/// cell seams unbroken.
+/// Whether the dashed underline is on at absolute column `x`: ~2/3 duty over a
+/// `max(cell_w/2, 2)` period, so a dash crosses cell seams unbroken.
 #[must_use]
 pub fn dashed_on(x: usize, cell_w: usize) -> bool {
     let p = (cell_w / 2).max(2);
@@ -173,10 +155,8 @@ pub fn dashed_on(x: usize, cell_w: usize) -> bool {
     x % p < d
 }
 
-/// Which half-phase of the LEGACY square-wave curly fallback absolute column
-/// `x` is in (`true` = raised segment). Only used when the AA undercurl mask
-/// is unsupported at this cell size ([`undercurl_supported`]); phased from
-/// `x == 0` like every other pattern.
+/// Whether absolute column `x` is in the raised half of the square-wave curly fallback,
+/// used when [`undercurl_supported`] is false.
 #[must_use]
 pub fn squarewave_up(x: usize, cell_h: usize) -> bool {
     let seg = (cell_h / 6).max(2);
@@ -188,18 +168,15 @@ pub fn squarewave_up(x: usize, cell_h: usize) -> bool {
 /// [`DECO_ATLAS_SPRITES`] cell-wide sprites in one row.
 pub const DECO_ATLAS_MAX_DIM: usize = 2048;
 
-/// Number of sprites in the shared deco atlas: the 7 sparkle-word glyphs plus
-/// the undercurl tile (slot [`UNDERCURL_SPRITE`]). The GPU const-asserts its
-/// sprite table against this so the layouts can never drift.
+/// Sprites in the shared deco atlas: the 7 sparkle-word glyphs plus the undercurl tile
+/// ([`UNDERCURL_SPRITE`]). aterm-gpu const-asserts its sprite table against this.
 pub const DECO_ATLAS_SPRITES: usize = 8;
 
 /// The undercurl's sprite slot in the shared deco atlas.
 pub const UNDERCURL_SPRITE: usize = 7;
 
-/// Whether the AA undercurl mask path is usable at this BASE cell size — i.e.
-/// the shared deco atlas fits the GPU's texture-size cap. When `false`, BOTH
-/// renderers fall back to the legacy square-wave rects (shared predicate, so
-/// CPU/GPU can never disagree on which path draws).
+/// Whether the AA undercurl mask fits the shared deco atlas at this base cell size. When
+/// `false`, both renderers draw the square-wave fallback.
 #[must_use]
 pub fn undercurl_supported(cell_w: usize, cell_h: usize) -> bool {
     cell_w > 0
@@ -282,16 +259,10 @@ pub fn undercurl_coverage(cell_w: usize, cell_h: usize, deco: DecoMetrics) -> Ve
     buf
 }
 
-/// The BASE-width mask column an absolute framebuffer column `x` samples from
-/// an undercurl tile, on a row whose on-screen cell advance is `rcw` (2× the
-/// base `cell_w` on DEC double-width rows) with the grid inset by `pad`.
-///
-/// The wave TILES per cell advance (`(x - pad) % rcw`) and NEAREST-samples the
-/// base-width sprite exactly like the GPU atlas sampler (and the sparkle-word
-/// precedent), so CPU and GPU read the same coverage byte. Pure in the
-/// ABSOLUTE column: the cell index never appears, so the wave's phase cannot
-/// reset at a seam — and it is `rcw`-periodic by integer `%` (period
-/// exactness, proven in `tests/deco_lines.rs`).
+/// The base-width undercurl tile column that absolute framebuffer column `x` samples, on a
+/// row with cell advance `rcw` (2× `base_cw` on DEC double-width rows) and grid inset
+/// `pad`. The wave tiles per advance and nearest-samples like the GPU atlas sampler, so CPU
+/// and GPU read the same byte; no cell index enters, so the phase never resets at a seam.
 #[must_use]
 pub fn undercurl_tile_col(x: usize, pad: usize, rcw: usize, base_cw: usize) -> usize {
     debug_assert!(x >= pad && rcw > 0 && base_cw > 0);
@@ -299,10 +270,8 @@ pub fn undercurl_tile_col(x: usize, pad: usize, rcw: usize, base_cw: usize) -> u
     ((((tx as f32) + 0.5) / rcw as f32) * base_cw as f32) as usize % base_cw.max(1)
 }
 
-/// The cell-relative `[y0, y1)` row band an underline STYLE occupies, from the
-/// resolved metrics — the rows descender ink-skip probes for glyph ink. `None`
-/// for `UnderlineStyle::None`. Shared by both renderers so the skip band can
-/// never diverge.
+/// The cell-relative `[y0, y1)` rows an underline style occupies (the band descender
+/// ink-skip probes), shared by both renderers; `None` for `UnderlineStyle::None`.
 #[must_use]
 pub fn underline_band(
     style: UnderlineStyle,
@@ -324,14 +293,8 @@ pub fn underline_band(
     }
 }
 
-/// Whether descender ink-skip may carve the underline of a cell whose glyph
-/// occupies `cols` terminal columns.
-///
-/// **Single-column cells only.** A double-width cell is, by Unicode East Asian
-/// Width, an ideograph or a fullwidth form — Han, Kana, Hangul, wide emoji —
-/// and those scripts have NO DESCENDERS. Their glyphs are set in the em square
-/// with the foot resting on the baseline, and the rule underneath is meant to
-/// run unbroken.
+/// Whether descender ink-skip may carve the underline of a cell whose glyph occupies `cols`
+/// columns: single-column cells only.
 ///
 /// # The defect this closes (composition underlines under CJK)
 ///
@@ -374,20 +337,12 @@ pub fn ink_skip_applies_to_width(cols: usize) -> bool {
     cols <= 1
 }
 
-/// Descender ink-skip core: given per-column glyph-ink presence over a cell's
-/// underline span (`ink[i]` = ink in the probed band at column `i`), push the
-/// maximal `(start, len)` spans of columns KEPT after removing every column
-/// within a 1px dilation of ink.
+/// Descender ink-skip: given per-column ink presence over a cell's underline span, push the
+/// maximal `(start, len)` spans kept after removing every column within 1px of ink.
 ///
-/// # Invariants (proven, `tests/deco_lines.rs`)
-///
-/// * **Coverage-monotone** — kept spans are a SUBSET of `[0, ink.len())`: the
-///   skip can only zero underline coverage, never add it.
-/// * **No-ink identity** — an all-false `ink` yields the single full span, so
-///   a cell with no descender ink renders byte-identically to the feature
-///   being off.
-/// * **Dilation exactness** — column `i` is skipped iff `ink` holds at
-///   `i-1`, `i`, or `i+1`.
+/// Kept spans are a subset of `[0, ink.len())` (the skip only erases), an all-false `ink`
+/// yields the one full span, and column `i` is skipped iff `ink` holds at `i-1`, `i` or
+/// `i+1` (`tests/deco_lines.rs`).
 pub fn keep_spans_after_ink(ink: &[bool], out: &mut Vec<(usize, usize)>) {
     let w = ink.len();
     let skipped = |i: usize| ink[i] || (i > 0 && ink[i - 1]) || (i + 1 < w && ink[i + 1]);
@@ -405,10 +360,8 @@ pub fn keep_spans_after_ink(ink: &[bool], out: &mut Vec<(usize, usize)>) {
     }
 }
 
-/// Intersect the rect `[rx, rx + rw)` (x-extent) with each `(start, len)` span,
-/// pushing the surviving `[x, y, w, h]` sub-rects. Used to apply descender
-/// ink-skip to already-emitted underline rects: output coverage ⊆ input
-/// coverage by construction.
+/// Intersect the rect's x-extent with each `(start, len)` span, pushing the surviving
+/// `[x, y, w, h]` sub-rects: ink-skip applied to already-emitted underline rects.
 pub fn intersect_rect_spans(out: &mut Vec<[usize; 4]>, rect: [usize; 4], spans: &[(usize, usize)]) {
     let [rx, ry, rw, rh] = rect;
     for &(sx, sw) in spans {

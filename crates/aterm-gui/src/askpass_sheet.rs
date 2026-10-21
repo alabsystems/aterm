@@ -123,6 +123,9 @@ impl App {
             ));
             return;
         }
+        // The secrets vault's join sheet gives the window up: a second sheet would queue
+        // unseen behind it until sudo's deadline. The join is asked again after.
+        self.withdraw_secrets_sheet_window(wid);
         self.build_askpass_sheet(wid, session, &command, &invoker, ticket, reply);
     }
 
@@ -372,7 +375,8 @@ impl App {
 
 /// Extract directly into guarded UTF-16 and UTF-8 buffers. No ordinary Rust
 /// String or Vec ever owns the field's plaintext, including malformed input.
-fn read_secure_field(field: &Obj) -> Option<aterm_uds::sudo::Secret> {
+/// The secrets vault's join sheet reads its password the same way.
+pub(crate) fn read_secure_field(field: &Obj) -> Option<aterm_uds::sudo::Secret> {
     // SAFETY: the caller owns this retained NSSecureTextField on the main
     // thread. Its NSString is borrowed through this synchronous read; the exact
     // counted range writes into initialized, bounded, scrubbed UTF-16 storage.

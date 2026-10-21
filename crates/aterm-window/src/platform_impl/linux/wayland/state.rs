@@ -27,7 +27,7 @@ use aterm_wayland::protocols::cursor_shape_v1::wp_cursor_shape_manager_v1;
 use aterm_wayland::protocols::fractional_scale_v1::wp_fractional_scale_manager_v1;
 use aterm_wayland::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use aterm_wayland::protocols::viewporter::wp_viewporter;
-use aterm_wayland::protocols::wayland::{wl_compositor, wl_shm};
+use aterm_wayland::protocols::wayland::{wl_compositor, wl_shm, wl_subcompositor};
 use aterm_wayland::protocols::xdg_activation_v1::xdg_activation_v1;
 use aterm_wayland::proxy::{Display, Proxy, Queue};
 use aterm_wayland::seat::Seats;
@@ -186,8 +186,11 @@ pub struct WinitState {
     /// The XDG shell that is used for windows.
     pub(crate) xdg_shell: Arc<Shell>,
 
-    /// The `wl_shm`, for the cursor theme's images.
+    /// The `wl_shm`, for the cursor theme's images and the shadow margin's buffers.
     shm: Arc<Owned>,
+
+    /// The `wl_subcompositor`, for the shadow margin's border parts (`None`: no shadow).
+    pub(crate) subcompositor: Option<Arc<Owned>>,
 
     /// The compositor, which is used to create new surfaces and regions.
     pub(crate) compositor: Arc<Owned>,
@@ -222,8 +225,13 @@ impl WinitState {
             // client-side destruction for one with none).
             proxy.map(|proxy| unsafe { Owned::new(proxy, destroy) })
         };
-        // LOCAL PATCH (aterm), LW.5: no `wl_subcompositor` bind; it served only the
-        // client-side frame's subsurfaces, and the window has no frame.
+        // LOCAL PATCH (aterm), L-HEADER-LW7: `wl_subcompositor` is bound again (LW.5 left it
+        // with sctk-adwaita's frame), for the shadow margin's border parts; a compositor
+        // without one shows windows with no shadow.
+        let subcompositor = owned(
+            bind(c"wl_subcompositor", &wl_subcompositor::INTERFACE, 1),
+            wl_subcompositor::destroy,
+        );
         let compositor = owned(
             bind(c"wl_compositor", &wl_compositor::INTERFACE, 6),
             aterm_wayland::proxy::Proxy::destroy,
@@ -292,6 +300,7 @@ impl WinitState {
             fractional_scaling_manager,
             xdg_shell: Arc::new(xdg_shell),
             shm: Arc::new(shm),
+            subcompositor: subcompositor.map(Arc::new),
             compositor: Arc::new(compositor),
             seats_book,
             outputs,
@@ -363,7 +372,30 @@ impl WinitState {
         drop(monitors);
         let outputs = &self.outputs;
         self.output_scales.retain(|global, _| outputs.proxy(*global).is_some());
+        if self.forget_gone_outputs() {
+            self.rescale_legacy_surfaces();
+        }
         self.sync_seats();
+    }
+
+    /// Drop every output the registry no longer lists from the outputs each surface is on:
+    /// whether any surface was on one. A compositor need not send `wl_surface.leave` for an
+    /// output that goes (sway sends none), and sctk kept such an output in a surface's list,
+    /// so before `wl_compositor` version 6 a window that was on a gone output kept its scale
+    /// until the next `enter`, `leave` or `done` (docs/AUDIT-third-party-2026-10-15.md,
+    /// L-HEADER-LW7). The proxy is released, and a later output's could reuse its address.
+    fn forget_gone_outputs(&mut self) -> bool {
+        let outputs = &self.outputs;
+        let mut gone = false;
+        for entry in self.surface_scales.values_mut() {
+            let before = entry.outputs.len();
+            entry.outputs.retain(|proxy| outputs.by_proxy(*proxy).is_some());
+            gone |= entry.outputs.len() != before;
+        }
+        for window in self.windows.get_mut().values() {
+            window.lock().unwrap().outputs.retain(|o| outputs.by_proxy(o.proxy()).is_some());
+        }
+        gone
     }
 
     /// The monitors list, as the outputs now are.
@@ -379,7 +411,6 @@ impl WinitState {
             Wire::PreferredScale { window, scale } => {
                 self.scale_factor_changed(window, scale as f64 / SCALE_DENOMINATOR, false)
             },
-            Wire::Frame { window } => self.frame(window),
             Wire::TextInput { seat, event } => self.text_input_event(seat, event),
             Wire::ActivationDone { window, token } => self.activation_done(window, &token),
             Wire::OutputDone(info) => self.output_done(info),
@@ -593,26 +624,6 @@ impl WinitState {
                 window_state.lock().unwrap().reload_cursor_style()
             }
         }
-    }
-
-    /// sctk's `CompositorHandler::frame`.
-    fn frame(&mut self, window_id: WindowId) {
-        let window = match self.windows.get_mut().get(&window_id) {
-            Some(window) => window,
-            None => return,
-        };
-
-        // In case we have a redraw requested we must indicate the wake up.
-        if self
-            .window_requests
-            .get_mut()
-            .get(&window_id)
-            .is_some_and(|requests| requests.redraw_requested.load(Ordering::Relaxed))
-        {
-            self.dispatched_events = true;
-        }
-
-        window.lock().unwrap().frame_callback_received();
     }
 
     /// The attention request's activation token arrived: activate the window with it.

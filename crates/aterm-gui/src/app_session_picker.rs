@@ -165,10 +165,9 @@ impl App {
         }
     }
 
-    /// While the picker is open on `wid`, drive it from the keyboard and
-    /// SWALLOW every key (the modal-overlay gate contract): printable chars
-    /// filter, Backspace deletes, Up/Down move, Enter chooses, Esc closes.
-    /// Mirrors `on_key_palette_mode`.
+    /// While the picker is open on `wid`, drive it from the keyboard and swallow
+    /// every key: printable chars filter, Backspace deletes, Up/Down move, Enter
+    /// chooses, Esc closes.
     pub(crate) fn on_key_session_picker_mode(
         &mut self,
         wid: WindowId,
@@ -206,10 +205,8 @@ impl App {
         true
     }
 
-    /// The ENGINE-NEUTRAL twin of [`Self::on_key_session_picker_mode`] —
-    /// reached by controller `key`/`text` verbs, mirroring
-    /// `palette_input_event`. The caller still swallows the event from the
-    /// PTY.
+    /// The engine-neutral twin of [`Self::on_key_session_picker_mode`], for the
+    /// controller's `key`/`text` verbs. The caller still keeps the event from the PTY.
     pub(crate) fn session_picker_input_event(
         &mut self,
         wid: WindowId,
@@ -225,14 +222,9 @@ impl App {
         {
             return;
         }
-        // THE KEYPAD IS ITS MAIN-BLOCK TWIN ON AN OVERLAY, as it is on a native
-        // page and in the seam's press classifier. This card reads the key for
-        // what it MEANS, and `keymap::build_key_input` hands it the keypad
-        // identity (`Numpad5`, `NumpadEnd`) so the PTY encoders can tell KP_5
-        // from 5 — which the arms below have no case for: a keypad digit
-        // typed NOTHING into the filter and a keypad arrow moved no row.
-        // `InputEvent::keypad_folded` is the one fold, shared with the native
-        // pages, and a controller's `key kp5` takes the same road.
+        // An overlay reads a keypad key as its main-block twin: `build_key_input`
+        // keeps the keypad identity (`Numpad5`) for the PTY encoders, which the arms
+        // below have no case for. `InputEvent::keypad_folded` is the shared fold.
         let folded = ev.keypad_folded();
         let ev = folded.as_ref().unwrap_or(ev);
         match ev {
@@ -266,7 +258,7 @@ impl App {
         }
     }
 
-    // ---- Pointer boundary (the palette_claims_pointer discipline) ----------
+    // ---- Pointer ----------------------------------------------------------------
 
     /// Modal pointer boundary: whether the open picker owns the gesture on
     /// `wid`. Shares [`Self::overlay_card_claims_pointer`] with the other modal
@@ -279,8 +271,8 @@ impl App {
         )
     }
 
-    /// The FILTERED row index under a window-space point, through the same
-    /// zoom-aware transform the card was composited with.
+    /// The filtered row index under a window-space point, through the zoom-aware
+    /// transform the card was composited with.
     fn session_picker_row_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
         let picker = self.windows.get(&wid)?.session_picker()?;
         let (transform, x, y) = self.overlay_card_point(wid, x, y)?;
@@ -323,8 +315,7 @@ impl App {
         self.repaint_session_picker_pointer(wid, changed);
     }
 
-    /// Settle a left release: same-row press+release chooses through the SAME
-    /// intent-dispatch seam as Enter.
+    /// Settle a left release: a same-row press and release chooses, as Enter does.
     pub(crate) fn session_picker_pointer_release(&mut self, wid: WindowId, x: f64, y: f64) {
         let hit = self.session_picker_row_at_pointer(wid, x, y);
         let (changed, activate) = self
@@ -450,8 +441,8 @@ mod tests {
         assert!(listed[1].contains("identity=alpha") && listed[2].contains("identity=beta"));
         assert!(listed[3].contains("identity=+new"), "{listed:?}");
 
-        // An EXISTING name typed in the filter: its own row is chosen, and the
-        // new-identity row refuses to recreate it.
+        // An existing name in the filter chooses its own row; the new-identity row
+        // refuses to recreate it.
         for c in "beta".chars() {
             app.session_picker_filter_push(wid, c);
         }
@@ -478,7 +469,7 @@ mod tests {
             "an invalid name chooses nothing and the picker stays open"
         );
 
-        // A valid NEW name: the new-identity row provisions it and closes.
+        // A valid new name: the new-identity row provisions it and closes.
         for _ in 0.."Bad Name".len() {
             app.session_picker_backspace(wid);
         }

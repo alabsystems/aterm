@@ -1499,6 +1499,68 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
     );
 }
 
+/// A RESTATEMENT THAT RE-TITLES A ROW TAKES THE SHORT FORM IT CARRIES
+/// ([`Restatement::short_title`]): the new title's own, as it takes the
+/// finished words it declares; the same title keeps its short form; and
+/// `Some(None)` clears it. NEGATIVE CONTROL: left unset, a new title drops
+/// the old short form — it shortened the old title.
+#[test]
+fn a_restatement_takes_the_short_form_it_carries() {
+    let now = t0();
+    let mut c = fresh(now);
+    let id = c
+        .post(
+            busy("Claude's login expired in tab 1").short_title("Login expired"),
+            stamp(),
+            now,
+        )
+        .id;
+    let short = |c: &MessageCenter| c.live(id).and_then(|l| l.msg.short_title.clone());
+    let retitle = |title: &str, short_title: Option<Option<String>>| Restatement {
+        title: Some(title.into()),
+        short_title,
+        ..Restatement::default()
+    };
+    assert!(c.restate(
+        id,
+        retitle("Claude's login expired in tab 1", None),
+        now + ms(1)
+    ));
+    assert_eq!(
+        short(&c).as_deref(),
+        Some("Login expired"),
+        "the same title"
+    );
+    let usage = Some(Some("Usage limit".to_string()));
+    assert!(c.restate(
+        id,
+        retitle("Claude usage limit reached in tab 1", usage.clone()),
+        now + ms(2)
+    ));
+    assert_eq!(short(&c).as_deref(), Some("Usage limit"));
+    assert!(c.restate(
+        id,
+        Restatement {
+            short_title: Some(None),
+            ..Restatement::default()
+        },
+        now + ms(3)
+    ));
+    assert_eq!(short(&c), None, "cleared");
+    // NEGATIVE CONTROL: unset, the new title drops the old short form.
+    assert!(c.restate(
+        id,
+        retitle("Claude usage limit reached in tab 1", usage),
+        now + ms(4)
+    ));
+    assert!(c.restate(
+        id,
+        retitle("Claude sign-in cancelled in tab 1", None),
+        now + ms(5)
+    ));
+    assert_eq!(short(&c), None, "the control");
+}
+
 /// An echo draws no load words (the work ended) and keeps the slot they sat
 /// in, declared or not, so nothing on the row reflows.
 #[test]

@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! COUNT tests for the many-tab / many-session wins MPT-2..5 and the subscribe
-//! idle wake (docs/PERF-REGRESSION-DEFENCE.md, W-4 and "If you are the next
-//! person here", item 1).
+//! Count tests for the many-tab / many-session paths and the subscribe idle
+//! wake.
 //!
-//! A pass that goes back to doing the work reaches the same ANSWER, only
-//! slower, so outcome-parity tests cannot catch the giveback. Each test here
-//! reads a `crate::work_counts` counter placed at the site that does the
-//! removed WORK (N tabs x M panes staged through `push_stub_tab` +
-//! `split_active_stub_tab`; the digest through `DigestFixture`). Each also
-//! shows its counter moving on a control, so a zero is never a counter nobody
-//! increments.
+//! Each test reads a `crate::work_counts` counter placed at the work site (N
+//! tabs x M panes staged through `push_stub_tab` + `split_active_stub_tab`; the
+//! digest through `DigestFixture`). Each also shows its counter moving on a
+//! control, so a zero is never a counter nobody increments.
 
 use super::*;
 use crate::work_counts;
@@ -23,7 +19,7 @@ const BURST_DT: Duration = Duration::from_micros(333);
 
 /// Window 0 split to `panes` panes,
 /// then `tabs - 1` more tabs appended, each split as it becomes active. Leaves
-/// the LAST tab active.
+/// the last tab active.
 fn workspace(tabs: usize, panes: usize) -> App {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -52,10 +48,9 @@ fn set_grid(app: &mut App, rows: u16, cols: u16) {
     ws.cols = cols;
 }
 
-/// MPT-2: the live-drag tick (`resize_panes_scoped(wid, true)`, run by
-/// `redraw_window` on EVERY presented frame while `panes_stale` stands) lays
-/// out the ACTIVE tab only. Before MPT-2 it built every tab's plan and threw
-/// the background ones away: 8 plans per frame here, 30 at the finding's shape.
+/// The live-drag tick (`resize_panes_scoped(wid, true)`, run by `redraw_window`
+/// on every presented frame while `panes_stale` stands) lays out the active tab
+/// only.
 #[test]
 fn a_live_drag_tick_lays_out_only_the_active_tab() {
     const TABS: usize = 8;
@@ -64,7 +59,7 @@ fn a_live_drag_tick_lays_out_only_the_active_tab() {
     app.resize_panes_scoped(wid, false);
     let _ = work_counts::take_plans_built();
 
-    // CONTROL: an AllTabs settle lays out every tab — the counter counts.
+    // Control: an AllTabs settle lays out every tab — the counter counts.
     set_grid(&mut app, 30, 100);
     app.resize_panes_scoped(wid, false);
     assert_eq!(
@@ -73,7 +68,7 @@ fn a_live_drag_tick_lays_out_only_the_active_tab() {
         "a settle plans every tab"
     );
 
-    // THE DRAG: a new grid, active-only ticks. One plan per tick.
+    // The drag: a new grid, active-only ticks. One plan per tick.
     set_grid(&mut app, 32, 120);
     for _ in 0..16 {
         app.resize_panes_scoped(wid, true);
@@ -90,10 +85,8 @@ fn a_live_drag_tick_lays_out_only_the_active_tab() {
     );
 }
 
-/// MPT-3: a successful present's latency walk touches the VISIBLE panes' stamps
-/// only — O(active tab), never O(tabs x panes). Before MPT-3 every present
-/// walked every leaf of every tab to discard hidden stamps: ~120 read-modify-
-/// writes at 30 x 4, against the 4 here.
+/// A successful present's latency walk touches the visible panes' stamps only
+/// — O(active tab), never O(tabs x panes).
 #[test]
 fn the_present_walk_touches_only_the_visible_panes_stamps() {
     const PANES: usize = 4;
@@ -123,8 +116,7 @@ fn the_present_walk_touches_only_the_visible_panes_stamps() {
         8 * PANES,
         "a steady present touches exactly the visible panes' stamps"
     );
-    // The retired sweep walked every TAB's leaves, which needs every tab's
-    // plan: one plan per present is the active tab's and nothing else.
+    // One plan per present is built for the active tab only.
     assert_eq!(
         work_counts::take_plans_built(),
         8,
@@ -132,10 +124,8 @@ fn the_present_walk_touches_only_the_visible_panes_stamps() {
     );
 }
 
-/// MPT-4: inside the observation interval the status sweep probes NO session
-/// — the O(1) deadline gate answers before the pool fold. Before MPT-4 every
-/// output wake folded the whole pool (30 probes per wake here, thousands of
-/// wakes a second under a flood) to usually find nothing due.
+/// Inside the observation interval the status sweep probes no session — the
+/// O(1) deadline gate answers before the pool fold.
 #[test]
 fn a_rate_limited_status_sweep_probes_no_session() {
     const SESSIONS: usize = 30;
@@ -170,10 +160,8 @@ fn a_rate_limited_status_sweep_probes_no_session() {
     );
 }
 
-/// MPT-5 (the half that landed): in the steady state the title-drift gate is
-/// decided by the labeling window's epoch cache and walks NO tab. Before the
-/// conjuncts were reordered it walked the window's whole tab list on every
-/// output burst: 30 tab touches per wake here.
+/// In the steady state the title-drift gate is decided by the labeling window's
+/// epoch cache and walks no tab.
 #[test]
 fn a_steady_title_gate_walks_no_tab() {
     const TABS: usize = 30;
@@ -197,9 +185,8 @@ fn a_steady_title_gate_walks_no_tab() {
         "a steady flood must not walk the tab list"
     );
 
-    // CONTROL: a window whose cache does not cover the session (it started
-    // labeling it after the last flush) walks the list to find out — the part
-    // the reverse index MPT-5 asks for would remove, and proof the counter runs.
+    // Control: a window whose cache does not cover the session (it started
+    // labeling it after the last flush) walks the list to find out.
     app.windows
         .get_mut(&wid)
         .expect("fixture window")
@@ -214,11 +201,9 @@ fn a_steady_title_gate_walks_no_tab() {
     );
 }
 
-/// The subscribe IDLE WAKE: an `events` digest whose ledgers are saturated
+/// The subscribe idle wake: an `events` digest whose ledgers are saturated
 /// (1000 shell blocks, 512 turn records, 512 timeline events per target)
-/// touches NO retained record on a wake where nothing happened. Before
-/// `458f0fa28` every wake — the 4 Hz liveness ticks included — walked all
-/// three ledgers linearly: ~2,000 records per target per wake.
+/// touches no retained record on a wake where nothing happened.
 #[test]
 fn an_idle_events_wake_touches_no_retained_record() {
     use crate::subscribe::digest_fixture::DigestFixture;
@@ -243,8 +228,8 @@ fn an_idle_events_wake_touches_no_retained_record() {
         "an idle wake must not touch the retained ledgers"
     );
 
-    // CONTROL: one real turn per target — the wake emits, and reaches the
-    // ledger by a SEEK (O(log n + new)), never a walk.
+    // Control: one real turn per target — the wake emits, and reaches the
+    // ledger by a seek (O(log n + new)), never a walk.
     f.land_turn();
     assert!(f.wake(true) > 0, "a wake after a real append emits");
     let touched = work_counts::take_retained_records_touched();
@@ -303,14 +288,13 @@ fn derivations_over(
     work_counts::take_cell_geometry_derivations()
 }
 
-/// THE CELL BOX IS DERIVED ONCE PER CHANGE, NEVER PER FRAME: the window's
+/// The cell box is derived once per change, never per frame: the window's
 /// cell size (`App::win_cell_size`, asked by the frame's layout, the cursor,
-/// the band, the cell-pixel sync and the composer's caret — 4 times a frame
-/// at rest and 6 a keystroke on this window, measured 2026-10-16) is read
+/// the band, the cell-pixel sync and the composer's caret) is read
 /// from what the renderer kept for the window's px, so a frame at rest and a
 /// keystroke's frame derive nothing. Each derivation reads the face's
 /// metrics, and the macOS default primary (SF Mono, instantiated) parses
-/// the face for them: ~0.2 µs a call.
+/// the face for them.
 ///
 /// Every real input of it derives exactly once and is then kept: a window
 /// whose scale changed (a move to another display, `on_scale_factor_changed`
@@ -320,10 +304,8 @@ fn derivations_over(
 /// px). Each reads the new geometry (it is what the face derives now), never
 /// a kept one.
 ///
-/// NEGATIVE CONTROLS: each change's first frame derives (the counter counts
-/// the frame's asks), and its answer is the new geometry. Without the kept
-/// answers the rest frames read 4.2 a frame, and without the baseline's
-/// forget the reloaded baseline reads the kept one (both mutation-checked).
+/// Negative controls: each change's first frame derives (the counter counts
+/// the frame's asks), and its answer is the new geometry.
 #[cfg(debug_assertions)]
 #[test]
 fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
@@ -343,7 +325,7 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
     });
     assert_eq!(keys, 0, "keystroke frames derive no cell box");
 
-    // A SCALE CHANGE: the window's metric record re-resolved at 2x (what
+    // Scale change: the window's metric record re-resolved at 2x (what
     // `on_scale_factor_changed` does for an attached window). Its first frame
     // derives the new px once; the frames after keep it.
     let px = app.windows[&wid].metrics.font_px;
@@ -383,7 +365,7 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
     );
     assert_eq!(app.win_cell_size(wid), before, "the first display's box");
 
-    // A CONFIG RELOAD of the baseline escape hatch (`adjust_baseline`),
+    // Config reload of the baseline escape hatch (`adjust_baseline`),
     // through the real admission path: a live push onto the renderer
     // (`apply_render_knob`), no rebuild, so the renderer itself forgets what
     // it kept. The reload and its first frame derive once between them.
@@ -412,7 +394,7 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
         "kept after the baseline's reload"
     );
 
-    // A CONFIG RELOAD that moves the cell box (`line_height`), through the
+    // Config reload that moves the cell box (`line_height`), through the
     // real admission path: a rebuild, whose new renderer has kept nothing.
     apply_config_text(&mut app, dir, "line_height = 1.5\n");
     let _ = work_counts::take_cell_geometry_derivations();
@@ -435,7 +417,7 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
         "kept after the reload"
     );
 
-    // A FONT ZOOM: the zoom's own transaction asks the outgoing renderer at
+    // Font zoom: the zoom's own transaction asks the outgoing renderer at
     // the new px (`refresh_all_window_metrics` syncing the cell pixel size)
     // before the rebuild replaces it, and the new renderer, which has kept
     // nothing, derives on its first frame: once per renderer, then kept.

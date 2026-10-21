@@ -1,12 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The production release host's own decisions, over what `gh` and the download host
-//! answer: an HTTP 404 is an ANSWER (not found), a 500 or a dropped connection is not,
-//! a name that exists is a refusal; a create is always a prerelease that never takes
-//! `latest` (the structural half of the retired prerelease suite); an upload replaces
-//! only when asked; a download always overwrites its own partial files; and a write is
-//! only ever made as a token file's identity.
+//! The production release host's own decisions over what `gh` and the download host answer:
+//! an HTTP 404 is an answer (not found), a 500 or a dropped connection is not, and a name that
+//! exists is a refusal; a create is always a prerelease that never takes `latest`; an upload
+//! replaces only when asked; a download overwrites its own partial files; a write is made only
+//! as a token file's identity.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

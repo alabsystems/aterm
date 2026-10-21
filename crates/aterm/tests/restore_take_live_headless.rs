@@ -74,12 +74,7 @@ impl World {
     fn new(tag: &str) -> Self {
         let world = Self(launch_isolation::scratch_root(&format!("atrt-{tag}")));
         assert!(
-            world
-                .path()
-                .join("run/aterm/a.sock.token")
-                .as_os_str()
-                .len()
-                < headless_boot::MAX_SOCK_PATH,
+            launch_isolation::sock_fits(&world.path().join("run/aterm/a.sock.token")),
             "the private root's socket fits sun_path"
         );
         world

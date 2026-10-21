@@ -201,9 +201,20 @@ fn the_decoder_refuses_what_is_not_a_line() {
         }
         other => panic!("a future kind is still a record: {other:?}"),
     }
-    // Negative control: this build knows 3B's kinds and phase 5's `task`, so
-    // the same line names them.
-    for k in [Kind::Source, Kind::MailLanded, Kind::Task] {
+    // Negative control: this build knows 3B's kinds, phase 5's `task` and
+    // Phase 6's ring kinds (6F-2), so the same line names them.
+    for k in [
+        Kind::Source,
+        Kind::MailLanded,
+        Kind::Task,
+        Kind::State,
+        Kind::Policy,
+        Kind::Topic,
+        Kind::Advisory,
+        Kind::Program,
+        Kind::MailFetch,
+        Kind::Shown,
+    ] {
         let line = future.replace("zzz-kind-of-phase-9", k.word());
         match decode_line(line.as_bytes()) {
             Ok(Frame::Rec { rec, .. }) => assert_eq!(rec.k, k),

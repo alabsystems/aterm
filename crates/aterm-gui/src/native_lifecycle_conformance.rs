@@ -4,9 +4,8 @@
 //! Tier-1 conformance for native Settings singleton activation and async routing.
 //!
 //! These traces drive the genuine [`crate::App`] Settings host, stable native runtime
-//! identities and the versioned config reducer.  Projections are reconstructed from
-//! those independent truth lanes; they are never copied from the model action or a
-//! single router verdict.
+//! identities and the versioned config reducer. Projections are reconstructed from those
+//! independent lanes, never copied from the model action or a single router verdict.
 
 #![cfg(test)]
 
@@ -202,8 +201,8 @@ fn real_app_settings_activation_conforms_in_two_windows_and_rejects_duplicates()
     assert_eq!(settings_views_in_window(&app, two), 1);
     assert!(app.structural_invariants_ok());
 
-    // Negative control: historical "open means allocate" behavior creates both
-    // a second controller and a second implicit view in the requesting window.
+    // Negative control: "open means allocate" creates a second controller and a second
+    // implicit view in the requesting window.
     let mut duplicate = before_repeat_two.clone();
     duplicate.insert("opens", before_repeat_two["opens"] + 1);
     duplicate.insert("settings_instances", 2);
@@ -458,7 +457,7 @@ impl AsyncHarness {
             .effects
             .into_iter()
             .find_map(|effect| match effect {
-                AppEffect::ConfigPatch { patch, reply } => Some((patch, reply)),
+                AppEffect::ConfigPatch { patch, reply, .. } => Some((patch, reply)),
                 _ => None,
             })
             .expect("real Settings config reply");
@@ -584,8 +583,8 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
     let Some(PendingReply::View(reply)) = harness.pending.as_ref() else {
         panic!("view reply");
     };
-    // Both halves live on their own: the Markdown view's identity, as owner
-    // AND sink, is a current reply proof...
+    // Both halves live on their own: the Markdown view's identity, as owner and sink, is a
+    // current reply proof...
     let markdown = CompletionSink::View {
         instance: harness.markdown_instance,
         view: harness.markdown_view,

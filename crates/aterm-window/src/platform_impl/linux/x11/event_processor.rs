@@ -7,6 +7,17 @@
 // Modified by the aterm project in 2026; see the repository NOTICE. (Events are read through
 // aterm-x11's Xlib and XInput 2 declarations, and the requests are its encoders, where
 // upstream used x11-dl and x11rb: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
+//
+// LOCAL PATCH (aterm), 2026-10-21 (docs/AUDIT-third-party-2026-10-15.md, WC.8): no device
+// events. No aterm crate handles `ApplicationHandler::device_event`, so the raw XInput 2
+// motion, button and key events are no longer selected on the root while a window has focus,
+// and hot-plugged devices only update the scroll axes; `WindowEvent::AxisMotion`, which aterm
+// ignores, is not reported either.
+//
+// LOCAL PATCH (aterm), 2026-10-21 (X11-GONE): a request an event's handling makes that fails is
+// reported (`XConnection::report`), where upstream's `expect`s panicked: the connection can break
+// while an event is handled, and the loop's next look ends the run with the loss. The IME
+// requests queued behind such an event are not sent on the broken connection.
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
@@ -21,19 +32,19 @@ use aterm_xkb::ModMask as xkb_mod_mask_t;
 use super::ffi::{
     self, event_type, xi, xkb_event, Display as XDisplay, Window as XWindow, XClientMessageEvent,
     XConfigureEvent, XDestroyWindowEvent, XEvent, XExposeEvent, XIDeviceEvent, XIEnterEvent,
-    XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent, XILeaveEvent, XIModifierState, XIRawEvent,
-    XKeyEvent, XMapEvent, XPropertyEvent, XReparentEvent, XSelectionEvent, XVisibilityEvent,
-    XkbAnyEvent, XkbStateRec,
+    XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent, XILeaveEvent, XIModifierState, XKeyEvent,
+    XMapEvent, XPropertyEvent, XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent,
+    XkbStateRec,
 };
 
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::event::{
-    DeviceEvent, ElementState, Event, Ime, InnerSizeWriter, MouseButton, MouseScrollDelta,
-    RawKeyEvent, Touch, TouchPhase, WindowEvent,
+    ElementState, Event, Ime, InnerSizeWriter, MouseButton, MouseScrollDelta, Touch, TouchPhase,
+    WindowEvent,
 };
 use crate::event_loop::ActiveEventLoop as RootAEL;
 use crate::keyboard::ModifiersState;
-use crate::platform_impl::common::xkb::{self, XkbState};
+use crate::platform_impl::common::xkb::XkbState;
 use crate::platform_impl::platform::common::xkb::Context;
 use crate::platform_impl::platform::x11::ime::{ImeEvent, ImeEventReceiver, ImeRequest};
 use crate::platform_impl::platform::x11::ActiveEventLoop;
@@ -42,7 +53,7 @@ use crate::platform_impl::x11::atoms::*;
 use crate::platform_impl::x11::util::cookie::GenericEventCookie;
 use crate::platform_impl::x11::{
     mkdid, mkwid, util, CookieResultExt, Device, DeviceId, DeviceInfo, Dnd, DndState, ImeReceiver,
-    ScrollOrientation, UnownedWindow, WindowId,
+    ReportExt, ScrollOrientation, UnownedWindow, WindowId,
 };
 
 /// The core protocol's modifier bits in a key event's state (`KeyButMask`).
@@ -118,8 +129,14 @@ impl EventProcessor {
 
         let window_target = Self::window_target_mut(&mut self.target);
 
-        // Handle IME requests.
-        while let Ok(request) = self.ime_receiver.try_recv() {
+        // Handle IME requests, unless the event's handling found the display gone: XIM speaks
+        // through Xlib, which queues a broken connection's requests until its buffer overflows
+        // (`XConnection::set_cursor_icon`). They stay queued, and the loop's next look ends
+        // the run (X11-GONE).
+        while !window_target.x_connection().is_broken() {
+            let Ok(request) = self.ime_receiver.try_recv() else {
+                break;
+            };
             let ime = match window_target.ime.as_mut() {
                 Some(ime) => ime,
                 None => continue,
@@ -321,34 +338,9 @@ impl EventProcessor {
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
                         self.xinput2_touch(xev, phase, &mut callback);
                     },
-                    xi::RAW_BUTTON_PRESS | xi::RAW_BUTTON_RELEASE => {
-                        let state = match evtype {
-                            xi::RAW_BUTTON_PRESS => ElementState::Pressed,
-                            xi::RAW_BUTTON_RELEASE => ElementState::Released,
-                            _ => unreachable!(),
-                        };
-
-                        let xev: &XIRawEvent = unsafe { xev.as_event() };
-                        self.xinput2_raw_button_input(xev, state, &mut callback);
-                    },
-                    xi::RAW_MOTION => {
-                        let xev: &XIRawEvent = unsafe { xev.as_event() };
-                        self.xinput2_raw_mouse_motion(xev, &mut callback);
-                    },
-                    xi::RAW_KEY_PRESS | xi::RAW_KEY_RELEASE => {
-                        let state = match evtype {
-                            xi::RAW_KEY_PRESS => ElementState::Pressed,
-                            xi::RAW_KEY_RELEASE => ElementState::Released,
-                            _ => unreachable!(),
-                        };
-
-                        let xev: &XIRawEvent = unsafe { xev.as_event() };
-                        self.xinput2_raw_key_input(xev, state, &mut callback);
-                    },
-
                     xi::HIERARCHY_CHANGED => {
                         let xev: &XIHierarchyEvent = unsafe { xev.as_event() };
-                        self.xinput2_hierarchy_changed(xev, &mut callback);
+                        self.xinput2_hierarchy_changed(xev);
                     },
                     _ => {},
                 }
@@ -489,7 +481,7 @@ impl EventProcessor {
                         | xproto::event_mask::SUBSTRUCTURE_REDIRECT,
                     &client_msg.to_bytes(),
                 ))
-                .expect_then_ignore_error("Failed to send `ClientMessage` event.");
+                .ignore_error_or_report(&wt.xconn, "Failed to send `ClientMessage` event.");
             return;
         }
 
@@ -548,7 +540,7 @@ impl EventProcessor {
                 unsafe {
                     self.dnd
                         .send_status(window, source_window, DndState::Rejected)
-                        .expect("Failed to send `XdndStatus` message.");
+                        .or_report(&wt.xconn, "Failed to send `XdndStatus` message.");
                 }
                 self.dnd.reset();
                 return;
@@ -572,7 +564,7 @@ impl EventProcessor {
             unsafe {
                 self.dnd
                     .send_status(window, source_window, DndState::Accepted)
-                    .expect("Failed to send `XdndStatus` message.");
+                    .or_report(&wt.xconn, "Failed to send `XdndStatus` message.");
             }
             return;
         }
@@ -599,7 +591,7 @@ impl EventProcessor {
             unsafe {
                 self.dnd
                     .send_finished(window, source_window, state)
-                    .expect("Failed to send `XdndFinished` message.");
+                    .or_report(&wt.xconn, "Failed to send `XdndFinished` message.");
             }
 
             self.dnd.reset();
@@ -701,12 +693,24 @@ impl EventProcessor {
         } else {
             let mut shared_state_lock = window.shared_state_lock();
 
-            // We need to convert client area position to window position.
+            // We need to convert client area position to window position. Extents the server
+            // cannot give (the display gone) are taken as none, and not cached.
             let frame_extents =
                 shared_state_lock.frame_extents.as_ref().cloned().unwrap_or_else(|| {
-                    let frame_extents = wt.xconn.get_frame_extents_heuristic(xwindow, wt.root);
-                    shared_state_lock.frame_extents = Some(frame_extents.clone());
-                    frame_extents
+                    match wt
+                        .xconn
+                        .get_frame_extents_heuristic(xwindow, wt.root)
+                        .or_report(&wt.xconn, "Failed to get the window's frame")
+                    {
+                        Some(frame_extents) => {
+                            shared_state_lock.frame_extents = Some(frame_extents.clone());
+                            frame_extents
+                        },
+                        None => util::FrameExtentsHeuristic {
+                            frame_extents: util::FrameExtents::from_border(0),
+                            heuristic_path: util::FrameExtentsHeuristicPath::UnsupportedBordered,
+                        },
+                    }
                 });
             let outer =
                 frame_extents.inner_pos_to_outer(new_inner_position.0, new_inner_position.1);
@@ -738,14 +742,16 @@ impl EventProcessor {
                 let monitor = wt
                     .xconn
                     .get_monitor_for_window(Some(window_rect))
-                    .expect("Failed to find monitor for window");
+                    .or_report(&wt.xconn, "Failed to find monitor for window");
 
-                if monitor.is_dummy() {
-                    // Avoid updating monitor using a dummy monitor handle
-                    last_scale_factor
-                } else {
-                    shared_state_lock.last_monitor = monitor.clone();
-                    monitor.scale_factor
+                match monitor {
+                    // Avoid updating monitor using a dummy monitor handle, or none
+                    None => last_scale_factor,
+                    Some(monitor) if monitor.is_dummy() => last_scale_factor,
+                    Some(monitor) => {
+                        shared_state_lock.last_monitor = monitor.clone();
+                        monitor.scale_factor
+                    },
                 }
             };
             if last_scale_factor != new_scale_factor {
@@ -867,7 +873,7 @@ impl EventProcessor {
         if let Some(ime) = wt.ime.as_ref() {
             ime.borrow_mut()
                 .remove_context(window as XWindow)
-                .expect("Failed to destroy input context");
+                .or_report(&wt.xconn, "Failed to destroy input context");
         }
 
         callback(&self.target, Event::WindowEvent { window_id, event: WindowEvent::Destroyed });
@@ -1168,7 +1174,9 @@ impl EventProcessor {
 
             let x = unsafe { *value };
 
-            let event = if let Some(&mut (_, ref mut info)) =
+            // A scroll axis scrolls; another axis's motion (upstream's `AxisMotion`, which
+            // aterm ignores) is not reported (WC.8).
+            if let Some(&mut (_, ref mut info)) =
                 physical_device.scroll_axes.iter_mut().find(|&&mut (axis, _)| axis == i as _)
             {
                 let delta = (x - info.position) / info.increment;
@@ -1181,12 +1189,9 @@ impl EventProcessor {
                     ScrollOrientation::Vertical => MouseScrollDelta::LineDelta(0.0, -delta as f32),
                 };
 
-                WindowEvent::MouseWheel { device_id, delta, phase: TouchPhase::Moved }
-            } else {
-                WindowEvent::AxisMotion { device_id, axis: i as u32, value: unsafe { *value } }
-            };
-
-            events.push(Event::WindowEvent { window_id, event });
+                let event = WindowEvent::MouseWheel { device_id, delta, phase: TouchPhase::Moved };
+                events.push(Event::WindowEvent { window_id, event });
+            }
 
             value = unsafe { value.offset(1) };
         }
@@ -1265,7 +1270,7 @@ impl EventProcessor {
         let window = xev.event as xproto::Window;
 
         if let Some(ime) = wt.ime.as_ref() {
-            ime.borrow_mut().focus(xev.event).expect("Failed to focus input context");
+            ime.borrow_mut().focus(xev.event).or_report(&wt.xconn, "Failed to focus input context");
         }
 
         if self.active_window == Some(window) {
@@ -1273,8 +1278,6 @@ impl EventProcessor {
         }
 
         self.active_window = Some(window);
-
-        wt.update_listen_device_events(true);
 
         let window_id = mkwid(window);
         let position = PhysicalPosition::new(xev.event_x, xev.event_y);
@@ -1325,13 +1328,13 @@ impl EventProcessor {
         }
 
         if let Some(ime) = wt.ime.as_ref() {
-            ime.borrow_mut().unfocus(xev.event).expect("Failed to unfocus input context");
+            ime.borrow_mut()
+                .unfocus(xev.event)
+                .or_report(&wt.xconn, "Failed to unfocus input context");
         }
 
         if self.active_window.take() == Some(window) {
             let window_id = mkwid(window);
-
-            wt.update_listen_device_events(false);
 
             // Clear the modifiers when unfocusing the window.
             if let Some(xkb_state) = self.xkb_context.state_mut() {
@@ -1403,116 +1406,14 @@ impl EventProcessor {
         }
     }
 
-    fn xinput2_raw_button_input<T: 'static, F>(
-        &self,
-        xev: &XIRawEvent,
-        state: ElementState,
-        mut callback: F,
-    ) where
-        F: FnMut(&RootAEL, Event<T>),
-    {
-        if xev.flags & XI_POINTER_EMULATED == 0 {
-            let event = Event::DeviceEvent {
-                device_id: mkdid(xev.deviceid as xinput::DeviceId),
-                event: DeviceEvent::Button { state, button: xev.detail as u32 },
-            };
-            callback(&self.target, event);
-        }
-    }
-
-    fn xinput2_raw_mouse_motion<T: 'static, F>(&self, xev: &XIRawEvent, mut callback: F)
-    where
-        F: FnMut(&RootAEL, Event<T>),
-    {
-        let did = mkdid(xev.deviceid as xinput::DeviceId);
-
-        let mask =
-            unsafe { slice::from_raw_parts(xev.valuators.mask, xev.valuators.mask_len as usize) };
-        let mut value = xev.raw_values;
-        let mut mouse_delta = util::Delta::default();
-        let mut scroll_delta = util::Delta::default();
-        for i in 0..xev.valuators.mask_len * 8 {
-            if !xi_mask_is_set(mask, i) {
-                continue;
-            }
-            let x = unsafe { value.read_unaligned() };
-
-            // We assume that every XInput2 device with analog axes is a pointing device emitting
-            // relative coordinates.
-            match i {
-                0 => mouse_delta.set_x(x),
-                1 => mouse_delta.set_y(x),
-                2 => scroll_delta.set_x(x as f32),
-                3 => scroll_delta.set_y(x as f32),
-                _ => {},
-            }
-
-            let event = Event::DeviceEvent {
-                device_id: did,
-                event: DeviceEvent::Motion { axis: i as u32, value: x },
-            };
-            callback(&self.target, event);
-
-            value = unsafe { value.offset(1) };
-        }
-
-        if let Some(mouse_delta) = mouse_delta.consume() {
-            let event = Event::DeviceEvent {
-                device_id: did,
-                event: DeviceEvent::MouseMotion { delta: mouse_delta },
-            };
-            callback(&self.target, event);
-        }
-
-        if let Some(scroll_delta) = scroll_delta.consume() {
-            let event = Event::DeviceEvent {
-                device_id: did,
-                event: DeviceEvent::MouseWheel {
-                    delta: MouseScrollDelta::LineDelta(scroll_delta.0, scroll_delta.1),
-                },
-            };
-            callback(&self.target, event);
-        }
-    }
-
-    fn xinput2_raw_key_input<T: 'static, F>(
-        &mut self,
-        xev: &XIRawEvent,
-        state: ElementState,
-        mut callback: F,
-    ) where
-        F: FnMut(&RootAEL, Event<T>),
-    {
-        let device_id = mkdid(xev.sourceid as xinput::DeviceId);
-        let keycode = xev.detail as u32;
-        if keycode < KEYCODE_OFFSET as u32 {
-            return;
-        }
-        let physical_key = xkb::raw_keycode_to_physicalkey(keycode);
-
-        callback(&self.target, Event::DeviceEvent {
-            device_id,
-            event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
-        });
-    }
-
-    fn xinput2_hierarchy_changed<T: 'static, F>(&mut self, xev: &XIHierarchyEvent, mut callback: F)
-    where
-        F: FnMut(&RootAEL, Event<T>),
-    {
+    /// A device came or went: its scroll axes are read, or forgotten. (WC.8: the
+    /// `DeviceEvent::Added`/`Removed` upstream reported no aterm crate reads.)
+    fn xinput2_hierarchy_changed(&mut self, xev: &XIHierarchyEvent) {
         let infos = unsafe { slice::from_raw_parts(xev.info, xev.num_info as usize) };
         for info in infos {
             if 0 != info.flags & (xi::SLAVE_ADDED | xi::MASTER_ADDED) {
                 self.init_device(info.deviceid as xinput::DeviceId);
-                callback(&self.target, Event::DeviceEvent {
-                    device_id: mkdid(info.deviceid as xinput::DeviceId),
-                    event: DeviceEvent::Added,
-                });
             } else if 0 != info.flags & (xi::SLAVE_REMOVED | xi::MASTER_REMOVED) {
-                callback(&self.target, Event::DeviceEvent {
-                    device_id: mkdid(info.deviceid as xinput::DeviceId),
-                    event: DeviceEvent::Removed,
-                });
                 let mut devices = self.devices.borrow_mut();
                 devices.remove(&DeviceId(info.deviceid as xinput::DeviceId));
             }
@@ -1804,7 +1705,7 @@ impl EventProcessor {
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
-        wt.xconn.reload_database().expect("failed to reload Xft database");
+        wt.xconn.reload_database().or_report(&wt.xconn, "failed to reload Xft database");
 
         // In the future, it would be quite easy to emit monitor hotplug events.
         let prev_list = {
@@ -1815,7 +1716,11 @@ impl EventProcessor {
             }
         };
 
-        let new_list = wt.xconn.available_monitors().expect("Failed to get monitor list");
+        let Some(new_list) =
+            wt.xconn.available_monitors().or_report(&wt.xconn, "Failed to get monitor list")
+        else {
+            return;
+        };
         for new_monitor in new_list {
             // Previous list may be empty, in case of disconnecting and
             // reconnecting the only one monitor. We still need to emit events in

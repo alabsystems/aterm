@@ -3,21 +3,10 @@
 
 # aterm-libc-oracle: spec recovery from its 72 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 12 tests it
-> deleted and 1 spec whose functions it deleted are gone, and the spec rows no longer cite those
-> tests. Counts elsewhere in this file were taken before.
+> Status: migration worklist. Each of the 54 specs below is proved through Trust/Clean against the
+> compiled Rust function, and then the tests it subsumes are deleted.
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 54 specs below gets proved
-> through Trust/Clean against the compiled Rust function, and then the tests it subsumes are deleted.
-> No test has been deleted yet.
-
-Source: `crates/aterm-libc-oracle` (read only). Every `#[test]` fn was read (src/cargo.rs 5, cells.rs 3,
-closure.rs 3, controls.rs 7, harvest.rs 3, main.rs 3, regen.rs 3, regen/behaviour.rs 1, regen/decls.rs 2,
-regen/handwritten.rs 1, regen/layout.rs 3, regen/oracle.rs 3, regen/probe.rs 4, regen/shim.rs 7, run.rs 1,
-rustdoc.rs 4, shape.rs 6, siblings.rs 4, symbols.rs 2, trust.rs 2, union.rs 2, verdict.rs 2,
-tests/exit_codes.rs 1 = 72), along with the code each one reaches. Nothing was compiled or run; the
-claims come from reading the code. The census counted 76 tests. The extra 4 are `#[test]` text inside
-string literals in `src/regen/oracle.rs` (§5.1).
+Source: `crates/aterm-libc-oracle` (72 `#[test]` fns across `src/` and `tests/exit_codes.rs`).
 
 Result: **54 specs**, covering **72 tests**. **0 tests are not spec samples**. Three tests also pin
 data or formatting that no spec should keep (§4).

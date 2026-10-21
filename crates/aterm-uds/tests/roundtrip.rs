@@ -169,8 +169,8 @@ fn clone_bidirectional_relay() {
 /// (signal(7)): that is no timeout, and a poll loop reads again, as this one
 /// does. This process installs no handler, but a translator may run its own:
 /// Rosetta signals every thread of a process it translates with an internal
-/// `SIGTRAP` whenever it syncs them (measured 2026-10-17, strace: si_code
-/// 0xffefdbe9, sent by one of the process's own threads).
+/// `SIGTRAP` whenever it syncs them (strace: si_code 0xffefdbe9, sent by one
+/// of the process's own threads).
 #[test]
 fn read_timeout_returns_would_block() {
     let (a, b) = CtlStream::pair().expect("pair");

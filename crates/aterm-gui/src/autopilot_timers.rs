@@ -634,14 +634,30 @@ impl App {
     /// (`None` for a live index): a passed instant is then said to have
     /// passed while that was closed. Where what the chip shows moved, the
     /// footer is posted and an open Autopilot menu for the session is built
-    /// again ([`Self::refresh_autopilot_menu`]). Reads the clocks only where
-    /// a timer is stored.
+    /// again ([`Self::refresh_autopilot_menu`]), and the strips that show it
+    /// are stamped again, since the tab's hover names the timer (`driven by
+    /// aterm (cruise, lands at 18:00)`, §12.4.1; `App::restamp_for_hover`).
+    /// Reads the clocks only where a timer is stored.
     pub(crate) fn index_autopilot_timer(&mut self, local_id: u64, closed: Option<ClosedOver>) {
+        if self.index_autopilot_timer_unstamped(local_id, closed) {
+            self.restamp_for_hover(local_id);
+        }
+    }
+
+    /// [`Self::index_autopilot_timer`] for a caller that stamps the strips
+    /// itself after it (a meta move's `refresh_meta_dependent_chrome`), so a
+    /// timed write stamps each strip once: whether what the chip shows moved,
+    /// for the caller to stamp where it does not.
+    pub(crate) fn index_autopilot_timer_unstamped(
+        &mut self,
+        local_id: u64,
+        closed: Option<ClosedOver>,
+    ) -> bool {
         let stored = self
             .pool
             .get(local_id)
             .and_then(|session| stored_timer(&session.ctx));
-        self.index_autopilot_timer_at(local_id, stored, closed);
+        self.index_autopilot_timer_at(local_id, stored, closed)
     }
 
     /// [`Self::index_autopilot_timer`] for a session not yet registered
@@ -652,15 +668,20 @@ impl App {
         ctx: &crate::SessionCtx,
         closed: Option<ClosedOver>,
     ) {
-        self.index_autopilot_timer_at(local_id, stored_timer(ctx), closed);
+        if self.index_autopilot_timer_at(local_id, stored_timer(ctx), closed) {
+            self.restamp_for_hover(local_id);
+        }
     }
 
+    /// The index follows `stored`; where what the chip shows moved, the
+    /// footer is posted and an open menu built again. Whether it moved: the
+    /// caller stamps the strips (the hover names the timer).
     fn index_autopilot_timer_at(
         &mut self,
         local_id: u64,
         stored: Option<i64>,
         closed: Option<ClosedOver>,
-    ) {
+    ) -> bool {
         let moved = match stored {
             Some(land_at_ms) => self.autopilot_timers.arm(
                 local_id,
@@ -676,6 +697,7 @@ impl App {
             crate::claude_footer::post_changed(local_id);
             self.refresh_autopilot_menu(local_id);
         }
+        moved
     }
 
     /// THE OFFER IS BUILT (the Autopilot menu's rows, Settings ▸ Harness's
@@ -780,9 +802,16 @@ impl App {
                     .arm(*id, *land_at_ms, now, wall, &local_offset_at, None);
             }
         }
-        for id in had.into_iter().chain(stored.iter().map(|(id, _)| *id)) {
+        // Each session once, though it both had an entry and stores one:
+        // its strips are stamped once.
+        let ids: std::collections::BTreeSet<u64> = had
+            .into_iter()
+            .chain(stored.iter().map(|(id, _)| *id))
+            .collect();
+        for id in ids {
             crate::claude_footer::post_changed(id);
             self.refresh_autopilot_menu(id);
+            self.restamp_for_hover(id);
         }
     }
 
@@ -877,6 +906,7 @@ impl App {
                     }
                     crate::claude_footer::post_changed(local_id);
                     self.refresh_autopilot_menu(local_id);
+                    self.restamp_for_hover(local_id);
                 }
             }
         }

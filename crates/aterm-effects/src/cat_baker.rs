@@ -249,6 +249,22 @@ impl CatBaker {
         Some(self.install(i, slot_key, tile.pixels(), tw, usize::from(key.h)))
     }
 
+    /// Look up a resident `BakeKeyV4` tile and stamp it used this frame without
+    /// spending bake budget on a miss.
+    pub fn peek_v4(&mut self, key: &BakeKeyV4) -> Option<CatTile> {
+        if self.cell_h == 0
+            || key.w == 0
+            || u32::from(key.w) + u32::from(PATCH_STRIP) > u32::from(self.slot_w)
+        {
+            return None;
+        }
+        let slot_h = 2 * usize::from(self.cell_h);
+        if key.h == 0 || usize::from(key.h) > slot_h {
+            return None;
+        }
+        self.touch(SlotKey::Cat(*key))
+    }
+
     /// The cache hit: find `key`'s slot and stamp it used this frame (the LRU
     /// touch), returning its atlas placement.
     fn touch(&mut self, key: SlotKey) -> Option<CatTile> {
@@ -291,13 +307,17 @@ impl CatBaker {
         let slot_h = 2 * usize::from(self.cell_h);
         let atlas_w = usize::from(self.slot_w);
         let y0 = i * slot_h;
-        for row in 0..slot_h {
+        let copy_rows = rows.min(slot_h);
+        for row in 0..copy_rows {
             let d = (y0 + row) * atlas_w * 4;
-            self.rgba[d..d + atlas_w * 4].fill(0);
-            if row < rows {
-                let s = row * tw * 4;
-                self.rgba[d..d + tw * 4].copy_from_slice(&src[s..s + tw * 4]);
-            }
+            let s = row * tw * 4;
+            self.rgba[d..d + tw * 4].copy_from_slice(&src[s..s + tw * 4]);
+            self.rgba[d + tw * 4..d + atlas_w * 4].fill(0);
+        }
+        if copy_rows < slot_h {
+            let tail_start = (y0 + copy_rows) * atlas_w * 4;
+            let tail_end = (y0 + slot_h) * atlas_w * 4;
+            self.rgba[tail_start..tail_end].fill(0);
         }
         self.slots[i] = Some(Slot {
             key,
@@ -350,6 +370,41 @@ impl CatBaker {
             return None;
         }
         self.touch(SlotKey::Host(host_id))
+    }
+
+    /// Whether this frame still has cold-bake budget left for an initialised
+    /// atlas. Lets callers with uncached vector bakes (such as pet motes) skip
+    /// rasterizing when [`CatBaker::host_tile`] would refuse admission anyway.
+    #[must_use]
+    pub fn can_bake(&self) -> bool {
+        self.cell_h > 0 && self.bakes_left > 0
+    }
+
+    /// Touch a held [`CatBaker::host_tile`] slot at `(ax, ay)` (`last_used =
+    /// clock`) and confirm it still holds the expected host-authored tile.
+    ///
+    /// When a companion falls back to its held `(ax, ay)` under bake pressure,
+    /// touching the slot keeps a later bake in the same frame (such as a pet
+    /// mote or departing ghost) from choosing that slot as its LRU victim and
+    /// overwriting the band on the frame it was queued to draw, while refusing
+    /// a slot that was cleared or evicted by any other tile.
+    pub fn touch_held_host_slot(&mut self, host_id: u64, ax: u16, ay: u16) -> bool {
+        if self.cell_h == 0 || ax != 0 {
+            return false;
+        }
+        let slot_h = 2 * usize::from(self.cell_h);
+        if !usize::from(ay).is_multiple_of(slot_h) {
+            return false;
+        }
+        let i = usize::from(ay) / slot_h;
+        let Some(Some(slot)) = self.slots.get_mut(i) else {
+            return false;
+        };
+        if slot.key != SlotKey::Host(host_id) {
+            return false;
+        }
+        slot.last_used = self.clock;
+        true
     }
 }
 
@@ -452,10 +507,13 @@ pub(crate) fn paint_dark_masked_disc(
     let y1 = ((cy + r) as i32)
         .saturating_add(2)
         .min(tile.height() as i32);
+    let tile_w = tile.width();
+    let mask_px = eye_mask.pixels();
     for y in y0..y1 {
+        let row_base = (y as u32 * tile_w) as usize;
         for x in x0..x1 {
-            let i = ((y as u32 * tile.width() + x as u32) * 4) as usize;
-            let covered_by_eye = eye_mask.pixels().get(i..i + 4).is_some_and(|p| p[3] != 0);
+            let i = (row_base + x as usize) * 4;
+            let covered_by_eye = mask_px.get(i + 3).is_some_and(|&a| a != 0);
             let dark_eye = covered_by_eye
                 && tile
                     .pixels()
@@ -466,11 +524,16 @@ pub(crate) fn paint_dark_masked_disc(
             }
             let mut hit = 0u32;
             for sy in 0..4 {
+                let fy = y as f32 + (sy as f32 + 0.5) * 0.25;
+                let dy = fy - cy;
+                let dy2 = dy * dy;
+                if dy2 > rr {
+                    continue;
+                }
                 for sx in 0..4 {
                     let fx = x as f32 + (sx as f32 + 0.5) * 0.25;
-                    let fy = y as f32 + (sy as f32 + 0.5) * 0.25;
-                    let (dx, dy) = (fx - cx, fy - cy);
-                    if dx * dx + dy * dy <= rr {
+                    let dx = fx - cx;
+                    if dx * dx + dy2 <= rr {
                         hit = hit.saturating_add(1);
                     }
                 }
@@ -710,7 +773,8 @@ fn mix3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32) {
 /// `floor`; a no-op when already there. At most 6 bisection steps (luminance
 /// is monotone but gamma-curved along the mix).
 fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
-    let lum = |c: (f32, f32, f32)| relative_luminance(packed_rgb(c));
+    let table = crate::color_math::relative_luminance_table();
+    let lum = |c: (f32, f32, f32)| crate::color_math::relative_luminance_with(table, packed_rgb(c));
     if lum(coat) >= floor {
         return coat;
     }
@@ -743,8 +807,9 @@ pub(crate) fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
 }
 
 fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
-    let a = relative_luminance(packed_rgb(a));
-    let b = relative_luminance(packed_rgb(b));
+    let table = crate::color_math::relative_luminance_table();
+    let a = crate::color_math::relative_luminance_with(table, packed_rgb(a));
+    let b = crate::color_math::relative_luminance_with(table, packed_rgb(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
@@ -965,6 +1030,9 @@ fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransfo
 /// to each open eye. Catch-lights pair with their nearest eye, so path order
 /// does not matter. A head with no authored catch-lights is left as drawn.
 fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTransform) {
+    if xform.scale_x.min(xform.scale_y) < OPEN_EYE_REFLECTION_MIN_PX {
+        return;
+    }
     let Some(eyes) = layers.iter().find(|layer| layer.role == GlyphRole::Eye) else {
         return;
     };
@@ -974,8 +1042,7 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
     else {
         return;
     };
-    let mut eye_mask = Tile::new(tile.width(), tile.height());
-    fill_path_fixed(&mut eye_mask, eyes.paths, (0.0, 0.0, 0.0), 1.0, xform);
+    let mut eye_mask: Option<Tile> = None;
 
     for catch_light in catch_lights.paths {
         let Some((cx0, cy0, cx1, cy1)) = path_bounds(catch_light) else {
@@ -988,6 +1055,14 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
         if !open_eye_reflection_eligible(eye_bounds, xform) {
             continue;
         }
+        // Allocate and rasterize the eye mask only when a catch-light clears
+        // the size and aspect floor: tiny word-cat heads and arc-eye variants
+        // skip both the heap allocation and the vector pass.
+        let eye_mask = eye_mask.get_or_insert_with(|| {
+            let mut mask = Tile::new(tile.width(), tile.height());
+            fill_path_fixed(&mut mask, eyes.paths, (0.0, 0.0, 0.0), 1.0, xform);
+            mask
+        });
         let (ex0, ey0, ex1, ey1) = eye_bounds;
         let eye_w = (ex1 - ex0) * xform.scale_x;
         let eye_h = (ey1 - ey0) * xform.scale_y;
@@ -1001,7 +1076,7 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
         );
         paint_dark_masked_disc(
             tile,
-            &eye_mask,
+            eye_mask,
             xform.dx + pcx * xform.scale_x,
             xform.dy + pcy * xform.scale_y,
             primary_r,
@@ -1021,7 +1096,7 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
                 .clamp(ey0 + 0.25 * (ey1 - ey0), ey1 - 0.25 * (ey1 - ey0));
             paint_dark_masked_disc(
                 tile,
-                &eye_mask,
+                eye_mask,
                 xform.dx + echo_x * xform.scale_x,
                 xform.dy + echo_y * xform.scale_y,
                 echo_r,
@@ -1121,7 +1196,8 @@ pub fn bake_variant_with(
     // Base variant: its 0..1 frame fills the w×h art box at the tile origin.
     paint_glyph(&mut tile, id, fills, PathTransform::fit(w, h), eyes, true);
     // Map the accessory's frame into a box centred on the attach point, keeping
-    // its viewbox aspect. Accessories have no eyes, so they bake open.
+    // its viewbox aspect. Accessories have no eyes, so they bake open without
+    // eye reflections.
     if let Some(acc) = accessory {
         paint_glyph(
             &mut tile,
@@ -1129,7 +1205,7 @@ pub fn bake_variant_with(
             fills,
             accessory_transform(acc, w, h),
             EyesFrame::Open,
-            true,
+            false,
         );
     }
     // §2 gaze catch-light: a small white dot baked into the reserved PATCH_STRIP at

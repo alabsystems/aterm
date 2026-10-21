@@ -21,6 +21,12 @@ aterm-time = { workspace = true }
 # checker's (`aterm_types::scheme::MIN_*`), defined once there. aterm-types is
 # wasm-clean (aterm-wasm ships it) and depends on nothing here.
 aterm-types = { workspace = true }
+# Where a title, a detail or a sentence may break (`line_breaks`,
+# `word_breaks`: spaces, and between CJK characters with kinsoku kept), the
+# one rule every wrap and cut of the chrome reads; and the grid's measure
+# (`str_grid_columns`), which hosts inject as `presence::Host::columns`.
+# Wasm-clean (aterm-core, which aterm-wasm ships, depends on it).
+aterm-grapheme = { workspace = true }
 
 # tests/conformance_*.rs drive `MessageCenter` in lock step with aterm-spec's
 # derived models.
@@ -31,9 +37,6 @@ aterm-models-session = { workspace = true }
 # Test-only: the control wire's percent escape (re-exported as
 # `aterm_control::wire::pct_encode`), so the tests pin the bytes the socket carries.
 aterm-codec = { workspace = true }
-# Test-only: the grid's measure (`str_grid_columns`), which hosts inject as
-# `presence::Host::columns`, so the presence width law is proven on real cells.
-aterm-grapheme = { workspace = true }
 
 [[test]]
 name = "messages_suite"

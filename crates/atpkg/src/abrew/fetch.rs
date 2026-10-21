@@ -71,22 +71,92 @@ fn proto_args(url: &str) -> [&'static str; 4] {
 /// itself (64 MiB — the API ceiling api.rs enforces again); a 60 s
 /// ceiling is fine at that size.
 pub fn curl_get(url: &str, headers: &[&str]) -> Result<Vec<u8>, String> {
-    check_url(url)?;
-    let mut args: Vec<&str> = vec!["-fsSL", "--max-time", "60", "--max-filesize", "67108864"];
+    curl_get_with_status(url, headers).map_err(GetError::into_message)
+}
+
+/// A missing package requires both curl's HTTP-failure exit and the final
+/// response status. URLs and diagnostic text never establish that status.
+#[derive(Debug)]
+pub(super) struct GetError {
+    code: Option<i32>,
+    status: Option<u16>,
+    message: String,
+}
+
+impl GetError {
+    pub(super) fn other(message: String) -> Self {
+        Self {
+            code: None,
+            status: None,
+            message,
+        }
+    }
+
+    pub(super) fn is_not_found(&self) -> bool {
+        self.code == Some(22) && self.status == Some(404)
+    }
+
+    pub(super) fn into_message(self) -> String {
+        self.message
+    }
+}
+
+/// Separate the fixed write-out suffix from the response body without decoding
+/// body bytes. Missing or malformed metadata cannot certify an HTTP absence.
+pub(super) fn parse_get_response(
+    url: &str,
+    code: Option<i32>,
+    mut stdout: Vec<u8>,
+    stderr: &[u8],
+) -> Result<Vec<u8>, GetError> {
+    let trailer = stdout.len().checked_sub(4).and_then(|at| {
+        let bytes = &stdout[at..];
+        if bytes[0] != b'\n' || !bytes[1..].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let status = u16::from(bytes[1] - b'0') * 100
+            + u16::from(bytes[2] - b'0') * 10
+            + u16::from(bytes[3] - b'0');
+        (status == 0 || (100..=599).contains(&status)).then_some((at, status))
+    });
+    if code == Some(0) {
+        let Some((at, _)) = trailer else {
+            return Err(GetError::other(format!(
+                "abrew: download returned invalid response status ({url})"
+            )));
+        };
+        stdout.truncate(at);
+        return Ok(stdout);
+    }
+    Err(GetError {
+        code,
+        status: trailer.map(|(_, status)| status),
+        message: format!(
+            "abrew: download failed ({url}): {}",
+            String::from_utf8_lossy(stderr).trim()
+        ),
+    })
+}
+
+pub(super) fn curl_get_with_status(url: &str, headers: &[&str]) -> Result<Vec<u8>, GetError> {
+    check_url(url).map_err(GetError::other)?;
+    let mut args: Vec<&str> = vec![
+        "-fsSL",
+        "--max-time",
+        "60",
+        "--max-filesize",
+        "67108864",
+        "--write-out",
+        "\n%{http_code}",
+    ];
     args.extend(proto_args(url));
     for h in headers {
         args.push("-H");
         args.push(h);
     }
     args.extend(["--", url]);
-    let out = run_capture("curl", &args)?;
-    if !out.status.success() {
-        return Err(format!(
-            "abrew: download failed ({url}): {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(out.stdout)
+    let out = run_capture("curl", &args).map_err(GetError::other)?;
+    parse_get_response(url, out.status.code(), out.stdout, &out.stderr)
 }
 
 /// Download into an exclusively owned scratch beside `dest`, then rename it.

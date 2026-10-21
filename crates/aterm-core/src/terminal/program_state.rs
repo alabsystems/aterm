@@ -10,14 +10,35 @@
 //! sends `idle`, `working` and `blocked` with no kind; codex-alab's main also
 //! sends `done`, `error` and a blocked report's kind.
 //!
-//! The engine keeps the last report and a sequence that moves with every report
-//! it accepted (a `clear` and a full reset included), and nothing else: it is a
-//! program's claim about itself, for display. Which reports a host honours (only
-//! while the program in front is a `codex`, and only since the foreground group
-//! last moved) is the host's to decide; the sequence is what lets it tell a
-//! report made since then from one made before. A report this reader does not
-//! take (no `state=`, an unknown state, an app other than `codex`) changes
-//! nothing.
+//! The engine keeps the last report, a sequence that moves with every report
+//! it accepted (a `clear` and a full reset included), and a count of the turns
+//! the reports began ([`ProgramStateReport::turns`]), and nothing else: it is a
+//! program's claim about itself. Which reports a host honours (only while the
+//! program in front is a `codex`, and only since the foreground group last
+//! moved) is the host's to decide; the sequence is what lets it tell a report
+//! made since then from one made before. A report this reader does not take (no
+//! `state=`, an unknown state, an app other than `codex`) changes nothing.
+//!
+//! THE TURN COUNT is kept here, as each report is parsed, because a host reads
+//! the engine only now and then (aterm's status sweep): a turn that begins and
+//! ends between two reads (`working`, then `done`) leaves the same report
+//! standing as before it, and only the count says it ran. A turn begins at an
+//! in-turn report (`working`, `blocked`) whose report before it was at rest
+//! (`idle`, `done`, `error`), or that is the first report taken. A `clear` and
+//! a full reset are looked past, never counted from: codex-alab clears its
+//! report when it lets the terminal go (an external editor, Ctrl+Z, its exit)
+//! and writes its state again when it takes it back, so `working`, `clear`,
+//! `working` is one turn resumed after a handoff, not a second one. A report
+//! written again with no move (`working`, `working`) and a move within a turn
+//! (`working` to `blocked` and back) begin none.
+//!
+//! The count is of what the reports claim: a stretch of work begun from rest.
+//! A program that reports work outside a turn moves it with no turn (codex-alab
+//! reports `working` while it starts its MCP servers, at a launch or a thread
+//! switch), and a turn begun while the report already reads `working` (codex-alab
+//! keeps it there while background work or an active goal runs on) writes
+//! nothing, so the count does not move for it. What a host makes of the count is
+//! the host's to say.
 
 /// The state word of an OSC 7501 report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -112,14 +133,21 @@ impl ProgramState {
     }
 }
 
-/// The engine's record of OSC 7501: the last accepted report, and how many
-/// reports (and full resets) it has taken.
+/// The engine's record of OSC 7501: the last accepted report, how many
+/// reports (and full resets) it has taken, and how many turns they began.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProgramStateReport {
     /// Moves with every accepted report, `clear` and full reset included.
     pub seq: u64,
     /// The report standing now; `None` after a `clear`, a reset, or before any.
     pub state: Option<ProgramState>,
+    /// How many turns the accepted reports began (the module doc's rule): a
+    /// count that only grows, so a turn that began and ended between two
+    /// reads of the engine still reads as begun.
+    pub turns: u64,
+    /// The state of the latest report taken, a `clear` or a full reset looked
+    /// past: what the next report is judged a turn's beginning against.
+    last: Option<ProgramStateWord>,
 }
 
 impl ProgramStateReport {
@@ -130,7 +158,13 @@ impl ProgramStateReport {
                 self.seq = self.seq.wrapping_add(1);
                 self.state = match next {
                     Body::Clear => None,
-                    Body::Report(state) => Some(state),
+                    Body::Report(state) => {
+                        if begins_a_turn(self.last, state.state) {
+                            self.turns = self.turns.wrapping_add(1);
+                        }
+                        self.last = Some(state.state);
+                        Some(state)
+                    }
                 };
                 true
             }
@@ -138,13 +172,23 @@ impl ProgramStateReport {
         }
     }
 
-    /// A full reset (RIS): no report stands.
+    /// A full reset (RIS): no report stands. The turn count, and the state it
+    /// judges the next report against, are kept (the module doc).
     pub(super) fn reset(&mut self) {
         if self.state.is_some() {
             self.seq = self.seq.wrapping_add(1);
             self.state = None;
         }
     }
+}
+
+/// Whether a report of `next` begins a turn after a report of `last` (`None`:
+/// no report taken yet): `next` is in a turn (`working`, `blocked`) and `last`
+/// was not.
+fn begins_a_turn(last: Option<ProgramStateWord>, next: ProgramStateWord) -> bool {
+    use ProgramStateWord as W;
+    let in_turn = |word: ProgramStateWord| matches!(word, W::Working | W::Blocked);
+    in_turn(next) && !last.is_some_and(in_turn)
 }
 
 /// The longest OSC 7501 body this reader looks at; anything longer is not a
@@ -272,6 +316,88 @@ mod tests {
         assert!(report.accept("state=idle:app=codex"));
         report.reset();
         assert_eq!((report.seq, report.state), (5, None));
+    }
+
+    /// THE TURN COUNT: a turn begins at `working` or `blocked` after a report
+    /// at rest (`idle`, `done`, `error`) or as the first report; a report
+    /// written again, a move within a turn, and a report written again after
+    /// a `clear` or a full reset (the program took the terminal back) begin
+    /// none, while a turn that began across a `clear` does. NEGATIVE
+    /// CONTROLS: every line that begins none.
+    #[test]
+    fn the_turn_count_moves_only_where_a_turn_begins() {
+        let mut report = ProgramStateReport::default();
+        let mut turns = |body: &str| {
+            assert!(report.accept(body), "{body:?}");
+            report.turns
+        };
+        let rows: [(&str, u64, &str); 17] = [
+            ("state=working:app=codex", 1, "the first report, in a turn"),
+            ("state=working:app=codex", 1, "written again: no move"),
+            (
+                "state=blocked:app=codex:kind=permission",
+                1,
+                "asked within it",
+            ),
+            ("state=working:app=codex", 1, "answered: the same turn"),
+            ("state=done:app=codex", 1, "the turn ended"),
+            ("state=working:app=codex", 2, "a turn after done"),
+            ("state=idle:app=codex", 2, "ended"),
+            (
+                "state=blocked:app=codex:kind=question",
+                3,
+                "a turn that asked at once",
+            ),
+            ("state=error:app=codex", 3, "ended on an error"),
+            ("state=working:app=codex", 4, "a turn after an error"),
+            ("state=clear", 4, "a handoff mid-turn"),
+            (
+                "state=working:app=codex",
+                4,
+                "the terminal taken back: resumed",
+            ),
+            ("state=done:app=codex", 4, "ended"),
+            ("state=clear", 4, "a handoff at rest"),
+            ("state=done:app=codex", 4, "taken back: still at rest"),
+            ("state=clear", 4, "a handoff at rest"),
+            ("state=working:app=codex", 5, "a turn begun across it"),
+        ];
+        for (body, want, why) in rows {
+            assert_eq!(turns(body), want, "{why}: {body}");
+        }
+        // A full reset is looked past as a clear is.
+        report.reset();
+        assert!(report.accept("state=working:app=codex"));
+        assert_eq!(report.turns, 5, "resumed after a reset");
+        assert!(report.accept("state=idle:app=codex"));
+        report.reset();
+        assert!(report.accept("state=working:app=codex"));
+        assert_eq!(report.turns, 6, "begun across a reset");
+        // A body not taken counts nothing.
+        assert!(!report.accept("state=idle:app=claude"));
+        assert!(!report.accept("state=working:app=claude"));
+        assert_eq!(report.turns, 6);
+    }
+
+    /// THE COUNT THROUGH THE PARSER, the bytes codex-alab writes: a turn
+    /// that begins and ends between two reads of the engine leaves the same
+    /// report standing (`done`) and the count one higher; a handoff mid-turn
+    /// (`clear`, then `working` again) leaves it as it was.
+    #[test]
+    fn a_turn_between_two_reads_moves_the_count_and_a_handoff_does_not() {
+        use crate::terminal::Terminal;
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b]7501;state=done:app=codex\x1b\\");
+        let before = term.program_state();
+        term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+        term.process(b"\x1b]7501;state=done:app=codex\x1b\\");
+        let after = term.program_state();
+        assert_eq!(after.state, before.state, "the same report stands");
+        assert_eq!(after.turns, before.turns + 1, "and a turn ran");
+        term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+        term.process(b"\x1b]7501;state=clear\x1b\\");
+        term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+        assert_eq!(term.program_state().turns, after.turns + 1, "one turn");
     }
 
     #[test]

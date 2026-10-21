@@ -5,8 +5,8 @@ struct VsOut {
     float4 pos [[position]];
 };
 
-// NAMED `vs_fs`, not `vs_fs_shimmer` — the twin of `renderer.rs::SHIMMER_SHADER`'s
-// `vs_fs`. See the same note in `bloom.metal`.
+// Named `vs_fs` to match the WGSL twin (`renderer.rs::SHIMMER_SHADER`); see
+// `bloom.metal`.
 vertex VsOut vs_fs(uint vi [[vertex_id]]) {
     const float2 xy[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
     VsOut o;
@@ -14,11 +14,8 @@ vertex VsOut vs_fs(uint vi [[vertex_id]]) {
     return o;
 }
 
-// std140 twin of the Rust `ShimmerU`. `heat` is float4[16] (NOT float[64]) for
-// exactly the reason the WGSL used array<vec4<f32>,16>: a uniform array of
-// scalars takes a 16-byte stride under std140, so the vec4 form is the layout
-// that is already byte-identical on both sides. MSL gives float4[16] the same
-// 16-byte stride, so the Rust struct is UNCHANGED.
+// std140 twin of the Rust `ShimmerU`. `heat` is float4[16], not float[64]: std140
+// gives a scalar array a 16-byte stride, and MSL gives float4[16] that same stride.
 struct ShimmerU {
     float2 frame;       // full frame dims, device px
     float2 region_min;  // pass rect min (== scissor origin)
@@ -60,7 +57,7 @@ fragment float4 fs_shimmer(VsOut in [[stage_in]],
     float xr = min(p.x - su.region_min.x, su.region_max.x - p.x);
     float e = clamp(xr / max(su.rolloff, 1.0), 0.0, 1.0);
     float xfade = e * e * (3.0 - 2.0 * e);
-    // The ripple field: two incommensurate plane waves RISING with time plus a
+    // The ripple field: two incommensurate plane waves rising with time plus a
     // slow columnar wobble that breaks straight-line coherence.
     float ky = TAU / max(su.period, 4.0);
     float col = p.x * ky;
@@ -69,8 +66,8 @@ fragment float4 fs_shimmer(VsOut in [[stage_in]],
     float wx = sin(1.31 * ky * p.y + TAU * (0.70 * su.phase) + 1.11 * col);
     float env = su.amp * clamp(heat, 0.0, 1.0) * vfade * xfade;
     float2 d = float2(0.30 * wx, 0.94 * (0.62 * w1 + 0.38 * w2)) * env;
-    // Belt-and-braces displacement cap: |d| <= amp by construction
-    // (sqrt(0.94^2 + 0.30^2) < 1); re-clamp so no future retune can break it.
+    // |d| <= amp by construction (sqrt(0.94^2 + 0.30^2) < 1); the re-clamp keeps
+    // it so under a retune.
     float m = length(d);
     if (m > su.amp) {
         d = d * (su.amp / m);
@@ -79,9 +76,8 @@ fragment float4 fs_shimmer(VsOut in [[stage_in]],
     // interior (the ClampToEdge sampler is the second fence).
     float2 sp = clamp(p + d, float2(0.5, 0.5), su.frame - float2(0.5, 0.5));
     float4 c = shimmer_src.sample(shimmer_samp, sp / su.frame, level(0.0));
-    // The WHOLE displaced sample, alpha included — the wgsl twin's law
-    // (fs_shimmer): rgb and alpha must describe ONE source pixel, or the
-    // translucent present decoheres inside the haze band. Byte-identical on
-    // opaque presents, where the offscreen alpha is uniform.
+    // The whole displaced sample, alpha included, as in the WGSL fs_shimmer: rgb
+    // and alpha must describe one source pixel or the translucent present
+    // decoheres inside the haze band.
     return c;
 }

@@ -32,7 +32,7 @@ target-trust.noindex
 # published GitHub Release, never dist/.
 /dist/
 
-# The astream oracle's side workspace (deleted in fd3700d103): a checkout that
+# The retired astream oracle's side workspace: a checkout that
 # built it keeps the Cargo.lock and target its own .gitignore ignored, which went
 # with it. Regenerable build output, never committed.
 /astream-oracle/
@@ -53,7 +53,7 @@ target-trust.noindex
 /.trust-cache/
 
 # Vendored dependency SOURCE must never be swallowed by the build-artifact `debug`
-# rule near the top. MEASURED on the winnow fork (retired 2026-08-27 with
+# rule near the top. Measured on the retired winnow fork (with
 # `toml_edit`): it shipped a real `combinator/debug` tracing module, and dropping
 # it broke `cargo build` on a fresh checkout. The re-include stays for the NEXT
 # vendored crate with a `debug` source directory — the bare `debug` rule still
@@ -139,13 +139,11 @@ __pycache__/
 
 # `ty`'s result cache (`.ty/cache.json`), written into the working directory of
 # whatever ran it — for the Tier-1 suites, the crate directory. It keys entries
-# by the absolute temp-dir paths of that one run, so it is machine-local residue:
-# the copy once committed under crates/aterm-gui/ was a Windows run's, naming a
-# local user profile directory, and no machine ever read it back.
+# by the absolute temp-dir paths of that one run, so it is machine-local residue.
 .ty/
 
-# Build output of the retired tools/freeze-safety-gate and tools/temporal-extract
-# (deleted in e90d858daf): these are the rules their own .gitignore files carried,
+# Build output of the retired tools/freeze-safety-gate and tools/temporal-extract:
+# these are the rules their own .gitignore files carried,
 # which went with them, so a checkout that built them shows the leftovers as
 # untracked. Regenerable and safe to delete; kept ignored so they never get committed.
 /tools/freeze-safety-gate/target/

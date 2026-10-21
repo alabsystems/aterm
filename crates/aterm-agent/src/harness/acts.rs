@@ -17,6 +17,11 @@
 //! * [`TaskFace`] — the task's face (§9.4.2): open, landed or theirs, and
 //!   the word `status task=` prints for it. Told by the loop through
 //!   `IdleHost::task_face` ([`crate::supervise::IdleHost::task_face`]).
+//! * [`LandHeld`] — why Land still holds (§12.3): the legs that kept a
+//!   land act's yield from landing ([`HoldLeg`]), the open words as indices
+//!   ([`OpenWord`]), the repository's counts, the hold's `since` and its
+//!   nudges. Kept by the loop's policy
+//!   (`supervise::policy::turn_end::TurnEndState::land_held`).
 //! * [`self_claim_act`] — the session log's act word for an act a
 //!   self-supervising agent (codex-alab) tells, its own FOREVER CRUISE /
 //!   FOREVER LAND acts and its landing ([`RULE_LANDED`]) among them.
@@ -31,14 +36,16 @@
 //! Nothing here reads a ledger, a screen or a clock.
 
 use crate::supervise::approvals::Outcome;
-use crate::supervise::policy::approval::QuestionPriority;
+use crate::supervise::policy::approval::{
+    QuestionPriority, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
+};
 use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_rule};
 // A rule id is never reworded (a ledger an earlier build wrote reads the
 // same), so the sort is the policy's own consts.
 use crate::supervise::policy::turn_end::{
-    RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE, RULE_DONE_CHECK,
-    RULE_HOST_TURN, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_LIMIT_RESUME,
-    RULE_LOGIN_BACK, RULE_OPEN_ITEMS, RULE_SUGGESTION, RULE_UNCOMMITTED,
+    RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE,
+    RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
+    RULE_LIMIT_RESUME, RULE_LOGIN_BACK, RULE_OPEN_ITEMS, RULE_SUGGESTION, RULE_UNCOMMITTED,
 };
 
 /// One act of the harness's, as the Autopilot chip names it for a moment
@@ -302,22 +309,36 @@ fn log_rule(rule_id: &str) -> String {
 /// | `<act>` | `word=` |
 /// |---|---|
 /// | `approve-all@v1` | `approve` |
-/// | `answer-recommended@v1`, `land-answer@v1` | `answer` |
-/// | `continue@v1`, `usage-resume@v1`, `continue-done-check@v1` | `continue` |
+/// | `answer-recommended@v1`, `land-answer@v1`, `answer@v1`, `prose-long-term@v1`, `prose-short-term@v1` | `answer` |
+/// | `continue@v1`, `usage-resume@v1`, `continue-done-check@v1`, `api-retry@v1`, `api-cutoff@v1`, `context-compact@v1` | `continue` |
 /// | `upgrade@v1` | `relaunch` |
 /// | `harness-turn@v1`, `land@v1`, `land-nudge@v1` | `dispatch` |
 /// | `landed@v1` | `landed` ([`LANDED_WORD`]) |
 ///
+/// Cruise's prose answers and the walls' acts (a server error's retry, a
+/// cut-off reply's, the compaction's continuation) are typed as aterm's own
+/// loop types them, so they get its typed rows' words ([`log_mark`]). The act
+/// carries no command, so `context-compact@v1` reads `continue` for
+/// codex-alab's compaction itself too, which it records under the same act as
+/// the continuation after it (aterm's own `/compact` row lights nothing).
+///
 /// Any other act (`finished@v1`, the retired token's end, which no build
-/// records now; a word no proof showed) is `None`: its row stands alone,
+/// records now; `left-to-person@v1`, a point left to a person's own exchange,
+/// recorded and never typed, as aterm's own loop's `LEFT` row lights
+/// nothing; a word no proof showed) is `None`: its row stands alone,
 /// and no act mark is guessed for it. The rule is the act itself, so
 /// `rule=` never names a rule the holder did not.
 #[must_use]
 pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
     let word = match act {
         RULE_APPROVE_ALL => "approve",
-        RULE_ANSWER_RECOMMENDED | RULE_LAND_ANSWER => "answer",
-        RULE_CONTINUE | RULE_LIMIT_RESUME | RULE_DONE_CHECK => "continue",
+        RULE_ANSWER_RECOMMENDED
+        | RULE_LAND_ANSWER
+        | RULE_ANSWER
+        | RULE_PROSE_LONG_TERM
+        | RULE_PROSE_SHORT_TERM => "answer",
+        RULE_CONTINUE | RULE_LIMIT_RESUME | RULE_DONE_CHECK | RULE_API_RETRY | RULE_API_CUTOFF
+        | RULE_COMPACT => "continue",
         RULE_UPGRADE => "relaunch",
         RULE_HOST_TURN | RULE_LAND | RULE_LAND_NUDGE => "dispatch",
         RULE_LANDED => LANDED_WORD,
@@ -358,8 +379,10 @@ pub fn relaunch_act(row: &str, step: &str) -> Option<String> {
 
 /// codex-alab's approval of an escalated box (the proof's `approval` leg).
 const RULE_APPROVE_ALL: &str = "approve-all@v1";
-/// codex-alab's re-exec onto a re-linked build (the proof's `upgrade` leg).
-const RULE_UPGRADE: &str = "upgrade@v1";
+/// codex-alab's re-exec onto a re-linked build (the proof's `upgrade` leg):
+/// the same conversation resumed by a new image, which carries a landing
+/// across, so it moves no task face.
+pub const RULE_UPGRADE: &str = "upgrade@v1";
 /// codex-alab's LANDING under its own Land (the contract's §5 Land row): a
 /// clean `Nothing left:` defense at a land act's yield over a repository its
 /// probe finds clean, after which it types nothing until someone else's turn.
@@ -402,6 +425,156 @@ impl TaskFace {
             TaskFace::Landed => "landed",
             TaskFace::Theirs => "theirs",
         }
+    }
+}
+
+/// WHY LAND STILL HOLDS (the Autopilot design's §12.3): the hold a Land
+/// episode stands at, as the loop keeps it
+/// (`supervise::policy::turn_end::TurnEndState::land_held`). `None` there
+/// until the episode's instruction is typed, and at a landing (and after
+/// it, until Land's next act begins the hold again), at a person's own
+/// exchange, outside Land, at Off and at the loop's end.
+///
+/// The legs are the yield's: set at a land act's yield that did not land,
+/// each leg the verdict's own reading evaluated in full (where the verdict
+/// stops at the first), kept through the act's own next turn, and dropped
+/// at someone else's turn (`read` false: its live read, or its end where no
+/// read saw it run), which may change every one of them. `since_ms` and
+/// `nudges` stay with the hold.
+///
+/// `Copy` and small, with no `Instant`, no `String` and no path: the open
+/// words are indices into the strict reading's own word tables
+/// ([`OpenWord`]), and the need's words are the standing set's, read beside
+/// the hold, so one set is never counted two ways.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LandHeld {
+    /// When the land act that began the hold was ledgered, unix ms: the
+    /// episode's instruction (`land@v1`), or the first land act typed after
+    /// a landing (`supervise::policy::turn_end::HoldStart`); a loop that
+    /// follows seeds it from that row (`supervise::approvals::LandSeed::hold`).
+    /// `None` where no row says (an older ledger, an instruction a wall's
+    /// continuation typed).
+    pub since_ms: Option<i64>,
+    /// The nudges (`land-nudge@v1`) typed since that act.
+    pub nudges: u32,
+    /// A land act's yield was judged, and no other turn ran since: the
+    /// legs below are that yield's.
+    pub read: bool,
+    /// What held the landing at that yield, a bit per [`HoldLeg`].
+    pub legs: u8,
+    /// The first four words Land's strict reading found open
+    /// ([`HoldLeg::Open`]).
+    pub open: [Option<OpenWord>; 4],
+    /// The repository's work at that yield ([`HoldLeg::Repo`];
+    /// `crate::harness::repo_work::RepoWork`'s counts, saturated): tracked
+    /// paths changed, untracked paths, stash entries, commits no remote
+    /// holds, commits the remote's main lacks.
+    pub changed: u16,
+    pub untracked: u16,
+    pub stashes: u16,
+    pub unpushed: u16,
+    pub unlanded: u16,
+}
+
+impl LandHeld {
+    /// Whether `leg` held the landing at the yield read.
+    #[must_use]
+    pub const fn holds(self, leg: HoldLeg) -> bool {
+        self.legs & leg.bit() != 0
+    }
+
+    /// The legs that held it, in the order the owner can act on them.
+    pub fn legs_held(self) -> impl Iterator<Item = HoldLeg> {
+        HoldLeg::ALL.into_iter().filter(move |&leg| self.holds(leg))
+    }
+
+    /// The open words, as the strict reading spelled them.
+    pub fn open_words(self) -> impl Iterator<Item = &'static str> {
+        self.open.into_iter().flatten().map(OpenWord::word)
+    }
+}
+
+/// ONE LEG OF A HOLD ([`LandHeld::legs`]), in the order the owner can act on
+/// them: a need said this turn, the repository's work, the open words Land's
+/// strict reading found, no defense yet, a reply too tall to read whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HoldLeg {
+    /// The reply named a need (`NEEDS YOU:`), in its last words or earlier
+    /// in the same turn.
+    Needs,
+    /// The session's repository holds work no remote main has.
+    Repo,
+    /// Land's strict reading found open work in the reply.
+    Open,
+    /// No `Nothing left:` defense in the reply.
+    Defense,
+    /// The reply, or the turn it ends, was taller than the rows read.
+    Cut,
+}
+
+impl HoldLeg {
+    /// Every leg, in the order the owner can act on them.
+    pub const ALL: [HoldLeg; 5] = [
+        HoldLeg::Needs,
+        HoldLeg::Repo,
+        HoldLeg::Open,
+        HoldLeg::Defense,
+        HoldLeg::Cut,
+    ];
+
+    /// Its bit in [`LandHeld::legs`]: NEEDS 1, REPO 2, OPEN 4, DEFENSE 8,
+    /// CUT 16.
+    #[must_use]
+    pub const fn bit(self) -> u8 {
+        match self {
+            HoldLeg::Needs => 1,
+            HoldLeg::Repo => 2,
+            HoldLeg::Open => 4,
+            HoldLeg::Defense => 8,
+            HoldLeg::Cut => 16,
+        }
+    }
+
+    /// Its word in `status land_held=` (the Autopilot design's §12.3.2,
+    /// which 3c prints).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            HoldLeg::Needs => "needs",
+            HoldLeg::Repo => "repo",
+            HoldLeg::Open => "open",
+            HoldLeg::Defense => "defense",
+            HoldLeg::Cut => "cut",
+        }
+    }
+}
+
+/// ONE WORD LAND'S STRICT READING FOUND OPEN, as an index into that
+/// reading's own word tables
+/// (`supervise::policy::turn_end::open_word_index`): two bytes and `Copy`,
+/// where the word itself would be sixteen. Its `Debug` is the word.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpenWord(std::num::NonZeroU16);
+
+impl OpenWord {
+    /// The index of `word`, a spelling the strict reading names; `None`
+    /// for any other.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Self> {
+        crate::supervise::policy::turn_end::open_word_index(word).map(Self)
+    }
+
+    /// The word, as the strict reading spelled it.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        // An index is only ever made by `of`, from the same tables.
+        crate::supervise::policy::turn_end::open_word_at(self.0).unwrap_or("open work")
+    }
+}
+
+impl std::fmt::Debug for OpenWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.word())
     }
 }
 
@@ -736,7 +909,14 @@ mod tests {
             ("land-nudge@v1", Some("dispatch")),
             ("land-answer@v1", Some("answer")),
             ("landed@v1", Some("landed")),
+            ("answer@v1", Some("answer")),
+            ("prose-long-term@v1", Some("answer")),
+            ("prose-short-term@v1", Some("answer")),
+            ("api-retry@v1", Some("continue")),
+            ("api-cutoff@v1", Some("continue")),
+            ("context-compact@v1", Some("continue")),
             ("finished@v1", None),
+            ("left-to-person@v1", None),
             ("approve-all@v2", None),
             ("approve-all", None),
             ("read-only@v3", None),
@@ -760,7 +940,7 @@ mod tests {
             }
         }
         let unmarked = cases.iter().filter(|c| c.1.is_none()).count();
-        assert_eq!(unmarked, 9, "the acts that write no mark, counted");
+        assert_eq!(unmarked, 10, "the acts that write no mark, counted");
         assert!(
             aterm_slog::Fields::new()
                 .word(aterm_slog::Key::Word, "landing")
@@ -774,6 +954,12 @@ mod tests {
             RULE_LAND,
             RULE_LAND_NUDGE,
             RULE_LAND_ANSWER,
+            RULE_ANSWER,
+            RULE_PROSE_LONG_TERM,
+            RULE_PROSE_SHORT_TERM,
+            RULE_API_RETRY,
+            RULE_API_CUTOFF,
+            RULE_COMPACT,
         ] {
             let loops = log_mark(rule, Outcome::Typed, "words").expect("a typed act");
             let (word, _) = self_claim_act(rule).expect("a self-claim act");

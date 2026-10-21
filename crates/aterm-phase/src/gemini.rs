@@ -174,11 +174,18 @@
 //! `1. Keep trying` and `2. Stop` in place of the composer and waits for a
 //! person: a [`PromptKind::UsageLimit`] box, both options [`Role::Other`].
 //! Not a wall: a wall's answer is typed into the composer, and here there is
-//! none — the dialog takes the keys (a digit chooses at once) — the turn has
-//! not ended, and no reset is said. Pressed by no role: `Keep trying` sends
-//! the request again into a quota that resets hours later, and `Stop` ends
-//! the turn on `✕ [API Error: An unknown error occurred.]`, which no longer
-//! says it was the quota.
+//! none — the dialog takes the keys (a digit chooses at once) — and the turn
+//! has not ended. A key's per-day quota says no reset; a Google account's
+//! spent quota (`QUOTA_EXHAUSTED` with a `RetryInfo` delay, the CLI's
+//! `TerminalQuotaError` with its delay) draws `Access resets at <time>.`
+//! under the title (MEASURED 2026-10-21, [`fixtures::LIMIT_DIALOG_ACCOUNT`]),
+//! the same box all the same; [`limit_reset`] reads that time. Pressed by
+//! no role: `Stop` ends the turn on `✕ [API Error: An unknown error
+//! occurred.]`, which no longer says it was the quota, and `Keep trying`
+//! sends the request again (`retry_once`, bundle), into the quota unless its
+//! reset has passed — so a supervisor presses it only past the reset the
+//! dialog names (aterm-agent's `limit-retry@v1`), and the dialog that names
+//! none is a person's.
 //!
 //! **THE TRUST DIALOG** (a first run in a folder, folder trust on) is a box
 //! no typing answers: a [`PromptKind::Trust`] box. Its Esc EXITS the program
@@ -581,6 +588,15 @@ pub fn fresh(rows: &[String]) -> bool {
     frame(rows).is_some_and(|f| {
         last_user(rows, f.live).is_none() && rows[..f.live].iter().any(|r| is_banner_row(r))
     })
+}
+
+/// A MESSAGE STANDS ON `rows` ([`crate::ScreenReader::message_drawn`]): the
+/// band of a message a person sent, above the live zone (above every row
+/// where no composer is drawn), answered or not.
+#[must_use]
+pub fn message_drawn(rows: &[String]) -> bool {
+    let end = frame(rows).map_or(rows.len(), |f| f.live);
+    last_user(rows, end).is_some()
 }
 
 /// A compact tool row (`  ✓  WriteFile  lab-write.txt → Accepted (+2, -0)`):
@@ -1094,6 +1110,53 @@ pub fn esc(p: &PromptV2) -> Option<CancelEffect> {
     }
 }
 
+/// THE RESET THE USAGE-LIMIT DIALOG NAMES (module header): the time its
+/// `Access resets at <time>.` row says, under the title of the dialog
+/// [`prompt`] reads whole and over its options, less the zone it is named in
+/// — `5:06 AM` of `Access resets at 5:06 AM PDT.`
+/// ([`fixtures::LIMIT_DIALOG_ACCOUNT`]). READ in the 0.46.0 bundle
+/// (`getResetTimeMessage`): the CLI formats `now + retryDelayMs` with
+/// `Intl.DateTimeFormat("en-US", {hour, minute, timeZoneName: "short"})`, the
+/// process's own zone, so the zone's short name (`PDT`, `GMT+2`) is the
+/// machine's and is dropped, and the space before `AM` may be a no-break
+/// one. `None` on any other screen, on a dialog whose head is off the rows
+/// read, and on the dialog a key's per-day quota draws, which names no reset
+/// ([`fixtures::LIMIT_DIALOG`]).
+#[must_use]
+pub fn limit_reset(rows: &[String]) -> Option<String> {
+    let p = prompt(rows)?;
+    if p.kind != PromptKind::UsageLimit || p.head_off_screen {
+        return None;
+    }
+    let first_option = p.options.first().map_or(p.span.1, |o| o.row);
+    let head = const { anchor_text("gemini.usage.resets") };
+    let text = rows
+        .get(p.span.0 + 1..first_option.min(rows.len()))?
+        .iter()
+        .find_map(|r| {
+            let inner = r.trim().strip_prefix('│')?.strip_suffix('│')?;
+            crate::text::trim(inner)
+                .strip_prefix(head)
+                .map(str::to_string)
+        })?;
+    let text = text.trim_end_matches('.');
+    let mut words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || c == '\u{202f}' || c == '\u{a0}')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let zone = |w: &str| {
+        let letters =
+            w.trim_end_matches(|c: char| c.is_ascii_digit() || c == '+' || c == '-' || c == ':');
+        (2..=5).contains(&letters.len())
+            && letters.bytes().all(|b| b.is_ascii_uppercase())
+            && !matches!(letters, "AM" | "PM")
+    };
+    if words.len() > 1 && words.last().is_some_and(|w| zone(w)) {
+        words.pop();
+    }
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
 /// The box on `rows`, read whole ([`PromptV2`]): its title (an approval
 /// box's tool row less its `?`; under `Action Required`, the tool's row
 /// below it), kind, question row and options with their roles — every role
@@ -1347,6 +1410,10 @@ pub mod fixtures {
     pub const TRUST: &str = include_str!("fixtures/gemini-0.46.0-first-run-trust.txt");
     /// A fresh session at its composer: the placeholder, `? for shortcuts`.
     pub const IDLE: &str = include_str!("fixtures/gemini-0.46.0-idle.txt");
+    /// The first frame a launch draws, before its banner: the composer, its
+    /// footer and `? for shortcuts`, nothing above them yet — idle, no
+    /// message and no reply, and NOT `fresh` (no banner row).
+    pub const PRE_BANNER: &str = include_str!("fixtures/gemini-0.46.0-pre-banner.txt");
     /// A typed, unsent draft: the status row blank.
     pub const DRAFT: &str = include_str!("fixtures/gemini-0.46.0-draft.txt");
     /// A fresh composer with a `GEMINI.md` loaded: `1 GEMINI.md file` on the
@@ -1402,6 +1469,11 @@ pub mod fixtures {
     pub const EXIT: &str = include_str!("fixtures/gemini-0.46.0-exit.txt");
     /// A per-day quota's 429: the usage-limit dialog, before any key.
     pub const LIMIT_DIALOG: &str = include_str!("fixtures/gemini-0.46.0-wall-429-per-day.txt");
+    /// A Google account's spent quota (`QUOTA_EXHAUSTED`, its reset in
+    /// `RetryInfo`): the same dialog with `Access resets at <time>.` under its
+    /// title, before any key.
+    pub const LIMIT_DIALOG_ACCOUNT: &str =
+        include_str!("fixtures/gemini-0.46.0-wall-429-account.txt");
     /// The same dialog answered `2. Stop`: the turn's `✕ [API Error: …]`.
     pub const LIMIT_STOPPED: &str = include_str!("fixtures/gemini-0.46.0-wall-429-stopped.txt");
     /// The same in a pane of 72 columns, a `GEMINI.md` loaded: the `ℹ`

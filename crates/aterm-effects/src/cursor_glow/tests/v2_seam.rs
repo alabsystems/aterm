@@ -303,3 +303,116 @@ fn only_the_rainbow_kitty_engages_v2() {
         assert_eq!(glow.v2_status().is_some(), kitty, "{style:?}");
     }
 }
+
+/// `reset` and `curtain` clear `kill_retreat_pending`, `v2_caret`, `v2_beams`,
+/// and any buffered v2 sound cues so no stale licence, flare timestamp, beam
+/// plane or sound cue leaks across a coordinate-space boundary.
+#[test]
+fn reset_and_curtain_clear_kill_retreat_caret_seam_and_v2_sound_cues() {
+    let g = geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    for is_curtain in [false, true] {
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        // Trigger a meteor jump with no ribbon cohorts so `v2_caret.flare_at` is
+        // populated, then advance past the arrival edge (`T <= 120 ms`) so
+        // `draw_burst` populates `v2_beams`.
+        let t2 = t0 + ms(16);
+        glow.note_synthetic_move(t2);
+        glow.tick(Some((2, 22)), t2, &c, g, &mut out);
+        assert!(
+            glow.caret_flare_at().is_some(),
+            "fixture: meteor jump stamps caret_flare_at"
+        );
+        let t2b = t2 + ms(220);
+        glow.tick(Some((2, 22)), t2b, &c, g, &mut out);
+        assert!(
+            !glow.under_quads().is_empty() && !glow.halos().is_empty() && !glow.v2_beams.is_empty(),
+            "fixture: landed meteor populates under_quads, halos, and v2_beams"
+        );
+        // Arm a caret-moving kill right before the space seam.
+        let t3 = t2b + ms(8);
+        glow.note_word_kill(t3, true);
+        if is_curtain {
+            glow.curtain(t3);
+        } else {
+            glow.reset();
+        }
+        assert_eq!(
+            glow.caret_flare_at(),
+            None,
+            "is_curtain={is_curtain}: caret_flare_at must clear at the space seam"
+        );
+        assert!(
+            glow.under_quads().is_empty() && glow.halos().is_empty() && glow.v2_beams.is_empty(),
+            "is_curtain={is_curtain}: cached under_quads, halos, and v2_beams must clear before the next tick"
+        );
+        assert!(
+            glow.drain_sound_cues().next().is_none(),
+            "is_curtain={is_curtain}: sound ledger must drain v2 cues too"
+        );
+        // After re-seeding in the new coordinate space, an unlicensed same-row
+        // retreat must NOT be licensed by the pre-seam `kill_retreat_pending`.
+        let t4 = t3 + ms(16);
+        glow.tick(Some((4, 15)), t4, &c, g, &mut out);
+        let t5 = t4 + ms(16);
+        glow.tick(Some((4, 10)), t5, &c, g, &mut out);
+        assert_eq!(
+            glow.v2_status().expect("engaged").meteors,
+            0,
+            "is_curtain={is_curtain}: pre-seam kill_retreat_pending must not license a post-seam move"
+        );
+    }
+}
+
+#[test]
+fn seated_caret_stop_and_licensed_row_follow_scroll_band_and_hand_lift() {
+    let g = geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let mut glow = CursorGlow::default();
+    let t0 = Instant::now();
+    let mut out = Vec::new();
+    glow.tick(Some((5, 2)), t0, &c, g, &mut out);
+
+    // Type a short run so the caret settles at a non-zero field stop on (5, 7).
+    let mut now = t0;
+    for col in 3..=7u16 {
+        now += ms(40);
+        glow.note_typed_cells(now, 1);
+        glow.tick(Some((5, col)), now, &c, g, &mut out);
+    }
+    let seated_t = glow.rainbow_field();
+    let seated_rgb = glow.rainbow_head_rgb(&c);
+    assert!(seated_t > 0.05, "fixture: caret must settle past red");
+
+    // Let the ribbon cells expire under the parked caret: `v2_stop` holds the seated stop.
+    now += Duration::from_secs(3);
+    glow.tick(Some((5, 7)), now, &c, g, &mut out);
+    assert_eq!(glow.v2.ribbon().live_cells(), 0, "fixture: ribbon expired");
+    assert_eq!(glow.rainbow_field(), seated_t);
+
+    // Whole-screen scroll carries `v2_stop` with the parked caret from row 5 to row 3.
+    glow.note_scroll(2);
+    now += ms(16);
+    glow.tick(Some((3, 7)), now, &c, g, &mut out);
+    assert_eq!(glow.rainbow_field(), seated_t);
+    assert_eq!(glow.rainbow_head_rgb(&c), seated_rgb);
+
+    // Row-band move carries `v2_stop` from row 3 to row 4.
+    glow.note_band_move(2, 6, 1);
+    now += ms(16);
+    glow.tick(Some((4, 7)), now, &c, g, &mut out);
+    assert_eq!(glow.rainbow_field(), seated_t);
+    assert_eq!(glow.rainbow_head_rgb(&c), seated_rgb);
+
+    // `lift_hand_row` carries both `v2_stop` and `last_licensed_row` with the hand's line.
+    glow.last_licensed_row = Some((4, now));
+    glow.lift_hand_row(4, 3);
+    assert_eq!(glow.last_licensed_row, Some((3, now)));
+    now += ms(16);
+    glow.tick(Some((3, 7)), now, &c, g, &mut out);
+    assert_eq!(glow.rainbow_field(), seated_t);
+    assert_eq!(glow.rainbow_head_rgb(&c), seated_rgb);
+}

@@ -1,27 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The store lock at the REAL process edge, two processes at a time (2026-09-10).
+//! Store lock contention at the process edge across two processes.
 //!
-//! The incident: a second aterm instance (the macOS Full Disk Access grant quits the
-//! app and opens it again) ran its launch-time `atpkg seed` while the first
-//! instance's pass still held `store.lock`, was refused, and reported "install
-//! failed" — and nothing retried for six hours. This test holds the lock in THIS
-//! process (a `Layout` over a temp prefix, exactly what a sibling process presents to
-//! `flock`) and drives the dev `atpkg` binary against it: a `--wait-lock` child
-//! announces the wait and proceeds once the holder lets go, times out with exit 75
-//! (`EX_TEMPFAIL`) and says it stood aside (`seed-busy:`) when it does not, a typed
-//! verb with no terminal to wait on (stdin not one; a person's waits behind a spinner,
-//! `typed_lock_wait_tty.rs`) stays fail-fast with the same code and prints no marker,
-//! an unwritable prefix is never waited on (exit 1), an uncontended child prints
-//! no marker at all, a waiter whose spawner has gone stands down silently, and a
-//! waiter whose parent is init from the start is no orphan and waits like any other.
+//! Holds `store.lock` in this process (`Layout` over a temp prefix) and drives
+//! the dev `atpkg` binary against it: a `--wait-lock` child announces the wait
+//! and proceeds once the holder releases, or times out with exit 75
+//! (`EX_TEMPFAIL`) and prints `seed-busy:`; a non-interactive typed verb stays
+//! fail-fast with exit 75 and prints no progress marker; an unwritable prefix
+//! fails immediately with exit 1; an uncontended child prints no lock marker;
+//! a waiter whose spawner exits stands down silently; and a waiter whose
+//! parent is init from the start is not treated as an orphan.
 //!
-//! NEVER THE REAL STORE. The child's HOME is a temp directory and its
-//! XDG_CONFIG_HOME is an absent one, so `store::resolve` lands on the DEFAULT prefix
-//! under that temp HOME (the developer's `[packages].prefix`, if any, is never read);
-//! `<prefix>/declined` makes `seed` exit 0 with one sentence before any index work,
-//! so no network and no store mutation happen even when the child does run.
+//! Isolation: the child's `HOME` is a temp directory and `XDG_CONFIG_HOME` is
+//! absent, so `store::resolve` lands on the default prefix under that temp
+//! `HOME`, and `<prefix>/declined` makes `seed` exit 0 before any index or
+//! network work.
 
 #![cfg(unix)]
 
@@ -42,7 +36,7 @@ fn waiting_line() -> String {
 }
 
 /// The sentence that answers it once the announced wait ends in the lock
-/// (`atpkg::cli::LOCK_ACQUIRED_MARKER`, 2026-09-14).
+/// (`atpkg::cli::LOCK_ACQUIRED_MARKER`).
 fn acquired_line() -> String {
     format!("atpkg: {}", atpkg::cli::LOCK_ACQUIRED_MARKER)
 }
@@ -69,9 +63,8 @@ impl Fixture {
         let registry = root.path().join("registry");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&registry).unwrap();
-        // The DEFAULT prefix under the temp HOME — the one place `store::resolve`
-        // can land with no config: it cannot fall back onto the real store because
-        // the default itself is under this HOME.
+        // The default prefix under the temp HOME — the one place `store::resolve`
+        // can land with no config.
         let prefix = atpkg::store::default_prefix(&home);
         assert!(
             prefix.starts_with(&home),
@@ -93,7 +86,7 @@ impl Fixture {
         }
     }
 
-    /// Take the store lock in THIS process (creates the 0700 prefix), and write the
+    /// Take the store lock in this process (creates the 0700 prefix), and write the
     /// `declined` marker so a child that does get to run its verb exits 0 at once.
     fn hold(&self) -> atpkg::lock::StoreLock {
         let guard =
@@ -111,10 +104,9 @@ impl Fixture {
     }
 
     /// A command confined to this fixture's HOME, config and registry, both pipes
-    /// captured — for the dev `atpkg` itself or for a shell that runs it. Never under an
-    /// inherited private state root (`ATERM_STATE_HOME`, rulings 409 and 410): a suite run
-    /// in a tab of a private instance would otherwise skip the `[machine]` edge these
-    /// tests read and write its logs into that instance's root.
+    /// captured — for the dev `atpkg` itself or for a shell that runs it. Clears
+    /// `ATERM_STATE_HOME` so a suite run inside a private instance does not skip
+    /// the `[machine]` edge or write logs into that instance's root.
     fn command(&self, program: &str) -> Command {
         let mut cmd = Command::new(program);
         cmd.env("HOME", &self.home)
@@ -135,9 +127,8 @@ impl Fixture {
     }
 }
 
-/// A spawned child with its stdout collected LINE BY LINE as it arrives (so the test
-/// can react to the waiting marker while the child is still waiting) and its stderr
-/// drained concurrently (the two-pipe rule).
+/// A spawned child with stdout collected line by line as it arrives and stderr
+/// drained concurrently.
 struct Streamed {
     child: Child,
     stdout: Arc<Mutex<Vec<String>>>,
@@ -242,18 +233,8 @@ fn lock_path_of(prefix: &Path) -> String {
 /// of a freshly linked binary has been measured at 26 s on a loaded machine.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 
-/// THE INCIDENT, FIXED: a `--wait-lock` child finds the lock held, announces the
-/// wait (naming THIS fixture's lock path, never the real store's), and — once the
-/// holder lets go — runs its verb and exits 0, with its normal output AFTER the
-/// announcement and nothing on stderr about the lock.
-/// Every stdout line a REFUSED pass may still carry.
-///
-/// The `[machine]` settings are applied at the dispatch edge, ABOVE the store lock
-/// (they take none: `defaults` writes a per-host preference domain), so a pass the lock
-/// refuses has already reported what it did to the host — including, in this fixture, the synthetic-home
-/// refusal, because the spawned child runs with a temp `HOME` and per-host preferences
-/// follow the ACCOUNT, not `HOME`. What must NOT be here is a PROGRESS marker: those
-/// are the window's channel, and a typed verb earns none.
+/// Assert that a refused pass prints only `[machine]` host lines and no window
+/// progress markers.
 fn no_progress_marker(stdout: &[String]) {
     for line in stdout {
         assert!(
@@ -307,10 +288,8 @@ fn a_waiting_seed_proceeds_once_the_holder_releases() {
         ran_at > waiting_at,
         "the verb runs AFTER the wait: {stdout:?}"
     );
-    // THE WAIT IS ANSWERED (2026-09-14): once, between the announcement and the
-    // verb's own output — the GUI retires its waiting row on it, since a quiet
-    // verb under the lock would otherwise leave "waiting for another install"
-    // standing until this child exits.
+    // `lock-acquired:` is printed once between the waiting announcement and the
+    // verb's own output so the GUI retires its waiting row immediately.
     let acquired: Vec<usize> = stdout
         .iter()
         .enumerate()
@@ -332,11 +311,9 @@ fn a_waiting_seed_proceeds_once_the_holder_releases() {
     );
 }
 
-/// A holder that never lets go: the waiter announces, waits its whole bound, and
-/// exits 75 (`EX_TEMPFAIL`) with the unchanged loud sentence on stderr — never
-/// having run its verb — and tells the lane that asked to wait, on stdout and once,
-/// that it stood aside (0.82.0's `seed-busy:` terminal, which a typed verb never
-/// prints: the test after this one pins the silence).
+/// When the holder never releases, the waiter announces, waits its full bound,
+/// exits 75 (`EX_TEMPFAIL`) with the contention refusal on stderr without
+/// running its verb, and emits one `seed-busy:` marker on stdout.
 #[test]
 fn a_waiting_seed_times_out_with_exit_75() {
     let fx = Fixture::new("timeout");
@@ -353,12 +330,7 @@ fn a_waiting_seed_times_out_with_exit_75() {
         .iter()
         .position(|l| l.starts_with(&waiting_line()))
         .unwrap_or_else(|| panic!("announced the wait: {stdout:?}"));
-    // THE STOOD-ASIDE TERMINAL REACHES THE `--wait-lock` CALLER. It is what the
-    // window's reader folds into its one timed-out-wait log line (the exit code, 75,
-    // is what keys its "another aterm is installing" reading), so a waiter that timed
-    // out without it would leave the window with an exit code and no sentence. Once,
-    // and after the announcement: a terminal that came first would answer a wait not
-    // yet begun.
+    // `seed-busy:` reaches the `--wait-lock` caller once after the announcement.
     let busy_line = format!("atpkg: {}", atpkg::cli::SEED_BUSY_MARKER);
     let busy: Vec<usize> = stdout
         .iter()
@@ -421,9 +393,8 @@ fn an_unwritable_prefix_never_waits_and_keeps_exit_1() {
     no_progress_marker(&stdout);
 }
 
-/// Whether `pid` is alive, asked the way atpkg's own progress reader asks
-/// (`kill -0`), because the waiter below is a GRANDCHILD this process cannot wait
-/// for.
+/// Check whether `pid` is alive via `kill -0` (the waiter is a grandchild
+/// this process cannot `waitpid` on).
 fn pid_alive(pid: u32) -> bool {
     Command::new("/bin/kill")
         .args(["-0", &pid.to_string()])
@@ -433,19 +404,10 @@ fn pid_alive(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// An ORPHANED waiter stands down on its own, silently, long before its bound: the
-/// window that spawned it quits while it is still queued — the incident's relaunch,
-/// had the first window been the one waiting — and it must neither poll out its
-/// half-hour (and then race the successor's own waiter for the freed lock) nor
-/// announce to a pipe nobody reads. The waiter is spawned by a throwaway `sh`
-/// (`script`, with `$1` the dev atpkg) that prints the waiter's pid and exits at
-/// once, so the waiter is re-parented — to launchd on macOS, to a subreaper or init
-/// on Linux — while the lock stays held here the whole time, so the only way the
-/// waiter can exit early is the orphan check. Its exit code is unobservable by
-/// design (init reaps it); what is observable is the pid going away within seconds,
-/// long before its ten-minute bound ([`ORPHAN_BOUND_SECS`]), a stdout carrying
-/// nothing but the pid line (no `lock-waiting:` announcement — the orphan check
-/// precedes it on every poll) and an empty stderr.
+/// An orphaned waiter stands down silently before its bound: a throwaway `sh`
+/// spawns the waiter, prints its pid, and exits immediately while the lock
+/// stays held here, so the waiter can only exit early via the orphan check
+/// before printing `lock-waiting:`.
 fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
     let fx = Fixture::new(case);
     let guard = fx.hold();
@@ -518,24 +480,9 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
         !stdout.iter().any(|l| l.contains(DECLINED_SENTENCE)),
         "the verb never ran: {stdout:?}"
     );
-    // …and once THIS holder lets go the lock is takeable: the orphan left nothing
-    // behind on it. (Asserting `Contended` while `guard` was still alive could
-    // never fail — a second flock from the holder's own process is always refused
-    // — so the guard is released first, and this is the assertion that can.)
-    //
-    // POLLED, NOT SAMPLED ONCE (2026-09-17), for the mechanism `atpkg::lock`'s
-    // own unit test records at the identical shape: `flock` is released only when
-    // every descriptor on the open file description is closed, and a
-    // `fork`/`posix_spawn` anywhere else in this binary copies every descriptor
-    // into the child, which holds them until it `exec`s (`FD_CLOEXEC` closes at
-    // exec, never at fork). THIS binary is the worst case for that: every test in
-    // it spawns `sh` and a waiter, so a sibling's fork window is not hypothetical
-    // here, it is the file's subject matter.
-    //
-    // The CLAIM IS UNCHANGED — a released lock must become takeable, and a
-    // release that never takes effect still fails, loudly, at a minute's hang
-    // detector. Only the instant it must be visible is relaxed, by exactly the
-    // thing that delays it.
+    // Once this holder releases `guard`, the lock becomes takeable (polled
+    // because a concurrent test's fork/posix_spawn can briefly inherit the
+    // open fd until `exec`).
     drop(guard);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -551,13 +498,9 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
     }
 }
 
-/// The window's shape: the spawner NAMES ITSELF (`ATPKG_SPAWNER_PID`, the `sh`'s
-/// own `$$`) beside `--wait-lock`, so "my parent is gone" is a comparison against
-/// that pid and holds on every Unix — including a Linux subreaper, where the orphan
-/// is re-parented to a pid that is not 1. This `sh` exits within microseconds of
-/// the fork, before the waiter has even reached its dispatch edge: exactly the race
-/// a `getppid`-at-the-edge guess loses (measured 2026-09-10 — the guess recorded
-/// launchd as the spawner and the waiter polled out its whole bound under ppid 1).
+/// The spawner passes `ATPKG_SPAWNER_PID=$$` beside `--wait-lock`, so orphan
+/// detection compares against that pid even when the spawner exits before the
+/// waiter reaches `getppid()` or under a Linux subreaper.
 #[test]
 fn an_orphaned_waiter_stands_down_silently_before_its_bound() {
     an_orphaned_waiter_stands_down(
@@ -573,24 +516,10 @@ fn an_orphaned_waiter_stands_down_silently_before_its_bound() {
 /// is told apart from one that stands down however loaded the machine is.
 const ORPHAN_BOUND_SECS: u64 = 600;
 
-/// A waiter whose parent IS init from the start — launchd's or a subreaper's job,
-/// with no `ATPKG_SPAWNER_PID` (a launchd agent's) — is not an orphan: the edge's own
-/// `getppid` recorded that parent as the spawner, it never changes, and the waiter
-/// waits like any other, announcing after the grace (its loud timeout with 75 at the
-/// deadline is `a_waiting_seed_times_out_with_exit_75`'s). Under the old rule ("init
-/// as the parent is orphaned") this stood down silently at its first contended poll,
-/// which made an unnamed `--wait-lock` a silent instant exit 75 from every
-/// pid-1-parented caller. (A `nohup … &` job is NOT this shape: its parent at the
-/// edge is the shell that launched it, and it stands down once that shell exits; a
-/// cron job's parent is cron's own child or the `sh` it runs, not init.) The shape is
-/// DETERMINISTIC, not a race on the spawner's exit: a throwaway `sh` forks a subshell
-/// (the pid `$!` names) that waits on a FIFO gate, and exits; this test reaps that `sh`
-/// — the kernel re-parents a process's children as it exits, before its parent can
-/// reap it — and only then opens the gate, so the subshell execs the waiter with its
-/// parent already init (or the subreaper), however loaded the machine is. (Before
-/// 2026-10-20 the subshell slept a second instead: an `sh` still alive then was
-/// recorded as the spawner, and the waiter stood down once it went.) Both pipes reach
-/// this process through the inherited fds.
+/// A waiter whose parent is already init/subreaper when it starts (with no
+/// `ATPKG_SPAWNER_PID`) records that initial `getppid()` as its spawner and
+/// waits normally instead of treating itself as orphaned. A throwaway `sh`
+/// forks a subshell that sleeps until re-parented and then `exec`s the waiter.
 #[test]
 fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
     use std::io::Write as _;
@@ -710,12 +639,9 @@ fn a_declined_seed_without_contention_is_unchanged() {
 /// The sentence a full `update` prints when nothing is installed and the set is not owed.
 const NOTHING_TO_UPDATE: &str = "nothing installed to update";
 
-/// A FULL PASS THAT QUEUED BEHIND ANOTHER STANDS DOWN BEHIND ITS END, WHATEVER IT WAS
-/// (2026-09-24). The holder records a FAILED full pass while the child waits; once it lets
-/// go, the child does not run the pass again back to back: it says the holder's failure on
-/// stderr,
-/// in the holder's own sentence, exits 1 so its window's ladder retries it, and records
-/// nothing of its own. Until then only a success stood it down.
+/// When the holder records a failed full pass while a child waits, the child
+/// does not re-run the pass back-to-back: it prints the holder's failure on
+/// stderr, exits 1, and leaves the holder's status record intact.
 #[test]
 fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited() {
     use aterm_update_core::pkg_check::PassOutcome;
@@ -723,9 +649,9 @@ fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited(
     let guard = fx.hold();
     let mut child = stream(fx.spawn(&["update", "--wait-lock", "60"]));
     child.wait_for_line(&waiting_line(), ANNOUNCE_WITHIN);
-    // Stamped in the very second the child found the lock held: a clock cannot tell that
-    // end from one before the wait (the child ran back to back until 2026-09-24); the
-    // store's full-pass count, which the child read before its first attempt, can.
+    // Stamped in the same second the child found the lock held: the store's
+    // full-pass sequence number (read before the first lock attempt) distinguishes
+    // a pass that ended during the wait from one that ended before it.
     let unix = aterm_time::unix_secs().unwrap();
     let ended = aterm_types::rfc3339::format_rfc3339(unix);
     let layout = fx.layout();
@@ -756,14 +682,9 @@ fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited(
     );
 }
 
-/// …AND BEHIND A PASS THAT FAILED ONLY FOR ITS CACHED INDEX IT EXITS AS THAT PASS DID
-/// (2026-09-26). The holder's pass ran on the §14 cache (the listing refused, a rate limit)
-/// and no member failed: it exited 1 with nothing on stderr, and the record says so for that
-/// pass end (`stale_index_only_pass_seq`). The child that waited stands down with its line
-/// on STDOUT and stderr silent, exit 1 — so the window's rule for a markerless exit 1 with
-/// empty stderr over a cached-index record reads a stale index, not "Package update
-/// failed" (until this, the line went to stderr and the window posted the failure). The
-/// holder's record stays the holder's.
+/// Behind a pass that failed only because its index came from cache
+/// (`stale_index_only_pass_seq`), the waiting child stands down with its line
+/// on stdout, empty stderr, and exit 1, preserving the holder's record.
 #[test]
 fn a_waiting_update_stands_down_quietly_behind_a_pass_that_failed_only_for_its_cached_index() {
     use aterm_update_core::pkg_check::PassOutcome;
@@ -805,10 +726,9 @@ fn a_waiting_update_stands_down_quietly_behind_a_pass_that_failed_only_for_its_c
     );
 }
 
-/// A FULL PASS WITH NOTHING TO CHECK STILL RECORDS ITS END (2026-09-24): with nothing
-/// installed and the set not owed, `update` says so, exits 0 and records `last_pass = ok`
-/// — the end the schedulers count their walk from — and no success, since nothing was
-/// checked. Unrecorded, every terminal tab owed it again five minutes on.
+/// With nothing installed and the default set declined, `update` exits 0 and
+/// records `last_pass = ok` (with `last_success_at` empty since nothing was
+/// checked).
 #[test]
 fn an_update_with_nothing_to_check_records_its_end() {
     let fx = Fixture::new("nothing-to-check");

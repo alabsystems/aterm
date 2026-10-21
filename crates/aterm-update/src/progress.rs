@@ -261,12 +261,9 @@ mod tests {
         assert!(!take_download_began(), "consumed");
     }
 
-    /// A DOWNLOAD IN A TERMINAL SESSION KEEPS ITS CHECKER ALIVE.
-    /// No observer is installed in this test process — the session's shape — and
-    /// watching used to spawn nothing, so the heartbeat of a check that was
-    /// downloading never moved: past 65 minutes on a slow link it read stalled, and
-    /// the window booked the session as a stopped stage holder. Now every byte the
-    /// sink gains re-stamps a check in flight. The minute is a hang detector.
+    /// A download in a terminal session (no observer installed) still re-stamps
+    /// the checker's heartbeat as `.part` grows so a slow download is not
+    /// mistaken for a stalled checker.
     #[test]
     fn a_download_with_no_observer_still_restamps_the_checking_heartbeat() {
         use crate::checker_watch::{CheckerPhase, WATCH};
@@ -333,9 +330,8 @@ mod tests {
         seen.lock().unwrap().contains(want)
     }
 
-    /// THE SIZE MAKES THE FILL (design ruling 226): the probe's total rides
-    /// every report from the moment it lands, beside the `.part`'s bytes, so a
-    /// person's download row has a fill and an ETA, not only a comet.
+    /// The size probe's total rides every report from the moment it lands,
+    /// beside the `.part`'s bytes.
     #[test]
     fn the_probed_size_rides_every_report_once_it_lands() {
         let dir = std::env::temp_dir().join(format!("aterm-update-size-{}", std::process::id()));

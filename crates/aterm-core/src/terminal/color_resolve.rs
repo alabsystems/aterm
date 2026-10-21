@@ -16,24 +16,16 @@ use crate::grid::{Cell, CellExtra, CellFlags, PackedColors};
 use aterm_types::{ColorPalette, DIM_FACTOR, Rgb};
 use std::sync::OnceLock;
 
-/// Host-configurable style-attribute policy for color resolution.
+/// Host-configurable style-attribute policy for color resolution:
 ///
-/// * `bold_is_bright` — whether SGR 1 promotes indexed colors 0–7 to their
-///   bright 8–15 siblings (the classic xterm behavior). Defaults to `true`
-///   (the historical unconditional promotion); config `bold_is_bright = false`
-///   keeps bold a pure weight change.
-/// * `faint_opacity` — how much of the foreground SGR 2 (dim/faint) retains,
-///   `0.0..=1.0`. The fg is blended toward the CELL background — light ink
-///   as far as an sRGB (alpha) blend at this opacity, dark ink a linear-light
-///   one — raised where needed so faint text keeps `contrast^opacity` and a
-///   readable `9^opacity` (3:1 at the default) capped below the colour's own
-///   contrast (see [`dim_toward_bg`]). Faint text recedes on both dark and
-///   light themes. Defaults to [`DIM_FACTOR`] (0.5).
-/// * `indexed_minimum_contrast` — the WCAG ratio a foreground is held to when
-///   both of a cell's colours come from the theme (see
-///   [`theme_pair_floor`]); while it is on, a light theme's dark white on a
-///   colour is drawn in the page colour ([`white_on_colour`]). `1.0`, the
-///   default, is off.
+/// * `bold_is_bright` — whether SGR 1 promotes indexed colors 0–7 to 8–15
+///   (default `true`).
+/// * `faint_opacity` — fraction of fg retained by SGR 2 (`0.0..=1.0`, default
+///   [`DIM_FACTOR`] = 0.5), blended toward the cell background via
+///   [`dim_toward_bg`].
+/// * `indexed_minimum_contrast` — WCAG contrast floor when both cell colors
+///   come from the theme ([`theme_pair_floor`], [`white_on_colour`]; default
+///   `1.0`, off).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StyleResolveOpts {
     /// SGR 1 promotes indexed 0–7 to bright 8–15 (default `true`).
@@ -106,21 +98,12 @@ pub(crate) fn is_shape_glyph(ch: char) -> bool {
     matches!(ch, '\u{2500}'..='\u{259F}' | '\u{E0A0}'..='\u{E0D7}')
 }
 
-/// What the theme-pair floor holds this cell's foreground to, or `None`
-/// where it does not apply. Windows Terminal's `adjustIndistinguishableColors`
-/// (`indexed`) rule, on WCAG contrast: it applies when both colours are the
-/// theme's own — the default foreground or background, or palette slots
-/// 0–15 — and are not both the defaults (the theme's body text, its own
-/// business). Text on the theme's background is held to at most
-/// [`THEME_BACKGROUND_FLOOR`] (aterm's own chromatic colours to
-/// [`DEFAULT_PALETTE_TEXT_FLOOR`]); text on a coloured cell, a pair no theme
-/// author tunes (pwsh's directories are its default foreground on slot 4),
-/// to the full `ratio`. Truecolor and the 256-colour cube are a program's own
-/// choice and stay exact, as do shapes ([`is_shape_glyph`]) and hidden text.
-/// `reverse_video` is DECSCNM, which swaps the page itself: the theme's
-/// background is drawn as the default foreground colour. A cell's own SGR 7
-/// draws its foreground colour as a block that is never the page, so only an
-/// un-inverted cell whose drawn background is a default sits on the page.
+/// WCAG contrast floor for a cell when both colors come from the theme
+/// (default fg/bg or palette slots 0–15, excluding default-on-default,
+/// same-slot fills, shapes [`is_shape_glyph`], and hidden text). Text on the
+/// theme's page is capped at [`THEME_BACKGROUND_FLOOR`] (or
+/// [`DEFAULT_PALETTE_TEXT_FLOOR`] for default chromatic slots 1–6); text on a
+/// colored cell uses the full `ratio`.
 fn theme_pair_floor(
     cell: Cell,
     colors: PackedColors,
@@ -177,25 +160,10 @@ fn theme_pair_floor(
     })
 }
 
-/// A light theme's own white as text on a colour, while the theme-pair floor
-/// is on: the page colour where that reads better on the cell than the white.
-///
-/// A light theme often draws white (slots 7 and 15) as a dark text colour,
-/// because a program that writes white on the page means text there
-/// (PSReadLine draws numbers `ESC[97m`, members and types `ESC[37m`):
-/// Default Light's are `#6B7280` and `#474D57`, Windows Terminal's VS Code
-/// Light Modern's `#555555` and `#A5A5A5`. On a coloured cell a program means
-/// light text — a test runner's `ESC[97;41m FAIL`, white on black
-/// (`ESC[97;40m`) — and the dark white put dark text on a dark cell
-/// (`#474D57` on `#C4262E`, 1.49:1). So a white `slot` whose colour is darker
-/// than `page` and at least [`THEME_BACKGROUND_FLOOR`] from it (the theme
-/// made it text) is drawn as `page` on any `ground` that is not its own slot
-/// (`ground_slot`) where `page` has the more contrast; on the page itself it
-/// keeps its colour (`page` on `page` is 1:1). A dark theme's whites are
-/// lighter than its page, and a light theme's light whites (Solarized
-/// Light's `#BBB5A2`, 1.9:1) are under the bar, so both keep their colours.
-/// Shapes ([`is_shape_glyph`]) and hidden text keep theirs, as under the
-/// floor.
+/// When the theme-pair floor is active on a light theme whose white slots
+/// (7, 15) are dark text colors (darker than `page` and at least
+/// [`THEME_BACKGROUND_FLOOR`] from it), substitute `page` on any non-page
+/// colored cell where `page` yields higher contrast.
 #[allow(
     clippy::too_many_arguments,
     reason = "the drawn pair, its slots and the page, all already in hand at both call sites"
@@ -313,25 +281,11 @@ const HALFWAY_TENTHS: u8 = 5;
 /// 0.044 (cyan's `#385D65`) to 0.106 (bright green's `#206431`).
 const MUD_CHROMA: f64 = 0.035;
 
-/// [`floor_contrast`] for text on a COLOURED cell, where clearing `min` can
-/// mean changing polarity (the default foreground on a yellow or green
-/// segment). The smallest nudge, exactly as [`floor_contrast`], while the
-/// text stays on its side of the cell's luminance and the nudge keeps it
-/// itself: a nudge under [`HALFWAY_TENTHS`], or one that keeps the text's hue
-/// (at least [`MUD_CHROMA`]): red on bright yellow is a darker red, green on
-/// white a darker green. Otherwise the smallest nudge ends at a grey that
-/// only just passes (`#535353` on `#CDCD00`, 4.52:1, beside `#111318`'s
-/// 10.9:1; the light default text on a lighter cell, `#535353` on bright
-/// green and `#686868` on bright yellow and white), so it takes instead the
-/// theme's own ink on the pole's side (of `inks`, its text and background
-/// colours, the darker toward black, the lighter toward white), the colour
-/// such a cell's text takes wherever it flips. When the text has to cross to
-/// the other side of the cell — `fg` is on the far side from the pole `bg`
-/// contrasts with more, or level with `bg` — the ink when it lies beyond
-/// `bg` toward the pole and clears `min`, else the pole; when it stays on
-/// its side, the ink when it lies beyond `bg` and is at least as legible as
-/// the grey, else the grey. The same bound as [`floor_contrast`]: `fg`
-/// itself when it clears `min`, else at least `min` or the best pole.
+/// [`floor_contrast`] for text on a colored cell (`inks` = theme default
+/// `[fg, bg]`). Uses the smallest sRGB nudge toward the higher-contrast pole
+/// when the text stays on its luminance side of `bg` and Either nudges less
+/// than [`HALFWAY_TENTHS`] or retains chroma `>= MUD_CHROMA`; otherwise
+/// prefers the theme's own ink on the pole's side when legible.
 #[must_use]
 pub fn floor_contrast_on_colour(fg: Rgb, bg: Rgb, min: f32, inks: [Rgb; 2]) -> Rgb {
     let lb = wcag_luminance(bg);
@@ -519,12 +473,7 @@ fn resolve_both_with<const LIGHT_WHITES: bool>(
         }
     }
 
-    // 3. Dim (SGR 2): blend fg toward the cell background (see
-    // `dim_toward_bg`). (The old "multiply toward black" made faint text
-    // darker — i.e. heavier — on light themes, the inversion of the
-    // attribute. Blending toward bg is theme-independent: it always recedes
-    // toward the surface it sits on.) Applied before the inverse swap, like
-    // the old multiply.
+    // 3. Dim (SGR 2): blend fg toward the cell background (`dim_toward_bg`) before inverse swap.
     if flags.contains(CellFlags::DIM) {
         fg = dim_toward_bg(fg, bg, opts.faint_opacity);
     }
@@ -549,12 +498,7 @@ fn resolve_both_with<const LIGHT_WHITES: bool>(
     (fg, bg)
 }
 
-/// The transfer functions are exact but include `powf`; keep them off the per-cell
-/// render path. `Terminal::cell_frame_into` resolves every faint cell on every
-/// candidate redraw, so three inverse + up to six forward `powf`s per cell showed up
-/// directly in samples of an event-loop wake storm. The process-lifetime tables below
-/// preserve the old f32 result byte-for-byte while reducing that hot path to lookups,
-/// arithmetic, and at most a one-step threshold correction.
+/// Precomputed sRGB <-> linear-light transfer tables avoiding per-cell `powf`.
 #[inline]
 fn srgb_to_linear_direct(c: u8) -> f32 {
     let n = f32::from(c) / 255.0;
@@ -590,10 +534,7 @@ const LINEAR_BUCKETS: usize = 8192;
 
 struct TransferTables {
     to_linear: [f32; 256],
-    /// `thresholds[q - 1]` is the first non-negative f32 that the historical
-    /// transfer function rounds to byte `q` (q=1..=255). Deriving the exact f32
-    /// transition, rather than merely sampling a curve, makes the fast quantizer
-    /// byte-identical even at rounding boundaries.
+    /// `thresholds[q - 1]` is the first non-negative f32 that rounds to sRGB byte `q` (`1..=255`).
     thresholds: [f32; 255],
     /// Result at each bucket's lower edge. An sRGB byte boundary is wider than an
     /// 1/8192 linear bucket; the correction below is therefore normally zero or one
@@ -659,8 +600,7 @@ fn srgb_to_linear(c: u8) -> f32 {
     transfer_tables().to_linear[usize::from(c)]
 }
 
-/// Linear light (0.0..=1.0) → sRGB channel (0..=255), rounding exactly as the
-/// former direct transfer function without evaluating `powf` per rendered channel.
+/// Linear light (`0.0..=1.0`) → sRGB channel (`0..=255`).
 #[cfg(test)]
 #[inline]
 fn linear_to_srgb(l: f32) -> u8 {
@@ -687,55 +627,17 @@ fn linear_to_srgb_with(tables: &TransferTables, l: f32) -> u8 {
     q as u8
 }
 
-/// SGR 2 (dim/faint): recede `fg` toward `bg`, keeping `opacity` of it.
+/// SGR 2 (dim/faint): blend `fg` toward `bg` in linear light, retaining
+/// `opacity` (`0.0..=1.0`).
 ///
-/// `opacity` is the fraction of the foreground retained (clamped to `0..=1`):
-/// `1.0` returns `fg` unchanged, `0.0` lands on `bg` (invisible). The blend
-/// is per-channel in linear light at a mix `m` ([`faint_mix`]), so the
-/// result keeps the colour's hue and its WCAG relative luminance is
-/// `L(dim) = L(bg) + m·(L(fg) − L(bg))` (up to u8 quantization). With
-/// `t = opacity`, `m` starts from whichever of two blends recedes further:
+/// Starts from the linear lerp `m = opacity` (or on Windows for light ink on
+/// a dark ground, [`srgb_blend_mix`]), then raises `m` via [`faint_mix`] to
+/// meet [`faint_target`]: `max(C^t, min(9^t, C^((1+t)/2)))` for `C >= 1.25`.
 ///
-/// * the linear-light lerp, `m = t`;
-/// * the sRGB-space blend `bg + t·(fg − bg)`, by its luminance
-///   ([`srgb_blend_mix`]): the alpha blend Windows Terminal, iTerm2 and
-///   Ghostty draw faint text with.
+/// # Invariant
 ///
-/// On Windows ([`FAINT_SRGB_BLEND`]) light ink on a dark ground takes the
-/// sRGB blend, which recedes as far as those terminals do. The lerp kept most
-/// of the contrast there: PSReadLine draws its inline prediction bright white
-/// and faint (`ESC[97;2;3m`), and on Default it was `#BCBCBC` (9.8:1) beside
-/// typed text at `#E5E5E5`, so the suggestion read as typed; it is `#898989`
-/// (5.3:1), and Default's faint text `#717172` (3.8:1, was 6.5:1). macOS and
-/// Linux keep the lerp, the faint they have always drawn. Dark ink on a light
-/// ground keeps the lerp everywhere, the further of the two there.
-///
-/// Then `m` is raised, when needed, to reach [`faint_target`]. With
-/// `C = contrast(fg, bg)`, the target is the larger of two floors:
-///
-/// * the log-share floor `C^t`: faint keeps `t` of the contrast in log
-///   space, which dominates for dark body text on a light ground;
-/// * the readable floor `9^t` (3:1 at the default 0.5, 1:1 at 0), capped by
-///   the recession ceiling `C^((1+t)/2)` so faint never reaches the colour's
-///   own contrast. It applies only where `C >= 1.25`; below that the pair is
-///   not legible text either way.
-///
-/// The floors are what make one opacity read alike on both polarities: the
-/// lerp lands dark ink on a light ground in the mid-greys, where the ratio
-/// collapses (14.35:1 → 1.9:1 for Aterm Day's fg). At the default 0.5, Aterm
-/// Day's fg goes 14.35:1 → 3.78:1 (the log share), colour 7 goes 5.76:1 →
-/// 3.0:1 (the readable floor) and colour 8 goes 3.50:1 → 2.57:1 (the
-/// ceiling).
-///
-/// # Invariant (proven)
-///
-/// `contrast(dim_toward_bg(fg, bg, t), bg) <= contrast(fg, bg)` for every
-/// `fg`/`bg` pair and `t ∈ [0,1]` — dim reduces contrast on both polarities
-/// (dark-on-light and light-on-dark), unlike the old gamma-space multiply
-/// toward black, which made faint text HIGHER-contrast (darker/heavier) on
-/// light backgrounds. Exhaustively machine-checked over all grayscale pairs
-/// and a dense RGB lattice in the `dim_contrast_law` tests below; the old
-/// multiply is kept there as the negative control.
+/// `contrast(dim_toward_bg(fg, bg, t), bg) <= contrast(fg, bg)` for all
+/// `fg`, `bg`, and `t ∈ [0, 1]`.
 #[must_use]
 pub fn dim_toward_bg(fg: Rgb, bg: Rgb, opacity: f32) -> Rgb {
     dim_toward_bg_with(fg, bg, opacity, FAINT_SRGB_BLEND)
@@ -925,25 +827,7 @@ fn raw_resolve(
     (fg, bg)
 }
 
-/// The dim contrast law, machine-checked (L0, always on).
-///
-/// Invariant: `contrast(dim_toward_bg(fg, bg, t), bg) <= contrast(fg, bg)`
-/// for all `fg`, `bg` and `t ∈ [0,1]`: SGR 2 reduces WCAG contrast on both
-/// polarities. In real arithmetic it is exact, since the linear-light blend
-/// makes relative luminance the lerp `L(dim) = L(bg) + t·(L(fg) − L(bg))`. u8
-/// quantization adds a bounded perturbation, checked here:
-///
-/// * grayscale: exact over the exhaustive 256×256×|t| domain, zero tolerance;
-/// * RGB (channels may move in opposing directions): exact for pairs with
-///   `contrast(fg,bg) >= 1.05`, within `+0.005` (one u8 step of luminance)
-///   for near-iso-luminant pairs, over a dense 8³-per-color lattice.
-///
-/// The faint floors are checked here too: faint reaches its target (within
-/// u8 quantization), stays strictly fainter than its colour, and never mixes
-/// less than `opacity`. Each floor term has a negative control showing what
-/// goes wrong without it, and a gamma-space multiply toward black is the
-/// negative control for the law itself: it raises contrast for dark-on-light
-/// text.
+/// Machine-checked dim contrast and floor invariants across grayscale and RGB lattices.
 #[cfg(test)]
 mod dim_contrast_law {
     use super::{dim_toward_bg_with, faint_target, srgb_to_linear};
@@ -1184,14 +1068,7 @@ mod dim_contrast_law {
         );
     }
 
-    /// Faint ink stays readable on the light themes: at the default opacity
-    /// the fg and every palette slot reach their target (within u8
-    /// quantization), so any colour at 4.4:1 or more is at about 3:1 faint,
-    /// and each stays fainter than its colour. Controls: the bare lerp drops
-    /// the fg under 2:1, and the pre-floor log share alone leaves Aterm
-    /// Day's colour 7 under 2.5:1. Dark ink keeps the lerp as its start, so
-    /// these are the bytes they were. (Dark themes:
-    /// `faint_light_ink_recedes_as_an_alpha_blend`.)
+    /// Verify faint ink reaches its target contrast floor on light themes while staying fainter than the undimmed color.
     #[test]
     fn faint_keeps_its_share_of_contrast_on_light_themes() {
         use super::faint_mix;
@@ -1248,14 +1125,7 @@ mod dim_contrast_law {
         assert!((faint_mix(0.02, 0.9, 1.0, 1.0) - 1.0).abs() < f32::EPSILON);
     }
 
-    /// Light ink on a dark ground recedes as the sRGB-space (alpha) blend
-    /// does — Windows Terminal's and iTerm2's faint — not as the linear lerp,
-    /// which kept most of its contrast. PSReadLine draws its inline
-    /// prediction bright white and faint (`ESC[97;2;3m`): on Default it is
-    /// 4.5..5.5:1, at least 2.5:1 from typed text in colour 7, and a dark
-    /// theme's body text is within 3% of its alpha blend's contrast and
-    /// under 0.6 of the lerp's. Control: the lerp drew the ghost `#BCBCBC`,
-    /// under 1.6:1 from colour 7, so the suggestion read as typed.
+    /// Verify light faint ink on dark backgrounds recedes to the sRGB-blend target.
     #[test]
     fn faint_light_ink_recedes_as_an_alpha_blend() {
         let t = aterm_types::DIM_FACTOR;
@@ -1371,9 +1241,6 @@ mod dim_contrast_law {
     #[test]
     fn faint_keeps_its_reference_bytes() {
         let colors = lattice();
-        // The old floor's f32 cancellation could push this light-ink pair
-        // past a blue-channel quantizer boundary: it must land on the
-        // reference's bytes.
         let fg = Rgb {
             r: 109,
             g: 255,
@@ -1680,15 +1547,7 @@ mod tests {
         }
     }
 
-    /// On a coloured cell, text that must change polarity to be legible
-    /// takes the theme's own ink on the far side, not the first grey that
-    /// passes: Default's text on xterm's yellow and green, and on the
-    /// Windows palette's, is Default's background colour (10:1 or more),
-    /// Default Light's text on its blue is Default Light's background; with
-    /// no theme ink that clears the ratio, the pole. Text that keeps its
-    /// polarity and needs only a small nudge is nudged exactly as on the
-    /// page. Control: the page's smallest nudge leaves `#535353` on
-    /// `#CDCD00` (4.52:1) and `#3E3E3E` on `#00CD00`.
+    /// Verify colored-cell contrast flooring uses the theme's far-side ink on polarity flips and small nudges for same-polarity pairs.
     #[test]
     fn a_flip_on_a_coloured_cell_takes_the_theme_ink() {
         let (ink, page) = (Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18));
@@ -1758,15 +1617,7 @@ mod tests {
         }
     }
 
-    /// Default's light text on a cell lighter than itself — white, bright
-    /// white and the bright green, yellow and cyan — keeps its polarity, but
-    /// the nudge carries it halfway to black or further, to a mud grey
-    /// (`#535353` or `#686868`, 5.0 to 6.1:1). It takes Default's own dark
-    /// ink instead, as on a cell it must flip on, so one row of labels on
-    /// the palette is one ink, 10:1 or more. A nudge that keeps the text's
-    /// hue stays, however far it goes: red on bright yellow and green on
-    /// white are darker shades of themselves. Control: the page's smallest
-    /// nudge, the old rule on these cells, gives the greys.
+    /// Verify light text on a lighter colored cell takes the theme's dark ink when a nudge would desaturate to grey, while preserving saturated hues.
     #[test]
     fn a_halfway_nudge_on_a_coloured_cell_takes_the_theme_ink() {
         let (ink, page) = (Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18));
@@ -2029,25 +1880,7 @@ mod tests {
         (pal, scheme.foreground, scheme.background)
     }
 
-    /// Default Light draws white as dark text for its page (`#6B7280` and
-    /// `#474D57`), so a program's white on a colour was dark on dark. Under
-    /// the theme-pair floor it is the page colour wherever that reads better:
-    /// white and bright white on black (`ESC[37;40m`, `ESC[97;40m`) are
-    /// `#F6F7F9` at 12.8:1, where the floor's smallest nudge left the greys
-    /// `#979CA6` (5.00:1) and `#91949A` (4.53:1), and bright white on a
-    /// program's own 24-bit or 256-colour cell, which the floor leaves alone,
-    /// is `#F6F7F9` at 6.6:1, where it was `#474D57` at 1.2:1. The test-runner
-    /// badges (`97;41`, `97;42`, `97;44`, `37;41`, `1;37;41`; the first three
-    /// are also pwsh's `White` on `DarkRed`, `DarkGreen` and `DarkBlue`),
-    /// already the page colour under the floor, stay so, and black on green
-    /// (`30;42`, 2.71:1 to 4.74:1) is the floor's: black is no white. pwsh's
-    /// `White on Black` reaches the terminal as bright white on the page (the
-    /// console host sends `Black` as the default background) and keeps the
-    /// slate, 7.9:1. With the floor off every cell keeps the palette's
-    /// colours (the `97;41` FAIL badge at 1.49:1). The page, shapes, hidden
-    /// text and a one-slot fill keep the white. NEGATIVE CONTROL: without the
-    /// rule (`resolve_both_with::<false>`) the floored greys and the 1.2:1
-    /// slate come back.
+    /// Verify Default Light's dark white slots (7, 15) resolve to the page color on colored backgrounds when the theme-pair floor is active.
     #[test]
     #[allow(
         clippy::too_many_lines,

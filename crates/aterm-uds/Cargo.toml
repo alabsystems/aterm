@@ -11,10 +11,14 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 
 # Dependency-free on every platform (the Windows side is raw FFI) so the
 # whole transport stays auditable in one small crate, but for one first-party
-# declaration crate on Unix and aterm-sysprobe's readers: `KERN_PROCARGS2`'s
-# (`procargs`, re-exported) on Unix and Windows, and its path rule and process
-# reader on Windows.
+# declaration crate on Unix, aterm-vitals' pure types, and aterm-sysprobe's
+# readers: `KERN_PROCARGS2`'s (`procargs`, re-exported) on Unix and Windows,
+# and its path rule and process reader on Windows.
 [dependencies]
+# aterm-vitals: the program check's reading and verdict types
+# (`program_check`), which this crate's reader fills. A pure model crate with
+# no dependencies of its own.
+aterm-vitals = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 # aterm-sysprobe: `procargs`, the workspace's one `KERN_PROCARGS2` reader and

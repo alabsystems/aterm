@@ -23,7 +23,13 @@
 //! owes itself (`Client::owed_acks`) and refuses such a request, sending
 //! nothing, with its typed `AcksOwed` (`astream_broker::client::acks_owed`
 //! reads it back) — a refusal that leaves the connection in step, except for a
-//! subscribe, which consumes its client and so closes the connection.
+//! subscribe, which consumes its client and so closes the connection. So a
+//! request sent past an ack fails at once and writes nothing, where it used to
+//! go out and read the ack as its reply
+//! (`a_request_behind_an_owed_ack_fails_loudly_and_sends_nothing`), and the
+//! bridge counts reaching it at all as its own bug: its verdict on every answer
+//! names it, and a build with debug assertions stops there
+//! (`bridge::sent_past_an_owed_ack`).
 //!
 //! The SECOND is [`Link`], the rule as a type, which carries what the client's
 //! bare count cannot. It owns the client and the queue of unread acks, each
@@ -36,6 +42,16 @@
 //! refusal is ever reached. And the queue lives and dies with the connection —
 //! a dropped connection drops the acks owed on it, so they can never be read
 //! off the NEXT connection, which owes them nothing.
+//!
+//! THE GROUP COMMIT RIDES IT TOO, AND NOTHING HAS TO WAIT FOR AN ACK
+//! (aterm-0). astream answers a `Commit` through the same in-order ack stream
+//! as a publish (`Client::send_commit`), so the inbox group's commit is one
+//! more owed ack ([`Link::send_commit`]) rather than a request the loop parks
+//! on for a flush; and an owed ack can be read without waiting
+//! ([`Link::try_recv`], astream's frame-atomic `Client::try_recv_publish_ack`):
+//! the oldest answer if the broker has sent it, nothing if not, the
+//! connection in step either way. Where the bridge reads its acks — waiting
+//! only where a reply must be judged — is the bridge's (`Bridge::settle_owed`).
 //!
 //! WHAT IT DOES NOT PROMISE is that a refusal is sticky. The broker answers a
 //! connection's writes in order, but a write it refuses for a reason not known
@@ -143,20 +159,61 @@ impl<T> Link<T> {
     ) -> Result<(), (io::Error, T)> {
         match self.client.send_publish(producer_id, seq, subject, body) {
             Ok(()) => {
-                self.unacked.push_back(Unacked {
+                self.owe(Unacked {
                     seq,
                     first,
                     sent: now,
                     tag,
                     rider: None,
                 });
-                #[cfg(test)]
-                {
-                    self.peak = self.peak.max(self.unacked.len());
-                }
                 Ok(())
             }
             Err(e) => Err((e, tag)),
+        }
+    }
+
+    /// Write a consumer group's COMMIT to `upto` WITHOUT waiting for its ack
+    /// (astream's `Client::send_commit`), and queue `tag` for the answer.
+    ///
+    /// The broker answers a commit as it answers a publish — in this
+    /// connection's order, with a `PublishAck` naming the commit record's
+    /// offset — so it is owed like one and read like one ([`Link::recv`],
+    /// [`Link::try_recv`]), and a request that reads its own reply is held
+    /// behind it ([`Link::ready`]). Its `seq` is 0 and it is never a `first`
+    /// send: a commit has no producer sequence, and its answer is never a
+    /// dedup. A commit that could not be written gives `tag` back, as
+    /// [`Link::send`] does.
+    ///
+    /// # Errors
+    ///
+    /// The send's, with the tag.
+    pub fn send_commit(
+        &mut self,
+        group: &str,
+        upto: u64,
+        tag: T,
+        now: Instant,
+    ) -> Result<(), (io::Error, T)> {
+        match self.client.send_commit(group, upto) {
+            Ok(()) => {
+                self.owe(Unacked {
+                    seq: 0,
+                    first: false,
+                    sent: now,
+                    tag,
+                    rider: None,
+                });
+                Ok(())
+            }
+            Err(e) => Err((e, tag)),
+        }
+    }
+
+    fn owe(&mut self, owed: Unacked<T>) {
+        self.unacked.push_back(owed);
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.unacked.len());
         }
     }
 
@@ -168,6 +225,32 @@ impl<T> Link<T> {
     pub fn recv(&mut self) -> Option<Settled<T>> {
         let owed = self.unacked.pop_front()?;
         let answer = self.client.recv_publish_ack();
+        Some((owed, answer))
+    }
+
+    /// [`Link::recv`] WITHOUT WAITING: the oldest owed ack if the broker has
+    /// answered it already, and `None` when nothing is owed or its answer has
+    /// not arrived — astream's `Client::try_recv_publish_ack`, which keeps a
+    /// frame that only partly arrived for the next read (a try's or a blocking
+    /// one's), so a `None` leaves the connection in step owing what it owed.
+    /// A refusal or a transport failure is answered as [`Link::recv`] answers
+    /// it, with the publish it belongs to.
+    ///
+    /// What makes the read not wait is astream's: a live connection's socket
+    /// is put in non-blocking mode for the read and back after it. A stream
+    /// handed to `Client::from_stream` — the simulated bus's — reads as the
+    /// stream reads, which is how the simulation answers "not yet"
+    /// (`crate::fx::Fx::unwaited`).
+    pub fn try_recv(&mut self) -> Option<Settled<T>> {
+        if self.unacked.is_empty() {
+            return None;
+        }
+        let answer = match self.client.try_recv_publish_ack() {
+            Ok(None) => return None,
+            Ok(Some(ack)) => Ok(ack),
+            Err(e) => Err(e),
+        };
+        let owed = self.unacked.pop_front()?;
         Some((owed, answer))
     }
 
@@ -337,6 +420,158 @@ mod tests {
             .fetch(0, "/f/f/x/*", 64)
             .expect("a second client agrees");
         assert_eq!(rows.len(), 9);
+    }
+
+    /// **A REQUEST BEHIND AN OWED ACK FAILS LOUDLY, AND SENDS NOTHING** — the
+    /// FIRST guard (the module doc), astream's own, reached the one way nothing
+    /// in this crate can: past [`Link::ready`], straight to the client. A
+    /// `Fetch` and a `Commit` written behind a pipelined publish's unread ack
+    /// once read that ack as their own reply (a fetch that failed on a reply of
+    /// the wrong kind and latched the client, a commit that answered the
+    /// publish's offset); now each is refused with astream's typed `AcksOwed`,
+    /// naming the one ack owed, and NOTHING is written: the ack read next is
+    /// the publish's own, and the blocking
+    /// publish after it is answered in step, one offset on — a fetch that had
+    /// gone out would have left its rows on the stream for that publish to
+    /// read, and the client would have latched.
+    ///
+    /// Negative control: the same fetch with nothing owed is answered, rows
+    /// and all — the refusal was the owed ack's, never the request's.
+    #[test]
+    fn a_request_behind_an_owed_ack_fails_loudly_and_sends_nothing() {
+        let (_dir, _server, mut link, _reader) = served();
+        link.send(7, 1, true, "/f/f/owed/a", b"a", 0, Instant::now())
+            .map_err(|(e, _)| e)
+            .expect("A written");
+        assert!(link.ready().is_none(), "the second guard holds the client");
+        // Past the second guard, as only this module can reach.
+        let fetched = link
+            .client
+            .fetch(0, "/f/f/owed/*", 64)
+            .expect_err("a fetch behind an owed ack is refused, never answered");
+        assert_eq!(
+            astream_broker::acks_owed(&fetched),
+            Some(&astream_broker::AcksOwed { owed: 1 }),
+            "astream's typed refusal, naming the ack owed: {fetched}"
+        );
+        assert_eq!(fetched.kind(), io::ErrorKind::ResourceBusy);
+        let committed = link
+            .client
+            .commit("/f/f/owed/g", 0)
+            .expect_err("a commit behind an owed ack is refused");
+        assert!(
+            astream_broker::acks_owed(&committed).is_some(),
+            "{committed}"
+        );
+
+        let (owed, answer) = link.recv().expect("A's ack is still owed");
+        let (a_at, deduped) = answer.expect("A's own ack, not a fetch's rows");
+        assert_eq!((owed.tag, deduped), (0, false));
+        let conn = link.ready().expect("nothing owed");
+        let (b_at, _) = conn
+            .publish(7, 2, "/f/f/owed/b", b"b")
+            .expect("in step: nothing the refusals wrote is on the stream");
+        assert_eq!(b_at, a_at + 1);
+        let (rows, _) = conn
+            .fetch(0, "/f/f/owed/*", 64)
+            .expect("NEGATIVE CONTROL: the same fetch, nothing owed, is answered");
+        assert_eq!(
+            rows.iter().map(|(off, _, _)| *off).collect::<Vec<_>>(),
+            [a_at, b_at]
+        );
+    }
+
+    /// **A PIPELINED COMMIT IS OWED LIKE A PUBLISH, IN ORDER, AND A TRY WAITS
+    /// FOR NOTHING** — on a real broker. A commit of the group past record A is
+    /// sent without waiting, the writer is held before it answers that batch
+    /// (`pause_next_acks`, a rendezvous, never a race), and B is published
+    /// behind it: both are owed, the client is handed out for nothing, and a
+    /// try finds the commit's answer not yet there and leaves both owed. Once
+    /// the batch goes on, the acks come back in send order, each with its own
+    /// tag — the commit's offset between A's and B's — and the group the
+    /// commit moved hands a fresh subscriber B, never A.
+    ///
+    /// NEGATIVE CONTROLS: a group nobody committed hands over A first (the
+    /// group's read is what says the commit landed); and the BLOCKING commit,
+    /// sent behind an owed publish straight to the client, is refused with
+    /// astream's `AcksOwed` and sends nothing — only the pipelined verb can
+    /// ride behind an unread ack.
+    #[test]
+    fn a_pipelined_commit_is_owed_in_order_and_a_try_waits_for_nothing() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-p")
+            .tempdir_in("/tmp")
+            .expect("a scratch dir");
+        let socket = dir.path().join("b.sock");
+        let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
+        let _server = broker.serve(&socket).expect("serve");
+        let dial = || {
+            crate::transport::connect(
+                &socket.to_string_lossy(),
+                std::time::Duration::from_secs(60),
+            )
+            .expect("dial")
+            .0
+        };
+        let mut link: Link<&str> = Link::from(dial());
+        let (group, filter) = ("/f/f/cur/n/node/inbox", "/f/f/c/*");
+
+        link.send(7, 1, true, "/f/f/c/a", b"a", "a", Instant::now())
+            .map_err(|(e, _)| e)
+            .expect("A written");
+        let (owed, answer) = link.recv().expect("A's ack");
+        let (a_at, _) = answer.expect("A landed");
+        assert_eq!(owed.tag, "a");
+
+        let held = broker.pause_next_acks();
+        link.send_commit(group, a_at, "commit", Instant::now())
+            .map_err(|(e, _)| e)
+            .expect("the commit written");
+        assert!(held.wait(), "the commit's batch is held unanswered");
+        link.send(7, 2, true, "/f/f/c/b", b"b", "b", Instant::now())
+            .map_err(|(e, _)| e)
+            .expect("B written behind the commit");
+        assert_eq!(link.unacked(), 2);
+        assert!(link.ready().is_none(), "nothing reads past an owed commit");
+        let blocking = link
+            .client
+            .commit(group, a_at)
+            .expect_err("NEGATIVE CONTROL: the blocking commit behind owed acks");
+        assert!(
+            astream_broker::acks_owed(&blocking).is_some(),
+            "refused, nothing sent: {blocking}"
+        );
+        assert!(
+            link.try_recv().is_none(),
+            "the commit's answer is held: a try does not wait for it"
+        );
+        assert_eq!(link.unacked(), 2, "a try that found nothing pays nothing");
+        held.resume();
+
+        let (owed, answer) = link.recv().expect("the commit's ack is owed first");
+        assert_eq!(owed.tag, "commit");
+        assert_eq!((owed.seq, owed.first), (0, false));
+        let (commit_at, deduped) = answer.expect("the commit landed");
+        assert!(!deduped);
+        let (owed, answer) = link.recv().expect("B's ack after it");
+        assert_eq!(owed.tag, "b");
+        let (b_at, _) = answer.expect("B landed");
+        assert!(
+            a_at < commit_at && commit_at < b_at,
+            "in send order: A @{a_at}, the commit @{commit_at}, B @{b_at}"
+        );
+        assert!(link.try_recv().is_none(), "nothing owed: nothing tried");
+
+        let first = |group: &str| {
+            let mut sub = dial().subscribe_group(group, filter).expect("subscribe");
+            sub.recv().expect("a delivery").expect("not the end").0
+        };
+        assert_eq!(first(group), b_at, "the commit moved the group past A");
+        assert_eq!(
+            first("/f/f/cur/m/node/inbox"),
+            a_at,
+            "NEGATIVE CONTROL: a group nobody committed starts at A"
+        );
     }
 
     /// **A RIDER COMES BACK WITH THE ACK IT WAS HUNG ON, AND ONLY THEN.** It

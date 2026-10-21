@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding for sing-along activation thresholds.
+//! Conformance binding for sing-along activation thresholds.
 //!
-//! The derived models exhaust the bounded detector/count spaces. These tests
-//! drive the shipping state machines with injected clocks, project the
-//! post-state at every abstract boundary, and validate representative traces in
-//! both the embedded interpreter and external `ty` when it is installed.
+//! Drives the shipping state machines with injected clocks, projects the post-state at every
+//! abstract boundary of the derived models, and validates representative traces in the embedded
+//! interpreter and, when installed, external `ty`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -60,9 +59,8 @@ fn sing_projection(detector: &KittySing, now: Instant, abstract_count: u32) -> S
     };
     BTreeMap::from([
         ("phase", phase),
-        // The run is semantically consumed once the celebration arms or winds
-        // down. `abstract_count` is derived from the real committed presses,
-        // while the public lifecycle observations choose the phase.
+        // The run is consumed once the celebration arms or winds down. `abstract_count` comes
+        // from the real committed presses; the public lifecycle observations choose the phase.
         (
             "count",
             if phase == 2 {
@@ -168,13 +166,10 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
             );
             assert!(detector.is_armed(at));
             assert_eq!(detector.drive(at), 1.0, "the arm is at full drive at once");
-            // Negative control, at the projection: no shipping function ramps
-            // the drive in, so this is the real sixteenth-press projection with
-            // the one field a ramped-in arm changes. The projection reads
-            // `is_armed` and `drive` independently, so such an arm would
-            // project to exactly this state: the healthy `Repeat` refuses it,
-            // `ArmedRunIsAtFullDrive` names the defect, and it is the `Buggy=1`
-            // successor of the same run once the ramped arm was picked.
+            // Negative control at the projection: no shipping function ramps the drive in, so
+            // this is the real sixteenth-press state with the one field a ramped-in arm changes.
+            // The healthy `Repeat` refuses it, `ArmedRunIsAtFullDrive` names the defect, and it
+            // is the `Buggy=1` successor once the ramped arm is picked.
             let mut silent = post.clone();
             silent.insert("drive_live", 0);
             let (healthy_ok, _) = verify::validate_transition_tiered(

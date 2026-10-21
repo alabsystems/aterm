@@ -83,8 +83,8 @@ impl Lane {
             self.complete(&mut guard, build, source);
             return;
         }
-        // Another checker holds the lane: wait for it, then join its answer if
-        // it completed this request's source/build, or run the check ourselves.
+        // Another checker holds the lane: wait, then join its answer if it completed
+        // this request's source and build, else check.
         let mut guard = self
             .state
             .lock()
@@ -107,8 +107,8 @@ impl Lane {
     }
 }
 
-/// Both guards are retired before the scheduler can sleep. The callback is also
-/// omitted for the documented interval=0 single-check mode.
+/// Drops both guards before the scheduler sleeps; `interval == 0` (single-check mode)
+/// does not wait.
 pub(crate) fn after_skip<G, L>(gate: G, lane: L, interval: u64, wait: impl FnOnce()) {
     drop(gate);
     drop(lane);
@@ -203,7 +203,7 @@ mod tests {
         let mut historical = model.init_state();
         historical.insert("poisoned", 1);
         historical.insert("recovered", 1);
-        // Former code took and dropped the guard without clearing poison.
+        // Negative control: taking and dropping the guard leaves the poison.
         let Err(TryLockError::Poisoned(poisoned)) = lane.state.try_lock() else {
             panic!("expected the historical poisoned-lock arm");
         };
@@ -211,7 +211,7 @@ mod tests {
         assert!(lane.state.is_poisoned());
         assert!(!model.check_invariant("RecoveryClearsPoison", &historical));
 
-        // This is precisely the periodic loop's entry, not a test-only repair.
+        // The periodic loop's own entry, not a test-only repair.
         let mut guard = lane
             .try_lock()
             .expect("periodic check can acquire immediately");
@@ -264,12 +264,9 @@ mod tests {
         after_skip(gate, guard, 30, || {
             waited = true;
             let lane_free = lane.try_lock().is_some();
-            // SAMPLED ONCE. `after_skip` has dropped `gate`, and a dropped
-            // `FileLock` is free at once (`LOCK_UN`, 2026-09-24) even while a
-            // sibling test's fork still holds a copy of its descriptor — so the
-            // five-second poll this used to need to wait out that window is gone,
-            // and one `WouldBlock` here means the lock really is held across the
-            // sleep.
+            // Sampled once: a dropped `FileLock` is free at once (`LOCK_UN`) even while a
+            // sibling test's fork holds a copy of its descriptor, so `WouldBlock` here
+            // means the lock is held across the sleep.
             let file_free =
                 aterm_update_core::FileLock::acquire_within(&file_path, std::time::Duration::ZERO)
                     .is_ok();

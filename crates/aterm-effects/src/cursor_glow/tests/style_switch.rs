@@ -243,3 +243,47 @@ fn a_pooled_bolt_jag_is_deterministic_across_strikes() {
         );
     }
 }
+
+/// Switching through an idle or v2-owned style with no v1 residue must not
+/// evict an earlier live outgoing fade from `fading`.
+#[test]
+fn empty_outgoing_style_does_not_evict_live_fades() {
+    let g = geom();
+    let t0 = Instant::now();
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let mut t = t0;
+
+    // 1. Forge live light under Laser.
+    let laser = cfg(GlowStyle::Laser, true);
+    glow.tick(Some((2, 0)), t, &laser, g, &mut out);
+    t += Duration::from_millis(20);
+    glow.note_synthetic_typed(t, 1);
+    glow.tick(Some((2, 1)), t, &laser, g, &mut out);
+
+    // 2. Switch to Sparkle and forge live light there too -> 1 fade (Laser).
+    let sparkle = cfg(GlowStyle::Sparkle, true);
+    t += Duration::from_millis(20);
+    glow.note_synthetic_typed(t, 1);
+    glow.tick(Some((2, 2)), t, &sparkle, g, &mut out);
+    assert_eq!(glow.fading.len(), 1);
+
+    // 3. Switch to RainbowKitty (both Laser and Sparkle are now in `fading`, len == 2 == FADE_CAP).
+    let rk_cfg = cfg(GlowStyle::RainbowKitty, true);
+    t += Duration::from_millis(20);
+    glow.tick(Some((2, 2)), t, &rk_cfg, g, &mut out);
+    assert_eq!(glow.fading.len(), 2);
+
+    // 4. Switch from RainbowKitty (which has no v1 residue) to Comet: neither
+    // the Laser fade nor the Sparkle fade may be evicted.
+    let comet = cfg(GlowStyle::Comet, true);
+    t += Duration::from_millis(20);
+    glow.tick(Some((2, 2)), t, &comet, g, &mut out);
+    assert_eq!(
+        glow.fading.len(),
+        2,
+        "switching away from an empty outgoing style must not evict live fades"
+    );
+    assert_eq!(glow.fading[0].cfg.style, GlowStyle::Laser);
+    assert_eq!(glow.fading[1].cfg.style, GlowStyle::Sparkle);
+}

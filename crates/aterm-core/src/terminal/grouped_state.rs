@@ -350,7 +350,7 @@ pub(super) struct ShellIntegrationState {
     /// by a checkpoint (`ShellRepr::held_cwd`).
     pub(super) held_cwd: Option<super::shell::CwdReport>,
     /// The shell signs its own cwd report (`633;P;AtermCwd=<uri>;id=<nonce>`
-    /// before its OSC 7, which every integration sends since 2026-10-19): one
+    /// before its OSC 7): one
     /// verified. A report no one signed while it sits at its prompt is then
     /// never its own, so it is dropped rather than held for its `A`. Kept across `reset()` (RIS does
     /// not change the shell's script); carried (`ShellRepr::signs_cwd`).

@@ -5,36 +5,33 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // LOCAL PATCH (aterm), 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
-// custom cursors are API no aterm crate uses. The macOS backend no longer implements them, so
-// everything here but `Cursor` and its `Icon` variant is `#[cfg(not(macos_platform))]`; the
-// Windows and Linux carves delete the rest with their halves.
+// custom cursors are API no aterm crate uses. The macOS backend no longer implements them, nor
+// (2026-10-21, WC.8) the Linux module, so everything here but `Cursor` and its `Icon` variant is
+// `#[cfg(windows_platform)]`; the Windows carve deletes the rest with its half. The
+// `OnlyCursorImage` handle the Wayland backend alone kept a cursor image in left with WC.8.
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 use core::fmt;
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 use std::error::Error;
-#[cfg(not(macos_platform))]
-use std::hash::{Hash, Hasher};
-#[cfg(not(macos_platform))]
-use std::sync::Arc;
 
 use crate::cursor_icon::CursorIcon;
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 use crate::platform_impl::{PlatformCustomCursor, PlatformCustomCursorSource};
 
 /// The maximum width and height for a cursor when using [`CustomCursor::from_rgba`].
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 pub const MAX_CURSOR_SIZE: u16 = 2048;
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 const PIXEL_SIZE: usize = 4;
 
 /// See [`Window::set_cursor()`][crate::window::Window::set_cursor] for more details.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Cursor {
     Icon(CursorIcon),
-    #[cfg(not(macos_platform))]
+    #[cfg(windows_platform)]
     Custom(CustomCursor),
 }
 
@@ -50,7 +47,7 @@ impl From<CursorIcon> for Cursor {
     }
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl From<CustomCursor> for Cursor {
     fn from(custom: CustomCursor) -> Self {
         Self::Custom(custom)
@@ -91,14 +88,14 @@ impl From<CustomCursor> for Cursor {
 /// window.set_cursor(custom_cursor.clone());
 /// # }
 /// ```
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CustomCursor {
     /// Platforms should make sure this is cheap to clone.
     pub(crate) inner: PlatformCustomCursor,
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl CustomCursor {
     /// Creates a new cursor from an rgba buffer.
     ///
@@ -134,14 +131,14 @@ impl CustomCursor {
 /// Source for [`CustomCursor`].
 ///
 /// See [`CustomCursor`] for more details.
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Debug)]
 pub struct CustomCursorSource {
     pub(crate) inner: PlatformCustomCursorSource,
 }
 
 /// An error produced when using [`CustomCursor::from_rgba`] with invalid arguments.
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Debug, Clone)]
 pub enum BadImage {
     /// Produced when the image dimensions are larger than [`MAX_CURSOR_SIZE`]. This doesn't
@@ -158,7 +155,7 @@ pub enum BadImage {
     HotspotOutOfBounds { width: u16, height: u16, hotspot_x: u16, hotspot_y: u16 },
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl fmt::Display for BadImage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -189,17 +186,17 @@ impl fmt::Display for BadImage {
     }
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl Error for BadImage {}
 
 /// Platforms export this directly as `PlatformCustomCursorSource` if they need to only work with
 /// images.
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct OnlyCursorImageSource(pub(crate) CursorImage);
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[allow(dead_code)]
 impl OnlyCursorImageSource {
     pub(crate) fn from_rgba(
@@ -213,30 +210,7 @@ impl OnlyCursorImageSource {
     }
 }
 
-/// Platforms export this directly as `PlatformCustomCursor` if they don't implement caching.
-#[cfg(not(macos_platform))]
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct OnlyCursorImage(pub(crate) Arc<CursorImage>);
-
-#[cfg(not(macos_platform))]
-impl Hash for OnlyCursorImage {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state);
-    }
-}
-
-#[cfg(not(macos_platform))]
-impl PartialEq for OnlyCursorImage {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-#[cfg(not(macos_platform))]
-impl Eq for OnlyCursorImage {}
-
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct CursorImage {
@@ -247,7 +221,7 @@ pub(crate) struct CursorImage {
     pub(crate) hotspot_y: u16,
 }
 
-#[cfg(not(macos_platform))]
+#[cfg(windows_platform)]
 impl CursorImage {
     pub(crate) fn from_rgba(
         rgba: Vec<u8>,

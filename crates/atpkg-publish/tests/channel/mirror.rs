@@ -1,11 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The MIRROR over a fake channel: skip a complete public pack with no staging read; check and create an absent one with
-//! exactly its signed set (extras refused, lookalike names as data); upload only what is
-//! missing, never replacing; a published pack is immutable; a one-shot HTTP 500 is
-//! retried; the work list is the union of `pin` and every overlay; an unreachable download
-//! host is never read as "absent".
+//! The mirror over a fake channel: a complete public pack is skipped with no staging read; an
+//! absent one is checked and created with exactly its signed set (extras refused, lookalike
+//! names read as data); only what is missing is uploaded, never replacing; a published pack is
+//! immutable; a one-shot HTTP 500 is retried; the work list is the union of `pin` and every
+//! overlay; an unreachable download host is never read as "absent".
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

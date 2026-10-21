@@ -337,6 +337,44 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         identity: "EMPTYING",
         def_file: "crates/aterm-gui/src/agent_identity.rs",
     },
+    GuardHelper {
+        // The secrets server's vaults and join queues (`Shared.server_state`). Named for
+        // its own lock: as a bare `lock()` on `shared` it took the identity `shared`, the
+        // harness host's and the retire worker's, and a by-name hop into the server's
+        // `stop` closed a cycle no thread can run.
+        symbol: "lock_server_state",
+        identity: "server_state",
+        def_file: "crates/aterm-secrets/src/server.rs",
+    },
+    GuardHelper {
+        // The secrets server's open connections by address (`Shared.peers`). Named
+        // `lock_peers` because a bare `peers(` is the fleet's verb (aterm-agent).
+        symbol: "lock_peers",
+        identity: "peers",
+        def_file: "crates/aterm-secrets/src/server.rs",
+    },
+    GuardHelper {
+        // The secrets server's PUT bodies being read (`Shared.puts`). Named
+        // `lock_puts` because a bare `puts(` is C's and aterm-lab's.
+        symbol: "lock_puts",
+        identity: "puts",
+        def_file: "crates/aterm-secrets/src/server.rs",
+    },
+    GuardHelper {
+        // The secrets server's join-request write lock (`Shared.join_writes`), taken
+        // before `state` and held across the store's write.
+        symbol: "join_writes",
+        identity: "join_writes",
+        def_file: "crates/aterm-secrets/src/server.rs",
+    },
+    GuardHelper {
+        // The Codex rollout tap's claim+copy gate (`self_claim::hold_rollout`):
+        // its body acquires `meta` then `COPIES` (`meta -> COPIES`), and its
+        // callers hold both across a bounded `timeline` hold (`COPIES -> timeline`).
+        symbol: "hold_rollout",
+        identity: "COPIES",
+        def_file: "crates/aterm-gui/src/self_claim.rs",
+    },
 ];
 
 /// A fn that implements a standard acquisition method by delegating to the
@@ -3009,220 +3047,79 @@ mod tests {
     use super::*;
     use crate::scan_set::test_fixtures::synth_tree;
 
-    /// Crates a synthetic tree must contain beyond the base fixture (aterm-gui
-    /// and aterm-types) because a `GUARD_HELPERS` entry is registered in them:
-    /// the registry's interior check reads the scanned corpus. Every synthetic
-    /// tree composing its own manifest set must splice these in.
-    const SYNTH_HELPER_CRATES: &[(&str, &str)] =
-        &[("aterm-log", ""), ("atpkg", ""), ("aterm-restore", "")];
-
-    /// Every registered helper and vocabulary interior at its `def_file`, its
-    /// acquisition spelled as the shipping one is, so the registry checks hold.
-    fn synth_helper_files() -> Vec<(String, String)> {
-        let mut files = crate::scan_set::test_fixtures::workspace_manifests(SYNTH_HELPER_CRATES);
-        files.push((
-            // term_lock's registered def_file; must match GUARD_HELPERS above.
-            "crates/aterm-gui/src/lib.rs".to_string(),
-            // `term_lock_ui` shares the file and the `term` identity: its interior
-            // acquires through `term_lock(term)`, exactly as the shipping helper does.
-            "pub(crate) fn term_lock(term: &Mutex<Terminal>) -> TermGuard<'_> {\n    \
-             term.lock().unwrap()\n}\n\
-             pub(crate) fn term_lock_ui(term: &Mutex<Terminal>, w: &AtomicU32) -> TermGuard<'_> {\n    \
-             term_lock(term)\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/consent_retire.rs".to_string(),
-            "impl RetireState {\n    \
-             fn retire_slot(&self) -> std::sync::MutexGuard<'_, Slot> {\n        \
-             self.shared.lock().unwrap_or_else(|p| p.into_inner())\n    \
-             }\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/tray_raster.rs".to_string(),
-            "fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {\n    \
-             chrome_fonts().lock().unwrap()\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/harness_host.rs".to_string(),
-            "fn disk_episode(board: &Shelf) -> EpisodeGuard<'_> {\n    \
-             EpisodeGuard(board.board_lock())\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/disk_board.rs".to_string(),
-            "impl Shelf {\n    \
-             pub(crate) fn board_lock(&self) -> MutexGuard<'_, Board> {\n        \
-             self.board.lock().unwrap_or_else(PoisonError::into_inner)\n    \
-             }\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/keeper_link.rs".to_string(),
-            "fn keeper_state() -> std::sync::MutexGuard<'static, State> {\n    \
-             KEEPER_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/fabric_launch.rs".to_string(),
-            "fn supervisor() -> std::sync::MutexGuard<'static, Supervisor> {\n    \
-             SUPERVISOR.lock().unwrap_or_else(|p| p.into_inner())\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-log/src/lib.rs".to_string(),
-            "fn env_lock() -> MutexGuard<'static, ()> {\n    \
-             ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/connections.rs".to_string(),
-            "impl ConnectionTable {\n    \
-             pub(crate) fn records(&self) -> MutexGuard<'_, Records> {\n        \
-             self.records.lock().unwrap_or_else(|p| p.into_inner())\n    }\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/atpkg/src/meter.rs".to_string(),
-            "fn screen_lock() -> std::sync::MutexGuard<'static, Screen> {\n    \
-             SCREEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-gui/src/askpass.rs".to_string(),
-            "impl PromptInputGate {\n    \
-             pub(crate) fn posting_permit(&self) -> Result<std::sync::MutexGuard<'_, ()>, ()> {\n        \
-             let posting = self.posting.lock().unwrap_or_else(|e| e.into_inner());\n        \
-             if self.is_open() { Err(()) } else { Ok(posting) }\n    \
-             }\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            // `identity_holds` and `emptying` share the file, as they do in
-            // the shipping agent_identity.rs.
-            "crates/aterm-gui/src/agent_identity.rs".to_string(),
-            "fn identity_holds() -> std::sync::MutexGuard<'static, HoldsByDir> {\n    \
-             HOLDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n\
-             fn emptying() -> std::sync::MutexGuard<'static, BTreeSet<PathBuf>> {\n    \
-             EMPTYING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-restore/src/store.rs".to_string(),
-            "impl VecStore {\n    \
-             fn lock_bytes(&self) -> MutexGuard<'_, Vec<u8>> {\n        \
-             self.bytes.lock().unwrap_or_else(PoisonError::into_inner)\n    }\n}\n"
-                .to_string(),
-        ));
-        files.push((
-            "crates/aterm-types/src/mutex_ext.rs".to_string(),
-            "impl<T> MutexExt<T> for Mutex<T> {\n    \
-             fn lock_or_recover(&self) -> MutexGuard<'_, T> {\n        \
-             match self.lock() {\n            Ok(guard) => guard,\n            \
-             Err(poisoned) => poisoned.into_inner(),\n        }\n    }\n}\n"
-                .to_string(),
-        ));
-        files
+    /// The crate a registered `def_file` lives in (`crates/<name>/…`), the only
+    /// layout the synthetic workspace models.
+    fn def_crate(def_file: &'static str) -> &'static str {
+        def_file
+            .strip_prefix("crates/")
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or_else(|| {
+                panic!("{def_file}: the synthetic workspace models crates/<name>/ only")
+            })
     }
 
-    /// Every GUARD_HELPERS / VOCABULARY_INTERIORS entry is defined in
-    /// [`synth_helper_files`] at its `def_file`, in a crate the synthetic scan
-    /// set reaches. Otherwise every synthetic tree fails on the real registry
-    /// and the whole self-test suite goes red for an unrelated reason.
-    #[test]
-    fn every_registry_entry_is_mirrored_in_the_synthetic_fixture() {
-        let files = synth_helper_files();
-        let find =
-            |rel: &str| -> Option<&String> { files.iter().find(|(p, _)| p == rel).map(|(_, c)| c) };
-        // The crates the synthetic workspace derives: the base fixture's two
-        // plus whatever SYNTH_HELPER_CRATES splices in.
-        let scanned_crate = |def_file: &str| -> bool {
-            let krate = def_file
-                .strip_prefix("crates/")
-                .and_then(|rest| rest.split('/').next());
-            krate.is_some_and(|k| {
-                k == "aterm-gui"
-                    || k == "aterm-types"
-                    || SYNTH_HELPER_CRATES.iter().any(|(name, _)| *name == k)
-            })
-        };
-        // A standard acquisition of the identity, or a call of another helper
-        // registered with it, which the census counts as a direct acquisition
-        // (`acquisitions_on`; a `fn <symbol>(` is the definition, not a call).
-        let acquires = |contents: &str, symbol: &str, identity: &str| -> bool {
-            STANDARD_METHOD_NAMES.iter().any(|m| {
-                contents.contains(&format!("{identity}.{m}("))
-                    || contents.contains(&format!("{identity}().{m}("))
-            }) || GUARD_HELPERS
-                .iter()
-                .filter(|o| o.symbol != symbol && o.identity == identity)
-                .any(|o| {
-                    contents
-                        .match_indices(&format!("{}(", o.symbol))
-                        .any(|(at, _)| !contents[..at].trim_end().ends_with("fn"))
-                })
-        };
+    /// Every registered `def_file`, helpers and vocabulary interiors alike.
+    fn registered_def_files() -> impl Iterator<Item = &'static str> {
+        GUARD_HELPERS
+            .iter()
+            .map(|h| h.def_file)
+            .chain(VOCABULARY_INTERIORS.iter().map(|v| v.def_file))
+    }
+
+    /// Crates a synthetic tree must contain beyond the base fixture (aterm-gui
+    /// and aterm-types), read off the registry: the registry's checks read the
+    /// scanned corpus, so every crate holding a `def_file` must be scanned.
+    /// Every synthetic tree composing its own manifest set must splice these in.
+    fn synth_helper_crates() -> Vec<(&'static str, &'static str)> {
+        let mut crates: Vec<(&'static str, &'static str)> = Vec::new();
+        for krate in registered_def_files().map(def_crate) {
+            if krate != "aterm-gui"
+                && krate != "aterm-types"
+                && crates.iter().all(|(name, _)| *name != krate)
+            {
+                crates.push((krate, ""));
+            }
+        }
+        crates
+    }
+
+    /// The registry, written out as the scanned corpus its checks expect:
+    /// every [`GUARD_HELPERS`] entry defined at its `def_file`, acquiring its
+    /// identity and returning the guard, and every [`VOCABULARY_INTERIORS`]
+    /// entry with its bare-`self` acquisition. Derived from the registry, so a
+    /// new entry needs no fixture edit.
+    fn synth_helper_files() -> Vec<(String, String)> {
+        let mut files = crate::scan_set::test_fixtures::workspace_manifests(&synth_helper_crates());
+        let mut sources: Vec<(String, String)> = Vec::new();
+        let mut define =
+            |def_file: &str, item: String| match sources.iter_mut().find(|(p, _)| p == def_file) {
+                Some((_, text)) => text.push_str(&item),
+                None => sources.push((def_file.to_string(), item)),
+            };
         for h in GUARD_HELPERS {
-            assert!(
-                scanned_crate(h.def_file),
-                "GUARD_HELPERS entry `{}` is registered in {}, a crate the synthetic \
-                 workspace never scans — add its crate to SYNTH_HELPER_CRATES (the OB-7 \
-                 interior check reads the SCANNED corpus)",
-                h.symbol,
-                h.def_file
-            );
-            let contents = find(h.def_file).unwrap_or_else(|| {
-                panic!(
-                    "GUARD_HELPERS entry `{}` has no fixture file at its registered \
-                     def_file {} — add it to synth_helper_files() (one fixture entry per \
-                     def_file; helpers sharing a file share its contents), or every \
-                     synthetic tree fails OB-7 as a STALE registration",
-                    h.symbol, h.def_file
-                )
-            });
-            assert!(
-                contents.contains(&format!("fn {}(", h.symbol)),
-                "the fixture at {} does not define `fn {}` — the registry's forward \
-                 fail-closed check reds every synthetic tree until it does",
+            define(
                 h.def_file,
-                h.symbol
-            );
-            assert!(
-                acquires(contents, h.symbol, h.identity),
-                "the fixture at {} defines `fn {}` but its body never acquires the \
-                 registered identity `{}` — the registry's interior check reads the \
-                 SCANNED corpus, so the mirror must acquire what the shipping helper does",
-                h.def_file,
-                h.symbol,
-                h.identity
+                format!(
+                    "fn {}() -> std::sync::MutexGuard<'static, ()> {{\n    \
+                     {}.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}}\n",
+                    h.symbol, h.identity
+                ),
             );
         }
         for v in VOCABULARY_INTERIORS {
-            assert!(
-                scanned_crate(v.def_file),
-                "VOCABULARY_INTERIORS entry `{}` is registered in {}, a crate the \
-                 synthetic workspace never scans — add its crate to SYNTH_HELPER_CRATES",
-                v.symbol,
-                v.def_file
-            );
-            let contents = find(v.def_file).unwrap_or_else(|| {
-                panic!(
-                    "VOCABULARY_INTERIORS entry `{}` has no fixture file at its registered \
-                     def_file {} — add it to synth_helper_files()",
-                    v.symbol, v.def_file
-                )
-            });
-            assert!(
-                contents.contains(&format!("fn {}(", v.symbol))
-                    && acquires(contents, v.symbol, "self"),
-                "the fixture at {} must define `fn {}` WITH its bare-`self` acquisition — \
-                 both halves of the interior registry are fail-closed",
+            define(
                 v.def_file,
-                v.symbol
+                format!(
+                    "impl<T> MutexExt<T> for Mutex<T> {{\n    \
+                     fn {}(&self) -> MutexGuard<'_, T> {{\n        \
+                     match self.lock() {{\n            Ok(guard) => guard,\n            \
+                     Err(poisoned) => poisoned.into_inner(),\n        }}\n    }}\n}}\n",
+                    v.symbol
+                ),
             );
         }
+        files.extend(sources);
+        files
     }
 
     /// Replace one synthetic file's contents (by exact repo-relative path).
@@ -4915,7 +4812,7 @@ mod tests {
         let newdep = ("aterm-newdep", "[dependencies]\n");
         // (a) The new crate's sites are counted and its identities resolved.
         let extras: Vec<(&str, &str)> = std::iter::once(newdep)
-            .chain(SYNTH_HELPER_CRATES.iter().copied())
+            .chain(synth_helper_crates())
             .collect();
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(&extras);
         files.extend(synth_helper_files().into_iter().filter(|(p, _)| {
@@ -4931,7 +4828,7 @@ mod tests {
         let out = run_lock_order_census(&root);
         assert!(out.ok, "GREEN expected:\n{}", out.log);
         // aterm-gui and aterm-types, the new dependency, and every helper crate.
-        let crates = 3 + SYNTH_HELPER_CRATES.len();
+        let crates = 3 + synth_helper_crates().len();
         assert!(
             out.log
                 .contains(&format!("across {crates} workspace crate(s)"))

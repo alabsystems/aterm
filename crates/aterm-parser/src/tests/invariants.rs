@@ -8,16 +8,14 @@
 use super::super::*;
 
 /// Representative states at every bound the invariant names: each of the 14
-/// states, a full parameter list, a saturated parameter, a subparameter, a
-/// full intermediate list, a string's split UTF-8 character, an OSC with
-/// data and all three `SosPmApcString` introducers; and at `Ground`, every
-/// lead byte `0xC0..=0xF7` (the ones that begin no sequence included), and
-/// for each three- and four-byte row of Unicode Table 3-7 the character
-/// pending with the lowest and with the highest second byte the row allows,
-/// and for a four-byte row a third byte after either (`E0` overlong, `E1`
-/// for `E1..=EC`, `ED` surrogate, `EE` for `EE..=EF`, `F0` and `F4` plane
-/// bounds, `F1` for `F1..=F3`). No prefix holds a byte in 0x80..=0x9F
-/// outside a character, so each reaches its state in both C1 modes.
+/// states, a full parameter list, a saturated parameter, a subparameter, a full
+/// intermediate list, a string's split UTF-8 character, an OSC with data, all
+/// three `SosPmApcString` introducers; and at Ground every lead `0xC0..=0xF7`
+/// and, for each three- and four-byte row of Unicode Table 3-7, the character
+/// pending with the row's lowest and highest second byte (and a third byte for
+/// four-byte rows): `E0`, `ED`, `F0` and `F4` have narrowed ranges, `E1`, `EE`
+/// and `F1` stand for the rest. No prefix holds a C1 byte outside a character,
+/// so each reaches its state in both C1 modes.
 fn reachable_starts() -> Vec<(Vec<u8>, State)> {
     let full_params = |intro: &[u8]| [intro, &b"1;".repeat(MAX_PARAMS)].concat();
     let starts: &[(&[u8], State)] = &[

@@ -170,8 +170,7 @@ fn log_posture_is_neutral_not_denial() {
 
 #[test]
 fn decide_permit_is_not_logged_as_denied() {
-    // Every spawn goes through `decide`, which records the OS-sandbox posture
-    // (owner, 2026-09-25).
+    // Every spawn goes through `decide`, which records the OS-sandbox posture.
     // A permitted spawn never appears as `DENIED:` (so `grep DENIED` counts
     // only denials). The one refused spawn, Containment where the platform has
     // no OS sandbox, logs exactly one `DENIED:` naming the gap and no posture

@@ -2,52 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tier-1 for `NativeUpdateSuccessorWarmBeforeClaim` (aterm-spec's
-//! `native_update_successor_warm_before_claim_model`), phase P1 of
-//! docs/DESIGN-warm-successor-2026-09-29.md: the REAL snapshot and intake,
-//! driven as a successor runs them, projected onto the model and checked
-//! transition by transition with `interp::admits` (the model must admit each
-//! real step, by the named action) and every invariant on every state.
+//! `native_update_successor_warm_before_claim_model`): the real snapshot and intake, driven as a
+//! successor runs them, projected onto the model and checked step by step (each real step admitted
+//! by the named action, every invariant on every state).
 //!
-//! What is measured, not asserted by the harness:
+//! The harness measures what it projects: `captured` (no handoff name left in the process
+//! environment after `HandoffEnv::capture`), `threads_spawned`, `env_mut_after_spawn` (a canary
+//! under every handoff name, planted after the spawn, moves on any set, unset or read-and-clear,
+//! and a plain read would feed the intake a canary, which authenticates nothing), `claim_ok` and
+//! `owned_taken`. The launched lane (macOS) claims over a real `Rendezvous` whose
+//! outgoing end is a thread of this process; the fork lane (unix) prearms and checks the proof
+//! against the parent's expectation. `warm_order`, `warm_miss_px` and `warm_config_moved` are bound
+//! to the `SpawnWarm`, `Reshape`/`RealPresent` and `Rewarm`/`RealPresent` guards, and the intake
+//! under a stale or hostile hint still proves the parent's expectation (`HintNotInProof`). The
+//! negative controls replay the retired env transport (admitted only as the `Buggy`
+//! `PublishToEnv`) and a hint folded into the proof.
 //!
-//! * `captured` — after the real `HandoffEnv::capture` no handoff name is left
-//!   in the process environment, and the snapshot holds what the launch
-//!   environment carried;
-//! * `threads_spawned` — a real thread, alive for the rest of the walk (the
-//!   P2 warm prologue's shape);
-//! * `env_mut_after_spawn` — a CANARY in the process environment under every
-//!   handoff name, planted after the spawn: any read-and-clear, set or unset of
-//!   one by the code under test moves a canary (and a read of one would feed
-//!   the intake a canary, which authenticates nothing);
-//! * `claim_ok` — the real claim returned and its descriptors landed in the
-//!   snapshot; `owned_taken` — the single-use manifest was consumed and every
-//!   session adopted.
-//!
-//! The launched lane (macOS) runs the real `claim_incoming` against a real
-//! `Rendezvous` whose other end is a thread of this process standing in for the
-//! outgoing parent, then the real `ClaimedIntake::install`, `take_incoming_from`
-//! and the channel admissions. The fork lane (unix) runs the real prearm and
-//! intake and checks the proof against the parent's expectation — the SAME
-//! authentication as before the snapshot, to the byte. The negative control
-//! replays the retired transport (`ClaimedHandoff::publish`'s three `set_var`s
-//! after a thread exists) and the model admits it only as the `Buggy`
-//! `PublishToEnv`.
-//!
-//! P2 (the warm prologue before the dial) adds four binds: the REAL order
-//! decision (`warm_order`) is the model's `SpawnWarm` guard over the socket
-//! shapes, relative included; the REAL miss decision (`warm_miss_px`, over
-//! the real `launch_font_for_zoom`/`successor_font_px` and the real hint
-//! parser) is its `Reshape`/`RealPresent` guards; the REAL re-warm decision
-//! (`warm_config_moved`, over real config reads around an edit made during the
-//! hold) is its `Rewarm`/`RealPresent` guards; and the real intake, run with
-//! a stale and a hostile hint in the snapshot, proves exactly the parent's
-//! expectation — the hint never reaches the adoption proof (`HintNotInProof`),
-//! with a hint-folding replay as the caught negative control.
-//!
-//! Not driven, and waived by name in `handoff_env`: the warm prologue itself
-//! (it builds a GPU device — AGENTS.md), the window's reveal and
-//! presents (a window, likewise), the relative shape's `chdir` (driven by
-//! `control_socket_identity`'s own suites) and Prove/Commit (bound by
+//! Not driven, and waived by name in `handoff_env`: the warm prologue itself (it builds a GPU
+//! device), the window's reveal and presents, the relative shape's `chdir` (driven by
+//! `control_socket_identity`'s suites) and Prove/Commit (bound by
 //! `NativeUpdateSeamlessHandoffOwnership`'s Tier-1).
 
 #[cfg(target_os = "macos")]
@@ -80,19 +53,18 @@ pub(crate) struct Observed {
     env_mut_after_spawn: bool,
     owned_taken: bool,
     claim_ok: bool,
-    /// P2: the warm prologue's main-thread section returned.
+    /// The warm prologue's main-thread section returned.
     warm_done: bool,
-    /// P2: this launch's control socket is an explicit relative path.
+    /// This launch's control socket is an explicit relative path.
     relative_socket: bool,
-    /// P2: the backend was built at a size the carry contradicts.
+    /// The backend was built at a size the carry contradicts.
     stale_build: bool,
-    /// P2: the outgoing process parked under a config edit the early warm
-    /// never read.
+    /// The outgoing process parked under a config edit the early warm never read.
     stale_config: bool,
 }
 
-/// Project an observation onto the model's state. The window, the warm
-/// present and the hint stay 0: P1 has none of them (headless, and no code).
+/// Project an observation onto the model's state; the window, the warm present and the hint keep
+/// the model's initial values (the walk is headless).
 pub(crate) fn project(model: &Model, seen: Observed) -> State {
     let mut state = model.init_state();
     state.insert("phase", seen.phase);
@@ -170,10 +142,9 @@ fn this_build() -> String {
     )
 }
 
-/// [`pipe_pair`] with both ends owned. The fork-lane intake ADOPTS the ends it
-/// is handed (`ReadySignal` the ready write end, the `CommitReceiver` the
-/// commit read end) and closes them when dropped, so a test publishes those
-/// with `into_raw_fd()` and drops the others: each number has one closer.
+/// [`pipe_pair`] with both ends owned. The fork-lane intake adopts the ends it is handed (the ready
+/// write end, the commit read end) and closes them on drop, so a test publishes those with
+/// `into_raw_fd()` and drops the others: each number has one closer.
 fn owned_pipe(label: &str) -> (OwnedFd, OwnedFd) {
     let (read, write) = pipe_pair(label);
     // SAFETY: pipe(2) just returned both numbers to this thread; nothing else
@@ -181,9 +152,9 @@ fn owned_pipe(label: &str) -> (OwnedFd, OwnedFd) {
     unsafe { (OwnedFd::from_raw_fd(read), OwnedFd::from_raw_fd(write)) }
 }
 
-/// THE LAUNCHED LANE, end to end over the snapshot: capture, a thread, the real
-/// dial and grant, the claim installed into the snapshot, the intake and both
-/// channels admitted — and not one process-environment access after the spawn.
+/// The launched lane end to end over the snapshot: capture, a thread, the real dial and grant, the
+/// claim installed into the snapshot, the intake and both channels admitted, and no
+/// process-environment access after the spawn.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_environment() {
@@ -203,8 +174,8 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
     let own = unsafe { libc::getpid() };
     let parent = AttestedParent::attest_live_for_test(own).expect("this process attests");
 
-    // THE LAUNCH ENVIRONMENT a LaunchServices successor is started with: the
-    // out-of-band shape (no descriptor numbers), as `app_launch_successor::begin_launch` writes it.
+    // The launch environment a LaunchServices successor is started with: the out-of-band shape
+    // (no descriptor numbers), as `app_launch_successor::begin_launch` writes it.
     for key in HANDOFF_ENV_KEYS {
         aterm_log::env::unset(key);
     }
@@ -297,8 +268,8 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
             },
             Some(parent),
         );
-        // The outgoing half's accept is judged first: a successor HELD for
-        // `trustd` is the machine's, before its claim's end is judged.
+        // The outgoing half's accept is judged first: a successor held for `trustd` is the
+        // machine's, before its claim's end is judged.
         let (peer, granted) = crate::handoff_rendezvous::admitted(
             outgoing.join().expect("the outgoing half"),
             "the successor presents its claim",
@@ -405,9 +376,8 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
     StagedHandoff::teardown(staged);
 }
 
-/// A FAILED CLAIM LEAVES NOTHING: nobody listens at the rendezvous, the real
-/// dial fails, and the manifest — the outgoing process's — is untouched, with
-/// nothing owned and nothing shown.
+/// A failed claim leaves nothing: nobody listens at the rendezvous, the real dial fails, and the
+/// outgoing process's manifest is untouched, with nothing owned and nothing shown.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_failed_claim_owns_nothing_and_touches_no_environment() {
@@ -494,10 +464,9 @@ fn a_failed_claim_owns_nothing_and_touches_no_environment() {
     staged.teardown();
 }
 
-/// THE FORK LANE, and the SAME AUTHENTICATION: the launch environment as the
-/// fork lane's parent writes it, captured, prearmed and taken entirely from
-/// the snapshot after a thread exists — and the proof the successor computes
-/// is the parent's expectation, byte for byte, as before the snapshot.
+/// The fork lane: the launch environment as its parent writes it, captured, prearmed and taken
+/// entirely from the snapshot after a thread exists, and the successor's proof is the parent's
+/// expectation byte for byte.
 #[cfg(unix)]
 #[test]
 fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
@@ -580,13 +549,10 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
     staged.teardown();
 }
 
-/// NEGATIVE CONTROL: the retired transport. `ClaimedHandoff::publish` wrote the
-/// claimed descriptors into the PROCESS environment — three `set_var`s — and
-/// with a thread alive (P2's order) that is the data race the snapshot removes.
-/// Replayed here exactly, the canaries see it, and the model admits the step
-/// only as its `Buggy` mutant `PublishToEnv`, whose state breaks
-/// `NoEnvMutationAfterSpawn`. A projection blind to env writes would pass this
-/// replay as a legal step, and this test would fail.
+/// Negative control: the retired transport, which wrote the claimed descriptors into the process
+/// environment (three `set_var`s), a data race once a thread is alive. Replayed, the canaries see
+/// it and the model admits the step only as its `Buggy` `PublishToEnv`, which breaks
+/// `NoEnvMutationAfterSpawn`; a projection blind to env writes would fail this test.
 #[cfg(unix)]
 #[test]
 fn the_retired_env_transport_is_the_caught_mutant() {
@@ -610,7 +576,7 @@ fn the_retired_env_transport_is_the_caught_mutant() {
         ..Observed::default()
     };
     assert!(!claimed.env_mut_after_spawn);
-    // `publish`, verbatim in effect.
+    // The retired transport's three writes.
     aterm_log::env::set(ENV_FDS, "0=9:4000");
     aterm_log::env::set(ENV_READY_FD, "10");
     aterm_log::env::set(ENV_COMMIT_FD, "11");
@@ -635,12 +601,10 @@ fn the_retired_env_transport_is_the_caught_mutant() {
     warm.join().expect("the warm thread");
 }
 
-/// P2's ORDER, BOUND: the real `warm_order` over every socket shape a launched
-/// successor can carry is the model's `SpawnWarm` guard — before the dial
-/// exactly where the model lets a thread exist before the dial, and never on
-/// the relative shape, whose intake `chdir`s. The negative control warms before
-/// the dial on that shape anyway; the model admits it only as its `Buggy`
-/// mutant, and the walk that follows breaks `NoCwdChangeAfterSpawn` at the
+/// The real `warm_order` over every socket shape a launched successor can carry is the model's
+/// `SpawnWarm` guard: before the dial exactly where the model lets a thread exist before the dial,
+/// never on the relative shape, whose intake `chdir`s. Negative control: warming before the dial
+/// on that shape is only the `Buggy` mutant, and the walk breaks `NoCwdChangeAfterSpawn` at the
 /// `chdir`.
 #[test]
 fn the_real_warm_order_is_the_models_spawn_guard() {
@@ -674,7 +638,7 @@ fn the_real_warm_order_is_the_models_spawn_guard() {
             "{explicit:?}: only the relative shape keeps the late order"
         );
         if relative {
-            // NEGATIVE CONTROL: warm before the dial on the relative shape.
+            // Negative control: warm before the dial on the relative shape.
             let mut run = captured.clone();
             assert!(!model.action_enabled("WarmBeforeDialOnRelativeSocket", &run));
             assert!(buggy.fire("WarmBeforeDialOnRelativeSocket", &mut run));
@@ -700,12 +664,11 @@ fn the_real_warm_order_is_the_models_spawn_guard() {
 /// The phase the model enters at `Capture`.
 const CAPTURED_PHASE: i64 = 1;
 
-/// A STALE HINT COSTS A WARM, NEVER A FRAME: the real hint parser, the real
-/// build font (`launch_font_for_zoom`, what the prologue builds at), the real
-/// launch font (`successor_font_px`, from the carry) and the real miss decision
-/// (`warm_miss_px`) decide the model's `Reshape`/`RealPresent` guards — a hint
-/// that matches builds at the carried size and presents; a stale or hostile one
-/// is re-selected first.
+/// A stale hint costs a warm, never a frame: the real hint parser, build font
+/// (`launch_font_for_zoom`, what the prologue builds at), launch font (`successor_font_px`, from
+/// the carry) and miss decision (`warm_miss_px`) decide the model's `Reshape`/`RealPresent`
+/// guards. A matching hint builds at the carried size and presents; a stale or hostile one is
+/// re-selected first.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stale_hint_is_reselected_before_any_carried_present() {
@@ -810,17 +773,12 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
     }
 }
 
-/// A CONFIG EDIT DURING THE HOLD IS WARMED AGAIN BEFORE ANY CARRIED PRESENT:
-/// the read `main_entry` takes before the early warm, the warm's own config
-/// read (`VersionedConfigService::load_path`), what the outgoing process does
-/// to `aterm.toml` while this successor holds its dial — nothing, a Settings
-/// save of the same bytes, a Settings font change (a new file renamed over the
-/// old, as a Settings save lands) — and the real re-warm decision after the
-/// intake (`warm_config_moved`). The decision is exactly "the early warm's
-/// config is not the one the outgoing process parked under", and it is the
-/// model's `Rewarm`/`RealPresent` guards. NEGATIVE CONTROL: presenting the
-/// carried screens under the early warm's config anyway (P2 as first built) is
-/// only the model's `Buggy` `PresentUnderStaleConfig`, and breaks
+/// A config edit during the hold is warmed again before any carried present. Between the read
+/// `main_entry` takes before the early warm and `warm_config_moved` after the intake, the outgoing
+/// process leaves `aterm.toml` alone, saves the same bytes, or changes the font as a Settings save
+/// does (a new file renamed over the old). A re-warm is due exactly when the early warm's config is
+/// not the one the outgoing process parked under: the model's `Rewarm`/`RealPresent` guards.
+/// Negative control: the `Buggy` `PresentUnderStaleConfig` breaks
 /// `CarriedPresentUnderCurrentConfig`.
 #[test]
 fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
@@ -889,14 +847,11 @@ fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
     }
 }
 
-/// A THEME-FILE EDIT DURING THE HOLD IS WARMED AGAIN TOO, though `aterm.toml`
-/// never moves: the file names a user theme, and the outgoing process applies
-/// an edit to that theme's file (saved as an editor saves, renamed over it)
-/// while this successor holds its dial. The real read before the early warm
-/// (`WarmConfigRead::take`), the real early warm (`warm_config`, headless), the
-/// edit, and the real decision after the intake (`warm_config_moved`): a
-/// re-warm, and it presents the edited theme. Control: an idle hold keeps the
-/// early warm.
+/// A theme-file edit during the hold is warmed again too, though `aterm.toml` never moves: the
+/// config names a user theme, and the theme's file is saved (renamed over) while this successor
+/// holds its dial. The real read (`WarmConfigRead::take`), early warm (`warm_config`, headless) and
+/// decision after the intake (`warm_config_moved`) re-warm onto the edited theme. Control: an idle
+/// hold keeps the early warm.
 #[test]
 fn a_theme_file_edit_during_the_hold_is_warmed_again() {
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
@@ -937,11 +892,9 @@ fn a_theme_file_edit_during_the_hold_is_warmed_again() {
     });
 }
 
-/// THE HINT NEVER REACHES THE PROOF: the real intake, run over a snapshot that
-/// carries no hint, a stale one and a hostile one, computes the adoption proof
-/// the outgoing process expects, byte for byte, every time. NEGATIVE CONTROL: a
-/// hint folded into the layout digest (the mutant `FoldHint`) proves something
-/// else — so a check blind to the hint could not pass this.
+/// The hint never reaches the proof: the real intake over a snapshot with no hint, a stale one and
+/// a hostile one computes the proof the outgoing process expects, every time. Negative control: a
+/// hint folded into the layout digest (the mutant `FoldHint`) proves something else.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_hint_never_reaches_the_adoption_proof() {
@@ -997,8 +950,8 @@ fn the_hint_never_reaches_the_adoption_proof() {
             .iter()
             .map(|item| (item.local_id, item.master.raw(), item.pid))
             .collect::<Vec<_>>();
-        // NEGATIVE CONTROL: the same proof with the hint folded into the
-        // layout digest (the model's `FoldHint`) is not the parent's.
+        // Negative control: the same proof with the hint folded into the layout digest (the
+        // model's `FoldHint`) is not the parent's.
         if let (Some(hint), Some(layout), Some(screen)) =
             (hint, incoming.layout_digest, incoming.screen_digest)
         {

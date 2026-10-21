@@ -25,17 +25,18 @@
 //! [`WindowExtWayland::client_decorations`] says when, and what the compositor can do for
 //! the header's buttons; the gestures go through [`Window::drag_window`],
 //! [`Window::drag_resize_window`] and [`Window::show_window_menu`].
+//!
+//! LOCAL PATCH (aterm), 2026-10-21 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 8,
+//! WC.8): upstream's `EventLoopBuilderExtWayland` (`with_wayland`, `with_any_thread`),
+//! `EventLoopExtWayland::is_wayland`, `WindowExtWayland::xdg_toplevel`,
+//! `MonitorHandleExtWayland` and the `Theme` re-export had no caller in any aterm crate and are
+//! gone. [`WindowAttributesExtWayland`]'s name and startup token serve X11 windows too.
 
-use std::ffi::c_void;
-use std::ptr::NonNull;
-
-use crate::event_loop::{ActiveEventLoop, EventLoop, EventLoopBuilder};
-use crate::monitor::MonitorHandle;
+use crate::event_loop::{ActiveEventLoop, EventLoop};
 use crate::window::{Window, WindowAttributes};
 
 #[cfg(wayland_platform)]
 pub use crate::platform_impl::wayland::{WaylandClipboard, WaylandSelection};
-pub use crate::window::Theme;
 
 /// Additional methods on [`ActiveEventLoop`] that are specific to Wayland.
 pub trait ActiveEventLoopExtWayland {
@@ -52,9 +53,6 @@ impl ActiveEventLoopExtWayland for ActiveEventLoop {
 
 /// Additional methods on [`EventLoop`] that are specific to Wayland.
 pub trait EventLoopExtWayland {
-    /// True if the [`EventLoop`] uses Wayland.
-    fn is_wayland(&self) -> bool;
-
     /// The Wayland CLIPBOARD / PRIMARY selection handle — a cloneable, thread-safe
     /// [`WaylandClipboard`] backed by the event loop's own seat and data devices.
     /// `None` on any other backend. (An aterm addition: upstream winit has no
@@ -64,40 +62,9 @@ pub trait EventLoopExtWayland {
 }
 
 impl<T: 'static> EventLoopExtWayland for EventLoop<T> {
-    #[inline]
-    fn is_wayland(&self) -> bool {
-        self.event_loop.is_wayland()
-    }
-
     #[cfg(wayland_platform)]
     fn wayland_clipboard(&self) -> Option<WaylandClipboard> {
         self.event_loop.wayland_clipboard()
-    }
-}
-
-/// Additional methods on [`EventLoopBuilder`] that are specific to Wayland.
-pub trait EventLoopBuilderExtWayland {
-    /// Force using Wayland.
-    fn with_wayland(&mut self) -> &mut Self;
-
-    /// Whether to allow the event loop to be created off of the main thread.
-    ///
-    /// By default, the window is only allowed to be created on the main
-    /// thread, to make platform compatibility easier.
-    fn with_any_thread(&mut self, any_thread: bool) -> &mut Self;
-}
-
-impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
-    #[inline]
-    fn with_wayland(&mut self) -> &mut Self {
-        self.platform_specific.forced_backend = Some(crate::platform_impl::Backend::Wayland);
-        self
-    }
-
-    #[inline]
-    fn with_any_thread(&mut self, any_thread: bool) -> &mut Self {
-        self.platform_specific.any_thread = any_thread;
-        self
     }
 }
 
@@ -121,7 +88,7 @@ pub struct ClientDecorations {
     pub fullscreen: bool,
     /// The window is tiled against at least one edge.
     pub tiled: bool,
-    /// The window is resizable ([`Window::set_resizable`]).
+    /// The window is resizable.
     pub resizable: bool,
 }
 
@@ -129,9 +96,6 @@ pub struct ClientDecorations {
 ///
 /// [`Window`]: crate::window::Window
 pub trait WindowExtWayland {
-    /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
-    fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
-
     /// The decorations this window's application must draw itself: [`Some`] once the
     /// compositor has settled on client-side decorations (it offers no xdg-decoration manager,
     /// or chose client mode) while decorations are asked for. [`None`] under server-side
@@ -144,17 +108,6 @@ pub trait WindowExtWayland {
 }
 
 impl WindowExtWayland for Window {
-    #[inline]
-    fn xdg_toplevel(&self) -> Option<NonNull<c_void>> {
-        #[allow(clippy::single_match)]
-        match &self.window {
-            #[cfg(x11_platform)]
-            crate::platform_impl::Window::X(_) => None,
-            #[cfg(wayland_platform)]
-            crate::platform_impl::Window::Wayland(window) => window.xdg_toplevel(),
-        }
-    }
-
     #[inline]
     fn client_decorations(&self) -> Option<ClientDecorations> {
         match &self.window {
@@ -198,18 +151,5 @@ impl WindowAttributesExtWayland for WindowAttributes {
     fn with_activation_token(mut self, token: impl Into<String>) -> Self {
         self.platform_specific.activation_token = Some(token.into());
         self
-    }
-}
-
-/// Additional methods on `MonitorHandle` that are specific to Wayland.
-pub trait MonitorHandleExtWayland {
-    /// Returns the inner identifier of the monitor.
-    fn native_id(&self) -> u32;
-}
-
-impl MonitorHandleExtWayland for MonitorHandle {
-    #[inline]
-    fn native_id(&self) -> u32 {
-        self.inner.native_identifier()
     }
 }

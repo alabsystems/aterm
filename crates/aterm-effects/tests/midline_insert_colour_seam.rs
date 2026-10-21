@@ -1,28 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A key typed inside a lit line leaves no colour seam at the tail it pushes.
-//! In Claude Code's composer, typing in the middle of a line after moving back
-//! must keep the rainbow smooth and continuous (`tests/midline_insert_band.rs`
-//! covers the band staying lit).
+//! A key typed inside a lit line leaves no colour seam at the tail it pushes: in Claude Code's
+//! composer the rainbow stays continuous (`tests/midline_insert_band.rs` covers the band staying
+//! lit).
 //!
-//! The shift pass (`Ribbon::shift_run`) re-reads each pushed cell's stop at the
-//! column it moved to and leaves the walk's anchor where it is: the colour stays
-//! with the screen column and the light rides the glyph. Every column keeps the
-//! colour it showed, the inserted keys walk on into the tail, and the band grows
-//! one stop at its right end. Carrying the pushed cells' `t` instead would make
-//! the tail restart `k − 1` stops back after `k` keys: a growing backward step
-//! at the seam (`5/16` of the arc after six keys on the fast leg).
+//! The shift pass (`Ribbon::shift_run`) re-reads each pushed cell's stop at the column it moved
+//! to and leaves the walk's anchor where it is: the colour stays with the screen column and the
+//! light rides the glyph. Carrying the pushed cells' `t` instead would restart the tail `k − 1`
+//! stops back after `k` keys, a growing backward step at the seam.
 //!
-//! The census is each cell's walk position (`Cell::t`, what the plan resolves to
-//! colour) on every text column of the composer row, on a settled frame after
-//! each key, beside the planned segment's `t` at the column (what the quads
-//! draw).
-//!
-//! The law: along one phrase the walk position never steps backward between
-//! neighbouring lit glyphs and never forward by more than one walk step (`1/16`,
-//! the fast leg's pace). The frame before the first inserted key satisfies it,
-//! showing the metric reads a real walk.
+//! The census is each cell's walk position (`Cell::t`, what the plan resolves to colour) on every
+//! text column of the composer row, on a settled frame after each key, beside the planned
+//! segment's `t` at the column (what the quads draw). The law: along one phrase the walk position
+//! never steps backward between neighbouring lit glyphs and never forward by more than one walk
+//! step (`1/16`, the fast leg's pace). The frame before the first inserted key satisfies it, so
+//! the metric reads a real walk.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, geom, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -41,7 +34,7 @@ const CW: usize = 8;
 const CH: usize = 16;
 const ROWS: usize = 60;
 const COLS: usize = 140;
-/// 12 cps, the owner's pace.
+/// 12 cps.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
 /// The Ink-shaped composer's pause between a redraw's two reads.
@@ -136,8 +129,8 @@ impl Snap {
             .fold((0, 0, 0.0), |m, s| if s.2 < m.2 { s } else { m })
     }
 
-    /// The most negative step of the PLAN's `t` between neighbouring text
-    /// columns (`0` when none is negative) — the drawn colour.
+    /// The most negative step of the plan's `t` (the drawn colour) between neighbouring text
+    /// columns (`0` when none is negative).
     fn plan_worst_back(&self) -> (u16, f32) {
         self.cols
             .windows(2)
@@ -148,8 +141,7 @@ impl Snap {
             .fold((0, 0.0), |m, s| if s.1 < m.1 { s } else { m })
     }
 
-    /// The largest forward cell step PER COLUMN crossed: `(left, right,
-    /// dt / (right − left))`.
+    /// The largest forward cell step per column crossed: `(left, right, dt / (right − left))`.
     fn worst_jump(&self) -> (u16, u16, f32) {
         self.cell_steps()
             .into_iter()
@@ -167,7 +159,7 @@ impl Snap {
             .collect()
     }
 
-    /// The live cells OFF their cohort's walk: `(col, t, t_at(col))`.
+    /// The live cells off their cohort's walk: `(col, t, t_at(col))`.
     fn off_walk(&self) -> Vec<(u16, f32, f32)> {
         self.walk
             .iter()
@@ -276,7 +268,7 @@ impl Host {
         h
     }
 
-    /// EXACTLY the render path of `tests/midline_insert_band.rs`.
+    /// The render path of `tests/midline_insert_band.rs`.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
@@ -542,12 +534,10 @@ const BACKS: [usize; 4] = [8, 15, 30, LINE.len()];
 /// The depths the walk law and the hop law read.
 const HOP_BACKS: [usize; 3] = [8, 15, 30];
 
-/// One [`take`] at 150 ms arrows, as the insert laws read it: the edited text,
-/// the census before the first inserted key and after each, and (at
-/// [`HOP_BACKS`]) the End hop over the pushed tail that
-/// [`a_hop_over_the_pushed_tail_does_not_repaint_it`] reads: its echo frame
-/// and the four after, or the message of the panic that ended it, so a hop
-/// that panics fails the hop law alone, as when only that law replayed it.
+/// One [`take`] at 150 ms arrows: the edited text, the census before the first inserted key and
+/// after each, and (at [`HOP_BACKS`]) the End hop over the pushed tail that
+/// [`a_hop_over_the_pushed_tail_does_not_repaint_it`] reads (its echo frame and the four after,
+/// or the panic message, so a panicking hop fails the hop law alone).
 struct Shared {
     text: String,
     col0: usize,
@@ -556,14 +546,10 @@ struct Shared {
     hop: Option<Result<Vec<Snap>, String>>,
 }
 
-/// The take of `(shape, back)`, replayed once per process.
-///
-/// The walk, hop and C2 laws read the same takes, so each is replayed once.
-/// A take is a pure function of `(shape, back)`: its own terminal, engine and
-/// clock, every instant relative to its own start. The hop continues the
-/// take's own host, so it is replayed here, right after it. A take that
-/// panics leaves its cell empty, so every law that reads it replays it and
-/// fails on its own.
+/// The take of `(shape, back)`, replayed once per process: the walk, hop and C2 laws read the
+/// same takes, each a pure function of `(shape, back)` on its own terminal, engine and clock. The
+/// hop continues the take's own host, so it is replayed right after it. A take that panics leaves
+/// its cell empty, so every law that reads it replays it and fails on its own.
 fn shared(shape: Shape, back: usize) -> &'static Shared {
     static TAKES: [OnceLock<Shared>; SHAPES.len() * BACKS.len()] =
         [const { OnceLock::new() }; SHAPES.len() * BACKS.len()];
@@ -605,11 +591,9 @@ fn replay_shared(shape: Shape, back: usize) -> Shared {
     }
 }
 
-/// Every take of `shapes × backs`, in that order, replayed on the binary's
-/// threads ([`crate::common::par_map`]) where no law has replayed it yet.
-/// Each is caught in its pool thread and handed out in order, a take that
-/// panicked raising its panic only when the law reaches it: the takes before
-/// it are judged first, as when the law replayed them one after another.
+/// Every take of `shapes × backs`, in that order, replayed on the binary's threads
+/// ([`crate::common::par_map`]) where no law has replayed it yet. A take that panicked raises its
+/// panic only when the law reaches it, after the takes before it are judged.
 fn takes_of(backs: &[usize]) -> impl Iterator<Item = (Shape, usize, &'static Shared)> {
     let keys: Vec<(Shape, usize)> = SHAPES
         .iter()
@@ -637,8 +621,6 @@ fn max_step() -> f32 {
 fn typing_inside_a_lit_line_keeps_the_walk_continuous_at_the_pushed_tail() {
     let mut report = String::new();
     let mut failures = 0usize;
-    // 30 back puts the insert at text column 4 (the fast leg, `1/16` a cell);
-    // 15 at column 19 and 8 at column 26 (the slow leg, `1/36`).
     for (shape, back, t) in takes_of(&HOP_BACKS) {
         let (before, after) = (&t.before, &t.after);
         let what = format!("{shape:?} back={back}");
@@ -725,7 +707,7 @@ fn a_hop_over_the_pushed_tail_does_not_repaint_it() {
         let first = t.col0 + LINE.len() - back + MID.len();
         let tail: Vec<usize> = (first + 1..t.col0 + t.text.len()).collect();
         let was: Vec<Option<f32>> = tail.iter().map(|&c| settled.t_at(c)).collect();
-        // PREMISE — the tail is lit and carries cells before the hop.
+        // Premise: the tail is lit and carries cells before the hop.
         assert!(
             was.iter().filter(|t| t.is_some()).count() + 1 >= tail.len(),
             "{what}: premise — the tail carries cells\n{}",
@@ -755,7 +737,7 @@ fn a_hop_over_the_pushed_tail_does_not_repaint_it() {
                 }
             }
         }
-        // PREMISE — the tail was read on every frame after the hop.
+        // Premise: the tail was read on every frame after the hop.
         assert!(
             compared >= 5 * (tail.len() - 1),
             "{what}: premise — the tail was compared ({compared})"

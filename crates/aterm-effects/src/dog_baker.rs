@@ -1,22 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The dog roster's bake path: one authored breed head
-//! ([`crate::dog_glyphs_gen::DOG_GLYPHS`]) rasterized into one exact-size
-//! straight-alpha RGBA8 tile, cached in a small LRU, and handed to the shared
-//! cat atlas through [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
+//! The dog roster's bake path: one authored breed head ([`crate::dog_glyphs_gen::DOG_GLYPHS`])
+//! rasterized into an exact-size straight-alpha RGBA8 tile, cached in a small LRU, and handed
+//! to the shared cat atlas through [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
 //!
-//! The [`crate::pet_baker`] pattern for the typed-word dog cameo: same
-//! rasterizer ([`fill_path_fixed`]), same fill resolution ([`resolve_layer`]
-//! over [`ResolvedFills`]), same budgets, no patch strip and no eyes axis. Two
-//! deltas from the pet:
-//!
-//! * **No iris axis.** Dog eyes use the adaptive eye ink, so
-//!   [`DogBakeKey::fills`] passes a fixed mid-ramp stop.
-//! * **Adaptive eye ink.** A dog head is one static bake without gaze
-//!   machinery, so its `GlyphRole::Eye` layers resolve to
-//!   [`ResolvedFills::eye_ink`] (dark on pale coats, pale on dark) instead of
-//!   the authored fill. Glints stay authored (`GlyphRole::Detail`, white).
+//! The [`crate::pet_baker`] pattern (same rasterizer, fill resolution and budgets) without the
+//! patch strip or the eye and iris axes: a dog head is one static bake, so its `GlyphRole::Eye`
+//! layers take [`ResolvedFills::eye_ink`] (dark on pale coats, pale on dark) instead of the
+//! authored fill. Glints stay authored (`GlyphRole::Detail`).
 
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
@@ -25,19 +17,16 @@ use crate::cat_glyphs_gen::GlyphRole;
 use crate::dog_glyphs_gen::{DOG_GLYPHS, DogGlyphId};
 use crate::pet_baker::{ExactTileBaker, ExactTileKey, host_tile_id};
 
-/// The fixed [`EYE_RAMP`](crate::cat_baker::EYE_RAMP) stop passed through
-/// [`ResolvedFills::from_context`] for the dog bake. No dog layer uses
-/// `Recolor::Iris`, so it never touches a texel; the signature requires it.
+/// The [`EYE_RAMP`](crate::cat_baker::EYE_RAMP) stop [`ResolvedFills::from_context`] requires.
+/// No dog layer uses `Recolor::Iris`, so it never touches a texel.
 const DOG_IRIS_STOP: u8 = 2;
 
-/// FNV namespace salt eaten FIRST by [`DogBakeKey::host_id`], so a dog key's
-/// id stream can never collide with a pet key that happens to share its field
-/// values (both rosters set the high bit and live in the same shared atlas).
+/// FNV namespace salt hashed first by [`DogBakeKey::host_id`], so a dog id never collides with a
+/// pet key that shares its field values (both set the high bit in the same atlas).
 const DOG_HOST_SALT: u64 = 0x646f_675f_6865_6164; // b"dog_head"
 
-/// Bake-cache key for one dog tile: everything that can change a texel, and
-/// nothing that cannot. All-integer by construction — the
-/// [`BakeKey`](crate::cat_baker::BakeKeyV4) discipline.
+/// Bake-cache key for one dog tile: everything that can change a texel, and nothing that
+/// cannot. All-integer, like [`BakeKeyV4`](crate::cat_baker::BakeKeyV4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DogBakeKey {
     /// The authored breed head this summon rolled.
@@ -46,15 +35,15 @@ pub struct DogBakeKey {
     pub coat: u8,
     /// Quantized local terminal palette (accent family + background band).
     pub colors: CatColorKey,
-    /// Tile width in px. The tile is EXACTLY this wide — no patch strip.
+    /// Tile width in px, exactly: no patch strip.
     pub w: u16,
     /// Tile height in px.
     pub h: u16,
 }
 
 impl DogBakeKey {
-    /// Resolve this key's ramp index + local palette into concrete bake fills
-    /// (the key → colours step; floats appear only past this point).
+    /// Resolve this key's ramp index + local palette into concrete bake fills (floats appear
+    /// only past this point).
     #[must_use]
     pub fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(self.coat, DOG_IRIS_STOP, self.colors)
@@ -71,10 +60,8 @@ impl DogBakeKey {
         )
     }
 
-    /// A stable `u64` identity for
-    /// [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile) — FNV-1a
-    /// over a namespace salt plus the key's own integer fields, high bit set
-    /// (the [`crate::pet_baker`] contract, in a salted namespace of its own).
+    /// A stable `u64` id for [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile):
+    /// FNV-1a over the salt and the key's integer fields, high bit set.
     #[must_use]
     pub fn host_id(&self) -> u64 {
         host_tile_id(&[
@@ -89,11 +76,8 @@ impl DogBakeKey {
     }
 }
 
-/// Rasterize one authored breed head into a fresh `w × h` [`Tile`], painter
-/// order = layer order, each layer's colour resolved by [`resolve_layer`] with
-/// the two dog deltas: `GlyphRole::Eye` layers take the adaptive
-/// [`ResolvedFills::eye_ink`] (see the module docs), and the mixed-background
-/// outline halo rides exactly the pet's rule.
+/// Rasterize one authored breed head into a fresh `w × h` [`Tile`] in layer order:
+/// `GlyphRole::Eye` layers take [`ResolvedFills::eye_ink`], outlines get the pet's halo.
 #[must_use]
 pub fn bake_breed(breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
     let mut tile = Tile::new(w, h);
@@ -125,14 +109,12 @@ impl ExactTileKey for DogBakeKey {
     }
 }
 
-/// Host-side LRU of exact-size dog tiles — the [`crate::pet_baker::PetBaker`]
-/// structure itself (see its docs for the budget rationale).
+/// Host-side LRU of exact-size dog tiles: the [`crate::pet_baker::PetBaker`] structure.
 pub type DogBaker = ExactTileBaker<DogBakeKey>;
 
 impl DogBaker {
-    /// The authored aspect (width ÷ height) of a breed head, from its asset
-    /// viewbox. Clamped away from zero so a degenerate asset cannot produce a
-    /// NaN/∞ destination rect.
+    /// The authored aspect (width ÷ height) of a breed head, clamped away from zero so a
+    /// degenerate asset cannot produce a NaN/∞ destination rect.
     #[must_use]
     pub fn aspect(breed: DogGlyphId) -> f32 {
         (f32::from(DOG_GLYPHS[breed as usize].aspect_x1000) / 1000.0).max(0.001)
@@ -224,13 +206,12 @@ mod tests {
         );
     }
 
-    /// Every breed at every ramp extreme draws a substantial, multi-colour dog
-    /// (the pet's smoke test, swept across the whole roster).
+    /// Every breed across all 16 coat stops draws a substantial, multi-colour dog.
     #[test]
     fn every_breed_draws_a_dog() {
         let (w, h) = (96u32, 82u32);
         for &id in DOG_GLYPH_IDS {
-            for coat in [0u8, 8, 15] {
+            for coat in 0..16u8 {
                 let fills = ResolvedFills::from_indices(coat, 2, coat < 4);
                 let tile = bake_breed(id, &fills, w, h);
                 let px = tile.pixels();
@@ -271,8 +252,7 @@ mod tests {
         }
     }
 
-    /// The `host_id` handed to the shared atlas is stable, key-separating, and
-    /// namespaced away from pet ids (high bit + salt).
+    /// `host_id` is stable, key-separating, and namespaced away from pet ids (high bit + salt).
     #[test]
     fn host_ids_are_stable_distinct_and_namespaced() {
         let a = key(1);

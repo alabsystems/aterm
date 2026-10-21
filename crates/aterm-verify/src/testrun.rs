@@ -1,57 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TEST BINARIES, SEVERAL AT A TIME.
+//! Running test binaries concurrently.
 //!
-//! WHY. cargo runs test binaries one at a time, even under `--no-fail-fast`, so
-//! a workspace's few hundred binaries, most of them under a second each, would
-//! be a serial walk on the run's critical path. This module runs several at
-//! once, `--test-jobs` at a time ([`DEFAULT_JOBS`]), each with the whole
-//! pinned `RUST_TEST_THREADS`, as cargo's own run hands it.
+//! Cargo runs test binaries one at a time, even under `--no-fail-fast`, so a
+//! workspace's test binaries would otherwise be a serial walk. This module runs
+//! `--test-jobs` binaries at a time ([`DEFAULT_JOBS`]), each with the pinned
+//! `RUST_TEST_THREADS`, in cargo's order.
 //!
-//! THE PROCESS IS CARGO'S, NOT A GUESS AT IT. A test binary is not just a path:
-//! cargo starts it in its package's root with an environment of its own —
-//! `CARGO` (under targo, targo itself), `CARGO_MANIFEST_DIR`, the whole
-//! `CARGO_PKG_*` family, the dynamic-library search path, every
-//! `cargo:rustc-env` its build script printed, targo's own
-//! `TRUST_TARGO_FRONTEND` — and tests in this tree read several of those at
-//! run time (`CARGO` in aterm-gui, aterm-forge and the conformance
-//! support). Rebuilding that from the compile's JSON would be a copy of cargo
-//! that drifts. So cargo is asked: the stage runs the very `targo test --tests`
-//! it always ran, with one addition — `--config
-//! target.'cfg(all())'.runner=[<this binary>, --record-test-binary, <dir>]`,
-//! ahead of the subcommand so it keeps the build cache ([`recording_cmd`]) —
-//! and cargo, instead of executing each test binary, executes this binary with
-//! the test binary's argv, in its directory, with its environment.
-//! [`record_main`] writes those three facts down and exits 0, so cargo walks
-//! every binary in a few seconds and runs nothing; the run then starts the
-//! recorded invocations itself.
+//! THE RUN IS CPU-BOUND. Eight binaries with the machine's thread count each
+//! keep every core busy until the last one ends, so the run lasts about as long
+//! as the binaries' CPU time over the cores, whatever order they start in.
+//! Measured on the whole workspace (18 cores): starting the longest binary
+//! first stayed within the run-to-run spread of cargo's order, and starting
+//! them all longest first was slower (the heaviest at once cost more system
+//! time); a thread count per binary scaled to its last run's time was slower
+//! (the small binaries, left a few threads, ended the run); and 4, 6, 10, 12
+//! or 16 at a time were slower than 8. What shortens the run is less CPU in
+//! the heaviest binaries.
 //!
-//! WHAT ELSE IT READS. The compile child (`--no-run`) is asked for
-//! `--message-format=json-render-diagnostics`: its diagnostics print exactly as
-//! before, and each `compiler-artifact` line names a test executable and its
-//! target's kind and name — which, with the recorded `CARGO_PKG_NAME`, is
-//! cargo's own re-run spec (`-p atpkg --test atpkg_suite`, `-p aterm-gui
-//! --lib`), the id every failed test is known by and rerun with
-//! ([`crate::findings::test_findings`]). The JSON lines themselves are
-//! removed from what the ladder shows.
+//! Cargo starts each test binary in its package's root with its environment
+//! (`CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_PKG_*`, dynamic-library search path,
+//! `cargo:rustc-env` values, `TRUST_TARGO_FRONTEND`). Rather than reconstructing
+//! that environment from compiler JSON, the stage runs `targo test --tests` with
+//! `--config target.'cfg(all())'.runner=[<this binary>, --record-test-binary, <dir>]`
+//! ahead of the subcommand so it keeps the build cache ([`recording_cmd`]).
+//! Cargo invokes [`record_main`] with each test binary's argv, cwd, and
+//! environment; [`record_main`] records them and exits 0, and this runner then
+//! executes the recorded invocations in parallel.
 //!
-//! THE LOG IS CARGO'S SHAPE. Each binary's output is captured on its own and
-//! printed in cargo's order — its `Running` header, its bytes, and, when it
-//! failed, cargo's `error: test failed, to rerun pass` line naming its spec —
-//! so the ladder reads exactly as a serial run's would, and every reader of
-//! that log ([`crate::libtest::failed_tests`],
-//! [`crate::libtest::environment_refusals`]) reads it unchanged. The header is
-//! written at the head of each binary's own log before it starts
-//! ([`exec::Cmd::preamble`]).
+//! The compile child (`--no-run`) uses `--message-format=json-render-diagnostics`:
+//! each `compiler-artifact` line names a test executable and its target kind and
+//! name, which with the recorded `CARGO_PKG_NAME` forms cargo's re-run spec
+//! (`-p atpkg --test atpkg_suite`, `-p aterm-gui --lib`) used by
+//! [`crate::findings::test_findings`]. The JSON lines are stripped from the
+//! ladder output.
 //!
-//! NEVER LESS THAN CARGO. Anything that does not add up — the recording pass
-//! failed, cargo announced a binary the recorder did not see (or the reverse),
-//! a recorded binary the compile did not report — and the stage runs the plain
-//! serial `targo test --tests` child it always ran, saying why in one line. A
-//! recording pass in which the recorder never ran (a runner the caller's own
-//! cargo config names outranks this one) WAS that serial run, and is judged as
-//! one. No retry anywhere: a red binary is decided once, as cargo decided it.
+//! Each binary's output is captured and printed in cargo's order — its
+//! `Running` header ([`exec::Cmd::preamble`]), its output, and on failure
+//! cargo's `error: test failed, to rerun pass` line — so
+//! [`crate::libtest::failed_tests`] and [`crate::libtest::environment_refusals`]
+//! read it unchanged.
+//!
+//! If the recording pass fails or its records disagree with cargo's headers or
+//! the compile's artifact list, the stage falls back to a serial `targo test
+//! --tests` run. If a caller-configured cargo runner outranks this one so the
+//! recorder never ran, the pass already executed the tests serially and is
+//! judged directly.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -65,14 +60,12 @@ use crate::ladder::Report;
 /// --record-test-binary <dir> <test binary> <its args…>` ([`record_main`]).
 pub const RECORD_FLAG: &str = "--record-test-binary";
 
-/// How many test binaries run at once unless `--test-jobs` says otherwise.
-/// Two at a time already took the run to about 60 % of cargo's serial walk
-/// (`docs/measured/test-pool-2026-09-30.md`).
+/// How many test binaries run at once unless `--test-jobs` says otherwise: the
+/// measured best (the module doc).
 pub const DEFAULT_JOBS: u32 = 8;
 
-// NO BINARY RUNS ALONE. Every live suite scratches under its own pid-keyed
-// world (private sockets, state and HOME), so two binaries booting headless
-// instances never meet, and every binary runs in the pool.
+// Every live suite uses its own pid-keyed scratch directory (private sockets,
+// state, and HOME), so binaries booting headless instances do not collide.
 
 // ---------------------------------------------------------------------------
 // The record: what cargo would have started.
@@ -292,15 +285,10 @@ pub fn runner_config(gate: &Path, dir: &Path) -> Option<String> {
     ))
 }
 
-/// The serial `--tests` child with the recording runner added — the same
-/// selection, flags and environment.
-///
-/// FIRST, BEFORE THE SUBCOMMAND, beside the build-cache `--config` that
-/// [`crate::stages::main_targo`] leads with. A `--config` after the subcommand
-/// replaces every `--config` before it instead of adding to them, so the runner
-/// once put there dropped the build cache: the run built the whole selection a
-/// second time in `target/`, about 150 s of every cold `verify test --all`, after
-/// the compile child had built it in the cache.
+/// The serial `--tests` child with the recording runner prepended before the
+/// subcommand, beside the build-cache `--config` from
+/// [`crate::stages::main_targo`] (a `--config` after the subcommand would
+/// replace `--config` flags before it and drop the build cache).
 #[must_use]
 pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
     let mut c = serial.clone();
@@ -504,9 +492,10 @@ where
         .collect()
 }
 
-/// Run `run(i)` for every index in `order`, `jobs` at a time (at least one),
-/// each started in `order` as a slot frees; the answers come back by index, of
-/// `n`, with `None` for an index `order` does not hold. Nothing is retried; a
+/// Run `run(i)` for each distinct index below `n` in `order`, `jobs` at a time
+/// (at least one). Indices are reserved in `order` as a slot frees; callback
+/// starts may interleave. Answers come back by index, with `None` for an index
+/// `order` does not hold. Nothing is retried; a
 /// `run` that panics is this call's panic once the others are done, as a
 /// scoped thread's is.
 pub fn pool<T, F>(n: usize, order: &[usize], jobs: usize, run: F) -> Vec<Option<T>>

@@ -1951,6 +1951,7 @@ mod tests {
             word: NeedWord::Ask,
             key: 1,
             what: String::new(),
+            harness: None,
         }));
         app.publish_agents_live(false, now + Duration::from_millis(500));
         assert!(
@@ -2394,6 +2395,7 @@ mod tests {
                     word: NeedWord::Ask,
                     key: 7,
                     what: String::new(),
+                    harness: None,
                 }),
                 ..crate::needs::Verdict::default()
             });
@@ -2424,6 +2426,7 @@ mod tests {
                         word: NeedWord::Ask,
                         key,
                         what: "approve?".to_string(),
+                        harness: None,
                     }),
                     ..crate::needs::Verdict::default()
                 });

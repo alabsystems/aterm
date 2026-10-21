@@ -750,17 +750,37 @@ const STEPS_2_1_303: &str = concat!(
     "/../aterm-agent/src/harness/testdata/steps/2.1.303.jsonl"
 );
 
-/// The committed Codex 0.163.0 reductions (5G), reduced again the same way.
-const STEPS_CODEX: [&str; 2] = [
-    concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../aterm-agent/src/harness/testdata/steps/codex-0.163.0.jsonl"
-    ),
-    concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../aterm-agent/src/harness/testdata/steps/codex-0.163.0-subagent.jsonl"
-    ),
-];
+/// Where the committed reductions are.
+const STEPS_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../aterm-agent/src/harness/testdata/steps"
+);
+
+/// Every committed Codex reduction (`codex-*.jsonl`): the 0.163.0 ones (5G),
+/// reduced again the same way, and the codex-alab legs (6D-3a), each
+/// committed as the reducer's fixed point. At least the three of 5G and the
+/// lab's codex-alab legs.
+fn steps_codex() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(STEPS_DIR)
+        .expect("the step testdata")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("codex-") && n.ends_with(".jsonl"))
+        })
+        .collect();
+    paths.sort();
+    assert!(
+        paths.len() >= 2
+            && paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("codex-alab-")),
+        "{paths:?}"
+    );
+    paths
+}
 
 /// A file's rows.
 fn rows_of(text: &str) -> Vec<Node> {
@@ -815,11 +835,12 @@ fn a_tool_argument_name_is_never_kept_as_written() {
     // Its header's form, its rows, ids one to one across keys and values,
     // and no 8-byte run of anyone's words: held on each committed file.
     check_no_text("2.1.303", &committed, &again, Program::Claude).expect("no text");
-    for path in STEPS_CODEX {
-        let text = std::fs::read_to_string(path).expect("a committed reduction");
+    for path in steps_codex() {
+        let text = std::fs::read_to_string(&path).expect("a committed reduction");
         let again = reduce(&text, Program::Codex).expect("reduced");
-        assert!(again.text == text, "{path} is reduced as it was");
-        check_no_text(path, &text, &again, Program::Codex).expect("no text");
+        let name = path.display().to_string();
+        assert!(again.text == text, "{name} is reduced as it was");
+        check_no_text(&name, &text, &again, Program::Codex).expect("no text");
     }
     // Planted row `n` and an earlier rule's reduction of it, `edit` (a
     // `from` written as `to`) made to it.

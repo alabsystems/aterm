@@ -14,9 +14,12 @@ use std::time::Duration;
 use aterm_agent::harness::footer;
 use aterm_slog::Tier;
 
-use super::super::tests::{WALL0, hand_clock, lines, stamp, time_order_holds, with_claude};
+use super::super::tests::{
+    WALL0, hand_clock, lines, lines_of, stamp, time_order_holds, with_claude,
+};
 use super::*;
 use crate::claude_footer::{LogWake, rig};
+use crate::codex_rollout_tap::{Host, Image};
 
 /// The Claude Code process in front ([`with_claude`]'s group).
 const PID: i32 = 300;
@@ -112,7 +115,7 @@ impl Rig {
         {
             let mut g = tl.lock().unwrap();
             let now = g.slog().now();
-            g.slog_mut().open_session(None, now);
+            g.slog_mut().open_session(None, None, now);
         }
         Rig::on(name, tl, hand)
     }
@@ -412,6 +415,7 @@ fn timed(tl: &Mutex<SessionTimeline>, batch: &StepBatch) -> (Applied, Vec<(Hold,
     let mut booked = Vec::new();
     let applied = apply_batch_timed(
         tl,
+        Source::Transcript,
         batch,
         false,
         &mut || {
@@ -473,7 +477,7 @@ fn each_chunk_hold_is_timed_and_booked_by_its_kind() {
     {
         let mut g = tl.lock().unwrap();
         let now = g.slog().now();
-        g.slog_mut().open_session(None, now);
+        g.slog_mut().open_session(None, None, now);
     }
     let (applied, booked) = timed(&tl, &compactions(81));
     assert!(applied.disarm && applied.events == 0, "{applied:?}");
@@ -653,4 +657,689 @@ fn a_transcripts_text_never_reaches_the_log() {
         "{content:?}"
     );
     assert!(!bus.join("\n").contains("SENTINELTOOL"), "{bus:?}");
+}
+
+// ---- the codex-alab rollout tap (session log 5G-3; plan A1's 6D-3b) ------
+
+/// A thread id in UUIDv7 form: created 2025-10-20T05:03:11Z, so its rollout
+/// sits in that UTC day's folder ([`rollout_rows`]).
+const THREAD: &str = "019a0000-0000-7000-8000-00000000000a";
+
+/// The thread's rollout rows on `build`, stamped `ms` into the test: its
+/// `session_meta`, a turn (`turn-1`) with its call, its count and its end,
+/// and a turn (`turn-2`) the usage wall ends; every text a sentinel (never
+/// kept, ruling S6).
+fn rollout_rows(build: &str) -> String {
+    rollout_rows_as(THREAD, build, 0, "turn")
+}
+
+/// [`rollout_rows`] of `thread`, every stamp `late` ms later, its turns
+/// `<turn>-1` and `<turn>-2`.
+fn rollout_rows_as(thread: &str, build: &str, late: u64, turn: &str) -> String {
+    let at = |ms: u64| at(late + ms);
+    let rows = [
+        format!(
+            r#"{{"timestamp":"{t}","type":"session_meta","payload":{{"session_id":"{thread}","id":"{thread}","timestamp":"{t}","cwd":"/private/tmp/x","originator":"codex-tui","cli_version":"{build}","source":"cli","history_mode":"paginated","base_instructions":{{"text":"SENTINEL-INSTRUCTIONS"}}}}}}"#,
+            t = at(100)
+        ),
+        format!(
+            r#"{{"timestamp":"{}","type":"turn_context","payload":{{"turn_id":"{turn}-1","root_turn_id":"{turn}-1","cwd":"/private/tmp/x","approval_policy":"on-request","model":"gpt-5.5","effort":"high","user_instructions":"SENTINEL-PROMPT"}}}}"#,
+            at(1_500)
+        ),
+        format!(
+            r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"function_call","name":"exec_command","arguments":"{{\"cmd\":\"SENTINEL-INPUT\"}}","call_id":"call_r0010"}}}}"#,
+            at(1_800)
+        ),
+        format!(
+            r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"function_call_output","call_id":"call_r0010","output":"SENTINEL-RESULT"}}}}"#,
+            at(2_000)
+        ),
+        format!(
+            r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":1200,"cached_input_tokens":1000,"output_tokens":40,"reasoning_output_tokens":0,"total_tokens":1240}},"last_token_usage":{{"input_tokens":1200,"cached_input_tokens":1000,"output_tokens":40,"reasoning_output_tokens":0,"total_tokens":1240}}}}}}}}"#,
+            at(2_500)
+        ),
+        format!(
+            r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn}-1","last_agent_message":"SENTINEL-REPLY","duration_ms":1800}}}}"#,
+            at(3_300)
+        ),
+        format!(
+            r#"{{"timestamp":"{}","type":"turn_context","payload":{{"turn_id":"{turn}-2","root_turn_id":"{turn}-2","cwd":"/private/tmp/x","approval_policy":"on-request","model":"gpt-5.5","effort":"high"}}}}"#,
+            at(4_000)
+        ),
+        format!(
+            r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn}-2","last_agent_message":null,"error":{{"message":"SENTINEL-NOTICE","codex_error_info":"usage_limit_exceeded"}},"duration_ms":32}}}}"#,
+            at(4_100)
+        ),
+    ];
+    rows.iter().map(|r| format!("{r}\n")).collect()
+}
+
+/// A session with `agent` in front, its run open, on a hand clock moved
+/// past the rows; a `CODEX_HOME` holding [`THREAD`]'s rollout on `build`;
+/// and the target a proven claim's copy would name for it.
+fn codex_rig(
+    name: &str,
+    agent: &str,
+    build: &str,
+) -> (
+    Arc<Mutex<SessionTimeline>>,
+    aterm_tempfile::TempDir,
+    crate::self_claim::RolloutTarget,
+    RolloutClaim,
+) {
+    codex_rig_opened(name, agent, build, 0)
+}
+
+/// [`codex_rig`], the run opened `opened` ms into the test.
+fn codex_rig_opened(
+    name: &str,
+    agent: &str,
+    build: &str,
+    opened: u64,
+) -> (
+    Arc<Mutex<SessionTimeline>>,
+    aterm_tempfile::TempDir,
+    crate::self_claim::RolloutTarget,
+    RolloutClaim,
+) {
+    let ctx = crate::session_store::test_handle(0xC0DE).ctx;
+    let tl = Arc::clone(&ctx.timeline);
+    let hand = hand_clock(&tl);
+    {
+        let mut g = tl.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut().open_session(None, None, now);
+        g.note_root_group(100);
+    }
+    hand.set(opened);
+    super::super::tests::with_agent(&tl, agent);
+    hand.set(10_000);
+    let home = aterm_tempfile::Builder::new()
+        .prefix(&format!("slog-rollout-{name}-"))
+        .tempdir()
+        .expect("temp dir");
+    let day = home.path().join("sessions/2025/10/20");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join(format!("rollout-2025-10-19T22-03-11-{THREAD}.jsonl")),
+        rollout_rows(build),
+    )
+    .unwrap();
+    let target = crate::self_claim::RolloutTarget {
+        revision: 1,
+        // A stand-in claimant: looked at through an `Image` of the test's.
+        pid: 300,
+        start: "Mon Oct 20 16:37:58 2026".to_string(),
+        thread: THREAD.to_string(),
+        home: home.path().to_path_buf(),
+    };
+    set_rollout_claim(&ctx, &target);
+    (tl, home, target, RolloutClaim(ctx))
+}
+
+/// Holds a real fd-less context and retires its captured copy after the
+/// test, without starting a claimant or asking the kernel for its identity.
+struct RolloutClaim(Arc<crate::SessionCtx>);
+
+impl Drop for RolloutClaim {
+    fn drop(&mut self) {
+        crate::self_claim::forget(self.0.self_id.as_str());
+    }
+}
+
+fn set_rollout_claim(ctx: &crate::SessionCtx, target: &crate::self_claim::RolloutTarget) {
+    use aterm_agent::harness::self_claimed::{Copy, Record, Seen};
+    let mut meta = ctx.meta.lock().unwrap();
+    meta.supervisor_revision = target.revision;
+    meta.supervisor = Some(crate::session_timeline::SupervisorClaim {
+        holder: format!("codex-alab@{}", target.pid),
+        conn: Some(1),
+        expires_us: None,
+        proven: Some(crate::self_claim::Proven {
+            pid: target.pid,
+            start: target.start.clone(),
+        }),
+    });
+    crate::self_claim::set_copy_for_test(
+        ctx.self_id.as_str(),
+        Some(Copy {
+            pid: target.pid,
+            start: target.start.clone(),
+            home: target.home.clone(),
+            seen: Seen::Present(Record {
+                pid: target.pid,
+                session_id: Some(target.thread.clone()),
+                resume_argv: None,
+                env: Vec::new(),
+                status: Some("busy".into()),
+                exit: None,
+                cwd: None,
+                draft_empty: None,
+                frame: None,
+            }),
+            resume: Err("captured-no-resume"),
+        }),
+    );
+}
+
+fn captured_start(_: u32) -> Option<String> {
+    Some("Mon Oct 20 16:37:58 2026".to_string())
+}
+
+/// A captured identity with no wall-ms birth reading (so the run's floor
+/// stands), running the measured build. No actual process is inspected.
+const MEASURED: Image = Image {
+    start: captured_start,
+    born_ms: unborn,
+    build: alab_12521,
+};
+
+fn unborn(_: u32) -> Option<u64> {
+    None
+}
+
+fn alab_12521(_: u32) -> Option<String> {
+    Some("0.164.0-dev.12521+g3d3eb12d8".to_string())
+}
+
+/// A CODEX-ALAB'S ROLLOUT ROW REACHES `log` on the rollout tap's own thread
+/// (session log 5G-3; plan A1's 6D-3b; ruling T15): a Codex run in front,
+/// the thread its proven claim's copy names, its rollout on a measured
+/// build. Its turn opens and closes from the rollout (`src=transcript`,
+/// exact), its call opens and closes under it, its numbers are the
+/// rollout's own, the model is said with the build's release, and no
+/// rollout text reaches any record. A hang detector (`MUST_HAPPEN`), never
+/// a latency budget. NEGATIVE CONTROLS, asked before it on the same thread
+/// (where the run admits an ask, the queue preserves its order): the same rows on a
+/// vendor build (0.163.0) bind nothing, and a Claude run in front takes no
+/// rollout step.
+#[test]
+fn a_codex_alab_rollout_row_reaches_the_log_through_the_rollout_tap() {
+    let (vendor, _vendor_home, vendor_target, vendor_claim) =
+        codex_rig("vendor", "codex", "0.163.0");
+    let (claude, _claude_home, claude_target, claude_claim) =
+        codex_rig("claude", "claude", "0.164.0-dev.12521+g3d3eb12d8");
+    let (tl, _home, target, claim) = codex_rig("alab", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let wake = LogWake::default();
+    let ask = |session, claim: &RolloutClaim, target| {
+        crate::codex_rollout_tap::request_as(session, &claim.0, target, &wake, MEASURED);
+    };
+    ask(0xC0DE_0001, &vendor_claim, vendor_target);
+    ask(0xC0DE_0002, &claude_claim, claude_target);
+    ask(0xC0DE_0003, &claim, target);
+    let got = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the rollout's usage wall in the log",
+        || {
+            let got = lines_of(&tl);
+            got.iter()
+                .any(|l| l.contains(" out=wall:usage-session "))
+                .then_some(got)
+        },
+    );
+    let one = |needle: &str| {
+        let found = having(&got, needle);
+        assert_eq!(found.len(), 1, "{needle}: {got:#?}");
+        found[0].clone()
+    };
+    assert!(
+        one(" source field=transcript ").contains(" state=on "),
+        "{got:#?}"
+    );
+    let open = one(" open t1 turn ");
+    assert!(
+        open.contains(" vref=turn-1 ") && open.contains(" src=transcript conf=exact "),
+        "{open}"
+    );
+    let call = one(" open p");
+    assert!(
+        call.contains(" tool=exec_command ") && call.contains(" vref=call_r0010 "),
+        "{call}"
+    );
+    assert_eq!(having(&got, " tool out=ok ").len(), 1, "{got:#?}");
+    let close = one(" close t1 turn ");
+    assert!(
+        close.contains(" out=done ") && close.contains(" src=transcript conf=exact "),
+        "{close}"
+    );
+    // The second turn ends on the usage wall, confirmed by the rollout.
+    assert!(one(" open t2 turn ").contains(" vref=turn-2 "), "{got:#?}");
+    assert!(
+        one(" out=wall:usage-session ").contains(" amend t2 turn ")
+            && one(" out=wall:usage-session ").contains(" src=transcript conf=exact "),
+        "{got:#?}"
+    );
+    assert!(
+        got.iter().any(|l| l.contains(" vdur_ms=1800 ")
+            && l.contains(" tok_in=1200 ")
+            && l.contains(" tok_out=40 ")),
+        "{got:#?}"
+    );
+    assert!(
+        got.iter()
+            .any(|l| l.contains(" model=gpt-5.5 ") && l.contains(" ver=0.164.0-dev.12521 ")),
+        "{got:#?}"
+    );
+    for l in &got {
+        assert!(!l.contains("SENTINEL"), "rollout text in the log: {l}");
+    }
+    time_order_holds(&got).unwrap_or_else(|e| panic!("{e}: {got:#?}"));
+    // NEGATIVE CONTROLS, read before it: nothing bound, nothing stepped.
+    for (what, other) in [("vendor", &vendor), ("claude", &claude)] {
+        let lines = lines_of(other);
+        assert!(
+            having(&lines, " source field=transcript ").is_empty()
+                && having(&lines, "turn-1").is_empty(),
+            "{what}: {lines:#?}"
+        );
+    }
+}
+
+/// The turns `got` opened, by their `vref`.
+fn turns_opened(got: &[String]) -> Vec<String> {
+    got.iter()
+        .filter(|l| l.contains(" turn ") && l.contains(" open t"))
+        .filter_map(|l| l.split(" vref=").nth(1))
+        .filter_map(|v| v.split(' ').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A TURN WRITTEN BEFORE THE RUN OPENED is history to the tap's fold as it
+/// is to the tracker (`codex "prompt"`, a relaunch that carries a turn on):
+/// the tap is armed with the run's open as its floor, so the first turn the
+/// log takes says the model, though the history's turn named the same one.
+/// NEGATIVE CONTROL (scratch, the unit's notes): arming with the join's
+/// floor alone lets the history's turn say the model, which the tracker
+/// drops, and the run never names it.
+#[test]
+fn a_turn_before_the_runs_open_is_history_and_the_next_says_the_model() {
+    let (tl, _home, target, claim) =
+        codex_rig_opened("opened", "codex", "0.164.0-dev.12521+g3d3eb12d8", 3_500);
+    let mut host = Host::default();
+    let _ = host.ask(0xC0DE_0011, &claim.0, target, MEASURED);
+    let got = lines_of(&tl);
+    assert_eq!(turns_opened(&got), ["turn-2"], "{got:#?}");
+    assert!(
+        got.iter()
+            .any(|l| l.contains(" model=gpt-5.5 ") && l.contains(" ver=0.164.0-dev.12521 ")),
+        "{got:#?}"
+    );
+}
+
+/// The claimant born after the first turn.
+fn born_late(_: u32) -> Option<u64> {
+    Some(WALL0 + 3_500)
+}
+
+fn alab_unmeasured(_: u32) -> Option<String> {
+    Some("0.164.0-dev.99999+g0123abcd".to_string())
+}
+
+/// THE HOST LOOKS AT THE CLAIMANT (`codex_rollout_tap::read_once`): the
+/// process's start floors the read, so a turn its rollout held from before
+/// it (a thread it resumed) is history; and the build its image runs now
+/// decides with the rollout's own, so a thread started on a measured build
+/// whose claimant runs one nobody measured binds nothing. NEGATIVE CONTROLS
+/// (scratch, the unit's notes): a floor without the process's start takes
+/// the earlier turn; the build of the thread alone binds the unmeasured
+/// claimant's rollout.
+#[test]
+fn the_host_floors_at_the_claimants_start_and_holds_it_to_its_build() {
+    let (tl, _home, target, claim) = codex_rig("born", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let mut host = Host::default();
+    let born = Image {
+        start: captured_start,
+        born_ms: born_late,
+        build: alab_12521,
+    };
+    let _ = host.ask(0xC0DE_0021, &claim.0, target, born);
+    let got = lines_of(&tl);
+    assert_eq!(turns_opened(&got), ["turn-2"], "{got:#?}");
+    let (tl, _home, target, claim) = codex_rig("running", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let unmeasured = Image {
+        start: captured_start,
+        born_ms: unborn,
+        build: alab_unmeasured,
+    };
+    let _ = host.ask(0xC0DE_0022, &claim.0, target, unmeasured);
+    let got = lines_of(&tl);
+    assert!(
+        having(&got, " source field=transcript ").is_empty() && turns_opened(&got).is_empty(),
+        "{got:#?}"
+    );
+}
+
+/// EACH ASK THE ROLLOUT TAP ANSWERS IS COUNTED, AFTER ITS RECORDS (B5c;
+/// `status rollout= rollout_asks=`, the fence the lab's rollout leg reads
+/// past): one ask as the tap's thread answers it (`read_once`) writes a
+/// measured thread's turns and moves the count with the log's last seq at
+/// or past every record it wrote; never asked, `-` and 0; the read and apply
+/// of a measured thread's ask alone put its turns in the log and count
+/// nothing; the ask answered, `bound` and 1; asked again, 2, nothing read
+/// twice. A claimant running an unmeasured build and a vendor thread's
+/// rollout are counted as `unmeasured`. A Claude run in front and a claim
+/// naming no thread id are refused before a job is queued, so neither is
+/// counted. NEGATIVE CONTROLS (scratch, the unit's notes): an
+/// ask never counted, one counted at the start of `read_once` (before its
+/// records) or of its read, and a word that is always `bound` each fail it.
+#[test]
+fn each_ask_the_rollout_tap_answers_is_counted_after_its_records() {
+    let fields = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().slog().rollout_fields();
+    let last_seq = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().slog().log().last_seq();
+    let mut host = Host::default();
+    // The order on the tap thread's own path: records first, then the count.
+    let (tl, _home, target, claim) =
+        codex_rig("asks-order", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let before = last_seq(&tl);
+    let _ = host.ask(0xC0DE_0040, &claim.0, target, MEASURED);
+    let after = last_seq(&tl);
+    assert_eq!(turns_opened(&lines_of(&tl)), ["turn-1", "turn-2"]);
+    assert!(
+        after > before,
+        "the ask wrote its records: {before} -> {after}"
+    );
+    assert_eq!(
+        tl.lock().unwrap().slog().rollout_counted_at(),
+        after,
+        "counted after every record the ask wrote (the log stood at {before} before it)"
+    );
+    assert_eq!(fields(&tl), "rollout=bound rollout_asks=1");
+    let (tl, _home, target, claim) = codex_rig("asks", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    assert_eq!(fields(&tl), "rollout=- rollout_asks=0");
+    assert_eq!(
+        host.read_on(0xC0DE_0041, &claim.0, target.clone(), MEASURED),
+        "bound"
+    );
+    assert_eq!(turns_opened(&lines_of(&tl)), ["turn-1", "turn-2"]);
+    assert_eq!(
+        fields(&tl),
+        "rollout=- rollout_asks=0",
+        "the read and apply alone count nothing"
+    );
+    let _ = host.ask(0xC0DE_0041, &claim.0, target.clone(), MEASURED);
+    assert_eq!(fields(&tl), "rollout=bound rollout_asks=1");
+    let _ = host.ask(0xC0DE_0041, &claim.0, target, MEASURED);
+    assert_eq!(fields(&tl), "rollout=bound rollout_asks=2");
+    assert_eq!(turns_opened(&lines_of(&tl)), ["turn-1", "turn-2"]);
+    let unmeasured = Image {
+        start: captured_start,
+        born_ms: unborn,
+        build: alab_unmeasured,
+    };
+    for ((name, agent, build, image, thread, word, asks), session) in [
+        (
+            "running",
+            "codex",
+            "0.164.0-dev.12521+g3d3eb12d8",
+            unmeasured,
+            None,
+            "unmeasured",
+            1,
+        ),
+        (
+            "vendor",
+            "codex",
+            "0.163.0",
+            MEASURED,
+            None,
+            "unmeasured",
+            1,
+        ),
+        (
+            "claude",
+            "claude",
+            "0.164.0-dev.12521+g3d3eb12d8",
+            MEASURED,
+            None,
+            "-",
+            0,
+        ),
+        (
+            "thread",
+            "codex",
+            "0.164.0-dev.12521+g3d3eb12d8",
+            MEASURED,
+            Some("not-a-thread"),
+            "-",
+            0,
+        ),
+    ]
+    .into_iter()
+    .zip(0xC0DE_0050_u64..)
+    {
+        let (tl, _home, target, claim) = codex_rig(&format!("asks-{name}"), agent, build);
+        let target = crate::self_claim::RolloutTarget {
+            thread: thread.map_or(target.thread.clone(), str::to_string),
+            ..target
+        };
+        set_rollout_claim(&claim.0, &target);
+        let _ = host.ask(session, &claim.0, target, image);
+        assert_eq!(
+            fields(&tl),
+            format!("rollout={word} rollout_asks={asks}"),
+            "{name}"
+        );
+        let got = lines_of(&tl);
+        assert!(turns_opened(&got).is_empty(), "{name}: {got:#?}");
+    }
+}
+
+/// THE SWEEP'S STOP IS SAID (B5c; `status rollout=stopped`): the status
+/// sweep's look whose claimant left the front ([`Ask::Stop`], through the
+/// sweep's own [`crate::codex_rollout_tap::follow_ask_as`]) reaches the tap's
+/// thread after the ask sent before it, so the read's turns are in the log,
+/// the count stays 1 and the word becomes `stopped`, where it used to keep
+/// `bound` for good; a session the tap never answered stays `-`; asked
+/// again, the tap answers afresh (`bound`, 2). A hang detector
+/// (`MUST_HAPPEN`), never a latency budget. NEGATIVE CONTROLS (scratch, the
+/// unit's notes): a stop that never says it, a sweep stop sent as a
+/// retirement's (no timeline), a stop said for a session never asked, and
+/// one that lowers the count each fail it.
+#[test]
+fn a_stopped_rollout_tap_says_stopped_and_keeps_its_count() {
+    use crate::codex_rollout_tap::{Ask, follow_ask_as};
+    let fields = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().slog().rollout_fields();
+    let (never, _never_home, _, never_claim) =
+        codex_rig("stop-never", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let (tl, _home, target, claim) = codex_rig("stop", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let wake = LogWake::default();
+    // The read first: it starts the tap's thread, so both stops reach it.
+    follow_ask_as(
+        Ask::Read(target.clone()),
+        0xC0DE_0062,
+        &claim.0,
+        &wake,
+        MEASURED,
+    );
+    follow_ask_as(Ask::Stop, 0xC0DE_0061, &never_claim.0, &wake, MEASURED);
+    follow_ask_as(Ask::Stop, 0xC0DE_0062, &claim.0, &wake, MEASURED);
+    let said = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the sweep's stop said in status",
+        || {
+            let said = fields(&tl);
+            said.starts_with("rollout=stopped ").then_some(said)
+        },
+    );
+    assert_eq!(said, "rollout=stopped rollout_asks=1");
+    assert_eq!(turns_opened(&lines_of(&tl)), ["turn-1", "turn-2"]);
+    // Its stop was answered before the stop sent after it.
+    assert_eq!(fields(&never), "rollout=- rollout_asks=0", "never asked");
+    follow_ask_as(Ask::Read(target), 0xC0DE_0062, &claim.0, &wake, MEASURED);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the tap asked again answers afresh",
+        || (fields(&tl) == "rollout=bound rollout_asks=2").then_some(()),
+    );
+}
+
+/// A NEW TARGET IS A NEW TAP: the claim's copy naming another thread (a new
+/// conversation in the same process, or another process's) replaces the
+/// session's tap, so the new thread's rollout reaches the log; asked again
+/// on the same target, nothing is read twice. NEGATIVE CONTROL (scratch, the
+/// unit's notes): a tap kept across targets reads the first thread on, and
+/// the new one's turns never reach the log.
+#[test]
+fn a_new_target_is_read_by_a_new_tap() {
+    const NEXT: &str = "019a0000-0000-7000-8000-00000000000b";
+    let (tl, home, target, claim) = codex_rig("target", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let mut host = Host::default();
+    let _ = host.ask(0xC0DE_0031, &claim.0, target.clone(), MEASURED);
+    assert_eq!(turns_opened(&lines_of(&tl)), ["turn-1", "turn-2"]);
+    let _ = host.ask(0xC0DE_0031, &claim.0, target.clone(), MEASURED);
+    assert_eq!(turns_opened(&lines_of(&tl)), ["turn-1", "turn-2"]);
+    std::fs::write(
+        home.path().join(format!(
+            "sessions/2025/10/20/rollout-2025-10-19T22-03-11-{NEXT}.jsonl"
+        )),
+        rollout_rows_as(NEXT, "0.164.0-dev.12521+g3d3eb12d8", 5_000, "next"),
+    )
+    .unwrap();
+    let next = crate::self_claim::RolloutTarget {
+        revision: target.revision + 1,
+        thread: NEXT.to_string(),
+        ..target
+    };
+    set_rollout_claim(&claim.0, &next);
+    let _ = host.ask(0xC0DE_0031, &claim.0, next, MEASURED);
+    let got = lines_of(&tl);
+    assert_eq!(
+        turns_opened(&got),
+        ["turn-1", "turn-2", "next-1", "next-2"],
+        "{got:#?}"
+    );
+
+    // A queued read still belongs to its captured run AND current claim's
+    // exact record. Exercise both dequeue and the post-IO apply boundary.
+    for after_io in [false, true] {
+        for change in ["run", "released", "renewed", "thread", "home"] {
+            let (tl, home, target, claim) =
+                codex_rig("stale", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+            // These rows follow the replacement run's open (10,000), so a
+            // timestamp floor alone cannot keep this old thread out of it.
+            std::fs::write(
+                home.path().join(format!(
+                    "sessions/2025/10/20/rollout-2025-10-19T22-03-11-{THREAD}.jsonl"
+                )),
+                rollout_rows_as(THREAD, "0.164.0-dev.12521+g3d3eb12d8", 20_000, "stale"),
+            )
+            .unwrap();
+            let before = tl
+                .lock()
+                .unwrap()
+                .slog()
+                .transcript_arm(Source::Rollout)
+                .unwrap()
+                .run;
+            let change_owner = || match change {
+                "run" => {
+                    let mut g = tl.lock().unwrap();
+                    assert!(g.note_foreground_group(301));
+                    assert!(g.set_program(301, Some("codex".into())));
+                    g.sweep_slog(&crate::session_log::BlockRead::default(), false, 100, 301);
+                    assert_ne!(
+                        g.slog().transcript_arm(Source::Rollout).unwrap().run,
+                        before
+                    );
+                }
+                "released" => {
+                    let mut meta = claim.0.meta.lock().unwrap();
+                    meta.supervisor = None;
+                    meta.supervisor_revision += 1;
+                }
+                "renewed" | "thread" | "home" => {
+                    let mut changed = target.clone();
+                    match change {
+                        "renewed" => changed.revision += 1,
+                        "thread" => changed.thread = NEXT.into(),
+                        "home" => changed.home = home.path().join("other-home"),
+                        _ => unreachable!(),
+                    }
+                    set_rollout_claim(&claim.0, &changed);
+                }
+                _ => unreachable!(),
+            };
+            let mut host = Host::default();
+            let result = host.queued(
+                0xC0DE_0032,
+                &claim.0,
+                target.clone(),
+                MEASURED,
+                (
+                    || {
+                        if !after_io {
+                            change_owner();
+                        }
+                    },
+                    || {
+                        if after_io {
+                            change_owner();
+                        }
+                    },
+                ),
+            );
+            assert!(
+                result.is_none_or(|r| r.disarm && r.events == 0),
+                "{change}, after_io={after_io}: {result:?}"
+            );
+            assert_eq!(
+                tl.lock().unwrap().slog().rollout_fields(),
+                "rollout=stale rollout_asks=1",
+                "the refused queued ask is counted after its guarded read/apply"
+            );
+            let got = lines_of(&tl);
+            assert!(
+                turns_opened(&got).is_empty()
+                    && having(&got, " source field=transcript ").is_empty(),
+                "{change}, after_io={after_io}: {got:#?}"
+            );
+            if change == "run" {
+                // Even a fresh ask cannot pair background A with run B.
+                assert!(
+                    host.ask(0xC0DE_0032, &claim.0, target.clone(), MEASURED)
+                        .is_none()
+                );
+                // B's own proof and a fresh ask can proceed; refusal of A
+                // does not disable later work for the replacement run.
+                let current = crate::self_claim::RolloutTarget {
+                    pid: 301,
+                    revision: target.revision + 1,
+                    ..target
+                };
+                set_rollout_claim(&claim.0, &current);
+                let applied = host.ask(0xC0DE_0032, &claim.0, current, MEASURED).unwrap();
+                assert!(!applied.disarm);
+                assert_eq!(turns_opened(&lines_of(&tl)), ["stale-1", "stale-2"]);
+            }
+        }
+    }
+    let (tl, _home, target, claim) =
+        codex_rig("unread-start", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let mut host = Host::default();
+    assert!(
+        host.ask(
+            0xC0DE_0033,
+            &claim.0,
+            target.clone(),
+            Image {
+                start: |_| None,
+                ..MEASURED
+            }
+        )
+        .is_none()
+    );
+    assert!(
+        host.ask(
+            0xC0DE_0033,
+            &claim.0,
+            target,
+            Image {
+                start: |_| Some("another process".into()),
+                ..MEASURED
+            }
+        )
+        .is_none()
+    );
+    assert!(turns_opened(&lines_of(&tl)).is_empty());
 }

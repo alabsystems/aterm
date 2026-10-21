@@ -214,6 +214,10 @@ mod tests {
         const TEST: &str =
             "stop::tests::a_second_interrupt_runs_the_hard_exit_act_and_ends_the_run";
         if std::env::var_os(PROBE).is_some() {
+            // Interrupts start at their default, whatever the runner left: a
+            // background job of a non-interactive shell starts with INT ignored,
+            // which `install` keeps ignored (`nohup`), and the probe would sleep.
+            crate::sys::start_signal(libc::SIGINT, false);
             super::install();
             super::at_hard_exit(hard_exit_act);
             let me = i32::try_from(std::process::id()).expect("pid");

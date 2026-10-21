@@ -25,18 +25,24 @@
 //!   tenth, and `mark <run> goal state=on|off` when its goal does;
 //! - `amend r<n> agent ver= model= effort= src=screen conf=strong`, the
 //!   launch card's names (a transcript's exact amend outranks it);
-//! - `mark - render state=desync-risk|healed|unjudged`, each transition of
-//!   the resize ledger's verdict;
+//! - `mark - render state=desync-risk|healed …`, each transition of the
+//!   resize ledger's verdict, with every field of its row (phase 6, 6F-7);
 //! - `mark - cwd cwd=<path>` when the OSC 7 directory moves (`cwd=` absent
 //!   for a cleared one), and `mark - title title=<informative title>`
 //!   (content tier: never journaled, never carried) when the title moves
 //!   past a spinner frame, from the drift flush;
 //! - `mark - modes n=<reverted>`, the modes a handback or a manual reset
-//!   put back;
-//! - `mark - in-doubt verb=<w>`, a keyed write whose outcome is unknown
-//!   (the producer's verb, never its bytes);
+//!   put back, since phase 6 (6F-7) on every row with its `source=` or
+//!   `from_pg= to_pg= prog=`, `reverted=` and `bytes=`;
+//! - `mark - in-doubt verb=<w> producer= key_seq=`, a keyed write whose
+//!   outcome is unknown (never its bytes; its reply's first two words at
+//!   the content tier, 6F-7);
 //! - `mark - mail dir=in|out …`, `mail-seen`, `mail-landed` and `hold`, from
-//!   the fabric's one typed hook (`FabricFact`), never a body;
+//!   the fabric's one typed hook (`FabricFact`), never a body; since phase
+//!   6 (6F-6) each with every field of its row: a post's `re= dl=` and, host
+//!   tier, `via= idem=`; every `inbox seen` with `moved=0|1` (the fold folds
+//!   only moves); a post landed nowhere with its `why=`; a hold's `origin=
+//!   hold_origin=` and its reason at the content tier;
 //! - `mark - meta field=<f> value=<v>` by its writer, from the one
 //!   `meta-change` writer (`SessionTimeline::record_meta_change`) — for
 //!   `attention`, whose text can hold a box's command or a question's words
@@ -49,7 +55,33 @@
 //!   reading the harness worker takes while `[harness] usage_tap` is on;
 //! - `mark - task rev= state= attention= [why=] [code=] src=aterm
 //!   conf=exact`, each move of a worker's task record (phase 5, 5C-3), in
-//!   the hold that records its `task-change` row.
+//!   the hold that records its `task-change` row;
+//! - `mark <run> program state=<idle|working|blocked|done|error|none>
+//!   [ask=<permission|question|auth>] [coalesced=<n>] src=engine
+//!   conf=claim`, each move of what the program in front says about itself
+//!   (OSC 7501) that the status sweep's gate shows, in the hold that records
+//!   its `program-state` row (phase 6, 6F-4; rulings U17, U44): a per-run
+//!   bucket of [`PROGRAM_BURST`], then one each [`PROGRAM_REFILL_MS`],
+//!   bounds a flapping program, and a move that finds it empty is
+//!   COALESCED, never dropped: it replaces the run's one pending state, and
+//!   the newest is written once a token frees (at the next move or status
+//!   sweep, [`SessionLog::program_tick`]) with `coalesced=` the states it
+//!   replaced. WHERE IT LANDS: on the run in front when the gate shows the
+//!   move (`-` with none open); a run's pending state is written on that run
+//!   before it closes (every run close is `SessionLog::close_node`), before
+//!   the session closes and before an update's carry, so the move the gate
+//!   shows once the program left (its report cleared, `state=none`) is the
+//!   next front's, and no program mark ever falls to the deepest open node.
+//!   The log keeps [`aterm_slog::program_share`] of them a run (64, T6); the
+//!   fold never reads them and `brief` prints none;
+//! - THE RING-ONLY FACTS (phase 6, 6F-5), each in the hold that records its
+//!   ring row: `mark - state state=<w>` each registry move
+//!   ([`SessionLog::observe_state`]; the close is the session's close
+//!   record); `mark - policy gen=<n>` on every session the harness policy
+//!   cell moves on (ruling U16); and from the fabric's hook `mark - advisory
+//!   origin=<w> gen=<n>` (its reason at the content tier), `mark -
+//!   mail-fetch off=<n>` (ruling U15) and `mark - topic change=add|drop
+//!   fp=<16 hex>` (the name and `since=` at the content tier, ruling U11).
 //!
 //! None of it is input, and none of it names a PTY path (slog-inert).
 
@@ -57,11 +89,60 @@ use aterm_slog::{
     Amend, BoundedText, BoundedToken, Conf, Fields, Key, Kind, Mark, Node, Src, Stamp, Val,
 };
 
-use super::{SessionLog, name_fp, with};
+use super::{SessionLog, name_fp, tok, with};
 
 /// A bell is said at most this often (monotonic ms): a flood of BELs is one
 /// count a second.
 pub(crate) const BELL_EVERY_MS: u64 = 1_000;
+
+/// A program's moves written at once before its run's bucket is empty
+/// (6F-4, U17): the mark limiter's burst.
+pub(crate) const PROGRAM_BURST: u64 = 20;
+/// Past the burst, a program's run earns one program mark this often
+/// (monotonic ms).
+pub(crate) const PROGRAM_REFILL_MS: u64 = 1_000;
+/// A full bucket, in thousandths of a token.
+const PROGRAM_FULL_MILLI: u64 = PROGRAM_BURST * 1_000;
+
+/// What the program in front says about itself, as its mark words it: the
+/// `state` word (`none` once the shown report went away) and the `ask` word
+/// of a blocked one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramWords {
+    pub(crate) state: &'static str,
+    pub(crate) ask: Option<&'static str>,
+}
+
+impl ProgramWords {
+    /// The words of the shown report `shown` (`None`: none shown).
+    pub(crate) fn of(shown: Option<aterm_core::terminal::program_state::ProgramState>) -> Self {
+        shown.map_or(
+            ProgramWords {
+                state: "none",
+                ask: None,
+            },
+            |s| ProgramWords {
+                state: s.state.as_str(),
+                ask: s.kind.map(|k| k.as_str()),
+            },
+        )
+    }
+}
+
+/// THE PROGRAM MARKS' BUCKET (6F-4; rulings U17, U44): the run in front's
+/// tokens, and the newest move not yet written. A move that finds no token
+/// replaces the pending one, counted; the pending state is written as soon
+/// as a token frees, so the newest is never lost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProgramMarks {
+    /// The run the bucket is the share of (`None`: no move yet).
+    run: Option<Node>,
+    /// Its tokens, in thousandths, as of `at` (monotonic ms).
+    milli: u64,
+    at: u64,
+    /// The newest move not yet written, and how many states it replaced.
+    pending: Option<(ProgramWords, u64)>,
+}
 
 /// What the engine says, read under the status sweep's terminal guard
 /// ([`Self::of`]) and written once that guard is released.
@@ -99,6 +180,21 @@ pub(crate) struct StatusFacts {
     pub(crate) conf: Conf,
 }
 
+/// What put a session's modes back ([`SessionLog::observe_modes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModesFrom<'a> {
+    /// A manual reset, by its source word (`manual_reset::ResetSource`'s
+    /// `ctl|menu`).
+    Reset(&'static str),
+    /// A foreground handback: the group that lost the terminal, the one that
+    /// holds it now, and the program the timeline names for the first.
+    Handback {
+        from: i32,
+        to: i32,
+        program: Option<&'a str>,
+    },
+}
+
 /// What each kind of mark last wrote ([`SessionLog`]'s `observed`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Observed {
@@ -114,7 +210,6 @@ pub(crate) struct Observed {
     bell_at: Option<u64>,
     /// The progress state and its tenth.
     progress: Option<(&'static str, Option<u8>)>,
-    render: Option<&'static str>,
     /// The cwd and the informative title last said, as fingerprints
     /// ([`name_fp`]; 0: cleared): the carry holds no text (ruling S5).
     cwd: Option<u64>,
@@ -125,6 +220,9 @@ pub(crate) struct Observed {
     /// Each meta field's value as the log last said it, a fingerprint
     /// ([`name_fp`]; 0: unset), at most [`META_FIELDS_MAX`] fields.
     meta: Vec<(String, u64)>,
+    /// The program marks' bucket (this process's: a successor starts a full
+    /// one, and the carry writes any pending state first).
+    program: ProgramMarks,
 }
 
 /// The most meta fields [`Observed`] remembers: every user field and the
@@ -188,7 +286,6 @@ const PROGRESS_WORDS: &[&str] = &[
     "paused",
     "unknown",
 ];
-const RENDER_WORDS: &[&str] = &["desync-risk", "healed", "unjudged"];
 
 impl Observed {
     /// The carry's tokens for the `state` host line (additive: a reader
@@ -212,9 +309,6 @@ impl Observed {
                 Some(d) => s.push_str(&format!(" obs_prog={w}.{d}")),
                 None => s.push_str(&format!(" obs_prog={w}")),
             }
-        }
-        if let Some(w) = self.render {
-            s.push_str(&format!(" obs_render={w}"));
         }
         if let Some(fp) = self.cwd {
             s.push_str(&format!(" cwd_fp={fp:x}"));
@@ -259,7 +353,6 @@ impl Observed {
             };
             Some((carried_word(PROGRESS_WORDS, &w)?, d))
         });
-        self.render = kv("obs_render").and_then(|w| carried_word(RENDER_WORDS, &w));
         let fp = |k: &str| kv(k).and_then(|h| u64::from_str_radix(&h, 16).ok());
         self.cwd = fp("cwd_fp");
         self.title = fp("title_fp");
@@ -393,6 +486,92 @@ impl SessionLog {
         }
     }
 
+    /// `mark <run> program state= [ask=] [coalesced=]`: one move of the
+    /// program's own report as the status sweep's gate showed it (`None`:
+    /// the shown report went away), through the run's bucket (the module
+    /// doc). A move in front of another run first writes the last run's
+    /// pending state (a run's change is no flap), and the new run's bucket
+    /// starts full.
+    pub(crate) fn observe_program(
+        &mut self,
+        shown: Option<aterm_core::terminal::program_state::ProgramState>,
+        at: Stamp,
+    ) {
+        let words = ProgramWords::of(shown);
+        let run = self.front_run();
+        if self.observed.program.run != Some(run) {
+            self.write_program(at, true);
+            self.observed.program = ProgramMarks {
+                run: Some(run),
+                milli: PROGRAM_FULL_MILLI,
+                at: at.mono_ms,
+                pending: None,
+            };
+        }
+        let p = &mut self.observed.program;
+        p.pending = Some(match p.pending {
+            Some((_, replaced)) => (words, replaced.saturating_add(1)),
+            None => (words, 0),
+        });
+        self.write_program(at, false);
+    }
+
+    /// THE PROGRAM BUCKET'S TICK, each status sweep: a pending state is
+    /// written once its run's bucket has a token again.
+    pub(crate) fn program_tick(&mut self, at: Stamp) {
+        self.write_program(at, false);
+    }
+
+    /// Write the pending program state now, whatever the bucket holds: the
+    /// session closes, or its log is carried across an update.
+    pub(crate) fn flush_program(&mut self, at: Stamp) {
+        self.write_program(at, true);
+    }
+
+    /// The run `closing` is about to close: when the bucket's run is that
+    /// run or lies under it, its pending state is written on it now,
+    /// whatever the bucket holds ([`SessionLog::close_node`], every run
+    /// close's one path).
+    pub(super) fn settle_program(&mut self, closing: Node, at: Stamp) {
+        let Some(run) = self.observed.program.run else {
+            return;
+        };
+        if run == closing || self.descends(run, closing) {
+            self.write_program(at, true);
+        }
+    }
+
+    /// Refill the bucket to `at`, and write the pending state with a token
+    /// (or without one, `force`), on the bucket's run while it is open and
+    /// on the session (`-`) once it is not: never on whatever node is
+    /// deepest open ([`aterm_slog::Log::mark`]'s rule for a mark that names
+    /// none).
+    fn write_program(&mut self, at: Stamp, force: bool) {
+        let open = self.observed.program.run.filter(|n| self.log.is_open(*n));
+        let p = &mut self.observed.program;
+        let Some((words, replaced)) = p.pending else {
+            return;
+        };
+        let now = at.mono_ms.max(p.at);
+        let earned = (now - p.at).saturating_mul(1_000) / PROGRAM_REFILL_MS;
+        p.milli = p.milli.saturating_add(earned).min(PROGRAM_FULL_MILLI);
+        p.at = now;
+        if p.milli < 1_000 && !force {
+            return;
+        }
+        p.milli = p.milli.saturating_sub(1_000);
+        p.pending = None;
+        let node = open.unwrap_or(Node::SESSION);
+        let f = with(Fields::new(), Key::State, Some(Val::Word(words.state)));
+        let f = with(f, Key::Ask, words.ask.map(Val::Word));
+        let f = with(
+            f,
+            Key::Coalesced,
+            (replaced > 0).then_some(Val::U(replaced)),
+        );
+        self.put(Kind::Program, Src::Engine, Conf::Claim, node, f, at);
+    }
+
     /// `mark <run> status …`: one published status transition (the status
     /// sweep dedups transitions; every call writes).
     pub(crate) fn observe_status(&mut self, s: StatusFacts, at: Stamp) {
@@ -482,14 +661,53 @@ impl SessionLog {
         }
     }
 
-    /// `mark - render state=…`: the resize ledger's verdict moved
-    /// (`SessionTimeline::record_render`).
-    pub(crate) fn observe_render(&mut self, state: &'static str, at: Stamp) {
-        if self.observed.render == Some(state) {
-            return;
-        }
-        self.observed.render = Some(state);
-        let f = with(Fields::new(), Key::State, Some(Val::Word(state)));
+    /// `mark - render state=desync-risk|healed …`: the resize ledger's
+    /// verdict moved (`SessionTimeline::record_render`), one mark for each
+    /// transition its row records, with every field of the row (phase 6,
+    /// 6F-7): a run's `run= displaced= net= at=` or `run= after_ms=`, an
+    /// epoch's `resize_epoch= displaced= pushed= cut= drew= class= at=` or
+    /// `resize_epoch= after_ms= healed_by=` (none for an open epoch's `-`).
+    pub(crate) fn observe_render(&mut self, t: &crate::resize_ledger::Transition, at: Stamp) {
+        use crate::resize_ledger::Transition as T;
+        let u = |f: Fields, k: Key, n: u64| with(f, k, Some(Val::U(n)));
+        let i = |f: Fields, k: Key, n: i32| with(f, k, Some(Val::I(i64::from(n))));
+        let f = with(Fields::new(), Key::State, Some(Val::Word(t.state_word())));
+        let f = match *t {
+            T::Risk {
+                run,
+                displaced,
+                net_zero,
+                at_ms,
+            } => {
+                let f = i(u(f, Key::Run, run), Key::Displaced, displaced);
+                let net = if net_zero { "zero" } else { "changed" };
+                u(with(f, Key::Net, Some(Val::Word(net))), Key::At, at_ms)
+            }
+            T::Healed { run, after_ms } => u(u(f, Key::Run, run), Key::AfterMs, after_ms),
+            T::EpochRisk {
+                epoch,
+                shift,
+                pushed,
+                cut,
+                drew,
+                class,
+                at_ms,
+            } => {
+                let f = i(u(f, Key::ResizeEpoch, epoch), Key::Displaced, shift);
+                let f = u(i(f, Key::Pushed, pushed), Key::Cut, u64::from(cut));
+                let f = u(f, Key::Drew, u64::from(drew));
+                let f = f.clone().word(Key::Class, class.wire()).unwrap_or(f);
+                u(f, Key::At, at_ms)
+            }
+            T::EpochHealed {
+                epoch,
+                after_ms,
+                by,
+            } => {
+                let f = u(u(f, Key::ResizeEpoch, epoch), Key::AfterMs, after_ms);
+                f.clone().word(Key::HealedBy, by.wire()).unwrap_or(f)
+            }
+        };
         self.put(Kind::Render, Src::Aterm, Conf::Exact, Node::SESSION, f, at);
     }
 
@@ -533,11 +751,35 @@ impl SessionLog {
         self.put(Kind::Title, Src::Engine, Conf::Exact, Node::SESSION, f, at);
     }
 
-    /// `mark - modes n=<reverted>`: a foreground handback or a manual reset
-    /// put `reverted` modes back (`by=human` for Edit ▸ Reset Terminal).
-    pub(crate) fn observe_modes(&mut self, reverted: usize, by: aterm_slog::Actor, at: Stamp) {
-        let n = u64::try_from(reverted).unwrap_or(u64::MAX);
-        let f = with(Fields::new(), Key::N, Some(Val::U(n)));
+    /// `mark - modes n=<k> …`: a foreground handback or a manual reset put
+    /// `reverted` modes back (`by=human` for Edit ▸ Reset Terminal), one
+    /// mark for every `modes-restored` row, nothing reverted too, with every
+    /// field of the row (phase 6, 6F-7): a reset's `source=ctl|menu`, or a
+    /// handback's foreground groups `from_pg= to_pg=` (host tier) and the
+    /// program that lost the terminal (`prog=`, when the timeline names
+    /// one); then the engine's mode names (`reverted=alt,kitty`, none for
+    /// none) and the bytes it wrote (`bytes=`).
+    pub(crate) fn observe_modes(
+        &mut self,
+        from: ModesFrom<'_>,
+        reverted: &[&str],
+        bytes: usize,
+        by: aterm_slog::Actor,
+        at: Stamp,
+    ) {
+        let count = |n: usize| Some(Val::U(u64::try_from(n).unwrap_or(u64::MAX)));
+        let f = with(Fields::new(), Key::N, count(reverted.len()));
+        let f = match from {
+            ModesFrom::Reset(source) => f.clone().word(Key::Source, source).unwrap_or(f),
+            ModesFrom::Handback { from, to, program } => {
+                let f = with(f, Key::FromPg, Some(Val::I(i64::from(from))));
+                let f = with(f, Key::ToPg, Some(Val::I(i64::from(to))));
+                with(f, Key::Prog, program.and_then(|p| tok(Key::Prog, p)))
+            }
+        };
+        let modes = reverted.join(",");
+        let f = with(f, Key::Reverted, tok(Key::Reverted, &modes));
+        let f = with(f, Key::Bytes, count(bytes));
         let _ = self.log.mark(
             Mark::new(Kind::Modes, Src::Engine, Conf::Exact)
                 .at(Node::SESSION)
@@ -549,24 +791,36 @@ impl SessionLog {
 
     /// THE FABRIC'S MARKS ([`crate::fabric::FabricFact`], through the one
     /// hook `fabric_bind` implements, in the timeline row's hold): `mail
-    /// dir=in|out`, `mail-seen`, `mail-landed` and `hold`. Ids, words and
-    /// offsets only — a body is never in a fact, so it is in no record.
+    /// dir=in|out`, `mail-seen`, `mail-landed` and `hold`, and since phase 6
+    /// (6F-5) `topic change=add|drop fp=`, `advisory origin= gen=` and
+    /// `mail-fetch off=`; since 6F-6 each with every field of its row (a
+    /// post's `re= dl=` and, host tier, `via= idem=`; every `inbox seen`
+    /// with `moved=`; a hold's `origin= hold_origin=`). Ids, words and
+    /// offsets — a body is never in a fact, so it is in no record; a topic's
+    /// name and `since=` and a hold's or an advisory's reason are content
+    /// tier, RAM only (ruling U11).
     pub(crate) fn observe_fabric(&mut self, fact: crate::fabric::FabricFact<'_>, at: Stamp) {
         use crate::fabric::FabricFact as F;
         // A person's key the timeline's hold kept from the log stands
         // before the mail (ruling T2).
         self.reconcile_person(at);
+        // A word outside the key's list is `unknown`, and a key with no
+        // `unknown` is left out: the fields already set stay.
         let word = |f: Fields, k: Key, w: &str| {
-            let fallback = f.clone();
+            let kept = f.clone();
             f.word(k, w)
-                .or_else(|_| fallback.word(k, "unknown"))
-                .unwrap_or_default()
+                .or_else(|_| kept.clone().word(k, "unknown"))
+                .unwrap_or(kept)
         };
         let text = |mut f: Fields, k: Key, t: &str| {
             if let Some(t) = BoundedText::new(k, t) {
                 let _ = f.set(k, Val::Text(t));
             }
             f
+        };
+        let some_text = |f: Fields, k: Key, t: Option<&str>| match t {
+            Some(t) => text(f, k, t),
+            None => f,
         };
         let (kind, by, f) = match fact {
             F::MailIn {
@@ -582,25 +836,101 @@ impl SessionLog {
                 let f = with(f, Key::Inbox, Some(Val::U(inbox)));
                 (Kind::Mail, aterm_slog::Actor::Bridge, f)
             }
-            F::MailOut { kind, to, post } => {
+            // The post's options (6F-6): `re=`, `dl=`, and host tier, never
+            // on the bus, its relay hops and the caller's key (`idem=`, the
+            // row's `key=`). A broadcast's topic is a fingerprint wherever
+            // its record leaves RAM (U11): `to=say:<16 hex>`, the name at
+            // the content tier.
+            F::MailOut {
+                kind,
+                to,
+                post,
+                re,
+                dl,
+                via,
+                idem,
+            } => {
                 let f = word(Fields::new(), Key::Dir, "out");
                 let f = word(f, Key::MailKind, kind);
-                let f = text(f, Key::To, to);
+                let f = match to.strip_prefix("say:") {
+                    Some(topic) => {
+                        let fp = format!("say:{:016x}", name_fp(Some(topic)));
+                        text(text(f, Key::To, &fp), Key::TopicName, topic)
+                    }
+                    None => text(f, Key::To, to),
+                };
                 let f = with(f, Key::Inbox, Some(Val::U(post)));
+                let f = with(
+                    f,
+                    Key::Re,
+                    re.and_then(|r| aterm_slog::ShortId::new(&r.to_string()))
+                        .map(Val::Id),
+                );
+                let f = with(f, Key::Dl, dl.map(Val::U));
+                let f = some_text(f, Key::Via, via);
+                let f = some_text(f, Key::Idem, idem);
                 (Kind::Mail, aterm_slog::Actor::Nobody, f)
             }
-            F::MailSeen { inbox, verdict } => {
+            // Every `inbox seen` (6F-6), `moved=0` when it moved nothing:
+            // the fold folds only moves. A decided verdict names the row's
+            // kind and sender, as the row does.
+            F::MailSeen {
+                inbox,
+                off,
+                floor,
+                seen,
+                verdict,
+                kind,
+                from,
+                moved,
+            } => {
                 let f = with(Fields::new(), Key::Inbox, Some(Val::U(inbox)));
-                let f = word(f, Key::Word, verdict.unwrap_or("handled"));
+                let f = with(f, Key::Off, Some(Val::U(off)));
+                let f = with(f, Key::Floor, floor.map(Val::U));
+                let f = with(f, Key::Seen, Some(Val::U(seen)));
+                let f = with(f, Key::Moved, Some(Val::U(u64::from(moved))));
+                let f = match verdict {
+                    Some(v) => text(
+                        word(word(f, Key::Word, v), Key::MailKind, kind),
+                        Key::From,
+                        from,
+                    ),
+                    None => f,
+                };
                 (Kind::MailSeen, aterm_slog::Actor::Nobody, f)
             }
-            F::MailLanded { post, off } => {
+            // A landing the bridge reported (`off=`, or none: `off=-`), or a
+            // post aterm retired, landed nowhere, and why (6F-6).
+            F::MailLanded { post, off, why } => {
                 let f = with(Fields::new(), Key::Inbox, Some(Val::U(post)));
-                let f = with(f, Key::Off, Some(Val::U(off)));
-                (Kind::MailLanded, aterm_slog::Actor::Bridge, f)
+                let f = with(f, Key::Off, off.map(Val::U));
+                let (f, by) = match why {
+                    Some(w) => (word(f, Key::Why, w), aterm_slog::Actor::Aterm),
+                    None => (f, aterm_slog::Actor::Bridge),
+                };
+                (Kind::MailLanded, by, f)
             }
-            F::Hold { held, bridge } => {
+            // The hold's row, whole (6F-6): its origin, the origins standing,
+            // whether it was carried in, and its reason at the content tier
+            // (a person's text: never journaled, carried or published).
+            F::Hold {
+                held,
+                bridge,
+                origin,
+                hold_origin,
+                reason,
+                carried,
+            } => {
                 let f = word(Fields::new(), Key::State, if held { "on" } else { "off" });
+                let mut f = word(f, Key::Origin, origin);
+                if let Some(t) = (hold_origin != "-")
+                    .then(|| BoundedToken::new(Key::HoldOrigin, hold_origin))
+                    .flatten()
+                {
+                    let _ = f.set(Key::HoldOrigin, Val::Tok(t));
+                }
+                let f = some_text(f, Key::Reason, reason);
+                let f = with(f, Key::Carried, carried.then_some(Val::U(1)));
                 let by = if bridge {
                     aterm_slog::Actor::Bridge
                 } else {
@@ -608,16 +938,91 @@ impl SessionLog {
                 };
                 (Kind::Hold, by, f)
             }
+            // A topic is a fingerprint wherever its record leaves RAM
+            // (ruling U11): the name and its `since=` are content tier.
+            F::Topic { add, name, since } => {
+                let f = word(Fields::new(), Key::Change, if add { "add" } else { "drop" });
+                let f = with(
+                    f,
+                    Key::Fp,
+                    aterm_slog::ShortId::new(&format!("{:016x}", name_fp(Some(name)))).map(Val::Id),
+                );
+                let f = text(f, Key::TopicName, name);
+                let f = match since {
+                    Some(s) => text(f, Key::Since, s),
+                    None => f,
+                };
+                (Kind::Topic, aterm_slog::Actor::Nobody, f)
+            }
+            // What a lost bridge left: aterm's advisory, the reason content
+            // tier as a hold's is.
+            F::Advisory {
+                origin,
+                reason,
+                generation,
+            } => {
+                let f = word(Fields::new(), Key::Origin, origin);
+                let f = with(
+                    f,
+                    Key::Gen,
+                    aterm_slog::ShortId::new(&generation.to_string()).map(Val::Id),
+                );
+                let f = text(f, Key::Reason, reason);
+                (Kind::Advisory, aterm_slog::Actor::Aterm, f)
+            }
+            F::Fetch { off } => {
+                let f = with(Fields::new(), Key::Off, Some(Val::U(off)));
+                (Kind::MailFetch, aterm_slog::Actor::Nobody, f)
+            }
         };
         // A `mail dir=in` mark sets the fold's mail latch as it folds: the
-        // person's next input is marked (rulings T39, U19).
-        let _ = self.log.mark(
+        // person's next input is marked (rulings T39, U19). A post's relay
+        // hops are the one field whose grammar's bound the record's others
+        // can leave no room for (`via=` admits 560 bytes beside a 70-byte
+        // `to=`, a 64-byte `idem=` and three numbers): the mark is cut there,
+        // never refused (the review of 6F-6). The row's 256-byte payload
+        // shows less of the hops than the record keeps.
+        let elastic = (kind == Kind::Mail).then_some(Key::Via);
+        let mark = |f: Fields| {
             Mark::new(kind, Src::Fabric, Conf::Exact)
                 .at(Node::SESSION)
                 .by(by)
-                .fields(f),
-            at,
-        );
+                .fields(f)
+        };
+        let _ = self.mark_within_record(mark, f, elastic, at);
+    }
+
+    /// `mark(f)` appended; when its record would pass
+    /// [`aterm_slog::MAX_RECORD_BYTES`], the free-text key `elastic` is cut
+    /// by the excess ([`aterm_slog::field::clamp_encoded`], never inside a
+    /// character) and the mark appended once more, so a record its writer
+    /// owes is never refused for one long field. Returns the seq.
+    fn mark_within_record(
+        &mut self,
+        mark: impl Fn(Fields) -> Mark,
+        f: Fields,
+        elastic: Option<Key>,
+        at: Stamp,
+    ) -> Option<u64> {
+        let over = match self.log.mark(mark(f.clone()), at) {
+            Ok(seq) => return Some(seq),
+            Err(aterm_slog::Refused::Encode(aterm_slog::EncodeError::TooLarge(n))) => {
+                n.saturating_sub(aterm_slog::MAX_RECORD_BYTES)
+            }
+            Err(_) => return None,
+        };
+        let key = elastic?;
+        let text = f.get_str(key)?;
+        let room = aterm_slog::field::encoded_len(text).checked_sub(over)?;
+        let kept = aterm_slog::field::clamp_encoded(text, room).to_string();
+        let mut f = f;
+        match BoundedText::new(key, &kept) {
+            Some(t) => {
+                let _ = f.set(key, Val::Text(t));
+            }
+            None => f.remove(key),
+        }
+        self.log.mark(mark(f), at).ok()
     }
 
     /// `mark - meta field=<f> value=<v>` by its writer (`value=` absent for
@@ -782,14 +1187,59 @@ impl SessionLog {
         }
     }
 
-    /// `mark - in-doubt verb=<w>`: a keyed write whose outcome nobody knows
-    /// (`pty_idem::record_in_doubt`), named by its verb (`unknown` for one
-    /// the vocabulary does not hold), never by its bytes or its reply.
-    pub(crate) fn observe_in_doubt(&mut self, verb: &str, at: Stamp) {
+    /// `mark - state state=<spawning|alive|exited>`: the registry moved the
+    /// session's lifecycle state (`SessionStore::set_state`, `mark_alive`),
+    /// the fact of the timeline's `state-change` row, in its hold (phase 6,
+    /// 6F-5). The registration's state is the `spawned` row's, which the
+    /// session open carries (6F-7; a carried session's, already open, is
+    /// this mark with `carried=1`), and the close's `state=closed` row is
+    /// the session close's: a mark after the close is refused.
+    pub(crate) fn observe_state(&mut self, state: &str, at: Stamp) {
+        let f = Fields::new()
+            .word(Key::State, state)
+            .or_else(|_| Fields::new().word(Key::State, "unknown"))
+            .unwrap_or_default();
+        self.put(Kind::State, Src::Aterm, Conf::Exact, Node::SESSION, f, at);
+    }
+
+    /// `mark - policy gen=<n>`: the harness policy cell moved to generation
+    /// `generation` (`App::announce_harness_policy`), the fact of the
+    /// `harness-policy gen=<n>` row it writes on every session, in its hold
+    /// (phase 6, 6F-5; ruling U16). The node log's `config key=` stays.
+    pub(crate) fn observe_policy(&mut self, generation: u64, at: Stamp) {
+        let f = with(
+            Fields::new(),
+            Key::Gen,
+            aterm_slog::ShortId::new(&generation.to_string()).map(Val::Id),
+        );
+        self.put(Kind::Policy, Src::Aterm, Conf::Exact, Node::SESSION, f, at);
+    }
+
+    /// `mark - in-doubt verb=<w> producer=<n> key_seq=<n> reply=<w-w>`: a
+    /// keyed write whose outcome nobody knows (`pty_idem::record_in_doubt`),
+    /// named by its verb (`unknown` for one the vocabulary does not hold)
+    /// and its key's producer and sequence, never by its bytes; the first
+    /// two words of its reply (`reply`, the `in-doubt` row's) at the content
+    /// tier, RAM only (phase 6, 6F-7).
+    pub(crate) fn observe_in_doubt(
+        &mut self,
+        verb: &str,
+        producer: u64,
+        key_seq: u64,
+        reply: &str,
+        at: Stamp,
+    ) {
         let f = Fields::new()
             .word(Key::Verb, verb)
             .or_else(|_| Fields::new().word(Key::Verb, "unknown"))
             .unwrap_or_default();
+        let f = with(f, Key::Producer, Some(Val::U(producer)));
+        let f = with(f, Key::KeySeq, Some(Val::U(key_seq)));
+        let f = with(
+            f,
+            Key::Reply,
+            BoundedText::new(Key::Reply, reply).map(Val::Text),
+        );
         self.put(Kind::InDoubt, Src::Aterm, Conf::Exact, Node::SESSION, f, at);
     }
 }
@@ -801,3 +1251,11 @@ mod tests;
 #[cfg(test)]
 #[path = "session_log_overlap_tests.rs"]
 mod overlap_tests;
+
+#[cfg(test)]
+#[path = "session_log_program_tests.rs"]
+mod program_tests;
+
+#[cfg(test)]
+#[path = "session_log_ring_facts_tests.rs"]
+mod ring_facts_tests;

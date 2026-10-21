@@ -430,12 +430,14 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
     let all_cases = (CASES * faithful_configs().len() / 2) as u64;
     assert_eq!(adaptive.settled_cases, all_cases, "{adaptive:?}");
     assert_eq!(always.settled_cases, all_cases, "{always:?}");
-    // The floors sit well under what the committed seed reaches over both
-    // ambiguous-width policies (1968 painting frames, 1162 fidelity comparisons,
-    // 2426 secrets, 13006 row moves, 561 ghosts the painter refused on a wide
-    // glyph in `Always`): a generator change that starves a clause fails here
-    // instead of passing vacuously. They count comparisons, not whether a
-    // comparison can fail; the mutant hosts below are that half.
+    // The floors sit under what the committed seed reaches over both
+    // ambiguous-width policies (5214 painting frames, 4180 fidelity comparisons,
+    // 1336 secrets, 12866 row moves, 12 ghosts the painter refused on a wide
+    // glyph in `Always`: 394 before DARK OVER TEXT kept a guess waiting over the
+    // line's text off the glass, 28 before it held the run's first guess over
+    // text behind a head that hides nothing): a generator change that starves a
+    // clause fails here instead of passing vacuously. They count comparisons,
+    // not whether a comparison can fail; the mutant hosts below are that half.
     assert!(
         adaptive.frames_displaying > 1000,
         "Adaptive must actually paint guesses for the theorem to mean anything: {adaptive:?}"
@@ -465,14 +467,15 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
         "guesses displayed on half of a wide glyph, which the painter must refuse: {always:?}"
     );
     // The phase-0 floors, again well under the committed seed's counts over the
-    // four Adaptive configurations (1568 whole frames compared with the screen
-    // they settle to, 200 credited echoes refused proof over a moved tail, 24
-    // standing proofs voided when the tail moved after them, 7187 expired
-    // guesses owed, 6743 typed owes, 4855 turns holding a guess on a glyph
-    // shown before its echo, 4786 credits checked against their key's output, 116
-    // frames painting beside a right prompt, 192 proofs over decoration the echo
-    // kept, 152 stale decoration cells counted), and every ghost on glass in
-    // either mode checked against the window (6788 Adaptive, 345203 Always).
+    // four Adaptive configurations (4806 whole frames compared with the screen
+    // they settle to, 630 credited echoes refused proof over a moved tail, 94
+    // standing proofs voided when the tail moved after them, 6710 expired
+    // guesses owed, 12956 typed owes, 3896 turns holding a guess on a glyph
+    // shown before its echo, 13228 credits checked against their key's output,
+    // 1214 frames painting beside a right prompt, 2380 proofs over decoration
+    // the echo kept, 580 stale decoration cells counted), and every ghost on
+    // glass in either mode checked against the window (10744 Adaptive, 233488
+    // Always; 287802 in `Always` with `Rule::DarkOverText` off).
     assert!(
         adaptive.frame_fidelity_checks > 500,
         "displayed frames compared whole with their settled screen: {adaptive:?}"
@@ -500,6 +503,14 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
     assert!(
         adaptive.advance_waits > 1000 && adaptive.attribution_checks > 1000,
         "turns holding a guess on a glyph shown before its echo, and credits checked: {adaptive:?}"
+    );
+    // DARK OVER TEXT: turns a guess typed over text where the line's end is
+    // not known was held off the glass, the head waiting on the screen as it
+    // was or the first such guess behind it (26889 over the four `Always`
+    // configurations, the same reconcile decisions as Adaptive's).
+    assert!(
+        always.text_waits > 5000,
+        "guesses waiting over the line's text, held off the glass: {always:?}"
     );
     // A line with a right prompt proves through it and paints (decoration the
     // snapshot keeps), and a frame shows a right prompt the settled screen hid
@@ -616,6 +627,44 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
     assert!(
         adaptive.kitty_refusals > 80,
         "chords refused under Kitty's mode or modifyOtherKeys: {adaptive:?}"
+    );
+}
+
+/// The seed indices (`seed_index`) the committed sweep below adds to the
+/// committed seed (index 0): as many as run in the time the theorem takes,
+/// every faithful configuration of each (16 sweeps of 600 cases in 0.71 s on
+/// 18 cores, beside the theorem's 8 in 0.64 s).
+const SWEPT_SEED_INDICES: std::ops::RangeInclusive<u64> = 1..=2;
+
+/// THE THEOREM OVER MORE SEEDS: the committed sweep of every faithful
+/// configuration over the seed indices `SWEPT_SEED_INDICES`, where the theorem
+/// holds index 0 alone. A sweep over many seeds found what the committed seed
+/// never reached (`sweep_cases`); this keeps a few of them in every run,
+/// deterministically, with every clause of the theorem in force. Its floors
+/// are the theorem's: they are counted on index 0.
+#[test]
+fn a_prediction_never_corrupts_the_reconciled_view_over_more_seeds() {
+    let failures = sweep_seed_indices(SWEPT_SEED_INDICES);
+    assert!(failures.is_empty(), "{}", failures.join("\n=====\n"));
+}
+
+/// THE REVIEW'S SWEEP, run on demand (`--ignored`): the theorem over seed
+/// indices 0 to 999, every faithful configuration of each, each failure
+/// shrunk. About seven minutes on 18 cores, too long for every run; a review
+/// of the predictor runs it, and each break it finds becomes a named case
+/// (`sweep_cases`).
+#[test]
+#[ignore = "the review's sweep: 8000 sweeps of 600 cases, minutes on every core"]
+fn a_prediction_never_corrupts_the_reconciled_view_over_a_thousand_seeds() {
+    let failures = sweep_seed_indices(0..1000);
+    for failure in &failures {
+        let head: String = failure.chars().take(6000).collect();
+        eprintln!("{head}\n=====");
+    }
+    assert!(
+        failures.is_empty(),
+        "{} sweeps broke a clause",
+        failures.len()
     );
 }
 
@@ -1187,6 +1236,7 @@ fn named_cases() -> Vec<NamedCase> {
     .chain(line_edge_cases())
     .chain(review_4_cases())
     .chain(review_5_cases())
+    .chain(sweep_cases())
     .collect()
 }
 
@@ -3463,4 +3513,53 @@ fn review_5_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StaleCancel)],
         },
     ]
+}
+
+/// The breaks the sweep over many seeds found (`seed_index`, the family the
+/// committed sweep and the review's draw from), each a named case with the
+/// rule that closes it switched off as its control.
+fn sweep_cases() -> Vec<NamedCase> {
+    vec![NamedCase {
+        // `i` typed and echoed; Home (owed: no integration) and its echo, the
+        // far end's cursor back on `i`; `i` typed on it. Readline inserts it
+        // before that `i`, writing the glyph, then the tail it shifts, then the
+        // step back (`i`, `i\b`), and the read split after the glyph: the
+        // frame shows `i` with the cursor past it and the row right of it
+        // blank, as the press saw it, so the echo retired as an append,
+        // uncredited while Home's echo was owed, with no proof to watch the
+        // row. `a`, typed on the cursor it left, read a blank row and took
+        // itself to be at the end of the line; the redraw and `a`'s echo
+        // (`ai\b`) landed in one read, `iai`, and `a` proved beside the `i`
+        // the redraw put right of it. `d` typed next was shown over that `i`:
+        // `iad` on glass, `iadi` settled. The `i` was drawn over the glyph it
+        // shifted (a HIDDEN TAIL), so for its window a blank row is no line
+        // end (seed index 97, case 27, shrunk; a break on main since the
+        // review of phase 0, 0376b47967).
+        name: "an_echo_drawn_over_the_glyph_it_shifts_hides_its_tail",
+        cfg: Config {
+            editor: Editor::Readline,
+            ..adaptive_remote()
+        },
+        ops: vec![
+            Op::Key(0, 5),
+            Op::Program(1, 0),
+            Op::Advance(30),
+            Op::Deliver(1024),
+            Op::Key(87, 6),
+            Op::Program(1, 0),
+            Op::Advance(71),
+            Op::Deliver(1024),
+            Op::Advance(57),
+            Op::Key(0, 5),
+            Op::Program(1, 0),
+            Op::Deliver(675),
+            Op::Advance(138),
+            Op::Key(0, 22),
+            Op::Program(1, 0),
+            Op::Advance(51),
+            Op::Deliver(1024),
+            Op::Key(0, 3),
+        ],
+        mutants: vec![Host::Rule(Rule::CleanTailInFlight)],
+    }]
 }

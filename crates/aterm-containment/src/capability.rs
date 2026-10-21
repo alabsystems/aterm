@@ -15,8 +15,7 @@
 
 /// Network capability levels.
 ///
-/// Discriminants: None=0, Full=1. There is no destination allowlist level
-/// (owner, 2026-09-27):
+/// Discriminants: None=0, Full=1. There is no destination allowlist level:
 /// Seatbelt filters only by port or localhost, not by host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]

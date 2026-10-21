@@ -11,116 +11,44 @@
 # Features enabled:
 # - Directory tracking (OSC 7): tab title updates, "Open Terminal Here" support
 # - Command tracking (OSC 133): command history indexing, timing, notifications
-# - The managed dirs, LIVE: an already-running session shell resolves `claude`/`codex`
-#   to atpkg's <prefix>/agents twins (and cargo/rustc to <prefix>/reroute) the moment
-#   atpkg lays them — no new tab, no `exec fish` (owner ask 2026-09-16; see "LIVE" below)
-# - A LOADER and a BODY (2026-09-26): the shell that is ALREADY RUNNING takes a newer
-#   build's integration at its next prompt, when the host that owns it points it there
-#   (see "THE LOADER" below)
+# - Live managed dirs: running shells resolve `claude`/`codex` to atpkg's
+#   <prefix>/agents twins and cargo/rustc to <prefix>/reroute as soon as atpkg
+#   lays them.
+# - Loader + body split: a running shell sources a newer build's integration
+#   body at its next prompt when the host updates the body pointer.
 #
-# Compatible with: fish 3.4+. The guards below `return` outside a function,
-# which fish first allowed in 3.4: fish 3.1.2 refuses the whole file at the
-# first one, and every fish test of this crate passes on 3.4.1 and 4.9.3
-# (2026-10-18). (`string escape --style=url` needs 3.1.)
+# Compatible with fish 3.4+ (`return` outside a function requires 3.4;
+# `string escape --style=url` requires 3.1).
 
-# Only run in interactive shells.
-# Use `return` (not `exit`) — `exit` in a sourced file kills the entire
-# fish process, which breaks non-interactive invocations when loaded
-# via XDG_DATA_DIRS conf.d auto-loading.
+# Only run in interactive shells. Use `return` (not `exit`, which kills the
+# fish process when loaded via XDG_DATA_DIRS conf.d).
 if not status is-interactive
     return
 end
 
 # Skip if already loaded.
 #
-# `test -n`, NOT `set -q`: `set -q` asks whether the variable is DEFINED, and
-# aterm's spawn seam deliberately defines this guard as an EMPTY string on
-# every integrated spawn. That override is the NESTED-LAUNCH lifeline (the
-# 0.19.0 gauntlet's F3): a shell running inside aterm exports the guard as `1`,
-# that export rides the environment into the shell the NEXT aterm spawns, and
-# without the override the inner shell's loader would bail. bash and zsh spell
-# the guard `[[ -n "$ATERM_SHELL_INTEGRATION_INSTALLED" ]]`, which the empty
-# override defuses exactly as designed. fish's `set -q` saw "defined" and
-# returned before defining a single function — so the empty value meant to
-# REVIVE the integration was what killed it.
+# Use `test -n` (emptiness), never `set -q` (definedness), for ATERM_* env vars:
+# aterm's spawn seam defines `ATERM_SHELL_INTEGRATION_INSTALLED=""` on every
+# integrated spawn so nested launches still load integration, matching bash/zsh
+# `[[ -n ... ]]`. `set -q` is used only for internal script variables or where
+# `set -e` must also scrub an empty exported variable (`ATERM_SHELL_NONCE`).
 #
-# Measured on Linux with fish 4.2.1 under aterm 0.55.0 before this fix: ZERO
-# OSC 133 marks on the wire, `aterm ctl blocks` -> "no results", and
-# ATERM_SHELL_NONCE left un-scrubbed in the child environment (#8015's leak
-# defense also lives past this guard) — in EVERY integrated fish session, not
-# just nested ones. The OSC 133 marks that DID appear were fish 4.x's own
-# built-in ones (`133;A;click_events=1`, `133;C;cmdline_url=…`), which aterm
-# drops for carrying no `id=` nonce.
-#
-# `test -n "$var"` is false for BOTH unset and empty — the bash/zsh semantics
-# this guard always intended. (The variable is quoted so an unset variable
-# still expands to exactly one empty argument rather than zero arguments.)
-#
-# THE RULE, for every ATERM_* variable in this file: bash and zsh read these
-# with `-n` / `-z` / `${VAR:-default}`, all of which treat UNSET and EMPTY
-# alike, and aterm's spawn seam plus the user's own environment can and do
-# deliver empty values. So test EMPTINESS (`test -n` / `test -z`), never
-# definedness (`set -q`). `set -q` is correct only for a variable this script
-# defines itself and always defines non-empty, or where both arms are
-# equivalent and the `set -q` arm additionally scrubs (`ATERM_SHELL_NONCE`,
-# whose note explains why).
-#
-# ─── The multiplexer boundary (screen / tmux) ───
-#
-# aterm hosts ONE session per PTY. Run screen or tmux in that PTY and the
-# multiplexer owns it: every pane it draws lives inside the SAME aterm session,
-# and aterm has no name for a pane. Two things break at that boundary, and both
-# used to break SILENTLY:
-#
-#  1. $ATERM_PARENT_SESSION_ID is an ordinary exported variable, so it rides into
-#     every pane shell unchanged — and `aterm ctl`'s flagless self-location then
-#     resolves it to the session HOSTING the multiplexer. A flagless call typed
-#     in a pane drove the OUTER terminal, said OK, and moved the wrong session.
-#  2. The loader guard below is exported too, so a pane shell finds it already
-#     set and returns before defining a single hook. No OSC 133 mark is ever
-#     emitted from inside the multiplexer (and neither screen nor tmux forwards
-#     an unknown OSC outward anyway), so command blocks, exit codes and cwd
-#     tracking are ABSENT for the duration — not empty, absent.
-#
-# This block does not try to fix either — a pane is genuinely not an aterm
-# session — it makes them VISIBLE. It MARKS the crossing ($ATERM_MUX, plus the
-# outer sid so a tool can name what a flagless call would have hit), and says so
-# once. `aterm ctl` reads the marks and refuses an implicitly self-targeting call
-# rather than driving the wrong terminal.
-#
-# $ATERM_PARENT_SESSION_ID is deliberately left ALONE: it is also what provisions
-# a nested aterm's parent capability edges, and the outer session really is the
-# parent of anything launched from a pane. Marking costs nothing; unsetting would
-# quietly disarm recursion provisioning to fix a targeting bug.
-#
-# The guard is what makes the detection trustworthy WHERE IT RUNS: aterm's spawn
-# seam forces $ATERM_SHELL_INTEGRATION_INSTALLED to the EMPTY string for every
-# session it starts, so a NON-empty value proves we did not come straight from
-# aterm. That tells a real pane shell apart from an aterm window that was
-# launched FROM a pane and merely inherited $TMUX/$STY.
-#
-# fish is the ONE shell where this block really does run in a pane, and the
-# reason is worth writing down: aterm injects fish through a vendor conf.d on
-# $XDG_DATA_DIRS, an ordinary EXPORTED variable, so it rides into a pane shell
-# and fish sources this file there. bash and zsh are injected through argv
-# (`--rcfile`) and $ZDOTDIR — one-shot mechanisms only the shell ATERM ITSELF
-# starts receives — so their pane shells never source their script at all
-# (measured in a real GNU screen 4.09.01 window under a headless aterm: STY, a
-# screen TERM and the inherited guard all set, $ATERM_MUX still EMPTY, no hook
-# defined), and `aterm ctl` carries the boundary for them.
-#
-# What runs in every session aterm starts, in all three shells, is the tail of
-# this file past the guard, and that is where the detection now originates:
-# $ATERM_MUX_BASE records the multiplexer environment THIS session shell was born
-# into. See the export below.
+# Multiplexer boundary (screen / tmux):
+# aterm hosts one session per PTY. Inside screen or tmux, `$ATERM_PARENT_SESSION_ID`
+# and `$ATERM_SHELL_INTEGRATION_INSTALLED` are inherited from the outer shell.
+# Because aterm injects fish via `XDG_DATA_DIRS` (exported), pane shells source
+# this file and hit the guard below. When a multiplexer is detected at that
+# boundary, export `$ATERM_MUX` and `$ATERM_MUX_OUTER_SESSION_ID` so `aterm ctl`
+# refuses implicit self-targeting rather than driving the outer session, while
+# leaving `$ATERM_PARENT_SESSION_ID` intact for nested-aterm capability edges.
 set -l __aterm_mux ""
 if test -n "$TMUX"
     set __aterm_mux tmux
 else if test -n "$STY"
     set __aterm_mux screen
 else
-    # tmux's default TERM is screen-256color, so TERM alone names the family,
-    # not the program; the markers above are consulted first for that reason.
+    # tmux's default TERM is screen-256color, so $TMUX/$STY are checked first.
     switch "$TERM"
         case tmux 'tmux-*' 'tmux.*'
             set __aterm_mux tmux
@@ -129,31 +57,12 @@ else
     end
 end
 
-# A user's ATERM_MUX=0 (or off/no/none/false) turns the whole check off:
-# keep it, and say nothing.
 contains -- "$ATERM_MUX" 0 off no none false; and set __aterm_mux ""
 
-# THE IN-PLACE UPGRADE (2026-09-26). The guard below is exported, so a NON-empty
-# value normally proves this shell did not come straight from aterm (a pane — see
-# above). There is one other way to arrive here with it set: THIS VERY SHELL
-# sourcing the file again — the live agent upgrade's relaunch line sources a newer
-# build's loader into a shell spawned before loaders existed (`typed_rekey` in
-# aterm-shell-integration). That shell, and only that shell, already holds
-# `$__aterm_shell_nonce` AND the preexec handler its integration defined,
-# `__aterm_fish_preexec` (every build's since 0.61): a function, which no pane or
-# child shell inherits (`set -q` is right here: it is this script's own variable,
-# not an ATERM_* one). The nonce alone is no proof — the typed line assigns it in
-# a NESTED shell too (the zsh script says why). For the shell that holds both the
-# guard is its own, and the load goes on as an upgrade in place: everything below
-# is idempotent, and what must run once per shell (the package blocks, the prompt
-# wrapper's copy of the user's prompt) is skipped where it already ran.
-#
-# An upgrade in place first notes, for the body's AN OLDER SCRIPT'S
-# `~/.aterm/bin`, the script that loaded this shell FRESH — before this load
-# writes over what says so: the loader in `__aterm_si_dir` when its own load was
-# the fresh one (`__aterm_fresh_load` 1), `-` for a shell from before loaders
-# (neither is set), nothing it can name otherwise (a loader that itself came in
-# place). Once per shell, while the body has not settled it.
+# In-place upgrade: when a running shell re-sources this file (`typed_rekey`),
+# it already holds `$__aterm_shell_nonce` and the uninherited function
+# `__aterm_fish_preexec`. Record the origin script for `old_bin` cleanup and
+# clear the guard so the load proceeds as an in-place upgrade.
 if set -q __aterm_shell_nonce; and functions -q __aterm_fish_preexec; and test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
     if not set -q __aterm_old_bin_off; and not set -q __aterm_bin_from
         if not set -q __aterm_fresh_load; and not set -q __aterm_si_dir
@@ -171,16 +80,11 @@ else
 end
 
 if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
-    # Skipping as before — but mark the boundary on the way out when the
-    # inherited guard means we crossed one.
     if test -n "$__aterm_mux"
         set -gx ATERM_MUX $__aterm_mux
         if test -n "$ATERM_PARENT_SESSION_ID"
             set -gx ATERM_MUX_OUTER_SESSION_ID $ATERM_PARENT_SESSION_ID
-            # Say it ONCE per multiplexer session — not once per pane, which is
-            # the same true sentence six times before lunch. The stamp is keyed
-            # by the multiplexer's own id ($TMUX / $STY), so every pane of one
-            # screen or tmux shares it.
+            # Emit notice once per multiplexer session, keyed by $TMUX / $STY.
             if test "$ATERM_MUX_NOTICE" != 0
                 set -l __aterm_mux_id "$TMUX"
                 test -n "$__aterm_mux_id"; or set __aterm_mux_id "$STY"
@@ -188,10 +92,6 @@ if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
                 set -l __aterm_mux_root "$XDG_RUNTIME_DIR"
                 test -n "$__aterm_mux_root"; or set __aterm_mux_root "$TMPDIR"
                 test -n "$__aterm_mux_root"; or set __aterm_mux_root /tmp
-                # Captured into locals and interpolated QUOTED — never glued to
-                # a command substitution, this script's standing rule (a
-                # substitution printing nothing would take the whole argument
-                # with it).
                 set -l __aterm_mux_dir "$__aterm_mux_root/aterm/mux-notice"
                 set -l __aterm_mux_key (string replace -ra '[^A-Za-z0-9._-]' _ -- "$__aterm_mux_id")
                 set -l __aterm_mux_stamp "$__aterm_mux_dir/$__aterm_mux-$__aterm_mux_key"
@@ -206,35 +106,11 @@ if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
     return
 end
 set -gx ATERM_SHELL_INTEGRATION_INSTALLED 1
-# Past the guard, so aterm started this shell ITSELF. Record the multiplexer
-# environment this session shell was born into. This is the one detection input
-# that comes from a place which ACTUALLY RUNS for every session, and it reaches a
-# pane the only way anything can: ordinary environment inheritance. A pane's own
-# $TMUX/$STY are the multiplexer's and no longer match this base — that mismatch
-# IS the crossing — while an aterm window merely launched FROM a pane re-runs
-# this file and re-stamps the base as its own, so it matches and is not refused.
-# It also closes what TERM cannot: a tmux set to default-terminal
-# "xterm-256color" is indistinguishable from an aterm window to TERM, and plainly
-# a pane to this. `aterm ctl` reads it as $ATERM_MUX_BASE.
-#
-# Interpolated inside ONE double-quoted word, never glued to a substitution:
-# unset expands to the empty string here (fish's rule for an undefined variable
-# inside quotes), which is exactly the "<$TMUX>|<$STY>" spelling bash and zsh
-# write with ${TMUX-}, so the three shells stamp byte-identical values.
-# Fallback only — the spawn seam stamps this for every session, including one
-# whose shell never sources this file; overwriting it after a pane was entered
-# is exactly how a fresh window came to be refused as a pane. (`test -n --` is
-# the emptiness read this file now uses everywhere: `set -q` is definedness,
-# and aterm deliberately exports empty strings.)
+# Record the multiplexer environment this session shell started in (fallback if
+# not already stamped by the spawn seam) and clear any inherited pane markers.
 if not test -n "$ATERM_MUX_BASE"
     set -gx ATERM_MUX_BASE "$TMUX|$STY"
 end
-# Any ATERM_MUX inherited from the pane we were launched out of describes a
-# multiplexer this session is not inside. Clear it, or every window opened from
-# a tmux pane would inherit a refusal it does not deserve.
-# Guarded with `test -n`, this file's rule for every ATERM_* variable (an
-# unguarded `set -e` on an absent name is a silent status 4, and the guard also
-# documents that EMPTY counts as "not marked" here, exactly as bash/zsh read it).
 if test -n "$ATERM_MUX"
     set -e ATERM_MUX
 end
@@ -242,42 +118,15 @@ if test -n "$ATERM_MUX_OUTER_SESSION_ID"
     set -e ATERM_MUX_OUTER_SESSION_ID
 end
 
-# ─── THE LOADER (2026-09-26) ───
-#
-# Everything from here to the BODY marker, and the wiring after the body's end
-# marker, is the LOADER: what a shell runs once and keeps for its whole life — the
-# nonce and the two host channels captured and scrubbed, the fish_prompt
-# trampoline. Everything between the two markers is the BODY — every mark, every
-# prompt behaviour, the managed-PATH machinery — written a second time, alone, as
-# `aterm_shell_integration_body.fish` in the same content-addressed folder, so a
-# shell that is already running can source a NEWER build's body at its next
-# prompt. The zsh script's "THE LOADER" says why and how; this is its twin.
+# Loader: captures and scrubs the nonce and host channels once per shell and
+# installs the `fish_prompt` trampoline. The section between the BODY markers
+# is also written standalone as `aterm_shell_integration_body.fish` so running
+# shells can reload it at the next prompt.
 
-# Capture the capability nonce into a shell-global so we can immediately
-# drop it from the environment (#8015). Leaving ATERM_SHELL_NONCE in the
-# exported env lets every child process (env, ssh SendEnv, docker, cron,
-# tmux children, ...) read the 64-hex secret that would be used to bypass
-# the #7960 nonce-enforcement defense. Capture first, then `set -e`
-# (unexport) BEFORE any prompt hook fires so subprocesses never inherit
-# it.
-#
-# If the env var is missing or empty at source-time, __aterm_shell_nonce
-# stays empty and __aterm_id_suffix falls through to the unnonced form
-# (pre-nonce compatibility for hosts that have not yet authorized a
-# nonce). This matches the documented fallback: the host's OSC 133/633
-# handler drops sequences missing/with a wrong id= only when
-# `TerminalModes::require_shell_integration_nonce` is enabled.
-#
-# This is the ONE `set -q` on an ATERM_* variable that is deliberate. Both arms
-# leave $__aterm_shell_nonce empty when the env var is empty, so the definedness
-# test cannot change the nonce; taking the arm for an empty-but-defined variable
-# is strictly BETTER, because it also runs the `set -e` scrub on it. Do not
-# "fix" this one to `test -n` — that would leave an empty ATERM_SHELL_NONCE
-# exported into every child process.
-#
-# In an upgrade in place (see above) the environment holds no nonce any more — it
-# was scrubbed at this shell's first load — so the one the shell holds is kept: in
-# a typed upgrade, the key its line assigned just before sourcing this file.
+# Capture the capability nonce into a shell-global and unexport `ATERM_SHELL_NONCE`
+# so child processes never inherit the 64-hex secret. `set -q` is deliberate so
+# an empty-but-exported variable is still scrubbed by `set -e`. In-place upgrades
+# preserve the existing `$__aterm_shell_nonce`.
 if set -q ATERM_SHELL_NONCE
     set -g __aterm_shell_nonce "$ATERM_SHELL_NONCE"
     set -e ATERM_SHELL_NONCE
@@ -285,75 +134,26 @@ else if not set -q __aterm_shell_nonce
     set -g __aterm_shell_nonce ""
 end
 
-# Precomputed capability-nonce suffix for OSC 133/633 emissions — expands to
-# ";id=<64-hex>" when the captured nonce is non-empty, or to the empty string
-# otherwise. Mirrors the zsh script's `$__aterm_id_suffix_str`, and for the
-# same two reasons — plus one that is fish-specific and load-bearing.
-#
-# THE FISH-SPECIFIC REASON (a silent, total mark loss). The emitters below used
-# to spell the suffix as a command substitution glued to a string:
-#
-#     __aterm_osc "133;A"(__aterm_id_suffix)
-#
-# In fish, gluing a string to a command substitution is a CARTESIAN PRODUCT, and
-# a substitution that prints nothing is a ZERO-ELEMENT list — so the product is
-# ZERO arguments, not the string "133;A". Whenever the nonce was empty,
-# `__aterm_osc` was therefore called with NO arguments at all and its
-# `printf '\e]%s\a' $argv[1]` emitted a bare, EMPTY `ESC ] BEL` — every 133;A,
-# 133;B, 133;C, 133;D and 633;E silently replaced by a malformed empty OSC.
-# (bash and zsh interpolate a possibly-empty parameter, so neither shell has
-# this failure mode; it is unique to fish's list semantics.)
-#
-# The empty-nonce path is NOT hypothetical: it is this file's own documented
-# pre-nonce fallback, and it is exactly what the header's manual install
-# (`source ~/.config/aterm/shell_integration.fish` from config.fish) produces,
-# since nothing sets ATERM_SHELL_NONCE there. Measured on fish 4.2.1 before
-# this fix: OSC 7 arrived, and 133;A/B/C/D + 633;E were all absent.
-#
-# A plain variable is immune — `"133;A$__aterm_id_suffix_str"` is ordinary
-# string interpolation, one argument, empty suffix or not. Byte-identical
-# output when the nonce IS set (same ";id=<hex>" spelling), and it drops four
-# to five forkless-but-not-free command substitutions per command cycle.
-# `set -g` (not `-gx`), exactly like $__aterm_shell_nonce itself, so #8015 (no
-# nonce inheritance by subprocesses) is preserved.
+# Precomputed `;id=<64-hex>` suffix for OSC 133/633 emissions. Stored as a plain
+# string global rather than a command substitution because in fish, gluing a
+# string to a command substitution that prints nothing produces a zero-element
+# cartesian product, which would pass zero arguments to `__aterm_osc`.
 set -g __aterm_id_suffix_str ""
 if test -n "$__aterm_shell_nonce"
     set -g __aterm_id_suffix_str ";id=$__aterm_shell_nonce"
 end
 
-# THE RE-KEY CHANNEL (2026-09-24) — the zsh script's twin, for the same reason:
-# a seamless update that could not carry this shell's nonce left its marks
-# dropped for good (`status integration=degraded`). The host names a per-session
-# file at spawn ($ATERM_REKEY_PATH, in its 0700 control dir) and, to re-key an
-# adopted shell, writes a fresh 64-hex nonce there (0600, exclusive, never
-# through a symlink) and authorizes it; the next postexec or prompt takes it.
-# Two builtin `test`s per prompt while nothing waits. Captured, then scrubbed
-# UNCONDITIONALLY (an empty value is scrubbed too, with no `set -q` needed —
-# see the loader-guard note at the top); the key never appears in typed text,
-# scrollback or history.
-# An upgrade in place keeps the path the shell already has.
+# Per-session re-key file ($ATERM_REKEY_PATH in the 0700 control dir) for
+# re-keying adopted shells across seamless updates. Captured and scrubbed from env.
 if test -n "$ATERM_REKEY_PATH"; or not set -q __aterm_rekey_path
     set -g __aterm_rekey_path "$ATERM_REKEY_PATH"
 end
 set -e ATERM_REKEY_PATH 2>/dev/null
 
-# THE WARM SPARE (docs/DESIGN-warm-spare-2026-10-16.md), fish's half: the WARM
-# hold alone. fish reads no file of aterm's before the user's startup files (its
-# vendor conf.d runs with theirs), so a fish spare cannot park: it is spawned
-# WARM, its startup files running unseen at once, and waits at its first prompt
-# event (THE WARM HOLD) — the host books one only where the learned gate already
-# admits a WARM run. A spare is a shell whose hold FIFO exists, found from the
-# re-key path as the zsh and bash wrappers find it. Every fresh shell owes one
-# start record at its first prompt (THE START MARK).
-#
-# THE STARTUP ROOTS (R7, 2026-10-19): the record also names the folders fish's
-# own conf.d loop walks, this file among them, so the host stamps the files a
-# spare ran unseen where they really are, never where a guess from the binary's
-# prefix puts them (a build-configured sysconf folder, every inherited
-# $XDG_DATA_DIRS entry): the sysconf folder, then each vendor conf.d folder —
-# fish 4's global list, else fish 3's, local to the share/config.fish whose
-# loop is sourcing this file. A fish 3 that sources this file by hand sees
-# neither and names none, and its host runs none of its starts unseen.
+# Warm spare (docs/DESIGN-warm-spare-2026-10-16.md): fish runs vendor conf.d
+# alongside user startup files, so a fish spare runs startup unseen and waits at
+# its first prompt event when its hold FIFO exists. Also record the conf.d
+# startup roots so the host stamps the files a spare ran unseen.
 if test "$__aterm_fresh_load" = 1
     set -g __aterm_start_pending 1
     if set -q __fish_vendor_confdirs
@@ -368,19 +168,14 @@ if test "$__aterm_fresh_load" = 1
     end
 end
 
-# THE BODY POINTER (the zsh script's "THE LOADER"), captured and scrubbed exactly
-# like the re-key path: no child process learns it. An upgrade in place keeps the
-# one the shell already has, or takes the one its relaunch line hands it.
+# Body pointer path, captured and scrubbed so child processes do not inherit it.
 if test -n "$ATERM_INTEGRATION_POINTER"; or not set -q __aterm_body_pointer
     set -g __aterm_body_pointer "$ATERM_INTEGRATION_POINTER"
 end
 set -e ATERM_INTEGRATION_POINTER 2>/dev/null
 
-# Where this file was loaded from — `<root>/<address>/`, the content-addressed
-# folder the host prepared (the vendor conf.d copy sits in its `fish-xdg/`) — and
-# so which body is running: `<address>` when the folder is named by one (16
-# lowercase hex digits), empty for a hand-installed copy, which signs no revision.
-# Each piece is captured whole, never glued (this file's glue rule).
+# Resolve the content-addressed folder (`<root>/<16-hex-addr>/`) this script was
+# loaded from; empty for a hand-installed copy.
 set -l __aterm_here (status dirname)
 set -g __aterm_si_dir (string replace -r '/fish-xdg/fish/vendor_conf\.d$' '' -- "$__aterm_here")
 set -g __aterm_si_root (string replace -r '/[^/]*$' '' -- "$__aterm_si_dir")
@@ -389,18 +184,12 @@ if not string match -qr '^[0-9a-f]{16}$' -- "$__aterm_body_rev"
     set -g __aterm_body_rev ""
 end
 
-# A fresh load settles the body's AN OLDER SCRIPT'S `~/.aterm/bin` at once: this
-# loader puts no `~/.aterm/bin` on PATH, so no entry there is an integration's
-# and the body has nothing to look for.
+# Fresh loads never add `~/.aterm/bin` to PATH, so no legacy entry cleanup is needed.
 if test "$__aterm_fresh_load" = 1
     set -g __aterm_old_bin_off 1
 end
 
-# Source package shell hooks — once per shell: an upgrade in place already ran
-# them (the LIVE block re-sources the atpkg hook whenever it changes).
-# No `~/.aterm/bin` goes on PATH: nothing creates or manages that folder, and an
-# entry there ahead of everything would let whatever lands in it shadow every
-# command in every session. atpkg's managed bin/ is APPENDED, by its own hook.
+# Source package shell hooks once on fresh load.
 if test "$__aterm_fresh_load" = 1; and test -d "$HOME/.aterm/shell.d"
     for f in $HOME/.aterm/shell.d/*.fish $HOME/.aterm/shell.d/*.sh
         if test -f "$f"
@@ -409,18 +198,13 @@ if test "$__aterm_fresh_load" = 1; and test -d "$HOME/.aterm/shell.d"
     end
 end
 
-# THE BODY CHECK, first at every prompt (the prompt event and the trampoline at
-# the end of the file): a newer body waits when the host has written the
-# pointer. Two builtin `test`s while nothing waits; the read, the removal (the
-# one fork) and the source happen only when a pointer waits. The revision moves
-# only when the source succeeded: a body that failed to load is still reported
-# as the one before it.
+# Check for a newer body pointer at each prompt and source it if owned by the
+# current user (`test -O`) and addressed by a 16-hex digest.
 function __aterm_body_check
     test -n "$__aterm_body_pointer"; and test -f "$__aterm_body_pointer"; or return 0
     set -l addr ""
     read -l addr <"$__aterm_body_pointer" 2>/dev/null
     command rm -f -- "$__aterm_body_pointer"
-    # Exactly 16 lowercase hex digits — a folder address — or nothing changes.
     string match -qr '^[0-9a-f]{16}$' -- "$addr"; or return 0
     test "$addr" != "$__aterm_body_rev"; or return 0
     set -l file "$__aterm_si_root/$addr/aterm_shell_integration_body.fish"
@@ -433,27 +217,15 @@ end
 
 # @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
 
-# Enable agy's fast prompt editor by default (including in adopted shells when
-# this body is live-reloaded at the next prompt) so U+202F narrow no-break
-# spaces in macOS screenshot filenames do not desynchronize Bubble Tea's
-# textarea visual cursor.
+# Enable agy's fast prompt editor by default so U+202F narrow no-break spaces in
+# macOS screenshot filenames do not desynchronize Bubble Tea's textarea cursor.
 if not set -q AGY_CLI_FAST_PROMPT_EDITOR
     set -gx AGY_CLI_FAST_PROMPT_EDITOR true
 end
 
-# ─── AN OLDER SCRIPT'S `~/.aterm/bin`, taken off (2026-10-19) ───
-#
-# Once per shell, in a shell an older script loaded that this body reaches in
-# place (`__aterm_old_bin_off` unset; a fresh load settles it in the loader):
-# `aterm_shell_integration_old_bin.fish`, beside this file in its folder, says
-# what goes and when, and takes it off. Its own file (2026-10-20) because no
-# shell this build starts ever runs it, yet every one paid here to parse it:
-# about 0.45 M of the 165 M instructions to the first prompt (2026-10-20, fish
-# 4.9.3, a PTY, the captured aterm spawn env, interleaved, n=40).
-# The folder is `status dirname`'s less the vendor conf.d a fresh load comes
-# from (as `__aterm_si_dir`), each piece captured whole (the glue rule); a copy
-# with no such file beside it takes nothing off. Sourced only when it is this
-# user's (`test -O`), as THE BODY CHECK sources a body.
+# One-shot cleanup of legacy `~/.aterm/bin` PATH entries for shells upgraded in
+# place (`__aterm_old_bin_off` unset). Kept in a sidecar file so fresh shells do
+# not pay to parse it.
 if not set -q __aterm_old_bin_off
     set -g __aterm_old_bin_off 1
     set -l __aterm_here (status dirname)
@@ -465,31 +237,11 @@ if not set -q __aterm_old_bin_off
     set -e __aterm_bin_from
 end
 
-# ─── The reroute directory, FIRST — and the agents directory beside it ───
-#
-# $ATERM_REROUTE_DIR is set by aterm's spawn seam: the session-scoped directory of
-# stubs for the upstream Rust names (`aterm help reroute`), which the seam already
-# put FIRST on the PATH it handed this shell. That position is not final: fish
-# loads this file from conf.d, EARLY — before config.fish, where a user's
-# `fish_add_path ~/.cargo/bin` lands — and the package blocks just above may
-# prepend too. Measured 2026-09-07: ~/.cargo/bin at position 17, ahead of the
-# managed store at 19, so a bare `cargo` ran upstream Rust silently. An ORDER
-# failure — which is why this is move-to-front (every existing occurrence removed,
-# then prepended), never skip-if-present. Asserted here, and once more from a
-# one-shot on the first fish_prompt event, by which time config.fish has run.
-# Inert outside a session: the variable is unset, or the directory (Windows lays
-# none) does not exist. `test -n`, this file's rule for every ATERM_* variable.
-#
-# An explicit equality loop rather than `string match -v`: `string match` reads its
-# pattern as a wildcard, so a directory named with `*` or `[` would not be removed
-# by equality. The quoted `"$d"` keeps an EMPTY entry — the user's — intact.
-#
-# $ATPKG_AGENTS — set by the atpkg shell.d hook sourced just above — names
-# <prefix>/agents, which holds ONLY the agent shims aterm keeps current (claude,
-# codex, agy, muse; owner decisions 2026-09-10 and 2026-10-15). It fails the same
-# way (measured 2026-09-10 on m27: behind /opt/homebrew/bin and ~/.local/bin), so it
-# is moved to the front first, then the reroute directory, so PATH reads reroute,
-# agents, … — the spawn seam's own order.
+# Keep `$ATERM_REROUTE_DIR` first on PATH, followed by `$ATPKG_AGENTS`.
+# Fish loads vendor conf.d before `~/.config/fish/config.fish`, where user
+# `fish_add_path` calls prepend to PATH, so this moves both directories to the
+# front (removing existing occurrences via exact equality rather than wildcard
+# `string match -v`) at load and again on the first prompt event.
 function __aterm_path_front --argument-names dir
     set -l rest
     for d in $PATH
@@ -499,16 +251,9 @@ function __aterm_path_front --argument-names dir
     end
     set -gx PATH "$dir" $rest
 end
-#
-# It also records, in $__aterm_managed_want (a list, in order), the dirs it put in
-# front, which is what the per-prompt hot path below compares the head of $PATH
-# against, and in $__aterm_managed_agents_on / $__aterm_managed_reroute_on whether
-# each dir WAS there to front. A dir that was absent is re-probed by the hot path
-# (one `test -d` per prompt, only while it stays absent — review finding
-# 2026-09-16: a hook that predates agents/ set $ATPKG_AGENTS, the `test -d` here
-# failed once, and the shell never looked again) and fronted the moment it
-# appears. The `test -d` stats of the steady state live HERE, on the change path,
-# never on the per-prompt one.
+# Track expected leading directories in `$__aterm_managed_want` and whether each
+# existed when last fronted so the per-prompt hot path only stats when a
+# directory was absent.
 set -g __aterm_managed_want
 set -g __aterm_managed_agents_on 0
 set -g __aterm_managed_reroute_on 0
@@ -528,12 +273,8 @@ function __aterm_reroute_path_front
     end
 end
 __aterm_reroute_path_front
-# atpkg's managed bin/ goes LAST, where its hook appends it, so it shadows no
-# directory of the session's. fish runs this file among the other conf.d snippets,
-# in name order, and config.fish after them all: one of those appending a directory
-# (Ubuntu's snapd.fish appends /snap/bin to a PATH without it) left bin/ ahead of
-# that directory. The first prompt, after every startup file, puts bin/ back at the
-# end, as it puts the front back first.
+# Keep atpkg's managed `bin/` at the end of PATH after all startup files have run
+# so it never shadows user or system directories.
 function __aterm_managed_bin_last
     test -n "$ATPKG_BIN"; and test "$PATH[-1]" != "$ATPKG_BIN"; and contains -- "$ATPKG_BIN" $PATH
     or return 0
@@ -551,88 +292,19 @@ function __aterm_reroute_first_prompt --on-event fish_prompt
     __aterm_managed_bin_last
 end
 
-# ─── LIVE: the tab that is ALREADY OPEN picks the managed dirs up the moment atpkg lays them ───
-#
-# Owner, 2026-09-16, looking at a status row that read "✓ Claude Code 2.1.273 ·
-# Codex 0.154.0 — aterm-managed, current   what `claude` and `codex` run in new
-# tabs": "HEY! this is a bad experience. aterm atpkg DID install the latest but it
-# didn't make them available for me. instead, it is telling me to open a new tab.
-# NO! all the latest and best MUST WORK IN THE SAME TAB with live update! fix this
-# and this message and audit that this is the actual behavior."
-#
-# What was measured in that tab: its shell (pid 1784) was spawned at 10:44:24 by
-# the PREVIOUS app build and ADOPTED across the seamless update — the running app
-# (0.86.0, pid 1868) started at 10:44:32 — and <prefix>/agents plus the shell.d
-# hooks were created at 10:46 by the new build's first pass. The asserts above fire
-# ONCE each (load, first prompt), gated on $ATPKG_AGENTS / $ATERM_REROUTE_DIR being
-# set and the directories existing AT THAT INSTANT; that shell had neither variable
-# and no directory to find, so `claude` resolved to a foreign copy and the only way
-# to the build atpkg had just installed was a new tab. The same freeze hits EVERY
-# fresh machine: the first tab opens before the seed pass creates agents/.
-#
-# The fix is a per-prompt AND per-command re-assert — from fish_prompt and from
-# fish_preexec, because a command typed at an idle prompt after the dirs appear
-# runs BEFORE the next prompt — in three steps, all builtin-only (`test`, `set`,
-# `math`, `read`, `source`: no external stat/dirname/readlink; pinned by a grep
-# test):
-#
-#  1. THE HOOK IS THE SOURCE OF TRUTH when the environment is missing or stale.
-#     ~/.aterm/shell.d/00-atpkg.fish is what atpkg generates (crates/atpkg/src/hooks.rs;
-#     the spelling is pinned from that crate's side): it exports $ATPKG_AGENTS and
-#     $ATPKG_BIN, moves agents/ to the front and appends bin/, and it is idempotent.
-#     It is (re)sourced when the TEXT on disk is not the text last sourced — it
-#     appeared (a shell spawned before the file existed), or atpkg rewrote it on a
-#     later pass. fish has no builtin that reads an mtime or an inode, so unlike
-#     zsh (one zstat) the copy is compared by CONTENT: `read -z` — a builtin, on a
-#     builtin redirection — takes the whole file into one variable, and that is
-#     compared to the text recorded at the last source. Measured 2026-09-16 (fish
-#     4.9.3, the 9-line hook, 10000 calls): 22 µs per call, one `test -f` stat
-#     plus one open/read/close; a fork is ~1300 µs. The `test -nt` stamp
-#     alternative (two stats) was rejected for the STATE it carries: a per-shell
-#     file this shell must mint symlink-safely in a possibly shared /tmp, own,
-#     and delete at exit — a leak for every shell killed without one. A hook that
-#     predates R1 (no ATPKG_AGENTS) is sourced ONCE per copy, not once per
-#     prompt. An absent hook sources nothing; the empty text is recorded so a
-#     hook that appears later is seen as new.
-#  2. A DIR THAT WAS ABSENT when the front was last laid is probed again — one
-#     `test -d` per prompt, only in that degraded state — and fronted when it
-#     appears: a hook that names an agents/ atpkg has not created yet, or a
-#     session whose seam exported no $ATERM_REROUTE_DIR. Nothing is assigned
-#     while it stays absent.
-#  3. THE ORDER. $__aterm_managed_want holds the dirs that must lead $PATH; the hot
-#     path compares them element-wise against the head of $PATH and assigns ONLY
-#     on a mismatch.
-#
-# No twin watch is needed here, unlike zsh and bash: fish keeps no command hash —
-# every invocation walks $PATH — so a twin that lands in an agents/ already
-# leading $PATH is what the very next `claude` runs.
-#
-# $ATERM_REROUTE_DIR is derived for a shell that predates it — the sibling
-# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $__ATERM_REROUTE_PASSTHROUGH is
-# not engaged (non-empty and not "0": atpkg::reroute::engaged) — so the final order
-# is reroute, agents, everything else, bin/ last (the hook appends it). The parent
-# is cut with `string` (a builtin — its substitution forks nothing) and captured
-# into a local before it is interpolated, this file's glue rule.
-#
-# Gated on BEING INSIDE AN ATERM SESSION ($ATERM_CHILD=1, which the spawn seam sets
-# for every child, or $ATERM_SESSION_ID) — NOT on $ATERM_REROUTE_DIR, which is
-# precisely what the adopted shell lacks. Inert everywhere else. `test -n`, this
-# file's rule for every ATERM_* variable.
-#
-# The twin itself needs nothing from here: atpkg re-lays <prefix>/agents/claude
-# atomically, and the NEXT invocation follows the path — so once agents/ leads
-# $PATH, every later update is live too.
+# Live managed PATH re-assertion on `fish_prompt` and `fish_preexec` (builtin-only:
+# `test`, `set`, `math`, `read`, `source` — no external forks):
+#  1. Re-source `~/.aterm/shell.d/00-atpkg.fish` when its on-disk content changes
+#     (compared via builtin `read -z`).
+#  2. Re-probe `$ATPKG_AGENTS` / `$ATERM_REROUTE_DIR` if absent when last laid.
+#  3. Re-front `$__aterm_managed_want` if the head of `$PATH` drifted.
+# Gated on `$ATERM_CHILD` or `$ATERM_SESSION_ID`.
 set -g __aterm_atpkg_hook "$HOME/.aterm/shell.d/00-atpkg.fish"
 set -g __aterm_managed_live 0
 if test -n "$ATERM_CHILD"; or test -n "$ATERM_SESSION_ID"
     set -g __aterm_managed_live 1
 end
 
-# Leaves the hook's text in $__aterm_atpkg_hook_now, or the empty string when it
-# is absent. Builtin `read -z` (to NUL or EOF: the whole file, newlines kept) on
-# a builtin redirection, behind the `test -f` that keeps a missing file from
-# printing fish's redirection error. Its own global, not a local of the hot
-# path, so the compare below reads one string, never a list.
 set -g __aterm_atpkg_hook_now ""
 function __aterm_atpkg_hook_read
     set -g __aterm_atpkg_hook_now ""
@@ -641,11 +313,6 @@ function __aterm_atpkg_hook_read
     end
     return 0
 end
-# The copy the shell.d loop above sourced at load is the copy last sourced —
-# whatever it exported (a pre-R1 hook exports no $ATPKG_AGENTS, and is still not
-# sourced again until atpkg rewrites it). Recorded ONCE per shell: a body
-# re-sourced live keeps the record, so a hook rewritten just before is still
-# sourced at the next prompt.
 if not set -q __aterm_atpkg_hook_seen
     set -g __aterm_atpkg_hook_seen ""
     if test "$__aterm_managed_live" = 1
@@ -654,7 +321,8 @@ if not set -q __aterm_atpkg_hook_seen
     end
 end
 
-# Exports $ATERM_REROUTE_DIR (status 0) or leaves it alone (status 1).
+# Derive `$ATERM_REROUTE_DIR` from `<parent of $ATPKG_AGENTS>/reroute` when the
+# shell predates `$ATERM_REROUTE_DIR` and passthrough is not engaged.
 function __aterm_managed_derive_reroute
     if test -n "$ATERM_REROUTE_DIR"; or test -z "$ATPKG_AGENTS"
         return 1
@@ -670,21 +338,14 @@ function __aterm_managed_derive_reroute
     set -gx ATERM_REROUTE_DIR "$dir"
     return 0
 end
-# A session shell whose seam exported no $ATERM_REROUTE_DIR but whose rc block
-# sourced the hook derives it now, so the load-time order is final too.
 if test "$__aterm_managed_live" = 1; and __aterm_managed_derive_reroute
     __aterm_reroute_path_front
 end
 
-# The hot path: every fish_prompt and every fish_preexec. Builtin-only — see above.
 function __aterm_managed_path_live
     if test "$__aterm_managed_live" != 1
         return 0
     end
-    # 1. The hook: sourced when the text on disk is not the text last sourced. An
-    #    ABSENT hook falls through: steps 2 and 3 keep the reroute dir in front
-    #    regardless (review finding 2026-09-16: an early return here left a PATH
-    #    prepend at the prompt shadowing the reroute stubs for the shell's life).
     __aterm_atpkg_hook_read
     if test "$__aterm_atpkg_hook_now" != "$__aterm_atpkg_hook_seen"
         set -g __aterm_atpkg_hook_seen "$__aterm_atpkg_hook_now"
@@ -695,7 +356,6 @@ function __aterm_managed_path_live
             return 0
         end
     end
-    # 2. A dir that was absent when the front was last laid: probe it again.
     set -l refront 0
     if test "$__aterm_managed_agents_on" != 1; and test -n "$ATPKG_AGENTS"; and test -d "$ATPKG_AGENTS"
         set refront 1
@@ -713,8 +373,6 @@ function __aterm_managed_path_live
         __aterm_reroute_path_front
         return 0
     end
-    # 3. The order: assign only on a mismatch. An out-of-range $PATH index expands
-    #    to nothing, which never equals a directory, so a short $PATH mismatches.
     set -l i 1
     for d in $__aterm_managed_want
         if test "$PATH[$i]" != "$d"
@@ -726,17 +384,11 @@ function __aterm_managed_path_live
     return 0
 end
 
-# State tracking. KEPT across a live re-source: the body is re-sourced from the
-# prompt trampoline, and the prompt it draws still colours the last status.
-# `$__aterm_last_status` is the last command's `$status`, one value, as every
-# body reads it: an older body taking over draws its custom prompt with `test
-# $__aterm_last_status -ne 0`, which a list stops with a `test` error (measured).
-# `$__aterm_last_pipestatus` is its `$pipestatus`; the user's prompt is handed
-# both (see "THE USER'S PROMPT" below).
+# State tracking preserved across live body reloads. `$__aterm_last_status` is a
+# single scalar `$status`; `$__aterm_last_pipestatus` holds `$pipestatus`.
 if not set -q __aterm_last_status
     set -g __aterm_last_status 0
 end
-# How many prompts this shell has wrapped (see "THE USER'S PROMPT").
 if not set -q __aterm_prompt_gen
     set -g __aterm_prompt_gen 0
 end
@@ -746,40 +398,11 @@ function __aterm_osc
     printf '\e]%s\a' $argv[1]
 end
 
-# ─── Host identity (OSC 7 authority + prompt) ───
-#
-# Resolved ONCE at load time into plain string globals, exactly like zsh's
-# `typeset -g __aterm_report_host="${HOST:-${HOSTNAME:-localhost}}"`.
-#
-# THE GLUE RULE (this file's second cartesian-product casualty; see the
-# `$__aterm_id_suffix_str` note below for the first). `__aterm_report_cwd` used
-# to spell its payload as a string glued to a command substitution:
-#
-#     __aterm_osc "7;file://"(hostname)"$cwd"
-#
-# In fish a string glued to a command substitution is a CARTESIAN PRODUCT, and a
-# substitution that prints nothing is a ZERO-ELEMENT list — so the product is
-# ZERO arguments, `__aterm_osc` is called with no argv, and its
-# `printf '\e]%s\a' $argv[1]` emits a bare, empty `ESC ] BEL`. Measured on fish
-# 4.2.1 with a `hostname` that prints nothing: OSC 7 came out as exactly
-# `\e]\a` — no scheme, no path, so the host learns NOTHING about the cwd and
-# "Open Terminal Here" / tab titles / new-tab-inherits-cwd all go dead.
-#
-# And a host with NO `hostname` command at all (a container image, a slim
-# base, a Nix profile without inetutils — `hostname` is not in POSIX and not in
-# coreutils) is worse than silent: the substitution raises `Unknown command`, so
-# fish ABORTS the whole statement and additionally prints a five-line error
-# block — at source time AND on every single directory change.
-#
-# bash interpolates `${HOSTNAME:-$(hostname)}` and zsh a plain parameter, so
-# neither shell has this failure mode; it is unique to fish's list semantics.
-#
-# Resolution order mirrors the other two shells and ends somewhere non-empty:
-# `$HOST` then `$HOSTNAME` (zsh's and bash's spellings, and what the test
-# harness pins), then fish's own `$hostname` global (fish 3.5+, no fork), then
-# the `hostname` command — invoked ONLY behind `command -sq`, so a host without
-# it gets the `localhost` default instead of an error storm — then `localhost`,
-# which is also the canonical RFC 8089 `file://` authority.
+# Resolve host identity once at load time into string globals (`$HOST`,
+# `$HOSTNAME`, fish's `$hostname`, `command hostname` if installed, else
+# `localhost`) so OSC 7 and prompts never glue a command substitution directly
+# into an argument (which in fish collapses to zero arguments if empty and
+# aborts if `hostname` is not installed).
 set -g __aterm_report_host localhost
 if test -n "$HOST"
     set -g __aterm_report_host "$HOST"
@@ -788,34 +411,22 @@ else if test -n "$HOSTNAME"
 else if test -n "$hostname"
     set -g __aterm_report_host "$hostname"
 else if command -sq hostname
-    # `set -l` first, then a QUOTED emptiness test: a `hostname` that exists but
-    # prints nothing yields a zero-element list, and promoting that would put us
-    # right back at an empty OSC 7 authority.
     set -l __aterm_host_probe (command hostname 2>/dev/null)
     if test -n "$__aterm_host_probe"
         set -g __aterm_report_host "$__aterm_host_probe"
     end
 end
 
-# Short (first DNS label) form — the equivalent of bash's `\h` and the
-# `hostname -s` the prompt styles used to fork for. `string replace` always
-# prints its input, so this is a one-element substitution by construction; the
-# emptiness guard is belt-and-braces so the prompt can never inherit a
-# zero-element list.
+# Short (first DNS label) hostname for prompt styles.
 set -g __aterm_report_host_short "$__aterm_report_host"
 set -l __aterm_host_first_label (string replace -r '\..*' '' -- "$__aterm_report_host")
 if test -n "$__aterm_host_first_label"
     set -g __aterm_report_host_short "$__aterm_host_first_label"
 end
 
-# The re-key channel's check (the path is captured by the loader above).
-#
-# Inside a user's prompt it is the first thing a copy of the prompt wrapper from
-# before loaders runs — conda's `__fish_prompt_orig` or a venv's
-# `_old_fish_prompt` in a shell that took a loader by the typed upgrade — so it
-# keeps what that wrapper was handed, as a trampoline's first statement does:
-# the prompt the copy draws reads the status conda or the venv put back (`$status`
-# alone, `$pipestatus` of their own), not the command's (see "THE USER'S PROMPT").
+# Check the re-key channel. When called inside a pre-loader prompt wrapper
+# copy (`__fish_prompt_orig` / `_old_fish_prompt`), also preserve `$status` and
+# `$pipestatus` for the inner prompt draw.
 function __aterm_rekey_check
     set -l st $status $pipestatus
     __aterm_prompt_inner; and set -g __aterm_prompt_status $st
@@ -823,47 +434,29 @@ function __aterm_rekey_check
     set -l key ""
     read -l key <"$__aterm_rekey_path" 2>/dev/null
     command rm -f -- "$__aterm_rekey_path"
-    # Exactly 64 lowercase hex digits, or nothing changes.
     if string match -qr '^[0-9a-f]{64}$' -- "$key"
         set -g __aterm_shell_nonce "$key"
         set -g __aterm_id_suffix_str ";id=$key"
     end
 end
 
-# Capability-nonce suffix for OSC 133/633 emissions (#7960, #7987, #8015).
-# Prints ";id=<64-hex>" when the captured nonce is non-empty, or nothing
-# otherwise. Reads from the captured global — never from the environment
-# — so the nonce is not inherited by subprocesses. Kept as the documented
-# helper / external entry point (the zsh script keeps its twin for the same
-# reason); the hot emitters below interpolate $__aterm_id_suffix_str instead,
-# because a command substitution that prints nothing would take the whole
-# argument with it (see above).
+# Capability-nonce suffix helper for external callers; hot emitters interpolate
+# `$__aterm_id_suffix_str` directly.
 function __aterm_id_suffix
     if test -n "$__aterm_shell_nonce"
         printf ';id=%s' "$__aterm_shell_nonce"
     end
 end
 
-# Percent-encode a string for use in file:// URIs (RFC 3986).
-# Unreserved chars (A-Z a-z 0-9 - _ . ~ /) pass through; all others
-# are encoded byte-by-byte as %XX. fish's `string escape --style=url`
-# uses query-string encoding (+ for spaces); we fix that to %20.
+# Percent-encode a string for file:// URIs (RFC 3986), converting query-string
+# `+` for spaces to `%20`.
 function __aterm_urlencode
     string escape --style=url -- $argv[1] | string replace -a '+' '%20'
 end
 
-# Report current working directory (OSC 7)
+# Report current working directory (signed 633;P;AtermCwd + OSC 7).
 function __aterm_report_cwd
-    # `"$PWD"`, not `(pwd)` — bash and zsh both read the parameter, and a
-    # quoted parameter is one argument no matter what, where a substitution
-    # that printed nothing would hand `__aterm_urlencode` zero arguments (its
-    # `string escape -- $argv[1]` would then have no operand and read STDIN).
     set -l cwd (__aterm_urlencode "$PWD")
-    # file:// URL format. ONE double-quoted argument, interpolating the two
-    # precomputed globals — never a string glued to a command substitution;
-    # see the glue rule beside $__aterm_report_host above.
-    # SIGNED first, then plain (see the zsh script's __aterm_report_cwd), the
-    # pair in one printf: no `__aterm_osc` call for either, at every prompt.
     set -l uri "file://$__aterm_report_host$cwd"
     if test -n "$__aterm_id_suffix_str"
         printf '\e]633;P;AtermCwd=%s%s\a\e]7;%s\a' "$uri" "$__aterm_id_suffix_str" "$uri"
@@ -872,20 +465,14 @@ function __aterm_report_cwd
     end
 end
 
-# Mark prompt start (OSC 133;A). Never from inside a user's prompt: a wrapper's
-# copy of an older build's prompt wrapper calls this too (see "THE USER'S
-# PROMPT").
+# Mark prompt start (OSC 133;A); suppressed during nested prompt draws.
 function __aterm_mark_prompt_start
     __aterm_prompt_inner; and return 0
     __aterm_osc "133;A$__aterm_id_suffix_str"
 end
 
-# Mark command line start (OSC 133;B), the same. It ends the prompt fish draws
-# before the commandline, so it stands where the buffer starts, and a signed one
-# says so (`aterm_input=start`): aterm's typing prediction places Home, End,
-# Ctrl-A, Ctrl-E and Delete only on a line started at a mark that does
-# (`Terminal::input_region_start`; zsh's, sent after zle drew a pre-filled
-# line, says so only over an empty buffer).
+# Mark command line start (OSC 133;B). Signed marks carry `aterm_input=start`
+# so typing prediction knows the input buffer starts at the cursor.
 function __aterm_mark_command_start
     __aterm_prompt_inner; and return 0
     if test -n "$__aterm_id_suffix_str"
@@ -905,51 +492,15 @@ function __aterm_mark_exec_finish
     __aterm_osc "133;D;$argv[1]$__aterm_id_suffix_str"
 end
 
-# The body's revision, SIGNED (633;P, the VS Code property mark): the folder
-# address this body was taken from, so the host can tell a shell running its own
-# body from one running an older build's (`status integration_rev=`). Emitted
-# before every 133;A — nothing when the revision is unknown (a hand-installed
-# copy). One quoted argument, never glued.
+# Report the active integration body revision (signed 633;P;AtermIntegration).
 function __aterm_mark_integration_rev
     test -n "$__aterm_body_rev"; or return 0
     __aterm_osc "633;P;AtermIntegration=$__aterm_body_rev$__aterm_id_suffix_str"
 end
 
-# ─── Prompt Colors ───
-#
-# Render a palette INDEX as an SGR 256-color escape — byte-for-byte the same
-# bytes bash puts in PS1 (`\[\033[38;5;${hc}m\]`) and zsh in PROMPT.
-#
-# THE DEFECT THIS REPLACES. Every `ATERM_PROMPT_*_COLOR` is a palette index —
-# that is what the knob means in bash and zsh, and it is what all five of this
-# script's own defaults are (host=2, path=4, git=3, error=1, sep=8). fish's
-# `set_color`, though, accepts colour NAMES (`red`, `brblack`) and hex triples
-# (`a0a0a0`) ONLY. Handed an index it answers
-#
-#     set_color: Unknown color “4”
-#
-# on stderr, exits 2, and — the part that does the damage — emits NOTHING.
-#
-# Emitting nothing is not merely "the prompt is uncoloured". A `set_color` that
-# prints nothing is a ZERO-ELEMENT command substitution, so every place the old
-# prompt spliced one in lost an ARGUMENT, and `printf`'s remaining arguments all
-# slid one position left. Measured on fish 4.2.1, style=standard, before this
-# fix — four `Unknown color` lines dumped onto the user's terminal on EVERY
-# prompt render, and then:
-#
-#     userdev-host@/t/c/-/s/w/shell-render:  $
-#
-# instead of `user@dev-host:~/…`. The `@` and the `:` had migrated to the
-# wrong side of their operands because the colour arguments they were supposed
-# to follow no longer existed. powerline lost both separators outright.
-#
-# So: format the escape ourselves with `printf`, which always emits its literal
-# bytes and therefore can never be a zero-element substitution. A non-numeric
-# value still routes to `set_color`, so fish users who set a NAME or a hex
-# triple keep working — bash would emit `\033[38;5;redm` for those, so there is
-# no cross-shell output to match there, and fish may as well do the right
-# thing. `[0-9]{1,3}` is the index form: 1–3 digits is what a 0-255 palette
-# index looks like, and it leaves 6-digit hex to `set_color`.
+# Format a 0-255 palette index as `\e[38;5;Nm` (fish's `set_color` only accepts
+# color names and 6-digit hex triples, rejecting palette indices with stderr and
+# empty output). Non-numeric values still delegate to `set_color`.
 function __aterm_prompt_color
     if string match -qr '^[0-9]{1,3}$' -- "$argv[1]"
         printf '\e[38;5;%sm' "$argv[1]"
@@ -958,45 +509,27 @@ function __aterm_prompt_color
     end
 end
 
-# Reset — bash's and zsh's `\033[0m`, not fish's `set_color normal` (which
-# emits terminfo `sgr0`, i.e. `\e[m` on this terminal). Same meaning, but the
-# point of this section is that the three shells put the SAME bytes on the wire.
+# Emit `\e[0m` to match bash/zsh SGR reset bytes (`set_color normal` emits terminfo sgr0).
 function __aterm_prompt_color_reset
     printf '\e[0m'
 end
 
-# ─── Prompt Override ───
-# When ATERM_PROMPT_STYLE is set, override fish_prompt using palette-indexed colors.
+# When ATERM_PROMPT_STYLE is set, render the prompt using palette-indexed colors.
 function __aterm_custom_prompt
     set -l style "$ATERM_PROMPT_STYLE"
-    # `test -n`, NOT `set -q` — see the loader-guard note at the top. bash and
-    # zsh spell every one of these `${ATERM_PROMPT_*_COLOR:-<default>}`, and `:-`
-    # substitutes the default for BOTH unset and empty. `set -q` accepted an
-    # empty-but-defined value, `echo $VAR` then printed a bare newline, and the
-    # default was never reached — so `set_color ""` ran on EVERY prompt render
-    # and fish answered `set_color: Unknown color ""` (exit 2) straight onto the
-    # user's terminal. Measured on fish 4.2.1.
     set -l hc (test -n "$ATERM_PROMPT_HOST_COLOR"; and echo $ATERM_PROMPT_HOST_COLOR; or echo 2)
     set -l pc (test -n "$ATERM_PROMPT_PATH_COLOR"; and echo $ATERM_PROMPT_PATH_COLOR; or echo 4)
     set -l gc (test -n "$ATERM_PROMPT_GIT_COLOR"; and echo $ATERM_PROMPT_GIT_COLOR; or echo 3)
     set -l ec (test -n "$ATERM_PROMPT_ERROR_COLOR"; and echo $ATERM_PROMPT_ERROR_COLOR; or echo 1)
     set -l sc (test -n "$ATERM_PROMPT_SEP_COLOR"; and echo $ATERM_PROMPT_SEP_COLOR; or echo 8)
 
-    # Error-aware prompt char: separator color on success, error color on failure
     set -l prompt_color $sc
     if test "$__aterm_last_status[1]" -ne 0
         set prompt_color $ec
     end
 
-    # EVERY segment is captured into a local and interpolated QUOTED below.
-    #
-    # This is the glue rule again (see $__aterm_report_host), in its
-    # argument-position form. A bare `(cmd)` sitting in a `printf` argument list
-    # is not one argument — it is however many lines `cmd` printed, which for a
-    # failing `set_color`, a missing `hostname`, or a `whoami` that is not
-    # installed is ZERO. Every later argument then shifts left and `printf`
-    # pairs them with the wrong `%s`. `"$var"` is always exactly one argument,
-    # empty value or not, so the layout survives even when a segment does not.
+    # Capture each segment into a local and interpolate quoted so an empty
+    # output never drops an argument from `printf`.
     set -l h (__aterm_prompt_color $hc)
     set -l p (__aterm_prompt_color $pc)
     set -l g (__aterm_prompt_color $gc)
@@ -1005,19 +538,11 @@ function __aterm_custom_prompt
     set -l r (__aterm_prompt_color_reset)
     set -l cwd (prompt_pwd)
 
-    # bash's `\u`: fish keeps the login name in $USER, so the common path costs
-    # no fork; `whoami` is the fallback, guarded so a host without it degrades
-    # to an empty user segment rather than an `Unknown command` error.
     set -l user "$USER"
     if test -z "$user"; and command -sq whoami
         set user (whoami)
     end
 
-    # bash's git segment is `${g}$(__aterm_git_segment)${r}` — the colour and
-    # the reset are emitted whether or not there is a branch, and the leading
-    # space lives INSIDE them. Match that exactly: it makes fish's SGR sequence
-    # identical to bash's in a non-repo directory as well as in a repo, and the
-    # no-branch case is two invisible escapes, the same two bash already writes.
     set -l git_text ""
     if command -sq git
         set -l branch (command git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -1048,81 +573,24 @@ function __aterm_custom_prompt
     end
 end
 
-# ─── THE USER'S PROMPT: handed what fish hands it, and kept wrapped (2026-10-01) ───
-#
-# The trampoline (end of file) draws the user's prompt between this body's 133;A
-# and 133;B. Two things went wrong there, both measured on fish 4.9.3:
-#
-#  1. The prompt never saw the command's `$status` / `$pipestatus`: the
-#     trampoline and this body ran a dozen commands before it, each replacing
-#     both. fish's default prompt never showed `[1]` after `false`, and tide's
-#     and pure's error colours never turned.
-#  2. A prompt config.fish defines (`starship init fish | source`, oh-my-posh's,
-#     a plain `function fish_prompt` there) replaced the trampoline for the
-#     shell's life — fish reads the vendor conf.d, and so this file, BEFORE
-#     config.fish — and with it every 133;A and 133;B. Only fish's own unsigned
-#     `133;A;click_events=1` / `133;B` reached the wire, and were dropped, so the
-#     engine kept no block at all while `status` read `integration=on`. The marks
-#     cannot come from somewhere else: the `fish_prompt` event fires before the
-#     prompt is drawn, but nothing fires after it, where 133;B goes.
-#
-# So:
-#  - Every trampoline captures what fish handed it, `$status $pipestatus`, as its
-#    first statement (`$__aterm_prompt_status`; a copy of the wrapper from before
-#    loaders keeps it in its first call, `__aterm_rekey_check`; a trampoline from
-#    an older loader captures nothing, and the command's stands in), and
-#    `__aterm_prompt_dispatch` puts both back with a pipeline of
-#    `__aterm_return`s — negated when `not` inverted the status, which leaves
-#    `$pipestatus` alone — in the same `eval` as the call of the prompt: the
-#    prompt's first statement reads exactly what it would have read unwrapped.
-#  - A prompt that is no trampoline is wrapped again — at the first prompt this
-#    body sees (after config.fish) and after every command: a copy of it becomes
-#    `__aterm_fish_prompt_<n>` and `fish_prompt` a trampoline that NAMES it
-#    (`$__aterm_prompt_fn`). The prompt fish had at load becomes
-#    `__aterm_fish_prompt_0`, and `__aterm_original_fish_prompt` — what every
-#    body draws, an older one too — `__aterm_prompt_dispatch`, which draws the
-#    prompt the calling trampoline named (none: the load's).
-#  - Before every command that prompt is given back (`__aterm_prompt_give_back`):
-#    while a command runs, `fish_prompt` is the user's own, so what reads or
-#    copies it — `funcsave fish_prompt`, `funced`, `fish_config prompt save`, a
-#    venv's activate.fish — gets their prompt, never a trampoline (which, saved,
-#    would be every later shell's prompt), and `funced` edits the file that
-#    defined it.
-#  - A wrapper that keeps a COPY of a trampoline and calls it — conda's
-#    `__fish_prompt_orig` and a config.fish wrapper that calls it only some of
-#    the time, both taken from the loader's before any prompt — reaches, through
-#    that copy, the prompt the copy named, never the wrapper again (which would
-#    recurse to fish's call stack limit), and that inner draw writes no mark: one
-#    133;A and one 133;B per prompt. A prompt that recurses anyway stops four
-#    deep, at the fallback prompt; the one an older build let `funcsave
-#    fish_prompt` save — the loader's trampoline, which recursed to the limit in
-#    every later shell (measured: 63 marks, 7 stack-limit errors, no prompt) —
-#    is replaced at load by fish's own default prompt (`__aterm_prompt_shim`).
-#  - No mark is written from inside a user's prompt, whoever asks: a copy of a
-#    build's prompt wrapper from before loaders writes its own, and a typed
-#    upgrade of a shell whose conda or venv kept one drew two of each, nested,
-#    at every prompt for the shell's life (measured). "Inside" is
-#    `__aterm_prompt_inner`: a draw `__aterm_prompt_dispatch` started and has not
-#    finished, which only its own frame says (see there).
-#  - The prompt is handed the trampoline's `$argv` too: fish 4.1's transient
-#    prompt draws it once more with `--final-rendering` (starship's
-#    `enable_transience`), and without it the full prompt was drawn again.
+# User prompt wrapping and dispatch:
+#  - Every trampoline captures `$status $pipestatus` on entry into
+#    `$__aterm_prompt_status`, and `__aterm_prompt_dispatch` restores both via a
+#    pipeline of `__aterm_return` calls before invoking the user's prompt with
+#    `$argv` (preserving fish 4.1 `--final-rendering` for transient prompts).
+#  - If `config.fish` or a command replaces `fish_prompt`, `__aterm_prompt_wrap`
+#    copies it to `__aterm_fish_prompt_<n>` and installs a trampoline naming it.
+#  - Before each command (`__aterm_prompt_give_back`), `fish_prompt` is restored
+#    to the unwrapped function so `funcsave`, `funced`, and virtualenv wrappers
+#    see the user's own prompt definition and source file.
+#  - `__aterm_prompt_inner` checks an exported local (`$__aterm_prompt_drawing`)
+#    on `__aterm_prompt_dispatch`'s frame to suppress duplicate 133;A/133;B marks
+#    and bound recursion at depth 4, cleaning up automatically on Ctrl-C.
 
-# Returns its argument: a pipeline of these puts back a `$status` and a
-# `$pipestatus`.
 function __aterm_return
     return $argv[1]
 end
 
-# The fallback minimal prompt.
-#
-# Was `echo -n (whoami)'@'(hostname)' '(prompt_pwd)' $ '` — four glued command
-# substitutions, so a single one of them printing nothing (a host with no
-# `hostname`, the commonest case) collapsed the cartesian product to zero
-# arguments and `echo -n` printed NOTHING AT ALL: no user, no host, no path, no
-# `$`. Measured on fish 4.2.1 — the entire fallback prompt vanished, leaving a
-# bare line between the 133;A and 133;B marks. Quoted interpolation of captured
-# locals instead.
 function __aterm_prompt_fallback
     set -l user "$USER"
     if test -z "$user"; and command -sq whoami
@@ -1132,26 +600,10 @@ function __aterm_prompt_fallback
     printf '%s@%s %s $ ' "$user" "$__aterm_report_host" "$cwd"
 end
 
-# Whether this runs inside a user's prompt being drawn: inside a call of
-# `__aterm_prompt_dispatch`, whose frame holds `$__aterm_prompt_drawing` (how
-# many draws deep) as a local. It is EXPORTED only because fish hands a
-# function the exported locals of the functions that called it, and nothing
-# else does: every function the user's prompt calls sees it (and the commands
-# it runs, a name none of them reads), and it is gone with the dispatch's frame
-# — also when a Ctrl-C cancels the draw half way, which a count kept in a
-# global outlived: it left the prompts after it unmarked, and four cancelled
-# draws in a row drew the fallback prompt once nothing reset it (both measured).
-# Nothing fish prints is read: the stack trace this once matched names each
-# frame in the user's language (`in der Funktion '…'`), and under a German fish
-# a conda prompt drew two 133;A and two 133;B at every prompt (measured). `-l`:
-# a global of that name (an environment's) is no draw of this shell's.
 function __aterm_prompt_inner
     set -ql __aterm_prompt_drawing
 end
 
-# Draws the user's prompt the calling trampoline named, handed the status that
-# trampoline captured and its `$argv`. `__aterm_original_fish_prompt` once the
-# shim is in.
 function __aterm_prompt_dispatch
     set -l fn __aterm_fish_prompt_0
     if string match -qr '^__aterm_fish_prompt_[0-9]+$' -- "$__aterm_prompt_fn"
@@ -1167,7 +619,6 @@ function __aterm_prompt_dispatch
     if test "$st[1]" != "$ps[-1]"
         set run "not $run"
     end
-    # Integers only ever reach the `eval`.
     string match -qr '^(not )?__aterm_return [0-9]+( \| __aterm_return [0-9]+)*$' -- "$run"
     or set run true
     set -l depth 0
@@ -1176,11 +627,8 @@ function __aterm_prompt_dispatch
         __aterm_prompt_fallback
         return 0
     end
-    # The prompt's lines, read as fish reads a prompt's, and written back as ONE
-    # piece: fish draws every piece written apart on a line of its own, and a
-    # prompt that writes through `string` (fish-async-prompt's `string collect`,
-    # tide's `string unescape`) is a piece apart from the marks around it — its
-    # command line was drawn on the line below it (measured).
+    # Write all captured prompt lines in a single piece so prompts that pipe
+    # through `string collect` / `string unescape` do not split onto a new line.
     set -lx __aterm_prompt_drawing (math $depth + 1)
     set -l lines (eval "$run; $fn \$argv")
     set -q lines[1]; and printf '%s' $lines[1]
@@ -1188,10 +636,9 @@ function __aterm_prompt_dispatch
     return 0
 end
 
-# The prompt fish had at load becomes `__aterm_fish_prompt_0`, and
-# `__aterm_original_fish_prompt` the dispatch — once per shell. A load-time
-# prompt that is itself a trampoline (one saved with `funcsave fish_prompt`) is
-# replaced by fish's own default prompt where fish carries it.
+# Move the load-time prompt to `__aterm_fish_prompt_0` and install
+# `__aterm_prompt_dispatch` as `__aterm_original_fish_prompt`. If the load-time
+# prompt was itself a saved trampoline, restore fish's default `fish_prompt`.
 function __aterm_prompt_shim
     functions --no-details __aterm_original_fish_prompt 2>/dev/null | string match -q -- '*__aterm_prompt_dispatch*'
     and return 0
@@ -1210,8 +657,6 @@ function __aterm_prompt_shim
     return 0
 end
 
-# Wraps a prompt that is no trampoline (see above): under the name of the last
-# one wrapped when it is that one, given back for a command and left as it was.
 function __aterm_prompt_wrap
     functions -q fish_prompt; or return 0
     functions --no-details fish_prompt | string match -q -- '*__aterm_body_prompt*'
@@ -1239,8 +684,6 @@ function __aterm_prompt_wrap_first --on-event fish_prompt
     __aterm_prompt_wrap
     __aterm_prompt_give_back_arm
 end
-# The prompt a trampoline in `fish_prompt` draws, printed — the one it names, or
-# for the loader's, the one fish had at load; false when `fish_prompt` is none.
 function __aterm_prompt_wrapped
     set -l text (functions --no-details fish_prompt 2>/dev/null)
     string match -q -- '*__aterm_body_prompt*' $text; or return 1
@@ -1249,22 +692,9 @@ function __aterm_prompt_wrapped
     functions -q $fn[1]; or return 1
     printf '%s\n' $fn[1]
 end
-# Gives that prompt back as `fish_prompt` before a command (see above), copied
-# in a handler defined at a prompt — from no file. fish 4 records where a copy
-# was made (the file of the innermost function running that has one), and
-# `funced` reads a copy made in another file as a prompt with no file of its
-# own: the prompt given back from this file was edited as a dump, never in
-# config.fish or functions/fish_prompt.fish as fish without aterm edits it
-# (measured), and fish 4.0's funced edited this very file instead (fish 4.1.0's
-# changelog); `tide reload` sourced it.
-# Copied from nowhere, it names the user's file. So the handler is defined at a
-# prompt or after a command, never while a file is sourced (a newer body taking
-# over), which it would name, and once: a body sourced later leaves it be. It
-# gives the prompt back only while the body running is one that wraps it again
-# after the command, which each prompt and command of this body records (the
-# revision it runs): under a body from before this one, which never wraps it
-# again, fish's own default prompt lost its marks at the first command
-# (measured).
+# Define `__aterm_prompt_give_back` from a prompt or postexec context (outside
+# any sourced file) so fish 4's `functions -c` preserves the user's original
+# source file attribution for `funced`.
 function __aterm_prompt_give_back_arm
     set -g __aterm_prompt_rewrap_rev "$__aterm_body_rev"
     functions -q __aterm_prompt_give_back; and return 0
@@ -1276,69 +706,30 @@ function __aterm_prompt_give_back_arm
         functions -c $fn fish_prompt
     end
 end
-# The same from this file, for a command before that handler exists.
 function __aterm_prompt_unwrap
     functions -q __aterm_prompt_give_back; and return 0
     set -l fn (__aterm_prompt_wrapped); or return 0
     functions -e fish_prompt
     functions -c $fn fish_prompt
 end
-# A running shell that takes this body (the loader's trampoline is already
-# there) wraps it at once: the prompt about to be drawn is the first this body
-# sees. A fresh load has config.fish still to run, and leaves it to that event.
 if functions -q __aterm_fish_prompt_trampoline
     __aterm_prompt_wrap
 end
 
-# The prompt the loader's fish_prompt trampoline draws (end of file).
 function __aterm_body_prompt
-    # Called by a copy of a trampoline while a user's prompt is drawn: that
-    # prompt's own, nothing else (see "THE USER'S PROMPT" above).
     if __aterm_prompt_inner
         __aterm_original_fish_prompt $argv
         return 0
     end
-    # This body draws the prompt, and gives it back for the command (see "THE
-    # USER'S PROMPT") — the first prompt after it took over too.
     __aterm_prompt_give_back_arm
-
-    # A waiting re-key first, so every mark this prompt emits carries it.
     __aterm_rekey_check
-
-    # The managed dirs, live (see "LIVE" above): one probe, an assign only on change.
     __aterm_managed_path_live
-
-    # The shell's own cwd before every prompt start, as zsh and bash report it
-    # from their prompt hook. OSC 7 carries no nonce (a remote shell over ssh
-    # must be able to report a cwd), so a cwd a program — or a remote shell,
-    # after ssh exits — reported went into the next signed block and became the
-    # new-tab folder until the next `cd`. fish's own report rides the prompt
-    # event only from 4.3.
     __aterm_report_cwd
-
-    # The revision this prompt runs, then the prompt start.
     __aterm_mark_integration_rev
     __aterm_mark_prompt_start
 
-    # Set tab title to abbreviated CWD (OSC 0).
-    # Use prefix match (not substring) to avoid replacing $HOME in the middle of a path.
-    # Strip control characters: a crafted directory name (Unix dir names may
-    # contain any byte except '/' and NUL) could otherwise inject BEL/ESC and
-    # smuggle a nested OSC (e.g. clipboard write) out of the title. Mirrors the
-    # command-title path's string replace -ra '[\x00-\x1f\x7f]' '' guard.
-    #
-    # `test -z`, NOT `not set -q` — see the loader-guard note at the top. bash
-    # and zsh spell this `[[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]`, so an
-    # EMPTY value means "not disabled" and titles keep flowing. `set -q` read an
-    # empty-but-defined value as "disabled" and silently killed tab titles in
-    # fish only — the opposite of every other shell.
-    #
-    # The stripped title is captured into a QUOTED local rather than glued onto
-    # `"0;"`. `string` is a builtin that always prints exactly one line, so this
-    # pair could not collapse the way `(hostname)` did — but the glued spelling
-    # is the shape that has now cost this file three separate outages, and the
-    # next editor who swaps in an external command should not be able to
-    # reintroduce it.
+    # Set tab title to abbreviated CWD (OSC 0), stripping control bytes to
+    # prevent OSC break-out from directory names.
     if test -z "$ATERM_DISABLE_PROMPT_TITLES"
         set -l title "$PWD"
         if string match -q "$HOME/*" $PWD; or test "$PWD" = "$HOME"
@@ -1349,21 +740,6 @@ function __aterm_body_prompt
         __aterm_osc "0;$safe_title"
     end
 
-    # Use custom prompt if ATERM_PROMPT_STYLE is set.
-    #
-    # `test -n`, NOT `set -q` — the SAME defect that killed the loader guard
-    # above, in a second place. bash and zsh both spell this
-    # `[[ -n "$ATERM_PROMPT_STYLE" && "$ATERM_PROMPT_STYLE" != "none" ]]`, so an
-    # empty value falls through to the user's own prompt. `set -q` accepted the
-    # empty value, handed it to __aterm_custom_prompt, and its `switch "$style"`
-    # matched no case — so fish printed NO PROMPT AT ALL (an empty line between
-    # the 133;A and 133;B marks), while the user's real prompt was skipped.
-    #
-    # The shim runs under either prompt: it alone makes the load's prompt
-    # `__aterm_fish_prompt_0`, the one given back for a command. Called only for
-    # the user's prompt, a style left none to give back, so `fish_prompt` stayed
-    # the loader's trampoline for the shell's life and `funcsave fish_prompt`
-    # wrote it over the user's prompt file (measured, fish 4.9.3).
     __aterm_prompt_shim
     if test -n "$ATERM_PROMPT_STYLE"; and test "$ATERM_PROMPT_STYLE" != "none"
         __aterm_custom_prompt
@@ -1371,42 +747,14 @@ function __aterm_body_prompt
         __aterm_original_fish_prompt $argv
     end
 
-    # Mark command line start (user will type here)
     __aterm_mark_command_start
 end
 
-# Encode a string for OSC 633;E (VS Code convention).
-# Backslash-hex encodes semicolons, backslashes, space, and every control
-# byte (0x00-0x1f and 0x7f). Escaping ALL controls — not just the six
-# whitespace bytes handled below — stops a raw ESC/BEL (reachable via Ctrl-V
-# verbatim insert, paste, or tab-completing a filename that contains control
-# bytes) from prematurely terminating the OSC 633;E string and letting the
-# following bytes be parsed as fresh control sequences (a classic OSC
-# break-out, e.g. smuggling an OSC 52 clipboard write). Mirrors the zsh/bash
-# [[:cntrl:]] encoders and the control-byte stripping on the tab-title path,
-# and emits the \xNN form the aterm decoder (unescape_vscode_string) reverses.
-#
-# WHOLE STRINGS, NOT CHARACTERS (LAG-9, 2026-10-18): a loop over the characters
-# ran a `switch`, a regex match and a `set` for each one — 0.45 ms for the start
-# mark's 84-byte rc folder and 0.32 ms for a 44-byte command line (fish 4.9.3),
-# paid at every first prompt and every command (a pasted 40-line block: 24 ms).
-# A string with no byte to encode (most folders) is now printed as it is after
-# one regex match. Any other is split into its lines (a newline cannot ride a
-# command substitution), each reserved byte is one `string replace -a` over all
-# of them — backslash first, so the backslashes the others write are never
-# doubled — and the lines are joined by the newline's escape. The three now
-# cost 0.02, 0.09 and 0.8 ms. Each other control byte —
-# e.g. ESC (0x1b) or BEL (0x07), which terminate an OSC string in the parser
-# and would break out of the 633;E sequence — is found by the same
-# [\x00-\x1f\x7f] class the tab-title path strips, once per distinct byte,
-# turned into %NN by the url-escape helper already trusted by __aterm_urlencode,
-# and written as the decoder's \xNN form, lower-cased to match \x3b. Non-control
-# bytes (multi-byte UTF-8 included) pass through as-is.
-#
-# Captured, then interpolated quoted — never glued. `string replace` without
-# `-f` prints every line it is handed, matched or not (an empty one as an empty
-# line), so `set lines (…)` never takes zero arguments, which would WIPE the
-# line instead of leaving it.
+# Encode a string for OSC 633;E (VS Code convention, reversed by
+# `unescape_vscode_string`): backslash-hex encodes `\`, `;`, space, and all
+# control bytes (`0x00-0x1f`, `0x7f`) so raw ESC/BEL cannot break out of the OSC
+# sequence. Operates on whole lines via `string replace -a` with a fast path
+# when no reserved bytes are present.
 function __aterm_encode_cmd
     if not string match -qr '[\\\\; \x00-\x1f\x7f]' -- "$argv"
         printf '%s' "$argv"
@@ -1426,40 +774,9 @@ function __aterm_encode_cmd
     string join -- '\x0a' $lines
 end
 
-# ─── THE START MARK and THE WARM HOLD (docs/DESIGN-warm-spare-2026-10-16.md) ───
-#
-# The zsh and bash scripts' twins. Every fresh integrated fish signs ONE start
-# record at its first prompt event, after every startup file: its startup roots,
-# its rc folder ($__fish_config_dir), its flags and `cold` or `spare`, in one
-# fork-free write.
-# `pre` counts the prompt-event handlers that ran ahead of aterm's (fish runs
-# them in the order they were defined, so only a conf.d snippet sourced before
-# aterm's defines one): a warm spare runs them again at its release, as zsh
-# re-runs the precmd hooks ahead of its own. fish has no `sched` or periodic
-# hooks; its jobs are counted by the builtin.
-#
-# CHEAP, because every fish start no spare serves pays for it (LAG-9,
-# 2026-10-18): it cost 0.99 ms of a fish's first prompt (0.97 ms of its CPU),
-# against the same script without the call, and now 0.03 ms (0.12 ms), within
-# the noise (fish 4.9.3, a PTY replay, n=30 interleaved). A folder with nothing
-# to escape (the common case) skips the encoder, as zsh's does; the jobs are
-# listed only when `jobs -q` says there are any; a spare hands in the `pre` it
-# already counted. And the write goes to stdout, as every other mark of this
-# file's does — the event fires outside the prompt's capture, on the tty —
-# not to /dev/tty, whose open cost more than the write: zsh's twin opens
-# /dev/tty because p10k's instant prompt holds its stdout, and fish has no such
-# prompt.
-#
-# The startup roots (THE STARTUP ROOTS, in the loader) ride the same write,
-# ahead of the rc folder, joined by `\x00`, which no path holds. Each folder's
-# backslashes, `;` and control bytes are escaped as the 633 E encoder escapes
-# them, and nothing else: an OSC parameter ends only at a `;` or a control
-# byte, so a space stays as it is. The usual folders need no escape at all;
-# the others are escaped all at once, one substitution for the list, unless
-# one holds a control byte: each then goes through the encoder, which keeps a
-# newline inside its own folder. One regex looks at the rc folder and every
-# root at once (a `string match -r` compiles its pattern at every call, about
-# 0.04 ms here); only a hit looks again, item by item.
+# Emit the signed startup record (`AtermStartRoots`, `AtermStartRc`,
+# `AtermStartFlags`, `AtermStart`) at the first prompt event
+# (docs/DESIGN-warm-spare-2026-10-16.md). Startup roots are joined by `\x00`.
 function __aterm_start_mark --argument-names kind pre
     set -l rc "$__fish_config_dir"
     set -l folders $__aterm_start_roots
@@ -1492,13 +809,7 @@ function __aterm_start_mark --argument-names kind pre
         "$kind" "$__aterm_id_suffix_str"
 end
 
-# The user's prompt-event handlers defined ahead of aterm's, in their order
-# (this body's own first-prompt handlers come first too, and are aterm's), and
-# false when there are none. fish lists the generic handlers as `<event> <name>`
-# lines, by event, each event's in the order they were defined. One regex over
-# them, joined, answers the common case (no `fish_prompt` handler but aterm's
-# own ahead of aterm's): a name with a space in it can only make it look
-# further, never miss one.
+# List user `fish_prompt` event handlers defined before `__aterm_fish_prompt_event`.
 function __aterm_prompt_handlers_ahead
     set -l handlers (functions --handlers-type generic)
     string match -qr -- '(^| )fish_prompt (?!__aterm_).* fish_prompt __aterm_fish_prompt_event( |$)' "$handlers"
@@ -1507,16 +818,9 @@ function __aterm_prompt_handlers_ahead
     string replace -rf -- '^fish_prompt (?!__aterm_)' '' $handlers
 end
 
-# A WARM spare's hold, from its first prompt event: its startup files have run
-# unseen, and nothing of its prompt has. Released by `go`, it takes in what
-# other sessions added to its history since its own came up (`history merge`,
-# a no-op for a history nothing has read yet, which fish reads afresh at first
-# use as a cold start does), and the prompt-event handlers that ran ahead of
-# aterm's run again, their output dropped, as at an empty Enter. A discard's
-# hang-up writes no history: fish saves only the commands a session ran, and a
-# spare ran none. Nothing here touches the tty, so what is typed before the
-# release waits there for the line editor; fish keeps `$status` across an event
-# handler, so the first prompt still reads the startup files' own.
+# Warm spare hold at the first prompt event: emit the `spare` start mark, wait
+# for `go` on `$__aterm_spare_fifo`, then merge history and re-run prior
+# `fish_prompt` handlers upon release.
 function __aterm_spare_hold
     set -l ahead (__aterm_prompt_handlers_ahead)
     __aterm_start_mark spare (count $ahead)
@@ -1540,33 +844,13 @@ end
 
 # fish_preexec - runs before command execution
 function __aterm_fish_preexec --on-event fish_preexec
-    # The command runs with the user's own prompt (see "THE USER'S PROMPT").
     __aterm_prompt_unwrap
-
-    # The managed dirs, live — BEFORE this command resolves: a `claude` typed at a
-    # prompt that was drawn before atpkg laid agents/ must already run the twin.
     __aterm_managed_path_live
 
-    # Report command text for session memory (OSC 633;E).
-    #
-    # The encoded command line is captured into a QUOTED local before it is
-    # interpolated, for the same fish list reason as $__aterm_id_suffix_str
-    # above: glued command substitutions form a cartesian product, so a
-    # substitution that prints nothing collapses the ENTIRE argument to zero
-    # elements. Here that had two triggers — an empty nonce (always, on the
-    # manual-install path) and an empty command line — and either one turned
-    # this whole 633;E emission into a bare empty `ESC ] BEL`. `set -l` then
-    # `"$encoded"` is safe: a quoted empty list expands to exactly one empty
-    # string, so the payload degrades to `633;E;` instead of vanishing.
     set -l encoded (__aterm_encode_cmd "$argv")
     __aterm_osc "633;E;$encoded$__aterm_id_suffix_str"
-    # Set tab title to running command (OSC 0): the line, control characters
-    # stripped, at most 256 characters; a longer one is its first 255 and `…`, so
-    # the tab knows its end is cut off (the bash script's "The command title").
-    # `test -z`, NOT `not set -q` — same emptiness contract as the prompt-title
-    # path above.
-    # The strip comes first: it takes the line's newlines, so the cut below is one
-    # string, not one per line of a multi-line command.
+    # Set tab title to running command (OSC 0), stripped of control bytes and
+    # truncated to 256 characters.
     if test -z "$ATERM_DISABLE_PROMPT_TITLES"
         set -l cmd_title (string replace -ra '[\x00-\x1f\x7f]' '' -- "$argv")
         if test (string length -- "$cmd_title") -gt 256
@@ -1579,17 +863,12 @@ end
 
 # fish_postexec - runs after command execution
 function __aterm_fish_postexec --on-event fish_postexec
-    # Both in ONE statement: any command replaces both.
     set -l st $status $pipestatus
     set -g __aterm_last_status $st[1]
     set -g __aterm_last_pipestatus $st[2..-1]
-    # What a trampoline captured was the command before this one's.
     set -e __aterm_prompt_status
-    # The prompt the command leaves — the one it was given, or a new one — is
-    # wrapped for the prompt to come (see "THE USER'S PROMPT").
     __aterm_prompt_wrap
     __aterm_prompt_give_back_arm
-    # The command's end mark carries a key that arrived while it ran.
     __aterm_rekey_check
     __aterm_mark_exec_finish $__aterm_last_status
 end
@@ -1599,11 +878,7 @@ function __aterm_fish_pwd --on-variable PWD
     __aterm_report_cwd
 end
 
-# ─── Key Bindings ───
-# Bind xterm-style modifier+arrow sequences so they work at the prompt.
-# Without these, sequences like \e[1;3C (Alt+Right) leak as literal text.
-# Called ONCE per shell, by the loader (after the body's end marker): a body
-# re-sourced live leaves the user's bindings alone.
+# Bind xterm-style modifier+arrow and navigation sequences once on fresh load.
 function __aterm_setup_keybindings
     # Alt+Arrow: word navigation
     bind \e\[1\;3C forward-word       # Alt+Right
@@ -1623,32 +898,16 @@ function __aterm_setup_keybindings
     bind \e\[1\;2B down-or-search    # Shift+Down
 end
 
-# The body ends in success: the loader moves its revision only when the source
-# returned 0.
+# Return 0 so `__aterm_body_check` advances `$__aterm_body_rev`.
 true
 
 # @@ATERM-INTEGRATION-BODY-END@@
 
-# ─── THE LOADER, continued: the wiring, once per shell ───
-#
-# The trampoline: fish_prompt is the one prompt hook, and the one piece of the
-# prompt path that never changes. A body sourced by the check is the body whose
-# prompt is drawn in the SAME prompt.
-# fish_prompt hook - wrap existing prompt
-# We need to emit OSC 133;A before the prompt and OSC 133;B after
+# Loader wiring (runs once per shell):
 functions -c fish_prompt __aterm_original_fish_prompt 2>/dev/null
 
-# On a fresh load always; on an upgrade in place only over a prompt that is ours
-# — an older build's wrapper (review finding 2026-09-26). fish reads this file
-# from the vendor conf.d BEFORE config.fish, so a prompt the user defines there
-# (a framework's: `starship init fish | source`) replaced our wrapper for that
-# shell's life; replacing it in turn would draw the prompt copied above, from
-# before config.fish ran, and the user's own would be gone. The body wraps such
-# a prompt again, in a trampoline that names it (the body's "THE USER'S
-# PROMPT"), which is left alone too.
-#
-# The trampoline's first statement captures what fish handed it: every command
-# after it replaces `$status` and `$pipestatus`, and the user's prompt reads them.
+# Install the prompt trampoline on fresh load, or on in-place upgrade when
+# `fish_prompt` is an older unwrapped aterm prompt function.
 function __aterm_fish_prompt_trampoline
     set -g __aterm_prompt_status $status $pipestatus
     __aterm_body_check
@@ -1663,19 +922,9 @@ if test "$__aterm_fresh_load" = 1; or begin
     functions -c __aterm_fish_prompt_trampoline fish_prompt
 end
 
-# THE BODY CHECK ON THE PROMPT EVENT (review finding 2026-10-01). A prompt
-# config.fish defines (`starship init fish | source`, oh-my-posh's), read after
-# this file, replaces the trampoline above for that shell's life — and with it
-# the only call of the check and the only revision signed: such a shell left
-# every update's pointer unread and never said which body it ran. fish emits
-# `fish_prompt` before every prompt, whoever draws it, so the check rides that
-# event too (where the trampoline still draws, its own check then finds no
-# pointer waiting), and where the prompt is not the trampoline the revision is
-# signed here. The user's prompt is never touched, and fish keeps `$status`
-# across an event handler, so it still reads the command's.
+# Also run the body check and startup mark on the `fish_prompt` event so shells
+# whose `config.fish` replaces `fish_prompt` still reload bodies and report revisions.
 function __aterm_fish_prompt_event --on-event fish_prompt
-    # The first prompt of a fresh load signs the start record; a warm spare
-    # waits there first (THE WARM HOLD).
     if set -q __aterm_start_pending
         set -e __aterm_start_pending
         if set -q __aterm_spare_fifo
@@ -1689,24 +938,12 @@ function __aterm_fish_prompt_event --on-event fish_prompt
     or __aterm_mark_integration_rev
 end
 
-# The key bindings, ONCE per shell: a fresh load only — the zsh script's twin
-# (review finding 2026-09-26). This file runs from the vendor conf.d, before the
-# user's config.fish, so a binding of theirs for one of these keys wins; a body
-# re-sourced live, binding them again at a prompt, took those keys back from the
-# user in every live tab at every update.
 if test "$__aterm_fresh_load" = 1
     __aterm_setup_keybindings
 end
 
-# An upgrade in place SIGNS its revision now, not at the next prompt — the zsh
-# script's twin, for the same reason: the typed line that upgrades a shell from
-# before loaders goes on to relaunch its agent, and until the shell's next
-# prompt the host would name it `integration_rev=frozen` — and reports its cwd
-# with it. A fresh load does neither here: its first prompt does both, before
-# its 133;A, as every prompt does (`__aterm_body_prompt`), and zsh and bash
-# report the cwd only there. The report every load made here was that one's
-# twin a few milliseconds early (2026-10-20, fish 4.9.3, a PTY, the captured
-# aterm spawn env, n=40: about 0.8 M of the 163 M instructions to the prompt).
+# On an in-place upgrade, immediately emit CWD and the new integration revision
+# before the relaunch command continues.
 if test "$__aterm_fresh_load" = 0
     __aterm_report_cwd
     __aterm_mark_integration_rev

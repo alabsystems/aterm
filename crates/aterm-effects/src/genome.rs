@@ -185,18 +185,16 @@ fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) ->
     // The scanner's own fold (aterm-lexicon), buffer-reusing — no drift, no alloc.
     fold_into(tok, folded);
     let mut len = 0usize;
+    let mut h = aterm_hash::FNV64_OFFSET;
     for c in folded.chars() {
         if !c.is_alphabetic() {
             return None;
         }
         len += 1;
+        h = aterm_hash::fnv_mix_u64(h, c as u64);
     }
     if len < 2 {
         return None;
-    }
-    let mut h = aterm_hash::FNV64_OFFSET;
-    for c in folded.chars() {
-        h = aterm_hash::fnv_mix_u64(h, c as u64);
     }
     Some(mix(h))
 }
@@ -418,13 +416,14 @@ pub fn simhash_ctx_bitsliced(
 // ───────────────────────────── §3.3 Gray decode ──────────────────────────────
 
 /// §3.3 inverse-Gray decode, verbatim: `b_i = ⊕_{j ≥ i} g_j`.
-pub fn gray_decode(mut g: u64) -> u64 {
-    let mut b = g;
-    while g > 0 {
-        g >>= 1;
-        b ^= g;
-    }
-    b
+pub const fn gray_decode(mut g: u64) -> u64 {
+    g ^= g >> 1;
+    g ^= g >> 2;
+    g ^= g >> 4;
+    g ^= g >> 8;
+    g ^= g >> 16;
+    g ^= g >> 32;
+    g
 }
 
 /// §3.3 field extractor, verbatim: the `n`-bit field of `gkey` at bit `lo`,

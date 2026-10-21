@@ -1,29 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TWO WINDOWS IMAGES, driven the way a shell drives them.
+//! The two Windows images, driven the way a shell drives them.
 //!
-//! The PE subsystem is a header field of one file, and a Windows shell keys on
-//! it: it waits for a console-subsystem child and returns at once from a
-//! GUI-subsystem one. So `aterm.exe` is the CONSOLE image (every verb printed
-//! inline, piped, waited for) and `aterm-windowed.exe` — shipped as
-//! `aterm-gui.exe` — the WINDOWED one (no console flash from the Start Menu),
-//! and the console image hands every window it is asked for to the windowed
-//! image, detached, with that image's stdio on NUL (`src/main.rs`,
-//! `run_window`). These tests pin what a person at a prompt sees of that:
+//! A Windows shell keys on the PE subsystem header field: it waits for a console-subsystem
+//! child and returns at once from a GUI-subsystem one. So `aterm.exe` is the console image
+//! (every verb printed inline, piped, waited for) and `aterm-windowed.exe`, shipped as
+//! `aterm-gui.exe`, the windowed one (no console flash from the Start Menu), and the console
+//! image hands every window it is asked for to the windowed image, detached, its stdio on NUL
+//! (`src/main.rs`, `run_window`). These tests pin what a person at a prompt sees of that:
 //!
-//! * the two built files really carry the two subsystems (read from the PE
-//!   header, since the attribute lives in source and the fact lives in the
-//!   linked file);
-//! * a window flag the window's parser REFUSES is refused by the console image,
-//!   on its own stderr, exit 2 (handed to the sibling, it would print into NUL
-//!   and the console image would exit 0 with no window);
-//! * a window flag the parser answers by PRINTING still prints through the
-//!   console image.
+//! * the two built files carry the two subsystems (read from the PE header: the attribute
+//!   lives in source, the fact in the linked file);
+//! * a window flag the window's parser refuses is refused by the console image, on its own
+//!   stderr, exit 2 (handed to the sibling, it would print into NUL and the console image
+//!   would exit 0 with no window);
+//! * a window flag the parser answers by printing still prints through the console image.
 //!
-//! None of these opens a window or dials an instance: every argument list here
-//! is refused or answered by the parser before the handoff, and none is a
-//! plain launch the routing policy would forward.
+//! None of these opens a window or dials an instance: every argument list here is refused or
+//! answered by the parser before the handoff.
 
 #![cfg(windows)]
 
@@ -54,8 +49,8 @@ fn bytes<const N: usize>(head: &[u8], offset: usize, path: &str) -> [u8; N] {
         .unwrap_or_else(|| panic!("{path}: offset {offset:#x} is past the first 4 KiB"))
 }
 
-/// Run the CONSOLE image with `args`, stdin on NUL (so the mode fork takes the
-/// window route on its own, whatever `--window` says), everything captured.
+/// Run the console image with `args`, stdin on NUL (so the mode fork takes the window route
+/// on its own, whatever `--window` says), everything captured.
 fn console_image(args: &[&str]) -> Output {
     aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm"))
         .args(args)

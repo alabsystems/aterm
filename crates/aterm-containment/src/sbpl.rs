@@ -11,7 +11,7 @@
 //! SBPL string the spawn seam hands to `/usr/bin/sandbox-exec -p <sbpl>`, so the
 //! kernel enforces it on the child shell and everything it runs.
 //!
-//! ## What the profile enforces (`ATERM_DESIGN` §0.1 / §5.6)
+//! ## What the profile enforces
 //!
 //! Only a network-denied set gets a profile: `Containment`
 //! ([`NetworkCapability::None`](crate::NetworkCapability::None) with
@@ -19,57 +19,24 @@
 //! (the later matching rule wins):
 //!
 //! 1. **`(allow default)`** — the base, so dyld, `path_helper`, the user's rc
-//!    files, `/dev/tty` and every READ outside the deny sets keep working. A
+//!    files, `/dev/tty` and every read outside the deny sets keep working. A
 //!    blanket `(deny file-read*)` breaks `$SHELL`, so reads are scoped by deny
-//!    sets, not by an allowlist (owner, 2026-09-26).
+//!    sets rather than an allowlist.
 //! 2. **`(deny network*)`** — every socket domain, outbound and inbound.
 //!    **`(deny mach-priv-task-port)`**, then `(allow … (target self))`: no task
-//!    port but the caller's own, so a contained `lldb`/`debugserver` cannot take
-//!    control of (or read) a same-user process outside the sandbox — silently, once
-//!    macOS developer mode is on (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
-//!    O4). The one operation covers all four flavors — `task_for_pid`,
-//!    `task_read_for_pid`, `task_inspect_for_pid` and `task_name_for_pid` — and
-//!    a contained process's own children too (measured on macOS 26.6).
+//!    port but the caller's own (`task_for_pid`, `task_read_for_pid`,
+//!    `task_inspect_for_pid`, `task_name_for_pid`), so a contained
+//!    `lldb`/`debugserver` cannot attach to or read a same-user process outside
+//!    the sandbox even with macOS developer mode enabled.
 //!    **`(deny mach-lookup)`, then `(allow mach-lookup …)` for
-//!    [`MACH_LOOKUP_ALLOWLIST`] alone** — deny by default (since 2026-10-09). A
-//!    mach service is a daemon outside the sandbox that does work for whoever
-//!    looks it up, and the file and network rules cannot see that work: Launch
-//!    Services and the Apple Events daemon start or drive a process that does
-//!    not inherit the sandbox (`open`, `osascript`), the `ServiceManagement`
-//!    daemon registers a login item, the preferences daemon writes
-//!    `~/Library/Preferences`, the background-task agent edits login items, the
-//!    pasteboard hands data to every other app. Under `(allow default)` all of
-//!    them were reachable, and a denylist of the ones found left the rest open
-//!    by construction, so every lookup is refused (`kr` 1100), the XPC services
-//!    bundled in frameworks included, except the two directory queries a shell
-//!    needs to name its user and groups. Measured on macOS 26.6 with every
-//!    lookup refused (the per-tool table is the P1 entry in
-//!    `docs/HARDCORE_BACKLOG.md`): a `/bin/sh` pipeline, an interactive and a
-//!    login zsh with the user's rc files, bash, git (a `file://` clone too),
-//!    python3 (`ssl`, `socket.getaddrinfo("localhost")`), targo, trustc and a
-//!    `targo` build, make, xcrun and clang, ad-hoc `codesign` then exec, and
-//!    `dscacheutil` all still work; the only loss is the user and group names,
-//!    which the list restores. Refused on purpose, with what degrades: the
-//!    security daemon (`security` lists no keychain certificate; the system
-//!    roots stay readable as `/etc/ssl/cert.pem`), the pasteboard (`pbcopy` and
-//!    `pbpaste` fail), Spotlight (`mdfind` finds nothing), the preferences
-//!    daemon (`defaults read` still reads the plist files; nothing writes),
-//!    `notifyd`, `logd` and `diagnosticd` (a contained program's `os_log`
-//!    messages are dropped), `trustd`, `configd` and every GUI service. Each
-//!    refusal is reported in the unified log (`log stream --predicate 'sender ==
-//!    "Sandbox"'` prints `<program>(<pid>) deny(1) mach-lookup <name>`).
-//!    launchd itself is reached through the bootstrap port, not by a lookup, so
-//!    this rule does not cover it, and what a contained process may ask of it
-//!    is launchd's own policy; the posture therefore claims "no mach service
-//!    lookup", not "no system service". Measured on macOS 26.6: launchd refuses
-//!    `launchctl bootstrap` and `submit` from inside the profile, and refuses
-//!    the domain environment (`unsetenv`), the legacy `list`, `start` and
-//!    `stop` to any sandboxed caller, an `(allow default)` one included, while
-//!    it answers the reads (`print`, `print-disabled`, `blame`, `getenv`). The
-//!    verbs that act on a real user job (`kickstart`, `bootout`,
-//!    `enable`/`disable`, `setenv`) are unmeasured: the dated follow-up in the
-//!    P1 entry.
-//! 3. **WRITE confinement** (`TmpOnly` only) — [`PREFERENCE_WRITE_DENY`] (the
+//!    [`MACH_LOOKUP_ALLOWLIST`] alone** — refuses mach service lookups (including
+//!    framework XPC services) except the two `opendirectoryd` queries a shell
+//!    needs to resolve user and group names, so contained processes cannot delegate
+//!    work (`open`, `osascript`, `ServiceManagement`, `cfprefsd`, pasteboard,
+//!    keychain, Spotlight) to unsandboxed daemons. `launchd` itself is reached
+//!    through the bootstrap port rather than `mach-lookup`, so its own policy
+//!    governs `launchctl` requests.
+//! 3. **Write confinement** (`TmpOnly` only) — [`PREFERENCE_WRITE_DENY`] (the
 //!    preferences daemon writes `~/Library/Preferences` for its caller and
 //!    consults that operation, not the file rules), then `(deny file-write*)`
 //!    and `(allow file-write* …)` for [`WRITABLE_ROOTS`] (`/private/tmp`,
@@ -101,7 +68,7 @@
 //!
 //! ## Per-user profile
 //!
-//! Because the secret paths depend on `$HOME`, the Containment profile is now
+//! Because the secret paths depend on `$HOME`, the Containment profile is
 //! per-user and built at profile-generation time; it is therefore an owned
 //! `String`, not a `&'static str`. The homeless fallback
 //! ([`BASE_PROFILE`]) is still a const, used verbatim when `$HOME` is unset
@@ -131,15 +98,10 @@ pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 macro_rules! base_profile_allowing {
     ($($name:literal,)+) => {
         /// The only global mach service names a contained process may look up;
-        /// [`BASE_PROFILE`] refuses every other (`kr` 1100). Each is a read-only
-        /// directory QUERY answered by `opendirectoryd`: who a uid or gid is,
-        /// which groups a user is in. Neither changes anything for its caller —
-        /// no launch, no registration, no preference, keychain or file write (a
-        /// directory change goes through `com.apple.system.opendirectoryd.api`,
-        /// which stays refused) — and neither resolves a host name through DNS
-        /// for it (`dscacheutil -q host -a name example.com` resolves nothing
-        /// under the profile, measured 2026-10-09), so neither reopens the
-        /// network the profile denies.
+        /// [`BASE_PROFILE`] refuses every other. Each is a read-only directory
+        /// query answered by `opendirectoryd` (uid/gid lookup and group
+        /// membership) that mutates nothing (`com.apple.system.opendirectoryd.api`
+        /// stays refused) and does not resolve DNS host names.
         ///
         /// - `com.apple.system.opendirectoryd.libinfo` — `getpwuid`, `getpwnam`,
         ///   `getgrgid`, `getgrouplist` for an account outside `/etc/passwd`, as
@@ -152,15 +114,6 @@ macro_rules! base_profile_allowing {
         ///   it every such check errors (`dsmemberutil`: memberd is not
         ///   reachable) and `ls -le` prints raw UUIDs. git, python3, make, xcrun
         ///   and clang each look it up.
-        ///
-        /// A name joins only with a measurement that a normal shell or a
-        /// common tool fails without it, and a reason here that the daemon
-        /// behind it acts for nobody. The launch brokers are refused because
-        /// they are absent: `actuator`'s `enforcement_proof_launch_brokers_denied`
-        /// asks bootstrap for each, `enforcement_proof_mach_lookup_denied_by_default`
-        /// for a sample of other daemons that act for their caller and for
-        /// every name here, and `shell_compat_tool_set_runs_under_containment`
-        /// runs the tool set the list was measured on.
         pub const MACH_LOOKUP_ALLOWLIST: &[&str] = &[$($name,)+];
 
         /// The base SBPL profile — rules 1 and 2, and the whole profile when
@@ -171,9 +124,9 @@ macro_rules! base_profile_allowing {
         /// the caller's own; `(deny mach-lookup)` refuses every mach service but
         /// [`MACH_LOOKUP_ALLOWLIST`], so no daemon outside the sandbox works for
         /// the contained process. None of it names a path, so it is emitted
-        /// even with no resolvable home to scope secrets under (we emit NO file
+        /// even with no resolvable home to scope secrets under (we emit no file
         /// denies rather than deny bogus paths). The full Containment profile
-        /// ([`profile_for_home`]) is this PLUS the write confinement and the
+        /// ([`profile_for_home`]) is this plus the write confinement and the
         /// secret/private-set file denies.
         pub const BASE_PROFILE: &str = concat!(
             "(version 1)(allow default)(deny network*)",
@@ -191,7 +144,7 @@ base_profile_allowing!(
 );
 
 /// The canonical roots a Containment ([`FsCapability::TmpOnly`]) shell may still
-/// WRITE under, as `subpath`s, whoever the user is. Canonical on purpose — `/tmp`
+/// write under, as `subpath`s, whoever the user is. Canonical on purpose — `/tmp`
 /// and `/var` are symlinks into `/private` and Seatbelt matches the resolved path.
 /// `/dev` carries the tty, `/dev/null` and friends. The user's own `$TMPDIR` is
 /// added beside them ([`admitted_user_temp`]).
@@ -342,19 +295,26 @@ fn single_link(_meta: &std::fs::Metadata) -> bool {
 /// Each path component is joined onto the canonical home, so e.g. `.config/gh`
 /// becomes `<canonical-home>/.config/gh` (denying gh's token without denying the
 /// rest of `~/.config`).
+///
+/// `aterm secrets` (docs/DESIGN-secrets-2026-10-20.md §14.6) keeps two: `.secrets`,
+/// the files it materializes, and `.config/aterm/secrets`, the machine key and the
+/// last verified envelope. The second sits inside `.config/aterm` today and is
+/// named on its own so it stays denied if that entry is ever narrowed.
 pub const SECRET_SUBDIRS: &[&str] = &[
-    ".ssh",           // SSH private keys / known_hosts / config
-    ".aws",           // AWS credentials + config
-    ".gnupg",         // GnuPG keyrings
-    ".config/gh",     // GitHub CLI OAuth token
-    ".config/aterm",  // aterm's own config/secrets
-    ".kube",          // Kubernetes kubeconfig (cluster creds/tokens)
-    ".docker",        // Docker registry credentials (config.json)
-    ".config/gcloud", // Google Cloud SDK credentials/tokens
-    ".azure",         // Azure CLI tokens (accessTokens.json)
+    ".ssh",                  // SSH private keys / known_hosts / config
+    ".aws",                  // AWS credentials + config
+    ".gnupg",                // GnuPG keyrings
+    ".config/gh",            // GitHub CLI OAuth token
+    ".config/aterm",         // aterm's own config/secrets
+    ".config/aterm/secrets", // `aterm secrets`' machine key + vault cache
+    ".secrets",              // the credentials `aterm secrets` writes (tokens, release keys)
+    ".kube",                 // Kubernetes kubeconfig (cluster creds/tokens)
+    ".docker",               // Docker registry credentials (config.json)
+    ".config/gcloud",        // Google Cloud SDK credentials/tokens
+    ".azure",                // Azure CLI tokens (accessTokens.json)
 ];
 
-/// Conservative secret FILE set, denied (read+write) as `literal`s under the
+/// Conservative secret file set, denied (read+write) as `literal`s under the
 /// canonical `$HOME`. Unlike [`SECRET_SUBDIRS`] these are single files, not
 /// directories, so they are emitted as `(literal …)` not `(subpath …)`.
 pub const SECRET_LITERAL_FILES: &[&str] = &[
@@ -401,6 +361,29 @@ pub const PRIVATE_SUBDIRS: &[&str] = &[
     "Library/Application Support/Microsoft Edge",
 ];
 
+/// The roots under `$HOME` whose subtrees macOS guards with
+/// `kTCCServiceSystemPolicyAppData` (`"… would like to access data from other
+/// apps."`): every sandboxed app's container (`~/Library/Containers/<bundle-id>`)
+/// and every app-group container (`~/Library/Group Containers/<group-id>`).
+///
+/// Separate from [`PRIVATE_SUBDIRS`] on purpose:
+///
+/// * A contained shell ([`FsCapability::TmpOnly`]) is NOT denied these paths by
+///   Seatbelt — sandboxing `Library/Containers` as a whole would break tools
+///   that run inside their own container, and per-app names are not known up
+///   front.
+/// * Every UNATTENDED lane that walks the disk under aterm's own responsible
+///   process — the claimant census, the harness's disk discovery, the footer's
+///   git probe, the supervisor's hidden-twin directory listing, atpkg's
+///   protected-root fence — MUST treat these roots as off-limits. Unlike the
+///   [`PRIVATE_SUBDIRS`] folders, which a held Full Disk Access grant covers and
+///   whose per-folder Allow persists in user `TCC.db`, an App Data prompt has
+///   no System Settings toggle and its Allow is forgotten when the responsible
+///   process exits (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §1.6a), so an
+///   ambient read inside either root raises a modal dialog on every launch where
+///   Full Disk Access is not held.
+pub const APP_DATA_ROOTS: &[&str] = &["Library/Containers", "Library/Group Containers"];
+
 /// Generate the SBPL profile for the given resolved capability set, or `None`
 /// if no OS sandbox is required.
 ///
@@ -437,7 +420,7 @@ pub(crate) fn profile_for_scoped(caps: Capabilities, home: Option<&str>) -> Opti
     }
 }
 
-/// Read `$HOME` from the environment, treating unset OR empty as "no home".
+/// Read `$HOME` from the environment, treating unset or empty as "no home".
 ///
 /// Empty is treated as absent so we never join secret components onto `""` (which
 /// would produce absolute `/.ssh`-style denies for a bogus root-relative path).
@@ -461,14 +444,14 @@ pub(crate) fn home_dir() -> Option<String> {
 ///   follows the base profile. It needs no home to be meaningful, so it is
 ///   emitted even when there is none.
 /// - `home == None` (or canonicalization of a present home fails) ⇒ nothing else:
-///   we do NOT deny bogus paths. For a broader `fs` that is exactly
+///   we do not deny bogus paths. For a broader `fs` that is exactly
 ///   [`BASE_PROFILE`].
 /// - `home == Some(h)` ⇒ canonicalizes `h`, joins each [`SECRET_SUBDIRS`] entry as
 ///   a `(subpath …)` and each [`SECRET_LITERAL_FILES`] entry as a `(literal …)`,
 ///   and — for `TmpOnly` — each [`PRIVATE_SUBDIRS`] entry as a `(subpath …)`, then
-///   emits one `(deny file-read* file-write* …)` for the whole set. For NESTED
-///   entries it ALSO emits a `(deny file-write* (literal …) …)` clause over each
-///   EXISTING ancestor directory node, closing the relocate-the-writable-parent
+///   emits one `(deny file-read* file-write* …)` for the whole set. For nested
+///   entries it also emits a `(deny file-write* (literal …) …)` clause over each
+///   existing ancestor directory node, closing the relocate-the-writable-parent
 ///   bypass (see [`push_existing_ancestor_write_denies`]).
 ///
 /// Only [`FsCapability::TmpOnly`](crate::FsCapability::TmpOnly) gets the write
@@ -761,7 +744,7 @@ mod tests {
 
     /// `TmpOnly` confines writes: every write denied, the temp roots, `/dev`
     /// and the shell's history files allowed back, and nothing of `$HOME`
-    /// beyond those files (owner, 2026-09-26).
+    /// beyond those files.
     #[test]
     fn tmp_only_confines_writes_to_the_writable_roots() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -1016,7 +999,7 @@ mod tests {
         let canon = std::fs::canonicalize(&tmp).expect("canonicalize temp dir");
         let profile = profile_for_home(canon.to_str(), None, FsCapability::HomeReadWrite);
 
-        // (1) It is the base profile PLUS a file deny — never less. (A broader FS
+        // (1) It is the base profile plus a file deny — never less. (A broader FS
         // tier: no write confinement, so the file deny follows directly.)
         assert!(
             profile.starts_with(BASE_PROFILE),
@@ -1043,7 +1026,7 @@ mod tests {
                 "profile must deny secret file {file} as canonical literal {expect}; got {profile}"
             );
         }
-        // (4) Below TmpOnly, NO private-data path leaks in.
+        // (4) Below TmpOnly, no private-data path leaks in.
         for sub in PRIVATE_SUBDIRS {
             let leaked = format!("(subpath \"{}\")", sbpl_str(&canon.join(sub)));
             assert!(
@@ -1062,7 +1045,7 @@ mod tests {
         let off = profile_for_home(canon.to_str(), None, FsCapability::HomeReadWrite);
         let on = profile_for_home(canon.to_str(), None, FsCapability::TmpOnly);
 
-        // Every private dir is in ON, none in OFF.
+        // Every private dir is in `on`, none in `off`.
         for sub in PRIVATE_SUBDIRS {
             let expect = format!("(subpath \"{}\")", sbpl_str(&canon.join(sub)));
             assert!(
@@ -1079,7 +1062,7 @@ mod tests {
             let expect = format!("(subpath \"{}\")", sbpl_str(&canon.join(sub)));
             assert!(on.contains(&expect) && off.contains(&expect));
         }
-        // And ON is strictly longer (private clauses were appended, not substituted).
+        // And `on` is strictly longer (private clauses were appended, not substituted).
         assert!(on.len() > off.len(), "TmpOnly must add clauses");
     }
 
@@ -1106,24 +1089,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn secret_paths_are_canonicalized_not_raw() {
-        // A home reached via /tmp canonicalizes to /private/tmp; the generator
-        // must emit the canonical prefix. COULD NOT RUN where /tmp is not a symlink.
-        let raw = std::path::Path::new("/tmp");
-        let canon = std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf());
-        if canon == raw {
-            aterm_spec::host::could_not_run("/tmp is no symlink here to canonicalize");
-        }
+        // A home reached through a symlink (macOS's /tmp is one, to /private/tmp)
+        // canonicalizes to its target; the generator must emit the canonical
+        // prefix. The link is the test's own, so every unix host runs it.
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = dir.path().join("home");
+        std::fs::create_dir(&real).unwrap();
+        let raw = dir.path().join("home-link");
+        std::os::unix::fs::symlink(&real, &raw).unwrap();
+        let canon = std::fs::canonicalize(&raw).unwrap();
+        assert_ne!(canon, raw, "the fixture's link is no canonical path");
         let profile = profile_for_home(raw.to_str(), None, FsCapability::TmpOnly);
-        let canon_marker = format!("(subpath \"{}/.ssh\")", canon.display());
-        let raw_marker = "(subpath \"/tmp/.ssh\")";
+        let canon_marker = format!("(subpath \"{}\")", sbpl_str(&canon.join(".ssh")));
+        let raw_marker = format!("(subpath \"{}\")", sbpl_str(&raw.join(".ssh")));
         assert!(
             profile.contains(&canon_marker),
             "must emit CANONICAL secret path {canon_marker}; got {profile}"
         );
         assert!(
-            !profile.contains(raw_marker),
+            !profile.contains(&raw_marker),
             "must NOT emit the non-canonical raw path (Seatbelt would not match it); got {profile}"
         );
     }
@@ -1223,13 +1210,13 @@ mod tests {
             profile.contains("(deny file-write* (literal"),
             "must emit an ancestor write-deny clause; got {profile}"
         );
-        // The immediate parent `.config` is a literal NODE write-deny.
+        // The immediate parent `.config` is a literal node write-deny.
         let cfg = format!("(literal \"{}\")", sbpl_str(&canon_home.join(".config")));
         assert!(
             profile.contains(&cfg),
             "must write-deny the .config ancestor node {cfg}; got {profile}"
         );
-        // The FULL chain for the browser profile — every intermediate node, not just
+        // The full chain for the browser profile — every intermediate node, not just
         // the immediate parent (a higher rename relocates the subtree just as well).
         for anc in [
             "Library",
@@ -1242,7 +1229,7 @@ mod tests {
                 "must write-deny ancestor node {anc} as {lit}; got {profile}"
             );
         }
-        // The home NODE itself must never be write-denied (would break the shell).
+        // The home node itself must never be write-denied (would break the shell).
         let home_lit = format!("(literal \"{}\")", sbpl_str(&canon_home));
         assert!(
             !profile.contains(&home_lit),
@@ -1287,8 +1274,8 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         symlink(&store, canon_home.join(".config")).unwrap();
 
-        // (1) The lexical symlink node is write-denied, (2) and the resolved real store + its
-        // parent — closing the rename-the-real-ancestor bypass codex flagged.
+        // Both the lexical symlink node and the resolved real store + its parent
+        // are write-denied.
         let lex = format!("(literal \"{}\")", canon_home.join(".config").display());
         let real_store = format!("(literal \"{}\")", store.display());
         let real_parent = format!("(literal \"{}\")", canon_home.join("dotfiles").display());
@@ -1380,7 +1367,7 @@ mod tests {
             "Containment (fs TmpOnly) must deny private data; got {full}"
         );
 
-        // (b) network None but fs broadened to HomeReadWrite: secret YES, private NO.
+        // (b) network None but fs broadened to HomeReadWrite: secret yes, private no.
         let mut broadened = base;
         broadened.fs = FsCapability::HomeReadWrite;
         let prof = profile_for(&broadened).expect("network None still yields a profile");
@@ -1418,5 +1405,22 @@ mod tests {
         let mut full = base;
         full.network = NetworkCapability::Full;
         assert!(profile_for(&full).is_none());
+    }
+
+    #[test]
+    fn the_app_data_roots_share_no_entry_with_the_private_set() {
+        // `APP_DATA_ROOTS` are the `kTCCServiceSystemPolicyAppData` parents under
+        // `~/Library`; they are kept out of `PRIVATE_SUBDIRS` (Seatbelt does not
+        // deny them) and joined onto the unattended-lane fences instead.
+        assert_eq!(
+            APP_DATA_ROOTS,
+            &["Library/Containers", "Library/Group Containers"]
+        );
+        for root in APP_DATA_ROOTS {
+            assert!(
+                !PRIVATE_SUBDIRS.contains(root),
+                "{root} is an App Data root, not a Seatbelt private-data deny"
+            );
+        }
     }
 }

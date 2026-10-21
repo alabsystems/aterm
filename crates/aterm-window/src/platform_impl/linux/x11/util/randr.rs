@@ -13,7 +13,6 @@ use std::{env, str};
 
 use super::*;
 use crate::dpi::validate_scale_factor;
-use crate::platform_impl::platform::x11::{monitor, VideoModeHandle};
 
 use aterm_x11::proto::randr;
 use tracing::warn;
@@ -63,11 +62,7 @@ impl XConnection {
         self.database().get_string("Xft.dpi", "").and_then(|s| f64::from_str(s).ok())
     }
 
-    pub fn get_output_info(
-        &self,
-        resources: &monitor::ScreenResources,
-        crtc: &randr::GetCrtcInfoReply,
-    ) -> Option<(String, f64, Vec<VideoModeHandle>)> {
+    pub fn get_output_info(&self, crtc: &randr::GetCrtcInfoReply) -> Option<(String, f64)> {
         let output_info = match self.request(randr::get_output_info(
             self.randr_major(),
             crtc.outputs[0],
@@ -79,29 +74,6 @@ impl XConnection {
                 return None;
             },
         };
-
-        let bit_depth = self.default_root().root_depth;
-        let output_modes = &output_info.modes;
-        let resource_modes = resources.modes();
-
-        let modes = resource_modes
-            .iter()
-            // XRROutputInfo contains an array of mode ids that correspond to
-            // modes in the array in XRRScreenResources
-            .filter(|x| output_modes.contains(&x.id))
-            .map(|mode| {
-                VideoModeHandle {
-                    size: (mode.width.into(), mode.height.into()),
-                    refresh_rate_millihertz: monitor::mode_refresh_rate_millihertz(mode)
-                        .unwrap_or(0),
-                    bit_depth: bit_depth as u16,
-                    native_mode: mode.id,
-                    // This is populated in `MonitorHandle::video_modes` as the
-                    // video mode is returned to the user
-                    monitor: None,
-                }
-            })
-            .collect();
 
         let name = match str::from_utf8(&output_info.name) {
             Ok(name) => name.to_owned(),
@@ -162,39 +134,6 @@ impl XConnection {
             },
         };
 
-        Some((name, scale_factor, modes))
-    }
-
-    pub fn set_crtc_config(
-        &self,
-        crtc_id: randr::Crtc,
-        mode_id: randr::Mode,
-    ) -> Result<(), X11Error> {
-        let major = self.randr_major();
-        let crtc =
-            self.request(randr::get_crtc_info(major, crtc_id, aterm_x11::proto::CURRENT_TIME))?;
-
-        self.request(randr::set_crtc_config(
-            major,
-            crtc_id,
-            crtc.timestamp,
-            aterm_x11::proto::CURRENT_TIME,
-            crtc.x,
-            crtc.y,
-            mode_id,
-            crtc.rotation,
-            &crtc.outputs,
-        ))
-        .map(|_| ())
-    }
-
-    pub fn get_crtc_mode(&self, crtc_id: randr::Crtc) -> Result<randr::Mode, X11Error> {
-        Ok(self
-            .request(randr::get_crtc_info(
-                self.randr_major(),
-                crtc_id,
-                aterm_x11::proto::CURRENT_TIME,
-            ))?
-            .mode)
+        Some((name, scale_factor))
     }
 }

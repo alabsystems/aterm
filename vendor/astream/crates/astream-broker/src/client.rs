@@ -3,14 +3,26 @@
 //! deterministic — a publish round-trips before the next step, and a subscriber's
 //! `recv` returns exactly when the next delivery arrives, with no reliance on sleeps
 //! or wall-clock.
+//!
+//! One publisher's API does not wait for its broker's answers, for a caller whose loop
+//! has other work: the pipelined writes (`Client::send_publish`, `send_retire`,
+//! `send_commit`) return once written, and `Client::try_recv_publish_ack` reads an ack
+//! only if the broker has answered already, keeping a frame that has only partly
+//! arrived for the next read. The writes are still blocking writes: the broker stops
+//! reading a connection once about 1,024 of its acks are unresolved (its per-connection
+//! bound, `PIPELINE_DEPTH`: acks not yet written back, because their batch is still
+//! being flushed or because the client is not reading what was written), and once the
+//! socket's buffers fill the next write parks until the broker writes acks again. A
+//! caller that keeps what it owes under `Client::MAX_PIPELINE_WINDOW`, trying as it
+//! writes, never meets that bound: no more of its acks can be unresolved than it owes.
 
 use crate::logid::{Lineage, LogIdentity};
 use crate::proto::{
     append_frame, append_publish_frame, append_retire_frame, decode_response, encode_request,
     foreign_protocol, read_frame, Request, Response, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER,
     ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED,
-    ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RETIRE_CHARGED_PREFIX,
-    RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
+    ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RETAINED_FROM_PREFIX,
+    RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
 };
 use crate::proto::{NonceExt, ServedInfo};
 use astream_wire::{Frame, FrameError};
@@ -20,6 +32,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(clean_islands)]
@@ -166,8 +179,9 @@ impl CreditWindow {
     }
 
     /// Attempt to consume one unit of send credit (`SendBatch` in
-    /// `Astream.Broker.TlaCreditFlowWindow`) via the 4-parameter Clean-origin
-    /// [`crate::proto::windowed_send_advance`] kernel. Returns `true` and advances
+    /// `Astream.Broker.TlaCreditFlowWindow`) via the 4-parameter
+    /// [`crate::proto::windowed_send_advance`] kernel, hand-written Rust that calls the
+    /// Clean-Origin (`I5`) functions its doc names. Returns `true` and advances
     /// `next_send` by 1 if `self.can_send()` holds, or `false` if the credit window is full.
     pub const fn try_send(&mut self) -> bool {
         if !self.can_send() {
@@ -189,7 +203,8 @@ impl CreditWindow {
     }
 
     /// Advance `next_send` toward `cand_seq` clamped by `credit_horizon` via the
-    /// 4-parameter Clean-origin [`crate::proto::windowed_send_advance`] kernel.
+    /// 4-parameter [`crate::proto::windowed_send_advance`] kernel, hand-written Rust that
+    /// calls the Clean-Origin (`I5`) functions its doc names.
     pub const fn advance_send_to(&mut self, cand_seq: u64) -> u64 {
         self.next_send = crate::proto::windowed_send_advance(
             self.next_send,
@@ -257,12 +272,14 @@ const MAX_PIPELINE_WINDOW: usize = 512;
 /// reply is a [`ProtocolMismatch`], and it latches the client like any other failure.
 ///
 /// The client also keeps itself in step with the acks it OWES ITSELF. A pipelined
-/// publish ([`send_publish`](Client::send_publish), [`send_retire`](Client::send_retire))
-/// leaves its ack on the stream for a later [`recv_publish_ack`](Client::recv_publish_ack),
+/// write ([`send_publish`](Client::send_publish), [`send_retire`](Client::send_retire),
+/// [`send_commit`](Client::send_commit)) leaves its ack on the stream for a later
+/// [`recv_publish_ack`](Client::recv_publish_ack) (or a
+/// [`try_recv_publish_ack`](Client::try_recv_publish_ack), which does not wait for it),
 /// and the broker answers a connection's requests in the order it read them, so the
 /// next frame belongs to the oldest owed publish, not to whatever request is sent
 /// after it. A request that reads its own reply — a blocking publish, a commit, a
-/// fetch, a `Hello`, a subscribe: every verb but the pipelined pair — would take that
+/// fetch, a `Hello`, a subscribe: every verb but the pipelined ones — would take that
 /// ack as its answer: a commit would return the publish's offset, a fetch would fail
 /// on a reply of the wrong kind, and a REFUSED publish's `Error` would come back as
 /// the later request's own refusal. So the client counts the acks owed
@@ -293,14 +310,29 @@ pub struct Client<S = UnixStream> {
     /// The durable head the newest `Mark` this connection read carried
     /// ([`seen_durable`](Client::seen_durable)).
     durable: Option<u64>,
+    /// The oldest offset the newest page's `Mark` carried
+    /// ([`seen_oldest`](Client::seen_oldest)).
+    oldest: Option<u64>,
     /// Pipelined publishes written whose acks have not been read
     /// ([`owed_acks`](Client::owed_acks)).
     owed: u64,
+    /// What a [`try_recv_publish_ack`](Client::try_recv_publish_ack) read off the
+    /// stream that no reply has used yet: the part of a frame that had arrived when the
+    /// stream had no more to give, and whatever arrived with it. Empty until a try
+    /// leaves something, and every reply is read through it while it is not
+    /// ([`read_response`](Client::read_response)), so no byte read is dropped.
+    rx: RecvBuf,
+    /// How a try reads without waiting ([`Nowait`]).
+    nowait: Nowait<S>,
     /// The negative control of the owed-ack guard: a client that does not refuse a
     /// request while acks are owed, as every client did before it. Only this module's
     /// own unit tests set it.
     #[cfg(test)]
     unguarded: bool,
+    /// The negative controls of the try's two guarantees ([`TryMutant`]). Only this
+    /// module's own unit tests set it.
+    #[cfg(test)]
+    try_mutant: TryMutant,
 }
 
 /// A connection to a broker over a byte stream. Windows twin: std has no
@@ -323,12 +355,77 @@ pub struct Client<S = TcpStream> {
     /// The durable head the newest `Mark` this connection read carried
     /// ([`seen_durable`](Client::seen_durable)).
     durable: Option<u64>,
+    /// The oldest offset the newest page's `Mark` carried
+    /// ([`seen_oldest`](Client::seen_oldest)).
+    oldest: Option<u64>,
     /// Pipelined publishes written whose acks have not been read
     /// ([`owed_acks`](Client::owed_acks)).
     owed: u64,
+    /// What a try read that no reply has used yet (see the Unix definition).
+    rx: RecvBuf,
+    /// How a try reads without waiting ([`Nowait`]).
+    nowait: Nowait<S>,
     /// The negative control of the owed-ack guard (see the Unix definition).
     #[cfg(test)]
     unguarded: bool,
+    /// The negative controls of the try's two guarantees (see the Unix definition).
+    #[cfg(test)]
+    try_mutant: TryMutant,
+}
+
+/// How a client puts the socket under its stream into the mode a
+/// [`try_recv_publish_ack`](Client::try_recv_publish_ack) reads in — NON-BLOCKING, so a
+/// read with nothing to give answers at once — and back out of it. Every other verb
+/// reads and writes the stream blocking, as every constructor here leaves it.
+enum Nowait<S> {
+    /// A stream handed to [`Client::from_stream`]: the client cannot reach a socket
+    /// under it, so a try reads as the stream reads, and a read that answers
+    /// `WouldBlock` or `TimedOut` is "not yet".
+    AsIs,
+    /// The stream IS the socket, or wraps it and lends it out: [`Client::connect`], the
+    /// TCP constructors, and the sealed ones (through the record layer's `get_ref`).
+    /// Here and under [`Socket`](Nowait::Socket) only `WouldBlock` is "not yet"
+    /// ([`not_yet`](Nowait::not_yet)).
+    Stream(fn(&S, bool) -> io::Result<()>),
+    /// The stream was erased behind [`AnyStream`] by [`connect`]: the duplicate of its
+    /// socket the [`Closer`] holds, shared. Blocking or not is a property of the socket
+    /// (the open file description a duplicate shares), not of one descriptor, so what
+    /// is set through it is what the stream's own reads see — as the closer's timeouts
+    /// are.
+    Socket(Arc<Socket>),
+}
+
+impl<S> Nowait<S> {
+    /// Whether the error a try's read stopped on is "not yet" — the stream had nothing
+    /// more to give — rather than a failure. `WouldBlock` always is: a non-blocking
+    /// socket's, or (Unix) a read timeout's. `TimedOut` is only where a read TIMEOUT
+    /// can have fired, a stream read as it is ([`AsIs`](Nowait::AsIs); Windows reports
+    /// a read timeout so). A read on a socket the client put in non-blocking mode
+    /// ITSELF has no timeout to fire, so `TimedOut` there is the connection's own
+    /// `ETIMEDOUT` (`WSAETIMEDOUT`): retransmission or keepalive gave up on the peer.
+    /// Taken for "not yet", it would leave the client owing acks a dead connection will
+    /// never bring, and cost the caller the cause, which the read just consumed (the
+    /// next one reads a plain close); as a failure it latches the client with it.
+    fn not_yet(&self, e: &io::Error) -> bool {
+        match self {
+            Nowait::AsIs => is_not_yet(e),
+            Nowait::Stream(_) | Nowait::Socket(_) => e.kind() == io::ErrorKind::WouldBlock,
+        }
+    }
+}
+
+/// Which of a try's two guarantees a unit test switches off, to show it is what its
+/// test rests on: [`Torn`](TryMutant::Torn) reads with `proto::read_frame`, which drops
+/// the bytes of a frame it had only part of when the read stopped (what a try built on
+/// the blocking read would do); [`KeepsNowait`](TryMutant::KeepsNowait) leaves the
+/// socket non-blocking after the try, so the next blocking read cannot wait.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TryMutant {
+    #[default]
+    Off,
+    Torn,
+    KeepsNowait,
 }
 
 #[cfg(unix)]
@@ -336,7 +433,8 @@ impl Client<UnixStream> {
     /// Connect to the broker's Unix socket at `socket_path` (same machine,
     /// unsealed — reachability is scoped by the socket path's permissions).
     pub fn connect(socket_path: impl AsRef<Path>) -> io::Result<Client<UnixStream>> {
-        Ok(Client::from_stream(UnixStream::connect(socket_path)?))
+        Ok(Client::from_stream(UnixStream::connect(socket_path)?)
+            .nowait_by(UnixStream::set_nonblocking))
     }
 }
 
@@ -346,7 +444,7 @@ impl Client<TcpStream> {
     /// untrusted network use `connect_tcp_sealed` (the `aead` feature), which
     /// carries the same protocol inside an authenticated-encryption record layer.
     pub fn connect_tcp(addr: impl ToSocketAddrs) -> io::Result<Client<TcpStream>> {
-        Ok(Client::from_stream(dial_tcp(addr, None)?))
+        Ok(Client::from_stream(dial_tcp(addr, None)?).nowait_by(TcpStream::set_nonblocking))
     }
 
     /// [`connect_tcp`](Self::connect_tcp) with a bound on the CONNECT: each address
@@ -365,7 +463,8 @@ impl Client<TcpStream> {
         addr: impl ToSocketAddrs,
         timeout: Duration,
     ) -> io::Result<Client<TcpStream>> {
-        Ok(Client::from_stream(dial_tcp(addr, Some(timeout))?))
+        Ok(Client::from_stream(dial_tcp(addr, Some(timeout))?)
+            .nowait_by(TcpStream::set_nonblocking))
     }
 }
 
@@ -447,6 +546,15 @@ fn agree_tcp(
     Ok(sealed)
 }
 
+/// Put the TCP socket under a sealed stream into, or out of, non-blocking mode — for
+/// a [`Client::try_recv_publish_ack`]. The record layer keeps a record that has only
+/// partly arrived across a read that answers `WouldBlock`, and the plaintext of one it
+/// has opened and not yet handed out, so a try over it loses nothing either.
+#[cfg(feature = "aead")]
+fn sealed_nonblocking(s: &astream_aead::SealedStream<TcpStream>, on: bool) -> io::Result<()> {
+    s.get_ref().set_nonblocking(on)
+}
+
 #[cfg(feature = "aead")]
 impl Client<astream_aead::SealedStream<TcpStream>> {
     /// Connect to a broker served by [`serve_tcp_sealed`](crate::Broker::serve_tcp_sealed)
@@ -464,7 +572,7 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         key: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<Client<astream_aead::SealedStream<TcpStream>>> {
         let stream = seal_tcp(dial_tcp(addr, None)?, key, SEALED_HANDSHAKE_TIMEOUT)?;
-        Ok(Client::from_stream(stream))
+        Ok(Client::from_stream(stream).nowait_by(sealed_nonblocking))
     }
 }
 
@@ -481,7 +589,7 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         psk: [u8; astream_aead::KEY_LEN],
     ) -> io::Result<Client<astream_aead::SealedStream<TcpStream>>> {
         let sealed = agree_tcp(dial_tcp(addr, None)?, &psk, KEY_AGREEMENT_TIMEOUT)?;
-        Ok(Client::from_stream(sealed))
+        Ok(Client::from_stream(sealed).nowait_by(sealed_nonblocking))
     }
 }
 
@@ -507,7 +615,7 @@ impl Client<astream_aead::SealedStream<TcpStream>> {
         let sealed = astream_aead::client_identity_handshake(stream, &identity, &expected_server)?;
         sealed.get_ref().set_read_timeout(None)?;
         sealed.get_ref().set_write_timeout(None)?;
-        Ok(Client::from_stream(sealed))
+        Ok(Client::from_stream(sealed).nowait_by(sealed_nonblocking))
     }
 }
 
@@ -525,27 +633,49 @@ impl<S: Read + Write> Client<S> {
             sent_at: Instant::now(),
             keepalive_unknown: false,
             durable: None,
+            oldest: None,
             owed: 0,
+            rx: RecvBuf::default(),
+            nowait: Nowait::AsIs,
             #[cfg(test)]
             unguarded: false,
+            #[cfg(test)]
+            try_mutant: TryMutant::Off,
         }
+    }
+
+    /// This client, told how to put its stream's socket into and out of non-blocking
+    /// mode for a [`try_recv_publish_ack`](Self::try_recv_publish_ack): what every
+    /// constructor that knows its socket says, and [`from_stream`](Self::from_stream)
+    /// cannot ([`Nowait`]).
+    fn nowait_by(mut self, set: fn(&S, bool) -> io::Result<()>) -> Client<S> {
+        self.nowait = Nowait::Stream(set);
+        self
     }
 
     /// Give the underlying byte stream back (e.g. to box it behind a `dyn` trait so
     /// one code path serves every transport). The connection stays open. A client
-    /// that was out of step hands back a stream that still is, and one that owed
-    /// itself acks ([`owed_acks`](Self::owed_acks)) hands back a stream they will
-    /// still arrive on, first, with nothing left to count them: read them before
-    /// giving the stream up.
+    /// that was out of step hands back a stream that still is. Read the acks the client
+    /// owes itself ([`owed_acks`](Self::owed_acks)) before giving the stream up, for
+    /// nothing is left to count them, and they may not even be on the stream any more:
+    /// - a client that never tried hands back a stream they will still arrive on,
+    ///   first;
+    /// - but whatever the client has READ AHEAD goes with it and is dropped. A
+    ///   [`try_recv_publish_ack`](Self::try_recv_publish_ack) reads all the stream has
+    ///   to give, whole acks it has not returned yet as well as part of the next, and a
+    ///   reply read after a try reads through what it left. So the stream handed back
+    ///   can start mid-frame, or past acks that are owed and were already read off it.
     pub fn into_stream(self) -> S {
         self.stream
     }
 
-    /// How many pipelined acks this connection owes itself: publishes (and retires)
-    /// written by [`send_publish`](Self::send_publish) and
-    /// [`send_retire`](Self::send_retire) whose acks [`recv_publish_ack`](Self::recv_publish_ack)
-    /// has not read yet. While it is above zero every request that reads its own reply
-    /// is refused with [`AcksOwed`] (see [`Client`]).
+    /// How many pipelined acks this connection owes itself: publishes, retires and
+    /// commits written by [`send_publish`](Self::send_publish),
+    /// [`send_retire`](Self::send_retire) and [`send_commit`](Self::send_commit) whose
+    /// acks [`recv_publish_ack`](Self::recv_publish_ack) (or
+    /// [`try_recv_publish_ack`](Self::try_recv_publish_ack)) has not read yet. While it
+    /// is above zero every request that reads its own reply is refused with
+    /// [`AcksOwed`] (see [`Client`]).
     ///
     /// A latched client owes NOTHING, so this is zero once any failure has put the
     /// client out of step: a pipelined write that failed is not counted, and a read
@@ -666,6 +796,33 @@ impl<S: Read + Write> Client<S> {
     /// answers with a fresh `Mark`.
     pub const fn seen_durable(&self) -> Option<u64> {
         self.durable
+    }
+
+    /// The OLDEST offset a read of the newest `Fetch`'s filter can reach, as its `Mark`
+    /// told it (`REQUIREMENTS` R4): the log's base, or for what a hold rule keeps records
+    /// of, the oldest it still holds of them. `None` before any page, after a `Last`
+    /// page (whose `Mark` carries none), or from a broker that predates it.
+    pub const fn seen_oldest(&self) -> Option<u64> {
+        self.oldest
+    }
+
+    /// THE `HEAD`-STYLE QUERY that answers `oldest=` (`REQUIREMENTS` R4): a head query
+    /// (`Fetch` with `max = 0`, never refused) on `filter`, and the oldest offset its
+    /// `Mark` says a read of the filter can reach, beside the visible head. `None` for
+    /// the oldest from a broker that predates it. Refused with [`AcksOwed`], sending
+    /// nothing, while pipelined acks are owed, as every `fetch` is.
+    pub fn oldest(&mut self, filter: &str) -> io::Result<(Option<u64>, u64)> {
+        let (_, (_, head)) = self.fetch(0, filter, 0)?;
+        Ok((self.oldest, head))
+    }
+
+    /// The RETENTION RULES the broker retains its log by, as the latest `Hello` answer
+    /// advertised them. `None` before any `Hello`, from a broker that retains by none,
+    /// or from one that predates them.
+    #[cfg(feature = "retention")]
+    #[must_use]
+    pub fn retention_rules(&self) -> Option<crate::Retention> {
+        self.ext.retention_rules()
     }
 
     /// Keep what a `Mark` said about durability (an older broker's says nothing, which
@@ -931,6 +1088,46 @@ impl<S: Read + Write> Client<S> {
         self.write_owed(&out)
     }
 
+    /// PIPELINED commit (send side): write consumer `group`'s commit to `upto` WITHOUT
+    /// waiting for its ack, so a caller that publishes and commits on one connection
+    /// keeps its commits in the same pipeline as its publishes, and a loop that has
+    /// other work does not park on the commit's flush. Pair it with a later
+    /// [`recv_publish_ack`](Self::recv_publish_ack) or
+    /// [`try_recv_publish_ack`](Self::try_recv_publish_ack) in send order, exactly as a
+    /// [`send_publish`](Self::send_publish).
+    ///
+    /// The broker answers a commit as it answers a publish — through the same in-order
+    /// ack stream, with a `PublishAck` whose offset is the commit record's and whose
+    /// dedup flag is false (`broker.rs` `emit_op`) — so its ack is OWED like a
+    /// publish's ([`owed_acks`](Self::owed_acks)), and until it is read every request
+    /// that reads its own reply is refused with [`AcksOwed`]. A refused commit (a group
+    /// the connection's grants do not cover, a log that takes nothing) is the broker's
+    /// [`BrokerRefusal`] where its ack would be, and pays it. The commit is staged in
+    /// the order the broker read it, behind the publishes written before it on this
+    /// connection, and its ack, like each publish's, answers for the group-commit batch
+    /// it landed in. A publish ahead of it whose batch the broker rolled back (an
+    /// append or a flush that failed: the whole batch is refused) takes the commit with
+    /// it when the two shared that batch, as writes sent back to back usually do, and
+    /// does not when the commit reached a later batch, which can land. So the publish's
+    /// refusal says nothing about the commit behind it; the commit's own ack does.
+    ///
+    /// A commit refused before a byte is written (a frame over the cap) owes nothing
+    /// and leaves the client in step; a write that failed latches it out of step. The
+    /// blocking [`commit`](Self::commit) is this, refused first while acks are owed,
+    /// and then its own ack read at once.
+    pub fn send_commit(&mut self, group: &str, upto: u64) -> io::Result<()> {
+        self.in_step()?;
+        let mut out = Vec::new();
+        append_frame(
+            &mut out,
+            &encode_request(&Request::Commit {
+                group: group.to_string(),
+                upto,
+            }),
+        )?;
+        self.write_owed(&out)
+    }
+
     /// Write one pipelined request whose ack the caller reads later, and count that ack
     /// as owed — only once the whole frame is written: a failed write latches the
     /// client, and nothing it is owed is read again.
@@ -955,15 +1152,85 @@ impl<S: Read + Write> Client<S> {
     /// before anything is read — there is no ack on the way for it to read, so a read
     /// would park until the broker hung up, or take a reply that is nobody's.
     pub fn recv_publish_ack(&mut self) -> io::Result<(u64, bool)> {
+        self.owes_an_ack("recv_publish_ack")?;
+        let resp = self.read_response()?;
+        self.pay(resp)
+    }
+
+    /// PIPELINED publish (receive side), WITHOUT WAITING: the next owed ack if the
+    /// broker has answered it already, `Ok(None)` if not yet. For a publisher whose
+    /// loop has other work — a bridge serving its own mailbox — which reads its acks as
+    /// they arrive instead of parking on the broker's flush for each, as
+    /// [`recv_publish_ack`](Self::recv_publish_ack) does. Acks come in send order
+    /// either way, a commit's ([`send_commit`](Self::send_commit)) among them.
+    ///
+    /// FRAME-ATOMIC. An ack that has only partly arrived is KEPT, in the client, and
+    /// the next read finishes it — a try, or a blocking `recv_publish_ack` or any other
+    /// reply read — so no byte read is ever dropped: a `None` leaves the client in
+    /// step, owing what it owed. A sealed record partly arrived is kept by the record
+    /// layer the same way.
+    ///
+    /// HOW IT DOES NOT WAIT. A client that knows its socket — one from
+    /// [`connect`] (an [`AnyClient`]) or from any of the typed constructors here — puts
+    /// it in non-blocking mode for the length of the try and back after it, so a read
+    /// with nothing to give answers at once, and every other verb keeps the blocking
+    /// stream it had (the read and write timeouts set through a [`Closer`] are
+    /// untouched). A client made [`from_stream`](Self::from_stream) cannot reach a
+    /// socket under the stream it was handed: its try reads as that stream reads, and a
+    /// read that answers `WouldBlock` or `TimedOut` is `None` — so over a stream that
+    /// blocks, with no read timeout, it parks as `recv_publish_ack` does.
+    ///
+    /// It pays an owed ack exactly when it returns one, or the owed write's refusal (a
+    /// [`BrokerRefusal`]: a whole reply, which leaves the client in step).
+    ///
+    /// What does not wait is the READ. The pipelined writes stay blocking writes, and
+    /// the broker back-pressures a connection whose acks go unresolved (see the module
+    /// documentation): keep [`owed_acks`](Self::owed_acks) under
+    /// [`MAX_PIPELINE_WINDOW`](Self::MAX_PIPELINE_WINDOW) by trying as you write.
+    ///
+    /// # Errors
+    /// As [`recv_publish_ack`](Self::recv_publish_ack)'s: the owed write's refusal; a
+    /// transport failure, or the broker's close, which latch the client (and zero what
+    /// it owes); and `InvalidInput`, before anything is read, when no ack is owed — no
+    /// ack is on the way, and `None` would say one is. On a socket the client put in
+    /// non-blocking mode itself a read that answers `TimedOut` is such a failure, not a
+    /// `None`: no read timeout can fire there, so it is the connection's own
+    /// (`ETIMEDOUT`, the peer gone). A failure to put the socket into non-blocking
+    /// mode, or back out of it, latches the client too: its blocking reads could no
+    /// longer be trusted to wait.
+    pub fn try_recv_publish_ack(&mut self) -> io::Result<Option<(u64, bool)>> {
+        self.owes_an_ack("try_recv_publish_ack")?;
+        let Some(payload) = self.try_frame()? else {
+            return Ok(None);
+        };
+        let resp = match decode_reply(&payload) {
+            Ok(resp) => resp,
+            Err(e) => return Err(self.lose(e)),
+        };
+        self.pay(resp).map(Some)
+    }
+
+    /// `Ok` when the client is in step and owes an ack for `verb` to read; else the
+    /// latch's `BrokenPipe`, or `InvalidInput` with nothing read: there is no ack on
+    /// the way, so a read would park until the broker hung up, or take a reply that is
+    /// nobody's.
+    fn owes_an_ack(&self, verb: &str) -> io::Result<()> {
         self.in_step()?;
         if self.owed == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "no pipelined ack is owed on this connection: recv_publish_ack reads the ack \
-                 of an earlier send_publish or send_retire",
+                format!(
+                    "no pipelined ack is owed on this connection: {verb} reads the ack of an \
+                     earlier send_publish, send_retire or send_commit"
+                ),
             ));
         }
-        let resp = self.read_response()?;
+        Ok(())
+    }
+
+    /// Count one owed ack paid by the whole reply `resp`, and answer it: its
+    /// `(offset, deduped)`, or the owed write's refusal.
+    fn pay(&mut self, resp: Response) -> io::Result<(u64, bool)> {
         self.owed = self.owed.saturating_sub(1);
         match resp {
             Response::PublishAck { offset, deduped } => Ok((offset, deduped)),
@@ -971,8 +1238,65 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    /// Read the `PublishAck` a blocking write request is answered with — a `Commit`'s or
-    /// a `ProcessAndProduce`'s, which the broker answers like a publish
+    /// The next whole reply frame if it can be had WITHOUT WAITING, `None` if not yet:
+    /// one already in [`rx`](Client::rx) costs no I/O; otherwise the stream is read in
+    /// non-blocking mode ([`Nowait`]) until it has no more to give, and whatever part of
+    /// a frame arrived stays in `rx` for the next read. A close is `UnexpectedEof`, and
+    /// every failure latches the client.
+    fn try_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        match self.rx.buffered_frame() {
+            Ok(Some(payload)) => return Ok(Some(payload)),
+            Ok(None) => {}
+            Err(e) => return Err(self.lose(e)),
+        }
+        if let Err(e) = self.set_nowait(true) {
+            return Err(self.lose(e));
+        }
+        let read = self.read_nowait();
+        // Back to blocking BEFORE the read is judged, whatever it answered: a client
+        // left non-blocking would fail its next blocking read at once.
+        if let Err(e) = self.set_nowait(false) {
+            return Err(self.lose(e));
+        }
+        match read {
+            Ok(Some(payload)) => Ok(Some(payload)),
+            Ok(None) => Err(self.lose(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "broker closed",
+            ))),
+            // The stream had no more to give: "not yet", the client in step.
+            Err(e) if self.nowait.not_yet(&e) => Ok(None),
+            Err(e) => Err(self.lose(e)),
+        }
+    }
+
+    /// The read under [`try_frame`](Self::try_frame): through [`rx`](Client::rx), which
+    /// keeps the bytes of a frame the stream stopped part-way through. (Its negative
+    /// control reads with `proto::read_frame`, which drops them.)
+    fn read_nowait(&mut self) -> io::Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        if self.try_mutant == TryMutant::Torn {
+            return read_frame(&mut self.stream);
+        }
+        self.rx.next_frame(&mut self.stream)
+    }
+
+    /// Put the socket under the stream into non-blocking mode (`on`), or back into
+    /// blocking mode ([`Nowait`]); nothing for a stream the client cannot reach under.
+    fn set_nowait(&self, on: bool) -> io::Result<()> {
+        #[cfg(test)]
+        if !on && self.try_mutant == TryMutant::KeepsNowait {
+            return Ok(());
+        }
+        match &self.nowait {
+            Nowait::AsIs => Ok(()),
+            Nowait::Stream(set) => set(&self.stream, on),
+            Nowait::Socket(socket) => socket.set_nonblocking(on),
+        }
+    }
+
+    /// Read the `PublishAck` a blocking write request is answered with — a
+    /// `ProcessAndProduce`'s, which the broker answers like a publish
     /// (`broker.rs` `emit_op`). Its own reply, read at once: never an owed ack.
     fn read_publish_ack(&mut self) -> io::Result<(u64, bool)> {
         match self.read_response()? {
@@ -1537,8 +1861,10 @@ impl<S: Read + Write> Client<S> {
                     head,
                     resume,
                     durable,
+                    oldest,
                 } => {
                     self.saw_durable(durable);
+                    self.oldest = oldest;
                     return Ok((page, (next, head), resume));
                 }
                 other => return Err(self.reply_error(other)),
@@ -1580,13 +1906,11 @@ impl<S: Read + Write> Client<S> {
     /// so an owed pipelined ack would pass for the commit's own: the commit would
     /// return the publish's offset, with no error, and the commit's ack would be left
     /// for the next read. While acks are owed it is refused with [`AcksOwed`] and
-    /// nothing is sent.
+    /// nothing is sent. Not waiting for the ack is [`send_commit`](Self::send_commit).
     pub fn commit(&mut self, group: &str, upto: u64) -> io::Result<u64> {
-        self.send(&Request::Commit {
-            group: group.to_string(),
-            upto,
-        })?;
-        let (offset, _) = self.read_publish_ack()?;
+        self.owes_nothing()?;
+        self.send_commit(group, upto)?;
+        let (offset, _) = self.recv_publish_ack()?;
         Ok(offset)
     }
 
@@ -1660,7 +1984,7 @@ impl<S: Read + Write> Client<S> {
     /// Every request this writes reads its OWN reply next (or hands the stream to a
     /// subscription, which reads every frame after it), so each is refused with
     /// [`AcksOwed`] while a pipelined ack is owed: the next frame is that ack's. The
-    /// pipelined pair writes through [`write_owed`](Self::write_owed) instead.
+    /// pipelined writes go through [`write_owed`](Self::write_owed) instead.
     fn send(&mut self, req: &Request) -> io::Result<()> {
         self.owes_nothing()?;
         let mut out = Vec::new();
@@ -1677,9 +2001,18 @@ impl<S: Read + Write> Client<S> {
     /// `InvalidData`; a broker `Error` is returned AS a response, because a refusal
     /// leaves the stream in step and a transport failure does not — every failure here
     /// latches the client out of step.
+    ///
+    /// A frame a [`try_recv_publish_ack`](Self::try_recv_publish_ack) began is finished
+    /// out of [`rx`](Client::rx), and so is any frame read with it; with nothing there
+    /// the reply is read straight off the stream, as every reply was before the try.
     fn read_response(&mut self) -> io::Result<Response> {
         self.in_step()?;
-        let read = match read_frame(&mut self.stream) {
+        let frame = if self.rx.is_empty() {
+            read_frame(&mut self.stream)
+        } else {
+            self.rx.next_frame(&mut self.stream)
+        };
+        let read = match frame {
             Ok(Some(p)) => decode_reply(&p),
             Ok(None) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1770,11 +2103,16 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// Send a streaming request and hand the connection over to its delivery stream.
+    ///
+    /// Whatever a try read ahead goes with the stream, in order. Nothing is owed by
+    /// then ([`owes_nothing`](Self::owes_nothing)), so the broker has sent nothing past
+    /// the replies the client read, and it is empty; carried rather than dropped, so no
+    /// byte off the stream is ever lost.
     fn into_subscription(mut self, req: &Request) -> io::Result<Subscription<S>> {
         self.send(req)?;
         Ok(Subscription {
             stream: self.stream,
-            rx: RecvBuf::default(),
+            rx: self.rx,
             marked: false,
             durable: self.durable,
         })
@@ -1783,6 +2121,16 @@ impl<S: Read + Write> Client<S> {
 
 fn unexpected_response() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "unexpected response")
+}
+
+/// A read that stopped because the stream had nothing more to give right now — a
+/// non-blocking socket's `WouldBlock`, or a read timeout's (`WouldBlock` on Unix,
+/// `TimedOut` on Windows) — rather than because the connection failed.
+fn is_not_yet(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 fn is_refused_error(e: &io::Error) -> bool {
@@ -1857,13 +2205,14 @@ pub fn protocol_mismatch(e: &io::Error) -> Option<&ProtocolMismatch> {
 /// still owes itself `owed` pipelined acks ([`Client::owed_acks`]).
 ///
 /// The broker answers a connection's requests in the order it read them, so after a
-/// [`Client::send_publish`] (or [`Client::send_retire`]) the next frame on the stream
-/// is that publish's ack, and a request that reads its own reply would take it for
-/// its own: a commit or a blocking publish would return the PUBLISH's offset with no
-/// error, a fetch or a `Last` would fail on a reply of the wrong kind, and a refused
-/// publish's `Error` would come back as the later request's refusal. Nothing on the
-/// wire can tell one ack from another, so the rule is the client's to keep, and this
-/// is it kept: read the owed acks with [`Client::recv_publish_ack`], then send.
+/// [`Client::send_publish`] (or a [`Client::send_retire`] or [`Client::send_commit`])
+/// the next frame on the stream is that publish's ack, and a request that reads its
+/// own reply would take it for its own: a commit or a blocking publish would return
+/// the PUBLISH's offset with no error, a fetch or a `Last` would fail on a reply of
+/// the wrong kind, and a refused publish's `Error` would come back as the later
+/// request's refusal. Nothing on the wire can tell one ack from another, so the rule
+/// is the client's to keep, and this is it kept: read the owed acks with
+/// [`Client::recv_publish_ack`] (or [`Client::try_recv_publish_ack`]), then send.
 ///
 /// The client is NOT out of step: nothing was written and nothing read, the owed acks
 /// are still owed and still in order, and the request goes through once they are
@@ -2029,6 +2378,20 @@ impl BrokerRefusal {
     /// under which a producer retries.
     pub fn is_poisoned(&self) -> bool {
         self.code == ERR_REFUSED && self.msg.starts_with(LOG_POISONED_PREFIX)
+    }
+
+    /// Where a read RETENTION refused can start: the `<off>` of an [`ERR_RECORD_REFUSED`]
+    /// whose message starts [`RETAINED_FROM_PREFIX`]`<off>` — a `Fetch` below the oldest
+    /// offset its filter can reach (`REQUIREMENTS` R4), whose records below `<off>`
+    /// retention gave up. A fetch from `<off>` reads on. `None` for every other refusal,
+    /// and against a broker that predates it (which clamped such a fetch to its base).
+    pub fn retained_from(&self) -> Option<u64> {
+        if self.code != ERR_RECORD_REFUSED {
+            return None;
+        }
+        let rest = self.msg.strip_prefix(RETAINED_FROM_PREFIX)?;
+        let n = rest.bytes().take_while(u8::is_ascii_digit).count();
+        rest.get(..n)?.parse().ok()
     }
 
     /// Whether the refusal is a conditional or state-guarded `Retire` refusal
@@ -2405,23 +2768,8 @@ impl RecvBuf {
     /// error discards it, since the stream cannot be resumed past one.
     fn next_frame(&mut self, stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         loop {
-            match Frame::decode(self.buf.get(self.start..self.end).unwrap_or(&[])) {
-                Ok(Some(d)) => {
-                    self.start = self.start.saturating_add(d.consumed);
-                    if self.start == self.end {
-                        self.reset();
-                    }
-                    return Ok(Some(d.frame.payload));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    self.reset();
-                    let msg = match e {
-                        FrameError::TooLarge => "frame exceeds cap",
-                        _ => "corrupt frame",
-                    };
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
-                }
+            if let Some(payload) = self.buffered_frame()? {
+                return Ok(Some(payload));
             }
             if self.end == self.buf.len() {
                 // Full: slide the unfinished frame to the front, and grow only when it
@@ -2482,6 +2830,36 @@ impl RecvBuf {
                 }
             }
         }
+    }
+
+    /// The payload of the next frame if the buffer already holds all of it, reading
+    /// nothing; `Ok(None)` when it holds less (nothing at all included). A frame that
+    /// can never decode — a bad header, a length over the cap — empties the buffer and
+    /// is `InvalidData`, as in [`next_frame`](Self::next_frame).
+    fn buffered_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        match Frame::decode(self.buf.get(self.start..self.end).unwrap_or(&[])) {
+            Ok(Some(d)) => {
+                self.start = self.start.saturating_add(d.consumed);
+                if self.start == self.end {
+                    self.reset();
+                }
+                Ok(Some(d.frame.payload))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                self.reset();
+                let msg = match e {
+                    FrameError::TooLarge => "frame exceeds cap",
+                    _ => "corrupt frame",
+                };
+                Err(io::Error::new(io::ErrorKind::InvalidData, msg))
+            }
+        }
+    }
+
+    /// Whether nothing read is waiting here: no frame, and no part of one.
+    const fn is_empty(&self) -> bool {
+        self.start == self.end
     }
 
     /// Nothing is owed: empty the buffer, and give back whatever an oversized frame
@@ -2786,9 +3164,13 @@ impl std::fmt::Debug for Transport {
 /// `subscribe` consumes the client. Dropping a closer does nothing to the connection;
 /// [`close`](Self::close) is explicit. `Send + Sync`: one closer can be shared (an
 /// `Arc`) with a watchdog.
+///
+/// The [`AnyClient`] that [`connect`] hands back beside it shares that duplicate (it is
+/// how the client's [`try_recv_publish_ack`](Client::try_recv_publish_ack) reaches the
+/// socket under its erased stream), so the duplicate is closed when both are gone.
 #[derive(Debug)]
 pub struct Closer {
-    socket: Socket,
+    socket: Arc<Socket>,
 }
 
 /// The socket a [`Closer`] duplicated.
@@ -2799,17 +3181,30 @@ enum Socket {
     Tcp(TcpStream),
 }
 
+impl Socket {
+    /// Put the socket into non-blocking mode (`on`) or back into blocking mode: a
+    /// property of the socket, which the stream it was duplicated from reads and writes
+    /// in too (see [`Nowait::Socket`]).
+    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Socket::Unix(s) => s.set_nonblocking(on),
+            Socket::Tcp(s) => s.set_nonblocking(on),
+        }
+    }
+}
+
 impl Closer {
     #[cfg(unix)]
     fn unix(s: &UnixStream) -> io::Result<Closer> {
         Ok(Closer {
-            socket: Socket::Unix(s.try_clone()?),
+            socket: Arc::new(Socket::Unix(s.try_clone()?)),
         })
     }
 
     fn tcp(s: &TcpStream) -> io::Result<Closer> {
         Ok(Closer {
-            socket: Socket::Tcp(s.try_clone()?),
+            socket: Arc::new(Socket::Tcp(s.try_clone()?)),
         })
     }
 
@@ -2819,7 +3214,7 @@ impl Closer {
     /// (and fires a registered last will). Idempotent: closing an already-closed socket
     /// is not an error, and nothing is reported.
     pub fn close(&self) {
-        let _ = match &self.socket {
+        let _ = match &*self.socket {
             #[cfg(unix)]
             Socket::Unix(s) => s.shutdown(std::net::Shutdown::Both),
             Socket::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
@@ -2853,12 +3248,12 @@ impl Closer {
     /// own refusal, which carries no OS error).
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         unless_hung_up(
-            match &self.socket {
+            match &*self.socket {
                 #[cfg(unix)]
                 Socket::Unix(s) => s.set_read_timeout(d),
                 Socket::Tcp(s) => s.set_read_timeout(d),
             },
-            || match &self.socket {
+            || match &*self.socket {
                 #[cfg(unix)]
                 Socket::Unix(s) => socket_hung_up(s),
                 Socket::Tcp(s) => socket_hung_up(s),
@@ -2881,12 +3276,12 @@ impl Closer {
     /// own refusal, which carries no OS error).
     pub fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         unless_hung_up(
-            match &self.socket {
+            match &*self.socket {
                 #[cfg(unix)]
                 Socket::Unix(s) => s.set_write_timeout(d),
                 Socket::Tcp(s) => s.set_write_timeout(d),
             },
-            || match &self.socket {
+            || match &*self.socket {
                 #[cfg(unix)]
                 Socket::Unix(s) => socket_hung_up(s),
                 Socket::Tcp(s) => socket_hung_up(s),
@@ -2987,9 +3382,13 @@ pub fn connect(
     }
 }
 
-/// Box a connected stream behind [`AnyStream`], beside its closer.
+/// Box a connected stream behind [`AnyStream`], beside its closer. The box hides the
+/// socket from the client, so the client shares the closer's duplicate of it, for
+/// [`Client::try_recv_publish_ack`] ([`Nowait::Socket`]): no second descriptor.
 fn erase<S: AnyStream + 'static>(stream: S, closer: Closer) -> (AnyClient, Closer) {
-    (Client::from_stream(Box::new(stream)), closer)
+    let mut client: AnyClient = Client::from_stream(Box::new(stream));
+    client.nowait = Nowait::Socket(Arc::clone(&closer.socket));
+    (client, closer)
 }
 
 #[cfg(unix)]
@@ -3270,6 +3669,7 @@ mod tests {
                             head: 3,
                             resume: String::new(),
                             durable: None,
+                            oldest: None,
                         }));
                     }
                 } else {
@@ -3633,6 +4033,7 @@ mod owed_acks {
             ),
             ("fetch", Box::new(|c| c.fetch(0, "/o/>", 8).map(drop))),
             ("fetch head", Box::new(|c| c.fetch(0, "/o/>", 0).map(drop))),
+            ("oldest", Box::new(|c| c.oldest("/o/>").map(drop))),
             ("last", Box::new(|c| c.last("/o/>", "", 8).map(drop))),
             (
                 "last_page",
@@ -3877,4 +4278,810 @@ mod owed_acks {
             "the records the refused drain left on the subscription"
         );
     }
+}
+
+/// THE NON-BLOCKING PUBLISHER: a pipelined commit ([`Client::send_commit`]) and an ack
+/// read without waiting ([`Client::try_recv_publish_ack`]) — what a caller whose one
+/// loop has other work needs so that it does not park on its own broker's flush for
+/// each ack. (Its writes stay blocking writes; see the module documentation.)
+///
+/// Three properties, each with its negative control.
+///
+/// - A pipelined commit OWES ITS ACK like a publish and lands as a commit, in send
+///   order between the publishes around it, over a real broker; the control is a
+///   client with the owed-ack guard off, whose fetch behind the commit takes the
+///   commit's ack for its reply and latches.
+/// - A try is FRAME-ATOMIC wherever the stream stops: a scripted stream gives every
+///   byte in its own read with a dry read (`WouldBlock`) before each, and the tries
+///   answer the three owed replies exactly, each after one `None` per byte; a blocking
+///   read finishes a frame a try began at every split point, and a read that brings a
+///   frame and a half keeps the half. The control reads with `proto::read_frame`, the
+///   blocking read a naive try would use, which drops every byte a dry read cut off,
+///   so its first answer is the reply queued AFTER the three owed acks.
+/// - A try DOES NOT WAIT, and puts the socket back: over a real broker, on every
+///   transport [`connect`] dials (an [`AnyClient`]) — the Unix socket aterm's bus is
+///   served on, plaintext TCP, the sealed wire, the same wire behind the handshake —
+///   and from every typed constructor (whose client switches its own socket), with
+///   the writer held before it answers a committed batch (`Broker::pause_next_acks`),
+///   a try and a `send_commit` return under a one-minute hang detector that would
+///   otherwise shut the connection down, and the blocking reads after them wait for
+///   the acks; a burst and its commit are read by trying, in send order. The control
+///   leaves the socket non-blocking after the try: the blocking read that should wait
+///   for the held ack answers `WouldBlock` at once and latches the client. A
+///   `TimedOut` is "not yet" only where a read timeout can fire (a stream read as it
+///   is); on a socket the client switched itself it is the dead connection's, and
+///   latches the client.
+#[cfg(test)]
+mod ack_split {
+    use super::{acks_owed, broker_refusal, AcksOwed, AnyClient, Client, Closer, Transport};
+    use super::{TryMutant, Walk};
+    use crate::proto::{
+        decode_request, encode_response, read_frame, Request, Response, ERR_BAD_SUBJECT,
+    };
+    use astream_wire::Frame;
+    use std::collections::VecDeque;
+    use std::io::{self, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Every wait here is bounded by this HANG DETECTOR, never by a latency budget.
+    const HANG: Duration = Duration::from_secs(60);
+
+    /// One read of a [`Trickle`].
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// Hand out at most this many bytes.
+        Give(usize),
+        /// Answer `WouldBlock`: what a non-blocking socket with nothing to give answers.
+        Dry,
+        /// Answer `TimedOut`: what a read timeout answers on Windows, and what a dead
+        /// TCP connection (`ETIMEDOUT`) answers on any host.
+        Lapse,
+    }
+
+    /// One end of an in-memory connection whose reads follow a script, one step per
+    /// read; past the script every read hands out all that is left, and then EOF (a
+    /// blocking stream that has it all). Every byte written lands in `written`.
+    struct Trickle {
+        bytes: VecDeque<u8>,
+        script: VecDeque<Step>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = match self.script.pop_front() {
+                Some(Step::Dry) => return Err(io::ErrorKind::WouldBlock.into()),
+                Some(Step::Lapse) => return Err(io::ErrorKind::TimedOut.into()),
+                Some(Step::Give(n)) => n,
+                None => usize::MAX,
+            };
+            let n = n.min(buf.len()).min(self.bytes.len());
+            for (slot, byte) in buf.iter_mut().zip(self.bytes.drain(..n)) {
+                *slot = byte;
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn frame(r: &Response) -> Vec<u8> {
+        Frame::new(encode_response(r)).encode().unwrap()
+    }
+
+    fn ack(offset: u64) -> Vec<u8> {
+        frame(&Response::PublishAck {
+            offset,
+            deduped: false,
+        })
+    }
+
+    /// What [`owing_three`]'s client is owed, in order — an ack, the second publish's
+    /// refusal, the commit's ack — with each frame's length, and then the reply to the
+    /// blocking commit sent after them.
+    fn replies() -> (Vec<u8>, [usize; 3]) {
+        let owed = [
+            ack(10),
+            frame(&Response::Error {
+                code: ERR_BAD_SUBJECT,
+                msg: "bad subject \"no-slash\"".to_string(),
+            }),
+            ack(12),
+        ];
+        let lens = [owed[0].len(), owed[1].len(), owed[2].len()];
+        let mut bytes = owed.concat();
+        bytes.extend_from_slice(&ack(13));
+        (bytes, lens)
+    }
+
+    /// A client on a [`Trickle`] playing `script` over [`replies`], which has
+    /// pipelined two publishes and a commit and read nothing yet.
+    fn owing_three(script: Vec<Step>) -> (Client<Trickle>, Arc<Mutex<Vec<u8>>>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut c = Client::from_stream(Trickle {
+            bytes: replies().0.into(),
+            script: script.into(),
+            written: Arc::clone(&written),
+        });
+        c.send_publish(1, 1, "/o/a", b"one").unwrap();
+        c.send_publish(1, 2, "no-slash", b"two").unwrap();
+        c.send_commit("g", 1).unwrap();
+        assert_eq!(
+            c.owed_acks(),
+            3,
+            "the commit owes its ack as each publish does"
+        );
+        (c, written)
+    }
+
+    /// An answer as the tests compare it: the ack, or the refusal's code (`None` for
+    /// an error that is not a refusal).
+    type Answer = Result<(u64, bool), Option<u8>>;
+
+    fn answer(r: io::Result<(u64, bool)>) -> Answer {
+        r.map_err(|e| broker_refusal(&e).map(|r| r.code))
+    }
+
+    /// The three owed answers, in order.
+    const OWED: [Answer; 3] = [Ok((10, false)), Err(Some(ERR_BAD_SUBJECT)), Ok((12, false))];
+
+    /// Try until the three owed answers are in hand, counting the `None`s before each.
+    fn try_the_three(c: &mut Client<Trickle>) -> (Vec<Answer>, [usize; 3]) {
+        let mut answers = Vec::new();
+        let mut nones = [0usize; 3];
+        while c.owed_acks() > 0 {
+            let at = answers.len();
+            assert!(at < 3, "three owed, answered: {answers:?}");
+            match c.try_recv_publish_ack() {
+                Ok(None) => nones[at] += 1,
+                Ok(Some(a)) => answers.push(Ok(a)),
+                Err(e) => answers.push(answer(Err(e))),
+            }
+        }
+        (answers, nones)
+    }
+
+    /// Every request a [`Trickle`] was sent, decoded.
+    fn requests(written: &Mutex<Vec<u8>>) -> Vec<Request> {
+        let bytes = written.lock().unwrap().clone();
+        let mut at = &bytes[..];
+        let mut out = Vec::new();
+        while let Some(p) = read_frame(&mut at).unwrap() {
+            out.push(decode_request(&p).expect("a request this client wrote"));
+        }
+        out
+    }
+
+    /// The owed-ack refusal a request behind `owed` unread acks must get.
+    fn assert_refused_owing(what: &str, e: &io::Error, owed: u64) {
+        assert_eq!(acks_owed(e), Some(&AcksOwed { owed }), "{what}: {e:?}");
+    }
+
+    /// **A TRY FINISHES THE FRAME IT BEGAN, WHEREVER THE STREAM STOPS.** Every byte of
+    /// the three owed replies comes in a read of its own, with a dry read before each:
+    /// the tries answer one `None` per byte of each frame and then the frame's own
+    /// answer — the first ack, the second publish's refusal (which pays its ack and
+    /// leaves the client in step), the commit's ack — and the client owes nothing.
+    /// A try with nothing owed is `InvalidInput` and reads nothing, so the blocking
+    /// commit after it reads its own reply; the stream carries the two publishes and
+    /// the two commits.
+    #[test]
+    fn a_try_finishes_the_frame_it_began_wherever_the_stream_stops() {
+        let (_, lens) = replies();
+        let owed_bytes: usize = lens.iter().sum();
+        let script = (0..owed_bytes)
+            .flat_map(|_| [Step::Dry, Step::Give(1)])
+            .collect();
+        let (mut c, written) = owing_three(script);
+        let (answers, nones) = try_the_three(&mut c);
+        assert_eq!(answers, OWED, "each owed reply, in order");
+        assert_eq!(
+            nones, lens,
+            "one None per byte of each frame, then its answer"
+        );
+
+        let e = c.try_recv_publish_ack().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert_eq!(c.commit("g", 3).unwrap(), 13, "in step: its own reply");
+        let reqs = requests(&written);
+        assert!(
+            matches!(
+                reqs[..],
+                [
+                    Request::Publish { .. },
+                    Request::Publish { .. },
+                    Request::Commit { upto: 1, .. },
+                    Request::Commit { upto: 3, .. },
+                ]
+            ),
+            "{reqs:?}"
+        );
+    }
+
+    /// **NEGATIVE CONTROL: A TRY ON THE BLOCKING READ TEARS THE FRAME.** The same
+    /// replies, every byte in a read of its own with a dry read before it (and one
+    /// after the last), read by a try built on `proto::read_frame`
+    /// (`TryMutant::Torn`), whose `read_exact` drops the header byte it had when a dry
+    /// read stopped it: every byte of the three owed replies is eaten, each read as
+    /// "not yet", and the first answer the client hands back is the reply queued AFTER
+    /// them — the blocking commit's, taken, with no error, for the first publish's ack.
+    #[test]
+    fn torn_a_try_on_the_blocking_read_answers_a_later_reply_for_the_first_ack() {
+        let (_, lens) = replies();
+        let owed_bytes: usize = lens.iter().sum();
+        let script = (0..owed_bytes)
+            .flat_map(|_| [Step::Dry, Step::Give(1)])
+            .chain([Step::Dry])
+            .collect();
+        let (mut c, _written) = owing_three(script);
+        c.try_mutant = TryMutant::Torn;
+        let started = Instant::now();
+        let first = loop {
+            assert!(started.elapsed() < HANG, "hang detector");
+            if let Some(a) = c.try_recv_publish_ack().map_err(|e| e.kind()).transpose() {
+                break a;
+            }
+        };
+        assert_eq!(
+            first,
+            Ok((13, false)),
+            "the reply queued after the three owed acks"
+        );
+        assert_eq!(c.owed_acks(), 2, "and it paid the first owed ack with it");
+    }
+
+    /// **A BLOCKING READ FINISHES A FRAME A TRY BEGAN, AT EVERY SPLIT.** For every split
+    /// of the first ack, a try reads its first part and answers `None`, and
+    /// `recv_publish_ack` finishes it; the two after it are read blocking too. A read
+    /// that brings a frame and a half answers the frame, KEEPS the half — the next try
+    /// answers `None` on a dry read rather than tearing it — and the blocking read
+    /// finishes the half. A stream that closes part-way through a frame a try began is
+    /// `UnexpectedEof`, latches the client and zeroes what it owes.
+    #[test]
+    fn a_blocking_read_finishes_a_frame_a_try_began() {
+        let (bytes, lens) = replies();
+        for k in 1..lens[0] {
+            let (mut c, _) = owing_three(vec![Step::Give(k), Step::Dry]);
+            assert_eq!(c.try_recv_publish_ack().unwrap(), None, "split at {k}");
+            let rest: Vec<_> = (0..3).map(|_| answer(c.recv_publish_ack())).collect();
+            assert_eq!(rest, OWED, "split at {k}");
+        }
+
+        let half = lens[0] + lens[1] / 2;
+        let (mut c, _) = owing_three(vec![Step::Give(half), Step::Dry]);
+        assert_eq!(c.try_recv_publish_ack().unwrap(), Some((10, false)));
+        assert_eq!(c.try_recv_publish_ack().unwrap(), None, "the half is kept");
+        assert_eq!(answer(c.recv_publish_ack()), OWED[1]);
+        assert_eq!(
+            answer(c.try_recv_publish_ack().map(Option::unwrap)),
+            OWED[2]
+        );
+
+        let mut c = Client::from_stream(Trickle {
+            bytes: bytes[..5].to_vec().into(),
+            script: vec![Step::Give(5), Step::Dry].into(),
+            written: Arc::new(Mutex::new(Vec::new())),
+        });
+        c.send_publish(1, 1, "/o/a", b"one").unwrap();
+        assert_eq!(c.try_recv_publish_ack().unwrap(), None);
+        let e = c.try_recv_publish_ack().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+        assert_eq!(c.owed_acks(), 0, "latched: nothing it owed can be paid");
+        let e = c.try_recv_publish_ack().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "{e}");
+    }
+
+    /// **A TIMEOUT IS "NOT YET" ONLY WHERE A READ TIMEOUT CAN HAVE FIRED.** A client made
+    /// `from_stream` reads as its stream reads, so a read that answers `TimedOut` — a
+    /// read timeout, as Windows reports one — is "not yet": the try answers `None`,
+    /// owing what it owed, and the next try the ack. A client that switches its socket
+    /// non-blocking itself (here the same stream, given a mode switch that does nothing,
+    /// in place of the socket a constructor reaches) has no read timeout that could
+    /// fire: a dry read is still `None`, but a `TimedOut` is the connection's own
+    /// (`ETIMEDOUT`, retransmission or keepalive giving up on the peer), so the try
+    /// returns it as the failure it is and latches the client, owing nothing.
+    #[test]
+    fn a_timeout_is_not_yet_only_where_a_read_timeout_can_fire() {
+        let (mut c, _) = owing_three(vec![Step::Lapse]);
+        assert_eq!(c.try_recv_publish_ack().unwrap(), None, "a read timeout");
+        assert_eq!(c.owed_acks(), 3, "a None pays nothing");
+        assert_eq!(c.try_recv_publish_ack().unwrap(), Some((10, false)));
+
+        let (c, _) = owing_three(vec![Step::Dry, Step::Lapse]);
+        let mut c = c.nowait_by(|_, _| Ok(()));
+        assert_eq!(c.try_recv_publish_ack().unwrap(), None, "a dry read");
+        let e = c.try_recv_publish_ack().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "the connection's: {e}");
+        assert_eq!(c.owed_acks(), 0, "latched: nothing it owed can be paid");
+        let e = c.try_recv_publish_ack().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "{e}");
+    }
+
+    /// **A BROKER THAT ANSWERED AND HUNG UP IS STILL READ.** Over a real socket pair
+    /// (the typed Unix client's own mode switch): two acks are written and the far end
+    /// shut down before the client reads; the tries switch a socket whose peer is gone
+    /// into and out of non-blocking mode, answer both acks, and then report the close as
+    /// `UnexpectedEof`, which latches the client.
+    #[cfg(unix)]
+    #[test]
+    fn a_broker_that_answered_and_hung_up_is_still_read() {
+        use std::os::unix::net::UnixStream;
+        let (near, mut far) = UnixStream::pair().unwrap();
+        let mut c = Client::from_stream(near).nowait_by(UnixStream::set_nonblocking);
+        c.send_publish(1, 1, "/o/a", b"one").unwrap();
+        c.send_publish(1, 2, "/o/a", b"two").unwrap();
+        c.send_publish(1, 3, "/o/a", b"three").unwrap();
+        far.write_all(&[ack(0), ack(1)].concat()).unwrap();
+        far.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(far);
+        assert_eq!(c.try_recv_publish_ack().unwrap(), Some((0, false)));
+        assert_eq!(c.try_recv_publish_ack().unwrap(), Some((1, false)));
+        let e = c.try_recv_publish_ack().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+        assert_eq!(c.owed_acks(), 0);
+    }
+
+    /// A connection a case opens, and the [`Closer`] on its socket that the hang
+    /// detector shuts it down with and a subscription's read is bounded by.
+    type Dialed<S> = (Client<S>, Arc<Closer>);
+
+    /// The keys a broker served with static identity is reached with — this client's
+    /// key and the broker's host key — which only its typed constructor takes
+    /// ([`Client::connect_tcp_identity`]; no [`Transport`] names it).
+    #[cfg(feature = "identity")]
+    type IdentityKeys = (
+        astream_aead::IdentityKeypair,
+        [u8; astream_aead::ID_PUB_LEN],
+    );
+
+    /// A served broker, and how to reach it: [`super::connect`] over one transport, as
+    /// aterm does, which hands back an erased [`AnyClient`] beside its [`Closer`]; or a
+    /// typed constructor, whose client switches its own socket's mode
+    /// ([`Nowait::Stream`](super::Nowait::Stream)).
+    struct Served {
+        _root: crate::test_scratch::Scratch,
+        broker: crate::Broker,
+        _handle: crate::BrokerHandle,
+        /// The transport `connect` reaches it over; `None` for a broker no
+        /// [`Transport`] names (static identity).
+        transport: Option<Transport>,
+        /// The keys a broker served with static identity is reached with.
+        #[cfg(feature = "identity")]
+        identity: Option<Box<IdentityKeys>>,
+        endpoint: String,
+    }
+
+    impl Served {
+        /// A fresh broker in a scratch directory of its own, served by `serve`, which
+        /// answers its handle, the transport `connect` reaches it over, and where.
+        fn on(
+            tag: &str,
+            serve: impl FnOnce(
+                &crate::Broker,
+                &std::path::Path,
+            ) -> (crate::BrokerHandle, Option<Transport>, String),
+        ) -> Served {
+            let root = crate::test_scratch::Scratch::new(tag);
+            let broker = crate::Broker::open(root.path().join("log")).unwrap();
+            let (handle, transport, endpoint) = serve(&broker, root.path());
+            Served {
+                _root: root,
+                broker,
+                _handle: handle,
+                transport,
+                #[cfg(feature = "identity")]
+                identity: None,
+                endpoint,
+            }
+        }
+
+        /// On a Unix socket, as aterm's bus is served.
+        #[cfg(unix)]
+        fn unix(tag: &str) -> Served {
+            Served::on(tag, |broker, dir| {
+                let sock = dir.join("sock");
+                let handle = broker.serve(&sock).unwrap();
+                let endpoint = sock.to_string_lossy().into_owned();
+                (handle, Some(Transport::Unix), endpoint)
+            })
+        }
+
+        /// On plaintext TCP, on loopback: the transport every platform has.
+        fn tcp(tag: &str) -> Served {
+            Served::on(tag, |broker, _| {
+                let handle = broker.serve_tcp("127.0.0.1:0").unwrap();
+                let endpoint = handle.tcp_addr().expect("a TCP listener").to_string();
+                (handle, Some(Transport::Tcp), endpoint)
+            })
+        }
+
+        /// On the sealed wire: the record layer between the client and its socket.
+        #[cfg(feature = "aead")]
+        fn sealed(tag: &str) -> Served {
+            let key = [7u8; astream_aead::KEY_LEN];
+            Served::on(tag, |broker, _| {
+                let handle = broker.serve_tcp_sealed("127.0.0.1:0", key).unwrap();
+                let endpoint = handle.tcp_addr().expect("a TCP listener").to_string();
+                (handle, Some(Transport::Sealed(Box::new(key))), endpoint)
+            })
+        }
+
+        /// On the sealed wire behind the forward-secret handshake: the same record
+        /// layer, under a session key the two ends agreed.
+        #[cfg(feature = "handshake")]
+        fn handshake(tag: &str) -> Served {
+            let psk = [9u8; astream_aead::KEY_LEN];
+            Served::on(tag, |broker, _| {
+                let handle = broker.serve_tcp_handshake("127.0.0.1:0", psk).unwrap();
+                let endpoint = handle.tcp_addr().expect("a TCP listener").to_string();
+                (handle, Some(Transport::Handshake(Box::new(psk))), endpoint)
+            })
+        }
+
+        /// On the sealed wire behind static identity: the broker allow-lists one client
+        /// key and presents a host key that client pins.
+        #[cfg(feature = "identity")]
+        fn identity(tag: &str) -> Served {
+            let host = astream_aead::IdentityKeypair::generate();
+            let host_pub = host.public();
+            let client = astream_aead::IdentityKeypair::generate();
+            let client_pub = client.public();
+            let mut s = Served::on(tag, |broker, _| {
+                let handle = broker
+                    .serve_tcp_identity("127.0.0.1:0", host, vec![client_pub])
+                    .unwrap();
+                let endpoint = handle.tcp_addr().expect("a TCP listener").to_string();
+                (handle, None, endpoint)
+            });
+            s.identity = Some(Box::new((client, host_pub)));
+            s
+        }
+
+        /// A connection through [`super::connect`]: an [`AnyClient`], as aterm's bridge
+        /// has one.
+        fn dial(&self) -> Dialed<Box<dyn super::AnyStream>> {
+            let transport = self
+                .transport
+                .as_ref()
+                .expect("connect dials no identity transport");
+            let (c, closer): (AnyClient, Closer) =
+                super::connect(transport, &self.endpoint, None).expect("a connection");
+            (c, Arc::new(closer))
+        }
+
+        /// A connection from [`Client::connect`], the typed Unix constructor.
+        #[cfg(unix)]
+        fn typed_unix(&self) -> Dialed<std::os::unix::net::UnixStream> {
+            let c = Client::connect(&self.endpoint).expect("a connection");
+            let closer = Closer::unix(&c.stream).expect("a duplicate of its socket");
+            (c, Arc::new(closer))
+        }
+
+        /// A connection from [`Client::connect_tcp`].
+        fn typed_tcp(&self) -> Dialed<TcpStream> {
+            let c = Client::connect_tcp(self.endpoint.as_str()).expect("a connection");
+            let closer = Closer::tcp(&c.stream).expect("a duplicate of its socket");
+            (c, Arc::new(closer))
+        }
+
+        /// A connection from [`Client::connect_tcp_timeout`].
+        fn typed_tcp_timeout(&self) -> Dialed<TcpStream> {
+            let c =
+                Client::connect_tcp_timeout(self.endpoint.as_str(), HANG).expect("a connection");
+            let closer = Closer::tcp(&c.stream).expect("a duplicate of its socket");
+            (c, Arc::new(closer))
+        }
+
+        /// A connection from [`Client::connect_tcp_sealed`].
+        #[cfg(feature = "aead")]
+        fn typed_sealed(&self) -> Dialed<astream_aead::SealedStream<TcpStream>> {
+            let Some(Transport::Sealed(key)) = &self.transport else {
+                panic!("not served sealed");
+            };
+            let c =
+                Client::connect_tcp_sealed(self.endpoint.as_str(), **key).expect("a connection");
+            let closer = Closer::tcp(c.stream.get_ref()).expect("a duplicate of its socket");
+            (c, Arc::new(closer))
+        }
+
+        /// A connection from [`Client::connect_tcp_handshake`].
+        #[cfg(feature = "handshake")]
+        fn typed_handshake(&self) -> Dialed<astream_aead::SealedStream<TcpStream>> {
+            let Some(Transport::Handshake(psk)) = &self.transport else {
+                panic!("not served behind the handshake");
+            };
+            let c =
+                Client::connect_tcp_handshake(self.endpoint.as_str(), **psk).expect("a connection");
+            let closer = Closer::tcp(c.stream.get_ref()).expect("a duplicate of its socket");
+            (c, Arc::new(closer))
+        }
+
+        /// A connection from [`Client::connect_tcp_identity`].
+        #[cfg(feature = "identity")]
+        fn typed_identity(&self) -> Dialed<astream_aead::SealedStream<TcpStream>> {
+            let Some((client, host)) = self.identity.as_deref() else {
+                panic!("not served behind identity");
+            };
+            let c = Client::connect_tcp_identity(self.endpoint.as_str(), client.clone(), *host)
+                .expect("a connection");
+            let closer = Closer::tcp(c.stream.get_ref()).expect("a duplicate of its socket");
+            (c, Arc::new(closer))
+        }
+    }
+
+    /// Where consumer group `g` resumes: the offset of its first delivery of `/o/a`,
+    /// on a connection of its own.
+    fn group_resumes_at<S: Read + Write>((c, closer): Dialed<S>) -> u64 {
+        closer.set_read_timeout(Some(HANG)).unwrap();
+        let mut sub = c.subscribe_group("g", "/o/a").unwrap();
+        sub.recv().unwrap().expect("a delivery").0
+    }
+
+    /// Run `f`, a call that must not wait, under the HANG DETECTOR: should it park for
+    /// [`HANG`], the connection is shut down through `closer`, so the parked read
+    /// returns and this fails naming `what` — rather than the run hanging.
+    fn unparked<T>(closer: &Arc<Closer>, what: &str, f: impl FnOnce() -> T) -> T {
+        let (done, wait) = mpsc::channel::<()>();
+        let dog = {
+            let closer = Arc::clone(closer);
+            std::thread::spawn(move || {
+                let fired = matches!(
+                    wait.recv_timeout(HANG),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                );
+                if fired {
+                    closer.close();
+                }
+                fired
+            })
+        };
+        let out = f();
+        drop(done);
+        assert!(
+            !dog.join().unwrap(),
+            "{what} waited: the hang detector shut the connection down"
+        );
+        out
+    }
+
+    /// Read every owed ack by TRYING, as a loop with other work would between tries,
+    /// until none is owed: the answers in order. Bounded by the hang detector.
+    fn by_trying<S: Read + Write>(c: &mut Client<S>) -> Vec<(u64, bool)> {
+        let started = Instant::now();
+        let mut got = Vec::new();
+        while c.owed_acks() > 0 {
+            match c.try_recv_publish_ack().expect("an ack") {
+                Some(a) => got.push(a),
+                None => {
+                    assert!(
+                        started.elapsed() < HANG,
+                        "hang detector: {} acks still owed",
+                        c.owed_acks()
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        got
+    }
+
+    /// **A PIPELINED COMMIT OWES ITS ACK AND LANDS AS A COMMIT, IN SEND ORDER.** A
+    /// publish, a commit of group `g` to 0 and a publish are written without a read;
+    /// three acks are owed, so a head query is refused with nothing sent; the acks come
+    /// back in send order — the commit's is its own record's offset, 1, between the
+    /// publishes' 0 and 2 — the head counts the three records, and the group resumes
+    /// past 0: its first delivery is 2, the commit record at 1 being hidden.
+    fn a_pipelined_commit_owes_its_ack_and_lands_between_its_publishes<S: Read + Write>(
+        _: &Served,
+        dial: impl Fn() -> Dialed<S>,
+    ) {
+        let (mut c, _closer) = dial();
+        c.send_publish(1, 1, "/o/a", b"zero").unwrap();
+        c.send_commit("g", 0).unwrap();
+        c.send_publish(1, 2, "/o/a", b"two").unwrap();
+        assert_eq!(c.owed_acks(), 3);
+        assert_refused_owing("fetch", &c.fetch(0, "/o/>", 0).unwrap_err(), 3);
+        let acks: Vec<_> = (0..3).map(|_| c.recv_publish_ack().unwrap()).collect();
+        assert_eq!(acks, [(0, false), (1, false), (2, false)], "in send order");
+        let (_, (_, head)) = c.fetch(0, "/o/>", 0).unwrap();
+        assert_eq!(head, 3, "two publishes and the commit");
+        assert_eq!(group_resumes_at(dial()), 2, "past the commit's upto, 0");
+    }
+
+    /// **NEGATIVE CONTROL: WITHOUT THE GUARD, A FETCH BEHIND A PIPELINED COMMIT TAKES ITS
+    /// ACK.** The owed-ack guard off (`unguarded`): the commit's ack is the next frame on
+    /// the stream, so the head query sent behind it reads that `PublishAck` as its
+    /// reply, fails `InvalidData`, and latches the client; the count is what keeps a
+    /// request that reads its own reply off a commit's ack.
+    fn without_the_guard_a_fetch_behind_a_pipelined_commit_takes_its_ack<S: Read + Write>(
+        _: &Served,
+        dial: impl Fn() -> Dialed<S>,
+    ) {
+        let (mut c, _closer) = dial();
+        c.unguarded = true;
+        c.send_commit("g", 0).unwrap();
+        let e = c.fetch(0, "/o/>", 0).unwrap_err();
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::InvalidData,
+            "the commit's ack: {e}"
+        );
+        let e = c.last("/o/>", "", 8).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "latched: {e}");
+    }
+
+    /// **A TRY DOES NOT WAIT FOR AN ACK THE BROKER HOLDS, AND PUTS THE SOCKET BACK.** The
+    /// writer is held after it commits a publish's batch and before it answers it
+    /// (`pause_next_acks`). A try returns `None` under the hang detector, paying
+    /// nothing, and the client is in step (a head query is refused for the owed ack);
+    /// a `send_commit` returns too, and a second try. Once the writer goes on, the
+    /// blocking reads wait for both acks — the socket is blocking again — and the
+    /// commit moved the group. Then a burst of 64 publishes, a commit and a publish
+    /// are read by trying alone, in send order, and the connection is in step after.
+    /// A client that could not reach its socket's mode (one left
+    /// [`Nowait::AsIs`](super::Nowait::AsIs) over a blocking socket) parks in the first
+    /// try until the hang detector shuts it down.
+    fn a_try_does_not_wait_for_an_ack_the_broker_holds<S: Read + Write>(
+        s: &Served,
+        dial: impl Fn() -> Dialed<S>,
+    ) {
+        let (mut c, closer) = dial();
+        let held = s.broker.pause_next_acks();
+        c.send_publish(1, 1, "/o/a", b"held").unwrap();
+        assert!(held.wait_at_most(HANG), "the writer holds the batch's acks");
+        let tried = unparked(&closer, "a try", || c.try_recv_publish_ack());
+        assert_eq!(tried.unwrap(), None);
+        assert_eq!(c.owed_acks(), 1, "a None pays nothing");
+        assert_refused_owing("fetch", &c.fetch(0, "/o/>", 0).unwrap_err(), 1);
+        unparked(&closer, "send_commit", || c.send_commit("g", 0)).unwrap();
+        assert_eq!(c.owed_acks(), 2);
+        let tried = unparked(&closer, "a second try", || c.try_recv_publish_ack());
+        assert_eq!(tried.unwrap(), None);
+        held.resume();
+        assert_eq!(c.recv_publish_ack().unwrap(), (0, false), "the publish's");
+        assert_eq!(c.recv_publish_ack().unwrap(), (1, false), "the commit's");
+        assert_eq!(c.publish(1, 2, "/o/a", b"after").unwrap(), (2, false));
+        assert_eq!(group_resumes_at(dial()), 2, "past the commit's upto, 0");
+
+        for seq in 3..=66 {
+            c.send_publish(1, seq, "/o/a", b"burst").unwrap();
+        }
+        c.send_commit("g", 66).unwrap();
+        c.send_publish(1, 67, "/o/a", b"last").unwrap();
+        let acks = by_trying(&mut c);
+        let want: Vec<_> = (3..=68).map(|off| (off, false)).collect();
+        assert_eq!(
+            acks, want,
+            "64 publishes, the commit at 67, a publish at 68"
+        );
+        let mut seen = 0;
+        c.last_walk("/o/>", "", 8, |_| {
+            seen += 1;
+            Ok(Walk::Continue)
+        })
+        .unwrap();
+        assert_eq!(seen, 1, "in step after the tries: one subject, read whole");
+    }
+
+    /// **NEGATIVE CONTROL: A TRY THAT LEAVES THE SOCKET NON-BLOCKING BREAKS THE NEXT
+    /// WAIT.** The same held ack, read by a try that does not put the socket back
+    /// (`TryMutant::KeepsNowait`): the try answers `None` as before, but the blocking
+    /// read that must wait for the held ack answers `WouldBlock` at once and latches
+    /// the client, so the ack can never be paid. That `WouldBlock` is also what shows
+    /// the try reached the socket the stream reads: the mode it set is the mode the
+    /// stream's next read met.
+    fn a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait<S: Read + Write>(
+        s: &Served,
+        dial: impl Fn() -> Dialed<S>,
+    ) {
+        let (mut c, closer) = dial();
+        c.try_mutant = TryMutant::KeepsNowait;
+        let held = s.broker.pause_next_acks();
+        c.send_publish(1, 1, "/o/a", b"held").unwrap();
+        assert!(held.wait_at_most(HANG), "the writer holds the batch's acks");
+        let tried = unparked(&closer, "a try", || c.try_recv_publish_ack());
+        assert_eq!(tried.unwrap(), None);
+        let e = unparked(&closer, "the blocking read", || c.recv_publish_ack()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+        assert_eq!(c.owed_acks(), 0, "latched: the held ack can never be paid");
+        held.resume();
+    }
+
+    /// Each `$case` as a test of its own, on a fresh broker that `$serve` serves,
+    /// reached through the [`Served`] method `$dial`, in a module named for how the
+    /// client is reached (`ack_split::<module>::<case>`).
+    macro_rules! cases {
+        ($(#[$attr:meta])* $module:ident: $serve:ident, $dial:ident => $($case:ident),+ $(,)?) => {
+            $(#[$attr])*
+            mod $module {
+                use super::Served;
+                $(
+                    #[test]
+                    fn $case() {
+                        let s = Served::$serve(stringify!($module));
+                        super::$case(&s, || s.$dial());
+                    }
+                )+
+            }
+        };
+    }
+
+    // Every case on each transport `connect` dials, each connection an AnyClient whose
+    // try switches the mode of the socket the Closer duplicated: the Unix socket
+    // aterm's bus is served on, plaintext TCP (what every platform has), the sealed
+    // wire, whose record layer keeps a record that partly arrived and the plaintext it
+    // has not handed out, and the same wire behind the forward-secret handshake.
+
+    cases!(#[cfg(unix)] unix: unix, dial =>
+        a_pipelined_commit_owes_its_ack_and_lands_between_its_publishes,
+        without_the_guard_a_fetch_behind_a_pipelined_commit_takes_its_ack,
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    cases!(tcp: tcp, dial =>
+        a_pipelined_commit_owes_its_ack_and_lands_between_its_publishes,
+        without_the_guard_a_fetch_behind_a_pipelined_commit_takes_its_ack,
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    cases!(#[cfg(feature = "aead")] sealed: sealed, dial =>
+        a_pipelined_commit_owes_its_ack_and_lands_between_its_publishes,
+        without_the_guard_a_fetch_behind_a_pipelined_commit_takes_its_ack,
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    cases!(#[cfg(feature = "handshake")] handshake: handshake, dial =>
+        a_pipelined_commit_owes_its_ack_and_lands_between_its_publishes,
+        without_the_guard_a_fetch_behind_a_pipelined_commit_takes_its_ack,
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    // The two that rest on the try's mode switch, on each TYPED constructor, whose
+    // client switches its own socket (`nowait_by`): without that wiring the client is
+    // `AsIs` over a blocking socket, the first case's try parks until the hang
+    // detector shuts it down, and the second's never returns to show `WouldBlock`.
+
+    cases!(#[cfg(unix)] typed_unix: unix, typed_unix =>
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    cases!(typed_tcp: tcp, typed_tcp =>
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    cases!(typed_tcp_timeout: tcp, typed_tcp_timeout =>
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    cases!(#[cfg(feature = "aead")] typed_sealed: sealed, typed_sealed =>
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    cases!(#[cfg(feature = "handshake")] typed_handshake: handshake, typed_handshake =>
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
+
+    cases!(#[cfg(feature = "identity")] typed_identity: identity, typed_identity =>
+        a_try_does_not_wait_for_an_ack_the_broker_holds,
+        a_try_that_leaves_the_socket_non_blocking_breaks_the_next_wait,
+    );
 }

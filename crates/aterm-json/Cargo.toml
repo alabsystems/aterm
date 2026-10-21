@@ -10,13 +10,7 @@ repository.workspace = true
 description = "First-party JSON for aterm: a serde Deserializer/Serializer and an untyped Value (replaces `serde_json` and the `zmij` float formatter behind it)"
 
 [dependencies]
-# serde is the ONLY dependency, and it is deliberate — the same reasoning
-# `aterm-toml` records. The typed call sites in this tree are `from_str::<T>`
-# against `#[derive(Deserialize)]` models, so the replacement has to BE a
-# `serde::Deserializer`; a parser that returned a value tree would mean
-# rewriting every model by hand. `serde` is the workspace row: first-party
-# crates/aterm-serde and its derive since docs/AUDIT-third-party-2026-10-15.md
-# SP.6, so this crate's whole graph is aterm's own.
+# `serde` (first-party `crates/aterm-serde`) for typed `Deserialize` support.
 serde = { workspace = true }
 
 [dev-dependencies]
@@ -28,7 +22,5 @@ serde = { workspace = true, features = ["derive"] }
 workspace = true
 
 [lib]
-# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
-# gate while still being linked and executed. Off; doctests are governed
-# separately and still run.
+# Tests live in `tests/` and doctests.
 test = false

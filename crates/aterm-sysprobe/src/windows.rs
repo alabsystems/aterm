@@ -11,6 +11,7 @@
 //! | `NtQuerySystemInformationEx(SystemProcessorPerformanceInformation)` | [`processor_times`] | [`crate::Probe::core_ticks`] |
 //! | `GetSystemCpuSetInformation` | [`cpu_sets`], [`layout_from_cpu_sets`] | [`crate::cpu_layout`], [`crate::withdrawn_cores`] |
 //! | `GlobalMemoryStatusEx`, `K32GetPerformanceInfo` | [`memory_detail_of`] | [`crate::memory_detail`] |
+//! | `K32GetPerformanceInfo` | [`PerformanceInformation64::process_count`] | [`crate::pid_counts`] |
 //! | `NtQuerySystemInformation(SystemPageFileInformation)` | [`page_files`] | swap |
 //! | `NtQuerySystemInformation(SystemProcessInformation)` | [`processes`] | [`crate::processes`] |
 //! | a path's spelling | [`drive_root`], [`drive_is_local`] | [`crate::volume`] |
@@ -261,6 +262,7 @@ pub struct PerformanceInformation64 {
 const _: () = assert!(size_of::<PerformanceInformation64>() == 104);
 const _: () = assert!(offset_of!(PerformanceInformation64, commit_total) == 8);
 const _: () = assert!(offset_of!(PerformanceInformation64, page_size) == 80);
+const _: () = assert!(offset_of!(PerformanceInformation64, process_count) == 92);
 
 fn bytes_at<const N: usize>(b: &[u8], at: usize) -> Option<[u8; N]> {
     b.get(at..at.checked_add(N)?)?.try_into().ok()
@@ -506,6 +508,8 @@ pub fn memory_detail_of(
         pressure: commit_level(&commit, low_memory),
         commit: Some(commit),
         exact: false,
+        counters: None,
+        kernel_available_pct: None,
     })
 }
 
@@ -573,6 +577,9 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
             found.push((
                 ProcessReading {
                     pid: u32::try_from(pid).unwrap_or(u32::MAX),
+                    start: i64_at(rec, offset_of!(ProcessInformation64, create_time))
+                        .and_then(|value| u64::try_from(value).ok())
+                        .filter(|value| *value > 0),
                     ppid: u32::try_from(field(
                         rec,
                         offset_of!(ProcessInformation64, inherited_from_unique_process_id),
@@ -594,6 +601,11 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     state: RunState::Unknown,
                     session_leader: None,
                     has_tty: None,
+                    runnable_ns: None,
+                    peak_footprint: None,
+                    // One system call reads every process at once: the
+                    // caller stamps them all with its time.
+                    read_at: None,
                 },
                 i64_at(rec, offset_of!(ProcessInformation64, create_time)).unwrap_or(0),
             ));

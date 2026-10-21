@@ -156,9 +156,8 @@ fn real_instance_sweep_decision_conforms_for_entire_lease_pid_matrix() {
         "matrix must include both retention outcomes"
     );
 
-    // Negative control: removing a held exact-instance lease recreates the
-    // destructive false-stale policy. The same enabled guard must reject this
-    // post-state and its named invariant must fail.
+    // Negative control: removing a held lease must be rejected by the same
+    // enabled guard and fail its named invariant.
     let held = project_before(&model, Held, false);
     assert!(model.action_enabled(DECIDE_ACTION, &held));
     let destructive = project_after(&held, Remove);
@@ -181,10 +180,8 @@ fn real_instance_sweep_decision_conforms_for_entire_lease_pid_matrix() {
     );
     assert!(!model.check_invariant("HeldNeverRemoved", &destructive));
 
-    // Negative control: the `Missing if !pid_alive => Remove` arm folded into
-    // the fail-closed Keep arm. The shipping decision removes a lease-less
-    // namespace whose PID is dead; keeping it would leak every pre-lease
-    // namespace forever, and the PID-fallback law refuses that.
+    // Negative control: keeping a lease-less namespace whose PID is dead (the
+    // `Missing if !pid_alive => Remove` arm folded into Keep) leaks it forever.
     let legacy_dead = project_before(&model, Missing, false);
     assert_eq!(decide_instance_namespace_sweep(Missing, false), Remove);
     let leaked = project_after(&legacy_dead, Keep);

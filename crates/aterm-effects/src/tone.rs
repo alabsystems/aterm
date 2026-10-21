@@ -117,17 +117,18 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     /// distinct hash streams.
     const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 
-    fn fold(h: u64, c: char) -> u64 {
-        fnv1a_64_extend(h, &(c as u32).to_le_bytes())
+    fn fold(h: u64, cb: &[u8; 4]) -> u64 {
+        fnv1a_64_extend(h, cb)
     }
     fn bucket(h: u64) -> usize {
         (h as usize) & (BUCKETS - 1)
     }
 
     let mut count = 0usize;
-    // Rolling window of the previous two (folded) chars.
-    let mut prev1: Option<char> = None;
-    let mut prev2: Option<char> = None;
+    // Rolling partial hashes of the previous one and two (folded) chars.
+    let mut prev1_h2: Option<u64> = None;
+    let mut prev1_h3: Option<u64> = None;
+    let mut prev2_h3: Option<u64> = None;
     let mut last_was_space = false;
     for raw in text.chars() {
         let c = if raw.is_whitespace() {
@@ -144,27 +145,23 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
                 raw
             }
         };
+        let cb = (c as u32).to_le_bytes();
         // 1-gram.
-        f(bucket(fold(FNV64_OFFSET ^ ORDER_SALT, c)));
+        f(bucket(fold(FNV64_OFFSET ^ ORDER_SALT, &cb)));
         count += 1;
         // 2-gram ending here.
-        if let Some(p1) = prev1 {
-            f(bucket(fold(
-                fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(2), p1),
-                c,
-            )));
+        if let Some(h2_p1) = prev1_h2 {
+            f(bucket(fold(h2_p1, &cb)));
             count += 1;
             // 3-gram ending here.
-            if let Some(p2) = prev2 {
-                f(bucket(fold(
-                    fold(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(3), p2), p1),
-                    c,
-                )));
+            if let Some(h3_p2_p1) = prev2_h3 {
+                f(bucket(fold(h3_p2_p1, &cb)));
                 count += 1;
             }
         }
-        prev2 = prev1;
-        prev1 = Some(c);
+        prev2_h3 = prev1_h3.map(|h3_p1| fold(h3_p1, &cb));
+        prev1_h3 = Some(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(3), &cb));
+        prev1_h2 = Some(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(2), &cb));
     }
     count
 }
@@ -323,40 +320,53 @@ impl ToneModel {
         })
     }
 
-    /// Softmax scores in [`Tone::ALL`] order, or `None` when the text is too
-    /// short ([`MIN_NGRAMS`]). Pure, deterministic, allocation-free (state lives
-    /// in `s`).
-    pub fn scores(&self, text: &str, s: &mut ToneScratch) -> Option<[f32; TONE_COUNT]> {
+    /// Compute the raw output logits into `s.logits`, returning `false` when
+    /// the text has fewer than [`MIN_NGRAMS`] character n-grams.
+    fn compute_logits(&self, text: &str, s: &mut ToneScratch) -> bool {
         s.sum = [0.0; EMBED];
-        let emb = &self.emb;
+        let emb_rows = self.emb.as_chunks::<EMBED>().0;
         let n = for_each_ngram_bucket(text, |bucket| {
-            let row = bucket * EMBED;
             // Masking keeps `bucket < BUCKETS`, so this never misses.
-            if let Some(chunk) = emb.get(row..row + EMBED) {
+            if let Some(chunk) = emb_rows.get(bucket) {
                 for (acc, &w) in s.sum.iter_mut().zip(chunk) {
                     *acc += w;
                 }
             }
         });
         if n < MIN_NGRAMS {
-            return None;
+            return false;
         }
         let inv = 1.0 / n as f32;
-        // Hidden layer: tanh(b1 + e·W1).
-        for (j, h) in s.hid.iter_mut().enumerate() {
-            let mut acc = self.b1[j];
-            for (i, &e) in s.sum.iter().enumerate() {
-                acc += e * inv * self.w1[i * HIDDEN + j];
-            }
-            *h = acc.tanh();
+        for e in &mut s.sum {
+            *e *= inv;
         }
-        // Output logits.
-        for (c, l) in s.logits.iter_mut().enumerate() {
-            let mut acc = self.b2[c];
-            for (j, &h) in s.hid.iter().enumerate() {
-                acc += h * self.w2[j * TONE_COUNT + c];
+        // Hidden layer: tanh(b1 + e·W1), accumulated row-wise for cache locality
+        // and auto-vectorization in the exact `i = 0..EMBED` addition order.
+        s.hid.copy_from_slice(&self.b1);
+        for (row, &e) in self.w1.as_chunks::<HIDDEN>().0.iter().zip(&s.sum) {
+            for (h, &w) in s.hid.iter_mut().zip(row) {
+                *h += e * w;
             }
-            *l = acc;
+        }
+        for h in &mut s.hid {
+            *h = h.tanh();
+        }
+        // Output logits, accumulated row-wise in the exact `j = 0..HIDDEN` order.
+        s.logits.copy_from_slice(&self.b2);
+        for (row, &h) in self.w2.as_chunks::<TONE_COUNT>().0.iter().zip(&s.hid) {
+            for (l, &w) in s.logits.iter_mut().zip(row) {
+                *l += h * w;
+            }
+        }
+        true
+    }
+
+    /// Softmax scores in [`Tone::ALL`] order, or `None` when the text is too
+    /// short ([`MIN_NGRAMS`]). Pure, deterministic, allocation-free (state lives
+    /// in `s`).
+    pub fn scores(&self, text: &str, s: &mut ToneScratch) -> Option<[f32; TONE_COUNT]> {
+        if !self.compute_logits(text, s) {
+            return None;
         }
         // Softmax (max-shifted for stability).
         let mut mx = f32::NEG_INFINITY;
@@ -382,10 +392,12 @@ impl ToneModel {
     /// A host that caches a mood uses this, so an evidence-thin window (a
     /// one-char line after Enter) leaves the prior verdict standing.
     pub fn classify_opt(&self, text: &str, s: &mut ToneScratch) -> Option<Tone> {
-        let scores = self.scores(text, s)?;
+        if !self.compute_logits(text, s) {
+            return None;
+        }
         let mut best = 0usize;
-        for (i, &p) in scores.iter().enumerate() {
-            if p > scores[best] {
+        for (i, &l) in s.logits.iter().enumerate() {
+            if l > s.logits[best] {
                 best = i;
             }
         }

@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// The one-future, one-thread executor the native GPU init path runs on.
-//
-// wgpu's adapter/device acquisition is `async` for the browser's sake;
-// natively there is exactly one future, driven to completion on the calling
-// thread.
-//
-// Both cases the GPU path hits are supported:
-//   * a future already `Ready` on its first poll returns without touching the
-//     condvar (e.g. wgpu-core's `push_error_scope().pop()`);
-//   * a future whose waker fires from another thread (wgpu's driver-thread
-//     callbacks) wakes this one exactly once.
-//
-// The waiter consumes the wake flag, so a wake that arrives during a poll,
-// before the thread reaches the wait, is not lost: the next `wait()` sees the
-// latch set and returns immediately.
+// The one-future, one-thread executor native GPU init runs on (wgpu's
+// adapter/device acquisition is `async` for the browser's sake). A future Ready on
+// its first poll never touches the condvar. A wake from another thread (wgpu's
+// driver callbacks) or from inside `poll` sets a latch the waiter consumes, so a
+// wake that lands before the wait is not lost.
 
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -40,9 +30,8 @@ impl Signal {
     /// Latch a wake and release the waiter (if any). Called from arbitrary
     /// threads, including this one, including re-entrantly from inside `poll`.
     fn notify(&self) {
-        // A poisoned lock cannot corrupt a `bool`: nothing here can panic while
-        // the guard is held, so the only way to see poison is a panic in the
-        // *waiter's* poll, which is already unwinding out of `block_on`.
+        // Nothing panics while this guard is held, and poison cannot corrupt a
+        // `bool`, so poison is ignored.
         let mut woken = self.woken.lock().unwrap_or_else(PoisonError::into_inner);
         *woken = true;
         drop(woken);
@@ -51,12 +40,11 @@ impl Signal {
         self.cv.notify_one();
     }
 
-    /// Block until a wake is latched, then CONSUME the latch.
+    /// Block until a wake is latched, then consume the latch.
     fn wait(&self) {
         let mut woken = self.woken.lock().unwrap_or_else(PoisonError::into_inner);
         while !*woken {
-            // Condvar waits are permitted to return spuriously, hence the loop
-            // around the predicate rather than a bare wait.
+            // Condvar waits may return spuriously.
             woken = self.cv.wait(woken).unwrap_or_else(PoisonError::into_inner);
         }
         *woken = false;
@@ -119,8 +107,8 @@ mod tests {
         assert_eq!(polls.load(Ordering::Relaxed), 1);
     }
 
-    /// A future that parks and is woken from ANOTHER thread — the adapter /
-    /// device callback shape.
+    /// A future that parks and is woken from another thread (the adapter/device
+    /// callback shape).
     #[test]
     fn wakes_from_another_thread() {
         #[derive(Default)]

@@ -2,40 +2,78 @@
 // Copyright 2026 Andrew Yates
 
 //! `codex-alab-proof [--package DIR] [--aterm PATH] [--keep]`: the codex-alab
-//! native harness, end to end (its contract, `alab/CONTRACT.md` §9.3), against
-//! the REAL package in a private headless aterm sandboxed to one loopback port
-//! where the lab answers as the model ([`crate::codex_rig`]): no key, no
-//! account, no byte off the machine, nothing of the owner's touched.
+//! native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and
+//! FOREVER CRUISE / FOREVER LAND, the owner's ruling of 2026-10-19 its §5
+//! ports), against the REAL package in a private headless aterm sandboxed to
+//! one loopback port where the lab answers as the model ([`crate::codex_rig`],
+//! [`crate::codex_alab_model`]): no key, no account, no byte off the machine,
+//! nothing of the owner's touched.
 //!
 //! The package is linked as the owner links it (`aterm pkg link codex <pkg>
 //! bin/codex` under the scratch HOME), so a tab's `codex` is atpkg's twin, and
 //! every leg is a tab of ONE instance whose `[harness]` is on (headless,
 //! `human_grace_s = 5`). Each leg's prompt names it (`LEG-<name>`), and the
-//! fake model answers by that name ([`answer`]), as the scenario kit of the
-//! codex-alab end-to-end run did (its `continue`, `approval`, `usage-limit`,
-//! question and crash scenarios, ported step for step):
+//! fake model answers by that name and by the act codex-alab typed, told by
+//! aterm's own words ([`crate::codex_alab_model::step_of`]). Nothing ends a
+//! task by a token any more: `ATERM-TASK-DONE` is a done claim like any, and
+//! only Land lands, at a clean `Nothing left:` defense over a clean folder.
+//! codex-alab backs off after a short turn (2, 4, 8 … minutes; a done claim is
+//! short whatever it worked) and has no knob for it, so a leg that must see
+//! one act after another answers with a turn of real work
+//! ([`crate::codex_alab_model::SLOW_TURN`]) rather than sleeping through the
+//! ladder. Every prompt the lab types is a control write, which never stamps
+//! aterm's `human_ms`, save the `exchange` leg's, typed through aterm's
+//! development seam `send|key as=person`: the one person's own exchange here.
+//! The legs:
 //!
-//! * `first` (the instance's FIRST session): the claim is proven
-//!   (`supervisor_proven=1`) and aterm's lane parks (its host only watches);
-//!   one reply ending `ATERM-TASK-DONE` is the done stop (`finished@v1`, no
-//!   continuation). Then the crash rule: `SIGKILL` → relaunched on its
-//!   conversation and proven again; the relaunched one `SIGKILL`ed as soon as
-//!   its claim is proven (before its record may have been written) →
-//!   relaunched again.
-//! * `continue`: a turn that ends without the done mark gets `continue@v1`
-//!   (the `continue_text`, `keep going`); the next reply's done mark stops it.
-//!   Later the re-exec upgrade: the package re-linked to a copy of itself
-//!   (another path, the same bytes) moves the running codex-alab onto it
-//!   (`upgrade@v1`, its record's `execGeneration` up and its `exe` the copy's),
-//!   proven again.
+//! * `first` (the instance's FIRST session, Cruise): the claim is proven
+//!   (`supervisor_proven=1`) and aterm's lane parks (its host only watches).
+//!   Its reply ends on the retired token alone: a done claim, owed Cruise's
+//!   defend-and-find-more prompt (`continue-done-check@v1`, aterm's
+//!   `DONE_CHECK` words), never `finished@v1` nor `landed@v1`, and the model
+//!   is asked again; its answer, a clean `Nothing left:` defense, lands
+//!   nothing under Cruise and is owed the next defend prompt (four minutes
+//!   on). Then the crash rule, WHILE THAT ACT IS OWED AT REST: `SIGKILL` →
+//!   relaunched on its conversation and proven again; the relaunched one
+//!   `SIGKILL`ed as soon as its claim is proven (before its record may have
+//!   been written) → relaunched again; the owed defend prompt still comes on
+//!   time (the Cruise check at the end).
+//! * `needs` (Cruise): a report carrying `NEEDS YOU: <need>` raises
+//!   `attention owner=needs kind=ask` on the tab at once (`meta
+//!   attention_kinds=`, `status needs=ask`) while the next act is still typed
+//!   (`continue@v1`, carrying aterm's NEEDS YOU ack): never blocked. The
+//!   report to it names no need at all, which withdraws none: the need stays
+//!   up; the report after that says `NEEDS YOU: nothing`, which takes it
+//!   down.
+//! * `continue` (Cruise): a turn that ends without a done claim gets
+//!   `continue@v1` (aterm's Cruise continuation, `keep going`); the next
+//!   reply's token ends nothing. Later the re-exec upgrade: the package
+//!   re-linked to a copy of itself (another path, the same bytes) moves the
+//!   running codex-alab onto it (`upgrade@v1`, its record's `execGeneration`
+//!   up and its `exe` the copy's), proven again.
 //! * `approval`: an escalated `exec_command` under `on-request` is approved
 //!   once (`approve-all@v1`) and runs.
-//! * `question`: a `request_user_input` overlay is answered with its
-//!   `(Recommended)` option (`answer-recommended@v1`).
-//! * `usage`: the model's 429 `usage_limit_reached` is waited out: nothing is
-//!   sent before `resets_at` + 60 s, then `usage-resume@v1` continues.
-//! * `hold`: a hold put on the tab while its first turn runs keeps the claim
-//!   and stops the continuation while it stands; lifted, `continue@v1`.
+//! * `question` (Land): a `request_user_input` overlay is answered with its
+//!   `(Recommended)` option (`answer-recommended@v1`, codex-alab's box answer
+//!   under every word); the question in prose after it gets Land's answer
+//!   (`land-answer@v1`, aterm's `LAND_ANSWER` words), never a Cruise answer.
+//! * `off` (Cruise): Autopilot Off (`meta set autopilot off`, the chip's and
+//!   Settings' write) while its first turn, real work, runs: codex-alab gives
+//!   its claim back, and the turn ends INSIDE the Off window, where an act
+//!   falls due at once, yet nothing is typed; a manager tab's `post
+//!   kind=task` puts the mail ALONE over the lab's own bus (a guarded broker
+//!   the lab starts, the instance's `[fabric]` bridge on it): the task in the
+//!   worker's inbox, no request to the model and no `Inbox: task @` on its
+//!   screen. Autopilot back On (`cruise`): codex-alab claims again and the act
+//!   that fell due goes (`continue@v1`).
+//! * `usage`: the model's 429 `usage_limit_reached` is waited out: one 429,
+//!   then no request of any kind before `resets_at` + 60 s, then one
+//!   `usage-resume@v1`, each continuation its own turn (none sent twice). Its
+//!   reply is short, and a wall's act answered short moves no streak (aterm's
+//!   rule), so `continue@v1` follows it at once.
+//! * `hold`: a hold put on the tab while its first turn (real work) runs keeps
+//!   the claim and stops the continuation while it stands; lifted,
+//!   `continue@v1` at once.
 //! * `carry` (codex-alab's carry-on, CONTRACT §5): its first turn is held by
 //!   the model and the codex-alab `SIGKILL`ed mid-turn (its record `busy`,
 //!   its resume line in aterm's copy). The crash rule relaunches it under
@@ -44,52 +82,102 @@
 //!   launch probe (its first `@self status`) sees
 //!   `hand=lease:aterm-harness@<aterm>` and the relaunched process carries
 //!   the interrupted turn on by itself, once (`keep going`, `harness-turn@v1`
-//!   by the relaunched pid), then `finished@v1`. A lease given back as the
-//!   new TUI leads the tab (aterm 0.106.0) is read as `hand=-`: no carry-on,
-//!   and the conversation waits at its prompt.
-//! * all seven at once: five and more codex-alab sessions in one aterm each
-//!   hold a proven claim (each keeps one `subscribe @self` stream).
-//! * `question`, once finished, then Autopilot Off (`meta set autopilot off`,
-//!   the chip's and Settings' write): codex-alab gives its claim back, and a
-//!   manager tab's `post kind=task` puts the mail ALONE over the lab's own bus
-//!   (a guarded broker the lab starts, the instance's `[fabric]` bridge on
-//!   it): the task in the worker's inbox, no turn on its ledger and no `Inbox:
-//!   task @` on its screen. Autopilot back On (`cruise`): codex-alab claims
-//!   again.
+//!   by the relaunched pid); the carried reply's done claim then gets Cruise's
+//!   defend prompt, never `finished@v1`.
+//! * `land` (Land, `meta set autopilot land` before codex starts, in a folder
+//!   that is no repository): `land@v1` is typed, then `land-nudge@v1` at each
+//!   yield that is no clean defense: after real work, after a `Nothing left:`
+//!   defense that names a NEEDS YOU need, after real work, after a defense
+//!   that names a part left for later (its need withdrawn), FOUR nudges (a
+//!   bound under four fails here; no finite run proves there is none); the
+//!   clean defense at the fourth gives `landed@v1` and aterm's `status task=`
+//!   for the self-claimed tab reads `landed` (FOREVER LAND §10.4).
+//! * `reland` (Land, no repository): its first turn is real work, so
+//!   `land@v1` comes at once and its clean defense lands; then NOTHING (no
+//!   request to the model, no act) for 150 s, past the 120 s a codex-alab that
+//!   went on would wait after that short defense; then a person's turn of
+//!   real work reopens it (`task=open`) and codex-alab acts again: a new
+//!   `land@v1`, whose clean defense lands again.
+//! * `repo` (Land, a git repository with a local bare `origin` and an
+//!   uncommitted file): the same clean defense is NOT landed: a nudge follows
+//!   naming the file; the lab commits it without pushing, and the next clean
+//!   defense is NOT landed either: a nudge names the commit the remote main
+//!   lacks; the lab pushes it, and the next defense lands.
+//! * `exchange` (Cruise; `codex` started with no prompt): A PERSON'S OWN
+//!   EXCHANGE. A person's message is typed into codex's composer through
+//!   aterm's development seam `send|key as=person` (a debug or dev-seams
+//!   aterm's: a person's gesture through the window's own input seam, which
+//!   stamps `status human_ms=` as a window keystroke does, where a headless
+//!   lab has no window to key; a build that refuses the seam, or one older
+//!   than it that types the word into the composer, is a failed check that
+//!   names it, as is an Enter that stamped nothing past the send's own
+//!   stamp). The model answers with a
+//!   plain reply of real work, and codex-alab LEAVES THE POINT TO THE PERSON
+//!   (its exchange rule, aterm's `left-to-person@v1`): nothing is asked of the
+//!   model and no act is recorded for a minute past the reply, longer than the
+//!   control's continuation took, with its claim still proven; its journal
+//!   names the rule (`nothing (a person's own exchange: theirs to answer)`);
+//!   aterm's `status task=` reads `theirs` (a proven self-claim's face is told
+//!   only by the acts it records, FOREVER LAND §10.4, so this holds only where
+//!   codex-alab records the point it leaves and aterm tells `theirs` for it;
+//!   the failed check says so); and nothing is typed by the run's end, read
+//!   past the re-exec upgrade, which moves the exchange's codex-alab too: its
+//!   new image resumes the conversation and decides `nothing` at the point.
+//! * `control` (Cruise; the exchange's negative control): the same message
+//!   through the same path as a control write (`send`, `key`), which stamps no
+//!   `human_ms`, answered alike: the point is codex-alab's to go on with
+//!   (`continue@v1` at once, its journal's `act continue@v1`, `task=open`).
+//! * the rollout tap (session log 5G-3): once `first`, `continue`,
+//!   `approval` and `question` are done, each tab's `log kinds=turn`, read
+//!   past the tap's fence (two more asks answered, `status rollout_asks=`:
+//!   every write the tap would make about what the rollout held is in the
+//!   log by then), holds turns from its codex-alab's own rollout
+//!   (`src=transcript`, `rollout=bound`) when the build that rollout names
+//!   is one the session log measured (`CODEX_MEASURED_BUILDS`), and none
+//!   when not (`rollout=unmeasured`); each is printed.
+//! * all fourteen at once: fourteen codex-alab sessions in one aterm each hold
+//!   a proven claim (each keeps one `subscribe @self` stream).
+//! * at the end, every Cruise leg's done claims, from the model's log: each is
+//!   followed by a request carrying the defend prompt, or its back-off has not
+//!   run out yet (pending); none is followed by anything else or by nothing
+//!   past it. No Cruise timeline holds `finished@v1` or `landed@v1`.
 //!
 //! Exit 0 every check held, 1 a check failed, 2 usage, 3 not run (no
 //! codex-alab package: `--package`, `$LAB_CODEX`, or a managed `codex` that is
-//! an ALab build; no aterm). About three minutes before the Autopilot Off step (measured: `docs/measured/codex-alab-proof-2026-10-16.md`), which adds under one; run it alone.
+//! an ALab build; no aterm). About eleven minutes, the Land leg's four nudges
+//! the longest chain (measured:
+//! `docs/measured/codex-alab-proof-2026-10-20.md`); run it alone.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::acts::RULE_UPGRADE;
+use aterm_agent::supervise::policy::turn_end::{RULE_LEFT, says_done};
 use aterm_uds::spawnfd::Stdio;
 
-use crate::codex_rig::{self, Answered, call_item, message_item, request_view};
+use crate::codex_alab_model::{
+    self as model, KEEP_GOING, NEED, NUDGES_BEFORE_DEFENSE, PERSON_ASKS, REOPEN, REPO_COMMIT_HOLD,
+    REPO_PUSH_HOLD, SLOW_TURN,
+};
+use crate::codex_rig;
+use crate::forever::pct_decode;
 use crate::instance::{self, Instance, Launch, World};
 use crate::pyjson::J;
-use crate::screen::field;
+use crate::screen::{composer_row, field};
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
 
-/// The done mark a turn ends a task with.
-const DONE: &str = "ATERM-TASK-DONE";
+/// The act codex-alab records at a landing (never typed).
+const LANDED: &str = "landed@v1";
 
-/// `[harness]`'s continuation text, as aterm's default spells it.
-const KEEP_GOING: &str = "keep going";
+/// The act older codex-alab builds recorded where the retired token ended
+/// the task: nothing records it now.
+const FINISHED: &str = "finished@v1";
 
-/// How long the usage leg's 429 says the window lasts.
-const RESETS_IN_S: i64 = 5;
-
-/// How long the hold leg's first answer is held: the hold lands meanwhile.
-const HOLD_FIRST_TURN: Duration = Duration::from_secs(30);
-
-/// How long the carry leg's first answer is held: never before the kill that
-/// ends that turn (the leg kills it as soon as it is relaunchable).
-const CARRY_FIRST_TURN: Duration = Duration::from_secs(600);
+/// Cruise's defend-and-find-more prompt's act.
+const DEFEND: &str = "continue-done-check@v1";
 
 /// The fleet the lab's own bus names (`/f/lab/…`).
 const FLEET: &str = "lab";
@@ -249,148 +337,6 @@ impl Drop for Fabric {
     }
 }
 
-/// The leg a request belongs to: the `LEG-<name>` its user text names.
-fn leg_of(body: &J) -> Option<String> {
-    let input = body.get("input").and_then(J::as_arr).unwrap_or_default();
-    input
-        .iter()
-        .filter(|it| it.get("role").and_then(J::as_str) == Some("user"))
-        .map(crate::stub::item_text)
-        .find_map(|text| {
-            let (_, rest) = text.split_once("LEG-")?;
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                .collect();
-            (!name.is_empty()).then_some(name)
-        })
-}
-
-/// The usage leg's window: its reset, fixed at its first request.
-static RESETS: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
-
-fn reset_of(leg: &str) -> i64 {
-    let mut resets = RESETS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, at)) = resets.iter().find(|(l, _)| l == leg) {
-        return *at;
-    }
-    let at = crate::util::now_secs() + RESETS_IN_S;
-    resets.push((leg.to_string(), at));
-    at
-}
-
-/// What the fake model answers (module header). A structured side request
-/// (the thread's title) is answered with JSON that fits its schema.
-#[must_use]
-pub fn answer(body: &J) -> Answered {
-    let leg = leg_of(body).unwrap_or_else(|| "-".to_string());
-    let tagged = |mut a: Answered, step: &str| {
-        a.tag = format!("{leg}:{step}");
-        a
-    };
-    let say = |text: &str| Answered::items(vec![message_item(text)]);
-    let format = body.get("text").and_then(|t| t.get("format"));
-    if format.and_then(|f| f.get("type")).and_then(J::as_str) == Some("json_schema") {
-        let schema = format.and_then(|f| f.get("schema"));
-        return tagged(say(&crate::stub::schema_answer(schema)), "side");
-    }
-    let (user, tool) = request_view(body);
-    let asked_on = user.contains(KEEP_GOING);
-    match leg.as_str() {
-        "continue" | "hold" if asked_on => tagged(
-            say(&format!("Continued as asked. All done.\n\n{DONE}")),
-            "after-continue",
-        ),
-        "continue" | "hold" => {
-            let mut a = say("Here is step one of the plan. I will continue when asked.");
-            if leg == "hold" {
-                a.delay = HOLD_FIRST_TURN;
-            }
-            tagged(a, "t1")
-        }
-        "carry" if asked_on => tagged(
-            say(&format!(
-                "Carried on after the relaunch. All done.\n\n{DONE}"
-            )),
-            "after-carry",
-        ),
-        "carry" => {
-            let mut a = say("The long task's first step.");
-            a.delay = CARRY_FIRST_TURN;
-            tagged(a, "t1")
-        }
-        "approval" if tool.is_none() => tagged(
-            Answered::items(vec![call_item(
-                "exec_command",
-                &J::obj([
-                    ("cmd", J::s("echo approved-run >> ran.txt; echo done")),
-                    ("sandbox_permissions", J::s("require_escalated")),
-                    ("justification", J::s("write the marker file")),
-                ]),
-            )]),
-            "call",
-        ),
-        "approval" => tagged(say(&format!("The command ran.\n\n{DONE}")), "after-output"),
-        "question" if tool.is_none() => {
-            let option = |label: &str, description: &str| {
-                J::obj([("label", J::s(label)), ("description", J::s(description))])
-            };
-            tagged(
-                Answered::items(vec![call_item(
-                    "request_user_input",
-                    &J::obj([(
-                        "questions",
-                        J::Arr(vec![J::obj([
-                            ("id", J::s("db_choice")),
-                            ("header", J::s("Database")),
-                            ("question", J::s("Which database should I set up?")),
-                            (
-                                "options",
-                                J::Arr(vec![
-                                    option("SQLite", "A single local file."),
-                                    option(
-                                        "Postgres (Recommended)",
-                                        "A server, closer to production.",
-                                    ),
-                                ]),
-                            ),
-                        ])]),
-                    )]),
-                )]),
-                "ask",
-            )
-        }
-        "question" => tagged(
-            say(&format!("Setting up the chosen database.\n\n{DONE}")),
-            "after-answer",
-        ),
-        "usage" if asked_on => tagged(
-            say(&format!("Resumed after the reset.\n\n{DONE}")),
-            "after-reset",
-        ),
-        "usage" => {
-            let reset = reset_of(&leg);
-            let a = Answered {
-                status: 429,
-                kind: "application/json",
-                body: crate::stub::usage_limit_body("five_hour", reset, Some("plus")).py(),
-                headers: crate::stub::usage_limit_headers("five_hour", reset),
-                delay: Duration::ZERO,
-                tag: String::new(),
-            };
-            tagged(a, &format!("limit resets_at={reset}"))
-        }
-        _ => tagged(
-            say(&format!(
-                "Hello from the lab model. Nothing else to do.\n\n{DONE}"
-            )),
-            "t1",
-        ),
-    }
-}
-
 /// A `codex-package.json` root that carries `alab-build.json`: the package
 /// `given` names (a package directory, or a binary in one), else `$LAB_CODEX`,
 /// else the owner's managed `codex` — the binary its atpkg shim execs (the
@@ -452,6 +398,515 @@ struct Leg {
     /// Its `CODEX_HOME`.
     home: PathBuf,
     proj: PathBuf,
+}
+
+/// The folder a leg's codex starts in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Folder {
+    /// A fresh repository holding one untracked file (`git init`, a
+    /// `README.md`), as every leg had before the Land legs.
+    Scratch,
+    /// No repository at all: Land's probe finds nothing.
+    Plain,
+    /// A repository whose `main` is pushed to a local bare `origin`
+    /// (`origin/HEAD` naming it), then one uncommitted file (`notes.txt`).
+    Origin,
+}
+
+/// The file the repository leg leaves uncommitted.
+const NOTES: &str = "notes.txt";
+
+/// Whether a `meta` reply's attention entries hold the worker's NEEDS YOU
+/// (`attention_kinds=` naming `ask:needs`, pct-encoded or not).
+fn needs_raised(meta: &str) -> bool {
+    field(meta, "attention_kinds")
+        .map(|k| pct_decode(&k))
+        .is_some_and(|k| k.split(',').any(|e| e == "ask:needs"))
+}
+
+/// Whether a `log kinds=act` reply holds the act mark a self-claim's `act`
+/// writes for `holder` (session log phase 6, 6F-7): `<seq> mark <node> act
+/// word=<w> rule=<act, @ .> holder=<holder> harness_act=<act>`, the word
+/// map's ([`aterm_agent::harness::acts::self_claim_act`]; `word=unknown`
+/// and no `rule=` for an act it has no word for), its holder the proven
+/// claim's, which the server read, and the act whole (host tier: the
+/// owner's `log` prints both), as the timeline's `harness-act act=<act>
+/// holder=<holder>` row says it.
+fn acted_in_log(log: &str, act: &str, holder: &str) -> bool {
+    let worded = aterm_agent::harness::acts::self_claim_act(act);
+    let word = worded.as_ref().map_or("unknown", |(w, _)| *w);
+    let rule = worded.as_ref().map(|(_, r)| r.as_str());
+    log.lines()
+        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+        .filter(|l| l.split(' ').nth(3) == Some("act"))
+        .any(|l| {
+            field(l, "word").as_deref() == Some(word)
+                && field(l, "rule").as_deref() == rule
+                && field(l, "holder").as_deref() == Some(holder)
+                && field(l, "harness_act").as_deref() == Some(act)
+        })
+}
+
+/// The task face a `status` line reads (`task=`), `-` where none is named.
+fn task_face(status: &str) -> String {
+    field(status, "task").unwrap_or_else(|| "-".to_string())
+}
+
+/// What a session's codex-alab rollout tap last answered, as `status` says
+/// it (`rollout=<word> rollout_asks=<n>`): the answer's word and how many
+/// asks it answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TapSaid {
+    word: String,
+    asks: u64,
+}
+
+/// The tap's answer a `status` line names; `None` where it names none.
+fn tap_said(status: &str) -> Option<TapSaid> {
+    Some(TapSaid {
+        word: field(status, "rollout")?,
+        asks: field(status, "rollout_asks")?.parse().ok()?,
+    })
+}
+
+/// THE TAP'S FENCE: how many asks past a look the tap answers before every
+/// write it would make about what the rollout held at that look is in the
+/// log. The host's tap thread answers one ask at a time, in order, and
+/// counts each only after its records were applied
+/// (`aterm-gui`'s `codex_rollout_tap::read_once`): the first ask past the
+/// look may have begun before it, the second began after the first ended.
+const FENCE_ASKS: u64 = 2;
+
+/// What reading past the fence found ([`past_the_fence`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Fenced<T> {
+    /// The tap answered [`FENCE_ASKS`] asks past the first look: its answer
+    /// at the first look, its answer then, and the read made then.
+    Past { from: TapSaid, to: TapSaid, got: T },
+    /// No `status` line named a tap answer.
+    NoTap,
+    /// The tap answered too few asks past the first look before the hang
+    /// detector ran out: its answer at that look, and its last.
+    Stuck { from: TapSaid, to: TapSaid },
+}
+
+/// READ PAST THE FENCE (pure over its hands): `look` at the tap's answer,
+/// `wait` (a hang detector, never a latency budget) until it answered
+/// [`FENCE_ASKS`] more, and only then `read`. A read made at once would pass
+/// a tap whose write landed after it.
+fn past_the_fence<T>(
+    mut look: impl FnMut() -> Option<TapSaid>,
+    read: impl FnOnce() -> T,
+    wait: impl FnOnce(&mut dyn FnMut() -> bool) -> Result<bool, Stopped>,
+) -> Result<Fenced<T>, Stopped> {
+    let Some(from) = look() else {
+        return Ok(Fenced::NoTap);
+    };
+    let mut to = from.clone();
+    let past = wait(&mut || {
+        if let Some(now) = look() {
+            to = now;
+        }
+        to.asks >= from.asks.saturating_add(FENCE_ASKS)
+    })?;
+    if !past {
+        return Ok(Fenced::Stuck { from, to });
+    }
+    Ok(Fenced::Past {
+        from,
+        to,
+        got: read(),
+    })
+}
+
+/// THE ROLLOUT LEG'S VERDICT (pure), on the log read past the fence: on a
+/// measured build the tap said `bound` and the log holds a turn from the
+/// rollout (`src=transcript`); on any other the tap said `unmeasured` and
+/// the log holds none.
+fn rollout_holds(measured: bool, said: &TapSaid, turns: &[String]) -> bool {
+    let from_rollout = turns
+        .iter()
+        .filter(|l| l.contains(" src=transcript "))
+        .count();
+    if measured {
+        said.word == "bound" && from_rollout > 0
+    } else {
+        said.word == "unmeasured" && from_rollout == 0
+    }
+}
+
+/// The Land nudges a leg's model log names (`<leg>:nudge<n>[+…]`), in order.
+fn nudges_seen(tags: &[String]) -> Vec<usize> {
+    tags.iter()
+        .filter_map(|t| {
+            let (_, step) = t.split_once(':')?;
+            let n = step.strip_prefix("nudge")?;
+            n.split('+').next()?.parse().ok()
+        })
+        .collect()
+}
+
+/// The `land-nudge@v1` acts of a timeline's acts before its first
+/// `landed@v1` (all of them where none landed).
+fn nudges_before_landing(acts: &[String]) -> usize {
+    acts.iter()
+        .take_while(|a| *a != LANDED)
+        .filter(|a| *a == "land-nudge@v1")
+        .count()
+}
+
+/// The time (unix ms) of the first model request of `rows` whose tag starts
+/// with `tag`.
+fn first_at(rows: &[J], tag: &str) -> Option<i64> {
+    rows.iter()
+        .find(|r| {
+            r.get("tag")
+                .and_then(J::as_str)
+                .is_some_and(|t| t.starts_with(tag))
+        })
+        .and_then(|r| r.get("t").and_then(J::as_i64))
+}
+
+/// `ms` as seconds with one decimal, for a leg's evidence line.
+fn secs(ms: i64) -> String {
+    format!("{:.1} s", ms as f64 / 1000.0)
+}
+
+/// The last `n` characters of `text`.
+fn tail(text: &str, n: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars[chars.len().saturating_sub(n)..].iter().collect()
+}
+
+/// `d` in milliseconds.
+fn ms_of(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// A model log row's string field `k` (empty where it has none).
+fn str_of(row: &J, k: &str) -> String {
+    row.get(k)
+        .and_then(J::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A model log row's integer field `k` (0 where it has none).
+fn int_of(row: &J, k: &str) -> i64 {
+    row.get(k).and_then(J::as_i64).unwrap_or(0)
+}
+
+/// codex-alab's `min_work`: a turn under it is short.
+const MIN_WORK_MS: i64 = 120_000;
+
+/// The hang detector past a done claim's back-off before the Cruise check
+/// counts its act missing.
+const CLAIM_SLACK_MS: i64 = 90_000;
+
+/// How long a landed leg is watched for an act that must not come: past the
+/// 120 s a codex-alab that went on would wait after one short defense.
+const LANDED_QUIET: Duration = Duration::from_secs(150);
+
+/// The back-off before the act after `short` short turns in a row: 2, 4, 8 …
+/// minutes, an hour at most (codex-alab's `Timing`, aterm's `TurnEndTiming`).
+fn backoff_ms(short: u32) -> i64 {
+    if short == 0 {
+        0
+    } else {
+        (1i64 << short.min(6)).min(60) * 60_000
+    }
+}
+
+/// A Cruise leg's done claims, read from the model's log (FOREVER CRUISE).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Claims {
+    met: usize,
+    pending: usize,
+    unmet: Vec<String>,
+}
+
+/// Each reply of `rows` (one leg's model log, in order) that says done
+/// (aterm's `says_done`) and what came next: the defend prompt
+/// (`<leg>:defend…`) meets it; any other request, or none past the claim's
+/// back-off (after `short` short replies in a row, a done claim short
+/// whatever it worked and real work ending the run; a hang detector past
+/// it), leaves it unmet; none before then is pending. The back-off read here
+/// is never shorter than codex-alab's own: it counts every short reply, a
+/// wall's act answered short included, which codex-alab's does not.
+fn claims_of(leg: &str, rows: &[J], now_ms: i64) -> Claims {
+    let defend = format!("{leg}:defend");
+    let mut claims = Claims::default();
+    let mut short = 0u32;
+    for (i, row) in rows.iter().enumerate() {
+        if int_of(row, "status") != 200 {
+            continue;
+        }
+        let said = str_of(row, "said");
+        let hold = int_of(row, "hold_ms");
+        let done = says_done(Some(&said));
+        short = if done || hold < MIN_WORK_MS {
+            short.saturating_add(1)
+        } else {
+            0
+        };
+        if !done {
+            continue;
+        }
+        let tag = str_of(row, "tag");
+        let backoff = backoff_ms(short);
+        let due = int_of(row, "t") + hold + backoff + CLAIM_SLACK_MS;
+        match rows.get(i + 1) {
+            Some(next) if str_of(next, "tag").starts_with(&defend) => claims.met += 1,
+            Some(next) => claims
+                .unmet
+                .push(format!("{tag} then {}", str_of(next, "tag"))),
+            None if now_ms > due => claims.unmet.push(format!(
+                "{tag} then nothing past its {} s back-off",
+                backoff / 1000
+            )),
+            None => claims.pending += 1,
+        }
+    }
+    claims
+}
+
+/// How long past the reply to the person's own turn the exchange leg is
+/// watched for an act that must not come: after a turn of real work
+/// codex-alab types the next act at once (after `human_grace_s`), as the
+/// control leg shows, so a minute is decisive; the judge holds it past the
+/// control's measured latency too ([`left_to_person`]).
+const EXCHANGE_QUIET: Duration = Duration::from_secs(60);
+
+/// The hang detector past the control's reply for its continuation: typed at
+/// once after a turn of real work, it is late past this.
+const CONTROL_ACT_MS: i64 = 120_000;
+
+/// codex-alab's journal words for a point it leaves to a person (its
+/// decider's note, `<thread>: nothing (a person's own exchange: theirs to
+/// answer)`): the rule aterm journals as `left-to-person@v1` ([`RULE_LEFT`]).
+const EXCHANGE_WORDS: &str = "a person's own exchange";
+
+/// The reply to a leg's typed turn (`<leg>:person`): when its answer went
+/// (the request's time plus its hold, unix ms), and the leg's requests after
+/// that one.
+fn person_reply<'a>(leg: &str, rows: &'a [J]) -> Option<(i64, &'a [J])> {
+    let head = format!("{leg}:person");
+    let at = rows
+        .iter()
+        .position(|r| str_of(r, "tag").starts_with(&head))?;
+    let row = &rows[at];
+    Some((int_of(row, "t") + int_of(row, "hold_ms"), &rows[at + 1..]))
+}
+
+/// THE CONTROL'S VERDICT: its turn, typed as a control write, is codex-alab's
+/// to go on with — the request after its reply is Cruise's continuation
+/// (`<leg>:continue`), asked within [`CONTROL_ACT_MS`] of the reply, and the
+/// first act on its timeline is `continue@v1`. How long after the reply the
+/// continuation was asked (ms), or why not.
+fn continued_after(leg: &str, rows: &[J], acts: &[String]) -> Result<i64, String> {
+    let Some((reply, after)) = person_reply(leg, rows) else {
+        return Err("its turn never reached the model".to_string());
+    };
+    let Some(next) = after.first() else {
+        return Err("nothing asked after its reply".to_string());
+    };
+    let tag = str_of(next, "tag");
+    let late = int_of(next, "t") - reply;
+    if !tag.starts_with(&format!("{leg}:continue")) {
+        return Err(format!(
+            "the request after its reply was {tag}, no continuation"
+        ));
+    }
+    if late > CONTROL_ACT_MS {
+        return Err(format!(
+            "the continuation came {} after its reply, past {} s",
+            secs(late),
+            CONTROL_ACT_MS / 1000
+        ));
+    }
+    if acts.first().map(String::as_str) != Some("continue@v1") {
+        return Err(format!("its acts are {acts:?}, not continue@v1 first"));
+    }
+    Ok(late)
+}
+
+/// The acts of a leg's timeline that typed into its session: all of them but
+/// the two codex-alab records with `meta set harness_act` and never types —
+/// the point it left to a person's own exchange (`left-to-person@v1`,
+/// [`RULE_LEFT`]), so aterm's face reads `theirs`, and its live upgrade's
+/// re-exec onto a new build at rest (`upgrade@v1`, [`RULE_UPGRADE`]).
+fn typed_acts(acts: &[String]) -> Vec<String> {
+    acts.iter()
+        .filter(|a| *a != RULE_LEFT && *a != RULE_UPGRADE)
+        .cloned()
+        .collect()
+}
+
+/// How many times a leg's codex-alab journal says a thread was resumed
+/// (`<thread>: resumed (task=…)`): once per image that took a conversation
+/// up again, a live upgrade's re-exec among them.
+fn resumes(journal: &str) -> usize {
+    journal
+        .lines()
+        .filter_map(|l| l.split_once("codex_alab_autopilot: "))
+        .filter(|(_, rest)| rest.contains(": resumed (task="))
+        .count()
+}
+
+/// THE FIRST DECISION AFTER A RESUME: the first line of a leg's codex-alab
+/// journal after its resume number `n + 1` ([`resumes`] counted `n` before
+/// it) that says what the image did at the point — `nothing (…)`, a `wait`
+/// for an act, or an act — from its target on, on one line. `None` before
+/// that resume or before it decided: `passive (no proven claim)`, the line of
+/// an image whose claim is not proven again yet, decides nothing.
+fn decided_after_resume(journal: &str, n: usize) -> Option<String> {
+    let mut seen = 0;
+    for line in journal.lines() {
+        let Some((_, rest)) = line.split_once("codex_alab_autopilot: ") else {
+            continue;
+        };
+        if seen <= n {
+            if rest.contains(": resumed (task=") {
+                seen += 1;
+            }
+            continue;
+        }
+        let what = rest.split_once(": ").map_or(rest, |(_, what)| what);
+        if rest.starts_with("act ") || what.starts_with("nothing (") || what.starts_with("wait ") {
+            return Some(crate::util::one_line(rest, 160));
+        }
+    }
+    None
+}
+
+/// THE PERSON'S EXCHANGE, LEFT TO THEM: nothing asked of the model after the
+/// reply to their turn and no typed act on the leg's timeline
+/// ([`typed_acts`]), watched at least
+/// [`EXCHANGE_QUIET`] past the reply and longer than the control's
+/// continuation took after its own (`control_ms`), so the same path showed
+/// its act inside a window this one outlasted. What was watched, or why it
+/// fails (a control that got no continuation proves nothing quiet here).
+fn left_to_person(
+    leg: &str,
+    rows: &[J],
+    acts: &[String],
+    now_ms: i64,
+    control_ms: Option<i64>,
+) -> Result<String, String> {
+    let Some((reply, after)) = person_reply(leg, rows) else {
+        return Err("the person's turn never reached the model".to_string());
+    };
+    let acts = typed_acts(acts);
+    if !after.is_empty() || !acts.is_empty() {
+        let asked: Vec<String> = after.iter().map(|r| str_of(r, "tag")).collect();
+        return Err(format!(
+            "TYPED into the person's exchange: the model asked {asked:?} after the reply, acts {acts:?}"
+        ));
+    }
+    let Some(control) = control_ms else {
+        return Err("the control got no continuation, so a quiet here proves nothing".to_string());
+    };
+    let watched = now_ms - reply;
+    if watched < ms_of(EXCHANGE_QUIET) || watched <= control {
+        return Err(format!(
+            "watched only {} past the reply (at least {} s, and past the control's {})",
+            secs(watched),
+            EXCHANGE_QUIET.as_secs(),
+            secs(control)
+        ));
+    }
+    Ok(format!(
+        "nothing asked and no act for {} past the reply; the control's continuation came {} after its own",
+        secs(watched),
+        secs(control)
+    ))
+}
+
+/// The line of a leg's codex-alab journal naming the rule it left a point to
+/// a person by — codex-alab's words ([`EXCHANGE_WORDS`]) or aterm's id
+/// ([`RULE_LEFT`]) — from its target on, on one line.
+fn exchange_rule(journal: &str) -> Option<String> {
+    let line = journal
+        .lines()
+        .find(|l| l.contains(EXCHANGE_WORDS) || l.contains(RULE_LEFT))?;
+    let from = line
+        .split_once("codex_alab_autopilot: ")
+        .map_or(line, |(_, rest)| rest);
+    Some(crate::util::one_line(from, 160))
+}
+
+/// The acts a leg's codex-alab journal says it typed (`act <rule>: typed …`),
+/// in order.
+fn journal_typed(journal: &str) -> Vec<String> {
+    journal
+        .lines()
+        .filter_map(|l| {
+            l.match_indices("act ").find_map(|(i, _)| {
+                if l[..i].ends_with(char::is_alphanumeric) {
+                    return None;
+                }
+                let (rule, words) = l[i + 4..].split_once(": ")?;
+                (rule.contains('@') && !rule.contains(' ') && words.starts_with("typed"))
+                    .then(|| rule.to_string())
+            })
+        })
+        .collect()
+}
+
+/// A codex-alab record's `execGeneration`: how many re-execs its process has
+/// made (0 before the first).
+fn exec_generation(record: &J) -> i64 {
+    record
+        .get("execGeneration")
+        .and_then(J::as_i64)
+        .unwrap_or(0)
+}
+
+/// A person's gesture as a `status` line names it: how long ago
+/// (`human_ms=`, `None` for `-`: none since the session started) and how
+/// many (`human_seq=`, 0 before the first).
+fn person_hand(status: &str) -> (Option<u64>, u64) {
+    (
+        field(status, "human_ms").and_then(|v| v.parse().ok()),
+        field(status, "human_seq")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+/// What the lab typed into an exchange leg's codex, and what aterm said of
+/// it around the turn.
+struct Typed {
+    /// When the Enter that took the draft went in (unix ms).
+    pressed_ms: i64,
+    /// `status` read before the message was typed, once the draft stood in
+    /// the composer (before its Enter), and after its Enter.
+    before: String,
+    sent: String,
+    after: String,
+}
+
+impl Typed {
+    /// THE ENTER STAMPED A PERSON'S GESTURE: `human_ms` set and `human_seq`
+    /// past its count once the draft stood ([`Self::sent`]). `send
+    /// as=person` stamps the person's clock itself (one `Source::Human`
+    /// batch, `control_input::person_input`), so a count read before the
+    /// message was typed would credit the Enter with the send's own stamp.
+    /// With the counts it read: before the send, after it, after the Enter.
+    fn enter_stamped(&self) -> (bool, [u64; 3]) {
+        let (_, before) = person_hand(&self.before);
+        let (_, sent) = person_hand(&self.sent);
+        let (ms, after) = person_hand(&self.after);
+        (ms.is_some() && after > sent, [before, sent, after])
+    }
+
+    /// THE WRITE STAMPED NO GESTURE: a control write's message and Enter,
+    /// `human_ms` unset and `human_seq` where it stood before the message.
+    fn stamped_nothing(&self) -> bool {
+        let (_, was) = person_hand(&self.before);
+        let (ms, seq) = person_hand(&self.after);
+        ms.is_none() && seq == was
+    }
 }
 
 struct Proof {
@@ -577,28 +1032,104 @@ impl Proof {
         }
     }
 
-    /// The leg's world (its `CODEX_HOME` and project), its tab, and the
-    /// launch line typed at the tab's shell as a person types it.
-    fn spawn_leg(&self, name: &'static str, prompt: &str, extra: &str) -> Result<Leg, Fail> {
+    /// `git <args>` in `dir`, as the lab's own hand (outside the jail): the
+    /// scratch HOME, a lab identity, no signing. Its stdout, or why it failed.
+    fn git(&self, dir: &Path, args: &[&str]) -> Result<String, String> {
+        let out = aterm_uds::spawnfd::command("/usr/bin/git")
+            .env_clear()
+            .envs(self.world_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .args([
+                "-c",
+                "user.name=aterm-lab",
+                "-c",
+                "user.email=lab@aterm.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    /// Lay out the leg's folder as `folder` says (its README written).
+    fn lay_folder(&self, dir: &Path, proj: &Path, folder: Folder) -> Result<(), String> {
+        let readme = proj.join("README.md");
+        std::fs::write(&readme, "# lab scratch project\n")
+            .map_err(|e| format!("{}: {e}", readme.display()))?;
+        match folder {
+            Folder::Plain => Ok(()),
+            Folder::Scratch => self.git(proj, &["init", "-q"]).map(drop),
+            Folder::Origin => {
+                let origin = dir.join("origin.git");
+                let origin_s = origin.to_string_lossy().into_owned();
+                self.git(proj, &["init", "-q", "-b", "main"])?;
+                self.git(proj, &["add", "README.md"])?;
+                self.git(proj, &["commit", "-q", "-m", "lab: the scratch project"])?;
+                self.git(dir, &["init", "-q", "--bare", "-b", "main", &origin_s])?;
+                self.git(proj, &["remote", "add", "origin", &origin_s])?;
+                self.git(proj, &["push", "-q", "-u", "origin", "main"])?;
+                self.git(proj, &["remote", "set-head", "origin", "main"])?;
+                let notes = proj.join(NOTES);
+                std::fs::write(&notes, "# release notes\n\n- the lab's change\n")
+                    .map_err(|e| format!("{}: {e}", notes.display()))
+            }
+        }
+    }
+
+    /// The leg's world (its `CODEX_HOME` and its folder, laid out as `folder`
+    /// says), its tab, its Autopilot word where one is given (set on the tab
+    /// before codex starts there, as the chip's write), and the launch line
+    /// typed at the tab's shell as a person types it, its prompt naming the
+    /// leg.
+    fn spawn_leg(
+        &mut self,
+        name: &'static str,
+        prompt: &str,
+        extra: &str,
+        folder: Folder,
+        autopilot: Option<&str>,
+    ) -> Result<Leg, Fail> {
+        self.start_leg(name, Some(prompt), extra, folder, autopilot)
+    }
+
+    /// [`Self::spawn_leg`], or with no `prompt` a `codex` started bare, at its
+    /// composer, where the leg's turn is typed later ([`Self::type_exchange`]).
+    fn start_leg(
+        &mut self,
+        name: &'static str,
+        prompt: Option<&str>,
+        extra: &str,
+        folder: Folder,
+        autopilot: Option<&str>,
+    ) -> Result<Leg, Fail> {
         let dir = self.s.join("legs").join(name);
         let home = dir.join("codex-home");
         let proj = dir.join("proj");
-        let made = (|| -> std::io::Result<PathBuf> {
-            std::fs::create_dir_all(&home)?;
-            std::fs::create_dir_all(&proj)?;
-            let proj = std::fs::canonicalize(&proj)?;
-            let _ = aterm_uds::spawnfd::command("/usr/bin/git")
-                .args(["init", "-q"])
-                .current_dir(&proj)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            std::fs::write(proj.join("README.md"), "# lab scratch project\n")?;
+        let made = (|| -> Result<PathBuf, String> {
+            let io = |e: std::io::Error| e.to_string();
+            std::fs::create_dir_all(&home).map_err(io)?;
+            std::fs::create_dir_all(&proj).map_err(io)?;
+            let proj = std::fs::canonicalize(&proj).map_err(io)?;
+            let dir = std::fs::canonicalize(&dir).map_err(io)?;
+            self.lay_folder(&dir, &proj, folder)?;
             std::fs::write(
                 home.join("config.toml"),
                 codex_config(self.port, &proj, &home, extra),
-            )?;
+            )
+            .map_err(io)?;
             Ok(proj)
         })();
         let proj = made.map_err(|e| format!("cannot lay out leg {name}: {e}"))?;
@@ -612,11 +1143,27 @@ impl Proof {
             .map(str::to_string)
             .ok_or_else(|| format!("spawn for leg {name}: {}", spawned.first()))?;
         let _ = self.on(&sid, &["await", "idle", "400", "timeout=30000"]);
+        if let Some(word) = autopilot {
+            // The session's own word is `meta`'s (`status autopilot=` is the
+            // effective word only while a supervised agent runs there).
+            let set = self.on(&sid, &["meta", "set", "autopilot", word]);
+            let now = field(&self.on(&sid, &["meta"]).first(), "autopilot").unwrap_or_default();
+            self.check(
+                &format!(
+                    "{name}: Autopilot {word} set on its tab before codex starts ({}; meta autopilot={now})",
+                    set.first()
+                ),
+                set.code == 0 && now == word,
+            );
+        }
+        let codex = prompt.map_or_else(
+            || "codex".to_string(),
+            |p| format!("codex {}", sh_quote(&format!("LEG-{name} {p}"))),
+        );
         let line = format!(
-            "export CODEX_HOME={}; cd {} && codex {}\r",
+            "export CODEX_HOME={}; cd {} && {codex}\r",
             sh_quote(&home.to_string_lossy()),
             sh_quote(&proj.to_string_lossy()),
-            sh_quote(&format!("LEG-{name} {prompt}")),
         );
         let sent = self
             .inst
@@ -683,35 +1230,183 @@ impl Proof {
         })
     }
 
+    /// Every act of the leg's timeline that is one of `acts`.
+    fn has_any(&self, leg: &Leg, acts: &[&str]) -> Vec<String> {
+        self.acts(&leg.sid)
+            .into_iter()
+            .filter(|a| acts.contains(&a.as_str()))
+            .collect()
+    }
+
+    /// The model's first request of `leg` tagged `<leg>:<step>…` within
+    /// `limit`: a hang detector, never a budget.
+    fn await_tag(&self, leg: &Leg, step: &str, limit: Duration) -> Result<bool, Stopped> {
+        let head = format!("{}:{step}", leg.name);
+        Self::wait_for(limit, Duration::from_millis(250), || {
+            self.tags(leg.name).iter().any(|t| t.starts_with(&head))
+        })
+    }
+
+    /// [`Self::await_tag`] with its hang detector anchored at unix ms `by_ms`
+    /// (read off the run's own clock marks, never when the lab looked): no
+    /// wait at all once it has passed.
+    fn tag_by(&self, leg: &Leg, step: &str, by_ms: i64) -> Result<bool, Stopped> {
+        let head = format!("{}:{step}", leg.name);
+        loop {
+            if self.tags(leg.name).iter().any(|t| t.starts_with(&head)) {
+                return Ok(true);
+            }
+            if crate::util::now_ms() >= by_ms {
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(250))?;
+        }
+    }
+
+    /// FOREVER CRUISE on the instance's first session (module header).
     fn first_leg(&mut self, first: &Leg) -> Result<(), Stopped> {
-        let held = self.await_act(first, "finished@v1", Duration::from_secs(120))?;
+        let defended = self.await_act(first, DEFEND, Duration::from_secs(240))?;
         let parked = self
             .host_lines(&first.sid)
             .iter()
             .any(|l| l.contains("WATCHING a proven self-claim supervises this session"));
         self.check("first: aterm's lane parked (its host watches only)", parked);
-        self.check("first: the done mark stops it (finished@v1)", held);
-        // Nothing after the done: no continuation, no request.
-        sleep(Duration::from_secs(15))?;
-        let acts = self.acts(&first.sid);
+        let ended = self.has_any(first, &[FINISHED, LANDED]);
         self.check(
-            "first: no continuation after the done mark",
-            !acts.iter().any(|a| a.starts_with("continue")) && self.requests("first").len() == 1,
+            &format!(
+                "first: the reply ending on the retired token alone is a done claim: Cruise's defend-and-find-more prompt ({DEFEND}), never {FINISHED} nor {LANDED} (ends: {ended:?})"
+            ),
+            defended && ended.is_empty(),
+        );
+        let asked = self.await_tag(first, "defend", Duration::from_secs(60))?;
+        let rows = self.requests("first");
+        if let (Some(t1), Some(t2)) = (
+            first_at(&rows, "first:person"),
+            first_at(&rows, "first:defend"),
+        ) {
+            println!(
+                "    first: the defend prompt came {} after the reply (the back-off after one short turn: 2 min)",
+                secs(t2 - t1)
+            );
+        }
+        self.check(
+            "first: the session keeps going: the model's next turn is asked with aterm's defend words (DONE_CHECK)",
+            asked,
+        );
+        // Its answer is a clean `Nothing left:` defense: under Cruise a done
+        // claim like any. Something that must NOT happen gets a quiet window.
+        sleep(Duration::from_secs(15))?;
+        let ended = self.has_any(first, &[FINISHED, LANDED]);
+        let face = task_face(&self.status(&first.sid));
+        self.check(
+            &format!(
+                "first: a clean `Nothing left:` defense under Cruise lands nothing (15 s on: ends {ended:?}, status task={face})"
+            ),
+            asked && ended.is_empty() && face != "landed",
+        );
+        Ok(())
+    }
+
+    /// NEEDS YOU, loud and never blocking (module header).
+    fn needs_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let reported = self.await_tag(leg, "person", Duration::from_secs(120))?;
+        let mut meta = String::new();
+        let mut status = String::new();
+        let raised = Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), || {
+            meta = self.on(&leg.sid, &["meta"]).first();
+            status = self.status(&leg.sid);
+            needs_raised(&meta) && field(&status, "needs").as_deref() == Some("ask")
+        })?;
+        let seen_ms = crate::util::now_ms();
+        let rows = self.requests("needs");
+        let after = first_at(&rows, "needs:person").map_or_else(String::new, |t1| {
+            format!(
+                "; seen {} after the report was asked for",
+                secs(seen_ms - t1)
+            )
+        });
+        let text = pct_decode(&field(&meta, "attention").unwrap_or_default());
+        self.check(
+            &format!(
+                "needs: the report's NEEDS YOU line raises attention owner=needs kind=ask at once (attention_kinds={} status needs={} attention={text:?}{after})",
+                pct_decode(&field(&meta, "attention_kinds").unwrap_or_default()),
+                field(&status, "needs").unwrap_or_default()
+            ),
+            reported && raised && text.contains(NEED),
+        );
+        // The next act, typed while the need stands: the model holds its
+        // answer to it (NEEDS_HOLD), so a read after the act's request still
+        // finds the need up — the act neither waited for it nor took it down.
+        let mut stood_after_act = false;
+        let acked = Self::wait_for(Duration::from_secs(240), Duration::from_millis(250), || {
+            let rows = self.requests("needs");
+            let Some(at) = first_at(&rows, "needs:continue+ack") else {
+                return false;
+            };
+            let up = needs_raised(&self.on(&leg.sid, &["meta"]).first());
+            stood_after_act |= up && crate::util::now_ms() > at;
+            stood_after_act || crate::util::now_ms() > at + 5_000
+        })?;
+        let acts = self.acts(&leg.sid);
+        self.check(
+            &format!(
+                "needs: never blocked: the next act is still typed (continue@v1, carrying aterm's NEEDS YOU ack) while the need stands (stood after the act: {stood_after_act}; acts: {})",
+                acts.join(" ")
+            ),
+            acked && stood_after_act && acts.iter().any(|a| a == "continue@v1"),
+        );
+        // The report to that act names no need at all (NEEDS_PLAIN), which
+        // withdraws none. Something that must NOT happen gets a quiet window:
+        // 10 s past the reply, the need still up.
+        let replied = first_at(&self.requests("needs"), "needs:continue+ack")
+            .map(|at| at + ms_of(model::NEEDS_HOLD));
+        if let Some(at) = replied {
+            while crate::util::now_ms() < at + 10_000 {
+                sleep(Duration::from_millis(250))?;
+            }
+        }
+        let meta = self.on(&leg.sid, &["meta"]).first();
+        self.check(
+            &format!(
+                "needs: the report after it, which names no need at all, leaves the need up (10 s past it: attention_kinds={})",
+                pct_decode(&field(&meta, "attention_kinds").unwrap_or_default())
+            ),
+            acked && replied.is_some() && needs_raised(&meta),
+        );
+        Ok(())
+    }
+
+    /// The NEEDS YOU leg's last report, `NEEDS YOU: nothing`, after the plain
+    /// one (its act backed off four minutes): it takes the need down.
+    fn needs_cleared(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let reported = Self::wait_for(Duration::from_secs(420), Duration::from_secs(1), || {
+            self.requests("needs")
+                .iter()
+                .any(|r| str_of(r, "said").contains("NEEDS YOU: nothing"))
+        })?;
+        let mut meta = String::new();
+        let cleared = Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), || {
+            meta = self.on(&leg.sid, &["meta"]).first();
+            !needs_raised(&meta)
+        })?;
+        self.check(
+            &format!(
+                "needs: the report after that, `NEEDS YOU: nothing`, takes it down (reported: {reported}; attention_kinds={})",
+                pct_decode(&field(&meta, "attention_kinds").unwrap_or_default())
+            ),
+            reported && cleared,
         );
         Ok(())
     }
 
     fn continue_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
-        let done = self.await_act(leg, "finished@v1", Duration::from_secs(150))?;
-        let acts = self.acts(&leg.sid);
-        let at = |a: &str| acts.iter().position(|x| x == a);
+        let continued = self.await_act(leg, "continue@v1", Duration::from_secs(240))?;
         self.check(
-            "continue: a turn without the done mark is continued (continue@v1, then finished@v1)",
-            done && at("continue@v1")
-                .zip(at("finished@v1"))
-                .is_some_and(|(c, f)| c < f),
+            "continue: a turn without a done claim is continued (continue@v1)",
+            continued,
         );
-        let keep: Vec<J> = self
+        let replied = self.await_tag(leg, "continue", Duration::from_secs(60))?;
+        let keep = self
             .requests("continue")
             .into_iter()
             .filter(|r| {
@@ -719,21 +1414,28 @@ impl Proof {
                     .and_then(J::as_str)
                     .is_some_and(|u| u.contains(KEEP_GOING))
             })
-            .collect();
+            .count();
         self.check(
-            "continue: the continuation sent `keep going` once",
-            keep.len() == 1,
+            &format!(
+                "continue: the continuation sent aterm's Cruise words (`keep going`) once (x{keep})"
+            ),
+            replied && keep == 1,
         );
         sleep(Duration::from_secs(15))?;
+        let ended = self.has_any(leg, &[FINISHED, LANDED]);
+        let tags = self.tags("continue");
         self.check(
-            "continue: the done mark stops it (nothing sent after it)",
-            self.tags("continue") == ["continue:t1", "continue:after-continue"],
+            &format!(
+                "continue: the continued turn's token ends nothing (ends {ended:?}; the model asked: {})",
+                tags.join(" ")
+            ),
+            replied && ended.is_empty() && tags == ["continue:person", "continue:continue"],
         );
         Ok(())
     }
 
     fn approval_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
-        let done = self.await_act(leg, "finished@v1", Duration::from_secs(150))?;
+        let ran_back = self.await_tag(leg, "after-output", Duration::from_secs(180))?;
         let acts = self.acts(&leg.sid);
         self.check(
             "approval: the escalated exec is approved once (approve-all@v1)",
@@ -741,30 +1443,132 @@ impl Proof {
         );
         let ran = std::fs::read_to_string(leg.proj.join("ran.txt")).unwrap_or_default();
         self.check(
-            "approval: the approved command ran (ran.txt) and the task finished",
-            ran.contains("approved-run") && done,
+            "approval: the approved command ran (ran.txt) and its output went back to the model",
+            ran.contains("approved-run") && ran_back,
         );
         Ok(())
     }
 
+    /// The question leg under Land (module header).
     fn question_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
-        let done = self.await_act(leg, "finished@v1", Duration::from_secs(150))?;
+        let answered = Self::wait_for(Duration::from_secs(180), Duration::from_secs(1), || {
+            self.requests("question").iter().any(|r| {
+                r.get("tool_output")
+                    .and_then(J::as_str)
+                    .is_some_and(|o| o.contains("Postgres (Recommended)"))
+            })
+        })?;
         let acts = self.acts(&leg.sid);
-        let answered = self.requests("question").iter().any(|r| {
-            r.get("tool_output")
-                .and_then(J::as_str)
-                .is_some_and(|o| o.contains("Postgres (Recommended)"))
-        });
         self.check(
-            "question: the overlay is answered with its (Recommended) option (answer-recommended@v1)",
+            "question: the overlay is answered with its (Recommended) option (answer-recommended@v1: codex-alab's box answer under every word)",
             answered && acts.iter().any(|a| a == "answer-recommended@v1"),
         );
-        self.check("question: the task finished after the answer", done);
+        let land_answer = self.await_act(leg, "land-answer@v1", Duration::from_secs(240))?;
+        let asked = self.await_tag(leg, "land-answer", Duration::from_secs(60))?;
+        let acts = self.acts(&leg.sid);
+        self.check(
+            &format!(
+                "question: under Land the question in prose after it gets Land's answer (land-answer@v1, aterm's LAND_ANSWER words), never a Cruise answer (acts: {})",
+                acts.join(" ")
+            ),
+            land_answer && asked && !acts.iter().any(|a| a == "answer@v1"),
+        );
+        Ok(())
+    }
+
+    /// The build the leg's own rollout names (its `session_meta`'s
+    /// `cli_version`), read off the leg's scratch `CODEX_HOME`.
+    fn rollout_build(leg: &Leg) -> Option<String> {
+        let rollouts = aterm_agent::harness::codex_rollout::rollouts_by_write(&leg.home);
+        let (path, _) = rollouts.last()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let meta = J::parse(text.lines().next()?).ok()?;
+        meta.get("payload")?
+            .get("cli_version")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// THE ROLLOUT TAP, LIVE (session log 5G-3; plan A1's 6D-3b; ruling
+    /// T15): each done leg's tab logs turns from its codex-alab's own
+    /// rollout when the build that rollout names is one the session log
+    /// measured, and none when not. Each tab's log is read only past the
+    /// tap's fence ([`past_the_fence`]: two more asks answered, each counted
+    /// after its records reached the log), so a tap whose write lands late
+    /// is caught on either branch; the wait is a hang detector of a minute,
+    /// never a latency budget. Each tab's `log kinds=turn` is printed: ids
+    /// and numbers, no text.
+    fn rollout_leg(&mut self, legs: &[&Leg]) -> Result<(), Stopped> {
+        use aterm_agent::harness::codex_steps::CODEX_MEASURED_BUILDS;
+        for leg in legs {
+            let build = Self::rollout_build(leg);
+            let measured = build
+                .as_deref()
+                .is_some_and(|b| CODEX_MEASURED_BUILDS.contains(&b));
+            // The reply's records: each line opens with its seq.
+            let turns = || -> Vec<String> {
+                self.on(&leg.sid, &["log", "kinds=turn"])
+                    .stdout
+                    .lines()
+                    .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+                    .map(str::to_string)
+                    .collect()
+            };
+            let fenced = past_the_fence(
+                || tap_said(&self.status(&leg.sid)),
+                turns,
+                |ok| Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), ok),
+            )?;
+            println!(
+                "  {}: log @{} kinds=turn (its rollout names {}):",
+                leg.name,
+                leg.sid,
+                build.as_deref().unwrap_or("no build")
+            );
+            let name = leg.name;
+            let want = if measured {
+                "the tab's log holds turns from its rollout (src=transcript, rollout=bound)"
+            } else {
+                "an unmeasured build's rollout steps no turn (rollout=unmeasured)"
+            };
+            match fenced {
+                Fenced::Past { from, to, got } => {
+                    for line in &got {
+                        println!("    {line}");
+                    }
+                    self.check(
+                        &format!(
+                            "{name}: past the tap's fence (rollout_asks {} to {}, rollout={}), {want}",
+                            from.asks, to.asks, to.word
+                        ),
+                        rollout_holds(measured, &to, &got),
+                    );
+                }
+                Fenced::NoTap => {
+                    self.check(
+                        &format!(
+                            "{name}: status names the rollout tap's answer (rollout=), {want}"
+                        ),
+                        false,
+                    );
+                }
+                Fenced::Stuck { from, to } => {
+                    self.check(
+                        &format!(
+                            "{name}: the rollout tap answers two asks past a look within a minute (rollout_asks {} to {}, rollout={}), {want}",
+                            from.asks, to.asks, to.word
+                        ),
+                        false,
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
     fn hold_leg(&mut self, leg: &Leg, pid: Option<i32>) -> Result<(), Stopped> {
-        // The first turn's answer came (held by the model until the hold stood).
+        // The first turn's request came (its answer held by the model, a turn
+        // of real work, until well after the hold stood).
         let answered = Self::wait_for(Duration::from_secs(90), Duration::from_secs(1), || {
             !self.requests("hold").is_empty()
         })?;
@@ -775,8 +1579,9 @@ impl Proof {
             .unwrap_or(0);
         let since = Instant::now();
         // The answer is sent HOLD_FIRST_TURN after its request: past it, and
-        // past the grace, with room for a continuation that must not come.
-        let quiet = HOLD_FIRST_TURN + Duration::from_secs(25);
+        // past the grace, with room for a continuation that must not come
+        // (the turn was real work: unheld, it would come at once).
+        let quiet = model::HOLD_FIRST_TURN + Duration::from_secs(25);
         while since.elapsed() < quiet
             && crate::util::now_secs() * 1000 < t1 + i64::try_from(quiet.as_millis()).unwrap_or(0)
         {
@@ -784,10 +1589,10 @@ impl Proof {
         }
         let held_acts = self.acts(&leg.sid);
         self.check(
-            "hold: nothing continued while the hold stood",
+            "hold: nothing continued while the hold stood (25 s past a turn of real work)",
             answered
                 && !held_acts.iter().any(|a| a.starts_with("continue"))
-                && self.tags("hold") == ["hold:t1"],
+                && self.tags("hold") == ["hold:person"],
         );
         self.check(
             "hold: codex-alab kept its proven claim under the hold",
@@ -798,50 +1603,456 @@ impl Proof {
             &format!("hold: lifted ({})", off.first()),
             off.first().contains("hold=0"),
         );
-        let done = self.await_act(leg, "finished@v1", Duration::from_secs(120))?;
-        let acts = self.acts(&leg.sid);
+        let lifted = Instant::now();
+        let continued = self.await_act(leg, "continue@v1", Duration::from_secs(120))?;
+        println!(
+            "    hold: continued {:.1} s after the lift",
+            lifted.elapsed().as_secs_f64()
+        );
         self.check(
-            "hold: lifted, the turn is continued (continue@v1, then finished@v1)",
-            done && acts.iter().any(|a| a == "continue@v1"),
+            "hold: lifted, the turn is continued (continue@v1)",
+            continued,
         );
         Ok(())
     }
 
+    /// The usage wall (module header): waited out, then resumed once.
     fn usage_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
-        let done = self.await_act(leg, "finished@v1", Duration::from_secs(300))?;
+        let resumed_act = self.await_act(leg, "usage-resume@v1", Duration::from_secs(300))?;
+        let asked = self.await_tag(leg, "continue", Duration::from_secs(60))?;
         let rows = self.requests("usage");
-        let reset = rows
+        let limited: Vec<&J> = rows.iter().filter(|r| int_of(r, "status") == 429).collect();
+        let limit_at = limited.first().map(|r| int_of(r, "t"));
+        let reset = limited
             .first()
-            .and_then(|r| r.get("tag").and_then(J::as_str))
-            .and_then(|t| t.split_once("resets_at="))
-            .and_then(|(_, n)| n.parse::<i64>().ok());
-        let resumed = rows
+            .map(|r| str_of(r, "tag"))
+            .and_then(|t| t.split_once("resets_at=").map(|(_, n)| n.to_string()))
+            .and_then(|n| n.parse::<i64>().ok());
+        let floor = reset.map(|r| (r + 60) * 1000);
+        // Anything the model was asked after the 429 and before the floor,
+        // whatever its tag (the person's turn sent again is a 429 of its own).
+        let early: Vec<String> = rows
             .iter()
-            .find(|r| r.get("tag").and_then(J::as_str) == Some("usage:after-reset"))
-            .and_then(|r| r.get("t").and_then(J::as_i64));
-        let limited = rows
-            .iter()
-            .filter(|r| r.get("status").and_then(J::as_i64) == Some(429))
-            .count();
+            .filter(|r| {
+                let t = int_of(r, "t");
+                limit_at.is_some_and(|l| t > l) && floor.is_some_and(|f| t < f)
+            })
+            .map(|r| str_of(r, "tag"))
+            .collect();
+        let resumed = first_at(&rows, "usage:continue");
         if let (Some(reset), Some(at)) = (reset, resumed) {
             println!(
-                "    usage: resets_at={reset}; resumed {:.1} s after it",
-                (at - reset * 1000) as f64 / 1000.0
+                "    usage: resets_at={reset}; resumed {} after it",
+                secs(at - reset * 1000)
             );
         }
         self.check(
-            "usage: the 429 is waited out: nothing sent until resets_at + 60 s",
-            limited >= 1
-                && reset
-                    .zip(resumed)
-                    .is_some_and(|(reset, at)| at >= (reset + 60) * 1000),
+            &format!(
+                "usage: the 429 is waited out: one 429, and no request of any kind until resets_at + 60 s ({} 429s; early: {early:?})",
+                limited.len()
+            ),
+            limited.len() == 1
+                && early.is_empty()
+                && floor.zip(resumed).is_some_and(|(f, at)| at >= f),
         );
+        // A request sent twice carries its turn and its input again; each act
+        // is a turn of its own (a usage resume answered short moves no
+        // streak, aterm's rule, so `continue@v1` follows it at once).
+        let sent: Vec<(String, i64)> = rows
+            .iter()
+            .filter(|r| str_of(r, "tag").starts_with("usage:continue"))
+            .map(|r| (str_of(r, "turn"), int_of(r, "n")))
+            .collect();
+        let twice = sent.iter().enumerate().any(|(i, s)| sent[..i].contains(s));
         let acts = self.acts(&leg.sid);
+        let resumes = acts.iter().filter(|a| *a == "usage-resume@v1").count();
         self.check(
-            "usage: then resumed (usage-resume@v1) and finished",
-            done && acts.iter().any(|a| a == "usage-resume@v1"),
+            &format!(
+                "usage: then resumed once (usage-resume@v1 x{resumes}) and the model asked again, no request sent twice (turn, items: {sent:?}; acts: {})",
+                acts.join(" ")
+            ),
+            resumed_act && asked && resumes == 1 && !twice,
         );
         Ok(())
+    }
+
+    /// FOREVER LAND, unbounded, its unclean defenses nudged (module header).
+    fn land_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let started = Instant::now();
+        let land = self.await_act(leg, "land@v1", Duration::from_secs(240))?;
+        let land_asked = self.await_tag(leg, "land", Duration::from_secs(60))?;
+        let word = field(&self.status(&leg.sid), "autopilot").unwrap_or_default();
+        self.check(
+            &format!(
+                "land: Land's instruction is typed (land@v1, aterm's LAND words; status autopilot={word})"
+            ),
+            land && land_asked && word == "land",
+        );
+        if !land_asked {
+            return Ok(());
+        }
+        // Each nudge after the reply to the act before it: real work (at
+        // once), or a defense (backed off two minutes): a hang detector past
+        // either, never a budget.
+        let mut nudged = 0;
+        for n in 1..=NUDGES_BEFORE_DEFENSE {
+            if !self.await_tag(
+                leg,
+                &format!("nudge{n}"),
+                SLOW_TURN + Duration::from_secs(150),
+            )? {
+                break;
+            }
+            nudged = n;
+            println!(
+                "    land: nudge {n} asked {:.0} s into the leg's check",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        let seen = nudges_seen(&self.tags("land"));
+        // The clean defense answers the last nudge at once, so a landing
+        // stands within a second of it: what came before the landing is
+        // read off the timeline's order, never off when the lab looked.
+        let landed = self.await_act(leg, LANDED, Duration::from_secs(90))?;
+        let acts = self.acts(&leg.sid);
+        let before = nudges_before_landing(&acts);
+        let needs_acked = self
+            .tags("land")
+            .iter()
+            .any(|t| t.starts_with("land:nudge2+ack"));
+        self.check(
+            &format!(
+                "land: a `Nothing left:` defense that names a NEEDS YOU need is not landed: land-nudge@v1 follows it (nudges before the landing: {before}; the second carrying the NEEDS ack: {needs_acked})"
+            ),
+            before >= 2 && needs_acked,
+        );
+        self.check(
+            &format!(
+                "land: a `Nothing left:` defense that names a part left for later is not landed: land-nudge@v1 follows it (nudges before the landing: {before})"
+            ),
+            before >= 4,
+        );
+        let nudges = acts.iter().filter(|a| *a == "land-nudge@v1").count();
+        self.check(
+            &format!(
+                "land: each yield that is no clean defense gets land-nudge@v1, again and again: {nudges} nudges, the model asked at {seen:?} (four: past the two an older Land stopped after, and any bound under four)"
+            ),
+            nudged == NUDGES_BEFORE_DEFENSE && nudges >= NUDGES_BEFORE_DEFENSE,
+        );
+        let mut face = String::new();
+        let landed_face = landed
+            && Self::wait_for(Duration::from_secs(30), Duration::from_millis(250), || {
+                face = task_face(&self.status(&leg.sid));
+                face == "landed"
+            })?;
+        self.check(
+            &format!(
+                "land: the clean `Nothing left:` defense in a folder that is no repository gives {LANDED}, and aterm's status task= for the self-claimed tab reads landed (FOREVER LAND §10.4; task={face})"
+            ),
+            landed && landed_face,
+        );
+        println!(
+            "    land: landed {:.0} s into the leg's check",
+            started.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
+    /// The reland leg's landing and the quiet after it, past the back-off a
+    /// codex-alab that went on would wait; then a person's turn reopens it
+    /// (module header). Whether the reopening turn was asked.
+    fn reland_landed(&mut self, leg: &Leg) -> Result<bool, Stopped> {
+        let land = self.await_act(leg, "land@v1", Duration::from_secs(300))?;
+        let landed = self.await_act(leg, LANDED, Duration::from_secs(120))?;
+        let mut face = String::new();
+        let landed_face = landed
+            && Self::wait_for(Duration::from_secs(30), Duration::from_millis(250), || {
+                face = task_face(&self.status(&leg.sid));
+                face == "landed"
+            })?;
+        self.check(
+            &format!(
+                "reland: land@v1 after a turn of real work, and its clean defense lands ({LANDED}; status task={face})"
+            ),
+            land && landed && landed_face,
+        );
+        if !landed {
+            return Ok(false);
+        }
+        // The landing's point: the land act's request, answered at once.
+        let rows = self.requests("reland");
+        let at = rows
+            .iter()
+            .rev()
+            .find(|r| str_of(r, "tag").starts_with("reland:land"))
+            .map_or_else(crate::util::now_ms, |r| int_of(r, "t"));
+        let asked_before = rows.len();
+        let acts_before = self.acts(&leg.sid).len();
+        // Something that must NOT happen gets a quiet window past the 120 s
+        // a short defense's next act would wait.
+        let until = at + ms_of(LANDED_QUIET);
+        while crate::util::now_ms() < until {
+            sleep(Duration::from_secs(1))?;
+        }
+        let asked_after = self.tags("reland");
+        let acts_after = self.acts(&leg.sid);
+        self.check(
+            &format!(
+                "reland: then NOTHING more: no request to the model and no act for {} s after the landing, past the 120 s a codex-alab that went on would wait (asked: {}; acts: {})",
+                LANDED_QUIET.as_secs(),
+                asked_after.join(" "),
+                acts_after.join(" ")
+            ),
+            asked_after.len() == asked_before && acts_after.len() == acts_before,
+        );
+        // Anyone's later turn reopens it: a person's prompt, typed and
+        // submitted as a person types one, answered with real work.
+        let turn = self.on(
+            &leg.sid,
+            &[
+                "turn",
+                "settle=submitted",
+                "timeout=30000",
+                REOPEN,
+                "one more look at the landed work",
+            ],
+        );
+        let typed = Instant::now();
+        let mut face = String::new();
+        let reopened = Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), || {
+            face = task_face(&self.status(&leg.sid));
+            face == "open"
+        })?;
+        let after = typed.elapsed().as_secs_f64();
+        let asked = self.await_tag(leg, "reopen", Duration::from_secs(60))?;
+        self.check(
+            &format!(
+                "reland: a person's later turn reopens it (status task={face} {after:.1} s after the turn was typed; the model asked: {asked}; turn: {})",
+                turn.first()
+            ),
+            reopened && asked,
+        );
+        Ok(asked)
+    }
+
+    /// After the person's turn of real work, codex-alab acts again: a new
+    /// episode's `land@v1`, whose clean defense lands again.
+    fn reland_again(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let reopen_at = first_at(&self.requests("reland"), "reland:reopen");
+        let mut acts = Vec::new();
+        let landed_again = Self::wait_for(
+            SLOW_TURN + Duration::from_secs(120),
+            Duration::from_secs(1),
+            || {
+                acts = self.acts(&leg.sid);
+                let Some(first) = acts.iter().position(|a| a == LANDED) else {
+                    return false;
+                };
+                acts[first + 1..]
+                    .iter()
+                    .position(|a| a == "land@v1")
+                    .is_some_and(|again| acts[first + 1 + again..].iter().any(|a| a == LANDED))
+            },
+        )?;
+        let rows = self.requests("reland");
+        let relanded_at = rows
+            .iter()
+            .filter(|r| str_of(r, "tag").starts_with("reland:land"))
+            .nth(1)
+            .map(|r| int_of(r, "t"));
+        if let (Some(r), Some(l)) = (reopen_at, relanded_at) {
+            println!(
+                "    reland: the new land@v1 asked {} after the person's turn (its real work {} s)",
+                secs(l - r),
+                SLOW_TURN.as_secs()
+            );
+        }
+        self.check(
+            &format!(
+                "reland: after the person's turn of real work codex-alab acts again: a new land@v1, and its clean defense lands again (acts: {})",
+                acts.join(" ")
+            ),
+            landed_again && relanded_at.is_some(),
+        );
+        Ok(())
+    }
+
+    /// The first request of `leg` whose tag starts with `head`: its tag and
+    /// the tail of its text.
+    fn request_named(&self, leg: &str, head: &str) -> (String, String) {
+        self.requests(leg)
+            .iter()
+            .find(|r| str_of(r, "tag").starts_with(head))
+            .map(|r| (str_of(r, "tag"), str_of(r, "u")))
+            .unwrap_or_default()
+    }
+
+    /// A clean defense over a repository that still holds work: the file
+    /// untracked (module header). The lab commits it, never pushing.
+    fn repo_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let land = self.await_act(leg, "land@v1", Duration::from_secs(300))?;
+        let defended = self.await_tag(leg, "land", Duration::from_secs(60))?;
+        self.check(
+            "repo: Land's instruction is typed (land@v1)",
+            land && defended,
+        );
+        if !defended {
+            return Ok(());
+        }
+        // The defense's words are clean; the repository is not. A nudge comes
+        // (backed off: a done claim is a short turn).
+        let nudged = self.await_tag(leg, "nudge1", Duration::from_secs(240))?;
+        let ended = self.has_any(leg, &[LANDED]);
+        let asked = first_at(&self.requests("repo"), "repo:nudge1").unwrap_or(0);
+        let (tag, text) = self.request_named("repo", "repo:nudge1");
+        self.check(
+            &format!(
+                "repo: the clean defense over a repository with an untracked file is NOT landed: a land-nudge@v1 follows naming the repository's work (ends {ended:?}; …{})",
+                tail(&text, 180)
+            ),
+            nudged && ended.is_empty() && tag.ends_with("+repo") && text.contains(NOTES),
+        );
+        if !nudged {
+            return Ok(());
+        }
+        // The worker's hands, while the model holds its answer: the file
+        // committed, never pushed, so the reply's clean defense meets a
+        // commit the remote main lacks.
+        let committed = self
+            .git(&leg.proj, &["add", NOTES])
+            .and_then(|_| self.git(&leg.proj, &["commit", "-q", "-m", "lab: the release notes"]))
+            .and_then(|_| self.git(&leg.proj, &["status", "--porcelain", "--branch"]));
+        let into = crate::util::now_ms() - asked;
+        let late = into >= ms_of(REPO_COMMIT_HOLD);
+        self.check(
+            &format!(
+                "repo: the lab committed {NOTES}, not pushing it, {} into the model's {} s hold ({})",
+                secs(into),
+                REPO_COMMIT_HOLD.as_secs(),
+                committed
+                    .as_ref()
+                    .map_or_else(Clone::clone, |s| s.trim().replace('\n', " | "))
+            ),
+            committed.as_ref().is_ok_and(|s| s.contains("ahead 1")) && !late,
+        );
+        Ok(())
+    }
+
+    /// The repository leg after its commit: the clean defense is NOT landed
+    /// over the commit the remote main lacks; pushed, the next one lands.
+    fn repo_pushed(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        // The second claim's back-off: four minutes after the commit's reply.
+        let nudged = self.await_tag(leg, "nudge2", REPO_COMMIT_HOLD + Duration::from_secs(360))?;
+        let ended = self.has_any(leg, &[LANDED]);
+        let asked = first_at(&self.requests("repo"), "repo:nudge2").unwrap_or(0);
+        let (tag, text) = self.request_named("repo", "repo:nudge2");
+        self.check(
+            &format!(
+                "repo: committed but not pushed, the next clean defense is NOT landed either: a land-nudge@v1 names the commit the remote main lacks (ends {ended:?}; …{})",
+                tail(&text, 180)
+            ),
+            nudged && ended.is_empty() && tag.ends_with("+repo") && text.contains("not on origin/main"),
+        );
+        if !nudged {
+            return Ok(());
+        }
+        let pushed = self
+            .git(&leg.proj, &["push", "-q", "origin", "main"])
+            .and_then(|_| self.git(&leg.proj, &["status", "--porcelain", "--branch"]));
+        let into = crate::util::now_ms() - asked;
+        let late = into >= ms_of(REPO_PUSH_HOLD);
+        self.check(
+            &format!(
+                "repo: the lab pushed it to the local bare origin {} into the model's {} s hold ({})",
+                secs(into),
+                REPO_PUSH_HOLD.as_secs(),
+                pushed
+                    .as_ref()
+                    .map_or_else(Clone::clone, |s| s.trim().replace('\n', " | "))
+            ),
+            pushed.is_ok() && !late,
+        );
+        let landed = self.await_act(leg, LANDED, Duration::from_secs(90))?;
+        let mut face = String::new();
+        let landed_face = landed
+            && Self::wait_for(Duration::from_secs(30), Duration::from_millis(250), || {
+                face = task_face(&self.status(&leg.sid));
+                face == "landed"
+            })?;
+        self.check(
+            &format!(
+                "repo: pushed, the next clean defense lands it ({LANDED}; status task={face})"
+            ),
+            landed && landed_face,
+        );
+        Ok(())
+    }
+
+    /// The Land legs at the run's end: nothing after their landing (an
+    /// observation: how long since says what a later act would have needed).
+    fn landed_stay_quiet(&mut self, legs: &[&Leg]) {
+        for leg in legs {
+            let acts = self.acts(&leg.sid);
+            let Some(at) = acts.iter().rposition(|a| a == LANDED) else {
+                continue;
+            };
+            let rows = self.requests(leg.name);
+            let since = rows
+                .iter()
+                .rev()
+                .find(|r| str_of(r, "said").contains("Nothing left:"))
+                .map_or(0, |r| {
+                    crate::util::now_ms() - int_of(r, "t") - int_of(r, "hold_ms")
+                });
+            let after = &acts[at + 1..];
+            self.check(
+                &format!(
+                    "{}: nothing after its last {LANDED} by the run's end ({} since; acts after it: {after:?})",
+                    leg.name,
+                    secs(since)
+                ),
+                after.is_empty(),
+            );
+        }
+    }
+
+    /// FOREVER CRUISE, over every Cruise leg's whole run (module header):
+    /// nothing finished or landed, and each done claim met by the defend
+    /// prompt, by the model's own log ([`claims_of`]).
+    fn cruise_rests_never(&mut self, cruise: &[&Leg]) {
+        let ended: Vec<String> = cruise
+            .iter()
+            .flat_map(|leg| {
+                self.has_any(leg, &[FINISHED, LANDED])
+                    .into_iter()
+                    .map(move |a| format!("{}:{a}", leg.name))
+            })
+            .collect();
+        self.check(
+            &format!("cruise: no Cruise leg's timeline holds {FINISHED} or {LANDED} ({ended:?})"),
+            ended.is_empty(),
+        );
+        let now = crate::util::now_ms();
+        let mut met = 0;
+        let mut pending = 0;
+        let mut unmet = Vec::new();
+        let mut each = Vec::new();
+        for leg in cruise {
+            let c = claims_of(leg.name, &self.requests(leg.name), now);
+            if c.met + c.pending + c.unmet.len() > 0 {
+                each.push(format!("{} {}+{}", leg.name, c.met, c.pending));
+            }
+            met += c.met;
+            pending += c.pending;
+            unmet.extend(c.unmet);
+        }
+        self.check(
+            &format!(
+                "cruise: each done claim of every Cruise leg is followed by {DEFEND}'s request, or its back-off has not run out yet ({met} met, {pending} pending at the run's end: {}; unmet: {unmet:?})",
+                each.join(", ")
+            ),
+            unmet.is_empty() && met > 0,
+        );
     }
 
     /// `SIGKILL` the codex-alab `pid` of `leg`; the crash rule's relaunch
@@ -913,10 +2124,10 @@ impl Proof {
         Ok(())
     }
 
-    /// The leg's codex-alab journal (`<CODEX_HOME>/log/codex-tui.log`, every
-    /// process of the leg in one file).
+    /// The leg's codex-alab journal ([`journal_path`]: every process of the
+    /// leg appending to one file).
     fn codex_log(leg: &Leg) -> String {
-        std::fs::read_to_string(leg.home.join("log/codex-tui.log")).unwrap_or_default()
+        std::fs::read_to_string(journal_path(&leg.home)).unwrap_or_default()
     }
 
     /// The instance's harness upgrade ledger (`aterm harness ledger upgrade
@@ -973,7 +2184,7 @@ impl Proof {
         // codex-alab's carry-on (its continuation after the grace), and the
         // act it records once its turn started: hang detectors, never budgets.
         let carried = Self::wait_for(Duration::from_secs(120), Duration::from_secs(1), || {
-            self.tags("carry").iter().any(|t| t == "carry:after-carry")
+            self.tags("carry").iter().any(|t| t == "carry:continue")
         })?;
         let turned = self.await_act(leg, "harness-turn@v1", Duration::from_secs(60))?;
         let log = Self::codex_log(leg);
@@ -988,7 +2199,9 @@ impl Proof {
                 "carry: the relaunched codex-alab's launch probe saw aterm's relaunch lease and resumed as relaunched (probes: {})",
                 probes.join(" | ")
             ),
-            log.contains(&probe) && log.contains("relaunched=true)"),
+            // `resumed (task=true, relaunched=true, owed=none)` since the live
+            // upgrade's owed act joined the line (`relaunched=true)` before).
+            log.contains(&probe) && log.contains("relaunched=true"),
         );
         // How the hold ended, by aterm's own ledger: at the relaunched
         // process's first idle, never at its bound (which would also let the
@@ -1024,24 +2237,39 @@ impl Proof {
             })
             .count();
         let holder = format!("codex-alab@{pid2}");
-        let by_relaunched = turned
-            && self
-                .on(&leg.sid, &["timeline"])
-                .stdout
-                .lines()
-                .filter(|l| l.contains("kind=harness-act"))
-                .any(|l| {
-                    field(l, "act").as_deref() == Some("harness-turn@v1")
-                        && field(l, "holder").as_deref() == Some(holder.as_str())
-                });
+        let in_timeline = self
+            .on(&leg.sid, &["timeline"])
+            .stdout
+            .lines()
+            .filter(|l| l.contains("kind=harness-act"))
+            .any(|l| {
+                field(l, "act").as_deref() == Some("harness-turn@v1")
+                    && field(l, "holder").as_deref() == Some(holder.as_str())
+            });
+        // The same act from the session log (phase 6, 6F-7): its mark
+        // names the holder as the ring's row does.
+        let in_log = acted_in_log(
+            &self.on(&leg.sid, &["log", "kinds=act"]).stdout,
+            "harness-turn@v1",
+            &holder,
+        );
+        let by_relaunched = turned && in_timeline && in_log;
         self.check(
             &format!(
-                "carry: the relaunched codex-alab carried the interrupted turn on by itself, once (`keep going` x{keep} after the relaunch, harness-turn@v1 by {holder}: {by_relaunched})"
+                "carry: the relaunched codex-alab carried the interrupted turn on by itself, once (`keep going` x{keep} after the relaunch, harness-turn@v1 by {holder}: timeline {in_timeline}, log {in_log})"
             ),
             carried && keep == 1 && by_relaunched,
         );
-        let done = self.await_act(leg, "finished@v1", Duration::from_secs(60))?;
-        self.check("carry: then finished (finished@v1)", done);
+        // The carried reply claims done: Cruise's defend prompt, at once (the
+        // relaunched process has no short streak), never the token's end.
+        let defended = self.await_act(leg, DEFEND, Duration::from_secs(90))?;
+        let ended = self.has_any(leg, &[FINISHED, LANDED]);
+        self.check(
+            &format!(
+                "carry: the carried reply's done claim gets Cruise's defend prompt ({DEFEND}), never {FINISHED} (ends {ended:?})"
+            ),
+            defended && ended.is_empty(),
+        );
         Ok(())
     }
 
@@ -1050,7 +2278,7 @@ impl Proof {
             self.check("upgrade: no proven codex-alab to move", false);
             return Ok(());
         };
-        let generation = |r: &J| r.get("execGeneration").and_then(J::as_i64).unwrap_or(0);
+        let generation = exec_generation;
         let before = Self::record(leg, pid).map_or(0, |r| generation(&r));
         let linked = self.link(pkg_b);
         self.check(
@@ -1097,19 +2325,20 @@ impl Proof {
         Ok(up)
     }
 
-    /// THE AUTOPILOT OFF STEP (module header): Off gives the claim back and the
-    /// mail goes alone; On, the claim comes back.
-    fn autopilot_off_leg(&mut self, leg: &Leg, manager: &str) -> Result<(), Stopped> {
+    /// THE AUTOPILOT OFF STEP's start (module header): Off while the leg's
+    /// first turn, real work, runs; codex-alab gives its claim back. When Off
+    /// stood (unix ms).
+    fn autopilot_off(&mut self, leg: &Leg) -> Result<Option<i64>, Stopped> {
         let name = leg.name;
-        let before = self.proven_pid(&leg.sid);
-        self.check(
-            &format!("autopilot: {name} holds a proven claim before the off"),
-            before.is_some(),
-        );
         let off = self.on(&leg.sid, &["meta", "set", "autopilot", "off"]);
+        let at = crate::util::now_ms();
+        let set = off.code == 0 && off.first().starts_with("OK");
         self.check(
-            &format!("autopilot: Autopilot Off on {name} ({})", off.first()),
-            off.code == 0 && off.first().starts_with("OK"),
+            &format!(
+                "autopilot: Autopilot Off on {name} while its first turn (real work) runs ({})",
+                off.first()
+            ),
+            set,
         );
         let mut status = String::new();
         let released =
@@ -1126,8 +2355,19 @@ impl Proof {
             ),
             released,
         );
-        let turns_before = self.on(&leg.sid, &["history"]).stdout;
-        let asked_before = self.requests(name).len();
+        Ok(set.then_some(at))
+    }
+
+    /// THE AUTOPILOT OFF STEP (module header): the turn ends inside Off, an
+    /// act due at once, and nothing is typed; the mail goes alone; On, the
+    /// claim comes back and the act that fell due goes.
+    fn autopilot_off_leg(
+        &mut self,
+        leg: &Leg,
+        manager: &str,
+        off_at: Option<i64>,
+    ) -> Result<(), Stopped> {
+        let name = leg.name;
         // The manager's mail, posted from its own tab: `post` types nothing
         // into anyone (nothing aterm types wakes an agent for mail), and
         // `kind=task` waits for the landing, `OK <id> off=<n>`.
@@ -1135,7 +2375,7 @@ impl Proof {
         let text = format!("LEG-{name} lab mail sent under Autopilot Off");
         let task = self.on(manager, &["post", &to, "kind=task", "--", &text]);
         let said = task.first();
-        let off_at = said
+        let off_at_inbox = said
             .strip_prefix("OK ")
             .and_then(|r| r.split_whitespace().find_map(|w| w.strip_prefix("off=")))
             .map(str::to_string);
@@ -1148,7 +2388,7 @@ impl Proof {
                     format!("; exit {}: {}", task.code, task.stderr.trim())
                 }
             ),
-            task.code == 0 && off_at.is_some(),
+            task.code == 0 && off_at_inbox.is_some(),
         );
         let mut rows = String::new();
         let landed = Self::wait_for(Duration::from_secs(60), Duration::from_millis(500), || {
@@ -1156,7 +2396,7 @@ impl Proof {
             rows.lines().any(|row| {
                 row.starts_with("msg ")
                     && field(row, "kind").as_deref() == Some("task")
-                    && off_at
+                    && off_at_inbox
                         .as_deref()
                         .is_some_and(|off| field(row, "off").as_deref() == Some(off))
             })
@@ -1165,17 +2405,33 @@ impl Proof {
             "autopilot: the task is in the worker's inbox (kind=task, its offset)",
             landed,
         );
-        // Something that must NOT happen gets a quiet window, never a budget
-        // for something that must: past the harness's grace, nothing typed.
-        sleep(Duration::from_secs(15))?;
+        // The first turn's answer comes SLOW_TURN after its request, and the
+        // act after real work falls due at once: inside the Off window when
+        // Off stood before it. Something that must NOT happen gets a quiet
+        // window past it.
+        let due =
+            first_at(&self.requests(name), &format!("{name}:person")).map(|t| t + ms_of(SLOW_TURN));
+        let inside = off_at.zip(due).is_some_and(|(o, d)| o < d);
+        let until = due.map_or_else(crate::util::now_ms, |d| d + 25_000);
+        while crate::util::now_ms() < until {
+            sleep(Duration::from_secs(1))?;
+        }
         let screen = self.on(&leg.sid, &["text"]).stdout;
-        let turns_after = self.on(&leg.sid, &["history"]).stdout;
+        let turns = self.on(&leg.sid, &["history"]).stdout;
+        let asked = self.tags(name);
+        let acts = self.acts(&leg.sid);
         self.check(
-            "autopilot: no `Inbox: task @` line was typed (none on screen, no turn on the ledger, no model request)",
-            !screen.contains(NUDGE)
-                && turns_after == turns_before
-                && !turns_after.contains(NUDGE)
-                && self.requests(name).len() == asked_before,
+            &format!(
+                "autopilot: under Off nothing is typed although an act fell due inside the window (the turn of real work ended {} after the Off; 25 s past it the model was asked {asked:?}, acts {acts:?}; no `Inbox: task @` line)",
+                off_at
+                    .zip(due)
+                    .map_or_else(|| "?".to_string(), |(o, d)| secs(d - o))
+            ),
+            inside
+                && asked == [format!("{name}:person")]
+                && acts.is_empty()
+                && !screen.contains(NUDGE)
+                && !turns.contains(NUDGE),
         );
         let on = self.on(&leg.sid, &["meta", "set", "autopilot", "cruise"]);
         self.check(
@@ -1194,6 +2450,376 @@ impl Proof {
             ),
             again.is_some(),
         );
+        let continued = self.await_act(leg, "continue@v1", Duration::from_secs(120))?;
+        self.check(
+            "autopilot: back On, the act that fell due under Off is typed (continue@v1)",
+            continued,
+        );
+        Ok(())
+    }
+
+    /// THE EXCHANGE LEGS' TURN (module header): the message (`LEG-<leg>`
+    /// and [`PERSON_ASKS`]) typed into the leg's codex composer and sent with
+    /// Enter — as a PERSON types it where `as_person`, through aterm's
+    /// development seam `send|key as=person` (a person's gesture through the
+    /// window's own input seam, which stamps `status human_ms=`), else as a
+    /// control write (`send`, `key`). The Enter goes once more while the
+    /// draft still stands there, as a person's would (`forever`'s
+    /// `person_turn`). `None` where it could not be typed, each reason a
+    /// failed check that names it: a build that refuses the seam, one older
+    /// than it (it types the word into the composer as text), or a composer
+    /// that never showed or kept the draft.
+    fn type_exchange(&mut self, leg: &Leg, as_person: bool) -> Result<Option<Typed>, Stopped> {
+        let name = leg.name;
+        let text = format!("LEG-{name} {PERSON_ASKS}");
+        let draft = |p: &Self| composer_row("codex", &p.on(&leg.sid, &["text"]).stdout);
+        let ready = Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), || {
+            draft(self).is_some()
+        })?;
+        if !ready {
+            self.check(&format!("{name}: codex's composer is on its screen"), false);
+            return Ok(None);
+        }
+        let seam: &[&str] = if as_person { &["as=person"] } else { &[] };
+        let how = if as_person {
+            "`send|key as=person`"
+        } else {
+            "`send`, `key`"
+        };
+        let refused = |p: &mut Self, verb: &str, r: &instance::Reply| {
+            p.check(
+                &format!(
+                    "{name}: COULD NOT RUN: `{verb}{}` refused ({}{}){}",
+                    if as_person { " as=person" } else { "" },
+                    r.stdout.trim(),
+                    r.stderr.trim(),
+                    if as_person {
+                        ": a person's own exchange needs aterm's development seam, a debug or \
+                         dev-seams build of this tree (targo --unverified build -p aterm)"
+                    } else {
+                        ""
+                    }
+                ),
+                false,
+            );
+        };
+        let before = self.status(&leg.sid);
+        let mut send = vec!["send"];
+        send.extend_from_slice(seam);
+        send.push(&text);
+        let sent = self.on(&leg.sid, &send);
+        if sent.code != 0 {
+            refused(self, "send", &sent);
+            return Ok(None);
+        }
+        let mut seen = None;
+        let stood = Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), || {
+            seen = draft(self);
+            seen.as_deref() == Some(text.as_str())
+        })?;
+        if !stood {
+            let older = seen.as_deref().is_some_and(|d| d.starts_with("as=person"));
+            self.check(
+                &if older {
+                    format!(
+                        "{name}: COULD NOT RUN: the aterm under test is older than `send|key \
+                         as=person` (it typed the word into the composer: {seen:?}): build this \
+                         tree's (targo --unverified build -p aterm)"
+                    )
+                } else {
+                    format!("{name}: the message stood in codex's composer (it read {seen:?})")
+                },
+                false,
+            );
+            return Ok(None);
+        }
+        let drafted = self.status(&leg.sid);
+        let mut key = vec!["key"];
+        key.extend_from_slice(seam);
+        key.push("enter");
+        let mut pressed = None;
+        for _ in 0..2 {
+            let at = crate::util::now_ms();
+            let r = self.on(&leg.sid, &key);
+            if r.code != 0 {
+                refused(self, "key", &r);
+                return Ok(None);
+            }
+            let gone = Self::wait_for(Duration::from_secs(5), Duration::from_millis(250), || {
+                draft(self).as_deref() != Some(text.as_str())
+            })?;
+            if gone {
+                pressed = Some(at);
+                break;
+            }
+        }
+        let Some(pressed_ms) = pressed else {
+            self.check(
+                &format!("{name}: the message, typed by {how}, left codex's composer at its Enter"),
+                false,
+            );
+            return Ok(None);
+        };
+        let after = self.status(&leg.sid);
+        Ok(Some(Typed {
+            pressed_ms,
+            before,
+            sent: drafted,
+            after,
+        }))
+    }
+
+    /// The exchange legs' turns typed (module header), and what aterm's
+    /// `status` said of each hand: the person's Enter stamped `human_ms` and
+    /// moved `human_seq` past the send's own stamp ([`Typed::enter_stamped`];
+    /// else no person's Enter reached the session, and the exchange's checks
+    /// say nothing of a person's exchange); the control's stamped nothing.
+    fn type_exchanges(
+        &mut self,
+        person: &Leg,
+        control: &Leg,
+    ) -> Result<(Option<Typed>, Option<Typed>), Stopped> {
+        let theirs = self.type_exchange(person, true)?;
+        if let Some(t) = &theirs {
+            let (ms, _) = person_hand(&t.after);
+            let (stamped, [before, sent, after]) = t.enter_stamped();
+            self.check(
+                &format!(
+                    "exchange: the person's message typed through aterm's development seam \
+                     (`send|key as=person`), and their Enter stamped status human_ms as a window \
+                     keystroke does (human_ms={} human_seq {before}->{sent} at the send, \
+                     ->{after} at the Enter; task={} before it)",
+                    ms.map_or_else(|| "-".to_string(), |m| m.to_string()),
+                    task_face(&t.before)
+                ),
+                stamped,
+            );
+        }
+        let ours = self.type_exchange(control, false)?;
+        if let Some(t) = &ours {
+            let ((_, was), (ms, seq)) = (person_hand(&t.before), person_hand(&t.after));
+            self.check(
+                &format!(
+                    "control: the same message typed as a control write (`send`, `key`) stamped \
+                     no person's gesture (human_ms={} human_seq {was}->{seq})",
+                    ms.map_or_else(|| "-".to_string(), |m| m.to_string())
+                ),
+                t.stamped_nothing(),
+            );
+        }
+        Ok((theirs, ours))
+    }
+
+    /// Wait until unix ms `at` (no wait where it has passed): the anchored
+    /// end of a window read off the model's log, never when the lab looked.
+    fn sleep_until(at: i64) -> Result<(), Stopped> {
+        while crate::util::now_ms() < at {
+            sleep(Duration::from_millis(250))?;
+        }
+        Ok(())
+    }
+
+    /// A PERSON'S OWN EXCHANGE, judged (module header): the control's turn
+    /// continued, the person's left to them — nothing typed, the rule named
+    /// in its journal, aterm's face `theirs`. Each wait is anchored at the
+    /// replies' times in the model's log, so a judge called late waits for
+    /// nothing.
+    fn exchange_leg(
+        &mut self,
+        person: &Leg,
+        control: &Leg,
+        typed: &(Option<Typed>, Option<Typed>),
+    ) -> Result<(), Stopped> {
+        let (Some(theirs), Some(ours)) = typed else {
+            self.check(
+                "exchange: both turns typed (the person's and the control's), so the exchange is \
+                 judged against its control",
+                false,
+            );
+            return Ok(());
+        };
+        // Each turn at the model within a minute of its Enter, and the
+        // control's continuation at once after its reply of real work: hang
+        // detectors anchored there.
+        let asked = self.tag_by(person, "person", theirs.pressed_ms + 60_000)?
+            && self.tag_by(control, "person", ours.pressed_ms + 60_000)?;
+        if let Some((reply, _)) = person_reply(control.name, &self.requests(control.name))
+            && self.tag_by(control, "continue", reply + CONTROL_ACT_MS)?
+        {
+            // Its act is on the timeline once it is typed.
+            let _ = self.await_act(control, "continue@v1", Duration::from_secs(60))?;
+        }
+        let control_acts = self.acts(&control.sid);
+        let continued = continued_after(control.name, &self.requests(control.name), &control_acts);
+        self.check(
+            &format!(
+                "control: a turn typed as a control write through the same path is codex-alab's \
+                 to go on with: Cruise's continuation (continue@v1) after its plain reply of real \
+                 work ({}; acts: {})",
+                continued
+                    .as_ref()
+                    .map_or_else(Clone::clone, |ms| format!("{} after the reply", secs(*ms))),
+                control_acts.join(" ")
+            ),
+            asked && continued.is_ok(),
+        );
+        let control_ms = continued.ok();
+        // The person's quiet: at least a minute past their reply, and past
+        // the control's latency.
+        let reply = person_reply(person.name, &self.requests(person.name)).map(|(r, _)| r);
+        if let Some(reply) = reply {
+            let need = ms_of(EXCHANGE_QUIET).max(control_ms.unwrap_or(0) + 10_000);
+            Self::sleep_until(reply + need)?;
+        }
+        let acts = self.acts(&person.sid);
+        let rows = self.requests(person.name);
+        let left = left_to_person(person.name, &rows, &acts, crate::util::now_ms(), control_ms);
+        let proven = self.proven_pid(&person.sid).is_some();
+        self.check(
+            &format!(
+                "exchange: after the person's own turn and the model's plain reply of real work \
+                 ({} after their Enter), codex-alab types NOTHING, its claim still proven ({}; \
+                 proven: {proven})",
+                reply.map_or_else(|| "?".to_string(), |r| secs(r - theirs.pressed_ms)),
+                left.as_ref().unwrap_or_else(|why| why)
+            ),
+            asked && left.is_ok() && proven,
+        );
+        let journal = Self::codex_log(person);
+        let rule = exchange_rule(&journal);
+        let typed_acts = journal_typed(&journal);
+        self.check(
+            &format!(
+                "exchange: the leg's codex-alab journal names the rule it used, a person's own \
+                 exchange (aterm's {RULE_LEFT}) ({}; typed: {typed_acts:?})",
+                rule.as_deref().unwrap_or("no such line")
+            ),
+            rule.is_some() && typed_acts.is_empty(),
+        );
+        let control_journal = Self::codex_log(control);
+        let control_typed = journal_typed(&control_journal);
+        let control_rule = exchange_rule(&control_journal);
+        self.check(
+            &format!(
+                "control: its journal names the act it typed (act continue@v1) and no person's \
+                 exchange (typed: {control_typed:?}; rule line: {})",
+                control_rule.as_deref().unwrap_or("none")
+            ),
+            control_typed.iter().any(|a| a == "continue@v1") && control_rule.is_none(),
+        );
+        // The face, read now: nothing has moved it since the point (no act,
+        // no turn), so it is the point's.
+        let face = task_face(&self.status(&person.sid));
+        self.check(
+            &format!(
+                "exchange: aterm's task face reads theirs at the point left to the person (status \
+                 task={face}; task={} before their turn){}",
+                task_face(&theirs.before),
+                if face == "theirs" {
+                    ""
+                } else {
+                    ": aterm tells a proven self-claim's face from the acts it records (FOREVER \
+                     LAND §10.4), and codex-alab recorded no left-to-person@v1 at this point"
+                }
+            ),
+            face == "theirs",
+        );
+        let control_face = task_face(&self.status(&control.sid));
+        self.check(
+            &format!(
+                "control: aterm's task face never reads theirs at the control's point: open, told \
+                 by codex-alab's continue@v1 (status task={control_face}; task={} before its turn)",
+                task_face(&ours.before)
+            ),
+            control_face == "open",
+        );
+        Ok(())
+    }
+
+    /// Where the person's exchange's codex-alab stood before the live
+    /// upgrade ([`Self::exchange_stays_left`]): its proven pid, its record's
+    /// `execGeneration`, and the resumes its journal names ([`resumes`]).
+    fn exchange_before_upgrade(&self, person: &Leg) -> Option<(i32, i64, usize)> {
+        let pid = self.proven_pid(&person.sid)?;
+        let generation = Self::record(person, pid).map_or(0, |r| exec_generation(&r));
+        Some((pid, generation, resumes(&Self::codex_log(person))))
+    }
+
+    /// THE PERSON'S EXCHANGE AT THE RUN'S END, past the live upgrade: the
+    /// re-link moves every running codex-alab, the exchange's too (`was`,
+    /// [`Self::exchange_before_upgrade`]), and the image it re-execs into
+    /// resumes the conversation and decides its point again, the person's
+    /// own exchange; it must leave it to them as the image before did. So
+    /// the check waits for the re-exec (its record's `execGeneration` up) and
+    /// the new image's first decision after its resume
+    /// ([`decided_after_resume`], `nothing`), both hang detectors, then reads
+    /// the exchange: still nothing asked of the model after the person's
+    /// reply, no act typed on the timeline ([`typed_acts`]) nor in either
+    /// image's journal ([`journal_typed`]). How long since the reply says how
+    /// far the observation reaches.
+    fn exchange_stays_left(
+        &mut self,
+        person: &Leg,
+        was: Option<(i32, i64, usize)>,
+    ) -> Result<(), Stopped> {
+        let rows = self.requests(person.name);
+        let Some((reply, _)) = person_reply(person.name, &rows) else {
+            return Ok(());
+        };
+        let Some((pid, generation, resumed)) = was else {
+            self.check(
+                "exchange: a proven codex-alab held the person's exchange before the upgrade",
+                false,
+            );
+            return Ok(());
+        };
+        let mut now_at = generation;
+        let moved = Self::wait_for(Duration::from_secs(150), Duration::from_secs(1), || {
+            now_at = Self::record(person, pid).map_or(now_at, |r| exec_generation(&r));
+            now_at > generation
+        })?;
+        self.check(
+            &format!(
+                "exchange: the upgrade re-exec'd the exchange's codex-alab too (pid {pid}, \
+                 execGeneration {generation}->{now_at})"
+            ),
+            moved,
+        );
+        let mut decided = None;
+        if moved {
+            Self::wait_for(Duration::from_secs(90), Duration::from_secs(1), || {
+                decided = decided_after_resume(&Self::codex_log(person), resumed);
+                decided.is_some()
+            })?;
+        }
+        let left = decided.as_deref().is_some_and(|d| {
+            d.split_once(": ")
+                .is_some_and(|(_, what)| what.starts_with("nothing ("))
+        });
+        self.check(
+            &format!(
+                "exchange: the new image, resumed into the person's exchange, decided nothing \
+                 there ({})",
+                decided.as_deref().unwrap_or("no decision after its resume")
+            ),
+            left,
+        );
+        let rows = self.requests(person.name);
+        let asked: Vec<String> = person_reply(person.name, &rows)
+            .map(|(_, after)| after.iter().map(|r| str_of(r, "tag")).collect())
+            .unwrap_or_default();
+        let acts = self.acts(&person.sid);
+        let typed = typed_acts(&acts);
+        let journal = journal_typed(&Self::codex_log(person));
+        self.check(
+            &format!(
+                "exchange: nothing typed into the person's exchange by the run's end, past the \
+                 upgrade ({} since the reply; asked after it: {asked:?}; acts: {acts:?}; \
+                 journal typed: {journal:?})",
+                secs(crate::util::now_ms() - reply)
+            ),
+            asked.is_empty() && typed.is_empty() && journal.is_empty(),
+        );
         Ok(())
     }
 
@@ -1210,8 +2836,7 @@ impl Proof {
             }
             println!("  status {} {}", leg.name, self.status(&leg.sid));
             println!("  acts {} {}", leg.name, self.acts(&leg.sid).join(" "));
-            let log =
-                std::fs::read_to_string(leg.home.join("log/codex-tui.log")).unwrap_or_default();
+            let log = Self::codex_log(leg);
             let alab: Vec<&str> = log.lines().filter(|l| l.contains("codex_alab")).collect();
             for l in &alab[alab.len().saturating_sub(15)..] {
                 println!(
@@ -1236,9 +2861,24 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The folder of a leg's `CODEX_HOME` its codex writes its TUI log to
+/// (`log_dir`), the leg's codex-alab journal. Never `log`: codex removes
+/// `<CODEX_HOME>/log/codex-tui.log` at every start (upstream's legacy-log
+/// cleanup, `remove_legacy_tui_log_file`), so a journal there held only the
+/// newest image's lines, each crash relaunch and the live upgrade's re-exec
+/// wiping the one before (the live run of 2026-10-21 read the exchange's
+/// journal past the upgrade from its new image alone). Here codex appends,
+/// every process of the leg to one file.
+const JOURNAL_DIR: &str = "journal";
+
+/// The codex-alab journal of the leg whose `CODEX_HOME` is `home`.
+fn journal_path(home: &Path) -> PathBuf {
+    home.join(JOURNAL_DIR).join("codex-tui.log")
+}
+
 /// A leg's `config.toml`: the lab's model provider, Codex's own updater,
-/// analytics, feedback and telemetry off, the TUI's file log in its home, and
-/// the project trusted as spelled and as resolved.
+/// analytics, feedback and telemetry off, the TUI's file log in its home
+/// ([`JOURNAL_DIR`]), and the project trusted as spelled and as resolved.
 fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
     let p = proj.to_string_lossy();
     let mut trusted = vec![p.to_string()];
@@ -1260,7 +2900,7 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
          [model_providers.lab]\nname = \"lab fake model\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\n\
          wire_api = \"responses\"\nexperimental_bearer_token = \"{key}\"\nrequest_max_retries = 0\n\
          stream_max_retries = 0\nstream_idle_timeout_ms = 300000\n\n{projects}\n{extra}",
-        log = home.join("log").display(),
+        log = home.join(JOURNAL_DIR).display(),
         key = crate::stub::LAB_CODEX_KEY,
     )
 }
@@ -1321,7 +2961,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let log = api_log.clone();
-        std::thread::spawn(move || codex_rig::serve(listener, log, Arc::new(answer)));
+        std::thread::spawn(move || codex_rig::serve(listener, log, Arc::new(model::answer)));
         std::fs::write(
             s.join("zdot/.zshrc"),
             format!(
@@ -1439,6 +3079,7 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         return Err(f);
     }
     let _ = proof.inst.ctl(&["ready"]);
+    let began = Instant::now();
     // The Autopilot Off step's mail: the bridge on the lab's bus, and a plain
     // tab to post it from (`post kind=task`).
     let bus = proof.bus_up()?;
@@ -1459,25 +3100,61 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         ),
         manager.is_some(),
     );
-    println!("legs (one instance, each a tab; the model answers by the leg its prompt names)");
-    let first = proof.spawn_leg("first", "Say hello and finish.", "")?;
-    let hold = proof.spawn_leg("hold", "Write a plan, then stop.", "")?;
+    println!(
+        "legs (one instance, each a tab; the model answers by the leg its prompt names and the act aterm's words name)"
+    );
+    let first = proof.spawn_leg("first", "Say hello and finish.", "", Folder::Scratch, None)?;
+    // The longest chains first: Land's four nudges, the reland and the
+    // repository.
+    let land = proof.spawn_leg("land", "Land the work.", "", Folder::Plain, Some("land"))?;
+    let reland = proof.spawn_leg("reland", "Land the work.", "", Folder::Plain, Some("land"))?;
+    let repo = proof.spawn_leg(
+        "repo",
+        "Write the release notes.",
+        "",
+        Folder::Origin,
+        Some("land"),
+    )?;
+    let hold = proof.spawn_leg(
+        "hold",
+        "Write a plan, then stop.",
+        "",
+        Folder::Scratch,
+        None,
+    )?;
     let hold_pid = proof.claim(&hold)?;
     let on = proof.inst.ctl(&["hold", &hold.sid, "on", "reason=lab"]);
     proof.check(
         &format!("hold: put on while its first turn runs ({})", on.first()),
         on.first().contains("hold=1"),
     );
-    let cont = proof.spawn_leg("continue", "Write a plan, then stop.", "")?;
-    let approval = proof.spawn_leg("approval", "Run the build.", "")?;
+    let off = proof.spawn_leg("off", "Write a plan, then stop.", "", Folder::Scratch, None)?;
+    let needs = proof.spawn_leg("needs", "Build the release.", "", Folder::Scratch, None)?;
+    let cont = proof.spawn_leg(
+        "continue",
+        "Write a plan, then stop.",
+        "",
+        Folder::Scratch,
+        None,
+    )?;
+    let approval = proof.spawn_leg("approval", "Run the build.", "", Folder::Scratch, None)?;
     let question = proof.spawn_leg(
         "question",
         "Set up the database.",
         "[features]\ndefault_mode_request_user_input = true\n",
+        Folder::Scratch,
+        Some("land"),
     )?;
-    let usage = proof.spawn_leg("usage", "Start the task.", "")?;
-    let carry = proof.spawn_leg("carry", "Do the long task.", "")?;
-    let all = [&first, &hold, &cont, &approval, &question, &usage, &carry];
+    let usage = proof.spawn_leg("usage", "Start the task.", "", Folder::Scratch, None)?;
+    let carry = proof.spawn_leg("carry", "Do the long task.", "", Folder::Scratch, None)?;
+    // A person's own exchange and its control: `codex` bare, each turn typed
+    // into its composer once every claim is proven.
+    let exchange = proof.start_leg("exchange", None, "", Folder::Scratch, None)?;
+    let control = proof.start_leg("control", None, "", Folder::Scratch, None)?;
+    let all = [
+        &first, &land, &reland, &repo, &hold, &off, &needs, &cont, &approval, &question, &usage,
+        &carry, &exchange, &control,
+    ];
     let mut pids = vec![None; all.len()];
     for (i, leg) in all.iter().enumerate() {
         pids[i] = if leg.name == "hold" {
@@ -1486,22 +3163,71 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
             proof.claim(leg)?
         };
     }
+    let pid_of = |name: &str| {
+        all.iter()
+            .position(|leg| leg.name == name)
+            .and_then(|i| pids[i])
+    };
     let at_once = all
         .iter()
         .filter(|leg| proof.proven_pid(&leg.sid).is_some())
         .count();
     proof.check(
         &format!(
-            "{at_once} codex-alab sessions in one aterm hold proven claims at once (each keeps a subscribe stream; five and more)"
+            "{at_once} codex-alab sessions in one aterm hold proven claims at once (each keeps a subscribe stream; {})",
+            all.len()
         ),
         at_once == all.len(),
     );
+    // Off while the off leg's first turn (real work) runs, so the act after
+    // it falls due inside the window.
+    let off_at = proof.autopilot_off(&off)?;
+    // The person's turn and the control's, typed now: each answer is a turn
+    // of real work, judged once the reland leg is done (about 450 s), long
+    // past the windows it reads.
+    let typed = proof.type_exchanges(&exchange, &control)?;
+    let timed = |proof: &Proof, leg: &str, from: Instant| {
+        println!(
+            "    ({leg}: checked {:.0} s after the socket, {:.0} s on this leg)",
+            began.elapsed().as_secs_f64(),
+            from.elapsed().as_secs_f64()
+        );
+        let _ = proof;
+    };
+    // The checks in the order the lab's own hands are due: the repository's
+    // commit within its hold after the first nudge (about 250 s), the
+    // reland's reopening past its quiet (about 285 s), the push within its
+    // hold after the second nudge (about 550 s); the Land leg's fourth nudge
+    // the last (about 620 s).
+    let t = Instant::now();
+    proof.needs_leg(&needs)?;
+    timed(proof, "needs", t);
+    let t = Instant::now();
     proof.first_leg(&first)?;
+    timed(proof, "first", t);
+    // At rest, its next defend prompt owed four minutes on: the crash rule's
+    // relaunch must still type it (the Cruise check at the end).
+    let t = Instant::now();
+    proof.crash_leg(&first, pid_of("first"))?;
+    timed(proof, "crash", t);
+    let t = Instant::now();
+    proof.carry_leg(&carry, pid_of("carry"))?;
+    timed(proof, "carry", t);
+    let t = Instant::now();
     proof.continue_leg(&cont)?;
+    timed(proof, "continue", t);
+    let t = Instant::now();
     proof.approval_leg(&approval)?;
+    timed(proof, "approval", t);
+    let t = Instant::now();
     proof.question_leg(&question)?;
+    timed(proof, "question", t);
+    let t = Instant::now();
+    proof.rollout_leg(&[&first, &cont, &approval, &question])?;
+    timed(proof, "rollout", t);
+    let t = Instant::now();
     match (bus, manager.as_deref()) {
-        (true, Some(manager)) => proof.autopilot_off_leg(&question, manager)?,
+        (true, Some(manager)) => proof.autopilot_off_leg(&off, manager, off_at)?,
         _ => {
             proof.check(
                 "autopilot: the Autopilot Off step needs the lab's bus and the manager's tab",
@@ -1509,11 +3235,49 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
             );
         }
     }
+    timed(proof, "Autopilot Off", t);
+    let t = Instant::now();
     proof.hold_leg(&hold, hold_pid)?;
-    proof.crash_leg(&first, pids[0])?;
-    proof.carry_leg(&carry, pids[6])?;
+    timed(proof, "hold", t);
+    let t = Instant::now();
     proof.usage_leg(&usage)?;
+    timed(proof, "usage", t);
+    let t = Instant::now();
+    proof.repo_leg(&repo)?;
+    timed(proof, "repo (committed)", t);
+    let t = Instant::now();
+    let reopened = proof.reland_landed(&reland)?;
+    timed(proof, "reland (landed, quiet, reopened)", t);
+    if reopened {
+        let t = Instant::now();
+        proof.reland_again(&reland)?;
+        timed(proof, "reland (landed again)", t);
+    }
+    let t = Instant::now();
+    proof.exchange_leg(&exchange, &control, &typed)?;
+    timed(proof, "exchange", t);
+    let t = Instant::now();
+    proof.repo_pushed(&repo)?;
+    timed(proof, "repo (pushed)", t);
+    let t = Instant::now();
+    proof.land_leg(&land)?;
+    timed(proof, "land", t);
+    proof.needs_cleared(&needs)?;
+    proof.landed_stay_quiet(&[&land, &reland, &repo]);
+    proof.cruise_rests_never(&[
+        &first, &needs, &cont, &approval, &hold, &off, &usage, &carry, &exchange, &control,
+    ]);
+    // The exchange is read past the upgrade, which re-execs its codex-alab
+    // too: the new image's resume decides the person's point again.
+    let exchange_was = proof.exchange_before_upgrade(&exchange);
+    let t = Instant::now();
     proof.upgrade_leg(&cont, pkg_b)?;
+    timed(proof, "upgrade", t);
+    if typed.0.is_some() {
+        let t = Instant::now();
+        proof.exchange_stays_left(&exchange, exchange_was)?;
+        timed(proof, "exchange (past the upgrade)", t);
+    }
     if !proof.fails.is_empty() {
         proof.diagnose(&all);
     }
@@ -1524,110 +3288,452 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
 mod tests {
     use super::*;
 
-    fn body(texts: &[&str], tool: Option<&str>) -> J {
-        let mut input: Vec<J> = texts
-            .iter()
-            .map(|t| J::obj([("role", J::s("user")), ("content", J::s(*t))]))
-            .collect();
-        if let Some(out) = tool {
-            input.push(J::obj([
-                ("type", J::s("function_call_output")),
-                ("output", J::s(out)),
-            ]));
-        }
-        J::obj([("input", J::Arr(input))])
+    /// THE CARRY LEG'S HOLDER CHECK FROM THE SESSION LOG (phase 6, 6F-7):
+    /// the act mark `harness-turn@v1` writes names its holder, as the
+    /// timeline's row does. NEGATIVE CONTROLS: the mark without `holder=`
+    /// (the 6F-6 log's), another holder's, and the timeline's row itself
+    /// (no log line) each fail.
+    #[test]
+    fn the_relaunched_holders_act_is_read_from_the_log() {
+        let mark = "OK log ep=3\n41 mark t2 act word=dispatch rule=harness-turn.v1 \
+                    holder=codex-alab@4242 harness_act=harness-turn@v1 by=s-abc src=mark \
+                    conf=claim t=9\n";
+        assert!(acted_in_log(mark, "harness-turn@v1", "codex-alab@4242"));
+        assert!(
+            !acted_in_log(
+                &mark.replace(" harness_act=harness-turn@v1", ""),
+                "harness-turn@v1",
+                "codex-alab@4242"
+            ),
+            "a mark with no harness_act="
+        );
+        // An act with no word is a record too: `word=unknown`, no `rule=`.
+        let unworded = "OK log ep=3\n42 mark t2 act word=unknown holder=codex-alab@4242 \
+                        harness_act=finished@v1 by=s-abc src=mark conf=claim t=9\n";
+        assert!(acted_in_log(unworded, "finished@v1", "codex-alab@4242"));
+        assert!(!acted_in_log(unworded, "finished@v2", "codex-alab@4242"));
+        assert!(
+            !acted_in_log(
+                &mark.replace(" holder=codex-alab@4242", ""),
+                "harness-turn@v1",
+                "codex-alab@4242"
+            ),
+            "a mark with no holder="
+        );
+        assert!(!acted_in_log(mark, "harness-turn@v1", "codex-alab@1"));
+        assert!(!acted_in_log(mark, "land@v1", "codex-alab@4242"));
+        assert!(!acted_in_log(
+            "OK 7 t=1 kind=harness-act act=harness-turn@v1 holder=codex-alab@4242\n",
+            "harness-turn@v1",
+            "codex-alab@4242"
+        ));
     }
 
-    fn text_of(a: &Answered) -> String {
-        a.body
+    /// THE VERDICT READERS, on the lines aterm answers: the needs entry by
+    /// its kind and owner, the task face, the nudges the model was asked at,
+    /// a request's time by its tag. NEGATIVE CONTROLS beside each.
+    #[test]
+    fn the_verdicts_read_aterm_s_own_lines() {
+        let raised = "OK title=- attention=Codex%20needs%20you attention_owner=needs \
+                      attention_owners=2 attention_kinds=ask:codex-alab,ask:needs supervisor=-";
+        assert!(needs_raised(raised));
+        assert!(
+            needs_raised("OK attention_kinds=ask%3Aneeds"),
+            "pct-encoded too"
+        );
+        assert!(
+            !needs_raised("OK attention_kinds=ask:codex-alab"),
+            "another owner's ask"
+        );
+        assert!(
+            !needs_raised("OK attention_kinds=wait:needs"),
+            "a wait is no need"
+        );
+        assert!(!needs_raised("OK attention_kinds=-"));
+        assert_eq!(task_face("OK x=1 task=landed y=2"), "landed");
+        assert_eq!(
+            task_face("OK x=1 task_state=done"),
+            "-",
+            "task_state= is no face"
+        );
+        assert_eq!(
+            nudges_seen(&[
+                "land:person".to_string(),
+                "land:land".to_string(),
+                "land:nudge1".to_string(),
+                "land:nudge2+ack".to_string(),
+                "land:nudge3".to_string(),
+            ]),
+            vec![1, 2, 3]
+        );
+        assert!(nudges_seen(&["land:land".to_string()]).is_empty());
+        let acts = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            nudges_before_landing(&acts(&[
+                "land@v1",
+                "land-nudge@v1",
+                "land-nudge@v1",
+                "landed@v1",
+                "land-nudge@v1",
+            ])),
+            2,
+            "a nudge after the landing is none before it"
+        );
+        assert_eq!(
+            nudges_before_landing(&acts(&["land@v1", "land-nudge@v1"])),
+            1,
+            "no landing: every nudge"
+        );
+        // NEGATIVE CONTROL: a landing at the instruction's own yield.
+        assert_eq!(
+            nudges_before_landing(&acts(&["land@v1", "landed@v1", "land-nudge@v1"])),
+            0
+        );
+        let rows = vec![
+            J::obj([("t", J::Int(10)), ("tag", J::s("first:person"))]),
+            J::obj([("t", J::Int(130_010)), ("tag", J::s("first:defend"))]),
+        ];
+        assert_eq!(first_at(&rows, "first:defend"), Some(130_010));
+        assert_eq!(first_at(&rows, "first:nudge"), None);
+        assert_eq!(secs(130_000), "130.0 s");
+    }
+
+    /// THE CRUISE CHECK'S READER ([`claims_of`]): a done claim met by the
+    /// defend prompt, pending inside its back-off, unmet by another act or by
+    /// nothing past it. NEGATIVE CONTROLS beside each.
+    #[test]
+    fn a_done_claim_is_met_only_by_the_defend_prompt_within_its_back_off() {
+        let row = |t: i64, tag: &str, said: &str, hold: i64| {
+            J::obj([
+                ("t", J::Int(t)),
+                ("tag", J::s(tag)),
+                ("said", J::s(said)),
+                ("hold_ms", J::Int(hold)),
+                ("status", J::Int(200)),
+            ])
+        };
+        // The first leg as it ran: its claim met at 120 s, its defense's
+        // next prompt owed four minutes on (two short replies).
+        let rows = vec![
+            row(0, "first:person", model::FIRST_DONE, 0),
+            row(120_000, "first:defend+repo", model::CRUISE_DEFENSE, 0),
+        ];
+        assert_eq!(
+            claims_of("first", &rows, 200_000),
+            Claims {
+                met: 1,
+                pending: 1,
+                unmet: Vec::new()
+            }
+        );
+        // NEGATIVE CONTROL: the same log past that back-off and its slack.
+        let late = claims_of("first", &rows, 120_000 + 240_000 + CLAIM_SLACK_MS + 1);
+        assert_eq!(
+            (late.met, late.pending, late.unmet.len()),
+            (1, 0, 1),
+            "{late:?}"
+        );
+        // NEGATIVE CONTROL: a claim followed by another act.
+        let other = vec![
+            row(0, "first:person", model::FIRST_DONE, 0),
+            row(120_000, "first:continue", "Kept going.", 0),
+        ];
+        assert_eq!(
+            claims_of("first", &other, 130_000).unmet,
+            vec!["first:person then first:continue".to_string()]
+        );
+        // Real work before a claim ends the run: one short reply, two minutes.
+        let worked = vec![
+            row(0, "hold:person", model::STEP_ONE, 130_000),
+            row(191_000, "hold:continue", model::CONTINUED_DONE, 0),
+        ];
+        let due = 191_000 + 120_000 + CLAIM_SLACK_MS;
+        let c = claims_of("hold", &worked, due - 1);
+        assert_eq!((c.pending, c.unmet.len()), (1, 0));
+        assert_eq!(claims_of("hold", &worked, due + 1).unmet.len(), 1);
+        // A reply that claims nothing, and a 429, are no claims.
+        let mut wall = row(0, "usage:limit", "", 0);
+        wall.set("status", J::Int(429));
+        let none = vec![
+            wall,
+            row(120_000, "usage:continue", "Resumed after the reset.", 0),
+        ];
+        assert_eq!(claims_of("usage", &none, i64::MAX), Claims::default());
+        assert_eq!(
+            (backoff_ms(0), backoff_ms(1), backoff_ms(3), backoff_ms(9)),
+            (0, 120_000, 480_000, 3_600_000)
+        );
+        assert_eq!(tail("abcdef", 3), "def");
+        assert_eq!(tail("ab", 3), "ab");
+    }
+
+    /// A LEG'S JOURNAL OUTLIVES EACH OF ITS PROCESSES: the file
+    /// [`Proof::codex_log`] reads is the one the leg's config logs to, and it
+    /// is not `<CODEX_HOME>/log/codex-tui.log`, the file codex removes at every
+    /// start. NEGATIVE CONTROL: that removed path is the one a `log` folder
+    /// would name.
+    #[test]
+    fn a_legs_journal_is_the_file_its_config_logs_to_and_no_start_removes_it() {
+        let home = Path::new("/s/legs/exchange/codex-home");
+        let config = codex_config(1234, Path::new("/s/legs/exchange/proj"), home, "");
+        let dir = config
             .lines()
-            .filter_map(|l| l.strip_prefix("data: "))
-            .filter_map(|d| J::parse(d).ok())
-            .filter_map(|d| d.get("item").cloned())
-            .map(|it| it.py())
-            .collect()
+            .find_map(|l| l.strip_prefix("log_dir = "))
+            .map(|v| v.trim_matches('"'));
+        assert_eq!(
+            dir.map(|d| Path::new(d).join("codex-tui.log")),
+            Some(journal_path(home))
+        );
+        let removed = home.join("log").join("codex-tui.log");
+        assert_ne!(journal_path(home), removed);
+        assert_eq!(home.join("log").join("codex-tui.log"), removed);
     }
 
+    /// THE EXCHANGE LEGS' JUDGES ([`continued_after`], [`left_to_person`]):
+    /// the control continued at once after its reply, the person's exchange
+    /// quiet past the same reply for a minute and past the control's latency.
+    /// NEGATIVE CONTROLS beside each: the person's log with the control's
+    /// continuation in it, an act on the timeline alone, a window too short,
+    /// a control that got nothing, and each way the control can fail.
     #[test]
-    fn each_leg_is_answered_by_the_name_its_prompt_carries() {
+    fn a_person_s_exchange_is_left_only_beside_a_control_that_was_continued() {
+        let row = |t: i64, tag: &str, hold: i64| {
+            J::obj([
+                ("t", J::Int(t)),
+                ("tag", J::s(tag)),
+                ("hold_ms", J::Int(hold)),
+                ("status", J::Int(200)),
+            ])
+        };
+        let acts = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let reply = ms_of(SLOW_TURN);
+        // The control as it should run: its reply after a turn of real work,
+        // its continuation asked 2 s on.
+        let control = vec![
+            row(0, "control:person", reply),
+            row(reply + 2_000, "control:continue", 0),
+        ];
         assert_eq!(
-            leg_of(&body(&["<env>", "LEG-continue Write a plan"], None)).as_deref(),
-            Some("continue")
+            continued_after("control", &control, &acts(&["continue@v1"])),
+            Ok(2_000)
         );
-        assert_eq!(leg_of(&body(&["no leg here"], None)), None);
-        let first = answer(&body(&["LEG-continue Write a plan"], None));
-        assert_eq!(first.tag, "continue:t1");
+        // NEGATIVE CONTROLS: nothing after the reply; another act after it;
+        // the continuation past its hang detector; no act on the timeline.
+        assert!(continued_after("control", &control[..1], &[]).is_err());
+        let defended = vec![
+            row(0, "control:person", reply),
+            row(reply + 2_000, "control:defend", 0),
+        ];
+        assert!(continued_after("control", &defended, &acts(&["continue-done-check@v1"])).is_err());
+        let late = vec![
+            row(0, "control:person", reply),
+            row(reply + CONTROL_ACT_MS + 1, "control:continue", 0),
+        ];
+        assert!(continued_after("control", &late, &acts(&["continue@v1"])).is_err());
+        assert!(continued_after("control", &control, &[]).is_err());
+        assert!(continued_after("control", &[], &[]).is_err());
+        // The person's exchange: its reply, nothing after, watched 70 s past.
+        let person = vec![row(0, "exchange:person", reply)];
+        let now = reply + 70_000;
+        let held = left_to_person("exchange", &person, &[], now, Some(2_000));
         assert!(
-            !text_of(&first).contains(DONE),
-            "the first turn ends undone"
+            held.as_ref().is_ok_and(|s| s.contains("70.0 s")),
+            "{held:?}"
         );
-        let after = answer(&body(&["LEG-continue Write a plan", "keep going"], None));
-        assert_eq!(after.tag, "continue:after-continue");
-        assert!(text_of(&after).contains(DONE));
-        let long = answer(&body(&["LEG-carry Do the long task."], None));
-        assert_eq!(long.tag, "carry:t1");
+        // NEGATIVE CONTROL: the same log with the control's continuation in it.
+        let typed = vec![
+            row(0, "exchange:person", reply),
+            row(reply + 2_000, "exchange:continue", 0),
+        ];
+        let why = left_to_person(
+            "exchange",
+            &typed,
+            &acts(&["continue@v1"]),
+            now,
+            Some(2_000),
+        )
+        .unwrap_err();
         assert!(
-            long.delay >= CARRY_FIRST_TURN && !text_of(&long).contains(DONE),
-            "the carry leg's first turn is still running when it is killed"
+            why.contains("TYPED") && why.contains("exchange:continue"),
+            "{why}"
         );
-        let carried = answer(&body(&["LEG-carry Do the long task.", "keep going"], None));
+        // An act on the timeline alone (an answer, an approval) is typing too.
+        assert!(
+            left_to_person("exchange", &person, &acts(&["answer@v1"]), now, Some(2_000)).is_err()
+        );
+        // The point left to the person, recorded and never typed, is no
+        // typing; beside a typed act it hides nothing.
+        let left = acts(&[RULE_LEFT]);
+        assert!(left_to_person("exchange", &person, &left, now, Some(2_000)).is_ok());
+        let after = acts(&[RULE_LEFT, "continue@v1"]);
+        assert!(left_to_person("exchange", &person, &after, now, Some(2_000)).is_err());
+        // The live upgrade's re-exec at rest, recorded and never typed, is no
+        // typing either; beside a typed act it hides nothing.
+        let upgraded = acts(&[RULE_LEFT, RULE_UPGRADE]);
+        assert!(left_to_person("exchange", &person, &upgraded, now, Some(2_000)).is_ok());
         assert_eq!(
-            (carried.tag.as_str(), carried.delay),
-            ("carry:after-carry", Duration::ZERO)
+            typed_acts(&acts(&[RULE_UPGRADE, "continue@v1", RULE_LEFT])),
+            acts(&["continue@v1"])
         );
-        assert!(text_of(&carried).contains(DONE));
-        let call = answer(&body(&["LEG-approval Run the build."], None));
-        assert!(text_of(&call).contains("require_escalated"));
-        let ran = answer(&body(&["LEG-approval Run the build."], Some("done")));
-        assert_eq!(ran.tag, "approval:after-output");
-        let ask = answer(&body(&["LEG-question Set up"], None));
-        assert!(text_of(&ask).contains("request_user_input"));
-        assert!(text_of(&ask).contains("Postgres (Recommended)"));
-        // Negative control: an unnamed request is plainly finished, never a wall.
-        let plain = answer(&body(&["hello"], None));
-        assert_eq!((plain.status, plain.tag.as_str()), (200, "-:t1"));
+        // NEGATIVE CONTROLS: watched under the minute, or not past the
+        // control's latency; a control that got nothing; no turn at all.
+        assert!(left_to_person("exchange", &person, &[], reply + 59_000, Some(2_000)).is_err());
+        assert!(left_to_person("exchange", &person, &[], now, Some(75_000)).is_err());
+        assert!(left_to_person("exchange", &person, &[], now, None).is_err());
+        assert!(left_to_person("exchange", &[], &[], now, Some(2_000)).is_err());
     }
 
+    /// THE JOURNAL AND THE HAND ([`exchange_rule`], [`journal_typed`],
+    /// [`person_hand`]): the line naming the rule codex-alab left a point to
+    /// a person by, the acts it says it typed, and `status`'s person's
+    /// gesture. NEGATIVE CONTROLS: a journal of acts and other rests names no
+    /// exchange; an act not recorded, a word ending in `act`, or a phrase
+    /// with no rule is no act typed; a control write's status names no hand.
     #[test]
-    fn the_usage_leg_keeps_one_reset_until_it_is_continued() {
-        let a = answer(&body(&["LEG-usage Start the task."], None));
-        let b = answer(&body(&["LEG-usage Start the task."], None));
-        assert_eq!((a.status, b.status), (429, 429));
-        assert_eq!(a.tag, b.tag, "one window: the reset never moves");
-        assert!(a.body.contains("usage_limit_reached"));
-        assert!(
-            a.headers
-                .iter()
-                .any(|(k, _)| k == "x-codex-primary-used-percent")
-        );
-        let after = answer(&body(&["LEG-usage Start the task.", "keep going"], None));
+    fn the_journal_names_the_rule_and_status_the_hand() {
+        let left = "2026-10-21T10:00:00.000Z DEBUG codex_alab_autopilot: 019a-thread: nothing (a \
+                    person's own exchange: theirs to answer)";
         assert_eq!(
-            (after.status, after.tag.as_str()),
-            (200, "usage:after-reset")
+            exchange_rule(left).as_deref(),
+            Some("019a-thread: nothing (a person's own exchange: theirs to answer)")
+        );
+        assert!(
+            exchange_rule("LEFT seq=4 rule=left-to-person@v1").is_some(),
+            "aterm's id names it too"
+        );
+        let acted = "2026-10-21T10:00:00.000Z DEBUG codex_alab_autopilot: act continue@v1: typed \
+                     \"keep going\" (continue after a plain turn; turn 7)\n\
+                     2026-10-21T10:02:00.000Z DEBUG codex_alab_autopilot: 019a: wait 120s for \
+                     continue-done-check@v1 (a done claim)";
+        assert_eq!(exchange_rule(acted), None);
+        assert_eq!(journal_typed(acted), vec!["continue@v1".to_string()]);
+        assert!(journal_typed(left).is_empty());
+        assert!(journal_typed("act landed@v1 not recorded: no proven claim is held").is_empty());
+        assert!(journal_typed("exact continue@v1: typed").is_empty());
+        assert!(journal_typed("the act after it: typed").is_empty());
+        assert_eq!(
+            person_hand("OK hold=0 human_ms=412 human_seq=3 task=-"),
+            (Some(412), 3)
+        );
+        assert_eq!(
+            person_hand("OK hold=0 human_ms=- human_seq=0"),
+            (None, 0),
+            "a control write stamps none"
+        );
+        assert_eq!(person_hand("OK hold=0"), (None, 0));
+        assert_eq!(task_face("OK x=1 task=theirs pause=-"), "theirs");
+    }
+
+    /// THE PERSON'S ENTER IS JUDGED PAST THE SEND'S OWN STAMP
+    /// ([`Typed::enter_stamped`]): `send as=person` stamps the person's
+    /// clock itself, so the Enter is the person's only where `human_seq`
+    /// moved past its count once the draft stood. NEGATIVE CONTROL: an Enter
+    /// that stamped nothing after a send that did fails, though the count
+    /// moved from before the message; a control write stamps nothing at
+    /// either ([`Typed::stamped_nothing`]), and one that moved the count did.
+    #[test]
+    fn the_persons_enter_is_judged_past_the_sends_own_stamp() {
+        let typed = |before: &str, sent: &str, after: &str| Typed {
+            pressed_ms: 0,
+            before: format!("OK hold=0 {before} task=open"),
+            sent: format!("OK hold=0 {sent} task=open"),
+            after: format!("OK hold=0 {after} task=open"),
+        };
+        let theirs = typed(
+            "human_ms=- human_seq=0",
+            "human_ms=40 human_seq=1",
+            "human_ms=3 human_seq=2",
+        );
+        assert_eq!(theirs.enter_stamped(), (true, [0, 1, 2]));
+        assert!(!theirs.stamped_nothing());
+        let unstamped = typed(
+            "human_ms=- human_seq=0",
+            "human_ms=40 human_seq=1",
+            "human_ms=95 human_seq=1",
+        );
+        assert_eq!(
+            unstamped.enter_stamped(),
+            (false, [0, 1, 1]),
+            "the send's stamp is no Enter's"
+        );
+        let ours = typed(
+            "human_ms=- human_seq=0",
+            "human_ms=- human_seq=0",
+            "human_ms=- human_seq=0",
+        );
+        assert!(ours.stamped_nothing());
+        assert_eq!(ours.enter_stamped(), (false, [0, 0, 0]));
+        let stamped = typed(
+            "human_ms=- human_seq=0",
+            "human_ms=- human_seq=0",
+            "human_ms=2 human_seq=1",
+        );
+        assert!(
+            !stamped.stamped_nothing(),
+            "a control write that stamped one"
         );
     }
 
+    /// THE NEW IMAGE'S FIRST DECISION ([`resumes`], [`decided_after_resume`]):
+    /// a live upgrade's re-exec resumes the conversation, and its first
+    /// decision is the first deciding line after that resume — past a
+    /// `passive` line of an image not yet proven again, never one of the
+    /// image before. NEGATIVE CONTROLS: no decision before the resume
+    /// counted, none after a resume that has not come, and another target's
+    /// `resumed (` is no resume.
     #[test]
-    fn a_side_request_is_answered_by_its_schema_not_its_leg() {
-        let mut b = body(&["LEG-usage Start the task."], None);
-        b.set(
-            "text",
-            J::obj([(
-                "format",
-                J::obj([
-                    ("type", J::s("json_schema")),
-                    (
-                        "schema",
-                        J::obj([(
-                            "properties",
-                            J::obj([("title", J::obj([("type", J::s("string"))]))]),
-                        )]),
-                    ),
-                ]),
-            )]),
+    fn a_resumed_images_first_decision_is_read_after_its_resume() {
+        let before = "2026-10-21T10:00:00.000Z DEBUG codex_alab_autopilot: 019a: resumed \
+                      (task=none, relaunched=false, owed=none)\n\
+                      2026-10-21T10:00:01.000Z DEBUG codex_alab_autopilot: 019a: nothing (a \
+                      person's own exchange: theirs to answer)\n\
+                      2026-10-21T10:00:02.000Z DEBUG codex_core: 019a: resumed (task=x)\n\
+                      2026-10-21T10:09:00.000Z DEBUG codex_alab_autopilot: act upgrade@v1: \
+                      re-exec onto a new build at rest\n";
+        assert_eq!(resumes(before), 1, "codex_core's line is no resume");
+        assert_eq!(decided_after_resume(before, 1), None, "not resumed yet");
+        assert_eq!(
+            decided_after_resume(before, 0).as_deref(),
+            Some("019a: nothing (a person's own exchange: theirs to answer)"),
+            "the image before's own decision"
         );
-        let a = answer(&b);
-        assert_eq!((a.status, a.tag.as_str()), (200, "usage:side"));
+        let after = format!(
+            "{before}2026-10-21T10:09:03.000Z DEBUG codex_alab_autopilot: 019a: resumed \
+             (task=open, relaunched=false, owed=none)\n\
+             2026-10-21T10:09:03.100Z DEBUG codex_alab_autopilot: 019a: passive (no proven \
+             claim)\n"
+        );
+        assert_eq!(resumes(&after), 2);
+        assert_eq!(
+            decided_after_resume(&after, 1),
+            None,
+            "a passive image decided nothing"
+        );
+        let left = format!(
+            "{after}2026-10-21T10:09:04.000Z DEBUG codex_alab_autopilot: 019a: nothing (a \
+             person's own exchange: theirs to answer)\n"
+        );
+        assert_eq!(
+            decided_after_resume(&left, 1).as_deref(),
+            Some("019a: nothing (a person's own exchange: theirs to answer)")
+        );
+        let owed = format!(
+            "{after}2026-10-21T10:09:04.000Z DEBUG codex_alab_autopilot: 019a: wait 120s for \
+             continue@v1 (a plain turn)\n"
+        );
+        assert_eq!(
+            decided_after_resume(&owed, 1).as_deref(),
+            Some("019a: wait 120s for continue@v1 (a plain turn)")
+        );
+        let typed = format!(
+            "{after}2026-10-21T10:09:04.000Z DEBUG codex_alab_autopilot: act continue@v1: typed \
+             \"keep going\" (continue after a plain turn; turn 9)\n"
+        );
+        assert!(
+            decided_after_resume(&typed, 1).is_some_and(|d| d.starts_with("act continue@v1")),
+            "an act typed is a decision"
+        );
+        assert_eq!(decided_after_resume(&left, 2), None);
     }
 
     #[test]
@@ -1648,5 +3754,124 @@ mod tests {
         let root = package(Some(&bin), "/nonexistent").unwrap();
         assert_eq!(root, std::fs::canonicalize(dir).unwrap());
         assert!(package(Some("/nonexistent/codex"), "/nonexistent").is_err());
+    }
+
+    /// A tap stand-in for [`past_the_fence`]: each look after the first
+    /// answers one more ask, and the planted write (a turn from the
+    /// rollout, `src=transcript`) lands with the ask numbered `late`, before
+    /// that ask is counted, as the host counts it; `stuck` answers none past
+    /// the first look.
+    struct Script {
+        word: &'static str,
+        asks: std::cell::Cell<u64>,
+        looked: std::cell::Cell<bool>,
+        late: Option<u64>,
+        stuck: bool,
+        log: std::cell::RefCell<Vec<String>>,
+    }
+
+    const LATE_TURN: &str =
+        "12 open t1 turn par=r1 vref=turn-1 src=transcript conf=exact t=1760000001000";
+
+    impl Script {
+        fn new(word: &'static str, late: Option<u64>) -> Script {
+            Script {
+                word,
+                asks: std::cell::Cell::new(40),
+                looked: std::cell::Cell::new(false),
+                late,
+                stuck: false,
+                log: std::cell::RefCell::new(vec![
+                    "9 open t1 turn par=r1 src=screen conf=strong t=1760000000000".to_string(),
+                ]),
+            }
+        }
+
+        fn look(&self) -> Option<TapSaid> {
+            if self.looked.replace(true) && !self.stuck {
+                let next = self.asks.get() + 1;
+                if self.late == Some(next) {
+                    self.log.borrow_mut().push(LATE_TURN.to_string());
+                }
+                self.asks.set(next);
+            }
+            tap_said(&format!(
+                "OK schema=1 need=- need_since_ms=- rollout={} rollout_asks={} editing=0",
+                self.word,
+                self.asks.get()
+            ))
+        }
+
+        fn read(&self) -> Vec<String> {
+            self.log.borrow().clone()
+        }
+    }
+
+    /// The hang detector, by hand: at most 10 looks, no clock.
+    fn ten_looks(ok: &mut dyn FnMut() -> bool) -> Result<bool, Stopped> {
+        Ok((0..10).any(|_| ok()))
+    }
+
+    /// THE ROLLOUT LEG READS PAST THE TAP'S FENCE (B5c): the log is read
+    /// only once the tap answered two asks past the first look, so a turn
+    /// from the rollout that a tap writes late (with the second ask: the
+    /// last that could still hold what the rollout held at the look) fails
+    /// the unmeasured verdict, and the same tap with no late write passes
+    /// it. NEGATIVE CONTROLS: the planted late write fails it, where a read
+    /// at once (the branch before this one) passes it; a tap that answers
+    /// no ask past the look, a tap that says `bound` on an unmeasured build
+    /// and a `status` that names no answer each fail it; on a measured
+    /// build the same late turn is what passes, and a tap that bound
+    /// nothing fails.
+    #[test]
+    fn the_rollout_leg_reads_past_the_taps_fence() {
+        let verdict = |measured: bool, script: &Script| match past_the_fence(
+            || script.look(),
+            || script.read(),
+            ten_looks,
+        )
+        .expect("not stopped")
+        {
+            Fenced::Past { from, to, got } => {
+                assert_eq!(to.asks, from.asks + FENCE_ASKS, "read at the fence");
+                Some(rollout_holds(measured, &to, &got))
+            }
+            Fenced::NoTap | Fenced::Stuck { .. } => None,
+        };
+        // An unmeasured build, its tap refusing: nothing from the rollout.
+        assert_eq!(verdict(false, &Script::new("unmeasured", None)), Some(true));
+        // NEGATIVE CONTROL: the planted late write lands with the fence's
+        // last ask, and the read past the fence sees it.
+        let late = Script::new("unmeasured", Some(42));
+        assert_eq!(verdict(false, &late), Some(false));
+        assert!(late.read().iter().any(|l| l == LATE_TURN));
+        // ... where the read at once (before this unit) passed it.
+        let at_once = Script::new("unmeasured", Some(42));
+        let first = at_once.look().expect("an answer");
+        assert!(rollout_holds(false, &first, &at_once.read()));
+        // A tap that answers no ask past the look never reads.
+        let mut stuck = Script::new("unmeasured", None);
+        stuck.stuck = true;
+        let fenced = past_the_fence(|| stuck.look(), || stuck.read(), ten_looks).expect("ran");
+        assert!(
+            matches!(fenced, Fenced::Stuck { ref from, ref to } if from.asks == 40 && to.asks == 40),
+            "{fenced:?}"
+        );
+        // A tap that bound an unmeasured build fails though nothing landed.
+        assert_eq!(verdict(false, &Script::new("bound", None)), Some(false));
+        // No answer named at all.
+        assert_eq!(
+            past_the_fence(|| None, Vec::<String>::new, ten_looks).expect("ran"),
+            Fenced::NoTap
+        );
+        assert_eq!(tap_said("OK rollout=bound rollout_asks=x"), None);
+        // A measured build: the turn from the rollout is what holds, and a
+        // tap that bound nothing fails.
+        assert_eq!(verdict(true, &Script::new("bound", Some(41))), Some(true));
+        assert_eq!(verdict(true, &Script::new("bound", None)), Some(false));
+        assert_eq!(
+            verdict(true, &Script::new("unmeasured", Some(41))),
+            Some(false)
+        );
     }
 }

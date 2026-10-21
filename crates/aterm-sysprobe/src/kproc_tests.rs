@@ -206,8 +206,12 @@ mod live {
                     "tpgid: {line} vs {r:?}"
                 );
             }
+            // `ps` prints a uid as a signed number: `nobody` (4294967294,
+            // macOS's dhcp6d runs as it) reads `-2`.
             assert_eq!(
-                w[4].parse::<u32>().ok(),
+                w[4].parse::<u32>()
+                    .ok()
+                    .or_else(|| w[4].parse::<i32>().ok().map(i32::cast_unsigned)),
                 Some(r.uid),
                 "uid: {line} vs {r:?}"
             );

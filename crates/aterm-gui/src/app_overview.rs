@@ -128,7 +128,12 @@ impl App {
             None => ChipMark::Quiet,
         };
         let doing = match (&verdict.need, &verdict.waiting) {
-            (Some(need), _) => need.what.clone(),
+            // A harness's need, whose `what` has no frame (§12.2.3), says it
+            // is a need: no header above the line does (§12.2.9).
+            (Some(need), _) => need.harness.as_ref().map_or_else(
+                || need.what.clone(),
+                |ask| ask.cued_line(crate::needs::ROW_WHAT_MAX),
+            ),
             // A person's words, as ❯ ▸ Waiting says them, never the wire word.
             (None, Some(wait)) => {
                 let words = crate::needs::wait_words(wait, verdict.recheck_unix.is_some());
@@ -142,8 +147,16 @@ impl App {
         };
         let task_words = task.as_ref().map(|t| {
             let age = coarse_age(t.since_ms());
-            let mut words = format!("task {} {age}", t.state.as_str());
-            if let Some(why) = t.why {
+            // A landing says `landed` (§12.4.1): `task landed 4m`, never
+            // `task done 4m (landed)`; an older build's done keeps its why.
+            let landed = t.state == crate::task_record::TaskState::Done
+                && t.why == Some(crate::task_record::WHY_LANDED);
+            let mut words = if landed {
+                format!("task landed {age}")
+            } else {
+                format!("task {} {age}", t.state.as_str())
+            };
+            if let Some(why) = t.why.filter(|_| !landed) {
                 words.push_str(&format!(" ({why})"));
             }
             if t.state == crate::task_record::TaskState::Done && t.result_bytes > 0 {
@@ -166,9 +179,33 @@ impl App {
                     None => Driver::WorkerOfElsewhere(short_sid(&t.from)),
                 }
             });
-        let driven = program
+        // Who drives, in the chip's own words (`crate::app_presence::
+        // driven_words`: `land, landed`, §12.4.1), and why a landing holds
+        // (§12.3.1) on a line of its own under the chip's: the hold's words
+        // with no clock, as the menu bar's landing worker's tip says them
+        // (`hold_words`' tip form), only where a land act's yield was read.
+        // On the chip's own line the hover's long words would push `typed
+        // by` past the card's width.
+        let (driven, held) = program
             .filter(|agent| hosting.hosts(h.sid.as_str(), autopilot, *agent))
-            .map(|_| Driver::Aterm(autopilot.unwrap_or(hosting.autopilot).word().to_string()));
+            .map_or((None, None), |_| {
+                let glass = self.chip_glass(h.local_id);
+                let view = self.session_autopilot(h.local_id).1;
+                let face = crate::claude_lights::ChipFace::of(view, &glass);
+                let held = self
+                    .shown_hold(h.local_id)
+                    .filter(|hold| hold.read())
+                    .and_then(|hold| {
+                        crate::harness_glass::hold_words(
+                            &hold,
+                            None,
+                            crate::harness_glass::HoldForm::Tip,
+                            None,
+                        )
+                    });
+                (crate::app_presence::driven_words(face, &glass, None), held)
+            });
+        let driven = driven.map(Driver::Aterm);
         let is_worker = worker_of.is_some();
         let driver = if person {
             Some(Driver::You)
@@ -196,6 +233,7 @@ impl App {
             task: task.as_ref().map(|t| t.state.as_str()),
             task_words,
             driver,
+            held,
             typed: self.typed_by(ctx).map(|typed| {
                 let ago = aterm_time::unix_millis()
                     .unwrap_or(0)
@@ -1630,6 +1668,248 @@ mod tests {
         app.siblings.clear();
         app.overview_refresh_all();
         assert!(!title(&app).contains("another aterm"), "{}", title(&app));
+    }
+
+    /// THE OVERVIEW NAMES WHO DRIVES AS THE HOVER DOES (§12.4.1; one helper,
+    /// `app_presence::driven_words`): a Claude Code under Land this host
+    /// supervises reads `driven by aterm (land)`, then `(land, landed)` once
+    /// its loop tells the landing; a worker Land landed reads `task landed
+    /// …`, never `task done … (landed)` nor `task landed … (landed)`.
+    /// NEGATIVE CONTROLS (as run): main's mode word alone reads `driven by
+    /// aterm (land)` after the landing, and its task words `task done just
+    /// now (landed)`; the why kept beside `landed` reads `task landed just
+    /// now (landed)`.
+    #[test]
+    fn the_overview_names_the_chips_face_and_a_landed_task() {
+        use crate::overview::Driver;
+        use aterm_agent::harness::acts::TaskFace;
+        let mut app = App::headless_for_test();
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        {
+            let mut tl = ctx.timeline.lock().expect("timeline");
+            tl.note_foreground_group(7);
+            tl.set_program(7, Some("claude".into()));
+            tl.publish_agent(
+                "idle",
+                None,
+                None,
+                Some(aterm_phase::Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        ctx.meta
+            .lock()
+            .expect("meta")
+            .set("autopilot", Some("land".into()));
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("claimed");
+        let sid = ctx.self_id.clone();
+        let chip = |app: &App| {
+            let (groups, _) = app.overview_parts();
+            groups
+                .iter()
+                .flat_map(|g| g.chips.iter())
+                .find(|c| c.sid == sid)
+                .cloned()
+                .expect("listed")
+        };
+        assert_eq!(chip(&app).driver, Some(Driver::Aterm("land".to_string())));
+        app.apply_harness_fact(sid.as_str(), crate::HarnessFact::Task(Some(TaskFace::Open)));
+        app.apply_harness_fact(
+            sid.as_str(),
+            crate::HarnessFact::Task(Some(TaskFace::Landed)),
+        );
+        assert_eq!(
+            chip(&app).driver,
+            Some(Driver::Aterm("land, landed".to_string()))
+        );
+        assert_eq!(
+            chip(&app).driver.map(|d| d.words()).as_deref(),
+            Some("driven by aterm (land, landed)")
+        );
+        // A worker Land landed.
+        let mut mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Done);
+        mark.why = Some(crate::task_record::WHY_LANDED);
+        crate::task_record::mark_session_task(&ctx, 0, &mark).expect("marked");
+        let words = chip(&app).task_words.expect("a task");
+        assert!(words.starts_with("task landed "), "{words}");
+        assert!(!words.contains("done"), "{words}");
+        assert_eq!(words.matches("landed").count(), 1, "said once: {words}");
+        host.shutdown_and_join();
+    }
+
+    /// THE OVERVIEW SAYS WHY A LANDING HOLDS, ON A LINE OF ITS OWN (Autopilot
+    /// v5 §12.3.1, slice 3c and its review): a Claude Code under Land this
+    /// host supervises reads `driven by aterm (land)` on its chip's line
+    /// throughout — the hover's long words there pushed `typed by` past the
+    /// card's width — and, once its loop tells a hold whose yield was read,
+    /// the hold's words with no clock on the chip's held line (`not landed
+    /// yet: 2 unpushed commits; open work in its report: follow-up · 3
+    /// nudges`, the menu's tip form); none before a yield is read, none under
+    /// Cruise, none once the hold is taken down. NEGATIVE CONTROLS (as run):
+    /// the builder passing the hold to `driven_words` (3c's first cut) puts
+    /// the hold on the chip's line; the builder with no held line reads
+    /// `None` with the hold standing.
+    #[test]
+    fn the_overview_says_why_a_landing_holds() {
+        use aterm_agent::harness::acts::{HoldLeg, LandHeld, OpenWord, TaskFace};
+        let mut app = App::headless_for_test();
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        {
+            let mut tl = ctx.timeline.lock().expect("timeline");
+            tl.note_foreground_group(7);
+            tl.set_program(7, Some("claude".into()));
+        }
+        ctx.meta
+            .lock()
+            .expect("meta")
+            .set("autopilot", Some("land".into()));
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("claimed");
+        let sid = ctx.self_id.clone();
+        let chip = |app: &App| {
+            let (groups, _) = app.overview_parts();
+            groups
+                .iter()
+                .flat_map(|g| g.chips.iter())
+                .find(|c| c.sid == sid)
+                .map(|c| {
+                    (
+                        c.driver.as_ref().map(crate::overview::Driver::words),
+                        c.held.clone(),
+                    )
+                })
+                .expect("its chip")
+        };
+        let tell = |app: &mut App, held: Option<LandHeld>| {
+            if crate::harness_host::store_land_held(&app.store, sid.as_str(), held) {
+                app.apply_harness_fact(sid.as_str(), crate::HarnessFact::LandHeld);
+            }
+        };
+        let land = Some("driven by aterm (land)".to_string());
+        app.apply_harness_fact(sid.as_str(), crate::HarnessFact::Task(Some(TaskFace::Open)));
+        assert_eq!(chip(&app), (land.clone(), None));
+        let held = LandHeld {
+            since_ms: Some(1_792_159_320_000),
+            nudges: 3,
+            read: true,
+            legs: HoldLeg::Repo.bit() | HoldLeg::Open.bit(),
+            open: [OpenWord::of("follow-up"), None, None, None],
+            unpushed: 2,
+            ..LandHeld::default()
+        };
+        tell(
+            &mut app,
+            Some(LandHeld {
+                read: false,
+                legs: 0,
+                ..held
+            }),
+        );
+        assert_eq!(chip(&app), (land.clone(), None), "no yield read yet");
+        tell(&mut app, Some(held));
+        assert_eq!(
+            chip(&app),
+            (
+                land.clone(),
+                Some(
+                    "not landed yet: 2 unpushed commits; open work in its report: follow-up \
+                     \u{b7} 3 nudges"
+                        .to_string()
+                )
+            )
+        );
+        ctx.meta
+            .lock()
+            .expect("meta")
+            .set("autopilot", Some("cruise".into()));
+        assert_eq!(chip(&app).1, None, "none under Cruise");
+        ctx.meta
+            .lock()
+            .expect("meta")
+            .set("autopilot", Some("land".into()));
+        tell(&mut app, None);
+        assert_eq!(chip(&app), (land, None));
+        host.shutdown_and_join();
+    }
+
+    /// A HARNESS'S NEED SAYS IT IS ONE ON THE OVERVIEW (Autopilot v5
+    /// §12.2.9): no header above an Overview line says "needs you", and a
+    /// harness's `what` now carries the need without aterm's frame, so the
+    /// chip's doing (painted and spoken alike) leads with `needs you: ` and
+    /// keeps ` (+1 more)` whole within main's 72 bytes. Another owner's ask
+    /// keeps its own words. NEGATIVE CONTROL (run for the landing): the
+    /// doing arm reading `need.what` drops the lead.
+    #[test]
+    fn a_harness_need_says_needs_you_on_the_overview() {
+        let (mut app, _wid, sids) = app_with_three();
+        let (harness, person) = (&sids[1], &sids[2]);
+        let need = "grant Screen Recording to com.aterm.aterm in System Settings \u{25b8} \
+                    Privacy & Security \u{25b8} Screen Recording";
+        let ask = |sid: &aterm_session::SessionId, owner: &str, text: String| {
+            ctx_of(&app, sid)
+                .meta
+                .lock()
+                .unwrap()
+                .set_attention_kind(
+                    owner,
+                    Some(text),
+                    Some(aterm_types::needs::AttentionKind::Ask),
+                )
+                .expect("a slot");
+        };
+        ask(
+            harness,
+            crate::harness_host::NEEDS_ATTENTION_OWNER,
+            format!("claude needs you: {need} (+1 more) \u{2014} carrying on"),
+        );
+        ask(person, "person", "sign the release notes".to_string());
+        for sid in [harness, person] {
+            app.publish_need(local_of(&app, sid));
+        }
+        let doing = |sid: &aterm_session::SessionId| {
+            let (groups, _) = app.overview_parts();
+            groups
+                .iter()
+                .flat_map(|g| g.chips.iter())
+                .find(|c| &c.sid == sid)
+                .map(|c| c.doing.clone())
+                .expect("listed")
+        };
+        let words = doing(harness);
+        assert!(
+            words.starts_with("needs you: grant Screen Recording")
+                && words.ends_with("\u{2026} (+1 more)"),
+            "{words}"
+        );
+        assert!(!words.contains("claude"), "{words}");
+        assert!(words.len() <= crate::needs::ROW_WHAT_MAX, "{words}");
+        assert_eq!(doing(person), "sign the release notes");
     }
 
     /// The words are coarse, so a card left open does not repaint each

@@ -441,7 +441,7 @@ impl AiState {
         let Some(reading) = &self.reading else {
             return match (&self.unavailable, self.looking) {
                 (_, true) => "Looking at the AI CLIs\u{2026}".to_string(),
-                (Some(why), false) => format!("Not looked at: {why}"),
+                (Some(why), false) => format!("Not looked at: {}", one_line(why)),
                 (None, false) => "Not looked at yet".to_string(),
             };
         };
@@ -449,6 +449,17 @@ impl AiState {
             reading.as_of.saturating_mul(1000),
             reading.offset_s,
         );
+        // Keep the last observation's versions, but never let its successful
+        // summary hide a refresh in flight or one that could not be read.
+        if self.looking {
+            return format!("Looking at the AI CLIs\u{2026} \u{b7} last observed {when}");
+        }
+        if let Some(why) = &self.unavailable {
+            return format!(
+                "Last look failed: {} \u{b7} last observed {when}",
+                one_line(why)
+            );
+        }
         let needing: Vec<&str> = reading
             .clis
             .iter()

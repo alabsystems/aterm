@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The self-feed floor: a process-wide token bucket on control-injected input,
-//! keyed by the target session's process-local id.
+//! The self-feed floor: a process-wide token bucket on control-injected input, keyed by the
+//! target session's process-local id.
 //!
 //! A raw control-socket client can `feed @.` in a loop, and nothing on the
 //! client's side stops it. So every self-targeted injection verb passes [`allow`]
@@ -39,8 +39,8 @@ static FLOOR: OnceLock<Mutex<HashMap<u64, Bucket>>> = OnceLock::new();
 #[must_use]
 pub(crate) fn allow(session: u64, nbytes: usize) -> bool {
     let now = Instant::now(); // control-layer rate limiter, not engine state
-    // A named local so the lock-order census resolves this acquisition to the
-    // `floor` identity (`forget` uses the same name).
+    // A named local so the lock-order census resolves this acquisition to the `floor` identity
+    // (`forget` uses the same name).
     let floor = FLOOR.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = floor.lock().unwrap_or_else(|p| p.into_inner());
     let b = map.entry(session).or_insert(Bucket {
@@ -59,8 +59,8 @@ pub(crate) fn allow(session: u64, nbytes: usize) -> bool {
     }
 }
 
-/// Drop a session's bucket when it closes (the `Wake::Exit` arm of
-/// `App::user_event`, lib.rs), so the map does not grow for the process lifetime.
+/// Drop a session's bucket when it closes (`Wake::Exit` in `App::user_event`), so the map does
+/// not grow for the process lifetime.
 pub(crate) fn forget(session: u64) {
     if let Some(floor) = FLOOR.get() {
         floor
@@ -77,9 +77,7 @@ mod tests {
     #[test]
     fn floor_admits_under_cap_and_refuses_a_burst_storm() {
         let s = 9_999_001;
-        // A normal prompt-sized write is admitted.
         assert!(allow(s, 64), "a small write is under the floor");
-        // Draining far past the burst capacity in one shot is refused.
         assert!(
             !allow(s, (CAP_BYTES as usize) + 1),
             "a > cap single write is refused"
@@ -90,7 +88,6 @@ mod tests {
     #[test]
     fn floor_throttles_a_tight_loop_then_recovers() {
         let s = 9_999_002;
-        // Spend the whole burst in big chunks.
         let chunk = (CAP_BYTES as usize) / 4;
         let mut admitted = 0;
         for _ in 0..8 {
@@ -98,8 +95,7 @@ mod tests {
                 admitted += 1;
             }
         }
-        // The burst bounds how many back-to-back chunks get through (~4), so a
-        // tight loop cannot inject unboundedly.
+        // The burst admits about four back-to-back chunks.
         assert!(admitted <= 5, "burst is bounded, got {admitted} admits");
         forget(s);
     }

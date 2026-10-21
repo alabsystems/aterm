@@ -37,7 +37,7 @@
 //! opens a session recorded from it, and this crate's own known-answer test pins the
 //! full ciphertext and tag of the draft's §A.3.1 vector. This crate is the ONE place
 //! astream pulls a cipher dependency — deliberately isolated; the handshake's
-//! HMAC/HKDF run over the workspace's own SHA-256 (`astream-digest`).
+//! HMAC/HKDF are the workspace's own, `astream-digest`'s, over its SHA-256.
 //! `forbid(unsafe_code)` applies to this crate's own code.
 //!
 //! The `handshake` and `identity` features still delegate raw X25519 and Ed25519 to

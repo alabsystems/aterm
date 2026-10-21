@@ -25,16 +25,14 @@ use crate::session_picker::SessionPickerState;
 use crate::settings::SettingsGeom;
 use crate::widget::TrayInput;
 
-/// The paint/lifecycle contract shared by every overlay surface. `tray` and
-/// `fingerprint` read the SAME `&self`, so pixels and the repaint key cannot diverge.
+/// The paint/lifecycle contract shared by every overlay surface. `tray` and `fingerprint`
+/// read the same `&self`, so pixels and the repaint key cannot diverge.
 pub(crate) trait OverlayModel {
-    /// The INNER repaint fingerprint (never `0` while open). The [`Overlay`] wrapper folds
-    /// in the variant discriminant + forces non-zero so two surfaces can never collide in
-    /// the `settings_card` fp cache or the `RepaintKey`.
+    /// The surface's own repaint fingerprint; [`Overlay::fingerprint`] folds in the variant.
     fn fingerprint(&self) -> u64;
 
-    /// The overlay height (rows) the card wants, CLAMPED to the rows the composed frame
-    /// actually has (`avail`) — the single source the shared splice consults.
+    /// The overlay height in rows the card wants, clamped to the rows the composed frame has
+    /// (`avail`).
     fn wanted_rows(&self, avail: usize) -> usize;
 
     /// Paint the surface as a [`TrayInput`] card of pure [`crate::widget::DrawPrim`]s
@@ -53,10 +51,9 @@ pub(crate) trait OverlayModel {
         None
     }
 
-    /// The `controls front` truncation signal: `(scroll, total, visible)` — rows scrolled
-    /// past the top, the full model row count, and rows actually shown on the card. Read
-    /// from the SAME `&self` as the tray. A non-scrolling surface returns
-    /// `(0, total, visible)`.
+    /// The `controls front` truncation signal `(scroll, total, visible)`: rows scrolled past
+    /// the top, the model's row count, and rows shown on the card. A non-scrolling surface
+    /// returns `(0, total, visible)`.
     fn scroll_extent(&self) -> (usize, usize, usize);
     /// The cross-platform accessibility tree ([`aterm_a11y::model::TreeUpdate`]) for this surface,
     /// built from the SAME `&self` the pixels read — another observer
@@ -138,8 +135,8 @@ impl OverlayModel for SessionPickerState {
     }
 }
 
-/// Which surface a live [`Overlay`] holds — a cheap tag for the input gate + the
-/// `settings_card` cache key (so two surfaces never share a cache line).
+/// Which surface a live [`Overlay`] holds: a cheap tag for the input gate and the
+/// `settings_card` cache key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OverlayKind {
     Palette,
@@ -200,18 +197,16 @@ pub(crate) enum Overlay {
 }
 
 impl Overlay {
-    /// The DISCRIMINANT-SEEDED, forced-nonzero repaint fingerprint folded into
-    /// `RepaintKey::settings_fp`. Domain-separates per variant so two surfaces can NEVER
-    /// collide in the `settings_card` fp cache (which would reuse the WRONG surface's card
-    /// — a silent WYSIWYG corruption), and `| 1` keeps `0` reserved for "closed".
+    /// The repaint fingerprint folded into `RepaintKey::settings_fp`. Seeded per variant so
+    /// two surfaces never collide in the `settings_card` cache (which would reuse the wrong
+    /// surface's card); `| 1` keeps `0` for "closed".
     pub(crate) fn fingerprint(&self) -> u64 {
         // The INNER hash comes from the same `OverlayModel` that paints the tray; the
         // wrapper folds in the variant tag + forces non-zero.
         seal(self.kind().tag(), self.model().fingerprint())
     }
 
-    /// The active surface's model as a trait object — the single point the shared splice
-    /// and repaint fingerprint fan out from.
+    /// The active surface's model: the one point the splice and the fingerprint fan out from.
     pub(crate) fn model(&self) -> &dyn OverlayModel {
         match self {
             Overlay::Palette(p) => p,
@@ -229,10 +224,8 @@ impl Overlay {
         }
     }
 
-    /// The single `controls front` status line (design §5): which surface is open, its
-    /// repaint fp, and the scroll-truncation extent — the cheap open/closed + "does the
-    /// front `image` show the whole surface" signal. The closed case is emitted by the
-    /// caller as `overlay open=false`.
+    /// The `controls front` status line of the open surface: its kind, repaint fp and scroll
+    /// extent. The caller emits the closed case as `overlay open=false`.
     pub(crate) fn status_line(&self) -> String {
         let (scroll, total, visible) = self.model().scroll_extent();
         format!(

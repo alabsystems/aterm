@@ -143,10 +143,11 @@ pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
 /// ([`sync_file_contents`]). It is still a real flush, made at the same point and in the
 /// same order, so a test sees the same files, renames and errors. What it drops is the
 /// drive-cache barrier. No test can observe that barrier, because it only orders the disk
-/// against a power loss. It also stalls the whole VOLUME while it runs: one `atpkg --lib`
-/// run made 7,381 `F_FULLFSYNC`s (shim lays, vendor records, `status.toml`, the floors,
-/// swap directory syncs), and every test binary a run started beside it waited behind them
-/// for its own temp-dir metadata. With this arm the run took 28.5-29.8 s instead of
+/// against a power loss. It also holds up most flushes, growing writes, creates and
+/// renames on the volume while it runs (`docs/measured/flush-wait-2026-10-21.md`): one
+/// `atpkg --lib` run made 7,381 `F_FULLFSYNC`s (shim lays, vendor records, `status.toml`,
+/// the floors, swap directory syncs), and every test binary a run started beside it waited
+/// behind them for its own temp-dir metadata. With this arm the run took 28.5-29.8 s instead of
 /// 44.5-63.6 s alone, and 18.6-20.1 s instead of 74.6-96.5 s beside `aterm-gui --lib`
 /// (load 13-37). Off Apple targets `sync_all` already is
 /// `fsync(2)` (`FlushFileBuffers` on Windows, which is also what `sync_file_contents`

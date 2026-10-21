@@ -5,14 +5,12 @@
 //! crash-reporting panic hook.
 //!
 //! Without a logger every `aterm_log` record, including `containment_audit` security
-//! denials, is discarded. [`init`] installs one writing to
-//! `~/Library/Logs/aterm/aterm.log` on macOS and `~/.local/state/aterm/logs/aterm.log`
-//! elsewhere: a `0600` file in a `0700` dir, like the control socket. The level is
-//! `info`; a development build may set another through the `ATERM_LOG` seam
-//! (`off|error|warn|info|debug|trace`, [`aterm_types::dev_seam!`]). Each line carries
-//! its time, the writer's pid and the level. [`RotatingFile`] rotates past
-//! [`aterm_log::MAX_LOG_BYTES`] to `aterm.log.1`, at startup and while running, so the
-//! pair stays near 8 MiB.
+//! denials, is discarded. [`init`] installs one writing `aterm.log` in [`log_dir`]: a `0600`
+//! file in a `0700` dir, like the control socket. The level is `info`; a development build may
+//! set another through the `ATERM_LOG` seam (`off|error|warn|info|debug|trace`,
+//! [`aterm_types::dev_seam!`]). Each line carries its time, the writer's pid and the level.
+//! [`RotatingFile`] rotates past [`aterm_log::MAX_LOG_BYTES`] to `aterm.log.1`, at startup
+//! and while running.
 //!
 //! CONTENT SAFETY: terminal cell text, scrollback and keystrokes are never passed to
 //! `aterm_log` (call sites log metadata only). Every record body also goes through
@@ -23,15 +21,13 @@ use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// `eprintln!` that cannot panic, for every stderr line the windowed app writes at
-/// runtime.
+/// `eprintln!` that cannot panic, for every stderr line the windowed app writes at runtime.
 ///
-/// `eprintln!` panics when the write fails, and a GUI app's stderr fails in ordinary
-/// ways: a closed launching terminal (EIO), a vanished pipe reader (EPIPE, since Rust
-/// ignores SIGPIPE), or a closed fd 2. A panic inside an AppKit callback aborts under
-/// the `declare_class!` trampoline policy, and one inside the panic hook aborts the
-/// process. This writes and drops the result, as `aterm_objc::abort_on_unwind` does.
-/// Only cli.rs and the `*_conformance.rs` harnesses use bare `eprintln!`.
+/// `eprintln!` panics when the write fails, and a GUI app's stderr fails in ordinary ways: a
+/// closed launching terminal (EIO), a vanished pipe reader (EPIPE, since Rust ignores
+/// SIGPIPE), a closed fd 2. A panic inside an AppKit callback or inside the panic hook ends the
+/// process, so this writes and drops the result. Only cli.rs, the `*_conformance.rs` harnesses
+/// and tests use bare `eprintln!`.
 macro_rules! stderr_line {
     ($($arg:tt)*) => {{
         use ::std::io::Write as _;
@@ -47,7 +43,7 @@ use aterm_log::{LevelFilter, Log, Metadata, Record};
 
 /// Install the panic hook and file logger (at `info`; see the module docs).
 ///
-/// Called first in `main`, before any thread spawns. Failures are non-fatal: the
+/// Called early in `main_entry`, before any thread spawns. Failures are non-fatal: the
 /// facade keeps its discard-everything default and the reason goes to stderr.
 /// `arming` says what kind of start this is, for the crash marker
 /// ([`crate::crash_signal::Arming`]).
@@ -64,9 +60,8 @@ pub(crate) fn init(arming: crate::crash_signal::Arming) {
         );
         return;
     };
-    // Crash reporting is independent of the log level. Arm both crash paths: the
-    // panic hook (unwinds) and the async-signal-safe fatal-signal handler (SIGSEGV,
-    // SIGABRT, … which bypass panic machinery).
+    // Crash reporting is independent of the log level. Arm both crash paths: the panic hook
+    // and the async-signal-safe handler for fatal signals, which bypass the panic machinery.
     install_panic_hook(dir.clone());
     prune_harness_faults(&dir, std::process::id());
     crate::crash_signal::install_signal_handlers_as(arming);
@@ -264,10 +259,8 @@ fn file_panic_report(
         report_accessibility_failure(payload, location_file);
         return None;
     }
-    // Supervisor host threads are the other non-crash panic: each run is caught and
-    // restarted (past its budget on a pause growing to an hour, the session badged)
-    // while the terminal keeps running. Filed as a harness fault record, never as
-    // `crash-<pid>.log`.
+    // Supervisor host threads are the other non-crash panic: the host catches and restarts
+    // each run while the terminal keeps running, so it is a harness fault record.
     if is_harness_thread(thread_name) {
         let path = dir.join(format!("harness-fault-{}.log", std::process::id()));
         match write_harness_fault(&path, thread_name.unwrap_or(""), info, backtrace) {
@@ -401,23 +394,18 @@ pub(crate) fn write_crash_report(
     )
 }
 
-/// What names a panic report's RUN on its first line, before the start its
-/// crash marker is named for (round eight of the update audit, finding 47).
-/// The report itself is named by pid alone, and a later process that reused
-/// the pid — a headless run that left no journal, and no marker once its own
-/// unwind or this launch's sweep removed it — files under the same name: the
-/// claim counts a report that names its run for that run only
-/// (`crash_journal::classify_death`). A report from a build before the mark
-/// names none, and is bounded by the runs the claim knows of, as before.
+/// What names a panic report's run on its first line, before the start its crash marker is
+/// named for. The report is named by pid alone, and a later process that reused the pid files
+/// under the same name, so the claim counts a report that names its run for that run only
+/// (`crash_journal::classify_death`); one that names none is bounded by the runs the claim
+/// knows of.
 pub(crate) const REPORT_RUN: &str = " in run ";
 
-/// What ends a panic report's first line when the panic was on the MAIN
-/// thread: one that unwinds out of the event loop and `main` and ends the
-/// process, whose `atexit` then removes the run's crash marker — so once
-/// another launch has consumed the report (`.seen`), this mark is the only
-/// thing left that says the run ended in a crash (round seven of the update
-/// audit, finding 61; read by [`panic_report_head`]). A worker thread's
-/// panic carries no mark: the process can live on after it.
+/// What ends a panic report's first line when the panic was on the main thread: it unwinds
+/// out of `main` and ends the process, whose `atexit` removes the run's crash marker, so once
+/// another launch has consumed the report (`.seen`) this mark is the only record that the run
+/// crashed (read by [`panic_report_head`]). A worker's panic carries none: the process can
+/// live on.
 pub(crate) const MAIN_THREAD_PANIC: &str = " on the main thread";
 
 /// What a panic report's first line says of the run that filed it.
@@ -464,29 +452,24 @@ pub(crate) fn panic_report_head(path: &Path) -> ReportHead {
     }
 }
 
-/// One-shot startup scan for evidence that the previous run died without a clean
-/// exit, returning [`CrashEvidence`] (the report and its opening lines, for the crash
-/// message), or `None` when the last run ended normally. Both artifacts live in
-/// [`log_dir`]; on a GUI-subsystem Explorer launch stderr is null, so they are the
-/// only trace:
+/// One-shot startup scan for evidence that the previous run died without a clean exit:
+/// [`CrashEvidence`] (the artifact and its opening lines, for the crash message), or `None`.
+/// Both artifacts live in [`log_dir`]; on a GUI-subsystem Explorer launch stderr is null, so
+/// they are the only trace:
 ///
 ///   * `crash-<pid>.log`: the panic hook's report ([`install_panic_hook`]);
-///   * `crash-marker-<pid>-<nanos>-<owner>.log` (unix; Windows and older builds spell
-///     it `crash-signal-<pid>-<nanos>.log`): a non-empty fatal-signal/exception marker
+///   * `crash-marker-<pid>-<nanos>-<owner>.log` (unix; Windows and older builds spell it
+///     `crash-signal-<pid>-<nanos>.log`): a non-empty fatal-signal/exception marker
 ///     (`crate::crash_signal`). An empty marker belongs to a clean run or to
-///     [`take_kill_evidence`] (this launch's own included), so the `len() == 0` skip is
-///     correct even though this runs after `install_signal_handlers` created ours.
+///     [`take_kill_evidence`] (this launch's own included, which
+///     `install_signal_handlers_as` created before this runs), so it is skipped.
 ///
-/// Accessibility publisher panics never land here; [`file_panic_report`] routes them
-/// to [`crate::a11y_backend`].
+/// Accessibility publisher panics never land here ([`file_panic_report`]).
 ///
-/// Consuming, so the message posts once: every artifact found is renamed (never
-/// deleted) to `<name>.seen`, since the message's `Open log` points at it. A failed
-/// rename keeps the name and re-posts next launch. The evidence names the newest
-/// artifact by mtime, head read in the same pass; older ones are consumed silently.
-/// Consumed reports are pruned to [`KEEP_SEEN_CRASH_REPORTS`], never deleting the one
-/// the message names, nor the evidence of a run whose crash journal waits for its claim
-/// (`prune_seen_crash_reports`).
+/// Consuming, so the message posts once: every artifact found is renamed (never deleted) to
+/// `<name>.seen`, since the message's `Open log` points at it; a failed rename re-posts next
+/// launch. The evidence names the newest artifact by mtime; older ones are consumed silently.
+/// Consumed reports are pruned by `prune_seen_crash_reports`.
 pub(crate) fn take_crash_evidence() -> Option<CrashEvidence> {
     take_crash_evidence_in(&log_dir()?, crate::crash_journal::journal_dir().as_deref())
 }
@@ -504,8 +487,7 @@ pub(crate) struct CrashEvidence {
 }
 
 impl CrashEvidence {
-    /// The console's line — the sentence the banner carried, kept verbatim so
-    /// a console launch reads what it always read.
+    /// The line printed to the console.
     pub(crate) fn sentence(&self) -> String {
         format!(
             "aterm closed unexpectedly last time \u{2014} crash log at {}",
@@ -552,8 +534,8 @@ pub(crate) fn take_crash_evidence_in(dir: &Path, journals: Option<&Path>) -> Opt
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        // Matches BOTH artifact families ("crash-signal-…" shares the prefix);
-        // `aterm.log` and already-consumed "….log.seen" files do not match.
+        // Matches both artifact families ("crash-signal-…" and "crash-marker-…" share the
+        // prefix); `aterm.log` and consumed "….log.seen" files do not.
         if !(name.starts_with("crash-") && name.ends_with(".log")) {
             continue;
         }
@@ -660,7 +642,7 @@ pub(crate) fn take_kill_evidence_in(
     })
 }
 
-/// THE LAB DESK'S KILL SCAN (session log Phase 6, step 6C-4, ruling U9):
+/// The lab desk's kill scan:
 /// [`take_kill_evidence`]'s twin for a lab desk (`crash_signal::Arming::Lab`).
 /// The dead, empty `lab` markers its earlier runs left in its private root's log
 /// directory are consumed (renamed `.seen` and pruned, as the windowed scan's are)
@@ -724,13 +706,10 @@ pub(crate) fn consume_dead_markers(
 /// [`KEEP_SEEN_CRASH_REPORTS`] by mtime; `named`, the report the message points at, is
 /// never deleted.
 ///
-/// NOR IS THE EVIDENCE A CLAIM STILL NEEDS (round eight of the update audit, U59): a
-/// report of a pid whose crash journal waits in `journals` for a claim is neither
-/// deleted nor counted. An update's successor reads the evidence of runs it never
-/// claims, and a killed run's consumed marker is dated at the run's START, so it aged
-/// out first: by the cold launch that claimed the journal, the marker was gone and the
-/// killed desk was set aside as a clean end. Once claimed, the journal is gone and the
-/// report is pruned as before.
+/// Nor is the evidence a claim still needs: a report of a pid whose crash journal waits in
+/// `journals` is neither deleted nor counted. An update's successor reads evidence of runs it
+/// never claims, and a killed run's consumed marker is dated at the run's start, so it would
+/// otherwise age out before the launch that claims the journal.
 fn prune_seen_crash_reports(dir: &Path, named: Option<&Path>, journals: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1161,24 +1140,19 @@ fn create_0600(path: &Path) -> std::io::Result<File> {
 /// Writes one sanitized line per record, off the logging thread. Idle cost is
 /// zero: `aterm_log` gates on the max-level atomic before any record reaches us.
 ///
-/// THE LOGGING THREAD NEVER WAITS ON THE DISK (round-3 sweep, item 4). A
-/// record is formatted where it is logged, so its time and pid are the
-/// record's, and queued; the `aterm-log` thread appends the queue. An append
-/// made on the logging thread waited out whatever the volume was doing, and
-/// one `F_FULLFSYNC` anywhere on it (aterm's own durable writes, another
-/// process's) holds every write there: on a fresh install's first launch the
-/// main thread's log lines sat 2.7–4.8 ms behind the journal key's flush, as
-/// `user_event` turns (round-3 measurement).
+/// The logging thread never waits on the disk. A record is formatted where it
+/// is logged, so its time and pid are the record's, and queued; the
+/// `aterm-log` thread appends the queue, so an `F_FULLFSYNC` on the volume
+/// cannot stall the caller.
 ///
-/// * NEVER REORDERED. Lines leave the queue only under the file's lock, which
+/// * Never reordered. Lines leave the queue only under the file's lock, which
 ///   is taken first, so they reach the file in queue order whoever appends
 ///   them; one thread's lines keep the order it logged them in.
-/// * BOUNDED, NEVER DROPPED. Past `cap` bytes queued ([`LOG_QUEUE_BYTES`]),
-///   the logging thread appends the queue and then its own line itself: the
-///   cost every line paid before, now paid only by a flood the writer cannot
-///   keep up with. With no writer (not started yet, [`start_writer`], or it
-///   did not spawn) every line goes that way.
-/// * LANDED AT THE END. [`flush_within`] appends the queue on the calling
+/// * Bounded, never dropped. Past `cap` bytes queued ([`LOG_QUEUE_BYTES`]),
+///   the logging thread appends the queue and then its own line itself. With
+///   no writer (not started yet, [`start_writer`], or it did not spawn) every
+///   line goes that way.
+/// * Landed at the end. [`flush_within`] appends the queue on the calling
 ///   thread: from the `exit(3)` handler the writer registers, the
 ///   graceful quit, the panic hook, the clean `_exit`
 ///   ([`crate::crash_signal::clean_exit_now`]) and the cold `exec`. A fatal
@@ -1416,8 +1390,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    /// VERSION SKEW, the files (session log phase 2B): the logs folder's own
-    /// sweeps, the same in every build since before the journal, match
+    /// Version skew, the files: the logs folder's own
+    /// sweeps match
     /// `crash-*` and `harness-fault-*` names only, so a build that knows
     /// nothing of the journal leaves `session-log/` and its files as they are.
     #[test]
@@ -1531,8 +1505,8 @@ mod tests {
         }
     }
 
-    /// While running, a writer that fills the file rotates it itself, and only
-    /// ONE older copy is ever kept.
+    /// While running, a writer that fills the file rotates it itself, and only one older copy
+    /// is ever kept.
     #[test]
     fn rotates_while_running_and_keeps_one_older_copy() {
         let dir = Scratch::new("run");
@@ -1827,7 +1801,7 @@ mod tests {
             assert_eq!(dead.message.hold, aterm_messages::Hold::LogOnly);
         }
 
-        // The SAME dir, an ordinary panic: still a crash report, still posted.
+        // The same dir, an ordinary panic: still a crash report, still posted.
         let path = file_panic_report(
             &dir,
             "crates/aterm-gui/src/app.rs",
@@ -2093,11 +2067,9 @@ mod tests {
         );
     }
 
-    /// THE LOGGING THREAD WAITS ON NO DISK (round-3 sweep, item 4): with the
+    /// The logging thread waits on no disk: with the
     /// file held, as a writer behind an `F_FULLFSYNC` holds it, records still
     /// return, and once it is free the writer lands them in order.
-    /// NEGATIVE CONTROL: the synchronous logger this replaced appended on the
-    /// logging thread, which waited for the file and tripped the detector.
     #[test]
     fn a_record_returns_while_the_file_is_held_and_lands_in_order() {
         let dir = Scratch::new("held");
@@ -2128,11 +2100,9 @@ mod tests {
         assert_eq!(bodies(&dir.log()), lines(1..=3));
     }
 
-    /// BOUNDED, NEVER DROPPED, NEVER REORDERED: lines queue up to the cap;
+    /// Bounded, never dropped, never reordered: lines queue up to the cap;
     /// the line past it is appended by its own thread after every queued
     /// one; the next queues again, and a flush lands it.
-    /// NEGATIVE CONTROL: the synchronous logger had written each line at once,
-    /// so the file was not empty after the first three.
     #[test]
     fn a_full_queue_is_appended_in_order_by_the_thread_that_overflows_it() {
         let dir = Scratch::new("full");
@@ -2180,14 +2150,11 @@ mod tests {
         assert_eq!(bodies(&dir.log()), lines(1..=1));
     }
 
-    /// LANDED AT THE END: a process that `exit`s with a line still queued
+    /// Landed at the end: a process that `exit`s with a line still queued
     /// (its writer never ran) finds it on disk, through the `exit(3)`
     /// handler; and a line logged after that handler ran (here by a handler
     /// registered before it, so run after it) is appended by its own thread,
-    /// not queued for the writer the process is losing. NEGATIVE CONTROLS:
-    /// without that handler the first line died with the process
-    /// (`flush_at_exit` removed: the file is empty); with a handler that only
-    /// flushes, the second line was queued and died (the file held line 1).
+    /// not queued for the writer the process is losing.
     #[cfg(unix)]
     #[test]
     fn an_exit_lands_the_lines_still_queued() {
@@ -2263,7 +2230,7 @@ mod tests {
                 .set_modified(base + Duration::from_secs(i * 60))
                 .unwrap();
         }
-        // This launch's evidence, stamped OLDER than every shown report.
+        // This launch's evidence, stamped older than every shown report.
         let fresh = dir.0.path().join("crash-99.log");
         std::fs::write(&fresh, b"panicked").unwrap();
         File::options()
@@ -2296,8 +2263,8 @@ mod tests {
 /// allows; every look-due answer must match the model's guard. The negative control
 /// replays a truncating start and must be refused.
 ///
-/// The model counts lines, so the budget is in whole 4-byte lines (`Cap = 1` line per
-/// file, a look after every line) and the rotation note is empty.
+/// The model counts lines, so the budget is whole 4-byte lines (one per file, a look after
+/// every line) and the rotation note is empty.
 #[cfg(all(test, unix))]
 mod rotation_conformance {
     use super::*;
@@ -2554,7 +2521,7 @@ mod rotation_conformance {
         h.write('B');
         let before = h.project();
         assert!(before["live"] > 1, "the file is over the cap: {before:?}");
-        // The old `open_log_file`: truncate when oversized.
+        // B restarts by truncating the oversized file.
         drop(
             std::fs::OpenOptions::new()
                 .write(true)

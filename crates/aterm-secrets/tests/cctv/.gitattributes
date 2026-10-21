@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The CCTV vectors are bytes held to their exact decryption class: CRLF ends,
+# stray CRs and trailing whitespace are the very things several of them test
+# (armor_crlf, header_crlf, stanza_spurious_cr). Never converted, on any checkout.
+* -text

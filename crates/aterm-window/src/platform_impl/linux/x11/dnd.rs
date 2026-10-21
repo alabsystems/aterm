@@ -137,7 +137,7 @@ impl Dnd {
                 atoms[XdndSelection],
                 time,
             ))
-            .expect_then_ignore_error("Failed to send XdndSelection event")
+            .ignore_error_or_report(&self.xconn, "Failed to send XdndSelection event")
     }
 
     pub unsafe fn read_data(

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ONE error type for both halves of the crate.
-//!
-//! A message plus an optional byte span into the source: consumers call
-//! `error.span()` to underline a diagnostic and `error.to_string()` for the
-//! text. Parse, deserialize and serialize failures all use it.
+//! The one error type for parsing, deserializing and serializing: a message plus an optional
+//! byte span into the source (`span()` to underline, `to_string()` for the text).
 
 use core::fmt;
 use core::ops::Range;
@@ -15,14 +12,11 @@ use core::ops::Range;
 pub struct Error {
     message: String,
     span: Option<Range<usize>>,
-    /// 1-based line and column, resolved against the source at construction
-    /// time. Kept alongside the span because the span alone is useless in a
-    /// message printed without the source next to it.
+    /// 1-based line and column, resolved at construction so a message printed without
+    /// the source still says where.
     line_col: Option<(usize, usize)>,
-    /// The offending line, captured at construction so [`Display`] can print
-    /// the annotated snippet without holding a borrow of the whole document.
-    ///
-    /// [`Display`]: fmt::Display
+    /// The offending line, captured at construction so `Display` prints the snippet
+    /// without a borrow of the document.
     snippet: Option<Snippet>,
 }
 
@@ -32,7 +26,7 @@ struct Snippet {
     /// The line text, newline stripped.
     text: String,
     /// 0-based column within `text` where the carets start. May be one past the
-    /// end: an unterminated construct is reported AT the end of input.
+    /// end: an unterminated construct is reported at the end of input.
     caret_col: usize,
     /// How many carets. Never zero — an empty span still points somewhere.
     caret_len: usize,
@@ -86,12 +80,9 @@ impl Error {
     }
 }
 
-/// The largest char boundary at or below `i`.
-///
-/// `Display` must not panic, whatever span it is handed: a caller can build an
-/// [`Error`] from a span it computed itself, and slicing a string at a byte that
-/// is inside a character aborts. Rounding DOWN keeps the caret on the character
-/// the span started in.
+/// The largest char boundary at or below `i`. `Display` must not panic whatever span it is
+/// handed, and slicing inside a character panics; rounding down keeps the caret on the
+/// character the span started in.
 fn floor_boundary(source: &str, i: usize) -> usize {
     let mut i = i.min(source.len());
     while i > 0 && !source.is_char_boundary(i) {
@@ -100,15 +91,9 @@ fn floor_boundary(source: &str, i: usize) -> usize {
     i
 }
 
-/// Where `offset` sits: 1-based line, 1-based column, and the byte offset the
-/// line starts at.
-///
-/// END OF INPUT IS ON THE LAST LINE, not on the empty line after it. MEASURED
-/// against the oracle: `"x = [1, 2\n"` reports *line 1, column 11* for its
-/// end-of-input span, and `"# Manual\nfont_px = [ \n"` reports *line 2, column
-/// 14* — in both cases the line whose text the caret belongs under. Counting the
-/// final newline would put every unterminated-construct diagnostic on a blank
-/// line below the file, which is where a config editor would then scroll.
+/// Where `offset` sits: 1-based line and column. End of input is on the last line, not the
+/// empty line after it (`"x = [1, 2\n"` reports line 1, column 11), so an unterminated
+/// construct's diagnostic lands under its own text.
 fn line_col(source: &str, offset: usize) -> (usize, usize) {
     let (line, col, _) = locate(source, offset);
     (line, col)
@@ -139,12 +124,10 @@ fn snippet(source: &str, span: &Range<usize>) -> Snippet {
     let text = source[line_start..line_end]
         .trim_end_matches('\r')
         .to_owned();
-    // The caret run stops at the end of the line: a span that reaches over a
-    // newline (an unterminated multi-line string) would otherwise underline
-    // text that is not on the line being printed.
-    // `line_end` can be BEFORE `start` when the position is end-of-input on a
-    // file that ends with a newline: the line the caret belongs under has
-    // already ended. One caret, at the column past that line's last character.
+    // The caret run stops at the end of the line, so a span that crosses a newline (an
+    // unterminated multi-line string) underlines only the printed line. `line_end` is
+    // before `start` at end of input in a file that ends with a newline: one caret, past
+    // that line's last character.
     let cap = line_end.max(start);
     let end = floor_boundary(source, span.end.clamp(start, cap));
     let span_chars = source[start..end.max(start)].chars().count();
@@ -156,8 +139,7 @@ fn snippet(source: &str, span: &Range<usize>) -> Snippet {
 }
 
 impl fmt::Display for Error {
-    /// The annotated form `toml` and `toml_edit` print, because it is what the
-    /// config editor shows the operator:
+    /// The annotated form `toml` and `toml_edit` print, which the config editor shows:
     ///
     /// ```text
     /// TOML parse error at line 1, column 11
@@ -166,10 +148,6 @@ impl fmt::Display for Error {
     ///   |           ^^^^^^
     /// invalid type: string "huge", expected f64
     /// ```
-    ///
-    /// The offending LINE is the part that carries the information — a
-    /// diagnostic that named only a line number would make the editor's status
-    /// bar say "line 1, column 11" and nothing about `font_px`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Some((line, col)) = self.line_col else {
             return f.write_str(&self.message);
@@ -189,10 +167,8 @@ impl fmt::Display for Error {
                 carets = snippet.caret_len
             )?;
         }
-        // The TRAILING NEWLINE is the oracle's, and it is kept on purpose: both
-        // `toml` and `toml_edit` end this form with one, every consumer in this
-        // tree was written against that, and a Display that differs by a byte
-        // from the crate it replaces is a difference someone has to chase.
+        // The trailing newline matches `toml` and `toml_edit`, which this tree's consumers
+        // were written against.
         writeln!(f, "\n{}", self.message)
     }
 }

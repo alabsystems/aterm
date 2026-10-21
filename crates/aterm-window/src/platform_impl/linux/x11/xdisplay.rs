@@ -9,7 +9,9 @@
 // connection ends the event loop instead of the process: `install_io_error_exit_handler`.
 // The libraries, the XCB connection under Xlib's display and the resource database are
 // first-party `aterm-x11`'s, where upstream used x11-dl and x11rb:
-// docs/AUDIT-third-party-2026-10-15.md, LW.7.)
+// docs/AUDIT-third-party-2026-10-15.md, LW.7. With no XSETTINGS manager there is no window
+// to watch, and none is asked for: upstream selected events on window 0 and took the
+// BadWindow, which the lane's X11 wire trace showed on every start, X11-TRACE.)
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -23,7 +25,7 @@ use std::{fmt, ptr};
 
 use aterm_x11::proto::xproto::{self, cw, event_mask};
 use aterm_x11::proto::{atom, randr, xinput, Reply, Request, ValueList, Void};
-use aterm_x11::xrm::Database;
+use aterm_x11::xrm::{self, Database};
 
 use crate::window::CursorIcon;
 
@@ -80,7 +82,7 @@ pub struct XConnection {
     xsettings_screen: Option<xproto::Atom>,
 
     pub latest_error: Mutex<Option<XError>>,
-    pub cursor_cache: Mutex<HashMap<Option<CursorIcon>, ffi::Cursor>>,
+    pub cursor_cache: Mutex<HashMap<CursorIcon, ffi::Cursor>>,
 }
 
 unsafe impl Send for XConnection {}
@@ -125,22 +127,43 @@ impl XConnection {
         let database =
             load_database(&xcb).map_err(|e| XNotSupported::XcbConversionError(Arc::new(e)))?;
 
-        // Load the RandR version.
-        let randr_major = xcb
-            .extension(randr::NAME)
-            .expect("failed to request XRandR version")
-            .expect("X server missing XRandR extension")
-            .major_opcode;
+        // What the backend needs of the server, asked before anything uses it: RandR 1.3 or
+        // later (the monitors, their modes and scale), XInput 2 (every pointer, touch and
+        // focus event) and XKB (the keyboard). A server without one is refused here, by name,
+        // where upstream panicked further in (the Linux lane, 2026-10-20: under Xvfb's
+        // `-extension RANDR` aterm-gui died of "X server missing XRandR extension").
+        let failed = |e: aterm_x11::Error| XNotSupported::XcbConversionError(Arc::new(e));
+        let present = |name: &'static [u8]| -> Result<u8, XNotSupported> {
+            match xcb.extension(name).map_err(failed)? {
+                Some(info) => Ok(info.major_opcode),
+                None => Err(XNotSupported::MissingExtension(Requirement::of(name))),
+            }
+        };
+        let randr_major = present(randr::NAME)?;
         let randr_version = xcb
             .send(randr::query_version(randr_major, 1, 3))
             .and_then(|cookie| cookie.reply())
-            .expect("failed to query XRandR version");
-
-        let xinput_major = xcb
-            .extension(xinput::NAME)
-            .expect("Failed to query XInput extension")
-            .expect("X server missing XInput extension")
-            .major_opcode;
+            .map_err(failed)?;
+        if (randr_version.major_version, randr_version.minor_version) < (1, 3) {
+            return Err(XNotSupported::MissingExtension(Requirement::RandR13));
+        }
+        let xinput_major = present(xinput::NAME)?;
+        // A server whose XInputExtension predates version 2 does not know XIQueryVersion and
+        // answers it with an X error (`Request`): it lacks XInput 2, which is what it says.
+        let xi_version = match xcb
+            .send(xinput::xi_query_version(xinput_major, 2, 3))
+            .and_then(|cookie| cookie.reply())
+        {
+            Ok(version) => version,
+            Err(aterm_x11::Error::X11(_)) => {
+                return Err(XNotSupported::MissingExtension(Requirement::XInput2))
+            },
+            Err(e) => return Err(failed(e)),
+        };
+        if xi_version.major_version < 2 {
+            return Err(XNotSupported::MissingExtension(Requirement::XInput2));
+        }
+        present(XKB_EXTENSION_NAME)?;
 
         let xsettings_screen = Self::new_xsettings_screen(&xcb, default_screen);
         if xsettings_screen.is_none() {
@@ -183,6 +206,11 @@ impl XConnection {
         // this window in order to accommodate for a changed window here.
         let selector_window =
             xcb.send(xproto::get_selection_owner(xsettings_screen)).ok()?.reply().ok()?.owner;
+        // No manager owns the selection (a bare X server, many window managers): nothing to
+        // watch. Selecting on window 0 would only earn a BadWindow.
+        if selector_window == aterm_x11::proto::NONE {
+            return None;
+        }
 
         xcb.send_void(xproto::change_window_attributes(
             selector_window,
@@ -308,8 +336,9 @@ impl fmt::Debug for XConnection {
 /// of the first screen's root window (what `xrdb` sets), else `~/.Xresources`, else
 /// `~/.Xdefaults`; then, merged after it, the file `$XENVIRONMENT` names, else
 /// `~/.Xdefaults-<hostname>`. A later entry of equal precedence wins, so each file's lines
-/// are appended in that order. Unlike x11rb, a file's `#include` lines are not followed
-/// (aterm-x11's parser skips every directive).
+/// are appended in that order. A file's `#include "path"` lines are followed from its own
+/// directory, as x11rb followed them ([`Database::parse_file`]); the property's are not, its
+/// text being `xrdb`'s output, which cpp has already expanded.
 fn load_database(conn: &aterm_x11::Connection) -> Result<Database, X11Error> {
     let root = conn.setup().roots.first().map_or(0, |screen| screen.root);
     // x11rb asks for at most 100,000,000 words of the property, as Xlib does.
@@ -324,30 +353,30 @@ fn load_database(conn: &aterm_x11::Connection) -> Result<Database, X11Error> {
         ))?
         .reply()?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut data = if reply.format == 8 && !reply.value.is_empty() {
-        reply.value
+    let file = |path: PathBuf| {
+        std::fs::read(&path).ok().map(|data| Database::parse_file(&data, &xrm::include_dir(&path)))
+    };
+    let mut database = if reply.format == 8 && !reply.value.is_empty() {
+        Database::parse(&reply.value)
     } else {
         home.as_ref()
             .and_then(|home| {
-                std::fs::read(home.join(".Xresources"))
-                    .or_else(|_| std::fs::read(home.join(".Xdefaults")))
-                    .ok()
+                file(home.join(".Xresources")).or_else(|| file(home.join(".Xdefaults")))
             })
             .unwrap_or_default()
     };
     let merged = match std::env::var_os("XENVIRONMENT") {
-        Some(path) => std::fs::read(path).ok(),
+        Some(path) => file(PathBuf::from(path)),
         None => {
             let mut name = OsString::from(".Xdefaults-");
             name.push(hostname());
-            std::fs::read(home.unwrap_or_default().join(name)).ok()
+            file(home.unwrap_or_default().join(name))
         },
     };
     if let Some(merged) = merged {
-        data.push(b'\n');
-        data.extend_from_slice(&merged);
+        database.append(merged);
     }
-    Ok(Database::parse(&data))
+    Ok(database)
 }
 
 /// This machine's host name: uname(2)'s node name, which glibc's `gethostname` returns.
@@ -539,6 +568,51 @@ pub enum XNotSupported {
 
     /// We encountered an error while converting the connection to XCB.
     XcbConversionError(Arc<dyn Error + Send + Sync + 'static>),
+
+    /// The server lacks an extension the backend needs, or has too old a version of it.
+    MissingExtension(Requirement),
+}
+
+/// An X extension the X11 backend cannot run without ([`XNotSupported::MissingExtension`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Requirement {
+    /// RANDR at version 1.3 or later: the monitors, their modes and scale.
+    RandR13,
+    /// XInputExtension at version 2: every pointer, touch and focus event.
+    XInput2,
+    /// XKEYBOARD: the keyboard's layout and state.
+    Xkb,
+}
+
+impl Requirement {
+    /// The requirement an extension's name stands for.
+    fn of(name: &[u8]) -> Requirement {
+        if name == randr::NAME {
+            Requirement::RandR13
+        } else if name == xinput::NAME {
+            Requirement::XInput2
+        } else {
+            Requirement::Xkb
+        }
+    }
+
+    /// The extension's name, as the server lists it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Requirement::RandR13 => "RANDR",
+            Requirement::XInput2 => "XInputExtension",
+            Requirement::Xkb => "XKEYBOARD",
+        }
+    }
+
+    /// What the backend needs of it.
+    pub fn needs(self) -> &'static str {
+        match self {
+            Requirement::RandR13 => "RandR 1.3 or later",
+            Requirement::XInput2 => "XInput 2",
+            Requirement::Xkb => "XKB",
+        }
+    }
 }
 
 impl From<aterm_x11::Error> for XNotSupported {
@@ -554,6 +628,7 @@ impl XNotSupported {
             XNotSupported::LibraryOpenError(_) => "Failed to load one of xlib's shared libraries",
             XNotSupported::XOpenDisplayFailed => "Failed to open connection to X server",
             XNotSupported::XcbConversionError(_) => "Failed to convert Xlib connection to XCB",
+            XNotSupported::MissingExtension(_) => "The X server lacks an extension aterm needs",
         }
     }
 }
@@ -571,7 +646,15 @@ impl Error for XNotSupported {
 
 impl fmt::Display for XNotSupported {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        formatter.write_str(self.description())
+        match self {
+            XNotSupported::MissingExtension(r) => write!(
+                formatter,
+                "the X server has no {} extension (or too old a one); aterm's X11 backend needs {}",
+                r.name(),
+                r.needs()
+            ),
+            _ => formatter.write_str(self.description()),
+        }
     }
 }
 

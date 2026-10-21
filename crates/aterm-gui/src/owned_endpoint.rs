@@ -1,27 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What this instance published on its control socket, and the one rule by which
-//! any exit removes it.
+//! What this instance published on its control socket, and the one rule by which any exit
+//! removes it.
 //!
-//! Once the socket is bound, [`publish`] records the socket's and token's file
-//! identities (device, inode) and the `latest` alias with its target. Every exit
-//! removes each file only while it is still the one this instance published, and
-//! only in this process: a successor that rebound the same path owns a new inode, a
-//! newer instance may have repointed `latest`, and a child between `fork` and `exec`
-//! is not the publisher.
+//! Once the socket is bound, [`publish`] records the socket's and token's file identities
+//! (device, inode) and the `latest` alias with its target. Every exit removes each file only
+//! while it is still the one this instance published, and only in this process: a successor
+//! that rebound the path owns a new inode, a newer instance may have repointed `latest`, and a
+//! child between `fork` and `exec` is not the publisher. When this instance rebinds its own
+//! socket at the same path (the listener watchdog replacing a wedged one, the cold update lane
+//! reopening after a failed `exec`), [`rebound`] moves the record to the fresh socket, only
+//! from the one it replaced.
 //!
-//! When this instance rebinds its own socket at the same path (the listener
-//! watchdog replacing a wedged one, the cold update lane reopening after an `exec`
-//! that did not happen), [`rebound`] moves the record to the fresh socket, only from
-//! the one it replaced.
-//!
-//! * The loop's graceful exit calls [`release`].
-//! * `SIGTERM`, `SIGINT` and `SIGHUP` end the process by default action, running no
-//!   loop-exit code, and an explicit `$ATERM_CONTROL_SOCK` is not swept by anyone
-//!   else. [`publish`] installs a handler for each of the three whose disposition is
-//!   still the default (an ignored one, like `nohup`'s `SIGHUP`, stays ignored); it
-//!   removes by the same rule, restores the default and re-raises.
+//! The loop's graceful exit calls [`release`]. `SIGTERM`, `SIGINT` and `SIGHUP` end the process
+//! by default action with no loop-exit code, and nobody else sweeps an explicit
+//! `--control-sock` path, so [`publish`] installs a handler for each of the three still at its
+//! default disposition (an ignored one, like `nohup`'s `SIGHUP`, stays ignored); it removes by
+//! the same rule, restores the default and re-raises.
 //!
 //! A HEADLESS INSTANCE QUITS ON THEM INSTEAD ([`arm_orderly_quit`]): `kill <pid>` is how
 //! a harness or a person stops one, and it is a request to quit, not a crash. The arm
@@ -455,8 +451,7 @@ mod imp {
 /// identity read.
 #[cfg(not(unix))]
 pub(crate) fn publish(_plan: &crate::control_auth::SocketPlan) {
-    // Windows ends a process without a POSIX terminating signal, and its
-    // endpoint is a named file the next instance's stale sweep reclaims.
+    // The endpoint is a named file the next instance's stale sweep reclaims.
 }
 
 /// Off Unix no terminating signal quits the instance: nothing to die of.

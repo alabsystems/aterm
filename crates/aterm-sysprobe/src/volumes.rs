@@ -89,6 +89,13 @@ pub struct Mount {
     pub local: bool,
     /// Mounted by the automounter (macOS `MNT_AUTOMOUNTED`, or `autofs`).
     pub automounted: bool,
+    /// On removable media (macOS `MNT_REMOVABLE`: a USB disk, a card; touching
+    /// one can raise the removable-volumes privacy prompt). Linux reads it from
+    /// where udisks mounts such media (`/media/…`, `/run/media/…`), since
+    /// mountinfo carries no flag for it; Windows from the device class
+    /// (`\Device\CdRom<n>`, `\Device\Floppy<n>`), not from a USB stick's
+    /// `HarddiskVolume` (see `local`).
+    pub removable: bool,
     /// Mounted read-only.
     pub read_only: bool,
     /// What every mount sharing one free figure names alike: the APFS
@@ -913,7 +920,9 @@ pub fn parse_mountinfo(text: &str, cut: bool) -> Table {
         }
         let fstype = unescape_mount(fstype);
         let automounted = fstype == "autofs";
+        let removable = on.starts_with("/media") || on.starts_with("/run/media");
         mounts.push(Mount {
+            removable,
             on,
             from: fields
                 .get(dash + 2)
@@ -1039,6 +1048,7 @@ pub(crate) fn windows_table(
         fstype: String::new(),
         local: false,
         automounted: false,
+        removable: false,
         read_only: false,
         container: None,
     }];
@@ -1099,6 +1109,7 @@ pub(crate) fn windows_table(
                 fstype: String::new(),
                 local: class == Some(Device::Volume),
                 automounted: class == Some(Device::Removable),
+                removable: class == Some(Device::Removable),
                 read_only: false,
                 container: Some(v.name.clone()),
             });
@@ -1124,6 +1135,7 @@ pub(crate) fn windows_table(
             },
             local: class == Device::Volume,
             automounted: class == Device::Removable,
+            removable: class == Device::Removable,
             read_only: false,
             container: volumes
                 .iter()
@@ -1341,6 +1353,7 @@ mod arm {
     const MNT_NOWAIT: libc::c_int = 2;
     const MNT_RDONLY: u32 = 0x0000_0001;
     const MNT_LOCAL: u32 = 0x0000_1000;
+    const MNT_REMOVABLE: u32 = 0x0000_0200;
     const MNT_AUTOMOUNTED: u32 = 0x0040_0000;
 
     /// A NUL-terminated `c_char` array as text.
@@ -1399,6 +1412,7 @@ mod arm {
                     fstype: text(&r.f_fstypename),
                     local: r.f_flags & MNT_LOCAL != 0,
                     automounted: r.f_flags & MNT_AUTOMOUNTED != 0,
+                    removable: r.f_flags & MNT_REMOVABLE != 0,
                     read_only: r.f_flags & MNT_RDONLY != 0,
                 }
             })

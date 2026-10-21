@@ -1192,9 +1192,14 @@ impl ScriptedClock {
         s.sleeps_skip = true;
     }
 
+    /// Whether the clocks run on the run's steps alone ([`Self::run_virtual`]).
+    pub(crate) fn is_virtual(&self) -> bool {
+        self.script().sleeps_skip
+    }
+
     /// Sleep `d`: skipped on a clock that runs on the run's steps
     /// ([`Self::run_virtual`]), else slept.
-    fn sleep(&self, d: Duration) {
+    pub(crate) fn sleep(&self, d: Duration) {
         if self.script().sleeps_skip {
             self.skip(d);
         } else {

@@ -24,9 +24,8 @@ pub enum Anchor {
     /// updater obeys, for this client's platform) agreeing on `{version, url, sha512}`
     /// with the per-version `manifest.json` beside the payload in Google Cloud Storage,
     /// the payload exactly at its compiled bucket path — two services, no signature.
-    /// Residual: both hosts are Google's, so the agreement is one vendor's word from two
-    /// of its services, never a second party's; on darwin the Developer ID team pin binds
-    /// the bytes to Google independently of TLS.
+    /// Residual: both hosts are Google's, so this is one vendor's word from two services;
+    /// on darwin the Developer ID team pin binds the bytes to Google independently of TLS.
     #[serde(rename = "google-two-host")]
     GoogleTwoHost,
     /// muse's `muse-stable` channel on `api.meta.ai` naming the version, and the release
@@ -71,7 +70,7 @@ pub struct DocPin {
     pub redirect_hosts: &'static [&'static str],
 }
 
-/// How a build this machine just landed is WARMED ([`crate::warm`]): one headless run that
+/// How a build this machine just landed is warmed ([`crate::warm`]): one headless run that
 /// refreshes the vendor CLI's account-bound caches (the served model catalog, feature flags)
 /// before the user's first launch, and never starts a model turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,16 +78,16 @@ pub struct Warm {
     /// The arguments after the program's name.
     pub argv: &'static [&'static str],
     /// The AI variables ([`aterm_types::domain::is_ai_env_var`]) the program is handed
-    /// although they are stripped from every other child: not a session's state but the
-    /// user's own setup of THIS program — where it keeps its config and caches (the very
-    /// files the warm refreshes) and which endpoint it talks to. Every other AI variable,
-    /// another vendor's setup among them, is kept from it.
+    /// although every other child has them stripped: not a session's state but the user's
+    /// own setup of this program — where it keeps its config and caches (the files the warm
+    /// refreshes) and which endpoint it talks to. Every other AI variable, another vendor's
+    /// among them, is kept from it.
     pub keep: &'static [&'static str],
     /// `(NAME, VALUE)` pairs set on the program, over anything the user's setup holds.
     pub env: &'static [(&'static str, &'static str)],
-    /// The variable whose non-empty value is the user's opt-out of exactly the traffic the
-    /// warm exists to make: set, the program is not warmed. A variable the program honours
-    /// itself (`DISABLE_TELEMETRY`) is no opt-out here: it reaches the program.
+    /// The variable whose non-empty value opts the user out of exactly the traffic the warm
+    /// makes: set, the program is not warmed. A variable the program honours itself
+    /// (`DISABLE_TELEMETRY`) is not named here: it reaches the program.
     pub opt_out: Option<&'static str>,
     /// Where the program keeps its state on this account: none of it present, the program
     /// has never run here, there is nothing to refresh, and it is not warmed. `None`: it is
@@ -137,16 +136,14 @@ pub struct VendorSpec {
     pub digest_docs: &'static [DocPin],
     /// `NAME=VALUE` entries the shims export; never taken from the index.
     pub shim_env: &'static [&'static str],
-    /// How a build this machine just landed is warmed: its argv and every per-program fact
-    /// the warm reads. `None`: the program is never warmed. Compiled only, never taken from
-    /// the index — the rule [`Self::shim_env`] follows.
+    /// How a build this machine just landed is warmed; `None`: it never is. Compiled only,
+    /// never taken from the index.
     pub warm: Option<Warm>,
     /// The vendor's self-update verbs the program's twin hands to aterm's package manager
     /// ([`crate::selfupdate`]), exactly as typed as `$1`; each must pass
-    /// [`crate::selfupdate::is_shell_safe_verb`] (it lands in a `case` pattern). EMPTY means
-    /// the program has no self-updater and its twin carries no block — an explicit decision
-    /// per row. Where each was measured is the table in
-    /// `docs/DESIGN-vendor-self-update-2026-09-19.md`.
+    /// [`crate::selfupdate::is_shell_safe_verb`] (it lands in a `case` pattern). Empty: the
+    /// program has no self-updater and its twin carries no block. Where each was measured
+    /// is the table in `docs/DESIGN-vendor-self-update-2026-09-19.md`.
     pub self_update_verbs: &'static [&'static str],
     /// The vendor flags `--yolo` on the managed name expands to ([`crate::yolo`]) — the
     /// program's own "every approval and sandbox off" spelling, measured from its
@@ -192,12 +189,11 @@ pub struct VendorSpec {
     /// legacy pin up to [`Self::legacy_ceiling`] (with no pin, the head when the row was
     /// written).
     pub floor: Version,
-    /// The final legacy ALab index build of the program — the last one any index pinned
-    /// before the vendor lane was retired, or [`NEVER_INDEX_PINNED`]. A legacy build from
-    /// 1 up to it whose version cannot be read is replaced by any admissible head with no
-    /// index and no downgrade. Any other (a pin this code never saw) may carry a version
-    /// above the floor, so the lane keeps it until its version is read (`legacy_facts`) or
-    /// a person asks.
+    /// The newest legacy ALab index build of the program this code vouches for, or
+    /// [`NEVER_INDEX_PINNED`]. A legacy build from 1 up to it whose version is unread is
+    /// replaced by any admissible head, with no index and no downgrade; any other may carry
+    /// a version above the floor, so the lane keeps it until its version is read
+    /// (`legacy_facts`) or a person asks.
     pub legacy_ceiling: u64,
 }
 
@@ -270,7 +266,7 @@ macro_rules! agy_manifests {
     };
 }
 
-/// agy's head: the manifest for THIS client's own platform — the one agy's own updater
+/// agy's head: the manifest for this client's own platform — the one agy's own updater
 /// obeys while a rollout is staged — chosen by the arms `cli::current_triple` reports
 /// under. A platform with none of them gets the bare prefix, which no fetch admits.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -338,10 +334,10 @@ pub const VENDORS: &[VendorSpec] = &[
         ],
         warm: Some(Warm {
             // Print mode reading stream-json from a stdin the warm never writes (measured on
-            // 2.1.280): the bootstrap, feature and model-catalog fetches run and
-            // no `/v1/messages` call, no transcript and no hook or MCP server does; the warm
-            // closes stdin and the CLI exits 0. Never `--bare` (it skips those very fetches)
-            // and never `--init-only` (it exits racing them).
+            // 2.1.280): the bootstrap, feature and model-catalog fetches run, and no
+            // `/v1/messages` call, transcript, hook or MCP server does; the warm closes stdin
+            // and the CLI exits 0. Never `--bare` (it skips those fetches) and never
+            // `--init-only` (it exits racing them).
             argv: &[
                 "-p",
                 "--input-format",
@@ -527,7 +523,7 @@ pub const VENDORS: &[VendorSpec] = &[
             },
         ],
         // agy's background updater replaces its own executable unless this is exactly
-        // `true` (`1` leaves it on; measured on 1.3.6, 2026-10-15).
+        // `true` (`1` leaves it on; measured on 1.3.6).
         shim_env: &["AGY_CLI_DISABLE_AUTO_UPDATE=true"],
         // Nothing measured warms it signed out (`agy models` exits 1).
         warm: None,

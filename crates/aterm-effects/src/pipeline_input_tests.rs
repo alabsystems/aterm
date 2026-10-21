@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exercise the web host's public input seam against real terminal echoes.
-//! This child module reads existing engine diagnostics without exposing a
-//! production-only accessor just for tests.
+//! The web host's public input seam against real terminal echoes.
 
 use super::*;
 
@@ -93,9 +91,9 @@ impl Host {
         self.pipeline.cursor.glow.in_flight_tally().credits
     }
 
-    /// Compare emitted content in tests; production `Status::fp` remains the
-    /// inexpensive idle/non-idle sentinel. Summary counts cannot distinguish
-    /// equal-sized frames with different geometry, color or blend fields.
+    /// The emitted streams, for tests; production keeps `Status::fp` as the cheap idle
+    /// sentinel. Summary counts cannot tell apart equal-sized frames with different geometry,
+    /// color or blend.
     fn glow_frame(&self) -> GlowFrame<'_> {
         GlowFrame::read(&self.input)
     }
@@ -103,9 +101,8 @@ impl Host {
 
 #[test]
 fn web_glyph_classes_reach_the_real_rainbow_renderer() {
-    // The web host probes only the caret row. First present the blank row
-    // above through that real probe, then type beneath its observed sky.
-    // This uses normal terminal snapshots, not invented glyph clearance.
+    // The web host probes only the caret row: present the blank row above through that
+    // probe first, then type beneath its observed sky.
     for (ch, class, shifted) in [
         (' ', TypedClass::Space, false),
         ('!', TypedClass::Bang, true),
@@ -137,10 +134,8 @@ fn web_glyph_classes_reach_the_real_rainbow_renderer() {
         for _ in 0..16 {
             web.note(ch);
             let width = aterm_grapheme::char_width(ch) as u16;
-            // The typing CADENCE is not the class: the web seam heats it on
-            // every committed key (the rainbow block reads that energy), so
-            // both engine-level hosts are fed the same heat and only the
-            // glyph class can tell them apart.
+            // The web seam heats cadence on every committed key, so both engine-level hosts
+            // get the same heat and only the glyph class tells them apart.
             for host in [&mut explicit, &mut historical] {
                 let now = host.pipeline.now();
                 host.pipeline.cursor.cadence.on_keystroke(now);
@@ -173,8 +168,8 @@ fn web_glyph_classes_reach_the_real_rainbow_renderer() {
                 differs_from_unclassified |= web.glow_frame() != historical.glow_frame();
             }
         }
-        // Space must rest the sky, and hero classes must earn their stars.
-        // Both visibly differ from the old unclassified route.
+        // Space rests the sky and hero classes earn stars, so these differ from the
+        // unclassified route.
         if matches!(
             class,
             TypedClass::Space | TypedClass::Bang | TypedClass::Capital
@@ -199,9 +194,8 @@ fn web_non_text_intents_preserve_or_retire_the_existing_credit_pool() {
         (PetInputKind::KillForward, 0),
     ] {
         let mut host = Host::new(Instant::now());
-        // Two accepted writes are still in flight: one narrow and one wide.
-        // Deleting the newest must retire its entire two-cell credit while
-        // preserving the earlier key; a line kill retires both.
+        // Two writes in flight, one narrow and one wide: deleting the newest retires its
+        // two-cell credit and keeps the earlier key's; a line kill retires both.
         host.note('a');
         host.note('界');
         assert_eq!(host.credits(), 3);
@@ -244,8 +238,7 @@ fn web_delete_dispatch_reaches_erase_without_a_typed_replay() {
     assert_eq!(host.credits(), 0);
     assert_eq!(host.pipeline.pending_keys, 0);
 
-    // The old web contract queued a plain typed press for the same Backspace.
-    // Run that broken input through the genuine queue, not a forged tally.
+    // Negative control: a plain typed press for the same Backspace, through the real queue.
     host.pipeline.note_keystroke();
     host.pipeline.advance(16.0);
     assert_eq!(host.credits(), 1, "historical route mints false credit");

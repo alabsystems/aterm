@@ -15,15 +15,11 @@ fn project(app: &App, exited: bool) -> [i64; 4] {
     [win_count, frontmost, next_id, exited as i64]
 }
 
-/// Run `ty trace validate` for one real transition; returns (conforms, output).
-/// The spec + cfg are DERIVED from the SAME `window_routing_model()` that Tier-0
-/// exhaustively checks. `transition_spec()` opens `Init`, so the trace's step 0
-/// is `prev`; the cfg overrides `MaxWin`/`MaxId` to LARGE bounds so a real
-/// multi-window run's guards never spuriously reject — `Buggy` stays 0 (the
-/// committed, correct close→exit discipline the real `App` implements).
+/// Validate one real transition against `window_routing_model()`; returns (conforms, output).
+/// Tiered (`verify::validate_transition_tiered`): the in-process `Next` check always runs,
+/// `ty trace validate` too where installed, and the verdicts must agree. `MaxWin`/`MaxId` are
+/// raised so a real multi-window run's guards never spuriously reject; `Buggy` stays 0.
 fn validate_transition(action_name: &str, prev: [i64; 4], next: [i64; 4]) -> (bool, String) {
-    // Tiered (`verify::validate_transition_tiered`): the in-process `Next` check always
-    // runs; `ty trace validate` also runs where installed, and the verdicts must agree.
     let m = window_routing_model();
     let st = |s: [i64; 4]| -> BTreeMap<&'static str, i64> {
         [
@@ -66,8 +62,7 @@ fn run_conformance() {
     ));
     std::fs::create_dir_all(&dir).expect("mk tempdir");
 
-    // Projection-drift guard: the initial headless projection must equal the model's
-    // `init_state` (1, 1, 2, 0) before any `ty` call.
+    // Projection-drift guard: the headless projection must equal the model's `init_state`.
     let app0 = App::headless_for_test();
     let init = window_routing_model().init_state();
     let model_init = [
@@ -91,13 +86,13 @@ fn run_conformance() {
     );
     drop(app0);
 
-    // Drive a real create/close sequence through the production seams and
-    // strictly validate each transition against the derived `Next`.
+    // A real create/raise/close sequence through the production seams, each transition
+    // validated against the derived `Next`.
     let mut app = App::headless_for_test();
     let mut exited = false;
     let mut validated = 0usize;
 
-    // --- CreateWindow: a 2nd window (real wid/session minting + install).
+    // CreateWindow: a 2nd window.
     let prev = project(&app, exited);
     let sid1 = app.next_session_id;
     let _wid1 = app.insert_logical_window(stub_session(sid1), 24, 80);
@@ -113,7 +108,7 @@ fn run_conformance() {
     );
     validated += 1;
 
-    // --- CreateWindow: a 3rd window (a strictly-greater id; never reused).
+    // CreateWindow: a 3rd window (a strictly greater id, never reused).
     let prev = next;
     let sid2 = app.next_session_id;
     let _wid2 = app.insert_logical_window(stub_session(sid2), 24, 80);
@@ -203,8 +198,7 @@ fn run_conformance() {
     );
     validated += 1;
 
-    // --- CloseWindow: a NON-last window (WindowId(0)). A survivor remains, so
-    // the app stays and exited is unchanged (still false).
+    // CloseWindow: a non-last window (WindowId(0)); the app stays.
     let prev = next;
     let outcome = app.close_window_logical(WindowId(0));
     assert_eq!(
@@ -224,10 +218,8 @@ fn run_conformance() {
     );
     validated += 1;
 
-    // CloseWindow on the frontmost (highest id) while a lower-id survivor remains: the
-    // app re-points to the lowest live id, which the model's nondeterministic re-point
-    // (`frontmost' \in 1..next_id-1`) admits. The teardown below never reaches this
-    // branch.
+    // CloseWindow on the frontmost with a lower-id survivor: the app re-points to the lowest
+    // live id, which the model's nondeterministic re-point admits.
     if app.windows.len() >= 2 {
         let prev = project(&app, exited);
         let front = app
@@ -252,8 +244,8 @@ fn run_conformance() {
         validated += 1;
     }
 
-    // Close down to the last window, lowest id first; on `Exit` set `exited = true`.
-    // `structural_invariants_ok` needs a frontmost, so it is asserted only after creates.
+    // Close down to the last window, lowest id first. `structural_invariants_ok` needs a
+    // frontmost, so it is asserted only after creates.
     while let Some(&wid) = app.windows.keys().next() {
         let prev = project(&app, exited);
         let outcome = app.close_window_logical(wid);
@@ -272,7 +264,6 @@ fn run_conformance() {
     assert!(exited, "closing the last window set exited (ExitIffEmpty)");
 
     // Negative controls: each must be rejected, or the binding proves nothing.
-    //
     // (a) Missed exit: closing the last window while `exited=0` (the `Buggy=1` defect).
     let prev_missed = [1, 1, 2, 0];
     let next_missed = [0, 0, 2, 0]; // win_count 1->0 but exited stays 0
@@ -293,8 +284,7 @@ fn run_conformance() {
          — exiting while a window remains violates ExitIffEmpty\n--- ty ---\n{o}"
     );
 
-    // (c) Raise to an unallocated id (`frontmost' = next_id`), which
-    // `FrontmostAllocated` and the action's `1..(next_id - 1)` range forbid.
+    // (c) Raise to an unallocated id (`frontmost' = next_id`): `FrontmostAllocated` forbids it.
     let prev_raise = [2, 1, 3, 0];
     let next_raise = [2, 3, 3, 0]; // frontmost -> 3 = next_id (unallocated)
     let (ok, o) = validate_transition("RaiseSession", prev_raise, next_raise);
@@ -304,8 +294,7 @@ fn run_conformance() {
          rejected — frontmost may never re-point to a future/unallocated id\n--- ty ---\n{o}"
     );
 
-    // (d) Connected mint after exit: the hosted-origin guard (`win_count > 0 /\ exited =
-    // 0`) forbids it.
+    // (d) Connected mint after exit: the hosted-origin guard forbids it.
     let prev_dead = [0, 0, 2, 1];
     let next_dead = [1, 2, 3, 1]; // a mint out of the exited state
     let (ok, o) = validate_transition("ConnectedCreateWindow", prev_dead, next_dead);

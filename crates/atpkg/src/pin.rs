@@ -1,15 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Consumer-side LOCAL pin state (§11) — the set of programs the user has frozen against
-//! `update`/`sync`.
+//! Local pin state: the programs the user has frozen against `update`/`sync`.
 //!
-//! A pin is **upgrade-suppression ONLY**. It is a local file, never signed trust input; it
-//! can only cause an apply to SKIP an upgrade — never grant, move, or downgrade a build —
-//! and it is always consulted strictly AFTER [`crate::gate::decide`], so a Tombstone / floor
-//! always wins (a pin can never keep a revoked or below-floor build running). The state
-//! lives in a `0600` newline-delimited file directly under the hardened prefix and is
-//! mutated atomically (temp + rename), mirroring [`crate::store::mark_build_ready`].
+//! A pin only suppresses an upgrade; it never grants, moves or downgrades a build. It is a
+//! local file, never signed trust input, and is consulted after [`crate::gate::decide`], so a
+//! tombstone or floor always wins over it. The state is a `0600` newline-delimited file under
+//! the prefix, replaced atomically (temp + rename).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -21,13 +18,13 @@ use crate::store::Layout;
 const MAX_PIN_FILE_BYTES: usize = 256 * 1024;
 const MAX_PINNED_PROGRAMS: usize = 2048;
 
-/// `pins` — the `0600` newline-delimited pin-state file directly under the vetted prefix.
+/// `pins`, directly under the prefix.
 fn pins_path(layout: &Layout) -> PathBuf {
     layout.prefix.join("pins")
 }
 
-/// The set of pinned program names. An absent or unreadable file reads as EMPTY (a pin is
-/// suppression state, not trust input — its absence must never be an error).
+/// The set of pinned program names. An absent, unreadable, oversized or over-count file
+/// reads as empty: a pin is suppression state, not trust input.
 #[must_use]
 pub fn pinned_set(layout: &Layout) -> BTreeSet<String> {
     let Ok(body) =
@@ -51,12 +48,10 @@ pub fn is_pinned(layout: &Layout, program: &str) -> bool {
     pinned_set(layout).contains(program)
 }
 
-/// Set (or clear) the local pin for `program`, returning `Ok(changed)`. Rejects an unsafe
-/// program name (the same shape rule [`crate::ops::uninstall`] / [`crate::store::shim_allowed`]
-/// enforce, PLUS a newline guard so a crafted name cannot inject a phantom pin line) with
-/// [`io::ErrorKind::InvalidInput`] and writes nothing. Hardens the prefix (`0700`), writes a
-/// `0600` temp file, and atomically renames it into place so a crash leaves the old file or
-/// none — never a torn / loose-perm one.
+/// Set (or clear) the local pin for `program`, returning `Ok(changed)`. A name that is not a
+/// single safe path component, or holds a newline (a phantom pin line), is
+/// [`io::ErrorKind::InvalidInput`] and writes nothing. The file is written `0600` to a temp
+/// file and renamed into place, so a crash leaves the old file or none.
 pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bool> {
     if program.is_empty()
         || program == "."
@@ -78,7 +73,6 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
     } else {
         set.remove(program)
     };
-    // Harden the (vetted) prefix and write atomically.
     layout.ensure_dir(&layout.prefix)?;
     let dest = pins_path(layout);
     let tmp = layout
@@ -107,7 +101,6 @@ mod tests {
         assert!(!is_pinned(&l, "ay"));
         assert!(set_pinned(&l, "ay", true).unwrap(), "first pin is a change");
         assert!(is_pinned(&l, "ay"));
-        // 0600 — Unix-only mode check.
         #[cfg(unix)]
         {
             let mode = fs::metadata(pins_path(&l)).unwrap().permissions().mode();

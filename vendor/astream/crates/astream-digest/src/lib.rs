@@ -1,25 +1,39 @@
 #![forbid(unsafe_code)]
 //! `astream-digest` — SHA-256, transcribed from FIPS 180-4 section 6.2: the
-//! reference algorithm, checkable line by line against the standard.
+//! reference algorithm, checkable line by line against the standard; and the one
+//! HMAC-SHA256 (RFC 2104), HKDF-SHA256 (RFC 5869) and constant-time compare built
+//! on it.
 //!
-//! It is the one hash in the workspace. `astream-cap` builds its RFC 2104
-//! HMAC-SHA256 (capability tags, attach proofs) and derives producer ids over it;
-//! `astream-aead`'s handshake builds HMAC and HKDF over it; `astream-evidence`
-//! pins command output with it. Each of those owns its construction; this crate
-//! owns only the primitive.
+//! It is the one hash in the workspace, and the one MAC. `astream-cap` tags its
+//! capabilities, proves attaches and chains Macaroons with [`hmac_sha256_parts`]
+//! and derives producer ids over [`Sha256`]; `astream-aead`'s handshake and
+//! identity session keys derive through [`hkdf_extract`] and [`hkdf_expand_32`];
+//! `astream-evidence` pins command output with [`Sha256`]. aterm's `aterm-digest`
+//! re-exports this crate's [`Sha256`], MAC, HKDF and [`ct_eq`], its own copies
+//! deleted, and aterm's fleet keys, control-socket token and shell-integration
+//! nonce go through them.
+//!
+//! THE MAC LIVES HERE BECAUSE IT WAS FOUR. aterm-digest's streaming HMAC, aterm-net's
+//! fleet HKDF over it, astream-cap's const HMAC core and astream-aead's wiping HMAC
+//! were four transcriptions of the same RFC 2104 that nothing held to each other.
+//! Now [`HmacSha256`] (streaming), [`hmac_sha256_parts`] (const, over a list of
+//! parts) and [`hmac_sha256_wiping`] (zeroes its key block and pads) are one
+//! construction through the same steps (`src/hmac.rs`), checked against RFC 4231,
+//! RFC 5869 and the answers each copy recorded.
 //!
 //! Zero dependencies and no `unsafe`, SIMD or assembly: astream hashes grants,
 //! nonces and test output, not bulk traffic. The const slice updater copies bytes
 //! into one 64-byte buffer and compresses it whenever it fills.
 //!
-//! Ported from aterm's `aterm-digest` (the same author; it now re-exports this one),
-//! with its tests. Checked against the FIPS 180-4 vectors below, and against the
-//! `sha2` crate it replaced: every length 0..=1024, whole and under random update
-//! splits, matched sha2 byte for byte when it landed, and
+//! Ported from aterm's `aterm-digest` (the same author), with its tests: the
+//! SHA-256 first, then its HMAC, its `ct_eq` and its length sweeps
+//! (`tests/lengths_and_streaming.rs`). Checked against the FIPS 180-4 vectors
+//! below, and against the `sha2` crate it replaced: every length 0..=1024, whole
+//! and under random update splits, matched sha2 byte for byte when it landed, and
 //! `tests/lengths_and_splits.rs` pins the answers sha2 gave.
 //!
 //! ```
-//! use astream_digest::Sha256;
+//! use astream_digest::{ct_eq, HmacSha256, Sha256};
 //!
 //! // One-shot.
 //! let d = Sha256::digest(b"abc");
@@ -30,6 +44,13 @@
 //! h.update(b"a");
 //! h.update(b"bc");
 //! assert_eq!(h.finalize(), d);
+//!
+//! // Keyed authentication; verification is constant time.
+//! let mut mac = HmacSha256::new_from_slice(b"key").expect("any key length");
+//! mac.update(b"message");
+//! let tag = mac.finalize();
+//! assert_eq!(tag, astream_digest::hmac_sha256_parts(b"key", &[b"mess", b"age"]));
+//! assert!(ct_eq(&tag, &tag));
 //! ```
 
 // A contracted fn is written once, through `contract_fn!`: under a Trust compiler
@@ -43,6 +64,43 @@ mod contract_fn;
 // that cannot lex the islands.
 #[cfg(any(test, not(clean_islands)))]
 mod twins;
+
+// HMAC-SHA256 and HKDF-SHA256: the one construction, three doors (see the module).
+mod hmac;
+pub use hmac::{
+    hkdf_expand_32, hkdf_extract, hmac_sha256_parts, hmac_sha256_wiping, HmacSha256, InvalidLength,
+    MacError,
+};
+
+/// Compares two byte slices in constant time with respect to their contents.
+///
+/// Returns `true` when the slices have the same length and the same bytes.
+///
+/// An early-exit loop would leak the position of the first differing byte
+/// through timing, letting an attacker recover an HMAC tag byte by byte. Every
+/// byte pair is folded into one accumulator with `|=`, with no branch and no
+/// early exit. Length is not secret (it is visible in the wire format), so an
+/// unequal length may short-circuit. The final [`std::hint::black_box`] keeps
+/// the optimiser from reintroducing an early exit once `diff` is non-zero.
+///
+/// This is a property of the source's shape, not a timing measurement, and no
+/// test can observe it: the tests pin only that the answer is slice equality, a
+/// difference in the LAST byte included. `astream-cap` keeps its own fixed-width
+/// fold for its 32-byte tags (`ct_diff`), whose no-early-exit shape its tests pin
+/// through the function its verify calls.
+#[must_use]
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    let mut i = 0usize;
+    while i < a.len() && i < b.len() {
+        diff |= a[i] ^ b[i];
+        i += 1;
+    }
+    std::hint::black_box(diff) == 0
+}
 
 /// The SHA-256 block size, in bytes (FIPS 180-4 sec. 1: 512 bits) — also the
 /// HMAC block size `B` of RFC 2104.
@@ -98,8 +156,13 @@ const K: [u32; 64] = [
 
 /// Multi-parameter streaming SHA-256 buffer occupancy transition kernel:
 /// computes the next partial-buffer length in `0..64` after feeding `data_len`
-/// bytes with post-chunk remainder `tail_len`. Matches the Clean kernel specification
-/// `Astream.Digest.TlaStreamingSha256.sha256_next_buf_len_isl`.
+/// bytes with post-chunk remainder `tail_len`.
+///
+/// Hand-written plain Rust, not compiled from Clean: it restates
+/// `Astream.Digest.TlaStreamingSha256.sha256_next_buf_len_isl`, the island's composition of
+/// the Clean-Origin (`I5`) [`sha256_clamp_partial_len`] and [`sha256_partial_take`], and
+/// astream-broker's `clean_tla_protocol_surface` suite holds it to that composition over a
+/// grid of boundary operands.
 #[must_use]
 pub const fn sha256_next_buf_len(cur_buf_len: u64, data_len: u64, tail_len: u64) -> u64 {
     let clamped_tail = if tail_len < 63 { tail_len } else { 63 };
@@ -585,5 +648,66 @@ mod tests {
         assert_eq!(sha256_next_buf_len(0, 100, 36), 36);
         assert_eq!(sha256_next_buf_len(20, 15, 0), 35);
         assert_eq!(sha256_next_buf_len(20, 100, 12), 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // ct_eq (from aterm-digest, with its HMAC)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ct_eq_accepts_identical_slices() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"a", b"a"));
+        assert!(ct_eq(&[0u8; 32], &[0u8; 32]));
+        let tag = Sha256::digest(b"the quick brown fox");
+        assert!(ct_eq(&tag, &tag));
+        // Negative control: the same digest of a different message is refused.
+        assert!(!ct_eq(&tag, &Sha256::digest(b"the quick brown fix")));
+    }
+
+    #[test]
+    fn ct_eq_rejects_same_length_differences() {
+        // First byte differs.
+        assert!(!ct_eq(b"abcdef", b"Xbcdef"));
+        // Last byte differs -- the case an early-return loop would answer
+        // slowest, and the one a timing attacker walks toward.
+        assert!(!ct_eq(b"abcdef", b"abcdeX"));
+        // A single bit differs, at every position of a 32-byte tag; the
+        // unflipped tag is the control that the fold says equal to itself.
+        let a = [0u8; 32];
+        assert!(ct_eq(&a, &[0u8; 32]));
+        for i in 0..32 {
+            for bit in 0..8 {
+                let mut b = a;
+                b[i] = 1 << bit;
+                assert!(!ct_eq(&a, &b), "byte {i}, bit {bit}");
+            }
+        }
+    }
+
+    #[test]
+    fn ct_eq_rejects_length_mismatch() {
+        assert!(!ct_eq(b"", b"a"));
+        assert!(!ct_eq(b"a", b""));
+        // A prefix is not a match, in either direction.
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(!ct_eq(b"abcd", b"abc"));
+        // A truncated tag must never validate against a full one, though it
+        // validates against itself.
+        let tag = Sha256::digest(b"payload");
+        assert!(!ct_eq(&tag[..16], &tag));
+        assert!(ct_eq(&tag[..16], &tag[..16]));
+        // REGRESSION, moved here with aterm's last compare that had its own
+        // copy (aterm-gui's control socket): a compare that folds the length
+        // delta into the byte fold must fold all of it. One that kept the
+        // delta's low 16 bits, and read a zero past the end of the shorter
+        // side, answered all-zero slices 65,536 bytes apart EQUAL: no byte
+        // differs, and the delta folds to 0. Only zeros past the end show it
+        // (any other byte differs from the zero read in its place), so these
+        // are all zeros, in both orders. Refused on the length alone.
+        let (short, long) = (vec![0u8; 64], vec![0u8; 64 + 65_536]);
+        assert!(!ct_eq(&short, &long));
+        assert!(!ct_eq(&long, &short));
+        assert!(ct_eq(&long, &vec![0u8; 64 + 65_536]), "the control");
     }
 }

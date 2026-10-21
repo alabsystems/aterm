@@ -748,34 +748,44 @@ impl EchoLedger {
     /// A press at exactly the patience is kept.
     fn expire(&mut self, now: Instant) {
         let stale = |at: Instant| now.saturating_duration_since(at).as_secs_f32() > ECHO_PATIENCE_S;
+        let mut any = false;
         for slot in &mut self.slots {
-            if slot.is_some_and(|(at, _)| stale(at)) {
+            let Some((at, _)) = *slot else { break };
+            if stale(at) {
                 #[cfg(test)]
                 {
                     self.tally.expired += slot.map_or(0, |(_, c)| u32::from(c));
                 }
                 *slot = None;
+                any = true;
             }
         }
-        self.repack();
+        if any {
+            self.repack();
+        }
     }
 
     /// Restore the packing after slots were emptied in place: every `Some`
     /// precedes every `None`, oldest first, so a hole in the middle cannot
     /// hide the presses behind it.
     fn repack(&mut self) {
-        let mut kept = [None; ECHO_LEDGER_DEPTH];
-        for (n, entry) in self.slots.into_iter().flatten().enumerate() {
-            kept[n] = Some(entry);
+        let mut write = 0;
+        for read in 0..ECHO_LEDGER_DEPTH {
+            if let Some(entry) = self.slots[read] {
+                if write != read {
+                    self.slots[write] = Some(entry);
+                    self.slots[read] = None;
+                }
+                write += 1;
+            }
         }
-        self.slots = kept;
     }
 
     /// Cells of the banked presses whose clock passes `keep`.
     fn cells_where(&self, keep: impl Fn(Instant) -> bool) -> usize {
         self.slots
             .iter()
-            .flatten()
+            .map_while(Option::as_ref)
             .filter(|&&(at, _)| keep(at))
             .map(|&(_, cells)| usize::from(cells))
             .sum()
@@ -792,9 +802,24 @@ impl EchoLedger {
         self.cells_where(|at| at < key)
     }
 
+    /// `(older, total)` cells: presses banked strictly before `key` and all
+    /// banked presses, in a single pass.
+    fn older_and_total(&self, key: Instant) -> (usize, usize) {
+        let (mut older, mut total) = (0, 0);
+        for &(at, cells) in self.slots.iter().map_while(Option::as_ref) {
+            let c = usize::from(cells);
+            if at < key {
+                older += c;
+            }
+            total += c;
+        }
+        (older, total)
+    }
+
     /// Spend `cells` oldest-first — the presses that produced an echo are the
     /// ones it consumes, so one press can never fund a second cell.
     fn spend(&mut self, mut cells: usize) {
+        let mut any = false;
         for slot in &mut self.slots {
             if cells == 0 {
                 break;
@@ -808,8 +833,11 @@ impl EchoLedger {
             }
             let left = have - take as u16;
             *slot = (left > 0).then_some((at, left));
+            any |= left == 0;
         }
-        self.repack();
+        if any {
+            self.repack();
+        }
     }
 
     /// Forget every press as forfeited.
@@ -1560,11 +1588,14 @@ impl Engine {
             // span is the insert's and charges nothing; the hole before it (a
             // key whose late echo was refused just before the drop) is the
             // older presses', exactly.
-            Some(key) if insert => self.echo.older_than(key) == gap && gap <= self.echo.total(),
+            Some(key) if insert => self.echo.older_than(key) == gap,
             // The host swept `from..to` for the key at `key_at`: the hole
             // before it is the older presses', exactly, and the sweep's own
             // cells are the key's and the ones after it.
-            Some(key) => self.echo.older_than(key) == gap && advance <= self.echo.total() - gap,
+            Some(key) => {
+                let (older, total) = self.echo.older_and_total(key);
+                older == gap && advance <= total - gap
+            }
             // No sweep, no key clock: only a move starting at the mirror can
             // be attributed, to the oldest presses.
             None => gap == 0 && advance <= self.echo.total(),
@@ -1637,10 +1668,14 @@ impl Engine {
         }
         self.witness
             .restored_runs(self.ribbon.cells(), rows, &mut self.restore_scratch);
-        self.ribbon
-            .restore_releases(&self.restore_scratch, &mut self.restored_scratch);
-        self.witness
-            .restored(&self.restored_scratch, self.ribbon.cells());
+        if !self.restore_scratch.is_empty() {
+            self.ribbon
+                .restore_releases(&self.restore_scratch, &mut self.restored_scratch);
+            if !self.restored_scratch.is_empty() {
+                self.witness
+                    .restored(&self.restored_scratch, self.ribbon.cells());
+            }
+        }
         let recounted = self.witness.walk(
             self.ribbon.cells(),
             rows,
@@ -2132,9 +2167,23 @@ impl Engine {
         if self.caret_known {
             self.caret.0 = map(self.caret.0);
         }
+        self.caret_seen = self.caret_seen.map(|(r, c)| (map(r), c));
         self.erased.0 = map(self.erased.0);
+        for (cell, _) in &mut self.earned {
+            cell.0 = map(cell.0);
+        }
         self.ribbon.lift_hand(row, to);
+        self.translate_events(|r| Some(map(r)), map);
         self.translate_pre_move(|r| Some(map(r)));
+        if let Some((sw, _)) = &mut self.soft_wrap {
+            sw.origin.0 = map(sw.origin.0);
+            sw.landing.0 = map(sw.landing.0);
+        }
+        if let Some((sw, reflow_to)) = &mut self.reflow {
+            sw.origin.0 = map(sw.origin.0);
+            sw.landing.0 = map(sw.landing.0);
+            reflow_to.0 = map(reflow_to.0);
+        }
     }
 
     /// The hand's line the last follow pass lifted with the hand
@@ -2253,6 +2302,21 @@ impl Engine {
         self.spine.drive(now, floor);
     }
 
+    /// The grief gate, [`Self::celebrate`]'s inverse: hush the spine, cancel
+    /// any pending party fan or earned-star burst, and drop a pending delight
+    /// pose so a failed command's prompt jump never arrives under a celebration.
+    pub fn hush_fanfare(&mut self, now: Instant) {
+        if !self.engaged {
+            return;
+        }
+        self.spine.hush(now);
+        self.party = None;
+        self.earned.clear();
+        if matches!(self.companion, Some(CompanionImpulse::Delight)) {
+            self.companion = None;
+        }
+    }
+
     /// The party (§27): the host reports a sing-along bar (or the armed
     /// celebration's drop), `n` stars fanned ROYGBIV from the caret with the
     /// burst `ring` on every fourth bar, minted at the caret on the next tick
@@ -2318,6 +2382,10 @@ impl Engine {
             self.pre_move = None;
             self.soft_wrap = None;
             self.lift = None;
+            self.hand_run = None;
+            self.hand_lift = None;
+            self.withheld_n = 0;
+            self.flush_clock = None;
             self.reflow = None;
             self.revive = None;
             self.earned.clear();
@@ -2689,12 +2757,12 @@ impl Engine {
     /// two bands is what `ribbon_active` reads as a ribbon.
     #[must_use]
     pub fn ribbon_hue_bands(&self) -> usize {
-        let mut seen = [false; 20];
+        let mut seen = 0u32;
         for seg in self.ribbon.lit_segments() {
-            let band = (meteor::tri(seg.t) * seen.len() as f32) as usize;
-            seen[band.min(seen.len() - 1)] = true;
+            let band = ((meteor::tri(seg.t) * 20.0) as usize).min(19);
+            seen |= 1u32 << band;
         }
-        seen.iter().filter(|seen| **seen).count()
+        seen.count_ones() as usize
     }
 
     /// Seam point 7 (`rainbow_phase`): the family's shared phase ring. Hosts
@@ -2853,6 +2921,7 @@ impl Engine {
                     s.gold
                         && s.class == stardust::StarClass::M1
                         && s.lane.is_sky()
+                        && s.finish.is_none()
                         && s.in_sky_of(pet.row, geom)
                         && pet.columns_to(s.grid_col(geom)) <= companion::CATCH_REACH_CELLS
                 })
@@ -2903,44 +2972,17 @@ impl Engine {
             return;
         }
         self.ribbon.curtain(now);
-        // A hide armed and not yet taken belongs to a frame that is not
-        // coming (see [`Engine::hide_next_frame`]).
-        self.hidden = false;
-        self.spine.reset();
-        self.stardust.reset();
-        self.meteor.reset();
-        self.caret_seam = CaretSeam::default();
-        self.caret = (0, 0);
-        self.caret_known = false;
-        self.caret_seen = None;
-        self.echo.clear();
-        self.bridged = 0;
-        self.erased = (0, 0);
-        self.mend = None;
-        self.events.clear();
-        // And the record that indexed them, as [`Engine::reset`] drops it:
-        // `pre_move` indexes the buffer just cleared and holds a caret of the
-        // space that ended.
-        self.pre_move = None;
-        self.soft_wrap = None;
-        self.lift = None;
-        self.hand_run = None;
-        self.reflow = None;
-        self.revive = None;
-        self.earned.clear();
-        self.party = None;
-        self.pending_cues.clear();
-        self.companion = None;
-        self.paint_at = None;
-        self.fp = 0;
-        self.witness.clear();
-        self.retire_scratch.clear();
+        self.clear_non_ribbon_state();
+        self.fp = u64::from(!self.ribbon.at_rest());
         self.status = Status {
+            cells: self.ribbon.live_cells() as u32,
+            fp: self.fp,
             retired: self.retired,
             followed: self.followed,
             follow_missed: self.follow_missed,
             ..Status::default()
         };
+        self.brisk = self.ribbon.brisk(now);
     }
 
     /// Hide the next frame: the viewport is showing history, whose rows are
@@ -2967,11 +3009,25 @@ impl Engine {
     /// spine, the caret mirror, the ledger (and `bridged`) and the buffered
     /// events; the retire and follow tallies and the pane survive.
     pub fn reset(&mut self) {
+        self.ribbon.reset();
+        self.clear_non_ribbon_state();
+        self.fp = 0;
+        self.status = Status {
+            retired: self.retired,
+            followed: self.followed,
+            follow_missed: self.follow_missed,
+            ..Status::default()
+        };
+        self.brisk = false;
+    }
+
+    /// Clear every coordinate-space and transient producer state outside
+    /// `self.ribbon` (shared by [`Engine::curtain`] and [`Engine::reset`]).
+    fn clear_non_ribbon_state(&mut self) {
         // A hide armed and not yet taken belongs to a frame that is not
         // coming (see [`Engine::hide_next_frame`]).
         self.hidden = false;
         self.spine.reset();
-        self.ribbon.reset();
         self.stardust.reset();
         self.meteor.reset();
         self.caret_seam = CaretSeam::default();
@@ -2990,6 +3046,9 @@ impl Engine {
         self.soft_wrap = None;
         self.lift = None;
         self.hand_run = None;
+        self.hand_lift = None;
+        self.withheld_n = 0;
+        self.flush_clock = None;
         self.reflow = None;
         self.revive = None;
         self.earned.clear();
@@ -2998,18 +3057,16 @@ impl Engine {
         self.pending_cues.clear();
         self.companion = None;
         self.paint_at = None;
-        self.fp = 0;
         // The witness's records name cells of the old space; the retire and
         // follow tallies survive.
         self.witness.clear();
         self.retire_scratch.clear();
-        self.status = Status {
-            retired: self.retired,
-            followed: self.followed,
-            follow_missed: self.follow_missed,
-            ..Status::default()
-        };
-        self.brisk = false;
+        self.release_scratch.clear();
+        self.restore_scratch.clear();
+        self.restored_scratch.clear();
+        self.follow_scratch.clear();
+        self.shift_scratch.clear();
+        self.moved_scratch.clear();
     }
 
     /// Seam point 12 (`translate_scroll_state`): move every live mark with the
@@ -3035,14 +3092,29 @@ impl Engine {
         // The caret is a position, not a mark: saturated, never dropped. The
         // waiting presses were on a row that just moved: forgotten.
         self.caret.0 = self.caret.0.saturating_sub(rows);
+        if let Some((row, _)) = &mut self.caret_seen {
+            *row = row.saturating_sub(rows);
+        }
+        self.erased.0 = self.erased.0.saturating_sub(rows);
+        self.earned
+            .retain_mut(|(cell, _)| match cell.0.checked_sub(rows) {
+                Some(row) => {
+                    cell.0 = row;
+                    true
+                }
+                None => false,
+            });
         self.echo.clear();
+        self.soft_wrap = None;
+        self.reflow = None;
         self.translate_events(|r| r.checked_sub(rows), |r| r.saturating_sub(rows));
         self.translate_pre_move(|r| r.checked_sub(rows));
     }
 
-    /// The buffered events move with the marks: a park flushed by the scroll
-    /// or band hook buffers events in pre-translation rows. A buffered `Sweep`
-    /// or `Rewrite` is a mark (`mark`: translated, dropped past the edge); a
+    /// The buffered events and their one-shot seam verdicts move with the marks:
+    /// a park flushed by the scroll, band or tick-start hook buffers events in
+    /// pre-translation rows. A buffered `Sweep`, `Rewrite`, `Revive` or `Lift`
+    /// destination is a mark (`mark`: translated, dropped past the edge); a
     /// `Move`'s ends are positions (`pos`: saturated, like the caret);
     /// coordinate-free events are untouched.
     fn translate_events(&mut self, mark: impl Fn(u16) -> Option<u16>, pos: impl Fn(u16) -> u16) {
@@ -3061,6 +3133,21 @@ impl Engine {
             }
             _ => true,
         });
+        self.lift = self.lift.and_then(|(lift, key_at)| {
+            mark(lift.dst.0).map(|dst_row| {
+                (
+                    ribbon::Lift {
+                        origin: (pos(lift.origin.0), lift.origin.1),
+                        landing: (pos(lift.landing.0), lift.landing.1),
+                        dst: (dst_row, lift.dst.1),
+                    },
+                    key_at,
+                )
+            })
+        });
+        self.revive = self
+            .revive
+            .and_then(|rv| mark(rv.row).map(|row| ribbon::Revive { row, ..rv }));
     }
 
     /// The pre-move record ([`Engine::pre_move`]) holds a caret, so it rides
@@ -3100,6 +3187,8 @@ impl Engine {
         }
         // Banked presses have no row identity: retired as on a scroll.
         self.echo.clear();
+        self.soft_wrap = None;
+        self.reflow = None;
         self.ribbon.translate_band(top, bottom, delta);
         self.witness.translate_band(top, bottom, delta);
         self.meteor
@@ -3107,6 +3196,9 @@ impl Engine {
         self.stardust
             .translate_band(top, bottom, delta, cell_h, origin_y);
         self.caret.0 = band_pos(self.caret.0, top, bottom, delta);
+        if let Some((row, _)) = &mut self.caret_seen {
+            *row = band_pos(*row, top, bottom, delta);
+        }
         self.erased.0 = band_pos(self.erased.0, top, bottom, delta);
         self.earned
             .retain_mut(|(cell, _)| match band_row(cell.0, top, bottom, delta) {
@@ -7221,7 +7313,7 @@ mod tests {
         );
 
         // … no light was born (T1: the pet's own motion is not light) …
-        let (q, h, cues) = (sc.out.len(), sc.halos.len(), sc.cues.len());
+        let cues = sc.cues.len();
         let mut fr = sc.frame();
         eng.tick(paw, geom(), &cfg, &mut fr);
         assert!(
@@ -7229,7 +7321,11 @@ mod tests {
             "the catch minted a star"
         );
         assert_eq!(sc.cues.len(), cues, "the catch minted a sound");
-        assert!(sc.out.len() >= q && sc.halos.len() >= h, "scratch shrank");
+        assert_eq!(
+            eng.pet_offer(geom(), Some(near)).catch,
+            None,
+            "an already-caught star is not offered again"
+        );
 
         // … and no wake was bought: a life that ends sooner can only bring the
         // sky's next deadline forward.
@@ -7240,15 +7336,25 @@ mod tests {
             );
         }
 
-        // A second paw on a spent offer finds nothing to lengthen.
-        let again = eng.catch_star(star, paw + ms(300));
+        // A second paw on a spent offer finds nothing to lengthen and returns false,
+        // both while the finish is running and after it has expired.
+        assert!(
+            !eng.catch_star(star, paw + ms(10)),
+            "a second catch during the finish must return false"
+        );
         let still = eng
             .stardust
             .live_iter()
-            .find(|s| s.born == star.born && s.x == star.x);
-        assert!(
-            !again || still.is_none_or(|s| s.finish.is_some_and(|f| f.at == paw)),
+            .find(|s| s.born == star.born && s.x == star.x)
+            .expect("still finishing at +10 ms");
+        assert_eq!(
+            still.finish.map(|f| f.at),
+            Some(paw),
             "a second catch must never give the star more time"
+        );
+        assert!(
+            !eng.catch_star(star, paw + ms(300)),
+            "a catch after the star died must return false"
         );
     }
 
@@ -7961,5 +8067,132 @@ mod tests {
             "the ^A's landing is the hand reaching a column, and the pool has it on \
              the tick the flight is born"
         );
+    }
+
+    #[test]
+    fn curtain_updates_fingerprint_and_brisk_and_translate_scroll_carries_erased_and_earned() {
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        // Settle past EDGE_IN_S (18 ms) into Grace so the ribbon is live on glass
+        // (`fingerprint() == 1`) but no longer brisk (`needs_frame_cadence() == false`).
+        let settle = t + Duration::from_millis(60);
+        tick_at(&mut eng, settle);
+        assert_eq!(eng.fingerprint(), 1);
+        assert!(
+            !eng.needs_frame_cadence(),
+            "settled in Grace: no per-frame motion before the curtain"
+        );
+
+        // Dropping the curtain starts per-frame retract motion on the laid cells and
+        // preserves non-zero liveness before the next tick.
+        eng.curtain(settle);
+        assert_eq!(
+            eng.fingerprint(),
+            1,
+            "a falling curtain over laid cells must stay live (fingerprint != 0)"
+        );
+        assert!(
+            eng.needs_frame_cadence(),
+            "a falling curtain over laid cells must immediately report brisk frame cadence"
+        );
+        assert_eq!(eng.status().cells, 3);
+
+        // Conversely, if only a cross-row meteor is in flight (no laid ribbon cells),
+        // `curtain` resets the meteor and clears `brisk` and `fingerprint`.
+        let mut flight_only = engaged();
+        flight_only.on_event(mv((3, 5), (10, 5), Licence::Nav), t0);
+        tick_at(&mut flight_only, t0);
+        assert!(flight_only.needs_frame_cadence());
+        flight_only.curtain(t0 + Duration::from_millis(10));
+        assert_eq!(flight_only.fingerprint(), 0);
+        assert!(!flight_only.needs_frame_cadence());
+
+        // `translate_scroll` carries `erased`, `caret_seen`, and `earned` with the viewport.
+        let mut sc_eng = engaged();
+        let t_end = three_typed_cells(&mut sc_eng, t0);
+        sc_eng.on_event(Event::Erase, t_end + Duration::from_millis(20));
+        sc_eng.on_event(
+            mv((3, 7), (3, 6), Licence::Typed),
+            t_end + Duration::from_millis(20),
+        );
+        tick_at(&mut sc_eng, t_end + Duration::from_millis(20));
+        assert_eq!(sc_eng.erased, (3, 6));
+        sc_eng.observe_caret((5, 2));
+        sc_eng.earn_hero(t_end + Duration::from_millis(25), 3, 6);
+        sc_eng.translate_scroll(2, 18);
+        assert_eq!(
+            sc_eng.erased,
+            (1, 6),
+            "erased cell row translates with scroll"
+        );
+        assert_eq!(
+            sc_eng.caret_seen,
+            Some((3, 2)),
+            "pending observe_caret row translates with scroll"
+        );
+        assert_eq!(
+            sc_eng.earned.first().map(|(c, _)| *c),
+            Some((1, 6)),
+            "pending earned hero cell translates with scroll"
+        );
+
+        // `translate_scroll`, `translate_band`, and `lift_caret` carry buffered
+        // `lift` and `revive` verdicts and drop `soft_wrap` / `reflow` across scrolls.
+        sc_eng.note_lift(
+            ribbon::Lift {
+                origin: (4, 10),
+                landing: (4, 5),
+                dst: (3, 70),
+            },
+            Some(t_end),
+        );
+        sc_eng.note_soft_wrap(
+            ribbon::SoftWrap {
+                origin: (4, 79),
+                landing: (5, 0),
+                word_col0: 72,
+            },
+            Some(t_end),
+        );
+        sc_eng.translate_scroll(1, 18);
+        assert_eq!(
+            sc_eng.lift.map(|(l, _)| (l.origin, l.landing, l.dst)),
+            Some(((3, 10), (3, 5), (2, 70))),
+            "pending lift verdict translates with scroll"
+        );
+        assert!(
+            sc_eng.soft_wrap.is_none(),
+            "pending soft_wrap verdict is cleared by scroll"
+        );
+        sc_eng.earn_hero(t_end + Duration::from_millis(30), 3, 9);
+        sc_eng.prove_short_reanchor((3, 10), (3, 9), t_end);
+        sc_eng.lift_caret(3, 2);
+        assert_eq!(
+            sc_eng.lift.map(|(l, _)| (l.origin, l.landing, l.dst)),
+            Some(((2, 10), (2, 5), (2, 70))),
+            "lift_caret translates pending lift verdict on the lifted row"
+        );
+        assert_eq!(
+            sc_eng.earned.last().map(|(c, _)| *c),
+            Some((2, 9)),
+            "lift_caret translates pending earned hero cell on the lifted row"
+        );
+
+        sc_eng.hand_lift = Some((3, 2));
+        sc_eng.withheld_n = 1;
+        sc_eng.set_flush_clock(Some(t_end));
+        sc_eng.curtain(t_end + Duration::from_millis(40));
+        assert!(sc_eng.take_hand_lift().is_none());
+        assert_eq!(sc_eng.withheld_n, 0);
+        assert!(sc_eng.flush_clock.is_none());
+
+        sc_eng.hand_lift = Some((3, 2));
+        sc_eng.withheld_n = 1;
+        sc_eng.set_flush_clock(Some(t_end));
+        sc_eng.reset();
+        assert!(sc_eng.take_hand_lift().is_none());
+        assert_eq!(sc_eng.withheld_n, 0);
+        assert!(sc_eng.flush_clock.is_none());
     }
 }

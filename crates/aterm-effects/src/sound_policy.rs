@@ -287,11 +287,12 @@ pub fn drain_trail_sound_cues(
     policy: TrailSoundPolicy,
     mut emit: impl FnMut(crate::trail_sound::SoundEvent),
 ) -> usize {
+    let drain = glow.drain_sound_cues();
+    let Some(gain) = policy.gain else {
+        return 0;
+    };
     let mut emitted = 0;
-    for cue in glow.drain_sound_cues() {
-        let Some(gain) = policy.gain else {
-            continue;
-        };
+    for cue in drain {
         emit(trail_sound_event(&cue, style, cols, &policy, gain));
         emitted += 1;
     }

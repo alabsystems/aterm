@@ -460,10 +460,33 @@ const _: () = {
     const _: () = assert!(M::X509_ASN_ENCODING == 1);
 };
 
+// Win32::Storage::FileSystem
+const _: () = {
+    use aterm_win32::Win32::Storage::FileSystem as M;
+    const _: () = assert!(
+        size_of::<M::FILE_DISPOSITION_INFO>() == 1 && align_of::<M::FILE_DISPOSITION_INFO>() == 1
+    );
+    const _: () = assert!(offset_of!(M::FILE_DISPOSITION_INFO, DeleteFile) == 0);
+    const _: () =
+        assert!(size_of::<M::FILE_RENAME_INFO>() == 24 && align_of::<M::FILE_RENAME_INFO>() == 8);
+    const _: () = assert!(offset_of!(M::FILE_RENAME_INFO, Anonymous) == 0);
+    const _: () = assert!(offset_of!(M::FILE_RENAME_INFO, RootDirectory) == 8);
+    const _: () = assert!(offset_of!(M::FILE_RENAME_INFO, FileNameLength) == 16);
+    const _: () = assert!(offset_of!(M::FILE_RENAME_INFO, FileName) == 20);
+    const _: () = assert!(
+        size_of::<M::FILE_RENAME_INFO_0>() == 4 && align_of::<M::FILE_RENAME_INFO_0>() == 4
+    );
+    const _: () = assert!(offset_of!(M::FILE_RENAME_INFO_0, Flags) == 0);
+    const _: () = assert!(offset_of!(M::FILE_RENAME_INFO_0, ReplaceIfExists) == 0);
+    const _: () = assert!(M::FileDispositionInfo == 4);
+    const _: () = assert!(M::FileRenameInfo == 3);
+};
+
 // Win32::System::Com
 const _: () = {
     use aterm_win32::Win32::System::Com as M;
     const _: () = assert!(M::CLSCTX_ALL == 23);
+    const _: () = assert!(M::CLSCTX_INPROC_SERVER == 1);
     const _: () = assert!(M::COINIT_APARTMENTTHREADED == 2);
     const _: () = assert!(M::DVASPECT_CONTENT == 1);
     const _: () =

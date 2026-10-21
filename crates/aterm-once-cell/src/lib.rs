@@ -2,57 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `once_cell` — first-party replacement for the crates.io package of the same
-//! name (the manifest says why the directory name differs).
+//! name, backed by [`std::sync::OnceLock`], [`std::sync::Mutex`], and
+//! [`core::cell::Cell`] with no dependencies and no `unsafe`.
 //!
-//! Upstream predates `std`'s `OnceLock`; this crate expresses the same cells over
-//! [`std::sync::OnceLock`], [`std::sync::Mutex`] and [`core::cell::Cell`], with
-//! no dependencies and no `unsafe`. All eleven consumers are third-party, so
-//! the `[patch.crates-io]` row is the only thing that reaches them.
+//! # Exactly-once initialization contract
 //!
-//! # Liveness per consumer
-//!
-//! Unlike the retired `core_maths` facade, this code RUNS, so it must be
-//! right, not merely present. Measured against the consumers' resolved
-//! sources:
-//!
-//! ```text
-//! DEAD  (import sits under a `cfg` that is off in every cell)
-//!   rustls 0.23.41       race::OnceBox    #[cfg(not(feature = "std"))], std ON
-//!   naga 29.0.3          race::OnceBox    #[cfg(no_std)]; naga's build.rs sets
-//!                                         `std` from `wgsl-in`, which is ON
-//!
-//! LIVE  (called on the cells named)
-//!   wgpu-core 29.0.3     sync::OnceCell   win              get_or_try_init
-//!   wgpu-hal 29.0.3      sync::Lazy       win              Deref, Debug
-//!
-//! LOCK-ONLY  (no shipped cell compiles them: the wasm pair since
-//! wasm-platform WP.8, wayland-sys since LW.7)
-//!   js-sys 0.3.85        unsync::Lazy     Deref
-//!   wasm-bindgen 0.2.108 unsync::Lazy     force, Deref
-//!   wayland-sys 0.31.11  sync::Lazy       8 statics, Deref (only wgpu-hal
-//!                                         names it)
-//!
-//! DEV-ONLY (outside every `targo --unverified forge` cell, but `cargo test` builds them)
-//!   tempfile 3.27.0      sync::OnceCell   get_or_init, get
-//! ```
-//!
-//! On mac-arm and linux, whose sole parent is `rustls`, the package is dead
-//! weight; on win it is running code (forge blame, re-measured 2026-10-17).
-//! Neither wasm cell resolves it: its parents there were `wasm-bindgen`,
-//! which the CPU module left at wasm-platform WP.7, and `wgpu-core`, `js-sys`
-//! and `wasm-bindgen`, which the GPU module left at WP.8
-//! (docs/AUDIT-third-party-2026-10-15.md; re-measured 2026-10-17);
-//! `wasm-bindgen-futures` left the lock at WP.5, when the GPU module's init
-//! became synchronous. `race::OnceBox` has no live caller: `ahash` left the
-//! graph at winit-core step 2 and `read-fonts` at text-fonts TF.4. `x11-dl`
-//! and `x11rb` left linux with LW.7's X11 part, when the winit fork's X11
-//! backend moved onto first-party aterm-x11, `xkbcommon-dl` when its key
-//! handling moved onto aterm-xkb, and `wayland-sys` with its Wayland part;
-//! `wgpu-core` had left linux before.
-//!
-//! ## The contract that has teeth
-//!
-//! `wgpu-core`'s `ResourcePool::get_or_init` (src/pool.rs) relies on
+//! `wgpu-core`'s `ResourcePool::get_or_init` relies on
 //! [`sync::OnceCell::get_or_try_init`] calling its closure **exactly once**
 //! across threads:
 //!
@@ -65,13 +20,10 @@
 //! A check-compute-set implementation would let two threads both run the
 //! closure and return two different `Arc`s for one key. [`sync::OnceCell`]
 //! therefore serialises initialisation through a private
-//! [`Mutex`](std::sync::Mutex); `tests/behaviour.rs` asserts it, with a racy
-//! control cell the same test must catch.
+//! [`Mutex`](std::sync::Mutex); `tests/behaviour.rs` asserts this with a racy
+//! control cell.
 //!
 //! # Divergences
-//!
-//! Each is deliberate, unreachable in this graph, and fails closed (a compile
-//! error or a test failure, never a quiet behaviour change).
 //!
 //! 1. **Not `no_std`-capable.** Every target aterm builds has `std`,
 //!    `wasm32-unknown-unknown` included; a `no_std` build fails to compile.
@@ -80,8 +32,7 @@
 //!    concurrent `get_or_init` may call more than one `f` but returns one value
 //!    to all; ours calls `f` exactly once, which meets that contract. Reentrant
 //!    initialisation deadlocks here (as in upstream's `sync::OnceCell`) where
-//!    upstream's `race` merely wastes an allocation. No consumer calls it: its
-//!    importers, `rustls` and `naga`, compile the import out in every cell.
+//!    upstream's `race` wastes an allocation.
 //!
 //! 3. **`with_value` is not `const`.** `std` exposes no const initialiser for
 //!    a filled `OnceLock` or `core::cell::OnceCell`. Only this crate's own
@@ -89,45 +40,33 @@
 //!
 //! 4. **Sizes differ.** `sync::OnceCell<T>` adds a `Mutex<()>` gate;
 //!    `sync::Lazy` holds `Mutex<Option<F>>` where upstream holds a `Cell` behind
-//!    `unsafe impl Sync`. No consumer takes `size_of` of either. The `Mutex`
-//!    buys divergence 2's exactly-once guarantee and derives upstream's `Sync`
-//!    bound (`Mutex<Option<F>>: Sync` iff `F: Send`).
+//!    `unsafe impl Sync`. The `Mutex` provides divergence 2's exactly-once
+//!    guarantee and derives upstream's `Sync` bound (`Mutex<Option<F>>: Sync`
+//!    iff `F: Send`).
 //!
 //! 5. **Five upstream items are absent.** `race::OnceNonZeroUsize`,
-//!    `race::OnceBool`, `race::OnceRef` (no consumer names them),
-//!    `sync::OnceCell::wait` (no `OnceLock` equivalent) and
-//!    `sync::OnceCell::get_unchecked` (`unsafe` by signature). Using one is a
-//!    compile error.
+//!    `race::OnceBool`, `race::OnceRef`, `sync::OnceCell::wait` (no `OnceLock`
+//!    equivalent) and `sync::OnceCell::get_unchecked` (`unsafe` by signature).
 //!
 //! 6. **Feature flags gate nothing.** The five upstream names that change
-//!    nothing here are declared (a `[patch]` target must accept them) and
+//!    nothing here are declared so `[patch.crates-io]` resolves them, and are
 //!    inert. `critical-section`, `atomic-polyfill`, `parking_lot` and
-//!    `portable-atomic` would change upstream's implementation, so they are not
-//!    declared: a consumer that asks for one fails to resolve.
+//!    `portable-atomic` are omitted so any consumer requesting them fails to
+//!    resolve.
 //!
 //! # Auto traits match upstream
 //!
-//! `Send`, `Sync`, `UnwindSafe` and `RefUnwindSafe` were measured over both
-//! crates across sixteen instantiations. Fourteen fall out of the fields. The
-//! other two need hand-written impls: `UnsafeCell` (inside both
-//! `core::cell::OnceCell` and `Cell`) is `!RefUnwindSafe`, so
-//! [`unsync::OnceCell`] and [`unsync::Lazy`] would be narrower than upstream's
-//! (`once_cell-1.21.4/src/lib.rs:430`, `:729`). No consumer asks for the
-//! bound (`wasm-bindgen` hands `maybe_catch_unwind` an `AssertUnwindSafe`), so
-//! compiling every consumer on every cell cannot catch losing it;
-//! `tests/behaviour.rs::the_unwind_safety_surface_matches_upstream` pins the
-//! surface.
-//!
-//! [`sync::Lazy`] is deliberately WIDER: its `Mutex<Option<F>>` is
-//! `RefUnwindSafe` without `F: RefUnwindSafe`. Wider accepts every program
-//! upstream accepts.
+//! `UnsafeCell` (inside both `core::cell::OnceCell` and `Cell`) is
+//! `!RefUnwindSafe`, so [`unsync::OnceCell`] and [`unsync::Lazy`] carry
+//! explicit `RefUnwindSafe` impls matching upstream (`tests/behaviour.rs` pins
+//! the auto-trait surface). [`sync::Lazy`] is wider (`Mutex<Option<F>>` is
+//! `RefUnwindSafe` without `F: RefUnwindSafe`).
 //!
 //! # Poisoning
 //!
-//! Upstream has no locks. Every acquisition of the two private `Mutex`es here
-//! ignores poisoning ([`PoisonError::into_inner`](std::sync::PoisonError::into_inner)),
-//! so a panic inside an initialiser leaves the cell empty and retryable, as
-//! upstream does.
+//! Every acquisition of the two private `Mutex`es ignores poisoning
+//! ([`PoisonError::into_inner`](std::sync::PoisonError::into_inner)), so a
+//! panic inside an initialiser leaves the cell empty and retryable.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
@@ -279,12 +218,9 @@ pub mod unsync {
                 return Ok(val);
             }
             let val = f()?;
-            // `f` CAN have filled the cell: it may capture `&self` on its own
-            // and call `set` or `get_or_init` on it. Upstream asserts here
-            // (once_cell-1.21.4/src/lib.rs:644). Ruling 2026-10-10: assert
-            // too, rather than drop `f`'s value and hand the caller one its
-            // closure never produced. The sync cell needs no such check: a
-            // reentrant writer blocks on its gate before reaching `set`.
+            // `f` may capture `&self` and fill the cell reentrantly; assert
+            // empty before storing so `f`'s return value is never silently
+            // dropped in favour of an earlier reentrant write.
             assert!(self.0.set(val).is_ok(), "reentrant init");
             Ok(self
                 .get()

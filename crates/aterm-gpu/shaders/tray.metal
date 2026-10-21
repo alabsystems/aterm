@@ -1,10 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// std140 twin of the Rust `TrayUniform` (32 bytes: float4 @0, float2 @16,
-// float2 pad @24). MSL's natural constant-buffer layout matches std140 here
-// because every member is <=16B and naturally aligned, so the Rust struct is
-// UNCHANGED from the WGSL era.
+// std140 twin of the Rust `TrayUniform` (32 bytes: float4 @0, float2 @16, float2
+// pad @24); every member is <=16B and naturally aligned, so MSL's layout matches.
 struct Tray {
     float4 rect;  // device-px x, y, w, h
     float2 fb;    // framebuffer width, height in px

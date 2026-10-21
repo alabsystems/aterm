@@ -81,7 +81,7 @@ pub(crate) fn archive_url(platform: &str) -> String {
 /// host's user cache ([`crate::user_cache`]): on macOS
 /// `~/Library/Caches/aterm/browser.noindex`, elsewhere
 /// `$XDG_CACHE_HOME/aterm/browser`, else `~/.cache/aterm/browser`. The lane's
-/// Firefox is unpacked beside the Chromium.
+/// Firefox and WebKit are unpacked beside the Chromium.
 pub(crate) fn host_cache_root() -> Option<PathBuf> {
     crate::host_user_cache("browser")
 }
@@ -194,16 +194,17 @@ pub(crate) fn find() -> Result<Browser, String> {
     ))
 }
 
-/// `verify fetch-browser`: the pinned chrome-headless-shell and Firefox for
-/// this host, each downloaded, held to its sha256 and unpacked into the
-/// cache. Prints each executable; exit 0, 1 on a failure, 3 where nothing
+/// `verify fetch-browser`: the pinned chrome-headless-shell, Firefox and
+/// WebKit for this host, each downloaded, held to its sha256 and unpacked
+/// into the cache. Prints each executable; exit 0, 1 on a failure, 3 where nothing
 /// is pinned.
 pub fn fetch_main(args: &[String]) -> i32 {
     if let Some(a) = args.first() {
         eprintln!(
             "verify fetch-browser: takes no arguments, not `{a}` (it fetches chrome-headless-shell \
-             {PIN_VERSION} and Playwright's Firefox build {} for this host)",
-            super::firefox::BUILD
+             {PIN_VERSION} and Playwright's Firefox build {} and WebKit build {} for this host)",
+            super::firefox::BUILD,
+            super::webkit::BUILD
         );
         return crate::exit::USAGE;
     }
@@ -231,7 +232,19 @@ pub fn fetch_main(args: &[String]) -> i32 {
         dir: super::firefox::pinned_dir(&root, pin),
         binary: PathBuf::from(pin.binary),
     });
-    let pinned: Vec<Archive> = chromium.into_iter().chain(firefox).collect();
+    let webkit = super::webkit::host_pin().map(|pin| Archive {
+        what: format!(
+            "Playwright's WebKit build {} (WebKit {})",
+            super::webkit::BUILD,
+            super::webkit::VERSION
+        ),
+        url: super::webkit::archive_url(pin),
+        sha256: pin.sha256,
+        bytes: pin.bytes,
+        dir: super::webkit::pinned_dir(&root, pin),
+        binary: PathBuf::from(pin.binary),
+    });
+    let pinned: Vec<Archive> = chromium.into_iter().chain(firefox).chain(webkit).collect();
     if pinned.is_empty() {
         eprintln!(
             "verify fetch-browser: COULD NOT RUN — no browser is pinned for {}-{}; set \
@@ -248,6 +261,15 @@ pub fn fetch_main(args: &[String]) -> i32 {
             std::env::consts::OS,
             std::env::consts::ARCH,
             super::firefox::FIREFOX_ENV
+        );
+    }
+    if super::webkit::host_pin().is_none() {
+        eprintln!(
+            "verify fetch-browser: no WebKit is pinned for {}-{}; the browser lane's WebKit \
+             rows run only with {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            super::webkit::WEBKIT_ENV
         );
     }
     let mut code = crate::exit::PASS;

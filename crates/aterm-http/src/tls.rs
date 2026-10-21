@@ -31,10 +31,8 @@ pub enum Trust {
     Roots(Vec<Vec<u8>>),
 }
 
-/// THE crypto provider: the one place this crate names a rustls
-/// `CryptoProvider` implementation. Today it is rustls's `ring` provider, and
-/// ring is the bridge half of the KEEP pair (docs/AUDIT-third-party-2026-10-15.md):
-/// replacing it is a change to this function, not to its callers.
+/// The one place this crate names a rustls `CryptoProvider`: `ring`, the
+/// bridge half of the KEEP pair (docs/AUDIT-third-party-2026-10-15.md).
 pub(crate) fn provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::ring::default_provider()
 }
@@ -63,10 +61,8 @@ pub fn client_config(trust: &Trust) -> Result<Arc<ClientConfig>, String> {
         .unwrap_or_else(|| Arc::new(provider()));
     let config = match trust {
         Trust::PlatformVerifier => {
-            // `PlatformVerifier::new` is the ONLY constructor reachable from
-            // here: the extra-trust-anchor seam its tests need is
-            // `#[cfg(test)]`, so this path cannot be given anchors beyond the
-            // operating system's own, and the compiler is what enforces that.
+            // The extra-anchor constructor is `#[cfg(test)]`, so this path
+            // cannot trust anything beyond the operating system's own anchors.
             let verifier = crate::verifier::PlatformVerifier::new(Arc::clone(&provider))
                 .map_err(|error| format!("platform certificate verifier unavailable: {error}"))?;
             ClientConfig::builder_with_provider(provider)

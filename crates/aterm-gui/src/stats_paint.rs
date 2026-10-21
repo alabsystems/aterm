@@ -25,7 +25,9 @@
 
 use aterm_vitals::Motion;
 use aterm_vitals::ink::{HaloMode, Rgb, VitalsInks};
+use aterm_vitals::model::Resource;
 use aterm_vitals::trend::TrendView;
+use aterm_vitals::words;
 
 use crate::type_scale::{StepPx, TypeStep};
 use crate::widget::{DrawPrim, Rgba, TextFace, TextWeight, rgba, text_prim};
@@ -61,39 +63,78 @@ pub(crate) fn contains(r: Rect, px: f64, py: f64) -> bool {
     px >= x && px < x + w && py >= y && py < y + h
 }
 
-/// Which instrument a hit region names: the lens opens on its focus well.
+/// Which instrument a hit region names: the lens opens on its focus well
+/// (Stats Deck v2 §11.4): the deck's seven rows, and How to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Instrument {
-    /// The core tiles and the CPU lanes.
-    Cores,
-    /// The GPU tank.
+    /// The CPU row, the cores block and the Cores row.
+    Cpu,
+    /// The GPU row.
     Gpu,
-    /// The memory lanes.
+    /// The Memory row.
     Memory,
-    /// The disk.
+    /// The Disk row.
     Disk,
-    /// The attention marks.
-    Jobs,
+    /// The Network row.
+    Network,
+    /// The Tokens row.
+    Tokens,
+    /// The Processes row: the jobs engine's marks and the counts.
+    Processes,
+    /// The header line's "How to read" lens.
+    HowToRead,
 }
 
 impl Instrument {
-    /// Every instrument in the lens's ←/→ order.
-    pub(crate) const ALL: [Self; 5] =
-        [Self::Cores, Self::Gpu, Self::Memory, Self::Disk, Self::Jobs];
+    /// The rows' instruments in the lens's ←/→ order; How to read is
+    /// reached by the header alone (§11.4).
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Cpu,
+        Self::Gpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Network,
+        Self::Tokens,
+        Self::Processes,
+    ];
+
+    /// The instrument of a deck row.
+    pub(crate) const fn of(res: Resource) -> Self {
+        match res {
+            Resource::Cpu => Self::Cpu,
+            Resource::Gpu => Self::Gpu,
+            Resource::Memory => Self::Memory,
+            Resource::Disk => Self::Disk,
+            Resource::Network => Self::Network,
+            Resource::Tokens => Self::Tokens,
+            Resource::Processes => Self::Processes,
+        }
+    }
+
+    /// The deck row it names; none for How to read.
+    pub(crate) const fn resource(self) -> Option<Resource> {
+        Some(match self {
+            Self::Cpu => Resource::Cpu,
+            Self::Gpu => Resource::Gpu,
+            Self::Memory => Resource::Memory,
+            Self::Disk => Resource::Disk,
+            Self::Network => Resource::Network,
+            Self::Tokens => Resource::Tokens,
+            Self::Processes => Resource::Processes,
+            Self::HowToRead => return None,
+        })
+    }
 
     /// Its name in words.
     pub(crate) const fn word(self) -> &'static str {
-        match self {
-            Self::Cores => "Cores",
-            Self::Gpu => "GPU",
-            Self::Memory => "Memory",
-            Self::Disk => "Disk",
-            Self::Jobs => "Jobs",
+        match self.resource() {
+            Some(res) => words::resource_name(res),
+            None => "How to read",
         }
     }
 }
 
-/// Which of the three bars a hit region belongs to.
+/// Which of the three scopes a hit region belongs to (§11.1's Scope).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Bar {
     /// The machine.
@@ -109,13 +150,66 @@ impl Bar {
     pub(crate) const ALL: [Self; 3] = [Self::Global, Self::Aterm, Self::Tab];
 }
 
+/// What a hit region names (§11.1, §11.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HitKind {
+    /// A row, or one of its scope cells.
+    Row(Instrument, Bar),
+    /// The cores block, or the Cores row: the lens on CPU, cores well.
+    Cores,
+    /// The header line: the How to read lens.
+    Header,
+}
+
 /// A rectangle a pointer can rest on, and what it names.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Hit {
     /// In the card's own pixels.
     pub(crate) rect: Rect,
-    pub(crate) instrument: Instrument,
-    pub(crate) bar: Bar,
+    pub(crate) kind: HitKind,
+}
+
+impl Hit {
+    /// A row's region, or a scope cell's.
+    pub(crate) const fn row(rect: Rect, instrument: Instrument, bar: Bar) -> Self {
+        Self {
+            rect,
+            kind: HitKind::Row(instrument, bar),
+        }
+    }
+
+    /// The cores' region.
+    pub(crate) const fn cores(rect: Rect) -> Self {
+        Self {
+            rect,
+            kind: HitKind::Cores,
+        }
+    }
+
+    /// The header line's region.
+    pub(crate) const fn header(rect: Rect) -> Self {
+        Self {
+            rect,
+            kind: HitKind::Header,
+        }
+    }
+
+    /// The instrument the lens opens on.
+    pub(crate) const fn instrument(self) -> Instrument {
+        match self.kind {
+            HitKind::Row(instrument, _) => instrument,
+            HitKind::Cores => Instrument::Cpu,
+            HitKind::Header => Instrument::HowToRead,
+        }
+    }
+
+    /// The scope the lens opens on.
+    pub(crate) const fn bar(self) -> Bar {
+        match self.kind {
+            HitKind::Row(_, bar) => bar,
+            HitKind::Cores | HitKind::Header => Bar::Global,
+        }
+    }
 }
 
 /// What a tile of a given drawn size can carry (§12.1's resolution ladder).
@@ -189,18 +283,10 @@ impl Mark {
             motion: Motion::Steady,
         }
     }
-
-    /// The variance word the lens and accessibility say for this mark.
-    pub(crate) fn edge_word(self) -> &'static str {
-        match self.edge {
-            0 => "steady",
-            1 => "unsteady",
-            _ => "jittery",
-        }
-    }
 }
 
-/// An attention mark (§12.1's table), drawn as a vector shape.
+/// An attention mark (§12.1's table, Stats Deck v2 §10), drawn as a vector
+/// shape: the chrome faces lack the glyphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum WellMark {
     /// ⊘: a ring with a 45° slash, frost.
@@ -213,6 +299,14 @@ pub(crate) enum WellMark {
     Waiting,
     /// A drawn pause: a stopped job.
     Stopped,
+    /// ◢: the disk low, filling or stuck.
+    Low,
+    /// ↑: sending.
+    Up,
+    /// ↓: receiving.
+    Down,
+    /// ●: memory pressure, a GPU reset.
+    Dot,
 }
 
 impl WellMark {
@@ -224,6 +318,37 @@ impl WellMark {
             Self::Quiet => "quiet",
             Self::Waiting => "waiting for you",
             Self::Stopped => "stopped",
+            Self::Low => "low",
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Dot => "warn",
+        }
+    }
+
+    /// The mark the words name.
+    pub(crate) const fn of(mark: words::Mark) -> Self {
+        match mark {
+            words::Mark::Low => Self::Low,
+            words::Mark::Dot => Self::Dot,
+            words::Mark::Stuck => Self::Stuck,
+            words::Mark::Quiet => Self::Quiet,
+            words::Mark::Zombie => Self::Zombies,
+            words::Mark::Waiting => Self::Waiting,
+            words::Mark::Stopped => Self::Stopped,
+            words::Mark::Up => Self::Up,
+            words::Mark::Down => Self::Down,
+        }
+    }
+
+    /// Its own ink, where a phrase does not lend it one: frost for the jobs'
+    /// marks, the accent for waiting, warn for zombies and the levels.
+    fn ink(self, inks: &VitalsInks) -> Rgb {
+        match self {
+            Self::Stuck => inks.stuck,
+            Self::Quiet => inks.quiet,
+            Self::Waiting => inks.tab,
+            Self::Zombies | Self::Low | Self::Dot => inks.warn,
+            Self::Stopped | Self::Up | Self::Down => inks.words2,
         }
     }
 }
@@ -238,21 +363,16 @@ pub(crate) struct StatsMark {
 }
 
 impl StatsMark {
-    /// A mark of `kind` counting `count`, its arc full.
-    #[cfg(test)]
-    pub(crate) const fn new(kind: WellMark, count: u32) -> Self {
-        Self {
-            kind,
-            count,
-            frac: 1.0,
-        }
-    }
-
     /// The words a text surface and a reader say: `2 quiet`.
     pub(crate) fn words(self) -> String {
         format!("{} {}", self.count, self.kind.word())
     }
 }
+
+/// The ◔ arc the deck's well draws for a quiet row, and the lens for a quiet
+/// job whose φ was not read: a quarter (v2 §10, "a Dot clipped to the
+/// top-right quadrant").
+pub(crate) const QUIET_ARC: f32 = 0.25;
 
 /// How far a quiet job's ◔ arc has filled: 0 at the quiet line (φ = 3), full
 /// at the stuck line (φ = 8), so the arc closes as the verdict nears stuck.
@@ -368,39 +488,6 @@ impl<'a> Painter<'a> {
     pub(crate) fn figure_w(&self, s: &str, small: bool) -> f32 {
         let size = if small { self.small_px } else { self.text_px };
         crate::tray_raster::measure_text(s, size.get(), TextWeight::Regular).ceil()
-    }
-
-    /// A label or a clause in the system UI face.
-    pub(crate) fn label(
-        &mut self,
-        x: f32,
-        baseline: f32,
-        s: String,
-        color: Rgb,
-        bold: bool,
-        small: bool,
-    ) {
-        let size = if small { self.small_px } else { self.text_px };
-        self.prims.push(text_prim(
-            x.round(),
-            baseline.round(),
-            s,
-            size,
-            TextWeight::Regular,
-            if bold { TextFace::UiBold } else { TextFace::Ui },
-            rgba(color, 0xFF),
-        ));
-    }
-
-    /// A label's width.
-    pub(crate) fn label_w(&self, s: &str, bold: bool, small: bool) -> f32 {
-        let size = if small { self.small_px } else { self.text_px };
-        crate::tray_raster::ui_text_width_for(
-            if bold { TextFace::UiBold } else { TextFace::Ui },
-            s,
-            size.get(),
-        )
-        .ceil()
     }
 
     /// Draw `f` clipped to `clip`.
@@ -803,99 +890,31 @@ impl<'a> Painter<'a> {
         self.prims.push(panel(x, y, w, h, 0.0, c));
     }
 
-    /// A two-minute sparkline of `values` (each `0..=1`, `None` a gap),
-    /// newest at the right, in whole-pixel columns.
-    pub(crate) fn spark(
-        &mut self,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        values: &[Option<f32>],
-        ink_fill: Rgb,
-    ) {
-        let inks = *self.inks;
-        self.prims
-            .push(panel(x, y, w, h, (h * 0.18).round(), a(inks.track, 0.55)));
-        if values.is_empty() || w < 4.0 {
-            return;
-        }
-        let cols = w.floor() as usize;
-        let cap = aterm_vitals::trend::HISTORY_LEN;
-        let off = cap.saturating_sub(values.len());
-        for c in 0..cols {
-            let t0 = c * cap / cols;
-            let t1 = ((c + 1) * cap / cols).max(t0 + 1);
-            let mut peak: Option<f32> = None;
-            for t in t0..t1 {
-                if t < off {
-                    continue;
-                }
-                if let Some(Some(v)) = values.get(t - off) {
-                    peak = Some(peak.map_or(*v, |p: f32| p.max(*v)));
-                }
-            }
-            if let Some(v) = peak {
-                let vh = (v.clamp(0.0, 1.0) * (h - 2.0)).round();
-                if vh >= 1.0 {
-                    self.prims.push(panel(
-                        x + c as f32,
-                        y + h - 1.0 - vh,
-                        1.0,
-                        vh,
-                        0.0,
-                        a(ink_fill, 0.85),
-                    ));
-                }
-            }
-        }
-    }
-
-    /// A key swatch beside a bar's label: the bar's own ink, so the label is
-    /// its legend.
-    pub(crate) fn keyline(&mut self, x: f32, y: f32, w: f32, h: f32, ink: Rgb) {
-        self.prims
-            .push(panel(x, y, w, h, (w / 2.0).floor(), rgba(ink, 0xFF)));
-    }
-
-    /// The Global bar's key: the load ramp itself, idle at the foot and hot at
-    /// the head, because that bar's colour is its load, not an owner.
-    pub(crate) fn ramp_keyline(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        let r = (w / 2.0).floor();
-        let inks = *self.inks;
-        self.clipped((x, y, w, h), |p| {
-            let n = h.round().max(1.0) as usize;
-            for i in 0..n {
-                let t = 1.0 - i as f32 / (n.max(2) - 1) as f32;
-                p.prims.push(panel(
-                    x,
-                    y + i as f32,
-                    w,
-                    1.0,
-                    0.0,
-                    rgba(inks.load_at(t), 0xFF),
-                ));
-            }
-        });
-        // Round the ends with the ground, as the other keylines are round.
-        if r >= 1.0 {
-            self.prims.push(DrawPrim::Stroke {
-                x: x - 0.5,
-                y: y - 0.5,
-                w: w + 1.0,
-                h: h + 1.0,
-                radius: r + 0.5,
-                width: 1.0,
-                color: rgba(inks.ground, 0xFF),
-            });
-        }
-    }
-
-    /// An attention mark centred at `(cx, cy)` with radius `r`; `frac` grows
-    /// the quiet mark's arc (`0..=1`).
+    /// An attention mark centred at `(cx, cy)` with radius `r`, in its own
+    /// ink; `frac` grows the quiet mark's arc (`0..=1`).
     pub(crate) fn mark(&mut self, kind: WellMark, cx: f32, cy: f32, r: f32, frac: f32) {
-        let inks = *self.inks;
-        let lw = (r * 0.28).max(1.0);
+        let ink = kind.ink(self.inks);
+        self.mark_in(kind, (cx, cy, r), frac, ink, (r * 0.28).max(1.0));
+    }
+
+    /// A mark at `(cx, cy, r)` in `ink`, its strokes `lw` px (§10's table).
+    pub(crate) fn mark_in(
+        &mut self,
+        kind: WellMark,
+        (cx, cy, r): (f32, f32, f32),
+        frac: f32,
+        ink: Rgb,
+        lw: f32,
+    ) {
+        let c = rgba(ink, 0xFF);
+        let line = |x1: f32, y1: f32, x2: f32, y2: f32| DrawPrim::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            width: lw,
+            color: c,
+        };
         match kind {
             WellMark::Stuck => {
                 self.prims.push(DrawPrim::Ring {
@@ -903,19 +922,12 @@ impl<'a> Painter<'a> {
                     cy,
                     r_outer: r,
                     thickness: lw,
-                    track: rgba(inks.stuck, 0xFF),
+                    track: c,
                     frac: 0.0,
-                    fill: rgba(inks.stuck, 0xFF),
+                    fill: c,
                 });
                 let d = (r - lw / 2.0) * std::f32::consts::FRAC_1_SQRT_2;
-                self.prims.push(DrawPrim::Line {
-                    x1: cx - d,
-                    y1: cy + d,
-                    x2: cx + d,
-                    y2: cy - d,
-                    width: lw,
-                    color: rgba(inks.stuck, 0xFF),
-                });
+                self.prims.push(line(cx - d, cy + d, cx + d, cy - d));
             }
             WellMark::Quiet => {
                 self.prims.push(DrawPrim::Ring {
@@ -923,38 +935,29 @@ impl<'a> Painter<'a> {
                     cy,
                     r_outer: r,
                     thickness: lw,
-                    track: rgba(inks.quiet, 0xFF),
+                    track: c,
                     frac: 0.0,
-                    fill: rgba(inks.quiet, 0xFF),
+                    fill: c,
                 });
                 self.prims.push(DrawPrim::Ring {
                     cx,
                     cy,
                     r_outer: r - lw,
                     thickness: r - lw,
-                    track: rgba(inks.quiet, 0),
+                    track: rgba(ink, 0),
                     frac: frac.clamp(0.06, 1.0),
-                    fill: rgba(inks.quiet, 0xFF),
+                    fill: c,
                 });
             }
             WellMark::Waiting => {
-                let c = rgba(inks.tab, 0xFF);
                 let pts = [(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)];
                 for i in 0..4 {
                     let (p0, p1) = (pts[i], pts[(i + 1) % 4]);
-                    self.prims.push(DrawPrim::Line {
-                        x1: p0.0,
-                        y1: p0.1,
-                        x2: p1.0,
-                        y2: p1.1,
-                        width: lw,
-                        color: c,
-                    });
+                    self.prims.push(line(p0.0, p0.1, p1.0, p1.1));
                 }
             }
             WellMark::Zombies => {
                 // A skull reduced to what reads at 16 px: a dome and two eyes.
-                let c = rgba(inks.warn, 0xFF);
                 self.prims.push(DrawPrim::Dot {
                     cx,
                     cy: cy - r * 0.1,
@@ -974,98 +977,51 @@ impl<'a> Painter<'a> {
                         cx: cx + r * dx,
                         cy: cy - r * 0.1,
                         r: r * 0.2,
-                        color: rgba(inks.ground, 0xFF),
+                        color: rgba(self.inks.ground, 0xFF),
                     });
                 }
             }
             WellMark::Stopped => {
-                let c = rgba(inks.words2, 0xFF);
                 let bw = (r * 0.42).max(1.0);
                 self.prims
                     .push(panel(cx - r * 0.6, cy - r * 0.7, bw, r * 1.4, 0.0, c));
                 self.prims
                     .push(panel(cx + r * 0.18, cy - r * 0.7, bw, r * 1.4, 0.0, c));
             }
-        }
-    }
-
-    /// A clause list folded to `room` px: clauses join with ` · `; the last
-    /// one shortens to its short form, then leaves, until the rest fits. A
-    /// word is never cut in the middle.
-    pub(crate) fn fit_clauses(
-        &self,
-        clauses: &[Clause],
-        room: f32,
-        small: bool,
-    ) -> Vec<(String, Rgb)> {
-        let mut forms: Vec<(String, Rgb, Option<String>)> = clauses
-            .iter()
-            .map(|c| (c.full.clone(), c.ink, c.short.clone()))
-            .collect();
-        loop {
-            let joined: String = forms
-                .iter()
-                .map(|f| f.0.as_str())
-                .collect::<Vec<_>>()
-                .join(" \u{00B7} ");
-            if forms.is_empty() || self.label_w(&joined, false, small) <= room {
-                return forms.into_iter().map(|f| (f.0, f.1)).collect();
+            WellMark::Low => {
+                // ◢: one whole-pixel panel per scanline, the hypotenuse from
+                // the bottom left to the top right.
+                let (top, bottom, right) = ((cy - r).round(), (cy + r).round(), (cx + r).round());
+                let mut y = top;
+                while y < bottom {
+                    let reach = ((y + 0.5 - (cy - r)) / (2.0 * r)).clamp(0.0, 1.0) * 2.0 * r;
+                    let left = (right - reach).round();
+                    if right > left {
+                        self.prims.push(panel(left, y, right - left, 1.0, 0.0, c));
+                    }
+                    y += 1.0;
+                }
             }
-            let last = forms.len() - 1;
-            if let Some(short) = forms[last].2.take() {
-                forms[last].0 = short;
-            } else {
-                forms.pop();
+            WellMark::Up | WellMark::Down => {
+                // A shaft 0.72 em tall and two heads 0.24 em: the mark's
+                // radius is 0.36 em.
+                let (top, bottom, head) = (cy - r, cy + r, r * 0.24 / 0.36);
+                self.prims.push(line(cx, top, cx, bottom));
+                let (tip, back) = if kind == WellMark::Down {
+                    (bottom, bottom - head)
+                } else {
+                    (top, top + head)
+                };
+                self.prims.push(line(cx - head, back, cx, tip));
+                self.prims.push(line(cx + head, back, cx, tip));
             }
+            WellMark::Dot => self.prims.push(DrawPrim::Dot {
+                cx,
+                cy,
+                r: r * 0.33 / 0.36,
+                color: c,
+            }),
         }
-    }
-
-    /// Draw folded clauses from `x` on `baseline`, ` · ` between them.
-    pub(crate) fn clauses(
-        &mut self,
-        x: f32,
-        baseline: f32,
-        parts: Vec<(String, Rgb)>,
-        small: bool,
-    ) -> f32 {
-        let mut cx = x;
-        let sep = " \u{00B7} ";
-        let sep_w = self.label_w(sep, false, small);
-        let words2 = self.inks.words2;
-        for (i, (text, ink)) in parts.into_iter().enumerate() {
-            if i > 0 {
-                self.label(cx, baseline, sep.into(), words2, false, small);
-                cx += sep_w;
-            }
-            let w = self.label_w(&text, false, small);
-            self.label(cx, baseline, text, ink, false, small);
-            cx += w;
-        }
-        cx
-    }
-}
-
-/// One clause of a bar's words: its full form, a shorter form it takes
-/// before it leaves, and its ink.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Clause {
-    pub(crate) full: String,
-    pub(crate) short: Option<String>,
-    pub(crate) ink: Rgb,
-}
-
-impl Clause {
-    pub(crate) fn new(full: impl Into<String>, ink: Rgb) -> Self {
-        Self {
-            full: full.into(),
-            short: None,
-            ink,
-        }
-    }
-
-    pub(crate) fn or_short(mut self, short: impl Into<String>) -> Self {
-        self.short = Some(short.into());
-        self
     }
 }
 
@@ -1321,28 +1277,5 @@ pub(crate) mod tests {
             count(false) + 2,
             "a bottom notch and a hollow cap"
         );
-    }
-
-    #[test]
-    fn clauses_fold_from_the_end_and_never_cut_a_word() {
-        let inks = inks();
-        let p = Painter::new(&inks, 2.0, 24.0, false);
-        let clauses = vec![
-            Clause::new("24% of busy", inks.words2),
-            Clause::new("disk 1.26 TB free", inks.words2).or_short("1.26T free"),
-            Clause::new("5 proc", inks.words2),
-        ];
-        let all = p.fit_clauses(&clauses, 10_000.0, false);
-        assert_eq!(all.len(), 3);
-        let w = |parts: &[(String, Rgb)]| {
-            let joined: Vec<&str> = parts.iter().map(|x| x.0.as_str()).collect();
-            p.label_w(&joined.join(" \u{00B7} "), false, false)
-        };
-        let two = p.fit_clauses(&clauses, w(&all) - 1.0, false);
-        assert_eq!(two.len(), 2);
-        assert_eq!(two[1].0, "disk 1.26 TB free");
-        let short = p.fit_clauses(&clauses, w(&two) - 1.0, false);
-        assert_eq!(short[1].0, "1.26T free");
-        assert!(p.fit_clauses(&clauses, 1.0, false).is_empty());
     }
 }

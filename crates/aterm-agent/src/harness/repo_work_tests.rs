@@ -545,6 +545,7 @@ fn a_guarded_folder_is_never_probed() {
             fstype: "captured local".into(),
             local: true,
             automounted: false,
+            removable: false,
             read_only: false,
             container: None,
         }],
@@ -608,6 +609,7 @@ fn a_guarded_folder_is_never_probed() {
             on: work.clone(),
             local,
             automounted,
+            removable: false,
             ..table.mounts[0].clone()
         });
         assert_eq!(unattended_dir(&work, Some(&home), &unavailable), None);

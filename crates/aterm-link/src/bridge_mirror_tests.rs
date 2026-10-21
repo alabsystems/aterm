@@ -1725,6 +1725,12 @@ fn with_the_mirror_off_the_park_is_judged_before_the_rounds_settle() {
         1,
         "the settle read the ask's ack and armed its deadline"
     );
+    // THE PARK IS THE ROSTER'S, never the deadline's: the idle settle reads
+    // the ask's answer WAITING, as its sender waits for it (aterm-0,
+    // `Then::waited_when_idle`), so the deadline is armed before the park
+    // whatever the broker's timing, and only a park judged after the settle
+    // (the defect) is the deadline's. Nothing is owed at the park, so the
+    // idle backstop's grace never shortens it either.
     let parked = bridge.parked.expect("the round parked");
     assert!(
         parked > aterm_spec::wait::MUST_HAPPEN / 2,
@@ -1799,7 +1805,10 @@ fn successor(
 /// pinned seq, appends anew and lands: no `cap-compromised`, no incarnation
 /// rolled. Calling every unseen record another writer's (the defect) said the
 /// node's cap compromised for a compaction, as `publish_reserved`, whose rule
-/// Q3 names, never does for a post.
+/// Q3 names, never does for a post. The read-back, from below the oldest
+/// offset retention left, is refused `retained-from=` by a broker of astream's
+/// R4 (an older one clamped it to its base, past the record): no rows, never
+/// the link down (`read_back_rows`), so the connection stands.
 #[test]
 fn a_dedup_whose_record_retention_took_is_sent_again_never_a_collision() {
     let (lane, mut first) = FakeVerbLane::bridge(&[]);

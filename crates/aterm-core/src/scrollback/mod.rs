@@ -13,7 +13,7 @@ pub use aterm_scrollback::{
 // budgets and limits (wasm exports, the daemon builder).
 pub use aterm_scrollback::DEFAULT_LINE_LIMIT;
 
-// Block codec, public for `TerminalCheckpoint` grid-body encode/decode (B.3.2).
+// Block codec, public for `TerminalCheckpoint` grid-body encode/decode.
 pub use aterm_scrollback::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, max_linked_record_bytes, serialize_lines,

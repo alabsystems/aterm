@@ -964,15 +964,13 @@ impl LayerSampler {
     }
 }
 
-// ======================================================================
-// The encode seam (the verbs under `renderer.rs::run_frame_plan`): open a
-// pass (Clear or Load, optional scissor, shared uniforms bound once), switch
-// pipeline and atlas only on change, bind one instance stream, draw instanced
-// quads, copy texture rects, submit. The wgpu arm issues the same wgpu calls
-// in the same order as a direct encode; the Metal arm forwards to
-// `metal::encoder`, inheriting its loss-domain seal and draw-state refusals.
-// Crossing a handle into the wrong arm panics by name ("device layer").
-// ======================================================================
+// ---------------------------------------------------------------------------
+// The encode seam, the verbs under `renderer.rs::run_frame_plan`: open a pass
+// (Clear or Load, optional scissor, shared uniforms bound once), switch pipeline
+// and atlas only on change, bind one instance stream, draw instanced quads, copy
+// texture rects, submit. The Metal arm forwards to `metal::encoder`, inheriting its
+// loss-domain seal and draw-state refusals. A handle crossed into the wrong arm
+// panics by name ("device layer").
 
 #[cfg(target_os = "macos")]
 use crate::metal::encoder::{
@@ -1597,8 +1595,7 @@ pub(crate) fn metal_stage_readback(
     let mut cb = session.begin()?;
     cb.copy_texture_to_buffer(texture, w, h, &readback, padded)?;
     let submitted = cb.commit();
-    // aterm_time, not std: the wasm clock guard covers this crate, and the
-    // shim is byte-identical on native targets.
+    // aterm_time, not std: the wasm clock guard covers this crate.
     let deadline = aterm_time::Instant::now() + std::time::Duration::from_secs(5);
     let outcome = loop {
         if let Some(outcome) = submitted.try_outcome() {
@@ -1825,8 +1822,8 @@ mod tests {
             scissor: None,
         };
 
-        // ROUTE A: an alias view of a foreign texture as a render target —
-        // the inherited stamp must refuse exactly like the parent's.
+        // Route A: an alias view of a foreign texture as a render target refuses
+        // like its parent.
         let rogue_alias = rogue
             .alias_view(PixelFormat::Rgba8UnormSrgb)
             .expect("alias view");
@@ -1836,7 +1833,7 @@ mod tests {
             .expect_err("an aliased foreign texture must not become a domain-1 target");
         assert!(err.contains("loss domain"), "route A names the seal: {err}");
 
-        // ROUTE B: the alias as a COPY destination (dst-side smuggling).
+        // Route B: the alias as a copy destination.
         let err = cb1
             .copy_texture_to_texture(&native1, &rogue_alias)
             .expect_err("an aliased foreign texture must not become a copy dst");
@@ -1886,8 +1883,8 @@ mod tests {
         let wrapped = LayerTexture::Metal(rogue);
         handle1.upload_texture_rows(&wrapped, 2, 2, &[7u8; 64], 32, 8);
 
-        // Positive control, and both sessions' command buffers commit EMPTY
-        // and clean — every refusal happened before any encoding.
+        // Positive control; both sessions' command buffers commit empty and clean
+        // (every refusal came before any encoding).
         cb1.render_pass(&pass_desc(&native1))
             .expect("same-domain control");
         assert_eq!(
@@ -2022,7 +2019,7 @@ mod tests {
             );
             handle.upload_texture_full(&mt, &bytes, w * 4, w, h);
 
-            // The staged copy into a POISONED buffer — the raw staging shape.
+            // The staged copy into a poisoned buffer.
             let staging = mint.buffer(padded * hu).expect("staging buffer");
             let poison = vec![0xABu8; padded * hu];
             // SAFETY: fresh shared buffer, exactly sized, no GPU work yet.
@@ -2065,8 +2062,8 @@ mod tests {
                 );
             }
 
-            // The tail is not consulted: poisoned vs zeroed tails unpack
-            // identically (this pins the wgpu arm too — one shared spelling).
+            // The tail is not consulted: poisoned and zeroed tails unpack
+            // identically (the wgpu arm shares this unpack).
             let mut zeroed = raw.clone();
             for row in 0..hu {
                 zeroed[row * padded + wu * 4..(row + 1) * padded].fill(0);

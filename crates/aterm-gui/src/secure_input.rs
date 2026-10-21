@@ -2,21 +2,19 @@
 // Copyright 2026 Andrew Yates
 
 //! macOS Secure Keyboard Entry (`EnableSecureEventInput`): while engaged, other
-//! processes cannot observe this app's key events (event taps, `CGEventTap`
-//! keyloggers, the Input Method framework).
+//! processes cannot observe this app's key events (event taps, keyloggers, input methods).
 //!
-//! Focus-scoped per Apple's TN2150: a backgrounded process holding secure input
-//! suppresses every other app's global hotkeys and event taps, so the Carbon
-//! state is `desired && app_active`. The `secure_keyboard_entry` config key sets
-//! the desire (at launch and on every config commit); app activation (any aterm
-//! window focused) gates engagement.
+//! Focus-scoped per Apple's TN2150: a backgrounded holder suppresses every other app's
+//! global hotkeys and event taps, so the Carbon state is `desired && app_active`. The
+//! `secure_keyboard_entry` config key sets the desire (at launch and on every config
+//! commit); app activation (any aterm window focused) gates engagement.
 //!
-//! The OS API is refcounted per process; every transition runs under one lock,
-//! so this process contributes 0 or 1. Process exit and `execve` (the seamless
-//! update handoff) release the count, so a crash cannot wedge system state.
+//! The OS API is refcounted per process; every transition runs under one lock, so this
+//! process contributes 0 or 1. Process exit and `execve` (the seamless update handoff)
+//! release the count, so a crash cannot wedge system state.
 //!
-//! Off macOS this is a no-op: Wayland is secure by default, X11 cannot be
-//! secured and Windows has no equivalent; Settings shows it as unavailable.
+//! Off macOS this is a no-op: Wayland is secure by default, X11 cannot be secured and
+//! Windows has no equivalent.
 
 #[cfg(target_os = "macos")]
 mod imp {

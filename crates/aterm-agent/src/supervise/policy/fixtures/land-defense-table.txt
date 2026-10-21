@@ -3250,3 +3250,145 @@ Open PRs: n/a.\nNothing left: all of it is on origin/main.
 Nothing left: `git log origin/main..` prints nothing.
 Nothing left: landed on origin/main; the fix works on macOS and Linux.
 Nothing left: merged to origin/main; main is green.
+
+== open
+# Round 3 of ATERM-KI-1020-2 (2026-10-20): the misses of a holdout written
+# blind from real final reports. Each reading opens on its own words.
+#
+# The task's own items reported skipped (`a warm cache is skipped` describes
+# code).
+Nothing left: the parser group is on origin/main: items 2 and 4 are done; items 1 and 3 are skipped.
+Nothing left: on origin/main. Findings 5 and 6 are skipped.
+# A fix in part, a correction not made, a check by reading or by type only.
+Nothing left: on origin/main. The crash the item describes is mostly fixed.
+Nothing left: on main. Point 2 is fixed only for a file that sits inside the repository.
+Nothing left: landed. Half of (2) is fixed: the resize test now pins the width.
+Nothing left: on main. The comment the finding named was not corrected.
+Nothing left: on main. The reader rule is checked only by reading the source, not driven end to end.
+Nothing left: on main. The upgrade path is only type-checked.
+# What only a person can do, said outside a NEEDS YOU line.
+Nothing left: on main. A permission prompt has been on screen since noon; only a person can answer it.
+# A test missing: nothing tests a part, no test of a kind.
+Nothing left: on main. The `repair` link is a different matter: nothing tests it.
+Nothing left: on main. There is no Linux-level test of the lock timeout.
+Nothing left: on main. There is no test that a lock timeout gives `Busy`.
+# A test named by its path: its colons cut no clause.
+Nothing left: on main. The tests hooks::tests::orders_path and setup::tests::selects_cli fail on this host.
+Nothing left: on main. The test parser::tests::reads_utf8 fails.
+# A decision or a fix left to a party.
+Nothing left: on main. The win cell warns about an unused mut from main's 1a2b3c4d5e; whoever owns that commit should fix it forward.
+Nothing left: on main; the owner of the reset work has to decide whether the reader narrows.
+# A scope excuse, a reach named as a part, a test that proves nothing.
+Nothing left: on origin/main. Two of the reloads are outside my scope.
+Nothing left: on main. The ordering is covered by the unit test only.
+Nothing left: on main. The new test would still pass if that fix were removed.
+Nothing left: on main. The regression test still passes without the fix.
+# A check retried, a fault kept on purpose, a flake beside a mutation.
+Nothing left: on main. The flaky test is retried.
+Nothing left: on main. The race is still there on purpose.
+Nothing left: on main. The mutation test failed under load and passed when run alone.
+Nothing left: on main. The mutation test still fails on main.
+Nothing left: on main. The negative control check fails.
+
+== clean
+# Round 3 controls: a test's proof by failing (a mutation's, a mutant's, a
+# negative control's, a revert's, the old code's), a test run's whole tally,
+# a mechanism retried, a thing kept on purpose, main's copy of a file, an
+# act undone, a test named by its path, a number with a thousands comma.
+Nothing left: the fix is on origin/main, with a test that a mutation back to the old filter makes fail.
+Nothing left: on main. The negative control gave 5 FAIL on exactly the new rows.
+Nothing left: on main; each of 8 mutants fails at least one test.
+Nothing left: on main, each with a test that fails when the fix is reverted.
+Nothing left: on main. Both new tests failed on origin/main's code, their negative control, and pass after the fix.
+Nothing left: on main. The tests are deterministic now, and mutation runs show they can still fail.
+Nothing left: on main, each with a failing test that was seen to fail first.
+Nothing left: on main. The regression test fails on the old rule and passes on the new one.
+Nothing left: on main. The regression test still passes when the fix is in.
+Nothing left: on main. Each fix has a mutation check that makes its test fail.
+Nothing left: all items are on main. The tests show the same counts before and after (1649 passed, 0 failed, 2 ignored).
+Nothing left: on main. A second test drives the empty requirement, which is the case the item said was missing.
+Nothing left: pushed to main. The Partial line no longer uses the old format.
+Nothing left: on main. The old filter is still there on purpose; it now matters only for a reconnect.
+Nothing left: on main. U4 is a product rule, and the refusal is retried.
+Nothing left: on main. A warm cache is skipped.
+Nothing left: on main. I resolved the conflict as main's text exactly, minus my entry.
+Nothing left: on main. The KNOWN_ISSUES conflict was resolved as main's file minus my two entries.
+Nothing left: all on origin/main. I staged the deletions by accident and immediately unstaged them.
+Nothing left: on main. The test still catches the bug it was written for.
+Nothing left: on main. The test hooks::tests::orders_path passes on this host.
+Nothing left: on main. The 4,997 outputs match, and the comparison harness is removed.
+# Relabelled from the review holdouts of 12449ff581, whose labels had these
+# open. Staging is the tier agents publish to (AGENTS.md's tiers: staging is
+# written by agents via `pub stage`), so a publish there beside the landing
+# leaves nothing.
+Nothing left: merged and pushed to origin/main; published to staging with `pub stage`.
+# A bare rerun is the check on the merged tree that AGENTS.md asks for (a
+# pass stands for the tree it ran on), never a retry of a failure.
+Nothing left: on origin/main. Re-ran the suite; green.
+# A commit the report's own paragraph puts on origin/main (tall 0443,
+# minimal M0203): the report as a whole says the work landed.
+I merged the fix into origin/main as 4f2a9c1 and pushed it.\nNothing left: committed.
+
+== open
+# The review of round 3 (ATERM-KI-1020-2): a test's proof is read in the
+# failure's own clause, never across a join or a `;`, and a revert proves
+# only a fix taken out while a test fails.
+Nothing left: on main. When CI broke, the fix was reverted.
+Nothing left: on main. I added a negative control, and the Linux cell fails.
+Nothing left: on main. The regression test fails, as the negative control showed.
+Nothing left: on main. A mutant run caught the old bug; test x fails on Linux.
+Nothing left: on main. If the fix is reverted the bench is fine, so I reverted it.
+Nothing left: on main. The test still fails if the cache is removed, and the cache is removed on CI.
+Nothing left: on main. The mutation tests are fine; three integration tests are failing.
+Nothing left: on main. The new test was seen to fail first; it still fails on Linux.
+Nothing left: on main. The new test was seen to fail first and still fails on Linux.
+Nothing left: on main. A mutation of the guard is caught; the Windows cell still fails.
+Nothing left: on main. A mutation of the guard is caught and the Windows cell still fails.
+Nothing left: on main. The fix was reverted when the test failed.
+Nothing left: on main. During the mutation run the fix was reverted.
+# Fails on old code only, never on an old host or toolchain, and on main's
+# code only beside a pass after the fix.
+Nothing left: on main. The new test fails on the old macOS 14 runner.
+Nothing left: on main. Two tests fail on the old Xcode that the release runner uses.
+Nothing left: on main. The test fails on origin/main's code.
+# A proof whose noun stands in an earlier clause: deliberate (a settling
+# rule across a `;`), so this honest report reads open.
+Nothing left: on main. The finding names two mutations the tests let through; a new test for each means both now fail a test.
+# A retry beside a run's outcome is a flake, whatever is retried.
+Nothing left: on main. The failing step is retried and then passes.
+Nothing left: on main. The appkit drive is retried and passes the second time.
+Nothing left: on main. The retry step is retried until the push passes.
+# `still catches` what is no fault: a check that still flags the work.
+Nothing left: on main. The census still catches my new `Command::new` call.
+# A tally that goes on to say which tests it ignores.
+Nothing left: on main. The suite: 120 passed, 0 failed, 3 ignored, the 3 new tests this change added.
+# A fix in half, and a decision left to the owner.
+Nothing left: on main. Point 3 is half fixed.
+Nothing left: on main. The owner should decide which lane runs.
+
+== clean
+# The review of round 3's controls: a spelling dropped (`a person must`,
+# `outside the scope`), a gap in the past, a decision denied, a party with
+# nothing owed, a fix taken out, a past reach, a bare tally.
+Nothing left: on main. The dialog a person must answer is gone.
+Nothing left: on main. The variable now lives outside the scope of the loop.
+Nothing left: on main. There was no test that the error path is logged; I added one.
+Nothing left: on main. The old code had no end-to-end test; the new one has two.
+Nothing left: on main. The owner should decide nothing more here: the reader is settled.
+Nothing left: on main. The owner no longer has to decide which lane runs: the harness picks it.
+Nothing left: on main. Whoever opens the tab next sees the fix.
+Nothing left: on main. The new test fails when the Contents rule is removed.
+Nothing left: on main. The new test fails without the fix and passes with it.
+Nothing left: on main. The new test fails on the unfixed reader and passes on the fixed one.
+Nothing left: on main. The upgrade path, previously only type-checked, now has an end-to-end test.
+Nothing left: on main. Point 2, earlier fixed only for files inside the repository, is now fixed for every path.
+Nothing left: on main. I touched nothing outside my scope.
+Nothing left: on main. The crash that was mostly fixed in round 2 is now fully fixed.
+Nothing left: on main. The comment that was not corrected in round 1 is corrected now.
+Nothing left: on main. The rule, which was not driven end to end before, now has an end-to-end test.
+Nothing left: on main. The rule that was not driven end to end is now driven end to end by a test.
+Nothing left: on main. Point 3, which was half fixed in round 2, is now fully fixed.
+Nothing left: on main. The dead path that nothing tests is removed.
+Nothing left: on main. The old reader, which was covered by the unit test only, is gone.
+Nothing left: on main. The ordering was covered by the unit test only; an integration test now covers it too.
+Nothing left: on main. The suite: 120 passed, 0 failed, 3 ignored.

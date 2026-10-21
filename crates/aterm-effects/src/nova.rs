@@ -30,7 +30,7 @@
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, WordDecoration, premul_rgb};
 use aterm_scene::{mix_rgb, smoothstep};
 
-use crate::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
+use crate::color_math::{hsv2rgb, rgb2hsv};
 use crate::genome::{NovaFeatures, NovaMagic, mix};
 
 /// §6.1 anticipation-dip window (ms): ink dims ~35 %, no quads.
@@ -201,6 +201,8 @@ impl QuadSink<'_> {
         if x1 <= x0 || y1 <= y0 {
             return;
         }
+        let x0_u = x0 as u16;
+        let w_u = (x1 - x0) as u16;
         let mut yy = y0;
         while yy < y1 {
             if self.budget == 0 {
@@ -210,9 +212,9 @@ impl QuadSink<'_> {
             let band_end = ((row + 1) * self.cell_h).min(y1);
             self.out.push(GlowQuad {
                 row: row as u16,
-                x: x0 as u16,
+                x: x0_u,
                 y: yy as u16,
-                w: (x1 - x0) as u16,
+                w: w_u,
                 h: (band_end - yy) as u16,
                 color: premul,
                 // Additive light: this emitter has no other mode (see
@@ -268,9 +270,10 @@ pub fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f32, f32
 /// through; deterministic (≤ 8 fixed steps), resolved once per emission.
 pub fn vivid_fringe(core: u32, fringe: u32) -> u32 {
     const FLOOR: f32 = 0.42;
+    let table = crate::color_math::relative_luminance_table();
     let mut c = fringe;
     for k in 1..=8u32 {
-        if relative_luminance(c) >= FLOOR {
+        if crate::color_math::relative_luminance_with(table, c) >= FLOOR {
             return c;
         }
         c = mix_rgb(fringe, core, k as f32 / 8.0);
@@ -347,6 +350,9 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     // `√fade` keeps the shockwave bright through the mid-sweep; same 1 → 0
     // endpoints.
     let base_cov = (fade.max(0.0).sqrt() * env.intensity).clamp(0.0, 1.0);
+    if base_cov == 0.0 {
+        return;
+    }
     let fringe = vivid_fringe(env.core, env.fringe);
     let cxf = env.cx as f32;
     for i in 0..bands {
@@ -542,6 +548,16 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     }
     // Same visibility floor as the ring: dark fringes make invisible motes.
     let fringe = vivid_fringe(env.core, env.fringe);
+    // Twinkle phase locked to the shared grid: each mote's phase is 0 or
+    // TWINKLE_GRID_MS of the 2·grid period, so combined onsets stay ≤ 3/s.
+    let tw_pair = [0.0f32, 0.5].map(|grid_phase| {
+        0.35 + 0.65
+            * (0.5
+                + 0.5
+                    * (std::f32::consts::TAU
+                        * (t_ms as f32 / (2.0 * TWINKLE_GRID_MS as f32) + grid_phase))
+                        .sin())
+    });
     for m in 0..u32::from(env.feats.debris) {
         if out.len() >= cap {
             break;
@@ -572,16 +588,7 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
                 env.cy as f32 + vy * age + 0.5 * g * age * age,
             )
         };
-        // Twinkle phase locked to the shared grid: each mote's phase is 0 or
-        // TWINKLE_GRID_MS of the 2·grid period, so combined onsets stay ≤ 3/s.
-        let grid_phase = ((s >> 33) & 1) as f32 * 0.5;
-        let tw = 0.35
-            + 0.65
-                * (0.5
-                    + 0.5
-                        * (std::f32::consts::TAU
-                            * (t_ms as f32 / (2.0 * TWINKLE_GRID_MS as f32) + grid_phase))
-                            .sin());
+        let tw = tw_pair[((s >> 33) & 1) as usize];
         let alpha = (env.intensity * fade * tw).clamp(0.0, 1.0);
         if alpha <= 0.01 {
             continue;
@@ -633,15 +640,18 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
     let row1 = ((env.cy as f32 + r) as i32 / env.cell_h).min(rows - 1);
     let col0 = ((env.cx as f32 - r) as i32 / env.cell_w).max(0);
     let col1 = ((env.cx as f32 + r) as i32 / env.cell_w).min(cols - 1);
+    let alpha = (150.0 * fade * env.intensity).clamp(0.0, 255.0) as u8;
+    let cxf = env.cx as f32;
     let mut emitted = 0usize;
     for row in row0..=row1 {
+        let ccy = (row * env.cell_h + env.cell_h / 2) as f32;
+        let dy2 = (ccy - env.cy as f32).powi(2);
         for col in col0..=col1 {
             if emitted >= cap {
                 return;
             }
             let ccx = (col * env.cell_w + env.cell_w / 2) as f32;
-            let ccy = (row * env.cell_h + env.cell_h / 2) as f32;
-            let dist = ((ccx - env.cx as f32).powi(2) + (ccy - env.cy as f32).powi(2)).sqrt();
+            let dist = ((ccx - cxf).powi(2) + dy2).sqrt();
             if (dist - r).abs() > half {
                 continue;
             }
@@ -653,7 +663,7 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
                 glyph: DecoGlyph::RingArc,
                 blend: DecoBlend::Over,
                 color: 0x001A_1022, // near-black violet: the collapse shadow
-                alpha: (150.0 * fade * env.intensity).clamp(0.0, 255.0) as u8,
+                alpha,
             });
             emitted += 1;
         }
@@ -677,7 +687,10 @@ pub fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
         // R(q) = r_max·ease(q) grows to `dist`: (1−q)² = 1 − d/r_max.
         1.0 - (1.0 - dist / r_max).sqrt()
     };
-    Some(FLASH_END_MS + (q.clamp(0.0, 1.0) * (RING_END_MS - FLASH_END_MS) as f32) as u64)
+    Some(
+        (FLASH_END_MS + (q.clamp(0.0, 1.0) * (RING_END_MS - FLASH_END_MS) as f32) as u64)
+            .min(RING_END_MS - 1),
+    )
 }
 
 /// The ~150 ms smoothstep in/out pulse envelope at `t` for a crossing at
@@ -697,14 +710,15 @@ pub fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
 /// converges and |ΔL| ≤ 5% holds for every (anchor, palette) pair, as the table
 /// test checks.
 pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
-    let want = relative_luminance(anchor);
+    let table = crate::color_math::relative_luminance_table();
+    let want = crate::color_math::relative_luminance_with(table, anchor);
     let (h, s, _) = rgb2hsv(target);
     // L is monotone in v at fixed (h, s).
-    if relative_luminance(hsv2rgb(h, s, 1.0)) >= want {
+    if crate::color_math::relative_luminance_with(table, hsv2rgb(h, s, 1.0)) >= want {
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         for _ in 0..20 {
             let mid = 0.5 * (lo + hi);
-            if relative_luminance(hsv2rgb(h, s, mid)) < want {
+            if crate::color_math::relative_luminance_with(table, hsv2rgb(h, s, mid)) < want {
                 lo = mid;
             } else {
                 hi = mid;
@@ -717,7 +731,7 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
     let (mut lo, mut hi) = (0.0f32, s);
     for _ in 0..20 {
         let mid = 0.5 * (lo + hi);
-        if relative_luminance(hsv2rgb(h, mid, 1.0)) < want {
+        if crate::color_math::relative_luminance_with(table, hsv2rgb(h, mid, 1.0)) < want {
             hi = mid;
         } else {
             lo = mid;
@@ -927,8 +941,17 @@ mod tests {
         let sfar = crossing_ms(40.0, rm, true).unwrap();
         assert!(sfar < sa, "the contracting ring reaches far words FIRST");
         // The crossing frame actually lies inside the ring window and the
-        // radius there is within a frame's travel of the distance.
-        for (d, sing) in [(10.0f32, false), (40.0, false), (10.0, true)] {
+        // radius there is within a frame's travel of the distance, including at
+        // both endpoints (0.0 and r_max).
+        for (d, sing) in [
+            (0.0f32, false),
+            (10.0, false),
+            (40.0, false),
+            (rm, false),
+            (0.0, true),
+            (10.0, true),
+            (rm, true),
+        ] {
             let t = crossing_ms(d, rm, sing).unwrap();
             assert!((FLASH_END_MS..RING_END_MS).contains(&t));
             let (r, _) = ring_radius(t, rm, sing).unwrap();
@@ -947,7 +970,7 @@ mod tests {
     /// and for the ≤ 0.35-amplitude mix applied; plus a saturated-red check.
     #[test]
     fn delta_l_bound_over_palette_table() {
-        use crate::color_math::hue_nudge;
+        use crate::color_math::{hue_nudge, relative_luminance};
         // Deployed ink anchors: class base pairs + all 8 palettes' endpoints.
         let mut anchors: Vec<u32> = vec![
             0x007C_C8FF,

@@ -5,39 +5,26 @@
 //! Rung 0 of `docs/RFC-proof-carrying-dsu.md`): an update may be applied only
 //! at a quiescence point — never while a request is in flight.
 //!
-//! In the shipping overlap handoff a "request" is a slice of PTY output the
-//! reader has taken OUT OF THE KERNEL and not yet folded into the engine, and
-//! the "apply" is the handoff proceeding past `park_all_readers` to capture and
-//! hand over the screens — which it does only when every `park_reader` returned
-//! `true`. A capture taken with a slice in flight misses bytes that have already
-//! left the kernel queue, so neither side of the handoff ever shows them: a
-//! torn checkpoint. Quiescence is therefore a contract between two pieces of
-//! code, the reader (which may stop only between slices) and `park_reader`
-//! (which may ACK only once the reader has stopped), and both run here.
+//! A request is a slice of PTY output the reader has taken out of the kernel and not yet folded
+//! into the engine; the apply is the overlap handoff proceeding past `park_all_readers` to
+//! capture the screens, which it does only when every `park_reader` returned `true`. A capture
+//! with a slice in flight misses those bytes on both sides: a torn checkpoint. Quiescence is a
+//! contract between the reader (which stops only between slices) and `park_reader` (which ACKs
+//! only once the reader has stopped), and both run here.
 //!
-//! The reader is the REAL one — `attach_reader_inner`, the gather + parse
-//! pipeline every session runs — attached to a real pseudo-terminal. Only its
-//! wakes are redirected (a unit test has no event loop). It is driven the way a
-//! handoff meets it: output arrives, the reader drains it, and the engine is
-//! busy. "Busy" is the test holding the session's terminal lock, the lock the
-//! reader folds every slice under, so a slice the reader has drained stays in
-//! flight until the test lets go.
+//! The reader is the real `attach_reader_inner` on a real pseudo-terminal, with its wakes sent
+//! to a channel. The engine being busy is the test holding the session's terminal lock, which
+//! the reader folds every slice under. Projection:
 //!
-//! Projection, each variable read from the real pipeline:
+//! * `served`: slices the engine applied; each slice is one printable byte, so this is the
+//!   cursor column;
+//! * `inflight`: the reader has drained more slices than were applied (a slice is drained once
+//!   the reader's activity stamp moved and the master has nothing left to read);
+//! * `applied`: `park_reader` returned `true`;
+//! * `torn`: it did so while a drained slice was unapplied.
 //!
-//! * `served`   — slices the ENGINE has applied: every slice is one printable
-//!   byte, so this is the terminal's cursor column;
-//! * `inflight` — the reader has drained more slices than the engine applied.
-//!   A slice counts as drained once the reader's own post-drain activity stamp
-//!   moved and the master has nothing left to read;
-//! * `applied`  — `park_reader` returned `true` (the handoff may capture);
-//! * `torn`     — it did so while a drained slice was still unapplied.
-//!
-//! The reader runs on its own threads, so one observation can cover several
-//! slices; such a change is validated as the model path it has to be (`Finish`,
-//! then `Begin`/`Finish` for each further slice), every hop tiered.
-//!
-//! NEGATIVE CONTROL: from a real in-flight state, an apply is rejected by the
+//! The reader runs on its own threads, so one observation can cover several slices; `observe`
+//! validates it as a model path. Negative control: a real in-flight apply is rejected by the
 //! committed model and admitted by `Buggy = 1`'s `BuggyApplyInflight`.
 
 use std::collections::BTreeMap;
@@ -57,9 +44,7 @@ type State = BTreeMap<&'static str, i64>;
 /// `MaxReq` lifted past every real run.
 const OVERRIDES: &[(&str, i64)] = &[("MaxReq", 1_000)];
 
-/// Every wait in this file: a hang detector, never a latency budget, because a
-/// loaded machine only slows the reader down — it never changes what the
-/// reader may do.
+/// Every wait in this file: a hang detector, never a latency budget.
 const PATIENCE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// A spin that yields the core between looks (a zero gap).
@@ -196,10 +181,9 @@ fn conforms(prev: &State, next: &State, action: &str) -> (bool, String) {
     )
 }
 
-/// Validate an observed change of the reader's state as the model path it has
-/// to be: `Finish` for the slice in flight, `Begin`/`Finish` for each further
-/// slice applied, and a final `Begin` if one is in flight again. The
-/// intermediate states are the model's own successors; every hop is tiered.
+/// Validate an observed change as the model path it has to be: `Finish` for the slice in
+/// flight, `Begin`/`Finish` per further slice applied, and a final `Begin` if one is in flight
+/// again. Intermediate states are the model's own successors; every hop is tiered.
 fn observe(prev: &State, next: &State) {
     if prev == next {
         return;
@@ -246,8 +230,7 @@ fn the_real_reader_and_park_are_the_quiescence_gate() {
         "an idle reader is the model's Init"
     );
 
-    // One whole request: the reader drains a slice while the engine is busy,
-    // then the engine applies it.
+    // One whole request: drained while the engine is busy, then applied.
     let term = rig.term();
     let stalled = term.lock().expect("terminal lock");
     rig.output_one_slice();
@@ -262,9 +245,7 @@ fn the_real_reader_and_park_are_the_quiescence_gate() {
     observe(&state, &next);
     state = next;
 
-    // A slice is in flight, and more output queues behind it, when the handoff
-    // asks to park: the gate must refuse, and nothing the reader drained may be
-    // lost when it stops.
+    // A slice in flight with more queued behind it: the park must refuse and lose nothing.
     let stalled = term.lock().expect("terminal lock");
     rig.output_one_slice();
     let next = rig.project(Rig::served(&stalled), false);
@@ -285,8 +266,8 @@ fn the_real_reader_and_park_are_the_quiescence_gate() {
     );
     assert_eq!(rig.project(Rig::served(&stalled), false), state);
 
-    // The engine frees up; the stopped reader must finish EVERY slice it
-    // drained before it exits, and only then may the park authorize the apply.
+    // The engine frees up: the stopped reader finishes every drained slice before it exits,
+    // and only then may the park authorize the apply.
     drop(stalled);
     wait_for("the stopped reader to exit", || rig.reader_finished());
     let next = rig.project_now(false);
@@ -303,7 +284,7 @@ fn the_real_reader_and_park_are_the_quiescence_gate() {
     );
 }
 
-/// The defect from a REAL in-flight state: the apply lands mid-slice.
+/// Negative control: from a real in-flight state, the apply is the `Buggy = 1` tear.
 #[test]
 fn an_apply_while_a_slice_is_in_flight_is_the_buggy_step() {
     let model = dsu_quiescence_model();

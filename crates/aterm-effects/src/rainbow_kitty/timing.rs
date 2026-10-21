@@ -2,32 +2,22 @@
 // Copyright 2026 Andrew Yates
 
 //! The shared numbers of Rainbow Kitty v2: every constant and curve that more
-//! than one producer (or the glow and the synth) must agree on, each defined
-//! once here with its law beside it.
-//!
-//! Section references are to `docs/design/RAINBOW-KITTY-V2.md`: §8.1 (shared
-//! numbers), §2.5 (the seven named curves), §5.2 (coverage ceilings), §6.1-6.2
-//! (the meteor's trigger and clock), §13 (the token bucket).
-//!
+//! than one producer (or the glow and the synth) must agree on, defined once.
 //! Both `rainbow_kitty::meteor` and `trail_sound::rainbow_kitty_v2` read the
-//! distance→duration function, glint budget, shed count and fan hero count from
-//! here, so the landing and its bell cannot drift apart. A second definition of
-//! any number below is a bug, even if equal.
+//! flight clock and shared counts from here, so the landing and its bell cannot
+//! drift apart. A second definition of any number below is a bug, even if
+//! equal. Section references are to `docs/design/RAINBOW-KITTY-V2.md`.
 //!
-//! ## Not here
+//! Not here:
 //!
-//! * **The arrival edge `t₀ + T`** is an `Instant` minted by [`super::meteor`]
-//!   at spawn and read by the pin, ring, fan, flash, the kitty's `land_at` and
-//!   the bell; [`flight_ms`] computes its offset so every reader derives the
-//!   same instant.
-//! * **The caret's τ 220 ms cool** belongs to the host: `TypingCadence`'s
-//!   `energy` (`CadenceParams::half_life` in `cursor_trail`). The host takes
+//! * The arrival edge `t₀ + T`: an `Instant` minted by [`super::meteor`] at
+//!   spawn; [`flight_ms`] computes its offset so every reader derives the same
+//!   instant.
+//! * The caret's τ 220 ms cool: the host's `TypingCadence` energy
+//!   (`CadenceParams::half_life` in `cursor_trail`), taken as
 //!   `max(CaretSeam::paint, energy)`.
-//! * **"≤ 3 live glints, a fourth steals the oldest"** is a voice cap owned by
-//!   `trail_sound::rainbow_kitty_v2::lane_cap`; the glow's half is the token
-//!   bucket below.
-//!
-//! ## Units
+//! * The ≤ 3 live glints voice cap: `trail_sound::rainbow_kitty_v2::lane_cap`;
+//!   the glow's half is the token bucket below.
 //!
 //! Durations are milliseconds (`f32`) unless a name ends in `_S`. Pixel figures
 //! are at `ch = 18`; callers scale by `ch/18`. Coverages are additive `0..=255`
@@ -59,13 +49,10 @@ pub const FLIGHT_MAX_MS: f32 = 120.0;
 /// The distance→duration function (§8.1 no. 1):
 /// `T = clamp(50 + 1.0·cells, 60, 120)` ms.
 ///
-/// Read by exactly four couplings:
-///
-/// 1. the visual flight (`meteor.rs`'s `T`, hence the arrival edge `t₀ + T`);
-/// 2. the audio rain spacing ([`rain_spacing_ms`] is a function of this value);
-/// 3. the meteor bell's `Voice::delay` (§12.1), so it strikes on the landing
-///    frame;
-/// 4. the Enter cadence's resolution delay (D9).
+/// The visual flight (hence the arrival edge `t₀ + T`), the ribbon's jump, the
+/// meteor bell's `Voice::delay` (§12.1) and the Enter cadence's resolution (D9)
+/// all read it, so they land on the same frame; [`rain_spacing_ms`] is a
+/// function of it.
 ///
 /// `cells` is the path length in cell widths, diagonals included:
 /// `cells = sqrt(dcol² + (drow·ch/cw)²)`. Non-finite or negative input resolves
@@ -96,14 +83,12 @@ pub const IMPACT_EXP: f32 = 0.7;
 pub const IMPACT_MAX: f32 = 3.5;
 
 /// How hard a jump lands: one magnitude read by every distance-graded landing
-/// law (fan count, fan reach, ring radius, ring life), so the splash scales
-/// with the distance travelled (owner, 2026-09-08).
+/// law (fan count, fan reach, ring radius, ring life).
 ///
 /// `impact(cells) = clamp((cells / 8)^0.7, 1, 3.5)`: exactly `1.0` at the
 /// 8-cell meteor floor ([`JUMP_MIN_CELLS`]), 1.62 at 16 cells, 2.16 at 24,
-/// 3.09 at 40, capped from ≈ 48 on.
-///
-/// A NaN, infinite or non-positive distance is the floor.
+/// 3.09 at 40, capped from ≈ 48 on. A NaN, infinite or non-positive distance
+/// is the floor.
 #[inline]
 #[must_use]
 pub fn impact(cells: f32) -> f32 {
@@ -129,10 +114,9 @@ pub const FLIGHT_P0: f32 = 0.28;
 pub const FLIGHT_ENTER_EXP: f32 = 2.2;
 
 /// Milliseconds after the arrival edge by which every meteor pixel is off the
-/// glass. The impact carries a 420 ms shockwave, a 260 ms splash and sparks
-/// living up to 560 ms; the flight itself ([`flight_ms`]) is unaffected. Read
-/// by `meteor.rs` alone: the pool's `end()` is `arrival + this`, and every
-/// impact mark is asserted inside it at compile time there.
+/// glass; the flight itself ([`flight_ms`]) is unaffected. `meteor.rs` alone
+/// reads it: the pool's `end()` is `arrival + this`, and every impact mark is
+/// asserted inside it at compile time there.
 pub const FLIGHT_OFF_GLASS_MS: f32 = 600.0;
 
 /// The retire-previous finish (§6.9): a new meteor within 1 `ch` of a live one
@@ -192,7 +176,7 @@ pub const IOI_EMA_ALPHA: f32 = 0.5;
 /// The phrase rest in ms for a hand at `ioi_ms`: the longer of
 /// [`PHRASE_PAUSE_MS`] and [`PHRASE_REST_IOI_MUL`] tempos; non-finite input
 /// reads as the default tempo. Read by the melody (`MelodyV2::on_typed`) and
-/// the ribbon's grace (`Ribbon::place`).
+/// the ribbon's grace (`Ribbon::rest_s`).
 #[inline]
 #[must_use]
 pub fn phrase_rest_ms(ioi_ms: f32) -> f32 {
@@ -258,8 +242,8 @@ pub fn shed_n(cells: f32) -> u16 {
 
 /// `FAN_HERO_N = 5` (§8.1, D6): the landing fan always carries 1 gold m1 + 4
 /// m2, and the meteor's five rain glints pair 1:1 with them in throw order, so
-/// the visual census (`the_fan_is_one_hero_four_m2_and_grains`) and the audio
-/// run length agree.
+/// the visual census (`the_landing_fan_is_one_hero_four_m2_and_grains`) and the
+/// audio run length agree.
 pub const FAN_HERO_N: usize = 5;
 
 /// Fan stars in total, ceiling included:
@@ -324,8 +308,8 @@ pub fn kill_span_s(cells: u16) -> f32 {
 // 3. The token bucket (§8.1 no. 2, §13, D5)
 // ---------------------------------------------------------------------------
 
-/// Tokens the stardust bucket regains per second, hence ≤ 4 glints/s (§13).
-/// Refilled in `tick()`: `tokens = min(GLINT_CAP, tokens + GLINT_REFILL_PER_S · dt)`.
+/// Tokens the stardust bucket regains per second, hence ≤ 4 glints/s (§13);
+/// refilled once per `Engine::tick`.
 pub const GLINT_REFILL_PER_S: f32 = 4.0;
 
 /// Bucket depth: three banked tokens let a burst of capitals chime (three
@@ -333,11 +317,10 @@ pub const GLINT_REFILL_PER_S: f32 = 4.0;
 ///
 /// The bucket's law (D5), enforced at its one spend site (`stardust.rs`'s
 /// `deal_star`): only an m1 spends a token, cueing one glint at its column; an
-/// earned hero (capital, `!`, kitty Delight, the fan's slot) without a token is
-/// born silent; a dealt hero without one degrades to m2; m2/m3 never touch the
-/// bucket; meteor-lane stars are exempt, and a meteor empties the bucket on its
-/// move edge so nothing chimes over the rain. Voice concurrency is the synth's
-/// lane cap.
+/// earned hero without a token is born silent; a dealt hero without one
+/// degrades to m2; m2/m3 never touch the bucket; meteor-lane stars are exempt,
+/// and a meteor empties the bucket on its move edge so nothing chimes over the
+/// rain. Voice concurrency is the synth's lane cap.
 pub const GLINT_CAP: f32 = 3.0;
 
 // ---------------------------------------------------------------------------
@@ -347,8 +330,8 @@ pub const GLINT_CAP: f32 = 3.0;
 // The theme's only easing vocabulary; no linear fades except reduced motion's
 // `REDUCED_MOTION_FADE_MS`, which is deliberately not a curve function.
 
-/// Duration of the ribbon head cell's one ramp-in, seconds (v1's
-/// `RAINBOW_EDGE_IN_S`, kept verbatim). T3: *nothing else eases in.*
+/// Duration of the ribbon head cell's one ramp-in, seconds. Nothing else eases
+/// in (T3).
 pub const EDGE_IN_S: f32 = 0.018;
 
 /// `edge-in`: smoothstep over 18 ms, the theme's one attack (§2.5, §4): the
@@ -363,9 +346,6 @@ pub fn edge_in(age_s: f32) -> f32 {
 /// `enter-at-speed`: `p(u) = 1 − (1 − p₀)·(1 − u)^2.2`, `p₀ = 0.28` (§2.5, §6.2,
 /// D20), the meteor head's position at `u = t/T`. `p(0) = p₀`, so the gesture
 /// is never seen starting from rest; `p(1) = 1` exactly.
-///
-/// Pinned by `meteor_enters_at_speed_never_from_rest`: displacement over the
-/// first 8 ms is ≥ `0.10·L` at every `T ∈ {60, 90, 120}`.
 #[inline]
 #[must_use]
 pub fn enter_at_speed(u: f32) -> f32 {
@@ -395,10 +375,7 @@ pub fn spend(u: f32) -> f32 {
 /// `half-life`: `1` for a hold `H`, then `2^(−(age − H)/τ)` (§2.5, §5.6).
 ///
 /// The envelope of every star and of the caret's landing re-light
-/// (`Engine::caret_paint`, run on [`SPRING_SNAP_RESPONSE_S`] so re-light and
-/// flare share an edge). `hold_s` and `tau_s` are per population; the shape is
-/// shared. The caret's 220 ms cool is the host's and does not use this.
-///
+/// (`Engine::caret_paint`); `hold_s` and `tau_s` are per population.
 /// A non-positive `tau_s` is a step: full through the hold, then nothing.
 #[inline]
 #[must_use]
@@ -422,12 +399,12 @@ pub const STAR_CULL_ALPHA: f32 = 0.20;
 pub const CHROMA_CULL_ALPHA: f32 = 0.12;
 
 /// `H + 2.32·τ`: the actual life of a [`half_life`] envelope given
-/// [`STAR_CULL_ALPHA`] (`2.32 = log₂(1/0.20)`). The class lives (225 / 340 /
-/// 460 ms) follow from their `H`/`τ` pairs.
+/// [`STAR_CULL_ALPHA`] (`2.32 = log₂(1/0.20) = log₂(5) = log₂(10) − 1`).
+/// The class lives (225 / 340 / 460 ms) follow from their `H`/`τ` pairs.
 #[inline]
 #[must_use]
-pub fn half_life_life_s(hold_s: f32, tau_s: f32) -> f32 {
-    hold_s + tau_s * -STAR_CULL_ALPHA.log2()
+pub const fn half_life_life_s(hold_s: f32, tau_s: f32) -> f32 {
+    hold_s + tau_s * (std::f32::consts::LOG2_10 - 1.0)
 }
 
 /// `spring-snap`'s response time in seconds (§2.5, §7.1), read as the natural
@@ -456,28 +433,34 @@ pub fn spring_snap(age_s: f32) -> f32 {
 /// `spring-whip`'s natural frequency, rad/s (§2.5).
 pub const SPRING_WHIP_OMEGA: f32 = 24.0;
 
-/// `spring-whip`'s damping ratio (§2.5). Under 1, so it OVERSHOOTS — which is
-/// the point: the flying kitty is yanked backwards and springs past her
-/// resting lead before settling.
+/// `spring-whip`'s damping ratio (§2.5). Under 1, so it overshoots: the flying
+/// kitty is yanked backwards and springs past her resting lead before settling.
 pub const SPRING_WHIP_ZETA: f32 = 0.6;
+
+const SPRING_WHIP_ROOT: f32 = 0.8;
+const SPRING_WHIP_WD: f32 = SPRING_WHIP_OMEGA * SPRING_WHIP_ROOT;
+const SPRING_WHIP_Z_OVER_ROOT: f32 = SPRING_WHIP_ZETA / SPRING_WHIP_ROOT;
+const _: () = assert!(
+    (1.0 - SPRING_WHIP_ZETA * SPRING_WHIP_ZETA - SPRING_WHIP_ROOT * SPRING_WHIP_ROOT).abs()
+        < f32::EPSILON
+);
 
 /// `spring-whip`: the damped unit step (ω = 24 rad/s, ζ = 0.6) of §2.5:
 /// `x(t) = 1 − e^(−ζωt)·(cos ω_d t + (ζ/√(1−ζ²))·sin ω_d t)`,
 /// `ω_d = ω√(1−ζ²) = 19.2`.
 ///
 /// The flying kitty's lead on a meteor (§7.2): `−0.30` cell at `t = 0`,
-/// springing to `+LEAD_MAX 0.22`, settled by ≈ 180 ms (`e^(−ζωt) ≈ 0.07`).
+/// springing to `companion::FLYING_LEAD_MAX` (+0.22), settled by ≈ 180 ms
+/// (`e^(−ζωt) ≈ 0.07`).
 #[inline]
 #[must_use]
 pub fn spring_whip(age_s: f32) -> f32 {
     if !age_s.is_finite() || age_s <= 0.0 {
         return 0.0;
     }
-    let z = SPRING_WHIP_ZETA;
-    let root = (1.0 - z * z).sqrt();
-    let wd = SPRING_WHIP_OMEGA * root;
-    let env = (-z * SPRING_WHIP_OMEGA * age_s).exp();
-    1.0 - env * ((wd * age_s).cos() + (z / root) * (wd * age_s).sin())
+    let phase = SPRING_WHIP_WD * age_s;
+    let env = (-SPRING_WHIP_ZETA * SPRING_WHIP_OMEGA * age_s).exp();
+    1.0 - env * (phase.cos() + SPRING_WHIP_Z_OVER_ROOT * phase.sin())
 }
 
 /// The theme's one linear fade (§2.5, §6.11): under reduced motion every mark is
@@ -509,16 +492,14 @@ pub const FIELD_STAR_COV_CEIL: f32 = STAR_STACK_ADD * FIELD_STAR_COV_REQUEST_MAX
 /// mini-fan stars fly over ink. Class centres: m1 118, m2 80, m3 61.
 pub const TRANSIENT_STAR_COV_CEIL: f32 = 118.0;
 
-/// L3's graded-jump roof (v1's `RAINBOW_JUMP_COV_CEIL`): the meteor's
-/// `head_cov = min(118·bright, 160)` (§6.3) tops out here.
+/// L3's graded-jump roof: the meteor's `head_cov = min(118·bright, 160)` (§6.3)
+/// tops out here.
 pub const JUMP_COV_CEIL: f32 = 160.0;
 
 // ---------------------------------------------------------------------------
-// Compile-time laws
-// ---------------------------------------------------------------------------
-//
-// Relations between the shared numbers are const assertions, so a wrong value
+// Compile-time laws: relations between the shared numbers, so a wrong value
 // does not compile.
+// ---------------------------------------------------------------------------
 
 // §8.1 / D6: the fan's five paired stars fit inside the fan.
 const _: () = assert!(FAN_HERO_N <= FAN_MAX_N);
@@ -526,7 +507,6 @@ const _: () = assert!(FAN_HERO_N <= FAN_MAX_N);
 const _: () = assert!(MINI_FAN_MAX_CELLS + 1 == JUMP_MIN_CELLS);
 // §6.12: a one-cell move is typing or an arrow, never a hop.
 const _: () = assert!(MINI_FAN_MIN_CELLS >= 2);
-// §6.9: cap 2 live meteors.
 const _: () = assert!(FLIGHT_MAX_LIVE == 2);
 // D1: two ceilings are genuinely two numbers, and the field lane is the
 // brighter one.
@@ -536,7 +516,6 @@ const _: () = assert!(FIELD_STAR_COV_CEIL > TRANSIENT_STAR_COV_CEIL);
 // is never clipped.
 const _: () = assert!(TRANSIENT_STAR_COV_CEIL * 1.5 > JUMP_COV_CEIL);
 const _: () = assert!(TRANSIENT_STAR_COV_CEIL < JUMP_COV_CEIL);
-// §2.5: the one sanctioned attack has a positive span.
 const _: () = assert!(EDGE_IN_S > 0.0);
 // §2.6 / S5: both arms of `phrase_rest_ms`'s `max` are reachable. The floor
 // binds up to an IOI of 360 ms (`2.5 × 360 = 900`); above that the tempo term
@@ -629,7 +608,7 @@ mod tests {
         );
         assert!(edge_in(EDGE_IN_S * 0.5) > 0.4 && edge_in(EDGE_IN_S * 0.5) < 0.6);
 
-        // enter-at-speed: p(0) = p₀ EXACTLY (the frame-0 law), p(1) = 1.
+        // enter-at-speed: p(0) = p₀ exactly (the frame-0 law), p(1) = 1.
         assert!(
             (enter_at_speed(0.0) - FLIGHT_P0).abs() < 1e-6,
             "the head is never at rest on frame 0 (T2, D20)"
@@ -664,8 +643,7 @@ mod tests {
             "settled by its own response time"
         );
 
-        // spring-whip: starts at 0, DOES overshoot, and is inside 7 % of
-        // unity by 180 ms.
+        // spring-whip: starts at 0, overshoots, and is settled by ≈ 180 ms.
         assert!((spring_whip(0.0)).abs() < 1e-6);
         let mut peak = 0.0f32;
         let mut t = 0.0;

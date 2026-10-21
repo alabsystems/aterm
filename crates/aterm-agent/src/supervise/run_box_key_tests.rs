@@ -419,7 +419,7 @@ fn a_box_asked_again_after_work_waits_the_settle_again() {
     m.key_gates = vec![(0, 0), (2, 1)];
     m.stall_sleep = Some(settle);
     m.vanish_after = Some(1);
-    let mut s = session(&mut m, None);
+    let mut s = virtual_session(&mut m, None);
     s.set_box_settle(settle);
     let _ = s.supervise(&full_power_opts());
     drop(s);

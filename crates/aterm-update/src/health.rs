@@ -267,10 +267,9 @@ pub struct Health {
     /// on — in microseconds (0 when none has been recorded). Written by
     /// [`Self::record_handoff_park`].
     ///
-    /// The dry run of [`Self::handoff_capture_us`] cannot time the part of the
-    /// park that IS the freeze — stopping the readers — and that part is most of it
-    /// (measured 2026-09-26: a 1.1 ms capture inside a ~20 ms park). So the next
-    /// update seeds its first rung from the larger of the two.
+    /// The dry run of [`Self::handoff_capture_us`] cannot time stopping the
+    /// readers, which is most of the park (a 1.1 ms capture inside a ~20 ms
+    /// park), so the next update seeds its first rung from the larger of the two.
     #[serde(default)]
     pub handoff_park_us: u64,
     /// The build that was RUNNING when [`Self::handoff_park_us`] was recorded
@@ -1185,12 +1184,10 @@ mod tests {
         assert_eq!(h.kind, "pipeline", "named, not blanked");
     }
 
-    /// THE SPLICE THIS LEDGER USED TO REPORT. `failing_since` is any-class: it
-    /// stamps when the ledger stopped being clean and does not move again until it
-    /// is clean. A machine that had been failing to APPLY for days, and only later
-    /// met a bad manifest, therefore had its MANIFEST streak dated to the APPLY
-    /// streak's start — `update status` read "FAILING (6 consecutive checks since
-    /// <four days before the manifest problem existed>)". Each class owns its clock.
+    /// `failing_since` is any-class: it stamps when the ledger stopped being
+    /// clean and does not move again until it is clean. Each class owns its own
+    /// start-of-streak clock so a newer class's failure count is never paired
+    /// with an older class's start timestamp.
     #[test]
     fn each_failure_class_carries_its_own_clock() {
         let p = tmp("per-class-clock");
@@ -1261,11 +1258,8 @@ mod tests {
         );
     }
 
-    /// THE regression this class exists for. Through 2026-07 the apply lane failed
-    /// 100% of the time while the ledger read all-zero, because only the download
-    /// lane was recorded and every healthy check cleared everything. Assert the two
-    /// halves of the fix: apply failures are recorded, and a healthy CHECK does not
-    /// erase them.
+    /// Apply failures are recorded in `apply_failures`, and a healthy download
+    /// check clears only the acquisition streaks without erasing the apply streak.
     #[test]
     fn a_healthy_check_never_clears_the_apply_streak() {
         let p = tmp("apply-survives-check");
@@ -1404,10 +1398,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// An apply streak recorded by a DIFFERENT running build is proven stale
-    /// and expires; the same build's streak stands. The m3 field case: 2,191
-    /// counted failures presented as `persistent=true` on a machine that had
-    /// long since moved to the fixed build by manual install.
+    /// An apply streak recorded by a different running build is proven stale
+    /// and expires; the same build's streak stands.
     #[test]
     fn an_apply_streak_expires_once_a_different_build_is_running() {
         let p = tmp("apply-expiry");
@@ -1454,13 +1446,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// Every class that strands the machine escalates and names its own count:
-    /// `manifest` cannot heal on the client (an unsigned release stays unsigned until
-    /// it is republished), `stage` is an artifact that refuses to become a bundle.
-    /// `network` is the one class that must NOT alarm: it is transient and already
-    /// answered by slowing the cadence. Regression: the notice once took its count
-    /// from `pipeline_failures`, which is 0 for a manifest streak ("0 consecutive
-    /// checks").
+    /// Every class that strands the machine (`manifest`, `stage`, `pipeline`)
+    /// escalates and names its own count; `network` is transient and never
+    /// escalates.
     #[test]
     fn each_stranding_class_escalates_under_its_own_name_and_network_never_does() {
         for (class, escalates) in [

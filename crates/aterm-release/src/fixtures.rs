@@ -16,10 +16,14 @@
 //!   and removed after: `-p aterm-gui` resolves its dependencies' features apart from
 //!   `verify release`'s `--workspace` compile, so the two never share a unit, and a
 //!   whole-workspace compile beside the build is not short work.
-//! * [`land`], after the cut: one commit on origin/main's tip adding `vX.Y.0/`
-//!   and its `PINNED_DESKS` rows, pushed as a compare-and-swap like the claim's
-//!   ([`crate::ledger::claim`]). A tip that already holds them is a no-op, so a re-run
-//!   resumes.
+//!   The same run holds the desks to what the tree's handoff guard asks once they are
+//!   checked in, and writes the serde corpus's shipped-state answers file as it reads with
+//!   them ([`STAGED_ANSWERS`]).
+//! * [`land`], after the cut: one commit on origin/main's tip adding `vX.Y.0/`, its
+//!   `PINNED_DESKS` rows and its cases in the shipped-state corpus ([`SHIPPED_STATE_CORPUS`],
+//!   [`with_release_answers`]), so the commit that adds the desks leaves main's sweep of them
+//!   green, pushed as a compare-and-swap like the claim's ([`crate::ledger::claim`]). A tip
+//!   that already holds them is a no-op, so a re-run resumes.
 //!
 //! A staging is keyed by the reserved identity
 //! (`<cache>/handoff-fixtures/v<version>-<n>-<C12>/`) and its mark ([`STAGED_MARK`]) is
@@ -45,6 +49,19 @@ pub const GENERATOR_TESTS: [&str; 2] = ["generate_handoff_fixtures", "generate_r
 
 /// The mark a complete staging carries, written last: the identity it was written as.
 pub const STAGED_MARK: &str = "staged";
+
+/// The serde corpus's answers for every checked-in fixture
+/// (`serde_corpus_tests::state_written_by_shipped_producers_answers_as_recorded`): a release's
+/// desks are new cases in it, which its landing records.
+pub const SHIPPED_STATE_CORPUS: &str =
+    "crates/aterm-gui/tests/fixtures/serde-corpus/shipped-state.txt";
+
+/// The generator's copy of that file in a staging, beside `v<version>/`: the answers as the
+/// release's own models read the tree's fixtures with its desks checked in.
+pub const STAGED_ANSWERS: &str = "shipped-state.txt";
+
+/// The variable that names where the generator writes [`STAGED_ANSWERS`].
+pub const ANSWERS_OUT: &str = "ATERM_SHIPPED_STATE_OUT";
 
 /// The identity the fixtures are written as: what the shipped binary stamps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +108,8 @@ pub struct Staged {
     pub desks: Vec<String>,
     /// It holds `rendezvous.toml`.
     pub rendezvous: bool,
+    /// `<staging>/shipped-state.txt` ([`STAGED_ANSWERS`]).
+    pub answers: PathBuf,
     /// Written by this call (else found staged).
     pub fresh: bool,
 }
@@ -129,10 +148,12 @@ pub fn staged(root: &Path, pins: &Pins) -> Option<Staged> {
     }
     let dir = at.join(pins.tag());
     let desks = desks_in(&dir).ok()?;
-    (!desks.is_empty()).then(|| Staged {
+    let answers = at.join(STAGED_ANSWERS);
+    (!desks.is_empty() && answers.is_file()).then(|| Staged {
         rendezvous: dir.join("rendezvous.toml").is_file(),
         dir,
         desks,
+        answers,
         fresh: false,
     })
 }
@@ -165,8 +186,10 @@ pub fn generator_args() -> Vec<&'static str> {
 /// hand it any outcome.
 ///
 /// Refuses when the generator does not pass both its tests (one off macOS, which has no
-/// rendezvous), when a desk `REQUIRED_DESKS` asks of this release is missing, and when a
-/// desk's `parent.toml` was not written as `pins`.
+/// rendezvous; a desk the tree's guard cannot adopt as written fails the first), when a desk
+/// `REQUIRED_DESKS` asks of this release is missing, when a desk's `parent.toml` was not
+/// written as `pins`, and when it wrote no shipped-state answers for the release's desks
+/// ([`STAGED_ANSWERS`], at `$ATERM_SHIPPED_STATE_OUT`).
 ///
 /// # Errors
 /// Each refusal above, and a staging directory that cannot be written.
@@ -212,7 +235,8 @@ pub fn stage(
         .env("ATERM_BUILD_GIT_COMMIT_FULL", &pins.commit)
         .env("SOURCE_DATE_EPOCH", pins.build.to_string())
         .env("ATERM_HANDOFF_FIXTURE_OUT", &dir)
-        .env("ATERM_RENDEZVOUS_FIXTURE_OUT", &dir);
+        .env("ATERM_RENDEZVOUS_FIXTURE_OUT", &dir)
+        .env(ANSWERS_OUT, at.join(STAGED_ANSWERS));
     let outcome = run(&mut command);
     if let Err(error) = crate::gates::clear_path(&target) {
         println!(
@@ -280,6 +304,16 @@ pub fn stage(
     if cfg!(target_os = "macos") && !rendezvous {
         return Err(refuse("it wrote no rendezvous.toml".to_string()));
     }
+    let answers = at.join(STAGED_ANSWERS);
+    let prefix = format!("{}/", pins.tag());
+    if !fs::read_to_string(&answers).is_ok_and(|text| text.lines().any(|l| l.starts_with(&prefix)))
+    {
+        return Err(refuse(format!(
+            "it wrote no shipped-state answers for {}'s desks (${ANSWERS_OUT}, {})",
+            pins.tag(),
+            answers.display()
+        )));
+    }
     for desk in &desks {
         let parent = dir.join(desk).join("parent.toml");
         let text = fs::read_to_string(&parent).map_err(|e| io("cannot read", &parent, e))?;
@@ -303,6 +337,7 @@ pub fn stage(
         dir,
         desks,
         rendezvous,
+        answers,
         fresh: true,
     })
 }
@@ -380,6 +415,69 @@ pub fn with_pinned_rows(guard: &str, version: &str, desks: &[String]) -> Result<
         return Err(unreadable("the rows did not read back"));
     }
     Ok(out)
+}
+
+/// The shipped-state corpus `corpus` (as main holds it) with release `tag`'s cases recorded:
+/// the block of lines in `staged` (the generator's [`STAGED_ANSWERS`]) whose case ids name
+/// `tag`'s directory, put after the line `staged` puts them after, matched by case id (a
+/// comment line by its text), so an answer main re-recorded since the cut stays as main holds
+/// it. Beside it, how many cases it adds.
+///
+/// # Errors
+/// `staged` holds no case of `tag`, or holds them apart, or first; `corpus` records `tag`
+/// already, or holds no line, or more than one, with the case id they go after.
+pub fn with_release_answers(corpus: &str, staged: &str, tag: &str) -> Result<(String, usize)> {
+    let prefix = format!("{tag}/");
+    let refuse = |why: String| Error::new(format!("{tag}'s shipped-state answers: {why}"));
+    let key = |line: &str| line.split_once('\t').map_or(line, |(id, _)| id).to_string();
+    let lines: Vec<&str> = staged.lines().collect();
+    let first = lines
+        .iter()
+        .position(|line| line.starts_with(&prefix))
+        .ok_or_else(|| refuse("the staged answers hold no case of its desks".to_string()))?;
+    let count = lines[first..]
+        .iter()
+        .take_while(|line| line.starts_with(&prefix))
+        .count();
+    if lines[first + count..]
+        .iter()
+        .any(|line| line.starts_with(&prefix))
+    {
+        return Err(refuse(
+            "the staged answers hold its cases apart, not as one block".to_string(),
+        ));
+    }
+    let Some(before) = first.checked_sub(1).map(|at| key(lines[at])) else {
+        return Err(refuse(
+            "the staged answers put its cases before the file's header".to_string(),
+        ));
+    };
+    let mut out: Vec<&str> = corpus.lines().collect();
+    if out.iter().any(|line| line.starts_with(&prefix)) {
+        return Err(refuse(format!(
+            "{SHIPPED_STATE_CORPUS} records {tag} already"
+        )));
+    }
+    let anchors: Vec<usize> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| key(line) == before)
+        .map(|(at, _)| at)
+        .collect();
+    let [anchor] = anchors.as_slice() else {
+        return Err(refuse(format!(
+            "{SHIPPED_STATE_CORPUS} holds {} lines with the case id they go after ({before:?}), \
+             not one",
+            anchors.len()
+        )));
+    };
+    out.splice(
+        anchor + 1..anchor + 1,
+        lines[first..first + count].iter().copied(),
+    );
+    let mut text = out.join("\n");
+    text.push('\n');
+    Ok((text, count))
 }
 
 /// `base`'s tree (none: empty) with each `(path, blob)` of `files` set, at any depth, made
@@ -487,8 +585,38 @@ fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
-/// The commit that adds `staged` and its `PINNED_DESKS` rows on top of `tip`.
-fn fixture_commit(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins) -> Result<String> {
+/// What a landing did with the release's shipped-state answers ([`with_release_answers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answers {
+    /// Its this many cases recorded in [`SHIPPED_STATE_CORPUS`], in the commit with the desks.
+    Recorded(usize),
+    /// Left out, and why: the commit adds the desks alone, and main's sweep of the shipped
+    /// fixtures reads them as new cases until they are recorded by hand.
+    Unrecorded(String),
+}
+
+impl Answers {
+    fn words(&self) -> String {
+        match self {
+            Answers::Recorded(cases) => format!("with its {cases} shipped-state answers"),
+            Answers::Unrecorded(why) => format!(
+                "WITHOUT its shipped-state answers ({why}): main's \
+                 state_written_by_shipped_producers_answers_as_recorded fails until they are \
+                 recorded (ATERM_BLESS_SERDE_CORPUS=1 targo --unverified test -p aterm-gui --lib \
+                 -- state_written_by_shipped_producers)"
+            ),
+        }
+    }
+}
+
+/// The commit that adds `staged`, its `PINNED_DESKS` rows and, where `tip`'s corpus takes
+/// them, its shipped-state answers on top of `tip`.
+fn fixture_commit(
+    git: &dyn GitRunner,
+    tip: &str,
+    staged: &Staged,
+    pins: &Pins,
+) -> Result<(String, Answers)> {
     let guard = git_ok(
         git,
         &[
@@ -509,6 +637,23 @@ fn fixture_commit(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins) 
         })
         .collect();
     files.push((HANDOFF_FIXTURE_GUARD.to_string(), guard.into_bytes()));
+    let answers = fs::read_to_string(&staged.answers)
+        .map_err(|e| Error::new(format!("read {}: {e}", staged.answers.display())))
+        .and_then(|answers| {
+            let corpus = git_ok(
+                git,
+                &["cat-file", "blob", &format!("{tip}:{SHIPPED_STATE_CORPUS}")],
+            )?
+            .stdout_utf8();
+            with_release_answers(&corpus, &answers, &pins.tag())
+        });
+    let answers = match answers {
+        Ok((corpus, cases)) => {
+            files.push((SHIPPED_STATE_CORPUS.to_string(), corpus.into_bytes()));
+            Answers::Recorded(cases)
+        }
+        Err(why) => Answers::Unrecorded(why.to_string()),
+    };
     let mut blobs = Vec::new();
     for (path, bytes) in &files {
         let at = format!("--path={path}");
@@ -525,12 +670,22 @@ fn fixture_commit(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins) 
     let base = rev_parse(git, &format!("{tip}^{{tree}}"))?;
     let edits: Vec<(&str, &str)> = blobs.iter().map(|(p, b)| (*p, b.as_str())).collect();
     let tree = tree_with(git, Some(&base), &edits)?;
+    let recorded = match &answers {
+        Answers::Recorded(cases) => format!(
+            "Its {cases} cases in the serde corpus's sweep of every shipped\nproducer's bytes \
+             ({SHIPPED_STATE_CORPUS}),\nas its own cut's models read them, ride with them.\n"
+        ),
+        Answers::Unrecorded(why) => format!(
+            "Its cases in the serde corpus's sweep of every shipped producer's\nbytes \
+             ({SHIPPED_STATE_CORPUS})\nare NOT recorded here: {why}\n"
+        ),
+    };
     let message = format!(
         "test(handoff): {tag}'s producer fixtures, written by its own cut\n\n\
          {desks} desks{rendezvous} from build {build} ({short}), written before the claim \
          by the\nin-tree generator ({GENERATOR_SOURCE}) in the\nrelease's cut tree, and \
          the PINNED_DESKS rows that pin them. The next cut's\nhandoff fixture gate reads \
-         them ({HANDOFF_FIXTURE_README}).\n",
+         them ({HANDOFF_FIXTURE_README}).\n{recorded}",
         tag = pins.tag(),
         desks = staged.desks.len(),
         rendezvous = if staged.rendezvous {
@@ -541,12 +696,11 @@ fn fixture_commit(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins) 
         build = pins.build,
         short = pins.short(),
     );
-    Ok(
-        git_ok(git, &["commit-tree", &tree, "-p", tip, "-m", &message])?
-            .stdout_utf8()
-            .trim()
-            .to_string(),
-    )
+    let commit = git_ok(git, &["commit-tree", &tree, "-p", tip, "-m", &message])?
+        .stdout_utf8()
+        .trim()
+        .to_string();
+    Ok((commit, answers))
 }
 
 /// How [`land`] ended.
@@ -554,8 +708,13 @@ fn fixture_commit(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins) 
 pub enum Landed {
     /// origin/main held them already (at this tip): nothing was pushed.
     Already { tip: String, desks: Vec<String> },
-    /// This commit is origin/main now, pushed on the `attempt`th try.
-    Pushed { commit: String, attempt: u32 },
+    /// This commit is origin/main now, pushed on the `attempt`th try, with what it did with
+    /// the release's shipped-state answers.
+    Pushed {
+        commit: String,
+        attempt: u32,
+        answers: Answers,
+    },
 }
 
 impl Landed {
@@ -569,22 +728,28 @@ impl Landed {
                 desks.len(),
                 tip.get(..12).unwrap_or(tip)
             ),
-            Landed::Pushed { commit, attempt } => format!(
-                "{}'s handoff fixtures landed on main as {}{}",
+            Landed::Pushed {
+                commit,
+                attempt,
+                answers,
+            } => format!(
+                "{}'s handoff fixtures landed on main as {}{}, {}",
                 pins.tag(),
                 commit.get(..12).unwrap_or(commit),
                 if *attempt > 1 {
                     format!(" (try {attempt}: main moved meanwhile)")
                 } else {
                     String::new()
-                }
+                },
+                answers.words()
             ),
         }
     }
 }
 
 /// Land a staging on origin/main: fetch; when the tip already holds the release's fixtures
-/// ([`on_commit`]) do nothing; else commit `staged` and its `PINNED_DESKS` rows on the tip
+/// ([`on_commit`]) do nothing; else commit `staged`, its `PINNED_DESKS` rows and its
+/// shipped-state answers (where the tip's corpus takes them, [`with_release_answers`]) on the tip
 /// and push it as a fast-forward of main. A non-fast-forward rejection is a lost race:
 /// rebuild on the winner's tip, up to `max_attempts` tries; any other push failure stops at
 /// once. A push is verified as the claim's is: origin/main is the commit, or has it.
@@ -613,7 +778,7 @@ pub fn land(
                 desks: found.desks,
             });
         }
-        let commit = fixture_commit(git, &tip, staged, pins)?;
+        let (commit, answers) = fixture_commit(git, &tip, staged, pins)?;
         let push = git.git(&["push", "origin", &format!("{commit}:refs/heads/main")])?;
         if push.success() {
             git_ok(git, &["fetch", "origin", "main"])?;
@@ -629,7 +794,11 @@ pub fn land(
                      still missing"
                 )));
             }
-            return Ok(Landed::Pushed { commit, attempt });
+            return Ok(Landed::Pushed {
+                commit,
+                attempt,
+                answers,
+            });
         }
         let why = push.stderr_utf8().trim().to_string();
         let lost_race = why.contains("non-fast-forward")

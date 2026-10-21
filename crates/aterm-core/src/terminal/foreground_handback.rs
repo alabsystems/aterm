@@ -2,100 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Foreground handback: return the terminal to its host after the program
-//! that owned it lost the foreground without restoring what it negotiated.
+//! Foreground handback: restore program-negotiable terminal modes when an
+//! owning foreground process group exits without cleaning up.
 //!
-//! # Why
+//! At the byte offset where `tcgetpgrp` changes, the host calls
+//! [`Terminal::foreground_handback`] if a dead process group owned any
+//! input-hijacking mode bit ([`evidence::INPUT`]: mouse, kitty keyboard,
+//! modifyOtherKeys/formatOtherKeys, focus 1004, bracketed paste 2004, size
+//! 2048, color-scheme 2031). Display-only bits (`ALT_SCREEN`, `VT52`,
+//! `CURSOR_HIDDEN`, `SYNC`) do not trigger handback on their own so one-shot
+//! commands (`tput smcup`, `tput civis`) persist, but are reverted alongside
+//! an orphaned input bit.
 //!
-//! A killed program restores nothing. A Claude Code process killed while it
-//! held the alt screen, kitty flags, modifyOtherKeys 2, SGR any-motion mouse,
-//! 1004, 2004, 2026 and a hidden cursor left the reclaiming shell typing
-//! `ESC[<32;11;6M` on every mouse move and ringing the bell at every
-//! `ESC[55;5u` chord, behind an invisible cursor.
-//!
-//! # The mechanism
-//!
-//! The host (aterm-gui's PTY gather) samples `tcgetpgrp` on the master and
-//! cuts each read batch at the offset where the foreground process group
-//! changed. At exactly that offset — after every byte the old holder wrote,
-//! before any byte the new holder writes — the parse thread calls
-//! [`Terminal::foreground_handback`]. Because the cut is ordered IN the byte
-//! stream, the new holder's own mode setup (zsh's `ESC[?2004h`, fish's kitty
-//! push) lands AFTER the handback and survives it; a UI-side sweep would race
-//! it and undo the shell's own modes.
-//!
-//! # The gate
-//!
-//! A foreground change is a normal event (every command a shell runs starts and
-//! ends with one), so the handback acts only on EVIDENCE that the old holder
-//! left the terminal the way only a running program leaves it —
-//! [`Terminal::program_owns_terminal`]. A clean `vim`/`less`/`htop` exit, a
-//! `tput rmam`, `smkx`, `smacs` or `stty` leaves no evidence and is untouched;
-//! `tput smcup` and `tput civis` leave only display evidence and are
-//! untouched too (below).
-//!
-//! Evidence is necessary, not sufficient: the modes must also be ORPHANED —
-//! armed by a program that no longer exists. That half is the host's, because
-//! only the host knows which process group wrote which bytes and whether it
-//! is still alive. aterm-gui attributes each bit of
-//! [`Terminal::program_evidence`] to the foreground group whose bytes set it,
-//! and restores only when one of those groups' leaders is gone; a stopped job
-//! (Ctrl-Z), or a live `gdb -tui` that hands the terminal to its inferior, keeps
-//! its modes (stripping them would leave the job running without them after
-//! `fg`). [`Terminal::foreground_handback_scoped`] is the entry point that lets
-//! the host send the torn-sequence `CAN` alone.
-//!
-//! And the gone group must own an INPUT-HIJACKING bit ([`evidence::INPUT`]:
-//! mouse, kitty, modifyOtherKeys/formatOtherKeys, 1004, 2004, 2048, 2031). The
-//! display bits alone — alt screen, VT52, hidden cursor, 2026 — are what a
-//! one-shot command sets on purpose and then exits cleanly: `tput smcup; cmd;
-//! tput rmcup` and `tput civis` are kept (reverting them the moment `tput`
-//! exits would leave the wrapped `cmd` drawing on the main screen). RESIDUAL: a
-//! one-shot that arms an input bit on purpose (`/usr/bin/printf '\033[?1000h'`
-//! or `'\033[?2004h'`) is handed back when it exits — nothing tells a clean
-//! one-shot exit from a SIGKILL, and a mouse left reporting under the prompt is
-//! the failure above; and a program killed with
-//! only display modes armed (a SIGKILLed `less`) leaves them, as before the
-//! handback.
-//!
-//! 2004 is an input bit because it changes what a paste sends, and the host's
-//! multi-line paste guard reads it as the reader's promise to wait for Enter.
-//! PG1 (docs/AUDIT-side-effects-2026-10-07.md): a `cat` of a file that planted
-//! the clipboard with OSC 52 and armed 2004 under a reader that does not parse
-//! the brackets (`/bin/bash` 3.2, dash) turned the guard off for every later
-//! paste, and the reader ran each pasted line. zsh and bash 5.1+ arm it again
-//! at their next prompt, after the cut. RESIDUAL: a `?2004h` parsed while a
-//! long-lived holder or the shell itself holds the terminal (anything inside
-//! ssh, a background job's output, a `/bin/bash` 3.2 prompt printing a
-//! directory name raw, a builtin `printf`) is not handed back while that holder
-//! runs (ssh's only at its exit, the shell's never), and the paste guard trusts
-//! it.
-//!
-//! RESIDUAL, the late reader: the cut is placed where the host SAW the group
-//! change, so a starved reader that reads a holder's last bytes only after the
-//! shell took the terminal back parses them as the SHELL's. Late ARMING bytes
-//! (a one-shot's `?1000h`) make the shell their owner, and the one-shot loses
-//! its handback. Late RESET bytes are the mirror case: a clean exit whose own
-//! reset (a bare `vim -u NONE -c q` turning modifyOtherKeys off) lands after
-//! the cut is handed back there, so the modes end where the reset puts them
-//! anyway, but the timeline records a `modes-restored` the exit did not earn
-//! (3 of 160 runs at load 103-112, 2026-09-30).
-//!
-//! # The restore
-//!
-//! When the gate is open, every program-negotiable mode is returned to its
-//! power-on or host-configured value by feeding SYNTHESIZED BYTES through the
-//! real [`Terminal::process_at`]. The bytes are returned so the host can record
-//! them on the temporal spine (`RawIn`) and splice them into the cast/`bytes`
-//! taps at the cut: replaying the recording reproduces the live state exactly.
-//! A torn escape sequence (the program died mid-write) always gets a `CAN`,
-//! gate open or not, so the next holder's first byte is not swallowed.
-//!
-//! Never touched: cursor style/blink, SGR, palette and dynamic colours, titles,
-//! OSC 7/8 state (an open OSC 8 link is closed only by the manual reset,
-//! [`Terminal::manual_handback`]), tab stops, grid/scrollback/images, XTSAVE slots, bidi, modes
-//! 3/45 (2027 is permanently reset: a program cannot set it), the INACTIVE
-//! screen's kitty slot, and every host policy bit.
+//! Modes are restored by feeding synthesized reset bytes through
+//! [`Terminal::process_at`] and returning them so the host can record them in
+//! `RawIn` and cast taps. A mid-sequence parser always receives `CAN` (`0x18`),
+//! even when mode restoration is skipped ([`Terminal::foreground_handback_scoped`]).
 
 use core::fmt::Write as _;
 
@@ -324,34 +246,12 @@ impl Terminal {
         self.handback(owned, false)
     }
 
-    /// The manual reset: the same handback, requested by a person or operator
-    /// (the `reset` control verb, Edit ▸ Reset Terminal) rather than a
-    /// foreground change.
+    /// Manual terminal reset (`reset` control verb, Edit ▸ Reset Terminal).
     ///
-    /// It covers what the automatic gate cannot: modes armed before the
-    /// current holder (a live shell is never gone), a shifted charset left on,
-    /// an OSC 8 hyperlink a killed program left open, display modes a killed
-    /// `less` left, and foreground changes the sampler missed. Unlike DECSTR it
-    /// keeps the SGR pen and saved cursor and reports exactly what moved.
-    ///
-    /// It runs the byte plan of [`Self::foreground_handback_scoped`] without
-    /// the evidence gate (step 0's `CAN` if mid-sequence, steps 1-12 where the
-    /// live value differs from the host target, phase B), plus `OSC 8 ; ; ST`
-    /// when a hyperlink is open (`"hyperlink"`), plus the colour resets that
-    /// put back the theme colours a program set (OSC 4/10/11/12/17/19/21):
-    /// `OSC 104` for the palette and `OSC 110/111/112/117/119` for each
-    /// dynamic slot the program owns (`"colors"`). The colour stack (OSC
-    /// 30001) is kept: a running program's later pop is its own business. The
-    /// bytes go through [`Self::process_at`] so the host records them and
-    /// replay matches.
-    ///
-    /// It never clears the screen or scrollback or touches the SGR pen,
-    /// titles, tab stops or images; phase B puts the cursor back. The
-    /// alternate screen is left (`?1049l`). Run under a live TUI, it strips
-    /// that TUI's modes and colours too.
-    ///
-    /// Always returns a [`ForegroundHandback`]; its `bytes` are empty when the
-    /// terminal was already at its host defaults (nothing is processed then).
+    /// Runs the [`Self::foreground_handback_scoped`] byte plan unconditionally,
+    /// closes any open OSC 8 hyperlink (`"hyperlink"`), and resets program-overridden
+    /// palette/dynamic colors via `OSC 104/110/111/112/117/119` (`"colors"`),
+    /// while preserving the screen, scrollback, SGR pen, titles, and tab stops.
     pub fn manual_handback(&mut self) -> ForegroundHandback {
         self.handback(true, true).unwrap_or(ForegroundHandback {
             bytes: Vec::new(),

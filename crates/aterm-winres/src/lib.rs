@@ -1,41 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compile a Win32 resource script and link it into the calling package's
-//! binaries — the build-script step behind the shipped exe's icon, side-by-side
-//! manifest and `VS_VERSION_INFO` block.
+//! Compile a Win32 resource script (`.rc`) and emit `cargo:rustc-link-arg-bins`
+//! for the calling package's binaries.
 //!
-//! ## Why this is first-party
-//!
-//! `embed-resource` pulled `vswhom`/`vswhom-sys` on Windows-msvc hosts, which
-//! need `libc::wchar_t`/`wcslen`; `crates/aterm-libc` declares only the
-//! `core::ffi` primitives on Windows by design (`crates/aterm-libc-oracle`'s cell table).
-//! Build-dependencies compile for the HOST, so a cross build from a Mac never
-//! sees that graph (`verify cells`' `win` cell passes right through it):
-//! only a native Windows-msvc build breaks. Declaring `wchar_t`/`wcslen` in
-//! aterm-libc would trade its design for one build helper; dropping the helper
-//! cost nothing the product uses.
-//!
-//! ## What it does
-//!
-//! Exactly the three things a build script needs: pick a resource compiler for
-//! the TARGET (never the host — build scripts run on the host), run it on the
-//! `.rc`, and print `cargo:rustc-link-arg-bins=<artifact>` so the artifact
-//! reaches every `[[bin]]` of the calling package — and only those.
-//! `rc.exe` and `llvm-rc` produce a `.res` the MSVC and LLD linkers take on the
-//! command line as-is; `windres` produces a COFF object the GNU linker takes the
-//! same way.
-//!
-//! ## What it does not do
-//!
-//! No registry reads, no `vswhere`, no Visual Studio discovery. `rc.exe` is
-//! found on `PATH` (a Developer prompt / `vcvars64`, which is how
-//! `apps/aterm-win/build.ps1` runs), through the `WindowsSdkVerBinPath` variable
-//! `vcvars` exports, or by scanning the documented Windows Kits install root for
-//! the newest SDK. `ATERM_RC` names a compiler explicitly when none of those
-//! apply. A machine with no resource compiler gets an [`Outcome`] the caller
-//! turns into a warning or an error (`crates/aterm/build.rs`), never a silent
-//! no-op.
+//! Selects a resource compiler for the target (`rc.exe` or `llvm-rc` producing
+//! `.res` for MSVC/LLD; `windres` producing COFF `.o` for GNU), searching
+//! `ATERM_RC`, `PATH`, `WindowsSdkVerBinPath`, and the Windows Kits install root
+//! (newest SDK first). Returns an [`Outcome`] so callers can warn or fail when
+//! no compiler is found.
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: a build-script step"

@@ -117,18 +117,21 @@ impl Log {
         // the byte bound: neither can be refused.
         let _ = f.set(Key::Why, Val::Word(why.word()));
         let _ = f.set(Key::After, Val::U(after));
-        self.push(Rec {
-            seq: 0,
-            t: at.wall_ms,
-            op: Op::Gap,
-            node: Node::SESSION,
-            par: None,
-            k: Kind::Gap,
-            src: Src::Aterm,
-            conf: Conf::Exact,
-            by: Actor::Aterm,
-            f,
-        })
+        self.push(
+            Rec {
+                seq: 0,
+                t: at.wall_ms,
+                op: Op::Gap,
+                node: Node::SESSION,
+                par: None,
+                k: Kind::Gap,
+                src: Src::Aterm,
+                conf: Conf::Exact,
+                by: Actor::Aterm,
+                f,
+            },
+            at.mono_ms,
+        )
     }
 
     /// The read-only log of a journal read's image (module docs): its
@@ -281,7 +284,9 @@ impl Log {
             _ => {}
         }
         self.last_seq = rec.seq.saturating_sub(1);
-        self.push(rec);
+        // A journal holds no process-clock reading (6F-1): a record read back
+        // from one was appended by a process whose clock this one cannot read.
+        self.push(rec, 0);
     }
 
     /// `n` leaves the open set at the close record `seq` (its own, or an

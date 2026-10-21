@@ -77,7 +77,9 @@ impl LayoutWork {
         }
     }
 
-    /// Whether a walk ran past the budget.
+    /// Whether a walk ran past the budget. Only the hinter asks, so it is
+    /// built where the hinter is (`autohint`'s cfg).
+    #[cfg(any(feature = "hint", debug_assertions))]
     pub(crate) fn refused(&self) -> bool {
         self.refused.get()
     }

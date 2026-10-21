@@ -4,7 +4,11 @@
 //! The byte stream under the HTTP layer: TCP, optionally wrapped in TLS, with
 //! a global deadline and a revocable authority checked on every I/O step.
 //!
-//! # The authority guard
+//! The title-summary worker's authority can be revoked from the UI thread while
+//! a request is in flight, and DNS, `connect`, proxy negotiation and the TLS
+//! handshake can each block for seconds, so one check at the top is nearly
+//! meaningless. [`Guard`] is re-checked at every read and write: the points
+//! where terminal context could leave the process or a response be admitted.
 //!
 //! A caller's permission to speak can be revoked from another thread WHILE a
 //! request is in flight (whatever asked for the request goes away, or the
@@ -118,15 +122,13 @@ pub struct TcpConnector;
 impl Connect for TcpConnector {
     fn connect(&self, host: &str, port: u16, deadline: Deadline) -> io::Result<TcpStream> {
         use std::net::ToSocketAddrs;
-        // Check the budget BEFORE resolving: `to_socket_addrs` is a blocking
-        // system call with no timeout of its own, so an already-expired request
-        // must not enter it.
+        // `to_socket_addrs` blocks with no timeout of its own: an expired
+        // request must not enter it.
         deadline.remaining_or_timeout()?;
         let addrs = (host, port).to_socket_addrs()?;
         let mut last = None;
         for addr in addrs {
-            // Re-derive per address: three dead addresses must not each get the
-            // full budget, or the global timeout would be a per-address one.
+            // Re-derive per address, or the global timeout is a per-address one.
             let budget = deadline.remaining_or_timeout()?;
             match TcpStream::connect_timeout(&addr, budget) {
                 Ok(stream) => {
@@ -143,15 +145,8 @@ impl Connect for TcpConnector {
 }
 
 /// A socket carrying the request's deadline and authority, re-checked before
-/// EVERY call made on it.
-///
-/// Both arms of [`Stream`] own their socket through this, and for TLS it is
-/// the socket `rustls` itself reads and writes: `complete_io` and an
-/// established stream's `read` are loops, not steps, so a check made once
-/// before handing control to rustls bounds one of the many socket calls rustls
-/// then makes (see the module docs). Here the check sits in front of each of
-/// them, so the global deadline and a revocation hold inside those loops as
-/// they do between them.
+/// every call made on it. Both arms of [`Stream`] own their socket through
+/// this; under TLS it is the socket rustls itself drives (see the module docs).
 struct Bounded {
     sock: TcpStream,
     guard: Arc<dyn Guard>,
@@ -167,10 +162,8 @@ impl Bounded {
         self.deadline.remaining_or_timeout()
     }
 
-    /// [`Self::admit`], then the REMAINING budget as the timeout of the one
-    /// socket direction the coming call uses. Monotone by construction: the
-    /// budget only shrinks, so no call can outlive the deadline by more than
-    /// itself.
+    /// [`Self::admit`], then the remaining budget as the read timeout. The
+    /// budget only shrinks, so no call outlives the deadline by more than itself.
     fn admit_read(&self) -> io::Result<()> {
         let budget = self.admit()?;
         self.sock.set_read_timeout(Some(budget))
@@ -185,12 +178,10 @@ impl Bounded {
 
 /// Normalise a socket-timeout error into the deadline error.
 ///
-/// A blocking socket that hits `SO_RCVTIMEO` reports `WouldBlock` on Unix and
-/// `TimedOut` on Windows. The only timeout this socket ever carries IS the
-/// remaining global budget, so either kind means the same thing and callers
-/// should not have to know the platform to see it. (It also matters inside
-/// `complete_io`, which treats `WouldBlock` as "come back later" rather than as
-/// a failure.)
+/// `SO_RCVTIMEO` reports `WouldBlock` on Unix and `TimedOut` on Windows; the
+/// only timeout this socket carries is the remaining global budget, so both
+/// mean the deadline. It matters inside `complete_io` too, which treats
+/// `WouldBlock` as "come back later".
 fn as_deadline_timeout(error: io::Error) -> io::Error {
     match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
@@ -244,9 +235,8 @@ impl Stream {
 
     /// Complete a TLS handshake over an established connection.
     ///
-    /// `server_name` is the identity the certificate is checked against — the
-    /// ORIGIN host, even when the bytes travel through a proxy tunnel, so a
-    /// proxy cannot substitute its own certificate.
+    /// `server_name` is the origin host even through a proxy tunnel, so a proxy
+    /// cannot substitute its own certificate.
     ///
     /// # Errors
     ///
@@ -271,26 +261,21 @@ impl Stream {
                 deadline,
             },
         ));
-        // Drive the handshake now so a certificate failure surfaces here rather
-        // than as a confusing short write later. The socket rustls drives is
-        // `Bounded`, so the deadline and the guard hold for every syscall the
-        // handshake makes, however many `complete_io` loops over.
+        // Drive the handshake now so a certificate failure surfaces here, not as
+        // a confusing short write later. `Bounded` holds deadline and guard for
+        // every syscall the handshake makes.
         let rustls::StreamOwned { conn, sock } = &mut *tls;
         while conn.is_handshaking() {
             let (read, wrote) = conn.complete_io(sock).map_err(|error| {
-                // A revoked guard and a spent deadline both surface from
-                // inside `complete_io` as plain io errors. Keep their kinds
-                // — callers match on `PermissionDenied` to tell revocation
-                // from a network fault — and wrap only real TLS failures.
+                // Keep the revocation and deadline kinds callers match on;
+                // wrap only real TLS failures.
                 match error.kind() {
                     io::ErrorKind::PermissionDenied | io::ErrorKind::TimedOut => error,
                     _ => io::Error::other(format!("TLS handshake failed: {error}")),
                 }
             })?;
-            // NEITHER direction moving while still handshaking means the
-            // peer went away; surface it rather than spin on a dead socket.
-            // Testing only the write side would loop forever against a peer
-            // that accepts our flight and then stops talking.
+            // Neither direction moving mid-handshake means the peer went away;
+            // testing only writes would spin against a peer that went silent.
             if read == 0 && wrote == 0 && conn.is_handshaking() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -303,11 +288,9 @@ impl Stream {
         })
     }
 
-    /// Take the raw socket back out of a PLAINTEXT stream.
-    ///
-    /// Used once, by the proxy path: after `CONNECT` succeeds the same socket
-    /// has to be handed to the TLS handshake. `None` for a stream already under
-    /// TLS — unwrapping an established TLS session would discard its state.
+    /// Take the raw socket back out of a plaintext stream, for the TLS handshake
+    /// after a proxy `CONNECT`. `None` under TLS, whose session state it would
+    /// discard.
     #[must_use]
     pub fn into_tcp(self) -> Option<TcpStream> {
         match self.inner {
@@ -325,10 +308,8 @@ impl Stream {
     }
 }
 
-// The guard and the deadline are checked HERE as well as in front of every
-// socket call: rustls can answer a read from plaintext it already holds, and
-// accept a write into its buffer, without touching the socket at all, and a
-// revoked or expired request must do neither.
+// Checked here as well as before every socket call: rustls can answer a read
+// from plaintext it holds, or buffer a write, without touching the socket.
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.socket().admit()?;
@@ -414,8 +395,7 @@ mod tests {
 
     #[test]
     fn a_revoked_guard_stops_writes_and_reads_on_an_open_socket() {
-        // The socket is healthy; only authority changed. This is the case a
-        // top-of-request check would miss.
+        // The socket is healthy; only authority changed.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let accepted = std::thread::spawn(move || listener.accept().unwrap().0);

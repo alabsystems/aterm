@@ -462,10 +462,10 @@ fn foreground_handback_main_screen_kitty_flags_under_the_alt_screen_are_evidence
     );
 }
 
-/// PG1 (docs/AUDIT-side-effects-2026-10-07.md): a `cat` of a file at a prompt
-/// that does not parse the brackets (macOS `/bin/bash` 3.2, dash) plants the
-/// clipboard with OSC 52 and arms 2004. Left on, the next Cmd-V skipped the
-/// multi-line paste guard, and bash ran every pasted line. The `?2004h` is an
+/// A `cat` of a file at a prompt
+/// that does not parse the brackets (macOS `/bin/bash` 3.2, dash) can plant the
+/// clipboard with OSC 52 and arm 2004. Left on, the next Cmd-V would skip the
+/// multi-line paste guard. The `?2004h` is an
 /// input bit, so `cat`'s exit hands it back.
 #[test]
 fn foreground_handback_a_one_shot_that_armed_bracketed_paste_is_handed_back() {
@@ -543,7 +543,7 @@ fn manual_handback_reaches_what_the_evidence_gate_cannot() {
     );
 }
 
-/// The live-6874 state: every input-hijacking mode goes, the alt screen is
+/// Every input-hijacking mode goes, the alt screen is
 /// left, the cursor shows, and neither the scrollback nor the main screen
 /// loses a line. Ctrl+7 reaches the prompt as the legacy byte, not CSI-u.
 #[test]

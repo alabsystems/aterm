@@ -39,7 +39,12 @@
 //! - `turn-mail` (6A-6): a mail mark on the open turn (`src=aterm
 //!   conf=exact`), as `transcript_replays` writes one by hand. No host
 //!   writes mail under a turn (the fabric's marks are the session's), so
-//!   it only fills the turn's `mail=` rollup; a record of the log alone.
+//!   it only fills the turn's `mail=` rollup; a record of the log alone;
+//! - `program <state> [ask=<w>]` (phase 6, 6F-4): the program's own report
+//!   (OSC 7501) as aterm-gui writes it, `mark <run|-> program state=<w>
+//!   [ask=<w>] src=engine conf=claim` on the open run (the session's when
+//!   none is); a record of the log alone, which the fold never reads
+//!   ([`program_marks_interleaved_fold_to_the_same_lines`]).
 //!
 //! The SCREEN rig is `conformance_turn`'s: every step is a model step,
 //! checked against the derived `TurnTracker` model as `drive` checks it
@@ -74,7 +79,8 @@
 //!
 //! - `expect <op> <node> <kind> [<k=v>…]`: the next record of its
 //!   `(op, level)` pair has been appended and matches: op, node and kind,
-//!   and each token exactly (`at=<ms>` stands for `t=<WALL0+ms>`; `by=-`
+//!   and each token exactly (`@<ms>` stands for `t=<WALL0+ms>`, so a
+//!   record's own `at=` field is a token like any other; `by=-`
 //!   for no `by=` token: attributed to nobody). EXACT
 //!   (T4): at the end, every pair a file names holds exactly the records
 //!   the file expects of it, so a tracker that splits one turn into two
@@ -189,6 +195,11 @@ pub enum Ev {
     Human,
     /// `turn-mail`: a mail mark on the open turn, by hand (6A-6).
     TurnMail,
+    /// `program <state> [ask=<w>]`: the program's own report (6F-4).
+    Program {
+        state: String,
+        ask: Option<String>,
+    },
     /// `close-run <out>`: the agent's run closes (6A-6).
     CloseRun(RunOut),
     Handoff(bool),
@@ -505,7 +516,7 @@ fn expect(rest: &str) -> Result<Expect, String> {
             }
             let toks = toks
                 .iter()
-                .map(|t| match t.strip_prefix("at=") {
+                .map(|t| match t.strip_prefix('@') {
                     Some(ms) => num(ms).map(|ms| format!("t={}", WALL0 + ms)),
                     None if t.contains('=') => Ok((*t).to_string()),
                     None => Err(format!("`{t}` is no k=v token")),
@@ -575,6 +586,22 @@ fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
         }
         ["human"] => Ok(Ev::Human),
         ["turn-mail"] => Ok(Ev::TurnMail),
+        ["program", state, rest @ ..] => {
+            let (opts, bare) = split_opts(rest);
+            if let Some(k) = opts.keys().find(|k| **k != "ask") {
+                return Err(format!("`{k}=` is no option of `program`"));
+            }
+            if !bare.is_empty() {
+                return Err(format!("`{bare:?}` after `program {state}`"));
+            }
+            let ask = opts.get("ask").map(|a| (*a).to_string());
+            program_mark(state, ask.as_deref(), Node::SESSION)
+                .map_err(|e| format!("`program {state}`: {e:?}"))?;
+            Ok(Ev::Program {
+                state: (*state).to_string(),
+                ask,
+            })
+        }
         ["close-run", out] => {
             let o = [
                 RunOut::Ok,
@@ -653,10 +680,30 @@ fn mail_mark(kind: &str, off: u64) -> Result<Mark, aterm_slog::FieldError> {
         .fields(f))
 }
 
-/// A step that writes into the log alone (`mail`, `human`, `turn-mail`):
-/// `true` when `ev` is one, written at `stamp`.
+/// The program's own report at `node`, as aterm-gui's sweep writes it
+/// (`SessionLog::observe_program`, under its bucket's rate).
+fn program_mark(
+    state: &str,
+    ask: Option<&str>,
+    node: Node,
+) -> Result<Mark, aterm_slog::FieldError> {
+    let mut f = Fields::new().word(Key::State, state)?;
+    if let Some(a) = ask {
+        f = f.word(Key::Ask, a)?;
+    }
+    Ok(Mark::new(Kind::Program, Src::Engine, Conf::Claim)
+        .at(node)
+        .fields(f))
+}
+
+/// A step that writes into the log alone (`mail`, `human`, `turn-mail`,
+/// `program`): `true` when `ev` is one, written at `stamp`.
 fn log_only(log: &mut Log, ev: &Ev, stamp: aterm_slog::Stamp) -> Result<bool, String> {
     let mark = match ev {
+        Ev::Program { state, ask } => {
+            let node = log.deepest_open(Lvl::Run).unwrap_or(Node::SESSION);
+            program_mark(state, ask.as_deref(), node).map_err(|e| format!("{e:?}"))?
+        }
         Ev::Mail { kind, off } => mail_mark(kind, *off).map_err(|e| format!("{e:?}"))?,
         Ev::Human => Mark::new(Kind::Human, Src::Input, Conf::Strong)
             .at(Node::SESSION)
@@ -909,7 +956,7 @@ impl TxRig {
                 );
                 self.took(format!("{} ctl cause={cause}", self.now), seq0);
             }
-            Ev::Mail { .. } | Ev::Human | Ev::TurnMail => {
+            Ev::Mail { .. } | Ev::Human | Ev::TurnMail | Ev::Program { .. } => {
                 log_only(&mut self.log, ev, stamp)?;
             }
             Ev::CloseRun(out) => {
@@ -2163,6 +2210,67 @@ fn a_tracker_that_opens_a_second_turn_fails_the_exact_lists() {
     );
 }
 
+/// A RECORD'S OWN `at=` FIELD AND THE LINE'S INSTANT ARE APART (6F-2's
+/// appended wire key `at`): `@<ms>` is the instant (`t=<WALL0+ms>`) and
+/// `at=<n>` a field token like any other, so a file can expect a record
+/// that carries `at=` (6F-7's render row). A wrong field value, and a wrong
+/// instant, each fail the match. NEGATIVE CONTROL (scratch, the lander's):
+/// the grammar's old instant token, `at=<ms>` read as `t=`, fails this.
+#[test]
+fn an_expect_names_a_records_at_field_apart_from_its_instant() {
+    let mut log = Log::new(1);
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        Fields::new(),
+        at(0),
+    )
+    .expect("the session opens");
+    let f = Fields::new()
+        .with(Key::At, aterm_slog::Val::U(5))
+        .expect("at=");
+    log.mark(
+        Mark::new(Kind::Render, Src::Aterm, Conf::Exact)
+            .at(Node::SESSION)
+            .fields(f),
+        at(7),
+    )
+    .expect("the mark");
+    let rec = log.window().last().expect("a record").clone();
+    let line = enc(&rec);
+    assert!(line.contains(" at=5 "), "{line}");
+    let Expect::Rec {
+        op,
+        node,
+        kind,
+        toks,
+        ..
+    } = expect("mark - render at=5 @7").expect("parses")
+    else {
+        panic!("a record expect");
+    };
+    assert_eq!(toks, ["at=5".to_string(), format!("t={}", WALL0 + 7)]);
+    assert!(matches(&line, op, &node, kind, &toks), "{line}");
+    for wrong in ["mark - render at=7 @7", "mark - render at=5 @5"] {
+        let Expect::Rec {
+            op,
+            node,
+            kind,
+            toks,
+            ..
+        } = expect(wrong).expect("parses")
+        else {
+            panic!("a record expect");
+        };
+        assert!(
+            !matches(&line, op, &node, kind, &toks),
+            "{wrong} matched {line}"
+        );
+    }
+}
+
 /// NEGATIVE CONTROL (T4, T5): a wrong `expect` of each kind, planted in a
 /// file that passes, fails it: the matcher reads every check, a record's
 /// tokens as much as its place, and a pair's list is exact.
@@ -2391,4 +2499,117 @@ fn an_expect_at_an_instant_is_checked_at_it() {
         at.trace.iter().any(|t| t.text.starts_with("at 5000")),
         "the wait is traced at its line"
     );
+}
+
+/// `seq` with a `program` step before each of its steps (the program's own
+/// report: `working`, `blocked ask=permission`, `done`, in turn), and its
+/// record and `lost=` checks left out: what the program marks add.
+fn interleaved(seq: &Seq) -> Seq {
+    const REPORTS: [(&str, Option<&str>); 3] = [
+        ("working", None),
+        ("blocked", Some("permission")),
+        ("done", None),
+    ];
+    let mut out = seq.clone();
+    out.name = format!("{} with program marks", seq.name);
+    out.lines.clear();
+    for (i, line) in seq.lines.iter().enumerate() {
+        match &line.ev {
+            Ev::Expect(Expect::Rec { .. } | Expect::Lost(_)) => continue,
+            Ev::Expect(_) | Ev::Nothing => {}
+            _ => {
+                let (state, ask) = REPORTS[i % REPORTS.len()];
+                out.lines.push(Line {
+                    no: line.no,
+                    text: format!("program {state}"),
+                    at: None,
+                    ev: Ev::Program {
+                        state: state.to_string(),
+                        ask: ask.map(str::to_string),
+                    },
+                });
+            }
+        }
+        out.lines.push(line.clone());
+    }
+    out
+}
+
+/// A record line without its seq (its first token), and `None` for a
+/// program mark. A handoff's `carried=` (the records that crossed, the
+/// program marks among them) is left out too.
+fn unnumbered(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once(' ')?;
+    let toks: Vec<&str> = rest.split(' ').collect();
+    match toks.as_slice() {
+        ["mark", _, "program", ..] => None,
+        ["mark", "-", "handoff", ..] => Some(
+            toks.iter()
+                .filter(|t| !t.starts_with("carried="))
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => Some(rest.to_string()),
+    }
+}
+
+/// One host call as [`folded`] compares it: its name, the model state after
+/// it, and the records it appended ([`unnumbered`]).
+type FoldedCall = (String, Option<State>, Vec<String>);
+
+/// A path's host calls and final window, seqs aside and program marks out.
+fn folded(p: &seq_twins::Path) -> (Vec<FoldedCall>, Vec<String>) {
+    let steps = p
+        .steps
+        .iter()
+        .map(|t| {
+            (
+                t.step.clone(),
+                t.state.clone(),
+                t.lines.iter().filter_map(|l| unnumbered(l)).collect(),
+            )
+        })
+        .collect();
+    (
+        steps,
+        p.lines.iter().filter_map(|l| unnumbered(l)).collect(),
+    )
+}
+
+/// A `.seq` WITH PROGRAM MARKS INTERLEAVED FOLDS TO THE SAME LINES (phase 6,
+/// 6F-4; ruling U17: the fold never reads a program mark). Every corpus
+/// file on a session's ring whose steps name no record by its seq
+/// (`ctl cause=`), replayed with a `program` step before each of its steps,
+/// takes the same path: the same host calls, the same model state after
+/// each, the same records appended by each (their seqs aside), the same
+/// final window less the program marks; and its checkpoints of the fold and
+/// the tracker (`turn=`, `need=`, `clause=`, `wake=`, `link=`, `tx`) hold
+/// as written. NEGATIVE CONTROL (scratch, 6F-4's commit): a fold that reads
+/// a program mark (one that drops the open needs on it) fails it.
+#[test]
+fn program_marks_interleaved_fold_to_the_same_lines() {
+    let mut ran = 0;
+    let mut marks = 0;
+    for seq in corpus() {
+        if seq.ring.is_some() || seq.lines.iter().any(|l| matches!(l.ev, Ev::CtlCaused(_))) {
+            continue;
+        }
+        let twin = interleaved(&seq);
+        let plain = seq_twins::seq_path(&seq).expect("the file replays");
+        let with = seq_twins::seq_path(&twin).unwrap_or_else(|e| panic!("{e}"));
+        let (a, b) = (folded(&plain), folded(&with));
+        if let Some((i, (x, y))) = a.0.iter().zip(&b.0).enumerate().find(|(_, (x, y))| x != y) {
+            panic!(
+                "{}: host call {i} differs:\n  plain: {x:?}\n  with:  {y:?}",
+                seq.name
+            );
+        }
+        assert_eq!(a.0.len(), b.0.len(), "{}: the host calls", seq.name);
+        assert_eq!(a.1, b.1, "{}: the final window", seq.name);
+        marks += with.lines.len() - b.1.len();
+        ran += 1;
+    }
+    assert!(ran >= 60, "{ran} files compared");
+    assert!(marks > 0, "no program mark stayed in any window");
 }

@@ -9,12 +9,12 @@
 //! and byte for byte, so an offset found in one reads the same place in the
 //! other:
 //!
-//! * the CODE view: comments and literal contents blanked to spaces. A string
+//! * the code view: comments and literal contents blanked to spaces. A string
 //!   that opens and closes on one line keeps its two `"`, so
 //!   `#[cfg(all(test, feature = "x"))]` still parses as a gate and a call's
 //!   literal argument still shows where it sits; a multi-line string loses
 //!   them, so no line-based reader sees a stray quote.
-//! * the TEXT view: comments blanked, literals intact, for the rules whose
+//! * the text view: comments blanked, literals intact, for the rules whose
 //!   subject is a literal (a `/dev/` path, a framework name, a request string).
 //!
 //! Every delimiter is ASCII, so a blanked span always covers whole UTF-8

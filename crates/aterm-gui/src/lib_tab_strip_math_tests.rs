@@ -6,18 +6,15 @@ use crate::tab_bar;
 use aterm_core::terminal::Terminal;
 use aterm_render::RenderInput;
 
-/// `pixel_to_term_cell` over an 8×16 cell, 24×80 grid: the strip, the padding,
-/// the independent top pad and the chrome headroom each compose on the axes
-/// they own. Every row is a (label, x, y, strip_rows, pad, pad_top, head) →
-/// (row, col) case; `strip_rows == 0 && pad == 0 && head == 0` is the
-/// byte-identical pre-strip path (`y / ch`, no offset).
+/// `pixel_to_term_cell` over an 8×16 cell, 24×80 grid: the strip, the padding, the
+/// independent top pad and the chrome headroom each compose on the axes they own.
 #[test]
 fn pixel_to_term_cell_composes_strip_pad_top_pad_and_headroom() {
     // (label, x, y, strip_rows, pad, pad_top, head) → (row, col)
     type Row = (&'static str, f64, f64, u16, usize, usize, usize, (u16, u16));
     #[rustfmt::skip]
     let rows: [Row; 13] = [
-        // No strip, no pad, no headroom: the exact pre-strip math.
+        // No strip, pad or headroom: plain division.
         ("no strip: the origin", 0.0, 0.0, 0, 0, 0, 0, (0, 0)),
         ("no strip: y=32 → row 2 (32/16), x=24 → col 3 (24/8)", 24.0, 32.0, 0, 0, 0, 0, (2, 3)),
         // A strip shifts the terminal region down by strip·ch.
@@ -27,11 +24,11 @@ fn pixel_to_term_cell_composes_strip_pad_top_pad_and_headroom() {
         // Inside the strip clamps to row 0 — the safety net; the caller
         // intercepts strip clicks through `strip_col_for_pixel` first.
         ("inside the 1-row strip (y=8) clamps to row 0", 0.0, 8.0, 1, 0, 0, 0, (0, 0)),
-        // The chrome HEADROOM composes on y only: x is not head-inset.
+        // The chrome headroom composes on y only.
         ("head 30: a click in the band clamps to row 0, col from raw x", 24.0, 10.0, 0, 0, 0, 30, (0, 3)),
         ("head 30: y = head + 2·ch → row 2", 0.0, 62.0, 0, 0, 0, 30, (2, 0)),
-        // PADDING is stripped from both axes before the strip offset: the
-        // first terminal cell sits at y = pad + strip·ch, x = pad.
+        // Padding comes off both axes before the strip offset: the first terminal cell
+        // sits at y = pad + strip·ch, x = pad.
         ("pad 8 + 1-row strip: the first terminal cell", 8.0, 24.0, 1, 8, 8, 0, (0, 0)),
         ("pad 8 + 1-row strip: one row deeper, three cols right", 32.0, 40.0, 1, 8, 8, 0, (1, 3)),
         // The top pad is independent: pad_top 8 < pad 12 moves the grid's
@@ -49,10 +46,9 @@ fn pixel_to_term_cell_composes_strip_pad_top_pad_and_headroom() {
     }
 }
 
-/// `strip_col_for_pixel` over an 8×16 cell, 80-column grid: a pixel in the
-/// strip's band returns its column (clamped to the last one), a pixel below
-/// the band returns `None`, and the pad and headroom move the band. Every row
-/// is a (label, x, y, strip_rows, pad, pad_top, head) → column case.
+/// `strip_col_for_pixel` over an 8×16 cell, 80-column grid: a pixel in the strip's band
+/// returns its column (clamped to the last), one below it `None`; pad and headroom move
+/// the band.
 #[test]
 fn strip_col_for_pixel_hits_only_the_strip_band() {
     // (label, x, y, strip_rows, pad, pad_top, head) → column
@@ -90,11 +86,8 @@ fn strip_col_for_pixel_hits_only_the_strip_band() {
     }
 }
 
-/// `prepend_strip_rows` shifts a terminal frame down by the strip rows: the
-/// terminal content lands `strip` rows lower, the cursor moves down with it, the
-/// row count grows, and every per-row vector stays aligned (cells/clusters/
-/// combining/images/line_sizes/line_size_spans/default_bg_spans all gain
-/// `strip` leading rows).
+/// `prepend_strip_rows` shifts a terminal frame down by the strip rows: content and cursor
+/// move down, the row count grows, and every per-row vector gains `strip` leading rows.
 #[test]
 fn prepend_shifts_content_and_cursor_down() {
     // A 2x4 terminal frame with a cursor at row 1.
@@ -121,8 +114,8 @@ fn prepend_shifts_content_and_cursor_down() {
         color2: 0,
         alpha2: 0,
     });
-    // A second glow quad inside the grid (y=40 ≥ 16): pixel y still untouched,
-    // but its row TAG shifts with the splice like the grid content it lights.
+    // A second glow quad inside the grid (y=40 ≥ 16): pixel y still untouched, but its
+    // row tag shifts with the grid content it lights.
     frame.cursor_glow_add.push(aterm_render::GlowQuad {
         row: 1,
         x: 0,
@@ -130,7 +123,6 @@ fn prepend_shifts_content_and_cursor_down() {
         w: 1,
         h: 1,
         color: 0,
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: 0,
         alpha2: 0,
@@ -147,8 +139,7 @@ fn prepend_shifts_content_and_cursor_down() {
         col: 2,
         color: [1, 2, 3],
     });
-    // A peeking-cat quad (row band + pixel-y dest rect) must shift both,
-    // exactly like the aurora — the single splice rule (§2.4/§11).
+    // A peeking-cat quad (row band plus pixel-y dest rect) shifts both.
     frame.cat_quads.push(aterm_render::SpriteQuad {
         row: 1,
         x: 3,
@@ -163,9 +154,8 @@ fn prepend_shifts_content_and_cursor_down() {
         alpha: 255,
         flip_x: false,
     });
-    // A free-overlay sprite (overlay Phase 3: pure pixel rect, NO row
-    // tag, signed off-grid origin) must shift its dest y alone — the
-    // FreeSprite arm of the same single splice rule.
+    // A free-overlay sprite (a pixel rect, no row tag, signed origin) shifts its dest y
+    // alone.
     frame.free_sprites.push(aterm_core::render::FreeSprite {
         x: 3,
         y: -7, // peeking in from above row 0: the signed case survives
@@ -213,9 +203,8 @@ fn prepend_shifts_content_and_cursor_down() {
         (0, 8),
         "splice never touches source texels"
     );
-    // The free sprite's signed dest y moved by `strip · cell_h` (−7 → 9);
-    // extents and source texels untouched (the dirty row-union re-derives
-    // its covered bands from the shifted extent).
+    // The free sprite's signed dest y moved by `strip · cell_h` (−7 → 9); extents and
+    // source texels are untouched.
     assert_eq!(frame.free_sprites[0].y, -7 + 16);
     assert_eq!(frame.free_sprites[0].x, 3, "x is not a strip axis");
     assert_eq!(
@@ -266,7 +255,6 @@ fn prepend_multi_row_strip_tags_by_pixel_band() {
             w: 1,
             h: 1,
             color: 0,
-            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: 0,
             alpha2: 0,
@@ -298,7 +286,7 @@ fn end_to_end_strip_above_terminal() {
     let mut frame = RenderInput::empty();
     term.cell_frame_into(&mut frame, 3, cols);
     let term_cursor_row = frame.cursor_row;
-    // Build the strip exactly like splice_tab_strip: 2 tabs, tab 0 active.
+    // The strip as `splice_tab_strip` builds it: 2 tabs, tab 0 active.
     let segments = tab_bar::layout_segments(cols as u16, 2, 0, false);
     let titles = vec!["zsh".to_string(), "vim".to_string()];
     let mut strip_row = vec![tab_bar::blank_cell(theme); cols];
@@ -306,9 +294,8 @@ fn end_to_end_strip_above_terminal() {
     prepend_strip_rows(&mut frame, &[strip_row], 16, 0, &mut Vec::new());
     // The composed frame is one row taller; the strip is row 0.
     assert_eq!(frame.rows, 4);
-    // The active tab's title 'z','s','h' appears in the strip row, at the
-    // content start (a chip-card band adds an interior pad after the
-    // gutter; the flat strip starts right after the single leading pad).
+    // The active tab's title starts after the leading pad (plus a chip card's interior
+    // pad).
     let t0 = &segments[0];
     let ts = t0.start_col as usize + 1 + usize::from(tab_bar::STRIP_CHIP_CARDS);
     assert_eq!(frame.cells[0][ts].ch, 'z');
@@ -336,11 +323,8 @@ fn prepend_empty_is_noop() {
     assert_eq!(frame.cursor_row, cursor);
 }
 
-/// The resident strip-row pool reuses a reclaimed buffer instead of allocating a
-/// fresh cell row, and the spliced bytes are byte-identical to the empty-pool
-/// clone fallback. Witnesses the pool contract: `prepend_strip_rows` pops the
-/// pooled buffer and `clone_from`s the cached row into it (so `cells[0]` reuses
-/// the pooled allocation, same backing pointer), overwriting whatever it held.
+/// The strip-row pool: `prepend_strip_rows` pops a reclaimed buffer and `clone_from`s
+/// the cached row over it (same backing pointer), byte-identical to the empty-pool clone.
 #[test]
 fn strip_row_pool_reuses_buffer_byte_identical() {
     let theme = aterm_render::Theme::default();
@@ -362,9 +346,7 @@ fn strip_row_pool_reuses_buffer_byte_identical() {
         0,
         &mut Vec::new(),
     );
-    // Pooled: seed an over-capacity, non-empty buffer and witness that spliced
-    // row 0 reuses ITS allocation (same pointer, no realloc) with the cached row
-    // `clone_from`ed over its stale contents.
+    // Pooled: an over-capacity, non-empty buffer whose allocation row 0 must reuse.
     let mut frame_b = build();
     let mut pooled = Vec::with_capacity(cols + 32);
     pooled.push(tab_bar::blank_cell(theme));
@@ -391,7 +373,6 @@ fn selection_autoscroll_edges() {
     use crate::app_render::selection_autoscroll_lines;
     // 16px cells, no pad, no strip, 24 rows → grid spans y ∈ [0, 384).
     let (ch, pad, strip_px, rows) = (16usize, 0usize, 0usize, 24u16);
-    // Inside the grid → no autoscroll.
     assert_eq!(selection_autoscroll_lines(0.0, pad, strip_px, ch, rows), 0);
     assert_eq!(
         selection_autoscroll_lines(200.0, pad, strip_px, ch, rows),
@@ -401,7 +382,6 @@ fn selection_autoscroll_edges() {
         selection_autoscroll_lines(383.0, pad, strip_px, ch, rows),
         0
     );
-    // Just above the top edge → +1 (one line into history).
     assert_eq!(selection_autoscroll_lines(-1.0, pad, strip_px, ch, rows), 1);
     // A full cell-height above → +2 (overshoot/ch + 1).
     assert_eq!(
@@ -413,17 +393,14 @@ fn selection_autoscroll_edges() {
         selection_autoscroll_lines(384.0, pad, strip_px, ch, rows),
         -1
     );
-    // A full cell-height below the bottom → -2.
     assert_eq!(
         selection_autoscroll_lines(400.0, pad, strip_px, ch, rows),
         -2
     );
 }
 
-/// Nothing bounds the pointer coordinate a drag outside the window reports,
-/// so the step count SATURATES. Direction is the load-bearing half: a
-/// wrapped magnitude would send a drag held above the top edge scrolling
-/// toward the live bottom, i.e. backwards.
+/// Nothing bounds the pointer coordinate a drag outside the window reports, so the step
+/// count saturates; a wrapped magnitude would flip the direction.
 #[test]
 fn an_absurd_overshoot_pins_the_step_count_without_flipping_direction() {
     use crate::app_render::selection_autoscroll_lines;
@@ -453,9 +430,8 @@ fn an_absurd_overshoot_pins_the_step_count_without_flipping_direction() {
     }
 }
 
-/// The autoscroll edges shift by the interior `pad` and the tab-strip pixel
-/// band: the terminal grid starts at `pad + strip_px`, so the top edge moves
-/// down by both and the "inside" band is offset accordingly.
+/// The autoscroll edges shift by the interior `pad` and the tab-strip band: the grid
+/// starts at `pad + strip_px`.
 #[test]
 fn selection_autoscroll_respects_pad_and_strip() {
     use crate::app_render::selection_autoscroll_lines;
@@ -464,7 +440,6 @@ fn selection_autoscroll_respects_pad_and_strip() {
     let top = (pad + strip_px) as f64; // = 24.0
     // A pixel exactly at the grid top is inside (not above) → 0.
     assert_eq!(selection_autoscroll_lines(top, pad, strip_px, ch, rows), 0);
-    // One pixel above the grid top → scroll into history.
     assert_eq!(
         selection_autoscroll_lines(top - 1.0, pad, strip_px, ch, rows),
         1

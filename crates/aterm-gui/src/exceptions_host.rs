@@ -1,29 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOST'S HALF OF THE EXCEPTIONS DIGEST (owner rule, 2026-09-28: *"a single
-//! batched 'exceptions' [surface] that I can dismiss and they go to some log for
-//! me to look at later"*; `aterm_messages::exceptions`).
+//! The host's half of the exceptions digest (`aterm_messages::exceptions`): one batched surface
+//! of facts the owner can dismiss, which then go to the log for a later look.
 //!
-//! A reporter states an [`Entry`] and never touches the class ceremony. A
-//! family has ONE producer and ONE mode ([`aterm_messages::exceptions::Family::mode`]):
-//! a LEVEL family (the upgrade's rows, the resume loop's exceptions) gives its
-//! WHOLE answer with [`App::except_replace`] at every look it takes (a fact it
-//! stops naming ends ten minutes later, at a look or at the digest's own clock
-//! — the upgrade's looks are sent only when its rows change, so "a second look"
-//! is not something it can promise); an EVENT family (a macOS prompt observed,
-//! a verified grant, the state folder the upgrade cannot use) uses
-//! [`App::except`] and [`App::except_clear`] and is never swept. The host
-//! refuses the wrong call, so a level pass cannot end an event-raised
-//! sibling. The owner's `Dismiss all` is
-//! [`App::dismiss_exceptions`]: every open entry goes to the log at one
-//! stamp, and the same facts stay quiet for their span across restarts and
-//! updates, because the LOG is their memory.
+//! A reporter states an [`Entry`] and never touches the class ceremony. A family has one
+//! producer and one mode ([`aterm_messages::exceptions::Family::mode`]):
 //!
-//! The digest is a store beside the message center's live set, so nothing here
-//! can ask the band for a row: it costs the terminal nothing and re-grids no
-//! window. What it does move is the digest's own revision, which republishes
-//! Settings ▸ Messages and rebuilds the menu-bar item.
+//! - a level family (the upgrade's rows, the resume loop's exceptions) gives its whole answer
+//!   with [`App::except_replace`] at every look; a fact it stops naming ends ten minutes later,
+//!   at a look or at the digest's own clock (the upgrade looks only when its rows change);
+//! - an event family (a macOS prompt observed, a verified grant, the state folder the upgrade
+//!   cannot use) uses [`App::except`] and [`App::except_clear`] and is never swept.
+//!
+//! The host refuses the wrong call, so a level pass cannot end an event-raised sibling. The
+//! owner's `Dismiss all` is [`App::dismiss_exceptions`]: every open entry goes to the log at one
+//! stamp, and the same facts stay quiet for their span across restarts and updates, because the
+//! log is their memory.
+//!
+//! The digest is a store beside the message center's live set, so an entry never takes a band
+//! row: it costs the terminal nothing and re-grids no window. What it moves is the digest's own
+//! revision, which republishes Settings ▸ Messages and rebuilds the menu-bar item.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -41,22 +38,20 @@ use crate::harness_host::{AccountsSaid, HostNote, RelaunchSay};
 use crate::message_reporters;
 use crate::messages_host::wall_stamp_now;
 
-/// How long a rating survey the loop cannot close stands before it earns a line
-/// of the digest: an hour (the same named horizon as the supervisor's, since the
-/// card blocks nothing the worker does).
+/// How long a rating survey the loop cannot close stands before it earns a digest line: an hour,
+/// the supervisor's named horizon, since the card blocks nothing the worker does.
 const SURVEY_ENTRY_AFTER: Duration = Horizon::SUPERVISOR_RESTARTS.duration();
 
 #[cfg(test)]
 thread_local! {
-    /// How often the digest announced a change (the menu-bar item and Settings
-    /// follow): a test seam, since a headless App has neither.
+    /// How often the digest announced a change (the menu-bar item and Settings follow): a test
+    /// seam, since a headless App has neither.
     static DIGEST_MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// An entry that is not yet worth the owner's look: a fact that mends itself
-/// (a supervisor that keeps stopping, a rating card, updates that fail) is a
-/// RECORD until it has outlasted its horizon ([`App::except_after`]), and only
-/// then a line of the digest.
+/// An entry not yet worth the owner's look: a fact that mends itself (a supervisor that keeps
+/// stopping, a rating card, updates that fail) is a record until it has outlasted its horizon
+/// ([`App::except_after`]), and only then a digest line.
 #[derive(Debug)]
 pub(crate) struct Ripening {
     key: String,
@@ -64,10 +59,9 @@ pub(crate) struct Ripening {
     entry: Entry,
 }
 
-/// How long a restarted supervisor must have run without failing again before
-/// the failure is taken to be over ([`App::settle_supervisors`]): its pause and
-/// this. A crash loop whose runs live longer than that is still a failure, and
-/// says so at every failure it makes.
+/// How long a restarted supervisor must run without failing again before the failure is taken
+/// to be over ([`App::settle_supervisors`]): its pause and this. A crash loop whose runs live
+/// longer is still a failure, and says so at every failure it makes.
 const SUPERVISOR_STEADY: Duration = Duration::from_secs(30 * 60);
 
 /// How long after this process first looked at its exceptions the resume family
@@ -76,35 +70,32 @@ const SUPERVISOR_STEADY: Duration = Duration::from_secs(30 * 60);
 /// minutes is long past the first point every loop reaches.
 pub(crate) const RESUME_SETTLE: Duration = Duration::from_secs(10 * 60);
 
-/// The `host_noted` marks that THIS process recorded a short volume, one for
-/// each form of its line: the passes' ([`HostNote::DiskLow`]) and the one
-/// opened while cleanup is off by fault ([`HostNote::DiskLowCleanupOff`]).
-/// Each form is recorded once while its mark stands; the end of the form's
-/// premise lifts it.
+/// The `host_noted` marks that this process recorded a short volume, one per form of its line:
+/// the passes' ([`HostNote::DiskLow`]) and the one opened while cleanup is off by fault
+/// ([`HostNote::DiskLowCleanupOff`]). Each form is recorded once while its mark stands; the end
+/// of the form's premise lifts it.
 const DISK_NOTED: &str = "disk";
 const DISK_CLEANUP_OFF_NOTED: &str = "disk:cleanup-off";
 
-/// The `host_noted` marks of the usage tap's line ([`HostNote::UsageTap`]):
-/// one per tab whose tap stands silent, and the day it was last raised.
+/// The `host_noted` marks of the usage tap's line ([`HostNote::UsageTap`]): one per tab whose tap
+/// stands silent, and the day it was last raised.
 const USAGE_TAP_NOTED: &str = "usage-tap:";
 const USAGE_TAP_DAY: &str = "usage-tap-day:";
 
-/// The instant this process first looked at its exceptions, and whether it has
-/// since ended the supervisor lines an earlier process left open that nothing
-/// has told of ([`App::sweep_adopted_supervisor_lines`]): once per process, at the
-/// first sweep after the steady time (no wake of its own: the window sweeps at
-/// every event).
+/// When this process first looked at its exceptions, and whether it has since ended the
+/// supervisor lines an earlier process left open that nothing has told of
+/// ([`App::sweep_adopted_supervisor_lines`]): once per process, at the first sweep after the
+/// steady time (no wake of its own: the window sweeps at every event).
 static LOOKING_SINCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static ADOPTED_SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// One tab's supervisor that has failed past its restart budget and not yet
-/// been seen steady ([`HostNote::SupervisorFailing`]).
+/// One tab's supervisor that has failed past its restart budget and not yet been seen steady
+/// ([`HostNote::SupervisorFailing`]).
 #[derive(Debug)]
 pub(crate) struct SupervisorFail {
     /// The first failure of this episode: the hour counts from here.
     pub(crate) first: Instant,
-    /// The latest, and the pause the host waits before it starts the supervisor
-    /// again.
+    /// The latest, and the pause the host waits before it starts the supervisor again.
     pub(crate) last: Instant,
     pub(crate) pause: Duration,
     pub(crate) why: String,
@@ -164,17 +155,16 @@ fn span_ms(span: Duration) -> u64 {
 }
 
 impl SupervisorFail {
-    /// The instant a run started after the latest failure has outlived it
-    /// without failing again.
+    /// The instant a run started after the latest failure has outlived it without failing again.
     fn steady_at(&self) -> Instant {
         self.last + self.pause + SUPERVISOR_STEADY
     }
 }
 
 impl App {
-    /// A condition that needs the owner's look, not now, holds. Idempotent: the
-    /// same words are a duplicate, new words restate the entry in place, and a
-    /// fact the owner filed inside its span is quiet.
+    /// A condition that needs the owner's look, not now, holds. Idempotent: the same words are a
+    /// duplicate, new words restate the entry in place, and a fact the owner filed inside its
+    /// span is quiet.
     pub(crate) fn except(&mut self, entry: &Entry) {
         if entry.family().mode() != Mode::Event {
             aterm_log::error!(
@@ -204,14 +194,12 @@ impl App {
         }
     }
 
-    /// A fact that heals itself, said as an entry only once it has outlasted
-    /// `after` (the engine's named horizons: 24 h of failing updates, an hour of
-    /// a supervisor stopping): until then the reporter has written its record,
-    /// and nothing here is shown. The FIRST claim fixes the instant; the same key
-    /// again only re-words the entry it will raise, so a fact that is re-asserted
-    /// every look never postpones itself. [`App::except_clear`] withdraws the
-    /// claim (or ends the entry, once raised). An event family's call, like
-    /// [`App::except`].
+    /// A fact that heals itself, shown as an entry only once it has outlasted `after` (the
+    /// engine's named horizons: 24 h of failing updates, an hour of a supervisor stopping); until
+    /// then the reporter's record is all there is. The first claim fixes the instant; the same key
+    /// again only re-words the entry it will raise, so a fact re-asserted at every look never
+    /// postpones itself. [`App::except_clear`] withdraws the claim (or ends the entry, once
+    /// raised). An event family's call, like [`App::except`].
     pub(crate) fn except_after(&mut self, entry: &Entry, after: Duration) {
         if after.is_zero() {
             self.except(entry);
@@ -235,9 +223,8 @@ impl App {
         }
     }
 
-    /// Raise the entries whose horizon has come (`settle_messages` calls it on
-    /// every sweep, and `messages_deadline` names the instant, so a quiet
-    /// window still wakes for it).
+    /// Raise the entries whose horizon has come (`settle_messages` calls it on every sweep, and
+    /// `messages_deadline` names the instant, so a quiet window still wakes for it).
     pub(crate) fn ripen_exceptions(&mut self, now: Instant) {
         self.settle_supervisors(now);
         self.end_relaunch_lines_of_closed_tabs();
@@ -245,9 +232,9 @@ impl App {
         if now >= since + SUPERVISOR_STEADY && !ADOPTED_SWEPT.swap(true, Ordering::Relaxed) {
             self.sweep_adopted_supervisor_lines();
         }
-        // The resume family is a level family the loops speak for at every
-        // change: lines an earlier process left open, which no loop of this one
-        // tells of, end with the first whole answer after they have had time to.
+        // The resume family is a level family the loops speak for at every change: lines an
+        // earlier process left open, which no loop of this one tells of, end with the first
+        // whole answer after they have had time to.
         if !self.resume_swept {
             // The API outage is a level family too, stated only as tabs
             // enter and leave the wait: an entry an earlier process left open
@@ -283,8 +270,8 @@ impl App {
         }
     }
 
-    /// The instant the next claim ripens, or the next supervisor turns out
-    /// steady or has failed for the hour, if one is held.
+    /// The instant the next claim ripens, or the next held supervisor turns out steady or has
+    /// failed for the hour.
     pub(crate) fn ripening_deadline(&self) -> Option<Instant> {
         let supervisors = self.supervisor_failing.values().flat_map(|fail| {
             let horizon =
@@ -299,10 +286,9 @@ impl App {
             .min()
     }
 
-    /// A supervisor that failed past its budget is over the moment a run
-    /// started after its latest failure has outlived it ([`SUPERVISOR_STEADY`]
-    /// past the pause): its line is withdrawn, or never shown. One that is still
-    /// failing when an hour of it has gone is one line of the digest
+    /// A supervisor that failed past its budget is over once a run started after its latest
+    /// failure has outlived it by [`SUPERVISOR_STEADY`] past the pause: its line is withdrawn, or
+    /// never shown. One still failing an hour in is one digest line
     /// (`harness.supervisor.<tab>.failing`).
     fn settle_supervisors(&mut self, now: Instant) {
         if self.supervisor_failing.is_empty() {
@@ -343,10 +329,9 @@ impl App {
                 .any(|k| k == key)
     }
 
-    /// The line open under exactly `key` ends now, and a claim not yet ripe is
-    /// withdrawn; `true` when a line ended. NOTHING THE OWNER FILED IS
-    /// FORGOTTEN: this is for a reporter that can no longer say its fact, or
-    /// says it anew of another subject, which is not the cause ending
+    /// End the line open under exactly `key` now and withdraw a claim not yet ripe; `true` when a
+    /// line ended. What the owner filed is kept: this is for a reporter that can no longer say its
+    /// fact, or says it of another subject, which is not the cause ending
     /// ([`Self::except_clear`] is that).
     pub(crate) fn except_end(&mut self, key: &str) -> bool {
         self.ripening.retain(|claim| claim.key != key);
@@ -407,15 +392,12 @@ impl App {
         }
     }
 
-    /// A reporter's whole current answer for `family`: what still holds is
-    /// posted or kept, and what the pass no longer names ends once it has gone
-    /// unnamed for ten minutes (the digest's own clock, armed by
-    /// `messages_deadline`, ends it if no later look comes). AN ENTRY WHOSE
-    /// WORDS THE DOOR REFUSES IS STILL NAMED ([`Self::checked_entry`]): the
-    /// fact holds, so an open entry under its key stands in the words it was
-    /// last shown in, and its clock does not start — a wording fault never
-    /// ends a fact (2026-10-08: the upgrade's own-work line, refused at every
-    /// look, would have been filed `Resolved` while its cause stood).
+    /// A reporter's whole current answer for `family`: what still holds is posted or kept, and
+    /// what the pass no longer names ends once it has gone unnamed for ten minutes (the digest's
+    /// own clock, armed by `messages_deadline`, ends it if no later look comes). An entry whose
+    /// words the door refuses ([`Self::checked_entry`]) is still named: its open entry stands in
+    /// the words it was last shown in and its clock does not start, since a wording fault never
+    /// ends a fact.
     pub(crate) fn except_replace(&mut self, family: Family, entries: &[Entry]) {
         if family.mode() != Mode::Level || entries.iter().any(|e| e.family() != family) {
             aterm_log::error!(
@@ -464,20 +446,16 @@ impl App {
         }
     }
 
-    /// WHAT A HOST THREAD TELLS THE WINDOW ABOUT ITSELF (`Wake::HostNote`,
-    /// [`HostNote`]): a fact that begins is a RECORD (the log the owner reads
-    /// later) and a claim on the digest that only ripens if it goes on — the
-    /// supervisor that keeps stopping and the survey the loop cannot close, an
-    /// hour; or, when the reporter's own horizon has already passed, an entry at
-    /// once (the volume aterm could not help through two passes, a `[disk]`
-    /// setting aterm cannot read that turned its cleanup off and the volume
-    /// short through two looks while it holds, the upgrade
-    /// whose state folder cannot hold its lock, the Claude accounts that are
-    /// signed out or whose roster is refused). A fact that ends withdraws the
-    /// claim, or ends the entry. Never a band row, a tab mark or a notification.
-    /// Every `Ended` is idempotent and UNCONDITIONAL: it ends the line whether or not
-    /// this process raised it, because the log keeps an event family's open entries
-    /// across a restart and only the note that its cause is over can end them.
+    /// A host thread tells the window about itself (`Wake::HostNote`). A fact that begins is a
+    /// record and a claim on the digest that ripens only if it goes on (a supervisor that keeps
+    /// stopping, a survey the loop cannot close: an hour), or an entry at once when the reporter's
+    /// own horizon has passed (low disk, an unreadable `[disk]` setting, an upgrade that cannot
+    /// run, signed-out or refused Claude accounts). A fact that ends withdraws the claim or ends
+    /// the entry.
+    ///
+    /// Every end is idempotent and unconditional: it ends the line whether or not this process
+    /// raised it, because the log keeps an event family's open entries across a restart and only
+    /// the note that its cause is over can end them.
     pub(crate) fn note_harness_host(&mut self, note: HostNote) {
         match note {
             HostNote::SupervisorFailing { sid, why, pause } => {
@@ -487,8 +465,8 @@ impl App {
                     fail.pause = pause;
                     fail.why = why;
                 } else {
-                    // The episode begins: a record, once. The digest waits for
-                    // the hour ([`Self::settle_supervisors`]).
+                    // The episode begins: a record, once. The digest waits for the hour
+                    // (`settle_supervisors`).
                     let spot = self.upgrade_spot(&sid);
                     aterm_log::warn!("harness @{sid}: the supervisor keeps failing: {why}");
                     self.record_message(message_reporters::supervisor_failing_record(
@@ -541,12 +519,10 @@ impl App {
                 self.host_noted.retain(|key| !key.starts_with(&prefix));
                 self.except_clear(&message_reporters::survey_key(&sid));
             }
-            // A short volume is one low-disk line, in the form of the run that
-            // opened it: a line of the other form gives way to it. A pass ran,
-            // so the cleanup-off line's cause (cleanup off) has ended and is
-            // cleared; the passes' line giving way to the cleanup-off form is
-            // only ended, since the volume is still short and what the owner
-            // filed of it holds until space is back.
+            // A short volume is one low-disk line, in the form of the run that opened it; a line
+            // of the other form gives way. A pass ran, so the cleanup-off line's cause has ended
+            // and it is cleared; the passes' line giving way to the cleanup-off form is only
+            // ended, since the volume is still short and what the owner filed of it holds.
             HostNote::DiskLow {
                 free_gib,
                 floor_gib,
@@ -586,12 +562,10 @@ impl App {
                 self.except_clear(message_reporters::DISK_LOW_KEY);
                 self.except_clear(message_reporters::DISK_LOW_CLEANUP_OFF_KEY);
             }
-            // A setting only the owner can say the meaning of: a line at once,
-            // restated in place as the reading's notes change, and ended by
-            // the first look that reads the settings without that fault —
-            // with the low-disk line that fault opened, whose premise (aterm
-            // frees nothing) ends with it. A volume still short is the passes'
-            // to tell from here.
+            // A setting only the owner can give a meaning to: a line at once, restated in place as
+            // the reading's notes change, and ended by the first look that reads the settings
+            // without that fault, with the low-disk line the fault opened (its premise, that
+            // aterm frees nothing, ends too). A volume still short is the passes' to tell.
             HostNote::DiskSettingsOff { notes } => {
                 self.except(&message_reporters::disk_settings_entry(&notes));
             }
@@ -620,6 +594,24 @@ impl App {
                     Instant::now(),
                 );
                 aterm_log::info!("harness disk watch: the disk is out of its emergency");
+            }
+            HostNote::ProgramCheckStuck { workers, limit } => {
+                self.post_message(message_reporters::program_check_stuck(workers, limit));
+            }
+            // The episode is over: its row resolves, and the owner's word on it (folded or
+            // dismissed) ends with it, so the next episode reaches the glass. A relaunch
+            // inside the same episode never reads it over, so their word stands there.
+            HostNote::ProgramCheckUnstuck => {
+                self.messages.resolve_key_prefix(
+                    message_reporters::PROGRAM_CHECK_STUCK_KEY,
+                    aterm_messages::Outcome::Ok,
+                    Instant::now(),
+                );
+                let _ = self.messages.end_standing_quiet(
+                    message_reporters::PROGRAM_CHECK_STUCK_KEY,
+                    wall_stamp_now(),
+                    Instant::now(),
+                );
             }
             // A beat, not a fact: no record, no claim. With no window showing
             // the stats bars, the jobs engine reads on it.
@@ -674,6 +666,7 @@ impl App {
                 self.hand_resume_exceptions();
             }
             HostNote::LoginBack { sid } => self.close_notice_story(&sid),
+            HostNote::LimitOver { sid } => self.end_notice_story(&sid),
             HostNote::ResumeUnread { sid, agent, stall } => match stall {
                 Some(stall) => {
                     // The second rung of the stall canary (90 minutes of
@@ -813,14 +806,11 @@ impl App {
                 let key = message_reporters::ACCOUNTS_SIGNED_OUT_KEY;
                 match message_reporters::accounts_signed_out_entry(&labels) {
                     Some(entry) => {
-                        // THE LINE'S ASK IS ONE ACCOUNT'S COMMAND. Restated in
-                        // place, the next account's would stay unpublished
-                        // inside the digest's restate quiet, and the log —
-                        // what `aterm exceptions` prints — keeps a line's
-                        // first words for as long as it is open. So an open
-                        // line whose action is for another account ends, and
-                        // this one is raised with its own words. One the
-                        // owner filed is not open: it stays quiet.
+                        // The line's ask is one account's command. Restated in place, the next
+                        // account's would stay unpublished inside the restate quiet, and the log
+                        // (what `aterm exceptions` prints) keeps a line's first words while it is
+                        // open. So an open line for another account ends and this one is raised
+                        // in its own words; one the owner filed is not open and stays quiet.
                         let first = labels.first().map(String::as_str);
                         let digest = self.messages.digest();
                         let other = digest.entries.iter().any(|open| {
@@ -846,10 +836,9 @@ impl App {
                 let place = self.upgrade_place(&sid);
                 self.record_message(message_reporters::supervisor_note(&sid, &place, &text));
             }
-            // ONE line for the machine while any tab's usage tap stands
-            // silent, raised at most once a calendar day (UTC): a fact worth
-            // a look later. Its end is said when the last tab is heard again
-            // or its worker ends.
+            // One line for the machine while any tab's usage tap stands silent, raised at most
+            // once a calendar day (UTC). It ends when the last tab is heard again or its worker
+            // ends.
             HostNote::UsageTap { sid, silent } => {
                 let tab = format!("{USAGE_TAP_NOTED}{sid}");
                 if silent {
@@ -914,9 +903,9 @@ impl App {
 
     /// A tab's relaunch says something about itself ([`RelaunchSay`]): a record
     /// for a relaunch that keeps failing — and, where no command is named for
-    /// the tab's mark, one line of the digest at once (LC-5 of
-    /// ATERM-KI-1015-1), save for the harness's own restart, whose record's
-    /// own row speaks (`harness_host::failing_names_command`); else, for a
+    /// the tab's mark, one line of the digest at once, save for the harness's
+    /// own restart, whose record's own row speaks
+    /// (`harness_host::failing_names_command`); else, for a
     /// cause only a person clears, a line once it has gone on for an hour —
     /// and for the owner's own limit; for an agent that cannot be brought
     /// back, a record and, where no command can be named for the tab's mark,
@@ -954,9 +943,9 @@ impl App {
                     "the agent exited and its relaunch keeps failing; it is still tried"
                 };
                 self.record_message(message_reporters::relaunch_record(sid, &spot.place, text));
-                // AT ATTENTION (LC-5 of ATERM-KI-1015-1): with a command the
-                // tab's mark says it; with none, the digest's line now — save
-                // the harness's own restart's, which its row speaks for.
+                // At attention: with a command the tab's mark says it; with none,
+                // the digest's line now — save the harness's own restart's, which
+                // its row speaks for.
                 if command.is_none() && !restarted {
                     self.host_noted.insert(relaunch_told_key(sid));
                     self.except(&message_reporters::relaunch_failing_entry(
@@ -1037,10 +1026,9 @@ impl App {
         }
     }
 
-    /// The resume loops' exceptions as they stand, handed to the digest as the
-    /// family's WHOLE answer ([`Family::Resume`] is a level family): one entry per
-    /// kind naming its tabs, a stalled or a context tab its own. A kind no tab has any more
-    /// ends ten minutes after (the digest's clock).
+    /// The resume loops' exceptions as they stand, handed to the digest as the family's whole
+    /// answer ([`Family::Resume`] is a level family): one entry per kind naming its tabs, a
+    /// stalled or a context tab its own. A kind no tab has any more ends ten minutes after.
     pub(crate) fn hand_resume_exceptions(&mut self) {
         let standing: Vec<_> = self
             .resume_standing
@@ -1060,24 +1048,23 @@ impl App {
         );
     }
 
-    /// A tab's resume loop needs the owner NOW and nothing of the loop's says
+    /// A tab's resume loop needs the owner now and nothing of the loop's says
     /// so ([`message_reporters::resume_ask`]): its standing ask is posted —
     /// the same words are a duplicate, new ones restate it in place — and
     /// this process marks the tab as one it holds an ask for.
     ///
-    /// A NOTICE IS SAID ONCE: its key is the tab's and the notice's
+    /// A notice is said once: its key is the tab's and the notice's
     /// ([`message_reporters::notice_ask_key`]), so the same notice at every
-    /// point the loop tells it is the one row, and one the owner read stays
-    /// quiet while it stands; another notice of the tab's is raised as news.
+    /// point the loop tells it is one row; another notice of the tab's is
+    /// raised as news.
     ///
-    /// ONE LOSS, ONE ROW IN SETTINGS ▸ MESSAGES (the owner, 2026-10-19: the
-    /// same lost login listed three times): a tab's notices are one story
-    /// ([`NoticeStory`]). The row a new notice is posted in replaces the
-    /// story's row or record until now — on the glass, withdrawn as its point
-    /// moved on, or read — so the page lists the story once, in its latest
-    /// words ([`aterm_messages::MessageCenter::supersede_record`]); the login
-    /// back closes it fixed ([`Self::close_notice_story`]). A notice the owner
-    /// read stays quiet while its story stands, its row replaced or not
+    /// A tab's notices are one story ([`NoticeStory`]). The row a new notice
+    /// is posted in replaces the story's row or record until now — on the
+    /// glass, withdrawn as its point moved on, or read — so Settings ▸ Messages
+    /// lists the story once, in its latest words
+    /// ([`aterm_messages::MessageCenter::supersede_record`]); the login back
+    /// closes it fixed ([`Self::close_notice_story`]). A notice the owner read
+    /// stays quiet while its story stands, its row replaced or not
     /// ([`NoticeStory::keeps_quiet`]). A story whose row left the glass and
     /// that had no word for [`NOTICE_STORY_SPAN`] is over: the next notice is
     /// a loss of its own, its own row.
@@ -1198,19 +1185,31 @@ impl App {
             .max()
     }
 
-    /// TAB `sid`'S LOST LOGIN IS BACK ([`HostNote::LoginBack`]): the story its
-    /// notices told ends FIXED, as one row — a row still on the glass resolves
+    /// Tab `sid`'s lost login is back ([`HostNote::LoginBack`]): the story its
+    /// notices told ends fixed, as one row — a row still on the glass resolves
     /// `Ok` in its declared fix words, a record whose row already left
     /// (withdrawn as the agent went back to work, or read) is closed fixed in
     /// them ([`aterm_messages::MessageCenter::fix_record`]) — and the next
     /// loss is a story of its own, news even where the owner read this one.
     /// A tab with no story moves nothing.
+    ///
+    /// ONLY A STORY THAT GOES ON ([`NoticeStory::goes_on`]): one whose row
+    /// left the glass and that had no word for [`NOTICE_STORY_SPAN`] is over,
+    /// and a login back told after it — an account move days on — ends it
+    /// unfixed, as the next notice would (the review of the login carry,
+    /// r9h-3: a weekly limit's record that its reset ended read `Claude
+    /// switched accounts` days later).
     fn close_notice_story(&mut self, sid: &str) {
         let Some(story) = self.resume_stories.remove(sid) else {
             return;
         };
         self.host_noted.remove(&resume_asked_key(sid));
-        if self.messages.live(story.head).is_some() {
+        let live = self.messages.live(story.head).is_some();
+        if !story.goes_on(live, wall_stamp_now().unix_ms) {
+            aterm_log::info!("harness @{sid}: a login back after its story's span closes nothing");
+            return;
+        }
+        if live {
             let _ = self.resolve_message(story.head, aterm_messages::Outcome::Ok);
         } else if let Some(back) = story.back
             && self
@@ -1220,6 +1219,18 @@ impl App {
             self.sync_messages();
         }
         aterm_log::info!("harness @{sid}: the login is back; its notice reads fixed");
+    }
+
+    /// Tab `sid`'s usage or model limit ended with no sign-in that took
+    /// ([`HostNote::LimitOver`]): the story its notices told ends UNFIXED —
+    /// its row, if one still stands, is the loop's to withdraw as its point
+    /// moves on, and its record keeps the words it ended in — so a login back
+    /// told later (a lost login's, an account move's) fixes nothing of it,
+    /// and the tab's next notice is a story of its own.
+    fn end_notice_story(&mut self, sid: &str) {
+        if self.resume_stories.remove(sid).is_some() {
+            aterm_log::info!("harness @{sid}: the limit ended by itself; its notice reads unfixed");
+        }
     }
 
     /// Withdraws tab `sid`'s live asks ([`message_reporters::notice_ask_key`]
@@ -1260,9 +1271,8 @@ impl App {
         }
     }
 
-    /// The asks an earlier process carried here that no loop of this one
-    /// tells of: withdrawn at the resume family's settle, once every loop has
-    /// had its first point ([`RESUME_SETTLE`]), as the digest's lines end then.
+    /// Withdraw the asks an earlier process carried here that no loop of this one tells of, at the
+    /// resume family's settle ([`RESUME_SETTLE`]), as the digest's lines end then.
     fn sweep_resume_asks(&mut self) {
         let held: Vec<String> = self
             .host_noted
@@ -1305,21 +1315,16 @@ impl App {
         self.except(&message_reporters::palette_refused_entry());
     }
 
-    /// The repaint nudge gave up on `session`'s render epoch (`render.<tab>.
-    /// unrepaired`, an EVENT of [`Family::Render`]): the tab may be drawn one row
-    /// off, and dragging the window edge one row and back is the owner's. One
-    /// line, dismissable, never a mark on the tab; the entry ends when the epoch
-    /// heals ([`Self::check_render_repairs`]).
+    /// The repaint nudge gave up on `session`'s render epoch: one dismissable line
+    /// (`render.<tab>.unrepaired`, an event of [`Family::Render`]) saying the tab may be drawn one
+    /// row off, which dragging the window edge one row and back fixes; never a mark on the tab.
+    /// The entry ends when the epoch heals ([`Self::check_render_repairs`]).
     ///
-    /// An ADOPTION nudge (a blank agent tab, [`ADOPTION_EPOCH`]) names no epoch of
-    /// the ledger, so nothing could ever say it healed: it is a log line, not a
-    /// line of the digest. Nor is a give-up whose epoch the ledger no longer
-    /// holds at risk by the time it gets here (a resize opened a new one): the
-    /// line's own end is already true, so it would be raised and ended one
-    /// loop turn apart. ONE rule decides both ends, the engine's debt: the
-    /// machine gives up on a debt only while the engine owes rows, read fresh
-    /// at that step, so a debt the program's repaint paid never reaches here,
-    /// however late the ledger looks.
+    /// An adoption nudge ([`ADOPTION_EPOCH`]) names no ledger epoch, so nothing could say it
+    /// healed: it is a log line only. So is a give-up whose epoch is no longer at risk when it
+    /// arrives (a resize opened a new one), which would be raised and ended one loop turn apart.
+    /// The nudge gives up only while the engine still owes rows, so a debt the program's repaint
+    /// paid never reaches here.
     pub(crate) fn note_render_unrepaired(&mut self, session: u64, epoch: u64, why: GiveUp) {
         if epoch == ADOPTION_EPOCH {
             aterm_log::info!(
@@ -1488,9 +1493,7 @@ impl App {
     /// is no process's word but a fact (what a restart did not bring back):
     /// it stands, to its tab's close or the owner's look.
     pub(crate) fn sweep_adopted_supervisor_lines(&mut self) {
-        // The keys THIS process holds, computed from the ids it holds them
-        // under: an id is never read back out of a key (a key shortens a
-        // subject that does not fit its cap, so it does not round-trip).
+        // The keys this process holds, computed from its ids (a key never round-trips to an id).
         let mut held: std::collections::HashSet<String> = self
             .supervisor_failing
             .keys()
@@ -1502,9 +1505,9 @@ impl App {
                     held.insert(message_reporters::survey_key(sid));
                 }
             } else if let Some(sid) = noted.strip_prefix("relaunch:") {
-                // A relaunch line stands while THIS process's worker told of it
-                // and has not seen the agent run again; an earlier run's is
-                // ended here, a live relaunch tells it again.
+                // A relaunch line stands while this process's worker told of it and has not
+                // seen the agent run again; an earlier run's ends here, and a live relaunch tells
+                // it again.
                 held.extend(message_reporters::relaunch_keys(sid));
             }
         }
@@ -1539,16 +1542,14 @@ impl App {
             .map(|handle| handle.sid.as_str().to_string())
     }
 
-    /// Whether `session`'s render epoch `epoch` is still open and at risk. A
-    /// session that has gone, or whose timeline is busy, answers as the safer
-    /// half: a gone tab has nothing off, and a busy timeline is asked again.
+    /// Whether `session`'s render epoch `epoch` is still open and at risk. A gone session answers
+    /// no (nothing is off); a busy timeline answers yes, and is asked again.
     fn render_epoch_still_off(&self, session: u64, epoch: u64) -> bool {
         let Some(found) = self.pool.get(session) else {
             return false;
         };
-        // A timeline that is busy is asked again; one a panic poisoned is read
-        // as the rest of the window reads it (`into_inner`), never as "still
-        // off" for good.
+        // A poisoned timeline is read through (`into_inner`), as the rest of the window reads
+        // it, so it never answers "still off" for good.
         let timeline = match found.ctx.timeline.try_lock() {
             Ok(timeline) => timeline,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -1570,11 +1571,9 @@ impl App {
         filed
     }
 
-    /// The owner's dismissal of ONE entry (Settings ▸ Messages, `notice dismiss
-    /// <id>`): filed `Dismissed`, flushed before it returns.
-    // The Settings page's per-entry `Dismiss` (a view-time capsule,
-    // `aterm_messages::page::DISMISS_ACTION`) calls it; `notice dismiss <id>` files
-    // through the engine itself.
+    /// The Settings page's per-entry `Dismiss` (a view-time capsule,
+    /// `aterm_messages::page::DISMISS_ACTION`): the entry is filed `Dismissed` and flushed before
+    /// this returns. `notice dismiss <id>` files through the engine itself.
     pub(crate) fn dismiss_exception(&mut self, id: aterm_messages::MessageId) -> bool {
         let filed = self
             .messages
@@ -1610,9 +1609,9 @@ impl App {
         }
     }
 
-    /// The digest changed: Settings ▸ Messages and the menu-bar item follow,
-    /// and NO window repaints (the band is untouched by construction). The
-    /// new lines reach the log at the loop's next sweep (`settle_messages`).
+    /// The digest changed: Settings ▸ Messages and the menu-bar item follow, and no window
+    /// repaints (the band is untouched). The new lines reach the log at the loop's next sweep
+    /// (`settle_messages`).
     pub(crate) fn digest_moved(&mut self) {
         #[cfg(test)]
         DIGEST_MOVES.with(|c| c.set(c.get() + 1));
@@ -1621,11 +1620,9 @@ impl App {
         self.note_message_rule();
     }
 
-    /// The rule's counter, said in `aterm.log` when it MOVES, from every path
-    /// that posts (a plain post, a restatement, a family pass), not only from a
-    /// digest change: a reporter whose message the door recorded (`demotions`:
-    /// a defect, warn). The old spelling of a persistent hold is a compile
-    /// error (the seal), so the builders the door once counted are gone.
+    /// Log the rule's counter (`demotions`: messages the door recorded instead of showing, a
+    /// reporter defect) when it moves, from every posting path (a plain post, a restatement, a
+    /// family pass), not only a digest change.
     pub(crate) fn note_message_rule(&mut self) {
         let demoted = self.messages.demotions();
         if demoted != self.demotions_logged {
@@ -1638,10 +1635,9 @@ impl App {
         }
     }
 
-    /// AT COMMIT of a seamless update, in the successor: the parent's record was
-    /// its own to the end, so a dismissal the owner made there after this
-    /// process loaded the file is in the file and not in this ring. Read the
-    /// tail again and fold it in BEFORE the first digest pass of this process.
+    /// At Commit of a seamless update, in the successor: the parent wrote its log to the end, so a
+    /// dismissal made there after this process loaded the file is in the file but not in this
+    /// ring. Re-read the tail and fold it in before this process's first digest pass.
     #[cfg(unix)]
     pub(crate) fn catch_up_messages_log(&mut self) {
         let Some(path) = crate::messages_store::path() else {
@@ -1664,10 +1660,9 @@ impl App {
         }
     }
 
-    /// A dev build named aterm.app writes the release's setup (`Wake::DevBuildWrites`):
-    /// an entry of the digest, said once a launch. The Standing row an older
-    /// build carried across an update under the old key is withdrawn first (one
-    /// fact, one place).
+    /// A dev build named aterm.app writes the release's setup (`Wake::DevBuildWrites`): one entry
+    /// of the digest, said once a launch. A live row an older build left under
+    /// `KEY_DEV_BUILD_WRITES` is resolved first (one fact, one place).
     pub(crate) fn note_dev_build_writes(&mut self, writes: crate::DevSharedWrites) {
         let _ = self.messages.resolve_key_prefix(
             crate::update_words::KEY_DEV_BUILD_WRITES,
@@ -1706,7 +1701,7 @@ fn relaunch_told_key(sid: &str) -> String {
 /// The stem of [`resume_asked_key`].
 const RESUME_ASKED: &str = "resume-ask:";
 
-/// The `host_noted` key that says THIS process holds a tab's resume ask
+/// The `host_noted` key that says this process holds a tab's resume ask
 /// ([`App::raise_resume_ask`]).
 fn resume_asked_key(sid: &str) -> String {
     format!("{RESUME_ASKED}{sid}")
@@ -1755,15 +1750,10 @@ mod tests {
         crate::message_reporters::file_access_entry(&crate::consent_card::NeedWords::sample())
     }
 
-    /// LC-1 (ATERM-KI-1015-1): THE HOST'S WORD THAT WHAT A RESTORE CARRIES OF
-    /// A TAB'S AGENT MOVED OWES THE CRASH JOURNAL A CAPTURE — its conversation
-    /// followed on a desk that draws nothing more, the image a crash leaves
-    /// names it — and says nothing. AT ONCE, inside the write interval
-    /// (ATERM-KI-1016-1): held to it, a crash within 2 s of a `/clear` the
-    /// host had followed left the image naming the conversation the agent had
-    /// left, and the next launch resumed that one and typed its carry-on into
-    /// it. NEGATIVE CONTROL: another note owes none, and plain activity waits
-    /// for the interval.
+    /// The host's word that what a restore carries of a tab's agent moved owes
+    /// the crash journal a capture at once, inside the write interval, and
+    /// says nothing. Negative control: another note owes none, and plain
+    /// activity waits for the interval.
     #[cfg(unix)]
     #[test]
     fn an_agent_publication_owes_the_crash_journal_a_capture() {
@@ -1801,7 +1791,7 @@ mod tests {
         app.crash_journal = crate::crash_journal::Lane::inert();
     }
 
-    /// THE DIGEST COSTS THE TERMINAL NOTHING (the Row Law, clause 1): post,
+    /// The digest costs the terminal nothing (the Row Law, clause 1): post,
     /// restate, family pass, clear, dismiss — the band's re-grid counter, the
     /// committed row count and the window's chrome rows do not move once, in a
     /// real `App` (presence owns no row to re-grid).
@@ -1810,12 +1800,9 @@ mod tests {
         let mut app = App::headless_for_test();
         let message = message_regrids();
         let rows = app.message_band_rows;
-        // The upgrade's rows are a LEVEL family (a pass, never an event); the
-        // privacy card's is an EVENT family.
-        // The loop's own sweep (`sync_messages`: settle, regrid to the band's
-        // committed rows, publish) runs after each step: it is what would
-        // re-grid a tab if a Later had been seated, so the counters below
-        // judge something.
+        // The loop's own sweep (`sync_messages`: settle, re-grid to the band's committed rows,
+        // publish) runs after each step: it is what would re-grid a tab if a Later had been
+        // seated, so the counters below judge something.
         app.sync_messages();
         app.except_replace(Family::Upgrade, &[tab_one()]);
         app.sync_messages();
@@ -1837,10 +1824,10 @@ mod tests {
         );
     }
 
-    /// A DISMISS CLICK NEVER WAITS ON A WRITER THAT DOES NOT ANSWER: the
+    /// A dismiss click never waits on a writer that does not answer: the
     /// record's flush is bounded (law L5), so with the messages log's thread
     /// wedged the owner's `Dismiss all` and the per-entry `Dismiss` still
-    /// file and return. Unbounded, either waited forever on the UI thread.
+    /// file and return.
     #[test]
     fn a_dismissal_returns_though_the_log_writer_never_answers() {
         let mut app = App::headless_for_test();
@@ -1858,7 +1845,7 @@ mod tests {
         assert!(app.messages.digest().is_empty());
     }
 
-    /// A SCRIPT'S DISMISSAL MOVES THE SURFACES (`aterm ctl notice dismiss review`
+    /// A script's dismissal moves the surfaces (`aterm ctl notice dismiss review`
     /// and `dismiss <id>` file through the engine): the menu-bar item and
     /// Settings follow the same call, and the log is flushed before the reply.
     #[test]
@@ -1888,7 +1875,7 @@ mod tests {
         assert_eq!(moves(), before + 2, "nothing to file, nothing to announce");
     }
 
-    /// A dev build that writes the release's setup is ONE entry, said once.
+    /// A dev build that writes the release's setup is one entry, said once.
     #[test]
     fn a_dev_build_that_writes_the_setup_is_one_entry() {
         let mut app = App::headless_for_test();
@@ -1902,9 +1889,8 @@ mod tests {
         assert_eq!(app.messages.wanted_rows(), 0);
     }
 
-    /// AT COMMIT the successor folds the parent's log tail in: a `Dismiss all`
-    /// the parent made after this process loaded the file holds here, and the
-    /// surfaces move.
+    /// At Commit the successor folds the parent's log tail in: a `Dismiss all` the parent made
+    /// after this process loaded the file holds here, and the surfaces move.
     #[cfg(unix)]
     #[test]
     fn the_successor_folds_in_what_the_parent_filed() {
@@ -1974,10 +1960,8 @@ mod tests {
         assert!(app.messages.digest().is_empty());
     }
 
-    /// One producer, one mode: a LEVEL family speaks by pass and an EVENT family
-    /// by event, and the host refuses the wrong call, so a pass over the
-    /// upgrade's rows can never end the fact its HOST raised by event (review
-    /// 2026-09-29, issue 10).
+    /// One producer, one mode: the host refuses the wrong call, so a pass over the upgrade's rows
+    /// never ends the fact its host raised by event.
     #[test]
     fn a_level_family_is_never_raised_by_event_and_an_event_family_is_never_swept() {
         let mut app = App::headless_for_test();
@@ -2006,10 +1990,9 @@ mod tests {
         );
     }
 
-    /// THE DIGEST'S OWN CLOCK (review 2026-09-29, issue 2): the upgrade's looks
-    /// are sent only when its rows change. The row leaves in ONE change; the
-    /// entry must still end — the loop is told when to come back
-    /// (`messages_deadline`) and the sweep (`settle_messages`) ends it.
+    /// The digest's own clock: the upgrade's looks are sent only when its rows change, so an entry
+    /// its reporter stopped naming in one change still ends: `messages_deadline` tells the loop
+    /// when to come back and `settle_messages` ends it.
     #[test]
     fn an_entry_its_reporter_stopped_naming_ends_without_a_second_look() {
         use std::time::{Duration, Instant};
@@ -2030,12 +2013,9 @@ mod tests {
         );
     }
 
-    /// A WORDING FAULT NEVER ENDS A FACT (2026-10-08: the upgrade's own-work
-    /// line restated in words the door refuses, twelve times in a day): the
-    /// pass still names its key, so the open entry stands in the words it was
-    /// shown in and no clock starts — the digest's own settle past
-    /// `RESOLVE_AFTER` leaves it open. NEGATIVE CONTROL: a pass that stops
-    /// naming it starts the clock as before.
+    /// A wording fault never ends a fact: a pass that still names the key keeps the open entry in
+    /// the words it was shown in and starts no clock, so a settle past `RESOLVE_AFTER` leaves it
+    /// open. Negative control: a pass that stops naming it starts the clock.
     #[test]
     fn a_refused_restatement_leaves_its_entry_open() {
         use aterm_messages::need::RESOLVE_AFTER;
@@ -2070,15 +2050,14 @@ mod tests {
             .digest_entry(id)
             .expect("still open past the clock");
         assert_eq!(open.detail, shown, "in the words it was shown in");
-        // NEGATIVE CONTROL: unnamed, the clock runs.
+        // Negative control: unnamed, the clock runs.
         app.except_replace(Family::Upgrade, &[]);
         assert!(app.messages.digest_deadline().is_some());
     }
 
-    /// The page and the wire read ONE digest: an entry restated after its
-    /// posting (a holder count moved) reads the same words in Settings, in
-    /// `aterm ctl messages need=later live` and in the menu bar (review
-    /// 2026-09-29, issue 12) — and plain `live` does not list it.
+    /// The page and the wire read one digest: an open entry reads the same words in Settings and
+    /// in `aterm ctl messages need=later live`, the menu bar counts it, and plain `live` does not
+    /// list it.
     #[test]
     fn the_surfaces_read_one_digest() {
         let mut app = App::headless_for_test();
@@ -2108,10 +2087,10 @@ mod tests {
         );
     }
 
-    /// THE PAGE'S OWN DISMISS BUTTONS (owner rule, 2026-09-28): every open entry
-    /// offers `Dismiss` (files that one) and, with two or more open, the first
-    /// offers `Dismiss all`; each press is flushed to the log; a settled entry
-    /// offers neither; a stale press is `Gone`.
+    /// The page's own dismiss buttons: every open entry offers `Dismiss` (files
+    /// that one) and, with two or more open, the first offers `Dismiss all`;
+    /// each press is flushed to the log; a settled entry offers neither; a
+    /// stale press is `Gone`.
     #[test]
     fn the_page_dismisses_one_entry_or_all_of_them() {
         use crate::native_app::MessageActOutcome;
@@ -2181,9 +2160,8 @@ mod tests {
         assert!(app.messages.digest().is_empty());
     }
 
-    /// The rule's counter is said in `aterm.log` from EVERY posting path, once
-    /// per change (review 2026-09-29, issue 11): a plain post that the door
-    /// records.
+    /// The rule's counter is said in `aterm.log` from every posting path, once per change: here a
+    /// plain post the door records.
     #[test]
     fn the_rules_counter_is_said_once_per_change() {
         use aterm_messages::need::{Ask, Reason, StandingWhy, Then};

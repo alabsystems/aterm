@@ -5,9 +5,9 @@ seq v=1 rig=screen program=claude build=2.1.0
 see busy
 half
 see prompt edit
-expect open p1 approval par=t1 box=edit at=500
+expect open p1 approval par=t1 box=edit @500
 admit harness act=approve
 accept
 pass 600
 see busy
-expect close p1 approval out=passed by=- act=approve at=1100
+expect close p1 approval out=passed by=- act=approve @1100

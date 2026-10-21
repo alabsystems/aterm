@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TOML 1.0 date-times: the four shapes the spec defines, as plain data.
+//! TOML 1.0 date-times: the spec's four shapes, as plain data plus their lexical form. No
+//! calendar arithmetic, time zones or leap-second handling: a config date-time only has to
+//! round-trip and compare.
 //!
-//! TOML borrows RFC 3339 and then subsets it into four value kinds — offset
-//! date-time, local date-time, local date, local time. This module is the data
-//! model plus its lexical form; it deliberately does NOT do calendar
-//! arithmetic, time zones, or leap seconds, because nothing in aterm asks a
-//! config file for a moment in time — a date-time here is a value that must
-//! round-trip and compare, not a clock reading.
-//!
-//! Serde note: `Datetime` crosses serde as a struct with one reserved private
-//! name, the same protocol `toml` uses. That is what lets a `Datetime` field
-//! reach a `Deserializer` that has no serde data-model type for it, and it is
-//! why the name is checked for exactly.
+//! `Datetime` crosses serde as a struct with one reserved private name (the protocol `toml`
+//! uses), so a `Datetime` field can reach a `Deserializer` whose data model has no date-time
+//! type. The name is matched exactly.
 
 use core::fmt;
 use core::str::FromStr;
@@ -43,9 +37,7 @@ pub struct Datetime {
     pub offset: Option<Offset>,
 }
 
-/// A proleptic-Gregorian calendar date. Range-checked, not calendar-checked
-/// beyond month length (the spec asks for a valid date; it does not ask for a
-/// date library).
+/// A proleptic-Gregorian calendar date, range-checked against the month's length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Date {
     /// Four-digit year.
@@ -63,17 +55,16 @@ pub struct Time {
     pub hour: u8,
     /// 0..=59.
     pub minute: u8,
-    /// 0..=59. TOML 1.0 permits 60 for a leap second; it is accepted and kept.
+    /// 0..=60; 60 is a leap second.
     pub second: u8,
-    /// 0..=999_999_999. Digits beyond nanosecond resolution are truncated, as
-    /// RFC 3339 permits and every TOML implementation does.
+    /// 0..=999_999_999. Digits past nanosecond resolution are truncated.
     pub nanosecond: u32,
 }
 
 /// A UTC offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Offset {
-    /// `Z` — UTC, spelled as the zero-offset literal.
+    /// `Z`: UTC.
     Z,
     /// A numeric offset in minutes east of UTC.
     Custom {
@@ -110,9 +101,8 @@ impl fmt::Display for Time {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:02}:{:02}:{:02}", self.hour, self.minute, self.second)?;
         if self.nanosecond != 0 {
-            // Emit the shortest fraction that preserves the value, which is
-            // what every other TOML writer does and what keeps a parsed
-            // `.5` from re-serializing as `.500000000`.
+            // The shortest fraction that keeps the value, so a parsed `.5` does not
+            // re-serialize as `.500000000`.
             let mut frac = format!("{:09}", self.nanosecond);
             while frac.ends_with('0') {
                 frac.pop();

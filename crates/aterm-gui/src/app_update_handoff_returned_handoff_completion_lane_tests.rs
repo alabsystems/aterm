@@ -60,14 +60,7 @@ fn is_structural_resample(retry_at: Option<std::time::Instant>) -> bool {
     })
 }
 
-/// Drives one returned handoff for `mode` end to end through the production
-/// reducer: an authorized attempt is pending, the worker reports `outcome`
-/// against the artifact `digest` names, and the reducer decides the cost.
-///
-/// Nothing is hand-built: the ticket is the reducer's current apply, the pending
-/// record carries the authorized mode, and the completion has `reconcile: None`
-/// as every construction site emits. The outcome and the death evidence are
-/// parameters because both select the budget.
+/// Drive one returned handoff for `mode` through `reduce_returned_handoff_completion`.
 fn reduce_one_returned_failure(
     app: &mut App,
     mode: ApplyMode,
@@ -263,14 +256,9 @@ fn a_person_s_activity_revoked_completion_arms_no_automatic_retry() {
     );
 }
 
-/// Round eight of the update audit, lead U39 (r8d #738): an AUTOMATIC attempt the
-/// lane tries again by itself — a capture refusal (retried when the desk
-/// changes), a physical failure inside its budget (retried in ten minutes) — was
-/// put on record as "⚠ Couldn't install aterm vX", the needs-you glyph and a
-/// Problem in Settings ▸ Messages. The stop is said once the lane has decided: a
-/// lane that tries again by itself waits, in Info, and says so; one that
-/// stopped, or a person's press, could not install. A capture refusal's stop
-/// is its own outcome's one record, titled by the switch.
+/// Automatic attempts that will retry (capture refusal or physical failure within
+/// budget) record an Info wait entry rather than a Warn failure; stopped lanes and
+/// manual attempts record Warn.
 #[test]
 fn a_switch_the_automatic_lane_retries_by_itself_is_recorded_as_waiting() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -589,13 +577,8 @@ fn refuse_capture(app: &mut App, build: u64) {
     );
 }
 
-/// A refused desk is not released by WHERE A READ ENDED (round eight of the
-/// update audit, U43). The fingerprint hashed each parser's ground state, which
-/// flips with every PTY read that ends inside an escape sequence: a streaming
-/// tab released the refusal at the next 30 s probe, and each release was a full
-/// launch, freeze and export into the same deterministic refusal. No capture
-/// refusal is about it (a parser mid-sequence is a park MISS, never this lane),
-/// so it is no desk fact. Negative control: a resize still releases.
+/// Verify parser mid-escape state changes from streaming output do not release a
+/// capture-refusal hold, while a terminal resize does.
 #[test]
 fn a_parser_between_reads_does_not_release_a_capture_refusal() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -619,16 +602,8 @@ fn a_parser_between_reads_does_not_release_a_capture_refusal() {
     );
 }
 
-/// A REFUSAL THAT COMES BACK IS SPACED (round eight of the update audit, U43).
-/// The fingerprint is a guess at what the refusal was about: a busy desk moves
-/// it (a `cd`, a TUI on the alternate screen, a pane opened) at nearly every
-/// probe whatever refused, and 43c7d0936 put `ManifestOverCap` on this lane,
-/// where it was re-attempted every 30 s with no latch — each attempt a launch,
-/// a freeze of every tab and a history export, against the 600 s and 1800 s
-/// it had as a producer failure. A desk change releases the first refusal at
-/// the probe, as before (the update lands soon after the offending tab
-/// closes); a second refusal in a row holds 600 s, a third and later 1800 s,
-/// under the hourly backstop. Never a latch: each one still releases.
+/// Verify repeated capture refusals for the same build enforce backoff spacing
+/// (0 s first, 600 s second, 1800 s third+) before a desk change releases the hold.
 #[test]
 fn a_capture_refusal_that_comes_back_is_spaced_not_retried_every_probe() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -683,15 +658,8 @@ fn a_capture_refusal_that_comes_back_is_spaced_not_retried_every_probe() {
     ));
 }
 
-/// A REFUSAL RECORDED ON A BUSY DESK TAKES ITS BASELINE AT THE PROBE (round
-/// eight of the update audit, U43 review). A refusal comes back while the
-/// readers drain what queued up during the freeze, so one tab's engine can be
-/// locked when it is recorded and its desk is unreadable. Its baseline is the
-/// first readable desk; when that read waited for the spacing (600 s for a
-/// second refusal), a tab closed during the spacing became part of the
-/// baseline, nothing differed from it, and the attempt waited for the hourly
-/// backstop. The lane now comes back at the probe for the baseline, and the
-/// spacing holds back only the release.
+/// Verify a capture refusal recorded while a tab's engine is locked captures its
+/// baseline at the next probe rather than waiting for the backoff spacing to elapse.
 #[test]
 fn a_refusal_recorded_on_a_busy_desk_takes_its_baseline_at_the_probe() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -831,18 +799,8 @@ fn second_refusal_beside_a_busy_engine(
     (build, busy, quiet, refused_at)
 }
 
-/// A TAB CLOSED OR RESIZED BEFORE THE FIRST PROBE COUNTS, though another
-/// tab's engine is busy at every read (round eight of the update audit, U43
-/// second review). The desk fingerprint was one hash, unreadable whole while
-/// any engine was locked: on a desk with a tab streaming output, a refusal's
-/// baseline waited for the first probe that found every engine free, a tab
-/// the person closed at once (as the record asks) was already part of it,
-/// and the attempt waited for the hourly backstop instead of the 10 minutes
-/// the record said. Which tabs are open is now read with no engine lock, and
-/// a busy engine costs only its own tab's reading. Negative control: with
-/// nothing changed, the busy tab says nothing about itself while busy, its
-/// first reading after the spacing is its baseline, never a change, and a
-/// later change of it releases.
+/// Verify closing or resizing a quiet tab before the first probe releases a capture
+/// refusal even if another tab's engine remains locked.
 #[test]
 fn a_tab_closed_or_resized_before_the_first_probe_beside_a_busy_engine_counts() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -917,12 +875,8 @@ fn a_tab_closed_or_resized_before_the_first_probe_beside_a_busy_engine_counts() 
     }
 }
 
-/// THE POLL READS A BUSY TAB'S BASELINE WHATEVER IT DECIDES (round eight of
-/// the update audit, U43 second review). The hold reads the sessions a
-/// refusal's baseline lacks, but a poll in the ladder's first phase that
-/// waits for activity to settle never reaches the hold, and a tab first read
-/// once the activity ends would absorb what the person did to it meanwhile.
-/// The lane comes back within the baseline probe, and that look reads it.
+/// Verify `poll_native_auto_apply` captures a previously locked tab's baseline
+/// even when the poll defers on user activity.
 #[test]
 fn a_poll_that_waits_for_activity_still_reads_a_busy_tabs_baseline() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -956,13 +910,8 @@ fn a_poll_that_waits_for_activity_still_reads_a_busy_tabs_baseline() {
     );
 }
 
-/// A REFUSAL THAT CAME BACK SAYS WHEN THE NEXT TRY IS, through the production
-/// reducer. The one record a refusal leaves, titled by the switch it stopped
-/// (`Waiting to install aterm vX`), is the visible notice for the lane's wait: from
-/// the second refusal of an update it says the spacing, which no change of the
-/// tabs shortens, and the first says nothing more, as before. Every refusal of
-/// the build wears the same title: a later attempt opens no switch of its own
-/// on record (one fact, one entry), and its record was once "Update waiting".
+/// Verify repeated capture refusals log a single switch-titled wait record per
+/// refusal naming the retry spacing from the second refusal onward.
 #[test]
 fn a_refusal_that_came_back_is_recorded_with_its_spacing() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -1092,8 +1041,7 @@ fn a_fork_lane_park_miss_is_recorded_as_the_routine_wait_it_is() {
     assert!(!miss.stops_routinely(mode), "{mode:?}: a person asked");
     let activity = crate::UpdateHandoffStartError::activity("typing");
     assert!(activity.stops_routinely(ApplyMode::Immediate));
-    // The automatic lane's capture refusal arms the desk-change retry: a wait
-    // too (round eight, lead U39); a person's press it refused is not.
+    // Automatic capture refusal is routine (`stops_routinely`); manual is not.
     let refusal = crate::UpdateHandoffStartError::capture_refused("session 3");
     assert!(refusal.stops_routinely(ApplyMode::Automatic));
     assert!(!refusal.stops_routinely(ApplyMode::Immediate));
@@ -1178,15 +1126,8 @@ fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
     }
 }
 
-/// A starved child retries. Under heavy load a successor can end before its
-/// proof (`ChildDied`) while the same build applies cleanly once the load stops;
-/// charging that the structural budget would leave the user on "staged, applies
-/// on relaunch" for a merely busy machine.
-///
-/// `SIGKILL` is what that looks like when the parent can see it (macOS jetsam),
-/// so this drives the structural budget's worth of them and asserts the lane
-/// still comes back, then spends the rest, since retrying forever would be the
-/// opposite defect.
+/// Verify `ChildDied` with `Sigkill` uses the transient failure budget rather
+/// than converging on the structural budget.
 #[test]
 fn a_starved_child_died_keeps_retrying_past_the_budget_a_refusal_would_spend() {
     use crate::app_native::{
@@ -1409,15 +1350,8 @@ fn a_pre_park_check_that_did_not_finish_is_filed_transient() {
     );
 }
 
-/// A death nobody witnessed ([`crate::ChildDeathEvidence::Unobserved`]), the
-/// commonest `ChildDied` answer on the macOS lane: a refusing successor keeps
-/// running after closing the readiness channel, so the status reaped afterwards
-/// is this process's own SIGKILL.
-///
-/// That verdict is weaker than both above: it converges, but only after an
-/// independent sample of the machine, the stand-down at the end of the first
-/// epoch, rather than at the 600 s and 1800 s rungs that re-run the same bad
-/// hour.
+/// Verify `ChildDied` with `Unobserved` evidence converges after
+/// `UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS` and schedules an epoch-cooldown resample.
 #[test]
 fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
     use crate::app_native::{
@@ -1459,11 +1393,6 @@ fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
         &mut app,
         UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS - PHYSICAL_FAILURES_PER_EPOCH,
     );
-    // Two independent samples is where "a bad hour" stops justifying spending
-    // the schedule: {UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS} attempts, fewer than
-    // the {PHYSICAL_FAILURE_LIFETIME_ATTEMPTS} a named transient failure gets
-    // (pinned by a compile-time assert). The verdict is still unexplained, so a
-    // quiet re-sample one epoch cooldown out remains.
     let resample = deadline(&app)
         .expect("a spent unexplained budget re-samples after the cooldown")
         .saturating_duration_since(std::time::Instant::now());

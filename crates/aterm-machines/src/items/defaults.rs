@@ -478,6 +478,18 @@ impl Pref {
 }
 
 impl Item for Pref {
+    fn preference_changes(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+    ) -> Result<Vec<(Target, Read<PValue>)>, String> {
+        let read = self.target.read(sys);
+        Ok(if self.want.satisfied_by(&read)? {
+            Vec::new()
+        } else {
+            vec![(self.target.clone(), read)]
+        })
+    }
     fn id(&self) -> String {
         self.id.clone()
     }

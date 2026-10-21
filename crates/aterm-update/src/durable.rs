@@ -1,10 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The crate's durability flushes, in one place: the barrier every atomic publish
-//! takes on its temporary before the rename (`manifest::write_durable`'s ledgers and
-//! markers, the Linux lane's records and executables) and on the directory after it
-//! (those, and a completed bundle swap's parents).
+//! The crate's durability flushes: the barrier every atomic publish takes on its
+//! temporary before the rename (`manifest::write_durable`, the Linux lane's records and
+//! executables) and on the directory after it (those, and a bundle swap's parents).
 
 use aterm_durable::Flush;
 use std::fs::File;
@@ -22,8 +21,9 @@ pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {
 /// It is still a real flush, made at the same point and in the same order, so a test
 /// sees the same files, renames and errors. What it drops is the drive-cache barrier.
 /// No test can observe that barrier, because it only orders the disk against a power
-/// loss. It also stalls the whole VOLUME while it runs, so every test binary running
-/// beside this one waits behind it for its own temp-dir metadata. Measured: one
+/// loss. It also holds up most flushes, growing writes, creates and renames on the
+/// volume while it runs, so a test binary running beside this one waits behind it for
+/// its own temp-dir metadata (`docs/measured/flush-wait-2026-10-21.md`). Measured: one
 /// `aterm-update --lib` run made 4,492 `F_FULLFSYNC`s, 3,681 of them through this
 /// crate (the Linux lane's records and directories, `write_durable`'s ledgers, the
 /// swap's parents) and

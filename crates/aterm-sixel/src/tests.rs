@@ -29,11 +29,10 @@ fn empty_sequence_is_none() {
 
 #[test]
 fn width_growth_is_amortized_and_preserves_the_height_fast_path() {
-    // Regression: growing the raster width one column at a time (the per-byte sixel
-    // paint path) must over-allocate the stride GEOMETRICALLY — O(log W) reallocations
+    // Growing the raster width one column at a time (the per-byte sixel
+    // paint path) must over-allocate the stride geometrically — O(log W) reallocations
     // instead of a realloc+whole-raster copy on every byte (Theta(H*W^2) DoS). And a
-    // height-only growth must still take the in-place resize fast-path (the round-5
-    // attempt broke that by over-allocating unconditionally).
+    // height-only growth must still take the in-place resize fast-path.
     let mut d = SixelDecoder::new();
     d.hook();
 
@@ -66,12 +65,11 @@ fn width_growth_is_amortized_and_preserves_the_height_fast_path() {
 
 #[test]
 fn tall_raster_width_growth_stays_amortized_near_the_pixel_cap() {
-    // Regression: on a TALL raster, geometric doubling eventually overflows
+    // On a tall raster, geometric doubling eventually overflows
     // SIXEL_MAX_PIXELS while alloc_width is still moderate (2*alloc_width*new_h > cap).
-    // The fallback must grab the WIDEST cap-fitting stride in one realloc — NOT the
-    // exact needed width (= alloc+1 on a column-at-a-time paint), which reallocs +
-    // copies the whole raster on EVERY byte (the Theta(H*W^2) DoS the doubling exists
-    // to avoid, which the exact-width fallback re-introduced for tall rasters).
+    // The fallback must grab the widest cap-fitting stride in one realloc — not the
+    // exact needed width (= alloc+1 on a column-at-a-time paint), which would realloc +
+    // copy the whole raster on every byte.
     let mut d = SixelDecoder::new();
     d.hook();
 
@@ -93,9 +91,7 @@ fn tall_raster_width_growth_stays_amortized_near_the_pixel_cap() {
             prev_w = d.alloc_width;
         }
     }
-    // O(log W) reallocations, NOT one-per-column. Pre-fix, once the fallback engaged
-    // (~column 2048) EVERY subsequent column reallocated the whole raster: ~950
-    // reallocations across this loop. The amortized path takes ~13.
+    // O(log W) reallocations (~13 across this loop), not one per column.
     assert!(
         reallocs <= 20,
         "tall-raster column-at-a-time width growth must stay amortized (O(log W) \
@@ -302,7 +298,7 @@ fn repeat_does_not_survive_band_control() {
 fn decgra_only_oversized_yields_none_without_transient() {
     // A DECGRA declaration of the maximal raster with NO following data byte:
     // `apply_raster` is deferred to `unhook`. The decoder must NOT eagerly
-    // allocate the declared box during `put` (it once allocated ~64 MiB here),
+    // allocate the declared box during `put`,
     // and `unhook` must reject the over-cap geometry before composing the
     // output `pixels` Vec — so no multi-MiB transient is ever materialized.
     let mut d = SixelDecoder::new();
@@ -326,8 +322,7 @@ fn decgra_only_oversized_yields_none_without_transient() {
 #[test]
 fn decgra_only_within_cap_uses_declared_geometry() {
     // A small DECGRA-only declaration still yields a transparent image of the
-    // declared size (the declared-geometry fallback), proving the removed eager
-    // pre-size did not break the in-cap declared path.
+    // declared size (the declared-geometry fallback).
     let img = decode(b"\"1;1;4;6").expect("in-cap declared geometry");
     assert_eq!(img.width(), 4);
     assert_eq!(img.height(), 6);

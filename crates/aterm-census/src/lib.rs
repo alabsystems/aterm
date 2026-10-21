@@ -70,6 +70,7 @@ pub mod scan_set;
 mod scope_census;
 mod tree;
 mod wasm_census;
+mod wasm_cfg;
 pub use guards::{Finding, GUARDS, GuardReport, Rule, run_guards};
 pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
 pub use lock_order::run_lock_order_census;
@@ -358,9 +359,10 @@ struct UnboundedSink {
     def_file: &'static str,
 }
 
-/// The O(history) sinks the width-reflow funnels into. `Terminal::resize` ->
+/// The O(history) sinks the width-reflow funnels into (`Terminal::resize` ->
 /// `Grid::resize` -> `resize_with_reflow_mode`, whose width branch calls
-/// `take_scrollback_lines` + `reflow_scrollback_lines`.
+/// `take_scrollback_lines` + `reflow_scrollback_lines`), and the disk walker's
+/// O(tree) entry points.
 const UNBOUNDED_REGISTRY: &[UnboundedSink] = &[
     UnboundedSink {
         symbol: "reflow_scrollback_lines",
@@ -376,6 +378,19 @@ const UNBOUNDED_REGISTRY: &[UnboundedSink] = &[
         symbol: "resize_with_reflow_mode",
         dim: "scrollback-width-reflow",
         def_file: "crates/aterm-grid/src/grid/reflow.rs",
+    },
+    // The disk walker (design §10.5): a slice is clock-bounded but for one
+    // listing call, and a whole walk is the tree. Its thread runs them; the
+    // event loop never does.
+    UnboundedSink {
+        symbol: "diskwalk_slice",
+        dim: "entries",
+        def_file: "crates/aterm-diskwalk/src/walk.rs",
+    },
+    UnboundedSink {
+        symbol: "diskwalk_size_full",
+        dim: "entries",
+        def_file: "crates/aterm-diskwalk/src/walk.rs",
     },
 ];
 
@@ -1719,22 +1734,32 @@ mod tests {
                 "crates/aterm-control/src/lib.rs".to_string(),
                 "// stub\n".to_string(),
             ),
+            (
+                "crates/aterm-diskwalk/src/walk.rs".to_string(),
+                format!(
+                    "{m}(entries)\npub fn diskwalk_slice() {{}}\n\
+                     {m}(entries)\npub fn diskwalk_size_full() {{}}\n"
+                ),
+            ),
         ]
     }
 
     /// A derivable synthetic workspace: the marker sweep is closure-scoped, so
     /// every synthetic tree needs manifests. The derived closure is
-    /// {aterm-gui, aterm-types, aterm-core, aterm-grid}, plus src/ stubs so the
-    /// drift guard holds when a test filters a support file away.
+    /// {aterm-gui, aterm-types, aterm-core, aterm-grid, aterm-diskwalk}, plus
+    /// src/ stubs so the drift guard holds when a test filters a support file
+    /// away.
     fn synth_manifests() -> Vec<(String, String)> {
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(&[
             ("aterm-core", ""),
             ("aterm-grid", ""),
+            ("aterm-diskwalk", ""),
         ]);
         for stub in [
             "crates/aterm-types/src/lib.rs",
             "crates/aterm-core/src/lib.rs",
             "crates/aterm-grid/src/lib.rs",
+            "crates/aterm-diskwalk/src/lib.rs",
         ] {
             files.push((stub.to_string(), "// stub\n".to_string()));
         }
@@ -1779,10 +1804,11 @@ mod tests {
             out.log
         );
         // The sweep scope is the synthetic workspace's derived closure
-        // (aterm-gui, aterm-types, aterm-core, aterm-grid), stated in the log.
+        // (aterm-gui, aterm-types, aterm-core, aterm-grid, aterm-diskwalk),
+        // stated in the log.
         assert!(
             out.log
-                .contains("the DERIVED GUI-process closure (4 workspace crates"),
+                .contains("the DERIVED GUI-process closure (5 workspace crates"),
             "the transcript must state the derived marker-sweep scope; log:\n{}",
             out.log
         );

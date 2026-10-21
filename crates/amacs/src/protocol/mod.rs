@@ -8,10 +8,12 @@
 //! The `edit` request with its ticket replies (`edit`) and the file-URI codec
 //! (`uri`) are implemented, and aterm-gui serves them. The edit script
 //! (`script`), its `line:h6` anchors (`anchor`) and the anchored reads
-//! (`read`) are implemented as pure code; the faces that serve them
-//! (`doc read`/`doc apply`, `amacs --read`/`--apply`) are planned work.
+//! (`read`) are implemented as pure code. aterm-gui serves the reads through
+//! the `doc` verb, whose requests and `doc ls` rows are `doc`; `doc apply`
+//! and `amacs --read`/`--apply` are planned work.
 
 pub mod anchor;
+pub mod doc;
 pub mod edit;
 pub mod read;
 pub mod script;

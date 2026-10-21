@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The reviewer's proofs of the motion layer's DEADLINES and the ETA's
-//! honesty (design §10.4.4, §10.4.6, §10.8), driven only through the crate's
-//! public API at injected instants.
+//! Proofs of the motion layer's deadlines and the ETA's honesty, driven
+//! only through the crate's public API at injected instants.
 //!
 //! The central tool is [`audit`]: it walks the host's loop — wake at each
 //! `motion_deadline`, prepare the frame there — and between two wakes looks
@@ -80,9 +79,9 @@ fn present(c: &MessageCenter, cols: usize) -> Presentation {
 
 /// What a frame DRAWS: the row's surface at its cells (the engine's
 /// cell-resolution reading, [`aterm_messages::Surface::cells`] — the
-/// fractions the host maps onto its window's pixels, design ruling 140),
+/// fractions the host maps onto its window's pixels),
 /// its fill's EDGE to a sixteenth of a cell (the host rasters it to the
-/// pixel, ruling 242), the two time slots, the fade and the glyph —
+/// pixel), the two time slots, the fade and the glyph —
 /// `RowMotion` without its `anim` descriptor.
 type Drawn = Vec<(
     Vec<Tone>,
@@ -213,17 +212,15 @@ fn comet_walk(cols: usize, look: Look) -> Vec<String> {
         .collect()
 }
 
-/// NO MISSED FRAME, IN ANY LOOK: the comet at three widths for 75 s (its
+/// No missed frame, in any look: the comet at three widths for 75 s (its
 /// elapsed words included), a download through its latched ETA, its glint
 /// and its stall where the width lays out the ETA slot, a data glide, and
 /// every echo kind for both fills — each walked frame by frame between its
-/// deadlines. And the CADENCE: a moving comet wakes on the grid exactly at
-/// the frames it draws something new — none missed, none wasted (the braille
-/// spinner that once woke it every four steps whatever the comet drew went
-/// with ruling 251, so a flat comet's hand-over now sleeps through its blank
-/// frames): the frames where a crossing's faint last sliver and the
-/// hand-over round to the same cells are skipped, not drawn twice (design
-/// ruling 140); a still look wakes at most once a second, and a
+/// deadlines. A moving comet wakes on the grid exactly at the frames it
+/// draws something new — none missed, none wasted (a flat comet's hand-over
+/// sleeps through its blank frames, and the frames where a crossing's faint
+/// last sliver and the hand-over round to the same cells are skipped, not
+/// drawn twice); a still look wakes at most once a second, and a
 /// still echo asks no frame at all.
 #[test]
 fn deadlines_never_miss_a_change_the_motion_draws() {
@@ -303,10 +300,9 @@ fn deadlines_never_miss_a_change_the_motion_draws() {
     assert!(missed.is_empty(), "missed frames:\n{}", missed.join("\n"));
 }
 
-/// A BAR WAKES ONLY FOR A FRAME THAT DRAWS SOMETHING NEW (review
-/// 2026-09-24: 38 of 131 wakes of a 10 % download at 80 columns drew the
-/// same cells — the glint's centre off a short fill at either end of its
-/// travel, and glides inside one eighth): a download at short and long fills
+/// A bar wakes only for a frame that draws something new (the glint's
+/// centre off a short fill at either end of its travel, or glides inside
+/// one eighth of a cell): a download at short and long fills
 /// and two widths, and a data glide of half a per-mille, waste no wake in the
 /// moving look — and still miss none.
 #[test]
@@ -340,20 +336,10 @@ fn a_bar_never_wakes_for_a_frame_that_draws_nothing_new() {
     }
 }
 
-/// A STALL NEVER REPAINTS WHERE THE ETA SLOT
-/// STARVED. `motion_deadline` folds the stall's onset only for a MOVING,
-/// graded bar at least 1.5 cells long (center.rs, the `look.graded && f >=
-/// 384` arm), or through the ETA slot's `next_change`. Where the width
-/// starves that slot (52 columns here, over the full-width meter) the
-/// stall's tone change —
-/// `stalled_bar`, `Tone::STALLED`, the ONLY stall signal left on such a row,
-/// since the `stalled` word has no slot — is drawn by `motion` but asked by
-/// no deadline in the STILL look (every unfocused window, Reduce Motion,
-/// Serious Mode) nor for a short bar in the moving look. On an idle window
-/// the bar keeps its live ink after the bytes stop, until something else
-/// repaints it. Fix: fold `track.next_change(q)` for every graded
-/// determinate live row with an amount, whatever the pace, the slot and the
-/// bar's length.
+/// Where the width starves the ETA slot (52 columns here, over the
+/// full-width meter), the stall's tone change (`Tone::STALLED`) is the only
+/// stall signal left on the row, so `motion_deadline` must schedule a wake
+/// for it in both `Look::STILL` and `Look::MOVING`, regardless of bar length.
 #[test]
 fn a_stall_repaints_the_bar_even_where_the_eta_slot_starved() {
     let mut missed = Vec::new();
@@ -417,15 +403,13 @@ fn stream(seed: u64, n: usize) -> Vec<(u64, Amount)> {
     out
 }
 
-/// THE ETA NEVER SPEAKS FROM TOO LITTLE, NEVER GOES NEGATIVE OR ABSURD, AND
-/// ONLY COUNTS DOWN BETWEEN READINGS: over 64 random streams (bytes and
-/// steps; bursts, droughts, regressions, a growing total), a number appears
-/// only after at least five readings spanning at least five seconds since
-/// the estimator last started over (three samples for the first secant over
-/// `RATE_MIN_SPAN`, then three agreeing projections over `STABLE_MIN`); it
-/// is at most 48 h; its words are `<5 s left` or `N … left` — no `~`, since
-/// `left` already says it is an estimate (ruling 241) — never zero; and between
-/// two readings it never grows.
+/// Over 64 random streams (bytes and steps; bursts, droughts, regressions, a
+/// growing total), an ETA number appears only after at least five readings
+/// spanning at least five seconds since the estimator last started over
+/// (three samples for the first secant over `RATE_MIN_SPAN`, then three
+/// agreeing projections over `STABLE_MIN`); it is at most 48 h; its words are
+/// `<5 s left` or `N … left` — no `~`, since `left` already says it is an
+/// estimate — never zero; and between two readings it never grows.
 #[test]
 fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
     for seed in 0..64u64 {
@@ -473,18 +457,10 @@ fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
     }
 }
 
-/// AN OVERDUE ETA READS `<5 s` FOREVER FOR WORK
-/// COUNTED IN STEPS OR ITEMS. Once the latched completion instant passes
-/// with no further reading, `eta()` answers `Remaining(0)` — `<5 s` — for as
-/// long as the row lives: a minute (or ten) later it still promises "under
-/// five seconds". Bytes are rescued by the stall after `STALL_AFTER`; steps
-/// and items (the toolchain row's `Unit::Steps` amount) have no exit. The
-/// host's toolchain lane masks it today only because atpkg's 2 s heartbeat
-/// re-feeds the same `done`, which unlatches the ETA; a reporter that
-/// restates only on change shows the lie. Fix: once the anchor is overdue by
-/// more than a grace (e.g. `max(5 s, a fifth of the estimate)`) with no
-/// advance, unlatch (`Hidden`), and give `next_change` that instant so the
-/// slot clears on time.
+/// Once the latched completion instant is overdue by more than its grace
+/// window with no further advance, `eta()` unlatches (`Hidden`) for work
+/// counted in `Unit::Steps` or `Unit::Items` rather than continuing to
+/// report `<5 s left` indefinitely.
 #[test]
 fn an_overdue_eta_stops_promising_under_five_seconds() {
     for unit in [Unit::Steps, Unit::Items] {
@@ -538,18 +514,9 @@ fn the_elapsed_clock_ticks_exactly_on_its_deadlines() {
     assert!(first >= now + ELAPSED_AFTER && first < now + ELAPSED_AFTER + ANIM_FRAME);
 }
 
-/// A SAME-ACTIVITY SUPERSEDE RESTARTS THE
-/// ELAPSED CLOCK. The readout is `elapsed_words(q − posted_at)`, and a
-/// supersede by key is a new post — so work that re-words its row
-/// (`announce_toolchain_pass` twice; any reporter that re-titles a phase of
-/// the same work) shows `0:29`, then nothing for ten seconds, then `0:10`,
-/// while the comet's epoch (`motion_since`, inherited on a same-activity
-/// supersede) runs on — and the accessibility description, which speaks
-/// `elapsed_spoken(now − motion_since)` (app_settings.rs), says "running for
-/// 45 seconds" beside a band reading `0:14` (and lags the band by the reveal
-/// grace on every row posted with `reveal_after`). Fix: one clock for the
-/// work — carry the started-at instant across a same-activity supersede (as
-/// the epoch is) and have the band and the description read the same one.
+/// A same-activity supersede by key preserves the activity's started-at
+/// instant so the elapsed readout continues counting from the original post
+/// rather than resetting.
 #[test]
 fn the_elapsed_clock_survives_a_same_activity_supersede() {
     let now = minted_now();
@@ -587,7 +554,7 @@ fn the_elapsed_clock_survives_a_same_activity_supersede() {
         .readout
         .clone();
     // The frame grid floors 35 s to 34.98 s: `for 34 s` is the running
-    // time (labelled, never a bare clock: ruling 241).
+    // time (labelled, never a bare clock).
     assert_eq!(
         after.as_deref(),
         Some("for 34 s"),
@@ -595,7 +562,7 @@ fn the_elapsed_clock_survives_a_same_activity_supersede() {
     );
 }
 
-/// A FAULT ECHO'S HOLD ASKS NO FRAME (ruling 245): a bar's
+/// A fault echo's hold asks no frame: a bar's
 /// warn wash stands still from `ECHO_FAULT_CROSS` to `ECHO_FAULT_FLASH`, a
 /// busy row's drain from `ECHO_DRAIN` — no display frame there draws
 /// anything new, so none wakes; the fade's first frame is the next wake, and

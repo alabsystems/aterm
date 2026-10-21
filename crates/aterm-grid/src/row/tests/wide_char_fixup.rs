@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 //
-// cells_mut_with_fixup behavioral tests.
+// Wide-pair orphan fixups across the row write and erase lanes, and the early-wrap hole.
 
 use super::super::*;
 use super::make_row;
@@ -15,13 +15,10 @@ fn cells_mut_with_fixup_handles_multiple_wide_chars() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Place wide chars at 0-1, 2-3, 4-5
     row.write_wide_char(0, '\u{4E00}', fg, bg, CellFlags::empty());
     row.write_wide_char(2, '\u{4E8C}', fg, bg, CellFlags::empty());
     row.write_wide_char(4, '\u{4E09}', fg, bg, CellFlags::empty());
 
-    // The helper range covers cols 1-4 (starts on continuation of first,
-    // includes WIDE of third).
     {
         let target = row
             .cells_mut_with_fixup(1, 4)
@@ -29,11 +26,11 @@ fn cells_mut_with_fixup_handles_multiple_wide_chars() {
         assert_eq!(target.len(), 4);
     }
 
-    // Col 0 should be cleared (orphaned first half when continuation at 1 is overwritten)
+    // Col 0: the head orphaned by overwriting its continuation at 1.
     assert_eq!(row.get(0).unwrap().char(), ' ');
     assert!(!row.get(0).unwrap().is_wide());
 
-    // Col 5 should be cleared (orphaned continuation when WIDE at 4 is overwritten)
+    // Col 5: the continuation orphaned by overwriting the WIDE head at 4.
     assert_eq!(row.get(5).unwrap().char(), ' ');
     assert!(!row.get(5).unwrap().is_wide_continuation());
 }
@@ -68,7 +65,6 @@ fn fixup_wide_boundary_clears_orphaned_continuation_at_left() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Place a wide char at cols 2-3 so col 3 is WIDE_CONTINUATION.
     row.write_wide_char(2, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(row.get(2).unwrap().is_wide());
     assert!(row.get(3).unwrap().is_wide_continuation());
@@ -84,10 +80,8 @@ fn fixup_wide_boundary_clears_orphaned_continuation_at_left() {
     assert!(!row.get(2).unwrap().is_wide());
     assert!(row.get(3).unwrap().is_wide_continuation());
 
-    // left=3 is the orphaned continuation (cur_cont && !prev_wide).
     row.fixup_wide_boundary(3, 6, 10, true);
 
-    // The orphaned WIDE_CONTINUATION at col 3 should now be cleared.
     assert!(
         !row.get(3).unwrap().is_wide_continuation(),
         "orphaned WIDE_CONTINUATION at left boundary should be cleared"
@@ -99,8 +93,8 @@ fn fixup_wide_boundary_clears_orphaned_continuation_at_left() {
     );
 }
 
-/// `clear_range_with` (DECFRA/DECERA/BCE fill) clears an orphaned WIDE head just
-/// left of the rect to `Cell::EMPTY` instead of painting it with the fill.
+/// `clear_range_with` (the DECFRA/DECERA rule) clears an orphaned WIDE head just left of the
+/// rect to `Cell::EMPTY` instead of painting it with the fill.
 #[test]
 fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -109,7 +103,6 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Wide char at cols 0-1 (col 0 WIDE, col 1 its continuation).
     row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(row.get(0).unwrap().is_wide());
 
@@ -125,17 +118,14 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
         "fill must be visible for this test to mean anything"
     );
 
-    // Fill [1, 5): overwrites the continuation at col 1, orphaning the WIDE
-    // head at col 0 (which sits outside the rect).
+    // Overwrites the continuation at col 1, orphaning the WIDE head at col 0 outside the rect.
     row.clear_range_with(1, 5, fill);
 
-    // In-rect cells carry the fill.
     assert_eq!(
         row.get(3).unwrap().char(),
         'X',
         "in-rect cell should hold the fill"
     );
-    // The orphaned WIDE head at col 0 must be cleared to empty, not painted 'X'.
     assert!(
         !row.get(0).unwrap().is_wide(),
         "orphaned WIDE head must be cleared"
@@ -151,8 +141,7 @@ fn clear_range_with_does_not_bleed_fill_onto_left_wide_orphan() {
     );
 }
 
-/// Right boundary: an orphaned WIDE continuation just right of the fill rect is
-/// cleared to `Cell::EMPTY`, not painted with the fill.
+/// An orphaned continuation just right of the fill rect is cleared to `Cell::EMPTY`, not filled.
 #[test]
 fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -161,7 +150,6 @@ fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Wide char at cols 6-7 (col 6 WIDE, col 7 its continuation).
     row.write_wide_char(6, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(row.get(7).unwrap().is_wide_continuation());
 
@@ -172,8 +160,7 @@ fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
         CellFlags::empty(),
     );
 
-    // Fill [2, 7): overwrites the WIDE head at col 6, orphaning the
-    // continuation at col 7 (which sits outside the rect).
+    // Overwrites the WIDE head at col 6, orphaning the continuation at col 7 outside the rect.
     row.clear_range_with(2, 7, fill);
 
     assert_eq!(
@@ -194,8 +181,7 @@ fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
         row.get(7).unwrap().is_empty(),
         "right-of-rect orphan must not inherit fill attributes"
     );
-    // The cleared orphan at col 7 was the last content cell (old_len == 8), so
-    // len shrinks to 7; otherwise row_text would show a trailing space.
+    // The cleared orphan was the tail, so len shrinks to 7 (no trailing space in row_text).
     assert_eq!(
         row.len(),
         7,
@@ -203,9 +189,8 @@ fn clear_range_with_does_not_bleed_fill_onto_right_wide_orphan() {
     );
 }
 
-/// A DECLRMM-bounded insert that bisects a wide pair clears both halves, so the
-/// continuation's bit 10 (WIDE_CONTINUATION, aliasing PROTECTED) is not shifted
-/// into a phantom protected spacer. Mirrors insert_chars_fill.
+/// A DECLRMM-bounded insert that bisects a wide pair clears both halves, so the continuation's
+/// bit 10 (WIDE_CONTINUATION, aliasing PROTECTED) is not shifted into a phantom protected cell.
 #[test]
 fn insert_chars_bounded_fill_clears_phantom_continuation() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -214,21 +199,18 @@ fn insert_chars_bounded_fill_clears_phantom_continuation() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // Wide char at cols 4-5.
     row.write_wide_char(4, '\u{4E2D}', fg, bg, CellFlags::empty());
     assert!(row.get(4).unwrap().is_wide());
     assert!(row.get(5).unwrap().is_wide_continuation());
 
-    // DECIC-style bounded insert of 1 cell at the continuation (col 5), within
-    // margin [.., 9). This bisects the pair and shifts old cells[5] to cells[6].
+    // A bounded insert at the continuation bisects the pair and shifts cells[5] to cells[6].
     row.insert_chars_bounded_fill(5, 1, 9, Cell::EMPTY);
 
     assert!(
         !row.get(4).unwrap().is_wide(),
         "orphaned WIDE head at 4 must be cleared"
     );
-    // cells[6] holds the shifted continuation; its left neighbour is a fill, so
-    // a stale bit 10 would read as DECSCA-protected.
+    // cells[6] holds the shifted continuation; a stale bit 10 there would read as protected.
     assert!(
         !row.get(6)
             .unwrap()
@@ -267,8 +249,7 @@ fn clear_range_with_orphan_paints_left_wide_orphan_with_the_bce_blank() {
     let fill = Cell::bce_blank(PackedColors::with_indexed_bg(4));
     assert!(!fill.is_empty(), "precondition: the BCE blank is visible");
 
-    // EL-style erase of [1, 5): the continuation at col 1 goes, orphaning the
-    // WIDE head at col 0.
+    // EL-style erase of [1, 5) orphans the WIDE head at col 0.
     row.clear_range_with_orphan(1, 5, fill, fill);
 
     let orphan = row.get(0).unwrap();
@@ -286,8 +267,7 @@ fn clear_range_with_orphan_paints_left_wide_orphan_with_the_bce_blank() {
     );
 }
 
-/// Right-boundary twin: the orphan at index `end` now holds a visible blank, so
-/// `len` stretches to cover it.
+/// Right-boundary twin: the orphan at `end` holds a visible blank, so `len` covers it.
 #[test]
 fn clear_range_with_orphan_paints_right_wide_orphan_with_the_bce_blank() {
     use crate::{Cell, CellFlags, PackedColor, PackedColors};
@@ -328,8 +308,8 @@ fn clear_range_with_orphan_paints_right_wide_orphan_with_the_bce_blank() {
     );
 }
 
-/// A rect op (`clear_range_with`) blanks both orphans to `Cell::EMPTY` even with
-/// a visible fill background, and reports the widened span.
+/// A rect op (`orphan = Cell::EMPTY`) blanks both orphans to `Cell::EMPTY` even under a visible
+/// fill, and reports the widened span.
 #[test]
 fn clear_range_with_keeps_rect_orphans_empty_under_a_visible_fill() {
     use crate::{Cell, CellFlags, PackedColor, PackedColors};
@@ -356,8 +336,7 @@ fn clear_range_with_keeps_rect_orphans_empty_under_a_visible_fill() {
     assert_eq!(written, 2..8, "the widened span is reported either way");
 }
 
-/// clear_range_with with an empty fill that erases a trailing wide char shrinks
-/// len: the continuation at `end` (one past the range) was the tail.
+/// clear_range_with with an empty fill shrinks len past a tail continuation at `end`.
 #[test]
 fn clear_range_with_empty_fill_shrinks_len_on_tail_wide_orphan() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -374,8 +353,7 @@ fn clear_range_with_empty_fill_shrinks_len_on_tail_wide_orphan() {
     );
     assert_eq!(row.len(), 4, "AB中 → len 4");
 
-    // Erase [0, 3): fill 0..3 empty; cells[2] is the WIDE head, so its
-    // continuation at col 3 (== end) is the orphaned tail and gets cleared.
+    // cells[2] is the WIDE head, so its continuation at col 3 (== end) is the orphaned tail.
     row.clear_range_with(0, 3, Cell::EMPTY);
 
     for c in 0..4 {
@@ -520,8 +498,7 @@ fn write_wide_char_packed_shrinks_len_on_tail_wide_orphan() {
     row.write_wide_char_packed(2, '\u{4E00}', PackedColors::DEFAULT, CellFlags::empty());
     assert_eq!(row.len(), 4, "wide char at 2-3 → len 4");
 
-    // New wide char at 1-2 overwrites the head at col 2; its continuation at col 3
-    // (the tail) is orphaned and cleared.
+    // A wide char at 1-2 overwrites the head at col 2, orphaning the tail continuation at col 3.
     assert!(row.write_wide_char_packed(1, '\u{4E8C}', PackedColors::DEFAULT, CellFlags::empty()));
     assert!(row.get(1).unwrap().is_wide());
     assert!(row.get(2).unwrap().is_wide_continuation());
@@ -552,8 +529,7 @@ fn fill_cell_run_shrinks_len_on_tail_wide_orphan() {
     );
     assert_eq!(row.len(), 7, "wide char at 5-6 → len 7");
 
-    // Fill [3, 6) with a non-empty template: the last filled cell (col 5) is the
-    // WIDE head, so its continuation at col 6 (== end) is orphaned and cleared.
+    // The last filled cell (col 5) is the WIDE head; its continuation at col 6 is orphaned.
     let written = row.fill_cell_run(3, 3, Cell::from_ascii_fast(b'X'));
     assert_eq!(written, 3);
     assert!(
@@ -588,8 +564,7 @@ fn cells_mut_with_fixup_shrinks_len_on_tail_wide_orphan() {
     );
     assert_eq!(row.len(), 7, "wide char at 5-6 → len 7");
 
-    // Bulk ASCII write over [3, 6): the WIDE head at col 5 is covered, so its
-    // continuation at col 6 (== end, one past the slice) is orphaned and cleared.
+    // Covers the WIDE head at col 5; its continuation at col 6 (one past the slice) is orphaned.
     {
         let target = row.cells_mut_with_fixup(3, 3).expect("range inside row");
         assert_eq!(target.len(), 3);
@@ -633,8 +608,7 @@ fn delete_chars_fill_shrinks_len_on_deleted_wide_head_at_tail() {
     );
     assert_eq!(row.len(), 4, "ab中 → len 4");
 
-    // DCH at col 2 deletes the WIDE head; its continuation at col 3 (the tail) is
-    // cleared and shifted in. Real content is now just "ab".
+    // DCH at col 2 deletes the WIDE head and clears its continuation (the tail).
     row.delete_chars_fill(2, 1, Cell::EMPTY);
 
     assert_eq!(row.get(0).unwrap().char(), 'a');
@@ -650,11 +624,9 @@ fn delete_chars_fill_shrinks_len_on_deleted_wide_head_at_tail() {
     );
 }
 
-/// The early-wrap hole's life: recorded on a row whose last cell is the blank
-/// a wide glyph skipped, it stays a hole only while that cell holds the blank.
-/// A write into the last cell (any write lane), a width change without
-/// rewrap and a whole-row clear end it; a glyph that reaches the cell some
-/// other way makes it content without touching the flag.
+/// An early-wrap hole (the blank a wide glyph skipped) lasts only while the row's last cell
+/// holds that blank: a write into the cell (any lane), a width change without rewrap and a
+/// whole-row clear end it; a glyph placed there some other way makes it content.
 #[test]
 fn an_early_wrap_hole_lasts_until_its_cell_is_written() {
     use crate::{Cell, CellFlags, PackedColor};
@@ -706,14 +678,11 @@ fn an_early_wrap_hole_lasts_until_its_cell_is_written() {
     assert!(!row.has_early_wrap_hole(), "a whole-row clear");
 }
 
-/// Every lane that rewrites a hole's cell other than by erasing it ends the
-/// hole, also when it leaves a blank there: a wide glyph over the cell whose
-/// head a narrow glyph then overwrites (the spacer is blanked), a wide run,
-/// ICH shifting a printed space into the cell, DCH shifting the hole left and
-/// filling the cell, a DECFRA glyph a DECERA erases later. Left set, the flag
-/// would let the next rewrap drop that blank, a cell the screen shows inside
-/// its line. A bounded shift that stops short of the row end, a DECERA blank
-/// fill and an erase of the cell leave the hole a hole.
+/// Every lane that rewrites a hole's cell other than by erasing ends the hole, even when it
+/// leaves a blank there (a wide glyph's blanked spacer, a wide run, ICH/DCH shifting into the
+/// cell, a DECFRA glyph later erased); a stale flag would let the next rewrap drop a blank the
+/// screen shows. A bounded shift short of the row end, a DECERA blank fill and an erase of the
+/// cell leave the hole a hole.
 #[test]
 fn an_early_wrap_hole_ends_when_its_cell_is_rewritten_with_a_blank() {
     use crate::{Cell, CellFlags, PackedColor};

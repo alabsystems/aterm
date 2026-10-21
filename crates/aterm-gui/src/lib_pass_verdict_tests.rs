@@ -11,8 +11,7 @@ use std::time::Duration;
 fn every_pass_exit_classifies_to_its_verdict() {
     let busy = Some(i32::from(atpkg::lock::CONTENDED_EXIT));
     let offline = Some(i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT));
-    // The constants are the ones atpkg exits with, read from the crates both
-    // sides share.
+    // atpkg's exit codes, read from the crates both sides share.
     assert_eq!(busy, Some(75));
     assert_eq!(offline, Some(69));
     type Row = (&'static str, Option<i32>, bool, bool, PassVerdict);
@@ -31,10 +30,8 @@ fn every_pass_exit_classifies_to_its_verdict() {
         // A marker outranks the code…
         ("a marker outranks a failing code", Some(1), false, true, PassVerdict::Answered),
         ("a marker answers an opened card", Some(0), true, true, PassVerdict::Answered),
-        // …except beside the contention code: exit 75 comes only from the
-        // dispatch edge, before any verb, and since 0.82.0 that refusal prints
-        // a terminal of its own (`seed-busy:`) — so a marker beside 75 is the
-        // refusal saying it stood aside, and the pass is still deferred.
+        // …except beside exit 75: only the dispatch edge's refusal exits 75, printing
+        // its own `seed-busy:` terminal, so the pass is still deferred.
         ("the contention refusal's own terminal is not a pass that ran", busy, false, true, PassVerdict::Busy),
         // Offline is offline whatever marker answered…
         ("offline, no marker", offline, false, false, PassVerdict::Offline),

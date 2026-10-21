@@ -65,27 +65,9 @@ impl Cargo {
     }
 }
 
-/// The eight measurement cells, in report order.
-///
-/// # Every shipped triple is a cell
-///
-/// `atpkg::manifest::TARGETS` lists the triples this project publishes
-/// artifacts for; each has a cell, including the second architecture of each
-/// OS, where a cfg break otherwise hides. atpkg's
-/// `every_published_triple_is_a_forge_cell` holds the shipped triples to a cell each.
-///
-/// # Every cell is rooted at something aterm ships
-///
-/// The six native cells are rooted at the binary package `aterm`. `aterm` is
-/// never compiled for `wasm32`, so the wasm cells are rooted at the two shipped
-/// browser modules, each compiled by name in `verify cells` and the `wasm`
-/// lane of `verify perf`:
-///
-/// * `aterm-wasm`: the CPU/`putImageData` path (`aterm-render` rasterizer);
-/// * `aterm-gpu-web`: the GPU path (`aterm-gpu` over `wgpu` -> WebGL2/WebGPU).
-///
-/// They are different downloads with very different surfaces (`wgpu` and its
-/// subtree), so each has its own row and ratchet.
+/// The eight measurement cells, in report order: six native `aterm` cells
+/// (covering `atpkg::manifest::TARGETS`) plus the two browser wasm modules
+/// (`aterm-wasm` and `aterm-gpu-web`).
 pub fn default_cells() -> Vec<Cell> {
     vec![
         Cell {
@@ -103,41 +85,26 @@ pub fn default_cells() -> Vec<Cell> {
             triple: "x86_64-pc-windows-msvc".to_string(),
             package: "aterm".to_string(),
         },
-        // The CPU renderer module: `aterm-render`'s rasterizer to an RGBA
-        // buffer, blitted with `putImageData`. The smallest cell in the matrix.
         Cell {
             name: "wasm-cpu".to_string(),
             triple: "wasm32-unknown-unknown".to_string(),
             package: "aterm-wasm".to_string(),
         },
-        // The GPU renderer module: the engine plus `aterm-gpu` over `wgpu`.
-        // Each browser module can also have dependencies its sibling omits.
         Cell {
             name: "wasm-gpu".to_string(),
             triple: "wasm32-unknown-unknown".to_string(),
             package: "aterm-gpu-web".to_string(),
         },
-        // The second architecture of each shipped OS, rooted at `aterm`.
-        // linux-arm and win-arm are no fleet box's own triple, so they run in
-        // `verify cells`; mac-x64 is a fleet host triple.
-        //
-        // The Intel-Mac slice of the universal release binary
-        // (`aterm-release`'s buildplan.rs builds it under `RUSTUP_TOOLCHAIN=
-        // stable`); its artifacts ship inside the mac-arm `.dmg`.
         Cell {
             name: "mac-x64".to_string(),
             triple: "x86_64-apple-darwin".to_string(),
             package: "aterm".to_string(),
         },
-        // ARM Linux: the triple the Linux lane (`atpkg-publish lane run linux`)
-        // cross-packs beside x86_64, and the one an aarch64 cell would serve.
         Cell {
             name: "linux-arm".to_string(),
             triple: "aarch64-unknown-linux-gnu".to_string(),
             package: "aterm".to_string(),
         },
-        // ARM Windows: the triple apps/aterm-win/build.ps1 selects on an ARM64
-        // host.
         Cell {
             name: "win-arm".to_string(),
             triple: "aarch64-pc-windows-msvc".to_string(),

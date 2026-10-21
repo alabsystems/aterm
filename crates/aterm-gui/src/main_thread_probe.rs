@@ -1,34 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the stall watchdog can learn about the MAIN thread from another
-//! thread: how much CPU it has used, and — at a stall — where it is.
+//! What the stall watchdog can learn about the main thread from another thread: how much CPU
+//! it has used, and, at a stall, where it is. The heartbeat only names which aterm winit root
+//! ran last; a thread spinning below `-[NSApplication run]` (e.g. CoreFoundation timer catch-up,
+//! see `aterm_objc::wake_timer`) has no aterm frame on the stack at all.
 //!
-//! # Why the watchdog needs both (the 2026-09-26 freeze)
+//! * [`cpu_time`]: the thread's accumulated CPU (`thread_info`). A frozen heartbeat while the
+//!   thread burns CPU is a spin, whichever root ran last, including after `AboutToWait`, the
+//!   idle park point the heartbeat rule exempts.
+//! * [`stack`]: the thread's return addresses (suspend, read registers, walk the frame-pointer
+//!   chain with `vm_read_overwrite`, resume), symbolized with `dladdr` only after the thread
+//!   runs again, so the capture takes no lock the suspended thread could hold. Frames print as
+//!   `image + offset` after the executable's load address and UUID, so a stripped release's
+//!   frames resolve against its dSYM with `atos -l <load address>`.
 //!
-//! The watchdog's heartbeat is beaten by aterm's own winit roots, so it can say
-//! WHICH root ran last but not what the thread is doing now. On 2026-09-26 it
-//! reported `no heartbeat for 5.010037459s while inside \`NewEvents\`` — and the
-//! main thread was not inside `NewEvents`. That handler had returned; the thread
-//! was spinning in CoreFoundation's timer catch-up (`__CFRunLoopDoTimer + 1220`,
-//! see `aterm_objc::wake_timer`), below `-[NSApplication run]` with no aterm
-//! frame on the stack. Only a macOS hang report and the release's dSYM could
-//! say so. Two probes close that:
-//!
-//! * [`cpu_time`] — the main thread's accumulated CPU (`thread_info`). A
-//!   heartbeat that is frozen while the thread burns CPU is a spin, whichever
-//!   root ran last — including after `AboutToWait`, the idle park point the
-//!   heartbeat rule has to exempt.
-//! * [`stack`] — the main thread's return addresses (suspend, read its
-//!   registers, walk the frame-pointer chain with `vm_read_overwrite`, resume),
-//!   symbolized with `dladdr` only AFTER the thread runs again, so the capture
-//!   itself takes no lock the suspended thread could hold. Each frame is
-//!   printed as `image + offset` like a hang report — the aterm frames of a
-//!   stripped release resolve against its dSYM with `atos -l <load address>`,
-//!   which [`stack`] prints with the binary's UUID.
-//!
-//! macOS only; elsewhere both answer `None` and the watchdog keeps its
-//! heartbeat rule alone.
+//! macOS only; elsewhere both answer `None`.
 
 use std::time::Duration;
 
@@ -416,10 +403,8 @@ mod tests {
         assert_eq!(&out[..n], &[0xA0, 0xA1]);
     }
 
-    /// The live probe against a real spinning thread (a spawned stand-in for
-    /// the main thread, registered the way `watchdog::start` registers the
-    /// real one): its CPU time advances while it spins, and suspending it
-    /// yields a frame chain down to pthread's thread entry.
+    /// The live probe on a spinning stand-in for the main thread: its CPU time advances and a
+    /// suspend yields a frame chain down to pthread's thread entry.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_probe_reads_a_spinning_threads_cpu_and_stack() {
@@ -441,9 +426,8 @@ mod tests {
         while !registered.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        // CPU time is read until it has visibly advanced, not over a fixed
-        // wall window: under a loaded parallel suite the spinner may get a
-        // fraction of a core, and the claim is only that the reading moves.
+        // Read until the CPU time visibly advances, not over a fixed window: under a loaded
+        // suite the spinner may get a fraction of a core.
         let before = cpu_time().expect("thread_info on the registered thread");
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let mut used = Duration::ZERO;

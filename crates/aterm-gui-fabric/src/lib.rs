@@ -238,7 +238,13 @@ pub trait Timeline {
 
 /// WHAT A FABRIC RECORD SAYS, TYPED, for the session log's mark beside it
 /// ([`FabricSession::record_fact`]), so nothing parses a timeline payload
-/// back: ids, words and offsets only — never a body, a reason or a topic.
+/// back: ids, words and offsets — never a body. Every field of the record's
+/// row is the fact's (session log phase 6, 6F-5 and 6F-6), so the mark beside
+/// it reads the row's whole payload: a topic's name and its `since=` token,
+/// an advisory's or a hold's reason are the record's too, and the session
+/// log holds each at its content tier alone, beside a fingerprint where one
+/// names it (ruling U11): never journaled, carried or published. A post's
+/// relay hops and its caller's key are host tier: never on the bus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FabricFact<'a> {
     /// A row delivered to this session's inbox: its `kind`, its sender's
@@ -249,24 +255,75 @@ pub enum FabricFact<'a> {
         off: u64,
         inbox: u64,
     },
-    /// `inbox seen <id>` moved the watermark or decided a verdict: the row's
-    /// id and the verdict (`None`: seen, no verdict named).
+    /// `inbox seen <id>`, every one (6F-6): the named row's id and offset,
+    /// the addressed lane's refill floor (`None`: `floor=-`), the watermark
+    /// after, the verdict it decided with the row's kind and sender (`None`:
+    /// no verdict, or the same one again), and whether it MOVED anything
+    /// (the watermark, or a verdict decided): the fold folds only moves.
     MailSeen {
         inbox: u64,
+        off: u64,
+        floor: Option<u64>,
+        seen: u64,
         verdict: Option<&'a str>,
+        kind: &'a str,
+        from: &'a str,
+        moved: bool,
     },
-    /// A post queued for the bridge: its kind, its recipient's principal (as
-    /// the `post` record spells it) and its post id.
+    /// A post queued for the bridge: its kind, its recipient (as the caller
+    /// wrote it; the `post` record pct-encodes it), its post id, and its
+    /// options: the inbox id it answers (`re=`), its deadline (`dl=`), its
+    /// relay hops (`via=`) and the caller's own key for it (the `post`
+    /// row's `key=`, the mark's `idem=`; 6F-6).
     MailOut {
         kind: &'a str,
         to: &'a str,
         post: u64,
+        re: Option<u64>,
+        dl: Option<u64>,
+        via: Option<&'a str>,
+        idem: Option<&'a str>,
     },
-    /// An outbound post landed on the bus at `off`.
-    MailLanded { post: u64, off: u64 },
-    /// The session's hold moved: whether it is held after, and whether the
-    /// bridge moved it.
-    Hold { held: bool, bridge: bool },
+    /// An outbound post retired: landed on the bus at `off`, or landed
+    /// nowhere (`None`, the row's `off=-`) and why when aterm knows
+    /// (`not-carried`, `log-replaced`; 6F-6).
+    MailLanded {
+        post: u64,
+        off: Option<u64>,
+        why: Option<&'static str>,
+    },
+    /// The session's hold moved: whether it is held after, whether the
+    /// bridge moved it, and the row's fields (6F-6): the origin of the hold
+    /// that stands first (or the one just lifted), the origins standing
+    /// (`-` for none), the standing hold's reason (`None`: nothing stands),
+    /// and whether the halt was carried in rather than set here.
+    Hold {
+        held: bool,
+        bridge: bool,
+        origin: &'a str,
+        hold_origin: &'a str,
+        reason: Option<&'a str>,
+        carried: bool,
+    },
+    /// A broadcast opt-in moved (`topic add <t> since=<s>`, `topic drop
+    /// <t>`; phase 6, 6F-5): whether it was added, the topic, and the
+    /// `since=` token an add resumes from.
+    Topic {
+        add: bool,
+        name: &'a str,
+        since: Option<&'a str>,
+    },
+    /// A lost bridge's ADVISORY on a session it governed ([`bridge_lost`]'s
+    /// default): the hold the fail-closed sweep would have applied, its
+    /// origin and its reason, and the bridge generation lost (6F-5).
+    Advisory {
+        origin: &'a str,
+        reason: &'a str,
+        generation: u64,
+    },
+    /// A parked `inbox get @<off>` asked the bridge for the record at `off`
+    /// (the `fetch` row the bridge drains; 6F-5, ruling U15).
+    Fetch { off: u64 },
 }
 
 /// WHAT THE TWO BRIDGE VERBS NEED OF THE REGISTRY: aterm-gui's `SessionStore`,
@@ -280,6 +337,11 @@ pub trait Registry: Send + Sync + 'static {
     /// A lost bridge left `sessions` running with an advisory instead of
     /// halting them ([`bridge_lost`]): say so once, in the message band.
     fn bridge_lost_advised(&self, sessions: usize);
+    /// The bridge that owns the link moved `files` state files it found torn
+    /// after an unclean shutdown into its state dir's quarantine (`link
+    /// set-aside`, [`cmd_link`]):
+    /// a fact for the owner's later look, never an alert.
+    fn torn_state_set_aside(&self, files: u64);
 }
 
 /// The registry as the fabric holds it: one allocation per instance, whose
@@ -378,8 +440,9 @@ pub const OUTBOX_BYTES_MAX: usize = 4 * 1024 * 1024;
 /// caller and the endpoint MEET on, and it is enforced where the reply is built
 /// so no caller can disagree with it. Sized at one session's full queue: large
 /// enough that the common case (a handful of sessions, small bodies) is still one
-/// round trip, and a partial drain is resumed by the bridge's two-second roster
-/// backstop because `outbox` retires nothing.
+/// round trip. A partial drain retires nothing and says `more` ([`cmd_outbox`]),
+/// so the bridge's queued `post` events resume it at once, or with none queued
+/// its two-second roster backstop.
 const OUTBOX_DRAIN_BYTES_MAX: usize = OUTBOX_BYTES_MAX;
 
 /// How many RETIRED posts (landed or undeliverable) a session keeps after the
@@ -1134,14 +1197,22 @@ impl Holds {
     /// last event alone (`aterm fabric`, the bridge) reads what stands. When
     /// nothing stands it is `0 reason=- origin=<the origin just lifted>`.
     fn event(&self, lifted: &str) -> String {
+        let (origin, reason, hold_origin) = self.event_fields(lifted);
+        format!(
+            "{} reason={} origin={origin} hold_origin={hold_origin}",
+            u8::from(reason.is_some()),
+            reason.as_deref().unwrap_or("-"),
+        )
+    }
+
+    /// [`Self::event`]'s fields, for the [`FabricFact::Hold`] beside its
+    /// record (6F-6): the origin and the reason of the hold that stands
+    /// first, or `lifted` and `None` when nothing stands, and the standing
+    /// origins ([`Self::origins`]).
+    fn event_fields(&self, lifted: &str) -> (String, Option<String>, String) {
         match self.first() {
-            Some(first) => format!(
-                "1 reason={} origin={} hold_origin={}",
-                first.reason,
-                first.origin,
-                self.origins()
-            ),
-            None => format!("0 reason=- origin={lifted} hold_origin=-"),
+            Some(first) => (first.origin, Some(first.reason), self.origins()),
+            None => (lifted.to_string(), None, self.origins()),
         }
     }
 }
@@ -1593,6 +1664,11 @@ pub fn toml_cost(s: &str) -> usize {
 /// The reason a post the handoff could not carry is retired with in the
 /// successor ([`FabricCarry::uncarried`]).
 pub const NOT_CARRIED: &str = "not-carried";
+
+/// The reason a queued reply is retired with when the bus log it answers was
+/// replaced by one that does not hold the record its `re=` names
+/// (`Inbox::forget_bus_offsets`).
+pub const LOG_REPLACED: &str = "log-replaced";
 
 /// The largest number a TOML integer holds (an `i64`): a carried value past it
 /// would fail the whole manifest's serialization, so its row is not carried.
@@ -2112,7 +2188,7 @@ impl Inbox {
         for post in &mut self.posts {
             if post.off.is_none() && !post.dead && post.re.is_some_and(|re| !kept(re)) {
                 post.dead = true;
-                post.dead_reason = "log-replaced".to_string();
+                post.dead_reason = LOG_REPLACED.to_string();
                 post.body.clear();
                 post.body.shrink_to_fit();
                 post.via = None;
@@ -2487,21 +2563,22 @@ impl SessionFabric {
         since: &str,
         timeline: &Mutex<impl Timeline>,
     ) -> Result<bool, TopicsFull> {
-        self.topic_add_recording(t, since, &|kind, payload| {
-            timeline
+        self.topic_add_recording(t, since, &|kind, payload, fact| {
+            let _ = timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record(kind, payload);
+                .record_fact(kind, payload, fact);
         })
     }
 
     /// [`Self::topic_add`], recording through `record` (a session's own
-    /// [`FabricSession::record`]).
+    /// [`FabricSession::record_fact`]), with the move's [`FabricFact::Topic`]
+    /// for the session log's mark beside the row.
     pub fn topic_add_recording(
         &self,
         t: &str,
         since: &str,
-        record: &dyn Fn(&'static str, String),
+        record: &dyn Fn(&'static str, String, FabricFact<'_>),
     ) -> Result<bool, TopicsFull> {
         let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
         if set.contains_key(t) {
@@ -2522,26 +2599,41 @@ impl SessionFabric {
                 since: since.to_string(),
             },
         );
-        record("topic", format!("add {t} since={since}"));
+        let fact = FabricFact::Topic {
+            add: true,
+            name: t,
+            since: Some(since),
+        };
+        record("topic", format!("add {t} since={since}"), fact);
         Ok(true)
     }
 
     /// Drop a topic. `true` when it was there; recorded like [`Self::topic_add`].
     pub fn topic_drop(&self, t: &str, timeline: &Mutex<impl Timeline>) -> bool {
-        self.topic_drop_recording(t, &|kind, payload| {
-            timeline
+        self.topic_drop_recording(t, &|kind, payload, fact| {
+            let _ = timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record(kind, payload);
+                .record_fact(kind, payload, fact);
         })
     }
 
-    /// [`Self::topic_drop`], recording through `record`.
-    pub fn topic_drop_recording(&self, t: &str, record: &dyn Fn(&'static str, String)) -> bool {
+    /// [`Self::topic_drop`], recording through `record`, as
+    /// [`Self::topic_add_recording`] does.
+    pub fn topic_drop_recording(
+        &self,
+        t: &str,
+        record: &dyn Fn(&'static str, String, FabricFact<'_>),
+    ) -> bool {
         let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
         let dropped = set.remove(t).is_some();
         if dropped {
-            record("topic", format!("drop {t}"));
+            let fact = FabricFact::Topic {
+                add: false,
+                name: t,
+                since: None,
+            };
+            record("topic", format!("drop {t}"), fact);
         }
         dropped
     }
@@ -3077,7 +3169,16 @@ impl SessionFabric {
                 dead_reason: NOT_CARRIED.to_string(),
                 body: String::new(),
             });
-            tl.record("post-landed", format!("{id} off=- reason={NOT_CARRIED}"));
+            let fact = FabricFact::MailLanded {
+                post: id,
+                off: None,
+                why: Some(NOT_CARRIED),
+            };
+            let _ = tl.record_fact(
+                "post-landed",
+                format!("{id} off=- reason={NOT_CARRIED}"),
+                fact,
+            );
         }
         let mut rids = HashSet::new();
         let unknown_log = inbox.bus_log.is_none();
@@ -3183,9 +3284,14 @@ impl SessionFabric {
         }
         // Seeded before the session is registered: nobody can be watching
         // its log yet, so the owed wake is moot.
+        let (origin, reason, hold_origin) = inbox.holds.event_fields("local");
         let fact = FabricFact::Hold {
             held: true,
             bridge: false,
+            origin: &origin,
+            hold_origin: &hold_origin,
+            reason: reason.as_deref(),
+            carried: true,
         };
         let _ = timeline
             .lock()
@@ -3664,7 +3770,16 @@ pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) 
         if forget {
             let keep_below = clock.keep_below(inbox.bus_log.as_deref());
             for id in inbox.forget_bus_offsets(keep_below) {
-                ctx.record("post-landed", format!("{id} off=- reason=log-replaced"));
+                let fact = FabricFact::MailLanded {
+                    post: id,
+                    off: None,
+                    why: Some(LOG_REPLACED),
+                };
+                let _ = ctx.record_fact(
+                    "post-landed",
+                    format!("{id} off=- reason={LOG_REPLACED}"),
+                    fact,
+                );
             }
         }
         inbox.bus_log = Some(clock.ident);
@@ -4469,6 +4584,38 @@ fn cmd_link_mirror<'a>(
     .unwrap_or_else(|| "OK stale=1\n".to_string())
 }
 
+/// `link set-aside files=<n>` from the lane whose generation `generation` is
+/// (LANE 4): after an unclean stop in an earlier boot, the bridge moved `n`
+/// state files it found torn into its state dir's quarantine
+/// (`aterm_link::state::StateDir::set_aside_torn`) rather than refuse them at
+/// every attach. A fact for the owner's later look, handed to the registry
+/// ([`Registry::torn_state_set_aside`]) — once per line, from the bridge that
+/// owns the link; a ghost lane's is `OK stale=1` and hands nothing over. The
+/// registry is called with no link lock held; the bridge transition stays
+/// gated until the callback returns.
+fn cmd_link_set_aside<'a>(
+    store: &Store,
+    mut toks: impl Iterator<Item = &'a str>,
+    generation: Option<BridgeGeneration>,
+) -> String {
+    let files = toks
+        .next()
+        .and_then(|tok| kv(tok, "files"))
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0);
+    let (Some(files), None) = (files, toks.next()) else {
+        return LINK_USAGE.to_string();
+    };
+    with_current_bridge(generation, || {
+        store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .torn_state_set_aside(files);
+        "OK\n".to_string()
+    })
+    .unwrap_or_else(|| "OK stale=1\n".to_string())
+}
+
 /// The endpoint answered one of `generation`'s bridge-only lines `ERR usage`:
 /// count it for `fabric status`'s `lane_faults=` ([`LinkReport::lane_faults`]).
 /// Only for the incarnation that owns the link.
@@ -4500,7 +4647,8 @@ pub fn fabric_bridge_facts() -> (Option<u32>, Option<String>, u64) {
 const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>] | \
                           link log <identity> [continues=<off> was=<identity>] | \
                           link bye <quit|handoff> | \
-                          link mirror on|stopped|capped [reason=<token>]\n";
+                          link mirror on|stopped|capped [reason=<token>] | \
+                          link set-aside files=<n>\n";
 
 /// HOW MANY `bye`s THE LIVE BRIDGE HAS TAKEN — its `link bye <word>`, the
 /// answer to the `EVENT * bye <word>` this instance pushed before closing its
@@ -4556,9 +4704,10 @@ fn note_bye_taken(generation: Option<BridgeGeneration>) -> bool {
 }
 
 /// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]` / `link log
-/// <identity>` / `link bye <quit|handoff>` / `link mirror …`, from the bridge
-/// lane whose generation `generation` is. See [`link_report`],
-/// [`cmd_link_log`], [`note_bye_taken`] and [`cmd_link_mirror`].
+/// <identity>` / `link bye <quit|handoff>` / `link mirror …` / `link set-aside
+/// files=<n>`, from the bridge lane whose generation `generation` is. See
+/// [`link_report`], [`cmd_link_log`], [`note_bye_taken`], [`cmd_link_mirror`]
+/// and [`cmd_link_set_aside`].
 pub fn cmd_link(store: &impl AsStore, rest: &str, generation: Option<BridgeGeneration>) -> String {
     cmd_link_after_log_switch(store, rest, generation, || {})
 }
@@ -4615,6 +4764,7 @@ pub fn cmd_link_after_log_switch(
             };
         }
         Some("mirror") => return cmd_link_mirror(toks, generation),
+        Some("set-aside") => return cmd_link_set_aside(store, toks, generation),
         _ => return LINK_USAGE.to_string(),
     };
     let mut rtt: Option<u64> = None;
@@ -4739,7 +4889,16 @@ fn cmd_link_log(
             let keep_below = clock.keep_below(inbox.bus_log.as_deref());
             let retired = inbox.forget_bus_offsets(keep_below);
             for id in retired {
-                ctx.record("post-landed", format!("{id} off=- reason=log-replaced"));
+                let fact = FabricFact::MailLanded {
+                    post: id,
+                    off: None,
+                    why: Some(LOG_REPLACED),
+                };
+                let _ = ctx.record_fact(
+                    "post-landed",
+                    format!("{id} off=- reason={LOG_REPLACED}"),
+                    fact,
+                );
             }
             changed = true;
         }
@@ -5041,8 +5200,17 @@ fn advise(ctx: &dyn FabricSession, lost: Hold, generation: BridgeGeneration) -> 
         return false;
     }
     let record = format!("1 reason={} origin={}", lost.reason, lost.origin);
+    // The session log's `advisory origin= gen=` mark in the row's hold, the
+    // reason at its content tier alone (6F-5). The record rings the
+    // session's watchers, the log's readers among them, so the wake the hook
+    // owes is the record's own.
+    let fact = FabricFact::Advisory {
+        origin: &lost.origin,
+        reason: &lost.reason,
+        generation: generation.0,
+    };
+    let _ = ctx.record_fact("hold-advisory", record, fact);
     inbox.advisory = Some((lost, generation.0));
-    ctx.record("hold-advisory", record);
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
@@ -5259,19 +5427,40 @@ fn kv<'a>(tok: &'a str, key: &str) -> Option<&'a str> {
 /// form is pct-encoded and therefore ASCII by construction, and anything else is
 /// dropped rather than passed through — a raw control byte or a bidi override in a
 /// halt reason would become every reader's problem. Clamping then cannot split a
-/// character, and the trailing-escape trim stops it splitting a `%XX` either.
+/// character, and an escape is kept whole or not at all, so it never splits a
+/// `%XX` either.
+///
+/// WELL-FORMED PCT: a `%` that starts no escape (`100%sure`) is the caller's
+/// literal percent, kept as its own escape (`100%25sure`), so a strict decoder
+/// reads every reason, and every `%` costs one escape. That bounds what the
+/// session log's `hold` mark holds of it whole, in the record's 512 bytes: 128
+/// bytes of which at most 42 escapes (the review of 6F-6; a flood of `%` was 126
+/// of them, past what the record has room for). An escape the input ENDS inside
+/// (`a%2`, `a%`) was cut short by whoever bounded it upstream, and goes, as a
+/// carried hold row's parse has always dropped it.
 fn reason_token(raw: &str) -> String {
+    let mut kept: Vec<u8> = raw.trim().bytes().filter(u8::is_ascii_graphic).collect();
+    let cut = match kept.as_slice() {
+        [.., b'%'] => 1,
+        [.., b'%', d] if d.is_ascii_hexdigit() => 2,
+        _ => 0,
+    };
+    kept.truncate(kept.len() - cut);
+    let hex = |i: usize| kept.get(i).is_some_and(u8::is_ascii_hexdigit);
     let mut out = String::with_capacity(REASON_MAX);
-    for byte in raw.trim().bytes() {
-        if out.len() == REASON_MAX {
+    let mut i = 0;
+    while i < kept.len() {
+        let (piece, step): (&[u8], usize) = match kept[i] {
+            b'%' if hex(i + 1) && hex(i + 2) => (&kept[i..i + 3], 3),
+            b'%' => (b"%25", 1),
+            _ => (&kept[i..=i], 1),
+        };
+        if out.len() + piece.len() > REASON_MAX {
             break;
         }
-        if byte.is_ascii_graphic() {
-            out.push(byte as char);
-        }
-    }
-    while out.ends_with('%') || (out.len() >= 2 && out.as_bytes()[out.len() - 2] == b'%') {
-        out.pop();
+        // Every byte is ASCII-graphic, so each is one char.
+        out.extend(piece.iter().map(|&b| char::from(b)));
+        i += step;
     }
     if out.is_empty() { "-".to_string() } else { out }
 }
@@ -5606,9 +5795,14 @@ fn apply_hold_as(
         let lifted = act.origin().unwrap_or("local");
         ctx.fabric().hold_serial.fetch_add(1, Ordering::AcqRel);
         let mark = if carried { " carried=1" } else { "" };
+        let (origin, reason, hold_origin) = inbox.holds.event_fields(lifted);
         let fact = FabricFact::Hold {
             held,
             bridge: issuer == HoldIssuer::Bridge,
+            origin: &origin,
+            hold_origin: &hold_origin,
+            reason: reason.as_deref(),
+            carried,
         };
         let payload = format!("{}{mark}", inbox.holds.event(lifted));
         owed = ctx.record_fact("hold", payload, fact);
@@ -6596,16 +6790,16 @@ fn retire_post(
     let mut owed = false;
     if !already {
         inbox.outbox_moves += 1;
-        match off {
-            Some(n) => {
-                let fact = FabricFact::MailLanded {
-                    post: post_id,
-                    off: n,
-                };
-                owed = ctx.record_fact("post-landed", format!("{post_id} off={n}"), fact);
-            }
-            None => ctx.record("post-landed", format!("{post_id} off=-")),
-        }
+        let fact = FabricFact::MailLanded {
+            post: post_id,
+            off,
+            why: None,
+        };
+        let payload = match off {
+            Some(n) => format!("{post_id} off={n}"),
+            None => format!("{post_id} off=-"),
+        };
+        owed = ctx.record_fact("post-landed", payload, fact);
     }
     inbox.trim_retired_posts();
     drop(inbox);
@@ -6682,8 +6876,12 @@ pub fn cmd_outbox_verb_waking(
 /// the trade [`PostRow::body`] says this verb pair exists to refuse.
 /// [`OUTBOX_DRAIN_BYTES_MAX`] now stops the walk, and A PARTIAL DRAIN IS SAFE
 /// PRECISELY BECAUSE THIS IS A PEEK: nothing was retired, the remaining posts are
-/// still queued in the same order, and the bridge's two-second roster backstop
-/// calls `outbox` again. The bound is enforced HERE, where the reply is built, rather than by
+/// still queued in the same order, and the bridge calls `outbox` again. A walk
+/// the bound stopped with a post still unlisted ends the frame with a bare
+/// `more` line, so the bridge does not take the listing for the whole queue: it
+/// keeps the `post` events queued for what it was not shown, each of which runs
+/// its next drain at once, and with none queued its two-second roster backstop
+/// does. The bound is enforced HERE, where the reply is built, rather than by
 /// asking every caller to remember a number — the two sides of a bound must meet
 /// in one place.
 pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
@@ -6741,6 +6939,9 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
     let mut sent = 0usize;
     let mut listed: Vec<Option<u64>> = vec![None; handles.len()];
     let mut exhausted = vec![false; handles.len()];
+    // Whether the walk stopped at `<max>` or the byte budget rather than at the
+    // end of every queue.
+    let mut stopped = false;
     'turns: loop {
         let mut took = false;
         for (i, h) in handles.iter().enumerate() {
@@ -6752,6 +6953,7 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
             // the head of the queue would strand it forever behind a bound it can
             // never fit under.
             if sent >= max || (sent > 0 && payload.len() >= OUTBOX_DRAIN_BYTES_MAX) {
+                stopped = true;
                 break 'turns;
             }
             let mut inbox = h.fabric().lock();
@@ -6795,6 +6997,29 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
             break;
         }
     }
+    // MORE: a walk the bound stopped with a post still unlisted says so, as the
+    // frame's last line. A drain event is the bridge's cue to drain, and the
+    // bridge forgets the ones queued before a peek that showed it everything
+    // (aterm-link's `Mailbox::forget_queued_drains`): told nothing, it took a
+    // budget-cut peek for the whole queue and left the rest for its two-second
+    // roster backstop. After the walk, under each session's lock again, so a
+    // post queued since counts too: it is unlisted either way.
+    let mut more = false;
+    for (i, h) in handles.iter().enumerate() {
+        if !stopped || more {
+            break;
+        }
+        if exhausted[i] {
+            continue;
+        }
+        let after = listed[i];
+        more = h
+            .fabric()
+            .lock()
+            .posts
+            .iter()
+            .any(|p| p.off.is_none() && !p.dead && after.is_none_or(|last| p.id > last));
+    }
     // THE OWED RECEIPTS AND THE PARKED READS, AFTER EVERY POST: one bodiless
     // `receipt sid=<sid> rid=<n> off=<n> verdict=<v> kind=<k> from=<p>
     // [log=earlier]` line per receipt this session owes (R8; the bridge
@@ -6833,6 +7058,11 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
                 payload.push_str(&format!("fetch sid={sid} off={off}\n"));
             }
         }
+    }
+    // LAST, so a bridge from before it — whose parser stops at the first line
+    // without a `len=` — has read every post, receipt and fetch by then.
+    if more {
+        payload.push_str("more\n");
     }
     format!("OK {}\n{payload}", payload.len())
 }
@@ -7226,7 +7456,9 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
             // endpoint's, and only its bridge needs it.
             let added = ctx
                 .fabric()
-                .topic_add_recording(t, &since, &|kind, payload| ctx.record(kind, payload));
+                .topic_add_recording(t, &since, &|kind, payload, fact| {
+                    let _ = ctx.record_fact(kind, payload, fact);
+                });
             drop(unfenced);
             let Ok(added) = added else {
                 // Nothing changed, so nothing is pushed or woken.
@@ -7251,7 +7483,9 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
             };
             let dropped = ctx
                 .fabric()
-                .topic_drop_recording(t, &|kind, payload| ctx.record(kind, payload));
+                .topic_drop_recording(t, &|kind, payload, fact| {
+                    let _ = ctx.record_fact(kind, payload, fact);
+                });
             // THE BRIDGE FORGETS THIS TOPIC'S REFILL FLOOR WITH THE DROP
             // (aterm-link's `Bridge::forget_unhandled_topic`), so no successor
             // is offered the rows the ring still holds on it — not even after
@@ -7758,7 +7992,9 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
             // owed now: the record is the push lane's `fetch` event, and it
             // rings the session's watchers as it lands, before the park. The
             // roster round still finds a lost event.
-            ctx.record("fetch", format!("off={off}"));
+            // The session log's `mail-fetch off=` mark rides the same
+            // record (6F-5, ruling U15: the bridge drains these rows).
+            let _ = ctx.record_fact("fetch", format!("off={off}"), FabricFact::Fetch { off });
         }
     }
     let deadline = std::time::Instant::now() + wait;
@@ -7913,20 +8149,25 @@ pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
     // it came on — which is what releases a broadcast's refill floor
     // (`aterm-link`'s `Bridge::unhandled`). It is not `<id>`: acknowledging
     // an older row out of order leaves the watermark where it was.
-    let floor = addressed_floor(&inbox).map_or_else(|| "-".to_string(), |f| f.to_string());
+    let floor_at = addressed_floor(&inbox);
+    let floor = floor_at.map_or_else(|| "-".to_string(), |f| f.to_string());
     let payload = format!("{id} off={off} floor={floor} seen={seen}{verdict_tail}");
-    // The session log's `mail-seen` mark when the act moved something (the
-    // watermark, or a verdict decided). The record rings the session's
-    // watchers, the log's readers among them.
-    if seen > seen_before || decided.is_some() {
-        let fact = FabricFact::MailSeen {
-            inbox: id,
-            verdict: decided,
-        };
-        let _ = ctx.record_fact("inbox-seen", payload, fact);
-    } else {
-        ctx.record("inbox-seen", payload);
-    }
+    // The session log's `mail-seen` mark, every one (6F-6): `moved=` says
+    // whether the act moved something (the watermark, or a verdict
+    // decided), and the fold folds only the moves. The record rings the
+    // session's watchers, the log's readers among them.
+    let row = &inbox.rows[at];
+    let fact = FabricFact::MailSeen {
+        inbox: id,
+        off,
+        floor: floor_at,
+        seen,
+        verdict: decided,
+        kind: &row.kind,
+        from: &row.from,
+        moved: seen > seen_before || decided.is_some(),
+    };
+    let _ = ctx.record_fact("inbox-seen", payload, fact);
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
@@ -8295,6 +8536,10 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         kind: &kind,
         to: &to,
         post: id,
+        re,
+        dl,
+        via: via.as_deref(),
+        idem: key.as_deref(),
     };
     // The record rings the session's watchers, the session log's readers
     // among them, so the wake the hook owes is the record's own.
@@ -8889,6 +9134,9 @@ mod test_support {
     #[derive(Default)]
     pub(crate) struct TestStore {
         by_local: BTreeMap<u64, Arc<SessionCtx>>,
+        /// Every `link set-aside` count handed over
+        /// ([`Registry::torn_state_set_aside`]), in order.
+        pub(crate) set_aside: std::sync::Mutex<Vec<u64>>,
     }
 
     impl TestStore {
@@ -8921,6 +9169,12 @@ mod test_support {
                 .map(|c| Arc::clone(c) as Arc<dyn FabricSession>)
         }
         fn bridge_lost_advised(&self, _sessions: usize) {}
+        fn torn_state_set_aside(&self, files: u64) {
+            self.set_aside
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(files);
+        }
     }
 
     /// The tests' registry handle.
@@ -9765,6 +10019,102 @@ mod inbox_hold {
         });
     }
 
+    /// TORN STATE FILES SET ASIDE ARE THE OWNING BRIDGE'S TO SAY (lane 4): the
+    /// lane that owns the link hands its count to the registry, once per line;
+    /// a ghost lane's and an unowned line's are `OK stale=1` and hand nothing
+    /// over; a count that is not a positive number, or a word after it, is a
+    /// usage error.
+    #[test]
+    fn a_set_aside_count_reaches_the_registry_only_from_the_owning_lane() {
+        struct ReplaceDuringPublication {
+            owner: BridgeGeneration,
+            next: BridgeGeneration,
+            received: Mutex<Vec<(u64, bool)>>,
+        }
+
+        impl Registry for ReplaceDuringPublication {
+            fn sessions(&self) -> Vec<Arc<dyn FabricSession>> {
+                Vec::new()
+            }
+            fn session(&self, _: &SessionId) -> Option<Arc<dyn FabricSession>> {
+                None
+            }
+            fn bridge_lost_advised(&self, _: usize) {}
+            fn torn_state_set_aside(&self, files: u64) {
+                let transition = match LINK.log_transition.try_lock() {
+                    Ok(guard) => Some(guard),
+                    Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                };
+                if let Some(guard) = transition {
+                    drop(guard);
+                    bridge_attached(self.next);
+                }
+                self.received
+                    .lock()
+                    .unwrap()
+                    .push((files, lane_owns(Some(self.owner))));
+            }
+        }
+
+        with_link(|| {
+            let store = new_store();
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let taken = || store.read().unwrap().set_aside.lock().unwrap().clone();
+            assert_eq!(
+                cmd_link(&store, "set-aside files=3", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(taken(), vec![3]);
+            let ghost = next_bridge_generation();
+            assert_eq!(
+                cmd_link(&store, "set-aside files=2", Some(ghost)),
+                "OK stale=1\n"
+            );
+            assert_eq!(cmd_link(&store, "set-aside files=2", None), "OK stale=1\n");
+            for bad in [
+                "set-aside",
+                "set-aside files=0",
+                "set-aside files=-1",
+                "set-aside files=x",
+                "set-aside n=2",
+                "set-aside files=2 more",
+            ] {
+                assert!(
+                    cmd_link(&store, bad, Some(generation)).starts_with("ERR usage"),
+                    "{bad}"
+                );
+            }
+            assert_eq!(taken(), vec![3], "nothing but the owner's one line");
+
+            // Attempt the real replacement at the registry boundary. The
+            // ownership check must remain protected through publication.
+            let next = next_bridge_generation();
+            let replacing = Arc::new(RwLock::new(ReplaceDuringPublication {
+                owner: generation,
+                next,
+                received: Mutex::new(Vec::new()),
+            }));
+            assert_eq!(
+                cmd_link(&replacing, "set-aside files=4", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(
+                *replacing.read().unwrap().received.lock().unwrap(),
+                vec![(4, true)],
+                "replacement cannot cross the owning lane's publication"
+            );
+            attach_up(&store, next);
+            assert_eq!(
+                cmd_link(&store, "set-aside files=2", Some(generation)),
+                "OK stale=1\n"
+            );
+            assert_eq!(cmd_link(&store, "set-aside files=2", Some(next)), "OK\n");
+            assert_eq!(taken(), vec![3, 2]);
+        });
+    }
+
     /// **A BROADCAST REACHES ONLY A SESSION THAT HOLDS ITS TOPIC, AND A `drop`
     /// TAKES EFFECT HERE THE MOMENT IT ANSWERS.** The endpoint holds the
     /// opt-in set; the bridge's copy lags a drop (the rest of a catch-up page,
@@ -9901,8 +10251,10 @@ mod inbox_hold {
     /// never a body — to `record_fact` in the record's own call. A bridge
     /// verb's wake follows exactly when the hook owes one, once per record;
     /// the session's own verbs (`post`, `inbox seen`) ring its watchers with
-    /// the record itself. NEGATIVE CONTROLS: a redelivered offset, a repeated
-    /// `inbox seen` and a hold that moves nothing hand no fact and wake nobody.
+    /// the record itself. Every field of a record's row is its fact's (6F-6):
+    /// a repeated `inbox seen` is a fact too, `moved: false`. NEGATIVE
+    /// CONTROLS: a redelivered offset, a landing reported again and a hold
+    /// that moves nothing hand no fact and wake nobody.
     #[test]
     fn every_fabric_site_hands_its_facts_to_the_one_hook() {
         use std::time::Duration;
@@ -9932,16 +10284,36 @@ mod inbox_hold {
         assert_eq!(hold("on reason=demo"), "OK hold=1\n");
         assert_eq!(hold("on reason=demo"), "OK hold=1\n");
         assert_eq!(hold("off"), "OK hold=0\n");
+        // A topic's moves (6F-5), a repeat add and a drop of nothing moving
+        // nothing.
+        assert_eq!(
+            ctx.fabric.topic_add("builds", "@4", &ctx.timeline),
+            Ok(true)
+        );
+        assert_eq!(
+            ctx.fabric.topic_add("builds", "@5", &ctx.timeline),
+            Ok(false)
+        );
+        assert!(ctx.fabric.topic_drop("builds", &ctx.timeline));
+        assert!(!ctx.fabric.topic_drop("builds", &ctx.timeline));
         let facts = ctx.timeline.lock().unwrap().facts.clone();
         assert_eq!(
             facts,
             [
                 "inbox: MailIn { kind: \"task\", from: \"h-a\", off: 7, inbox: 1 }",
-                "post: MailOut { kind: \"ask\", to: \"@s-peer\", post: 1 }",
-                "post-landed: MailLanded { post: 1, off: 9 }",
-                "inbox-seen: MailSeen { inbox: 1, verdict: Some(\"handled\") }",
-                "hold: Hold { held: true, bridge: false }",
-                "hold: Hold { held: false, bridge: false }",
+                "post: MailOut { kind: \"ask\", to: \"@s-peer\", post: 1, re: None, dl: None, \
+                 via: None, idem: None }",
+                "post-landed: MailLanded { post: 1, off: Some(9), why: None }",
+                "inbox-seen: MailSeen { inbox: 1, off: 7, floor: Some(8), seen: 1, \
+                 verdict: Some(\"handled\"), kind: \"task\", from: \"h-a\", moved: true }",
+                "inbox-seen: MailSeen { inbox: 1, off: 7, floor: Some(8), seen: 1, \
+                 verdict: None, kind: \"task\", from: \"h-a\", moved: false }",
+                "hold: Hold { held: true, bridge: false, origin: \"local\", \
+                 hold_origin: \"local\", reason: Some(\"demo\"), carried: false }",
+                "hold: Hold { held: false, bridge: false, origin: \"local\", \
+                 hold_origin: \"-\", reason: None, carried: false }",
+                "topic: Topic { add: true, name: \"builds\", since: Some(\"@4\") }",
+                "topic: Topic { add: false, name: \"builds\", since: None }",
             ]
         );
         assert!(facts.iter().all(|f| !f.contains("SECRET")), "{facts:?}");
@@ -10120,6 +10492,33 @@ mod inbox_hold {
         let out = reason_token(&straddle);
         assert!(!out.ends_with('%'), "{out}");
         assert_eq!(out.len(), REASON_MAX - 2, "{out}");
+        // A `%` that starts no escape is a literal percent, kept as its own
+        // escape (the review of 6F-6), so every `%` of a reason starts one.
+        assert_eq!(reason_token("100%sure"), "100%25sure");
+        assert_eq!(reason_token("a%g"), "a%25g");
+        // An escape the input ends inside was cut short where the reason was
+        // bounded, and goes, as a carried row's parse always dropped it.
+        assert_eq!(reason_token("a%2"), "a");
+        assert_eq!(reason_token("a%"), "a");
+        assert_eq!(reason_token("%%41%4"), "%25%41");
+        let flood = reason_token(&"%".repeat(500));
+        assert_eq!(flood, "%25".repeat(REASON_MAX / 3), "a flood is escapes");
+        for raw in ["%", "a%", "a%4", "%zz%41", &"%".repeat(500), &straddle] {
+            let out = reason_token(raw);
+            let b = out.as_bytes();
+            let escapes = b.iter().filter(|&&c| c == b'%').count();
+            assert!(
+                (0..b.len()).filter(|&i| b[i] == b'%').all(|i| {
+                    b.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                        && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+                }),
+                "{raw:?}: a `%` that starts no escape in {out:?}"
+            );
+            assert!(
+                out.len() <= REASON_MAX && escapes <= REASON_MAX / 3,
+                "{out}"
+            );
+        }
     }
 
     /// THE DEFAULT SINCE 2026-09-29 — A LOST BRIDGE HALTS NOTHING (the owner:
@@ -10953,6 +11352,36 @@ mod inbox_hold {
                 );
             });
         }
+    }
+
+    /// A LOST BRIDGE'S ADVISORY IS ONE FACT (6F-5): by default nothing is
+    /// held, and the session the bridge governed is handed one
+    /// `FabricFact::Advisory` naming the origin, the reason and the
+    /// generation lost, beside its `hold-advisory` row.
+    #[test]
+    fn a_lost_bridges_advisory_is_one_fact() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            assert_eq!(bridge_lost(&store, generation), 1);
+            let facts = ctx.timeline.lock().unwrap().facts.clone();
+            let advised: Vec<_> = facts
+                .iter()
+                .filter(|f| f.starts_with("hold-advisory: "))
+                .collect();
+            assert_eq!(
+                advised,
+                [&format!(
+                    "hold-advisory: Advisory {{ origin: \"fleet\", reason: \"fabric-lost\", \
+                     generation: {} }}",
+                    generation.0
+                )],
+                "{facts:?}"
+            );
+        });
     }
 
     /// `hold` is governance whichever way it goes, so a session the bridge only
@@ -14128,6 +14557,19 @@ mod inbox_hold {
     /// many body bytes, repeated. A reader that got the arithmetic wrong here
     /// would silently read the next post's header as body.
     fn parse_outbox(reply: &str) -> (usize, Vec<(String, String)>) {
+        let (declared, posts, _) = parse_outbox_frame(reply);
+        (declared, posts)
+    }
+
+    /// Whether an `outbox` reply ends with a cut walk's `more` line, read as
+    /// the bridge reads it: after every post's `len=` body bytes (a body need
+    /// not end in a newline, so the line may follow it directly).
+    fn says_more(reply: &str) -> bool {
+        parse_outbox_frame(reply).2
+    }
+
+    /// [`parse_outbox`], and whether the frame's last line is `more`.
+    fn parse_outbox_frame(reply: &str) -> (usize, Vec<(String, String)>, bool) {
         let (head, payload) = reply.split_once('\n').expect("a header line");
         let declared: usize = head
             .strip_prefix("OK ")
@@ -14139,12 +14581,20 @@ mod inbox_hold {
             "the length prefix must equal the bytes that follow"
         );
         let mut out = Vec::new();
+        let mut more = false;
         let mut rest = payload;
         while !rest.is_empty() {
             let (line, tail) = rest.split_once('\n').expect("a post line");
             // The bodiless trailer lines (owed receipts, parked reads) ride after
             // every post and carry no `len=`.
             if line.starts_with("receipt ") || line.starts_with("fetch ") {
+                rest = tail;
+                continue;
+            }
+            // A cut walk's `more`, the frame's last line.
+            if line == "more" {
+                assert!(tail.is_empty(), "`more` is the frame's last line");
+                more = true;
                 rest = tail;
                 continue;
             }
@@ -14156,7 +14606,7 @@ mod inbox_hold {
             out.push((line.to_string(), tail[..len].to_string()));
             rest = &tail[len..];
         }
-        (declared, out)
+        (declared, out, more)
     }
 
     /// THE OUTBOUND HALF, end to end at the endpoint: a `post` is queued with its
@@ -14347,7 +14797,9 @@ mod inbox_hold {
         let (sid_b, ctx_b) = registered_as(&store, 2);
         assert_eq!(cmd_post(&ctx_a, "to=h-x kind=note from-a", None), "OK 1\n");
         assert_eq!(cmd_post(&ctx_b, "to=h-x kind=note from-b", None), "OK 1\n");
-        let (_, posts) = parse_outbox(&cmd_outbox(&store, ""));
+        let whole = cmd_outbox(&store, "");
+        assert!(!says_more(&whole), "every post listed: {whole:?}");
+        let (_, posts) = parse_outbox(&whole);
         assert_eq!(posts.len(), 2);
         assert!(
             posts[0].0.contains(&format!("sid={sid_a}")),
@@ -14359,7 +14811,9 @@ mod inbox_hold {
             "{:?}",
             posts[1].0
         );
-        let (_, one) = parse_outbox(&cmd_outbox(&store, "1"));
+        let cut = cmd_outbox(&store, "1");
+        assert!(says_more(&cut), "B's post is unlisted: {cut:?}");
+        let (_, one) = parse_outbox(&cut);
         assert_eq!(one.len(), 1, "`max` bounds the batch");
         assert_eq!(one[0].1, "from-a");
         assert_eq!(cmd_outbox(&store, "nope"), OUTBOX_USAGE);
@@ -14969,12 +15423,48 @@ mod inbox_hold {
             drained.len() > OUTBOX_DRAIN_BYTES_MAX / 2,
             "the budget must still hand the bridge a useful batch"
         );
+        assert!(
+            says_more(&drained),
+            "a cut walk says so, last, so the bridge does not take it for the whole queue"
+        );
         // A PEEK, so the rest is not lost — the next drain sees the same queue.
         let again = cmd_outbox(&store, "");
         assert_eq!(
             again.len(),
             drained.len(),
             "a bounded drain retires nothing"
+        );
+    }
+
+    /// `more` MEANS A POST WAS LEFT UNLISTED, not that the walk reached its
+    /// budget: two sessions' queues of exactly the budget between them are
+    /// listed whole, the walk stops at the bound on its next turn, and there is
+    /// nothing more. NEGATIVE CONTROL: one more post of the first session's,
+    /// past the budget, is unlisted, and `more` is said.
+    #[test]
+    fn a_walk_stopped_at_the_budget_with_nothing_left_says_no_more() {
+        let store = new_store();
+        let body = vec![b'x'; BODY_MAX];
+        let budget = OUTBOX_DRAIN_BYTES_MAX / BODY_MAX;
+        let (_a, ctx_a) = registered_as(&store, 1);
+        let (_b, ctx_b) = registered_as(&store, 2);
+        for _ in 1..budget {
+            assert!(
+                cmd_post(&ctx_a, "to=@s-peer kind=note", Some(body.clone())).starts_with("OK ")
+            );
+        }
+        assert!(cmd_post(&ctx_b, "to=@s-peer kind=note", Some(body.clone())).starts_with("OK "));
+        let whole = cmd_outbox(&store, "");
+        let (_, posts) = parse_outbox(&whole);
+        assert_eq!(posts.len(), budget);
+        assert!(!says_more(&whole), "every post listed");
+        assert!(cmd_post(&ctx_a, "to=h-x kind=note after", None).starts_with("OK "));
+        let cut = cmd_outbox(&store, "");
+        let (_, posts) = parse_outbox(&cut);
+        assert_eq!(posts.len(), budget, "the budget binds before `after`");
+        assert!(
+            says_more(&cut),
+            "the control: a post past the budget is unlisted"
         );
     }
 

@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **aterm-regex** — aterm's regular expressions, first-party.
+//! aterm's first-party regular expressions, used by `aterm-observe`, `aterm-search` and
+//! `aterm-selection` in place of the `regex` crate.
 //!
-//! Replaces the `regex` crate (four packages, 158,471 lines of third-party
-//! source) at the call sites in `aterm-observe`, `aterm-selection` and
-//! `aterm-search`, plus `aterm-core`'s test-support triggers. Owner rule: a
-//! package used this narrowly is one we maintain ourselves.
-//!
-//! ## What it is
-//!
-//! Parse → NFA → **Pike VM**: the pattern becomes a Thompson automaton and the
-//! search advances the whole set of live states one code point at a time, so
-//! match time is linear in the haystack — `(a|a)*b` against ten thousand `a`s
-//! is milliseconds, not a backtracking hang. Like `regex`, it has no
-//! backreferences or look-around and matches leftmost-first. Every pattern in
-//! `aterm-selection`'s `builtin_patterns` is a test here.
+//! Parse → NFA → Pike VM: the pattern becomes a Thompson automaton and the search advances
+//! every live state together, one code point at a time, so match time is linear in the
+//! haystack (`(a|a)*b` against ten thousand `a`s takes milliseconds, not a backtracking
+//! hang). As in `regex`, there are no backreferences or look-around, and matching is
+//! leftmost-first. Every `aterm-selection` built-in pattern is a test here.
 //!
 //! ```
 //! use aterm_regex::Regex;
@@ -27,113 +20,51 @@
 //! # Ok::<(), aterm_regex::Error>(())
 //! ```
 //!
-//! ## Bounds, because patterns here are user input
+//! ## Bounds
 //!
-//! Selection rules, `await match <re>` and the search options take patterns
-//! from a human or an agent. Nesting is capped at 250 levels, so `((((…))))`
-//! errors instead of overflowing the stack.
+//! Patterns here are user input: selection rules, `await match <re>` and the search
+//! options. Nesting is capped at 250 levels, so `((((…))))` errors instead of overflowing
+//! the stack. A scan costs `O(|haystack| × program)` and the caller chooses both factors:
+//! under a 1 MiB `size_limit` with no step budget, `(?:x?){2000}z` took 43 ms per
+//! 4,096-column row and 30 s over 3 MB, where `regex` takes 7 µs and 40 µs (m21,
+//! release). Two bounds cover the two factors:
 //!
-//! "Linear time" does not mean nothing can hang it. A scan costs
-//! `O(|haystack| × program)`, and the caller chooses both factors. Measured on
-//! the m21 box in release at a 1 MiB `size_limit` (~16k instructions):
+//! * [`RegexBuilder::size_limit`] bounds the program, checked on every instruction
+//!   emitted, so `(a{200}){200}` fails fast instead of allocating. The call sites pass
+//!   128 KiB (~2,048 instructions), which refuses `(?:x?){2000}z`.
+//! * [`RegexBuilder::step_limit`] bounds the scan. Exhausting it yields
+//!   [`StepLimitExceeded`], never a quiet "no match": a wrong answer is worse than a
+//!   refusal.
 //!
-//! | pattern | bytes | one 4,096-column row | a 3 MB haystack | `regex` |
-//! |---|---|---|---|---|
-//! | `(?:x?){2000}z` | 13 | 42.7 ms | 30.25 s | 6.8 µs / 40 µs |
-//! | `(?:x\|x\|x\|x\|x\|x\|x\|x){400}z` | 25 | 60.3 ms | 50.09 s | 855 µs / 1.01 ms |
+//! ## Cost
 //!
-//! Two bounds cover the two factors:
-//!
-//! * [`RegexBuilder::size_limit`] bounds the *program*, re-checked on every
-//!   instruction emitted, so `(a{200}){200}` fails fast instead of allocating.
-//!   The call sites pass 128 KiB (~2,048 instructions) rather than the 10 MiB
-//!   default, which refuses both patterns above.
-//! * [`RegexBuilder::step_limit`] bounds the *scan*: positions visited,
-//!   prefilter bytes skipped, epsilon instructions entered and threads stepped
-//!   all draw on one budget, so the product itself is capped. Exhausting it
-//!   yields [`StepLimitExceeded`], never a quiet "no match": a wrong answer
-//!   is worse than a refusal.
-//!
-//! `tests/bounds.rs` pins the compile half; `step_budget_tests` below pins the
-//! scan half.
-//!
-//! ## What it costs, measured
-//!
-//! `regex` drives a lazy DFA behind SIMD prefilters, so it scans faster; this
-//! crate compiles faster, because it has no DFA to build. m21 box, release,
-//! min of three alternated runs, `find_iter` over 20,000 terminal-style rows
-//! (~3 MB):
-//!
-//! | pattern | here | `regex` |
-//! |---|---|---|
-//! | literal `aterm` | 2.7 ms | 0.30 ms |
-//! | `\b[0-9a-fA-F]{7,40}\b` (git hash) | 21.0 ms | 2.4 ms |
-//! | the built-in IPv4 rule | 30.2 ms | 1.4 ms |
-//! | the built-in URL rule | 14.0 ms | 1.1 ms |
-//! | `(?i)ATERM` | 3.2 ms | 0.69 ms |
-//! | a pattern that never matches | 1.0 ms | 0.23 ms |
-//! | one compile of the IPv4 rule | 3.2 µs | 150 µs |
-//! | one compile of a literal | 0.37 µs | 1.5 µs |
-//!
-//! Five to twenty times slower per full scan, forty-odd times faster per
-//! compile — and `aterm-search` recompiles on every keystroke while selection
-//! compiles eleven rules at startup. Scans run in budgeted batches
-//! (`BudgetedSearch`), so 30 ms is a whole-scrollback worst case, not per frame.
-//!
-//! The scan-side fast paths, each measured over the shipped 100,000-row
-//! scrollback against the same binary with the path forced off:
-//!
-//! * **First-code-point prefilter**: rejects a position with one array lookup
-//!   per byte and survives a leading assertion (`\bcommit`, `^ERROR`).
-//! * **Start anchoring** ([`Program::start_anchored`]): a program that can only
-//!   match at offset 0 stops instead of letting the prefilter hunt every `E`.
-//!   `(?i)^ERROR` 7.42 → 2.10 ms, `(?i)^\d+` 10.10 → 1.45 ms; the unanchored
-//!   controls (`(?i)ERROR`, `(?im)^ERROR`, `\bcommit`) stay inside a 3.1%
-//!   noise floor.
-//! * **ASCII class bitmap**: a dense `u128` per class answers membership below
-//!   U+0080 with a shift, instead of a binary search; `(?i)ERROR` compiles to
-//!   five classes. 16.90 → 13.76 ms.
-//! * **Second-code-point prefilter** ([`Prefilter`](compile::Prefilter)): armed
-//!   when every path provably consumes a first code point, and tested before
-//!   the decode, since an ASCII lead byte is its whole code point. Cost tracks
-//!   the lead byte's frequency (`(?i)QUARK` 3.6 ms vs `(?i)ERROR` 13.2 ms on a
-//!   one-byte filter); with two bytes `(?i)ERROR` 12.87 → 8.39 ms, `\bcommit`
-//!   5.90 → 4.66 ms.
-//!
-//! Together: the find bar's default `(?i)ERROR` went from 16.90 ms to 7.79 ms
-//! per keystroke over 100,000 rows.
+//! `regex` scans faster (a lazy DFA behind SIMD prefilters); this crate compiles faster,
+//! having no DFA to build. Over ~3 MB of terminal rows (m21, release) a full `find_iter`
+//! is 5–20x slower (the git-hash rule: 21 ms against 2.4 ms), while compiling the IPv4
+//! rule takes 3.2 µs against 150 µs. That suits `aterm-search`, which recompiles on every
+//! keystroke and scans in budgeted batches (`BudgetedSearch`). The scan's fast paths: a
+//! first-code-point prefilter that sees through a leading assertion (`\bcommit`,
+//! `^ERROR`), a second-code-point prefilter, start anchoring for programs that can only
+//! match at offset 0, and a `u128` ASCII bitmap per class.
 //!
 //! ## Divergences from the `regex` crate
 //!
-//! Every one of these is a *refusal* — an [`Error`] naming the construct — never
-//! a quiet reinterpretation. `tests/differential.rs` pins everything else, as
-//! recorded when it agreed with `regex`.
+//! Each is a refusal, an [`Error`] naming the construct, never a reinterpretation.
+//! `tests/differential.rs` pins everything else against answers recorded from `regex`.
 //!
-//! * `\p{…}` / `\pL` Unicode property classes are not supported.
-//! * Character-class set operations (`[a&&b]`, `[a--b]`, `[a~~b]`) and the
-//!   nested classes that go with them are not supported. Escape the operator to
-//!   match it literally.
-//! * `(?-u)` byte-oriented mode is not supported: this engine matches `&str` by
-//!   code point.
-//! * `(?R)` CRLF mode is not supported.
-//! * `\w`, and therefore `\b`, follow the *toolchain's* Unicode version through
-//!   `char::is_alphabetic`, which is newer than the tables `regex` bundles.
-//!   `^\w$` disagreed with `regex` on 4,662 code points, all in one direction
-//!   (this engine is a strict superset); `\d`, `\s`, `\D`, `\S` and `\W` agree
-//!   exactly. Two consequences:
+//! * `\p{…}` / `\pL` Unicode property classes.
+//! * Character-class set operations (`[a&&b]`, `[a--b]`, `[a~~b]`) and the nested classes
+//!   that go with them. Escape the operator to match it literally.
+//! * `(?-u)` byte-oriented mode: this engine matches `&str` by code point.
+//! * `(?R)` CRLF mode.
 //!
-//!   1. **It reaches a shipped selection rule.** `git_hash` is
-//!      `\b[0-9a-fA-F]{7,40}\b`; on `"deadbeef\u{088F}"` `regex` selects
-//!      `deadbeef` and this engine selects nothing, because U+088F is
-//!      `Alphabetic` to the current toolchain. `url`, `email` and `semver` are
-//!      unaffected.
-//!   2. **The answer tracks the compiler.** Two builds on different toolchains
-//!      can select differently. For reproducibility, bake `Alphabetic` into a
-//!      range table beside `ND`/`MARK`/`PC`, checked against `std` by a sibling
-//!      of `fold_table_matches_std`.
-//!
-//! Nothing in the aterm tree uses any of the first four; the built-in patterns
-//! all pass.
+//! Nothing in the aterm tree uses these. One difference is not a refusal: `\w`, and so
+//! `\b`, use `char::is_alphabetic`, which follows the toolchain's Unicode version, newer
+//! than the tables `regex` bundles. `^\w$` matched 4,662 code points `regex` rejects, and
+//! none the other way; `\d` and `\s` agree exactly. It reaches the `git_hash` rule (on
+//! `"deadbeef\u{088F}"` `regex` selects `deadbeef` and this engine nothing) and makes the
+//! answer depend on the compiler; baking `Alphabetic` into a range table beside
+//! `ND`/`MARK`/`PC` would pin it.
 
 #![forbid(unsafe_code)]
 
@@ -154,21 +85,15 @@ use pikevm::Cache;
 /// default so a call site that does not set one behaves the same.
 const DEFAULT_SIZE_LIMIT: usize = 10 * (1 << 20);
 
-/// Default ceiling on the work one search may do, in units of
-/// `positions × live threads`. See [`RegexBuilder::step_limit`] for what a unit
-/// is and how this number was chosen.
+/// Default ceiling on the work one search may do; see [`RegexBuilder::step_limit`].
 const DEFAULT_STEP_LIMIT: u64 = 1 << 26;
 
 /// A pattern that would not compile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The pattern is not valid syntax, or uses a construct this engine
-    /// refuses. The string is a rendered, caret-annotated message meant to be
-    /// shown to whoever typed the pattern; `aterm-search` surfaces it through
-    /// `SearchOptionsError::InvalidRegex`.
-    ///
-    /// Constructible on purpose: `aterm-observe` builds one directly to report
-    /// its own pattern-length ceiling in the same shape as a compile failure.
+    /// Invalid or refused syntax, as a caret-annotated message for whoever typed the
+    /// pattern (`aterm-search` surfaces it as `SearchOptionsError::InvalidRegex`). Public
+    /// so `aterm-observe` can report its own pattern-length ceiling in the same shape.
     Syntax(String),
     /// The compiled program passed the byte ceiling set by
     /// [`RegexBuilder::size_limit`]. Carries the limit that was exceeded.
@@ -188,18 +113,11 @@ impl std::fmt::Display for Error {
 
 /// A search that ran out of budget before it could answer.
 ///
-/// Distinct from "no match" **on purpose**. The two are not the same fact: a
-/// completed search that found nothing has proved the haystack contains no
-/// match, while an exhausted one has proved nothing at all. Collapsing them
-/// would turn a refusal into a wrong answer, which is the worse of the two
-/// failures — a watcher that never latches or a search that quietly loses rows
-/// is a bug you cannot see. The fallible entry points
-/// ([`Regex::try_is_match`], [`Regex::try_find`]) hand this back so a call site can decide; the infallible ones fail closed
-/// and record it on the [`Regex`] for [`Regex::step_limit_exceeded`] to read.
-///
-/// This is not an [`Error`]: `Error` is what a *pattern* can be wrong about and
-/// is reported when compiling. Exhaustion is a property of a pattern-plus-
-/// haystack pair, and only a search can discover it.
+/// Distinct from "no match": a completed search that found nothing proves there is no
+/// match, an exhausted one proves nothing. [`Regex::try_is_match`] and [`Regex::try_find`]
+/// return it; the infallible entry points fail closed and record it for
+/// [`Regex::step_limit_exceeded`]. Not an [`Error`]: an `Error` is about the pattern and
+/// found at compile time, while exhaustion belongs to a pattern-haystack pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepLimitExceeded {
     limit: u64,
@@ -258,13 +176,10 @@ impl Regex {
 
     /// Does `text` contain a match anywhere?
     ///
-    /// Cheaper than [`find`](Self::find): it may stop at the first match found
-    /// rather than establishing which match is leftmost-first.
-    ///
-    /// **Fails closed.** A search that exhausts its
-    /// [step budget](RegexBuilder::step_limit) reports `false` — the answer a
-    /// caller can act on safely — and sets [`step_limit_exceeded`](Self::step_limit_exceeded).
-    /// Use [`try_is_match`](Self::try_is_match) to be told instead of guessing.
+    /// Cheaper than [`find`](Self::find): it may stop at the first match found. Fails
+    /// closed: a search that exhausts its [step budget](RegexBuilder::step_limit) reports
+    /// `false` and sets [`step_limit_exceeded`](Self::step_limit_exceeded);
+    /// [`try_is_match`](Self::try_is_match) reports the exhaustion instead.
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
         self.try_is_match(text).unwrap_or(false)
@@ -274,8 +189,7 @@ impl Regex {
     ///
     /// # Errors
     /// [`StepLimitExceeded`] if the search ran out of budget before it could
-    /// decide. Nothing about the haystack is implied by that: the pattern may
-    /// or may not match it.
+    /// decide.
     pub fn try_is_match(&self, text: &str) -> Result<bool, StepLimitExceeded> {
         let mut budget = self.step_limit;
         Ok(self.search(text, 0, true, &mut budget)?.is_some())
@@ -283,9 +197,8 @@ impl Regex {
 
     /// The leftmost-first match in `text`, if any.
     ///
-    /// **Fails closed**, exactly as [`is_match`](Self::is_match) does: an
-    /// exhausted search reports `None` and sets
-    /// [`step_limit_exceeded`](Self::step_limit_exceeded).
+    /// Fails closed like [`is_match`](Self::is_match): an exhausted search reports `None`
+    /// and sets [`step_limit_exceeded`](Self::step_limit_exceeded).
     #[must_use]
     pub fn find<'t>(&self, text: &'t str) -> Option<Match<'t>> {
         self.try_find(text).unwrap_or(None)
@@ -295,8 +208,7 @@ impl Regex {
     ///
     /// # Errors
     /// [`StepLimitExceeded`] if the search ran out of budget before it could
-    /// decide. No partial span is returned: a truncated search has not
-    /// established which match is leftmost-first.
+    /// decide; no partial span is returned.
     pub fn try_find<'t>(&self, text: &'t str) -> Result<Option<Match<'t>>, StepLimitExceeded> {
         let mut budget = self.step_limit;
         Ok(self
@@ -311,15 +223,11 @@ impl Regex {
         self.step_limit
     }
 
-    /// Has any search on this compiled pattern ever been cut short by the step
-    /// budget?
+    /// Has any search on this pattern been cut short by the step budget?
     ///
-    /// Sticky and shared with every clone, so a call site that scans through an
-    /// infallible helper — `find_iter` inside somebody else's loop — can still
-    /// tell the difference between "no matches" and "gave up". Never cleared:
-    /// once a pattern has proved it can exhaust the budget on real content, the
-    /// results it produced are not exhaustive and no later cheap row makes them
-    /// so.
+    /// Sticky and shared with every clone, so a caller scanning through an infallible
+    /// helper can tell "no matches" from "gave up". Never cleared: the results the
+    /// pattern produced are not exhaustive, whatever later rows cost.
     #[must_use]
     pub fn step_limit_exceeded(&self) -> bool {
         self.cut_short.load(Ordering::Relaxed)
@@ -327,36 +235,26 @@ impl Regex {
 
     /// Every non-overlapping match in `text`, left to right.
     ///
-    /// Zero-width matches are yielded (`\b` against `"ab cd"` yields four of
-    /// them, at 0, 2, 3 and 5) and the iterator always makes progress: after an
-    /// empty match it resumes at the next code point, and never reports two
-    /// matches ending at the same offset in a row. Call sites that do not want
-    /// empty matches filter them — `aterm-search` does exactly that.
+    /// Zero-width matches are yielded (`\b` on `"ab cd"` yields 0, 2, 3 and 5). After an
+    /// empty match the iterator resumes at the next code point, and it never reports two
+    /// matches ending at the same offset in a row; `aterm-search` filters empty matches.
     ///
-    /// The whole iteration is held to ONE [step budget](RegexBuilder::step_limit),
-    /// shared by the search it runs per match — see there for why a budget per
-    /// search bounds nothing.
-    ///
-    /// **Fails closed**: if the iteration exhausts that budget the iterator
-    /// ends there, and the sticky [`Regex::step_limit_exceeded`] records it. A caller that
-    /// treats the yielded matches as the complete set without asking is
-    /// reading a truncated list.
+    /// The whole iteration shares one [step budget](RegexBuilder::step_limit). It fails
+    /// closed: on exhaustion the iterator ends, the yielded matches are a prefix, and
+    /// [`Matches::step_limit_exceeded`] and [`Regex::step_limit_exceeded`] record it.
     #[must_use]
     pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
         self.find_iter_with_limit(text, self.step_limit)
     }
 
-    /// [`find_iter`](Self::find_iter), held to `step_limit` units instead of
-    /// the pattern's own [`RegexBuilder::step_limit`].
+    /// [`find_iter`](Self::find_iter), held to `step_limit` units instead of the pattern's
+    /// own [`RegexBuilder::step_limit`].
     ///
-    /// For a caller whose fair budget depends on the haystack. `aterm-search`
-    /// matches a soft-wrapped run as ONE line, of any length, and a budget
-    /// sized for one grid row runs out on a long run for any pattern at all,
-    /// so it scales the budget with the line under a ceiling of its own. The
-    /// iteration still shares one budget across the search it runs per match,
-    /// and still fails closed: [`Matches::step_limit_exceeded`] says whether
-    /// it reached the end, and an exhausted search is recorded on the pattern
-    /// as [`step_limit_exceeded`](Self::step_limit_exceeded) too.
+    /// For a caller whose fair budget depends on the haystack: `aterm-search` matches a
+    /// soft-wrapped run as one line of any length and scales the budget with it. Fails
+    /// closed like `find_iter`: [`Matches::step_limit_exceeded`] says whether it reached
+    /// the end, and the pattern records an exhausted search as
+    /// [`step_limit_exceeded`](Self::step_limit_exceeded).
     #[must_use]
     pub fn find_iter_with_limit<'r, 't>(
         &'r self,
@@ -386,8 +284,7 @@ impl Regex {
         budget: &mut u64,
     ) -> Result<Option<(usize, usize)>, StepLimitExceeded> {
         thread_local! {
-            /// Per-thread scratch for the simulation, so a scan over ten
-            /// thousand rows allocates once rather than ten thousand times.
+            /// Per-thread scratch, so a scan over many rows allocates once.
             static CACHE: RefCell<Cache> = RefCell::new(Cache::new());
         }
         let outcome = CACHE
@@ -405,8 +302,7 @@ impl Regex {
                 pikevm::search(&self.prog, &mut Cache::new(), text, start, earliest, budget)
             });
         if outcome.is_err() {
-            // Recorded here, in the one place every entry point funnels
-            // through, so no caller can lose the fact by taking a shortcut.
+            // Every entry point funnels through here, so none can lose the fact.
             self.cut_short.store(true, Ordering::Relaxed);
         }
         outcome.map_err(|_| StepLimitExceeded::new(self.step_limit))
@@ -490,8 +386,7 @@ pub struct Matches<'r, 't> {
     text: &'t str,
     last_end: usize,
     last_match: Option<usize>,
-    /// What is left of the ONE step budget the whole iteration shares. See
-    /// [`RegexBuilder::step_limit`] for why it is not one budget per search.
+    /// What is left of the one step budget the whole iteration shares.
     budget: u64,
     cut_short: bool,
 }
@@ -500,14 +395,9 @@ impl Matches<'_, '_> {
     /// Did this iterator stop early because a search exhausted the
     /// [step budget](RegexBuilder::step_limit)?
     ///
-    /// `false` means the iterator ran to the end of the haystack and the
-    /// matches it yielded are every match there is. `true` means it gave up
-    /// part-way: what it yielded is a prefix of the truth, not the truth.
-    ///
-    /// Unlike [`Regex::step_limit_exceeded`], which is sticky across every
-    /// search on the pattern, this is about one haystack: a caller scanning
-    /// many lines with one pattern reads it per line to say WHICH lines it
-    /// could not finish.
+    /// `false` means it yielded every match in the haystack; `true` means what it yielded
+    /// is a prefix. Unlike the sticky [`Regex::step_limit_exceeded`], this is per
+    /// haystack, so a caller scanning many lines learns which ones it could not finish.
     #[must_use]
     pub fn step_limit_exceeded(&self) -> bool {
         self.cut_short
@@ -528,19 +418,17 @@ impl<'t> Iterator for Matches<'_, 't> {
             let (start, end) = match searched {
                 Ok(found) => found?,
                 Err(_) => {
-                    // Fail closed and stay closed: fuse the iterator so a
-                    // caller that keeps polling does not re-run the search that
-                    // just proved too expensive, once per remaining position.
+                    // Fuse, so further polls do not re-run the search that just ran
+                    // out of budget at every remaining position.
                     self.cut_short = true;
                     self.last_end = self.text.len().saturating_add(1);
                     return None;
                 }
             };
             if start == end {
-                // Empty match: step one code point so the iterator terminates,
-                // and drop it if the previous match already ended here — which
-                // is what stops `a*` on "aab" reporting an empty match at 2
-                // right after the "aa" that ended there.
+                // Empty match: step one code point so the iterator terminates, and
+                // drop it if the previous match ended here, so `a*` on "aab" reports
+                // no empty match at 2 right after "aa".
                 self.last_end = end
                     + self
                         .text
@@ -605,92 +493,50 @@ impl RegexBuilder {
 
     /// Ceiling, in bytes, on the compiled program.
     ///
-    /// Charged per instruction and re-checked on every one emitted, so a pattern
-    /// that would exceed it fails after a few thousand instructions rather than
-    /// allocating until it runs out of budget. The charge covers the whole cost
-    /// of an instruction: the instruction itself plus the per-instruction slots
-    /// it forces in the simulation's two thread lists.
+    /// Checked on every instruction emitted, so an oversized pattern fails early instead
+    /// of allocating. Each instruction is charged with the slots it forces in the
+    /// simulation's two thread lists.
     #[must_use]
     pub fn size_limit(mut self, bytes: usize) -> Self {
         self.size_limit = bytes;
         self
     }
 
-    /// Ceiling, in bytes, on a lazy-DFA cache.
-    ///
-    /// **This engine has no DFA.** A Pike VM simulates the NFA directly, which
-    /// is what buys the linear-time guarantee, and it holds no cache that could
-    /// grow: per-search memory is already bounded by
-    /// [`size_limit`](Self::size_limit) alone. The setting is accepted for
-    /// source compatibility with the call sites that pass it, and it is what a
-    /// lazy DFA would be bounded by if one were ever added. It is
-    /// deliberately *not* silently repurposed as a second cap on the program:
-    /// that would reject patterns the caller expected to compile.
+    /// Ceiling, in bytes, on a lazy-DFA cache: accepted for source compatibility and
+    /// ignored. This engine has no DFA, and per-search memory is already bounded by
+    /// [`size_limit`](Self::size_limit). It is not repurposed as a second program cap,
+    /// which would reject patterns the caller expects to compile.
     #[must_use]
     pub fn dfa_size_limit(self, _bytes: usize) -> Self {
         self
     }
 
-    /// Ceiling on the work **one search** may do, in units of
-    /// `positions × live threads`.
+    /// Ceiling on the work one search may do, in units of `positions × live threads`.
     ///
-    /// This is the bound [`size_limit`](Self::size_limit) cannot give. A Pike
-    /// VM's scan is linear in the haystack, but the constant of that linearity
-    /// is the program size, and both factors come from untrusted input — so
-    /// `size_limit` bounds one factor of a product and nothing bounds the
-    /// product. The step budget bounds the product itself.
+    /// [`size_limit`](Self::size_limit) bounds the program, but a scan costs program ×
+    /// haystack and both come from untrusted input; this bounds the product. A unit is one
+    /// input position visited, one byte the prefilter skips, one instruction entered in an
+    /// epsilon closure, or one live thread advanced. Exhausting it ends the search with
+    /// [`StepLimitExceeded`] rather than a span; [`Regex::is_match`] says which entry
+    /// points fail closed.
     ///
-    /// A unit is one real piece of work: one input position visited, one byte
-    /// the literal prefilter skips, one instruction entered while taking an
-    /// epsilon closure, or one live thread advanced. Exhausting it ends the
-    /// search with [`StepLimitExceeded`] rather than a span — see that type for
-    /// why "no match" would be the wrong answer, and [`Regex::is_match`] for
-    /// which entry points fail closed.
+    /// Each [`find`](Regex::find), [`is_match`](Regex::is_match) and
+    /// [`find_iter`](Regex::find_iter) call starts from a full budget, and the searches a
+    /// `find_iter` runs, one per match, share it. Leftmost-first iteration can re-walk the
+    /// rest of the haystack per match: `\w+=|\w` over `n` word characters has each
+    /// one-character match in hand at once but must walk the higher-priority `\w+=` thread
+    /// to the end of the run first, `n²/2` positions in all with no single search over
+    /// `n`. A budget per search would bound nothing.
     ///
-    /// The budget is spent per call, not per `Regex`: every
-    /// [`find`](Regex::find), [`is_match`](Regex::is_match) and
-    /// [`find_iter`](Regex::find_iter) starts from a full one — and a
-    /// `find_iter` is ONE call, however many matches it yields. Its searches,
-    /// one per match, share the budget, because leftmost-first iteration can
-    /// re-walk the rest of the haystack in every one of them: `\w+=|\w` over a
-    /// run of `n` word characters has its one-character match in hand at once,
-    /// but must walk the higher-priority `\w+=` thread to the end of the run
-    /// before it may report it, `n` times — `n²/2` positions, with no single
-    /// search over `n`. Scanning a thousand rows therefore costs at most a
-    /// thousand budgets whatever the rows hold, which is what makes the
-    /// ceiling a per-row cost the caller can reason about.
-    ///
-    /// ## Choosing the default: 2^26 = 67,108,864 units
-    ///
-    /// A unit is worth **1.15 ns** on the m21 box in release — measured across
-    /// four programs of different shapes, which came in at 1.13, 1.15, 1.15 and
-    /// 1.19 ns, so the count is a good proxy for time and not just for work.
-    /// The default is therefore about 77 ms of scanning for the one search that
-    /// actually exhausts it.
-    ///
-    /// It is pinned from below by the most expensive thing a bounded call site
-    /// can legitimately be handed, and every number here is measured by
-    /// `step_budget_tests`, which fails if the margins stop holding:
-    ///
-    /// * The heaviest program the call sites' 128 KiB `size_limit` admits at
-    ///   all needs **~16.7M** units to cross one 4,096-column row
-    ///   (`(?:x?){1020}z`, 19.3 ms). A pattern that compiles must be able to
-    ///   run, so the default clears that with 4x to spare.
-    /// * Every built-in `aterm-selection` rule is over *two orders of
-    ///   magnitude* below it. Finding every match in a full-width row of
-    ///   exactly the text each rule exists to find — the whole `find_iter`,
-    ///   which is what one budget pays for — costs at most **~252,000** units
-    ///   (the IPv6 rule); git hashes cost ~19,000, emails ~45,000, file paths
-    ///   ~48,000, URLs ~34,000. Nothing aterm ships can notice this budget exists.
-    ///
-    /// What the default deliberately does *not* do is make one expensive row
-    /// cheap: `(?:x?){2000}z` compiled under a 1 MiB ceiling costs 32.8M units
-    /// (37.7 ms) on a single row, and the default lets that finish while
-    /// refusing the same pattern's 3 MB scan. Call sites that take their
-    /// pattern *and* their content from outside pass something tighter —
-    /// `aterm-observe` and `aterm-search` pass 2^22, about 4.8 ms per row,
-    /// which still clears every match of the most expensive built-in rule in a
-    /// full row by 16x.
+    /// The default, 2^26 units, is about 77 ms of scanning (a unit is ~1.15 ns on the m21
+    /// box, release, across programs of different shapes). It sits above what anything that
+    /// compiles needs: the heaviest program the call sites' 128 KiB `size_limit` admits,
+    /// `(?:x?){1020}z`, needs ~16.7M units per 4,096-column row, and every built-in
+    /// `aterm-selection` rule at most ~252,000 (IPv6) to find every match in a full row;
+    /// `step_budget_tests` checks both. It does not make one expensive row cheap:
+    /// `(?:x?){2000}z` under a 1 MiB ceiling finishes a row (32.8M units) and is refused
+    /// over 3 MB. Call sites that take both pattern and content from outside
+    /// (`aterm-observe`, `aterm-search`) pass 2^22, about 4.8 ms per row.
     #[must_use]
     pub fn step_limit(mut self, steps: u64) -> Self {
         self.step_limit = steps;
@@ -911,10 +757,7 @@ pub const fn decode_match_span_le(bytes: [u8; 16]) -> (u64, u64) {
 mod step_budget_tests {
     use super::*;
 
-    /// The gate quoted in the bug report: the builder the untrusted-pattern
-    /// call sites used when `(?:x?){2000}z` was measured at 42.7 ms per row and
-    /// 30.25 s over a 3 MB haystack. Kept here exactly as it was so the test
-    /// exercises the shape that actually hung, not a friendlier one.
+    /// `pattern` under a 1 MiB `size_limit` and the default step budget.
     fn one_mib_gate(pattern: &str) -> Regex {
         RegexBuilder::new(pattern)
             .size_limit(1 << 20)
@@ -923,15 +766,13 @@ mod step_budget_tests {
             .expect("the amplifiers compile under a 1 MiB ceiling — that is the problem")
     }
 
-    /// The two amplifiers from the bug report, thirteen and twenty-five bytes.
+    /// Thirteen- and twenty-five-byte patterns that compile to thousands of instructions.
     const AMPLIFIERS: [&str; 2] = ["(?:x?){2000}z", "(?:x|x|x|x|x|x|x|x){400}z"];
 
-    /// What `aterm-observe` and `aterm-search` pass — kept in step with their
-    /// own constants, and the number the amplifier test below is run at.
+    /// The step limit `aterm-observe` and `aterm-search` pass; keep it equal to theirs.
     const CALL_SITE_STEP_LIMIT: u64 = 1 << 22;
 
-    /// One 4,096-column row and one 3 MB scrollback, both of them the input the
-    /// amplifiers were measured against.
+    /// One 4,096-column row and a 3 MB scrollback.
     fn row() -> String {
         "x".repeat(4096)
     }
@@ -950,11 +791,9 @@ mod step_budget_tests {
         !it.step_limit_exceeded()
     }
 
-    /// The smallest budget that lets a whole `find_iter` finish, to within 2%:
-    /// double until it fits, then bisect. That is the number the default has to
-    /// clear, and it is measured rather than reasoned about. (2% rather than
-    /// exact because every bisection step rescans the haystack, and the
-    /// assertions built on this compare against margins of 4x and up.)
+    /// The smallest budget that lets a whole `find_iter` finish, to within 2%: double,
+    /// then bisect. Not exact because each step rescans the haystack, and the assertions
+    /// compare against margins of 4x and up.
     fn budget_needed(pattern: &str, haystack: &str) -> u64 {
         let mut hi = 1u64;
         while !completes_within(pattern, haystack, hi) {
@@ -972,10 +811,8 @@ mod step_budget_tests {
         hi
     }
 
-    /// **The defect, at the budget the untrusted-pattern call sites pass.**
-    /// Both amplifiers, through the exact gate they were measured on, over both
-    /// haystacks — the 42.7 ms row and the 30.25 s scrollback — and every one
-    /// of the four stops immediately and *says* it stopped.
+    /// At the call sites' budget both amplifiers stop at once, over a row and over 3 MB,
+    /// and report exhaustion.
     #[test]
     fn the_amplifiers_terminate_promptly_instead_of_hanging() {
         let row = row();
@@ -997,14 +834,8 @@ mod step_budget_tests {
         }
     }
 
-    /// The same amplifiers under the *default* budget, which is deliberately
-    /// looser: it exists to leave every pattern in the tree alone, and what it
-    /// stops is the run-away scan rather than the expensive row. So the 3 MB
-    /// haystack — the 30.25 s measurement, and the shape that is actually a
-    /// hang — is refused, while one 4,096-column row is still answered.
-    ///
-    /// This is the honest boundary of the default, and the reason the call
-    /// sites pass something tighter rather than inheriting it.
+    /// The default budget refuses each amplifier's 3 MB scan. It still answers one row,
+    /// which is why the call sites pass a tighter budget.
     #[test]
     fn the_default_budget_stops_the_runaway_scan() {
         let scrollback = scrollback();
@@ -1018,10 +849,8 @@ mod step_budget_tests {
         }
     }
 
-    /// Exhaustion is a **distinct outcome**, not a quiet "no match". The
-    /// distinction is the whole point: the same pattern and haystack that
-    /// report `Err` under a small budget report a real match under a large one,
-    /// so reading `Err` as "no match" would be reading a wrong answer.
+    /// Exhaustion is not "no match": a starved search refuses where a fed one finds a real
+    /// match.
     #[test]
     fn exhaustion_never_masquerades_as_no_match() {
         let haystack = format!("{}z", "x".repeat(4096));
@@ -1061,16 +890,11 @@ mod step_budget_tests {
         assert!(!fed.step_limit_exceeded());
     }
 
-    /// A truncated `find_iter` says it is truncated, and stays truncated: the
-    /// iterator does not re-run the search that just proved too expensive at
-    /// every remaining position.
+    /// A truncated `find_iter` reports it and stays fused.
     #[test]
     fn find_iter_reports_truncation_and_fuses() {
-        // Cheap prefix, then a run that costs more than the budget allows.
-        // The whole iteration shares the budget, so it has to cover all three
-        // cheap matches: each start thread walks the amplifier's ~4,000
-        // epsilon instructions, some 16,000 units per match. The run after
-        // them costs ~16M.
+        // Three cheap matches (~16,000 units each: every start thread walks the
+        // amplifier's ~4,000 epsilon instructions), then a run that costs ~16M.
         let haystack = format!("ab ab ab {}", "x".repeat(4096));
         let re = RegexBuilder::new("ab|(?:x?){2000}z")
             .size_limit(1 << 20)
@@ -1097,22 +921,9 @@ mod step_budget_tests {
         );
     }
 
-    /// A `find_iter` is ONE scan of its haystack and is held to ONE budget, not
-    /// one per match.
-    ///
-    /// Leftmost-first iteration can re-walk the haystack once per match: in
-    /// `\w+=|\w` over a run of `n` word characters with no `=`, every search
-    /// has its one-character `\w` match in hand after a single step, but the
-    /// higher-priority `\w+=` thread is still alive and must be walked to the
-    /// end of the run before that match may be reported. The `k`th search
-    /// walks `n - k` positions, so the iteration walks `n²/2` positions while no
-    /// single search walks more than `n`. A budget per search is then no bound
-    /// on the iteration at all — measured at the call sites' 2^22, release, one
-    /// 4,096-column row took 115 ms (24x the 4.8 ms per row the call sites
-    /// document) and a 16,384-column one 1.6 s, and neither reported anything.
-    ///
-    /// The counts make it exact without a clock: one search over the row fits
-    /// the budget many times over, the iteration's `n` searches do not.
+    /// A `find_iter` is held to one budget, not one per match: `\w+=|\w` over a row of `n`
+    /// word characters walks `n²/2` positions in all, though no single search walks more
+    /// than `n`.
     #[test]
     fn a_find_iter_is_held_to_one_budget_not_one_per_match() {
         let row = row();
@@ -1152,8 +963,7 @@ mod step_budget_tests {
             "and records it for infallible callers"
         );
 
-        // A linear iteration over the same row with the same budget is
-        // untouched: `\w` yields every one of its `n` matches.
+        // A linear iteration under the same budget yields all `n` matches.
         let linear = RegexBuilder::new(r"\w")
             .size_limit(128 * 1024)
             .step_limit(CALL_SITE_STEP_LIMIT)
@@ -1188,17 +998,13 @@ mod step_budget_tests {
         hi
     }
 
-    /// The default budget is chosen to be invisible to everything aterm runs.
-    /// This is the evidence for the number in [`RegexBuilder::step_limit`]'s
-    /// docs: every built-in selection rule, over a full-width row of the text
-    /// it is designed to match and over a 1 MB scrollback of it, needs a tiny
-    /// fraction of the default — measured for the whole `find_iter`, which is
-    /// what one budget pays for.
+    /// Every built-in selection rule finds every match in a full row within an eighth of
+    /// the call sites' budget, and completes under the default: the evidence for the
+    /// numbers in [`RegexBuilder::step_limit`].
     #[test]
     fn every_builtin_selection_rule_stays_far_inside_the_default() {
-        // `aterm-selection`'s builtin_patterns.rs, verbatim, each paired with a
-        // row of the content it exists to find (the expensive case for a rule
-        // is text that keeps its threads alive, not text it rejects at once).
+        // `aterm-selection`'s built-in patterns, verbatim, each with a sample of what it
+        // finds: text that keeps a rule's threads alive is its expensive case.
         let rules: [(&str, &str); 11] = [
             (
                 r#"(?i)(?:https?|ftp|file)://[^\s<>\[\](){}'"`,;|\\^]+[^\s<>\[\](){}'"`,;|\\^.!?:]"#,
@@ -1247,9 +1053,6 @@ mod step_budget_tests {
         ];
 
         for (pattern, sample) in rules {
-            // A full 4,096-column row of exactly the content the rule exists to
-            // find — the expensive case for a rule is text that keeps its
-            // threads alive, not text it rejects at the first code point.
             let row: String = sample.repeat(4096 / sample.len() + 1);
             let per_row = budget_needed(pattern, &row);
             println!("{per_row:>12} units/row  {pattern}");
@@ -1259,8 +1062,7 @@ mod step_budget_tests {
                  docs claim every built-in rule is far inside even the call sites' budget of \
                  {CALL_SITE_STEP_LIMIT}, let alone the default of {DEFAULT_STEP_LIMIT}"
             );
-            // And under the default the rule simply works, over a full row and
-            // over a 1 MB scrollback of the same, with nothing cut off.
+            // Under the default the rule completes over a row and a 1 MB scrollback.
             let scrollback: String = sample.repeat(1024 * 1024 / sample.len() + 1);
             let re = Regex::new(pattern).expect("compiles");
             for haystack in [&row, &scrollback] {
@@ -1275,9 +1077,8 @@ mod step_budget_tests {
         }
     }
 
-    /// The heaviest program the call sites' own 128 KiB `size_limit` admits,
-    /// over a full-width row — the worst *legitimate* case a bounded call site
-    /// can be handed, and the other end of the margin the default has to leave.
+    /// The heaviest program a 128 KiB `size_limit` admits finishes a full row under the
+    /// default budget.
     #[test]
     fn the_worst_admitted_program_still_fits_the_default_budget() {
         for pattern in ["(?:x?){1020}z", "(?:x|x|x|x|x|x|x|x){100}z"] {
@@ -1327,8 +1128,7 @@ mod step_budget_tests {
         );
     }
 
-    /// Ordinary patterns over ordinary rows are untouched: same matches, no
-    /// exhaustion, whatever the budget is set to.
+    /// Ordinary patterns give the same matches under any budget, without exhaustion.
     #[test]
     fn ordinary_patterns_are_unaffected() {
         let text = "commit 66390b5c8f is the release; see http://example.com/x?y=1 (v1.2.3)";
@@ -1357,9 +1157,7 @@ mod step_budget_tests {
         }
     }
 
-    /// The sticky flag is shared by clones, because the program is: a call site
-    /// that clones a compiled rule into a watcher must not lose the fact that
-    /// the rule has already proved too expensive.
+    /// Clones share the sticky cut-short flag.
     #[test]
     fn the_cut_short_flag_is_shared_with_clones() {
         let re = RegexBuilder::new(AMPLIFIERS[0])
@@ -1376,10 +1174,8 @@ mod step_budget_tests {
         );
     }
 
-    /// `find_iter_with_limit` is held to the budget it is handed, not the
-    /// pattern's own, in both directions, and its iterator says per haystack
-    /// whether it finished — a caller scanning many lines needs to know which
-    /// one it could not, which the pattern's sticky flag cannot tell it.
+    /// `find_iter_with_limit` spends the budget it is handed, not the pattern's own, and
+    /// reports truncation per haystack.
     #[test]
     fn find_iter_with_limit_spends_the_budget_it_is_handed() {
         let text = format!("{} needle", "x".repeat(10_000));
@@ -1399,8 +1195,7 @@ mod step_budget_tests {
         assert!(it.step_limit_exceeded(), "the smaller budget does not");
         assert!(roomy.step_limit_exceeded(), "and the pattern records it");
 
-        // Per haystack: the next one starts from its own budget and its own
-        // verdict, whatever the pattern learned before.
+        // Each haystack starts from its own budget and its own verdict.
         let mut it = roomy.find_iter_with_limit("a needle", needed / 2);
         assert_eq!(it.next().map(|m| m.range()), Some(2..8));
         assert_eq!(it.next(), None);

@@ -235,6 +235,25 @@ impl core::ops::BitAndAssign for ScaleFlags {
     }
 }
 
+/// The largest scale the hinter fits at, in 26.6 units per font unit: 128
+/// pixels per unit. An unscaled point is at most 32768 units from the origin
+/// (the loaders truncate to 16 bits), so below it every scaled coordinate is
+/// within 2^28 and the sums of a few that the fitting adds stay inside an
+/// `i32`. [`Scale::new`]'s 16.16 scale wraps at 32768 (512 pixels per unit),
+/// and past that the fitting overflowed on outlines near the 16-bit edge
+/// (`tests/hint_extremes.rs`).
+pub(crate) const MAX_SCALE_26_6: f32 = 8192.0;
+
+/// Whether `size` pixels per em at `units_per_em` is a scale the hinter fits
+/// at ([`MAX_SCALE_26_6`]); `false` for a size that is not finite and
+/// positive, or a face with no units.
+pub(crate) fn scale_fits(size: f32, units_per_em: i32) -> bool {
+    units_per_em > 0
+        && size.is_finite()
+        && size > 0.0
+        && size * 64.0 <= MAX_SCALE_26_6 * units_per_em as f32
+}
+
 /// Captures scaling parameters which may be modified during metrics
 /// computation.
 #[derive(Copy, Clone, Default, Debug)]

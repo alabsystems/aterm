@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `HarnessUsageTap` (aterm-spec `harness_usage_tap_model`): on every
-//! reachable state of the model, the real code (`tap::gate` at a relaunch, the
+//! Tier-1 for `HarnessUsageTap` (aterm-models-harness `harness_usage_tap_model`): on
+//! every reachable state of the model, the real code (`tap::gate` at a relaunch, the
 //! silence rule at the new process's first point via `tap::Silence::step` or
-//! `tap::Silence::untapped`, `tap::Fresh::admit` and `accounts::note_reading` at the
-//! host's read, `tap::Silence::step` at a decided point 30 s on) is handed what the
-//! state stands for and takes exactly the model's step.
+//! `tap::Silence::untapped`, `tap::Fresh::admit`, `tap::Fresh::beside` and
+//! `accounts::note_reading` at the host's read, `tap::Silence::step` at a decided
+//! point 30 s on) is handed what the state stands for and takes exactly the model's
+//! step.
 //!
 //! A state stands for: the switch (`armed`: the gate is handed this aterm's path, or
 //! none); the session's own status line (`userline`); the machine's stored login
@@ -14,14 +15,17 @@
 //! the login a renewal bound the machine's one account to); a process (`pid`) with
 //! `api` API time and the five-hour figure `figs` (as `10 + 10·figs` percent); the
 //! reading last admitted (`lpid`, `lapi`, `lfigs`), replayed into a fresh `Fresh`;
-//! the figure on record (`noted`); the silence rule's strikes, replayed into a fresh
-//! `Silence`; and the window's line (`said`: a `Heard::Silent` tells it, a
-//! `Heard::Again` ends it). Compared: every variable in [`DECIDED`]. Attribution
-//! beyond the stored login is the model's `cred`, as handed.
+//! the figure on record (`noted`, as the account's held five-hour figure) and the
+//! reset used inside its window (`epoch`, that figure's epoch); the silence rule's
+//! strikes, replayed into a fresh `Silence`; and the window's line (`said`: a
+//! `Heard::Silent` tells it, a `Heard::Again` ends it). Compared: every variable in
+//! [`DECIDED`]. Attribution beyond the stored login is the model's `cred`, as handed.
 //!
 //! Negative controls: an `admit` that takes every reading (it records the idle
-//! repeat), and a silence rule that starts over on a new process without a word (the
-//! window's mark outlives its process), each disagree with the model somewhere.
+//! repeat), a freshness rule blind to a refill (the max rule across a reset used
+//! inside the window keeps the figure served before it), and a silence rule that
+//! starts over on a new process without a word (the window's mark outlives its
+//! process), each disagree with the model somewhere.
 //!
 //! Unix only: the tap rides on a POSIX shell's relaunch line, and no Windows
 //! path is a command one would run inert (`tap::exe_admissible`).
@@ -32,7 +36,7 @@ use std::path::Path;
 
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::netwatch::Source;
-use aterm_agent::harness::tap::{self, Fresh, Heard, Reading, Silence, Window};
+use aterm_agent::harness::tap::{self, Beside, Fresh, Heard, Reading, Silence, Window};
 use aterm_models_harness::harness_usage_tap_model;
 use aterm_spec::derive::Model;
 
@@ -45,8 +49,8 @@ const RESET: i64 = 1_792_062_396;
 const NOW: i64 = 1_792_050_000;
 
 /// What the real code decides; every other variable is the model's own.
-const DECIDED: [&str; 8] = [
-    "tapped", "noted", "lpid", "lapi", "lfigs", "strike", "silent", "said",
+const DECIDED: [&str; 9] = [
+    "tapped", "noted", "epoch", "lpid", "lapi", "lfigs", "strike", "silent", "said",
 ];
 
 /// Every state `m` reaches, invariants unchecked.
@@ -85,11 +89,13 @@ fn reading(pid: i64, api: i64, figs: i64) -> Reading {
         five_hour: Some(Window {
             pct: pct(figs),
             resets_at: RESET,
+            pct_x10: None,
         }),
         seven_day: None,
         warm: None,
         cache_expires_at: None,
         version: None,
+        model: None,
         dur_us: 0,
     }
 }
@@ -127,8 +133,13 @@ fn gate_taps(s: &S) -> bool {
     taps[0]
 }
 
-/// The real host's read from `s`, under `admit`: the decided variables after.
-fn read_by(s: &S, admit: &dyn Fn(&mut Fresh, &Reading) -> bool) -> S {
+/// What the host's freshness rule says of a reading beside the last one
+/// admitted, as `beside`.
+type BesideBy = dyn Fn(&Fresh, &Reading) -> Beside;
+
+/// The real host's read from `s`, under `admit` and `beside`: the decided
+/// variables after.
+fn read_by(s: &S, admit: &dyn Fn(&mut Fresh, &Reading) -> bool, beside: &BesideBy) -> S {
     let mut fresh = Fresh::default();
     if s["lpid"] > 0 {
         assert!(admit(
@@ -137,7 +148,9 @@ fn read_by(s: &S, admit: &dyn Fn(&mut Fresh, &Reading) -> bool) -> S {
         ));
     }
     let mut out = s.clone();
-    if !admit(&mut fresh, &reading(s["pid"], s["api"], s["figs"])) {
+    let now = reading(s["pid"], s["api"], s["figs"]);
+    let said = beside(&fresh, &now);
+    if !admit(&mut fresh, &now) {
         return out;
     }
     out.insert("lpid", s["pid"]);
@@ -145,25 +158,31 @@ fn read_by(s: &S, admit: &dyn Fn(&mut Fresh, &Reading) -> bool) -> S {
     out.insert("lfigs", s["figs"]);
     if s["cred"] == 1 {
         let mut state = accounts::State::default();
-        let held = accounts::Sample {
-            session_pct: Some(pct(s["noted"])),
-            session_reset: Some(RESET),
+        let held = accounts::TapRead {
+            five_hour: Some(accounts::WindowRead {
+                pct_x10: pct(s["noted"]) * 10,
+                reset: RESET,
+                refilled: None,
+            }),
             at: NOW - 3600,
-            ..accounts::Sample::default()
+            seen_before: true,
+            ..accounts::TapRead::default()
         };
-        let _ = accounts::note_reading(&mut state, "main", held, NOW - 3600);
-        let _ = accounts::note_reading(
-            &mut state,
-            "main",
-            reading(s["pid"], s["api"], s["figs"]).sample(NOW),
-            NOW,
-        );
-        let recorded = state.accounts["main"]
-            .sample
-            .as_ref()
-            .and_then(|sample| sample.session_pct)
-            .expect("a figure");
-        out.insert("noted", (i64::from(recorded) - 10) / 10);
+        let _ = accounts::note_reading(&mut state, "main", &held, NOW - 3600);
+        // The reset used inside the window, where `s` holds one: the
+        // figure on record is from its epoch on.
+        if s["epoch"] == 1 {
+            let account = state.accounts.get_mut("main").expect("held");
+            let fig = account
+                .windows
+                .get_mut(accounts::SESSION_LIMIT)
+                .expect("a figure");
+            fig.epoch_at = Some(NOW - 3600);
+        }
+        let _ = accounts::note_reading(&mut state, "main", &now.tap_read(said, None), NOW);
+        let fig = &state.accounts["main"].windows[accounts::SESSION_LIMIT];
+        out.insert("noted", (i64::from(fig.pct_x10) / 10 - 10) / 10);
+        out.insert("epoch", i64::from(fig.epoch_at.is_some()));
     }
     out
 }
@@ -250,6 +269,7 @@ fn launch_by(s: &S, first: &First) -> S {
 fn disagreements(
     m: &Model,
     admit: &dyn Fn(&mut Fresh, &Reading) -> bool,
+    beside: &BesideBy,
     first: &First,
 ) -> Vec<(&'static str, S, S, S)> {
     let mut out = Vec::new();
@@ -261,7 +281,7 @@ fn disagreements(
             }
             let real = match action {
                 "Launch" => launch_by(&s, first),
-                "Read" => read_by(&s, admit),
+                "Read" => read_by(&s, admit, beside),
                 _ => tick_by(&s),
             };
             if DECIDED.iter().any(|v| real[v] != model[v]) {
@@ -284,7 +304,8 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
         states.len()
     );
     let real = |f: &mut Fresh, r: &Reading| f.admit(r);
-    let wrong = disagreements(&m, &real, &first_point);
+    let beside = |f: &Fresh, r: &Reading| f.beside(r);
+    let wrong = disagreements(&m, &real, &beside, &first_point);
     assert!(wrong.is_empty(), "{:?}", wrong.first());
     // Every decided step is reached with each outcome.
     let reads = |m: &Model, pick: &dyn Fn(&S, &S) -> bool| {
@@ -295,6 +316,17 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
     };
     assert!(reads(&m, &|s, n| n["noted"] > s["noted"]), "a record");
     assert!(reads(&m, &|s, n| n == s), "a stale read left alone");
+    assert!(
+        reads(&m, &|s, n| n["epoch"] > s["epoch"]
+            && n["noted"] < s["noted"]),
+        "a refill seen: the epoch opened, the lower figure taken"
+    );
+    assert!(
+        reads(&m, &|s, n| s["epoch"] == 1
+            && n["lpid"] != s["lpid"]
+            && n["noted"] == s["noted"]),
+        "a first reading under the epoch says nothing"
+    );
     assert!(
         reachable(&m).iter().any(|s| s["silent"] == 1),
         "a silent tap"
@@ -316,16 +348,24 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
     // Negative controls: the always-fresh admit; the rule started over on a new
     // process without a word.
     let always = |_: &mut Fresh, _: &Reading| true;
-    let caught = disagreements(&m, &always, &first_point);
+    let caught = disagreements(&m, &always, &beside, &first_point);
     assert!(
         caught.iter().any(|(action, ..)| *action == "Read"),
         "the always-fresh admit must disagree with the model"
+    );
+    let blind = |_: &Fresh, _: &Reading| Beside::default();
+    let caught = disagreements(&m, &real, &blind, &first_point);
+    assert!(
+        caught
+            .iter()
+            .any(|(action, s, real, _)| *action == "Read" && real["noted"] > s["figs"]),
+        "a freshness rule blind to a refill must disagree with the model"
     );
     let unsaid = |silence: &mut Silence, _: i64, _: u32, _: bool| {
         *silence = Silence::default();
         Heard::Same
     };
-    let caught = disagreements(&m, &real, &unsaid);
+    let caught = disagreements(&m, &real, &beside, &unsaid);
     assert!(
         caught
             .iter()

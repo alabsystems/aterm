@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, decide_turn_end};
+use crate::supervise::approvals::{Outcome, RULE_WALL_WAIT, Row};
+use crate::supervise::policy::turn_end::{Conversation, RULE_LIMIT_RESUME, decide_turn_end};
 
 /// Compose the measured limit/resume screens with a shell that outlived the
 /// turn, as the measured background-work fixtures draw it. No live turn runs.
@@ -183,4 +184,1644 @@ fn a_remembered_bucket_obeys_the_newest_model_choice_under_background_work() {
         drop(s);
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// ONE PROGRAM'S LIMIT AS THE LOOP MEETS IT: `wall`, a screen of the program
+/// that draws the limit's notice with its reset (`None`: none of its screens
+/// draws one, and the limit is the ledger's open wall a loop that follows
+/// another takes up), then `after`, a screen of the same program that draws
+/// none of it: the turn's end over its own background work on Muse Code, agy
+/// and Claude Code, which the memory keeps the wall for, an idle point on
+/// Gemini CLI, a screen no reader names for Codex and any other program.
+/// `program` is the name `status` gives (`None`: the screen tells).
+struct Limited {
+    program: Option<&'static str>,
+    wall: Option<Vec<String>>,
+    after: Vec<String>,
+    /// The open wall a loop that follows takes up, where `wall` is `None`:
+    /// its words and its reset as the loop that wrote it read them.
+    seed: Option<aterm_phase::Wall>,
+}
+
+/// What one point decided, and the limit's conversation it left: the
+/// track's ([`TurnEndState::limit_conversation`]) and the memory's.
+#[derive(Debug, PartialEq, Eq)]
+struct Decided {
+    act: String,
+    track: Option<Conversation>,
+    memory: Option<Conversation>,
+}
+
+/// One point of a loop: its `seq`, the program `status` names there
+/// (`None`: the screen tells), its screen, the seconds past [`TEST_NOW`] its
+/// clock reads, and the work a turn ran to it.
+struct At<'a> {
+    seq: u64,
+    program: Option<&'a str>,
+    rows: &'a [String],
+    at: i64,
+    worked: Option<Duration>,
+}
+
+/// How far ahead a seeded open wall's reset is placed.
+const LIMITED_RESET_IN: i64 = 600;
+
+/// The open wall `w` leaves for a loop that follows, its reset
+/// [`LIMITED_RESET_IN`] past [`TEST_NOW`], written a minute before it, its
+/// conversation `scope`.
+fn open_wall_of(w: &aterm_phase::Wall, scope: &Conversation) -> approvals::OpenWall {
+    approvals::OpenWall {
+        conversation: scope.clone(),
+        program: None,
+        at_ms: (TEST_NOW - 60) * 1000,
+        message: w.message.clone(),
+        reset: w.reset.clone(),
+        reset_unix: Some(TEST_NOW + LIMITED_RESET_IN),
+        kind: Some(w.kind),
+        judged_ms: None,
+        retry_ms: None,
+    }
+}
+
+/// ONE LOOP ON THE SESSION'S LEDGER at `ledger`: `host`, a host that reads
+/// no transcript (as a window's host is for every agent but Claude Code);
+/// `seed`, the open wall it takes up at the first point's clock; then each
+/// of `points` decided by the session's own loop.
+fn loop_points(
+    ledger: &Path,
+    host: bool,
+    seed: Option<approvals::OpenWall>,
+    points: &[At<'_>],
+) -> Vec<Decided> {
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, Some("@s-1".to_owned()));
+    s.set_clock(TEST_NOW + points.first().map_or(0, |p| p.at), PDT);
+    s.set_zone_lookup(test_zones);
+    // Every deadline the policy's to the second, however long the steps take.
+    s.set_mono_standing();
+    s.set_approval_ledger(Some(ledger.to_path_buf()));
+    let mut notes = Vec::new();
+    s.ledger = approvals::Ledger::open(Some(ledger), Some("@s-1"), &mut notes);
+    assert!(notes.is_empty(), "the scratch ledger opens: {notes:?}");
+    let opts = SuperviseOpts {
+        idle_host: host.then(|| Arc::new(AccountHost::default()) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    if let Some(open) = seed {
+        s.seed_wall_memory(Some(open));
+        assert!(s.wall_memory.is_some(), "the seed is taken up");
+    }
+    let mut decided = Vec::new();
+    for p in points {
+        s.set_clock(TEST_NOW + p.at, PDT);
+        s.program = p.program.map(str::to_owned);
+        let point = point_at(&s, p.rows.to_vec(), p.seq);
+        let act = match s.turn_end_at_point(&point, p.worked, &opts) {
+            Ok(TurnEndAction::WaitUntil { until, why, .. }) => {
+                format!("wait {}s: {why}", s.unix_of(until) - s.now_unix())
+            }
+            Ok(TurnEndAction::Nothing) => "nothing".to_owned(),
+            Ok(a) => format!("act {}", a.rule_id().unwrap_or("-")),
+            Err(e) => format!("fail {e:?}"),
+        };
+        decided.push(Decided {
+            act,
+            track: s.turn_end.limit_conversation().cloned(),
+            memory: s.wall_memory.as_ref().map(|m| m.conversation.clone()),
+        });
+    }
+    decided
+}
+
+/// Each row of the ledger at `ledger`: its rule and the conversation it was
+/// written with.
+fn ledger_scopes(ledger: &Path) -> Vec<String> {
+    std::fs::read_to_string(ledger)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .map(|v| {
+            format!(
+                "{} conversation={:?}",
+                v.get("rule_id")
+                    .and_then(aterm_json::Value::as_str)
+                    .unwrap_or("-"),
+                v.get("conversation")
+            )
+        })
+        .collect()
+}
+
+/// The program each wall row of the ledger at `ledger` names it met under
+/// ([`approvals::PROGRAM`]; `None`: the row names none).
+fn wall_programs(ledger: &Path) -> Vec<Option<String>> {
+    std::fs::read_to_string(ledger)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|v| v.get("rule_id").and_then(aterm_json::Value::as_str) == Some(RULE_WALL_WAIT))
+        .map(|v| {
+            v.get(approvals::PROGRAM)
+                .and_then(aterm_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The points of `p`'s limit, decided by the session's own loop: its wall
+/// (where a screen draws it), a point drawing none of it before the reset,
+/// and the same screen two days past it. `host`: a host that reads no
+/// transcript; `scope`: the open wall's conversation, as the row that seeds
+/// it says. Also each ledger row's rule and the conversation it was written
+/// with.
+fn limited_points(
+    p: &Limited,
+    host: bool,
+    scope: &Conversation,
+    tag: &str,
+) -> (Vec<Decided>, Vec<String>) {
+    let (dir, ledger) = ledger_at(tag);
+    let mut points = Vec::new();
+    if let Some(wall) = &p.wall {
+        points.push(At {
+            seq: 101,
+            program: p.program,
+            rows: wall,
+            at: 0,
+            worked: Some(Duration::from_secs(60)),
+        });
+    }
+    for (seq, at) in [(102, 0), (103, 2 * 86_400)] {
+        points.push(At {
+            seq,
+            program: p.program,
+            rows: &p.after,
+            at,
+            worked: None,
+        });
+    }
+    let seed = p.seed.as_ref().map(|w| open_wall_of(w, scope));
+    let decided = loop_points(&ledger, host, seed, &points);
+    let rows = ledger_scopes(&ledger);
+    let _ = std::fs::remove_dir_all(dir);
+    (decided, rows)
+}
+
+/// A LIMIT ON AN AGENT WHOSE CONVERSATION THE LOOP NEVER READS
+/// ([`screen_alone`]: Muse Code, agy, Gemini CLI) is the hostless lane's, a
+/// host there or not: the screen is all the evidence there is, and no host
+/// read can name the conversation. Under a host that reads no transcript
+/// every point decides as with no host, the limit's track and memory keep
+/// the hostless lane's conversation, and no ledger row carries a scope — for
+/// a wall the screen drew, a legacy open wall, and an open wall a
+/// host-scoped loop wrote unread (as a host's loop writes every legacy wall
+/// at its start: [`a_hosts_loop_requires_the_wall_it_takes_up_before_any_decision`]).
+/// The limit is waited for to its reset, never looked at as unread, and the
+/// resume is typed past it. Measured before: under the host, every point
+/// after the wall waited `now + 5 min` ("the remembered limit's conversation
+/// is unread"), two days past the reset too, never resumed, and an unread
+/// open wall was held so with no host as well.
+fn a_limit_is_the_hostless_lanes(name: &str, p: &Limited) {
+    let scopes: &[Conversation] = if p.wall.is_some() {
+        &[Conversation::Hostless]
+    } else {
+        &[Conversation::Hostless, Conversation::Unknown]
+    };
+    for scope in scopes {
+        let tag = |host| format!("never-read-{name}-{scope:?}-{host}");
+        let (hosted, hosted_rows) = limited_points(p, true, scope, &tag(true));
+        let (hostless, hostless_rows) = limited_points(p, false, scope, &tag(false));
+        assert_eq!(
+            hosted, hostless,
+            "{name}, seeded {scope:?}: a host that reads no transcript decides as none"
+        );
+        assert_eq!(
+            hosted_rows, hostless_rows,
+            "{name}, seeded {scope:?}: the ledger a host leaves is the hostless lane's"
+        );
+        for d in &hosted {
+            assert!(
+                d.track
+                    .as_ref()
+                    .is_none_or(|c| *c == Conversation::Hostless)
+                    && d.memory
+                        .as_ref()
+                        .is_none_or(|c| *c == Conversation::Hostless),
+                "{name}, seeded {scope:?}: the hostless lane's conversation: {hosted:#?}"
+            );
+        }
+        assert!(
+            hosted_rows.iter().all(|r| r.ends_with("conversation=None")),
+            "{name}, seeded {scope:?}: no row is scoped: {hosted_rows:#?}"
+        );
+        let (past, before) = hosted.split_last().expect("points");
+        for d in before {
+            assert!(
+                d.act.starts_with("wait ") && !d.act.contains("unread"),
+                "{name}, seeded {scope:?}: the reset is waited for: {hosted:#?}"
+            );
+        }
+        assert_eq!(
+            past.act,
+            format!("act {RULE_LIMIT_RESUME}"),
+            "{name}, seeded {scope:?}: resumed past the reset: {hosted:#?}"
+        );
+    }
+}
+
+/// The open wall a Muse Code's usage limit leaves (`resets at 1:06 PM`).
+fn muse_limit() -> aterm_phase::Wall {
+    aterm_phase::read(
+        None,
+        &aterm_phase::prompt::fixtures::screen(aterm_phase::muse::fixtures::USAGE_WALL),
+        None,
+    )
+    .wall
+    .expect("Muse Code's usage wall")
+}
+
+/// [`a_limit_is_the_hostless_lanes`]: Muse Code's usage wall (the lab's
+/// 429), drawn and then hidden under a backgrounded shell's panel, and a
+/// loop that follows taking it up from the ledger.
+#[test]
+fn a_muse_codes_limit_under_a_host_is_the_hostless_lanes() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let after = screen(u::END_OF_TURN_BG_RUNNING);
+    for p in [
+        Limited {
+            program: None,
+            wall: Some(screen(u::USAGE_WALL)),
+            after: after.clone(),
+            seed: None,
+        },
+        Limited {
+            program: None,
+            wall: None,
+            after,
+            seed: Some(muse_limit()),
+        },
+    ] {
+        a_limit_is_the_hostless_lanes("muse", &p);
+    }
+}
+
+/// [`a_limit_is_the_hostless_lanes`]: Muse Code's usage wall hidden under the
+/// `/status` cards a person entered at the empty composer under it, the
+/// composer open under the cards (measured on 1.4.10 in the lab, 2026-10-21:
+/// three cards pushed the notice out of sight), and a loop that follows
+/// taking the wall up from the ledger there. The cards are a session at rest
+/// (`aterm_phase::muse`'s `Turn::Carded`): the reset is waited for and the
+/// resume typed past it, a host there or not. Measured before (a unit probe,
+/// `docs/measured/forever-lab-2026-10-20.md` W2): the cards read as no
+/// evidence, so the policy decided nothing there, two days past the reset
+/// too.
+#[test]
+fn a_muse_codes_limit_under_its_status_cards_resumes_at_its_reset() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let after = screen(u::USAGE_WALL_STATUS_CARDS);
+    for p in [
+        Limited {
+            program: None,
+            wall: Some(screen(u::USAGE_WALL)),
+            after: after.clone(),
+            seed: None,
+        },
+        Limited {
+            program: None,
+            wall: None,
+            after,
+            seed: Some(muse_limit()),
+        },
+    ] {
+        a_limit_is_the_hostless_lanes("muse-cards", &p);
+    }
+}
+
+/// What one loop on a scratch ledger decides at each of `points` (`rows`,
+/// seconds past [`TEST_NOW`], the work a turn ran to it), a host that reads
+/// no transcript there or not.
+fn decided_at(
+    tag: &str,
+    host: bool,
+    points: &[(&[String], i64, Option<Duration>)],
+) -> Vec<Decided> {
+    let (dir, ledger) = ledger_at(tag);
+    let points: Vec<At<'_>> = points
+        .iter()
+        .zip(101..)
+        .map(|(&(rows, at, worked), seq)| At {
+            seq,
+            program: None,
+            rows,
+            at,
+            worked,
+        })
+        .collect();
+    let decided = loop_points(&ledger, host, None, &points);
+    let _ = std::fs::remove_dir_all(dir);
+    decided
+}
+
+/// A MUSE CODE SESSION WITH NO TURN YET UNDER ITS CARDS IS TYPED NOTHING
+/// (measured on 1.4.10, the lab of 2026-10-21: `/status`, `/usage` and
+/// `/status` twice more at a fresh session's empty composer pushed its
+/// banner out of sight, each `/status` card saying `IDLE`,
+/// [`aterm_phase::muse::fixtures::FRESH_STATUS_CARDS`]). The loop reads no
+/// conversation of Muse Code's (a host's `taskless` is Claude Code's alone),
+/// and a person's keys there leave no unasked launch: the screen is all that
+/// says nobody gave the session a task. Every point decides nothing, a host
+/// there or not, at the banner and then under the cards, in a 24-row window
+/// of them too. Measured before (the review's probe): the cards read as a
+/// session at rest after a turn, and the loop decided `nothing`, a 2 min
+/// back-off, then `continue@v1` into the session nobody had asked
+/// anything. THE CONTROL: the same cards after a turn the stub answered
+/// (`COMPLETED`, measured) are that turn's end, and the loop types there.
+#[test]
+fn a_muse_codes_fresh_session_under_its_cards_is_typed_nothing() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let banner = screen(u::IDLE_1_4_10);
+    let cards = screen(u::FRESH_STATUS_CARDS);
+    let window = cards[cards.len() - 24..].to_vec();
+    for host in [false, true] {
+        for (what, after) in [("cards", &cards), ("24 rows", &window)] {
+            let d = decided_at(
+                &format!("muse-fresh-cards-{host}-{}", after.len()),
+                host,
+                &[
+                    (&banner, 0, None),
+                    (after, 60, None),
+                    (after, 300, None),
+                    (after, 3600, None),
+                ],
+            );
+            assert!(
+                d.iter().all(|d| d.act == "nothing"),
+                "host={host}, {what}: nobody gave it a task: {d:#?}"
+            );
+        }
+    }
+    let done = screen(u::COMPLETED_STATUS_CARDS);
+    let d = decided_at(
+        "muse-completed-cards",
+        false,
+        &[
+            (&done, 0, Some(Duration::from_secs(60))),
+            (&done, 300, None),
+            (&done, 3600, None),
+        ],
+    );
+    assert!(
+        d.iter().any(|d| d.act.starts_with("act ")),
+        "the control: a turn's end under its cards is acted at: {d:#?}"
+    );
+}
+
+/// Muse Code's usage wall in a form whose notice names no reset: `at` the
+/// measured 429 of a `usage_limit_reached` with no `resets_at`
+/// ([`aterm_phase::muse::fixtures::LIMIT_UNNAMED`]), and the measured usage
+/// wall's notice put in the binary's two other shapes, bare and its quota's,
+/// each with its own wall read off it.
+fn unnamed_walls() -> Vec<(&'static str, Vec<String>)> {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let named = screen(u::USAGE_WALL);
+    let at = named
+        .iter()
+        .position(|r| r.starts_with("◆ Usage limit reached"))
+        .expect("the notice");
+    let with = |notice: &str| -> Vec<String> {
+        let mut rows = named.clone();
+        rows[at] = notice.to_owned();
+        rows.remove(at + 1);
+        rows
+    };
+    let walls = vec![
+        ("the 429", screen(u::LIMIT_UNNAMED)),
+        (
+            "bare",
+            with(
+                "◆ Usage limit reached · /upgrade (https://accountscenter.meta.com/muse_code/?ep=xgrade) for increased limits",
+            ),
+        ),
+        ("its quota's", with("◆ You've used your 5-hour quota.")),
+    ];
+    for (name, rows) in &walls {
+        let w = aterm_phase::read(None, rows, None)
+            .wall
+            .unwrap_or_else(|| panic!("{name}: a wall"));
+        assert!(
+            w.kind.reads_limited() && w.reset.is_none(),
+            "{name}: a limit naming no reset: {w:?}"
+        );
+    }
+    walls
+}
+
+/// MUSE CODE'S WALL UNDER ITS `FAILED` CARDS IS THE WALL STILL (measured on
+/// 1.4.10, the lab of 2026-10-21: `/status` three times under a 429 its
+/// retries did not get past, and under the usage wall, each card saying the
+/// run `FAILED`, the notice out of sight). The cards are a person's look, no
+/// work since: a wall whose notice names no reset is waited on as with its
+/// notice in sight, the 30 min the policy gives such a limit counted from
+/// the wall, a host there or not. Measured before (the review's probe): the
+/// cards read as an idle point with no wall, the limit's notice had left the
+/// screen with no work since and named no reset, so the resume was typed a
+/// minute after the wall, into the standing limit. THE CONTROL: the same
+/// cards after a turn that ended as a turn does since (`COMPLETED`,
+/// measured) end the wall: the worker worked.
+#[test]
+fn a_muse_codes_wall_under_its_failed_cards_is_waited_on_as_at_its_notice() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let worked = Some(Duration::from_secs(60));
+    for (name, wall) in unnamed_walls() {
+        let cards = screen(if name == "the 429" {
+            u::LIMIT_UNNAMED_STATUS_CARDS
+        } else {
+            u::USAGE_WALL_STATUS_CARDS
+        });
+        for host in [false, true] {
+            let tag = |what: &str| format!("muse-failed-cards-{what}-{host}-{}", name.len());
+            let shown = decided_at(
+                &tag("shown"),
+                host,
+                &[(&wall, 0, worked), (&wall, 60, None), (&wall, 300, None)],
+            );
+            assert!(
+                shown[0].act.starts_with("wait ") && shown.iter().all(|d| d.memory.is_some()),
+                "{name}, host={host}: the wall in sight is waited on: {shown:#?}"
+            );
+            let hidden = decided_at(
+                &tag("hidden"),
+                host,
+                &[(&wall, 0, worked), (&cards, 60, None), (&cards, 300, None)],
+            );
+            assert_eq!(
+                hidden, shown,
+                "{name}, host={host}: under its cards the wall is decided as in sight"
+            );
+        }
+        let done = screen(u::COMPLETED_STATUS_CARDS);
+        let worked_since = decided_at(
+            &format!("muse-completed-after-{}", name.len()),
+            false,
+            &[(&wall, 0, worked), (&done, 60, None)],
+        );
+        assert!(
+            worked_since[1].memory.is_none() && !worked_since[1].act.contains("resets"),
+            "{name}: the control, a turn completed since: {worked_since:#?}"
+        );
+    }
+}
+
+/// MUSE CODE'S WALL WITH A LOCAL COMMAND'S ROWS UNDER IT WAITS ON THE RESET IT
+/// NAMES (measured in the W2 lab, 2026-10-21: `/rules` entered at the empty
+/// composer under the usage wall printed three indented rows under the
+/// notice, [`aterm_phase::muse::fixtures::USAGE_WALL_RULES_UNDER`]). The
+/// point decides as at the notice alone, and its wait is the named reset's.
+/// Measured before: the rows were folded into the wall's message (`reset=3:34
+/// AM Rules loaded …`), its reset named no time, and the wait fell back to
+/// 30 min from the wall's first read. THE CONTROL: the notice alone, the
+/// lab's own screen before the first `/rules`, waits on the same reset.
+#[test]
+fn a_muse_codes_wall_with_a_local_commands_rows_under_it_waits_on_its_reset() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let ruled = screen(u::USAGE_WALL_RULES_UNDER);
+    let at = ruled
+        .iter()
+        .position(|r| r.starts_with("  Rules loaded"))
+        .expect("the /rules rows");
+    // The notice alone: its block, the blank row under it, the composer.
+    let alone: Vec<String> = ruled[..at]
+        .iter()
+        .chain(&ruled[at + 4..])
+        .cloned()
+        .collect();
+    assert!(
+        alone.iter().all(|r| !r.contains("Rules loaded")) && alone.len() + 4 == ruled.len(),
+        "{alone:#?}"
+    );
+    // The lab's clock of day when the wall was first read, 03:28:51 PDT,
+    // five minutes before the reset it names.
+    const WALL_READ_AT: i64 = -(5 * 3600 + 26 * 60 + 9);
+    let decide = |rows: &[String], tag: &str| {
+        let (dir, ledger) = ledger_at(tag);
+        let decided = loop_points(
+            &ledger,
+            false,
+            None,
+            &[At {
+                seq: 101,
+                program: None,
+                rows,
+                at: WALL_READ_AT,
+                worked: Some(Duration::from_secs(60)),
+            }],
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        decided
+    };
+    // The wait's seconds: the reset 309 s ahead, and at most its grace and
+    // jitter past it (`TurnEndTiming`'s defaults, 150 s and 60 s), well short
+    // of the 30 min fallback.
+    let waits = |d: &[Decided]| -> Option<i64> {
+        d.first()?
+            .act
+            .strip_prefix("wait ")?
+            .split_once("s: ")
+            .filter(|(_, why)| why.ends_with("usage-session resets"))?
+            .0
+            .parse()
+            .ok()
+    };
+    let named = decide(&alone, "muse-rules-control");
+    assert!(
+        waits(&named).is_some_and(|s| (309..=309 + 150 + 60).contains(&s)),
+        "the control waits on the named reset: {named:#?}"
+    );
+    assert_eq!(decide(&ruled, "muse-rules-under"), named);
+}
+
+/// [`a_limit_is_the_hostless_lanes`]: agy's per-day 429 (the lab's), drawn
+/// and then hidden under a command task's panel, and a loop that follows
+/// taking it up from the ledger.
+#[test]
+fn an_agys_limit_under_a_host_is_the_hostless_lanes() {
+    use aterm_phase::agy::fixtures::lab as a;
+    use aterm_phase::prompt::fixtures::screen;
+    let after = screen(a::BG_TASK);
+    let seed = aterm_phase::read(None, &screen(a::ERROR_429_LONG), None)
+        .wall
+        .expect("agy's 429");
+    for p in [
+        Limited {
+            program: None,
+            wall: Some(screen(a::ERROR_429_LONG)),
+            after: after.clone(),
+            seed: None,
+        },
+        Limited {
+            program: None,
+            wall: None,
+            after,
+            seed: Some(seed),
+        },
+    ] {
+        a_limit_is_the_hostless_lanes("agy", &p);
+    }
+}
+
+/// [`a_limit_is_the_hostless_lanes`]: Gemini CLI draws no limit that names
+/// its reset (its 429 is an API error's row, its quota a dialog), so its
+/// limit is an open wall a loop that follows takes up, at Gemini CLI's
+/// idle turn end.
+#[test]
+fn a_gemini_clis_limit_under_a_host_is_the_hostless_lanes() {
+    use aterm_phase::prompt::fixtures::screen;
+    a_limit_is_the_hostless_lanes(
+        "gemini",
+        &Limited {
+            program: None,
+            wall: None,
+            after: screen(aterm_phase::gemini::fixtures::END_OF_TURN),
+            seed: Some(muse_limit()),
+        },
+    );
+}
+
+/// A build's output: a screen no reader names.
+fn a_build() -> Vec<String> {
+    rows(&["$ make", "cc -c parser.c", "cc -c lexer.c"])
+}
+
+/// A SCREEN NO READER NAMES SAYS NOTHING OF WHOSE THE LIMIT IS (neither
+/// [`screen_alone`] nor [`reads_conversation`]): Codex, named `codex` by
+/// `status`, its screen read by nothing; a shell (`zsh`, the one Claude Code
+/// exited to); a program started as `node` (Claude Code installed by npm)
+/// and one with no name, drawing no frame or box any reader knows. Each
+/// makes no point and keeps the limit's scope as it stands, a host there or
+/// not: an open wall a host-scoped loop wrote unread stays unread, a legacy
+/// one the hostless lane's, and no wall row is written. Measured before
+/// (217343ef72): each released an unread scope to the hostless lane's at
+/// its first decision, on the track, in memory and in a row a hostless loop
+/// that follows reads ([`claude_codes_unread_limit_outlives_a_screen_no_reader_names`]).
+#[test]
+fn a_screen_no_reader_names_keeps_the_limits_scope() {
+    for (name, program, after) in [
+        (
+            "codex",
+            Some("codex"),
+            rows(&["• Working on the parser", "", "› "]),
+        ),
+        ("shell", Some("zsh"), a_build()),
+        ("node", Some("node"), a_build()),
+        ("unnamed", None, a_build()),
+    ] {
+        for host in [true, false] {
+            for scope in [Conversation::Hostless, Conversation::Unknown] {
+                let p = Limited {
+                    program,
+                    wall: None,
+                    after: after.clone(),
+                    seed: Some(muse_limit()),
+                };
+                let tag = format!("unnamed-{name}-{host}-{scope:?}");
+                let (points, rows) = limited_points(&p, host, &scope, &tag);
+                let kept = |c: &Option<Conversation>| c.as_ref().is_none_or(|c| *c == scope);
+                assert!(
+                    points.iter().all(|d| d.act == "nothing")
+                        && points[0].track.as_ref() == Some(&scope)
+                        && points[0].memory.as_ref() == Some(&scope)
+                        && points.iter().all(|d| kept(&d.track) && kept(&d.memory)),
+                    "{name}, host {host}: the scope kept as it stands: {points:#?}"
+                );
+                assert!(
+                    rows.iter()
+                        .all(|r| r.split(' ').next() != Some(RULE_WALL_WAIT)),
+                    "{name}, host {host}: no scope written: {rows:#?}"
+                );
+            }
+            // The point's own evidence: unread under a host, never the
+            // hostless lane's there, so no point of it answers a limit's try
+            // as the limit's own conversation would (`owns_answer`).
+            let mut m = Mock::new(vec![busy_screen()]);
+            let mut s = session(&mut m, Some("@s-1".to_owned()));
+            s.set_clock(TEST_NOW, PDT);
+            s.program = program.map(str::to_owned);
+            let opts = SuperviseOpts {
+                idle_host: host.then(|| Arc::new(AccountHost::default()) as Arc<dyn IdleHost>),
+                ..hosted(30)
+            };
+            let (reading, _) = fold(&mut s, after.clone(), &opts);
+            assert_eq!(
+                reading.conversation,
+                if host {
+                    Conversation::Unknown
+                } else {
+                    Conversation::Hostless
+                },
+                "{name}, host {host}: the point's evidence"
+            );
+        }
+    }
+}
+
+/// THE CONTROL: Claude Code's conversation IS read (its transcript), so a
+/// host makes its remembered limit's conversation required, as 0ab6eaf3e6
+/// bound it, and the hostless lane's rule is no release of it. Conversation
+/// B's five-hour limit, drawn and then hidden under a shell: under a host
+/// whose read names no conversation, the points after it look again
+/// (`limit-conversation-unread`) and nothing is typed, past the reset too;
+/// with no host, the resume past the reset. A legacy open wall under a host
+/// is required the same, and an open wall a host-scoped loop wrote unread
+/// stays unread with no host (a departed host cannot unbind it).
+#[test]
+fn claude_codes_remembered_limit_still_needs_its_conversation_read() {
+    use aterm_phase::prompt::fixtures::{RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300, screen};
+    let after = with_shell(screen(RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300));
+    let unread = |d: &Decided| {
+        d.act
+            .contains("the remembered limit's conversation is unread")
+    };
+    let live = Limited {
+        program: None,
+        wall: Some(armed_conversation_b()),
+        after: after.clone(),
+        seed: None,
+    };
+    let (hosted, _) = limited_points(&live, true, &Conversation::Hostless, "claude-live-host");
+    assert!(
+        hosted[1..].iter().all(unread)
+            && hosted[1..]
+                .iter()
+                .all(|d| d.track == Some(Conversation::Unknown)),
+        "under a host, read and unnamed: {hosted:#?}"
+    );
+    let (hostless, _) = limited_points(&live, false, &Conversation::Hostless, "claude-live");
+    assert_eq!(
+        hostless.last().map(|d| d.act.as_str()),
+        Some(format!("act {RULE_LIMIT_RESUME}").as_str()),
+        "with no host, resumed past the reset: {hostless:#?}"
+    );
+    let seeded = Limited {
+        program: None,
+        wall: None,
+        after,
+        seed: aterm_phase::read(None, &armed_conversation_b(), None).wall,
+    };
+    for (host, scope) in [
+        (true, Conversation::Hostless),
+        (false, Conversation::Unknown),
+    ] {
+        let (points, rows) = limited_points(&seeded, host, &scope, &format!("claude-seed-{host}"));
+        assert!(
+            points.iter().all(unread)
+                && points
+                    .iter()
+                    .all(|d| d.track == Some(Conversation::Unknown)),
+            "seeded {scope:?}, host {host}: held unread: {points:#?}"
+        );
+        assert!(
+            !host || rows.iter().any(|r| r.ends_with("conversation=Some(Null)")),
+            "the required scope is written for a loop that follows: {rows:#?}"
+        );
+    }
+}
+
+/// A CLAUDE CODE LIMIT NO READ NAMED OUTLIVES A SCREEN NO READER NAMES, for
+/// the loop that reads it and for a hostless one that follows. A host's
+/// loop takes up conversation B's five-hour limit from the row a
+/// host-scoped loop wrote unread (`"conversation":null`), and at Claude
+/// Code's screen, its notice hidden under a shell, looks again
+/// (`limit-conversation-unread`). Then the tab is at a screen no reader
+/// names: the shell Claude Code exited to (`status` names `zsh`), or a
+/// Claude Code installed by npm (`status` names `node`) whose transcript
+/// view draws no frame of its own. The limit stays unread on the track and
+/// in memory, and no row releases it. A hostless loop that follows, an hour
+/// past the reset at Claude Code's screen, takes the row up unread and looks
+/// again: nothing is typed into a conversation no read confirmed. Measured
+/// before (217343ef72): the second point released the scope to the hostless
+/// lane's and wrote it, and the hostless loop typed `usage-resume@v1`.
+#[test]
+fn claude_codes_unread_limit_outlives_a_screen_no_reader_names() {
+    use aterm_phase::prompt::fixtures::{RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300, screen};
+    let claude = with_shell(screen(RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300));
+    let shell = a_build();
+    let view = rows(&[
+        "⏺ Bash(make)",
+        "  ⎿  cc -c parser.c",
+        "     cc -c lexer.c",
+        "",
+        "  Showing detailed transcript · ctrl+o to toggle",
+    ]);
+    assert_eq!(
+        aterm_phase::identify(Some("node"), &view).program(),
+        Program::Generic,
+        "the transcript view names no program"
+    );
+    let unread = |d: &Decided| {
+        d.act
+            .contains("the remembered limit's conversation is unread")
+    };
+    let wall = aterm_phase::read(None, &armed_conversation_b(), None)
+        .wall
+        .expect("B's limit");
+    let reason = approvals::wall_wait_reason(
+        Some(TEST_NOW + LIMITED_RESET_IN),
+        wall.reset.as_deref(),
+        wall.kind,
+        &wall.message,
+    );
+    let written = Row {
+        rule_id: RULE_WALL_WAIT,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: &reason,
+        box_seq: 100,
+    }
+    .to_json_wall_wait((TEST_NOW - 60) * 1000, Some("@s-1"), &Conversation::Unknown);
+    for (name, first, second, unnamed) in [
+        ("exited", None, Some("zsh"), &shell),
+        ("npm", Some("node"), Some("node"), &view),
+    ] {
+        let (dir, ledger) = ledger_at(&format!("unread-across-{name}"));
+        std::fs::write(&ledger, format!("{written}\n")).expect("the ledger");
+        let seed = approvals::open_wall(&ledger, Some("@s-1"));
+        assert_eq!(
+            seed.as_ref().map(|o| &o.conversation),
+            Some(&Conversation::Unknown),
+            "{name}: the row a host-scoped loop wrote"
+        );
+        let hosted = loop_points(
+            &ledger,
+            true,
+            seed,
+            &[
+                At {
+                    seq: 101,
+                    program: first,
+                    rows: &claude,
+                    at: 0,
+                    worked: None,
+                },
+                At {
+                    seq: 102,
+                    program: second,
+                    rows: unnamed,
+                    at: 60,
+                    worked: None,
+                },
+            ],
+        );
+        assert!(
+            unread(&hosted[0])
+                && hosted.iter().all(|d| d.track == Some(Conversation::Unknown)
+                    && d.memory == Some(Conversation::Unknown)),
+            "{name}: unread through the screen no reader names: {hosted:#?}"
+        );
+        let successor = loop_points(
+            &ledger,
+            false,
+            approvals::open_wall(&ledger, Some("@s-1")),
+            &[At {
+                seq: 103,
+                program: first,
+                rows: &claude,
+                at: LIMITED_RESET_IN + 3600,
+                worked: None,
+            }],
+        );
+        let rows = ledger_scopes(&ledger);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            successor.iter().all(unread),
+            "{name}: a hostless loop that follows holds it: {successor:#?}\n{rows:#?}"
+        );
+    }
+}
+
+/// A HOST'S LOOP REQUIRES THE LEGACY WALL IT TAKES UP AT ITS START, before
+/// any decision, and writes it: a loop that ends there (stopped, here) leaves
+/// a hostless loop that follows no legacy row to act on from the screen
+/// alone. No screen has named the program yet: the first decision of an
+/// agent whose screen is all the evidence releases the scope
+/// ([`a_limit_is_the_hostless_lanes`], seeded unread). NEGATIVE CONTROL: a
+/// loop with no host leaves the legacy row as it is. Measured before
+/// (217343ef72, the start's require dropped): the row stayed legacy under
+/// the host, the hostless lane's to a loop that follows.
+#[test]
+fn a_hosts_loop_requires_the_wall_it_takes_up_before_any_decision() {
+    let wall = aterm_phase::read(None, &armed_conversation_b(), None)
+        .wall
+        .expect("B's limit");
+    let reason = approvals::wall_wait_reason(
+        Some(TEST_NOW + LIMITED_RESET_IN),
+        wall.reset.as_deref(),
+        wall.kind,
+        &wall.message,
+    );
+    let legacy = Row {
+        rule_id: RULE_WALL_WAIT,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: &reason,
+        box_seq: 100,
+    }
+    .to_json((TEST_NOW - 60) * 1000, Some("@s-1"));
+    for host in [true, false] {
+        let (dir, ledger) = ledger_at(&format!("start-require-{host}"));
+        std::fs::write(&ledger, format!("{legacy}\n")).expect("the ledger");
+        let mut m = Mock::new(vec![busy_screen()]);
+        {
+            let mut s = session(&mut m, Some("@s-1".to_owned()));
+            s.set_clock(TEST_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            s.set_approval_ledger(Some(ledger.clone()));
+            // Stopped before its first look: the loop's start, and nothing after it.
+            s.stop = Some(Arc::new(AtomicBool::new(true)));
+            let opts = SuperviseOpts {
+                idle_host: host.then(|| Arc::new(AccountHost::default()) as Arc<dyn IdleHost>),
+                ..hosted(30)
+            };
+            let mut out: Vec<u8> = Vec::new();
+            let _ = s.watch(&opts, &mut out);
+        }
+        let open = approvals::open_wall(&ledger, Some("@s-1"));
+        let rows = ledger_scopes(&ledger);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(
+            open.map(|o| o.conversation),
+            Some(if host {
+                Conversation::Unknown
+            } else {
+                Conversation::Hostless
+            }),
+            "host {host}: the wall a loop that follows takes up: {rows:#?}\n{:#?}",
+            m.requests
+        );
+    }
+}
+
+/// A LIMIT IS RELEASED TO THE HOSTLESS LANE'S ONLY WHERE IT WAS MET UNDER AN
+/// AGENT WHOSE SCREEN IS ALL ITS EVIDENCE ([`screen_alone`]), whatever program
+/// the tab runs at the decision. One tab under a host whose read names no
+/// conversation: Claude Code meets conversation B's five-hour limit (unread,
+/// `"conversation":null`), hides its notice under a shell, then exits and Muse
+/// Code, agy or Gemini CLI runs in the same tab. That agent's decisions leave
+/// Claude Code's limit unread, on the track, in memory and in every wall row,
+/// and a hostless loop that follows, an hour past the reset at Claude Code's
+/// screen, looks again: nothing is typed into a conversation no read
+/// confirmed. NEGATIVE CONTROL: Muse Code's own limit, required unread by a
+/// Claude Code decision under the host, is released by Muse Code's next
+/// decision and written so, and a hostless loop that follows resumes it past
+/// its reset. Measured before: the agent's first decision released Claude
+/// Code's limit and wrote it, and the hostless loop typed `usage-resume@v1`.
+#[test]
+fn a_limit_met_under_claude_code_outlives_a_screen_alone_agent_in_its_tab() {
+    use aterm_phase::prompt::fixtures::{RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300, screen};
+    let claude = with_shell(screen(RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300));
+    let unread = |d: &Decided| {
+        d.act
+            .contains("the remembered limit's conversation is unread")
+    };
+    let walls = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.split(' ').next() == Some(RULE_WALL_WAIT))
+            .cloned()
+            .collect()
+    };
+    let past_reset = |ledger: &Path| {
+        approvals::open_wall(ledger, Some("@s-1"))
+            .and_then(|o| o.reset_unix)
+            .expect("the open wall's reset")
+            + 3600
+            - TEST_NOW
+    };
+    for (name, agent) in [
+        (
+            "muse",
+            screen(aterm_phase::muse::fixtures::END_OF_TURN_BG_RUNNING),
+        ),
+        ("agy", screen(aterm_phase::agy::fixtures::lab::BG_TASK)),
+        ("gemini", screen(aterm_phase::gemini::fixtures::END_OF_TURN)),
+    ] {
+        let (dir, ledger) = ledger_at(&format!("met-under-claude-{name}"));
+        let hosted = loop_points(
+            &ledger,
+            true,
+            None,
+            &[
+                At {
+                    seq: 101,
+                    program: None,
+                    rows: &armed_conversation_b(),
+                    at: 0,
+                    worked: Some(Duration::from_secs(60)),
+                },
+                At {
+                    seq: 102,
+                    program: None,
+                    rows: &claude,
+                    at: 30,
+                    worked: None,
+                },
+                At {
+                    seq: 103,
+                    program: None,
+                    rows: &agent,
+                    at: 60,
+                    worked: None,
+                },
+            ],
+        );
+        let rows = ledger_scopes(&ledger);
+        assert!(
+            hosted.iter().all(|d| d.track == Some(Conversation::Unknown)
+                && d.memory == Some(Conversation::Unknown))
+                && hosted[1..].iter().all(unread),
+            "{name}: Claude Code's limit stays unread in its tab: {hosted:#?}\n{rows:#?}"
+        );
+        assert!(
+            !walls(&rows).is_empty()
+                && walls(&rows)
+                    .iter()
+                    .all(|r| r.contains("conversation=Some(Null)")),
+            "{name}: no row releases it: {rows:#?}"
+        );
+        assert!(
+            wall_programs(&ledger)
+                .iter()
+                .all(|p| p.as_deref() == Some("claude")),
+            "{name}: each wall row names the program it was met under: {:?}",
+            wall_programs(&ledger)
+        );
+        let successor = loop_points(
+            &ledger,
+            false,
+            approvals::open_wall(&ledger, Some("@s-1")),
+            &[At {
+                seq: 104,
+                program: None,
+                rows: &claude,
+                at: past_reset(&ledger),
+                worked: None,
+            }],
+        );
+        let rows = ledger_scopes(&ledger);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            successor.iter().all(unread),
+            "{name}: a hostless loop that follows holds it: {successor:#?}\n{rows:#?}"
+        );
+    }
+    // NEGATIVE CONTROL: the limit met under Muse Code is released by Muse
+    // Code's decision after a Claude Code decision required it.
+    use aterm_phase::muse::fixtures as u;
+    let muse_after = screen(u::END_OF_TURN_BG_RUNNING);
+    let (dir, ledger) = ledger_at("met-under-muse");
+    let hosted = loop_points(
+        &ledger,
+        true,
+        None,
+        &[
+            At {
+                seq: 101,
+                program: None,
+                rows: &screen(u::USAGE_WALL),
+                at: 0,
+                worked: Some(Duration::from_secs(60)),
+            },
+            At {
+                seq: 102,
+                program: None,
+                rows: &claude,
+                at: 30,
+                worked: None,
+            },
+            At {
+                seq: 103,
+                program: None,
+                rows: &muse_after,
+                at: 60,
+                worked: None,
+            },
+        ],
+    );
+    let rows = ledger_scopes(&ledger);
+    assert!(
+        hosted[1].track == Some(Conversation::Unknown)
+            && hosted[2].track == Some(Conversation::Hostless)
+            && hosted[2].memory == Some(Conversation::Hostless)
+            && walls(&rows)
+                .last()
+                .is_some_and(|r| r.contains("conversation=None")),
+        "CONTROL: Muse Code's own limit is released by its decision: {hosted:#?}\n{rows:#?}"
+    );
+    assert!(
+        wall_programs(&ledger)
+            .iter()
+            .all(|p| p.as_deref() == Some("muse")),
+        "CONTROL: each wall row names Muse Code: {:?}",
+        wall_programs(&ledger)
+    );
+    let successor = loop_points(
+        &ledger,
+        false,
+        approvals::open_wall(&ledger, Some("@s-1")),
+        &[At {
+            seq: 104,
+            program: None,
+            rows: &muse_after,
+            at: past_reset(&ledger),
+            worked: None,
+        }],
+    );
+    let rows = ledger_scopes(&ledger);
+    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(
+        successor.last().map(|d| d.act.as_str()),
+        Some(format!("act {RULE_LIMIT_RESUME}").as_str()),
+        "CONTROL: a hostless loop that follows resumes Muse Code's limit: {successor:#?}\n{rows:#?}"
+    );
+}
+
+/// A loop on the session's ledger at `ledger`, `host` there or not, stopped
+/// before its first look: its start, and nothing after it.
+fn stopped_at_start(ledger: &Path, host: bool) {
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, Some("@s-1".to_owned()));
+    s.set_clock(TEST_NOW, PDT);
+    s.set_zone_lookup(test_zones);
+    s.set_approval_ledger(Some(ledger.to_path_buf()));
+    s.stop = Some(Arc::new(AtomicBool::new(true)));
+    let opts = SuperviseOpts {
+        idle_host: host.then(|| Arc::new(AccountHost::default()) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let _ = s.watch(&opts, &mut out);
+}
+
+/// A HOST'S LOOP TAKES UP THE OPEN WALL OF AN AGENT WHOSE SCREEN IS ALL ITS
+/// EVIDENCE WITH NO CHURN: the row names the program the wall was met under
+/// (Muse Code, agy, Gemini CLI: [`screen_alone`]), so the loop's start under
+/// a host does not require its conversation, and the first decision at that
+/// agent's screen has no scope to release. The ledger keeps the one wall row
+/// it had, and the reset is waited for. NEGATIVE CONTROLS: the same row
+/// naming no program (an older build's) is required at the start
+/// (`"conversation":null`) and released at the first decision, two rows as
+/// before; a row naming Claude Code is required at the start, and so is one
+/// naming a program this build does not know (read as a screen no reader
+/// names). Measured before: every such row was written twice, `null` at the
+/// start and the release at the first decision.
+#[test]
+fn a_hosts_loop_takes_up_a_screen_alone_agents_wall_with_no_churn() {
+    use aterm_phase::prompt::fixtures::screen;
+    let agy_limit = aterm_phase::read(
+        None,
+        &screen(aterm_phase::agy::fixtures::lab::ERROR_429_LONG),
+        None,
+    )
+    .wall
+    .expect("agy's 429");
+    let row = |wall: &aterm_phase::Wall, program: Option<Program>| {
+        let reason = approvals::wall_wait_reason(
+            Some(TEST_NOW + LIMITED_RESET_IN),
+            wall.reset.as_deref(),
+            wall.kind,
+            &wall.message,
+        );
+        Row {
+            rule_id: RULE_WALL_WAIT,
+            outcome: Outcome::Waiting,
+            command: "",
+            reason: &reason,
+            box_seq: 100,
+        }
+        .to_json_wall_wait_by(
+            (TEST_NOW - 60) * 1000,
+            Some("@s-1"),
+            &Conversation::Hostless,
+            program,
+        )
+    };
+    let walls = |ledger: &Path| -> Vec<String> {
+        ledger_scopes(ledger)
+            .into_iter()
+            .filter(|r| r.split(' ').next() == Some(RULE_WALL_WAIT))
+            .collect()
+    };
+    // The wall rows and the first decision a host's loop leaves, its start
+    // and then that decision, over `body`.
+    let take_up = |tag: &str, body: &str, after: &[String]| {
+        let (dir, ledger) = ledger_at(tag);
+        std::fs::write(&ledger, format!("{body}\n")).expect("the ledger");
+        stopped_at_start(&ledger, true);
+        let started = walls(&ledger);
+        let decided = loop_points(
+            &ledger,
+            true,
+            approvals::open_wall(&ledger, Some("@s-1")),
+            &[At {
+                seq: 101,
+                program: None,
+                rows: after,
+                at: 0,
+                worked: None,
+            }],
+        );
+        let rows = walls(&ledger);
+        let _ = std::fs::remove_dir_all(dir);
+        (started, decided, rows)
+    };
+    let first = format!("{RULE_WALL_WAIT} conversation=None");
+    let waits = |d: &[Decided]| {
+        d.iter()
+            .all(|d| d.act.starts_with("wait ") && !d.act.contains("unread"))
+    };
+    for (name, program, wall, after) in [
+        (
+            "muse",
+            Program::Muse,
+            muse_limit(),
+            screen(aterm_phase::muse::fixtures::END_OF_TURN_BG_RUNNING),
+        ),
+        (
+            "agy",
+            Program::Agy,
+            agy_limit,
+            screen(aterm_phase::agy::fixtures::lab::BG_TASK),
+        ),
+        (
+            "gemini",
+            Program::Gemini,
+            muse_limit(),
+            screen(aterm_phase::gemini::fixtures::END_OF_TURN),
+        ),
+    ] {
+        let named = row(&wall, Some(program));
+        let (started, decided, rows) = take_up(&format!("churn-{name}"), &named, &after);
+        assert_eq!(
+            (started, rows),
+            (vec![first.clone()], vec![first.clone()]),
+            "{name}: no row written at the start or the first decision: {decided:#?}"
+        );
+        assert!(
+            waits(&decided)
+                && decided
+                    .iter()
+                    .all(|d| d.track == Some(Conversation::Hostless)),
+            "{name}: the reset waited for: {decided:#?}"
+        );
+        // NEGATIVE CONTROL: the row an older build wrote, naming no program.
+        let legacy = row(&wall, None);
+        let (started, decided, rows) = take_up(&format!("churn-{name}-legacy"), &legacy, &after);
+        let null = format!("{RULE_WALL_WAIT} conversation=Some(Null)");
+        assert_eq!(
+            (started, rows),
+            (
+                vec![first.clone(), null.clone()],
+                vec![first.clone(), null, first.clone()]
+            ),
+            "{name}, CONTROL: a legacy row is required, then released: {decided:#?}"
+        );
+        assert!(waits(&decided), "{name}, CONTROL: {decided:#?}");
+    }
+    // NEGATIVE CONTROLS: a row naming Claude Code is required at the start,
+    // and so is one naming a program this build does not know, read as a
+    // screen no reader names.
+    let claude = aterm_phase::read(None, &armed_conversation_b(), None)
+        .wall
+        .expect("B's limit");
+    let named = row(&claude, Some(Program::Claude));
+    for (tag, body, program) in [
+        ("churn-claude", named.clone(), Program::Claude),
+        (
+            "churn-unknown-name",
+            named.replace("\"program\":\"claude\"", "\"program\":\"zork\""),
+            Program::Generic,
+        ),
+    ] {
+        assert!(body.contains("\"program\":"), "{tag}: {body}");
+        let (dir, ledger) = ledger_at(tag);
+        std::fs::write(&ledger, format!("{body}\n")).expect("the ledger");
+        stopped_at_start(&ledger, true);
+        let open = approvals::open_wall(&ledger, Some("@s-1"));
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(
+            open.map(|o| (o.conversation, o.program)),
+            Some((Conversation::Unknown, Some(program))),
+            "{tag}, CONTROL: required at the start"
+        );
+    }
+}
+
+/// What one loop left that typed a try at conversation B's five-hour limit
+/// ([`try_then`]).
+#[derive(Debug)]
+struct Tried {
+    /// The limit's track's tries after the try's point (`None`: the track
+    /// ended).
+    open: Option<usize>,
+    /// The decision at the screen after it.
+    then: String,
+    /// The track's tries after that.
+    still: Option<usize>,
+    /// What was typed after the try.
+    typed: usize,
+    /// The try a loop that follows takes up from the ledger.
+    taken_up: bool,
+    /// The ledger's rows, each one's rule and scope ([`ledger_scopes`]).
+    rows: Vec<String>,
+}
+
+/// ONE LOOP ON A CLAUDE CODE LIMIT'S TRY, `host` a host whose read names no
+/// conversation or none: conversation B's five-hour limit met by a turn, its
+/// reset waited for and the try typed there (`usage-resume@v1`); then the
+/// try's point, past its take window, at `unnamed` (the program `status`
+/// names there `program`); then Claude Code's screen `then`, a minute on.
+fn try_then(
+    tag: &str,
+    host: bool,
+    program: Option<&str>,
+    unnamed: &[String],
+    then: &[String],
+) -> Tried {
+    let wall = armed_conversation_b();
+    let bucket = aterm_phase::WallKind::UsageSession;
+    let (dir, ledger) = ledger_at(tag);
+    let mut m = Mock::new(vec![wall.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_owned()));
+    s.set_clock(TEST_NOW, PDT);
+    s.set_zone_lookup(test_zones);
+    s.set_mono_standing();
+    // A try's take window is over at its first read after it.
+    s.set_turn_end_timing(TurnEndTiming {
+        take_within: Duration::ZERO,
+        reset_jitter: Duration::ZERO,
+        ..TurnEndTiming::default()
+    });
+    s.set_approval_ledger(Some(ledger.clone()));
+    let mut notes = Vec::new();
+    s.ledger = approvals::Ledger::open(Some(&ledger), Some("@s-1"), &mut notes);
+    assert!(notes.is_empty(), "the scratch ledger opens: {notes:?}");
+    let opts = SuperviseOpts {
+        idle_host: host.then(|| Arc::new(AccountHost::default()) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let decided = |s: &Session<'_, Mock>, a: &TurnEndAction| match a {
+        TurnEndAction::WaitUntil { until, why, .. } => {
+            format!("wait {}s: {why}", s.unix_of(*until) - s.now_unix())
+        }
+        TurnEndAction::Nothing => "nothing".to_owned(),
+        a => format!("act {}", a.rule_id().unwrap_or("-")),
+    };
+    // The wall, met by a turn: its reset waited for.
+    let p = point_at(&s, wall.clone(), 101);
+    let reset = match s.turn_end_at_point(&p, Some(Duration::from_secs(60)), &opts) {
+        Ok(TurnEndAction::WaitUntil { until, .. }) => s.unix_of(until),
+        other => panic!("{tag}: the reset waited for: {other:?}"),
+    };
+    // At the reset, the try, typed.
+    s.set_clock(reset, PDT);
+    let p = point_at(&s, wall.clone(), 102);
+    let act = s.turn_end_at_point(&p, None, &opts).expect("the try");
+    assert_eq!(act.rule_id(), Some(RULE_LIMIT_RESUME), "{tag}: {act:?}");
+    s.pass_wake_settle();
+    s.turn_end_execute(&p, act, &opts, &[], &mut Alone)
+        .expect("typed");
+    assert_eq!(s.turn_end.wall_attempts(bucket), Some(1), "{tag}: the try");
+    let turns = |s: &Session<'_, Mock>| {
+        s.ctl
+            .requests
+            .iter()
+            .filter(|r| r.contains(" turn "))
+            .count()
+    };
+    let typed = turns(&s);
+    // The try's point: a screen no reader names.
+    s.set_clock(reset + 60, PDT);
+    s.program = program.map(str::to_owned);
+    s.ctl.screens = vec![unnamed.to_vec()];
+    s.ctl.served = 0;
+    let p = point_at(&s, unnamed.to_vec(), 103);
+    let a = s.turn_end_at_point(&p, None, &opts).expect("a decision");
+    let _ = s.turn_end_execute(&p, a, &opts, &[], &mut Alone);
+    let open = s.turn_end.wall_attempts(bucket);
+    // The screen after it.
+    s.set_clock(reset + 120, PDT);
+    s.program = None;
+    s.ctl.screens = vec![then.to_vec()];
+    s.ctl.served = 0;
+    let p = point_at(&s, then.to_vec(), 104);
+    let a = s.turn_end_at_point(&p, None, &opts).expect("a decision");
+    let then = decided(&s, &a);
+    let _ = s.turn_end_execute(&p, a, &opts, &[], &mut Alone);
+    let still = s.turn_end.wall_attempts(bucket);
+    let typed = turns(&s) - typed;
+    drop(s);
+    let taken_up = approvals::usage_attempt(&ledger, Some("@s-1")).is_some();
+    let rows = ledger_scopes(&ledger);
+    let _ = std::fs::remove_dir_all(dir);
+    Tried {
+        open,
+        then,
+        still,
+        typed,
+        taken_up,
+        rows,
+    }
+}
+
+/// The transcript view of a Claude Code installed by npm (`status` names
+/// `node`): no frame or box of Claude Code's own, a screen no reader names.
+fn npm_transcript_view() -> Vec<String> {
+    rows(&[
+        "⏺ Bash(make)",
+        "  ⎿  cc -c parser.c",
+        "     cc -c lexer.c",
+        "",
+        "  Showing detailed transcript · ctrl+o to toggle",
+    ])
+}
+
+/// A TRY AT A CLAUDE CODE LIMIT NO READ NAMED IS NOT TAKEN AT A SCREEN NO
+/// READER NAMES (`retry_taken` and the `owns_answer` that gates it on the
+/// limit's conversation, end to end through the loop's own decisions). Under
+/// a host whose read names no conversation, Claude Code meets conversation
+/// B's five-hour limit (unread), the loop waits for its reset and types the
+/// try there. The try's point, past its take window, is a screen identify
+/// cannot name: the shell Claude Code exited to (`status` names `zsh`), or a
+/// Claude Code installed by npm (`node`) whose transcript view draws no
+/// frame. Under a host that screen's evidence is unread too, so it is no
+/// answer of the limit's own conversation: the try stays open, on the track
+/// and in the ledger (a loop that follows takes it up), and at Claude Code's
+/// own screen after it, its notice gone, nothing is typed: the remembered
+/// limit's conversation is unread. NEGATIVE CONTROL: with no host the screen
+/// is all the evidence there is, and the same screen takes the try (the
+/// limit's track ends there). (`owed`, the other premise of that gate, is a
+/// retry's seed alone, `TurnEndState::seed_retry`: never a limit's.)
+#[test]
+fn a_try_at_an_unread_limit_stays_open_through_a_screen_no_reader_names() {
+    use aterm_phase::prompt::fixtures::{RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300, screen};
+    let claude = screen(RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300);
+    for (name, program, unnamed) in [
+        ("exited", Some("zsh"), a_build()),
+        ("npm", Some("node"), npm_transcript_view()),
+    ] {
+        assert_eq!(
+            aterm_phase::identify(program, &unnamed).program(),
+            Program::Generic,
+            "{name}: a screen identify cannot name"
+        );
+        let t = try_then(
+            &format!("try-unnamed-{name}"),
+            true,
+            program,
+            &unnamed,
+            &claude,
+        );
+        assert!(
+            t.open == Some(1)
+                && t.still == Some(1)
+                && t.taken_up
+                && t.rows
+                    .contains(&format!("{RULE_LIMIT_RESUME} conversation=Some(Null)")),
+            "{name}: the try, typed unread, stays open: {t:#?}"
+        );
+        assert!(
+            t.typed == 0
+                && t.then
+                    .contains("the remembered limit's conversation is unread"),
+            "{name}: nothing is typed on an unconfirmed conversation: {t:#?}"
+        );
+        let control = try_then(
+            &format!("try-unnamed-{name}-hostless"),
+            false,
+            program,
+            &unnamed,
+            &claude,
+        );
+        assert_eq!(
+            control.open, None,
+            "{name}, CONTROL: with no host the screen takes the try: {control:#?}"
+        );
+    }
+}
+
+/// A LIMIT'S TRY CARRIES THE PROGRAM ITS WALL WAS MET UNDER: the one the wall
+/// row before it names ([`approvals::UsageAttempt::program`]), so a loop that
+/// takes up the try alone (its typed row closed the open wall) holds the
+/// limit as the loop that typed it did. Claude Code's limit, its try typed
+/// unread under a host: a host's loop that takes the try up keeps it unread
+/// at a Muse Code decision. Muse Code's limit, its try typed on the hostless
+/// lane: a host's loop does not require its conversation at the start.
+/// NEGATIVE CONTROLS: a try after a wall row that names no program (an older
+/// build's) is released by the Muse Code decision and required at the
+/// start, as before.
+#[test]
+fn a_limits_try_carries_the_program_its_wall_was_met_under() {
+    use crate::supervise::policy::turn_end::LimitTry;
+    let wall = aterm_phase::read(None, &armed_conversation_b(), None)
+        .wall
+        .expect("B's limit");
+    let reason = approvals::wall_wait_reason(
+        Some(TEST_NOW + LIMITED_RESET_IN),
+        wall.reset.as_deref(),
+        wall.kind,
+        &wall.message,
+    );
+    let tried = approvals::act_reason(Some(LimitTry {
+        bucket: false,
+        in_place: false,
+        attempts: 1,
+        entitlement: false,
+    }));
+    // The ledger a loop that typed the limit's try leaves: the wall's row,
+    // met under `program`, its scope `scope`, then the try typed at it.
+    let books = |program: Option<Program>, scope: &Conversation| {
+        let wall_row = Row {
+            rule_id: RULE_WALL_WAIT,
+            outcome: Outcome::Waiting,
+            command: "",
+            reason: &reason,
+            box_seq: 100,
+        }
+        .to_json_wall_wait_by((TEST_NOW - 120) * 1000, Some("@s-1"), scope, program);
+        let try_row = Row {
+            rule_id: RULE_LIMIT_RESUME,
+            outcome: Outcome::Typed,
+            command: "keep going",
+            reason: &tried,
+            box_seq: 101,
+        }
+        .to_json_scoped((TEST_NOW - 60) * 1000, Some("@s-1"), None, None, scope);
+        format!("{wall_row}\n{try_row}\n")
+    };
+    // A host's loop that takes the try in `body` up: the limit's scope after
+    // its start, and after a decision's read of Muse Code's screen.
+    let take_up = |tag: &str, body: &str| {
+        let (dir, ledger) = ledger_at(tag);
+        std::fs::write(&ledger, body).expect("the ledger");
+        let attempt = approvals::usage_attempt(&ledger, Some("@s-1"));
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut m, Some("@s-1".to_owned()));
+        s.set_clock(TEST_NOW, PDT);
+        seed_usage_act(
+            &mut s.turn_end,
+            &ledger,
+            Some("@s-1"),
+            TEST_NOW * 1000,
+            Instant::now(),
+        );
+        s.seed_wall_memory(approvals::open_wall(&ledger, Some("@s-1")));
+        assert!(
+            s.wall_memory.is_none() && s.turn_end.has_limit_track(),
+            "{tag}: the try alone is taken up: {attempt:?}"
+        );
+        s.require_seeded_limit_conversation();
+        let started = s.turn_end.limit_conversation().cloned();
+        s.scope_limit_conversation(Program::Muse, true, 102);
+        let decided = s.turn_end.limit_conversation().cloned();
+        drop(s);
+        let _ = std::fs::remove_dir_all(dir);
+        (attempt.and_then(|a| a.program), started, decided)
+    };
+    let unread = Some(Conversation::Unknown);
+    let hostless = Some(Conversation::Hostless);
+    assert_eq!(
+        take_up(
+            "try-claude",
+            &books(Some(Program::Claude), &Conversation::Unknown)
+        ),
+        (Some(Program::Claude), unread.clone(), unread.clone()),
+        "Claude Code's try stays unread at a Muse Code decision"
+    );
+    assert_eq!(
+        take_up(
+            "try-muse",
+            &books(Some(Program::Muse), &Conversation::Hostless)
+        ),
+        (Some(Program::Muse), hostless.clone(), hostless.clone()),
+        "Muse Code's try is not required at a host's start"
+    );
+    assert_eq!(
+        take_up("try-legacy-unread", &books(None, &Conversation::Unknown)),
+        (None, unread.clone(), hostless.clone()),
+        "CONTROL: an older build's unread try is released as before"
+    );
+    assert_eq!(
+        take_up("try-legacy", &books(None, &Conversation::Hostless)),
+        (None, unread, hostless),
+        "CONTROL: an older build's try is required at the start, then released"
+    );
+}
+
+/// THE LIMIT'S TRACK KEEPS THE PROGRAM IT WAS MET UNDER where no wall is
+/// remembered: Claude Code's Fable bucket, its notice naming no reset, met
+/// unread under a host whose read names no conversation; an idle point of
+/// Claude Code's then ends the remembered wall (no reset it named is waited
+/// on) but not the limit's track. Then Muse Code runs in the tab: its
+/// decision leaves Claude Code's limit unread, by the track's own record
+/// ([`Session::limit_met_under`]). NEGATIVE CONTROL: agy's quota, met under
+/// agy and required unread by the same Claude Code decision, is released by
+/// Muse Code's.
+#[test]
+fn a_limits_track_keeps_the_program_it_was_met_under_without_its_wall() {
+    use aterm_phase::prompt::fixtures::{
+        RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300, WALL_FABLE_NO_RESET_2_1_301, screen,
+    };
+    let claude_idle = screen(RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300);
+    let muse = screen(aterm_phase::muse::fixtures::END_OF_TURN_BG_RUNNING);
+    let in_tab = |tag: &str, wall: &[String]| {
+        let (dir, ledger) = ledger_at(tag);
+        let decided = loop_points(
+            &ledger,
+            true,
+            None,
+            &[
+                At {
+                    seq: 101,
+                    program: None,
+                    rows: wall,
+                    at: 0,
+                    worked: Some(Duration::from_secs(60)),
+                },
+                At {
+                    seq: 102,
+                    program: None,
+                    rows: &claude_idle,
+                    at: 30,
+                    worked: None,
+                },
+                At {
+                    seq: 103,
+                    program: None,
+                    rows: &muse,
+                    at: 60,
+                    worked: None,
+                },
+            ],
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        decided
+    };
+    let fable = in_tab("track-fable", &screen(WALL_FABLE_NO_RESET_2_1_301));
+    assert!(
+        fable[1..].iter().all(|d| d.memory.is_none())
+            && fable.iter().all(|d| d.track == Some(Conversation::Unknown)),
+        "Claude Code's bucket stays unread on its track alone: {fable:#?}"
+    );
+    let agy = in_tab(
+        "track-agy",
+        &screen(aterm_phase::agy::fixtures::lab::ERROR_429_LONG),
+    );
+    assert!(
+        agy[1].track == Some(Conversation::Unknown) && agy[2].track == Some(Conversation::Hostless),
+        "CONTROL: agy's quota is released by Muse Code's decision: {agy:#?}"
+    );
 }

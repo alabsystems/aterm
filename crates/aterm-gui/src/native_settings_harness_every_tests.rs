@@ -681,10 +681,14 @@ fn the_every_rows_timer_choices_line_up_where_they_wrap() {
                 }
             }
             // Beside the words (the Timer and Follow the default on one
-            // line): the grid's columns under them, two and two.
+            // line), where every face is whole in the row's slot (a choice
+            // is then as wide as the Timer): the grid's columns under them,
+            // two and two. A face wider than a slot (`at Sat 18:00` at 2×
+            // in the Linux lane's Noto Sans) gives each choice the widest's
+            // width instead, its columns still under one another (above).
             let timer = node(&pages, "harness/session/all/timer").rect;
             let follow = node(&pages, "harness/session/all/follow").rect;
-            if (timer.y - follow.y).abs() < 0.5 {
+            if (timer.y - follow.y).abs() < 0.5 && (first[0].width - timer.width).abs() < 0.5 {
                 *on_slots.lock().unwrap() += 1;
                 assert!(
                     lines.iter().all(|line| line.len() == 2),

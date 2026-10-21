@@ -513,8 +513,9 @@ where
 /// carries the producer, the sequence and the reply's first two tokens joined with
 /// `-` (`ERR-write` for `ERR write failed`), never the input bytes or the reply's
 /// tail (a `turn` reply is a whole screen). The session log's `in-doubt` mark
-/// goes in the same hold, named by the verb alone; the answer is whether its
-/// readers are owed a wake.
+/// goes in the same hold with the row's every field, named by its verb too,
+/// the reply's words at the content tier (phase 6, 6F-7); the answer is
+/// whether its readers are owed a wake.
 pub(crate) fn record_in_doubt(ctx: &SessionCtx, verb: &str, key: Key, reply: &str) -> bool {
     let why = reply
         .trim_end_matches(['\r', '\n'])
@@ -522,6 +523,12 @@ pub(crate) fn record_in_doubt(ctx: &SessionCtx, verb: &str, key: Key, reply: &st
         .take(2)
         .collect::<Vec<_>>()
         .join("-");
+    // ONE BOUND FOR THE ROW AND THE MARK (the review of 6F-7): the words as
+    // the log's `reply=` holds them, hidden characters out and cut at its
+    // cap, so the row never shows what the log does not hold.
+    let why = aterm_slog::BoundedText::new(aterm_slog::Key::Reply, &why)
+        .map(|t| t.as_str().to_string())
+        .unwrap_or_default();
     let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     tl.record(
         "in-doubt",
@@ -533,7 +540,8 @@ pub(crate) fn record_in_doubt(ctx: &SessionCtx, verb: &str, key: Key, reply: &st
         ),
     );
     let at = tl.slog().now();
-    tl.slog_mut().observe_in_doubt(verb, at);
+    tl.slog_mut()
+        .observe_in_doubt(verb, key.producer, key.seq, &why, at);
     tl.slog_take_wake()
 }
 

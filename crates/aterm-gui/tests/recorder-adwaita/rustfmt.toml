@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE RECORDER IS AT EDITION 2021, as the sctk-adwaita 0.10.1 sources it
+# compiles are, and `rustfmt` learns a file's edition from the nearest
+# `rustfmt.toml`, never from `Cargo.toml` (crates/aterm-link/rustfmt.toml says
+# why that matters). Keep it equal to the manifest's edition.
+edition = "2021"

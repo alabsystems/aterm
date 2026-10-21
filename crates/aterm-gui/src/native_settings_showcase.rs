@@ -33,6 +33,18 @@
 //! and closing Settings all end the trial the same way: no view asks for it
 //! any more, so the host reverts.
 //!
+//! NO PRESS WAITS ON A KEEP. Keep's write shows at once (the kept theme is
+//! the one in use) and the strip's controls take every press while it saves,
+//! as every Settings control does: a second Keep asks for nothing more,
+//! Revert (or Esc) takes the Keep back with a write that follows it in the
+//! config lane ([`SettingsApp::revert_trial`]), Keep colours only follows
+//! it (and a Keep after that takes its type pins off again), and another
+//! row is tried over it. What each key held before the trial's first Keep
+//! is the trial's own record ([`ShowcaseTrial::Keeping`]), so Revert and
+//! the strip's "was" read through every Keep of it on its way. The themes
+//! folder's requests are each their own, never refused for another on its
+//! way.
+//!
 //! THE CUSTOMIZE SHEET ([`customize`]) replaces the chooser: the five colour
 //! overrides with their Resets, the sixteen palette slots, and "Save as
 //! theme…", which writes the colours the demo shows as a new theme file
@@ -134,8 +146,19 @@ pub(crate) enum ShowcaseTrial {
     /// is written.
     Trying { id: String },
     /// Keep wrote `theme` for `id`; the trial stands until that write lands
-    /// (or is refused, which goes back to Trying).
-    Keeping { id: String, operation: OperationId },
+    /// (or is refused, which goes back to Trying). Every control of the page
+    /// takes a press meanwhile: Revert takes the Keep back, Keep colours
+    /// only and a save's select follow it, another row is tried.
+    Keeping {
+        id: String,
+        /// The newest of the trial's Keeps on its way.
+        operation: OperationId,
+        /// What each key the trial's Keeps write held before the first of
+        /// them wrote it: what Revert puts back, what the strip says the
+        /// trial replaces, and what a Keep after Keep colours only leaves
+        /// the type settings at, however many of its Keeps are on their way.
+        under: BTreeMap<String, Option<String>>,
+    },
 }
 
 /// The open Save as theme row.
@@ -295,6 +318,10 @@ pub(crate) struct ShowcaseState {
     /// An input arrived since the last render read the clock (reducers have
     /// none): the next render stamps it.
     pub(crate) input_pending: Cell<bool>,
+    /// Escape asked for a Revert while the trial's Keep is on its way: the
+    /// reducer that took the Escape sends the write that takes the Keep back
+    /// ([`SettingsApp::revert_trial`]); Escape's own reduction writes nothing.
+    pub(crate) revert_asked: bool,
 }
 
 impl ShowcaseState {
@@ -323,6 +350,7 @@ impl ShowcaseState {
             demo_epoch_ms: Cell::new(None),
             last_input_phase_ms: Cell::new(0),
             input_pending: Cell::new(true),
+            revert_asked: false,
         }
     }
 
@@ -678,6 +706,12 @@ impl SettingsViewState {
             self.revert_showcase();
             return true;
         }
+        // A Keep on its way is taken back by a write, which the reducer
+        // that took the Escape sends.
+        if matches!(self.showcase.trial, ShowcaseTrial::Keeping { .. }) {
+            self.showcase.revert_asked = true;
+            return true;
+        }
         false
     }
 
@@ -784,12 +818,15 @@ impl SettingsViewState {
     /// theme in use, the trial ends. Nothing is written, and a saved theme
     /// waiting to be selected no longer is: the person chose another row.
     /// The live region says it once, after the frame's install. Whether the
-    /// highlight moved (it stays while a Keep is landing).
+    /// highlight moved. While a Keep is on its way the theme it keeps is the
+    /// one in use (its write shows at once), so another row is tried over it
+    /// and the kept row's own press changes nothing.
     pub(super) fn highlight_card(&mut self, id: &str) -> bool {
         self.showcase.note_input();
-        if matches!(self.showcase.trial, ShowcaseTrial::Keeping { .. }) {
-            self.feedback = Some("Keeping the theme you tried\u{2026}".to_string());
-            return false;
+        if matches!(&self.showcase.trial, ShowcaseTrial::Keeping { id: kept, .. }
+            if kept.eq_ignore_ascii_case(id))
+        {
+            return true;
         }
         self.showcase.pending_select = None;
         self.showcase.keep_more = false;
@@ -1102,9 +1139,22 @@ impl SettingsViewState {
     /// The theme the configuration draws on the side the page shows (what
     /// Keep replaces, and what a card marked Current names).
     pub(super) fn configured_theme_id(&self) -> String {
+        self.theme_id_drawn_by(self.raw_value(prefs::EDIT_THEME))
+    }
+
+    /// The theme a trial replaces: [`Self::configured_theme_id`], save
+    /// that a Keep on its way is weighed against what aterm.toml holds under
+    /// it ([`Self::theme_under_trial`]), so its strip still says what was in
+    /// use before it.
+    pub(super) fn theme_id_under_trial(&self) -> String {
+        self.theme_id_drawn_by(self.theme_under_trial())
+    }
+
+    /// The theme `theme` (a `theme` value) draws on the side the page shows.
+    fn theme_id_drawn_by(&self, theme: Option<String>) -> String {
         let side = theme_visible_side(self, self.presented_motion.get().system_dark);
         let config = Config {
-            theme: self.raw_value(prefs::EDIT_THEME).or_else(|| {
+            theme: theme.or_else(|| {
                 self.environment_override(prefs::EDIT_THEME)
                     .map(|active| active.effective.clone())
             }),
@@ -1583,7 +1633,9 @@ pub(super) fn override_note(resolved: &crate::resolved_colors::ResolvedColors) -
 
 /// The page's palette commands while it is the route.
 pub(super) fn showcase_commands(view: &SettingsViewState) -> Vec<Command> {
-    let trying = matches!(view.showcase.trial, ShowcaseTrial::Trying { .. });
+    // A Keep on its way is still the trial: Revert takes it back and Keep
+    // colours only follows it.
+    let trying = view.showcase.trial_id().is_some();
     vec![
         Command {
             id: ActionId::new(SHOWCASE_KEEP),
@@ -1603,10 +1655,10 @@ pub(super) fn showcase_commands(view: &SettingsViewState) -> Vec<Command> {
             shortcut: None,
             // Only while the tried theme would change the face, and every
             // change can be kept apart.
-            enabled: match &view.showcase.trial {
-                ShowcaseTrial::Trying { id } => view.trial_typography(id).keeps_colours_only(),
-                _ => false,
-            },
+            enabled: view
+                .showcase
+                .trial_id()
+                .is_some_and(|id| view.trial_typography(id).keeps_colours_only()),
         },
         Command {
             id: ActionId::new(SHOWCASE_SAVE_AS),
@@ -1653,8 +1705,7 @@ impl SettingsApp {
             view.showcase.keep_more = false;
             self.keep_colours_only(view, cx);
         } else if action == SHOWCASE_REVERT {
-            view.showcase.pending_select = None;
-            view.revert_showcase();
+            self.revert_trial(view, cx);
         } else if action == CUSTOMIZE {
             view.showcase.sheet_open = true;
             view.showcase.keep_more = false;
@@ -1756,24 +1807,20 @@ impl SettingsApp {
             view.invalidate_result_page_limit();
             view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_AS));
         } else if action == IMPORT || action == OPEN_FOLDER {
-            if themes_busy(view) {
-                view.feedback = Some("Working on the themes folder\u{2026}".to_string());
+            let (request, feedback) = if action == OPEN_FOLDER {
+                (
+                    ThemesRequest::OpenFolder,
+                    "Opening the themes folder\u{2026}",
+                )
             } else {
-                let (request, feedback) = if action == OPEN_FOLDER {
-                    (
-                        ThemesRequest::OpenFolder,
-                        "Opening the themes folder\u{2026}",
-                    )
-                } else {
-                    (
-                        ThemesRequest::Import,
-                        "Choose a theme file to import\u{2026}",
-                    )
-                };
-                let operation = cx.themes(request);
-                view.pending.insert(operation, PendingAction::Themes);
-                view.feedback = Some(feedback.to_string());
-            }
+                (
+                    ThemesRequest::Import,
+                    "Choose a theme file to import\u{2026}",
+                )
+            };
+            let operation = cx.themes(request);
+            view.pending.insert(operation, PendingAction::Themes);
+            view.feedback = Some(feedback.to_string());
         } else if let Some(index) = action
             .strip_prefix(PALETTE_PREFIX)
             .and_then(|index| index.parse::<usize>().ok())
@@ -1858,10 +1905,6 @@ impl SettingsApp {
             return;
         };
         view.common.last_focus = Some(UiKey::new(format!("{CARD_PREFIX}{slug}/{CARD_OPEN}")));
-        if themes_busy(view) {
-            view.feedback = Some("Working on the themes folder\u{2026}".to_string());
-            return;
-        }
         let operation = cx.themes(ThemesRequest::OpenFile { id });
         view.pending.insert(operation, PendingAction::Themes);
         view.feedback = Some(format!("Opening {label}\u{2026}"));
@@ -1913,20 +1956,79 @@ impl SettingsApp {
             ));
             return;
         }
-        if themes_busy(view) {
-            view.feedback = Some("Working on the themes folder\u{2026}".to_string());
-            return;
-        }
         let operation = cx.themes(ThemesRequest::Trash { id: card.id });
         view.pending.insert(operation, PendingAction::Themes);
         view.feedback = Some(format!("Moving {} to the Trash\u{2026}", card.label));
     }
 
+    /// Revert (its button, the palette, or Escape over a Keep on its way):
+    /// the trial ends and the theme in use before it shows again. A Keep
+    /// still on its way is taken back by a write that puts each key it
+    /// writes back to what it held, following it in the config lane, so
+    /// the press shows at once and the file ends as it began; a Keep's
+    /// Revert is never refused for waiting on the Keep.
+    pub(super) fn revert_trial(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
+        view.showcase.pending_select = None;
+        view.showcase.revert_asked = false;
+        if let ShowcaseTrial::Keeping { id, under, .. } = view.showcase.trial.clone() {
+            // Every key the trial's Keeps write goes back to what it held
+            // before the first of them (a Keep and the Keep colours only
+            // over it are taken back together), composed over what the keys
+            // show now, which is what the lane holds once those Keeps land.
+            let back: Vec<ConfigEdit> = under
+                .into_iter()
+                .filter_map(|(key, before)| {
+                    let now = view.raw_value(&key);
+                    (now != before).then_some(ConfigEdit {
+                        key,
+                        expected: ExpectedConfigValue::Exact(now),
+                        value: before,
+                    })
+                })
+                .collect();
+            let operation = (!back.is_empty()).then(|| {
+                Self::send_config(
+                    view,
+                    cx,
+                    ConfigPatch {
+                        base_revision: self.config_revision,
+                        edits: back,
+                    },
+                )
+            });
+            // Ended as a trial is: the highlight and the live region go back
+            // to the theme the take-back shows.
+            view.showcase.trial = ShowcaseTrial::Trying { id };
+            view.revert_showcase();
+            let to = view.showcase.label_of(&view.configured_theme_id());
+            view.feedback = Some(match operation {
+                // Its landing says it reverted, named by the page's own
+                // operation, not by the keys it wrote back.
+                Some(operation) => {
+                    view.name_write(operation, WriteKind::Revert { to: to.clone() });
+                    format!("Reverting to {to}\u{2026}")
+                }
+                // Every key already shows what it held: nothing to write.
+                None => format!("Reverted to {to}"),
+            });
+            return;
+        }
+        view.revert_showcase();
+    }
+
     /// Keep the tried theme: one `theme` write through the patch lane (one
     /// side of a Follow-system pair), the trial standing until it lands.
     fn keep_trial(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
-        let ShowcaseTrial::Trying { id } = view.showcase.trial.clone() else {
-            return;
+        let id = match view.showcase.trial.clone() {
+            ShowcaseTrial::Trying { id } => id,
+            ShowcaseTrial::Keeping { id, operation, .. } => {
+                if !view.showcase_select_is(operation) {
+                    view.showcase.keep_more = false;
+                    self.keep_over_keeping(view, cx, id);
+                }
+                return;
+            }
+            ShowcaseTrial::Idle => return,
         };
         view.showcase.keep_more = false;
         // A community theme is drawn from the embedded pack: Keep adds its
@@ -1938,10 +2040,6 @@ impl SettingsApp {
             if view.showcase.pending_keep.is_some() {
                 return;
             }
-            if themes_busy(view) {
-                view.feedback = Some("Working on the themes folder\u{2026}".to_string());
-                return;
-            }
             let operation = cx.themes(ThemesRequest::AddPack { id: id.clone() });
             view.pending.insert(operation, PendingAction::Themes);
             view.feedback = Some(format!("Adding {}\u{2026}", view.showcase.label_of(&id)));
@@ -1950,9 +2048,6 @@ impl SettingsApp {
                 id,
                 written: false,
             });
-            return;
-        }
-        if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
             return;
         }
         let (value, side) = view.keep_value(&id);
@@ -1968,20 +2063,65 @@ impl SettingsApp {
                 value,
             }],
         };
-        let operation = cx.config_patch(patch.clone());
-        view.pend_config(operation, patch);
-        let label = view
-            .showcase
-            .card(&id)
-            .map_or_else(|| id.clone(), |card| card.label.clone());
-        let following = prefs::theme_mode(view.raw_value(prefs::EDIT_THEME).as_deref())
-            == prefs::ThemeMode::FollowSystem;
-        view.feedback = Some(match side {
-            Some(side) => format!("Keeping {label} for {} mode\u{2026}", appearance_word(side)),
-            None if following => format!("Keeping {label} for light and dark mode\u{2026}"),
-            None => format!("Keeping {label}\u{2026}"),
-        });
-        view.showcase.trial = ShowcaseTrial::Keeping { id, operation };
+        let under = view.trial_under(&patch.edits);
+        let operation = Self::send_config(view, cx, patch);
+        view.feedback = Some(keeping_words(view, &id, side));
+        view.showcase.trial = ShowcaseTrial::Keeping {
+            id,
+            operation,
+            under,
+        };
+    }
+
+    /// Keep pressed while the trial's Keep is on its way: the trial is kept
+    /// as tried, its theme with its own type settings. After a Keep that
+    /// asks nothing more (its write already holds it); after Keep colours
+    /// only, the type settings that pinned go back to what they held before
+    /// the trial, in a write that follows it.
+    fn keep_over_keeping(
+        &mut self,
+        view: &mut SettingsViewState,
+        cx: &mut UpdateCx<'_>,
+        id: String,
+    ) {
+        let (value, side) = view.keep_value(&id);
+        let mut under = view.trial_under(&[]);
+        under
+            .entry(prefs::EDIT_THEME.to_string())
+            .or_insert_with(|| view.raw_value(prefs::EDIT_THEME));
+        let edits: Vec<ConfigEdit> = under
+            .iter()
+            .filter_map(|(key, before)| {
+                let want = if key == prefs::EDIT_THEME {
+                    value.clone()
+                } else {
+                    before.clone()
+                };
+                let now = view.raw_value(key);
+                (now != want).then(|| ConfigEdit {
+                    key: key.clone(),
+                    expected: ExpectedConfigValue::Exact(now),
+                    value: want,
+                })
+            })
+            .collect();
+        if edits.is_empty() {
+            return;
+        }
+        let operation = Self::send_config(
+            view,
+            cx,
+            ConfigPatch {
+                base_revision: self.config_revision,
+                edits,
+            },
+        );
+        view.feedback = Some(keeping_words(view, &id, side));
+        view.showcase.trial = ShowcaseTrial::Keeping {
+            id,
+            operation,
+            under,
+        };
     }
 
     /// Keep the tried theme's colours and the type settings in force now:
@@ -1992,17 +2132,20 @@ impl SettingsApp {
     /// feedback says why: the button is drawn disabled then, so this is the
     /// palette or a stale press.
     fn keep_colours_only(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
-        let ShowcaseTrial::Trying { id } = view.showcase.trial.clone() else {
-            return;
+        // Over a Keep on its way too: this write follows it. A save's
+        // select on its way keeps the saved theme, not the trial.
+        let id = match view.showcase.trial.clone() {
+            ShowcaseTrial::Trying { id } => id,
+            ShowcaseTrial::Keeping { id, operation, .. } if !view.showcase_select_is(operation) => {
+                id
+            }
+            ShowcaseTrial::Keeping { .. } | ShowcaseTrial::Idle => return,
         };
         let trial = view.trial_typography(&id);
         if !trial.keeps_colours_only() {
             if let Some(why) = trial.why_not_colours_only(view) {
                 view.feedback = Some(why);
             }
-            return;
-        }
-        if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
             return;
         }
         let (value, _) = view.keep_value(&id);
@@ -2020,20 +2163,40 @@ impl SettingsApp {
                 });
             }
         }
+        // A second press of it while its first saves asks for what that
+        // write already holds: nothing more to write.
+        if edits
+            .iter()
+            .all(|edit| edit.expected == ExpectedConfigValue::Exact(edit.value.clone()))
+        {
+            return;
+        }
+        let under = view.trial_under(&edits);
         let patch = ConfigPatch {
             base_revision: self.config_revision,
             edits,
         };
-        let operation = cx.config_patch(patch.clone());
-        view.pend_config(operation, patch);
+        let operation = Self::send_config(view, cx, patch);
         let label = view
             .showcase
             .card(&id)
             .map_or_else(|| id.clone(), |card| card.label.clone());
+        // Its landing and its refusal say what it kept, named by the page's
+        // own operation, not by the keys it wrote ("Changed 3 settings").
+        view.name_write(
+            operation,
+            WriteKind::KeepColours {
+                label: label.clone(),
+            },
+        );
         view.feedback = Some(format!(
             "Keeping {label}'s colors and your type settings\u{2026}"
         ));
-        view.showcase.trial = ShowcaseTrial::Keeping { id, operation };
+        view.showcase.trial = ShowcaseTrial::Keeping {
+            id,
+            operation,
+            under,
+        };
     }
 
     /// A config patch finished. A Keep (or a save's select) that landed
@@ -2063,6 +2226,7 @@ impl SettingsApp {
         let ShowcaseTrial::Keeping {
             id,
             operation: keeping,
+            ..
         } = &view.showcase.trial
         else {
             return false;
@@ -2119,10 +2283,6 @@ impl SettingsApp {
                 save.error = Some(problem);
             }
             view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_NAME));
-            return;
-        }
-        if themes_busy(view) {
-            view.feedback = Some("Working on the themes folder\u{2026}".to_string());
             return;
         }
         let resolved = view.showcase_colors();
@@ -2264,10 +2424,7 @@ impl SettingsApp {
         };
         if std::iter::once(&select.theme)
             .chain(&select.clears)
-            .any(|edit| {
-                edit.expected != ExpectedConfigValue::Exact(view.raw_value(&edit.key))
-                    || Self::reject_pending_key(view, &edit.key, cx)
-            })
+            .any(|edit| edit.expected != ExpectedConfigValue::Exact(view.raw_value(&edit.key)))
         {
             view.feedback = Some(format!(
                 "Saved {} \u{b7} your settings changed; choose it when ready",
@@ -2295,13 +2452,14 @@ impl SettingsApp {
             base_revision: self.config_revision,
             edits,
         };
-        let operation = cx.config_patch(patch.clone());
-        view.pend_config(operation, patch);
+        let under = view.trial_under(&patch.edits);
+        let operation = Self::send_config(view, cx, patch);
         view.showcase.selecting = Some((operation, select.id.clone(), select.drafts));
         view.showcase.trial = match view.showcase.trial_id() {
             Some(tried) => ShowcaseTrial::Keeping {
                 id: tried.to_string(),
                 operation,
+                under,
             },
             None => ShowcaseTrial::Idle,
         };
@@ -2402,9 +2560,6 @@ impl SettingsApp {
         }
         let mut edits = Vec::new();
         if list {
-            if Self::reject_pending_key(view, prefs::EDIT_PALETTE, cx) {
-                return;
-            }
             let entries = view.palette_entries();
             edits.push(ConfigEdit {
                 key: prefs::EDIT_PALETTE.to_string(),
@@ -2413,9 +2568,6 @@ impl SettingsApp {
             });
         }
         if let (Some((_, color)), Some(key)) = (slot, slot_key) {
-            if Self::reject_pending_key(view, &key, cx) {
-                return;
-            }
             edits.push(ConfigEdit {
                 expected: ExpectedConfigValue::Exact(view.raw_value(&key)),
                 key,
@@ -2430,8 +2582,7 @@ impl SettingsApp {
             base_revision: self.config_revision,
             edits,
         };
-        let operation = cx.config_patch(patch.clone());
-        view.pend_config(operation, patch);
+        Self::send_config(view, cx, patch);
         view.feedback = Some("Applying\u{2026}".to_string());
     }
 
@@ -2440,19 +2591,16 @@ impl SettingsApp {
     fn close_palette_slot(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
         if let Some((index, color)) = view.slot_override_draft() {
             let key = crate::resolved_colors::palette_override_key(index);
-            if !Self::reject_pending_key(view, &key, cx) {
-                let patch = ConfigPatch {
-                    base_revision: self.config_revision,
-                    edits: vec![ConfigEdit {
-                        expected: ExpectedConfigValue::Exact(view.raw_value(&key)),
-                        key,
-                        value: Some(hex_of(color)),
-                    }],
-                };
-                let operation = cx.config_patch(patch.clone());
-                view.pend_config(operation, patch);
-                view.feedback = Some("Applying\u{2026}".to_string());
-            }
+            let patch = ConfigPatch {
+                base_revision: self.config_revision,
+                edits: vec![ConfigEdit {
+                    expected: ExpectedConfigValue::Exact(view.raw_value(&key)),
+                    key,
+                    value: Some(hex_of(color)),
+                }],
+            };
+            Self::send_config(view, cx, patch);
+            view.feedback = Some("Applying\u{2026}".to_string());
         }
         view.showcase.slot = None;
     }
@@ -2470,9 +2618,6 @@ impl SettingsApp {
         let key = crate::resolved_colors::palette_override_key(index);
         let mut edits = Vec::new();
         if view.is_explicit(&key) {
-            if Self::reject_pending_key(view, &key, cx) {
-                return;
-            }
             edits.push(ConfigEdit {
                 expected: ExpectedConfigValue::Exact(view.raw_value(&key)),
                 key,
@@ -2484,9 +2629,6 @@ impl SettingsApp {
             let drafted = view.field_has_unsaved_draft(prefs::EDIT_PALETTE);
             view.set_palette_draft(&entries);
             if !drafted {
-                if Self::reject_pending_key(view, prefs::EDIT_PALETTE, cx) {
-                    return;
-                }
                 edits.push(ConfigEdit {
                     key: prefs::EDIT_PALETTE.to_string(),
                     expected: ExpectedConfigValue::Exact(view.raw_value(prefs::EDIT_PALETTE)),
@@ -2505,8 +2647,7 @@ impl SettingsApp {
                 base_revision: self.config_revision,
                 edits,
             };
-            let operation = cx.config_patch(patch.clone());
-            view.pend_config(operation, patch);
+            Self::send_config(view, cx, patch);
             view.feedback = Some("Applying\u{2026}".to_string());
         }
         view.invalidate_result_page_limit();
@@ -2525,11 +2666,7 @@ impl SettingsApp {
             .into_iter()
             .filter(|key| view.is_explicit(key))
             .collect();
-        if keys.is_empty()
-            || keys
-                .iter()
-                .any(|key| Self::reject_pending_key(view, key, cx))
-        {
+        if keys.is_empty() {
             return;
         }
         let edits = keys
@@ -2544,8 +2681,7 @@ impl SettingsApp {
             base_revision: self.config_revision,
             edits,
         };
-        let operation = cx.config_patch(patch.clone());
-        view.pend_config(operation, patch);
+        Self::send_config(view, cx, patch);
         view.feedback = Some("Resetting the palette\u{2026}".to_string());
         view.invalidate_result_page_limit();
     }
@@ -2660,11 +2796,21 @@ impl SettingsApp {
     }
 }
 
-/// Whether a themes-folder request is in flight (one at a time).
-fn themes_busy(view: &SettingsViewState) -> bool {
-    view.pending
-        .values()
-        .any(|pending| matches!(pending, PendingAction::Themes))
+/// What a Keep of `id` on its way says, once its write shows: the side it
+/// keeps it for (`side`), or both where the theme follows the system.
+fn keeping_words(
+    view: &SettingsViewState,
+    id: &str,
+    side: Option<aterm_types::Appearance>,
+) -> String {
+    let label = view.showcase.label_of(id);
+    let following = prefs::theme_mode(view.raw_value(prefs::EDIT_THEME).as_deref())
+        == prefs::ThemeMode::FollowSystem;
+    match side {
+        Some(side) => format!("Keeping {label} for {} mode\u{2026}", appearance_word(side)),
+        None if following => format!("Keeping {label} for light and dark mode\u{2026}"),
+        None => format!("Keeping {label}\u{2026}"),
+    }
 }
 
 /// The selected saved theme carries `drafts` now: each goes, while it still
@@ -2696,10 +2842,17 @@ fn text_width(text: &str, role: SemanticRole, style: StyleRef) -> f32 {
     crate::tray_raster::ui_text_width_for(face, text, px)
 }
 
-/// `text` fitted to `width` in the face `role`/`style` paints it in.
+/// `text` fitted to `width` in the face `role`/`style` paints it in: where
+/// it is cut, after a whole word, as every one-line native label is
+/// ([`crate::native_ui::whole_word_cut`]) — the strip at 2× text in a
+/// 24-column window named GitHub Light "GitHub L…". Only a first word too
+/// wide alone is cut inside it.
 fn fit_text(text: &str, role: SemanticRole, style: StyleRef, width: f32) -> String {
     let (px, face) = crate::native_ui::text_paint_metrics(role, style);
-    crate::native_ui::elide_text_label(text, width.max(0.0), px, face)
+    crate::native_ui::whole_word_cut(
+        text,
+        crate::native_ui::elide_text_label(text, width.max(0.0), px, face),
+    )
 }
 
 /// A one-line text node `height` tall, fitted to `width`.
@@ -2875,6 +3028,45 @@ impl TrialTypography {
 }
 
 impl SettingsViewState {
+    /// The `theme` a trial is weighed against: what aterm.toml holds under
+    /// the trial's own Keep while that write is on its way (the key already
+    /// shows the kept value), else what the page shows. So the strip and Keep
+    /// colours only read a Keep on its way as the trial it keeps.
+    fn theme_under_trial(&self) -> Option<String> {
+        if let ShowcaseTrial::Keeping { under, .. } = &self.showcase.trial
+            && let Some(before) = under.get(prefs::EDIT_THEME)
+        {
+            return before.clone();
+        }
+        self.raw_value(prefs::EDIT_THEME)
+    }
+
+    /// The trial's record of what its Keeps replace ([`ShowcaseTrial::Keeping`]),
+    /// with `edits`, a Keep about to be sent, added: a key no Keep of the
+    /// trial has written yet held what the edit expects.
+    fn trial_under(&self, edits: &[ConfigEdit]) -> BTreeMap<String, Option<String>> {
+        let mut under = match &self.showcase.trial {
+            ShowcaseTrial::Keeping { under, .. } => under.clone(),
+            ShowcaseTrial::Idle | ShowcaseTrial::Trying { .. } => BTreeMap::new(),
+        };
+        for edit in edits {
+            let ExpectedConfigValue::Exact(before) = &edit.expected;
+            under
+                .entry(edit.key.clone())
+                .or_insert_with(|| before.clone());
+        }
+        under
+    }
+
+    /// Whether `operation` is a save's select (Save as theme's write of the
+    /// saved theme), which keeps the saved theme rather than the trial.
+    fn showcase_select_is(&self, operation: OperationId) -> bool {
+        self.showcase
+            .selecting
+            .as_ref()
+            .is_some_and(|(selecting, ..)| *selecting == operation)
+    }
+
     /// A config that sets exactly the typography keys aterm.toml sets (with
     /// stand-in values: only whether each is set matters to the resolver),
     /// and `theme`.
@@ -2908,11 +3100,16 @@ impl SettingsViewState {
         config
     }
 
-    /// The value in force now for the typography key `key` (aterm.toml
-    /// leaves it unset): the current theme's, else aterm's default, in the
-    /// words [`type_value_words`] compares in, with what keeps it.
-    fn current_type_value(&self, key: &'static str) -> (String, Option<String>) {
-        if let Some((value, _)) = self.theme_fallback_for(key) {
+    /// The value in force for the typography key `key` (aterm.toml leaves
+    /// it unset) under the theme whose typography is `typo`: the theme's,
+    /// else aterm's default, in the words [`type_value_words`] compares in,
+    /// with what keeps it.
+    fn type_value_under(
+        &self,
+        key: &'static str,
+        typo: &crate::resolved_typography::ResolvedTypography,
+    ) -> (String, Option<String>) {
+        if let Some(value) = prefs::theme_value_for(&Config::default(), typo, key) {
             return (type_value_words(key, &value), Some(value));
         }
         self.default_type_value(key)
@@ -2969,7 +3166,14 @@ impl SettingsViewState {
                 .resolved_typography_with_flag(side, &self.assets.themes, flag.as_deref())
         };
         let tried = resolve(value);
-        let configured = resolve(self.raw_value(prefs::EDIT_THEME));
+        let base = self.theme_under_trial();
+        let configured = resolve(base.clone());
+        // In force now: under the trial's own Keep while it is on its way.
+        let base_typography = Config {
+            theme: base,
+            ..Config::default()
+        }
+        .resolved_typography_with_flag(side, &self.assets.themes, None);
         let mut out = TrialTypography::default();
         for spec in aterm_types::scheme::THEME_KEYS
             .iter()
@@ -2984,7 +3188,7 @@ impl SettingsViewState {
                 }
                 None => continue,
             };
-            let (current, pin) = self.current_type_value(spec.name);
+            let (current, pin) = self.type_value_under(spec.name, &base_typography);
             if current != type_value_words(spec.name, &theme) {
                 out.changes.push(TypeChange {
                     key: spec.name,

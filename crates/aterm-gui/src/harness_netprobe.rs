@@ -1,59 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE API'S REACH, MEASURED: the one thread that carries out aterm-agent's
-//! `harness::netwatch` for this instance (the outage of 2026-09-27, when
-//! every hosted Claude Code turn ended on `API Error: Can't reach the API
-//! server … (ENOTFOUND)`). The window's supervisor host asks it, per session,
-//! while that session's loop waits at a wall the network answers
-//! ([`crate::harness_host`]'s `WorkerIdle::reach`), and the turn-end policy
-//! holds the wall while the API is measured DOWN and continues an unreachable
-//! one as soon as it is measured UP — never a certificate or proxy refusal:
-//! this handshake trusts the platform's store, the agent its own.
+//! The API's reach, measured: the one thread that carries out aterm-agent's `harness::netwatch`
+//! for this instance. The supervisor host asks it per session while that session's loop waits
+//! at a wall the network answers (`API Error: Can't reach the API server … (ENOTFOUND)`;
+//! [`crate::harness_host`]'s `WorkerIdle::reach`), and the turn-end policy holds the wall while
+//! the API is measured down. A certificate or proxy refusal is never down: this handshake trusts
+//! the platform's store, the agent its own.
 //!
-//! **One thread, `aterm-harness-netprobe`, at [`crate::qos::Role::Background`]**
-//! (useful work nobody is blocked on, never `Housekeeping`, which can starve
-//! it for as long as it likes — and a starved probe reads nothing worse than
-//! Unknown, since only a DEFINITE failure is Down). Started on the first ask,
-//! parked on a condition variable while no lease lives — it costs nothing
-//! while nothing waits — and it probes one at a time: a probe still in flight
-//! past its budget reads Unknown (`NetState::reach`), and no second one
-//! starts beside it. Nothing joins it: a resolve the system resolver holds
-//! for minutes holds this thread alone, and a stop wakes it at its next look.
-//! The state's lock is taken only to read or write the state — never across
-//! I/O, never with another lock held.
+//! One thread, `aterm-harness-netprobe`, at [`crate::qos::Role::Background`] (`Housekeeping` can
+//! starve it). It starts on the first ask, parks while no lease lives, and probes one at a time:
+//! a probe past its budget reads Unknown and no second one starts beside it. Nothing joins it,
+//! so a hung resolver holds only this thread. The state's lock is never held across I/O or with
+//! another lock held.
 //!
-//! **One probe** ([`probe_once`]): the system resolver for
-//! `api.anthropic.com`, a TCP connect to its addresses — IPv4 and IPv6
-//! interleaved, IPv4 first, each attempt given an equal share of what is left
-//! of the budget, so a black-holed IPv6 address cannot spend it all while the
-//! agent's own Happy-Eyeballs connect goes through on IPv4 — and a TLS
-//! handshake the PLATFORM verifies (aterm-http's `Stream::start_tls` over
-//! `Trust::PlatformVerifier`, the OS trust store), no request byte sent, all
-//! under [`aterm_agent::harness::netwatch::PROBE_BUDGET`]. Down only on a
-//! definite failure: a known no-name answer, or every address was refused
-//! or unreachable by the kernel's own word (`ECONNREFUSED`, `ENETUNREACH`,
-//! `EHOSTUNREACH`, `ENETDOWN`). Up only on a completed verified handshake.
-//! Everything else — a temporary/unknown resolver failure, a timeout, a TLS
-//! or certificate failure, any other error — is Unknown.
+//! One probe ([`probe_once`]) resolves `api.anthropic.com`, connects to its addresses IPv4 and
+//! IPv6 interleaved, IPv4 first, each attempt given an equal share of the budget left (so a
+//! black-holed IPv6 address cannot spend it all while the agent's Happy Eyeballs succeeds on
+//! IPv4), and completes a platform-verified TLS handshake (aterm-http's `Stream::start_tls`)
+//! with no request byte sent. Down only on a definite failure: a known no-name answer, or every
+//! address refused or unreachable by the kernel's word. Up only on a completed verified
+//! handshake. Anything else is Unknown.
 //!
-//! **Only the default route is measured** ([`route_of_agent`]): what decides
-//! it is read, read-only, from the agent's exec environment (atpkg's
-//! `process_args`, the one KERN_PROCARGS2 reader) and every settings document
-//! Claude Code reads for it — THE CHAIN, read where and as Claude Code reads
-//! it (aterm-agent's `claude_settings::sources_under`, the approval lane's
-//! own: the managed file and its drop-ins, a `--settings`, the project's
-//! files or a `--project-config-root`'s, the main worktree's local one, the
-//! user's `settings.json` or `cowork_settings.json` in its Claude Code
-//! directory) — and its managed
-//! preference domains, which this host cannot parse
-//! (`claude_settings::managed_preferences`). A route the host cannot
-//! reproduce, or cannot see, is never measured: its wall is tried on the time
-//! ladder. `[harness] probe_api = false` measures nothing at all.
+//! Only the default route is measured ([`route_of_agent`]), read from the agent's exec
+//! environment and every settings source Claude Code reads for it, its managed preference
+//! domains included (unparsed). A route the host cannot reproduce or see is never measured: its
+//! wall is tried on the time ladder. `[harness] probe_api = false` measures nothing.
 //!
-//! Tests inject the resolver, the connector and the handshake ([`Probe`]):
-//! no test touches the network — the real connect and the real verified
-//! handshake are driven against loopback listeners.
+//! Tests inject the resolver, the connector and the handshake ([`Probe`]); the real connect and
+//! handshake run only against loopback listeners.
 
 use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
@@ -69,7 +44,7 @@ use aterm_agent::supervise::policy::WorkerEnv;
 use aterm_agent::supervise::policy::claude_settings;
 use aterm_agent::supervise::policy::turn_end::Reach;
 
-/// A probe's three steps — the seam the tests replace.
+/// A probe's three steps: the seam the tests replace.
 pub(crate) trait Probe: Send + Sync {
     /// The host's addresses.
     fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
@@ -111,9 +86,8 @@ impl Probe for SystemProbe {
     }
 }
 
-/// A TLS handshake to `host` over `tcp`, verified against the operating
-/// system's trust store, completed before `deadline` — no request sent. The
-/// session is dropped at once.
+/// A TLS handshake to `host` over `tcp`, verified against the OS trust store and completed
+/// before `deadline`, with no request sent. The session is dropped at once.
 pub(crate) fn verified_handshake(
     tcp: TcpStream,
     host: &str,
@@ -131,8 +105,8 @@ pub(crate) fn verified_handshake(
     .map(drop)
 }
 
-/// A failure that says the address cannot be reached from here — the
-/// kernel's own word, never a timeout.
+/// A failure that says the address cannot be reached from here: the kernel's own word, never a
+/// timeout.
 fn definite_failure(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -143,12 +117,10 @@ fn definite_failure(e: &io::Error) -> bool {
     ) || raw_unreachable(e)
 }
 
-/// A resolver answer that specifically says the name has no address. The
-/// standard library reports `getaddrinfo` errors as `Uncategorized` with no
-/// raw OS code on macOS (measured on this host), so only its known no-name
-/// wording can distinguish that answer from a temporary DNS failure. An
-/// unmatched platform message (or a changed macOS message) stays Unknown:
-/// it must never suppress the harness's retry ladder.
+/// A resolver answer that specifically says the name has no address. On macOS std reports
+/// `getaddrinfo` errors as `Uncategorized` with no raw OS code, so only the known no-name
+/// wording tells that answer from a temporary DNS failure. An unmatched or changed message
+/// stays Unknown: it must never suppress the harness's retry ladder.
 fn definite_name_failure(e: &io::Error) -> bool {
     if e.kind() == io::ErrorKind::NotFound {
         return true;
@@ -164,10 +136,8 @@ fn definite_name_failure(e: &io::Error) -> bool {
     }
 }
 
-/// The same four answers by raw errno, for a Unix error std has not mapped to its
-/// `ErrorKind`. Unix-only: these are POSIX errnos (the `libc` crate defines none of
-/// them for Windows, whose WSA codes std already maps to the kinds above), so a
-/// non-Unix build answers from the kinds alone.
+/// The same four answers by raw errno, for a Unix error std has not mapped to its `ErrorKind`.
+/// Unix-only: these are POSIX errnos (std already maps Windows' WSA codes to the kinds above).
 #[cfg(unix)]
 fn raw_unreachable(e: &io::Error) -> bool {
     e.raw_os_error().is_some_and(|code| {
@@ -204,8 +174,8 @@ fn interleaved(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     out
 }
 
-/// ONE PROBE of the default route under `budget` (module header): Down only
-/// on a definite failure, Up only on a verified handshake, else Unknown.
+/// One probe of the default route under `budget` (see the module doc): Down only on a definite
+/// failure, Up only on a verified handshake, else Unknown.
 pub(crate) fn probe_once(probe: &dyn Probe, budget: Duration) -> Outcome {
     let deadline = aterm_http::Deadline::after(budget);
     let in_time = |definite: Outcome| {
@@ -217,10 +187,9 @@ pub(crate) fn probe_once(probe: &dyn Probe, budget: Duration) -> Outcome {
     };
     let addrs = match probe.resolve(API_HOST, API_PORT) {
         Ok(addrs) if !addrs.is_empty() => interleaved(addrs),
-        // No address, or a resolver answer that specifically says no name:
-        // the agent's own request fails the same way — its `ENOTFOUND`. A
-        // temporary or unrecognized resolver error is no definite outage;
-        // a resolver past the budget is no definite word either.
+        // No address, or a resolver answer that specifically says no name: the agent's own
+        // request fails the same way (its `ENOTFOUND`). A temporary or unrecognized resolver
+        // error, or one past the budget, is no definite word.
         Ok(_) => return in_time(Outcome::Down),
         Err(e) if definite_name_failure(&e) => return in_time(Outcome::Down),
         Err(_) => return Outcome::Unknown,
@@ -256,8 +225,8 @@ pub(crate) fn probe_once(probe: &dyn Probe, budget: Duration) -> Outcome {
     }
 }
 
-/// THE INSTANCE'S PROBE: the pure state (`NetState`), the thread that
-/// carries it out, and the seam it probes through.
+/// The instance's probe: the pure state (`NetState`), the thread that carries it out, and the
+/// seam it probes through.
 pub(crate) struct NetProbe {
     state: Mutex<NetState>,
     wake: Condvar,
@@ -353,9 +322,8 @@ impl NetProbe {
         self.run_before_park(|| {});
     }
 
-    /// The shipping loop, with an observation seam immediately before parking
-    /// under the state mutex. Tests hold this boundary to replay a lost wake;
-    /// production's callback is empty.
+    /// The loop, with a seam just before parking under the state mutex where tests replay a lost
+    /// wake; production's callback is empty.
     fn run_before_park(&self, mut before_park: impl FnMut()) {
         loop {
             {
@@ -414,22 +382,13 @@ impl NetProbe {
     }
 }
 
-/// What decides an agent's route, read now (module header): `env` its exec
-/// environment (`None`: unreadable, and then nothing else is read), `argv`
-/// its command line, `cwd` its directory (one not absolute is not known:
-/// a snapshot taken before its cwd was read, whose project settings are
-/// then reported unread, never skipped — the review of 2026-09-27 found them
-/// skipped, and a proxy in `.claude/settings.local.json` read Default),
-/// `managed` Claude Code's managed-settings directory and `prefs` the
-/// managed-preferences one, `home` this process's home (parameters, so the
-/// tests read a scratch tree). The settings documents are the chain's
-/// ([`claude_settings::sources_under`]) and the managed preference domains
-/// ([`claude_settings::managed_preferences`]), each as the chain's one
-/// reader returned it — FENCED by `home`: one that is there inside a
-/// file-provider domain of it (iCloud Drive, a sync provider's folder) is
-/// read as unreadable, never opened, since this is the one thread every
-/// session shares and the open can raise a consent dialog that has no
-/// timeout (the chain's ruling, "The file-provider fence is the route's").
+/// What decides an agent's route, read now. `env` is its exec environment (`None`: unreadable,
+/// and nothing else is read), `argv` its command line, `cwd` its directory (not absolute:
+/// unknown, and its project settings are reported unread), `managed` and `prefs` Claude Code's
+/// managed-settings and managed-preferences directories, `home` this process's home (all
+/// parameters so tests read a scratch tree). A document inside a file-provider domain of `home`
+/// (iCloud Drive, a sync provider's folder) reads as unreadable and is never opened: every
+/// session shares this thread and the open can raise a consent dialog with no timeout.
 fn gather(
     env: Option<Vec<String>>,
     argv: &[String],
@@ -457,8 +416,8 @@ fn gather(
     }
 }
 
-/// AGENT `pid`'S ROUTE, read now: its exec environment and every settings
-/// source Claude Code reads for it ([`netwatch::route_of`]).
+/// Agent `pid`'s route, read now: its exec environment and every settings source Claude Code
+/// reads for it ([`netwatch::route_of`]).
 pub(crate) fn route_of_agent(pid: u32, argv: &[String], cwd: &str) -> Route {
     let env = atpkg::caller_shell::process_args(pid).map(|a| a.env);
     netwatch::route_of(&gather(
@@ -471,16 +430,11 @@ pub(crate) fn route_of_agent(pid: u32, argv: &[String], cwd: &str) -> Route {
     ))
 }
 
-/// WHETHER AGENT `pid`'S SETTINGS LEAVE IT ITS STORED LOGIN, read now (the
-/// accounts design, §6 rule 1): the SAME gather the route is read from
-/// ([`gather`]: its exec environment and every settings source Claude Code
-/// reads for it), handed to `accounts::ProcessLogin` — and the vendor's
-/// profile store, where that process's environment places it
-/// ([`stored_login_of`]). `false`: some source gives it a credential, a
-/// profile or an `apiKeyHelper`, a source that is there could not be read,
-/// or its environment could not — it is then no stored login, and nothing of
-/// an account is recorded for it or advised to it. Asked by the window's
-/// host only where the owner listed an account, once per agent process.
+/// Whether agent `pid`'s settings leave it its stored login (the accounts design, §6 rule 1),
+/// read now from the same [`gather`] plus the vendor's profile store ([`stored_login_of`]).
+/// `false` when a source gives it a credential, a profile or an `apiKeyHelper`, or when a source
+/// that is there or its environment could not be read; nothing of an account is then recorded
+/// or advised for it. Asked only where the owner listed an account, once per agent process.
 pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> bool {
     let env = atpkg::caller_shell::process_args(pid).map(|a| a.env);
     let home = aterm_types::dirs::home_dir();
@@ -498,15 +452,11 @@ pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> boo
 }
 
 /// [`stored_login_of_agent`] over what was gathered: the environment
-/// (`accounts::ProcessLogin::of_env`), the settings sources
-/// (`with_settings`: the one settings reader, `netwatch::settings_of`) and
-/// the vendor's profile store (`with_profile_store`: one listing of the
-/// directory `accounts::profile_configs_dir` names for that environment —
-/// names only, no config opened). A store inside a file-provider domain of
-/// `home` is NOT LISTED (the listing could raise a consent dialog in aterm's
-/// name, as a settings file there could, `claude_settings`'s reader): it is read as
-/// holding a config, the direction that leaves the session alone. An
-/// environment that could not be read, or reads empty, is no stored login.
+/// (`accounts::ProcessLogin::of_env`), the settings sources (`with_settings`) and the vendor's
+/// profile store (`with_profile_store`: one names-only listing of the directory
+/// `accounts::profile_configs_dir` names). A store inside a file-provider domain of `home` is
+/// not listed (the listing could raise a consent dialog in aterm's name) and reads as holding a
+/// config, which leaves the session alone. An unread or empty environment is no stored login.
 fn stored_login_of(facts: &RouteFacts, home: Option<&Path>) -> bool {
     use aterm_agent::harness::accounts;
     let Some(env) = facts.env.as_ref().filter(|env| !env.is_empty()) else {
@@ -514,8 +464,8 @@ fn stored_login_of(facts: &RouteFacts, home: Option<&Path>) -> bool {
     };
     let pairs = || env.iter().filter_map(|kv| kv.split_once('='));
     let profile = accounts::profile_configs_dir(pairs()).is_some_and(|configs| {
-        // As named and as resolved: a store that does not exist yet has no
-        // resolved path, and is still not to be listed where it is named.
+        // As named and as resolved: a store that does not exist yet has no resolved path and
+        // is still not listed where it is named.
         let unseen = home.is_some_and(|home| {
             let real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
             let resolved = std::fs::canonicalize(&configs).unwrap_or_else(|_| configs.clone());
@@ -538,8 +488,8 @@ mod tests {
 
     const BUDGET: Duration = Duration::from_secs(2);
 
-    /// The implementation exercised by the fixture, never a claimed fact
-    /// about whether another thread is currently parked.
+    /// Which stop publisher the fixture runs: the shipping mutex-guarded one, or the unlocked
+    /// negative control.
     #[derive(Clone, Copy)]
     enum ShutdownPublisher {
         MutexGuarded,
@@ -561,10 +511,9 @@ mod tests {
         }
     }
 
-    /// Project the actual observed park/stop order, independently of the
-    /// model's transition function. The fixture begins only once the real
-    /// worker has checked its predicate under the mutex. A notification can
-    /// release that wait only when its publisher follows the park boundary.
+    /// Project the observed park/stop order, independently of the model's transition function.
+    /// The fixture begins once the real worker has checked its predicate under the mutex; a
+    /// notification releases that wait only when it follows the park.
     fn project_shutdown_park(observed: &[ShutdownObservation]) -> aterm_spec::interp::State {
         let park = observed.iter().position(|step| step.action == "Park");
         let stop = observed.iter().position(|step| step.action == "Stop");
@@ -582,9 +531,9 @@ mod tests {
         ])
     }
 
-    /// Replay shutdown after the real worker checked its predicate but before
-    /// it parks. The old publisher deliberately skips the mutex; an explicit
-    /// second wake cleans up that negative control, so neither arm leaks.
+    /// Replay a stop after the real worker checked its predicate but before it parks. The
+    /// unlocked publisher skips the mutex; a second wake then releases its worker, so neither
+    /// arm leaks.
     fn shutdown_at_park_trace(publisher: ShutdownPublisher) -> Vec<ShutdownObservation> {
         let probe = Arc::new(Seam::new(
             Err(io::Error::other("this fixture must never resolve")),
@@ -621,7 +570,7 @@ mod tests {
             .expect("worker reached its checked, mutex-held park boundary");
         let stopper = match publisher {
             ShutdownPublisher::HistoricalUnlocked => {
-                // The exact old publisher: the wake precedes the worker's park.
+                // The unlocked publisher: the wake lands before the worker parks.
                 np.stop.store(true, Ordering::SeqCst);
                 np.wake.notify_all();
                 trace
@@ -644,8 +593,8 @@ mod tests {
         };
         park_tx.send(()).unwrap();
         if matches!(publisher, ShutdownPublisher::HistoricalUnlocked) {
-            // Acquiring the mutex proves the waiter has atomically released
-            // it into Condvar::wait. Rescue only the historical mutant.
+            // Taking the mutex proves the waiter released it into `Condvar::wait`; rescue only
+            // the unlocked arm.
             let _state = np.lock();
             np.wake.notify_all();
         }
@@ -661,9 +610,9 @@ mod tests {
         Arc::try_unwrap(trace).unwrap().into_inner().unwrap()
     }
 
-    /// Tier-1 at the real park boundary: the checked predicate and shutdown
-    /// cannot straddle a lost notification. The derived mutant admits and
-    /// rejects exactly the old unlocked publisher's observed ordering.
+    /// At the real park boundary a stop cannot lose the wake of a worker that checked its
+    /// predicate. The `Buggy` mutant admits exactly the unlocked publisher's order, and its
+    /// invariant catches it.
     #[test]
     fn shutdown_cannot_lose_the_park_wake_or_retain_the_worker() {
         let model = aterm_models_gui::netprobe_shutdown_park_model();
@@ -701,11 +650,9 @@ mod tests {
 
     /// A loopback port nothing listens on: a real connect is refused.
     ///
-    /// Dropping the listener does not close it while a sibling test's
-    /// `fork`/`posix_spawn` holds a copy of its descriptor (until that child
-    /// `exec`s — ~0.5 s under load), and in that window a connect is ACCEPTED
-    /// into the child's backlog. So the port is handed out only once a real
-    /// connect is refused, against a bounded deadline that fails loudly.
+    /// A dropped listener stays open while a sibling test's `fork`/`posix_spawn` child holds a
+    /// copy of its descriptor (until it `exec`s), and a connect in that window is accepted into
+    /// the child's backlog. So the port is returned only once a real connect is refused.
     fn refused_port() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
         let addr = listener.local_addr().expect("addr");
@@ -814,10 +761,9 @@ mod tests {
         addr
     }
 
-    /// DOWN ONLY ON A DEFINITE FAILURE: the name not resolving; every address
-    /// refused (a real refused loopback connect) or unreachable by the
-    /// kernel's own word. UNKNOWN for a timeout anywhere among them, and for
-    /// a handshake that failed. UP only on a completed handshake.
+    /// Down only on a definite failure: the name not resolving, or every address refused (a
+    /// real refused loopback connect) or unreachable by the kernel's word. Unknown for a timeout
+    /// among them and for a failed handshake. Up only on a completed handshake.
     #[test]
     fn the_probe_reads_down_only_on_definite_failures() {
         let nx = Seam::new(
@@ -887,17 +833,9 @@ mod tests {
         assert_eq!(probe_once(&good, BUDGET), Outcome::Up);
     }
 
-    /// A BLACK-HOLED IPv6 CANNOT EAT THE BUDGET: with two v6 addresses that
-    /// swallow every SYN ahead of a working v4 one, IPv4 is dialled FIRST, on
-    /// its share of the budget, and the probe is Up without dialling a black
-    /// hole at all. NEGATIVE CONTROL: the order the resolver gave (v6 first)
-    /// is not the order dialled.
-    ///
-    /// PROVED BY ORDER, not by a clock. The seam's black holes are the only
-    /// thing here that spends the budget (each sleeps its whole share), and
-    /// the dial record shows none was dialled — so none was waited on. A wall
-    /// clock bound (`< BUDGET / 2`) added nothing to that record and failed a
-    /// loaded machine's pass.
+    /// Two black-holed v6 addresses ahead of a working v4 one: IPv4 is dialled first on its share
+    /// of the budget and the probe is Up without dialling a black hole (negative control: not the
+    /// resolver's v6-first order). The dial record proves it, not a clock.
     #[test]
     fn a_black_holed_ipv6_cannot_eat_the_budget() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
@@ -912,9 +850,8 @@ mod tests {
         drop(listener);
     }
 
-    /// THE REAL VERIFIED HANDSHAKE, OFFLINE: a loopback listener that answers
-    /// the ClientHello with an HTTP error (a captive portal's shape) is no
-    /// verified handshake — Unknown, never Down, never Up.
+    /// The real verified handshake, offline: a loopback listener that answers the ClientHello
+    /// with an HTTP error (a captive portal's shape) reads Unknown, never Down or Up.
     #[test]
     fn a_garbage_answer_to_the_client_hello_reads_unknown() {
         let addr = answering(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
@@ -922,11 +859,9 @@ mod tests {
         assert_eq!(probe_once(&seam, BUDGET), Outcome::Unknown);
     }
 
-    /// A resolver that blocks: the ask never waits on it and reads Unknown;
-    /// exactly one thread, and one probe in flight however often it is
-    /// asked. What a probe finds past its budget is Unknown, never Down
-    /// (`NetState`'s own test holds the overrun's verdict). NEGATIVE
-    /// CONTROL: the same no-name answer in time reads Down.
+    /// A resolver that blocks: the ask never waits on it and reads Unknown, with one thread and
+    /// one probe in flight however often it is asked. A probe's finding past its budget is
+    /// Unknown. Negative control: the same no-name answer in time reads Down.
     #[test]
     fn a_resolver_that_blocks_past_the_budget_reads_unknown_and_starts_no_second_probe() {
         struct Stuck {
@@ -1070,7 +1005,7 @@ mod tests {
             )
         };
         let user = home.join(".claude/settings.json");
-        // NEGATIVE CONTROLS: nothing that names a login.
+        // Negative controls: nothing that names a login.
         assert!(stored(env(&[]), &["claude"]), "a quiet tree");
         write(&user, "{\"model\":\"opus\",\"env\":{\"EDITOR\":\"vi\"}}");
         assert!(stored(env(&[]), &["claude"]), "a model and an editor");
@@ -1124,9 +1059,8 @@ mod tests {
         assert!(!stored(env(&cloud), &["claude"]), "a store nobody lists");
         assert!(!home.join("Library/CloudStorage").exists(), "nor made");
 
-        // An environment that was not read, or reads empty, is no stored
-        // login (an empty one is not gathered here: the chain would read the
-        // account's own Claude Code directory).
+        // An unread or empty environment is no stored login (the empty one is built by hand:
+        // through `gather` the chain would read the account's own Claude Code directory).
         assert!(!stored(None, &["claude"]));
         let empty = RouteFacts {
             env: Some(Vec::new()),
@@ -1136,15 +1070,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE ROUTE'S SOURCES, READ-ONLY: a quiet tree is the default route;
-    /// each source that names a route makes it custom — the user's, the
-    /// project's, the local one, the managed file, a managed drop-in, a
-    /// managed preference domain's mere presence, and a `--settings` file or
-    /// inline JSON — and so does an unparseable file and an agent directory
-    /// not known (its project settings unseen). Nothing is written but by the
-    /// test. (An environment with no `HOME` reads the account's own Claude
-    /// Code directory, as Claude Code's `os.homedir()` does: the chain's
-    /// `claude_dir_at`, tested in aterm-agent.)
+    /// A quiet tree is the default route; each source that names a route makes it custom (user,
+    /// project, local, managed file, managed drop-in, a managed preference domain's presence,
+    /// `--settings` file or inline JSON), as does an unparseable file or an unknown directory.
     #[test]
     fn the_route_reads_every_settings_source_claude_code_reads() {
         let proxy = "{\"env\":{\"HTTPS_PROXY\":\"http://proxy.corp:3128\"}}";
@@ -1214,9 +1142,8 @@ mod tests {
             Route::Custom(_)
         ));
         assert_eq!(facts(&["claude", "--settings", "{}"]), Route::Default);
-        // The agent's directory not known (an empty or relative cwd): its
-        // project settings cannot be read, so the route is custom — even
-        // with every source this host CAN see quiet (the control above).
+        // The agent's directory not known (an empty or relative cwd): its project settings
+        // cannot be read, so the route is custom even with every visible source quiet.
         for cwd in ["", "proj"] {
             let blind = netwatch::route_of(&gather(
                 env(),
@@ -1231,17 +1158,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE ROUTE'S FENCE (aterm-agent's `claude_settings`, "The
-    /// file-provider fence is the route's"): an agent launched in a
-    /// file-provider domain of the home (a sync provider's folder) is on the
-    /// DEFAULT route, and keeps its stored login, where no settings document
-    /// is there — a `stat` tells that, nothing is opened — and is custom, its
-    /// stored login not taken for granted, where one is there, however quiet
-    /// its text: it is never opened on this thread. NEGATIVE CONTROL: the same
-    /// quiet file in an ordinary folder is the default route. On f71bc6de9 the
-    /// first case read custom wherever the domain was this process's home's:
-    /// the fence fired before the existence check (aterm-agent's
-    /// `a_settings_file_not_there_in_a_file_provider_domain_sets_nothing`).
+    /// An agent in a file-provider domain of the home is on the default route, its stored login
+    /// kept, while no settings document is there (a `stat`, nothing opened); one that is there,
+    /// however quiet, is never opened and makes the route custom. Negative control: the same
+    /// file in an ordinary folder is the default route.
     #[test]
     fn a_project_in_a_file_provider_domain_is_measured_unless_a_document_is_there() {
         let dir = scratch("provider");

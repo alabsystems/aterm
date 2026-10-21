@@ -216,13 +216,11 @@ fn moved(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A stand-in `targo`: `vendor … <out>` lays one versioned directory per line of
-/// `crates` beside it (`name version package-checksum`), each with the
-/// `.cargo-checksum.json` the real vendor writes, and leaves the `.crate` it would have
-/// extracted (the file `archive-<name>-<version>` beside it, [`ARCHIVE`] for itoa) in
-/// `$CARGO_HOME/registry/cache`. A marker file `link-<name>-<version>` makes it leave a
-/// symbolic link in that crate too. It refuses to run while `$CARGO_HOME` holds a Cargo
-/// config, as a stand-in for one steering where the bytes come from.
+/// A stand-in `targo`: `vendor … <out>` lays one versioned directory (with its
+/// `.cargo-checksum.json`) per `name version checksum` line of `crates`, and leaves the
+/// `.crate` (the file `archive-<name>-<version>` beside it) in `$CARGO_HOME/registry/cache`.
+/// A marker `link-<name>-<version>` adds a symbolic link to that crate. It refuses to run
+/// while `$CARGO_HOME` holds a Cargo config.
 fn stub_targo(root: &Path, crates: &str) -> PathBuf {
     let bin = root.join("toolchain/bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -271,9 +269,8 @@ fn mtime(path: &Path) -> std::time::SystemTime {
     std::fs::symlink_metadata(path).unwrap().modified().unwrap()
 }
 
-/// The take is C's objects, vendored and sealed: every kind of tree entry lands as
-/// git stores it, the submodule at its gitlink, and the digest is the same for the
-/// same commit from two clones at different paths and across two runs.
+/// The take is the commit's objects, vendored and sealed, the submodule at its gitlink; the
+/// digest is the same from two clones at different paths and across runs.
 #[test]
 fn a_snapshot_is_the_commits_objects_and_its_digest_is_path_independent() {
     let dir = scratch();
@@ -339,8 +336,8 @@ fn a_snapshot_is_the_commits_objects_and_its_digest_is_path_independent() {
     assert_eq!(theirs.digest, snap.digest);
 }
 
-/// The sync writes only what differs: an unchanged file keeps its mtime (so cargo's
-/// path fingerprints stay warm), a changed one is rewritten, a removed one goes.
+/// The sync writes only what differs: an unchanged file keeps its mtime (cargo's path
+/// fingerprints stay warm), a changed one is rewritten, a removed one goes.
 #[test]
 fn the_sync_rewrites_only_changed_files_and_removes_what_the_commit_dropped() {
     let dir = scratch();
@@ -378,8 +375,8 @@ fn the_sync_rewrites_only_changed_files_and_removes_what_the_commit_dropped() {
     assert_ne!(second.digest, first.digest);
 }
 
-/// A byte changed after the take was digested — what a build that wrote into its
-/// sources would do — is refused by `verify`, naming the path; so is a file added.
+/// `verify` refuses a byte changed or a file added after the take was digested, naming the
+/// path.
 #[test]
 fn verify_refuses_a_take_changed_after_it_was_digested() {
     let dir = scratch();
@@ -429,9 +426,8 @@ fn an_unfetched_gitlink_refuses() {
     assert!(err.contains("vendor/sub"), "{err}");
 }
 
-/// Vendoring is held to the lockfile: a vendored checksum that differs, an archive
-/// missing or differing from the lock, a crate the lockfile does not name and one it
-/// names but vendoring left out each refuse.
+/// Vendoring is held to the lockfile: a differing vendored checksum, a missing or differing
+/// archive, an unnamed crate and a named one left out each refuse.
 #[test]
 fn vendored_crates_are_held_to_the_lockfile_checksums() {
     let dir = scratch();
@@ -447,8 +443,8 @@ fn vendored_crates_are_held_to_the_lockfile_checksums() {
     .unwrap_err();
     assert!(err.contains("itoa-1.0.0"), "{err}");
 
-    // The json agreeing is not enough: the bytes are tied to the lock by the archive
-    // vendoring extracted, which must be there and hash to the lock's checksum.
+    // A matching json is not enough: the archive vendoring extracted must exist and hash to
+    // the lock's checksum.
     let missing = stub_targo(
         &dir.path().join("missing"),
         &format!("itoa 1.0.0 {}\n", checksum()),
@@ -552,9 +548,8 @@ fn the_lockfile_admits_crates_io_and_path_packages_only() {
     .unwrap_err();
 }
 
-/// One cache per clone, beside it and named `.noindex`, shared by its linked
-/// worktrees (the cut tree is one) and held by one take at a time; a symlink in its
-/// place is refused.
+/// One `.noindex` cache beside each clone, shared by its linked worktrees, held by one take at
+/// a time; a symlink in its place is refused.
 #[test]
 fn the_cache_is_one_noindex_directory_beside_the_clone() {
     let dir = scratch();
@@ -577,8 +572,7 @@ fn the_cache_is_one_noindex_directory_beside_the_clone() {
     );
     assert_eq!(CacheRoot::for_repo(&tree).unwrap().path(), cache.path());
 
-    // One take at a time: a second hold, from the clone or from its worktree, is told
-    // which pid holds it, and the first hold's drop frees it.
+    // A second hold, from the clone or its worktree, is told the holder's pid; a drop frees it.
     let hold = cache.hold().unwrap();
     CacheRoot::for_repo(&tree)
         .unwrap()
@@ -597,10 +591,8 @@ fn the_cache_is_one_noindex_directory_beside_the_clone() {
     CacheRoot::at(link).unwrap_err();
 }
 
-/// A rename by case alone between two commits lands under the new spelling on a
-/// volume that ignores case (macOS's default): the directory and a same-bytes file
-/// both end up under their new names with their contents, and the take digests as a
-/// fresh one of the same commit does.
+/// A case-only rename lands under the new spelling on a case-insensitive volume, and the take
+/// digests as a fresh take of the same commit does.
 #[test]
 fn a_case_only_rename_lands_under_the_new_spelling() {
     let dir = scratch();
@@ -659,9 +651,8 @@ fn a_case_only_rename_lands_under_the_new_spelling() {
     );
 }
 
-/// What a commit holds is read as git recorded it: a replace ref (`git replace`) does
-/// not reach the take, and bytes that are not the object their id names (a corrupted
-/// or planted loose object) are refused, naming the path.
+/// A replace ref (`git replace`) does not reach the take, and bytes that are not the object
+/// their id names (a corrupted or planted loose object) are refused, naming the path.
 #[test]
 fn replaced_or_substituted_objects_never_reach_the_take() {
     let dir = scratch();
@@ -695,11 +686,9 @@ fn replaced_or_substituted_objects_never_reach_the_take() {
     assert!(err.contains("src/a.txt"), "{err}");
 }
 
-/// A planted TREE is refused as a planted blob is. git reads a tree below a commit's
-/// root without checking it against its id, so another `.cargo` tree planted under the
-/// committed one's id — its `config.toml` a correctly hashed blob naming a
-/// `rustc-wrapper`, which every release build would then run — is listed as C's by a
-/// plain `git ls-tree -r` (the negative control), and must never reach the take.
+/// A planted tree is refused as a planted blob is. git reads trees below the root unchecked,
+/// so a `.cargo` planted under the committed id (its config naming a `rustc-wrapper`) is
+/// listed by a plain `git ls-tree -r` (the negative control), and must never reach the take.
 #[test]
 fn a_planted_subtree_never_reaches_the_take() {
     let dir = scratch();
@@ -707,8 +696,7 @@ fn a_planted_subtree_never_reaches_the_take() {
     let targo = stub_targo(dir.path(), &format!("itoa 1.0.0 {}\n", checksum()));
     let cache = held(dir.path().join("t-release.noindex"));
     let good = git(&repo, &["rev-parse", "HEAD:.cargo"]);
-    // The other `.cargo` tree, written through the index: every object in it is
-    // correctly hashed, so only the tree's own bytes can tell it is not C's.
+    // Every object in the planted tree hashes correctly; only the tree's own bytes betray it.
     std::fs::write(
         repo.join(".cargo/config.toml"),
         "[build]\nrustc-wrapper = \"/tmp/evil\"\n",
@@ -738,10 +726,8 @@ fn a_planted_subtree_never_reaches_the_take() {
     assert!(!taken.contains("rustc-wrapper"), "{taken}");
 }
 
-/// The ROOT trees are held to their ids too — C's, and each submodule
-/// gitlink's — which `ls-tree` used to check itself and the walk now does:
-/// another root tree planted under the id the commit records (every object in
-/// it correctly hashed) is refused, naming where.
+/// The root trees (the commit's and each gitlink's) are held to their ids too: another root
+/// tree planted under the recorded id is refused, naming where.
 #[test]
 fn a_planted_root_tree_never_reaches_the_take() {
     let dir = scratch();
@@ -799,9 +785,8 @@ fn a_planted_submodule_root_tree_never_reaches_the_take() {
     assert!(err.contains(&good) && err.contains("vendor/sub"), "{err}");
 }
 
-/// A symbolic link is refused, from the tree and from vendoring alike: what it
-/// reaches (here, out of the take and into the clone beside it) is no byte the digest
-/// covers.
+/// A symbolic link is refused, from the tree and from vendoring alike: what it reaches is no
+/// byte the digest covers.
 #[test]
 fn a_symbolic_link_is_refused_in_the_tree_and_in_the_vendored_output() {
     let dir = scratch();
@@ -819,9 +804,8 @@ fn a_symbolic_link_is_refused_in_the_tree_and_in_the_vendored_output() {
     assert!(err.contains("escape"), "{err}");
 }
 
-/// A Cargo config in the vendoring `CARGO_HOME` (one could point crates.io at a
-/// directory of anyone's bytes) is removed before `targo vendor` runs: the stand-in
-/// refuses to vendor while one is there.
+/// A Cargo config in the vendoring `CARGO_HOME` (one could repoint crates.io) is removed
+/// before `targo vendor` runs; the stand-in refuses to vendor while one is there.
 #[test]
 fn a_cargo_config_in_the_vendoring_home_is_removed_before_vendoring() {
     let dir = scratch();

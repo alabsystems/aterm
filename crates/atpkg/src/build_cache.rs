@@ -15,10 +15,16 @@
 //! one rule. Only `targo trust`, whose cargo reads no `--config`, gets its folder through
 //! the environment (`CARGO_BUILD_BUILD_DIR`); every other command is handed a `--config`,
 //! which a nested cargo started by the build never inherits. [`reclaim`] removes what
-//! nobody builds into any more.
+//! nobody builds into any more: whole build directories, and inside one that stays what no
+//! build reads again ([`stale`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+#[path = "build_cache_stale.rs"]
+pub mod stale;
+
+pub use stale::RECLAIM_STALE;
 
 /// When a workspace is gone: the rule the window's disk watch uses too. It never looks
 /// into a privacy-guarded folder or a mounted volume.
@@ -242,15 +248,25 @@ pub enum Unused {
     Idle { idle: Duration },
     /// What an earlier pass renamed aside and did not finish removing.
     Unfinished,
+    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders and
+    /// `units` an old compiler built, each unwritten for `after` ([`RECLAIM_STALE`]) or more.
+    /// The path that goes is the stage they were moved into.
+    Stale {
+        incremental: usize,
+        units: usize,
+        after: Duration,
+    },
 }
 
 /// Removes the build directories under the cache `root` that nobody builds into any more,
 /// and returns them: one unwritten for [`RECLAIM_GONE`] whose workspace is seen gone
 /// ([`checkout::gone`], `home` naming the folders it never looks into), and any unwritten
-/// for [`RECLAIM_IDLE`]. One whose build lock a build holds is kept; each other is renamed
-/// aside while its locks are held, then removed. A stage an earlier pass renamed aside and
-/// did not finish removing is finished, and returned too. Never follows a symlink and never
-/// leaves `root`. Mirror folders left empty go too.
+/// for [`RECLAIM_IDLE`]. From each build directory that stays, what no build reads again
+/// goes ([`stale`]), returned as the stage it was moved into. One whose build lock a build
+/// holds is kept whole; each other is renamed aside while its locks are held, then removed.
+/// A stage an earlier pass renamed aside and did not finish removing is finished, and
+/// returned too. Never follows a symlink and never leaves `root`. Mirror folders left empty
+/// go too.
 pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf> {
     reclaim_watched(root, home, now, RECLAIM_GONE, None, &mut |_, _| true)
         .into_iter()
@@ -267,10 +283,12 @@ pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf
 /// WRITE-AHEAD: `record` is asked for each build directory about to go, and why, with its
 /// locks held and before anything of it is moved — and for a stage an earlier pass left
 /// ([`Unused::Unfinished`]) before it is removed; one it answers `false` for (its intent
-/// could not be put on record — a full disk) is kept. The caller may size it there. What is
-/// returned was removed whole: a stage finished is returned as [`Unused::Unfinished`], so
-/// each intent asked has its outcome; a directory whose removal was cut short is returned by
-/// the pass that finishes its stage.
+/// could not be put on record — a full disk) is kept. The caller may size it there. What
+/// goes from a build directory that stays ([`Unused::Stale`]) is asked for as the stage it
+/// was moved into under the locks, holding exactly what goes; refused, each entry is moved
+/// back before the locks are let go. What is returned was removed whole: a stage finished is
+/// returned as [`Unused::Unfinished`], so each intent asked has its outcome; a directory
+/// whose removal was cut short is returned by the pass that finishes its stage.
 pub fn reclaim_watched(
     root: &Path,
     home: Option<&Path>,
@@ -287,6 +305,7 @@ pub fn reclaim_watched(
             now,
             gone_after,
             placing,
+            compiler_store: compiler_store(home),
             record,
             removed: &mut removed,
         };
@@ -304,6 +323,8 @@ struct Sweep<'a> {
     gone_after: Duration,
     /// What places a workspace nested in a removed checkout ([`checkout::gone_placed`]).
     placing: Option<&'a checkout::Placing>,
+    /// Independently admitted actual store; unknown keeps compiler-classified units.
+    compiler_store: Option<PathBuf>,
     /// Asked before each removal, its locks held: `false` keeps it.
     record: &'a mut dyn FnMut(&Path, Unused) -> bool,
     removed: &'a mut Vec<(PathBuf, Unused)>,
@@ -339,6 +360,98 @@ impl Sweep<'_> {
         gone
     }
 
+    /// WHAT NO BUILD READS AGAIN in the build directory `leaf` that stays ([`stale`]):
+    /// surveyed without locks, then every cargo lock it holds taken (one a build holds keeps
+    /// it all this pass), and the decision made again from a fresh survey under those locks;
+    /// moved into the stage `dir`/[`DOOMED`] under the locks, recorded as that stage
+    /// ([`Unused::Stale`]; refused, every entry moves back), and removed with the locks let
+    /// go. An entry that cannot move back stays in the stage, which the next pass records
+    /// and finishes. Returns whether anything was moved.
+    fn prune(&mut self, dir: &Path, leaf: &Path) -> bool {
+        let Some(seen) = look(leaf) else {
+            return false;
+        };
+        let profiles = profiles_of(&seen.locks);
+        let doomed = stale::decide(
+            &stale::survey(
+                &stale::Disk,
+                leaf,
+                &profiles,
+                self.compiler_store.as_deref(),
+            ),
+            self.now,
+        );
+        if doomed.is_empty() {
+            return false;
+        }
+        let Some(held) = hold(&seen.locks) else {
+            return false;
+        };
+        if look(leaf).is_none_or(|again| again.locks != seen.locks) {
+            return false;
+        }
+        // The unlocked survey only avoided needless lock attempts. Re-read the
+        // compiler classification and every artifact under the Cargo locks.
+        let doomed = stale::decide(
+            &stale::survey(
+                &stale::Disk,
+                leaf,
+                &profiles,
+                self.compiler_store.as_deref(),
+            ),
+            self.now,
+        );
+        if doomed.is_empty() {
+            return false;
+        }
+        let stage = dir.join(DOOMED);
+        let mut any = false;
+        match self.stage_recorded(&stage) {
+            None => return false,
+            Some(true) => any |= self.finish_stage(&stage),
+            Some(false) => {}
+        }
+        if std::fs::create_dir(&stage).is_err() {
+            return any;
+        }
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let (mut incremental, mut units) = (0, 0);
+        for one in &doomed {
+            let before = moved.len();
+            for path in &one.paths {
+                let to = stage.join(moved.len().to_string());
+                if std::fs::rename(path, &to).is_ok() {
+                    moved.push((path.clone(), to));
+                }
+            }
+            if moved.len() > before {
+                match one.part {
+                    stale::Part::Incremental => incremental += 1,
+                    stale::Part::Unit => units += 1,
+                }
+            }
+        }
+        let why = Unused::Stale {
+            incremental,
+            units,
+            after: RECLAIM_STALE,
+        };
+        if moved.is_empty() || !(self.record)(&stage, why) {
+            for (from, to) in moved.iter().rev() {
+                let _ = std::fs::rename(to, from);
+            }
+            let _ = std::fs::remove_dir(&stage);
+            drop(held);
+            return any;
+        }
+        // A build that started meanwhile waited on these, and finds what it needs in place.
+        drop(held);
+        if std::fs::remove_dir_all(&stage).is_ok() {
+            self.removed.push((stage, why));
+        }
+        true
+    }
+
     fn walk(&mut self, dir: &Path, depth: usize) -> bool {
         let (root, home, now) = (self.root, self.home, self.now);
         let quiet = last_written(dir).is_some_and(|t| age(now, t) >= RECLAIM_GONE);
@@ -357,6 +470,7 @@ impl Sweep<'_> {
                 let Some((held, why)) = workspace_of(root, dir)
                     .and_then(|ws| unused(&ws, &child, home, now, self.gone_after, self.placing))
                 else {
+                    any |= self.prune(dir, &child);
                     continue;
                 };
                 if !(self.record)(&child, why) {
@@ -423,22 +537,41 @@ fn unused(
     placing: Option<&checkout::Placing>,
 ) -> Option<(Vec<crate::lock::Flock>, Unused)> {
     let seen = look(leaf)?;
+    let why = whole(workspace, &seen, home, now, gone_after, placing)?;
+    let held = hold(&seen.locks)?;
+    let again = look(leaf)?;
+    (again.newest == seen.newest && again.locks == seen.locks).then_some((held, why))
+}
+
+/// Why the build directory of `workspace`, as [`look`] `seen` it, goes whole: idle at least
+/// `gone_after` with its workspace seen gone, or [`RECLAIM_IDLE`] whatever its state.
+fn whole(
+    workspace: &Path,
+    seen: &Seen,
+    home: Option<&Path>,
+    now: SystemTime,
+    gone_after: Duration,
+    placing: Option<&checkout::Placing>,
+) -> Option<Unused> {
     let idle = age(now, seen.newest);
     if idle < gone_after {
-        return None;
-    }
-    let why = if idle >= RECLAIM_IDLE {
-        Unused::Idle { idle }
+        None
+    } else if idle >= RECLAIM_IDLE {
+        Some(Unused::Idle { idle })
     } else if checkout::gone_placed(workspace, home, placing).is_ok() {
-        Unused::Gone {
+        Some(Unused::Gone {
             idle,
             after: gone_after,
-        }
+        })
     } else {
-        return None;
-    };
-    let held = seen
-        .locks
+        None
+    }
+}
+
+/// Every cargo lock in `locks` taken without waiting: `None` when a build holds one, or one
+/// is no regular file (a link is never followed to a lock elsewhere).
+fn hold(locks: &[PathBuf]) -> Option<Vec<crate::lock::Flock>> {
+    locks
         .iter()
         .map(|lock| {
             if !std::fs::symlink_metadata(lock).is_ok_and(|m| m.is_file()) {
@@ -446,9 +579,18 @@ fn unused(
             }
             crate::lock::Flock::try_lock(std::fs::File::open(lock).ok()?).ok()
         })
-        .collect::<Option<Vec<_>>>()?;
-    let again = look(leaf)?;
-    (again.newest == seen.newest && again.locks == seen.locks).then_some((held, why))
+        .collect()
+}
+
+/// The profiles of a build directory: the folders holding its cargo `locks`.
+fn profiles_of(locks: &[PathBuf]) -> Vec<PathBuf> {
+    let mut profiles: Vec<PathBuf> = locks
+        .iter()
+        .filter_map(|lock| lock.parent().map(Path::to_path_buf))
+        .collect();
+    profiles.sort();
+    profiles.dedup();
+    profiles
 }
 
 /// What [`look`] finds in a build directory.
@@ -501,6 +643,72 @@ fn age(now: SystemTime, then: SystemTime) -> Duration {
     now.duration_since(then).unwrap_or(Duration::ZERO)
 }
 
+/// Admit the actual configured store independently of cache-supplied sysroots. Unknown
+/// or unsafe roots keep units. The default owned package subtree is the sole exception
+/// to the home Library fence; every component is still checked before looking below it.
+#[cfg(unix)]
+fn compiler_store(home: Option<&Path>) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::Component;
+
+    let home = home.filter(|home| {
+        home.is_absolute() && !home.components().any(|c| c == Component::ParentDir)
+    })?;
+    let cfg = match crate::config::config_path() {
+        Some(path) => crate::config::load_live(&path)?,
+        None => crate::config::PackagesConfig::default(),
+    };
+    if cfg.unreadable {
+        return None;
+    }
+    let default = crate::store::default_prefix(home);
+    let prefix = cfg
+        .prefix_path(Some(home))
+        .unwrap_or_else(|| default.clone());
+    if !prefix.is_absolute()
+        || prefix.components().any(|c| c == Component::ParentDir)
+        || (prefix != default && checkout::never_looked_at(&prefix, Some(home)).is_some())
+    {
+        return None;
+    }
+    let home_meta = std::fs::symlink_metadata(home).ok()?;
+    if !home_meta.is_dir() || crate::platform::is_reparse(&home_meta) {
+        return None;
+    }
+    let store = prefix.join("store");
+    let own = prefix.starts_with(home) && prefix != home;
+    let base = if own { home } else { Path::new("/") };
+    let mut path = base.to_path_buf();
+    let mut way = vec![path.clone()];
+    for component in store.strip_prefix(base).ok()?.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        path.push(name);
+        way.push(path.clone());
+    }
+    for path in way {
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        let owner_ok = if own {
+            crate::platform::dir_meta_is_private(&meta)
+        } else {
+            crate::platform::dir_meta_is_system(&meta)
+        };
+        if !meta.is_dir() || crate::platform::is_reparse(&meta) || !owner_ok {
+            return None;
+        }
+        if path.starts_with(&prefix) && meta.dev() != home_meta.dev() {
+            return None;
+        }
+    }
+    Some(store)
+}
+
+#[cfg(not(unix))]
+fn compiler_store(_: Option<&Path>) -> Option<PathBuf> {
+    None
+}
+
 /// [`reclaim_watched`] over this user's cache, now, `record` asked before each removal;
 /// nothing off macOS or without a home.
 pub fn reclaim_home_watched(
@@ -523,15 +731,175 @@ pub fn reclaim_home_watched(
     })
 }
 
-/// [`reclaim`] over this user's cache, now; nothing off macOS or without a home.
+/// [`reclaim`] over this user's cache, now, each path returned with why it went; nothing
+/// off macOS or without a home.
 #[must_use]
-pub fn reclaim_home() -> Vec<PathBuf> {
+pub fn reclaim_home() -> Vec<(PathBuf, Unused)> {
+    reclaim_home_watched(RECLAIM_GONE, None, &mut |_, _| true)
+}
+
+/// WHAT A PASS WOULD TAKE, read and never acted on ([`plan`]): one build directory that
+/// would go whole, the parts that would go from one that stays, or a stage an earlier pass
+/// left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    /// The build directory, or the stage.
+    pub path: PathBuf,
+    /// Why, as the pass would record it.
+    pub why: Unused,
+    /// What would be removed: `path` itself, or the parts of it.
+    pub paths: Vec<PathBuf>,
+    /// Its cargo locks could not all be taken just now (a build holds one): a pass now
+    /// keeps it whole.
+    pub held: bool,
+}
+
+/// [`reclaim_watched`]'s decisions over the cache `root` at `now`, read and never acted on:
+/// nothing is moved or removed and no stage is finished. Each build directory's cargo locks
+/// are only tried, and let go at once, to say whether a build holds one ([`Planned::held`]).
+/// What would go from one that stays is what [`stale::decide`] says of its survey; the pass
+/// itself re-reads each under the locks first.
+#[must_use]
+pub fn plan(
+    root: &Path,
+    home: Option<&Path>,
+    now: SystemTime,
+    gone_after: Duration,
+    placing: Option<&checkout::Placing>,
+) -> Vec<Planned> {
+    let mut planned = Vec::new();
+    if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+        let store = compiler_store(home);
+        let pass = (root, home, now, gone_after, placing, store.as_deref());
+        plan_walk(pass, root, 0, &mut planned);
+    }
+    planned
+}
+
+/// [`plan`] for this user's cache now, with the day's window ([`reclaim_home`]'s); nothing
+/// off macOS or without a home.
+#[must_use]
+pub fn plan_home() -> Vec<Planned> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
-        reclaim(&cache_root(&home), Some(&home), SystemTime::now())
+        plan(
+            &cache_root(&home),
+            Some(&home),
+            SystemTime::now(),
+            RECLAIM_GONE,
+            None,
+        )
     })
+}
+
+/// What one [`plan`] judges by: its `root`, `home`, `now`, `gone_after` and `placing`.
+type PlanPass<'a> = (
+    &'a Path,
+    Option<&'a Path>,
+    SystemTime,
+    Duration,
+    Option<&'a checkout::Placing>,
+    Option<&'a Path>,
+);
+
+/// [`plan`]'s walk of the mirror folder `dir`, as [`Sweep::walk`] walks it.
+fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Planned>) {
+    let (root, home, now, gone_after, placing, store) = pass;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    children.sort();
+    for child in children {
+        let name = child.file_name().unwrap_or_default();
+        if name == LEAF {
+            let Some(seen) = look(&child) else {
+                continue;
+            };
+            let held = hold(&seen.locks).is_none();
+            let goes = workspace_of(root, dir)
+                .and_then(|ws| whole(&ws, &seen, home, now, gone_after, placing));
+            if let Some(why) = goes {
+                planned.push(Planned {
+                    path: child.clone(),
+                    why,
+                    paths: vec![child],
+                    held,
+                });
+                continue;
+            }
+            let survey = stale::survey(&stale::Disk, &child, &profiles_of(&seen.locks), store);
+            let doomed = stale::decide(&survey, now);
+            if doomed.is_empty() {
+                continue;
+            }
+            let count = |part| doomed.iter().filter(|d| d.part == part).count();
+            planned.push(Planned {
+                path: child,
+                why: Unused::Stale {
+                    incremental: count(stale::Part::Incremental),
+                    units: count(stale::Part::Unit),
+                    after: RECLAIM_STALE,
+                },
+                paths: doomed.into_iter().flat_map(|d| d.paths).collect(),
+                held,
+            });
+        } else if name == DOOMED {
+            planned.push(Planned {
+                path: child.clone(),
+                why: Unused::Unfinished,
+                paths: vec![child],
+                held: false,
+            });
+        } else if depth < MAX_DEPTH {
+            plan_walk(pass, &child, depth + 1, planned);
+        }
+    }
+}
+
+/// The bytes `paths` hold on disk: each file's allocated blocks once, however many names it
+/// has among them, never following a link.
+#[must_use]
+pub fn allocated(paths: &[PathBuf]) -> u64 {
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut total = 0u64;
+    let mut stack: Vec<PathBuf> = paths.to_vec();
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            stack.extend(
+                std::fs::read_dir(&path)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path()),
+            );
+            continue;
+        }
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::fs::MetadataExt as _;
+            if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
+                continue;
+            }
+            meta.blocks().saturating_mul(512)
+        };
+        #[cfg(not(unix))]
+        let bytes = {
+            let _ = &mut seen;
+            meta.len()
+        };
+        total = total.saturating_add(bytes);
+    }
+    total
 }
 
 #[cfg(test)]

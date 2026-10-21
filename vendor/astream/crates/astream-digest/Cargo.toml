@@ -1,6 +1,6 @@
 [package]
 name = "astream-digest"
-description = "astream SHA-256: FIPS 180-4 transcribed line by line, zero dependencies, forbid(unsafe). The one hash under astream-cap's HMAC capabilities and producer ids, astream-aead's handshake HKDF, and astream-evidence's output pins."
+description = "astream SHA-256 and the one HMAC-SHA256/HKDF-SHA256 over it: FIPS 180-4 and RFC 2104/5869 transcribed line by line, zero dependencies, forbid(unsafe). The one hash and MAC under astream-cap's capabilities, attach proofs and producer ids, astream-aead's handshake and identity session keys, and astream-evidence's output pins; plus a constant-time slice compare."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

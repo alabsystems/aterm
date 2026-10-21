@@ -2,34 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, and here the directory
-# also had to grow a suffix.
-#
-# `[patch.crates-io]` matches on PACKAGE name, so to redirect the thirteen
-# third-party consumers' `log = "0.4.x"` lines at this code the package must be
-# called `log` — nothing else works. The DIRECTORY keeps the `aterm-` prefix so
-# a `ls crates/` or a stack trace still reads as ours and nobody mistakes this
-# for a vendored upstream (those live under `vendor/`, which is where genuinely
-# upstream source belongs).
-#
-# The `-shim` suffix is forced: `crates/aterm-log` is ALREADY TAKEN by aterm's
-# real logging facade — the one 14 workspace crates depend on by that name and
-# whose global level `crates/aterm-gui/src/logging.rs` actually sets. The two must be separate
-# packages, not one; see this crate's `src/lib.rs` module docs for the four
-# measured reasons, of which the sharpest is that merging them would switch on
-# Vulkan validation severities that are off today.
+# `[patch.crates-io]` matches on package name, so to redirect third-party
+# consumers' `log = "0.4.x"` dependencies here the package is named `log`.
+# The directory is `crates/aterm-log-shim` because `crates/aterm-log` is
+# aterm's own logging facade. See `src/lib.rs` for why the two are separate
+# packages.
 name = "log"
-# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
-# consumers, not an aterm release number. Measured requirements across the
-# consumers, all four cells (`cargo tree -e all --workspace --target
-# <cell> --depth 2 -i log`, then each parent's manifest):
-#   ^0.4.29 — naga, wgpu, wgpu-core, wgpu-hal, wgpu-types  (the strictest)
-#   ^0.4    — the other eight
-# (rustybuzz's ^0.4.22 left the graph with it at TF.6 of
-# docs/AUDIT-third-party-2026-10-15.md.)
-# 0.4.32 satisfies both requirements and is what the graph resolved to
-# before the swap, so the lockfile's version line did not move when the
-# `[patch.crates-io]` row landed: the lock holds one `log 0.4.32`, this member.
+# Semver contract with third-party consumers (^0.4.29 for naga/wgpu/wgpu-core/
+# wgpu-hal/wgpu-types, ^0.4 for the rest), not an aterm release number.
 version = "0.4.32"
 edition.workspace = true
 license.workspace = true
@@ -37,44 +17,14 @@ repository.workspace = true
 description = "First-party no-op `log` facade for aterm (package `log`; replaces the crates.io log 0.4.32 for its third-party consumers)"
 
 [dependencies]
-# NONE, and the absence is deliberate rather than incidental.
-#
-# The obvious edge — `aterm-log`, the first-party logger this repository already
-# ships — is NOT taken. Four measured reasons, argued in full in src/lib.rs:
-#   1. `max_level()`. aterm-log's global IS set (Info by default in
-#      crates/aterm-gui/src/logging.rs); crates.io `log`'s is `Off`
-#      forever. wgpu-hal reads `log::max_level()` four times to gate REAL WORK.
-#   2. `Display for Level`. aterm-log writes `f.write_str("WARN")`; upstream
-#      writes `fmt.pad(self.as_str())`, which honours `{:>7}`.
-#   3. `LevelFilter::parse`. aterm-log has an inherent `parse` that trims its
-#      input; upstream has `FromStr`, which does not. Re-exporting the type
-#      exports the inherent method too, under the name `log::LevelFilter::parse`.
-#   4. `no_std`. aterm-log is std-only (`std::sync::OnceLock`, `std::env`);
-#      six consumers are `#![no_std]` and none enables `log/std`.
-# Reasons 2 and 3 are cases where DELEGATING WOULD SHIP A WRONG API, not merely
-# an inelegant one — so the exception swallows the rule for this target.
+# Deliberately empty (does not depend on `aterm-log`; see `src/lib.rs` for why
+# `max_level()`, `Display for Level`, `LevelFilter::parse`, and `#![no_std]`
+# require a separate implementation).
 
 [features]
-# Upstream's feature table, reproduced by NAME. Only the implicit, empty
-# `default` is reachable from aterm's graph — measured on all four cells with
-# `cargo tree -e features --workspace --target <cell> -i log`, which prints
-# exactly `log feature "default"` and nothing else — and `default` is left
-# IMPLICIT here precisely because upstream declares no `default` key either.
-#
-# The unreachable entries are declared anyway because they cost one line each
-# and they remove a whole class of "some transitive crate asked for `log/std`"
-# resolution failures that would otherwise surface as a broken build on a cell
-# we cannot compile here. They are all no-ops: there is no `kv` module, no
-# `serde` impls, and no compile-time level filtering, because there is nothing
-# to filter.
-#
-# THE OPTIONAL-DEPENDENCY NAMES ARE HERE TOO (`value-bag`, `sval`, `sval_ref`,
-# `serde_core`). Upstream declares those as optional deps, which makes cargo
-# synthesize a feature of the same name; a consumer writing
-# `log = { features = ["value-bag"] }` therefore resolves against the real crate
-# and would fail against this one if the name were missing. Declaring them empty
-# keeps the resolvable name set a superset of upstream's while keeping the
-# EXPORTED ITEM set a strict subset (see the glob-collision note in src/lib.rs).
+# Upstream's feature table, reproduced by name as no-ops so any transitive
+# consumer enabling a `log/*` feature or optional-dependency feature resolves.
+# `default` is left implicit, matching upstream.
 std = []
 kv = []
 kv_std = ["std", "kv"]

@@ -1660,14 +1660,16 @@ pub fn list_root(dir: &Path) -> Listing {
 /// `codesign` runs only for a bundle that claims the identifier.
 #[must_use]
 pub fn read_candidate(root: &Path, bundle_id: &str, protected: &[PathBuf]) -> Candidate {
-    if !std::fs::metadata(root).is_ok_and(|m| m.is_dir()) {
-        return Candidate::NotOurs;
-    }
     let plist = root.join("Contents").join("Info.plist");
-    // The plist too: a `Contents` link into a protected root is followed by
-    // every read below, `codesign` included.
+    // Check the fence before `metadata`: a candidate inside a non-existent or
+    // symlinked protected root is a hole without touching the path first, and
+    // a `Contents` link into a protected root is followed by every read below,
+    // `codesign` included.
     if !census_may_read(root, protected) || !census_may_read(&plist, protected) {
         return Candidate::Hole;
+    }
+    if !std::fs::metadata(root).is_ok_and(|m| m.is_dir()) {
+        return Candidate::NotOurs;
     }
     match std::fs::symlink_metadata(&plist) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Candidate::NotOurs,
@@ -1696,8 +1698,9 @@ pub fn read_candidate(root: &Path, bundle_id: &str, protected: &[PathBuf]) -> Ca
 /// ([`same_identity`]). Runs `codesign`, so it belongs on a worker.
 #[must_use]
 pub fn still_claims(claimant: &Claimant, bundle_id: &str) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     matches!(
-        read_candidate(&claimant.path, bundle_id, &protected_roots(&[])),
+        read_candidate(&claimant.path, bundle_id, &census_fence(home.as_deref())),
         Candidate::Ours(id) if same_identity(&id, claimant)
     )
 }
@@ -2120,7 +2123,7 @@ pub fn claimants_for(bundle_id: &str) -> Claimants {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let roots = claimant_search_roots(running.as_deref(), home.as_deref());
     let registered = registered_bundles(bundle_id);
-    let protected = protected_roots(&[]);
+    let protected = census_fence(home.as_deref());
     census_in(
         bundle_id,
         running.as_deref(),
@@ -2128,6 +2131,44 @@ pub fn claimants_for(bundle_id: &str) -> Claimants {
         registered.as_deref(),
         &protected,
     )
+}
+
+/// The roots [`claimants_for`] and [`still_claims`] refuse to list or read
+/// inside: [`protected_roots_in`] with default overrides PLUS
+/// [`app_data_roots`] (`~/Library/Containers` and `~/Library/Group Containers`),
+/// for both `home` as spelled and `canonicalize(home)` when they differ (e.g. a
+/// symlinked `$HOME` or `/var/…` vs `/private/var/…`), so a copy `LaunchServices`
+/// registered inside another app's container is a hole rather than an `Info.plist`
+/// read or `codesign` run that raises the App Data dialog.
+#[must_use]
+fn census_fence(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = protected_roots_in(home, &[]);
+    if let Some(h) = home {
+        roots.extend(app_data_roots(h));
+        if let Ok(canon) = std::fs::canonicalize(h)
+            && canon != h
+        {
+            for p in protected_roots_in(Some(&canon), &[])
+                .into_iter()
+                .chain(app_data_roots(&canon))
+            {
+                if !roots.contains(&p) {
+                    roots.push(p);
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// The `kTCCServiceSystemPolicyAppData` parent roots under `home`
+/// ([`crate::sbpl::APP_DATA_ROOTS`]), resolved as absolute paths.
+#[must_use]
+pub fn app_data_roots(home: &Path) -> Vec<PathBuf> {
+    crate::sbpl::APP_DATA_ROOTS
+        .iter()
+        .map(|sub| home.join(sub))
+        .collect()
 }
 
 /// [`claimants_for`] with its sources given: the real listing and candidate
@@ -2294,6 +2335,60 @@ pub fn protected_roots_in(home: Option<&Path>, overrides: &[String]) -> Vec<Path
     roots
 }
 
+/// The paths under `$HOME`, beyond [`crate::sbpl::PRIVATE_SUBDIRS`], whose `stat` can raise
+/// a macOS privacy prompt: other apps' data (`kTCCServiceSystemPolicyAppData`), the File
+/// Provider and iCloud Drive stores, and the Trash. The sandbox does not read these (it keeps
+/// `PRIVATE_SUBDIRS` unchanged); a reader that `stat`s paths it did not write takes them
+/// through [`tcc_prompting_roots`]. The census guard `protected-folder` (aterm-census
+/// `guards/rules.rs`) keeps its own needles for the literal shapes it refuses in shipped code
+/// (`Library/Containers`, `Library/CloudStorage`, `/Volumes`); it does not read this const.
+pub const TCC_PROMPTING_SUBPATHS: &[&str] = &[
+    "Library/Containers",
+    "Library/Group Containers",
+    "Library/CloudStorage",
+    "Library/Mobile Documents",
+    ".Trash",
+];
+
+/// The machine-wide paths whose `stat` can raise a privacy prompt or mount a volume:
+/// removable and network volumes (`kTCCServiceSystemPolicyRemovableVolumes`,
+/// `…NetworkVolumes`), the automounted home and network maps.
+pub const TCC_PROMPTING_ABSOLUTE: &[&str] = &["/Volumes", "/System/Volumes/Data/home", "/Network"];
+
+/// Every path whose `stat` can put a privacy dialog on the owner's screen (design
+/// `docs/DESIGN-system-awareness-2026-10-16.md` §3.4 row 10, §10.5 rule 7), absolute, for a
+/// reader that touches paths it did not create (the disk walker, a job's output-file read).
+///
+/// It is [`protected_roots_in`]'s default set ALWAYS (an override adds to it here, never
+/// removes: a prompt is macOS's behaviour, not a setting), plus `overrides`, plus
+/// [`TCC_PROMPTING_SUBPATHS`] under `home` and [`TCC_PROMPTING_ABSOLUTE`]. Other users'
+/// homes are a rule, not a list ([`other_homes_root`]). Pure.
+#[must_use]
+pub fn tcc_prompting_roots(home: &Path, overrides: &[String]) -> Vec<PathBuf> {
+    let mut roots = protected_roots_in(Some(home), &[]);
+    for extra in protected_roots_in(Some(home), overrides) {
+        if !roots.contains(&extra) {
+            roots.push(extra);
+        }
+    }
+    roots.extend(TCC_PROMPTING_SUBPATHS.iter().map(|sub| home.join(sub)));
+    roots.extend(TCC_PROMPTING_ABSOLUTE.iter().map(PathBuf::from));
+    roots
+}
+
+/// The folder that holds every user's home (`/Users` for `/Users//a`): every path under it
+/// that is not under `home` is another user's, and reading it can prompt. `None` when `home`
+/// sits directly under `/` or is not absolute. Pure.
+#[must_use]
+pub fn other_homes_root(home: &Path) -> Option<PathBuf> {
+    if !home.is_absolute() {
+        return None;
+    }
+    home.parent()
+        .filter(|p| p.parent().is_some())
+        .map(Path::to_path_buf)
+}
+
 // ---------------------------------------------------------------------------
 // Folders
 // ---------------------------------------------------------------------------
@@ -2382,8 +2477,7 @@ impl Folder {
             Self::Desktop => home.join("Desktop"),
             Self::Downloads => home.join("Downloads"),
             Self::AppData => home
-                .join("Library")
-                .join("Containers")
+                .join(crate::sbpl::APP_DATA_ROOTS[0])
                 .join(APP_DATA_PROBE_BUNDLE),
         }
     }
@@ -7674,6 +7768,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The census fence includes `~/Library/Containers` and
+    /// `~/Library/Group Containers` (`app_data_roots`), so a bundle registered by
+    /// `LaunchServices` inside another app's container — or a symlink in
+    /// `/Applications` that resolves into one — is a hole, never read or handed
+    /// to `codesign`.
+    #[test]
+    fn the_census_never_reads_a_copy_inside_another_apps_container() {
+        let scratch = aterm_tempfile::tempdir().expect("owned census scratch");
+        let home = scratch.path().canonicalize().unwrap().join("home");
+        let container_app =
+            home.join("Library/Containers/com.other.App/Data/Applications/aterm.app");
+        let group_app = home.join("Library/Group Containers/group.other/aterm.app");
+        let normal_app = home.join("Applications/aterm.app");
+        for bundle in [&container_app, &group_app, &normal_app] {
+            let contents = bundle.join("Contents");
+            std::fs::create_dir_all(&contents).unwrap();
+            std::fs::write(
+                contents.join("Info.plist"),
+                "<plist><dict><key>CFBundleIdentifier</key><string>dev.aterm</string></dict></plist>",
+            )
+            .unwrap();
+        }
+        let protected = census_fence(Some(&home));
+        assert!(
+            protected.contains(&home.join("Library/Containers"))
+                && protected.contains(&home.join("Library/Group Containers")),
+            "census_fence must include both App Data roots: {protected:?}"
+        );
+        assert_eq!(
+            read_candidate(&container_app, "dev.aterm", &protected),
+            Candidate::Hole,
+            "a bundle under ~/Library/Containers must not be read"
+        );
+        assert_eq!(
+            read_candidate(&group_app, "dev.aterm", &protected),
+            Candidate::Hole,
+            "a bundle under ~/Library/Group Containers must not be read"
+        );
+        // Even when the container path does not exist on disk, the lexical arm of
+        // `census_may_read` refuses before `metadata` or `read_info_plist`.
+        let absent_container = home.join("Library/Containers/com.apple.Notes/Data/aterm.app");
+        assert_eq!(
+            read_candidate(&absent_container, "dev.aterm", &protected),
+            Candidate::Hole,
+            "an absent path under ~/Library/Containers is still fenced as a hole"
+        );
+        #[cfg(unix)]
+        {
+            let link_in_apps = home.join("Applications/linked-aterm.app");
+            std::os::unix::fs::symlink(&container_app, &link_in_apps).unwrap();
+            assert_eq!(
+                read_candidate(&link_in_apps, "dev.aterm", &protected),
+                Candidate::Hole,
+                "a symlink in ~/Applications resolving into ~/Library/Containers must not be read"
+            );
+            // A symlinked `$HOME` (where `locate_candidate` canonicalizes the
+            // bundle to `real_home/...` while `home` is the symlink path) must
+            // fence both spellings.
+            let link_home = scratch.path().canonicalize().unwrap().join("home-link");
+            std::os::unix::fs::symlink(&home, &link_home).unwrap();
+            let linked_fence = census_fence(Some(&link_home));
+            assert_eq!(
+                read_candidate(&container_app, "dev.aterm", &linked_fence),
+                Candidate::Hole,
+                "canonical container path must be fenced even when HOME is a symlink"
+            );
+        }
+        // Control: a bundle in `~/Applications` is outside the fence and is read.
+        assert!(
+            matches!(
+                read_candidate(&normal_app, "dev.aterm", &protected),
+                Candidate::Ours(_)
+            ),
+            "control bundle in ~/Applications must still be read"
+        );
+        // And `Folder::AppData.path` sits under `app_data_roots(home)[0]`.
+        assert!(
+            Folder::AppData
+                .path(&home)
+                .starts_with(&app_data_roots(&home)[0]),
+            "Folder::AppData probe path must share APP_DATA_ROOTS[0]"
+        );
+    }
+
     /// The Trash is offered only among the rows the owner can see: a retirable
     /// copy past the first MAX_CLAIMANT_ROWS conflicting ones is never offered.
     #[test]
@@ -8396,6 +8574,40 @@ mod tests {
         // With no home there is no default, and a `~` override is dropped.
         assert!(protected_roots_in(None, &[]).is_empty());
         assert_eq!(protected_roots_in(None, &overrides), vec![p(volumes)]);
+    }
+
+    /// The prompting set is the sandbox's private set plus what it omits, and an override
+    /// widens it but never narrows it: dropping `~/Documents` from `[privacy]` does not stop
+    /// macOS from prompting on it.
+    #[test]
+    fn tcc_prompting_roots_hold_the_private_set_and_what_it_omits() {
+        let home = p("/Users//a");
+        let roots = tcc_prompting_roots(&home, &[]);
+        for sub in crate::sbpl::PRIVATE_SUBDIRS {
+            assert!(roots.contains(&home.join(sub)), "{sub}");
+        }
+        for sub in TCC_PROMPTING_SUBPATHS {
+            assert!(roots.contains(&home.join(sub)), "{sub}");
+        }
+        for abs in TCC_PROMPTING_ABSOLUTE {
+            assert!(roots.contains(&p(abs)), "{abs}");
+        }
+        let narrowed = tcc_prompting_roots(&home, &[String::from("~/Projects/secret")]);
+        assert!(narrowed.contains(&home.join("Documents")));
+        assert!(narrowed.contains(&p("/Users//a/Projects/secret")));
+        assert_eq!(narrowed.len(), roots.len() + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_homes_sit_beside_this_one() {
+        assert_eq!(other_homes_root(Path::new("/Users//a")), Some(p("/Users")));
+        assert_eq!(
+            other_homes_root(Path::new("/System/Volumes/Data/Users//a")),
+            Some(p("/System/Volumes/Data/Users"))
+        );
+        assert_eq!(other_homes_root(Path::new("/root")), None);
+        assert_eq!(other_homes_root(Path::new("relative/a")), None);
     }
 
     #[test]
